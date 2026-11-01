@@ -1,0 +1,310 @@
+package encode
+
+// Modular stream coding: per pixel, walk the MA tree to a context and
+// predictor, then code the zig-zagged residual. Runs of equal residuals
+// become LZ77 copies at distance 1. The same code counts symbols (first
+// pass) and writes them (second pass), so both passes agree exactly.
+
+// Channels of one modular stream: a palette meta channel and/or image
+// channels, stored row-major in the plane buffer.
+struct Stream {
+    count: usize
+    offset: [5]usize
+    width: [5]usize
+    height: [5]usize
+    // Stream index (MA property 1).
+    id: u32
+    // Reference properties may use earlier channels of this stream.
+    refs: bool
+
+    fn new(id: u32) -> Stream {
+        return Stream { count: 0, offset: [0usize; 5], width: [0usize; 5], height: [0usize; 5], id: id, refs: false }
+    }
+    fn add(&mut self, offset: usize, width: usize, height: usize) {
+        self.offset[self.count] = offset
+        self.width[self.count] = width
+        self.height[self.count] = height
+        self.count += 1
+    }
+}
+
+// Counts or writes symbols, turning runs of equal values into LZ77 copies.
+struct Emitter {
+    counting: bool
+    hist: &mut[u32]
+    split: u32
+    msb: u32
+    lsb: u32
+    lz77: bool
+    min_length: usize
+    dist_ctx: usize
+    run_value: u64
+    run_count: usize
+    run_ctx: [16]u16
+
+    fn literal(&mut self, codes: &CodeSet, w: &mut BitWriter, ctx: usize, value: u64) {
+        t := hybrid(value, self.split, self.msb, self.lsb)
+        token := (t & 0xFFFF) as usize
+        if self.counting {
+            at := ctx * MAX_ALPHA + token
+            if self.hist[at] != 0xFFFFFFFF {
+                self.hist[at] += 1
+            }
+            return
+        }
+        codes.put(w, ctx, token)
+        w.write(((t >> 16) & 255) as u32, t >> 24)
+    }
+    fn copy(&mut self, codes: &CodeSet, w: &mut BitWriter, ctx: usize, length: usize) {
+        t := hybrid((length - self.min_length) as u64, LZ77_LEN_SPLIT, 0, 0)
+        symbol := LZ77_MIN_SYMBOL as usize + (t & 0xFFFF) as usize
+        if self.counting {
+            at := ctx * MAX_ALPHA + symbol
+            if self.hist[at] != 0xFFFFFFFF {
+                self.hist[at] += 1
+            }
+            // Distance 1 is special distance index 1, token 1.
+            at2 := self.dist_ctx * MAX_ALPHA + 1
+            if self.hist[at2] != 0xFFFFFFFF {
+                self.hist[at2] += 1
+            }
+            return
+        }
+        codes.put(w, ctx, symbol)
+        w.write(((t >> 16) & 255) as u32, t >> 24)
+        codes.put(w, self.dist_ctx, 1)
+    }
+    fn feed(&mut self, codes: &CodeSet, w: &mut BitWriter, ctx: usize, value: u64) {
+        if !self.lz77 {
+            self.literal(codes, w, ctx, value)
+            return
+        }
+        if self.run_count > 0 && value == self.run_value {
+            if self.run_count < 16 {
+                self.run_ctx[self.run_count] = ctx as u16
+            }
+            self.run_count += 1
+            return
+        }
+        self.flush(codes, w)
+        self.run_value = value
+        self.run_ctx[0] = ctx as u16
+        self.run_count = 1
+    }
+    // End the pending run; called at the end of every stream.
+    fn flush(&mut self, codes: &CodeSet, w: &mut BitWriter) {
+        n := self.run_count
+        if n == 0 {
+            return
+        }
+        value := self.run_value
+        if n - 1 >= self.min_length {
+            c0 := self.run_ctx[0] as usize
+            c1 := self.run_ctx[1] as usize
+            self.literal(codes, w, c0, value)
+            self.copy(codes, w, c1, n - 1)
+        } else {
+            for i in 0usize..n {
+                c := self.run_ctx[i] as usize
+                self.literal(codes, w, c, value)
+            }
+        }
+        self.run_count = 0
+    }
+}
+
+fn clamped_gradient(n: i64, w: i64, nw: i64) -> i64 {
+    lo := n
+    hi := w
+    if w < n {
+        lo = w
+        hi = n
+    }
+    if nw > hi {
+        return lo
+    }
+    if nw < lo {
+        return hi
+    }
+    return n + w - nw
+}
+
+fn abs64(v: i64) -> i64 {
+    if v < 0 {
+        return -v
+    }
+    return v
+}
+
+fn predict(predictor: i32, w: i64, n: i64, nw: i64) -> i64 {
+    if predictor == 5 {
+        return clamped_gradient(n, w, nw)
+    }
+    if predictor == 1 {
+        return w
+    }
+    if predictor == 2 {
+        return n
+    }
+    if predictor == 4 {
+        // Select: the neighbor closer to W + N - NW.
+        if abs64(n - nw) < abs64(w - nw) {
+            return w
+        }
+        return n
+    }
+    if predictor == 8 {
+        return nw
+    }
+    return 0
+}
+
+// Code every channel of a stream.
+fn code_stream(planes: &[i32], stream: &Stream, tree: &Tree, e: &mut Emitter, codes: &CodeSet, w: &mut BitWriter) {
+    for c in 0usize..stream.count {
+        start := tree.resolve(c as u32, stream.id)
+        if tree.prop[start] == LEAF && tree.predictor[start] != PRED_WEIGHTED as i32 {
+            code_fixed(planes, stream.offset[c], stream.width[c], stream.height[c], tree.ctx[start] as usize, tree.predictor[start], tree.mul[start], e, codes, w)
+        } else {
+            reference := stream.offset[c]
+            if c > 0 {
+                reference = stream.offset[c - 1]
+            }
+            code_tree(planes, stream.offset[c], reference, stream.width[c], stream.height[c], tree, start, e, codes, w)
+        }
+    }
+    e.flush(codes, w)
+}
+
+// A channel whose context and predictor do not depend on the pixel.
+fn code_fixed(planes: &[i32], offset: usize, width: usize, height: usize, ctx: usize, predictor: i32, mul: i32, e: &mut Emitter, codes: &CodeSet, w: &mut BitWriter) {
+    for y in 0usize..height {
+        row := offset + y * width
+        for x in 0usize..width {
+            v := planes[row + x] as i64
+            left := 0i64
+            top := 0i64
+            topleft := 0i64
+            if x > 0 {
+                left = planes[row + x - 1] as i64
+            } else if y > 0 {
+                left = planes[row - width] as i64
+            }
+            if y > 0 {
+                top = planes[row - width + x] as i64
+            } else {
+                top = left
+            }
+            if x > 0 && y > 0 {
+                topleft = planes[row - width + x - 1] as i64
+            } else {
+                topleft = left
+            }
+            guess := predict(predictor, left, top, topleft)
+            e.feed(codes, w, ctx, pack_signed((v - guess) / mul as i64))
+        }
+    }
+}
+
+// A channel coded through the tree below `start`.
+fn code_tree(planes: &[i32], offset: usize, reference: usize, width: usize, height: usize, tree: &Tree, start: usize, e: &mut Emitter, codes: &CodeSet, w: &mut BitWriter) {
+    use_wp := tree.uses_wp(start) && width <= WP_MAX_WIDTH
+    wp := Wp.new(width)
+    for y in 0usize..height {
+        row := offset + y * width
+        for x in 0usize..width {
+            v := planes[row + x] as i64
+            left := 0i64
+            if x > 0 {
+                left = planes[row + x - 1] as i64
+            } else if y > 0 {
+                left = planes[row - width] as i64
+            }
+            top := left
+            if y > 0 {
+                top = planes[row - width + x] as i64
+            }
+            topleft := left
+            if x > 0 && y > 0 {
+                topleft = planes[row - width + x - 1] as i64
+            }
+            topright := top
+            if x + 1 < width && y > 0 {
+                topright = planes[row - width + x + 1] as i64
+            }
+            leftleft := left
+            if x > 1 {
+                leftleft = planes[row + x - 2] as i64
+            }
+            toptop := top
+            if y > 1 {
+                toptop = planes[row - 2 * width + x] as i64
+            }
+            guess_wp := 0i64
+            if use_wp {
+                guess_wp = wp.predict(x, y, top, left, topright, topleft, toptop)
+            }
+            n := start
+            for tree.prop[n] != LEAF {
+                p := tree.prop[n]
+                value := 0i64
+                if p == PROP_W_NW {
+                    value = left - topleft
+                } else if p == PROP_NW_N {
+                    value = topleft - top
+                } else if p == PROP_N_NE {
+                    value = top - topright
+                } else if p == PROP_GRADIENT {
+                    value = left + top - topleft
+                } else if p == PROP_PREV_ABS_RESIDUAL {
+                    rrow := reference + y * width
+                    rv := planes[rrow + x] as i64
+                    rw := 0i64
+                    if x > 0 {
+                        rw = planes[rrow + x - 1] as i64
+                    }
+                    rn := rw
+                    if y > 0 {
+                        rn = planes[rrow - width + x] as i64
+                    }
+                    rnw := rw
+                    if x > 0 && y > 0 {
+                        rnw = planes[rrow - width + x - 1] as i64
+                    }
+                    value = abs64(rv - clamped_gradient(rn, rw, rnw))
+                } else if p == PROP_WP_ERROR {
+                    value = wp.property
+                } else if p == PROP_N_NN {
+                    value = top - toptop
+                } else if p == PROP_W_WW {
+                    value = left - leftleft
+                } else if p == PROP_Y {
+                    value = y as i64
+                } else if p == PROP_X {
+                    value = x as i64
+                } else if p == PROP_ABS_N {
+                    value = abs64(top)
+                } else if p == PROP_ABS_W {
+                    value = abs64(left)
+                } else if p == PROP_N {
+                    value = top
+                } else if p == PROP_W {
+                    value = left
+                }
+                if value > tree.split[n] as i64 {
+                    n = tree.left[n] as usize
+                } else {
+                    n = tree.right[n] as usize
+                }
+            }
+            guess := guess_wp
+            if tree.predictor[n] != PRED_WEIGHTED as i32 {
+                guess = predict(tree.predictor[n], left, top, topleft)
+            }
+            e.feed(codes, w, tree.ctx[n] as usize, pack_signed((v - guess) / tree.mul[n] as i64))
+            if use_wp {
+                wp.update(v, x, y)
+            }
+        }
+    }
+}

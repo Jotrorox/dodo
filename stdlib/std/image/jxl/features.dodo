@@ -1,0 +1,750 @@
+package jxl
+
+import "std/image/convert"
+import "std/image/pixels"
+import "std/math"
+
+// Noise synthesis (libjxl dec_noise.cc, stage_noise.cc): per group, three
+// planes of uniform noise from an 8-lane XorShift128+ generator seeded by
+// the frame indices and the group position, a 5x5 high-pass convolution,
+// then noise scaled by the intensity-dependent LUT is added to X, Y and B.
+
+// shl for u64 that drops the bits shifted out.
+fn shl64(v: u64, n: u64) -> u64 {
+    return (v & ((1u64 << (64 - n)) - 1)) << n
+}
+
+fn splitmix64(seed: u64) -> u64 {
+    z := seed
+    z = core.wrapping_mul(z ^ (z >> 30), 0xBF58476D1CE4E5B9u64)
+    z = core.wrapping_mul(z ^ (z >> 27), 0x94D049BB133111EBu64)
+    return z ^ (z >> 31)
+}
+
+struct Rng {
+    s0: [8]u64
+    s1: [8]u64
+}
+
+fn rng_new(seed1: u32, seed2: u32, seed3: u32, seed4: u32) -> Rng {
+    rng := Rng { s0: [0u64; 8], s1: [0u64; 8] }
+    rng.s0[0] = splitmix64(core.wrapping_add(((seed1 as u64) << 32) + seed2 as u64, 0x9E3779B97F4A7C15u64))
+    rng.s1[0] = splitmix64(core.wrapping_add(((seed3 as u64) << 32) + seed4 as u64, 0x9E3779B97F4A7C15u64))
+    for i in 1usize..8 {
+        rng.s0[i] = splitmix64(rng.s0[i - 1])
+        rng.s1[i] = splitmix64(rng.s1[i - 1])
+    }
+    return rng
+}
+
+// 16 floats in [1, 2) from one step of the 8 generators.
+fn rng_fill(rng: &mut Rng, out: &mut[f32]) {
+    for i in 0usize..8 {
+        s1 := rng.s0[i]
+        s0 := rng.s1[i]
+        bits := core.wrapping_add(s1, s0)
+        rng.s0[i] = s0
+        s1 = s1 ^ shl64(s1, 23)
+        rng.s1[i] = s1 ^ (s0 ^ ((s1 >> 18) ^ (s0 >> 5)))
+        out[2 * i] = convert.f32_from_bits(0x3F800000u32 | ((bits & 0xffffffff) as u32 >> 9))
+        out[2 * i + 1] = convert.f32_from_bits(0x3F800000u32 | ((bits >> 32) as u32 >> 9))
+    }
+}
+
+// RandomImage(): rows of plane p (width fw) over [x0, x0 + xs) x [y0, y0 + ys).
+fn random_rect(rng: &mut Rng, noise: &mut[f32], p: usize, fw: usize, x0: usize, y0: usize, xs: usize, ys: usize) {
+    batch := [0.0f32; 16]
+    for y in 0usize..ys {
+        row := p + (y0 + y) * fw + x0
+        x := 0usize
+        for x + 16 < xs {
+            rng_fill(rng, &mut batch)
+            for i in 0usize..16 {
+                noise[row + x + i] = batch[i]
+            }
+            x += 16
+        }
+        rng_fill(rng, &mut batch)
+        i := 0usize
+        for x < xs {
+            noise[row + x] = batch[i]
+            x += 1
+            i += 1
+        }
+    }
+}
+
+// The noise strength for intensity x from the 8-point LUT.
+fn noise_strength(lut: &[f32], x: f32) -> f32 {
+    scaled := x * 6.0
+    if !(scaled > 0.0) {
+        scaled = 0.0
+    }
+    fl := 6.0f32
+    frac := 1.0f32
+    if scaled < 7.0 {
+        fl = math.floor(scaled as f64) as f32
+        frac = scaled - fl
+    }
+    i := fl as usize
+    if i > 6 {
+        i = 6
+    }
+    v := (lut[i + 1] - lut[i]) * frac + lut[i]
+    if v > 1.0 {
+        v = 1.0
+    }
+    if !(v > 0.0) {
+        v = 0.0
+    }
+    return v
+}
+
+// Add noise to the frame's color planes (after upsampling, before the
+// color transform). `noise` holds three frame-sized planes of scratch.
+fn render_noise(f: &FrameHeader, fb: &mut FloatBufs, lut: &[f32], visible: u32, nonvisible: u32, ytox: f32, ytob: f32) -> void!pixels.Error {
+    fw := fb.fw
+    fh := fb.fh
+    plane := fw * fh
+    if 3 * plane > fb.noise.len || 5 * (fw + 4) > fb.ftemp.len {
+        return err(pixels.Error.TooLarge)
+    }
+    any := false
+    for i in 0usize..8 {
+        if lut[i] != 0.0 {
+            any = true
+        }
+    }
+    if !any {
+        return ok()
+    }
+    gd := f.group_dim as usize
+    ups := f.upsampling as usize
+    for gy in 0usize..f.groups_y as usize {
+        for gx in 0usize..f.groups_x as usize {
+            for iy in 0usize..ups {
+                for ix in 0usize..ups {
+                    x0 := (gx * ups + ix) * gd
+                    y0 := (gy * ups + iy) * gd
+                    if x0 >= fw || y0 >= fh {
+                        continue
+                    }
+                    xs := fw - x0
+                    if xs > gd {
+                        xs = gd
+                    }
+                    ys := fh - y0
+                    if ys > gd {
+                        ys = gd
+                    }
+                    rng := rng_new(visible, nonvisible, x0 as u32, y0 as u32)
+                    for c in 0usize..3 {
+                        random_rect(&mut rng, fb.noise, c * plane, fw, x0, y0, xs, ys)
+                    }
+                }
+            }
+        }
+    }
+    // 5x5 convolution in place; the ring holds mirrored copies of the
+    // original rows y - 2 to y + 2.
+    pw := fw + 4
+    for c in 0usize..3 {
+        base := c * plane
+        for y in 0usize..fh + 2 {
+            // Load original row y (if any) into the ring before row y - 2
+            // is convolved.
+            if y < fh {
+                slot := (y % 5) * pw
+                for x in 0usize..pw {
+                    fb.ftemp[slot + x] = fb.noise[base + y * fw + mirror(x as i64 - 2, fw)]
+                }
+            }
+            if y < 2 {
+                continue
+            }
+            oy := y - 2
+            r0 := (mirror(oy as i64 - 2, fh) % 5) * pw
+            r1 := (mirror(oy as i64 - 1, fh) % 5) * pw
+            r2 := (oy % 5) * pw
+            r3 := (mirror(oy as i64 + 1, fh) % 5) * pw
+            r4 := (mirror(oy as i64 + 2, fh) % 5) * pw
+            for x in 0usize..fw {
+                others := 0.0f32
+                for i in 0usize..5 {
+                    others += fb.ftemp[r0 + x + i]
+                    others += fb.ftemp[r1 + x + i]
+                    others += fb.ftemp[r3 + x + i]
+                    others += fb.ftemp[r4 + x + i]
+                }
+                others += fb.ftemp[r2 + x]
+                others += fb.ftemp[r2 + x + 1]
+                others += fb.ftemp[r2 + x + 3]
+                others += fb.ftemp[r2 + x + 4]
+                fb.noise[base + oy * fw + x] = others * 0.16 + fb.ftemp[r2 + x + 2] * -3.84
+            }
+        }
+    }
+    for i in 0usize..plane {
+        vx := fb.frame[i]
+        vy := fb.frame[plane + i]
+        sg := noise_strength(lut, (vy - vx) * 0.5)
+        sr := noise_strength(lut, (vy + vx) * 0.5)
+        nr := fb.noise[i] * 0.22
+        ng := fb.noise[plane + i] * 0.22
+        nc := fb.noise[2 * plane + i] * 0.22
+        red := sr * (0.0078125 * nr + 0.9921875 * nc)
+        green := sg * (0.0078125 * ng + 0.9921875 * nc)
+        rg := red + green
+        fb.frame[i] = (ytox * rg + (red - green)) + vx
+        fb.frame[plane + i] = vy + rg
+        fb.frame[2 * plane + i] = ytob * rg + fb.frame[2 * plane + i]
+    }
+    return ok()
+}
+
+// Splines (libjxl splines.cc): quantized control points and DCT-coded
+// color / width along the curve, drawn as Gaussian segments every pixel of
+// arc length of the centripetal Catmull-Rom curve through the points.
+
+const MAX_SPLINES: usize = 65536
+const MAX_SPLINE_POINTS: usize = 65536
+// i32 words of spline storage: starting points and one spline's control
+// points.
+const SPLINE_WORDS: usize = 4 * 65536
+const SPLINE_POS_LIMIT: i64 = 8388608
+
+static CHANNEL_WEIGHT: [4]f32 = [0.0042, 0.075, 0.07, 0.3333]
+
+fn unpack_signed64(v: u32) -> i64 {
+    if (v & 1) == 0 {
+        return (v >> 1) as i64
+    }
+    return -((v >> 1) as i64) - 1
+}
+
+// libjxl FastCosf.
+fn fast_cosf(x: f32) -> f32 {
+    if !(x == x) || x > 1.0e30 || x < -1.0e30 {
+        return 0.0
+    }
+    pi := 3.14159265f32
+    pi2 := pi * 2.0
+    pi2_inv := 0.5f32 / pi
+    npi2 := math.floor((x * pi2_inv) as f64) as f32 * pi2
+    xmodpi2 := x - npi2
+    x_pi := xmodpi2
+    if pi2 - xmodpi2 < x_pi {
+        x_pi = pi2 - xmodpi2
+    }
+    above := x_pi >= pi / 2.0
+    x_pihalf := x_pi
+    if above {
+        x_pihalf = pi - x_pi
+    }
+    xs := x_pihalf * 0.25
+    x2 := xs * xs
+    x4 := x2 * x2
+    pre := x4 * 0.06960438 + (x2 * -0.84087373 + 1.68179268)
+    s1 := pre * pre + -1.414213562
+    s2 := s1 * s1 + -1.0
+    if above {
+        return -s2
+    }
+    return s2
+}
+
+// libjxl FastErff.
+fn fast_erff(x: f32) -> f32 {
+    a := x
+    if a < 0.0 {
+        a = -a
+    }
+    d1 := a * 0.0777394369 + 0.000205260015
+    d2 := d1 * a + 0.232120216
+    d3 := d2 * a + 0.277820801
+    d4 := d3 * a + 1.0
+    d5 := d4 * d4
+    inv := 1.0f32 / d5
+    result := 1.0 - inv * inv
+    if x <= 0.0 {
+        return -result
+    }
+    return result
+}
+
+fn continuous_idct(dct: &[f32], at: usize, t: f32) -> f32 {
+    sum := 0.0f32
+    th := t + 0.5
+    for i in 0usize..32 {
+        m := 3.14159265f32 / 32.0 * i as f32
+        sum += 1.41421356f32 * (dct[at + i] * fast_cosf(m * th))
+    }
+    return sum
+}
+
+fn llround(v: f32) -> i64 {
+    if !(v == v) {
+        return 0
+    }
+    if v > 1.0e18 {
+        return 1000000000000000000
+    }
+    if v < -1.0e18 {
+        return -1000000000000000000
+    }
+    if v >= 0.0 {
+        return math.floor(v as f64 + 0.5) as i64
+    }
+    return -(math.floor(-v as f64 + 0.5) as i64)
+}
+
+fn log32(v: f32) -> f32 {
+    match math.log(v as f64) {
+        ok(l) => {
+            return l as f32
+        }
+        err(_) => {
+            return 0.0
+        }
+    }
+}
+
+// One Gaussian segment at (cx, cy) drawn into the frame color planes.
+fn draw_segment(frame: &mut[f32], fw: usize, fh: usize, cx: f32, cy: f32, intensity: f32, color: &[f32], sigma: f32) {
+    inv_sigma := 1.0f32 / sigma
+    if !(sigma == sigma) || sigma == 0.0 || !(inv_sigma == inv_sigma) || inv_sigma > 3.4e38 || inv_sigma < -3.4e38 || !(intensity == intensity) || intensity > 3.4e38 || intensity < -3.4e38 {
+        return
+    }
+    max_color := 0.01f32
+    for c in 0usize..3 {
+        v := color[c] * intensity
+        if v < 0.0 {
+            v = -v
+        }
+        if v > max_color {
+            max_color = v
+        }
+    }
+    maxd := sqrt32(-2.0 * sigma * sigma * (log32(0.1) * 3.0 - log32(max_color)))
+    if !(maxd == maxd) {
+        return
+    }
+    y0 := llround(cy - maxd)
+    if y0 < 0 {
+        y0 = 0
+    }
+    y1 := llround(cy + maxd) + 1
+    if y1 > fh as i64 {
+        y1 = fh as i64
+    }
+    if y1 <= y0 {
+        return
+    }
+    start := llround(cx - maxd)
+    end := llround(cx + maxd)
+    if end < 0 || start >= fw as i64 {
+        return
+    }
+    x0 := start
+    if x0 < 0 {
+        x0 = 0
+    }
+    x1 := end + 1
+    if x1 > fw as i64 {
+        x1 = fw as i64
+    }
+    s4 := 0.25f32 * sigma * intensity
+    plane := fw * fh
+    for y in y0 as usize..y1 as usize {
+        dy := y as f32 - cy
+        for x in x0 as usize..x1 as usize {
+            dx := x as f32 - cx
+            distance := sqrt32(dx * dx + dy * dy)
+            one := fast_erff((distance * 0.5 + 0.353553391) * inv_sigma) - fast_erff((distance * 0.5 - 0.353553391) * inv_sigma)
+            local := s4 * (one * one)
+            at := y * fw + x
+            for c in 0usize..3 {
+                frame[c * plane + at] = color[c] * local + frame[c * plane + at]
+            }
+        }
+    }
+}
+
+fn hypot_sqrt(dx: f32, dy: f32) -> f32 {
+    h := 0.0f32
+    match math.sqrt(dx as f64 * dx as f64 + dy as f64 * dy as f64) {
+        ok(v) => {
+            h = v as f32
+        }
+        err(_) => {}
+    }
+    return sqrt32(h)
+}
+
+// Point k of the centripetal Catmull-Rom curve through control points
+// cp[0..n] (k in 0 .. (n - 1) * 16 + 1), into out[0], out[1].
+fn curve_point(cp: &[f32], n: usize, k: usize, out: &mut[f32]) {
+    if n == 1 || k == (n - 1) * 16 {
+        out[0] = cp[2 * (n - 1)]
+        out[1] = cp[2 * (n - 1) + 1]
+        return
+    }
+    start := k / 16
+    i := k % 16
+    if i == 0 {
+        out[0] = cp[2 * start]
+        out[1] = cp[2 * start + 1]
+        return
+    }
+    // The four points p[start - 1 .. start + 2], extended at the ends.
+    px := [0.0f32; 4]
+    py := [0.0f32; 4]
+    for j in 0usize..4 {
+        idx := start as i64 + j as i64 - 1
+        if idx < 0 {
+            px[j] = cp[0] + (cp[0] - cp[2])
+            py[j] = cp[1] + (cp[1] - cp[3])
+        } else if idx as usize >= n {
+            px[j] = cp[2 * (n - 1)] + (cp[2 * (n - 1)] - cp[2 * (n - 2)])
+            py[j] = cp[2 * (n - 1) + 1] + (cp[2 * (n - 1) + 1] - cp[2 * (n - 2) + 1])
+        } else {
+            px[j] = cp[2 * idx as usize]
+            py[j] = cp[2 * idx as usize + 1]
+        }
+    }
+    d := [0.0f32; 3]
+    t := [0.0f32; 4]
+    for j in 0usize..3 {
+        d[j] = hypot_sqrt(px[j + 1] - px[j], py[j + 1] - py[j])
+        t[j + 1] = t[j] + d[j]
+    }
+    tt := d[0] + (i as f32 / 16.0) * d[1]
+    ax := [0.0f32; 3]
+    ay := [0.0f32; 3]
+    for j in 0usize..3 {
+        s := (tt - t[j]) / d[j]
+        ax[j] = px[j] + s * (px[j + 1] - px[j])
+        ay[j] = py[j] + s * (py[j + 1] - py[j])
+    }
+    bx := [0.0f32; 2]
+    by := [0.0f32; 2]
+    for j in 0usize..2 {
+        s := (tt - t[j]) / (d[j] + d[j + 1])
+        bx[j] = ax[j] + s * (ax[j + 1] - ax[j])
+        by[j] = ay[j] + s * (ay[j + 1] - ay[j])
+    }
+    s := (tt - t[1]) / d[1]
+    out[0] = bx[0] + s * (bx[1] - bx[0])
+    out[1] = by[0] + s * (by[1] - by[0])
+}
+
+// Walk the curve one pixel of arc length at a time (libjxl
+// ForEachEquallySpacedPoint). Without `draw`, returns the arc length used
+// to place colors; with it, draws a segment at every point.
+fn walk_spline(frame: &mut[f32], fw: usize, fh: usize, cp: &[f32], n: usize, dct: &[f32], arc: f32, draw: bool) -> f32 {
+    total := (n - 1) * 16 + 1
+    cur := [0.0f32; 2]
+    nxt := [0.0f32; 2]
+    curve_point(cp, n, 0, &mut cur)
+    count := 0usize
+    last_mult := 1.0f32
+    inv_arc := 1.0f32 / arc
+    // Emit (cur, 1).
+    emit_x := cur[0]
+    emit_y := cur[1]
+    emit_m := 1.0f32
+    next := 0usize
+    prevx := cur[0]
+    prevy := cur[1]
+    for {
+        // Emit the pending point.
+        if draw {
+            progress := count as f32 * inv_arc
+            if progress > 1.0 {
+                progress = 1.0
+            }
+            color := [0.0f32; 3]
+            for c in 0usize..3 {
+                color[c] = continuous_idct(dct, c * 32, 31.0 * progress)
+            }
+            sigma := continuous_idct(dct, 96, 31.0 * progress)
+            draw_segment(frame, fw, fh, emit_x, emit_y, emit_m, &color, sigma)
+        }
+        count += 1
+        last_mult = emit_m
+        if next >= total {
+            break
+        }
+        // Advance from cur.
+        prevx = cur[0]
+        prevy = cur[1]
+        from_prev := 0.0f32
+        found := false
+        for next < total {
+            curve_point(cp, n, next, &mut nxt)
+            ddx := nxt[0] - prevx
+            ddy := nxt[1] - prevy
+            to_next := sqrt32(ddx * ddx + ddy * ddy)
+            if from_prev + to_next >= 1.0 {
+                s := (1.0 - from_prev) / to_next
+                cur[0] = prevx + s * ddx
+                cur[1] = prevy + s * ddy
+                emit_x = cur[0]
+                emit_y = cur[1]
+                emit_m = 1.0
+                found = true
+                break
+            }
+            from_prev += to_next
+            prevx = nxt[0]
+            prevy = nxt[1]
+            next += 1
+        }
+        if !found {
+            emit_x = prevx
+            emit_y = prevy
+            emit_m = from_prev
+            // Final point; afterwards the walk ends.
+            if draw {
+                progress := count as f32 * inv_arc
+                if progress > 1.0 {
+                    progress = 1.0
+                }
+                color := [0.0f32; 3]
+                for c in 0usize..3 {
+                    color[c] = continuous_idct(dct, c * 32, 31.0 * progress)
+                }
+                sigma := continuous_idct(dct, 96, 31.0 * progress)
+                draw_segment(frame, fw, fh, emit_x, emit_y, emit_m, &color, sigma)
+            }
+            count += 1
+            last_mult = emit_m
+            break
+        }
+    }
+    return (count - 2) as f32 + last_mult
+}
+
+// Parse the splines of LfGlobal; with `apply`, also draw them into the
+// color planes of `frame` (fw x fh), using sbuf (SPLINE_WORDS) and cpf
+// (2 * MAX_SPLINE_POINTS) as storage.
+fn splines(r: &mut Reader, f: &FrameHeader, tcode: &mut Code, n1: &mut Code, n2: &mut Code, window: &mut[u32], apply: bool, frame: &mut[f32], fw: usize, fh: usize, sbuf: &mut[i32], cpf: &mut[f32], ytox: f32, ytob: f32) -> void!pixels.Error {
+    read_code(r, 6, tcode, n1, n2, window)?
+    st := Stream.new(window)
+    st.begin(tcode, r)
+    num_pixels := f.sample_width as u64 * f.sample_height as u64
+    max_cp := num_pixels / 2
+    if max_cp > 1048576 {
+        max_cp = 1048576
+    }
+    count := tcode.read(&mut st, r, 2, 0) as u64
+    if count + 1 > max_cp {
+        return err(pixels.Error.Malformed)
+    }
+    count += 1
+    if apply && (count as usize > MAX_SPLINES || sbuf.len < SPLINE_WORDS || cpf.len < 2 * MAX_SPLINE_POINTS) {
+        return err(pixels.Error.TooLarge)
+    }
+    last_x := 0i64
+    last_y := 0i64
+    for i in 0usize..count as usize {
+        dx := tcode.read(&mut st, r, 1, 0)
+        dy := tcode.read(&mut st, r, 1, 0)
+        x := dx as i64
+        y := dy as i64
+        if i != 0 {
+            x = unpack_signed64(dx) + last_x
+            y = unpack_signed64(dy) + last_y
+        }
+        if x >= SPLINE_POS_LIMIT || x <= -SPLINE_POS_LIMIT || y >= SPLINE_POS_LIMIT || y <= -SPLINE_POS_LIMIT {
+            return err(pixels.Error.Malformed)
+        }
+        if apply {
+            sbuf[2 * i] = x as i32
+            sbuf[2 * i + 1] = y as i32
+        }
+        last_x = x
+        last_y = y
+        if r.overrun {
+            return err(pixels.Error.Truncated)
+        }
+    }
+    adjust := unpack_signed64(tcode.read(&mut st, r, 0, 0))
+    inv_quant := 0.0f32
+    if adjust >= 0 {
+        inv_quant = 1.0 / (1.0 + 0.125 * adjust as f32)
+    } else {
+        inv_quant = 1.0 - 0.125 * adjust as f32
+    }
+    image_size := f.width as u64 * f.height as u64
+    area_limit := 1024 * image_size + (1u64 << 32)
+    if area_limit > (1u64 << 42) {
+        area_limit = 1u64 << 42
+    }
+    total_area := 0u64
+    total_cp := count
+    cpbase := 2 * MAX_SPLINES
+    dctq := [0i32; 128]
+    dct := [0.0f32; 128]
+    for s in 0usize..count as usize {
+        ncp := tcode.read(&mut st, r, 3, 0) as u64
+        total_cp += ncp
+        if ncp > max_cp || total_cp > max_cp {
+            return err(pixels.Error.Malformed)
+        }
+        if apply && ncp as usize + 1 > MAX_SPLINE_POINTS {
+            return err(pixels.Error.TooLarge)
+        }
+        // Control points: deltas of deltas from the starting point.
+        cur_x := 0i64
+        cur_y := 0i64
+        if apply {
+            cur_x = sbuf[2 * s] as i64
+            cur_y = sbuf[2 * s + 1] as i64
+            sbuf[cpbase] = cur_x as i32
+            sbuf[cpbase + 1] = cur_y as i32
+        }
+        delta_x := 0i64
+        delta_y := 0i64
+        manhattan := 0u64
+        for k in 0usize..ncp as usize {
+            ddx := unpack_signed64(tcode.read(&mut st, r, 4, 0))
+            ddy := unpack_signed64(tcode.read(&mut st, r, 4, 0))
+            if ddx >= 1073741824 || ddx <= -1073741824 || ddy >= 1073741824 || ddy <= -1073741824 {
+                return err(pixels.Error.Malformed)
+            }
+            delta_x += ddx
+            delta_y += ddy
+            adx := delta_x
+            if adx < 0 {
+                adx = -adx
+            }
+            ady := delta_y
+            if ady < 0 {
+                ady = -ady
+            }
+            manhattan += (adx + ady) as u64
+            if manhattan > area_limit || adx >= SPLINE_POS_LIMIT || ady >= SPLINE_POS_LIMIT {
+                return err(pixels.Error.Malformed)
+            }
+            cur_x += delta_x
+            cur_y += delta_y
+            if apply {
+                if cur_x >= SPLINE_POS_LIMIT || cur_x <= -SPLINE_POS_LIMIT || cur_y >= SPLINE_POS_LIMIT || cur_y <= -SPLINE_POS_LIMIT {
+                    return err(pixels.Error.Malformed)
+                }
+                sbuf[cpbase + 2 * (k + 1)] = cur_x as i32
+                sbuf[cpbase + 2 * (k + 1) + 1] = cur_y as i32
+            }
+            if r.overrun {
+                return err(pixels.Error.Truncated)
+            }
+        }
+        for i in 0usize..128 {
+            v := tcode.read(&mut st, r, 5, 0)
+            if v == 0xffffffff {
+                return err(pixels.Error.Malformed)
+            }
+            dctq[i] = unpack_signed64(v) as i32
+        }
+        if r.overrun {
+            return err(pixels.Error.Truncated)
+        }
+        if !apply {
+            continue
+        }
+        // Dequantize, and bound the area the spline can cover.
+        for c in 0usize..4 {
+            for i in 0usize..32 {
+                inv_dct := 1.0f32
+                if i == 0 {
+                    inv_dct = 0.70710678
+                }
+                dct[c * 32 + i] = dctq[c * 32 + i] as f32 * inv_dct * CHANNEL_WEIGHT[c] * inv_quant
+            }
+        }
+        for i in 0usize..32 {
+            dct[i] += ytox * dct[32 + i]
+            dct[64 + i] += ytob * dct[32 + i]
+        }
+        col := [0u64; 3]
+        for c in 0usize..3 {
+            for i in 0usize..32 {
+                v := dctq[c * 32 + i] as f32
+                if v < 0.0 {
+                    v = -v
+                }
+                col[c] += math.ceil((inv_quant * v) as f64) as u64
+            }
+        }
+        ax := ytox
+        if ax < 0.0 {
+            ax = -ax
+        }
+        ab := ytob
+        if ab < 0.0 {
+            ab = -ab
+        }
+        col[0] += math.ceil(ax as f64) as u64 * col[1]
+        col[2] += math.ceil(ab as f64) as u64 * col[1]
+        maxc := col[0]
+        if col[1] > maxc {
+            maxc = col[1]
+        }
+        if col[2] > maxc {
+            maxc = col[2]
+        }
+        lc := maxc + 1
+        logcolor := floor_log2(lc) as u64
+        if (lc & (lc - 1)) != 0 {
+            logcolor += 1
+        }
+        if logcolor < 1 {
+            logcolor = 1
+        }
+        mdist := manhattan
+        if mdist < 1 {
+            mdist = 1
+        }
+        weight_limit := math.ceil(sqrt32((area_limit as f32 / logcolor as f32) / mdist as f32) as f64) as f32
+        width_estimate := 0u64
+        for i in 0usize..32 {
+            v := dctq[96 + i] as f32
+            if v < 0.0 {
+                v = -v
+            }
+            wf := math.ceil((inv_quant * v) as f64) as f32
+            if wf < 1.0 {
+                wf = 1.0
+            }
+            if wf > weight_limit {
+                wf = weight_limit
+            }
+            w := wf as u64
+            width_estimate += w * w * logcolor
+        }
+        total_area += width_estimate * manhattan
+        if total_area > area_limit {
+            return err(pixels.Error.Malformed)
+        }
+        n := ncp as usize + 1
+        if 2 * n > sbuf.len - cpbase {
+            return err(pixels.Error.TooLarge)
+        }
+        for k in 1usize..n {
+            if sbuf[cpbase + 2 * k] == sbuf[cpbase + 2 * k - 2] && sbuf[cpbase + 2 * k + 1] == sbuf[cpbase + 2 * k - 1] {
+                return err(pixels.Error.Malformed)
+            }
+        }
+        for k in 0usize..2 * n {
+            cpf[k] = sbuf[cpbase + k] as f32
+        }
+        arc := walk_spline(frame, fw, fh, cpf, n, &dct, 1.0, false)
+        if !(arc > 0.0) {
+            continue
+        }
+        walk_spline(frame, fw, fh, cpf, n, &dct, arc, true)
+    }
+    st.finish(tcode)?
+    return ok()
+}

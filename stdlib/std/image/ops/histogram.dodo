@@ -1,0 +1,152 @@
+package ops
+
+import "std/image/convert"
+import "std/image/pixels"
+
+// Histograms and simple channel statistics.
+//
+// Pixels are read as straight 16-bit RGBA like everywhere in ops (gray
+// replicated, 8-bit samples times 257, floats clamped to 0.0..1.0); luma is
+// BT.709 (convert.luma16). A histogram with N bins puts 16-bit value v into
+// bin v * N / 65536, so 256 bins of an 8-bit image count each 8-bit value
+// separately. Counts saturate at 2^32 - 1.
+
+pub enum Channel {
+    Red,
+    Green,
+    Blue,
+    Alpha,
+    Luma
+}
+
+fn channel_index(channel: &Channel) -> usize {
+    match channel {
+        Channel.Red => {
+            return 0
+        }
+        Channel.Green => {
+            return 1
+        }
+        Channel.Blue => {
+            return 2
+        }
+        Channel.Alpha => {
+            return 3
+        }
+        Channel.Luma => {
+            return 4
+        }
+    }
+}
+
+// The smallest and largest value of a channel, in 16-bit units.
+pub struct Range {
+    pub min: u32
+    pub max: u32
+}
+
+// Running statistics of one channel.
+struct Scan {
+    min: u32
+    max: u32
+    sum: Wide
+}
+
+fn value_of(wide: &[u16], i: usize, index: usize) -> u32 {
+    o := i * 4
+    if index == 4 {
+        return convert.luma16(wide[o] as u32, wide[o + 1] as u32, wide[o + 2] as u32)
+    }
+    return wide[o + index] as u32
+}
+
+// Count the values of one channel of `source` into bins (cleared first;
+// bins.len is the bin count). Malformed when bins is empty.
+pub fn histogram(source: &pixels.View, channel: Channel, bins: &mut[u32]) -> void!pixels.Error {
+    if bins.len == 0 {
+        return err(pixels.Error.Malformed)
+    }
+    for i in 0usize..bins.len {
+        bins[i] = 0
+    }
+    index := channel_index(&channel)
+    layout := source.layout().clone()
+    width := source.width() as usize
+    count_bins := bins.len as u64
+    wide := [0u16; 256]
+    for y in 0u32..source.height() {
+        line := source.row(y)
+        x := 0usize
+        for x < width {
+            count := width - x
+            if count > BATCH {
+                count = BATCH
+            }
+            convert.load_rgba16(line, &layout, x, count, &mut wide)
+            for i in 0usize..count {
+                bin := ((value_of(&wide, i, index) as u64 * count_bins) >> 16) as usize
+                if bins[bin] < 0xffffffff {
+                    bins[bin] += 1
+                }
+            }
+            x += count
+        }
+    }
+    return ok()
+}
+
+// The histogram of BT.709 luma.
+pub fn luma_histogram(source: &pixels.View, bins: &mut[u32]) -> void!pixels.Error {
+    return histogram(source, Channel.Luma, bins)
+}
+
+fn scan(source: &pixels.View, index: usize) -> Scan {
+    result := Scan { min: 65535, max: 0, sum: Wide.zero() }
+    layout := source.layout().clone()
+    width := source.width() as usize
+    wide := [0u16; 256]
+    for y in 0u32..source.height() {
+        line := source.row(y)
+        row_sum := 0u64
+        x := 0usize
+        for x < width {
+            count := width - x
+            if count > BATCH {
+                count = BATCH
+            }
+            convert.load_rgba16(line, &layout, x, count, &mut wide)
+            for i in 0usize..count {
+                v := value_of(&wide, i, index)
+                if v < result.min {
+                    result.min = v
+                }
+                if v > result.max {
+                    result.max = v
+                }
+                row_sum += v as u64
+            }
+            x += count
+        }
+        result.sum.add(row_sum)
+    }
+    return result
+}
+
+// The smallest and largest value of a channel. Malformed for an empty
+// image.
+pub fn channel_range(source: &pixels.View, channel: Channel) -> Range!pixels.Error {
+    if source.width() == 0 || source.height() == 0 {
+        return err(pixels.Error.Malformed)
+    }
+    result := scan(source, channel_index(&channel))
+    return ok(Range { min: result.min, max: result.max })
+}
+
+// The mean of a channel from 0.0 to 1.0. Malformed for an empty image.
+pub fn mean(source: &pixels.View, channel: Channel) -> f64!pixels.Error {
+    if source.width() == 0 || source.height() == 0 {
+        return err(pixels.Error.Malformed)
+    }
+    result := scan(source, channel_index(&channel))
+    return ok(result.sum.to_f64() / (source.width() as f64 * source.height() as f64) / 65535.0)
+}

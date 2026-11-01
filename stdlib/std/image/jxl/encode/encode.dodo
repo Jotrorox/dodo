@@ -1,0 +1,506 @@
+package encode
+
+import "core/slice"
+import "std/image/color"
+import "std/image/pixels"
+import "std/image/shared/binary"
+import "std/image/shared/scratch"
+
+// JPEG XL lossless encoder: pure Dodo, no allocation, integer-only, with
+// byte-identical output on every target.
+//
+// Design
+//
+// Output is one lossless modular frame (not XYB) as a bare codestream, or in
+// the ISOBMFF container (signature, ftyp, optional jxll/Exif/xml boxes, then
+// jxlc) when asked for or when metadata is attached. Samples keep their
+// precision: U8 and U16 become 8 and 16-bit integer samples; F16 and F32
+// become 16 and 32-bit float samples whose bit patterns are coded exactly.
+// Alpha is an extra channel; premultiplied input is stored unchanged and
+// flagged alpha_associated.
+//
+// Bitstream: 256x256 groups. A single-group image is one section. Larger
+// images get a TOC with LfGlobal (MA tree, prefix codes, palette and the
+// global transform header), empty LF group and HfGlobal sections, and one
+// section per group with its rectangle of every channel. One global tree
+// and one set of clustered prefix codes (hybrid integers 4/2/0) serve all
+// groups; they come from a first pass that counts symbols over the whole
+// image, and a second pass writes each group independently. Runs of equal
+// residuals become LZ77 copies at distance 1 (RLE). Channels whose samples
+// share a factor (8-bit data * 257, 12-bit data * 16) code residuals
+// divided by it through the tree leaf multiplier.
+//
+// Effort:
+//   1: fjxl-like: YCoCg for RGB, the clamped gradient predictor, one context
+//      per channel, at most 8 prefix codes.
+//   2: palette (up to 1024 colors), the best of three color transforms, the
+//      best of gradient/W/N per channel, contexts from the local gradients
+//      W-NW and NW-N (and the previous channel's residual), up to 32
+//      clustered codes. Choices are estimated by coding sample bands of the
+//      image with the real model.
+//   3+: nine color transforms, more predictors including the weighted
+//      (self-correcting) predictor with contexts on its error, and four
+//      times the sample.
+//
+// Memory: encode_scratch_size() bytes of scratch, carved into the i32
+// planes of one group (all channels; 256x256 at most), the context
+// histograms (256 contexts x 272 symbols), cluster sums, prefix code
+// tables, the palette hash and the TOC sizes (4 bytes per group). Planes are
+// bounded by the group size, so scratch stays between about 0.5 and 1.5 MiB
+// for any image. max_encoded_size() bounds the output.
+
+// Default effort for EncodeOptions.new().
+pub const DEFAULT_EFFORT: u32 = 2
+
+// Encoder settings.
+pub struct EncodeOptions {
+    // 1 (fastest) to 9; values above 3 currently behave like 3, 0 like 1.
+    pub effort: u32
+    // Wrap the codestream in the ISOBMFF container. Implied when metadata
+    // is attached (encode_with_metadata).
+    pub container: bool
+    // Color description written as the JPEG XL color encoding: CICP
+    // primaries and transfer (sRGB, linear, BT.709/601/2020 curves, PQ, HLG,
+    // DCI, power-law gamma; BT.709, BT.2020, Display P3, DCI-P3 or custom
+    // chromaticities). Unrepresentable values fall back to sRGB; ICC
+    // profiles are not embedded.
+    pub color: color.ColorInfo
+    pub orientation: color.Orientation
+
+    pub fn new() -> EncodeOptions {
+        return EncodeOptions { effort: DEFAULT_EFFORT, container: false, color: color.ColorInfo.srgb(), orientation: color.Orientation.Identity }
+    }
+}
+
+// Metadata stored in container boxes. Kept apart from EncodeOptions so the
+// options hold no borrows.
+pub struct Metadata {
+    // EXIF payload starting at the TIFF header ("II*\0" or "MM\0*"), or
+    // with a leading "Exif\0\0"; stored in an "Exif" box. Empty for none.
+    pub exif: &[u8]
+    // XMP packet, stored in an "xml " box. Empty for none.
+    pub xmp: &[u8]
+
+    pub fn new(exif: &[u8], xmp: &[u8]) -> Metadata from(exif, xmp) {
+        return Metadata { exif: exif, xmp: xmp }
+    }
+}
+
+// Layout and modelling decisions for one encode.
+struct Plan {
+    width: usize
+    height: usize
+    // Source channels (1 to 4) and color channels (1 or 3).
+    channels: usize
+    color_channels: usize
+    alpha: bool
+    sample: u32
+    bits: u32
+    float: bool
+    premultiplied: bool
+    // Reversible color transform type (0..41) or -1.
+    rct: i32
+    // Palette colors, 0 for none.
+    palette: usize
+    // Channels of the modular image after transforms (palette: meta + index).
+    modular_channels: usize
+    predictors: [5]u32
+    // Predictor fixed for correctness (mixed-sign float channels).
+    locked: [5]bool
+    // Per source channel: a common factor of every sample (usually 1).
+    source_factors: [4]u32
+    groups_x: usize
+    groups_y: usize
+    lf_groups: usize
+    effort: u32
+    lz77: bool
+    min_length: usize
+    // Use activity contexts (effort 2+).
+    contexts: bool
+    // The chroma subtrees may test the previous channel's residual.
+    refs: bool
+}
+
+fn new_plan(width: u32, height: u32, layout: &pixels.Layout, effort: u32) -> Plan {
+    channels := layout.channel_count()
+    sample := layout.sample_code()
+    bits := 8u32
+    if sample == pixels.SAMPLE_U16 || sample == pixels.SAMPLE_F16 {
+        bits = 16
+    } else if sample == pixels.SAMPLE_F32 {
+        bits = 32
+    }
+    color_channels := 1usize
+    if channels >= 3 {
+        color_channels = 3
+    }
+    e := effort
+    if e == 0 {
+        e = 1
+    }
+    if e > 3 {
+        e = 3
+    }
+    w := width as usize
+    h := height as usize
+    rct := -1i32
+    if color_channels == 3 && sample != pixels.SAMPLE_F32 {
+        rct = 6
+    }
+    return Plan { width: w, height: h, channels: channels, color_channels: color_channels, alpha: channels == 2 || channels == 4, sample: sample, bits: bits, float: sample >= pixels.SAMPLE_F16, premultiplied: layout.premultiplied && (channels == 2 || channels == 4), rct: rct, palette: 0, modular_channels: channels, predictors: [5u32; 5], locked: [false; 5], source_factors: [1u32; 4], groups_x: (w + 255) / 256, groups_y: (h + 255) / 256, lf_groups: ((w + 2047) / 2048) * ((h + 2047) / 2048), effort: e, lz77: true, min_length: 7, contexts: e >= 2 && sample != pixels.SAMPLE_F32, refs: e >= 2 && sample != pixels.SAMPLE_F32 }
+}
+
+fn group_count(width: usize, height: usize) -> usize {
+    return ((width + 255) / 256) * ((height + 255) / 256)
+}
+
+// TOC entries: one for a single-group image, else LfGlobal, the LF groups,
+// HfGlobal and every group.
+fn toc_entries(width: usize, height: usize) -> usize {
+    groups := group_count(width, height)
+    if groups == 1 {
+        return 1
+    }
+    return 2 + ((width + 2047) / 2048) * ((height + 2047) / 2048) + groups
+}
+
+fn check_size(width: u32, height: u32) -> void!pixels.Error {
+    if width == 0 || height == 0 {
+        return err(pixels.Error.Malformed)
+    }
+    return binary.check_dimensions(width, height)
+}
+
+// Bytes of container boxes before the codestream.
+fn container_prefix(options: &EncodeOptions, exif: &[u8], xmp: &[u8], codestream_bound: usize, level10: bool) -> usize!pixels.Error {
+    if !options.container && exif.len == 0 && xmp.len == 0 {
+        return ok(0)
+    }
+    total := 12usize + 20
+    if level10 {
+        total += 9
+    }
+    if exif.len > 0 {
+        total = pixels.checked(1, total, exif.len + 12)?
+    }
+    if xmp.len > 0 {
+        total = pixels.checked(1, total, xmp.len + 8)?
+    }
+    if codestream_bound + 8 > 0xFFFFFFFF {
+        total += 16
+    } else {
+        total += 8
+    }
+    return ok(total)
+}
+
+// Level 5 allows integer samples up to 16 bits and moderate dimensions;
+// anything else announces level 10 in the container.
+fn needs_level10(width: u32, height: u32, layout: &pixels.Layout) -> bool {
+    if layout.sample_code() == pixels.SAMPLE_F32 {
+        return true
+    }
+    return width > 262144 || height > 262144 || width as u64 * height as u64 > 268435456
+}
+
+// Worst-case bits per sample: a 15-bit prefix code plus the hybrid integer
+// extra bits of the largest residual (8 or 16-bit samples after a color
+// transform give residuals below 2^(bits + 2), with margin for the weighted
+// predictor), or 30 bits for 32-bit float patterns.
+fn sample_bound_bits(layout: &pixels.Layout) -> usize {
+    code := layout.sample_code()
+    if code == pixels.SAMPLE_U8 {
+        return 15 + 8 + 2
+    }
+    if code == pixels.SAMPLE_F32 {
+        return 15 + 30
+    }
+    return 15 + 16 + 2
+}
+
+fn codestream_bound(width: u32, height: u32, layout: &pixels.Layout) -> usize!pixels.Error {
+    check_size(width, height)?
+    w := width as usize
+    h := height as usize
+    samples := pixels.checked(binary.pixel_count(width, height)?, layout.channel_count(), MAX_PALETTE * 4)?
+    data := pixels.checked(samples, sample_bound_bits(layout), 7)? / 8
+    // Headers, tree, prefix codes and per-section padding.
+    overhead := pixels.checked(toc_entries(w, h), 8, 65536)?
+    return pixels.checked(1, data, overhead)
+}
+
+// An upper bound on the bytes encode() writes for this image and options.
+// It is a worst case (about 3 bytes per 8-bit sample); typical output is
+// far smaller, and encode() reports BufferTooSmall rather than overrunning a
+// smaller buffer.
+pub fn max_encoded_size(width: u32, height: u32, layout: &pixels.Layout, options: &EncodeOptions) -> usize!pixels.Error {
+    bound := codestream_bound(width, height, layout)?
+    prefix := container_prefix(options, b"", b"", bound, needs_level10(width, height, layout))?
+    return pixels.checked(1, bound, prefix)
+}
+
+// max_encoded_size() including the metadata boxes.
+pub fn max_encoded_size_with_metadata(width: u32, height: u32, layout: &pixels.Layout, options: &EncodeOptions, metadata: &Metadata) -> usize!pixels.Error {
+    bound := codestream_bound(width, height, layout)?
+    prefix := container_prefix(options, metadata.exif, metadata.xmp, bound, needs_level10(width, height, layout))?
+    return pixels.checked(1, bound, prefix)
+}
+
+// Scratch sizes in elements.
+fn plane_words(width: u32, height: u32, layout: &pixels.Layout) -> usize {
+    gw := width as usize
+    if gw > 256 {
+        gw = 256
+    }
+    gh := height as usize
+    if gh > 256 {
+        gh = 256
+    }
+    return layout.channel_count() * gw * gh + 4 * MAX_PALETTE
+}
+
+const HIST_WORDS: usize = MAX_CONTEXTS * MAX_ALPHA
+const SUM_WORDS: usize = MAX_CLUSTERS * MAX_ALPHA
+
+// Bytes of scratch encode() needs for this image and options.
+pub fn encode_scratch_size(width: u32, height: u32, layout: &pixels.Layout, options: &EncodeOptions) -> usize!pixels.Error {
+    check_size(width, height)?
+    total := scratch.size(plane_words(width, height, layout), 4)?
+    total = scratch.add(total, scratch.size(HIST_WORDS, 4)?)?
+    total = scratch.add(total, scratch.size(SUM_WORDS, 4)?)?
+    total = scratch.add(total, scratch.size(MAX_CONTEXTS, 4)?)?
+    total = scratch.add(total, scratch.size(SUM_WORDS, 2)?)?
+    total = scratch.add(total, scratch.size(SUM_WORDS + MAX_CONTEXTS, 1)?)?
+    total = scratch.add(total, scratch.size(PALETTE_WORDS, 4)?)?
+    total = scratch.add(total, scratch.size(toc_entries(width as usize, height as usize), 4)?)?
+    return ok(total)
+}
+
+// Encode `source` as a lossless JPEG XL file into `output`, returning the
+// byte count. Fails with BufferTooSmall when `scratch` is shorter than
+// encode_scratch_size() or the output does not fit, and Malformed for an
+// empty image.
+pub fn encode(source: &pixels.View, options: &EncodeOptions, output: &mut[u8], scratch_bytes: &mut[u8]) -> usize!pixels.Error {
+    return encode_boxes(source, options, b"", b"", output, scratch_bytes)
+}
+
+// encode() with EXIF and/or XMP boxes; the output uses the container when
+// either is present. Size the output with max_encoded_size_with_metadata().
+pub fn encode_with_metadata(source: &pixels.View, options: &EncodeOptions, metadata: &Metadata, output: &mut[u8], scratch_bytes: &mut[u8]) -> usize!pixels.Error {
+    return encode_boxes(source, options, metadata.exif, metadata.xmp, output, scratch_bytes)
+}
+
+fn encode_boxes(source: &pixels.View, options: &EncodeOptions, exif: &[u8], xmp: &[u8], output: &mut[u8], scratch_bytes: &mut[u8]) -> usize!pixels.Error {
+    width := source.width()
+    height := source.height()
+    layout := source.layout()
+    check_size(width, height)?
+    need := encode_scratch_size(width, height, layout, options)?
+    if scratch_bytes.len < need {
+        return err(pixels.Error.BufferTooSmall)
+    }
+    let slice.SplitMut { left: plane_bytes, right: rest1 } = scratch.split(scratch_bytes, scratch.size(plane_words(width, height, layout), 4)?)?
+    let slice.SplitMut { left: hist_bytes, right: rest2 } = scratch.split(rest1, scratch.size(HIST_WORDS, 4)?)?
+    let slice.SplitMut { left: sum_bytes, right: rest3 } = scratch.split(rest2, scratch.size(SUM_WORDS, 4)?)?
+    let slice.SplitMut { left: choice_bytes, right: rest4 } = scratch.split(rest3, scratch.size(MAX_CONTEXTS, 4)?)?
+    let slice.SplitMut { left: code_bytes, right: rest5 } = scratch.split(rest4, scratch.size(SUM_WORDS, 2)?)?
+    let slice.SplitMut { left: small_bytes, right: rest6 } = scratch.split(rest5, scratch.size(SUM_WORDS + MAX_CONTEXTS, 1)?)?
+    let slice.SplitMut { left: palette_bytes, right: toc_bytes } = scratch.split(rest6, scratch.size(PALETTE_WORDS, 4)?)?
+    let slice.SplitMut { left: lengths, right: map } = scratch.split(small_bytes, SUM_WORDS)?
+    planes := scratch.i32s(plane_bytes)
+    hist := scratch.u32s(hist_bytes)
+    sums := scratch.u32s(sum_bytes)
+    choice := scratch.u32s(choice_bytes)
+    codes := scratch.u16s(code_bytes)
+    words := scratch.u32s(palette_bytes)
+    sizes := scratch.u32s(toc_bytes)
+
+    plan := new_plan(width, height, layout, options.effort)
+    analyze(source, &mut plan, planes, hist, words)
+    tree := Tree.new()
+    build_tree(&plan, &mut tree)
+    tree_ctxs := [0u8; 2560]
+    tree_values := [0u32; 2560]
+    tree_tokens := tree.serialize(&mut tree_ctxs, &mut tree_values)
+    contexts := tree.contexts
+    if plan.lz77 {
+        contexts += 1
+    }
+
+    // Pass 1: count symbols over the whole image.
+    for i in 0usize..contexts * MAX_ALPHA {
+        hist[i] = 0
+    }
+    set := CodeSet { map: map, lengths: lengths, codes: codes, contexts: contexts, clusters: 1, alphabets: [0u16; 32], singles: [false; 32], split: LIT_SPLIT, msb: LIT_MSB, lsb: LIT_LSB, lz77: plan.lz77, min_length: plan.min_length as u32 }
+    {
+        empty := [0u8; 1]
+        dummy := BitWriter.new(&mut empty, 1)
+        e := Emitter { counting: true, hist: &mut hist[..], split: LIT_SPLIT, msb: LIT_MSB, lsb: LIT_LSB, lz77: plan.lz77, min_length: plan.min_length, dist_ctx: tree.contexts, run_value: 0, run_count: 0, run_ctx: [0u16; 16] }
+        code_image(source, &plan, &tree, planes, words, &mut e, &set, &mut dummy, false)
+    }
+    // Cluster the context histograms and build prefix codes.
+    limit := MAX_CLUSTERS
+    if plan.effort == 1 {
+        limit = 8
+    }
+    set.clusters = cluster_histograms(hist, contexts, limit, set.map, sums, choice)
+    set.build(sums)
+
+    // Pass 2: write.
+    level10 := needs_level10(width, height, layout)
+    bound := codestream_bound(width, height, layout)?
+    base := container_prefix(options, exif, xmp, bound, level10)?
+    if output.len < base {
+        return err(pixels.Error.BufferTooSmall)
+    }
+    shape := Shape { width: width, height: height, color_channels: plan.color_channels, alpha: plan.alpha, bits: plan.bits, float: plan.float, alpha_associated: plan.premultiplied, orientation: color.exif_value(&options.orientation) }
+    entries := toc_entries(plan.width, plan.height)
+    // First attempt: leave room for the largest TOC, write the sections,
+    // then move them down behind the real TOC.
+    reserve := 4 * entries + 1
+    toc_start := 0usize
+    end := 0usize
+    overflow := false
+    {
+        w := BitWriter.new(output, base)
+        write_image_header(&mut w, &shape, &options.color)
+        write_frame_header(&mut w, plan.alpha)
+        toc_start = w.pos
+        w.pos = toc_start + reserve
+        write_sections(source, &plan, &tree, planes, words, &tree_ctxs, &tree_values, tree_tokens, &set, &mut hist[..], sizes, &mut w)
+        end = w.pos
+        overflow = w.overflow
+    }
+    toc_bits := 0usize
+    for i in 0usize..entries {
+        toc_bits += toc_entry_bits(sizes[i]) as usize
+    }
+    toc_used := (toc_bits + 7) / 8
+    final_end := end - (reserve - toc_used)
+    if final_end > output.len {
+        return err(pixels.Error.BufferTooSmall)
+    }
+    if overflow {
+        // The output fits only without the TOC slack: write again with the
+        // TOC (sizes now known) in place.
+        w := BitWriter.new(output, base)
+        write_image_header(&mut w, &shape, &options.color)
+        write_frame_header(&mut w, plan.alpha)
+        for i in 0usize..entries {
+            write_toc_entry(&mut w, sizes[i])
+        }
+        w.pad()
+        write_sections(source, &plan, &tree, planes, words, &tree_ctxs, &tree_values, tree_tokens, &set, &mut hist[..], sizes, &mut w)
+        if w.overflow || w.pos != final_end {
+            return err(pixels.Error.BufferTooSmall)
+        }
+    } else {
+        from_at := toc_start + reserve
+        to_at := toc_start + toc_used
+        for i in 0usize..end - from_at {
+            output[to_at + i] = output[from_at + i]
+        }
+        w := BitWriter.new(output, toc_start)
+        for i in 0usize..entries {
+            write_toc_entry(&mut w, sizes[i])
+        }
+        w.pad()
+    }
+    codestream := final_end - base
+    if base > 0 {
+        write_container(exif, xmp, output, base, codestream, level10)
+    }
+    return ok(base + codestream)
+}
+
+// LfGlobal (default LF dequantization, then GlobalModular: tree, codes and
+// the global stream), the empty LF group and HfGlobal sections, and the
+// groups, recording every section's byte size.
+fn write_sections(source: &pixels.View, plan: &Plan, tree: &Tree, planes: &mut[i32], words: &[u32], tree_ctxs: &[u8], tree_values: &[u32], tree_tokens: usize, set: &CodeSet, hist: &mut[u32], sizes: &mut[u32], w: &mut BitWriter) {
+    section := w.pos
+    w.write(1, 1)
+    w.write(1, 1)
+    write_tree(w, tree_ctxs, tree_values, tree_tokens)
+    set.write(w)
+    e := Emitter { counting: false, hist: hist, split: LIT_SPLIT, msb: LIT_MSB, lsb: LIT_LSB, lz77: plan.lz77, min_length: plan.min_length, dist_ctx: tree.contexts, run_value: 0, run_count: 0, run_ctx: [0u16; 16] }
+    code_global(source, plan, tree, planes, words, &mut e, set, w)
+    w.pad()
+    sizes[0] = (w.pos - section) as u32
+    if single_group(plan) {
+        return
+    }
+    at := 1usize
+    for i in 0usize..plan.lf_groups + 1 {
+        sizes[at] = 0
+        at += 1
+    }
+    for g in 0usize..plan.groups_x * plan.groups_y {
+        section = w.pos
+        code_group(source, plan, tree, planes, words, g, &mut e, set, w)
+        w.pad()
+        sizes[at] = (w.pos - section) as u32
+        at += 1
+    }
+}
+fn write_container(exif: &[u8], xmp: &[u8], output: &mut[u8], base: usize, codestream: usize, level10: bool) {
+    at := 0usize
+    for i in 0usize..12 {
+        output[at + i] = SIGNATURE_BOX[i]
+    }
+    at += 12
+    for i in 0usize..20 {
+        output[at + i] = FTYP_BOX[i]
+    }
+    at += 20
+    if level10 {
+        put_box_header(output, at, 9, b"jxll")
+        output[at + 8] = 10
+        at += 9
+    }
+    if exif.len > 0 {
+        put_box_header(output, at, (exif.len + 12) as u32, b"Exif")
+        binary.put_be32(output, at + 8, exif_tiff_offset(exif))
+        at += 12
+        for i in 0usize..exif.len {
+            output[at + i] = exif[i]
+        }
+        at += exif.len
+    }
+    if xmp.len > 0 {
+        put_box_header(output, at, (xmp.len + 8) as u32, b"xml ")
+        at += 8
+        for i in 0usize..xmp.len {
+            output[at + i] = xmp[i]
+        }
+        at += xmp.len
+    }
+    if base - at == 16 {
+        put_box_header(output, at, 1, b"jxlc")
+        size := (codestream + 16) as u64
+        binary.put_be32(output, at + 8, (size >> 32) as u32)
+        binary.put_be32(output, at + 12, (size & 0xFFFFFFFF) as u32)
+    } else {
+        put_box_header(output, at, (codestream + 8) as u32, b"jxlc")
+    }
+}
+
+// The MA tree: its code spec (six contexts sharing one prefix code) and
+// tokens.
+fn write_tree(w: &mut BitWriter, ctxs: &[u8], values: &[u32], tokens: usize) {
+    freq := [0u32; 272]
+    for i in 0usize..tokens {
+        t := hybrid(values[i] as u64, 4, 2, 0)
+        freq[(t & 0xFFFF) as usize] += 1
+    }
+    map := [0u8; 6]
+    lengths := [0u8; 272]
+    codes := [0u16; 272]
+    set := CodeSet { map: &mut map, lengths: &mut lengths, codes: &mut codes, contexts: 6, clusters: 1, alphabets: [0u16; 32], singles: [false; 32], split: 4, msb: 2, lsb: 0, lz77: false, min_length: 0 }
+    set.build(&freq)
+    set.write(w)
+    for i in 0usize..tokens {
+        t := hybrid(values[i] as u64, 4, 2, 0)
+        set.put(w, ctxs[i] as usize, (t & 0xFFFF) as usize)
+        w.write(((t >> 16) & 255) as u32, t >> 24)
+    }
+}

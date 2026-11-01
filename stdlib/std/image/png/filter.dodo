@@ -1,0 +1,105 @@
+package png
+
+import "std/image/pixels"
+
+// Row filters (PNG section 7.3). Bytes are filtered against `a`, the
+// corresponding byte of the pixel on the left, `b` above and `c` above-left;
+// all three read as zero outside the image or pass.
+
+pub const FILTER_NONE: u32 = 0
+pub const FILTER_SUB: u32 = 1
+pub const FILTER_UP: u32 = 2
+pub const FILTER_AVERAGE: u32 = 3
+pub const FILTER_PAETH: u32 = 4
+// Pick the filter per row by the smallest sum of filtered bytes taken as
+// signed magnitudes, the usual heuristic.
+pub const FILTER_ADAPTIVE: u32 = 5
+
+// Undo the row filter in place. The rows start at `previous` and `current`
+// in `scratch`, each `length` bytes with the filter type first; `step` is the
+// distance to the corresponding byte of the pixel on the left.
+fn unfilter(scratch: &mut[u8], previous: usize, current: usize, length: usize, step: usize) -> void!pixels.Error {
+    filter := scratch[current]
+    p := previous + 1
+    c := current + 1
+    n := length - 1
+    lead := step
+    if lead > n {
+        lead = n
+    }
+    if filter == 0 {
+        return ok()
+    }
+    if filter == 1 {
+        for i in lead..n {
+            scratch[c + i] = core.wrapping_add(scratch[c + i], scratch[c + i - step])
+        }
+    } else if filter == 2 {
+        for i in 0usize..n {
+            scratch[c + i] = core.wrapping_add(scratch[c + i], scratch[p + i])
+        }
+    } else if filter == 3 {
+        for i in 0usize..lead {
+            scratch[c + i] = core.wrapping_add(scratch[c + i], scratch[p + i] >> 1)
+        }
+        for i in lead..n {
+            average := ((scratch[c + i - step] as u32 + scratch[p + i] as u32) >> 1) as u8
+            scratch[c + i] = core.wrapping_add(scratch[c + i], average)
+        }
+    } else if filter == 4 {
+        // With no pixel on the left, Paeth predicts the byte above.
+        for i in 0usize..lead {
+            scratch[c + i] = core.wrapping_add(scratch[c + i], scratch[p + i])
+        }
+        for i in lead..n {
+            predictor := paeth(scratch[c + i - step], scratch[p + i], scratch[p + i - step])
+            scratch[c + i] = core.wrapping_add(scratch[c + i], predictor)
+        }
+    } else {
+        return err(pixels.Error.Malformed)
+    }
+    return ok()
+}
+
+fn paeth(left: u8, above: u8, corner: u8) -> u8 {
+    a := left as i32
+    b := above as i32
+    c := corner as i32
+    estimate := a + b - c
+    da := estimate - a
+    db := estimate - b
+    dc := estimate - c
+    if da < 0 {
+        da = -da
+    }
+    if db < 0 {
+        db = -db
+    }
+    if dc < 0 {
+        dc = -dc
+    }
+    if da <= db && da <= dc {
+        return left
+    }
+    if db <= dc {
+        return above
+    }
+    return corner
+}
+
+// The byte filter type `filter` stores for raw byte x.
+fn filtered(filter: u32, x: u8, a: u8, b: u8, c: u8) -> u8 {
+    if filter == 1 {
+        return core.wrapping_sub(x, a)
+    }
+    if filter == 2 {
+        return core.wrapping_sub(x, b)
+    }
+    if filter == 3 {
+        return core.wrapping_sub(x, ((a as u32 + b as u32) >> 1) as u8)
+    }
+    if filter == 4 {
+        return core.wrapping_sub(x, paeth(a, b, c))
+    }
+    return x
+}

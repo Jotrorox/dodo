@@ -1,0 +1,92 @@
+package binary
+
+import "std/image/pixels"
+
+// Bounds-checked integer fields of untrusted file data. Reads past the end
+// fail with Truncated; writes assume the caller checked the output length.
+
+pub fn u8_at(data: &[u8], offset: usize) -> u8!pixels.Error {
+    if offset >= data.len {
+        return err(pixels.Error.Truncated)
+    }
+    return ok(data[offset])
+}
+
+pub fn be16(data: &[u8], offset: usize) -> u32!pixels.Error {
+    if offset > data.len || data.len - offset < 2 {
+        return err(pixels.Error.Truncated)
+    }
+    return ok(((data[offset] as u32) << 8) | (data[offset + 1] as u32))
+}
+
+pub fn be32(data: &[u8], offset: usize) -> u32!pixels.Error {
+    if offset > data.len || data.len - offset < 4 {
+        return err(pixels.Error.Truncated)
+    }
+    return ok(((data[offset] as u32) << 24) | ((data[offset + 1] as u32) << 16) | ((data[offset + 2] as u32) << 8) | (data[offset + 3] as u32))
+}
+
+pub fn be64(data: &[u8], offset: usize) -> u64!pixels.Error {
+    high := be32(data, offset)? as u64
+    low := be32(data, offset + 4)? as u64
+    return ok((high << 32) | low)
+}
+
+pub fn le16(data: &[u8], offset: usize) -> u32!pixels.Error {
+    if offset > data.len || data.len - offset < 2 {
+        return err(pixels.Error.Truncated)
+    }
+    return ok((data[offset] as u32) | ((data[offset + 1] as u32) << 8))
+}
+
+pub fn le32(data: &[u8], offset: usize) -> u32!pixels.Error {
+    if offset > data.len || data.len - offset < 4 {
+        return err(pixels.Error.Truncated)
+    }
+    return ok((data[offset] as u32) | ((data[offset + 1] as u32) << 8) | ((data[offset + 2] as u32) << 16) | ((data[offset + 3] as u32) << 24))
+}
+
+pub fn put_be16(output: &mut[u8], offset: usize, value: u32) {
+    output[offset] = ((value >> 8) & 255) as u8
+    output[offset + 1] = (value & 255) as u8
+}
+
+pub fn put_be32(output: &mut[u8], offset: usize, value: u32) {
+    output[offset] = (value >> 24) as u8
+    output[offset + 1] = ((value >> 16) & 255) as u8
+    output[offset + 2] = ((value >> 8) & 255) as u8
+    output[offset + 3] = (value & 255) as u8
+}
+
+pub fn put_le16(output: &mut[u8], offset: usize, value: u32) {
+    output[offset] = (value & 255) as u8
+    output[offset + 1] = ((value >> 8) & 255) as u8
+}
+
+pub fn put_le32(output: &mut[u8], offset: usize, value: u32) {
+    output[offset] = (value & 255) as u8
+    output[offset + 1] = ((value >> 8) & 255) as u8
+    output[offset + 2] = ((value >> 16) & 255) as u8
+    output[offset + 3] = (value >> 24) as u8
+}
+
+// The bytes data[offset..offset + length], or Truncated.
+pub fn range(data: &[u8], offset: usize, length: usize) -> &[u8]!pixels.Error from(data) {
+    if offset > data.len || length > data.len - offset {
+        return err(pixels.Error.Truncated)
+    }
+    return ok(&data[offset..offset + length])
+}
+
+// Width and height within pixels.MAX_DIMENSION, else TooLarge.
+pub fn check_dimensions(width: u32, height: u32) -> void!pixels.Error {
+    if width > pixels.MAX_DIMENSION || height > pixels.MAX_DIMENSION {
+        return err(pixels.Error.TooLarge)
+    }
+    return ok()
+}
+
+// width * height, or TooLarge.
+pub fn pixel_count(width: u32, height: u32) -> usize!pixels.Error {
+    return pixels.checked(width as usize, height as usize, 0)
+}

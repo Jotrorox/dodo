@@ -1,0 +1,244 @@
+package targets
+
+import "std/graphics"
+import "std/graphics/image" as graphics_image
+import "std/image"
+import "std/image/pixels"
+import "std/image/sink"
+
+// The unified layer: detect, info, metadata, ICC, decode into several
+// target layouts (integer, float, premultiplied, fewer channels), draw onto
+// a canvas at an offset with a clip, the Canvas-based std/graphics/image
+// API, and every animation frame.
+
+const LAYOUTS: usize = 9
+
+fn unified_layout(k: usize) -> pixels.Layout {
+    if k == 0 {
+        return pixels.Layout.rgba8()
+    }
+    if k == 1 {
+        return pixels.Layout.rgba16()
+    }
+    if k == 2 {
+        return pixels.Layout.rgba_f32()
+    }
+    if k == 3 {
+        return pixels.Layout.from_codes(4, pixels.SAMPLE_U8, true)
+    }
+    if k == 4 {
+        return pixels.Layout.from_codes(4, pixels.SAMPLE_U16, true)
+    }
+    if k == 5 {
+        return pixels.Layout.from_codes(2, pixels.SAMPLE_F16, true)
+    }
+    if k == 6 {
+        return pixels.Layout.gray8()
+    }
+    if k == 7 {
+        return pixels.Layout.rgb_f32()
+    }
+    return pixels.Layout.from_codes(4, pixels.SAMPLE_F32, true)
+}
+
+fn image_target(data: &[u8]) {
+    format := match image.detect(data) {
+        ok(value) => value,
+        err(_) => {
+            return
+        },
+    }
+    image.extension(&format)
+    if format == pixels.Format.Jxl {
+        mark_frame_sized()
+    }
+    match image.metadata(data) {
+        ok(found) => {
+            check_metadata(data, &found)
+        }
+        err(_) => {}
+    }
+    header := match image.info(data) {
+        ok(value) => value,
+        err(_) => {
+            return
+        },
+    }
+    header.display_width()
+    header.display_height()
+    unified_icc(data, &header)
+    rgba := pixels.Layout.rgba8()
+    need := match image.scratch_size(data, &rgba) {
+        ok(value) => value,
+        err(_) => {
+            return
+        },
+    }
+    if grant(need, header.width, header.height) && decodable(header.width, header.height) {
+        for k in 0usize..LAYOUTS {
+            layout := unified_layout(k)
+            unified_decode(data, &header, need, &layout)
+        }
+        unified_draw(data, &header, need)
+        legacy_draw(data, &header)
+    }
+    unified_frames(data, &header)
+}
+
+fn unified_icc(data: &[u8], header: &pixels.Header) {
+    need := match image.icc_scratch_size(data) {
+        ok(value) => value,
+        err(_) => {
+            return
+        },
+    }
+    if !grant(need, header.width, header.height) {
+        return
+    }
+    unsafe {
+        match image.icc(data, &mut OUTPUT, &mut SCRATCH[..need]) {
+            ok(length) => {
+                assert(length <= OUTPUT_CAP, "image.icc length past the output")
+            }
+            err(_) => {}
+        }
+    }
+}
+
+fn unified_decode(data: &[u8], header: &pixels.Header, need: usize, layout: &pixels.Layout) {
+    size := match pixels.bytes_needed(header.width, header.height, layout) {
+        ok(value) => value,
+        err(_) => {
+            return
+        },
+    }
+    if size > PIXEL_CAP {
+        skip()
+        return
+    }
+    unsafe {
+        target := match pixels.ViewMut.new(&mut PIXELS[..size], header.width, header.height, layout.clone()) {
+            ok(value) => value,
+            err(_) => {
+                return
+            },
+        }
+        match image.decode(data, &mut target, &mut SCRATCH[..need]) {
+            ok() => {
+                passed("image.decode")
+            }
+            err(e) => {
+                failed("image.decode", e)
+            }
+        }
+    }
+}
+
+// Draw onto a canvas smaller than the image at an offset that depends on
+// the data, with a clip, so the sink's clipping runs.
+fn unified_draw(data: &[u8], header: &pixels.Header, need: usize) {
+    width := header.width
+    if width > 64 {
+        width = 64
+    }
+    height := header.height
+    if height > 64 {
+        height = 64
+    }
+    x := 0i32
+    y := 0i32
+    if data.len > 0 {
+        x = (data[data.len - 1] % 16) as i32 - 8
+        y = (data[data.len / 2] % 16) as i32 - 8
+    }
+    unsafe {
+        canvas := match graphics.canvas(&mut PIXELS[..width as usize * height as usize * 4], width, height, graphics.PixelFormat.Rgba8888) {
+            ok(value) => value,
+            err(_) => {
+                return
+            },
+        }
+        canvas.set_clip(graphics.Rect.new(1, 1, width, height))
+        match image.draw(data, &mut canvas, x, y, &mut SCRATCH[..need]) {
+            ok() => {}
+            err(_) => {}
+        }
+    }
+}
+
+// std/graphics/image: info, then draw onto a small canvas.
+fn legacy_draw(data: &[u8], header: &pixels.Header) {
+    match graphics_image.info(data) {
+        ok(_) => {}
+        err(_) => {
+            return
+        }
+    }
+    unsafe {
+        canvas := match graphics.canvas(&mut PIXELS[..32 * 32 * 4], 32, 32, graphics.PixelFormat.Rgba8888) {
+            ok(value) => value,
+            err(_) => {
+                return
+            },
+        }
+        match graphics_image.draw(data, &mut canvas, -3, 2) {
+            ok() => {}
+            err(_) => {}
+        }
+    }
+}
+
+fn unified_frames(data: &[u8], header: &pixels.Header) {
+    match image.frame_count(data) {
+        ok(count) => {
+            assert(count == header.frames, "image.frame_count differs from info().frames")
+        }
+        err(_) => {
+            return
+        }
+    }
+    count := header.frames
+    if count > FRAME_CAP {
+        count = FRAME_CAP
+    }
+    need := match image.frame_scratch_size(data) {
+        ok(value) => value,
+        err(_) => {
+            return
+        },
+    }
+    layout := pixels.Layout.rgba16()
+    size := match pixels.bytes_needed(header.width, header.height, &layout) {
+        ok(value) => value,
+        err(_) => {
+            return
+        },
+    }
+    for index in 0u32..count + 1 {
+        match image.frame_info(data, index) {
+            ok(timing) => {
+                timing.milliseconds()
+            }
+            err(_) => {}
+        }
+        // Frame 0 of a still image was decoded above.
+        if index == 0 && !header.animated {
+            continue
+        }
+        if size > PIXEL_CAP || !grant(need, header.width, header.height) || !decodable(header.width, header.height) {
+            continue
+        }
+        unsafe {
+            target := match pixels.ViewMut.new(&mut PIXELS[..size], header.width, header.height, layout.clone()) {
+                ok(value) => value,
+                err(_) => {
+                    return
+                },
+            }
+            match image.decode_frame(data, index, &mut target, &mut SCRATCH[..need]) {
+                ok() => {}
+                err(_) => {}
+            }
+        }
+    }
+}

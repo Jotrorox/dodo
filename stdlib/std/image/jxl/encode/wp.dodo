@@ -1,0 +1,154 @@
+package encode
+
+// The weighted (self-correcting) predictor, predictor 6, and its maximum
+// error property 15, exactly as the decoder computes them: four sub-
+// predictions in 1/8 units mixed by weights from their recent errors.
+// Default WP header parameters.
+
+const WP_MAX_WIDTH: usize = 256
+const WP_ROW: usize = 258
+// floor(2^24 / (i + 1)).
+const WP_DIVLOOKUP: [64]u32 = [
+    16777216, 8388608, 5592405, 4194304, 3355443, 2796202, 2396745, 2097152,
+    1864135, 1677721, 1525201, 1398101, 1290555, 1198372, 1118481, 1048576,
+    986895, 932067, 883011, 838860, 798915, 762600, 729444, 699050,
+    671088, 645277, 621378, 599186, 578524, 559240, 541200, 524288,
+    508400, 493447, 479349, 466033, 453438, 441505, 430185, 419430,
+    409200, 399457, 390167, 381300, 372827, 364722, 356962, 349525,
+    342392, 335544, 328965, 322638, 316551, 310689, 305040, 299593,
+    294337, 289262, 284359, 279620, 275036, 270600, 266305, 262144
+]
+const WP_WEIGHTS: [4]u32 = [13, 12, 12, 12]
+
+struct Wp {
+    // Per sub-predictor: two rows of accumulated absolute errors.
+    errors: [2064]u32
+    // Two rows of signed errors of the mixed prediction (1/8 units).
+    error: [516]i32
+    prediction: [4]i64
+    pred: i64
+    width: usize
+    // The last max-error property (MA property 15).
+    property: i64
+
+    fn new(width: usize) -> Wp {
+        return Wp { errors: [0u32; 2064], error: [0i32; 516], prediction: [0i64; 4], pred: 0, width: width, property: 0 }
+    }
+    fn predict(&mut self, x: usize, y: usize, n0: i64, w0: i64, ne0: i64, nw0: i64, nn0: i64) -> i64 {
+        xsize := self.width
+        cur := xsize + 2
+        prev := 0usize
+        if (y & 1) == 1 {
+            cur = 0
+            prev = xsize + 2
+        }
+        pos_n := prev + x
+        pos_ne := pos_n
+        if x + 1 < xsize {
+            pos_ne = pos_n + 1
+        }
+        pos_nw := pos_n
+        if x > 0 {
+            pos_nw = pos_n - 1
+        }
+        weights := [0u32; 4]
+        for i in 0usize..4 {
+            base := i * 2 * WP_ROW
+            sum := self.errors[base + pos_n] as u64 + self.errors[base + pos_ne] as u64 + self.errors[base + pos_nw] as u64
+            weights[i] = error_weight(sum, WP_WEIGHTS[i])
+        }
+        n := n0 * 8
+        w := w0 * 8
+        ne := ne0 * 8
+        nw := nw0 * 8
+        nn := nn0 * 8
+        te_w := 0i64
+        if x > 0 {
+            te_w = self.error[cur + x - 1] as i64
+        }
+        te_n := self.error[pos_n] as i64
+        te_nw := self.error[pos_nw] as i64
+        te_ne := self.error[pos_ne] as i64
+        sum_wn := te_n + te_w
+        p := te_w
+        if abs64(te_n) > abs64(p) {
+            p = te_n
+        }
+        if abs64(te_nw) > abs64(p) {
+            p = te_nw
+        }
+        if abs64(te_ne) > abs64(p) {
+            p = te_ne
+        }
+        self.property = p
+        self.prediction[0] = w + ne - n
+        self.prediction[1] = n - (((sum_wn + te_ne) * 16) >> 5)
+        self.prediction[2] = w - (((sum_wn + te_nw) * 10) >> 5)
+        self.prediction[3] = n - ((te_nw * 7 + te_n * 7 + te_ne * 7 + (nn - n) * 0 + (nw - w) * 0) >> 5)
+        // Weighted average with weights scaled to 5 bits.
+        total := weights[0] + weights[1] + weights[2] + weights[3]
+        shift := floor_log2(total as u64) - 4
+        total = 0
+        for i in 0usize..4 {
+            weights[i] = weights[i] >> shift
+            total += weights[i]
+        }
+        sum := (total >> 1) as i64 - 1
+        for i in 0usize..4 {
+            sum += self.prediction[i] * weights[i] as i64
+        }
+        pred := (sum * WP_DIVLOOKUP[(total - 1) as usize] as i64) >> 24
+        if ((te_n ^ te_w) | (te_n ^ te_nw)) <= 0 {
+            // Mixed signs: clamp to the neighbors W, NE and N.
+            hi := w
+            if ne > hi {
+                hi = ne
+            }
+            if n > hi {
+                hi = n
+            }
+            lo := w
+            if ne < lo {
+                lo = ne
+            }
+            if n < lo {
+                lo = n
+            }
+            if pred < lo {
+                pred = lo
+            }
+            if pred > hi {
+                pred = hi
+            }
+        }
+        self.pred = pred
+        return (pred + 3) >> 3
+    }
+    fn update(&mut self, value: i64, x: usize, y: usize) {
+        xsize := self.width
+        cur := xsize + 2
+        prev := 0usize
+        if (y & 1) == 1 {
+            cur = 0
+            prev = xsize + 2
+        }
+        v := value * 8
+        self.error[cur + x] = (self.pred - v) as i32
+        for i in 0usize..4 {
+            base := i * 2 * WP_ROW
+            err := ((abs64(self.prediction[i] - v) + 3) >> 3) as u32
+            self.errors[base + cur + x] = err
+            self.errors[base + prev + x + 1] += err
+        }
+    }
+}
+
+// About 4 + (maxweight << 24) / (x + 1), without division.
+fn error_weight(x: u64, maxweight: u32) -> u32 {
+    shift := 0u32
+    lg := floor_log2(x + 1)
+    if lg > 5 {
+        shift = lg - 5
+    }
+    return 4 + ((maxweight * WP_DIVLOOKUP[(x >> (shift as u64)) as usize]) >> shift)
+}
