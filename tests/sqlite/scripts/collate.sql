@@ -1,0 +1,14 @@
+create table c(t text collate nocase, r text collate rtrim, b text);
+insert into c values ('Abc', 'x  ', 'B'), ('abc', 'x', 'a'), ('ABD', 'y ', 'C');
+select t from c order by t, b;
+select count(*) from c where t = 'ABC';
+select count(*) from c where r = 'x';
+select b from c order by b;
+select b from c order by b collate nocase;
+select distinct t from c order by t;
+select t, count(*) from c group by t order by t;
+create index ci on c(t);
+select b from c where t = 'abc' order by b;
+select 'a' = 'A', 'a' = 'A' collate nocase, 'x ' = 'x' collate rtrim;
+select max(t), min(t) from c;
+select b from c where b > 'A' collate nocase order by b;

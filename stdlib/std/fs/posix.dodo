@@ -42,6 +42,8 @@ unsafe extern "C" fn dodo_fs_open_directory(path: *const u8) -> *mut u8
 unsafe extern "C" fn dodo_fs_read_directory(directory: *mut u8) -> *mut u8
 unsafe extern "C" fn dodo_fs_close_directory(directory: *mut u8) -> i32
 unsafe extern "C" fn dodo_fs_rename_exclusive(old: *const u8, new: *const u8) -> i32
+// POSIX record locks through the C adapter (fcntl is variadic).
+unsafe extern "C" fn dodo_fs_lock(fd: i32, kind: i32, start: i64, length: i64) -> i32
 
 pub fn capabilities() -> types.Capabilities {
     return types.Capabilities { symbolic_links: true, unix_permissions: true, windows_sharing: false, directory_sync: true }
@@ -124,6 +126,36 @@ pub fn handle_metadata(handle: &native.Handle) -> types.Metadata!error.Error {
         initialized := mem.assume_init(data)
         return ok(convert(&initialized))
     }
+}
+// Non-blocking POSIX record lock on [start, start + length): shared (read)
+// or exclusive (write). Returns false when another process holds a
+// conflicting lock. Changing the kind of a range this process already
+// holds converts the lock.
+pub fn lock_range(handle: &native.Handle, start: u64, length: u64, shared: bool) -> bool!error.Error {
+    return record_lock(handle, start, length, if shared {
+        1
+    } else {
+        2
+    })
+}
+pub fn unlock_range(handle: &native.Handle, start: u64, length: u64) -> void!error.Error {
+    record_lock(handle, start, length, 0)?
+    return ok()
+}
+fn record_lock(handle: &native.Handle, start: u64, length: u64, kind: i32) -> bool!error.Error {
+    if start > 9223372036854775807u64 || length == 0 || length > 9223372036854775807u64 - start {
+        return err(error.failure(error.Kind.InvalidInput))
+    }
+    unsafe {
+        result := dodo_fs_lock(handle.raw() as i32, kind, start as i64, length as i64)
+        if result == 1 {
+            return ok(false)
+        }
+        if result != 0 {
+            return err(native.last_error())
+        }
+    }
+    return ok(true)
 }
 pub fn create_directory(path: &native.NativeString, mode: u32) -> void!error.Error {
     unsafe {

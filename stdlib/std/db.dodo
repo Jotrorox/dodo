@@ -1,0 +1,193 @@
+package db
+
+import "std/io"
+
+// Shared vocabulary for database drivers. This package contains no driver
+// code and needs no native dependency: drivers such as `std/db/sqlite` map
+// their native result codes onto these portable classes, so retry and error
+// handling logic can be written once for every store.
+
+// Portable error class. `code` on Error keeps the driver's native code
+// (an SQLite extended result code, a Postgres SQLSTATE number, ...).
+pub enum ErrorKind {
+    // The store could not be reached or opened.
+    Connect,
+    // Credentials or permissions were rejected.
+    Auth,
+    // A constraint rejected the change; see Error.constraint.
+    Constraint,
+    // The transaction conflicted with another one and may be retried.
+    Serialization,
+    // Another connection holds a lock; the operation may be retried later.
+    Busy,
+    // An operation exceeded its time limit.
+    Timeout,
+    // Malformed SQL or an unknown name in a statement.
+    Syntax,
+    // The statement is valid but refers to a schema object that is missing.
+    Schema,
+    // A value had the wrong type or was out of range for the operation.
+    Type,
+    // A parameter or column index was out of range.
+    Range,
+    // A wire-protocol violation from the peer.
+    Protocol,
+    // A fixed-size workspace, buffer, or limit was exhausted.
+    Capacity,
+    // The underlying file, socket, or device failed.
+    Io,
+    // Stored data is malformed.
+    Corrupt,
+    // The store is read-only.
+    ReadOnly,
+    // The API was used out of order (for example, commit without begin).
+    Misuse,
+    // The driver does not implement the requested feature.
+    Unsupported,
+    // An operation was cancelled.
+    Interrupted,
+    // A driver-internal invariant failed.
+    Internal,
+}
+
+// Which constraint rejected a change, for ErrorKind.Constraint.
+pub enum Constraint {
+    None,
+    Unique,
+    PrimaryKey,
+    NotNull,
+    ForeignKey,
+    Check,
+    Other,
+}
+
+pub struct Error {
+    pub kind: ErrorKind
+    pub constraint: Constraint
+    // Driver-native code. Zero when the driver has none.
+    pub code: i32
+    // Byte offset into the statement text the error refers to, or -1.
+    pub position: i32
+
+    pub fn new(kind: ErrorKind, code: i32) -> Error {
+        Error { kind, constraint: Constraint.None, code, position: -1 }
+    }
+
+    pub fn constraint(constraint: Constraint, code: i32) -> Error {
+        Error { kind: ErrorKind.Constraint, constraint, code, position: -1 }
+    }
+
+    pub fn at(kind: ErrorKind, code: i32, position: i32) -> Error {
+        Error { kind, constraint: Constraint.None, code, position }
+    }
+
+    // True for failures that may succeed when the operation is retried.
+    pub fn is_transient(&self) -> bool {
+        match &self.kind {
+            ErrorKind.Busy => true,
+            ErrorKind.Serialization => true,
+            ErrorKind.Timeout => true,
+            ErrorKind.Interrupted => true,
+            _ => false,
+        }
+    }
+
+    // Only fixed names and numeric metadata; drivers expose their message
+    // text separately (for example `sqlite.Connection.message`).
+    pub fn format<F>(&self, output: &mut F) -> void!io.Error {
+        output.string("db: ")?
+        output.string(kind_name(&self.kind))?
+        match &self.constraint {
+            Constraint.None => {},
+            _ => {
+                output.string("(")?
+                output.string(constraint_name(&self.constraint))?
+                output.string(")")?
+            },
+        }
+        output.string(" code ")?
+        output.decimal(self.code as i64)?
+        if self.position >= 0 {
+            output.string(" at ")?
+            output.decimal(self.position as i64)?
+        }
+        ok()
+    }
+}
+
+pub fn kind_name(kind: &ErrorKind) -> &str from(static) {
+    match kind {
+        ErrorKind.Connect => "Connect",
+        ErrorKind.Auth => "Auth",
+        ErrorKind.Constraint => "Constraint",
+        ErrorKind.Serialization => "Serialization",
+        ErrorKind.Busy => "Busy",
+        ErrorKind.Timeout => "Timeout",
+        ErrorKind.Syntax => "Syntax",
+        ErrorKind.Schema => "Schema",
+        ErrorKind.Type => "Type",
+        ErrorKind.Range => "Range",
+        ErrorKind.Protocol => "Protocol",
+        ErrorKind.Capacity => "Capacity",
+        ErrorKind.Io => "Io",
+        ErrorKind.Corrupt => "Corrupt",
+        ErrorKind.ReadOnly => "ReadOnly",
+        ErrorKind.Misuse => "Misuse",
+        ErrorKind.Unsupported => "Unsupported",
+        ErrorKind.Interrupted => "Interrupted",
+        ErrorKind.Internal => "Internal",
+    }
+}
+
+pub fn constraint_name(constraint: &Constraint) -> &str from(static) {
+    match constraint {
+        Constraint.None => "None",
+        Constraint.Unique => "Unique",
+        Constraint.PrimaryKey => "PrimaryKey",
+        Constraint.NotNull => "NotNull",
+        Constraint.ForeignKey => "ForeignKey",
+        Constraint.Check => "Check",
+        Constraint.Other => "Other",
+    }
+}
+
+// A borrowed database value. Text and Bytes borrow the driver's workspace
+// or the caller's data, so producing or binding a value never allocates.
+pub enum Value {
+    Null,
+    Int(i64),
+    Real(f64),
+    Text(&str),
+    Bytes(&[u8]),
+}
+
+// Value classes, for drivers and generic code that need to branch on a type
+// without borrowing a payload.
+pub enum ValueType {
+    Null,
+    Int,
+    Real,
+    Text,
+    Bytes,
+}
+
+pub fn value_type(value: &Value) -> ValueType {
+    match value {
+        Value.Null => ValueType.Null,
+        Value.Int(_) => ValueType.Int,
+        Value.Real(_) => ValueType.Real,
+        Value.Text(_) => ValueType.Text,
+        Value.Bytes(_) => ValueType.Bytes,
+    }
+}
+
+// Transaction isolation requested by `sql.Conn.begin`. Drivers map each level
+// to the closest level they support; a driver never silently weakens the
+// requested guarantee below what it documents.
+pub enum IsolationLevel {
+    Default,
+    ReadUncommitted,
+    ReadCommitted,
+    RepeatableRead,
+    Serializable,
+}

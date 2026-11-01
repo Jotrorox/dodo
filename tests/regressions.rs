@@ -304,3 +304,24 @@ fn main() -> i32 {
         assert_eq!(workspace.run(&executable).status.code(), Some(42));
     }
 }
+
+#[test]
+fn borrowed_slice_pattern_bindings_index_and_measure() {
+    // Matching `&enum` binds `&&[u8]` / `&&str`; `.len` and indexing load
+    // through the extra reference.
+    let workspace = Workspace::new();
+    let source = workspace.file(
+        "main.dodo",
+        "package main\n\
+         enum V { Bytes(&[u8]), Text(&str) }\n\
+         fn total(values: &[V]) -> usize {\n n := 0usize\n for v in values {\n\
+         match v {\n V.Bytes(b) => { n += b.len\n n += b[0] as usize },\n\
+         V.Text(t) => { n += t.len },\n }\n }\n n\n}\n\
+         fn main() -> i32 {\n data := [7u8, 8]\n values := [V.Bytes(&data), V.Text(\"abc\")]\n\
+         if total(&values) != 12 { return 1 }\n 0\n}\n",
+    );
+    for optimization in [0, 2] {
+        let executable = workspace.build(&source, optimization, None);
+        assert!(workspace.run(&executable).status.success());
+    }
+}

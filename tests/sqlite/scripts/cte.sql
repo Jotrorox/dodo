@@ -1,0 +1,16 @@
+create table e(id integer primary key, name text, boss int);
+insert into e values (1, 'root', null), (2, 'a', 1), (3, 'b', 1), (4, 'c', 2), (5, 'd', 4), (6, 'f', 3);
+with t as (select id, name from e where boss = 1) select name from t order by name;
+with t(x, y) as (select id, name from e) select y from t where x > 4 order by x;
+with a as (select 1 as v), b as (select v + 1 as v from a) select a.v, b.v from a, b;
+with t as (select id from e) select count(*) from t as p join t as q on p.id = q.id;
+with recursive cnt(x) as (select 1 union all select x + 1 from cnt where x < 10) select x from cnt;
+with recursive cnt(x) as (select 1 union all select x + 1 from cnt limit 5) select sum(x) from cnt;
+with recursive tree(id, name, depth) as (select id, name, 0 from e where boss is null union all select e.id, e.name, tree.depth + 1 from e join tree on e.boss = tree.id) select name, depth from tree order by depth, name;
+with recursive r(n) as (select 1 union select n % 3 + 1 from r) select n from r order by n;
+with recursive fib(a, b) as (select 0, 1 union all select b, a + b from fib where b < 100) select group_concat(a, ',') from fib;
+with x as (select 5 as v) select * from x where v in (select v from x);
+insert into e(name, boss) with n as (select 'g' as nm) select nm, 6 from n;
+select id, name, boss from e order by id;
+with recursive c(x) as (select 1 union all select x + 1 from c limit 3 offset 1) select x from c;
+with t as (select * from t) select 1;

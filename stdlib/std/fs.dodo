@@ -78,6 +78,18 @@ pub struct File {
     pub fn metadata(&self) -> types.Metadata!error.Error {
         return adapter.handle_metadata(&self.handle)
     }
+    // Non-blocking byte-range lock on [start, start + length), shared or
+    // exclusive. Returns false when another process holds a conflicting
+    // lock. POSIX uses fcntl record locks (advisory; locking a range this
+    // process already holds converts it; closing any descriptor of the file
+    // releases the process's locks on it). Windows uses LockFileEx
+    // (mandatory for other handles). The range may extend past end of file.
+    pub fn try_lock_range(&mut self, start: u64, length: u64, shared: bool) -> bool!error.Error {
+        return adapter.lock_range(&self.handle, start, length, shared)
+    }
+    pub fn unlock_range(&mut self, start: u64, length: u64) -> void!error.Error {
+        return adapter.unlock_range(&self.handle, start, length)
+    }
     // Access to raw numbers does not transfer ownership. Native calls and
     // creating another owner remain unsafe; use after close is invalid.
     pub fn raw_handle(&self) -> isize {

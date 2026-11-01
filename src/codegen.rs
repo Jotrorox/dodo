@@ -2203,10 +2203,34 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                 *t.clone(),
             )),
             Type::Ref(_, t) => {
-                let p = self.expr(e)?;
-                match &**t {
+                let mut p = self.expr(e)?;
+                let mut target = &**t;
+                // A reference to a slice, string, or another reference (such
+                // as `&&[u8]` from a borrowed pattern) is loaded until the
+                // collection value itself is reached.
+                while let Type::Ref(_, inner) = target {
+                    p = self.load(p, target)?;
+                    target = &**inner;
+                }
+                match target {
                     Type::Array(n, t) => {
                         Ok((p, self.usize_type().const_int(*n as u64, false), *t.clone()))
+                    }
+                    Type::Slice(_, t) => {
+                        let v = self.load(p, target)?;
+                        Ok((
+                            self.builder.build_extract_value(v, 0, "data")?,
+                            self.builder.build_extract_value(v, 1, "len")?,
+                            *t.clone(),
+                        ))
+                    }
+                    Type::Str => {
+                        let v = self.load(p, target)?;
+                        Ok((
+                            self.builder.build_extract_value(v, 0, "data")?,
+                            self.builder.build_extract_value(v, 1, "len")?,
+                            Type::u8(),
+                        ))
                     }
                     _ => Err(error("reference is not a collection")),
                 }

@@ -1,0 +1,728 @@
+package sqlite
+
+import "std/db"
+
+// CREATE / DROP / ALTER and sqlite_schema maintenance.
+
+const SCHEMA_CUR: usize = 46
+
+// Inserts a sqlite_schema row; returns its rowid. `sql` may be 0 (NULL).
+fn schema_insert(e: &mut Engine, kind: &str, name: usize, nl: usize, tbl: usize, tl: usize, root: u32, sql: usize, sqll: usize) -> i64!db.Error {
+    c := SCHEMA_CUR
+    cur_open(e, c, 1, false)
+    rowid := 1i64
+    if cur_last(e, c)? {
+        rowid = cur_rowid(e, c) + 1
+    }
+    save := e.rtop
+    r := e.rtop
+    for _ in 0usize..5 {
+        reg_push(e)?
+    }
+    set_text_str(e, r, kind)?
+    set_bytes(e, r + 1, T_TEXT, name, nl)
+    set_bytes(e, r + 2, T_TEXT, tbl, tl)
+    set_int(e, r + 3, root as i64)
+    if sqll == 0 && sql == 0 {
+        set_null(e, r + 4)
+    } else {
+        set_bytes(e, r + 4, T_TEXT, sql, sqll)
+    }
+    size := record_size(e, r, 5)
+    rec := arena_alloc(e, size)?
+    record_write(e, r, 5, rec)
+    e.rtop = save
+    table_insert(e, c, rowid, rec, size)?
+    ok(rowid)
+}
+
+fn schema_delete(e: &mut Engine, rowid: i64) -> void!db.Error {
+    c := SCHEMA_CUR
+    cur_open(e, c, 1, false)
+    if seek_rowid(e, c, rowid)? {
+        cur_delete(e, c)?
+    }
+    ok()
+}
+
+// Rewrites the sql column of schema row `rowid`.
+fn schema_update(e: &mut Engine, rowid: i64, name: usize, nl: usize, tbl: usize, tl: usize, sql: usize, sqll: usize, sql_null: bool) -> void!db.Error {
+    c := SCHEMA_CUR
+    cur_open(e, c, 1, false)
+    if !seek_rowid(e, c, rowid)? {
+        return err(corrupt(e))
+    }
+    let (p, n) = cur_payload(e, c)?
+    save := e.rtop
+    r := e.rtop
+    for _ in 0usize..5 {
+        reg_push(e)?
+    }
+    record_column(e, p, n, 0, r)?
+    set_bytes(e, r + 1, T_TEXT, name, nl)
+    set_bytes(e, r + 2, T_TEXT, tbl, tl)
+    record_column(e, p, n, 3, r + 3)?
+    if sql_null {
+        set_null(e, r + 4)
+    } else {
+        set_bytes(e, r + 4, T_TEXT, sql, sqll)
+    }
+    size := record_size(e, r, 5)
+    rec := arena_alloc(e, size)?
+    record_write(e, r, 5, rec)
+    e.rtop = save
+    table_insert(e, c, rowid, rec, size)
+}
+
+// Increments the schema cookie and reloads the catalog.
+fn schema_changed(e: &mut Engine) -> void!db.Error {
+    cookie := hdr_get(e, 40)?
+    hdr_set(e, 40, core.wrapping_add(cookie, 1u32))?
+    if hdr_get(e, 44)? < 4 {
+        // New features may need the newest schema format.
+        hdr_set(e, 44, 4)?
+        e.schema_format = 4
+    }
+    e.schema_cookie = core.wrapping_add(cookie, 1u32)
+    e.schema_loaded = false
+    load_schema(e)
+}
+
+fn name_taken(e: &mut Engine, o: usize, l: usize) -> db.Error {
+    t := find_obj(e, 0, o, l)
+    e.msg_len = 0
+    if t != NO_COL && obj_type(e, t) == OT_INDEX {
+        msg_add(e, "there is already an index named ")
+    } else {
+        msg_add(e, "table ")
+        msg_add_ws(e, o, l)
+        msg_add(e, " already exists")
+        return make_error(e, SQLITE_ERROR)
+    }
+    msg_add_ws(e, o, l)
+    make_error(e, SQLITE_ERROR)
+}
+
+fn reserved_name(e: &Engine, o: usize, l: usize) -> bool {
+    l >= 7 && name_is(e, o, 7, "sqlite_")
+}
+
+// Writes "<prefix><text from start to end>" into the arena.
+fn normalized_sql(e: &mut Engine, prefix: &str, start: usize, end: usize) -> (usize, usize)!db.Error {
+    p := mem_bytes(prefix)
+    len := p.len + (end - start)
+    o := arena_alloc(e, len)?
+    copy_in(e.ws, o, p)
+    move_bytes(e.ws, start, o + p.len, end - start)
+    ok((o, len))
+}
+
+fn exec_create_table(e: &mut Engine, s: usize) -> void!db.Error {
+    name := na(e, s)
+    nl := nb(e, s)
+    if find_obj(e, 0, name, nl) != NO_COL {
+        if (nflags(e, s) & 1) != 0 && find_obj(e, OT_TABLE, name, nl) != NO_COL {
+            return ok()
+        }
+        return err(name_taken(e, name, nl))
+    }
+    if reserved_name(e, name, nl) && !name_is(e, name, nl, "sqlite_sequence") {
+        e.msg_len = 0
+        msg_add(e, "object name reserved for internal use: ")
+        msg_add_ws(e, name, nl)
+        return err(make_error(e, SQLITE_ERROR))
+    }
+    // Validate the definition by building a catalog entry.
+    t := new_obj(e)?
+    o := obj(e, t)
+    e.ws[o + O_TYPE] = OT_TABLE
+    stu(e.ws, o + O_NAME, name)
+    stu(e.ws, o + O_NAMEL, nl)
+    table_from_ast(e, t, s)?
+    // AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY.
+    if (obj_flags(e, t) & OF_AUTOINC) != 0 && rowid_col(e, t) == NO_COL {
+        e.schema_objs -= 1
+        return err(fail(e, SQLITE_ERROR, "AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY"))
+    }
+    nauto := autoindex_constraint(e, t, s, 0)?
+    autoinc := (obj_flags(e, t) & OF_AUTOINC) != 0
+    e.schema_objs -= 1
+    let s_e = ne_(e, s)
+    let s_f = nff(e, s)
+    let (sql, sqll) = normalized_sql(e, "CREATE TABLE ", s_e, s_f)?
+    root := btree_create(e, false)?
+    schema_insert(e, "table", name, nl, name, nl, root, sql, sqll)?
+    // Automatic indexes for PRIMARY KEY and UNIQUE constraints.
+    for k in 1usize..(nauto + 1) {
+        buf := [0u8; 300]
+        b := mem_bytes("sqlite_autoindex_")
+        m := 0usize
+        for i in 0usize..b.len {
+            buf[m] = b[i]
+            m += 1
+        }
+        for i in 0usize..nl {
+            if m < 270 {
+                buf[m] = e.ws[name + i]
+                m += 1
+            }
+        }
+        buf[m] = 95
+        m += 1
+        digits := [0u8; 24]
+        dn := format_i64(&mut digits, k as i64)
+        for i in 0usize..dn {
+            buf[m] = digits[i]
+            m += 1
+        }
+        io := arena_alloc(e, m)?
+        copy_in(e.ws, io, &buf[..m])
+        iroot := btree_create(e, true)?
+        schema_insert(e, "index", io, m, name, nl, iroot, 0, 0)?
+    }
+    if autoinc && find_obj(e, OT_TABLE, 0, 0) == NO_COL {
+        seqo := arena_alloc(e, 15)?
+        copy_in(e.ws, seqo, mem_bytes("sqlite_sequence"))
+        if find_obj(e, OT_TABLE, seqo, 15) == NO_COL {
+            sroot := btree_create(e, false)?
+            sq := mem_bytes("CREATE TABLE sqlite_sequence(name,seq)")
+            so := arena_alloc(e, sq.len)?
+            copy_in(e.ws, so, sq)
+            schema_insert(e, "table", seqo, 15, seqo, 15, sroot, so, sq.len)?
+        }
+    }
+    schema_changed(e)
+}
+
+fn exec_create_view(e: &mut Engine, s: usize) -> void!db.Error {
+    name := na(e, s)
+    nl := nb(e, s)
+    if find_obj(e, 0, name, nl) != NO_COL {
+        if (nflags(e, s) & 1) != 0 && find_obj(e, OT_VIEW, name, nl) != NO_COL {
+            return ok()
+        }
+        e.msg_len = 0
+        let value = if find_obj(e, OT_VIEW, name, nl) != NO_COL {
+            "view "
+        } else {
+            "table "
+        }
+        msg_add(e, value)
+        msg_add_ws(e, name, nl)
+        msg_add(e, " already exists")
+        return err(make_error(e, SQLITE_ERROR))
+    }
+    if reserved_name(e, name, nl) {
+        e.msg_len = 0
+        msg_add(e, "object name reserved for internal use: ")
+        msg_add_ws(e, name, nl)
+        return err(make_error(e, SQLITE_ERROR))
+    }
+    let start = ne_(e, s)
+    let end = nff(e, s)
+    let (sql, sqll) = normalized_sql(e, "CREATE VIEW ", start, end)?
+    schema_insert(e, "view", name, nl, name, nl, 0, sql, sqll)?
+    schema_changed(e)
+}
+
+fn exec_create_index(e: &mut Engine, s: usize) -> void!db.Error {
+    name := na(e, s)
+    nl := nb(e, s)
+    if find_obj(e, 0, name, nl) != NO_COL {
+        if (nflags(e, s) & 1) != 0 && find_obj(e, OT_INDEX, name, nl) != NO_COL {
+            return ok()
+        }
+        return err(name_taken(e, name, nl))
+    }
+    if reserved_name(e, name, nl) {
+        e.msg_len = 0
+        msg_add(e, "object name reserved for internal use: ")
+        msg_add_ws(e, name, nl)
+        return err(make_error(e, SQLITE_ERROR))
+    }
+    let s_c = nc(e, s)
+    let s_d = ndd(e, s)
+    t := find_obj(e, OT_TABLE, s_c, s_d)
+    if t == NO_COL {
+        e.msg_len = 0
+        msg_add(e, "no such table: ")
+        let s_c2 = nc(e, s)
+        let s_d2 = ndd(e, s)
+        msg_add_ws(e, s_c2, s_d2)
+        return err(make_error(e, SQLITE_ERROR))
+    }
+    let s_c3 = nc(e, s)
+    let s_d3 = ndd(e, s)
+    if reserved_name(e, s_c3, s_d3) {
+        return err(fail(e, SQLITE_ERROR, "table sqlite_master may not be indexed"))
+    }
+    // Validate columns through a temporary catalog entry.
+    x := new_obj(e)?
+    o := obj(e, x)
+    e.ws[o + O_TYPE] = OT_INDEX
+    stu(e.ws, o + O_TABLE, t)
+    match index_from_ast(e, x, t, s) {
+        ok() => {},
+        err(reason) => {
+            e.schema_objs -= 1
+            return err(reason)
+        },
+    }
+    unique := (nflags(e, s) & 2) != 0
+    prefix := if unique {
+        "CREATE UNIQUE INDEX "
+    } else {
+        "CREATE INDEX "
+    }
+    let s_f = nff(e, s)
+    let s_g = ng(e, s)
+    let (sql, sqll) = normalized_sql(e, prefix, s_f, s_g)?
+    root := btree_create(e, true)?
+    let obj2 = obj(e, x) + O_ROOT
+    st32(e.ws, obj2, root)
+    // Populate from the table.
+    tc := SCHEMA_CUR - 1
+    ic := SCHEMA_CUR - 2
+    let root2 = obj_root(e, t)
+    cur_open(e, tc, root2, false)
+    open_index_cursor(e, ic, x)
+    n := obj_ncol(e, x)
+    ipk := rowid_col(e, t)
+    save := e.rtop
+    keys := e.rtop
+    for _ in 0usize..(n + 1) {
+        reg_push(e)?
+    }
+    more := cur_first(e, tc)?
+    for more {
+        mark := e.arena_top
+        rowid := cur_rowid(e, tc)
+        let (p, len) = cur_payload(e, tc)?
+        any_null := false
+        for k in 0usize..n {
+            c := idx_col(e, x, k)
+            if c == NO_COL || c == ipk {
+                set_int(e, keys + k, rowid)
+            } else {
+                if !record_column(e, p, len, c, keys + k)? {
+                    column_default(e, t, c, keys + k)?
+                }
+                if rtype(e, keys + k) == T_NULL {
+                    any_null = true
+                }
+            }
+        }
+        set_int(e, keys + n, rowid)
+        if unique && !any_null {
+            if seek_index(e, ic, keys, n)? == 0 {
+                e.rtop = save
+                e.schema_objs -= 1
+                return err(constraint_fail(e, SQLITE_CONSTRAINT_UNIQUE, "UNIQUE", t, 0, n, x))
+            }
+        }
+        size := record_size(e, keys, n + 1)
+        rec := arena_alloc(e, size)?
+        record_write(e, keys, n + 1, rec)
+        index_insert(e, ic, rec, size)?
+        arena_reset(e, mark)
+        // The table cursor is unaffected by index inserts; continue.
+        more = cur_next(e, tc)?
+    }
+    e.rtop = save
+    e.schema_objs -= 1
+    tname := obj_u(e, t, O_NAME)
+    tl := obj_u(e, t, O_NAMEL)
+    schema_insert(e, "index", name, nl, tname, tl, root, sql, sqll)?
+    schema_changed(e)
+}
+
+fn exec_drop(e: &mut Engine, s: usize) -> void!db.Error {
+    name := na(e, s)
+    nl := nb(e, s)
+    kind := if nop(e, s) == 1 {
+        OT_TABLE
+    } else if nop(e, s) == 3 {
+        OT_VIEW
+    } else {
+        OT_INDEX
+    }
+    i := find_obj(e, kind, name, nl)
+    if i == NO_COL {
+        if (nflags(e, s) & 1) != 0 {
+            return ok()
+        }
+        e.msg_len = 0
+        msg_add(e, if kind == OT_TABLE {
+            "no such table: "
+        } else if kind == OT_VIEW {
+            "no such view: "
+        } else {
+            "no such index: "
+        })
+        msg_add_ws(e, name, nl)
+        return err(make_error(e, SQLITE_ERROR))
+    }
+    if kind == OT_TABLE {
+        if reserved_name(e, name, nl) && !name_is(e, name, nl, "sqlite_sequence") || obj_root(e, i) == 1 {
+            return err(fail(e, SQLITE_ERROR, "table sqlite_master may not be dropped"))
+        }
+        // Indexes and triggers of the table go with it.
+        for j in 0usize..e.schema_objs {
+            k := obj_type(e, j)
+            let tbl = obj_u(e, j, O_TBL)
+            let tbl_len = obj_u(e, j, O_TBLL)
+            if (k == OT_INDEX || k == OT_TRIGGER) && names_eq(e, tbl, tbl_len, name, nl) {
+                if k == OT_INDEX && obj_root(e, j) != 0 {
+                    let root = obj_root(e, j)
+                    btree_drop(e, root)?
+                }
+                let schema_rowid = obj_u(e, j, O_ROWNO) as i64
+                schema_delete(e, schema_rowid)?
+            }
+        }
+        let root2 = obj_root(e, i)
+        btree_drop(e, root2)?
+        let schema_rowid2 = obj_u(e, i, O_ROWNO) as i64
+        schema_delete(e, schema_rowid2)?
+        // Forget its AUTOINCREMENT sequence.
+        for j in 0usize..e.schema_objs {
+            let name2 = obj_u(e, j, O_NAME)
+            let name_len = obj_u(e, j, O_NAMEL)
+            if obj_type(e, j) == OT_TABLE && name_is(e, name2, name_len, "sqlite_sequence") {
+                let root3 = obj_root(e, j)
+                drop_sequence_row(e, root3, name, nl)?
+            }
+        }
+    } else if kind == OT_VIEW {
+        let rowno = obj_u(e, i, O_ROWNO) as i64
+        schema_delete(e, rowno)?
+    } else {
+        if (obj_flags(e, i) & OF_AUTO) != 0 || obj_u(e, i, O_SQLL) == 0 {
+            return err(fail(e, SQLITE_ERROR, "index associated with UNIQUE or PRIMARY KEY constraint cannot be dropped"))
+        }
+        let root4 = obj_root(e, i)
+        btree_drop(e, root4)?
+        let schema_rowid3 = obj_u(e, i, O_ROWNO) as i64
+        schema_delete(e, schema_rowid3)?
+    }
+    schema_changed(e)
+}
+
+fn drop_sequence_row(e: &mut Engine, root: u32, name: usize, nl: usize) -> void!db.Error {
+    c := SCHEMA_CUR - 1
+    cur_open(e, c, root, false)
+    more := cur_first(e, c)?
+    for more {
+        let (p, n) = cur_payload(e, c)?
+        record_column(e, p, n, 0, R_TMP)?
+        let off = roff(e, R_TMP)
+        let len = rlen(e, R_TMP)
+        if rtype(e, R_TMP) == T_TEXT && names_eq_exact(e, off, len, name, nl) {
+            cur_delete(e, c)?
+            return ok()
+        }
+        more = cur_next(e, c)?
+    }
+    ok()
+}
+
+// Finds the span of the first identifier token after `from` in [o, o+l)
+// that names `name` (quoted or not). Returns (start, end) or (0, 0).
+fn find_name_token(e: &mut Engine, o: usize, l: usize, skip: usize, name: usize, nl: usize) -> (usize, usize) {
+    e.src = o
+    e.src_end = o + l
+    e.pos = o
+    e.ts = o
+    e.tl = 0
+    e.last_end = o
+    next_token(e)
+    count := 0usize
+    for e.tk != TK_EOF {
+        if e.tk == TK_ID || e.tk == TK_QID {
+            start := e.ts
+            end := e.ts + e.tl
+            inner_o := if e.tk == TK_ID {
+                start
+            } else {
+                start + 1
+            }
+            inner_l := if e.tk == TK_ID {
+                e.tl
+            } else {
+                e.tl - 2
+            }
+            if names_eq(e, inner_o, inner_l, name, nl) {
+                if count == skip {
+                    return (start, end)
+                }
+                count += 1
+            }
+        }
+        next_token(e)
+    }
+    (0usize, 0usize)
+}
+
+// Copies [o, o+l) to the arena replacing [a, b) with `rep`.
+fn splice(e: &mut Engine, o: usize, l: usize, a: usize, b: usize, rep: usize, rl: usize) -> (usize, usize)!db.Error {
+    len := l - (b - a) + rl
+    d := arena_alloc(e, len)?
+    move_bytes(e.ws, o, d, a - o)
+    move_bytes(e.ws, rep, d + (a - o), rl)
+    move_bytes(e.ws, b, d + (a - o) + rl, o + l - b)
+    ok((d, len))
+}
+
+// Quotes a name if needed: "name" with doubled quotes.
+fn quoted_name(e: &mut Engine, o: usize, l: usize) -> (usize, usize)!db.Error {
+    quotes := 0usize
+    for i in 0usize..l {
+        if e.ws[o + i] == 34 {
+            quotes += 1
+        }
+    }
+    d := arena_alloc(e, l + quotes + 2)?
+    e.ws[d] = 34
+    k := 1usize
+    for i in 0usize..l {
+        b := e.ws[o + i]
+        e.ws[d + k] = b
+        k += 1
+        if b == 34 {
+            e.ws[d + k] = 34
+            k += 1
+        }
+    }
+    e.ws[d + k] = 34
+    ok((d, k + 1))
+}
+
+fn exec_alter(e: &mut Engine, s: usize) -> void!db.Error {
+    name := na(e, s)
+    nl := nb(e, s)
+    t := find_obj(e, OT_TABLE, name, nl)
+    if t == NO_COL {
+        e.msg_len = 0
+        msg_add(e, "no such table: ")
+        msg_add_ws(e, name, nl)
+        return err(make_error(e, SQLITE_ERROR))
+    }
+    if reserved_name(e, name, nl) {
+        e.msg_len = 0
+        msg_add(e, "table ")
+        msg_add_ws(e, name, nl)
+        msg_add(e, " may not be altered")
+        return err(make_error(e, SQLITE_ERROR))
+    }
+    op := nop(e, s)
+    sql := obj_u(e, t, O_SQL)
+    sqll := obj_u(e, t, O_SQLL)
+    if op == 1 {
+        // RENAME TO
+        nn := nc(e, s)
+        nnl := ndd(e, s)
+        if find_obj(e, 0, nn, nnl) != NO_COL {
+            e.msg_len = 0
+            msg_add(e, "there is already another table or index with this name: ")
+            msg_add_ws(e, nn, nnl)
+            return err(make_error(e, SQLITE_ERROR))
+        }
+        if reserved_name(e, nn, nnl) {
+            return err(fail(e, SQLITE_ERROR, "object name reserved for internal use"))
+        }
+        // Copy the new name: the statement text stays valid, but be safe.
+        nd_ := arena_alloc(e, nnl)?
+        move_bytes(e.ws, nn, nd_, nnl)
+        let (qo, ql) = quoted_name(e, nd_, nnl)?
+        let (a, b) = find_name_token(e, sql, sqll, 0, name, nl)
+        if b == 0 {
+            return err(corrupt(e))
+        }
+        let (ns, nsl) = splice(e, sql, sqll, a, b, qo, ql)?
+        let schema_rowid = obj_u(e, t, O_ROWNO) as i64
+        schema_update(e, schema_rowid, nd_, nnl, nd_, nnl, ns, nsl, false)?
+        for j in 0usize..e.schema_objs {
+            let tbl = obj_u(e, j, O_TBL)
+            let tbl_len = obj_u(e, j, O_TBLL)
+            if obj_type(e, j) != OT_INDEX || !names_eq(e, tbl, tbl_len, name, nl) {
+                continue
+            }
+            isql := obj_u(e, j, O_SQL)
+            isqll := obj_u(e, j, O_SQLL)
+            if isqll == 0 {
+                // sqlite_autoindex_<old>_N becomes sqlite_autoindex_<new>_N.
+                iname := obj_u(e, j, O_NAME)
+                inl := obj_u(e, j, O_NAMEL)
+                pre := 17usize
+                suffix := iname + pre + nl
+                sl := inl - pre - nl
+                newl := pre + nnl + sl
+                d := arena_alloc(e, newl)?
+                move_bytes(e.ws, iname, d, pre)
+                move_bytes(e.ws, nd_, d + pre, nnl)
+                move_bytes(e.ws, suffix, d + pre + nnl, sl)
+                let schema_rowid2 = obj_u(e, j, O_ROWNO) as i64
+                schema_update(e, schema_rowid2, d, newl, nd_, nnl, 0, 0, true)?
+            } else {
+                // The table name is the first matching identifier after the
+                // index name.
+                let name2 = obj_u(e, j, O_NAME)
+                let name_len = obj_u(e, j, O_NAMEL)
+                let value2 = if names_eq(e, name2, name_len, name, nl) {
+                    1usize
+                } else {
+                    0usize
+                }
+                let (ia, ib) = find_name_token(e, isql, isqll, value2, name, nl)
+                if ib == 0 {
+                    return err(corrupt(e))
+                }
+                let (is, isl) = splice(e, isql, isqll, ia, ib, qo, ql)?
+                let schema_rowid3 = obj_u(e, j, O_ROWNO) as i64
+                let name3 = obj_u(e, j, O_NAME)
+                let name_len2 = obj_u(e, j, O_NAMEL)
+                schema_update(e, schema_rowid3, name3, name_len2, nd_, nnl, is, isl, false)?
+            }
+        }
+        return schema_changed(e)
+    }
+    if op == 2 {
+        // ADD COLUMN: append the definition before the closing parenthesis.
+        cd := ne_(e, s)
+        flags := nflags(e, cd)
+        if (flags & (CF_PK | CF_UNIQUE)) != 0 {
+            return err(fail(e, SQLITE_ERROR, "Cannot add a PRIMARY KEY or UNIQUE column"))
+        }
+        if (flags & CF_NOTNULL) != 0 && ne_(e, cd) == 0 {
+            return err(fail(e, SQLITE_ERROR, "Cannot add a NOT NULL column with default value NULL"))
+        }
+        let cd_a = na(e, cd)
+        let cd_b = nb(e, cd)
+        if find_column(e, t, cd_a, cd_b) != NO_COL {
+            e.msg_len = 0
+            msg_add(e, "duplicate column name: ")
+            let cd_a2 = na(e, cd)
+            let cd_b2 = nb(e, cd)
+            msg_add_ws(e, cd_a2, cd_b2)
+            return err(make_error(e, SQLITE_ERROR))
+        }
+        close := sqll
+        for close > 0 && e.ws[sql + close - 1] != 41 {
+            close -= 1
+        }
+        if close == 0 {
+            return err(corrupt(e))
+        }
+        start := nff(e, s)
+        end := ng(e, s)
+        add := end - start
+        len := sqll + add + 2
+        d := arena_alloc(e, len)?
+        move_bytes(e.ws, sql, d, close - 1)
+        e.ws[d + close - 1] = 44
+        e.ws[d + close] = 32
+        move_bytes(e.ws, start, d + close + 1, add)
+        move_bytes(e.ws, sql + close - 1, d + close + 1 + add, sqll - close + 1)
+        let schema_rowid4 = obj_u(e, t, O_ROWNO) as i64
+        let name4 = obj_u(e, t, O_NAME)
+        let name_len3 = obj_u(e, t, O_NAMEL)
+        let name5 = obj_u(e, t, O_NAME)
+        let name_len4 = obj_u(e, t, O_NAMEL)
+        schema_update(e, schema_rowid4, name4, name_len3, name5, name_len4, d, len, false)?
+        return schema_changed(e)
+    }
+    if op == 3 {
+        // RENAME COLUMN old TO new: rewrite the table and index definitions.
+        co := ne_(e, s)
+        cl := nff(e, s)
+        c := find_column(e, t, co, cl)
+        if c == NO_COL {
+            e.msg_len = 0
+            msg_add(e, "no such column: \"")
+            msg_add_ws(e, co, cl)
+            msg_add(e, "\"")
+            return err(make_error(e, SQLITE_ERROR))
+        }
+        nn := nc(e, s)
+        nnl := ndd(e, s)
+        if find_column(e, t, nn, nnl) != NO_COL {
+            e.msg_len = 0
+            msg_add(e, "duplicate column name: ")
+            msg_add_ws(e, nn, nnl)
+            return err(make_error(e, SQLITE_ERROR))
+        }
+        nd_ := arena_alloc(e, nnl)?
+        move_bytes(e.ws, nn, nd_, nnl)
+        let (qo, ql) = quoted_name(e, nd_, nnl)?
+        let (ts, tsl) = rename_tokens(e, sql, sqll, co, cl, qo, ql)?
+        let schema_rowid5 = obj_u(e, t, O_ROWNO) as i64
+        let name6 = obj_u(e, t, O_NAME)
+        let name_len5 = obj_u(e, t, O_NAMEL)
+        let name7 = obj_u(e, t, O_NAME)
+        let name_len6 = obj_u(e, t, O_NAMEL)
+        schema_update(e, schema_rowid5, name6, name_len5, name7, name_len6, ts, tsl, false)?
+        for j in 0usize..e.schema_objs {
+            if obj_type(e, j) != OT_INDEX || obj_u(e, j, O_TABLE) != t || obj_u(e, j, O_SQLL) == 0 {
+                continue
+            }
+            let sql_value = obj_u(e, j, O_SQL)
+            let sql_len = obj_u(e, j, O_SQLL)
+            let (is, isl) = rename_tokens(e, sql_value, sql_len, co, cl, qo, ql)?
+            let schema_rowid6 = obj_u(e, j, O_ROWNO) as i64
+            let name8 = obj_u(e, j, O_NAME)
+            let name_len7 = obj_u(e, j, O_NAMEL)
+            let tbl2 = obj_u(e, j, O_TBL)
+            let tbl_len2 = obj_u(e, j, O_TBLL)
+            schema_update(e, schema_rowid6, name8, name_len7, tbl2, tbl_len2, is, isl, false)?
+        }
+        return schema_changed(e)
+    }
+    err(fail(e, SQLITE_ERROR, "unsupported ALTER TABLE"))
+}
+
+// Renames identifier tokens equal to `old` that follow the first "(".
+fn rename_tokens(e: &mut Engine, o: usize, l: usize, old: usize, ol: usize, new_o: usize, nl: usize) -> (usize, usize)!db.Error {
+    // Count matches before the opening parenthesis (object names).
+    e.src = o
+    e.src_end = o + l
+    e.pos = o
+    e.ts = o
+    e.tl = 0
+    e.last_end = o
+    next_token(e)
+    skip := 0usize
+    for e.tk != TK_EOF && e.tk != TK_LP {
+        if e.tk == TK_ID || e.tk == TK_QID {
+            io := if e.tk == TK_ID {
+                e.ts
+            } else {
+                e.ts + 1
+            }
+            il := if e.tk == TK_ID {
+                e.tl
+            } else {
+                e.tl - 2
+            }
+            if names_eq(e, io, il, old, ol) {
+                skip += 1
+            }
+        }
+        next_token(e)
+    }
+    same := names_eq(e, new_o, nl, old, ol)
+    cur_o := o
+    cur_l := l
+    for _ in 0usize..10000 {
+        let (a, b) = find_name_token(e, cur_o, cur_l, skip, old, ol)
+        if b == 0 {
+            break
+        }
+        let (ns, nsl) = splice(e, cur_o, cur_l, a, b, new_o, nl)?
+        cur_o = ns
+        cur_l = nsl
+        if same {
+            skip += 1
+        }
+    }
+    ok((cur_o, cur_l))
+}
