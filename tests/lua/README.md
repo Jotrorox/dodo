@@ -37,6 +37,11 @@ python3 scripts/test_lua.py suite [--files strings,pm] [--no-dump] [--no-clibs]
 python3 scripts/test_lua.py bench [--repeat N]
 ```
 
+CI runs the same check without Python: `cargo test --test lua_corpus` builds
+`examples/lua` with the compiler under test and runs every script against its
+expected file (`tests/lua_corpus.rs` ports the directives, environment and
+stderr rules below). It also builds and runs `examples/lua_embed`.
+
 `--lua` defaults to `build/lua`; `--lua ref` means the reference build.
 Arguments to `check`, `diff` and `expect` can be paths, directories, test
 names, or name prefixes (`coro_` runs every `coro_*.lua`).

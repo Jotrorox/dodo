@@ -109,7 +109,7 @@ buffer. By contrast, a `NativeString` continues to borrow its backing storage.
 [environment](environment.md), [threads](threads.md),
 [synchronization](synchronization.md), [clocks](time.md), [networking](networking.md),
 [TLS](tls.md), [web static files](web.md#optional-static-files) and the
-[Lua runtime](script.md#standard-libraries-and-platforms) select their
+[Lua runtime](script.md#platforms) select their
 adapters independently. [Console](console.md) uses the platform stream adapter.
 `std/AREA/native` resolves to `std/AREA/posix` or `std/AREA/windows` using the
 compilation target, including `dodo check --target ...`. `std/AREA/linux` and

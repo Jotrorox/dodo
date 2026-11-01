@@ -57,6 +57,7 @@ they are not prerequisites for using the safe entry APIs.
 | Serve a route | `app.new().get(...).run(...)` from `std/web/app` | [Web applications](web.md) |
 | React to MQTT messages or publish on a timer | `app.new(id).on(...).every(...).run(url)` from `std/mqtt/app` | [MQTT](mqtt.md) |
 | Run an MQTT broker | `broker.new().run(address)` from `std/mqtt/broker` | [MQTT](mqtt.md#the-broker) |
+| Run Lua scripts or plugins inside a program | `lua.Lua.new()`, `open_libs()` and `cx.do_string` from `std/script/lua` | [Embedded scripting with Lua](script.md) |
 
 Use a fresh directory for each copied example and run the commands there.
 A marked `dodo test` example also runs through
@@ -208,6 +209,7 @@ individual modules and links every public declaration back to its source.
 | [HTTP](http.md), [hosted HTTP/HTTPS](hosted-http.md) | `std/http`, `std/http/client`, `std/http/connection`, `std/http/hosted`, `std/http/https`, `std/http/server` | Protocol/polling portable; hosted/HTTPS explicit. |
 | [MQTT](mqtt.md) | `std/mqtt`, `std/mqtt/app`, `std/mqtt/broker`, `std/mqtt/hosted` | Packets/topics/handlers/test deliveries portable; app, broker, and client hosted. |
 | [Web serving](web.md) | `std/web`, `std/web/application`, `std/web/app`, `std/web/hosted`, `std/web/https`, `std/web/reactor`, `std/web/response`, `std/web/server`, `std/web/static_files`, `std/web/stream`, `std/web/testing` | Routing/registration/composition portable; app/hosted/HTTPS/reactor/static files explicit. |
+| [Embedded scripting with Lua](script.md) | `std/script/lua` | Hosted: Linux, macOS, and Windows; `io` and `os` follow the target C library. |
 | [Hardware and embedded](hardware.md) | `std/embedded/hal`, `std/embedded/hal/serial`, `std/embedded/hal/fake`, `std/embedded/executor`, `std/embedded/power`, `std/embedded/board`, `std/embedded/chip`, `std/embedded/peripheral/designware_i2c`, `std/embedded/peripheral/pl022`, `std/embedded/peripheral/pl011`, `std/embedded/wireless/cyw43`, `std/embedded/can/mcp2515`, `std/embedded/cortex_m` | `std/embedded/hal`, `std/embedded/executor`, and `std/embedded/power` are portable, with interrupt masking on bare-metal Cortex-M and RISC-V. `std/embedded/cortex_m` (interrupt controller, SysTick, barriers) runs only on Cortex-M. `std/embedded/board` and `std/embedded/chip` resolve to the firmware build's board and chip packages, such as `std/embedded/board/pico2` and `std/embedded/chip/rp2350`. |
 
 ## Implementation and adapter packages
@@ -259,12 +261,14 @@ select providers; they are not additional recommended starting paths.
 | `std/gpu/opengl/macos` | CGL context adapter; use [OpenGL](opengl.md). |
 | `std/gpu/opengl/windows` | WGL context adapter; use [OpenGL](opengl.md). |
 | `std/gpu/opengl/common` | Error type and helpers the adapters share; use [OpenGL](opengl.md). |
+| `std/script/posix` | Lua host boundary on Linux and macOS (C library streams, processes, time, locale); use [Lua](script.md#platforms). |
+| `std/script/windows` | Lua host boundary on Windows; use [Lua](script.md#platforms). |
 
 Virtual imports `std/platform/native`, `std/fs/native`, `std/env/native`,
 `std/process/native`, `std/signal/native`, `std/thread/native`, `std/sync/native`, `std/net/native`,
 `std/time/native`, `std/tls/native`, `std/quic/native`, `std/crypto/native`,
-`std/crypto/openssl/native`, `std/web/native`, `std/window/native` and
-`std/gpu/opengl/native` select compatible providers. `std/platform/native` exposes advanced native values;
+`std/crypto/openssl/native`, `std/web/native`, `std/window/native`,
+`std/gpu/opengl/native` and `std/script/native` select compatible providers. `std/platform/native` exposes advanced native values;
 `std/net/native` is also the public socket entry point. Explicit `linux`/`windows`
 imports are for matching-target integrations. `runtime.c` files are embedded
 implementation boundaries, not Dodo imports.

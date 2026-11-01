@@ -75,7 +75,7 @@ print(string.unpack("<i16", string.pack("<i16", -2)), pcall(string.unpack, "<i16
 print(string.unpack(">I3", "\1\2\3"), string.unpack("<h", "\255\255"), string.unpack("f", string.pack("f", 0.1)))
 print(string.pack("<f", 1e300):byte(1, -1))
 print(string.pack("<f", -1e300):byte(1, -1))
-print(string.pack("<f", 0/0):byte(1, -1))
+print((function(a, b, c, d) return a, b, c, d & 0x7f end)(string.pack("<f", 0/0):byte(1, -1)))  -- 0/0 has the sign bit set on x86-64
 print(string.pack("<f", 3.4028235e38):byte(1, -1))
 print(string.pack("<f", 1e-50):byte(1, -1))
 print(string.unpack("i4", string.pack("i4", 100), 1), pcall(string.unpack, "i4", "abc", 5))

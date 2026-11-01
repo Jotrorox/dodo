@@ -38,8 +38,16 @@ fn build_tool() -> (Workspace, PathBuf) {
             fs::copy(&path, package.join(path.file_name().unwrap())).unwrap();
         }
     }
-    fs::copy(root().join("tests/lua_compiler/tool/lua_tool.dodo"), package.join("lua_tool.dodo")).unwrap();
-    fs::copy(root().join("tests/lua_compiler/tool/main.dodo"), dir.join("main.dodo")).unwrap();
+    fs::copy(
+        root().join("tests/lua_compiler/tool/lua_tool.dodo"),
+        package.join("lua_tool.dodo"),
+    )
+    .unwrap();
+    fs::copy(
+        root().join("tests/lua_compiler/tool/main.dodo"),
+        dir.join("main.dodo"),
+    )
+    .unwrap();
     let tool = dir.join("luatool");
     let output = Command::new(COMPILER)
         .arg("build")
@@ -93,8 +101,14 @@ fn lua_compiler_matches_reference_luac() {
 
     let snippets = root().join("tests/lua_compiler/snippets");
     for name in lua_sources(&snippets) {
-        let output = Command::new(&tool).current_dir(&snippets).arg("-l").arg(&name).output().unwrap();
-        let expected = fs::read_to_string(snippets.join(name.replace(".lua", ".expected"))).unwrap();
+        let output = Command::new(&tool)
+            .current_dir(&snippets)
+            .arg("-l")
+            .arg(&name)
+            .output()
+            .unwrap();
+        let expected =
+            fs::read_to_string(snippets.join(name.replace(".lua", ".expected"))).unwrap();
         let actual = normalize_addresses(&String::from_utf8_lossy(&output.stdout));
         if !output.status.success() || actual != expected {
             failures.push(format!(
@@ -106,7 +120,11 @@ fn lua_compiler_matches_reference_luac() {
 
     let errors = root().join("tests/lua_compiler/errors");
     for name in lua_sources(&errors) {
-        let output = Command::new(&tool).current_dir(&errors).arg(&name).output().unwrap();
+        let output = Command::new(&tool)
+            .current_dir(&errors)
+            .arg(&name)
+            .output()
+            .unwrap();
         let expected = fs::read_to_string(errors.join(name.replace(".lua", ".expected"))).unwrap();
         let stderr = String::from_utf8_lossy(&output.stderr);
         let actual = stderr.strip_prefix("luatool: ").unwrap_or(&stderr);

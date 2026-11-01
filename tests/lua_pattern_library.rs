@@ -48,7 +48,12 @@ fn describe(case: &str) -> String {
     if parts.len() != 3 {
         return case.to_string();
     }
-    format!("subject {} pattern {} init {}", field(parts[0]), field(parts[1]), parts[2])
+    format!(
+        "subject {} pattern {} init {}",
+        field(parts[0]),
+        field(parts[1]),
+        parts[2]
+    )
 }
 
 #[test]
@@ -82,7 +87,11 @@ fn lua_patterns_match_reference_interpreter() {
     let case_lines: Vec<&str> = cases.lines().collect();
     let expected_lines: Vec<&str> = expected.lines().collect();
     let actual_lines: Vec<&str> = actual.lines().collect();
-    assert_eq!(case_lines.len(), expected_lines.len(), "fixture line counts differ");
+    assert_eq!(
+        case_lines.len(),
+        expected_lines.len(),
+        "fixture line counts differ"
+    );
     let mut failures = Vec::new();
     for (i, case) in case_lines.iter().enumerate() {
         let got = actual_lines.get(i).copied().unwrap_or("<missing>");
@@ -101,7 +110,12 @@ fn lua_patterns_match_reference_interpreter() {
         "{} of {} Lua pattern cases differ from the reference:\n{}",
         failures.len(),
         case_lines.len(),
-        failures.iter().take(20).cloned().collect::<Vec<_>>().join("\n")
+        failures
+            .iter()
+            .take(20)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n")
     );
     fs::remove_dir_all(scratch).unwrap();
 }

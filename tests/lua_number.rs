@@ -22,8 +22,7 @@ fn success(output: &Output, context: &str) {
 #[test]
 fn lua_number_conversions_match_recorded_vectors() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let scratch =
-        std::env::temp_dir().join(format!("dodo-lua-number-{}", std::process::id()));
+    let scratch = std::env::temp_dir().join(format!("dodo-lua-number-{}", std::process::id()));
     let package = scratch.join("lua");
     fs::create_dir_all(&package).unwrap();
     fs::copy(
@@ -88,7 +87,9 @@ fn lua_number_conversions_match_recorded_vectors() {
         let mut failures = Vec::new();
         for ((command, want), got) in expected.iter().zip(actual.iter()) {
             if want != got {
-                failures.push(format!("{command}\n  expected [{want}]\n  actual   [{got}]"));
+                failures.push(format!(
+                    "{command}\n  expected [{want}]\n  actual   [{got}]"
+                ));
             }
         }
         assert!(
@@ -96,7 +97,12 @@ fn lua_number_conversions_match_recorded_vectors() {
             "-O{optimization}: {} of {} vectors differ:\n{}",
             failures.len(),
             expected.len(),
-            failures.iter().take(20).cloned().collect::<Vec<_>>().join("\n")
+            failures
+                .iter()
+                .take(20)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n")
         );
     }
     fs::remove_dir_all(scratch).unwrap();

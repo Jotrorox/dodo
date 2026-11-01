@@ -225,20 +225,33 @@ fn script_runtimes_select_the_script_host_adapter() {
         ("std/script/lua", "x86_64-unknown-linux-gnu", "posix"),
         ("std/script/lua", "x86_64-pc-windows-gnu", "windows"),
     ] {
-        fs::write(&source, format!("package main\nimport \"{import}\"\nfn main() {{}}\n")).unwrap();
+        fs::write(
+            &source,
+            format!("package main\nimport \"{import}\"\nfn main() {{}}\n"),
+        )
+        .unwrap();
         let loaded = package::load_for_target(&source, target).unwrap();
         let adapter_path = format!("<stdlib>/std/script/{adapter}.dodo");
         assert!(
-            loaded.sources.iter().any(|s| s.path.to_str() == Some(adapter_path.as_str())),
+            loaded
+                .sources
+                .iter()
+                .any(|s| s.path.to_str() == Some(adapter_path.as_str())),
             "{import} for {target}"
         );
         let native = package::native_sources(&loaded);
         assert!(
-            native.iter().any(|(name, _)| *name == "std/script/runtime.c"),
+            native
+                .iter()
+                .any(|(name, _)| *name == "std/script/runtime.c"),
             "{import} for {target}"
         );
     }
-    fs::write(&source, "package main\nimport \"std/script/native\"\nfn main() {}\n").unwrap();
+    fs::write(
+        &source,
+        "package main\nimport \"std/script/native\"\nfn main() {}\n",
+    )
+    .unwrap();
     assert!(
         package::load_for_target(&source, "thumbv6m-none-eabi")
             .unwrap_err()
