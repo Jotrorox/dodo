@@ -434,7 +434,9 @@ fn io_number_text(cx: &Cx, idx: i32, out: &mut[u8]) -> usize {
     }
     match cx.to_number(idx) {
         some(v) => {
-            return num_format_float(out, v, b'g', 0, -1, 14)
+            let n = num_format_float(out, v, b'g', 0, -1, 14)
+            num_localize(out, n)
+            return n
         },
         none => {
             return 0

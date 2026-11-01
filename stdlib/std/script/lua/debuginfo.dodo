@@ -12,6 +12,9 @@ const HOOK_MASK_CALL: u8 = 1
 const HOOK_MASK_RET: u8 = 2
 const HOOK_MASK_LINE: u8 = 4
 const HOOK_MASK_COUNT: u8 = 8
+// Set asynchronously by the SIGINT handler (Cx.watch_interrupt): the next
+// traced instruction raises "interrupted!".
+const HOOK_MASK_INTERRUPT: u8 = 128
 const HOOK_CALL: i32 = 0
 const HOOK_RET: i32 = 1
 const HOOK_LINE: i32 = 2
@@ -911,6 +914,11 @@ fn hook_return(L: *mut State, ci: *mut CallInfo, nres: i32) -> void!Throw {
 // interpreter must keep tracing.
 fn vm_trace(L: *mut State, ci: *mut CallInfo, pc: *mut u32) -> bool!Throw {
     unsafe {
+        if ((*L).hookmask & HOOK_MASK_INTERRUPT) != 0 {
+            (*L).hookmask = (*L).hookmask & ~HOOK_MASK_INTERRUPT
+            (*ci).savedpc = pc
+            return err(err_interrupted(L))
+        }
         let mask = (*L).hookmask
         if (mask & (HOOK_MASK_LINE | HOOK_MASK_COUNT)) == 0 {
             return ok(mask != 0)
@@ -952,5 +960,41 @@ fn vm_trace(L: *mut State, ci: *mut CallInfo, pc: *mut u32) -> bool!Throw {
             (*L).oldpc = npci
         }
         return ok(true)
+    }
+}
+
+// The error of an interrupt, positioned like luaL_error at level 1 (the
+// caller of the interrupted function), as lua.c's handler reports it.
+fn err_interrupted(L: *mut State) -> Throw {
+    unsafe {
+        let ci = (*L).ci
+        let prev = (*ci).previous
+        s := SBuf.new(L)
+        if !ptr.is_null(prev) {
+            (*L).ci = prev
+            let r = err_add_position(L, &mut s)
+            (*L).ci = ci
+            match r {
+                ok() => {},
+                err(e) => {
+                    return e
+                },
+            }
+        }
+        match s.add_str("interrupted!") {
+            ok() => {},
+            err(e) => {
+                return e
+            },
+        }
+        match s.to_lstring() {
+            ok(str) => {
+                err_set_msg(L, str)
+                return Throw.Runtime
+            },
+            err(e) => {
+                return e
+            },
+        }
     }
 }

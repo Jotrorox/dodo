@@ -1090,12 +1090,39 @@ fn num_float_to_string(out: &mut[u8], value: f64) -> usize {
     for index in 0usize..length {
         c := out[index]
         if c != 45 && (c < 48 || c > 57) {
+            num_localize(out, length)
             return length
         }
     }
-    out[length] = 46
+    out[length] = num_decimal_point()
     out[length + 1] = 48
     return length + 2
+}
+
+// Radix character of the current C locale (LC_NUMERIC), as C's printf and
+// strtod use it. os.setlocale keeps it current; it is '.' in the "C" locale.
+static mut NUM_DECPOINT: u8 = 46
+
+fn num_decimal_point() -> u8 {
+    unsafe { return NUM_DECPOINT }
+}
+
+fn num_set_decimal_point(point: u8) {
+    unsafe { NUM_DECPOINT = point }
+}
+
+// Replace the '.' of a formatted float by the locale's radix character.
+fn num_localize(out: &mut[u8], length: usize) {
+    let point = num_decimal_point()
+    if point == 46 {
+        return
+    }
+    for index in 0usize..length {
+        if out[index] == 46 {
+            out[index] = point
+            return
+        }
+    }
 }
 
 // Lua tostring() for integers.
@@ -1531,6 +1558,33 @@ fn num_parse_decimal(text: &[u8], start: usize, end: usize, negative: bool, ival
 
 // Lua 5.4 string -> number: 0 = not a numeral, 1 = integer (*ival), 2 = float (*fval).
 fn num_string_to_number(text: &[u8], ival: &mut i64, fval: &mut f64) -> u32 {
+    // Like strtod, also accept the locale's radix character (used instead
+    // of '.', never together with it).
+    let point = num_decimal_point()
+    if point != 46 && text.len <= 200 {
+        at := text.len
+        for index in 0usize..text.len {
+            if text[index] == 46 {
+                at = text.len
+                break
+            }
+            if text[index] == point && at == text.len {
+                at = index
+            }
+        }
+        if at < text.len {
+            copy := [0u8; 200]
+            for index in 0usize..text.len {
+                copy[index] = text[index]
+            }
+            copy[at] = 46
+            return num_string_to_number_c(&copy[..text.len], ival, fval)
+        }
+    }
+    return num_string_to_number_c(text, ival, fval)
+}
+
+fn num_string_to_number_c(text: &[u8], ival: &mut i64, fval: &mut f64) -> u32 {
     end := text.len
     for end > 0 && num_is_space(text[end - 1]) {
         end = end - 1

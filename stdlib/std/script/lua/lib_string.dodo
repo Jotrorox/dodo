@@ -362,7 +362,22 @@ struct SlBuf {
         return ok()
     }
 
+    // Formats with the locale's radix character, like C's printf.
     fn add_fmt_float(&mut self, v: f64, conv: u8, flags: u32, width: i32, prec: i32) -> void!Throw {
+        dst := sl_null_mut()
+        self.room(NUM_BUFFER, &mut dst)?
+        let k = unsafe {
+            let out = ptr.borrow_slice_mut(dst, NUM_BUFFER, self)
+            let n = num_format_float(out, v, conv, flags, width, prec)
+            num_localize(out, n)
+            n
+        }
+        self.add_size(k)
+        return ok()
+    }
+
+    // Formats with '.' whatever the locale (for %q, which must reload).
+    fn add_fmt_float_c(&mut self, v: f64, conv: u8, flags: u32, width: i32, prec: i32) -> void!Throw {
         dst := sl_null_mut()
         self.room(NUM_BUFFER, &mut dst)?
         let k = unsafe {

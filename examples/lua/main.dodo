@@ -174,7 +174,10 @@ fn docall(cx: &mut lua.Cx, narg: i32, nres: i32) -> i32 {
         },
     }
     cx.insert(base)
+    // Ctrl-C interrupts the chunk ("interrupted!"), a second one kills it.
+    cx.watch_interrupt(true)
     let status = cx.pcall(narg, nres, base)
+    cx.watch_interrupt(false)
     cx.remove(base)
     return status
 }
@@ -399,10 +402,23 @@ fn handle_script(cx: &mut lua.Cx, prog: &Prog, args: &Args, script: usize) -> i3
     }
     if status == lua.OK {
         // Push the script arguments.
+        // Like lua.c, errors here are reported as runtime errors with the
+        // error object on the stack.
         match cx.get_global("arg") {
-            ok(_) => {},
+            ok(t) => {
+                if t != lua.TTABLE {
+                    cx.pop(1)
+                    match cx.push_str("'arg' is not a table") {
+                        ok() => {},
+                        err(_) => {
+                            return report(cx, prog, lua.ERRMEM)
+                        },
+                    }
+                    return report(cx, prog, lua.ERRRUN)
+                }
+            },
             err(_) => {
-                return report(cx, prog, lua.ERRMEM)
+                return report(cx, prog, lua.ERRRUN)
             },
         }
         n := 0i32
@@ -410,16 +426,24 @@ fn handle_script(cx: &mut lua.Cx, prog: &Prog, args: &Args, script: usize) -> i3
             ok(v) => {
                 n = v as i32
             },
-            err(_) => {},
+            err(_) => {
+                return report(cx, prog, lua.ERRRUN)
+            },
         }
         if !cx.check_stack(n + 3) {
             cx.pop(1)
+            match cx.push_str("too many arguments to script") {
+                ok() => {},
+                err(_) => {},
+            }
             return report(cx, prog, lua.ERRRUN)
         }
         for i in 1i32..(n + 1) {
             match cx.get_i(-i, i as i64) {
                 ok(_) => {},
-                err(_) => {},
+                err(_) => {
+                    return report(cx, prog, lua.ERRRUN)
+                },
             }
         }
         cx.remove(-n - 1)
@@ -597,7 +621,6 @@ fn incomplete(cx: &mut lua.Cx, status: i32) -> bool {
                             }
                         }
                         if okm {
-                            cx.pop(1)
                             return true
                         }
                     }
@@ -631,6 +654,8 @@ fn multiline(cx: &mut lua.Cx) -> i32 {
         if !incomplete(cx, status) || !push_line(cx, false) {
             return status
         }
+        // Drop the error message of the incomplete chunk.
+        cx.remove(-2)
         match cx.push_str("\n") {
             ok() => {},
             err(_) => {

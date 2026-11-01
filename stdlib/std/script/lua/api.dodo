@@ -1585,6 +1585,24 @@ pub struct Cx {
         }
     }
 
+    // While `on`, the first SIGINT (Ctrl-C) makes the Lua code running in
+    // this thread raise "interrupted!" at its next jump, loop or call; the
+    // handler then restores the default action, so a second SIGINT ends a
+    // program stuck in native code. This is what the standalone interpreter
+    // does around each chunk it runs. Turn it off before the thread is closed.
+    pub fn watch_interrupt(&mut self, on: bool) {
+        unsafe {
+            let L = self.L
+            if on {
+                let mask = ptr.offset(L as *mut u8, mem.offset_of::<State>("hookmask") as isize)
+                script_host.dodo_script_watch_interrupt(mask)
+            } else {
+                script_host.dodo_script_watch_interrupt(0 as *mut u8)
+                (*L).hookmask = (*L).hookmask & ~HOOK_MASK_INTERRUPT
+            }
+        }
+    }
+
     // Install (or remove, with mask 0) the debug hook of this thread.
     pub fn set_hook(&mut self, f: HookFn, mask: i32, count: i32) {
         unsafe {

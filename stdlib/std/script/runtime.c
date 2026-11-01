@@ -10,6 +10,7 @@
 #endif
 #include <errno.h>
 #include <locale.h>
+#include <signal.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -188,6 +189,12 @@ const char *dodo_script_setlocale(int32_t category, const char *locale) {
     return setlocale(categories[category], locale);
 }
 
+/* The radix character of the current LC_NUMERIC locale. */
+unsigned char dodo_script_decimal_point(void) {
+    const char *point = localeconv()->decimal_point;
+    return (unsigned char)(point != NULL && point[0] != 0 ? point[0] : '.');
+}
+
 /* A fresh temporary file name in out (capacity >= 32); 1 on success. POSIX
  * systems create the file (mkstemp) so the name cannot be taken by others. */
 int32_t dodo_script_tmpname(char *out, size_t capacity) {
@@ -204,3 +211,21 @@ int32_t dodo_script_tmpname(char *out, size_t capacity) {
     return 1;
 #endif
 }
+
+/* Ctrl-C for the interpreter: the first SIGINT sets bit 0x80 of the watched
+ * hook mask (the VM then raises "interrupted!") and restores the default
+ * action, so a second SIGINT terminates a program stuck in native code. */
+static volatile unsigned char *dodo_script_interrupt_target;
+
+static void dodo_script_on_interrupt(int sig) {
+    signal(sig, SIG_DFL);
+    if (dodo_script_interrupt_target != NULL) {
+        *dodo_script_interrupt_target |= 0x80;
+    }
+}
+
+void dodo_script_watch_interrupt(unsigned char *mask) {
+    dodo_script_interrupt_target = mask;
+    signal(SIGINT, mask != NULL ? dodo_script_on_interrupt : SIG_DFL);
+}
+
