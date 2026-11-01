@@ -269,6 +269,43 @@ the collector rules above.
   declare each name only once, and several library files need the same C
   functions.
 
+## Performance notes
+
+Benchmarks live in `benchmarks/lua` (`python3 scripts/test_lua.py bench`).
+Things the interpreter's speed depends on:
+
+* **Threaded dispatch.** The compiler gives an interpreter loop one indirect
+  branch per opcode handler only if the loop keeps its shape: the inner
+  `for { ... }` of `vm_execute` has no condition, its last statement is
+  `match ((i & 127) as u8) { ... }` with one arm per opcode, and the
+  statements before the match (fetch, trap test, `ra`) are plain `let`s with
+  distinct names that shadow nothing, plus assignments. Each arm that falls
+  through runs those statements again and dispatches by itself. Moving the
+  match, matching on a wider type, or adding a guard or range arm before
+  the opcode arms silently falls back to one shared switch.
+* **Keep the dispatch path short.** The trap test stays a predicted branch
+  before the dispatch; folding it into the opcode (`op | trapbit`) lengthens
+  the dependency chain to the indirect branch and was slower.
+* **Inlining is explicit.** Hot helpers called from `vm_execute` (table
+  lookups, barriers, stack arithmetic) are `@inline`; error, hook,
+  metamethod and allocation slow paths are `@cold` or `@inline(never)` so
+  they do not bloat the loop or perturb its register allocation. Check the
+  calls left in `vm_execute` with `--emit asm` after larger changes.
+* **Frame entry.** CALL and the returns set `cl`, `pc` and `base` directly;
+  re-deriving them through `ci->func` costs a chain of dependent loads.
+* **Checked arithmetic.** Use wrapping operations, masked shift counts and
+  `small_i32` for values known to be in range; each remaining check is a
+  compare and a branch, and the panic paths make helpers look bigger to the
+  inliner.
+* **Result payloads.** `T!Throw` with a non-void `T` returns its payload as
+  bytes the caller reassembles; hot internal functions return `void!Throw`
+  and write results through out-parameters (e.g. `tab_find_index`).
+* **Allocation.** Blocks up to 256 bytes come from the small-block free
+  lists in mem.dodo; the system allocator's slow paths dominated
+  allocation-heavy programs. Frees must pass the exact allocated size
+  (`MEM_CHECK` in mem.dodo verifies this; run the corpus and the suite with
+  it after changing object layouts).
+
 ## Development workflow
 
 * Fast builds: the stdlib is embedded when cargo builds the compiler, so
