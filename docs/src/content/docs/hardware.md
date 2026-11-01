@@ -1968,13 +1968,18 @@ Every chip package implements its `power.Power` protocol, every board hands it
 out as `b.power`, and `std/embedded/hal/fake.Power` implements it on a
 desktop. Power-aware code is therefore written and tested once, like a driver.
 
-There are three levels, from the lightest to the deepest:
+There are three levels, from the lightest to the deepest, and on the RP2350
+a fourth that switches power off:
 
 | Level | What stops | What wakes it | How |
 | --- | --- | --- | --- |
 | Sleep | The core | Any enabled interrupt | `power.Mode.Sleep`, the mode at reset |
 | Deep sleep | The core and every clock outside the sleep set | An interrupt from a peripheral whose clock still runs | `power.Mode.DeepSleep` with `set_sleep_clocks` |
-| Dormant | Every oscillator, and with them every clock | A pin event in a `power.Wake` | `dormant(&wake)` |
+| Dormant | Every oscillator, and with them every clock | A pin event or the timeout in a `power.Wake` | `dormant(&wake)` |
+| Power-down (RP2350) | Power to the cores, peripherals, and the SRAM not kept | A pin event or the timeout; the chip restarts | `b.power.power_down(&wake, retain)` |
+
+Running the whole chip slower also saves power while it works:
+`b.power.set_system_hz(hz)` [lowers the system clock](#a-slower-system-clock).
 
 ### Sleep modes
 
@@ -2061,6 +2066,41 @@ The events are `power.LEVEL_LOW`, `LEVEL_HIGH`, `FALLING_EDGE`, and
 first, with the pull it needs, so its level is defined while nothing runs.
 An edge or level that is present already ends the dormant state at once.
 
+A timeout ends a dormant state too. `wake.after_ms(ms)` adds one, alone or
+with pins, and `power.dormant_for(&mut b.power, ms)` is the shorthand for a
+timeout alone. Bit 63 of the result, `power.BY_TIME`, says the timeout
+passed; `power.by_time(woken)` tests it and `power.woken_pins(woken)`
+strips it, so pins reach up to `power.MAX_PINS - 1`, pin 62:
+
+```dodo
+wake := power.Wake.new()
+wake.on(15, power.RISING_EDGE)
+wake.after_ms(60_000)
+woken := b.power.dormant(&wake)!
+if power.by_time(woken) {
+    // a minute passed without a press
+}
+```
+
+Nothing that counts the crystal runs while the chip is dormant, so the
+timeout needs a slow clock that keeps running, and the time on it:
+
+- The **RP2040** counts it on its RTC, whose clock must come from a GPIO
+  clock input (`b.rtc.use_clock_input(&mut b.pins, 20, 32_768)`, see [real-time
+  clocks](#real-time-clocks-on-the-rp2040-and-rp2350)), and the RTC must be
+  set. `dormant` returns `Unsupported` while clk_rtc comes from the crystal
+  and `Busy` while the RTC has no time. The RTC counts whole seconds, so the
+  chip wakes one to two seconds after the timeout.
+- The **RP2350** counts it on its always-on timer, which must be set
+  (`Busy` otherwise). A tick from the crystal moves to the low-power
+  oscillator for the dormant state and back afterwards, and clk_ref runs
+  from that oscillator meanwhile so the power manager that raises the alarm
+  stays clocked. The chip wakes about a millisecond after the timeout, as
+  precisely as the oscillator counts.
+
+Either way an alarm the program set on `b.rtc` is put back afterwards, and
+`dormant` never wakes before the timeout.
+
 On the RP2040 and RP2350, `dormant` runs clk_sys from the crystal, stops
 PLL_SYS, the ring oscillator, and the crystal, and afterwards starts PLL_SYS
 again. Both cores stop. The microsecond timer pauses meanwhile, so `now_us`
@@ -2070,16 +2110,116 @@ Wait until serial ports have sent their last bytes before calling it. A
 complete example that blinks, deep-sleeps, and goes dormant until a button
 press is `examples/low_power.dodo`.
 
+### Power-down on the RP2350
+
+`b.power.power_down(&wake, retain)` switches off the RP2350's switched-core
+power domain, with both cores, the bus, and every peripheral, and the XIP
+cache and every SRAM domain not in `retain`, through the power manager.
+Only the always-on domain keeps power: the always-on timer, the power
+manager, and its scratch registers. A pin event or the timeout in `wake`
+powers the chip up again, and it restarts through reset into the program,
+from `main`:
+
+```dodo
+import "std/embedded/board"
+import "std/embedded/chip"
+import "std/embedded/power"
+
+// Kept with SRAM0, which holds the program's statics.
+@section(".noinit")
+static mut READINGS: u32 = 0
+
+fn main() {
+    b := board.take()!
+    if b.power.woke_from_power_down() && (b.power.retained() & chip.RETAIN_SRAM0) != 0 {
+        unsafe {
+            READINGS += 1
+        }
+    } else {
+        unsafe {
+            READINGS = 0
+        }
+    }
+    // ... take a reading ...
+    button := b.pins.input(15)!
+    wake := power.Wake.new()
+    wake.on(15, power.FALLING_EDGE)
+    wake.after_ms(600_000)
+    b.power.power_down(&wake, chip.RETAIN_SRAM0)!
+}
+```
+
+After the restart, `woke_from_power_down()` says this start followed a
+power-down, `power_down_wake()` says what ended it, as a `dormant` result
+(pins and `power.BY_TIME`), and `retained()` names the SRAM domains that
+stayed powered. `chip.RETAIN_SRAM0` keeps SRAM0 to SRAM3, the lower
+256 KiB, where the program's statics, `.noinit` ones included, live until
+they pass 256 KiB; `chip.RETAIN_SRAM1` keeps the rest, SRAM4 to SRAM9.
+Kept memory costs a little power; `chip.RETAIN_NOTHING` keeps none. For a
+few words without any SRAM, `b.power.set_scratch(index, value)` and
+`scratch(index)` use the power manager's scratch registers 0 to
+`chip.SCRATCH_WORDS - 1` (7 words), which keep their values through every
+reset but a loss of power.
+
+Up to four pin events wake the chip, one per pin and event kind, each a
+level or an edge; claim their pins as inputs first, with the pulls they
+need, as the pads keep their state while the core is off. A timeout uses the
+always-on timer, which must be set, replacing an alarm set on `b.rtc`; a
+tick from the crystal moves to the low-power oscillator, and `take()` moves
+it back. Both cores must wait for the power-down: stop a task running on
+core 1 first. `power_down` returns only on failure: `InvalidInput` for an
+empty `wake`, a pin from `chip.PIN_COUNT` up, more than four events, or
+another `retain`, `Busy` if the always-on timer has no time for a timeout or
+a power-up request cancels the power-down, and `Timeout` if the power manager
+does not take the request. An attached debugger does not keep the chip
+powered.
+
+### A slower system clock
+
+`b.power.set_system_hz(hz)` runs clk_sys, and with it clk_peri, at exactly
+`hz`, and `b.power.system_hz()` reads it back:
+
+```dodo
+// The crystal's 12 MHz, with PLL_SYS stopped.
+b.power.set_system_hz(b.power.crystal_hz())!
+// ... work slowly ...
+b.power.set_system_hz(chip.SYS_HZ)!
+```
+
+A rate the crystal divides into by a whole number, up to 256, runs from the
+crystal with PLL_SYS stopped, which saves the most. Another runs from
+PLL_SYS at the slowest VCO that reaches it exactly, such as 48 MHz from a
+768 MHz VCO, and `chip.SYS_HZ` restores the settings `take()` uses.
+`InvalidInput` refuses 0, rates above `chip.SYS_HZ`, and rates neither
+reaches. What changes with it:
+
+- UART, SPI, I2C, PWM, and PIO compute their dividers from clk_sys or
+  clk_peri when claimed, so `set_system_hz` returns `Busy` while one is
+  claimed. Release them and claim them again afterwards; claims use the
+  current rate. A SysTick reload the program set counts the new rate too.
+- The USB controller needs clk_sys above 48 MHz, so the USB serial port
+  refuses to open below that, and `set_system_hz` refuses a rate of 48 MHz or
+  less while it runs (`Busy`). The ADC and USB keep their 48 MHz clock from
+  PLL_USB.
+- The microsecond timer, the watchdog, and the real-time clocks keep their
+  rates, as they count clk_ref, clk_rtc, or their own ticks. Flash reads,
+  and with them code running from flash, slow down with clk_sys.
+- `dormant` restarts clk_sys at the rate set here.
+
 ### Testing power-aware code
 
 `fake.Power.new(essential, managed)` starts with every clock running. It
 refuses to disable `essential` clocks and treats `managed` clocks as
 peripherals that `disable_unused_clocks` stops. Tests can `claim` and
 `release` clocks as a chip does, and choose with `wake_next_dormant(pins)`
-which pins end the next dormant state. A dormant state that nothing could end
-traps instead of hanging the test. The fake counts `light_sleeps`,
-`deep_sleeps`, and `dormant_states`, and reports the `requested_events` of
-each pin.
+which pins end the next dormant state; without one of those, a dormant state
+with a timeout ends on it and returns `power.BY_TIME`. A dormant state that
+nothing could end traps instead of hanging the test. `refuse_timeouts(busy)`
+makes timeouts fail as on a chip whose clock has no time (`Busy`) or stops
+while dormant (`Unsupported`), until `accept_timeouts`. The fake counts
+`light_sleeps`, `deep_sleeps`, and `dormant_states`, and reports the
+`requested_events` of each pin, the `requested_timeout_ms`, and the total
+`dormant_ms` that timeouts lasted.
 
 ### Sleep controls of the Cortex-M core
 
@@ -3263,8 +3403,34 @@ generic over a register block for desktop tests, are in
 - The **RP2350's always-on timer** is the power manager's 64-bit millisecond
   counter, ticking from the crystal. It sits in the always-on power domain:
   once set, it keeps counting through the resets that leave that domain
-  running, such as the watchdog's, and a later `take()` finds it still set.
-  It stops when the chip loses power.
+  running, such as the watchdog's and the restart after a
+  [power-down](#power-down-on-the-rp2350), and a later `take()` finds it still
+  set. It stops when the chip loses power.
+
+Both can count from a clock that keeps running while the crystal is
+stopped, so they keep time while the chip is dormant or powered down and
+their alarm can [end those states](#dormant):
+
+- On the RP2040, `b.rtc.use_clock_input(&mut b.pins, pin, hz)` feeds clk_rtc
+  from a clock on GPIO 20 or 22 (the clock inputs GPIN0 and GPIN1), such as a
+  32.768 kHz oscillator. Faster inputs, up to 50 MHz, are divided down by the
+  smallest whole number that leaves 65536 Hz or less and a whole number of
+  hertz from 1 kHz up; a one-pulse-per-second input is not supported. The
+  time keeps counting, losing up to a second. `b.rtc.clock_hz()` and
+  `runs_while_dormant()` report the clock, and `release_clock_input(&mut
+  b.pins)` returns to the crystal and gives back the pin.
+- On the RP2350, `b.rtc.use_low_power_oscillator()` ticks from the on-chip
+  32 kHz oscillator at the frequency each chip's OTP records from
+  manufacturing, or `use_low_power_oscillator_at(hz)` at one the program
+  measured; it drifts by several percent with temperature and voltage.
+  `use_clock_input(&mut b.pins, pin, hz)` takes an external 32 kHz clock on
+  GPIO 12, 14, 20, or 22 in place of that oscillator, which also clocks the
+  power manager while the core is off, and `use_tick_input(&mut b.pins, pin)`
+  an external 1 kHz tick on one of those pins. `release_clock_input`
+  returns to the crystal, `use_crystal()` does so from the oscillator, and
+  `tick_source()` reports `rp_rtc.TICK_CRYSTAL`, `TICK_LPOSC`,
+  `TICK_CLOCK_INPUT`, or `TICK_INPUT`. A timed dormant state or a
+  power-down moves a crystal tick to the oscillator by itself.
 
 The alarm raises the clock's interrupt while `listen`ing: `RTC_IRQ` on the
 RP2040, during the alarm's second, and `POWMAN_IRQ_TIMER` on the RP2350,
@@ -3298,10 +3464,10 @@ With [low power](#low-power), the RP2040's RTC keeps counting in deep
 sleep only if its clock is in the sleep set, as in
 `b.power.set_sleep_clocks(rp2040.ALARM_CLOCKS | rp2040.CLOCK_RTC)`; its alarm
 then wakes the core like a timer alarm. The RP2350's always-on timer needs no
-gate and counts through deep sleep. Both tick from the crystal, which
-`b.power.dormant` stops, so neither counts while the chip is dormant, nor can
-its alarm end a dormant state; set the clock again from another source
-afterwards if the time matters.
+gate and counts through deep sleep. From the crystal, which
+`b.power.dormant` stops, the RP2040's RTC does not count while the chip is
+dormant; from a clock input it does. The RP2350's always-on timer always
+does, as `dormant` moves its tick to the low-power oscillator.
 
 ### Two cores on the RP2040 and RP2350
 
@@ -3739,13 +3905,18 @@ dodo build firmware.dodo --emit obj --target thumbv7em-none-eabihf \
 - Inline assembly lives inside functions; there is no global or naked
   assembly, so startup code and vector tables come from the chip runtime or a
   `@section`-placed static.
-- Low power covers sleep, deep sleep, clock gating, and the dormant state
-  woken by any GPIO the chip has (GPIO 0 to 47 on the RP2350B). The RP2350's power manager states, which switch
-  power domains off, its always-on timer, and waking a dormant chip by time
-  (the RP2040's RTC from an external clock, the RP2350's AON timer) are not
-  supported. Neither is lowering the system clock to save power. On a dual-core chip,
-  deep sleep stops the sleep set's other clocks only while both cores
-  deep-sleep.
+- Low power covers sleep, deep sleep, clock gating, the dormant state
+  woken by any GPIO the chip has (GPIO 0 to 47 on the RP2350B) or a timeout,
+  the RP2350's power-down states, and a slower system clock. A timed dormant
+  state on the RP2040 needs an external clock on GPIO 20 or 22 for its RTC
+  and wakes to the second. A power-down powers the XIP cache down too and
+  always restarts through reset; the RP2350's voltage regulator, brown-out
+  detector, and the power manager's GPIO outputs for external devices keep
+  their settings, and powering SRAM domains down while running is not
+  supported. `set_system_hz` refuses while a peripheral whose divider
+  follows clk_sys is claimed rather than re-deriving its rate, and does not
+  raise clk_sys above `chip.SYS_HZ`. On a dual-core chip, deep sleep stops
+  the sleep set's other clocks only while both cores deep-sleep.
 - The timer protocols count microseconds. Counters at other rates, a
   timer's capture and compare channels, and periodic hardware timers have no
   shared protocol; use the chip's own methods, as for the RP2040's and
@@ -3756,10 +3927,9 @@ dodo build firmware.dodo --emit obj --target thumbv7em-none-eabihf \
   are not paused. `std/embedded/flash/spi_nor` drives external SPI NOR chips
   over single-wire SPI only, without dual or quad reads, SST26 block
   protection, or erase suspend.
-- Real-time clocks tick from the crystal: the RP2040's RTC is not clocked
-  from a GPIO, nor the RP2350's always-on timer from its low-power
-  oscillator or a GPIO, so they stop while the chip is dormant and cannot
-  wake it, and the RP2350's power-down states are not supported.
+- The RP2040's RTC takes a GPIO clock from 1 kHz up, not a
+  one-pulse-per-second input, and the RP2350's always-on timer does not use
+  the power manager's 1 Hz synchronisation to an external pulse.
 - SPI by DMA and polled SPI transfers move frames of up to 8 bits; wider
   frames use the word methods, which wait. Channel signals come only from
   `DMA_IRQ_0`.

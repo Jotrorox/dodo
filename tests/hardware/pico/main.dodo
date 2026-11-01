@@ -1310,6 +1310,59 @@ fn power_checks(chip_power: &mut chip.Power, usb: &mut board.Usb, pins: &mut chi
     }
 }
 
+// clk_sys from the crystal and from PLL_SYS at 48 MHz, by the frequency
+// counter, and back at full speed. The timer keeps its rate, as it counts
+// clk_ref; a UART claimed at the slow rate keeps its baud, and while
+// claimed refuses a change.
+fn system_clock_checks(chip_power: &mut chip.Power, pins: &mut chip.Pins, timer: &mut chip.Timer) {
+    feed_watchdog()
+    crystal := chip_power.crystal_hz()
+    slow := !failed_with(chip_power.set_system_hz(crystal), hal.Error.Busy) && chip_power.system_hz() == crystal
+    crystal_khz := clk_sys_khz()
+    before := timer.now_us()
+    timer.delay_us(10_000)
+    delay := timer.now_us() - before
+    serial_ok := false
+    match pins.uart(4, none, 115_200) {
+        ok(port) => {
+            baud := port.baud()
+            busy := failed_with(chip_power.set_system_hz(chip.SYS_HZ), hal.Error.Busy)
+            pins.release_uart(port)
+            serial_ok = busy && baud > 113_000 && baud < 117_000
+        }
+        err(_) => {}
+    }
+    pll := !failed_with(chip_power.set_system_hz(48_000_000), hal.Error.Timeout) && chip_power.system_hz() == 48_000_000
+    pll_khz := clk_sys_khz()
+    back := !failed_with(chip_power.set_system_hz(chip.SYS_HZ), hal.Error.Timeout) && chip_power.system_hz() == chip.SYS_HZ
+    full_khz := clk_sys_khz()
+    check(slow && crystal_khz > 11_900 && crystal_khz < 12_100 && delay >= 10_000 && delay < 10_200 && serial_ok && pll && pll_khz > 47_500 && pll_khz < 48_500 && back && full_khz > chip.SYS_HZ / 1000 - 1000 && full_khz < chip.SYS_HZ / 1000 + 1000)
+}
+
+// A timed dormant state needs clk_rtc from a clock input. The Pico has no
+// 32 kHz oscillator on GPIO 20, so with the RTC unset only the refusals and
+// the input's ownership are checked.
+fn timed_dormant_checks(chip_power: &mut chip.Power, rtc: &mut chip.Rtc, pins: &mut chip.Pins) {
+    wake := power.Wake.new()
+    wake.after_ms(100)
+    unsupported := dormant_refused(chip_power, &wake, hal.Error.Unsupported) && !rtc.runs_while_dormant()
+    wrong := failed_with(rtc.use_clock_input(pins, 21, 32_768), hal.Error.InvalidInput) && failed_with(rtc.use_clock_input(pins, 20, 500), hal.Error.InvalidInput)
+    claimed := !failed_with(rtc.use_clock_input(pins, 20, 32_768), hal.Error.Timeout)
+    owned := refused(pins.input(20), hal.Error.Busy) && rtc.runs_while_dormant() && rtc.clock_hz() == 32_768
+    again := failed_with(rtc.use_clock_input(pins, 22, 32_768), hal.Error.Busy)
+    unset := dormant_refused(chip_power, &wake, hal.Error.Busy)
+    released := !failed_with(rtc.release_clock_input(pins), hal.Error.Timeout) && rtc.clock_hz() == 31_250 && !rtc.runs_while_dormant()
+    free := false
+    match pins.input(20) {
+        ok(pin) => {
+            pins.release(pin)
+            free = true
+        }
+        err(_) => {}
+    }
+    check(unsupported && wrong && claimed && owned && again && unset && released && free)
+}
+
 fn core1_checks(core1: &mut rp_multicore.Core1, fifos: &mut rp_multicore.Fifos, spinlocks: &mut rp_multicore.Spinlocks, timer: &mut chip.Timer) {
     feed_watchdog()
     fifo := fifos.claim()!
@@ -1990,6 +2043,8 @@ fn main() {
     core1_gpio_checks(&mut b.core1, &mut b.pins, &mut b.timer)
     rng_checks(&mut b.rng)
     power_checks(&mut b.power, &mut b.usb, &mut b.pins, &mut b.timer)
+    system_clock_checks(&mut b.power, &mut b.pins, &mut b.timer)
+    timed_dormant_checks(&mut b.power, &mut b.rtc, &mut b.pins)
     watchdog_checks(&mut b.watchdog, &mut b.timer)
     rtc_checks(&mut b.rtc, &mut b.watchdog, &mut b.timer)
     flash_checks(&mut b.flash, &mut b.core1, &mut b.timer)

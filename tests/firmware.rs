@@ -342,6 +342,124 @@ fn main() {
     }
 }
 
+// Waking a dormant chip by time, a slower system clock, and the real-time
+// clocks' other tick sources on every board, and the RP2350's power-down
+// states, linked into firmware.
+#[test]
+fn low_power_states_link_for_every_board() {
+    if !ld_lld() {
+        return;
+    }
+    let scratch = Scratch::new("low-power");
+    let portable = scratch.write(
+        "timed.dodo",
+        r#"package main
+import "std/embedded/board"
+import "std/embedded/chip"
+import "std/embedded/hal"
+import "std/embedded/power"
+fn nap<P: power.Power>(chip_power: &mut P, milliseconds: u64) -> bool!hal.Error {
+    woken := power.dormant_for(chip_power, milliseconds)?
+    return ok(power.by_time(woken))
+}
+fn main() {
+    b := board.take()!
+    // A 32.768 kHz oscillator on GPIO 20 keeps the clock running.
+    b.rtc.use_clock_input(&mut b.pins, 20, 32_768)!
+    b.rtc.set_ms(1_800_000_000_000)!
+    crystal := b.power.crystal_hz()
+    b.power.set_system_hz(crystal)!
+    core.assert(b.power.system_hz() == crystal)
+    button := b.pins.input(15)!
+    wake := power.Wake.new()
+    wake.on(15, power.FALLING_EDGE)
+    wake.after_ms(60_000)
+    woken := b.power.dormant(&wake)!
+    core.assert(power.by_time(woken) || power.woken_pins(woken) <= 1u64 << 15)
+    core.assert(nap(&mut b.power, 1000)!)
+    b.power.set_system_hz(chip.SYS_HZ)!
+    serial := b.pins.uart(4, none, 9600)!
+    match b.power.set_system_hz(crystal / 2) {
+        ok() => core.assert(false),
+        err(error) => core.assert(error == hal.Error.Busy),
+    }
+    b.pins.release_uart(serial)
+    b.rtc.release_clock_input(&mut b.pins)!
+    b.pins.release(button)
+}
+"#,
+    );
+    let power_down = scratch.write(
+        "power_down.dodo",
+        r#"package main
+import "std/embedded/board"
+import "std/embedded/chip"
+import "std/embedded/chip/rp_rtc"
+import "std/embedded/hal"
+import "std/embedded/power"
+// Survives the power-down with SRAM0 kept.
+@section(".noinit")
+static mut WAKES: u32 = 0
+fn main() {
+    b := board.take()!
+    if b.power.woke_from_power_down() && (b.power.retained() & chip.RETAIN_SRAM0) != 0 {
+        unsafe {
+            WAKES += 1
+        }
+        core.assert(b.power.power_down_wake() != 0)
+    } else {
+        unsafe {
+            WAKES = 0
+        }
+    }
+    count := b.power.scratch(0)
+    b.power.set_scratch(chip.SCRATCH_WORDS - 1, count + 1)
+    b.rtc.use_low_power_oscillator()!
+    core.assert(b.rtc.tick_source() == rp_rtc.TICK_LPOSC)
+    b.rtc.use_crystal()!
+    if !b.rtc.is_set()! {
+        b.rtc.set_ms(1_800_000_000_000)!
+    }
+    button := b.pins.input(15)!
+    wake := power.Wake.new()
+    wake.on(15, power.FALLING_EDGE)
+    wake.after_ms(3_600_000)
+    match b.power.power_down(&wake, chip.RETAIN_SRAM0) {
+        ok() => {}
+        err(error) => core.assert(error != hal.Error.InvalidInput),
+    }
+    b.pins.release(button)
+}
+"#,
+    );
+    for board in ["pico", "pico2", "pico2_w"] {
+        let mut sources = vec![(portable.as_path(), "timed")];
+        if board != "pico" {
+            sources.push((power_down.as_path(), "power-down"));
+        }
+        for (input, name) in sources {
+            for level in ["0", "2"] {
+                let elf = scratch.path(&format!("{name}-{board}-O{level}.elf"));
+                build(&[
+                    "build",
+                    input.to_str().unwrap(),
+                    "--board",
+                    board,
+                    "-O",
+                    level,
+                    "-o",
+                    &elf,
+                ]);
+                if board == "pico" {
+                    check_rp2040_firmware(Path::new(&elf));
+                } else {
+                    check_rp2350_firmware(Path::new(&elf));
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn platforms_fill_settings_that_are_not_explicit() {
     let blink = root().join("examples/blink");

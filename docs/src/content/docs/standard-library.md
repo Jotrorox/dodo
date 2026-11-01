@@ -165,8 +165,9 @@ the RP2040's RTC and the RP2350's always-on timer, through
 with the FIFOs, spinlocks, and RP2350 doorbells the cores share, through
 `std/embedded/chip/rp_multicore`, their watchdog through
 `std/embedded/chip/rp_watchdog`, and the free flash above the program
-through `std/embedded/chip/rp_flash`. The clock gating and dormant state both
-chips share are in `std/embedded/chip/rp_power`. `std/embedded/storage` keeps
+through `std/embedded/chip/rp_flash`. The clock gating, dormant state,
+system-clock rates, and RP2350 power-down states both chips share are in
+`std/embedded/chip/rp_power`. `std/embedded/storage` keeps
 a power-cut-safe key-value store on that flash, or on any device with the
 `hal.Flash` protocol, such as an external SPI NOR flash chip driven by
 `std/embedded/flash/spi_nor`.
@@ -177,8 +178,8 @@ tasks on a core, waking each on time or on an interrupt and sleeping
 in between; tasks are hand-written or [`async fn`s](async.md).
 `std/embedded/sync` shares values between interrupt handlers, tasks, and
 cores through `Mutex<T>` statics. `std/embedded/power` is the low-power layer every chip implements:
-sleep and deep sleep modes, clock gating, and a dormant state that pins
-end. `std/embedded/wireless/cyw43` drives the Pico 2 W's CYW43439 wireless chip
+sleep and deep sleep modes, clock gating, and a dormant state that pins or
+a timeout end. `std/embedded/wireless/cyw43` drives the Pico 2 W's CYW43439 wireless chip
 far enough for its LED; Wi-Fi and Bluetooth are not supported yet.
 `std/embedded/rtc/ds3231` drives a DS3231 battery-backed clock chip on I2C
 through the same real-time clock protocols as the chips' own clocks.

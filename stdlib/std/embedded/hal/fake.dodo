@@ -1876,8 +1876,10 @@ fn power_of_two(value: u32) -> bool {
 // the simulated chip manages for peripherals, and which of those are
 // claimed, and the fake records the sleeps and dormant states the code
 // under test asks for. A dormant state ends on the pins given to
-// `wake_next_dormant`; one that nothing could end traps instead of
-// hanging the test.
+// `wake_next_dormant`, or else on its timeout; one that nothing could end
+// traps instead of hanging the test. Timeouts work until
+// `refuse_timeouts`, which simulates a chip whose clocks all stop while it
+// is dormant.
 pub struct Power {
     deep: bool
     enabled: u64
@@ -1890,8 +1892,17 @@ pub struct Power {
     dormant_states: u32
     // The pins and events that end the next dormant state.
     wake_pins: u64
-    // The events the last dormant state waited for, per pin.
+    // The events the last dormant state waited for, per pin, and its
+    // timeout.
     requested: [64]u8
+    timeout: u64
+    // The milliseconds that dormant states have spent until their
+    // timeouts, in total.
+    slept: u64
+    // Dormant states with a timeout fail while `refusing`: with Busy if
+    // `refusal_busy`, else with Unsupported.
+    refusing: bool
+    refusal_busy: bool
 
     // Clocks 0 to 63 all exist. `essential` cannot be disabled, and
     // `managed` belong to peripherals, which disable_unused_clocks stops
@@ -1909,6 +1920,10 @@ pub struct Power {
             dormant_states: 0,
             wake_pins: 0,
             requested: [0u8; 64],
+            timeout: 0,
+            slept: 0,
+            refusing: false,
+            refusal_busy: false,
         }
     }
 
@@ -1930,9 +1945,34 @@ pub struct Power {
     }
 
     // End the next dormant state as if `pins` (bit n for pin n) changed;
-    // only those the dormant state waits for wake it.
+    // only those the dormant state waits for wake it. Without such a pin, a
+    // dormant state with a timeout ends on it.
     pub fn wake_next_dormant(&mut self, pins: u64) {
         self.wake_pins = pins
+    }
+
+    // Refuse every later dormant state with a timeout, as a chip does
+    // whose clock for it has no time set (`busy`: Busy) or does not run
+    // while dormant (Unsupported).
+    pub fn refuse_timeouts(&mut self, busy: bool) {
+        self.refusal_busy = busy
+        self.refusing = true
+    }
+
+    // Accept timeouts again.
+    pub fn accept_timeouts(&mut self) {
+        self.refusing = false
+    }
+
+    // The timeout of the last dormant state, 0 for none.
+    pub fn requested_timeout_ms(&self) -> u64 {
+        return self.timeout
+    }
+
+    // The milliseconds that dormant states ended by their timeouts have
+    // lasted, in total.
+    pub fn dormant_ms(&self) -> u64 {
+        return self.slept
     }
 
     // Waits in each mode, and dormant states, so far.
@@ -2010,16 +2050,27 @@ pub struct Power {
     }
 
     pub fn dormant(&mut self, wake: &power.Wake) -> u64!hal.Error {
-        waiting := wake.pins()
-        if waiting == 0 {
+        if wake.is_empty() {
             return err(hal.Error.InvalidInput)
+        }
+        timeout := wake.timeout_ms()
+        if timeout != 0 && self.refusing {
+            if self.refusal_busy {
+                return err(hal.Error.Busy)
+            }
+            return err(hal.Error.Unsupported)
         }
         for index in 0u32..64 {
             self.requested[index as usize] = wake.events(index) as u8
         }
-        woken := waiting & self.wake_pins
-        // Nothing would ever end this dormant state.
-        core.assert(woken != 0)
+        self.timeout = timeout
+        woken := wake.pins() & self.wake_pins
+        if woken == 0 {
+            // Nothing would ever end this dormant state.
+            core.assert(timeout != 0)
+            woken = power.BY_TIME
+            self.slept += timeout
+        }
         self.wake_pins = 0
         self.dormant_states += 1
         return ok(woken)
