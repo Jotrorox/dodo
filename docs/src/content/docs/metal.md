@@ -12,9 +12,8 @@ install. Building for a macOS target links Metal, QuartzCore, Foundation and
 libobjc automatically.
 
 The module follows Metal closely, one Dodo method per Metal method, so Apple's
-documentation applies directly. It is the bottom layer for a future portable
-`std/gpu`: higher layers can be built on it in Dodo, and programs can use it
-on its own.
+documentation applies directly. It is the bottom layer of the portable
+[std/gpu](gpu.md) on macOS, and programs can use it on its own.
 
 ## Quickstart
 

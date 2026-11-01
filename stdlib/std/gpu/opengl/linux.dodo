@@ -14,7 +14,9 @@ import "std/gpu/opengl/common"
 // elsewhere; drawing goes to framebuffer objects either way.
 
 unsafe extern "C" fn dlopen(path: *const u8, mode: i32) -> *mut u8
-unsafe extern "C" fn dlsym(handle: *mut u8, name: *const u8) -> usize
+// Declared with the pointer result std/dylib and std/gpu/metal use, as one
+// program may load all three: a symbol has a single C signature.
+unsafe extern "C" fn dlsym(handle: *mut u8, name: *const u8) -> *mut u8
 unsafe extern "C" fn dlclose(handle: *mut u8) -> i32
 
 const RTLD_NOW: i32 = 2
@@ -87,7 +89,7 @@ unsafe fn load_egl(library: *mut u8) -> Option<Egl> {
     addresses := [0usize; 12]
     for i in 0usize..12 {
         address := unsafe {
-            dlsym(library, common.c_string(names[i]))
+            dlsym(library, common.c_string(names[i])) as usize
         }
         if address == 0 {
             return none
@@ -311,7 +313,7 @@ pub struct Backend {
         }
         if address == 0 && !ptr.is_null(self.gl_library) {
             address = unsafe {
-                dlsym(self.gl_library, name)
+                dlsym(self.gl_library, name) as usize
             }
         }
         return address

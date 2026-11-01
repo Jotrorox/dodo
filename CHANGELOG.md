@@ -16,6 +16,34 @@
   unused bytes for the next fill. A stopped source reports `Timeout` and
   failing health checks `Bus`. Both drivers are generic over
   `hal.Registers` and tested against simulated registers on the desktop.
+- `std/gpu`: portable GPU compute and rendering on Metal, Vulkan and
+  OpenGL, written in Dodo on top of `std/gpu/metal`, `std/gpu/vulkan` and
+  `std/gpu/opengl`. It follows WebGPU's model: a `Device` creates buffers,
+  2D textures, samplers and compute and render pipelines; a
+  `CommandEncoder` records compute passes, render passes and copies;
+  `submit()` runs them in order, and `write_buffer`, `read_buffer`,
+  `write_texture` and `read_texture` move data in queue order.
+  `Device.open` picks Metal on macOS and Vulkan elsewhere, falling back to
+  OpenGL 4.5. Shaders come as SPIR-V, MSL and GLSL in one `ShaderSource`,
+  with numbered binding slots that mean the same in every language, and
+  clip space, depth range, winding and texture rows agree on every backend.
+  Every call is checked (usages, ranges, pipeline layouts and attachment
+  formats, workgroup limits, and SPIR-V entry points), and resources dropped
+  while the GPU may still use them are destroyed once it has finished.
+  Backends implement the `std/gpu/hal` interface; `std/gpu/hal/native`
+  selects the OS's own API. A fixture runs the same compute, rendering,
+  depth, sampling, blending, copy and lifetime checks on Metal, on Vulkan
+  with lavapipe and on OpenGL with llvmpipe, clean under the Vulkan
+  validation and synchronization layers and Metal's debug layer.
+  `examples/gpu_compute.dodo` and `examples/gpu_triangle.dodo` show compute
+  and a window. The Vulkan guide moved to its own page, and
+  `std/gpu/opengl` now declares `dlsym` and `GetProcAddress` with the
+  pointer results `std/dylib` uses, so one program can load both.
+- Large values loaded whole and stored after code that may write their
+  source, such as a big struct returned in a `Result` while locals with
+  drops are still alive, are now copied aside in memory instead of being
+  split by LLVM into one operation per byte. Such functions took minutes to
+  compile at -O1 and above.
 - Fixed: `Fifo.set_signal` and the FIFO interrupt hook of
   `std/embedded/chip/rp_multicore` wrote 0 to `FIFO_ST` to clear its sticky
   WOF and ROE flags, which only a 1 clears. A flag left set, such as the ROE
@@ -167,7 +195,7 @@
   `Canvas.fill_spans` and `gradient_spans`, all drawing exactly what
   `fill_outline` draws.
 - `std/gpu/vulkan`: the Vulkan API in pure Dodo, one to one like Rust's
-  `ash`, as the bottom layer for a future portable `std/gpu`. Constants,
+  `ash`, as the bottom layer for the portable `std/gpu`. Constants,
   handles, enums, bitmasks, structs and the command tables are generated from
   the Khronos registry by `scripts/generate_vulkan.py` and cover core Vulkan
   1.0 to 1.4, the Xlib, XCB, Wayland, Win32, Metal and headless surfaces,
