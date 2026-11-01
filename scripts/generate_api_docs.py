@@ -306,6 +306,7 @@ def guide_for(module: str) -> str:
         "encoding": "json", "compress": "compression", "checksum": "hash", "fs": "filesystem",
         "env": "environment", "process": "processes", "signal": "signals", "thread": "threads",
         "sync": "synchronization", "net": "networking", "embedded": "hardware",
+        "script": "standard-library",
     }.get(family, family)
 
 
