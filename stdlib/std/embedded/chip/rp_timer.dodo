@@ -1,0 +1,331 @@
+package rp_timer
+
+import "core/ptr"
+import "std/embedded/hal"
+
+// The timer block the RP2040 and RP2350 share (RP2040 datasheet 4.6,
+// RP2350 datasheet 12.8): a 64-bit counter that never wraps in practice,
+// and four alarms that compare its low 32 bits with a target. The RP2040
+// has one such block, counting microseconds; the RP2350 has two, TIMER0,
+// counting microseconds, and TIMER1, which the rp2350 package lets count
+// at other rates (`Timer1`).
+//
+// An alarm arms when its ALARMn register is written and fires when the
+// counter's low 32 bits equal the target, setting its bit in INTR (write
+// one to clear) and disarming. While its INTE bit is set it raises the
+// alarm's interrupt. Writing one to its ARMED bit disarms it, and its INTF
+// bit forces the interrupt as if it had fired. INTR is at 0x34 on the
+// RP2040 and 0x3C on the RP2350, which has LOCKED and SOURCE registers
+// before it; INTE, INTF, and INTS follow it on both. The atomic set and
+// clear aliases at 0x2000 and 0x3000 above a register (RP2040 datasheet
+// 2.1.2, RP2350 datasheet 2.1.3) let each alarm change only its own bits
+// of the shared registers.
+//
+// `Alarm` is one alarm over any `Block`: an `Mmio` at the block's base on
+// the chip, or a simulated block in a desktop test. It counts ticks, at
+// whatever rate the block counts, and serves three protocols at once:
+//
+// - hal.Compare: fire once at a tick count, `schedule_at_ticks`.
+// - hal.PeriodicTimer: `start(period)` fires at the start plus every whole
+//   number of periods. `poll_periods`, from the program or the alarm's
+//   interrupt handler, counts the periods that ended and re-arms the alarm
+//   at the next one, computed from the start and not from when the poll
+//   ran, so the periods do not drift and a late poll learns how many it
+//   missed.
+// - the raw alarm: `schedule_at` and `schedule_in` write the 32-bit
+//   target directly.
+//
+// The chip packages wrap it in their own alarm types (`Alarm`, and the
+// RP2350's `Timer1Alarm`), which add the alarm's interrupt number and, on
+// the microsecond timers, the hal.Alarm protocol and sleeping.
+
+// Registers, from the block's base.
+const ALARM0: usize = 0x10
+const ARMED: usize = 0x20
+const TIMERAWH: usize = 0x24
+const TIMERAWL: usize = 0x28
+// INTR on each chip; INTE, INTF, and INTS follow it, 4 bytes apart.
+pub const RP2040_INTR: usize = 0x34
+pub const RP2350_INTR: usize = 0x3C
+const INTE: usize = 4
+const INTF: usize = 8
+
+// Atomic register aliases.
+const SET_ALIAS: usize = 0x2000
+const CLEAR_ALIAS: usize = 0x3000
+
+// The alarms of one block.
+pub const ALARM_COUNT: u32 = 4
+// The furthest ahead an alarm reaches: below 2^31 ticks, so a target
+// written now is still ahead of the counter's low 32 bits when the write
+// lands, rather than just behind them, which would fire only after the
+// low 32 bits wrap.
+pub const MAX_AHEAD: u64 = 0x7FFF_FFFF
+
+// A peripheral's 32-bit registers at offsets from one base address, as
+// hal.Registers, but read through `&self`, so the alarm's counter and
+// flags are read by `&self` methods as hal.Counter and hal.Compare want.
+// The timer's registers change nothing when read.
+pub interface Block {
+    fn read(&self, offset: usize) -> u32
+    fn write(&mut self, offset: usize, value: u32)
+}
+
+// A block of registers on the chip. Every access is one volatile 32-bit
+// load or store. Move-only: owning it is the permission to use the
+// registers its driver uses.
+pub struct Mmio: Block {
+    base: usize
+
+    // SAFETY: `base` must be the 4-aligned base address of a peripheral on
+    // this chip whose registers have no side effects when read, every
+    // offset its driver uses must be a valid 32-bit register of it, and no
+    // other handle or code may access those registers in a conflicting way
+    // while this handle exists.
+    pub unsafe fn at(base: usize) -> Mmio {
+        return Mmio { base }
+    }
+
+    pub fn base(&self) -> usize {
+        return self.base
+    }
+
+    pub fn read(&self, offset: usize) -> u32 {
+        // SAFETY: `at` guarantees a valid register block owned by this
+        // handle.
+        unsafe {
+            return ptr.read_volatile((self.base + offset) as *const u32)
+        }
+    }
+
+    pub fn write(&mut self, offset: usize, value: u32) {
+        // SAFETY: as in `read`.
+        unsafe {
+            ptr.write_volatile((self.base + offset) as *mut u32, value)
+        }
+    }
+}
+
+// The 64-bit count of the timer at `block`, read high, low, high again
+// until the high word holds still.
+pub fn read_count<B: Block>(block: &B) -> u64 {
+    for {
+        high := block.read(TIMERAWH)
+        low := block.read(TIMERAWL)
+        if block.read(TIMERAWH) == high {
+            return ((high as u64) << 32) | low as u64
+        }
+    }
+}
+
+// One alarm of a timer block, counting ticks at the block's rate.
+// Implements hal.TickCounter, hal.Compare, and hal.PeriodicTimer.
+pub struct Alarm<B: Block>: hal.TickCounter + hal.Compare + hal.PeriodicTimer {
+    block: B
+    number: u32
+    bit: u32
+    // INTR's offset on this chip.
+    intr: usize
+    hz: u32
+    // Periodic mode: the period and the count the next period ends at.
+    periodic: bool
+    period: u64
+    next: u64
+
+    // Alarm `number`, 0 to 3, of the timer at `block`, whose INTR is at
+    // `intr` (RP2040_INTR or RP2350_INTR) and which counts at `tick_hz`.
+    // It starts disarmed and periodic mode off; its flags are left as they
+    // are.
+    // SAFETY: `block` must be a running timer block of the chip at `intr`,
+    // counting at `tick_hz`, and this alarm the only user of ALARMn and of
+    // bit `number` of ARMED, INTR, INTE, and INTF.
+    pub unsafe fn new(block: B, intr: usize, number: u32, tick_hz: u32) -> Alarm<B> {
+        core.assert(number < ALARM_COUNT)
+        return Alarm<B> { block, number, bit: 1u32 << number, intr, hz: tick_hz, periodic: false, period: 0, next: 0 }
+    }
+
+    // 0 to 3.
+    pub fn number(&self) -> u32 {
+        return self.number
+    }
+
+    pub fn tick_hz(&self) -> u32 {
+        return self.hz
+    }
+
+    // The counter's low 32 bits, which alarm targets compare with.
+    pub fn now(&self) -> u32 {
+        return self.block.read(TIMERAWL)
+    }
+
+    // The whole 64-bit count.
+    pub fn now_ticks(&self) -> u64 {
+        return read_count(&self.block)
+    }
+
+    // Fire when the counter's low 32 bits equal `time`, replacing any
+    // earlier target and periodic mode. A time that has just passed fires
+    // only after the low 32 bits wrap.
+    pub fn schedule_at(&mut self, time: u32) {
+        self.periodic = false
+        self.block.write(ALARM0 + 4 * self.number as usize, time)
+    }
+
+    // Fire `ticks` from now: at least 1, and below 2^31 so the target is
+    // still ahead when the write lands.
+    pub fn schedule_in(&mut self, ticks: u32) {
+        now := self.now()
+        self.schedule_at(core.wrapping_add(now, ticks))
+    }
+
+    // Fire when now_ticks() reaches `ticks`, replacing any earlier target
+    // and periodic mode, and clearing an earlier firing; hal.Compare. A
+    // count already reached fires at once, raising the interrupt if the
+    // alarm listens. InvalidInput for a count more than MAX_AHEAD ahead.
+    pub fn schedule_at_ticks(&mut self, ticks: u64) -> void!hal.Error {
+        now := self.now_ticks()
+        if ticks > now && ticks - now > MAX_AHEAD {
+            return err(hal.Error.InvalidInput)
+        }
+        self.periodic = false
+        self.arm_at(ticks)
+        return ok()
+    }
+
+    // Disarm, and end periodic mode: a target no longer fires. An earlier
+    // firing stays reported until `clear`.
+    pub fn cancel(&mut self) {
+        self.periodic = false
+        self.disarm()
+    }
+
+    // True from scheduling until it fires or is cancelled.
+    pub fn is_armed(&self) -> bool {
+        return (self.block.read(ARMED) & self.bit) != 0
+    }
+
+    // True once it has fired, until `clear`.
+    pub fn fired(&self) -> bool {
+        raw := self.block.read(self.intr)
+        forced := self.block.read(self.intr + INTF)
+        return ((raw | forced) & self.bit) != 0
+    }
+
+    // Acknowledge a firing. An interrupt handler has to, or the interrupt
+    // stays raised and the handler runs again at once.
+    pub fn clear(&mut self) {
+        intr := self.intr
+        bit := self.bit
+        self.block.write(intr, bit)
+        self.block.write(intr + INTF + CLEAR_ALIAS, bit)
+    }
+
+    // Raise the alarm's interrupt when it fires.
+    pub fn listen(&mut self) {
+        intr := self.intr
+        bit := self.bit
+        self.block.write(intr + INTE + SET_ALIAS, bit)
+    }
+
+    // Stop raising the interrupt; `fired` still reports.
+    pub fn ignore(&mut self) {
+        intr := self.intr
+        bit := self.bit
+        self.block.write(intr + INTE + CLEAR_ALIAS, bit)
+    }
+
+    pub fn is_listening(&self) -> bool {
+        return (self.block.read(self.intr + INTE) & self.bit) != 0
+    }
+
+    // Fire every `period_ticks` ticks, the first time one period from
+    // now; hal.PeriodicTimer. Replaces any target and clears an earlier
+    // firing. InvalidInput for 0 or more than MAX_AHEAD ticks.
+    pub fn start(&mut self, period_ticks: u64) -> void!hal.Error {
+        if period_ticks == 0 || period_ticks > MAX_AHEAD {
+            return err(hal.Error.InvalidInput)
+        }
+        next := self.now_ticks() + period_ticks
+        self.period = period_ticks
+        self.next = next
+        self.periodic = true
+        self.arm_at(next)
+        return ok()
+    }
+
+    // How many periods ended since `start` or the last call, 0 while none
+    // has, or when periodic mode is off. Clears the firing and arms the
+    // alarm for the next period still ahead, so call it from the alarm's
+    // interrupt handler, or poll it.
+    pub fn poll_periods(&mut self) -> u32 {
+        if !self.periodic {
+            return 0
+        }
+        now := self.now_ticks()
+        if now < self.next {
+            return 0
+        }
+        periods := (now - self.next) / self.period + 1
+        next := self.next + periods * self.period
+        self.next = next
+        self.arm_at(next)
+        if periods > 0xFFFF_FFFFu64 {
+            return 0xFFFF_FFFF
+        }
+        return periods as u32
+    }
+
+    // Whether periodic mode is on, since `start` and until `cancel` or a
+    // schedule.
+    pub fn is_periodic(&self) -> bool {
+        return self.periodic
+    }
+
+    // The period `start` set.
+    pub fn period_ticks(&self) -> u64 {
+        return self.period
+    }
+
+    // In periodic mode, the count the next period ends at.
+    pub fn next_ticks(&self) -> u64 {
+        return self.next
+    }
+
+    // Cancel, stop the interrupt, clear the firing, and return the block.
+    pub fn release(self) -> B {
+        self.cancel()
+        self.ignore()
+        self.clear()
+        let Alarm { block, number, bit, intr, hz, periodic, period, next } = self
+        return block
+    }
+
+    // Disarm without changing the mode.
+    fn disarm(&mut self) {
+        bit := self.bit
+        self.block.write(ARMED, bit)
+    }
+
+    // Clear an earlier firing and fire when the counter reaches `ticks`,
+    // at most MAX_AHEAD ahead, or at once if it already has.
+    fn arm_at(&mut self, ticks: u64) {
+        self.clear()
+        now := self.now_ticks()
+        if ticks > now {
+            self.block.write(ALARM0 + 4 * self.number as usize, (ticks & 0xFFFF_FFFF) as u32)
+            if self.now_ticks() < ticks {
+                return
+            }
+        }
+        // The count was reached before the alarm was armed, which would
+        // fire only once the low 32 bits wrap, unless it fired just before.
+        // Either way the hardware alarm is done; force the firing it
+        // missed.
+        self.disarm()
+        if (self.block.read(self.intr) & self.bit) == 0 {
+            intr := self.intr
+            bit := self.bit
+            self.block.write(intr + INTF + SET_ALIAS, bit)
+        }
+    }
+}

@@ -11,10 +11,11 @@ import "std/io"
 // In-memory devices implementing the `std/embedded/hal` protocols. They let
 // driver code run under `dodo test` on a desktop with no hardware attached, and
 // record what the driver did so tests can assert on it. There is one for
-// every protocol: pins, delays, I2C and SPI buses (blocking and polled),
-// serial ports, PWM outputs and inputs, analog inputs, I2C and SPI targets,
-// CAN controllers, I2S streams, DMA channels and buffer transfers, and a
-// simulated clock for executor tasks.
+// every protocol: pins, delays, alarms, tick counters, compare channels,
+// periodic timers, capture channels, I2C and SPI buses (blocking and
+// polled), serial ports, PWM outputs and inputs, analog inputs, I2C and
+// SPI targets, CAN controllers, I2S streams, DMA channels and buffer
+// transfers, and a simulated clock for executor tasks.
 
 // An output and input pin. It starts low.
 pub struct Pin {
@@ -146,6 +147,337 @@ pub struct Alarm {
             self.armed = false
             self.fired = true
         }
+    }
+}
+
+// A counter at `tick_hz` that starts at 0 and moves only when the test
+// calls `advance`. Implements hal.TickCounter.
+pub struct TickCounter: hal.TickCounter {
+    hz: u32
+    now: u64
+
+    pub fn new(tick_hz: u32) -> TickCounter {
+        return TickCounter { hz: tick_hz, now: 0 }
+    }
+
+    pub fn advance(&mut self, ticks: u64) {
+        self.now += ticks
+    }
+
+    pub fn tick_hz(&self) -> u32 {
+        return self.hz
+    }
+
+    pub fn now_ticks(&self) -> u64 {
+        return self.now
+    }
+}
+
+// A compare channel on a simulated counter at `tick_hz` that starts at 0
+// and moves only when the test calls `advance`. It reaches any count ahead
+// unless `set_reach` limits it, as hardware with a narrower compare
+// register does. Implements hal.Compare.
+pub struct Compare: hal.Compare {
+    hz: u32
+    now: u64
+    target: u64
+    reach: u64
+    armed: bool
+    fired: bool
+    listening: bool
+    schedules: u32
+    failure: Option<hal.Error>
+
+    pub fn new(tick_hz: u32) -> Compare {
+        return Compare { hz: tick_hz, now: 0, target: 0, reach: 0xFFFF_FFFF_FFFF_FFFFu64, armed: false, fired: false, listening: false, schedules: 0, failure: none }
+    }
+
+    // Refuse counts more than `ticks` ahead with InvalidInput.
+    pub fn set_reach(&mut self, ticks: u64) {
+        self.reach = ticks
+    }
+
+    // Let `ticks` pass; the channel fires if its count falls within them.
+    pub fn advance(&mut self, ticks: u64) {
+        self.now += ticks
+        self.check()
+    }
+
+    pub fn tick_hz(&self) -> u32 {
+        return self.hz
+    }
+
+    pub fn now_ticks(&self) -> u64 {
+        return self.now
+    }
+
+    pub fn schedule_at_ticks(&mut self, ticks: u64) -> void!hal.Error {
+        if let some(error) = option.take(&mut self.failure) {
+            return err(error)
+        }
+        if ticks > self.now && ticks - self.now > self.reach {
+            return err(hal.Error.InvalidInput)
+        }
+        self.schedules += 1
+        self.target = ticks
+        self.armed = true
+        self.fired = false
+        self.check()
+        return ok()
+    }
+
+    pub fn cancel(&mut self) {
+        self.armed = false
+    }
+
+    pub fn fired(&self) -> bool {
+        return self.fired
+    }
+
+    pub fn clear(&mut self) {
+        self.fired = false
+    }
+
+    pub fn listen(&mut self) {
+        self.listening = true
+    }
+
+    pub fn ignore(&mut self) {
+        self.listening = false
+    }
+
+    pub fn is_listening(&self) -> bool {
+        return self.listening
+    }
+
+    // True while its interrupt would be raised: it fired and listens.
+    pub fn is_raised(&self) -> bool {
+        return self.fired && self.listening
+    }
+
+    // True from scheduling until it fires or is cancelled.
+    pub fn is_armed(&self) -> bool {
+        return self.armed
+    }
+
+    // The scheduled count, armed or not.
+    pub fn target_ticks(&self) -> u64 {
+        return self.target
+    }
+
+    // Number of successful schedules so far.
+    pub fn schedules(&self) -> u32 {
+        return self.schedules
+    }
+
+    // Make the next schedule fail with `error`, for testing error paths.
+    pub fn fail_next(&mut self, error: hal.Error) {
+        self.failure = some(error)
+    }
+
+    fn check(&mut self) {
+        if self.armed && self.now >= self.target {
+            self.armed = false
+            self.fired = true
+        }
+    }
+}
+
+// A periodic timer on a simulated counter at `tick_hz` that starts at 0 and
+// moves only when the test calls `advance`. Periods up to `set_max_period`
+// (any at first) are accepted. Implements hal.PeriodicTimer.
+pub struct PeriodicTimer: hal.PeriodicTimer {
+    hz: u32
+    now: u64
+    period: u64
+    next: u64
+    max_period: u64
+    running: bool
+    ended: u64
+    listening: bool
+    starts: u32
+    failure: Option<hal.Error>
+
+    pub fn new(tick_hz: u32) -> PeriodicTimer {
+        return PeriodicTimer { hz: tick_hz, now: 0, period: 0, next: 0, max_period: 0xFFFF_FFFF_FFFF_FFFFu64, running: false, ended: 0, listening: false, starts: 0, failure: none }
+    }
+
+    // Refuse periods longer than `ticks` with InvalidInput.
+    pub fn set_max_period(&mut self, ticks: u64) {
+        self.max_period = ticks
+    }
+
+    // Let `ticks` pass; every period that ends within them counts.
+    pub fn advance(&mut self, ticks: u64) {
+        self.now += ticks
+        if self.running && self.now >= self.next {
+            periods := (self.now - self.next) / self.period + 1
+            self.ended += periods
+            self.next += periods * self.period
+        }
+    }
+
+    pub fn tick_hz(&self) -> u32 {
+        return self.hz
+    }
+
+    pub fn now_ticks(&self) -> u64 {
+        return self.now
+    }
+
+    pub fn start(&mut self, period_ticks: u64) -> void!hal.Error {
+        if let some(error) = option.take(&mut self.failure) {
+            return err(error)
+        }
+        if period_ticks == 0 || period_ticks > self.max_period {
+            return err(hal.Error.InvalidInput)
+        }
+        self.starts += 1
+        self.period = period_ticks
+        self.next = self.now + period_ticks
+        self.ended = 0
+        self.running = true
+        return ok()
+    }
+
+    pub fn cancel(&mut self) {
+        self.running = false
+        self.ended = 0
+    }
+
+    pub fn poll_periods(&mut self) -> u32 {
+        periods := self.ended
+        self.ended = 0
+        if periods > 0xFFFF_FFFFu64 {
+            return 0xFFFF_FFFF
+        }
+        return periods as u32
+    }
+
+    pub fn listen(&mut self) {
+        self.listening = true
+    }
+
+    pub fn ignore(&mut self) {
+        self.listening = false
+    }
+
+    pub fn is_listening(&self) -> bool {
+        return self.listening
+    }
+
+    // True while its interrupt would be raised: a period ended that was
+    // not polled yet, and it listens.
+    pub fn is_raised(&self) -> bool {
+        return self.ended > 0 && self.listening
+    }
+
+    pub fn is_running(&self) -> bool {
+        return self.running
+    }
+
+    pub fn period_ticks(&self) -> u64 {
+        return self.period
+    }
+
+    // The count at which the next period ends.
+    pub fn next_ticks(&self) -> u64 {
+        return self.next
+    }
+
+    // Number of successful starts so far.
+    pub fn starts(&self) -> u32 {
+        return self.starts
+    }
+
+    // Make the next start fail with `error`, for testing error paths.
+    pub fn fail_next(&mut self, error: hal.Error) {
+        self.failure = some(error)
+    }
+}
+
+// A capture channel at `tick_hz` whose events the test makes with `event`.
+// It holds up to `set_depth` events (16, and 16 at most), as a FIFO in
+// hardware does; one that arrives while it is full is lost and the next
+// poll reports Overrun. Implements hal.InputCapture.
+pub struct InputCapture: hal.InputCapture {
+    hz: u32
+    events: [16]u64
+    first: usize
+    waiting: usize
+    depth: usize
+    lost: bool
+    listening: bool
+    failure: Option<hal.Error>
+
+    pub fn new(tick_hz: u32) -> InputCapture {
+        return InputCapture { hz: tick_hz, events: [0u64; 16], first: 0, waiting: 0, depth: 16, lost: false, listening: false, failure: none }
+    }
+
+    // Hold at most `events` events, 1 to 16; 1 is a single capture
+    // register.
+    pub fn set_depth(&mut self, events: usize) {
+        core.assert(events >= 1 && events <= 16)
+        self.depth = events
+    }
+
+    // An event at tick count `ticks`, as if the input saw one then.
+    pub fn event(&mut self, ticks: u64) {
+        if self.waiting == self.depth {
+            self.lost = true
+            return
+        }
+        self.events[(self.first + self.waiting) % 16] = ticks
+        self.waiting += 1
+    }
+
+    // The events waiting to be read.
+    pub fn waiting(&self) -> usize {
+        return self.waiting
+    }
+
+    pub fn tick_hz(&self) -> u32 {
+        return self.hz
+    }
+
+    pub fn poll_event(&mut self, ticks: &mut u64) -> bool!hal.Error {
+        if let some(error) = option.take(&mut self.failure) {
+            return err(error)
+        }
+        if self.lost {
+            self.lost = false
+            return err(hal.Error.Overrun)
+        }
+        if self.waiting == 0 {
+            return ok(false)
+        }
+        *ticks = self.events[self.first]
+        self.first = (self.first + 1) % 16
+        self.waiting -= 1
+        return ok(true)
+    }
+
+    pub fn listen(&mut self) {
+        self.listening = true
+    }
+
+    pub fn ignore(&mut self) {
+        self.listening = false
+    }
+
+    pub fn is_listening(&self) -> bool {
+        return self.listening
+    }
+
+    // True while its interrupt would be raised: an event waits and it
+    // listens.
+    pub fn is_raised(&self) -> bool {
+        return self.waiting > 0 && self.listening
+    }
+
+    // Make the next poll fail with `error`, for testing error paths.
+    pub fn fail_next(&mut self, error: hal.Error) {
+        self.failure = some(error)
     }
 }
 

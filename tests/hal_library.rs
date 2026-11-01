@@ -100,6 +100,25 @@ fn polling_target_capture_can_i2s_and_dma_protocols_execute_with_fakes() {
 }
 
 #[test]
+fn timer_protocols_alarms_and_pwm_timers_execute_against_fakes_and_models() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let scratch = Scratch::new("timers");
+    let source = root.join("tests/stdlib/timer_checks.dodo");
+    for optimization in ["0", "3"] {
+        let executable = scratch.0.join(format!(
+            "timers-O{optimization}{}",
+            std::env::consts::EXE_SUFFIX
+        ));
+        let args = ["build", source.to_str().unwrap(), "-O", optimization, "-o"];
+        success(&dodo(&args, &executable), "compile timer fixture");
+        success(
+            &Command::new(&executable).output().unwrap(),
+            "execute timer fixture",
+        );
+    }
+}
+
+#[test]
 fn pwm_input_capture_measures_against_a_simulated_slice() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let scratch = Scratch::new("pwm-capture");

@@ -13,6 +13,7 @@ import "std/embedded/chip/rp_power"
 import "std/embedded/chip/rp_pwm"
 import "std/embedded/chip/rp_rng"
 import "std/embedded/chip/rp_rtc"
+import "std/embedded/chip/rp_timer"
 import "std/embedded/chip/rp_usb"
 import "std/embedded/chip/rp_watchdog"
 import "std/embedded/peripheral/designware_i2c"
@@ -150,6 +151,7 @@ const DIVIDE_BY_ONE: u32 = 0x1_0000
 // and the watchdog. Each has CTRL, CYCLES, and COUNT registers.
 const TICKS_BASE: usize = 0x4010_8000
 const TICK_TIMER0: usize = TICKS_BASE + 0x18
+const TICK_TIMER1: usize = TICKS_BASE + 0x24
 const TICK_WATCHDOG: usize = TICKS_BASE + 0x30
 const TICK_ENABLE: u32 = 1 << 0
 
@@ -161,14 +163,15 @@ const TIMER0_BASE: usize = 0x400B_0000
 const TIMER_RAW_HIGH: usize = TIMER0_BASE + 0x24
 const TIMER_RAW_LOW: usize = TIMER0_BASE + 0x28
 // Alarms (12.8.4): ALARMn arms when written and fires when the counter's
-// low 32 bits reach it, setting its INTR bit (write one to clear) and, while
-// its INTE bit is set, raising its interrupt. ARMED bits disarm when written.
-const TIMER_ALARM0: usize = TIMER0_BASE + 0x10
-const TIMER_ARMED: usize = TIMER0_BASE + 0x20
-const TIMER_INTR: usize = TIMER0_BASE + 0x3C
-const TIMER_INTE: usize = TIMER0_BASE + 0x40
-// INTF forces an alarm's interrupt, as if it had fired, until cleared.
-const TIMER_INTF: usize = TIMER0_BASE + 0x44
+// low 32 bits reach it; std/embedded/chip/rp_timer drives them.
+// TIMER1 (12.8), the second timer, which `Timer.timer1` hands out. Its
+// SOURCE register (12.8.6) counts clk_sys cycles instead of ticks while
+// CLK_SYS is set; its ticks come from its own tick generator.
+const TIMER1_BASE: usize = 0x400B_8000
+const TIMER_SOURCE: usize = 0x38
+const SOURCE_CLK_SYS: u32 = 1 << 0
+// The tick generators' CYCLES field: 1 to 511 clk_ref cycles per tick.
+const MAX_TICK_CYCLES: u32 = 511
 // The longest an alarm sleeps at once: below 2^31 us, so its 32-bit
 // target time is still ahead when the write lands.
 const MAX_ALARM_SLEEP_US: u64 = 0x7FFF_FFFF
@@ -364,6 +367,8 @@ const PSM_PROC1: u32 = 1 << 24
 const RESERVED_SPINLOCKS: u32 = 0x0003_F31F
 
 static mut TAKEN: bool = false
+// Whether `Timer.timer1` handed TIMER1 out.
+static mut TIMER1_TAKEN: bool = false
 // What runs PLL_USB: the ADC and the USB controller, one each. It stops when
 // neither does.
 static mut PLL_USB_USERS: u32 = 0
@@ -868,6 +873,24 @@ pub struct Pins {
         self.bank.release_pwm(output)
     }
 
+    // Claim PWM slice `slice`, 0 to 11, as a periodic timer and counter
+    // counting at `tick_hz`: clk_sys divided by a whole number of
+    // sixteenths from 1 to 255 15/16, such as 150 MHz, 10 MHz, 1 MHz, or
+    // 600 kHz. It is a hal.PeriodicTimer whose periods, up to 65536 ticks,
+    // end when the slice's counter wraps, raising PWM_IRQ_WRAP_0 while it
+    // listens, and a hal.TickCounter; rp_pwm.SliceTimer documents it. It
+    // drives no pins but takes both outputs of its slice; slices 8 to 11
+    // serve no pins here, so they cost none. InvalidInput for another
+    // slice or rate, Busy if the slice is in use.
+    pub fn pwm_timer(&mut self, slice: u32, tick_hz: u32) -> rp_pwm.PwmTimer!hal.Error {
+        return self.bank.pwm_timer(slice, tick_hz)
+    }
+
+    // Give back a timer from `pwm_timer`.
+    pub fn release_pwm_timer(&mut self, timer: rp_pwm.PwmTimer) {
+        self.bank.release_pwm_timer(timer)
+    }
+
     // Give back a PWM input. Its slice stops and its pin is disconnected.
     pub fn release_pwm_input(&mut self, input: rp_pwm.PwmCapture) {
         self.bank.release_pwm_input(input)
@@ -1081,6 +1104,10 @@ struct Chip {
 
     pub fn pwm_slices(&self) -> u32 {
         return 12
+    }
+
+    pub fn pwm_irq(&self) -> u32 {
+        return PWM_IRQ_WRAP_0
     }
 
     pub fn timer_base(&self) -> usize {
@@ -1338,31 +1365,93 @@ pub struct Timer {
         // write-one-to-clear registers and the atomic set and clear
         // aliases, only its own bit of the shared ones.
         alarm := unsafe {
-            Alarm {
-                number,
-                bit,
-                target: hal.Reg.at(TIMER_ALARM0 + 4 * number as usize),
-                high: hal.Reg.at(TIMER_RAW_HIGH),
-                low: hal.Reg.at(TIMER_RAW_LOW),
-                armed: hal.Reg.at(TIMER_ARMED),
-                raw: hal.Reg.at(TIMER_INTR),
-                listening: hal.Reg.at(TIMER_INTE),
-                listen_set: hal.Reg.at(TIMER_INTE + SET_ALIAS),
-                listen_clear: hal.Reg.at(TIMER_INTE + CLEAR_ALIAS),
-                forced: hal.Reg.at(TIMER_INTF),
-                force_set: hal.Reg.at(TIMER_INTF + SET_ALIAS),
-                force_clear: hal.Reg.at(TIMER_INTF + CLEAR_ALIAS),
-            }
+            rp_timer.Alarm.new(rp_timer.Mmio.at(TIMER0_BASE), rp_timer.RP2350_INTR, number, 1_000_000)
         }
-        return ok(alarm)
+        return ok(Alarm { alarm })
     }
 
     // Disarm an alarm, stop its interrupt, and take it back.
     pub fn release_alarm(&mut self, alarm: Alarm) {
-        alarm.cancel()
-        alarm.ignore()
-        alarm.clear()
-        self.alarms &= ~alarm.bit
+        number := alarm.number()
+        let Alarm { alarm: inner } = alarm
+        inner.release()
+        self.alarms &= ~(1u32 << number)
+    }
+
+    // Start TIMER1, the chip's second timer, counting from 0 at
+    // `tick_hz`: SYS_HZ to count clk_sys cycles (150 MHz), or the crystal
+    // divided by a whole number from 1 to 511, such as 12 MHz, 1 MHz, or
+    // 100 kHz with a 12 MHz crystal, from TIMER1's own tick generator.
+    // InvalidInput for another rate, Busy while it is out.
+    pub fn timer1(&mut self, tick_hz: u32) -> Timer1!hal.Error {
+        if tick_hz == 0 {
+            return err(hal.Error.InvalidInput)
+        }
+        // SAFETY: start_clocks set TIMER0's tick generator to a CYCLES of
+        // crystal_hz / 1 MHz; reading it has no side effects.
+        crystal := unsafe {
+            reg(TICK_TIMER0 + 4)
+        }
+        crystal_hz := (crystal.read() & MAX_TICK_CYCLES) * 1_000_000
+        cycles := 0u32
+        if tick_hz != SYS_HZ {
+            if crystal_hz % tick_hz != 0 || crystal_hz / tick_hz > MAX_TICK_CYCLES {
+                return err(hal.Error.InvalidInput)
+            }
+            cycles = crystal_hz / tick_hz
+        }
+        section := hal.Critical.enter()
+        // SAFETY: interrupts are masked, so the flag is read and set
+        // atomically on this core.
+        taken := unsafe {
+            TIMER1_TAKEN
+        }
+        unsafe {
+            TIMER1_TAKEN = true
+        }
+        core.drop(section)
+        if taken {
+            return err(hal.Error.Busy)
+        }
+        // SAFETY: TIMER1_TAKEN makes this the only user of TIMER1, its
+        // reset, and its tick generator.
+        unsafe {
+            // Ticks first, or none for clk_sys, so the reset starts the
+            // count from 0 at the right rate.
+            if cycles == 0 {
+                control := reg(TICK_TIMER1)
+                control.write(0)
+            } else {
+                start_tick(TICK_TIMER1, cycles)
+            }
+            match reset_blocks(RESET_TIMER1) {
+                ok() => {}
+                err(error) => {
+                    TIMER1_TAKEN = false
+                    return err(error)
+                }
+            }
+            block := rp_timer.Mmio.at(TIMER1_BASE)
+            if cycles == 0 {
+                block.write(TIMER_SOURCE, SOURCE_CLK_SYS)
+            }
+            return ok(Timer1 { block, hz: tick_hz, alarms: 0 })
+        }
+    }
+
+    // Give TIMER1 back: it stops, held in reset, and its tick generator
+    // stops. Every alarm claimed from it must have been given back.
+    pub fn release_timer1(&mut self, timer1: Timer1) {
+        core.assert(timer1.alarms == 0)
+        // SAFETY: the Timer1 was the only user of TIMER1 and its tick
+        // generator, and nothing uses them any more.
+        unsafe {
+            control := reg(TICK_TIMER1)
+            control.write(0)
+            hold := reg(RESET + SET_ALIAS)
+            hold.write(RESET_TIMER1)
+            TIMER1_TAKEN = false
+        }
     }
 
     // Microseconds since take().
@@ -1374,6 +1463,15 @@ pub struct Timer {
                 return ((high as u64) << 32) | low as u64
             }
         }
+    }
+
+    // The counter as a hal.TickCounter: ticks of 1 MHz, as now_us.
+    pub fn tick_hz(&self) -> u32 {
+        return 1_000_000
+    }
+
+    pub fn now_ticks(&self) -> u64 {
+        return self.now_us()
     }
 
     pub fn delay_us(&mut self, microseconds: u32) {
@@ -1393,124 +1491,130 @@ pub struct Timer {
 // `clear` and may schedule the next time. Move it into a
 // `static mut Option<Alarm>` for the handler to use. Implements the
 // std/embedded/hal alarm and counter protocols, with times up to
-// 2^31 - 1 us (35 minutes) ahead.
-pub struct Alarm {
-    number: u32
-    bit: u32
-    target: hal.Reg<u32>
-    high: hal.Reg<u32>
-    low: hal.Reg<u32>
-    armed: hal.Reg<u32>
-    raw: hal.Reg<u32>
-    listening: hal.Reg<u32>
-    listen_set: hal.Reg<u32>
-    listen_clear: hal.Reg<u32>
-    forced: hal.Reg<u32>
-    force_set: hal.Reg<u32>
-    force_clear: hal.Reg<u32>
+// 2^31 - 1 us (35 minutes) ahead, and, counting microseconds as ticks of
+// 1 MHz, the compare channel and periodic timer protocols: `start(period)`
+// fires it every period, without drift, and the interrupt handler calls
+// `poll_periods` instead of `clear`. rp_timer.Alarm documents the modes.
+pub struct Alarm: hal.Alarm + hal.Compare + hal.PeriodicTimer {
+    alarm: rp_timer.Alarm<rp_timer.Mmio>
 
     // 0 to 3.
     pub fn number(&self) -> u32 {
-        return self.number
+        return self.alarm.number()
     }
 
     // The interrupt the alarm raises: its number for cortex_m.enable, and
     // its vector name, TIMER0_IRQ_0 + n, for `@interrupt`.
     pub fn irq(&self) -> u32 {
-        return TIMER0_IRQ_0 + self.number
+        return TIMER0_IRQ_0 + self.alarm.number()
     }
 
     // The low 32 bits of the microsecond counter, which alarm times use.
     pub fn now(&self) -> u32 {
-        return self.low.read()
+        return self.alarm.now()
     }
 
     // Fire when the counter's low 32 bits equal `time`, replacing any
-    // earlier time. A time that has just passed fires only after the
-    // counter wraps, 71.6 minutes later.
+    // earlier time and periodic mode. A time that has just passed fires
+    // only after the counter wraps, 71.6 minutes later.
     pub fn schedule_at(&mut self, time: u32) {
-        self.target.write(time)
+        self.alarm.schedule_at(time)
     }
 
     // Fire `microseconds` from now; at least 1, and below 2^31 so the time
     // is still ahead when the write lands.
     pub fn schedule_in(&mut self, microseconds: u32) {
-        self.target.write(core.wrapping_add(self.low.read(), microseconds))
+        self.alarm.schedule_in(microseconds)
     }
 
     // Fire when now_us() reaches `time_us`, replacing any earlier time and
-    // clearing an earlier firing; the std/embedded/hal alarm protocol. A
-    // time already reached fires at once, raising the interrupt if the
-    // alarm listens. InvalidInput for a time more than 2^31 - 1 us ahead.
+    // periodic mode, and clearing an earlier firing; the std/embedded/hal
+    // alarm protocol. A time already reached fires at once, raising the
+    // interrupt if the alarm listens. InvalidInput for a time more than
+    // 2^31 - 1 us ahead.
     pub fn schedule_at_us(&mut self, time_us: u64) -> void!hal.Error {
-        now := self.now_us()
-        if time_us > now && time_us - now > MAX_ALARM_SLEEP_US {
-            return err(hal.Error.InvalidInput)
-        }
-        self.clear()
-        if time_us > now {
-            self.target.write((time_us & 0xFFFF_FFFF) as u32)
-            if self.now_us() < time_us {
-                return ok()
-            }
-        }
-        // The time had passed before the alarm was armed, which would fire
-        // only once the counter wraps, unless it fired just before. Either
-        // way the hardware alarm is done; force the firing it missed.
-        self.cancel()
-        if !self.raw.any(self.bit) {
-            self.force_set.write(self.bit)
-        }
-        return ok()
+        return self.alarm.schedule_at_ticks(time_us)
     }
 
-    // Disarm: a scheduled time no longer fires.
+    // Disarm, and end periodic mode: a scheduled time no longer fires.
     pub fn cancel(&mut self) {
-        self.armed.write(self.bit)
+        self.alarm.cancel()
     }
 
     // True from scheduling until it fires or is cancelled.
     pub fn is_armed(&self) -> bool {
-        return self.armed.any(self.bit)
+        return self.alarm.is_armed()
     }
 
     // True once it has fired, until `clear`.
     pub fn fired(&self) -> bool {
-        return self.raw.any(self.bit) || self.forced.any(self.bit)
+        return self.alarm.fired()
     }
 
     // Acknowledge that it fired. An interrupt handler has to, or the
     // interrupt stays raised and the handler runs again at once.
     pub fn clear(&mut self) {
-        self.raw.write(self.bit)
-        self.force_clear.write(self.bit)
+        self.alarm.clear()
     }
 
     // Raise the interrupt when it fires. Enable the interrupt in the NVIC
     // too: `cortex_m.enable(alarm.irq())`.
     pub fn listen(&mut self) {
-        self.listen_set.write(self.bit)
+        self.alarm.listen()
     }
 
     // Stop raising the interrupt; `fired` still reports.
     pub fn ignore(&mut self) {
-        self.listen_clear.write(self.bit)
+        self.alarm.ignore()
     }
 
     pub fn is_listening(&self) -> bool {
-        return self.listening.any(self.bit)
+        return self.alarm.is_listening()
     }
 
     // Microseconds since take(), from the whole 64-bit counter, as
     // Timer.now_us reads it.
     pub fn now_us(&self) -> u64 {
-        for {
-            high := self.high.read()
-            low := self.low.read()
-            if self.high.read() == high {
-                return ((high as u64) << 32) | low as u64
-            }
-        }
+        return self.alarm.now_ticks()
+    }
+
+    // The compare channel and periodic timer protocols count ticks of
+    // 1 MHz: microseconds.
+    pub fn tick_hz(&self) -> u32 {
+        return 1_000_000
+    }
+
+    pub fn now_ticks(&self) -> u64 {
+        return self.alarm.now_ticks()
+    }
+
+    // As schedule_at_us; hal.Compare.
+    pub fn schedule_at_ticks(&mut self, ticks: u64) -> void!hal.Error {
+        return self.alarm.schedule_at_ticks(ticks)
+    }
+
+    // Fire every `period_us` microseconds, the first time one period from
+    // now, each a whole number of periods after the start; hal.PeriodicTimer.
+    // InvalidInput for 0 or more than 2^31 - 1 us (35 minutes).
+    pub fn start(&mut self, period_us: u64) -> void!hal.Error {
+        return self.alarm.start(period_us)
+    }
+
+    // How many periods ended since `start` or the last call, 0 while none
+    // has. Clears the firing and arms the alarm for the next period, so
+    // the interrupt handler calls it instead of `clear`.
+    pub fn poll_periods(&mut self) -> u32 {
+        return self.alarm.poll_periods()
+    }
+
+    // Whether `start` runs it, until `cancel` or a schedule.
+    pub fn is_periodic(&self) -> bool {
+        return self.alarm.is_periodic()
+    }
+
+    // The period `start` set, in microseconds.
+    pub fn period_us(&self) -> u64 {
+        return self.alarm.period_ticks()
     }
 
     // Sleep (`wfi`) until an interrupt is pending or the counter reaches
@@ -1553,6 +1657,173 @@ pub struct Alarm {
             cpu.wait_for_interrupt()
         }
         core.drop(section)
+    }
+}
+
+// TIMER1, the chip's second timer, from `Timer.timer1`: a 64-bit counter
+// at the rate it was started at, with four alarms of its own, which `alarm`
+// hands out. At 150 MHz it counts for 3900 years before wrapping, so it
+// times short events to a clk_sys cycle (6.7 ns); at a divided crystal rate
+// it reaches further with each alarm. Implements the std/embedded/hal tick
+// counter protocol and, through now_us, the counter protocol.
+pub struct Timer1: hal.TickCounter + hal.Counter {
+    block: rp_timer.Mmio
+    hz: u32
+    // Claimed alarms, one bit each.
+    alarms: u32
+
+    pub fn tick_hz(&self) -> u32 {
+        return self.hz
+    }
+
+    // Ticks since `Timer.timer1` started it.
+    pub fn now_ticks(&self) -> u64 {
+        return rp_timer.read_count(&self.block)
+    }
+
+    // Microseconds since `Timer.timer1` started it, rounded down.
+    pub fn now_us(&self) -> u64 {
+        return hal.ticks_to_us(self.now_ticks(), self.hz)
+    }
+
+    // Claim alarm 0 to 3 of TIMER1, raising TIMER1_IRQ_0 + n. Busy if it is
+    // claimed already; InvalidInput for another number.
+    pub fn alarm(&mut self, number: u32) -> Timer1Alarm!hal.Error {
+        if number >= ALARM_COUNT {
+            return err(hal.Error.InvalidInput)
+        }
+        bit := 1u32 << number
+        if (self.alarms & bit) != 0 {
+            return err(hal.Error.Busy)
+        }
+        self.alarms |= bit
+        // SAFETY: the claim above makes this the only Timer1Alarm for
+        // `number`; as for Timer.alarm, it changes only its own bits.
+        alarm := unsafe {
+            rp_timer.Alarm.new(rp_timer.Mmio.at(TIMER1_BASE), rp_timer.RP2350_INTR, number, self.hz)
+        }
+        return ok(Timer1Alarm { alarm })
+    }
+
+    // Disarm an alarm, stop its interrupt, and take it back.
+    pub fn release_alarm(&mut self, alarm: Timer1Alarm) {
+        number := alarm.number()
+        let Timer1Alarm { alarm: inner } = alarm
+        inner.release()
+        self.alarms &= ~(1u32 << number)
+    }
+}
+
+// One of TIMER1's four alarms, claimed with `Timer1.alarm(n)`, counting
+// TIMER1's ticks: a compare channel that fires once at a tick count, and a
+// periodic timer whose periods are whole ticks and do not drift (see
+// rp_timer.Alarm). With `listen` it raises interrupt TIMER1_IRQ_0 + n,
+// whose handler calls `clear`, or `poll_periods` in periodic mode. Targets
+// reach up to 2^31 - 1 ticks ahead: 14.3 s at 150 MHz, 2147 s at 1 MHz.
+// Implements the std/embedded/hal compare channel and periodic timer
+// protocols, and through microsecond conversions the alarm and counter
+// protocols too.
+pub struct Timer1Alarm: hal.Compare + hal.PeriodicTimer + hal.Alarm {
+    alarm: rp_timer.Alarm<rp_timer.Mmio>
+
+    // 0 to 3.
+    pub fn number(&self) -> u32 {
+        return self.alarm.number()
+    }
+
+    // The interrupt the alarm raises: its number for cortex_m.enable, and
+    // its vector name, TIMER1_IRQ_0 + n, for `@interrupt`.
+    pub fn irq(&self) -> u32 {
+        return TIMER1_IRQ_0 + self.alarm.number()
+    }
+
+    pub fn tick_hz(&self) -> u32 {
+        return self.alarm.tick_hz()
+    }
+
+    // The low 32 bits of TIMER1's count, which raw targets use.
+    pub fn now(&self) -> u32 {
+        return self.alarm.now()
+    }
+
+    // Fire when TIMER1's low 32 bits equal `time`, as Alarm.schedule_at.
+    pub fn schedule_at(&mut self, time: u32) {
+        self.alarm.schedule_at(time)
+    }
+
+    // Fire `ticks` from now; at least 1 and below 2^31.
+    pub fn schedule_in(&mut self, ticks: u32) {
+        self.alarm.schedule_in(ticks)
+    }
+
+    pub fn now_ticks(&self) -> u64 {
+        return self.alarm.now_ticks()
+    }
+
+    // Fire when now_ticks() reaches `ticks`, as rp_timer.Alarm does;
+    // InvalidInput more than 2^31 - 1 ticks ahead.
+    pub fn schedule_at_ticks(&mut self, ticks: u64) -> void!hal.Error {
+        return self.alarm.schedule_at_ticks(ticks)
+    }
+
+    pub fn cancel(&mut self) {
+        self.alarm.cancel()
+    }
+
+    pub fn is_armed(&self) -> bool {
+        return self.alarm.is_armed()
+    }
+
+    pub fn fired(&self) -> bool {
+        return self.alarm.fired()
+    }
+
+    pub fn clear(&mut self) {
+        self.alarm.clear()
+    }
+
+    // Raise the interrupt when it fires. Enable the interrupt in the NVIC
+    // too: `cortex_m.enable(alarm.irq())`.
+    pub fn listen(&mut self) {
+        self.alarm.listen()
+    }
+
+    pub fn ignore(&mut self) {
+        self.alarm.ignore()
+    }
+
+    pub fn is_listening(&self) -> bool {
+        return self.alarm.is_listening()
+    }
+
+    // Fire every `period_ticks` ticks without drift; InvalidInput for 0 or
+    // more than 2^31 - 1.
+    pub fn start(&mut self, period_ticks: u64) -> void!hal.Error {
+        return self.alarm.start(period_ticks)
+    }
+
+    pub fn poll_periods(&mut self) -> u32 {
+        return self.alarm.poll_periods()
+    }
+
+    pub fn is_periodic(&self) -> bool {
+        return self.alarm.is_periodic()
+    }
+
+    pub fn period_ticks(&self) -> u64 {
+        return self.alarm.period_ticks()
+    }
+
+    // Microseconds since TIMER1 started, rounded down.
+    pub fn now_us(&self) -> u64 {
+        return hal.ticks_to_us(self.alarm.now_ticks(), self.alarm.tick_hz())
+    }
+
+    // Fire once now_us() reaches `time_us`: at the first tick at or after
+    // it. InvalidInput for a time more than 2^31 - 1 ticks ahead.
+    pub fn schedule_at_us(&mut self, time_us: u64) -> void!hal.Error {
+        ticks := hal.us_to_ticks(time_us, self.alarm.tick_hz())
+        return self.alarm.schedule_at_ticks(ticks)
     }
 }
 

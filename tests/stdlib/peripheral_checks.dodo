@@ -3177,8 +3177,11 @@ fn rp_pin_assignments() {
 // Every Channel reaches the one block through its own PwmView, as on the
 // chip, where each holds a register block at the same base. Registers are
 // stored by word, slice * 5 + offset / 4: CSR, DIV, CTR, CC, and TOP.
-const PWM_WORDS: usize = 40
-static mut PWM_REGISTERS: [40]u32 = [0u32; 40]
+// The eight slices' registers, then EN, INTR (write one to clear), and
+// INTE at words 40 to 42.
+const PWM_WORDS: usize = 43
+const PWM_INTR_WORD: usize = 41
+static mut PWM_REGISTERS: [43]u32 = [0u32; 43]
 // Writes through the plain address of a compare register, which would
 // overwrite the other output's half.
 static mut PLAIN_COMPARE_WRITES: u32 = 0
@@ -3190,7 +3193,7 @@ struct PwmView: hal.Registers {
         unsafe {
             value := PWM_REGISTERS[word]
             // The counter advances between reads while the slice runs.
-            if word % 5 == 2 && (PWM_REGISTERS[word - 2] & 1) != 0 {
+            if word < 40 && word % 5 == 2 && (PWM_REGISTERS[word - 2] & 1) != 0 {
                 PWM_REGISTERS[word] = (value + 1) % (PWM_REGISTERS[word + 2] + 1)
             }
             return value
@@ -3202,8 +3205,13 @@ struct PwmView: hal.Registers {
         word := (offset & 0xFFF) / 4
         core.assert(word < PWM_WORDS)
         unsafe {
+            if word == PWM_INTR_WORD {
+                core.assert(alias == 0)
+                PWM_REGISTERS[word] &= ~value
+                return
+            }
             current := PWM_REGISTERS[word]
-            if word % 5 == 3 && alias == 0 {
+            if word < 40 && word % 5 == 3 && alias == 0 {
                 PLAIN_COMPARE_WRITES += 1
             }
             if alias == 0 {
@@ -3217,7 +3225,9 @@ struct PwmView: hal.Registers {
             }
             // CSR has 8 bits, DIV 12, the counter and TOP 16.
             register := word % 5
-            if register == 0 {
+            if word >= 40 {
+                current &= 0xFF
+            } else if register == 0 {
                 current &= 0xFF
             } else if register == 1 {
                 current &= 0xFFF
@@ -3658,6 +3668,10 @@ struct FakeChip {
     // PWM inputs are checked in pwm_capture_checks.dodo.
     pub fn pwm_slices(&self) -> u32 {
         return 8
+    }
+
+    pub fn pwm_irq(&self) -> u32 {
+        return 4
     }
 
     pub fn timer_base(&self) -> usize {
