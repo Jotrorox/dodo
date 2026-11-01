@@ -18,7 +18,8 @@ import "std/embedded/hal"
 //
 // `Channel` is one output over any hal.Registers: a `hal.RegisterBlock` at
 // the block's base on the chip, or a simulated block in a desktop test. It
-// implements hal.PwmOutput. The outputs of a slice write their own bits of
+// implements hal.PwmOutput. `Capture` instead measures the signal on a B
+// pin with the slice's counter; see "Input capture" below. The outputs of a slice write their own bits of
 // shared registers through the block's atomic XOR, set, and clear aliases,
 // at 0x1000, 0x2000, and 0x3000 above each register, so neither disturbs
 // the other, nor an interrupt handler that owns one of them.
@@ -383,5 +384,564 @@ pub struct Pwm: hal.PwmOutput {
         let Pwm { channel } = self
         registers := channel.release()
         return registers.base()
+    }
+}
+
+// --- Input capture ---------------------------------------------------------
+//
+// A slice can count from its B pin instead of the clock (RP2040 datasheet
+// 4.5.2.6, RP2350 datasheet 12.5.2.6): CSR.DIVMODE 1 runs the fractional
+// divider only while the pin is high, and DIVMODE 2 advances it on each
+// rising edge. The slice cannot timestamp edges, so `Capture` measures by
+// counting over windows of `window_us`, two per measurement, one after the
+// other and continuously:
+//
+// 1. An edge window counts rising edges. The polls watch the count change:
+//    the times of the first and last change seen and the edges between
+//    them give the period, as a reciprocal counter does, so its error is
+//    the timer's microsecond and the gap between polls at each end of
+//    that span, at most a period per end. A program that polls only when
+//    the window ends gets edges / window time, accurate to a period per
+//    window.
+// 2. A level window counts clk_sys cycles while the pin is high, and lasts
+//    a whole number of the periods just measured, so pulses cut at its
+//    start and end add up to whole ones. High time per period is the high
+//    time counted divided by the periods the window lasted.
+//
+// The counter has 16 bits. In the level window the divider is the smallest
+// that covers four windows, so a poll that comes up to three windows late
+// loses nothing, and a count stands for divider / 16 clk_sys cycles: about
+// a 16000th of the window, 0.6 us for 10 ms. From 33 ms (at 125 MHz; 28 ms
+// at 150 MHz) the largest divider covers fewer windows, down to one at the
+// longest window, and a count is 2 us (1.7 us).
+//
+// In the edge window the divider is a whole number, 1 to 255, that counts
+// every n-th edge: it starts at 1 and is chosen after each window so that
+// the next one counts at most half the counter's range. A window whose
+// count wraps, which the block's raw interrupt flag for the slice (INTR)
+// reports, is counted again with a divider at least four times larger, so
+// a jump in frequency costs a window or a few. Edges are sampled at
+// clk_sys, so the highs and lows of the signal must each last at least a
+// clk_sys cycle or two.
+//
+// The slowest signal measured has two rising edges in a window, 200 Hz
+// for a 10 ms window and 20 Hz for 100 ms. A slower signal, or a line that
+// changes only once, reads as a steady line does: cycles 0, period_ns the
+// level window's length, and high_ns the time the line was high in it.
+
+// CSR: the divider runs while pin B is high, or on its rising edges.
+const DIVMODE_LEVEL: u32 = 1 << 4
+const DIVMODE_RISING: u32 = 2 << 4
+// The counter's full range, for input capture.
+const FULL_TOP: u32 = 0xFFFF
+const FULL_RANGE: u64 = 0x1_0000
+// The largest whole divider in edge windows.
+pub const MAX_EDGE_DIVIDER: u32 = 255
+// Level window dividers cover this many windows when they can.
+const LEVEL_HEADROOM: u64 = 4
+// A level count within this many nanoseconds of the whole window, twice
+// the timer's resolution, is a line held high.
+const STEADY_SLACK_NS: u64 = 2000
+
+// The offset of INTR, the raw interrupt flags, in a PWM block of `slices`
+// slices: 8 on the RP2040 (0xA4), 12 on the RP2350 (0xF4). It follows the
+// slices' registers and EN.
+pub fn interrupt_offset(slices: u32) -> usize {
+    return SLICE_STRIDE * slices as usize + 4
+}
+
+// The divider, in sixteenths, that level windows of `window_us` count
+// with at `clock_hz`: the smallest that covers four windows in 65535
+// counts, or as many windows as MAX_DIVIDER covers. InvalidInput for a
+// window of 0 or one longer than MAX_DIVIDER covers: 134 ms at a clk_sys
+// of 125 MHz, 111 ms at 150 MHz.
+pub fn capture_divider(clock_hz: u32, window_us: u32) -> u32!hal.Error {
+    // clk_sys cycles in the window, in millionths. Both factors fit 32
+    // bits, so the product fits 64.
+    cycles := window_us as u64 * clock_hz as u64
+    if window_us == 0 || cycles > max_window_cycles() {
+        return err(hal.Error.InvalidInput)
+    }
+    counts := 0xFFFFu64 * 1_000_000
+    divider := (cycles * 16 * LEVEL_HEADROOM + counts - 1) / counts
+    if divider < MIN_DIVIDER as u64 {
+        divider = MIN_DIVIDER as u64
+    }
+    if divider > MAX_DIVIDER as u64 {
+        divider = MAX_DIVIDER as u64
+    }
+    return ok(divider as u32)
+}
+
+// The longest window, in microseconds, at `clock_hz`: what 65535 counts
+// at MAX_DIVIDER cover.
+pub fn max_window_us(clock_hz: u32) -> u32 {
+    if clock_hz == 0 {
+        return 0
+    }
+    longest := max_window_cycles() / clock_hz as u64
+    if longest > 0xFFFF_FFFFu64 {
+        return 0xFFFF_FFFF
+    }
+    return longest as u32
+}
+
+// window_us * clock_hz at most: 65535 counts of MAX_DIVIDER / 16 cycles,
+// in millionths.
+fn max_window_cycles() -> u64 {
+    return 0xFFFFu64 * MAX_DIVIDER as u64 * 1_000_000 / 16
+}
+
+// Input capture on the B pin of a slice, over any hal.Registers: a
+// `hal.RegisterBlock` at the PWM block's base on the chip, or a simulated
+// block in a desktop test. The caller passes the time to each poll, in
+// microseconds from any fixed start; `PwmCapture` reads the chip's timer
+// itself and implements hal.PwmInput. The input claims both outputs of
+// its slice, since it uses the slice's counter.
+pub struct Capture<R: hal.Registers> {
+    registers: R
+    pin: u32
+    // The slice's registers, from the block's base; INTR's offset and the
+    // slice's bit in it; and the slice's two bits in CLAIMED.
+    base: usize
+    interrupts: usize
+    wrap: u32
+    claim: u32
+    clock_hz: u32
+    window_us: u32
+    // The level windows' divider in sixteenths, and the edge windows'
+    // whole divider.
+    level_divider: u32
+    edge_divider: u32
+    // Whether an edge window runs, else a level window, since start_us;
+    // the level window ends at deadline_us.
+    counting_edges: bool
+    start_us: u64
+    deadline_us: u64
+    // The count at the last poll, and the first and latest polls that saw
+    // it change: their counts and times, and how many such polls there
+    // were.
+    last_count: u32
+    first_count: u32
+    first_us: u64
+    latest_count: u32
+    latest_us: u64
+    changes: u32
+    // The period the edge window measured, 0 for none, and the edges it
+    // spans.
+    period_ns: u64
+    edges: u32
+    // A finished measurement poll has not returned yet.
+    ready: bool
+    ready_period_ns: u64
+    ready_high_ns: u64
+    ready_cycles: u32
+
+    // Start measuring the signal on GPIO `pin`, output B of slice
+    // `slice_of(pin)`, at `now_us`, in windows of `window_us`; see
+    // capture_divider for the range. `slices` is the number of slices of
+    // the block, 8 on the RP2040 and 12 on the RP2350, which places INTR.
+    // InvalidInput for an even pin (output A cannot count), above GPIO 29,
+    // or for a window out of range; Busy if either output of the slice is
+    // in use, by a Channel or another Capture.
+    // SAFETY: `registers` must be the PWM block's, out of reset and clocked
+    // at `clock_hz`, and only Channels and Captures may use it; nothing
+    // else may clear the slice's INTR flag.
+    pub unsafe fn new(registers: R, slices: u32, clock_hz: u32, pin: u32, window_us: u32, now_us: u64) -> Capture<R>!hal.Error {
+        if pin >= PIN_COUNT || output_of(pin) != 1 {
+            return err(hal.Error.InvalidInput)
+        }
+        level_divider := capture_divider(clock_hz, window_us)?
+        slice := slice_of(pin)
+        capture := Capture<R> {
+            registers,
+            pin,
+            base: SLICE_STRIDE * slice as usize,
+            interrupts: interrupt_offset(slices),
+            wrap: 1u32 << slice,
+            claim: 3u32 << (2 * slice),
+            clock_hz,
+            window_us,
+            level_divider,
+            edge_divider: 1,
+            counting_edges: true,
+            start_us: now_us,
+            deadline_us: now_us,
+            last_count: 0,
+            first_count: 0,
+            first_us: now_us,
+            latest_count: 0,
+            latest_us: now_us,
+            changes: 0,
+            period_ns: 0,
+            edges: 0,
+            ready: false,
+            ready_period_ns: 0,
+            ready_high_ns: 0,
+            ready_cycles: 0,
+        }
+        section := hal.Critical.enter()
+        // SAFETY: interrupts are masked, so CLAIMED is read and changed
+        // atomically on this core; only core 0 runs.
+        claimed := unsafe {
+            CLAIMED
+        }
+        if (claimed & capture.claim) != 0 {
+            core.drop(section)
+            return err(hal.Error.Busy)
+        }
+        unsafe {
+            CLAIMED = claimed | capture.claim
+        }
+        core.drop(section)
+        capture.registers.write(capture.base + CSR, 0)
+        capture.registers.write(capture.base + CC, 0)
+        capture.registers.write(capture.base + TOP, FULL_TOP)
+        capture.start_edges(now_us)
+        return ok(capture)
+    }
+
+    // Advance the measurement to `now_us`, without waiting, as
+    // hal.PwmInput.poll_capture does: true with `capture` set once a
+    // measurement has finished since the last call that returned true,
+    // false while none has. Overrun if a count wrapped in a way the input
+    // cannot recover from: an edge window that wraps even at
+    // MAX_EDGE_DIVIDER (a signal near clk_sys / 2, or polls far apart), or
+    // a level window that outlasts what its divider covers (a poll more
+    // than about three windows late). The measurement then starts over.
+    pub fn poll(&mut self, now_us: u64, capture: &mut hal.PulseCapture) -> bool!hal.Error {
+        // A time before the window started counts as its start.
+        now := now_us
+        if now < self.start_us {
+            now = self.start_us
+        }
+        if self.counting_edges {
+            self.poll_edges(now)?
+        } else {
+            self.poll_level(now)?
+        }
+        if !self.ready {
+            return ok(false)
+        }
+        capture.period_ns = self.ready_period_ns
+        capture.high_ns = self.ready_high_ns
+        capture.cycles = self.ready_cycles
+        self.ready = false
+        return ok(true)
+    }
+
+    // The GPIO measured.
+    pub fn pin(&self) -> u32 {
+        return self.pin
+    }
+
+    // The slice, 0 to 7, whose counter measures.
+    pub fn slice(&self) -> u32 {
+        return (self.base / SLICE_STRIDE) as u32
+    }
+
+    // The window length, in microseconds; a measurement takes two.
+    pub fn window_us(&self) -> u32 {
+        return self.window_us
+    }
+
+    // The level windows' divider, in sixteenths, from capture_divider.
+    pub fn level_divider(&self) -> u32 {
+        return self.level_divider
+    }
+
+    // The whole divider the next or running edge window counts edges with,
+    // 1 to MAX_EDGE_DIVIDER.
+    pub fn edge_divider(&self) -> u32 {
+        return self.edge_divider
+    }
+
+    // The time a level count stands for, in picoseconds: divider / 16
+    // clk_sys cycles, the high time's resolution in one window.
+    pub fn level_resolution_ps(&self) -> u64 {
+        return self.level_divider as u64 * 1_000_000_000_000 / 16 / self.clock_hz as u64
+    }
+
+    // Stop the slice and give it up: it is left disabled, free-running
+    // (DIVMODE 0), at a divider of 1 and a TOP of 65535, with its wrap flag
+    // clear, so both outputs can be opened again. Returns the registers.
+    pub fn release(self) -> R {
+        self.registers.write(self.base + CSR, 0)
+        self.registers.write(self.base + DIV, MIN_DIVIDER)
+        self.registers.write(self.base + CTR, 0)
+        self.registers.write(self.base + TOP, FULL_TOP)
+        self.clear_wrap()
+        section := hal.Critical.enter()
+        // SAFETY: as in `new`.
+        unsafe {
+            CLAIMED &= ~self.claim
+        }
+        core.drop(section)
+        let Capture { registers, pin, base, interrupts, wrap, claim, clock_hz, window_us, level_divider, edge_divider, counting_edges, start_us, deadline_us, last_count, first_count, first_us, latest_count, latest_us, changes, period_ns, edges, ready, ready_period_ns, ready_high_ns, ready_cycles } = self
+        return registers
+    }
+
+    // Count from 0 in `mode` with divider `divider`, in sixteenths, from
+    // now on, with the wrap flag clear.
+    fn restart(&mut self, mode: u32, divider: u32, now_us: u64) {
+        self.registers.write(self.base + CSR, 0)
+        self.registers.write(self.base + DIV, divider)
+        self.registers.write(self.base + CTR, 0)
+        self.clear_wrap()
+        self.registers.write(self.base + CSR, mode | ENABLE)
+        self.start_us = now_us
+    }
+
+    // Clear the slice's wrap flag, if set, by writing its bit alone to
+    // INTR, which leaves the other slices' flags. The slice is stopped, so
+    // the flag cannot set again in between.
+    fn clear_wrap(&mut self) {
+        if (self.registers.read(self.interrupts) & self.wrap) != 0 {
+            self.registers.write(self.interrupts, self.wrap)
+        }
+    }
+
+    fn start_edges(&mut self, now_us: u64) {
+        divider := self.edge_divider * 16
+        self.restart(DIVMODE_RISING, divider, now_us)
+        self.counting_edges = true
+        self.last_count = 0
+        self.first_count = 0
+        self.first_us = now_us
+        self.latest_count = 0
+        self.latest_us = now_us
+        self.changes = 0
+    }
+
+    // Stop the counter and return its count, or none if it wrapped.
+    fn stop(&mut self) -> Option<u32> {
+        self.registers.write(self.base + CSR, 0)
+        return self.count()
+    }
+
+    // The running count, or none if it wrapped since the window started.
+    fn count(&mut self) -> Option<u32> {
+        count := self.registers.read(self.base + CTR) & FULL_TOP
+        if (self.registers.read(self.interrupts) & self.wrap) != 0 {
+            return none
+        }
+        return some(count)
+    }
+
+    fn poll_edges(&mut self, now_us: u64) -> void!hal.Error {
+        elapsed := now_us - self.start_us
+        done := elapsed >= self.window_us as u64
+        counted: Option<u32> = none
+        if done {
+            counted = self.stop()
+        } else {
+            counted = self.count()
+        }
+        count := 0u32
+        match counted {
+            some(value) => {
+                count = value
+            }
+            none => {
+                return self.edges_wrapped(now_us)
+            }
+        }
+        if count != self.last_count {
+            if self.changes == 0 {
+                self.first_count = count
+                self.first_us = now_us
+            }
+            self.latest_count = count
+            self.latest_us = now_us
+            self.changes += 1
+            self.last_count = count
+        }
+        if !done {
+            return ok()
+        }
+        divider := self.edge_divider as u64
+        total := count as u64 * divider
+        self.period_ns = 0
+        self.edges = 0
+        if self.latest_count > self.first_count {
+            // The reciprocal estimate, between the first and latest polls
+            // that saw the count change.
+            edges := (self.latest_count - self.first_count) as u64 * divider
+            span_ns := (self.latest_us - self.first_us) * 1000
+            if span_ns > 0 {
+                self.period_ns = (span_ns + edges / 2) / edges
+                self.edges = edges as u32
+            }
+        }
+        if self.period_ns == 0 && total >= 2 && elapsed > 0 {
+            // Edges over the whole window.
+            self.period_ns = (elapsed * 1000 + total / 2) / total
+            self.edges = total as u32
+        }
+        // Count at most half the range in the next edge window.
+        self.edge_divider = clamp_edge_divider((total + FULL_RANGE / 2 - 1) / (FULL_RANGE / 2))
+        // A level window of a whole number of periods, or of the window
+        // without a period.
+        window_ns := self.window_us as u64 * 1000
+        length_ns := window_ns
+        if self.period_ns > 0 && self.period_ns <= window_ns {
+            length_ns = window_ns / self.period_ns * self.period_ns
+        }
+        level_divider := self.level_divider
+        self.restart(DIVMODE_LEVEL, level_divider, now_us)
+        self.deadline_us = now_us + (length_ns + 999) / 1000
+        self.counting_edges = false
+        return ok()
+    }
+
+    // An edge window's count wrapped: count again with a larger divider,
+    // or report Overrun at the largest.
+    fn edges_wrapped(&mut self, now_us: u64) -> void!hal.Error {
+        if self.edge_divider >= MAX_EDGE_DIVIDER {
+            self.start_edges(now_us)
+            return err(hal.Error.Overrun)
+        }
+        // At least a full range and what the counter shows now, so far.
+        count := self.registers.read(self.base + CTR) & FULL_TOP
+        edges := (FULL_RANGE + count as u64) * self.edge_divider as u64
+        needed := (edges + FULL_RANGE / 2 - 1) / (FULL_RANGE / 2)
+        larger := self.edge_divider as u64 * 4
+        if needed > larger {
+            larger = needed
+        }
+        self.edge_divider = clamp_edge_divider(larger)
+        self.start_edges(now_us)
+        return ok()
+    }
+
+    fn poll_level(&mut self, now_us: u64) -> void!hal.Error {
+        if now_us < self.deadline_us {
+            return ok()
+        }
+        counted := self.stop()
+        count := 0u32
+        match counted {
+            some(value) => {
+                count = value
+            }
+            none => {
+                self.start_edges(now_us)
+                return err(hal.Error.Overrun)
+            }
+        }
+        scale := 16 * self.clock_hz as u64
+        high_ns := (count as u64 * self.level_divider as u64 * 1_000_000_000 + scale / 2) / scale
+        length_ns := (now_us - self.start_us) * 1000
+        if high_ns > length_ns {
+            high_ns = length_ns
+        }
+        if self.period_ns == 0 {
+            // No period: the line's level over the window.
+            if high_ns + STEADY_SLACK_NS >= length_ns {
+                high_ns = length_ns
+            }
+            self.ready_period_ns = length_ns
+            self.ready_high_ns = high_ns
+            self.ready_cycles = 0
+        } else {
+            // High time per period: the window lasted length / period
+            // periods.
+            per_period := (high_ns * self.period_ns + length_ns / 2) / length_ns
+            if per_period > self.period_ns {
+                per_period = self.period_ns
+            }
+            self.ready_period_ns = self.period_ns
+            self.ready_high_ns = per_period
+            self.ready_cycles = self.edges
+        }
+        self.ready = true
+        self.start_edges(now_us)
+        return ok()
+    }
+}
+
+// `divider` within 1 to MAX_EDGE_DIVIDER.
+fn clamp_edge_divider(divider: u64) -> u32 {
+    if divider < 1 {
+        return 1
+    }
+    if divider > MAX_EDGE_DIVIDER as u64 {
+        return MAX_EDGE_DIVIDER
+    }
+    return divider as u32
+}
+
+// Input capture on the chip: a Capture over the PWM block's registers,
+// timed by the chip's microsecond timer, which the chip packages hand out.
+// Implements hal.PwmInput.
+pub struct PwmCapture: hal.PwmInput {
+    capture: Capture<hal.RegisterBlock>
+    // The timer's raw count, TIMERAWH and TIMERAWL, which read without
+    // latching.
+    high: hal.Reg<u32>
+    low: hal.Reg<u32>
+
+    // Capture.new over the block at `base`, timed by the microsecond timer
+    // at `timer`, whose TIMERAWH and TIMERAWL registers are at 0x24 and
+    // 0x28 on both chips. Errors as for Capture.new.
+    // SAFETY: as for Capture.new, with `base` the PWM block's base address
+    // and `timer` a running microsecond timer's.
+    pub unsafe fn at(base: usize, slices: u32, timer: usize, clock_hz: u32, pin: u32, window_us: u32) -> PwmCapture!hal.Error {
+        unsafe {
+            high: hal.Reg<u32> = hal.Reg.at(timer + 0x24)
+            low: hal.Reg<u32> = hal.Reg.at(timer + 0x28)
+            now := read_timer(&high, &low)
+            capture := Capture.new(hal.RegisterBlock.at(base), slices, clock_hz, pin, window_us, now)?
+            return ok(PwmCapture { capture, high, low })
+        }
+    }
+
+    // Capture.poll at the timer's time.
+    pub fn poll_capture(&mut self, capture: &mut hal.PulseCapture) -> bool!hal.Error {
+        now := read_timer(&self.high, &self.low)
+        return self.capture.poll(now, capture)
+    }
+
+    pub fn pin(&self) -> u32 {
+        return self.capture.pin()
+    }
+
+    pub fn slice(&self) -> u32 {
+        return self.capture.slice()
+    }
+
+    pub fn window_us(&self) -> u32 {
+        return self.capture.window_us()
+    }
+
+    pub fn level_divider(&self) -> u32 {
+        return self.capture.level_divider()
+    }
+
+    pub fn edge_divider(&self) -> u32 {
+        return self.capture.edge_divider()
+    }
+
+    pub fn level_resolution_ps(&self) -> u64 {
+        return self.capture.level_resolution_ps()
+    }
+
+    // Capture.release; returns the block's base address.
+    pub fn release(self) -> usize {
+        let PwmCapture { capture, high, low } = self
+        registers := capture.release()
+        return registers.base()
+    }
+}
+
+// The timer's 64-bit microsecond count, read high, low, high again until
+// the high word holds still.
+fn read_timer(high: &hal.Reg<u32>, low: &hal.Reg<u32>) -> u64 {
+    for {
+        upper := high.read()
+        lower := low.read()
+        if high.read() == upper {
+            return ((upper as u64) << 32) | lower as u64
+        }
     }
 }

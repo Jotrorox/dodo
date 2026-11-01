@@ -1,14 +1,20 @@
 package fake
 
 import "core/option"
+import "core/ptr"
 import "std/embedded/executor"
 import "std/embedded/hal"
+import "std/embedded/hal/serial"
 import "std/embedded/power"
 import "std/io"
 
 // In-memory devices implementing the `std/embedded/hal` protocols. They let
 // driver code run under `dodo test` on a desktop with no hardware attached, and
-// record what the driver did so tests can assert on it.
+// record what the driver did so tests can assert on it. There is one for
+// every protocol: pins, delays, I2C and SPI buses (blocking and polled),
+// serial ports, PWM outputs and inputs, analog inputs, I2C and SPI targets,
+// CAN controllers, I2S streams, DMA channels and buffer transfers, and a
+// simulated clock for executor tasks.
 
 // An output and input pin. It starts low.
 pub struct Pin {
@@ -147,14 +153,90 @@ pub struct Alarm {
 // sensors. A write sets the register pointer from its first byte and stores
 // any following bytes at successive registers; a read continues from the
 // pointer. Other addresses report NoAcknowledge.
-pub struct I2c {
+//
+// It also implements hal.I2cPoll: a polled transaction takes the number of
+// polls set by `set_poll_steps` (1 at first) and happens, all at once, on
+// the last of them.
+pub struct I2c: hal.I2c + hal.I2cPoll {
     address: u8
     registers: [256]u8
     pointer: u8
     failure: Option<hal.Error>
+    steps: u32
+    // A polled transaction: polls so far (0 when none runs), and what the
+    // first poll asked for, to check the later ones.
+    polls: u32
+    polled_address: u8
+    polled_write: usize
+    polled_read: usize
+    cancels: u32
 
     pub fn new(address: u8) -> I2c {
-        return I2c { address, registers: [0; 256], pointer: 0, failure: none }
+        return I2c { address, registers: [0; 256], pointer: 0, failure: none, steps: 1, polls: 0, polled_address: 0, polled_write: 0, polled_read: 0, cancels: 0 }
+    }
+
+    // Make each polled transaction take `polls` polls, at least 1.
+    pub fn set_poll_steps(&mut self, polls: u32) {
+        core.assert(polls != 0)
+        self.steps = polls
+    }
+
+    // How many polled transactions were cancelled.
+    pub fn cancels(&self) -> u32 {
+        return self.cancels
+    }
+
+    // True while a polled transaction runs.
+    pub fn is_busy(&self) -> bool {
+        return self.polls != 0
+    }
+
+    pub fn poll_write(&mut self, address: u8, bytes: &[u8]) -> bool!hal.Error {
+        if !self.step(address, bytes.len, 0)? {
+            return ok(false)
+        }
+        self.write(address, bytes)?
+        return ok(true)
+    }
+
+    pub fn poll_read(&mut self, address: u8, buffer: &mut[u8]) -> bool!hal.Error {
+        if !self.step(address, 0, buffer.len)? {
+            return ok(false)
+        }
+        self.read(address, buffer)?
+        return ok(true)
+    }
+
+    pub fn poll_write_read(&mut self, address: u8, bytes: &[u8], buffer: &mut[u8]) -> bool!hal.Error {
+        if !self.step(address, bytes.len, buffer.len)? {
+            return ok(false)
+        }
+        self.write_read(address, bytes, buffer)?
+        return ok(true)
+    }
+
+    pub fn cancel(&mut self) {
+        if self.polls != 0 {
+            self.polls = 0
+            self.cancels += 1
+        }
+    }
+
+    // Count one poll of a transaction; true on its last.
+    fn step(&mut self, address: u8, write: usize, read: usize) -> bool!hal.Error {
+        if self.polls == 0 {
+            self.polled_address = address
+            self.polled_write = write
+            self.polled_read = read
+        } else if address != self.polled_address || write != self.polled_write || read != self.polled_read {
+            return err(hal.Error.InvalidInput)
+        }
+        self.polls += 1
+        if self.polls < self.steps {
+            return ok(false)
+        }
+        self.polls = 0
+        return ok(true)
     }
 
     pub fn register(&self, index: u8) -> u8 {
@@ -210,15 +292,91 @@ pub struct I2c {
 
 // An SPI bus that records the most recent 64 bytes sent and answers each
 // byte from a programmed reply, then with zeros.
-pub struct Spi {
+//
+// It also implements hal.SpiPoll: each poll exchanges at most the number
+// of bytes set by `set_poll_chunk` (all at first).
+pub struct Spi: hal.Spi + hal.SpiPoll {
     sent: [64]u8
     sent_length: usize
     reply: [64]u8
     reply_length: usize
     reply_position: usize
+    chunk: usize
+    // A polled transfer: bytes done, its length, whether it runs, and
+    // whether it writes only.
+    done: usize
+    length: usize
+    polling: bool
+    writing: bool
+    polls: u32
 
     pub fn new() -> Spi {
-        return Spi { sent: [0; 64], sent_length: 0, reply: [0; 64], reply_length: 0, reply_position: 0 }
+        return Spi { sent: [0; 64], sent_length: 0, reply: [0; 64], reply_length: 0, reply_position: 0, chunk: 0, done: 0, length: 0, polling: false, writing: false, polls: 0 }
+    }
+
+    // Exchange at most `bytes` bytes per poll; 0 for all of them.
+    pub fn set_poll_chunk(&mut self, bytes: usize) {
+        self.chunk = bytes
+    }
+
+    // Polls made of polled transfers so far.
+    pub fn polls(&self) -> u32 {
+        return self.polls
+    }
+
+    pub fn poll_transfer(&mut self, bytes: &mut[u8]) -> bool!hal.Error {
+        self.begin_poll(bytes.len, false)?
+        end := self.chunk_end()
+        for index in self.done..end {
+            bytes[index] = self.exchange(bytes[index])
+        }
+        return ok(self.end_poll(end))
+    }
+
+    pub fn poll_write(&mut self, bytes: &[u8]) -> bool!hal.Error {
+        self.begin_poll(bytes.len, true)?
+        end := self.chunk_end()
+        for index in self.done..end {
+            self.exchange(bytes[index])
+        }
+        return ok(self.end_poll(end))
+    }
+
+    pub fn cancel(&mut self) {
+        self.polling = false
+    }
+
+    pub fn is_busy(&self) -> bool {
+        return self.polling
+    }
+
+    fn begin_poll(&mut self, length: usize, writing: bool) -> void!hal.Error {
+        self.polls += 1
+        if !self.polling {
+            self.polling = true
+            self.writing = writing
+            self.length = length
+            self.done = 0
+        } else if self.length != length || self.writing != writing {
+            return err(hal.Error.InvalidInput)
+        }
+        return ok()
+    }
+
+    fn chunk_end(&self) -> usize {
+        if self.chunk == 0 || self.length - self.done <= self.chunk {
+            return self.length
+        }
+        return self.done + self.chunk
+    }
+
+    fn end_poll(&mut self, end: usize) -> bool {
+        self.done = end
+        if end == self.length {
+            self.polling = false
+            return true
+        }
+        return false
     }
 
     // Bytes the device answers with, in order. At most 64.
@@ -386,15 +544,68 @@ pub struct Analog {
 // once they are read, reads report end of input. Implements the std/io
 // Reader and Writer protocols like the chips' serial ports, so drivers for
 // devices on a UART, and std/fmt output, can be tested on a desktop.
-pub struct Serial {
+//
+// It also implements serial.Port and serial.PollPort. `set_write_room`
+// limits how many bytes one poll_write takes, to test a driver against a
+// full transmitter, and `set_flush_polls` how many poll_flush calls report
+// output still going out after a write.
+pub struct Serial: serial.Port + serial.PollPort {
     sent: [256]u8
     sent_length: usize
     input: [256]u8
     input_length: usize
     input_position: usize
+    room: usize
+    flush_polls: u32
+    unflushed: u32
+    flushes: u32
 
     pub fn new() -> Serial {
-        return Serial { sent: [0; 256], sent_length: 0, input: [0; 256], input_length: 0, input_position: 0 }
+        return Serial { sent: [0; 256], sent_length: 0, input: [0; 256], input_length: 0, input_position: 0, room: 0, flush_polls: 0, unflushed: 0, flushes: 0 }
+    }
+
+    // Take at most `bytes` bytes per poll_write; 0 for no limit.
+    pub fn set_write_room(&mut self, bytes: usize) {
+        self.room = bytes
+    }
+
+    // After each write, report output going out for `polls` poll_flush
+    // calls.
+    pub fn set_flush_polls(&mut self, polls: u32) {
+        self.flush_polls = polls
+    }
+
+    // Times flush or a finished poll_flush saw all output gone.
+    pub fn flushes(&self) -> u32 {
+        return self.flushes
+    }
+
+    pub fn poll_write(&mut self, bytes: &[u8]) -> io.Poll!io.Error {
+        count := bytes.len
+        if self.room != 0 && count > self.room {
+            count = self.room
+        }
+        self.write(bytes[0..count])?
+        state := io.PollState.Ready
+        if count < bytes.len {
+            state = io.PollState.Pending
+        }
+        return ok(io.Poll { transferred: count, state })
+    }
+
+    pub fn flush(&mut self) -> void!io.Error {
+        self.unflushed = 0
+        self.flushes += 1
+        return ok()
+    }
+
+    pub fn poll_flush(&mut self) -> bool!io.Error {
+        if self.unflushed != 0 {
+            self.unflushed -= 1
+            return ok(false)
+        }
+        self.flushes += 1
+        return ok(true)
     }
 
     // Bytes for reads to return, after any still unread. At most 256 can
@@ -427,6 +638,9 @@ pub struct Serial {
                 self.sent[self.sent_length] = bytes[index]
                 self.sent_length += 1
             }
+        }
+        if bytes.len != 0 {
+            self.unflushed = self.flush_polls
         }
         return ok(bytes.len)
     }
@@ -541,6 +755,831 @@ pub struct Clock {
                 index += 1
             }
         }
+    }
+}
+
+// An I2C target and the master that addresses it, played by the test:
+// `master_write`, `master_read`, and `master_stop` queue what the master
+// does, and the target's poll reports it in order, as hal.I2cTarget
+// requires. A master read waits until the driver answers with `respond`;
+// the bytes it read are in `master_received`. At most 64 steps wait at
+// once, and 256 bytes are recorded.
+pub struct I2cTarget: hal.I2cTarget {
+    // The master's steps: STEP_WRITE (with the byte, and FIRST when it
+    // follows the address), STEP_READ (with the count), or STEP_STOP.
+    steps: [64]u32
+    step_count: usize
+    step_position: usize
+    // Bytes of the current master read still to answer.
+    reading: usize
+    received: [256]u8
+    received_length: usize
+    failure: Option<hal.Error>
+
+    pub fn new() -> I2cTarget {
+        return I2cTarget { steps: [0u32; 64], step_count: 0, step_position: 0, reading: 0, received: [0; 256], received_length: 0, failure: none }
+    }
+
+    // The master addresses the target and writes `bytes`.
+    pub fn master_write(&mut self, bytes: &[u8]) {
+        for index in 0..bytes.len {
+            step := STEP_WRITE | bytes[index] as u32
+            if index == 0 {
+                step |= STEP_FIRST
+            }
+            self.push(step)
+        }
+    }
+
+    // The master addresses the target, or repeats a START, and reads
+    // `count` bytes.
+    pub fn master_read(&mut self, count: usize) {
+        core.assert(count != 0 && count <= 0xFFFF)
+        self.push(STEP_READ | count as u32)
+    }
+
+    // The master ends the transaction with a STOP.
+    pub fn master_stop(&mut self) {
+        self.push(STEP_STOP)
+    }
+
+    // The bytes the master has read so far, up to the first 256.
+    pub fn master_received(&self) -> &[u8] {
+        return self.received[0..self.received_length]
+    }
+
+    // True once every queued step has been reported and answered.
+    pub fn is_idle(&self) -> bool {
+        return self.step_position == self.step_count && self.reading == 0
+    }
+
+    // Make the next poll fail with `error`, for testing error paths.
+    pub fn fail_next(&mut self, error: hal.Error) {
+        self.failure = some(error)
+    }
+
+    pub fn poll(&mut self, buffer: &mut[u8]) -> hal.I2cTargetEvent!hal.Error {
+        if let some(error) = option.take(&mut self.failure) {
+            return err(error)
+        }
+        if self.reading != 0 {
+            return ok(hal.I2cTargetEvent.Read)
+        }
+        count := 0usize
+        start := false
+        for count < buffer.len && self.step_position < self.step_count {
+            step := self.steps[self.step_position]
+            if (step & STEP_KIND) != STEP_WRITE {
+                break
+            }
+            first := (step & STEP_FIRST) != 0
+            if first && count > 0 {
+                break
+            }
+            if count == 0 {
+                start = first
+            }
+            buffer[count] = (step & 0xFF) as u8
+            count += 1
+            self.step_position += 1
+        }
+        if count > 0 {
+            return ok(hal.I2cTargetEvent.Write(count, start))
+        }
+        if self.step_position == self.step_count {
+            return ok(hal.I2cTargetEvent.Idle)
+        }
+        step := self.steps[self.step_position]
+        if (step & STEP_KIND) == STEP_STOP {
+            self.step_position += 1
+            return ok(hal.I2cTargetEvent.Stop)
+        }
+        if (step & STEP_KIND) == STEP_READ {
+            self.step_position += 1
+            self.reading = (step & 0xFFFF) as usize
+            return ok(hal.I2cTargetEvent.Read)
+        }
+        // A write longer than an empty buffer can take.
+        return ok(hal.I2cTargetEvent.Idle)
+    }
+
+    pub fn respond(&mut self, bytes: &[u8]) -> usize!hal.Error {
+        if self.reading == 0 {
+            // No read waits: a real controller would hold the bytes for
+            // the next one, which this fake does not model.
+            return ok(0)
+        }
+        if bytes.len == 0 {
+            self.record(0xFF)
+            self.reading -= 1
+            return ok(0)
+        }
+        count := 0usize
+        for count < bytes.len && self.reading > 0 {
+            self.record(bytes[count])
+            self.reading -= 1
+            count += 1
+        }
+        return ok(count)
+    }
+
+    fn push(&mut self, step: u32) {
+        if self.step_position == self.step_count {
+            self.step_position = 0
+            self.step_count = 0
+        }
+        core.assert(self.step_count < 64)
+        self.steps[self.step_count] = step
+        self.step_count += 1
+    }
+
+    fn record(&mut self, byte: u8) {
+        if self.received_length < 256 {
+            self.received[self.received_length] = byte
+            self.received_length += 1
+        }
+    }
+}
+
+const STEP_KIND: u32 = 0b11 << 24
+const STEP_WRITE: u32 = 1 << 24
+const STEP_READ: u32 = 2 << 24
+const STEP_STOP: u32 = 3 << 24
+const STEP_FIRST: u32 = 1 << 16
+
+// An SPI target and the master that clocks it, played by the test:
+// `master_exchange` clocks bytes in from the master and out of the queue
+// the driver filled, as many as the master sends; with the queue empty the
+// target answers 0. 64 bytes wait in each direction at most; bytes the
+// master sends beyond what waits unread are lost, and the next read reports
+// Overrun.
+pub struct SpiTarget: hal.SpiTarget {
+    outgoing: [64]u8
+    outgoing_length: usize
+    incoming: [64]u8
+    incoming_length: usize
+    lost: bool
+
+    pub fn new() -> SpiTarget {
+        return SpiTarget { outgoing: [0; 64], outgoing_length: 0, incoming: [0; 64], incoming_length: 0, lost: false }
+    }
+
+    // The master sends `bytes`, each replaced by the byte the target sent
+    // in its place.
+    pub fn master_exchange(&mut self, bytes: &mut[u8]) {
+        for index in 0..bytes.len {
+            reply := 0u8
+            if self.outgoing_length > 0 {
+                reply = self.outgoing[0]
+                for move in 1..self.outgoing_length {
+                    self.outgoing[move - 1] = self.outgoing[move]
+                }
+                self.outgoing_length -= 1
+            }
+            if self.incoming_length < 64 {
+                self.incoming[self.incoming_length] = bytes[index]
+                self.incoming_length += 1
+            } else {
+                self.lost = true
+            }
+            bytes[index] = reply
+        }
+    }
+
+    // Bytes queued and not yet clocked out.
+    pub fn queued(&self) -> usize {
+        return self.outgoing_length
+    }
+
+    pub fn queue(&mut self, bytes: &[u8]) -> usize!hal.Error {
+        count := 0usize
+        for count < bytes.len && self.outgoing_length < 64 {
+            self.outgoing[self.outgoing_length] = bytes[count]
+            self.outgoing_length += 1
+            count += 1
+        }
+        return ok(count)
+    }
+
+    pub fn read(&mut self, buffer: &mut[u8]) -> usize!hal.Error {
+        count := buffer.len
+        if count > self.incoming_length {
+            count = self.incoming_length
+        }
+        for index in 0..count {
+            buffer[index] = self.incoming[index]
+        }
+        for index in count..self.incoming_length {
+            self.incoming[index - count] = self.incoming[index]
+        }
+        self.incoming_length -= count
+        if count == 0 && self.lost {
+            self.lost = false
+            return err(hal.Error.Overrun)
+        }
+        return ok(count)
+    }
+}
+
+// A PWM input that reports the measurements given to `queue`, one per
+// poll_capture, in order; with none waiting, poll_capture is false. At
+// most 16 wait at once.
+pub struct PwmInput: hal.PwmInput {
+    periods: [16]u64
+    highs: [16]u64
+    cycles: [16]u32
+    length: usize
+    position: usize
+    failure: Option<hal.Error>
+
+    pub fn new() -> PwmInput {
+        return PwmInput { periods: [0u64; 16], highs: [0u64; 16], cycles: [0u32; 16], length: 0, position: 0, failure: none }
+    }
+
+    // A measurement for a later poll_capture to report.
+    pub fn queue(&mut self, period_ns: u64, high_ns: u64, cycles: u32) {
+        if self.position == self.length {
+            self.position = 0
+            self.length = 0
+        }
+        core.assert(self.length < 16)
+        self.periods[self.length] = period_ns
+        self.highs[self.length] = high_ns
+        self.cycles[self.length] = cycles
+        self.length += 1
+    }
+
+    // A signal of `frequency_hz` that is high `percent` of each period,
+    // as a single-period measurement.
+    pub fn queue_signal(&mut self, frequency_hz: u32, percent: u32) {
+        core.assert(frequency_hz != 0 && percent <= 100)
+        period := 1_000_000_000u64 / frequency_hz as u64
+        self.queue(period, period * percent as u64 / 100, 1)
+    }
+
+    pub fn fail_next(&mut self, error: hal.Error) {
+        self.failure = some(error)
+    }
+
+    pub fn poll_capture(&mut self, capture: &mut hal.PulseCapture) -> bool!hal.Error {
+        if let some(error) = option.take(&mut self.failure) {
+            return err(error)
+        }
+        if self.position == self.length {
+            return ok(false)
+        }
+        capture.period_ns = self.periods[self.position]
+        capture.high_ns = self.highs[self.position]
+        capture.cycles = self.cycles[self.position]
+        self.position += 1
+        return ok(true)
+    }
+}
+
+// A CAN controller on a simulated bus. Frames sent are recorded, up to
+// 16, for `sent` to return, and with `set_loopback` also received, as a
+// controller in loopback mode does; frames given to `inject` arrive as if
+// another node had sent them. `set_transmit_room` limits how many frames
+// may wait to leave, until `drain_transmit` sends them; up to 16 received
+// frames wait. Classic CAN unless created with `new_fd`.
+pub struct Can: hal.Can {
+    fd: bool
+    loopback: bool
+    room: usize
+    pending: usize
+    // Sent frames, in order.
+    sent_frames: [16]hal.CanFrame
+    sent_count: usize
+    // Received frames waiting: a ring.
+    queue: [16]hal.CanFrame
+    queue_start: usize
+    queue_length: usize
+    lost: bool
+    state: hal.CanErrorState
+    failure: Option<hal.Error>
+
+    pub fn new() -> Can {
+        return Can.make(false)
+    }
+
+    // A CAN FD controller, which also sends and receives FD frames.
+    pub fn new_fd() -> Can {
+        return Can.make(true)
+    }
+
+    fn make(fd: bool) -> Can {
+        return Can {
+            fd,
+            loopback: false,
+            room: 16,
+            pending: 0,
+            sent_frames: [hal.CanFrame.new(), hal.CanFrame.new(), hal.CanFrame.new(), hal.CanFrame.new(), hal.CanFrame.new(), hal.CanFrame.new(), hal.CanFrame.new(), hal.CanFrame.new(), hal.CanFrame.new(), hal.CanFrame.new(), hal.CanFrame.new(), hal.CanFrame.new(), hal.CanFrame.new(), hal.CanFrame.new(), hal.CanFrame.new(), hal.CanFrame.new()],
+            sent_count: 0,
+            queue: [hal.CanFrame.new(), hal.CanFrame.new(), hal.CanFrame.new(), hal.CanFrame.new(), hal.CanFrame.new(), hal.CanFrame.new(), hal.CanFrame.new(), hal.CanFrame.new(), hal.CanFrame.new(), hal.CanFrame.new(), hal.CanFrame.new(), hal.CanFrame.new(), hal.CanFrame.new(), hal.CanFrame.new(), hal.CanFrame.new(), hal.CanFrame.new()],
+            queue_start: 0,
+            queue_length: 0,
+            lost: false,
+            state: hal.CanErrorState.Active,
+            failure: none,
+        }
+    }
+
+    // Receive every frame sent, too.
+    pub fn set_loopback(&mut self, on: bool) {
+        self.loopback = on
+    }
+
+    // Let at most `frames` frames wait to leave, as a controller with that
+    // many transmit buffers on a bus where frames leave only when
+    // `drain_transmit` says so; 0 sends every frame at once (the default).
+    pub fn set_transmit_room(&mut self, frames: usize) {
+        if frames == 0 {
+            self.room = 16
+        } else {
+            self.room = frames
+        }
+    }
+
+    // Let the frames waiting to leave go.
+    pub fn drain_transmit(&mut self) {
+        self.pending = 0
+    }
+
+    // Change the fault confinement state; while BusOff, poll_send fails
+    // with Bus.
+    pub fn set_error_state(&mut self, state: hal.CanErrorState) {
+        self.state = state
+    }
+
+    // A frame arrives from another node. When 16 already wait, it is lost
+    // and the next poll_receive reports Overrun.
+    pub fn inject(&mut self, frame: &hal.CanFrame) {
+        if self.queue_length == 16 {
+            self.lost = true
+            return
+        }
+        slot := (self.queue_start + self.queue_length) % 16
+        self.queue[slot].copy_from(frame)
+        self.queue_length += 1
+    }
+
+    // The frames sent so far, up to the first 16.
+    pub fn sent_count(&self) -> usize {
+        return self.sent_count
+    }
+
+    pub fn sent(&self, index: usize) -> &hal.CanFrame {
+        core.assert(index < self.sent_count)
+        return &self.sent_frames[index]
+    }
+
+    // Received frames still waiting.
+    pub fn waiting(&self) -> usize {
+        return self.queue_length
+    }
+
+    pub fn fail_next(&mut self, error: hal.Error) {
+        self.failure = some(error)
+    }
+
+    pub fn poll_send(&mut self, frame: &hal.CanFrame) -> bool!hal.Error {
+        if let some(error) = option.take(&mut self.failure) {
+            return err(error)
+        }
+        if frame.is_fd() && !self.fd {
+            return err(hal.Error.Unsupported)
+        }
+        match &self.state {
+            hal.CanErrorState.BusOff => {
+                return err(hal.Error.Bus)
+            }
+            _ => {}
+        }
+        if self.room != 16 && self.pending >= self.room {
+            return ok(false)
+        }
+        if self.room != 16 {
+            self.pending += 1
+        }
+        if self.sent_count < 16 {
+            self.sent_frames[self.sent_count].copy_from(frame)
+            self.sent_count += 1
+        }
+        if self.loopback {
+            self.inject(frame)
+        }
+        return ok(true)
+    }
+
+    pub fn poll_receive(&mut self, frame: &mut hal.CanFrame) -> bool!hal.Error {
+        if let some(error) = option.take(&mut self.failure) {
+            return err(error)
+        }
+        if self.lost {
+            self.lost = false
+            return err(hal.Error.Overrun)
+        }
+        if self.queue_length == 0 {
+            return ok(false)
+        }
+        frame.copy_from(&self.queue[self.queue_start])
+        self.queue_start = (self.queue_start + 1) % 16
+        self.queue_length -= 1
+        return ok(true)
+    }
+
+    pub fn error_state(&mut self) -> hal.CanErrorState!hal.Error {
+        match &self.state {
+            hal.CanErrorState.Active => {
+                return ok(hal.CanErrorState.Active)
+            }
+            hal.CanErrorState.Passive => {
+                return ok(hal.CanErrorState.Passive)
+            }
+            hal.CanErrorState.BusOff => {
+                return ok(hal.CanErrorState.BusOff)
+            }
+        }
+    }
+}
+
+// An I2S output that records the samples it plays, up to the first 1024,
+// and takes at most `room` samples per poll_write, as a stream whose queue
+// is full.
+pub struct I2sOutput: hal.I2sOutput {
+    rate: u32
+    channel_count: u32
+    room: usize
+    played: [1024]i32
+    played_length: usize
+    total: usize
+
+    // A stream of `sample_rate` frames per second with `channels` (1 or 2)
+    // samples each.
+    pub fn new(sample_rate: u32, channels: u32) -> I2sOutput {
+        core.assert(channels == 1 || channels == 2)
+        return I2sOutput { rate: sample_rate, channel_count: channels, room: 0, played: [0i32; 1024], played_length: 0, total: 0 }
+    }
+
+    // Take at most `samples` samples per poll_write, rounded down to whole
+    // frames; 0 for no limit.
+    pub fn set_room(&mut self, samples: usize) {
+        self.room = samples
+    }
+
+    // The samples queued so far, up to the first 1024.
+    pub fn played(&self) -> &[i32] {
+        return self.played[0..self.played_length]
+    }
+
+    // How many samples were queued in all.
+    pub fn total(&self) -> usize {
+        return self.total
+    }
+
+    pub fn sample_rate(&self) -> u32 {
+        return self.rate
+    }
+
+    pub fn channels(&self) -> u32 {
+        return self.channel_count
+    }
+
+    pub fn poll_write(&mut self, samples: &[i32]) -> usize!hal.Error {
+        frame := self.channel_count as usize
+        if samples.len % frame != 0 {
+            return err(hal.Error.InvalidInput)
+        }
+        count := samples.len
+        if self.room != 0 && count > self.room {
+            count = self.room - self.room % frame
+        }
+        for index in 0..count {
+            if self.played_length < 1024 {
+                self.played[self.played_length] = samples[index]
+                self.played_length += 1
+            }
+        }
+        self.total += count
+        return ok(count)
+    }
+}
+
+// An I2S input that delivers the samples given to `feed`, at most `room`
+// per poll_read. `drop_samples` makes the next read report Overrun.
+pub struct I2sInput: hal.I2sInput {
+    rate: u32
+    channel_count: u32
+    room: usize
+    waiting: [1024]i32
+    waiting_length: usize
+    position: usize
+    lost: bool
+
+    pub fn new(sample_rate: u32, channels: u32) -> I2sInput {
+        core.assert(channels == 1 || channels == 2)
+        return I2sInput { rate: sample_rate, channel_count: channels, room: 0, waiting: [0i32; 1024], waiting_length: 0, position: 0, lost: false }
+    }
+
+    // Samples for later reads, after any unread; whole frames, at most
+    // 1024 waiting at once.
+    pub fn feed(&mut self, samples: &[i32]) {
+        core.assert(samples.len % self.channel_count as usize == 0)
+        unread := self.waiting_length - self.position
+        core.assert(unread + samples.len <= 1024)
+        for index in 0..unread {
+            self.waiting[index] = self.waiting[self.position + index]
+        }
+        for index in 0..samples.len {
+            self.waiting[unread + index] = samples[index]
+        }
+        self.position = 0
+        self.waiting_length = unread + samples.len
+    }
+
+    // Deliver at most `samples` samples per read, rounded down to whole
+    // frames; 0 for no limit.
+    pub fn set_room(&mut self, samples: usize) {
+        self.room = samples
+    }
+
+    // Report Overrun on the next read, as if samples had been lost.
+    pub fn drop_samples(&mut self) {
+        self.lost = true
+    }
+
+    pub fn sample_rate(&self) -> u32 {
+        return self.rate
+    }
+
+    pub fn channels(&self) -> u32 {
+        return self.channel_count
+    }
+
+    pub fn poll_read(&mut self, samples: &mut[i32]) -> usize!hal.Error {
+        if self.lost {
+            self.lost = false
+            return err(hal.Error.Overrun)
+        }
+        frame := self.channel_count as usize
+        count := self.waiting_length - self.position
+        limit := samples.len
+        if self.room != 0 && limit > self.room {
+            limit = self.room
+        }
+        limit -= limit % frame
+        if count > limit {
+            count = limit
+        }
+        for index in 0..count {
+            samples[index] = self.waiting[self.position + index]
+        }
+        self.position += count
+        return ok(count)
+    }
+}
+
+// A DMA buffer transfer without DMA: it holds up to 256 bytes of its own,
+// and a transfer finishes after the number of polls set by
+// `set_poll_steps` (1 at first). A transmitting buffer records what each
+// transfer sent, for `sent`; a receiving one fills the buffer from the
+// bytes given to `feed`, then zeros.
+pub struct DmaBuffer: hal.DmaBuffer {
+    storage: [256]u8
+    size: usize
+    receive: bool
+    running: bool
+    count: usize
+    polls: u32
+    steps: u32
+    sent: [256]u8
+    sent_length: usize
+    input: [256]u8
+    input_length: usize
+    failure: Option<hal.Error>
+
+    // A session that sends `capacity` bytes at most, up to 256.
+    pub fn transmit(capacity: usize) -> DmaBuffer {
+        return DmaBuffer.make(capacity, false)
+    }
+
+    // A session that receives `capacity` bytes at most, up to 256.
+    pub fn receive(capacity: usize) -> DmaBuffer {
+        return DmaBuffer.make(capacity, true)
+    }
+
+    fn make(capacity: usize, receive: bool) -> DmaBuffer {
+        core.assert(capacity != 0 && capacity <= 256)
+        return DmaBuffer { storage: [0; 256], size: capacity, receive, running: false, count: 0, polls: 0, steps: 1, sent: [0; 256], sent_length: 0, input: [0; 256], input_length: 0, failure: none }
+    }
+
+    pub fn set_poll_steps(&mut self, polls: u32) {
+        core.assert(polls != 0)
+        self.steps = polls
+    }
+
+    // Bytes the next receive transfers deliver, in order, up to 256.
+    pub fn feed(&mut self, bytes: &[u8]) {
+        core.assert(bytes.len <= 256)
+        for index in 0..bytes.len {
+            self.input[index] = bytes[index]
+        }
+        self.input_length = bytes.len
+    }
+
+    // What the last finished transmit transfer sent.
+    pub fn sent(&self) -> &[u8] {
+        return self.sent[0..self.sent_length]
+    }
+
+    // Make the running or next transfer end with `error`.
+    pub fn fail_next(&mut self, error: hal.Error) {
+        self.failure = some(error)
+    }
+
+    pub fn is_busy(&self) -> bool {
+        return self.running
+    }
+
+    pub fn buffer(&mut self) -> &mut[u8]!hal.Error {
+        if self.running {
+            return err(hal.Error.Busy)
+        }
+        return ok(&mut self.storage[0..self.size])
+    }
+
+    pub fn capacity(&self) -> usize {
+        return self.size
+    }
+
+    pub fn start(&mut self, count: usize) -> void!hal.Error {
+        if self.running {
+            return err(hal.Error.Busy)
+        }
+        if count == 0 || count > self.size {
+            return err(hal.Error.InvalidInput)
+        }
+        self.running = true
+        self.count = count
+        self.polls = 0
+        return ok()
+    }
+
+    pub fn poll_finish(&mut self) -> bool!hal.Error {
+        if !self.running {
+            return ok(true)
+        }
+        self.polls += 1
+        if self.polls < self.steps {
+            return ok(false)
+        }
+        self.running = false
+        if let some(error) = option.take(&mut self.failure) {
+            return err(error)
+        }
+        if self.receive {
+            for index in 0..self.count {
+                value := 0u8
+                if index < self.input_length {
+                    value = self.input[index]
+                }
+                self.storage[index] = value
+            }
+        } else {
+            for index in 0..self.count {
+                self.sent[index] = self.storage[index]
+            }
+            self.sent_length = self.count
+        }
+        return ok(true)
+    }
+
+    pub fn abort(&mut self) {
+        self.running = false
+    }
+}
+
+// A DMA channel that runs transfers in host memory: `start` moves every
+// element at once, through real addresses, and the channel then reports
+// itself busy for the number of is_busy calls set by `set_busy_polls` (0
+// at first). Addresses that do not increment are read or written element
+// by element, as a peripheral register would be, so a test passes the
+// address of a variable standing in for the register. Pacing is ignored;
+// rings are Unsupported. For testing code written against hal.DmaChannel,
+// such as hal.DmaStream, on a desktop.
+pub struct DmaChannel: hal.DmaChannel {
+    busy_polls: u32
+    busy: u32
+    remaining: u32
+    largest: u32
+    starts: u32
+    aborts: u32
+    failure: bool
+
+    pub fn new() -> DmaChannel {
+        return DmaChannel { busy_polls: 0, busy: 0, remaining: 0, largest: 0xFFFF_FFFF, starts: 0, aborts: 0, failure: false }
+    }
+
+    pub fn set_busy_polls(&mut self, polls: u32) {
+        self.busy_polls = polls
+    }
+
+    // The largest count a transfer may have, for max_count.
+    pub fn set_max_count(&mut self, count: u32) {
+        self.largest = count
+    }
+
+    // Make the next transfer report a bus error to take_error.
+    pub fn fail_next(&mut self) {
+        self.failure = true
+    }
+
+    // Transfers started and aborted so far.
+    pub fn starts(&self) -> u32 {
+        return self.starts
+    }
+
+    pub fn aborts(&self) -> u32 {
+        return self.aborts
+    }
+
+    pub unsafe fn start(&mut self, transfer: hal.DmaTransfer) -> void!hal.Error {
+        if self.busy != 0 {
+            return err(hal.Error.Busy)
+        }
+        if transfer.count > self.largest {
+            return err(hal.Error.InvalidInput)
+        }
+        match &transfer.ring {
+            hal.DmaRing.None => {}
+            _ => {
+                return err(hal.Error.Unsupported)
+            }
+        }
+        size := hal.dma_width_bytes(&transfer.width)
+        source := transfer.source
+        destination := transfer.destination
+        for _ in 0..transfer.count {
+            // SAFETY: the caller of start vouches for both addresses over
+            // the whole transfer.
+            unsafe {
+                if size == 1 {
+                    ptr.write_volatile(destination as *mut u8, ptr.read_volatile(source as *const u8))
+                } else if size == 2 {
+                    ptr.write_volatile(destination as *mut u16, ptr.read_volatile(source as *const u16))
+                } else {
+                    ptr.write_volatile(destination as *mut u32, ptr.read_volatile(source as *const u32))
+                }
+            }
+            if transfer.increment_source {
+                source += size
+            }
+            if transfer.increment_destination {
+                destination += size
+            }
+        }
+        self.starts += 1
+        self.busy = self.busy_polls
+        self.remaining = 0
+        if self.busy != 0 {
+            self.remaining = transfer.count
+        }
+        return ok()
+    }
+
+    pub fn is_busy(&mut self) -> bool {
+        if self.busy == 0 {
+            return false
+        }
+        self.busy -= 1
+        if self.busy == 0 {
+            self.remaining = 0
+        }
+        return true
+    }
+
+    pub fn remaining(&mut self) -> u32 {
+        return self.remaining
+    }
+
+    pub fn max_count(&mut self) -> u32 {
+        return self.largest
+    }
+
+    pub fn abort(&mut self) {
+        if self.busy != 0 {
+            self.aborts += 1
+        }
+        self.busy = 0
+        self.remaining = 0
+    }
+
+    pub fn take_error(&mut self) -> void!hal.Error {
+        if self.failure {
+            self.failure = false
+            return err(hal.Error.Bus)
+        }
+        return ok()
     }
 }
 

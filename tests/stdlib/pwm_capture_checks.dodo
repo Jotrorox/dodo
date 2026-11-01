@@ -1,0 +1,1014 @@
+package main
+
+import "core/ptr"
+import "std/embedded/hal"
+import "std/embedded/chip/rp_pins"
+import "std/embedded/chip/rp_pwm"
+import "std/console"
+
+// Host checks for PWM input capture on the RP2040 and RP2350 PWM slices
+// (rp_pwm.Capture, rp_pwm.PwmCapture, and rp_pins.Bank.pwm_input) against
+// a behavioural model of the PWM block. The model runs each enabled slice's
+// counter from a synthetic input signal as simulated time advances: in
+// level mode the fractional divider counts clk_sys cycles while the signal
+// is high, in edge modes it counts rising or falling edges, and the 16-bit
+// counter wraps at TOP and raises the slice's raw interrupt flag (INTR),
+// which a written 1 clears.
+
+const RP2040_HZ: u32 = 125_000_000
+const RP2350_HZ: u32 = 150_000_000
+
+// --- The PWM block model -----------------------------------------------------
+
+// Twelve slices' CSR, DIV, CTR, CC, and TOP, stored by word, slice * 5 +
+// offset / 4, then EN and INTR, at word SLICES * 5 + 1.
+const WORDS: usize = 64
+static mut REGISTERS: [64]u32 = [0u32; 64]
+// The number of slices: 8 for an RP2040 block, 12 for an RP2350's.
+static mut SLICES: u32 = 8
+static mut CLOCK: u32 = 125_000_000
+// Simulated time, in nanoseconds; every register access first brings the
+// counters up to it.
+static mut NOW_NS: u64 = 0
+// Each slice's fractional divider state, in sixteenths, and the time its
+// counter was last brought up to date.
+static mut PHASES: [12]u64 = [0u64; 12]
+static mut UPDATED: [12]u64 = [0u64; 12]
+// The input signal, on every slice's B pin: a period of PERIOD_NS, high
+// for HIGH_NS from each rising edge, the first at PHASE_NS (below the
+// period) after EPOCH_NS. A period of 0 is a steady line, high with LEVEL.
+static mut PERIOD_NS: u64 = 0
+static mut HIGH_NS: u64 = 0
+static mut PHASE_NS: u64 = 0
+static mut LEVEL: bool = false
+static mut EPOCH_NS: u64 = 0
+
+fn interrupt_word() -> usize {
+    unsafe {
+        return SLICES as usize * 5 + 1
+    }
+}
+
+// Reset the block, the clock, and time, for a block of `slices` slices.
+fn reset_block(slices: u32, clock_hz: u32) {
+    unsafe {
+        for word in 0usize..WORDS {
+            REGISTERS[word] = 0
+        }
+        for slice in 0usize..12 {
+            // DIV resets to 1, TOP to 65535.
+            REGISTERS[5 * slice + 1] = 16
+            REGISTERS[5 * slice + 4] = 0xFFFF
+            PHASES[slice] = 0
+            UPDATED[slice] = 0
+        }
+        SLICES = slices
+        CLOCK = clock_hz
+        NOW_NS = 0
+        EPOCH_NS = 0
+    }
+}
+
+// Change the input signal from now on.
+fn set_signal(period_ns: u64, high_ns: u64, phase_ns: u64) {
+    catch_up()
+    unsafe {
+        PERIOD_NS = period_ns
+        HIGH_NS = high_ns
+        PHASE_NS = phase_ns
+        EPOCH_NS = NOW_NS
+    }
+}
+
+fn set_level(high: bool) {
+    catch_up()
+    unsafe {
+        PERIOD_NS = 0
+        LEVEL = high
+        EPOCH_NS = NOW_NS
+    }
+}
+
+// A signal of `frequency_hz` with `high_ns` high time.
+fn set_frequency(frequency_hz: u64, high_ns: u64, phase_ns: u64) {
+    set_signal(1_000_000_000 / frequency_hz, high_ns, phase_ns)
+}
+
+// The signal's high time from the epoch to `t`, nanoseconds after it.
+fn high_time(t: u64) -> u64 {
+    unsafe {
+        if PERIOD_NS == 0 {
+            if LEVEL {
+                return t
+            }
+            return 0
+        }
+        // Shifted by a period less the phase, so the shifted time is
+        // positive and periods start at rising edges.
+        offset := PERIOD_NS - PHASE_NS
+        return periodic_high(t + offset) - periodic_high(offset)
+    }
+}
+
+fn periodic_high(x: u64) -> u64 {
+    unsafe {
+        part := x % PERIOD_NS
+        if part > HIGH_NS {
+            part = HIGH_NS
+        }
+        return x / PERIOD_NS * HIGH_NS + part
+    }
+}
+
+// Rising (or falling) edges at most `t` after the epoch, from a fixed
+// origin.
+fn edges(t: u64, falling: bool) -> u64 {
+    unsafe {
+        if PERIOD_NS == 0 {
+            return 0
+        }
+        phase := PHASE_NS
+        if falling {
+            phase = (PHASE_NS + HIGH_NS) % PERIOD_NS
+        }
+        return (t + PERIOD_NS - phase) / PERIOD_NS
+    }
+}
+
+// clk_sys cycles from the epoch to `t` after it, while the signal is high
+// or in all.
+fn cycles(time_ns: u64) -> u64 {
+    unsafe {
+        return time_ns * CLOCK as u64 / 1_000_000_000
+    }
+}
+
+// Bring every slice's counter up to NOW_NS.
+fn catch_up() {
+    unsafe {
+        for slice in 0usize..SLICES as usize {
+            advance(slice)
+        }
+    }
+}
+
+fn advance(slice: usize) {
+    unsafe {
+        from_ns := UPDATED[slice] - EPOCH_NS
+        to_ns := NOW_NS - EPOCH_NS
+        if UPDATED[slice] < EPOCH_NS {
+            from_ns = 0
+        }
+        UPDATED[slice] = NOW_NS
+        csr := REGISTERS[5 * slice]
+        if (csr & 1) == 0 || to_ns <= from_ns {
+            return
+        }
+        mode := (csr >> 4) & 3
+        events := 0u64
+        if mode == 0 {
+            events = cycles(to_ns) - cycles(from_ns)
+        } else if mode == 1 {
+            events = cycles(high_time(to_ns)) - cycles(high_time(from_ns))
+        } else {
+            events = edges(to_ns, mode == 3) - edges(from_ns, mode == 3)
+        }
+        divider := (REGISTERS[5 * slice + 1] & 0xFFF) as u64
+        if divider < 16 {
+            divider += 256 * 16
+        }
+        PHASES[slice] += events * 16
+        steps := PHASES[slice] / divider
+        PHASES[slice] = PHASES[slice] % divider
+        top := REGISTERS[5 * slice + 4] as u64
+        count := REGISTERS[5 * slice + 2] as u64 + steps
+        if count > top {
+            REGISTERS[interrupt_word()] |= 1u32 << slice as u32
+            count = count % (top + 1)
+        }
+        REGISTERS[5 * slice + 2] = count as u32
+    }
+}
+
+// Move time to `now_ns`.
+fn set_time(now_ns: u64) {
+    unsafe {
+        core.assert(now_ns >= NOW_NS)
+        NOW_NS = now_ns
+    }
+    catch_up()
+}
+
+fn now_ns() -> u64 {
+    unsafe {
+        return NOW_NS
+    }
+}
+
+fn now_us() -> u64 {
+    return now_ns() / 1000
+}
+
+// The block's registers, through the XOR, set, and clear aliases too.
+struct PwmView: hal.Registers {
+    pub fn read(&mut self, offset: usize) -> u32 {
+        core.assert(offset < 0x1000 && offset % 4 == 0)
+        word := offset / 4
+        core.assert(word <= interrupt_word())
+        catch_up()
+        unsafe {
+            return REGISTERS[word]
+        }
+    }
+
+    pub fn write(&mut self, offset: usize, value: u32) {
+        alias := offset & 0x3000
+        word := (offset & 0xFFF) / 4
+        core.assert(word <= interrupt_word())
+        catch_up()
+        unsafe {
+            if word == interrupt_word() {
+                // INTR: write 1 to clear, only through the plain address.
+                core.assert(alias == 0)
+                REGISTERS[word] &= ~value
+                return
+            }
+            core.assert(word < SLICES as usize * 5)
+            current := REGISTERS[word]
+            if alias == 0 {
+                current = value
+            } else if alias == 0x1000 {
+                current ^= value
+            } else if alias == 0x2000 {
+                current |= value
+            } else {
+                current &= ~value
+            }
+            register := word % 5
+            if register == 0 {
+                current &= 0xFF
+            } else if register == 1 {
+                current &= 0xFFF
+            } else if register == 2 {
+                current &= 0xFFFF
+                PHASES[word / 5] = 0
+            } else if register == 4 {
+                current &= 0xFFFF
+            }
+            REGISTERS[word] = current
+        }
+    }
+}
+
+fn csr(slice: usize) -> u32 {
+    unsafe {
+        return REGISTERS[5 * slice]
+    }
+}
+
+fn div(slice: usize) -> u32 {
+    unsafe {
+        return REGISTERS[5 * slice + 1]
+    }
+}
+
+fn top(slice: usize) -> u32 {
+    unsafe {
+        return REGISTERS[5 * slice + 4]
+    }
+}
+
+fn wrap_flags() -> u32 {
+    unsafe {
+        return REGISTERS[interrupt_word()]
+    }
+}
+
+fn set_wrap_flags(flags: u32) {
+    unsafe {
+        REGISTERS[interrupt_word()] = flags
+    }
+}
+
+// --- Driving a capture ---------------------------------------------------------
+
+fn open(pin: u32, window_us: u32) -> rp_pwm.Capture<PwmView> {
+    unsafe {
+        slices := SLICES
+        clock := CLOCK
+        return rp_pwm.Capture.new(PwmView {}, slices, clock, pin, window_us, now_us())!
+    }
+}
+
+fn open_result(pin: u32, window_us: u32) -> rp_pwm.Capture<PwmView>!hal.Error {
+    unsafe {
+        slices := SLICES
+        clock := CLOCK
+        return rp_pwm.Capture.new(PwmView {}, slices, clock, pin, window_us, now_us())
+    }
+}
+
+fn expect_capture_error(result: rp_pwm.Capture<PwmView>!hal.Error, expected: hal.Error) {
+    match result {
+        ok(capture) => {
+            capture.release()
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == expected)
+        }
+    }
+}
+
+fn expect_channel_error(result: rp_pwm.Channel<PwmView>!hal.Error, expected: hal.Error) {
+    match result {
+        ok(channel) => {
+            channel.release()
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == expected)
+        }
+    }
+}
+
+// Poll every `step_ns` until a measurement finishes, at most `limit_ns`.
+fn next(capture: &mut rp_pwm.Capture<PwmView>, step_ns: u64, limit_ns: u64) -> hal.PulseCapture!hal.Error {
+    result := hal.PulseCapture.new()
+    end := now_ns() + limit_ns
+    for now_ns() < end {
+        set_time(now_ns() + step_ns)
+        if capture.poll(now_us(), &mut result)? {
+            return ok(result)
+        }
+    }
+    core.assert(false)
+    return err(hal.Error.Timeout)
+}
+
+// The second measurement from now: the first may straddle a change of the
+// signal.
+fn settled(capture: &mut rp_pwm.Capture<PwmView>, step_ns: u64) -> hal.PulseCapture {
+    limit := 1_000_000_000u64
+    next(capture, step_ns, limit)!
+    return next(capture, step_ns, limit)!
+}
+
+// `value` within `tolerance` of `expected`.
+fn near(value: u64, expected: u64, tolerance: u64) -> bool {
+    if value > expected {
+        return value - expected <= tolerance
+    }
+    return expected - value <= tolerance
+}
+
+fn assert_near(value: u64, expected: u64, tolerance: u64) {
+    if !near(value, expected, tolerance) {
+        out := console.stderr()
+        out.printf("{} is not within {} of {}\n", value, tolerance, expected)!
+        core.assert_eq(value, expected)
+    }
+}
+
+// --- Window and divider selection --------------------------------------------
+
+fn dividers() {
+    // The smallest divider that covers four windows in 65535 counts.
+    core.assert_eq(rp_pwm.capture_divider(RP2040_HZ, 10_000)!, 1221u32)
+    four_windows := 40_000u64 * RP2040_HZ as u64 * 16 / 1221 / 1_000_000
+    core.assert(four_windows <= 0xFFFF)
+    core.assert(40_000u64 * RP2040_HZ as u64 * 16 / 1220 / 1_000_000 > 0xFFFF)
+    core.assert_eq(rp_pwm.capture_divider(RP2350_HZ, 10_000)!, 1465u32)
+    // Short windows divide by one; long ones by the largest divider, with
+    // less headroom.
+    core.assert_eq(rp_pwm.capture_divider(RP2040_HZ, 100)!, 16u32)
+    core.assert_eq(rp_pwm.capture_divider(RP2040_HZ, 100_000)!, 4095u32)
+    // The longest windows: 134 ms at 125 MHz, 111 ms at 150 MHz.
+    core.assert_eq(rp_pwm.max_window_us(RP2040_HZ), 134_182u32)
+    core.assert_eq(rp_pwm.max_window_us(RP2350_HZ), 111_819u32)
+    core.assert_eq(rp_pwm.capture_divider(RP2040_HZ, 134_182)!, 4095u32)
+    expect_divider_error(rp_pwm.capture_divider(RP2040_HZ, 134_183))
+    expect_divider_error(rp_pwm.capture_divider(RP2350_HZ, 111_820))
+    expect_divider_error(rp_pwm.capture_divider(RP2040_HZ, 0))
+    expect_divider_error(rp_pwm.capture_divider(RP2040_HZ, 0xFFFF_FFFF))
+    // INTR follows the slices and EN.
+    core.assert_eq(rp_pwm.interrupt_offset(8), 0xA4usize)
+    core.assert_eq(rp_pwm.interrupt_offset(12), 0xF4usize)
+
+    reset_block(8, RP2040_HZ)
+    capture := open(3, 10_000)
+    core.assert_eq(capture.pin(), 3u32)
+    core.assert_eq(capture.slice(), 1u32)
+    core.assert_eq(capture.window_us(), 10_000u32)
+    core.assert_eq(capture.level_divider(), 1221u32)
+    core.assert_eq(capture.edge_divider(), 1u32)
+    // 1221 / 16 cycles of 8 ns: 610 ns a count.
+    core.assert_eq(capture.level_resolution_ps(), 610_500u64)
+    // The first edge window runs: rising edges of pin B, divided by one,
+    // over the counter's full range.
+    core.assert_eq(csr(1), (2u32 << 4) | 1)
+    core.assert_eq(div(1), 16u32)
+    core.assert_eq(top(1), 0xFFFFu32)
+    // Then a level window with the level divider.
+    set_level(false)
+    result := hal.PulseCapture.new()
+    set_time(10_000_000)
+    core.assert(!capture.poll(now_us(), &mut result)!)
+    core.assert_eq(csr(1), (1u32 << 4) | 1)
+    core.assert_eq(div(1), 1221u32)
+    capture.release()
+}
+
+fn expect_divider_error(result: u32!hal.Error) {
+    match result {
+        ok(_) => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == hal.Error.InvalidInput)
+        }
+    }
+}
+
+// --- Measurements --------------------------------------------------------------
+
+fn servo() {
+    reset_block(8, RP2040_HZ)
+    // 50 Hz with a 1.5 ms pulse, over 100 ms windows, polled every 7 us.
+    set_signal(20_000_000, 1_500_000, 3_210_000)
+    capture := open(1, 100_000)
+    result := settled(&mut capture, 7_000)
+    // Five periods: 20 ms within 20 us, the pulse within 2 us.
+    assert_near(result.period_ns, 20_000_000, 20_000)
+    assert_near(result.high_ns, 1_500_000, 2_000)
+    core.assert(result.cycles >= 4)
+    core.assert_eq(result.frequency_hz(), 50u32)
+    assert_near(result.frequency_millihz(), 50_000, 50)
+    core.assert_eq(result.high_us() / 10, 150u32)
+    assert_near(result.high_us() as u64, 1500, 2)
+    assert_near(result.period_us() as u64, 20_000, 20)
+    core.assert_eq(result.duty(1000), 75u32)
+
+    // The pulse moves to 2 ms; the next measurements follow.
+    set_signal(20_000_000, 2_000_000, 11_000_000)
+    moved := settled(&mut capture, 7_000)
+    assert_near(moved.high_ns, 2_000_000, 2_000)
+    capture.release()
+}
+
+fn kilohertz() {
+    reset_block(8, RP2040_HZ)
+    // 1 kHz at 25 %, over 10 ms windows.
+    set_frequency(1000, 250_000, 123_456)
+    capture := open(5, 10_000)
+    result := settled(&mut capture, 3_000)
+    assert_near(result.period_ns, 1_000_000, 1_000)
+    assert_near(result.high_ns, 250_000, 500)
+    core.assert_eq(result.frequency_hz(), 1000u32)
+    core.assert_eq(result.duty(100), 25u32)
+    core.assert(result.cycles >= 8)
+
+    // A period that is no whole number of microseconds: 3 kHz, 40 %.
+    set_signal(333_333, 133_333, 5)
+    third := settled(&mut capture, 3_000)
+    core.assert_eq(third.frequency_hz(), 3000u32)
+    core.assert_eq(third.duty(100), 40u32)
+
+    // Polled only every 3 ms, the edge window's count over the window:
+    // a period's precision per window.
+    set_frequency(1000, 250_000, 0)
+    slow := settled(&mut capture, 3_000_000)
+    assert_near(slow.period_ns, 1_000_000, 200_000)
+    assert_near(slow.duty(100) as u64, 25, 5)
+    capture.release()
+}
+
+fn fan() {
+    reset_block(8, RP2040_HZ)
+    // A 25 kHz fan drive at 30 %.
+    set_frequency(25_000, 12_000, 7_777)
+    capture := open(7, 10_000)
+    result := settled(&mut capture, 5_000)
+    core.assert_eq(result.frequency_hz(), 25_000u32)
+    assert_near(result.period_ns, 40_000, 20)
+    assert_near(result.high_ns, 12_000, 20)
+    core.assert_eq(result.duty(100), 30u32)
+    core.assert(result.cycles >= 240)
+    // Reproduced on an output with 65535 duty steps.
+    assert_near(result.duty(65535) as u64, 19_660, 40)
+    capture.release()
+}
+
+fn tachometer() {
+    reset_block(8, RP2040_HZ)
+    // A fan's tachometer at 100 Hz (two pulses a turn: 3000 rpm), over
+    // 50 ms windows: five periods each.
+    set_frequency(100, 5_000_000, 1_234_567)
+    capture := open(9, 50_000)
+    result := settled(&mut capture, 11_000)
+    core.assert_eq(result.frequency_hz(), 100u32)
+    assert_near(result.period_ns, 10_000_000, 10_000)
+    core.assert_eq(result.duty(100), 50u32)
+    rpm := result.frequency_millihz() * 60 / 2 / 1000
+    assert_near(rpm, 3000, 3)
+    capture.release()
+    // 20 Hz is too slow for a 10 ms window: under two edges in it, so the
+    // measurement reads like a steady line's, with the high share.
+    set_frequency(20, 25_000_000, 0)
+    short := open(11, 10_000)
+    partial := settled(&mut short, 11_000)
+    core.assert_eq(partial.cycles, 0u32)
+    core.assert_eq(partial.frequency_hz(), 0u32)
+    core.assert(partial.high_ns <= partial.period_ns)
+    short.release()
+}
+
+fn rp2350_block() {
+    // Twelve slices place INTR at 0xF4; clk_sys runs at 150 MHz.
+    reset_block(12, RP2350_HZ)
+    set_frequency(2000, 100_000, 77)
+    capture := open(29, 10_000)
+    core.assert_eq(capture.slice(), 6u32)
+    core.assert_eq(capture.level_divider(), 1465u32)
+    result := settled(&mut capture, 4_000)
+    core.assert_eq(result.frequency_hz(), 2000u32)
+    core.assert_eq(result.duty(100), 20u32)
+    assert_near(result.high_ns, 100_000, 300)
+    capture.release()
+}
+
+fn steady_lines() {
+    reset_block(8, RP2040_HZ)
+    set_level(false)
+    capture := open(13, 10_000)
+    low := settled(&mut capture, 9_000)
+    core.assert_eq(low.cycles, 0u32)
+    core.assert_eq(low.high_ns, 0u64)
+    // The level window watched about 10 ms.
+    assert_near(low.period_ns, 10_000_000, 10_000)
+    core.assert_eq(low.frequency_hz(), 0u32)
+    core.assert_eq(low.frequency_millihz(), 0u64)
+    core.assert_eq(low.duty(100), 0u32)
+
+    set_level(true)
+    high := settled(&mut capture, 9_000)
+    core.assert_eq(high.cycles, 0u32)
+    core.assert_eq(high.high_ns, high.period_ns)
+    assert_near(high.period_ns, 10_000_000, 10_000)
+    core.assert_eq(high.duty(100), 100u32)
+    core.assert_eq(high.frequency_hz(), 0u32)
+
+    // A pulse train that stops low.
+    set_frequency(1000, 500_000, 0)
+    running := settled(&mut capture, 9_000)
+    core.assert_eq(running.frequency_hz(), 1000u32)
+    set_level(false)
+    stopped := settled(&mut capture, 9_000)
+    core.assert_eq(stopped.cycles, 0u32)
+    core.assert_eq(stopped.duty(100), 0u32)
+    capture.release()
+}
+
+// --- Counter wraps ----------------------------------------------------------------
+
+fn wraps() {
+    reset_block(8, RP2040_HZ)
+    // 10 MHz: 100000 edges in a 10 ms window, past the counter's range at
+    // a divider of 1. The window is counted again with a larger divider.
+    set_signal(100, 30, 0)
+    capture := open(15, 10_000)
+    result := settled(&mut capture, 50_000)
+    core.assert(capture.edge_divider() >= 2)
+    // 100000 edges / 32768, rounded up.
+    core.assert_eq(capture.edge_divider(), 4u32)
+    assert_near(result.frequency_hz() as u64, 10_000_000, 10_000)
+    assert_near(result.duty(100) as u64, 30, 1)
+    core.assert(result.cycles >= 50_000)
+
+    // The divider comes back down for a slower signal.
+    set_frequency(1000, 500_000, 0)
+    slower := settled(&mut capture, 50_000)
+    core.assert_eq(capture.edge_divider(), 1u32)
+    core.assert_eq(slower.frequency_hz(), 1000u32)
+
+    // 20 MHz polled once a second: every edge window lasts a second and
+    // wraps even at the largest divider (16.7 million edges), which the
+    // poll reports as Overrun.
+    set_signal(50, 25, 0)
+    result_slot := hal.PulseCapture.new()
+    overrun := false
+    for poll in 0..10 {
+        set_time(now_ns() + 1_000_000_000)
+        match capture.poll(now_us(), &mut result_slot) {
+            ok(_) => {}
+            err(error) => {
+                core.assert(error == hal.Error.Overrun)
+                overrun = true
+                break
+            }
+        }
+    }
+    core.assert(overrun)
+    core.assert_eq(capture.edge_divider(), rp_pwm.MAX_EDGE_DIVIDER)
+    // Measurements go on once polls come in time.
+    set_frequency(1000, 250_000, 0)
+    again := settled(&mut capture, 20_000)
+    core.assert_eq(again.frequency_hz(), 1000u32)
+    core.assert_eq(capture.edge_divider(), 1u32)
+
+    // A level window that outlasts four windows wraps for a line held
+    // high: Overrun.
+    set_level(true)
+    settled(&mut capture, 20_000)
+    late := false
+    for poll in 0..4 {
+        set_time(now_ns() + 50_000_000)
+        match capture.poll(now_us(), &mut result_slot) {
+            ok(_) => {}
+            err(error) => {
+                core.assert(error == hal.Error.Overrun)
+                late = true
+                break
+            }
+        }
+    }
+    core.assert(late)
+    // Three windows late is still in range.
+    for poll in 0..4 {
+        set_time(now_ns() + 30_000_000)
+        capture.poll(now_us(), &mut result_slot)!
+    }
+    core.assert_eq(result_slot.duty(100), 100u32)
+    // Only the slice's own wrap flag is cleared.
+    core.assert_eq(capture.slice(), 7u32)
+    set_wrap_flags(0x41)
+    set_time(now_ns() + 30_000_000)
+    capture.poll(now_us(), &mut result_slot)!
+    core.assert_eq(wrap_flags(), 0x41u32)
+    capture.release()
+    core.assert_eq(wrap_flags(), 0x41u32)
+    set_wrap_flags(0)
+}
+
+// --- Claims --------------------------------------------------------------------------
+
+fn claims() {
+    reset_block(8, RP2040_HZ)
+    // Only odd pins, output B, count.
+    expect_capture_error(open_result(2, 10_000), hal.Error.InvalidInput)
+    expect_capture_error(open_result(30, 10_000), hal.Error.InvalidInput)
+    expect_capture_error(open_result(31, 10_000), hal.Error.InvalidInput)
+    expect_capture_error(open_result(3, 0), hal.Error.InvalidInput)
+    expect_capture_error(open_result(3, 200_000), hal.Error.InvalidInput)
+
+    // Output A of slice 1 in use: the slice's counter is not free.
+    timing := rp_pwm.timing(RP2040_HZ, 1000)!
+    output := unsafe {
+        rp_pwm.Channel.new(PwmView {}, 2, timing)!
+    }
+    expect_capture_error(open_result(3, 10_000), hal.Error.Busy)
+    expect_capture_error(open_result(19, 10_000), hal.Error.Busy)
+    // Another slice is free.
+    other := open(5, 10_000)
+    other.release()
+    output.release()
+
+    // An input holds both outputs of its slice, on either pin.
+    capture := open(19, 10_000)
+    core.assert_eq(capture.slice(), 1u32)
+    timing_a := rp_pwm.timing(RP2040_HZ, 1000)!
+    expect_channel_error(unsafe {
+        rp_pwm.Channel.new(PwmView {}, 2, timing_a)
+    }, hal.Error.Busy)
+    timing_b := rp_pwm.timing(RP2040_HZ, 1000)!
+    expect_channel_error(unsafe {
+        rp_pwm.Channel.new(PwmView {}, 3, timing_b)
+    }, hal.Error.Busy)
+    timing_c := rp_pwm.timing(RP2040_HZ, 1000)!
+    expect_channel_error(unsafe {
+        rp_pwm.Channel.new(PwmView {}, 18, timing_c)
+    }, hal.Error.Busy)
+    expect_capture_error(open_result(3, 10_000), hal.Error.Busy)
+
+    // Release restores the slice: disabled, free-running, divider 1, full
+    // TOP, wrap flag clear; both outputs open again.
+    set_signal(100, 50, 0)
+    set_time(now_ns() + 3_000_000)
+    capture.release()
+    core.assert_eq(csr(1), 0u32)
+    core.assert_eq(div(1), 16u32)
+    core.assert_eq(top(1), 0xFFFFu32)
+    core.assert_eq(wrap_flags() & 2, 0u32)
+    timing_d := rp_pwm.timing(RP2040_HZ, 1000)!
+    first := unsafe {
+        rp_pwm.Channel.new(PwmView {}, 2, timing_d)!
+    }
+    timing_e := rp_pwm.timing(RP2040_HZ, 1000)!
+    second := unsafe {
+        rp_pwm.Channel.new(PwmView {}, 3, timing_e)!
+    }
+    core.assert_eq(csr(1) & 0x31, 1u32)
+    first.release()
+    second.release()
+}
+
+// --- Through the protocol ------------------------------------------------------------
+
+// A capture with a simulated clock that advances `step_ns` per poll, so it
+// implements hal.PwmInput as rp_pwm.PwmCapture does with the chip's timer.
+struct Simulated: hal.PwmInput {
+    capture: rp_pwm.Capture<PwmView>
+    step_ns: u64
+
+    pub fn poll_capture(&mut self, capture: &mut hal.PulseCapture) -> bool!hal.Error {
+        set_time(now_ns() + self.step_ns)
+        return self.capture.poll(now_us(), capture)
+    }
+}
+
+fn measure_any(input: &mut dyn hal.PwmInput) -> hal.PulseCapture {
+    result := hal.PulseCapture.new()
+    for !input.poll_capture(&mut result)! {}
+    return result
+}
+
+fn measure_generic<P: hal.PwmInput>(input: &mut P) -> hal.PulseCapture {
+    hal.capture(input, hal.NO_POLL_LIMIT)!
+    return hal.capture(input, hal.NO_POLL_LIMIT)!
+}
+
+fn protocol() {
+    reset_block(8, RP2040_HZ)
+    set_frequency(1000, 750_000, 400_000)
+    simulated := Simulated { capture: open(21, 10_000), step_ns: 2_000 }
+    // Statically dispatched, through hal.capture.
+    first := measure_generic(&mut simulated)
+    core.assert_eq(first.frequency_hz(), 1000u32)
+    core.assert_eq(first.duty(100), 75u32)
+    // Dynamically dispatched.
+    dynamic: &mut dyn hal.PwmInput = &mut simulated
+    measure_any(dynamic)
+    second := measure_any(dynamic)
+    core.assert_eq(second.frequency_hz(), 1000u32)
+    core.assert_eq(second.duty(4), 3u32)
+    // hal.capture's poll limit: a measurement takes two 10 ms windows,
+    // 10000 polls of 2 us.
+    match hal.capture(&mut simulated, 100) {
+        ok(_) => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == hal.Error.Timeout)
+        }
+    }
+    // One measurement per true: polling again right away has none.
+    result := hal.PulseCapture.new()
+    hal.capture(&mut simulated, hal.NO_POLL_LIMIT)!
+    core.assert(!simulated.poll_capture(&mut result)!)
+    let Simulated { capture, step_ns } = simulated
+    capture.release()
+}
+
+// The PulseCapture helpers on edge values.
+fn helpers() {
+    rounded := hal.PulseCapture { period_ns: 1_499, high_ns: 500, cycles: 1 }
+    core.assert_eq(rounded.period_us(), 1u32)
+    core.assert_eq(rounded.high_us(), 1u32)
+    core.assert_eq(rounded.frequency_millihz(), 667_111_408u64)
+    core.assert_eq(rounded.frequency_hz(), 667_111u32)
+    core.assert_eq(rounded.duty(3), 1u32)
+    // The shortest period, 1 ns, is 1 GHz.
+    fastest := hal.PulseCapture { period_ns: 1, high_ns: 1, cycles: 1 }
+    core.assert_eq(fastest.frequency_hz(), 1_000_000_000u32)
+    core.assert_eq(fastest.duty(0xFFFF_FFFF), 0xFFFF_FFFFu32)
+    // A high time above the period reads as 100 %.
+    over := hal.PulseCapture { period_ns: 1000, high_ns: 2000, cycles: 1 }
+    core.assert_eq(over.duty(100), 100u32)
+    // An hour-long period still converts to microseconds.
+    hour := hal.PulseCapture { period_ns: 3_600_000_000_000, high_ns: 1_800_000_000_000, cycles: 1 }
+    core.assert_eq(hour.period_us(), 3_600_000_000u32)
+    core.assert_eq(hour.duty(100), 50u32)
+    core.assert_eq(hour.frequency_millihz(), 0u64)
+}
+
+// --- The pin bank ----------------------------------------------------------------------
+
+// GPIO functions and pad bits, as rp_pins numbers them.
+const PWM_FUNCTION: u32 = 4
+const DISCONNECTED: u32 = 31
+const PULL_DOWN: u32 = 1 << 2
+const PULL_UP: u32 = 1 << 3
+const INPUT_ENABLE: u32 = 1 << 6
+const OUTPUT_DISABLE: u32 = 1 << 7
+
+static mut FUNCTIONS: [30]u32 = [0u32; 30]
+static mut PADS: [30]u32 = [0u32; 30]
+static mut HELD: u32 = 0
+static mut RESETS: u32 = 0
+// Plain memory standing in for the PWM block, with its aliases, and for
+// the timer, whose raw count is at words 9 (high) and 10 (low).
+static mut BLOCK_MEMORY: [4096]u32 = [0u32; 4096]
+static mut TIMER_MEMORY: [16]u32 = [0u32; 16]
+
+struct BankChip {
+    pub fn route(&mut self, pin: u32, function: u32, clear: u32, set: u32) {
+        unsafe {
+            FUNCTIONS[pin as usize] = function
+            PADS[pin as usize] = (PADS[pin as usize] & ~clear) | set
+        }
+    }
+
+    pub fn reset(&mut self, controller: u32) -> void!hal.Error {
+        unsafe {
+            RESETS += 1
+            HELD &= ~(1u32 << controller)
+        }
+        return ok()
+    }
+
+    pub fn hold(&mut self, controller: u32) {
+        unsafe {
+            HELD |= 1u32 << controller
+        }
+    }
+
+    pub fn base(&self, controller: u32) -> usize {
+        core.assert(controller == rp_pins.PWM)
+        unsafe {
+            return ptr.from_mut(&mut BLOCK_MEMORY) as usize
+        }
+    }
+
+    pub fn clock_hz(&self) -> u32 {
+        return RP2040_HZ
+    }
+
+    pub fn pwm_slices(&self) -> u32 {
+        return 8
+    }
+
+    pub fn timer_base(&self) -> usize {
+        unsafe {
+            return ptr.from_mut(&mut TIMER_MEMORY) as usize
+        }
+    }
+
+    pub fn start_adc(&mut self) -> void!hal.Error {
+        return ok()
+    }
+
+    pub fn stop_adc(&mut self) {}
+
+    pub fn uart_aux(&self) -> bool {
+        return false
+    }
+
+    pub fn pio_blocks(&self) -> u32 {
+        return 2
+    }
+
+    pub fn pio_version(&self) -> u32 {
+        return 0
+    }
+
+    pub fn pio_irq(&self, block: u32) -> u32 {
+        return 7 + 2 * block
+    }
+}
+
+fn set_timer(now_us: u64) {
+    unsafe {
+        TIMER_MEMORY[9] = (now_us >> 32) as u32
+        TIMER_MEMORY[10] = (now_us & 0xFFFF_FFFF) as u32
+    }
+}
+
+fn block_word(offset: usize) -> u32 {
+    unsafe {
+        return BLOCK_MEMORY[offset / 4]
+    }
+}
+
+fn function(pin: u32) -> u32 {
+    unsafe {
+        return FUNCTIONS[pin as usize]
+    }
+}
+
+fn pad(pin: u32) -> u32 {
+    unsafe {
+        return PADS[pin as usize]
+    }
+}
+
+fn held() -> u32 {
+    unsafe {
+        return HELD
+    }
+}
+
+fn expect_bank_error(result: rp_pwm.PwmCapture!hal.Error, expected: hal.Error) {
+    match result {
+        ok(input) => {
+            input.release()
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == expected)
+        }
+    }
+}
+
+fn bank() {
+    bank := unsafe {
+        rp_pins.Bank.new(BankChip {})
+    }
+    unsafe {
+        HELD = 1u32 << rp_pins.PWM
+        // The pad's reset state: pull-down on; and a pull-up left over.
+        PADS[17] = PULL_UP | OUTPUT_DISABLE
+    }
+    // Timer values above 32 bits are read whole.
+    set_timer(0x1_0000_0000)
+    input := bank.pwm_input(17, 10_000)!
+    core.assert_eq(input.pin(), 17u32)
+    core.assert_eq(input.slice(), 0u32)
+    core.assert_eq(input.window_us(), 10_000u32)
+    core.assert_eq(input.level_divider(), 1221u32)
+    core.assert_eq(input.edge_divider(), 1u32)
+    core.assert_eq(input.level_resolution_ps(), 610_500u64)
+    core.assert_eq(function(17), PWM_FUNCTION)
+    core.assert_eq(pad(17), INPUT_ENABLE | PULL_DOWN | OUTPUT_DISABLE)
+    core.assert_eq(held() & (1u32 << rp_pins.PWM), 0u32)
+    // The first edge window runs on slice 0.
+    core.assert_eq(block_word(0), (2u32 << 4) | 1)
+    core.assert_eq(block_word(0x0C), 0u32)
+    core.assert_eq(block_word(0x10), 0xFFFFu32)
+    // The block's memory never counts: a steady low line, measured on the
+    // chip's timer.
+    result := hal.PulseCapture.new()
+    core.assert(!input.poll_capture(&mut result)!)
+    set_timer(0x1_0000_0000 + 10_000)
+    core.assert(!input.poll_capture(&mut result)!)
+    core.assert_eq(block_word(0), (1u32 << 4) | 1)
+    core.assert_eq(block_word(0x04), 1221u32)
+    set_timer(0x1_0000_0000 + 20_000)
+    core.assert(input.poll_capture(&mut result)!)
+    core.assert_eq(result.cycles, 0u32)
+    core.assert_eq(result.period_ns, 10_000_000u64)
+    core.assert_eq(result.high_ns, 0u64)
+    dynamic: &mut dyn hal.PwmInput = &mut input
+    core.assert(!dynamic.poll_capture(&mut result)!)
+
+    // Pins and slices it holds.
+    expect_bank_error(bank.pwm_input(17, 10_000), hal.Error.Busy)
+    expect_bank_error(bank.pwm_input(1, 10_000), hal.Error.Busy)
+    match bank.pwm(16, 1000) {
+        ok(output) => {
+            bank.release_pwm(output)
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == hal.Error.Busy)
+        }
+    }
+    // The failed claims gave their pins back.
+    core.assert_eq(function(16), 0u32)
+    led := bank.gpio(16)!
+    bank.release_gpio(led)
+    expect_bank_error(bank.pwm_input(4, 10_000), hal.Error.InvalidInput)
+    expect_bank_error(bank.pwm_input(30, 10_000), hal.Error.InvalidInput)
+    expect_bank_error(bank.pwm_input(3, 0), hal.Error.InvalidInput)
+    // An output on another slice shares the block.
+    output := bank.pwm(2, 1000)!
+    bank.release_pwm_input(input)
+    core.assert_eq(function(17), DISCONNECTED)
+    core.assert_eq(block_word(0), 0u32)
+    core.assert_eq(block_word(0x04), 16u32)
+    core.assert_eq(held() & (1u32 << rp_pins.PWM), 0u32)
+    bank.release_pwm(output)
+    core.assert((held() & (1u32 << rp_pins.PWM)) != 0)
+    // A failed claim on a held block holds it again.
+    expect_bank_error(bank.pwm_input(5, 0), hal.Error.InvalidInput)
+    core.assert((held() & (1u32 << rp_pins.PWM)) != 0)
+    // The slice serves outputs again.
+    first := bank.pwm(16, 1000)!
+    second := bank.pwm(17, 1000)!
+    bank.release_pwm(first)
+    bank.release_pwm(second)
+}
+
+fn main() {
+    dividers()
+    servo()
+    kilohertz()
+    fan()
+    tachometer()
+    rp2350_block()
+    steady_lines()
+    wraps()
+    claims()
+    protocol()
+    helpers()
+    bank()
+}
