@@ -1,7 +1,940 @@
 package lua
 
-// Stub: replaced by the table library implementation.
+import "core/ptr"
+
+// The table library (Lua 5.4 manual §6.6).
+//
+// Element access follows the manual: every read and write goes through the
+// `__index` / `__newindex` metamethods and lengths through `__len`, so the
+// functions also work on proxy objects. Plain table slots that already hold
+// a value take a direct path (a raw access there is indistinguishable from a
+// metamethod-respecting one).
+//
+// `sort` copies the elements into a private, collector-anchored array, sorts
+// it with an introspective quicksort (median-of-three / ninther pivots,
+// insertion sort for short runs, heapsort when recursion gets too deep) and
+// stores the result back. Scans that rely on sentinel elements report an
+// inconsistent comparison function ("invalid order function for sorting")
+// instead of running past their bounds.
+
+// What a table argument must support (see tl_check_table).
+const TL_READ: i32 = 1
+const TL_WRITE: i32 = 2
+const TL_LENGTH: i32 = 4
+
+const TL_INT_MAX: i64 = 2147483647
+const TL_MAXINTEGER: i64 = 9223372036854775807
+
+// --- Element access -------------------------------------------------------------
+
+// The value at stack index idx as a table, or null.
+fn tl_table_at(cx: &mut Cx, idx: i32) -> *mut Table {
+    unsafe {
+        let v = cx.idx2val(idx)
+        if (*v).tag == TAG_TABLE {
+            return val_gc(v) as *mut Table
+        }
+        return 0 as *mut Table
+    }
+}
+
+// Push t[i] (t at stack index tidx, metamethods honoured).
+fn tl_geti(cx: &mut Cx, tidx: i32, i: i64) -> void!Throw {
+    unsafe {
+        let h = tl_table_at(cx, tidx)
+        if !ptr.is_null(h) {
+            let slot = tab_get_int(h, i)
+            if !val_is_empty(slot) {
+                L_push_value(cx.L, slot)
+                return ok()
+            }
+        }
+        cx.get_i(tidx, i)?
+        return ok()
+    }
+}
+
+// t[i] = v where v is the value on top of the stack (popped).
+fn tl_seti(cx: &mut Cx, tidx: i32, i: i64) -> void!Throw {
+    unsafe {
+        let L = cx.L
+        let h = tl_table_at(cx, tidx)
+        if !ptr.is_null(h) {
+            let v = ptr.offset((*L).top, -1)
+            let slot = tab_get_int(h, i)
+            if !val_is_empty(slot) {
+                set_obj(slot, v)
+                gc_barrier_back(L, h, v)
+                (*L).top = v
+                return ok()
+            }
+            if ptr.is_null(meta_fast_tm(G(L), (*h).metatable, TM_NEWINDEX)) {
+                kv := Value { bits: 0, tag: 0 }
+                let k = ptr.from_mut(&mut kv)
+                set_int(k, i)
+                tab_finish_set(L, h, k, slot, v)?
+                (*L).top = v
+                return ok()
+            }
+        }
+        cx.set_i(tidx, i)?
+        return ok()
+    }
+}
+
+// Raise "table expected" unless the argument is a table or has a metatable
+// providing the metamethods the operation needs.
+fn tl_check_table(cx: &mut Cx, arg: i32, what: i32) -> void!Throw {
+    unsafe {
+        if cx.type_of(arg) == TTABLE {
+            return ok()
+        }
+        good := false
+        if cx.get_metatable(arg) {
+            good = true
+            if (what & TL_READ) != 0 && !tl_meta_has(cx, "__index")? {
+                good = false
+            }
+            if good && (what & TL_WRITE) != 0 && !tl_meta_has(cx, "__newindex")? {
+                good = false
+            }
+            if good && (what & TL_LENGTH) != 0 && !tl_meta_has(cx, "__len")? {
+                good = false
+            }
+            cx.pop(1)
+        }
+        if !good {
+            return err(cx.type_error(arg, "table"))
+        }
+        return ok()
+    }
+}
+
+// Whether the metatable on top of the stack has a non-nil raw field.
+fn tl_meta_has(cx: &mut Cx, name: &str) -> bool!Throw {
+    cx.push_str(name)?
+    let t = cx.raw_get(-2)
+    cx.pop(1)
+    return ok(t != TNIL)
+}
+
+// Length of the value at idx (with __len), which must be an integer.
+fn tl_length(cx: &mut Cx, idx: i32, out: &mut i64) -> void!Throw {
+    unsafe {
+        let h = tl_table_at(cx, idx)
+        if !ptr.is_null(h) && ptr.is_null(meta_fast_tm(G(cx.L), (*h).metatable, TM_LEN)) {
+            *out = u2i(tab_length(h))
+            return ok()
+        }
+        *out = cx.len_of(idx)?
+        return ok()
+    }
+}
+
+// Check the table argument (always needing a length) and get its length.
+fn tl_getn(cx: &mut Cx, arg: i32, what: i32, out: &mut i64) -> void!Throw {
+    tl_check_table(cx, arg, what | TL_LENGTH)?
+    return tl_length(cx, arg, out)
+}
+
+// --- insert / remove -------------------------------------------------------------
+
+fn tl_insert(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        n: i64 = 0
+        tl_getn(cx, 1, TL_READ | TL_WRITE, &mut n)?
+        // First empty slot.
+        let e = core.wrapping_add(n, 1i64)
+        let nargs = cx.get_top()
+        pos := e
+        if nargs == 3 {
+            pos = cx.check_integer(2)?
+            // 1 <= pos <= e, as an unsigned comparison.
+            let inside = core.wrapping_sub(i2u(pos), 1u64) < i2u(e)
+            cx.arg_check(inside, 2, "position out of bounds")?
+            // Shift t[pos..e-1] up by one.
+            i := e
+            for i > pos {
+                tl_geti(cx, 1, i - 1)?
+                tl_seti(cx, 1, i)?
+                i -= 1
+            }
+        } else if nargs != 2 {
+            return err(cx.error_msg("wrong number of arguments to 'insert'"))
+        }
+        tl_seti(cx, 1, pos)?
+        return ok(0)
+    }
+}
+
+fn tl_remove(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        size: i64 = 0
+        tl_getn(cx, 1, TL_READ | TL_WRITE, &mut size)?
+        pos := cx.opt_integer(2, size)?
+        if pos != size {
+            // 1 <= pos <= size + 1, as an unsigned comparison.
+            let inside = core.wrapping_sub(i2u(pos), 1u64) <= i2u(size)
+            cx.arg_check(inside, 2, "position out of bounds")?
+        }
+        // The removed value is the result.
+        tl_geti(cx, 1, pos)?
+        for pos < size {
+            tl_geti(cx, 1, pos + 1)?
+            tl_seti(cx, 1, pos)?
+            pos += 1
+        }
+        cx.push_nil()
+        tl_seti(cx, 1, pos)?
+        return ok(1)
+    }
+}
+
+// --- move ------------------------------------------------------------------------
+
+// table.move(a1, f, e, t [, a2]): a2[t..] = a1[f..e]; returns a2.
+fn tl_move(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        let f = cx.check_integer(2)?
+        let e = cx.check_integer(3)?
+        let t = cx.check_integer(4)?
+        let tt = if !cx.is_none_or_nil(5) {
+            5i32
+        } else {
+            1i32
+        }
+        tl_check_table(cx, 1, TL_READ)?
+        tl_check_table(cx, tt, TL_WRITE)?
+        if e >= f {
+            // The element count e - f + 1 must be representable.
+            let countable = f > 0 || e < TL_MAXINTEGER + f
+            cx.arg_check(countable, 3, "too many elements to move")?
+            let n = e - f + 1
+            cx.arg_check(t <= TL_MAXINTEGER - n + 1, 4, "destination wrap around")?
+            // Copy backwards only when the destination overlaps the source
+            // from above within the same table.
+            forward := t > e || t <= f
+            if !forward && tt != 1 {
+                forward = !cx.compare(1, tt, OPEQ)?
+            }
+            if forward {
+                for i in 0i64..n {
+                    tl_geti(cx, 1, f + i)?
+                    tl_seti(cx, tt, t + i)?
+                }
+            } else {
+                i := n - 1
+                for i >= 0 {
+                    tl_geti(cx, 1, f + i)?
+                    tl_seti(cx, tt, t + i)?
+                    i -= 1
+                }
+            }
+        }
+        cx.push_value(tt)
+        return ok(1)
+    }
+}
+
+// --- concat ----------------------------------------------------------------------
+
+// Append t[i] (a string or number) to the buffer.
+fn tl_concat_field(cx: &mut Cx, buf: &mut Buffer, i: i64) -> void!Throw {
+    unsafe {
+        let L = cx.L
+        v := 0 as *mut Value
+        pushed := false
+        let h = tl_table_at(cx, 1)
+        if !ptr.is_null(h) {
+            v = tab_get_int(h, i)
+            if val_is_empty(v) {
+                v = 0 as *mut Value
+            }
+        }
+        if ptr.is_null(v) {
+            cx.get_i(1, i)?
+            v = ptr.offset((*L).top, -1)
+            pushed = true
+        }
+        let tag = (*v).tag
+        if tag == TAG_SHORTSTR || tag == TAG_LONGSTR {
+            let s = val_str(v)
+            buf.add_raw(str_data(s) as *const u8, (*s).length)?
+        } else if tag == TAG_INT {
+            buf.add_integer(val_int(v))?
+        } else if tag == TAG_FLOAT {
+            buf.add_number(val_float(v))?
+        } else {
+            b := Buffer.new(cx)
+            b.add_str("invalid value (")?
+            b.add_str(type_name((*v).tag & 15))?
+            b.add_str(") at index ")?
+            b.add_integer(i)?
+            b.add_str(" in table for 'concat'")?
+            return err(cx.error_buffer(&mut b))
+        }
+        if pushed {
+            cx.pop(1)
+        }
+        return ok()
+    }
+}
+
+fn tl_concat(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        last: i64 = 0
+        tl_getn(cx, 1, TL_READ, &mut last)?
+        let sep = cx.opt_lstr(2, b"")?
+        i := cx.opt_integer(3, 1)?
+        last = cx.opt_integer(4, last)?
+        buf := Buffer.new(cx)
+        let sepb = sep.bytes()
+        for i < last {
+            tl_concat_field(cx, &mut buf, i)?
+            if sepb.len > 0 {
+                buf.add_bytes(sepb)?
+            }
+            i += 1
+        }
+        if i == last {
+            tl_concat_field(cx, &mut buf, i)?
+        }
+        buf.push_result(cx)?
+        return ok(1)
+    }
+}
+
+// --- pack / unpack ---------------------------------------------------------------
+
+fn tl_pack(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        let L = cx.L
+        let n = cx.get_top()
+        cx.create_table(n, 1)?
+        let h = tl_table_at(cx, -1)
+        for i in 1i32..(n + 1) {
+            tab_set_int(L, h, i as i64, cx.idx2val(i))?
+        }
+        cx.push_integer(n as i64)
+        cx.set_field(-2, "n")?
+        return ok(1)
+    }
+}
+
+fn tl_unpack(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        i := cx.opt_integer(2, 1)?
+        e: i64 = 0
+        if cx.is_none_or_nil(3) {
+            e = cx.len_of(1)?
+        } else {
+            e = cx.check_integer(3)?
+        }
+        if i > e {
+            return ok(0)
+        }
+        let span = core.wrapping_sub(i2u(e), i2u(i))
+        if span >= (TL_INT_MAX as u64) || !cx.check_stack((span + 1) as i32) {
+            return err(cx.error_msg("too many results to unpack"))
+        }
+        let L = cx.L
+        let h = tl_table_at(cx, 1)
+        if !ptr.is_null(h) && ptr.is_null((*h).metatable) {
+            // Plain table: copy the slots straight to the stack.
+            for i <= e {
+                let slot = tab_get_int(h, i)
+                if val_is_empty(slot) {
+                    L_push_nil(L)
+                } else {
+                    L_push_value(L, slot)
+                }
+                if i == e {
+                    break
+                }
+                i += 1
+            }
+        } else {
+            for i < e {
+                tl_geti(cx, 1, i)?
+                i += 1
+            }
+            tl_geti(cx, 1, e)?
+        }
+        return ok((span + 1) as i32)
+    }
+}
+
+// --- sort ------------------------------------------------------------------------
+
+// Comparison strategies: numbers natively, strings natively, the generic
+// `<` with metamethods, or a Lua comparison function (stack index 2).
+const SRT_NUM: i32 = 0
+const SRT_STR: i32 = 1
+const SRT_LT: i32 = 2
+const SRT_FN: i32 = 3
+
+// Partitions at most this long are finished by insertion sort.
+const SRT_SMALL: isize = 10
+// Partitions longer than this use a ninther (median of three medians).
+const SRT_NINTHER: isize = 128
+
+struct SortState {
+    L: *mut State
+    // Element k (0-based) of the array being sorted.
+    a: *mut Value
+    // A scratch slot of the anchored array (insertion sort's hole value).
+    tmp: *mut Value
+    mode: i32
+    // Result of the last srt_less.
+    res: bool
+}
+
+fn srt_at(a: *mut Value, i: isize) -> *mut Value {
+    unsafe {
+        return ptr.offset(a, i)
+    }
+}
+
+fn srt_swap(x: *mut Value, y: *mut Value) {
+    unsafe {
+        let b = (*x).bits
+        let t = (*x).tag
+        (*x).bits = (*y).bits
+        (*x).tag = (*y).tag
+        (*y).bits = b
+        (*y).tag = t
+    }
+}
+
+// s.res = x < y under the active comparison.
+fn srt_less(s: &mut SortState, x: *mut Value, y: *mut Value) -> void!Throw {
+    unsafe {
+        let mode = s.mode
+        if mode == SRT_NUM {
+            s.res = num_lt(x, y)
+            return ok()
+        }
+        if mode == SRT_STR {
+            s.res = str_compare(val_str(x), val_str(y)) < 0
+            return ok()
+        }
+        let L = s.L
+        if mode == SRT_LT {
+            s.res = vm_less_than(L, x, y)?
+            return ok()
+        }
+        let top = (*L).top
+        set_obj(top, ptr.offset((*(*L).ci).func, 2))
+        set_obj(ptr.offset(top, 1), x)
+        set_obj(ptr.offset(top, 2), y)
+        (*L).top = ptr.offset(top, 3)
+        call_noyield(L, top, 1)?
+        let r = ptr.offset((*L).top, -1)
+        s.res = !val_is_falsy(r)
+        (*L).top = r
+        return ok()
+    }
+}
+
+fn srt_invalid(s: &mut SortState) -> Throw {
+    cx := Cx { L: s.L }
+    return cx.error_msg("invalid order function for sorting")
+}
+
+// Order a[i] <= a[j] <= a[k].
+fn srt_sort3(s: &mut SortState, i: isize, j: isize, k: isize) -> void!Throw {
+    let a = s.a
+    let pi = srt_at(a, i)
+    let pj = srt_at(a, j)
+    let pk = srt_at(a, k)
+    srt_less(s, pj, pi)?
+    if s.res {
+        srt_swap(pi, pj)
+    }
+    srt_less(s, pk, pj)?
+    if s.res {
+        srt_swap(pj, pk)
+        srt_less(s, pj, pi)?
+        if s.res {
+            srt_swap(pi, pj)
+        }
+    }
+    return ok()
+}
+
+// Insertion sort of a[first..hi], where a[sent..first-1] is already in
+// order and a[sent] is not greater than any element of the range: moving an
+// element below it means the comparison function is inconsistent.
+fn srt_insertion(s: &mut SortState, sent: isize, first: isize, hi: isize) -> void!Throw {
+    unsafe {
+        let a = s.a
+        let tmp = s.tmp
+        k := first
+        for k <= hi {
+            let pk = srt_at(a, k)
+            srt_less(s, pk, srt_at(a, k - 1))?
+            if s.res {
+                if k - 1 == sent {
+                    return err(srt_invalid(s))
+                }
+                set_obj(tmp, pk)
+                set_obj(pk, srt_at(a, k - 1))
+                j := k - 1
+                for {
+                    srt_less(s, tmp, srt_at(a, j - 1))?
+                    if !s.res {
+                        break
+                    }
+                    if j - 1 == sent {
+                        return err(srt_invalid(s))
+                    }
+                    set_obj(srt_at(a, j), srt_at(a, j - 1))
+                    j -= 1
+                }
+                set_obj(srt_at(a, j), tmp)
+            }
+            k += 1
+        }
+        return ok()
+    }
+}
+
+// Finish a short range a[lo..hi].
+fn srt_small(s: &mut SortState, lo: isize, hi: isize) -> void!Throw {
+    let a = s.a
+    let count = hi - lo + 1
+    if count < 2 {
+        return ok()
+    }
+    if lo > 0 {
+        // a[lo-1] is a pivot already in its final place below this range.
+        return srt_insertion(s, lo - 1, lo + 1, hi)
+    }
+    if count == 2 {
+        let p0 = srt_at(a, lo)
+        let p1 = srt_at(a, lo + 1)
+        srt_less(s, p1, p0)?
+        if s.res {
+            srt_swap(p0, p1)
+        }
+        return ok()
+    }
+    if count == 3 {
+        return srt_sort3(s, lo, lo + 1, lo + 2)
+    }
+    // Leftmost range: bring its minimum to the front to act as sentinel.
+    best := lo
+    for i in (lo + 1)..(hi + 1) {
+        srt_less(s, srt_at(a, i), srt_at(a, best))?
+        if s.res {
+            best = i
+        }
+    }
+    srt_swap(srt_at(a, lo), srt_at(a, best))
+    return srt_insertion(s, lo, lo + 1, hi)
+}
+
+// Partition a[lo..hi] around a median pivot; returns the pivot's final index.
+fn srt_partition(s: &mut SortState, lo: isize, hi: isize, out: &mut isize) -> void!Throw {
+    let a = s.a
+    let count = hi - lo + 1
+    let mid = lo + count / 2
+    if count > SRT_NINTHER {
+        let d = count / 8
+        srt_sort3(s, lo, lo + d, lo + 2 * d)?
+        srt_sort3(s, mid - d, mid, mid + d)?
+        srt_sort3(s, hi - 2 * d, hi - d, hi)?
+        srt_sort3(s, lo + d, mid, hi - d)?
+    }
+    // a[lo] <= pivot <= a[hi]: both ends bound the scans below.
+    srt_sort3(s, lo, mid, hi)?
+    let pv = srt_at(a, hi - 1)
+    srt_swap(srt_at(a, mid), pv)
+    i := lo
+    j := hi - 1
+    for {
+        for {
+            i += 1
+            srt_less(s, srt_at(a, i), pv)?
+            if !s.res {
+                break
+            }
+            if i == hi - 1 {
+                // The pivot compared less than itself.
+                return err(srt_invalid(s))
+            }
+        }
+        for {
+            j -= 1
+            srt_less(s, pv, srt_at(a, j))?
+            if !s.res {
+                break
+            }
+            if j < i {
+                // Everything below i was already found not greater.
+                return err(srt_invalid(s))
+            }
+        }
+        if j <= i {
+            break
+        }
+        srt_swap(srt_at(a, i), srt_at(a, j))
+    }
+    srt_swap(srt_at(a, i), pv)
+    *out = i
+    return ok()
+}
+
+// Heapsort fallback for a[lo..hi] (bounded work for adversarial inputs).
+fn srt_sift(s: &mut SortState, lo: isize, root0: isize, size: isize) -> void!Throw {
+    let a = s.a
+    root := root0
+    for {
+        child := 2 * root + 1
+        if child >= size {
+            break
+        }
+        if child + 1 < size {
+            srt_less(s, srt_at(a, lo + child), srt_at(a, lo + child + 1))?
+            if s.res {
+                child += 1
+            }
+        }
+        srt_less(s, srt_at(a, lo + root), srt_at(a, lo + child))?
+        if !s.res {
+            break
+        }
+        srt_swap(srt_at(a, lo + root), srt_at(a, lo + child))
+        root = child
+    }
+    return ok()
+}
+
+fn srt_heapsort(s: &mut SortState, lo: isize, hi: isize) -> void!Throw {
+    let a = s.a
+    let count = hi - lo + 1
+    start := count / 2
+    for start > 0 {
+        start -= 1
+        srt_sift(s, lo, start, count)?
+    }
+    end := count - 1
+    for end > 0 {
+        srt_swap(srt_at(a, lo), srt_at(a, lo + end))
+        srt_sift(s, lo, 0, end)?
+        end -= 1
+    }
+    return ok()
+}
+
+fn srt_sort(s: &mut SortState, lo0: isize, hi0: isize, depth0: i32) -> void!Throw {
+    lo := lo0
+    hi := hi0
+    depth := depth0
+    for hi - lo + 1 > SRT_SMALL {
+        if depth == 0 {
+            return srt_heapsort(s, lo, hi)
+        }
+        depth -= 1
+        p: isize = 0
+        srt_partition(s, lo, hi, &mut p)?
+        // Recurse into the smaller side, iterate on the larger one.
+        if p - lo < hi - p {
+            srt_sort(s, lo, p - 1, depth)?
+            lo = p + 1
+        } else {
+            srt_sort(s, p + 1, hi, depth)?
+            hi = p - 1
+        }
+    }
+    return srt_small(s, lo, hi)
+}
+
+// --- Key sort -----------------------------------------------------------------
+//
+// Arrays whose elements all have one tag and are totally ordered by a 64-bit
+// key (integers; floats without NaN, through an order-preserving key) are
+// sorted without the generic comparison: only the `bits` words move, since
+// every tag is the same.
+
+const SRTK_SMALL: isize = 16
+
+fn srtk_get(a: *mut Value, i: isize) -> i64 {
+    unsafe {
+        return u2i((*ptr.offset(a, i)).bits)
+    }
+}
+
+fn srtk_put(a: *mut Value, i: isize, k: i64) {
+    unsafe {
+        (*ptr.offset(a, i)).bits = i2u(k)
+    }
+}
+
+fn srtk_swap(a: *mut Value, i: isize, j: isize) {
+    unsafe {
+        let pi = ptr.offset(a, i)
+        let pj = ptr.offset(a, j)
+        let b = (*pi).bits
+        (*pi).bits = (*pj).bits
+        (*pj).bits = b
+    }
+}
+
+// Map float bits to integers with the same order (negative floats have
+// their magnitude bits flipped); the mapping is its own inverse.
+fn srtk_float_keys(a: *mut Value, n: isize) {
+    for i in 0isize..n {
+        let k = srtk_get(a, i)
+        if k < 0 {
+            srtk_put(a, i, k ^ 9223372036854775807)
+        }
+    }
+}
+
+fn srtk_insertion(a: *mut Value, lo: isize, hi: isize) {
+    for k in (lo + 1)..(hi + 1) {
+        let x = srtk_get(a, k)
+        j := k
+        for j > lo && x < srtk_get(a, j - 1) {
+            srtk_put(a, j, srtk_get(a, j - 1))
+            j -= 1
+        }
+        srtk_put(a, j, x)
+    }
+}
+
+fn srtk_sift(a: *mut Value, lo: isize, root0: isize, size: isize) {
+    root := root0
+    for {
+        child := 2 * root + 1
+        if child >= size {
+            break
+        }
+        if child + 1 < size && srtk_get(a, lo + child) < srtk_get(a, lo + child + 1) {
+            child += 1
+        }
+        if srtk_get(a, lo + root) >= srtk_get(a, lo + child) {
+            break
+        }
+        srtk_swap(a, lo + root, lo + child)
+        root = child
+    }
+}
+
+fn srtk_heapsort(a: *mut Value, lo: isize, hi: isize) {
+    let count = hi - lo + 1
+    start := count / 2
+    for start > 0 {
+        start -= 1
+        srtk_sift(a, lo, start, count)
+    }
+    end := count - 1
+    for end > 0 {
+        srtk_swap(a, lo, lo + end)
+        srtk_sift(a, lo, 0, end)
+        end -= 1
+    }
+}
+
+fn srtk_median3(a: *mut Value, i: isize, j: isize, k: isize) -> i64 {
+    let x = srtk_get(a, i)
+    let y = srtk_get(a, j)
+    let z = srtk_get(a, k)
+    if x < y {
+        if y < z {
+            return y
+        }
+        if x < z {
+            return z
+        }
+        return x
+    }
+    if x < z {
+        return x
+    }
+    if y < z {
+        return z
+    }
+    return y
+}
+
+fn srtk_sort(a: *mut Value, lo0: isize, hi0: isize, depth0: i32) {
+    lo := lo0
+    hi := hi0
+    depth := depth0
+    for hi - lo + 1 > SRTK_SMALL {
+        if depth == 0 {
+            srtk_heapsort(a, lo, hi)
+            return
+        }
+        depth -= 1
+        let count = hi - lo + 1
+        let mid = lo + count / 2
+        pv := srtk_median3(a, lo, mid, hi)
+        if count > SRT_NINTHER {
+            let d = count / 8
+            let m1 = srtk_median3(a, lo, lo + d, lo + 2 * d)
+            let m3 = srtk_median3(a, hi - 2 * d, hi - d, hi)
+            let m2 = srtk_median3(a, mid - d, mid, mid + d)
+            // Median of the three medians.
+            pv = if m1 < m2 {
+                if m2 < m3 {
+                    m2
+                } else if m1 < m3 {
+                    m3
+                } else {
+                    m1
+                }
+            } else if m1 < m3 {
+                m1
+            } else if m2 < m3 {
+                m3
+            } else {
+                m2
+            }
+        }
+        // Hoare partition around the value pv, which occurs in the range,
+        // so both scans stop inside it.
+        i := lo - 1
+        j := hi + 1
+        for {
+            i += 1
+            for srtk_get(a, i) < pv {
+                i += 1
+            }
+            j -= 1
+            for pv < srtk_get(a, j) {
+                j -= 1
+            }
+            if i >= j {
+                break
+            }
+            srtk_swap(a, i, j)
+        }
+        // [lo, j] <= pv <= [j+1, hi]
+        if j - lo < hi - j {
+            srtk_sort(a, lo, j, depth)
+            lo = j + 1
+        } else {
+            srtk_sort(a, j + 1, hi, depth)
+            hi = j
+        }
+    }
+    srtk_insertion(a, lo, hi)
+}
+
+fn tl_sort(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        n: i64 = 0
+        tl_getn(cx, 1, TL_READ | TL_WRITE, &mut n)?
+        if n <= 1 {
+            return ok(0)
+        }
+        cx.arg_check(n < TL_INT_MAX, 1, "array too big")?
+        if !cx.is_none_or_nil(2) {
+            cx.check_type(2, TFUNCTION)?
+        }
+        cx.set_top(2)
+        cx.check_stack_msg(8, "")?
+        let L = cx.L
+        // Anchored work array (stack index 3): n elements plus a scratch slot.
+        cx.create_table(0, 0)?
+        let work = tl_table_at(cx, 3)
+        tab_resize(L, work, (n + 1) as u32, 0)?
+        let a = (*work).array
+        for i in 0i64..n {
+            let dst = ptr.offset(a, i as isize)
+            let h = tl_table_at(cx, 1)
+            src := 0 as *mut Value
+            if !ptr.is_null(h) {
+                src = tab_get_int(h, i + 1)
+            }
+            if !ptr.is_null(src) && !val_is_empty(src) {
+                set_obj(dst, src)
+            } else {
+                cx.get_i(1, i + 1)?
+                set_obj(dst, ptr.offset((*L).top, -1))
+                cx.pop(1)
+            }
+            gc_barrier_back(L, work, dst)
+        }
+        // Depth limit 2 * floor(log2 n) before falling back to heapsort.
+        depth := 0i32
+        m := n
+        for m > 1 {
+            depth += 2
+            m = m / 2
+        }
+        mode := SRT_FN
+        if cx.is_nil(2) {
+            nums := true
+            strs := true
+            ints := true
+            floats := true
+            for i in 0i64..n {
+                let e = ptr.offset(a, i as isize)
+                let tag = (*e).tag
+                let t = tag & 15
+                if t != TYPE_NUMBER {
+                    nums = false
+                }
+                if t != TYPE_STRING {
+                    strs = false
+                }
+                if tag != TAG_INT {
+                    ints = false
+                }
+                if tag != TAG_FLOAT || val_float(e) != val_float(e) {
+                    floats = false
+                }
+            }
+            mode = if nums {
+                SRT_NUM
+            } else if strs {
+                SRT_STR
+            } else {
+                SRT_LT
+            }
+            if ints {
+                srtk_sort(a, 0, (n - 1) as isize, depth)
+                mode = -1
+            } else if floats {
+                srtk_float_keys(a, n as isize)
+                srtk_sort(a, 0, (n - 1) as isize, depth)
+                srtk_float_keys(a, n as isize)
+                mode = -1
+            }
+        }
+        if mode >= 0 {
+            s := SortState { L: L, a: a, tmp: ptr.offset(a, n as isize), mode: mode, res: false }
+            srt_sort(&mut s, 0, (n - 1) as isize, depth)?
+            set_nil(s.tmp)
+        }
+        // Store the ordered elements back.
+        for i in 0i64..n {
+            L_push_value(L, ptr.offset(a, i as isize))
+            tl_seti(cx, 1, i + 1)?
+        }
+        return ok(0)
+    }
+}
+
+// --- Registration -------------------------------------------------------------------
+
 pub fn open_table(cx: &mut Cx) -> i32!Throw {
-    cx.create_table(0, 0)?
-    return ok(1)
+    unsafe {
+        let funcs = [
+            ("concat", tl_concat),
+            ("insert", tl_insert),
+            ("pack", tl_pack),
+            ("unpack", tl_unpack),
+            ("remove", tl_remove),
+            ("move", tl_move),
+            ("sort", tl_sort),
+        ]
+        cx.create_table(0, 7)?
+        cx.set_funcs(&funcs, 0)?
+        return ok(1)
+    }
 }
