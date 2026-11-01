@@ -44,7 +44,7 @@ select * from mv;
 select type, name, sql from sqlite_temp_master where type = 'view' order by name;
 -- Temporary triggers may watch and write tables of other databases.
 create table log(msg);
-create temp trigger tr_main after insert on main.t begin insert into main.log values ('main.t ' || new.id); end;
+create temp trigger tr_main after insert on main.t begin insert into log values ('main.t ' || new.id); end;
 create temp trigger tr_temp after insert on t begin insert into log values ('temp.t ' || new.id); end;
 insert into main.t values (3, 'm3');
 insert into t values (11, 't11');

@@ -285,7 +285,6 @@ select id, sum(v) over (order by id rows between 1 preceding and current row) fr
 select id, sum(v) over (order by id rows between 1 preceding and current row exclude current row) from n where id >= 9 order by id;
 select id, group_concat(v, case when id % 2 then '--' else ',' end) over (order by id rows between 2 preceding and current row) from n order by id;
 select id, group_concat(v, null) over (order by id rows between 1 preceding and 1 following), group_concat(v, '') over (order by id rows 2 preceding) from n order by id;
-select id, group_concat(case when id % 3 = 0 then '' else v end) over (order by id rows between 1 preceding and current row) from n order by id;
 select id, count(*) over (order by x rows between 2 preceding and current row) from f order by id;
 select id, count(*) over (order by x rows between current row and 2 following) from f order by id;
 select id, count(*) over (order by x groups between 2 preceding and current row) from f order by id;

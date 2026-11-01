@@ -64,12 +64,13 @@ insert into late.l values ('x');
 detach late;
 rollback;
 detach late;
--- TEMP triggers on attached tables.
+-- TEMP triggers on attached tables. Unqualified names in their bodies
+-- resolve as in top-level statements: temp, main, then attached databases.
 attach 'aux.db' as aux;
 create table aux.a(id integer primary key, n);
 create table aux.audit(what);
-create temp trigger ta after insert on aux.a begin insert into aux.audit values ('ins ' || new.id); end;
-create temp trigger tb after update of n on aux.a begin insert into aux.audit values ('upd ' || old.n || '>' || new.n); end;
+create temp trigger ta after insert on aux.a begin insert into audit values ('ins ' || new.id); end;
+create temp trigger tb after update of n on aux.a begin insert into audit values ('upd ' || old.n || '>' || new.n); end;
 create temp trigger tc before delete on aux.a begin insert into t values (100 + old.id, 'deleted from aux'); end;
 insert into aux.a values (1, 10), (2, 20);
 update aux.a set n = n + 1;
