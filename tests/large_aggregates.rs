@@ -130,3 +130,102 @@ fn large_records_run_on_small_stacks() {
     }
     fs::remove_dir_all(dir).unwrap();
 }
+
+// A large record built into a Result while values with drops are still in
+// scope: the drops run between loading the Result and storing it to the
+// return slot, so the load cannot simply become a memmove.
+const RESULT_WITH_DROPS: &str = r#"package main
+struct Table {
+    first: u64
+    second: u32
+    words: [100]u64
+    small: [4]u32
+    flag: u8
+}
+struct Inner {
+    table: Table
+    other: Table
+    count: u32
+    name: [256]u8
+}
+struct Other {
+    x: u32
+    y: [7]u16
+    z: u64
+}
+enum Raw {
+    First(Inner),
+    Second(Other),
+    Third(Table)
+}
+struct Guard {
+    value: u32
+    fn drop(&mut self) {
+        self.value = 0
+    }
+}
+struct Device {
+    raw: Raw
+    log: [64]u64
+    name: [256]u8
+    length: usize
+    fn open(flag: bool) -> Device!u32 {
+        if flag {
+            return err(1)
+        }
+        table := Table { first: 1, second: 2, words: [3u64; 100], small: [4u32; 4], flag: 5 }
+        other := Table { first: 1, second: 2, words: [3u64; 100], small: [4u32; 4], flag: 6 }
+        return Device.from_raw(Raw.First(Inner { table: table, other: other, count: 3, name: [0u8; 256] }))
+    }
+    fn from_raw(raw: Raw) -> Device!u32 {
+        device := Device { raw: raw, log: [0u64; 64], name: [0u8; 256], length: 0 }
+        guard := Guard { value: 3 }
+        name := [0u8; 256]
+        for i in 0usize..16 {
+            name[i] = 65
+        }
+        device.name = name
+        device.length = 16 + guard.value as usize
+        device.length += device.peek()
+        return ok(device)
+    }
+    fn peek(&self) -> usize {
+        match &self.raw {
+            Raw.First(inner) => {
+                return inner.table.words[5] as usize + inner.count as usize
+            }
+            Raw.Second(other) => {
+                return other.y[3] as usize + other.z as usize
+            }
+            Raw.Third(table) => {
+                return table.flag as usize
+            }
+        }
+    }
+    fn drop(&mut self) {
+        self.length = 0
+    }
+}
+fn main() -> i32 {
+    device := Device.open(false)!
+    if device.length != 16 + 3 + 3 + 3 {
+        return 1
+    }
+    return 0
+}
+"#;
+
+#[test]
+fn large_results_built_before_drops_compile_quickly() {
+    // Before such loads were copied aside this took over a minute at -O1.
+    let dir = scratch("drops");
+    let input = dir.join("main.dodo");
+    fs::write(&input, RESULT_WITH_DROPS).unwrap();
+    for level in ["0", "1", "3"] {
+        let exe = dir.join(format!("main{level}{}", std::env::consts::EXE_SUFFIX));
+        dodo(&["-O", level], &input, &exe);
+        let status = Command::new(&exe).status().unwrap();
+        assert_eq!(status.code(), Some(0), "O{level}");
+    }
+    fs::remove_dir_all(dir).unwrap();
+}
