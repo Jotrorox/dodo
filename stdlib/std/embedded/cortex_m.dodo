@@ -25,10 +25,15 @@ const NVIC_ISPR: usize = 0xE000_E200
 const NVIC_ICPR: usize = 0xE000_E280
 // One priority byte per interrupt. Armv6-M only allows word accesses.
 const NVIC_IPR: usize = 0xE000_E400
-// SCB: interrupt control and state, and the vector table offset.
+// SCB: interrupt control and state, the vector table offset, and the
+// system control register, which says how `wfi` and `wfe` sleep (B3.2.7).
 const SCB_ICSR: usize = 0xE000_ED04
 const SCB_VTOR: usize = 0xE000_ED08
+const SCB_SCR: usize = 0xE000_ED10
 const PENDSV_SET: u32 = 1 << 28
+const SCR_SLEEP_ON_EXIT: u32 = 1 << 1
+const SCR_SLEEP_DEEP: u32 = 1 << 2
+const SCR_EVENT_ON_PEND: u32 = 1 << 4
 // SysTick (B3.3): control and status, reload, current value.
 const SYST_CSR: usize = 0xE000_E010
 const SYST_RVR: usize = 0xE000_E014
@@ -228,6 +233,63 @@ pub unsafe fn enable_interrupts() {
     unsafe {
         asm("cpsie i")
     }
+}
+
+// Make this core's later sleeps (`wfi`, `wfe`) deep sleeps, or light ones
+// again. What a deep sleep stops is up to the chip; std/embedded/power
+// describes it, and a chip's Power implements that protocol on top of this.
+// Each core has its own setting.
+pub fn set_deep_sleep(deep: bool) {
+    change_scr(SCR_SLEEP_DEEP, deep)
+}
+
+// True when this core's sleeps are deep sleeps (SCR.SLEEPDEEP).
+pub fn deep_sleep() -> bool {
+    return (scr() & SCR_SLEEP_DEEP) != 0
+}
+
+// Sleep again whenever the last active handler returns to thread mode,
+// instead of resuming the program (SCR.SLEEPONEXIT): for firmware that does
+// all its work in interrupt handlers. Thread mode runs again only once this
+// is turned off, by a handler.
+pub fn set_sleep_on_exit(on: bool) {
+    change_scr(SCR_SLEEP_ON_EXIT, on)
+}
+
+pub fn sleep_on_exit() -> bool {
+    return (scr() & SCR_SLEEP_ON_EXIT) != 0
+}
+
+// Let an interrupt that becomes pending wake `wait_for_event` even while it
+// is disabled in the NVIC or masked (SCR.SEVONPEND), so a program polls a
+// peripheral's flag between `wfe`s without a handler.
+pub fn set_event_on_pend(on: bool) {
+    change_scr(SCR_EVENT_ON_PEND, on)
+}
+
+fn scr() -> u32 {
+    // SAFETY: reading SCR has no side effects.
+    return unsafe {
+        mmio.read32(SCB_SCR)
+    }
+}
+
+fn change_scr(bit: u32, on: bool) {
+    // SAFETY: SCR belongs to this core; the read-modify-write runs with
+    // interrupts masked so a handler cannot change it in between, and it
+    // changes only `bit`.
+    section := hal.Critical.enter()
+    unsafe {
+        value := mmio.read32(SCB_SCR)
+        if on {
+            value |= bit
+        } else {
+            value &= ~bit
+        }
+        mmio.write32(SCB_SCR, value)
+    }
+    core.drop(section)
+    data_barrier()
 }
 
 // Sleep until an event (`wfe`): an interrupt, or `send_event` on another

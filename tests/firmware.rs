@@ -278,6 +278,70 @@ fn main() {
     }
 }
 
+// Low power on a board: the chip's Power through the portable protocol
+// and directly, and the example. Needs no linker.
+#[test]
+fn power_controls_compile_for_every_board() {
+    let scratch = Scratch::new("power");
+    let example = root().join("examples/low_power.dodo");
+    let source = scratch.write(
+        "power.dodo",
+        r#"package main
+import "std/embedded/board"
+import "std/embedded/chip"
+import "std/embedded/hal"
+import "std/embedded/power"
+fn idle<P: power.Power>(chip_power: &mut P, keep: power.Clocks) -> power.Clocks {
+    stopped := chip_power.disable_unused_clocks()
+    chip_power.set_sleep_clocks(keep)
+    chip_power.set_mode(power.Mode.DeepSleep)
+    chip_power.sleep()
+    chip_power.set_mode(power.Mode.Sleep)
+    return stopped
+}
+fn main() {
+    b := board.take()!
+    stopped := idle(&mut b.power, chip.ALARM_CLOCKS | chip.CLOCK_GPIO)
+    core.assert((stopped & chip.ESSENTIAL_CLOCKS) == 0)
+    match b.power.disable_clocks(chip.ESSENTIAL_CLOCKS) {
+        ok() => core.assert(false),
+        err(error) => core.assert(error == hal.Error.InvalidInput),
+    }
+    b.power.disable_clocks(chip.CLOCK_UART1)!
+    serial := b.pins.uart(4, none, 9600)!
+    core.assert((b.power.enabled_clocks() & chip.CLOCK_UART1) == chip.CLOCK_UART1)
+    b.pins.release_uart(serial)
+    power.deep_sleep(&mut b.power, chip.ALARM_CLOCKS)
+    button := b.pins.input(15)!
+    wake := power.Wake.new()
+    wake.on(15, power.RISING_EDGE | power.LEVEL_HIGH)
+    woken := b.power.dormant(&wake)!
+    core.assert(woken <= 1u64 << 15)
+    b.pins.release(button)
+}
+"#,
+    );
+    for board in ["pico", "pico2", "pico2_w"] {
+        for (input, name) in [(source.as_path(), "power"), (example.as_path(), "example")] {
+            for level in ["0", "2"] {
+                let object = scratch.path(&format!("{name}-{board}-O{level}.o"));
+                stdout(&dodo(&[
+                    "build",
+                    input.to_str().unwrap(),
+                    "--board",
+                    board,
+                    "-O",
+                    level,
+                    "--emit",
+                    "obj",
+                    "-o",
+                    &object,
+                ]));
+            }
+        }
+    }
+}
+
 #[test]
 fn platforms_fill_settings_that_are_not_explicit() {
     let blink = root().join("examples/blink");
