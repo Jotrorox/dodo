@@ -1,0 +1,50 @@
+package posix
+
+// Host boundary of the script runtimes on Linux and macOS; see runtime.c.
+// std/script/windows declares the same interface.
+
+// errno of the calling thread, and resetting it to zero.
+pub unsafe extern "C" fn dodo_script_errno() -> i32
+pub unsafe extern "C" fn dodo_script_clear_errno()
+// The C library's stdin (0), stdout (1) and stderr (2) streams.
+pub unsafe extern "C" fn dodo_script_std_stream(which: i32) -> *mut u8
+// 64-bit fseek (whence 0 set, 1 cur, 2 end) and ftell.
+pub unsafe extern "C" fn dodo_script_seek(f: *mut u8, offset: i64, whence: i32) -> i32
+pub unsafe extern "C" fn dodo_script_tell(f: *mut u8) -> i64
+// Read up to a newline (excluded) into out; *last is 10 or -1 (EOF) when
+// the line ended, 0 when out is full.
+pub unsafe extern "C" fn dodo_script_read_line(f: *mut u8, out: *mut u8, capacity: usize, last: *mut i32) -> usize
+// setvbuf with mode 0 unbuffered, 1 full, 2 line.
+pub unsafe extern "C" fn dodo_script_setvbuf(f: *mut u8, mode: i32, size: usize) -> i32
+// popen (after flushing all output) and pclose/system decoded into
+// (exited, code); the latter return 0 on failure with errno set.
+pub unsafe extern "C" fn dodo_script_popen(command: *const u8, mode: *const u8) -> *mut u8
+pub unsafe extern "C" fn dodo_script_pclose(f: *mut u8, exited: *mut i32, code: *mut i32) -> i32
+pub unsafe extern "C" fn dodo_script_system(command: *const u8, exited: *mut i32, code: *mut i32) -> i32
+pub unsafe extern "C" fn dodo_script_has_shell() -> i32
+// time(NULL) and clock() in seconds.
+pub unsafe extern "C" fn dodo_script_time() -> i64
+pub unsafe extern "C" fn dodo_script_clock() -> f64
+// Broken-down time in an opaque 128-byte struct tm block; fields are
+// sec, min, hour, mday, mon, year, wday, yday, isdst.
+pub unsafe extern "C" fn dodo_script_broken_down(t: i64, utc: i32, tm: *mut u8) -> i32
+pub unsafe extern "C" fn dodo_script_tm_get(tm: *const u8, fields: *mut i32)
+pub unsafe extern "C" fn dodo_script_tm_set(tm: *mut u8, fields: *const i32)
+pub unsafe extern "C" fn dodo_script_mktime(tm: *mut u8, ok: *mut i32) -> i64
+pub unsafe extern "C" fn dodo_script_strftime(out: *mut u8, size: usize, format: *const u8, tm: *const u8) -> usize
+// getenv (NULL when the variable is not set).
+pub unsafe extern "C" fn dodo_script_getenv(name: *const u8) -> *const u8
+// setlocale with category 0 all, 1 collate, 2 ctype, 3 monetary,
+// 4 numeric, 5 time.
+pub unsafe extern "C" fn dodo_script_setlocale(category: i32, locale: *const u8) -> *const u8
+// First byte of the current locale's decimal point (localeconv).
+pub unsafe extern "C" fn dodo_script_decimal_point() -> u8
+// A unique temporary file name (the file is created); 1 on success.
+pub unsafe extern "C" fn dodo_script_tmpname(out: *mut u8, capacity: usize) -> i32
+
+// strftime conversions accepted by os.date (ISO C99 and POSIX): one-byte
+// conversions, and two-byte ones (E and O modifiers).
+pub const STRFTIME_SINGLE: &str = "aAbBcCdDeFgGhHIjmMnprRStTuUVwWxXyYzZ%"
+pub const STRFTIME_DOUBLE: &str = "EcECExEXEyEYOdOeOHOIOmOMOSOuOUOVOwOWOy"
+// Route SIGINT to bit 0x80 of `mask` (null restores the default action).
+pub unsafe extern "C" fn dodo_script_watch_interrupt(mask: *mut u8)

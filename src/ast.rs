@@ -566,8 +566,24 @@ pub struct Function {
     /// different signatures, as Objective-C does with `objc_msgSend`.
     pub link_name: Option<String>,
     pub placement: Placement,
+    /// `@inline`, `@inline(never)` or `@cold`.
+    pub inlining: Inlining,
     /// The role of a function generated from an `async fn`; see `AsyncPart`.
     pub async_part: Option<AsyncPart>,
+}
+/// Inlining request of a function with a body, applied by optimized builds.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Inlining {
+    /// The optimizer decides.
+    #[default]
+    Auto,
+    /// `@inline`: inline into every caller where possible.
+    Always,
+    /// `@inline(never)`: keep calls as calls.
+    Never,
+    /// `@cold`: rarely executed; never inlined, and paths that call it are
+    /// laid out and optimized as unlikely.
+    Cold,
 }
 /// The pieces an `async fn name(params) -> T` becomes. Its future type is a
 /// struct whose fields are the parameters; `name(args)` builds it, and the

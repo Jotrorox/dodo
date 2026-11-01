@@ -1,0 +1,71 @@
+@@exit 0
+@@stdout
+char U+0	[00 ]
+char U+41	[41 ]
+char U+7F	[7F ]
+char U+80	[C2 80 ]
+char U+7FF	[DF BF ]
+char U+800	[E0 A0 80 ]
+char U+D7FF	[ED 9F BF ]
+char U+D800	[ED A0 80 ]
+char U+DFFF	[ED BF BF ]
+char U+FFFF	[EF BF BF ]
+char U+10000	[F0 90 80 80 ]
+char U+10FFFF	[F4 8F BF BF ]
+char U+110000	[F4 90 80 80 ]
+char U+1FFFFF	[F7 BF BF BF ]
+char U+200000	[F8 88 80 80 80 ]
+char U+3FFFFFF	[FB BF BF BF BF ]
+char U+4000000	[FC 84 80 80 80 80 ]
+char U+7FFFFFFF	[FD BF BF BF BF BF ]
+char multi	[48 C3 A9 E2 82 AC F0 9F 98 80 ]
+char none	[]
+char -1	error: bad argument #1 to 'utf8.char' (value out of range)
+char 0x80000000	error: bad argument #1 to 'utf8.char' (value out of range)
+char 65.0	[41 ]
+char '66'	[42 ]
+char 1.5	error: bad argument #1 to 'utf8.char' (number has no integer representation)
+char 2nd bad	error: bad argument #2 to 'utf8.char' (value out of range)
+char string	error: bad argument #1 to 'utf8.char' (number expected, got string)
+charpattern	[\x00-\x7F\xC2-\xFD][\x80-\xBF]*
+[68 ][C3 A9 ][E2 82 AC ][F0 9F 98 80 ] count	4
+1:68 2:E9 4:6C 5:6C 6:6F 7:20AC 10:1F600 
+codes [61 62 FF 63 64 ]	strict	1:61 2:62	error: utf8_char_codes.lua:40: invalid UTF-8 code
+codes [61 80 ]	strict		error: utf8_char_codes.lua:40: invalid UTF-8 code
+codes [C0 80 ]	strict		error: utf8_char_codes.lua:40: invalid UTF-8 code
+codes [E0 80 80 ]	strict		error: utf8_char_codes.lua:40: invalid UTF-8 code
+codes [C3 ]	strict		error: utf8_char_codes.lua:40: invalid UTF-8 code
+codes [61 C3 ]	strict	1:61	error: utf8_char_codes.lua:40: invalid UTF-8 code
+codes [C3 A9 A9 ]	strict		error: utf8_char_codes.lua:40: invalid UTF-8 code
+codes [ED A0 80 ]	strict		error: utf8_char_codes.lua:40: invalid UTF-8 code
+codes [ED A0 80 ]	lax	1:D800	ok
+codes [F4 90 80 80 ]	strict		error: utf8_char_codes.lua:40: invalid UTF-8 code
+codes [F4 90 80 80 ]	lax	1:110000	ok
+codes [FD BF BF BF BF BF ]	lax	1:7FFFFFFF	ok
+codes [F4 90 80 80 ]	lax	1:110000	ok
+codes [F8 88 80 80 80 ]	lax	1:200000	ok
+codes [FE ]	strict		error: utf8_char_codes.lua:40: invalid UTF-8 code
+codes [00 61 00 ]	strict	1:0 2:61 3:0	ok
+codepoint()	97
+codepoint(2)	233
+codepoint(1,-1)	97 233 8364 128512 122
+codepoint(4,7)	8364 128512
+codepoint(-1)	122
+codepoint(3)	error: invalid UTF-8 code
+codepoint(5,4)	
+codepoint(0)	error: bad argument #2 to 'utf8.codepoint' (out of bounds)
+codepoint(12)	error: bad argument #3 to 'utf8.codepoint' (out of bounds)
+codepoint(1,12)	error: bad argument #3 to 'utf8.codepoint' (out of bounds)
+codepoint(-11)	97
+codepoint(-12)	error: bad argument #2 to 'utf8.codepoint' (out of bounds)
+codepoint(11,11)	122
+codepoint empty	error: bad argument #3 to 'utf8.codepoint' (out of bounds)
+codepoint empty 1,0	
+codepoint surrogate	error: invalid UTF-8 code
+codepoint surrogate lax	57343
+codepoint big lax	2147483647
+codepoint big strict	error: invalid UTF-8 code
+codepoint 10FFFF	1114111
+codepoint overlong	error: invalid UTF-8 code
+codepoint truncated	error: invalid UTF-8 code
+codepoint number	49 50

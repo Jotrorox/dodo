@@ -1,0 +1,369 @@
+package lua
+
+import "core/mem"
+import "core/ptr"
+
+// Shared object model of the Lua runtime. Every file in this package works on
+// raw pointers to these records; the checked public API lives in api.dodo.
+//
+// A Value is 16 bytes: an 8-byte payload followed by a one-byte tag. The
+// payload is reinterpreted through typed pointers (i64, f64, pointer), which
+// is why it comes first and why every accessor takes a pointer.
+
+// Tag layout: low nibble = basic type (the numbers `type()` exposes),
+// bits 4-5 = variant, bit 6 = collectable.
+const TYPE_NIL: u8 = 0
+const TYPE_BOOLEAN: u8 = 1
+const TYPE_LIGHTUSERDATA: u8 = 2
+const TYPE_NUMBER: u8 = 3
+const TYPE_STRING: u8 = 4
+const TYPE_TABLE: u8 = 5
+const TYPE_FUNCTION: u8 = 6
+const TYPE_USERDATA: u8 = 7
+const TYPE_THREAD: u8 = 8
+// Internal types, never visible to Lua code.
+const TYPE_UPVAL: u8 = 9
+const TYPE_PROTO: u8 = 10
+// Pseudo type for "no value" (an index above the stack top in the API).
+const TYPE_NONE: u8 = 255
+
+const COLLECTABLE: u8 = 64
+
+const TAG_NIL: u8 = 0x00
+// A table slot that holds no value; reads as nil.
+const TAG_EMPTY: u8 = 0x10
+// Returned by table lookups for a key that is absent; reads as nil.
+const TAG_ABSENT: u8 = 0x20
+const TAG_FALSE: u8 = 0x01
+const TAG_TRUE: u8 = 0x11
+const TAG_LIGHTUD: u8 = 0x02
+const TAG_INT: u8 = 0x03
+const TAG_FLOAT: u8 = 0x13
+const TAG_SHORTSTR: u8 = 0x44
+const TAG_LONGSTR: u8 = 0x54
+const TAG_TABLE: u8 = 0x45
+// Lua closure.
+const TAG_LCLOSURE: u8 = 0x46
+// Native (Dodo) closure, possibly with zero upvalues.
+const TAG_NCLOSURE: u8 = 0x56
+const TAG_USERDATA: u8 = 0x47
+const TAG_THREAD: u8 = 0x48
+const TAG_UPVAL: u8 = 0x49
+const TAG_PROTO: u8 = 0x4A
+
+// Strings up to this length are interned; longer ones are not.
+const SHORTSTR_MAX: usize = 40
+
+@repr(C)
+struct Value {
+    bits: u64
+    tag: u8
+}
+
+// Common header of every collectable object. Every object record starts with
+// exactly these three fields, so a pointer to any object can be viewed as a
+// *mut GCObject.
+@repr(C)
+struct GCObject {
+    next: *mut GCObject
+    tag: u8
+    marked: u8
+}
+
+// String object. The bytes follow the header inline and are always followed
+// by a NUL byte (not counted in len), which simplifies C-style scanning.
+@repr(C)
+struct LString {
+    next: *mut GCObject
+    tag: u8
+    marked: u8
+    // Short strings: 1 + index of the reserved word it spells, or 0.
+    // Long strings: 1 once `hash` has been computed.
+    extra: u8
+    hash: u32
+    length: usize
+    // Chain in the short-string intern table.
+    hnext: *mut LString
+}
+
+// Debug description of an upvalue in a prototype.
+@repr(C)
+struct UpvalDesc {
+    name: *mut LString
+    // 1 if the upvalue captures a register of the enclosing function,
+    // 0 if it refers to an upvalue of the enclosing function.
+    instack: u8
+    // Register or upvalue index in the enclosing function.
+    index: u8
+    // Variable kind: 0 regular, 1 <const>, 2 <close>, 3 compile-time constant.
+    kind: u8
+}
+
+// Debug description of a local variable.
+@repr(C)
+struct LocVar {
+    name: *mut LString
+    // First instruction where the variable is active, and first where it is dead.
+    startpc: i32
+    endpc: i32
+}
+
+// Absolute line information anchor (see DESIGN.md "Line information").
+@repr(C)
+struct AbsLineInfo {
+    pc: i32
+    line: i32
+}
+
+// Function prototype produced by the compiler or the binary-chunk loader.
+// The arrays are owned by the prototype and released with mem_free when the
+// prototype is collected.
+@repr(C)
+struct Proto {
+    next: *mut GCObject
+    tag: u8
+    marked: u8
+    numparams: u8
+    is_vararg: u8
+    maxstacksize: u8
+    sizeupvalues: i32
+    sizek: i32
+    sizecode: i32
+    sizelineinfo: i32
+    sizep: i32
+    sizelocvars: i32
+    sizeabslineinfo: i32
+    linedefined: i32
+    lastlinedefined: i32
+    k: *mut Value
+    code: *mut u32
+    p: *mut *mut Proto
+    upvalues: *mut UpvalDesc
+    lineinfo: *mut i8
+    abslineinfo: *mut AbsLineInfo
+    locvars: *mut LocVar
+    source: *mut LString
+    gclist: *mut GCObject
+}
+
+// --- Value accessors --------------------------------------------------------
+
+fn val_tag(v: *mut Value) -> u8 {
+    unsafe {
+        return (*v).tag
+    }
+}
+fn val_type(v: *mut Value) -> u8 {
+    unsafe {
+        return (*v).tag & 15
+    }
+}
+fn val_is_nil(v: *mut Value) -> bool {
+    unsafe {
+        return ((*v).tag & 15) == TYPE_NIL
+    }
+}
+// nil and false are the only false values.
+fn val_is_falsy(v: *mut Value) -> bool {
+    unsafe {
+        let t = (*v).tag
+        return t == TAG_FALSE || (t & 15) == TYPE_NIL
+    }
+}
+fn val_is_collectable(v: *mut Value) -> bool {
+    unsafe {
+        return ((*v).tag & COLLECTABLE) != 0
+    }
+}
+fn val_int(v: *mut Value) -> i64 {
+    unsafe {
+        return *(v as *mut i64)
+    }
+}
+fn val_float(v: *mut Value) -> f64 {
+    unsafe {
+        return *(v as *mut f64)
+    }
+}
+fn val_ptr(v: *mut Value) -> *mut u8 {
+    unsafe {
+        return *(v as *mut *mut u8)
+    }
+}
+fn val_gc(v: *mut Value) -> *mut GCObject {
+    unsafe {
+        return *(v as *mut *mut GCObject)
+    }
+}
+fn val_str(v: *mut Value) -> *mut LString {
+    unsafe {
+        return *(v as *mut *mut LString)
+    }
+}
+fn val_proto(v: *mut Value) -> *mut Proto {
+    unsafe {
+        return *(v as *mut *mut Proto)
+    }
+}
+
+fn set_nil(v: *mut Value) {
+    unsafe {
+        (*v).tag = TAG_NIL
+    }
+}
+fn set_empty(v: *mut Value) {
+    unsafe {
+        (*v).tag = TAG_EMPTY
+    }
+}
+fn set_bool(v: *mut Value, b: bool) {
+    unsafe {
+        if b {
+            (*v).tag = TAG_TRUE
+        } else {
+            (*v).tag = TAG_FALSE
+        }
+    }
+}
+fn set_int(v: *mut Value, i: i64) {
+    unsafe {
+        *(v as *mut i64) = i
+        (*v).tag = TAG_INT
+    }
+}
+fn set_float(v: *mut Value, f: f64) {
+    unsafe {
+        *(v as *mut f64) = f
+        (*v).tag = TAG_FLOAT
+    }
+}
+fn set_lightud(v: *mut Value, p: *mut u8) {
+    unsafe {
+        *(v as *mut *mut u8) = p
+        (*v).tag = TAG_LIGHTUD
+    }
+}
+// Store a collectable object; `tag` must be the object's own tag.
+fn set_gc(v: *mut Value, o: *mut GCObject, tag: u8) {
+    unsafe {
+        *(v as *mut *mut GCObject) = o
+        (*v).tag = tag
+    }
+}
+fn set_str(v: *mut Value, s: *mut LString) {
+    unsafe {
+        *(v as *mut *mut LString) = s
+        (*v).tag = (*s).tag
+    }
+}
+fn set_obj(dst: *mut Value, src: *mut Value) {
+    unsafe {
+        (*dst).bits = (*src).bits
+        (*dst).tag = (*src).tag
+    }
+}
+
+// --- String accessors -------------------------------------------------------
+
+fn str_data(s: *mut LString) -> *mut u8 {
+    unsafe {
+        return ptr.offset(s as *mut u8, mem.size_of::<LString>() as isize)
+    }
+}
+fn str_len(s: *mut LString) -> usize {
+    unsafe {
+        return (*s).length
+    }
+}
+fn str_is_short(s: *mut LString) -> bool {
+    unsafe {
+        return (*s).tag == TAG_SHORTSTR
+    }
+}
+
+fn gc_of<T>(o: *mut T) -> *mut GCObject {
+    unsafe {
+        return o as *mut GCObject
+    }
+}
+
+// Outcome of a raised Lua error or a coroutine yield, propagated through
+// every internal function that can raise (`T!Throw`). The error object itself
+// is stored by the raiser as described in DESIGN.md ("Errors").
+pub enum Throw {
+    // LUA_ERRRUN: runtime error (error(), failed operation).
+    Runtime,
+    // LUA_ERRSYNTAX: compilation error.
+    Syntax,
+    // LUA_ERRMEM: allocation failure.
+    Memory,
+    // LUA_ERRERR: error while running a message handler.
+    Handler,
+    // A coroutine yield unwinding the native stack.
+    Yield,
+}
+
+// Size of a printable chunk identifier, including room for a terminator.
+const CHUNKID_SIZE: usize = 60
+
+fn cid_put(out: *mut u8, at: usize, src: *mut u8, count: usize) -> usize {
+    unsafe {
+        ptr.copy_nonoverlapping(src, ptr.offset(out, at as isize), count)
+    }
+    return at + count
+}
+
+// Writes the printable name of a chunk (as used in error messages and
+// debug.getinfo().short_src) into `out` (at least CHUNKID_SIZE bytes) and
+// returns its length. "=name" prints name, "@file" prints the file name
+// (keeping its end when too long), anything else prints [string "..."]
+// with the first line of the source.
+fn chunk_id(source: *mut u8, length: usize, out: *mut u8) -> usize {
+    unsafe {
+        let first = if length > 0 {
+            *source
+        } else {
+            0u8
+        }
+        if first == b'=' {
+            let n = if length <= CHUNKID_SIZE {
+                length - 1
+            } else {
+                CHUNKID_SIZE - 1
+            }
+            return cid_put(out, 0, ptr.offset(source, 1), n)
+        }
+        if first == b'@' {
+            if length <= CHUNKID_SIZE {
+                return cid_put(out, 0, ptr.offset(source, 1), length - 1)
+            }
+            let dots = b"..."
+            at := cid_put(out, 0, ptr.as_ptr(dots) as *mut u8, 3)
+            let keep = CHUNKID_SIZE - 4
+            return cid_put(out, at, ptr.offset(source, (length - keep) as isize), keep)
+        }
+        let prefix = b"[string \""
+        let suffix = b"\"]"
+        let dots = b"..."
+        at := cid_put(out, 0, ptr.as_ptr(prefix) as *mut u8, prefix.len)
+        let room = CHUNKID_SIZE - prefix.len - dots.len - suffix.len - 1
+        newline := length
+        for i in 0usize..length {
+            if *ptr.offset(source, i as isize) == b'\n' {
+                newline = i
+                break
+            }
+        }
+        if length < room && newline == length {
+            at = cid_put(out, at, source, length)
+        } else {
+            n := newline
+            if n > room {
+                n = room
+            }
+            at = cid_put(out, at, source, n)
+            at = cid_put(out, at, ptr.as_ptr(dots) as *mut u8, dots.len)
+        }
+        return cid_put(out, at, ptr.as_ptr(suffix) as *mut u8, suffix.len)
+    }
+}

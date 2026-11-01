@@ -420,6 +420,8 @@ conflicting aliases. Prefer passing state explicitly or using
 | `@link_name("symbol")` | `extern "C"` prototype: bind `symbol` instead of the function's name; several prototypes may bind one symbol with different signatures; see [FFI](memory-and-ffi.md#struct-layout-and-the-c-abi). |
 | `@section("name")` | Function or `static`: place it in an object file section, and keep it even if unreferenced. |
 | `@align(N)` | Function or `static`: align it to `N` bytes, a power of two. |
+| `@inline`, `@inline(never)` | Function with a body: optimized builds inline it into every caller where possible, or never. |
+| `@cold` | Function with a body: rarely executed; never inlined, and optimized builds treat paths that call it as unlikely. |
 
 `@compiler(print)`, `@compiler(println)`, and `@compiler(printf)` are reserved for
 bundled printing declarations, and `@compiler(pio)` for the

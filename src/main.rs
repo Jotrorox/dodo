@@ -675,6 +675,11 @@ fn compile(args: &Args, loaded: &package::Loaded, out: &Path) -> Result<(), Stri
             {
                 linker.arg("-ldl");
             }
+            // glibc keeps the math functions (fmod, pow, ...) that libraries
+            // such as std/script/lua declare in libm.
+            if target.contains("-linux-") {
+                linker.arg("-lm");
+            }
             linker.args(&args.link_args).arg("-o").arg(out);
             if args.verbose {
                 eprintln!("Linking: {linker:?}");

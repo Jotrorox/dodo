@@ -1,0 +1,1 @@
+::top:: local x = 1 goto top

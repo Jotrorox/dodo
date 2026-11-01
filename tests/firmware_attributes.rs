@@ -554,6 +554,35 @@ fn sections_and_alignment_place_code_and_data() {
 }
 
 #[test]
+fn constants_holding_addresses_stay_out_of_hosted_text_segments() {
+    let scratch = Scratch::new("relro");
+    let source = "package main\n\nconst NAME: &str = \"lua\"\nconst LIMIT: i64 = 7\n\n\
+                  fn main() -> i32 {\n    return (NAME.len as i32) + (LIMIT as i32)\n}\n";
+    // Position-independent code makes NAME's section writable; on hosted
+    // ELF it belongs in RELRO, or GNU ld merges it into an RWX segment.
+    let hosted = emit(
+        &scratch,
+        source,
+        "asm",
+        &["--target", "x86_64-unknown-linux-gnu"],
+    );
+    assert!(
+        hosted.contains(".section\t.data.rel.ro.dodo.main.NAME,"),
+        "{hosted}"
+    );
+    assert!(
+        hosted.contains(".section\t.rodata.dodo.main.LIMIT,"),
+        "{hosted}"
+    );
+    // Firmware linker scripts keep every constant in flash under .rodata.
+    let firmware = emit(&scratch, source, "asm", &["--target", "thumbv6m-none-eabi"]);
+    assert!(
+        firmware.contains(".section\t.rodata.dodo.main.NAME,"),
+        "{firmware}"
+    );
+}
+
+#[test]
 fn interrupt_handlers_fill_the_vector_table() {
     let scratch = Scratch::new("vectors");
     // Exported under the vector name with the C ABI, whatever the function is called.

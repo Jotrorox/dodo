@@ -185,6 +185,7 @@ virtual package names rather than independent source files:
 | `std/crypto/openssl/native` | [OpenSSL libcrypto](crypto.md#backend-and-build) |
 | `std/web/native` | [Static-file providers](web.md) |
 | `std/dylib/native` | [Shared libraries](dylib.md) |
+| `std/script/native` | [Lua host boundary](script.md#platforms) |
 | `std/gpu/hal/native` | [The operating system's own GPU backend for std/gpu](gpu.md#writing-a-backend) |
 
 `std/net/native` is the socket entry point; many other native packages implement

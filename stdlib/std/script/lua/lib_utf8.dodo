@@ -1,0 +1,325 @@
+package lua
+
+import "core/mem"
+import "core/ptr"
+
+// The utf8 library (reference manual section 6.5). Sequences of up to six
+// bytes (code points up to 0x7FFFFFFF) are decoded; strict mode (the default)
+// also rejects surrogates and code points above 0x10FFFF. Decoding relies on
+// the NUL that follows every Lua string: it is never a continuation byte, so a
+// truncated sequence at the end is rejected without reading further.
+
+const UTF8_MAXUNICODE: u32 = 0x10FFFF
+const UTF8_MAXUTF: u32 = 0x7FFFFFFF
+const UTF8_INVALID: &str = "invalid UTF-8 code"
+
+fn utf8_is_cont(c: u8) -> bool {
+    return (c & 0xC0) == 0x80
+}
+
+// Decode the sequence at s[i]; returns the offset after it, or -1 when the
+// sequence is invalid. The code point goes to *code.
+fn utf8_decode(s: *const u8, i: usize, strict: bool, code: &mut u32) -> isize {
+    c := sl_load(s, i) as u32
+    if c < 0x80 {
+        *code = c
+        return (i + 1) as isize
+    }
+    if c >= 0xFE || c < 0xC0 {
+        return -1
+    }
+    res := 0u32
+    count := 0usize
+    for (c & 0x40) != 0 {
+        count += 1
+        let cc = sl_load(s, i + count)
+        if !utf8_is_cont(cc) {
+            return -1
+        }
+        res = (res << 6) | (cc & 0x3F) as u32
+        c = (c << 1) & 0xFF
+    }
+    // c holds the first byte's payload bits shifted left by count, so this
+    // places them above the 6 * count continuation bits.
+    res = res | ((c & 0x7F) << (count * 5) as u32)
+    let minimum = if count == 1 {
+        0x80u32
+    } else if count == 2 {
+        0x800u32
+    } else if count == 3 {
+        0x10000u32
+    } else if count == 4 {
+        0x200000u32
+    } else {
+        0x4000000u32
+    }
+    if res > UTF8_MAXUTF || res < minimum {
+        return -1
+    }
+    if strict && (res > UTF8_MAXUNICODE || (res >= 0xD800 && res <= 0xDFFF)) {
+        return -1
+    }
+    *code = res
+    return (i + 1 + count) as isize
+}
+
+// Relative position: negative counts from the end (clamped to 0).
+fn utf8_posrelat(pos: i64, len: usize) -> i64 {
+    if pos >= 0 {
+        return pos
+    }
+    let l = len as i64
+    if pos < -l {
+        return 0
+    }
+    return l + pos + 1
+}
+
+// Encode a code point (up to 0x7FFFFFFF) into out; returns the byte count.
+fn utf8_encode(out: *mut u8, x: u32) -> usize {
+    if x < 0x80 {
+        sl_store(out, 0, x as u8)
+        return 1
+    }
+    tmp := [0u8; 8]
+    n := 0usize
+    v := x
+    // Room left in the first byte for payload bits.
+    mfb := 0x3Fu32
+    for v > mfb {
+        tmp[n] = (0x80 | (v & 0x3F)) as u8
+        n += 1
+        v = v >> 6
+        mfb = mfb >> 1
+    }
+    let first = ((~mfb & 0x7F) << 1) | v
+    sl_store(out, 0, first as u8)
+    for k in 0usize..n {
+        sl_store(out, 1 + k, tmp[n - 1 - k])
+    }
+    return n + 1
+}
+
+fn utf8_char(cx: &mut Cx) -> i32!Throw {
+    let n = cx.get_top()
+    stk := mem.uninit::<[256]u8>()
+    b := SlBuf.new(cx.L, unsafe {
+        mem.uninit_as_mut_ptr(&mut stk) as *mut u8
+    }, 256)
+    for i in 1i32..(n + 1) {
+        c := 0i64
+        sl_arg_int(cx, i, &mut c)?
+        if num_i64_as_u64(c) > UTF8_MAXUTF as u64 {
+            return err(cx.arg_error(i, "value out of range"))
+        }
+        dst := sl_null_mut()
+        b.room(8, &mut dst)?
+        let k = utf8_encode(dst, c as u32)
+        b.add_size(k)
+    }
+    b.push(cx)?
+    return ok(1)
+}
+
+fn utf8_len(cx: &mut Cx) -> i32!Throw {
+    s := sl_null()
+    len := 0usize
+    sl_arg_str(cx, 1, &mut s, &mut len)?
+    a := 0i64
+    sl_opt_int(cx, 2, 1, &mut a)?
+    posi := utf8_posrelat(a, len)
+    bj := 0i64
+    sl_opt_int(cx, 3, -1, &mut bj)?
+    posj := utf8_posrelat(bj, len)
+    let lax = cx.to_boolean(4)
+    if posi < 1 || posi - 1 > len as i64 {
+        return err(cx.arg_error(2, "initial position out of bounds"))
+    }
+    posi -= 1
+    posj -= 1
+    if posj >= len as i64 {
+        return err(cx.arg_error(3, "final position out of bounds"))
+    }
+    n := 0i64
+    code := 0u32
+    for posi <= posj {
+        if sl_load(s, posi as usize) < 0x80 {
+            posi += 1
+            n += 1
+            continue
+        }
+        let next = utf8_decode(s, posi as usize, !lax, &mut code)
+        if next < 0 {
+            cx.push_fail()
+            cx.push_integer(posi + 1)
+            return ok(2)
+        }
+        posi = next as i64
+        n += 1
+    }
+    cx.push_integer(n)
+    return ok(1)
+}
+
+fn utf8_codepoint(cx: &mut Cx) -> i32!Throw {
+    s := sl_null()
+    len := 0usize
+    sl_arg_str(cx, 1, &mut s, &mut len)?
+    a := 0i64
+    sl_opt_int(cx, 2, 1, &mut a)?
+    let posi = utf8_posrelat(a, len)
+    bj := 0i64
+    sl_opt_int(cx, 3, posi, &mut bj)?
+    let pose = utf8_posrelat(bj, len)
+    let lax = cx.to_boolean(4)
+    if posi < 1 {
+        return err(cx.arg_error(2, "out of bounds"))
+    }
+    if pose > len as i64 {
+        return err(cx.arg_error(3, "out of bounds"))
+    }
+    if posi > pose {
+        return ok(0)
+    }
+    if pose - posi >= 2147483647 {
+        return err(cx.error_msg("string slice too long"))
+    }
+    cx.check_stack_msg((pose - posi) as i32 + 1, "string slice too long")?
+    n := 0i32
+    let se = pose as usize
+    at := (posi - 1) as usize
+    code := 0u32
+    for at < se {
+        let next = utf8_decode(s, at, !lax, &mut code)
+        if next < 0 {
+            return err(cx.error_msg(UTF8_INVALID))
+        }
+        cx.push_integer(code as i64)
+        n += 1
+        at = next as usize
+    }
+    return ok(n)
+}
+
+fn utf8_offset(cx: &mut Cx) -> i32!Throw {
+    s := sl_null()
+    len := 0usize
+    sl_arg_str(cx, 1, &mut s, &mut len)?
+    n := 0i64
+    sl_arg_int(cx, 2, &mut n)?
+    let def = if n >= 0 {
+        1i64
+    } else {
+        len as i64 + 1
+    }
+    a := 0i64
+    sl_opt_int(cx, 3, def, &mut a)?
+    posi := utf8_posrelat(a, len)
+    if posi < 1 || posi - 1 > len as i64 {
+        return err(cx.arg_error(3, "position out of bounds"))
+    }
+    posi -= 1
+    if n == 0 {
+        for posi > 0 && utf8_is_cont(sl_load(s, posi as usize)) {
+            posi -= 1
+        }
+    } else {
+        if utf8_is_cont(sl_load(s, posi as usize)) {
+            return err(cx.error_msg("initial position is a continuation byte"))
+        }
+        if n < 0 {
+            for n < 0 && posi > 0 {
+                posi -= 1
+                for posi > 0 && utf8_is_cont(sl_load(s, posi as usize)) {
+                    posi -= 1
+                }
+                n += 1
+            }
+        } else {
+            n -= 1
+            for n > 0 && posi < len as i64 {
+                posi += 1
+                for utf8_is_cont(sl_load(s, posi as usize)) {
+                    posi += 1
+                }
+                n -= 1
+            }
+        }
+    }
+    if n == 0 {
+        cx.push_integer(posi + 1)
+    } else {
+        cx.push_fail()
+    }
+    return ok(1)
+}
+
+fn utf8_iter(cx: &mut Cx, strict: bool) -> i32!Throw {
+    s := sl_null()
+    len := 0usize
+    sl_arg_str(cx, 1, &mut s, &mut len)?
+    nv := 0i64
+    match cx.to_integer(2) {
+        some(v) => {
+            nv = v
+        },
+        none => {},
+    }
+    n := num_i64_as_u64(nv)
+    if n < len as u64 {
+        for utf8_is_cont(sl_load(s, n as usize)) {
+            n += 1
+        }
+    }
+    if n >= len as u64 {
+        return ok(0)
+    }
+    code := 0u32
+    let next = utf8_decode(s, n as usize, strict, &mut code)
+    if next < 0 || utf8_is_cont(sl_load(s, next as usize)) {
+        return err(cx.error_msg(UTF8_INVALID))
+    }
+    cx.push_integer(n as i64 + 1)
+    cx.push_integer(code as i64)
+    return ok(2)
+}
+
+fn utf8_iter_strict(cx: &mut Cx) -> i32!Throw {
+    return utf8_iter(cx, true)
+}
+
+fn utf8_iter_lax(cx: &mut Cx) -> i32!Throw {
+    return utf8_iter(cx, false)
+}
+
+fn utf8_codes(cx: &mut Cx) -> i32!Throw {
+    let lax = cx.to_boolean(2)
+    s := sl_null()
+    len := 0usize
+    sl_arg_str(cx, 1, &mut s, &mut len)?
+    if utf8_is_cont(sl_load(s, 0)) {
+        return err(cx.arg_error(1, UTF8_INVALID))
+    }
+    if lax {
+        cx.push_native(utf8_iter_lax)?
+    } else {
+        cx.push_native(utf8_iter_strict)?
+    }
+    cx.push_value(1)
+    cx.push_integer(0)
+    return ok(3)
+}
+
+pub fn open_utf8(cx: &mut Cx) -> i32!Throw {
+    let funcs = [
+        ("offset", utf8_offset),
+        ("codepoint", utf8_codepoint),
+        ("char", utf8_char),
+        ("len", utf8_len),
+        ("codes", utf8_codes),
+    ]
+    cx.new_lib(&funcs)?
+    cx.push_bytes(b"[\x00-\x7F\xC2-\xFD][\x80-\xBF]*")?
+    cx.set_field(-2, "charpattern")?
+    return ok(1)
+}
