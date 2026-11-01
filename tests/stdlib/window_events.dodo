@@ -29,30 +29,31 @@ fn draw(win: &mut window.Window) {
 }
 
 fn run() -> void!window.Error {
-    win := window.open(window.Options.new("Events", 320, 240))?
+    app := window.App.new()?
+    win := app.open(window.Options.new("Events", 320, 240))?
     console.printf("open {} {}\n", win.width(), win.height())!
     draw(&mut win)
     win.update_all()?
     console.println("drawn")!
     idle := 0u32
     for idle < 50 {
-        match win.wait_event_timeout(100)? {
+        match app.wait_event_timeout(100)? {
             some(event) => {
                 idle = 0
                 match event {
-                    window.Event.Close => {
+                    window.Event.Close(_) => {
                         console.println("close")!
                         break
                     }
-                    window.Event.Resize(width, height) => {
+                    window.Event.Resize(_, width, height) => {
                         console.printf("resize {} {}\n", width, height)!
                         draw(&mut win)
                         win.update_all()?
                     }
-                    window.Event.Focus(focused) => {
+                    window.Event.Focus(_, focused) => {
                         console.printf("focus {}\n", focused)!
                     }
-                    window.Event.Key(key) => {
+                    window.Event.Key(_, key) => {
                         console.printf("key {} {} {} {}\n", window.key_name(&key.key), key.pressed, key.repeat, key.modifiers.shift())!
                         if key.key == window.Key.Escape {
                             break
@@ -74,20 +75,25 @@ fn run() -> void!window.Error {
                             }
                         }
                     }
-                    window.Event.Text(code_point) => {
+                    window.Event.Text(_, code_point) => {
                         console.printf("text {}\n", code_point)!
                     }
-                    window.Event.MouseMove(x, y) => {
+                    window.Event.MouseMove(_, x, y) => {
                         console.printf("move {} {}\n", x, y)!
                     }
-                    window.Event.MouseButton(button) => {
+                    window.Event.MouseButton(_, button) => {
                         console.printf("button {} {} {}\n", button.pressed, button.x, button.y)!
                     }
-                    window.Event.MouseLeave => {
+                    window.Event.MouseLeave(_) => {
                         console.println("leave")!
                     }
-                    window.Event.Scroll(dx, dy) => {
+                    window.Event.Scroll(_, dx, dy) => {
                         console.printf("scroll {} {}\n", dx, dy)!
+                    }
+                    window.Event.Frame(_) => {}
+                    window.Event.Quit => {
+                        console.println("quit")!
+                        break
                     }
                 }
             }

@@ -60,7 +60,8 @@ fn setup() -> u32 {
 fn run() -> void!opengl.Error {
     context := opengl.Context.create(opengl.Options.default())?
     title := context.renderer()
-    win := window.open(window.Options { title: title, width: WIDTH, height: HEIGHT, resizable: false })!
+    app := window.App.new()!
+    win := app.open(window.Options { title: title, width: WIDTH, height: HEIGHT, resizable: false })!
     // The canvas has scale() times more pixels per side than the window.
     scale := win.scale()
     if scale > 2 {
@@ -87,11 +88,11 @@ fn run() -> void!opengl.Error {
         canvas.blit(&image, 0, 0)
         dirty := canvas.take_dirty()
         win.update(dirty)!
-        match win.wait_event()! {
-            window.Event.Close => {
+        match app.wait_event()! {
+            window.Event.Close(_) | window.Event.Quit => {
                 return ok()
             }
-            window.Event.Key(key) => {
+            window.Event.Key(_, key) => {
                 if key.key == window.Key.Escape {
                     return ok()
                 }
