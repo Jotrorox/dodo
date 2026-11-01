@@ -10,7 +10,7 @@ import "std/graphics/truetype"
 
 // Portable checks for std/graphics: exact pixels for every primitive, all
 // pixel formats, clipping, dirty tracking, text, blitting, the Display
-// protocol, the image codecs, antialiased paths, gradients and TrueType
+// protocol, the image codecs, antialiased paths and strokes, gradients and TrueType
 // fonts. No OS, allocator or floating point.
 
 // The compressing PNG encoder's storage, too big for small stacks.
@@ -1394,6 +1394,560 @@ fn many_edges() {
     assert_eq(at(&e, 300, 4), graphics.WHITE)
 }
 
+// -- Strokes ----------------------------------------------------------------
+
+fn path_box(path: &mut graphics.Path, left: i32, top: i32, right: i32, bottom: i32) {
+    path.move_to(left * 256, top * 256)
+    path.line_to(right * 256, top * 256)
+    path.line_to(right * 256, bottom * 256)
+    path.line_to(left * 256, bottom * 256)
+}
+
+// The largest channel difference between two canvases of one size.
+fn largest_gap(a: &graphics.Canvas, b: &graphics.Canvas) -> u32 {
+    gap := 0u32
+    for y in 0i32..a.height() as i32 {
+        for x in 0i32..a.width() as i32 {
+            g := channel_gap(at(a, x, y), at(b, x, y))
+            if g > gap {
+                gap = g
+            }
+        }
+    }
+    return gap
+}
+
+// A zigzag whose stroke crosses each row hundreds of times.
+fn zigzag(path: &mut graphics.Path, teeth: i32) {
+    path.clear()
+    path.move_to(300, 200)
+    for i in 1i32..teeth + 1 {
+        y := 200i32
+        if i % 2 == 1 {
+            y = 19 * 256 + 37 * (i % 5)
+        }
+        path.cubic_to(i * 384 - 400, y - 900, i * 384 - 200, y + 300, i * 384 + 300, y)
+    }
+}
+
+fn strokes() {
+    a_pixels := [0u8; 24 * 24 * 4]
+    b_pixels := [0u8; 24 * 24 * 4]
+    a := graphics.canvas(&mut a_pixels, 24, 24, graphics.PixelFormat.Rgba8888)!
+    b := graphics.canvas(&mut b_pixels, 24, 24, graphics.PixelFormat.Rgba8888)!
+    storage := [0i32; 256]
+    path := graphics.Path.new(&mut storage)
+
+    // A two pixel wide stroke along pixel corners covers whole pixels: butt
+    // caps end at the end points, square caps a pixel beyond.
+    a.clear(graphics.BLACK)
+    b.clear(graphics.BLACK)
+    a.take_dirty()
+    b.take_dirty()
+    path.move_to(3 * 256, 5 * 256)
+    path.line_to(9 * 256, 5 * 256)
+    path.move_to(12 * 256, 3 * 256)
+    path.line_to(12 * 256, 20 * 256)
+    style := graphics.Stroke.new(2 * 256)
+    assert_eq(style.width(), 512)
+    a.stroke_path(&path, &style, graphics.WHITE)
+    b.fill_rect(3, 4, 6, 2, graphics.WHITE)
+    b.fill_rect(11, 3, 2, 17, graphics.WHITE)
+    assert(a.equals(&b))
+    a_dirty := a.dirty()
+    b_dirty := b.dirty()
+    assert(a_dirty.equals(&b_dirty))
+    style.set_cap(graphics.LineCap.Square)
+    a.clear(graphics.BLACK)
+    a.stroke_path(&path, &style, graphics.WHITE)
+    b.fill_rect(2, 4, 8, 2, graphics.WHITE)
+    b.fill_rect(11, 2, 2, 19, graphics.WHITE)
+    assert(a.equals(&b))
+    // Round caps bulge half a pixel past the end points, partly covering
+    // the pixels there.
+    style.set_cap(graphics.LineCap.Round)
+    a.clear(graphics.BLACK)
+    a.stroke_path(&path, &style, graphics.WHITE)
+    edge := graphics.red(at(&a, 2, 4))
+    assert(edge > 0 && edge < 255)
+    assert_eq(at(&a, 1, 4), graphics.BLACK)
+    assert_eq(at(&a, 3, 4), graphics.WHITE)
+    assert_eq(at(&a, 4, 6), graphics.BLACK)
+
+    // A closed square with miter joins is exactly the ring between two
+    // squares, the closing corner included. Bevels cut the corners, and
+    // round joins round them.
+    path.clear()
+    path_box(&mut path, 4, 4, 20, 20)
+    path.close()
+    style = graphics.Stroke.new(2 * 256)
+    a.clear(graphics.BLACK)
+    a.stroke_path(&path, &style, graphics.WHITE)
+    ring_storage := [0i32; 32]
+    ring := graphics.Path.new(&mut ring_storage)
+    ring.rect(3 * 256, 3 * 256, 18 * 256, 18 * 256)
+    ring.rect(5 * 256, 5 * 256, 14 * 256, 14 * 256)
+    b.clear(graphics.BLACK)
+    b.fill_path(&ring, graphics.FillRule.EvenOdd, graphics.WHITE)
+    assert(a.equals(&b))
+    stroked := graphics.Stroked.new(&path, &style)
+    bounds := graphics.outline_bounds(&stroked)
+    assert(same_rect(&bounds, 3, 3, 18, 18))
+    style.set_join(graphics.LineJoin.Bevel)
+    a.clear(graphics.BLACK)
+    a.stroke_path(&path, &style, graphics.WHITE)
+    for corner in 0usize..4 {
+        x := 3 + 17 * (corner % 2) as i32
+        y := 3 + 17 * (corner / 2) as i32
+        level := graphics.red(at(&a, x, y))
+        assert(level > 100 && level < 160)
+    }
+    assert_eq(at(&a, 4, 3), graphics.WHITE)
+    style.set_join(graphics.LineJoin.Round)
+    a.clear(graphics.BLACK)
+    a.stroke_path(&path, &style, graphics.WHITE)
+    level := graphics.red(at(&a, 3, 3))
+    assert(level > 160 && level < 230)
+    // Left open, the square's first corner gets two caps instead.
+    path.clear()
+    path_box(&mut path, 4, 4, 20, 20)
+    path.line_to(4 * 256, 4 * 256)
+    style = graphics.Stroke.new(2 * 256)
+    a.clear(graphics.BLACK)
+    a.stroke_path(&path, &style, graphics.WHITE)
+    assert_eq(at(&a, 3, 3), graphics.BLACK)
+    assert_eq(at(&a, 4, 3), graphics.WHITE)
+    assert_eq(at(&a, 20, 3), graphics.WHITE)
+
+    // The miter limit bevels sharp corners: a limit of 1 always does, and
+    // a corner of 58 degrees (miter ratio 2.06) is mitered by the default
+    // but not with a limit of 2.
+    path.clear()
+    path.move_to(2 * 256, 22 * 256)
+    path.line_to(12 * 256, 4 * 256)
+    path.line_to(22 * 256, 22 * 256)
+    style = graphics.Stroke.new(3 * 256)
+    a.clear(graphics.BLACK)
+    a.stroke_path(&path, &style, graphics.WHITE)
+    style.set_join(graphics.LineJoin.Bevel)
+    b.clear(graphics.BLACK)
+    b.stroke_path(&path, &style, graphics.WHITE)
+    assert(!a.equals(&b))
+    style.set_join(graphics.LineJoin.Miter)
+    style.set_miter_limit(2 * 256)
+    a.clear(graphics.BLACK)
+    a.stroke_path(&path, &style, graphics.WHITE)
+    assert(a.equals(&b))
+    style.set_miter_limit(0)
+    a.clear(graphics.BLACK)
+    a.stroke_path(&path, &style, graphics.WHITE)
+    assert(a.equals(&b))
+
+    // Dashes along a line through pixel corners cover whole pixels.
+    path.clear()
+    path.move_to(0, 10 * 256)
+    path.line_to(24 * 256, 10 * 256)
+    style = graphics.Stroke.new(2 * 256)
+    pattern := [2i32 * 256, 3 * 256]
+    style.set_dashes(&pattern, 0)
+    assert_eq(style.dash_count(), 2usize)
+    a.clear(graphics.BLACK)
+    a.stroke_path(&path, &style, graphics.WHITE)
+    b.clear(graphics.BLACK)
+    for k in 0i32..5 {
+        b.fill_rect(5 * k, 9, 2, 2, graphics.WHITE)
+    }
+    assert(a.equals(&b))
+    // An offset moves the pattern back along the line, wrapping around;
+    // an odd pattern repeats to make dashes and gaps.
+    style.set_dashes(&pattern, 6 * 256)
+    a.clear(graphics.BLACK)
+    a.stroke_path(&path, &style, graphics.WHITE)
+    b.clear(graphics.BLACK)
+    b.fill_rect(0, 9, 1, 2, graphics.WHITE)
+    for k in 0i32..5 {
+        b.fill_rect(5 * k + 4, 9, 2, 2, graphics.WHITE)
+    }
+    assert(a.equals(&b))
+    style.set_dashes(&pattern, -4 * 256)
+    c_pixels := [0u8; 24 * 24 * 4]
+    c := graphics.canvas(&mut c_pixels, 24, 24, graphics.PixelFormat.Rgba8888)!
+    c.clear(graphics.BLACK)
+    c.stroke_path(&path, &style, graphics.WHITE)
+    assert(a.equals(&c))
+    odd := [3i32 * 256]
+    style.set_dashes(&odd, 0)
+    assert_eq(style.dash_count(), 2usize)
+    a.clear(graphics.BLACK)
+    a.stroke_path(&path, &style, graphics.WHITE)
+    b.clear(graphics.BLACK)
+    for k in 0i32..4 {
+        b.fill_rect(6 * k, 9, 3, 2, graphics.WHITE)
+    }
+    assert(a.equals(&b))
+    // Patterns with a negative length or none positive stay solid.
+    bad := [2i32 * 256, -1]
+    style.set_dashes(&bad, 0)
+    assert_eq(style.dash_count(), 0usize)
+    zeros := [0i32, 0]
+    style.set_dashes(&zeros, 0)
+    assert_eq(style.dash_count(), 0usize)
+    style.set_dashes(&pattern, 0)
+    style.clear_dashes()
+    a.clear(graphics.BLACK)
+    a.stroke_path(&path, &style, graphics.WHITE)
+    b.clear(graphics.BLACK)
+    b.fill_rect(0, 9, 24, 2, graphics.WHITE)
+    assert(a.equals(&b))
+    // Zero-length dashes with round caps are dots.
+    dots := [0i32, 6 * 256]
+    style.set_dashes(&dots, 0)
+    style.set_cap(graphics.LineCap.Round)
+    a.clear(graphics.BLACK)
+    a.stroke_path(&path, &style, graphics.WHITE)
+    for k in 0i32..4 {
+        dot := graphics.red(at(&a, 6 * k, 9))
+        assert(dot > 100 && dot < 255)
+        assert_eq(at(&a, 6 * k + 3, 9), graphics.BLACK)
+    }
+    // A closed square dashed from 4 pixels into its 64 pixel outline ends
+    // inside a dash, which joins the first one at the closing corner.
+    path.clear()
+    path_box(&mut path, 4, 4, 20, 20)
+    path.close()
+    style = graphics.Stroke.new(2 * 256)
+    long := [6i32 * 256, 2 * 256]
+    style.set_dashes(&long, 4 * 256)
+    a.clear(graphics.BLACK)
+    a.stroke_path(&path, &style, graphics.WHITE)
+    assert_eq(at(&a, 3, 3), graphics.WHITE)
+    assert_eq(at(&a, 5, 3), graphics.WHITE)
+    assert_eq(at(&a, 6, 3), graphics.BLACK)
+    assert_eq(at(&a, 3, 20), graphics.WHITE)
+    assert_eq(at(&a, 3, 17), graphics.BLACK)
+    // Unclosed, the same dashes stop at the corner with flat caps.
+    path.clear()
+    path_box(&mut path, 4, 4, 20, 20)
+    path.line_to(4 * 256, 4 * 256)
+    a.clear(graphics.BLACK)
+    a.stroke_path(&path, &style, graphics.WHITE)
+    assert_eq(at(&a, 3, 3), graphics.BLACK)
+    assert_eq(at(&a, 4, 3), graphics.WHITE)
+
+    // A subpath of no length is a dot with round or square caps and
+    // nothing with butt caps; a lone move_to is nothing.
+    path.clear()
+    path.move_to(10 * 256, 10 * 256)
+    path.close()
+    path.move_to(16 * 256, 16 * 256)
+    path.line_to(16 * 256, 16 * 256)
+    path.move_to(4 * 256, 4 * 256)
+    style = graphics.Stroke.new(2 * 256)
+    a.clear(graphics.BLACK)
+    a.take_dirty()
+    a.stroke_path(&path, &style, graphics.WHITE)
+    assert(clean(&a))
+    style.set_cap(graphics.LineCap.Square)
+    a.stroke_path(&path, &style, graphics.WHITE)
+    b.clear(graphics.BLACK)
+    b.fill_rect(9, 9, 2, 2, graphics.WHITE)
+    b.fill_rect(15, 15, 2, 2, graphics.WHITE)
+    assert(a.equals(&b))
+    style.set_cap(graphics.LineCap.Round)
+    a.clear(graphics.BLACK)
+    a.stroke_path(&path, &style, graphics.WHITE)
+    dot := graphics.red(at(&a, 9, 9))
+    assert(dot > 100 && dot < 255)
+    assert_eq(at(&a, 8, 9), graphics.BLACK)
+    assert_eq(at(&a, 4, 4), graphics.BLACK)
+
+    // Nothing is drawn by a stroke of no width.
+    zero := graphics.Stroke.new(-5)
+    assert_eq(zero.width(), 0)
+    zero.set_cap(graphics.LineCap.Round)
+    a.take_dirty()
+    a.stroke_path(&path, &zero, graphics.WHITE)
+    assert(clean(&a))
+    unstroked := graphics.Stroked.new(&path, &zero)
+    nothing := graphics.outline_bounds(&unstroked)
+    assert(nothing.is_empty())
+
+    // Strokes agree with the shapes drawn directly: a round-capped line
+    // with aa_thick_line, a one pixel square-capped line with aa_line, and
+    // a circle with aa_circle.
+    big_a_pixels := [0u8; 48 * 48 * 4]
+    big_b_pixels := [0u8; 48 * 48 * 4]
+    big_a := graphics.canvas(&mut big_a_pixels, 48, 48, graphics.PixelFormat.Rgba8888)!
+    big_b := graphics.canvas(&mut big_b_pixels, 48, 48, graphics.PixelFormat.Rgba8888)!
+    big_a.clear(graphics.BLACK)
+    big_b.clear(graphics.BLACK)
+    path.clear()
+    path.move_to(3 * 256 + 128, 40 * 256 + 128)
+    path.line_to(44 * 256 + 128, 9 * 256 + 128)
+    style = graphics.Stroke.new(5 * 256)
+    style.set_cap(graphics.LineCap.Round)
+    big_a.stroke_path(&path, &style, graphics.rgba(224, 108, 117, 200))
+    big_b.aa_thick_line(3, 40, 44, 9, 5, graphics.rgba(224, 108, 117, 200))
+    assert(largest_gap(&big_a, &big_b) <= 3)
+    big_a.clear(graphics.BLACK)
+    big_b.clear(graphics.BLACK)
+    path.clear()
+    path.move_to(5 * 256 + 128, 3 * 256 + 128)
+    path.line_to(30 * 256 + 128, 44 * 256 + 128)
+    style = graphics.Stroke.new(256)
+    style.set_cap(graphics.LineCap.Square)
+    big_a.stroke_path(&path, &style, graphics.WHITE)
+    big_b.aa_line(5, 3, 30, 44, graphics.WHITE)
+    assert(largest_gap(&big_a, &big_b) <= 2)
+    big_a.clear(graphics.BLACK)
+    big_b.clear(graphics.BLACK)
+    path.clear()
+    path.circle(23 * 256 + 128, 23 * 256 + 128, 18 * 256)
+    big_a.stroke_path(&path, &style, graphics.WHITE)
+    big_b.aa_circle(23, 23, 18, graphics.WHITE)
+    assert(largest_gap(&big_a, &big_b) <= 3)
+
+    // A gradient stroke paints only the stroke.
+    big_a.clear(graphics.BLACK)
+    shade := graphics.Gradient.linear(0, 0, 47, 0, graphics.RED, graphics.BLUE)
+    style = graphics.Stroke.new(4 * 256)
+    big_a.gradient_stroke_path(&path, &style, &shade)
+    assert_eq(at(&big_a, 23, 23), graphics.BLACK)
+    assert_eq(at(&big_a, 5, 23), shade.color_at(5, 23))
+    assert_eq(at(&big_a, 41, 23), shade.color_at(41, 23))
+
+    // Stroking a stroked outline strokes it once, by the outer style. Any
+    // outline can be stroked, but its open contours stay open: the
+    // triangle has no left side.
+    inner := graphics.Stroke.new(9 * 256)
+    shape := graphics.Stroked.new(&path, &inner)
+    big_a.clear(graphics.BLACK)
+    big_a.stroke_outline(&shape, &style, graphics.WHITE)
+    big_b.clear(graphics.BLACK)
+    big_b.stroke_path(&path, &style, graphics.WHITE)
+    assert(big_a.equals(&big_b))
+    // A TrueType glyph's closed contours stroke as outlined text: the
+    // stroke straddles the filled glyph's edges, leaving its interior.
+    font := truetype.Font.new(&TEST_FONT)!
+    glyph := font.glyph(2, 4 * 256, 40 * 256, 40)
+    big_a.clear(graphics.BLACK)
+    big_b.clear(graphics.BLACK)
+    big_b.fill_outline(&glyph, graphics.FillRule.NonZero, graphics.WHITE)
+    big_a.clear(graphics.BLACK)
+    style = graphics.Stroke.new(2 * 256)
+    big_a.stroke_outline(&glyph, &style, graphics.WHITE)
+    assert(!big_a.equals(&big_b) && count(&big_a, graphics.WHITE) > 0)
+    glyph_shape := graphics.Stroked.new(&glyph, &style)
+    glyph_bounds := graphics.outline_bounds(&glyph_shape)
+    plain_bounds := graphics.outline_bounds(&glyph)
+    assert(glyph_bounds.x < plain_bounds.x && glyph_bounds.y < plain_bounds.y)
+    assert(glyph_bounds.width > plain_bounds.width && glyph_bounds.height > plain_bounds.height)
+    style = graphics.Stroke.new(4 * 256)
+    triangle := Triangle { size: 30 * 256 }
+    big_a.clear(graphics.BLACK)
+    big_a.stroke_outline(&triangle, &style, graphics.WHITE)
+    assert_eq(at(&big_a, 10, 0), graphics.WHITE)
+    assert_eq(at(&big_a, 10, 2), graphics.BLACK)
+    assert_eq(at(&big_a, 15, 15), graphics.WHITE)
+    assert_eq(at(&big_a, 0, 20), graphics.BLACK)
+}
+
+// Strokes with more edges than a band holds, drawn whole, in clipped tiles
+// (which band, pass and cull differently), and through a coverage mask,
+// give the same pixels; huge strokes and dashes cost only what is visible.
+fn many_stroke_edges() {
+    a_pixels := [0u8; 64 * 24 * 4]
+    b_pixels := [0u8; 64 * 24 * 4]
+    a := graphics.canvas(&mut a_pixels, 64, 24, graphics.PixelFormat.Rgba8888)!
+    b := graphics.canvas(&mut b_pixels, 64, 24, graphics.PixelFormat.Rgba8888)!
+    storage := [0i32; 512]
+    path := graphics.Path.new(&mut storage)
+    zigzag(&mut path, 40)
+    assert(!path.overflowed())
+    for case in 0u32..4 {
+        style := graphics.Stroke.new(3 * 256 + 77)
+        if case == 1 {
+            style.set_join(graphics.LineJoin.Round)
+            style.set_cap(graphics.LineCap.Round)
+        } else if case == 2 {
+            style.set_join(graphics.LineJoin.Bevel)
+            style.set_cap(graphics.LineCap.Square)
+            pattern := [5i32 * 256, 2 * 256 + 50, 0, 3 * 256]
+            style.set_dashes(&pattern, 700)
+        } else if case == 3 {
+            style.set_cap(graphics.LineCap.Round)
+            pattern := [300i32, 200]
+            style.set_dashes(&pattern, 0)
+        }
+        color := graphics.rgba(230, 190, 90, 200)
+        a.reset_clip()
+        b.reset_clip()
+        a.clear(graphics.BLACK)
+        b.clear(graphics.BLACK)
+        a.stroke_path(&path, &style, color)
+        for ty in 0i32..3 {
+            for tx in 0i32..4 {
+                b.set_clip(graphics.Rect.new(tx * 19 - 3, ty * 11 - 4, 19, 11))
+                b.stroke_path(&path, &style, color)
+            }
+        }
+        assert(a.equals(&b))
+        assert(count(&a, graphics.BLACK) < 64 * 24)
+        // The same through a coverage mask.
+        shape := graphics.Stroked.new(&path, &style)
+        bounds := graphics.outline_bounds(&shape)
+        assert(bounds.x >= -5 && bounds.y >= -5 && bounds.width <= 72 && bounds.height <= 32)
+        mask := [0u8; 72 * 32]
+        graphics.coverage_mask(&shape, graphics.FillRule.NonZero, &mut mask, bounds.x, bounds.y, bounds.width, bounds.height)
+        b.reset_clip()
+        b.clear(graphics.BLACK)
+        b.fill_mask(&mask[..bounds.width as usize * bounds.height as usize], bounds.width, bounds.height, bounds.x, bounds.y, color)
+        assert(a.equals(&b))
+    }
+
+    // Wide dashed strokes running far past the canvas at an angle, whose
+    // dashes are skipped where they miss each pass.
+    for case in 0u32..3 {
+        path.clear()
+        path.move_to(-300 * 256, -90 * 256 + 77)
+        path.line_to(400 * 256, 140 * 256)
+        path.line_to(30 * 256, -200 * 256)
+        style := graphics.Stroke.new(23 * 256)
+        pattern := [700i32, 900, 0, 1300]
+        if case == 1 {
+            style.set_cap(graphics.LineCap.Round)
+            style.set_join(graphics.LineJoin.Round)
+        } else if case == 2 {
+            style.set_cap(graphics.LineCap.Square)
+            pattern[3] = 9000
+        }
+        style.set_dashes(&pattern, 333 * (case as i32))
+        color := graphics.rgba(90, 200, 230, 180)
+        a.reset_clip()
+        b.reset_clip()
+        a.clear(graphics.BLACK)
+        b.clear(graphics.BLACK)
+        a.stroke_path(&path, &style, color)
+        for ty in 0i32..3 {
+            for tx in 0i32..4 {
+                b.set_clip(graphics.Rect.new(tx * 17 - 2, ty * 9 - 1, 17, 9))
+                b.stroke_path(&path, &style, color)
+            }
+        }
+        assert(a.equals(&b))
+        assert(count(&a, graphics.BLACK) < 64 * 24)
+    }
+
+    // A stroke far wider than the canvas, with round caps and joins and
+    // dashes of one subpixel along segments 2^21 pixels long, draws in
+    // bounded time.
+    path.clear()
+    path.move_to(-536870912, 4000)
+    path.line_to(536870912, 4100)
+    path.line_to(-536870912, 536870912)
+    path.close()
+    huge := graphics.Stroke.new(2147483647)
+    huge.set_join(graphics.LineJoin.Round)
+    huge.set_cap(graphics.LineCap.Round)
+    a.clear(graphics.BLACK)
+    a.stroke_path(&path, &huge, graphics.WHITE)
+    assert_eq(count(&a, graphics.WHITE), 64u32 * 24)
+    tiny := [1i32, 1]
+    // Round caps close gaps this much narrower than the stroke: solid.
+    huge.set_dashes(&tiny, 0)
+    a.clear(graphics.BLACK)
+    a.stroke_path(&path, &huge, graphics.WHITE)
+    assert_eq(count(&a, graphics.WHITE), 64u32 * 24)
+    // Flat caps leave them open, half covering every pixel.
+    huge.set_cap(graphics.LineCap.Butt)
+    a.clear(graphics.BLACK)
+    a.stroke_path(&path, &huge, graphics.WHITE)
+    level := graphics.red(at(&a, 30, 10))
+    assert(level > 120 && level < 136)
+    thin := graphics.Stroke.new(512)
+    thin.set_dashes(&tiny, 1)
+    a.clear(graphics.BLACK)
+    a.stroke_path(&path, &thin, graphics.WHITE)
+    level = graphics.red(at(&a, 40, 15))
+    assert(level > 120 && level < 136)
+    far_shape := graphics.Stroked.new(&path, &thin)
+    far := graphics.outline_bounds(&far_shape)
+    assert(far.x < -2000000 && far.y == 14)
+}
+
+fn nearby(random: &mut Random) -> i32 {
+    return (random.next() % (90 * 256)) as i32 - 25 * 256
+}
+
+// Random strokes around the canvas give the same pixels drawn whole and in
+// clipped tiles, whatever the bands, passes and culling.
+fn random_strokes() {
+    a_pixels := [0u8; 40 * 30 * 4]
+    b_pixels := [0u8; 40 * 30 * 4]
+    a := graphics.canvas(&mut a_pixels, 40, 30, graphics.PixelFormat.Rgba8888)!
+    b := graphics.canvas(&mut b_pixels, 40, 30, graphics.PixelFormat.Rgba8888)!
+    path_storage := [0i32; 128]
+    path := graphics.Path.new(&mut path_storage)
+    random := Random { state: 0x12345 }
+    for _ in 0u32..400 {
+        path.clear()
+        commands := random.next() % 9 + 1
+        for _ in 0u32..commands {
+            kind := random.next() % 7
+            if kind <= 1 {
+                path.line_to(nearby(&mut random), nearby(&mut random))
+            } else if kind == 2 {
+                path.move_to(nearby(&mut random), nearby(&mut random))
+            } else if kind == 3 {
+                path.quad_to(nearby(&mut random), nearby(&mut random), nearby(&mut random), nearby(&mut random))
+            } else if kind == 4 {
+                path.cubic_to(nearby(&mut random), nearby(&mut random), nearby(&mut random), nearby(&mut random), nearby(&mut random), nearby(&mut random))
+            } else if kind == 5 {
+                path.close()
+            } else {
+                path.circle(nearby(&mut random), nearby(&mut random), (random.next() % 4000) as i32)
+            }
+        }
+        style := graphics.Stroke.new((random.next() % 4000) as i32)
+        join := random.next() % 3
+        if join == 1 {
+            style.set_join(graphics.LineJoin.Round)
+        } else if join == 2 {
+            style.set_join(graphics.LineJoin.Bevel)
+        }
+        cap := random.next() % 3
+        if cap == 1 {
+            style.set_cap(graphics.LineCap.Round)
+        } else if cap == 2 {
+            style.set_cap(graphics.LineCap.Square)
+        }
+        style.set_miter_limit(256 + random.next() % 3000)
+        if random.next() % 2 == 0 {
+            pattern := [(random.next() % 3000) as i32, (random.next() % 3000) as i32, (random.next() % 3000) as i32]
+            style.set_dashes(&pattern[..(random.next() % 3 + 1) as usize], (random.next() % 5000) as i32 - 2500)
+        }
+        color := graphics.rgba(250, 200, 100, 170)
+        a.reset_clip()
+        b.reset_clip()
+        a.clear(graphics.BLACK)
+        b.clear(graphics.BLACK)
+        a.stroke_path(&path, &style, color)
+        w := (random.next() % 15 + 3) as i32
+        h := (random.next() % 11 + 2) as i32
+        ty := 0i32
+        for ty * h < 30 {
+            tx := 0i32
+            for tx * w < 40 {
+                b.set_clip(graphics.Rect.new(tx * w, ty * h, w as u32, h as u32))
+                b.stroke_path(&path, &style, color)
+                tx += 1
+            }
+            ty += 1
+        }
+        assert(a.equals(&b))
+    }
+}
+
 fn vector_scene(canvas: &mut graphics.Canvas) {
     canvas.clear(graphics.hex(0x1d2330))
     canvas.aa_fill_circle(10, 12, 9, graphics.hex(0xe5c07b))
@@ -2212,7 +2766,7 @@ fn random_drawing() {
         if random.next() % 16 == 0 {
             canvas.set_clip(graphics.Rect.new(wild(&mut random), wild(&mut random), extent(&mut random), extent(&mut random)))
         }
-        operation := random.next() % 22
+        operation := random.next() % 23
         if operation == 0 {
             canvas.line(wild(&mut random), wild(&mut random), wild(&mut random), wild(&mut random), color)
         } else if operation == 1 {
@@ -2299,6 +2853,45 @@ fn random_drawing() {
             } else {
                 canvas.fill_path(&path, graphics.FillRule.EvenOdd, color)
             }
+        } else if operation == 22 {
+            path.clear()
+            commands := random.next() % 6
+            for _ in 0u32..commands {
+                kind := random.next() % 6
+                if kind == 0 {
+                    path.move_to(wild(&mut random), wild(&mut random))
+                } else if kind == 1 {
+                    path.line_to(wild(&mut random), wild(&mut random))
+                } else if kind == 2 {
+                    path.quad_to(wild(&mut random), wild(&mut random), wild(&mut random), wild(&mut random))
+                } else if kind == 3 {
+                    path.cubic_to(wild(&mut random), wild(&mut random), wild(&mut random), wild(&mut random), wild(&mut random), wild(&mut random))
+                } else if kind == 4 {
+                    path.close()
+                } else {
+                    path.round_rect(wild(&mut random), wild(&mut random), wild(&mut random), wild(&mut random), wild(&mut random))
+                }
+            }
+            style := graphics.Stroke.new(wild(&mut random))
+            choice := random.next() % 3
+            if choice == 1 {
+                style.set_join(graphics.LineJoin.Round)
+                style.set_cap(graphics.LineCap.Round)
+            } else if choice == 2 {
+                style.set_join(graphics.LineJoin.Bevel)
+                style.set_cap(graphics.LineCap.Square)
+            }
+            style.set_miter_limit(extent(&mut random))
+            if random.next() % 2 == 0 {
+                pattern := [wild(&mut random), wild(&mut random), wild(&mut random)]
+                style.set_dashes(&pattern[..(random.next() % 4) as usize], wild(&mut random))
+            }
+            if random.next() % 4 == 0 {
+                shade := graphics.Gradient.radial(wild(&mut random), wild(&mut random), extent(&mut random), color, random.next())
+                canvas.gradient_stroke_path(&path, &style, &shade)
+            } else {
+                canvas.stroke_path(&path, &style, color)
+            }
         } else if operation == 21 {
             shade := graphics.Gradient.linear(wild(&mut random), wild(&mut random), wild(&mut random), wild(&mut random), color, random.next())
             if random.next() % 2 == 0 {
@@ -2349,6 +2942,9 @@ fn main() {
     random_drawing()
     antialiasing()
     many_edges()
+    strokes()
+    many_stroke_edges()
+    random_strokes()
     gradients()
     gradient_walks()
     truetype_checks()

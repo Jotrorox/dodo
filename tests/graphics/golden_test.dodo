@@ -248,6 +248,94 @@ fn antialiased() {
     check("antialiased", &canvas)
 }
 
+// Stroked paths: the three joins and caps, a mitered and a beveled sharp
+// corner, dashes along a curve and around a closed rounded rectangle, dots,
+// a translucent stroke over itself, and a gradient stroke.
+@test
+fn strokes() {
+    pixels := [0u8; 96 * 64 * 4]
+    canvas := graphics.canvas(&mut pixels, 96, 64, graphics.PixelFormat.Rgba8888)!
+    canvas.clear(graphics.hex(0x1d2330))
+    storage := [0i32; 256]
+    path := graphics.Path.new(&mut storage)
+    hairline := graphics.Stroke.new(48)
+    for k in 0i32..3 {
+        x := (2 + k * 31) * 256
+        path.clear()
+        path.move_to(x + 512, 22 * 256)
+        path.line_to(x + 7 * 256, 7 * 256)
+        path.line_to(x + 14 * 256, 22 * 256)
+        path.line_to(x + 22 * 256, 10 * 256)
+        path.line_to(x + 27 * 256, 18 * 256)
+        style := graphics.Stroke.new(5 * 256)
+        if k == 1 {
+            style.set_join(graphics.LineJoin.Round)
+            style.set_cap(graphics.LineCap.Round)
+        } else if k == 2 {
+            style.set_join(graphics.LineJoin.Bevel)
+            style.set_cap(graphics.LineCap.Square)
+        }
+        canvas.stroke_path(&path, &style, graphics.hex(0x61afef))
+        canvas.stroke_path(&path, &hairline, graphics.hex(0xe06c75))
+    }
+    // A dash-dot curve with round caps.
+    path.clear()
+    path.move_to(4 * 256, 44 * 256)
+    path.cubic_to(16 * 256, 20 * 256, 30 * 256, 62 * 256, 44 * 256, 30 * 256)
+    dashed := graphics.Stroke.new(2 * 256 + 128)
+    dashed.set_cap(graphics.LineCap.Round)
+    dash_dot := [5i32 * 256, 3 * 256, 0, 3 * 256]
+    dashed.set_dashes(&dash_dot, 0)
+    canvas.stroke_path(&path, &dashed, graphics.hex(0xe5c07b))
+    // A closed dashed rounded rectangle whose first and last dashes join.
+    path.clear()
+    path.round_rect(52 * 256, 26 * 256, 40 * 256, 16 * 256, 5 * 256)
+    frame := graphics.Stroke.new(384)
+    pattern := [4i32 * 256, 2 * 256]
+    frame.set_dashes(&pattern, 2 * 256)
+    canvas.stroke_path(&path, &frame, graphics.hex(0x98c379))
+    // A sharp closed triangle, translucent: mitered, beveled past the limit.
+    path.clear()
+    path.move_to(5 * 256, 60 * 256)
+    path.line_to(19 * 256, 47 * 256 + 128)
+    path.line_to(29 * 256, 60 * 256)
+    path.close()
+    corner := graphics.Stroke.new(3 * 256)
+    canvas.stroke_path(&path, &corner, graphics.rgba(255, 255, 255, 170))
+    path.clear()
+    path.move_to(34 * 256, 61 * 256)
+    path.line_to(41 * 256, 46 * 256)
+    path.line_to(44 * 256, 61 * 256)
+    corner.set_miter_limit(512)
+    canvas.stroke_path(&path, &corner, graphics.hex(0xc678dd))
+    // A chart line with a gradient and round joins.
+    path.clear()
+    path.move_to(54 * 256, 60 * 256)
+    path.line_to(60 * 256, 50 * 256)
+    path.line_to(66 * 256, 55 * 256)
+    path.line_to(74 * 256, 46 * 256)
+    path.line_to(80 * 256, 52 * 256)
+    path.line_to(91 * 256, 45 * 256)
+    shade := graphics.Gradient.linear(54, 0, 91, 0, graphics.hex(0x56b6c2), graphics.hex(0xe06c75))
+    chart := graphics.Stroke.new(2 * 256)
+    chart.set_join(graphics.LineJoin.Round)
+    chart.set_cap(graphics.LineCap.Round)
+    canvas.gradient_stroke_path(&path, &chart, &shade)
+    // Dots: zero-length subpaths with round and square caps.
+    path.clear()
+    path.move_to(49 * 256, 50 * 256)
+    path.close()
+    dot := graphics.Stroke.new(3 * 256)
+    dot.set_cap(graphics.LineCap.Round)
+    canvas.stroke_path(&path, &dot, graphics.WHITE)
+    path.clear()
+    path.move_to(49 * 256, 57 * 256)
+    path.close()
+    dot.set_cap(graphics.LineCap.Square)
+    canvas.stroke_path(&path, &dot, graphics.WHITE)
+    check("strokes", &canvas)
+}
+
 // Linear and radial gradients with stops, spreads and dithering, on their
 // own and filling paths.
 @test
