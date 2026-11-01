@@ -54,6 +54,13 @@ pub(crate) struct Spec {
     generate: Generate,
 }
 
+// Derive names are unique in the registry.
+impl PartialEq for Spec {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+    }
+}
+
 pub(crate) static REGISTRY: &[&Spec] = &[&json::SPEC, &row::SPEC];
 
 pub(crate) fn find(name: &str) -> Option<&'static Spec> {
@@ -93,7 +100,7 @@ pub(crate) fn supported_attributes() -> String {
 }
 
 /// One derive-owned attribute as written in source.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Attribute {
     pub name: &'static str,
     pub value: Option<String>,

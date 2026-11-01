@@ -1631,8 +1631,8 @@ are unspecified. These storage rules do not constitute a C enum or C union ABI.
 Target scalar and aggregate alignment remain implementation-defined (ID-TARGET).
 
 Function attributes are `@test`, `@ignore("reason")`, `@interrupt(VECTOR)`
-(section 16.6), `@link_name("symbol")` (section 16.1), `@section("name")`, and
-`@align(N)` (section 16.5); statics
+(section 16.6), `@link_name("symbol")` (section 16.1), `@naked` (section 16.4),
+`@section("name")`, and `@align(N)` (section 16.5); statics
 accept `@section` and `@align`. Accepted struct attributes are `@repr(C)`, `@unsafe_send`, `@unsafe_sync`,
 `@derive(D, ...)` with the derives `Json` and `Row`, and `@json_deny_unknown`;
 the latter requires `@derive(Json)`. A derive may be listed once per struct,
@@ -1683,6 +1683,8 @@ newline, so each usually holds one instruction. Operands follow:
 | `in("r0") expression` | Pass it in exactly the named register. |
 | `out(reg) Type` | The template writes a value of `Type` to a register; the expression returns it. |
 | `inout(reg) expression` | Pass the value and return the register's final value, of the same type. |
+| `sym path` | Write the assembler name of the named function or static into the template. |
+| `const expression` | Write the value of an integer constant expression into the template, in decimal. |
 
 The template names operands `{0}`, `{1}`, ... in the order written, or `{}` for
 the next one; `{N:modifier}` applies a target operand modifier (letters only),
@@ -1691,6 +1693,19 @@ unmatched brace, or an empty modifier must be rejected. Operand values are
 integers no wider than the target pointer, raw pointers, or function pointers;
 other types must be rejected. One register must not serve two operands in the
 same direction, or both an output and a clobber.
+
+A `sym` path names a non-generic function, including a method or a C
+function, or a `static` or `static mut`, visible under the usual privacy
+rules; a `const`, an interface method, an interrupt handler (section 16.6), a
+local binding, or a generic function must be rejected. The template receives
+the symbol the linker sees, with any target prefix, such as Mach-O's leading
+underscore. A definition named by `sym` is kept in the output even when nothing
+else refers to it. The reference does not make it callable with any other
+convention: only C functions have a convention assembly can rely on (ABI-C).
+A `const` operand's expression is checked like a constant initializer, has an
+integer type, and its value is written as signed decimal text; such an
+operand takes no modifier. `sym` and `const` operands are not registers, add
+no inputs or outputs, and do not change the expression's type.
 
 The expression's type is `void` without outputs, the output's type with one, and
 a tuple of the output types in order with several. Inputs are evaluated once, in
@@ -1713,6 +1728,50 @@ every unlisted register as it found them. Template syntax is the target
 assembler's: LLVM's integrated assembler with unified syntax on Arm and AT&T
 syntax on x86 (ID-ASM). A template the assembler rejects must be reported as a
 compile error, not accepted silently.
+
+**ASM-GLOBAL.** Global assembly is a top-level declaration:
+
+```dodo
+unsafe asm(
+    ".globl {0}",
+    "{0}:",
+    "    adds r0, r0, #{1}",
+    "    bx lr",
+    sym add_three,
+    const 3,
+)
+unsafe extern "C" fn add_three(value: u32) -> u32
+```
+
+Its templates are joined as in ASM and passed to the target assembler as
+written outside any function. Blocks from one file keep their source order;
+the order between files and packages is unspecified. Its operands are only `sym` and `const`; register operands, clobbers,
+and options must be rejected. The `unsafe` modifier is required, and no other
+modifier or attribute applies. The section in effect when it begins is
+unspecified, so code and data in global assembly should select a section first.
+Code calls a function the assembly defines through an `extern "C"`
+prototype; it must not define a symbol that a Dodo declaration also defines.
+
+**ASM-NAKED.** `@naked` declares a function without a prologue or epilogue:
+
+```dodo
+@naked
+extern "C" fn read_stack_pointer() -> u32 {
+    unsafe {
+        asm("mov r0, sp", "bx lr")
+    }
+}
+```
+
+A naked function is a non-generic, top-level `extern "C"` function with a
+body; it cannot also be `async`, `@test`, `@interrupt`, or carry an inlining
+attribute. Its body is exactly one `unsafe { asm(...) }` whose operands are only
+`sym` and `const`, without clobbers or options; any other statement must be
+rejected. Parameters are not bindings: the assembly finds its arguments and
+places its result where the C calling convention (ABI-C) puts them, and returns
+by itself. Execution must not reach the end of the template. The function is
+never inlined, and calls to it are calls of a C function. `@section` and
+`@align` apply as to other functions.
 
 ### 16.5. Placement attributes
 
@@ -1961,7 +2020,9 @@ import-decl   = "import", string-literal, [ "as", identifier ], newline ;
 
 declaration   = { attribute }, [ "pub" ],
                 ( function-decl | struct-decl | enum-decl | alias-decl )
-              | { attribute }, const-decl ;
+              | { attribute }, const-decl
+              | global-asm ;
+global-asm    = "unsafe", inline-asm, newline ;
 attribute     = "@", identifier, [ "(", attribute-argument, ")" ], [ newline ] ;
 alias-decl    = "type", identifier, [ type-params ], "=", type, newline ;
 const-decl    = ( "const" | "static", [ "mut" ] ), identifier, ":", type, "=",
@@ -2046,6 +2107,8 @@ inline-asm    = "asm", "(", string-literal, { ",", string-literal },
                 { ",", asm-operand }, [ "," ], ")" ;
 asm-operand   = ( "in" | "inout" ), "(", asm-register, ")", expression
               | "out", "(", asm-register, ")", type
+              | "sym", identifier, { ".", identifier }
+              | "const", expression
               | "clobber", "(", string-literal, { ",", string-literal }, ")"
               | "options", "(", identifier, { ",", identifier }, ")" ;
 asm-register  = "reg" | string-literal ;
@@ -2075,7 +2138,7 @@ A compiler claiming Dodo 0.1 conformance must, at minimum:
 - Trap on safe overflow, division by zero, invalid shifts, and invalid indexing
   in every build profile.
 - Preserve volatile-access semantics.
-- Check inline assembly operands and templates, and keep its declared effects.
+- Check inline, global, and naked assembly operands and templates, and keep the declared effects of inline assembly.
 - Export interrupt handlers under their vector names and reject direct calls.
 - Avoid a mandatory garbage collector, heap, scheduler, or exception runtime
   when the program does not request one.
@@ -2135,6 +2198,7 @@ execution cases and enforced static boundaries are identified separately.
 | CORE-MMIO, sections 15.2–15.3 | T `compiler::gpio_emits_volatile_accesses_without_host_execution`; R `sema::mmio_checked`; board address/width legality remains an unsafe precondition. |
 | CORE-CPU, section 15.4 | R `sema::cpu_operations_checked`; T `hal_library::interrupt_control_lowers_to_each_architecture_mask`; E `hal_library::core1_launch_and_shared_parts_execute_against_a_simulated_boot_rom`; R/T `hal_library::freestanding_targets_without_an_interrupt_model_are_rejected`; E `hal_library::registers_protocols_and_fakes_execute_on_the_host`. |
 | ASM, ASM-EFFECT | E `firmware_attributes::inline_assembly_runs_on_the_host`; R `firmware_attributes::inline_assembly_mistakes_are_diagnosed`; T `firmware_attributes::firmware_uses_inline_assembly_and_the_cortex_m_package`; A `sema::asm::tests::templates_number_outputs_before_inputs`, `parser::tests::firmware_attributes_and_inline_assembly`. |
+| ASM-GLOBAL, ASM-NAKED, `sym` and `const` operands | E `firmware_attributes::global_and_naked_assembly_run_on_the_host`; R `firmware_attributes::global_and_naked_assembly_mistakes_are_diagnosed`; T `firmware_attributes::firmware_uses_global_and_naked_assembly`; A `sema::asm::tests::text_operands_are_written_into_the_template`, `parser::tests::global_and_naked_assembly`. |
 | PLACE | T `firmware_attributes::sections_and_alignment_place_code_and_data`; R `firmware_attributes::placement_mistakes_are_diagnosed`. |
 | IRQ | T `firmware_attributes::interrupt_handlers_fill_the_vector_table`, `riscv_interrupt_handlers_return_with_mret`; R `firmware_attributes::interrupt_handler_mistakes_are_diagnosed`; A `hardware::tests::interrupt_names_match_the_runtime_vector_tables`. |
 | ABI-C | E `spec::c_scalar_results_and_struct_pointer_layout_interoperate`, `spec::c_structs_pass_and_return_by_value_across_the_c_abi`, `spec::c_struct_classification_follows_each_target_abi`, `spec::link_name_prototypes_lower_c_structs_with_their_own_signature`; R `spec::incompatible_lowered_foreign_declarations_fail_before_linking`; E `regressions::foreign_narrow_integer_arguments_follow_the_c_abi`, `compiler::hello_uses_native_c_abi`, `imported_foreign_declarations_keep_their_c_symbol_name`, `repeated_foreign_declarations_across_packages_share_a_c_symbol`; E/R `spec::hosted_entry_signatures_and_c_definitions`; R `spec::unsafe_pointer_conversions_and_unsupported_abi_are_rejected`. |
@@ -2169,7 +2233,7 @@ tests constrain the documented choice, not every possible conforming choice.
 | ID-RUNTIME: startup and linking | Hosted builds use a native C linker driver. Importing std/env initializes its argument runtime from the C main arguments before source main; other library facilities initialize through explicit calls. Raw object/IR emission supplies no startup. Freestanding startup, linker scripts, system libraries, and OS exit-status encoding are supplied by the target/toolchain. Evidence: `spec::hosted_entry_signatures_and_c_definitions` (A/R/E), `tests/env_library.rs` (E), `compiler::emits_llvm_ir_bitcode_assembly_and_object_files` (T). |
 | ID-TRAP: failure mechanism | `--panic auto` writes the check kind, file, line, and column to stderr and calls C `abort` on supported hosted targets; other targets use `llvm.trap`, which may itself lower to C `abort`. `--panic hosted`, `--panic trap`, and `--panic-hook SYMBOL` select behavior explicitly for checked operations and ordinary assertions. The non-returning C ABI hook receives static NUL-terminated check/file strings and u32 line/column and owns termination without a fallback trap; returning is undefined behavior. The hosted test runner uses its own reporting and trap behavior. No mode unwinds, runs destructors, or supplies a reset driver. Instruction, signal/exception, and exit encoding are target-specific. Evidence: `tests/debugging.rs`, `compiler::arithmetic_and_index_traps_survive_optimization`, `spec::checked_float_cast_boundaries_trap` (E/T). |
 | ID-HW: device access and atomics | MMIO widths are restricted as in CORE-MMIO and use volatile loads/stores; board address legality is an unsafe precondition. CORE-CPU masks PRIMASK on bare-metal Arm M-profile targets and `mstatus.MIE` on bare-metal RISC-V (machine mode); hosted Linux, Windows, Apple, BSD, Android, and WASI targets have no program-visible mask, so masking and waiting are no-ops there and `core_id` is 0; `core_id` reads `mhartid` on RISC-V and calls the chip runtime's weakly referenced `dodo_core_id` on Cortex-M, 0 without one; other targets reject reachable masking or waiting after dead-code elimination. Native integer atomic capabilities/orderings are target-restricted; unsupported operations are diagnosed, with no implicit libatomic fallback. Evidence: `compiler::gpio_emits_volatile_accesses_without_host_execution` (T), `tests/thread_library.rs::atomic_ordering_and_target_capabilities_are_checked` (R/T). |
-| ID-ASM: inline assembly syntax | Templates are assembled by LLVM 23's integrated assembler for the selected target: unified syntax on Arm and Thumb, AT&T syntax on x86. `reg` is the general-purpose register class (`r` constraint); a named register is passed to LLVM as `{name}`. Every template is a memory barrier unless `options(nomem)`, and also clobbers the condition flags (`cc` on Arm and AArch64; `flags`, `fpsr`, and `dirflag` on x86). Assembler errors are reported as compile errors with the assembler's message. Evidence: `firmware_attributes::inline_assembly_runs_on_the_host` (E), `inline_assembly_mistakes_are_diagnosed` (R). |
+| ID-ASM: inline assembly syntax | Templates are assembled by LLVM 23's integrated assembler for the selected target: unified syntax on Arm and Thumb, AT&T syntax on x86. `reg` is the general-purpose register class (`r` constraint); a named register is passed to LLVM as `{name}`. Every template is a memory barrier unless `options(nomem)`, and also clobbers the condition flags (`cc` on Arm and AArch64; `flags`, `fpsr`, and `dirflag` on x86). Assembler errors are reported as compile errors with the assembler's message. Global assembly becomes LLVM module-level assembly, appended in package load order; on Arm it starts in unified syntax and in the target's instruction set (Thumb on M-profile). Naked functions carry LLVM's `naked` and `noinline` attributes and contain only their template. `sym` writes the symbol's LLVM name with the data layout's global prefix (an underscore on Mach-O and 32-bit Windows), quoted when it is not a plain assembler identifier, and lists definitions in `llvm.used`; Dodo-convention functions keep the ID-NATIVE calling convention. Evidence: `firmware_attributes::inline_assembly_runs_on_the_host` (E), `inline_assembly_mistakes_are_diagnosed` (R), `global_and_naked_assembly_run_on_the_host` (E), `firmware_uses_global_and_naked_assembly` (T). |
 | ID-PLACE: sections and interrupts | Section names are passed to the object file unchanged, and placed definitions are listed in `llvm.used`. The RP2040 and RP2350 linker scripts copy `.ramfunc` sections to SRAM with `.data`, and keep `.noinit` sections in SRAM without loading or zeroing them. Interrupt handlers use the C calling convention on Arm M-profile targets, whose hardware saves the caller-saved registers, and the machine-mode interrupt convention (`mret`) on bare-metal RISC-V. Chip vector names are those of `std/embedded/chip/NAME`'s runtime vector table. Evidence: `firmware_attributes::sections_and_alignment_place_code_and_data`, `interrupt_handlers_fill_the_vector_table`, `riscv_interrupt_handlers_return_with_mret` (T). |
 | ID-LIMIT: resource limits | Parser nesting: 64 levels. Constant dependency depth: 128; expansion work: 200,000 nodes. Array count must fit target usize and u32; nonzero repeated constants are limited to 1,000,000 elements. Generic instantiation: 4,096 specializations and 64 nested specializations (including generated methods). Pattern expansion: 4096 alternatives; exhaustiveness work has a 131,072-unit budget (charged for matrix rows and type columns); exhaustion must diagnose, not assume coverage. Evidence: `compiler::generic_specialization_breadth_and_depth_have_separate_limits` (R), `compiler::constant_cycles_width_and_expansion_limits_are_diagnosed` (R), `sema::excessive_pattern_expansion_reports_a_diagnostic` (R), `compiler::new_forms_reject_invalid_types_moves_lifetimes_and_unhandled_errors` (R). |
 | ID-DIAG: diagnostic presentation | Errors identify a source location where available. Text wording, ordering, number of follow-on errors, and CLI/LSP presentation are not a stable machine-readable language ABI. Editor transport is separately documented. Evidence: `tests/diagnostics.rs`, `tests/lsp.rs`, `package::diagnostic_labels_resolve_each_file_independently` (A/R). |
@@ -2178,8 +2242,8 @@ tests constrain the documented choice, not every possible conforming choice.
 
 Specialization, user lifetime/variance syntax, standalone
 partial field moves, a package registry, package initializers, re-exports,
-variadic C calls, C unions or arrays by value, user export attributes, assembly outside
-functions (global or naked assembly), and panic-handler registration are not
+variadic C calls, C unions or arrays by value, user export attributes, and
+panic-handler registration are not
 part of 0.1. The compiler must reject syntax presented as these features rather
 than assign it an undocumented meaning. Checked mutable slice splitting is
 available through `core/slice.split_at_mut` and its compiler-recognized

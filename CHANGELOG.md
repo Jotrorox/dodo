@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Global and naked assembly. Top-level `unsafe asm("...")` is emitted into
+  the object file outside any function, for startup code, functions written
+  entirely in assembly, or tables. `@naked` marks an `extern "C"` function
+  whose body is one `unsafe { asm(...) }` and which has no prologue or
+  epilogue, such as a fault handler that reads the stacked frame. Assembly
+  of every kind takes two new operands: `sym name` writes the link symbol
+  of a function or static into the template (with Mach-O's underscore, and
+  keeping the definition even when only assembly uses it), and `const value`
+  writes an integer constant expression. See
+  [global assembly](docs/src/content/docs/memory-and-ffi.md#global-assembly)
+  and [naked functions](docs/src/content/docs/memory-and-ffi.md#naked-functions).
 - Fixed: a struct field named `len` failed code generation ("is not an
   array or slice") because every `.len` was compiled as a collection length.
   `len` is now the built-in length only on arrays, slices and strings.

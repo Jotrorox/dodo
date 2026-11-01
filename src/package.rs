@@ -1011,6 +1011,7 @@ fn append(target: &mut Program, mut source: Program) {
     target.constants.append(&mut source.constants);
     target.interfaces.append(&mut source.interfaces);
     target.aliases.append(&mut source.aliases);
+    target.global_asm.append(&mut source.global_asm);
 }
 
 // Only generated functions can mention a fresh implicit alias. Reuse the AST
@@ -1148,6 +1149,10 @@ fn namespace(
         if let Some(body) = &mut function.body {
             names.block(body, &mut locals, &generics);
         }
+    }
+    for global in &mut program.global_asm {
+        global.namespace = prefix.to_owned();
+        names.asm(&mut global.asm, &BTreeSet::new(), &BTreeSet::new());
     }
     let missing = names.missing_imports.into_inner();
     if !missing.is_empty() {
@@ -1370,15 +1375,19 @@ impl Names<'_> {
                     self.expr(argument, locals, generics);
                 }
             }
-            ExprKind::Asm(asm) => {
-                for (ty, _) in asm.output_types_mut() {
-                    self.scoped_ty(ty, locals, generics);
-                }
-                for value in asm.inputs_mut() {
-                    self.expr(value, locals, generics);
-                }
-            }
+            ExprKind::Asm(asm) => self.asm(asm, locals, generics),
             _ => {}
+        }
+    }
+    fn asm(&self, asm: &mut InlineAsm, locals: &BTreeSet<String>, generics: &BTreeSet<String>) {
+        for (ty, _) in asm.output_types_mut() {
+            self.scoped_ty(ty, locals, generics);
+        }
+        for value in asm.inputs_mut() {
+            self.expr(value, locals, generics);
+        }
+        for path in asm.symbols_mut() {
+            *path = self.name(path, locals);
         }
     }
     fn pattern(&self, pattern: &mut Pattern, generics: &BTreeSet<String>) {
@@ -1581,6 +1590,18 @@ fn shift_program(program: &mut Program, offset: usize) {
     for function in &mut program.functions {
         shift_function(function, offset);
     }
+    for global in &mut program.global_asm {
+        shift_asm(&mut global.asm, offset);
+    }
+}
+fn shift_asm(asm: &mut InlineAsm, offset: usize) {
+    shift(&mut asm.span, offset);
+    for operand in &mut asm.operands {
+        shift(&mut operand.span, offset);
+    }
+    for value in asm.inputs_mut() {
+        shift_expr(value, offset);
+    }
 }
 fn shift_expr(expression: &mut Expr, offset: usize) {
     shift(&mut expression.span, offset);
@@ -1641,15 +1662,7 @@ fn shift_expr(expression: &mut Expr, offset: usize) {
                 shift_expr(argument, offset);
             }
         }
-        ExprKind::Asm(asm) => {
-            shift(&mut asm.span, offset);
-            for operand in &mut asm.operands {
-                shift(&mut operand.span, offset);
-            }
-            for value in asm.inputs_mut() {
-                shift_expr(value, offset);
-            }
-        }
+        ExprKind::Asm(asm) => shift_asm(asm, offset),
         _ => {}
     }
 }

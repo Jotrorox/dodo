@@ -424,6 +424,7 @@ conflicting aliases. Prefer passing state explicitly or using
 | `@align(N)` | Function or `static`: align it to `N` bytes, a power of two. |
 | `@inline`, `@inline(never)` | Function with a body: optimized builds inline it into every caller where possible, or never. |
 | `@cold` | Function with a body: rarely executed; never inlined, and optimized builds treat paths that call it as unlikely. |
+| `@naked` | `extern "C"` function whose body is one `unsafe { asm(...) }`: no prologue or epilogue; see [naked functions](memory-and-ffi.md#naked-functions). |
 
 `@compiler(print)`, `@compiler(println)`, and `@compiler(printf)` are reserved for
 bundled printing declarations, and `@compiler(pio)` for the
@@ -436,5 +437,6 @@ type checking, borrow checking, or checked indexing. An `unsafe fn` requires
 callers to satisfy its documented preconditions, and its body still needs
 explicit unsafe blocks around unchecked operations. `extern "C" fn` declares or
 defines a C-ABI function. `asm("template", operands...)` is inline assembly
-and needs an unsafe block. The complete rules and examples are in
+and needs an unsafe block; `unsafe asm(...)` at the top level of a file is
+[global assembly](memory-and-ffi.md#global-assembly). The complete rules and examples are in
 [memory and foreign calls](memory-and-ffi.md).
