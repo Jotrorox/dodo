@@ -58,6 +58,11 @@ fn io_c_length(s: &[u8]) -> usize {
     return s.len
 }
 
+// s up to its first NUL (how C functions and messages see it).
+fn io_c_str(s: &[u8]) -> &[u8] from(s) {
+    return s[0..io_c_length(s)]
+}
+
 // --- Handles ----------------------------------------------------------------
 
 // Push a new handle that is still closed (no stream yet).
@@ -264,27 +269,23 @@ fn io_read_number(cx: &mut Cx, f: *mut u8) -> bool!Throw {
 fn io_read_line(cx: &mut Cx, f: *mut u8, chop: bool) -> bool!Throw {
     unsafe {
         b := Buffer.new(cx)
-        c := 0i32
+        last := 0i32
+        chunk := 128usize
         for {
-            let p = b.prepare(256)?
-            i := 0usize
-            for i < 256 {
-                c = getc(f)
-                if c == IO_EOF || c == 10 {
-                    break
-                }
-                *ptr.offset(p, i as isize) = c as u8
-                i += 1
-            }
-            b.add_size(i)
-            if i < 256 {
+            let p = b.prepare(chunk)?
+            let n = script_host.dodo_script_read_line(f, p, chunk, ptr.from_mut(&mut last))
+            b.add_size(n)
+            if last != 0 {
                 break
             }
+            if chunk < 65536 {
+                chunk = chunk * 2
+            }
         }
-        if c == 10 && !chop {
+        if last == 10 && !chop {
             b.add_char(10)?
         }
-        let got = c == 10 || b.size() > 0
+        let got = last == 10 || b.size() > 0
         b.push_result(cx)?
         return ok(got)
     }
@@ -599,7 +600,7 @@ fn io_open(cx: &mut Cx) -> i32!Throw {
         script_host.dodo_script_clear_errno()
         (*p).f = fopen(name.as_ptr(), mode.as_ptr())
         if ptr.is_null((*p).f) {
-            return cx.file_result(false, some(name.bytes()))
+            return cx.file_result(false, some(io_c_str(name.bytes())))
         }
         return ok(1)
     }
@@ -617,7 +618,7 @@ fn io_popen(cx: &mut Cx) -> i32!Throw {
         (*p).f = script_host.dodo_script_popen(prog.as_ptr(), mode.as_ptr())
         (*p).kind = IO_KIND_PIPE
         if ptr.is_null((*p).f) {
-            return cx.file_result(false, some(prog.bytes()))
+            return cx.file_result(false, some(io_c_str(prog.bytes())))
         }
         return ok(1)
     }

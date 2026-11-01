@@ -56,6 +56,23 @@ int64_t dodo_script_tell(FILE *f) {
 #endif
 }
 
+/* Read bytes up to (not including) a newline into out[0..capacity) and
+ * return how many were stored. *last is '\n' or EOF when the line ended, or
+ * 0 when out filled up first. The stream stays locked for the whole run. */
+size_t dodo_script_read_line(FILE *f, char *out, size_t capacity, int32_t *last) {
+    size_t n = 0;
+    int c = 0;
+#if defined(_WIN32)
+    while (n < capacity && (c = getc(f)) != EOF && c != '\n') out[n++] = (char)c;
+#else
+    flockfile(f);
+    while (n < capacity && (c = getc_unlocked(f)) != EOF && c != '\n') out[n++] = (char)c;
+    funlockfile(f);
+#endif
+    *last = n == capacity ? 0 : c;
+    return n;
+}
+
 /* mode: 0 unbuffered, 1 fully buffered, 2 line buffered. */
 int32_t dodo_script_setvbuf(FILE *f, int32_t mode, size_t size) {
     int m = mode == 0 ? _IONBF : mode == 1 ? _IOFBF : _IOLBF;
