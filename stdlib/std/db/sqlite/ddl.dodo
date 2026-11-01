@@ -606,13 +606,13 @@ fn exec_alter(e: &mut Engine, s: usize) -> void!db.Error {
             msg_add_ws(e, cd_a2, cd_b2)
             return err(make_error(e, SQLITE_ERROR))
         }
-        close := sqll
-        for close > 0 && e.ws[sql + close - 1] != 41 {
-            close -= 1
-        }
-        if close == 0 {
+        // SQLite inserts the column after the last column definition,
+        // before any table constraints.
+        let (_, _, col_end) = table_items(e, sql, sqll, NO_COL - 1)
+        if col_end == 0 {
             return err(corrupt(e))
         }
+        close := col_end - sql + 1
         start := nff(e, s)
         end := ng(e, s)
         add := end - start
@@ -677,6 +677,12 @@ fn exec_alter(e: &mut Engine, s: usize) -> void!db.Error {
         }
         return schema_changed(e)
     }
+    if op == 4 {
+        check_schema_resolves(e)?
+        let co2 = ne_(e, s)
+        let cl2 = nff(e, s)
+        return drop_column(e, t, co2, cl2)
+    }
     err(fail(e, SQLITE_ERROR, "unsupported ALTER TABLE"))
 }
 
@@ -725,4 +731,325 @@ fn rename_tokens(e: &mut Engine, o: usize, l: usize, old: usize, ol: usize, new_
         }
     }
     ok((cur_o, cur_l))
+}
+
+// ---------------------------------------------------------------------------
+// Column list geometry of CREATE TABLE text, as SQLite's ALTER TABLE uses
+// it: the start of column `want`'s name token, the start of the next
+// column's name token (0 for the last column), and the end of the column
+// definitions (the comma before the first table constraint, or the closing
+// parenthesis).
+fn table_items(e: &mut Engine, o: usize, l: usize, want: usize) -> (usize, usize, usize) {
+    e.src = o
+    e.src_end = o + l
+    e.pos = o
+    e.ts = o
+    e.tl = 0
+    e.last_end = o
+    next_token(e)
+    for e.tk != TK_EOF && e.tk != TK_LP {
+        next_token(e)
+    }
+    if e.tk == TK_EOF {
+        return (0usize, 0usize, 0usize)
+    }
+    next_token(e)
+    depth := 0usize
+    item := 0usize
+    at_start := true
+    want_start := 0usize
+    next_start := 0usize
+    last_sep := 0usize
+    for e.tk != TK_EOF {
+        if at_start {
+            at_start = false
+            constraint := e.tk == TK_ID && (is_kw(e, "CONSTRAINT") || is_kw(e, "PRIMARY") || is_kw(e, "UNIQUE") || is_kw(e, "CHECK") || is_kw(e, "FOREIGN"))
+            if constraint {
+                return (want_start, next_start, last_sep)
+            }
+            if item == want {
+                want_start = e.ts
+            } else if item == want + 1 {
+                next_start = e.ts
+            }
+            item += 1
+        }
+        if e.tk == TK_LP {
+            depth += 1
+        } else if e.tk == TK_RP {
+            if depth == 0 {
+                return (want_start, next_start, e.ts)
+            }
+            depth -= 1
+        } else if e.tk == TK_COMMA && depth == 0 {
+            last_sep = e.ts
+            at_start = true
+        }
+        next_token(e)
+    }
+    (want_start, next_start, 0usize)
+}
+
+// True when nodes (lo, e.node_n] contain a reference to column `name`.
+fn nodes_reference(e: &Engine, lo: usize, name: usize, nl: usize) -> bool {
+    for n in (lo + 1)..(e.node_n + 1) {
+        if nkind(e, n) == N_ID {
+            let no = na(e, n)
+            let nn = nb(e, n)
+            if names_eq(e, no, nn, name, nl) {
+                return true
+            }
+        }
+    }
+    false
+}
+
+// True when a FOREIGN KEY(...) column list in CREATE TABLE text names
+// `name`.
+fn foreign_key_uses(e: &mut Engine, o: usize, l: usize, name: usize, nl: usize) -> bool {
+    e.src = o
+    e.src_end = o + l
+    e.pos = o
+    e.ts = o
+    e.tl = 0
+    e.last_end = o
+    next_token(e)
+    for e.tk != TK_EOF {
+        if e.tk == TK_ID && is_kw(e, "FOREIGN") {
+            next_token(e)
+            if e.tk == TK_ID && is_kw(e, "KEY") {
+                next_token(e)
+                if e.tk == TK_LP {
+                    next_token(e)
+                    for e.tk != TK_EOF && e.tk != TK_RP {
+                        if e.tk == TK_ID || e.tk == TK_QID {
+                            io := if e.tk == TK_ID {
+                                e.ts
+                            } else {
+                                e.ts + 1
+                            }
+                            il := if e.tk == TK_ID {
+                                e.tl
+                            } else {
+                                e.tl - 2
+                            }
+                            if names_eq(e, io, il, name, nl) {
+                                return true
+                            }
+                        }
+                        next_token(e)
+                    }
+                }
+            }
+            continue
+        }
+        next_token(e)
+    }
+    false
+}
+
+fn drop_error(e: &mut Engine, what: &str, oname: usize, onl: usize, col: usize, cl: usize) -> db.Error {
+    e.msg_len = 0
+    msg_add(e, "error in ")
+    msg_add(e, what)
+    msg_add(e, " ")
+    msg_add_ws(e, oname, onl)
+    msg_add(e, " after drop column: no such column: ")
+    msg_add_ws(e, col, cl)
+    make_error(e, SQLITE_ERROR)
+}
+
+// Resolves a view's SELECT against the current schema (used to validate
+// schema changes). Resolution state of the running statement is kept.
+fn check_view(e: &mut Engine, v: usize) -> void!db.Error {
+    save_cur := e.cur_alloc
+    save_reg := e.reg_alloc
+    save_ctx_n := e.ctx_n
+    save_ctx := e.ctx_off
+    save_agg := e.agg_list
+    save_aggn := e.agg_n
+    save_subq := e.subq_list
+    save_subqn := e.subq_n
+    save_cte := e.cte_off
+    save_cten := e.cte_n
+    save_min := e.min_ctx
+    save_rt := e.regctx_t
+    save_nodes := e.node_n
+    save_pool := e.pool_lo
+    e.cur_alloc = 0
+    e.reg_alloc = e.rtop
+    e.ctx_n = 0
+    e.agg_list = 0
+    e.agg_n = 0
+    e.subq_list = 0
+    e.subq_n = 0
+    e.cte_off = 0
+    e.cte_n = 0
+    e.min_ctx = NO_COL
+    e.regctx_t = NO_COL
+    res := check_view_inner(e, v)
+    e.cur_alloc = save_cur
+    e.reg_alloc = save_reg
+    e.ctx_n = save_ctx_n
+    e.ctx_off = save_ctx
+    e.agg_list = save_agg
+    e.agg_n = save_aggn
+    e.subq_list = save_subq
+    e.subq_n = save_subqn
+    e.cte_off = save_cte
+    e.cte_n = save_cten
+    e.min_ctx = save_min
+    e.regctx_t = save_rt
+    e.node_n = save_nodes
+    e.pool_lo = save_pool
+    res
+}
+
+fn check_view_inner(e: &mut Engine, v: usize) -> void!db.Error {
+    let ctx = pool_alloc(e, 16 * 8)?
+    e.ctx_off = ctx
+    let (sel, _) = view_select(e, v)?
+    resolve_select(e, sel)
+}
+
+// ALTER TABLE ... DROP COLUMN: edits the CREATE TABLE text the way SQLite
+// does, checks that nothing else refers to the column, and rewrites every
+// row without it.
+fn drop_column(e: &mut Engine, t: usize, co: usize, cl: usize) -> void!db.Error {
+    name := obj_u(e, t, O_NAME)
+    nl := obj_u(e, t, O_NAMEL)
+    sql := obj_u(e, t, O_SQL)
+    sqll := obj_u(e, t, O_SQLL)
+    c := find_column(e, t, co, cl)
+    if c == NO_COL {
+        e.msg_len = 0
+        msg_add(e, "no such column: \"")
+        msg_add_ws(e, co, cl)
+        msg_add(e, "\"")
+        return err(make_error(e, SQLITE_ERROR))
+    }
+    flags := col_flags(e, t, c)
+    if (flags & CF_PK) != 0 || (flags & CF_UNIQUE) != 0 {
+        e.msg_len = 0
+        if (flags & CF_PK) != 0 {
+            msg_add(e, "cannot drop PRIMARY KEY column: \"")
+        } else {
+            msg_add(e, "cannot drop UNIQUE column: \"")
+        }
+        msg_add_ws(e, co, cl)
+        msg_add(e, "\"")
+        return err(make_error(e, SQLITE_ERROR))
+    }
+    ncol := obj_ncol(e, t)
+    if ncol <= 1 {
+        e.msg_len = 0
+        msg_add(e, "cannot drop column \"")
+        msg_add_ws(e, co, cl)
+        msg_add(e, "\": no other columns exist")
+        return err(make_error(e, SQLITE_ERROR))
+    }
+    let (a, b, end) = table_items(e, sql, sqll, c)
+    if a == 0 || end == 0 {
+        return err(corrupt(e))
+    }
+    start := a
+    stop := b
+    if c == ncol - 1 {
+        // The last column takes the comma before it.
+        for start > sql && e.ws[start] != 44 {
+            start -= 1
+        }
+        stop = end
+    }
+    len := sqll - (stop - start)
+    ns := arena_alloc(e, len)?
+    move_bytes(e.ws, sql, ns, start - sql)
+    move_bytes(e.ws, stop, ns + (start - sql), sql + sqll - stop)
+    // Nothing else in the table definition may use the column.
+    lo := e.node_n
+    match parse_fragment_stmt(e, ns, len) {
+        ok(_) => {},
+        err(reason) => {
+            e.node_n = lo
+            return err(reason)
+        },
+    }
+    uses := nodes_reference(e, lo, co, cl) || foreign_key_uses(e, ns, len, co, cl)
+    e.node_n = lo
+    if uses {
+        return err(drop_error(e, "table", name, nl, co, cl))
+    }
+    for j in 0usize..e.schema_objs {
+        if obj_type(e, j) != OT_INDEX || obj_u(e, j, O_TABLE) != t || obj_u(e, j, O_SQLL) == 0 {
+            continue
+        }
+        let isql = obj_u(e, j, O_SQL)
+        let isqll = obj_u(e, j, O_SQLL)
+        lo2 := e.node_n
+        parse_fragment_stmt(e, isql, isqll)?
+        used := nodes_reference(e, lo2, co, cl)
+        e.node_n = lo2
+        if used {
+            let iname = obj_u(e, j, O_NAME)
+            let inl = obj_u(e, j, O_NAMEL)
+            return err(drop_error(e, "index", iname, inl, co, cl))
+        }
+    }
+    // Rewrite the rows first, while the catalog still describes them.
+    root := obj_root(e, t)
+    cur := SCHEMA_CUR - 1
+    cur_open(e, cur, root, false)
+    save := e.rtop
+    base := e.rtop
+    for _ in 0usize..ncol {
+        reg_push(e)?
+    }
+    ipk := rowid_col(e, t)
+    more := cur_first(e, cur)?
+    for more {
+        mark := e.arena_top
+        rowid := cur_rowid(e, cur)
+        let (p, n) = cur_payload(e, cur)?
+        k := 0usize
+        for i in 0usize..ncol {
+            if i == c {
+                continue
+            }
+            if i == ipk {
+                set_null(e, base + k)
+            } else if !record_column(e, p, n, i, base + k)? {
+                column_default(e, t, i, base + k)?
+            }
+            reg_own(e, base + k)?
+            k += 1
+        }
+        size := record_size(e, base, ncol - 1)
+        rec := arena_alloc(e, size)?
+        record_write(e, base, ncol - 1, rec)
+        table_insert(e, cur, rowid, rec, size)?
+        arena_reset(e, mark)
+        seek_rowid(e, cur, rowid)?
+        more = cur_next(e, cur)?
+    }
+    e.rtop = save
+    let schema_rowid = obj_u(e, t, O_ROWNO) as i64
+    schema_update(e, schema_rowid, name, nl, name, nl, ns, len, false)?
+    schema_changed(e)
+}
+
+// Like SQLite, ALTER TABLE first checks that the existing schema resolves;
+// a view broken by an earlier change blocks further alterations.
+fn check_schema_resolves(e: &mut Engine) -> void!db.Error {
+    for v in 0usize..e.schema_objs {
+        if obj_type(e, v) != OT_VIEW {
+            continue
+        }
+        match check_view(e, v) {
+            ok() => {},
+            err(_) => {
+                return err(fail(e, SQLITE_ERROR, "SQL logic error"))
+            },
+        }
+    }
+    ok()
 }

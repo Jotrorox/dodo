@@ -2860,7 +2860,12 @@ fn parse_alter(e: &mut Engine) -> usize!db.Error {
         return ok(s)
     }
     if accept_kw(e, "DROP") {
-        return err(fail(e, SQLITE_ERROR, "ALTER TABLE DROP COLUMN is not supported"))
+        accept_kw(e, "COLUMN")
+        set_op(e, s, 4)
+        let (co, cl) = take_name(e)?
+        set_nf(e, s, 4, co)
+        set_nf(e, s, 5, cl)
+        return ok(s)
     }
     err(syntax_error(e))
 }
