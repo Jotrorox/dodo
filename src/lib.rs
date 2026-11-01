@@ -9,12 +9,12 @@ pub mod cli;
 #[cfg(feature = "llvm")]
 pub mod codegen;
 pub mod consteval;
+mod derive;
 pub mod diagnostic;
 pub mod editor;
 pub mod format;
 pub mod hardware;
 pub mod json;
-mod json_derive;
 pub mod lexer;
 #[cfg(feature = "llvm")]
 pub mod lsp;

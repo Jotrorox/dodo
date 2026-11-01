@@ -11,8 +11,8 @@
 ;
 ; There is no libc or compiler-rt; the floating-point helpers are in
 ; arm_float.ll.
-; This module is not optimized by the IR pass pipeline, so the helpers below
-; are never rewritten into calls to themselves.
+; The compiler optimizes this module with "no-builtins" on every function,
+; so the helpers below are never rewritten into calls to themselves.
 
 attributes #0 = { nounwind "no-builtins" }
 

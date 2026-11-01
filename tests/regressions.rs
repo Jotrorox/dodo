@@ -304,6 +304,111 @@ fn main() -> i32 {
         assert_eq!(workspace.run(&executable).status.code(), Some(42));
     }
 }
+#[test]
+fn struct_fields_named_len_are_ordinary_fields() {
+    // `len` used to be lowered as the built-in collection length for every
+    // base type, so a struct field with that name failed code generation.
+    let workspace = Workspace::new();
+    let source = workspace.file(
+        "main.dodo",
+        r#"package regression
+import "core/ptr"
+struct Buf {
+    data: i64
+    len: i64
+}
+fn through_pointer(p: *mut Buf) -> i64 {
+    unsafe {
+        (*p).len = 9
+        return (*p).len + (*p).data
+    }
+}
+fn nested(s: & &[u8], a: & &[3]u8, t: & &str) -> usize {
+    return s.len + a.len + t.len + s[1] as usize
+}
+fn main() -> i32 {
+    b := Buf { data: 1, len: 5 }
+    x := b.len
+    r := &mut b
+    y := r.len
+    rr := &r
+    z := rr.len
+    p := ptr.from_mut(&mut b)
+    bytes := [1u8, 2, 3, 4]
+    arr := [7u8, 8, 9]
+    s := &bytes[..]
+    ar := &arr
+    text := "hello"
+    if nested(&s, &ar, &text) != 14 {
+        return 1
+    }
+    return (x + y + z + through_pointer(p)) as i32 - 25
+}
+"#,
+    );
+    for optimization in [0, 3] {
+        let executable = workspace.build(&source, optimization, None);
+        let output = workspace.run(&executable);
+        assert!(
+            output.status.success(),
+            "`len` field program failed at O{optimization}: {}",
+            output.status
+        );
+    }
+}
+#[test]
+fn result_and_enum_payloads_survive_word_storage() {
+    // Payload unions are stored as integer words so results return in
+    // registers; every alternative's bytes must still round-trip.
+    let workspace = Workspace::new();
+    let source = workspace.file(
+        "main.dodo",
+        r#"package regression
+struct Throw { code: i32 }
+enum Mixed { Byte(u8), Pair(u16, u32), Wide(u64), Real(f64) }
+fn real(x: f64) -> f64!u8 { if x < 0.0 { return err(7u8) } return ok(x * 2.0) }
+fn pair(x: u8) -> (u8, u64)!Throw { if x == 0 { return err(Throw { code: 3 }) } return ok((x, 0x1122334455667788u64)) }
+fn narrow(x: u16) -> u16!u8 { if x == 0 { return err(9u8) } return ok(x) }
+fn pick(i: i32) -> Mixed {
+    if i == 0 { return Mixed.Byte(200u8) }
+    if i == 1 { return Mixed.Pair(0xBEEFu16, 0xDEADBEEFu32) }
+    if i == 2 { return Mixed.Wide(0xFFEEDDCCBBAA9988u64) }
+    return Mixed.Real(-1.5)
+}
+fn check(m: Mixed, i: i32) -> bool {
+    match m {
+        Mixed.Byte(b) => { return i == 0 && b == 200u8 }
+        Mixed.Pair(a, b) => { return i == 1 && a == 0xBEEFu16 && b == 0xDEADBEEFu32 }
+        Mixed.Wide(w) => { return i == 2 && w == 0xFFEEDDCCBBAA9988u64 }
+        Mixed.Real(r) => { return i == 3 && r == -1.5 }
+    }
+}
+fn main() -> i32 {
+    match real(1.25) { ok(v) => { if v != 2.5 { return 1 } } err(_) => { return 2 } }
+    match real(-1.0) { ok(_) => { return 3 } err(e) => { if e != 7u8 { return 4 } } }
+    match pair(5u8) { ok(p) => { if p.0 != 5u8 || p.1 != 0x1122334455667788u64 { return 5 } } err(_) => { return 6 } }
+    match pair(0u8) { ok(_) => { return 7 } err(e) => { if e.code != 3 { return 8 } } }
+    match narrow(0xABCDu16) { ok(v) => { if v != 0xABCDu16 { return 9 } } err(_) => { return 10 } }
+    match narrow(0u16) { ok(_) => { return 11 } err(e) => { if e != 9u8 { return 12 } } }
+    i := 0i32
+    for i < 4 {
+        if !check(pick(i), i) { return 20 + i }
+        i = i + 1
+    }
+    return 0
+}
+"#,
+    );
+    for optimization in [0, 3] {
+        let executable = workspace.build(&source, optimization, None);
+        let output = workspace.run(&executable);
+        assert!(
+            output.status.success(),
+            "payload program failed at O{optimization}: {}",
+            output.status
+        );
+    }
+}
 
 #[test]
 fn borrowed_slice_pattern_bindings_index_and_measure() {

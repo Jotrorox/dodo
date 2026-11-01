@@ -749,15 +749,8 @@ fn link_firmware(
         ));
     }
     let runtime = temporary.join("runtime.o");
-    // AVR's soft-float and division helpers are several times larger
-    // unoptimized, too large for 32 KiB of flash; the runtime holds no
-    // program code to debug.
-    let mut options = args.options.clone();
-    if platform.chip.triple.starts_with("avr") {
-        options.optimization = options.optimization.max(2);
-    }
     codegen::compile_ir_object(
-        &options,
+        &args.options,
         platform.chip.name,
         &(platform.chip.runtime)(),
         &runtime,

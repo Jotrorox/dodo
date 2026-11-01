@@ -738,6 +738,11 @@ impl<'ctx> Module<'ctx> {
             Err(error(errors.join("\n")))
         }
     }
+    /// Append module-level assembly, which the assembler reads as written
+    /// outside any function.
+    pub(super) fn append_inline_asm(&self, assembly: &str) {
+        unsafe { LLVMAppendModuleInlineAsm(self.0, assembly.as_ptr().cast(), assembly.len()) }
+    }
     pub(super) fn set_source_file_name(&self, name: &str) {
         unsafe { LLVMSetSourceFileName(self.0, name.as_ptr().cast(), name.len()) }
     }

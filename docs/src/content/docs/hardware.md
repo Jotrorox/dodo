@@ -1461,6 +1461,70 @@ is a memory barrier and is never removed unless `options(nomem)` or
 overwrites. See [memory and foreign calls](memory-and-ffi.md#inline-assembly)
 for the full rules.
 
+### Naked handlers and global assembly
+
+A `@naked` function has no prologue or epilogue, so its assembly sees the
+registers and stack exactly as the caller, or the hardware, left them. That is
+what a fault handler needs to find the stack frame the processor pushed. The
+chip runtime's vector table refers to weak handler symbols, so a C function
+with the vector's name replaces the default:
+
+```dodo
+import "core/ptr"
+
+static mut FAULT_PC: u32 = 0
+
+// Thumb (Cortex-M0+). Bit 2 of EXC_RETURN in lr says which stack the
+// processor pushed r0-r3, r12, lr, pc, and xPSR to.
+@naked
+extern "C" fn HardFault_Handler() {
+    unsafe {
+        asm(
+            "movs r0, #4",
+            "mov r1, lr",
+            "tst r0, r1",
+            "mrs r0, msp",
+            "beq 1f",
+            "mrs r0, psp",
+            "1:",
+            "ldr r1, ={0}",
+            "bx r1",
+            sym record_fault,
+        )
+    }
+}
+
+extern "C" fn record_fault(frame: *const u32) {
+    unsafe {
+        FAULT_PC = ptr.read(ptr.offset(frame, 6))
+    }
+    for {
+    }
+}
+```
+
+`sym record_fault` writes the function's symbol into the template, and
+`const` writes a constant's value. Top-level `unsafe asm(...)` is global
+assembly, for code or data with no Dodo declaration around it. On Cortex-M,
+mark a function label with `.thumb_func` so its address has the Thumb bit set:
+
+```dodo
+unsafe asm(
+    ".section .text.add_three,\"ax\",%progbits",
+    ".global add_three",
+    ".thumb_func",
+    "add_three:",
+    "    adds r0, r0, #{0}",
+    "    bx lr",
+    const 3,
+)
+
+unsafe extern "C" fn add_three(value: u32) -> u32
+```
+
+See [global assembly](memory-and-ffi.md#global-assembly) and
+[naked functions](memory-and-ffi.md#naked-functions) for the rules.
+
 ### Sleeping and other targets
 
 `cpu.wait_for_interrupt()` sleeps until an interrupt is pending, which is the
@@ -2130,7 +2194,7 @@ compiler adds what a desktop operating system would otherwise provide:
 | Vector table | Initial stack and reset handler. Every exception and interrupt is a weak default that an `@interrupt(NAME)` handler replaces. The default `USBCTRL_IRQ` serves the [USB serial port](#usb-serial-on-the-rp2040-and-rp2350) while one is open. |
 | Reset handler | Copies initialized statics to RAM, zeroes the rest, and calls `main`. If `main` returns, the core sleeps. |
 | Panic hook | `dodo_board_panic` masks interrupts, writes the failure to the program's [serial ports](#panics-on-the-serial-port) and USB serial port, if it opened any, and halts, keeping an open USB serial port served. Define `extern "C" fn dodo_board_panic(check: *const u8, file: *const u8, line: u32, column: u32)` to report failures differently; it must not return. |
-| Runtime helpers | `memcpy`, `memmove`, `memset`, `memcmp`, the 32- and 64-bit division, 64-bit multiplication, and shift routines the Cortex-M0+ lacks in hardware, and software `f32` and `f64` arithmetic, comparisons, conversions, and `%`, since it has no floating-point unit. Results are correctly rounded IEEE 754, to nearest with ties to even, subnormals included. |
+| Runtime helpers | `memcpy`, `memmove`, `memset`, `memcmp`, the 32- and 64-bit division, 64-bit multiplication, and shift routines the Cortex-M0+ lacks in hardware, and software `f32` and `f64` arithmetic, comparisons, conversions, and `%`, since it has no floating-point unit. Results are correctly rounded IEEE 754, to nearest with ties to even, subnormals included. Addition, subtraction, and multiplication of normal numbers run in hand-written assembly, and division multiplies by a reciprocal. Typical cycles per call, as the RP2040 emulator counts them: `f32` addition 85, multiplication 90, division 280, comparison 50; `f64` addition 130, multiplication 195, division 570, comparison 80. The helpers are optimized whatever the program's `-O` level. |
 | Linker script | Flash at `0x10000000` (size from the board), 264 KiB of RAM, and the stack at the top of RAM; `.ramfunc` and `.noinit` [sections](#sections-and-alignment). |
 
 `std/embedded/chip/rp2040` is the chip support. `rp2040.take(config)` starts the
@@ -2158,7 +2222,7 @@ RP2040's:
 | Vector table | At the start of flash, where the boot ROM enters Arm images. Weak defaults for the Cortex-M33 exceptions (including `SecureFault_Handler`) and all 52 interrupts. |
 | Image definition | The `IMAGE_DEF` block, in the first 4 KiB of flash, that marks the image as a secure Arm RP2350 executable. The boot ROM runs nothing without it. |
 | Reset handler | Clears the stack limit, installs the vector table, enables the FPU and the double-precision coprocessor, initializes RAM, and calls `main`. |
-| Panic hook and helpers | As on the RP2040. The Cortex-M33 divides 32-bit integers in hardware, so only the 64-bit helpers are linked. Its FPU does single precision only, so `f32` arithmetic runs in hardware. `f64` addition, subtraction, multiplication, and division, and conversions between `f64` and `f32` or 32-bit integers, run on the RP2350's double-precision coprocessor (DCP): an `f64` division takes about 90 cycles instead of 1300, an addition about 45 instead of 260. The results are the software helpers' bit for bit: subnormal operands and results, which the coprocessor flushes to zero, are computed in software, and NaN results are the default NaN. The helpers save and restore the coprocessor's state when they interrupt one another, so `f64` works in interrupt handlers. The coprocessor sequences come from the Pico SDK, under its BSD-3-Clause license (`src/hardware/rp2350/LICENSE.pico-sdk`). Comparisons, `%`, conversion from `f32`, and conversions to and from 64-bit integers use the software helpers. |
+| Panic hook and helpers | As on the RP2040. The Cortex-M33 divides 32-bit integers in hardware, so only the 64-bit helpers are linked. Its FPU does single precision only, so `f32` arithmetic runs in hardware. `f64` addition, subtraction, multiplication, and division, and conversions between `f64` and `f32` or 32-bit integers, run on the RP2350's double-precision coprocessor (DCP): an `f64` division takes about 90 cycles instead of 340 in software, an addition about 45 instead of 150. The results are the software helpers' bit for bit: subnormal operands and results, which the coprocessor flushes to zero, are computed in software, and NaN results are the default NaN. The helpers save and restore the coprocessor's state when they interrupt one another, so `f64` works in interrupt handlers. The coprocessor sequences come from the Pico SDK, under its BSD-3-Clause license (`src/hardware/rp2350/LICENSE.pico-sdk`). Comparisons, `%`, conversion from `f32`, and conversions to and from 64-bit integers use the software helpers. |
 | Linker script | Flash at `0x10000000` (size from the board), 520 KiB of RAM, and the stack at the top of RAM; `.ramfunc` and `.noinit` [sections](#sections-and-alignment). |
 
 `std/embedded/chip/rp2350` mirrors the RP2040 package: `rp2350.take(config)`
@@ -3486,13 +3550,16 @@ so each new board or chip is a small, self-contained addition:
   `hal.RegisterBlock`. A new controller design is a new package there, with a
   simulated controller to test it on a desktop.
 
-The compiler compiles the runtime itself with the selected target machine, so
-no assembler or C toolchain is involved. `scripts/test_pico.py` (with
-`--board pico`, `--board pico2`, or `--board pico2_w`) and `scripts/test_arduino_uno.py`
-show how to check a chip on real hardware, and `scripts/test_rp2350_float.py` checks the RP2350's
+The compiler compiles and optimizes the runtime itself with the selected
+target machine, whatever the program's `-O` level, so no assembler or C
+toolchain is involved. `scripts/test_pico.py` (with
+`--board pico`, `--board pico2`, or `--board pico2_w`) and
+`scripts/test_arduino_uno.py` show how to check a chip on real hardware, and
+`scripts/test_rp2350_float.py` checks the RP2350's
 coprocessor `f64` helpers against the software ones on a board. Without a
 board, `scripts/test_emulator.py` runs the self-test in `tests/emulator` on
-emulated RP2040 and RP2350 chips, as CI does.
+emulated RP2040 and RP2350 chips, as CI does; on the RP2040 it also checks
+the assembly floating-point helpers against the software ones.
 
 ### Unsupported chips
 
@@ -3547,12 +3614,8 @@ dodo build firmware.dodo --emit obj --target thumbv7em-none-eabihf \
   LRCLK).
   The Pico 2 W's wireless chip drives only its LED and senses USB power;
   Wi-Fi and Bluetooth need its firmware, which is not loaded yet.
-- The software floating-point helpers are written for correctness, not speed:
-  division, for example, computes one quotient bit per step, and `f32`
-  arithmetic on the Cortex-M0+ goes through `f64`. On the RP2350, `f64`
-  arithmetic runs on the double-precision coprocessor instead. They raise no
-  floating-point exception flags and return the default quiet NaN for every
-  NaN result.
+- The software floating-point helpers raise no floating-point exception
+  flags and return the default quiet NaN for every NaN result.
 - Core 1 runs one task, started from core 0, and the cores share the
   vector table. Executor tasks on either core, async or hand-written, are
   cooperative: there is no preemptive scheduler. GPIO events interrupt
@@ -3566,9 +3629,9 @@ dodo build firmware.dodo --emit obj --target thumbv7em-none-eabihf \
   the executor's signals, so use both from one thread there.
 - On the Cortex-M0+ of the RP2040, atomics only load and store; see
   [sharing state with atomics](#sharing-state-with-atomics).
-- Inline assembly lives inside functions; there is no global or naked
-  assembly, so startup code and vector tables come from the chip runtime or a
-  `@section`-placed static.
+- A naked function or global assembly can replace a vector's default
+  handler or add code the runtime lacks, but the boot sequence and the
+  vector table itself still come from the chip runtime.
 - Low power covers sleep, deep sleep, clock gating, and the dormant state
   woken by GPIO 0 to 29. The RP2350's power manager states, which switch
   power domains off, its always-on timer, and waking a dormant chip by time
