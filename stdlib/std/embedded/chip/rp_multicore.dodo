@@ -7,6 +7,7 @@ import "core/ptr"
 import "std/embedded/cortex_m"
 import "std/embedded/executor"
 import "std/embedded/hal"
+import "std/embedded/sync"
 
 // The two Arm cores of the RP2040 and RP2350 working together (RP2040
 // datasheet 2.3.1 and 2.8.2, RP2350 datasheet 3.1 and 5.3). Both cores run
@@ -21,6 +22,8 @@ import "std/embedded/hal"
 //   its own, in order.
 // - `Spinlocks` hands out the hardware locks both cores see, for state that
 //   both use.
+// - `Doorbells` hands out the RP2350's doorbells, which interrupt the other
+//   core without passing data. The RP2040 has none.
 //
 // A task for core 1 is a value with a public `run(self)` method, like a
 // std/thread task. It moves to core 1, so it may hold peripherals and other
@@ -55,10 +58,12 @@ import "std/embedded/hal"
 // `cortex_m.enable` act on the core that calls them, and an interrupt's
 // handler runs on the core, or cores, that enabled it. Each core can run
 // its own std/embedded/executor, whose signals belong to the core that
-// uses them; `Fifo.set_signal` wakes a task when the other core writes.
-// Statics are shared: guard what both cores use with a `Spinlock` or, on
-// the RP2350, with std/sync/atomic. The RP2040's Cortex-M0+ has only atomic
-// loads and stores.
+// uses them; `Fifo.set_signal` and `Doorbell.set_signal` wake a task when
+// the other core writes or rings. Statics are shared: guard what both cores
+// use with a std/embedded/sync Mutex, which `Core1.start` makes hold off the
+// other core through spinlock 31, with a `Spinlock` of the program's own,
+// or, on the RP2350, with std/sync/atomic. The RP2040's Cortex-M0+ has only
+// atomic loads and stores.
 
 // SIO, the single-cycle I/O block. Each core sees its own FIFO end and
 // CPUID at the same addresses.
@@ -69,12 +74,21 @@ const FIFO_WR: usize = 0x054
 const FIFO_RD: usize = 0x058
 const SPINLOCK_ST: usize = 0x05C
 const SPINLOCK0: usize = 0x100
+// The RP2350's doorbells (datasheet 3.1.4): a write of ones to OUT_SET rings
+// them on the other core, OUT_CLR withdraws them, IN_SET rings them on this
+// core and reads which ring here, and IN_CLR acknowledges them. Each core's
+// SIO_IRQ_BELL is raised while any bell rings on it.
+const DOORBELL_OUT_SET: usize = 0x180
+const DOORBELL_OUT_CLR: usize = 0x184
+const DOORBELL_IN_SET: usize = 0x188
+const DOORBELL_IN_CLR: usize = 0x18C
 // FIFO_ST: this core's end has a word to read (VLD), room to write (RDY),
 // and sticky flags for a write when full (WOF) and a read when empty (ROE),
-// cleared by writing the register. The FIFO interrupt is raised while any
+// each cleared by writing a 1 to it. The FIFO interrupt is raised while any
 // of VLD, WOF, and ROE is set.
 const FIFO_VALID: u32 = 1 << 0
 const FIFO_READY: u32 = 1 << 1
+const FIFO_STICKY: u32 = 0b1100
 
 // The Cortex-M core's ICSR, whose low bits are the running exception's
 // number, 16 + the IRQ; and the NVIC's interrupt clear-enable registers.
@@ -89,6 +103,10 @@ const CLEAR_ALIAS: usize = 0x3000
 
 pub const CORE_COUNT: u32 = 2
 pub const SPINLOCK_COUNT: u32 = 32
+pub const DOORBELL_COUNT: u32 = 8
+// The spinlock std/embedded/sync's sections take once core 1 runs; never
+// handed out by Spinlocks.
+pub const CORE_LOCK: u32 = 31
 // The smallest stack `Core1.start` accepts, in bytes, besides the task.
 pub const MIN_STACK_BYTES: usize = 256
 
@@ -100,6 +118,9 @@ const MAX_RESTARTS: u32 = 8
 // Per core, the signal raised when its FIFO end has a word, or NO_SIGNAL.
 const NO_SIGNAL: u32 = 0xFFFF_FFFF
 static mut WAKE: [2]u32 = [NO_SIGNAL, NO_SIGNAL]
+// Per core and doorbell, at core * DOORBELL_COUNT + number, the signal its
+// ring raises on that core, or NO_SIGNAL.
+static mut BELLS: [16]u32 = [NO_SIGNAL; 16]
 
 // Provided by the compiler's RP2040 and RP2350 firmware runtimes: where core
 // 1 starts, with the Thumb bit set.
@@ -116,6 +137,8 @@ pub struct Chip {
     pub core1_fifo_irq: u32
     // Spinlocks that must not be handed out, one bit each.
     pub reserved_locks: u32
+    // The doorbell interrupt, if the chip has doorbells.
+    pub doorbell_irq: Option<u32>
 }
 
 // The parts the chip's take() hands out.
@@ -123,6 +146,7 @@ pub struct Cores {
     pub core1: Core1
     pub fifos: Fifos
     pub spinlocks: Spinlocks
+    pub doorbells: Doorbells
 }
 
 // The parts for `chip`.
@@ -133,8 +157,16 @@ pub unsafe fn take(chip: Chip) -> Cores {
         return Cores {
             core1: Core1 { psm_base: chip.psm_base, core1_bit: chip.core1_bit, fifo_irq: chip.core0_fifo_irq },
             fifos: Fifos { irq0: chip.core0_fifo_irq, irq1: chip.core1_fifo_irq, claimed: 0 },
-            spinlocks: Spinlocks { reserved: chip.reserved_locks, claimed: 0 },
+            spinlocks: Spinlocks { reserved: chip.reserved_locks | (1u32 << CORE_LOCK), claimed: 0 },
+            doorbells: Doorbells { irq: copied(&chip.doorbell_irq), claimed: 0 },
         }
+    }
+}
+
+fn copied(value: &Option<u32>) -> Option<u32> {
+    match value {
+        some(inner) => some(*inner),
+        none => none,
     }
 }
 
@@ -215,6 +247,11 @@ pub struct Core1 {
             ptr.write((frame + 8) as *mut u32, bottom as u32)
         }
         finished := start + mem.offset_of::<Start<T>>("finished")
+        // From now on std/embedded/sync's sections hold off the other core.
+        // SAFETY: only core 0 runs here, and the caller holds no section.
+        unsafe {
+            sync.set_core_lock(acquire_core_lock, release_core_lock)
+        }
         // Core 0's FIFO interrupt stays off while core 1's boot ROM uses
         // the FIFO, so the program's handler does not see the handshake.
         irq := self.fifo_irq
@@ -306,6 +343,8 @@ pub struct Running {
                 ok() => {}
                 err(_) => {}
             }
+            // A section core 1 held would keep core 0 out forever.
+            sync.abandon_core(1)
         }
     }
 
@@ -539,8 +578,9 @@ pub struct Fifo {
             WAKE[cpu.core_id() as usize] = signal.id
         }
         // Flags from reads and writes outside this API would hold the
-        // interrupt raised.
-        self.sio.write(FIFO_ST, 0)
+        // interrupt raised. Core 1's boot ROM leaves ROE set: it reads the
+        // FIFO before checking for a word while it waits to be launched.
+        self.sio.write(FIFO_ST, FIFO_STICKY)
         core.drop(section)
         self.listen()
     }
@@ -599,7 +639,7 @@ extern "C" fn dodo_fifo_interrupt() {
         cpu.fence()
         index := cpu.core_id() as usize
         status: hal.Reg<u32> = hal.Reg.at(SIO_BASE + FIFO_ST)
-        status.write(0)
+        status.write(FIFO_STICKY)
         if WAKE[index] != NO_SIGNAL {
             signal := executor.Signal { id: WAKE[index] }
             signal.raise()
@@ -741,5 +781,244 @@ pub struct Guard {
         // Order the guarded accesses before releasing the lock.
         cpu.fence()
         self.register.write(1)
+    }
+}
+
+// std/embedded/sync's cross-core lock: hardware spinlock CORE_LOCK, which
+// reads nonzero when the read took it.
+fn acquire_core_lock() {
+    // SAFETY: the spinlock is reserved for std/embedded/sync, which calls
+    // this with interrupts masked and releases it once.
+    unsafe {
+        lock := lock_register(CORE_LOCK)
+        for lock.read() == 0 {}
+    }
+}
+
+fn release_core_lock() {
+    // SAFETY: as in acquire_core_lock; only the holder releases it.
+    unsafe {
+        lock := lock_register(CORE_LOCK)
+        lock.write(1)
+    }
+}
+
+// The RP2350's eight doorbells, handed out by number. A doorbell interrupts
+// the other core without passing data: ring it on one core, and the other
+// core's SIO_IRQ_BELL is raised until that core acknowledges the ring. It
+// suits waking the other core's executor, as a signal does on one core,
+// without using the FIFO. On the RP2040, which has no doorbells, `claim`
+// returns Unsupported.
+pub struct Doorbells {
+    irq: Option<u32>
+    claimed: u32
+
+    // Claim doorbell `number`, 0 to 7. Unsupported on a chip without
+    // doorbells, InvalidInput for another number, Busy if claimed already.
+    pub fn claim(&mut self, number: u32) -> Doorbell!hal.Error {
+        irq := 0u32
+        match &self.irq {
+            some(line) => {
+                irq = *line
+            }
+            none => {
+                return err(hal.Error.Unsupported)
+            }
+        }
+        if number >= DOORBELL_COUNT {
+            return err(hal.Error.InvalidInput)
+        }
+        bit := 1u32 << number
+        if (self.claimed & bit) != 0 {
+            return err(hal.Error.Busy)
+        }
+        self.claimed |= bit
+        return ok(Doorbell { number, irq })
+    }
+
+    // Claim the lowest-numbered doorbell that is free. Busy if none is.
+    pub fn claim_free(&mut self) -> Doorbell!hal.Error {
+        for number in 0..DOORBELL_COUNT {
+            if (self.claimed & (1u32 << number)) == 0 {
+                return self.claim(number)
+            }
+        }
+        return err(hal.Error.Busy)
+    }
+
+    // True if the chip has doorbells.
+    pub fn is_supported(&self) -> bool {
+        match &self.irq {
+            some(_) => true,
+            none => false,
+        }
+    }
+
+    // Give back a doorbell; it stops raising its signal on the calling core.
+    // Clones of it keep working and must no longer be used.
+    pub fn release(&mut self, bell: Doorbell) {
+        bell.clear_signal()
+        self.claimed &= ~(1u32 << bell.number)
+    }
+}
+
+// One doorbell between the cores, claimed from `Doorbells`. Give the other
+// core its own copy with `clone`: whichever core rings it interrupts the
+// other one.
+//
+//     const WAKE: executor.Signal = executor.Signal { id: 4 }
+//
+//     // On core 0, before starting core 1's task with `bell.clone()`:
+//     bell.set_signal(&WAKE)
+//     ...
+//     await WAKE.wait()        // in an async task of core 0's executor
+//
+//     // On core 1:
+//     bell.ring()
+pub struct Doorbell {
+    number: u32
+    irq: u32
+
+    pub fn number(&self) -> u32 {
+        return self.number
+    }
+
+    // Ring the doorbell on the other core. Rings before it acknowledges are
+    // one ring.
+    pub fn ring(&self) {
+        // SAFETY: OUT_SET only rings the bits written as ones.
+        unsafe {
+            mmio.write32(SIO_BASE + DOORBELL_OUT_SET, self.bit())
+        }
+    }
+
+    // Withdraw a ring of this core's that the other core has not
+    // acknowledged yet.
+    pub fn withdraw(&self) {
+        // SAFETY: OUT_CLR only clears the bits written as ones.
+        unsafe {
+            mmio.write32(SIO_BASE + DOORBELL_OUT_CLR, self.bit())
+        }
+    }
+
+    // True if the other core rang the doorbell and this core has not
+    // acknowledged it.
+    pub fn is_ringing(&self) -> bool {
+        // SAFETY: reading IN_SET has no side effects.
+        status := unsafe {
+            mmio.read32(SIO_BASE + DOORBELL_IN_SET)
+        }
+        return (status & self.bit()) != 0
+    }
+
+    // Acknowledge a ring on this core: true if the doorbell was ringing.
+    pub fn answer(&mut self) -> bool {
+        ringing := self.is_ringing()
+        if ringing {
+            // SAFETY: IN_CLR only acknowledges the bits written as ones.
+            unsafe {
+                mmio.write32(SIO_BASE + DOORBELL_IN_CLR, self.bit())
+            }
+        }
+        listen_bells(self.irq)
+        return ringing
+    }
+
+    // Raise `signal` on this core whenever the other core rings: the chip
+    // runtime's handler of this core's SIO_IRQ_BELL acknowledges the ring
+    // and raises the signal, so a task of this core's executor waits with
+    // `await signal.wait()` or `signal.take(cx)`. A program's own
+    // `@interrupt(SIO_IRQ_BELL)` handler replaces this.
+    pub fn set_signal(&mut self, signal: &executor.Signal) {
+        section := hal.Critical.enter()
+        // SAFETY: this core's slot, which only this core's program and its
+        // doorbell interrupt handler use; interrupts are masked.
+        unsafe {
+            BELLS[bell_slot(self.number)] = signal.id
+        }
+        core.drop(section)
+        listen_bells(self.irq)
+    }
+
+    // Stop raising the signal on this core.
+    pub fn clear_signal(&self) {
+        section := hal.Critical.enter()
+        // SAFETY: as in set_signal.
+        unsafe {
+            BELLS[bell_slot(self.number)] = NO_SIGNAL
+        }
+        core.drop(section)
+    }
+
+    // The doorbell interrupt, SIO_IRQ_BELL, which each core has.
+    pub fn irq(&self) -> u32 {
+        return self.irq
+    }
+
+    // The same doorbell, for the other core.
+    pub fn clone(&self) -> Doorbell {
+        return Doorbell { number: self.number, irq: self.irq }
+    }
+
+    fn bit(&self) -> u32 {
+        return 1u32 << self.number
+    }
+}
+
+// This core's slot of doorbell `number` in BELLS.
+fn bell_slot(number: u32) -> usize {
+    return cpu.core_id() as usize * DOORBELL_COUNT as usize + number as usize
+}
+
+// Let this core's doorbell interrupt through if one of its doorbells has a
+// signal.
+fn listen_bells(irq: u32) {
+    base := cpu.core_id() as usize * DOORBELL_COUNT as usize
+    for number in 0usize..8 {
+        // SAFETY: a word read is atomic, and only this core writes its slots.
+        signal := unsafe {
+            BELLS[base + number]
+        }
+        if signal != NO_SIGNAL {
+            cortex_m.enable(irq)
+            return
+        }
+    }
+}
+
+// The RP2350 runtime's default SIO_IRQ_BELL handler calls this weak symbol
+// on the core where a doorbell rings; every program that uses
+// std/embedded/chip defines it through this package. It acknowledges the
+// rings that have signals and raises those. Rings without a signal are left
+// for code that polls them, with the interrupt disabled until
+// `Doorbell.answer` or `set_signal` lets it through again.
+extern "C" fn dodo_doorbell_interrupt() {
+    // SAFETY: IN_SET reads without side effects, and IN_CLR acknowledges
+    // only the bits written; the BELLS slots are this core's, as in
+    // Doorbell.set_signal. ICER is write-one-to-clear, as in
+    // dodo_fifo_interrupt.
+    unsafe {
+        rung := mmio.read32(SIO_BASE + DOORBELL_IN_SET) & 0xFF
+        base := cpu.core_id() as usize * DOORBELL_COUNT as usize
+        answered := 0u32
+        for number in 0u32..8 {
+            bit := 1u32 << number
+            signal := BELLS[base + number as usize]
+            if (rung & bit) != 0 && signal != NO_SIGNAL {
+                answered |= bit
+            }
+        }
+        mmio.write32(SIO_BASE + DOORBELL_IN_CLR, answered)
+        if rung != answered {
+            irq := (mmio.read32(SCB_ICSR) & 0x1FF) - 16
+            mmio.write32(NVIC_ICER + 4 * (irq / 32) as usize, 1u32 << (irq % 32))
+        }
+        cpu.fence()
+        for number in 0u32..8 {
+            if (answered & (1u32 << number)) != 0 {
+                signal := executor.Signal { id: BELLS[base + number as usize] }
+                signal.raise()
+            }
+        }
     }
 }

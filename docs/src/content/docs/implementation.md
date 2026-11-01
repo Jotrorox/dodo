@@ -55,7 +55,7 @@ operator precedence, runtime checks, unsafe contracts, and compiler restrictions
 | --- | --- | --- |
 | Values | Integers, floats, bool, arrays, tuples, checked references/slices, strings, structs, enums, Options, Results, raw pointers, `dyn` interface references, type aliases. | No owned `dyn` values or closures, or automatic tuple equality. |
 | Functions | Declared signatures, final-expression returns, methods, associated functions, recursion, generics, function pointers, and closures that borrow what they capture. | No overloads, inheritance, default/named arguments, owning or heap-allocated closures, or specialization. |
-| Control flow | `if`, `match`, conditional patterns, four `for` forms, `break`, `continue`, `return`. | No `while`, `loop`, labels, general iterator protocol, or async/await. |
+| Control flow | `if`, `match`, conditional patterns, four `for` forms, `break`, `continue`, `return`, and `async fn` with `await` compiled to state machines for the embedded executor. | No `while`, `loop`, labels, or general iterator protocol; `await` begins its statement, and a started future must not move. |
 | Ownership | Moves, shared/exclusive loans, source-based returns, deterministic destruction. | Conservative indexing, joins, loops, and aggregate lifetime tracking. |
 | Errors | Mandatory Result handling, explicit matching, `?` with wrapping into an error enum's variant, panic-on-error `!`. | No exceptions, user-defined error conversion, or panic unwinding. |
 | Generic behavior | Concrete specialization, structural interfaces with bounds checked at each use, and `dyn` references with method tables. | No generic interfaces, associated types, owned `dyn` values, or separately compiled generic code. |

@@ -264,8 +264,27 @@ fn a_silent_core1_times_out() {
     }
 }
 
+fn rp2040_has_no_doorbells() {
+    parts := unsafe {
+        rp_multicore.take(rp_multicore.Chip {
+            psm_base: 0x4001_0000,
+            core1_bit: PROC1,
+            core0_fifo_irq: 15,
+            core1_fifo_irq: 16,
+            reserved_locks: 0,
+            doorbell_irq: none,
+        })
+    }
+    core.assert(!parts.doorbells.is_supported())
+    match parts.doorbells.claim(0) {
+        ok(_) => core.assert(false),
+        err(error) => core.assert(error == hal.Error.Unsupported),
+    }
+}
+
 fn spinlocks_and_fifo_ends_are_claimed_once() {
-    // RP2350 numbering: locks 0 to 4, 8, 9, and 12 to 17 are reserved.
+    // RP2350 numbering: locks 0 to 4, 8, 9, and 12 to 17 are reserved, and
+    // 31 is std/embedded/sync's.
     parts := unsafe {
         rp_multicore.take(rp_multicore.Chip {
             psm_base: 0x4001_8000,
@@ -273,6 +292,7 @@ fn spinlocks_and_fifo_ends_are_claimed_once() {
             core0_fifo_irq: 25,
             core1_fifo_irq: 25,
             reserved_locks: 0x0003_F31F,
+            doorbell_irq: some(26),
         })
     }
     spinlocks := &mut parts.spinlocks
@@ -304,7 +324,8 @@ fn spinlocks_and_fifo_ends_are_claimed_once() {
             usable += 1
         }
     }
-    core.assert(usable == 19)
+    core.assert(usable == 18)
+    core.assert(!spinlocks.is_usable(rp_multicore.CORE_LOCK))
     count := 3u32
     for {
         match spinlocks.claim_free() {
@@ -318,6 +339,27 @@ fn spinlocks_and_fifo_ends_are_claimed_once() {
         }
     }
     core.assert(count == usable)
+
+    bells := &mut parts.doorbells
+    core.assert(bells.is_supported())
+    bell := bells.claim(3)!
+    core.assert(bell.number() == 3)
+    core.assert(bell.irq() == 26)
+    match bells.claim(3) {
+        ok(_) => core.assert(false),
+        err(error) => core.assert(error == hal.Error.Busy),
+    }
+    match bells.claim(8) {
+        ok(_) => core.assert(false),
+        err(error) => core.assert(error == hal.Error.InvalidInput),
+    }
+    lowest := bells.claim_free()!
+    core.assert(lowest.number() == 0)
+    copy := bell.clone()
+    core.assert(copy.number() == 3)
+    bells.release(lowest)
+    reclaimed := bells.claim_free()!
+    core.assert(reclaimed.number() == 0)
 
     fifos := &mut parts.fifos
     fifo0 := fifos.claim()!
@@ -336,4 +378,5 @@ fn main() {
     wrong_echoes_start_the_sequence_over()
     a_silent_core1_times_out()
     spinlocks_and_fifo_ends_are_claimed_once()
+    rp2040_has_no_doorbells()
 }

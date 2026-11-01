@@ -4,75 +4,89 @@ import "core/cpu"
 import "std/embedded/board"
 import "std/embedded/chip"
 import "std/embedded/cortex_m"
-import "std/embedded/hal"
 import "std/embedded/peripheral/pl011"
+import "std/embedded/sync"
+import "std/sync/atomic"
 
 // Interrupt-driven firmware: the UART's receive interrupt moves arriving
 // bytes into a queue, SysTick counts milliseconds, and the main loop sleeps
 // until either has news, then echoes what arrived and blinks the LED.
 // Connect a USB serial adapter to GP0 (TX) and GP1 (RX) at 115200 baud.
 //
-// Handlers and the main loop share `static mut` state. The handlers run
-// with the interrupt that started them in progress; the main loop reads
-// and changes shared state inside a `hal.Critical` section, so a handler
-// never sees it half-updated.
+// Handlers and the main loop share state through std/embedded/sync
+// mutexes in plain statics: locking one masks interrupts, so a handler
+// never sees the state half-updated, and no `unsafe` is needed. The
+// millisecond count, which only its handler changes, is an atomic.
 
 const QUEUE_SIZE: usize = 64
 const BLINK_MS: u32 = 250
 
-// The serial port, owned by the receive handler once main hands it over.
-static mut SERIAL: Option<pl011.Port> = none
 // Bytes received and not yet echoed: a ring buffer the handler fills.
-static mut QUEUE: [64]u8 = [0u8; 64]
-static mut QUEUE_START: usize = 0
-static mut QUEUED: usize = 0
-static mut DROPPED: u32 = 0
-static mut MILLISECONDS: u32 = 0
+struct Queue {
+    bytes: [64]u8
+    start: usize
+    queued: usize
+    dropped: u32
 
-// Add received bytes to the queue, dropping what does not fit.
-fn enqueue(bytes: &[u8]) {
-    for index in 0..bytes.len {
-        unsafe {
-            if QUEUED == QUEUE_SIZE {
-                DROPPED += 1
+    // Add received bytes, dropping what does not fit.
+    fn push(&mut self, bytes: &[u8]) {
+        for index in 0..bytes.len {
+            if self.queued == QUEUE_SIZE {
+                self.dropped += 1
             } else {
-                QUEUE[(QUEUE_START + QUEUED) % QUEUE_SIZE] = bytes[index]
-                QUEUED += 1
+                self.bytes[(self.start + self.queued) % QUEUE_SIZE] = bytes[index]
+                self.queued += 1
             }
         }
     }
+
+    // Move the queued bytes into `out`; returns how many there were.
+    fn drain(&mut self, out: &mut[64]u8) -> usize {
+        count := self.queued
+        for index in 0..count {
+            out[index] = self.bytes[(self.start + index) % QUEUE_SIZE]
+        }
+        self.start = (self.start + count) % QUEUE_SIZE
+        self.queued = 0
+        return count
+    }
 }
+
+// The serial port, owned by the receive handler once main hands it over.
+static SERIAL: sync.Mutex<Option<pl011.Port>> = sync.Mutex.new(none)
+static QUEUE: sync.Mutex<Queue> = sync.Mutex.new(Queue { bytes: [0u8; 64], start: 0, queued: 0, dropped: 0 })
+static MILLISECONDS: atomic.Atomic<u32> = atomic.Atomic.new(0u32)
 
 // UART0 raises its interrupt when its receive FIFO is 3/4 full, when bytes
 // have waited for 32 bit times, and on receive errors.
 @interrupt(UART0_IRQ)
 fn serial_received() {
-    unsafe {
-        match &mut SERIAL {
-            some(port) => {
-                buffer := [0u8; 32]
-                match port.poll_read(&mut buffer) {
-                    ok(progress) => {
-                        enqueue(&buffer[..progress.transferred])
-                    }
-                    err(failure) => {
-                        // A framing, parity, break, or overrun error: keep
-                        // the bytes before it and acknowledge it.
-                        enqueue(&buffer[..failure.transferred])
-                        port.clear_interrupts(pl011.ERROR_INTERRUPTS)
-                    }
-                }
+    serial := SERIAL.lock()
+    if let some(port) = serial.get_mut() {
+        buffer := [0u8; 32]
+        received := 0usize
+        match port.poll_read(&mut buffer) {
+            ok(progress) => {
+                received = progress.transferred
             }
-            none => {}
+            err(failure) => {
+                // A framing, parity, break, or overrun error: keep the bytes
+                // before it and acknowledge it.
+                received = failure.transferred
+                port.clear_interrupts(pl011.ERROR_INTERRUPTS)
+            }
         }
+        queue := QUEUE.lock()
+        queue.get_mut().push(&buffer[..received])
     }
 }
 
+// The only writer of MILLISECONDS, so a load and a store suffice, even on
+// the RP2040's Cortex-M0+, which has no atomic read-modify-write.
 @interrupt(SysTick_Handler)
 fn tick() {
-    unsafe {
-        MILLISECONDS = core.wrapping_add(MILLISECONDS, 1)
-    }
+    now := MILLISECONDS.load(atomic.Ordering.Relaxed)!
+    MILLISECONDS.store(core.wrapping_add(now, 1), atomic.Ordering.Relaxed)!
 }
 
 fn main() {
@@ -80,47 +94,35 @@ fn main() {
     port := b.pins.uart(board.UART_TX_PIN, some(board.UART_RX_PIN), 115_200)!
     port.set_crlf(true)
     port.listen(pl011.RX_INTERRUPT | pl011.RX_TIMEOUT_INTERRUPT | pl011.ERROR_INTERRUPTS)
-    // The handler cannot run before its interrupt is enabled below.
-    unsafe {
-        SERIAL = some(port)
-    }
+    SERIAL.set(some(port))
     cortex_m.enable(chip.UART0_IRQ)
     cortex_m.systick_start(chip.SYS_HZ / 1000 - 1, true)!
 
     echo := [0u8; 64]
     blinked := 0u32
     for {
-        section := hal.Critical.enter()
         count := 0usize
-        now := 0u32
-        unsafe {
-            for count < QUEUED {
-                echo[count] = QUEUE[(QUEUE_START + count) % QUEUE_SIZE]
-                count += 1
+        {
+            queue := QUEUE.lock()
+            count = queue.get_mut().drain(&mut echo)
+            now := MILLISECONDS.load(atomic.Ordering.Relaxed)!
+            if count == 0 && core.wrapping_sub(now, blinked) < BLINK_MS {
+                // Sleep while the lock masks interrupts: a pending interrupt
+                // still wakes the core, and its handler runs once the guard
+                // is dropped, so an interrupt between the check and the
+                // sleep is not missed.
+                cpu.wait_for_interrupt()
             }
-            QUEUE_START = (QUEUE_START + count) % QUEUE_SIZE
-            QUEUED = 0
-            now = MILLISECONDS
-        }
-        if count == 0 && core.wrapping_sub(now, blinked) < BLINK_MS {
-            // Sleep with interrupts masked: a pending interrupt still wakes
-            // the core, and its handler runs when the section ends, so an
-            // interrupt between the check and the sleep is not missed.
-            cpu.wait_for_interrupt()
         }
         if count > 0 {
-            unsafe {
-                match &mut SERIAL {
-                    some(port) => {
-                        // The transmit FIFO holds 32 bytes; at 115200 baud
-                        // the queue never outruns it for long.
-                        port.write(&echo[..count])!
-                    }
-                    none => {}
-                }
+            serial := SERIAL.lock()
+            if let some(port) = serial.get_mut() {
+                // The transmit FIFO holds 32 bytes; at 115200 baud the queue
+                // never outruns it for long.
+                port.write(&echo[..count])!
             }
         }
-        core.drop(section)
+        now := MILLISECONDS.load(atomic.Ordering.Relaxed)!
         if core.wrapping_sub(now, blinked) >= BLINK_MS {
             b.led.toggle()
             blinked = now
