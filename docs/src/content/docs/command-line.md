@@ -320,7 +320,8 @@ Otherwise `run` executes only the host target. The repository exercises
 hosted Linux GNU, macOS, and Windows x64 programs, portable standard-library
 object generation for WebAssembly and Cortex-M0, and firmware images for the
 Pico and Pico 2. Hardware execution is checked with `scripts/test_pico.py` on a
-connected board. See
+connected board, and CI runs a firmware self-test on emulated RP2040 and RP2350
+chips with `scripts/test_emulator.py`. See
 [library availability](standard-library.md#portable-and-hosted-functionality)
 for the distinctions that affect imported APIs.
 

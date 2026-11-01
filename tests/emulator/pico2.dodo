@@ -1,0 +1,16 @@
+package main
+
+import "selftest"
+
+// The emulator self-test for the `pico2` board (RP2350); see selftest.dodo.
+// Alarm 0's interrupt has a different vector name on each chip.
+@interrupt(TIMER0_IRQ_0)
+fn alarm_fired() {
+    selftest.alarm_fired()
+}
+
+fn main() {
+    // The RP2350 emulator does not model the double-precision coprocessor
+    // faithfully, so binary64 arithmetic is only checked on real boards.
+    selftest.run(false)
+}

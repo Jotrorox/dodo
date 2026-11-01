@@ -71,10 +71,11 @@ const SPINLOCK_ST: usize = 0x05C
 const SPINLOCK0: usize = 0x100
 // FIFO_ST: this core's end has a word to read (VLD), room to write (RDY),
 // and sticky flags for a write when full (WOF) and a read when empty (ROE),
-// cleared by writing the register. The FIFO interrupt is raised while any
+// each cleared by writing a 1 to it. The FIFO interrupt is raised while any
 // of VLD, WOF, and ROE is set.
 const FIFO_VALID: u32 = 1 << 0
 const FIFO_READY: u32 = 1 << 1
+const FIFO_STICKY: u32 = 0b1100
 
 // The Cortex-M core's ICSR, whose low bits are the running exception's
 // number, 16 + the IRQ; and the NVIC's interrupt clear-enable registers.
@@ -539,8 +540,9 @@ pub struct Fifo {
             WAKE[cpu.core_id() as usize] = signal.id
         }
         // Flags from reads and writes outside this API would hold the
-        // interrupt raised.
-        self.sio.write(FIFO_ST, 0)
+        // interrupt raised. Core 1's boot ROM leaves ROE set: it reads the
+        // FIFO before checking for a word while it waits to be launched.
+        self.sio.write(FIFO_ST, FIFO_STICKY)
         core.drop(section)
         self.listen()
     }
@@ -599,7 +601,7 @@ extern "C" fn dodo_fifo_interrupt() {
         cpu.fence()
         index := cpu.core_id() as usize
         status: hal.Reg<u32> = hal.Reg.at(SIO_BASE + FIFO_ST)
-        status.write(0)
+        status.write(FIFO_STICKY)
         if WAKE[index] != NO_SIGNAL {
             signal := executor.Signal { id: WAKE[index] }
             signal.raise()
