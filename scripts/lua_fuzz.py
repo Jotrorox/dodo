@@ -758,10 +758,13 @@ def normalise(b: bytes) -> bytes:
     return ADDR.sub(b"ADDR", b)
 
 
-def run_one(interp: str, script: Path, timeout: float):
+def run_one(interp: str, script: Path, timeout: float, gc_stress: int = 0):
+    env = {"PATH": "/usr/bin:/bin", "LC_ALL": "C", "TZ": "UTC"}
+    if gc_stress:
+        env["DODO_LUA_GC_STRESS"] = str(gc_stress)
     try:
         p = subprocess.run([interp, script.name], cwd=script.parent, capture_output=True, timeout=timeout,
-                           env={"PATH": "/usr/bin:/bin", "LC_ALL": "C", "TZ": "UTC"})
+                           env=env)
         err = p.stderr.replace(interp.encode(), b"lua")
         return p.returncode, normalise(p.stdout), normalise(err)
     except subprocess.TimeoutExpired:
@@ -794,7 +797,7 @@ def cmd_run(a):
         if exp[0] == "timeout":
             shutil.rmtree(d)
             return i, None
-        got = run_one(lua, f, a.timeout * 4)
+        got = run_one(lua, f, a.timeout * 4, a.gc_stress)
         bad = got != exp
         if bad:
             (keep / ("s%d_%d" % (a.seed, i))).mkdir(exist_ok=True)
@@ -833,6 +836,8 @@ def main():
     r.add_argument("--jobs", type=int, default=os.cpu_count() or 4)
     r.add_argument("--timeout", type=float, default=10.0)
     r.add_argument("--keep", default=str(REPO / "build" / "lua-fuzz-fail"))
+    r.add_argument("--gc-stress", type=int, default=0,
+                   help="run our interpreter with DODO_LUA_GC_STRESS=N")
     a = ap.parse_args()
     sys.exit(cmd_gen(a) if a.cmd == "gen" else cmd_run(a))
 

@@ -250,6 +250,24 @@ pub struct Lua {
         }
     }
 
+    // Testing aid: make the collector work at every check point (where it
+    // may run), not only when the allocation debt asks for it. Level 0 turns
+    // this off, 1 runs one incremental step and 2 a full collection at each
+    // check point. Programs behave the same, only (much) slower; this shakes
+    // out missing write barriers and unanchored objects in native code.
+    pub fn set_gc_stress(&mut self, level: i32) {
+        unsafe {
+            lvl := level
+            if lvl < 0 {
+                lvl = 0
+            }
+            if lvl > 2 {
+                lvl = 2
+            }
+            (*G(self.L)).gc_stress = lvl as u8
+        }
+    }
+
     // Close the state now (running pending finalizers) and return the
     // number of bytes that were not released (0 when nothing leaked).
     pub fn close(&mut self) -> usize {

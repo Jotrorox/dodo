@@ -96,11 +96,13 @@ def resolve_interp(value: Optional[str], cache: Path, default: Path) -> Path:
     return path
 
 
-def run_env() -> Dict[str, str]:
+def run_env(extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
     env = dict(os.environ)
     for name in LUA_ENV_VARS:
         env.pop(name, None)
     env.update(TEST_ENV)
+    if extra:
+        env.update(extra)
     return env
 
 
@@ -112,13 +114,13 @@ class Result(NamedTuple):
 
 
 def run(argv: Sequence[str], cwd: Path, timeout: float,
-        stdin: Optional[bytes] = None) -> Result:
+        stdin: Optional[bytes] = None, env: Optional[Dict[str, str]] = None) -> Result:
     start = time.perf_counter()
     posix = os.name == "posix"
     # Own process group, so a timeout also kills processes the test spawned
     # (os.execute, io.popen, main.lua's background interpreters).
     proc = subprocess.Popen(
-        list(argv), cwd=str(cwd), env=run_env(), start_new_session=posix,
+        list(argv), cwd=str(cwd), env=run_env(env), start_new_session=posix,
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
     )
     try:
@@ -512,6 +514,7 @@ class Directives(NamedTuple):
     cmd: Optional[List[str]]  # full argument list replacing opts/script/args
     stdin: Optional[str]  # file (relative to the script, or {script}) fed on stdin
     stderr: str       # "message" (default), "full" or "ignore"
+    env: Dict[str, str]  # extra environment variables
 
 
 def parse_directives(path: Path) -> Directives:
@@ -525,12 +528,16 @@ def parse_directives(path: Path) -> Directives:
       --! stdin: fixtures/f.txt file fed to stdin ({script} = the test itself)
       --! stderr: message       compare stderr up to 'stack traceback:'
                                 (default), 'full', or 'ignore'
+      --! env: NAME=value ...   extra environment variables (for example
+                                DODO_LUA_GC_STRESS=1, which the reference
+                                interpreter ignores)
     """
     opts: List[str] = []
     args: List[str] = []
     cmd: Optional[List[str]] = None
     stdin = None
     stderr = "message"
+    env: Dict[str, str] = {}
     with open(path, encoding="utf-8", errors="replace") as f:
         for lineno, line in enumerate(f, 1):
             if (lineno == 1 and line.startswith("#")) or not line.strip():
@@ -553,9 +560,15 @@ def parse_directives(path: Path) -> Directives:
                 if value not in ("message", "full", "ignore"):
                     die("%s: bad stderr directive %r" % (path, value))
                 stderr = value
+            elif key == "env":
+                for item in shlex.split(value):
+                    name, eq, val = item.partition("=")
+                    if not eq or not name:
+                        die("%s: bad env directive %r" % (path, item))
+                    env[name] = val
             else:
                 die("%s: unknown directive %r" % (path, key))
-    return Directives(opts, args, cmd, stdin, stderr)
+    return Directives(opts, args, cmd, stdin, stderr, env)
 
 
 def run_script(lua: Path, script: Path, timeout: float) -> Result:
@@ -567,7 +580,7 @@ def run_script(lua: Path, script: Path, timeout: float) -> Result:
         argv = [str(lua)] + [a.replace("{script}", script.name) for a in d.cmd]
     else:
         argv = [str(lua)] + d.opts + [script.name] + d.args
-    return run(argv, script.parent, timeout, stdin)
+    return run(argv, script.parent, timeout, stdin, d.env)
 
 
 def normalize_stderr(text: str, lua: Path, mode: str) -> str:
