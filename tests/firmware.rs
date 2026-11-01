@@ -215,6 +215,68 @@ fn main() {
     }
 }
 
+// Every board's timer is a hal counter and delay, and its alarms are hal
+// alarms: drivers generic over the protocols take them unchanged.
+#[test]
+fn timer_protocols_compile_for_every_board() {
+    let scratch = Scratch::new("timer-protocols");
+    let source = scratch.write(
+        "timers.dodo",
+        r#"package main
+import "std/embedded/board"
+import "std/embedded/hal"
+fn settle<T: hal.Delay + hal.Counter>(timer: &mut T) -> u64 {
+    start := timer.now_us()
+    deadline := hal.Deadline.after(timer, 2000)
+    for !deadline.passed(timer) {
+        timer.delay_us(100)
+    }
+    return hal.elapsed_us(timer, start)
+}
+fn pulse<A: hal.Alarm>(alarm: &mut A) -> void!hal.Error {
+    hal.schedule_in_us(alarm, 500)?
+    hal.wait_for_alarm(alarm)
+    alarm.schedule_at_us(0)?
+    core.assert(alarm.fired())
+    alarm.clear()
+    alarm.cancel()
+    return ok()
+}
+fn main() {
+    b := board.take()!
+    core.assert(settle(&mut b.timer) >= 2000)
+    ticker := hal.Ticker.start(&b.timer, 1000)
+    ticker.wait(&b.timer)
+    alarm := b.timer.alarm(1)!
+    pulse(&mut alarm)!
+    far := alarm.now_us() + 0x8000_0000
+    match alarm.schedule_at_us(far) {
+        ok() => core.assert(false),
+        err(error) => core.assert(error == hal.Error.InvalidInput),
+    }
+    b.timer.release_alarm(alarm)
+}
+"#,
+    );
+    for board in ["pico", "pico2", "pico2_w"] {
+        for level in ["0", "2"] {
+            let object = scratch.path(&format!("timers-{board}-O{level}.o"));
+            stdout(&dodo(&[
+                "build",
+                source.to_str().unwrap(),
+                "--board",
+                board,
+                "-O",
+                level,
+                "--emit",
+                "obj",
+                "-o",
+                &object,
+            ]));
+        }
+    }
+}
+
 // Low power on a board: the chip's Power through the portable protocol
 // and directly, and the example. Needs no linker.
 #[test]

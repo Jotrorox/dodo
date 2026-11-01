@@ -43,7 +43,9 @@ pub struct Pin {
     }
 }
 
-// A delay that returns immediately and adds up the requested time.
+// A delay that returns immediately and adds up the requested time. It is a
+// counter too, whose time is that sum, so a driver that delays between polls
+// of a device reaches its deadline without waiting.
 pub struct Delay {
     elapsed: u64
 
@@ -57,6 +59,87 @@ pub struct Delay {
 
     pub fn elapsed_us(&self) -> u64 {
         return self.elapsed
+    }
+
+    // The counter's time: the delays so far.
+    pub fn now_us(&self) -> u64 {
+        return self.elapsed
+    }
+}
+
+// A one-shot alarm on a simulated counter that starts at 0 and moves only
+// when the test calls `advance`. It reaches any time ahead.
+pub struct Alarm {
+    now: u64
+    target: u64
+    armed: bool
+    fired: bool
+    schedules: u32
+    failure: Option<hal.Error>
+
+    pub fn new() -> Alarm {
+        return Alarm { now: 0, target: 0, armed: false, fired: false, schedules: 0, failure: none }
+    }
+
+    pub fn now_us(&self) -> u64 {
+        return self.now
+    }
+
+    // Let `microseconds` pass; the alarm fires if its time falls within them.
+    pub fn advance(&mut self, microseconds: u64) {
+        self.now += microseconds
+        self.check()
+    }
+
+    pub fn schedule_at_us(&mut self, time_us: u64) -> void!hal.Error {
+        if let some(error) = option.take(&mut self.failure) {
+            return err(error)
+        }
+        self.schedules += 1
+        self.target = time_us
+        self.armed = true
+        self.fired = false
+        self.check()
+        return ok()
+    }
+
+    pub fn cancel(&mut self) {
+        self.armed = false
+    }
+
+    // True from scheduling until it fires or is cancelled.
+    pub fn is_armed(&self) -> bool {
+        return self.armed
+    }
+
+    pub fn fired(&self) -> bool {
+        return self.fired
+    }
+
+    pub fn clear(&mut self) {
+        self.fired = false
+    }
+
+    // The scheduled time, armed or not.
+    pub fn target_us(&self) -> u64 {
+        return self.target
+    }
+
+    // Number of successful schedules so far.
+    pub fn schedules(&self) -> u32 {
+        return self.schedules
+    }
+
+    // Make the next schedule fail with `error`, for testing error paths.
+    pub fn fail_next(&mut self, error: hal.Error) {
+        self.failure = some(error)
+    }
+
+    fn check(&mut self) {
+        if self.armed && self.now >= self.target {
+            self.armed = false
+            self.fired = true
+        }
     }
 }
 
