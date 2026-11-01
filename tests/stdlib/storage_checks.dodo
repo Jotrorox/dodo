@@ -1,0 +1,733 @@
+package main
+
+import "core/mem"
+import "std/checksum"
+import "std/embedded/hal"
+import "std/embedded/hal/fake"
+import "std/embedded/storage"
+
+// std/embedded/storage and the hal Flash protocol, against
+// std/embedded/hal/fake's flash: the fake's protocol checks, regions, the
+// key-value store's operations, limits, compaction, persistence, the
+// on-flash record format, and recovery from a power cut at every point of
+// a long run of updates.
+
+fn refused<T>(result: T!hal.Error, expected: hal.Error) -> bool {
+    match result {
+        ok(_) => {
+            return false
+        }
+        err(error) => {
+            return error == expected
+        }
+    }
+}
+
+fn rejected(result: void!hal.Error, expected: hal.Error) -> bool {
+    match result {
+        ok() => {
+            return false
+        }
+        err(error) => {
+            return error == expected
+        }
+    }
+}
+
+fn denied(result: void!storage.Error, expected: storage.Error) -> bool {
+    match result {
+        ok() => {
+            return false
+        }
+        err(error) => {
+            return error == expected
+        }
+    }
+}
+
+fn failed<T>(result: T!storage.Error, expected: storage.Error) -> bool {
+    match result {
+        ok(_) => {
+            return false
+        }
+        err(error) => {
+            return error == expected
+        }
+    }
+}
+
+// A length, or -1 for none and -2 for an error.
+fn length(result: Option<usize>!storage.Error) -> i64 {
+    match result {
+        ok(some(value)) => {
+            return value as i64
+        }
+        ok(none) => {
+            return -1
+        }
+        err(_) => {
+            return -2
+        }
+    }
+}
+
+fn number(result: Option<u32>!storage.Error) -> i64 {
+    match result {
+        ok(some(value)) => {
+            return value as i64
+        }
+        ok(none) => {
+            return -1
+        }
+        err(_) => {
+            return -2
+        }
+    }
+}
+
+fn all(bytes: &[u8], value: u8) -> bool {
+    for &byte in bytes {
+        if byte != value {
+            return false
+        }
+    }
+    return true
+}
+
+fn same(a: &[u8], b: &[u8]) -> bool {
+    if a.len != b.len {
+        return false
+    }
+    for index in 0..a.len {
+        if a[index] != b[index] {
+            return false
+        }
+    }
+    return true
+}
+
+fn fake_flash() {
+    memory := [0u8; 1024]
+    flash := fake.Flash.new(&mut memory, 256, 4)
+    core.assert(flash.capacity() == 1024 && flash.erase_size() == 256 && flash.write_size() == 4)
+    flash.erase(0, 1024)!
+    core.assert(flash.erases() == 4)
+    buffer := [0u8; 8]
+    flash.read(1021, &mut buffer[..3])!
+    core.assert(all(&buffer[..3], 0xFF))
+    // Out of range or misaligned.
+    core.assert(rejected(flash.read(1020, &mut buffer), hal.Error.InvalidInput))
+    core.assert(rejected(flash.erase(128, 256), hal.Error.InvalidInput))
+    core.assert(rejected(flash.erase(0, 100), hal.Error.InvalidInput))
+    core.assert(rejected(flash.erase(1024, 256), hal.Error.InvalidInput))
+    data: [4]u8 = [1, 2, 3, 4]
+    core.assert(rejected(flash.write(2, &data), hal.Error.InvalidInput))
+    core.assert(rejected(flash.write(4, &data[..2]), hal.Error.InvalidInput))
+    core.assert(rejected(flash.write(1024, &data), hal.Error.InvalidInput))
+    flash.write(4, &data)!
+    flash.read(4, &mut buffer[..4])!
+    core.assert(same(&buffer[..4], &data) && flash.written() == 4)
+    // Written bytes are not written again before an erase.
+    core.assert(rejected(flash.write(4, &data), hal.Error.InvalidInput))
+    flash.erase(0, 256)!
+    flash.write(4, &data)!
+    // An injected failure changes nothing.
+    flash.fail_next(hal.Error.Timeout)
+    core.assert(rejected(flash.write(8, &data), hal.Error.Timeout))
+    flash.read(8, &mut buffer[..4])!
+    core.assert(all(&buffer[..4], 0xFF))
+    // A power cut stops an operation partway and fails all until restored.
+    flash.cut_power_after(6)
+    eight: [8]u8 = [9, 9, 9, 9, 9, 9, 9, 9]
+    core.assert(rejected(flash.write(16, &eight), hal.Error.Bus))
+    core.assert(flash.is_off())
+    core.assert(rejected(flash.read(16, &mut buffer), hal.Error.Bus))
+    flash.restore_power()
+    flash.read(16, &mut buffer)!
+    core.assert(all(&buffer[..6], 9) && all(&buffer[6..], 0xFF))
+    flash.cut_power_after(100)
+    core.assert(rejected(flash.erase(0, 256), hal.Error.Bus))
+    flash.restore_power()
+    contents := flash.memory()
+    core.assert(all(&contents[..100], 0xFF) && contents[16 + 6] == 0xFF && contents[100] == 0xFF)
+}
+
+fn regions() {
+    memory := [0u8; 4096]
+    flash := fake.Flash.new(&mut memory, 512, 1)
+    flash.erase(0, 4096)!
+    core.assert(refused(storage.Region.new(flash, 100, 512), hal.Error.InvalidInput))
+    flash = fake.Flash.new(&mut memory, 512, 1)
+    core.assert(refused(storage.Region.new(flash, 512, 4096), hal.Error.InvalidInput))
+    flash = fake.Flash.new(&mut memory, 512, 1)
+    core.assert(refused(storage.Region.last(flash, 4608), hal.Error.InvalidInput))
+    flash = fake.Flash.new(&mut memory, 512, 1)
+    region := storage.Region.last(flash, 1024)!
+    core.assert(region.start() == 3072 && region.capacity() == 1024)
+    core.assert(region.erase_size() == 512 && region.write_size() == 1)
+    data: [3]u8 = [7, 8, 9]
+    region.write(1021, &data)!
+    core.assert(rejected(region.write(1022, &data), hal.Error.InvalidInput))
+    core.assert(rejected(region.erase(1024, 512), hal.Error.InvalidInput))
+    buffer := [0u8; 3]
+    region.read(1021, &mut buffer)!
+    core.assert(same(&buffer, &data))
+    region.erase(512, 512)!
+    region.read(1021, &mut buffer)!
+    core.assert(all(&buffer, 0xFF))
+    region.write(0, &data)!
+    flash = region.release()
+    flash.read(3072, &mut buffer)!
+    core.assert(same(&buffer, &data))
+    // A region inside a region.
+    inner := storage.Region.new(storage.Region.new(flash, 1024, 2048)!, 512, 512)!
+    core.assert(inner.capacity() == 512)
+    inner.write(0, &data)!
+    outer := inner.release()
+    flash = outer.release()
+    flash.read(1536, &mut buffer)!
+    core.assert(same(&buffer, &data))
+}
+
+fn basics() {
+    memory := [0xFFu8; 4096]
+    flash := fake.Flash.new(&mut memory, 1024, 4)
+    store := storage.Store.open(flash)!
+    core.assert(store.flash().written() == 0 && store.flash().erases() == 0)
+    buffer := [0u8; 64]
+    core.assert(length(store.get("missing", &mut buffer)) == -1)
+    core.assert(!store.contains("missing")!)
+    core.assert(length(store.len_of("missing")) == -1)
+    store.set("greeting", b"hello")!
+    match store.get("greeting", &mut buffer)! {
+        some(length) => {
+            core.assert(same(&buffer[..length], b"hello"))
+        }
+        none => {
+            core.assert(false)
+        }
+    }
+    core.assert(store.contains("greeting")!)
+    core.assert(length(store.len_of("greeting")) == 5)
+    // The value is replaced, and an unchanged value writes nothing.
+    store.set("greeting", b"good morning")!
+    written := store.flash().written()
+    store.set("greeting", b"good morning")!
+    core.assert(store.flash().written() == written)
+    core.assert(length(store.get("greeting", &mut buffer)) == 12)
+    core.assert(same(&buffer[..12], b"good morning"))
+    // An empty value is a value.
+    store.set("empty", b"")!
+    core.assert(store.contains("empty")! && length(store.len_of("empty")) == 0)
+    // Removal.
+    core.assert(store.remove("greeting")!)
+    core.assert(!store.remove("greeting")!)
+    core.assert(length(store.get("greeting", &mut buffer)) == -1)
+    core.assert(!store.remove("never")!)
+    store.set("greeting", b"back")!
+    core.assert(length(store.len_of("greeting")) == 4)
+    // Numbers.
+    core.assert(number(store.get_u32("count")) == -1)
+    store.set_u32("count", 0xDEAD_BEEF)!
+    core.assert(number(store.get_u32("count")) == 0xDEAD_BEEF)
+    core.assert(failed(store.get_u32("empty"), storage.Error.InvalidInput))
+    // Limits.
+    core.assert(denied(store.set("", b"x"), storage.Error.InvalidInput))
+    core.assert(failed(store.get("", &mut buffer), storage.Error.InvalidInput))
+    long := "0123456789012345678901234567890123456789012345678901234567890123"
+    longer := "01234567890123456789012345678901234567890123456789012345678901234"
+    store.set(long, b"64")!
+    core.assert(length(store.len_of(long)) == 2)
+    core.assert(denied(store.set(longer, b"65"), storage.Error.TooLarge))
+    core.assert(failed(store.get("greeting", &mut buffer[..3]), storage.Error.BufferTooSmall))
+    // A value as long as a block allows: 1024 - 12 block header - 8 kept
+    // for compaction - 8 record header - 3 key.
+    core.assert(store.max_value_len(3) == 993)
+    big := [0x5Au8; 994]
+    core.assert(denied(store.set("big", &big), storage.Error.TooLarge))
+    store.set("big", &big[..993])!
+    large := [0u8; 993]
+    core.assert(length(store.get("big", &mut large)) == 993)
+    core.assert(all(&large, 0x5A))
+    // Everything survives reopening.
+    flash = store.release()
+    store = storage.Store.open(flash)!
+    core.assert(length(store.get("greeting", &mut buffer)) == 4 && same(&buffer[..4], b"back"))
+    core.assert(number(store.get_u32("count")) == 0xDEAD_BEEF)
+    core.assert(length(store.len_of("big")) == 993)
+    core.assert(length(store.len_of(long)) == 2)
+    core.assert(store.contains("empty")!)
+    // Clearing erases everything.
+    store.clear()!
+    core.assert(!store.contains("greeting")! && !store.contains("big")!)
+    store.set("after", b"clear")!
+    flash = store.release()
+    store = storage.Store.open(flash)!
+    core.assert(length(store.len_of("after")) == 5 && !store.contains("count")!)
+}
+
+fn geometry() {
+    memory := [0xFFu8; 4096]
+    // One block is too few, a block below 256 bytes too small.
+    flash := fake.Flash.new(&mut memory[..1024], 1024, 4)
+    core.assert(failed(storage.Store.open(flash), storage.Error.InvalidInput))
+    flash = fake.Flash.new(&mut memory, 128, 4)
+    core.assert(failed(storage.Store.open(flash), storage.Error.InvalidInput))
+    // Write sizes from 1 to 256 bytes.
+    for shift in 0u32..9 {
+        size := 1u32 << shift
+        memory := [0xFFu8; 4096]
+        flash := fake.Flash.new(&mut memory, 1024, size)
+        store := storage.Store.open(flash)!
+        value := [0u8; 100]
+        for round in 0u32..40 {
+            for index in 0usize..100 {
+                value[index] = ((round * 3 + index as u32) & 0xFF) as u8
+            }
+            store.set("value", &value[..(round as usize % 90) + 10])!
+            store.set_u32("round", round)!
+        }
+        core.assert(number(store.get_u32("round")) == 39)
+        flash = store.release()
+        store = storage.Store.open(flash)!
+        core.assert(number(store.get_u32("round")) == 39)
+        buffer := [0u8; 100]
+        core.assert(length(store.get("value", &mut buffer)) == 49)
+        core.assert(buffer[0] == 117 && buffer[48] == 165)
+        if size == 256 {
+            core.assert(store.max_value_len(5) == 1024 - 256 - 256 - 8 - 5)
+        }
+    }
+}
+
+// The bytes of a record as documented in the package: value length, key
+// length, kind, CRC-32, key, value, padding.
+fn record_format() {
+    memory := [0x00u8; 2048]
+    flash := fake.Flash.new(&mut memory, 1024, 8)
+    store := storage.Store.open(flash)!
+    store.set("key", b"value")!
+    flash = store.release()
+    contents := flash.memory()
+    // Garbage was erased before the block header went in.
+    core.assert(contents[0] == 0x44 && contents[1] == 0x4B && contents[2] == 0x53 && contents[3] == 0x31)
+    core.assert(contents[4] == 0 && contents[5] == 0 && contents[6] == 0 && contents[7] == 0)
+    crc := checksum.crc32(&contents[..8])
+    core.assert(contents[8] == (crc & 0xFF) as u8 && contents[11] == (crc >> 24) as u8)
+    core.assert(all(&contents[12..16], 0xFF))
+    record := &contents[16..]
+    core.assert(record[0] == 5 && record[1] == 0 && record[2] == 3 && record[3] == 0x56)
+    covered: [12]u8 = [5, 0, 3, 0x56, 0x6B, 0x65, 0x79, 0x76, 0x61, 0x6C, 0x75, 0x65]
+    crc = checksum.crc32(&covered)
+    core.assert(record[4] == (crc & 0xFF) as u8 && record[5] == ((crc >> 8) & 0xFF) as u8)
+    core.assert(record[6] == ((crc >> 16) & 0xFF) as u8 && record[7] == (crc >> 24) as u8)
+    core.assert(same(&record[8..16], b"keyvalue"))
+    core.assert(all(&record[16..24], 0xFF) && all(&contents[1024..], 0))
+}
+
+fn name(index: u32) -> &str from(static) {
+    if index == 0 {
+        return "alpha"
+    } else if index == 1 {
+        return "beta"
+    } else if index == 2 {
+        return "gamma"
+    } else if index == 3 {
+        return "delta-with-a-longer-key"
+    } else if index == 4 {
+        return "e"
+    }
+    return "zeta"
+}
+
+const KEYS: u32 = 6
+
+// The value of version `version` of key `key`, into `buffer`.
+fn value_of(key: u32, version: u32, buffer: &mut[u8]) -> usize {
+    length := ((key * 7 + version * 13) % 40) as usize + 1
+    for index in 0..length {
+        buffer[index] = ((key * 31 + version * 17 + index as u32) & 0xFF) as u8
+    }
+    return length
+}
+
+// Whether key `key` holds version `version` (0 for none).
+fn holds(store: &mut storage.Store<fake.Flash>, key: u32, version: u32) -> bool {
+    buffer := [0u8; 64]
+    expected := [0u8; 64]
+    match store.get(name(key), &mut buffer) {
+        ok(some(length)) => {
+            if version == 0 {
+                return false
+            }
+            expected_length := value_of(key, version, &mut expected)
+            return same(&buffer[..length], &expected[..expected_length])
+        }
+        ok(none) => {
+            return version == 0
+        }
+        err(_) => {
+            return false
+        }
+    }
+}
+
+fn holds_all(store: &mut storage.Store<fake.Flash>, versions: &[u32]) -> bool {
+    for key in 0..KEYS {
+        if !holds(store, key, versions[key as usize]) {
+            return false
+        }
+    }
+    return true
+}
+
+fn next_random(state: &mut u32) -> u32 {
+    *state = core.wrapping_add(core.wrapping_mul(*state, 1_103_515_245), 12_345)
+    return *state >> 16
+}
+
+const OPERATIONS: u32 = 120
+// Operations in a power-cut run, and how many follow the cut.
+const CUT_OPERATIONS: u32 = 80
+const AFTER_CUT: u32 = 20
+
+// Operation `index` of the run: set key to version index + 1, or remove it.
+fn operate(store: &mut storage.Store<fake.Flash>, random: &mut u32, key: &mut u32, version: &mut u32) -> void!storage.Error {
+    choice := next_random(random)
+    *key = choice % KEYS
+    if choice % 7 == 3 {
+        *version = 0
+        store.remove(name(*key))?
+        return ok()
+    }
+    *version += 1000
+    buffer := [0u8; 64]
+    length := value_of(*key, *version, &mut buffer)
+    return store.set(name(*key), &buffer[..length])
+}
+
+// Many updates of a few keys run through every block many times: values
+// stay right, and erases are spread over the blocks.
+fn compaction() {
+    memory := [0xFFu8; 1024]
+    flash := fake.Flash.new(&mut memory, 256, 4)
+    store := storage.Store.open(flash)!
+    versions := [0u32; 6]
+    random := 7u32
+    stamp := 0u32
+    for _ in 0..OPERATIONS * 4 {
+        key := 0u32
+        version := stamp
+        operate(&mut store, &mut random, &mut key, &mut version)!
+        if version != 0 {
+            stamp = version
+        }
+        versions[key as usize] = version
+        core.assert(holds_all(&mut store, &versions))
+    }
+    core.assert(store.flash().erases() > 40)
+    flash = store.release()
+    store = storage.Store.open(flash)!
+    core.assert(holds_all(&mut store, &versions))
+    // The keys, each once.
+    cursor := storage.Cursor.new()
+    seen := [0u32; 6]
+    key := [0u8; 64]
+    count := 0u32
+    for {
+        match store.next_key(&mut cursor, &mut key)! {
+            some(length) => {
+                count += 1
+                for index in 0..KEYS {
+                    if same(&key[..length], mem.str_bytes(name(index))) {
+                        seen[index as usize] += 1
+                    }
+                }
+            }
+            none => {
+                break
+            }
+        }
+    }
+    live := 0u32
+    for index in 0..KEYS {
+        if versions[index as usize] != 0 {
+            live += 1
+            core.assert(seen[index as usize] == 1)
+        } else {
+            core.assert(seen[index as usize] == 0)
+        }
+    }
+    core.assert(count == live)
+    short := [0u8; 1]
+    cursor = storage.Cursor.new()
+    if live > 0 {
+        core.assert(failed(store.next_key(&mut cursor, &mut short), storage.Error.BufferTooSmall) || live == 1)
+    }
+}
+
+// Filling the store with distinct keys ends in Full, keeps what was
+// stored, and removing keys makes room again.
+fn full() {
+    memory := [0xFFu8; 1024]
+    flash := fake.Flash.new(&mut memory, 256, 4)
+    store := storage.Store.open(flash)!
+    value := [0x33u8; 40]
+    names := ["k00", "k01", "k02", "k03", "k04", "k05", "k06", "k07", "k08", "k09", "k10", "k11", "k12", "k13", "k14", "k15", "k16", "k17", "k18", "k19"]
+    stored := 0usize
+    for index in 0usize..20 {
+        match store.set(names[index], &value) {
+            ok() => {
+                stored += 1
+            }
+            err(error) => {
+                core.assert(error == storage.Error.Full)
+                break
+            }
+        }
+    }
+    // Three blocks take 12 records of 52 bytes: 4 each, after the 12-byte
+    // block header and with 8 bytes kept for compaction.
+    core.assert(stored == 12)
+    erases := store.flash().erases()
+    // Retrying a write that cannot fit does not wear the flash, nor does
+    // replacing a value, as the old one stays until the new one is in.
+    core.assert(denied(store.set(names[stored], &value), storage.Error.Full))
+    other := [0x44u8; 40]
+    core.assert(denied(store.set(names[0], &other), storage.Error.Full))
+    core.assert(store.flash().erases() == erases)
+    buffer := [0u8; 40]
+    for index in 0usize..stored {
+        core.assert(length(store.get(names[index], &mut buffer)) == 40 && buffer[0] == 0x33)
+    }
+    // A full store still removes keys, in its oldest block or its newest.
+    core.assert(store.remove(names[5])!)
+    core.assert(store.remove(names[11])!)
+    core.assert(!store.contains(names[5])! && !store.contains(names[11])!)
+    store.set(names[0], &other)!
+    store.set(names[stored], &value)!
+    core.assert(store.contains(names[stored])!)
+    for index in 0usize..stored + 1 {
+        if index != 5 && index != 11 {
+            core.assert(length(store.get(names[index], &mut buffer)) == 40)
+            core.assert(buffer[0] == 0x33 || (index == 0 && buffer[0] == 0x44))
+        }
+    }
+    flash = store.release()
+    store = storage.Store.open(flash)!
+    core.assert(store.contains(names[stored])! && !store.contains(names[5])! && !store.contains(names[11])!)
+    store.get(names[0], &mut buffer)!
+    core.assert(buffer[0] == 0x44)
+}
+
+// Cut the power after `budget` changed bytes of a run of operations, or
+// with `between`, just after `budget` erases and writes. The operation in
+// progress either happened or did not, every other key keeps its value,
+// and the store keeps working, both after reopening and, with `remount`
+// false, with the same store once the power is back.
+fn power_cut(budget: u32, between: bool, remount: bool) -> bool {
+    memory := [0xFFu8; 1024]
+    flash := fake.Flash.new(&mut memory, 256, 4)
+    if between {
+        flash.cut_power_after_operations(budget)
+    } else {
+        flash.cut_power_after(budget)
+    }
+    store := storage.Store.open(flash)!
+    versions := [0u32; 6]
+    random := 11u32
+    stamp := 0u32
+    cut := false
+    left := AFTER_CUT
+    for _ in 0..CUT_OPERATIONS {
+        if cut {
+            if left == 0 {
+                break
+            }
+            left -= 1
+        }
+        key := 0u32
+        version := stamp
+        before := versions[key as usize]
+        result := operate(&mut store, &mut random, &mut key, &mut version)
+        if version != 0 {
+            stamp = version
+        }
+        match result {
+            ok() => {
+                versions[key as usize] = version
+            }
+            err(error) => {
+                core.assert(!cut && error == storage.Error.Flash && store.flash().is_off())
+                cut = true
+                before = versions[key as usize]
+                store.flash().restore_power()
+                if remount {
+                    flash = store.release()
+                    store = storage.Store.open(flash)!
+                }
+                if holds(&mut store, key, version) {
+                    versions[key as usize] = version
+                } else {
+                    core.assert(holds(&mut store, key, before))
+                }
+                core.assert(holds_all(&mut store, &versions))
+            }
+        }
+    }
+    core.assert(holds_all(&mut store, &versions))
+    flash = store.release()
+    store = storage.Store.open(flash)!
+    core.assert(holds_all(&mut store, &versions))
+    return cut
+}
+
+fn power_cuts() {
+    // Bytes the whole run changes, without a cut.
+    memory := [0xFFu8; 1024]
+    flash := fake.Flash.new(&mut memory, 256, 4)
+    store := storage.Store.open(flash)!
+    random := 11u32
+    stamp := 0u32
+    for _ in 0..CUT_OPERATIONS {
+        key := 0u32
+        version := stamp
+        operate(&mut store, &mut random, &mut key, &mut version)!
+        if version != 0 {
+            stamp = version
+        }
+    }
+    flash = store.release()
+    total := flash.written() + flash.erases() * 256
+    operations := flash.operations()
+    core.assert(total > 4000 && operations > 100)
+    // Partway through erases and writes.
+    budget := 0u32
+    runs := 0u32
+    cuts := 0u32
+    for budget < total {
+        if power_cut(budget, false, true) {
+            cuts += 1
+        }
+        if power_cut(budget + 5, false, false) {
+            cuts += 1
+        }
+        runs += 1
+        budget += 11
+    }
+    core.assert(cuts >= runs)
+    // Just after each erase and write.
+    cuts = 0
+    for count in 1..operations {
+        if power_cut(count, true, true) && power_cut(count, true, false) {
+            cuts += 1
+        }
+    }
+    core.assert(cuts == operations - 1)
+}
+
+// A compaction's erase that fails halfway can leave the old block's header
+// and records behind. Its records are older than their copies, and a
+// deletion whose value was in the same block was copied, so nothing comes
+// back.
+fn half_erased_block() {
+    memory := [0xFFu8; 1024]
+    flash := fake.Flash.new(&mut memory, 256, 4)
+    store := storage.Store.open(flash)!
+    store.set("gone", b"forgotten value")!
+    store.set("kept", b"first")!
+    core.assert(store.remove("gone")!)
+    store.set("kept", b"second")!
+    snapshot := [0u8; 1024]
+    padding := [0x77u8; 30]
+    round := 0u32
+    restored := false
+    for round < 40 && !restored {
+        flash = store.release()
+        before := flash.erases()
+        contents := flash.memory()
+        for index in 0usize..1024 {
+            snapshot[index] = contents[index]
+        }
+        store = storage.Store.open(flash)!
+        padding[0] = (round & 0xFF) as u8
+        store.set("padding", &padding)!
+        flash = store.release()
+        if flash.erases() > before {
+            // Bring back every erased block as it was, except the deletion.
+            contents := flash.memory()
+            for block in 0usize..4 {
+                start := block * 256
+                if all(&contents[start..start + 256], 0xFF) && !all(&snapshot[start..start + 256], 0xFF) {
+                    for index in start..start + 256 {
+                        contents[index] = snapshot[index]
+                    }
+                    for index in start..start + 244 {
+                        if contents[index] == 0 && contents[index + 1] == 0 && contents[index + 2] == 4 && contents[index + 3] == 0x44 && contents[index + 8] == 0x67 && contents[index + 9] == 0x6F {
+                            for wipe in index..index + 12 {
+                                contents[wipe] = 0xFF
+                            }
+                            restored = true
+                        }
+                    }
+                }
+            }
+        }
+        store = storage.Store.open(flash)!
+        round += 1
+    }
+    core.assert(restored)
+    core.assert(!store.contains("gone")!)
+    buffer := [0u8; 30]
+    core.assert(length(store.get("kept", &mut buffer)) == 6 && same(&buffer[..6], b"second"))
+    core.assert(length(store.get("padding", &mut buffer)) == 30)
+    store.set("more", b"still works")!
+    flash = store.release()
+    store = storage.Store.open(flash)!
+    core.assert(!store.contains("gone")! && store.contains("more")!)
+}
+
+// Regions as stores, and device errors reported as storage errors.
+fn stores_in_regions() {
+    memory := [0xFFu8; 8192]
+    flash := fake.Flash.new(&mut memory, 1024, 4)
+    region := storage.Region.last(flash, 4096)!
+    store := storage.Store.open(region)!
+    store.set("in region", b"yes")!
+    region = store.release()
+    flash = region.release()
+    core.assert(all(&flash.memory()[..4096], 0xFF))
+    region = storage.Region.last(flash, 4096)!
+    store = storage.Store.open(region)!
+    core.assert(length(store.len_of("in region")) == 3)
+    core.assert(store.flash().start() == 4096)
+}
+
+fn device_errors() {
+    memory := [0xFFu8; 2048]
+    flash := fake.Flash.new(&mut memory, 1024, 4)
+    store := storage.Store.open(flash)!
+    store.flash().fail_next(hal.Error.Timeout)
+    core.assert(denied(store.set("a", b"b"), storage.Error.Flash))
+    store.flash().fail_next(hal.Error.Busy)
+    core.assert(denied(store.set("a", b"b"), storage.Error.Busy))
+    store.set("a", b"b")!
+    store.flash().fail_next(hal.Error.Bus)
+    core.assert(failed(store.contains("a"), storage.Error.Flash))
+    core.assert(length(store.len_of("a")) == 1)
+    core.assert(same(mem.str_bytes(storage.error_name(storage.Error.Full)), b"Full"))
+}
+
+fn main() {
+    fake_flash()
+    regions()
+    basics()
+    geometry()
+    record_format()
+    compaction()
+    full()
+    half_erased_block()
+    stores_in_regions()
+    device_errors()
+    power_cuts()
+}

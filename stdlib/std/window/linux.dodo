@@ -2,6 +2,7 @@ package linux
 
 import "core/ptr"
 import "core/mem"
+import "std/window/heap"
 import "std/window/raw"
 import "std/window/x11"
 
@@ -9,12 +10,13 @@ import "std/window/x11"
 // only finds the server, connects and moves bytes, so no X library is
 // needed. Pixels are sent with PutImage, split to fit the server's request
 // size limit.
+//
+// The process's one connection lives in a static, with a Slot per open
+// window; Backend's associated functions act on it, so windows need no
+// reference to the App that opened them.
 
 unsafe extern "C" fn dodo_window_claim() -> i32
 unsafe extern "C" fn dodo_window_release()
-unsafe extern "C" fn dodo_window_alloc(bytes: usize) -> *mut u8
-unsafe extern "C" fn dodo_window_free(memory: *mut u8)
-unsafe extern "C" fn dodo_window_empty() -> *mut u8
 unsafe extern "C" fn dodo_window_x11_connect(socket: *mut i32, screen: *mut u32, cookie: *mut u8, capacity: usize) -> i32
 unsafe extern "C" fn dodo_window_x11_read(socket: i32, buffer: *mut u8, length: usize) -> i64
 unsafe extern "C" fn dodo_window_x11_write(socket: i32, data: *const u8, length: usize) -> i32
@@ -32,47 +34,6 @@ const OUTPUT: usize = 262144
 const NO_REPLY: u32 = 0xffffffff
 
 const EVENTS: u32 = 0x1 | 0x2 | 0x4 | 0x8 | 0x20 | 0x40 | 0x8000 | 0x20000 | 0x200000
-
-// Bytes allocated by the C runtime and freed with their owner.
-struct Memory {
-    pointer: *mut u8
-    length: usize
-
-    fn new(length: usize) -> Memory!raw.Error {
-        pointer := unsafe {
-            dodo_window_alloc(length)
-        }
-        if ptr.is_null(pointer) {
-            return err(raw.Error.OutOfMemory)
-        }
-        return ok(Memory { pointer: pointer, length: length })
-    }
-    fn empty() -> Memory {
-        pointer := unsafe {
-            dodo_window_empty()
-        }
-        return Memory { pointer: pointer, length: 0 }
-    }
-    fn bytes(&mut self) -> &mut[u8] from(self) {
-        unsafe {
-            pointer := self.pointer
-            length := self.length
-            return ptr.borrow_slice_mut(pointer, length, self)
-        }
-    }
-    fn view(&self) -> &[u8] from(self) {
-        unsafe {
-            return ptr.borrow_slice(self.pointer as *const u8, self.length, self)
-        }
-    }
-    fn drop(&mut self) {
-        if self.length != 0 {
-            unsafe {
-                dodo_window_free(self.pointer)
-            }
-        }
-    }
-}
 
 fn modifiers(state: u32) -> u32 {
     bits := 0u32
@@ -114,27 +75,51 @@ fn key_of(keycode: u32) -> u32 {
     return EVDEV_KEYS[(keycode - 8) as usize] as u32
 }
 
-fn set(event: &mut raw.Event, kind: u32, code: u32, modifiers: u32, flags: u32, x: i32, y: i32) {
+fn set(event: &mut raw.Event, window: u32, kind: u32, code: u32, modifiers: u32, flags: u32, x: i32, y: i32) {
     event.kind = kind
     event.code = code
     event.modifiers = modifiers
     event.flags = flags
     event.x = x
     event.y = y
+    event.window = window
 }
 
-pub struct Backend {
-    socket: i32
-    active: bool
-    pixels: Memory
+// One open window.
+struct Slot {
+    // Its std/window id, and its X11 window and graphics context.
+    id: u32
+    window: u32
+    gc: u32
+    // The drawing area as the server last reported it.
     width: u32
     height: u32
-    input: Memory
+    // The attached pixel buffer, owned by std/window; 0 before the first.
+    pixels: usize
+    pixel_width: u32
+    pixel_height: u32
+    mouse_inside: bool
+    // An earlier refresh Present reported, its time in microseconds and
+    // frame counter, to measure the refresh period in nanoseconds against.
+    base_ust: u64
+    base_msc: u64
+    period: u64
+}
+
+// Window ids are never reused within a process, across connections too.
+static mut NEXT_ID: u32 = 1
+
+static mut CONNECTION: Connection = Connection { active: false, socket: -1, input: heap.Bytes { address: 0, length: 0 }, input_start: 0, input_end: 0, output: heap.Bytes { address: 0, length: 0 }, output_length: 0, mapping: heap.Bytes { address: 0, length: 0 }, mapping_first: 0, mapping_count: 0, per_keycode: 0, mapping_sequence: NO_REPLY, root: 0, depth: 24, max_request: 0, id_base: 0, id_step: 1, id_count: 0, blank_cursor: 0, wm_protocols: 0, wm_delete: 0, net_wm_name: 0, utf8_string: 0, sequence: 0, pending_text: 0, pending_window: 0, repeat_keycode: 0, present_opcode: 0, present_serial: 0, windows: heap.Table<Slot> { address: 0, count: 0, capacity: 0 } }
+
+struct Connection {
+    active: bool
+    socket: i32
+    input: heap.Bytes
     input_start: usize
     input_end: usize
-    output: Memory
+    output: heap.Bytes
     output_length: usize
-    mapping: Memory
+    mapping: heap.Bytes
     mapping_first: u32
     mapping_count: u32
     per_keycode: u32
@@ -145,41 +130,24 @@ pub struct Backend {
     id_base: u32
     id_step: u32
     id_count: u32
-    window: u32
-    gc: u32
     blank_cursor: u32
     wm_protocols: u32
     wm_delete: u32
     net_wm_name: u32
     utf8_string: u32
     sequence: u32
+    // Text of the last key press, reported after its Key event, and its
+    // window.
     pending_text: u32
+    pending_window: u32
     repeat_keycode: u32
-    mouse_inside: bool
     // The Present extension's major opcode, or 0 without it.
     present_opcode: u8
     present_serial: u32
-    // An earlier refresh Present reported, its time in microseconds and
-    // frame counter, to measure the refresh period in nanoseconds against.
-    base_ust: u64
-    base_msc: u64
-    period: u64
+    windows: heap.Table<Slot>
 
-    pub fn open(title: &str, width: u32, height: u32, resizable: bool) -> Backend!raw.Error {
-        claimed := unsafe {
-            dodo_window_claim()
-        }
-        if claimed != 0 {
-            return err(raw.from_code(claimed))
-        }
-        backend := Backend { socket: -1, active: false, pixels: Memory.empty(), width: 0, height: 0, input: Memory.empty(), input_start: 0, input_end: 0, output: Memory.empty(), output_length: 0, mapping: Memory.empty(), mapping_first: 0, mapping_count: 0, per_keycode: 0, mapping_sequence: NO_REPLY, root: 0, depth: 24, max_request: 0, id_base: 0, id_step: 1, id_count: 0, window: 0, gc: 0, blank_cursor: 0, wm_protocols: 0, wm_delete: 0, net_wm_name: 0, utf8_string: 0, sequence: 0, pending_text: 0, repeat_keycode: 0, mouse_inside: false, present_opcode: 0, present_serial: 0, base_ust: 0, base_msc: 0, period: 0 }
-        // From here on, dropping the backend releases the claim and socket.
-        backend.active = true
-        backend.connect(title, width, height, resizable)?
-        return ok(backend)
-    }
-
-    fn connect(&mut self, title: &str, width: u32, height: u32, resizable: bool) -> void!raw.Error {
+    // Connect to the server named by DISPLAY.
+    fn connect(&mut self) -> void!raw.Error {
         cookie := [0u8; 256]
         socket := -1i32
         screen := 0u32
@@ -190,8 +158,8 @@ pub struct Backend {
             return err(raw.from_code(-found))
         }
         self.socket = socket
-        self.input = Memory.new(INPUT)?
-        self.output = Memory.new(OUTPUT)?
+        self.input = allocate(INPUT)?
+        self.output = allocate(OUTPUT)?
 
         // Setup: the request, then a reply of announced length.
         name := mem.str_bytes("MIT-MAGIC-COOKIE-1")
@@ -236,35 +204,33 @@ pub struct Backend {
         for self.mapping_sequence != NO_REPLY {
             self.receive(raw.FOREVER)?
         }
-        self.find_present()?
+        return self.find_present()
+    }
 
-        // The window and its properties.
-        self.pixels = Memory.new(width as usize * height as usize * 4)?
-        self.width = width
-        self.height = height
-        window_id := self.new_id()?
-        self.window = window_id
-        gc_id := self.new_id()?
-        self.gc = gc_id
-        window := self.window
+    // Create, describe and map a window; returns its id.
+    fn open(&mut self, title: &str, width: u32, height: u32, resizable: bool) -> u32!raw.Error {
+        if !self.active {
+            return err(raw.Error.Closed)
+        }
+        window := self.new_id()?
+        gc := self.new_id()?
         root := self.root
         self.reserve(512)?
-        start = self.output_length
-        out = self.output.bytes()
-        length = x11.create_window(&mut out[start..], window, root, width, height, EVENTS)
+        start := self.output_length
+        out := self.output.bytes()
+        length := x11.create_window(&mut out[start..], window, root, width, height, EVENTS)
         self.commit(length)?
-        self.set_title(title)?
+        self.name(window, title)?
         protocols := [0u8; 4]
         put32(&mut protocols, 0, self.wm_delete)
         wm_protocols := self.wm_protocols
-        self.property(wm_protocols, x11.ATOM_ATOM, 32, &protocols)?
-        self.property(x11.ATOM_WM_CLASS, x11.ATOM_STRING, 8, mem.str_bytes("dodo\0Dodo\0"))?
+        self.property(window, wm_protocols, x11.ATOM_ATOM, 32, &protocols)?
+        self.property(window, x11.ATOM_WM_CLASS, x11.ATOM_STRING, 8, mem.str_bytes("dodo\0Dodo\0"))?
         if !resizable {
             hints := [0u8; 72]
             x11.fixed_size_hints(&mut hints, width, height)
-            self.property(x11.ATOM_WM_NORMAL_HINTS, x11.ATOM_WM_SIZE_HINTS, 32, &hints)?
+            self.property(window, x11.ATOM_WM_NORMAL_HINTS, x11.ATOM_WM_SIZE_HINTS, 32, &hints)?
         }
-        gc := self.gc
         self.reserve(64)?
         start = self.output_length
         out = self.output.bytes()
@@ -282,7 +248,98 @@ pub struct Backend {
         out = self.output.bytes()
         length = x11.map_window(&mut out[start..], window)
         self.commit(length)?
-        return self.flush()
+        id := unsafe {
+            NEXT_ID
+        }
+        unsafe {
+            NEXT_ID += 1
+        }
+        if !self.windows.push(Slot { id: id, window: window, gc: gc, width: width, height: height, pixels: 0, pixel_width: 0, pixel_height: 0, mouse_inside: false, base_ust: 0, base_msc: 0, period: 0 }) {
+            self.destroy(window, gc)
+            return err(raw.Error.OutOfMemory)
+        }
+        self.flush()?
+        return ok(id)
+    }
+
+    fn close(&mut self, id: u32) {
+        if let some(index) = self.slot(id) {
+            window := 0u32
+            gc := 0u32
+            {
+                records := self.windows.records()
+                window = records[index].window
+                gc = records[index].gc
+            }
+            self.windows.remove(index)
+            if self.pending_window == id {
+                self.pending_text = 0
+            }
+            self.destroy(window, gc)
+        }
+    }
+    // Free a window's server resources, ignoring a broken connection.
+    fn destroy(&mut self, window: u32, gc: u32) {
+        match self.reserve(16) {
+            ok() => {}
+            err(_) => {
+                return
+            }
+        }
+        start := self.output_length
+        out := self.output.bytes()
+        length := x11.free_gc(&mut out[start..], gc)
+        self.output_length += length
+        start = self.output_length
+        out = self.output.bytes()
+        length = x11.destroy_window(&mut out[start..], window)
+        self.output_length += length
+        self.sequence = (self.sequence + 2) & 0xffff
+        match self.flush() {
+            ok() => {}
+            err(_) => {}
+        }
+    }
+
+    // Close the socket, which destroys every window, and release the claim.
+    fn disconnect(&mut self) {
+        if self.socket >= 0 {
+            unsafe {
+                dodo_window_x11_close(self.socket)
+            }
+            self.socket = -1
+        }
+        self.windows.clear()
+        self.input = heap.Bytes.empty()
+        self.output = heap.Bytes.empty()
+        self.mapping = heap.Bytes.empty()
+        if self.active {
+            self.active = false
+            unsafe {
+                dodo_window_release()
+            }
+        }
+    }
+
+    // The index of window `id`'s slot.
+    fn slot(&self, id: u32) -> Option<usize> {
+        records := self.windows.view()
+        for i in 0usize..records.len {
+            if records[i].id == id {
+                return some(i)
+            }
+        }
+        return none
+    }
+    // The index of the slot of the X11 window `window`.
+    fn slot_of(&self, window: u32) -> Option<usize> {
+        records := self.windows.view()
+        for i in 0usize..records.len {
+            if records[i].window == window {
+                return some(i)
+            }
+        }
+        return none
     }
 
     fn new_id(&mut self) -> u32!raw.Error {
@@ -317,23 +374,30 @@ pub struct Backend {
         length := self.output_length
         self.output_length = 0
         code := unsafe {
-            dodo_window_x11_write(self.socket, self.output.pointer as *const u8, length)
+            dodo_window_x11_write(self.socket, self.output.pointer() as *const u8, length)
         }
         if code != 0 {
             return err(raw.from_code(code))
         }
         return ok()
     }
-    fn property(&mut self, property: u32, kind: u32, format: u8, data: &[u8]) -> void!raw.Error {
+    fn property(&mut self, window: u32, property: u32, kind: u32, format: u8, data: &[u8]) -> void!raw.Error {
         if data.len > OUTPUT - 64 {
             return err(raw.Error.InvalidInput)
         }
         self.reserve(data.len + 32)?
-        window := self.window
         start := self.output_length
         out := self.output.bytes()
         length := x11.change_property(&mut out[start..], window, property, kind, format, data)
         return self.commit(length)
+    }
+    // Set both the Latin-1 and the UTF-8 title properties.
+    fn name(&mut self, window: u32, title: &str) -> void!raw.Error {
+        text := mem.str_bytes(title)
+        self.property(window, x11.ATOM_WM_NAME, x11.ATOM_STRING, 8, text)?
+        net_wm_name := self.net_wm_name
+        utf8_string := self.utf8_string
+        return self.property(window, net_wm_name, utf8_string, 8, text)
     }
     fn atom(&mut self, name: &str) -> u32!raw.Error {
         self.reserve(64)?
@@ -349,7 +413,7 @@ pub struct Backend {
         return ok(x11.u32_at(&head, 8))
     }
     // Send the buffered requests and wait for the answer to request
-    // `wanted`, skipping other messages; only used before the window
+    // `wanted`, skipping other messages; only used before any window
     // exists. Copies the answer's first 32 bytes to `head` and returns true
     // for a reply, false for an error.
     fn reply(&mut self, wanted: u32, head: &mut[u8]) -> bool!raw.Error {
@@ -437,7 +501,7 @@ pub struct Backend {
         }
         end := self.input_end
         count := unsafe {
-            dodo_window_x11_read(self.socket, ptr.offset(self.input.pointer, end as isize), INPUT - end)
+            dodo_window_x11_read(self.socket, ptr.offset(self.input.pointer(), end as isize), INPUT - end)
         }
         if count < 0 {
             return err(raw.from_code(-(count as i32)))
@@ -498,7 +562,7 @@ pub struct Backend {
         self.input_start += x11.PACKET
         if kind == x11.ERROR {
             // A failed asynchronous request such as a PutImage racing a
-            // resize; nothing waits for it.
+            // resize or a window's destruction; nothing waits for it.
             if x11.sequence(&message) == self.mapping_sequence {
                 self.mapping_sequence = NO_REPLY
             }
@@ -514,33 +578,40 @@ pub struct Backend {
         }
         ust := 0u64
         msc := 0u64
+        window := 0u32
         {
             source := self.input.view()
             message := &source[begin..begin + 40]
-            if message[1] != self.present_opcode || x11.u16_at(message, 8) != x11.PRESENT_COMPLETE_NOTIFY || message[10] != x11.PRESENT_KIND_NOTIFY_MSC || x11.u32_at(message, 16) != self.window {
+            if message[1] != self.present_opcode || x11.u16_at(message, 8) != x11.PRESENT_COMPLETE_NOTIFY || message[10] != x11.PRESENT_KIND_NOTIFY_MSC {
                 return false
             }
+            window = x11.u32_at(message, 16)
             ust = x11.u64_at(message, 24)
             msc = x11.u64_at(message, 32)
         }
+        let some(index) = self.slot_of(window) else {
+            return false
+        }
+        records := self.windows.records()
+        slot := &mut records[index]
         // Averaged over at least 30 refreshes, since single reports jitter,
         // and restarted every 300 to follow a changing display.
-        if self.base_msc == 0 || msc <= self.base_msc || ust <= self.base_ust {
-            self.base_ust = ust
-            self.base_msc = msc
-        } else if msc - self.base_msc >= 30 {
-            period := (ust - self.base_ust) * 1000 / (msc - self.base_msc)
+        if slot.base_msc == 0 || msc <= slot.base_msc || ust <= slot.base_ust {
+            slot.base_ust = ust
+            slot.base_msc = msc
+        } else if msc - slot.base_msc >= 30 {
+            period := (ust - slot.base_ust) * 1000 / (msc - slot.base_msc)
             // Between 500 and 10 Hz; anything else is a clock glitch.
             plausible := period >= 2000000 && period <= 100000000
             if plausible {
-                self.period = period
+                slot.period = period
             }
-            if msc - self.base_msc >= 300 || !plausible {
-                self.base_ust = ust
-                self.base_msc = msc
+            if msc - slot.base_msc >= 300 || !plausible {
+                slot.base_ust = ust
+                slot.base_msc = msc
             }
         }
-        set(event, raw.FRAME, 0, 0, 0, 0, 0)
+        set(event, slot.id, raw.FRAME, 0, 0, 0, 0, 0)
         return true
     }
     fn receive(&mut self, milliseconds: u32) -> bool!raw.Error {
@@ -554,11 +625,11 @@ pub struct Backend {
         if per == 0 || bytes < self.mapping_count as usize * per as usize * 4 {
             return
         }
-        match Memory.new(bytes) {
-            ok(memory) => {
+        match heap.Bytes.new(bytes) {
+            some(memory) => {
                 self.mapping = memory
             }
-            err(_) => {
+            none => {
                 return
             }
         }
@@ -569,9 +640,23 @@ pub struct Backend {
         copy_to(target, &source[begin..begin + bytes])
     }
 
+    // The id of the window whose X11 window is at `offset` in `message`,
+    // or 0 when it is none of ours.
+    fn window_at(&self, message: &[u8], offset: usize) -> u32 {
+        if let some(index) = self.slot_of(x11.u32_at(message, offset)) {
+            records := self.windows.view()
+            return records[index].id
+        }
+        return 0
+    }
+
     fn translate(&mut self, message: &[u8], event: &mut raw.Event) -> bool!raw.Error {
         kind := x11.code(message)
         if kind == x11.KEY_PRESS || kind == x11.KEY_RELEASE {
+            id := self.window_at(message, 12)
+            if id == 0 {
+                return ok(false)
+            }
             keycode := message[1] as u32
             state := x11.u16_at(message, 28)
             if kind == x11.KEY_RELEASE {
@@ -581,7 +666,7 @@ pub struct Backend {
                     self.repeat_keycode = keycode
                     return ok(false)
                 }
-                set(event, raw.KEY, key_of(keycode), modifiers(state), 0, 0, 0)
+                set(event, id, raw.KEY, key_of(keycode), modifiers(state), 0, 0, 0)
                 return ok(true)
             }
             flags := raw.PRESSED
@@ -594,11 +679,16 @@ pub struct Backend {
             sym := x11.lookup(self.mapping.view(), first, per, keycode, state)
             if (state & (x11.CONTROL_MASK | x11.MOD1_MASK | x11.MOD4_MASK)) == 0 {
                 self.pending_text = x11.keysym_to_unicode(sym)
+                self.pending_window = id
             }
-            set(event, raw.KEY, key_of(keycode), modifiers(state), flags, 0, 0)
+            set(event, id, raw.KEY, key_of(keycode), modifiers(state), flags, 0, 0)
             return ok(true)
         }
         if kind == x11.BUTTON_PRESS || kind == x11.BUTTON_RELEASE {
+            id := self.window_at(message, 12)
+            if id == 0 {
+                return ok(false)
+            }
             detail := message[1] as u32
             x := x11.i16_at(message, 24)
             y := x11.i16_at(message, 26)
@@ -618,7 +708,7 @@ pub struct Backend {
                 } else {
                     dx = 120
                 }
-                set(event, raw.SCROLL, 0, bits, 0, dx, dy)
+                set(event, id, raw.SCROLL, 0, bits, 0, dx, dy)
                 return ok(true)
             }
             button := 0u32
@@ -637,60 +727,73 @@ pub struct Backend {
             if kind == x11.BUTTON_PRESS {
                 flags = raw.PRESSED
             }
-            set(event, raw.MOUSE_BUTTON, button, bits, flags, x, y)
+            set(event, id, raw.MOUSE_BUTTON, button, bits, flags, x, y)
             return ok(true)
         }
-        if kind == x11.MOTION_NOTIFY {
-            self.mouse_inside = true
-            set(event, raw.MOUSE_MOVE, 0, modifiers(x11.u16_at(message, 28)), 0, x11.i16_at(message, 24), x11.i16_at(message, 26))
-            return ok(true)
-        }
-        if kind == x11.LEAVE_NOTIFY {
-            // Ignore the crossings grabs cause while a button is held.
-            if message[30] != 0 || !self.mouse_inside {
+        if kind == x11.MOTION_NOTIFY || kind == x11.LEAVE_NOTIFY {
+            let some(index) = self.slot_of(x11.u32_at(message, 12)) else {
                 return ok(false)
             }
-            self.mouse_inside = false
-            set(event, raw.MOUSE_LEAVE, 0, 0, 0, 0, 0)
+            records := self.windows.records()
+            slot := &mut records[index]
+            if kind == x11.MOTION_NOTIFY {
+                slot.mouse_inside = true
+                set(event, slot.id, raw.MOUSE_MOVE, 0, modifiers(x11.u16_at(message, 28)), 0, x11.i16_at(message, 24), x11.i16_at(message, 26))
+                return ok(true)
+            }
+            // Ignore the crossings grabs cause while a button is held.
+            if message[30] != 0 || !slot.mouse_inside {
+                return ok(false)
+            }
+            slot.mouse_inside = false
+            set(event, slot.id, raw.MOUSE_LEAVE, 0, 0, 0, 0, 0)
             return ok(true)
         }
         if kind == x11.FOCUS_IN || kind == x11.FOCUS_OUT {
-            mode := message[9]
+            id := self.window_at(message, 4)
+            mode := message[8]
             detail := message[1]
-            if (mode != 0 && mode != 3) || detail == 5 {
+            if id == 0 || (mode != 0 && mode != 3) || detail == 5 {
                 return ok(false)
             }
             flags := 0u32
             if kind == x11.FOCUS_IN {
                 flags = raw.PRESSED
             }
-            set(event, raw.FOCUS, 0, 0, flags, 0, 0)
+            set(event, id, raw.FOCUS, 0, 0, flags, 0, 0)
             return ok(true)
         }
         if kind == x11.EXPOSE {
-            x := x11.u16_at(message, 8) as i32
-            y := x11.u16_at(message, 10) as i32
-            width := x11.u16_at(message, 12)
-            height := x11.u16_at(message, 14)
-            self.put(x, y, width, height)?
+            if let some(index) = self.slot_of(x11.u32_at(message, 4)) {
+                x := x11.u16_at(message, 8) as i32
+                y := x11.u16_at(message, 10) as i32
+                width := x11.u16_at(message, 12)
+                height := x11.u16_at(message, 14)
+                self.put(index, x, y, width, height)?
+            }
             return ok(false)
         }
         if kind == x11.CONFIGURE_NOTIFY {
-            if x11.u32_at(message, 8) != self.window {
+            let some(index) = self.slot_of(x11.u32_at(message, 8)) else {
                 return ok(false)
             }
             width := x11.u16_at(message, 20)
             height := x11.u16_at(message, 22)
-            if width == self.width && height == self.height {
+            records := self.windows.records()
+            slot := &mut records[index]
+            if width == slot.width && height == slot.height {
                 return ok(false)
             }
-            self.resize(width, height)?
-            set(event, raw.RESIZE, 0, 0, 0, width as i32, height as i32)
+            // std/window brings the pixel buffer to the new size itself.
+            slot.width = width
+            slot.height = height
+            set(event, slot.id, raw.RESIZE, 0, 0, 0, width as i32, height as i32)
             return ok(true)
         }
         if kind == x11.CLIENT_MESSAGE {
-            if x11.u32_at(message, 8) == self.wm_protocols && x11.u32_at(message, 12) == self.wm_delete {
-                set(event, raw.CLOSE, 0, 0, 0, 0, 0)
+            id := self.window_at(message, 4)
+            if id != 0 && x11.u32_at(message, 8) == self.wm_protocols && x11.u32_at(message, 12) == self.wm_delete {
+                set(event, id, raw.CLOSE, 0, 0, 0, 0, 0)
                 return ok(true)
             }
             return ok(false)
@@ -717,33 +820,27 @@ pub struct Backend {
         return ok(x11.code(next) == x11.KEY_PRESS && next[1] as u32 == keycode && x11.u32_at(next, 4) == time)
     }
 
-    fn resize(&mut self, width: u32, height: u32) -> void!raw.Error {
-        next := Memory.new(width as usize * height as usize * 4)?
-        rows := smaller(height, self.height)
-        columns := smaller(width, self.width)
+    // Send a rectangle of slot `index`'s pixel buffer in requests below the
+    // server's size limit.
+    fn put(&mut self, index: usize, x: i32, y: i32, width: u32, height: u32) -> void!raw.Error {
+        pixels := 0usize
+        buffer_width := 0u32
+        buffer_height := 0u32
+        window := 0u32
+        gc := 0u32
         {
-            source := self.pixels.view()
-            target := next.bytes()
-            for y in 0usize..rows as usize {
-                origin := y * self.width as usize * 4
-                to := y * width as usize * 4
-                copy_to(&mut target[to..to + columns as usize * 4], &source[origin..origin + columns as usize * 4])
-            }
+            records := self.windows.view()
+            pixels = records[index].pixels
+            buffer_width = records[index].pixel_width
+            buffer_height = records[index].pixel_height
+            window = records[index].window
+            gc = records[index].gc
         }
-        self.pixels = next
-        self.width = width
-        self.height = height
-        return ok()
-    }
-
-    // Send a rectangle of the pixel buffer in requests below the server's
-    // size limit.
-    fn put(&mut self, x: i32, y: i32, width: u32, height: u32) -> void!raw.Error {
-        if x < 0 || y < 0 || width == 0 || height == 0 || x as u32 >= self.width || y as u32 >= self.height {
+        if pixels == 0 || x < 0 || y < 0 || width == 0 || height == 0 || x as u32 >= buffer_width || y as u32 >= buffer_height {
             return ok()
         }
-        w := smaller(width, self.width - x as u32)
-        h := smaller(height, self.height - y as u32)
+        w := smaller(width, buffer_width - x as u32)
+        h := smaller(height, buffer_height - y as u32)
         limit := OUTPUT
         if self.max_request < limit {
             limit = self.max_request
@@ -753,9 +850,7 @@ pub struct Backend {
         if per_request == 0 {
             return err(raw.Error.Unsupported)
         }
-        stride := self.width as usize * 4
-        window := self.window
-        gc := self.gc
+        stride := buffer_width as usize * 4
         depth := self.depth as u8
         done := 0u32
         for done < h {
@@ -767,13 +862,16 @@ pub struct Backend {
             start := self.output_length
             {
                 out := self.output.bytes()
-                source := self.pixels.view()
                 x11.put_image_header(&mut out[start..], window, gc, w, rows, x, y + done as i32, depth)
-                at := start + x11.PUT_IMAGE_HEADER
+            }
+            // The buffer belongs to the window, which keeps it attached
+            // until it replaces or frees it, so it is read in place.
+            unsafe {
+                at := self.output.pointer()
                 for r in 0u32..rows {
                     origin := (y as usize + (done + r) as usize) * stride + x as usize * 4
-                    copy_to(&mut out[at..at + row], &source[origin..origin + row])
-                    at += row
+                    target := start + x11.PUT_IMAGE_HEADER + r as usize * row
+                    ptr.copy_nonoverlapping(ptr.offset(pixels as *const u8, origin as isize), ptr.offset(at, target as isize), row)
                 }
             }
             self.commit(x11.PUT_IMAGE_HEADER + rows as usize * row)?
@@ -782,29 +880,13 @@ pub struct Backend {
         return ok()
     }
 
-    // -- std/window adapter --------------------------------------------------
-
-    pub fn width(&self) -> u32 {
-        return self.width
-    }
-    pub fn height(&self) -> u32 {
-        return self.height
-    }
-    pub fn stride(&self) -> usize {
-        return self.width as usize * 4
-    }
-    pub fn scale_percent(&self) -> u32 {
-        return 100
-    }
-    pub fn pixels(&mut self) -> &mut[u8] from(self) {
-        return self.pixels.bytes()
-    }
-    pub fn next_event(&mut self, milliseconds: u32, event: &mut raw.Event) -> bool!raw.Error {
+    fn next_event(&mut self, milliseconds: u32, event: &mut raw.Event) -> bool!raw.Error {
         if !self.active {
             return err(raw.Error.Closed)
         }
         if self.pending_text != 0 {
-            set(event, raw.TEXT, self.pending_text, 0, 0, 0, 0)
+            window := self.pending_window
+            set(event, window, raw.TEXT, self.pending_text, 0, 0, 0, 0)
             self.pending_text = 0
             return ok(true)
         }
@@ -825,32 +907,21 @@ pub struct Backend {
             }
         }
     }
-    // Monotonic nanoseconds, the clock of next_vblank and frame pacing.
-    pub fn clock(&self) -> u64 {
-        return unsafe {
-            dodo_window_clock()
-        }
-    }
-    // Nanoseconds per display refresh, or 0 while unknown: Present's
-    // reports give it after about half a second of frames.
-    pub fn frame_period(&self) -> u64 {
-        return self.period
-    }
-    // X11 reports refreshes as they happen instead; 0 means unknown.
-    pub fn next_vblank(&mut self, now: u64) -> u64 {
-        return 0
-    }
-    // Ask for a FRAME event at the next refresh. False without Present.
-    pub fn request_frame(&mut self) -> bool!raw.Error {
-        if !self.active {
+
+    fn request_frame(&mut self, id: u32) -> bool!raw.Error {
+        let some(index) = self.slot(id) else {
             return err(raw.Error.Closed)
         }
         if self.present_opcode == 0 {
             return ok(false)
         }
+        window := 0u32
+        {
+            records := self.windows.view()
+            window = records[index].window
+        }
         self.present_serial = core.wrapping_add(self.present_serial, 1u32)
         opcode := self.present_opcode
-        window := self.window
         serial := self.present_serial
         self.reserve(40)?
         start := self.output_length
@@ -860,40 +931,48 @@ pub struct Backend {
         self.flush()?
         return ok(true)
     }
-    // Nothing throttles an X11 client in the background.
-    pub fn set_animating(&mut self, animating: bool) {}
-    pub fn present(&mut self, x: i32, y: i32, width: u32, height: u32) -> void!raw.Error {
-        if !self.active {
+
+    fn present(&mut self, id: u32, x: i32, y: i32, width: u32, height: u32) -> void!raw.Error {
+        let some(index) = self.slot(id) else {
             return err(raw.Error.Closed)
         }
-        self.put(x, y, width, height)?
+        self.put(index, x, y, width, height)?
         return self.flush()
     }
-    pub fn set_title(&mut self, title: &str) -> void!raw.Error {
-        if !self.active {
+
+    fn set_title(&mut self, id: u32, title: &str) -> void!raw.Error {
+        let some(index) = self.slot(id) else {
             return err(raw.Error.Closed)
         }
-        text := mem.str_bytes(title)
-        self.property(x11.ATOM_WM_NAME, x11.ATOM_STRING, 8, text)?
-        net_wm_name := self.net_wm_name
-        utf8_string := self.utf8_string
-        self.property(net_wm_name, utf8_string, 8, text)?
+        window := 0u32
+        {
+            records := self.windows.view()
+            window = records[index].window
+        }
+        self.name(window, title)?
         return self.flush()
     }
-    pub fn set_cursor_visible(&mut self, visible: bool) -> void!raw.Error {
-        if !self.active {
+
+    fn set_cursor_visible(&mut self, id: u32, visible: bool) -> void!raw.Error {
+        let some(index) = self.slot(id) else {
             return err(raw.Error.Closed)
+        }
+        window := 0u32
+        {
+            records := self.windows.view()
+            window = records[index].window
         }
         if !visible && self.blank_cursor == 0 {
-            // An invisible cursor: a 1x1 bitmap cleared to 0 as its mask.
+            // An invisible cursor shared by every window: a 1x1 bitmap
+            // cleared to 0 as its mask.
             pixmap := self.new_id()?
             gc := self.new_id()?
             cursor := self.new_id()?
-            window := self.window
+            root := self.root
             self.reserve(128)?
             start := self.output_length
             out := self.output.bytes()
-            length := x11.create_pixmap(&mut out[start..], pixmap, window, 1, 1, 1)
+            length := x11.create_pixmap(&mut out[start..], pixmap, root, 1, 1, 1)
             self.commit(length)?
             start = self.output_length
             out = self.output.bytes()
@@ -921,7 +1000,6 @@ pub struct Backend {
         if !visible {
             cursor = self.blank_cursor
         }
-        window := self.window
         self.reserve(16)?
         start := self.output_length
         out := self.output.bytes()
@@ -929,37 +1007,139 @@ pub struct Backend {
         self.commit(length)?
         return self.flush()
     }
-    pub fn close(&mut self) {
-        if !self.active {
-            return
+}
+
+fn allocate(length: usize) -> heap.Bytes!raw.Error {
+    match heap.Bytes.new(length) {
+        some(memory) => {
+            return ok(memory)
         }
-        self.active = false
-        if self.socket >= 0 {
-            if self.window != 0 {
-                window := self.window
-                self.output_length = 0
-                out := self.output.bytes()
-                length := x11.destroy_window(out, window)
-                self.output_length = length
-                match self.flush() {
-                    ok() => {}
-                    err(_) => {}
-                }
-            }
-            unsafe {
-                dodo_window_x11_close(self.socket)
-            }
-            self.socket = -1
-        }
-        self.pixels = Memory.empty()
-        self.width = 0
-        self.height = 0
-        unsafe {
-            dodo_window_release()
+        none => {
+            return err(raw.Error.OutOfMemory)
         }
     }
-    fn drop(&mut self) {
-        self.close()
+}
+
+// A fresh, unconnected state.
+fn fresh() -> Connection {
+    return Connection { active: false, socket: -1, input: heap.Bytes.empty(), input_start: 0, input_end: 0, output: heap.Bytes.empty(), output_length: 0, mapping: heap.Bytes.empty(), mapping_first: 0, mapping_count: 0, per_keycode: 0, mapping_sequence: NO_REPLY, root: 0, depth: 24, max_request: 0, id_base: 0, id_step: 1, id_count: 0, blank_cursor: 0, wm_protocols: 0, wm_delete: 0, net_wm_name: 0, utf8_string: 0, sequence: 0, pending_text: 0, pending_window: 0, repeat_keycode: 0, present_opcode: 0, present_serial: 0, windows: heap.Table<Slot> { address: 0, count: 0, capacity: 0 } }
+}
+
+// The std/window adapter: the process's connection and its windows by id.
+pub struct Backend {
+    pub fn connect() -> void!raw.Error {
+        claimed := unsafe {
+            dodo_window_claim()
+        }
+        if claimed != 0 {
+            return err(raw.from_code(claimed))
+        }
+        unsafe {
+            CONNECTION = fresh()
+            // From here on, disconnect releases the claim and socket.
+            CONNECTION.active = true
+            match CONNECTION.connect() {
+                ok() => {
+                    return ok()
+                }
+                err(error) => {
+                    CONNECTION.disconnect()
+                    return err(error)
+                }
+            }
+        }
+    }
+    pub fn disconnect() {
+        unsafe {
+            CONNECTION.disconnect()
+        }
+    }
+    pub fn open(title: &str, width: u32, height: u32, resizable: bool) -> u32!raw.Error {
+        unsafe {
+            return CONNECTION.open(title, width, height, resizable)
+        }
+    }
+    pub fn close(id: u32) {
+        unsafe {
+            CONNECTION.close(id)
+        }
+    }
+    pub fn size(id: u32, width: &mut u32, height: &mut u32) -> bool {
+        unsafe {
+            if let some(index) = CONNECTION.slot(id) {
+                records := CONNECTION.windows.view()
+                *width = records[index].width
+                *height = records[index].height
+                return true
+            }
+        }
+        *width = 0
+        *height = 0
+        return false
+    }
+    pub fn attach(id: u32, pixels: *mut u8, width: u32, height: u32) {
+        unsafe {
+            if let some(index) = CONNECTION.slot(id) {
+                records := CONNECTION.windows.records()
+                records[index].pixels = pixels as usize
+                records[index].pixel_width = width
+                records[index].pixel_height = height
+            }
+        }
+    }
+    // X11 has no system-wide scale.
+    pub fn scale_percent(id: u32) -> u32 {
+        return 100
+    }
+    pub fn next_event(milliseconds: u32, event: &mut raw.Event) -> bool!raw.Error {
+        unsafe {
+            return CONNECTION.next_event(milliseconds, event)
+        }
+    }
+    pub fn present(id: u32, x: i32, y: i32, width: u32, height: u32) -> void!raw.Error {
+        unsafe {
+            return CONNECTION.present(id, x, y, width, height)
+        }
+    }
+    // Monotonic nanoseconds, the clock of next_vblank and frame pacing.
+    pub fn clock() -> u64 {
+        return unsafe {
+            dodo_window_clock()
+        }
+    }
+    // Nanoseconds per display refresh, or 0 while unknown: Present's
+    // reports give it after about half a second of frames.
+    pub fn frame_period(id: u32) -> u64 {
+        unsafe {
+            if let some(index) = CONNECTION.slot(id) {
+                records := CONNECTION.windows.view()
+                return records[index].period
+            }
+        }
+        return 0
+    }
+    // X11 reports refreshes as they happen instead; 0 means unknown.
+    pub fn next_vblank(id: u32, now: u64) -> u64 {
+        return 0
+    }
+    // Ask for a FRAME event at the window's next refresh. False without
+    // Present.
+    pub fn request_frame(id: u32) -> bool!raw.Error {
+        unsafe {
+            return CONNECTION.request_frame(id)
+        }
+    }
+    // Nothing throttles an X11 client in the background.
+    pub fn set_animating(animating: bool) {}
+    pub fn set_title(id: u32, title: &str) -> void!raw.Error {
+        unsafe {
+            return CONNECTION.set_title(id, title)
+        }
+    }
+    pub fn set_cursor_visible(id: u32, visible: bool) -> void!raw.Error {
+        unsafe {
+            return CONNECTION.set_cursor_visible(id, visible)
+        }
     }
 }
 

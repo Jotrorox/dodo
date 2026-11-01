@@ -4,6 +4,7 @@ import "std/embedded/wireless/cyw43"
 import "std/embedded/hal"
 import "std/embedded/chip/rp2350"
 import "std/embedded/chip/rp_dma"
+import "std/embedded/chip/rp_flash"
 import "std/embedded/chip/rp_multicore"
 import "std/embedded/chip/rp_rng"
 import "std/embedded/chip/rp_usb"
@@ -91,6 +92,10 @@ pub struct Board {
     pub fifos: rp_multicore.Fifos
     pub spinlocks: rp_multicore.Spinlocks
     pub doorbells: rp_multicore.Doorbells
+    // The program flash: the free flash above `flash.program_end()` keeps
+    // data across restarts and reflashing, for example a
+    // std/embedded/storage key-value store; see std/embedded/chip/rp_flash.
+    pub flash: rp_flash.Flash
     // Sleep modes, clock gating, and the dormant state, with the
     // std/embedded/power protocol; see rp2350.Power.
     pub power: rp2350.Power
@@ -110,8 +115,8 @@ pub fn take() -> Board!hal.Error {
     wireless.init(&mut chip.timer)?
     led := Led { wireless, on: false }
     led.set_low()
-    let rp2350.Peripherals { pins, timer, rtc, watchdog, usb, dma, rng, core1, fifos, spinlocks, doorbells, power } = chip
-    return ok(Board { led, pins, timer, rtc, watchdog, usb: Usb { usb }, dma, rng, core1, fifos, spinlocks, doorbells, power })
+    let rp2350.Peripherals { pins, timer, rtc, watchdog, usb, dma, rng, core1, fifos, spinlocks, doorbells, power, flash } = chip
+    return ok(Board { led, pins, timer, rtc, watchdog, usb: Usb { usb }, dma, rng, core1, fifos, spinlocks, doorbells, power, flash })
 }
 
 // The LED on the wireless chip's GPIO 0. Implements the std/embedded/hal
