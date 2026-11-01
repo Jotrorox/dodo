@@ -10,7 +10,7 @@ import "std/float_decimal"
 // binary chunk in the Lua 5.4 format so the output can be run by the
 // reference interpreter.
 //
-//   luatool [-l] [-o out.luac] [-t N] file.lua
+//   luatool [-l] [-o out.luac] [-t N] [-n chunkname] file.lua
 
 @link_name("open")
 unsafe extern "C" fn lt_open(path: *const u8, flags: i32) -> i32
@@ -836,6 +836,7 @@ pub fn tool_main() -> i32 {
         outpath := 0 as *mut u8
         times := 1i32
         input := 0 as *mut u8
+        given_name := 0 as *mut u8
         i := 1usize
         for i < argc {
             let a = argv[i]
@@ -844,6 +845,9 @@ pub fn tool_main() -> i32 {
             } else if lt_streq(a, "-o") && i + 1 < argc {
                 i = i + 1
                 outpath = argv[i]
+            } else if lt_streq(a, "-n") && i + 1 < argc {
+                i = i + 1
+                given_name = argv[i]
             } else if lt_streq(a, "-t") && i + 1 < argc {
                 i = i + 1
                 times = lt_atoi(argv[i])
@@ -875,7 +879,10 @@ pub fn tool_main() -> i32 {
         let name = malloc(inlen + 1)
         *name = 64
         ptr.copy_nonoverlapping(input as *const u8, ptr.offset(name, 1), inlen)
-        let chunkname = str_new(L, name as *const u8, inlen + 1)!
+        chunkname := str_new(L, name as *const u8, inlen + 1)!
+        if !ptr.is_null(given_name) {
+            chunkname = str_new(L, given_name as *const u8, lt_cstrlen(given_name))!
+        }
         let t0 = lt_clock()
         fp := 0 as *mut Proto
         for rep in 0..times {

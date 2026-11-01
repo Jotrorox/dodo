@@ -874,122 +874,132 @@ fn lx_scan(cx: *mut CompileState) -> i32!Throw {
         (*cx).nbuf = 0
         for {
             let c = (*cx).cur
-            if c == 10 || c == 13 {
-                lx_newline(cx)?
-            } else if c == 32 || c == 9 || c == 11 || c == 12 {
-                lx_advance(cx)
-            } else if c == 45 {
-                lx_advance(cx)
-                if (*cx).cur != 45 {
-                    return ok(45)
-                }
-                lx_advance(cx)
-                if (*cx).cur == 91 {
-                    let sep = lx_skipsep(cx)?
-                    (*cx).nbuf = 0
-                    if sep >= 2 {
-                        lx_longstring(cx, false, sep)?
-                        (*cx).nbuf = 0
-                        continue
+            match c {
+                b'a'..=b'z' | b'A'..=b'Z' | b'_' => {
+                    lx_save_run(cx, lx_ident_run(cx))?
+                    tok := 0i32
+                    (*cx).sc_s = lx_intern(cx, (*cx).buf, (*cx).nbuf, ptr.from_mut(&mut tok))?
+                    if tok != 0 {
+                        return ok(tok)
                     }
-                }
-                for !lx_isnewline((*cx).cur) && (*cx).cur != LX_EOZ {
+                    return ok(TK_NAME)
+                },
+                b' ' | b'\t' | 11 | 12 => {
                     lx_advance(cx)
-                }
-            } else if c == 91 {
-                let sep = lx_skipsep(cx)?
-                if sep >= 2 {
-                    lx_longstring(cx, true, sep)?
+                },
+                b'\n' | b'\r' => {
+                    lx_newline(cx)?
+                },
+                b'0'..=b'9' => {
+                    return lx_numeral(cx)
+                },
+                b'-' => {
+                    lx_advance(cx)
+                    if (*cx).cur != 45 {
+                        return ok(45)
+                    }
+                    // A comment: long if it starts with a long bracket.
+                    lx_advance(cx)
+                    if (*cx).cur == 91 {
+                        let sep = lx_skipsep(cx)?
+                        (*cx).nbuf = 0
+                        if sep >= 2 {
+                            lx_longstring(cx, false, sep)?
+                            (*cx).nbuf = 0
+                            continue
+                        }
+                    }
+                    for !lx_isnewline((*cx).cur) && (*cx).cur != LX_EOZ {
+                        lx_advance(cx)
+                    }
+                },
+                b'[' => {
+                    let sep = lx_skipsep(cx)?
+                    if sep >= 2 {
+                        lx_longstring(cx, true, sep)?
+                        return ok(TK_STRING)
+                    }
+                    if sep == 0 {
+                        return err(lx_error(cx, "invalid long string delimiter", TK_STRING))
+                    }
+                    return ok(91)
+                },
+                b'=' => {
+                    return lx_pair(cx, 61, 61, TK_EQ)
+                },
+                b'<' => {
+                    lx_advance(cx)
+                    if (*cx).cur == 61 {
+                        lx_advance(cx)
+                        return ok(TK_LE)
+                    }
+                    if (*cx).cur == 60 {
+                        lx_advance(cx)
+                        return ok(TK_SHL)
+                    }
+                    return ok(60)
+                },
+                b'>' => {
+                    lx_advance(cx)
+                    if (*cx).cur == 61 {
+                        lx_advance(cx)
+                        return ok(TK_GE)
+                    }
+                    if (*cx).cur == 62 {
+                        lx_advance(cx)
+                        return ok(TK_SHR)
+                    }
+                    return ok(62)
+                },
+                b'/' => {
+                    return lx_pair(cx, 47, 47, TK_IDIV)
+                },
+                b'~' => {
+                    return lx_pair(cx, 126, 61, TK_NE)
+                },
+                b':' => {
+                    return lx_pair(cx, 58, 58, TK_DBCOLON)
+                },
+                b'"' | b'\'' => {
+                    lx_shortstring(cx, c)?
                     return ok(TK_STRING)
-                }
-                if sep == 0 {
-                    return err(lx_error(cx, "invalid long string delimiter", TK_STRING))
-                }
-                return ok(91)
-            } else if c == 61 {
-                lx_advance(cx)
-                if (*cx).cur == 61 {
-                    lx_advance(cx)
-                    return ok(TK_EQ)
-                }
-                return ok(61)
-            } else if c == 60 {
-                lx_advance(cx)
-                if (*cx).cur == 61 {
-                    lx_advance(cx)
-                    return ok(TK_LE)
-                }
-                if (*cx).cur == 60 {
-                    lx_advance(cx)
-                    return ok(TK_SHL)
-                }
-                return ok(60)
-            } else if c == 62 {
-                lx_advance(cx)
-                if (*cx).cur == 61 {
-                    lx_advance(cx)
-                    return ok(TK_GE)
-                }
-                if (*cx).cur == 62 {
-                    lx_advance(cx)
-                    return ok(TK_SHR)
-                }
-                return ok(62)
-            } else if c == 47 {
-                lx_advance(cx)
-                if (*cx).cur == 47 {
-                    lx_advance(cx)
-                    return ok(TK_IDIV)
-                }
-                return ok(47)
-            } else if c == 126 {
-                lx_advance(cx)
-                if (*cx).cur == 61 {
-                    lx_advance(cx)
-                    return ok(TK_NE)
-                }
-                return ok(126)
-            } else if c == 58 {
-                lx_advance(cx)
-                if (*cx).cur == 58 {
-                    lx_advance(cx)
-                    return ok(TK_DBCOLON)
-                }
-                return ok(58)
-            } else if c == 34 || c == 39 {
-                lx_shortstring(cx, c)?
-                return ok(TK_STRING)
-            } else if c == 46 {
-                lx_save_advance(cx)?
-                if (*cx).cur == 46 {
-                    lx_advance(cx)
+                },
+                b'.' => {
+                    lx_save_advance(cx)?
                     if (*cx).cur == 46 {
                         lx_advance(cx)
-                        return ok(TK_DOTS)
+                        if (*cx).cur == 46 {
+                            lx_advance(cx)
+                            return ok(TK_DOTS)
+                        }
+                        return ok(TK_CONCAT)
                     }
-                    return ok(TK_CONCAT)
-                }
-                if !lx_isdigit((*cx).cur) {
-                    return ok(46)
-                }
-                return lx_numeral(cx)
-            } else if lx_isdigit(c) {
-                return lx_numeral(cx)
-            } else if c == LX_EOZ {
-                return ok(TK_EOS)
-            } else if lx_isalpha(c) {
-                lx_save_run(cx, lx_ident_run(cx))?
-                tok := 0i32
-                (*cx).sc_s = lx_intern(cx, (*cx).buf, (*cx).nbuf, ptr.from_mut(&mut tok))?
-                if tok != 0 {
-                    return ok(tok)
-                }
-                return ok(TK_NAME)
-            } else {
-                lx_advance(cx)
-                return ok(c)
+                    if !lx_isdigit((*cx).cur) {
+                        return ok(46)
+                    }
+                    return lx_numeral(cx)
+                },
+                -1 => {
+                    return ok(TK_EOS)
+                },
+                _ => {
+                    lx_advance(cx)
+                    return ok(c)
+                },
             }
         }
+    }
+}
+
+// A one-character token `single` that becomes `double` when followed by `second`.
+fn lx_pair(cx: *mut CompileState, single: i32, second: i32, double: i32) -> i32!Throw {
+    unsafe {
+        lx_advance(cx)
+        if (*cx).cur == second {
+            lx_advance(cx)
+            return ok(double)
+        }
+        return ok(single)
     }
 }
 

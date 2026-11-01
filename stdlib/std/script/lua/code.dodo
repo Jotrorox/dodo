@@ -512,10 +512,12 @@ fn cg_line_add(fs: *mut FnState, line: i32) -> void!Throw {
             diff = CG_ABSLINEINFO
             (*fs).since_abs = 1
         }
-        cap2 := (*f).sizelineinfo
-        let nb2 = cg_grow(fs, (*f).lineinfo as *mut u8, ptr.from_mut(&mut cap2), pc, 1, 2147483647, "opcodes")?
-        (*f).lineinfo = nb2 as *mut i8
-        (*f).sizelineinfo = cap2
+        if pc >= (*f).sizelineinfo {
+            cap2 := (*f).sizelineinfo
+            let nb2 = cg_grow(fs, (*f).lineinfo as *mut u8, ptr.from_mut(&mut cap2), pc, 1, 2147483647, "opcodes")?
+            (*f).lineinfo = nb2 as *mut i8
+            (*f).sizelineinfo = cap2
+        }
         *ptr.offset((*f).lineinfo, pc as isize) = diff as i8
         (*fs).prevline = line
         return ok()
@@ -554,10 +556,12 @@ fn cg_line_fix(fs: *mut FnState, line: i32) -> void!Throw {
 fn cg_emit(fs: *mut FnState, i: u32) -> i32!Throw {
     unsafe {
         let f = (*fs).f
-        cap := (*f).sizecode
-        let nb = cg_grow(fs, (*f).code as *mut u8, ptr.from_mut(&mut cap), (*fs).pc, 4, 2147483647, "opcodes")?
-        (*f).code = nb as *mut u32
-        (*f).sizecode = cap
+        if (*fs).pc >= (*f).sizecode {
+            cap := (*f).sizecode
+            let nb = cg_grow(fs, (*f).code as *mut u8, ptr.from_mut(&mut cap), (*fs).pc, 4, 2147483647, "opcodes")?
+            (*f).code = nb as *mut u32
+            (*f).sizecode = cap
+        }
         let pc = (*fs).pc
         *ptr.offset((*f).code, pc as isize) = i
         (*fs).pc = pc + 1
