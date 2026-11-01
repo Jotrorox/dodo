@@ -24,9 +24,8 @@ pub enum ExtraChannelType {
     Black
     Cfa
     Thermal
-    // Type 15: not to be ignored, but unknown to this decoder.
-    Unknown
-    // Type 16: may be ignored.
+    // Type 16: may be ignored. (Type 15, an extra channel that must not be
+    // ignored but is unknown, fails Unsupported as in libjxl.)
     Optional
 }
 
@@ -80,6 +79,10 @@ fn read_ec_info(r: &mut Reader) -> EcInfo!pixels.Error {
     e.bits = depth >> 8
     e.exp_bits = depth & 255
     e.dim_shift = r.u32c(dist(0, 0), dist(3, 0), dist(4, 0), dist(1, 3))
+    // Channels are at most 8 times smaller than the image.
+    if e.dim_shift > 3 {
+        return err(pixels.Error.Malformed)
+    }
     length := r.u32c(dist(0, 0), dist(0, 4), dist(16, 5), dist(48, 10))
     e.name_bit = r.position()
     e.name_length = length
@@ -92,6 +95,9 @@ fn read_ec_info(r: &mut Reader) -> EcInfo!pixels.Error {
         }
     } else if kind == EC_CFA {
         e.cfa = r.u32c(dist(1, 0), dist(0, 2), dist(3, 4), dist(19, 8))
+    }
+    if kind == EC_NON_OPTIONAL {
+        return err(pixels.Error.Unsupported)
     }
     return ok(e)
 }
@@ -213,10 +219,7 @@ fn extra_type(kind: u32) -> ExtraChannelType {
     if kind == EC_THERMAL {
         return ExtraChannelType.Thermal
     }
-    if kind == EC_OPTIONAL {
-        return ExtraChannelType.Optional
-    }
-    return ExtraChannelType.Unknown
+    return ExtraChannelType.Optional
 }
 
 // Description of extra channel `channel`, parsed at the reader.

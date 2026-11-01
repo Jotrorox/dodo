@@ -17,7 +17,8 @@ import "std/text"
 // tests/image/jxl/generate.py (cjxl encodes, djxl decodes for references):
 // lossless cases must reproduce djxl's samples exactly (compared by hash),
 // lossy, composited and VarDCT cases must match djxl's 8-bit decode within
-// two levels (one is observed).
+// two levels (one is observed); extra channels must match djxl's float
+// decode within two 8-bit levels (U8 channels) or 4/65535 (deeper ones).
 // Then animation timing, metadata boxes, the ICC profile, scratch sizing and
 // robustness against truncated and corrupted files.
 //
@@ -81,7 +82,69 @@ fn decode_into(data: &[u8], index: u32, layout: &pixels.Layout) -> usize!pixels.
 }
 
 fn shape(k: usize, field: usize) -> u32 {
-    return CASE_SHAPES[k * 6 + field]
+    return CASE_SHAPES[k * 7 + field]
+}
+
+// Decode extra channel `channel` of displayed frame `index` into PIXELS as
+// 16-bit gray; returns the byte count.
+fn decode_extra_into(data: &[u8], index: u32, channel: u32) -> usize!pixels.Error {
+    header := jxl.info(data)?
+    need := jxl.scratch_size(data)?
+    assert(need <= SCRATCH_LIMIT, "scratch limit")
+    layout := pixels.Layout.from_codes(1, pixels.SAMPLE_U16, false)
+    size := pixels.bytes_needed(header.width, header.height, &layout)?
+    assert(size <= PIXEL_LIMIT, "pixel limit")
+    unsafe {
+        target := pixels.ViewMut.new(&mut PIXELS[..size], header.width, header.height, layout.clone())?
+        view_sink := sink.ViewSink.new(&mut target)
+        buffer := &mut SCRATCH[..need]
+        jxl.decode_extra_channel(data, index, channel, &mut view_sink, buffer)?
+    }
+    return ok(size)
+}
+
+// The largest difference between the 16-bit samples of PIXELS and
+// REFERENCE.
+fn compare_reference16(size: usize) -> u32 {
+    worst := 0u32
+    unsafe {
+        for i in 0usize..size / 2 {
+            a := PIXELS[2 * i] as u32 | ((PIXELS[2 * i + 1] as u32) << 8)
+            b := REFERENCE[2 * i] as u32 | ((REFERENCE[2 * i + 1] as u32) << 8)
+            d := 0u32
+            if a > b {
+                d = a - b
+            } else {
+                d = b - a
+            }
+            if d > worst {
+                worst = d
+            }
+        }
+    }
+    return worst
+}
+
+// Extra channel case k: the channel's info, then its decode against the
+// 16-bit reference.
+fn check_extra_case(k: usize, data: &[u8]) {
+    name := CASE_FILES[k]
+    channel := shape(k, 6)
+    info := jxl.extra_channel_info(data, channel)!
+    assert_eq(info.layout.channel_count() as u32, 1u32, name)
+    assert_eq(info.layout.sample_code(), shape(k, 3), name)
+    reference := [0u8; FILE_LIMIT]
+    ref_length := read_fixture(CASE_REFS[k], ".jxl", &mut reference)
+    gray16 := pixels.Layout.from_codes(1, pixels.SAMPLE_U16, false)
+    ref_size := decode_into(&reference[..ref_length], 0, &gray16)!
+    keep_reference(ref_size)
+    size := decode_extra_into(data, shape(k, 5), channel)!
+    assert_eq(size, ref_size, name)
+    limit := 4u32
+    if shape(k, 3) == pixels.SAMPLE_U8 {
+        limit = 514
+    }
+    assert(compare_reference16(size) <= limit, name)
 }
 
 fn check_case(k: usize) {
@@ -90,6 +153,10 @@ fn check_case(k: usize) {
     length := read_fixture(name, ".jxl", &mut file)
     data := &file[..length]
     assert(jxl.matches(data), name)
+    if shape(k, 4) == 3 {
+        check_extra_case(k, data)
+        return
+    }
     header := jxl.info(data)!
     assert(header.format == pixels.Format.Jxl, name)
     assert_eq(header.width, shape(k, 0), name)
@@ -228,9 +295,91 @@ fn vardct_fixtures() {
     }
 }
 
+// Extra channels against djxl, and the extra channel descriptions.
+@test
+fn extra_channel_fixtures() {
+    for k in 0usize..CASE_COUNT {
+        if shape(k, 4) == 3 {
+            check_case(k)
+        }
+    }
+}
+
+@test
+fn extra_channel_info() {
+    file := [0u8; FILE_LIMIT]
+    length := read_fixture("extra_channels", ".jxl", &mut file)
+    data := &file[..length]
+    assert_eq(jxl.extra_channel_count(data)!, 8u32)
+    alpha := jxl.extra_channel_info(data, 0)!
+    assert(alpha.kind == jxl.ExtraChannelType.Alpha)
+    assert_eq(alpha.bit_depth, 8u32)
+    assert(!alpha.alpha_associated)
+    assert_eq(alpha.name_length, 0u32)
+    depth := jxl.extra_channel_info(data, 1)!
+    assert(depth.kind == jxl.ExtraChannelType.Depth)
+    assert_eq(depth.bit_depth, 16u32)
+    assert_eq(depth.dim_shift, 1u32)
+    assert_eq(depth.layout.sample_code(), pixels.SAMPLE_U16)
+    name := [0u8; 16]
+    length_name := jxl.extra_channel_name(data, 1, &mut name)!
+    assert_eq(length_name, 5usize)
+    assert(name[0] == b'd' && name[1] == b'e' && name[4] == b'h')
+    short := [0u8; 2]
+    match jxl.extra_channel_name(data, 1, &mut short) {
+        ok(_) => {
+            assert(false, "name longer than the buffer")
+        }
+        err(e) => {
+            assert(e == pixels.Error.BufferTooSmall)
+        }
+    }
+    spot := jxl.extra_channel_info(data, 2)!
+    assert(spot.kind == jxl.ExtraChannelType.SpotColor)
+    assert(spot.spot_color[0] > 0.89 && spot.spot_color[0] < 0.91)
+    assert(spot.spot_color[3] > 0.79 && spot.spot_color[3] < 0.81)
+    mask := jxl.extra_channel_info(data, 3)!
+    assert(mask.kind == jxl.ExtraChannelType.SelectionMask)
+    assert_eq(mask.bit_depth, 1u32)
+    thermal := jxl.extra_channel_info(data, 4)!
+    assert(thermal.kind == jxl.ExtraChannelType.Thermal)
+    black := jxl.extra_channel_info(data, 5)!
+    assert(black.kind == jxl.ExtraChannelType.Black)
+    cfa := jxl.extra_channel_info(data, 6)!
+    assert(cfa.kind == jxl.ExtraChannelType.Cfa)
+    assert_eq(cfa.cfa_channel, 2u32)
+    half := jxl.extra_channel_info(data, 7)!
+    assert(half.kind == jxl.ExtraChannelType.Optional)
+    assert_eq(half.exponent_bits, 5u32)
+    assert_eq(half.layout.sample_code(), pixels.SAMPLE_F32)
+    match jxl.extra_channel_info(data, 8) {
+        ok(_) => {
+            assert(false, "only 8 extra channels")
+        }
+        err(e) => {
+            assert(e == pixels.Error.Malformed)
+        }
+    }
+    match decode_extra_into(data, 0, 8) {
+        ok(_) => {
+            assert(false, "only 8 extra channels")
+        }
+        err(e) => {
+            assert(e == pixels.Error.Malformed)
+        }
+    }
+    // The maximum count, and a file without extra channels.
+    many := [0u8; FILE_LIMIT]
+    many_length := read_fixture("max_ec", ".jxl", &mut many)
+    assert_eq(jxl.extra_channel_count(&many[..many_length])!, 4096u32)
+    plain := [0u8; FILE_LIMIT]
+    plain_length := read_fixture("rgb_e7", ".jxl", &mut plain)
+    assert_eq(jxl.extra_channel_count(&plain[..plain_length])!, 0u32)
+}
+
 @test
 fn scratch_size_is_exact_and_checked() {
-    names := ["rgb_e7", "squeeze_big", "anim_blend", "lossy_d1", "patches_text"]
+    names := ["rgb_e7", "squeeze_big", "anim_blend", "lossy_d1", "patches_text", "patches_up", "max_ec", "vd_ycbcr420"]
     for n in 0usize..names.len {
         file := [0u8; FILE_LIMIT]
         length := read_fixture(names[n], ".jxl", &mut file)
@@ -486,6 +635,18 @@ fn attempt(data: &[u8]) {
                     ok() => {}
                     err(_) => {}
                 }
+                // The last extra channel too, when there is one.
+                match jxl.extra_channel_count(data) {
+                    ok(count) => {
+                        if count > 0 {
+                            match jxl.decode_extra_channel(data, 0, count - 1, &mut null, buffer) {
+                                ok() => {}
+                                err(_) => {}
+                            }
+                        }
+                    }
+                    err(_) => {}
+                }
             }
         }
         err(_) => {}
@@ -522,6 +683,14 @@ fn robustness_jpeg_noise_splines() {
     mangle("jpeg420")
     mangle("vd_noise")
     mangle("splines")
+}
+
+@test
+fn robustness_new_features() {
+    mangle("patches_up")
+    mangle("vd_ycbcr420")
+    mangle("lf_upsampled")
+    mangle("extra_channels")
 }
 
 @test
