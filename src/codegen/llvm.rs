@@ -798,8 +798,10 @@ impl<'ctx> Module<'ctx> {
     /// into one operation per element, costing minutes and gigabytes of
     /// compiler memory, and megabytes of stack at -O0. Constant stores become
     /// memset or field stores. A loaded value's store becomes a memmove when
-    /// nothing in between can write its source, a field extraction becomes a
-    /// field load, and a load left without uses is erased. Other loads stay.
+    /// nothing in between can write its source; otherwise the load becomes a
+    /// memcpy into a stack copy that the stores read. A field extraction
+    /// becomes a field load, and a load left without uses is erased. Loads
+    /// with other uses stay.
     pub(super) fn lower_large_aggregates(&self, data: &TargetData, limit: u64) {
         unsafe {
             let context = LLVMGetModuleContext(self.0);
@@ -848,7 +850,7 @@ impl<'ctx> Module<'ctx> {
                     users.push(LLVMGetUser(use_));
                     use_ = LLVMGetNextUse(use_);
                 }
-                let rewritable = users.iter().all(|&user| {
+                let movable = |user: LLVMValueRef| {
                     if !LLVMIsAExtractValueInst(user).is_null() {
                         return LLVMGetOperand(user, 0) == load;
                     }
@@ -856,9 +858,8 @@ impl<'ctx> Module<'ctx> {
                         && LLVMGetVolatile(user) == 0
                         && LLVMGetOperand(user, 0) == load
                         && LLVMGetOperand(user, 1) != load
-                        && no_writes_between(load, user, source)
-                });
-                if !rewritable {
+                };
+                if !users.iter().all(|&user| movable(user)) {
                     continue;
                 }
                 let ty = LLVMTypeOf(load);
@@ -867,6 +868,31 @@ impl<'ctx> Module<'ctx> {
                     LLVMABISizeOfType(data.0, ty),
                     0,
                 );
+                // When something between the load and a store may write the
+                // source, such as the drops after a Result is built, copy the
+                // value aside where it was loaded and read the copy instead.
+                // Left as a load, scalar replacement would split it into one
+                // operation per byte.
+                let direct = users.iter().all(|&user| {
+                    !LLVMIsAExtractValueInst(user).is_null()
+                        || no_writes_between(load, user, source)
+                });
+                let source = if direct {
+                    source
+                } else {
+                    let function = LLVMGetBasicBlockParent(LLVMGetInstructionParent(load));
+                    let entry = LLVMGetEntryBasicBlock(function);
+                    let first = LLVMGetFirstInstruction(entry);
+                    if first.is_null() {
+                        LLVMPositionBuilderAtEnd(builder, entry);
+                    } else {
+                        LLVMPositionBuilderBefore(builder, first);
+                    }
+                    let snapshot = LLVMBuildAlloca(builder, ty, c"snapshot".as_ptr());
+                    LLVMPositionBuilderBefore(builder, load);
+                    LLVMBuildMemCpy(builder, snapshot, 1, source, 1, size);
+                    snapshot
+                };
                 for user in users {
                     if LLVMIsAStoreInst(user).is_null() {
                         // Read the field where the whole value was read.

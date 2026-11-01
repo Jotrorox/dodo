@@ -9,7 +9,8 @@ order: 160.7
 `std/gpu/opengl/gl` is the raw OpenGL binding: every enum and command of the
 OpenGL 4.6 core profile, generated from the Khronos registry. Both are written
 in Dodo. Nothing is linked at build time: each operating system's own OpenGL
-interface is opened when a context is created.
+interface is opened when a context is created. The portable
+[std/gpu](gpu.md) uses OpenGL 4.5 where Vulkan is missing.
 
 | System | Interface | Loaded at run time | Highest version |
 | --- | --- | --- | --- |

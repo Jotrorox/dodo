@@ -1,0 +1,77 @@
+package unavailable
+
+import "std/gpu/hal"
+
+// The native backend of systems without one of their own (Linux, and
+// Windows until a Direct3D 12 backend exists): opening it always fails
+// with NoBackend, so std/gpu moves on to Vulkan and OpenGL. No Device is
+// ever created, so its other methods are never called.
+
+pub struct Device: hal.Backend {
+    unused: u8
+
+    pub fn open(debug: bool) -> Device!hal.Error {
+        return err(hal.Error.NoBackend)
+    }
+    pub fn api(&self) -> hal.Api {
+        return hal.Api.Metal
+    }
+    pub fn limits(&self) -> hal.Limits {
+        return hal.Limits { max_texture_size: 0, max_buffer_size: 0, max_uniform_binding_size: 0, max_storage_binding_size: 0, max_workgroups: 0, max_workgroup_size_x: 0, max_workgroup_size_y: 0, max_workgroup_size_z: 0, max_workgroup_invocations: 0 }
+    }
+    pub fn name(&self, out: &mut[u8]) -> usize {
+        return 0
+    }
+    pub fn create_buffer(&self, size: u64, usage: u32) -> hal.Handle!hal.Error {
+        return err(hal.Error.NoBackend)
+    }
+    pub fn write_buffer(&self, buffer: &hal.Handle, offset: u64, data: &[u8]) -> void!hal.Error {
+        return err(hal.Error.NoBackend)
+    }
+    pub fn read_buffer(&self, buffer: &hal.Handle, offset: u64, out: &mut[u8]) -> void!hal.Error {
+        return err(hal.Error.NoBackend)
+    }
+    pub fn create_texture(&self, descriptor: &hal.TextureDescriptor) -> hal.Handle!hal.Error {
+        return err(hal.Error.NoBackend)
+    }
+    pub fn write_texture(&self, texture: &hal.Handle, descriptor: &hal.TextureDescriptor, region: &hal.Region, data: &[u8], bytes_per_row: u32) -> void!hal.Error {
+        return err(hal.Error.NoBackend)
+    }
+    pub fn read_texture(&self, texture: &hal.Handle, descriptor: &hal.TextureDescriptor, region: &hal.Region, out: &mut[u8], bytes_per_row: u32) -> void!hal.Error {
+        return err(hal.Error.NoBackend)
+    }
+    pub fn create_sampler(&self, descriptor: &hal.SamplerDescriptor) -> hal.Handle!hal.Error {
+        return err(hal.Error.NoBackend)
+    }
+    pub fn create_compute_pipeline(&self, descriptor: &hal.ComputePipelineDescriptor) -> hal.Handle!hal.Error {
+        return err(hal.Error.NoBackend)
+    }
+    pub fn create_render_pipeline(&self, descriptor: &hal.RenderPipelineDescriptor) -> hal.Handle!hal.Error {
+        return err(hal.Error.NoBackend)
+    }
+    pub fn destroy(&self, object: u32, handle: &hal.Handle) {}
+    pub fn completed(&self) -> u64 {
+        return 0
+    }
+    pub fn wait(&self, index: u64) -> void!hal.Error {
+        return ok()
+    }
+    pub fn begin_encoder(&self) -> hal.Handle!hal.Error {
+        return err(hal.Error.NoBackend)
+    }
+    pub fn submit(&self, encoder: &mut hal.Handle) -> u64!hal.Error {
+        return err(hal.Error.NoBackend)
+    }
+    pub fn begin_compute_pass(&self, encoder: &mut hal.Handle) {}
+    pub fn end_compute_pass(&self, encoder: &mut hal.Handle) {}
+    pub fn begin_render_pass(&self, encoder: &mut hal.Handle, pass: &hal.RenderPassInfo) {}
+    pub fn end_render_pass(&self, encoder: &mut hal.Handle) {}
+    pub fn set_viewport(&self, encoder: &mut hal.Handle, x: f32, y: f32, width: f32, height: f32, min_depth: f32, max_depth: f32) {}
+    pub fn set_scissor(&self, encoder: &mut hal.Handle, x: u32, y: u32, width: u32, height: u32) {}
+    pub fn dispatch(&self, encoder: &mut hal.Handle, state: &mut hal.PassState, x: u32, y: u32, z: u32) {}
+    pub fn draw(&self, encoder: &mut hal.Handle, state: &mut hal.PassState, vertex_count: u32, instance_count: u32, first_vertex: u32, first_instance: u32) {}
+    pub fn draw_indexed(&self, encoder: &mut hal.Handle, state: &mut hal.PassState, index_count: u32, instance_count: u32, first_index: u32, base_vertex: i32, first_instance: u32) {}
+    pub fn copy_buffer(&self, encoder: &mut hal.Handle, source: &hal.Handle, source_offset: u64, destination: &hal.Handle, destination_offset: u64, size: u64) {}
+    pub fn copy_buffer_to_texture(&self, encoder: &mut hal.Handle, source: &hal.Handle, offset: u64, bytes_per_row: u32, destination: &hal.Handle, descriptor: &hal.TextureDescriptor, region: &hal.Region) {}
+    pub fn copy_texture_to_buffer(&self, encoder: &mut hal.Handle, source: &hal.Handle, descriptor: &hal.TextureDescriptor, region: &hal.Region, destination: &hal.Handle, offset: u64, bytes_per_row: u32) {}
+}

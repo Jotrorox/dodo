@@ -551,8 +551,9 @@ impl Loader<'_> {
         }
         // An area is a stdlib directory with its own adapters, usually with a
         // `runtime.c`; `crypto/openssl` keeps libcrypto out of programs that
-        // only need entropy, and `gpu/opengl` is pure Dodo that loads the
-        // system's OpenGL interface at run time.
+        // only need entropy, `gpu/opengl` is pure Dodo that loads the
+        // system's OpenGL interface at run time, and `gpu/hal` selects the
+        // operating system's own GPU API for `std/gpu` (Metal on macOS).
         let Some((area, selector)) = import
             .strip_prefix("std/")
             .and_then(|rest| rest.rsplit_once('/'))
@@ -577,6 +578,7 @@ impl Loader<'_> {
                 | "time"
                 | "window"
                 | "gpu/opengl"
+                | "gpu/hal"
                 | "dylib"
         ) || !matches!(selector, "native" | "posix" | "linux" | "macos" | "windows")
         {
@@ -586,9 +588,9 @@ impl Loader<'_> {
             return Err(format!("`{import}` is unsupported for target `{}`; hosted adapters require x86_64 or aarch64 Linux GNU, x86_64 or arm64 macOS, or x86_64 Windows (MSVC/GNU)", self.target).into());
         };
         // Window systems differ on every OS, so `window` has one adapter per OS
-        // (X11, Cocoa, Win32) instead of a shared POSIX one, and so does
-        // `gpu/opengl` (EGL, CGL, WGL).
-        let adapter = if matches!(area, "window" | "gpu/opengl") {
+        // (X11, Cocoa, Win32) instead of a shared POSIX one, and so do
+        // `gpu/opengl` (EGL, CGL, WGL) and `gpu/hal` (Metal on macOS).
+        let adapter = if matches!(area, "window" | "gpu/opengl" | "gpu/hal") {
             os
         } else {
             adapter
