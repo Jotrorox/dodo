@@ -6,6 +6,7 @@ import "std/gpu/hal"
 import "std/gpu/hal/native" as native_hal
 import "std/gpu/hal/opengl" as opengl_hal
 import "std/gpu/hal/vulkan" as vulkan_hal
+import "std/window/handle"
 
 // Portable GPU computing and rendering on Vulkan, Metal and OpenGL.
 //
@@ -22,6 +23,21 @@ import "std/gpu/hal/vulkan" as vulkan_hal
 // mistakes, such as a draw without a pipeline or a buffer bound without
 // the usage its slot needs, panic like an out-of-bounds index; creating
 // objects and copying data return errors.
+//
+// The CPU runs ahead of the GPU: write_buffer and write_texture copy the
+// data into a staging ring and record the copy into an upload command
+// buffer that runs just before the next submission, so they never wait
+// for the GPU. A Surface keeps two or three frames in flight. Reading
+// results back waits for every submission so far; on Vulkan the data comes
+// through memory the CPU caches.
+//
+// std/gpu tracks how each command uses every buffer and texture, and asks
+// the backend for a barrier only where a command depends on an earlier one
+// of the same command encoder, with exactly the stages and accesses
+// involved. Each submission starts after the ones before it have finished.
+// Within one render pass, draws are not ordered against each other: a
+// draw cannot read what an earlier draw of the same pass wrote to a
+// storage buffer or texture.
 //
 // Shaders are given in each backend's language at once (ShaderSource):
 // SPIR-V words for Vulkan, Metal Shading Language source for Metal, GLSL
@@ -63,6 +79,9 @@ pub fn error_name(error: Error) -> &str from(static) {
         }
         Error.DeviceLost => {
             return "DeviceLost"
+        }
+        Error.Outdated => {
+            return "Outdated"
         }
         Error.System => {
             return "System"
@@ -244,6 +263,104 @@ struct Life {
     wait: [64]u64
 }
 
+// The staging ring starts at RING_START bytes and doubles up to RING_MAX
+// when it runs out of room while the GPU still reads it; writes of more
+// than a quarter of RING_MAX get a staging buffer of their own.
+const RING_START: u64 = 4 * 1024 * 1024
+const RING_MAX: u64 = 64 * 1024 * 1024
+// Ring offsets keep every texel size's alignment.
+const RING_ALIGNMENT: u64 = 16
+const MARKS: usize = 32
+
+// Staged transfers: the upload encoder, the ring it copies from, and the
+// buffer reads come back through.
+struct Uploads {
+    // The upload encoder is recording; it counts as an open encoder.
+    open: bool
+    encoder: hal.Handle
+    hazards: Hazards
+    ring: hal.Handle
+    ring_size: u64
+    ring_address: usize
+    // Positions in the ring count bytes ever allocated: `head` is the next
+    // one, everything from `tail` on may still be read by the GPU.
+    head: u64
+    tail: u64
+    // Submitted uploads, oldest first: once submission `mark_index[i]`
+    // has finished, the ring is free up to `mark_end[i]`.
+    mark_index: [32]u64
+    mark_end: [32]u64
+    marks: usize
+    readback: hal.Handle
+    readback_size: u64
+    readback_address: usize
+}
+
+// The handles of Uploads, for get_handle and set_handle.
+const UPLOAD_ENCODER: u32 = 0
+const UPLOAD_RING: u32 = 1
+const UPLOAD_READBACK: u32 = 2
+
+// Uploads is changed through a pointer from &Device, which allows reading
+// and writing its fields but no borrows of them.
+fn get_handle(which: u32, uploads: *mut Uploads) -> hal.Handle {
+    unsafe {
+        if which == UPLOAD_ENCODER {
+            return hal.Handle { a: (*uploads).encoder.a, b: (*uploads).encoder.b, c: (*uploads).encoder.c, d: (*uploads).encoder.d }
+        }
+        if which == UPLOAD_RING {
+            return hal.Handle { a: (*uploads).ring.a, b: (*uploads).ring.b, c: (*uploads).ring.c, d: (*uploads).ring.d }
+        }
+        return hal.Handle { a: (*uploads).readback.a, b: (*uploads).readback.b, c: (*uploads).readback.c, d: (*uploads).readback.d }
+    }
+}
+
+fn set_handle(which: u32, uploads: *mut Uploads, handle: &hal.Handle) {
+    unsafe {
+        if which == UPLOAD_ENCODER {
+            (*uploads).encoder.a = handle.a
+            (*uploads).encoder.b = handle.b
+            (*uploads).encoder.c = handle.c
+            (*uploads).encoder.d = handle.d
+        } else if which == UPLOAD_RING {
+            (*uploads).ring.a = handle.a
+            (*uploads).ring.b = handle.b
+            (*uploads).ring.c = handle.c
+            (*uploads).ring.d = handle.d
+        } else {
+            (*uploads).readback.a = handle.a
+            (*uploads).readback.b = handle.b
+            (*uploads).readback.c = handle.c
+            (*uploads).readback.d = handle.d
+        }
+    }
+}
+
+fn take_hazards(uploads: *mut Uploads) -> Hazards {
+    unsafe {
+        return Hazards { table: (*uploads).hazards.table, capacity: (*uploads).hazards.capacity, count: (*uploads).hazards.count, off: (*uploads).hazards.off, degraded: (*uploads).hazards.degraded }
+    }
+}
+
+fn put_hazards(uploads: *mut Uploads, hazards: &Hazards) {
+    unsafe {
+        (*uploads).hazards.table = hazards.table
+        (*uploads).hazards.capacity = hazards.capacity
+        (*uploads).hazards.count = hazards.count
+        (*uploads).hazards.off = hazards.off
+        (*uploads).hazards.degraded = hazards.degraded
+    }
+}
+
+// Where a staged write's bytes go: `address` maps `offset` of `buffer`.
+struct Staging {
+    buffer: hal.Handle
+    offset: u64
+    address: usize
+    // A buffer of its own, retired once the upload has run.
+    dedicated: bool
+}
+
 // A GPU and the queue its work runs on.
 pub struct Device {
     raw: Raw
@@ -251,6 +368,11 @@ pub struct Device {
     name: [256]u8
     name_length: usize
     life: Life
+    uploads: Uploads
+    // Whether std/gpu stages transfers itself and tracks hazards for
+    // barriers (both off for OpenGL and Metal respectively).
+    staged: bool
+    tracks: bool
 
     // Open a device. With Preference.Auto, tries the operating system's
     // own API, then Vulkan, then OpenGL. Fails with NoBackend when no
@@ -300,14 +422,84 @@ pub struct Device {
         return err(failure)
     }
 
+    // Open a device that can present to a window, for a Surface. OpenGL
+    // devices draw with the window's own context, so only this window can
+    // have a Surface on them; Vulkan prefers a GPU that can present to it.
+    // Fails like open().
+    pub fn open_for_window(native: &handle.NativeHandle, options: Options) -> Device!Error {
+        debug := options.debug
+        match &options.backend {
+            Preference.Vulkan => {
+                return Device.from_raw(Raw.Vulkan(vulkan_hal.Device.open_for_window(native, debug)?))
+            }
+            Preference.Metal => {
+                return Device.from_raw(Raw.Native(native_hal.Device.open_for_window(native, debug)?))
+            }
+            Preference.OpenGl => {
+                return Device.from_raw(Raw.OpenGl(opengl_hal.Device.open_for_window(native, debug)?))
+            }
+            Preference.Auto => {}
+        }
+        failure := Error.NoBackend
+        match native_hal.Device.open_for_window(native, debug) {
+            ok(device) => {
+                return Device.from_raw(Raw.Native(device))
+            }
+            err(error) => {
+                failure = worse(failure, error)
+            }
+        }
+        match vulkan_hal.Device.open_for_window(native, debug) {
+            ok(device) => {
+                return Device.from_raw(Raw.Vulkan(device))
+            }
+            err(error) => {
+                failure = worse(failure, error)
+            }
+        }
+        match opengl_hal.Device.open_for_window(native, debug) {
+            ok(device) => {
+                return Device.from_raw(Raw.OpenGl(device))
+            }
+            err(error) => {
+                failure = worse(failure, error)
+            }
+        }
+        return err(failure)
+    }
+
     fn from_raw(raw: Raw) -> Device!Error {
         device := Device {
             raw: raw,
             limits: hal.Limits { max_texture_size: 0, max_buffer_size: 0, max_uniform_binding_size: 0, max_storage_binding_size: 0, max_workgroups: 0, max_workgroup_size_x: 0, max_workgroup_size_y: 0, max_workgroup_size_z: 0, max_workgroup_invocations: 0 },
             name: [0u8; 256],
             name_length: 0,
-            life: Life { open_encoders: 0, submitted: 0, count: 0, object: [0u32; 64], a: [0u64; 64], b: [0u64; 64], c: [0u64; 64], d: [0u64; 64], wait: [0u64; 64] }
+            life: Life { open_encoders: 0, submitted: 0, count: 0, object: [0u32; 64], a: [0u64; 64], b: [0u64; 64], c: [0u64; 64], d: [0u64; 64], wait: [0u64; 64] },
+            uploads: Uploads {
+                open: false,
+                encoder: hal.Handle.null(),
+                hazards: Hazards.new(false),
+                ring: hal.Handle.null(),
+                ring_size: 0,
+                ring_address: 0,
+                head: 0,
+                tail: 0,
+                mark_index: [0u64; 32],
+                mark_end: [0u64; 32],
+                marks: 0,
+                readback: hal.Handle.null(),
+                readback_size: 0,
+                readback_address: 0
+            },
+            staged: false,
+            tracks: false
         }
+        device.staged = device.raw_staged()
+        device.tracks = match device.api() {
+            Api.Metal => false,
+            _ => true,
+        }
+        device.uploads.hazards = Hazards.new(device.tracks)
         device.limits = device.raw_limits()
         name := [0u8; 256]
         length := device.raw_name(&mut name)
@@ -359,6 +551,21 @@ pub struct Device {
         // Whole words, so that shaders reading u32s stay in bounds.
         rounded := (size + 3) & ~3u64
         handle := self.raw_create_buffer(rounded, usage)?
+        // Mapped buffers start out zero; the others are cleared on the GPU
+        // before anything else uses them.
+        if self.staged && self.raw_mapped(&handle) == 0 {
+            match self.upload_encoder() {
+                ok(encoder) => {
+                    self.use_uploaded(&mut encoder, handle.a, hal.USE_COPY_DST)
+                    self.raw_clear_buffer(&mut encoder, &handle, 0, rounded)
+                    self.upload_done(&encoder)
+                }
+                err(error) => {
+                    self.raw_destroy(hal.OBJECT_BUFFER, &handle)
+                    return err(error)
+                }
+            }
+        }
         return ok(Buffer { device: self, handle: handle, size: size, usage: usage })
     }
 
@@ -366,7 +573,19 @@ pub struct Device {
     // usage needs no BUFFER_COPY_DST for this first write.
     pub fn create_buffer_with_data(&self, data: &[u8], usage: u32) -> Buffer!Error from(self) {
         buffer := self.create_buffer(data.len as u64, usage)?
-        self.raw_write_buffer(&buffer.handle, 0, data)?
+        if !self.staged {
+            self.raw_write_buffer(&buffer.handle, 0, data)?
+            return ok(buffer)
+        }
+        // Nothing uses a new buffer yet: write a mapped one directly.
+        address := self.raw_mapped(&buffer.handle)
+        if address != 0 {
+            unsafe {
+                ptr.copy_nonoverlapping(ptr.as_ptr(data), address as *mut u8, data.len)
+            }
+            return ok(buffer)
+        }
+        self.stage_buffer_write(&buffer.handle, 0, data)?
         return ok(buffer)
     }
 
@@ -382,7 +601,20 @@ pub struct Device {
         if data.len == 0 {
             return ok()
         }
-        return self.raw_write_buffer(&buffer.handle, offset, data)
+        if !self.staged {
+            return self.raw_write_buffer(&buffer.handle, offset, data)
+        }
+        address := self.raw_mapped(&buffer.handle)
+        if address != 0 && ((offset | data.len as u64) & 3) != 0 {
+            // Copies move whole words on some GPUs: write a mapped buffer
+            // directly instead, once the GPU is done with it.
+            self.finish()?
+            unsafe {
+                ptr.copy_nonoverlapping(ptr.as_ptr(data), (address + offset as usize) as *mut u8, data.len)
+            }
+            return ok()
+        }
+        return self.stage_buffer_write(&buffer.handle, offset, data)
     }
 
     // Copy bytes of `buffer` from `offset` into `out`, after waiting for
@@ -396,7 +628,30 @@ pub struct Device {
         if out.len == 0 {
             return ok()
         }
-        return self.raw_read_buffer(&buffer.handle, offset, out)
+        if !self.staged {
+            return self.raw_read_buffer(&buffer.handle, offset, out)
+        }
+        self.finish()?
+        address := self.raw_mapped(&buffer.handle)
+        if address != 0 {
+            self.raw_invalidate(&buffer.handle, offset, out.len as u64)
+            unsafe {
+                ptr.copy_nonoverlapping((address + offset as usize) as *const u8, ptr.as_mut_ptr(out), out.len)
+            }
+            return ok()
+        }
+        // Copy the words holding the range into the readback buffer.
+        start := offset & ~3u64
+        end := (offset + out.len as u64 + 3) & ~3u64
+        readback := self.readback(end - start)?
+        encoder := self.raw_begin_encoder()?
+        self.raw_copy_buffer(&mut encoder, &buffer.handle, start, &readback, 0, end - start)
+        self.run_readback(&mut encoder, &readback, end - start)?
+        unsafe {
+            source := (*self.uploads()).readback_address + (offset - start) as usize
+            ptr.copy_nonoverlapping(source as *const u8, ptr.as_mut_ptr(out), out.len)
+        }
+        return ok()
     }
 
     // A two-dimensional texture. Fails with InvalidInput for a zero size,
@@ -423,7 +678,20 @@ pub struct Device {
             return err(Error.InvalidInput)
         }
         handle := self.raw_create_texture(&descriptor)?
-        return ok(Texture { device: self, handle: handle, descriptor: descriptor })
+        if self.staged {
+            match self.upload_encoder() {
+                ok(encoder) => {
+                    self.use_uploaded(&mut encoder, handle.a ^ TEXTURE_KEY, hal.USE_COPY_DST)
+                    self.raw_initialize_texture(&mut encoder, &handle, &descriptor)
+                    self.upload_done(&encoder)
+                }
+                err(error) => {
+                    self.raw_destroy(hal.OBJECT_TEXTURE, &handle)
+                    return err(error)
+                }
+            }
+        }
+        return ok(Texture { device: self, handle: handle, descriptor: descriptor, external: false })
     }
 
     // Copy texels from `data` into `region` of `texture`, rows
@@ -439,7 +707,18 @@ pub struct Device {
         if region.width == 0 || region.height == 0 {
             return ok()
         }
-        return self.raw_write_texture(&texture.handle, &texture.descriptor, &region, data, bytes_per_row)
+        if !self.staged {
+            return self.raw_write_texture(&texture.handle, &texture.descriptor, &region, data, bytes_per_row)
+        }
+        size := copy_size(&texture.descriptor, &region, bytes_per_row)
+        staging := self.stage(&data[..size as usize])?
+        encoder := self.upload_encoder()?
+        self.use_uploaded(&mut encoder, staging.buffer.a, hal.USE_COPY_SRC)
+        self.use_uploaded(&mut encoder, texture.handle.a ^ TEXTURE_KEY, hal.USE_COPY_DST)
+        self.raw_copy_buffer_to_texture(&mut encoder, &staging.buffer, staging.offset, bytes_per_row, &texture.handle, &texture.descriptor, &region)
+        self.upload_done(&encoder)
+        self.unstage(&staging)
+        return ok()
     }
 
     // Copy texels of `region` into `out`, rows `bytes_per_row` apart, top
@@ -453,7 +732,19 @@ pub struct Device {
         if region.width == 0 || region.height == 0 {
             return ok()
         }
-        return self.raw_read_texture(&texture.handle, &texture.descriptor, &region, out, bytes_per_row)
+        if !self.staged {
+            return self.raw_read_texture(&texture.handle, &texture.descriptor, &region, out, bytes_per_row)
+        }
+        self.finish()?
+        size := copy_size(&texture.descriptor, &region, bytes_per_row)
+        readback := self.readback(size)?
+        encoder := self.raw_begin_encoder()?
+        self.raw_copy_texture_to_buffer(&mut encoder, &texture.handle, &texture.descriptor, &region, &readback, 0, bytes_per_row)
+        self.run_readback(&mut encoder, &readback, size)?
+        unsafe {
+            ptr.copy_nonoverlapping((*self.uploads()).readback_address as *const u8, ptr.as_mut_ptr(out), size as usize)
+        }
+        return ok()
     }
 
     pub fn create_sampler(&self, descriptor: SamplerDescriptor) -> Sampler!Error from(self) {
@@ -572,26 +863,303 @@ pub struct Device {
         unsafe {
             (*self.life()).open_encoders += 1
         }
-        return ok(CommandEncoder { device: self, handle: handle, open: true })
+        return ok(CommandEncoder { device: self, handle: handle, open: true, hazards: Hazards.new(self.tracks) })
     }
 
-    // Wait until the GPU has finished everything submitted so far.
+    // Wait until the GPU has finished everything submitted so far,
+    // including writes not yet followed by a submission.
     pub fn wait(&self) -> void!Error {
+        self.finish()?
+        self.collect(false)
+        return ok()
+    }
+
+    // Destroy dropped objects the GPU has finished with, and start staged
+    // writes not yet followed by a submission. submit() and wait() do this
+    // too; call it in programs that drop objects and then submit nothing
+    // for a while.
+    pub fn poll(&self) {
+        match self.flush() {
+            ok() => {}
+            err(_) => {}
+        }
+        self.collect(false)
+    }
+
+    fn uploads(&self) -> *mut Uploads {
+        unsafe {
+            return ptr.from_ref(&self.uploads) as *mut Uploads
+        }
+    }
+
+    // Submit staged writes, then wait for every submission.
+    fn finish(&self) -> void!Error {
+        self.flush()?
         submitted := unsafe {
             (*self.life()).submitted
         }
         if submitted != 0 {
             self.raw_wait(submitted)?
         }
-        self.collect(false)
         return ok()
     }
 
-    // Destroy dropped objects the GPU has finished with. submit() and
-    // wait() do this too; call it in programs that drop objects and then
-    // submit nothing for a while.
-    pub fn poll(&self) {
-        self.collect(false)
+    // The upload encoder, begun if it is not recording. Record into the
+    // copy, then store it back with upload_done.
+    fn upload_encoder(&self) -> hal.Handle!Error {
+        uploads := self.uploads()
+        unsafe {
+            if !(*uploads).open {
+                encoder := self.raw_begin_encoder()?
+                set_handle(UPLOAD_ENCODER, uploads, &encoder)
+                (*uploads).open = true
+                (*self.life()).open_encoders += 1
+                return ok(encoder)
+            }
+        }
+        return ok(get_handle(UPLOAD_ENCODER, uploads))
+    }
+
+    fn upload_done(&self, encoder: &hal.Handle) {
+        set_handle(UPLOAD_ENCODER, self.uploads(), encoder)
+    }
+
+    // Record a use by the upload encoder, with the barrier it needs.
+    fn use_uploaded(&self, encoder: &mut hal.Handle, key: u64, usage: u32) {
+        uploads := self.uploads()
+        before := 0u32
+        after := 0u32
+        hazards := take_hazards(uploads)
+        hazards.use_resource(key, usage, (usage & hal.USE_WRITES) != 0, &mut before, &mut after)
+        put_hazards(uploads, &hazards)
+        if before != 0 {
+            self.raw_barrier(encoder, before, after)
+        }
+    }
+
+    // Submit the upload encoder, if it recorded anything.
+    fn flush(&self) -> void!Error {
+        uploads := self.uploads()
+        open := unsafe {
+            (*uploads).open
+        }
+        if !open {
+            return ok()
+        }
+        encoder := get_handle(UPLOAD_ENCODER, uploads)
+        hazards := take_hazards(uploads)
+        hazards.clear()
+        put_hazards(uploads, &hazards)
+        unsafe {
+            (*uploads).open = false
+        }
+        index := match self.raw_submit(&mut encoder) {
+            ok(index) => index,
+            err(error) => {
+                self.raw_destroy(hal.OBJECT_ENCODER, &encoder)
+                self.close_encoder(0)
+                return err(error)
+            }
+        }
+        unsafe {
+            // Room for the mark: forget the oldest after waiting for it.
+            if (*uploads).marks == MARKS {
+                match self.raw_wait((*uploads).mark_index[0]) {
+                    ok() => {}
+                    err(_) => {}
+                }
+                self.reclaim()
+            }
+            if (*uploads).marks < MARKS {
+                (*uploads).mark_index[(*uploads).marks] = index
+                (*uploads).mark_end[(*uploads).marks] = (*uploads).head
+                (*uploads).marks += 1
+            }
+        }
+        self.close_encoder(index)
+        self.bury(hal.OBJECT_ENCODER, &encoder, index)
+        return ok()
+    }
+
+    // Free the ring space of finished uploads.
+    fn reclaim(&self) {
+        uploads := self.uploads()
+        completed := self.raw_completed()
+        unsafe {
+            kept := 0usize
+            for i in 0usize..(*uploads).marks {
+                if (*uploads).mark_index[i] <= completed {
+                    (*uploads).tail = (*uploads).mark_end[i]
+                } else {
+                    (*uploads).mark_index[kept] = (*uploads).mark_index[i]
+                    (*uploads).mark_end[kept] = (*uploads).mark_end[i]
+                    kept += 1
+                }
+            }
+            (*uploads).marks = kept
+            // Nothing submitted or recording uses the ring.
+            if kept == 0 && !(*uploads).open {
+                (*uploads).tail = (*uploads).head
+            }
+        }
+    }
+
+    // Copy `data` into staging memory for the upload encoder.
+    fn stage(&self, data: &[u8]) -> Staging!Error {
+        size := data.len as u64
+        staging := self.staging_space(size)?
+        unsafe {
+            ptr.copy_nonoverlapping(ptr.as_ptr(data), staging.address as *mut u8, data.len)
+        }
+        return ok(staging)
+    }
+
+    // A staged write is recorded: retire its own buffer once it has run.
+    fn unstage(&self, staging: &Staging) {
+        if staging.dedicated {
+            self.retire(hal.OBJECT_BUFFER, &staging.buffer)
+        }
+    }
+
+    // `size` bytes of staging memory: in the ring when it fits, otherwise
+    // in a buffer of its own.
+    fn staging_space(&self, size: u64) -> Staging!Error {
+        if size > RING_MAX / 4 {
+            buffer := self.raw_create_buffer((size + 3) & ~3u64, hal.BUFFER_UPLOAD)?
+            address := self.raw_mapped(&buffer)
+            return ok(Staging { buffer: buffer, offset: 0, address: address, dedicated: true })
+        }
+        uploads := self.uploads()
+        for {
+            self.reclaim()
+            ring_size := unsafe {
+                (*uploads).ring_size
+            }
+            if ring_size != 0 {
+                unsafe {
+                    start := ((*uploads).head + RING_ALIGNMENT - 1) & ~(RING_ALIGNMENT - 1)
+                    position := start % ring_size
+                    // Allocations never wrap around the end of the ring.
+                    if position + size > ring_size {
+                        start += ring_size - position
+                    }
+                    if start + size - (*uploads).tail <= ring_size {
+                        (*uploads).head = start + size
+                        offset := start % ring_size
+                        return ok(Staging { buffer: get_handle(UPLOAD_RING, uploads), offset: offset, address: (*uploads).ring_address + offset as usize, dedicated: false })
+                    }
+                }
+            }
+            if ring_size < RING_MAX {
+                self.grow_ring(size)?
+            } else {
+                // The ring is as large as it gets: wait for the oldest
+                // upload still using it.
+                self.flush()?
+                oldest := unsafe {
+                    (*uploads).mark_index[0]
+                }
+                self.raw_wait(oldest)?
+            }
+        }
+    }
+
+    // Replace the ring with one at least twice as large and four times
+    // `size`; the old one is retired once the GPU is done with it.
+    fn grow_ring(&self, size: u64) -> void!Error {
+        uploads := self.uploads()
+        old_size := unsafe {
+            (*uploads).ring_size
+        }
+        new_size := RING_START
+        if old_size * 2 > new_size {
+            new_size = old_size * 2
+        }
+        for new_size < size * 4 && new_size < RING_MAX {
+            new_size = new_size * 2
+        }
+        if new_size > RING_MAX {
+            new_size = RING_MAX
+        }
+        ring := self.raw_create_buffer(new_size, hal.BUFFER_UPLOAD)?
+        address := self.raw_mapped(&ring)
+        if old_size != 0 {
+            old := get_handle(UPLOAD_RING, uploads)
+            self.retire(hal.OBJECT_BUFFER, &old)
+        }
+        set_handle(UPLOAD_RING, uploads, &ring)
+        unsafe {
+            (*uploads).ring_size = new_size
+            (*uploads).ring_address = address
+            (*uploads).head = 0
+            (*uploads).tail = 0
+            (*uploads).marks = 0
+        }
+        return ok()
+    }
+
+    fn stage_buffer_write(&self, buffer: &hal.Handle, offset: u64, data: &[u8]) -> void!Error {
+        staging := self.stage(data)?
+        encoder := self.upload_encoder()?
+        self.use_uploaded(&mut encoder, staging.buffer.a, hal.USE_COPY_SRC)
+        self.use_uploaded(&mut encoder, buffer.a, hal.USE_COPY_DST)
+        self.raw_copy_buffer(&mut encoder, &staging.buffer, staging.offset, buffer, offset, data.len as u64)
+        self.upload_done(&encoder)
+        self.unstage(&staging)
+        return ok()
+    }
+
+    // The readback buffer, with room for `size` bytes. It is only used
+    // while a read waits for it, so replacing it needs no care.
+    fn readback(&self, size: u64) -> hal.Handle!Error {
+        uploads := self.uploads()
+        current := get_handle(UPLOAD_READBACK, uploads)
+        if unsafe {
+            (*uploads).readback_size
+        } >= size {
+            return ok(current)
+        }
+        unsafe {
+            if (*uploads).readback_size != 0 {
+                self.raw_destroy(hal.OBJECT_BUFFER, &current)
+                (*uploads).readback_size = 0
+            }
+        }
+        rounded := (size + 65535) & ~65535u64
+        readback := self.raw_create_buffer(rounded, hal.BUFFER_READBACK)?
+        address := self.raw_mapped(&readback)
+        set_handle(UPLOAD_READBACK, uploads, &readback)
+        unsafe {
+            (*uploads).readback_size = rounded
+            (*uploads).readback_address = address
+        }
+        return ok(readback)
+    }
+
+    // Submit a readback encoder, wait for it and make its writes visible.
+    fn run_readback(&self, encoder: &mut hal.Handle, readback: &hal.Handle, size: u64) -> void!Error {
+        index := match self.raw_submit(encoder) {
+            ok(index) => index,
+            err(error) => {
+                self.raw_destroy(hal.OBJECT_ENCODER, encoder)
+                return err(error)
+            }
+        }
+        self.note_submission(index)
+        result := self.raw_wait(index)
+        self.raw_destroy(hal.OBJECT_ENCODER, encoder)
+        result?
+        self.raw_invalidate(readback, 0, size)
+        return ok()
+    }
+
+    // The backend made submission `index` outside any encoder.
+    fn note_submission(&self, index: u64) {
+        if index != 0 {
+            unsafe {
+                (*self.life()).submitted = index
+            }
+        }
     }
 
     fn life(&self) -> *mut Life {
@@ -642,6 +1210,12 @@ pub struct Device {
         if unsafe {
             (*life).count
         } == GRAVEYARD {
+            // Staged writes keep the graveyard's objects pending: start them
+            // so that waiting can free some.
+            match self.flush() {
+                ok() => {}
+                err(_) => {}
+            }
             self.collect(true)
         }
         unsafe {
@@ -666,9 +1240,9 @@ pub struct Device {
             return
         }
         completed := self.raw_completed()
-        if block && unsafe {
-            (*life).open_encoders
-        } == 0 {
+        if block {
+            // Objects of submitted work can be waited for even while
+            // encoders are open; those of open encoders stay.
             submitted := unsafe {
                 (*life).submitted
             }
@@ -1103,9 +1677,160 @@ pub struct Device {
         }
     }
 
+    fn raw_staged(&self) -> bool {
+        match &self.raw {
+            Raw.Vulkan(raw) => {
+                return raw.staged()
+            }
+            Raw.Native(raw) => {
+                return raw.staged()
+            }
+            Raw.OpenGl(raw) => {
+                return raw.staged()
+            }
+        }
+    }
+    fn raw_mapped(&self, buffer: &hal.Handle) -> usize {
+        match &self.raw {
+            Raw.Vulkan(raw) => {
+                return raw.mapped(buffer)
+            }
+            Raw.Native(raw) => {
+                return raw.mapped(buffer)
+            }
+            Raw.OpenGl(raw) => {
+                return raw.mapped(buffer)
+            }
+        }
+    }
+    fn raw_invalidate(&self, buffer: &hal.Handle, offset: u64, size: u64) {
+        match &self.raw {
+            Raw.Vulkan(raw) => {
+                raw.invalidate(buffer, offset, size)
+            }
+            Raw.Native(raw) => {
+                raw.invalidate(buffer, offset, size)
+            }
+            Raw.OpenGl(raw) => {
+                raw.invalidate(buffer, offset, size)
+            }
+        }
+    }
+    fn raw_clear_buffer(&self, encoder: &mut hal.Handle, buffer: &hal.Handle, offset: u64, size: u64) {
+        match &self.raw {
+            Raw.Vulkan(raw) => {
+                raw.clear_buffer(encoder, buffer, offset, size)
+            }
+            Raw.Native(raw) => {
+                raw.clear_buffer(encoder, buffer, offset, size)
+            }
+            Raw.OpenGl(raw) => {
+                raw.clear_buffer(encoder, buffer, offset, size)
+            }
+        }
+    }
+    fn raw_initialize_texture(&self, encoder: &mut hal.Handle, texture: &hal.Handle, descriptor: &TextureDescriptor) {
+        match &self.raw {
+            Raw.Vulkan(raw) => {
+                raw.initialize_texture(encoder, texture, descriptor)
+            }
+            Raw.Native(raw) => {
+                raw.initialize_texture(encoder, texture, descriptor)
+            }
+            Raw.OpenGl(raw) => {
+                raw.initialize_texture(encoder, texture, descriptor)
+            }
+        }
+    }
+    fn raw_barrier(&self, encoder: &mut hal.Handle, before: u32, after: u32) {
+        match &self.raw {
+            Raw.Vulkan(raw) => {
+                raw.barrier(encoder, before, after)
+            }
+            Raw.Native(raw) => {
+                raw.barrier(encoder, before, after)
+            }
+            Raw.OpenGl(raw) => {
+                raw.barrier(encoder, before, after)
+            }
+        }
+    }
+    fn raw_create_surface(&self, native: &handle.NativeHandle) -> hal.Handle!Error {
+        match &self.raw {
+            Raw.Vulkan(raw) => {
+                return raw.create_surface(native)
+            }
+            Raw.Native(raw) => {
+                return raw.create_surface(native)
+            }
+            Raw.OpenGl(raw) => {
+                return raw.create_surface(native)
+            }
+        }
+    }
+    fn raw_configure_surface(&self, surface: &mut hal.Handle, config: &mut hal.SurfaceConfig) -> void!Error {
+        match &self.raw {
+            Raw.Vulkan(raw) => {
+                return raw.configure_surface(surface, config)
+            }
+            Raw.Native(raw) => {
+                return raw.configure_surface(surface, config)
+            }
+            Raw.OpenGl(raw) => {
+                return raw.configure_surface(surface, config)
+            }
+        }
+    }
+    fn raw_acquire(&self, surface: &mut hal.Handle, texture: &mut hal.Handle) -> u64!Error {
+        match &self.raw {
+            Raw.Vulkan(raw) => {
+                return raw.acquire(surface, texture)
+            }
+            Raw.Native(raw) => {
+                return raw.acquire(surface, texture)
+            }
+            Raw.OpenGl(raw) => {
+                return raw.acquire(surface, texture)
+            }
+        }
+    }
+    fn raw_present(&self, surface: &mut hal.Handle) -> u64!Error {
+        match &self.raw {
+            Raw.Vulkan(raw) => {
+                return raw.present(surface)
+            }
+            Raw.Native(raw) => {
+                return raw.present(surface)
+            }
+            Raw.OpenGl(raw) => {
+                return raw.present(surface)
+            }
+        }
+    }
+    fn raw_destroy_surface(&self, surface: &hal.Handle) {
+        match &self.raw {
+            Raw.Vulkan(raw) => {
+                raw.destroy_surface(surface)
+            }
+            Raw.Native(raw) => {
+                raw.destroy_surface(surface)
+            }
+            Raw.OpenGl(raw) => {
+                raw.destroy_surface(surface)
+            }
+        }
+    }
+
     fn drop(&mut self) {
-        // Every object borrowing the device is gone; only the graveyard is
-        // left. Destroy it once the GPU is idle.
+        // Every object borrowing the device is gone; only the graveyard and
+        // the staging buffers are left. Staged writes no one can see any
+        // more are discarded. Destroy the rest once the GPU is idle.
+        if self.uploads.open {
+            handle := self.uploads.encoder.copy()
+            self.raw_destroy(hal.OBJECT_ENCODER, &handle)
+            self.uploads.open = false
+        }
+        self.uploads.hazards.clear()
         submitted := self.life.submitted
         if submitted != 0 {
             match self.raw_wait(submitted) {
@@ -1118,6 +1843,16 @@ pub struct Device {
             self.raw_destroy(self.life.object[i], &handle)
         }
         self.life.count = 0
+        if self.uploads.ring_size != 0 {
+            ring := self.uploads.ring.copy()
+            self.raw_destroy(hal.OBJECT_BUFFER, &ring)
+            self.uploads.ring_size = 0
+        }
+        if self.uploads.readback_size != 0 {
+            readback := self.uploads.readback.copy()
+            self.raw_destroy(hal.OBJECT_BUFFER, &readback)
+            self.uploads.readback_size = 0
+        }
     }
 }
 
@@ -1156,6 +1891,12 @@ fn worse(current: Error, next: Error) -> Error {
 // Whether [offset, offset + length) lies within `size` bytes.
 fn fits(offset: u64, length: u64, size: u64) -> bool {
     return length <= size && offset <= size - length
+}
+
+// The bytes a texture copy of `region` spans, rows `bytes_per_row` apart.
+fn copy_size(texture: &TextureDescriptor, region: &Region, bytes_per_row: u32) -> u64 {
+    row := region.width as u64 * hal.texel_size(texture.format) as u64
+    return (region.height as u64 - 1) * bytes_per_row as u64 + row
 }
 
 // Whether a copy of `region` between `texture` and `available` bytes
@@ -1230,6 +1971,8 @@ pub struct Texture {
     device: &Device
     handle: hal.Handle
     descriptor: hal.TextureDescriptor
+    // A surface's image, which belongs to the surface.
+    external: bool
 
     pub fn width(&self) -> u32 {
         return self.descriptor.width
@@ -1253,7 +1996,9 @@ pub struct Texture {
     }
 
     fn drop(&mut self) {
-        self.device.retire(hal.OBJECT_TEXTURE, &self.handle)
+        if !self.external {
+            self.device.retire(hal.OBJECT_TEXTURE, &self.handle)
+        }
     }
 }
 
@@ -1322,6 +2067,7 @@ pub struct CommandEncoder {
     device: &Device
     handle: hal.Handle
     open: bool
+    hazards: Hazards
 
     // Record a compute pass. The encoder is busy until the pass ends.
     pub fn compute_pass(&mut self) -> ComputePass from(self) {
@@ -1380,6 +2126,15 @@ pub struct CommandEncoder {
             tracked.depth_format = depth.descriptor.format
         }
         device.raw_begin_render_pass(&mut self.handle, &info)
+        before := 0u32
+        after := 0u32
+        self.hazards.use_resource(target.handle.a ^ TEXTURE_KEY, hal.USE_COLOR, true, &mut before, &mut after)
+        if has_depth {
+            self.hazards.use_resource(depth.handle.a ^ TEXTURE_KEY, hal.USE_DEPTH, true, &mut before, &mut after)
+        }
+        if before != 0 {
+            device.raw_barrier(&mut self.handle, before, after)
+        }
         return RenderPass { encoder: self, state: hal.PassState.new(), tracked: tracked }
     }
 
@@ -1400,6 +2155,7 @@ pub struct CommandEncoder {
         if size == 0 {
             return
         }
+        copy_hazards(device, &mut self.hazards, &mut self.handle, source.handle.a, destination.handle.a)
         device.raw_copy_buffer(&mut self.handle, &source.handle, source_offset, &destination.handle, destination_offset, size)
     }
 
@@ -1417,6 +2173,7 @@ pub struct CommandEncoder {
         if region.width == 0 || region.height == 0 {
             return
         }
+        copy_hazards(device, &mut self.hazards, &mut self.handle, source.handle.a, destination.handle.a ^ TEXTURE_KEY)
         device.raw_copy_buffer_to_texture(&mut self.handle, &source.handle, offset, bytes_per_row, &destination.handle, &destination.descriptor, &region)
     }
 
@@ -1432,12 +2189,15 @@ pub struct CommandEncoder {
         if region.width == 0 || region.height == 0 {
             return
         }
+        copy_hazards(device, &mut self.hazards, &mut self.handle, source.handle.a ^ TEXTURE_KEY, destination.handle.a)
         device.raw_copy_texture_to_buffer(&mut self.handle, &source.handle, &source.descriptor, &region, &destination.handle, offset, bytes_per_row)
     }
 
-    // Run the recorded commands after everything submitted before.
+    // Run the recorded commands after everything submitted before, and
+    // after the writes made with write_buffer and write_texture so far.
     pub fn submit(self) -> void!Error {
         device := self.device
+        device.flush()?
         index := device.raw_submit(&mut self.handle)?
         self.open = false
         device.close_encoder(index)
@@ -1447,11 +2207,23 @@ pub struct CommandEncoder {
     }
 
     fn drop(&mut self) {
+        self.hazards.clear()
         if self.open {
             device := self.device
             device.raw_destroy(hal.OBJECT_ENCODER, &self.handle)
             device.close_encoder(0)
         }
+    }
+}
+
+// A copy from `source` to `destination` (tracking keys) follows.
+fn copy_hazards(device: &Device, hazards: &mut Hazards, encoder: &mut hal.Handle, source: u64, destination: u64) {
+    before := 0u32
+    after := 0u32
+    hazards.use_resource(source, hal.USE_COPY_SRC, false, &mut before, &mut after)
+    hazards.use_resource(destination, hal.USE_COPY_DST, true, &mut before, &mut after)
+    if before != 0 {
+        device.raw_barrier(encoder, before, after)
     }
 }
 
@@ -1599,6 +2371,12 @@ pub struct ComputePass {
         if x == 0 || y == 0 || z == 0 {
             return
         }
+        before := 0u32
+        after := 0u32
+        binding_hazards(&self.state, &mut self.encoder.hazards, &mut before, &mut after)
+        if before != 0 {
+            device.raw_barrier(&mut self.encoder.handle, before, after)
+        }
         device.raw_dispatch(&mut self.encoder.handle, &mut self.state, x, y, z)
     }
 
@@ -1713,6 +2491,7 @@ pub struct RenderPass {
         if vertex_count == 0 || instance_count == 0 {
             return
         }
+        draw_hazards(device, &self.state, &mut self.encoder.hazards, &mut self.encoder.handle, false)
         device.raw_draw(&mut self.encoder.handle, &mut self.state, vertex_count, instance_count, first_vertex, first_instance)
     }
 
@@ -1730,6 +2509,7 @@ pub struct RenderPass {
         if index_count == 0 || instance_count == 0 {
             return
         }
+        draw_hazards(device, &self.state, &mut self.encoder.hazards, &mut self.encoder.handle, true)
         device.raw_draw_indexed(&mut self.encoder.handle, &mut self.state, index_count, instance_count, first_index, base_vertex, first_instance)
     }
 
@@ -1738,6 +2518,23 @@ pub struct RenderPass {
     fn drop(&mut self) {
         device := self.encoder.device
         device.raw_end_render_pass(&mut self.encoder.handle)
+    }
+}
+
+// A draw follows: barriers for its bindings, vertex buffers and, when
+// `indexed`, index buffer. Backends run them before the pass.
+fn draw_hazards(device: &Device, state: &hal.PassState, hazards: &mut Hazards, encoder: &mut hal.Handle, indexed: bool) {
+    before := 0u32
+    after := 0u32
+    binding_hazards(state, hazards, &mut before, &mut after)
+    for i in 0usize..state.pipeline.vertex_buffer_count as usize {
+        hazards.use_resource(state.vertex_a[i], hal.USE_VERTEX_INPUT, false, &mut before, &mut after)
+    }
+    if indexed {
+        hazards.use_resource(state.index_a, hal.USE_INDEX, false, &mut before, &mut after)
+    }
+    if before != 0 {
+        device.raw_barrier(encoder, before, after)
     }
 }
 
@@ -1800,5 +2597,402 @@ pub fn u32_bytes_mut(values: &mut[u32]) -> &mut[u8] from(values) {
 pub fn i32_bytes_mut(values: &mut[i32]) -> &mut[u8] from(values) {
     unsafe {
         return ptr.borrow_slice_mut(ptr.as_mut_ptr(values) as *mut u8, values.len * 4, values)
+    }
+}
+
+// Hazard tracking. Every buffer and texture an encoder uses gets an entry,
+// keyed by its handle's first word (textures with TEXTURE_KEY flipped, as
+// OpenGL buffer and texture names overlap), holding the USE_* bits of its
+// last write, the reads since then, and the uses that write was made
+// visible to. Each encoder starts with empty entries: the backend orders
+// it after earlier submissions as a whole.
+
+unsafe extern "C" fn malloc(size: usize) -> *mut u8
+unsafe extern "C" fn free(block: *mut u8)
+
+const TEXTURE_KEY: u64 = 0x8000000000000000
+// Bytes per entry: key, write, reads, visible and padding.
+const ENTRY: usize = 24
+const FIRST_CAPACITY: usize = 64
+// Every USE_* bit, for a barrier against everything.
+const ALL_USES: u32 = 0x7ff
+
+struct Hazards {
+    // Open addressing with linear probing; key 0 marks a free entry.
+    table: usize
+    capacity: usize
+    count: usize
+    // Tracking is off (Metal, which tracks hazards itself).
+    off: bool
+    // Memory ran out: every use waits for everything before it.
+    degraded: bool
+
+    fn new(on: bool) -> Hazards {
+        return Hazards { table: 0, capacity: 0, count: 0, off: !on, degraded: false }
+    }
+
+    // Forget every entry and free the table.
+    fn clear(&mut self) {
+        if self.table != 0 {
+            unsafe {
+                free(self.table as *mut u8)
+            }
+        }
+        self.table = 0
+        self.capacity = 0
+        self.count = 0
+        self.degraded = false
+    }
+
+    // A command uses the resource `key` as `usage` says, writing it when
+    // `write`: add the barrier it needs to `before` and `after`.
+    fn use_resource(&mut self, key: u64, usage: u32, write: bool, before: &mut u32, after: &mut u32) {
+        if self.off {
+            return
+        }
+        entry := self.find(key)
+        if entry == 0 {
+            *before = ALL_USES
+            *after = *after | usage
+            return
+        }
+        written := load32(entry, 8)
+        reads := load32(entry, 12)
+        visible := load32(entry, 16)
+        if load64(entry, 0) != key {
+            // First use in this encoder.
+            store64(entry, 0, key)
+            store32(entry, 16, 0)
+            if write {
+                store32(entry, 8, usage)
+                store32(entry, 12, 0)
+            } else {
+                store32(entry, 8, 0)
+                store32(entry, 12, usage)
+            }
+            return
+        }
+        // Read after write, or write after write.
+        if written != 0 && (write || (usage & ~visible) != 0) {
+            *before = *before | written
+            *after = *after | usage
+        }
+        // Write after read.
+        if write && reads != 0 {
+            *before = *before | reads
+            *after = *after | usage
+        }
+        if write {
+            store32(entry, 8, usage)
+            store32(entry, 12, 0)
+            store32(entry, 16, 0)
+        } else {
+            store32(entry, 12, reads | usage)
+            if written != 0 {
+                store32(entry, 16, visible | usage)
+            }
+        }
+    }
+
+    // The address of `key`'s entry, or of the free entry it goes into;
+    // 0 when memory ran out.
+    fn find(&mut self, key: u64) -> usize {
+        if self.degraded {
+            return 0
+        }
+        if (self.count + 1) * 2 > self.capacity && !self.grow() {
+            self.degraded = true
+            return 0
+        }
+        mask := self.capacity - 1
+        index := hash(key) & mask
+        for {
+            entry := self.table + index * ENTRY
+            stored := load64(entry, 0)
+            if stored == key {
+                return entry
+            }
+            if stored == 0 {
+                self.count += 1
+                return entry
+            }
+            index = (index + 1) & mask
+        }
+    }
+
+    // Double the table (or make the first one); false when out of memory.
+    fn grow(&mut self) -> bool {
+        capacity := FIRST_CAPACITY
+        if self.capacity != 0 {
+            capacity = self.capacity * 2
+        }
+        table := unsafe {
+            malloc(capacity * ENTRY) as usize
+        }
+        if table == 0 {
+            return false
+        }
+        unsafe {
+            ptr.write_bytes(table as *mut u8, 0u8, capacity * ENTRY)
+        }
+        mask := capacity - 1
+        for i in 0usize..self.capacity {
+            old := self.table + i * ENTRY
+            key := load64(old, 0)
+            if key != 0 {
+                index := hash(key) & mask
+                for load64(table + index * ENTRY, 0) != 0 {
+                    index = (index + 1) & mask
+                }
+                entry := table + index * ENTRY
+                store64(entry, 0, key)
+                store32(entry, 8, load32(old, 8))
+                store32(entry, 12, load32(old, 12))
+                store32(entry, 16, load32(old, 16))
+            }
+        }
+        if self.table != 0 {
+            unsafe {
+                free(self.table as *mut u8)
+            }
+        }
+        self.table = table
+        self.capacity = capacity
+        return true
+    }
+}
+
+// Handles are mostly aligned addresses: mix their higher bits down.
+fn hash(key: u64) -> usize {
+    return ((key >> 4) ^ (key >> 20) ^ (key >> 36) ^ (key >> 63)) as usize
+}
+
+fn load64(entry: usize, offset: usize) -> u64 {
+    return unsafe {
+        *((entry + offset) as *const u64)
+    }
+}
+
+fn store64(entry: usize, offset: usize, value: u64) {
+    unsafe {
+        *((entry + offset) as *mut u64) = value
+    }
+}
+
+fn load32(entry: usize, offset: usize) -> u32 {
+    return unsafe {
+        *((entry + offset) as *const u32)
+    }
+}
+
+fn store32(entry: usize, offset: usize, value: u32) {
+    unsafe {
+        *((entry + offset) as *mut u32) = value
+    }
+}
+
+// The uses of the pipeline's bound slots by a draw or dispatch.
+fn binding_hazards(state: &hal.PassState, hazards: &mut Hazards, before: &mut u32, after: &mut u32) {
+    for slot in 0usize..16 {
+        kind := state.pipeline.kinds[slot]
+        if kind != hal.BINDING_NONE {
+            stages := state.pipeline.stages[slot]
+            usage := 0u32
+            if (stages & hal.STAGE_VERTEX) != 0 {
+                usage = usage | hal.USE_VERTEX_READ
+            }
+            if (stages & hal.STAGE_FRAGMENT) != 0 {
+                usage = usage | hal.USE_FRAGMENT_READ
+            }
+            if (stages & hal.STAGE_COMPUTE) != 0 {
+                usage = usage | hal.USE_COMPUTE_READ
+            }
+            writable := kind == hal.BINDING_STORAGE_BUFFER || kind == hal.BINDING_STORAGE_TEXTURE
+            if writable {
+                // Vertex shaders never write (see check_bindings).
+                if (stages & hal.STAGE_FRAGMENT) != 0 {
+                    usage = usage | hal.USE_FRAGMENT_WRITE
+                }
+                if (stages & hal.STAGE_COMPUTE) != 0 {
+                    usage = usage | hal.USE_COMPUTE_WRITE
+                }
+            }
+            key := state.object_a[slot]
+            if state.bound[slot] != hal.BOUND_BUFFER {
+                key = key ^ TEXTURE_KEY
+            }
+            hazards.use_resource(key, usage, writable, before, after)
+        }
+    }
+}
+
+// How a Surface presents. Surface.create uses the defaults: vsync on, two
+// frames in flight.
+pub struct SurfaceOptions {
+    // Wait for the display's refresh to show each frame (no tearing).
+    pub vsync: bool
+    // How many frames the CPU may record before the GPU has finished the
+    // oldest: 2 or 3. More hides GPU latency, fewer cuts input lag.
+    pub frames_in_flight: u32
+
+    pub fn default() -> SurfaceOptions {
+        return SurfaceOptions { vsync: true, frames_in_flight: 2 }
+    }
+}
+
+// The images a window shows. Each frame, acquire() a Frame, render into
+// its texture() and present() it.
+//
+// On Vulkan the surface is a swapchain (VK_KHR_xcb_surface on Linux,
+// VK_KHR_win32_surface on Windows), on Metal the view's CAMetalLayer (the
+// one Window.metal_layer() made, or a new one), and on OpenGL a texture
+// copied into the window by the window's own context, which needs a device
+// from Device.open_for_window. The images have format(), an 8-bit sRGB
+// format, and usages TEXTURE_RENDER, TEXTURE_COPY_SRC and TEXTURE_COPY_DST.
+//
+// Call resize() with the window's size in pixels whenever it changes
+// (window.Event.Resize). The window must stay open while the surface
+// exists; use both from the thread that opened the window.
+pub struct Surface {
+    device: &Device
+    handle: hal.Handle
+    config: hal.SurfaceConfig
+
+    // A surface for `native`'s window, `width` by `height` pixels, with
+    // the default SurfaceOptions. Fails with Unsupported when the device
+    // cannot present to this window, as an OpenGL device not opened for it
+    // with Device.open_for_window, or a Vulkan device on macOS (use Metal).
+    pub fn create(device: &Device, native: &handle.NativeHandle, width: u32, height: u32) -> Surface!Error from(device) {
+        return Surface.create_with(device, native, width, height, SurfaceOptions.default())
+    }
+
+    pub fn create_with(device: &Device, native: &handle.NativeHandle, width: u32, height: u32, options: SurfaceOptions) -> Surface!Error from(device) {
+        if options.frames_in_flight < 2 || options.frames_in_flight > 3 || width > device.limits.max_texture_size || height > device.limits.max_texture_size {
+            return err(Error.InvalidInput)
+        }
+        handle := device.raw_create_surface(native)?
+        surface := Surface { device: device, handle: handle, config: hal.SurfaceConfig { width: width, height: height, vsync: options.vsync, frames: options.frames_in_flight, format: hal.FORMAT_NONE } }
+        surface.configure()?
+        return ok(surface)
+    }
+
+    // The format of the images: FORMAT_BGRA8_UNORM_SRGB or
+    // FORMAT_RGBA8_UNORM_SRGB. Render pipelines drawing into them use it.
+    pub fn format(&self) -> u32 {
+        return self.config.format
+    }
+    // The images' size in pixels, which can differ from the one asked for
+    // where the window system decides.
+    pub fn width(&self) -> u32 {
+        return self.config.width
+    }
+    pub fn height(&self) -> u32 {
+        return self.config.height
+    }
+
+    // Make the images `width` by `height` pixels, the window's new size.
+    // A size of 0, as for a minimized window, makes acquire() fail with
+    // Outdated until the next resize.
+    pub fn resize(&mut self, width: u32, height: u32) -> void!Error {
+        limit := self.device.limits.max_texture_size
+        if width > limit || height > limit {
+            return err(Error.InvalidInput)
+        }
+        self.config.width = width
+        self.config.height = height
+        return self.configure()
+    }
+
+    pub fn set_vsync(&mut self, vsync: bool) -> void!Error {
+        self.config.vsync = vsync
+        return self.configure()
+    }
+
+    // Wait for the next image, at most frames_in_flight frames after the
+    // oldest one the GPU is still working on. Fails with Outdated when the
+    // window's size changed in a way the surface could not follow by
+    // itself; resize() it then.
+    pub fn acquire(&mut self) -> Frame!Error from(self) {
+        device := self.device
+        texture := hal.Handle.null()
+        if self.config.width == 0 || self.config.height == 0 {
+            return err(Error.Outdated)
+        }
+        index := match device.raw_acquire(&mut self.handle, &mut texture) {
+            ok(index) => index,
+            err(Error.Outdated) => {
+                // Rebuild for the window's current size and try once more.
+                configure_surface(device, &mut self.handle, &mut self.config)?
+                if self.config.width == 0 || self.config.height == 0 {
+                    return err(Error.Outdated)
+                }
+                device.raw_acquire(&mut self.handle, &mut texture)?
+            }
+            err(error) => {
+                return err(error)
+            }
+        }
+        device.note_submission(index)
+        descriptor := hal.TextureDescriptor.new(self.config.width, self.config.height, self.config.format, hal.TEXTURE_RENDER | hal.TEXTURE_COPY_SRC | hal.TEXTURE_COPY_DST)
+        image := Texture { device: device, handle: texture, descriptor: descriptor, external: true }
+        return ok(Frame { surface: self, texture: image, presented: false })
+    }
+
+    fn configure(&mut self) -> void!Error {
+        return configure_surface(self.device, &mut self.handle, &mut self.config)
+    }
+
+    fn drop(&mut self) {
+        device := self.device
+        match device.finish() {
+            ok() => {}
+            err(_) => {}
+        }
+        device.raw_destroy_surface(&self.handle)
+    }
+}
+
+// Wait for the GPU, then make a surface's images for its settings.
+fn configure_surface(device: &Device, surface: &mut hal.Handle, config: &mut hal.SurfaceConfig) -> void!Error {
+    device.finish()?
+    return device.raw_configure_surface(surface, config)
+}
+
+// One image of a Surface, to render into and present. Dropping a frame
+// without present() presents it anyway.
+pub struct Frame {
+    surface: &mut Surface
+    texture: Texture
+    presented: bool
+
+    // The image: a color attachment or copy destination of the surface's
+    // format and size.
+    pub fn texture(&self) -> &Texture from(self) {
+        return &self.texture
+    }
+
+    // Show the image once every submission so far has finished drawing it.
+    pub fn present(self) -> void!Error {
+        self.presented = true
+        return self.show()
+    }
+
+    fn show(&mut self) -> void!Error {
+        device := self.surface.device
+        device.flush()?
+        index := device.raw_present(&mut self.surface.handle)?
+        device.note_submission(index)
+        device.collect(false)
+        return ok()
+    }
+
+    fn drop(&mut self) {
+        if !self.presented {
+            self.presented = true
+            match self.show() {
+                ok() => {}
+                err(_) => {}
+            }
+        }
     }
 }

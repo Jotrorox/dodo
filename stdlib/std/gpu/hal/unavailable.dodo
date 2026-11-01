@@ -1,6 +1,7 @@
 package unavailable
 
 import "std/gpu/hal"
+import "std/window/handle"
 
 // The native backend of systems without one of their own (Linux, and
 // Windows until a Direct3D 12 backend exists): opening it always fails
@@ -13,6 +14,16 @@ pub struct Device: hal.Backend {
     pub fn open(debug: bool) -> Device!hal.Error {
         return err(hal.Error.NoBackend)
     }
+    pub fn open_for_window(native: &handle.NativeHandle, debug: bool) -> Device!hal.Error {
+        return err(hal.Error.NoBackend)
+    }
+    pub fn staged(&self) -> bool {
+        return false
+    }
+    pub fn mapped(&self, buffer: &hal.Handle) -> usize {
+        return 0
+    }
+    pub fn invalidate(&self, buffer: &hal.Handle, offset: u64, size: u64) {}
     pub fn api(&self) -> hal.Api {
         return hal.Api.Metal
     }
@@ -74,4 +85,20 @@ pub struct Device: hal.Backend {
     pub fn copy_buffer(&self, encoder: &mut hal.Handle, source: &hal.Handle, source_offset: u64, destination: &hal.Handle, destination_offset: u64, size: u64) {}
     pub fn copy_buffer_to_texture(&self, encoder: &mut hal.Handle, source: &hal.Handle, offset: u64, bytes_per_row: u32, destination: &hal.Handle, descriptor: &hal.TextureDescriptor, region: &hal.Region) {}
     pub fn copy_texture_to_buffer(&self, encoder: &mut hal.Handle, source: &hal.Handle, descriptor: &hal.TextureDescriptor, region: &hal.Region, destination: &hal.Handle, offset: u64, bytes_per_row: u32) {}
+    pub fn clear_buffer(&self, encoder: &mut hal.Handle, buffer: &hal.Handle, offset: u64, size: u64) {}
+    pub fn initialize_texture(&self, encoder: &mut hal.Handle, texture: &hal.Handle, descriptor: &hal.TextureDescriptor) {}
+    pub fn barrier(&self, encoder: &mut hal.Handle, before: u32, after: u32) {}
+    pub fn create_surface(&self, native: &handle.NativeHandle) -> hal.Handle!hal.Error {
+        return err(hal.Error.NoBackend)
+    }
+    pub fn configure_surface(&self, surface: &mut hal.Handle, config: &mut hal.SurfaceConfig) -> void!hal.Error {
+        return err(hal.Error.NoBackend)
+    }
+    pub fn acquire(&self, surface: &mut hal.Handle, texture: &mut hal.Handle) -> u64!hal.Error {
+        return err(hal.Error.NoBackend)
+    }
+    pub fn present(&self, surface: &mut hal.Handle) -> u64!hal.Error {
+        return err(hal.Error.NoBackend)
+    }
+    pub fn destroy_surface(&self, surface: &hal.Handle) {}
 }
