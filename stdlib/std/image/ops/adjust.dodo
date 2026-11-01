@@ -1,0 +1,214 @@
+package ops
+
+import "std/image/convert"
+import "std/image/pixels"
+
+// Pixel adjustments: fill, alpha compositing, grayscale and invert.
+//
+// Integer targets are processed as straight 16-bit RGBA with integer
+// arithmetic; float targets (F16, F32) as straight f32 RGBA, keeping values
+// outside 0.0..1.0. Premultiplied layouts are handled by the load and store
+// helpers, so callers never multiply by alpha themselves.
+
+// Set every pixel of `target` to a straight 16-bit RGBA color (8-bit values
+// times 257); gray targets receive its BT.709 luma, layouts without alpha
+// drop it.
+pub fn fill(target: &mut pixels.ViewMut, r: u16, g: u16, b: u16, a: u16) {
+    color := [r, g, b, a]
+    layout := target.layout().clone()
+    size := layout.bytes_per_pixel()
+    pixel := [0u8; 16]
+    convert.store_rgba16(&color, &mut pixel, &layout, 0, 1)
+    width := target.width() as usize
+    for y in 0u32..target.height() {
+        line := target.row_mut(y)
+        for x in 0usize..width {
+            for k in 0usize..size {
+                line[x * size + k] = pixel[k]
+            }
+        }
+    }
+}
+
+// fill() with an 8-bit color.
+pub fn fill8(target: &mut pixels.ViewMut, r: u8, g: u8, b: u8, a: u8) {
+    fill(target, r as u16 * 257, g as u16 * 257, b as u16 * 257, a as u16 * 257)
+}
+
+// Straight source-over blend of one 16-bit pixel onto another, in place in
+// `under` at o. Exact up to one final rounding per channel.
+fn over16(top: &[u16], under: &mut[u16], o: usize) {
+    alpha := top[o + 3] as u64
+    if alpha == 65535 {
+        for c in 0usize..4 {
+            under[o + c] = top[o + c]
+        }
+        return
+    }
+    if alpha == 0 {
+        return
+    }
+    rest := 65535 - alpha
+    below := under[o + 3] as u64
+    // Output alpha in units of 65535^2.
+    coverage := alpha * 65535 + below * rest
+    for c in 0usize..3 {
+        mixed := top[o + c] as u64 * alpha * 65535 + under[o + c] as u64 * below * rest
+        under[o + c] = ((mixed + coverage / 2) / coverage) as u16
+    }
+    under[o + 3] = ((coverage + 32767) / 65535) as u16
+}
+
+fn over_f32(top: &[f32], under: &mut[f32], o: usize) {
+    alpha := top[o + 3]
+    if alpha >= 1.0f32 {
+        for c in 0usize..4 {
+            under[o + c] = top[o + c]
+        }
+        return
+    }
+    if !(alpha > 0.0f32) {
+        return
+    }
+    rest := (1.0f32 - alpha) * under[o + 3]
+    coverage := alpha + rest
+    for c in 0usize..3 {
+        under[o + c] = (top[o + c] * alpha + under[o + c] * rest) / coverage
+    }
+    under[o + 3] = coverage
+}
+
+// Blend `source` over `target` with source pixel (0, 0) at target (x, y),
+// using its alpha (straight or premultiplied, any layout). Parts outside
+// the target are skipped.
+pub fn composite_over(source: &pixels.View, target: &mut pixels.ViewMut, x: i32, y: i32) {
+    source_x := 0i64
+    target_x := x as i64
+    if target_x < 0 {
+        source_x = -target_x
+        target_x = 0
+    }
+    source_y := 0i64
+    target_y := y as i64
+    if target_y < 0 {
+        source_y = -target_y
+        target_y = 0
+    }
+    columns := source.width() as i64 - source_x
+    if target.width() as i64 - target_x < columns {
+        columns = target.width() as i64 - target_x
+    }
+    rows := source.height() as i64 - source_y
+    if target.height() as i64 - target_y < rows {
+        rows = target.height() as i64 - target_y
+    }
+    if columns <= 0 || rows <= 0 {
+        return
+    }
+    source_layout := source.layout().clone()
+    target_layout := target.layout().clone()
+    float := target_layout.is_float()
+    top16 := [0u16; 256]
+    under16 := [0u16; 256]
+    top_f := [0.0f32; 256]
+    under_f := [0.0f32; 256]
+    for r in 0i64..rows {
+        top_line := source.row((source_y + r) as u32)
+        line := target.row_mut((target_y + r) as u32)
+        done := 0i64
+        for done < columns {
+            count := columns - done
+            if count > BATCH as i64 {
+                count = BATCH as i64
+            }
+            s := (source_x + done) as usize
+            t := (target_x + done) as usize
+            n := count as usize
+            if float {
+                load_f32(top_line, &source_layout, s, n, &mut top_f)
+                load_f32(line, &target_layout, t, n, &mut under_f)
+                for i in 0usize..n {
+                    over_f32(&top_f, &mut under_f, i * 4)
+                }
+                store_f32(&under_f, line, &target_layout, t, n)
+            } else {
+                convert.load_rgba16(top_line, &source_layout, s, n, &mut top16)
+                convert.load_rgba16(line, &target_layout, t, n, &mut under16)
+                for i in 0usize..n {
+                    over16(&top16, &mut under16, i * 4)
+                }
+                convert.store_rgba16(&under16, line, &target_layout, t, n)
+            }
+            done += count
+        }
+    }
+}
+
+const MAP_GRAY: u32 = 0
+const MAP_INVERT: u32 = 1
+
+fn map_pixels(source: &pixels.View, target: &mut pixels.ViewMut, operation: u32) -> void!pixels.Error {
+    same_size(source, target)?
+    source_layout := source.layout().clone()
+    target_layout := target.layout().clone()
+    float := target_layout.is_float()
+    width := source.width() as usize
+    wide := [0u16; 256]
+    floats := [0.0f32; 256]
+    for y in 0u32..source.height() {
+        line := source.row(y)
+        x := 0usize
+        for x < width {
+            count := width - x
+            if count > BATCH {
+                count = BATCH
+            }
+            if float {
+                load_f32(line, &source_layout, x, count, &mut floats)
+                for i in 0usize..count {
+                    o := i * 4
+                    if operation == MAP_GRAY {
+                        luma := 0.2126f32 * floats[o] + 0.7152f32 * floats[o + 1] + 0.0722f32 * floats[o + 2]
+                        floats[o] = luma
+                        floats[o + 1] = luma
+                        floats[o + 2] = luma
+                    } else {
+                        for c in 0usize..3 {
+                            floats[o + c] = 1.0f32 - floats[o + c]
+                        }
+                    }
+                }
+                store_f32(&floats, target.row_mut(y), &target_layout, x, count)
+            } else {
+                convert.load_rgba16(line, &source_layout, x, count, &mut wide)
+                for i in 0usize..count {
+                    o := i * 4
+                    if operation == MAP_GRAY {
+                        luma := convert.luma16(wide[o] as u32, wide[o + 1] as u32, wide[o + 2] as u32) as u16
+                        wide[o] = luma
+                        wide[o + 1] = luma
+                        wide[o + 2] = luma
+                    } else {
+                        for c in 0usize..3 {
+                            wide[o + c] = 65535 - wide[o + c]
+                        }
+                    }
+                }
+                convert.store_rgba16(&wide, target.row_mut(y), &target_layout, x, count)
+            }
+            x += count
+        }
+    }
+    return ok()
+}
+
+// Replace color by its BT.709 luma, keeping alpha; the target (same size)
+// may be color or gray.
+pub fn grayscale(source: &pixels.View, target: &mut pixels.ViewMut) -> void!pixels.Error {
+    return map_pixels(source, target, MAP_GRAY)
+}
+
+// Invert color (1 - value per channel), keeping alpha.
+pub fn invert(source: &pixels.View, target: &mut pixels.ViewMut) -> void!pixels.Error {
+    return map_pixels(source, target, MAP_INVERT)
+}

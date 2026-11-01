@@ -2,6 +2,8 @@ package linux
 
 import "core/ptr"
 import "core/mem"
+import "std/dylib"
+import "std/window/handle"
 import "std/window/heap"
 import "std/window/raw"
 import "std/window/x11"
@@ -14,6 +16,18 @@ import "std/window/x11"
 // The process's one connection lives in a static, with a Slot per open
 // window; Backend's associated functions act on it, so windows need no
 // reference to the App that opened them.
+//
+// The clipboard is the CLIPBOARD selection, held by a hidden window that
+// is created on first use: copying makes it the owner and answers other
+// clients' requests from the event loop; pasting asks the owner to write the
+// text into a property of that window, waiting for the answer while keeping
+// the events that arrive meanwhile in a queue next_event drains first.
+//
+// GPU APIs cannot use that socket: Vulkan and EGL take a libxcb or Xlib
+// connection. native_handle() therefore loads libxcb at run time and opens a
+// second connection to the same server; X11 resource ids are valid on every
+// connection, so the GPU presents into these windows through it. Programs
+// that never ask for a handle need nothing beyond libc.
 
 unsafe extern "C" fn dodo_window_claim() -> i32
 unsafe extern "C" fn dodo_window_release()
@@ -32,8 +46,40 @@ const INPUT: usize = 262144
 // Buffered requests; also bounds one PutImage.
 const OUTPUT: usize = 262144
 const NO_REPLY: u32 = 0xffffffff
+// GetProperty reads this many 4-byte units at a time, which keeps each reply
+// within the input buffer.
+const PROPERTY_CHUNK: u32 = 65280
+// How long a clipboard owner may take to answer each request.
+const CLIPBOARD_WAIT: u32 = 1000
+// Outcomes of asking the clipboard's owner for a conversion.
+const CONVERTED: u32 = 0
+const REFUSED: u32 = 1
+const NO_ANSWER: u32 = 2
+
+// Every atom the connection interns, separated by spaces, in the order of
+// the fields Connection.connect stores them in.
+const ATOM_NAMES: &str = "WM_PROTOCOLS WM_DELETE_WINDOW _NET_WM_NAME UTF8_STRING CLIPBOARD TARGETS TEXT INCR _NET_WM_STATE _NET_WM_STATE_FULLSCREEN _NET_SUPPORTING_WM_CHECK DODO_SELECTION"
+const ATOMS: usize = 12
 
 const EVENTS: u32 = 0x1 | 0x2 | 0x4 | 0x8 | 0x20 | 0x40 | 0x8000 | 0x20000 | 0x200000
+
+type XcbConnect = extern "C" fn(*const u8, *mut i32) -> *mut u8
+type XcbConnectionHasError = extern "C" fn(*mut u8) -> i32
+type XcbDisconnect = extern "C" fn(*mut u8)
+
+// libxcb stays loaded once opened, like every library std/dylib opens.
+fn symbol(library: &dylib.Library, name: &[u8]) -> usize {
+    match library.symbol(name) {
+        ok(address) => {
+            return unsafe {
+                address as usize
+            }
+        }
+        err(_) => {
+            return 0
+        }
+    }
+}
 
 fn modifiers(state: u32) -> u32 {
     bits := 0u32
@@ -99,17 +145,87 @@ struct Slot {
     pixel_width: u32
     pixel_height: u32
     mouse_inside: bool
+    // Opened without a pixel buffer, for drawing with the GPU.
+    gpu: bool
     // An earlier refresh Present reported, its time in microseconds and
     // frame counter, to measure the refresh period in nanoseconds against.
     base_ust: u64
     base_msc: u64
     period: u64
+    // The position the server last reported, relative to the parent.
+    x: i32
+    y: i32
+    resizable: bool
+    // Size limits in pixels; 0 is none.
+    min_width: u32
+    min_height: u32
+    max_width: u32
+    max_height: u32
+    // The raw.CURSOR_ shape, and whether the pointer is hidden.
+    cursor: u32
+    cursor_hidden: bool
+    fullscreen: bool
+    // Fullscreen through the window manager (true), or by covering the
+    // screen without one.
+    managed: bool
+    // The geometry to return to from fullscreen, and whether set_size
+    // changed it meanwhile.
+    saved_x: i32
+    saved_y: i32
+    saved_width: u32
+    saved_height: u32
+    resize_after: bool
+}
+
+// Text bytes collected in a buffer that grows as needed.
+struct Growing {
+    bytes: heap.Bytes
+    used: usize
+
+    fn new() -> Growing {
+        return Growing { bytes: heap.Bytes.empty(), used: 0 }
+    }
+    // False when memory runs out.
+    fn append(&mut self, data: &[u8]) -> bool {
+        if data.len == 0 {
+            return true
+        }
+        if self.used + data.len > self.bytes.len() {
+            capacity := self.bytes.len() * 2
+            if capacity < self.used + data.len {
+                capacity = self.used + data.len
+            }
+            if capacity < 4096 {
+                capacity = 4096
+            }
+            let some(next) = heap.Bytes.new(capacity) else {
+                return false
+            }
+            unsafe {
+                ptr.copy_nonoverlapping(self.bytes.pointer() as *const u8, next.pointer(), self.used)
+            }
+            self.bytes = next
+        }
+        unsafe {
+            ptr.copy_nonoverlapping(ptr.as_ptr(data), ptr.offset(self.bytes.pointer(), self.used as isize), data.len)
+        }
+        self.used += data.len
+        return true
+    }
+    // The collected bytes, leaving this buffer empty.
+    fn finish(&mut self) -> heap.Bytes {
+        result := heap.Bytes { address: self.bytes.address, length: self.used }
+        self.bytes.address = 0
+        self.bytes.length = 0
+        self.used = 0
+        return result
+    }
 }
 
 // Window ids are never reused within a process, across connections too.
 static mut NEXT_ID: u32 = 1
 
-static mut CONNECTION: Connection = Connection { active: false, socket: -1, input: heap.Bytes { address: 0, length: 0 }, input_start: 0, input_end: 0, output: heap.Bytes { address: 0, length: 0 }, output_length: 0, mapping: heap.Bytes { address: 0, length: 0 }, mapping_first: 0, mapping_count: 0, per_keycode: 0, mapping_sequence: NO_REPLY, root: 0, depth: 24, max_request: 0, id_base: 0, id_step: 1, id_count: 0, blank_cursor: 0, wm_protocols: 0, wm_delete: 0, net_wm_name: 0, utf8_string: 0, sequence: 0, pending_text: 0, pending_window: 0, repeat_keycode: 0, present_opcode: 0, present_serial: 0, windows: heap.Table<Slot> { address: 0, count: 0, capacity: 0 } }
+static mut CONNECTION: Connection = Connection { active: false, socket: -1, input: heap.Bytes { address: 0, length: 0 }, input_start: 0, input_end: 0, output: heap.Bytes { address: 0, length: 0 }, output_length: 0, mapping: heap.Bytes { address: 0, length: 0 }, mapping_first: 0, mapping_count: 0, per_keycode: 0, mapping_sequence: NO_REPLY, root: 0, depth: 24, visual: 0, max_request: 0, id_base: 0, id_step: 1, id_count: 0, blank_cursor: 0, wm_protocols: 0, wm_delete: 0, net_wm_name: 0, utf8_string: 0, sequence: 0, pending_text: 0, pending_window: 0, repeat_keycode: 0, present_opcode: 0, present_serial: 0, xcb: 0, xcb_screen: 0, xcb_disconnect: 0, windows: heap.Table<Slot> { address: 0, count: 0, capacity: 0 }, screen_width: 0, screen_height: 0, time: 0, clipboard_atom: 0, targets_atom: 0, text_atom: 0, incr_atom: 0, net_wm_state: 0, net_wm_fullscreen: 0, net_wm_check: 0, transfer_atom: 0, helper: 0, clipboard: heap.Bytes { address: 0, length: 0 }, clipboard_owned: false, clipboard_ascii: false, cursor_font: 0, cursors: [0u32; 11], deferred: heap.Table<raw.Event> { address: 0, count: 0, capacity: 0 }, deferred_head: 0 }
 
 struct Connection {
     active: bool
@@ -126,6 +242,8 @@ struct Connection {
     mapping_sequence: u32
     root: u32
     depth: u32
+    // The root window's visual, which every window uses.
+    visual: u32
     max_request: usize
     id_base: u32
     id_step: u32
@@ -144,7 +262,42 @@ struct Connection {
     // The Present extension's major opcode, or 0 without it.
     present_opcode: u8
     present_serial: u32
+    // The libxcb connection native_handle() opened, its screen and its
+    // xcb_disconnect, or 0 before the first handle.
+    xcb: usize
+    xcb_screen: u32
+    xcb_disconnect: usize
     windows: heap.Table<Slot>
+    screen_width: u32
+    screen_height: u32
+    // The server time of the latest input event, for selection requests;
+    // 0 (CurrentTime) before the first.
+    time: u32
+    clipboard_atom: u32
+    targets_atom: u32
+    text_atom: u32
+    incr_atom: u32
+    net_wm_state: u32
+    net_wm_fullscreen: u32
+    net_wm_check: u32
+    // The property of `helper` that pasted text is written to.
+    transfer_atom: u32
+    // The hidden window owning the clipboard and receiving pasted text, 0
+    // before the first clipboard call.
+    helper: u32
+    // The text this App copied while it owns the clipboard, and whether it
+    // is plain ASCII, which may also be handed out as STRING.
+    clipboard: heap.Bytes
+    clipboard_owned: bool
+    clipboard_ascii: bool
+    // The "cursor" font and the glyph cursor of each raw.CURSOR_ shape,
+    // made on first use; 0 before.
+    cursor_font: u32
+    cursors: [11]u32
+    // Events that arrived while a request waited for its answer, for
+    // next_event to return first, from deferred_head on.
+    deferred: heap.Table<raw.Event>
+    deferred_head: usize
 
     // Connect to the server named by DISPLAY.
     fn connect(&mut self) -> void!raw.Error {
@@ -181,6 +334,7 @@ struct Connection {
         self.input_start = total
         self.root = setup.root
         self.depth = setup.root_depth
+        self.visual = setup.root_visual
         self.max_request = setup.max_request
         self.id_base = setup.id_base
         // Resource ids step by the lowest bit of the mask.
@@ -189,15 +343,24 @@ struct Connection {
             return err(raw.Error.Protocol)
         }
 
+        self.screen_width = setup.screen_width
+        self.screen_height = setup.screen_height
+
         // Atoms and the keyboard mapping, before any window can send events.
-        protocols_atom := self.atom("WM_PROTOCOLS")?
-        self.wm_protocols = protocols_atom
-        delete_atom := self.atom("WM_DELETE_WINDOW")?
-        self.wm_delete = delete_atom
-        name_atom := self.atom("_NET_WM_NAME")?
-        self.net_wm_name = name_atom
-        utf8_atom := self.atom("UTF8_STRING")?
-        self.utf8_string = utf8_atom
+        atoms := [0u32; 12]
+        self.intern(&mut atoms)?
+        self.wm_protocols = atoms[0]
+        self.wm_delete = atoms[1]
+        self.net_wm_name = atoms[2]
+        self.utf8_string = atoms[3]
+        self.clipboard_atom = atoms[4]
+        self.targets_atom = atoms[5]
+        self.text_atom = atoms[6]
+        self.incr_atom = atoms[7]
+        self.net_wm_state = atoms[8]
+        self.net_wm_fullscreen = atoms[9]
+        self.net_wm_check = atoms[10]
+        self.transfer_atom = atoms[11]
         self.mapping_first = setup.min_keycode
         self.mapping_count = setup.max_keycode - setup.min_keycode + 1
         self.request_mapping()?
@@ -208,7 +371,7 @@ struct Connection {
     }
 
     // Create, describe and map a window; returns its id.
-    fn open(&mut self, title: &str, width: u32, height: u32, resizable: bool) -> u32!raw.Error {
+    fn open(&mut self, title: &str, width: u32, height: u32, resizable: bool, pixel_buffer: bool) -> u32!raw.Error {
         if !self.active {
             return err(raw.Error.Closed)
         }
@@ -254,7 +417,7 @@ struct Connection {
         unsafe {
             NEXT_ID += 1
         }
-        if !self.windows.push(Slot { id: id, window: window, gc: gc, width: width, height: height, pixels: 0, pixel_width: 0, pixel_height: 0, mouse_inside: false, base_ust: 0, base_msc: 0, period: 0 }) {
+        if !self.windows.push(Slot { id: id, window: window, gc: gc, width: width, height: height, pixels: 0, pixel_width: 0, pixel_height: 0, mouse_inside: false, gpu: !pixel_buffer, base_ust: 0, base_msc: 0, period: 0, x: 0, y: 0, resizable: resizable, min_width: 0, min_height: 0, max_width: 0, max_height: 0, cursor: raw.CURSOR_ARROW, cursor_hidden: false, fullscreen: false, managed: false, saved_x: 0, saved_y: 0, saved_width: width, saved_height: height, resize_after: false }) {
             self.destroy(window, gc)
             return err(raw.Error.OutOfMemory)
         }
@@ -275,6 +438,7 @@ struct Connection {
             if self.pending_window == id {
                 self.pending_text = 0
             }
+            self.drop_deferred(id)
             self.destroy(window, gc)
         }
     }
@@ -303,6 +467,7 @@ struct Connection {
 
     // Close the socket, which destroys every window, and release the claim.
     fn disconnect(&mut self) {
+        self.disconnect_xcb()
         if self.socket >= 0 {
             unsafe {
                 dodo_window_x11_close(self.socket)
@@ -310,6 +475,10 @@ struct Connection {
             self.socket = -1
         }
         self.windows.clear()
+        self.deferred.clear()
+        self.deferred_head = 0
+        self.clipboard = heap.Bytes.empty()
+        self.clipboard_owned = false
         self.input = heap.Bytes.empty()
         self.output = heap.Bytes.empty()
         self.mapping = heap.Bytes.empty()
@@ -382,13 +551,23 @@ struct Connection {
         return ok()
     }
     fn property(&mut self, window: u32, property: u32, kind: u32, format: u8, data: &[u8]) -> void!raw.Error {
-        if data.len > OUTPUT - 64 {
+        return self.property_mode(x11.PROPERTY_REPLACE, window, property, kind, format, data)
+    }
+    fn property_mode(&mut self, mode: u8, window: u32, property: u32, kind: u32, format: u8, data: &[u8]) -> void!raw.Error {
+        if data.len > OUTPUT - 64 || data.len + 64 > self.max_request {
             return err(raw.Error.InvalidInput)
         }
         self.reserve(data.len + 32)?
         start := self.output_length
         out := self.output.bytes()
-        length := x11.change_property(&mut out[start..], window, property, kind, format, data)
+        length := x11.change_property_mode(&mut out[start..], mode, window, property, kind, format, data)
+        return self.commit(length)
+    }
+    fn configure(&mut self, window: u32, mask: u32, values: &[u32]) -> void!raw.Error {
+        self.reserve(40)?
+        start := self.output_length
+        out := self.output.bytes()
+        length := x11.configure_window(&mut out[start..], window, mask, values)
         return self.commit(length)
     }
     // Set both the Latin-1 and the UTF-8 title properties.
@@ -399,18 +578,41 @@ struct Connection {
         utf8_string := self.utf8_string
         return self.property(window, net_wm_name, utf8_string, 8, text)
     }
-    fn atom(&mut self, name: &str) -> u32!raw.Error {
-        self.reserve(64)?
-        start := self.output_length
-        out := self.output.bytes()
-        length := x11.intern_atom(&mut out[start..], mem.str_bytes(name))
-        self.commit(length)?
-        wanted := self.sequence
-        head := [0u8; 32]
-        if !self.reply(wanted, &mut head)? {
+    // Intern the ATOM_NAMES, sending every request before reading the
+    // replies so the server is asked only once; only used before any window
+    // exists.
+    fn intern(&mut self, atoms: &mut[u32]) -> void!raw.Error {
+        names := mem.str_bytes(ATOM_NAMES)
+        first := 0u32
+        start := 0usize
+        count := 0usize
+        for end in 0usize..names.len + 1 {
+            if end < names.len && names[end] != 32 {
+                continue
+            }
+            self.reserve(64)?
+            at := self.output_length
+            out := self.output.bytes()
+            length := x11.intern_atom(&mut out[at..], &names[start..end])
+            self.commit(length)?
+            if count == 0 {
+                first = self.sequence
+            }
+            count += 1
+            start = end + 1
+        }
+        if count != ATOMS || atoms.len < ATOMS {
             return err(raw.Error.Protocol)
         }
-        return ok(x11.u32_at(&head, 8))
+        head := [0u8; 32]
+        for i in 0usize..ATOMS {
+            wanted := (first + i as u32) & 0xffff
+            if !self.reply(wanted, &mut head)? {
+                return err(raw.Error.Protocol)
+            }
+            atoms[i] = x11.u32_at(&head, 8)
+        }
+        return ok()
     }
     // Send the buffered requests and wait for the answer to request
     // `wanted`, skipping other messages; only used before any window
@@ -538,6 +740,12 @@ struct Connection {
         if !self.ready(milliseconds)? {
             return ok(false)
         }
+        return self.dispatch(event)
+    }
+    // Handle the message at input_start, of which at least 32 bytes are
+    // buffered, and consume it. Fills `event` and returns true when the
+    // message is one to report.
+    fn dispatch(&mut self, event: &mut raw.Event) -> bool!raw.Error {
         begin := self.input_start
         message := [0u8; 32]
         copy_to(&mut message, &self.input.view()[begin..begin + x11.PACKET])
@@ -652,6 +860,10 @@ struct Connection {
 
     fn translate(&mut self, message: &[u8], event: &mut raw.Event) -> bool!raw.Error {
         kind := x11.code(message)
+        if kind >= x11.KEY_PRESS && kind <= x11.LEAVE_NOTIFY {
+            // Input events carry the server time selection requests use.
+            self.time = x11.u32_at(message, 4)
+        }
         if kind == x11.KEY_PRESS || kind == x11.KEY_RELEASE {
             id := self.window_at(message, 12)
             if id == 0 {
@@ -781,6 +993,8 @@ struct Connection {
             height := x11.u16_at(message, 22)
             records := self.windows.records()
             slot := &mut records[index]
+            slot.x = x11.i16_at(message, 16)
+            slot.y = x11.i16_at(message, 18)
             if width == slot.width && height == slot.height {
                 return ok(false)
             }
@@ -795,6 +1009,18 @@ struct Connection {
             if id != 0 && x11.u32_at(message, 8) == self.wm_protocols && x11.u32_at(message, 12) == self.wm_delete {
                 set(event, id, raw.CLOSE, 0, 0, 0, 0, 0)
                 return ok(true)
+            }
+            return ok(false)
+        }
+        if kind == x11.SELECTION_REQUEST {
+            self.serve(message)?
+            return ok(false)
+        }
+        if kind == x11.SELECTION_CLEAR {
+            // Another client copied something: forget the text.
+            if self.helper != 0 && x11.u32_at(message, 8) == self.helper && x11.u32_at(message, 12) == self.clipboard_atom {
+                self.clipboard_owned = false
+                self.clipboard = heap.Bytes.empty()
             }
             return ok(false)
         }
@@ -884,6 +1110,19 @@ struct Connection {
         if !self.active {
             return err(raw.Error.Closed)
         }
+        if self.deferred_head < self.deferred.len() {
+            {
+                records := self.deferred.view()
+                kept := &records[self.deferred_head]
+                set(event, kept.window, kept.kind, kept.code, kept.modifiers, kept.flags, kept.x, kept.y)
+            }
+            self.deferred_head += 1
+            if self.deferred_head == self.deferred.len() {
+                self.deferred.truncate(0)
+                self.deferred_head = 0
+            }
+            return ok(true)
+        }
         if self.pending_text != 0 {
             window := self.pending_window
             set(event, window, raw.TEXT, self.pending_text, 0, 0, 0, 0)
@@ -936,8 +1175,70 @@ struct Connection {
         let some(index) = self.slot(id) else {
             return err(raw.Error.Closed)
         }
+        if self.windows.view()[index].gpu {
+            return err(raw.Error.Unsupported)
+        }
         self.put(index, x, y, width, height)?
         return self.flush()
+    }
+
+    // The window and the libxcb connection for GPU APIs, opened on the first
+    // call. GPU drivers act on the window through that other connection, so
+    // the window must exist on the server first.
+    fn native_handle(&mut self, id: u32) -> handle.NativeHandle!raw.Error {
+        let some(index) = self.slot(id) else {
+            return err(raw.Error.Closed)
+        }
+        window := self.windows.view()[index].window
+        self.flush()?
+        if self.xcb == 0 {
+            self.connect_xcb()?
+        }
+        return ok(handle.NativeHandle.Xcb(self.xcb, window, self.xcb_screen, self.visual))
+    }
+    fn connect_xcb(&mut self) -> void!raw.Error {
+        library := match dylib.open(b"libxcb.so.1\0") {
+            ok(library) => library,
+            err(_) => {
+                return err(raw.Error.NoDisplay)
+            }
+        }
+        connect := symbol(&library, b"xcb_connect\0")
+        has_error := symbol(&library, b"xcb_connection_has_error\0")
+        disconnect := symbol(&library, b"xcb_disconnect\0")
+        if connect == 0 || has_error == 0 || disconnect == 0 {
+            return err(raw.Error.NoDisplay)
+        }
+        screen := 0i32
+        connection := unsafe {
+            open_connection := connect as XcbConnect
+            open_connection(0usize as *const u8, ptr.from_mut(&mut screen)) as usize
+        }
+        // xcb_connect never returns null; a failed connection reports an
+        // error and must still be disconnected.
+        self.xcb = connection
+        self.xcb_disconnect = disconnect
+        failed := unsafe {
+            check := has_error as XcbConnectionHasError
+            check(connection as *mut u8)
+        }
+        if failed != 0 || screen < 0 {
+            self.disconnect_xcb()
+            return err(raw.Error.NoDisplay)
+        }
+        self.xcb_screen = screen as u32
+        return ok()
+    }
+    fn disconnect_xcb(&mut self) {
+        if self.xcb != 0 {
+            unsafe {
+                close := self.xcb_disconnect as XcbDisconnect
+                close(self.xcb as *mut u8)
+            }
+        }
+        self.xcb = 0
+        self.xcb_screen = 0
+        self.xcb_disconnect = 0
     }
 
     fn set_title(&mut self, id: u32, title: &str) -> void!raw.Error {
@@ -957,55 +1258,700 @@ struct Connection {
         let some(index) = self.slot(id) else {
             return err(raw.Error.Closed)
         }
+        self.windows.records()[index].cursor_hidden = !visible
+        self.apply_cursor(index)?
+        return self.flush()
+    }
+    fn set_cursor(&mut self, id: u32, shape: u32) -> void!raw.Error {
+        let some(index) = self.slot(id) else {
+            return err(raw.Error.Closed)
+        }
+        self.windows.records()[index].cursor = shape
+        self.apply_cursor(index)?
+        return self.flush()
+    }
+    // Give slot `index`'s window the cursor its state asks for. The arrow
+    // is the parent's cursor, which desktops set to their themed arrow.
+    fn apply_cursor(&mut self, index: usize) -> void!raw.Error {
         window := 0u32
+        hidden := false
+        shape := 0u32
         {
             records := self.windows.view()
             window = records[index].window
-        }
-        if !visible && self.blank_cursor == 0 {
-            // An invisible cursor shared by every window: a 1x1 bitmap
-            // cleared to 0 as its mask.
-            pixmap := self.new_id()?
-            gc := self.new_id()?
-            cursor := self.new_id()?
-            root := self.root
-            self.reserve(128)?
-            start := self.output_length
-            out := self.output.bytes()
-            length := x11.create_pixmap(&mut out[start..], pixmap, root, 1, 1, 1)
-            self.commit(length)?
-            start = self.output_length
-            out = self.output.bytes()
-            length = x11.create_gc(&mut out[start..], gc, pixmap, 0)
-            self.commit(length)?
-            start = self.output_length
-            out = self.output.bytes()
-            length = x11.fill_rectangle(&mut out[start..], pixmap, gc, 0, 0, 1, 1)
-            self.commit(length)?
-            start = self.output_length
-            out = self.output.bytes()
-            length = x11.create_cursor(&mut out[start..], cursor, pixmap, pixmap)
-            self.commit(length)?
-            start = self.output_length
-            out = self.output.bytes()
-            length = x11.free_gc(&mut out[start..], gc)
-            self.commit(length)?
-            start = self.output_length
-            out = self.output.bytes()
-            length = x11.free_pixmap(&mut out[start..], pixmap)
-            self.commit(length)?
-            self.blank_cursor = cursor
+            hidden = records[index].cursor_hidden
+            shape = records[index].cursor
         }
         cursor := 0u32
-        if !visible {
-            cursor = self.blank_cursor
+        if hidden {
+            cursor = self.blank()?
+        } else if shape != raw.CURSOR_ARROW && shape < raw.CURSORS {
+            cursor = self.glyph_cursor(shape)?
         }
         self.reserve(16)?
         start := self.output_length
         out := self.output.bytes()
         length := x11.set_cursor(&mut out[start..], window, cursor)
+        return self.commit(length)
+    }
+    // An invisible cursor shared by every window: a 1x1 bitmap cleared to 0
+    // as its mask.
+    fn blank(&mut self) -> u32!raw.Error {
+        if self.blank_cursor != 0 {
+            return ok(self.blank_cursor)
+        }
+        pixmap := self.new_id()?
+        gc := self.new_id()?
+        cursor := self.new_id()?
+        root := self.root
+        self.reserve(128)?
+        start := self.output_length
+        out := self.output.bytes()
+        length := x11.create_pixmap(&mut out[start..], pixmap, root, 1, 1, 1)
+        self.commit(length)?
+        start = self.output_length
+        out = self.output.bytes()
+        length = x11.create_gc(&mut out[start..], gc, pixmap, 0)
+        self.commit(length)?
+        start = self.output_length
+        out = self.output.bytes()
+        length = x11.fill_rectangle(&mut out[start..], pixmap, gc, 0, 0, 1, 1)
+        self.commit(length)?
+        start = self.output_length
+        out = self.output.bytes()
+        length = x11.create_cursor(&mut out[start..], cursor, pixmap, pixmap)
+        self.commit(length)?
+        start = self.output_length
+        out = self.output.bytes()
+        length = x11.free_gc(&mut out[start..], gc)
+        self.commit(length)?
+        start = self.output_length
+        out = self.output.bytes()
+        length = x11.free_pixmap(&mut out[start..], pixmap)
+        self.commit(length)?
+        self.blank_cursor = cursor
+        return ok(cursor)
+    }
+    // The cursor of a shape from the server's "cursor" font, made once and
+    // shared by every window.
+    fn glyph_cursor(&mut self, shape: u32) -> u32!raw.Error {
+        if self.cursors[shape as usize] != 0 {
+            return ok(self.cursors[shape as usize])
+        }
+        if self.cursor_font == 0 {
+            font := self.new_id()?
+            self.reserve(32)?
+            start := self.output_length
+            out := self.output.bytes()
+            length := x11.open_font(&mut out[start..], font, mem.str_bytes("cursor"))
+            self.commit(length)?
+            self.cursor_font = font
+        }
+        cursor := self.new_id()?
+        font := self.cursor_font
+        self.reserve(32)?
+        start := self.output_length
+        out := self.output.bytes()
+        length := x11.create_glyph_cursor(&mut out[start..], cursor, font, x11.cursor_glyph(shape))
+        self.commit(length)?
+        self.cursors[shape as usize] = cursor
+        return ok(cursor)
+    }
+
+    // -- Size and fullscreen -----------------------------------------------
+
+    fn set_size(&mut self, id: u32, width: u32, height: u32) -> void!raw.Error {
+        let some(index) = self.slot(id) else {
+            return err(raw.Error.Closed)
+        }
+        window := 0u32
+        resizable := false
+        {
+            records := self.windows.records()
+            slot := &mut records[index]
+            if slot.fullscreen {
+                // Applies when the window leaves fullscreen.
+                slot.saved_width = width
+                slot.saved_height = height
+                slot.resize_after = true
+                return ok()
+            }
+            window = slot.window
+            resizable = slot.resizable
+        }
+        if !resizable {
+            self.write_hints(index, width, height)?
+        }
+        sizes := [width, height]
+        self.configure(window, x11.CONFIGURE_WIDTH | x11.CONFIGURE_HEIGHT, &sizes)?
+        return self.flush()
+    }
+    fn set_size_limits(&mut self, id: u32, min_width: u32, min_height: u32, max_width: u32, max_height: u32) -> void!raw.Error {
+        let some(index) = self.slot(id) else {
+            return err(raw.Error.Closed)
+        }
+        window := 0u32
+        width := 0u32
+        height := 0u32
+        {
+            records := self.windows.records()
+            slot := &mut records[index]
+            slot.min_width = min_width
+            slot.min_height = min_height
+            slot.max_width = max_width
+            slot.max_height = max_height
+            if slot.fullscreen {
+                // The hints return with the window from fullscreen.
+                return ok()
+            }
+            window = slot.window
+            width = slot.width
+            height = slot.height
+        }
+        fitted_width := within(width, min_width, max_width)
+        fitted_height := within(height, min_height, max_height)
+        self.write_hints(index, fitted_width, fitted_height)?
+        if fitted_width != width || fitted_height != height {
+            sizes := [fitted_width, fitted_height]
+            self.configure(window, x11.CONFIGURE_WIDTH | x11.CONFIGURE_HEIGHT, &sizes)?
+        }
+        return self.flush()
+    }
+    // WM_NORMAL_HINTS for slot `index`: none while fullscreen, the size
+    // `width` x `height` for a window the user cannot resize, and the size
+    // limits otherwise.
+    fn write_hints(&mut self, index: usize, width: u32, height: u32) -> void!raw.Error {
+        hints := [0u8; 72]
+        window := 0u32
+        {
+            records := self.windows.view()
+            slot := &records[index]
+            window = slot.window
+            if slot.fullscreen {
+                x11.size_hints(&mut hints, 0, 0, 0, 0)
+            } else if !slot.resizable {
+                x11.fixed_size_hints(&mut hints, width, height)
+            } else {
+                x11.size_hints(&mut hints, slot.min_width, slot.min_height, slot.max_width, slot.max_height)
+            }
+        }
+        return self.property(window, x11.ATOM_WM_NORMAL_HINTS, x11.ATOM_WM_SIZE_HINTS, 32, &hints)
+    }
+    // Fullscreen through the window manager's _NET_WM_STATE when one runs,
+    // which also drops the size hints that would keep a window from
+    // covering the screen. Without a window manager the window covers the
+    // screen itself and returns to its saved geometry.
+    fn set_fullscreen(&mut self, id: u32, fullscreen: bool) -> void!raw.Error {
+        let some(found) = self.slot(id) else {
+            return err(raw.Error.Closed)
+        }
+        if self.windows.view()[found].fullscreen == fullscreen {
+            return ok()
+        }
+        managed := false
+        if fullscreen {
+            managed = self.has_window_manager()?
+        }
+        // Waiting for the server ran the event loop; find the slot again.
+        let some(index) = self.slot(id) else {
+            return err(raw.Error.Closed)
+        }
+        window := 0u32
+        saved_x := 0i32
+        saved_y := 0i32
+        saved_width := 0u32
+        saved_height := 0u32
+        resize_after := false
+        {
+            records := self.windows.records()
+            slot := &mut records[index]
+            window = slot.window
+            if fullscreen {
+                slot.fullscreen = true
+                slot.managed = managed
+                slot.saved_x = slot.x
+                slot.saved_y = slot.y
+                slot.saved_width = slot.width
+                slot.saved_height = slot.height
+                slot.resize_after = false
+            } else {
+                slot.fullscreen = false
+                managed = slot.managed
+                saved_x = slot.saved_x
+                saved_y = slot.saved_y
+                saved_width = slot.saved_width
+                saved_height = slot.saved_height
+                resize_after = slot.resize_after
+            }
+        }
+        if fullscreen {
+            if managed {
+                self.write_hints(index, 0, 0)?
+                self.window_state(window, 1)?
+            } else {
+                screen := [0u32, 0, self.screen_width, self.screen_height, x11.STACK_ABOVE]
+                self.configure(window, x11.CONFIGURE_X | x11.CONFIGURE_Y | x11.CONFIGURE_WIDTH | x11.CONFIGURE_HEIGHT | x11.CONFIGURE_STACK_MODE, &screen)?
+            }
+            return self.flush()
+        }
+        self.write_hints(index, saved_width, saved_height)?
+        if managed {
+            self.window_state(window, 0)?
+            if resize_after {
+                sizes := [saved_width, saved_height]
+                self.configure(window, x11.CONFIGURE_WIDTH | x11.CONFIGURE_HEIGHT, &sizes)?
+            }
+        } else {
+            geometry := [word(saved_x), word(saved_y), saved_width, saved_height]
+            self.configure(window, x11.CONFIGURE_X | x11.CONFIGURE_Y | x11.CONFIGURE_WIDTH | x11.CONFIGURE_HEIGHT, &geometry)?
+        }
+        return self.flush()
+    }
+    // Ask the window manager to add (1) or remove (0) the fullscreen state.
+    fn window_state(&mut self, window: u32, action: u32) -> void!raw.Error {
+        event := [0u8; 32]
+        data := [action, self.net_wm_fullscreen, 0, 1, 0]
+        x11.client_message(&mut event, window, self.net_wm_state, &data)
+        root := self.root
+        self.reserve(44)?
+        start := self.output_length
+        out := self.output.bytes()
+        length := x11.send_event(&mut out[start..], false, root, x11.SUBSTRUCTURE_NOTIFY_MASK | x11.SUBSTRUCTURE_REDIRECT_MASK, &event)
+        return self.commit(length)
+    }
+    // Whether an EWMH window manager runs: it names its check window in a
+    // property of the root window.
+    fn has_window_manager(&mut self) -> bool!raw.Error {
+        root := self.root
+        check := self.net_wm_check
+        self.reserve(24)?
+        start := self.output_length
+        out := self.output.bytes()
+        length := x11.get_property(&mut out[start..], false, root, check, x11.ATOM_WINDOW, 0, 1)
+        self.commit(length)?
+        wanted := self.sequence
+        total := self.await_reply(wanted)?
+        if total == 0 {
+            return ok(false)
+        }
+        found := false
+        {
+            begin := self.input_start
+            view := self.input.view()
+            reply := &view[begin..begin + total]
+            found = total >= 36 && x11.u32_at(reply, 8) == x11.ATOM_WINDOW && x11.u32_at(reply, 16) == 1 && x11.u32_at(reply, 32) != 0
+        }
+        self.input_start += total
+        return ok(found)
+    }
+
+    // -- Waiting for answers -----------------------------------------------
+
+    // Wait up to `milliseconds` for a whole message and leave it unread at
+    // input_start; its length, or 0 when the time passed first.
+    fn peek_message(&mut self, milliseconds: u32) -> usize!raw.Error {
+        if !self.ready(milliseconds)? {
+            return ok(0)
+        }
+        head := [0u8; 32]
+        begin := self.input_start
+        copy_to(&mut head, &self.input.view()[begin..begin + x11.PACKET])
+        total := x11.message_length(&head)
+        if total > INPUT {
+            return err(raw.Error.Protocol)
+        }
+        self.need(total)?
+        return ok(total)
+    }
+    // Handle the message at input_start as next_event would, keeping an
+    // event it reports, and the text of a key press, for next_event.
+    fn defer(&mut self) -> void!raw.Error {
+        self.defer_text()
+        event := raw.Event.empty()
+        if self.dispatch(&mut event)? {
+            self.deferred.push(event)
+        }
+        self.defer_text()
+        return ok()
+    }
+    fn defer_text(&mut self) {
+        if self.pending_text != 0 {
+            self.deferred.push(raw.Event { kind: raw.TEXT, code: self.pending_text, modifiers: 0, flags: 0, x: 0, y: 0, window: self.pending_window })
+            self.pending_text = 0
+        }
+    }
+    // Forget the kept events of a closed window.
+    fn drop_deferred(&mut self, id: u32) {
+        kept := self.deferred_head
+        {
+            records := self.deferred.records()
+            for i in self.deferred_head..records.len {
+                if records[i].window != id {
+                    if kept != i {
+                        window := records[i].window
+                        kind := records[i].kind
+                        code := records[i].code
+                        modifiers := records[i].modifiers
+                        flags := records[i].flags
+                        x := records[i].x
+                        y := records[i].y
+                        set(&mut records[kept], window, kind, code, modifiers, flags, x, y)
+                    }
+                    kept += 1
+                }
+            }
+        }
+        self.deferred.truncate(kept)
+    }
+    // Send the buffered requests and wait for the answer to request
+    // `wanted`, keeping the events that arrive first. Leaves a reply unread
+    // at input_start and returns its length, or consumes an error and
+    // returns 0.
+    fn await_reply(&mut self, wanted: u32) -> usize!raw.Error {
+        self.flush()?
+        for {
+            total := self.peek_message(raw.FOREVER)?
+            kind := 0u8
+            sequence := 0u32
+            {
+                begin := self.input_start
+                view := self.input.view()
+                head := &view[begin..begin + x11.PACKET]
+                kind = x11.code(head)
+                sequence = x11.sequence(head)
+            }
+            if (kind == x11.REPLY || kind == x11.ERROR) && sequence == wanted {
+                if kind == x11.ERROR {
+                    self.input_start += x11.PACKET
+                    return ok(0)
+                }
+                return ok(total)
+            }
+            self.defer()?
+        }
+    }
+    // Wait up to `milliseconds` for an event of kind `kind` whose word at
+    // `offset` is `window`, keeping other events. A PropertyNotify only
+    // counts when it reports a new value. Copies the event to `out` and
+    // returns true, or false when the time passed.
+    fn await_event(&mut self, kind: u8, offset: usize, window: u32, milliseconds: u32, out: &mut[u8]) -> bool!raw.Error {
+        self.flush()?
+        start := unsafe {
+            dodo_window_clock()
+        }
+        for {
+            now := unsafe {
+                dodo_window_clock()
+            }
+            elapsed := (now - start) / 1000000
+            if elapsed >= milliseconds as u64 {
+                return ok(false)
+            }
+            total := self.peek_message(milliseconds - elapsed as u32)?
+            if total == 0 {
+                continue
+            }
+            found := false
+            {
+                begin := self.input_start
+                view := self.input.view()
+                message := &view[begin..begin + x11.PACKET]
+                found = x11.code(message) == kind && x11.u32_at(message, offset) == window && (kind != x11.PROPERTY_NOTIFY || message[16] == 0)
+                if found {
+                    copy_to(out, message)
+                }
+            }
+            if found {
+                self.input_start += total
+                return ok(true)
+            }
+            self.defer()?
+        }
+    }
+
+    // -- Clipboard -----------------------------------------------------------
+
+    // The hidden window owning the clipboard; it hears about changes to its
+    // properties, which incremental transfers need.
+    fn ensure_helper(&mut self) -> void!raw.Error {
+        if self.helper != 0 {
+            return ok()
+        }
+        window := self.new_id()?
+        root := self.root
+        self.reserve(40)?
+        start := self.output_length
+        out := self.output.bytes()
+        length := x11.create_window(&mut out[start..], window, root, 1, 1, x11.PROPERTY_CHANGE_MASK)
+        self.commit(length)?
+        self.helper = window
+        return ok()
+    }
+    fn set_clipboard(&mut self, text: &[u8]) -> void!raw.Error {
+        if !self.active {
+            return err(raw.Error.Closed)
+        }
+        copy := allocate(text.len)?
+        ascii := true
+        {
+            target := copy.bytes()
+            for i in 0usize..text.len {
+                target[i] = text[i]
+                if text[i] >= 0x80 {
+                    ascii = false
+                }
+            }
+        }
+        self.ensure_helper()?
+        helper := self.helper
+        selection := self.clipboard_atom
+        time := self.time
+        self.reserve(32)?
+        start := self.output_length
+        out := self.output.bytes()
+        length := x11.set_selection_owner(&mut out[start..], helper, selection, time)
+        self.commit(length)?
+        // A request older than the selection's last change is ignored, so
+        // ask who owns it now.
+        start = self.output_length
+        out = self.output.bytes()
+        length = x11.get_selection_owner(&mut out[start..], selection)
+        self.commit(length)?
+        wanted := self.sequence
+        total := self.await_reply(wanted)?
+        owner := 0u32
+        if total != 0 {
+            begin := self.input_start
+            owner = x11.u32_at(&self.input.view()[begin..begin + total], 8)
+            self.input_start += total
+        }
+        if owner != helper {
+            return err(raw.Error.System)
+        }
+        self.clipboard = copy
+        self.clipboard_owned = true
+        self.clipboard_ascii = ascii
+        return ok()
+    }
+    fn clipboard(&mut self) -> heap.Bytes!raw.Error {
+        if !self.active {
+            return err(raw.Error.Closed)
+        }
+        if self.clipboard_owned {
+            copy := allocate(self.clipboard.len())?
+            copy_to(copy.bytes(), self.clipboard.view())
+            return ok(copy)
+        }
+        self.ensure_helper()?
+        text := Growing.new()
+        utf8 := self.utf8_string
+        outcome := self.convert(utf8, &mut text)?
+        if outcome == REFUSED {
+            // Older programs offer only Latin-1.
+            outcome = self.convert(x11.ATOM_STRING, &mut text)?
+        }
+        if outcome != CONVERTED {
+            return ok(heap.Bytes.empty())
+        }
+        return ok(text.finish())
+    }
+    // Ask the clipboard's owner for its text as `target` and collect it in
+    // `text` as UTF-8, also when it arrives in increments.
+    fn convert(&mut self, target: u32, text: &mut Growing) -> u32!raw.Error {
+        helper := self.helper
+        selection := self.clipboard_atom
+        property := self.transfer_atom
+        time := self.time
+        self.reserve(64)?
+        start := self.output_length
+        out := self.output.bytes()
+        length := x11.delete_property(&mut out[start..], helper, property)
+        self.commit(length)?
+        start = self.output_length
+        out = self.output.bytes()
+        length = x11.convert_selection(&mut out[start..], helper, selection, target, property, time)
+        self.commit(length)?
+        notify := [0u8; 32]
+        if !self.await_event(x11.SELECTION_NOTIFY, 8, helper, CLIPBOARD_WAIT, &mut notify)? {
+            return ok(NO_ANSWER)
+        }
+        if x11.u32_at(&notify, 20) == 0 {
+            return ok(REFUSED)
+        }
+        data := Growing.new()
+        kind := self.read_property(helper, property, &mut data)?
+        if kind == self.incr_atom {
+            // Reading the INCR value deleted it, which asks the owner for
+            // the first part; each part deleted asks for the next, and an
+            // empty part ends the transfer.
+            data.used = 0
+            event := [0u8; 32]
+            for {
+                if !self.await_event(x11.PROPERTY_NOTIFY, 4, helper, CLIPBOARD_WAIT, &mut event)? {
+                    return ok(NO_ANSWER)
+                }
+                if x11.u32_at(&event, 8) != property {
+                    continue
+                }
+                before := data.used
+                part := self.read_property(helper, property, &mut data)?
+                if data.used == before {
+                    break
+                }
+                kind = part
+            }
+        }
+        collected := data.finish()
+        if kind == x11.ATOM_STRING {
+            if !latin1_to_utf8(collected.view(), text) {
+                return err(raw.Error.OutOfMemory)
+            }
+        } else if !text.append(collected.view()) {
+            return err(raw.Error.OutOfMemory)
+        }
+        return ok(CONVERTED)
+    }
+    // Append the whole value of `property` of `window` to `data`, read in
+    // parts that fit the input buffer, then delete it. Returns its type, 0
+    // when it does not exist.
+    fn read_property(&mut self, window: u32, property: u32, data: &mut Growing) -> u32!raw.Error {
+        offset := 0u32
+        kind := 0u32
+        for {
+            self.reserve(24)?
+            start := self.output_length
+            out := self.output.bytes()
+            length := x11.get_property(&mut out[start..], false, window, property, x11.ATOM_NONE, offset, PROPERTY_CHUNK)
+            self.commit(length)?
+            wanted := self.sequence
+            total := self.await_reply(wanted)?
+            if total == 0 {
+                break
+            }
+            after := 0u32
+            size := 0usize
+            stored := true
+            {
+                begin := self.input_start
+                view := self.input.view()
+                reply := &view[begin..begin + total]
+                format := reply[1] as usize
+                kind = x11.u32_at(reply, 8)
+                after = x11.u32_at(reply, 12)
+                size = x11.u32_at(reply, 16) as usize * (format / 8)
+                if size > total - x11.PACKET {
+                    size = total - x11.PACKET
+                }
+                stored = data.append(&reply[x11.PACKET..x11.PACKET + size])
+            }
+            self.input_start += total
+            if !stored {
+                return err(raw.Error.OutOfMemory)
+            }
+            if after == 0 || kind == 0 || size == 0 {
+                break
+            }
+            offset += (size / 4) as u32
+        }
+        self.reserve(12)?
+        start := self.output_length
+        out := self.output.bytes()
+        length := x11.delete_property(&mut out[start..], window, property)
+        self.commit(length)?
+        self.flush()?
+        return ok(kind)
+    }
+    // Answer another client asking for the clipboard this App owns:
+    // the list of targets, or the text, written into the property it
+    // named, then a SelectionNotify saying whether that worked.
+    fn serve(&mut self, message: &[u8]) -> void!raw.Error {
+        time := x11.u32_at(message, 4)
+        owner := x11.u32_at(message, 8)
+        requestor := x11.u32_at(message, 12)
+        selection := x11.u32_at(message, 16)
+        target := x11.u32_at(message, 20)
+        property := x11.u32_at(message, 24)
+        if property == 0 {
+            // Obsolete clients leave the property to the owner.
+            property = target
+        }
+        answer := 0u32
+        if self.helper != 0 && owner == self.helper && selection == self.clipboard_atom && self.clipboard_owned {
+            if target == self.targets_atom {
+                targets := [0u8; 16]
+                put32(&mut targets, 0, self.targets_atom)
+                put32(&mut targets, 4, self.utf8_string)
+                put32(&mut targets, 8, self.text_atom)
+                put32(&mut targets, 12, x11.ATOM_STRING)
+                count := 12usize
+                if self.clipboard_ascii {
+                    count = 16
+                }
+                self.property(requestor, property, x11.ATOM_ATOM, 32, &targets[..count])?
+                answer = property
+            } else if target == self.utf8_string || target == self.text_atom || (target == x11.ATOM_STRING && self.clipboard_ascii) {
+                kind := self.utf8_string
+                if target == x11.ATOM_STRING {
+                    kind = x11.ATOM_STRING
+                }
+                self.send_text(requestor, property, kind)?
+                answer = property
+            }
+        }
+        event := [0u8; 32]
+        x11.selection_notify(&mut event, time, requestor, selection, target, answer)
+        self.reserve(44)?
+        start := self.output_length
+        out := self.output.bytes()
+        length := x11.send_event(&mut out[start..], false, requestor, 0, &event)
         self.commit(length)?
         return self.flush()
+    }
+    // Write the clipboard text into `property` of `requestor`: replaced by
+    // the first part and appended to with the rest, so text larger than one
+    // request arrives as one value.
+    fn send_text(&mut self, requestor: u32, property: u32, kind: u32) -> void!raw.Error {
+        part := OUTPUT - 64
+        if self.max_request - 64 < part {
+            part = self.max_request - 64
+        }
+        part = part / 4 * 4
+        // Borrowed out of the connection while requests are written, and
+        // put back before any error is returned.
+        text := heap.Bytes { address: self.clipboard.address, length: self.clipboard.length }
+        self.clipboard.address = 0
+        self.clipboard.length = 0
+        failed := false
+        failure := raw.Error.System
+        {
+            view := text.view()
+            at := 0usize
+            mode := x11.PROPERTY_REPLACE
+            for {
+                end := at + part
+                if end > view.len {
+                    end = view.len
+                }
+                match self.property_mode(mode, requestor, property, kind, 8, &view[at..end]) {
+                    ok() => {}
+                    err(error) => {
+                        failed = true
+                        failure = error
+                        break
+                    }
+                }
+                mode = x11.PROPERTY_APPEND
+                at = end
+                if at >= view.len {
+                    break
+                }
+            }
+        }
+        self.clipboard = text
+        if failed {
+            return err(failure)
+        }
+        return ok()
     }
 }
 
@@ -1022,7 +1968,7 @@ fn allocate(length: usize) -> heap.Bytes!raw.Error {
 
 // A fresh, unconnected state.
 fn fresh() -> Connection {
-    return Connection { active: false, socket: -1, input: heap.Bytes.empty(), input_start: 0, input_end: 0, output: heap.Bytes.empty(), output_length: 0, mapping: heap.Bytes.empty(), mapping_first: 0, mapping_count: 0, per_keycode: 0, mapping_sequence: NO_REPLY, root: 0, depth: 24, max_request: 0, id_base: 0, id_step: 1, id_count: 0, blank_cursor: 0, wm_protocols: 0, wm_delete: 0, net_wm_name: 0, utf8_string: 0, sequence: 0, pending_text: 0, pending_window: 0, repeat_keycode: 0, present_opcode: 0, present_serial: 0, windows: heap.Table<Slot> { address: 0, count: 0, capacity: 0 } }
+    return Connection { active: false, socket: -1, input: heap.Bytes.empty(), input_start: 0, input_end: 0, output: heap.Bytes.empty(), output_length: 0, mapping: heap.Bytes.empty(), mapping_first: 0, mapping_count: 0, per_keycode: 0, mapping_sequence: NO_REPLY, root: 0, depth: 24, visual: 0, max_request: 0, id_base: 0, id_step: 1, id_count: 0, blank_cursor: 0, wm_protocols: 0, wm_delete: 0, net_wm_name: 0, utf8_string: 0, sequence: 0, pending_text: 0, pending_window: 0, repeat_keycode: 0, present_opcode: 0, present_serial: 0, xcb: 0, xcb_screen: 0, xcb_disconnect: 0, windows: heap.Table<Slot> { address: 0, count: 0, capacity: 0 }, screen_width: 0, screen_height: 0, time: 0, clipboard_atom: 0, targets_atom: 0, text_atom: 0, incr_atom: 0, net_wm_state: 0, net_wm_fullscreen: 0, net_wm_check: 0, transfer_atom: 0, helper: 0, clipboard: heap.Bytes.empty(), clipboard_owned: false, clipboard_ascii: false, cursor_font: 0, cursors: [0u32; 11], deferred: heap.Table<raw.Event> { address: 0, count: 0, capacity: 0 }, deferred_head: 0 }
 }
 
 // The std/window adapter: the process's connection and its windows by id.
@@ -1054,9 +2000,9 @@ pub struct Backend {
             CONNECTION.disconnect()
         }
     }
-    pub fn open(title: &str, width: u32, height: u32, resizable: bool) -> u32!raw.Error {
+    pub fn open(title: &str, width: u32, height: u32, resizable: bool, pixel_buffer: bool) -> u32!raw.Error {
         unsafe {
-            return CONNECTION.open(title, width, height, resizable)
+            return CONNECTION.open(title, width, height, resizable, pixel_buffer)
         }
     }
     pub fn close(id: u32) {
@@ -1086,6 +2032,21 @@ pub struct Backend {
                 records[index].pixel_height = height
             }
         }
+    }
+    // The X11 window and a libxcb connection to its server, for GPU APIs.
+    pub fn native_handle(id: u32) -> handle.NativeHandle!raw.Error {
+        unsafe {
+            return CONNECTION.native_handle(id)
+        }
+    }
+    // Metal layers are macOS only.
+    pub fn metal_layer(id: u32) -> usize!raw.Error {
+        unsafe {
+            if let some(_) = CONNECTION.slot(id) {
+                return err(raw.Error.Unsupported)
+            }
+        }
+        return err(raw.Error.Closed)
     }
     // X11 has no system-wide scale.
     pub fn scale_percent(id: u32) -> u32 {
@@ -1141,6 +2102,45 @@ pub struct Backend {
             return CONNECTION.set_cursor_visible(id, visible)
         }
     }
+    pub fn set_cursor(id: u32, shape: u32) -> void!raw.Error {
+        unsafe {
+            return CONNECTION.set_cursor(id, shape)
+        }
+    }
+    pub fn set_size(id: u32, width: u32, height: u32) -> void!raw.Error {
+        unsafe {
+            return CONNECTION.set_size(id, width, height)
+        }
+    }
+    pub fn set_size_limits(id: u32, min_width: u32, min_height: u32, max_width: u32, max_height: u32) -> void!raw.Error {
+        unsafe {
+            return CONNECTION.set_size_limits(id, min_width, min_height, max_width, max_height)
+        }
+    }
+    pub fn set_fullscreen(id: u32, fullscreen: bool) -> void!raw.Error {
+        unsafe {
+            return CONNECTION.set_fullscreen(id, fullscreen)
+        }
+    }
+    // What the program last asked for; the window manager is not asked.
+    pub fn fullscreen(id: u32) -> bool {
+        unsafe {
+            if let some(index) = CONNECTION.slot(id) {
+                return CONNECTION.windows.view()[index].fullscreen
+            }
+        }
+        return false
+    }
+    pub fn set_clipboard(text: &[u8]) -> void!raw.Error {
+        unsafe {
+            return CONNECTION.set_clipboard(text)
+        }
+    }
+    pub fn clipboard() -> heap.Bytes!raw.Error {
+        unsafe {
+            return CONNECTION.clipboard()
+        }
+    }
 }
 
 fn smaller(a: u32, b: u32) -> u32 {
@@ -1148,6 +2148,43 @@ fn smaller(a: u32, b: u32) -> u32 {
         return a
     }
     return b
+}
+
+// `value` within the limits `low` and `high`, where 0 is no limit.
+fn within(value: u32, low: u32, high: u32) -> u32 {
+    if high != 0 && value > high {
+        return high
+    }
+    if value < low {
+        return low
+    }
+    return value
+}
+
+// A coordinate as the 32-bit word of a request.
+fn word(value: i32) -> u32 {
+    return ((value as i64) & 0xffffffff) as u32
+}
+
+// Append Latin-1 `source` to `target` as UTF-8; false when memory runs out.
+fn latin1_to_utf8(source: &[u8], target: &mut Growing) -> bool {
+    pair := [0u8; 2]
+    start := 0usize
+    for i in 0usize..source.len {
+        if source[i] < 0x80 {
+            continue
+        }
+        if !target.append(&source[start..i]) {
+            return false
+        }
+        pair[0] = 0xc0 | (source[i] >> 6)
+        pair[1] = 0x80 | (source[i] & 0x3f)
+        if !target.append(&pair) {
+            return false
+        }
+        start = i + 1
+    }
+    return target.append(&source[start..])
 }
 
 fn copy_to(target: &mut[u8], source: &[u8]) {

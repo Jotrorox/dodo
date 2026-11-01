@@ -1,0 +1,443 @@
+package ops_test
+
+import "std/image/ops"
+import "std/image/pixels"
+import "std/image/sink"
+
+// Resizing: same-size identity, constants staying constant under every
+// filter, 2x down and up against floating-point references (computed by the
+// textbook formulas in Python, allowed one 8-bit step of rounding), alpha
+// bleed prevention, monotonic gradients, degenerate sizes, the float path,
+// scratch checks and the streaming sink.
+
+static mut SCRATCH: [65536]u8 = [0u8; 65536]
+
+fn filter(k: usize) -> ops.Filter {
+    if k == 0 {
+        return ops.Filter.Nearest
+    }
+    if k == 1 {
+        return ops.Filter.Box
+    }
+    if k == 2 {
+        return ops.Filter.Bilinear
+    }
+    if k == 3 {
+        return ops.Filter.CatmullRom
+    }
+    if k == 4 {
+        return ops.Filter.Mitchell
+    }
+    return ops.Filter.Lanczos3
+}
+
+fn near(value: u8, expected: u8) -> bool {
+    return value as u32 + 1 >= expected as u32 && value as u32 <= expected as u32 + 1
+}
+
+// A gray row resized with filter k; the result lands in out.
+fn resize_row(input: &[u8], out: &mut[u8], k: usize) {
+    source := pixels.View.new(input, input.len as u32, 1, pixels.Layout.gray8())!
+    target := pixels.ViewMut.new(out, out.len as u32, 1, pixels.Layout.gray8())!
+    options := ops.ResizeOptions.new(filter(k))
+    unsafe {
+        ops.resize(&source, &mut target, &options, &mut SCRATCH)!
+    }
+}
+
+fn expect_row(input: &[u8], width: usize, k: usize, expected: &[u8]) {
+    out := [0u8; 16]
+    resize_row(input, &mut out[..width], k)
+    for i in 0usize..width {
+        assert(near(out[i], expected[i]), "resized value differs from the reference")
+    }
+    // The same samples as a column take the vertical pass.
+    source := pixels.View.new(input, 1, input.len as u32, pixels.Layout.gray8())!
+    column := [0u8; 16]
+    target := pixels.ViewMut.new(&mut column[..width], 1, width as u32, pixels.Layout.gray8())!
+    options := ops.ResizeOptions.new(filter(k))
+    unsafe {
+        ops.resize(&source, &mut target, &options, &mut SCRATCH)!
+    }
+    for i in 0usize..width {
+        assert_eq(column[i], out[i])
+    }
+}
+
+@test
+fn downscale_and_upscale_match_the_references() {
+    source8 := [0u8, 40, 80, 200, 255, 255, 30, 10]
+    source4 := [0u8, 200, 50, 255]
+    // Nearest picks pixel floor((2i + 1) * in / (2 * out)).
+    out := [0u8; 8]
+    resize_row(&source8, &mut out[..4], 0)
+    assert_eq(out[0], 40)
+    assert_eq(out[1], 200)
+    assert_eq(out[2], 255)
+    assert_eq(out[3], 10)
+    resize_row(&source4, &mut out, 0)
+    for i in 0usize..8 {
+        assert_eq(out[i], source4[i / 2])
+    }
+    r1 := [20u8, 140, 255, 20]
+    expect_row(&source8, 4, 1, &r1)
+    u1 := [0u8, 50, 150, 162, 88, 101, 204, 255]
+    expect_row(&source4, 8, 1, &u1)
+    r2 := [25u8, 142, 220, 48]
+    expect_row(&source8, 4, 2, &r2)
+    expect_row(&source4, 8, 2, &u1)
+    r3 := [16u8, 146, 243, 36]
+    expect_row(&source8, 4, 3, &r3)
+    u3 := [0u8, 44, 170, 179, 71, 81, 210, 255]
+    expect_row(&source4, 8, 3, &u3)
+    r4 := [22u8, 144, 227, 45]
+    expect_row(&source8, 4, 4, &r4)
+    u4 := [0u8, 50, 155, 165, 84, 96, 203, 255]
+    expect_row(&source4, 8, 4, &u4)
+    r5 := [11u8, 147, 251, 31]
+    expect_row(&source8, 4, 5, &r5)
+    u5 := [0u8, 53, 180, 177, 73, 72, 201, 255]
+    expect_row(&source4, 8, 5, &u5)
+}
+
+fn resize_with(source: &pixels.View, target: &mut pixels.ViewMut, k: usize, linear: bool) {
+    options := ops.ResizeOptions.new(filter(k))
+    options.linear = linear
+    unsafe {
+        ops.resize(source, target, &options, &mut SCRATCH)!
+    }
+}
+
+@test
+fn same_size_is_an_exact_copy() {
+    data := [0u8; 36]
+    for i in 0usize..36 {
+        data[i] = (i * 37 % 256) as u8
+    }
+    source := pixels.View.new(&data, 3, 3, pixels.Layout.rgba8())!
+    for k in 0usize..6 {
+        out := [0u8; 36]
+        target := pixels.ViewMut.new(&mut out, 3, 3, pixels.Layout.rgba8())!
+        resize_with(&source, &mut target, k, k == 3)
+        for i in 0usize..36 {
+            assert_eq(out[i], data[i])
+        }
+    }
+}
+
+@test
+fn constant_images_stay_constant() {
+    data := [0u8; 7 * 5 * 4]
+    for p in 0usize..35 {
+        data[p * 4] = 200
+        data[p * 4 + 1] = 100
+        data[p * 4 + 2] = 50
+        data[p * 4 + 3] = 180
+    }
+    source := pixels.View.new(&data, 7, 5, pixels.Layout.rgba8())!
+    for k in 0usize..6 {
+        for linear in 0usize..2 {
+            small := [0u8; 3 * 2 * 4]
+            target := pixels.ViewMut.new(&mut small, 3, 2, pixels.Layout.rgba8())!
+            resize_with(&source, &mut target, k, linear == 1)
+            for p in 0usize..6 {
+                assert_eq(small[p * 4], 200)
+                assert_eq(small[p * 4 + 1], 100)
+                assert_eq(small[p * 4 + 2], 50)
+                assert_eq(small[p * 4 + 3], 180)
+            }
+            large := [0u8; 11 * 9 * 4]
+            wide := pixels.ViewMut.new(&mut large, 11, 9, pixels.Layout.rgba8())!
+            resize_with(&source, &mut wide, k, linear == 1)
+            for p in 0usize..99 {
+                assert_eq(large[p * 4], 200)
+                assert_eq(large[p * 4 + 1], 100)
+                assert_eq(large[p * 4 + 2], 50)
+                assert_eq(large[p * 4 + 3], 180)
+            }
+        }
+    }
+}
+
+@test
+fn constants_survive_16_bit_premultiplied_and_float_targets() {
+    data := [0u8; 5 * 3 * 3]
+    for i in 0usize..45 {
+        data[i] = 90
+    }
+    source := pixels.View.new(&data, 5, 3, pixels.Layout.rgb8())!
+    layout := pixels.Layout.rgba16()
+    layout.premultiplied = true
+    out := [0u8; 2 * 2 * 8]
+    target := pixels.ViewMut.new(&mut out, 2, 2, layout)!
+    resize_with(&source, &mut target, 5, false)
+    for p in 0usize..4 {
+        assert_eq(pixels.get16(&out, p * 8), 90 * 257)
+        assert_eq(pixels.get16(&out, p * 8 + 6), 65535)
+    }
+    // An HDR float constant keeps its value above 1.0.
+    hdr := [0u8; 4 * 4 * 4]
+    for p in 0usize..16 {
+        pixels.put32(&mut hdr, p * 4, 0x40000000)
+    }
+    gray := pixels.Layout.new(pixels.Channels.Gray, pixels.Sample.F32)
+    floats := pixels.View.new(&hdr, 4, 4, gray.clone())!
+    result := [0u8; 3 * 3 * 4]
+    smaller := pixels.ViewMut.new(&mut result, 3, 3, gray)!
+    resize_with(&floats, &mut smaller, 3, false)
+    for p in 0usize..9 {
+        bits := pixels.get32(&result, p * 4)
+        assert(bits >= 0x3fffff00 && bits <= 0x40000100, "float constant changed")
+    }
+}
+
+@test
+fn float_targets_filter_in_f32() {
+    // Black and white halve to exactly 0.5 with Bilinear and Box.
+    data := [0u8, 255]
+    source := pixels.View.new(&data, 2, 1, pixels.Layout.gray8())!
+    gray := pixels.Layout.new(pixels.Channels.Gray, pixels.Sample.F32)
+    for k in 1usize..3 {
+        out := [0u8; 4]
+        target := pixels.ViewMut.new(&mut out, 1, 1, gray.clone())!
+        resize_with(&source, &mut target, k, false)
+        assert_eq(pixels.get32(&out, 0), 0x3f000000u32)
+    }
+    // Half-float RGBA, premultiplied: opaque red beside transparent black
+    // gives half-covered pure red, stored premultiplied as 0.5.
+    pair := [255u8, 0, 0, 255, 0, 0, 0, 0]
+    rgba := pixels.View.new(&pair, 2, 1, pixels.Layout.rgba8())!
+    half := pixels.Layout.new(pixels.Channels.Rgba, pixels.Sample.F16)
+    half.premultiplied = true
+    out := [0u8; 8]
+    target := pixels.ViewMut.new(&mut out, 1, 1, half)!
+    resize_with(&rgba, &mut target, 1, false)
+    // binary16 0.5 is 0x3800.
+    assert_eq(pixels.get16(&out, 0), 0x3800u16)
+    assert_eq(pixels.get16(&out, 2), 0u16)
+    assert_eq(pixels.get16(&out, 6), 0x3800u16)
+    // A premultiplied 8-bit source reads back straight.
+    premultiplied := pixels.Layout.rgba8()
+    premultiplied.premultiplied = true
+    stored := [100u8, 50, 0, 128, 100, 50, 0, 128]
+    source_p := pixels.View.new(&stored, 2, 1, premultiplied)!
+    straight := [0u8; 4]
+    single := pixels.ViewMut.new(&mut straight, 1, 1, pixels.Layout.rgba8())!
+    resize_with(&source_p, &mut single, 2, false)
+    assert(near(straight[0], 199), "red unpremultiplied")
+    assert(near(straight[1], 100), "green unpremultiplied")
+    assert_eq(straight[3], 128)
+}
+
+@test
+fn transparent_pixels_do_not_bleed_color() {
+    // Opaque red next to fully transparent green: no green may show.
+    data := [255u8, 0, 0, 255, 255, 0, 0, 255, 0, 255, 0, 0, 0, 255, 0, 0]
+    source := pixels.View.new(&data, 4, 1, pixels.Layout.rgba8())!
+    for k in 1usize..6 {
+        out := [0u8; 8]
+        target := pixels.ViewMut.new(&mut out, 2, 1, pixels.Layout.rgba8())!
+        resize_with(&source, &mut target, k, false)
+        for p in 0usize..2 {
+            if out[p * 4 + 3] != 0 {
+                assert_eq(out[p * 4], 255)
+                assert_eq(out[p * 4 + 1], 0)
+                assert_eq(out[p * 4 + 2], 0)
+            }
+        }
+        one := [0u8; 4]
+        single := pixels.ViewMut.new(&mut one, 1, 1, pixels.Layout.rgba8())!
+        resize_with(&source, &mut single, k, false)
+        assert_eq(one[0], 255)
+        assert_eq(one[1], 0)
+        big := [0u8; 9 * 4]
+        upscaled := pixels.ViewMut.new(&mut big, 9, 1, pixels.Layout.rgba8())!
+        resize_with(&source, &mut upscaled, k, true)
+        for p in 0usize..9 {
+            if big[p * 4 + 3] != 0 {
+                assert_eq(big[p * 4], 255)
+                assert_eq(big[p * 4 + 1], 0)
+            }
+        }
+    }
+    // Box averages alpha exactly: half covered.
+    one := [0u8; 4]
+    single := pixels.ViewMut.new(&mut one, 1, 1, pixels.Layout.rgba8())!
+    resize_with(&source, &mut single, 1, false)
+    assert_eq(one[3], 128)
+}
+
+@test
+fn gradients_stay_monotonic() {
+    ramp := [0u8; 16]
+    for i in 0usize..16 {
+        ramp[i] = (i * 17) as u8
+    }
+    for k in 0usize..6 {
+        down := [0u8; 5]
+        resize_row(&ramp, &mut down, k)
+        up := [0u8; 37]
+        resize_row(&ramp, &mut up, k)
+        for i in 1usize..5 {
+            assert(down[i] >= down[i - 1], "downscaled ramp not monotonic")
+        }
+        for i in 1usize..37 {
+            assert(up[i] >= up[i - 1], "upscaled ramp not monotonic")
+        }
+    }
+}
+
+@test
+fn degenerate_sizes() {
+    // 4x4 to 1x1 with Box is the mean.
+    data := [0u8; 16]
+    for i in 0usize..16 {
+        data[i] = (i * 10) as u8
+    }
+    source := pixels.View.new(&data, 4, 4, pixels.Layout.gray8())!
+    one := [0u8; 1]
+    single := pixels.ViewMut.new(&mut one, 1, 1, pixels.Layout.gray8())!
+    resize_with(&source, &mut single, 1, false)
+    assert_eq(one[0], 75)
+    // 4x4 to 2x2 with Box averages each 2x2 block.
+    quad := [0u8; 4]
+    blocks := pixels.ViewMut.new(&mut quad, 2, 2, pixels.Layout.gray8())!
+    resize_with(&source, &mut blocks, 1, false)
+    assert_eq(quad[0], 25)
+    assert_eq(quad[1], 45)
+    assert_eq(quad[2], 105)
+    assert_eq(quad[3], 125)
+    for k in 0usize..6 {
+        // 1xN and Nx1 in both directions.
+        column := pixels.ViewMut.new(&mut one, 1, 1, pixels.Layout.gray8())!
+        resize_with(&source, &mut column, k, false)
+        tall := [0u8; 7]
+        narrow := pixels.ViewMut.new(&mut tall, 1, 7, pixels.Layout.gray8())!
+        resize_with(&source, &mut narrow, k, false)
+        flat := [0u8; 9]
+        wide := pixels.ViewMut.new(&mut flat, 9, 1, pixels.Layout.gray8())!
+        resize_with(&source, &mut wide, k, false)
+        // A single pixel grows into a constant.
+        pixel := pixels.View.new(&data[5..6], 1, 1, pixels.Layout.gray8())!
+        block := [0u8; 15]
+        grown := pixels.ViewMut.new(&mut block, 5, 3, pixels.Layout.gray8())!
+        resize_with(&pixel, &mut grown, k, false)
+        for i in 0usize..15 {
+            assert_eq(block[i], 50)
+        }
+        // A 1x4 column to 1x2 and 3x1.
+        strip := pixels.View.new(&data[..4], 1, 4, pixels.Layout.gray8())!
+        pair := [0u8; 2]
+        halves := pixels.ViewMut.new(&mut pair, 1, 2, pixels.Layout.gray8())!
+        resize_with(&strip, &mut halves, k, false)
+        assert(pair[0] <= pair[1], "column order lost")
+    }
+    // Empty targets do nothing; an empty source with a real target is
+    // Malformed.
+    nothing := [0u8; 1]
+    empty := pixels.ViewMut.new(&mut nothing, 0, 0, pixels.Layout.gray8())!
+    resize_with(&source, &mut empty, 2, false)
+    hollow := pixels.View.new(&data, 0, 4, pixels.Layout.gray8())!
+    target := pixels.ViewMut.new(&mut one, 1, 1, pixels.Layout.gray8())!
+    options := ops.ResizeOptions.new(ops.Filter.Bilinear)
+    unsafe {
+        match ops.resize(&hollow, &mut target, &options, &mut SCRATCH) {
+            ok() => {
+                assert(false, "empty source accepted")
+            }
+            err(e) => {
+                assert_eq(pixels.error_name(e), "Malformed")
+            }
+        }
+    }
+}
+
+@test
+fn linear_light_averages_in_linear_light() {
+    data := [0u8, 255]
+    source := pixels.View.new(&data, 2, 1, pixels.Layout.gray8())!
+    one := [0u8; 1]
+    target := pixels.ViewMut.new(&mut one, 1, 1, pixels.Layout.gray8())!
+    resize_with(&source, &mut target, 1, false)
+    assert_eq(target.pixel(0, 0)[0], 128)
+    resize_with(&source, &mut target, 1, true)
+    // sRGB encoding of linear 0.5.
+    assert(near(target.pixel(0, 0)[0], 188), "linear average")
+}
+
+@test
+fn short_scratch_is_reported() {
+    data := [0u8; 64]
+    source := pixels.View.new(&data, 8, 8, pixels.Layout.gray8())!
+    out := [0u8; 9]
+    target := pixels.ViewMut.new(&mut out, 3, 3, pixels.Layout.gray8())!
+    options := ops.ResizeOptions.new(ops.Filter.Lanczos3)
+    layout := pixels.Layout.gray8()
+    need := ops.resize_scratch_size(8, 8, 3, 3, &layout, &options)!
+    work := [0u8; 4096]
+    assert(need <= work.len, "scratch estimate unexpectedly large")
+    match ops.resize(&source, &mut target, &options, &mut work[..need - 1]) {
+        ok() => {
+            assert(false, "short scratch accepted")
+        }
+        err(e) => {
+            assert_eq(pixels.error_name(e), "BufferTooSmall")
+        }
+    }
+    ops.resize(&source, &mut target, &options, &mut work[..need])!
+}
+
+@test
+fn the_sink_streams_rows_to_the_same_result() {
+    data := [0u8; 10 * 6 * 4]
+    for i in 0usize..240 {
+        data[i] = (i * 29 % 251) as u8
+    }
+    source := pixels.View.new(&data, 10, 6, pixels.Layout.rgba8())!
+    for k in 0usize..6 {
+        expected := [0u8; 4 * 3 * 4]
+        target := pixels.ViewMut.new(&mut expected, 4, 3, pixels.Layout.rgba8())!
+        resize_with(&source, &mut target, k, false)
+        streamed := [0u8; 4 * 3 * 4]
+        output := pixels.ViewMut.new(&mut streamed, 4, 3, pixels.Layout.rgba8())!
+        options := ops.ResizeOptions.new(filter(k))
+        work := [0u8; 8192]
+        resizer := ops.ResizeSink.new(&mut output, 10, 6, &options, &mut work)!
+        header := pixels.Header.new(pixels.Format.Png, 10, 6, pixels.Layout.rgba8(), 8)
+        feed(&mut resizer, &header, &source)
+        assert(resizer.complete(), "sink did not finish")
+        for i in 0usize..48 {
+            assert_eq(streamed[i], expected[i])
+        }
+    }
+    // Out-of-order rects are refused.
+    out := [0u8; 4 * 3 * 4]
+    output := pixels.ViewMut.new(&mut out, 4, 3, pixels.Layout.rgba8())!
+    options := ops.ResizeOptions.new(ops.Filter.Box)
+    work := [0u8; 8192]
+    resizer := ops.ResizeSink.new(&mut output, 10, 6, &options, &mut work)!
+    second := source.sub(0, 2, 10, 1)!
+    match resizer.rect(0, 2, &second) {
+        ok() => {
+            assert(false, "skipped rows accepted")
+        }
+        err(e) => {
+            assert_eq(pixels.error_name(e), "Unsupported")
+        }
+    }
+}
+
+// Deliver an image the way a row decoder does: one row, then two rows.
+fn feed<S: sink.Sink>(output: &mut S, header: &pixels.Header, source: &pixels.View) {
+    output.begin(header)!
+    y := 0u32
+    for y < source.height() {
+        rows := 1u32
+        if y % 2 == 1 && y + 2 <= source.height() {
+            rows = 2
+        }
+        part := source.sub(0, y, source.width(), rows)!
+        output.rect(0, y, &part)!
+        y += rows
+    }
+}

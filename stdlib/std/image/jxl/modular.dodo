@@ -1,0 +1,783 @@
+package jxl
+
+import "std/image/pixels"
+
+// Modular image decoding (18181-1 annex H): channel lists, the modular
+// header with its transforms, MA trees, and the per-channel decoding loop
+// with every predictor including the self-correcting weighted one.
+//
+// Memory model. All sample storage is one i32 arena. The frame's channels
+// (color, then extra channels) are allocated first, at their coded size;
+// palette meta channels are allocated when a header introduces them. Every
+// other channel is a *view* (offset, stride, width, height) into those
+// buffers: squeezing a channel splits its view into an average view and an
+// adjacent residual view of the same buffer, and the inverse squeeze merges
+// them back in place with one temporary row or column. So decoded groups
+// write straight into the frame's buffers and no transform allocates.
+
+// Channel descriptor words: offset, stride, width, height, hshift, vshift.
+const CH_STRIDE: usize = 8
+// Transform words: kind, begin_c, num_c, then kind specific values.
+const TR_STRIDE: usize = 8
+const TR_RCT: i32 = 0
+const TR_PALETTE: i32 = 1
+const TR_SQUEEZE: i32 = 2
+// Limits on header-driven counts.
+const MAX_CHANNELS: usize = 4096
+const MAX_TRANSFORMS: usize = 2048
+const MAX_REFS: usize = 32
+const MAX_TREE_DEPTH: u32 = 2048
+const NODE_STRIDE: usize = 4
+
+static DIV_LOOKUP: [65]u32 = [
+    0, 16777216, 8388608, 5592405, 4194304, 3355443, 2796202, 2396745, 2097152, 1864135, 1677721, 1525201, 1398101, 1290555, 1198372, 1118481,
+    1048576, 986895, 932067, 883011, 838860, 798915, 762600, 729444, 699050, 671088, 645277, 621378, 599186, 578524, 559240, 541200,
+    524288, 508400, 493447, 479349, 466033, 453438, 441505, 430185, 419430, 409200, 399457, 390167, 381300, 372827, 364722, 356962,
+    349525, 342392, 335544, 328965, 322638, 316551, 310689, 305040, 299593, 294337, 289262, 284359, 279620, 275036, 270600, 266305,
+    262144
+]
+
+static DELTA_PALETTE: [216]i32 = [
+    0, 0, 0, 4, 4, 4, 11, 0, 0, 0, 0, -13, 0, -12, 0, -10, -10, -10,
+    -18, -18, -18, -27, -27, -27, -18, -18, 0, 0, 0, -32, -32, 0, 0, -37, -37, -37,
+    0, -32, -32, 24, 24, 45, 50, 50, 50, -45, -24, -24, -24, -45, -45, 0, -24, -24,
+    -34, -34, 0, -24, 0, -24, -45, -45, -24, 64, 64, 64, -32, 0, -32, 0, -32, 0,
+    -32, 0, 32, -24, -45, -24, 45, 24, 45, 24, -24, -45, -45, -24, 24, 80, 80, 80,
+    64, 0, 0, 0, 0, -64, 0, -64, -64, -24, -24, 45, 96, 96, 96, 64, 64, 0,
+    45, -24, -24, 34, -34, 0, 112, 112, 112, 24, -45, -45, 45, 45, -24, 0, -32, 32,
+    24, -24, 45, 0, 96, 96, 45, -24, 24, 24, -45, -24, -24, -45, 24, 0, -64, 0,
+    96, 0, 0, 128, 128, 128, 64, 0, 64, 144, 144, 144, 96, 96, 0, -36, -36, 36,
+    45, -24, -45, 45, -45, -24, 0, 0, -96, 0, 128, 128, 0, 96, 0, 45, 24, -45,
+    -128, 0, 0, 24, -45, 24, -45, 24, -45, 64, 0, -64, 64, -64, -64, 96, 0, 96,
+    45, -45, 24, 24, 45, -45, 64, 64, -64, 128, 128, 0, 0, 0, -128, -24, 45, -45
+]
+
+// An ordered list of channel views.
+struct ChanList {
+    d: &mut[i32]
+    count: usize
+    nb_meta: usize
+
+    fn offset(&self, i: usize) -> usize {
+        return self.d[i * CH_STRIDE] as usize
+    }
+    fn stride(&self, i: usize) -> usize {
+        return self.d[i * CH_STRIDE + 1] as usize
+    }
+    fn width(&self, i: usize) -> usize {
+        return self.d[i * CH_STRIDE + 2] as usize
+    }
+    fn height(&self, i: usize) -> usize {
+        return self.d[i * CH_STRIDE + 3] as usize
+    }
+    fn hshift(&self, i: usize) -> i32 {
+        return self.d[i * CH_STRIDE + 4]
+    }
+    fn vshift(&self, i: usize) -> i32 {
+        return self.d[i * CH_STRIDE + 5]
+    }
+    fn set(&mut self, i: usize, offset: usize, stride: usize, width: usize, height: usize, hshift: i32, vshift: i32) {
+        b := i * CH_STRIDE
+        self.d[b] = offset as i32
+        self.d[b + 1] = stride as i32
+        self.d[b + 2] = width as i32
+        self.d[b + 3] = height as i32
+        self.d[b + 4] = hshift
+        self.d[b + 5] = vshift
+    }
+    fn same_shape(&self, i: usize, j: usize) -> bool {
+        return self.width(i) == self.width(j) && self.height(i) == self.height(j) && self.hshift(i) == self.hshift(j) && self.vshift(i) == self.vshift(j)
+    }
+    fn reset(&mut self) {
+        self.count = 0
+        self.nb_meta = 0
+    }
+    // Open an empty slot at `at`.
+    fn insert(&mut self, at: usize) -> void!pixels.Error {
+        if (self.count + 1) * CH_STRIDE > self.d.len || self.count + 1 > MAX_CHANNELS {
+            return err(pixels.Error.TooLarge)
+        }
+        i := self.count
+        for i > at {
+            for k in 0usize..CH_STRIDE {
+                self.d[i * CH_STRIDE + k] = self.d[(i - 1) * CH_STRIDE + k]
+            }
+            i -= 1
+        }
+        self.count += 1
+        return ok()
+    }
+    fn remove(&mut self, at: usize) {
+        for i in at..self.count - 1 {
+            for k in 0usize..CH_STRIDE {
+                self.d[i * CH_STRIDE + k] = self.d[(i + 1) * CH_STRIDE + k]
+            }
+        }
+        self.count -= 1
+    }
+    fn push_from(&mut self, other: &ChanList, j: usize) -> void!pixels.Error {
+        at := self.count
+        self.insert(at)?
+        for k in 0usize..CH_STRIDE {
+            self.d[at * CH_STRIDE + k] = other.d[j * CH_STRIDE + k]
+        }
+        return ok()
+    }
+    fn copy_to(&self, i: usize, other: &mut ChanList, j: usize) {
+        for k in 0usize..CH_STRIDE {
+            other.d[j * CH_STRIDE + k] = self.d[i * CH_STRIDE + k]
+        }
+    }
+}
+
+struct TrList {
+    t: &mut[i32]
+    count: usize
+
+    fn get(&self, i: usize, k: usize) -> i32 {
+        return self.t[i * TR_STRIDE + k]
+    }
+    fn push(&mut self, kind: i32, a: i32, b: i32, c: i32, d: i32, e: i32, f: i32, g: i32) -> void!pixels.Error {
+        if (self.count + 1) * TR_STRIDE > self.t.len || self.count + 1 > MAX_TRANSFORMS {
+            return err(pixels.Error.TooLarge)
+        }
+        base := self.count * TR_STRIDE
+        self.t[base] = kind
+        self.t[base + 1] = a
+        self.t[base + 2] = b
+        self.t[base + 3] = c
+        self.t[base + 4] = d
+        self.t[base + 5] = e
+        self.t[base + 6] = f
+        self.t[base + 7] = g
+        self.count += 1
+        return ok()
+    }
+}
+
+// Sample storage, trees and predictor state of the modular decoder.
+struct ModularWork {
+    arena: &mut[i32]
+    arena_used: usize
+    // Weighted predictor rows: true errors, and four subprediction errors
+    // per column.
+    wp_err: &mut[i32]
+    wp_sub: &mut[u32]
+    // A row or column for the inverse squeeze.
+    temp: &mut[i32]
+    gtree: &mut[i32]
+    gtree_nodes: usize
+    ltree: &mut[i32]
+    ltree_nodes: usize
+
+    fn alloc(&mut self, count: u64) -> usize!pixels.Error {
+        if count > (self.arena.len - self.arena_used) as u64 {
+            return err(pixels.Error.TooLarge)
+        }
+        at := self.arena_used
+        self.arena_used += count as usize
+        return ok(at)
+    }
+}
+
+// Weighted predictor parameters: p1, p2, p3a..p3e, w0..w3.
+fn read_wp_header(r: &mut Reader, wp: &mut[i32]) {
+    if r.bit() {
+        wp[0] = 16
+        wp[1] = 10
+        wp[2] = 7
+        wp[3] = 7
+        wp[4] = 7
+        wp[5] = 0
+        wp[6] = 0
+        wp[7] = 13
+        wp[8] = 12
+        wp[9] = 12
+        wp[10] = 12
+        return
+    }
+    for i in 0usize..7 {
+        wp[i] = r.bits(5) as i32
+    }
+    for i in 7usize..11 {
+        wp[i] = r.bits(4) as i32
+    }
+}
+
+// Read an MA tree into `nodes` (4 words each: branch [property, split,
+// left, right], leaf [-1 - predictor, offset, cluster, multiplier]) and the
+// Code of its leaves. Returns the node count.
+fn read_tree(r: &mut Reader, limit: u64, nodes: &mut[i32], tcode: &mut Code, n1: &mut Code, n2: &mut Code, window: &mut[u32], leaf_code: &mut Code) -> usize!pixels.Error {
+    read_code(r, 6, tcode, n1, n2, window)?
+    stream := Stream.new(window)
+    stream.begin(tcode, r)
+    capacity := nodes.len / NODE_STRIDE
+    count := 0usize
+    pending := 1usize
+    leaves := 0u32
+    level_end := 0usize
+    depth := 0u32
+    for pending > 0 {
+        if count as u64 >= limit || count >= capacity {
+            return err(pixels.Error.TooLarge)
+        }
+        if count == level_end {
+            depth += 1
+            if depth > MAX_TREE_DEPTH {
+                return err(pixels.Error.Malformed)
+            }
+            level_end = count + pending
+        }
+        pending -= 1
+        b := count * NODE_STRIDE
+        property := tcode.read(&mut stream, r, 1, 0)
+        if property > 0 {
+            split := unpack_signed(tcode.read(&mut stream, r, 0, 0))
+            child := count + pending + 1
+            if property - 1 > 0x7fffffff {
+                return err(pixels.Error.Malformed)
+            }
+            nodes[b] = (property - 1) as i32
+            nodes[b + 1] = split
+            nodes[b + 2] = child as i32
+            nodes[b + 3] = (child + 1) as i32
+            pending += 2
+        } else {
+            predictor := tcode.read(&mut stream, r, 2, 0)
+            if predictor >= 14 {
+                return err(pixels.Error.Malformed)
+            }
+            offset := unpack_signed(tcode.read(&mut stream, r, 3, 0))
+            mul_log := tcode.read(&mut stream, r, 4, 0)
+            if mul_log > 30 {
+                return err(pixels.Error.Malformed)
+            }
+            mul_bits := tcode.read(&mut stream, r, 5, 0)
+            if mul_bits as u64 > (1u64 << (31 - mul_log as u64)) - 2 {
+                return err(pixels.Error.Malformed)
+            }
+            nodes[b] = -1 - predictor as i32
+            nodes[b + 1] = offset
+            nodes[b + 2] = leaves as i32
+            nodes[b + 3] = ((mul_bits + 1) << mul_log) as i32
+            leaves += 1
+        }
+        count += 1
+        if r.overrun {
+            return err(pixels.Error.Truncated)
+        }
+        if r.broken {
+            return err(pixels.Error.Malformed)
+        }
+    }
+    stream.finish(tcode)?
+    read_code(r, leaves, leaf_code, n1, n2, window)?
+    for i in 0usize..count {
+        if nodes[i * NODE_STRIDE] < 0 {
+            nodes[i * NODE_STRIDE + 2] = leaf_code.cluster(nodes[i * NODE_STRIDE + 2] as u32) as i32
+        }
+    }
+    return ok(count)
+}
+
+// Whether a tree needs the weighted predictor, and how many previous
+// channels its properties reference.
+fn tree_uses_wp(nodes: &[i32], count: usize) -> bool {
+    for i in 0usize..count {
+        p := nodes[i * NODE_STRIDE]
+        if p == 15 || p == -1 - 6 {
+            return true
+        }
+    }
+    return false
+}
+
+fn tree_refs(nodes: &[i32], count: usize) -> usize {
+    refs := 0usize
+    for i in 0usize..count {
+        p := nodes[i * NODE_STRIDE]
+        if p >= 16 {
+            k := ((p - 16) / 4) as usize + 1
+            if k > refs {
+                refs = k
+            }
+        }
+    }
+    if refs > MAX_REFS {
+        refs = MAX_REFS
+    }
+    return refs
+}
+
+fn wrap_i32(v: i64) -> i32 {
+    if v >= -2147483648 && v <= 2147483647 {
+        return v as i32
+    }
+    m := v % 4294967296
+    if m < 0 {
+        m += 4294967296
+    }
+    if m >= 2147483648 {
+        m -= 4294967296
+    }
+    return m as i32
+}
+
+fn abs64(v: i64) -> i64 {
+    if v < 0 {
+        return -v
+    }
+    return v
+}
+
+fn clamped_gradient(n: i64, w: i64, nw: i64) -> i64 {
+    lo := n
+    hi := w
+    if w < n {
+        lo = w
+        hi = n
+    }
+    g := n + w - nw
+    if g < lo {
+        return lo
+    }
+    if g > hi {
+        return hi
+    }
+    return g
+}
+
+fn predict(predictor: i32, w: i64, n: i64, nw: i64, ne: i64, nn: i64, ww: i64, nee: i64, wp: i64) -> i64 {
+    if predictor == 5 {
+        return clamped_gradient(n, w, nw)
+    }
+    if predictor == 0 {
+        return 0
+    }
+    if predictor == 1 {
+        return w
+    }
+    if predictor == 2 {
+        return n
+    }
+    if predictor == 3 {
+        return (w + n) / 2
+    }
+    if predictor == 4 {
+        if abs64(n - nw) < abs64(w - nw) {
+            return w
+        }
+        return n
+    }
+    if predictor == 6 {
+        return (wp + 3) >> 3
+    }
+    if predictor == 7 {
+        return ne
+    }
+    if predictor == 8 {
+        return nw
+    }
+    if predictor == 9 {
+        return ww
+    }
+    if predictor == 10 {
+        return (w + nw) / 2
+    }
+    if predictor == 11 {
+        return (n + nw) / 2
+    }
+    if predictor == 12 {
+        return (n + ne) / 2
+    }
+    return (6 * n - 2 * nn + 7 * w + ww + nee + 3 * ne + 8) / 16
+}
+
+// The self-correcting predictor's rolling state for one channel.
+struct Wp {
+    width: usize
+    x: usize
+    y: usize
+    p: [11]i64
+    te_w: i64
+    te_nw: i64
+    te_n: i64
+    te_ne: i64
+    se_nw_ww: [4]u32
+    se_n_w: [4]u32
+    se_ne: [4]u32
+    // The last prediction.
+    prediction: i64
+    max_error: i64
+    sub: [4]i64
+
+    fn new(width: usize, params: &[i32]) -> Wp {
+        p := [0i64; 11]
+        for i in 0usize..11 {
+            p[i] = params[i] as i64
+        }
+        return Wp { width: width, x: 0, y: 0, p: p, te_w: 0, te_nw: 0, te_n: 0, te_ne: 0, se_nw_ww: [0u32; 4], se_n_w: [0u32; 4], se_ne: [0u32; 4], prediction: 0, max_error: 0, sub: [0i64; 4] }
+    }
+
+    fn predict(&mut self, n: i64, nw: i64, ne: i64, w: i64, nn: i64) {
+        n3 := n * 8
+        nw3 := nw * 8
+        ne3 := ne * 8
+        w3 := w * 8
+        nn3 := nn * 8
+        self.sub[0] = w3 + ne3 - n3
+        self.sub[1] = n3 - (((self.te_w + self.te_n + self.te_ne) * self.p[0]) >> 5)
+        self.sub[2] = w3 - (((self.te_w + self.te_n + self.te_nw) * self.p[1]) >> 5)
+        self.sub[3] = n3 - ((self.te_nw * self.p[2] + self.te_n * self.p[3] + self.te_ne * self.p[4] + (nn3 - n3) * self.p[5] + (nw3 - w3) * self.p[6]) >> 5)
+        weight := [0u32; 4]
+        sum := 0u32
+        for i in 0usize..4 {
+            err_sum := core.wrapping_add(core.wrapping_add(self.se_nw_ww[i], self.se_n_w[i]), self.se_ne[i])
+            shift := 0u32
+            top := (err_sum as u64 + 1) >> 5
+            if top > 0 {
+                shift = floor_log2(top)
+            }
+            weight[i] = 4 + (((self.p[7 + i] as u32) * DIV_LOOKUP[((err_sum >> shift) + 1) as usize]) >> shift)
+            sum += weight[i]
+        }
+        log_weight := floor_log2((sum >> 4) as u64)
+        sum = 0
+        for i in 0usize..4 {
+            weight[i] = weight[i] >> log_weight
+            sum += weight[i]
+        }
+        s := (sum as i64 >> 1) - 1
+        for i in 0usize..4 {
+            s = core.wrapping_add(s, core.wrapping_mul(self.sub[i], weight[i] as i64))
+        }
+        prediction := core.wrapping_mul(s, DIV_LOOKUP[sum as usize] as i64) >> 24
+        if ((self.te_n ^ self.te_w) | (self.te_n ^ self.te_nw)) <= 0 {
+            lo := n3
+            hi := n3
+            if w3 < lo {
+                lo = w3
+            }
+            if ne3 < lo {
+                lo = ne3
+            }
+            if w3 > hi {
+                hi = w3
+            }
+            if ne3 > hi {
+                hi = ne3
+            }
+            if prediction < lo {
+                prediction = lo
+            }
+            if prediction > hi {
+                prediction = hi
+            }
+        }
+        self.prediction = prediction
+        max_error := self.te_w
+        if abs64(self.te_n) > abs64(max_error) {
+            max_error = self.te_n
+        }
+        if abs64(self.te_nw) > abs64(max_error) {
+            max_error = self.te_nw
+        }
+        if abs64(self.te_ne) > abs64(max_error) {
+            max_error = self.te_ne
+        }
+        self.max_error = max_error
+    }
+
+    fn record(&mut self, sample: i64, err_row: &mut[i32], sub_row: &mut[u32]) {
+        true_err := wrap_i32(self.prediction - sample * 8) as i64
+        errs := [0u32; 4]
+        for i in 0usize..4 {
+            e := (abs64(self.sub[i] - sample * 8) + 3) >> 3
+            errs[i] = (e & 0xffffffff) as u32
+        }
+        x := self.x
+        err_row[x] = true_err as i32
+        for i in 0usize..4 {
+            sub_row[x * 4 + i] = errs[i]
+        }
+        self.x += 1
+        if self.x >= self.width {
+            self.y += 1
+            self.x = 0
+            self.te_w = 0
+            self.te_n = err_row[0] as i64
+            self.te_nw = self.te_n
+            for i in 0usize..4 {
+                self.se_n_w[i] = sub_row[i]
+                self.se_nw_ww[i] = sub_row[i]
+            }
+            if self.width <= 1 {
+                self.te_ne = self.te_n
+                for i in 0usize..4 {
+                    self.se_ne[i] = self.se_n_w[i]
+                }
+            } else {
+                self.te_ne = err_row[1] as i64
+                for i in 0usize..4 {
+                    self.se_ne[i] = sub_row[4 + i]
+                }
+            }
+        } else {
+            self.te_w = true_err
+            self.te_nw = self.te_n
+            self.te_n = self.te_ne
+            for i in 0usize..4 {
+                self.se_nw_ww[i] = self.se_n_w[i]
+                self.se_n_w[i] = core.wrapping_add(self.se_ne[i], errs[i])
+            }
+            if self.x + 1 >= self.width {
+                self.te_ne = self.te_n
+                for i in 0usize..4 {
+                    self.se_ne[i] = self.se_n_w[i]
+                }
+            } else if self.y != 0 {
+                nx := self.x + 1
+                self.te_ne = err_row[nx] as i64
+                for i in 0usize..4 {
+                    self.se_ne[i] = sub_row[nx * 4 + i]
+                }
+            }
+        }
+    }
+}
+
+fn reset_wp_rows(err_row: &mut[i32], sub_row: &mut[u32], width: usize) {
+    for x in 0usize..width {
+        err_row[x] = 0
+        sub_row[x * 4] = 0
+        sub_row[x * 4 + 1] = 0
+        sub_row[x * 4 + 2] = 0
+        sub_row[x * 4 + 3] = 0
+    }
+}
+
+// Reference channel property: abs/plain value or difference from its
+// clamped gradient (properties 16 and up).
+fn ref_property(a: &[i32], off: usize, stride: usize, x: usize, y: usize, kind: i32) -> i64 {
+    p := off + y * stride + x
+    v := a[p] as i64
+    if kind == 0 {
+        return abs64(v)
+    }
+    if kind == 1 {
+        return v
+    }
+    left := 0i64
+    if x > 0 {
+        left = a[p - 1] as i64
+    }
+    top := left
+    if y > 0 {
+        top = a[p - stride] as i64
+    }
+    topleft := left
+    if x > 0 && y > 0 {
+        topleft = a[p - stride - 1] as i64
+    }
+    g := clamped_gradient(top, left, topleft)
+    if kind == 2 {
+        return abs64(v - g)
+    }
+    return v - g
+}
+
+// Per-stream constants of the channel loop.
+struct ChannelJob {
+    off: usize
+    stride: usize
+    width: usize
+    height: usize
+    channel_index: i64
+    stream_index: i64
+    dist_mult: u32
+    use_wp: bool
+    num_refs: usize
+    ref_off: [MAX_REFS]usize
+    ref_stride: [MAX_REFS]usize
+}
+
+// Decode one channel of a modular stream into the arena.
+fn decode_channel(work: &mut ModularWork, global_tree: bool, code: &Code, st: &mut Stream, r: &mut Reader, job: &ChannelJob, wp_params: &[i32]) -> void!pixels.Error {
+    width := job.width
+    height := job.height
+    if width == 0 || height == 0 {
+        return ok()
+    }
+    if job.use_wp && (width > work.wp_err.len || width * 4 > work.wp_sub.len) {
+        return err(pixels.Error.TooLarge)
+    }
+    wp := Wp.new(width, wp_params)
+    if job.use_wp {
+        reset_wp_rows(work.wp_err, work.wp_sub, width)
+    }
+    nodes_len := work.ltree_nodes
+    if global_tree {
+        nodes_len = work.gtree_nodes
+    }
+    if nodes_len == 0 {
+        return err(pixels.Error.Malformed)
+    }
+    // A single leaf: no property needed.
+    single := false
+    root_prop := work.gtree[0]
+    if !global_tree {
+        root_prop = work.ltree[0]
+    }
+    if root_prop < 0 {
+        single = true
+    }
+    stride := job.stride
+    for y in 0usize..height {
+        row := job.off + y * stride
+        prev_grad := 0i64
+        for x in 0usize..width {
+            p := row + x
+            left := 0i64
+            if x > 0 {
+                left = work.arena[p - 1] as i64
+            } else if y > 0 {
+                left = work.arena[p - stride] as i64
+            }
+            top := left
+            if y > 0 {
+                top = work.arena[p - stride] as i64
+            }
+            topleft := left
+            if x > 0 && y > 0 {
+                topleft = work.arena[p - stride - 1] as i64
+            }
+            topright := top
+            if x + 1 < width && y > 0 {
+                topright = work.arena[p - stride + 1] as i64
+            }
+            toptop := top
+            if y > 1 {
+                toptop = work.arena[p - 2 * stride] as i64
+            }
+            leftleft := left
+            if x > 1 {
+                leftleft = work.arena[p - 2] as i64
+            }
+            toprightright := topright
+            if x + 2 < width && y > 0 {
+                toprightright = work.arena[p - stride + 2] as i64
+            }
+            if job.use_wp {
+                wp.predict(top, topleft, topright, left, toptop)
+            }
+            // Walk the tree.
+            node := 0usize
+            leaf := 0usize
+            if single {
+                leaf = 0
+            } else {
+                for {
+                    b := node * NODE_STRIDE
+                    prop := 0i32
+                    split := 0i32
+                    if global_tree {
+                        prop = work.gtree[b]
+                        split = work.gtree[b + 1]
+                    } else {
+                        prop = work.ltree[b]
+                        split = work.ltree[b + 1]
+                    }
+                    if prop < 0 {
+                        leaf = b
+                        break
+                    }
+                    v := 0i64
+                    if prop == 0 {
+                        v = job.channel_index
+                    } else if prop == 1 {
+                        v = job.stream_index
+                    } else if prop == 2 {
+                        v = y as i64
+                    } else if prop == 3 {
+                        v = x as i64
+                    } else if prop == 4 {
+                        v = abs64(top)
+                    } else if prop == 5 {
+                        v = abs64(left)
+                    } else if prop == 6 {
+                        v = top
+                    } else if prop == 7 {
+                        v = left
+                    } else if prop == 8 {
+                        v = left - prev_grad
+                    } else if prop == 9 {
+                        v = left + top - topleft
+                    } else if prop == 10 {
+                        v = left - topleft
+                    } else if prop == 11 {
+                        v = topleft - top
+                    } else if prop == 12 {
+                        v = top - topright
+                    } else if prop == 13 {
+                        v = top - toptop
+                    } else if prop == 14 {
+                        v = left - leftleft
+                    } else if prop == 15 {
+                        v = wp.max_error
+                    } else {
+                        k := ((prop - 16) / 4) as usize
+                        if k < job.num_refs {
+                            v = ref_property(work.arena, job.ref_off[k], job.ref_stride[k], x, y, (prop - 16) % 4)
+                        }
+                    }
+                    next := 0i32
+                    if global_tree {
+                        if v > split as i64 {
+                            next = work.gtree[b + 2]
+                        } else {
+                            next = work.gtree[b + 3]
+                        }
+                    } else {
+                        if v > split as i64 {
+                            next = work.ltree[b + 2]
+                        } else {
+                            next = work.ltree[b + 3]
+                        }
+                    }
+                    node = next as usize
+                }
+            }
+            predictor := 0i32
+            offset := 0i32
+            cluster := 0u32
+            multiplier := 0i32
+            if global_tree {
+                predictor = -1 - work.gtree[leaf]
+                offset = work.gtree[leaf + 1]
+                cluster = work.gtree[leaf + 2] as u32
+                multiplier = work.gtree[leaf + 3]
+            } else {
+                predictor = -1 - work.ltree[leaf]
+                offset = work.ltree[leaf + 1]
+                cluster = work.ltree[leaf + 2] as u32
+                multiplier = work.ltree[leaf + 3]
+            }
+            token := code.read_cluster(st, r, cluster, job.dist_mult)
+            residual := core.wrapping_add(core.wrapping_mul(unpack_signed(token), multiplier), offset)
+            guess := wrap_i32(predict(predictor, left, top, topleft, topright, toptop, leftleft, toprightright, wp.prediction))
+            value := core.wrapping_add(residual, guess)
+            work.arena[p] = value
+            if job.use_wp {
+                wp.record(value as i64, work.wp_err, work.wp_sub)
+            }
+            prev_grad = left + top - topleft
+        }
+        if r.overrun {
+            return err(pixels.Error.Truncated)
+        }
+        if r.broken {
+            return err(pixels.Error.Malformed)
+        }
+    }
+    return ok()
+}

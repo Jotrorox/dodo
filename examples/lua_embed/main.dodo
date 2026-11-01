@@ -1,0 +1,154 @@
+package main
+
+// Embedding Lua in a Dodo program: register Dodo functions and a module,
+// run a script, call a Lua function and read the values it returns.
+//
+// Build and run: dodo run examples/lua_embed
+// The guide is docs/src/content/docs/script.md.
+
+import "std/script/lua"
+
+// The script, one line per element (Dodo has no multi-line string
+// literals). An application might instead load a file the user edits, with
+// `cx.load_file(some(path), b"t")`. It uses the global `clamp` and the module
+// `units`, both written in Dodo below.
+const SCRIPT_LINES: [10]&str = [
+    "local units = require 'units'",
+    "local readings = {12.5, 101.0, -3.0, 48.25}",
+    "local total = 0",
+    "for i, r in ipairs(readings) do",
+    "    readings[i] = clamp(r, 0, 100)",
+    "    total = total + readings[i]",
+    "end",
+    "report = {count = #readings, mean = total / #readings}",
+    "function describe(name, value)",
+    "    return string.format('%s is %s', name, units.format(value, 'C')), value > 50 end",
+]
+
+// clamp(v [, lo [, hi]]): a native function with argument checking.
+fn clamp(cx: &mut lua.Cx) -> i32!lua.Throw {
+    let v = cx.check_number(1)?
+    let lo = cx.opt_number(2, 0.0)?
+    let hi = cx.opt_number(3, 1.0)?
+    if lo > hi {
+        return err(cx.error_msg("empty range"))
+    }
+    cx.push_number(if v < lo {
+        lo
+    } else if v > hi {
+        hi
+    } else {
+        v
+    })
+    return ok(1)
+}
+
+// units.format(value, unit) -> "12.5 C"
+fn units_format(cx: &mut lua.Cx) -> i32!lua.Throw {
+    let value = cx.check_number(1)?
+    let unit = cx.check_lstr(2)?
+    b := lua.Buffer.new(cx)
+    b.add_number(value)?
+    b.add_char(32)?
+    b.add_bytes(unit.bytes())?
+    b.push_result(cx)?
+    return ok(1)
+}
+
+// Opener of the module `units`: returns its table.
+fn open_units(cx: &mut lua.Cx) -> i32!lua.Throw {
+    let funcs = [("format", units_format)]
+    cx.new_lib(&funcs)?
+    return ok(1)
+}
+
+// Print the error message on top of the stack and pop it.
+fn report_error(cx: &mut lua.Cx) -> void!lua.Throw {
+    match cx.to_lstr(-1)? {
+        some(msg) => {
+            lua.write_stderr(b"error: ")
+            lua.write_stderr(msg.bytes())
+            lua.write_stderr(b"\n")
+        },
+        none => {
+            lua.write_stderr(b"error: (error object is not a string)\n")
+        },
+    }
+    cx.pop(1)
+    return ok()
+}
+
+// Write the value at idx converted like Lua's tostring.
+fn write_value(cx: &mut lua.Cx, idx: i32) -> void!lua.Throw {
+    let s = cx.to_lstring_meta(idx)?
+    lua.write_stdout(s.bytes())
+    cx.pop(1)
+    return ok()
+}
+
+fn run() -> i32!lua.Throw {
+    state := lua.Lua.new()?
+    state.open_libs()?
+    state.preload_module("units", open_units)?
+    cx := state.cx()
+    cx.push_native(clamp)?
+    cx.set_global("clamp")?
+
+    // Compile and run the script.
+    source := lua.Buffer.new(&cx)
+    for i in 0usize..SCRIPT_LINES.len {
+        source.add_str(SCRIPT_LINES[i])?
+        source.add_char(10)?
+    }
+    if cx.load_bytes(source.bytes(), b"=config", b"t") != lua.OK || cx.pcall(0, 0, 0) != lua.OK {
+        report_error(&mut cx)?
+        return ok(1)
+    }
+
+    // Read fields of the global table `report`.
+    cx.get_global("report")?
+    cx.get_field(-1, "count")?
+    cx.get_field(-2, "mean")?
+    lua.write_stdout(b"count: ")
+    write_value(&mut cx, -2)?
+    lua.write_stdout(b"\nmean: ")
+    write_value(&mut cx, -1)?
+    lua.write_stdout(b"\n")
+    cx.set_top(0)
+
+    // Call describe("boiler", 72.5): two results.
+    cx.get_global("describe")?
+    cx.push_str("boiler")?
+    cx.push_number(72.5)
+    if cx.pcall(2, 2, 0) != lua.OK {
+        report_error(&mut cx)?
+        return ok(1)
+    }
+    let hot = cx.to_boolean(-1)
+    write_value(&mut cx, -2)?
+    lua.write_stdout(if hot {
+        b" (hot)\n"
+    } else {
+        b"\n"
+    })
+    cx.set_top(0)
+
+    // Errors raised by Dodo functions reach Lua like any other error.
+    if cx.do_string(b"return clamp(1, 5, 2)") != lua.OK {
+        report_error(&mut cx)?
+    }
+    return ok(0)
+}
+
+fn main() -> i32 {
+    match run() {
+        ok(code) => {
+            return code
+        },
+        err(_) => {
+            // An error raised outside pcall (for example out of memory).
+            lua.write_stderr(b"error: unprotected Lua error\n")
+            return 1
+        },
+    }
+}

@@ -1,0 +1,957 @@
+package main
+
+import "core/mem"
+import "alloc/error"
+import "alloc/shared_arena"
+import "std/console"
+import "std/env"
+import "std/image"
+import "std/image/color"
+import "std/image/meta"
+import "std/image/ops"
+import "std/image/pixels"
+import "std/image_alloc"
+import "std/io"
+import "std/platform"
+import "std/platform/error" as platform_error
+
+// imgtool: inspect, convert and transform image files with std/image_alloc.
+// Every image lives in one shared arena over a static buffer; the format
+// of an output file comes from its extension (png, apng, qoi, bmp, ppm,
+// pgm, pam, pfm, jxl).
+//
+// Exit status: 0 on success, 1 when a file cannot be read, decoded,
+// processed or written, 2 for a usage error, and 3 when `compare` finds
+// the images differ.
+
+fn usage() -> void!io.Error {
+    errors := console.stderr()
+    errors.printf("usage: imgtool COMMAND ARGUMENTS\n\n")?
+    errors.printf("  info FILE                       format, size, layout, color, orientation, frames, metadata\n")?
+    errors.printf("  convert IN OUT [--effort N] [--layout L] [--strip]\n")?
+    errors.printf("                                  re-encode as OUT's format (L: gray8 graya8 rgb8 rgba8,\n")?
+    errors.printf("                                  gray16 ... rgba16, rgbf32 rgbaf32 ...)\n")?
+    errors.printf("  resize IN OUT WxH [--filter F] [--linear]\n")?
+    errors.printf("                                  F: nearest box bilinear catmull-rom mitchell lanczos;\n")?
+    errors.printf("                                  a 0 side keeps the aspect ratio\n")?
+    errors.printf("  strip IN OUT                    re-encode without EXIF and ICC metadata\n")?
+    errors.printf("  orient IN OUT                   apply the EXIF orientation to the pixels\n")?
+    errors.printf("  crop IN OUT X Y W H             keep a rectangle\n")?
+    errors.printf("  rotate IN OUT 90|180|270        rotate clockwise\n")?
+    errors.printf("  flip IN OUT h|v                 mirror horizontally or vertically\n")?
+    errors.printf("  quantize IN OUT N [--dither fs|ordered|none]\n")?
+    errors.printf("                                  reduce to N colors (an indexed PNG for .png)\n")?
+    errors.printf("  compare A B                     PSNR, SSIM and the largest sample difference\n")?
+    errors.printf("  frames IN OUTPREFIX [--format F] write every animation frame as OUTPREFIX-NNN.F\n")?
+    return ok()
+}
+
+// Everything that can go wrong while running a command.
+enum Failure {
+    Image(image_alloc.Error), Pixels(pixels.Error), Allocation(error.AllocError), Output(io.Error)
+}
+
+const EXIT_ERROR: i32 = 1
+const EXIT_USAGE: i32 = 2
+const EXIT_DIFFERENT: i32 = 3
+
+// 512 MiB of arena: enough for images of about 30 megapixels with room for
+// the decoder's and encoder's scratch.
+const ARENA_SIZE: usize = 536870912
+
+static mut ARENA: [ARENA_SIZE]u8 = [0u8; ARENA_SIZE]
+
+fn arena() -> shared_arena.SharedArena from(static) {
+    unsafe {
+        return shared_arena.SharedArena.new(&mut ARENA)!
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Arguments, copied once into fixed storage.
+
+const MAX_ARGUMENTS: usize = 24
+
+struct Arguments {
+    text: [16384]u8
+    starts: [MAX_ARGUMENTS]usize
+    ends: [MAX_ARGUMENTS]usize
+    count: usize
+
+    fn len(&self) -> usize {
+        return self.count
+    }
+    fn get(&self, index: usize) -> &str from(self) {
+        // Captured with TextPolicy.Strict, so every argument is UTF-8.
+        unsafe {
+            return mem.str_from_utf8(&self.text[self.starts[index]..self.ends[index]])
+        }
+    }
+    // The value after option `name`, or `fallback`.
+    fn option(&self, name: &str, fallback: &str) -> &str from(self, fallback) {
+        for i in 0usize..self.count {
+            if same(self.get(i), name) && i + 1 < self.count {
+                return self.get(i + 1)
+            }
+        }
+        return fallback
+    }
+    fn flag(&self, name: &str) -> bool {
+        for i in 0usize..self.count {
+            if same(self.get(i), name) {
+                return true
+            }
+        }
+        return false
+    }
+}
+
+fn capture() -> Arguments!platform_error.Error {
+    result := Arguments { text: [0u8; 16384], starts: [0usize; MAX_ARGUMENTS], ends: [0usize; MAX_ARGUMENTS], count: 0 }
+    storage := platform.list_workspace()
+    found := env.Arguments.capture(&mut storage, platform.TextPolicy.Strict)?
+    used := 0usize
+    for index in 0usize..found.len() {
+        if index >= MAX_ARGUMENTS {
+            break
+        }
+        match found.get(index, &mut result.text[used..])? {
+            some(value) => {
+                length := mem.str_bytes(value).len
+                result.starts[index] = used
+                result.ends[index] = used + length
+                used += length
+                result.count = index + 1
+            }
+            none => {
+                break
+            }
+        }
+    }
+    return ok(result)
+}
+
+fn same(a: &str, b: &str) -> bool {
+    x := mem.str_bytes(a)
+    y := mem.str_bytes(b)
+    if x.len != y.len {
+        return false
+    }
+    for i in 0usize..x.len {
+        if x[i] != y[i] {
+            return false
+        }
+    }
+    return true
+}
+
+// A decimal number, or none.
+fn number(text: &str) -> Option<u32> {
+    digits := mem.str_bytes(text)
+    if digits.len == 0 || digits.len > 9 {
+        return none
+    }
+    value := 0u32
+    for d in digits {
+        if *d < b'0' || *d > b'9' {
+            return none
+        }
+        value = value * 10 + (*d - b'0') as u32
+    }
+    return some(value)
+}
+
+// ---------------------------------------------------------------------------
+// Names
+
+fn channel_name(shape: &pixels.Layout) -> &str from(static) {
+    count := shape.channel_count()
+    if count == 1 {
+        return "gray"
+    }
+    if count == 2 {
+        return "graya"
+    }
+    if count == 3 {
+        return "rgb"
+    }
+    return "rgba"
+}
+
+fn sample_name(shape: &pixels.Layout) -> &str from(static) {
+    code := shape.sample_code()
+    if code == pixels.SAMPLE_U8 {
+        return "8"
+    }
+    if code == pixels.SAMPLE_U16 {
+        return "16"
+    }
+    if code == pixels.SAMPLE_F16 {
+        return "f16"
+    }
+    return "f32"
+}
+
+// A layout name such as rgba8, gray16 or rgbf32.
+fn parse_layout(text: &str) -> Option<pixels.Layout> {
+    bytes := mem.str_bytes(text)
+    channels := 0usize
+    rest := 0usize
+    if starts(bytes, b"graya") {
+        channels = 2
+        rest = 5
+    } else if starts(bytes, b"gray") {
+        channels = 1
+        rest = 4
+    } else if starts(bytes, b"rgba") {
+        channels = 4
+        rest = 4
+    } else if starts(bytes, b"rgb") {
+        channels = 3
+        rest = 3
+    } else {
+        return none
+    }
+    suffix := &bytes[rest..]
+    sample := 0u32
+    if equal_bytes(suffix, b"8") {
+        sample = pixels.SAMPLE_U8
+    } else if equal_bytes(suffix, b"16") {
+        sample = pixels.SAMPLE_U16
+    } else if equal_bytes(suffix, b"f16") {
+        sample = pixels.SAMPLE_F16
+    } else if equal_bytes(suffix, b"f32") {
+        sample = pixels.SAMPLE_F32
+    } else {
+        return none
+    }
+    return some(pixels.Layout.from_codes(channels, sample, false))
+}
+
+fn starts(text: &[u8], prefix: &[u8]) -> bool {
+    return text.len >= prefix.len && equal_bytes(&text[..prefix.len], prefix)
+}
+
+fn equal_bytes(a: &[u8], b: &[u8]) -> bool {
+    if a.len != b.len {
+        return false
+    }
+    for i in 0usize..a.len {
+        if a[i] != b[i] {
+            return false
+        }
+    }
+    return true
+}
+
+fn orientation_name(orientation: &color.Orientation) -> &str from(static) {
+    code := color.exif_value(orientation)
+    if code == 2 {
+        return "flip horizontal"
+    }
+    if code == 3 {
+        return "rotate 180"
+    }
+    if code == 4 {
+        return "flip vertical"
+    }
+    if code == 5 {
+        return "transpose"
+    }
+    if code == 6 {
+        return "rotate 90"
+    }
+    if code == 7 {
+        return "transverse"
+    }
+    if code == 8 {
+        return "rotate 270"
+    }
+    return "identity"
+}
+
+fn encoding_name(encoding: u8) -> &str from(static) {
+    if encoding == meta.ENCODING_ZLIB {
+        return "zlib"
+    }
+    if encoding == meta.ENCODING_BROTLI {
+        return "brotli"
+    }
+    if encoding == meta.ENCODING_JXL {
+        return "jxl"
+    }
+    return "raw"
+}
+
+fn color_name(info: &color.ColorInfo) -> &str from(static) {
+    if info.has_icc() {
+        return "ICC profile"
+    }
+    if info.is_srgb() {
+        return "sRGB"
+    }
+    if info.primaries == color.PRIMARIES_BT709 && info.is_linear() {
+        return "linear sRGB"
+    }
+    if info.primaries == color.PRIMARIES_DISPLAY_P3 {
+        return "Display P3"
+    }
+    if info.primaries == color.PRIMARIES_BT2020 && info.transfer == color.TRANSFER_PQ {
+        return "BT.2100 PQ"
+    }
+    if info.primaries == color.PRIMARIES_BT2020 && info.transfer == color.TRANSFER_HLG {
+        return "BT.2100 HLG"
+    }
+    if info.gamma != 0 {
+        return "gamma curve"
+    }
+    return "other"
+}
+
+fn yes(value: bool) -> &str from(static) {
+    if value {
+        return "yes"
+    }
+    return "no"
+}
+
+fn filter_by_name(name: &str) -> Option<ops.Filter> {
+    if same(name, "nearest") {
+        return some(ops.Filter.Nearest)
+    }
+    if same(name, "box") {
+        return some(ops.Filter.Box)
+    }
+    if same(name, "bilinear") {
+        return some(ops.Filter.Bilinear)
+    }
+    if same(name, "catmull-rom") {
+        return some(ops.Filter.CatmullRom)
+    }
+    if same(name, "mitchell") {
+        return some(ops.Filter.Mitchell)
+    }
+    if same(name, "lanczos") || same(name, "lanczos3") {
+        return some(ops.Filter.Lanczos3)
+    }
+    return none
+}
+
+fn dither_by_name(name: &str) -> Option<ops.Dither> {
+    if same(name, "fs") || same(name, "floyd-steinberg") {
+        return some(ops.Dither.FloydSteinberg)
+    }
+    if same(name, "ordered") {
+        return some(ops.Dither.Ordered)
+    }
+    if same(name, "none") {
+        return some(ops.Dither.None)
+    }
+    return none
+}
+
+// ---------------------------------------------------------------------------
+// Commands
+
+// Print a problem with the arguments and return EXIT_ERROR.
+fn invalid(what: &str, value: &str) -> i32!Failure {
+    errors := console.stderr()
+    errors.printf("imgtool: invalid {}: {}\n", what, value)?
+    return ok(EXIT_ERROR)
+}
+
+fn info(file: &str) -> i32!Failure {
+    storage := arena()
+    contents := image_alloc.read_file(file, storage.handle())?
+    data := contents.as_slice()
+    header := image.info(data)?
+    found := image.metadata(data)?
+    console.printf("file: {}\n", file)?
+    console.printf("format: {}\n", image.extension(&header.format))?
+    console.printf("size: {}x{}\n", header.width, header.height)?
+    if color.swaps_axes(&header.orientation) {
+        console.printf("display size: {}x{}\n", header.display_width(), header.display_height())?
+    }
+    console.printf("layout: {}{}", channel_name(&header.native), sample_name(&header.native))?
+    if header.native.premultiplied {
+        console.printf(" premultiplied")?
+    }
+    console.printf("\nbit depth: {}\n", header.bit_depth)?
+    info := header.color.clone()
+    console.printf("color: {} (tagged: {})\n", color_name(&info), yes(info.tagged))?
+    console.printf("cicp: primaries {}, transfer {}, matrix {}, full range {}\n", info.primaries, info.transfer, info.matrix, yes(info.full_range))?
+    if info.gamma != 0 {
+        console.printf("gamma: {:.5}\n", info.gamma as f64 / 100000.0)?
+    }
+    if info.intensity_target != 0 {
+        console.printf("intensity target: {} nits\n", info.intensity_target)?
+    }
+    console.printf("orientation: {} (EXIF {})\n", orientation_name(&header.orientation), color.exif_value(&header.orientation))?
+    if header.animated {
+        console.printf("frames: {} (animated", header.frames)?
+        if header.loops == 0 {
+            console.printf(", loops forever")?
+        } else {
+            console.printf(", {} loops", header.loops)?
+        }
+        total := 0u64
+        for index in 0u32..header.frames {
+            timing := image.frame_info(data, index)?
+            total += timing.milliseconds() as u64
+        }
+        console.printf(", {} ms)\n", total)?
+    } else {
+        console.printf("frames: {}\n", header.frames)?
+    }
+    console.printf("lossy: {}\nprogressive: {}\n", yes(header.lossy), yes(header.progressive))?
+    count := 0u32
+    if found.exif.present() {
+        console.printf("metadata: exif, {} bytes ({})\n", found.exif.length, encoding_name(found.exif.encoding))?
+        count += 1
+    }
+    if found.xmp.present() {
+        console.printf("metadata: xmp, {} bytes ({})\n", found.xmp.length, encoding_name(found.xmp.encoding))?
+        count += 1
+    }
+    if found.icc.present() {
+        console.printf("metadata: icc, {} bytes ({})\n", found.icc.length, encoding_name(found.icc.encoding))?
+        count += 1
+    }
+    if count == 0 {
+        console.printf("metadata: none\n")?
+    }
+    return ok(0)
+}
+
+// Encoder options from --effort and --strip.
+fn encode_options(arguments: &Arguments) -> Option<image.EncodeOptions> {
+    options := image.EncodeOptions.new()
+    effort := arguments.option("--effort", "")
+    if mem.str_bytes(effort).len > 0 {
+        match number(effort) {
+            some(value) => {
+                if value > 9 {
+                    return none
+                }
+                options.effort = value
+            }
+            none => {
+                return none
+            }
+        }
+    }
+    options.keep_metadata = !arguments.flag("--strip")
+    return some(options)
+}
+
+fn convert(arguments: &Arguments, input: &str, output: &str) -> i32!Failure {
+    format := match image.format_from_extension(output) {
+        ok(value) => {
+            value
+        }
+        err(_) => {
+            return invalid("output format (png, qoi, bmp, ppm, pgm, pam, pfm, jxl)", output)
+        }
+    }
+    options := match encode_options(arguments) {
+        some(value) => {
+            value
+        }
+        none => {
+            return invalid("effort (0 to 9)", arguments.option("--effort", ""))
+        }
+    }
+    storage := arena()
+    name := arguments.option("--layout", "")
+    picture := image_alloc.load(input, storage.handle())?
+    if mem.str_bytes(name).len > 0 {
+        match parse_layout(name) {
+            some(shape) => {
+                picture.convert(shape)?
+            }
+            none => {
+                return invalid("layout", name)
+            }
+        }
+    }
+    picture.save(output, format, &options)?
+    return ok(0)
+}
+
+fn resize(arguments: &Arguments, input: &str, output: &str, size: &str) -> i32!Failure {
+    format := match image.format_from_extension(output) {
+        ok(value) => {
+            value
+        }
+        err(_) => {
+            return invalid("output format (png, qoi, bmp, ppm, pgm, pam, pfm, jxl)", output)
+        }
+    }
+    bytes := mem.str_bytes(size)
+    split := bytes.len
+    for i in 0usize..bytes.len {
+        if bytes[i] == b'x' {
+            split = i
+        }
+    }
+    if split == bytes.len {
+        return invalid("size (WxH)", size)
+    }
+    width_text := [0u8; 16]
+    height_text := [0u8; 16]
+    width := parse_part(&bytes[..split], &mut width_text)
+    height := parse_part(&bytes[split + 1..], &mut height_text)
+    filter := match filter_by_name(arguments.option("--filter", "lanczos")) {
+        some(value) => {
+            value
+        }
+        none => {
+            return invalid("filter", arguments.option("--filter", ""))
+        }
+    }
+    options := ops.ResizeOptions.new(filter)
+    options.linear = arguments.flag("--linear")
+    storage := arena()
+    picture := image_alloc.load(input, storage.handle())?
+    match width {
+        some(w) => {
+            match height {
+                some(h) => {
+                    if w == 0 && h == 0 {
+                        return invalid("size (WxH)", size)
+                    }
+                    target_width := w
+                    target_height := h
+                    // A zero side keeps the aspect ratio.
+                    if w == 0 {
+                        target_width = scale(picture.width(), h, picture.height())
+                    }
+                    if h == 0 {
+                        target_height = scale(picture.height(), w, picture.width())
+                    }
+                    picture.resize(target_width, target_height, &options)?
+                }
+                none => {
+                    return invalid("size (WxH)", size)
+                }
+            }
+        }
+        none => {
+            return invalid("size (WxH)", size)
+        }
+    }
+    encode := image.EncodeOptions.new()
+    picture.save(output, format, &encode)?
+    return ok(0)
+}
+
+fn parse_part(digits: &[u8], storage: &mut[u8]) -> Option<u32> {
+    if digits.len > storage.len {
+        return none
+    }
+    for i in 0usize..digits.len {
+        if digits[i] >= 128 {
+            return none
+        }
+        storage[i] = digits[i]
+    }
+    unsafe {
+        return number(mem.str_from_utf8(&storage[..digits.len]))
+    }
+}
+
+// value * numerator / denominator, rounded, at least 1.
+fn scale(value: u32, numerator: u32, denominator: u32) -> u32 {
+    if denominator == 0 {
+        return 1
+    }
+    result := (value as u64 * numerator as u64 + denominator as u64 / 2) / denominator as u64
+    if result == 0 {
+        return 1
+    }
+    if result > pixels.MAX_DIMENSION as u64 {
+        return pixels.MAX_DIMENSION
+    }
+    return result as u32
+}
+
+fn strip(input: &str, output: &str) -> i32!Failure {
+    format := match image.format_from_extension(output) {
+        ok(value) => {
+            value
+        }
+        err(_) => {
+            return invalid("output format (png, qoi, bmp, ppm, pgm, pam, pfm, jxl)", output)
+        }
+    }
+    storage := arena()
+    picture := image_alloc.load(input, storage.handle())?
+    picture.clear_metadata()?
+    options := image.EncodeOptions.new()
+    options.keep_metadata = false
+    picture.save(output, format, &options)?
+    return ok(0)
+}
+
+fn orient(input: &str, output: &str) -> i32!Failure {
+    format := match image.format_from_extension(output) {
+        ok(value) => {
+            value
+        }
+        err(_) => {
+            return invalid("output format (png, qoi, bmp, ppm, pgm, pam, pfm, jxl)", output)
+        }
+    }
+    storage := arena()
+    picture := image_alloc.load(input, storage.handle())?
+    picture.orient()?
+    options := image.EncodeOptions.new()
+    picture.save(output, format, &options)?
+    return ok(0)
+}
+
+fn crop(arguments: &Arguments, input: &str, output: &str) -> i32!Failure {
+    format := match image.format_from_extension(output) {
+        ok(value) => {
+            value
+        }
+        err(_) => {
+            return invalid("output format (png, qoi, bmp, ppm, pgm, pam, pfm, jxl)", output)
+        }
+    }
+    values := [0u32; 4]
+    for i in 0usize..4 {
+        match number(arguments.get(4 + i)) {
+            some(value) => {
+                values[i] = value
+            }
+            none => {
+                return invalid("number", arguments.get(4 + i))
+            }
+        }
+    }
+    storage := arena()
+    picture := image_alloc.load(input, storage.handle())?
+    if values[0] as u64 + values[2] as u64 > picture.width() as u64 || values[1] as u64 + values[3] as u64 > picture.height() as u64 || values[2] == 0 || values[3] == 0 {
+        errors := console.stderr()
+        errors.printf("imgtool: the rectangle does not fit the {}x{} image\n", picture.width(), picture.height())?
+        return ok(EXIT_ERROR)
+    }
+    picture.crop(values[0], values[1], values[2], values[3])?
+    options := image.EncodeOptions.new()
+    picture.save(output, format, &options)?
+    return ok(0)
+}
+
+fn rotate(input: &str, output: &str, angle: &str) -> i32!Failure {
+    format := match image.format_from_extension(output) {
+        ok(value) => {
+            value
+        }
+        err(_) => {
+            return invalid("output format (png, qoi, bmp, ppm, pgm, pam, pfm, jxl)", output)
+        }
+    }
+    degrees := 0u32
+    match number(angle) {
+        some(value) => {
+            if value != 90 && value != 180 && value != 270 {
+                return invalid("angle (90, 180 or 270)", angle)
+            }
+            degrees = value
+        }
+        none => {
+            return invalid("angle (90, 180 or 270)", angle)
+        }
+    }
+    storage := arena()
+    picture := image_alloc.load(input, storage.handle())?
+    picture.rotate(degrees)?
+    options := image.EncodeOptions.new()
+    picture.save(output, format, &options)?
+    return ok(0)
+}
+
+fn flip(input: &str, output: &str, direction: &str) -> i32!Failure {
+    format := match image.format_from_extension(output) {
+        ok(value) => {
+            value
+        }
+        err(_) => {
+            return invalid("output format (png, qoi, bmp, ppm, pgm, pam, pfm, jxl)", output)
+        }
+    }
+    horizontal := same(direction, "h")
+    if !horizontal && !same(direction, "v") {
+        return invalid("direction (h or v)", direction)
+    }
+    storage := arena()
+    picture := image_alloc.load(input, storage.handle())?
+    if horizontal {
+        picture.flip_horizontal()
+    } else {
+        picture.flip_vertical()
+    }
+    options := image.EncodeOptions.new()
+    picture.save(output, format, &options)?
+    return ok(0)
+}
+
+fn quantize(arguments: &Arguments, input: &str, output: &str, colors: &str) -> i32!Failure {
+    format := match image.format_from_extension(output) {
+        ok(value) => {
+            value
+        }
+        err(_) => {
+            return invalid("output format (png, qoi, bmp, ppm, pgm, pam, pfm, jxl)", output)
+        }
+    }
+    count := 0usize
+    match number(colors) {
+        some(value) => {
+            if value < 1 || value > 256 {
+                return invalid("color count (1 to 256)", colors)
+            }
+            count = value as usize
+        }
+        none => {
+            return invalid("color count (1 to 256)", colors)
+        }
+    }
+    dither := match dither_by_name(arguments.option("--dither", "fs")) {
+        some(value) => {
+            value
+        }
+        none => {
+            return invalid("dither", arguments.option("--dither", ""))
+        }
+    }
+    storage := arena()
+    picture := image_alloc.load(input, storage.handle())?
+    entries := picture.quantize(count, dither)?
+    options := image.EncodeOptions.new()
+    options.palette = true
+    picture.save(output, format, &options)?
+    console.printf("{} colors\n", entries)?
+    return ok(0)
+}
+
+fn compare(first: &str, second: &str) -> i32!Failure {
+    storage := arena()
+    a := image_alloc.load(first, storage.handle())?
+    b := image_alloc.load(second, storage.handle())?
+    if a.width() != b.width() || a.height() != b.height() {
+        errors := console.stderr()
+        errors.printf("imgtool: sizes differ: {}x{} and {}x{}\n", a.width(), a.height(), b.width(), b.height())?
+        return ok(EXIT_DIFFERENT)
+    }
+    left := a.view()
+    right := b.view()
+    metrics := ops.measure(&left, &right)?
+    similarity := ops.ssim(&left, &right)?
+    console.printf("size: {}x{}\n", a.width(), a.height())?
+    console.printf("identical: {}\n", yes(metrics.identical()))?
+    console.printf("different pixels: {}\n", metrics.different_pixels)?
+    console.printf("max difference: {} (16-bit samples)\n", metrics.max_difference)?
+    if metrics.identical() {
+        console.printf("psnr: inf\n")?
+    } else {
+        console.printf("psnr: {:.2} dB\n", metrics.psnr())?
+    }
+    console.printf("ssim: {:.6}\n", similarity)?
+    if metrics.identical() {
+        return ok(0)
+    }
+    return ok(EXIT_DIFFERENT)
+}
+
+fn frames(arguments: &Arguments, input: &str, prefix: &str) -> i32!Failure {
+    extension := arguments.option("--format", "png")
+    format := match image.format_from_extension(extension) {
+        ok(value) => {
+            value
+        }
+        err(_) => {
+            return invalid("frame format", extension)
+        }
+    }
+    storage := arena()
+    contents := image_alloc.read_file(input, storage.handle())?
+    data := contents.as_slice()
+    count := image.frame_count(data)?
+    // Each frame is decoded and written in an arena of its own over the
+    // rest of the storage, emptied for the next frame.
+    spare := 0usize
+    if storage.remaining() > 4096 {
+        spare = storage.remaining() - 4096
+    }
+    backing := image_alloc.bytes(spare, storage.handle())?
+    options := image.EncodeOptions.new()
+    for index in 0u32..count {
+        name := [0u8; 4096]
+        length := frame_name(prefix, index, extension, &mut name)
+        if length == 0 {
+            return invalid("output prefix", prefix)
+        }
+        path := unsafe {
+            mem.str_from_utf8(&name[..length])
+        }
+        timing := image.frame_info(data, index)?
+        {
+            frame_arena := shared_arena.SharedArena.new(backing.as_mut_slice())?
+            frame := image_alloc.decode_frame(data, index, pixels.Layout.rgba8(), true, frame_arena.handle())?
+            frame.save(path, pixels.clone_format(&format), &options)?
+        }
+        console.printf("{} ({} ms)\n", path, timing.milliseconds())?
+    }
+    return ok(0)
+}
+
+// PREFIX-NNN.EXTENSION in `output`, returning its length (0 if too long).
+fn frame_name(prefix: &str, index: u32, extension: &str, output: &mut[u8]) -> usize {
+    head := mem.str_bytes(prefix)
+    tail := mem.str_bytes(extension)
+    if head.len + tail.len + 16 > output.len {
+        return 0
+    }
+    used := 0usize
+    for byte in head {
+        output[used] = *byte
+        used += 1
+    }
+    output[used] = b'-'
+    used += 1
+    digits := 3usize
+    if index >= 1000 {
+        digits = 6
+    }
+    value := index
+    for k in 0usize..digits {
+        output[used + digits - 1 - k] = b'0' + (value % 10) as u8
+        value = value / 10
+    }
+    used += digits
+    output[used] = b'.'
+    used += 1
+    for byte in tail {
+        output[used] = *byte
+        used += 1
+    }
+    return used
+}
+
+// Run the command; Ok carries the exit status.
+fn run(arguments: &Arguments) -> i32!Failure {
+    count := arguments.len()
+    if count < 2 {
+        usage()?
+        return ok(EXIT_USAGE)
+    }
+    command := arguments.get(1)
+    if same(command, "info") && count == 3 {
+        return info(arguments.get(2))
+    }
+    if same(command, "compare") && count == 4 {
+        return compare(arguments.get(2), arguments.get(3))
+    }
+    if count >= 4 {
+        input := arguments.get(2)
+        output := arguments.get(3)
+        if same(command, "convert") {
+            return convert(arguments, input, output)
+        }
+        if same(command, "strip") && count == 4 {
+            return strip(input, output)
+        }
+        if same(command, "orient") && count == 4 {
+            return orient(input, output)
+        }
+        if same(command, "frames") {
+            return frames(arguments, input, output)
+        }
+    }
+    if count >= 5 {
+        input := arguments.get(2)
+        output := arguments.get(3)
+        parameter := arguments.get(4)
+        if same(command, "resize") {
+            return resize(arguments, input, output, parameter)
+        }
+        if same(command, "rotate") && count == 5 {
+            return rotate(input, output, parameter)
+        }
+        if same(command, "flip") && count == 5 {
+            return flip(input, output, parameter)
+        }
+        if same(command, "quantize") {
+            return quantize(arguments, input, output, parameter)
+        }
+        if same(command, "crop") && count == 8 {
+            return crop(arguments, input, output)
+        }
+    }
+    usage()?
+    return ok(EXIT_USAGE)
+}
+
+fn pixel_error_name(reason: &pixels.Error) -> &str from(static) {
+    match reason {
+        pixels.Error.Truncated => {
+            return "truncated file"
+        }
+        pixels.Error.Malformed => {
+            return "malformed file"
+        }
+        pixels.Error.Unsupported => {
+            return "unsupported format or feature"
+        }
+        pixels.Error.TooLarge => {
+            return "too large"
+        }
+        pixels.Error.BufferTooSmall => {
+            return "buffer too small"
+        }
+    }
+}
+
+fn report(failure: &Failure) -> void!io.Error {
+    errors := console.stderr()
+    match failure {
+        Failure.Image(reason) => {
+            errors.printf("imgtool: {}\n", image_alloc.error_name(reason))?
+        }
+        Failure.Pixels(reason) => {
+            errors.printf("imgtool: image: {}\n", pixel_error_name(reason))?
+        }
+        Failure.Allocation(_) => {
+            errors.printf("imgtool: out of memory\n")?
+        }
+        Failure.Output(_) => {
+            errors.printf("imgtool: cannot write the output\n")?
+        }
+    }
+    return ok()
+}
+
+fn main() -> i32 {
+    arguments := match capture() {
+        ok(value) => {
+            value
+        }
+        err(_) => {
+            return EXIT_USAGE
+        }
+    }
+    match run(&arguments) {
+        ok(status) => {
+            return status
+        }
+        err(failure) => {
+            match report(&failure) {
+                ok() => {}
+                err(_) => {}
+            }
+            return EXIT_ERROR
+        }
+    }
+}

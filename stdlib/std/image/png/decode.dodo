@@ -1,0 +1,363 @@
+package png
+
+import "std/compress/deflate"
+import "std/compress/zlib"
+import "std/image/pixels"
+import "std/image/shared/binary"
+import "std/image/sink"
+
+// Pixels converted per batch on the stack.
+const CHUNK: usize = 64
+
+// Where the decoder reads compressed data: the rest of the current chunk,
+// then the chunk at `next` while it has the same kind. fdAT chunks carry a
+// sequence number, checked against `sequence`.
+struct Input {
+    position: usize
+    end: usize
+    next: usize
+    kind: u32
+    sequence: u32
+
+    fn clone(&self) -> Input {
+        return Input { position: self.position, end: self.end, next: self.next, kind: self.kind, sequence: self.sequence }
+    }
+}
+
+fn image_input(png: &Png) -> Input {
+    return Input { position: 0, end: 0, next: png.idat, kind: IDAT, sequence: 0 }
+}
+
+// Move `input` to the next chunk; false when it has another kind.
+fn next_chunk(data: &[u8], input: &mut Input) -> bool!pixels.Error {
+    chunk := read_chunk(data, input.next)?
+    if chunk.kind != input.kind {
+        return ok(false)
+    }
+    start := chunk.data
+    if chunk.kind == FDAT {
+        if chunk.length < 4 {
+            return err(pixels.Error.Malformed)
+        }
+        if binary.be32(data, start)? != input.sequence {
+            return err(pixels.Error.Malformed)
+        }
+        input.sequence += 1
+        start += 4
+    }
+    input.position = start
+    input.end = chunk.data + chunk.length
+    input.next = chunk.next
+    return ok(true)
+}
+
+fn deflate_error(error: deflate.Error) -> pixels.Error {
+    if error == deflate.Error.Truncated {
+        return pixels.Error.Truncated
+    }
+    return pixels.Error.Malformed
+}
+
+// Decompress exactly row.len bytes, reading chunks as needed.
+fn fill(data: &[u8], decoder: &mut zlib.Decoder, input: &mut Input, row: &mut[u8]) -> void!pixels.Error {
+    filled := 0usize
+    for filled < row.len {
+        progress := match decoder.process(&data[input.position..input.end], &mut row[filled..]) {
+            ok(value) => value,
+            err(error) => {
+                return err(deflate_error(error))
+            }
+        }
+        input.position += progress.input_consumed
+        filled += progress.output_written
+        if filled < row.len {
+            if progress.status == deflate.Status.Done {
+                // The stream ended before the image did.
+                return err(pixels.Error.Truncated)
+            }
+            if progress.status == deflate.Status.NeedInput && !next_chunk(data, input)? {
+                return err(pixels.Error.Truncated)
+            }
+        }
+    }
+    return ok()
+}
+
+// After the last row, read the rest of the zlib stream to check its Adler-32
+// when it is there. Data past the image is ignored, and so is a stream or
+// file that ends right after the image data.
+fn finish(data: &[u8], decoder: &mut zlib.Decoder, input: &mut Input) -> void!pixels.Error {
+    nothing := [0u8; 1]
+    for {
+        progress := match decoder.process(&data[input.position..input.end], &mut nothing[..0]) {
+            ok(value) => value,
+            err(error) => {
+                return err(deflate_error(error))
+            }
+        }
+        input.position += progress.input_consumed
+        if progress.status != deflate.Status.NeedInput {
+            return ok()
+        }
+        match next_chunk(data, input) {
+            ok(more) => {
+                if !more {
+                    return ok()
+                }
+            }
+            err(error) => {
+                if error == pixels.Error.Truncated {
+                    return ok()
+                }
+                return err(error)
+            }
+        }
+    }
+}
+
+// How raw rows map to native pixels.
+struct RowFormat {
+    color: u32
+    depth: u32
+    // Samples per stored pixel.
+    channels: usize
+    palette_count: u32
+    // The tRNS color of gray and RGB images, as raw samples.
+    keyed: bool
+    key_red: u32
+    key_green: u32
+    key_blue: u32
+    // The native layout and its pixel size.
+    layout: pixels.Layout
+    size: usize
+}
+
+fn row_format(data: &[u8], png: &Png) -> RowFormat {
+    layout := native_layout(png)
+    size := layout.bytes_per_pixel()
+    f := RowFormat { color: png.color, depth: png.depth, channels: png.channels as usize, palette_count: png.palette_count as u32, keyed: false, key_red: 0, key_green: 0, key_blue: 0, layout: layout, size: size }
+    if png.transparency_len > 0 && png.color != 3 {
+        t := png.transparency
+        f.keyed = true
+        f.key_red = ((data[t] as u32) << 8) | (data[t + 1] as u32)
+        f.key_green = f.key_red
+        f.key_blue = f.key_red
+        if png.color == 2 {
+            f.key_green = ((data[t + 2] as u32) << 8) | (data[t + 3] as u32)
+            f.key_blue = ((data[t + 4] as u32) << 8) | (data[t + 5] as u32)
+        }
+    }
+    return f
+}
+
+// Palette entries as RGBA in colors[4 * i..], with tRNS alpha.
+fn load_palette(data: &[u8], png: &Png, colors: &mut[u8]) {
+    for i in 0usize..png.palette_count {
+        p := png.palette + i * 3
+        colors[i * 4] = data[p]
+        colors[i * 4 + 1] = data[p + 1]
+        colors[i * 4 + 2] = data[p + 2]
+        colors[i * 4 + 3] = 255
+        if i < png.transparency_len {
+            colors[i * 4 + 3] = data[png.transparency + i]
+        }
+    }
+}
+
+// Sample `i` of a row of 1, 2, 4 or 8-bit single-sample pixels.
+fn index_at(row: &[u8], i: usize, depth: u32) -> u32 {
+    if depth == 8 {
+        return row[i] as u32
+    }
+    bit := i * depth as usize
+    shift := 8 - depth - (bit % 8) as u32
+    return ((row[bit / 8] as u32) >> shift) & ((1u32 << depth) - 1)
+}
+
+// Stored pixel i of `row` in the native layout at out[o..].
+fn convert_pixel(row: &[u8], i: usize, f: &RowFormat, colors: &[u8], out: &mut[u8], o: usize) -> void!pixels.Error {
+    if f.color == 3 {
+        index := index_at(row, i, f.depth)
+        if index >= f.palette_count {
+            return err(pixels.Error.Malformed)
+        }
+        p := index as usize * 4
+        out[o] = colors[p]
+        out[o + 1] = colors[p + 1]
+        out[o + 2] = colors[p + 2]
+        if f.size == 4 {
+            out[o + 3] = colors[p + 3]
+        }
+        return ok()
+    }
+    if f.depth < 8 {
+        value := index_at(row, i, f.depth)
+        out[o] = (value * (255 / ((1u32 << f.depth) - 1))) as u8
+        if f.keyed {
+            out[o + 1] = 255
+            if value == f.key_red {
+                out[o + 1] = 0
+            }
+        }
+        return ok()
+    }
+    if f.depth == 8 {
+        p := i * f.channels
+        for k in 0usize..f.channels {
+            out[o + k] = row[p + k]
+        }
+        if f.keyed {
+            transparent := false
+            if f.channels == 1 {
+                transparent = row[p] as u32 == f.key_red
+            } else {
+                transparent = row[p] as u32 == f.key_red && row[p + 1] as u32 == f.key_green && row[p + 2] as u32 == f.key_blue
+            }
+            out[o + f.channels] = 255
+            if transparent {
+                out[o + f.channels] = 0
+            }
+        }
+        return ok()
+    }
+    // 16-bit samples, big-endian in the file and little-endian in views.
+    p := i * f.channels * 2
+    for k in 0usize..f.channels {
+        out[o + 2 * k] = row[p + 2 * k + 1]
+        out[o + 2 * k + 1] = row[p + 2 * k]
+    }
+    if f.keyed {
+        first := ((row[p] as u32) << 8) | (row[p + 1] as u32)
+        transparent := first == f.key_red
+        if f.channels == 3 {
+            second := ((row[p + 2] as u32) << 8) | (row[p + 3] as u32)
+            third := ((row[p + 4] as u32) << 8) | (row[p + 5] as u32)
+            transparent = transparent && second == f.key_green && third == f.key_blue
+        }
+        a := o + 2 * f.channels
+        out[a] = 255
+        out[a + 1] = 255
+        if transparent {
+            out[a] = 0
+            out[a + 1] = 0
+        }
+    }
+    return ok()
+}
+
+// Emit one unfiltered row of `columns` pixels: pixel i lands at
+// (x0 + i * dx, y). Rows already in the native layout are passed through;
+// others are converted CHUNK pixels at a time.
+fn emit_row<S: sink.Sink>(row: &[u8], columns: u32, x0: u32, dx: u32, y: u32, f: &RowFormat, colors: &[u8], output: &mut S) -> void!pixels.Error {
+    size := f.size
+    if f.depth == 8 && !f.keyed && f.color != 3 {
+        if dx == 1 {
+            view := pixels.View.new(&row[..columns as usize * size], columns, 1, f.layout.clone())?
+            return output.rect(x0, y, &view)
+        }
+        for i in 0u32..columns {
+            p := i as usize * size
+            view := pixels.View.new(&row[p..p + size], 1, 1, f.layout.clone())?
+            output.rect(x0 + i * dx, y, &view)?
+        }
+        return ok()
+    }
+    buffer := [0u8; CHUNK * 8]
+    first := 0u32
+    for first < columns {
+        count := columns - first
+        if count > CHUNK as u32 {
+            count = CHUNK as u32
+        }
+        for k in 0usize..count as usize {
+            convert_pixel(row, first as usize + k, f, colors, &mut buffer, k * size)?
+        }
+        if dx == 1 {
+            view := pixels.View.new(&buffer[..count as usize * size], count, 1, f.layout.clone())?
+            output.rect(x0 + first, y, &view)?
+        } else {
+            for k in 0u32..count {
+                p := k as usize * size
+                view := pixels.View.new(&buffer[p..p + size], 1, 1, f.layout.clone())?
+                output.rect(x0 + (first + k) * dx, y, &view)?
+            }
+        }
+        first += count
+    }
+    return ok()
+}
+
+// Scratch for decoding images up to `width` pixels wide.
+fn rows_scratch(png: &Png, width: u32) -> usize!pixels.Error {
+    row := row_bytes(width, png.depth * png.channels)?
+    return pixels.checked(row + 1, 2, 0)
+}
+
+// Decode a width x height image (the default image or an APNG frame) whose
+// compressed data starts at `input`, emitting rects relative to its
+// top-left corner. The caller has called output.begin().
+fn decode_image<S: sink.Sink>(data: &[u8], png: &Png, width: u32, height: u32, input: Input, output: &mut S, scratch: &mut[u8]) -> void!pixels.Error {
+    bits := png.depth * png.channels
+    if scratch.len < rows_scratch(png, width)? {
+        return err(pixels.Error.BufferTooSmall)
+    }
+    colors := [0u8; 1024]
+    load_palette(data, png, &mut colors)
+    f := row_format(data, png)
+    // Bytes per complete pixel, at least one, for the filters.
+    step := (bits as usize + 7) / 8
+    decoder := zlib.Decoder.new()
+    stream := input
+    passes := 1usize
+    if png.interlaced {
+        passes = 7
+    }
+    for pass in 0usize..passes {
+        x0 := 0u32
+        y0 := 0u32
+        dx := 1u32
+        dy := 1u32
+        if png.interlaced {
+            x0 = ADAM7_X[pass]
+            y0 = ADAM7_Y[pass]
+            dx = ADAM7_DX[pass]
+            dy = ADAM7_DY[pass]
+        }
+        if width <= x0 || height <= y0 {
+            continue
+        }
+        columns := (width - x0 + dx - 1) / dx
+        rows := (height - y0 + dy - 1) / dy
+        length := row_bytes(columns, bits)? + 1
+        // The row above a pass's first row reads as zeros.
+        previous := 0usize
+        current := length
+        for i in 0usize..length {
+            scratch[i] = 0
+        }
+        for r in 0u32..rows {
+            fill(data, &mut decoder, &mut stream, &mut scratch[current..current + length])?
+            unfilter(scratch, previous, current, length, step)?
+            emit_row(&scratch[current + 1..current + length], columns, x0, dx, y0 + r * dy, &f, &colors, output)?
+            swap := previous
+            previous = current
+            current = swap
+        }
+    }
+    return finish(data, &mut decoder, &mut stream)
+}
+
+// Decode the default image (IDAT) into `output` in the header's native
+// layout, using scratch_size(data) bytes of `scratch`. For an animation this
+// is the image shown by viewers without APNG support, which may or may not
+// be frame 0; see decode_frame.
+pub fn decode<S: sink.Sink>(data: &[u8], output: &mut S, scratch: &mut[u8]) -> void!pixels.Error {
+    png := parse(data)?
+    if scratch.len < rows_scratch(&png, png.width)? {
+        return err(pixels.Error.BufferTooSmall)
+    }
+    find_late_exif(data, &mut png)
+    header := header_of(data, &png)
+    output.begin(&header)?
+    return decode_image(data, &png, png.width, png.height, image_input(&png), output, scratch)
+}

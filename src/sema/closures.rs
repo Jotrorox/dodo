@@ -481,6 +481,7 @@ impl Checker<'_> {
             extern_: false,
             printing: None,
             pio: false,
+            wgsl: false,
             generics: vec![],
             bounds: vec![],
             generic_instance: false,
@@ -505,6 +506,8 @@ impl Checker<'_> {
             interrupt: None,
             link_name: None,
             placement: Placement::default(),
+            inlining: Inlining::Auto,
+            naked: false,
             async_part: None,
         };
         let mut checker = Checker::new(self.context, closure.ret.clone());

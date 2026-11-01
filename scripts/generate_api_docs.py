@@ -25,7 +25,7 @@ REPOSITORY = "https://github.com/Jotrorox/dodo/blob/main/"
 INTRINSIC_IMPORTS = {"core/mem", "core/ptr", "core/mmio", "core/cpu"}
 VIRTUAL_IMPORTS = {
     f"std/{family}/native"
-    for family in ("platform", "fs", "env", "process", "signal", "thread", "sync", "net", "time", "tls", "quic", "crypto", "crypto/openssl", "web", "window", "dylib", "gpu/opengl", "gpu/hal")
+    for family in ("platform", "fs", "env", "process", "signal", "thread", "sync", "net", "time", "tls", "quic", "crypto", "crypto/openssl", "web", "window", "dylib", "gpu/opengl", "gpu/hal", "script")
 }
 
 
@@ -302,10 +302,11 @@ def guide_for(module: str) -> str:
     return {
         "arena_bytes": "bytes", "bytes_alloc": "bytes", "pool_bytes": "bytes",
         "io_alloc": "io", "fmt": "formatting", "fmt_alloc": "formatting",
-        "text_alloc": "text", "text_shared": "text", "float_decimal": "text",
+        "text_alloc": "text", "text_shared": "text", "float_decimal": "text", "image_alloc": "image",
         "encoding": "json", "compress": "compression", "checksum": "hash", "fs": "filesystem",
         "env": "environment", "process": "processes", "signal": "signals", "thread": "threads",
         "sync": "synchronization", "net": "networking", "embedded": "hardware",
+        "db": "sqlite",
     }.get(family, family)
 
 

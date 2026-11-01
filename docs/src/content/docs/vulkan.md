@@ -167,6 +167,52 @@ instance create info) while developing. Pointers stored in create infos are
 raw: keep the pointed-to values alive until the command returns, and binding
 them to locals first, as the examples do, guarantees it.
 
+## Drawing into a window
+
+A [std/window](window.md#drawing-with-the-gpu) window becomes a Vulkan
+surface through its native handle. Open it with `window.Options.gpu()`,
+which leaves out the pixel buffer, enable `VK_KHR_surface` and the
+extension for the handle, and create the surface:
+
+```dodo
+native := win.native_handle()?
+surface := vk.NULL_HANDLE
+match &native {
+    window.NativeHandle.Xcb(connection, window_id, _, _) => {
+        // VK_KHR_xcb_surface, on std/window's libxcb connection.
+        info := vk.XcbSurfaceCreateInfoKHR.default()
+        info.connection = unsafe {
+            *connection as *mut u8
+        }
+        info.window = *window_id
+        unsafe {
+            vk.check(fns.create_xcb_surface_khr(instance, ptr.from_ref(&info), vk.no_allocator(), ptr.from_mut(&mut surface)))?
+        }
+    }
+    window.NativeHandle.Win32(hwnd, module) => {
+        // VK_KHR_win32_surface: hinstance and hwnd from the handle.
+    }
+    window.NativeHandle.AppKit(_, _) => {
+        // VK_EXT_metal_surface with p_layer = win.metal_layer()?, through
+        // MoltenVK.
+    }
+}
+```
+
+From there it is ordinary Vulkan: a device with `VK_KHR_swapchain` (and
+`VK_KHR_portability_subset` when the device lists it), a swapchain of
+`win.size()` pixels, and `vkQueuePresentKHR` once per
+`Event.Frame`. Rebuild the swapchain after a `Resize`
+event or when presenting reports `ERROR_OUT_OF_DATE_KHR` or `SUBOPTIMAL_KHR`.
+Destroy the swapchain and surface before the window closes.
+[`examples/vulkan_window.dodo`](https://github.com/Jotrorox/dodo/blob/main/examples/vulkan_window.dodo)
+does all of this for all three systems and draws a spinning triangle:
+
+```sh
+dodo run examples/vulkan_window.dodo
+dodo run examples/vulkan_window.dodo -- 120   # stop after 120 frames
+```
+
 ## Shaders
 
 Vulkan takes SPIR-V. Compile GLSL or HLSL with `glslangValidator -V` or

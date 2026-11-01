@@ -1,0 +1,407 @@
+package main
+
+import "std/console"
+import "std/gpu"
+
+// std/gpu shaders written once in WGSL, translated by gpu.wgsl when this
+// program is compiled, on every backend this machine has. Each check
+// prints its name; a failed expectation panics with the reason. Exits 0
+// when at least one backend ran every check, 2 when none could be opened.
+
+fn main() -> i32 {
+    ran := 0
+    if run(gpu.Preference.Vulkan, "Vulkan") {
+        ran += 1
+    }
+    if run(gpu.Preference.Metal, "Metal") {
+        ran += 1
+    }
+    if run(gpu.Preference.OpenGl, "OpenGL") {
+        ran += 1
+    }
+    if ran == 0 {
+        console.println("no backend")!
+        return 2
+    }
+    console.println("wgsl ok")!
+    return 0
+}
+
+fn run(preference: gpu.Preference, label: &str) -> bool {
+    device := match gpu.Device.open(gpu.Options.with_backend(preference)) {
+        ok(device) => device,
+        err(error) => {
+            console.printf("skip {}: {}\n", label, gpu.error_name(error))!
+            return false
+        }
+    }
+    console.printf("{}: {}\n", label, device.name())!
+    match checks(&device) {
+        ok() => {}
+        err(error) => {
+            console.printf("{} failed: {}\n", label, gpu.error_name(error))!
+            assert(false, "a check returned an error")
+        }
+    }
+    console.printf("{} ok\n", label)!
+    return true
+}
+
+fn checks(device: &gpu.Device) -> void!gpu.Error {
+    check_compute(device)?
+    console.println("  compute")!
+    check_shared_slots(device)?
+    console.println("  shared slots")!
+    check_storage_texture(device)?
+    console.println("  storage texture")!
+    check_triangles(device)?
+    console.println("  triangles")!
+    check_depth(device)?
+    console.println("  depth")!
+    check_sampling(device)?
+    console.println("  sampling")!
+    check_blending(device)?
+    console.println("  blending")!
+    return ok()
+}
+
+// Every entry point the render checks use, in one module.
+fn shaders() -> gpu.ShaderSource from(static) {
+    return gpu.wgsl(
+        "struct ColorOut {",
+        "    @builtin(position) position: vec4<f32>,",
+        "    @location(0) color: vec4<f32>,",
+        "}",
+        "",
+        "@vertex",
+        "fn color_vertex(@location(0) position: vec3<f32>, @location(1) color: vec4<f32>) -> ColorOut {",
+        "    var out: ColorOut;",
+        "    out.position = vec4<f32>(position, 1.0);",
+        "    out.color = color;",
+        "    return out;",
+        "}",
+        "",
+        "@fragment",
+        "fn color_fragment(in: ColorOut) -> @location(0) vec4<f32> {",
+        "    return in.color;",
+        "}",
+        "",
+        "struct ScreenOut {",
+        "    @builtin(position) position: vec4<f32>,",
+        "    @location(0) uv: vec2<f32>,",
+        "}",
+        "",
+        "@vertex",
+        "fn screen_vertex(@builtin(vertex_index) id: u32) -> ScreenOut {",
+        "    let corner = vec2<f32>(f32((id << 1u) & 2u), f32(id & 2u));",
+        "    var out: ScreenOut;",
+        "    out.position = vec4<f32>(corner * 2.0 - 1.0, 0.0, 1.0);",
+        "    out.uv = vec2<f32>(corner.x, 1.0 - corner.y);",
+        "    return out;",
+        "}",
+        "",
+        "@group(0) @binding(0) var picture: texture_2d<f32>;",
+        "@group(1) @binding(0) var nearest: sampler;",
+        "",
+        "@fragment",
+        "fn texture_fragment(in: ScreenOut) -> @location(0) vec4<f32> {",
+        "    return textureSample(picture, nearest, in.uv);",
+        "}",
+        "",
+        "@group(0) @binding(0) var<uniform> shade: vec4<f32>;",
+        "",
+        "@fragment",
+        "fn constant_fragment(in: ScreenOut) -> @location(0) vec4<f32> {",
+        "    return shade;",
+        "}",
+        "",
+        "struct Params {",
+        "    count: u32,",
+        "    factor: u32,",
+        "}",
+        "",
+        "@group(0) @binding(0) var<storage, read_write> values: array<u32>;",
+        "@group(0) @binding(1) var<uniform> params: Params;",
+        "",
+        "@compute @workgroup_size(64)",
+        "fn update(@builtin(global_invocation_id) id: vec3<u32>) {",
+        "    let i = id.x;",
+        "    if i < params.count {",
+        "        values[i] = values[i] * params.factor + i;",
+        "    }",
+        "}",
+        "",
+        "@group(0) @binding(0) var image: texture_storage_2d<r32uint, write>;",
+        "",
+        "@compute @workgroup_size(8, 8)",
+        "fn fill(@builtin(global_invocation_id) id: vec3<u32>) {",
+        "    textureStore(image, vec2<i32>(id.xy), vec4<u32>(id.x + id.y * 100u, 0u, 0u, 0u));",
+        "}"
+    )
+}
+
+fn check_compute(device: &gpu.Device) -> void!gpu.Error {
+    values := [0u32; 1000]
+    for i in 0usize..1000 {
+        values[i] = i as u32 + 1
+    }
+    buffer := device.create_buffer_with_data(gpu.u32_bytes(&values), gpu.BUFFER_STORAGE | gpu.BUFFER_COPY_SRC)?
+    params := [1000u32, 3]
+    uniform := device.create_buffer_with_data(gpu.u32_bytes(&params), gpu.BUFFER_UNIFORM)?
+    source := shaders()
+    bindings := [gpu.BindingLayout.storage_buffer(0, gpu.STAGE_COMPUTE), gpu.BindingLayout.uniform_buffer(1, gpu.STAGE_COMPUTE)]
+    descriptor := gpu.ComputePipelineDescriptor.new(&source, "update", 64, 1, 1)
+    descriptor.bindings = &bindings
+    pipeline := device.create_compute_pipeline(descriptor)?
+    encoder := device.encoder()?
+    {
+        pass := encoder.compute_pass()
+        pass.set_pipeline(&pipeline)
+        pass.set_buffer(0, &buffer)
+        pass.set_buffer(1, &uniform)
+        pass.dispatch(16, 1, 1)
+        pass.dispatch(16, 1, 1)
+    }
+    encoder.submit()?
+    result := [0u32; 1000]
+    device.read_buffer(&buffer, 0, gpu.u32_bytes_mut(&mut result))?
+    for i in 0u32..1000 {
+        once := (i + 1) * 3 + i
+        assert(result[i as usize] == once * 3 + i, "compute result")
+    }
+    return ok()
+}
+
+// Two kernels of one module reading different types from the same slot,
+// with the shader written where it is used.
+fn check_shared_slots(device: &gpu.Device) -> void!gpu.Error {
+    source := gpu.wgsl(
+        "@group(0) @binding(0) var<storage, read_write> words: array<u32>;",
+        "@group(0) @binding(0) var<storage, read_write> floats: array<f32>;",
+        "@compute @workgroup_size(16) fn bump(@builtin(global_invocation_id) id: vec3<u32>) { words[id.x] = words[id.x] + 7u; }",
+        "@compute @workgroup_size(16) fn halve(@builtin(global_invocation_id) id: vec3<u32>) { floats[id.x] = floats[id.x] * 0.5; }"
+    )
+    bindings := [gpu.BindingLayout.storage_buffer(0, gpu.STAGE_COMPUTE)]
+    bump_descriptor := gpu.ComputePipelineDescriptor.new(&source, "bump", 16, 1, 1)
+    bump_descriptor.bindings = &bindings
+    bump := device.create_compute_pipeline(bump_descriptor)?
+    halve_descriptor := gpu.ComputePipelineDescriptor.new(&source, "halve", 16, 1, 1)
+    halve_descriptor.bindings = &bindings
+    halve := device.create_compute_pipeline(halve_descriptor)?
+    words := [0u32; 16]
+    floats := [0.0f32; 16]
+    for i in 0usize..16 {
+        words[i] = i as u32
+        floats[i] = i as f32
+    }
+    word_buffer := device.create_buffer_with_data(gpu.u32_bytes(&words), gpu.BUFFER_STORAGE | gpu.BUFFER_COPY_SRC)?
+    float_buffer := device.create_buffer_with_data(gpu.f32_bytes(&floats), gpu.BUFFER_STORAGE | gpu.BUFFER_COPY_SRC)?
+    encoder := device.encoder()?
+    {
+        pass := encoder.compute_pass()
+        pass.set_pipeline(&bump)
+        pass.set_buffer(0, &word_buffer)
+        pass.dispatch(1, 1, 1)
+        pass.set_pipeline(&halve)
+        pass.set_buffer(0, &float_buffer)
+        pass.dispatch(1, 1, 1)
+    }
+    encoder.submit()?
+    device.read_buffer(&word_buffer, 0, gpu.u32_bytes_mut(&mut words))?
+    device.read_buffer(&float_buffer, 0, gpu.f32_bytes_mut(&mut floats))?
+    for i in 0usize..16 {
+        assert(words[i] == i as u32 + 7, "bumped word")
+        assert(floats[i] == i as f32 * 0.5, "halved float")
+    }
+    return ok()
+}
+
+fn check_storage_texture(device: &gpu.Device) -> void!gpu.Error {
+    image := device.create_texture(gpu.TextureDescriptor.new(16, 16, gpu.FORMAT_R32_UINT, gpu.TEXTURE_STORAGE | gpu.TEXTURE_COPY_SRC))?
+    source := shaders()
+    bindings := [gpu.BindingLayout.storage_texture(0, gpu.STAGE_COMPUTE, gpu.FORMAT_R32_UINT)]
+    descriptor := gpu.ComputePipelineDescriptor.new(&source, "fill", 8, 8, 1)
+    descriptor.bindings = &bindings
+    pipeline := device.create_compute_pipeline(descriptor)?
+    encoder := device.encoder()?
+    {
+        pass := encoder.compute_pass()
+        pass.set_pipeline(&pipeline)
+        pass.set_storage_texture(0, &image)
+        pass.dispatch(2, 2, 1)
+    }
+    encoder.submit()?
+    texels := [0u32; 256]
+    device.read_texture(&image, image.region(), gpu.u32_bytes_mut(&mut texels), 64)?
+    for y in 0u32..16 {
+        for x in 0u32..16 {
+            assert(texels[(y * 16 + x) as usize] == x + y * 100, "storage texture texel")
+        }
+    }
+    return ok()
+}
+
+fn pixel(pixels: &[u8], width: u32, x: u32, y: u32) -> u32 {
+    i := ((y * width + x) * 4) as usize
+    return pixels[i] as u32 | (pixels[i + 1] as u32 << 8) | (pixels[i + 2] as u32 << 16) | (pixels[i + 3] as u32 << 24)
+}
+
+fn expect_pixel(pixels: &[u8], width: u32, x: u32, y: u32, wanted: u32) {
+    got := pixel(pixels, width, x, y)
+    if got != wanted {
+        console.printf("pixel ({}, {}) is {}, expected {}\n", x, y, got, wanted)!
+        assert(false, "wrong pixel")
+    }
+}
+
+const RED: u32 = 0xff0000ff
+const GREEN: u32 = 0xff00ff00
+const BLUE: u32 = 0xffff0000
+const WHITE: u32 = 0xffffffff
+const BLACK: u32 = 0xff000000
+
+fn color_pipeline(device: &gpu.Device, source: &gpu.ShaderSource, depth: bool, cull: u32) -> gpu.RenderPipeline!gpu.Error from(device) {
+    positions := [gpu.VertexAttribute.new(0, gpu.VERTEX_FLOAT32X3, 0)]
+    colors := [gpu.VertexAttribute.new(1, gpu.VERTEX_UNORM8X4, 0)]
+    layouts := [gpu.VertexBufferLayout.new(12, &positions), gpu.VertexBufferLayout.new(4, &colors)]
+    descriptor := gpu.RenderPipelineDescriptor.new(source, "color_vertex", source, "color_fragment", gpu.FORMAT_RGBA8_UNORM)
+    descriptor.vertex_buffers = &layouts
+    descriptor.cull_mode = cull
+    if depth {
+        descriptor.depth_format = gpu.FORMAT_DEPTH32_FLOAT
+    }
+    return device.create_render_pipeline(descriptor)
+}
+
+// Clip space has y up; front faces wind counterclockwise there.
+fn check_triangles(device: &gpu.Device) -> void!gpu.Error {
+    target := device.create_texture(gpu.TextureDescriptor.new(64, 64, gpu.FORMAT_RGBA8_UNORM, gpu.TEXTURE_RENDER | gpu.TEXTURE_COPY_SRC))?
+    source := shaders()
+    pipeline := color_pipeline(device, &source, false, gpu.CULL_BACK)?
+    positions := [
+        // Top left, counterclockwise: drawn.
+        -1.0f32, 1.0, 0.5, -1.0, 0.0, 0.5, 0.0, 1.0, 0.5,
+        // Bottom left, counterclockwise: drawn.
+        -1.0, 0.0, 0.5, -1.0, -1.0, 0.5, 0.0, -1.0, 0.5,
+        // Bottom right, clockwise: culled.
+        0.0, -1.0, 0.5, 1.0, 0.0, 0.5, 1.0, -1.0, 0.5,
+    ]
+    colors := [RED, RED, RED, BLUE, BLUE, BLUE, GREEN, GREEN, GREEN]
+    position_buffer := device.create_buffer_with_data(gpu.f32_bytes(&positions), gpu.BUFFER_VERTEX)?
+    color_buffer := device.create_buffer_with_data(gpu.u32_bytes(&colors), gpu.BUFFER_VERTEX)?
+    encoder := device.encoder()?
+    {
+        color := gpu.ColorAttachment.clear(&target, 0.0, 0.0, 0.0, 1.0)
+        pass := encoder.render_pass(color)
+        pass.set_pipeline(&pipeline)
+        pass.set_vertex_buffer(0, &position_buffer, 0)
+        pass.set_vertex_buffer(1, &color_buffer, 0)
+        pass.draw(9, 1, 0, 0)
+    }
+    encoder.submit()?
+    pixels := [0u8; 16384]
+    device.read_texture(&target, target.region(), &mut pixels, 256)?
+    expect_pixel(&pixels, 64, 8, 8, RED)
+    expect_pixel(&pixels, 64, 8, 56, BLUE)
+    expect_pixel(&pixels, 64, 56, 56, BLACK)
+    expect_pixel(&pixels, 64, 56, 8, BLACK)
+    return ok()
+}
+
+fn check_depth(device: &gpu.Device) -> void!gpu.Error {
+    target := device.create_texture(gpu.TextureDescriptor.new(32, 32, gpu.FORMAT_RGBA8_UNORM, gpu.TEXTURE_RENDER | gpu.TEXTURE_COPY_SRC))?
+    depth := device.create_texture(gpu.TextureDescriptor.new(32, 32, gpu.FORMAT_DEPTH32_FLOAT, gpu.TEXTURE_RENDER | gpu.TEXTURE_COPY_SRC))?
+    source := shaders()
+    pipeline := color_pipeline(device, &source, true, gpu.CULL_NONE)?
+    positions := [
+        -1.0f32, 1.0, 0.25, -1.0, -1.0, 0.25, 1.0, 1.0, 0.25, 1.0, -1.0, 0.25,
+        -1.0, 1.0, 0.75, -1.0, -1.0, 0.75, 1.0, 1.0, 0.75, 1.0, -1.0, 0.75,
+    ]
+    colors := [BLUE, BLUE, BLUE, BLUE, RED, RED, RED, RED]
+    indices := [0u16, 1, 2, 2, 1, 3]
+    position_buffer := device.create_buffer_with_data(gpu.f32_bytes(&positions), gpu.BUFFER_VERTEX)?
+    color_buffer := device.create_buffer_with_data(gpu.u32_bytes(&colors), gpu.BUFFER_VERTEX)?
+    index_buffer := device.create_buffer_with_data(gpu.u16_bytes(&indices), gpu.BUFFER_INDEX)?
+    readback := device.create_buffer(4096, gpu.BUFFER_COPY_DST | gpu.BUFFER_COPY_SRC)?
+    encoder := device.encoder()?
+    {
+        color := gpu.ColorAttachment.clear(&target, 0.0, 0.0, 0.0, 1.0)
+        depth_attachment := gpu.DepthAttachment.clear(&depth, 1.0)
+        pass := encoder.render_pass_with_depth(color, depth_attachment)
+        pass.set_pipeline(&pipeline)
+        pass.set_vertex_buffer(0, &position_buffer, 0)
+        pass.set_vertex_buffer(1, &color_buffer, 0)
+        pass.set_index_buffer(&index_buffer, gpu.INDEX_UINT16, 0)
+        // The near blue quad first; the far red one fails the depth test.
+        pass.draw_indexed(6, 1, 0, 0, 0)
+        pass.draw_indexed(6, 1, 0, 4, 0)
+    }
+    encoder.copy_texture_to_buffer(&depth, depth.region(), &readback, 0, 128)
+    encoder.submit()?
+    pixels := [0u8; 4096]
+    device.read_texture(&target, target.region(), &mut pixels, 128)?
+    expect_pixel(&pixels, 32, 16, 16, BLUE)
+    expect_pixel(&pixels, 32, 2, 30, BLUE)
+    depths := [0.0f32; 1024]
+    device.read_buffer(&readback, 0, gpu.f32_bytes_mut(&mut depths))?
+    assert(depths[16 * 32 + 16] > 0.249 && depths[16 * 32 + 16] < 0.251, "depth value")
+    return ok()
+}
+
+fn screen_pipeline(device: &gpu.Device, source: &gpu.ShaderSource, entry: &str, bindings: &[gpu.BindingLayout], blend: u32) -> gpu.RenderPipeline!gpu.Error from(device) {
+    descriptor := gpu.RenderPipelineDescriptor.new(source, "screen_vertex", source, entry, gpu.FORMAT_RGBA8_UNORM)
+    descriptor.bindings = bindings
+    descriptor.blend = blend
+    return device.create_render_pipeline(descriptor)
+}
+
+// Texture rows run top to bottom in memory, on screen and in uv space.
+fn check_sampling(device: &gpu.Device) -> void!gpu.Error {
+    image := device.create_texture(gpu.TextureDescriptor.new(2, 2, gpu.FORMAT_RGBA8_UNORM, gpu.TEXTURE_SAMPLED | gpu.TEXTURE_COPY_DST))?
+    texels := [RED, GREEN, BLUE, WHITE]
+    device.write_texture(&image, image.region(), gpu.u32_bytes(&texels), 8)?
+    sampler := device.create_sampler(gpu.SamplerDescriptor.nearest())?
+    target := device.create_texture(gpu.TextureDescriptor.new(64, 64, gpu.FORMAT_RGBA8_UNORM, gpu.TEXTURE_RENDER | gpu.TEXTURE_COPY_SRC))?
+    source := shaders()
+    bindings := [gpu.BindingLayout.sampled_texture(0, gpu.STAGE_FRAGMENT)]
+    pipeline := screen_pipeline(device, &source, "texture_fragment", &bindings, gpu.BLEND_REPLACE)?
+    encoder := device.encoder()?
+    {
+        color := gpu.ColorAttachment.clear(&target, 0.0, 0.0, 0.0, 1.0)
+        pass := encoder.render_pass(color)
+        pass.set_pipeline(&pipeline)
+        pass.set_texture(0, &image, &sampler)
+        pass.draw(3, 1, 0, 0)
+    }
+    encoder.submit()?
+    pixels := [0u8; 16384]
+    device.read_texture(&target, target.region(), &mut pixels, 256)?
+    expect_pixel(&pixels, 64, 16, 16, RED)
+    expect_pixel(&pixels, 64, 48, 16, GREEN)
+    expect_pixel(&pixels, 64, 16, 48, BLUE)
+    expect_pixel(&pixels, 64, 48, 48, WHITE)
+    return ok()
+}
+
+fn check_blending(device: &gpu.Device) -> void!gpu.Error {
+    target := device.create_texture(gpu.TextureDescriptor.new(16, 16, gpu.FORMAT_RGBA8_UNORM, gpu.TEXTURE_RENDER | gpu.TEXTURE_COPY_SRC))?
+    shade := [1.0f32, 0.0, 0.0, 0.5]
+    uniform := device.create_buffer_with_data(gpu.f32_bytes(&shade), gpu.BUFFER_UNIFORM)?
+    source := shaders()
+    bindings := [gpu.BindingLayout.uniform_buffer(0, gpu.STAGE_FRAGMENT)]
+    pipeline := screen_pipeline(device, &source, "constant_fragment", &bindings, gpu.BLEND_ALPHA)?
+    encoder := device.encoder()?
+    {
+        color := gpu.ColorAttachment.clear(&target, 1.0, 1.0, 1.0, 1.0)
+        pass := encoder.render_pass(color)
+        pass.set_pipeline(&pipeline)
+        pass.set_buffer(0, &uniform)
+        pass.draw(3, 1, 0, 0)
+    }
+    encoder.submit()?
+    pixels := [0u8; 1024]
+    device.read_texture(&target, target.region(), &mut pixels, 64)?
+    i := ((8 * 16 + 8) * 4) as usize
+    assert(pixels[i] == 255 && pixels[i + 1] >= 126 && pixels[i + 1] <= 129 && pixels[i + 2] >= 126 && pixels[i + 2] <= 129 && pixels[i + 3] == 255, "blended color")
+    return ok()
+}

@@ -1,0 +1,1057 @@
+package lua
+
+import "core/mem"
+import "core/ptr"
+
+// Lexical analysis for the compiler, following the token rules of the Lua
+// 5.4 manual (§3.1). The scanner reads the whole chunk from memory, keeps
+// the text of the token being scanned in a scratch buffer (error messages
+// quote it), and interns every name and string literal in a compile-local
+// table so equal strings are one object: the parser and the code generator
+// compare names and constants by pointer.
+
+// Single-character tokens are their byte value; the others follow.
+const TK_AND: i32 = 257
+const TK_BREAK: i32 = 258
+const TK_DO: i32 = 259
+const TK_ELSE: i32 = 260
+const TK_ELSEIF: i32 = 261
+const TK_END: i32 = 262
+const TK_FALSE: i32 = 263
+const TK_FOR: i32 = 264
+const TK_FUNCTION: i32 = 265
+const TK_GOTO: i32 = 266
+const TK_IF: i32 = 267
+const TK_IN: i32 = 268
+const TK_LOCAL: i32 = 269
+const TK_NIL: i32 = 270
+const TK_NOT: i32 = 271
+const TK_OR: i32 = 272
+const TK_REPEAT: i32 = 273
+const TK_RETURN: i32 = 274
+const TK_THEN: i32 = 275
+const TK_TRUE: i32 = 276
+const TK_UNTIL: i32 = 277
+const TK_WHILE: i32 = 278
+const TK_IDIV: i32 = 279
+const TK_CONCAT: i32 = 280
+const TK_DOTS: i32 = 281
+const TK_EQ: i32 = 282
+const TK_GE: i32 = 283
+const TK_LE: i32 = 284
+const TK_NE: i32 = 285
+const TK_SHL: i32 = 286
+const TK_SHR: i32 = 287
+const TK_DBCOLON: i32 = 288
+const TK_EOS: i32 = 289
+const TK_FLT: i32 = 290
+const TK_INT: i32 = 291
+const TK_NAME: i32 = 292
+const TK_STRING: i32 = 293
+
+// "No character": end of the chunk.
+const LX_EOZ: i32 = -1
+
+// Spellings of tokens TK_AND..TK_STRING, in order.
+const LX_TOKEN_NAMES: [37]&str = [
+    "and", "break", "do", "else", "elseif", "end", "false", "for", "function",
+    "goto", "if", "in", "local", "nil", "not", "or", "repeat", "return", "then",
+    "true", "until", "while", "//", "..", "...", "==", ">=", "<=", "~=", "<<",
+    ">>", "::", "<eof>", "<number>", "<integer>", "<name>", "<string>",
+]
+
+// One entry of the compile-local string table.
+struct LexStr {
+    s: *mut LString
+    hash: u32
+    // Reserved-word token spelled by the string, or 0.
+    tok: i32
+}
+
+// Whole-compilation state: scanner, string table, constant cache and the
+// parser's shared lists (active variables, pending gotos, visible labels).
+struct CompileState {
+    L: *mut State
+    src: *mut u8
+    srclen: usize
+    pos: usize
+    // Current character (LX_EOZ at the end).
+    cur: i32
+    line: i32
+    // Line of the last token consumed.
+    lastline: i32
+    // Current token and its value.
+    tk: i32
+    tk_i: i64
+    tk_f: f64
+    tk_s: *mut LString
+    // Look-ahead token (TK_EOS when there is none).
+    ak: i32
+    ak_i: i64
+    ak_f: f64
+    ak_s: *mut LString
+    // Value of the token just scanned.
+    sc_i: i64
+    sc_f: f64
+    sc_s: *mut LString
+    // Text of the token being scanned.
+    buf: *mut u8
+    nbuf: usize
+    capbuf: usize
+    source: *mut LString
+    st_slots: *mut LexStr
+    st_cap: usize
+    st_count: usize
+    kc_slots: *mut CgKSlot
+    kc_cap: usize
+    kc_count: usize
+    name_env: *mut LString
+    name_break: *mut LString
+    name_self: *mut LString
+    name_forstate: *mut LString
+    // Parser state.
+    fs: *mut FnState
+    actvar: *mut ParVar
+    nactv: i32
+    capactv: i32
+    gotos: *mut ParLabel
+    ngoto: i32
+    capgoto: i32
+    labels: *mut ParLabel
+    nlabel: i32
+    caplabel: i32
+    // Syntactic nesting depth (bounded like the C stack of the reference).
+    nlevels: i32
+}
+
+// --- Character classes ----------------------------------------------------------
+
+fn lx_isdigit(c: i32) -> bool {
+    return c >= 48 && c <= 57
+}
+fn lx_isalpha(c: i32) -> bool {
+    return (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || c == 95
+}
+fn lx_isalnum(c: i32) -> bool {
+    return lx_isalpha(c) || lx_isdigit(c)
+}
+fn lx_isxdigit(c: i32) -> bool {
+    return lx_isdigit(c) || (c >= 97 && c <= 102) || (c >= 65 && c <= 70)
+}
+fn lx_isspace(c: i32) -> bool {
+    return c == 32 || (c >= 9 && c <= 13)
+}
+fn lx_isprint(c: i32) -> bool {
+    return c >= 32 && c <= 126
+}
+fn lx_hexvalue(c: i32) -> i32 {
+    if lx_isdigit(c) {
+        return c - 48
+    }
+    return (c | 32) - 97 + 10
+}
+fn lx_isnewline(c: i32) -> bool {
+    return c == 10 || c == 13
+}
+
+// --- Error messages ------------------------------------------------------------
+
+// A growable message under construction.
+struct LexMsg {
+    L: *mut State
+    p: *mut u8
+    n: usize
+    cap: usize
+    oom: bool
+}
+
+fn lmsg_new(L: *mut State) -> LexMsg {
+    unsafe {
+        return LexMsg { L: L, p: 0 as *mut u8, n: 0, cap: 0, oom: false }
+    }
+}
+
+fn lmsg_bytes(m: *mut LexMsg, src: *const u8, count: usize) {
+    unsafe {
+        if (*m).oom {
+            return
+        }
+        if (*m).n + count > (*m).cap {
+            newcap := (*m).cap * 2
+            if newcap < 128 {
+                newcap = 128
+            }
+            for newcap < (*m).n + count {
+                newcap = newcap * 2
+            }
+            match mem_realloc((*m).L, (*m).p, (*m).cap, newcap) {
+                ok(nb) => {
+                    (*m).p = nb
+                    (*m).cap = newcap
+                },
+                err(_) => {
+                    (*m).oom = true
+                    return
+                },
+            }
+        }
+        ptr.copy_nonoverlapping(src, ptr.offset((*m).p, (*m).n as isize), count)
+        (*m).n = (*m).n + count
+    }
+}
+
+fn lmsg_str(m: *mut LexMsg, s: &str) {
+    unsafe {
+        let b = mem.str_bytes(s)
+        lmsg_bytes(m, ptr.as_ptr(b), b.len)
+    }
+}
+
+fn lmsg_char(m: *mut LexMsg, c: u8) {
+    unsafe {
+        ch := c
+        lmsg_bytes(m, ptr.from_ref(&ch), 1)
+    }
+}
+
+fn lmsg_lstr(m: *mut LexMsg, s: *mut LString) {
+    unsafe {
+        lmsg_bytes(m, str_data(s) as *const u8, str_len(s))
+    }
+}
+
+fn lmsg_int(m: *mut LexMsg, v: i64) {
+    digits: [24]u8 = [0u8; 24]
+    n := 0usize
+    neg := v < 0
+    // Work on the negative value so the minimum integer has no overflow.
+    x := if neg {
+        v
+    } else {
+        0 - v
+    }
+    for {
+        let d = 0 - (x % 10)
+        digits[n] = 48 + d as u8
+        n = n + 1
+        x = x / 10
+        if x == 0 {
+            break
+        }
+    }
+    if neg {
+        lmsg_char(m, 45)
+    }
+    for i in 0usize..n {
+        lmsg_char(m, digits[n - 1 - i])
+    }
+}
+
+fn lmsg_free(m: *mut LexMsg) {
+    unsafe {
+        if (*m).cap != 0 {
+            mem_free((*m).L, (*m).p, (*m).cap)
+        }
+        (*m).cap = 0
+    }
+}
+
+// Start a positioned message: "chunkid:line: ".
+fn lmsg_begin(cx: *mut CompileState, m: *mut LexMsg) {
+    unsafe {
+        out: [64]u8 = [0u8; 64]
+        let src = (*cx).source
+        let n = chunk_id(str_data(src), str_len(src), ptr.as_mut_ptr(&mut out))
+        lmsg_bytes(m, ptr.as_ptr(&out), n)
+        lmsg_char(m, 58)
+        lmsg_int(m, (*cx).line as i64)
+        lmsg_str(m, ": ")
+    }
+}
+
+// Append the printable form of a token: 'x' for symbols and reserved
+// words, '<\N>' for control characters, the class name for the others.
+fn lx_token2str(m: *mut LexMsg, token: i32) {
+    if token < 257 {
+        if lx_isprint(token) {
+            lmsg_char(m, 39)
+            lmsg_char(m, token as u8)
+            lmsg_char(m, 39)
+        } else {
+            lmsg_str(m, "'<\\")
+            lmsg_int(m, token as i64)
+            lmsg_str(m, ">'")
+        }
+        return
+    }
+    let s = LX_TOKEN_NAMES[(token - 257) as usize]
+    if token < TK_EOS {
+        lmsg_char(m, 39)
+        lmsg_str(m, s)
+        lmsg_char(m, 39)
+    } else {
+        lmsg_str(m, s)
+    }
+}
+
+// Like lx_token2str, but names, strings and numerals show their text.
+fn lx_txttoken(cx: *mut CompileState, m: *mut LexMsg, token: i32) {
+    unsafe {
+        if token == TK_NAME || token == TK_STRING || token == TK_FLT || token == TK_INT {
+            // The text is cut at an embedded zero byte, like a C string.
+            n := 0usize
+            for n < (*cx).nbuf && *ptr.offset((*cx).buf, n as isize) != 0 {
+                n = n + 1
+            }
+            lmsg_char(m, 39)
+            lmsg_bytes(m, (*cx).buf as *const u8, n)
+            lmsg_char(m, 39)
+            return
+        }
+        lx_token2str(m, token)
+    }
+}
+
+// Finish a message (adding " near <token>" unless token is 0) and raise it.
+fn lmsg_raise(cx: *mut CompileState, m: *mut LexMsg, token: i32) -> Throw {
+    unsafe {
+        if token != 0 {
+            lmsg_str(m, " near ")
+            lx_txttoken(cx, m, token)
+        }
+        if (*m).oom {
+            lmsg_free(m)
+            return Throw.Memory
+        }
+        let t = err_syntax((*cx).L, (*m).p as *const u8, (*m).n)
+        lmsg_free(m)
+        return t
+    }
+}
+
+// A lexical error at the current line, near `token`.
+fn lx_error(cx: *mut CompileState, text: &str, token: i32) -> Throw {
+    unsafe {
+        m := lmsg_new((*cx).L)
+        let pm = ptr.from_mut(&mut m)
+        lmsg_begin(cx, pm)
+        lmsg_str(pm, text)
+        return lmsg_raise(cx, pm, token)
+    }
+}
+
+// A syntax error near the current token.
+fn lex_error_here(cx: *mut CompileState, text: &str) -> Throw {
+    unsafe {
+        return lx_error(cx, text, (*cx).tk)
+    }
+}
+
+// A semantic error (no token shown).
+fn lex_semerror(cx: *mut CompileState, text: &str) -> Throw {
+    return lx_error(cx, text, 0)
+}
+
+// "too many <what> (limit is N)" for internal array limits.
+fn lex_limit_error(fs: *mut FnState, what: &str, limit: i32) -> Throw {
+    unsafe {
+        let cx = (*fs).cx
+        m := lmsg_new((*cx).L)
+        let pm = ptr.from_mut(&mut m)
+        lmsg_str(pm, "too many ")
+        lmsg_str(pm, what)
+        lmsg_str(pm, " (limit is ")
+        lmsg_int(pm, limit as i64)
+        lmsg_str(pm, ")")
+        return lmsg_raise(cx, pm, 0)
+    }
+}
+
+// --- String table ---------------------------------------------------------------
+
+fn lx_hash(p: *mut u8, n: usize) -> u32 {
+    unsafe {
+        h := 2166136261u32 ^ (n as u32)
+        for i in 0usize..n {
+            h = core.wrapping_mul(h ^ (*ptr.offset(p, i as isize) as u32), 16777619u32)
+        }
+        return h
+    }
+}
+
+fn lx_strtab_grow(cx: *mut CompileState) -> void!Throw {
+    unsafe {
+        let oldcap = (*cx).st_cap
+        let old = (*cx).st_slots
+        let newcap = if oldcap == 0 {
+            256usize
+        } else {
+            oldcap * 2
+        }
+        let nb = mem_alloc((*cx).L, newcap * mem.size_of::<LexStr>())? as *mut LexStr
+        for i in 0usize..newcap {
+            (*ptr.offset(nb, i as isize)).s = 0 as *mut LString
+        }
+        let mask = newcap - 1
+        for i in 0usize..oldcap {
+            let e = ptr.offset(old, i as isize)
+            if !ptr.is_null((*e).s) {
+                h := ((*e).hash as usize) & mask
+                for !ptr.is_null((*ptr.offset(nb, h as isize)).s) {
+                    h = (h + 1) & mask
+                }
+                let d = ptr.offset(nb, h as isize)
+                (*d).s = (*e).s
+                (*d).hash = (*e).hash
+                (*d).tok = (*e).tok
+            }
+        }
+        if oldcap != 0 {
+            mem_free((*cx).L, old as *mut u8, oldcap * mem.size_of::<LexStr>())
+        }
+        (*cx).st_slots = nb
+        (*cx).st_cap = newcap
+        return ok()
+    }
+}
+
+// The unique string with these bytes; `tok` receives its reserved-word token (or 0).
+fn lx_intern(cx: *mut CompileState, p: *mut u8, n: usize, tok: *mut i32) -> (*mut LString)!Throw {
+    unsafe {
+        if ((*cx).st_count + 1) * 2 > (*cx).st_cap {
+            lx_strtab_grow(cx)?
+        }
+        let h = lx_hash(p, n)
+        let mask = (*cx).st_cap - 1
+        i := (h as usize) & mask
+        for {
+            let e = ptr.offset((*cx).st_slots, i as isize)
+            let s = (*e).s
+            if ptr.is_null(s) {
+                break
+            }
+            if (*e).hash == h && str_len(s) == n {
+                same := true
+                let d = str_data(s)
+                for j in 0usize..n {
+                    if *ptr.offset(d, j as isize) != *ptr.offset(p, j as isize) {
+                        same = false
+                        break
+                    }
+                }
+                if same {
+                    *tok = (*e).tok
+                    return ok(s)
+                }
+            }
+            i = (i + 1) & mask
+        }
+        let s = str_new((*cx).L, p as *const u8, n)?
+        let e = ptr.offset((*cx).st_slots, i as isize)
+        (*e).s = s
+        (*e).hash = h
+        (*e).tok = 0
+        (*cx).st_count = (*cx).st_count + 1
+        *tok = 0
+        return ok(s)
+    }
+}
+
+fn lx_intern_str(cx: *mut CompileState, text: &str) -> (*mut LString)!Throw {
+    unsafe {
+        let b = mem.str_bytes(text)
+        t := 0i32
+        return lx_intern(cx, ptr.as_ptr(b) as *mut u8, b.len, ptr.from_mut(&mut t))
+    }
+}
+
+// Enter the reserved words (marked with their tokens) and the fixed names.
+fn lx_init_names(cx: *mut CompileState) -> void!Throw {
+    unsafe {
+        for i in 0usize..22 {
+            let s = lx_intern_str(cx, LX_TOKEN_NAMES[i])?
+            // Find the slot again to mark it.
+            let h = lx_hash(str_data(s), str_len(s))
+            let mask = (*cx).st_cap - 1
+            j := (h as usize) & mask
+            for (*ptr.offset((*cx).st_slots, j as isize)).s != s {
+                j = (j + 1) & mask
+            }
+            (*ptr.offset((*cx).st_slots, j as isize)).tok = TK_AND + i as i32
+        }
+        (*cx).name_env = lx_intern_str(cx, "_ENV")?
+        (*cx).name_break = lx_intern_str(cx, "break")?
+        (*cx).name_self = lx_intern_str(cx, "self")?
+        (*cx).name_forstate = lx_intern_str(cx, "(for state)")?
+        return ok()
+    }
+}
+
+// --- Reading characters -----------------------------------------------------------
+
+fn lx_advance(cx: *mut CompileState) {
+    unsafe {
+        let p = (*cx).pos
+        if p < (*cx).srclen {
+            (*cx).cur = *ptr.offset((*cx).src, p as isize) as i32
+            (*cx).pos = p + 1
+        } else {
+            (*cx).cur = LX_EOZ
+        }
+    }
+}
+
+fn lx_save(cx: *mut CompileState, c: i32) -> void!Throw {
+    unsafe {
+        if (*cx).nbuf >= (*cx).capbuf {
+            let old = (*cx).capbuf
+            if old >= 0x3fffffffffffffffusize {
+                return err(lx_error(cx, "lexical element too long", 0))
+            }
+            let nb = mem_realloc((*cx).L, (*cx).buf, old, old * 2)?
+            (*cx).buf = nb
+            (*cx).capbuf = old * 2
+        }
+        *ptr.offset((*cx).buf, (*cx).nbuf as isize) = (c & 255) as u8
+        (*cx).nbuf = (*cx).nbuf + 1
+        return ok()
+    }
+}
+
+// Append the `n` source bytes starting at the current character and move
+// past them (the caller has checked they need no special treatment).
+fn lx_save_run(cx: *mut CompileState, n: usize) -> void!Throw {
+    unsafe {
+        let need = (*cx).nbuf + n
+        if need > (*cx).capbuf {
+            newcap := (*cx).capbuf * 2
+            for newcap < need {
+                newcap = newcap * 2
+            }
+            let nb = mem_realloc((*cx).L, (*cx).buf, (*cx).capbuf, newcap)?
+            (*cx).buf = nb
+            (*cx).capbuf = newcap
+        }
+        let start = (*cx).pos - 1
+        ptr.copy_nonoverlapping(ptr.offset((*cx).src, start as isize) as *const u8, ptr.offset((*cx).buf, (*cx).nbuf as isize), n)
+        (*cx).nbuf = need
+        (*cx).pos = start + n
+        lx_advance(cx)
+        return ok()
+    }
+}
+
+// Length of the run of bytes from the current character on for which
+// are name characters (at least 1: the current character starts a name).
+fn lx_ident_run(cx: *mut CompileState) -> usize {
+    unsafe {
+        let start = (*cx).pos - 1
+        i := (*cx).pos
+        for i < (*cx).srclen && lx_isalnum(*ptr.offset((*cx).src, i as isize) as i32) {
+            i = i + 1
+        }
+        return i - start
+    }
+}
+
+// Run of plain string characters: not the delimiter, a backslash or a line break.
+fn lx_plain_run(cx: *mut CompileState, del: i32) -> usize {
+    unsafe {
+        let start = (*cx).pos - 1
+        i := (*cx).pos
+        for i < (*cx).srclen {
+            let c = *ptr.offset((*cx).src, i as isize) as i32
+            if c == del || c == 92 || c == 10 || c == 13 {
+                break
+            }
+            i = i + 1
+        }
+        return i - start
+    }
+}
+
+fn lx_save_advance(cx: *mut CompileState) -> void!Throw {
+    unsafe {
+        lx_save(cx, (*cx).cur)?
+    }
+    lx_advance(cx)
+    return ok()
+}
+
+fn lx_unsave(cx: *mut CompileState, n: usize) {
+    unsafe {
+        (*cx).nbuf = (*cx).nbuf - n
+    }
+}
+
+// Skip a line break: \n, \r, \n\r or \r\n each count as one.
+fn lx_newline(cx: *mut CompileState) -> void!Throw {
+    unsafe {
+        let old = (*cx).cur
+        lx_advance(cx)
+        if lx_isnewline((*cx).cur) && (*cx).cur != old {
+            lx_advance(cx)
+        }
+        if (*cx).line >= 2147483646 {
+            return err(lx_error(cx, "chunk has too many lines", 0))
+        }
+        (*cx).line = (*cx).line + 1
+        return ok()
+    }
+}
+
+// --- Numerals --------------------------------------------------------------------
+
+// Read a numeral: digits, letters, dots and exponent signs right after an
+// exponent mark; the text is then converted (and rejected if malformed).
+fn lx_numeral(cx: *mut CompileState) -> i32!Throw {
+    unsafe {
+        e1 := 69i32
+        e2 := 101i32
+        let first = (*cx).cur
+        lx_save_advance(cx)?
+        if first == 48 && ((*cx).cur == 120 || (*cx).cur == 88) {
+            lx_save_advance(cx)?
+            e1 = 80
+            e2 = 112
+        }
+        for {
+            let c = (*cx).cur
+            if c == e1 || c == e2 {
+                lx_save_advance(cx)?
+                if (*cx).cur == 43 || (*cx).cur == 45 {
+                    lx_save_advance(cx)?
+                }
+            } else if lx_isxdigit(c) || c == 46 {
+                lx_save_advance(cx)?
+            } else {
+                break
+            }
+        }
+        if lx_isalpha((*cx).cur) {
+            lx_save_advance(cx)?
+        }
+        iv := 0i64
+        fv := 0.0
+        let owner = 0u8
+        let text = ptr.borrow_slice((*cx).buf as *const u8, (*cx).nbuf, &owner)
+        let kind = num_string_to_number(text, &mut iv, &mut fv)
+        if kind == 1 {
+            (*cx).sc_i = iv
+            return ok(TK_INT)
+        }
+        if kind == 2 {
+            (*cx).sc_f = fv
+            return ok(TK_FLT)
+        }
+        return err(lx_error(cx, "malformed number", TK_FLT))
+    }
+}
+
+// --- Strings ---------------------------------------------------------------------
+
+// At '[' or ']': read the bracket and its '='s. Returns level + 2 for a
+// well-formed long bracket, 1 for a lone bracket, 0 for '[=' without the
+// second bracket.
+fn lx_skipsep(cx: *mut CompileState) -> usize!Throw {
+    unsafe {
+        count := 0usize
+        let s = (*cx).cur
+        lx_save_advance(cx)?
+        for (*cx).cur == 61 {
+            lx_save_advance(cx)?
+            count = count + 1
+        }
+        if (*cx).cur == s {
+            return ok(count + 2)
+        }
+        if count == 0 {
+            return ok(1)
+        }
+        return ok(0)
+    }
+}
+
+// Read a long string (or comment, when `keep` is false) after its opening
+// bracket of `sep` (= level + 2); a newline right after it is dropped.
+fn lx_longstring(cx: *mut CompileState, keep: bool, sep: usize) -> void!Throw {
+    unsafe {
+        let startline = (*cx).line
+        lx_save_advance(cx)?
+        if lx_isnewline((*cx).cur) {
+            lx_newline(cx)?
+        }
+        for {
+            let c = (*cx).cur
+            if c == LX_EOZ {
+                m := lmsg_new((*cx).L)
+                let pm = ptr.from_mut(&mut m)
+                lmsg_begin(cx, pm)
+                lmsg_str(pm, if keep {
+                    "unfinished long string (starting at line "
+                } else {
+                    "unfinished long comment (starting at line "
+                })
+                lmsg_int(pm, startline as i64)
+                lmsg_str(pm, ")")
+                return err(lmsg_raise(cx, pm, TK_EOS))
+            }
+            if c == 93 {
+                if lx_skipsep(cx)? == sep {
+                    lx_save_advance(cx)?
+                    break
+                }
+            } else if c == 10 || c == 13 {
+                lx_save(cx, 10)?
+                lx_newline(cx)?
+                if !keep {
+                    (*cx).nbuf = 0
+                }
+            } else if keep {
+                lx_save_run(cx, lx_plain_run(cx, 93))?
+            } else {
+                lx_advance(cx)
+            }
+        }
+        if keep {
+            t := 0i32
+            (*cx).sc_s = lx_intern(cx, ptr.offset((*cx).buf, sep as isize), (*cx).nbuf - 2 * sep, ptr.from_mut(&mut t))?
+        }
+        return ok()
+    }
+}
+
+// Raise an escape-sequence error unless `good`; the offending character
+// becomes part of the quoted text.
+fn lx_esccheck(cx: *mut CompileState, good: bool, text: &str) -> void!Throw {
+    unsafe {
+        if !good {
+            if (*cx).cur != LX_EOZ {
+                lx_save_advance(cx)?
+            }
+            return err(lx_error(cx, text, TK_STRING))
+        }
+        return ok()
+    }
+}
+
+fn lx_gethexa(cx: *mut CompileState) -> i32!Throw {
+    unsafe {
+        lx_save_advance(cx)?
+        lx_esccheck(cx, lx_isxdigit((*cx).cur), "hexadecimal digit expected")?
+        return ok(lx_hexvalue((*cx).cur))
+    }
+}
+
+fn lx_hexaesc(cx: *mut CompileState) -> i32!Throw {
+    r := lx_gethexa(cx)?
+    r = (r << 4) + lx_gethexa(cx)?
+    lx_unsave(cx, 2)
+    return ok(r)
+}
+
+// \u{XXX}: append the UTF-8 encoding (up to 6 bytes, values below 2^31).
+fn lx_utf8esc(cx: *mut CompileState) -> void!Throw {
+    unsafe {
+        removed := 4usize
+        lx_save_advance(cx)?
+        lx_esccheck(cx, (*cx).cur == 123, "missing '{'")?
+        r := lx_gethexa(cx)? as u32
+        for {
+            lx_save_advance(cx)?
+            if !lx_isxdigit((*cx).cur) {
+                break
+            }
+            removed = removed + 1
+            lx_esccheck(cx, r <= (0x7FFFFFFFu32 >> 4), "UTF-8 value too large")?
+            r = (r << 4) + lx_hexvalue((*cx).cur) as u32
+        }
+        lx_esccheck(cx, (*cx).cur == 125, "missing '}'")?
+        lx_advance(cx)
+        lx_unsave(cx, removed)
+        if r < 0x80 {
+            return lx_save(cx, r as i32)
+        }
+        tail: [8]u8 = [0u8; 8]
+        n := 0usize
+        x := r
+        limit := 0x3fu32
+        for {
+            tail[n] = (0x80u32 | (x & 0x3f)) as u8
+            n = n + 1
+            x = x >> 6
+            limit = limit >> 1
+            if x <= limit {
+                break
+            }
+        }
+        lx_save(cx, (((((~limit) & 0x7F) << 1) | x) & 0xFF) as i32)?
+        for i in 0usize..n {
+            lx_save(cx, tail[n - 1 - i] as i32)?
+        }
+        return ok()
+    }
+}
+
+fn lx_decesc(cx: *mut CompileState) -> i32!Throw {
+    unsafe {
+        r := 0i32
+        i := 0usize
+        for i < 3 && lx_isdigit((*cx).cur) {
+            r = 10 * r + (*cx).cur - 48
+            lx_save_advance(cx)?
+            i = i + 1
+        }
+        lx_esccheck(cx, r <= 255, "decimal escape too large")?
+        lx_unsave(cx, i)
+        return ok(r)
+    }
+}
+
+// A short string delimited by `del`. The buffer keeps the delimiters (for
+// error messages) and the decoded contents.
+fn lx_shortstring(cx: *mut CompileState, del: i32) -> void!Throw {
+    unsafe {
+        lx_save_advance(cx)?
+        for (*cx).cur != del {
+            let c = (*cx).cur
+            if c == LX_EOZ {
+                return err(lx_error(cx, "unfinished string", TK_EOS))
+            }
+            if c == 10 || c == 13 {
+                return err(lx_error(cx, "unfinished string", TK_STRING))
+            }
+            if c != 92 {
+                lx_save_run(cx, lx_plain_run(cx, del))?
+                continue
+            }
+            // Escape sequence; keep the backslash until it is decoded.
+            lx_save_advance(cx)?
+            let e = (*cx).cur
+            out := -1i32
+            consume := true
+            if e == 97 {
+                out = 7
+            } else if e == 98 {
+                out = 8
+            } else if e == 102 {
+                out = 12
+            } else if e == 110 {
+                out = 10
+            } else if e == 114 {
+                out = 13
+            } else if e == 116 {
+                out = 9
+            } else if e == 118 {
+                out = 11
+            } else if e == 120 {
+                out = lx_hexaesc(cx)?
+            } else if e == 117 {
+                lx_utf8esc(cx)?
+                continue
+            } else if e == 10 || e == 13 {
+                lx_newline(cx)?
+                out = 10
+                consume = false
+            } else if e == 92 || e == 34 || e == 39 {
+                out = e
+            } else if e == LX_EOZ {
+                continue
+            } else if e == 122 {
+                lx_unsave(cx, 1)
+                lx_advance(cx)
+                for lx_isspace((*cx).cur) {
+                    if lx_isnewline((*cx).cur) {
+                        lx_newline(cx)?
+                    } else {
+                        lx_advance(cx)
+                    }
+                }
+                continue
+            } else {
+                lx_esccheck(cx, lx_isdigit(e), "invalid escape sequence")?
+                out = lx_decesc(cx)?
+                consume = false
+            }
+            if consume {
+                lx_advance(cx)
+            }
+            lx_unsave(cx, 1)
+            lx_save(cx, out)?
+        }
+        lx_save_advance(cx)?
+        t := 0i32
+        (*cx).sc_s = lx_intern(cx, ptr.offset((*cx).buf, 1), (*cx).nbuf - 2, ptr.from_mut(&mut t))?
+        return ok()
+    }
+}
+
+// --- The scanner -----------------------------------------------------------------
+
+// Scan the next token; its value goes to the sc_* fields.
+fn lx_scan(cx: *mut CompileState) -> i32!Throw {
+    unsafe {
+        (*cx).nbuf = 0
+        for {
+            let c = (*cx).cur
+            match c {
+                b'a'..=b'z' | b'A'..=b'Z' | b'_' => {
+                    lx_save_run(cx, lx_ident_run(cx))?
+                    tok := 0i32
+                    (*cx).sc_s = lx_intern(cx, (*cx).buf, (*cx).nbuf, ptr.from_mut(&mut tok))?
+                    if tok != 0 {
+                        return ok(tok)
+                    }
+                    return ok(TK_NAME)
+                },
+                b' ' | b'\t' | 11 | 12 => {
+                    lx_advance(cx)
+                },
+                b'\n' | b'\r' => {
+                    lx_newline(cx)?
+                },
+                b'0'..=b'9' => {
+                    return lx_numeral(cx)
+                },
+                b'-' => {
+                    lx_advance(cx)
+                    if (*cx).cur != 45 {
+                        return ok(45)
+                    }
+                    // A comment: long if it starts with a long bracket.
+                    lx_advance(cx)
+                    if (*cx).cur == 91 {
+                        let sep = lx_skipsep(cx)?
+                        (*cx).nbuf = 0
+                        if sep >= 2 {
+                            lx_longstring(cx, false, sep)?
+                            (*cx).nbuf = 0
+                            continue
+                        }
+                    }
+                    for !lx_isnewline((*cx).cur) && (*cx).cur != LX_EOZ {
+                        lx_advance(cx)
+                    }
+                },
+                b'[' => {
+                    let sep = lx_skipsep(cx)?
+                    if sep >= 2 {
+                        lx_longstring(cx, true, sep)?
+                        return ok(TK_STRING)
+                    }
+                    if sep == 0 {
+                        return err(lx_error(cx, "invalid long string delimiter", TK_STRING))
+                    }
+                    return ok(91)
+                },
+                b'=' => {
+                    return lx_pair(cx, 61, 61, TK_EQ)
+                },
+                b'<' => {
+                    lx_advance(cx)
+                    if (*cx).cur == 61 {
+                        lx_advance(cx)
+                        return ok(TK_LE)
+                    }
+                    if (*cx).cur == 60 {
+                        lx_advance(cx)
+                        return ok(TK_SHL)
+                    }
+                    return ok(60)
+                },
+                b'>' => {
+                    lx_advance(cx)
+                    if (*cx).cur == 61 {
+                        lx_advance(cx)
+                        return ok(TK_GE)
+                    }
+                    if (*cx).cur == 62 {
+                        lx_advance(cx)
+                        return ok(TK_SHR)
+                    }
+                    return ok(62)
+                },
+                b'/' => {
+                    return lx_pair(cx, 47, 47, TK_IDIV)
+                },
+                b'~' => {
+                    return lx_pair(cx, 126, 61, TK_NE)
+                },
+                b':' => {
+                    return lx_pair(cx, 58, 58, TK_DBCOLON)
+                },
+                b'"' | b'\'' => {
+                    lx_shortstring(cx, c)?
+                    return ok(TK_STRING)
+                },
+                b'.' => {
+                    lx_save_advance(cx)?
+                    if (*cx).cur == 46 {
+                        lx_advance(cx)
+                        if (*cx).cur == 46 {
+                            lx_advance(cx)
+                            return ok(TK_DOTS)
+                        }
+                        return ok(TK_CONCAT)
+                    }
+                    if !lx_isdigit((*cx).cur) {
+                        return ok(46)
+                    }
+                    return lx_numeral(cx)
+                },
+                -1 => {
+                    return ok(TK_EOS)
+                },
+                _ => {
+                    lx_advance(cx)
+                    return ok(c)
+                },
+            }
+        }
+    }
+}
+
+// A one-character token `single` that becomes `double` when followed by `second`.
+fn lx_pair(cx: *mut CompileState, single: i32, second: i32, double: i32) -> i32!Throw {
+    unsafe {
+        lx_advance(cx)
+        if (*cx).cur == second {
+            lx_advance(cx)
+            return ok(double)
+        }
+        return ok(single)
+    }
+}
+
+// Move to the next token.
+fn lex_next(cx: *mut CompileState) -> void!Throw {
+    unsafe {
+        (*cx).lastline = (*cx).line
+        if (*cx).ak != TK_EOS {
+            (*cx).tk = (*cx).ak
+            (*cx).tk_i = (*cx).ak_i
+            (*cx).tk_f = (*cx).ak_f
+            (*cx).tk_s = (*cx).ak_s
+            (*cx).ak = TK_EOS
+        } else {
+            let t = lx_scan(cx)?
+            (*cx).tk = t
+            (*cx).tk_i = (*cx).sc_i
+            (*cx).tk_f = (*cx).sc_f
+            (*cx).tk_s = (*cx).sc_s
+        }
+        return ok()
+    }
+}
+
+// Scan the token after the current one without consuming it.
+fn lex_lookahead(cx: *mut CompileState) -> i32!Throw {
+    unsafe {
+        let t = lx_scan(cx)?
+        (*cx).ak = t
+        (*cx).ak_i = (*cx).sc_i
+        (*cx).ak_f = (*cx).sc_f
+        (*cx).ak_s = (*cx).sc_s
+        return ok(t)
+    }
+}

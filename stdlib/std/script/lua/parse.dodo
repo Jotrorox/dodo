@@ -1,0 +1,2091 @@
+package lua
+
+import "core/mem"
+import "core/ptr"
+
+// Recursive-descent parser for the Lua 5.4 grammar (manual §9). It drives
+// the code generator directly: there is no syntax tree. Scoping of local
+// variables, upvalue resolution, goto/label matching and to-be-closed
+// variables are handled here.
+
+// Variable kinds (also the `kind` of upvalue descriptions).
+const PVK_REGULAR: u8 = 0
+const PVK_READONLY: u8 = 1
+const PVK_TOCLOSE: u8 = 2
+// Compile-time constant: has no register; its value is in `kval`.
+const PVK_COMPILETIME: u8 = 3
+
+// Local variables per function.
+const PAR_MAXVARS: i32 = 200
+const PAR_MAXUPVAL: i32 = 255
+// Nesting limit of the recursive parser.
+const PAR_MAXLEVELS: i32 = 200
+
+// An active local variable.
+struct ParVar {
+    kval: Value
+    kind: u8
+    // Register of the variable (unless it is a compile-time constant).
+    ridx: i32
+    // Index of its debug entry in the Proto's locvars.
+    pidx: i32
+    name: *mut LString
+}
+
+// A pending goto or a visible label.
+struct ParLabel {
+    name: *mut LString
+    pc: i32
+    line: i32
+    // Active variables at that position.
+    nactvar: i32
+    // Goto that leaves the scope of a variable captured as an upvalue.
+    close: bool
+}
+
+// A lexical block.
+struct ParScope {
+    previous: *mut ParScope
+    first_label: i32
+    first_goto: i32
+    // Active variables outside the block.
+    nactvar: i32
+    // Some variable of the block is captured or to be closed.
+    upval: bool
+    is_loop: bool
+    in_tbc: bool
+}
+
+// Target list of a multiple assignment.
+struct ParLhs {
+    prev: *mut ParLhs
+    v: CgExp
+}
+
+// State of a table constructor.
+struct ParTable {
+    // Last list item read (not yet stored).
+    v: CgExp
+    t: *mut CgExp
+    nh: i32
+    na: i32
+    tostore: i32
+}
+
+// --- Token helpers ---------------------------------------------------------------
+
+fn par_tk(cx: *mut CompileState) -> i32 {
+    unsafe {
+        return (*cx).tk
+    }
+}
+
+fn par_fs(cx: *mut CompileState) -> *mut FnState {
+    unsafe {
+        return (*cx).fs
+    }
+}
+
+fn par_err_expected(cx: *mut CompileState, token: i32) -> Throw {
+    unsafe {
+        m := lmsg_new((*cx).L)
+        let pm = ptr.from_mut(&mut m)
+        lmsg_begin(cx, pm)
+        lx_token2str(pm, token)
+        lmsg_str(pm, " expected")
+        return lmsg_raise(cx, pm, (*cx).tk)
+    }
+}
+
+fn par_accept(cx: *mut CompileState, c: i32) -> bool!Throw {
+    unsafe {
+        if (*cx).tk == c {
+            lex_next(cx)?
+            return ok(true)
+        }
+        return ok(false)
+    }
+}
+
+fn par_require(cx: *mut CompileState, c: i32) -> void!Throw {
+    unsafe {
+        if (*cx).tk != c {
+            return err(par_err_expected(cx, c))
+        }
+        return ok()
+    }
+}
+
+fn par_expect(cx: *mut CompileState, c: i32) -> void!Throw {
+    par_require(cx, c)?
+    return lex_next(cx)
+}
+
+// Expect `what` closing `who` opened at line `where`.
+fn par_expect_closing(cx: *mut CompileState, what: i32, who: i32, where: i32) -> void!Throw {
+    unsafe {
+        if par_accept(cx, what)? {
+            return ok()
+        }
+        if where == (*cx).line {
+            return err(par_err_expected(cx, what))
+        }
+        m := lmsg_new((*cx).L)
+        let pm = ptr.from_mut(&mut m)
+        lmsg_begin(cx, pm)
+        lx_token2str(pm, what)
+        lmsg_str(pm, " expected (to close ")
+        lx_token2str(pm, who)
+        lmsg_str(pm, " at line ")
+        lmsg_int(pm, where as i64)
+        lmsg_str(pm, ")")
+        return err(lmsg_raise(cx, pm, (*cx).tk))
+    }
+}
+
+fn par_name(cx: *mut CompileState) -> (*mut LString)!Throw {
+    unsafe {
+        par_require(cx, TK_NAME)?
+        let s = (*cx).tk_s
+        lex_next(cx)?
+        return ok(s)
+    }
+}
+
+fn ex_string(e: *mut CgExp, s: *mut LString) {
+    unsafe {
+        ex_init(e, EK_KSTR, 0)
+        (*e).sval = s
+    }
+}
+
+fn par_name_exp(cx: *mut CompileState, e: *mut CgExp) -> void!Throw {
+    let s = par_name(cx)?
+    ex_string(e, s)
+    return ok()
+}
+
+// "too many <what> (limit is N) in <function>".
+fn par_err_limit(fs: *mut FnState, limit: i32, what: &str) -> Throw {
+    unsafe {
+        let cx = (*fs).cx
+        m := lmsg_new((*cx).L)
+        let pm = ptr.from_mut(&mut m)
+        lmsg_begin(cx, pm)
+        lmsg_str(pm, "too many ")
+        lmsg_str(pm, what)
+        lmsg_str(pm, " (limit is ")
+        lmsg_int(pm, limit as i64)
+        lmsg_str(pm, ") in ")
+        let line = (*(*fs).f).linedefined
+        if line == 0 {
+            lmsg_str(pm, "main function")
+        } else {
+            lmsg_str(pm, "function at line ")
+            lmsg_int(pm, line as i64)
+        }
+        return lmsg_raise(cx, pm, (*cx).tk)
+    }
+}
+
+fn par_limit(fs: *mut FnState, v: i32, limit: i32, what: &str) -> void!Throw {
+    if v > limit {
+        return err(par_err_limit(fs, limit, what))
+    }
+    return ok()
+}
+
+fn par_nest(cx: *mut CompileState) -> void!Throw {
+    unsafe {
+        (*cx).nlevels = (*cx).nlevels + 1
+        // Nesting shares the runtime's C-call budget, as each level is a
+        // native recursion; overflow reports like any C stack overflow.
+        if (*cx).nlevels + ((*(*cx).L).n_ccalls as i32) >= PAR_MAXLEVELS {
+            return err(err_runtime((*cx).L, "C stack overflow"))
+        }
+        return ok()
+    }
+}
+
+fn par_unnest(cx: *mut CompileState) {
+    unsafe {
+        (*cx).nlevels = (*cx).nlevels - 1
+    }
+}
+
+// --- Variables -------------------------------------------------------------------
+
+fn par_var(fs: *mut FnState, vidx: i32) -> *mut ParVar {
+    unsafe {
+        return ptr.offset((*(*fs).cx).actvar, ((*fs).first_local + vidx) as isize)
+    }
+}
+
+// Value of the compile-time constant at absolute index `idx`.
+fn par_const_slot(fs: *mut FnState, idx: i32) -> *mut Value {
+    unsafe {
+        return ptr.offset((*(*fs).cx).actvar, idx as isize) as *mut Value
+    }
+}
+
+// First register above the variables below level `nvar`.
+fn par_reg_level(fs: *mut FnState, nvar: i32) -> i32 {
+    unsafe {
+        n := nvar
+        for n > 0 {
+            n = n - 1
+            let vd = par_var(fs, n)
+            if (*vd).kind != PVK_COMPILETIME {
+                return (*vd).ridx + 1
+            }
+        }
+        return 0
+    }
+}
+
+// Number of registers held by active variables.
+fn par_regs_in_use(fs: *mut FnState) -> i32 {
+    unsafe {
+        return par_reg_level(fs, (*fs).nactvar)
+    }
+}
+
+fn par_local_debug(fs: *mut FnState, vidx: i32) -> *mut LocVar {
+    unsafe {
+        let vd = par_var(fs, vidx)
+        if (*vd).kind == PVK_COMPILETIME {
+            return 0 as *mut LocVar
+        }
+        return ptr.offset((*(*fs).f).locvars, (*vd).pidx as isize)
+    }
+}
+
+fn par_debug_local(fs: *mut FnState, name: *mut LString) -> i32!Throw {
+    unsafe {
+        let f = (*fs).f
+        let n = (*fs).ndebug
+        cap := (*f).sizelocvars
+        let nb = cg_grow(fs, (*f).locvars as *mut u8, ptr.from_mut(&mut cap), n, mem.size_of::<LocVar>(), 32767, "local variables")?
+        (*f).locvars = nb as *mut LocVar
+        for i in (*f).sizelocvars..cap {
+            let lv = ptr.offset((*f).locvars, i as isize)
+            (*lv).name = 0 as *mut LString
+            (*lv).startpc = 0
+            (*lv).endpc = 0
+        }
+        (*f).sizelocvars = cap
+        let lv = ptr.offset((*f).locvars, n as isize)
+        (*lv).name = name
+        (*lv).startpc = (*fs).pc
+        (*fs).ndebug = n + 1
+        return ok(n)
+    }
+}
+
+// Declare a new local (not yet active); returns its index in the function.
+fn par_declare_local(cx: *mut CompileState, name: *mut LString) -> i32!Throw {
+    unsafe {
+        let fs = (*cx).fs
+        par_limit(fs, (*cx).nactv + 1 - (*fs).first_local, PAR_MAXVARS, "local variables")?
+        if (*cx).nactv >= (*cx).capactv {
+            let old = (*cx).capactv
+            let newcap = if old == 0 {
+                32i32
+            } else {
+                old * 2
+            }
+            let esz = mem.size_of::<ParVar>()
+            (*cx).actvar = mem_realloc((*cx).L, (*cx).actvar as *mut u8, (old as usize) * esz, (newcap as usize) * esz)? as *mut ParVar
+            (*cx).capactv = newcap
+        }
+        let vd = ptr.offset((*cx).actvar, (*cx).nactv as isize)
+        (*vd).kind = PVK_REGULAR
+        (*vd).name = name
+        (*vd).ridx = 0
+        (*vd).pidx = 0
+        set_nil(ptr.offset((*cx).actvar, (*cx).nactv as isize) as *mut Value)
+        (*cx).nactv = (*cx).nactv + 1
+        return ok((*cx).nactv - 1 - (*fs).first_local)
+    }
+}
+
+// Activate the last `nvars` declared variables.
+fn par_activate_locals(cx: *mut CompileState, nvars: i32) -> void!Throw {
+    unsafe {
+        let fs = (*cx).fs
+        reg := par_regs_in_use(fs)
+        for i in 0..nvars {
+            let vidx = (*fs).nactvar
+            (*fs).nactvar = vidx + 1
+            let vd = par_var(fs, vidx)
+            (*vd).ridx = reg
+            reg = reg + 1
+            (*vd).pidx = par_debug_local(fs, (*vd).name)?
+        }
+        return ok()
+    }
+}
+
+// End the scope of the variables above level `tolevel`.
+fn par_retire_locals(fs: *mut FnState, tolevel: i32) {
+    unsafe {
+        let cx = (*fs).cx
+        (*cx).nactv = (*cx).nactv - ((*fs).nactvar - tolevel)
+        for (*fs).nactvar > tolevel {
+            (*fs).nactvar = (*fs).nactvar - 1
+            let lv = par_local_debug(fs, (*fs).nactvar)
+            if !ptr.is_null(lv) {
+                (*lv).endpc = (*fs).pc
+            }
+        }
+    }
+}
+
+fn par_find_upvalue(fs: *mut FnState, name: *mut LString) -> i32 {
+    unsafe {
+        let up = (*(*fs).f).upvalues
+        for i in 0..(*fs).nups {
+            if (*ptr.offset(up, i as isize)).name == name {
+                return i
+            }
+        }
+        return -1
+    }
+}
+
+fn par_new_upvalue_slot(fs: *mut FnState) -> (*mut UpvalDesc)!Throw {
+    unsafe {
+        let f = (*fs).f
+        par_limit(fs, (*fs).nups + 1, PAR_MAXUPVAL, "upvalues")?
+        cap := (*f).sizeupvalues
+        let nb = cg_grow(fs, (*f).upvalues as *mut u8, ptr.from_mut(&mut cap), (*fs).nups, mem.size_of::<UpvalDesc>(), PAR_MAXUPVAL, "upvalues")?
+        (*f).upvalues = nb as *mut UpvalDesc
+        for i in (*f).sizeupvalues..cap {
+            let u = ptr.offset((*f).upvalues, i as isize)
+            (*u).name = 0 as *mut LString
+            (*u).instack = 0
+            (*u).index = 0
+            (*u).kind = 0
+        }
+        (*f).sizeupvalues = cap
+        let u = ptr.offset((*f).upvalues, (*fs).nups as isize)
+        (*fs).nups = (*fs).nups + 1
+        return ok(u)
+    }
+}
+
+// Create an upvalue of `fs` for variable `v` of the enclosing function.
+fn par_add_upvalue(fs: *mut FnState, name: *mut LString, v: *mut CgExp) -> i32!Throw {
+    unsafe {
+        let up = par_new_upvalue_slot(fs)?
+        let prev = (*fs).prev
+        if (*v).k == EK_LOCAL {
+            (*up).instack = 1
+            (*up).index = (*v).ridx as u8
+            (*up).kind = (*par_var(prev, (*v).vidx)).kind
+        } else {
+            (*up).instack = 0
+            (*up).index = (*v).info as u8
+            (*up).kind = (*ptr.offset((*(*prev).f).upvalues, (*v).info as isize)).kind
+        }
+        (*up).name = name
+        return ok((*fs).nups - 1)
+    }
+}
+
+// Look for an active local named `n`; fills `var` and returns its kind or -1.
+fn par_find_local(fs: *mut FnState, n: *mut LString, var: *mut CgExp) -> i32 {
+    unsafe {
+        i := (*fs).nactvar - 1
+        for i >= 0 {
+            let vd = par_var(fs, i)
+            if (*vd).name == n {
+                if (*vd).kind == PVK_COMPILETIME {
+                    ex_init(var, EK_CONST, (*fs).first_local + i)
+                } else {
+                    ex_init(var, EK_LOCAL, 0)
+                    (*var).vidx = i
+                    (*var).ridx = (*vd).ridx
+                }
+                return (*var).k
+            }
+            i = i - 1
+        }
+        return -1
+    }
+}
+
+// The block declaring variable `level` must close its upvalues.
+fn par_mark_captured(fs: *mut FnState, level: i32) {
+    unsafe {
+        bl := (*fs).scope
+        for (*bl).nactvar > level {
+            bl = (*bl).previous
+        }
+        (*bl).upval = true
+        (*fs).need_close = true
+    }
+}
+
+fn par_mark_tbc(fs: *mut FnState) {
+    unsafe {
+        let bl = (*fs).scope
+        (*bl).upval = true
+        (*bl).in_tbc = true
+        (*fs).need_close = true
+    }
+}
+
+// Resolve name `n` in `fs` and its enclosing functions, creating upvalues
+// along the way; a global leaves `var` as EK_VOID.
+fn par_resolve(fs: *mut FnState, n: *mut LString, var: *mut CgExp, base: bool) -> void!Throw {
+    unsafe {
+        if ptr.is_null(fs) {
+            ex_init(var, EK_VOID, 0)
+            return ok()
+        }
+        let v = par_find_local(fs, n, var)
+        if v >= 0 {
+            if v == EK_LOCAL && !base {
+                par_mark_captured(fs, (*var).vidx)
+            }
+            return ok()
+        }
+        idx := par_find_upvalue(fs, n)
+        if idx < 0 {
+            par_resolve((*fs).prev, n, var, false)?
+            if (*var).k == EK_LOCAL || (*var).k == EK_UPVAL {
+                idx = par_add_upvalue(fs, n, var)?
+            } else {
+                return ok()
+            }
+        }
+        ex_init(var, EK_UPVAL, idx)
+        return ok()
+    }
+}
+
+// A variable reference: local, upvalue, or global (_ENV.name).
+fn par_name_ref(cx: *mut CompileState, var: *mut CgExp) -> void!Throw {
+    unsafe {
+        let name = par_name(cx)?
+        let fs = (*cx).fs
+        par_resolve(fs, name, var, true)?
+        if (*var).k == EK_VOID {
+            par_resolve(fs, (*cx).name_env, var, true)?
+            cg_to_reg_or_upval(fs, var)?
+            key := ex_blank()
+            ex_string(ptr.from_mut(&mut key), name)
+            cg_index(fs, var, ptr.from_mut(&mut key))?
+        }
+        return ok()
+    }
+}
+
+// Make an expression list of `nexps` values produce `nvars` values.
+fn par_fit_values(cx: *mut CompileState, nvars: i32, nexps: i32, e: *mut CgExp) -> void!Throw {
+    unsafe {
+        let fs = (*cx).fs
+        let needed = nvars - nexps
+        if ex_multret((*e).k) {
+            extra := needed + 1
+            if extra < 0 {
+                extra = 0
+            }
+            cg_set_nresults(fs, e, extra)?
+        } else {
+            if (*e).k != EK_VOID {
+                cg_to_nextreg(fs, e)?
+            }
+            if needed > 0 {
+                cg_load_nils(fs, (*fs).free_reg, needed)?
+            }
+        }
+        if needed > 0 {
+            cg_alloc_regs(fs, needed)?
+        } else {
+            (*fs).free_reg = (*fs).free_reg + needed
+        }
+        return ok()
+    }
+}
+
+// --- Gotos and labels --------------------------------------------------------------
+
+fn par_label_slot(list: *mut ParLabel, i: i32) -> *mut ParLabel {
+    unsafe {
+        return ptr.offset(list, i as isize)
+    }
+}
+
+fn par_err_into_scope(cx: *mut CompileState, gt: *mut ParLabel) -> Throw {
+    unsafe {
+        let vd = par_var((*cx).fs, (*gt).nactvar)
+        m := lmsg_new((*cx).L)
+        let pm = ptr.from_mut(&mut m)
+        lmsg_begin(cx, pm)
+        lmsg_str(pm, "<goto ")
+        lmsg_lstr(pm, (*gt).name)
+        lmsg_str(pm, "> at line ")
+        lmsg_int(pm, (*gt).line as i64)
+        lmsg_str(pm, " jumps into the scope of local '")
+        lmsg_lstr(pm, (*vd).name)
+        lmsg_str(pm, "'")
+        return lmsg_raise(cx, pm, 0)
+    }
+}
+
+// Resolve pending goto `g` to `label` and drop it from the list.
+fn par_resolve_goto(cx: *mut CompileState, g: i32, label: *mut ParLabel) -> void!Throw {
+    unsafe {
+        let gt = par_label_slot((*cx).gotos, g)
+        if (*gt).nactvar < (*label).nactvar {
+            return err(par_err_into_scope(cx, gt))
+        }
+        cg_jumps_to((*cx).fs, (*gt).pc, (*label).pc)?
+        let n = (*cx).ngoto
+        for i in g..(n - 1) {
+            ptr.copy_nonoverlapping(par_label_slot((*cx).gotos, i + 1), par_label_slot((*cx).gotos, i), 1)
+        }
+        (*cx).ngoto = n - 1
+        return ok()
+    }
+}
+
+// A visible label of the current function named `name`, or null.
+fn par_find_label(cx: *mut CompileState, name: *mut LString) -> *mut ParLabel {
+    unsafe {
+        for i in (*(*cx).fs).first_label..(*cx).nlabel {
+            let lb = par_label_slot((*cx).labels, i)
+            if (*lb).name == name {
+                return lb
+            }
+        }
+        return 0 as *mut ParLabel
+    }
+}
+
+fn par_add_label(cx: *mut CompileState, isgoto: bool, name: *mut LString, line: i32, pc: i32) -> i32!Throw {
+    unsafe {
+        n := if isgoto {
+            (*cx).ngoto
+        } else {
+            (*cx).nlabel
+        }
+        cap := if isgoto {
+            (*cx).capgoto
+        } else {
+            (*cx).caplabel
+        }
+        arr := if isgoto {
+            (*cx).gotos
+        } else {
+            (*cx).labels
+        }
+        if n >= cap {
+            let newcap = if cap == 0 {
+                16i32
+            } else {
+                cap * 2
+            }
+            let esz = mem.size_of::<ParLabel>()
+            arr = mem_realloc((*cx).L, arr as *mut u8, (cap as usize) * esz, (newcap as usize) * esz)? as *mut ParLabel
+            if isgoto {
+                (*cx).gotos = arr
+                (*cx).capgoto = newcap
+            } else {
+                (*cx).labels = arr
+                (*cx).caplabel = newcap
+            }
+        }
+        let e = par_label_slot(arr, n)
+        (*e).name = name
+        (*e).line = line
+        (*e).nactvar = (*(*cx).fs).nactvar
+        (*e).close = false
+        (*e).pc = pc
+        if isgoto {
+            (*cx).ngoto = n + 1
+        } else {
+            (*cx).nlabel = n + 1
+        }
+        return ok(n)
+    }
+}
+
+fn par_add_goto(cx: *mut CompileState, name: *mut LString, line: i32, pc: i32) -> i32!Throw {
+    return par_add_label(cx, true, name, line, pc)
+}
+
+// Resolve the pending gotos of the current block that match label `lb`;
+// true if one of them needs to close upvalues.
+fn par_resolve_gotos(cx: *mut CompileState, lb: i32) -> bool!Throw {
+    unsafe {
+        i := (*(*(*cx).fs).scope).first_goto
+        needsclose := false
+        let label = par_label_slot((*cx).labels, lb)
+        for i < (*cx).ngoto {
+            let gt = par_label_slot((*cx).gotos, i)
+            if (*gt).name == (*label).name {
+                needsclose = needsclose || (*gt).close
+                par_resolve_goto(cx, i, label)?
+            } else {
+                i = i + 1
+            }
+        }
+        return ok(needsclose)
+    }
+}
+
+// Declare a label here. `last`: it ends its block, so the block's locals
+// are already out of scope for it. True if a CLOSE was emitted.
+fn par_define_label(cx: *mut CompileState, name: *mut LString, line: i32, last: bool) -> bool!Throw {
+    unsafe {
+        let fs = (*cx).fs
+        let l = par_add_label(cx, false, name, line, cg_mark_target(fs))?
+        if last {
+            (*par_label_slot((*cx).labels, l)).nactvar = (*(*fs).scope).nactvar
+        }
+        if par_resolve_gotos(cx, l)? {
+            cg_emit_abc(fs, OP_CLOSE, par_regs_in_use(fs), 0, 0)?
+            return ok(true)
+        }
+        return ok(false)
+    }
+}
+
+// Pending gotos of a block that is ending now belong to the outer block.
+fn par_lift_gotos(fs: *mut FnState, bl: *mut ParScope) {
+    unsafe {
+        let cx = (*fs).cx
+        for i in (*bl).first_goto..(*cx).ngoto {
+            let gt = par_label_slot((*cx).gotos, i)
+            if par_reg_level(fs, (*gt).nactvar) > par_reg_level(fs, (*bl).nactvar) {
+                (*gt).close = (*gt).close || (*bl).upval
+            }
+            (*gt).nactvar = (*bl).nactvar
+        }
+    }
+}
+
+fn par_open_scope(fs: *mut FnState, bl: *mut ParScope, is_loop: bool) {
+    unsafe {
+        let cx = (*fs).cx
+        (*bl).is_loop = is_loop
+        (*bl).nactvar = (*fs).nactvar
+        (*bl).first_label = (*cx).nlabel
+        (*bl).first_goto = (*cx).ngoto
+        (*bl).upval = false
+        (*bl).in_tbc = !ptr.is_null((*fs).scope) && (*(*fs).scope).in_tbc
+        (*bl).previous = (*fs).scope
+        (*fs).scope = bl
+    }
+}
+
+fn par_err_no_label(cx: *mut CompileState, gt: *mut ParLabel) -> Throw {
+    unsafe {
+        m := lmsg_new((*cx).L)
+        let pm = ptr.from_mut(&mut m)
+        lmsg_begin(cx, pm)
+        if (*gt).name == (*cx).name_break {
+            lmsg_str(pm, "break outside loop at line ")
+            lmsg_int(pm, (*gt).line as i64)
+        } else {
+            lmsg_str(pm, "no visible label '")
+            lmsg_lstr(pm, (*gt).name)
+            lmsg_str(pm, "' for <goto> at line ")
+            lmsg_int(pm, (*gt).line as i64)
+        }
+        return lmsg_raise(cx, pm, 0)
+    }
+}
+
+fn par_close_scope(fs: *mut FnState) -> void!Throw {
+    unsafe {
+        let bl = (*fs).scope
+        let cx = (*fs).cx
+        hasclose := false
+        let stklevel = par_reg_level(fs, (*bl).nactvar)
+        par_retire_locals(fs, (*bl).nactvar)
+        if (*bl).is_loop {
+            hasclose = par_define_label(cx, (*cx).name_break, 0, false)?
+        }
+        if !hasclose && !ptr.is_null((*bl).previous) && (*bl).upval {
+            cg_emit_abc(fs, OP_CLOSE, stklevel, 0, 0)?
+        }
+        (*fs).free_reg = stklevel
+        (*cx).nlabel = (*bl).first_label
+        (*fs).scope = (*bl).previous
+        if !ptr.is_null((*bl).previous) {
+            par_lift_gotos(fs, bl)
+        } else if (*bl).first_goto < (*cx).ngoto {
+            return err(par_err_no_label(cx, par_label_slot((*cx).gotos, (*bl).first_goto)))
+        }
+        return ok()
+    }
+}
+
+// --- Functions -------------------------------------------------------------------
+
+fn par_new_child(cx: *mut CompileState) -> (*mut Proto)!Throw {
+    unsafe {
+        let fs = (*cx).fs
+        let f = (*fs).f
+        if (*fs).np >= (*f).sizep {
+            cap := (*f).sizep
+            let nb = cg_grow(fs, (*f).p as *mut u8, ptr.from_mut(&mut cap), (*fs).np, mem.size_of::<*mut Proto>(), MAXARG_BX, "functions")?
+            (*f).p = nb as *mut *mut Proto
+            for i in (*f).sizep..cap {
+                *ptr.offset((*f).p, i as isize) = 0 as *mut Proto
+            }
+            (*f).sizep = cap
+        }
+        let np = proto_new((*cx).L)?
+        *ptr.offset((*f).p, (*fs).np as isize) = np
+        (*fs).np = (*fs).np + 1
+        return ok(np)
+    }
+}
+
+// CLOSURE for the function just compiled, in the next free register.
+fn par_emit_closure(cx: *mut CompileState, v: *mut CgExp) -> void!Throw {
+    unsafe {
+        let fs = (*(*cx).fs).prev
+        let pc = cg_emit_abx(fs, OP_CLOSURE, 0, (*fs).np - 1)?
+        ex_init(v, EK_ANYDEST, pc)
+        return cg_to_nextreg(fs, v)
+    }
+}
+
+fn par_begin_function(cx: *mut CompileState, fs: *mut FnState, bl: *mut ParScope) {
+    unsafe {
+        let f = (*fs).f
+        (*fs).prev = (*cx).fs
+        (*fs).cx = cx
+        (*cx).fs = fs
+        (*fs).pc = 0
+        (*fs).prevline = (*f).linedefined
+        (*fs).since_abs = 0
+        (*fs).last_target = 0
+        (*fs).free_reg = 0
+        (*fs).nk = 0
+        (*fs).nabs = 0
+        (*fs).np = 0
+        (*fs).nups = 0
+        (*fs).ndebug = 0
+        (*fs).nactvar = 0
+        (*fs).need_close = false
+        (*fs).first_local = (*cx).nactv
+        (*fs).first_label = (*cx).nlabel
+        (*fs).scope = 0 as *mut ParScope
+        (*f).source = (*cx).source
+        (*f).maxstacksize = 2
+        par_open_scope(fs, bl, false)
+    }
+}
+
+fn par_end_function(cx: *mut CompileState) -> void!Throw {
+    unsafe {
+        let L = (*cx).L
+        let fs = (*cx).fs
+        let f = (*fs).f
+        cg_return(fs, par_regs_in_use(fs), 0)?
+        par_close_scope(fs)?
+        cg_finalize(fs)?
+        (*f).code = cg_shrink(L, (*f).code as *mut u8, (*f).sizecode, (*fs).pc, 4)? as *mut u32
+        (*f).sizecode = (*fs).pc
+        (*f).lineinfo = cg_shrink(L, (*f).lineinfo as *mut u8, (*f).sizelineinfo, (*fs).pc, 1)? as *mut i8
+        (*f).sizelineinfo = (*fs).pc
+        (*f).abslineinfo = cg_shrink(L, (*f).abslineinfo as *mut u8, (*f).sizeabslineinfo, (*fs).nabs, mem.size_of::<AbsLineInfo>())? as *mut AbsLineInfo
+        (*f).sizeabslineinfo = (*fs).nabs
+        (*f).k = cg_shrink(L, (*f).k as *mut u8, (*f).sizek, (*fs).nk, mem.size_of::<Value>())? as *mut Value
+        (*f).sizek = (*fs).nk
+        (*f).p = cg_shrink(L, (*f).p as *mut u8, (*f).sizep, (*fs).np, mem.size_of::<*mut Proto>())? as *mut *mut Proto
+        (*f).sizep = (*fs).np
+        (*f).locvars = cg_shrink(L, (*f).locvars as *mut u8, (*f).sizelocvars, (*fs).ndebug, mem.size_of::<LocVar>())? as *mut LocVar
+        (*f).sizelocvars = (*fs).ndebug
+        (*f).upvalues = cg_shrink(L, (*f).upvalues as *mut u8, (*f).sizeupvalues, (*fs).nups, mem.size_of::<UpvalDesc>())? as *mut UpvalDesc
+        (*f).sizeupvalues = (*fs).nups
+        (*cx).fs = (*fs).prev
+        return ok()
+    }
+}
+
+// --- Grammar: blocks and expressions --------------------------------------------------
+
+// Does the current token end a block? ('until' only when `withuntil`.)
+fn par_block_ends(cx: *mut CompileState, withuntil: bool) -> bool {
+    let t = par_tk(cx)
+    if t == TK_ELSE || t == TK_ELSEIF || t == TK_END || t == TK_EOS {
+        return true
+    }
+    if t == TK_UNTIL {
+        return withuntil
+    }
+    return false
+}
+
+fn par_statements(cx: *mut CompileState) -> void!Throw {
+    for !par_block_ends(cx, true) {
+        if par_tk(cx) == TK_RETURN {
+            par_stmt(cx)?
+            return ok()
+        }
+        par_stmt(cx)?
+    }
+    return ok()
+}
+
+// ['.' | ':'] NAME
+fn par_dot_key(cx: *mut CompileState, v: *mut CgExp) -> void!Throw {
+    unsafe {
+        let fs = par_fs(cx)
+        key := ex_blank()
+        cg_to_reg_or_upval(fs, v)?
+        lex_next(cx)?
+        par_name_exp(cx, ptr.from_mut(&mut key))?
+        return cg_index(fs, v, ptr.from_mut(&mut key))
+    }
+}
+
+// '[' expr ']'
+fn par_bracket_key(cx: *mut CompileState, v: *mut CgExp) -> void!Throw {
+    lex_next(cx)?
+    par_expr(cx, v)?
+    cg_to_value(par_fs(cx), v)?
+    return par_expect(cx, 93)
+}
+
+// (NAME | '[' exp ']') '=' exp
+fn par_keyed_field(cx: *mut CompileState, cc: *mut ParTable) -> void!Throw {
+    unsafe {
+        let fs = par_fs(cx)
+        let reg = (*fs).free_reg
+        tab := ex_blank()
+        key := ex_blank()
+        val := ex_blank()
+        if par_tk(cx) == TK_NAME {
+            par_name_exp(cx, ptr.from_mut(&mut key))?
+        } else {
+            par_bracket_key(cx, ptr.from_mut(&mut key))?
+        }
+        par_limit(fs, (*cc).nh, 2147483647, "items in a constructor")?
+        (*cc).nh = (*cc).nh + 1
+        par_expect(cx, 61)?
+        ex_copy(ptr.from_mut(&mut tab), (*cc).t)
+        cg_index(fs, ptr.from_mut(&mut tab), ptr.from_mut(&mut key))?
+        par_expr(cx, ptr.from_mut(&mut val))?
+        cg_store(fs, ptr.from_mut(&mut tab), ptr.from_mut(&mut val))?
+        (*fs).free_reg = reg
+        return ok()
+    }
+}
+
+fn par_table_v(cc: *mut ParTable) -> *mut CgExp {
+    unsafe {
+        return ptr.offset(cc as *mut u8, mem.offset_of::<ParTable>("v") as isize) as *mut CgExp
+    }
+}
+
+// Store the pending list item; flush a full batch with SETLIST.
+fn par_flush_item(fs: *mut FnState, cc: *mut ParTable) -> void!Throw {
+    unsafe {
+        let v = par_table_v(cc)
+        if (*v).k == EK_VOID {
+            return ok()
+        }
+        cg_to_nextreg(fs, v)?
+        (*v).k = EK_VOID
+        if (*cc).tostore == FIELDS_PER_FLUSH {
+            cg_flush_list(fs, (*(*cc).t).info, (*cc).na, (*cc).tostore)?
+            (*cc).na = (*cc).na + (*cc).tostore
+            (*cc).tostore = 0
+        }
+        return ok()
+    }
+}
+
+fn par_finish_items(fs: *mut FnState, cc: *mut ParTable) -> void!Throw {
+    unsafe {
+        if (*cc).tostore == 0 {
+            return ok()
+        }
+        let v = par_table_v(cc)
+        if ex_multret((*v).k) {
+            cg_set_allresults(fs, v)?
+            cg_flush_list(fs, (*(*cc).t).info, (*cc).na, CG_MULTRET)?
+            (*cc).na = (*cc).na - 1
+        } else {
+            if (*v).k != EK_VOID {
+                cg_to_nextreg(fs, v)?
+            }
+            cg_flush_list(fs, (*(*cc).t).info, (*cc).na, (*cc).tostore)?
+        }
+        (*cc).na = (*cc).na + (*cc).tostore
+        return ok()
+    }
+}
+
+fn par_positional_field(cx: *mut CompileState, cc: *mut ParTable) -> void!Throw {
+    unsafe {
+        par_expr(cx, par_table_v(cc))?
+        (*cc).tostore = (*cc).tostore + 1
+        return ok()
+    }
+}
+
+fn par_table_item(cx: *mut CompileState, cc: *mut ParTable) -> void!Throw {
+    let t = par_tk(cx)
+    if t == TK_NAME {
+        if lex_lookahead(cx)? != 61 {
+            return par_positional_field(cx, cc)
+        }
+        return par_keyed_field(cx, cc)
+    }
+    if t == 91 {
+        return par_keyed_field(cx, cc)
+    }
+    return par_positional_field(cx, cc)
+}
+
+// '{' [ field { sep field } [sep] ] '}'
+fn par_table(cx: *mut CompileState, t: *mut CgExp) -> void!Throw {
+    unsafe {
+        let fs = par_fs(cx)
+        let line = (*cx).line
+        let pc = cg_emit_abc(fs, OP_NEWTABLE, 0, 0, 0)?
+        cg_emit(fs, 0)?
+        cc := ParTable { v: ex_blank(), t: t, nh: 0, na: 0, tostore: 0 }
+        let pcc = ptr.from_mut(&mut cc)
+        ex_init(t, EK_FIXED, (*fs).free_reg)
+        cg_alloc_regs(fs, 1)?
+        ex_init(par_table_v(pcc), EK_VOID, 0)
+        par_expect(cx, 123)?
+        for {
+            if par_tk(cx) == 125 {
+                break
+            }
+            par_flush_item(fs, pcc)?
+            par_table_item(cx, pcc)?
+            par_limit(fs, cc.tostore + cc.na + cc.nh, 1073741823, "items in a constructor")?
+            if !(par_accept(cx, 44)? || par_accept(cx, 59)?) {
+                break
+            }
+        }
+        par_expect_closing(cx, 125, 123, line)?
+        par_finish_items(fs, pcc)?
+        cg_table_size(fs, pc, (*t).info, cc.na, cc.nh)
+        return ok()
+    }
+}
+
+fn par_mark_vararg(fs: *mut FnState, nparams: i32) -> void!Throw {
+    unsafe {
+        (*(*fs).f).is_vararg = 1
+        cg_emit_abc(fs, OP_VARARGPREP, nparams, 0, 0)?
+        return ok()
+    }
+}
+
+// [ {NAME ','} (NAME | '...') ]
+fn par_params(cx: *mut CompileState) -> void!Throw {
+    unsafe {
+        let fs = par_fs(cx)
+        let f = (*fs).f
+        nparams := 0i32
+        isvararg := false
+        if par_tk(cx) != 41 {
+            for {
+                let t = par_tk(cx)
+                if t == TK_NAME {
+                    let name = par_name(cx)?
+                    par_declare_local(cx, name)?
+                    nparams = nparams + 1
+                } else if t == TK_DOTS {
+                    lex_next(cx)?
+                    isvararg = true
+                } else {
+                    return err(lex_error_here(cx, "<name> or '...' expected"))
+                }
+                if isvararg || !par_accept(cx, 44)? {
+                    break
+                }
+            }
+        }
+        par_activate_locals(cx, nparams)?
+        (*f).numparams = (*fs).nactvar as u8
+        if isvararg {
+            par_mark_vararg(fs, (*f).numparams as i32)?
+        }
+        cg_alloc_regs(fs, (*fs).nactvar)?
+        return ok()
+    }
+}
+
+// '(' parlist ')' block END
+fn par_function_body(cx: *mut CompileState, e: *mut CgExp, ismethod: bool, line: i32) -> void!Throw {
+    unsafe {
+        nfs := par_fresh_fs()
+        bl := par_fresh_scope()
+        let pfs = ptr.from_mut(&mut nfs)
+        nfs.f = par_new_child(cx)?
+        (*nfs.f).linedefined = line
+        par_begin_function(cx, pfs, ptr.from_mut(&mut bl))
+        par_expect(cx, 40)?
+        if ismethod {
+            par_declare_local(cx, (*cx).name_self)?
+            par_activate_locals(cx, 1)?
+        }
+        par_params(cx)?
+        par_expect(cx, 41)?
+        par_statements(cx)?
+        (*nfs.f).lastlinedefined = (*cx).line
+        par_expect_closing(cx, TK_END, TK_FUNCTION, line)?
+        par_emit_closure(cx, e)?
+        return par_end_function(cx)
+    }
+}
+
+fn par_fresh_fs() -> FnState {
+    unsafe {
+        return FnState {
+            f: 0 as *mut Proto, prev: 0 as *mut FnState, cx: 0 as *mut CompileState, scope: 0 as *mut ParScope,
+            pc: 0, last_target: 0, prevline: 0, nk: 0, np: 0, nabs: 0, first_local: 0, first_label: 0,
+            ndebug: 0, nactvar: 0, nups: 0, free_reg: 0, since_abs: 0, need_close: false,
+        }
+    }
+}
+
+fn par_fresh_scope() -> ParScope {
+    unsafe {
+        return ParScope {
+            previous: 0 as *mut ParScope, first_label: 0, first_goto: 0, nactvar: 0,
+            upval: false, is_loop: false, in_tbc: false,
+        }
+    }
+}
+
+// expr { ',' expr }; returns the number of expressions.
+fn par_expr_list(cx: *mut CompileState, v: *mut CgExp) -> i32!Throw {
+    n := 1i32
+    par_expr(cx, v)?
+    for par_accept(cx, 44)? {
+        cg_to_nextreg(par_fs(cx), v)?
+        par_expr(cx, v)?
+        n = n + 1
+    }
+    return ok(n)
+}
+
+fn par_call_args(cx: *mut CompileState, f: *mut CgExp) -> void!Throw {
+    unsafe {
+        let fs = par_fs(cx)
+        args := ex_blank()
+        let pargs = ptr.from_mut(&mut args)
+        let line = (*cx).line
+        let t = par_tk(cx)
+        if t == 40 {
+            lex_next(cx)?
+            if par_tk(cx) == 41 {
+                args.k = EK_VOID
+            } else {
+                par_expr_list(cx, pargs)?
+                if ex_multret(args.k) {
+                    cg_set_allresults(fs, pargs)?
+                }
+            }
+            par_expect_closing(cx, 41, 40, line)?
+        } else if t == 123 {
+            par_table(cx, pargs)?
+        } else if t == TK_STRING {
+            ex_string(pargs, (*cx).tk_s)
+            lex_next(cx)?
+        } else {
+            return err(lex_error_here(cx, "function arguments expected"))
+        }
+        let base = (*f).info
+        nparams := 0i32
+        if ex_multret(args.k) {
+            nparams = CG_MULTRET
+        } else {
+            if args.k != EK_VOID {
+                cg_to_nextreg(fs, pargs)?
+            }
+            nparams = (*fs).free_reg - (base + 1)
+        }
+        let pc = cg_emit_abc(fs, OP_CALL, base, nparams + 1, 2)?
+        ex_init(f, EK_CALL, pc)
+        cg_line_fix(fs, line)?
+        (*fs).free_reg = base + 1
+        return ok()
+    }
+}
+
+// NAME | '(' expr ')'
+fn par_primary(cx: *mut CompileState, v: *mut CgExp) -> void!Throw {
+    unsafe {
+        let t = par_tk(cx)
+        if t == 40 {
+            let line = (*cx).line
+            lex_next(cx)?
+            par_expr(cx, v)?
+            par_expect_closing(cx, 41, 40, line)?
+            return cg_read_var(par_fs(cx), v)
+        }
+        if t == TK_NAME {
+            return par_name_ref(cx, v)
+        }
+        return err(lex_error_here(cx, "unexpected symbol"))
+    }
+}
+
+// primaryexp { '.' NAME | '[' exp ']' | ':' NAME funcargs | funcargs }
+fn par_suffixed(cx: *mut CompileState, v: *mut CgExp) -> void!Throw {
+    unsafe {
+        let fs = par_fs(cx)
+        par_primary(cx, v)?
+        for {
+            let t = par_tk(cx)
+            if t == 46 {
+                par_dot_key(cx, v)?
+            } else if t == 91 {
+                key := ex_blank()
+                cg_to_reg_or_upval(fs, v)?
+                par_bracket_key(cx, ptr.from_mut(&mut key))?
+                cg_index(fs, v, ptr.from_mut(&mut key))?
+            } else if t == 58 {
+                key := ex_blank()
+                lex_next(cx)?
+                par_name_exp(cx, ptr.from_mut(&mut key))?
+                cg_method(fs, v, ptr.from_mut(&mut key))?
+                par_call_args(cx, v)?
+            } else if t == 40 || t == TK_STRING || t == 123 {
+                cg_to_nextreg(fs, v)?
+                par_call_args(cx, v)?
+            } else {
+                return ok()
+            }
+        }
+    }
+}
+
+fn par_simple(cx: *mut CompileState, v: *mut CgExp) -> void!Throw {
+    unsafe {
+        let t = par_tk(cx)
+        if t == TK_FLT {
+            ex_init(v, EK_KFLT, 0)
+            (*v).nval = (*cx).tk_f
+        } else if t == TK_INT {
+            ex_init(v, EK_KINT, 0)
+            (*v).ival = (*cx).tk_i
+        } else if t == TK_STRING {
+            ex_string(v, (*cx).tk_s)
+        } else if t == TK_NIL {
+            ex_init(v, EK_NIL, 0)
+        } else if t == TK_TRUE {
+            ex_init(v, EK_TRUE, 0)
+        } else if t == TK_FALSE {
+            ex_init(v, EK_FALSE, 0)
+        } else if t == TK_DOTS {
+            let fs = par_fs(cx)
+            if (*(*fs).f).is_vararg == 0 {
+                return err(lex_error_here(cx, "cannot use '...' outside a vararg function"))
+            }
+            let pc = cg_emit_abc(fs, OP_VARARG, 0, 0, 1)?
+            ex_init(v, EK_VARARG, pc)
+        } else if t == 123 {
+            return par_table(cx, v)
+        } else if t == TK_FUNCTION {
+            lex_next(cx)?
+            return par_function_body(cx, v, false, (*cx).line)
+        } else {
+            return par_suffixed(cx, v)
+        }
+        return lex_next(cx)
+    }
+}
+
+fn par_unary_op(t: i32) -> i32 {
+    if t == TK_NOT {
+        return UOPR_NOT
+    }
+    if t == 45 {
+        return UOPR_MINUS
+    }
+    if t == 126 {
+        return UOPR_BNOT
+    }
+    if t == 35 {
+        return UOPR_LEN
+    }
+    return UOPR_NONE
+}
+
+fn par_binary_op(t: i32) -> i32 {
+    if t < 128 {
+        if t == 43 {
+            return OPR_ADD
+        }
+        if t == 45 {
+            return OPR_SUB
+        }
+        if t == 42 {
+            return OPR_MUL
+        }
+        if t == 37 {
+            return OPR_MOD
+        }
+        if t == 94 {
+            return OPR_POW
+        }
+        if t == 47 {
+            return OPR_DIV
+        }
+        if t == 38 {
+            return OPR_BAND
+        }
+        if t == 124 {
+            return OPR_BOR
+        }
+        if t == 126 {
+            return OPR_BXOR
+        }
+        if t == 60 {
+            return OPR_LT
+        }
+        if t == 62 {
+            return OPR_GT
+        }
+        return OPR_NONE
+    }
+    if t == TK_IDIV {
+        return OPR_IDIV
+    }
+    if t == TK_SHL {
+        return OPR_SHL
+    }
+    if t == TK_SHR {
+        return OPR_SHR
+    }
+    if t == TK_CONCAT {
+        return OPR_CONCAT
+    }
+    if t == TK_NE {
+        return OPR_NE
+    }
+    if t == TK_EQ {
+        return OPR_EQ
+    }
+    if t == TK_LE {
+        return OPR_LE
+    }
+    if t == TK_GE {
+        return OPR_GE
+    }
+    if t == TK_AND {
+        return OPR_AND
+    }
+    if t == TK_OR {
+        return OPR_OR
+    }
+    return OPR_NONE
+}
+
+// Binding powers (left, right) of the binary operators, indexed by OPR_*.
+// '..' and '^' bind tighter on the left: they are right associative.
+const PAR_LEFT_PRI: [21]i32 = [10, 10, 11, 11, 14, 11, 11, 6, 4, 5, 7, 7, 9, 3, 3, 3, 3, 3, 3, 2, 1]
+const PAR_RIGHT_PRI: [21]i32 = [10, 10, 11, 11, 13, 11, 11, 6, 4, 5, 7, 7, 8, 3, 3, 3, 3, 3, 3, 2, 1]
+const PAR_UNARY_PRI: i32 = 12
+
+// (simpleexp | unop subexpr) { binop subexpr }, consuming binary operators
+// that bind tighter than `limit`; returns the first operator left over.
+fn par_operand_chain(cx: *mut CompileState, v: *mut CgExp, limit: i32) -> i32!Throw {
+    unsafe {
+        par_nest(cx)?
+        let uop = par_unary_op(par_tk(cx))
+        if uop != UOPR_NONE {
+            let line = (*cx).line
+            lex_next(cx)?
+            par_operand_chain(cx, v, PAR_UNARY_PRI)?
+            cg_unary(par_fs(cx), uop, v, line)?
+        } else {
+            par_simple(cx, v)?
+        }
+        op := par_binary_op(par_tk(cx))
+        for op != OPR_NONE && PAR_LEFT_PRI[op as usize] > limit {
+            v2 := ex_blank()
+            let line = (*cx).line
+            lex_next(cx)?
+            cg_binary_left(par_fs(cx), op, v)?
+            let nextop = par_operand_chain(cx, ptr.from_mut(&mut v2), PAR_RIGHT_PRI[op as usize])?
+            cg_binary(par_fs(cx), op, v, ptr.from_mut(&mut v2), line)?
+            op = nextop
+        }
+        par_unnest(cx)
+        return ok(op)
+    }
+}
+
+fn par_expr(cx: *mut CompileState, v: *mut CgExp) -> void!Throw {
+    par_operand_chain(cx, v, 0)?
+    return ok()
+}
+
+// --- Grammar: statements -------------------------------------------------------------
+
+fn par_block(cx: *mut CompileState) -> void!Throw {
+    unsafe {
+        let fs = par_fs(cx)
+        bl := par_fresh_scope()
+        par_open_scope(fs, ptr.from_mut(&mut bl), false)
+        par_statements(cx)?
+        return par_close_scope(fs)
+    }
+}
+
+fn par_lhs_v(l: *mut ParLhs) -> *mut CgExp {
+    unsafe {
+        return ptr.offset(l as *mut u8, mem.offset_of::<ParLhs>("v") as isize) as *mut CgExp
+    }
+}
+
+// In a multiple assignment, a local/upvalue assigned now may be the table
+// or key of an earlier indexed target: those targets then use a copy of
+// its old value, saved in a fresh register.
+fn par_protect_targets(cx: *mut CompileState, start: *mut ParLhs, v: *mut CgExp) -> void!Throw {
+    unsafe {
+        let fs = par_fs(cx)
+        let extra = (*fs).free_reg
+        conflict := false
+        lh := start
+        for !ptr.is_null(lh) {
+            let lv = par_lhs_v(lh)
+            let k = (*lv).k
+            if k >= EK_INDEXED && k <= EK_INDEXSTR {
+                if k == EK_INDEXUP {
+                    if (*v).k == EK_UPVAL && (*lv).tab == (*v).info {
+                        conflict = true
+                        (*lv).k = EK_INDEXSTR
+                        (*lv).tab = extra
+                    }
+                } else {
+                    if (*v).k == EK_LOCAL && (*lv).tab == (*v).ridx {
+                        conflict = true
+                        (*lv).tab = extra
+                    }
+                    if k == EK_INDEXED && (*v).k == EK_LOCAL && (*lv).key == (*v).ridx {
+                        conflict = true
+                        (*lv).key = extra
+                    }
+                }
+            }
+            lh = (*lh).prev
+        }
+        if conflict {
+            if (*v).k == EK_LOCAL {
+                cg_emit_abc(fs, OP_MOVE, extra, (*v).ridx, 0)?
+            } else {
+                cg_emit_abc(fs, OP_GETUPVAL, extra, (*v).info, 0)?
+            }
+            cg_alloc_regs(fs, 1)?
+        }
+        return ok()
+    }
+}
+
+// Error if `e` is a read-only variable.
+fn par_check_writable(cx: *mut CompileState, e: *mut CgExp) -> void!Throw {
+    unsafe {
+        let fs = par_fs(cx)
+        varname := 0 as *mut LString
+        let k = (*e).k
+        if k == EK_CONST {
+            varname = (*ptr.offset((*cx).actvar, (*e).info as isize)).name
+        } else if k == EK_LOCAL {
+            let vd = par_var(fs, (*e).vidx)
+            if (*vd).kind != PVK_REGULAR {
+                varname = (*vd).name
+            }
+        } else if k == EK_UPVAL {
+            let up = ptr.offset((*(*fs).f).upvalues, (*e).info as isize)
+            if (*up).kind != PVK_REGULAR {
+                varname = (*up).name
+            }
+        } else {
+            return ok()
+        }
+        if !ptr.is_null(varname) {
+            m := lmsg_new((*cx).L)
+            let pm = ptr.from_mut(&mut m)
+            lmsg_begin(cx, pm)
+            lmsg_str(pm, "attempt to assign to const variable '")
+            lmsg_lstr(pm, varname)
+            lmsg_str(pm, "'")
+            return err(lmsg_raise(cx, pm, 0))
+        }
+        return ok()
+    }
+}
+
+// restassign -> ',' suffixedexp restassign | '=' explist
+fn par_assign_rest(cx: *mut CompileState, lh: *mut ParLhs, nvars: i32) -> void!Throw {
+    unsafe {
+        e := ex_blank()
+        let pe = ptr.from_mut(&mut e)
+        let lv = par_lhs_v(lh)
+        if !((*lv).k >= EK_LOCAL && (*lv).k <= EK_INDEXSTR) {
+            return err(lex_error_here(cx, "syntax error"))
+        }
+        par_check_writable(cx, lv)?
+        if par_accept(cx, 44)? {
+            nv := ParLhs { prev: lh, v: ex_blank() }
+            let pnv = ptr.from_mut(&mut nv)
+            par_suffixed(cx, par_lhs_v(pnv))?
+            let nk = (*par_lhs_v(pnv)).k
+            if !(nk >= EK_INDEXED && nk <= EK_INDEXSTR) {
+                par_protect_targets(cx, lh, par_lhs_v(pnv))?
+            }
+            par_nest(cx)?
+            par_assign_rest(cx, pnv, nvars + 1)?
+            par_unnest(cx)
+        } else {
+            par_expect(cx, 61)?
+            let nexps = par_expr_list(cx, pe)?
+            if nexps != nvars {
+                par_fit_values(cx, nvars, nexps, pe)?
+            } else {
+                cg_single_result(par_fs(cx), pe)
+                return cg_store(par_fs(cx), lv, pe)
+            }
+        }
+        ex_init(pe, EK_FIXED, (*par_fs(cx)).free_reg - 1)
+        return cg_store(par_fs(cx), lv, pe)
+    }
+}
+
+// A condition: returns the jump list taken when it is false.
+fn par_condition(cx: *mut CompileState) -> i32!Throw {
+    unsafe {
+        v := ex_blank()
+        par_expr(cx, ptr.from_mut(&mut v))?
+        unsafe {
+            if v.k == EK_NIL {
+                v.k = EK_FALSE
+            }
+        }
+        cg_cond_true(par_fs(cx), ptr.from_mut(&mut v))?
+        return ok(v.f)
+    }
+}
+
+fn par_goto(cx: *mut CompileState) -> void!Throw {
+    unsafe {
+        let fs = par_fs(cx)
+        let line = (*cx).line
+        let name = par_name(cx)?
+        let lb = par_find_label(cx, name)
+        if ptr.is_null(lb) {
+            let j = cg_emit_jump(fs)?
+            par_add_goto(cx, name, line, j)?
+        } else {
+            let lblevel = par_reg_level(fs, (*lb).nactvar)
+            if par_regs_in_use(fs) > lblevel {
+                cg_emit_abc(fs, OP_CLOSE, lblevel, 0, 0)?
+            }
+            let j = cg_emit_jump(fs)?
+            cg_jumps_to(fs, j, (*lb).pc)?
+        }
+        return ok()
+    }
+}
+
+fn par_break(cx: *mut CompileState) -> void!Throw {
+    unsafe {
+        let line = (*cx).line
+        lex_next(cx)?
+        let j = cg_emit_jump(par_fs(cx))?
+        par_add_goto(cx, (*cx).name_break, line, j)?
+        return ok()
+    }
+}
+
+fn par_check_label_unique(cx: *mut CompileState, name: *mut LString) -> void!Throw {
+    unsafe {
+        let lb = par_find_label(cx, name)
+        if !ptr.is_null(lb) {
+            m := lmsg_new((*cx).L)
+            let pm = ptr.from_mut(&mut m)
+            lmsg_begin(cx, pm)
+            lmsg_str(pm, "label '")
+            lmsg_lstr(pm, name)
+            lmsg_str(pm, "' already defined on line ")
+            lmsg_int(pm, (*lb).line as i64)
+            return err(lmsg_raise(cx, pm, 0))
+        }
+        return ok()
+    }
+}
+
+// '::' NAME '::'
+fn par_label(cx: *mut CompileState, name: *mut LString, line: i32) -> void!Throw {
+    par_expect(cx, TK_DBCOLON)?
+    for par_tk(cx) == 59 || par_tk(cx) == TK_DBCOLON {
+        par_stmt(cx)?
+    }
+    par_check_label_unique(cx, name)?
+    par_define_label(cx, name, line, par_block_ends(cx, false))?
+    return ok()
+}
+
+// WHILE cond DO block END
+fn par_while(cx: *mut CompileState, line: i32) -> void!Throw {
+    unsafe {
+        let fs = par_fs(cx)
+        bl := par_fresh_scope()
+        lex_next(cx)?
+        let whileinit = cg_mark_target(fs)
+        let condexit = par_condition(cx)?
+        par_open_scope(fs, ptr.from_mut(&mut bl), true)
+        par_expect(cx, TK_DO)?
+        par_block(cx)?
+        cg_jump_back(fs, whileinit)?
+        par_expect_closing(cx, TK_END, TK_WHILE, line)?
+        par_close_scope(fs)?
+        return cg_jumps_here(fs, condexit)
+    }
+}
+
+// REPEAT block UNTIL cond; the condition sees the block's locals.
+fn par_repeat(cx: *mut CompileState, line: i32) -> void!Throw {
+    unsafe {
+        let fs = par_fs(cx)
+        let repeat_init = cg_mark_target(fs)
+        bl1 := par_fresh_scope()
+        bl2 := par_fresh_scope()
+        par_open_scope(fs, ptr.from_mut(&mut bl1), true)
+        par_open_scope(fs, ptr.from_mut(&mut bl2), false)
+        lex_next(cx)?
+        par_statements(cx)?
+        par_expect_closing(cx, TK_UNTIL, TK_REPEAT, line)?
+        condexit := par_condition(cx)?
+        par_close_scope(fs)?
+        if bl2.upval {
+            let exit = cg_emit_jump(fs)?
+            cg_jumps_here(fs, condexit)?
+            cg_emit_abc(fs, OP_CLOSE, par_reg_level(fs, bl2.nactvar), 0, 0)?
+            condexit = cg_emit_jump(fs)?
+            cg_jumps_here(fs, exit)?
+        }
+        cg_jumps_to(fs, condexit, repeat_init)?
+        return par_close_scope(fs)
+    }
+}
+
+// An expression into the next register.
+fn par_expr_to_reg(cx: *mut CompileState) -> void!Throw {
+    unsafe {
+        e := ex_blank()
+        par_expr(cx, ptr.from_mut(&mut e))?
+        return cg_to_nextreg(par_fs(cx), ptr.from_mut(&mut e))
+    }
+}
+
+// Set the Bx distance of the loop instruction at `pc` to reach `dest`.
+fn par_set_loop_jump(fs: *mut FnState, pc: i32, dest: i32, back: bool) -> void!Throw {
+    unsafe {
+        let p = cg_instr(fs, pc)
+        off := dest - (pc + 1)
+        if back {
+            off = -off
+        }
+        if off > MAXARG_BX {
+            return err(lex_error_here((*fs).cx, "control structure too long"))
+        }
+        *p = set_arg_bx(*p, off)
+        return ok()
+    }
+}
+
+// DO block, between the loop's prepare and loop instructions.
+fn par_loop_body(cx: *mut CompileState, base: i32, line: i32, nvars: i32, isgen: bool) -> void!Throw {
+    unsafe {
+        let fs = par_fs(cx)
+        bl := par_fresh_scope()
+        par_expect(cx, TK_DO)?
+        let prep = cg_emit_abx(fs, if isgen {
+            OP_TFORPREP
+        } else {
+            OP_FORPREP
+        }, base, 0)?
+        par_open_scope(fs, ptr.from_mut(&mut bl), false)
+        par_activate_locals(cx, nvars)?
+        cg_alloc_regs(fs, nvars)?
+        par_block(cx)?
+        par_close_scope(fs)?
+        par_set_loop_jump(fs, prep, cg_mark_target(fs), false)?
+        if isgen {
+            cg_emit_abc(fs, OP_TFORCALL, base, 0, nvars)?
+            cg_line_fix(fs, line)?
+        }
+        let endfor = cg_emit_abx(fs, if isgen {
+            OP_TFORLOOP
+        } else {
+            OP_FORLOOP
+        }, base, 0)?
+        par_set_loop_jump(fs, endfor, prep + 1, true)?
+        return cg_line_fix(fs, line)
+    }
+}
+
+// NAME '=' exp ',' exp [',' exp] forbody
+fn par_numeric_for(cx: *mut CompileState, varname: *mut LString, line: i32) -> void!Throw {
+    unsafe {
+        let fs = par_fs(cx)
+        let base = (*fs).free_reg
+        par_declare_local(cx, (*cx).name_forstate)?
+        par_declare_local(cx, (*cx).name_forstate)?
+        par_declare_local(cx, (*cx).name_forstate)?
+        par_declare_local(cx, varname)?
+        par_expect(cx, 61)?
+        par_expr_to_reg(cx)?
+        par_expect(cx, 44)?
+        par_expr_to_reg(cx)?
+        if par_accept(cx, 44)? {
+            par_expr_to_reg(cx)?
+        } else {
+            cg_load_int(fs, (*fs).free_reg, 1)?
+            cg_alloc_regs(fs, 1)?
+        }
+        par_activate_locals(cx, 3)?
+        return par_loop_body(cx, base, line, 1, false)
+    }
+}
+
+// NAME {',' NAME} IN explist forbody
+fn par_generic_for(cx: *mut CompileState, indexname: *mut LString) -> void!Throw {
+    unsafe {
+        let fs = par_fs(cx)
+        e := ex_blank()
+        nvars := 5i32
+        let base = (*fs).free_reg
+        par_declare_local(cx, (*cx).name_forstate)?
+        par_declare_local(cx, (*cx).name_forstate)?
+        par_declare_local(cx, (*cx).name_forstate)?
+        par_declare_local(cx, (*cx).name_forstate)?
+        par_declare_local(cx, indexname)?
+        for par_accept(cx, 44)? {
+            let n = par_name(cx)?
+            par_declare_local(cx, n)?
+            nvars = nvars + 1
+        }
+        par_expect(cx, TK_IN)?
+        let line = (*cx).line
+        let nexps = par_expr_list(cx, ptr.from_mut(&mut e))?
+        par_fit_values(cx, 4, nexps, ptr.from_mut(&mut e))?
+        par_activate_locals(cx, 4)?
+        par_mark_tbc(fs)
+        cg_need_regs(fs, 3)?
+        return par_loop_body(cx, base, line, nvars - 4, true)
+    }
+}
+
+fn par_for(cx: *mut CompileState, line: i32) -> void!Throw {
+    unsafe {
+        let fs = par_fs(cx)
+        bl := par_fresh_scope()
+        par_open_scope(fs, ptr.from_mut(&mut bl), true)
+        lex_next(cx)?
+        let varname = par_name(cx)?
+        let t = par_tk(cx)
+        if t == 61 {
+            par_numeric_for(cx, varname, line)?
+        } else if t == 44 || t == TK_IN {
+            par_generic_for(cx, varname)?
+        } else {
+            return err(lex_error_here(cx, "'=' or 'in' expected"))
+        }
+        par_expect_closing(cx, TK_END, TK_FOR, line)?
+        return par_close_scope(fs)
+    }
+}
+
+// [IF | ELSEIF] cond THEN block
+fn par_if_arm(cx: *mut CompileState, escapelist: i32) -> i32!Throw {
+    unsafe {
+        let fs = par_fs(cx)
+        bl := par_fresh_scope()
+        let pbl = ptr.from_mut(&mut bl)
+        v := ex_blank()
+        let pv = ptr.from_mut(&mut v)
+        jf := CG_NO_JUMP
+        esc := escapelist
+        lex_next(cx)?
+        par_expr(cx, pv)?
+        par_expect(cx, TK_THEN)?
+        if par_tk(cx) == TK_BREAK {
+            // 'if cond then break': jump out when the condition holds.
+            let line = (*cx).line
+            cg_cond_false(fs, pv)?
+            lex_next(cx)?
+            par_open_scope(fs, pbl, false)
+            par_add_goto(cx, (*cx).name_break, line, v.t)?
+            for par_accept(cx, 59)? {
+            }
+            if par_block_ends(cx, false) {
+                par_close_scope(fs)?
+                return ok(esc)
+            }
+            jf = cg_emit_jump(fs)?
+        } else {
+            cg_cond_true(fs, pv)?
+            par_open_scope(fs, pbl, false)
+            jf = v.f
+        }
+        par_statements(cx)?
+        par_close_scope(fs)?
+        if par_tk(cx) == TK_ELSE || par_tk(cx) == TK_ELSEIF {
+            let j = cg_emit_jump(fs)?
+            esc = cg_join_lists(fs, esc, j)?
+        }
+        cg_jumps_here(fs, jf)?
+        return ok(esc)
+    }
+}
+
+// IF cond THEN block {ELSEIF cond THEN block} [ELSE block] END
+fn par_if(cx: *mut CompileState, line: i32) -> void!Throw {
+    let fs = par_fs(cx)
+    escapelist := par_if_arm(cx, CG_NO_JUMP)?
+    for par_tk(cx) == TK_ELSEIF {
+        escapelist = par_if_arm(cx, escapelist)?
+    }
+    if par_accept(cx, TK_ELSE)? {
+        par_block(cx)?
+    }
+    par_expect_closing(cx, TK_END, TK_IF, line)?
+    return cg_jumps_here(fs, escapelist)
+}
+
+fn par_local_function(cx: *mut CompileState) -> void!Throw {
+    unsafe {
+        b := ex_blank()
+        let fs = par_fs(cx)
+        let fvar = (*fs).nactvar
+        let name = par_name(cx)?
+        par_declare_local(cx, name)?
+        par_activate_locals(cx, 1)?
+        par_function_body(cx, ptr.from_mut(&mut b), false, (*cx).line)?
+        // The debug information sees the variable only after the closure.
+        (*par_local_debug(fs, fvar)).startpc = (*fs).pc
+        return ok()
+    }
+}
+
+// ['<' NAME '>']
+fn par_attribute(cx: *mut CompileState) -> u8!Throw {
+    unsafe {
+        if par_accept(cx, 60)? {
+            let attr = par_name(cx)?
+            par_expect(cx, 62)?
+            if lx_str_is(attr, "const") {
+                return ok(PVK_READONLY)
+            }
+            if lx_str_is(attr, "close") {
+                return ok(PVK_TOCLOSE)
+            }
+            m := lmsg_new((*cx).L)
+            let pm = ptr.from_mut(&mut m)
+            lmsg_begin(cx, pm)
+            lmsg_str(pm, "unknown attribute '")
+            lmsg_lstr(pm, attr)
+            lmsg_str(pm, "'")
+            return err(lmsg_raise(cx, pm, 0))
+        }
+        return ok(PVK_REGULAR)
+    }
+}
+
+fn lx_str_is(s: *mut LString, text: &str) -> bool {
+    unsafe {
+        let b = mem.str_bytes(text)
+        if str_len(s) != b.len {
+            return false
+        }
+        let d = str_data(s)
+        for i in 0usize..b.len {
+            if *ptr.offset(d, i as isize) != b[i] {
+                return false
+            }
+        }
+        return true
+    }
+}
+
+fn par_open_tbc(fs: *mut FnState, level: i32) -> void!Throw {
+    if level != -1 {
+        par_mark_tbc(fs)
+        cg_emit_abc(fs, OP_TBC, par_reg_level(fs, level), 0, 0)?
+    }
+    return ok()
+}
+
+// LOCAL NAME ATTRIB { ',' NAME ATTRIB } ['=' explist]
+fn par_local(cx: *mut CompileState) -> void!Throw {
+    unsafe {
+        let fs = par_fs(cx)
+        toclose := -1i32
+        vidx := 0i32
+        nvars := 0i32
+        nexps := 0i32
+        e := ex_blank()
+        let pe = ptr.from_mut(&mut e)
+        for {
+            let name = par_name(cx)?
+            vidx = par_declare_local(cx, name)?
+            let kind = par_attribute(cx)?
+            (*par_var(fs, vidx)).kind = kind
+            if kind == PVK_TOCLOSE {
+                if toclose != -1 {
+                    return err(lex_semerror(cx, "multiple to-be-closed variables in local list"))
+                }
+                toclose = (*fs).nactvar + nvars
+            }
+            nvars = nvars + 1
+            if !par_accept(cx, 44)? {
+                break
+            }
+        }
+        if par_accept(cx, 61)? {
+            nexps = par_expr_list(cx, pe)?
+        } else {
+            e.k = EK_VOID
+            nexps = 0
+        }
+        let var = par_var(fs, vidx)
+        if nvars == nexps && (*var).kind == PVK_READONLY && cg_const_value(fs, pe, var as *mut Value) {
+            (*var).kind = PVK_COMPILETIME
+            par_activate_locals(cx, nvars - 1)?
+            (*fs).nactvar = (*fs).nactvar + 1
+        } else {
+            par_fit_values(cx, nvars, nexps, pe)?
+            par_activate_locals(cx, nvars)?
+        }
+        return par_open_tbc(fs, toclose)
+    }
+}
+
+// NAME {fieldsel} [':' NAME]; true for a method.
+fn par_function_name(cx: *mut CompileState, v: *mut CgExp) -> bool!Throw {
+    ismethod := false
+    par_name_ref(cx, v)?
+    for par_tk(cx) == 46 {
+        par_dot_key(cx, v)?
+    }
+    if par_tk(cx) == 58 {
+        ismethod = true
+        par_dot_key(cx, v)?
+    }
+    return ok(ismethod)
+}
+
+// FUNCTION funcname body
+fn par_function_stmt(cx: *mut CompileState, line: i32) -> void!Throw {
+    unsafe {
+        v := ex_blank()
+        b := ex_blank()
+        lex_next(cx)?
+        let ismethod = par_function_name(cx, ptr.from_mut(&mut v))?
+        par_function_body(cx, ptr.from_mut(&mut b), ismethod, line)?
+        par_check_writable(cx, ptr.from_mut(&mut v))?
+        cg_store(par_fs(cx), ptr.from_mut(&mut v), ptr.from_mut(&mut b))?
+        // The definition "happens" in the first line.
+        return cg_line_fix(par_fs(cx), line)
+    }
+}
+
+// A call statement or an assignment.
+fn par_call_or_assign(cx: *mut CompileState) -> void!Throw {
+    unsafe {
+        let fs = par_fs(cx)
+        v := ParLhs { prev: 0 as *mut ParLhs, v: ex_blank() }
+        let pv = ptr.from_mut(&mut v)
+        par_suffixed(cx, par_lhs_v(pv))?
+        if par_tk(cx) == 61 || par_tk(cx) == 44 {
+            return par_assign_rest(cx, pv, 1)
+        }
+        if (*par_lhs_v(pv)).k != EK_CALL {
+            return err(lex_error_here(cx, "syntax error"))
+        }
+        let p = cg_instr(fs, (*par_lhs_v(pv)).info)
+        *p = set_arg_c(*p, 1)
+        return ok()
+    }
+}
+
+// RETURN [explist] [';']
+fn par_return(cx: *mut CompileState) -> void!Throw {
+    unsafe {
+        let fs = par_fs(cx)
+        e := ex_blank()
+        let pe = ptr.from_mut(&mut e)
+        nret := 0i32
+        first := par_regs_in_use(fs)
+        if par_block_ends(cx, true) || par_tk(cx) == 59 {
+            nret = 0
+        } else {
+            nret = par_expr_list(cx, pe)?
+            if ex_multret(e.k) {
+                cg_set_allresults(fs, pe)?
+                if e.k == EK_CALL && nret == 1 && !(*(*fs).scope).in_tbc {
+                    let p = cg_instr(fs, e.info)
+                    *p = (*p & ~127u32) | OP_TAILCALL
+                }
+                nret = CG_MULTRET
+            } else if nret == 1 {
+                first = cg_to_anyreg(fs, pe)?
+            } else {
+                cg_to_nextreg(fs, pe)?
+            }
+        }
+        cg_return(fs, first, nret)?
+        par_accept(cx, 59)?
+        return ok()
+    }
+}
+
+fn par_stmt(cx: *mut CompileState) -> void!Throw {
+    unsafe {
+        let line = (*cx).line
+        par_nest(cx)?
+        let t = par_tk(cx)
+        if t == 59 {
+            lex_next(cx)?
+        } else if t == TK_IF {
+            par_if(cx, line)?
+        } else if t == TK_WHILE {
+            par_while(cx, line)?
+        } else if t == TK_DO {
+            lex_next(cx)?
+            par_block(cx)?
+            par_expect_closing(cx, TK_END, TK_DO, line)?
+        } else if t == TK_FOR {
+            par_for(cx, line)?
+        } else if t == TK_REPEAT {
+            par_repeat(cx, line)?
+        } else if t == TK_FUNCTION {
+            par_function_stmt(cx, line)?
+        } else if t == TK_LOCAL {
+            lex_next(cx)?
+            if par_accept(cx, TK_FUNCTION)? {
+                par_local_function(cx)?
+            } else {
+                par_local(cx)?
+            }
+        } else if t == TK_DBCOLON {
+            lex_next(cx)?
+            let name = par_name(cx)?
+            par_label(cx, name, line)?
+        } else if t == TK_RETURN {
+            lex_next(cx)?
+            par_return(cx)?
+        } else if t == TK_BREAK {
+            par_break(cx)?
+        } else if t == TK_GOTO {
+            lex_next(cx)?
+            par_goto(cx)?
+        } else {
+            par_call_or_assign(cx)?
+        }
+        let fs = par_fs(cx)
+        (*fs).free_reg = par_regs_in_use(fs)
+        par_unnest(cx)
+        return ok()
+    }
+}
+
+// The main function: vararg, with the single upvalue _ENV.
+fn par_main(cx: *mut CompileState, fs: *mut FnState) -> void!Throw {
+    unsafe {
+        bl := par_fresh_scope()
+        par_begin_function(cx, fs, ptr.from_mut(&mut bl))
+        par_mark_vararg(fs, 0)?
+        let env = par_new_upvalue_slot(fs)?
+        (*env).instack = 1
+        (*env).index = 0
+        (*env).kind = PVK_REGULAR
+        (*env).name = (*cx).name_env
+        lex_next(cx)?
+        par_statements(cx)?
+        par_require(cx, TK_EOS)?
+        return par_end_function(cx)
+    }
+}
+
+fn par_run(cx: *mut CompileState, main: *mut Proto) -> void!Throw {
+    unsafe {
+        lx_init_names(cx)?
+        lx_advance(cx)
+        fs := par_fresh_fs()
+        fs.f = main
+        return par_main(cx, ptr.from_mut(&mut fs))
+    }
+}
+
+// Compile the text chunk source[0..length] named `chunkname` (see DESIGN.md
+// "Compiler interface"). Every object created is reachable from the
+// returned prototype, apart from unused strings of the scanner.
+fn compile(L: *mut State, source: *mut u8, length: usize, chunkname: *mut LString) -> (*mut Proto)!Throw {
+    unsafe {
+        let size = mem.size_of::<CompileState>()
+        let cx = mem_alloc(L, size)? as *mut CompileState
+        ptr.write_bytes(cx as *mut u8, 0u8, size)
+        (*cx).L = L
+        (*cx).src = source
+        (*cx).srclen = length
+        (*cx).line = 1
+        (*cx).lastline = 1
+        (*cx).ak = TK_EOS
+        (*cx).source = chunkname
+        let r = par_compile_in(cx)
+        par_release(cx)
+        return r
+    }
+}
+
+fn par_compile_in(cx: *mut CompileState) -> (*mut Proto)!Throw {
+    unsafe {
+        let L = (*cx).L
+        (*cx).buf = mem_alloc(L, 256)?
+        (*cx).capbuf = 256
+        let main = proto_new(L)?
+        (*main).source = (*cx).source
+        par_run(cx, main)?
+        return ok(main)
+    }
+}
+
+// Free the compiler's temporary structures.
+fn par_release(cx: *mut CompileState) {
+    unsafe {
+        let L = (*cx).L
+        if (*cx).capbuf != 0 {
+            mem_free(L, (*cx).buf, (*cx).capbuf)
+        }
+        if (*cx).st_cap != 0 {
+            mem_free(L, (*cx).st_slots as *mut u8, (*cx).st_cap * mem.size_of::<LexStr>())
+        }
+        if (*cx).kc_cap != 0 {
+            mem_free(L, (*cx).kc_slots as *mut u8, (*cx).kc_cap * mem.size_of::<CgKSlot>())
+        }
+        if (*cx).capactv != 0 {
+            mem_free(L, (*cx).actvar as *mut u8, ((*cx).capactv as usize) * mem.size_of::<ParVar>())
+        }
+        if (*cx).capgoto != 0 {
+            mem_free(L, (*cx).gotos as *mut u8, ((*cx).capgoto as usize) * mem.size_of::<ParLabel>())
+        }
+        if (*cx).caplabel != 0 {
+            mem_free(L, (*cx).labels as *mut u8, ((*cx).caplabel as usize) * mem.size_of::<ParLabel>())
+        }
+        mem_free(L, cx as *mut u8, mem.size_of::<CompileState>())
+    }
+}

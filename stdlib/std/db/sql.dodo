@@ -1,0 +1,197 @@
+package sql
+
+import "core/mem"
+import "std/db"
+
+// Shared interfaces for SQL drivers. Every SQL driver's connection matches
+// `Conn` structurally, so generic code (`<C: sql.Conn>`, specialized with no
+// overhead) and runtime-selected code (`&mut dyn sql.Conn`) work with any of
+// them. Rows are delivered to a visitor because a method cannot return "some
+// driver's row type"; the row and its borrowed values are valid only during
+// the visitor call.
+
+pub interface Row {
+    // Number of result columns.
+    fn len(&self) -> usize
+    // Column name as written in the statement (or its alias).
+    fn name(&self, index: usize) -> &str
+    // Column value. Text and Bytes borrow the driver's workspace.
+    fn get(&self, index: usize) -> db.Value!db.Error
+}
+
+pub interface RowSink {
+    fn row(&mut self, row: &dyn Row) -> void!db.Error
+}
+
+pub interface Conn {
+    // Runs one statement and returns the number of rows it changed.
+    fn execute(&mut self, sql: &str, params: &[db.Value]) -> u64!db.Error
+    // Runs one statement and passes every result row to `sink`.
+    fn query(&mut self, sql: &str, params: &[db.Value], sink: &mut dyn RowSink) -> void!db.Error
+    fn begin(&mut self, level: db.IsolationLevel) -> void!db.Error
+    fn commit(&mut self) -> void!db.Error
+    fn rollback(&mut self) -> void!db.Error
+}
+
+// Ready-made sinks for the common shapes.
+
+// Counts rows and discards them.
+pub struct Count {
+    pub rows: u64
+
+    pub fn new() -> Count {
+        Count { rows: 0 }
+    }
+
+    pub fn row(&mut self, row: &dyn Row) -> void!db.Error {
+        self.rows += 1
+        ok()
+    }
+}
+
+// Captures the first column of the first row as an integer. NULL leaves
+// `found` false; other non-integer values are a Type error.
+pub struct ScalarInt {
+    pub value: i64
+    pub found: bool
+
+    pub fn new() -> ScalarInt {
+        ScalarInt { value: 0, found: false }
+    }
+
+    pub fn row(&mut self, row: &dyn Row) -> void!db.Error {
+        if self.found || row.len() == 0 {
+            return ok()
+        }
+        match row.get(0)? {
+            db.Value.Null => {},
+            db.Value.Int(v) => {
+                self.value = v
+                self.found = true
+            },
+            _ => {
+                return err(db.Error.new(db.ErrorKind.Type, 20))
+            },
+        }
+        ok()
+    }
+}
+
+// Row decoding helpers. `@derive(Row)` generates `decode_row` methods from
+// these, and hand-written decoders for custom types use the same rules:
+//
+//     struct Point {
+//         x: i32
+//         y: i32
+//
+//         pub fn decode_row<R: sql.Row>(row: &R) -> Self!db.Error {
+//             x := sql.int_in(row.get(sql.column(row, "x", 0)?)?, -2147483648, 2147483647)?
+//             y := sql.int_in(row.get(sql.column(row, "y", 1)?)?, -2147483648, 2147483647)?
+//             ok(Point { x: x as i32, y: y as i32 })
+//         }
+//     }
+
+// Index of the column called `name` (exact, case-sensitive match). `hint` is
+// checked first, so a caller that passes the expected position pays one
+// comparison when the statement lists columns in that order. A missing
+// column is a Schema error.
+pub fn column<R: Row>(row: &R, name: &str, hint: usize) -> usize!db.Error {
+    count := row.len()
+    if hint < count && same_name(row.name(hint), name) {
+        return ok(hint)
+    }
+    for index in 0usize..count {
+        if index != hint && same_name(row.name(index), name) {
+            return ok(index)
+        }
+    }
+    err(db.Error.new(db.ErrorKind.Schema, 0))
+}
+
+fn same_name(left: &str, right: &str) -> bool {
+    a := mem.str_bytes(left)
+    b := mem.str_bytes(right)
+    if a.len != b.len {
+        return false
+    }
+    for index in 0usize..a.len {
+        if a[index] != b[index] {
+            return false
+        }
+    }
+    true
+}
+
+pub fn is_null(value: &db.Value) -> bool {
+    match value {
+        db.Value.Null => true,
+        _ => false,
+    }
+}
+
+fn mismatch() -> db.Error {
+    db.Error.new(db.ErrorKind.Type, 0)
+}
+
+// Integer value; any nonzero integer is true. Other values are Type errors.
+pub fn boolean(value: db.Value) -> bool!db.Error {
+    match value {
+        db.Value.Int(v) => ok(v != 0),
+        _ => err(mismatch()),
+    }
+}
+
+// Integer value. Other values, NULL included, are Type errors.
+pub fn int(value: db.Value) -> i64!db.Error {
+    match value {
+        db.Value.Int(v) => ok(v),
+        _ => err(mismatch()),
+    }
+}
+
+// Integer value within `min..=max`, for narrower integer fields. Values
+// outside the range are Type errors rather than traps.
+pub fn int_in(value: db.Value, min: i64, max: i64) -> i64!db.Error {
+    v := int(value)?
+    if v < min || v > max {
+        return err(mismatch())
+    }
+    ok(v)
+}
+
+// Real value; integers convert. Other values are Type errors.
+pub fn real(value: db.Value) -> f64!db.Error {
+    match value {
+        db.Value.Real(v) => ok(v),
+        db.Value.Int(v) => ok(v as f64),
+        _ => err(mismatch()),
+    }
+}
+
+// Real value that fits an f32. NaN, infinities and out-of-range values are
+// Type errors, because narrowing them would trap.
+pub fn real32(value: db.Value) -> f32!db.Error {
+    v := real(value)?
+    if v != v || v > 3.4028234663852886e38 || v < -3.4028234663852886e38 {
+        return err(mismatch())
+    }
+    ok(v as f32)
+}
+
+// Text value, borrowed from the row. Other values are Type errors.
+pub fn text(value: db.Value) -> &str!db.Error from(value) {
+    match value {
+        db.Value.Text(v) => ok(v),
+        _ => err(mismatch()),
+    }
+}
+
+// Blob value, or the UTF-8 bytes of a text value, borrowed from the row.
+// Other values are Type errors.
+pub fn bytes(value: db.Value) -> &[u8]!db.Error from(value) {
+    match value {
+        db.Value.Bytes(v) => ok(v),
+        db.Value.Text(v) => ok(mem.str_bytes(v)),
+        _ => err(mismatch()),
+    }
+}

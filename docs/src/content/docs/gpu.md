@@ -11,7 +11,9 @@ creates buffers, textures, samplers and pipelines, and a command encoder
 records compute passes, render passes and copies that `submit()` runs in
 order. Every call is checked before it reaches the GPU, and objects stay alive
 until the GPU has finished with them, so safe code cannot make the GPU read
-freed memory or copy outside a buffer.
+freed memory or copy outside a buffer. Shaders can be written once in WGSL,
+frames go to [std/window](window.md) windows through `gpu.Surface`, and the
+CPU runs ahead of the GPU: writing data never waits for it.
 
 It is written in Dodo on top of the raw bindings, which stay available for
 everything it does not cover:
@@ -43,7 +45,8 @@ compute ok
 
 On Linux the first line reads `Vulkan: llvmpipe (LLVM 19.1.7, 128 bits)` or
 similar. Without a usable GPU it prints `NoBackend` and exits 2. The heart of
-the program, with the shader sources left out:
+the program, with the WGSL kernel (see [Shaders in WGSL](#shaders-in-wgsl))
+left out:
 
 ```dodo
 fn run(device: &gpu.Device) -> u32!gpu.Error {
@@ -61,8 +64,8 @@ fn run(device: &gpu.Device) -> u32!gpu.Error {
     x := device.create_buffer_with_data(gpu.f32_bytes(&xs), gpu.BUFFER_STORAGE)?
     y := device.create_buffer_with_data(gpu.f32_bytes(&ys), gpu.BUFFER_STORAGE | gpu.BUFFER_COPY_SRC)?
 
-    // The kernel in each backend's language.
-    source := gpu.ShaderSource { spirv: &SPIRV, msl: MSL, glsl: GLSL }
+    // The kernel, translated from WGSL for every backend.
+    source := kernel()
     bindings := [
         gpu.BindingLayout.uniform_buffer(0, gpu.STAGE_COMPUTE),
         gpu.BindingLayout.read_only_storage_buffer(1, gpu.STAGE_COMPUTE),
@@ -89,8 +92,11 @@ fn run(device: &gpu.Device) -> u32!gpu.Error {
 }
 ```
 
+[`examples/gpu_window.dodo`](https://github.com/Jotrorox/dodo/blob/main/examples/gpu_window.dodo)
+draws a spinning triangle into a [std/window](window.md) window through a
+`gpu.Surface` (see [Surfaces](#surfaces)), and
 [`examples/gpu_triangle.dodo`](https://github.com/Jotrorox/dodo/blob/main/examples/gpu_triangle.dodo)
-draws a spinning triangle and shows it in a [std/window](window.md) window.
+does the same by reading each frame back into the window's canvas.
 
 ## Devices
 
@@ -106,7 +112,13 @@ context for OpenGL. For Metal, run with `MTL_DEBUG_LAYER=1` instead.
 | `device.api()` | `gpu.Api.Vulkan`, `Metal` or `OpenGl`; `gpu.api_name(&api)` names it |
 | `device.name()` | The GPU's name, such as `"Apple M2"` |
 | `device.limits()` | `gpu.Limits`: the largest texture, buffer, binding and workgroup |
-| `device.wait()` | Waits until the GPU has finished everything submitted |
+| `device.wait()` | Waits until the GPU has finished everything submitted, and every write |
+| `device.poll()` | Starts pending writes and destroys dropped objects the GPU is done with |
+
+`gpu.Device.open_for_window(&native, options)` opens a device that can
+present to a window, for a [Surface](#surfaces): `native` comes from
+std/window's `win.native_handle()`. On OpenGL the device then draws with the
+window's own context; Vulkan picks a GPU that can present to the window.
 
 Use a device from the thread that opened it. Everything the device creates
 borrows it, so it outlives its buffers, textures and pipelines; keep those
@@ -132,10 +144,12 @@ and friends let `read_buffer` fill them.
 
 `device.write_buffer(&buffer, offset, bytes)` happens after every submission
 made before it and before every later one, exactly as if it were a command
-of its own: a write never changes what an earlier submission sees.
-`device.read_buffer(&buffer, offset, &mut out)` waits for every submission so
-far and then copies. Both fail with `InvalidInput` when the range does not
-fit or the buffer lacks the usage.
+of its own: a write never changes what an earlier submission sees. It does
+not wait for the GPU: the bytes go into a staging buffer, and the copy runs
+just before the next submission (see [Staging and frames in
+flight](#staging-and-frames-in-flight)). `device.read_buffer(&buffer, offset,
+&mut out)` waits for every submission so far and then copies. Both fail with
+`InvalidInput` when the range does not fit or the buffer lacks the usage.
 
 ## Textures and samplers
 
@@ -159,7 +173,7 @@ Usages are `TEXTURE_COPY_SRC`, `TEXTURE_COPY_DST`, `TEXTURE_SAMPLED`,
 `TEXTURE_STORAGE` and `TEXTURE_RENDER`. Textures start out zero.
 `device.write_texture(&texture, region, bytes, bytes_per_row)` and
 `device.read_texture(&texture, region, &mut out, bytes_per_row)` copy a
-`gpu.Region` of texels, ordered like the buffer calls. Rows are
+`gpu.Region` of texels, ordered and staged like the buffer calls. Rows are
 `bytes_per_row` apart, a multiple of the texel size and at least the width of
 the region; `texture.region()` covers the whole texture and
 `texture.bytes_per_row()` is its tight row size. Rows run top to bottom:
@@ -217,6 +231,63 @@ The same GLSL also compiles for Vulkan, which needs `gl_VertexIndex` where
 OpenGL has `gl_VertexID`; glslangValidator defines `VULKAN` to tell them
 apart.
 
+## Shaders in WGSL
+
+`gpu.wgsl` takes a shader written once in [WGSL](https://www.w3.org/TR/WGSL/)
+and translates it when the program is compiled, into SPIR-V, Metal Shading
+Language and GLSL 4.50, so one source runs on every backend with no tools to
+install:
+
+```dodo
+fn kernels() -> gpu.ShaderSource from(static) {
+    return gpu.wgsl(
+        "@group(0) @binding(0) var<uniform> a: f32;",
+        "@group(0) @binding(1) var<storage, read> x: array<f32>;",
+        "@group(0) @binding(2) var<storage, read_write> y: array<f32>;",
+        "",
+        "@compute @workgroup_size(64)",
+        "fn saxpy(@builtin(global_invocation_id) id: vec3<u32>) {",
+        "    y[id.x] = a * x[id.x] + y[id.x];",
+        "}"
+    )
+}
+```
+
+The arguments are string literals, one or more, joined with line breaks; a
+mistake in the shader is a compile error that points into the literal. The
+result is an ordinary `ShaderSource` whose SPIR-V lives in static storage,
+so it can be bound to a local (`source := gpu.wgsl(...)`) or returned from a
+function declared `from(static)` as above, and passed to pipeline
+descriptors like any other. A module may hold many entry points; pass the
+WGSL function's name as the entry point, the same on every backend.
+
+Bindings use std/gpu's slots:
+
+| WGSL | std/gpu |
+| --- | --- |
+| `@group(0) @binding(n) var<uniform>` | `BindingLayout.uniform_buffer(n, stages)` |
+| `@group(0) @binding(n) var<storage, read_write>` or `var<storage, read>` | `storage_buffer` or `read_only_storage_buffer` |
+| `@group(0) @binding(n) var t: texture_2d<f32>` and `@group(1) @binding(n) var s: sampler` | `sampled_texture(n, stages)`, bound with `set_texture(n, texture, sampler)` |
+| `@group(0) @binding(n) var t: texture_storage_2d<r32uint, write>` | `storage_texture(n, stages, gpu.FORMAT_R32_UINT)` |
+| `@location(l)` input of a `@vertex` function | `VertexAttribute.new(l, format, offset)` |
+
+So samplers sit in `@group(1)`, at the binding of the texture they are read
+with in `@group(0)`; every other resource is in `@group(0)`, at slots 0 to
+15. Different entry points of one module may use the same slot for
+different resources. Clip space and depth are as WGSL defines them, which is
+what std/gpu uses on every backend. The translation is done by
+[naga](https://github.com/gfx-rs/wgpu/tree/trunk/naga), and refuses what
+some backend cannot run as std/gpu drives it:
+
+- `arrayLength` (Metal would need buffer sizes std/gpu does not pass): put
+  the length in a uniform buffer.
+- Immediate data (push constants): use a uniform buffer.
+- Entry point names Metal reserves, such as `main`, and names that are not
+  ASCII identifiers.
+
+A compiler built without its default `wgsl` feature reports `gpu.wgsl` calls
+as errors; `ShaderSource` with hand-written languages keeps working.
+
 ## Pipelines
 
 ```dodo
@@ -272,7 +343,105 @@ multiples of `gpu.BINDING_ALIGNMENT` (256).
 
 Dropping an encoder without submitting discards its commands, except on
 OpenGL, which has no command buffers: there commands run as they are
-recorded, and `submit()` only flushes them.
+recorded, and `submit()` only flushes them. For the same reason, a write
+made on OpenGL while an encoder is open lands after the commands that
+encoder recorded so far, not before all of them.
+
+## Surfaces
+
+A `gpu.Surface` shows frames in a [std/window](window.md) window opened
+with `window.Options.gpu`, which has no pixel buffer of its own. Each frame,
+`acquire()` an image, render into `frame.texture()` and `present()` it:
+
+```dodo
+native := win.native_handle()!
+device := gpu.Device.open_for_window(&native, gpu.Options.default())?
+surface := gpu.Surface.create(&device, &native, win.width(), win.height())?
+// Pipelines drawing into it use surface.format().
+// ... for every window.Event.Frame:
+frame := surface.acquire()?
+encoder := device.encoder()?
+{
+    pass := encoder.render_pass(gpu.ColorAttachment.clear(frame.texture(), 0.0, 0.0, 0.0, 1.0))
+    // set_pipeline, draw, ...
+}
+encoder.submit()?
+frame.present()?
+// ... and for every window.Event.Resize:
+surface.resize(win.width(), win.height())?
+```
+
+The images have an 8-bit sRGB format, `FORMAT_BGRA8_UNORM_SRGB` or
+`FORMAT_RGBA8_UNORM_SRGB` (`surface.format()`), the size `surface.width()`
+by `surface.height()`, and the usages `TEXTURE_RENDER`, `TEXTURE_COPY_SRC`
+and `TEXTURE_COPY_DST`, so a program drawing on the CPU can also
+`write_texture` its picture straight into the frame. Presenting waits for
+every submission so far, and for writes made before it.
+
+`gpu.Surface.create_with` takes `gpu.SurfaceOptions`: `vsync` (on by
+default) ties presenting to the display's refresh, and `frames_in_flight`
+(2 by default, or 3) is how many frames the CPU may record before the GPU
+has finished the oldest; `acquire()` waits for that. `set_vsync` changes it
+later. A frame dropped without `present()` is presented anyway.
+
+`acquire()` fails with `Outdated` when the window's size changed in a way
+the surface could not follow by itself, or while it has no size, as when the
+window is minimized (`resize(0, 0)`): skip the frame and resize the surface
+to the window's size. Vulkan follows size changes by itself on Linux and
+Windows; Metal and OpenGL need `resize`.
+
+| Backend | Presents through |
+| --- | --- |
+| Vulkan | A swapchain on `VK_KHR_xcb_surface` (Linux) or `VK_KHR_win32_surface` (Windows), FIFO with vsync and mailbox or immediate without |
+| Metal | The view's `CAMetalLayer`: the one `win.metal_layer()` made, or a new one |
+| OpenGL | A texture that `present()` copies into the window's framebuffer with the window's context, then swaps; the device must come from `open_for_window` for that window |
+
+Vulkan surfaces on macOS are not supported; there `Preference.Auto` picks
+Metal. The window must stay open while its surface exists, and both are used
+from the thread that opened the window.
+
+## Staging and frames in flight
+
+`std/gpu` keeps the CPU from waiting for the GPU. On Vulkan and Metal,
+`write_buffer`, `write_texture` and `create_buffer_with_data` copy the data
+into a staging ring buffer in memory the GPU can read, and record the copy
+into an upload command buffer that is submitted just ahead of the next
+`submit()`, `present()`, read or `wait()`. Nothing waits until the ring is
+full of copies the GPU has not run yet: it starts at 4 MiB and doubles up to
+64 MiB, and writes of more than 16 MiB get a staging buffer of their own.
+Several writes to the same buffer before a submission land in the order they
+were made. OpenGL's driver stages such calls itself, so there they go
+straight to it.
+
+Reading back is the only call that waits: `read_buffer` and `read_texture`
+wait for every submission so far, then copy. On Vulkan, buffers live in GPU
+memory; where the CPU can map that memory (GPUs with unified memory, or
+resizable BAR) reads copy from it directly, and otherwise through a readback
+buffer in memory the CPU caches. With a [Surface](#surfaces), two or three
+frames are in flight.
+
+Setting the environment variable `DODO_GPU_UNMAPPED` makes the Vulkan
+backend treat every buffer as unmapped, as on a GPU with memory of its own,
+so the copy paths can be tested on any machine.
+
+## Synchronization
+
+Commands see the results of the ones before them without any calls from the
+program. `std/gpu` tracks how every command uses each buffer and texture
+(vertex input, uniform or storage reads, storage writes, attachments,
+copies) and asks the backend for a barrier only where a command depends on
+an earlier one of the same encoder, with exactly the stages and accesses
+involved: a compute pass writing a buffer that a render pass then reads as
+vertices gets one barrier from compute writes to vertex input, and
+independent dispatches, copies and passes get none. Each submission starts
+after the ones before it have finished.
+
+The Vulkan backend records each render pass into a secondary command
+buffer, so that the barriers its draws need can run before the pass;
+OpenGL needs `glMemoryBarrier` only after shader writes to storage buffers
+and textures, and Metal tracks hazards itself. Draws of one render pass are
+not ordered against each other: a draw cannot read what an earlier draw of
+the same pass wrote to a storage buffer or texture.
 
 ## Object lifetimes
 
@@ -280,8 +449,9 @@ Dropping a buffer, texture, sampler or pipeline that a submitted command or an
 open encoder may still use is safe: `std/gpu` destroys it once the GPU has
 finished every such submission. `submit()`, `wait()` and `poll()` destroy what
 has become free; call `device.poll()` in a program that drops objects and then
-submits nothing for a while. At most 64 objects wait at a time. Dropping more
-while encoders are open panics, and otherwise waits for the GPU to catch up.
+submits nothing for a while. At most 64 objects wait at a time; dropping more
+waits for the GPU to finish what was submitted, and panics only when all of
+them may still be used by encoders that are open.
 
 ## What is checked
 
@@ -318,6 +488,7 @@ developing.
 | `InvalidShader` | The shader does not compile or link, or lacks the entry point |
 | `OutOfMemory` | The GPU or driver ran out of memory |
 | `DeviceLost` | The GPU stopped responding |
+| `Outdated` | A surface no longer matches its window; resize it |
 | `System` | Another backend call failed |
 
 ## Backends
@@ -325,9 +496,11 @@ developing.
 | | Vulkan | Metal | OpenGL |
 | --- | --- | --- | --- |
 | Version | 1.2 with dynamic rendering and push descriptors (core in 1.3 and 1.4) | Any Mac GPU | 4.5 core, without a window |
-| Buffers | Host-visible memory, device-local where possible | Shared storage | Buffer objects |
+| Memory | Large blocks per memory type, carved into buffers and images | Metal's own | The driver's |
+| Buffers | Device-local, mapped too on unified memory; staged writes, reads through host-cached memory | Shared storage; staged writes | Buffer objects |
 | Textures | Optimal tiling, always in the general layout | Private storage, copied through buffers | Immutable storage |
-| Synchronization | A full barrier before every pass, copy and dispatch; a timeline semaphore numbers submissions | Metal's own tracking; a shared event numbers submissions | `glMemoryBarrier` after every pass and dispatch |
+| Synchronization | Barriers from tracked usage, one per submission besides; a timeline semaphore numbers submissions | Metal's own tracking; a shared event numbers submissions | `glMemoryBarrier` after shader storage writes |
+| Surfaces | Swapchains (Linux, Windows) | `CAMetalLayer` | The window's context |
 
 macOS stops at OpenGL 4.1, so there `Preference.OpenGl` fails with
 `Unsupported`; Vulkan needs MoltenVK there, as described on the
@@ -335,9 +508,7 @@ macOS stops at OpenGL 4.1, so there `Preference.OpenGl` fails with
 
 ## Limits
 
-There are no window surfaces yet: frames reach a [std/window](window.md)
-window by reading the texture back into its canvas, as the triangle example
-does. A render pass has one color attachment; textures have no mipmaps,
+A render pass has one color attachment; textures have no mipmaps,
 layers or multisampling; there are no push constants, indirect draws, stencil
 buffers or queries. The raw bindings, [std/gpu/vulkan](vulkan.md),
 [std/gpu/metal](metal.md) and [std/gpu/opengl](opengl.md), cover all of that.
@@ -350,5 +521,10 @@ already-checked descriptors and returns them as `hal.Handle`s, four words whose
 meaning it defines, and it records commands into an encoder handle. `std/gpu`
 does the checking, keeps each pass's bindings in a `hal.PassState` that the
 backend applies at each draw or dispatch, and tells the backend when to destroy
-objects. `std/gpu/hal/native` names the operating system's own backend, Metal
-on macOS; on Linux and Windows it never opens.
+objects. A backend whose `staged()` is true leaves transfers to `std/gpu`,
+which copies through `BUFFER_UPLOAD` and `BUFFER_READBACK` buffers it maps
+with `mapped()`; `barrier(encoder, before, after)` receives the `USE_*`
+bits of the dependent uses; and `create_surface`, `configure_surface`,
+`acquire` and `present` drive surfaces. `std/gpu/hal/native` names the
+operating system's own backend, Metal on macOS; on Linux and Windows it
+never opens.

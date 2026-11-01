@@ -209,3 +209,35 @@ fn match_guards_cannot_move_or_borrow_mutably() {
         &[],
     );
 }
+
+#[test]
+fn string_literals_never_conflict_with_mutable_statics() {
+    // A literal is immutable program data, not the storage of a static.
+    compare(
+        "static mut BUFFER: [16]u8 = [0u8; 16]\n\
+         fn take(text: &str, out: &mut [u8]) -> usize { out[0] = 1\n return text.len }\n\
+         fn f() -> usize {\n out := unsafe { &mut BUFFER[..] }\n\
+         return take(\"literal\", out) }\n",
+        None,
+        &[],
+    );
+    compare(
+        "static mut BUFFER: [16]u8 = [0u8; 16]\n\
+         fn storage() -> &mut [u8] from(static) { return unsafe { &mut BUFFER[..] } }\n\
+         fn take(text: &str, out: &mut [u8]) -> usize { out[0] = 1\n return text.len }\n\
+         fn f() -> usize {\n name := \"literal\"\n return take(name, storage()) }\n",
+        None,
+        &[],
+    );
+}
+
+#[test]
+fn mutable_statics_still_conflict_with_each_other() {
+    compare(
+        "static mut BUFFER: [16]u8 = [0u8; 16]\n\
+         fn f() {\n unsafe {\n a := &mut BUFFER[..]\n b := &mut BUFFER[..]\n\
+         a[0] = 1\n b[0] = 2\n }\n}\n",
+        Some("access conflicts with a live mutable borrow held by `a`"),
+        &[],
+    );
+}

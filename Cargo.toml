@@ -11,14 +11,18 @@ repository = "https://github.com/Jotrorox/dodo"
 name = "dodoc"
 
 [features]
-default = ["llvm"]
+default = ["llvm", "wgsl"]
 # Native code generation, the LSP server, and the CLI.
 llvm = ["dep:llvm-sys", "dep:libc"]
+# std/gpu's `gpu.wgsl`: WGSL shaders translated to SPIR-V, MSL and GLSL at
+# compile time.
+wgsl = ["dep:naga"]
 
 [dependencies]
 # llvm-sys defaults to preferring static LLVM, with a shared-library fallback.
 # Release packaging explicitly enables llvm-sys/force-static.
 llvm-sys = { version = "231.0.0", optional = true }
+naga = { version = "30.0.1", optional = true, default-features = false, features = ["wgsl-in", "spv-out", "msl-out", "glsl-out"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = { version = "0.2.189", optional = true }
@@ -130,6 +134,30 @@ name = "graphics_library"
 required-features = ["llvm"]
 
 [[test]]
+name = "image_codecs_library"
+required-features = ["llvm"]
+
+[[test]]
+name = "image_jxl_library"
+required-features = ["llvm"]
+
+[[test]]
+name = "image_jxl_encode_library"
+required-features = ["llvm"]
+
+[[test]]
+name = "image_ops_library"
+required-features = ["llvm"]
+
+[[test]]
+name = "image_fuzz"
+required-features = ["llvm"]
+
+[[test]]
+name = "image_alloc_library"
+required-features = ["llvm"]
+
+[[test]]
 name = "gpu_metal_library"
 required-features = ["llvm"]
 
@@ -148,6 +176,10 @@ required-features = ["llvm"]
 [[test]]
 name = "gpu_library"
 required-features = ["llvm"]
+
+[[test]]
+name = "gpu_wgsl"
+required-features = ["llvm", "wgsl"]
 
 [[test]]
 name = "hal_library"
@@ -211,6 +243,10 @@ required-features = ["llvm"]
 
 [[test]]
 name = "mqtt_library"
+required-features = ["llvm"]
+
+[[test]]
+name = "sqlite_library"
 required-features = ["llvm"]
 
 [[test]]
@@ -295,6 +331,26 @@ required-features = ["llvm"]
 
 [[test]]
 name = "compress_roundtrip_library"
+required-features = ["llvm"]
+
+[[test]]
+name = "lua_pattern_library"
+required-features = ["llvm"]
+
+[[test]]
+name = "lua_compiler"
+required-features = ["llvm"]
+
+[[test]]
+name = "lua_core"
+required-features = ["llvm"]
+
+[[test]]
+name = "lua_corpus"
+required-features = ["llvm"]
+
+[[test]]
+name = "lua_number"
 required-features = ["llvm"]
 
 [[test]]

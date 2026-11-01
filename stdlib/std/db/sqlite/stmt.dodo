@@ -1,0 +1,615 @@
+package sqlite
+
+import "core/mem"
+import "std/db"
+
+// Prepared statements live in fixed slots of the statement region:
+//   [0..128) header, [128..512) named parameters, [512..) SQL copy, then
+//   parse-tree nodes growing up and the string pool growing down.
+
+const SLOT_NAMED: usize = 128
+const SLOT_SQL: usize = 512
+
+const SH_ROOT: usize = 0
+const SH_SQLLEN: usize = 4
+const SH_NPARAM: usize = 8
+const SH_GEN: usize = 12
+const SH_NCOL: usize = 16
+const SH_RESREG: usize = 20
+const SH_PARAMREG: usize = 24
+const SH_REGTOP: usize = 28
+const SH_TAIL: usize = 32
+const SH_NAMED: usize = 36
+const SH_KIND: usize = 40
+const SH_STATE: usize = 44
+const SH_NODEN: usize = 48
+const SH_POOL: usize = 52
+const SH_SUBQ: usize = 56
+const SH_NSUBQ: usize = 60
+const SH_SERIAL: usize = 64
+const SH_INUSE: usize = 68
+const SH_PRAGMA: usize = 72
+const SH_PIDX: usize = 76
+const SH_PN: usize = 80
+const SH_PPOS: usize = 84
+const SH_NAMES: usize = 88
+const SH_CURTOP: usize = 92
+const SH_LRU: usize = 96
+
+const ST_IDLE: usize = 0
+const ST_RUNNING: usize = 1
+const ST_DONE: usize = 2
+
+fn slot_base(e: &Engine, slot: usize) -> usize {
+    e.stmt_off + slot * e.stmt_slot
+}
+
+fn sh(e: &Engine, slot: usize, f: usize) -> usize {
+    ldu(e.ws, slot_base(e, slot) + f)
+}
+
+fn sh_set(e: &mut Engine, slot: usize, f: usize, v: usize) {
+    o := slot_base(e, slot) + f
+    stu(e.ws, o, v)
+}
+
+// Makes the slot's parse tree addressable (nd() etc.).
+fn activate(e: &mut Engine, slot: usize) {
+    base := slot_base(e, slot)
+    e.sb = base
+    sqll := ldu(e.ws, base + SH_SQLLEN)
+    e.node_off = align8(base + SLOT_SQL + sqll)
+    e.node_n = ldu(e.ws, base + SH_NODEN)
+    e.pool_lo = ldu(e.ws, base + SH_POOL)
+    e.param_reg = ldu(e.ws, base + SH_PARAMREG)
+    e.subq_list = ldu(e.ws, base + SH_SUBQ)
+    e.subq_n = ldu(e.ws, base + SH_NSUBQ)
+}
+
+fn align8(v: usize) -> usize {
+    (v + 7) / 8 * 8
+}
+
+// Parses and resolves the first statement of `sql` into `slot`.
+fn prepare_slot(e: &mut Engine, slot: usize, sql: &[u8]) -> void!db.Error {
+    base := slot_base(e, slot)
+    if SLOT_SQL + sql.len + 1024 > e.stmt_slot {
+        return err(fail(e, SQLITE_TOOBIG, "statement too long for the statement workspace"))
+    }
+    serial := ldu(e.ws, base + SH_SERIAL)
+    zero_bytes(e.ws, base, SLOT_SQL)
+    stu(e.ws, base + SH_SERIAL, serial)
+    stu(e.ws, base + SH_SQLLEN, sql.len)
+    copy_in(e.ws, base + SLOT_SQL, sql)
+    stu(e.ws, base + SH_INUSE, 1)
+    compile_slot(e, slot)
+}
+
+// (Re)compiles the SQL stored in the slot.
+fn compile_slot(e: &mut Engine, slot: usize) -> void!db.Error {
+    base := slot_base(e, slot)
+    sqll := ldu(e.ws, base + SH_SQLLEN)
+    src := base + SLOT_SQL
+    e.error_offset = -1
+    e.sb = base
+    e.src = src
+    e.src_end = src + sqll
+    e.pos = src
+    e.ts = src
+    e.tl = 0
+    e.last_end = src
+    e.node_off = align8(src + sqll)
+    e.node_n = 0
+    e.pool_lo = base + e.stmt_slot
+    e.nparam = 0
+    e.named_n = 0
+    e.named_off = base + SLOT_NAMED
+    e.depth = 0
+    e.cur_alloc = 0
+    e.reg_alloc = FIRST_REG
+    e.ctx_n = 0
+    e.agg_list = 0
+    e.agg_n = 0
+    e.subq_list = 0
+    e.subq_n = 0
+    e.cte_off = 0
+    e.cte_n = 0
+    e.min_ctx = NO_COL
+    e.regctx_t = NO_COL
+    next_token(e)
+    root := 0usize
+    if e.tk == TK_EOF || e.tk == TK_SEMI {
+        root = new_node(e, S_EMPTY)?
+    } else {
+        root = parse_statement(e)?
+    }
+    if e.tk == TK_SEMI {
+        next_token(e)
+    } else if e.tk != TK_EOF {
+        return err(syntax_error(e))
+    }
+    tail := e.ts - src
+    // Parameters occupy the first registers.
+    param_reg := e.reg_alloc
+    e.reg_alloc += e.nparam
+    e.param_reg = param_reg
+    if e.reg_alloc >= REG_LIMIT - 64 {
+        return err(fail(e, SQLITE_ERROR, "too many SQL variables"))
+    }
+    // Context for name resolution lives in the pool.
+    let pool_alloc2 = pool_alloc(e, 16 * 8)?
+    e.ctx_off = pool_alloc2
+    kind := nkind(e, root)
+    ncol := 0usize
+    resreg := 0usize
+    names := 0usize
+    pragma := 0usize
+    if kind == S_SELECT {
+        resolve_select(e, root)?
+        ncol = select_ncols(e, root)
+        resreg = select_resreg(e, root)
+        names = pool_alloc(e, ncol * 8 + 8)?
+        rc := na(e, root)
+        k := 0usize
+        for rc != 0 {
+            x := na(e, rc)
+            if nb(e, rc) != 0 {
+                let rc_b = nb(e, rc)
+                stu(e.ws, names + k * 8, rc_b)
+                let rc_c = nc(e, rc)
+                stu(e.ws, names + k * 8 + 4, rc_c)
+            } else if nkind(e, x) == N_COL && nb(e, x) != NO_COL && nc(e, x) != NO_COL {
+                let x_c = nc(e, x)
+                let x_b = nb(e, x)
+                r := col_rec(e, x_c, x_b)
+                let name2 = ldu(e.ws, r + K_NAME)
+                stu(e.ws, names + k * 8, name2)
+                let name_len = ldu(e.ws, r + K_NAMEL)
+                stu(e.ws, names + k * 8 + 4, name_len)
+            } else if nkind(e, x) == N_COL && nb(e, x) == NO_COL && ndd(e, rc) == 0 {
+                stu(e.ws, names + k * 8, 0)
+                stu(e.ws, names + k * 8 + 4, 0)
+            } else {
+                let rc_d = ndd(e, rc)
+                stu(e.ws, names + k * 8, rc_d)
+                let rc_e = ne_(e, rc)
+                stu(e.ws, names + k * 8 + 4, rc_e)
+            }
+            k += 1
+            rc = nnext(e, rc)
+        }
+    } else if kind == S_CREATE_VIEW {
+        // Validate the definition now, as SQLite does.
+        sel := ndd(e, root)
+        resolve_select(e, sel)?
+        cols := nc(e, root)
+        if cols != 0 && list_len(e, cols) != select_ncols(e, sel) {
+            return err(fail(e, SQLITE_ERROR, "number of columns in the view definition does not match the select"))
+        }
+    } else if kind == S_INSERT || kind == S_UPDATE || kind == S_DELETE {
+        if kind == S_INSERT {
+            resolve_insert(e, root)?
+        } else if kind == S_UPDATE {
+            resolve_update(e, root)?
+        } else {
+            resolve_delete(e, root)?
+        }
+        if nx(e, root) != 0 {
+            let (r, n) = resolve_returning(e, root, kind == S_DELETE)?
+            resreg = r
+            ncol = n
+            head := nx(e, root) as usize
+            names = pool_alloc(e, n * 8 + 8)?
+            rc := head
+            k := 0usize
+            for rc != 0 {
+                let rc_a = na(e, rc)
+                let (no, nl) = if nb(e, rc) != 0 {
+                    (nb(e, rc), nc(e, rc))
+                } else if nkind(e, rc_a) == N_REG {
+                    (ndd(e, rc), ne_(e, rc))
+                } else {
+                    (ndd(e, rc), ne_(e, rc))
+                }
+                stu(e.ws, names + k * 8, no)
+                stu(e.ws, names + k * 8 + 4, nl)
+                k += 1
+                rc = nnext(e, rc)
+            }
+        }
+    } else if kind == S_PRAGMA {
+        let root_a = na(e, root)
+        let root_b = nb(e, root)
+        pragma = pragma_id(e, root_a, root_b)
+        if nflags(e, root) == 1 && pragma != P_BUSY_TIMEOUT {
+            ncol = 0
+        } else {
+            ncol = pragma_columns(pragma)
+        }
+        resreg = alloc_regs(e, if ncol == 0 {
+            1usize
+        } else {
+            ncol
+        })?
+        if nc(e, root) != 0 {
+            let root_c = nc(e, root)
+            resolve_expr(e, root_c, 0, false)?
+        }
+    }
+    stu(e.ws, base + SH_ROOT, root)
+    let nparam2 = e.nparam
+    stu(e.ws, base + SH_NPARAM, nparam2)
+    let value = e.schema_gen as usize
+    stu(e.ws, base + SH_GEN, value)
+    stu(e.ws, base + SH_NCOL, ncol)
+    stu(e.ws, base + SH_RESREG, resreg)
+    stu(e.ws, base + SH_PARAMREG, param_reg)
+    let reg_alloc2 = e.reg_alloc
+    stu(e.ws, base + SH_REGTOP, reg_alloc2)
+    stu(e.ws, base + SH_TAIL, tail)
+    let named_n2 = e.named_n
+    stu(e.ws, base + SH_NAMED, named_n2)
+    stu(e.ws, base + SH_KIND, kind as usize)
+    stu(e.ws, base + SH_STATE, ST_IDLE)
+    let node_n2 = e.node_n
+    stu(e.ws, base + SH_NODEN, node_n2)
+    let pool_lo2 = e.pool_lo
+    stu(e.ws, base + SH_POOL, pool_lo2)
+    let subq_list2 = e.subq_list
+    stu(e.ws, base + SH_SUBQ, subq_list2)
+    let subq_n2 = e.subq_n
+    stu(e.ws, base + SH_NSUBQ, subq_n2)
+    stu(e.ws, base + SH_PRAGMA, pragma)
+    stu(e.ws, base + SH_NAMES, names)
+    let cur_alloc2 = e.cur_alloc
+    stu(e.ws, base + SH_CURTOP, cur_alloc2)
+    ok()
+}
+
+// Prepares a slot's statement for execution with `params`.
+fn stmt_start(e: &mut Engine, slot: usize, params: &[db.Value]) -> void!db.Error {
+    if e.active != NO_COL && e.active != slot {
+        prev := e.active
+        stmt_finish(e, prev, true)?
+    }
+    if e.active == slot {
+        stmt_finish(e, slot, true)?
+    }
+    e.error_offset = -1
+    activate(e, slot)
+    kind := sh(e, slot, SH_KIND) as u8
+    root := sh(e, slot, SH_ROOT)
+    // Transaction control runs outside the autocommit logic.
+    if kind == S_BEGIN || kind == S_COMMIT || kind == S_ROLLBACK || kind == S_EMPTY || kind == S_VACUUM {
+        sh_set(e, slot, SH_STATE, ST_RUNNING)
+        e.active = slot
+        return ok()
+    }
+    nodes_root := root
+    write := false
+    if kind == S_PRAGMA {
+        write = pragma_writes(e, nodes_root)
+    } else {
+        write = kind == S_INSERT || kind == S_UPDATE || kind == S_DELETE || kind == S_CREATE_TABLE || kind == S_CREATE_INDEX || kind == S_DROP || kind == S_ALTER || kind == S_CREATE_VIEW
+    }
+    if write {
+        begin_write(e)?
+    } else {
+        begin_read(e)?
+    }
+    match load_schema(e) {
+        ok() => {},
+        err(reason) => {
+            abort_txn(e)
+            return err(reason)
+        },
+    }
+    if sh(e, slot, SH_GEN) != (e.schema_gen as usize) {
+        // The schema changed since this statement was prepared.
+        match compile_slot(e, slot) {
+            ok() => {},
+            err(reason) => {
+                abort_txn(e)
+                return err(reason)
+            },
+        }
+        activate(e, slot)
+    }
+    // Bind parameters (data is copied to the bottom of the sort stack).
+    e.sort_top = e.sort_off
+    e.sort_hi = e.sort_off + e.sort_cap
+    e.arena_top = e.arena_off
+    for c in 0usize..NCURSORS {
+        co := e.cur_off + c * CURSOR_BYTES
+        e.ws[co + C_PAYVALID] = 0
+    }
+    nparam := sh(e, slot, SH_NPARAM)
+    if params.len > nparam {
+        abort_txn(e)
+        return err(fail(e, SQLITE_RANGE, "too many parameters for the statement"))
+    }
+    for i in 0usize..nparam {
+        r := e.param_reg + i
+        if i >= params.len {
+            set_null(e, r)
+            continue
+        }
+        match &params[i] {
+            db.Value.Null => {
+                set_null(e, r)
+            },
+            db.Value.Int(v) => {
+                set_int(e, r, *v)
+            },
+            db.Value.Real(v) => {
+                if *v != *v {
+                    set_null(e, r)
+                } else {
+                    set_real(e, r, *v)
+                }
+            },
+            db.Value.Text(t) => {
+                b := mem.str_bytes(*t)
+                o := bind_alloc(e, b.len)?
+                copy_in(e.ws, o, b)
+                set_bytes(e, r, T_TEXT, o, b.len)
+            },
+            db.Value.Bytes(b) => {
+                bytes := *b
+                o := bind_alloc(e, bytes.len)?
+                copy_in(e.ws, o, bytes)
+                set_bytes(e, r, T_BLOB, o, bytes.len)
+            },
+        }
+    }
+    let regtop = sh(e, slot, SH_REGTOP)
+    e.rtop = regtop
+    e.arena_base = e.arena_top
+    // Uncorrelated subquery caches are per execution.
+    for i in 0usize..e.subq_n {
+        n := ldu(e.ws, e.subq_list + i * 4)
+        o := nd(e, n)
+        e.ws[o + 3] = 0
+    }
+    e.changes = 0
+    e.slot_rec = 0
+    stmt_begin(e)
+    if kind == S_SELECT {
+        select_reset(e, root)
+    }
+    sh_set(e, slot, SH_STATE, ST_RUNNING)
+    e.active = slot
+    ok()
+}
+
+fn bind_alloc(e: &mut Engine, len: usize) -> usize!db.Error {
+    if e.sort_top + len > e.sort_hi {
+        abort_txn(e)
+        return err(full(e, "parameter data"))
+    }
+    o := e.sort_top
+    e.sort_top += len
+    ok(o)
+}
+
+// Ends an autocommit transaction that failed before running.
+fn abort_txn(e: &mut Engine) {
+    if !e.explicit_txn {
+        match rollback(e) {
+            ok() => {},
+            err(_) => {},
+        }
+        end_read(e)
+    }
+}
+
+// Runs one step. Returns true when a row is available in the result
+// registers.
+fn stmt_step(e: &mut Engine, slot: usize) -> bool!db.Error {
+    if e.active != slot || sh(e, slot, SH_STATE) != ST_RUNNING {
+        return ok(false)
+    }
+    activate(e, slot)
+    match step_inner(e, slot) {
+        ok(row) => {
+            if !row {
+                // Statement completed successfully.
+                stmt_finish(e, slot, true)?
+            }
+            ok(row)
+        },
+        err(reason) => {
+            stmt_fail(e, slot)
+            err(reason)
+        },
+    }
+}
+
+fn step_inner(e: &mut Engine, slot: usize) -> bool!db.Error {
+    kind := sh(e, slot, SH_KIND) as u8
+    root := sh(e, slot, SH_ROOT)
+    let arena_base2 = e.arena_base
+    arena_reset(e, arena_base2)
+    if kind == S_SELECT {
+        return select_next(e, root)
+    }
+    returning := (kind == S_INSERT || kind == S_UPDATE || kind == S_DELETE) && nx(e, root) != 0
+    if kind == S_PRAGMA || returning {
+        if sh(e, slot, SH_PN) == 0 && sh(e, slot, SH_PPOS) == 0 && sh(e, slot, SH_PIDX) == 0 {
+            start := e.sort_top
+            if returning {
+                // Run the whole statement first, as SQLite does; each written
+                // row left one record on the sort stack.
+                if kind == S_INSERT {
+                    exec_insert(e, root)?
+                } else if kind == S_UPDATE {
+                    exec_update(e, root)?
+                } else {
+                    exec_delete(e, root)?
+                }
+                start = e.ret_start
+            } else {
+                let resreg2 = sh(e, slot, SH_RESREG)
+                exec_pragma(e, root, resreg2)?
+            }
+            let sort_top2 = e.sort_top
+            let (idx, n) = index_records(e, start, sort_top2)?
+            sh_set(e, slot, SH_PIDX, idx)
+            sh_set(e, slot, SH_PN, n)
+            sh_set(e, slot, SH_PPOS, 0)
+            if n == 0 {
+                sh_set(e, slot, SH_PIDX, 1)
+            }
+        }
+        pos := sh(e, slot, SH_PPOS)
+        if pos >= sh(e, slot, SH_PN) {
+            return ok(false)
+        }
+        sh_set(e, slot, SH_PPOS, pos + 1)
+        rec := ldu(e.ws, sh(e, slot, SH_PIDX) + pos * 4)
+        ncol := sh(e, slot, SH_NCOL)
+        resreg := sh(e, slot, SH_RESREG)
+        for i in 0usize..ncol {
+            let len = rec_len(e, rec)
+            record_column(e, rec + 4, len, i, resreg + i)?
+        }
+        return ok(true)
+    }
+    if kind == S_INSERT {
+        exec_insert(e, root)?
+    } else if kind == S_UPDATE {
+        exec_update(e, root)?
+    } else if kind == S_DELETE {
+        exec_delete(e, root)?
+    } else if kind == S_CREATE_TABLE {
+        exec_create_table(e, root)?
+    } else if kind == S_CREATE_INDEX {
+        exec_create_index(e, root)?
+    } else if kind == S_CREATE_VIEW {
+        exec_create_view(e, root)?
+    } else if kind == S_DROP {
+        exec_drop(e, root)?
+    } else if kind == S_ALTER {
+        exec_alter(e, root)?
+    } else if kind == S_BEGIN {
+        if e.explicit_txn {
+            return err(fail(e, SQLITE_ERROR, "cannot start a transaction within a transaction"))
+        }
+        e.explicit_txn = true
+        if nop(e, root) != 0 {
+            match begin_write(e) {
+                ok() => {},
+                err(reason) => {
+                    e.explicit_txn = false
+                    return err(reason)
+                },
+            }
+        }
+    } else if kind == S_COMMIT {
+        if !e.explicit_txn {
+            return err(fail(e, SQLITE_ERROR, "cannot commit - no transaction is active"))
+        }
+        commit(e)?
+        e.explicit_txn = false
+        unlock_to(e, false)
+    } else if kind == S_ROLLBACK {
+        if !e.explicit_txn {
+            return err(fail(e, SQLITE_ERROR, "cannot rollback - no transaction is active"))
+        }
+        e.explicit_txn = false
+        rollback(e)?
+        unlock_to(e, false)
+    }
+    ok(false)
+}
+
+// Completes the statement: counts changes and commits in autocommit mode.
+fn stmt_finish(e: &mut Engine, slot: usize, success: bool) -> void!db.Error {
+    if e.active != slot {
+        return ok()
+    }
+    e.active = NO_COL
+    sh_set(e, slot, SH_STATE, ST_DONE)
+    sh_set(e, slot, SH_PN, 0)
+    sh_set(e, slot, SH_PPOS, 0)
+    sh_set(e, slot, SH_PIDX, 0)
+    kind := sh(e, slot, SH_KIND) as u8
+    if kind == S_INSERT || kind == S_UPDATE || kind == S_DELETE {
+        e.total_changes += e.changes
+    }
+    stmt_end(e)
+    if !success {
+        return ok()
+    }
+    if !e.explicit_txn {
+        if e.write_txn {
+            match commit(e) {
+                ok() => {},
+                err(reason) => {
+                    match rollback(e) {
+                        ok() => {},
+                        err(_) => {},
+                    }
+                    end_read(e)
+                    return err(reason)
+                },
+            }
+        }
+        end_read(e)
+    }
+    ok()
+}
+
+// Undoes a failed statement: the statement alone inside BEGIN...COMMIT
+// (when its journal kept up), otherwise the whole transaction.
+fn stmt_fail(e: &mut Engine, slot: usize) {
+    // Keep the message of the original error.
+    saved_len := e.msg_len
+    if e.active == slot {
+        e.active = NO_COL
+    }
+    sh_set(e, slot, SH_STATE, ST_DONE)
+    sh_set(e, slot, SH_PN, 0)
+    sh_set(e, slot, SH_PPOS, 0)
+    sh_set(e, slot, SH_PIDX, 0)
+    if e.explicit_txn && e.write_txn {
+        undone := match stmt_rollback(e) {
+            ok(v) => v,
+            err(_) => false,
+        }
+        if !undone {
+            match rollback(e) {
+                ok() => {},
+                err(_) => {},
+            }
+            e.explicit_txn = false
+            unlock_to(e, false)
+        }
+    } else if !e.explicit_txn {
+        match rollback(e) {
+            ok() => {},
+            err(_) => {},
+        }
+        end_read(e)
+    }
+    stmt_end(e)
+    e.changes = 0
+    e.msg_len = saved_len
+}
+
+// Reads column i of the current row of `slot`.
+fn column_reg(e: &Engine, slot: usize, i: usize) -> usize {
+    sh(e, slot, SH_RESREG) + i
+}
+
+fn column_name(e: &Engine, slot: usize, i: usize) -> (usize, usize) {
+    kind := sh(e, slot, SH_KIND) as u8
+    if kind == S_PRAGMA {
+        return (0usize, 0usize)
+    }
+    names := sh(e, slot, SH_NAMES)
+    if names == 0 {
+        return (0usize, 0usize)
+    }
+    (ldu(e.ws, names + i * 8), ldu(e.ws, names + i * 8 + 4))
+}

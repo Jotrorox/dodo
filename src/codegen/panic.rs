@@ -18,6 +18,28 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             Ok(self.module.add_function(name, ty, None))
         }
     }
+    /// A NUL-terminated string in program memory, as a data pointer holding
+    /// its address there. On AVR every constant in data memory takes SRAM,
+    /// and a program has hundreds of panic sites; the chip's panic hook reads
+    /// these with LPM. Identical texts share one copy.
+    fn program_string(&mut self, text: &str) -> Value<'ctx> {
+        if let Some(&pointer) = self.program_strings.get(text) {
+            return pointer;
+        }
+        let data = self.context.const_string(text.as_bytes(), true);
+        let global = self
+            .module
+            .add_global(data.get_type(), Some(self.code_space), "panic.text");
+        global.set_initializer(&data);
+        global.set_constant(true);
+        global.set_linkage(LLVMPrivateLinkage);
+        global.set_unnamed_addr(true);
+        let pointer = global
+            .const_ptr_to_int(self.usize_type())
+            .const_int_to_ptr(self.context.ptr_type(0));
+        self.program_strings.insert(text.to_owned(), pointer);
+        pointer
+    }
     pub(super) fn panic(&mut self, check: &str) -> Result<()> {
         let triple = self
             .module
@@ -105,8 +127,14 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                     self.context
                         .create_enum_attribute(Attribute::get_named_enum_kind_id("noreturn"), 0),
                 );
-                let message = self.builder.build_global_string_ptr(check, "panic.check")?;
-                let file = self.builder.build_global_string_ptr(&file, "panic.file")?;
+                let (message, file) = if self.code_space != 0 {
+                    (self.program_string(check), self.program_string(&file))
+                } else {
+                    (
+                        self.builder.build_global_string_ptr(check, "panic.check")?,
+                        self.builder.build_global_string_ptr(&file, "panic.file")?,
+                    )
+                };
                 self.builder.build_call(
                     hook,
                     &[

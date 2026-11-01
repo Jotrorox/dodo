@@ -1,0 +1,263 @@
+package main
+
+// Exercises the public embedding API of std/script/lua without the
+// compiler: values, tables, metatables, native functions and closures,
+// protected calls, error messages, coroutines with continuations,
+// userdata with finalizers, references, the registry, and leak checking.
+
+import "core/mem"
+import "core/ptr"
+import "std/script/lua"
+
+fn add(cx: &mut lua.Cx) -> i32!lua.Throw {
+    let a = cx.check_integer(1)?
+    let b = cx.check_integer(2)?
+    cx.push_integer(a + b)
+    return ok(1)
+}
+
+fn counter(cx: &mut lua.Cx) -> i32!lua.Throw {
+    let n = int_or0(cx.to_integer(lua.upvalue_index(1))) + 1
+    cx.push_integer(n)
+    cx.copy(-1, lua.upvalue_index(1))
+    return ok(1)
+}
+
+fn fails(cx: &mut lua.Cx) -> i32!lua.Throw {
+    return err(cx.error_msg("custom failure"))
+}
+
+fn yielder_k(cx: &mut lua.Cx, status: i32, ctx: isize) -> i32!lua.Throw {
+    // Resumed: return the resume arguments plus the context.
+    cx.push_integer(ctx as i64)
+    return ok(cx.get_top())
+}
+
+fn yielder(cx: &mut lua.Cx) -> i32!lua.Throw {
+    cx.push_str("yielded")?
+    return err(cx.yield_k(1, 7, yielder_k))
+}
+
+static mut FINALIZED: i32 = 0
+
+fn ud_gc(cx: &mut lua.Cx) -> i32!lua.Throw {
+    unsafe {
+        FINALIZED += 1
+    }
+    return ok(0)
+}
+
+fn count_hook(cx: &mut lua.Cx, ar: &mut lua.Debug) -> void!lua.Throw {
+    return ok()
+}
+
+fn int_or0(o: Option<i64>) -> i64 {
+    match o {
+        some(v) => {
+            return v
+        },
+        none => {
+            return 0
+        },
+    }
+}
+
+fn bytes_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len != b.len {
+        return false
+    }
+    for i in 0usize..a.len {
+        if a[i] != b[i] {
+            return false
+        }
+    }
+    return true
+}
+
+fn check(cond: bool, what: &str) {
+    if !cond {
+        lua.write_stderr(b"FAILED: ")
+        lua.write_stderr(mem.str_bytes(what))
+        lua.write_stderr(b"\n")
+    }
+}
+
+fn run() -> void!lua.Throw {
+    st := lua.Lua.new()?
+    st.open_libs()?
+    cx := st.cx()
+
+    // Basic values and type queries.
+    cx.push_integer(42)
+    cx.push_number(1.5)
+    cx.push_str("hello")?
+    cx.push_boolean(true)
+    cx.push_nil()
+    check(cx.get_top() == 5, "top")
+    check(cx.type_of(1) == lua.TNUMBER && cx.is_integer(1), "integer")
+    check(!cx.is_integer(2) && cx.is_number(2), "float")
+    check(cx.is_string(3) && cx.is_string(1), "string")
+    check(cx.to_boolean(4) && !cx.to_boolean(5), "booleans")
+    check(cx.type_of(10) == lua.TNONE, "none")
+    match cx.to_lstr(1)? {
+        some(s) => {
+            check(s.size() == 2, "number to string")
+        },
+        none => {
+            check(false, "tolstring")
+        },
+    }
+    cx.set_top(0)
+
+    // Tables.
+    cx.new_table()?
+    cx.push_integer(10)
+    cx.set_field(1, "x")?
+    cx.push_str("one")?
+    cx.set_i(1, 1)?
+    check(cx.get_field(1, "x")? == lua.TNUMBER, "get_field")
+    check(int_or0(cx.to_integer(-1)) == 10, "field value")
+    cx.pop(1)
+    check(cx.raw_len(1) == 1, "raw_len")
+    count := 0i32
+    cx.push_nil()
+    for cx.next(1)? {
+        count += 1
+        cx.pop(1)
+    }
+    check(count == 2, "next")
+
+    // Native functions and closures.
+    cx.push_native(add)?
+    cx.push_integer(2)
+    cx.push_integer(3)
+    cx.call(2, 1)?
+    check(int_or0(cx.to_integer(-1)) == 5, "call native")
+    cx.pop(1)
+    cx.push_integer(0)
+    cx.push_closure(counter, 1)?
+    cx.set_global("counter")?
+    for i in 0..3 {
+        cx.get_global("counter")?
+        cx.call(0, 1)?
+        cx.pop(1)
+    }
+    cx.get_global("counter")?
+    cx.call(0, 1)?
+    check(int_or0(cx.to_integer(-1)) == 4, "closure upvalue")
+    cx.pop(1)
+
+    // Protected calls and error messages.
+    cx.push_native(add)?
+    cx.push_str("x")?
+    cx.push_integer(1)
+    let status = cx.pcall(2, 1, 0)
+    check(status == lua.ERRRUN, "pcall status")
+    match cx.to_lstr(-1)? {
+        some(m) => {
+            check(bytes_eq(m.bytes(), b"bad argument #1 to '?' (number expected, got string)"), "argerror message")
+        },
+        none => {
+            check(false, "message")
+        },
+    }
+    cx.pop(1)
+    cx.push_native(fails)?
+    check(cx.pcall(0, 0, 0) == lua.ERRRUN, "error_msg")
+    cx.pop(1)
+
+    // Arithmetic and comparison with metamethod-free values.
+    cx.push_integer(7)
+    cx.push_integer(2)
+    cx.arith(lua.OPIDIV)?
+    check(int_or0(cx.to_integer(-1)) == 3, "arith idiv")
+    cx.push_number(3.0)
+    check(cx.compare(-1, -2, lua.OPEQ)?, "compare int/float")
+    cx.set_top(1)
+    cx.pop(1)
+
+    // Coroutines with a continuation.
+    co := cx.new_thread()?
+    co.push_native(yielder)?
+    nres := 0i32
+    let s1 = cx.resume(&mut co, 0, &mut nres)
+    check(s1 == lua.YIELD && nres == 1, "yield")
+    co.pop(nres)
+    co.push_integer(99)
+    let s2 = cx.resume(&mut co, 1, &mut nres)
+    check(s2 == lua.OK && nres == 2, "resume continuation")
+    check(int_or0(co.to_integer(-1)) == 7, "continuation context")
+    cx.pop(1)
+
+    // Userdata with a metatable and a finalizer.
+    let blk = cx.new_userdata(16, 1)?
+    unsafe {
+        *(blk as *mut i64) = 1234
+    }
+    cx.new_metatable("Test.Box")?
+    cx.push_native(ud_gc)?
+    cx.set_field(-2, "__gc")?
+    cx.set_metatable(-2)
+    let p = cx.check_udata(-1, "Test.Box")?
+    unsafe {
+        check(*(p as *mut i64) == 1234, "udata block")
+    }
+    cx.pop(1)
+    cx.gc_collect()
+    unsafe {
+        check(FINALIZED == 1, "finalizer ran")
+    }
+
+    // Hooks: get_hook mirrors lua_gethook.
+    check(!cx.has_hook(), "no hook yet")
+    cx.set_hook(count_hook, lua.MASKCALL | lua.MASKCOUNT, 100)
+    match cx.get_hook() {
+        some(h) => {},
+        none => {
+            check(false, "get_hook returns the hook")
+        },
+    }
+    check(cx.get_hook_mask() == (lua.MASKCALL | lua.MASKCOUNT) && cx.get_hook_count() == 100, "hook mask and count")
+    cx.clear_hook()
+    match cx.get_hook() {
+        some(h) => {
+            check(false, "hook removed")
+        },
+        none => {},
+    }
+
+    // get_info pushes the function once, however often 'f' appears.
+    cx.set_top(0)
+    cx.push_native(add)?
+    ar := lua.Debug.new()
+    let good = cx.get_info(">ffS", &mut ar)?
+    check(good && cx.get_top() == 1 && cx.is_function(1), "get_info pushes 'f' once")
+    cx.set_top(0)
+
+    // References.
+    cx.push_str("referenced")?
+    let r = cx.reference(lua.REGISTRY_INDEX)?
+    cx.raw_get_i(lua.REGISTRY_INDEX, r as i64)
+    check(cx.is_string(-1), "reference value")
+    cx.pop(1)
+    cx.unreference(lua.REGISTRY_INDEX, r)?
+
+    // Traceback of an error inside a native function.
+    cx.set_top(0)
+    let leaked = st.close()
+    check(leaked == 0, "no leaks")
+    lua.write_stdout(b"api ok\n")
+    return ok()
+}
+
+fn main() -> i32 {
+    match run() {
+        ok() => {
+            return 0
+        },
+        err(_) => {
+            lua.write_stderr(b"unexpected error\n")
+            return 1
+        },
+    }
+}

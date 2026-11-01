@@ -1,0 +1,195 @@
+package ops
+
+import "std/image/color"
+import "std/image/convert"
+import "std/image/pixels"
+
+// Helpers shared by the ops files: the float pixel path, a 128-bit counter
+// for sums over huge images, and size checks.
+//
+// The integer path uses convert.load_rgba16 / convert.store_rgba16 (straight
+// 16-bit RGBA). The float path below is its f32 twin: straight RGBA f32 in,
+// straight RGBA f32 out, with premultiplied layouts divided or multiplied by
+// alpha and gray targets receiving BT.709 luma, exactly as convert does.
+
+// Pixels per batch when rows are converted through stack buffers.
+const BATCH: usize = 64
+
+// ---------------------------------------------------------------------------
+// Size checks
+
+fn same_size(source: &pixels.View, target: &pixels.ViewMut) -> void!pixels.Error {
+    if source.width() != target.width() || source.height() != target.height() {
+        return err(pixels.Error.Malformed)
+    }
+    return ok()
+}
+
+fn same_view_size(a: &pixels.View, b: &pixels.View) -> void!pixels.Error {
+    if a.width() != b.width() || a.height() != b.height() {
+        return err(pixels.Error.Malformed)
+    }
+    return ok()
+}
+
+// ---------------------------------------------------------------------------
+// The float path
+
+fn read_sample_f32(row: &[u8], sample: u32, offset: usize) -> f32 {
+    if sample == pixels.SAMPLE_U8 {
+        return row[offset] as f32 / 255.0f32
+    }
+    if sample == pixels.SAMPLE_U16 {
+        return pixels.get16(row, offset) as f32 / 65535.0f32
+    }
+    if sample == pixels.SAMPLE_F16 {
+        return convert.f32_from_bits(convert.half_to_f32_bits(pixels.get16(row, offset)))
+    }
+    return convert.f32_from_bits(pixels.get32(row, offset))
+}
+
+fn write_sample_f32(row: &mut[u8], sample: u32, offset: usize, value: f32) {
+    if sample == pixels.SAMPLE_F32 {
+        pixels.put32(row, offset, convert.f32_bits(value))
+    } else {
+        pixels.put16(row, offset, convert.f32_bits_to_half(convert.f32_bits(value)))
+    }
+}
+
+// `count` pixels of `row` from pixel `first` as straight f32 RGBA in
+// out[..4 * count].
+fn load_f32(row: &[u8], layout: &pixels.Layout, first: usize, count: usize, out: &mut[f32]) {
+    channels := layout.channel_count()
+    sample := layout.sample_code()
+    size := layout.sample_bytes()
+    bpp := channels * size
+    premultiplied := layout.premultiplied && layout.has_alpha()
+    for i in 0usize..count {
+        p := (first + i) * bpp
+        r := read_sample_f32(row, sample, p)
+        g := r
+        b := r
+        a := 1.0f32
+        if channels >= 3 {
+            g = read_sample_f32(row, sample, p + size)
+            b = read_sample_f32(row, sample, p + 2 * size)
+            if channels == 4 {
+                a = read_sample_f32(row, sample, p + 3 * size)
+            }
+        } else if channels == 2 {
+            a = read_sample_f32(row, sample, p + size)
+        }
+        if premultiplied {
+            if a == 0.0f32 {
+                r = 0.0f32
+                g = 0.0f32
+                b = 0.0f32
+            } else if a != 1.0f32 {
+                r = r / a
+                g = g / a
+                b = b / a
+            }
+        }
+        o := i * 4
+        out[o] = r
+        out[o + 1] = g
+        out[o + 2] = b
+        out[o + 3] = a
+    }
+}
+
+// Write `count` straight f32 RGBA pixels from input[..4 * count] into `row`
+// from pixel `first`. Integer layouts clamp to 0.0..1.0 and round.
+fn store_f32(input: &[f32], row: &mut[u8], layout: &pixels.Layout, first: usize, count: usize) {
+    channels := layout.channel_count()
+    sample := layout.sample_code()
+    if sample < pixels.SAMPLE_F16 {
+        wide := [0u16; 4]
+        for i in 0usize..count {
+            for k in 0usize..4 {
+                wide[k] = convert.f32_bits_to_unorm16(convert.f32_bits(input[i * 4 + k]))
+            }
+            convert.store_rgba16(&wide, row, layout, first + i, 1)
+        }
+        return
+    }
+    size := layout.sample_bytes()
+    bpp := channels * size
+    premultiplied := layout.premultiplied && layout.has_alpha()
+    for i in 0usize..count {
+        o := i * 4
+        r := input[o]
+        g := input[o + 1]
+        b := input[o + 2]
+        a := input[o + 3]
+        if premultiplied {
+            r = r * a
+            g = g * a
+            b = b * a
+        }
+        p := (first + i) * bpp
+        if channels <= 2 {
+            write_sample_f32(row, sample, p, 0.2126f32 * r + 0.7152f32 * g + 0.0722f32 * b)
+            if channels == 2 {
+                write_sample_f32(row, sample, p + size, a)
+            }
+        } else {
+            write_sample_f32(row, sample, p, r)
+            write_sample_f32(row, sample, p + size, g)
+            write_sample_f32(row, sample, p + 2 * size, b)
+            if channels == 4 {
+                write_sample_f32(row, sample, p + 3 * size, a)
+            }
+        }
+    }
+}
+
+// The sRGB transfer curve on a float sample by interpolating the 16-bit
+// integer curves; values outside 0.0..1.0 pass through unchanged.
+fn transfer_f32(value: f32, to_linear: bool) -> f32 {
+    if !(value > 0.0f32) || value >= 1.0f32 {
+        return value
+    }
+    scaled := value * 65535.0f32
+    low := scaled as u32
+    if low > 65534 {
+        low = 65534
+    }
+    fraction := scaled - low as f32
+    a := 0u32
+    b := 0u32
+    if to_linear {
+        a = color.srgb_to_linear16(low as u16) as u32
+        b = color.srgb_to_linear16((low + 1) as u16) as u32
+    } else {
+        a = color.linear_to_srgb16(low as u16) as u32
+        b = color.linear_to_srgb16((low + 1) as u16) as u32
+    }
+    return (a as f32 + (b as f32 - a as f32) * fraction) / 65535.0f32
+}
+
+// ---------------------------------------------------------------------------
+// A 128-bit unsigned counter, for sums that could pass 2^64 on the largest
+// images.
+
+struct Wide {
+    high: u64
+    low: u64
+
+    fn zero() -> Wide {
+        return Wide { high: 0, low: 0 }
+    }
+    fn add(&mut self, value: u64) {
+        sum := core.wrapping_add(self.low, value)
+        if sum < self.low {
+            self.high += 1
+        }
+        self.low = sum
+    }
+    fn is_zero(&self) -> bool {
+        return self.high == 0 && self.low == 0
+    }
+    fn to_f64(&self) -> f64 {
+        return self.high as f64 * 18446744073709551616.0 + self.low as f64
+    }
+}

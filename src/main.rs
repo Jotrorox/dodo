@@ -1,7 +1,7 @@
 //! Command-line driver. Linking is an explicit process invocation, never a shell command.
 use cli::{Action, Invocation, Parsed};
 use dodoc::codegen::{Context, FileType};
-use dodoc::hardware::{ImageFormat, Platform, esp_flash, image, serial};
+use dodoc::hardware::{ImageFormat, Platform, esp_flash, image, serial, stk500};
 use dodoc::{cli, codegen, lsp, package, project, sema, toml};
 use project::{Emit, Purpose, Resolved};
 use std::ffi::{OsStr, OsString};
@@ -498,8 +498,28 @@ fn compile(args: &Args, loaded: &package::Loaded, out: &Path) -> Result<(), Stri
     let mut options = args.options.clone();
     options.entry = args.emit == Emit::Exe;
     options.sources = loaded.sources.clone();
-    let generated = codegen::generate(&context, &loaded.program, &options)
-        .map_err(|e| format!("code generation failed: {e}"))?;
+    let generated = codegen::generate(&context, &loaded.program, &options).map_err(|e| {
+        let text = e.to_string();
+        // Map an embedded "Span { start: N" to file:line for diagnosis.
+        let location = text
+            .split("Span { start: ")
+            .nth(1)
+            .and_then(|rest| rest.split(',').next())
+            .and_then(|n| n.trim().parse::<usize>().ok())
+            .and_then(|at| {
+                loaded
+                    .sources
+                    .iter()
+                    .filter(|s| s.start <= at && at <= s.start + s.text.len())
+                    .max_by_key(|s| s.start)
+                    .map(|s| {
+                        let line = s.text[..at - s.start].matches('\n').count() + 1;
+                        format!(" ({}:{line})", s.path.display())
+                    })
+            })
+            .unwrap_or_default();
+        format!("code generation failed: {text}{location}")
+    })?;
     match args.emit {
         Emit::Ir => generated
             .module
@@ -655,6 +675,11 @@ fn compile(args: &Args, loaded: &package::Loaded, out: &Path) -> Result<(), Stri
             {
                 linker.arg("-ldl");
             }
+            // glibc keeps the math functions (fmod, pow, ...) that libraries
+            // such as std/script/lua declare in libm.
+            if target.contains("-linux-") {
+                linker.arg("-lm");
+            }
             linker.args(&args.link_args).arg("-o").arg(out);
             if args.verbose {
                 eprintln!("Linking: {linker:?}");
@@ -727,7 +752,7 @@ fn link_firmware(
     codegen::compile_ir_object(
         &args.options,
         platform.chip.name,
-        platform.chip.runtime,
+        &(platform.chip.runtime)(),
         &runtime,
     )
     .map_err(|e| format!("cannot build the {} runtime: {e}", platform.chip.name))?;
@@ -770,8 +795,17 @@ fn link_firmware(
     fs::write(&path, flashable).map_err(|e| format!("cannot write {}: {e}", path.display()))
 }
 /// Build firmware and flash it: copy it to the platform's mounted
-/// bootloader drive, or write it through the chip's serial flasher.
+/// bootloader drive, or write it through the board's serial bootloader or
+/// the chip's serial flasher.
 fn flash(args: &mut Args, platform: Platform, loaded: &package::Loaded) -> Result<i32, String> {
+    if let ImageFormat::Stk500 {
+        signature,
+        page_size,
+        baud,
+    } = platform.chip.image
+    {
+        return flash_stk500(args, platform, loaded, signature, page_size, baud);
+    }
     if let ImageFormat::EspFlash {
         chip_id,
         usb,
@@ -870,6 +904,48 @@ fn flash_serial(
             args.input.display(),
             written.bytes.div_ceil(1024),
             port.path.display()
+        );
+    }
+    Ok(0)
+}
+
+/// Build firmware and write it through the board's STK500 serial
+/// bootloader, which then starts it.
+fn flash_stk500(
+    args: &mut Args,
+    platform: Platform,
+    loaded: &package::Loaded,
+    signature: [u8; 3],
+    page_size: u16,
+    baud: u32,
+) -> Result<i32, String> {
+    let port = stk500::find_port(platform.description())?;
+    let temp = TempDir::new(&std::env::temp_dir())?;
+    let elf = temp.0.join("firmware.elf");
+    args.emit = Emit::Exe;
+    compile(args, loaded, &elf)?;
+    let bytes = fs::read(&elf).map_err(|e| e.to_string())?;
+    let flash = platform.flash();
+    let flashable = image::flat(&bytes, &image::load_segments(&bytes)?, flash.origin);
+    if args.verbose {
+        eprintln!("Flashing: {} -> {}", elf.display(), port.display());
+    }
+    let written = stk500::flash(
+        &port,
+        baud,
+        &flashable,
+        signature,
+        page_size,
+        flash.length,
+        args.verbose,
+    )?;
+    if !args.quiet {
+        eprintln!(
+            "Flashed {} ({} of {} bytes of flash) on {}",
+            args.input.display(),
+            written.bytes,
+            flash.length,
+            port.display()
         );
     }
     Ok(0)

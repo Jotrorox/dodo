@@ -20,14 +20,18 @@
 //! list the chip in [`CHIPS`]. Adding a board: add a [`BOARDS`] entry and a
 //! `std/embedded/board/BOARD` package that follows the board contract in
 //! `std/embedded/hal`.
+use std::borrow::Cow;
 use std::path::PathBuf;
 
+mod atmega328p;
+pub mod avr;
 mod esp32c6;
 pub mod esp_flash;
 pub mod image;
 mod rp2040;
 mod rp2350;
 pub mod serial;
+pub mod stk500;
 
 #[derive(Debug)]
 pub struct Chip {
@@ -43,7 +47,7 @@ pub struct Chip {
     pub default_flash_size: u32,
     pub ram: Region,
     /// Startup code and runtime helpers, as LLVM IR text.
-    pub runtime: &'static str,
+    pub runtime: fn() -> Cow<'static, str>,
     /// Linker script sections; the platform prepends its MEMORY block.
     pub linker_script: &'static str,
     /// The C symbol the runtime defines weakly as the panic hook.
@@ -54,6 +58,10 @@ pub struct Chip {
     pub interrupts: &'static [&'static str],
     /// How the hardware enters `@interrupt` handlers.
     pub interrupt_abi: InterruptAbi,
+    /// The optimization level when no setting chooses one. AVR's 32 KiB of
+    /// flash and 2 KiB of SRAM fit few unoptimized programs, so its chips
+    /// default to 2; others to the usual 0.
+    pub opt_level: u8,
     /// The default ELF linker.
     pub linker: &'static str,
     /// The standard library package `import "std/embedded/chip"` selects.
@@ -107,6 +115,15 @@ pub enum ImageFormat {
         usb: serial::UsbId,
         download_flag: esp_flash::DownloadFlag,
     },
+    /// Intel HEX of the flash contents, which `dodo run` writes through the
+    /// board's serial bootloader, speaking STK500 version 1 at `baud` (see
+    /// [`stk500`]), to a chip with the device `signature` and flash pages of
+    /// `page_size` bytes.
+    Stk500 {
+        signature: [u8; 3],
+        page_size: u16,
+        baud: u32,
+    },
 }
 
 #[derive(Debug)]
@@ -119,7 +136,12 @@ pub struct Board {
     pub package: &'static str,
 }
 
-pub static CHIPS: &[&Chip] = &[&rp2040::CHIP, &rp2350::CHIP, &esp32c6::CHIP];
+pub static CHIPS: &[&Chip] = &[
+    &rp2040::CHIP,
+    &rp2350::CHIP,
+    &esp32c6::CHIP,
+    &atmega328p::CHIP,
+];
 
 pub static BOARDS: &[Board] = &[
     Board {
@@ -149,6 +171,14 @@ pub static BOARDS: &[Board] = &[
         chip: &esp32c6::CHIP,
         flash_size: 8 * 1024 * 1024,
         package: "std/embedded/board/esp32c6_devkitc",
+    },
+    Board {
+        name: "arduino_uno",
+        description: "Arduino Uno",
+        chip: &atmega328p::CHIP,
+        // Optiboot takes the top 512 bytes.
+        flash_size: 32 * 1024 - 512,
+        package: "std/embedded/board/arduino_uno",
     },
 ];
 
@@ -242,6 +272,7 @@ impl Platform {
         match self.chip.image {
             ImageFormat::Uf2 { .. } => "uf2",
             ImageFormat::EspFlash { .. } => "bin",
+            ImageFormat::Stk500 { .. } => "hex",
         }
     }
 
@@ -267,6 +298,10 @@ impl Platform {
         Ok(match self.chip.image {
             ImageFormat::Uf2 { family, .. } => image::uf2(elf, &segments, family),
             ImageFormat::EspFlash { .. } => image::flat(elf, &segments, flash.origin),
+            ImageFormat::Stk500 { .. } => {
+                avr::intel_hex(&image::flat(elf, &segments, flash.origin), flash.origin)
+                    .into_bytes()
+            }
         })
     }
 
@@ -276,6 +311,7 @@ impl Platform {
         match self.chip.image {
             ImageFormat::Uf2 { drive_id, .. } => image::uf2_drives(drive_id),
             ImageFormat::EspFlash { .. } => vec![],
+            ImageFormat::Stk500 { .. } => vec![],
         }
     }
 
@@ -283,6 +319,7 @@ impl Platform {
         match self.chip.image {
             ImageFormat::Uf2 { drive_id, .. } => drive_id,
             ImageFormat::EspFlash { .. } => "",
+            ImageFormat::Stk500 { .. } => "",
         }
     }
 }
@@ -340,7 +377,7 @@ mod tests {
         assert!(
             Platform::select(None, Some("rp2041"))
                 .unwrap_err()
-                .contains("available chips: rp2040, rp2350, esp32c6")
+                .contains("available chips: rp2040, rp2350, esp32c6, atmega328p")
         );
     }
 
@@ -418,8 +455,8 @@ mod tests {
     #[test]
     fn interrupt_names_match_the_runtime_vector_tables() {
         for chip in CHIPS {
-            let weak: Vec<&str> = chip
-                .runtime
+            let runtime = (chip.runtime)();
+            let weak: Vec<&str> = runtime
                 .lines()
                 .filter_map(|line| line.strip_prefix("module asm \".weak "))
                 .flat_map(|names| names.trim_end_matches('"').split(", "))
@@ -429,15 +466,21 @@ mod tests {
                 .collect();
             assert_eq!(weak, chip.interrupts, "{}", chip.name);
             // The ESP32-C6's handlers follow its dispatch table's label;
-            // the Cortex-M tables mix the IRQs with exception handlers.
+            // Cortex-M tables hold addresses, mixing the IRQs with exception
+            // handlers; AVR's hold a jmp per vector.
             let dispatched = chip.interrupt_abi == InterruptAbi::Dispatched;
+            let jumps = runtime
+                .lines()
+                .filter_map(|line| line.strip_prefix("module asm \"    jmp "))
+                .map(|name| name.trim_end_matches('"'))
+                .filter(|&name| name != "__reset");
             let lines: Vec<&str> = if dispatched {
-                chip.runtime
+                runtime
                     .lines()
                     .skip_while(|line| !line.contains("dodo_interrupt_table:"))
                     .collect()
             } else {
-                chip.runtime.lines().collect()
+                runtime.lines().collect()
             };
             let table: Vec<&str> = lines
                 .iter()
@@ -452,6 +495,7 @@ mod tests {
                         .split(", ")
                 })
                 .filter(|name| dispatched || name.contains("_IRQ") || name.starts_with("IRQ"))
+                .chain(jumps)
                 .collect();
             let irqs: Vec<&str> = chip
                 .interrupts
@@ -496,6 +540,37 @@ mod tests {
         assert!(script.contains("RAM (rwx) : ORIGIN = 0x40800000, LENGTH = 0x7e610"));
         let custom = Platform::select(None, Some("esp32c6")).unwrap().unwrap();
         assert_eq!(custom.flash().length, 4 * 1024 * 1024);
+    }
+
+    #[test]
+    fn uno_images_are_intel_hex_below_the_bootloader() {
+        let platform = Platform::select(Some("arduino_uno"), None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(platform.chip.name, "atmega328p");
+        assert_eq!(platform.image_extension(), "hex");
+        assert!(platform.bootloader_drives().is_empty());
+        let script = platform.linker_script();
+        assert!(script.contains("FLASH (rx) : ORIGIN = 0x00000000, LENGTH = 0x7e00"));
+        assert!(script.contains("RAM (rwx) : ORIGIN = 0x00800100, LENGTH = 0x800"));
+        // A jmp to word 0x34, then .data's load image after a gap.
+        let mut vectors = vec![0x0C, 0x94, 0x34, 0x00];
+        vectors.resize(104, 0);
+        let mut file = elf(&[(0, &vectors), (0x70, &[9, 8])]);
+        let image = String::from_utf8(platform.finish(&mut file).unwrap()).unwrap();
+        assert!(image.starts_with(":100000000C943400000000000000000000000000"));
+        assert!(image.contains(":0200700009087D\n"));
+        let mut file = elf(&[(0, &[0; 104])]);
+        assert!(
+            platform
+                .finish(&mut file)
+                .unwrap_err()
+                .contains("reset vector")
+        );
+        let mut file = elf(&[(0, &vectors), (0x7E00, &[1])]);
+        assert!(platform.finish(&mut file).unwrap_err().contains("outside"));
+        let custom = Platform::select(None, Some("atmega328p")).unwrap().unwrap();
+        assert_eq!(custom.flash().length, 32 * 1024);
     }
 
     #[test]

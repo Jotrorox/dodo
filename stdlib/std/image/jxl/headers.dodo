@@ -1,0 +1,502 @@
+package jxl
+
+import "std/image/pixels"
+
+// Codestream headers: SizeHeader, ImageMetadata (bit depth, extra channels,
+// color encoding, tone mapping, orientation, animation, preview) and
+// CustomTransformData (opsin inverse matrix, upsampling weights).
+
+// Extra channels supported per image; files with more fail Unsupported.
+const MAX_EXTRA: usize = 64
+
+// Extra channel types.
+const EC_ALPHA: u32 = 0
+const EC_DEPTH: u32 = 1
+const EC_SPOT: u32 = 2
+const EC_SELECTION: u32 = 3
+const EC_BLACK: u32 = 4
+const EC_CFA: u32 = 5
+const EC_THERMAL: u32 = 6
+const EC_NON_OPTIONAL: u32 = 15
+const EC_OPTIONAL: u32 = 16
+
+// ColourEncoding color spaces.
+const CS_RGB: u32 = 0
+const CS_GREY: u32 = 1
+const CS_XYB: u32 = 2
+const CS_UNKNOWN: u32 = 3
+
+// White points and primaries.
+const WP_D65: u32 = 1
+const WP_CUSTOM: u32 = 2
+const WP_E: u32 = 10
+const WP_DCI: u32 = 11
+const PR_SRGB: u32 = 1
+const PR_CUSTOM: u32 = 2
+const PR_2100: u32 = 9
+const PR_P3: u32 = 11
+
+// Transfer functions (gamma is separate).
+const TF_709: u32 = 1
+const TF_UNKNOWN: u32 = 2
+const TF_LINEAR: u32 = 8
+const TF_SRGB: u32 = 13
+const TF_PQ: u32 = 16
+const TF_DCI: u32 = 17
+const TF_HLG: u32 = 18
+
+struct ImageHeader {
+    width: u32
+    height: u32
+    orientation: u32
+    have_preview: bool
+    preview_width: u32
+    preview_height: u32
+    animated: bool
+    tps_numerator: u32
+    tps_denominator: u32
+    loops: u32
+    have_timecodes: bool
+    // Bits per sample; exp_bits > 0 for floating-point samples.
+    bits: u32
+    exp_bits: u32
+    modular16: bool
+    num_extra: u32
+    ec_type: [MAX_EXTRA]u32
+    ec_bits: [MAX_EXTRA]u32
+    ec_exp_bits: [MAX_EXTRA]u32
+    ec_dim_shift: [MAX_EXTRA]u32
+    ec_associated: [MAX_EXTRA]bool
+    xyb: bool
+    // ColourEncoding.
+    want_icc: bool
+    color_space: u32
+    white_point: u32
+    white_x: i32
+    white_y: i32
+    primaries: u32
+    red_x: i32
+    red_y: i32
+    green_x: i32
+    green_y: i32
+    blue_x: i32
+    blue_y: i32
+    have_gamma: bool
+    // Encoding exponent times 10^7.
+    gamma: u32
+    transfer: u32
+    intent: u32
+    // ToneMapping.
+    intensity_target: f32
+    min_nits: f32
+    relative_to_max_display: bool
+    linear_below: f32
+    // CustomTransformData.
+    opsin: [9]f32
+    opsin_bias: [3]f32
+    quant_bias: [3]f32
+    quant_bias_numerator: f32
+    // Bit 0: custom 2x upsampling weights, bit 1: 4x, bit 2: 8x; their
+    // F16 values start at weights_bit.
+    custom_weights: u32
+    weights_bit: u64
+    // Where the ICC stream starts (when want_icc) and the logical byte
+    // offset of the first frame header (the preview frame, if any).
+    icc_bit: u64
+    icc_enc_size: u64
+    frames_byte: usize
+
+    fn clone_header(&self) -> ImageHeader {
+        c := default_header()
+        c.width = self.width
+        c.height = self.height
+        c.orientation = self.orientation
+        c.have_preview = self.have_preview
+        c.preview_width = self.preview_width
+        c.preview_height = self.preview_height
+        c.animated = self.animated
+        c.tps_numerator = self.tps_numerator
+        c.tps_denominator = self.tps_denominator
+        c.loops = self.loops
+        c.have_timecodes = self.have_timecodes
+        c.bits = self.bits
+        c.exp_bits = self.exp_bits
+        c.modular16 = self.modular16
+        c.num_extra = self.num_extra
+        c.xyb = self.xyb
+        c.want_icc = self.want_icc
+        c.color_space = self.color_space
+        c.white_point = self.white_point
+        c.white_x = self.white_x
+        c.white_y = self.white_y
+        c.primaries = self.primaries
+        c.red_x = self.red_x
+        c.red_y = self.red_y
+        c.green_x = self.green_x
+        c.green_y = self.green_y
+        c.blue_x = self.blue_x
+        c.blue_y = self.blue_y
+        c.have_gamma = self.have_gamma
+        c.gamma = self.gamma
+        c.transfer = self.transfer
+        c.intent = self.intent
+        c.intensity_target = self.intensity_target
+        c.min_nits = self.min_nits
+        c.relative_to_max_display = self.relative_to_max_display
+        c.linear_below = self.linear_below
+        c.quant_bias_numerator = self.quant_bias_numerator
+        c.custom_weights = self.custom_weights
+        c.weights_bit = self.weights_bit
+        c.icc_bit = self.icc_bit
+        c.icc_enc_size = self.icc_enc_size
+        c.frames_byte = self.frames_byte
+        for i in 0usize..MAX_EXTRA {
+            c.ec_type[i] = self.ec_type[i]
+            c.ec_bits[i] = self.ec_bits[i]
+            c.ec_exp_bits[i] = self.ec_exp_bits[i]
+            c.ec_dim_shift[i] = self.ec_dim_shift[i]
+            c.ec_associated[i] = self.ec_associated[i]
+        }
+        for i in 0usize..9 {
+            c.opsin[i] = self.opsin[i]
+        }
+        for i in 0usize..3 {
+            c.opsin_bias[i] = self.opsin_bias[i]
+            c.quant_bias[i] = self.quant_bias[i]
+        }
+        return c
+    }
+
+    fn is_gray(&self) -> bool {
+        return self.color_space == CS_GREY
+    }
+
+    // The first alpha extra channel, or MAX_EXTRA when there is none.
+    fn alpha_channel(&self) -> usize {
+        for i in 0usize..self.num_extra as usize {
+            if self.ec_type[i] == EC_ALPHA {
+                return i
+            }
+        }
+        return MAX_EXTRA
+    }
+}
+
+fn default_header() -> ImageHeader {
+    return ImageHeader { width: 0, height: 0, orientation: 1, have_preview: false, preview_width: 0, preview_height: 0, animated: false, tps_numerator: 0, tps_denominator: 0, loops: 0, have_timecodes: false, bits: 8, exp_bits: 0, modular16: true, num_extra: 0, ec_type: [0u32; MAX_EXTRA], ec_bits: [8u32; MAX_EXTRA], ec_exp_bits: [0u32; MAX_EXTRA], ec_dim_shift: [0u32; MAX_EXTRA], ec_associated: [false; MAX_EXTRA], xyb: true, want_icc: false, color_space: CS_RGB, white_point: WP_D65, white_x: 312700, white_y: 329000, primaries: PR_SRGB, red_x: 640000, red_y: 330000, green_x: 300000, green_y: 600000, blue_x: 150000, blue_y: 60000, have_gamma: false, gamma: 0, transfer: TF_SRGB, intent: 1, intensity_target: 255.0, min_nits: 0.0, relative_to_max_display: false, linear_below: 0.0, opsin: [11.031566901960783f32, -9.866943921568629, -0.16462299647058826, -3.254147380392157, 4.418770392156863, -0.16462299647058826, -3.6588512862745097, 2.7129230470588235, 1.9459282392156863], opsin_bias: [-0.0037930732552754493f32; 3], quant_bias: [0.94534993f32, 0.92994550, 0.95006490], quant_bias_numerator: 0.145, custom_weights: 0, weights_bit: 0, icc_bit: 0, icc_enc_size: 0, frames_byte: 0 }
+}
+
+// SizeHeader: (width, height).
+fn read_size(r: &mut Reader) -> u64 {
+    div8 := r.bit()
+    height := 0u64
+    if div8 {
+        height = (r.bits(5) as u64 + 1) * 8
+    } else {
+        height = r.u32c(dist(1, 9), dist(1, 13), dist(1, 18), dist(1, 30)) as u64
+    }
+    ratio := r.bits(3)
+    width := ratio_width(ratio, height)
+    if ratio == 0 {
+        if div8 {
+            width = (r.bits(5) as u64 + 1) * 8
+        } else {
+            width = r.u32c(dist(1, 9), dist(1, 13), dist(1, 18), dist(1, 30)) as u64
+        }
+    }
+    return (width << 32) | height
+}
+
+fn ratio_width(ratio: u32, height: u64) -> u64 {
+    if ratio == 1 {
+        return height
+    }
+    if ratio == 2 {
+        return height * 12 / 10
+    }
+    if ratio == 3 {
+        return height * 4 / 3
+    }
+    if ratio == 4 {
+        return height * 3 / 2
+    }
+    if ratio == 5 {
+        return height * 16 / 9
+    }
+    if ratio == 6 {
+        return height * 5 / 4
+    }
+    if ratio == 7 {
+        return height * 2
+    }
+    return 0
+}
+
+// BitDepth: bits << 8 | exp_bits.
+fn read_bit_depth(r: &mut Reader) -> u32!pixels.Error {
+    if r.bit() {
+        bits := r.u32c(dist(32, 0), dist(16, 0), dist(24, 0), dist(1, 6))
+        exp_bits := r.bits(4) + 1
+        if exp_bits < 2 || exp_bits > 8 || bits < exp_bits + 3 || bits - exp_bits - 1 > 23 {
+            return err(pixels.Error.Malformed)
+        }
+        return ok((bits << 8) | exp_bits)
+    }
+    bits := r.u32c(dist(8, 0), dist(10, 0), dist(12, 0), dist(1, 6))
+    if bits < 1 || bits > 31 {
+        return err(pixels.Error.Malformed)
+    }
+    return ok(bits << 8)
+}
+
+fn skip_name(r: &mut Reader) {
+    length := r.u32c(dist(0, 0), dist(0, 4), dist(16, 5), dist(48, 10))
+    r.skip(length as u64 * 8)
+}
+
+fn read_extensions(r: &mut Reader) {
+    extensions := r.u64c()
+    total := 0u64
+    for i in 0u64..64 {
+        if ((extensions >> i) & 1) != 0 {
+            length := r.u64c()
+            if length > 0xffffffffffff || total > 0xffffffffffff {
+                r.overrun = true
+                return
+            }
+            total += length
+        }
+    }
+    r.skip(total)
+}
+
+fn read_customxy(r: &mut Reader) -> i32 {
+    return unpack_signed(r.u32c(dist(0, 19), dist(524288, 19), dist(1048576, 20), dist(2097152, 21)))
+}
+
+fn read_color_encoding(r: &mut Reader, h: &mut ImageHeader) -> void!pixels.Error {
+    if r.bit() {
+        return ok()
+    }
+    h.want_icc = r.bit()
+    h.color_space = r.enumv()
+    if h.color_space > 3 {
+        return err(pixels.Error.Malformed)
+    }
+    if h.want_icc {
+        return ok()
+    }
+    if h.color_space != CS_XYB {
+        h.white_point = r.enumv()
+        if h.white_point == WP_CUSTOM {
+            h.white_x = read_customxy(r)
+            h.white_y = read_customxy(r)
+        } else if h.white_point == WP_E {
+            h.white_x = 333333
+            h.white_y = 333333
+        } else if h.white_point == WP_DCI {
+            h.white_x = 314000
+            h.white_y = 351000
+        } else if h.white_point != WP_D65 {
+            return err(pixels.Error.Malformed)
+        }
+        if h.color_space != CS_GREY {
+            h.primaries = r.enumv()
+            if h.primaries == PR_CUSTOM {
+                h.red_x = read_customxy(r)
+                h.red_y = read_customxy(r)
+                h.green_x = read_customxy(r)
+                h.green_y = read_customxy(r)
+                h.blue_x = read_customxy(r)
+                h.blue_y = read_customxy(r)
+            } else if h.primaries == PR_2100 {
+                h.red_x = 708000
+                h.red_y = 292000
+                h.green_x = 170000
+                h.green_y = 797000
+                h.blue_x = 131000
+                h.blue_y = 46000
+            } else if h.primaries == PR_P3 {
+                h.red_x = 680000
+                h.red_y = 320000
+                h.green_x = 265000
+                h.green_y = 690000
+                h.blue_x = 150000
+                h.blue_y = 60000
+            } else if h.primaries != PR_SRGB {
+                return err(pixels.Error.Malformed)
+            }
+        }
+    }
+    h.have_gamma = r.bit()
+    if h.have_gamma {
+        h.gamma = r.bits(24)
+        if h.gamma == 0 || h.gamma > 10000000 {
+            return err(pixels.Error.Malformed)
+        }
+    } else {
+        h.transfer = r.enumv()
+        t := h.transfer
+        if t != TF_709 && t != TF_UNKNOWN && t != TF_LINEAR && t != TF_SRGB && t != TF_PQ && t != TF_DCI && t != TF_HLG {
+            return err(pixels.Error.Malformed)
+        }
+    }
+    h.intent = r.enumv()
+    if h.intent > 3 {
+        return err(pixels.Error.Malformed)
+    }
+    return ok()
+}
+
+// Parse the headers up to the first frame. The ICC stream, when present, is
+// skipped with `work` (see skip_icc), so the frame offset is known.
+fn read_headers(r: &mut Reader, work: &mut[u8]) -> ImageHeader!pixels.Error {
+    if r.bits(16) != 0x0aff {
+        return err(pixels.Error.Malformed)
+    }
+    h := default_header()
+    size := read_size(r)
+    h.width = (size >> 32) as u32
+    h.height = (size & 0xffffffff) as u32
+    if (size >> 32) > pixels.MAX_DIMENSION as u64 || (size & 0xffffffff) > pixels.MAX_DIMENSION as u64 {
+        return err(pixels.Error.TooLarge)
+    }
+    if h.width == 0 || h.height == 0 {
+        return err(pixels.Error.Malformed)
+    }
+    all_default := r.bit()
+    if !all_default {
+        extra_fields := r.bit()
+        if extra_fields {
+            h.orientation = r.bits(3) + 1
+            if r.bit() {
+                read_size(r)
+            }
+            if r.bit() {
+                h.have_preview = true
+                div8 := r.bit()
+                ph := 0u64
+                if div8 {
+                    ph = r.u32c(dist(16, 0), dist(32, 0), dist(1, 5), dist(33, 9)) as u64 * 8
+                } else {
+                    ph = r.u32c(dist(1, 6), dist(65, 8), dist(321, 10), dist(1345, 12)) as u64
+                }
+                ratio := r.bits(3)
+                pw := ratio_width(ratio, ph)
+                if ratio == 0 {
+                    if div8 {
+                        pw = r.u32c(dist(16, 0), dist(32, 0), dist(1, 5), dist(33, 9)) as u64 * 8
+                    } else {
+                        pw = r.u32c(dist(1, 6), dist(65, 8), dist(321, 10), dist(1345, 12)) as u64
+                    }
+                }
+                if pw > 4096 || ph > 4096 || pw == 0 || ph == 0 {
+                    return err(pixels.Error.Malformed)
+                }
+                h.preview_width = pw as u32
+                h.preview_height = ph as u32
+            }
+            if r.bit() {
+                h.animated = true
+                h.tps_numerator = r.u32c(dist(100, 0), dist(1000, 0), dist(1, 10), dist(1, 30))
+                h.tps_denominator = r.u32c(dist(1, 0), dist(1001, 0), dist(1, 8), dist(1, 10))
+                h.loops = r.u32c(dist(0, 0), dist(0, 3), dist(0, 16), dist(0, 32))
+                h.have_timecodes = r.bit()
+            }
+        }
+        depth := read_bit_depth(r)?
+        h.bits = depth >> 8
+        h.exp_bits = depth & 255
+        h.modular16 = r.bit()
+        h.num_extra = r.u32c(dist(0, 0), dist(1, 0), dist(2, 4), dist(1, 12))
+        if h.num_extra as usize > MAX_EXTRA {
+            return err(pixels.Error.Unsupported)
+        }
+        for i in 0usize..h.num_extra as usize {
+            if r.bit() {
+                // Default: 8-bit unassociated alpha.
+                continue
+            }
+            kind := r.enumv()
+            if kind > 6 && kind != EC_NON_OPTIONAL && kind != EC_OPTIONAL {
+                return err(pixels.Error.Malformed)
+            }
+            h.ec_type[i] = kind
+            ec_depth := read_bit_depth(r)?
+            h.ec_bits[i] = ec_depth >> 8
+            h.ec_exp_bits[i] = ec_depth & 255
+            h.ec_dim_shift[i] = r.u32c(dist(0, 0), dist(3, 0), dist(4, 0), dist(1, 3))
+            skip_name(r)
+            if kind == EC_ALPHA {
+                h.ec_associated[i] = r.bit()
+            } else if kind == EC_SPOT {
+                r.f16()
+                r.f16()
+                r.f16()
+                r.f16()
+            } else if kind == EC_CFA {
+                r.u32c(dist(1, 0), dist(0, 2), dist(3, 4), dist(19, 8))
+            }
+        }
+        h.xyb = r.bit()
+        read_color_encoding(r, &mut h)?
+        if extra_fields {
+            if !r.bit() {
+                h.intensity_target = r.f16()
+                h.min_nits = r.f16()
+                h.relative_to_max_display = r.bit()
+                h.linear_below = r.f16()
+                if !(h.intensity_target > 0.0) || h.min_nits < 0.0 || h.min_nits > h.intensity_target || h.linear_below < 0.0 {
+                    return err(pixels.Error.Malformed)
+                }
+            }
+        }
+        read_extensions(r)
+    }
+    if !r.bit() {
+        if h.xyb && !r.bit() {
+            for i in 0usize..9 {
+                h.opsin[i] = r.f16()
+            }
+            for i in 0usize..3 {
+                h.opsin_bias[i] = r.f16()
+            }
+            for i in 0usize..3 {
+                h.quant_bias[i] = r.f16()
+            }
+            h.quant_bias_numerator = r.f16()
+        }
+        h.custom_weights = r.bits(3)
+        h.weights_bit = r.position()
+        count := 0u64
+        if (h.custom_weights & 1) != 0 {
+            count += 15
+        }
+        if (h.custom_weights & 2) != 0 {
+            count += 55
+        }
+        if (h.custom_weights & 4) != 0 {
+            count += 210
+        }
+        r.skip(count * 16)
+    }
+    if r.broken {
+        return err(pixels.Error.Malformed)
+    }
+    if r.overrun {
+        return err(pixels.Error.Truncated)
+    }
+    if h.color_space == CS_XYB && !h.want_icc && h.have_gamma && h.gamma != 3333333 {
+        return err(pixels.Error.Malformed)
+    }
+    h.icc_bit = r.position()
+    if h.want_icc {
+        h.icc_enc_size = skip_icc(r, work)?
+    }
+    r.pad()
+    if r.overrun {
+        return err(pixels.Error.Truncated)
+    }
+    h.frames_byte = r.byte_position()
+    return ok(h)
+}

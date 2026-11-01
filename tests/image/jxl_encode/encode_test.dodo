@@ -1,0 +1,662 @@
+package jxl_encode
+
+import "core/bytes"
+import "core/mem"
+import "std/env"
+import "std/fs"
+import "std/image/color"
+import "std/image/jxl"
+import "std/image/jxl/encode"
+import "std/image/pixels"
+import "std/image/sink"
+import "std/platform"
+import "std/platform/error"
+import "std/text"
+
+// Tests of the JPEG XL lossless encoder (std/image/jxl/encode).
+//
+// Run from the repository root:
+//
+//     dodo test tests/image/jxl_encode
+//
+// Golden files: tests/image/jxl_encode/golden/NAME-eN.jxl is the exact
+// encoding of the image make_image(NAME) at effort N. The encoder is
+// integer-only, so the bytes are the same on every target and optimization
+// level. tests/image/jxl_encode/verify.py checks such files bit-exactly
+// against libjxl's djxl. After an intended encoder change, verify with that
+// script, then regenerate and commit:
+//
+//     DODO_UPDATE_GOLDEN=1 dodo test tests/image/jxl_encode
+//
+// Round trips through our own decoder: check_round_trip() receives every
+// encoded file with the pixels it must decode to, checks the headers,
+// decodes it with std/image/jxl into the source's layout and compares
+// sample for sample.
+
+const PIXEL_LIMIT: usize = 262144
+const OUTPUT_LIMIT: usize = 1048576
+const SCRATCH_LIMIT: usize = 4194304
+
+static mut PIXELS: [262144]u8 = [0u8; 262144]
+static mut PIXELS2: [262144]u8 = [0u8; 262144]
+static mut OUTPUT: [1048576]u8 = [0u8; 1048576]
+static mut OUTPUT2: [1048576]u8 = [0u8; 1048576]
+static mut SCRATCH: [4194304]u8 = [0u8; 4194304]
+static mut DECODED: [1048576]u8 = [0u8; 1048576]
+static mut DECODE_SCRATCH: [33554432]u8 = [0u8; 33554432]
+
+// ---------------------------------------------------------------------------
+// Test images
+
+// Test images by number (string names would be static borrows, which
+// conflict with the mutable static buffers).
+const GRADIENT_RGB8: u32 = 0
+const FEW_RGBA8: u32 = 1
+const NOISE_GRAY16: u32 = 2
+const EDGES_GA8: u32 = 3
+const WIDE_RGB8: u32 = 4
+const TINY_GRAY8: u32 = 5
+const IMAGES: u32 = 6
+
+const WIDTHS: [6]u32 = [16, 24, 9, 7, 300, 1]
+const HEIGHTS: [6]u32 = [8, 16, 5, 3, 20, 1]
+
+fn image_name(id: u32) -> &str from(static) {
+    if id == GRADIENT_RGB8 {
+        return "gradient-rgb8"
+    }
+    if id == FEW_RGBA8 {
+        return "few-rgba8"
+    }
+    if id == NOISE_GRAY16 {
+        return "noise-gray16"
+    }
+    if id == EDGES_GA8 {
+        return "edges-ga8"
+    }
+    if id == WIDE_RGB8 {
+        return "wide-rgb8"
+    }
+    return "tiny-gray8"
+}
+
+// Fill `data` with test image `id` and return its layout.
+fn make_image(id: u32, data: &mut[u8]) -> pixels.Layout {
+    w := WIDTHS[id as usize] as usize
+    h := HEIGHTS[id as usize] as usize
+    if id == GRADIENT_RGB8 || id == WIDE_RGB8 {
+        fill(data, w, h, 3, 1, 0)
+        return pixels.Layout.rgb8()
+    }
+    if id == FEW_RGBA8 {
+        fill(data, w, h, 4, 1, 1)
+        return pixels.Layout.rgba8()
+    }
+    if id == NOISE_GRAY16 {
+        fill(data, w, h, 1, 2, 2)
+        return pixels.Layout.gray16()
+    }
+    if id == EDGES_GA8 {
+        fill(data, w, h, 2, 1, 3)
+        return pixels.Layout.gray_alpha8()
+    }
+    fill(data, w, h, 1, 1, 0)
+    return pixels.Layout.gray8()
+}
+
+// Pattern 0: gradients; 1: five colors in blocks; 2: noise; 3: edges.
+fn fill(data: &mut[u8], width: usize, height: usize, channels: usize, size: usize, pattern: u32) {
+    seed := 12345u32
+    for y in 0usize..height {
+        for x in 0usize..width {
+            for c in 0usize..channels {
+                v := 0u32
+                if pattern == 0 {
+                    v = ((x * (c + 2) + y * (5 - c)) * 7) as u32
+                } else if pattern == 1 {
+                    block := ((x / 5) + (y / 4) * 3) % 5
+                    v = (block * 53 + c * 31) as u32
+                } else if pattern == 2 {
+                    seed = core.wrapping_add(core.wrapping_mul(seed, 1103515245u32), 12345u32)
+                    v = seed >> 8
+                } else {
+                    if (x + 2 * y) % 5 < 2 {
+                        v = 250
+                    } else {
+                        v = (c * 40) as u32
+                    }
+                }
+                at := ((y * width + x) * channels + c) * size
+                data[at] = (v & 255) as u8
+                if size == 2 {
+                    data[at + 1] = ((v >> 8) & 255) as u8
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+
+fn variable(name: &str, output: &mut[u8]) -> Option<&str> from(output) {
+    workspace := env.Workspace.new()
+    match env.get(name, output, &mut workspace, platform.TextPolicy.Strict) {
+        ok(value) => {
+            return value
+        }
+        err(_) => {
+            return none
+        }
+    }
+}
+
+fn updating() -> bool {
+    storage := [0u8; 16]
+    match variable("DODO_UPDATE_GOLDEN", &mut storage) {
+        some(value) => {
+            return !bytes.equal(mem.str_bytes(value), b"") && !bytes.equal(mem.str_bytes(value), b"0")
+        }
+        none => {
+            return false
+        }
+    }
+}
+
+// Compare `encoded` with golden/NAME-eEFFORT.jxl, or write it when updating.
+fn golden(id: u32, effort: u32, encoded: &[u8]) {
+    name := image_name(id)
+    path_storage := [0u8; 256]
+    builder := text.Builder.new(&mut path_storage)
+    first := text.Text.from_str("tests/image/jxl_encode/golden/")
+    builder.append(&first)!
+    second := text.Text.from_str(name)
+    builder.append(&second)!
+    digit := [0x2Du8, 0x65, 0x30 + effort as u8]
+    third := text.Text.new(&digit)!
+    builder.append(&third)!
+    fourth := text.Text.from_str(".jxl")
+    builder.append(&fourth)!
+    built := builder.as_text()
+    path := built.as_str()
+    workspace := platform.workspace()
+    if updating() {
+        fs.write_file(path, encoded, &mut workspace)!
+        return
+    }
+    stored := [0u8; 65536]
+    match fs.read_file(path, &mut stored, &mut workspace) {
+        ok(report) => {
+            assert(report.eof, "golden file larger than the test's buffer")
+            assert_eq(report.read, encoded.len, "encoded size differs from the golden file; verify with verify.py and regenerate with DODO_UPDATE_GOLDEN=1")
+            assert(bytes.equal(&stored[..report.read], encoded), "encoded bytes differ from the golden file; verify with verify.py and regenerate with DODO_UPDATE_GOLDEN=1")
+        }
+        err(reason) => {
+            assert(reason.cause.kind != error.Kind.NotFound, "golden file missing: run from the repository root, or create it with DODO_UPDATE_GOLDEN=1")
+            assert(false, "golden file unreadable")
+        }
+    }
+}
+
+// Encode with exactly the advertised scratch and output bounds.
+fn encode_view(view: &pixels.View, options: &encode.EncodeOptions, output: &mut[u8]) -> usize {
+    layout := view.layout()
+    need := encode.encode_scratch_size(view.width(), view.height(), layout, options)!
+    bound := encode.max_encoded_size(view.width(), view.height(), layout, options)!
+    assert(need <= SCRATCH_LIMIT, "test scratch too small")
+    assert(bound <= output.len, "test output too small")
+    scratch := unsafe {
+        &mut SCRATCH
+    }
+    n := encode.encode(view, options, &mut output[..bound], &mut scratch[..need])!
+    assert(n <= bound, "output exceeds max_encoded_size")
+    return n
+}
+
+// What the codestream headers say.
+struct Info {
+    width: u32
+    height: u32
+    bits: u32
+    float: bool
+    extra: u32
+    associated: bool
+    gray: bool
+    orientation: u32
+}
+
+// LSB-first reader for header checks.
+struct Reader {
+    data: &[u8]
+    bit: usize
+
+    fn read(&mut self, n: u32) -> u32 {
+        v := 0u32
+        for i in 0u32..n {
+            byte := self.data[self.bit / 8] as u32
+            v = v | (((byte >> ((self.bit % 8) as u32)) & 1) << i)
+            self.bit += 1
+        }
+        return v
+    }
+    fn u32(&mut self, o0: u32, b0: u32, o1: u32, b1: u32, o2: u32, b2: u32, o3: u32, b3: u32) -> u32 {
+        selector := self.read(2)
+        if selector == 0 {
+            return o0 + self.read(b0)
+        }
+        if selector == 1 {
+            return o1 + self.read(b1)
+        }
+        if selector == 2 {
+            return o2 + self.read(b2)
+        }
+        return o3 + self.read(b3)
+    }
+    fn size(&mut self, div8: bool) -> u32 {
+        if div8 {
+            return (self.read(5) + 1) * 8
+        }
+        return self.u32(1, 9, 1, 13, 1, 18, 1, 30)
+    }
+    fn bit_depth(&mut self, info: &mut Info) {
+        if self.read(1) == 1 {
+            info.float = true
+            info.bits = self.u32(32, 0, 16, 0, 24, 0, 1, 6)
+            self.read(4)
+        } else {
+            info.float = false
+            info.bits = self.u32(8, 0, 10, 0, 12, 0, 1, 6)
+        }
+    }
+}
+
+// Header fields of a bare codestream.
+fn read_info(codestream: &[u8]) -> Info {
+    assert(codestream.len >= 2 && codestream[0] == 0xFF && codestream[1] == 0x0A, "codestream signature")
+    r := Reader { data: codestream, bit: 16 }
+    info := Info { width: 0, height: 0, bits: 0, float: false, extra: 0, associated: false, gray: false, orientation: 1 }
+    div8 := r.read(1) == 1
+    info.height = r.size(div8)
+    ratio := r.read(3)
+    if ratio == 0 {
+        info.width = r.size(div8)
+    } else {
+        h := info.height as u64
+        widths := [h, h * 6 / 5, h * 4 / 3, h * 3 / 2, h * 16 / 9, h * 5 / 4, h * 2]
+        info.width = widths[(ratio - 1) as usize] as u32
+    }
+    assert_eq(r.read(1), 0, "image metadata is never all-default")
+    extra_fields := r.read(1) == 1
+    if extra_fields {
+        info.orientation = r.read(3) + 1
+        assert_eq(r.read(3), 0, "no intrinsic size, preview or animation")
+    }
+    r.bit_depth(&mut info)
+    r.read(1)
+    info.extra = r.u32(0, 0, 1, 0, 2, 4, 1, 12)
+    if info.extra == 1 {
+        if r.read(1) == 0 {
+            assert_eq(r.u32(0, 0, 1, 0, 2, 4, 18, 6), 0, "extra channel type alpha")
+            alpha := Info { width: 0, height: 0, bits: 0, float: false, extra: 0, associated: false, gray: false, orientation: 1 }
+            r.bit_depth(&mut alpha)
+            assert_eq(alpha.bits, info.bits, "alpha bit depth")
+            assert_eq(r.u32(0, 0, 3, 0, 4, 0, 1, 3), 0, "dim shift")
+            assert_eq(r.u32(0, 0, 0, 4, 16, 5, 48, 10), 0, "name length")
+            info.associated = r.read(1) == 1
+        }
+    }
+    assert_eq(r.read(1), 0, "not XYB")
+    if r.read(1) == 0 {
+        assert_eq(r.read(1), 0, "no ICC")
+        info.gray = r.u32(0, 0, 1, 0, 2, 4, 18, 6) == 1
+    }
+    return info
+}
+
+// The codestream inside a container (checking the box structure), or the
+// data itself when it is a bare codestream.
+fn codestream_of(data: &[u8]) -> &[u8] from(data) {
+    if data[0] == 0xFF {
+        return data
+    }
+    signature := [0u8, 0, 0, 12, 0x4A, 0x58, 0x4C, 0x20, 0x0D, 0x0A, 0x87, 0x0A]
+    assert(bytes.equal(&data[..12], &signature), "container signature box")
+    at := 12usize
+    found := 0usize
+    found_end := 0usize
+    for at < data.len {
+        size := be32(data, at) as usize
+        assert(size >= 8 && at + size <= data.len, "box size")
+        if data[at + 4] == 0x6A && data[at + 5] == 0x78 && data[at + 6] == 0x6C && data[at + 7] == 0x63 {
+            found = at + 8
+            found_end = at + size
+        }
+        at += size
+    }
+    assert_eq(at, data.len, "boxes cover the file")
+    assert(found > 0, "jxlc box")
+    return &data[found..found_end]
+}
+
+fn be32(data: &[u8], at: usize) -> u32 {
+    return ((data[at] as u32) << 24) | ((data[at + 1] as u32) << 16) | ((data[at + 2] as u32) << 8) | (data[at + 3] as u32)
+}
+
+// Everything checkable about `encoded` as the encoding of `source`.
+fn check_round_trip(encoded: &[u8], source: &pixels.View) {
+    codestream := codestream_of(encoded)
+    info := read_info(codestream)
+    layout := source.layout()
+    assert_eq(info.width, source.width(), "width")
+    assert_eq(info.height, source.height(), "height")
+    assert_eq(info.gray, layout.is_gray(), "gray")
+    if layout.has_alpha() {
+        assert_eq(info.extra, 1, "alpha channel")
+    } else {
+        assert_eq(info.extra, 0, "no extra channels")
+    }
+    assert_eq(info.float, layout.is_float(), "float samples")
+    assert_eq(info.bits, (layout.sample_bytes() * 8) as u32, "bits per sample")
+    assert_eq(info.associated, layout.premultiplied && layout.has_alpha(), "associated alpha")
+    decode_and_compare(encoded, source)
+}
+
+fn decode_and_compare(encoded: &[u8], source: &pixels.View) {
+    header := jxl.info(encoded)!
+    assert(header.width == source.width() && header.height == source.height())
+    need := jxl.scratch_size(encoded)!
+    unsafe {
+        assert(need <= DECODE_SCRATCH.len)
+        target := pixels.ViewMut.new(&mut DECODED, source.width(), source.height(), source.layout().clone())!
+        output := sink.ViewSink.new(&mut target)
+        jxl.decode(encoded, &mut output, &mut DECODE_SCRATCH[..need])!
+        for y in 0u32..source.height() {
+            expected := source.row(y)
+            actual := target.row(y)
+            for i in 0usize..expected.len {
+                assert(expected[i] == actual[i])
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+
+@test
+fn golden_outputs_match_and_headers_describe_the_image() {
+    data := unsafe {
+        &mut PIXELS
+    }
+    output := unsafe {
+        &mut OUTPUT
+    }
+    for id in 0u32..IMAGES {
+        layout := make_image(id, &mut data[..])
+        view := pixels.View.new(&data[..], WIDTHS[id as usize], HEIGHTS[id as usize], layout)!
+        for effort in 1u32..4 {
+            options := encode.EncodeOptions.new()
+            options.effort = effort
+            n := encode_view(&view, &options, &mut output[..])
+            check_round_trip(&output[..n], &view)
+            golden(id, effort, &output[..n])
+        }
+    }
+}
+
+@test
+fn output_is_deterministic_and_ignores_the_stride() {
+    data := unsafe {
+        &mut PIXELS
+    }
+    layout := make_image(WIDE_RGB8, &mut data[..])
+    view := pixels.View.new(&data[..300 * 20 * 3], 300, 20, layout.clone())!
+    // The same pixels inside a wider buffer.
+    wide := unsafe {
+        &mut PIXELS2
+    }
+    for y in 0usize..20 {
+        for i in 0usize..900 {
+            wide[y * 1000 + 30 + i] = data[y * 900 + i]
+        }
+    }
+    strided := pixels.View.with_stride(&wide[30..], 300, 20, 1000, layout)!
+    for effort in 1u32..4 {
+        options := encode.EncodeOptions.new()
+        options.effort = effort
+        first := unsafe {
+            &mut OUTPUT
+        }
+        second := unsafe {
+            &mut OUTPUT2
+        }
+        a := encode_view(&view, &options, &mut first[..])
+        b := encode_view(&view, &options, &mut second[..])
+        assert_eq(a, b, "repeat size")
+        assert(bytes.equal(&first[..a], &second[..b]), "repeat bytes")
+        c := encode_view(&strided, &options, &mut second[..])
+        assert_eq(a, c, "strided size")
+        assert(bytes.equal(&first[..a], &second[..c]), "strided bytes")
+    }
+}
+
+@test
+fn container_wraps_the_same_codestream_with_metadata_boxes() {
+    data := unsafe {
+        &mut PIXELS
+    }
+    layout := make_image(GRADIENT_RGB8, &mut data[..])
+    view := pixels.View.new(&data[..], 16, 8, layout)!
+    options := encode.EncodeOptions.new()
+    bare := unsafe {
+        &mut OUTPUT
+    }
+    n := encode_view(&view, &options, &mut bare[..])
+    assert(bare[0] == 0xFF && bare[1] == 0x0A, "bare codestream by default")
+    options.container = true
+    boxed := unsafe {
+        &mut OUTPUT2
+    }
+    m := encode_view(&view, &options, &mut boxed[..])
+    assert_eq(m, n + 40, "signature, ftyp and jxlc headers")
+    assert(bytes.equal(codestream_of(&boxed[..m]), &bare[..n]), "jxlc holds the bare codestream")
+
+    // EXIF with a JPEG-style prefix (TIFF offset 6) and XMP; implies the
+    // container even when not asked for.
+    exif := [0x45u8, 0x78, 0x69, 0x66, 0, 0, 0x4D, 0x4D, 0, 0x2A, 0, 0, 0, 8]
+    xmp := [0x3Cu8, 0x78, 0x2F, 0x3E]
+    metadata := encode.Metadata.new(&exif, &xmp)
+    options.container = false
+    bound := encode.max_encoded_size_with_metadata(16, 8, view.layout(), &options, &metadata)!
+    need := encode.encode_scratch_size(16, 8, view.layout(), &options)!
+    scratch := unsafe {
+        &mut SCRATCH
+    }
+    k := encode.encode_with_metadata(&view, &options, &metadata, &mut boxed[..bound], &mut scratch[..need])!
+    assert_eq(k, n + 40 + 12 + exif.len + 8 + xmp.len, "metadata box sizes")
+    // Exif box right after ftyp: size, type, TIFF offset, payload.
+    assert_eq(be32(&boxed[..k], 32), (12 + exif.len) as u32, "Exif box size")
+    exif_type := [0x45u8, 0x78, 0x69, 0x66]
+    assert(bytes.equal(&boxed[36..40], &exif_type), "Exif box type")
+    assert_eq(be32(&boxed[..k], 40), 6, "TIFF header offset")
+    assert(bytes.equal(&boxed[44..44 + exif.len], &exif), "Exif payload")
+    at := 44 + exif.len
+    xml_type := [0x78u8, 0x6D, 0x6C, 0x20]
+    assert(bytes.equal(&boxed[at + 4..at + 8], &xml_type), "xml box type")
+    assert(bytes.equal(&boxed[at + 8..at + 8 + xmp.len], &xmp), "XMP payload")
+    assert(bytes.equal(codestream_of(&boxed[..k]), &bare[..n]), "same codestream with metadata")
+}
+
+@test
+fn size_header_round_trips_for_many_sizes() {
+    sizes := [1u32, 1, 8, 8, 16, 24, 256, 256, 3, 5, 257, 131, 300, 225, 512, 8, 1, 300, 2049, 2]
+    data := unsafe {
+        &mut PIXELS
+    }
+    for i in 0usize..20 {
+        data[i] = 0
+    }
+    for k in 0usize..10 {
+        width := sizes[2 * k]
+        height := sizes[2 * k + 1]
+        for i in 0usize..(width * height) as usize {
+            data[i] = ((i * 7) & 255) as u8
+        }
+        view := pixels.View.new(&data[..], width, height, pixels.Layout.gray8())!
+        options := encode.EncodeOptions.new()
+        options.effort = 1
+        output := unsafe {
+            &mut OUTPUT
+        }
+        n := encode_view(&view, &options, &mut output[..])
+        check_round_trip(&output[..n], &view)
+    }
+}
+
+@test
+fn every_layout_is_accepted() {
+    data := unsafe {
+        &mut PIXELS
+    }
+    for i in 0usize..33 * 9 * 16 {
+        // Finite floats: keep the exponent field of every 16/32-bit word
+        // away from all ones (bytes below 0x7c), since NaN payloads may be
+        // quieted when samples pass through f32.
+        data[i] = ((i * 37 + i / 7) & 63) as u8
+    }
+    for channels in 1usize..5 {
+        for sample in 0u32..4 {
+            for premultiplied in 0usize..2 {
+                layout := pixels.Layout.from_codes(channels, sample, premultiplied == 1)
+                view := pixels.View.new(&data[..], 33, 9, layout)!
+                for effort in 1u32..4 {
+                    options := encode.EncodeOptions.new()
+                    options.effort = effort
+                    output := unsafe {
+                        &mut OUTPUT
+                    }
+                    n := encode_view(&view, &options, &mut output[..])
+                    check_round_trip(&output[..n], &view)
+                }
+            }
+        }
+    }
+}
+
+@test
+fn buffer_errors_are_reported() {
+    data := unsafe {
+        &mut PIXELS
+    }
+    layout := make_image(WIDE_RGB8, &mut data[..])
+    view := pixels.View.new(&data[..], 300, 20, layout)!
+    options := encode.EncodeOptions.new()
+    need := encode.encode_scratch_size(300, 20, view.layout(), &options)!
+    output := unsafe {
+        &mut OUTPUT
+    }
+    scratch := unsafe {
+        &mut SCRATCH
+    }
+    n := encode.encode(&view, &options, &mut output[..], &mut scratch[..need])!
+    match encode.encode(&view, &options, &mut output[..], &mut scratch[..need - 1]) {
+        ok(_) => {
+            assert(false, "short scratch accepted")
+        }
+        err(e) => {
+            assert(e == pixels.Error.BufferTooSmall, "short scratch")
+        }
+    }
+    match encode.encode(&view, &options, &mut output[..n - 1], &mut scratch[..need]) {
+        ok(_) => {
+            assert(false, "short output accepted")
+        }
+        err(e) => {
+            assert(e == pixels.Error.BufferTooSmall, "short output")
+        }
+    }
+    match encode.encode(&view, &options, &mut output[..10], &mut scratch[..need]) {
+        ok(_) => {
+            assert(false, "tiny output accepted")
+        }
+        err(e) => {
+            assert(e == pixels.Error.BufferTooSmall, "tiny output")
+        }
+    }
+    // Exactly the encoded size is enough.
+    m := encode.encode(&view, &options, &mut output[..n], &mut scratch[..need])!
+    assert_eq(m, n, "exact output")
+    // An empty image has no JPEG XL encoding.
+    empty := pixels.View.new(&data[..0], 0, 5, pixels.Layout.rgb8())!
+    match encode.encode(&empty, &options, &mut output[..], &mut scratch[..need]) {
+        ok(_) => {
+            assert(false, "empty image accepted")
+        }
+        err(e) => {
+            assert(e == pixels.Error.Malformed, "empty image")
+        }
+    }
+    match encode.max_encoded_size(0, 5, view.layout(), &options) {
+        ok(_) => {
+            assert(false, "empty size accepted")
+        }
+        err(e) => {
+            assert(e == pixels.Error.Malformed, "empty size")
+        }
+    }
+}
+
+@test
+fn max_encoded_size_bounds_noise_at_every_effort() {
+    data := unsafe {
+        &mut PIXELS
+    }
+    seed := 7u32
+    for i in 0usize..64 * 48 * 8 {
+        seed = core.wrapping_add(core.wrapping_mul(seed, 1664525u32), 1013904223u32)
+        data[i] = (seed >> 24) as u8
+    }
+    layouts := [pixels.SAMPLE_U8, pixels.SAMPLE_U16]
+    for k in 0usize..2 {
+        layout := pixels.Layout.from_codes(4, layouts[k], false)
+        view := pixels.View.new(&data[..], 64, 48, layout)!
+        for effort in 1u32..4 {
+            options := encode.EncodeOptions.new()
+            options.effort = effort
+            output := unsafe {
+                &mut OUTPUT
+            }
+            n := encode_view(&view, &options, &mut output[..])
+            raw := 64 * 48 * view.layout().bytes_per_pixel()
+            // Noise does not compress, but must not expand much either.
+            assert(n < raw + raw / 8 + 256, "noise expanded")
+        }
+    }
+}
+
+@test
+fn color_options_and_orientation_reach_the_header() {
+    data := unsafe {
+        &mut PIXELS
+    }
+    layout := make_image(GRADIENT_RGB8, &mut data[..])
+    view := pixels.View.new(&data[..], 16, 8, layout)!
+    options := encode.EncodeOptions.new()
+    options.orientation = color.Orientation.Rotate270
+    options.color = color.ColorInfo.linear()
+    output := unsafe {
+        &mut OUTPUT
+    }
+    n := encode_view(&view, &options, &mut output[..])
+    info := read_info(&output[..n])
+    assert_eq(info.orientation, 8, "orientation")
+    plain := encode.EncodeOptions.new()
+    second := unsafe {
+        &mut OUTPUT2
+    }
+    m := encode_view(&view, &plain, &mut second[..])
+    plain_info := read_info(&second[..m])
+    assert_eq(plain_info.orientation, 1, "default orientation")
+    // A non-default color encoding costs header bits.
+    assert(n > m, "explicit color encoding")
+}

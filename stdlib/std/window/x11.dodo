@@ -22,7 +22,10 @@ pub const LEAVE_WINDOW_MASK: u32 = 0x20
 pub const POINTER_MOTION_MASK: u32 = 0x40
 pub const EXPOSURE_MASK: u32 = 0x8000
 pub const STRUCTURE_NOTIFY_MASK: u32 = 0x20000
+pub const SUBSTRUCTURE_NOTIFY_MASK: u32 = 0x80000
+pub const SUBSTRUCTURE_REDIRECT_MASK: u32 = 0x100000
 pub const FOCUS_CHANGE_MASK: u32 = 0x200000
+pub const PROPERTY_CHANGE_MASK: u32 = 0x400000
 
 // Event codes, after clearing the "sent by a client" bit 0x80.
 pub const ERROR: u8 = 0
@@ -38,6 +41,10 @@ pub const FOCUS_IN: u8 = 9
 pub const FOCUS_OUT: u8 = 10
 pub const EXPOSE: u8 = 12
 pub const CONFIGURE_NOTIFY: u8 = 22
+pub const PROPERTY_NOTIFY: u8 = 28
+pub const SELECTION_CLEAR: u8 = 29
+pub const SELECTION_REQUEST: u8 = 30
+pub const SELECTION_NOTIFY: u8 = 31
 pub const CLIENT_MESSAGE: u8 = 33
 pub const MAPPING_NOTIFY: u8 = 34
 // An extension event that may be longer than 32 bytes.
@@ -52,13 +59,28 @@ pub const MOD2_MASK: u32 = 0x10
 pub const MOD4_MASK: u32 = 0x40
 pub const MOD5_MASK: u32 = 0x80
 
-// Predefined atoms.
+// Predefined atoms; 0 is None, which GetProperty also takes as any type.
+pub const ATOM_NONE: u32 = 0
 pub const ATOM_ATOM: u32 = 4
 pub const ATOM_STRING: u32 = 31
+pub const ATOM_WINDOW: u32 = 33
 pub const ATOM_WM_NAME: u32 = 39
 pub const ATOM_WM_NORMAL_HINTS: u32 = 40
 pub const ATOM_WM_SIZE_HINTS: u32 = 41
 pub const ATOM_WM_CLASS: u32 = 67
+
+// ChangeProperty modes.
+pub const PROPERTY_REPLACE: u8 = 0
+pub const PROPERTY_APPEND: u8 = 2
+
+// ConfigureWindow value-mask bits; values follow in this order.
+pub const CONFIGURE_X: u32 = 0x1
+pub const CONFIGURE_Y: u32 = 0x2
+pub const CONFIGURE_WIDTH: u32 = 0x4
+pub const CONFIGURE_HEIGHT: u32 = 0x8
+pub const CONFIGURE_STACK_MODE: u32 = 0x40
+// The stack mode raising a window above its siblings.
+pub const STACK_ABOVE: u32 = 0
 
 // Every message the server sends is at least this long.
 pub const PACKET: usize = 32
@@ -292,12 +314,18 @@ pub fn intern_atom(out: &mut[u8], name: &[u8]) -> usize {
 // ChangeProperty in Replace mode. `format` is 8 or 32: the size in bits of
 // each element of `data`, whose length is in bytes.
 pub fn change_property(out: &mut[u8], window: u32, property: u32, kind: u32, format: u8, data: &[u8]) -> usize {
+    return change_property_mode(out, PROPERTY_REPLACE, window, property, kind, format, data)
+}
+
+// ChangeProperty in `mode`: PROPERTY_REPLACE, or PROPERTY_APPEND to add
+// `data` at the end, which builds a value larger than one request.
+pub fn change_property_mode(out: &mut[u8], mode: u8, window: u32, property: u32, kind: u32, format: u8, data: &[u8]) -> usize {
     total := 24 + padded(data.len)
-    if out.len < total || (format != 8 && format != 32) || data.len > 0x3ffff {
+    if out.len < total || (format != 8 && format != 32) || data.len > 0x3ffff || (mode != PROPERTY_REPLACE && mode != PROPERTY_APPEND) || (format == 32 && data.len % 4 != 0) {
         return 0
     }
     zero(out, 0, total)
-    header(out, 18, 0, total)
+    header(out, 18, mode, total)
     put32(out, 4, window)
     put32(out, 8, property)
     put32(out, 12, kind)
@@ -309,16 +337,183 @@ pub fn change_property(out: &mut[u8], window: u32, property: u32, kind: u32, for
 
 // A WM_NORMAL_HINTS value fixing the size, for windows that cannot be resized.
 pub fn fixed_size_hints(out: &mut[u8], width: u32, height: u32) -> usize {
+    return size_hints(out, width, height, width, height)
+}
+
+// A WM_NORMAL_HINTS value with a minimum and a maximum size; a 0 dimension
+// is unlimited, and with both 0 the hint is left out. 0 everywhere makes a
+// value without hints.
+pub fn size_hints(out: &mut[u8], min_width: u32, min_height: u32, max_width: u32, max_height: u32) -> usize {
     if out.len < 72 {
         return 0
     }
     zero(out, 0, 72)
-    put32(out, 0, 16 | 32) // PMinSize | PMaxSize
-    put32(out, 20, width)
-    put32(out, 24, height)
-    put32(out, 28, width)
-    put32(out, 32, height)
+    flags := 0u32
+    if min_width != 0 || min_height != 0 {
+        flags |= 16 // PMinSize
+        put32(out, 20, min_width)
+        put32(out, 24, min_height)
+    }
+    if max_width != 0 || max_height != 0 {
+        flags |= 32 // PMaxSize
+        put32(out, 28, unlimited(max_width))
+        put32(out, 32, unlimited(max_height))
+    }
+    put32(out, 0, flags)
     return 72
+}
+
+// The largest X11 size where 0 means no limit.
+fn unlimited(size: u32) -> u32 {
+    if size == 0 {
+        return 32767
+    }
+    return size
+}
+
+pub fn delete_property(out: &mut[u8], window: u32, property: u32) -> usize {
+    if out.len < 12 {
+        return 0
+    }
+    header(out, 19, 0, 12)
+    put32(out, 4, window)
+    put32(out, 8, property)
+    return 12
+}
+
+// GetProperty for `length` 4-byte units from `offset` (also in 4-byte
+// units) of a value of type `kind`, ATOM_NONE for any. The reply has the
+// value's format in byte 1, its type at 8, the bytes left after this part at
+// 12, the returned length in format units at 16 and the data from 32 on.
+pub fn get_property(out: &mut[u8], delete: bool, window: u32, property: u32, kind: u32, offset: u32, length: u32) -> usize {
+    if out.len < 24 {
+        return 0
+    }
+    flag := 0u8
+    if delete {
+        flag = 1
+    }
+    header(out, 20, flag, 24)
+    put32(out, 4, window)
+    put32(out, 8, property)
+    put32(out, 12, kind)
+    put32(out, 16, offset)
+    put32(out, 20, length)
+    return 24
+}
+
+// ConfigureWindow. `values` holds one value per bit set in `mask`, in the
+// order of the CONFIGURE_ bits.
+pub fn configure_window(out: &mut[u8], window: u32, mask: u32, values: &[u32]) -> usize {
+    total := 12 + values.len * 4
+    bits := 0usize
+    for bit in 0u32..7 {
+        if (mask & (1u32 << bit)) != 0 {
+            bits += 1
+        }
+    }
+    if out.len < total || mask > 0x7f || bits != values.len {
+        return 0
+    }
+    header(out, 12, 0, total)
+    put32(out, 4, window)
+    put16(out, 8, mask)
+    put16(out, 10, 0)
+    for i in 0usize..values.len {
+        put32(out, 12 + i * 4, values[i])
+    }
+    return total
+}
+
+// -- Selections ----------------------------------------------------------
+
+// Selections such as CLIPBOARD pass data between clients: the owner keeps
+// it and converts it into a property of the requestor's window on request.
+
+pub fn set_selection_owner(out: &mut[u8], owner: u32, selection: u32, time: u32) -> usize {
+    if out.len < 16 {
+        return 0
+    }
+    header(out, 22, 0, 16)
+    put32(out, 4, owner)
+    put32(out, 8, selection)
+    put32(out, 12, time)
+    return 16
+}
+
+// GetSelectionOwner, whose reply names the owner at byte 8, 0 for none.
+pub fn get_selection_owner(out: &mut[u8], selection: u32) -> usize {
+    if out.len < 8 {
+        return 0
+    }
+    header(out, 23, 0, 8)
+    put32(out, 4, selection)
+    return 8
+}
+
+// Ask the owner of `selection` to store it as `target` in `property` of
+// `requestor`; a SelectionNotify reports the outcome.
+pub fn convert_selection(out: &mut[u8], requestor: u32, selection: u32, target: u32, property: u32, time: u32) -> usize {
+    if out.len < 24 {
+        return 0
+    }
+    header(out, 24, 0, 24)
+    put32(out, 4, requestor)
+    put32(out, 8, selection)
+    put32(out, 12, target)
+    put32(out, 16, property)
+    put32(out, 20, time)
+    return 24
+}
+
+// SendEvent of the 32-byte `event` to `destination`; with an empty `mask`
+// it goes to the destination's owner whatever it selected.
+pub fn send_event(out: &mut[u8], propagate: bool, destination: u32, mask: u32, event: &[u8]) -> usize {
+    if out.len < 44 || event.len < PACKET {
+        return 0
+    }
+    flag := 0u8
+    if propagate {
+        flag = 1
+    }
+    header(out, 25, flag, 44)
+    put32(out, 4, destination)
+    put32(out, 8, mask)
+    copy(out, 12, &event[..PACKET])
+    return 44
+}
+
+// The SelectionNotify an owner sends the requestor, with `property` 0 when
+// it refused the conversion.
+pub fn selection_notify(out: &mut[u8], time: u32, requestor: u32, selection: u32, target: u32, property: u32) -> usize {
+    if out.len < PACKET {
+        return 0
+    }
+    zero(out, 0, PACKET)
+    out[0] = SELECTION_NOTIFY
+    put32(out, 4, time)
+    put32(out, 8, requestor)
+    put32(out, 12, selection)
+    put32(out, 16, target)
+    put32(out, 20, property)
+    return PACKET
+}
+
+// A ClientMessage event of format 32 about `window` with five data words,
+// such as the _NET_WM_STATE requests window managers take.
+pub fn client_message(out: &mut[u8], window: u32, kind: u32, data: &[u32]) -> usize {
+    if out.len < PACKET || data.len > 5 {
+        return 0
+    }
+    zero(out, 0, PACKET)
+    out[0] = CLIENT_MESSAGE
+    out[1] = 32
+    put32(out, 4, window)
+    put32(out, 8, kind)
+    for i in 0usize..data.len {
+        put32(out, 12 + i * 4, data[i])
+    }
+    return PACKET
 }
 
 pub fn create_pixmap(out: &mut[u8], pixmap: u32, drawable: u32, depth: u8, width: u32, height: u32) -> usize {
@@ -415,6 +610,75 @@ pub fn create_cursor(out: &mut[u8], cursor: u32, source: u32, mask: u32) -> usiz
     put32(out, 8, source)
     put32(out, 12, mask)
     return 32
+}
+
+pub fn open_font(out: &mut[u8], font: u32, name: &[u8]) -> usize {
+    total := 12 + padded(name.len)
+    if out.len < total || name.len > 0xffff {
+        return 0
+    }
+    zero(out, 0, total)
+    header(out, 45, 0, total)
+    put32(out, 4, font)
+    put16(out, 8, name.len as u32)
+    copy(out, 12, name)
+    return total
+}
+
+// CreateGlyphCursor from the cursor font: glyph `glyph` drawn black on a
+// white outline, the mask glyph that follows it.
+pub fn create_glyph_cursor(out: &mut[u8], cursor: u32, font: u32, glyph: u32) -> usize {
+    if out.len < 32 || glyph > 0xfffe {
+        return 0
+    }
+    zero(out, 0, 32)
+    header(out, 94, 0, 32)
+    put32(out, 4, cursor)
+    put32(out, 8, font)
+    put32(out, 12, font)
+    put16(out, 16, glyph)
+    put16(out, 18, glyph + 1)
+    put16(out, 26, 0xffff)
+    put16(out, 28, 0xffff)
+    put16(out, 30, 0xffff)
+    return 32
+}
+
+// The glyph of the standard "cursor" font for a raw.CURSOR_ shape, from
+// X11's cursorfont.h. Diagonal resizing uses the corner arrows, and
+// NotAllowed the circle, as the core font has no closer shapes.
+pub fn cursor_glyph(shape: u32) -> u32 {
+    if shape == raw.CURSOR_TEXT {
+        return 152 // XC_xterm
+    }
+    if shape == raw.CURSOR_HAND {
+        return 60 // XC_hand2
+    }
+    if shape == raw.CURSOR_CROSSHAIR {
+        return 34 // XC_crosshair
+    }
+    if shape == raw.CURSOR_MOVE {
+        return 52 // XC_fleur
+    }
+    if shape == raw.CURSOR_RESIZE_EW {
+        return 108 // XC_sb_h_double_arrow
+    }
+    if shape == raw.CURSOR_RESIZE_NS {
+        return 116 // XC_sb_v_double_arrow
+    }
+    if shape == raw.CURSOR_RESIZE_NWSE {
+        return 14 // XC_bottom_right_corner
+    }
+    if shape == raw.CURSOR_RESIZE_NESW {
+        return 12 // XC_bottom_left_corner
+    }
+    if shape == raw.CURSOR_NOT_ALLOWED {
+        return 24 // XC_circle
+    }
+    if shape == raw.CURSOR_WAIT {
+        return 150 // XC_watch
+    }
+    return 68 // XC_left_ptr
 }
 
 pub fn get_keyboard_mapping(out: &mut[u8], first: u32, count: u32) -> usize {

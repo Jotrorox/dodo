@@ -1,0 +1,402 @@
+package targets
+
+import "std/image/bmp"
+import "std/image/color"
+import "std/image/convert"
+import "std/image/jxl/encode" as jxl_encode
+import "std/image/meta"
+import "std/image/pixels"
+import "std/image/png"
+import "std/image/ppm"
+import "std/image/qoi"
+import "std/image/sink"
+
+// Round trip targets. The input is pixels plus parameters:
+//
+//     byte 0  layout: channels (bits 0-1, +1), sample (bits 2-3: U8, U16,
+//             F16, F32), premultiplied (bit 4), row padding (bits 5-7)
+//     byte 1  width (0 to 127)
+//     byte 2  height (0 to 127)
+//     byte 3  codec options A
+//     byte 4  codec options B
+//     byte 5  output buffer: below 32 it is max_encoded_size * byte / 32
+//     byte 6  metadata payload length (PNG, JPEG XL), taken from the pixels
+//     rest    sample bytes, repeated to fill the image
+//
+// Encoders must never trap, whatever the layout and values (NaN and
+// infinite floats included). When encoding succeeds, the file must decode,
+// report the source size, and for integer straight-alpha sources the
+// decoded native pixels must equal the source converted to that layout:
+// every codec here is lossless for what it stores.
+
+const HEADER_BYTES: usize = 7
+const SOURCE_CAP: usize = 1048576
+
+static mut SOURCE: [SOURCE_CAP]u8 = [0u8; SOURCE_CAP]
+
+struct Params {
+    width: u32
+    height: u32
+    layout: pixels.Layout
+    stride: usize
+    a: u8
+    b: u8
+    output_fraction: u32
+    meta_length: usize
+}
+
+fn param(data: &[u8], index: usize) -> u8 {
+    if index < data.len {
+        return data[index]
+    }
+    return 0
+}
+
+fn read_params(data: &[u8]) -> Params {
+    b0 := param(data, 0)
+    layout := pixels.Layout.from_codes(((b0 & 3) + 1) as usize, ((b0 >> 2) & 3) as u32, ((b0 >> 4) & 1) != 0)
+    width := (param(data, 1) & 0x7f) as u32
+    height := (param(data, 2) & 0x7f) as u32
+    stride := width as usize * layout.bytes_per_pixel() + ((b0 >> 5) & 7) as usize
+    fraction := 32u32
+    if param(data, 5) < 32 {
+        fraction = param(data, 5) as u32
+    }
+    return Params { width: width, height: height, layout: layout, stride: stride, a: param(data, 3), b: param(data, 4), output_fraction: fraction, meta_length: param(data, 6) as usize }
+}
+
+// Fill SOURCE from the sample bytes, repeated.
+fn fill_source(data: &[u8], length: usize) {
+    unsafe {
+        if data.len <= HEADER_BYTES {
+            for i in 0usize..length {
+                SOURCE[i] = ((i * 37) % 251) as u8
+            }
+            return
+        }
+        samples := &data[HEADER_BYTES..]
+        for i in 0usize..length {
+            SOURCE[i] = samples[i % samples.len]
+        }
+    }
+}
+
+// The metadata payload: the first meta_length sample bytes.
+fn payload(data: &[u8], p: &Params) -> &[u8] from(data) {
+    if data.len <= HEADER_BYTES {
+        return &data[..0]
+    }
+    samples := &data[HEADER_BYTES..]
+    length := p.meta_length
+    if length > samples.len {
+        length = samples.len
+    }
+    return &samples[..length]
+}
+
+fn png_options(p: &Params) -> png.EncodeOptions {
+    options := png.EncodeOptions.new()
+    options.level = (p.a % 10) as u32
+    options.filter = ((p.a >> 4) % 7) as u32
+    options.interlace = (p.b & 1) != 0
+    options.palette = (p.b & 2) != 0
+    options.srgb_chunk = (p.b & 4) != 0
+    return options
+}
+
+fn qoi_options(p: &Params) -> qoi.EncodeOptions {
+    options := qoi.EncodeOptions.new()
+    choice := p.a & 3
+    if choice == 1 {
+        options.channels = 3
+    } else if choice == 2 {
+        options.channels = 4
+    } else if choice == 3 {
+        options.channels = 7
+    }
+    options.linear = (p.a & 4) != 0
+    return options
+}
+
+fn bmp_options(p: &Params) -> bmp.EncodeOptions {
+    options := bmp.EncodeOptions.new()
+    options.alpha = (p.a & 1) != 0
+    return options
+}
+
+fn ppm_options(p: &Params) -> ppm.EncodeOptions {
+    options := ppm.EncodeOptions.new()
+    choice := p.a % 6
+    if choice == 1 {
+        options.kind = ppm.KIND_PGM
+    } else if choice == 2 {
+        options.kind = ppm.KIND_PPM
+    } else if choice == 3 {
+        options.kind = ppm.KIND_PAM
+    } else if choice == 4 {
+        options.kind = ppm.KIND_PFM
+    } else if choice == 5 {
+        options.kind = 3
+    }
+    return options
+}
+
+fn jxl_options(p: &Params) -> jxl_encode.EncodeOptions {
+    options := jxl_encode.EncodeOptions.new()
+    options.effort = (p.a % 10) as u32
+    options.container = (p.b & 1) != 0
+    options.orientation = color.orientation_from_exif(((p.b >> 1) & 7) as u32 + 1)
+    return options
+}
+
+fn encode_bound(codec: u32, p: &Params) -> usize!pixels.Error {
+    if codec == CODEC_PNG {
+        options := png_options(p)
+        size := png.max_encoded_size(p.width, p.height, &p.layout, &options)?
+        extra := png.metadata_size(p.meta_length, p.meta_length)?
+        return pixels.checked(1, size, extra)
+    }
+    if codec == CODEC_QOI {
+        options := qoi_options(p)
+        return qoi.max_encoded_size(p.width, p.height, &p.layout, &options)
+    }
+    if codec == CODEC_BMP {
+        options := bmp_options(p)
+        return bmp.max_encoded_size(p.width, p.height, &p.layout, &options)
+    }
+    if codec == CODEC_PPM {
+        options := ppm_options(p)
+        return ppm.max_encoded_size(p.width, p.height, &p.layout, &options)
+    }
+    options := jxl_options(p)
+    nothing := [0u8; 1]
+    boxes := jxl_encode.Metadata.new(&nothing[..0], &nothing[..0])
+    size := jxl_encode.max_encoded_size_with_metadata(p.width, p.height, &p.layout, &options, &boxes)?
+    return pixels.checked(1, size, p.meta_length + 64)
+}
+
+fn encode_scratch(codec: u32, p: &Params) -> usize!pixels.Error {
+    if codec == CODEC_PNG {
+        options := png_options(p)
+        return png.encode_scratch_size(p.width, p.height, &p.layout, &options)
+    }
+    if codec == CODEC_QOI {
+        options := qoi_options(p)
+        return qoi.encode_scratch_size(p.width, p.height, &p.layout, &options)
+    }
+    if codec == CODEC_BMP {
+        options := bmp_options(p)
+        return bmp.encode_scratch_size(p.width, p.height, &p.layout, &options)
+    }
+    if codec == CODEC_PPM {
+        options := ppm_options(p)
+        return ppm.encode_scratch_size(p.width, p.height, &p.layout, &options)
+    }
+    options := jxl_options(p)
+    return jxl_encode.encode_scratch_size(p.width, p.height, &p.layout, &options)
+}
+
+fn encode_with(codec: u32, p: &Params, source: &pixels.View, extra: &[u8], output: &mut[u8], buffer: &mut[u8]) -> usize!pixels.Error {
+    nothing := [0u8; 1]
+    if codec == CODEC_PNG {
+        options := png_options(p)
+        if (p.b & 8) != 0 {
+            return png.encode_with_metadata(source, &options, extra, &nothing[..0], output, buffer)
+        }
+        if (p.b & 16) != 0 {
+            return png.encode_with_metadata(source, &options, &nothing[..0], extra, output, buffer)
+        }
+        return png.encode(source, &options, output, buffer)
+    }
+    if codec == CODEC_QOI {
+        options := qoi_options(p)
+        return qoi.encode(source, &options, output, buffer)
+    }
+    if codec == CODEC_BMP {
+        options := bmp_options(p)
+        return bmp.encode(source, &options, output, buffer)
+    }
+    if codec == CODEC_PPM {
+        options := ppm_options(p)
+        return ppm.encode(source, &options, output, buffer)
+    }
+    options := jxl_options(p)
+    if (p.b & 16) != 0 {
+        boxes := jxl_encode.Metadata.new(extra, &nothing[..0])
+        return jxl_encode.encode_with_metadata(source, &options, &boxes, output, buffer)
+    }
+    if (p.b & 32) != 0 {
+        boxes := jxl_encode.Metadata.new(&nothing[..0], extra)
+        return jxl_encode.encode_with_metadata(source, &options, &boxes, output, buffer)
+    }
+    return jxl_encode.encode(source, &options, output, buffer)
+}
+
+fn roundtrip_target(codec: u32, data: &[u8]) {
+    p := read_params(data)
+    span := p.stride * p.height as usize
+    if span > SOURCE_CAP {
+        return
+    }
+    fill_source(data, span)
+    extra := payload(data, &p)
+    need := match encode_scratch(codec, &p) {
+        ok(value) => value,
+        err(_) => {
+            0usize
+        },
+    }
+    if !grant(need, p.width, p.height) {
+        return
+    }
+    bound := match encode_bound(codec, &p) {
+        ok(value) => value,
+        err(_) => {
+            OUTPUT_CAP
+        },
+    }
+    if bound > OUTPUT_CAP {
+        skip()
+        return
+    }
+    room := (bound as u64 * p.output_fraction as u64 / 32) as usize
+    length := 0usize
+    unsafe {
+        source := match pixels.View.with_stride(&SOURCE[..span], p.width, p.height, p.stride, p.layout.clone()) {
+            ok(value) => value,
+            err(_) => {
+                return
+            },
+        }
+        length = match encode_with(codec, &p, &source, extra, &mut OUTPUT[..room], &mut SCRATCH[..need]) {
+            ok(value) => value,
+            err(e) => {
+                failed("encode", e)
+                return
+            },
+        }
+        passed("encode")
+        assert(length <= room, "encoder reported more bytes than its output holds")
+        verify(codec, &p, &source, &OUTPUT[..length], extra)
+    }
+}
+
+// Decode what the encoder wrote and compare.
+fn verify(codec: u32, p: &Params, source: &pixels.View, file: &[u8], extra: &[u8]) {
+    assert(codec_matches(codec, file), "round trip: encoded file not recognized")
+    header := match codec_info(codec, file) {
+        ok(value) => value,
+        err(_) => {
+            assert(false, "round trip: info() rejects the encoder's output")
+            return
+        },
+    }
+    assert(header.width == p.width && header.height == p.height, "round trip: size changed")
+    need := match codec_scratch_size(codec, file) {
+        ok(value) => value,
+        err(_) => {
+            assert(false, "round trip: scratch_size() rejects the encoder's output")
+            return
+        },
+    }
+    assert(need <= SCRATCH_CAP, "round trip: decoder scratch above the cap")
+    size := match pixels.bytes_needed(p.width, p.height, &header.native) {
+        ok(value) => value,
+        err(_) => {
+            assert(false, "round trip: native layout too large")
+            return
+        },
+    }
+    assert(size <= PIXEL_CAP, "round trip: decoded image above the cap")
+    unsafe {
+        target := match pixels.ViewMut.new(&mut PIXELS[..size], p.width, p.height, header.native.clone()) {
+            ok(value) => value,
+            err(_) => {
+                assert(false, "round trip: native view")
+                return
+            },
+        }
+        view_sink := sink.ViewSink.new(&mut target)
+        match codec_decode(codec, file, &mut view_sink, &mut SCRATCH[..need]) {
+            ok() => {}
+            err(e) => {
+                assert(false, pixels.error_name(e))
+                return
+            }
+        }
+    }
+    check_metadata_round_trip(codec, p, file, extra)
+    layout := source.layout().clone()
+    exact := !layout.premultiplied && (layout.sample_code() == pixels.SAMPLE_U8 || layout.sample_code() == pixels.SAMPLE_U16)
+    if !exact {
+        return
+    }
+    row := p.width as usize * header.native.bytes_per_pixel()
+    unsafe {
+        for y in 0u32..p.height {
+            convert.row(source.row(y), &layout, 0, &mut EXPECTED[..row], &header.native, 0, p.width as usize)
+            base := y as usize * row
+            if header.native.is_float() {
+                // Integer to float conversion may round differently in the
+                // encoder (luma) than in convert.row: allow 2 ULP.
+                for i in 0usize..row / 4 {
+                    a := pixels.get32(&EXPECTED, i * 4)
+                    b := pixels.get32(&PIXELS, base + i * 4)
+                    assert(a == b || (a > b && a - b <= 2) || (b > a && b - a <= 2), "round trip: decoded float pixels differ from the source")
+                }
+                continue
+            }
+            for i in 0usize..row {
+                assert(EXPECTED[i] == PIXELS[base + i], "round trip: decoded pixels differ from the source")
+            }
+        }
+    }
+}
+
+// EXIF/XMP/ICC payloads given to the encoder come back unchanged.
+fn check_metadata_round_trip(codec: u32, p: &Params, file: &[u8], extra: &[u8]) {
+    if extra.len == 0 || (codec != CODEC_PNG && codec != CODEC_JXL) {
+        return
+    }
+    found := match codec_metadata(codec, file) {
+        ok(value) => value,
+        err(_) => {
+            assert(false, "round trip: metadata() rejects the encoder's output")
+            return
+        },
+    }
+    item := meta.Item.none()
+    if codec == CODEC_PNG {
+        if (p.b & 8) != 0 {
+            item = found.exif.clone()
+        } else if (p.b & 16) != 0 {
+            item = found.icc.clone()
+        } else {
+            return
+        }
+    } else {
+        if (p.b & 16) != 0 {
+            item = found.exif.clone()
+        } else if (p.b & 32) != 0 {
+            item = found.xmp.clone()
+        } else {
+            return
+        }
+    }
+    if !item.present() {
+        // Encoders may decline payloads that are not valid EXIF.
+        return
+    }
+    unsafe {
+        match meta.decode(file, &item, &mut EXPECTED[..OUTPUT_CAP]) {
+            ok(length) => {
+                if length == extra.len {
+                    for i in 0usize..length {
+                        assert(EXPECTED[i] == extra[i], "round trip: metadata payload changed")
+                    }
+                }
+            }
+            err(_) => {}
+        }
+    }
+}

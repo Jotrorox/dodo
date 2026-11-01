@@ -1,0 +1,351 @@
+package main
+
+import "core/mem"
+import "std/console"
+import "std/env"
+import "std/graphics"
+import "std/platform"
+import "std/window"
+
+// Checks the desktop basics on a real window, without any input: clipboard
+// round trips, every cursor shape, set_size and the size limits, and
+// fullscreen. Prints a line per step, then "passed"; prints "error NAME" and
+// exits 1 when no window opens, and "failed STEP" with exit 2 when a check
+// fails.
+//
+// With the argument "interop" it then copies "from dodo ✓" and keeps its
+// event loop running so other programs can paste it: V pastes and prints
+// "pasted TEXT" (or "pasted N bytes FIRST LAST" for long texts), L copies
+// 300000 letters a to z, T, H and A show the Text, Hand and Arrow
+// pointers, Escape exits. tests/window_library.rs drives that
+// part with xclip under Xvfb.
+
+// Whether the window's drawing area reaches `width` x `height` in units of
+// Options within a few seconds, pumping events meanwhile; X11 reports sizes
+// asynchronously and macOS animates fullscreen.
+fn settle(app: &mut window.App, win: &window.Window, width: u32, height: u32) -> bool!window.Error {
+    scale := win.scale_percent()
+    for round in 0u32..200 {
+        if win.width() == width * scale / 100 && win.height() == height * scale / 100 {
+            return ok(true)
+        }
+        app.wait_event_timeout(25)?
+    }
+    return ok(false)
+}
+
+// Pump events until the window is at least `width` x `height` pixels; a
+// fullscreen window covers a screen of unknown size.
+fn grows(app: &mut window.App, win: &window.Window, width: u32, height: u32) -> bool!window.Error {
+    for round in 0u32..200 {
+        if win.width() > width && win.height() > height {
+            return ok(true)
+        }
+        app.wait_event_timeout(25)?
+    }
+    return ok(false)
+}
+
+fn same(a: &str, b: &str) -> bool {
+    left := mem.str_bytes(a)
+    right := mem.str_bytes(b)
+    if left.len != right.len {
+        return false
+    }
+    for i in 0usize..left.len {
+        if left[i] != right[i] {
+            return false
+        }
+    }
+    return true
+}
+
+fn invalid(result: void!window.Error) -> bool {
+    match result {
+        ok() => {
+            return false
+        }
+        err(window.Error.InvalidInput) => {
+            return true
+        }
+        err(_) => {
+            return false
+        }
+    }
+}
+
+fn closed(result: void!window.Error) -> bool {
+    match result {
+        ok() => {
+            return false
+        }
+        err(window.Error.Closed) => {
+            return true
+        }
+        err(_) => {
+            return false
+        }
+    }
+}
+
+fn interop_requested() -> bool {
+    storage := platform.list_workspace()
+    arguments := match env.Arguments.capture(&mut storage, platform.TextPolicy.Strict) {
+        ok(value) => value,
+        err(_) => {
+            return false
+        }
+    }
+    buffer := [0u8; 16]
+    match arguments.get(1, &mut buffer) {
+        ok(some(value)) => {
+            return same(value, "interop")
+        }
+        ok(none) => {
+            return false
+        }
+        err(_) => {
+            return false
+        }
+    }
+}
+
+// 300000 bytes cycling through a to z, larger than one X11 request.
+fn copy_large(app: &mut window.App) -> void!window.Error {
+    large := [0u8; 300000]
+    for i in 0usize..large.len {
+        large[i] = (97 + i % 26) as u8
+    }
+    return app.set_clipboard_text(unsafe {
+        mem.str_from_utf8(&large)
+    })
+}
+
+fn clipboard(app: &mut window.App) -> u32!window.Error {
+    app.set_clipboard_text("Grüße, ✓ 𝄞\nline two")?
+    {
+        text := app.clipboard_text()?
+        if !same(text.as_str(), "Grüße, ✓ 𝄞\nline two") {
+            console.printf("clipboard read {}\n", text.as_str())!
+            return ok(1)
+        }
+    }
+    app.set_clipboard_text("")?
+    {
+        text := app.clipboard_text()?
+        if !text.is_empty() || text.len() != 0 {
+            return ok(2)
+        }
+    }
+    copy_large(app)?
+    {
+        text := app.clipboard_text()?
+        // Byte 299999 is letter 299999 % 26 = 11 after a: l.
+        if text.len() != 300000 || mem.str_bytes(text.as_str())[299999] != 108 {
+            return ok(3)
+        }
+    }
+    console.println("clipboard round trip")!
+    return ok(0)
+}
+
+fn cursors(win: &mut window.Window) -> void!window.Error {
+    win.set_cursor(window.Cursor.Text)?
+    win.set_cursor(window.Cursor.Hand)?
+    win.set_cursor(window.Cursor.Crosshair)?
+    win.set_cursor(window.Cursor.Move)?
+    win.set_cursor(window.Cursor.ResizeEW)?
+    win.set_cursor(window.Cursor.ResizeNS)?
+    win.set_cursor(window.Cursor.ResizeNWSE)?
+    win.set_cursor(window.Cursor.ResizeNESW)?
+    win.set_cursor(window.Cursor.NotAllowed)?
+    win.set_cursor(window.Cursor.Wait)?
+    // A hidden pointer keeps its shape for when it shows again.
+    win.set_cursor_visible(false)?
+    win.set_cursor(window.Cursor.Text)?
+    win.set_cursor_visible(true)?
+    win.set_cursor(window.Cursor.Arrow)?
+    console.println("cursors set")!
+    return ok()
+}
+
+fn sizes(app: &mut window.App, win: &mut window.Window) -> u32!window.Error {
+    win.set_size(300, 200)?
+    if !settle(app, win, 300, 200)? {
+        return ok(10)
+    }
+    console.printf("resized {} {}\n", win.width(), win.height())!
+    if !invalid(win.set_size(0, 100)) || !invalid(win.set_size(100, window.MAX_SIZE + 1)) {
+        return ok(11)
+    }
+    // A window smaller than a new minimum grows to it.
+    win.set_min_size(320, 220)?
+    if !settle(app, win, 320, 220)? {
+        return ok(12)
+    }
+    // set_size keeps within the limits.
+    win.set_size(100, 100)?
+    win.set_max_size(360, 0)?
+    win.set_size(1000, 230)?
+    if !settle(app, win, 360, 230)? {
+        return ok(13)
+    }
+    console.printf("limited {} {}\n", win.width(), win.height())!
+    if !invalid(win.set_min_size(400, 0)) || !invalid(win.set_max_size(300, 0)) || !invalid(win.set_max_size(window.MAX_SIZE + 1, 0)) {
+        return ok(14)
+    }
+    // A larger window shrinks to a new maximum.
+    win.set_max_size(340, 225)?
+    if !settle(app, win, 340, 225)? {
+        return ok(15)
+    }
+    win.set_max_size(0, 0)?
+    win.set_min_size(0, 0)?
+    win.set_size(300, 200)?
+    if !settle(app, win, 300, 200)? {
+        return ok(16)
+    }
+    console.println("limits removed")!
+    return ok(0)
+}
+
+fn fullscreen(app: &mut window.App, win: &mut window.Window) -> u32!window.Error {
+    if win.is_fullscreen() {
+        return ok(20)
+    }
+    width := win.width()
+    height := win.height()
+    win.set_fullscreen(true)?
+    if !win.is_fullscreen() {
+        return ok(21)
+    }
+    if !grows(app, win, width, height)? {
+        return ok(22)
+    }
+    console.println("fullscreen")!
+    // Asking again changes nothing; a size set now applies afterwards.
+    win.set_fullscreen(true)?
+    win.set_size(310, 210)?
+    win.set_fullscreen(false)?
+    if win.is_fullscreen() {
+        return ok(23)
+    }
+    if !settle(app, win, 310, 210)? {
+        return ok(24)
+    }
+    console.printf("windowed {} {}\n", win.width(), win.height())!
+    return ok(0)
+}
+
+fn interop(app: &mut window.App, win: &mut window.Window) -> void!window.Error {
+    app.set_clipboard_text("from dodo ✓")?
+    console.println("copied")!
+    idle := 0u32
+    for idle < 200 {
+        match app.wait_event_timeout(50)? {
+            some(window.Event.Key(_, key)) => {
+                idle = 0
+                if !key.pressed {
+                    continue
+                }
+                if key.key == window.Key.Escape {
+                    return ok()
+                }
+                if key.key == window.Key.V {
+                    text := app.clipboard_text()?
+                    if text.len() > 100 {
+                        // Large texts are summarized: length, first and last byte.
+                        bytes := mem.str_bytes(text.as_str())
+                        console.printf("pasted {} bytes {} {}\n", text.len(), bytes[0], bytes[bytes.len - 1])!
+                    } else {
+                        console.printf("pasted {}\n", text.as_str())!
+                    }
+                }
+                if key.key == window.Key.T || key.key == window.Key.H || key.key == window.Key.A {
+                    shape := window.Cursor.Arrow
+                    if key.key == window.Key.T {
+                        shape = window.Cursor.Text
+                    } else if key.key == window.Key.H {
+                        shape = window.Cursor.Hand
+                    }
+                    win.set_cursor(shape)?
+                    console.println("cursor")!
+                }
+                if key.key == window.Key.L {
+                    copy_large(app)?
+                    console.println("copied large")!
+                }
+            }
+            some(window.Event.Close(_)) | some(window.Event.Quit) => {
+                return ok()
+            }
+            some(_) => {}
+            none => {
+                idle += 1
+            }
+        }
+    }
+    return ok()
+}
+
+fn run() -> u32!window.Error {
+    app := window.App.new()?
+    win := app.open(window.Options.new("Desktop", 280, 180))?
+    {
+        canvas := win.canvas()
+        canvas.clear(graphics.hex(0x808080))
+    }
+    win.update_all()?
+    console.println("open")!
+    failure := clipboard(&mut app)?
+    if failure != 0 {
+        return ok(failure)
+    }
+    cursors(&mut win)?
+    failure = sizes(&mut app, &mut win)?
+    if failure != 0 {
+        return ok(failure)
+    }
+    failure = fullscreen(&mut app, &mut win)?
+    if failure != 0 {
+        return ok(failure)
+    }
+    if interop_requested() {
+        interop(&mut app, &mut win)?
+    }
+    win.close()
+    if !closed(win.set_cursor(window.Cursor.Text)) || !closed(win.set_size(100, 100)) || !closed(win.set_min_size(10, 10)) || !closed(win.set_fullscreen(true)) || win.is_fullscreen() {
+        return ok(30)
+    }
+    app.close()
+    if !closed(app.set_clipboard_text("late")) {
+        return ok(31)
+    }
+    match app.clipboard_text() {
+        ok(_) => {
+            return ok(32)
+        }
+        err(window.Error.Closed) => {}
+        err(_) => {
+            return ok(32)
+        }
+    }
+    return ok(0)
+}
+
+fn main() -> i32 {
+    match run() {
+        ok(0) => {
+            console.println("passed")!
+            return 0
+        }
+        ok(step) => {
+            console.printf("failed {}\n", step)!
+            return 2
+        }
+        err(error) => {
+            console.printf("error {}\n", window.error_name(error))!
+            return 1
+        }
+    }
+}

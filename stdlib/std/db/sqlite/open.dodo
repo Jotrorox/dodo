@@ -1,0 +1,117 @@
+package sqlite
+
+import "core/mem"
+import "std/db"
+import "std/fs"
+import "std/platform"
+
+fn engine_new(ws: &mut[u8]) -> Engine from(ws) {
+    Engine {
+        ws, file: none, journal: none, memory: false, readonly: false, create: true,
+        path_len: 0, msg_len: 0,
+        schema_off: 0, schema_cap: 0, stmt_off: 0, stmt_slot: 0, stmt_slots: 0,
+        reg_off: 0, cur_off: 0, arena_off: 0, arena_cap: 0, arena_top: 0,
+        sort_off: 0, sort_cap: 0, sort_top: 0, sort_hi: 0, bitmap_off: 0, bitmap_bytes: 0,
+        sj_off: 0, sj_cap: 0, sj_used: 0, sj_active: false, sj_overflow: false, sj_pages: 0,
+        gather_a: 0, gather_b: 0, meta_off: 0, hash_off: 0, hash_cap: 0,
+        cache_off: 0, cache_end: 0, nslots: 0, scratch_page: 0, cell_buf: 0, cell_buf2: 0,
+        mj_off: 0, mj_cap: 0, mj_used: 0, stamp: 0,
+        page_size: 4096, usable: 4096, reserved: 0, db_pages: 0, file_pages: 0, disk_pages: 0,
+        lock: 0, shared_byte: 0, write_txn: false, explicit_txn: false,
+        journal_open: false, journal_synced: false, journal_records: 0, journal_nonce: 0,
+        db_written: false, initialized: false, schema_format: 4, change_counter: 0,
+        schema_cookie: 0, schema_loaded: false, schema_gen: 0, schema_len: 0,
+        schema_objs: 0, schema_pool: 0, rng: 88172645463325252u64, busy_retries: 0,
+        last_rowid: 0, changes: 0, total_changes: 0, error_offset: -1,
+        sb: 0, src: 0, src_end: 0, pos: 0, tk: 0, ts: 0, tl: 0, last_end: 0,
+        node_off: 0, node_n: 0, pool_lo: 0, nparam: 0, named_n: 0, named_off: 0,
+        depth: 0, auto_target: 0,
+        cur_alloc: 0, reg_alloc: 16, ctx_n: 0, ctx_off: 0, agg_list: 0, agg_n: 0,
+        subq_list: 0, subq_n: 0, min_ctx: 4294967295, regctx_t: 4294967295, regctx_base: 0, excluded_base: 0, group_list: 0, view_depth: 0, cte_off: 0, cte_n: 0, queue_rec: 0, ret_start: 0, bal_append: false,
+        rtop: 16, param_reg: 16, arena_base: 0, slot_rec: 0, slot_len: 0, slot_first: 0, slot_first_len: 0,
+        agg_top: 0, agg_end: 0, agg_hit: 0, active: 4294967295,
+    }
+}
+
+// Opens (creating if allowed) the database file and reads its page size.
+fn engine_open(e: &mut Engine, path: &str) -> void!db.Error {
+    if e.ws.len < MIN_WORKSPACE_BYTES {
+        e.msg_len = 0
+        return err(db.Error.new(db.ErrorKind.Capacity, SQLITE_NOMEM))
+    }
+    bytes := mem.str_bytes(path)
+    if bytes.len == 0 || bytes_eq(bytes, mem.str_bytes(":memory:")) {
+        e.memory = true
+        layout(e)?
+        return ok()
+    }
+    if bytes.len + 16 > PATH_CAP {
+        return err(fail(e, SQLITE_CANTOPEN, "path is too long"))
+    }
+    copy_in(e.ws, 0, bytes)
+    e.path_len = bytes.len
+    pws := platform.workspace()
+    options := fs.OpenOptions.new()
+    options.read = true
+    options.write = !e.readonly
+    options.create = e.create && !e.readonly
+    match fs.File.open_utf8(path, &options, &mut pws) {
+        ok(file) => {
+            e.file = some(file)
+        },
+        err(_) => {
+            return err(fail(e, SQLITE_CANTOPEN, "unable to open database file"))
+        },
+    }
+    // Probe the page size from the header, if there is one.
+    hdr := [0u8; 100]
+    got := 0usize
+    match &mut e.file {
+        some(f) => {
+            match f.read(&mut hdr) {
+                ok(n) => {
+                    got = n
+                },
+                err(_) => {},
+            }
+        },
+        none => {},
+    }
+    if got >= 100 {
+        ps := rd16(&hdr, 16)
+        if ps == 1 {
+            ps = 65536
+        }
+        if ps >= 512 && ps <= 65536 && (ps & (ps - 1)) == 0 {
+            e.page_size = ps
+        }
+    }
+    layout(e)?
+    ok()
+}
+
+fn engine_close(e: &mut Engine) -> void!db.Error {
+    if e.write_txn {
+        rollback(e)?
+    }
+    e.explicit_txn = false
+    unlock_to(e, false)
+    journal_close(e)
+    failed := false
+    match &mut e.file {
+        some(f) => {
+            match f.close() {
+                ok() => {},
+                err(_) => {
+                    failed = true
+                },
+            }
+        },
+        none => {},
+    }
+    e.file = none
+    if failed {
+        return err(io_fail(e, "disk I/O error (close)"))
+    }
+    ok()
+}

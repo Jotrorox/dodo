@@ -8,9 +8,15 @@ package raw
 // Every adapter has a Backend type whose associated functions act on the
 // process's one connection to the window system and on its windows by id:
 // connect and disconnect; open, close, size, attach (the pixel buffer to
-// repaint from), present, set_title, set_cursor_visible and scale_percent;
-// next_event; and the frame pacing primitives clock, frame_period,
-// next_vblank, request_frame and set_animating.
+// repaint from), present, set_title, set_cursor_visible, set_cursor and
+// scale_percent; set_size, set_size_limits, set_fullscreen and fullscreen;
+// the clipboard's set_clipboard and clipboard; next_event; the frame pacing
+// primitives clock, frame_period, next_vblank, request_frame and
+// set_animating; and for GPU programs native_handle and metal_layer. open
+// takes whether the window gets a pixel buffer; one without refuses
+// present. set_cursor takes a CURSOR_ shape, set_size and set_size_limits
+// sizes in the units of window.Options with 0 for no limit, and clipboard
+// returns the text as UTF-8 bytes that std/window repairs if malformed.
 
 // Why a window could not be opened or used.
 pub enum Error {
@@ -86,6 +92,20 @@ pub const FRAME: u32 = 10
 // The user asked the application to quit, such as with Command-Q on macOS;
 // window is 0.
 pub const QUIT: u32 = 11
+
+// Pointer shapes, in the order of window.Cursor.
+pub const CURSOR_ARROW: u32 = 0
+pub const CURSOR_TEXT: u32 = 1
+pub const CURSOR_HAND: u32 = 2
+pub const CURSOR_CROSSHAIR: u32 = 3
+pub const CURSOR_MOVE: u32 = 4
+pub const CURSOR_RESIZE_EW: u32 = 5
+pub const CURSOR_RESIZE_NS: u32 = 6
+pub const CURSOR_RESIZE_NWSE: u32 = 7
+pub const CURSOR_RESIZE_NESW: u32 = 8
+pub const CURSOR_NOT_ALLOWED: u32 = 9
+pub const CURSOR_WAIT: u32 = 10
+pub const CURSORS: u32 = 11
 
 pub const PRESSED: u32 = 1
 pub const REPEAT: u32 = 2

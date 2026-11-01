@@ -8,8 +8,11 @@
  * 1 and are never reused, so a stale id simply finds nothing. Each window's
  * pixel buffer is 32-bit BGRA, top-down, and owned by std/window, which
  * attaches it here whenever it replaces it; the window system repaints from
- * it. Events of every window are queued in one ring and handed out one at a
- * time in the std/window/raw Event layout, which names the window.
+ * it. A window opened for the GPU has no buffer: the program draws into it
+ * through its native handle (dodo_window_native) or, on macOS, a CAMetalLayer
+ * (dodo_window_metal_layer), and present refuses it. Events of every window
+ * are queued in one ring and handed out one at a time in the std/window/raw
+ * Event layout, which names the window.
  *
  * Error codes match std/window/raw from_code: 0 success, 1 NoDisplay,
  * 2 AlreadyOpen, 3 Closed, 4 InvalidInput, 5 OutOfMemory, 6 Protocol,
@@ -18,7 +21,13 @@
  * Frame pacing: dodo_window_clock is a monotonic nanosecond clock on every
  * OS. macOS 14 and later report display refreshes with a CADisplayLink per
  * window as FRAME events; Windows reads the next refresh time from the
- * compositor. */
+ * compositor.
+ *
+ * Sizes passed to dodo_window_set_size and dodo_window_set_size_limits are
+ * in window.Options units (points, or pixels at the system scale), 0 meaning
+ * no limit. Cursor shapes are the ordinals of window.Cursor. The clipboard
+ * is UTF-8 text in both directions; dodo_window_clipboard hands out memory
+ * from malloc that std/window frees with dodo_window_free. */
 #if defined(__linux__)
 #define _GNU_SOURCE
 #endif
@@ -38,6 +47,14 @@ enum {
 };
 enum { F_PRESSED = 1, F_REPEAT = 2 };
 enum { M_SHIFT = 1, M_CONTROL = 2, M_ALT = 4, M_META = 8, M_CAPS = 16 };
+/* dodo_window_open flags, and the kinds dodo_window_native reports. */
+enum { O_RESIZABLE = 1, O_PIXEL_BUFFER = 2 };
+enum { NATIVE_APPKIT = 1, NATIVE_WIN32 = 2 };
+/* window.Cursor ordinals. */
+enum {
+    CURSOR_ARROW, CURSOR_TEXT, CURSOR_HAND, CURSOR_CROSSHAIR, CURSOR_MOVE, CURSOR_RESIZE_EW,
+    CURSOR_RESIZE_NS, CURSOR_RESIZE_NWSE, CURSOR_RESIZE_NESW, CURSOR_NOT_ALLOWED, CURSOR_WAIT, CURSORS
+};
 #define FOREVER 0xffffffffu
 
 struct dodo_window_event {
@@ -108,6 +125,7 @@ static void push_text(uint32_t window, uint32_t code_point) {
 #include <objc/runtime.h>
 #include <objc/message.h>
 #include <CoreGraphics/CoreGraphics.h>
+#include <float.h>
 #include <math.h>
 #include <pthread.h>
 #include <time.h>
@@ -129,18 +147,36 @@ struct dodo_window {
     uint8_t *pixels;
     uint32_t pixel_width, pixel_height;
     int cursor_hidden, mouse_inside;
+    /* The window.Cursor shown over the drawing area. */
+    uint32_t cursor;
+    /* Size limits in window.Options units; 0 is none. */
+    uint32_t min_width, min_height, max_width, max_height;
+    /* Opened without a pixel buffer, for drawing with the GPU. */
+    int gpu;
 #if defined(__APPLE__)
-    id window, view, layer;
+    /* layer shows the pixel buffer; a GPU window has none, and metal_layer
+     * is the CAMetalLayer dodo_window_metal_layer made, retained here. */
+    id window, view, layer, metal_layer;
     /* A CADisplayLink, paused except between request_frame and the refresh
      * it reports, and the refresh period it measured. */
     id display_link;
     uint64_t link_period;
     double backing_scale;
+    /* Fullscreen is an animated transition: the state set_fullscreen asked
+     * for (-1 when it is reached), whether a transition runs, whether the
+     * window was made resizable for it, and a set_size waiting for the end
+     * of fullscreen. */
+    int fullscreen_target, fullscreen_moving, made_resizable;
+    uint32_t pending_width, pending_height;
 #else
     HWND hwnd;
     UINT dpi;
     int mouse_tracking, buttons_down;
     WCHAR high_surrogate;
+    /* While fullscreen, the style and placement to return to. */
+    int fullscreen;
+    LONG_PTR saved_style;
+    WINDOWPLACEMENT saved_placement;
 #endif
 };
 
@@ -181,6 +217,12 @@ void dodo_window_attach(uint32_t window, uint8_t *pixels, uint32_t width, uint32
     if (!w) return;
     w->pixels = pixels; w->pixel_width = width; w->pixel_height = height;
 }
+
+/* `value` within the limits `low` and `high`, where 0 is no limit. */
+static uint32_t within(uint32_t value, uint32_t low, uint32_t high) {
+    if (high && value > high) value = high;
+    return value < low ? low : value;
+}
 #endif
 
 /* ------------------------------------------------------------------------ */
@@ -190,6 +232,7 @@ extern void objc_autoreleasePoolPop(void *pool);
 extern id const kCAGravityTopLeft;
 extern id const kCAFilterNearest;
 extern id const NSDefaultRunLoopMode;
+extern id const NSPasteboardTypeString;
 
 /* Typed views of objc_msgSend, one per signature used. */
 #define SEND(type) ((type)objc_msgSend)
@@ -209,6 +252,7 @@ typedef long (*send_long)(id, SEL);
 typedef CGPoint (*send_point)(id, SEL);
 typedef CGPoint (*send_point_point)(id, SEL, CGPoint);
 typedef CGPoint (*send_point_point_id)(id, SEL, CGPoint, id);
+typedef void (*send_void_size)(id, SEL, CGSize);
 typedef const char *(*send_cstring)(id, SEL);
 
 static id cls(const char *name) { return (id)objc_getClass(name); }
@@ -227,6 +271,10 @@ static CGRect msg_rect(id target, const char *name) {
 #else
     return ((CGRect (*)(id, SEL))objc_msgSend)(target, sel(name));
 #endif
+}
+
+static BOOL responds(id target, const char *name) {
+    return SEND(BOOL (*)(id, SEL, SEL))(target, sel("respondsToSelector:"), sel(name));
 }
 
 /* One delegate serves every window, the Quit item and the display links;
@@ -288,7 +336,15 @@ static unsigned long modifier_bit(unsigned short code) {
 static void update_scale(struct dodo_window *w) {
     double scale = SEND(send_double)(w->window, sel("backingScaleFactor"));
     w->backing_scale = scale > 0 ? scale : 1;
-    SEND(send_void_double)(w->layer, sel("setContentsScale:"), w->backing_scale);
+    if (w->layer) SEND(send_void_double)(w->layer, sel("setContentsScale:"), w->backing_scale);
+    if (w->metal_layer) SEND(send_void_double)(w->metal_layer, sel("setContentsScale:"), w->backing_scale);
+}
+
+/* Keep the Metal layer's drawables at the drawing area's size in pixels. */
+static void size_metal_layer(struct dodo_window *w) {
+    if (!w->metal_layer) return;
+    CGSize size = CGSizeMake(w->width ? w->width : 1, w->height ? w->height : 1);
+    SEND(send_void_size)(w->metal_layer, sel("setDrawableSize:"), size);
 }
 
 /* Record the content view's size in pixels, reporting a change. */
@@ -300,6 +356,7 @@ static void sync_size(struct dodo_window *w, int report) {
     uint32_t pw = width > 0 ? (uint32_t)width : 0, ph = height > 0 ? (uint32_t)height : 0;
     if (pw == w->width && ph == w->height) return;
     w->width = pw; w->height = ph;
+    size_metal_layer(w);
     if (report) push(w->id, EV_RESIZE, 0, 0, 0, (int32_t)pw, (int32_t)ph);
 }
 
@@ -337,6 +394,135 @@ static void did_resize(id self, SEL command, id note) {
     struct dodo_window *w = by_window(msg(note, "object"));
     if (w) sync_size(w, 1);
 }
+
+/* NSWindowStyleMaskFullScreen and NSWindowStyleMaskResizable. */
+#define STYLE_FULLSCREEN (1ul << 14)
+#define STYLE_RESIZABLE (1ul << 3)
+
+static int is_fullscreen(struct dodo_window *w) {
+    return (SEND(send_ulong)(w->window, sel("styleMask")) & STYLE_FULLSCREEN) != 0;
+}
+
+/* Resize the content area to width x height points, keeping the window's
+ * top-left corner in place. */
+static void resize_content(struct dodo_window *w, double width, double height) {
+    CGRect frame = msg_rect(w->window, "frame");
+    CGRect bounds = msg_rect(w->view, "bounds");
+    double top = frame.origin.y + frame.size.height;
+    frame.size.width += width - bounds.size.width;
+    frame.size.height += height - bounds.size.height;
+    frame.origin.y = top - frame.size.height;
+    SEND(void (*)(id, SEL, CGRect, BOOL))(w->window, sel("setFrame:display:"), frame, YES);
+    sync_size(w, 1);
+}
+
+/* Start the transition into or out of fullscreen. Only windows with the
+ * full-screen-primary behavior and a resizable style may enter, so a fixed
+ * window is resizable while it is fullscreen. */
+static void toggle_fullscreen(struct dodo_window *w) {
+    if (!is_fullscreen(w)) {
+        unsigned long behavior = SEND(send_ulong)(w->window, sel("collectionBehavior"));
+        /* Primary on; auxiliary, none and allows-tiling off. */
+        behavior = (behavior | (1ul << 7)) & ~((1ul << 8) | (1ul << 9));
+        SEND(void (*)(id, SEL, unsigned long))(w->window, sel("setCollectionBehavior:"), behavior);
+        unsigned long style = SEND(send_ulong)(w->window, sel("styleMask"));
+        if (!(style & STYLE_RESIZABLE)) {
+            SEND(void (*)(id, SEL, unsigned long))(w->window, sel("setStyleMask:"), style | STYLE_RESIZABLE);
+            w->made_resizable = 1;
+        }
+    }
+    w->fullscreen_moving = 1;
+    msg_void_id(w->window, "toggleFullScreen:", nil);
+}
+
+static void fullscreen_starts(id self, SEL command, id note) {
+    (void)self; (void)command;
+    struct dodo_window *w = by_window(msg(note, "object"));
+    if (w) w->fullscreen_moving = 1;
+}
+
+/* A transition ended, or failed when `failed`: undo what entering needed,
+ * apply a size set meanwhile, and go on to the state last asked for. */
+static void fullscreen_settled(struct dodo_window *w, int failed) {
+    w->fullscreen_moving = 0;
+    int now = is_fullscreen(w);
+    if (!now && w->made_resizable) {
+        unsigned long style = SEND(send_ulong)(w->window, sel("styleMask"));
+        SEND(void (*)(id, SEL, unsigned long))(w->window, sel("setStyleMask:"), style & ~STYLE_RESIZABLE);
+        w->made_resizable = 0;
+    }
+    if (!now && w->pending_width) {
+        resize_content(w, w->pending_width, w->pending_height);
+        w->pending_width = w->pending_height = 0;
+    }
+    sync_size(w, 1);
+    if (failed || w->fullscreen_target < 0 || w->fullscreen_target == now) { w->fullscreen_target = -1; return; }
+    /* AppKit ignores a toggle from inside the callback that ends the last
+     * transition, so the next one starts from the run loop right after. */
+    SEND(void (*)(id, SEL, SEL, id, double))(delegate, sel("performSelector:withObject:afterDelay:"),
+        sel("dodoFullscreen:"), w->window, 0.0);
+}
+/* The follow-up of fullscreen_settled, unless the program changed its mind
+ * or closed the window meanwhile. */
+static void fullscreen_follow_up(id self, SEL command, id window) {
+    (void)self; (void)command;
+    struct dodo_window *w = by_window(window);
+    if (!w || w->fullscreen_moving || w->fullscreen_target < 0) return;
+    if (w->fullscreen_target == is_fullscreen(w)) { w->fullscreen_target = -1; return; }
+    toggle_fullscreen(w);
+}
+static void fullscreen_ended(id self, SEL command, id note) {
+    (void)self; (void)command;
+    struct dodo_window *w = by_window(msg(note, "object"));
+    if (w) fullscreen_settled(w, 0);
+}
+static void fullscreen_failed(id self, SEL command, id window) {
+    (void)self; (void)command;
+    struct dodo_window *w = by_window(window);
+    if (w) fullscreen_settled(w, 1);
+}
+
+/* The NSCursor for a window.Cursor: the public cursors of macOS 15 first,
+ * then older public ones, then private ones that respondsToSelector: guards:
+ * the diagonal window-edge arrows before macOS 15, and the busy pointer. */
+static id cursor_object(uint32_t shape) {
+    id type = cls("NSCursor");
+    switch (shape) {
+    case CURSOR_TEXT: return msg(type, "IBeamCursor");
+    case CURSOR_HAND: return msg(type, "pointingHandCursor");
+    case CURSOR_CROSSHAIR: return msg(type, "crosshairCursor");
+    /* macOS has no four-way arrow; the private _moveCursor still answers
+     * respondsToSelector: but throws on current systems. */
+    case CURSOR_MOVE: return msg(type, "openHandCursor");
+    case CURSOR_RESIZE_EW: return msg(type, responds(type, "columnResizeCursor") ? "columnResizeCursor" : "resizeLeftRightCursor");
+    case CURSOR_RESIZE_NS: return msg(type, responds(type, "rowResizeCursor") ? "rowResizeCursor" : "resizeUpDownCursor");
+    case CURSOR_RESIZE_NWSE: case CURSOR_RESIZE_NESW: {
+        /* NSCursorFrameResizePositionTopLeft or TopRight, in both directions. */
+        if (responds(type, "frameResizeCursorFromPosition:inDirections:"))
+            return SEND(id (*)(id, SEL, unsigned long, unsigned long))(type, sel("frameResizeCursorFromPosition:inDirections:"),
+                shape == CURSOR_RESIZE_NWSE ? 3ul : 9ul, 3ul);
+        const char *name = shape == CURSOR_RESIZE_NWSE ? "_windowResizeNorthWestSouthEastCursor" : "_windowResizeNorthEastSouthWestCursor";
+        return msg(type, responds(type, name) ? name : "crosshairCursor");
+    }
+    case CURSOR_NOT_ALLOWED: return msg(type, "operationNotAllowedCursor");
+    case CURSOR_WAIT: return msg(type, responds(type, "busyButClickableCursor") ? "busyButClickableCursor" : "arrowCursor");
+    default: return msg(type, "arrowCursor");
+    }
+}
+
+/* The plain content view has no cursor rects, so the shape is set again
+ * whenever the pointer moves over the drawing area, after AppKit has seen
+ * the event. */
+static void show_cursor_shape(struct dodo_window *w) {
+    id cursor = cursor_object(w->cursor);
+    if (cursor) msg_void(cursor, "set");
+}
+static void follow_pointer(id event) {
+    long type = SEND(send_long)(event, sel("type"));
+    if (type != 5 && type != 6 && type != 7 && type != 27 && type != 8) return;
+    struct dodo_window *w = by_window(msg(event, "window"));
+    if (w && w->mouse_inside && w->cursor != CURSOR_ARROW) show_cursor_shape(w);
+}
 /* Marks frame_ready's application-defined wake-up event in data1. */
 #define FRAME_WAKE 0x646f646fl
 
@@ -371,6 +557,13 @@ static Class delegate_class(void) {
     class_addMethod(created, sel("windowDidChangeBackingProperties:"), (IMP)did_resize, "v@:@");
     class_addMethod(created, sel("dodoQuit:"), (IMP)quit_requested, "v@:@");
     class_addMethod(created, sel("dodoFrame:"), (IMP)frame_ready, "v@:@");
+    class_addMethod(created, sel("windowWillEnterFullScreen:"), (IMP)fullscreen_starts, "v@:@");
+    class_addMethod(created, sel("windowWillExitFullScreen:"), (IMP)fullscreen_starts, "v@:@");
+    class_addMethod(created, sel("windowDidEnterFullScreen:"), (IMP)fullscreen_ended, "v@:@");
+    class_addMethod(created, sel("windowDidExitFullScreen:"), (IMP)fullscreen_ended, "v@:@");
+    class_addMethod(created, sel("windowDidFailToEnterFullScreen:"), (IMP)fullscreen_failed, "v@:@");
+    class_addMethod(created, sel("windowDidFailToExitFullScreen:"), (IMP)fullscreen_failed, "v@:@");
+    class_addMethod(created, sel("dodoFullscreen:"), (IMP)fullscreen_follow_up, "v@:@");
     objc_registerClassPair(created);
     return created;
 }
@@ -401,10 +594,6 @@ static void install_menu(void) {
     msg_void(app_item, "release"); msg_void(bar, "release");
 }
 
-static BOOL responds(id target, const char *name) {
-    return SEND(BOOL (*)(id, SEL, SEL))(target, sel("respondsToSelector:"), sel(name));
-}
-
 /* NSView display links exist from macOS 14; older systems pace by timer. */
 static void create_display_link(struct dodo_window *w) {
     if (!responds(w->view, "displayLinkWithTarget:selector:")) return;
@@ -431,11 +620,14 @@ static void destroy_window(struct dodo_window *w) {
         msg_void(w->display_link, "release");
     }
     if (w->window) {
+        SEND(void (*)(id, SEL, id, SEL, id))(cls("NSObject"), sel("cancelPreviousPerformRequestsWithTarget:selector:object:"),
+            delegate, sel("dodoFullscreen:"), w->window);
         msg_void_id(w->window, "setDelegate:", nil);
         msg_void_id(w->window, "orderOut:", nil);
         msg_void(w->window, "close");
         msg_void(w->window, "release");
     }
+    if (w->metal_layer) msg_void(w->metal_layer, "release");
     purge(w->id, 0);
     free(w);
     apply_cursor();
@@ -478,10 +670,13 @@ void dodo_window_disconnect(void) {
     objc_autoreleasePoolPop(pool);
 }
 
-int32_t dodo_window_open(const uint8_t *title, size_t title_length, uint32_t width, uint32_t height, uint32_t resizable, uint32_t *handle) {
+int32_t dodo_window_open(const uint8_t *title, size_t title_length, uint32_t width, uint32_t height, uint32_t flags, uint32_t *handle) {
     if (!connected) return E_CLOSED;
     struct dodo_window *w = new_window();
     if (!w) return E_MEMORY;
+    int resizable = (flags & O_RESIZABLE) != 0;
+    w->gpu = (flags & O_PIXEL_BUFFER) == 0;
+    w->fullscreen_target = -1;
     void *pool = objc_autoreleasePoolPush();
     unsigned long style = 1 | 2 | 4 | (resizable ? 8 : 0); /* titled, closable, miniaturizable, resizable */
     CGRect frame = CGRectMake(0, 0, width, height);
@@ -494,10 +689,14 @@ int32_t dodo_window_open(const uint8_t *title, size_t title_length, uint32_t wid
     msg_void_id(w->window, "setTitle:", text);
     msg_void(text, "release");
     w->view = msg(w->window, "contentView");
-    msg_void_bool(w->view, "setWantsLayer:", YES);
-    w->layer = msg(w->view, "layer");
-    msg_void_id(w->layer, "setContentsGravity:", kCAGravityTopLeft);
-    msg_void_id(w->layer, "setMagnificationFilter:", kCAFilterNearest);
+    /* The pixel buffer is shown as the contents of the view's layer. A GPU
+     * window leaves the view alone for NSOpenGLContext or a Metal layer. */
+    if (!w->gpu) {
+        msg_void_bool(w->view, "setWantsLayer:", YES);
+        w->layer = msg(w->view, "layer");
+        msg_void_id(w->layer, "setContentsGravity:", kCAGravityTopLeft);
+        msg_void_id(w->layer, "setMagnificationFilter:", kCAFilterNearest);
+    }
     create_display_link(w);
     /* Moves and exits over the drawing area, focused or not. */
     id area = SEND(id (*)(id, SEL, CGRect, unsigned long, id, id))(msg(cls("NSTrackingArea"), "alloc"),
@@ -547,6 +746,14 @@ static void mouse_position(struct dodo_window *w, id event, int32_t *x, int32_t 
     CGRect bounds = msg_rect(w->view, "bounds");
     *x = (int32_t)floor(local.x * w->backing_scale);
     *y = (int32_t)floor((bounds.size.height - local.y) * w->backing_scale);
+}
+
+/* The pointer left the drawing area, for the title bar perhaps, where the
+ * window's own shape no longer applies. */
+static void left(struct dodo_window *w) {
+    w->mouse_inside = 0;
+    push(w->id, EV_LEAVE, 0, 0, 0, 0, 0);
+    if (w->cursor != CURSOR_ARROW) msg_void(msg(cls("NSCursor"), "arrowCursor"), "set");
 }
 
 /* Translates an event into the queue. Returns whether AppKit should also
@@ -601,11 +808,11 @@ static int translate(id event) {
         int inside = x >= 0 && y >= 0 && x < (int32_t)(bounds.size.width * w->backing_scale)
             && y < (int32_t)(bounds.size.height * w->backing_scale);
         if (inside || type != 5) { w->mouse_inside = 1; push(w->id, EV_MOVE, 0, modifiers, 0, x, y); }
-        else if (w->mouse_inside) { w->mouse_inside = 0; push(w->id, EV_LEAVE, 0, 0, 0, 0, 0); }
+        else if (w->mouse_inside) left(w);
         return 1;
     }
     case 9: /* exited */
-        if (w && w->mouse_inside) { w->mouse_inside = 0; push(w->id, EV_LEAVE, 0, 0, 0, 0, 0); }
+        if (w && w->mouse_inside) left(w);
         return 1;
     case 22: { /* scroll wheel */
         if (!w) return 1;
@@ -634,6 +841,7 @@ int32_t dodo_window_next_event(uint32_t milliseconds, struct dodo_window_event *
             sel("nextEventMatchingMask:untilDate:inMode:dequeue:"), ~0ull, until, NSDefaultRunLoopMode, YES);
         if (!next) break;
         if (translate(next)) msg_void_id(app, "sendEvent:", next);
+        follow_pointer(next);
         for (struct dodo_window *w = windows; w; w = w->next) sync_size(w, 1);
         if (queue_count) break;
     }
@@ -647,6 +855,7 @@ int32_t dodo_window_present(uint32_t window, int32_t x, int32_t y, uint32_t widt
     (void)x; (void)y; (void)width; (void)height;
     struct dodo_window *w = find(window);
     if (!w) return E_CLOSED;
+    if (w->gpu) return E_UNSUPPORTED;
     if (!w->pixels || !w->pixel_width || !w->pixel_height) return 0;
     void *pool = objc_autoreleasePoolPush();
     /* The image takes a copy, so the program can keep drawing at once. */
@@ -690,10 +899,133 @@ int32_t dodo_window_set_cursor_visible(uint32_t window, uint32_t visible) {
     return 0;
 }
 
+int32_t dodo_window_set_cursor(uint32_t window, uint32_t shape) {
+    struct dodo_window *w = find(window);
+    if (!w) return E_CLOSED;
+    w->cursor = shape < CURSORS ? shape : CURSOR_ARROW;
+    void *pool = objc_autoreleasePoolPush();
+    if (w->mouse_inside) show_cursor_shape(w);
+    objc_autoreleasePoolPop(pool);
+    return 0;
+}
+
+int32_t dodo_window_set_size(uint32_t window, uint32_t width, uint32_t height) {
+    struct dodo_window *w = find(window);
+    if (!w) return E_CLOSED;
+    void *pool = objc_autoreleasePoolPush();
+    if (is_fullscreen(w) || w->fullscreen_moving) { w->pending_width = width; w->pending_height = height; }
+    else resize_content(w, width, height);
+    objc_autoreleasePoolPop(pool);
+    return 0;
+}
+
+int32_t dodo_window_set_size_limits(uint32_t window, uint32_t min_width, uint32_t min_height, uint32_t max_width, uint32_t max_height) {
+    struct dodo_window *w = find(window);
+    if (!w) return E_CLOSED;
+    w->min_width = min_width; w->min_height = min_height;
+    w->max_width = max_width; w->max_height = max_height;
+    void *pool = objc_autoreleasePoolPush();
+    SEND(send_void_size)(w->window, sel("setContentMinSize:"), CGSizeMake(min_width, min_height));
+    SEND(send_void_size)(w->window, sel("setContentMaxSize:"), CGSizeMake(max_width ? max_width : FLT_MAX, max_height ? max_height : FLT_MAX));
+    if (!is_fullscreen(w) && !w->fullscreen_moving) {
+        CGRect bounds = msg_rect(w->view, "bounds");
+        uint32_t width = (uint32_t)lround(bounds.size.width), height = (uint32_t)lround(bounds.size.height);
+        uint32_t fitted_width = within(width, min_width, max_width), fitted_height = within(height, min_height, max_height);
+        if (fitted_width != width || fitted_height != height) resize_content(w, fitted_width, fitted_height);
+    }
+    objc_autoreleasePoolPop(pool);
+    return 0;
+}
+
+int32_t dodo_window_set_fullscreen(uint32_t window, uint32_t fullscreen) {
+    struct dodo_window *w = find(window);
+    if (!w) return E_CLOSED;
+    int wanted = fullscreen != 0;
+    void *pool = objc_autoreleasePoolPush();
+    if (w->fullscreen_moving) w->fullscreen_target = wanted;
+    else if (is_fullscreen(w) != wanted) { w->fullscreen_target = wanted; toggle_fullscreen(w); }
+    else w->fullscreen_target = -1;
+    objc_autoreleasePoolPop(pool);
+    return 0;
+}
+
+uint32_t dodo_window_fullscreen(uint32_t window) {
+    struct dodo_window *w = find(window);
+    if (!w) return 0;
+    if (w->fullscreen_target >= 0) return (uint32_t)w->fullscreen_target;
+    return (uint32_t)is_fullscreen(w);
+}
+
+int32_t dodo_window_set_clipboard(const uint8_t *text, size_t length) {
+    if (!connected) return E_CLOSED;
+    void *pool = objc_autoreleasePoolPush();
+    id board = msg(cls("NSPasteboard"), "generalPasteboard");
+    id string = string_from(text, length);
+    SEND(send_long)(board, sel("clearContents"));
+    BOOL done = board && SEND(BOOL (*)(id, SEL, id, id))(board, sel("setString:forType:"), string, NSPasteboardTypeString);
+    msg_void(string, "release");
+    objc_autoreleasePoolPop(pool);
+    return done ? 0 : E_SYSTEM;
+}
+
+int32_t dodo_window_clipboard(uintptr_t *data, size_t *length) {
+    *data = 0; *length = 0;
+    if (!connected) return E_CLOSED;
+    void *pool = objc_autoreleasePoolPush();
+    int32_t code = 0;
+    id board = msg(cls("NSPasteboard"), "generalPasteboard");
+    id string = board ? SEND(send_id_id)(board, sel("stringForType:"), NSPasteboardTypeString) : nil;
+    id bytes = string ? SEND(id (*)(id, SEL, unsigned long))(string, sel("dataUsingEncoding:"), 4ul) : nil;
+    size_t size = bytes ? (size_t)SEND(send_ulong)(bytes, sel("length")) : 0;
+    if (size) {
+        uint8_t *copy = malloc(size);
+        if (copy) {
+            memcpy(copy, SEND(const void *(*)(id, SEL))(bytes, sel("bytes")), size);
+            *data = (uintptr_t)copy; *length = size;
+        } else {
+            code = E_MEMORY;
+        }
+    }
+    objc_autoreleasePoolPop(pool);
+    return code;
+}
+
 uint32_t dodo_window_scale_percent(uint32_t window) {
     struct dodo_window *w = find(window);
     if (!w) return 100;
     return (uint32_t)lround(w->backing_scale * 100);
+}
+
+/* The NSWindow and its content view; negative error codes. */
+int32_t dodo_window_native(uint32_t window, uintptr_t *first, uintptr_t *second) {
+    struct dodo_window *w = find(window);
+    if (!w) return -E_CLOSED;
+    *first = (uintptr_t)w->window; *second = (uintptr_t)w->view;
+    return NATIVE_APPKIT;
+}
+
+/* Make a CAMetalLayer the GPU window's backing layer, once: a layer-hosting
+ * view, so the layer is set before wantsLayer. */
+int32_t dodo_window_metal_layer(uint32_t window, uintptr_t *out) {
+    *out = 0;
+    struct dodo_window *w = find(window);
+    if (!w) return E_CLOSED;
+    if (!w->gpu) return E_UNSUPPORTED;
+    if (!w->metal_layer) {
+        id type = cls("CAMetalLayer");
+        if (!type) return E_UNSUPPORTED;
+        void *pool = objc_autoreleasePoolPush();
+        id created = msg(msg(type, "alloc"), "init");
+        if (!created) { objc_autoreleasePoolPop(pool); return E_SYSTEM; }
+        w->metal_layer = created;
+        msg_void_id(w->view, "setLayer:", w->metal_layer);
+        msg_void_bool(w->view, "setWantsLayer:", YES);
+        update_scale(w);
+        size_metal_layer(w);
+        objc_autoreleasePoolPop(pool);
+    }
+    *out = (uintptr_t)w->metal_layer;
+    return 0;
 }
 
 /* mach_absolute_time in nanoseconds, the clock CADisplayLink uses. */
@@ -1041,8 +1373,10 @@ static void blit(struct dodo_window *w, HDC dc, int32_t x, int32_t y, uint32_t w
 }
 
 /* Repaint from the buffer; until the program draws at a new size, the part
- * of the window beyond the buffer is black. */
+ * of the window beyond the buffer is black. A GPU window is left to its
+ * program, which draws over GDI. */
 static void paint(struct dodo_window *w, HDC dc) {
+    if (w->gpu) return;
     RECT client;
     GetClientRect(w->hwnd, &client);
     LONG covered_width = w->pixels ? (LONG)w->pixel_width : 0;
@@ -1057,6 +1391,49 @@ static void paint(struct dodo_window *w, HDC dc) {
         RECT bottom = { 0, covered_height, covered_width < client.right ? covered_width : client.right, client.bottom };
         FillRect(dc, &bottom, black);
     }
+}
+
+/* The system cursor for a window.Cursor. */
+static HCURSOR shape_cursor(uint32_t shape) {
+    static const LPCWSTR names[CURSORS] = {
+        (LPCWSTR)IDC_ARROW, (LPCWSTR)IDC_IBEAM, (LPCWSTR)IDC_HAND, (LPCWSTR)IDC_CROSS, (LPCWSTR)IDC_SIZEALL,
+        (LPCWSTR)IDC_SIZEWE, (LPCWSTR)IDC_SIZENS, (LPCWSTR)IDC_SIZENWSE, (LPCWSTR)IDC_SIZENESW, (LPCWSTR)IDC_NO,
+        (LPCWSTR)IDC_WAIT
+    };
+    return LoadCursorW(NULL, names[shape < CURSORS ? shape : CURSOR_ARROW]);
+}
+
+/* Show the window's pointer now if it is over the drawing area; otherwise
+ * WM_SETCURSOR shows it when it arrives. */
+static void refresh_cursor(struct dodo_window *w) {
+    POINT point;
+    RECT client;
+    if (!GetCursorPos(&point) || WindowFromPoint(point) != w->hwnd) return;
+    if (ScreenToClient(w->hwnd, &point) && GetClientRect(w->hwnd, &client) && PtInRect(&client, point))
+        SetCursor(w->cursor_hidden ? NULL : shape_cursor(w->cursor));
+}
+
+/* The outer size of a window whose drawing area is width x height in
+ * window.Options units, with the window's style or `style`. */
+static SIZE outer_size(struct dodo_window *w, uint32_t width, uint32_t height, LONG_PTR style) {
+    RECT frame = { 0, 0, (LONG)MulDiv((int)width, (int)w->dpi, 96), (LONG)MulDiv((int)height, (int)w->dpi, 96) };
+    AdjustWindowRectEx(&frame, (DWORD)style, FALSE, (DWORD)GetWindowLongPtrW(w->hwnd, GWL_EXSTYLE));
+    SIZE size = { frame.right - frame.left, frame.bottom - frame.top };
+    return size;
+}
+
+static void resize_client(struct dodo_window *w, uint32_t width, uint32_t height) {
+    if (w->fullscreen) {
+        /* Applies when the window returns to its saved placement. */
+        SIZE size = outer_size(w, width, height, w->saved_style);
+        RECT *normal = &w->saved_placement.rcNormalPosition;
+        normal->right = normal->left + size.cx;
+        normal->bottom = normal->top + size.cy;
+        return;
+    }
+    if (IsZoomed(w->hwnd) || IsIconic(w->hwnd)) ShowWindow(w->hwnd, SW_RESTORE);
+    SIZE size = outer_size(w, width, height, GetWindowLongPtrW(w->hwnd, GWL_STYLE));
+    SetWindowPos(w->hwnd, NULL, 0, 0, size.cx, size.cy, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
 }
 
 static void button(struct dodo_window *w, UINT message, WPARAM wparam, LPARAM lparam) {
@@ -1175,8 +1552,25 @@ static LRESULT CALLBACK procedure(HWND hwnd, UINT message, WPARAM wparam, LPARAM
         return 0;
     }
     case WM_SETCURSOR:
-        if (w->cursor_hidden && LOWORD(lparam) == HTCLIENT) { SetCursor(NULL); return TRUE; }
+        if (LOWORD(lparam) == HTCLIENT) { SetCursor(w->cursor_hidden ? NULL : shape_cursor(w->cursor)); return TRUE; }
         break;
+    case WM_GETMINMAXINFO: {
+        /* Fullscreen covers the monitor whatever the limits. */
+        if (w->fullscreen) break;
+        MINMAXINFO *info = (MINMAXINFO *)lparam;
+        LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+        if (w->min_width || w->min_height) {
+            SIZE size = outer_size(w, w->min_width ? w->min_width : 1, w->min_height ? w->min_height : 1, style);
+            if (w->min_width) info->ptMinTrackSize.x = size.cx;
+            if (w->min_height) info->ptMinTrackSize.y = size.cy;
+        }
+        if (w->max_width || w->max_height) {
+            SIZE size = outer_size(w, w->max_width ? w->max_width : 1, w->max_height ? w->max_height : 1, style);
+            if (w->max_width) info->ptMaxTrackSize.x = info->ptMaxSize.x = size.cx;
+            if (w->max_height) info->ptMaxTrackSize.y = info->ptMaxSize.y = size.cy;
+        }
+        return 0;
+    }
     default:
         break;
     }
@@ -1205,6 +1599,10 @@ int32_t dodo_window_connect(void) {
     return 0;
 }
 
+/* A hidden message-only window that owns what this process puts on the
+ * clipboard. */
+static HWND clipboard_window;
+
 /* Remove a window from the screen and the list, with its queued events. */
 static void destroy_window(struct dodo_window *w) {
     unlink_window(w);
@@ -1219,17 +1617,20 @@ static void destroy_window(struct dodo_window *w) {
 void dodo_window_disconnect(void) {
     if (!connected) return;
     while (windows) destroy_window(windows);
+    if (clipboard_window) { DestroyWindow(clipboard_window); clipboard_window = NULL; }
     if (wait_timer) { CloseHandle(wait_timer); wait_timer = NULL; }
     queue_head = queue_count = 0;
     connected = 0;
 }
 
-int32_t dodo_window_open(const uint8_t *title, size_t title_length, uint32_t width, uint32_t height, uint32_t resizable, uint32_t *handle) {
+int32_t dodo_window_open(const uint8_t *title, size_t title_length, uint32_t width, uint32_t height, uint32_t flags, uint32_t *handle) {
     if (!connected) return E_CLOSED;
+    int resizable = (flags & O_RESIZABLE) != 0;
     WCHAR *text = wide_from(title, title_length);
     if (!text) return E_MEMORY;
     struct dodo_window *w = new_window();
     if (!w) { free(text); return E_MEMORY; }
+    w->gpu = (flags & O_PIXEL_BUFFER) == 0;
     DWORD style = WS_OVERLAPPEDWINDOW;
     if (!resizable) style &= ~(DWORD)(WS_THICKFRAME | WS_MAXIMIZEBOX);
     HWND hwnd = CreateWindowExW(0, L"DodoWindow", text, style, CW_USEDEFAULT, CW_USEDEFAULT,
@@ -1373,6 +1774,7 @@ int32_t dodo_window_next_event(uint32_t milliseconds, struct dodo_window_event *
 int32_t dodo_window_present(uint32_t window, int32_t x, int32_t y, uint32_t width, uint32_t height) {
     struct dodo_window *w = find(window);
     if (!w) return E_CLOSED;
+    if (w->gpu) return E_UNSUPPORTED;
     if (!w->pixels || !w->pixel_width || !w->pixel_height) return 0;
     HDC dc = GetDC(w->hwnd);
     if (!dc) return E_SYSTEM;
@@ -1395,16 +1797,144 @@ int32_t dodo_window_set_cursor_visible(uint32_t window, uint32_t visible) {
     struct dodo_window *w = find(window);
     if (!w) return E_CLOSED;
     w->cursor_hidden = !visible;
-    POINT point;
-    RECT client;
-    if (GetCursorPos(&point) && ScreenToClient(w->hwnd, &point) && GetClientRect(w->hwnd, &client) && PtInRect(&client, point))
-        SetCursor(visible ? LoadCursorW(NULL, (LPCWSTR)IDC_ARROW) : NULL);
+    refresh_cursor(w);
     return 0;
+}
+
+int32_t dodo_window_set_cursor(uint32_t window, uint32_t shape) {
+    struct dodo_window *w = find(window);
+    if (!w) return E_CLOSED;
+    w->cursor = shape < CURSORS ? shape : CURSOR_ARROW;
+    refresh_cursor(w);
+    return 0;
+}
+
+int32_t dodo_window_set_size(uint32_t window, uint32_t width, uint32_t height) {
+    struct dodo_window *w = find(window);
+    if (!w) return E_CLOSED;
+    resize_client(w, width, height);
+    return 0;
+}
+
+int32_t dodo_window_set_size_limits(uint32_t window, uint32_t min_width, uint32_t min_height, uint32_t max_width, uint32_t max_height) {
+    struct dodo_window *w = find(window);
+    if (!w) return E_CLOSED;
+    w->min_width = min_width; w->min_height = min_height;
+    w->max_width = max_width; w->max_height = max_height;
+    if (w->fullscreen || IsIconic(w->hwnd)) return 0;
+    uint32_t width = (uint32_t)MulDiv((int)w->width, 96, (int)w->dpi), height = (uint32_t)MulDiv((int)w->height, 96, (int)w->dpi);
+    uint32_t fitted_width = within(width, min_width, max_width), fitted_height = within(height, min_height, max_height);
+    if (fitted_width != width || fitted_height != height) resize_client(w, fitted_width, fitted_height);
+    return 0;
+}
+
+/* Fullscreen as a borderless window covering the window's monitor. */
+int32_t dodo_window_set_fullscreen(uint32_t window, uint32_t fullscreen) {
+    struct dodo_window *w = find(window);
+    if (!w) return E_CLOSED;
+    if ((fullscreen != 0) == (w->fullscreen != 0)) return 0;
+    if (fullscreen) {
+        MONITORINFO monitor;
+        memset(&monitor, 0, sizeof(monitor));
+        monitor.cbSize = sizeof(monitor);
+        w->saved_placement.length = sizeof(w->saved_placement);
+        if (!GetWindowPlacement(w->hwnd, &w->saved_placement)
+            || !GetMonitorInfoW(MonitorFromWindow(w->hwnd, MONITOR_DEFAULTTONEAREST), &monitor)) return E_SYSTEM;
+        w->saved_style = GetWindowLongPtrW(w->hwnd, GWL_STYLE);
+        w->fullscreen = 1;
+        SetWindowLongPtrW(w->hwnd, GWL_STYLE, w->saved_style & ~(LONG_PTR)WS_OVERLAPPEDWINDOW);
+        SetWindowPos(w->hwnd, HWND_TOP, monitor.rcMonitor.left, monitor.rcMonitor.top,
+            monitor.rcMonitor.right - monitor.rcMonitor.left, monitor.rcMonitor.bottom - monitor.rcMonitor.top,
+            SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+    } else {
+        w->fullscreen = 0;
+        SetWindowLongPtrW(w->hwnd, GWL_STYLE, w->saved_style);
+        SetWindowPlacement(w->hwnd, &w->saved_placement);
+        SetWindowPos(w->hwnd, NULL, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+    }
+    return 0;
+}
+
+uint32_t dodo_window_fullscreen(uint32_t window) {
+    struct dodo_window *w = find(window);
+    return w && w->fullscreen;
+}
+
+/* Another program may hold the clipboard open for a moment. */
+static int open_clipboard(void) {
+    if (!clipboard_window)
+        clipboard_window = CreateWindowExW(0, L"DodoWindow", L"", 0, 0, 0, 0, 0, HWND_MESSAGE, NULL, GetModuleHandleW(NULL), NULL);
+    for (int attempt = 0; attempt < 20; ++attempt) {
+        if (OpenClipboard(clipboard_window)) return 1;
+        Sleep(5);
+    }
+    return 0;
+}
+
+int32_t dodo_window_set_clipboard(const uint8_t *text, size_t length) {
+    if (!connected) return E_CLOSED;
+    if (length > 0x7fffffff) return E_INVALID;
+    int count = length ? MultiByteToWideChar(CP_UTF8, 0, (const char *)text, (int)length, NULL, 0) : 0;
+    HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, ((size_t)count + 1) * sizeof(WCHAR));
+    if (!memory) return E_MEMORY;
+    WCHAR *wide = GlobalLock(memory);
+    if (!wide) { GlobalFree(memory); return E_SYSTEM; }
+    if (count) MultiByteToWideChar(CP_UTF8, 0, (const char *)text, (int)length, wide, count);
+    wide[count] = 0;
+    GlobalUnlock(memory);
+    if (!open_clipboard()) { GlobalFree(memory); return E_SYSTEM; }
+    EmptyClipboard();
+    /* The clipboard owns the memory once SetClipboardData succeeds. */
+    int done = SetClipboardData(CF_UNICODETEXT, memory) != NULL;
+    CloseClipboard();
+    if (!done) { GlobalFree(memory); return E_SYSTEM; }
+    return 0;
+}
+
+int32_t dodo_window_clipboard(uintptr_t *data, size_t *length) {
+    *data = 0; *length = 0;
+    if (!connected) return E_CLOSED;
+    if (!open_clipboard()) return E_SYSTEM;
+    int32_t code = 0;
+    /* Windows converts CF_TEXT and CF_OEMTEXT to CF_UNICODETEXT itself. */
+    HANDLE memory = GetClipboardData(CF_UNICODETEXT);
+    const WCHAR *wide = memory ? GlobalLock(memory) : NULL;
+    if (wide) {
+        size_t limit = GlobalSize(memory) / sizeof(WCHAR), units = 0;
+        while (units < limit && units < 0x7fffffff && wide[units]) units++;
+        int size = units ? WideCharToMultiByte(CP_UTF8, 0, wide, (int)units, NULL, 0, NULL, NULL) : 0;
+        if (size > 0) {
+            uint8_t *copy = malloc((size_t)size);
+            if (copy) {
+                WideCharToMultiByte(CP_UTF8, 0, wide, (int)units, (char *)copy, size, NULL, NULL);
+                *data = (uintptr_t)copy; *length = (size_t)size;
+            } else {
+                code = E_MEMORY;
+            }
+        }
+        GlobalUnlock(memory);
+    }
+    CloseClipboard();
+    return code;
 }
 
 uint32_t dodo_window_scale_percent(uint32_t window) {
     struct dodo_window *w = find(window);
     if (!w) return 100;
     return (uint32_t)MulDiv((int)w->dpi, 100, 96);
+}
+
+/* The HWND and the module that registered its class; negative error codes. */
+int32_t dodo_window_native(uint32_t window, uintptr_t *first, uintptr_t *second) {
+    struct dodo_window *w = find(window);
+    if (!w) return -E_CLOSED;
+    *first = (uintptr_t)w->hwnd; *second = (uintptr_t)GetModuleHandleW(NULL);
+    return NATIVE_WIN32;
+}
+
+/* Metal layers are macOS only. */
+int32_t dodo_window_metal_layer(uint32_t window, uintptr_t *out) {
+    *out = 0;
+    return find(window) ? E_UNSUPPORTED : E_CLOSED;
 }
 #endif

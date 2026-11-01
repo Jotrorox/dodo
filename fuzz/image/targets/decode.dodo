@@ -1,0 +1,466 @@
+package targets
+
+import "std/checksum"
+import "std/image/bmp"
+import "std/image/jxl"
+import "std/image/meta"
+import "std/image/pixels"
+import "std/image/png"
+import "std/image/ppm"
+import "std/image/qoi"
+import "std/image/shared/isobmff"
+import "std/image/sink"
+
+// Codec-level decode targets: png, bmp, qoi, ppm and jxl_decode share
+// still_target (info, metadata, scratch_size, decode into a checking sink
+// and into a view, undersized scratch), and png/jxl add every animation
+// frame. jxl_container and jxl_headers stop before pixel decoding.
+
+const CODEC_PNG: u32 = 0
+const CODEC_BMP: u32 = 1
+const CODEC_QOI: u32 = 2
+const CODEC_PPM: u32 = 3
+const CODEC_JXL: u32 = 4
+
+fn codec_matches(codec: u32, data: &[u8]) -> bool {
+    if codec == CODEC_PNG {
+        return png.matches(data)
+    }
+    if codec == CODEC_BMP {
+        return bmp.matches(data)
+    }
+    if codec == CODEC_QOI {
+        return qoi.matches(data)
+    }
+    if codec == CODEC_PPM {
+        return ppm.matches(data)
+    }
+    return jxl.matches(data)
+}
+
+fn codec_info(codec: u32, data: &[u8]) -> pixels.Header!pixels.Error {
+    if codec == CODEC_PNG {
+        return png.info(data)
+    }
+    if codec == CODEC_BMP {
+        return bmp.info(data)
+    }
+    if codec == CODEC_QOI {
+        return qoi.info(data)
+    }
+    if codec == CODEC_PPM {
+        return ppm.info(data)
+    }
+    return jxl.info(data)
+}
+
+fn codec_metadata(codec: u32, data: &[u8]) -> meta.Metadata!pixels.Error {
+    if codec == CODEC_PNG {
+        return png.metadata(data)
+    }
+    if codec == CODEC_BMP {
+        return bmp.metadata(data)
+    }
+    if codec == CODEC_QOI {
+        return qoi.metadata(data)
+    }
+    if codec == CODEC_PPM {
+        return ppm.metadata(data)
+    }
+    return jxl.metadata(data)
+}
+
+fn codec_scratch_size(codec: u32, data: &[u8]) -> usize!pixels.Error {
+    if codec == CODEC_PNG {
+        return png.scratch_size(data)
+    }
+    if codec == CODEC_BMP {
+        return bmp.scratch_size(data)
+    }
+    if codec == CODEC_QOI {
+        return qoi.scratch_size(data)
+    }
+    if codec == CODEC_PPM {
+        return ppm.scratch_size(data)
+    }
+    return jxl.scratch_size(data)
+}
+
+fn codec_decode<S: sink.Sink>(codec: u32, data: &[u8], output: &mut S, buffer: &mut[u8]) -> void!pixels.Error {
+    if codec == CODEC_PNG {
+        return png.decode(data, output, buffer)
+    }
+    if codec == CODEC_BMP {
+        return bmp.decode(data, output, buffer)
+    }
+    if codec == CODEC_QOI {
+        return qoi.decode(data, output, buffer)
+    }
+    if codec == CODEC_PPM {
+        return ppm.decode(data, output, buffer)
+    }
+    return jxl.decode(data, output, buffer)
+}
+
+// Every metadata item: its bytes, decoded payload and EXIF orientation.
+fn check_metadata(data: &[u8], found: &meta.Metadata) {
+    check_item(data, &found.exif, true)
+    check_item(data, &found.xmp, false)
+    check_item(data, &found.icc, false)
+}
+
+fn check_item(data: &[u8], item: &meta.Item, exif: bool) {
+    if !item.present() {
+        return
+    }
+    if item.encoding == meta.ENCODING_JXL {
+        return
+    }
+    match item.bytes(data) {
+        ok(stored) => {
+            if exif && item.encoding == meta.ENCODING_RAW {
+                match meta.exif_orientation(stored) {
+                    ok(value) => {
+                        assert(value >= 1 && value <= 8, "exif_orientation out of range")
+                    }
+                    err(_) => {}
+                }
+            }
+        }
+        err(_) => {
+            return
+        }
+    }
+    unsafe {
+        match meta.decode(data, item, &mut OUTPUT) {
+            ok(length) => {
+                assert(length <= OUTPUT_CAP, "meta.decode length past the output")
+            }
+            err(_) => {}
+        }
+    }
+}
+
+const REPAIR_CAP: usize = 16777216
+
+static mut REPAIRED: [REPAIR_CAP]u8 = [0u8; REPAIR_CAP]
+
+// PNG chunks carry CRCs, so most mutations stop at the first damaged chunk.
+// The png target runs the input as given, then again with every complete
+// chunk's CRC recomputed so the damage reaches the decoder.
+fn png_target(data: &[u8]) {
+    still_target(CODEC_PNG, data)
+    if data.len > REPAIR_CAP || !png.matches(data) {
+        return
+    }
+    unsafe {
+        for i in 0usize..data.len {
+            REPAIRED[i] = data[i]
+        }
+        if repair_crcs(&mut REPAIRED[..data.len]) {
+            still_target(CODEC_PNG, &REPAIRED[..data.len])
+        }
+    }
+}
+
+// Recompute the CRC of every complete chunk; true when one changed.
+fn repair_crcs(file: &mut[u8]) -> bool {
+    changed := false
+    offset := 8usize
+    for file.len - offset >= 12 {
+        length := (file[offset] as usize << 24) | (file[offset + 1] as usize << 16) | (file[offset + 2] as usize << 8) | file[offset + 3] as usize
+        if length > file.len - offset - 12 {
+            break
+        }
+        end := offset + 8 + length
+        crc := checksum.crc32(&file[offset + 4..end])
+        stored := (file[end] as u32 << 24) | (file[end + 1] as u32 << 16) | (file[end + 2] as u32 << 8) | file[end + 3] as u32
+        if crc != stored {
+            file[end] = (crc >> 24) as u8
+            file[end + 1] = ((crc >> 16) & 0xff) as u8
+            file[end + 2] = ((crc >> 8) & 0xff) as u8
+            file[end + 3] = (crc & 0xff) as u8
+            changed = true
+        }
+        offset = end + 4
+    }
+    return changed
+}
+
+// The decode stages every codec shares.
+fn still_target(codec: u32, data: &[u8]) {
+    codec_matches(codec, data)
+    match codec_metadata(codec, data) {
+        ok(found) => {
+            check_metadata(data, &found)
+        }
+        err(_) => {}
+    }
+    header := match codec_info(codec, data) {
+        ok(value) => value,
+        err(e) => {
+            failed("info", e)
+            // decode() must reject what info() rejects, without trapping,
+            // whatever scratch it gets.
+            null_sink := sink.NullSink.new()
+            unsafe {
+                match codec_decode(codec, data, &mut null_sink, &mut SCRATCH[..65536]) {
+                    ok() => {}
+                    err(_) => {}
+                }
+            }
+            return
+        },
+    }
+    assert(header.width <= pixels.MAX_DIMENSION && header.height <= pixels.MAX_DIMENSION, "info() reported a size above MAX_DIMENSION")
+    assert(header.frames >= 1, "info() reported no frames")
+    passed("info")
+    need := match codec_scratch_size(codec, data) {
+        ok(value) => value,
+        err(e) => {
+            failed("scratch_size", e)
+            return
+        },
+    }
+    if grant(need, header.width, header.height) && decodable(header.width, header.height) {
+        decode_checked(codec, data, &header, need)
+        decode_view(codec, data, &header, need)
+        if need > 0 && header.width as u64 * header.height as u64 <= 65536 {
+            // Too little scratch fails cleanly.
+            null_sink := sink.NullSink.new()
+            unsafe {
+                match codec_decode(codec, data, &mut null_sink, &mut SCRATCH[..need - 1]) {
+                    ok() => {}
+                    err(_) => {}
+                }
+            }
+        }
+    }
+    if codec == CODEC_PNG {
+        png_frames(data, &header)
+    } else if codec == CODEC_JXL {
+        jxl_frames(data, &header)
+    }
+}
+
+fn decode_checked(codec: u32, data: &[u8], header: &pixels.Header, need: usize) {
+    check := CheckSink.new(header, true)
+    unsafe {
+        match codec_decode(codec, data, &mut check, &mut SCRATCH[..need]) {
+            ok() => {
+                check.finish()
+                passed("decode")
+            }
+            err(e) => {
+                failed("decode", e)
+            }
+        }
+    }
+}
+
+// Decode into a view in the native layout when it fits.
+fn decode_view(codec: u32, data: &[u8], header: &pixels.Header, need: usize) {
+    size := match pixels.bytes_needed(header.width, header.height, &header.native) {
+        ok(value) => value,
+        err(_) => {
+            return
+        },
+    }
+    if size > PIXEL_CAP {
+        skip()
+        return
+    }
+    unsafe {
+        target := match pixels.ViewMut.new(&mut PIXELS[..size], header.width, header.height, header.native.clone()) {
+            ok(value) => value,
+            err(_) => {
+                assert(false, "ViewMut.new rejected the native layout of info()")
+                return
+            },
+        }
+        view_sink := sink.ViewSink.new(&mut target)
+        match codec_decode(codec, data, &mut view_sink, &mut SCRATCH[..need]) {
+            ok() => {}
+            err(_) => {}
+        }
+    }
+}
+
+// Every APNG frame: timing, scratch and composited pixels (one Rgba16 rect
+// per frame), plus one index past the end.
+fn png_frames(data: &[u8], header: &pixels.Header) {
+    count := header.frames
+    if count > FRAME_CAP {
+        count = FRAME_CAP
+    }
+    need := match png.frame_scratch_size(data) {
+        ok(value) => value,
+        err(_) => {
+            return
+        },
+    }
+    for index in 0u32..count + 1 {
+        match png.frame_info(data, index) {
+            ok(timing) => {
+                timing.milliseconds()
+            }
+            err(_) => {}
+        }
+        if !grant(need, header.width, header.height) || !decodable(header.width, header.height) {
+            continue
+        }
+        check := CheckSink.new(header, !header.animated)
+        unsafe {
+            match png.decode_frame(data, index, &mut check, &mut SCRATCH[..need]) {
+                ok() => {
+                    assert(index < header.frames, "png.decode_frame accepted an index past the last frame")
+                    check.finish()
+                    passed("decode_frame")
+                }
+                err(e) => {
+                    failed("decode_frame", e)
+                }
+            }
+        }
+    }
+}
+
+// Every displayed JPEG XL frame, plus one index past the end.
+fn jxl_frames(data: &[u8], header: &pixels.Header) {
+    count := header.frames
+    if count > FRAME_CAP {
+        count = FRAME_CAP
+    }
+    need := match jxl.scratch_size(data) {
+        ok(value) => value,
+        err(_) => {
+            return
+        },
+    }
+    for index in 0u32..count + 1 {
+        match jxl.frame_info(data, index) {
+            ok(timing) => {
+                timing.milliseconds()
+            }
+            err(_) => {}
+        }
+        // Frame 0 was decoded by still_target.
+        if index == 0 || !grant(need, header.width, header.height) || !decodable(header.width, header.height) {
+            continue
+        }
+        check := CheckSink.new(header, true)
+        unsafe {
+            match jxl.decode_frame(data, index, &mut check, &mut SCRATCH[..need]) {
+                ok() => {
+                    assert(index < header.frames, "jxl.decode_frame accepted an index past the last frame")
+                    check.finish()
+                    passed("decode_frame")
+                }
+                err(e) => {
+                    failed("decode_frame", e)
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// JPEG XL container and headers.
+
+// Box iteration (top level and one level of children), metadata boxes and
+// the header walk.
+fn jxl_container_target(data: &[u8]) {
+    jxl.matches(data)
+    boxes := isobmff.Boxes.new(data)
+    count := 0u32
+    for count < 4096 {
+        count += 1
+        match boxes.next() {
+            ok(some(b)) => {
+                assert(b.start < b.offset && b.end() <= data.len, "isobmff box outside the data")
+                inner := isobmff.Boxes.within(data, b.offset, b.length)
+                children := 0u32
+                for children < 256 {
+                    children += 1
+                    match inner.next() {
+                        ok(some(c)) => {
+                            assert(c.offset >= b.offset && c.end() <= b.end(), "isobmff child box outside its parent")
+                        }
+                        ok(none) => {
+                            break
+                        }
+                        err(_) => {
+                            break
+                        }
+                    }
+                }
+            }
+            ok(none) => {
+                break
+            }
+            err(_) => {
+                break
+            }
+        }
+    }
+    match jxl.metadata(data) {
+        ok(found) => {
+            check_metadata(data, &found)
+        }
+        err(_) => {}
+    }
+    match jxl.info(data) {
+        ok(header) => {
+            assert(header.width > 0 && header.height > 0 && header.frames >= 1, "jxl.info reported an empty image")
+        }
+        err(_) => {}
+    }
+}
+
+// Everything that reads headers without decoding pixels: info, scratch
+// size, the timing of every frame and the ICC profile.
+fn jxl_headers_target(data: &[u8]) {
+    header := match jxl.info(data) {
+        ok(value) => value,
+        err(_) => {
+            match jxl.scratch_size(data) {
+                ok(_) => {}
+                err(_) => {}
+            }
+            return
+        },
+    }
+    count := header.frames
+    if count > 64 {
+        count = 64
+    }
+    for index in 0u32..count + 1 {
+        match jxl.frame_info(data, index) {
+            ok(timing) => {
+                assert(index < header.frames, "jxl.frame_info accepted an index past the last frame")
+                timing.milliseconds()
+            }
+            err(_) => {}
+        }
+    }
+    need := match jxl.scratch_size(data) {
+        ok(value) => value,
+        err(_) => {
+            return
+        },
+    }
+    if !grant(need, header.width, header.height) {
+        return
+    }
+    unsafe {
+        match jxl.icc(data, &mut OUTPUT, &mut SCRATCH[..need]) {
+            ok(length) => {
+                assert(length <= OUTPUT_CAP, "jxl.icc length past the output")
+                passed("icc")
+            }
+            err(e) => {
+                failed("icc", e)
+            }
+        }
+    }
+}

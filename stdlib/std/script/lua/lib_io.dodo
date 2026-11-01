@@ -1,0 +1,830 @@
+package lua
+
+import "core/mem"
+import "core/ptr"
+import "std/script/native" as script_host
+
+// The io library (Lua 5.4 manual §6.8): file handles are full userdata with
+// the "FILE*" metatable wrapping a C stdio stream; io.stdin/stdout/stderr
+// wrap the process-wide streams shared with print and warnings.
+
+unsafe extern "C" fn getc(f: *mut u8) -> i32
+unsafe extern "C" fn ungetc(c: i32, f: *mut u8) -> i32
+unsafe extern "C" fn clearerr(f: *mut u8)
+unsafe extern "C" fn tmpfile() -> *mut u8
+
+const IO_HANDLE: &str = "FILE*"
+// Registry keys of the default input and output files.
+const IO_INPUT: &str = "_IO_input"
+const IO_OUTPUT: &str = "_IO_output"
+
+// How a handle is closed; IO_CLOSED marks a closed handle.
+const IO_CLOSED: i32 = 0
+const IO_KIND_FILE: i32 = 1
+const IO_KIND_PIPE: i32 = 2
+const IO_KIND_STD: i32 = 3
+
+// Default size for setvbuf (the reference's LUAL_BUFFERSIZE).
+const IO_BUFFER_SIZE: i64 = 1024
+// Most formats io.lines accepts, and the longest numeral read("n") reads.
+const IO_MAX_LINE_FORMATS: i32 = 250
+const IO_MAX_NUMERAL: usize = 200
+const IO_EOF: i32 = -1
+// Byte counts from here on cannot be allocated (beyond 48-bit addresses).
+const IO_MAX_READ: u64 = 0x1000000000000
+
+// The userdata block of a file handle.
+struct IoStream {
+    f: *mut u8
+    kind: i32
+}
+
+// A NUL-terminated view of a string argument, or of a literal default.
+fn io_opt_cstr(cx: &mut Cx, arg: i32, def: &[u8]) -> LuaStr!Throw {
+    if cx.is_none_or_nil(arg) {
+        // `def` ends with a NUL that is not part of the string.
+        return ok(LuaStr { p: ptr.as_ptr(def), n: def.len - 1 })
+    }
+    return cx.check_lstr(arg)
+}
+
+// Length of s as C sees it (up to the first NUL).
+fn io_c_length(s: &[u8]) -> usize {
+    for i in 0usize..s.len {
+        if s[i] == 0 {
+            return i
+        }
+    }
+    return s.len
+}
+
+// s up to its first NUL (how C functions and messages see it).
+fn io_c_str(s: &[u8]) -> &[u8] from(s) {
+    return s[0..io_c_length(s)]
+}
+
+// --- Handles ----------------------------------------------------------------
+
+// Push a new handle that is still closed (no stream yet).
+fn io_new_prefile(cx: &mut Cx) -> (*mut IoStream)!Throw {
+    unsafe {
+        let raw = cx.new_userdata(mem.size_of::<IoStream>(), 0)?
+        let p = raw as *mut IoStream
+        (*p).f = 0 as *mut u8
+        (*p).kind = IO_CLOSED
+        cx.set_metatable_by_name(IO_HANDLE)?
+        return ok(p)
+    }
+}
+
+// Push a new handle for a regular file (closed with fclose).
+fn io_new_file(cx: &mut Cx) -> (*mut IoStream)!Throw {
+    unsafe {
+        let p = io_new_prefile(cx)?
+        (*p).kind = IO_KIND_FILE
+        return ok(p)
+    }
+}
+
+// The handle at argument 1.
+fn io_stream_arg(cx: &mut Cx) -> (*mut IoStream)!Throw {
+    let raw = cx.check_udata(1, IO_HANDLE)?
+    unsafe {
+        return ok(raw as *mut IoStream)
+    }
+}
+
+// The handle at argument 1, which must be open.
+fn io_open_stream_arg(cx: &mut Cx) -> (*mut IoStream)!Throw {
+    unsafe {
+        let p = io_stream_arg(cx)?
+        if (*p).kind == IO_CLOSED {
+            return err(cx.error_msg("attempt to use a closed file"))
+        }
+        return ok(p)
+    }
+}
+
+// The open stream of the handle at argument 1.
+fn io_file_arg(cx: &mut Cx) -> (*mut u8)!Throw {
+    unsafe {
+        let p = io_open_stream_arg(cx)?
+        return ok((*p).f)
+    }
+}
+
+// Close the stream of p and push the results of the close operation.
+fn io_close_stream(cx: &mut Cx, p: *mut IoStream) -> i32!Throw {
+    unsafe {
+        let kind = (*p).kind
+        let f = (*p).f
+        (*p).kind = IO_CLOSED
+        if kind == IO_KIND_STD {
+            // Standard files stay open.
+            (*p).kind = IO_KIND_STD
+            cx.push_fail()
+            cx.push_str("cannot close standard file")?
+            return ok(2)
+        }
+        if kind == IO_KIND_PIPE {
+            exited := 0i32
+            code := 0i32
+            if script_host.dodo_script_pclose(f, ptr.from_mut(&mut exited), ptr.from_mut(&mut code)) == 0 {
+                return cx.file_result(false, none)
+            }
+            return cx.exec_result(exited != 0, code as i64)
+        }
+        script_host.dodo_script_clear_errno()
+        return cx.file_result(fclose(f) == 0, none)
+    }
+}
+
+// Open fname with mode as a new handle (pushed), raising an error on failure.
+fn io_open_checked(cx: &mut Cx, fname: LuaStr, mode: &[u8]) -> void!Throw {
+    unsafe {
+        let p = io_new_file(cx)?
+        (*p).f = fopen(fname.as_ptr(), ptr.as_ptr(mode))
+        if ptr.is_null((*p).f) {
+            let msg = last_os_error_message()
+            b := Buffer.new(cx)
+            b.add_str("cannot open file '")?
+            b.add_raw(fname.as_ptr(), io_c_length(fname.bytes()))?
+            b.add_str("' (")?
+            b.add_bytes(msg)?
+            b.add_str(")")?
+            return err(cx.error_buffer(&mut b))
+        }
+        return ok()
+    }
+}
+
+// Push the default input or output handle (registry `key`) and return its
+// stream; `what` names it in the error for a closed one.
+fn io_default_file(cx: &mut Cx, key: &str, what: &str) -> (*mut u8)!Throw {
+    unsafe {
+        cx.get_field(REGISTRY_INDEX, key)?
+        let p = cx.to_userdata(-1) as *mut IoStream
+        if ptr.is_null(p) || (*p).kind == IO_CLOSED {
+            b := Buffer.new(cx)
+            b.add_str("default ")?
+            b.add_str(what)?
+            b.add_str(" file is closed")?
+            return err(cx.error_buffer(&mut b))
+        }
+        return ok((*p).f)
+    }
+}
+
+// --- Reading ----------------------------------------------------------------
+
+fn io_is_space(c: i32) -> bool {
+    return c == 32 || (c >= 9 && c <= 13)
+}
+
+fn io_is_digit(c: i32, hex: bool) -> bool {
+    if c >= 48 && c <= 57 {
+        return true
+    }
+    if hex {
+        let l = c | 32
+        return l >= 97 && l <= 102
+    }
+    return false
+}
+
+// Scanner for read("n"): collects at most IO_MAX_NUMERAL characters that
+// can form a numeral, with one character of look-ahead.
+struct IoNumeral {
+    f: *mut u8
+    c: i32
+    count: usize
+    overflow: bool
+    text: [201]u8
+
+    // Keep the look-ahead character and read the next one.
+    fn advance(&mut self) -> bool {
+        if self.count >= IO_MAX_NUMERAL {
+            self.overflow = true
+            return false
+        }
+        self.text[self.count] = self.c as u8
+        self.count += 1
+        unsafe {
+            self.c = getc(self.f)
+        }
+        return true
+    }
+    // Accept the look-ahead character if it is a or b.
+    fn accept(&mut self, a: u8, b: u8) -> bool {
+        if self.c == a as i32 || self.c == b as i32 {
+            return self.advance()
+        }
+        return false
+    }
+    // Accept a run of (hexadecimal) digits; returns how many.
+    fn digits(&mut self, hex: bool) -> i32 {
+        n := 0i32
+        for io_is_digit(self.c, hex) && self.advance() {
+            n += 1
+        }
+        return n
+    }
+}
+
+// Read a numeral and push its value (true), or push nil (false). Reads
+// greedily what could start a numeral and pushes back the first character
+// that cannot continue it.
+fn io_read_number(cx: &mut Cx, f: *mut u8) -> bool!Throw {
+    unsafe {
+        rn := IoNumeral { f: f, c: 0, count: 0, overflow: false, text: [0u8; 201] }
+        rn.c = getc(f)
+        for io_is_space(rn.c) {
+            rn.c = getc(f)
+        }
+        rn.accept(b'-', b'+')
+        count := 0i32
+        hex := false
+        if rn.accept(b'0', b'0') {
+            if rn.accept(b'x', b'X') {
+                hex = true
+            } else {
+                count = 1
+            }
+        }
+        count += rn.digits(hex)
+        if rn.accept(b'.', b'.') {
+            count += rn.digits(hex)
+        }
+        if count > 0 {
+            let marked = if hex {
+                rn.accept(b'p', b'P')
+            } else {
+                rn.accept(b'e', b'E')
+            }
+            if marked {
+                rn.accept(b'-', b'+')
+                rn.digits(false)
+            }
+        }
+        ungetc(rn.c, f)
+        if !rn.overflow && cx.string_to_number(rn.text[0..rn.count]) != 0 {
+            return ok(true)
+        }
+        cx.push_nil()
+        return ok(false)
+    }
+}
+
+// Read a line and push it (without the newline when chop); false at EOF.
+fn io_read_line(cx: &mut Cx, f: *mut u8, chop: bool) -> bool!Throw {
+    unsafe {
+        b := Buffer.new(cx)
+        last := 0i32
+        chunk := 128usize
+        for {
+            let p = b.prepare(chunk)?
+            let n = script_host.dodo_script_read_line(f, p, chunk, ptr.from_mut(&mut last))
+            b.add_size(n)
+            if last != 0 {
+                break
+            }
+            if chunk < 65536 {
+                chunk = chunk * 2
+            }
+        }
+        if last == 10 && !chop {
+            b.add_char(10)?
+        }
+        let got = last == 10 || b.size() > 0
+        b.push_result(cx)?
+        return ok(got)
+    }
+}
+
+// Read the rest of the file and push it.
+fn io_read_all(cx: &mut Cx, f: *mut u8) -> void!Throw {
+    unsafe {
+        b := Buffer.new(cx)
+        for {
+            let p = b.prepare(4096)?
+            let n = fread(p, 1, 4096, f)
+            b.add_size(n)
+            if n < 4096 {
+                break
+            }
+        }
+        return b.push_result(cx)
+    }
+}
+
+// Read up to n bytes and push them; false if nothing could be read.
+fn io_read_chars(cx: &mut Cx, f: *mut u8, n: u64) -> bool!Throw {
+    unsafe {
+        if n >= IO_MAX_READ {
+            // The reference reserves the whole count up front, which no
+            // system can allocate (negative counts land here too).
+            return err(mem_error(cx.L))
+        }
+        b := Buffer.new(cx)
+        remaining := n
+        total := 0usize
+        for remaining > 0 {
+            chunk := 65536usize
+            if remaining < 65536 {
+                chunk = remaining as usize
+            }
+            let p = b.prepare(chunk)?
+            let got = fread(p, 1, chunk, f)
+            b.add_size(got)
+            total += got
+            remaining -= got as u64
+            if got < chunk {
+                break
+            }
+        }
+        b.push_result(cx)?
+        return ok(total > 0)
+    }
+}
+
+// Push "" and tell whether the stream is not at its end.
+fn io_test_eof(cx: &mut Cx, f: *mut u8) -> bool!Throw {
+    unsafe {
+        let c = getc(f)
+        ungetc(c, f)
+        cx.push_str("")?
+        return ok(c != IO_EOF)
+    }
+}
+
+// Read with the `nargs` formats starting at stack index `first`; pushes one
+// result per format up to the first failure (which pushes fail).
+fn io_read(cx: &mut Cx, f: *mut u8, first: i32, nargs: i32) -> i32!Throw {
+    unsafe {
+        clearerr(f)
+        script_host.dodo_script_clear_errno()
+        success := true
+        n := first
+        if nargs == 0 {
+            success = io_read_line(cx, f, true)?
+            n = first + 1
+        } else {
+            cx.check_stack_msg(nargs + 20, "too many arguments")?
+            remaining := nargs
+            for remaining > 0 && success {
+                remaining -= 1
+                if cx.type_of(n) == TNUMBER {
+                    let count = cx.check_integer(n)?
+                    if count == 0 {
+                        success = io_test_eof(cx, f)?
+                    } else {
+                        success = io_read_chars(cx, f, num_i64_as_u64(count))?
+                    }
+                } else {
+                    let s = cx.check_lstr(n)?
+                    let fmt = s.bytes()
+                    k := 0usize
+                    if fmt.len > 0 && fmt[0] == b'*' {
+                        k = 1
+                    }
+                    let c = if k < fmt.len {
+                        fmt[k]
+                    } else {
+                        0u8
+                    }
+                    if c == b'n' {
+                        success = io_read_number(cx, f)?
+                    } else if c == b'l' {
+                        success = io_read_line(cx, f, true)?
+                    } else if c == b'L' {
+                        success = io_read_line(cx, f, false)?
+                    } else if c == b'a' {
+                        io_read_all(cx, f)?
+                        success = true
+                    } else {
+                        return err(cx.arg_error(n, "invalid format"))
+                    }
+                }
+                n += 1
+            }
+        }
+        if ferror(f) != 0 {
+            return cx.file_result(false, none)
+        }
+        if !success {
+            cx.pop(1)
+            cx.push_fail()
+        }
+        return ok(n - first)
+    }
+}
+
+// --- Writing ----------------------------------------------------------------
+
+// Numbers are written with "%d" (integers) or "%.14g" (floats): unlike
+// tostring, an integral float gets no ".0".
+fn io_number_text(cx: &Cx, idx: i32, out: &mut[u8]) -> usize {
+    if cx.is_integer(idx) {
+        match cx.to_integer(idx) {
+            some(v) => {
+                return num_int_to_string(out, v)
+            },
+            none => {},
+        }
+    }
+    match cx.to_number(idx) {
+        some(v) => {
+            let n = num_format_float(out, v, b'g', 0, -1, 14)
+            num_localize(out, n)
+            return n
+        },
+        none => {
+            return 0
+        },
+    }
+}
+
+// Write the `nargs` values starting at stack index `arg`; the handle to
+// return is on top.
+fn io_write(cx: &mut Cx, f: *mut u8, arg: i32, nargs: i32) -> i32!Throw {
+    unsafe {
+        script_host.dodo_script_clear_errno()
+        status := true
+        for i in 0i32..nargs {
+            let idx = arg + i
+            if cx.type_of(idx) == TNUMBER {
+                tmp := [0u8; 64]
+                let n = io_number_text(cx, idx, &mut tmp)
+                status = status && fwrite(ptr.as_ptr(&tmp), 1, n, f) == n
+            } else {
+                let s = cx.check_lstr(idx)?
+                status = status && fwrite(s.as_ptr(), 1, s.size(), f) == s.size()
+            }
+        }
+        if status {
+            return ok(1)
+        }
+        return cx.file_result(false, none)
+    }
+}
+
+// --- Line iterators -----------------------------------------------------------
+
+// Iterator of io.lines/file:lines. Upvalues: the handle, the number of
+// formats, whether to close the file at the end, then the formats.
+fn io_lines_step(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        let p = cx.to_userdata(upvalue_index(1)) as *mut IoStream
+        nfmt := 0i32
+        match cx.to_integer(upvalue_index(2)) {
+            some(v) => {
+                nfmt = v as i32
+            },
+            none => {},
+        }
+        if (*p).kind == IO_CLOSED {
+            return err(cx.error_msg("file is already closed"))
+        }
+        cx.set_top(1)
+        cx.check_stack_msg(nfmt, "too many arguments")?
+        for i in 1i32..(nfmt + 1) {
+            cx.push_value(upvalue_index(3 + i))
+        }
+        let n = io_read(cx, (*p).f, 2, nfmt)?
+        if cx.to_boolean(-n) {
+            return ok(n)
+        }
+        if n > 1 {
+            // A read error: the message follows the fail value.
+            let msg = cx.check_lstr(-n + 1)?
+            return err(cx.error_bytes(msg.bytes()))
+        }
+        if cx.to_boolean(upvalue_index(3)) {
+            cx.set_top(0)
+            cx.push_value(upvalue_index(1))
+            io_close_stream(cx, p)?
+        }
+        return ok(0)
+    }
+}
+
+// Push the line iterator for the handle at 1 and the formats after it.
+fn io_push_lines(cx: &mut Cx, toclose: bool) -> void!Throw {
+    let n = cx.get_top() - 1
+    cx.arg_check(n <= IO_MAX_LINE_FORMATS, IO_MAX_LINE_FORMATS + 2, "too many arguments")?
+    cx.push_value(1)
+    cx.push_integer(n as i64)
+    cx.push_boolean(toclose)
+    cx.rotate(2, 3)
+    return cx.push_closure(io_lines_step, 3 + n)
+}
+
+// --- io functions -------------------------------------------------------------
+
+fn io_close(cx: &mut Cx) -> i32!Throw {
+    if cx.is_none(1) {
+        cx.get_field(REGISTRY_INDEX, IO_OUTPUT)?
+    }
+    return io_m_close(cx)
+}
+
+fn io_flush(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        let f = io_default_file(cx, IO_OUTPUT, "output")?
+        script_host.dodo_script_clear_errno()
+        return cx.file_result(fflush(f) == 0, none)
+    }
+}
+
+// io.input / io.output: set the default file from a name or a handle, and
+// return the current one.
+fn io_set_default(cx: &mut Cx, key: &str, mode: &[u8]) -> i32!Throw {
+    if !cx.is_none_or_nil(1) {
+        match cx.to_lstr(1)? {
+            some(name) => {
+                io_open_checked(cx, name, mode)?
+            },
+            none => {
+                io_file_arg(cx)?
+                cx.push_value(1)
+            },
+        }
+        cx.set_field(REGISTRY_INDEX, key)?
+    }
+    cx.get_field(REGISTRY_INDEX, key)?
+    return ok(1)
+}
+
+fn io_input(cx: &mut Cx) -> i32!Throw {
+    return io_set_default(cx, IO_INPUT, b"r\0")
+}
+
+fn io_output(cx: &mut Cx) -> i32!Throw {
+    return io_set_default(cx, IO_OUTPUT, b"w\0")
+}
+
+fn io_lines(cx: &mut Cx) -> i32!Throw {
+    if cx.is_none(1) {
+        cx.push_nil()
+    }
+    toclose := false
+    if cx.is_nil(1) {
+        cx.get_field(REGISTRY_INDEX, IO_INPUT)?
+        cx.replace(1)
+        io_file_arg(cx)?
+    } else {
+        let name = cx.check_lstr(1)?
+        io_open_checked(cx, name, b"r\0")?
+        cx.replace(1)
+        toclose = true
+    }
+    io_push_lines(cx, toclose)?
+    if toclose {
+        // Generic-for values: iterator, nil, nil, and the file to close.
+        cx.push_nil()
+        cx.push_nil()
+        cx.push_value(1)
+        return ok(4)
+    }
+    return ok(1)
+}
+
+// "r", "w" or "a", an optional "+", then only "b"s.
+fn io_valid_mode(mode: &[u8]) -> bool {
+    let n = io_c_length(mode)
+    if n == 0 || (mode[0] != b'r' && mode[0] != b'w' && mode[0] != b'a') {
+        return false
+    }
+    i := 1usize
+    if i < n && mode[i] == b'+' {
+        i += 1
+    }
+    for i < n {
+        if mode[i] != b'b' {
+            return false
+        }
+        i += 1
+    }
+    return true
+}
+
+fn io_open(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        let name = cx.check_lstr(1)?
+        let mode = io_opt_cstr(cx, 2, b"r\0")?
+        let p = io_new_file(cx)?
+        cx.arg_check(io_valid_mode(mode.bytes()), 2, "invalid mode")?
+        script_host.dodo_script_clear_errno()
+        (*p).f = fopen(name.as_ptr(), mode.as_ptr())
+        if ptr.is_null((*p).f) {
+            return cx.file_result(false, some(io_c_str(name.bytes())))
+        }
+        return ok(1)
+    }
+}
+
+fn io_popen(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        let prog = cx.check_lstr(1)?
+        let mode = io_opt_cstr(cx, 2, b"r\0")?
+        let p = io_new_prefile(cx)?
+        let m = mode.bytes()
+        let valid = io_c_length(m) == 1 && (m[0] == b'r' || m[0] == b'w')
+        cx.arg_check(valid, 2, "invalid mode")?
+        script_host.dodo_script_clear_errno()
+        (*p).f = script_host.dodo_script_popen(prog.as_ptr(), mode.as_ptr())
+        (*p).kind = IO_KIND_PIPE
+        if ptr.is_null((*p).f) {
+            return cx.file_result(false, some(io_c_str(prog.bytes())))
+        }
+        return ok(1)
+    }
+}
+
+fn io_read_default(cx: &mut Cx) -> i32!Throw {
+    let f = io_default_file(cx, IO_INPUT, "input")?
+    // The handle pushed above is not a format.
+    let nargs = cx.get_top() - 1
+    return io_read(cx, f, 1, nargs)
+}
+
+fn io_tmpfile(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        let p = io_new_file(cx)?
+        script_host.dodo_script_clear_errno()
+        (*p).f = tmpfile()
+        if ptr.is_null((*p).f) {
+            return cx.file_result(false, none)
+        }
+        return ok(1)
+    }
+}
+
+fn io_type(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        cx.check_any(1)?
+        let raw = cx.test_udata(1, IO_HANDLE)?
+        if ptr.is_null(raw) {
+            cx.push_fail()
+        } else if (*(raw as *mut IoStream)).kind == IO_CLOSED {
+            cx.push_str("closed file")?
+        } else {
+            cx.push_str("file")?
+        }
+        return ok(1)
+    }
+}
+
+fn io_write_default(cx: &mut Cx) -> i32!Throw {
+    let f = io_default_file(cx, IO_OUTPUT, "output")?
+    let nargs = cx.get_top() - 1
+    return io_write(cx, f, 1, nargs)
+}
+
+// --- File methods -------------------------------------------------------------
+
+fn io_m_close(cx: &mut Cx) -> i32!Throw {
+    let p = io_open_stream_arg(cx)?
+    return io_close_stream(cx, p)
+}
+
+fn io_m_flush(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        let f = io_file_arg(cx)?
+        script_host.dodo_script_clear_errno()
+        return cx.file_result(fflush(f) == 0, none)
+    }
+}
+
+fn io_m_lines(cx: &mut Cx) -> i32!Throw {
+    io_file_arg(cx)?
+    io_push_lines(cx, false)?
+    return ok(1)
+}
+
+fn io_m_read(cx: &mut Cx) -> i32!Throw {
+    let f = io_file_arg(cx)?
+    let nargs = cx.get_top() - 1
+    return io_read(cx, f, 2, nargs)
+}
+
+fn io_m_seek(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        let f = io_file_arg(cx)?
+        let names = ["set", "cur", "end"]
+        let whence = cx.check_option(2, "cur", &names)?
+        let offset = cx.opt_integer(3, 0)?
+        script_host.dodo_script_clear_errno()
+        if script_host.dodo_script_seek(f, offset, whence) != 0 {
+            return cx.file_result(false, none)
+        }
+        cx.push_integer(script_host.dodo_script_tell(f))
+        return ok(1)
+    }
+}
+
+fn io_m_setvbuf(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        let f = io_file_arg(cx)?
+        let names = ["no", "full", "line"]
+        let mode = cx.check_option(2, "", &names)?
+        let size = cx.opt_integer(3, IO_BUFFER_SIZE)?
+        script_host.dodo_script_clear_errno()
+        let r = script_host.dodo_script_setvbuf(f, mode, num_i64_as_u64(size) as usize)
+        return cx.file_result(r == 0, none)
+    }
+}
+
+fn io_m_write(cx: &mut Cx) -> i32!Throw {
+    let f = io_file_arg(cx)?
+    // The handle is returned: keep a copy on top.
+    cx.push_value(1)
+    let nargs = cx.get_top() - 2
+    return io_write(cx, f, 2, nargs)
+}
+
+// __gc and __close: close the stream if it is still open.
+fn io_m_gc(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        let p = io_stream_arg(cx)?
+        if (*p).kind != IO_CLOSED && !ptr.is_null((*p).f) {
+            io_close_stream(cx, p)?
+        }
+        return ok(0)
+    }
+}
+
+fn io_m_tostring(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        let p = io_stream_arg(cx)?
+        if (*p).kind == IO_CLOSED {
+            cx.push_str("file (closed)")?
+            return ok(1)
+        }
+        tmp := [0u8; 24]
+        let n = fmt_pointer(&mut tmp, (*p).f)
+        b := Buffer.new(cx)
+        b.add_str("file (")?
+        b.add_bytes(tmp[0..n])?
+        b.add_str(")")?
+        b.push_result(cx)?
+        return ok(1)
+    }
+}
+
+// Push a handle for a standard stream, store it under the registry key (if
+// any) and as field `name` of the io table below it.
+fn io_std_file(cx: &mut Cx, f: *mut u8, key: &str, name: &str) -> void!Throw {
+    unsafe {
+        let p = io_new_prefile(cx)?
+        (*p).f = f
+        (*p).kind = IO_KIND_STD
+        if key.len > 0 {
+            cx.push_value(-1)
+            cx.set_field(REGISTRY_INDEX, key)?
+        }
+        return cx.set_field(-2, name)
+    }
+}
+
+// Open the io library (pushes the io table).
+pub fn open_io(cx: &mut Cx) -> i32!Throw {
+    let funcs = [
+        ("close", io_close),
+        ("flush", io_flush),
+        ("input", io_input),
+        ("lines", io_lines),
+        ("open", io_open),
+        ("output", io_output),
+        ("popen", io_popen),
+        ("read", io_read_default),
+        ("tmpfile", io_tmpfile),
+        ("type", io_type),
+        ("write", io_write_default),
+    ]
+    cx.new_lib(&funcs)?
+    // The metatable of handles, with the methods as __index.
+    let metamethods = [
+        ("__gc", io_m_gc),
+        ("__close", io_m_gc),
+        ("__tostring", io_m_tostring),
+    ]
+    let methods = [
+        ("read", io_m_read),
+        ("write", io_m_write),
+        ("lines", io_m_lines),
+        ("flush", io_m_flush),
+        ("seek", io_m_seek),
+        ("close", io_m_close),
+        ("setvbuf", io_m_setvbuf),
+    ]
+    cx.new_metatable(IO_HANDLE)?
+    cx.set_funcs(&metamethods, 0)?
+    cx.new_lib(&methods)?
+    cx.set_field(-2, "__index")?
+    cx.pop(1)
+    io_std_file(cx, c_stdin(), IO_INPUT, "stdin")?
+    io_std_file(cx, c_stdout(), IO_OUTPUT, "stdout")?
+    io_std_file(cx, c_stderr(), "", "stderr")?
+    return ok(1)
+}

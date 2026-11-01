@@ -5,6 +5,7 @@ import "core/ptr"
 import "std/gpu/hal"
 import "std/gpu/opengl" as context
 import "std/gpu/opengl/gl"
+import "std/window/handle"
 
 // std/gpu's OpenGL backend: OpenGL 4.5 core through std/gpu/opengl, on a
 // context without a window (EGL on Linux, WGL on Windows). macOS stops at
@@ -13,8 +14,18 @@ import "std/gpu/opengl/gl"
 // OpenGL has no command buffers, so commands run as they are recorded and
 // submit() only flushes. glClipControl(GL_UPPER_LEFT, GL_ZERO_TO_ONE)
 // gives clip space and depth the conventions of Vulkan and Metal, so
-// rendered images and texture rows come out the same way round. Every
-// dispatch and pass ends with glMemoryBarrier(GL_ALL_BARRIER_BITS).
+// rendered images and texture rows come out the same way round.
+//
+// OpenGL orders everything except shader writes to storage buffers and
+// images by itself. std/gpu's barrier() calls after such writes become
+// glMemoryBarrier with the bits of the uses that follow; between encoders
+// and before transfers, any shader writes since the last full barrier get
+// glMemoryBarrier(GL_ALL_BARRIER_BITS).
+//
+// A device opened for a window draws with the window's context. Its
+// surface renders into a texture, which present() copies into the
+// window's framebuffer, upside down to undo OpenGL's bottom-up window
+// coordinates, before swapping buffers.
 //
 // Handles:
 //   buffer            a = buffer name
@@ -24,47 +35,30 @@ import "std/gpu/opengl/gl"
 //   render pipeline   a = program, b = vertex array, c = packed state
 //                     (see pack_state)
 //   encoder           a = framebuffer of the open render pass or 0
+//   surface           a = texture, b = framebuffer reading it, c = width,
+//                     d = height
 
 struct State {
     submitted: u64
+    // Shader writes to storage buffers or images happened since the last
+    // glMemoryBarrier(GL_ALL_BARRIER_BITS).
+    dirty: bool
 }
 
 pub struct Device: hal.Backend {
     context: context.Context
     limits: hal.Limits
     state: State
+    // The window the context draws into: its kind (WINDOW_*) and id.
+    window_kind: u32
+    window: u64
 
     pub fn open(debug: bool) -> Device!hal.Error {
-        options := context.Options.new(4, 5)
-        options.debug = debug
-        created := match context.Context.create(options) {
-            ok(created) => created,
-            err(context.Error.Unsupported) => {
-                return err(hal.Error.Unsupported)
-            }
-            err(context.Error.NoLibrary) => {
-                return err(hal.Error.NoBackend)
-            }
-            err(context.Error.NoDisplay) => {
-                return err(hal.Error.NoBackend)
-            }
-            err(context.Error.NoConfig) => {
-                return err(hal.Error.NoBackend)
-            }
-            err(_) => {
-                return err(hal.Error.System)
-            }
-        }
-        unsafe {
-            // Clip space with y up and depth from 0 to 1, drawn with the top
-            // row first, as in Vulkan and Metal.
-            gl.clip_control(gl.UPPER_LEFT, gl.ZERO_TO_ONE)
-            gl.enable(gl.FRAMEBUFFER_SRGB)
-            gl.enable(gl.PROGRAM_POINT_SIZE)
-            gl.enable(gl.SCISSOR_TEST)
-        }
-        limits := query_limits()
-        return ok(Device { context: created, limits: limits, state: State { submitted: 0 } })
+        return open_device(none, debug)
+    }
+
+    pub fn open_for_window(native: &handle.NativeHandle, debug: bool) -> Device!hal.Error {
+        return open_device(some(native), debug)
     }
 
     pub fn api(&self) -> hal.Api {
@@ -87,6 +81,16 @@ pub struct Device: hal.Backend {
         return length
     }
 
+    pub fn staged(&self) -> bool {
+        return false
+    }
+
+    pub fn mapped(&self, buffer: &hal.Handle) -> usize {
+        return 0
+    }
+
+    pub fn invalidate(&self, buffer: &hal.Handle, offset: u64, size: u64) {}
+
     pub fn create_buffer(&self, size: u64, usage: u32) -> hal.Handle!hal.Error {
         self.current()?
         name := 0u32
@@ -105,8 +109,8 @@ pub struct Device: hal.Backend {
 
     pub fn write_buffer(&self, buffer: &hal.Handle, offset: u64, data: &[u8]) -> void!hal.Error {
         self.current()?
+        self.settle()
         unsafe {
-            gl.memory_barrier(gl.ALL_BARRIER_BITS)
             gl.named_buffer_sub_data(buffer.a as u32, offset as isize, data.len as isize, ptr.as_ptr(data))
         }
         return ok()
@@ -114,8 +118,8 @@ pub struct Device: hal.Backend {
 
     pub fn read_buffer(&self, buffer: &hal.Handle, offset: u64, out: &mut[u8]) -> void!hal.Error {
         self.current()?
+        self.settle()
         unsafe {
-            gl.memory_barrier(gl.ALL_BARRIER_BITS)
             gl.get_named_buffer_sub_data(buffer.a as u32, offset as isize, out.len as isize, ptr.as_mut_ptr(out))
         }
         return ok()
@@ -150,8 +154,8 @@ pub struct Device: hal.Backend {
     pub fn write_texture(&self, texture: &hal.Handle, descriptor: &hal.TextureDescriptor, region: &hal.Region, data: &[u8], bytes_per_row: u32) -> void!hal.Error {
         self.current()?
         format := pixel_format(descriptor.format)
+        self.settle()
         unsafe {
-            gl.memory_barrier(gl.ALL_BARRIER_BITS)
             gl.pixel_storei(gl.UNPACK_ROW_LENGTH, (bytes_per_row / hal.texel_size(descriptor.format)) as i32)
             gl.pixel_storei(gl.UNPACK_ALIGNMENT, 1)
             gl.texture_sub_image_2d(texture.a as u32, 0, region.x as i32, region.y as i32, region.width as i32, region.height as i32, format.format, format.kind, ptr.as_ptr(data))
@@ -163,8 +167,8 @@ pub struct Device: hal.Backend {
     pub fn read_texture(&self, texture: &hal.Handle, descriptor: &hal.TextureDescriptor, region: &hal.Region, out: &mut[u8], bytes_per_row: u32) -> void!hal.Error {
         self.current()?
         format := pixel_format(descriptor.format)
+        self.settle()
         unsafe {
-            gl.memory_barrier(gl.ALL_BARRIER_BITS)
             gl.pixel_storei(gl.PACK_ROW_LENGTH, (bytes_per_row / hal.texel_size(descriptor.format)) as i32)
             gl.pixel_storei(gl.PACK_ALIGNMENT, 1)
             gl.get_texture_sub_image(texture.a as u32, 0, region.x as i32, region.y as i32, 0, region.width as i32, region.height as i32, 1, format.format, format.kind, out.len as i32, ptr.as_mut_ptr(out))
@@ -188,15 +192,15 @@ pub struct Device: hal.Backend {
 
     pub fn create_compute_pipeline(&self, descriptor: &hal.ComputePipelineDescriptor) -> hal.Handle!hal.Error {
         self.current()?
-        shader := compile(gl.COMPUTE_SHADER, descriptor.source.glsl, b"#define COMPUTE 1\n")?
+        shader := compile(gl.COMPUTE_SHADER, descriptor.source.glsl, b"#define COMPUTE 1\n", descriptor.entry)?
         program := link(shader, 0)?
         return ok(hal.Handle { a: program as u64, b: 0, c: 0, d: 0 })
     }
 
     pub fn create_render_pipeline(&self, descriptor: &hal.RenderPipelineDescriptor) -> hal.Handle!hal.Error {
         self.current()?
-        vertex := compile(gl.VERTEX_SHADER, descriptor.vertex.glsl, b"#define VERTEX 1\n")?
-        fragment := match compile(gl.FRAGMENT_SHADER, descriptor.fragment.glsl, b"#define FRAGMENT 1\n") {
+        vertex := compile(gl.VERTEX_SHADER, descriptor.vertex.glsl, b"#define VERTEX 1\n", descriptor.vertex_entry)?
+        fragment := match compile(gl.FRAGMENT_SHADER, descriptor.fragment.glsl, b"#define FRAGMENT 1\n", descriptor.fragment_entry) {
             ok(fragment) => fragment,
             err(error) => {
                 unsafe {
@@ -289,6 +293,8 @@ pub struct Device: hal.Backend {
 
     pub fn begin_encoder(&self) -> hal.Handle!hal.Error {
         self.current()?
+        // Earlier encoders' shader writes are visible to this one.
+        self.settle()
         return ok(hal.Handle.null())
     }
 
@@ -370,8 +376,8 @@ pub struct Device: hal.Backend {
         bind(state)
         unsafe {
             gl.dispatch_compute(x, y, z)
-            gl.memory_barrier(gl.ALL_BARRIER_BITS)
         }
+        self.wrote(state)
     }
 
     pub fn draw(&self, encoder: &mut hal.Handle, state: &mut hal.PassState, vertex_count: u32, instance_count: u32, first_vertex: u32, first_instance: u32) {
@@ -379,6 +385,7 @@ pub struct Device: hal.Backend {
         unsafe {
             gl.draw_arrays_instanced_base_instance(mode(state.pipeline.handle.c), first_vertex as i32, vertex_count as i32, instance_count as i32, first_instance)
         }
+        self.wrote(state)
     }
 
     pub fn draw_indexed(&self, encoder: &mut hal.Handle, state: &mut hal.PassState, index_count: u32, instance_count: u32, first_index: u32, base_vertex: i32, first_instance: u32) {
@@ -399,11 +406,11 @@ pub struct Device: hal.Backend {
         unsafe {
             gl.draw_elements_instanced_base_vertex_base_instance(mode(state.pipeline.handle.c), index_count as i32, index_type, offset as usize as *const u8, instance_count as i32, base_vertex, first_instance)
         }
+        self.wrote(state)
     }
 
     pub fn copy_buffer(&self, encoder: &mut hal.Handle, source: &hal.Handle, source_offset: u64, destination: &hal.Handle, destination_offset: u64, size: u64) {
         unsafe {
-            gl.memory_barrier(gl.ALL_BARRIER_BITS)
             gl.copy_named_buffer_sub_data(source.a as u32, destination.a as u32, source_offset as isize, destination_offset as isize, size as isize)
         }
     }
@@ -411,7 +418,6 @@ pub struct Device: hal.Backend {
     pub fn copy_buffer_to_texture(&self, encoder: &mut hal.Handle, source: &hal.Handle, offset: u64, bytes_per_row: u32, destination: &hal.Handle, descriptor: &hal.TextureDescriptor, region: &hal.Region) {
         format := pixel_format(descriptor.format)
         unsafe {
-            gl.memory_barrier(gl.ALL_BARRIER_BITS)
             gl.bind_buffer(gl.PIXEL_UNPACK_BUFFER, source.a as u32)
             gl.pixel_storei(gl.UNPACK_ROW_LENGTH, (bytes_per_row / hal.texel_size(descriptor.format)) as i32)
             gl.pixel_storei(gl.UNPACK_ALIGNMENT, 1)
@@ -426,13 +432,160 @@ pub struct Device: hal.Backend {
         row := region.width as u64 * hal.texel_size(descriptor.format) as u64
         size := (region.height as u64 - 1) * bytes_per_row as u64 + row
         unsafe {
-            gl.memory_barrier(gl.ALL_BARRIER_BITS)
             gl.bind_buffer(gl.PIXEL_PACK_BUFFER, destination.a as u32)
             gl.pixel_storei(gl.PACK_ROW_LENGTH, (bytes_per_row / hal.texel_size(descriptor.format)) as i32)
             gl.pixel_storei(gl.PACK_ALIGNMENT, 1)
             gl.get_texture_sub_image(source.a as u32, 0, region.x as i32, region.y as i32, 0, region.width as i32, region.height as i32, 1, format.format, format.kind, (offset + size) as i32, offset as usize as *mut u8)
             gl.pixel_storei(gl.PACK_ROW_LENGTH, 0)
             gl.bind_buffer(gl.PIXEL_PACK_BUFFER, 0)
+        }
+    }
+
+    pub fn clear_buffer(&self, encoder: &mut hal.Handle, buffer: &hal.Handle, offset: u64, size: u64) {
+        unsafe {
+            gl.clear_named_buffer_sub_data(buffer.a as u32, gl.R8, offset as isize, size as isize, gl.RED, gl.UNSIGNED_BYTE, 0usize as *const u8)
+        }
+    }
+
+    // create_texture clears textures already.
+    pub fn initialize_texture(&self, encoder: &mut hal.Handle, texture: &hal.Handle, descriptor: &hal.TextureDescriptor) {}
+
+    // Only shader writes to storage buffers and images need barriers.
+    pub fn barrier(&self, encoder: &mut hal.Handle, before: u32, after: u32) {
+        if (before & (hal.USE_FRAGMENT_WRITE | hal.USE_COMPUTE_WRITE)) == 0 {
+            return
+        }
+        unsafe {
+            gl.memory_barrier(barrier_bits(after))
+        }
+    }
+
+    // Only the window the device was opened for has a surface.
+    pub fn create_surface(&self, native: &handle.NativeHandle) -> hal.Handle!hal.Error {
+        kind := window_kind(native)
+        if kind == WINDOW_NONE || kind != self.window_kind || window_id(native) != self.window {
+            return err(hal.Error.Unsupported)
+        }
+        return ok(hal.Handle.null())
+    }
+
+    // A texture to render into, and a framebuffer to copy it into the
+    // window with.
+    pub fn configure_surface(&self, surface: &mut hal.Handle, config: &mut hal.SurfaceConfig) -> void!hal.Error {
+        self.current()?
+        self.destroy_surface(surface)
+        surface.a = 0
+        surface.b = 0
+        surface.c = 0
+        surface.d = 0
+        config.format = hal.FORMAT_RGBA8_UNORM_SRGB
+        self.context.update_surface()
+        interval := 0i32
+        if config.vsync {
+            interval = 1
+        }
+        // Not every driver lets the interval change; keep its own then.
+        match self.context.set_swap_interval(interval) {
+            ok() => {}
+            err(_) => {}
+        }
+        if config.width == 0 || config.height == 0 {
+            return ok()
+        }
+        descriptor := hal.TextureDescriptor.new(config.width, config.height, hal.FORMAT_RGBA8_UNORM_SRGB, hal.TEXTURE_RENDER | hal.TEXTURE_COPY_SRC | hal.TEXTURE_COPY_DST)
+        texture := self.create_texture(&descriptor)?
+        framebuffer := 0u32
+        unsafe {
+            gl.create_framebuffers(1, ptr.from_mut(&mut framebuffer))
+            gl.named_framebuffer_texture(framebuffer, gl.COLOR_ATTACHMENT0, texture.a as u32, 0)
+            gl.named_framebuffer_read_buffer(framebuffer, gl.COLOR_ATTACHMENT0)
+        }
+        surface.a = texture.a
+        surface.b = framebuffer as u64
+        surface.c = config.width as u64
+        surface.d = config.height as u64
+        return ok()
+    }
+
+    pub fn acquire(&self, surface: &mut hal.Handle, texture: &mut hal.Handle) -> u64!hal.Error {
+        if surface.a == 0 {
+            return err(hal.Error.Outdated)
+        }
+        texture.a = surface.a
+        texture.b = gl.SRGB8_ALPHA8 as u64
+        texture.c = 0
+        texture.d = 0
+        return ok(0)
+    }
+
+    pub fn present(&self, surface: &mut hal.Handle) -> u64!hal.Error {
+        self.current()?
+        self.settle()
+        width := surface.c as i32
+        height := surface.d as i32
+        unsafe {
+            // Copy the bytes as they are: the window shows them as sRGB.
+            gl.disable(gl.FRAMEBUFFER_SRGB)
+            gl.disable(gl.SCISSOR_TEST)
+            gl.bind_framebuffer(gl.DRAW_FRAMEBUFFER, 0)
+            gl.blit_named_framebuffer(surface.b as u32, 0, 0, 0, width, height, 0, height, width, 0, gl.COLOR_BUFFER_BIT, gl.NEAREST)
+            gl.enable(gl.SCISSOR_TEST)
+            gl.enable(gl.FRAMEBUFFER_SRGB)
+        }
+        swapped := self.context.swap_buffers()
+        state := self.state()
+        index := unsafe {
+            (*state).submitted += 1
+            (*state).submitted
+        }
+        match swapped {
+            ok() => {
+                return ok(index)
+            }
+            err(_) => {
+                return err(hal.Error.Outdated)
+            }
+        }
+    }
+
+    pub fn destroy_surface(&self, surface: &hal.Handle) {
+        match self.current() {
+            ok() => {}
+            err(_) => {
+                return
+            }
+        }
+        if surface.b != 0 {
+            framebuffer := surface.b as u32
+            unsafe {
+                gl.delete_framebuffers(1, ptr.from_ref(&framebuffer))
+            }
+        }
+        delete_texture(surface.a as u32)
+    }
+
+    // Shader writes since the last full barrier become visible to
+    // everything.
+    fn settle(&self) {
+        state := self.state()
+        unsafe {
+            if (*state).dirty {
+                gl.memory_barrier(gl.ALL_BARRIER_BITS)
+                (*state).dirty = false
+            }
+        }
+    }
+
+    // A draw or dispatch ran: note whether it may have written storage.
+    fn wrote(&self, state: &hal.PassState) {
+        for slot in 0usize..16 {
+            kind := state.pipeline.kinds[slot]
+            if kind == hal.BINDING_STORAGE_BUFFER || kind == hal.BINDING_STORAGE_TEXTURE {
+                unsafe {
+                    (*self.state()).dirty = true
+                }
+                return
+            }
         }
     }
 
@@ -561,8 +714,11 @@ fn positive(value: i64) -> u64 {
 }
 
 // Compile one stage of `source`, with `define` inserted after its
-// #version line (GLSL requires that line to come first).
-fn compile(stage: u32, source: &str, define: &[u8]) -> u32!hal.Error {
+// #version line (GLSL requires that line to come first), followed by
+// `#define DODO_ENTRY_<entry> 1` when the entry point's name is an
+// identifier: shaders from gpu.wgsl hold every entry point, each inside
+// `#if defined(DODO_ENTRY_<name>)`.
+fn compile(stage: u32, source: &str, define: &[u8], entry: &str) -> u32!hal.Error {
     text := mem.str_bytes(source)
     split := 0usize
     if text.len >= 8 && text[0] == 35 && text[1] == 118 {
@@ -574,15 +730,17 @@ fn compile(stage: u32, source: &str, define: &[u8]) -> u32!hal.Error {
             }
         }
     }
-    parts := [ptr.as_ptr(text), ptr.as_ptr(define), unsafe {
+    selector := [0u8; 256]
+    selector_length := entry_define(entry, &mut selector)
+    parts := [ptr.as_ptr(text), ptr.as_ptr(define), ptr.as_ptr(&selector), unsafe {
         ptr.offset(ptr.as_ptr(text), split as isize)
     }]
-    lengths := [split as i32, define.len as i32, (text.len - split) as i32]
+    lengths := [split as i32, define.len as i32, selector_length as i32, (text.len - split) as i32]
     status := 0i32
     shader := 0u32
     unsafe {
         shader = gl.create_shader(stage)
-        gl.shader_source(shader, 3, ptr.as_ptr(&parts), ptr.as_ptr(&lengths))
+        gl.shader_source(shader, 4, ptr.as_ptr(&parts), ptr.as_ptr(&lengths))
         gl.compile_shader(shader)
         gl.get_shaderiv(shader, gl.COMPILE_STATUS, ptr.from_mut(&mut status))
     }
@@ -593,6 +751,38 @@ fn compile(stage: u32, source: &str, define: &[u8]) -> u32!hal.Error {
         return err(hal.Error.InvalidShader)
     }
     return ok(shader)
+}
+
+// Write `#define DODO_ENTRY_<entry> 1` and a newline into `out` and return
+// its length, or 0 when `entry` is not an identifier of at most 200 bytes.
+fn entry_define(entry: &str, out: &mut[256]u8) -> usize {
+    name := mem.str_bytes(entry)
+    if name.len == 0 || name.len > 200 || (name[0] >= 48 && name[0] <= 57) {
+        return 0
+    }
+    for i in 0usize..name.len {
+        byte := name[i]
+        letter := (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || byte == 95
+        if !letter && !(byte >= 48 && byte <= 57) {
+            return 0
+        }
+    }
+    prefix := b"#define DODO_ENTRY_"
+    length := 0usize
+    for i in 0usize..prefix.len {
+        out[length] = prefix[i]
+        length += 1
+    }
+    for i in 0usize..name.len {
+        out[length] = name[i]
+        length += 1
+    }
+    suffix := b" 1\n"
+    for i in 0usize..suffix.len {
+        out[length] = suffix[i]
+        length += 1
+    }
+    return length
 }
 
 // Link shaders into a program and delete them; `second` may be 0.
@@ -656,7 +846,6 @@ fn delete_texture(name: u32) {
 
 fn close_framebuffer(framebuffer: u32) {
     unsafe {
-        gl.memory_barrier(gl.ALL_BARRIER_BITS)
         gl.bind_framebuffer(gl.DRAW_FRAMEBUFFER, 0)
         gl.delete_framebuffers(1, ptr.from_ref(&framebuffer))
     }
@@ -802,4 +991,102 @@ fn address(mode: u32) -> u32 {
         return gl.MIRRORED_REPEAT
     }
     return gl.CLAMP_TO_EDGE
+}
+
+// The glMemoryBarrier bits for uses after shader writes.
+fn barrier_bits(after: u32) -> u32 {
+    bits := 0u32
+    if (after & hal.USE_VERTEX_INPUT) != 0 {
+        bits = bits | gl.VERTEX_ATTRIB_ARRAY_BARRIER_BIT
+    }
+    if (after & hal.USE_INDEX) != 0 {
+        bits = bits | gl.ELEMENT_ARRAY_BARRIER_BIT
+    }
+    if (after & (hal.USE_VERTEX_READ | hal.USE_FRAGMENT_READ | hal.USE_COMPUTE_READ | hal.USE_FRAGMENT_WRITE | hal.USE_COMPUTE_WRITE)) != 0 {
+        bits = bits | gl.UNIFORM_BARRIER_BIT | gl.TEXTURE_FETCH_BARRIER_BIT | gl.SHADER_IMAGE_ACCESS_BARRIER_BIT | gl.SHADER_STORAGE_BARRIER_BIT
+    }
+    if (after & (hal.USE_COLOR | hal.USE_DEPTH)) != 0 {
+        bits = bits | gl.FRAMEBUFFER_BARRIER_BIT
+    }
+    if (after & (hal.USE_COPY_SRC | hal.USE_COPY_DST)) != 0 {
+        bits = bits | gl.BUFFER_UPDATE_BARRIER_BIT | gl.TEXTURE_UPDATE_BARRIER_BIT | gl.PIXEL_BUFFER_BARRIER_BIT
+    }
+    return bits
+}
+
+const WINDOW_NONE: u32 = 0
+const WINDOW_XCB: u32 = 1
+const WINDOW_APPKIT: u32 = 2
+const WINDOW_WIN32: u32 = 3
+
+fn window_kind(native: &handle.NativeHandle) -> u32 {
+    match native {
+        handle.NativeHandle.Xcb(_, _, _, _) => {
+            return WINDOW_XCB
+        }
+        handle.NativeHandle.AppKit(_, _) => {
+            return WINDOW_APPKIT
+        }
+        handle.NativeHandle.Win32(_, _) => {
+            return WINDOW_WIN32
+        }
+    }
+}
+
+// What identifies the window: X11 window id, NSView, HWND.
+fn window_id(native: &handle.NativeHandle) -> u64 {
+    match native {
+        handle.NativeHandle.Xcb(_, window, _, _) => {
+            return *window as u64
+        }
+        handle.NativeHandle.AppKit(_, view) => {
+            return *view as u64
+        }
+        handle.NativeHandle.Win32(hwnd, _) => {
+            return *hwnd as u64
+        }
+    }
+}
+
+fn open_device(window: Option<&handle.NativeHandle>, debug: bool) -> Device!hal.Error {
+    options := context.Options.new(4, 5)
+    options.debug = debug
+    kind := WINDOW_NONE
+    id := 0u64
+    result := match window {
+        some(native) => {
+            kind = window_kind(native)
+            id = window_id(native)
+            context.Context.create_for_window(native, options)
+        }
+        none => context.Context.create(options),
+    }
+    created := match result {
+        ok(created) => created,
+        err(context.Error.Unsupported) => {
+            return err(hal.Error.Unsupported)
+        }
+        err(context.Error.NoLibrary) => {
+            return err(hal.Error.NoBackend)
+        }
+        err(context.Error.NoDisplay) => {
+            return err(hal.Error.NoBackend)
+        }
+        err(context.Error.NoConfig) => {
+            return err(hal.Error.NoBackend)
+        }
+        err(_) => {
+            return err(hal.Error.System)
+        }
+    }
+    unsafe {
+        // Clip space with y up and depth from 0 to 1, drawn with the top
+        // row first, as in Vulkan and Metal.
+        gl.clip_control(gl.UPPER_LEFT, gl.ZERO_TO_ONE)
+        gl.enable(gl.FRAMEBUFFER_SRGB)
+        gl.enable(gl.PROGRAM_POINT_SIZE)
+        gl.enable(gl.SCISSOR_TEST)
+    }
+    limits := query_limits()
+    return ok(Device { context: created, limits: limits, state: State { submitted: 0, dirty: false }, window_kind: kind, window: id })
 }

@@ -1,0 +1,482 @@
+package sqlite
+
+import "std/db"
+
+// Record format (serial types) and value comparison.
+
+// Engine temporaries; statement registers start at FIRST_REG.
+const R_CMP_A: usize = 0
+const R_CMP_B: usize = 1
+const R_TMP: usize = 2
+const R_TMP2: usize = 3
+const R_TMP3: usize = 4
+const R_TMP4: usize = 5
+const FIRST_REG: usize = 16
+// Registers reserved for b-tree key positioning.
+const R_BTKEY: usize = 896
+// Statement registers must stay below this.
+const REG_LIMIT: usize = 896
+
+fn serial_len(t: u64) -> usize {
+    if t < 12 {
+        if t == 1 {
+            return 1
+        }
+        if t == 2 {
+            return 2
+        }
+        if t == 3 {
+            return 3
+        }
+        if t == 4 {
+            return 4
+        }
+        if t == 5 {
+            return 6
+        }
+        if t == 6 || t == 7 {
+            return 8
+        }
+        return 0
+    }
+    ((t - 12) / 2) as usize
+}
+
+fn read_be_int(b: &[u8], o: usize, n: usize) -> i64 {
+    v := 0u64
+    for i in 0usize..n {
+        v = (v << 8) | (b[o + i] as u64)
+    }
+    // Sign-extend.
+    if n < 8 && n > 0 && (b[o] & 128) != 0 {
+        bits := (n * 8) as u64
+        v = v + (18446744073709551615u64 - ((1u64 << bits) - 1))
+    }
+    u2i(v)
+}
+
+// Decodes one field into register `r`. Text/blob reference `o` directly.
+fn decode_field(e: &mut Engine, o: usize, t: u64, r: usize) {
+    if t == 0 || t == 10 || t == 11 {
+        set_null(e, r)
+        return
+    }
+    if t == 8 {
+        set_int(e, r, 0)
+        return
+    }
+    if t == 9 {
+        set_int(e, r, 1)
+        return
+    }
+    if t == 7 {
+        v := 0u64
+        for i in 0usize..8 {
+            v = (v << 8) | (e.ws[o + i] as u64)
+        }
+        f := u2f(v)
+        if f != f {
+            set_null(e, r)
+        } else {
+            set_real(e, r, f)
+        }
+        return
+    }
+    if t < 7 {
+        let read_be_int2 = read_be_int(e.ws, o, serial_len(t))
+        set_int(e, r, read_be_int2)
+        return
+    }
+    n := serial_len(t)
+    if (t & 1) == 1 {
+        set_bytes(e, r, T_TEXT, o, n)
+    } else {
+        set_bytes(e, r, T_BLOB, o, n)
+    }
+}
+
+// Reads column `col` of the record at [rec, rec + len) into `r`. Returns
+// false when the record has fewer columns (the caller supplies a default).
+fn record_column(e: &mut Engine, rec: usize, len: usize, col: usize, r: usize) -> bool!db.Error {
+    if len == 0 {
+        set_null(e, r)
+        return ok(false)
+    }
+    let (hsize, hn) = get_varint(e.ws, rec)
+    hs := hsize as usize
+    if hs > len || hs < hn {
+        return err(corrupt(e))
+    }
+    p := rec + hn
+    body := rec + hs
+    i := 0usize
+    for p < rec + hs {
+        let (t, tn) = get_varint(e.ws, p)
+        p += tn
+        n := serial_len(t)
+        if i == col {
+            if body + n > rec + len {
+                return err(corrupt(e))
+            }
+            decode_field(e, body, t, r)
+            return ok(true)
+        }
+        body += n
+        i += 1
+    }
+    set_null(e, r)
+    ok(false)
+}
+
+fn record_count(e: &Engine, rec: usize, len: usize) -> usize {
+    if len == 0 {
+        return 0
+    }
+    let (hsize, hn) = get_varint(e.ws, rec)
+    hs := hsize as usize
+    p := rec + hn
+    n := 0usize
+    for p < rec + hs && p < rec + len {
+        let (_, tn) = get_varint(e.ws, p)
+        p += tn
+        n += 1
+    }
+    n
+}
+
+fn int_serial(v: i64, format4: bool) -> u64 {
+    if format4 && (v == 0 || v == 1) {
+        return (8 + v) as u64
+    }
+    if v >= -128 && v <= 127 {
+        return 1
+    }
+    if v >= -32768 && v <= 32767 {
+        return 2
+    }
+    if v >= -8388608 && v <= 8388607 {
+        return 3
+    }
+    if v >= -2147483648 && v <= 2147483647 {
+        return 4
+    }
+    if v >= -140737488355328 && v <= 140737488355327 {
+        return 5
+    }
+    6
+}
+
+fn reg_serial(e: &Engine, r: usize) -> u64 {
+    t := rtype(e, r)
+    if t == T_NULL {
+        return 0
+    }
+    if t == T_INT {
+        return int_serial(rint(e, r), e.schema_format >= 4)
+    }
+    if t == T_REAL {
+        return 7
+    }
+    if t == T_TEXT {
+        return (rlen(e, r) as u64) * 2 + 13
+    }
+    (rlen(e, r) as u64) * 2 + 12
+}
+
+fn write_be(b: &mut[u8], o: usize, v: u64, n: usize) {
+    x := v
+    for k in 0usize..n {
+        b[o + n - 1 - k] = (x & 255) as u8
+        x = x >> 8
+    }
+}
+
+fn record_size(e: &Engine, first: usize, n: usize) -> usize {
+    hbody := 0usize
+    body := 0usize
+    for i in 0usize..n {
+        t := reg_serial(e, first + i)
+        hbody += varint_len(t)
+        body += serial_len(t)
+    }
+    h := hbody + 1
+    if varint_len(h as u64) > 1 {
+        h = hbody + varint_len((hbody + 2) as u64)
+        if varint_len(h as u64) + hbody > h {
+            h = hbody + varint_len(h as u64)
+        }
+    }
+    h + body
+}
+
+// Serializes registers [first, first + n) as a record at `dst`; returns its
+// length. The destination must not overlap the registers' data.
+fn record_write(e: &mut Engine, first: usize, n: usize, dst: usize) -> usize {
+    hbody := 0usize
+    for i in 0usize..n {
+        hbody += varint_len(reg_serial(e, first + i))
+    }
+    h := hbody + 1
+    for varint_len(h as u64) + hbody != h {
+        h = varint_len(h as u64) + hbody
+    }
+    p := dst + put_varint(e.ws, dst, h as u64)
+    body := dst + h
+    for i in 0usize..n {
+        r := first + i
+        t := reg_serial(e, r)
+        p += put_varint(e.ws, p, t)
+        if t >= 1 && t <= 6 {
+            len := serial_len(t)
+            let bits = i2u(rint(e, r))
+            write_be(e.ws, body, bits, len)
+            body += len
+        } else if t == 7 {
+            let f2u2 = f2u(rreal(e, r))
+            write_be(e.ws, body, f2u2, 8)
+            body += 8
+        } else if t >= 12 {
+            len := rlen(e, r)
+            let off = roff(e, r)
+            move_bytes(e.ws, off, body, len)
+            body += len
+        }
+    }
+    body - dst
+}
+
+// ---------------------------------------------------------------------------
+// Comparison
+
+fn fold(b: u8) -> u8 {
+    if b >= 65 && b <= 90 {
+        return b + 32
+    }
+    b
+}
+
+fn compare_bytes(e: &Engine, a: usize, an: usize, b: usize, bn: usize, coll: u8) -> i32 {
+    la := an
+    lb := bn
+    if coll == COLL_RTRIM {
+        for la > 0 && e.ws[a + la - 1] == 32 {
+            la -= 1
+        }
+        for lb > 0 && e.ws[b + lb - 1] == 32 {
+            lb -= 1
+        }
+    }
+    n := if la < lb {
+        la
+    } else {
+        lb
+    }
+    for i in 0usize..n {
+        x := e.ws[a + i]
+        y := e.ws[b + i]
+        if coll == COLL_NOCASE {
+            x = fold(x)
+            y = fold(y)
+        }
+        if x != y {
+            return if x < y {
+                -1
+            } else {
+                1
+            }
+        }
+    }
+    if la == lb {
+        return 0
+    }
+    if la < lb {
+        -1
+    } else {
+        1
+    }
+}
+
+fn cmp_int_real(i: i64, r: f64) -> i32 {
+    if r != r {
+        return 1
+    }
+    if r < -9223372036854775808.0 {
+        return 1
+    }
+    if r >= 9223372036854775808.0 {
+        return -1
+    }
+    t := r as i64
+    if i < t {
+        return -1
+    }
+    if i > t {
+        return 1
+    }
+    f := r - (t as f64)
+    if f > 0.0 {
+        return -1
+    }
+    if f < 0.0 {
+        return 1
+    }
+    0
+}
+
+fn type_class(t: u8) -> i32 {
+    if t == T_NULL {
+        return 0
+    }
+    if t == T_INT || t == T_REAL {
+        return 1
+    }
+    if t == T_TEXT {
+        return 2
+    }
+    3
+}
+
+// Total order used by ORDER BY, indexes, min/max: NULL < numbers < text < blob.
+fn reg_compare(e: &Engine, a: usize, b: usize, coll: u8) -> i32 {
+    ta := rtype(e, a)
+    tb := rtype(e, b)
+    ca := type_class(ta)
+    cb := type_class(tb)
+    if ca != cb {
+        return if ca < cb {
+            -1
+        } else {
+            1
+        }
+    }
+    if ca == 0 {
+        return 0
+    }
+    if ca == 1 {
+        if ta == T_INT && tb == T_INT {
+            x := rint(e, a)
+            y := rint(e, b)
+            return if x < y {
+                -1
+            } else if x > y {
+                1
+            } else {
+                0
+            }
+        }
+        if ta == T_REAL && tb == T_REAL {
+            x := rreal(e, a)
+            y := rreal(e, b)
+            return if x < y {
+                -1
+            } else if x > y {
+                1
+            } else {
+                0
+            }
+        }
+        if ta == T_INT {
+            return cmp_int_real(rint(e, a), rreal(e, b))
+        }
+        return -cmp_int_real(rint(e, b), rreal(e, a))
+    }
+    if ca == 2 {
+        let off = roff(e, a)
+        let len = rlen(e, a)
+        let off2 = roff(e, b)
+        let len2 = rlen(e, b)
+        return compare_bytes(e, off, len, off2, len2, coll)
+    }
+    let off3 = roff(e, a)
+    let len3 = rlen(e, a)
+    let off4 = roff(e, b)
+    let len4 = rlen(e, b)
+    compare_bytes(e, off3, len3, off4, len4, COLL_BINARY)
+}
+
+// Compares the record at [rec, rec+len) against registers [key, key+nkey)
+// field by field. `info` points at nkey (collation, descending) byte pairs.
+// Fields missing from the record compare as smaller.
+fn record_compare(e: &mut Engine, rec: usize, len: usize, key: usize, nkey: usize, info: usize) -> i32!db.Error {
+    let (hsize, hn) = get_varint(e.ws, rec)
+    hs := hsize as usize
+    if hs > len {
+        return err(corrupt(e))
+    }
+    p := rec + hn
+    body := rec + hs
+    for i in 0usize..nkey {
+        if p >= rec + hs {
+            return ok(-1)
+        }
+        let (t, tn) = get_varint(e.ws, p)
+        p += tn
+        n := serial_len(t)
+        if body + n > rec + len {
+            return err(corrupt(e))
+        }
+        decode_field(e, body, t, R_CMP_A)
+        body += n
+        coll := e.ws[info + i * 2]
+        desc := e.ws[info + i * 2 + 1] != 0
+        c := reg_compare(e, R_CMP_A, key + i, coll)
+        if c != 0 {
+            return ok(if desc {
+                -c
+            } else {
+                c
+            })
+        }
+    }
+    ok(0)
+}
+
+// Compares two records over their first `nkey` fields.
+fn record_compare2(e: &mut Engine, a: usize, alen: usize, b: usize, blen: usize, nkey: usize, info: usize) -> i32!db.Error {
+    let (ah, an) = get_varint(e.ws, a)
+    let (bh, bn) = get_varint(e.ws, b)
+    pa := a + an
+    pb := b + bn
+    da := a + (ah as usize)
+    db_ := b + (bh as usize)
+    for i in 0usize..nkey {
+        ea := pa >= a + (ah as usize)
+        eb := pb >= b + (bh as usize)
+        if ea || eb {
+            if ea && eb {
+                return ok(0)
+            }
+            return ok(if ea {
+                -1
+            } else {
+                1
+            })
+        }
+        let (ta, tna) = get_varint(e.ws, pa)
+        let (tb, tnb) = get_varint(e.ws, pb)
+        pa += tna
+        pb += tnb
+        decode_field(e, da, ta, R_CMP_A)
+        decode_field(e, db_, tb, R_CMP_B)
+        da += serial_len(ta)
+        db_ += serial_len(tb)
+        coll := COLL_BINARY
+        desc := false
+        if info != 0 {
+            coll = e.ws[info + i * 2]
+            desc = e.ws[info + i * 2 + 1] != 0
+        }
+        c := reg_compare(e, R_CMP_A, R_CMP_B, coll)
+        if c != 0 {
+            return ok(if desc {
+                -c
+            } else {
+                c
+            })
+        }
+    }
+    if alen == 0 && blen == 0 {
+        return ok(0)
+    }
+    ok(0)
+}

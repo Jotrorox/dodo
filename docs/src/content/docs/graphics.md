@@ -1,6 +1,6 @@
 ---
 title: "Graphics"
-description: "Draw shapes, antialiased paths, gradients, bitmap and TrueType text and images into pixel buffers on any target, present them on display panels or through the Display protocol, and test rendering with golden images."
+description: "Draw shapes, antialiased and stroked paths, gradients, bitmap and TrueType text and images into pixel buffers on any target, present them on display panels or through the Display protocol, and test rendering with golden images."
 section: "Standard library"
 order: 160.5
 ---
@@ -16,10 +16,10 @@ microcontrollers:
 
 | Import | Contents |
 | --- | --- |
-| `std/graphics` | `Canvas`, colors, rectangles, drawing, antialiased paths and shapes, gradients, text rendering, the `Display` protocol, band rendering. |
+| `std/graphics` | `Canvas`, colors, rectangles, drawing, antialiased paths, strokes and shapes, gradients, text rendering, the `Display` protocol, band rendering. |
 | `std/graphics/font` | Built-in 6x8 and 8x16 bitmap fonts for ASCII and Latin-1. |
 | `std/graphics/truetype` | TrueType (`.ttf`, `.ttc`) fonts drawn antialiased at any size. |
-| `std/graphics/image` | PPM, QOI, BMP and PNG decoding and encoding into caller buffers. |
+| `std/graphics/image` | PPM, QOI, BMP and PNG decoding onto canvases and encoding from them; the full codecs are in [std/image](image.md). |
 | `std/graphics/fake` | An in-memory `Display` for tests. |
 | `std/embedded/display` | The SPI and I2C links that panel drivers talk over. |
 | `std/embedded/display/st7789` | ST7789 colour TFT and IPS panels, RGB565 over SPI. |
@@ -399,7 +399,8 @@ fn edges_blend_and_interiors_fill() {
 | `aa_round_rect` / `aa_fill_round_rect(x, y, width, height, radius, color)` | Exactly round corners; radius 0 gives the same pixels as `fill_rect`. |
 | `aa_fill_polygon(coordinates, color)` | An even-odd polygon through pixel corners, like `fill_polygon`. |
 | `fill_path(path, rule, color)`, `fill_outline(outline, rule, color)` | Any [path or outline](#paths-and-outlines). |
-| `gradient_rect`, `gradient_path`, `gradient_outline` | The same with a [gradient](#gradients). |
+| `stroke_path(path, style, color)`, `stroke_outline(outline, style, color)` | The [stroke](#strokes) of a path or outline: its width, joins, caps and dashes. |
+| `gradient_rect`, `gradient_path`, `gradient_outline`, `gradient_stroke_path`, `gradient_stroke_outline` | The same with a [gradient](#gradients). |
 
 Clipping, dirty rectangles, origins and bands work as for every other call,
 and every pixel format is supported: `Mono1` lights a pixel once it is about
@@ -473,6 +474,77 @@ straight edges at a time. When more edges cross the visible rows, the rows
 are drawn in bands, each tracing the outline again, and a row crossed by more
 than 256 edges traces it once per 256 columns, so an outline with thousands
 of edges is still drawn faster as several smaller ones.
+
+### Strokes
+
+`stroke_path` paints a band of the stroke's width centred on a path, the way
+borders, chart lines and icon outlines are drawn. A `graphics.Stroke` holds
+the style; its lengths are in subpixels, like path coordinates:
+
+```dodo test
+package strokes
+
+import "std/graphics"
+
+@test
+fn a_dashed_border() {
+    pixels := [0u8; 24 * 24 * 4]
+    canvas := graphics.canvas(&mut pixels, 24, 24, graphics.PixelFormat.Rgba8888)!
+    canvas.clear(graphics.BLACK)
+    storage := [0i32; 64]
+    path := graphics.Path.new(&mut storage)
+    path.round_rect(3 * 256, 3 * 256, 18 * 256, 18 * 256, 4 * 256)
+
+    style := graphics.Stroke.new(2 * graphics.SUBPIXEL)
+    style.set_join(graphics.LineJoin.Round)
+    style.set_cap(graphics.LineCap.Round)
+    dashes := [4i32 * graphics.SUBPIXEL, 3 * graphics.SUBPIXEL]
+    style.set_dashes(&dashes, 0)
+    canvas.stroke_path(&path, &style, graphics.hex(0x98c379))
+
+    // The stroke straddles the outline; the inside stays untouched.
+    match canvas.color_at(12, 12) {
+        some(color) => assert_eq(color, graphics.BLACK),
+        none => assert(false),
+    }
+}
+```
+
+| Setting | Effect |
+| --- | --- |
+| `Stroke.new(width)` | A solid stroke `width` subpixels wide; zero or less draws nothing. |
+| `set_join(LineJoin.Miter / Round / Bevel)` | How corners between segments are filled. Miter is the default. |
+| `set_miter_limit(limit)` | The longest a miter may reach, as the ratio of its length to the width in `SUBPIXEL` units: the default 1024 (4) bevels corners sharper than about 29 degrees. |
+| `set_cap(LineCap.Butt / Round / Square)` | How open ends and dashes end: flat at the end point (the default), round, or flat half the width beyond it. |
+| `set_dashes(pattern, offset)`, `clear_dashes()` | Alternating dash and gap lengths, starting `offset` into the pattern at each subpath. An odd count repeats to make it even, as in SVG; at most `graphics.STROKE_DASHES` (16) lengths are kept. |
+
+The defaults (miter joins, a limit of 4, butt caps, solid) are those of SVG
+and the HTML canvas. Contours are not closed for stroking: an open subpath
+gets a cap at each end, and only `close` joins its end to its start. A
+subpath of no length, such as `move_to` followed by `close`, is a dot with
+round or square caps. Each dash gets the caps; a zero-length dash with round
+caps is a dot, and a closed subpath whose pattern is on at both ends joins
+its last dash to its first.
+
+Strokes are rasterized like fills, with exact coverage, so a stroke along
+pixel edges covers whole pixels: a two pixel wide stroke from (3, 5) to (9, 5)
+in pixels paints exactly the pixels of `fill_rect(3, 4, 6, 2, ...)`, and a
+closed square with miter joins is exactly a ring. Curves are flattened as
+for filling, and round joins and caps are drawn within 1/32 pixel. A
+translucent stroke paints each pixel once, even where it overlaps itself.
+
+`stroke_outline` strokes any [outline](#paths-and-outlines), including
+procedural shapes and TrueType glyph outlines. `graphics.Stroked.new(&outline,
+&style)` is the stroke as an outline of its own, for
+[coverage masks](#coverage-masks) and `outline_bounds`; fill it by
+`FillRule.NonZero`, since a stroke overlaps itself at every join.
+
+A dash pattern shorter than a quarter pixel in all is scaled up to that,
+since finer dashes only blend to gray. Round or square caps close gaps under
+1/4096 of the width, so such a stroke is drawn solid. Widths are limited to
+2^30 subpixels. Like fills, strokes cost what is visible: segments,
+joins and caps outside the clip rectangle are skipped, and only the dashes
+that cross it are drawn.
 
 ### Coverage masks
 
@@ -649,8 +721,12 @@ cache per font.
 
 ## Images
 
-`std/graphics/image` decodes from a byte slice and encodes into a byte buffer;
-read and write files with [std/fs](filesystem.md) or embed the bytes.
+`std/graphics/image` decodes image files onto canvases and encodes canvases
+into files, from and into byte buffers; read and write files with
+[std/fs](filesystem.md) or embed the bytes. It is a thin layer over the codec
+packages of [std/image](image.md), which add every pixel layout (16-bit and
+float included), color information, EXIF/XMP/ICC metadata, APNG frames and
+encoder options. Like the rest of the family it needs no floating point.
 
 ```dodo
 header := image.info(&data)?              // format, width, height, has_alpha
@@ -661,25 +737,27 @@ image.draw(&data, &mut canvas, 10, 10)?   // straight onto an existing canvas
 
 | Format | Decodes | Encodes |
 | --- | --- | --- |
-| Netpbm | Binary PPM (P6) and PGM (P5), any maxval, comments | P6, `ppm_size` bytes |
+| Netpbm | Binary PPM (P6) and PGM (P5), any maxval, comments; PAM (P7) and PFM | P6, `ppm_size` bytes |
 | QOI | RGB and RGBA | RGBA, at most `qoi_max_size` bytes |
-| BMP | Uncompressed 1, 4, 8-bit palettes; 16, 24, 32-bit with or without bit-field masks; bottom-up or top-down | 24-bit, `bmp_size` bytes |
-| PNG | Every color type and bit depth (gray, RGB, palette, gray and RGB with alpha; 1 to 16 bits), `tRNS` transparency, Adam7 interlacing | 8-bit RGBA: uncompressed, `png_size` bytes; or compressed, at most `png_compressed_max_size` bytes |
+| BMP | 1, 4, 8-bit palettes, RLE8 and RLE4; 16, 24, 32-bit with or without bit-field masks; bottom-up or top-down | 24-bit, `bmp_size` bytes |
+| PNG | Every color type and bit depth (gray, RGB, palette, gray and RGB with alpha; 1 to 16 bits), `tRNS` transparency, Adam7 interlacing; the default image of an APNG | 8-bit RGBA: uncompressed, `png_size` bytes; or compressed, at most `png_compressed_max_size` bytes |
 
-PPM and BMP encoding drop alpha; QOI and PNG keep it. Errors are `Truncated`,
-`Malformed`, `Unsupported` (ASCII PPM, compressed BMP, an unknown critical PNG
-chunk), `TooLarge`, and `BufferTooSmall`. Every length is checked before use,
-so untrusted files are safe to decode; a failure part-way through `draw` can
-leave part of the image drawn.
+PPM and BMP encoding drop alpha; QOI and PNG keep it. Errors are those of
+std/image (`image.Error` is `pixels.Error`): `Truncated`, `Malformed`,
+`Unsupported` (ASCII PPM, an unknown critical PNG chunk), `TooLarge`, and
+`BufferTooSmall`. Every length is checked before use, so untrusted files are
+safe to decode; a failure part-way through `draw` can leave part of the image
+drawn.
 
-PNG decoding checks every chunk's CRC and the zlib Adler-32, skips unknown
-ancillary chunks, and rounds 16-bit samples to 8 bits. Gamma, chromaticity and
-color profile chunks are ignored, so samples are taken as sRGB. Unfiltering
-needs two rows of raw image data: `decode` and `draw` keep
-`image.PNG_SCRATCH_LEN` (16 KiB) bytes of them on the stack and fail with
-`BufferTooSmall` for wider rows, such as RGBA wider than 2047 pixels. Pass
-your own storage of `image.png_scratch_size(&data)` bytes to `decode_png` or
-`draw_png` instead. The zlib decoder adds about 40 KiB of stack either way.
+Colors are converted to 8 bits as they are drawn: 16-bit samples are rounded,
+and color information is not applied, so samples are taken as sRGB. PNG
+decoding checks every chunk's CRC and the zlib Adler-32, and skips unknown
+ancillary chunks. Unfiltering needs two rows of raw image data: `decode` and
+`draw` keep `image.PNG_SCRATCH_LEN` (16 KiB) bytes of them on the stack and
+fail with `BufferTooSmall` for wider rows, such as RGBA wider than 2047
+pixels. Pass your own storage of `image.png_scratch_size(&data)` bytes to
+`decode_png` or `draw_png` instead. The zlib decoder adds about 40 KiB of
+stack either way.
 
 ```dodo
 scratch := [0u8; 32768]                   // png_scratch_size(&data) or more
@@ -711,8 +789,7 @@ including regenerating every image with `DODO_UPDATE_GOLDEN=1`.
 ## Limits
 
 There is no floating point and no GPU path: both are deliberate for
-predictable results on microcontrollers. Paths can be filled but not yet
-stroked, except for the straight `aa_line` and `aa_thick_line`. TrueType
+predictable results on microcontrollers. TrueType
 text is not hinted, and there is no text shaping: no ligatures, GPOS
 kerning, right-to-left or vertical text, and characters map one to one to
 glyphs.

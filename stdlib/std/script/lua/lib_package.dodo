@@ -1,0 +1,467 @@
+package lua
+
+import "core/mem"
+import "core/ptr"
+import "std/platform/native" as platform_native
+
+// The package library: `require`, `package.path`/`cpath`/`config`,
+// `package.loaded`/`preload`/`searchers`, `package.searchpath` and
+// `package.loadlib` (Lua 5.4 Reference Manual §6.3).
+//
+// This implementation has no C API, so it behaves like a reference build
+// without dynamic-library support: the C searchers still look for files
+// along `package.cpath` (and report every name tried), but a file that
+// exists cannot be loaded ("dynamic libraries not enabled; check your Lua
+// installation"), and `package.loadlib` always fails with the "absent"
+// error kind. Native modules written in Dodo are registered with
+// `Cx.preload_module` (see api.dodo), which stores their opener in
+// `package.preload`.
+//
+// `require`, the searchers and the path lookups take the package table as
+// their first upvalue, so replacing the global `package` (or its fields
+// `path`, `cpath`, `searchers`) affects them the way the manual describes.
+
+// Private names for C functions (other library files may declare the same
+// symbols under their usual names).
+@link_name("getenv")
+unsafe extern "C" fn pkg_getenv(name: *const u8) -> *const u8
+
+const PKG_DLL_MSG: &str = "dynamic libraries not enabled; check your Lua installation"
+
+// Default search paths of the reference POSIX build (LUA_ROOT "/usr/local/").
+const PKG_PATH_POSIX: &str = "/usr/local/share/lua/5.4/?.lua;/usr/local/share/lua/5.4/?/init.lua;/usr/local/lib/lua/5.4/?.lua;/usr/local/lib/lua/5.4/?/init.lua;./?.lua;./?/init.lua"
+const PKG_CPATH_POSIX: &str = "/usr/local/lib/lua/5.4/?.so;/usr/local/lib/lua/5.4/loadall.so;./?.so"
+// Windows defaults; '!' stands for the directory of the executable.
+const PKG_PATH_WIN: &str = "!\\lua\\?.lua;!\\lua\\?\\init.lua;!\\?.lua;!\\?\\init.lua;!\\..\\share\\lua\\5.4\\?.lua;!\\..\\share\\lua\\5.4\\?\\init.lua;.\\?.lua;.\\?\\init.lua"
+const PKG_CPATH_WIN: &str = "!\\?.dll;!\\..\\lib\\lua\\5.4\\?.dll;!\\loadall.dll;.\\?.dll"
+
+// Whether the compilation target is Windows. The platform layer has no
+// explicit flag; its native text workspace holds UTF-16 units on Windows
+// and is therefore twice as large (a compile-time constant).
+fn pkg_is_windows() -> bool {
+    return mem.size_of::<platform_native.Workspace>() > 6000
+}
+
+// Directory separator used when a module name's dots become path levels.
+fn pkg_dirsep() -> &str from(static) {
+    if pkg_is_windows() {
+        return "\\"
+    }
+    return "/"
+}
+
+// The bytes of `s` up to its first NUL: names and paths reach the file
+// system as C strings, so anything after an embedded zero is ignored.
+fn pkg_cstr(s: &[u8]) -> &[u8] from(s) {
+    for i in 0usize..s.len {
+        if s[i] == 0 {
+            return s[0..i]
+        }
+    }
+    return s
+}
+
+// Append `src` to `b` with every occurrence of the non-empty pattern `pat`
+// replaced by `rep`.
+fn pkg_add_replaced(b: &mut Buffer, src: &[u8], pat: &[u8], rep: &[u8]) -> void!Throw {
+    i := 0usize
+    start := 0usize
+    for i + pat.len <= src.len {
+        matched := true
+        for j in 0usize..pat.len {
+            if src[i + j] != pat[j] {
+                matched = false
+                break
+            }
+        }
+        if matched {
+            b.add_bytes(src[start..i])?
+            b.add_bytes(rep)?
+            i += pat.len
+            start = i
+        } else {
+            i += 1
+        }
+    }
+    b.add_bytes(src[start..src.len])?
+    return ok()
+}
+
+// Whether the file can be opened for reading.
+fn pkg_readable(cx: &Cx, name: &[u8]) -> bool!Throw {
+    z := Buffer.new(cx)
+    z.add_bytes(name)?
+    z.add_char(0)?
+    unsafe {
+        let f = fopen(ptr.as_ptr(z.bytes()), ptr.as_ptr(b"r\0"))
+        if ptr.is_null(f) {
+            return ok(false)
+        }
+        fclose(f)
+    }
+    return ok(true)
+}
+
+// Look for `name` along the ';'-separated templates of `path` ('?' stands
+// for the name, in which every `sep` became `dirsep`). Pushes the first
+// readable file name and returns true, or pushes the list of names tried
+// ("no file 'a'\n\tno file 'b'") and returns false.
+fn pkg_search(cx: &mut Cx, name0: &[u8], path0: &[u8], sep0: &[u8], dirsep0: &[u8]) -> bool!Throw {
+    let path = pkg_cstr(path0)
+    let sep = pkg_cstr(sep0)
+    let dirsep = pkg_cstr(dirsep0)
+    nb := Buffer.new(cx)
+    let name1 = pkg_cstr(name0)
+    has_sep := false
+    if sep.len > 0 {
+        for i in 0usize..name1.len {
+            if name1[i] == sep[0] {
+                has_sep = true
+                break
+            }
+        }
+    }
+    if has_sep {
+        pkg_add_replaced(&mut nb, name1, sep, dirsep)?
+    } else {
+        nb.add_bytes(name1)?
+    }
+    full := Buffer.new(cx)
+    pkg_add_replaced(&mut full, path, b"?", nb.bytes())?
+    let all = full.bytes()
+    if all.len > 0 {
+        start := 0usize
+        for i in 0usize..(all.len + 1) {
+            if i == all.len || all[i] == b';' {
+                let cand = all[start..i]
+                if pkg_readable(cx, cand)? {
+                    cx.push_bytes(cand)?
+                    return ok(true)
+                }
+                start = i + 1
+            }
+        }
+    }
+    msg := Buffer.new(cx)
+    msg.add_str("no file '")?
+    pkg_add_replaced(&mut msg, all, b";", b"'\n\tno file '")?
+    msg.add_str("'")?
+    msg.push_result(cx)?
+    return ok(false)
+}
+
+// package.searchpath(name, path [, sep [, rep]])
+fn pkg_searchpath(cx: &mut Cx) -> i32!Throw {
+    let name = cx.check_lstr(1)?
+    let path = cx.check_lstr(2)?
+    let sep = cx.opt_lstr(3, b".")?
+    let rep = cx.opt_lstr(4, mem.str_bytes(pkg_dirsep()))?
+    if pkg_search(cx, name.bytes(), path.bytes(), sep.bytes(), rep.bytes())? {
+        return ok(1)
+    }
+    cx.push_fail()
+    cx.insert(-2)
+    return ok(2)
+}
+
+// package.loadlib(libname, funcname): dynamic libraries are not available,
+// so this always returns fail, the reason and the "absent" error kind.
+fn pkg_loadlib(cx: &mut Cx) -> i32!Throw {
+    cx.check_lstr(1)?
+    cx.check_lstr(2)?
+    cx.push_fail()
+    cx.push_str(PKG_DLL_MSG)?
+    cx.push_str("absent")?
+    return ok(3)
+}
+
+// Searcher 1: a loader stored in package.preload (registry._PRELOAD).
+fn pkg_searcher_preload(cx: &mut Cx) -> i32!Throw {
+    let nstr = cx.check_lstr(1)?
+    let name = pkg_cstr(nstr.bytes())
+    cx.get_field(REGISTRY_INDEX, "_PRELOAD")?
+    if cx.get_field_bytes(-1, name)? == TNIL {
+        b := Buffer.new(cx)
+        b.add_str("no field package.preload['")?
+        b.add_bytes(name)?
+        b.add_str("']")?
+        b.push_result(cx)?
+        return ok(1)
+    }
+    cx.push_str(":preload:")?
+    return ok(2)
+}
+
+// Search `name` along package[pname] (which must be a string).
+fn pkg_find_file(cx: &mut Cx, name: &[u8], pname: &str) -> bool!Throw {
+    cx.get_field(upvalue_index(1), pname)?
+    match cx.to_lstr(-1)? {
+        some(path) => {
+            return pkg_search(cx, name, path.bytes(), b".", mem.str_bytes(pkg_dirsep()))
+        },
+        none => {
+            b := Buffer.new(cx)
+            b.add_str("'package.")?
+            b.add_str(pname)?
+            b.add_str("' must be a string")?
+            return err(cx.error_buffer(&mut b))
+        },
+    }
+}
+
+// Result of a searcher that found file `filename` (on top of the stack):
+// the loader (below it) plus the file name, or the loading error.
+fn pkg_check_load(cx: &mut Cx, loaded: bool, filename: LuaStr) -> i32!Throw {
+    if loaded {
+        cx.push_raw_bytes(filename.as_ptr(), filename.size())?
+        return ok(2)
+    }
+    b := Buffer.new(cx)
+    b.add_str("error loading module '")?
+    match cx.to_lstr(1)? {
+        some(n) => {
+            b.add_bytes(pkg_cstr(n.bytes()))?
+        },
+        none => {},
+    }
+    b.add_str("' from file '")?
+    b.add_bytes(pkg_cstr(filename.bytes()))?
+    b.add_str("':\n\t")?
+    match cx.to_lstr(-1)? {
+        some(m) => {
+            b.add_bytes(pkg_cstr(m.bytes()))?
+        },
+        none => {
+            b.add_str("(null)")?
+        },
+    }
+    return err(cx.error_buffer(&mut b))
+}
+
+// Searcher 2: a Lua file along package.path.
+fn pkg_searcher_lua(cx: &mut Cx) -> i32!Throw {
+    let name = cx.check_lstr(1)?
+    if !pkg_find_file(cx, name.bytes(), "path")? {
+        return ok(1)
+    }
+    let filename = pkg_str_at(cx, -1)?
+    let st = cx.load_file(some(pkg_cstr(filename.bytes())), b"bt")
+    return pkg_check_load(cx, st == OK, filename)
+}
+
+// String view of the value at idx (a string or number; "" otherwise).
+fn pkg_str_at(cx: &mut Cx, idx: i32) -> LuaStr!Throw {
+    match cx.to_lstr(idx)? {
+        some(s) => {
+            return ok(s)
+        },
+        none => {
+            return ok(LuaStr { p: ptr.as_ptr(b""), n: 0 })
+        },
+    }
+}
+
+// Opening a C library always fails here: push the reason.
+fn pkg_load_native(cx: &mut Cx) -> void!Throw {
+    return cx.push_str(PKG_DLL_MSG)
+}
+
+// Searcher 3: a C library along package.cpath.
+fn pkg_searcher_c(cx: &mut Cx) -> i32!Throw {
+    let name = cx.check_lstr(1)?
+    if !pkg_find_file(cx, name.bytes(), "cpath")? {
+        return ok(1)
+    }
+    let filename = pkg_str_at(cx, -1)?
+    pkg_load_native(cx)?
+    return pkg_check_load(cx, false, filename)
+}
+
+// Searcher 4: the C library of the root of a dotted name ("a" for "a.b.c").
+fn pkg_searcher_croot(cx: &mut Cx) -> i32!Throw {
+    let nstr = cx.check_lstr(1)?
+    let name = pkg_cstr(nstr.bytes())
+    dot := name.len
+    for i in 0usize..name.len {
+        if name[i] == b'.' {
+            dot = i
+            break
+        }
+    }
+    if dot == name.len {
+        return ok(0)
+    }
+    if !pkg_find_file(cx, name[0..dot], "cpath")? {
+        return ok(1)
+    }
+    let filename = pkg_str_at(cx, -1)?
+    pkg_load_native(cx)?
+    return pkg_check_load(cx, false, filename)
+}
+
+// Run package.searchers in order until one returns a loader; leaves the
+// loader and its data on the stack, or raises "module 'x' not found:" with
+// every searcher's message.
+fn pkg_find_loader(cx: &mut Cx, name: &[u8]) -> void!Throw {
+    if cx.get_field(upvalue_index(1), "searchers")? != TTABLE {
+        return err(cx.error_msg("'package.searchers' must be a table"))
+    }
+    let searchers = cx.get_top()
+    msg := Buffer.new(cx)
+    i := 1i64
+    for {
+        if cx.raw_get_i(searchers, i) == TNIL {
+            cx.pop(1)
+            b := Buffer.new(cx)
+            b.add_str("module '")?
+            b.add_bytes(name)?
+            b.add_str("' not found:")?
+            b.add_bytes(msg.bytes())?
+            return err(cx.error_buffer(&mut b))
+        }
+        cx.push_bytes(name)?
+        cx.call(1, 2)?
+        if cx.is_function(-2) {
+            return ok()
+        }
+        if cx.is_string(-2) {
+            cx.pop(1)
+            let s = pkg_str_at(cx, -1)?
+            msg.add_str("\n\t")?
+            msg.add_bytes(s.bytes())?
+            cx.pop(1)
+        } else {
+            cx.pop(2)
+        }
+        i += 1
+    }
+}
+
+// require(modname)
+fn pkg_require(cx: &mut Cx) -> i32!Throw {
+    let nstr = cx.check_lstr(1)?
+    let name = pkg_cstr(nstr.bytes())
+    cx.set_top(1)
+    cx.get_field(REGISTRY_INDEX, "_LOADED")?
+    cx.get_field_bytes(2, name)?
+    if cx.to_boolean(-1) {
+        return ok(1)
+    }
+    cx.pop(1)
+    pkg_find_loader(cx, name)?
+    // Stack: 1 name, 2 LOADED, 3 searchers, loader, data.
+    cx.rotate(-2, 1)
+    cx.push_value(1)
+    cx.push_value(-3)
+    cx.call(2, 1)?
+    // Stack: ..., data, result.
+    if !cx.is_nil(-1) {
+        cx.set_field_bytes(2, name)?
+    } else {
+        cx.pop(1)
+    }
+    if cx.get_field_bytes(2, name)? == TNIL {
+        cx.push_boolean(true)
+        cx.copy(-1, -2)
+        cx.set_field_bytes(2, name)?
+    }
+    cx.rotate(-2, 1)
+    return ok(2)
+}
+
+// Set package[field] from the environment variable `envname` (versioned
+// name first), the default `dft`, or both (";;" in the variable stands for
+// the default). Environment variables are ignored when the registry field
+// LUA_NOENV is true (the stand-alone interpreter's -E option).
+fn pkg_set_path(cx: &mut Cx, field: &str, envname: &str, dft: &str) -> void!Throw {
+    vname := Buffer.new(cx)
+    vname.add_str(envname)?
+    vname.add_str("_5_4")?
+    vname.add_char(0)?
+    nm := Buffer.new(cx)
+    nm.add_str(envname)?
+    nm.add_char(0)?
+    cx.get_field(REGISTRY_INDEX, "LUA_NOENV")?
+    let noenv = cx.to_boolean(-1)
+    cx.pop(1)
+    unsafe {
+        p := pkg_getenv(ptr.as_ptr(vname.bytes()))
+        if ptr.is_null(p) {
+            p = pkg_getenv(ptr.as_ptr(nm.bytes()))
+        }
+        if ptr.is_null(p) || noenv {
+            cx.push_str(dft)?
+        } else {
+            let v = ptr.borrow_slice(p, strlen(p), &nm)
+            mark := v.len
+            for i in 0usize..v.len {
+                if i + 1 < v.len && v[i] == b';' && v[i + 1] == b';' {
+                    mark = i
+                    break
+                }
+            }
+            if mark == v.len {
+                cx.push_bytes(v)?
+            } else {
+                b := Buffer.new(cx)
+                if mark > 0 {
+                    b.add_bytes(v[0..mark])?
+                    b.add_char(b';')?
+                }
+                b.add_str(dft)?
+                if mark + 2 < v.len {
+                    b.add_char(b';')?
+                    b.add_bytes(v[mark + 2..v.len])?
+                }
+                b.push_result(cx)?
+            }
+        }
+    }
+    return cx.set_field(-2, field)
+}
+
+// Store `open` as the loader of module `name` in package.preload
+// (registry._PRELOAD, created if needed). See Cx.preload_module.
+fn pkg_preload_module(cx: &mut Cx, name: &[u8], open: NativeFn) -> void!Throw {
+    cx.get_subtable(REGISTRY_INDEX, "_PRELOAD")?
+    cx.push_native(open)?
+    cx.set_field_bytes(-2, name)?
+    cx.pop(1)
+    return ok()
+}
+
+pub fn open_package(cx: &mut Cx) -> i32!Throw {
+    let funcs = [("loadlib", pkg_loadlib), ("searchpath", pkg_searchpath)]
+    cx.new_lib(&funcs)?
+    let pkg = cx.get_top()
+    // Searchers share the package table as upvalue.
+    cx.create_table(4, 0)?
+    let searchers: [4]NativeFn = [pkg_searcher_preload, pkg_searcher_lua, pkg_searcher_c, pkg_searcher_croot]
+    for i in 0usize..4 {
+        cx.push_value(pkg)
+        cx.push_closure(searchers[i], 1)?
+        cx.raw_set_i(-2, (i + 1) as i64)?
+    }
+    cx.set_field(pkg, "searchers")?
+    if pkg_is_windows() {
+        pkg_set_path(cx, "path", "LUA_PATH", PKG_PATH_WIN)?
+        pkg_set_path(cx, "cpath", "LUA_CPATH", PKG_CPATH_WIN)?
+        cx.push_str("\\\n;\n?\n!\n-\n")?
+    } else {
+        pkg_set_path(cx, "path", "LUA_PATH", PKG_PATH_POSIX)?
+        pkg_set_path(cx, "cpath", "LUA_CPATH", PKG_CPATH_POSIX)?
+        cx.push_str("/\n;\n?\n!\n-\n")?
+    }
+    cx.set_field(pkg, "config")?
+    cx.get_subtable(REGISTRY_INDEX, "_LOADED")?
+    cx.set_field(pkg, "loaded")?
+    cx.get_subtable(REGISTRY_INDEX, "_PRELOAD")?
+    cx.set_field(pkg, "preload")?
+    // Global `require`, also with the package table as upvalue.
+    cx.push_global_table()
+    cx.push_value(pkg)
+    let gfuncs = [("require", pkg_require)]
+    cx.set_funcs(&gfuncs, 1)?
+    cx.pop(1)
+    return ok(1)
+}

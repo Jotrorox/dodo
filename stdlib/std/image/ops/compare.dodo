@@ -1,0 +1,300 @@
+package ops
+
+import "std/image/convert"
+import "std/image/pixels"
+import "std/math"
+
+// Image comparison: error statistics, PSNR and SSIM.
+//
+// Both images must have the same size (Malformed otherwise) and may use
+// any layouts: pixels are compared as straight 16-bit RGBA (gray replicated,
+// 8-bit samples times 257, floats clamped to 0.0..1.0), so a gray image and
+// its RGB copy compare equal. Alpha takes part when either image has alpha;
+// premultiplied pixels are compared after division by alpha.
+//
+// Sums are exact integers (128-bit where they could overflow); only the
+// final ratios and logarithms use f64. MSE is reported on the 0..255 scale
+// used for 8-bit images (the 16-bit sum divided by 257^2), PSNR in decibels
+// with peak 255 (equivalently 65535 on the 16-bit scale), infinite for
+// identical images.
+//
+// SSIM follows Wang et al. on BT.709 luma: 8x8 windows every 4 pixels with
+// uniform weights (as x264 and libvpx compute it), K1 = 0.01, K2 = 0.03,
+// dynamic range 65535, averaged over all windows. Images narrower or
+// shorter than 8 pixels use windows as wide or tall as the image. Window
+// sums are integers; identical images give exactly 1.0. Alpha is ignored.
+
+// Per-channel error statistics of two images; see measure().
+pub struct Metrics {
+    pub width: u32
+    pub height: u32
+    // 3, or 4 when either image has alpha.
+    pub channels: usize
+    // Pixels with any channel different.
+    pub different_pixels: u64
+    // Largest difference of any channel, in 16-bit units (257 per 8-bit
+    // step).
+    pub max_difference: u32
+    // Largest difference per channel R, G, B, A.
+    pub max_channel: [4]u32
+    // Sums of squared 16-bit differences per channel, as high and low
+    // 64-bit halves.
+    high: [4]u64
+    low: [4]u64
+
+    fn sum(&self, channel: usize) -> f64 {
+        return self.high[channel] as f64 * 18446744073709551616.0 + self.low[channel] as f64
+    }
+    fn pixels(&self) -> f64 {
+        return self.width as f64 * self.height as f64
+    }
+    // Mean squared error of all compared channels on the 0..255 scale.
+    pub fn mse(&self) -> f64 {
+        total := 0.0
+        for c in 0usize..self.channels {
+            total += self.sum(c)
+        }
+        count := self.pixels() * self.channels as f64
+        if count == 0.0 {
+            return 0.0
+        }
+        return total / count / 66049.0
+    }
+    // Mean squared error of channel 0 (red) to 3 (alpha).
+    pub fn mse_channel(&self, channel: usize) -> f64 {
+        if channel > 3 || self.pixels() == 0.0 {
+            return 0.0
+        }
+        return self.sum(channel) / self.pixels() / 66049.0
+    }
+    // Peak signal-to-noise ratio in dB; infinity when identical.
+    pub fn psnr(&self) -> f64 {
+        return psnr_of(self.mse())
+    }
+    pub fn psnr_channel(&self, channel: usize) -> f64 {
+        return psnr_of(self.mse_channel(channel))
+    }
+    pub fn identical(&self) -> bool {
+        return self.different_pixels == 0
+    }
+}
+
+fn psnr_of(mse: f64) -> f64 {
+    if mse <= 0.0 {
+        return math.infinity()
+    }
+    match math.log10(65025.0 / mse) {
+        ok(value) => {
+            return 10.0 * value
+        }
+        err(_) => {
+            return 0.0
+        }
+    }
+}
+
+fn add_wide(high: &mut[u64], low: &mut[u64], channel: usize, value: u64) {
+    sum := core.wrapping_add(low[channel], value)
+    if sum < low[channel] {
+        high[channel] += 1
+    }
+    low[channel] = sum
+}
+
+// Compare two same-sized images in one pass.
+pub fn measure(a: &pixels.View, b: &pixels.View) -> Metrics!pixels.Error {
+    same_view_size(a, b)?
+    width := a.width()
+    height := a.height()
+    channels := 3usize
+    if a.layout().has_alpha() || b.layout().has_alpha() {
+        channels = 4
+    }
+    result := Metrics { width: width, height: height, channels: channels, different_pixels: 0, max_difference: 0, max_channel: [0u32, 0, 0, 0], high: [0u64, 0, 0, 0], low: [0u64, 0, 0, 0] }
+    layout_a := a.layout().clone()
+    layout_b := b.layout().clone()
+    first := [0u16; 256]
+    second := [0u16; 256]
+    for y in 0u32..height {
+        line_a := a.row(y)
+        line_b := b.row(y)
+        row_sums := [0u64, 0, 0, 0]
+        x := 0usize
+        for x < width as usize {
+            count := width as usize - x
+            if count > BATCH {
+                count = BATCH
+            }
+            convert.load_rgba16(line_a, &layout_a, x, count, &mut first)
+            convert.load_rgba16(line_b, &layout_b, x, count, &mut second)
+            for i in 0usize..count {
+                differs := false
+                for c in 0usize..4 {
+                    va := first[i * 4 + c] as u32
+                    vb := second[i * 4 + c] as u32
+                    d := 0u32
+                    if va > vb {
+                        d = va - vb
+                    } else {
+                        d = vb - va
+                    }
+                    if d != 0 {
+                        differs = true
+                        // Squares of one row fit: 2^24 * 2^32.
+                        row_sums[c] += d as u64 * d as u64
+                        if d > result.max_channel[c] {
+                            result.max_channel[c] = d
+                        }
+                        if d > result.max_difference {
+                            result.max_difference = d
+                        }
+                    }
+                }
+                if differs {
+                    result.different_pixels += 1
+                }
+            }
+            x += count
+        }
+        for c in 0usize..4 {
+            add_wide(&mut result.high, &mut result.low, c, row_sums[c])
+        }
+    }
+    return ok(result)
+}
+
+// Mean squared error on the 0..255 scale over R, G, B (and A when either
+// image has alpha).
+pub fn mse(a: &pixels.View, b: &pixels.View) -> f64!pixels.Error {
+    metrics := measure(a, b)?
+    return ok(metrics.mse())
+}
+
+// PSNR in dB, infinity for identical images.
+pub fn psnr(a: &pixels.View, b: &pixels.View) -> f64!pixels.Error {
+    metrics := measure(a, b)?
+    return ok(metrics.psnr())
+}
+
+// The largest difference of any channel in 16-bit units.
+pub fn max_difference(a: &pixels.View, b: &pixels.View) -> u32!pixels.Error {
+    metrics := measure(a, b)?
+    return ok(metrics.max_difference)
+}
+
+// How many pixels differ in any channel.
+pub fn difference_count(a: &pixels.View, b: &pixels.View) -> u64!pixels.Error {
+    metrics := measure(a, b)?
+    return ok(metrics.different_pixels)
+}
+
+// True when both images have the same size and every pixel matches as
+// straight 16-bit RGBA.
+pub fn equal(a: &pixels.View, b: &pixels.View) -> bool {
+    if a.width() != b.width() || a.height() != b.height() {
+        return false
+    }
+    layout_a := a.layout().clone()
+    layout_b := b.layout().clone()
+    first := [0u16; 256]
+    second := [0u16; 256]
+    width := a.width() as usize
+    for y in 0u32..a.height() {
+        line_a := a.row(y)
+        line_b := b.row(y)
+        x := 0usize
+        for x < width {
+            count := width - x
+            if count > BATCH {
+                count = BATCH
+            }
+            convert.load_rgba16(line_a, &layout_a, x, count, &mut first)
+            convert.load_rgba16(line_b, &layout_b, x, count, &mut second)
+            for i in 0usize..4 * count {
+                if first[i] != second[i] {
+                    return false
+                }
+            }
+            x += count
+        }
+    }
+    return true
+}
+
+// ---------------------------------------------------------------------------
+// SSIM
+
+const SSIM_WINDOW: u32 = 8
+const SSIM_STEP: u32 = 4
+
+// Luma of `count` pixels of row y from pixel x into out[..count].
+fn luma_run(view: &pixels.View, layout: &pixels.Layout, x: u32, y: u32, count: usize, out: &mut[u32]) {
+    wide := [0u16; 32]
+    convert.load_rgba16(view.row(y), layout, x as usize, count, &mut wide)
+    for i in 0usize..count {
+        out[i] = convert.luma16(wide[i * 4] as u32, wide[i * 4 + 1] as u32, wide[i * 4 + 2] as u32)
+    }
+}
+
+// Mean structural similarity of the two images' luma, 1.0 when identical.
+// Empty images give 1.0.
+pub fn ssim(a: &pixels.View, b: &pixels.View) -> f64!pixels.Error {
+    same_view_size(a, b)?
+    width := a.width()
+    height := a.height()
+    if width == 0 || height == 0 {
+        return ok(1.0)
+    }
+    window_width := SSIM_WINDOW
+    if width < window_width {
+        window_width = width
+    }
+    window_height := SSIM_WINDOW
+    if height < window_height {
+        window_height = height
+    }
+    layout_a := a.layout().clone()
+    layout_b := b.layout().clone()
+    n := (window_width * window_height) as f64
+    c1 := 0.01 * 65535.0 * 0.01 * 65535.0 * n * n
+    c2 := 0.03 * 65535.0 * 0.03 * 65535.0 * n * n
+    total := 0.0
+    windows := 0u64
+    luma_a := [0u32; 8]
+    luma_b := [0u32; 8]
+    top := 0u32
+    for top + window_height <= height {
+        left := 0u32
+        for left + window_width <= width {
+            sum_a := 0u64
+            sum_b := 0u64
+            sum_aa := 0u64
+            sum_bb := 0u64
+            sum_ab := 0u64
+            for row in 0u32..window_height {
+                luma_run(a, &layout_a, left, top + row, window_width as usize, &mut luma_a)
+                luma_run(b, &layout_b, left, top + row, window_width as usize, &mut luma_b)
+                for i in 0usize..window_width as usize {
+                    va := luma_a[i] as u64
+                    vb := luma_b[i] as u64
+                    sum_a += va
+                    sum_b += vb
+                    sum_aa += va * va
+                    sum_bb += vb * vb
+                    sum_ab += va * vb
+                }
+            }
+            fa := sum_a as f64
+            fb := sum_b as f64
+            variance := (sum_aa + sum_bb) as f64 * n - fa * fa - fb * fb
+            covariance := sum_ab as f64 * n - fa * fb
+            numerator := (2.0 * fa * fb + c1) * (2.0 * covariance + c2)
+            denominator := (fa * fa + fb * fb + c1) * (variance + c2)
+            total += numerator / denominator
+            windows += 1
+            left += SSIM_STEP
+        }
+        top += SSIM_STEP
+    }
+    return ok(total / windows as f64)
+}

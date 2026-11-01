@@ -1,0 +1,278 @@
+package png
+
+import "core/slice"
+import "std/image/convert"
+import "std/image/pixels"
+import "std/image/shared/binary"
+import "std/image/shared/scratch" as storage
+import "std/image/sink"
+
+// Animated PNG (APNG): acTL announces the frame count, each frame has an
+// fcTL with its region, timing, disposal and blending, and its image data
+// is IDAT (when the default image is frame 0) or the fdAT chunks after the
+// fcTL. fcTL and fdAT share one sequence, checked here.
+//
+// decode_frame() renders frame `index` the way a viewer shows it: frames
+// 0 through index are composited in turn onto a transparent canvas in
+// straight 16-bit RGBA, then the whole canvas is emitted as one Rgba16 rect
+// (the header passed to begin() says so). The canvas and the copy kept for
+// "dispose to previous" live in frame_scratch_size(data) bytes of scratch.
+
+const DISPOSE_NONE: u8 = 0
+const DISPOSE_BACKGROUND: u8 = 1
+const DISPOSE_PREVIOUS: u8 = 2
+const BLEND_SOURCE: u8 = 0
+const BLEND_OVER: u8 = 1
+
+// One frame's control chunk.
+struct Frame {
+    width: u32
+    height: u32
+    x: u32
+    y: u32
+    delay_num: u32
+    delay_den: u32
+    dispose: u8
+    blend: u8
+    // Where its image data starts.
+    input: Input
+}
+
+// Visits the fcTL chunks in file order.
+struct Walker {
+    offset: usize
+    sequence: u32
+    index: u32
+}
+
+fn walker() -> Walker {
+    return Walker { offset: 8, sequence: 0, index: 0 }
+}
+
+// The next frame's control, checking the sequence numbers of every fcTL and
+// fdAT on the way.
+fn next_frame(data: &[u8], png: &Png, walk: &mut Walker) -> Frame!pixels.Error {
+    for {
+        at := walk.offset
+        chunk := read_chunk(data, at)?
+        if chunk.kind == IEND {
+            // Fewer frames than acTL announced.
+            return err(pixels.Error.Malformed)
+        }
+        if chunk.kind == FCTL || chunk.kind == FDAT {
+            if chunk.length < 4 || binary.be32(data, chunk.data)? != walk.sequence {
+                return err(pixels.Error.Malformed)
+            }
+            walk.sequence += 1
+        }
+        walk.offset = chunk.next
+        if chunk.kind == FCTL {
+            if chunk.length != 26 {
+                return err(pixels.Error.Malformed)
+            }
+            p := chunk.data
+            frame := Frame { width: word(data, p + 4), height: word(data, p + 8), x: word(data, p + 12), y: word(data, p + 16), delay_num: (data[p + 20] as u32) << 8 | data[p + 21] as u32, delay_den: (data[p + 22] as u32) << 8 | data[p + 23] as u32, dispose: data[p + 24], blend: data[p + 25], input: image_input(png) }
+            if frame.width == 0 || frame.height == 0 || frame.dispose > 2 || frame.blend > 1 {
+                return err(pixels.Error.Malformed)
+            }
+            if frame.x as u64 + frame.width as u64 > png.width as u64 || frame.y as u64 + frame.height as u64 > png.height as u64 {
+                return err(pixels.Error.Malformed)
+            }
+            if at < png.idat {
+                // The default image is frame 0 and fills the canvas.
+                if walk.index != 0 || frame.x != 0 || frame.y != 0 || frame.width != png.width || frame.height != png.height {
+                    return err(pixels.Error.Malformed)
+                }
+            } else {
+                frame.input = Input { position: 0, end: 0, next: chunk.next, kind: FDAT, sequence: walk.sequence }
+            }
+            walk.index += 1
+            return ok(frame)
+        }
+    }
+}
+
+// Timing of frame `index`: delay_num / delay_den seconds, a zero
+// denominator meaning 100. A still image has one frame of zero duration.
+pub fn frame_info(data: &[u8], index: u32) -> pixels.FrameInfo!pixels.Error {
+    png := parse(data)?
+    if !png.animated {
+        if index != 0 {
+            return err(pixels.Error.Malformed)
+        }
+        return ok(pixels.FrameInfo { numerator: 0, denominator: 1 })
+    }
+    if index >= png.frames {
+        return err(pixels.Error.Malformed)
+    }
+    walk := walker()
+    frame := next_frame(data, &png, &mut walk)?
+    for _ in 0u32..index {
+        frame = next_frame(data, &png, &mut walk)?
+    }
+    denominator := frame.delay_den
+    if denominator == 0 {
+        denominator = 100
+    }
+    return ok(pixels.FrameInfo { numerator: frame.delay_num, denominator: denominator })
+}
+
+fn canvas_bytes(png: &Png) -> usize!pixels.Error {
+    count := binary.pixel_count(png.width, png.height)?
+    return pixels.checked(count, 8, 0)
+}
+
+// Bytes of scratch decode_frame() needs: the rows of scratch_size() plus two
+// 16-bit RGBA canvases. For a still image, scratch_size().
+pub fn frame_scratch_size(data: &[u8]) -> usize!pixels.Error {
+    png := parse(data)?
+    rows := rows_scratch(&png, png.width)?
+    if !png.animated {
+        return ok(rows)
+    }
+    canvas := canvas_bytes(&png)?
+    return pixels.checked(canvas, 2, rows)
+}
+
+// Composites rects of one frame onto the canvas at the frame's offset.
+struct Compose {
+    canvas: &mut[u8]
+    stride: usize
+    x: u32
+    y: u32
+    over: bool
+
+    pub fn begin(&mut self, header: &pixels.Header) -> void!pixels.Error {
+        return ok()
+    }
+    pub fn rect(&mut self, x: u32, y: u32, source: &pixels.View) -> void!pixels.Error {
+        layout := source.layout().clone()
+        width := source.width()
+        wide := [0u16; CHUNK * 4]
+        for r in 0u32..source.height() {
+            line := source.row(r)
+            first := 0u32
+            for first < width {
+                count := width - first
+                if count > CHUNK as u32 {
+                    count = CHUNK as u32
+                }
+                convert.load_rgba16(line, &layout, first as usize, count as usize, &mut wide)
+                row := self.y as usize + y as usize + r as usize
+                base := row * self.stride + (self.x as usize + x as usize + first as usize) * 8
+                if base + count as usize * 8 > self.canvas.len {
+                    return err(pixels.Error.Malformed)
+                }
+                for k in 0usize..count as usize {
+                    put_pixel(self.canvas, base + k * 8, &wide, k * 4, self.over)
+                }
+                first += count
+            }
+        }
+        return ok()
+    }
+}
+
+// Store or blend (APNG_BLEND_OP_OVER, straight alpha) one RGBA16 pixel.
+fn put_pixel(canvas: &mut[u8], o: usize, wide: &[u16], w: usize, over: bool) {
+    sa := wide[w + 3] as u64
+    if !over || sa == 65535 {
+        for k in 0usize..4 {
+            pixels.put16(canvas, o + 2 * k, wide[w + k])
+        }
+        return
+    }
+    if sa == 0 {
+        return
+    }
+    da := pixels.get16(canvas, o + 6) as u64
+    // The destination's share of the result.
+    rest := (da * (65535 - sa) + 32767) / 65535
+    total := sa + rest
+    for k in 0usize..3 {
+        sc := wide[w + k] as u64
+        dc := pixels.get16(canvas, o + 2 * k) as u64
+        value := (sc * sa + dc * rest + total / 2) / total
+        if value > 65535 {
+            value = 65535
+        }
+        pixels.put16(canvas, o + 2 * k, value as u16)
+    }
+    if total > 65535 {
+        total = 65535
+    }
+    pixels.put16(canvas, o + 6, total as u16)
+}
+
+// Set a frame's region of the canvas to transparent black, or copy it
+// between the canvas and the saved copy.
+fn clear_region(canvas: &mut[u8], stride: usize, frame: &Frame) {
+    for r in 0u32..frame.height {
+        start := (frame.y + r) as usize * stride + frame.x as usize * 8
+        for i in start..start + frame.width as usize * 8 {
+            canvas[i] = 0
+        }
+    }
+}
+
+fn copy_region(source: &[u8], target: &mut[u8], stride: usize, frame: &Frame) {
+    for r in 0u32..frame.height {
+        start := (frame.y + r) as usize * stride + frame.x as usize * 8
+        for i in start..start + frame.width as usize * 8 {
+            target[i] = source[i]
+        }
+    }
+}
+
+// Render animation frame `index` (see above) into `output` as one Rgba16
+// rect covering the canvas, using frame_scratch_size(data) bytes of
+// `work`. For a still image, frame 0 is decode().
+pub fn decode_frame<S: sink.Sink>(data: &[u8], index: u32, output: &mut S, work: &mut[u8]) -> void!pixels.Error {
+    png := parse(data)?
+    if !png.animated {
+        if index != 0 {
+            return err(pixels.Error.Malformed)
+        }
+        return decode(data, output, work)
+    }
+    if index >= png.frames {
+        return err(pixels.Error.Malformed)
+    }
+    rows := rows_scratch(&png, png.width)?
+    size := canvas_bytes(&png)?
+    if work.len < pixels.checked(size, 2, rows)? {
+        return err(pixels.Error.BufferTooSmall)
+    }
+    let slice.SplitMut { left: row_part, right: rest } = storage.split(work, rows)?
+    let slice.SplitMut { left: canvas, right: saved } = storage.split(rest, size)?
+    for i in 0usize..size {
+        canvas[i] = 0
+    }
+    stride := png.width as usize * 8
+    walk := walker()
+    for j in 0u32..index + 1 {
+        frame := next_frame(data, &png, &mut walk)?
+        dispose := frame.dispose
+        if j == 0 && dispose == DISPOSE_PREVIOUS {
+            dispose = DISPOSE_BACKGROUND
+        }
+        if j < index && dispose == DISPOSE_PREVIOUS {
+            copy_region(canvas, saved, stride, &frame)
+        }
+        compose := Compose { canvas: &mut canvas[..], stride: stride, x: frame.x, y: frame.y, over: frame.blend == BLEND_OVER && j > 0 }
+        decode_image(data, &png, frame.width, frame.height, frame.input.clone(), &mut compose, row_part)?
+        if j < index {
+            if dispose == DISPOSE_BACKGROUND {
+                clear_region(canvas, stride, &frame)
+            } else if dispose == DISPOSE_PREVIOUS {
+                copy_region(saved, canvas, stride, &frame)
+            }
+        }
+    }
+    find_late_exif(data, &mut png)
+    header := header_of(data, &png)
+    header.native = pixels.Layout.rgba16()
+    output.begin(&header)?
+    view := pixels.View.new(&canvas[..size], png.width, png.height, pixels.Layout.rgba16())?
+    return output.rect(0, 0, &view)
+}

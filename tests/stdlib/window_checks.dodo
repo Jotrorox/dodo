@@ -6,7 +6,8 @@ import "std/window/raw"
 import "std/window/x11"
 
 // Portable checks for std/window: the X11 protocol encoders and parsers,
-// keysym translation and the public key tables. No window system is needed.
+// keysym translation, the public key tables and the clipboard's selection
+// requests. No window system is needed.
 
 fn put16(out: &mut[u8], offset: usize, value: u32) {
     out[offset] = (value & 0xff) as u8
@@ -348,10 +349,131 @@ fn keys() {
     assert_eq(raw.QUIT, 11u32)
 }
 
+// The requests behind the clipboard, cursor shapes, size limits and
+// fullscreen.
+fn desktop_requests() {
+    out := [0u8; 128]
+
+    // Append mode builds a property larger than one request.
+    assert_eq(x11.change_property_mode(&mut out, x11.PROPERTY_APPEND, 7, 300, 301, 8, mem.str_bytes("abcde")), 32usize)
+    assert_eq(out[0], 18u8)
+    assert_eq(out[1], 2u8)
+    assert_eq(x11.u32_at(&out, 20), 5u32)
+    assert_eq(out[28], 101u8)
+    assert_eq(out[29], 0u8)
+    assert_eq(x11.change_property_mode(&mut out, 1, 7, 300, 301, 8, mem.str_bytes("a")), 0usize)
+    // 32-bit data must be whole elements.
+    assert_eq(x11.change_property(&mut out, 7, 300, x11.ATOM_ATOM, 32, mem.str_bytes("abc")), 0usize)
+
+    assert_eq(x11.get_property(&mut out, true, 7, 300, x11.ATOM_NONE, 2, 65280), 24usize)
+    assert_eq(out[0], 20u8)
+    assert_eq(out[1], 1u8)
+    assert_eq(x11.u16_at(&out, 2), 6u32)
+    assert_eq(x11.u32_at(&out, 4), 7u32)
+    assert_eq(x11.u32_at(&out, 8), 300u32)
+    assert_eq(x11.u32_at(&out, 12), 0u32)
+    assert_eq(x11.u32_at(&out, 16), 2u32)
+    assert_eq(x11.u32_at(&out, 20), 65280u32)
+    assert_eq(x11.delete_property(&mut out, 7, 300), 12usize)
+    assert_eq(out[0], 19u8)
+    assert_eq(x11.u16_at(&out, 2), 3u32)
+
+    assert_eq(x11.set_selection_owner(&mut out, 9, 302, 1234), 16usize)
+    assert_eq(out[0], 22u8)
+    assert_eq(x11.u32_at(&out, 4), 9u32)
+    assert_eq(x11.u32_at(&out, 8), 302u32)
+    assert_eq(x11.u32_at(&out, 12), 1234u32)
+    assert_eq(x11.get_selection_owner(&mut out, 302), 8usize)
+    assert_eq(out[0], 23u8)
+    assert_eq(x11.convert_selection(&mut out, 9, 302, 303, 304, 0), 24usize)
+    assert_eq(out[0], 24u8)
+    assert_eq(x11.u16_at(&out, 2), 6u32)
+    assert_eq(x11.u32_at(&out, 12), 303u32)
+    assert_eq(x11.u32_at(&out, 16), 304u32)
+
+    // The answer to a paste, sent to the requestor with SendEvent.
+    event := [0u8; 32]
+    assert_eq(x11.selection_notify(&mut event, 55, 9, 302, 303, 0), 32usize)
+    assert_eq(event[0], x11.SELECTION_NOTIFY)
+    assert_eq(x11.u32_at(&event, 4), 55u32)
+    assert_eq(x11.u32_at(&event, 8), 9u32)
+    assert_eq(x11.u32_at(&event, 20), 0u32)
+    assert_eq(x11.send_event(&mut out, false, 9, 0, &event), 44usize)
+    assert_eq(out[0], 25u8)
+    assert_eq(out[1], 0u8)
+    assert_eq(x11.u16_at(&out, 2), 11u32)
+    assert_eq(x11.u32_at(&out, 4), 9u32)
+    assert_eq(out[12], x11.SELECTION_NOTIFY)
+    assert_eq(x11.u32_at(&out, 16), 55u32)
+    assert_eq(x11.send_event(&mut out, false, 9, 0, &event[..16]), 0usize)
+
+    // _NET_WM_STATE: add the fullscreen state, from a normal application.
+    data := [1u32, 400, 0, 1, 0]
+    assert_eq(x11.client_message(&mut event, 7, 401, &data), 32usize)
+    assert_eq(event[0], x11.CLIENT_MESSAGE)
+    assert_eq(event[1], 32u8)
+    assert_eq(x11.u32_at(&event, 4), 7u32)
+    assert_eq(x11.u32_at(&event, 8), 401u32)
+    assert_eq(x11.u32_at(&event, 12), 1u32)
+    assert_eq(x11.u32_at(&event, 16), 400u32)
+    assert_eq(x11.u32_at(&event, 24), 1u32)
+
+    sizes := [640u32, 480]
+    assert_eq(x11.configure_window(&mut out, 7, x11.CONFIGURE_WIDTH | x11.CONFIGURE_HEIGHT, &sizes), 20usize)
+    assert_eq(out[0], 12u8)
+    assert_eq(x11.u16_at(&out, 2), 5u32)
+    assert_eq(x11.u16_at(&out, 8), 12u32)
+    assert_eq(x11.u32_at(&out, 12), 640u32)
+    assert_eq(x11.u32_at(&out, 16), 480u32)
+    // One value per mask bit.
+    assert_eq(x11.configure_window(&mut out, 7, x11.CONFIGURE_X | x11.CONFIGURE_WIDTH | x11.CONFIGURE_HEIGHT, &sizes), 0usize)
+    screen := [0u32, 0, 1920, 1080, x11.STACK_ABOVE]
+    assert_eq(x11.configure_window(&mut out, 7, 0x4f, &screen), 32usize)
+
+    // Size hints: a 0 dimension is unlimited, 0 everywhere is no hint.
+    assert_eq(x11.size_hints(&mut out, 200, 0, 0, 300), 72usize)
+    assert_eq(x11.u32_at(&out, 0), 48u32)
+    assert_eq(x11.u32_at(&out, 20), 200u32)
+    assert_eq(x11.u32_at(&out, 24), 0u32)
+    assert_eq(x11.u32_at(&out, 28), 32767u32)
+    assert_eq(x11.u32_at(&out, 32), 300u32)
+    assert_eq(x11.size_hints(&mut out, 0, 0, 800, 600), 72usize)
+    assert_eq(x11.u32_at(&out, 0), 32u32)
+    assert_eq(x11.size_hints(&mut out, 0, 0, 0, 0), 72usize)
+    assert_eq(x11.u32_at(&out, 0), 0u32)
+    assert_eq(x11.u32_at(&out, 28), 0u32)
+
+    assert_eq(x11.open_font(&mut out, 11, mem.str_bytes("cursor")), 20usize)
+    assert_eq(out[0], 45u8)
+    assert_eq(x11.u16_at(&out, 2), 5u32)
+    assert_eq(x11.u16_at(&out, 8), 6u32)
+    assert_eq(out[12], 99u8)
+    assert_eq(out[18], 0u8)
+    assert_eq(x11.create_glyph_cursor(&mut out, 12, 11, x11.cursor_glyph(raw.CURSOR_TEXT)), 32usize)
+    assert_eq(out[0], 94u8)
+    assert_eq(x11.u32_at(&out, 8), 11u32)
+    assert_eq(x11.u32_at(&out, 12), 11u32)
+    assert_eq(x11.u16_at(&out, 16), 152u32)
+    assert_eq(x11.u16_at(&out, 18), 153u32)
+    // Black on white.
+    assert_eq(x11.u16_at(&out, 20), 0u32)
+    assert_eq(x11.u16_at(&out, 26), 0xffffu32)
+    assert_eq(x11.u16_at(&out, 30), 0xffffu32)
+    // Every shape has a glyph with a mask glyph after it.
+    for shape in 0u32..raw.CURSORS {
+        glyph := x11.cursor_glyph(shape)
+        assert(glyph < 154 && glyph % 2 == 0)
+    }
+    assert_eq(x11.cursor_glyph(raw.CURSOR_HAND), 60u32)
+    assert_eq(x11.cursor_glyph(raw.CURSOR_RESIZE_EW), 108u32)
+    assert_eq(x11.cursor_glyph(99), 68u32)
+}
+
 fn main() {
     setup_request()
     setup_parsing()
     requests()
+    desktop_requests()
     messages()
     keysyms()
     keys()

@@ -5,6 +5,8 @@
 //!
 //! The chip's low-power RISC-V core and its radios (Wi-Fi 6, Bluetooth LE,
 //! IEEE 802.15.4) are not used.
+use std::borrow::Cow;
+
 use super::{
     Chip, ImageFormat, InterruptAbi, Platform, Region, esp_flash::DownloadFlag, image::Segment,
     serial::UsbId,
@@ -24,12 +26,14 @@ pub static CHIP: Chip = Chip {
         origin: 0x4080_0000,
         length: 0x7_E610,
     },
-    runtime: concat!(
-        include_str!("esp32c6/runtime.ll"),
-        include_str!("arm_eabi.ll"),
-        include_str!("arm_float.ll"),
-        include_str!("arm_float_soft.ll")
-    ),
+    runtime: || {
+        Cow::Borrowed(concat!(
+            include_str!("esp32c6/runtime.ll"),
+            include_str!("arm_eabi.ll"),
+            include_str!("arm_float.ll"),
+            include_str!("arm_float_soft.ll")
+        ))
+    },
     linker_script: include_str!("esp32c6/link.ld"),
     panic_hook: "dodo_board_panic",
     interrupts: &[
@@ -114,6 +118,7 @@ pub static CHIP: Chip = Chip {
         "ECC",
     ],
     interrupt_abi: InterruptAbi::Dispatched,
+    opt_level: 0,
     linker: "ld.lld",
     package: "std/embedded/chip/esp32c6",
     image: ImageFormat::EspFlash {

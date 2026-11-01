@@ -1,0 +1,236 @@
+package main
+
+// Minimal SQL shell used by the differential tests: runs every statement of
+// a script against a database and prints each result row as values joined
+// by "|" (NULL, integers, SQLite-formatted reals, raw text, x'..' blobs).
+// Errors print "ERROR: <message>". Usage: shell <database> <script>
+
+import "std/console"
+import "std/db"
+import "std/db/sqlite"
+import "std/env"
+import "std/fs"
+import "std/thread"
+import "std/io"
+import "std/platform"
+import "std/text"
+import "core/mem"
+
+static mut WORKSPACE: [8388608]u8 = [0u8; 8388608]
+static mut SCRIPT: [4194304]u8 = [0u8; 4194304]
+
+fn hex(b: u8) -> u8 {
+    if b < 10 {
+        48 + b
+    } else {
+        55 + b
+    }
+}
+
+fn print_value(out: &mut console.Output, row: &sqlite.Row, i: usize) -> void!io.Error {
+    match row.value_type(i) {
+        db.ValueType.Null => {
+            out.write(b"NULL")?
+        },
+        db.ValueType.Bytes => {
+            out.write(b"x'")?
+            bytes := row.bytes(i)
+            for &b in bytes {
+                pair := [hex(b >> 4), hex(b & 15)]
+                out.write(&pair)?
+            }
+            out.write(b"'")?
+        },
+        db.ValueType.Text => {
+            out.write(row.bytes(i))?
+        },
+        _ => {
+            buf := [0u8; 64]
+            match row.text_into(i, &mut buf) {
+                some(n) => {
+                    out.write(&buf[..n])?
+                },
+                none => {},
+            }
+        },
+    }
+    ok()
+}
+
+fn run(db_path: &str, script: &[u8]) -> i32 {
+    out := console.stdout()
+    ws := unsafe {
+        &mut WORKSPACE[..]
+    }
+    conn := match sqlite.Connection.open(db_path, ws) {
+        ok(c) => c,
+        err(_) => {
+            match out.println("ERROR: cannot open") {
+                ok(_) => {},
+                err(_) => {},
+            }
+            return 1
+        },
+    }
+    text := match core_str(script) {
+        some(t) => t,
+        none => {
+            return 2
+        },
+    }
+    rest := text
+    for {
+        n := match conn.statement_length(rest) {
+            ok(v) => v,
+            err(_) => {
+                match out.println("ERROR: split") {
+                    ok(_) => {},
+                    err(_) => {},
+                }
+                return 3
+            },
+        }
+        if n == 0 {
+            break
+        }
+        stmt := slice_str(rest, 0, n)
+        rest = slice_str(rest, n, rest.len)
+        none_: [0]db.Value = []
+        match conn.select(stmt, &none_) {
+            ok(rows) => {
+                failed := false
+                for {
+                    match rows.next() {
+                        ok(some(row)) => {
+                            // Test hooks: "__crash__" aborts without closing the
+                            // database (leaving any journal hot); "__sleep__", n
+                            // pauses n milliseconds while locks are held.
+                            if row.len() > 0 && same(row.text(0), "__crash__") {
+                                core.assert(false)
+                            }
+                            if row.len() > 1 && same(row.text(0), "__sleep__") {
+                                thread.sleep_ms(row.int(1) as u32)
+                            }
+                            for i in 0usize..row.len() {
+                                if i > 0 {
+                                    match out.write(b"|") {
+                                        ok(_) => {},
+                                        err(_) => {},
+                                    }
+                                }
+                                match print_value(&mut out, &row, i) {
+                                    ok() => {},
+                                    err(_) => {},
+                                }
+                            }
+                            match out.write(b"\n") {
+                                ok(_) => {},
+                                err(_) => {},
+                            }
+                        },
+                        ok(none) => {
+                            break
+                        },
+                        err(_) => {
+                            failed = true
+                            break
+                        },
+                    }
+                }
+                core.drop(rows)
+                if failed {
+                    match out.print("ERROR: ") {
+                        ok(_) => {},
+                        err(_) => {},
+                    }
+                    match out.println(conn.message()) {
+                        ok(_) => {},
+                        err(_) => {},
+                    }
+                }
+            },
+            err(_) => {
+                match out.print("ERROR: ") {
+                    ok(_) => {},
+                    err(_) => {},
+                }
+                match out.println(conn.message()) {
+                    ok(_) => {},
+                    err(_) => {},
+                }
+            },
+        }
+    }
+    match conn.close() {
+        ok() => {},
+        err(_) => {
+            return 4
+        },
+    }
+    0
+}
+
+fn same(a: &str, b: &str) -> bool {
+    x := mem.str_bytes(a)
+    y := mem.str_bytes(b)
+    if x.len != y.len {
+        return false
+    }
+    for i in 0usize..x.len {
+        if x[i] != y[i] {
+            return false
+        }
+    }
+    true
+}
+
+fn core_str(b: &[u8]) -> Option<&str> {
+    match text_validate(b) {
+        true => some(unsafe {
+            mem.str_from_utf8(b)
+        }),
+        false => none,
+    }
+}
+
+fn slice_str(s: &str, a: usize, b: usize) -> &str {
+    bytes := mem.str_bytes(s)
+    unsafe {
+        mem.str_from_utf8(&bytes[a..b])
+    }
+}
+
+fn text_validate(b: &[u8]) -> bool {
+    match text.validate(b) {
+        ok() => true,
+        err(_) => false,
+    }
+}
+
+fn main() -> i32 {
+    storage := platform.list_workspace()
+    args := env.Arguments.capture(&mut storage, platform.TextPolicy.Strict)!
+    path_buf := [0u8; 4096]
+    script_buf := [0u8; 4096]
+    db_path := match args.get(1, &mut path_buf)! {
+        some(p) => p,
+        none => {
+            return 64
+        },
+    }
+    script_path := match args.get(2, &mut script_buf)! {
+        some(p) => p,
+        none => {
+            return 64
+        },
+    }
+    pws := platform.workspace()
+    data := unsafe {
+        &mut SCRIPT[..]
+    }
+    report := fs.read_file(script_path, data, &mut pws)!
+    n := report.read
+    run(db_path, unsafe {
+        &SCRIPT[..n]
+    })
+}

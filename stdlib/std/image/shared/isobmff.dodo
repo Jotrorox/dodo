@@ -1,0 +1,133 @@
+package isobmff
+
+import "std/image/pixels"
+import "std/image/shared/binary"
+
+// Boxes of the ISO base media file format (ISO/IEC 14496-12), the container
+// of JPEG XL, AVIF and HEIF files, read in place from a byte slice.
+//
+// A box starts with a 32-bit big-endian size and a four-character type. Size
+// 1 means a 64-bit size follows the type; size 0 means the box extends to the
+// end of the enclosing data. Type "uuid" is followed by a 16-byte extended
+// type, which is part of the header here. Iterate the top level of a file
+// with Boxes.new(data), and the children of a container box with
+// Boxes.within(data, box.offset, box.length):
+//
+//     boxes := isobmff.Boxes.new(data)
+//     for {
+//         match boxes.next() {
+//             ok(some(b)) => { if b.kind == isobmff.fourcc(b'f', b't', b'y', b'p') { ... } },
+//             ok(none) => { break },
+//             err(e) => { return err(e) },
+//         }
+//     }
+
+// One box: its header at `start` and its payload at data[offset..offset +
+// length].
+pub struct Box {
+    pub start: usize
+    pub offset: usize
+    pub length: usize
+    // The four-character type, first character in the high byte.
+    pub kind: u32
+    // The size field was 0: the payload runs to the end of the data.
+    pub open_ended: bool
+
+    // The offset just past the payload, where the next sibling starts.
+    pub fn end(&self) -> usize {
+        return self.offset + self.length
+    }
+    pub fn clone(&self) -> Box {
+        return Box { start: self.start, offset: self.offset, length: self.length, kind: self.kind, open_ended: self.open_ended }
+    }
+}
+
+// A four-character code as compared with Box.kind.
+pub fn fourcc(a: u8, b: u8, c: u8, d: u8) -> u32 {
+    return ((a as u32) << 24) | ((b as u32) << 16) | ((c as u32) << 8) | (d as u32)
+}
+
+// The box whose header starts at `offset` within data[..end], or none when
+// offset == end. A header or payload running past `end` fails with
+// Truncated.
+pub fn read_box(data: &[u8], offset: usize, end: usize) -> Option<Box>!pixels.Error {
+    if end > data.len || offset > end {
+        return err(pixels.Error.Truncated)
+    }
+    if offset == end {
+        return ok(none)
+    }
+    if end - offset < 8 {
+        return err(pixels.Error.Truncated)
+    }
+    size := binary.be32(data, offset)? as u64
+    kind := binary.be32(data, offset + 4)?
+    header := 8usize
+    open_ended := false
+    if size == 1 {
+        if end - offset < 16 {
+            return err(pixels.Error.Truncated)
+        }
+        size = binary.be64(data, offset + 8)?
+        header = 16
+    } else if size == 0 {
+        open_ended = true
+        size = (end - offset) as u64
+    }
+    if kind == fourcc(b'u', b'u', b'i', b'd') {
+        header += 16
+    }
+    if size < header as u64 {
+        return err(pixels.Error.Malformed)
+    }
+    if size > (end - offset) as u64 {
+        return err(pixels.Error.Truncated)
+    }
+    total := size as usize
+    return ok(some(Box { start: offset, offset: offset + header, length: total - header, kind: kind, open_ended: open_ended }))
+}
+
+// Iterates the boxes of data[offset..end] in order.
+pub struct Boxes {
+    data: &[u8]
+    offset: usize
+    end: usize
+    failed: bool
+
+    // The top-level boxes of a file.
+    pub fn new(data: &[u8]) -> Boxes from(data) {
+        return Boxes { data: data, offset: 0, end: data.len, failed: false }
+    }
+    // The boxes inside data[offset..offset + length], such as a container
+    // box's payload. A range outside the data yields Truncated.
+    pub fn within(data: &[u8], offset: usize, length: usize) -> Boxes from(data) {
+        if offset > data.len || length > data.len - offset {
+            return Boxes { data: data, offset: 0, end: 0, failed: true }
+        }
+        return Boxes { data: data, offset: offset, end: offset + length, failed: false }
+    }
+    // The next box, none after the last one. After an error every call
+    // fails again.
+    pub fn next(&mut self) -> Option<Box>!pixels.Error {
+        if self.failed {
+            return err(pixels.Error.Truncated)
+        }
+        match read_box(self.data, self.offset, self.end) {
+            ok(some(b)) => {
+                self.offset = b.end()
+                return ok(some(b))
+            }
+            ok(none) => {
+                return ok(none)
+            }
+            err(e) => {
+                self.failed = true
+                return err(e)
+            }
+        }
+    }
+    // Where the next box would start.
+    pub fn position(&self) -> usize {
+        return self.offset
+    }
+}

@@ -1,0 +1,4 @@
+--! cmd: -e "print('-e runs before the script is opened')" no_such_script_cli.lua a b
+-- A script file that does not exist: lua.c reports "lua: cannot open
+-- no_such_script_cli.lua" and exits with status 1 (after earlier -e
+-- options have run).
