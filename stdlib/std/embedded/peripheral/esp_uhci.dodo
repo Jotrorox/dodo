@@ -1,0 +1,424 @@
+package esp_uhci
+
+import "std/embedded/chip/esp_gdma"
+import "std/embedded/hal"
+import "std/embedded/hal/serial"
+import "std/embedded/peripheral/esp_uart"
+import "std/io"
+
+// Serial ports that receive by DMA on the ESP32-C6. Its UARTs have no DMA
+// interface of their own: UHCI0, the host controller interface, sits
+// between a UART and the general DMA controller (GDMA, peripheral UHCI0)
+// and moves what the UART receives into memory. UHCI was made to frame
+// packets (SLIP separators, a header, CRC, escapes for flow control
+// characters); a DmaPort turns all of that off, so bytes arrive unchanged.
+// The chip package hands one out as `esp32c6.UartDma` from `Uart.dma`.
+//
+// Receiving. A receive channel follows an esp_gdma.InRing over the ring
+// buffer: RING_PARTS parts of the same size linked into a loop. UHCI ends a
+// "packet", which closes the part being filled, when the line has been
+// idle for IDLE_BITS bit times after a byte (UHCI_UART_IDLE_EOF_EN with the
+// UART's RX_IDLE_THRHD) or when a part's worth of bytes arrived without a
+// pause (UHCI_LEN_EOF_EN with PKT_THRES); a full part closes anyway. Bytes
+// become readable once their part closes, so a message is readable 3 bytes'
+// time after its last byte. Each pause closes a part, so the ring holds at
+// most RING_PARTS messages, however short. The channel never overwrites a
+// part the program has not read: when the ring is full it stops, the
+// UART's 128-byte FIFO fills behind it, and later bytes are lost. A read
+// returns everything the ring held first, then reports OVERRUN, and
+// reception starts again with the bytes that follow. The UART drops bytes
+// with framing or parity errors and breaks (as esp_uart.Controller does),
+// and a read reports them, with the error bits of esp_uart, after the bytes
+// it returns.
+//
+// Sending goes through the UART's 128-byte transmit FIFO, as on
+// esp_uart.Controller: a write waits only while the FIFO is full. UHCI's
+// transmit side (its "encoder", GDMA to UART) does not work on the
+// ESP32-C6 as tested on an ESP32-C6-DevKitC-1: linked to either UART, with
+// framing on or off, it writes the first byte of a transfer into the UART's
+// FIFO over and over and never takes the next from the channel, and its
+// own short-packet send (REG_Q) never ends either; ESP-IDF's register
+// sequence behaves the same there. So a DmaPort keeps UHCI's transmit side
+// idle.
+//
+// The port works over any hal.Registers spanning the chip's address space:
+// the UART's, UHCI0's, and GDMA's registers at their bus addresses
+// (esp32c6 passes a hal.RegisterBlock at 0; a desktop test, a model of the
+// three). Register names follow the ESP32-C6 technical reference manual
+// (UART Controller, UHCI).
+
+pub const UHCI0_BASE: usize = 0x6000_5000
+
+const CONF0: usize = 0x00
+const INT_ENA: usize = 0x0C
+const INT_CLR: usize = 0x10
+const CONF1: usize = 0x14
+const ESCAPE_CONF: usize = 0x20
+const HUNG_CONF: usize = 0x24
+const PKT_THRES: usize = 0x7C
+// CONF0. UHCI's "decoder" turns what the UART receives into DMA data, its
+// "encoder" DMA data into what the UART sends; the reset bits are named the
+// other way round in the manual (TX_RST resets the decoder). Then the UART
+// it serves, the framing (separators, header, CRC), the packet ends, and
+// the register clock.
+const DECODER_RESET: u32 = 1 << 0
+const ENCODER_RESET: u32 = 1 << 1
+const UART0_CE: u32 = 1 << 2
+const IDLE_EOF: u32 = 1 << 8
+const LENGTH_EOF: u32 = 1 << 9
+const REGISTER_CLOCK: u32 = 1 << 11
+const ALL_INTERRUPTS: u32 = 0x1FF
+
+// The UART's registers, as in esp_uart.
+const UART_FIFO: usize = 0x00
+const UART_INT_RAW: usize = 0x04
+const UART_INT_ST: usize = 0x08
+const UART_INT_ENA: usize = 0x0C
+const UART_INT_CLR: usize = 0x10
+const UART_STATUS: usize = 0x1C
+const UART_IDLE_CONF: usize = 0x48
+const UART_FSM_STATUS: usize = 0x70
+const UART_REG_UPDATE: usize = 0x98
+const TX_COUNT: u32 = 0xFF << 16
+const TX_STATE: u32 = 0xF << 4
+// IDLE_CONF: RX_IDLE_THRHD, the bit times after a byte that end a packet.
+const RX_IDLE_THRESHOLD: u32 = 0x3FF
+pub const IDLE_BITS: u32 = 30
+const PARITY_INTERRUPT: u32 = 1 << 2
+const FRAMING_INTERRUPT: u32 = 1 << 3
+const OVERFLOW_INTERRUPT: u32 = 1 << 4
+const BREAK_INTERRUPT: u32 = 1 << 7
+const RECEIVE_ERRORS: u32 = PARITY_INTERRUPT | FRAMING_INTERRUPT | OVERFLOW_INTERRUPT | BREAK_INTERRUPT
+const ALL_UART_INTERRUPTS: u32 = 0xF_FFFF
+const UPDATE_POLLS: u32 = 100_000
+
+// The parts of the receive ring: the chip package's descriptor storage
+// holds this many.
+pub const RING_PARTS: usize = 32
+// The smallest ring buffer: a word per part.
+pub const MIN_RING: usize = 4 * RING_PARTS + 3
+
+const LINE_FEED: u8 = 10
+const CARRIAGE_RETURN: u8 = 13
+
+// A serial port that receives into a ring buffer by DMA through UHCI0, from
+// `open`. It implements the std/io Reader and Writer protocols, serial.Port,
+// and serial.PollPort like esp_uart.Controller; see above for how input
+// reaches the ring. Dropping it stops the channel and disconnects UHCI0
+// from the UART; input still in the ring is lost.
+pub struct DmaPort<R: hal.Registers>: serial.Port + serial.PollPort {
+    bus: R
+    uart: usize
+    uhci: usize
+    ring: esp_gdma.InRing
+    poll_limit: u32
+    read_poll_limit: u32
+    crlf: bool
+    after_return: bool
+    feed_pending: bool
+    // The UART's IDLE_CONF before the port changed it.
+    idle_conf: u32
+    stopped: bool
+
+    // Take over UART `number` (0 or 1) with registers at `uart`, through
+    // UHCI0 at `uhci`: receive into `ring` by GDMA channel `rx`, whose
+    // descriptors (3 words each, RING_PARTS of them) are `descriptors`.
+    // `crlf`, `poll_limit`, and `read_poll_limit` carry over the port's
+    // settings (esp_uart.Controller.dma_settings). The caller has claimed
+    // UHCI0 and the channel, started UHCI0's clock, and checked that the
+    // ring is in SRAM. InvalidInput for another UART, a ring buffer shorter
+    // than MIN_RING, or too few descriptors.
+    pub fn open(bus: R, uart: usize, uhci: usize, number: u32, rx: u32, descriptors: &mut[u32], ring: &mut[u8], crlf: bool, poll_limit: u32, read_poll_limit: u32) -> DmaPort<R>!hal.Error from(descriptors, ring) {
+        if number > 1 || ring.len < MIN_RING {
+            return err(hal.Error.InvalidInput)
+        }
+        receive := esp_gdma.InRing.new(rx, esp_gdma.PERIPHERAL_UHCI0, descriptors, ring)?
+        port := DmaPort<R> {
+            bus,
+            uart,
+            uhci,
+            ring: receive,
+            poll_limit,
+            read_poll_limit,
+            crlf,
+            after_return: false,
+            feed_pending: false,
+            idle_conf: 0,
+            stopped: false,
+        }
+        port.idle_conf = port.bus.read(uart + UART_IDLE_CONF)
+        port.bus.write(uart + UART_IDLE_CONF, (port.idle_conf & ~RX_IDLE_THRESHOLD) | IDLE_BITS)
+        port.update()
+        port.bus.write(uart + UART_INT_CLR, RECEIVE_ERRORS)
+        // Raw bytes: no separators, header, CRC, checksums, sequence
+        // numbers, or escapes, and no hung-transfer timeouts.
+        port.bus.write(uhci + CONF0, REGISTER_CLOCK | DECODER_RESET | ENCODER_RESET)
+        port.bus.write(uhci + CONF0, REGISTER_CLOCK)
+        port.bus.write(uhci + CONF1, 0)
+        port.bus.write(uhci + ESCAPE_CONF, 0)
+        port.bus.write(uhci + HUNG_CONF, 0)
+        port.bus.write(uhci + PKT_THRES, port.ring.part_size() as u32)
+        port.bus.write(uhci + INT_ENA, 0)
+        port.bus.write(uhci + INT_CLR, ALL_INTERRUPTS)
+        port.ring.start(&mut port.bus)
+        port.bus.write(uhci + CONF0, REGISTER_CLOCK | (UART0_CE << number) | IDLE_EOF | LENGTH_EOF)
+        return ok(port)
+    }
+
+    // The ring's size in bytes: how much input waits for the program.
+    pub fn ring_size(&self) -> usize {
+        return self.ring.ring_size()
+    }
+
+    // The bytes received and readable now, up to the ring's size.
+    pub fn available(&mut self) -> usize {
+        return self.ring.available()
+    }
+
+    // Wait for the first byte, then return what has arrived, up to
+    // `buffer.len`; errors as for `poll_read`. The read poll limit bounds
+    // the wait as on esp_uart.Controller.
+    pub fn read(&mut self, buffer: &mut[u8]) -> usize!io.Error {
+        polls := 0u32
+        for {
+            progress := self.poll_read(buffer)?
+            if progress.transferred != 0 || buffer.len == 0 {
+                return ok(progress.transferred)
+            }
+            polls += 1
+            if self.read_poll_limit != esp_uart.NO_POLL_LIMIT && polls >= self.read_poll_limit {
+                return err(io.failure(io.ErrorKind.TimedOut, 0))
+            }
+        }
+    }
+
+    // Return what the ring holds, up to `buffer.len`, without waiting:
+    // Pending, with nothing, while it is empty. An error has kind Other and
+    // the bits of esp_uart.FRAMING_ERROR, PARITY_ERROR, BREAK, and OVERRUN in
+    // its code, after the bytes before it in buffer[..transferred]; OVERRUN
+    // here means the ring filled up and later bytes were lost.
+    pub fn poll_read(&mut self, buffer: &mut[u8]) -> io.Poll!io.Error {
+        count := 0usize
+        for count < buffer.len {
+            taken := self.ring.read(&mut buffer[count..])
+            if taken == 0 {
+                break
+            }
+            count += self.translate(buffer, count, taken)
+        }
+        if self.ring.available() == 0 && self.ring.stalled(&mut self.bus) {
+            self.restart_receiver()
+            self.after_return = false
+            self.bus.write(self.uart + UART_INT_CLR, RECEIVE_ERRORS)
+            return err(io.Error { kind: io.ErrorKind.Other, transferred: count, code: esp_uart.OVERRUN })
+        }
+        raw := self.bus.read(self.uart + UART_INT_RAW)
+        errors := 0i32
+        if (raw & FRAMING_INTERRUPT) != 0 {
+            errors |= esp_uart.FRAMING_ERROR
+        }
+        if (raw & PARITY_INTERRUPT) != 0 {
+            errors |= esp_uart.PARITY_ERROR
+        }
+        if (raw & BREAK_INTERRUPT) != 0 {
+            errors |= esp_uart.BREAK
+        }
+        if (raw & OVERFLOW_INTERRUPT) != 0 {
+            errors |= esp_uart.OVERRUN
+        }
+        if errors != 0 {
+            self.bus.write(self.uart + UART_INT_CLR, RECEIVE_ERRORS)
+            self.after_return = false
+            return err(io.Error { kind: io.ErrorKind.Other, transferred: count, code: errors })
+        }
+        state := io.PollState.Ready
+        if count == 0 && buffer.len != 0 {
+            state = io.PollState.Pending
+        }
+        return ok(io.Poll { transferred: count, state })
+    }
+
+    // Send `bytes` through the transmit FIFO, waiting while it is full;
+    // returns once the last byte is queued, and `flush` waits until it has
+    // left. TimedOut, with the bytes queued before it, if the FIFO stays
+    // full for the poll limit.
+    pub fn write(&mut self, bytes: &[u8]) -> usize!io.Error {
+        sent := 0usize
+        polls := 0u32
+        for sent < bytes.len {
+            count := self.queue(&bytes[sent..])
+            if count == 0 {
+                polls += 1
+                if self.poll_limit != esp_uart.NO_POLL_LIMIT && polls >= self.poll_limit {
+                    return err(io.failure(io.ErrorKind.TimedOut, sent))
+                }
+            } else {
+                sent += count
+                polls = 0
+            }
+        }
+        return ok(bytes.len)
+    }
+
+    // Queue as much of `bytes` as the transmit FIFO has room for, without
+    // waiting; Pending, with what was queued, once it is full.
+    pub fn poll_write(&mut self, bytes: &[u8]) -> io.Poll!io.Error {
+        count := self.queue(bytes)
+        state := io.PollState.Ready
+        if count < bytes.len {
+            state = io.PollState.Pending
+        }
+        return ok(io.Poll { transferred: count, state })
+    }
+
+    // `flush` without waiting: true once everything written has left the
+    // UART, stop bits included.
+    pub fn poll_flush(&mut self) -> bool!io.Error {
+        return ok(self.transmitter_idle())
+    }
+
+    // Wait until everything written has left; TimedOut after the poll
+    // limit, as on esp_uart.Controller.
+    pub fn flush(&mut self) -> void!io.Error {
+        polls := 0u64
+        budget := self.poll_limit as u64 * (esp_uart.FIFO_DEPTH as u64 + 1)
+        for !self.transmitter_idle() {
+            polls += 1
+            if self.poll_limit != esp_uart.NO_POLL_LIMIT && polls >= budget {
+                return err(io.failure(io.ErrorKind.TimedOut, 0))
+            }
+        }
+        return ok()
+    }
+
+    // Translate newlines, as esp_uart.Controller.set_crlf does.
+    pub fn set_crlf(&mut self, on: bool) {
+        self.crlf = on
+        self.after_return = false
+        self.feed_pending = false
+    }
+
+    pub fn set_poll_limit(&mut self, polls: u32) {
+        self.poll_limit = polls
+    }
+
+    pub fn set_read_poll_limit(&mut self, polls: u32) {
+        self.read_poll_limit = polls
+    }
+
+    // The UART's interrupts, as on esp_uart.Controller. The receive FIFO
+    // levels stay low while UHCI empties the FIFO; RX_TIMEOUT_INTERRUPT
+    // still marks a pause in the input.
+    pub fn listen(&mut self, sources: u32) {
+        mask := self.bus.read(self.uart + UART_INT_ENA)
+        self.bus.write(self.uart + UART_INT_ENA, (mask | sources) & ALL_UART_INTERRUPTS)
+    }
+
+    pub fn ignore(&mut self, sources: u32) {
+        mask := self.bus.read(self.uart + UART_INT_ENA)
+        self.bus.write(self.uart + UART_INT_ENA, mask & ~sources)
+    }
+
+    pub fn pending_interrupts(&mut self) -> u32 {
+        return self.bus.read(self.uart + UART_INT_ST)
+    }
+
+    pub fn clear_interrupts(&mut self, sources: u32) {
+        self.bus.write(self.uart + UART_INT_CLR, sources & ALL_UART_INTERRUPTS)
+    }
+
+    // Stop the channel, disconnect UHCI0 from the UART, and put the UART's
+    // idle threshold back; the port no longer receives. Dropping the port
+    // does this too.
+    pub fn stop(&mut self) {
+        if self.stopped {
+            return
+        }
+        self.stopped = true
+        self.ring.stop(&mut self.bus)
+        self.bus.write(self.uhci + CONF0, REGISTER_CLOCK | DECODER_RESET | ENCODER_RESET)
+        self.bus.write(self.uhci + CONF0, REGISTER_CLOCK)
+        self.bus.write(self.uart + UART_IDLE_CONF, self.idle_conf)
+        self.update()
+    }
+
+    // Translate newlines in buffer[first..first + taken], which the ring just
+    // filled, in place; returns how many bytes are left.
+    fn translate(&mut self, buffer: &mut[u8], first: usize, taken: usize) -> usize {
+        if !self.crlf {
+            return taken
+        }
+        kept := first
+        for index in first..first + taken {
+            byte := buffer[index]
+            if self.after_return && byte == LINE_FEED {
+                self.after_return = false
+            } else {
+                self.after_return = byte == CARRIAGE_RETURN
+                if self.after_return {
+                    byte = LINE_FEED
+                }
+                buffer[kept] = byte
+                kept += 1
+            }
+        }
+        return kept - first
+    }
+
+    // Start receiving into an empty ring again, after it filled up.
+    fn restart_receiver(&mut self) {
+        self.ring.stop(&mut self.bus)
+        conf := self.bus.read(self.uhci + CONF0)
+        self.bus.write(self.uhci + CONF0, conf | DECODER_RESET)
+        self.bus.write(self.uhci + CONF0, conf & ~DECODER_RESET)
+        self.ring.start(&mut self.bus)
+    }
+
+    // Queue the start of `bytes` while the transmit FIFO has room,
+    // translating newlines; returns how many went in.
+    fn queue(&mut self, bytes: &[u8]) -> usize {
+        count := 0usize
+        queued := hal.decode(TX_COUNT, self.bus.read(self.uart + UART_STATUS)) as usize
+        for count < bytes.len && queued < esp_uart.FIFO_DEPTH {
+            byte := bytes[count]
+            if self.crlf && byte == LINE_FEED && !self.feed_pending {
+                self.bus.write(self.uart + UART_FIFO, CARRIAGE_RETURN as u32)
+                self.feed_pending = true
+            } else {
+                self.bus.write(self.uart + UART_FIFO, byte as u32)
+                self.feed_pending = false
+                count += 1
+            }
+            queued += 1
+        }
+        return count
+    }
+
+    // Whether the UART's transmit FIFO is empty and its transmitter idle,
+    // read twice, as esp_uart does: the state machine reads idle for a
+    // moment between a byte and the next start bit.
+    fn transmitter_idle(&mut self) -> bool {
+        for _ in 0..2 {
+            status := self.bus.read(self.uart + UART_STATUS)
+            state := self.bus.read(self.uart + UART_FSM_STATUS)
+            if hal.decode(TX_COUNT, status) != 0 || hal.decode(TX_STATE, state) != 0 {
+                return false
+            }
+        }
+        return true
+    }
+
+    // Latch the UART's configuration into its clock domain.
+    fn update(&mut self) {
+        self.bus.write(self.uart + UART_REG_UPDATE, 1)
+        for _ in 0..UPDATE_POLLS {
+            if (self.bus.read(self.uart + UART_REG_UPDATE) & 1) == 0 {
+                return
+            }
+        }
+    }
+
+    fn drop(&mut self) {
+        self.stop()
+    }
+}

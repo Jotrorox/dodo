@@ -1,0 +1,616 @@
+package main
+
+import "std/embedded/board"
+import "std/embedded/chip"
+import "std/embedded/hal"
+import "std/embedded/peripheral/esp_rmt"
+import "std/fmt"
+
+// Hardware checks for the ESP32-C6's remote control peripheral (RMT) in
+// std/embedded/chip/esp32c6 and std/embedded/peripheral/esp_rmt: channel
+// and memory claims, pulse trains looped from a transmit channel to a
+// receive channel through one pad, frames longer than the channels'
+// memory in both directions, carrier modulation and demodulation, the
+// receiver's idle threshold and glitch filter, loops, the interrupt, and
+// WS2812 LEDs. Nothing needs to be wired to the board: a receive channel
+// given a transmit channel's pin reads that pad, which the transmitter
+// drives.
+//
+// Checks 12 and 15 refill a channel's memory with WS2812 pulses, a code
+// every 1.25 us, while they go out, which an unoptimized build is too slow
+// for (it reports Overrun): run the project at -O1 or above.
+//
+// Same protocol as tests/hardware/esp32c6_devkitc: after the host sends a
+// byte, `selftest ready`, then `check N ok` or `check N FAILED` per check,
+// and `selftest done N`. Run with `python3 scripts/test_esp32c6.py -O 2
+// --project tests/hardware/esp32c6_rmt`.
+
+static mut CHECKS: u32 = 0
+static mut SERIAL: Option<chip.UsbSerial> = none
+
+// The pad the checks send and receive on, and another free one.
+const PIN: u32 = 4
+const OTHER_PIN: u32 = 5
+
+fn say(text: &str) {
+    unsafe {
+        match &mut SERIAL {
+            some(serial) => {
+                fmt.printf(serial, "{}", text)!
+                serial.flush()!
+            }
+            none => {}
+        }
+    }
+}
+
+fn say_number(text: &str, value: u32) {
+    unsafe {
+        match &mut SERIAL {
+            some(serial) => {
+                fmt.printf(serial, "{}{}\n", text, value)!
+                serial.flush()!
+            }
+            none => {}
+        }
+    }
+}
+
+fn check(ok: bool) {
+    unsafe {
+        match &mut SERIAL {
+            some(serial) => {
+                if ok {
+                    fmt.printf(serial, "check {} ok\n", CHECKS)!
+                } else {
+                    fmt.printf(serial, "check {} FAILED\n", CHECKS)!
+                }
+                serial.flush()!
+            }
+            none => {}
+        }
+        CHECKS += 1
+    }
+}
+
+fn refused<T>(result: T!hal.Error, expected: hal.Error) -> bool {
+    match result {
+        ok(_) => {
+            return false
+        }
+        err(error) => {
+            return error == expected
+        }
+    }
+}
+
+fn report(what: &str, error: hal.Error) {
+    say(what)
+    say(hal.error_name(error))
+    say("\n")
+}
+
+fn bit(value: bool) -> u32 {
+    if value {
+        return 1
+    }
+    return 0
+}
+
+fn near(value: u32, expected: u32, tolerance: u32) -> bool {
+    return value + tolerance >= expected && value <= expected + tolerance
+}
+
+// Print codes as `level ticks level ticks` lines, for a failed check.
+fn dump(codes: &[u32], count: usize) {
+    say_number("  codes: ", count as u32)
+    for index in 0..count {
+        if index < codes.len && index < 24 {
+            code := codes[index]
+            unsafe {
+                match &mut SERIAL {
+                    some(serial) => {
+                        fmt.printf(serial, "  {} {} {} {}\n", esp_rmt.level0(code), esp_rmt.ticks0(code), esp_rmt.level1(code), esp_rmt.ticks1(code))!
+                        serial.flush()!
+                    }
+                    none => {}
+                }
+            }
+        }
+    }
+}
+
+// Whether `received` holds `expected` with durations within `tolerance`
+// ticks, except that the last received code ends in a zero duration where
+// the expected one's second pulse merged into the idle line.
+fn matches(received: &[u32], count: usize, expected: &[u32], tolerance: u32) -> bool {
+    if count != expected.len {
+        return false
+    }
+    for index in 0..count {
+        got := received[index]
+        want := expected[index]
+        if esp_rmt.level0(got) != esp_rmt.level0(want) || !near(esp_rmt.ticks0(got), esp_rmt.ticks0(want), tolerance) {
+            return false
+        }
+        if index + 1 == count {
+            if esp_rmt.ticks1(got) != 0 {
+                return false
+            }
+        } else if esp_rmt.level1(got) != esp_rmt.level1(want) || !near(esp_rmt.ticks1(got), esp_rmt.ticks1(want), tolerance) {
+            return false
+        }
+    }
+    return true
+}
+
+// Send `codes` on `tx` while `rx` receives, both polled, and return the
+// codes received, or 0 after an error or 200 ms.
+fn exchange(tx: &mut chip.RmtTx, rx: &mut chip.RmtRx, codes: &[u32], buffer: &mut[u32], timer: &mut chip.Timer) -> usize {
+    sent := false
+    received := false
+    start := timer.now_us()
+    for !sent || !received {
+        if !received {
+            match rx.poll_receive(buffer) {
+                ok(done) => {
+                    received = done
+                }
+                err(error) => {
+                    report("  receive: ", error)
+                    tx.stop()
+                    return 0
+                }
+            }
+        }
+        if !sent {
+            match tx.poll_transmit(codes) {
+                ok(done) => {
+                    sent = done
+                }
+                err(error) => {
+                    report("  transmit: ", error)
+                    rx.stop()
+                    return 0
+                }
+            }
+        }
+        if timer.now_us() - start > 200_000 {
+            say("  exchange timed out\n")
+            tx.stop()
+            rx.stop()
+            return 0
+        }
+    }
+    return rx.received()
+}
+
+fn pin_level(pin: u32) -> bool {
+    // SAFETY: GPIO_IN only reads the pads.
+    input: hal.Reg<u32> = unsafe {
+        hal.Reg.at(0x6009_103C)
+    }
+    return input.any(1u32 << pin)
+}
+
+// --- Claims and settings ----------------------------------------------------
+
+fn claim_checks(pins: &mut chip.Pins) {
+    // Settings out of range, and pins that cannot be claimed.
+    config := esp_rmt.TxConfig.new(100_000)
+    slow := refused(pins.rmt_tx(PIN, &config), hal.Error.InvalidInput)
+    config.resolution_hz = 1_000_000
+    config.memory_blocks = 0
+    no_memory := refused(pins.rmt_tx(PIN, &config), hal.Error.InvalidInput)
+    config.memory_blocks = 1
+    config.carrier_hz = 50_000_000
+    fast_carrier := refused(pins.rmt_tx(PIN, &config), hal.Error.InvalidInput)
+    config.carrier_hz = 0
+    usb_pin := refused(pins.rmt_tx(12, &config), hal.Error.InvalidInput)
+    led_pin := refused(pins.rmt_tx(board.LED_PIN, &config), hal.Error.Busy)
+    receive := esp_rmt.RxConfig.new(1_000_000, 0)
+    no_idle := refused(pins.rmt_rx(PIN, &receive), hal.Error.InvalidInput)
+    receive.idle_ticks = 1000
+    receive.filter_ns = 5000
+    long_filter := refused(pins.rmt_rx(PIN, &receive), hal.Error.InvalidInput)
+    receive.filter_ns = 0
+    receive.memory_blocks = 3
+    rx_memory := refused(pins.rmt_rx(PIN, &receive), hal.Error.InvalidInput)
+    if !(slow && no_memory && fast_carrier && usb_pin && led_pin && no_idle && long_filter && rx_memory) {
+        say("  validation:")
+        say_number(" ", bit(slow) | (bit(no_memory) << 1) | (bit(fast_carrier) << 2) | (bit(usb_pin) << 3) | (bit(led_pin) << 4) | (bit(no_idle) << 5) | (bit(long_filter) << 6) | (bit(rx_memory) << 7))
+    }
+    check(slow && no_memory && fast_carrier && usb_pin && led_pin && no_idle && long_filter && rx_memory)
+
+    // The board's LED holds transmit channel 0 and its block; channel 1
+    // is the only one left, and memory blocks take the channels after.
+    config.resolution_hz = 3_000_000
+    tx := pins.rmt_tx(PIN, &config)!
+    first := tx.channel() == 1 && tx.resolution_hz() == 2_962_962 && tx.memory_codes() == 48
+    no_channel := refused(pins.rmt_tx(OTHER_PIN, &config), hal.Error.Busy)
+    receive.memory_blocks = 2
+    wide := pins.rmt_rx(OTHER_PIN, &receive)!
+    second := wide.channel() == 0 && wide.memory_codes() == 96 && wide.resolution_hz() == 1_000_000
+    receive.memory_blocks = 1
+    full := refused(pins.rmt_rx(6, &receive), hal.Error.Busy)
+    pins.release_rmt_rx(wide)
+    narrow := pins.rmt_rx(OTHER_PIN, &receive)!
+    other := pins.rmt_rx(6, &receive)!
+    third := narrow.channel() == 0 && other.channel() == 1
+    pins.release_rmt_rx(narrow)
+    pins.release_rmt_rx(other)
+    pins.release_rmt_tx(tx)
+    config.memory_blocks = 3
+    big := pins.rmt_tx(PIN, &config)!
+    fourth := big.channel() == 1 && big.memory_codes() == 144
+    blocked := refused(pins.rmt_rx(OTHER_PIN, &receive), hal.Error.Busy)
+    pins.release_rmt_tx(big)
+    again := pins.rmt_rx(OTHER_PIN, &receive)!
+    pins.release_rmt_rx(again)
+    if !(first && no_channel && second && full && third && fourth && blocked) {
+        say("  claims:")
+        say_number(" ", bit(first) | (bit(no_channel) << 1) | (bit(second) << 2) | (bit(full) << 3) | (bit(third) << 4) | (bit(fourth) << 5) | (bit(blocked) << 6))
+    }
+    check(first && no_channel && second && full && third && fourth && blocked)
+}
+
+// --- Pulse trains through the pad -------------------------------------------
+
+fn loopback_checks(pins: &mut chip.Pins, timer: &mut chip.Timer) {
+    config := esp_rmt.TxConfig.new(1_000_000)
+    tx := pins.rmt_tx(PIN, &config)!
+    receive := esp_rmt.RxConfig.new(1_000_000, 1000)
+    receive.memory_blocks = 2
+    rx := pins.rmt_rx(PIN, &receive)!
+    buffer: [600]u32 = [0u32; 600]
+
+    // A short frame, blocking: the receiver records each pulse, and the
+    // last low pulse runs into the idle line, which ends the frame.
+    codes := [esp_rmt.code(true, 100, false, 200), esp_rmt.code(true, 300, false, 400), esp_rmt.code(true, 50, false, 60)]
+    rx.poll_receive(&mut buffer)!
+    tx.transmit(&codes)!
+    count := rx.receive(&mut buffer, 10_000)!
+    short := matches(&buffer, count, &codes, 2)
+    if !short {
+        dump(&buffer, count)
+    }
+    check(short)
+
+    // 400 codes, eight times the transmitter's memory and four times the
+    // receiver's, polled: the start returns at once, and both channels'
+    // memory is refilled and emptied while the frame runs.
+    long: [400]u32 = [0u32; 400]
+    for index in 0..400usize {
+        high := 10 + ((index * 7) % 30) as u32
+        low := 12 + ((index * 11) % 29) as u32
+        long[index] = esp_rmt.code(true, high, false, low)
+    }
+    begin := timer.now_us()
+    rx.poll_receive(&mut buffer)!
+    tx.poll_transmit(&long)!
+    started := timer.now_us() - begin
+    count = exchange(&mut tx, &mut rx, &long, &mut buffer, timer)
+    long_ok := matches(&buffer, count, &long, 1) && started < 1000
+    if !long_ok {
+        say_number("  start us: ", started as u32)
+        dump(&buffer, count)
+    }
+    check(long_ok)
+
+    // The idle threshold ends a frame: a 300 us gap does not, an 800 us
+    // one does, at 500 us.
+    pins.release_rmt_rx(rx)
+    receive.idle_ticks = 500
+    rx = pins.rmt_rx(PIN, &receive)!
+    gaps := [esp_rmt.code(true, 100, false, 300), esp_rmt.code(true, 100, false, 800), esp_rmt.code(true, 100, false, 100)]
+    rx.poll_receive(&mut buffer)!
+    tx.poll_transmit(&gaps)!
+    count = rx.receive(&mut buffer, 10_000)!
+    for !tx.poll_transmit(&gaps)! {}
+    first_frame := [esp_rmt.code(true, 100, false, 300), esp_rmt.code(true, 100, false, 0)]
+    idle_ok := matches(&buffer, count, &first_frame, 2)
+    if !idle_ok {
+        dump(&buffer, count)
+    }
+    check(idle_ok)
+
+    // The glitch filter: a 1 us pulse passes without it and is removed
+    // with a 2 us filter, joining the low pulses around it.
+    glitch := [esp_rmt.code(true, 100, false, 100), esp_rmt.code(true, 1, false, 100), esp_rmt.code(true, 100, false, 100)]
+    rx.poll_receive(&mut buffer)!
+    tx.transmit(&glitch)!
+    unfiltered := rx.receive(&mut buffer, 10_000)!
+    pins.release_rmt_rx(rx)
+    receive.filter_ns = 2000
+    rx = pins.rmt_rx(PIN, &receive)!
+    rx.poll_receive(&mut buffer)!
+    tx.transmit(&glitch)!
+    count = rx.receive(&mut buffer, 10_000)!
+    joined := [esp_rmt.code(true, 100, false, 201), esp_rmt.code(true, 100, false, 0)]
+    filter_ok := unfiltered == 3 && matches(&buffer, count, &joined, 3)
+    if !filter_ok {
+        say_number("  unfiltered: ", unfiltered as u32)
+        dump(&buffer, count)
+    }
+    check(filter_ok)
+
+    // Loops: two codes five times, back to back, then until stopped.
+    pins.release_rmt_rx(rx)
+    receive.filter_ns = 0
+    receive.idle_ticks = 300
+    rx = pins.rmt_rx(PIN, &receive)!
+    pattern := [esp_rmt.code(true, 20, false, 30), esp_rmt.code(true, 40, false, 50)]
+    rx.poll_receive(&mut buffer)!
+    tx.start_loop(&pattern, 5)!
+    count = rx.receive(&mut buffer, 10_000)!
+    done := tx.poll_loop()!
+    looped: [10]u32 = [0u32; 10]
+    for index in 0..10usize {
+        looped[index] = pattern[index % 2]
+    }
+    loop_ok := matches(&buffer, count, &looped, 2) && done && !tx.is_busy()
+    if !loop_ok {
+        say_number("  loop done: ", bit(done))
+        dump(&buffer, count)
+    }
+    check(loop_ok)
+    tx.start_loop(&pattern, 0)!
+    timer.delay_ms(2)
+    endless := tx.is_busy() && !tx.poll_loop()!
+    tx.stop()
+    timer.delay_ms(1)
+    stopped := !tx.is_busy() && !pin_level(PIN)
+    check(endless && stopped)
+
+    // The interrupt: pending while a transmission needs attention, and
+    // clear once polled to its end.
+    tx.listen()
+    tx.poll_transmit(&codes)!
+    timer.delay_ms(2)
+    raised := tx.is_pending() && chip.is_pending(tx.irq())
+    for !tx.poll_transmit(&codes)! {}
+    lowered := !tx.is_pending()
+    tx.ignore()
+    if !(raised && lowered) {
+        say_number("  raised: ", bit(raised))
+    }
+    check(raised && lowered)
+    pins.release_rmt_rx(rx)
+    pins.release_rmt_tx(tx)
+}
+
+// --- Carrier ------------------------------------------------------------------
+
+fn carrier_checks(pins: &mut chip.Pins, timer: &mut chip.Timer) {
+    config := esp_rmt.TxConfig.new(1_000_000)
+    config.carrier_hz = 38_000
+    config.carrier_duty_percent = 50
+    tx := pins.rmt_tx(PIN, &config)!
+    buffer: [200]u32 = [0u32; 200]
+    bursts := [esp_rmt.code(true, 1000, false, 500), esp_rmt.code(true, 1000, false, 500)]
+
+    // Received at 8 MHz without demodulation: 38 kHz pulses, high and low
+    // 13.2 us (105 ticks) each, during the high pulses, and none in the
+    // gap between them. The carrier runs freely, so a burst's first and
+    // last pulses may be cut short.
+    receive := esp_rmt.RxConfig.new(8_000_000, 8000)
+    receive.memory_blocks = 2
+    rx := pins.rmt_rx(PIN, &receive)!
+    rx.poll_receive(&mut buffer)!
+    tx.transmit(&bursts)!
+    count := rx.receive(&mut buffer, 10_000)!
+    pulses := 0u32
+    gaps := 0u32
+    wrong := 0u32
+    for index in 0..count {
+        code := buffer[index]
+        high := esp_rmt.ticks0(code)
+        if esp_rmt.level0(code) && near(high, 105, 8) {
+            pulses += 1
+        } else if !esp_rmt.level0(code) || high > 113 {
+            wrong += 1
+        }
+        low := esp_rmt.ticks1(code)
+        if low > 3000 {
+            gaps += 1
+        } else if low != 0 && !near(low, 105, 8) {
+            wrong += 1
+        }
+    }
+    raw_ok := tx.carrier_hz() == 38_004 && pulses >= 72 && count <= 78 && gaps == 1 && wrong == 0
+    if !raw_ok {
+        say_number("  carrier hz: ", tx.carrier_hz())
+        say_number("  pulses: ", pulses)
+        say_number("  gaps: ", gaps)
+        say_number("  wrong: ", wrong)
+        dump(&buffer, count)
+    }
+    check(raw_ok)
+    pins.release_rmt_rx(rx)
+
+    // Demodulated at 1 MHz: the bursts read as plain 1 ms pulses.
+    receive = esp_rmt.RxConfig.new(1_000_000, 2000)
+    receive.carrier_hz = 38_000
+    rx = pins.rmt_rx(PIN, &receive)!
+    rx.poll_receive(&mut buffer)!
+    tx.transmit(&bursts)!
+    count = rx.receive(&mut buffer, 10_000)!
+    demodulated := matches(&buffer, count, &bursts, 30)
+    if !demodulated {
+        dump(&buffer, count)
+    }
+    check(demodulated)
+    pins.release_rmt_rx(rx)
+    pins.release_rmt_tx(tx)
+
+    // An idle-high transmitter drives its pad high from the start.
+    config = esp_rmt.TxConfig.new(1_000_000)
+    config.idle_high = true
+    tx = pins.rmt_tx(PIN, &config)!
+    timer.delay_ms(1)
+    high_before := pin_level(PIN)
+    low_first := [esp_rmt.code(false, 50, true, 50)]
+    tx.transmit(&low_first)!
+    timer.delay_ms(1)
+    check(high_before && pin_level(PIN))
+    pins.release_rmt_tx(tx)
+}
+
+// --- WS2812 LEDs --------------------------------------------------------------
+
+// Whether `count` received codes are the WS2812 bits of `colors`: 400 or
+// 800 ns high (32 or 64 ticks at 80 MHz), the last one's low part merged
+// into the latch.
+fn ws2812_bits(received: &[u32], count: usize, colors: &[u32]) -> bool {
+    if count != colors.len * 24 {
+        say_number("  ws2812 codes: ", count as u32)
+        return false
+    }
+    for index in 0..count {
+        rgb := colors[index / 24]
+        grb := ((rgb >> 8) & 0xFF00) | ((rgb << 8) & 0xFF_0000) | (rgb & 0xFF)
+        one := (grb & (0x80_0000u32 >> (index % 24) as u32)) != 0
+        code := received[index]
+        high := esp_rmt.ticks0(code)
+        low := esp_rmt.ticks1(code)
+        if !esp_rmt.level0(code) {
+            return false
+        }
+        if one && !(near(high, 64, 3) && (low == 0 || near(low, 36, 3))) {
+            say_number("  ws2812 bad one at ", index as u32)
+            return false
+        }
+        if !one && !(near(high, 32, 3) && (low == 0 || near(low, 68, 3))) {
+            say_number("  ws2812 bad zero at ", index as u32)
+            return false
+        }
+    }
+    return true
+}
+
+fn ws2812_checks(pins: &mut chip.Pins, timer: &mut chip.Timer) {
+    buffer: [300]u32 = [0u32; 300]
+    receive := esp_rmt.RxConfig.new(80_000_000, 20_000)
+    receive.memory_blocks = 2
+
+    // Ten LEDs' pulses, polled on a transmit channel while the receiver
+    // reads them: 241 codes refilled 12 at a time, every 15 us.
+    colors: [10]u32 = [0u32; 10]
+    for index in 0..10usize {
+        colors[index] = ((index as u32 * 0x13_57_9B) ^ 0xA5_5A_C3) & 0xFF_FFFF
+    }
+    config := esp_rmt.TxConfig.new(80_000_000)
+    tx := pins.rmt_tx(PIN, &config)!
+    rx := pins.rmt_rx(PIN, &receive)!
+    pulses := esp_rmt.Ws2812Pulses.new(&colors, 80_000_000)
+    rx.poll_receive(&mut buffer)!
+    sent := false
+    received := false
+    failed := false
+    start := timer.now_us()
+    for !failed && (!sent || !received) {
+        if !received {
+            match rx.poll_receive(&mut buffer) {
+                ok(done) => {
+                    received = done
+                }
+                err(error) => {
+                    report("  receive: ", error)
+                    failed = true
+                }
+            }
+        }
+        if !sent {
+            match tx.poll_send(&pulses) {
+                ok(done) => {
+                    sent = done
+                }
+                err(error) => {
+                    report("  send: ", error)
+                    failed = true
+                }
+            }
+        }
+        if timer.now_us() - start > 100_000 {
+            failed = true
+        }
+    }
+    tx.stop()
+    rx.stop()
+    check(!failed && ws2812_bits(&buffer, rx.received(), &colors))
+    pins.release_rmt_rx(rx)
+    pins.release_rmt_tx(tx)
+
+    // The WS2812 driver on the same pad: two LEDs, 49 codes and the end,
+    // which take a second memory block for the write, received after it
+    // into one block.
+    leds := pins.ws2812(PIN)!
+    receive.memory_blocks = 1
+    rx = pins.rmt_rx(PIN, &receive)!
+    narrow := rx.channel() == 0
+    pins.release_rmt_rx(rx)
+    other := pins.rmt_rx(OTHER_PIN, &receive)!
+    rx = pins.rmt_rx(PIN, &receive)!
+    pins.release_rmt_rx(other)
+    two := [0xFF_00_81u32, 0x12_34_56]
+    rx.poll_receive(&mut buffer)!
+    leds.write(&two)!
+    count := rx.receive(&mut buffer, 10_000)!
+    check(narrow && rx.channel() == 1 && leds.pin() == PIN && ws2812_bits(&buffer, count, &two))
+    pins.release_rmt_rx(rx)
+
+    // Five LEDs fit the free blocks after the driver's channel, so they
+    // need no refill: 30 us per LED and the 300 us latch.
+    five: [5]u32 = [0x01_02_03u32; 5]
+    begin := timer.now_us()
+    leds.write(&five)!
+    elapsed := timer.now_us() - begin
+    say_number("  5 LEDs us: ", elapsed as u32)
+    check(elapsed >= 440 && elapsed < 1000)
+
+    // A chain of 30 is refilled while it goes out, which needs an
+    // optimized build.
+    chain: [30]u32 = [0x01_02_03u32; 30]
+    begin = timer.now_us()
+    match leds.write(&chain) {
+        ok() => {
+            elapsed = timer.now_us() - begin
+            say_number("  30 LEDs us: ", elapsed as u32)
+            check(elapsed >= 1190 && elapsed < 1600)
+        }
+        err(error) => {
+            report("  30 LEDs: ", error)
+            check(false)
+        }
+    }
+    pins.release_ws2812(leds)
+}
+
+fn main() {
+    b := board.take()!
+    serial := b.usb.serial()!
+    poke: [1]u8 = [0]
+    serial.read(&mut poke)!
+    serial.set_crlf(true)
+    unsafe {
+        SERIAL = some(serial)
+    }
+    say("selftest ready\n")
+
+    claim_checks(&mut b.pins)
+    loopback_checks(&mut b.pins, &mut b.timer)
+    carrier_checks(&mut b.pins, &mut b.timer)
+    ws2812_checks(&mut b.pins, &mut b.timer)
+    // The board's LED still takes colors through its channel.
+    b.led.set_color(0x00_04_00)
+    b.timer.delay_ms(1)
+    b.led.set_color(0)
+
+    count := unsafe {
+        CHECKS
+    }
+    say_number("selftest done ", count)
+    for {
+        b.timer.delay_ms(1000)
+    }
+}

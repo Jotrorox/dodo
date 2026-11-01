@@ -27,6 +27,8 @@ struct Args {
     manifest: Option<PathBuf>,
     profile: Option<String>,
     platform: Option<Platform>,
+    /// The ESP32-C6 LP core program to embed in the firmware.
+    lp_core: Option<PathBuf>,
     forbid_unsafe: bool,
 }
 struct FormatArgs {
@@ -76,6 +78,7 @@ fn from_resolved(i: &Invocation, r: &Resolved) -> Args {
         profile: r.profile.clone(),
         // Resolution already validated the board and chip names.
         platform: r.settings.platform().ok().flatten(),
+        lp_core: r.settings.lp_core.clone(),
         forbid_unsafe: r.forbid_unsafe,
     }
 }
@@ -758,13 +761,19 @@ fn link_firmware(
     .map_err(|e| format!("cannot build the {} runtime: {e}", platform.chip.name))?;
     let script = temporary.join("memory.ld");
     fs::write(&script, platform.linker_script()).map_err(|e| e.to_string())?;
+    let lp_image = match &args.lp_core {
+        Some(entry) => Some(embed_lp_core(args, platform, entry, temporary)?),
+        None => None,
+    };
     let mut linker = Command::new(&args.linker);
     if let Some(cwd) = &args.link_cwd {
         linker.current_dir(cwd);
     }
+    linker.arg(object).arg(&runtime);
+    if let Some(image) = &lp_image {
+        linker.arg(image);
+    }
     linker
-        .arg(object)
-        .arg(&runtime)
         .arg("-T")
         .arg(&script)
         .arg("--gc-sections")
@@ -794,10 +803,92 @@ fn link_firmware(
     let path = image_path(out, platform);
     fs::write(&path, flashable).map_err(|e| format!("cannot write {}: {e}", path.display()))
 }
+/// Build the ESP32-C6 LP core program at `entry` for `chip = "esp32c6_lp"`,
+/// and wrap its image in an object whose `.lp_image` section the main
+/// firmware's linker script places in flash, between `__lp_image_start` and
+/// `__lp_image_end`, for `esp32c6.LpCore` to load. The LP program uses the
+/// firmware's settings, except at -O0, which its 12 KiB rarely hold: then
+/// the LP chip's default level.
+fn embed_lp_core(
+    args: &Args,
+    platform: Platform,
+    entry: &Path,
+    temporary: &Path,
+) -> Result<PathBuf, String> {
+    let chip = &dodoc::hardware::esp32c6_lp::CHIP;
+    if platform.chip.name != "esp32c6" {
+        return Err(format!(
+            "lp-core embeds an ESP32-C6 LP core program, but this firmware is for '{}'",
+            platform.name()
+        ));
+    }
+    if !entry.is_file() {
+        return Err(format!("lp-core: expected source file {}", entry.display()));
+    }
+    let lp_platform = Platform { chip, board: None };
+    let mut options = args.options.clone();
+    options.target = Some(chip.triple.into());
+    options.cpu = Some(chip.cpu.into());
+    options.features = chip.features.into();
+    options.panic = codegen::PanicStrategy::Hook(chip.panic_hook.into());
+    if options.optimization == 0 {
+        options.optimization = chip.opt_level;
+    }
+    let lp_args = Args {
+        action: Action::Build,
+        input: entry.to_path_buf(),
+        output: None,
+        emit: Emit::Exe,
+        options,
+        linker: args.linker.clone(),
+        link_args: vec![],
+        run_args: vec![],
+        link_cwd: args.link_cwd.clone(),
+        run_cwd: None,
+        quiet: args.quiet,
+        verbose: args.verbose,
+        manifest: args.manifest.clone(),
+        profile: args.profile.clone(),
+        platform: Some(lp_platform),
+        lp_core: None,
+        forbid_unsafe: args.forbid_unsafe,
+    };
+    let fail = |e: String| format!("LP core program {}: {e}", entry.display());
+    let mut loaded =
+        package::load_for_platform(entry, chip.triple, Some(lp_platform)).map_err(fail)?;
+    if lp_args.forbid_unsafe {
+        forbid_unsafe(&loaded).map_err(fail)?;
+    }
+    let bits = codegen::pointer_bits(&lp_args.options).map_err(|e| fail(e.to_string()))?;
+    sema::check_for_target(&mut loaded.program, bits).map_err(|d| fail(loaded.render(&d)))?;
+    let directory = temporary.join("lp_core");
+    fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
+    let elf = directory.join("lp_core.elf");
+    compile(&lp_args, &loaded, &elf).map_err(fail)?;
+    let image = fs::read(image_path(&elf, lp_platform)).map_err(|e| e.to_string())?;
+    let mut bytes = String::with_capacity(image.len() * 3);
+    for byte in &image {
+        bytes.push_str(&format!("\\{byte:02X}"));
+    }
+    let ir = format!(
+        "@dodo_lp_image = constant [{} x i8] c\"{bytes}\", section \".lp_image\", align 4\n",
+        image.len()
+    );
+    let object = directory.join("lp_image.o");
+    codegen::compile_ir_object(&args.options, platform.chip.name, &ir, &object)
+        .map_err(|e| format!("cannot embed the LP core program: {e}"))?;
+    Ok(object)
+}
 /// Build firmware and flash it: copy it to the platform's mounted
 /// bootloader drive, or write it through the board's serial bootloader or
 /// the chip's serial flasher.
 fn flash(args: &mut Args, platform: Platform, loaded: &package::Loaded) -> Result<i32, String> {
+    if let ImageFormat::Coprocessor { host } = platform.chip.image {
+        return Err(format!(
+            "an {} program runs inside {host} firmware: name it with lp-core in the firmware's target (or pass --lp-core) and run that",
+            platform.chip.name
+        ));
+    }
     if let ImageFormat::Stk500 {
         signature,
         page_size,

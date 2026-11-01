@@ -1,0 +1,337 @@
+package main
+
+import "core/mmio"
+import "std/embedded/board"
+import "std/embedded/chip"
+import "std/embedded/hal"
+import "std/embedded/power"
+import "std/fmt"
+import "std/io"
+
+// Hardware checks of the ESP32-C6's hibernation on the esp32c6_devkitc
+// board. Run with
+//
+//     python3 scripts/test_esp32c6.py --project tests/hardware/esp32c6_hibernate --follow-resets
+//
+// The protocol is the self-test's: after the host sends a byte, `selftest
+// ready`, `check N ok` or `check N FAILED` per check, and `selftest done N`.
+// Each hibernation ends in a new boot, so the checks run across boots: the
+// first, after flashing, hibernates for 1.5 s on the LP timer; the second
+// checks the wake cause and what LP SRAM kept, and hibernates until GPIO 4,
+// pulled up, is high, which it is at once; the third checks that wake,
+// runs the LP core program (lp/main.dodo, embedded through the target's
+// `lp-core`) once, periodically, through its wake requests, an LP IO pad,
+// and a panic, then hibernates until the LP core's fifth run wakes the
+// chip; the fourth checks that wake and stops the LP core. The boot's number lives in LP SRAM (`.lp_noinit`), which only a
+// power cycle clears; `selftest restarting` announces each hibernation.
+
+static mut SERIAL: Option<chip.UsbSerial> = none
+static mut CHECKS: u32 = 0
+
+// What survives hibernation: a marker, the next boot's number, a pattern,
+// and the LP timer's count when the timed hibernation began.
+const MAGIC: u32 = 0x4849_424E
+@section(".lp_noinit")
+static mut KEPT_MAGIC: u32 = 0
+@section(".lp_noinit")
+static mut KEPT_PHASE: u32 = 0
+@section(".lp_noinit")
+static mut KEPT_PATTERN: [16]u32 = [0u32; 16]
+@section(".lp_noinit")
+static mut KEPT_TICKS: u64 = 0
+
+const WAKE_PIN: u32 = 4
+const HIBERNATE_US: u64 = 1_500_000
+
+fn say(text: &str) {
+    unsafe {
+        match &mut SERIAL {
+            some(serial) => {
+                fmt.printf(serial, "{}", text)!
+                serial.flush()!
+            }
+            none => {}
+        }
+    }
+}
+
+fn say_number(text: &str, value: u64) {
+    unsafe {
+        match &mut SERIAL {
+            some(serial) => {
+                fmt.printf(serial, "{}{}\n", text, value)!
+                serial.flush()!
+            }
+            none => {}
+        }
+    }
+}
+
+fn check(ok: bool) {
+    unsafe {
+        match &mut SERIAL {
+            some(serial) => {
+                if ok {
+                    fmt.printf(serial, "check {} ok\n", CHECKS)!
+                } else {
+                    fmt.printf(serial, "check {} FAILED\n", CHECKS)!
+                }
+                serial.flush()!
+            }
+            none => {}
+        }
+        CHECKS += 1
+    }
+}
+
+fn pattern(index: u32) -> u32 {
+    return core.wrapping_mul(index + 1, 0x9E37_79B9)
+}
+
+fn keep_pattern() {
+    unsafe {
+        for index in 0u32..16 {
+            KEPT_PATTERN[index as usize] = pattern(index)
+        }
+    }
+}
+
+fn pattern_kept() -> bool {
+    unsafe {
+        for index in 0u32..16 {
+            if KEPT_PATTERN[index as usize] != pattern(index) {
+                return false
+            }
+        }
+    }
+    return true
+}
+
+// Announce the hibernation, so the host follows the new boot, give the USB
+// serial port time to send the line, and hibernate.
+fn hibernate(power: &mut chip.Power, timer: &mut chip.Timer, wake: &chip.Hibernation, next: u32) {
+    unsafe {
+        KEPT_MAGIC = MAGIC
+        KEPT_PHASE = next
+    }
+    say("selftest restarting\n")
+    timer.delay_ms(50)
+    error := power.hibernate(wake)
+    say("hibernate failed: ")
+    say(hal.error_name(error))
+    say("\n")
+    unsafe {
+        say_number(" pmu int raw ", mmio.read32(0x600B_015C) as u64)
+        say_number(" wakeup status0 ", mmio.read32(0x600B_0140) as u64)
+        say_number(" reject cause ", mmio.read32(0x600B_0144) as u64)
+        say_number(" main state ", mmio.read32(0x600B_018C) as u64)
+        say_number(" pwr state ", mmio.read32(0x600B_0190) as u64)
+        say_number(" clk state0 ", mmio.read32(0x600B_0194) as u64)
+        say_number(" wakeup cntl2 ", mmio.read32(0x600B_0128) as u64)
+        say_number(" cntl0 ", mmio.read32(0x600B_0120) as u64)
+        say_number(" lp timer tar0 high ", mmio.read32(0x600B_0C04) as u64)
+    }
+    check(false)
+    say_number("selftest done ", 0)
+    for {}
+}
+
+fn main() {
+    b := board.take()!
+    let board.Board { led: board_led, pins: board_pins, timer: board_timer, usb: board_usb, dma: board_dma, rng: board_rng, watchdog: board_watchdog, rtc: board_rtc, flash: board_flash, power: board_power, lp_core: board_lp_core } = b
+    pins := board_pins
+    timer := board_timer
+    usb := board_usb
+    power := board_power
+    serial := usb.serial()!
+    poke: [1]u8 = [0]
+    serial.read(&mut poke)!
+    serial.set_crlf(true)
+    unsafe {
+        SERIAL = some(serial)
+    }
+    say("selftest ready\n")
+
+    phase := 0u32
+    unsafe {
+        if power.woke_from_hibernation() && KEPT_MAGIC == MAGIC {
+            phase = KEPT_PHASE
+        }
+    }
+    say_number("boot: ", phase as u64)
+    say_number("wake cause: ", power.wake_cause() as u64)
+    say_number("wake pins: ", power.wake_pins() as u64)
+
+    if phase == 0 {
+        // 0: a boot after flashing follows no hibernation.
+        check(!power.woke_from_hibernation() && power.wake_cause() == 0 && power.wake_pins() == 0)
+        // 1: hibernate refuses what nothing could end, a pin without an LP
+        // pad or with an edge, and an LP core that is not running.
+        empty := chip.Hibernation.new()
+        high_pin := chip.Hibernation.new()
+        high_pin.wake_on_pin(8, power.LEVEL_HIGH)
+        edge := chip.Hibernation.new()
+        edge.wake_on_pin(2, power.RISING_EDGE)
+        lp := chip.Hibernation.new()
+        lp.wake_on_lp_core()
+        e1 := power.hibernate(&empty)
+        e2 := power.hibernate(&high_pin)
+        e3 := power.hibernate(&edge)
+        e4 := power.hibernate(&lp)
+        check(e1 == hal.Error.InvalidInput && e2 == hal.Error.InvalidInput && e3 == hal.Error.InvalidInput && e4 == hal.Error.InvalidInput)
+        keep_pattern()
+        unsafe {
+            KEPT_TICKS = power.lp_ticks()
+        }
+        wake := chip.Hibernation.new()
+        wake.wake_after_us(HIBERNATE_US)
+        hibernate(&mut power, &mut timer, &wake, 1)
+    }
+    unsafe {
+        if phase == 1 {
+            CHECKS = 2
+        } else if phase == 2 {
+            CHECKS = 5
+        } else {
+            CHECKS = 14
+        }
+    }
+    lp_core := board_lp_core
+    if phase == 1 {
+        // 2: the LP timer ended it.
+        check(power.wake_cause() == chip.WAKE_TIMER && power.wake_pins() == 0)
+        // 3: LP SRAM kept its statics.
+        check(pattern_kept())
+        // 4: the LP timer counted through it, 1.5 s and the boot.
+        elapsed := unsafe {
+            power.lp_ticks() - KEPT_TICKS
+        }
+        rate := power.lp_rate()
+        elapsed_ms := elapsed * 10 / rate
+        say_number("hibernated and booted, ms: ", elapsed_ms)
+        check(elapsed_ms >= 1450 && elapsed_ms < 4000)
+        input := pins.input(WAKE_PIN)!
+        input.set_pull(true, false)
+        timer.delay_ms(1)
+        wake := chip.Hibernation.new()
+        wake.wake_on_pin(WAKE_PIN, power.LEVEL_HIGH)
+        wake.wake_after_us(5_000_000)
+        hibernate(&mut power, &mut timer, &wake, 2)
+    }
+    if phase == 2 {
+        // 5: GPIO 4's level ended it, not the timer.
+        check(power.wake_cause() == chip.WAKE_PINS && power.wake_pins() == (1u32 << WAKE_PIN))
+        // 6: the pad is the HP system's again: an output drives it.
+        output := pins.output(WAKE_PIN)!
+        output.set_low()
+        timer.delay_us(10)
+        low := !output.is_high()
+        output.set_high()
+        timer.delay_us(10)
+        check(low && output.is_high() && pattern_kept())
+        pins.release(output)
+        // 7: the LP SRAM marker clears.
+        unsafe {
+            KEPT_MAGIC = 0
+            check(KEPT_MAGIC == 0)
+        }
+        lp_checks(&mut lp_core, &mut timer)
+        // Hibernate until the LP core's fifth run, 50 ms apart, wakes the
+        // chip; the timer only in case it does not.
+        lp_core.load()!
+        lp_core.set_shared(LP_TARGET, 5)
+        lp_core.set_shared(LP_MODE, MODE_WAKE_AT_TARGET)
+        lp_core.start_every_us(50_000)!
+        wake := chip.Hibernation.new()
+        wake.wake_on_lp_core()
+        wake.wake_after_us(5_000_000)
+        hibernate(&mut power, &mut timer, &wake, 3)
+    }
+    // 14: the LP core ended it, after its fifth run, and still runs.
+    count := lp_core.shared(LP_COUNT)
+    say_number("lp runs before the wake: ", count as u64)
+    check(phase == 3 && power.wake_cause() == chip.WAKE_LP_CORE && lp_core.is_running() && count >= 5 && count < 60)
+    // 15: stopped, it runs no more.
+    lp_core.stop()
+    timer.delay_ms(5)
+    stopped_at := lp_core.runs()
+    timer.delay_ms(120)
+    check(!lp_core.is_running() && lp_core.runs() == stopped_at)
+    say_number("selftest done ", 16)
+}
+
+// Shared words of the LP program (lp/main.dodo) and its modes.
+const LP_MODE: u32 = 0
+const LP_COUNT: u32 = 1
+const LP_RUNS: u32 = 2
+const LP_TARGET: u32 = 3
+const LP_PIN_SEEN: u32 = 4
+const LP_MATH: u32 = 5
+const MODE_COUNT: u32 = 0
+const MODE_WAKE_REQUEST: u32 = 1
+const MODE_WAKE_AT_TARGET: u32 = 2
+const MODE_PIN: u32 = 3
+const MODE_PANIC: u32 = 4
+
+fn lp_math(count: u32) -> u32 {
+    big := 0x1234_5678_9ABC_DEF0u64 + count as u64
+    return ((big / 1_000_003) % 1_000_000) as u32
+}
+
+fn lp_checks(lp_core: &mut chip.LpCore, timer: &mut chip.Timer) {
+    // 8: the firmware embeds the LP program; take() stopped any earlier
+    // one.
+    say_number("lp program bytes: ", lp_core.program_size() as u64)
+    check(lp_core.has_program() && lp_core.program_size() > 0x80 && lp_core.program_size() <= 0x3000 && !lp_core.is_running())
+    // 9: one start runs `main` once; its statics, shared words, and
+    // 64-bit helpers work.
+    lp_core.load()!
+    lp_core.set_shared(LP_MODE, MODE_COUNT)
+    lp_core.start()!
+    timer.delay_ms(5)
+    say_number("lp runs: ", lp_core.runs() as u64)
+    check(lp_core.runs() == 1 && lp_core.shared(LP_COUNT) == 1 && lp_core.shared(LP_RUNS) == 1 && lp_core.shared(LP_MATH) == lp_math(1) && lp_core.is_running())
+    // 10: every 20 ms it runs again, counting on in its statics.
+    lp_core.start_every_us(20_000)!
+    timer.delay_ms(210)
+    runs := lp_core.runs()
+    say_number("lp runs after 210 ms at 20 ms: ", runs as u64)
+    check(runs >= 7 && runs <= 14 && lp_core.shared(LP_COUNT) == runs && lp_core.shared(LP_MATH) == lp_math(runs))
+    // 11: its wake requests reach the running main core.
+    first := lp_core.take_wake_request()
+    lp_core.set_shared(LP_MODE, MODE_WAKE_REQUEST)
+    timer.delay_ms(50)
+    requested := lp_core.take_wake_request()
+    lp_core.set_shared(LP_MODE, MODE_COUNT)
+    timer.delay_ms(30)
+    cleared := lp_core.take_wake_request()
+    timer.delay_ms(30)
+    check(!first && requested && !lp_core.take_wake_request())
+    if cleared {
+        say("a wake request outlived its mode\n")
+    }
+    // 12: it drives an LP IO pad and reads it back.
+    lp_core.set_shared(LP_PIN_SEEN, 7)
+    lp_core.set_shared(LP_MODE, MODE_PIN)
+    timer.delay_ms(50)
+    lp_core.set_shared(LP_MODE, MODE_COUNT)
+    check(lp_core.shared(LP_PIN_SEEN) == 1)
+    // 13: a panic stops it and leaves its message.
+    lp_core.set_shared(LP_MODE, MODE_PANIC)
+    timer.delay_ms(50)
+    message: [96]u8 = [0u8; 96]
+    length := lp_core.panic_message(&mut message)
+    say("lp panic: ")
+    unsafe {
+        match &mut SERIAL {
+            some(serial) => {
+                serial.write(&message[..length])!
+            }
+            none => {}
+        }
+    }
+    say("\n")
+    stopped_at := lp_core.runs()
+    timer.delay_ms(50)
+    check(lp_core.panicked() && length > 20 && !lp_core.is_running() && lp_core.runs() == stopped_at)
+}

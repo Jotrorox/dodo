@@ -1,0 +1,1145 @@
+package esp_rmt
+
+import "std/embedded/hal"
+
+// The remote control peripheral (RMT) of the ESP32-C6: pulse trains sent
+// and measured in hardware, for infrared remotes, one-wire protocols such
+// as WS2812 LEDs, servo-like waveforms, and measuring a signal's pulses. It
+// is the ESP32-C6's counterpart to the Raspberry Pi chips' PIO for such
+// signals. `Transmitter` and `Receiver` drive one channel each over any
+// hal.Registers: a `hal.RegisterBlock` on the chip, or a simulated
+// peripheral in a desktop test. The chip package hands them out through
+// `Pins.rmt_tx` and `Pins.rmt_rx`:
+//
+//     config := esp_rmt.TxConfig.new(1_000_000)
+//     tx := b.pins.rmt_tx(4, &config)!
+//     codes := [esp_rmt.code(true, 9000, false, 4500), esp_rmt.code(true, 560, false, 560)]
+//     tx.transmit(&codes)!
+//
+// Codes. A pulse train is a run of 32-bit codes, each two pulses: a level
+// and a duration of 1 to MAX_TICKS (32767) ticks in bits 15 and 0-14, sent
+// first, then a second level and duration in bits 31 and 16-30. `code`
+// builds one, `level0`, `ticks0`, `level1`, and `ticks1` take one apart,
+// and `encode` turns durations of alternating levels into codes. A zero
+// duration ends the pulse train, so the hardware stops at a code with one,
+// and `END` (0) is a code that ends at once. Transmitters add the end
+// themselves; receivers store a zero duration where the line went idle.
+//
+// Channels and memory. The ESP32-C6 has two transmit channels, 0 and 1,
+// and two receive channels, 2 and 3 (receive channels 0 and 1 here). Each
+// has a block of 48 codes of RMT memory, and a channel may take more
+// blocks: those of the channels after it, which then cannot be used
+// (TxConfig.memory_blocks, RxConfig.memory_blocks). A pulse train longer
+// than the channel's memory is refilled, or emptied, a quarter of the
+// memory at a time while it runs (the memory's wrap mode and the threshold
+// events, TX_LIM and RX_LIM): each poll that finds a quarter sent copies
+// the next codes into it, and each poll that finds a quarter received
+// copies it out. A poll must come before the channel has gone through the
+// other three quarters: 36 codes for one block.
+// A program that polls too late for that has the hardware send or
+// overwrite stale codes; the drivers notice when they can and report
+// Overrun. More blocks leave more time between polls.
+//
+// Clocks. Every channel counts ticks of the RMT source clock (PLL_F80M,
+// 80 MHz, on the ESP32-C6) divided by its own divider of 1 to 256, so the
+// resolution is 312.5 kHz to 80 MHz; `divider` picks the closest, and
+// `resolution_hz` reports it. A carrier is set in source clock cycles and
+// a glitch filter counts them too, whatever the resolution.
+//
+// Transmitting. `transmit` sends codes and waits until the last has gone
+// out; `poll_transmit` starts and refills a transmission and reports when
+// it has ended, and `send` and `poll_send` do the same for codes computed
+// while they go out (`Pulses`, as `Ws2812Pulses` does for WS2812 LEDs).
+// Between pulse trains the output stays at TxConfig.idle_high. With a
+// carrier, the output is modulated with it while at the carrier's level
+// (high unless TxConfig.carrier_on_low), as infrared LEDs need, and never
+// while idle. `start_loop` sends codes that fit the channel's memory a
+// given number of times, up to MAX_LOOPS, or until `stop`, with no gaps.
+//
+// Receiving. A receiver records the lengths of the pulses on its input
+// from the first edge until the line has kept its level for
+// RxConfig.idle_ticks; that frame's codes then are in the caller's buffer.
+// Pulses shorter than RxConfig.filter_ns are ignored. With a carrier set,
+// the receiver demodulates: runs of the carrier's pulses count as one
+// pulse at the carrier's level. `receive` waits for a frame with a
+// timeout, `poll_receive` starts a reception and reports when a frame has
+// ended.
+//
+// Register names follow the ESP32-C6 technical reference manual (Remote
+// Control Peripheral).
+
+// Registers. Transmit channel n's CH_TX_CONF0, CH_TX_STATUS, CHCARRIER_DUTY,
+// and CH_TX_LIM are 4 bytes apart; receive channel k's CH_RX_CONF0 and
+// CH_RX_CONF1 8 bytes apart, and its CH_RX_STATUS, CH_RX_CARRIER_RM, and
+// CH_RX_LIM 4 bytes apart. The channels' memory follows at RAM, 48 codes
+// per channel, transmit channels first.
+const CH_TX_CONF0: usize = 0x10
+const CH_RX_CONF0: usize = 0x18
+const CH_RX_CONF1: usize = 0x1C
+const CH_TX_STATUS: usize = 0x28
+const CH_RX_STATUS: usize = 0x30
+const INT_RAW: usize = 0x38
+const INT_ENA: usize = 0x40
+const INT_CLR: usize = 0x44
+const CHCARRIER_DUTY: usize = 0x48
+const CH_RX_CARRIER_RM: usize = 0x50
+const CH_TX_LIM: usize = 0x58
+const CH_RX_LIM: usize = 0x60
+const RAM: usize = 0x400
+
+// CH_TX_CONF0: start, reset the memory read pointer and the APB access
+// pointer, loop (continuous) mode, wrap mode, the idle level and its
+// enable, stop, the divider (0 is 256), the memory blocks, the carrier only
+// while sending data, the carrier, its level, and the configuration update.
+const TX_START: u32 = 1 << 0
+const MEM_RD_RST: u32 = 1 << 1
+const APB_MEM_RST: u32 = 1 << 2
+const TX_CONTI_MODE: u32 = 1 << 3
+const MEM_TX_WRAP_EN: u32 = 1 << 4
+const IDLE_OUT_LV: u32 = 1 << 5
+const IDLE_OUT_EN: u32 = 1 << 6
+const TX_STOP: u32 = 1 << 7
+const TX_DIV_CNT: u32 = 0xFF << 8
+const TX_MEM_SIZE: u32 = 0b111 << 16
+const CARRIER_EFF_EN: u32 = 1 << 20
+const TX_CARRIER_EN: u32 = 1 << 21
+const TX_CARRIER_OUT_LV: u32 = 1 << 22
+const TX_CONF_UPDATE: u32 = 1 << 24
+// CH_RX_CONF0: the divider, the idle threshold, the memory blocks, and
+// demodulation with its level.
+const RX_DIV_CNT: u32 = 0xFF
+const IDLE_THRES: u32 = 0x7FFF << 8
+const RX_MEM_SIZE: u32 = 0b111 << 23
+const RX_CARRIER_EN: u32 = 1 << 28
+const RX_CARRIER_OUT_LV: u32 = 1 << 29
+// CH_RX_CONF1: receive, reset the memory write pointer and the APB access
+// pointer, the memory belongs to the receiver, the filter and its
+// threshold, wrap mode, and the configuration update.
+const RX_EN: u32 = 1 << 0
+const MEM_WR_RST: u32 = 1 << 1
+const RX_APB_MEM_RST: u32 = 1 << 2
+const MEM_OWNER: u32 = 1 << 3
+const RX_FILTER_EN: u32 = 1 << 4
+const RX_FILTER_THRES: u32 = 0xFF << 5
+const MEM_RX_WRAP_EN: u32 = 1 << 13
+const RX_CONF_UPDATE: u32 = 1 << 15
+// CH_TX_LIM: the threshold in codes, the loop count, counting loops,
+// resetting the count, and stopping after the count.
+const TX_LIM: u32 = 0x1FF
+const TX_LOOP_NUM: u32 = 0x3FF << 9
+const TX_LOOP_CNT_EN: u32 = 1 << 19
+const LOOP_COUNT_RESET: u32 = 1 << 20
+const LOOP_STOP_EN: u32 = 1 << 21
+// CH_TX_STATUS and CH_RX_STATUS: where the channel reads or writes, in
+// codes from the start of the memory; the receiver's memory owner error
+// and memory full.
+const MEM_ADDRESS: u32 = 0x1FF
+const RX_MEM_OWNER_ERR: u32 = 1 << 25
+const RX_MEM_FULL: u32 = 1 << 26
+// CHCARRIER_DUTY and CH_RX_CARRIER_RM: the carrier's low and high counts.
+const CARRIER_LOW: u32 = 0xFFFF
+const CARRIER_HIGH: u32 = 0xFFFF << 16
+
+// The interrupt bits of transmit channel n and receive channel k, in
+// INT_RAW, INT_ENA, and INT_CLR.
+fn tx_end(n: u32) -> u32 {
+    return 1u32 << n
+}
+
+fn rx_end(k: u32) -> u32 {
+    return 1u32 << (2 + k)
+}
+
+fn tx_error(n: u32) -> u32 {
+    return 1u32 << (4 + n)
+}
+
+fn rx_error(k: u32) -> u32 {
+    return 1u32 << (6 + k)
+}
+
+fn tx_threshold(n: u32) -> u32 {
+    return 1u32 << (8 + n)
+}
+
+fn rx_threshold(k: u32) -> u32 {
+    return 1u32 << (10 + k)
+}
+
+fn tx_loop(n: u32) -> u32 {
+    return 1u32 << (12 + n)
+}
+
+// Transmit and receive channels, and memory blocks; a block holds 48
+// codes.
+pub const TX_CHANNELS: u32 = 2
+pub const RX_CHANNELS: u32 = 2
+pub const BLOCKS: u32 = 4
+pub const BLOCK_CODES: usize = 48
+// The longest duration in a code, in ticks.
+pub const MAX_TICKS: u32 = 0x7FFF
+// A code that ends a pulse train.
+pub const END: u32 = 0
+// The most a channel's clock divides the source clock by.
+pub const MAX_DIVIDER: u32 = 256
+// The most times `start_loop` repeats its codes.
+pub const MAX_LOOPS: u32 = 1023
+// The longest pulse the glitch filter removes, in source clock cycles.
+pub const MAX_FILTER_CYCLES: u32 = 255
+
+// The code of a level for `ticks0`, then a level for `ticks1`; both 0 to
+// MAX_TICKS, and a 0 ends the pulse train there.
+pub fn code(level0: bool, ticks0: u32, level1: bool, ticks1: u32) -> u32 {
+    core.assert(ticks0 <= MAX_TICKS && ticks1 <= MAX_TICKS)
+    value := ticks0 | (ticks1 << 16)
+    if level0 {
+        value |= 1u32 << 15
+    }
+    if level1 {
+        value |= 1u32 << 31
+    }
+    return value
+}
+
+// A code's first level and duration, then its second.
+pub fn level0(code: u32) -> bool {
+    return (code & (1u32 << 15)) != 0
+}
+
+pub fn ticks0(code: u32) -> u32 {
+    return code & MAX_TICKS
+}
+
+pub fn level1(code: u32) -> bool {
+    return (code >> 31) != 0
+}
+
+pub fn ticks1(code: u32) -> u32 {
+    return (code >> 16) & MAX_TICKS
+}
+
+// Write the codes of pulses that alternate between high and low, starting
+// high when `first_high`, with the durations in ticks of `durations`, into
+// `out`, and return how many codes that took. A duration longer than
+// MAX_TICKS becomes several pulses at the same level; an odd number of
+// pulses leaves the last code's second duration 0, which ends the pulse
+// train. InvalidInput for a duration of 0, Overrun if `out` is too short.
+pub fn encode(first_high: bool, durations: &[u32], out: &mut[u32]) -> usize!hal.Error {
+    used := 0usize
+    half := false
+    level := first_high
+    for index in 0..durations.len {
+        rest := durations[index]
+        if rest == 0 {
+            return err(hal.Error.InvalidInput)
+        }
+        for rest > 0 {
+            ticks := rest
+            if ticks > MAX_TICKS {
+                ticks = MAX_TICKS
+            }
+            rest -= ticks
+            if !half {
+                if used == out.len {
+                    return err(hal.Error.Overrun)
+                }
+                out[used] = code(level, ticks, false, 0)
+                used += 1
+            } else {
+                out[used - 1] |= code(false, 0, level, ticks)
+            }
+            half = !half
+        }
+        level = !level
+    }
+    return ok(used)
+}
+
+// The channel divider for ticks at `resolution_hz` from a source clock at
+// `source_hz`: the closest of 1 to MAX_DIVIDER. InvalidInput if none is
+// within reach.
+pub fn divider(source_hz: u32, resolution_hz: u32) -> u32!hal.Error {
+    if resolution_hz == 0 || resolution_hz > source_hz {
+        return err(hal.Error.InvalidInput)
+    }
+    value := (source_hz + resolution_hz / 2) / resolution_hz
+    if value > MAX_DIVIDER {
+        return err(hal.Error.InvalidInput)
+    }
+    return ok(value)
+}
+
+// The carrier's high and low counts, CHCARRIER_DUTY's CARRIER_HIGH and
+// CARRIER_LOW, for `carrier_hz` at `duty_percent` from a clock at
+// `clock_hz`, or 0 for no carrier (`carrier_hz` 0). InvalidInput for a duty
+// cycle outside 1 to 99 percent, or a frequency whose counts fall outside
+// 1 to 65535.
+pub fn carrier_counts(clock_hz: u32, carrier_hz: u32, duty_percent: u32) -> u32!hal.Error {
+    if carrier_hz == 0 {
+        return ok(0)
+    }
+    if duty_percent < 1 || duty_percent > 99 || carrier_hz > clock_hz / 2 {
+        return err(hal.Error.InvalidInput)
+    }
+    total := ((clock_hz as u64 + carrier_hz as u64 / 2) / carrier_hz as u64)
+    high := (total * duty_percent as u64 + 50) / 100
+    low := total - high
+    if high < 1 || low < 1 || high > 0xFFFF || low > 0xFFFF {
+        return err(hal.Error.InvalidInput)
+    }
+    return ok(((high as u32) << 16) | low as u32)
+}
+
+// A transmit channel's settings.
+pub struct TxConfig {
+    // The tick in which codes count, 312.5 kHz to the source clock
+    // (80 MHz); the channel gets the closest its divider makes.
+    pub resolution_hz: u32
+    // The output's level between pulse trains.
+    pub idle_high: bool
+    // A carrier modulating the output, 0 for none, and its duty cycle,
+    // 1 to 99 percent; counted in source clock cycles, so 1.3 kHz to
+    // 40 MHz from 80 MHz.
+    pub carrier_hz: u32
+    pub carrier_duty_percent: u32
+    // Modulate the low level instead of the high one.
+    pub carrier_on_low: bool
+    // Blocks of RMT memory, 1 to 4 less the channel's number: the codes
+    // that fit before the transmission must be refilled.
+    pub memory_blocks: u32
+
+    // Ticks at `resolution_hz`, idle low, no carrier, one block.
+    pub fn new(resolution_hz: u32) -> TxConfig {
+        return TxConfig { resolution_hz, idle_high: false, carrier_hz: 0, carrier_duty_percent: 50, carrier_on_low: false, memory_blocks: 1 }
+    }
+}
+
+// A receive channel's settings.
+pub struct RxConfig {
+    // The tick in which codes count, as for TxConfig.
+    pub resolution_hz: u32
+    // The ticks, 1 to MAX_TICKS, the input must keep its level for the
+    // frame to end.
+    pub idle_ticks: u32
+    // Pulses shorter than this are ignored; 0 turns the filter off. It
+    // counts source clock cycles, up to MAX_FILTER_CYCLES: 3187 ns from
+    // 80 MHz.
+    pub filter_ns: u32
+    // Demodulate a carrier of this frequency, 0 for none, and duty cycle,
+    // counted in ticks: the resolution must be several times the carrier
+    // frequency.
+    pub carrier_hz: u32
+    pub carrier_duty_percent: u32
+    // The carrier is on the low level instead of the high one.
+    pub carrier_on_low: bool
+    // Blocks of RMT memory, 1 for receive channel 1, 1 or 2 for channel 0:
+    // the codes that arrive before the channel must be emptied.
+    pub memory_blocks: u32
+
+    // Ticks at `resolution_hz`, frames ending after `idle_ticks`, no
+    // filter, no carrier, one block.
+    pub fn new(resolution_hz: u32, idle_ticks: u32) -> RxConfig {
+        return RxConfig { resolution_hz, idle_ticks, filter_ns: 0, carrier_hz: 0, carrier_duty_percent: 50, carrier_on_low: false, memory_blocks: 1 }
+    }
+}
+
+// Check `config` for transmit channel `channel` from a source clock at
+// `source_hz`; InvalidInput for settings out of range.
+pub fn check_tx(source_hz: u32, channel: u32, config: &TxConfig) -> void!hal.Error {
+    divider(source_hz, config.resolution_hz)?
+    carrier_counts(source_hz, config.carrier_hz, config.carrier_duty_percent)?
+    if channel >= TX_CHANNELS || config.memory_blocks < 1 || config.memory_blocks > BLOCKS - channel {
+        return err(hal.Error.InvalidInput)
+    }
+    return ok()
+}
+
+// Check `config` for receive channel `channel` from a source clock at
+// `source_hz`; InvalidInput for settings out of range.
+pub fn check_rx(source_hz: u32, channel: u32, config: &RxConfig) -> void!hal.Error {
+    divider(source_hz, config.resolution_hz)?
+    filter_cycles(source_hz, config.filter_ns)?
+    demodulation(source_hz, config)?
+    if channel >= RX_CHANNELS || config.memory_blocks < 1 || config.memory_blocks > RX_CHANNELS - channel {
+        return err(hal.Error.InvalidInput)
+    }
+    if config.idle_ticks < 1 || config.idle_ticks > MAX_TICKS {
+        return err(hal.Error.InvalidInput)
+    }
+    return ok()
+}
+
+// The glitch filter's threshold in source clock cycles for `filter_ns`.
+fn filter_cycles(source_hz: u32, filter_ns: u32) -> u32!hal.Error {
+    cycles := (source_hz as u64 * filter_ns as u64 + 500_000_000) / 1_000_000_000
+    if cycles > MAX_FILTER_CYCLES as u64 {
+        return err(hal.Error.InvalidInput)
+    }
+    return ok(cycles as u32)
+}
+
+// CH_RX_CARRIER_RM for `config`, or 0 without a carrier: the longest high
+// and low pulses, less one, that count as the carrier's, in ticks. The
+// carrier's own lengths with half again as margin, since a received
+// pulse may be a tick or more longer than its nominal length.
+fn demodulation(source_hz: u32, config: &RxConfig) -> u32!hal.Error {
+    if config.carrier_hz == 0 {
+        return ok(0)
+    }
+    resolution := source_hz / divider(source_hz, config.resolution_hz)?
+    counts := carrier_counts(resolution, config.carrier_hz, config.carrier_duty_percent)?
+    high := (counts >> 16) * 3 / 2
+    low := (counts & CARRIER_LOW) * 3 / 2
+    if high > 0xFFFF || low > 0xFFFF {
+        return err(hal.Error.InvalidInput)
+    }
+    return ok((high << 16) | low)
+}
+
+// Codes a transmitter sends, computed while they go out, for `send` and
+// `poll_send`.
+pub interface Pulses {
+    // How many codes, at least 1.
+    fn count(&self) -> usize
+    // Write codes `first` to `first + out.len - 1` into `out`.
+    fn fill(&self, first: usize, out: &mut[u32])
+}
+
+// Codes in a slice, as Pulses.
+pub struct Codes: Pulses {
+    codes: &[u32]
+
+    pub fn new(codes: &[u32]) -> Codes from(codes) {
+        return Codes { codes }
+    }
+
+    pub fn count(&self) -> usize {
+        return self.codes.len
+    }
+
+    pub fn fill(&self, first: usize, out: &mut[u32]) {
+        for index in 0..out.len {
+            out[index] = self.codes[first + index]
+        }
+    }
+}
+
+// WS2812 timing in nanoseconds: a 0 bit is high for 400 ns and low for
+// 850 ns, a 1 bit high for 800 ns and low for 450 ns, and 300 us low
+// latches the colors.
+const WS2812_ZERO_HIGH_NS: u32 = 400
+const WS2812_ZERO_LOW_NS: u32 = 850
+const WS2812_ONE_HIGH_NS: u32 = 800
+const WS2812_ONE_LOW_NS: u32 = 450
+const WS2812_LATCH_NS: u32 = 300_000
+
+// The pulses of colors for WS2812 addressable LEDs (also sold as
+// NeoPixels, SK6812, and others with the same protocol): 24 codes per LED,
+// green, red, then blue, most significant bit first, then a code that
+// holds the line low long enough to latch the colors.
+pub struct Ws2812Pulses: Pulses {
+    colors: &[u32]
+    zero: u32
+    one: u32
+    latch: u32
+
+    // The pulses of `colors`, one 0xRRGGBB value per LED along the chain,
+    // in ticks at `resolution_hz`, which must be at least 10 MHz.
+    pub fn new(colors: &[u32], resolution_hz: u32) -> Ws2812Pulses from(colors) {
+        core.assert(resolution_hz >= 10_000_000)
+        zero := code(true, ns_ticks(WS2812_ZERO_HIGH_NS, resolution_hz), false, ns_ticks(WS2812_ZERO_LOW_NS, resolution_hz))
+        one := code(true, ns_ticks(WS2812_ONE_HIGH_NS, resolution_hz), false, ns_ticks(WS2812_ONE_LOW_NS, resolution_hz))
+        half := ns_ticks(WS2812_LATCH_NS / 2, resolution_hz)
+        if half > MAX_TICKS {
+            half = MAX_TICKS
+        }
+        return Ws2812Pulses { colors, zero, one, latch: code(false, half, false, half) }
+    }
+
+    pub fn count(&self) -> usize {
+        return self.colors.len * 24 + 1
+    }
+
+    pub fn fill(&self, first: usize, out: &mut[u32]) {
+        led := first / 24
+        bit := (first % 24) as u32
+        grb := 0u32
+        if led < self.colors.len {
+            grb = ws2812_order(self.colors[led])
+        }
+        for index in 0..out.len {
+            if led >= self.colors.len {
+                out[index] = self.latch
+            } else {
+                if (grb & (0x80_0000u32 >> bit)) != 0 {
+                    out[index] = self.one
+                } else {
+                    out[index] = self.zero
+                }
+                bit += 1
+                if bit == 24 {
+                    bit = 0
+                    led += 1
+                    if led < self.colors.len {
+                        grb = ws2812_order(self.colors[led])
+                    }
+                }
+            }
+        }
+    }
+}
+
+// 0xRRGGBB as the LEDs take it: green, red, blue.
+fn ws2812_order(rgb: u32) -> u32 {
+    return ((rgb >> 8) & 0xFF00) | ((rgb << 8) & 0xFF_0000) | (rgb & 0xFF)
+}
+
+// `ns` nanoseconds in ticks at `resolution_hz`, rounded.
+fn ns_ticks(ns: u32, resolution_hz: u32) -> u32 {
+    return ((ns as u64 * resolution_hz as u64 + 500_000_000) / 1_000_000_000) as u32
+}
+
+// What a channel is doing.
+const IDLE: u32 = 0
+const SENDING: u32 = 1
+const LOOPING: u32 = 2
+const RECEIVING: u32 = 3
+
+// Codes copied at a time.
+const CHUNK: usize = 24
+// A transmission ends within the sum of its durations and this.
+const SEND_MARGIN_US: u64 = 10_000
+
+// One transmit channel. Its configuration is set when it is created and
+// kept until it is released.
+pub struct Transmitter<R: hal.Registers> {
+    registers: R
+    channel: u32
+    // CH_TX_CONF0 without the one-shot bits: divider, memory, idle level,
+    // and carrier.
+    conf: u32
+    // Codes in the channel's memory, and where it starts.
+    memory: usize
+    base: usize
+    resolution_hz: u32
+    carrier_hz: u32
+    // Microseconds since some start, for blocking waits.
+    clock: fn() -> u64
+    // The transmission: its phase, codes, codes written into memory so
+    // far, the quarter refilled next, and whether its end is in memory.
+    phase: u32
+    total: usize
+    written: usize
+    quarter: usize
+    ended: bool
+
+    // Configure transmit channel `channel`, 0 or 1, of an RMT whose source
+    // clock runs at `source_hz`, from `config`; `clock` gives microseconds
+    // for blocking waits. The output goes to its idle level. InvalidInput
+    // for settings out of range (check_tx).
+    pub fn new(registers: R, channel: u32, source_hz: u32, config: &TxConfig, clock: fn() -> u64) -> Transmitter<R>!hal.Error {
+        check_tx(source_hz, channel, config)?
+        divide := divider(source_hz, config.resolution_hz)?
+        counts := carrier_counts(source_hz, config.carrier_hz, config.carrier_duty_percent)?
+        conf := hal.encode(TX_DIV_CNT, divide & 0xFF) | hal.encode(TX_MEM_SIZE, config.memory_blocks) | IDLE_OUT_EN | CARRIER_EFF_EN
+        if config.idle_high {
+            conf |= IDLE_OUT_LV
+        }
+        carrier := 0u32
+        if counts != 0 {
+            conf |= TX_CARRIER_EN
+            if !config.carrier_on_low {
+                conf |= TX_CARRIER_OUT_LV
+            }
+            carrier = source_hz / ((counts >> 16) + (counts & CARRIER_LOW))
+        }
+        memory := config.memory_blocks as usize * BLOCK_CODES
+        tx := Transmitter<R> { registers, channel, conf, memory, base: channel as usize * BLOCK_CODES, resolution_hz: source_hz / divide, carrier_hz: carrier, clock, phase: IDLE, total: 0, written: 0, quarter: 0, ended: false }
+        index := channel as usize
+        tx.disable_interrupts()
+        tx.registers.write(CHCARRIER_DUTY + 4 * index, counts)
+        tx.registers.write(CH_TX_LIM + 4 * index, hal.encode(TX_LIM, (memory / 4) as u32))
+        tx.clear_events()
+        tx.registers.write(CH_TX_CONF0 + 4 * index, conf | MEM_RD_RST | APB_MEM_RST)
+        tx.registers.write(CH_TX_CONF0 + 4 * index, conf | TX_CONF_UPDATE)
+        return ok(tx)
+    }
+
+    // Stop any transmission and give back the registers.
+    pub fn release(self) -> R {
+        self.stop()
+        self.disable_interrupts()
+        let Transmitter { registers, channel, conf, memory, base, resolution_hz, carrier_hz, clock, phase, total, written, quarter, ended } = self
+        return registers
+    }
+
+    // Send `codes` and wait until the last has gone out. InvalidInput for
+    // no codes; Busy while another transmission runs; Overrun if refilling
+    // fell behind; Bus if the channel reports an error; Timeout if the
+    // transmission takes longer than its durations add up to, plus 10 ms.
+    pub fn transmit(&mut self, codes: &[u32]) -> void!hal.Error {
+        pulses := Codes.new(codes)
+        return self.send(&pulses)
+    }
+
+    // Start sending `codes`, then, called again with the same codes, keep
+    // the channel's memory filled; true once the last code has gone out.
+    // Errors as for `transmit`, without Timeout; the transmission is over
+    // after any error.
+    pub fn poll_transmit(&mut self, codes: &[u32]) -> bool!hal.Error {
+        pulses := Codes.new(codes)
+        return self.poll_send(&pulses)
+    }
+
+    // `transmit` for codes computed while they go out.
+    pub fn send<P: Pulses>(&mut self, pulses: &P) -> void!hal.Error {
+        if self.phase != IDLE {
+            return err(hal.Error.Busy)
+        }
+        limit := duration_us(pulses, self.resolution_hz) + SEND_MARGIN_US
+        start := (self.clock)()
+        for {
+            if self.poll_send(pulses)? {
+                return ok()
+            }
+            if (self.clock)() - start > limit {
+                self.stop()
+                return err(hal.Error.Timeout)
+            }
+        }
+    }
+
+    // `poll_transmit` for codes computed while they go out.
+    pub fn poll_send<P: Pulses>(&mut self, pulses: &P) -> bool!hal.Error {
+        index := self.channel as usize
+        if self.phase == LOOPING {
+            return err(hal.Error.Busy)
+        }
+        if self.phase == IDLE {
+            total := pulses.count()
+            if total == 0 {
+                return err(hal.Error.InvalidInput)
+            }
+            self.total = total
+            self.written = 0
+            self.quarter = 0
+            self.ended = false
+            memory := self.memory
+            self.copy(pulses, 0, memory)
+            self.clear_events()
+            limit := hal.encode(TX_LIM, (self.memory / 4) as u32)
+            self.registers.write(CH_TX_LIM + 4 * index, limit)
+            self.start(MEM_TX_WRAP_EN)
+            self.phase = SENDING
+            return ok(false)
+        }
+        raw := self.registers.read(INT_RAW)
+        if (raw & tx_error(self.channel)) != 0 {
+            self.stop()
+            return err(hal.Error.Bus)
+        }
+        if (raw & tx_end(self.channel)) != 0 {
+            self.clear_events()
+            self.phase = IDLE
+            return ok(true)
+        }
+        if (raw & tx_threshold(self.channel)) != 0 {
+            threshold := tx_threshold(self.channel)
+            self.registers.write(INT_CLR, threshold)
+            if !self.ended {
+                // The transmitter has moved on past the quarter it sent; if
+                // it is already back in it, it sent stale codes.
+                size := self.memory / 4
+                start := self.quarter * size
+                position := self.position()
+                if position >= start && position < start + size {
+                    self.stop()
+                    return err(hal.Error.Overrun)
+                }
+                self.copy(pulses, start, size)
+                self.quarter = (self.quarter + 1) % 4
+            }
+        }
+        return ok(false)
+    }
+
+    // Send `codes`, which with their end must fit the channel's memory,
+    // `count` times, 1 to MAX_LOOPS, or 0 for until `stop`, back to back.
+    // InvalidInput for too many codes or loops; Busy while another
+    // transmission runs. `poll_loop` reports when the loops are done.
+    pub fn start_loop(&mut self, codes: &[u32], count: u32) -> void!hal.Error {
+        if codes.len == 0 || codes.len >= self.memory || count > MAX_LOOPS {
+            return err(hal.Error.InvalidInput)
+        }
+        if self.phase != IDLE {
+            return err(hal.Error.Busy)
+        }
+        index := self.channel as usize
+        for code_index in 0..codes.len {
+            self.put(code_index, codes[code_index])
+        }
+        self.put(codes.len, END)
+        self.clear_events()
+        limit := hal.encode(TX_LIM, (self.memory / 4) as u32) | hal.encode(TX_LOOP_NUM, count)
+        if count > 0 {
+            limit |= TX_LOOP_CNT_EN | LOOP_STOP_EN
+        }
+        self.registers.write(CH_TX_LIM + 4 * index, limit | LOOP_COUNT_RESET)
+        self.registers.write(CH_TX_LIM + 4 * index, limit)
+        self.start(TX_CONTI_MODE)
+        self.phase = LOOPING
+        return ok()
+    }
+
+    // Whether the loops of `start_loop` are done; never for endless ones.
+    // Bus if the channel reports an error, Unsupported without loops.
+    pub fn poll_loop(&mut self) -> bool!hal.Error {
+        if self.phase != LOOPING {
+            return err(hal.Error.Unsupported)
+        }
+        raw := self.registers.read(INT_RAW)
+        if (raw & tx_error(self.channel)) != 0 {
+            self.stop()
+            return err(hal.Error.Bus)
+        }
+        if (raw & tx_loop(self.channel)) != 0 {
+            self.stop()
+            return ok(true)
+        }
+        return ok(false)
+    }
+
+    // Stop any transmission at once; the output returns to its idle
+    // level.
+    pub fn stop(&mut self) {
+        index := self.channel as usize
+        conf := self.conf
+        self.registers.write(CH_TX_CONF0 + 4 * index, conf | TX_STOP)
+        self.registers.write(CH_TX_CONF0 + 4 * index, conf | TX_STOP | TX_CONF_UPDATE)
+        limit := hal.encode(TX_LIM, (self.memory / 4) as u32)
+        self.registers.write(CH_TX_LIM + 4 * index, limit)
+        self.clear_events()
+        self.phase = IDLE
+    }
+
+    // Whether a transmission or loop runs.
+    pub fn is_busy(&self) -> bool {
+        return self.phase != IDLE
+    }
+
+    // Use `blocks` blocks of memory from now on, 1 to 4 less the channel's
+    // number; the blocks after the channel's own must be free for it.
+    // InvalidInput for another number; Busy while a transmission runs.
+    pub fn set_memory_blocks(&mut self, blocks: u32) -> void!hal.Error {
+        if blocks < 1 || blocks > BLOCKS - self.channel {
+            return err(hal.Error.InvalidInput)
+        }
+        if self.phase != IDLE {
+            return err(hal.Error.Busy)
+        }
+        index := self.channel as usize
+        self.memory = blocks as usize * BLOCK_CODES
+        self.conf = (self.conf & ~TX_MEM_SIZE) | hal.encode(TX_MEM_SIZE, blocks)
+        conf := self.conf
+        self.registers.write(CH_TX_CONF0 + 4 * index, conf)
+        self.registers.write(CH_TX_CONF0 + 4 * index, conf | TX_CONF_UPDATE)
+        limit := hal.encode(TX_LIM, (self.memory / 4) as u32)
+        self.registers.write(CH_TX_LIM + 4 * index, limit)
+        return ok()
+    }
+
+    // Raise the RMT interrupt when the transmission ends, fails, its loops
+    // are done, or a quarter of the memory needs refilling; poll to handle and
+    // clear it. `ignore` stops that.
+    pub fn listen(&mut self) {
+        section := hal.Critical.enter()
+        enabled := self.registers.read(INT_ENA)
+        events := self.events()
+        self.registers.write(INT_ENA, enabled | events)
+        core.drop(section)
+    }
+
+    pub fn ignore(&mut self) {
+        self.disable_interrupts()
+    }
+
+    // Whether this channel raises the RMT interrupt now.
+    pub fn is_pending(&mut self) -> bool {
+        events := self.events()
+        raw := self.registers.read(INT_RAW)
+        return (raw & self.registers.read(INT_ENA) & events) != 0
+    }
+
+    // The tick the channel counts, and the carrier frequency, 0 for none.
+    pub fn resolution_hz(&self) -> u32 {
+        return self.resolution_hz
+    }
+
+    pub fn carrier_hz(&self) -> u32 {
+        return self.carrier_hz
+    }
+
+    // The transmit channel, 0 or 1.
+    pub fn channel(&self) -> u32 {
+        return self.channel
+    }
+
+    // The codes the channel's memory holds.
+    pub fn memory_codes(&self) -> usize {
+        return self.memory
+    }
+
+    fn events(&self) -> u32 {
+        return tx_end(self.channel) | tx_error(self.channel) | tx_threshold(self.channel) | tx_loop(self.channel)
+    }
+
+    fn clear_events(&mut self) {
+        events := self.events()
+        self.registers.write(INT_CLR, events)
+    }
+
+    fn disable_interrupts(&mut self) {
+        section := hal.Critical.enter()
+        enabled := self.registers.read(INT_ENA)
+        events := self.events()
+        self.registers.write(INT_ENA, enabled & ~events)
+        core.drop(section)
+    }
+
+    // Write code `index` of the channel's memory.
+    fn put(&mut self, index: usize, value: u32) {
+        address := RAM + 4 * (self.base + index)
+        self.registers.write(address, value)
+    }
+
+    // Where the transmitter reads, in codes from the channel's start.
+    fn position(&mut self) -> usize {
+        status := CH_TX_STATUS + 4 * self.channel as usize
+        address := (self.registers.read(status) & MEM_ADDRESS) as usize
+        if address < self.base {
+            return 0
+        }
+        return address - self.base
+    }
+
+    // Copy the next codes of `pulses` into the memory from code `at`, at
+    // most `room` of them, and the end after the last if it fits.
+    fn copy<P: Pulses>(&mut self, pulses: &P, at: usize, room: usize) {
+        buffer: [CHUNK]u32 = [0u32; CHUNK]
+        count := self.total - self.written
+        if count > room {
+            count = room
+        }
+        done := 0usize
+        for done < count {
+            step := count - done
+            if step > CHUNK {
+                step = CHUNK
+            }
+            pulses.fill(self.written + done, &mut buffer[..step])
+            for index in 0..step {
+                self.put(at + done + index, buffer[index])
+            }
+            done += step
+        }
+        self.written += count
+        if self.written == self.total && count < room {
+            self.put(at + count, END)
+            self.ended = true
+        }
+    }
+
+    // Start the channel with `mode`, wrap or loop mode.
+    fn start(&mut self, mode: u32) {
+        address := CH_TX_CONF0 + 4 * self.channel as usize
+        conf := self.conf | mode
+        self.registers.write(address, conf | TX_CONF_UPDATE)
+        self.registers.write(address, conf | TX_START | MEM_RD_RST | APB_MEM_RST)
+        self.registers.write(address, conf | TX_CONF_UPDATE)
+    }
+}
+
+// The microseconds the codes of `pulses` last at `resolution_hz`, up to
+// the first zero duration.
+fn duration_us<P: Pulses>(pulses: &P, resolution_hz: u32) -> u64 {
+    buffer: [CHUNK]u32 = [0u32; CHUNK]
+    total := pulses.count()
+    ticks := 0u64
+    done := 0usize
+    for done < total {
+        step := total - done
+        if step > CHUNK {
+            step = CHUNK
+        }
+        pulses.fill(done, &mut buffer[..step])
+        for index in 0..step {
+            first := ticks0(buffer[index])
+            second := ticks1(buffer[index])
+            ticks += first as u64 + second as u64
+            if first == 0 || second == 0 {
+                return ticks * 1_000_000 / resolution_hz as u64
+            }
+        }
+        done += step
+    }
+    return ticks * 1_000_000 / resolution_hz as u64
+}
+
+// One receive channel. Its configuration is set when it is created and
+// kept until it is released.
+pub struct Receiver<R: hal.Registers> {
+    registers: R
+    channel: u32
+    // CH_RX_CONF1 without the one-shot bits: filter, wrap mode, owner.
+    conf: u32
+    memory: usize
+    base: usize
+    resolution_hz: u32
+    clock: fn() -> u64
+    // The reception: its phase, where the next codes to copy out start,
+    // and the codes received so far.
+    phase: u32
+    offset: usize
+    received: usize
+
+    // Configure receive channel `channel`, 0 or 1 (the RMT's channels 2
+    // and 3), of an RMT whose source clock runs at `source_hz`, from
+    // `config`; `clock` gives microseconds for blocking waits. InvalidInput
+    // for settings out of range (check_rx).
+    pub fn new(registers: R, channel: u32, source_hz: u32, config: &RxConfig, clock: fn() -> u64) -> Receiver<R>!hal.Error {
+        check_rx(source_hz, channel, config)?
+        divide := divider(source_hz, config.resolution_hz)?
+        cycles := filter_cycles(source_hz, config.filter_ns)?
+        thresholds := demodulation(source_hz, config)?
+        conf0 := hal.encode(RX_DIV_CNT, divide & 0xFF) | hal.encode(IDLE_THRES, config.idle_ticks) | hal.encode(RX_MEM_SIZE, config.memory_blocks)
+        if thresholds != 0 {
+            conf0 |= RX_CARRIER_EN
+            if !config.carrier_on_low {
+                conf0 |= RX_CARRIER_OUT_LV
+            }
+        }
+        conf := MEM_RX_WRAP_EN | MEM_OWNER
+        if cycles > 0 {
+            conf |= RX_FILTER_EN | hal.encode(RX_FILTER_THRES, cycles)
+        }
+        memory := config.memory_blocks as usize * BLOCK_CODES
+        rx := Receiver<R> { registers, channel, conf, memory, base: (TX_CHANNELS + channel) as usize * BLOCK_CODES, resolution_hz: source_hz / divide, clock, phase: IDLE, offset: 0, received: 0 }
+        index := channel as usize
+        rx.disable_interrupts()
+        rx.registers.write(CH_RX_CONF0 + 8 * index, conf0)
+        rx.registers.write(CH_RX_CARRIER_RM + 4 * index, thresholds)
+        rx.registers.write(CH_RX_LIM + 4 * index, hal.encode(TX_LIM, (memory / 4) as u32))
+        rx.clear_events()
+        rx.registers.write(CH_RX_CONF1 + 8 * index, conf)
+        rx.registers.write(CH_RX_CONF1 + 8 * index, conf | RX_CONF_UPDATE)
+        return ok(rx)
+    }
+
+    // Stop any reception and give back the registers.
+    pub fn release(self) -> R {
+        self.stop()
+        self.disable_interrupts()
+        let Receiver { registers, channel, conf, memory, base, resolution_hz, clock, phase, offset, received } = self
+        return registers
+    }
+
+    // Receive one frame into `buffer` and return its number of codes, the
+    // last of which holds a zero duration where the input went idle; a
+    // reception `poll_receive` started into the same buffer goes on.
+    // Timeout if no frame has ended within `timeout_us`; Overrun if the
+    // frame does not fit `buffer` (which then holds its start) or the
+    // channel's memory was emptied too late; Bus if the channel reports an
+    // error. The reception is stopped after any error.
+    pub fn receive(&mut self, buffer: &mut[u32], timeout_us: u64) -> usize!hal.Error {
+        start := (self.clock)()
+        for {
+            if self.poll_receive(buffer)? {
+                return ok(self.received)
+            }
+            if (self.clock)() - start > timeout_us {
+                self.stop()
+                return err(hal.Error.Timeout)
+            }
+        }
+    }
+
+    // Start receiving a frame into `buffer`, then, called again with the
+    // same buffer, keep the channel's memory emptied; true once the frame
+    // has ended, with `received` codes in `buffer`. Errors as for
+    // `receive`, without Timeout.
+    pub fn poll_receive(&mut self, buffer: &mut[u32]) -> bool!hal.Error {
+        index := self.channel as usize
+        if self.phase == IDLE {
+            self.offset = 0
+            self.received = 0
+            self.clear_events()
+            limit := hal.encode(TX_LIM, (self.memory / 4) as u32)
+            self.registers.write(CH_RX_LIM + 4 * index, limit)
+            if self.memory > BLOCK_CODES {
+                // The second block's owner bit is the next channel's.
+                self.registers.write(CH_RX_CONF1 + 8 * (index + 1), MEM_OWNER)
+            }
+            address := CH_RX_CONF1 + 8 * index
+            conf := self.conf
+            self.registers.write(address, conf | RX_CONF_UPDATE)
+            self.registers.write(address, conf | MEM_WR_RST | RX_APB_MEM_RST | RX_EN)
+            self.registers.write(address, conf | RX_EN | RX_CONF_UPDATE)
+            self.phase = RECEIVING
+            return ok(false)
+        }
+        raw := self.registers.read(INT_RAW)
+        if (raw & rx_error(self.channel)) != 0 {
+            self.stop()
+            return err(hal.Error.Bus)
+        }
+        if (raw & rx_end(self.channel)) != 0 {
+            self.halt()
+            position := self.position()
+            count := position + self.memory - self.offset
+            if position >= self.offset {
+                count = position - self.offset
+            }
+            if count == 0 && (raw & rx_threshold(self.channel)) != 0 {
+                // The receiver wrote the whole memory since the last copy.
+                count = self.memory
+            }
+            self.clear_events()
+            self.phase = IDLE
+            self.copy(buffer, count)?
+            return ok(true)
+        }
+        if (raw & rx_threshold(self.channel)) != 0 {
+            threshold := rx_threshold(self.channel)
+            self.registers.write(INT_CLR, threshold)
+            // The receiver has moved on past the quarter to copy; if it is
+            // back in it, it overwrote codes not yet copied.
+            size := self.memory / 4
+            position := self.position()
+            ahead := position + self.memory - self.offset
+            if position >= self.offset {
+                ahead = position - self.offset
+            }
+            if ahead < size {
+                self.stop()
+                return err(hal.Error.Overrun)
+            }
+            match self.copy(buffer, size) {
+                ok() => {}
+                err(error) => {
+                    self.stop()
+                    return err(error)
+                }
+            }
+        }
+        return ok(false)
+    }
+
+    // Stop any reception.
+    pub fn stop(&mut self) {
+        self.halt()
+        self.clear_events()
+        self.phase = IDLE
+    }
+
+    // Whether a reception runs.
+    pub fn is_busy(&self) -> bool {
+        return self.phase != IDLE
+    }
+
+    // The codes of the last frame, or received so far.
+    pub fn received(&self) -> usize {
+        return self.received
+    }
+
+    // Raise the RMT interrupt when a frame ends, the channel fails, or
+    // a quarter of the memory needs emptying; poll to handle and clear it.
+    // `ignore` stops that.
+    pub fn listen(&mut self) {
+        section := hal.Critical.enter()
+        enabled := self.registers.read(INT_ENA)
+        events := self.events()
+        self.registers.write(INT_ENA, enabled | events)
+        core.drop(section)
+    }
+
+    pub fn ignore(&mut self) {
+        self.disable_interrupts()
+    }
+
+    // Whether this channel raises the RMT interrupt now.
+    pub fn is_pending(&mut self) -> bool {
+        events := self.events()
+        raw := self.registers.read(INT_RAW)
+        return (raw & self.registers.read(INT_ENA) & events) != 0
+    }
+
+    pub fn resolution_hz(&self) -> u32 {
+        return self.resolution_hz
+    }
+
+    // The receive channel, 0 or 1 (the RMT's channels 2 and 3).
+    pub fn channel(&self) -> u32 {
+        return self.channel
+    }
+
+    pub fn memory_codes(&self) -> usize {
+        return self.memory
+    }
+
+    fn events(&self) -> u32 {
+        return rx_end(self.channel) | rx_error(self.channel) | rx_threshold(self.channel)
+    }
+
+    fn clear_events(&mut self) {
+        events := self.events()
+        self.registers.write(INT_CLR, events)
+    }
+
+    fn disable_interrupts(&mut self) {
+        section := hal.Critical.enter()
+        enabled := self.registers.read(INT_ENA)
+        events := self.events()
+        self.registers.write(INT_ENA, enabled & ~events)
+        core.drop(section)
+    }
+
+    // Turn the receiver off.
+    fn halt(&mut self) {
+        address := CH_RX_CONF1 + 8 * self.channel as usize
+        conf := self.conf
+        self.registers.write(address, conf)
+        self.registers.write(address, conf | RX_CONF_UPDATE)
+    }
+
+    // Where the receiver writes next, in codes from the channel's start.
+    fn position(&mut self) -> usize {
+        status := CH_RX_STATUS + 4 * self.channel as usize
+        address := (self.registers.read(status) & MEM_ADDRESS) as usize
+        if address < self.base {
+            return 0
+        }
+        position := address - self.base
+        if position >= self.memory {
+            return position - self.memory
+        }
+        return position
+    }
+
+    // Copy `count` codes from the memory at the offset into `buffer` after
+    // those received; Overrun for codes that do not fit.
+    fn copy(&mut self, buffer: &mut[u32], count: usize) -> void!hal.Error {
+        for _ in 0..count {
+            if self.received == buffer.len {
+                return err(hal.Error.Overrun)
+            }
+            address := RAM + 4 * (self.base + self.offset)
+            buffer[self.received] = self.registers.read(address)
+            self.received += 1
+            self.offset += 1
+            if self.offset == self.memory {
+                self.offset = 0
+            }
+        }
+        return ok()
+    }
+}

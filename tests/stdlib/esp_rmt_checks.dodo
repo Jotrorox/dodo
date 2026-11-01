@@ -1,0 +1,687 @@
+package main
+
+import "std/embedded/hal"
+import "std/embedded/peripheral/esp_rmt"
+
+// Host checks for std/embedded/peripheral/esp_rmt, the ESP32-C6's remote
+// control peripheral, against a model of its channels: a transmitter reads
+// codes from the channel memory and a receiver writes a prepared frame
+// into it, a few codes each time the program reads INT_RAW, with the
+// memory's wrap mode, the threshold events, loops, and the end and error
+// events. The checks cover the code helpers, the clock divider and the
+// carrier and filter settings, transmissions and receptions longer than
+// the channels' memory, too-late refills, loops, and WS2812 pulses.
+
+const SOURCE_HZ: u32 = 80_000_000
+
+const TX_START: u32 = 1 << 0
+const TX_CONTI_MODE: u32 = 1 << 3
+const MEM_TX_WRAP_EN: u32 = 1 << 4
+const TX_STOP: u32 = 1 << 7
+const RX_EN: u32 = 1 << 0
+const MEM_RX_WRAP_EN: u32 = 1 << 13
+
+struct RmtModel {
+    registers: [64]u32
+    ram: [192]u32
+    raw: u32
+    // Codes each channel moves per INT_RAW read.
+    speed: usize
+    // The transmitters: running, where they read, codes since the last
+    // threshold event, and loops done; every code sent, logged.
+    tx_running: [2]bool
+    tx_position: [2]usize
+    tx_since: [2]usize
+    tx_loops: [2]u32
+    log: [600]u32
+    logged: usize
+    // The receivers: running, where they write, codes since the last
+    // threshold event; the frame they receive and how much of it.
+    rx_running: [2]bool
+    rx_position: [2]usize
+    rx_since: [2]usize
+    frame: [400]u32
+    frame_codes: usize
+    frame_given: usize
+    // INT_RAW reads until transmit channel 1 and receive channel 0 report
+    // an error, 0 for never.
+    error_in: u32
+
+    fn new(speed: usize) -> RmtModel {
+        return RmtModel { registers: [0u32; 64], ram: [0u32; 192], raw: 0, speed, tx_running: [false; 2], tx_position: [0usize; 2], tx_since: [0usize; 2], tx_loops: [0u32; 2], log: [0u32; 600], logged: 0, rx_running: [false; 2], rx_position: [0usize; 2], rx_since: [0usize; 2], frame: [0u32; 400], frame_codes: 0, frame_given: 0, error_in: 0 }
+    }
+
+    pub fn read(&mut self, offset: usize) -> u32 {
+        if offset >= 0x400 {
+            return self.ram[(offset - 0x400) / 4]
+        }
+        if offset == 0x38 {
+            self.step()
+            return self.raw
+        }
+        if offset == 0x28 || offset == 0x2C {
+            n := (offset - 0x28) / 4
+            return (n * 48 + self.tx_position[n]) as u32
+        }
+        if offset == 0x30 || offset == 0x34 {
+            k := (offset - 0x30) / 4
+            return ((2 + k) * 48 + self.rx_position[k]) as u32
+        }
+        return self.registers[offset / 4]
+    }
+
+    pub fn write(&mut self, offset: usize, value: u32) {
+        if offset >= 0x400 {
+            self.ram[(offset - 0x400) / 4] = value
+            return
+        }
+        if offset == 0x44 {
+            self.raw &= ~value
+            return
+        }
+        self.registers[offset / 4] = value
+        if offset == 0x10 || offset == 0x14 {
+            n := (offset - 0x10) / 4
+            if (value & TX_START) != 0 {
+                self.tx_running[n] = true
+                self.tx_position[n] = 0
+                self.tx_since[n] = 0
+                self.tx_loops[n] = 0
+            }
+            if (value & TX_STOP) != 0 {
+                self.tx_running[n] = false
+            }
+        }
+        if offset == 0x1C || offset == 0x24 {
+            k := (offset - 0x1C) / 8
+            if (value & 0b10) != 0 {
+                self.rx_position[k] = 0
+                self.rx_since[k] = 0
+            }
+            self.rx_running[k] = (value & RX_EN) != 0
+        }
+    }
+
+    fn step(&mut self) {
+        if self.error_in > 0 {
+            self.error_in -= 1
+            if self.error_in == 0 {
+                self.raw |= (1u32 << 5) | (1u32 << 6)
+            }
+        }
+        for n in 0..2usize {
+            for _ in 0..self.speed {
+                if self.tx_running[n] {
+                    self.send(n)
+                }
+            }
+        }
+        for k in 0..2usize {
+            for _ in 0..self.speed {
+                if self.rx_running[k] {
+                    self.receive(k)
+                }
+            }
+        }
+    }
+
+    // Send one code on transmit channel `n`.
+    fn send(&mut self, n: usize) {
+        conf := self.registers[(0x10 + 4 * n) / 4]
+        memory := (((conf >> 16) & 7) * 48) as usize
+        limit := self.registers[(0x58 + 4 * n) / 4]
+        code := self.ram[n * 48 + self.tx_position[n]]
+        ended := (code & 0x7FFF) == 0 || ((code >> 16) & 0x7FFF) == 0
+        if (code & 0x7FFF) != 0 {
+            self.log[self.logged] = code
+            self.logged += 1
+        }
+        self.tx_position[n] += 1
+        self.tx_since[n] += 1
+        if self.tx_since[n] == (limit & 0x1FF) as usize {
+            self.raw |= 1u32 << (8 + n as u32)
+            self.tx_since[n] = 0
+        }
+        if ended {
+            if (conf & TX_CONTI_MODE) != 0 {
+                self.tx_loops[n] += 1
+                self.tx_position[n] = 0
+                if (limit & (1u32 << 19)) != 0 && self.tx_loops[n] == ((limit >> 9) & 0x3FF) {
+                    self.raw |= 1u32 << (12 + n as u32)
+                    if (limit & (1u32 << 21)) != 0 {
+                        self.tx_running[n] = false
+                    }
+                }
+                return
+            }
+            self.raw |= 1u32 << n as u32
+            self.tx_running[n] = false
+            return
+        }
+        if self.tx_position[n] == memory {
+            if (conf & MEM_TX_WRAP_EN) != 0 || (conf & TX_CONTI_MODE) != 0 {
+                self.tx_position[n] = 0
+            } else {
+                self.raw |= 1u32 << (4 + n as u32)
+                self.tx_running[n] = false
+            }
+        }
+    }
+
+    // Receive one code on receive channel `k`.
+    fn receive(&mut self, k: usize) {
+        if self.frame_given == self.frame_codes {
+            return
+        }
+        conf0 := self.registers[(0x18 + 8 * k) / 4]
+        conf1 := self.registers[(0x1C + 8 * k) / 4]
+        memory := (((conf0 >> 23) & 7) * 48) as usize
+        limit := (self.registers[(0x60 + 4 * k) / 4] & 0x1FF) as usize
+        code := self.frame[self.frame_given]
+        self.frame_given += 1
+        self.ram[(2 + k) * 48 + self.rx_position[k]] = code
+        self.rx_position[k] += 1
+        self.rx_since[k] += 1
+        if self.rx_since[k] == limit {
+            self.raw |= 1u32 << (10 + k as u32)
+            self.rx_since[k] = 0
+        }
+        if self.rx_position[k] == memory {
+            if (conf1 & MEM_RX_WRAP_EN) != 0 {
+                self.rx_position[k] = 0
+            } else {
+                self.raw |= 1u32 << (6 + k as u32)
+                self.rx_running[k] = false
+                return
+            }
+        }
+        if (code & 0x7FFF) == 0 || ((code >> 16) & 0x7FFF) == 0 {
+            self.raw |= 1u32 << (2 + k as u32)
+            self.rx_running[k] = false
+        }
+    }
+}
+
+static mut NOW: u64 = 0
+
+// A clock that advances a microsecond per reading.
+fn clock() -> u64 {
+    unsafe {
+        NOW += 1
+        return NOW
+    }
+}
+
+fn failed_with(result: void!hal.Error, expected: hal.Error) -> bool {
+    match result {
+        ok() => {
+            return false
+        }
+        err(error) => {
+            return error == expected
+        }
+    }
+}
+
+fn refused<T>(result: T!hal.Error, expected: hal.Error) -> bool {
+    match result {
+        ok(_) => {
+            return false
+        }
+        err(error) => {
+            return error == expected
+        }
+    }
+}
+
+fn same(a: &[u32], b: &[u32], count: usize) -> bool {
+    for index in 0..count {
+        if a[index] != b[index] {
+            return false
+        }
+    }
+    return true
+}
+
+// Codes with varied durations, high then low.
+fn pattern(out: &mut[u32]) {
+    for index in 0..out.len {
+        out[index] = esp_rmt.code(true, 10 + (index as u32 * 7) % 30, false, 12 + (index as u32 * 11) % 29)
+    }
+}
+
+fn codes_and_settings() {
+    code := esp_rmt.code(true, 100, false, 0x7FFF)
+    core.assert(code == ((0x7FFFu32 << 16) | 0x8000 | 100))
+    core.assert(esp_rmt.level0(code) && esp_rmt.ticks0(code) == 100 && !esp_rmt.level1(code) && esp_rmt.ticks1(code) == 0x7FFF)
+    core.assert(esp_rmt.code(false, 5, true, 6) == ((1u32 << 31) | (6u32 << 16) | 5))
+
+    // Durations of alternating levels; one longer than MAX_TICKS becomes
+    // two pulses at the same level, and an odd count ends in a zero.
+    durations := [100u32, 200, 40000, 300]
+    out: [4]u32 = [0u32; 4]
+    count := esp_rmt.encode(true, &durations, &mut out)!
+    core.assert(count == 3)
+    core.assert(out[0] == esp_rmt.code(true, 100, false, 200))
+    core.assert(out[1] == esp_rmt.code(true, 0x7FFF, true, 40000 - 0x7FFF))
+    core.assert(out[2] == esp_rmt.code(false, 300, false, 0))
+    zero := [100u32, 0]
+    core.assert(refused(esp_rmt.encode(false, &zero, &mut out), hal.Error.InvalidInput))
+    small: [1]u32 = [0u32; 1]
+    core.assert(refused(esp_rmt.encode(false, &durations, &mut small), hal.Error.Overrun))
+
+    // The divider: the closest of 1 to 256.
+    core.assert(esp_rmt.divider(SOURCE_HZ, 1_000_000)! == 80)
+    core.assert(esp_rmt.divider(SOURCE_HZ, 3_000_000)! == 27)
+    core.assert(esp_rmt.divider(SOURCE_HZ, SOURCE_HZ)! == 1)
+    core.assert(esp_rmt.divider(SOURCE_HZ, 312_500)! == 256)
+    core.assert(refused(esp_rmt.divider(SOURCE_HZ, 300_000), hal.Error.InvalidInput))
+    core.assert(refused(esp_rmt.divider(SOURCE_HZ, 0), hal.Error.InvalidInput))
+    core.assert(refused(esp_rmt.divider(SOURCE_HZ, 90_000_000), hal.Error.InvalidInput))
+
+    // The carrier's high and low counts.
+    core.assert(esp_rmt.carrier_counts(SOURCE_HZ, 0, 50)! == 0)
+    core.assert(esp_rmt.carrier_counts(SOURCE_HZ, 38_000, 50)! == ((1053u32 << 16) | 1052))
+    core.assert(esp_rmt.carrier_counts(SOURCE_HZ, 38_000, 33)! == ((695u32 << 16) | 1410))
+    core.assert(refused(esp_rmt.carrier_counts(SOURCE_HZ, 500, 50), hal.Error.InvalidInput))
+    core.assert(refused(esp_rmt.carrier_counts(SOURCE_HZ, 38_000, 0), hal.Error.InvalidInput))
+    core.assert(refused(esp_rmt.carrier_counts(SOURCE_HZ, 38_000, 100), hal.Error.InvalidInput))
+    core.assert(refused(esp_rmt.carrier_counts(SOURCE_HZ, 50_000_000, 50), hal.Error.InvalidInput))
+
+    // Settings out of range.
+    config := esp_rmt.TxConfig.new(1_000_000)
+    config.memory_blocks = 4
+    esp_rmt.check_tx(SOURCE_HZ, 0, &config)!
+    core.assert(failed_with(esp_rmt.check_tx(SOURCE_HZ, 1, &config), hal.Error.InvalidInput))
+    config.memory_blocks = 1
+    core.assert(failed_with(esp_rmt.check_tx(SOURCE_HZ, 2, &config), hal.Error.InvalidInput))
+    receive := esp_rmt.RxConfig.new(1_000_000, 0)
+    core.assert(failed_with(esp_rmt.check_rx(SOURCE_HZ, 0, &receive), hal.Error.InvalidInput))
+    receive.idle_ticks = 0x8000
+    core.assert(failed_with(esp_rmt.check_rx(SOURCE_HZ, 0, &receive), hal.Error.InvalidInput))
+    receive.idle_ticks = 1000
+    receive.filter_ns = 3187
+    esp_rmt.check_rx(SOURCE_HZ, 0, &receive)!
+    receive.filter_ns = 3200
+    core.assert(failed_with(esp_rmt.check_rx(SOURCE_HZ, 0, &receive), hal.Error.InvalidInput))
+    receive.filter_ns = 0
+    receive.memory_blocks = 2
+    esp_rmt.check_rx(SOURCE_HZ, 0, &receive)!
+    core.assert(failed_with(esp_rmt.check_rx(SOURCE_HZ, 1, &receive), hal.Error.InvalidInput))
+}
+
+fn transmitter_setup() {
+    config := esp_rmt.TxConfig.new(1_000_000)
+    config.idle_high = true
+    config.carrier_hz = 38_000
+    config.carrier_duty_percent = 33
+    config.memory_blocks = 2
+    tx := esp_rmt.Transmitter.new(RmtModel.new(4), 1, SOURCE_HZ, &config, clock)!
+    core.assert(tx.resolution_hz() == 1_000_000 && tx.carrier_hz() == 38_004 && tx.channel() == 1 && tx.memory_codes() == 96)
+    model := tx.release()
+    // CH1_TX_CONF0: divider 80, two blocks, idle high and driven, the
+    // carrier on the high level and only while sending; stopped by
+    // release. CH1 carrier duty and TX_LIM (a quarter of the memory).
+    conf := model.registers[0x14 / 4]
+    core.assert((conf & ~(TX_STOP | (1u32 << 24))) == ((80u32 << 8) | (2u32 << 16) | (1u32 << 5) | (1u32 << 6) | (1u32 << 20) | (1u32 << 21) | (1u32 << 22)))
+    core.assert(model.registers[0x4C / 4] == ((695u32 << 16) | 1410))
+    core.assert(model.registers[0x5C / 4] == 24)
+
+    config = esp_rmt.TxConfig.new(3_000_000)
+    config.carrier_on_low = true
+    config.carrier_hz = 1_000_000
+    tx = esp_rmt.Transmitter.new(RmtModel.new(4), 0, SOURCE_HZ, &config, clock)!
+    core.assert(tx.resolution_hz() == 2_962_962 && tx.carrier_hz() == 1_000_000)
+    // Interrupts: each channel enables its own bits only.
+    tx.listen()
+    model = tx.release()
+    core.assert(model.registers[0x40 / 4] == 0)
+    conf = model.registers[0x10 / 4]
+    core.assert((conf & (1u32 << 22)) == 0 && (conf & (1u32 << 21)) != 0 && ((conf >> 8) & 0xFF) == 27)
+    config = esp_rmt.TxConfig.new(1_000_000)
+    config.memory_blocks = 5
+    core.assert(refused(esp_rmt.Transmitter.new(RmtModel.new(4), 0, SOURCE_HZ, &config, clock), hal.Error.InvalidInput))
+}
+
+fn transmissions() {
+    config := esp_rmt.TxConfig.new(1_000_000)
+    tx := esp_rmt.Transmitter.new(RmtModel.new(3), 1, SOURCE_HZ, &config, clock)!
+
+    // A short transmission, blocking, then the interrupt enables.
+    codes := [esp_rmt.code(true, 100, false, 200), esp_rmt.code(true, 300, false, 400)]
+    tx.transmit(&codes)!
+    core.assert(!tx.is_busy())
+    tx.listen()
+    tx.ignore()
+    core.assert(refused(tx.poll_transmit(&codes[..0]), hal.Error.InvalidInput))
+    model := tx.release()
+    core.assert(model.logged == 2 && same(&model.log, &codes, 2))
+
+    // Transmissions longer than the memory, refilled a quarter at a time,
+    // and ones whose end falls on the edges of the memory and its
+    // quarters.
+    long: [200]u32 = [0u32; 200]
+    pattern(&mut long)
+    lengths := [200usize, 48, 47, 49, 60, 59, 61, 96, 1]
+    for index in 0..lengths.len {
+        count := lengths[index]
+        tx = esp_rmt.Transmitter.new(RmtModel.new(3), 1, SOURCE_HZ, &config, clock)!
+        polls := 0u32
+        for !tx.poll_transmit(&long[..count])! {
+            polls += 1
+            core.assert(polls < 1000)
+        }
+        model = tx.release()
+        core.assert(model.logged == count && same(&model.log, &long, count))
+    }
+
+    // Two blocks on channel 0.
+    config.memory_blocks = 2
+    tx = esp_rmt.Transmitter.new(RmtModel.new(5), 0, SOURCE_HZ, &config, clock)!
+    tx.transmit(&long)!
+    model = tx.release()
+    core.assert(model.logged == 200 && same(&model.log, &long, 200))
+
+    // A refill too late: the transmitter is back in the quarter to refill.
+    config.memory_blocks = 1
+    tx = esp_rmt.Transmitter.new(RmtModel.new(52), 1, SOURCE_HZ, &config, clock)!
+    core.assert(failed_with(tx.transmit(&long), hal.Error.Overrun))
+    core.assert(!tx.is_busy())
+    model = tx.release()
+    core.assert(!model.tx_running[1])
+
+    // An error event, and a transmission that never ends.
+    model = RmtModel.new(0)
+    model.error_in = 3
+    tx = esp_rmt.Transmitter.new(model, 1, SOURCE_HZ, &config, clock)!
+    core.assert(failed_with(tx.transmit(&codes), hal.Error.Bus))
+    core.assert(!tx.is_busy())
+    model = tx.release()
+    core.assert(!model.tx_running[1])
+    tx = esp_rmt.Transmitter.new(model, 1, SOURCE_HZ, &config, clock)!
+    core.assert(failed_with(tx.transmit(&codes), hal.Error.Timeout))
+    tx.poll_transmit(&codes)!
+    core.assert(failed_with(tx.transmit(&codes), hal.Error.Busy))
+    tx.stop()
+    tx.release()
+}
+
+fn errors_and_loops() {
+    config := esp_rmt.TxConfig.new(1_000_000)
+    codes := [esp_rmt.code(true, 100, false, 200), esp_rmt.code(true, 300, false, 400)]
+    model := RmtModel.new(0)
+    model.error_in = 2
+    tx := esp_rmt.Transmitter.new(model, 1, SOURCE_HZ, &config, clock)!
+    tx.start_loop(&codes, 0)!
+    core.assert(!tx.poll_loop()!)
+    core.assert(refused(tx.poll_loop(), hal.Error.Bus))
+    core.assert(!tx.is_busy())
+    tx.release()
+
+    // Loops: three times, then done; never for endless loops until stopped.
+    tx = esp_rmt.Transmitter.new(RmtModel.new(2), 1, SOURCE_HZ, &config, clock)!
+    core.assert(refused(tx.poll_loop(), hal.Error.Unsupported))
+    tx.start_loop(&codes, 3)!
+    core.assert(tx.is_busy())
+    core.assert(refused(tx.poll_transmit(&codes), hal.Error.Busy))
+    core.assert(failed_with(tx.start_loop(&codes, 3), hal.Error.Busy))
+    polls := 0u32
+    for !tx.poll_loop()! {
+        polls += 1
+        core.assert(polls < 100)
+    }
+    core.assert(!tx.is_busy())
+    model = tx.release()
+    core.assert(model.logged == 6 && same(&model.log, &codes, 2) && same(&model.log[2..], &codes, 2) && same(&model.log[4..], &codes, 2))
+    core.assert((model.registers[0x5C / 4] & ((1u32 << 19) | (1u32 << 21))) == 0)
+    tx = esp_rmt.Transmitter.new(RmtModel.new(2), 1, SOURCE_HZ, &config, clock)!
+    tx.start_loop(&codes, 0)!
+    for _ in 0..50 {
+        core.assert(!tx.poll_loop()!)
+    }
+    tx.stop()
+    core.assert(!tx.is_busy())
+    model = tx.release()
+    core.assert(!model.tx_running[1] && model.logged > 50)
+    tx = esp_rmt.Transmitter.new(RmtModel.new(2), 1, SOURCE_HZ, &config, clock)!
+    long: [48]u32 = [0u32; 48]
+    pattern(&mut long)
+    core.assert(failed_with(tx.start_loop(&long, 2), hal.Error.InvalidInput))
+    tx.start_loop(&long[..47], 1)!
+    for !tx.poll_loop()! {}
+    core.assert(failed_with(tx.start_loop(&codes, esp_rmt.MAX_LOOPS + 1), hal.Error.InvalidInput))
+    core.assert(failed_with(tx.start_loop(&codes[..0], 1), hal.Error.InvalidInput))
+
+    // More memory for a channel that owns the blocks after its own.
+    core.assert(failed_with(tx.set_memory_blocks(4), hal.Error.InvalidInput))
+    tx.set_memory_blocks(3)!
+    core.assert(tx.memory_codes() == 144)
+    full: [143]u32 = [0u32; 143]
+    pattern(&mut full)
+    tx.start_loop(&full, 1)!
+    core.assert(failed_with(tx.set_memory_blocks(1), hal.Error.Busy))
+    for !tx.poll_loop()! {}
+    tx.set_memory_blocks(1)!
+    model = tx.release()
+    core.assert(((model.registers[0x14 / 4] >> 16) & 7) == 1 && (model.registers[0x5C / 4] & 0x1FF) == 12)
+    core.assert(model.logged == 47 + 143 && same(&model.log[47..], &full, 143))
+}
+
+fn ws2812_pulses() {
+    colors := [0x80_00_01u32, 0x00_FF_00, 0x12_34_56]
+    pulses := esp_rmt.Ws2812Pulses.new(&colors, 80_000_000)
+    core.assert(pulses.count() == 73)
+    zero := esp_rmt.code(true, 32, false, 68)
+    one := esp_rmt.code(true, 64, false, 36)
+    all: [73]u32 = [0u32; 73]
+    pulses.fill(0, &mut all)
+    // Green, red, blue, most significant bit first.
+    for bit in 0..24usize {
+        expected := zero
+        if bit == 8 || bit == 23 {
+            expected = one
+        }
+        core.assert(all[bit] == expected)
+        expected = zero
+        if bit < 8 {
+            expected = one
+        }
+        core.assert(all[24 + bit] == expected)
+    }
+    core.assert(all[72] == esp_rmt.code(false, 12000, false, 12000))
+    // Filled in pieces across the LEDs' edges, the same codes.
+    piece: [7]u32 = [0u32; 7]
+    first := 0usize
+    for first < 73 {
+        step := 73 - first
+        if step > 7 {
+            step = 7
+        }
+        pulses.fill(first, &mut piece[..step])
+        core.assert(same(&piece, &all[first..], step))
+        first += step
+    }
+    // At 10 MHz: 4 and 9, 8 and 5 ticks, and a 300 us latch.
+    slow := esp_rmt.Ws2812Pulses.new(&colors[..1], 10_000_000)
+    slow.fill(0, &mut piece[..1])
+    core.assert(piece[0] == esp_rmt.code(true, 4, false, 9))
+    slow.fill(8, &mut piece[..1])
+    core.assert(piece[0] == esp_rmt.code(true, 8, false, 5))
+    slow.fill(24, &mut piece[..1])
+    core.assert(piece[0] == esp_rmt.code(false, 1500, false, 1500))
+
+    // Sent through a transmitter with refills.
+    config := esp_rmt.TxConfig.new(80_000_000)
+    tx := esp_rmt.Transmitter.new(RmtModel.new(3), 0, SOURCE_HZ, &config, clock)!
+    tx.send(&pulses)!
+    model := tx.release()
+    core.assert(model.logged == 73 && same(&model.log, &all, 73))
+}
+
+fn receiver_setup() {
+    config := esp_rmt.RxConfig.new(1_000_000, 1000)
+    config.filter_ns = 2000
+    config.carrier_hz = 38_000
+    config.memory_blocks = 2
+    rx := esp_rmt.Receiver.new(RmtModel.new(4), 0, SOURCE_HZ, &config, clock)!
+    core.assert(rx.resolution_hz() == 1_000_000 && rx.channel() == 0 && rx.memory_codes() == 96)
+    rx.listen()
+    model := rx.release()
+    // CH2_RX_CONF0: divider 80, idle 1000, two blocks, demodulation on the
+    // high level; CH2_RX_CONF1: the filter at 160 cycles, wrap mode, the
+    // memory the receiver's; the carrier thresholds a half above its 13
+    // ticks high and low; RX_LIM a quarter of the memory.
+    core.assert(model.registers[0x18 / 4] == (80u32 | (1000u32 << 8) | (2u32 << 23) | (1u32 << 28) | (1u32 << 29)))
+    core.assert((model.registers[0x1C / 4] & ~(1u32 << 15)) == ((1u32 << 3) | (1u32 << 4) | (160u32 << 5) | MEM_RX_WRAP_EN))
+    core.assert(model.registers[0x50 / 4] == ((19u32 << 16) | 19))
+    core.assert(model.registers[0x60 / 4] == 24)
+    core.assert(model.registers[0x40 / 4] == 0)
+
+    // Without a carrier or filter, both are off, though the reset value
+    // turns demodulation on.
+    model.registers[0x20 / 4] = 0x30FF_FF02
+    config = esp_rmt.RxConfig.new(8_000_000, 0x7FFF)
+    rx = esp_rmt.Receiver.new(model, 1, SOURCE_HZ, &config, clock)!
+    model = rx.release()
+    core.assert(model.registers[0x20 / 4] == (10u32 | (0x7FFFu32 << 8) | (1u32 << 23)))
+    core.assert((model.registers[0x24 / 4] & ~(1u32 << 15)) == ((1u32 << 3) | MEM_RX_WRAP_EN))
+    core.assert(model.registers[0x54 / 4] == 0)
+}
+
+fn receptions() {
+    config := esp_rmt.RxConfig.new(1_000_000, 1000)
+    buffer: [300]u32 = [0u32; 300]
+
+    // A short frame, its last code ending in a zero duration.
+    model := RmtModel.new(2)
+    model.frame[0] = esp_rmt.code(true, 100, false, 200)
+    model.frame[1] = esp_rmt.code(true, 300, false, 400)
+    model.frame[2] = esp_rmt.code(true, 50, false, 0)
+    model.frame_codes = 3
+    rx := esp_rmt.Receiver.new(model, 0, SOURCE_HZ, &config, clock)!
+    core.assert(rx.receive(&mut buffer, 1000)! == 3)
+    core.assert(rx.received() == 3 && !rx.is_busy())
+    model = rx.release()
+    core.assert(same(&buffer, &model.frame, 3))
+    core.assert(!model.rx_running[0])
+
+    // Frames longer than the memory, emptied a quarter at a time, and ones
+    // whose end falls on the edges of the memory and its quarters.
+    lengths := [250usize, 48, 47, 49, 12, 13, 1]
+    for index in 0..lengths.len {
+        count := lengths[index]
+        model = RmtModel.new(3)
+        pattern(&mut model.frame[..count])
+        model.frame[count - 1] &= 0xFFFF
+        model.frame_codes = count
+        rx = esp_rmt.Receiver.new(model, 1, SOURCE_HZ, &config, clock)!
+        polls := 0u32
+        for !rx.poll_receive(&mut buffer)! {
+            polls += 1
+            core.assert(polls < 1000)
+        }
+        core.assert(rx.received() == count)
+        model = rx.release()
+        core.assert(same(&buffer, &model.frame, count))
+    }
+
+    // Two blocks; and a whole memory's worth received between two polls.
+    config.memory_blocks = 2
+    model = RmtModel.new(5)
+    pattern(&mut model.frame[..250])
+    model.frame[249] &= 0xFFFF
+    model.frame_codes = 250
+    rx = esp_rmt.Receiver.new(model, 0, SOURCE_HZ, &config, clock)!
+    core.assert(rx.receive(&mut buffer, 1000)! == 250)
+    model = rx.release()
+    core.assert(same(&buffer, &model.frame, 250))
+    config.memory_blocks = 1
+    model = RmtModel.new(48)
+    pattern(&mut model.frame[..48])
+    model.frame[47] &= 0xFFFF
+    model.frame_codes = 48
+    rx = esp_rmt.Receiver.new(model, 0, SOURCE_HZ, &config, clock)!
+    core.assert(rx.receive(&mut buffer, 1000)! == 48)
+    model = rx.release()
+    core.assert(same(&buffer, &model.frame, 48))
+
+    // Emptied too late: the receiver is back in the quarter to copy.
+    model = RmtModel.new(52)
+    pattern(&mut model.frame[..200])
+    model.frame_codes = 200
+    rx = esp_rmt.Receiver.new(model, 0, SOURCE_HZ, &config, clock)!
+    core.assert(refused(rx.receive(&mut buffer, 1000), hal.Error.Overrun))
+    core.assert(!rx.is_busy())
+    model = rx.release()
+    core.assert(!model.rx_running[0])
+
+    // A frame longer than the buffer.
+    model = RmtModel.new(3)
+    pattern(&mut model.frame[..100])
+    model.frame[99] &= 0xFFFF
+    model.frame_codes = 100
+    rx = esp_rmt.Receiver.new(model, 0, SOURCE_HZ, &config, clock)!
+    core.assert(refused(rx.receive(&mut buffer[..60], 1000), hal.Error.Overrun))
+    model = rx.release()
+    core.assert(same(&buffer, &model.frame, 60))
+
+    // No frame within the timeout; then one, the same buffer polled on.
+    model = RmtModel.new(3)
+    rx = esp_rmt.Receiver.new(model, 0, SOURCE_HZ, &config, clock)!
+    core.assert(refused(rx.receive(&mut buffer, 500), hal.Error.Timeout))
+    core.assert(!rx.is_busy())
+    core.assert(!rx.poll_receive(&mut buffer)!)
+    model = rx.release()
+    core.assert(!model.rx_running[0])
+    model.frame[0] = esp_rmt.code(true, 7, false, 0)
+    model.frame_codes = 1
+    rx = esp_rmt.Receiver.new(model, 0, SOURCE_HZ, &config, clock)!
+    core.assert(!rx.poll_receive(&mut buffer)!)
+    core.assert(rx.receive(&mut buffer, 500)! == 1 && buffer[0] == esp_rmt.code(true, 7, false, 0))
+
+    // The receiver's error event.
+    rx.release()
+    model = RmtModel.new(0)
+    model.error_in = 3
+    rx = esp_rmt.Receiver.new(model, 0, SOURCE_HZ, &config, clock)!
+    core.assert(refused(rx.receive(&mut buffer, 1000), hal.Error.Bus))
+    core.assert(!rx.is_busy())
+    rx.release()
+}
+
+fn shared_interrupts() {
+    // Two channels on one model: each enables and disables only its own
+    // events.
+    model := RmtModel.new(0)
+    model.registers[0x40 / 4] = 1u32 << 31
+    config := esp_rmt.TxConfig.new(1_000_000)
+    tx := esp_rmt.Transmitter.new(model, 1, SOURCE_HZ, &config, clock)!
+    tx.listen()
+    model = tx.release()
+    core.assert(model.registers[0x40 / 4] == 1u32 << 31)
+    model.registers[0x40 / 4] = (1u32 << 31) | (1u32 << 2)
+    tx = esp_rmt.Transmitter.new(model, 1, SOURCE_HZ, &config, clock)!
+    tx.listen()
+    codes := [esp_rmt.code(true, 1, false, 1)]
+    tx.poll_transmit(&codes)!
+    model = tx.release()
+    core.assert(model.registers[0x40 / 4] == ((1u32 << 31) | (1u32 << 2)))
+    receive := esp_rmt.RxConfig.new(1_000_000, 100)
+    rx := esp_rmt.Receiver.new(model, 0, SOURCE_HZ, &receive, clock)!
+    core.assert(!rx.is_pending())
+    rx.listen()
+    rx.ignore()
+    model = rx.release()
+    core.assert(model.registers[0x40 / 4] == 1u32 << 31)
+}
+
+fn main() {
+    codes_and_settings()
+    transmitter_setup()
+    transmissions()
+    errors_and_loops()
+    ws2812_pulses()
+    receiver_setup()
+    receptions()
+    shared_interrupts()
+}

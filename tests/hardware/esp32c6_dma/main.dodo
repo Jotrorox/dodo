@@ -1,0 +1,477 @@
+package main
+
+import "std/embedded/board"
+import "std/embedded/chip"
+import "std/embedded/chip/esp_adc"
+import "std/embedded/chip/esp_rng"
+import "std/embedded/hal"
+import "std/embedded/peripheral/esp_uart"
+import "std/fmt"
+import "std/io"
+
+// Hardware checks for the ESP32-C6's DMA streams in
+// std/embedded/chip/esp32c6: a serial port receiving by DMA through UHCI0
+// (esp_uhci), and the ADC's continuous sampler (esp_adc).
+// Nothing needs to be wired to the board: the serial port runs in the
+// UART's internal loopback, and the ADC samples pins the program drives
+// high and low with their own output drivers.
+//
+// Same protocol as tests/hardware/esp32c6_devkitc: after the host sends a
+// byte, `selftest ready`, then `check N ok` or `check N FAILED` per check,
+// and `selftest done N`. Run with
+// `python3 scripts/test_esp32c6.py -O 2 --project tests/hardware/esp32c6_dma`.
+
+static mut CHECKS: u32 = 0
+static mut SERIAL: Option<chip.UsbSerial> = none
+
+fn say_number(text: &str, value: u32) {
+    unsafe {
+        match &mut SERIAL {
+            some(serial) => {
+                fmt.printf(serial, "{}{}\n", text, value)!
+                serial.flush()!
+            }
+            none => {}
+        }
+    }
+}
+
+fn say_hex(text: &str, value: u32) {
+    unsafe {
+        match &mut SERIAL {
+            some(serial) => {
+                fmt.printf(serial, "{}{:x}\n", text, value)!
+                serial.flush()!
+            }
+            none => {}
+        }
+    }
+}
+
+fn say(text: &str) {
+    unsafe {
+        match &mut SERIAL {
+            some(serial) => {
+                fmt.printf(serial, "{}", text)!
+                serial.flush()!
+            }
+            none => {}
+        }
+    }
+}
+
+fn check(ok: bool) {
+    unsafe {
+        match &mut SERIAL {
+            some(serial) => {
+                if ok {
+                    fmt.printf(serial, "check {} ok\n", CHECKS)!
+                } else {
+                    fmt.printf(serial, "check {} FAILED\n", CHECKS)!
+                }
+                serial.flush()!
+            }
+            none => {}
+        }
+        CHECKS += 1
+    }
+}
+
+fn refused<T>(result: T!hal.Error, expected: hal.Error) -> bool {
+    match result {
+        ok(_) => {
+            return false
+        }
+        err(error) => {
+            return error == expected
+        }
+    }
+}
+
+// Drive a pin owned by an analog input high or low with its output driver,
+// or stop driving it, from outside the chip package.
+fn drive(pin: u32, level: Option<bool>) {
+    // SAFETY: the test owns the pin through its analog input.
+    unsafe {
+        set: hal.Reg<u32> = hal.Reg.at(0x6009_1008)
+        clear: hal.Reg<u32> = hal.Reg.at(0x6009_100C)
+        enable: hal.Reg<u32> = hal.Reg.at(0x6009_1024)
+        disable: hal.Reg<u32> = hal.Reg.at(0x6009_1028)
+        match level {
+            some(high) => {
+                if high {
+                    set.write(1u32 << pin)
+                } else {
+                    clear.write(1u32 << pin)
+                }
+                enable.write(1u32 << pin)
+            }
+            none => {
+                disable.write(1u32 << pin)
+            }
+        }
+    }
+}
+
+// --- Serial ports by DMA ----------------------------------------------------
+
+// Read into `buffer` until it is full or `limit_us` passes; returns how
+// many bytes, or the first error's code (with what came before it in
+// `buffer`) as a negative count.
+fn read_for(serial: &mut chip.UartDma, buffer: &mut[u8], timer: &mut chip.Timer, limit_us: u64) -> i32 {
+    count := 0usize
+    start := timer.now_us()
+    for count < buffer.len && timer.now_us() - start < limit_us {
+        match serial.poll_read(&mut buffer[count..]) {
+            ok(progress) => {
+                count += progress.transferred
+            }
+            err(error) => {
+                return -error.code
+            }
+        }
+    }
+    return count as i32
+}
+
+fn pattern(index: usize) -> u8 {
+    return ((index * 7 + 3) & 255) as u8
+}
+
+fn uart_checks(pins: &mut chip.Pins, timer: &mut chip.Timer, dma: &mut chip.Dma) {
+    port := pins.uart(board.UART_TX_PIN, some(board.UART_RX_PIN), 115_200)!
+    port.set_loopback(true)!
+    rx := dma.channel()!
+    small: [64]u8 = [0; 64]
+    check(refused(port.dma(&mut rx, &mut small), hal.Error.InvalidInput))
+    ring: [1024]u8 = [0; 1024]
+    serial := port.dma(&mut rx, &mut ring)!
+    size := serial.ring_size()
+    say_number("uart ring bytes ", size as u32)
+    check(size >= 896 && size % 128 == 0 && serial.available() == 0)
+
+    // Every byte value goes through unchanged: UHCI's separators (0xC0),
+    // escapes (0xDB), and flow control characters (0x11, 0x13) are off.
+    values: [256]u8 = [0; 256]
+    for index in 0usize..256 {
+        values[index] = index as u8
+    }
+    serial.write(&values)!
+    serial.flush()!
+    received: [300]u8 = [0; 300]
+    got := read_for(&mut serial, &mut received[..256], timer, 50_000)
+    same := got == 256
+    for index in 0usize..256 {
+        if received[index] != index as u8 {
+            same = false
+        }
+    }
+    say_number("uart all byte values back ", got as u32)
+    check(same)
+
+    // A message becomes readable once the line has been idle for 30 bit
+    // times after its last byte.
+    hello: [5]u8 = [104, 101, 108, 108, 111]
+    serial.write(&hello)!
+    serial.flush()!
+    early := serial.available()
+    timer.delay_us(1000)
+    later := serial.available()
+    got = read_for(&mut serial, &mut received[..5], timer, 10_000)
+    say_number("uart message available before idle ", early as u32)
+    say_number("uart message available after idle ", later as u32)
+    check(early == 0 && later == 5 && got == 5 && received[0] == 104 && received[4] == 111)
+
+    // Newlines: "a\n" goes out as "a\r\n" and reads back as "a\n".
+    serial.set_crlf(true)
+    line: [2]u8 = [97, 10]
+    serial.write(&line)!
+    serial.flush()!
+    timer.delay_us(1000)
+    available := serial.available()
+    got = read_for(&mut serial, &mut received[..8], timer, 5000)
+    serial.set_crlf(false)
+    say_number("uart crlf available ", available as u32)
+    check(available == 3 && got == 2 && received[0] == 97 && received[1] == 10)
+
+    // poll_flush: 32 bytes at 115200 baud take 2.8 ms to leave.
+    text: [32]u8 = [0x55; 32]
+    serial.write(&text)!
+    busy := !serial.poll_flush()!
+    start := timer.now_us()
+    for !serial.poll_flush()! {}
+    elapsed := timer.now_us() - start
+    timer.delay_us(1000)
+    got = read_for(&mut serial, &mut received[..32], timer, 10_000)
+    say_number("uart dma poll_flush us ", elapsed as u32)
+    check(busy && elapsed >= 2500 && elapsed < 3300 && got == 32)
+
+    // Each pause closes a part, so 40 one-byte messages fill the 32 parts;
+    // the channel stops there, and a read returns the 32 bytes the ring
+    // held, then reports OVERRUN.
+    for index in 0usize..40 {
+        one: [1]u8 = [index as u8]
+        serial.write(&one)!
+        serial.flush()!
+        timer.delay_us(1000)
+    }
+    held := serial.available()
+    received[0] = 0xFF
+    received[31] = 0xFF
+    code := 0i32
+    transferred := 0usize
+    match serial.poll_read(&mut received[..64]) {
+        ok(progress) => {
+            transferred = progress.transferred
+        }
+        err(error) => {
+            code = error.code
+            transferred = error.transferred
+        }
+    }
+    say_number("uart parts held ", held as u32)
+    say_number("uart read before overrun ", transferred as u32)
+    check(held == 32 && code == esp_uart.OVERRUN && transferred == 32 && received[0] == 0 && received[31] == 31)
+    // Reception starts again: what waited in the FIFO, then new messages.
+    timer.delay_us(2000)
+    leftover := read_for(&mut serial, &mut received[..64], timer, 2000)
+    xyz: [3]u8 = [120, 121, 122]
+    serial.write(&xyz)!
+    serial.flush()!
+    timer.delay_us(1000)
+    got = read_for(&mut serial, &mut received[..3], timer, 10_000)
+    say_number("uart bytes after overrun ", leftover as u32)
+    check(leftover >= 0 && leftover <= 8 && got == 3 && received[0] == 120 && received[2] == 122)
+
+    // A stream three times the ring, read while it arrives.
+    total := 3000usize
+    sent := 0usize
+    taken := 0usize
+    mismatches := 0u32
+    chunk: [64]u8 = [0; 64]
+    incoming: [100]u8 = [0; 100]
+    start = timer.now_us()
+    for taken < total && timer.now_us() - start < 1_000_000 {
+        if sent < total {
+            count := total - sent
+            if count > 64 {
+                count = 64
+            }
+            for index in 0..count {
+                chunk[index] = pattern(sent + index)
+            }
+            progress := serial.poll_write(&chunk[..count])!
+            sent += progress.transferred
+        }
+        progress := serial.poll_read(&mut incoming)!
+        for index in 0..progress.transferred {
+            if incoming[index] != pattern(taken + index) {
+                mismatches += 1
+            }
+        }
+        taken += progress.transferred
+    }
+    say_number("uart stream bytes ", taken as u32)
+    say_number("uart stream mismatches ", mismatches)
+    check(taken == total && mismatches == 0)
+    core.drop(serial)
+
+    // The port works polled again after the session.
+    ok: [2]u8 = [111, 107]
+    port.write(&ok)!
+    port.flush()!
+    back: [2]u8 = [0; 2]
+    port.set_read_poll_limit(1_000_000)
+    count := match port.read(&mut back) {
+        ok(count) => count,
+        err(_) => 0usize,
+    }
+    check(count >= 1 && back[0] == 111)
+    pins.release_uart(port)
+    dma.release(rx)
+}
+
+// --- The ADC's continuous sampler ------------------------------------------
+
+// Read and discard what the stream holds.
+fn drain(stream: &mut chip.AnalogStream) {
+    samples: [32]u32 = [0u32; 32]
+    for {
+        match stream.poll_read(&mut samples) {
+            ok(count) => {
+                if count == 0 {
+                    return
+                }
+            }
+            err(_) => {
+                return
+            }
+        }
+    }
+}
+
+// Whether `samples` take channels `first` and `second` in turn, the first
+// at least `high` millivolts and the second at most `low`.
+fn alternate(samples: &[u32], first: u32, second: u32, high: u16, low: u16) -> bool {
+    turn := esp_adc.sample_channel(samples[0]) == second
+    for index in 0..samples.len {
+        sample := samples[index]
+        expected := first
+        if turn {
+            expected = second
+        }
+        if esp_adc.sample_channel(sample) != expected {
+            return false
+        }
+        if !turn && esp_adc.sample_millivolts(sample) < high {
+            return false
+        }
+        if turn && esp_adc.sample_millivolts(sample) > low {
+            return false
+        }
+        turn = !turn
+    }
+    return true
+}
+
+fn adc_checks(pins: &mut chip.Pins, timer: &mut chip.Timer, dma: &mut chip.Dma, rng: &mut esp_rng.Rng) {
+    channel := dma.channel()!
+    buffer: [1024]u8 = [0; 1024]
+    one := [esp_adc.Channel { pin: 1, attenuation: esp_adc.Attenuation.Db12 }]
+    seven := [esp_adc.Channel { pin: 7, attenuation: esp_adc.Attenuation.Db12 }]
+    twice := [esp_adc.Channel { pin: 1, attenuation: esp_adc.Attenuation.Db12 }, esp_adc.Channel { pin: 1, attenuation: esp_adc.Attenuation.Db0 }]
+    invalid := refused(pins.analog_stream(&one, 100, &mut channel, &mut buffer), hal.Error.InvalidInput) && refused(pins.analog_stream(&one, 90_000, &mut channel, &mut buffer), hal.Error.InvalidInput) && refused(pins.analog_stream(&seven, 10_000, &mut channel, &mut buffer), hal.Error.InvalidInput) && refused(pins.analog_stream(&twice, 10_000, &mut channel, &mut buffer), hal.Error.InvalidInput)
+    tiny: [16]u8 = [0; 16]
+    short := refused(pins.analog_stream(&one, 10_000, &mut channel, &mut tiny), hal.Error.InvalidInput)
+    input := pins.analog(1)!
+    pins.release_analog(input)
+    input = pins.analog(3)!
+    shared := refused(pins.analog_stream(&one, 10_000, &mut channel, &mut buffer), hal.Error.Busy)
+    pins.release_analog(input)
+    check(invalid && short && shared)
+
+    two := [esp_adc.Channel { pin: 1, attenuation: esp_adc.Attenuation.Db12 }, esp_adc.Channel { pin: 2, attenuation: esp_adc.Attenuation.Db12 }]
+    stream := pins.analog_stream(&two, 10_000, &mut channel, &mut buffer)!
+    busy := refused(pins.analog(3), hal.Error.Busy) && refused(pins.temperature(), hal.Error.Busy) && refused(pins.output(1), hal.Error.Busy)
+    noise := rng.has_noise_source()
+    say_number("adc stream rate ", stream.rate_hz())
+    say_number("adc stream capacity ", stream.capacity() as u32)
+    say_number("adc stream part ", stream.part_samples() as u32)
+    check(busy && !noise && stream.rate_hz() == 10_000 && stream.capacity() >= 224 && stream.channels() == 2)
+
+    // GPIO 1 high and GPIO 2 low, then the other way round.
+    drive(1, some(true))
+    drive(2, some(false))
+    timer.delay_ms(5)
+    drain(&mut stream)
+    samples: [64]u32 = [0u32; 64]
+    stream.read(&mut samples)!
+    say_hex("adc first sample ", samples[0])
+    say_hex("adc second sample ", samples[1])
+    say_number("adc high mV ", esp_adc.sample_millivolts(samples[0]) as u32)
+    first := alternate(&samples, 1, 2, 3000, 300)
+    drive(1, some(false))
+    drive(2, some(true))
+    timer.delay_ms(5)
+    drain(&mut stream)
+    stream.read(&mut samples)!
+    say_hex("adc swapped sample ", samples[0])
+    second := alternate(&samples, 2, 1, 3000, 300)
+    check(first && second)
+
+    // 2000 conversions at 10 kHz take 200 ms.
+    drain(&mut stream)
+    start := timer.now_us()
+    total := 0usize
+    for total < 2000 {
+        total += stream.poll_read(&mut samples)!
+    }
+    elapsed := timer.now_us() - start
+    say_number("adc 2000 samples us ", elapsed as u32)
+    check(elapsed > 185_000 && elapsed < 215_000)
+
+    // Left alone, the ring fills: the samples it held, then Overrun once,
+    // then fresh samples.
+    timer.delay_ms(60)
+    kept := 0usize
+    overrun := false
+    for !overrun && kept < 2000 {
+        match stream.poll_read(&mut samples) {
+            ok(count) => {
+                kept += count
+                if count == 0 {
+                    break
+                }
+            }
+            err(error) => {
+                overrun = error == hal.Error.Overrun
+                break
+            }
+        }
+    }
+    timer.delay_ms(10)
+    fresh := stream.poll_read(&mut samples)!
+    say_number("adc kept before overrun ", kept as u32)
+    say_number("adc fresh after overrun ", fresh as u32)
+    check(overrun && kept == stream.capacity() && fresh > 0)
+    drive(1, none)
+    drive(2, none)
+    pins.release_analog_stream(stream)
+
+    // The converter is free again: the generator's noise source, and
+    // one-shot conversions.
+    restored := rng.has_noise_source()
+    input = pins.analog(1)!
+    drive(1, some(true))
+    timer.delay_ms(1)
+    top := input.read()!
+    drive(1, none)
+    pins.release_analog(input)
+    say_number("adc one-shot after stream ", top as u32)
+    check(restored && top > 3800)
+
+    // At 0 dB the input saturates near 1 V.
+    low := [esp_adc.Channel { pin: 1, attenuation: esp_adc.Attenuation.Db0 }]
+    stream = pins.analog_stream(&low, 20_000, &mut channel, &mut buffer)!
+    drive(1, some(false))
+    timer.delay_ms(2)
+    drain(&mut stream)
+    stream.read(&mut samples[..16])!
+    grounded := esp_adc.sample_millivolts(samples[8])
+    drive(1, some(true))
+    timer.delay_ms(2)
+    drain(&mut stream)
+    stream.read(&mut samples[..16])!
+    saturated := esp_adc.sample_millivolts(samples[8])
+    raw := esp_adc.sample_raw(samples[8])
+    drive(1, none)
+    pins.release_analog_stream(stream)
+    say_number("adc 0 dB grounded mV ", grounded as u32)
+    say_number("adc 0 dB saturated mV ", saturated as u32)
+    say_number("adc 0 dB saturated raw ", raw as u32)
+    check(grounded < 100 && saturated > 800 && saturated < 1400 && raw > 4000)
+    dma.release(channel)
+}
+
+fn main() {
+    b := board.take()!
+    serial := b.usb.serial()!
+    poke: [1]u8 = [0]
+    serial.read(&mut poke)!
+    serial.set_crlf(true)
+    unsafe {
+        SERIAL = some(serial)
+    }
+    say("selftest ready\n")
+
+    adc_checks(&mut b.pins, &mut b.timer, &mut b.dma, &mut b.rng)
+    uart_checks(&mut b.pins, &mut b.timer, &mut b.dma)
+
+    count := unsafe {
+        CHECKS
+    }
+    say_number("selftest done ", count)
+    for {
+        b.timer.delay_ms(1000)
+    }
+}

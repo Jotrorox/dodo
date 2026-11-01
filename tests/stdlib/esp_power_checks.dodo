@@ -7,7 +7,8 @@ import "std/embedded/power"
 // Host checks for std/embedded/chip/esp_power, the ESP32-C6's low-power
 // parts, against simulated register blocks: the PCR clock gates, the PMU's
 // sleep configuration, request, and its save and restore, GPIO wakeup, the
-// low-power timer, and the planning of a dormant state's pin events.
+// low-power timer, the planning of a dormant state's pin events, and
+// hibernation: its PMU states, EXT1's pads, and the wake records.
 
 // A register block of plain memory, 4-byte words at byte offsets.
 struct Memory: hal.Registers {
@@ -254,6 +255,90 @@ fn timer_checks() {
     core.assert(timer.get(0x00) == 0x1111 && timer.get(0x04) == ((1u32 << 31) | 0x22))
 }
 
+fn hibernation_checks() {
+    pmu := Pmu.new()
+    // Power-up leaves every HP domain forced on.
+    pmu.write(0x0F4, 0x1C)
+    pmu.write(0x0F8, 0x1C)
+    pmu.write(0x0FC, 0x1C)
+    pmu.write(0x104, 0x1C | (1u32 << 27))
+    pmu.write(0x108, 0x1C)
+    pmu.write(0x10C, 0xFF00_0000)
+    pmu.write(0x080, (1u32 << 25) | (0x3F << 26))
+    pmu.write(0x0C8, 1u32 << 25)
+    pmu.write(0x090, (1u32 << 18) | (25u32 << 27))
+    pmu.write(0x134, 0x0100_0080)
+    esp_power.configure_hibernation(&mut pmu, false)
+    // The force bits clear; the masks stay.
+    core.assert(pmu.read(0x0F4) == 0 && pmu.read(0x104) == (1u32 << 27) && pmu.read(0x108) == 0 && pmu.read(0x10C) == 0)
+    // Flash supply, radio, CPU, HP always-on, and top domains power down.
+    core.assert(pmu.read(0x068) == ((1u32 << 21) | (1u32 << 27) | (1u32 << 29) | (1u32 << 30) | (1u32 << 31)))
+    // HP clocks gated, the analog bus isolated, crystal off.
+    core.assert(pmu.read(0x06C) == 0 && pmu.read(0x070) == 0 && pmu.read(0x07C) == ((1u32 << 26) | (1u32 << 27)) && pmu.read(0x098) == 0)
+    // The HP bias fields clear, its regulator off at its old voltage.
+    core.assert(pmu.read(0x080) == (1u32 << 25) && pmu.read(0x090) == (25u32 << 27))
+    // LP SRAM retained, LP peripherals and the fast RC oscillator off.
+    core.assert(pmu.read(0x0C0) == ((1u32 << 30) | (1u32 << 31)) && pmu.read(0x0C4) == 0)
+    // The LP bias asleep, the LP regulator at DBIAS 23.
+    core.assert(pmu.read(0x0C8) == ((1u32 << 25) | (12u32 << 26) | (1u32 << 30) | (1u32 << 31)) && pmu.read(0x0B4) == ((23u32 << 27) | (1u32 << 22)))
+    // 500 us of LP analog wait; the modem field stays.
+    core.assert(pmu.read(0x134) == ((68u32 << 24) | 0x80))
+    // The gating handed to the PMU.
+    core.assert(pmu.read(0x0D0) == (1u32 << 28))
+
+    // With the LP core: LP peripherals and the fast RC oscillator stay on.
+    lp := Pmu.new()
+    esp_power.configure_hibernation(&mut lp, true)
+    core.assert(lp.read(0x0C0) == (1u32 << 30) && lp.read(0x0C4) == (1u32 << 30) && lp.read(0x0AC) == ((1u32 << 29) | (1u32 << 30)))
+
+    // The request: wake sources, nothing rejected, interrupts cleared.
+    pmu.write(0x124, 0xFFFF_FFFF)
+    pmu.write(0x15C, 0xE000_0000)
+    esp_power.prepare_hibernation_request(&mut pmu, esp_power.WAKE_EXT1 | esp_power.WAKE_LP_TIMER)
+    core.assert(pmu.read(0x128) == 0x12 && pmu.read(0x124) == 0 && pmu.read(0x130) == (1u32 << 31) && pmu.read(0x15C) == 0)
+    core.assert(esp_power.SLEEP_REQUEST_REGISTER == 0x120 && esp_power.SLEEP_REQUEST_BIT == (1u32 << 31))
+    esp_power.clear_wakeup_sources(&mut pmu)
+    core.assert(pmu.read(0x128) == 0)
+
+    // The boot ROM's wake type and stub.
+    lp_aon := Memory.new()
+    lp_aon.write(0x18, 0x4080_0000)
+    lp_aon.write(0x24, 0x10)
+    esp_power.mark_deep_sleep_boot(&mut lp_aon)
+    core.assert(lp_aon.get(0x18) == 0 && lp_aon.get(0x24) == 0x11)
+
+    // EXT1: pins 2 (pulled up, wakes high) and 5 (pulled down, wakes low).
+    lp_io := Memory.new()
+    io_mux := Memory.new()
+    io_mux.write(0x04 + 4 * 2, 1u32 << 8)
+    io_mux.write(0x04 + 4 * 5, 1u32 << 7)
+    lp_io.write(0x48 + 4 * 2, (0b101u32 << 12) | (1u32 << 1) | (1u32 << 7))
+    lp_aon.write(0x28, 0x01)
+    lp_aon.write(0x40, 0x0000_0005)
+    esp_power.arm_ext1(&mut lp_aon, &mut lp_io, &mut io_mux, (1u32 << 2) | (1u32 << 5), 1u32 << 2)
+    // The pulls carry over, input enabled, LP GPIO function.
+    core.assert(lp_io.get(0x48 + 4 * 2) == ((1u32 << 8) | (1u32 << 9) | (1u32 << 4)))
+    core.assert(lp_io.get(0x48 + 4 * 5) == ((1u32 << 7) | (1u32 << 9) | (1u32 << 4)))
+    // The pads go to the LP IO MUX and are held.
+    core.assert(lp_aon.get(0x28) == 0x25 && lp_aon.get(0x2C) == 0x24)
+    // EXT1's pads and levels.
+    core.assert(lp_aon.get(0x40) == ((0x24u32 << 15) | (0x04u32 << 23) | 0x05))
+    // The wake's pads, then their release.
+    core.assert(esp_power.ext1_status(&mut lp_aon) == 0x05)
+    esp_power.release_ext1(&mut lp_aon)
+    core.assert(lp_aon.get(0x28) == 0x01 && lp_aon.get(0x2C) == 0 && (lp_aon.get(0x40) & ~0xFFu32) == 0)
+
+    // The timer's record of target 0.
+    timer := Memory.new()
+    timer.write(0x00, 0x1000)
+    timer.write(0x04, 0x2)
+    timer.write(0x14, 0x0FFF)
+    timer.write(0x18, 0x2)
+    core.assert(!esp_power.lp_alarm_reached(&mut timer))
+    timer.write(0x14, 0x1000)
+    core.assert(esp_power.lp_alarm_reached(&mut timer))
+}
+
 fn is_true(result: bool!hal.Error) -> bool {
     match result {
         ok(value) => {
@@ -303,4 +388,5 @@ fn main() {
     wake_checks()
     sleep_checks()
     timer_checks()
+    hibernation_checks()
 }

@@ -185,12 +185,16 @@ and serial ports through `std/embedded/peripheral/esp_i2c`, `esp_spi`, and
 `esp_uart`, SPI by DMA, CAN through `std/embedded/peripheral/esp_twai`,
 I2S audio through `std/embedded/chip/esp_i2s`, PWM outputs and inputs, the
 calibrated ADC and temperature sensor, the system timer's alarms, DMA
-copies, WS2812 LEDs such as the board's RGB LED, the random number
+copies, pulse trains through the remote control peripheral
+(`std/embedded/peripheral/esp_rmt`) and WS2812 LEDs on it, such as the
+board's RGB LED, the random number
 generator, the watchdog, the low-power timer as a real-time clock, the
 flash above the program (`esp_rng`, `esp_watchdog`, `esp_rtc`,
-`esp_flash`), low power (`esp_power`), and the chip's own USB serial port through
-`std/embedded/peripheral/esp_usb_serial`, which `dodo run` also flashes
-through.
+`esp_flash`), low power and hibernation (`esp_power`), the chip's own USB
+serial port through `std/embedded/peripheral/esp_usb_serial`, which `dodo
+run` also flashes through, and its low-power core, whose programs use
+`std/embedded/chip/esp32c6_lp` and share LP SRAM through
+`std/embedded/chip/esp_lp_shared`.
 `std/embedded/can/mcp2515` drives the MCP2515 CAN controller over any SPI bus.
 `std/embedded/cortex_m` enables, pends, and prioritizes interrupts and runs
 SysTick on any Cortex-M core. `std/embedded/executor` runs several firmware

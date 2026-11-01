@@ -238,6 +238,12 @@ pub struct Controller<R: hal.Registers>: serial.Port + serial.PollPort {
         return self.divisor.clock_hz
     }
 
+    // Whether newlines are translated, and the poll limit and read poll
+    // limit, for a DMA session that takes the port over (esp_uhci).
+    pub fn dma_settings(&self) -> (bool, u32, u32) {
+        return (self.crlf, self.poll_limit, self.read_poll_limit)
+    }
+
     pub fn set_poll_limit(&mut self, polls: u32) {
         self.poll_limit = polls
     }

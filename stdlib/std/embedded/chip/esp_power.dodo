@@ -106,8 +106,9 @@ const IMM_MODEM_ICG: usize = 0x0DC
 const UPDATE_MODEM_ICG: u32 = 1 << 31
 
 // Put the PMU's HP_ACTIVE state, which the chip runs in and returns to
-// after every PMU sleep, and the analog bus's power where ESP-IDF's and
-// esp-hal's start-up code put them. These registers are in the always-on
+// after every PMU sleep, the analog bus's power, and the power domains'
+// overrides (release_power_domains) where ESP-IDF's and esp-hal's start-up
+// code put them. These registers are in the always-on
 // domain: a core reset, as `dodo run` does, keeps what an earlier program
 // left, and their power-up values power neither the PLL nor the bias and
 // gate the system clock, the radio domain's clocks, and the analog
@@ -116,6 +117,7 @@ const UPDATE_MODEM_ICG: u32 = 1 << 31
 // gating maps must already allow the ACTIVE code (the chip package opens
 // them first), as this applies that code.
 pub fn init_active_state<R: hal.Registers>(pmu: &mut R) {
+    release_power_domains(pmu)
     pmu.write(HP_ACTIVE_DIG_POWER, 0)
     pmu.write(HP_ACTIVE_ICG_HP_FUNC, 0xFFFF_FFFF)
     pmu.write(HP_ACTIVE_ICG_HP_APB, 0xFFFF_FFFF)
@@ -179,12 +181,13 @@ const INT_RAW: usize = 0x15C
 const INT_CLR: usize = 0x168
 const CLK_STATE0: usize = 0x194
 
-// HP_SLEEP_DIG_POWER: VDD_SPI_PD_EN powers the flash down, set at reset;
-// it stays on. The other fields keep their reset values: the radio (modem)
-// domain powers down (WIFI_PD_EN), the CPU, SRAM, and peripherals stay on.
-// The modem domain's registers return to their reset values, among them
-// the clock gating maps that the chip package opens again afterwards.
-const VDD_SPI_POWER_DOWN: u32 = 1 << 21
+// HP_SLEEP_DIG_POWER: only the radio (modem) domain powers down
+// (WIFI_PD_EN); the flash's supply (VDD_SPI_PD_EN, set at reset), the CPU,
+// SRAM, and peripherals stay on. Written whole, as a hibernation leaves the
+// other power-down bits set. The modem domain's registers return to their
+// reset values, among them the clock gating maps that the chip package
+// opens again afterwards.
+const LIGHT_SLEEP_DIG_POWER: u32 = 1 << 27
 // HP_SLEEP_HP_CK_POWER: isolate and keep the analog I2C bus, power the
 // PLL and its I2C interface down.
 const SLEEP_CK_POWER: u32 = (1u32 << 26) | (1u32 << 27) | (1u32 << 28)
@@ -250,8 +253,7 @@ pub fn configure_sleep<R: hal.Registers>(pmu: &mut R) {
     pmu.write(HP_ACTIVE_SYSCLK, sysclk)
     xtal := pmu.read(HP_ACTIVE_XTAL) | ACTIVE_XPD_XTAL
     pmu.write(HP_ACTIVE_XTAL, xtal)
-    dig := pmu.read(HP_SLEEP_DIG_POWER)
-    pmu.write(HP_SLEEP_DIG_POWER, dig & ~VDD_SPI_POWER_DOWN)
+    pmu.write(HP_SLEEP_DIG_POWER, LIGHT_SLEEP_DIG_POWER)
     pmu.write(HP_SLEEP_ICG_HP_FUNC, 0)
     pmu.write(HP_SLEEP_ICG_HP_APB, 0)
     pmu.write(HP_SLEEP_HP_SYS_CNTL, SLEEP_SYS_CNTL)
@@ -499,7 +501,251 @@ pub fn arm_lp_alarm<R: hal.Registers>(timer: &mut R, ticks: u64) {
     timer.write(TAR0_HIGH, high | TARGET_ENABLE)
 }
 
+// Whether the count has reached target 0, armed or not.
+pub fn lp_alarm_reached<R: hal.Registers>(timer: &mut R) -> bool {
+    target := ((timer.read(TAR0_HIGH) & 0xFFFF) as u64 << 32) | timer.read(TAR0_LOW) as u64
+    return lp_ticks(timer) >= target
+}
+
 pub fn disarm_lp_alarm<R: hal.Registers>(timer: &mut R) {
     timer.write(TAR0_HIGH, 0)
     timer.write(TIMER_INT_CLR, TIMER_SOC_WAKEUP)
+}
+
+// --- Hibernation: the PMU's deep sleep ------------------------------------
+
+// Hibernation is what Espressif calls deep sleep: the PMU powers the whole
+// HP system down, the CPU, its SRAM, the peripherals, the flash's supply,
+// the crystal, and the PLL, and keeps only the always-on LP system: the LP
+// timer, the LP IO pads, LP SRAM, the PMU, LP_AON's registers, and, when
+// asked, the LP peripherals and the LP core. A wakeup source enabled in
+// SLP_WAKEUP_CNTL2 powers the HP system up again, which then boots as
+// after a reset: LP_CLKRST RESET_CAUSE reads DEEP_SLEEP_RESET and
+// SLP_WAKEUP_STATUS0 the sources that ended the sleep. The register values
+// follow Espressif's deep sleep (pmu_sleep_config_default with every
+// power-down flag).
+
+// LP_CLKRST RESET_CAUSE after a wake from hibernation.
+pub const DEEP_SLEEP_RESET: u32 = 0x05
+
+// Wakeup sources of a hibernation, as SLP_WAKEUP_CNTL2 and
+// SLP_WAKEUP_STATUS0 number them: the LP IO pads (EXT1), the LP timer
+// (WAKE_LP_TIMER above), and the LP core.
+pub const WAKE_EXT1: u32 = 1 << 1
+pub const WAKE_LP_CORE: u32 = 1 << 11
+
+// The pads EXT1 watches, GPIO 0 to LP_PIN_LIMIT - 1, the LP IO pads.
+pub const LP_PIN_LIMIT: u32 = 8
+
+// HP_SLEEP_DIG_POWER: the flash's supply, the radio domain, the CPU, the HP
+// always-on domain, and the top domain (peripherals and SRAM) powered down.
+const HIBERNATE_DIG_POWER: u32 = (1u32 << 21) | (1u32 << 27) | (1u32 << 29) | (1u32 << 30) | (1u32 << 31)
+// HP_SLEEP_HP_CK_POWER: the analog I2C bus isolated and retained, the PLL
+// and its interfaces down.
+const HIBERNATE_CK_POWER: u32 = (1u32 << 26) | (1u32 << 27)
+// HP_SLEEP_HP_SYS_CNTL: watchdogs paused, CPU stalled.
+const HIBERNATE_SYS_CNTL: u32 = (1u32 << 28) | (1u32 << 29)
+// HP_SLEEP_BIAS: debug attenuation, current power-off, and sleep bias
+// cleared; LP_SLEEP_BIAS: attenuation 12, current off, bias in sleep mode.
+const BIAS_FIELDS: u32 = 0x3F << 26
+const LP_HIBERNATE_BIAS: u32 = (12u32 << 26) | (1u32 << 30) | (1u32 << 31)
+// HP_SLEEP_HP_REGULATOR0.XPD: the HP regulator on.
+const HP_REGULATOR_XPD: u32 = 1 << 18
+// LP_SLEEP_LP_REGULATOR0: on (XPD) at DBIAS 23, 0.7 V, its sleep half off.
+const LP_HIBERNATE_REGULATOR: u32 = (23u32 << 27) | (1u32 << 22)
+const LP_SLEEP_LP_REGULATOR1: usize = 0x0B8
+// The LP system's state while the HP system sleeps and the LP system runs
+// (the LP core awake): every LP domain on, the fast RC oscillator and the
+// 32 kHz RC oscillator running.
+const HP_SLEEP_LP_DIG_POWER: usize = 0x0A8
+const HP_SLEEP_LP_CK_POWER: usize = 0x0AC
+const LP_ACTIVE_CK_POWER: u32 = (1u32 << 29) | (1u32 << 30)
+// LP_SLEEP_LP_DIG_POWER: LP SRAM in retention, and the LP peripherals
+// powered down unless the LP core needs them.
+const LP_PERIPHERALS_DOWN: u32 = 1 << 31
+// LP_SLEEP_LP_CK_POWER.XPD_FOSC_CLK: the fast RC oscillator, the LP core's
+// clock, keeps running.
+const LP_SLEEP_FOSC: u32 = 1 << 30
+// SLP_WAKEUP_CNTL5.LP_ANA_WAIT_TARGET for a hibernation: 500 us of the
+// 136 kHz slow clock.
+const LP_HIBERNATE_ANALOG_WAIT: u32 = 68u32 << 24
+
+// Write the HP_SLEEP and LP_SLEEP states for a hibernation. With
+// `keep_lp`, the LP peripherals and the fast RC oscillator stay on, so the
+// LP core can run and wake the chip; the LP fast clock must then run from
+// that oscillator (`use_rc_fast`).
+pub fn configure_hibernation<R: hal.Registers>(pmu: &mut R, keep_lp: bool) {
+    release_power_domains(pmu)
+    pmu.write(HP_SLEEP_DIG_POWER, HIBERNATE_DIG_POWER)
+    pmu.write(HP_SLEEP_ICG_HP_FUNC, 0)
+    pmu.write(HP_SLEEP_ICG_HP_APB, 0)
+    pmu.write(HP_SLEEP_HP_SYS_CNTL, HIBERNATE_SYS_CNTL)
+    pmu.write(HP_SLEEP_HP_CK_POWER, HIBERNATE_CK_POWER)
+    pmu.write(HP_SLEEP_XTAL, 0)
+    hp_bias := pmu.read(HP_SLEEP_BIAS) & ~BIAS_FIELDS
+    pmu.write(HP_SLEEP_BIAS, hp_bias)
+    regulator := pmu.read(HP_SLEEP_HP_REGULATOR0) & ~HP_REGULATOR_XPD
+    pmu.write(HP_SLEEP_HP_REGULATOR0, regulator)
+    pmu.write(HP_SLEEP_HP_REGULATOR1, 0)
+    pmu.write(HP_SLEEP_LP_DIG_POWER, 0)
+    pmu.write(HP_SLEEP_LP_CK_POWER, LP_ACTIVE_CK_POWER)
+    lp_dig := LP_MEMORY_RETENTION
+    lp_ck := 0u32
+    if keep_lp {
+        lp_ck = LP_SLEEP_FOSC
+    } else {
+        lp_dig |= LP_PERIPHERALS_DOWN
+    }
+    pmu.write(LP_SLEEP_LP_DIG_POWER, lp_dig)
+    pmu.write(LP_SLEEP_LP_CK_POWER, lp_ck)
+    pmu.write(LP_SLEEP_XTAL, 0)
+    lp_bias := pmu.read(LP_SLEEP_BIAS) & ~BIAS_FIELDS
+    pmu.write(LP_SLEEP_BIAS, lp_bias | LP_HIBERNATE_BIAS)
+    pmu.write(LP_SLEEP_LP_REGULATOR0, LP_HIBERNATE_REGULATOR)
+    pmu.write(LP_SLEEP_LP_REGULATOR1, 0)
+    pmu.write(SLP_WAKEUP_CNTL3, SLEEP_TIMING)
+    wait := pmu.read(SLP_WAKEUP_CNTL5) & ~LP_ANALOG_WAIT_FIELD
+    pmu.write(SLP_WAKEUP_CNTL5, wait | LP_HIBERNATE_ANALOG_WAIT)
+    pmu.write(SLP_WAKEUP_CNTL7, HP_ANALOG_WAIT)
+    pmu.write(IMM_SLEEP_SYSCLK, UPDATE_ICG)
+}
+
+// The PMU's per-domain overrides: POWER_PD_TOP_CNTL, _HPAON_CNTL,
+// _HPCPU_CNTL, and _HPWIFI_CNTL for the HP domains, _LPPERI_CNTL for the LP
+// peripherals, each with force reset, isolate, power-up, no-reset,
+// no-isolate, and power-down bits (0 to 5); POWER_PD_MEM_CNTL's force bits
+// for the HP memories. A forced power-up keeps a domain on whatever the
+// sleep state says, and the chip leaves them set from power-up, so the PMU
+// cannot power anything down until they are clear, as ESP-IDF's
+// pmu_power_domain_force_default clears them.
+const POWER_PD_TOP_CNTL: usize = 0x0F4
+const POWER_PD_HPAON_CNTL: usize = 0x0F8
+const POWER_PD_HPCPU_CNTL: usize = 0x0FC
+const POWER_PD_HPWIFI_CNTL: usize = 0x104
+const POWER_PD_LPPERI_CNTL: usize = 0x108
+const POWER_PD_MEM_CNTL: usize = 0x10C
+const FORCE_BITS: u32 = 0x3F
+
+pub fn release_power_domains<R: hal.Registers>(pmu: &mut R) {
+    top := pmu.read(POWER_PD_TOP_CNTL) & ~FORCE_BITS
+    pmu.write(POWER_PD_TOP_CNTL, top)
+    aon := pmu.read(POWER_PD_HPAON_CNTL) & ~FORCE_BITS
+    pmu.write(POWER_PD_HPAON_CNTL, aon)
+    cpu := pmu.read(POWER_PD_HPCPU_CNTL) & ~FORCE_BITS
+    pmu.write(POWER_PD_HPCPU_CNTL, cpu)
+    wifi := pmu.read(POWER_PD_HPWIFI_CNTL) & ~FORCE_BITS
+    pmu.write(POWER_PD_HPWIFI_CNTL, wifi)
+    lp := pmu.read(POWER_PD_LPPERI_CNTL) & ~FORCE_BITS
+    pmu.write(POWER_PD_LPPERI_CNTL, lp)
+    pmu.write(POWER_PD_MEM_CNTL, 0)
+}
+
+// Everything `request_sleep` writes before SLP_WAKEUP_CNTL0, which the
+// caller writes from SRAM: enable `wake`, reject nothing (a source already
+// active ends the hibernation at once, as a reset), and clear the
+// interrupts and the reject cause.
+pub fn prepare_hibernation_request<R: hal.Registers>(pmu: &mut R, wake: u32) {
+    pmu.write(SLP_WAKEUP_CNTL2, wake)
+    pmu.write(SLP_WAKEUP_CNTL1, 0)
+    pmu.write(SLP_WAKEUP_CNTL4, REJECT_CAUSE_CLEAR)
+    pmu.write(INT_CLR, INT_SOFTWARE | INT_REJECTED | INT_WOKEN)
+}
+
+// The PMU register that starts a sleep and its request bit, for the
+// caller's SRAM code.
+pub const SLEEP_REQUEST_REGISTER: usize = SLP_WAKEUP_CNTL0
+pub const SLEEP_REQUEST_BIT: u32 = SLEEP_REQUEST
+
+// LP_AON registers: the boot ROM's wake type (STORE9 bit 0 set: the next
+// boot follows a deep sleep, so the ROM does not jump to the light sleep
+// wake address in STORE8), the deep sleep wake stub's entry (STORE6, 0
+// for none), the pads the LP IO MUX drives, the pad holds, and EXT1's
+// pads, levels, and status.
+const LP_AON_STORE6: usize = 0x18
+const LP_AON_STORE9: usize = 0x24
+const LP_AON_GPIO_MUX: usize = 0x28
+const LP_AON_GPIO_HOLD0: usize = 0x2C
+const LP_AON_EXT_WAKEUP: usize = 0x40
+const EXT_STATUS: u32 = 0xFF
+const EXT_STATUS_CLEAR: u32 = 1 << 14
+const EXT_SELECT_SHIFT: u32 = 15
+const EXT_LEVEL_SHIFT: u32 = 23
+const EXT_FIELDS: u32 = (0xFFu32 << 15) | (0xFFu32 << 23)
+const STORE9_DEEP_SLEEP: u32 = 1 << 0
+
+// Tell the boot ROM that the next boot ends a deep sleep and runs no wake
+// stub, so it boots the firmware from flash as after a reset.
+pub fn mark_deep_sleep_boot<R: hal.Registers>(lp_aon: &mut R) {
+    lp_aon.write(LP_AON_STORE6, 0)
+    store9 := lp_aon.read(LP_AON_STORE9)
+    lp_aon.write(LP_AON_STORE9, store9 | STORE9_DEEP_SLEEP)
+}
+
+// LP IO MUX GPIOn registers, 0x48 + 4n: pull-down, pull-up, input enable,
+// and the function, 0 for LP GPIO; IO MUX GPIOn's pulls, which the HP
+// system's pins set.
+const LP_IO_GPIO: usize = 0x48
+const LP_FUN_WPD: u32 = 1 << 7
+const LP_FUN_WPU: u32 = 1 << 8
+const LP_FUN_IE: u32 = 1 << 9
+const LP_MCU_IE: u32 = 1 << 4
+const LP_MCU_SEL: u32 = 0b111 << 12
+const LP_SLP_SEL: u32 = 1 << 1
+const IO_MUX_GPIO: usize = 0x04
+const HP_FUN_WPD: u32 = 1 << 7
+const HP_FUN_WPU: u32 = 1 << 8
+
+// Arm EXT1 to end a hibernation when one of `pins` (bit n for GPIO n,
+// below LP_PIN_LIMIT) is at its level in `levels` (bit set: high). Each
+// pad moves to the LP IO MUX with the pulls IO MUX gave it, as input, and
+// is held, so its level is defined while the HP system is off.
+pub fn arm_ext1<A: hal.Registers, L: hal.Registers, M: hal.Registers>(lp_aon: &mut A, lp_io: &mut L, io_mux: &mut M, pins: u32, levels: u32) {
+    for pin in 0u32..LP_PIN_LIMIT {
+        bit := 1u32 << pin
+        if (pins & bit) != 0 {
+            pulls := io_mux.read(IO_MUX_GPIO + 4 * pin as usize)
+            offset := LP_IO_GPIO + 4 * pin as usize
+            value := lp_io.read(offset) & ~(LP_FUN_WPD | LP_FUN_WPU | LP_MCU_SEL | LP_SLP_SEL)
+            if (pulls & HP_FUN_WPD) != 0 {
+                value |= LP_FUN_WPD
+            }
+            if (pulls & HP_FUN_WPU) != 0 {
+                value |= LP_FUN_WPU
+            }
+            lp_io.write(offset, value | LP_FUN_IE | LP_MCU_IE)
+        }
+    }
+    mux := lp_aon.read(LP_AON_GPIO_MUX)
+    lp_aon.write(LP_AON_GPIO_MUX, mux | (pins & 0xFF))
+    hold := lp_aon.read(LP_AON_GPIO_HOLD0)
+    lp_aon.write(LP_AON_GPIO_HOLD0, hold | (pins & 0xFF))
+    ext := lp_aon.read(LP_AON_EXT_WAKEUP) & ~EXT_FIELDS
+    lp_aon.write(LP_AON_EXT_WAKEUP, ext | EXT_STATUS_CLEAR)
+    selected := ((pins & 0xFF) << EXT_SELECT_SHIFT) | ((levels & pins & 0xFF) << EXT_LEVEL_SHIFT)
+    lp_aon.write(LP_AON_EXT_WAKEUP, ext | selected)
+}
+
+// The pads whose level ended the last hibernation through EXT1, bit n for
+// GPIO n.
+pub fn ext1_status<R: hal.Registers>(lp_aon: &mut R) -> u32 {
+    return lp_aon.read(LP_AON_EXT_WAKEUP) & EXT_STATUS
+}
+
+// After a wake, give the pads EXT1 watched back to the HP system: release
+// their holds, return them to IO MUX, and clear EXT1's pads and status.
+pub fn release_ext1<R: hal.Registers>(lp_aon: &mut R) {
+    ext := lp_aon.read(LP_AON_EXT_WAKEUP)
+    pins := (ext >> EXT_SELECT_SHIFT) & 0xFF
+    hold := lp_aon.read(LP_AON_GPIO_HOLD0)
+    lp_aon.write(LP_AON_GPIO_HOLD0, hold & ~pins)
+    mux := lp_aon.read(LP_AON_GPIO_MUX)
+    lp_aon.write(LP_AON_GPIO_MUX, mux & ~pins)
+    lp_aon.write(LP_AON_EXT_WAKEUP, (ext & ~EXT_FIELDS) | EXT_STATUS_CLEAR)
+    lp_aon.write(LP_AON_EXT_WAKEUP, ext & ~EXT_FIELDS & ~EXT_STATUS_CLEAR)
+}
+
+// After a wake, stop the wakeup sources so that none of them ends a later
+// sleep it was not asked for.
+pub fn clear_wakeup_sources<R: hal.Registers>(pmu: &mut R) {
+    pmu.write(SLP_WAKEUP_CNTL2, 0)
 }

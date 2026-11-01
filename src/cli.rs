@@ -264,6 +264,14 @@ const OPTIONS: &[OptionSpec] = &[
         "Firmware chip for a custom board, e.g. rp2040, rp2350, or atmega328p; implied by --board"
     ),
     option!(
+        "lp-core",
+        None,
+        Some("FILE"),
+        B | R | C,
+        "Platform",
+        "ESP32-C6 LP core program (entry file) to embed in the firmware"
+    ),
+    option!(
         "cpu",
         None,
         Some("NAME"),
@@ -674,6 +682,12 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Parsed, String>
                 let name = utf8(value, "chip")?;
                 crate::hardware::chip(&name).ok_or_else(|| crate::hardware::unknown_chip(&name))?;
                 invocation.settings.chip = Some(name)
+            }
+            "lp-core" => {
+                if value.is_empty() {
+                    return Err("--lp-core requires a source file".into());
+                }
+                invocation.settings.lp_core = Some(PathBuf::from(value))
             }
             "cpu" => invocation.settings.cpu = Some(utf8(value, "CPU")?),
             "features" => invocation.settings.features = Some(utf8(value, "features")?),

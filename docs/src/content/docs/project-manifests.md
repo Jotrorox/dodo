@@ -134,8 +134,8 @@ custom profiles require one. `check` does not use profiles.
 | `[tool.NAME]` | Data reserved for other tools; Dodo does not interpret it. |
 
 Compiler settings are `opt-level` (integer 0–3), `debug` (boolean), `triple`,
-`cpu`, `features`, `panic`, `panic-hook`, `linker`, `link-args`, `board`, and
-`chip`.
+`cpu`, `features`, `panic`, `panic-hook`, `linker`, `link-args`, `board`,
+`chip`, and `lp-core`.
 Features are an LLVM CPU-feature string such as `"+sse4.2,-avx"`. `emit` accepts
 `exe` (default), `obj`, `asm`, `llvm-ir`, or `bitcode`.
 
@@ -150,7 +150,10 @@ image (the target's `.elf` plus a `.uf2`, the ESP32-C6's `.bin`, or a `.hex` for
 the packages `import "std/embedded/board"` and `import "std/embedded/chip"` resolve to. `run`
 flashes the board instead of executing on the host. A `triple` the chip cannot
 run, or a `chip` that is not the board's, is an error. See
-[hardware and embedded](hardware.md#boards).
+[hardware and embedded](hardware.md#boards). `lp-core` names the entry file of
+a program for the ESP32-C6's low-power core, relative to the manifest; an
+ESP32-C6 firmware builds it for `chip = "esp32c6_lp"` and embeds its image
+(see [hibernation and the LP core](hardware.md#hibernation-and-the-lp-core-on-the-esp32-c6)).
 
 ```toml
 schema = 1

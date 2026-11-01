@@ -3,20 +3,24 @@ package esp32c6
 import "core/cpu"
 import "core/mmio"
 import "core/ptr"
+import "std/embedded/chip/esp_adc"
 import "std/embedded/chip/esp_flash"
 import "std/embedded/chip/esp_rng"
 import "std/embedded/chip/esp_rtc"
 import "std/embedded/chip/esp_watchdog"
 import "std/embedded/chip/esp_capture"
 import "std/embedded/chip/esp_i2s"
+import "std/embedded/chip/esp_lp_shared"
 import "std/embedded/chip/esp_power"
 import "std/embedded/executor"
 import "std/embedded/hal"
 import "std/embedded/hal/serial"
 import "std/embedded/peripheral/esp_i2c"
+import "std/embedded/peripheral/esp_rmt"
 import "std/embedded/peripheral/esp_spi"
 import "std/embedded/peripheral/esp_twai"
 import "std/embedded/peripheral/esp_uart"
+import "std/embedded/peripheral/esp_uhci"
 import "std/embedded/peripheral/esp_usb_serial"
 import "std/embedded/power"
 import "std/io"
@@ -25,7 +29,7 @@ import "std/io"
 // clocks, GPIO through the IO MUX and GPIO matrix, interrupts, the system
 // timer and its alarms, the USB serial port, and the boot ROM; the rest of
 // the package adds I2C, SPI, UART, PWM (LEDC), the ADC and temperature
-// sensor, DMA, an addressable LED driver (RMT), CAN (TWAI), I2S audio,
+// sensor, DMA, pulse trains and addressable LEDs (RMT), CAN (TWAI), I2S audio,
 // PWM input capture (MCPWM and PCNT), the random number generator, the
 // watchdog, the real-time clock, the flash above the program, and low power
 // (`Power`: clock gating, sleep modes, and a dormant state). `take()` brings the chip
@@ -389,8 +393,12 @@ pub struct Peripherals {
     // The program flash, for storing data above the program; see
     // std/embedded/chip/esp_flash.
     pub flash: esp_flash.Flash
-    // Sleep modes, clock gating, and the dormant state; see Power.
+    // Sleep modes, clock gating, the dormant state, and hibernation; see
+    // Power.
     pub power: Power
+    // The low-power core and the program the firmware embeds for it; see
+    // LpCore.
+    pub lp_core: LpCore
 }
 
 // Configure clocks and return the peripherals. A second call returns
@@ -431,6 +439,19 @@ pub fn take() -> Peripherals!hal.Error {
     cause := unsafe {
         mmio.read32(LP_CLKRST_RESET_CAUSE) & RESET_CAUSE
     }
+    // SAFETY: TAKEN guarantees one Power, the owner of the PMU's wakeup
+    // registers and EXT1.
+    let (wake_sources, woken_pins) = unsafe {
+        take_wake_cause(cause)
+    }
+    // An LP core program outlives the resets that flashing and restarts
+    // cause; only a wake from hibernation may find the firmware's own.
+    // SAFETY: TAKEN guarantees one LpCore, the owner of the LP core.
+    if cause != esp_power.DEEP_SLEEP_RESET {
+        unsafe {
+            stop_lp_core()
+        }
+    }
     watchdog := unsafe {
         esp_watchdog.Watchdog.at(TIMG0_BASE, LP_AON_BASE, cause, now_us)
     }
@@ -449,7 +470,8 @@ pub fn take() -> Peripherals!hal.Error {
         timer: Timer { alarms: 0 },
         usb: Usb { open: false },
         dma: Dma { channels: 0 },
-        power: Power { timeout_us: 0, lp_ticks_per_10ms: 0 },
+        power: Power { timeout_us: 0, lp_ticks_per_10ms: 0, wake_sources, woken_pins },
+        lp_core: LpCore { loaded: lp_core_running() },
     })
 }
 
@@ -974,6 +996,9 @@ pub struct Pins {
         if pin >= ADC_CHANNELS {
             return err(hal.Error.InvalidInput)
         }
+        if (self.analog_inputs & STREAM_BIT) != 0 {
+            return err(hal.Error.Busy)
+        }
         self.reserve(pin)?
         // SAFETY: the claim makes this the pin's only owner; the first input
         // starts the converter.
@@ -994,7 +1019,7 @@ pub struct Pins {
     // Claim the chip's temperature sensor as an analog input: 8-bit
     // readings that `millicelsius` converts. Busy if claimed.
     pub fn temperature(&mut self) -> Analog!hal.Error {
-        if (self.analog_inputs & TEMPERATURE_BIT) != 0 {
+        if (self.analog_inputs & (TEMPERATURE_BIT | STREAM_BIT)) != 0 {
             return err(hal.Error.Busy)
         }
         self.analog_inputs |= TEMPERATURE_BIT
@@ -1042,39 +1067,265 @@ pub struct Pins {
         }
     }
 
-    // Claim `pin` to drive WS2812 addressable LEDs (also sold as NeoPixels,
-    // SK6812, and others with the same protocol), such as the RGB LED of
-    // Espressif's development boards, through the remote control
-    // peripheral's channel 0. InvalidInput for a pin that cannot be
-    // claimed; Busy if the pin or the channel is taken.
-    pub fn ws2812(&mut self, pin: u32) -> Ws2812!hal.Error {
-        bit := pin_bit(pin)?
-        self.take_bus(BUS_RMT, bit)?
-        // SAFETY: the claims make this the channel's and the pin's only
-        // owner.
-        unsafe {
-            start_peripheral(PCR_RMT_CONF)
-            mmio.write32(PCR_RMT_SCLK_CONF, hal.encode(SCLK_SELECT, 1) | SCLK_ENABLE)
-            system := mmio.read32(RMT_BASE + RMT_SYS_CONF)
-            mmio.write32(RMT_BASE + RMT_SYS_CONF, system | RMT_DIRECT_MEMORY | RMT_CLOCK_ON)
-            mmio.write32(RMT_BASE + RMT_CH0_CONF0, RMT_CONF)
-            mmio.write32(RMT_BASE + RMT_CH0_CONF0, RMT_CONF | RMT_CONF_UPDATE)
-            gpio_function(pin)
-            mmio.write32(GPIO_OUT_W1TC, bit)
-            route_output(pin, SIGNAL_RMT0, false)
+    // Convert analog inputs continuously by DMA: `channels`, up to
+    // esp_adc.MAX_CHANNELS entries of a pin (GPIO 0 to 6) and its
+    // attenuation, converted in turn, `rate_hz` conversions a second in all
+    // (esp_adc.MIN_RATE_HZ to MAX_RATE_HZ), streamed through `dma` into a
+    // ring in `buffer`; see AnalogStream. The pins are set up as for
+    // `analog`. The stream has the converter to itself: Busy while an
+    // analog input or the temperature sensor is claimed, and they are Busy
+    // until the stream is given back with `release_analog_stream`; Busy too
+    // if a pin is taken or the channel runs a copy. InvalidInput for no
+    // channels or too many, another pin or the same pin twice, a rate out of
+    // range, or a buffer outside SRAM or too short for a sample in each of
+    // its eight parts.
+    pub fn analog_stream(&mut self, channels: &[esp_adc.Channel], rate_hz: u32, dma: &mut DmaChannel, buffer: &mut[u8]) -> AnalogStream!hal.Error from(dma, buffer) {
+        if channels.len == 0 || channels.len > esp_adc.MAX_CHANNELS || !in_sram(hal.address_of(buffer), buffer.len as u64) {
+            return err(hal.Error.InvalidInput)
         }
-        return ok(Ws2812 { pin })
+        pins := 0u32
+        for index in 0..channels.len {
+            pin := channels[index].pin
+            if pin >= ADC_CHANNELS || (pins & (1u32 << pin)) != 0 {
+                return err(hal.Error.InvalidInput)
+            }
+            pins |= 1u32 << pin
+        }
+        esp_adc.timer_target(rate_hz)?
+        if self.analog_inputs != 0 || dma.is_busy() || (self.taken & pins) != 0 {
+            return err(hal.Error.Busy)
+        }
+        index := dma.number as usize
+        // SAFETY: no analog input owns the converter and the pins are free,
+        // so the claims below make the stream their only owner; the
+        // receive descriptors belong to `dma`, which the stream borrows.
+        started := unsafe {
+            claim_clocks(CLOCK_SARADC)
+            start_adc()
+            calibration := adc_calibration()
+            code := esp_adc.attenuation_code(&channels[0].attenuation)
+            if calibration.scheme != 0 && code != ATTEN_12DB {
+                initial := calibration.init_code[code as usize]
+                sar_write(0, 7, 0, initial & 0xFF)
+                sar_write(1, 3, 0, initial >> 8)
+            }
+            clocks := mmio.read32(PCR_SARADC_CLKM_CONF) & ~((3u32 << 20) | (0xFFu32 << 12) | 0xFFF)
+            mmio.write32(PCR_SARADC_CLKM_CONF, clocks | hal.encode(0xFFu32 << 12, esp_adc.CLOCK_DIVIDER - 1) | (1u32 << 22))
+            for pin in 0..ADC_CHANNELS {
+                if (pins & (1u32 << pin)) != 0 {
+                    address := IO_MUX_BASE + 4 * pin as usize
+                    pad := mmio.read32(address) & ~(PAD_FUNCTION | PAD_PULL_UP | PAD_PULL_DOWN | PAD_INPUT)
+                    mmio.write32(address, pad | hal.encode(PAD_FUNCTION, FUNCTION_GPIO))
+                    mmio.write32(GPIO_ENABLE_W1TC, 1u32 << pin)
+                }
+            }
+            esp_adc.Stream.start(hal.RegisterBlock.at(0), channels, rate_hz, dma.number, &mut DMA_DESCRIPTORS[48 * index + 24..48 * index + 48], buffer, calibration)
+        }
+        match started {
+            ok(stream) => {
+                self.taken |= pins
+                self.analog_inputs |= STREAM_BIT
+                return ok(AnalogStream { stream, channel: dma, pins })
+            }
+            err(error) => {
+                // SAFETY: nothing converts; the converter goes back to rest
+                // and the pins, still free, to GPIO inputs.
+                unsafe {
+                    reset_adc_controller()
+                    release_clocks(CLOCK_SARADC)
+                    for pin in 0..ADC_CHANNELS {
+                        if (pins & (1u32 << pin)) != 0 {
+                            gpio_function(pin)
+                        }
+                    }
+                }
+                return err(error)
+            }
+        }
     }
 
-    // Give back the LED driver: its pin is disconnected.
+    // Give back a stream: it stops, its pins return to GPIO inputs, and the
+    // converter's controller is reset, ready for `analog` and for the
+    // random number generator's noise source.
+    pub fn release_analog_stream(&mut self, stream: AnalogStream) {
+        stream.stop()
+        let AnalogStream { stream: inner, channel, pins } = stream
+        core.drop(inner)
+        // SAFETY: the stream owned the converter and the pins, and stopped.
+        unsafe {
+            reset_adc_controller()
+            release_clocks(CLOCK_SARADC)
+            for pin in 0..ADC_CHANNELS {
+                if (pins & (1u32 << pin)) != 0 {
+                    gpio_function(pin)
+                }
+            }
+        }
+        self.taken &= ~pins
+        self.analog_inputs &= ~STREAM_BIT
+    }
+
+    // Claim `pin` to drive WS2812 addressable LEDs (also sold as NeoPixels,
+    // SK6812, and others with the same protocol), such as the RGB LED of
+    // Espressif's development boards, through an RMT transmit channel with
+    // one block of memory, as `rmt_tx` claims it. `write` refills the
+    // channel's memory while it sends, so a chain may have any length.
+    // InvalidInput for a pin that cannot be claimed; Busy if the pin or
+    // both transmit channels are taken.
+    pub fn ws2812(&mut self, pin: u32) -> Ws2812!hal.Error {
+        config := esp_rmt.TxConfig.new(WS2812_HZ)
+        tx := self.rmt_tx(pin, &config)?
+        return ok(Ws2812 { tx })
+    }
+
+    // Give back the LED driver: its channel stops and its pin is
+    // disconnected.
     pub fn release_ws2812(&mut self, leds: Ws2812) {
-        let Ws2812 { pin } = leds
-        // SAFETY: the driver owned the channel and the pin.
+        let Ws2812 { tx } = leds
+        self.release_rmt_tx(tx)
+    }
+
+    // Claim `pin` as the output of an RMT transmit channel set up from
+    // `config`: channel 0, or 1, whichever is free with
+    // config.memory_blocks blocks of memory after it; see
+    // std/embedded/peripheral/esp_rmt. The channel counts ticks of the
+    // PLL's 80 MHz output (PLL_F80M_HZ) divided down to
+    // config.resolution_hz, and the pin drives the idle level from now on.
+    // Any pin carries it. InvalidInput for a pin that cannot be claimed or
+    // settings out of range (esp_rmt.check_tx); Busy if the pin is taken
+    // or no transmit channel has that much memory free.
+    pub fn rmt_tx(&mut self, pin: u32, config: &esp_rmt.TxConfig) -> RmtTx!hal.Error {
+        bit := pin_bit(pin)?
+        esp_rmt.check_tx(PLL_F80M_HZ, 0, config)?
+        if (self.taken & bit) != 0 {
+            return err(hal.Error.Busy)
+        }
+        blocks := config.memory_blocks
+        channel := rmt_channel(0, esp_rmt.TX_CHANNELS, blocks)?
+        self.taken |= bit
+        // SAFETY: the claims make this the channel's, its memory's, and the
+        // pin's only owner. Each channel's handle on the RMT's registers
+        // writes only its own registers and memory, the write-one-to-clear
+        // INT_CLR, and INT_ENA in a critical section.
+        registers := unsafe {
+            start_rmt(channel, blocks)
+            gpio_function(pin)
+            mmio.write32(GPIO_OUT_W1TC, bit)
+            hal.RegisterBlock.at(RMT_BASE)
+        }
+        match esp_rmt.Transmitter.new(registers, channel, PLL_F80M_HZ, config, now_us) {
+            ok(tx) => {
+                // SAFETY: as above.
+                unsafe {
+                    route_output(pin, SIGNAL_RMT0 + channel, false)
+                    RMT_TX_PINS |= bit
+                }
+                return ok(RmtTx { tx, pin })
+            }
+            err(error) => {
+                // SAFETY: as above; nothing uses the channel.
+                unsafe {
+                    stop_rmt(channel, blocks)
+                }
+                self.taken &= ~bit
+                return err(error)
+            }
+        }
+    }
+
+    // Give back an RMT transmit channel: its transmission stops and its
+    // pin is disconnected.
+    pub fn release_rmt_tx(&mut self, tx: RmtTx) {
+        let RmtTx { tx: channel, pin } = tx
+        number := channel.channel()
+        blocks := (channel.memory_codes() / esp_rmt.BLOCK_CODES) as u32
+        channel.release()
+        // SAFETY: the transmitter owned the channel, its memory, and the
+        // pin.
         unsafe {
             disconnect(pin)
-            stop_peripheral(PCR_RMT_CONF)
+            RMT_TX_PINS &= ~(1u32 << pin)
+            stop_rmt(number, blocks)
         }
-        self.give_bus(BUS_RMT, 1u32 << pin)
+        self.taken &= ~(1u32 << pin)
+    }
+
+    // Claim `pin` as the input of an RMT receive channel set up from
+    // `config`: receive channel 0 (the RMT's channel 2), or 1, whichever
+    // is free with config.memory_blocks blocks of memory after it; see
+    // std/embedded/peripheral/esp_rmt. The channel counts ticks of the
+    // PLL's 80 MHz output divided down to config.resolution_hz. Any pin
+    // carries it, with its pulls off (`set_pull` sets them). The pin of an
+    // RMT transmit channel, a WS2812 driver's included, may be given too:
+    // the receiver then reads what the transmitter sends, through the
+    // pad, for self-tests. InvalidInput for a pin that cannot be claimed
+    // or settings out of range (esp_rmt.check_rx); Busy if the pin is
+    // taken otherwise or no receive channel has that much memory free.
+    pub fn rmt_rx(&mut self, pin: u32, config: &esp_rmt.RxConfig) -> RmtRx!hal.Error {
+        bit := pin_bit(pin)?
+        esp_rmt.check_rx(PLL_F80M_HZ, 0, config)?
+        // SAFETY: Pins is the only user of RMT_TX_PINS.
+        shared := unsafe {
+            (RMT_TX_PINS & bit) != 0
+        }
+        if !shared && (self.taken & bit) != 0 {
+            return err(hal.Error.Busy)
+        }
+        blocks := config.memory_blocks
+        channel := rmt_channel(esp_rmt.TX_CHANNELS, esp_rmt.RX_CHANNELS, blocks)?
+        number := channel - esp_rmt.TX_CHANNELS
+        if !shared {
+            self.taken |= bit
+        }
+        // SAFETY: as in rmt_tx; a shared pin stays its transmitter's.
+        registers := unsafe {
+            start_rmt(channel, blocks)
+            if !shared {
+                gpio_function(pin)
+            }
+            hal.RegisterBlock.at(RMT_BASE)
+        }
+        match esp_rmt.Receiver.new(registers, number, PLL_F80M_HZ, config, now_us) {
+            ok(rx) => {
+                // SAFETY: as above.
+                unsafe {
+                    route_input(SIGNAL_RMT0 + number, pin)
+                }
+                return ok(RmtRx { rx, pin, shared })
+            }
+            err(error) => {
+                // SAFETY: as above; nothing uses the channel.
+                unsafe {
+                    stop_rmt(channel, blocks)
+                }
+                if !shared {
+                    self.taken &= ~bit
+                }
+                return err(error)
+            }
+        }
+    }
+
+    // Give back an RMT receive channel: its reception stops and its pin,
+    // unless a transmitter's, is disconnected with its pulls off.
+    pub fn release_rmt_rx(&mut self, rx: RmtRx) {
+        let RmtRx { rx: channel, pin, shared } = rx
+        number := channel.channel()
+        blocks := (channel.memory_codes() / esp_rmt.BLOCK_CODES) as u32
+        channel.release()
+        // SAFETY: the receiver owned the channel, its memory, and the pin
+        // unless shared.
+        unsafe {
+            tie_input(SIGNAL_RMT0 + number, false)
+            if !shared {
+                set_pad_pull(pin, false, false)
+                disconnect(pin)
+            }
+            stop_rmt(esp_rmt.TX_CHANNELS + number, blocks)
+        }
+        if !shared {
+            self.taken &= ~(1u32 << pin)
+        }
     }
 
     // Claim a CAN controller on pins `tx` and `rx`: TWAI0 for the first,
@@ -2231,7 +2482,6 @@ const SIGNAL_PCNT0_SIG_CH0: u32 = 101
 const BUS_UART0: u32 = 1 << 0
 const BUS_I2C: u32 = 1 << 2
 const BUS_SPI: u32 = 1 << 3
-const BUS_RMT: u32 = 1 << 4
 const BUS_TWAI0: u32 = 1 << 16
 const BUS_TWAI1: u32 = 1 << 17
 const BUS_I2S_OUT: u32 = 1 << 18
@@ -2735,6 +2985,50 @@ pub struct Uart: serial.Port + serial.PollPort {
     pub fn irq(&self) -> u32 {
         return UART0 + self.number
     }
+
+    // Receive into `ring` by DMA, through UHCI0 and channel `rx`, until the
+    // returned UartDma is dropped; see UartDma. InvalidInput for a ring
+    // shorter than esp_uhci.MIN_RING or outside SRAM; Busy if the channel
+    // runs a copy or the other port receives by DMA.
+    pub fn dma(&mut self, rx: &mut DmaChannel, ring: &mut[u8]) -> UartDma!hal.Error from(self, rx, ring) {
+        if ring.len < esp_uhci.MIN_RING || !in_sram(hal.address_of(ring), ring.len as u64) {
+            return err(hal.Error.InvalidInput)
+        }
+        if rx.is_busy() {
+            return err(hal.Error.Busy)
+        }
+        // SAFETY: the claim makes this UHCI0's only owner.
+        unsafe {
+            section := hal.Critical.enter()
+            taken := UHCI_TAKEN
+            UHCI_TAKEN = true
+            core.drop(section)
+            if taken {
+                return err(hal.Error.Busy)
+            }
+            start_peripheral(PCR_UHCI_CONF)
+        }
+        let (crlf, poll_limit, read_poll_limit) = self.port.dma_settings()
+        // SAFETY: the descriptors are UHCI0's, claimed above; the register
+        // block spans the UART, UHCI0, and GDMA, which the port and the
+        // channel own.
+        opened := unsafe {
+            esp_uhci.DmaPort.open(hal.RegisterBlock.at(0), UART0_BASE + 0x1000 * self.number as usize, esp_uhci.UHCI0_BASE, self.number, rx.number, &mut UHCI_DESCRIPTORS, ring, crlf, poll_limit, read_poll_limit)
+        }
+        match opened {
+            ok(port) => {
+                return ok(UartDma { port, rx, number: self.number })
+            }
+            err(error) => {
+                // SAFETY: as above; nothing uses UHCI0.
+                unsafe {
+                    stop_peripheral(PCR_UHCI_CONF)
+                    UHCI_TAKEN = false
+                }
+                return err(error)
+            }
+        }
+    }
 }
 
 // Write a panic report to the UART with registers R.
@@ -3112,82 +3406,442 @@ pub fn millicelsius(value: u16) -> i32 {
     return (value as i32 * 4386) / 10 + 7360
 }
 
-// --- Addressable LEDs: the remote control peripheral (RMT) ---------------
+// --- The ADC's continuous sampler ------------------------------------------
 
+// Pins.analog_inputs: a stream holds the converter.
+const STREAM_BIT: u32 = 1 << 8
+// PCR SARADC_CONF: the controller's function and register resets.
+const SARADC_RESETS: u32 = (1u32 << 1) | (1u32 << 3)
+
+// The converter's calibration for every attenuation, from eFuse, as
+// Espressif's drivers read it (esp_efuse_rtc_calib.c): initial codes at
+// block 2 bits 145, 155, 165, 175, reference readings at 185 to 215, and
+// channel offsets from bit 225.
+// SAFETY: reads eFuse words.
+unsafe fn adc_calibration() -> esp_adc.Calibration {
+    unsafe {
+        calibration := esp_adc.Calibration.none()
+        version := efuse_bits(EFUSE_BLOCK1, 123, 3)
+        if version == 0 {
+            return calibration
+        }
+        scheme := 1u32
+        references: [4]u32 = [400u32, 550, 750, 1370]
+        if version >= 2 {
+            scheme = 2
+            references = [750u32, 1000, 1500, 2800]
+        }
+        calibration.scheme = scheme
+        for code in 0usize..4 {
+            calibration.init_code[code] = efuse_bits(EFUSE_BLOCK2, 145 + 10 * code as u32, 10) + 1600
+            point := 1500i32
+            if scheme == 2 {
+                point = 2850
+                if code == 2 {
+                    point = 2900
+                }
+            }
+            calibration.reference_code[code] = (point + signed_field(efuse_bits(EFUSE_BLOCK2, 185 + 10 * code as u32, 10), 10)) as u32
+            calibration.reference_mv[code] = references[code]
+        }
+        for channel in 0usize..7 {
+            calibration.channel_offset[channel] = signed_field(efuse_bits(EFUSE_BLOCK2, 225 + 4 * channel as u32, 4), 4)
+        }
+        return calibration
+    }
+}
+
+// Put the converter's digital controller back to its reset state once the
+// conversion in progress is over: after its timer has run, one-shot
+// conversions only finish again after this, as esp_rng found.
+// SAFETY: the caller owns the converter, which no longer converts.
+unsafe fn reset_adc_controller() {
+    unsafe {
+        ets_delay_us(20)
+        conf := mmio.read32(PCR_SARADC_CONF)
+        mmio.write32(PCR_SARADC_CONF, conf | SARADC_RESETS)
+        mmio.write32(PCR_SARADC_CONF, conf & ~SARADC_RESETS)
+    }
+}
+
+// Analog inputs converted continuously by DMA, as `Pins.analog_stream`
+// hands them out (esp_adc documents the details). The timer starts a
+// conversion `rate_hz()` times a second, taking the channels in turn, and
+// the channel stores the results in a ring in the buffer: its first
+// word-aligned byte on, in eight parts of the same size, 4 bytes per
+// sample. Samples become readable a part at a time.
+//
+// A sample is a word: `esp_adc.sample_millivolts(sample)` is the voltage,
+// calibrated from eFuse for the channel's attenuation,
+// `esp_adc.sample_channel(sample)` the GPIO, and `esp_adc.sample_raw` the
+// 12-bit reading. When the ring is full the channel stops; once the program
+// has read what it held, poll_read reports Overrun once, and the stream
+// starts again from the first channel. Dropping the stream stops it; give
+// it back with `Pins.release_analog_stream` to free its pins and the
+// converter.
+pub struct AnalogStream {
+    stream: esp_adc.Stream<hal.RegisterBlock>
+    channel: &mut DmaChannel
+    pins: u32
+
+    // The samples converted since the last call, oldest first, as many as
+    // fit `samples`, without waiting; returns how many. Overrun once after
+    // the ring filled up and conversions were lost.
+    pub fn poll_read(&mut self, samples: &mut[u32]) -> usize!hal.Error {
+        return self.stream.poll_read(samples)
+    }
+
+    // Wait until `samples` is full. Overrun as for poll_read, with the
+    // samples read before it dropped.
+    pub fn read(&mut self, samples: &mut[u32]) -> void!hal.Error {
+        return self.stream.read(samples)
+    }
+
+    // The samples converted and readable now.
+    pub fn available(&mut self) -> usize {
+        return self.stream.available()
+    }
+
+    // The samples the ring holds when full, and per part.
+    pub fn capacity(&self) -> usize {
+        return self.stream.capacity()
+    }
+
+    pub fn part_samples(&self) -> usize {
+        return self.stream.part_samples()
+    }
+
+    // The conversions a second, in all channels, that the timer gives.
+    pub fn rate_hz(&self) -> u32 {
+        return self.stream.rate_hz()
+    }
+
+    // The entries in the pattern.
+    pub fn channels(&self) -> u32 {
+        return self.stream.channels()
+    }
+
+    // The DMA channel the stream runs on.
+    pub fn dma_channel(&self) -> u32 {
+        return self.channel.number
+    }
+
+    // Stop converting; nothing more arrives. Dropping the stream does this
+    // too.
+    pub fn stop(&mut self) {
+        self.stream.stop()
+    }
+}
+
+// --- Pulse trains and addressable LEDs: the remote control peripheral (RMT)
+
+// The RMT's registers, its memory at 0x400 above them, and SYS_CONF: the
+// memory accessed directly rather than through the FIFO
+// (APB_FIFO_MASK), and the register clock on.
 const RMT_BASE: usize = 0x6000_6000
-const RMT_CH0_CONF0: usize = 0x10
-const RMT_INT_RAW: usize = 0x38
-const RMT_INT_CLR: usize = 0x44
 const RMT_SYS_CONF: usize = 0x68
-const RMT_RAM: usize = 0x6000_6400
-// CH0_TX_CONF0: start, reset the memory read pointers, idle output low and
-// driven, the clock divider (1), four memory blocks, carrier off, and latch.
-const RMT_START: u32 = 0b111
-const RMT_CONF: u32 = (1u32 << 6) | (1u32 << 8) | (4u32 << 16) | (1u32 << 20)
-const RMT_CONF_UPDATE: u32 = 1 << 24
 const RMT_DIRECT_MEMORY: u32 = 1 << 0
 const RMT_CLOCK_ON: u32 = 1u32 << 31
-const RMT_TX_END: u32 = 1 << 0
-const RMT_TX_ERROR: u32 = 1 << 4
-const RMT_CLEAR: u32 = 0x1111
-// Pulse codes at 80 MHz: a 0 bit is high for 0.4 us and low for 0.85 us, a
-// 1 bit high for 0.8 us and low for 0.45 us; 300 us low latches the colors.
-const WS2812_ZERO: u32 = 0x0044_8020
-const WS2812_ONE: u32 = 0x0024_8040
-const WS2812_LATCH: u32 = 24_000
-// Four memory blocks of 48 codes: 24 per LED, and the latch and the end.
-pub const WS2812_MAX_LEDS: usize = 7
-const RMT_POLLS: u32 = 1_000_000
+// The tick WS2812 LEDs are timed in; how long an LED's colors and the
+// latch take, and the margin a write may take beyond them.
+const WS2812_HZ: u32 = 80_000_000
+const WS2812_LED_US: u64 = 30
+const WS2812_LATCH_US: u64 = 300
+const WS2812_MARGIN_US: u64 = 10_000
 
-// WS2812 LEDs on one pin, as `Pins.ws2812` hands them out.
-pub struct Ws2812 {
+// The RMT's memory blocks in use, one bit each, and the pins its transmit
+// channels drive, which a receive channel may share. A channel is free
+// while its own block is.
+static mut RMT_BLOCKS: u32 = 0
+static mut RMT_TX_PINS: u32 = 0
+
+// The first of `count` channels from `first` whose block and the
+// `blocks - 1` after it are free; Busy if none is.
+fn rmt_channel(first: u32, count: u32, blocks: u32) -> u32!hal.Error {
+    for channel in first..first + count {
+        mask := ((1u32 << blocks) - 1) << channel
+        // SAFETY: Pins is the only user of RMT_BLOCKS.
+        used := unsafe {
+            RMT_BLOCKS
+        }
+        if channel + blocks <= esp_rmt.BLOCKS && (used & mask) == 0 {
+            return ok(channel)
+        }
+    }
+    return err(hal.Error.Busy)
+}
+
+// Take channel `channel`'s memory, `blocks` blocks from its own; the
+// first channel starts the RMT: its clocks (the 80 MHz PLL output,
+// undivided, as its source), out of reset, and the memory accessed
+// directly.
+// SAFETY: the caller owns the channel and its memory.
+unsafe fn start_rmt(channel: u32, blocks: u32) {
+    unsafe {
+        if RMT_BLOCKS == 0 {
+            start_peripheral(PCR_RMT_CONF)
+            mmio.write32(PCR_RMT_SCLK_CONF, hal.encode(SCLK_SELECT, 1) | SCLK_ENABLE)
+            system := mmio.read32(RMT_BASE + RMT_SYS_CONF)
+            mmio.write32(RMT_BASE + RMT_SYS_CONF, system | RMT_DIRECT_MEMORY | RMT_CLOCK_ON)
+        }
+        RMT_BLOCKS |= ((1u32 << blocks) - 1) << channel
+    }
+}
+
+// Give back a channel's memory; the last stops the RMT.
+// SAFETY: the caller owned the channel and no longer uses it.
+unsafe fn stop_rmt(channel: u32, blocks: u32) {
+    unsafe {
+        RMT_BLOCKS &= ~(((1u32 << blocks) - 1) << channel)
+        if RMT_BLOCKS == 0 {
+            stop_peripheral(PCR_RMT_CONF)
+        }
+    }
+}
+
+// An RMT transmit channel and its pin, as `Pins.rmt_tx` hands it out; see
+// std/embedded/peripheral/esp_rmt for the codes and the operations.
+pub struct RmtTx {
+    tx: esp_rmt.Transmitter<hal.RegisterBlock>
     pin: u32
 
-    // Show `colors`, one 0xRRGGBB value per LED along the chain, at most
-    // WS2812_MAX_LEDS, and wait until they are sent. InvalidInput for more;
-    // Timeout if the transmission does not end.
-    pub fn write(&mut self, colors: &[u32]) -> void!hal.Error {
-        if colors.len > WS2812_MAX_LEDS {
-            return err(hal.Error.InvalidInput)
-        }
-        // SAFETY: the driver owns channel 0 and its memory.
-        unsafe {
-            code := 0usize
-            for index in 0..colors.len {
-                rgb := colors[index]
-                // The LEDs take green, red, then blue, most significant bit
-                // first.
-                grb := ((rgb >> 8) & 0xFF00) | ((rgb << 8) & 0xFF_0000) | (rgb & 0xFF)
-                for bit in 0..24u32 {
-                    pulse := WS2812_ZERO
-                    if (grb & (0x80_0000u32 >> bit)) != 0 {
-                        pulse = WS2812_ONE
-                    }
-                    mmio.write32(RMT_RAM + 4 * code, pulse)
-                    code += 1
-                }
-            }
-            mmio.write32(RMT_RAM + 4 * code, WS2812_LATCH)
-            mmio.write32(RMT_RAM + 4 * (code + 1), 0)
-            mmio.write32(RMT_BASE + RMT_INT_CLR, RMT_CLEAR)
-            mmio.write32(RMT_BASE + RMT_CH0_CONF0, RMT_CONF | RMT_CONF_UPDATE)
-            mmio.write32(RMT_BASE + RMT_CH0_CONF0, RMT_CONF | RMT_START)
-            mmio.write32(RMT_BASE + RMT_CH0_CONF0, RMT_CONF | RMT_CONF_UPDATE)
-            for _ in 0..RMT_POLLS {
-                raw := mmio.read32(RMT_BASE + RMT_INT_RAW)
-                if (raw & RMT_TX_ERROR) != 0 {
-                    return err(hal.Error.Bus)
-                }
-                if (raw & RMT_TX_END) != 0 {
-                    return ok()
-                }
-            }
-        }
-        return err(hal.Error.Timeout)
+    // Send `codes` and wait until the last has gone out.
+    pub fn transmit(&mut self, codes: &[u32]) -> void!hal.Error {
+        return self.tx.transmit(codes)
+    }
+
+    // Start sending `codes`, then keep the channel's memory filled; true
+    // once sent.
+    pub fn poll_transmit(&mut self, codes: &[u32]) -> bool!hal.Error {
+        return self.tx.poll_transmit(codes)
+    }
+
+    // `transmit` and `poll_transmit` for codes computed while they go out.
+    pub fn send<P: esp_rmt.Pulses>(&mut self, pulses: &P) -> void!hal.Error {
+        return self.tx.send(pulses)
+    }
+
+    pub fn poll_send<P: esp_rmt.Pulses>(&mut self, pulses: &P) -> bool!hal.Error {
+        return self.tx.poll_send(pulses)
+    }
+
+    // Send `codes` `count` times back to back, or until `stop` for 0.
+    pub fn start_loop(&mut self, codes: &[u32], count: u32) -> void!hal.Error {
+        return self.tx.start_loop(codes, count)
+    }
+
+    pub fn poll_loop(&mut self) -> bool!hal.Error {
+        return self.tx.poll_loop()
+    }
+
+    // Stop at once; the pin returns to the idle level.
+    pub fn stop(&mut self) {
+        self.tx.stop()
+    }
+
+    pub fn is_busy(&self) -> bool {
+        return self.tx.is_busy()
+    }
+
+    // The channel's part of the RMT interrupt, `irq()`; see esp_rmt.
+    pub fn listen(&mut self) {
+        self.tx.listen()
+    }
+
+    pub fn ignore(&mut self) {
+        self.tx.ignore()
+    }
+
+    pub fn is_pending(&mut self) -> bool {
+        return self.tx.is_pending()
+    }
+
+    pub fn irq(&self) -> u32 {
+        return RMT
+    }
+
+    // The tick the channel counts, the closest to the configuration's.
+    pub fn resolution_hz(&self) -> u32 {
+        return self.tx.resolution_hz()
+    }
+
+    // The carrier's frequency, 0 for none.
+    pub fn carrier_hz(&self) -> u32 {
+        return self.tx.carrier_hz()
+    }
+
+    // The transmit channel, 0 or 1.
+    pub fn channel(&self) -> u32 {
+        return self.tx.channel()
+    }
+
+    pub fn memory_codes(&self) -> usize {
+        return self.tx.memory_codes()
     }
 
     pub fn pin(&self) -> u32 {
         return self.pin
+    }
+}
+
+// An RMT receive channel and its pin, as `Pins.rmt_rx` hands it out; see
+// std/embedded/peripheral/esp_rmt for the codes and the operations.
+pub struct RmtRx {
+    rx: esp_rmt.Receiver<hal.RegisterBlock>
+    pin: u32
+    // The pin is a transmit channel's.
+    shared: bool
+
+    // Receive a frame into `buffer` within `timeout_us`; the number of
+    // codes.
+    pub fn receive(&mut self, buffer: &mut[u32], timeout_us: u64) -> usize!hal.Error {
+        return self.rx.receive(buffer, timeout_us)
+    }
+
+    // Start receiving a frame into `buffer`, then keep the channel's memory
+    // emptied; true once the frame has ended.
+    pub fn poll_receive(&mut self, buffer: &mut[u32]) -> bool!hal.Error {
+        return self.rx.poll_receive(buffer)
+    }
+
+    // The codes of the last frame, or received so far.
+    pub fn received(&self) -> usize {
+        return self.rx.received()
+    }
+
+    pub fn stop(&mut self) {
+        self.rx.stop()
+    }
+
+    pub fn is_busy(&self) -> bool {
+        return self.rx.is_busy()
+    }
+
+    // The channel's part of the RMT interrupt, `irq()`; see esp_rmt.
+    pub fn listen(&mut self) {
+        self.rx.listen()
+    }
+
+    pub fn ignore(&mut self) {
+        self.rx.ignore()
+    }
+
+    pub fn is_pending(&mut self) -> bool {
+        return self.rx.is_pending()
+    }
+
+    pub fn irq(&self) -> u32 {
+        return RMT
+    }
+
+    // Turn the pin's pull-up or pull-down on, as for an infrared receiver
+    // with an open-collector output; a transmitter's pin keeps its own.
+    pub fn set_pull(&mut self, up: bool, down: bool) {
+        if !self.shared {
+            // SAFETY: the receiver owns the pin.
+            unsafe {
+                set_pad_pull(self.pin, up, down)
+            }
+        }
+    }
+
+    pub fn resolution_hz(&self) -> u32 {
+        return self.rx.resolution_hz()
+    }
+
+    // The receive channel, 0 or 1 (the RMT's channels 2 and 3).
+    pub fn channel(&self) -> u32 {
+        return self.rx.channel()
+    }
+
+    pub fn memory_codes(&self) -> usize {
+        return self.rx.memory_codes()
+    }
+
+    pub fn pin(&self) -> u32 {
+        return self.pin
+    }
+}
+
+// Lend transmit channel `channel` the free memory blocks after its own,
+// up to `wanted` blocks in all, and return how many it has then.
+// SAFETY: the caller owns the channel, and gives the blocks back with
+// rmt_return before Pins claims anything else.
+unsafe fn rmt_lend(channel: u32, wanted: u32) -> u32 {
+    unsafe {
+        blocks := 1u32
+        for blocks < wanted && channel + blocks < esp_rmt.BLOCKS && (RMT_BLOCKS & (1u32 << (channel + blocks))) == 0 {
+            RMT_BLOCKS |= 1u32 << (channel + blocks)
+            blocks += 1
+        }
+        return blocks
+    }
+}
+
+// Give back the blocks rmt_lend lent channel `channel`, which now has
+// `blocks`.
+// SAFETY: the channel no longer uses them.
+unsafe fn rmt_return(channel: u32, blocks: u32) {
+    unsafe {
+        RMT_BLOCKS &= ~((((1u32 << blocks) - 1) << channel) & ~(1u32 << channel))
+    }
+}
+
+// WS2812 LEDs on one pin, as `Pins.ws2812` hands them out.
+pub struct Ws2812 {
+    tx: RmtTx
+
+    // Show `colors`, one 0xRRGGBB value per LED along the chain, and wait
+    // until they are sent: 30 us per LED and 300 us that latch them, with
+    // interrupts masked. For the write the channel also takes the RMT
+    // memory blocks after its own that nothing has claimed, so that up to
+    // 7 LEDs (one block for each 2) fit in memory at once. Longer chains
+    // are refilled while they go out, 12 codes every 15 us, which needs an
+    // optimized build (-O1 and up); too slow a refill reports Overrun.
+    // Timeout if the transmission does not end; Bus if the channel reports
+    // an error.
+    pub fn write(&mut self, colors: &[u32]) -> void!hal.Error {
+        pulses := esp_rmt.Ws2812Pulses.new(colors, WS2812_HZ)
+        // The codes and the end.
+        wanted := ((colors.len * 24 + 2 + esp_rmt.BLOCK_CODES - 1) / esp_rmt.BLOCK_CODES) as u32
+        channel := self.tx.channel()
+        section := hal.Critical.enter()
+        // SAFETY: interrupts are masked and Pins is not used until the
+        // blocks are given back.
+        blocks := unsafe {
+            rmt_lend(channel, wanted)
+        }
+        if blocks > 1 {
+            self.tx.tx.set_memory_blocks(blocks)!
+        }
+        result := self.stream(&pulses, WS2812_LED_US * colors.len as u64 + WS2812_LATCH_US + WS2812_MARGIN_US)
+        if blocks > 1 {
+            self.tx.tx.set_memory_blocks(1)!
+            // SAFETY: as above.
+            unsafe {
+                rmt_return(channel, blocks)
+            }
+        }
+        core.drop(section)
+        return result
+    }
+
+    pub fn pin(&self) -> u32 {
+        return self.tx.pin
+    }
+
+    // Send `pulses` within `limit_us`.
+    fn stream(&mut self, pulses: &esp_rmt.Ws2812Pulses, limit_us: u64) -> void!hal.Error {
+        start := now_us()
+        for {
+            if self.tx.poll_send(pulses)? {
+                return ok()
+            }
+            if now_us() - start > limit_us {
+                self.tx.stop()
+                return err(hal.Error.Timeout)
+            }
+        }
     }
 }
 
@@ -3994,6 +4648,124 @@ pub struct SpiDmaBus: hal.SpiDma {
     }
 }
 
+// --- Serial ports by DMA (UHCI) ------------------------------------------
+
+const PCR_UHCI_CONF: usize = PCR_BASE + 0x028
+// The receive ring's descriptors, and whether a port holds UHCI0, which
+// serves one UART at a time.
+static mut UHCI_DESCRIPTORS: [96]u32 = [0u32; 96]
+static mut UHCI_TAKEN: bool = false
+
+// A serial port that receives into a ring buffer by DMA, from
+// `Uart.dma(rx, ring)`. It implements the std/io Reader and Writer
+// protocols, serial.Port, and serial.PollPort like Uart; esp_uhci documents
+// the details:
+//
+// - Input waits in the ring, not just the 128-byte FIFO, so the program
+//   reads at its own pace. The ring is the part of `ring` from its first
+//   word-aligned byte, cut into 32 parts of the same size, a multiple of 4
+//   bytes; `ring_size()` tells. Received bytes become readable when their
+//   part closes: when it is full, or 30 bit times after the last byte of a
+//   message (2.6 ms at 115200 baud). Each message takes at least one part,
+//   so the ring holds at most 32 messages.
+// - When the ring is full, the channel stops instead of overwriting it, and
+//   bytes that arrive beyond the 128-byte FIFO are lost; a read returns
+//   what the ring held and then reports esp_uart.OVERRUN.
+// - Bytes with framing or parity errors, and breaks, are dropped, and a
+//   read reports them after the bytes it returns.
+//
+// Writes go through the transmit FIFO as on Uart: UHCI0's transmit side
+// does not work on this chip (see esp_uhci). Dropping the session stops the
+// channel and hands the port back; input still in the ring is lost.
+pub struct UartDma: serial.Port + serial.PollPort {
+    port: esp_uhci.DmaPort<hal.RegisterBlock>
+    rx: &mut DmaChannel
+    number: u32
+
+    pub fn write(&mut self, bytes: &[u8]) -> usize!io.Error {
+        return self.port.write(bytes)
+    }
+
+    pub fn poll_write(&mut self, bytes: &[u8]) -> io.Poll!io.Error {
+        return self.port.poll_write(bytes)
+    }
+
+    pub fn flush(&mut self) -> void!io.Error {
+        return self.port.flush()
+    }
+
+    pub fn poll_flush(&mut self) -> bool!io.Error {
+        return self.port.poll_flush()
+    }
+
+    pub fn read(&mut self, buffer: &mut[u8]) -> usize!io.Error {
+        return self.port.read(buffer)
+    }
+
+    pub fn poll_read(&mut self, buffer: &mut[u8]) -> io.Poll!io.Error {
+        return self.port.poll_read(buffer)
+    }
+
+    // The ring's size in bytes.
+    pub fn ring_size(&self) -> usize {
+        return self.port.ring_size()
+    }
+
+    // The bytes received and readable now.
+    pub fn available(&mut self) -> usize {
+        return self.port.available()
+    }
+
+    pub fn set_crlf(&mut self, on: bool) {
+        self.port.set_crlf(on)
+    }
+
+    pub fn set_poll_limit(&mut self, polls: u32) {
+        self.port.set_poll_limit(polls)
+    }
+
+    pub fn set_read_poll_limit(&mut self, polls: u32) {
+        self.port.set_read_poll_limit(polls)
+    }
+
+    pub fn listen(&mut self, sources: u32) {
+        self.port.listen(sources)
+    }
+
+    pub fn ignore(&mut self, sources: u32) {
+        self.port.ignore(sources)
+    }
+
+    pub fn pending_interrupts(&mut self) -> u32 {
+        return self.port.pending_interrupts()
+    }
+
+    pub fn clear_interrupts(&mut self, sources: u32) {
+        self.port.clear_interrupts(sources)
+    }
+
+    // 0 for UART0, 1 for UART1.
+    pub fn number(&self) -> u32 {
+        return self.number
+    }
+
+    // The interrupt source of the controller, UART0 or UART1.
+    pub fn irq(&self) -> u32 {
+        return UART0 + self.number
+    }
+
+    fn drop(&mut self) {
+        self.port.stop()
+        // SAFETY: the session owned UHCI0, which nothing uses any more.
+        unsafe {
+            stop_peripheral(PCR_UHCI_CONF)
+            section := hal.Critical.enter()
+            UHCI_TAKEN = false
+            core.drop(section)
+        }
+    }
+}
+
 // --- CAN (TWAI), I2S, and PWM input --------------------------------------
 
 // A CAN controller, as `Pins.can` hands it out: TWAI0 or TWAI1. Implements
@@ -4438,6 +5210,10 @@ pub struct Power: power.Power {
     // rate.
     timeout_us: u64
     lp_ticks_per_10ms: u64
+    // What ended the hibernation this boot follows, 0 for none, and the
+    // pins among it.
+    wake_sources: u32
+    woken_pins: u32
 
     pub fn mode(&self) -> power.Mode {
         // SAFETY: a single byte, written only by set_mode.
@@ -4617,6 +5393,502 @@ pub struct Power: power.Power {
             self.lp_ticks_per_10ms = self.lp_ticks() - start
         }
         return self.lp_ticks_per_10ms
+    }
+
+    // Hibernate: power the whole chip down but its LP system until one of
+    // `wake`'s sources, which then boots the firmware again from the
+    // start, as a reset does. Returns only if it cannot: InvalidInput for a
+    // Hibernation without sources, with a pin above GPIO 7, or that waits
+    // for an LP core that is not running; Timeout if the PMU never powers
+    // the chip down. See the package comment of Hibernation.
+    pub fn hibernate(&mut self, wake: &Hibernation) -> hal.Error {
+        lp_running := lp_core_running()
+        if wake.invalid || (wake.after_us == 0 && wake.pins == 0 && !wake.lp_core) || (wake.lp_core && !lp_running) {
+            return hal.Error.InvalidInput
+        }
+        sources := 0u32
+        ticks := 0u64
+        if wake.after_us != 0 {
+            sources |= WAKE_TIMER
+            ticks = wake.after_us * self.lp_rate() / 10_000
+            if ticks == 0 {
+                ticks = 1
+            }
+        }
+        if wake.pins != 0 {
+            sources |= WAKE_PINS
+        }
+        if wake.lp_core {
+            sources |= WAKE_LP_CORE
+        }
+        // The section is never left: the chip powers down inside, and
+        // boots again.
+        section := hal.Critical.enter()
+        // SAFETY: interrupts stay masked; Power owns the PMU, the LP timer,
+        // and the LP_AON wake registers, and the program asked for its end.
+        unsafe {
+            pmu := hal.RegisterBlock.at(PMU_BASE)
+            timer := hal.RegisterBlock.at(LP_TIMER_BASE)
+            lp_aon := hal.RegisterBlock.at(LP_AON_BASE)
+            lp_io := hal.RegisterBlock.at(LP_IO_BASE)
+            io_mux := hal.RegisterBlock.at(IO_MUX_BASE - 4)
+            lp_clkrst := hal.RegisterBlock.at(LP_CLKRST_BASE)
+            if ticks != 0 {
+                deadline := esp_power.lp_ticks(&mut timer) + ticks
+                esp_power.arm_lp_alarm(&mut timer, deadline)
+            }
+            if wake.pins != 0 {
+                esp_power.arm_ext1(&mut lp_aon, &mut lp_io, &mut io_mux, wake.pins, wake.levels)
+            }
+            esp_power.configure_hibernation(&mut pmu, lp_running)
+            esp_power.use_rc_fast(&mut lp_clkrst)
+            esp_power.mark_deep_sleep_boot(&mut lp_aon)
+            sysclk := mmio.read32(PCR_SYSCLK_CONF)
+            mmio.write32(PCR_SYSCLK_CONF, (sysclk & ~SOC_CLK_SEL) | hal.encode(SOC_CLK_SEL, SOC_CLK_XTAL))
+            ets_update_cpu_frequency(XTAL_HZ / 1_000_000)
+            esp_power.prepare_hibernation_request(&mut pmu, sources)
+            enter_hibernation(PMU_BASE + esp_power.SLEEP_REQUEST_REGISTER, esp_power.SLEEP_REQUEST_BIT)
+            // Still here: the PMU did not power the chip down.
+            mmio.write32(PCR_SYSCLK_CONF, sysclk)
+            ets_update_cpu_frequency(CPU_HZ / 1_000_000)
+        }
+        core.drop(section)
+        return hal.Error.Timeout
+    }
+
+    // True if this boot follows a hibernation.
+    pub fn woke_from_hibernation(&self) -> bool {
+        return self.wake_sources != 0
+    }
+
+    // The sources that ended the hibernation this boot follows, WAKE_PINS,
+    // WAKE_TIMER, and WAKE_LP_CORE; 0 after any other reset.
+    pub fn wake_cause(&self) -> u32 {
+        return self.wake_sources
+    }
+
+    // The pins whose level ended that hibernation, bit n for GPIO n.
+    pub fn wake_pins(&self) -> u32 {
+        return self.woken_pins
+    }
+}
+
+// --- Hibernation ------------------------------------------------------------
+
+// Wakeup sources of a hibernation, for Power.wake_cause: a pin's level, the
+// LP timer, and the LP core.
+pub const WAKE_PINS: u32 = esp_power.WAKE_EXT1
+pub const WAKE_TIMER: u32 = esp_power.WAKE_LP_TIMER
+pub const WAKE_LP_CORE: u32 = esp_power.WAKE_LP_CORE
+// The pins that can end a hibernation, GPIO 0 to 7: the LP IO pads.
+pub const HIBERNATE_PINS: u32 = 0xFF
+
+const LP_IO_BASE: usize = 0x600B_2000
+
+// What ends a hibernation, for Power.hibernate:
+//
+//     wake := esp32c6.Hibernation.new()
+//     wake.wake_after_us(60_000_000)
+//     wake.wake_on_pin(4, power.LEVEL_LOW)
+//     error := b.power.hibernate(&wake)    // returns only on failure
+//
+// Hibernation is the ESP32-C6's deep sleep, the deepest state there is: the
+// CPU, SRAM, every HP peripheral, the flash, and the crystal power down,
+// and only the LP system keeps running, the LP timer, LP SRAM, the LP IO
+// pads, and the LP core if it was started. The chip then draws a few
+// microamps. One of the sources boots the firmware again from the reset
+// handler; `Power.wake_cause()` and `wake_pins()` tell what woke it.
+// SRAM does not survive, but statics placed with `@section(".lp_noinit")`
+// live in LP SRAM and keep their values through hibernation and every
+// reset but a power cycle (they start out random, so mark them valid
+// yourself). The pins are GPIO 0 to 7, each ending the hibernation at a
+// level: claim each as an input with the pull it needs first; its pulls
+// carry over to the LP IO pad, which keeps them while the chip sleeps. A
+// source that holds already ends the hibernation at once. The USB serial
+// port goes away while the chip hibernates and comes back with the new
+// boot. The timer uses the LP timer's target 0, like the RTC's alarm.
+pub struct Hibernation {
+    after_us: u64
+    pins: u32
+    levels: u32
+    lp_core: bool
+    invalid: bool
+
+    // No sources yet.
+    pub fn new() -> Hibernation {
+        return Hibernation { after_us: 0, pins: 0, levels: 0, lp_core: false, invalid: false }
+    }
+
+    // Wake after `microseconds` of the LP timer, whose RC oscillator the
+    // first hibernation or timed dormant state measures for 10 ms: accurate
+    // to about 1 %. 0 removes the timer.
+    pub fn wake_after_us(&mut self, microseconds: u64) {
+        self.after_us = microseconds
+    }
+
+    // Wake while GPIO `pin`, 0 to 7, is at `level`, power.LEVEL_HIGH or
+    // power.LEVEL_LOW. Anything else makes hibernate return InvalidInput.
+    pub fn wake_on_pin(&mut self, pin: u32, level: u32) {
+        if pin >= esp_power.LP_PIN_LIMIT || (level != power.LEVEL_HIGH && level != power.LEVEL_LOW) {
+            self.invalid = true
+            return
+        }
+        bit := 1u32 << pin
+        self.pins |= bit
+        if level == power.LEVEL_HIGH {
+            self.levels |= bit
+        } else {
+            self.levels &= ~bit
+        }
+    }
+
+    // Wake when the LP core asks, with `esp32c6_lp.wake_hp()`; the LP core
+    // must be running (LpCore.start).
+    pub fn wake_on_lp_core(&mut self) {
+        self.lp_core = true
+    }
+}
+
+// Write the PMU's sleep request and wait for the power to go, from SRAM, as
+// the flash's supply goes too. Returns only if the PMU never powers down.
+@section(".ramfunc")
+fn enter_hibernation(register: usize, request: u32) {
+    // SAFETY: the caller has prepared the PMU; the store is to its
+    // register, and the loop only counts.
+    unsafe {
+        asm("sw {1}, 0({0})", "li t0, 40000000", "1: addi t0, t0, -1", "bnez t0, 1b", in(reg) register, in(reg) request, clobber("t0"))
+    }
+}
+
+// What ended the hibernation this boot follows, as PMU wakeup sources, and
+// its pins; (0, 0) after any other reset. Gives the pins back to the HP
+// system and stops the wakeup sources.
+// SAFETY: the caller owns the PMU and LP_AON's wake registers.
+unsafe fn take_wake_cause(reset_cause: u32) -> (u32, u32) {
+    unsafe {
+        pmu := hal.RegisterBlock.at(PMU_BASE)
+        lp_aon := hal.RegisterBlock.at(LP_AON_BASE)
+        sources := 0u32
+        pins := 0u32
+        if reset_cause == esp_power.DEEP_SLEEP_RESET {
+            // SLP_WAKEUP_STATUS0 also reports an enabled source that did
+            // not end the sleep, the LP timer when a pin did; each source
+            // counts only if its own record agrees.
+            sources = esp_power.wakeup_cause(&mut pmu) & (WAKE_PINS | WAKE_TIMER | WAKE_LP_CORE)
+            pins = esp_power.ext1_status(&mut lp_aon)
+            if pins == 0 {
+                sources &= ~WAKE_PINS
+            }
+            timer := hal.RegisterBlock.at(LP_TIMER_BASE)
+            if !esp_power.lp_alarm_reached(&mut timer) {
+                sources &= ~WAKE_TIMER
+            }
+        }
+        esp_power.release_ext1(&mut lp_aon)
+        esp_power.clear_wakeup_sources(&mut pmu)
+        return (sources, pins)
+    }
+}
+
+// --- The LP core -------------------------------------------------------------
+
+// LP_AON LPCORE.DISABLE holds the LP core off; LPBUS.FAST_MEM_MUX_SEL
+// gives LP SRAM to the LP core's bus rather than the HP system's while the
+// chip sleeps (cleared), applied by its UPDATE bit.
+const LP_AON_LPCORE: usize = LP_AON_BASE + 0x50
+const LPCORE_DISABLE: u32 = 1 << 31
+const LP_AON_LPBUS: usize = LP_AON_BASE + 0x48
+const FAST_MEM_MUX_SEL: u32 = 1 << 31
+const FAST_MEM_MUX_UPDATE: u32 = 1 << 30
+// PMU LP_CPU_PWR0: stall the LP core when it asks to sleep, and reset it
+// when it wakes, so every wake starts its program anew. LP_CPU_PWR1: its
+// wakeup sources, the HP core (bit 0) and the LP timer (bit 4), and its
+// sleep request. HP_LP_CPU_COMM.HP_TRIGGER_LP wakes it.
+const PMU_LP_CPU_PWR0: usize = PMU_BASE + 0x17C
+const LP_CPU_STALL_AND_RESET: u32 = (1u32 << 29) | (1u32 << 30)
+const PMU_LP_CPU_PWR1: usize = PMU_BASE + 0x180
+const LP_WAKE_HP_CPU: u32 = 1 << 0
+const LP_WAKE_LP_TIMER: u32 = 1 << 4
+const LP_WAKEUP_SOURCES: u32 = 0xFFFF
+const LP_CPU_SLEEP_REQUEST: u32 = 1 << 31
+const PMU_HP_LP_CPU_COMM: usize = PMU_BASE + 0x184
+const HP_TRIGGER_LP: u32 = 1 << 31
+// PMU INT_RAW and INT_CLR: the LP core's wake request (SW) and its
+// exception (LP_CPU_EXC).
+const PMU_INT_RAW: usize = PMU_BASE + 0x15C
+const PMU_INT_CLR: usize = PMU_BASE + 0x168
+const PMU_INT_LP_REQUEST: u32 = 1 << 29
+const PMU_INT_LP_EXCEPTION: u32 = 1 << 27
+// LP_PERI CPU.LPCORE_DBGM_UNAVALIABLE (sic): cleared, a debugger reaches
+// the LP core.
+const LP_PERI_CPU: usize = 0x600B_280C
+const LPCORE_DEBUG_OFF: u32 = 1 << 31
+// The LP core's 12 KiB of LP SRAM.
+const LP_PROGRAM_BASE: usize = 0x5000_0000
+const LP_PROGRAM_BYTES: usize = 0x3000
+
+// Where the firmware's embedded LP program lies in flash, from the linker
+// script (`.lp_image`, empty without `lp-core`).
+unsafe extern "C" fn dodo_lp_image_start() -> u32
+unsafe extern "C" fn dodo_lp_image_end() -> u32
+
+// Whether the LP core has a program and a way to wake: started, and
+// neither stopped nor panicked since.
+fn lp_core_running() -> bool {
+    // SAFETY: reading the registers has no side effects.
+    unsafe {
+        enabled := (mmio.read32(LP_AON_LPCORE) & LPCORE_DISABLE) == 0
+        return enabled && (mmio.read32(PMU_LP_CPU_PWR1) & LP_WAKEUP_SOURCES) != 0
+    }
+}
+
+// Take the LP core's wakeup sources away and ask it to sleep, then hold it
+// off. A run in progress ends at once.
+// SAFETY: the caller owns the LP core.
+unsafe fn stop_lp_core() {
+    unsafe {
+        mmio.write32(PMU_LP_CPU_PWR1, LP_CPU_SLEEP_REQUEST)
+        ets_delay_us(100)
+        lpcore := mmio.read32(LP_AON_LPCORE)
+        mmio.write32(LP_AON_LPCORE, lpcore | LPCORE_DISABLE)
+    }
+}
+
+// The ESP32-C6's low-power core, as `Peripherals.lp_core`: loads the
+// program the firmware embeds and starts, stops, and talks to it.
+//
+// The program is a Dodo program built for `chip = "esp32c6_lp"` with
+// std/embedded/chip/esp32c6_lp; name its entry file in the firmware's
+// target, and the compiler builds it and embeds its image:
+//
+//     [targets.app]
+//     entry = "main.dodo"
+//     board = "esp32c6_devkitc"
+//     lp-core = "lp/main.dodo"
+//
+// `start()` runs its `main` once; `start_every_us(period)` runs it now and
+// then again each period, timed by the LP timer, which keeps going while
+// the main core hibernates. The two programs share SHARED_WORDS words of LP
+// SRAM, `shared` and `set_shared` on both sides, and the LP program wakes
+// the main core with `esp32c6_lp.wake_hp()`: it ends a hibernation that
+// waits for it (Hibernation.wake_on_lp_core) or, while the main core runs,
+// raises the request `take_wake_request` reports. A panic on the LP core
+// stops it and leaves its message for `panic_message`.
+//
+// The LP core keeps running through hibernation, as it should, so a boot
+// that follows one finds it as it was: the firmware need not start it
+// again. Every other reset stops it at take(), so a program flashed later
+// never meets an earlier one's LP core.
+pub struct LpCore {
+    loaded: bool
+
+    // Whether the firmware embeds an LP program (`lp-core`).
+    pub fn has_program(&self) -> bool {
+        return self.program_size() != 0
+    }
+
+    // The embedded program's size in bytes, at most 12 KiB.
+    pub fn program_size(&self) -> usize {
+        // SAFETY: the functions return the linker script's addresses.
+        unsafe {
+            return (dodo_lp_image_end() - dodo_lp_image_start()) as usize
+        }
+    }
+
+    // Stop the LP core, copy the program into its LP SRAM, zero the rest
+    // of that, and clear the shared words. Unsupported if the firmware
+    // embeds no program. `start` loads too, the first time; load first to
+    // set shared words the program reads at its start.
+    pub fn load(&mut self) -> void!hal.Error {
+        size := self.program_size()
+        if size == 0 {
+            return err(hal.Error.Unsupported)
+        }
+        // SAFETY: LpCore owns the LP core and its LP SRAM; the core is
+        // stopped before its memory changes. The image lies in flash at
+        // a word-aligned address.
+        unsafe {
+            stop_lp_core()
+            start := dodo_lp_image_start() as usize
+            offset := 0usize
+            for offset < size {
+                mmio.write32(LP_PROGRAM_BASE + offset, mmio.read32(start + offset))
+                offset += 4
+            }
+            for offset < LP_PROGRAM_BYTES {
+                mmio.write32(LP_PROGRAM_BASE + offset, 0)
+                offset += 4
+            }
+        }
+        esp_lp_shared.clear()
+        self.loaded = true
+        return ok()
+    }
+
+    // Run the program's `main` once, loading it first if it is not. A
+    // program that has halted runs again from the start. Unsupported
+    // without a program.
+    pub fn start(&mut self) -> void!hal.Error {
+        return self.run(0)
+    }
+
+    // Run the program now, and then again every `period_us` microseconds
+    // of the LP timer from the end of one run to the start of the next,
+    // until `stop`. The timer's RC oscillator is measured for 10 ms the
+    // first time, so periods are accurate to about 1 %. InvalidInput for a
+    // period of 0.
+    pub fn start_every_us(&mut self, period_us: u64) -> void!hal.Error {
+        if period_us == 0 {
+            return err(hal.Error.InvalidInput)
+        }
+        return self.run(period_us)
+    }
+
+    fn run(&mut self, period_us: u64) -> void!hal.Error {
+        if !self.loaded {
+            self.load()?
+        }
+        if !self.has_program() {
+            return err(hal.Error.Unsupported)
+        }
+        rate := lp_timer_rate()
+        esp_lp_shared.write(esp_lp_shared.TICKS_PER_10MS, rate as u32)
+        ticks := period_us * rate / 10_000
+        if period_us != 0 && ticks == 0 {
+            ticks = 1
+        }
+        esp_lp_shared.write(esp_lp_shared.PERIOD_HIGH, (ticks >> 32) as u32)
+        esp_lp_shared.write(esp_lp_shared.PERIOD_LOW, (ticks & 0xFFFF_FFFF) as u32)
+        sources := LP_WAKE_HP_CPU
+        if period_us != 0 {
+            sources |= LP_WAKE_LP_TIMER
+        }
+        // SAFETY: LpCore owns the LP core, the LP fast clock's source, and
+        // the PMU's LP core registers.
+        unsafe {
+            lp_clkrst := hal.RegisterBlock.at(LP_CLKRST_BASE)
+            esp_power.use_rc_fast(&mut lp_clkrst)
+            lpcore := mmio.read32(LP_AON_LPCORE)
+            mmio.write32(LP_AON_LPCORE, lpcore & ~LPCORE_DISABLE)
+            lpbus := mmio.read32(LP_AON_LPBUS) & ~FAST_MEM_MUX_SEL
+            mmio.write32(LP_AON_LPBUS, lpbus)
+            mmio.write32(LP_AON_LPBUS, lpbus | FAST_MEM_MUX_UPDATE)
+            pwr0 := mmio.read32(PMU_LP_CPU_PWR0)
+            mmio.write32(PMU_LP_CPU_PWR0, pwr0 | LP_CPU_STALL_AND_RESET)
+            mmio.write32(PMU_LP_CPU_PWR1, sources)
+            debug := mmio.read32(LP_PERI_CPU)
+            mmio.write32(LP_PERI_CPU, debug & ~LPCORE_DEBUG_OFF)
+            mmio.write32(PMU_INT_CLR, PMU_INT_LP_REQUEST | PMU_INT_LP_EXCEPTION)
+            mmio.write32(PMU_HP_LP_CPU_COMM, HP_TRIGGER_LP)
+        }
+        return ok()
+    }
+
+    // Stop the LP core: a run in progress ends at once, and it does not
+    // wake again until the next start.
+    pub fn stop(&mut self) {
+        // SAFETY: LpCore owns the LP core.
+        unsafe {
+            stop_lp_core()
+        }
+    }
+
+    // True from a start until `stop` or a panic.
+    pub fn is_running(&self) -> bool {
+        return lp_core_running()
+    }
+
+    // How many runs of `main` have started since the program was loaded.
+    pub fn runs(&self) -> u32 {
+        return esp_lp_shared.read(esp_lp_shared.RUNS)
+    }
+
+    // Shared word `index`, below SHARED_WORDS, as either program last
+    // wrote it. Traps past the end.
+    pub fn shared(&self, index: u32) -> u32 {
+        core.assert(index < SHARED_WORDS)
+        return esp_lp_shared.read(esp_lp_shared.USER + index)
+    }
+
+    pub fn set_shared(&mut self, index: u32, value: u32) {
+        core.assert(index < SHARED_WORDS)
+        esp_lp_shared.write(esp_lp_shared.USER + index, value)
+    }
+
+    // True once if the LP program asked to wake the main core
+    // (`esp32c6_lp.wake_hp()`) while it ran, since the last call.
+    pub fn take_wake_request(&mut self) -> bool {
+        // SAFETY: the PMU's interrupt status; LpCore owns its LP bits.
+        unsafe {
+            raised := (mmio.read32(PMU_INT_RAW) & PMU_INT_LP_REQUEST) != 0
+            if raised {
+                mmio.write32(PMU_INT_CLR, PMU_INT_LP_REQUEST)
+            }
+            return raised
+        }
+    }
+
+    // True if the LP program panicked since it was loaded.
+    pub fn panicked(&self) -> bool {
+        return esp_lp_shared.read(esp_lp_shared.PANIC) == esp_lp_shared.PANIC_MAGIC
+    }
+
+    // Write the LP program's panic into `out` as `CHECK check failed at
+    // FILE:LINE:COLUMN`, as much as fits, and return the length; 0 if it
+    // has not panicked.
+    pub fn panic_message(&self, out: &mut[u8]) -> usize {
+        if !self.panicked() {
+            return 0
+        }
+        length := lp_string(out, 0, esp_lp_shared.read(esp_lp_shared.PANIC_CHECK))
+        length = append(out, length, b" check failed at ")
+        length = lp_string(out, length, esp_lp_shared.read(esp_lp_shared.PANIC_FILE))
+        length = append(out, length, b":")
+        length = append_number(out, length, esp_lp_shared.read(esp_lp_shared.PANIC_LINE))
+        length = append(out, length, b":")
+        return append_number(out, length, esp_lp_shared.read(esp_lp_shared.PANIC_COLUMN))
+    }
+}
+
+// How many shared words the programs have.
+pub const SHARED_WORDS: u32 = esp_lp_shared.USER_WORDS
+
+// Append the NUL-terminated string at `address` in the LP program's LP
+// SRAM, up to 64 bytes, to out[..length].
+fn lp_string(out: &mut[u8], length: usize, address: u32) -> usize {
+    at := address as usize
+    if at < LP_PROGRAM_BASE || at >= LP_PROGRAM_BASE + LP_PROGRAM_BYTES - 64 {
+        return append(out, length, b"?")
+    }
+    position := length
+    for index in 0usize..64 {
+        // SAFETY: inside the LP program's LP SRAM.
+        byte := unsafe {
+            mmio.read8(at + index)
+        }
+        if byte == 0 || position >= out.len {
+            break
+        }
+        out[position] = byte
+        position += 1
+    }
+    return position
+}
+
+// The LP timer's counts per 10 ms, measured once against the system timer.
+static mut LP_TICKS_PER_10MS: u64 = 0
+
+fn lp_timer_rate() -> u64 {
+    // SAFETY: a value computed once; a second computation gives the same.
+    unsafe {
+        if LP_TICKS_PER_10MS == 0 {
+            timer := hal.RegisterBlock.at(LP_TIMER_BASE)
+            start_us := now_us()
+            start := esp_power.lp_ticks(&mut timer)
+            for now_us() - start_us < 10_000 {}
+            LP_TICKS_PER_10MS = esp_power.lp_ticks(&mut timer) - start
+        }
+        return LP_TICKS_PER_10MS
     }
 }
 
