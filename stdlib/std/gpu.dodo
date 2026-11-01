@@ -41,6 +41,24 @@ pub type VertexBufferLayout = hal.VertexBufferLayout
 pub type ComputePipelineDescriptor = hal.ComputePipelineDescriptor
 pub type RenderPipelineDescriptor = hal.RenderPipelineDescriptor
 
+// A shader written once in WGSL, translated when the program is compiled
+// into SPIR-V for Vulkan, Metal Shading Language for Metal and GLSL 4.50 for
+// OpenGL. The argument is one or more string literals, joined with line
+// breaks; a mistake in the shader is a compile error pointing into them.
+// The result borrows static storage, so a function declared
+// `-> gpu.ShaderSource from(static)` may return it.
+//
+// Bindings follow std/gpu's slots: slot N is `@group(0) @binding(N)` for
+// buffers, sampled textures and storage textures, and the sampler read
+// with the sampled texture in slot N is `@group(1) @binding(N)`. Vertex
+// attribute location N is `@location(N)`. Entry points keep their WGSL
+// names on every backend, so pass those names to the pipeline
+// descriptors; a name Metal reserves, such as `main`, is rejected.
+// Clip space and depth are as WGSL defines them, as everywhere in std/gpu.
+// Immediate data (push constants) is not available.
+@compiler(wgsl)
+pub fn wgsl(source: &str) -> ShaderSource
+
 pub fn error_name(error: Error) -> &str from(static) {
     match error {
         Error.NoBackend => {

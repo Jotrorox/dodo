@@ -9,6 +9,8 @@ use std::collections::{HashMap, HashSet};
 mod pio;
 #[path = "printing.rs"]
 mod printing;
+#[path = "wgsl.rs"]
+mod wgsl;
 
 // Composed standard-library apps need many independent specializations. Bound
 // total work separately from recursive expansion so that raising the breadth
@@ -112,6 +114,7 @@ pub(super) fn instantiate(program: &mut Program) -> Check<Vec<Obligation>> {
         depth: 0,
         printing_count: 0,
         pio_version: program.pio_version,
+        wgsl_constants: vec![],
         obligations: vec![],
         required: HashSet::new(),
         pending: vec![],
@@ -127,7 +130,7 @@ pub(super) fn instantiate(program: &mut Program) -> Check<Vec<Obligation>> {
     program.structs.retain(|s| s.generics.is_empty());
     program.enums.retain(|e| e.generics.is_empty());
     program.functions.retain(|f| {
-        f.generics.is_empty() && (f.printing.is_none() || f.generic_instance) && !f.pio
+        f.generics.is_empty() && (f.printing.is_none() || f.generic_instance) && !f.pio && !f.wgsl
     });
     let substitutions = HashMap::new();
     for structure in &mut program.structs {
@@ -156,6 +159,7 @@ pub(super) fn instantiate(program: &mut Program) -> Check<Vec<Obligation>> {
     program.structs.append(&mut expander.structs);
     program.enums.append(&mut expander.enums);
     program.functions.append(&mut expander.functions);
+    program.constants.append(&mut expander.wgsl_constants);
     Ok(expander.obligations)
 }
 struct Expander {
@@ -180,6 +184,9 @@ struct Expander {
     printing_count: usize,
     /// The build chip's PIO version, for `rp_pio.assemble`.
     pio_version: Option<u8>,
+    /// The SPIR-V word arrays of `gpu.wgsl` calls, added to the program's
+    /// constants once expansion is done.
+    wgsl_constants: Vec<Constant>,
     obligations: Vec<Obligation>,
     required: HashSet<(String, String, String)>,
     // Generic parameters of the call whose arguments are being inferred.
@@ -224,15 +231,19 @@ impl Expander {
     /// The function pointer type of a named, non-generic function.
     fn function_value_type(&self, name: &str) -> Option<Type> {
         let function = self.signatures.get(name)?;
-        (function.generics.is_empty() && function.printing.is_none() && !function.pio).then(|| {
-            let params = function.params.iter().map(|p| p.ty.clone()).collect();
-            let ret = Box::new(function.ret.clone());
-            if function.extern_ {
-                Type::ExternFn(params, ret)
-            } else {
-                Type::Fn(params, ret)
-            }
-        })
+        (function.generics.is_empty()
+            && function.printing.is_none()
+            && !function.pio
+            && !function.wgsl)
+            .then(|| {
+                let params = function.params.iter().map(|p| p.ty.clone()).collect();
+                let ret = Box::new(function.ret.clone());
+                if function.extern_ {
+                    Type::ExternFn(params, ret)
+                } else {
+                    Type::Fn(params, ret)
+                }
+            })
     }
     /// A named function used as a value. Generic functions are specialized
     /// from the expected function type, and the name becomes the specialization.
@@ -255,6 +266,12 @@ impl Expander {
             return Err(Diagnostic::new(
                 span,
                 "rp_pio.assemble runs at compile time and cannot be used as a function value",
+            ));
+        }
+        if template.wgsl {
+            return Err(Diagnostic::new(
+                span,
+                "gpu.wgsl translates shaders at compile time and cannot be used as a function value",
             ));
         }
         if template.generics.is_empty() {
@@ -1212,6 +1229,17 @@ impl Expander {
         {
             e.kind = self.pio_program(template, type_args, args, span)?;
         }
+        if let ExprKind::Call {
+            name,
+            type_args,
+            args,
+        } = &e.kind
+            && let Some(template) = self.signatures.get(name)
+            && template.wgsl
+        {
+            let template = template.clone();
+            e.kind = self.wgsl_shader(&template, type_args, args, span)?;
+        }
         // A qualified function used as a value, such as `math.square`.
         if let ExprKind::Field(..) = &e.kind
             && let Some(path) = qualified_name(e)
@@ -1596,6 +1624,12 @@ impl Expander {
                         return Err(Diagnostic::new(
                             span,
                             "rp_pio.assemble runs at compile time and cannot be used as a callback",
+                        ));
+                    }
+                    if template.wgsl {
+                        return Err(Diagnostic::new(
+                            span,
+                            "gpu.wgsl translates shaders at compile time and cannot be used as a callback",
                         ));
                     }
                     let mapping = self.substitutions(&template.generics, type_args, span)?;

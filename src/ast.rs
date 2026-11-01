@@ -537,6 +537,9 @@ pub struct Function {
     /// `@compiler(pio)`: std/embedded/chip/rp_pio's `assemble`, whose calls
     /// are assembled at compile time into a `Program` literal.
     pub pio: bool,
+    /// `@compiler(wgsl)`: std/gpu's `wgsl`, whose calls are translated at
+    /// compile time into a `ShaderSource` literal for every backend.
+    pub wgsl: bool,
     pub generics: Vec<String>,
     pub bounds: Vec<Bound>,
     /// Compiler-generated specialization: declared borrow sources may become

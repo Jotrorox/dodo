@@ -95,6 +95,8 @@ struct Modifiers {
     printing: Option<Printing>,
     // `@compiler(pio)`: rp_pio's compile-time assembler.
     pio: bool,
+    // `@compiler(wgsl)`: std/gpu's compile-time WGSL translator.
+    wgsl: bool,
     test: bool,
     ignore: Option<String>,
     public: bool,
@@ -117,7 +119,7 @@ struct Modifiers {
 
 impl Modifiers {
     fn compiler(&self) -> bool {
-        self.printing.is_some() || self.pio
+        self.printing.is_some() || self.pio || self.wgsl
     }
 }
 
@@ -580,7 +582,10 @@ impl Parser {
                         "println" => mods.printing = Some(Printing::Println),
                         "printf" => mods.printing = Some(Printing::Printf),
                         "pio" => mods.pio = true,
-                        _ => return Err(self.error("expected print, println, printf, or pio")),
+                        "wgsl" => mods.wgsl = true,
+                        _ => {
+                            return Err(self.error("expected print, println, printf, pio, or wgsl"));
+                        }
                     }
                     self.expect(")")?;
                     self.newlines();
@@ -1605,6 +1610,7 @@ impl Parser {
             extern_: mods.extern_,
             printing: mods.printing,
             pio: mods.pio,
+            wgsl: mods.wgsl,
             generics,
             bounds,
             params,

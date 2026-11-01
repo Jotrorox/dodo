@@ -188,15 +188,15 @@ pub struct Device: hal.Backend {
 
     pub fn create_compute_pipeline(&self, descriptor: &hal.ComputePipelineDescriptor) -> hal.Handle!hal.Error {
         self.current()?
-        shader := compile(gl.COMPUTE_SHADER, descriptor.source.glsl, b"#define COMPUTE 1\n")?
+        shader := compile(gl.COMPUTE_SHADER, descriptor.source.glsl, b"#define COMPUTE 1\n", descriptor.entry)?
         program := link(shader, 0)?
         return ok(hal.Handle { a: program as u64, b: 0, c: 0, d: 0 })
     }
 
     pub fn create_render_pipeline(&self, descriptor: &hal.RenderPipelineDescriptor) -> hal.Handle!hal.Error {
         self.current()?
-        vertex := compile(gl.VERTEX_SHADER, descriptor.vertex.glsl, b"#define VERTEX 1\n")?
-        fragment := match compile(gl.FRAGMENT_SHADER, descriptor.fragment.glsl, b"#define FRAGMENT 1\n") {
+        vertex := compile(gl.VERTEX_SHADER, descriptor.vertex.glsl, b"#define VERTEX 1\n", descriptor.vertex_entry)?
+        fragment := match compile(gl.FRAGMENT_SHADER, descriptor.fragment.glsl, b"#define FRAGMENT 1\n", descriptor.fragment_entry) {
             ok(fragment) => fragment,
             err(error) => {
                 unsafe {
@@ -561,8 +561,11 @@ fn positive(value: i64) -> u64 {
 }
 
 // Compile one stage of `source`, with `define` inserted after its
-// #version line (GLSL requires that line to come first).
-fn compile(stage: u32, source: &str, define: &[u8]) -> u32!hal.Error {
+// #version line (GLSL requires that line to come first), followed by
+// `#define DODO_ENTRY_<entry> 1` when the entry point's name is an
+// identifier: shaders from gpu.wgsl hold every entry point, each inside
+// `#if defined(DODO_ENTRY_<name>)`.
+fn compile(stage: u32, source: &str, define: &[u8], entry: &str) -> u32!hal.Error {
     text := mem.str_bytes(source)
     split := 0usize
     if text.len >= 8 && text[0] == 35 && text[1] == 118 {
@@ -574,15 +577,17 @@ fn compile(stage: u32, source: &str, define: &[u8]) -> u32!hal.Error {
             }
         }
     }
-    parts := [ptr.as_ptr(text), ptr.as_ptr(define), unsafe {
+    selector := [0u8; 256]
+    selector_length := entry_define(entry, &mut selector)
+    parts := [ptr.as_ptr(text), ptr.as_ptr(define), ptr.as_ptr(&selector), unsafe {
         ptr.offset(ptr.as_ptr(text), split as isize)
     }]
-    lengths := [split as i32, define.len as i32, (text.len - split) as i32]
+    lengths := [split as i32, define.len as i32, selector_length as i32, (text.len - split) as i32]
     status := 0i32
     shader := 0u32
     unsafe {
         shader = gl.create_shader(stage)
-        gl.shader_source(shader, 3, ptr.as_ptr(&parts), ptr.as_ptr(&lengths))
+        gl.shader_source(shader, 4, ptr.as_ptr(&parts), ptr.as_ptr(&lengths))
         gl.compile_shader(shader)
         gl.get_shaderiv(shader, gl.COMPILE_STATUS, ptr.from_mut(&mut status))
     }
@@ -593,6 +598,38 @@ fn compile(stage: u32, source: &str, define: &[u8]) -> u32!hal.Error {
         return err(hal.Error.InvalidShader)
     }
     return ok(shader)
+}
+
+// Write `#define DODO_ENTRY_<entry> 1` and a newline into `out` and return
+// its length, or 0 when `entry` is not an identifier of at most 200 bytes.
+fn entry_define(entry: &str, out: &mut[256]u8) -> usize {
+    name := mem.str_bytes(entry)
+    if name.len == 0 || name.len > 200 || (name[0] >= 48 && name[0] <= 57) {
+        return 0
+    }
+    for i in 0usize..name.len {
+        byte := name[i]
+        letter := (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || byte == 95
+        if !letter && !(byte >= 48 && byte <= 57) {
+            return 0
+        }
+    }
+    prefix := b"#define DODO_ENTRY_"
+    length := 0usize
+    for i in 0usize..prefix.len {
+        out[length] = prefix[i]
+        length += 1
+    }
+    for i in 0usize..name.len {
+        out[length] = name[i]
+        length += 1
+    }
+    suffix := b" 1\n"
+    for i in 0usize..suffix.len {
+        out[length] = suffix[i]
+        length += 1
+    }
+    return length
 }
 
 // Link shaders into a program and delete them; `second` may be 0.
