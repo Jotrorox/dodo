@@ -1648,6 +1648,24 @@ pub struct Canvas {
     pub fn gradient_path(&mut self, path: &Path, rule: FillRule, gradient: &Gradient) {
         self.gradient_outline(path, rule, gradient)
     }
+    // Stroke `outline` with `style` in `color`: paint the band of the
+    // stroke's width along it, with the style's joins, caps and dashes.
+    pub fn stroke_outline<O: Outline>(&mut self, outline: &O, style: &Stroke, color: Color) {
+        shape := Stroked.new(outline, style)
+        self.fill_outline(&shape, FillRule.NonZero, color)
+    }
+    // Stroke a stored path with `style` in `color`.
+    pub fn stroke_path(&mut self, path: &Path, style: &Stroke, color: Color) {
+        self.stroke_outline(path, style, color)
+    }
+    // Stroke `outline` with `style`, painted with a gradient.
+    pub fn gradient_stroke_outline<O: Outline>(&mut self, outline: &O, style: &Stroke, gradient: &Gradient) {
+        shape := Stroked.new(outline, style)
+        self.gradient_outline(&shape, FillRule.NonZero, gradient)
+    }
+    pub fn gradient_stroke_path(&mut self, path: &Path, style: &Stroke, gradient: &Gradient) {
+        self.gradient_stroke_outline(path, style, gradient)
+    }
     // Fill a width x height rectangle with a gradient.
     pub fn gradient_rect(&mut self, x: i32, y: i32, width: u32, height: u32, gradient: &Gradient) {
         t := max64(y as i64, self.clip_top)
@@ -2494,10 +2512,10 @@ pub struct Bands {
 // ---------------------------------------------------------------------------
 // Antialiased vector drawing
 //
-// Paths, outlines and the aa_* canvas methods are rasterized with exact
-// coverage: each pixel's alpha is the area of the pixel the shape covers,
-// computed in integers from the shape's edges at 1/256 pixel precision.
-// Curves are flattened to within 1/32 pixel. Antialiased and gradient drawing
+// Paths, outlines, strokes and the aa_* canvas methods are rasterized with
+// exact coverage: each pixel's alpha is the area of the pixel the shape
+// covers, computed in integers from the shape's edges at 1/256 pixel
+// precision. Curves are flattened to within 1/32 pixel. Antialiased and gradient drawing
 // composites over the existing pixels (source-over), unlike the integer
 // primitives above, which store their color.
 //
@@ -2554,7 +2572,9 @@ pub interface Outline {
 
 // Receives an outline as move, line, curve and close commands in subpixel
 // coordinates. Contours close themselves: move_to and the end of a trace
-// close an open contour with a straight line to its start.
+// close an open contour with a straight line to its start. Inside a
+// Stroked outline the commands trace the centre line of a stroke instead,
+// and open contours stay open.
 //
 // A pen works in one of three modes. Measuring finds the bounds from the
 // points and control points alone. Collecting flattens the outline once into
@@ -2599,9 +2619,57 @@ pub struct Pen {
     x: i64
     y: i64
     open: bool
+    // Stroking (see Stroked): while `stroking` is above zero the commands
+    // trace a centre line, and the pen adds the edges of the stroke around
+    // it instead. x, y, start_x, start_y and open then follow the centre
+    // line. The style is copied from the Stroke.
+    stroking: u32
+    stroke_half: i64
+    stroke_reach: i64
+    stroke_join: u8
+    stroke_cap: u8
+    stroke_miter: i64
+    dash_count: usize
+    dashes: [16]i64
+    dash_first: usize
+    dash_first_left: i64
+    dash_first_on: bool
+    dash_period: i64
+    // The current subpath: whether a command drew (`drawn`) and whether
+    // the centre line moved, and the dash element under the current point.
+    drawn: bool
+    moved: bool
+    at_start: bool
+    dash_index: usize
+    dash_left: i64
+    dash_on: bool
+    // The segment being stroked: its unit direction (2^-24 units) and the
+    // direction scaled to the half width, from which its normal follows.
+    segment_ux: i64
+    segment_uy: i64
+    segment_ax: i64
+    segment_ay: i64
+    // The piece of stroke ending at the current point, which the next
+    // piece joins; `previous_hidden` when it lies outside the pass.
+    has_previous: bool
+    previous_hidden: bool
+    previous_ux: i64
+    previous_uy: i64
+    previous_ax: i64
+    previous_ay: i64
+    previous_length: i64
+    // The piece starting the subpath, whose start is capped or, when the
+    // subpath closes with the stroke still drawn, joined at the end.
+    deferred: bool
+    first_hidden: bool
+    first_ux: i64
+    first_uy: i64
+    first_ax: i64
+    first_ay: i64
+    first_length: i64
 
     fn new() -> Pen {
-        return Pen { mode: PEN_MEASURE, any: false, min_x: 0, min_y: 0, max_x: 0, max_y: 0, row_top: 0, row_bottom: 0, column_start: 0, column_end: 0, carry: 0, cells: [0i64; 256], edges: 0, overflow: false, edge_top_x: [0i32; 256], edge_top_y: [0i32; 256], edge_bottom_x: [0i32; 256], edge_bottom_y: [0i32; 256], edge_down: [false; 256], order: [0u16; 256], active: [0u16; 256], span_left: [0i32; 256], span_right: [0i32; 256], span_rows: [0i32; 256], next_edge: 0, active_count: 0, start_x: 0, start_y: 0, x: 0, y: 0, open: false }
+        return Pen { mode: PEN_MEASURE, any: false, min_x: 0, min_y: 0, max_x: 0, max_y: 0, row_top: 0, row_bottom: 0, column_start: 0, column_end: 0, carry: 0, cells: [0i64; 256], edges: 0, overflow: false, edge_top_x: [0i32; 256], edge_top_y: [0i32; 256], edge_bottom_x: [0i32; 256], edge_bottom_y: [0i32; 256], edge_down: [false; 256], order: [0u16; 256], active: [0u16; 256], span_left: [0i32; 256], span_right: [0i32; 256], span_rows: [0i32; 256], next_edge: 0, active_count: 0, start_x: 0, start_y: 0, x: 0, y: 0, open: false, stroking: 0, stroke_half: 0, stroke_reach: 0, stroke_join: JOIN_MITER, stroke_cap: CAP_BUTT, stroke_miter: 1024, dash_count: 0, dashes: [0i64; 16], dash_first: 0, dash_first_left: 0, dash_first_on: true, dash_period: 0, drawn: false, moved: false, at_start: false, dash_index: 0, dash_left: 0, dash_on: true, segment_ux: 0, segment_uy: 0, segment_ax: 0, segment_ay: 0, has_previous: false, previous_hidden: false, previous_ux: 0, previous_uy: 0, previous_ax: 0, previous_ay: 0, previous_length: 0, deferred: false, first_hidden: false, first_ux: 0, first_uy: 0, first_ax: 0, first_ay: 0, first_length: 0 }
     }
     // Rasterize the pixel row `row`, columns start..end, on the next trace.
     fn begin(&mut self, row: i64, start: i64, end: i64) {
@@ -2755,6 +2823,11 @@ pub struct Pen {
 
     // Start a new contour at (x, y), closing the current one.
     pub fn move_to(&mut self, x: i32, y: i32) {
+        if self.stroking > 0 {
+            self.stroke_finish(false)
+            self.stroke_start(path_coordinate(x), path_coordinate(y))
+            return
+        }
         self.close()
         px := path_coordinate(x)
         py := path_coordinate(y)
@@ -2768,6 +2841,11 @@ pub struct Pen {
     // A straight edge from the current point to (x, y). Without a preceding
     // move_to, the contour starts at the current point, initially (0, 0).
     pub fn line_to(&mut self, x: i32, y: i32) {
+        if self.stroking > 0 {
+            self.stroke_open()
+            self.stroke_line(path_coordinate(x), path_coordinate(y), false)
+            return
+        }
         self.ensure_open()
         px := path_coordinate(x)
         py := path_coordinate(y)
@@ -2779,6 +2857,11 @@ pub struct Pen {
     }
     // A quadratic Bezier curve through control point (cx, cy) to (x, y).
     pub fn quad_to(&mut self, cx: i32, cy: i32, x: i32, y: i32) {
+        if self.stroking > 0 {
+            self.stroke_open()
+            self.stroke_cubic(path_coordinate(cx), path_coordinate(cy), path_coordinate(cx), path_coordinate(cy), path_coordinate(x), path_coordinate(y), true)
+            return
+        }
         self.ensure_open()
         x0 := self.x
         y0 := self.y
@@ -2817,6 +2900,11 @@ pub struct Pen {
     // A cubic Bezier curve through control points (c1x, c1y) and (c2x, c2y)
     // to (x, y).
     pub fn cubic_to(&mut self, c1x: i32, c1y: i32, c2x: i32, c2y: i32, x: i32, y: i32) {
+        if self.stroking > 0 {
+            self.stroke_open()
+            self.stroke_cubic(path_coordinate(c1x), path_coordinate(c1y), path_coordinate(c2x), path_coordinate(c2y), path_coordinate(x), path_coordinate(y), false)
+            return
+        }
         self.ensure_open()
         x0 := self.x
         y0 := self.y
@@ -2862,6 +2950,11 @@ pub struct Pen {
     // Close the current contour with a straight edge back to its start.
     pub fn close(&mut self) {
         if !self.open {
+            return
+        }
+        if self.stroking > 0 {
+            self.drawn = true
+            self.stroke_finish(true)
             return
         }
         self.open = false
@@ -3035,6 +3128,644 @@ pub struct Pen {
             previous = value
             column += 1
         }
+    }
+
+    // -- Stroking -------------------------------------------------------
+    //
+    // A stroke is the union of a band of the half width along every
+    // segment of the centre line, a cap at each open end and a join at each
+    // vertex. The pen adds its outline as separate directed edges, in no
+    // particular order, without storing the centre line: along each piece
+    // the edge on the normal's side runs forwards and the other backwards,
+    // and caps and joins connect them. Every band, cap and join then winds
+    // the same way, so filling by the non-zero rule paints their union.
+    //
+    // At a vertex the outer side gets the join; the inner side either
+    // connects the two offset edges directly or, when a piece is too short
+    // for them to cross, through the vertex itself, which keeps the winding
+    // positive however sharp the turn.
+
+    // Start stroking: commands up to end_stroke trace a centre line. A
+    // nested call (stroking an outline that is itself stroked) only counts,
+    // and the outer stroke applies.
+    fn begin_stroke(&mut self, stroke: &Stroke) {
+        if self.stroking > 0 {
+            self.stroking += 1
+            return
+        }
+        self.close()
+        self.stroking = 1
+        self.stroke_half = stroke.width / 2
+        self.stroke_join = stroke.join
+        self.stroke_cap = stroke.cap
+        self.stroke_miter = stroke.miter_limit
+        self.stroke_reach = 2 * self.stroke_half + 2
+        if stroke.join == JOIN_MITER {
+            self.stroke_reach = max64(self.stroke_reach, ceil_div(self.stroke_half * stroke.miter_limit, 256) + 2)
+        }
+        self.dash_count = stroke.dash_count
+        self.dash_period = 0
+        closed_gaps := stroke.cap != CAP_BUTT
+        for i in 0usize..stroke.dash_count {
+            self.dashes[i] = stroke.dashes[i]
+            self.dash_period += stroke.dashes[i]
+            if i % 2 == 1 && stroke.dashes[i] * 4096 > self.stroke_half {
+                closed_gaps = false
+            }
+        }
+        // Round or square caps close gaps under 1/4096 of the width (to
+        // within 1/64 pixel), so such a stroke is drawn solid.
+        if closed_gaps {
+            self.dash_count = 0
+        }
+        // Find the dash element `offset` along the pattern.
+        self.dash_first = 0
+        self.dash_first_on = true
+        self.dash_first_left = 0
+        if self.dash_count > 0 {
+            phase := stroke.dash_offset
+            // Skip the elements that end at or before the offset, except
+            // a zero-length one right at it, which is a dot.
+            for phase > self.dashes[self.dash_first] || phase == self.dashes[self.dash_first] && phase > 0 {
+                phase -= self.dashes[self.dash_first]
+                self.dash_first = (self.dash_first + 1) % self.dash_count
+                self.dash_first_on = !self.dash_first_on
+            }
+            self.dash_first_left = self.dashes[self.dash_first] - phase
+        }
+        self.open = false
+    }
+    fn end_stroke(&mut self) {
+        if self.stroking == 0 {
+            return
+        }
+        self.stroking -= 1
+        if self.stroking > 0 {
+            return
+        }
+        self.stroke_finish(false)
+        self.open = false
+    }
+    // Begin a subpath at (x, y).
+    fn stroke_start(&mut self, x: i64, y: i64) {
+        self.start_x = x
+        self.start_y = y
+        self.x = x
+        self.y = y
+        self.open = true
+        self.drawn = false
+        self.moved = false
+        self.at_start = true
+        self.has_previous = false
+        self.previous_hidden = false
+        self.deferred = false
+        self.first_hidden = false
+        self.dash_index = self.dash_first
+        self.dash_left = self.dash_first_left
+        self.dash_on = self.dash_first_on
+    }
+    // A drawing command without a subpath starts one at the current point.
+    fn stroke_open(&mut self) {
+        if !self.open {
+            sx := self.x
+            sy := self.y
+            self.stroke_start(sx, sy)
+        }
+        self.drawn = true
+    }
+    // End the subpath: close it with a segment back to its start and a
+    // join there, or cap its ends.
+    fn stroke_finish(&mut self, closed: bool) {
+        if !self.open {
+            return
+        }
+        sx := self.start_x
+        sy := self.start_y
+        if closed {
+            self.stroke_line(sx, sy, false)
+        }
+        self.open = false
+        if self.stroke_half == 0 {
+            return
+        }
+        r := self.stroke_half
+        if !self.moved {
+            // A subpath of no length: a dot of the cap's shape.
+            if self.drawn && self.stroke_cap != CAP_BUTT && self.dash_on {
+                self.stroke_cap_at(sx, sy, r, 0, false)
+                self.stroke_cap_at(sx, sy, r, 0, true)
+            }
+            return
+        }
+        if closed && self.dash_on && self.has_previous && self.deferred {
+            if !self.previous_hidden && !self.first_hidden {
+                self.segment_ux = self.first_ux
+                self.segment_uy = self.first_uy
+                self.segment_ax = self.first_ax
+                self.segment_ay = self.first_ay
+                length := self.first_length
+                self.stroke_join_at(sx, sy, false, length)
+            }
+            return
+        }
+        if self.dash_on && self.has_previous && !self.previous_hidden {
+            ex := self.x
+            ey := self.y
+            ax := self.previous_ax
+            ay := self.previous_ay
+            self.stroke_cap_at(ex, ey, ax, ay, true)
+        }
+        if self.deferred && !self.first_hidden {
+            ax := self.first_ax
+            ay := self.first_ay
+            self.stroke_cap_at(sx, sy, ax, ay, false)
+        }
+    }
+    // Where the box low_x..high_x, low_y..high_y, widened by `margin`,
+    // lies relative to the current pass: 1 when it is above, below or right
+    // of the pass, where it adds nothing, 2 when it is wholly left of the
+    // pass, where only winding matters (as in `outside`), 0 otherwise and
+    // while measuring.
+    fn stroke_place(&self, low_x: i64, high_x: i64, low_y: i64, high_y: i64, margin: i64) -> u8 {
+        if self.mode == PEN_MEASURE {
+            return 0
+        }
+        if self.mode == PEN_COLLECT && self.overflow {
+            return 1
+        }
+        if high_y + margin <= self.row_top || low_y - margin >= self.row_bottom || low_x - margin >= self.column_end * 256 {
+            return 1
+        }
+        if high_x + margin <= (self.column_start - 1) * 256 {
+            return 2
+        }
+        return 0
+    }
+    // True when everything a stroke adds around the box lies above, below
+    // or right of the pass.
+    fn stroke_hidden(&self, low_x: i64, high_x: i64, low_y: i64, high_y: i64) -> bool {
+        return self.stroke_place(low_x, high_x, low_y, high_y, self.stroke_reach) == 1
+    }
+    // stroke_place for a cap or join at (x, y). One wholly left of the pass
+    // may be replaced by straight edges between its ends.
+    fn stroke_near(&self, x: i64, y: i64) -> u8 {
+        return self.stroke_place(x, x, y, y, self.stroke_reach)
+    }
+    fn stroke_include(&mut self, x: i64, y: i64) {
+        self.include(clamp64(x, -PATH_LIMIT, PATH_LIMIT), clamp64(y, -PATH_LIMIT, PATH_LIMIT))
+    }
+    // One edge of the stroke outline, clamped to the path limit.
+    fn stroke_edge(&mut self, x0: i64, y0: i64, x1: i64, y1: i64) {
+        self.segment(clamp64(x0, -PATH_LIMIT, PATH_LIMIT), clamp64(y0, -PATH_LIMIT, PATH_LIMIT), clamp64(x1, -PATH_LIMIT, PATH_LIMIT), clamp64(y1, -PATH_LIMIT, PATH_LIMIT))
+    }
+    // The arc of radius stroke_half around (cx, cy) from offset (ax, ay) to
+    // (bx, by), at most a quarter turn, as chords within FLATNESS: each half
+    // is split at the normalized midpoint until its chord is close enough.
+    // Parts outside the pass are skipped or, left of it, replaced by their
+    // chord, so a huge arc costs only its visible chords. Measuring takes
+    // the ends and the axis extremes the arc passes.
+    fn stroke_arc(&mut self, cx: i64, cy: i64, ax: i64, ay: i64, bx: i64, by: i64, depth: u32) {
+        r := self.stroke_half
+        if self.mode == PEN_MEASURE {
+            self.stroke_include(cx + ax, cy + ay)
+            self.stroke_include(cx + bx, cy + by)
+            turn := ax * by - ay * bx
+            if arc_passes(turn, -ay, by) {
+                self.stroke_include(cx + r, cy)
+            }
+            if arc_passes(turn, ay, -by) {
+                self.stroke_include(cx - r, cy)
+            }
+            if arc_passes(turn, ax, -bx) {
+                self.stroke_include(cx, cy + r)
+            }
+            if arc_passes(turn, -ax, bx) {
+                self.stroke_include(cx, cy - r)
+            }
+            return
+        }
+        sx := ax + bx
+        sy := ay + by
+        s := isqrt((sx * sx + sy * sy) as u64) as i64
+        // The arc bulges at most r - s / 2 past its chord.
+        place := self.stroke_place(cx + min64(ax, bx), cx + max64(ax, bx), cy + min64(ay, by), cy + max64(ay, by), max64(r - s / 2, 0) + 2)
+        if place == 1 {
+            return
+        }
+        if place == 2 || depth == 0 || s == 0 || 2 * r - s <= 2 * FLATNESS {
+            self.stroke_edge(cx + ax, cy + ay, cx + bx, cy + by)
+            return
+        }
+        mx := round_div(sx * r, s)
+        my := round_div(sy * r, s)
+        self.stroke_arc(cx, cy, ax, ay, mx, my, depth - 1)
+        self.stroke_arc(cx, cy, mx, my, bx, by, depth - 1)
+    }
+    // The cap at (x, y) of a piece running along (ax, ay), its direction
+    // scaled to the half width: an end cap from the normal's side round the
+    // front to the other side, or a start cap, which is the end cap of the
+    // reversed piece.
+    fn stroke_cap_at(&mut self, x: i64, y: i64, along_x: i64, along_y: i64, end: bool) {
+        ax := along_x
+        ay := along_y
+        if !end {
+            ax = -ax
+            ay = -ay
+        }
+        nx := -ay
+        ny := ax
+        near := self.stroke_near(x, y)
+        if near == 1 {
+            return
+        }
+        if near == 2 || self.stroke_cap == CAP_BUTT {
+            self.stroke_edge(x + nx, y + ny, x - nx, y - ny)
+        } else if self.stroke_cap == CAP_SQUARE {
+            self.stroke_edge(x + nx, y + ny, x + nx + ax, y + ny + ay)
+            self.stroke_edge(x + nx + ax, y + ny + ay, x - nx + ax, y - ny + ay)
+            self.stroke_edge(x - nx + ax, y - ny + ay, x - nx, y - ny)
+        } else {
+            self.stroke_arc(x, y, nx, ny, ax, ay, 24)
+            self.stroke_arc(x, y, ax, ay, -nx, -ny, 24)
+        }
+    }
+    // Join, at (x, y), the previous piece to the segment's next piece,
+    // which is `length` long. `smooth` marks a vertex inside a flattened
+    // curve, joined by a bevel or, where a bevel would stray from the
+    // curve's offset, by an arc.
+    fn stroke_join_at(&mut self, x: i64, y: i64, smooth: bool, length: i64) {
+        r := self.stroke_half
+        pux := self.previous_ux
+        puy := self.previous_uy
+        nux := self.segment_ux
+        nuy := self.segment_uy
+        n1x := -self.previous_ay
+        n1y := self.previous_ax
+        n2x := -self.segment_ay
+        n2y := self.segment_ax
+        cross := (pux * nuy - puy * nux) >> 24
+        dot := clamp64((pux * nux + puy * nuy) >> 24, -ARC_ONE, ARC_ONE)
+        if cross == 0 && dot > 0 {
+            if n1x != n2x || n1y != n2y {
+                self.stroke_edge(x + n1x, y + n1y, x + n2x, y + n2y)
+                self.stroke_edge(x - n2x, y - n2y, x - n1x, y - n1y)
+            }
+            return
+        }
+        near := self.stroke_near(x, y)
+        if near == 1 {
+            return
+        }
+        if near == 2 {
+            self.stroke_edge(x + n1x, y + n1y, x + n2x, y + n2y)
+            self.stroke_edge(x - n2x, y - n2y, x - n1x, y - n1y)
+            return
+        }
+        // The outer side runs from offset a to b, the inner from i to j.
+        // Turning towards the normal (cross > 0) puts the normal's side
+        // inside; a full reversal counts as turning away.
+        ax := n1x
+        ay := n1y
+        bx := n2x
+        by := n2y
+        ix := -n2x
+        iy := -n2y
+        jx := -n1x
+        jy := -n1y
+        if cross > 0 {
+            ax = -n2x
+            ay = -n2y
+            bx = -n1x
+            by = -n1y
+            ix = n1x
+            iy = n1y
+            jx = n2x
+            jy = n2y
+        }
+        // The inner offset edges cross within both pieces when each is at
+        // least r * max(sin t, tan(t / 2)) long, t the turn.
+        shortest := min64(self.previous_length, length)
+        if shortest * min64(ARC_ONE, ARC_ONE + dot) >= r * abs64(cross) {
+            self.stroke_edge(x + ix, y + iy, x + jx, y + jy)
+        } else {
+            self.stroke_edge(x + ix, y + iy, x, y)
+            self.stroke_edge(x, y, x + jx, y + jy)
+        }
+        join := self.stroke_join
+        if smooth {
+            sx := ax + bx
+            sy := ay + by
+            s := isqrt((sx * sx + sy * sy) as u64) as i64
+            join = JOIN_ROUND
+            if 2 * r - s <= 2 * FLATNESS {
+                join = JOIN_BEVEL
+            }
+        }
+        if join == JOIN_BEVEL {
+            self.stroke_edge(x + ax, y + ay, x + bx, y + by)
+            return
+        }
+        // The outer bisector, as a unit vector: from the offsets for turns
+        // up to a right angle, from the directions beyond, where the
+        // offsets nearly cancel.
+        wx := ax + bx
+        wy := ay + by
+        if dot < 0 {
+            wx = pux - nux
+            wy = puy - nuy
+        }
+        if wx == 0 && wy == 0 {
+            self.stroke_edge(x + ax, y + ay, x + bx, y + by)
+            return
+        }
+        w := unit(wx, wy)
+        ux := w.x
+        uy := w.y
+        if join == JOIN_ROUND {
+            if dot >= 0 {
+                self.stroke_arc(x, y, ax, ay, bx, by, 24)
+            } else {
+                mx := shift24(ux * r)
+                my := shift24(uy * r)
+                self.stroke_arc(x, y, ax, ay, mx, my, 24)
+                self.stroke_arc(x, y, mx, my, bx, by, 24)
+            }
+            return
+        }
+        // Miter: the offset edges meet r / cos(t / 2) from the vertex,
+        // unless that is beyond the limit.
+        half_cos := isqrt(((ARC_ONE + dot) * ARC_ONE / 2) as u64) as i64
+        if half_cos == 0 || self.stroke_miter * half_cos < 256 * ARC_ONE {
+            self.stroke_edge(x + ax, y + ay, x + bx, y + by)
+            return
+        }
+        distance := r * ARC_ONE / half_cos
+        mx := x + shift24(ux * distance)
+        my := y + shift24(uy * distance)
+        self.stroke_edge(x + ax, y + ay, mx, my)
+        self.stroke_edge(mx, my, x + bx, y + by)
+    }
+    // A piece of stroke along the current segment from (x0, y0) to (x1, y1),
+    // `length` long. `at_vertex` when it starts at the segment's start,
+    // where it joins the previous piece if the stroke continues.
+    fn stroke_piece(&mut self, x0: i64, y0: i64, x1: i64, y1: i64, length: i64, at_vertex: bool, smooth: bool) {
+        if self.has_previous {
+            if !self.previous_hidden {
+                self.stroke_join_at(x0, y0, smooth, length)
+            }
+        } else if at_vertex && self.at_start {
+            // Capped or joined once the subpath ends.
+            self.deferred = true
+            self.first_hidden = false
+            self.first_ux = self.segment_ux
+            self.first_uy = self.segment_uy
+            self.first_ax = self.segment_ax
+            self.first_ay = self.segment_ay
+            self.first_length = length
+        } else {
+            ax := self.segment_ax
+            ay := self.segment_ay
+            self.stroke_cap_at(x0, y0, ax, ay, false)
+        }
+        nx := -self.segment_ay
+        ny := self.segment_ax
+        self.stroke_edge(x0 + nx, y0 + ny, x1 + nx, y1 + ny)
+        self.stroke_edge(x1 - nx, y1 - ny, x0 - nx, y0 - ny)
+        self.has_previous = true
+        self.previous_hidden = false
+        self.previous_ux = self.segment_ux
+        self.previous_uy = self.segment_uy
+        self.previous_ax = self.segment_ax
+        self.previous_ay = self.segment_ay
+        self.previous_length = length
+    }
+    // The same for a piece outside the pass: only the state follows.
+    fn stroke_hidden_piece(&mut self, at_vertex: bool) {
+        if !self.has_previous && at_vertex && self.at_start {
+            self.deferred = true
+            self.first_hidden = true
+        }
+        self.has_previous = true
+        self.previous_hidden = true
+    }
+    // Continue the centre line straight to (x, y), cut into dashes. Returns
+    // whether the segment has any length.
+    fn stroke_line(&mut self, x: i64, y: i64, smooth: bool) -> bool {
+        x0 := self.x
+        y0 := self.y
+        dx := x - x0
+        dy := y - y0
+        if dx == 0 && dy == 0 || self.stroke_half == 0 {
+            return false
+        }
+        self.x = x
+        self.y = y
+        self.moved = true
+        hidden := self.stroke_hidden(min64(x0, x), max64(x0, x), min64(y0, y), max64(y0, y))
+        if hidden && self.dash_count == 0 {
+            self.stroke_hidden_piece(true)
+            self.at_start = false
+            return true
+        }
+        length := isqrt((dx * dx + dy * dy) as u64) as i64
+        u := unit(dx, dy)
+        self.segment_ux = u.x
+        self.segment_uy = u.y
+        self.segment_ax = shift24(u.x * self.stroke_half)
+        self.segment_ay = shift24(u.y * self.stroke_half)
+        if self.dash_count == 0 {
+            self.stroke_piece(x0, y0, x, y, length, true, smooth)
+            self.at_start = false
+            return true
+        }
+        t := 0i64
+        for {
+            if !(self.dash_on && self.has_previous) {
+                t = self.dash_skip(x0, y0, dx, dy, length, t)
+            }
+            step := min64(self.dash_left, length - t)
+            if self.dash_on {
+                if hidden {
+                    self.stroke_hidden_piece(t == 0)
+                } else {
+                    px := x0 + round_div(dx * t, length)
+                    py := y0 + round_div(dy * t, length)
+                    qx := x0 + round_div(dx * (t + step), length)
+                    qy := y0 + round_div(dy * (t + step), length)
+                    self.stroke_piece(px, py, qx, qy, step, t == 0, smooth)
+                }
+            }
+            t += step
+            self.dash_left -= step
+            if self.dash_left > 0 {
+                break
+            }
+            // The dash element ends at t.
+            if self.dash_on {
+                if !hidden {
+                    px := x0 + round_div(dx * t, length)
+                    py := y0 + round_div(dy * t, length)
+                    ax := self.segment_ax
+                    ay := self.segment_ay
+                    self.stroke_cap_at(px, py, ax, ay, true)
+                }
+                self.has_previous = false
+            }
+            self.dash_index = (self.dash_index + 1) % self.dash_count
+            self.dash_left = self.dashes[self.dash_index]
+            self.dash_on = !self.dash_on
+            if t == length {
+                break
+            }
+        }
+        self.at_start = false
+        return true
+    }
+    // Where to continue dashing the segment from (x0, y0) along (dx, dy),
+    // `length` long, from t when no dash is in progress: past the whole
+    // dash periods that lie outside the pass, so dashing costs only the
+    // visible dashes. Skipped dashes left of the pass are closed outlines,
+    // which add no winding to its pixels. The first period of a subpath
+    // and the last of a segment stay, to start and end them exactly. While measuring every whole period is skipped,
+    // and the band around them counts instead.
+    fn dash_skip(&mut self, x0: i64, y0: i64, dx: i64, dy: i64, length: i64, t: i64) -> i64 {
+        period := self.dash_period
+        available := (length - t) / period - 1
+        // The subpath's first dash may be joined to its last at its start,
+        // where the last segment's cap or join may reach into the pass.
+        if available <= 0 || self.at_start && t == 0 {
+            return t
+        }
+        if self.mode == PEN_MEASURE {
+            end := t + available * period
+            ax := self.segment_ax
+            ay := self.segment_ay
+            px := x0 + round_div(dx * t, length) - ax
+            py := y0 + round_div(dy * t, length) - ay
+            qx := x0 + round_div(dx * end, length) + ax
+            qy := y0 + round_div(dy * end, length) + ay
+            self.stroke_include(px - ay, py + ax)
+            self.stroke_include(px + ay, py - ax)
+            self.stroke_include(qx - ay, qy + ax)
+            self.stroke_include(qx + ay, qy - ax)
+            return end
+        }
+        // Gallop to the most periods that can be skipped, then refine.
+        px := x0 + round_div(dx * t, length)
+        py := y0 + round_div(dy * t, length)
+        skipped := 0i64
+        step := 1i64
+        for skipped + step <= available && self.dash_skippable(px, py, x0, y0, dx, dy, length, t + (skipped + step) * period) {
+            skipped += step
+            step = step * 2
+        }
+        for step > 1 {
+            step = step / 2
+            if skipped + step <= available && self.dash_skippable(px, py, x0, y0, dx, dy, length, t + (skipped + step) * period) {
+                skipped += step
+            }
+        }
+        return t + skipped * period
+    }
+    // True when the dashes along the segment from (px, py) to the point at
+    // `end` miss the pass, so that, being closed outlines, they add nothing
+    // to it. They lie in the band of the half width around that stretch,
+    // lengthened by the half width at both ends unless the caps are flat:
+    // a rectangle along the segment, tested against the pass on both its
+    // axes and the pass's, so a wide stroke's dashes only count where they
+    // cross the pass.
+    fn dash_skippable(&self, px: i64, py: i64, x0: i64, y0: i64, dx: i64, dy: i64, length: i64, end: i64) -> bool {
+        if self.mode == PEN_COLLECT && self.overflow {
+            return true
+        }
+        ax := 0i64
+        ay := 0i64
+        if self.stroke_cap != CAP_BUTT {
+            ax = self.segment_ax
+            ay = self.segment_ay
+        }
+        sx := px - ax
+        sy := py - ay
+        ex := x0 + round_div(dx * end, length) + ax
+        ey := y0 + round_div(dy * end, length) + ay
+        left := (self.column_start - 1) * 256 - 2
+        right := self.column_end * 256 + 2
+        top := self.row_top - 2
+        bottom := self.row_bottom + 2
+        wide_x := abs64(self.segment_ay) + 2
+        wide_y := abs64(self.segment_ax) + 2
+        if max64(sx, ex) + wide_x <= left || min64(sx, ex) - wide_x >= right || max64(sy, ey) + wide_y <= top || min64(sy, ey) - wide_y >= bottom {
+            return true
+        }
+        // Across the segment, along its normal (-uy, ux) in 2^-24 units.
+        ux := self.segment_ux
+        uy := self.segment_uy
+        across := ux * sy - uy * sx
+        half := (self.stroke_half + 2) * ARC_ONE
+        low := min64(-uy * left, -uy * right) + min64(ux * top, ux * bottom)
+        high := max64(-uy * left, -uy * right) + max64(ux * top, ux * bottom)
+        if across + half <= low || across - half >= high {
+            return true
+        }
+        // Along it.
+        first := ux * sx + uy * sy
+        last := ux * ex + uy * ey
+        low = min64(ux * left, ux * right) + min64(uy * top, uy * bottom)
+        high = max64(ux * left, ux * right) + max64(uy * top, uy * bottom)
+        return max64(first, last) + 2 * ARC_ONE <= low || min64(first, last) - 2 * ARC_ONE >= high
+    }
+    // Stroke a cubic Bezier curve from the current point, or a quadratic
+    // one through (x1, y1) when `quadratic`, flattened as for filling. The
+    // chords meet at smooth vertices.
+    fn stroke_cubic(&mut self, x1: i64, y1: i64, x2: i64, y2: i64, x3: i64, y3: i64, quadratic: bool) {
+        if self.stroke_half == 0 {
+            return
+        }
+        x0 := self.x
+        y0 := self.y
+        low_x := min64(min64(x0, x1), min64(x2, x3))
+        high_x := max64(max64(x0, x1), max64(x2, x3))
+        low_y := min64(min64(y0, y1), min64(y2, y3))
+        high_y := max64(max64(y0, y1), max64(y2, y3))
+        if self.dash_count == 0 && self.stroke_hidden(low_x, high_x, low_y, high_y) {
+            self.x = x3
+            self.y = y3
+            if low_x != high_x || low_y != high_y {
+                self.moved = true
+                self.stroke_hidden_piece(true)
+                self.at_start = false
+            }
+            return
+        }
+        n := 1i64
+        if quadratic {
+            n = curve_steps(abs64(x0 - 2 * x1 + x3) + abs64(y0 - 2 * y1 + y3), 4 * FLATNESS)
+        } else {
+            bend := max64(abs64(x0 - 2 * x1 + x2) + abs64(y0 - 2 * y1 + y2), abs64(x1 - 2 * x2 + x3) + abs64(y1 - 2 * y2 + y3))
+            n = curve_steps(3 * bend, 4 * FLATNESS)
+        }
+        smooth := false
+        for i in 1i64..n + 1 {
+            s := n - i
+            qx := x3
+            qy := y3
+            if i < n {
+                if quadratic {
+                    square := n * n
+                    qx = round_div(x0 * s * s + 2 * x1 * s * i + x3 * i * i, square)
+                    qy = round_div(y0 * s * s + 2 * y1 * s * i + y3 * i * i, square)
+                } else {
+                    cube := n * n * n
+                    qx = round_div(x0 * s * s * s + 3 * x1 * s * s * i + 3 * x2 * s * i * i + x3 * i * i * i, cube)
+                    qy = round_div(y0 * s * s * s + 3 * y1 * s * s * i + 3 * y2 * s * i * i + y3 * i * i * i, cube)
+                }
+            }
+            if self.stroke_line(qx, qy, smooth) {
+                smooth = true
+            }
+        }
+        self.x = x3
+        self.y = y3
     }
 }
 
@@ -3267,6 +3998,35 @@ fn ramp_area(v: i64) -> i64 {
     return 512 * v - 65536
 }
 
+// A direction as a unit vector in 2^-24 units.
+struct Unit {
+    x: i64
+    y: i64
+}
+
+// The unit vector along (dx, dy), not both zero, computed after scaling it
+// up to about 2^29 so that even a short segment's direction is exact.
+fn unit(dx: i64, dy: i64) -> Unit {
+    x := dx
+    y := dy
+    for abs64(x) < 268435456 && abs64(y) < 268435456 {
+        x = x * 2
+        y = y * 2
+    }
+    length := isqrt((x * x + y * y) as u64) as i64
+    return Unit { x: round_div(x * ARC_ONE, length), y: round_div(y * ARC_ONE, length) }
+}
+
+// Whether an arc of at most a quarter turn from offset a to b, turning by
+// `turn` (the cross product of a and b), passes the direction e, given the
+// cross products a x e and e x b.
+fn arc_passes(turn: i64, a_cross: i64, b_cross: i64) -> bool {
+    if turn >= 0 {
+        return a_cross >= 0 && b_cross >= 0
+    }
+    return a_cross <= 0 && b_cross <= 0
+}
+
 // Chords needed so a curve whose second difference is `bend` stays within
 // tolerance: ceil(sqrt(bend / tolerance)), from 1 to CURVE_STEPS.
 fn curve_steps(bend: i64, tolerance: i64) -> i64 {
@@ -3450,6 +4210,181 @@ pub struct Path {
                 i += 1
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Strokes
+
+// How a stroke turns a corner between two segments.
+pub enum LineJoin {
+    // Extend the outer edges until they meet, or bevel the corner where
+    // that would reach further than the miter limit.
+    Miter,
+    // An arc of the half width around the corner.
+    Round,
+    // A straight edge across the corner.
+    Bevel
+}
+
+// How a stroke ends at each end of an open subpath and of every dash.
+pub enum LineCap {
+    // Flat, at the end point.
+    Butt,
+    // A half disk of the half width around the end point.
+    Round,
+    // Flat, half the width beyond the end point.
+    Square
+}
+
+const JOIN_MITER: u8 = 0
+const JOIN_ROUND: u8 = 1
+const JOIN_BEVEL: u8 = 2
+const CAP_BUTT: u8 = 0
+const CAP_ROUND: u8 = 1
+const CAP_SQUARE: u8 = 2
+
+// The most dash lengths a stroke holds; set_dashes ignores more.
+pub const STROKE_DASHES: usize = 16
+// The shortest dash pattern, in subpixels: a quarter pixel.
+const DASH_PERIOD: i64 = 64
+
+// How to stroke an outline: its width, joins, caps and dash pattern.
+// Lengths are in subpixels, like path coordinates. The defaults are those
+// of SVG and HTML canvas: miter joins with a limit of 4, butt caps, solid.
+//
+//     style := graphics.Stroke.new(3 * graphics.SUBPIXEL)
+//     style.set_join(graphics.LineJoin.Round)
+//     dashes := [6 * graphics.SUBPIXEL, 3 * graphics.SUBPIXEL]
+//     style.set_dashes(&dashes, 0)
+//     canvas.stroke_path(&path, &style, graphics.WHITE)
+pub struct Stroke {
+    width: i64
+    join: u8
+    cap: u8
+    miter_limit: i64
+    dash_count: usize
+    dashes: [16]i64
+    dash_offset: i64
+
+    // A solid stroke `width` subpixels wide, centred on the outline. A
+    // width of zero or less draws nothing; widths are limited to 2^30.
+    pub fn new(width: i32) -> Stroke {
+        return Stroke { width: clamp64(width as i64, 0, 2 * PATH_LIMIT), join: JOIN_MITER, cap: CAP_BUTT, miter_limit: 1024, dash_count: 0, dashes: [0i64; 16], dash_offset: 0 }
+    }
+    pub fn width(&self) -> i32 {
+        return self.width as i32
+    }
+    pub fn set_join(&mut self, join: LineJoin) {
+        match join {
+            LineJoin.Miter => {
+                self.join = JOIN_MITER
+            }
+            LineJoin.Round => {
+                self.join = JOIN_ROUND
+            }
+            LineJoin.Bevel => {
+                self.join = JOIN_BEVEL
+            }
+        }
+    }
+    pub fn set_cap(&mut self, cap: LineCap) {
+        match cap {
+            LineCap.Butt => {
+                self.cap = CAP_BUTT
+            }
+            LineCap.Round => {
+                self.cap = CAP_ROUND
+            }
+            LineCap.Square => {
+                self.cap = CAP_SQUARE
+            }
+        }
+    }
+    // The longest a miter may reach from its corner, as a ratio of the
+    // miter's length to the stroke width in SUBPIXEL units: 1024 (the
+    // default) is 4, which bevels corners sharper than about 29 degrees.
+    // Clamped to 256 (1, always bevel) to 16384 (64).
+    pub fn set_miter_limit(&mut self, limit: u32) {
+        self.miter_limit = clamp64(limit as i64, 256, 16384)
+    }
+    // Dash the stroke: `pattern` alternates the lengths of dashes and gaps,
+    // starting with a dash, and repeats along each subpath from `offset`
+    // into it. An odd count is repeated to make it even, as in SVG, and
+    // at most STROKE_DASHES lengths are kept. Zero-length dashes draw only
+    // their caps, dots with round caps. A pattern shorter than a quarter
+    // pixel in all is scaled up to that, keeping its proportions. A pattern
+    // with a negative length, or no positive one, leaves the stroke solid,
+    // as do gaps under 1/4096 of the width with round or square caps,
+    // which the caps close.
+    pub fn set_dashes(&mut self, pattern: &[i32], offset: i32) {
+        self.dash_count = 0
+        for i in 0usize..pattern.len {
+            if pattern[i] < 0 {
+                return
+            }
+        }
+        count := pattern.len
+        if count % 2 == 1 {
+            count = count * 2
+        }
+        count = num.min(count, STROKE_DASHES)
+        total := 0i64
+        for i in 0usize..count {
+            self.dashes[i] = pattern[i % pattern.len] as i64
+            total += self.dashes[i]
+        }
+        if total == 0 {
+            return
+        }
+        // Finer dashes only blend to gray, and would cost a dash per
+        // subpixel: scale the pattern up to a quarter pixel.
+        phase := offset as i64
+        if total < DASH_PERIOD {
+            scale := ceil_div(DASH_PERIOD, total)
+            for i in 0usize..count {
+                self.dashes[i] = self.dashes[i] * scale
+            }
+            total = total * scale
+            phase = phase * scale
+        }
+        self.dash_count = count
+        phase = phase % total
+        if phase < 0 {
+            phase += total
+        }
+        self.dash_offset = phase
+    }
+    // Make the stroke solid again.
+    pub fn clear_dashes(&mut self) {
+        self.dash_count = 0
+    }
+    // Lengths in the dash pattern, 0 for a solid stroke.
+    pub fn dash_count(&self) -> usize {
+        return self.dash_count
+    }
+}
+
+// An outline's stroke as an outline of its own, for coverage masks and
+// spans or to combine with other shapes. Fill it by FillRule.NonZero:
+// strokes overlap themselves at every join, and the even-odd rule would
+// cut holes there. Contours are not closed for stroking: an open contour
+// gets caps, and only `close` joins its end to its start. An outline that
+// is stroked again inside a Stroked is stroked once, by the outer style.
+//
+//     shape := graphics.Stroked.new(&path, &style)
+//     graphics.coverage_mask(&shape, graphics.FillRule.NonZero, &mut mask, x, y, w, h)
+pub struct Stroked<O: Outline> {
+    outline: &O
+    style: &Stroke
+
+    pub fn new(outline: &O, style: &Stroke) -> Stroked<O> from(outline, style) {
+        return Stroked<O> { outline: outline, style: style }
+    }
+    pub fn trace(&self, pen: &mut Pen) {
+        pen.begin_stroke(self.style)
+        self.outline.trace(pen)
+        pen.end_stroke()
     }
 }
 
