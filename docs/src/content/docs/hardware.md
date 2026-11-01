@@ -1461,6 +1461,70 @@ is a memory barrier and is never removed unless `options(nomem)` or
 overwrites. See [memory and foreign calls](memory-and-ffi.md#inline-assembly)
 for the full rules.
 
+### Naked handlers and global assembly
+
+A `@naked` function has no prologue or epilogue, so its assembly sees the
+registers and stack exactly as the caller, or the hardware, left them. That is
+what a fault handler needs to find the stack frame the processor pushed. The
+chip runtime's vector table refers to weak handler symbols, so a C function
+with the vector's name replaces the default:
+
+```dodo
+import "core/ptr"
+
+static mut FAULT_PC: u32 = 0
+
+// Thumb (Cortex-M0+). Bit 2 of EXC_RETURN in lr says which stack the
+// processor pushed r0-r3, r12, lr, pc, and xPSR to.
+@naked
+extern "C" fn HardFault_Handler() {
+    unsafe {
+        asm(
+            "movs r0, #4",
+            "mov r1, lr",
+            "tst r0, r1",
+            "mrs r0, msp",
+            "beq 1f",
+            "mrs r0, psp",
+            "1:",
+            "ldr r1, ={0}",
+            "bx r1",
+            sym record_fault,
+        )
+    }
+}
+
+extern "C" fn record_fault(frame: *const u32) {
+    unsafe {
+        FAULT_PC = ptr.read(ptr.offset(frame, 6))
+    }
+    for {
+    }
+}
+```
+
+`sym record_fault` writes the function's symbol into the template, and
+`const` writes a constant's value. Top-level `unsafe asm(...)` is global
+assembly, for code or data with no Dodo declaration around it. On Cortex-M,
+mark a function label with `.thumb_func` so its address has the Thumb bit set:
+
+```dodo
+unsafe asm(
+    ".section .text.add_three,\"ax\",%progbits",
+    ".global add_three",
+    ".thumb_func",
+    "add_three:",
+    "    adds r0, r0, #{0}",
+    "    bx lr",
+    const 3,
+)
+
+unsafe extern "C" fn add_three(value: u32) -> u32
+```
+
+See [global assembly](memory-and-ffi.md#global-assembly) and
+[naked functions](memory-and-ffi.md#naked-functions) for the rules.
+
 ### Sleeping and other targets
 
 `cpu.wait_for_interrupt()` sleeps until an interrupt is pending, which is the
@@ -3483,9 +3547,9 @@ dodo build firmware.dodo --emit obj --target thumbv7em-none-eabihf \
   the executor's signals, so use both from one thread there.
 - On the Cortex-M0+ of the RP2040, atomics only load and store; see
   [sharing state with atomics](#sharing-state-with-atomics).
-- Inline assembly lives inside functions; there is no global or naked
-  assembly, so startup code and vector tables come from the chip runtime or a
-  `@section`-placed static.
+- A naked function or global assembly can replace a vector's default
+  handler or add code the runtime lacks, but the boot sequence and the
+  vector table itself still come from the chip runtime.
 - Low power covers sleep, deep sleep, clock gating, and the dormant state
   woken by GPIO 0 to 29. The RP2350's power manager states, which switch
   power domains off, its always-on timer, and waking a dormant chip by time

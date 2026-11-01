@@ -413,15 +413,18 @@ conflicting aliases. Prefer passing state explicitly or using
 | `@unsafe_send`, `@unsafe_sync` | `unsafe struct`: explicit unsafe thread transfer/sharing contract; see [threads](threads.md). |
 | `@test` | Safe nongeneric top-level void function with no parameters; see [testing](testing.md). |
 | `@ignore("reason")` | Test function: skipped unless ignored tests are selected. |
-| `@derive(Json)` | Struct: generate supported JSON methods; see [JSON](json.md). |
+| `@derive(Json, Row)` | Struct: generate methods for each listed derive. `Json` adds JSON codecs, see [JSON](json.md); `Row` maps SQL rows and parameters, see [SQLite](sqlite.md#mapping-rows-to-structs). |
 | `@json_name("name")` | Field of a JSON-derived struct: select its external key. |
 | `@json_deny_unknown` | JSON-derived struct: reject unknown fields. |
+| `@db_name("column")` | Field of a Row-derived struct: select its column name. |
+| `@db_flatten` | Field of a Row-derived struct: decode a nested Row-derived struct from the same row. |
 | `@interrupt(VECTOR)` | Private, safe, nongeneric top-level `fn name()`: the hardware's handler for `VECTOR`; see [interrupts](hardware.md#interrupts). |
 | `@link_name("symbol")` | `extern "C"` prototype: bind `symbol` instead of the function's name; several prototypes may bind one symbol with different signatures; see [FFI](memory-and-ffi.md#struct-layout-and-the-c-abi). |
 | `@section("name")` | Function or `static`: place it in an object file section, and keep it even if unreferenced. |
 | `@align(N)` | Function or `static`: align it to `N` bytes, a power of two. |
 | `@inline`, `@inline(never)` | Function with a body: optimized builds inline it into every caller where possible, or never. |
 | `@cold` | Function with a body: rarely executed; never inlined, and optimized builds treat paths that call it as unlikely. |
+| `@naked` | `extern "C"` function whose body is one `unsafe { asm(...) }`: no prologue or epilogue; see [naked functions](memory-and-ffi.md#naked-functions). |
 
 `@compiler(print)`, `@compiler(println)`, and `@compiler(printf)` are reserved for
 bundled printing declarations, and `@compiler(pio)` for the
@@ -434,5 +437,6 @@ type checking, borrow checking, or checked indexing. An `unsafe fn` requires
 callers to satisfy its documented preconditions, and its body still needs
 explicit unsafe blocks around unchecked operations. `extern "C" fn` declares or
 defines a C-ABI function. `asm("template", operands...)` is inline assembly
-and needs an unsafe block. The complete rules and examples are in
+and needs an unsafe block; `unsafe asm(...)` at the top level of a file is
+[global assembly](memory-and-ffi.md#global-assembly). The complete rules and examples are in
 [memory and foreign calls](memory-and-ffi.md).

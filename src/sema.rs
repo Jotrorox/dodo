@@ -171,6 +171,16 @@ fn check_program(
             diagnostics.push(error);
         }
     }
+    for global in &mut program.global_asm {
+        let mut checker = Checker::new(&context, Type::Void);
+        checker.namespace = global.namespace.clone();
+        if let Err(error) = checker.textual_asm(&mut global.asm, "global asm") {
+            if !recover {
+                return Err(error);
+            }
+            diagnostics.push(error);
+        }
+    }
     // Bodies whose AST check failed are not analyzed for ownership.
     let mut failed = HashSet::new();
     for function in program.functions.iter_mut() {
@@ -184,6 +194,11 @@ fn check_program(
             checker.function_name = function.name.clone();
             checker.imported = function.imported;
             checker.async_body = function.async_part == Some(AsyncPart::Body);
+            if let Some(asm) = function.naked_asm_mut() {
+                // The parameters arrive in registers and stack slots the
+                // assembly reads itself; they are not bindings.
+                return checker.textual_asm(asm, "the asm of a @naked function");
+            }
             for parameter in &function.params {
                 checker.bind_parameter(&parameter.name, &parameter.ty, parameter.span)?;
             }
@@ -232,7 +247,7 @@ fn check_program(
     let mut bodies = report.as_ref().map(|_| Vec::new());
     for function in &program.functions {
         let enclosing = function.name.split('#').next().unwrap_or(&function.name);
-        if function.body.is_none() || failed.contains(enclosing) {
+        if function.body.is_none() || function.naked || failed.contains(enclosing) {
             continue;
         }
         let body = flow::lower(&context, function);
@@ -2629,7 +2644,9 @@ impl<'a> Checker<'a> {
                 .filter_map(|operand| match &operand.kind {
                     AsmOperandKind::Out(ty) => Some(Some(ty.clone())),
                     AsmOperandKind::InOut(value) => Some(self.peek_type(value)),
-                    AsmOperandKind::In(_) => None,
+                    AsmOperandKind::In(_) | AsmOperandKind::Sym(_) | AsmOperandKind::Const(_) => {
+                        None
+                    }
                 })
                 .collect::<Option<Vec<_>>>()
                 .map(asm_result),
