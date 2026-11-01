@@ -828,15 +828,22 @@ fn run_hook(L: *mut State, event: i32, line: i32, ftransfer: i32, ntransfer: i32
         match h(&mut cx, &mut ar) {
             ok() => {},
             err(e) => {
-                (*L).allowhook = 1
-                (*ci2).callstatus = (*ci2).callstatus & ~(CIST_HOOKED | CIST_TRAN)
-                if e == Throw.Yield && ci_is_lua(ci2) {
-                    // A native hook yielded: when resumed, the interrupted
-                    // instruction runs again (without calling the hook).
-                    (*ci2).callstatus = (*ci2).callstatus | CIST_HOOKYIELD
-                    (*ci2).savedpc = ptr.offset((*ci2).savedpc, -1)
-                    (*L).top = restore_stack(L, top)
+                if e == Throw.Yield {
+                    (*L).allowhook = 1
+                    (*ci2).callstatus = (*ci2).callstatus & ~(CIST_HOOKED | CIST_TRAN)
+                    if ci_is_lua(ci2) {
+                        // A native hook yielded: when resumed, the interrupted
+                        // instruction runs again (without calling the hook).
+                        (*ci2).callstatus = (*ci2).callstatus | CIST_HOOKYIELD
+                        (*ci2).savedpc = ptr.offset((*ci2).savedpc, -1)
+                        (*L).top = restore_stack(L, top)
+                    }
                 }
+                // On errors the frame stays marked as hooked and hooks stay
+                // disabled until the protected call that catches the error
+                // restores the state (it discards this frame): its message
+                // handler then sees the stack as it was when the error was
+                // raised (a traceback shows "in hook '?'").
                 return err(e)
             },
         }
