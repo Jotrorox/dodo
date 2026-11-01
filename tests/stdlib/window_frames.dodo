@@ -5,27 +5,26 @@ import "std/graphics"
 import "std/time/hosted"
 import "std/window"
 
-// Draws a frame whenever wait_event_until_frame says one is due, for two
-// seconds, then prints how many frames and events there were and the frame
-// interval. tests/window_library.rs runs it under Xvfb while moving the
+// Draws a frame on every Frame event, asking for the next one each time, for
+// two seconds, then prints how many frames and events there were and the
+// frame interval. tests/window_library.rs runs it under Xvfb while moving the
 // mouse, since a steady stream of events must not hold frames back.
 
 fn run() -> void!window.Error {
-    win := window.open(window.Options.new("Frames", 160, 120))?
+    app := window.App.new()?
+    win := app.open(window.Options.new("Frames", 160, 120))?
     clock := hosted.MonotonicClock.new()
     start := clock.now()!
     frames := 0u32
     events := 0u32
     console.println("open")!
+    win.request_frame()?
     for {
-        match win.wait_event_until_frame()? {
-            some(window.Event.Close) => {
+        match app.wait_event()? {
+            window.Event.Close(_) => {
                 break
             }
-            some(_) => {
-                events += 1
-            }
-            none => {
+            window.Event.Frame(_) => {
                 frames += 1
                 canvas := win.canvas()
                 canvas.clear(graphics.hex(0x102030 + (frames & 0xff)))
@@ -36,13 +35,17 @@ fn run() -> void!window.Error {
                 if elapsed.seconds() >= 2 {
                     break
                 }
+                win.request_frame()?
+            }
+            _ => {
+                events += 1
             }
         }
     }
     interval := win.frame_interval()
     console.printf("frames {} events {} interval_us {}\n", frames, events, interval.to_micros()!)!
-    // A program that stops animating goes back to plain event waits.
-    match win.wait_event_timeout(10)? {
+    // A program that stops asking for frames goes back to plain event waits.
+    match app.wait_event_timeout(10)? {
         some(_) => {}
         none => {}
     }

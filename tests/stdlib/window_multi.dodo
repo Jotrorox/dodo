@@ -1,0 +1,154 @@
+package main
+
+import "std/console"
+import "std/graphics"
+import "std/window"
+
+// Several windows on one App. Opens "Main" (320x240, red) and "Tools"
+// (120x90, green), asks both for a frame and prints every event with the
+// name of its window. N in Main opens a blue "Dialog", W closes the window
+// it is typed in, Escape or closing Main ends the loop. Afterwards the old
+// handles must report Closed and a second App must work.
+// tests/window_library.rs drives it with xdotool under Xvfb; it also exits
+// after five idle seconds, so a lost event cannot hang a test.
+
+fn fill(win: &mut window.Window, color: u32) -> void!window.Error {
+    canvas := win.canvas()
+    canvas.clear(color)
+    dirty := canvas.take_dirty()
+    return win.update(dirty)
+}
+
+fn name(id: window.WindowId, main: window.WindowId, tools: window.WindowId) -> &str from(static) {
+    if id == main {
+        return "main"
+    }
+    if id == tools {
+        return "tools"
+    }
+    return "dialog"
+}
+
+fn run() -> void!window.Error {
+    app := window.App.new()?
+    // A second App fails while the first exists.
+    match window.App.new() {
+        ok(_) => console.println("second app opened")!,
+        err(error) => console.printf("second app {}\n", window.error_name(error))!,
+    }
+    match app.open(window.Options.new("Zero", 0, 10)) {
+        ok(_) => console.println("zero size opened")!,
+        err(error) => console.printf("zero size {}\n", window.error_name(error))!,
+    }
+    match app.open(window.Options.new("Huge", 10, window.MAX_SIZE + 1)) {
+        ok(_) => console.println("huge size opened")!,
+        err(error) => console.printf("huge size {}\n", window.error_name(error))!,
+    }
+    main := app.open(window.Options.new("Main", 320, 240))?
+    tools := app.open(window.Options { title: "Tools", width: 120, height: 90, resizable: false })?
+    main_id := main.id()
+    tools_id := tools.id()
+    console.printf("open {} {} {} {} {}\n", main_id < tools_id, main.width(), main.height(), tools.width(), tools.height())!
+    fill(&mut main, graphics.RED)?
+    fill(&mut tools, graphics.GREEN)?
+    main.request_frame()?
+    tools.request_frame()?
+    console.println("drawn")!
+    dialog_open := false
+    tools_open := true
+    dialog := app.open(window.Options.new("Placeholder", 10, 10))?
+    dialog.close()
+    idle := 0u32
+    for idle < 50 {
+        match app.wait_event_timeout(100)? {
+            some(event) => {
+                idle = 0
+                id := window.event_window(&event)
+                which := name(id, main_id, tools_id)
+                match event {
+                    window.Event.Frame(_) => {
+                        console.printf("frame {}\n", which)!
+                    }
+                    window.Event.Close(_) => {
+                        console.printf("close {}\n", which)!
+                        if id == main_id {
+                            break
+                        }
+                    }
+                    window.Event.Quit => {
+                        console.println("quit")!
+                        break
+                    }
+                    window.Event.Key(_, key) => {
+                        console.printf("key {} {} {}\n", which, window.key_name(&key.key), key.pressed)!
+                        if !key.pressed {
+                            continue
+                        }
+                        if key.key == window.Key.Escape {
+                            break
+                        }
+                        if key.key == window.Key.N && id == main_id && !dialog_open {
+                            dialog = app.open(window.Options.new("Dialog", 100, 60))?
+                            dialog_open = true
+                            fill(&mut dialog, graphics.BLUE)?
+                            console.printf("dialog {}\n", dialog.id() > tools_id)!
+                        }
+                        if key.key == window.Key.W {
+                            if id == tools_id && tools_open {
+                                tools.close()
+                                tools_open = false
+                                console.println("tools closed")!
+                            } else if id == dialog.id() && dialog_open {
+                                dialog.close()
+                                dialog_open = false
+                                console.println("dialog closed")!
+                            }
+                        }
+                    }
+                    window.Event.Text(_, code_point) => {
+                        console.printf("text {} {}\n", which, code_point)!
+                    }
+                    window.Event.MouseButton(_, button) => {
+                        console.printf("button {} {} {} {}\n", which, button.pressed, button.x, button.y)!
+                    }
+                    window.Event.Resize(_, width, height) => {
+                        console.printf("resize {} {} {}\n", which, width, height)!
+                        if id == main_id {
+                            fill(&mut main, graphics.RED)?
+                        }
+                    }
+                    window.Event.Focus(_, focused) => {
+                        console.printf("focus {} {}\n", which, focused)!
+                    }
+                    _ => {}
+                }
+            }
+            none => {
+                idle += 1
+            }
+        }
+    }
+    app.close()
+    match main.update_all() {
+        ok() => console.println("stale update worked")!,
+        err(error) => console.printf("stale {}\n", window.error_name(error))!,
+    }
+    size := main.size()
+    console.printf("stale size {} {}\n", size.width, size.height)!
+    again := window.App.new()?
+    other := again.open(window.Options.new("Again", 50, 50))?
+    console.printf("reopened {}\n", other.id() > tools_id)!
+    return ok()
+}
+
+fn main() -> i32 {
+    match run() {
+        ok() => {
+            return 0
+        }
+        err(error) => {
+            console.printf("error {}\n", window.error_name(error))!
+            return 1
+        }
+    }
+}

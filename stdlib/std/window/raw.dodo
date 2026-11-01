@@ -1,18 +1,26 @@
 package raw
 
 // The boundary between std/window and its per-OS adapters. Adapters report
-// events as plain codes in an Event record; std/window turns them into its
-// public types. The Cocoa and Win32 C runtimes fill the same record, so its
-// layout is part of their ABI.
+// events as plain codes in an Event record that names its window; std/window
+// turns them into its public types. The Cocoa and Win32 C runtimes fill the
+// same record, so its layout is part of their ABI.
+//
+// Every adapter has a Backend type whose associated functions act on the
+// process's one connection to the window system and on its windows by id:
+// connect and disconnect; open, close, size, attach (the pixel buffer to
+// repaint from), present, set_title, set_cursor_visible and scale_percent;
+// next_event; and the frame pacing primitives clock, frame_period,
+// next_vblank, request_frame and set_animating.
 
 // Why a window could not be opened or used.
 pub enum Error {
     // No window system is reachable: no WAYLAND or X11 display on Linux, no
     // GUI session on macOS, no interactive desktop on Windows.
     NoDisplay,
-    // A window is already open; a process has at most one at a time.
+    // An App already exists; a process has at most one at a time.
     AlreadyOpen,
-    // The window was closed, or the connection to the window system ended.
+    // The window or App was closed, or the connection to the window system
+    // ended.
     Closed,
     // A zero or too large size, or a title that is too long.
     InvalidInput,
@@ -22,8 +30,8 @@ pub enum Error {
     // for example an X server refusing the connection's authorization.
     Protocol,
     // The window system works in a way this library does not support, such
-    // as an X server without a 24-bit true-color visual, or opening a Cocoa
-    // window off the main thread.
+    // as an X server without a 24-bit true-color visual, or starting a Cocoa
+    // App off the main thread.
     Unsupported,
     // Another operating-system call failed.
     System
@@ -72,9 +80,12 @@ pub const MOUSE_BUTTON: u32 = 7
 pub const MOUSE_LEAVE: u32 = 8
 // x and y hold the horizontal and vertical amounts, 120 per wheel notch.
 pub const SCROLL: u32 = 9
-// The display refreshed after a request_frame(); std/window does not report
-// it as an Event but ends wait_event_until_frame with it.
+// The display refreshed after a request_frame(); std/window turns it into a
+// Frame event when the window asked for one.
 pub const FRAME: u32 = 10
+// The user asked the application to quit, such as with Command-Q on macOS;
+// window is 0.
+pub const QUIT: u32 = 11
 
 pub const PRESSED: u32 = 1
 pub const REPEAT: u32 = 2
@@ -89,6 +100,8 @@ pub const CAPS_LOCK: u32 = 16
 // Waiting without a time limit.
 pub const FOREVER: u32 = 0xffffffff
 
+// One event of the window `window`. Window ids start at 1 and are never
+// reused within a process; 0 stands for no window.
 @repr(C)
 pub struct Event {
     pub kind: u32
@@ -97,8 +110,9 @@ pub struct Event {
     pub flags: u32
     pub x: i32
     pub y: i32
+    pub window: u32
 
     pub fn empty() -> Event {
-        return Event { kind: NONE, code: 0, modifiers: 0, flags: 0, x: 0, y: 0 }
+        return Event { kind: NONE, code: 0, modifiers: 0, flags: 0, x: 0, y: 0, window: 0 }
     }
 }

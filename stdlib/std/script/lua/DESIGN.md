@@ -33,7 +33,7 @@ private helpers use a file-specific prefix (`tab_`, `gc_`, `vm_`, `lex_`, ...).
 | `dump.dodo`, `undump.dodo` | Binary chunks. |
 | `number.dodo` | Number formatting and parsing (`num_*`). |
 | `pattern.dodo` | Pattern matching engine (`pat_*`). |
-| `api.dodo`, `aux.dodo` | Public embedding API. |
+| `api.dodo`, `auxlib.dodo` | Public embedding API. |
 | `lib_*.dodo` | Standard libraries. |
 
 ## Coding conventions
@@ -204,7 +204,7 @@ the main function. Sizes are written as variable-length unsigned integers
 ## Runtime notes for library authors
 
 The standard libraries (`lib_*.dodo`) are native functions written against
-the public API in api.dodo/aux.dodo (`Cx`, `Buffer`, `LuaStr`), which mirrors
+the public API in api.dodo/auxlib.dodo (`Cx`, `Buffer`, `LuaStr`), which mirrors
 the C API (`cx.check_integer` ~ `luaL_checkinteger`, `cx.get_field` ~
 `lua_getfield`, ...). Being in the same package they may also use internal
 functions for hot paths (`tab_get_int`, `tab_set_int`, `str_new`, ...), with
@@ -221,7 +221,7 @@ the collector rules above.
   `cx`. Build results with `Buffer` (Dodo-owned, freed on drop) and
   `buf.push_result(cx)`.
 * Registration: `cx.new_lib(&[("name", f), ...])` or `cx.set_funcs(...)`
-  (with upvalues); `open_all_libs` (aux.dodo) calls `require_lib` for each
+  (with upvalues); `open_all_libs` (auxlib.dodo) calls `require_lib` for each
   library — add new libraries there.
 * String metatable: lib_string creates it (`__index = string`) and must call
   `set_string_arith_metamethods(cx)` on it: 5.4 converts strings for

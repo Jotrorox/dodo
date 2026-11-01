@@ -47,7 +47,7 @@ they are not prerequisites for using the safe entry APIs.
 | Store values | `fixed_vector.Vector.new` with `Option<T>` slots | [Collections](collections.md) |
 | Draw shapes, text, or images | `graphics.canvas` over a byte array | [Graphics](graphics.md) |
 | Draw smooth shapes, gradients, or TrueType text | `canvas.aa_fill_circle`, `graphics.Gradient`, `truetype.Font.new` | [Graphics](graphics.md#antialiased-drawing) |
-| Open a window | `window.open` and `win.canvas()` | [Windows](window.md) |
+| Open windows | `window.App.new`, `app.open` and `win.canvas()` | [Windows](window.md) |
 | Render with the GPU through OpenGL | `opengl.Context.create`, `opengl.Target.new` and the `gl` commands | [OpenGL](opengl.md) |
 | Compute or render on any GPU | `gpu.Device.open`, `device.encoder()` and `encoder.submit()` | [GPU programming](gpu.md) |
 | Run a shader on the GPU (macOS) | `metal.Device.system_default` and `new_library_with_source` | [Metal](metal.md) |
@@ -267,6 +267,7 @@ select providers; they are not additional recommended starting paths.
 | `std/window/windows` | Native Win32 window boundary; use [windows](window.md). |
 | `std/window/system` | The C-runtime adapter the macOS and Windows boundaries share; use [windows](window.md). |
 | `std/window/raw` | Error and event records exchanged with the adapters; use [windows](window.md). |
+| `std/window/heap` | C-heap pixel buffers and window tables shared by `std/window` and its adapters; use [windows](window.md). |
 | `std/gpu/opengl/linux` | EGL context adapter; use [OpenGL](opengl.md). |
 | `std/gpu/opengl/macos` | CGL context adapter; use [OpenGL](opengl.md). |
 | `std/gpu/opengl/windows` | WGL context adapter; use [OpenGL](opengl.md). |
