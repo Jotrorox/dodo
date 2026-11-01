@@ -147,7 +147,8 @@ the board's own USB connector through `std/embedded/chip/rp_usb`, their DMA
 channels through `std/embedded/chip/rp_dma`, which the SPI buses and serial
 ports use for transfers that run in the background, and their second core,
 with the FIFOs and spinlocks the cores share, through
-`std/embedded/chip/rp_multicore`. The clock gating and dormant state both
+`std/embedded/chip/rp_multicore`, and their watchdog through
+`std/embedded/chip/rp_watchdog`. The clock gating and dormant state both
 chips share are in `std/embedded/chip/rp_power`.
 `std/embedded/cortex_m` enables, pends, and prioritizes interrupts and runs
 SysTick on any Cortex-M core. `std/embedded/executor` runs several firmware

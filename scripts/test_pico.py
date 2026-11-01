@@ -101,6 +101,7 @@ LAST_CHECKS = [
     "unused clocks stop; claiming starts them; claimed and essential clocks are refused",
     "deep sleep with only the timer's clocks wakes on its alarm",
     "dormant is refused without pins and with USB running; a present level wakes it and clk_sys returns",
+    "watchdog refuses bad timeouts, counts 1 us per us, reloads when fed, holds when stopped; scratch 0 is the record's",
     "invalid crystal is rejected",
     "chip take() after board take() is refused",
     "delay_ms(10) lasts 10 ms",

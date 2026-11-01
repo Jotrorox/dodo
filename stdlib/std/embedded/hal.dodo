@@ -18,7 +18,7 @@ import "core/ptr"
 // 2. Interrupts. `Critical` masks interrupts on the current core until it is
 //    dropped. It never excludes other threads or cores.
 // 3. Device protocols. The interfaces below (OutputPin, InputPin, Delay, I2c,
-//    Spi, PwmOutput, AnalogInput, and Registers) name what drivers need
+//    Spi, PwmOutput, AnalogInput, Watchdog, and Registers) name what drivers need
 //    from a device. Any value with
 //    matching methods implements them. Drivers are usually generic over a
 //    bounded parameter, `fn probe<B: hal.I2c>(bus: &mut B)`, which is
@@ -82,6 +82,13 @@ import "core/ptr"
 //                                  chips may hand out alarms that are
 //                                  std/embedded/executor clocks, as the
 //                                  RP2040 and RP2350 do with alarm(n)
+//    Board.watchdog                start(timeout_ms) -> void!Error, feed(),
+//                                  stop(), with the Watchdog protocol:
+//                                  resets the chip unless fed in time
+//                                  (InvalidInput for a timeout of 0 or
+//                                  above max_timeout_ms()); reset_reason()
+//                                  tells whether it did, and the
+//                                  scratch(n) words survive its reset
 //    Board.usb                     serial() -> port!Error, a USB serial
 //                                  port on the board's USB connector with
 //                                  the serial port protocols (Busy if one
@@ -203,6 +210,41 @@ pub interface AnalogInput {
     // converter.
     fn max_value(&self) -> u16
     fn read(&mut self) -> u16!Error
+}
+
+// A watchdog: once started, it resets the chip unless the program feeds it
+// again within its timeout, so firmware that hangs restarts instead of
+// staying stuck. Its timeout is set when it is started; drivers and tasks
+// that run long loops only feed it.
+pub interface Watchdog {
+    // Count down from the timeout again.
+    fn feed(&mut self)
+}
+
+// Why the chip last started, as its watchdog reports it.
+pub enum ResetReason {
+    // Not the watchdog: power-up, the reset pin, a debugger, or the boot
+    // ROM, for example after flashing.
+    Other,
+    // The watchdog was not fed before its timeout, or a panic halted the
+    // program while the watchdog ran.
+    Timeout,
+    // The program reset the chip through the watchdog on purpose.
+    Restart
+}
+
+pub fn reset_reason_name(reason: ResetReason) -> &str from(static) {
+    match reason {
+        ResetReason.Other => {
+            return "Other"
+        }
+        ResetReason.Timeout => {
+            return "Timeout"
+        }
+        ResetReason.Restart => {
+            return "Restart"
+        }
+    }
 }
 
 // A peripheral's 32-bit registers at byte offsets, for peripheral drivers.

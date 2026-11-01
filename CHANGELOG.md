@@ -17,6 +17,21 @@
   `cortex_m.set_deep_sleep`, `set_sleep_on_exit`, and `set_event_on_pend`
   expose the core's SCR. The self-tests gain on-board checks, and
   `examples/low_power.dodo` shows all three levels.
+- Watchdog for the RP2040 and RP2350: `b.watchdog` on every board (and
+  `watchdog` in the chips' `Peripherals`) is a `std/embedded/chip/rp_watchdog`
+  `Watchdog`. It is stopped after `take()`. `start(timeout_ms)` makes it reset
+  the chip unless `feed()` is called in time, from 1 ms up to 8388 ms on the
+  RP2040 (whose count runs twice per tick, erratum RP2040-E1) or 16777 ms on
+  the RP2350. `stop()`, `remaining_us()`, and `restart()` for a deliberate
+  reset complete it. The reset restarts everything but the oscillators, and
+  the count pauses while a debugger halts a core. `reset_reason()` reads
+  `hal.ResetReason.Timeout`, `Restart`, or `Other`. A Pico SDK-style mark tells
+  the program's watchdog resets apart from the boot ROM's, so the first run
+  after flashing reads `Other`. Two `scratch` words survive the reset.
+  `std/embedded/hal` gains the `Watchdog` protocol (`feed`), so drivers and
+  tasks can feed any chip's watchdog. Desktop tests run the driver against a
+  model of both chips' watchdogs, and the board self-tests gain a watchdog
+  check.
 - `std/gpu/opengl` creates OpenGL contexts without a window, and
   `std/gpu/opengl/gl` binds the complete OpenGL 4.6 core profile (656
   commands, 1364 enums), generated from the Khronos registry by
