@@ -89,7 +89,7 @@ fn async_fns_run_on_the_executor_against_the_simulated_clock() {
 
 #[test]
 fn mutexes_share_values_and_take_the_cross_core_lock() {
-    run_fixture("sync_checks");
+    run_fixture("embedded_sync_checks");
 }
 
 #[test]
