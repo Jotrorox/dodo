@@ -336,6 +336,52 @@ fn sp_column_unknown(e: &mut Engine, k: usize) {
 // ---------------------------------------------------------------------------
 // Transactions over every database
 
+fn mark_db(e: &mut Engine, k: usize) {
+    if k < DB_MAX {
+        e.db_mask = e.db_mask | (1u32 << (k as u32))
+    }
+}
+
+// Starts read transactions on the databases in `mask` that have none.
+// Returns the mask of those it started.
+fn begin_read_mask(e: &mut Engine, mask: u32) -> u32!db.Error {
+    here := e.cur_db
+    started := 0u32
+    for k in 0usize..e.ndb {
+        if !db_used(e, k) || (mask & (1u32 << (k as u32))) == 0 {
+            continue
+        }
+        use_db(e, k)
+        fresh := !read_active(e)
+        match begin_read(e) {
+            ok() => {},
+            err(reason) => {
+                use_db(e, here)
+                return err(reason)
+            },
+        }
+        if fresh {
+            started = started | (1u32 << (k as u32))
+        }
+    }
+    use_db(e, here)
+    ok(started)
+}
+
+// Ends the read transactions in `mask` (not write transactions).
+fn release_reads(e: &mut Engine, mask: u32) {
+    here := e.cur_db
+    for k in 0usize..e.ndb {
+        if db_used(e, k) && (mask & (1u32 << (k as u32))) != 0 {
+            use_db(e, k)
+            if !e.write_txn {
+                unlock_to(e, false)
+            }
+        }
+    }
+    use_db(e, here)
+}
+
 fn begin_read_all(e: &mut Engine) -> void!db.Error {
     here := e.cur_db
     for k in 0usize..e.ndb {

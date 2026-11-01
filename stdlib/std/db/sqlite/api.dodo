@@ -363,18 +363,19 @@ fn prepare_one(e: &mut Engine, slot: usize, sql: &str) -> void!db.Error {
     if e.active == slot {
         stmt_finish(e, slot, true)?
     }
-    // Schema resolution needs the current schema.
-    begin_read_all(e)?
+    // Schema resolution needs the current schema (of every database:
+    // read transactions this starts end afterwards, even inside BEGIN).
+    fresh := begin_read_mask(e, 4095)?
     r := load_schema(e)
     match r {
         ok() => {},
         err(reason) => {
-            end_read_all(e)
+            release_reads(e, fresh)
             return err(reason)
         },
     }
     res := prepare_slot(e, slot, bytes)
-    end_read_all(e)
+    release_reads(e, fresh)
     res?
     tail := sh(e, slot, SH_TAIL)
     if tail < bytes.len {

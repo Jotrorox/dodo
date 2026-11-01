@@ -37,6 +37,8 @@ const SH_CURTOP: usize = 92
 const SH_LRU: usize = 96
 // Database the statement writes, plus one (0 = main / none).
 const SH_WDB: usize = 100
+// Databases the statement reads or writes (bit per index).
+const SH_DBMASK: usize = 104
 
 const ST_IDLE: usize = 0
 const ST_RUNNING: usize = 1
@@ -124,6 +126,7 @@ fn compile_slot(e: &mut Engine, slot: usize) -> void!db.Error {
     e.tstack_n = 0
     e.wdb = NO_DB
     e.fix_db = NO_DB
+    e.db_mask = 0
     next_token(e)
     root := 0usize
     if e.tk == TK_EOF || e.tk == TK_SEMI {
@@ -267,6 +270,24 @@ fn compile_slot(e: &mut Engine, slot: usize) -> void!db.Error {
     } else {
         wdb + 1
     })
+    if wdb != NO_DB {
+        mark_db(e, wdb)
+    }
+    if kind == S_PRAGMA {
+        let pq = ndb_of(e, root)
+        let pid = pragma
+        if pid == P_INTEGRITY_CHECK && pq == NO_DB || pid == P_JOURNAL_MODE && pq == NO_DB && nflags(e, root) == 1 {
+            e.db_mask = 4095
+        } else {
+            mark_db(e, if pq == NO_DB {
+                0usize
+            } else {
+                pq
+            })
+        }
+    }
+    let dbm = e.db_mask as usize
+    stu(e.ws, base + SH_DBMASK, dbm)
     stu(e.ws, base + SH_ROOT, root)
     let nparam2 = e.nparam
     stu(e.ws, base + SH_NPARAM, nparam2)
@@ -351,8 +372,9 @@ fn stmt_start(e: &mut Engine, slot: usize, params: &[db.Value]) -> void!db.Error
             },
         }
     }
-    match begin_read_all(e) {
-        ok() => {},
+    let mask0 = sh(e, slot, SH_DBMASK) as u32
+    match begin_read_mask(e, mask0) {
+        ok(_) => {},
         err(reason) => {
             abort_txn(e)
             return err(reason)
@@ -383,6 +405,14 @@ fn stmt_start(e: &mut Engine, slot: usize, params: &[db.Value]) -> void!db.Error
                     return err(reason)
                 },
             }
+        }
+        let mask1 = sh(e, slot, SH_DBMASK) as u32
+        match begin_read_mask(e, mask1) {
+            ok(_) => {},
+            err(reason) => {
+                abort_txn(e)
+                return err(reason)
+            },
         }
     }
     // Bind parameters (data is copied to the bottom of the sort stack).
@@ -725,7 +755,12 @@ fn stmt_fail(e: &mut Engine, slot: usize) {
     sh_set(e, slot, SH_PPOS, 0)
     sh_set(e, slot, SH_PIDX, 0)
     clear_read_fresh(e)
-    if e.explicit_txn && any_write(e) {
+    kind0 := sh(e, slot, SH_KIND) as u8
+    control := kind0 == S_BEGIN || kind0 == S_SAVEPOINT || kind0 == S_RELEASE || kind0 == S_ATTACH || kind0 == S_DETACH || kind0 == S_EMPTY || kind0 == S_VACUUM || kind0 == S_ROLLBACK && e.explicit_txn
+    if control && e.explicit_txn {
+        // A failed BEGIN, SAVEPOINT, RELEASE, ROLLBACK TO, ATTACH or DETACH
+        // changed nothing; the transaction goes on.
+    } else if e.explicit_txn && any_write(e) {
         undone := match stmt_rollback(e) {
             ok(v) => v,
             err(_) => false,

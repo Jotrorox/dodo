@@ -475,7 +475,16 @@ fn load_schema_all(e: &mut Engine) -> void!db.Error {
             continue
         }
         use_db(e, k)
-        load_db_objects(e, k)?
+        // Databases the statement does not use are read just for this.
+        fresh := !read_active(e)
+        if fresh {
+            begin_read(e)?
+        }
+        r := load_db_objects(e, k)
+        if fresh && !e.write_txn {
+            unlock_to(e, false)
+        }
+        r?
     }
     // Pass 2: tables, then indexes and triggers (which refer to tables).
     for i in 0usize..e.schema_objs {

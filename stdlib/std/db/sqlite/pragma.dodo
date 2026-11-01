@@ -344,6 +344,19 @@ fn exec_pragma(e: &mut Engine, s: usize, resreg: usize) -> void!db.Error {
         set_text_str(e, r, "UTF-8")?
         return prow(e, r, 1)
     }
+    if id == P_JOURNAL_MODE && set && pdb == NO_DB {
+        // Without a schema the mode of every attached database changes
+        // (not TEMP); the row reports main's.
+        k := e.ndb
+        for k > 1 {
+            k -= 1
+            if db_used(e, k) && k != DB_TEMP {
+                use_db(e, k)
+                journal_mode_pragma(e, s)?
+            }
+        }
+        use_db(e, 0)
+    }
     if id == P_JOURNAL_MODE {
         mode := journal_mode_pragma(e, s)?
         set_text_str(e, r, mode)?

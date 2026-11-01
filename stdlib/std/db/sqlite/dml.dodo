@@ -101,6 +101,8 @@ fn table_for_write(e: &mut Engine, s: usize) -> usize!db.Error {
     if e.tstack_n == 0 && e.wdb == NO_DB {
         e.wdb = obj_db(e, t)
     }
+    let tdb = obj_db(e, t)
+    mark_db(e, tdb)
     if (flags & OF_UNSUPPORTED) != 0 {
         return err(fail(e, SQLITE_ERROR, "table uses unsupported features"))
     }
@@ -245,6 +247,10 @@ fn resolve_insert(e: &mut Engine, s: usize) -> void!db.Error {
     let s_a0 = na(e, s)
     let s_b0 = nb(e, s)
     view := view_target(e, s, TE_INSERT)
+    if view != 0 {
+        let vdb = obj_db(e, view - 1)
+        mark_db(e, vdb)
+    }
     resolve_insert_rows(e, s, view)?
     w := sget_w(e, s)
     t := wget(e, w, W_TABLE)
@@ -1563,6 +1569,10 @@ fn resolve_update(e: &mut Engine, s: usize) -> void!db.Error {
     let s_b0 = nb(e, s)
     view := view_target(e, s, TE_UPDATE)
     if view != 0 {
+        let vdb = obj_db(e, view - 1)
+        mark_db(e, vdb)
+    }
+    if view != 0 {
         resolve_view_update(e, s, view)?
     } else {
         resolve_update_table(e, s)?
@@ -1829,6 +1839,10 @@ fn resolve_delete(e: &mut Engine, s: usize) -> void!db.Error {
     let s_a = na(e, s)
     let s_b = nb(e, s)
     view := view_target(e, s, TE_DELETE)
+    if view != 0 {
+        let vdb = obj_db(e, view - 1)
+        mark_db(e, vdb)
+    }
     if view != 0 {
         t := view_columns(e, view - 1)?
         w := write_info(e, s, t)?

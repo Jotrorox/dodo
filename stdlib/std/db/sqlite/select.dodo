@@ -776,6 +776,8 @@ fn resolve_core(e: &mut Engine, s: usize, own_order: bool) -> void!db.Error {
                 }
                 if t == NO_COL {
                     if v != NO_COL {
+                        let vdb0 = obj_db(e, v)
+                        mark_db(e, vdb0)
                         let (vsel, vcols) = view_select(e, v)?
                         sub = vsel
                         // A view's body names objects of its own database
@@ -810,6 +812,10 @@ fn resolve_core(e: &mut Engine, s: usize, own_order: bool) -> void!db.Error {
         }
         if (obj_flags(e, t) & OF_UNSUPPORTED) != 0 {
             return err(fail(e, SQLITE_ERROR, "table uses unsupported features"))
+        }
+        if t < LOCAL_OBJ {
+            let tdb = obj_db(e, t)
+            mark_db(e, tdb)
         }
         c := alloc_cursor(e)?
         set_nf(e, src, 6, t)
