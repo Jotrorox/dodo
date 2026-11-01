@@ -8,6 +8,7 @@ import "std/embedded/chip/rp_dma"
 import "std/embedded/chip/rp_flash"
 import "std/embedded/chip/rp_multicore"
 import "std/embedded/chip/rp_pio"
+import "std/embedded/chip/rp_rtc"
 import "std/embedded/chip/rp_watchdog"
 import "std/embedded/cortex_m"
 import "std/embedded/executor"
@@ -1252,6 +1253,154 @@ fn power_checks(chip_power: &mut chip.Power, usb: &mut board.Usb, pins: &mut chi
     }
 }
 
+// clk_sys from the crystal and from PLL_SYS at 48 MHz, by the frequency
+// counter, and back at full speed. The timer keeps its rate, as it counts
+// clk_ref; a UART claimed at the slow rate keeps its baud, and while
+// claimed refuses a change.
+fn system_clock_checks(chip_power: &mut chip.Power, pins: &mut chip.Pins, timer: &mut chip.Timer) {
+    feed_watchdog()
+    crystal := chip_power.crystal_hz()
+    slow := !failed_with(chip_power.set_system_hz(crystal), hal.Error.Busy) && chip_power.system_hz() == crystal
+    crystal_khz := clk_sys_khz()
+    before := timer.now_us()
+    timer.delay_us(10_000)
+    delay := timer.now_us() - before
+    serial_ok := false
+    match pins.uart(4, none, 115_200) {
+        ok(port) => {
+            baud := port.baud()
+            busy := failed_with(chip_power.set_system_hz(chip.SYS_HZ), hal.Error.Busy)
+            pins.release_uart(port)
+            serial_ok = busy && baud > 113_000 && baud < 117_000
+        }
+        err(_) => {}
+    }
+    pll := !failed_with(chip_power.set_system_hz(48_000_000), hal.Error.Timeout) && chip_power.system_hz() == 48_000_000
+    pll_khz := clk_sys_khz()
+    back := !failed_with(chip_power.set_system_hz(chip.SYS_HZ), hal.Error.Timeout) && chip_power.system_hz() == chip.SYS_HZ
+    full_khz := clk_sys_khz()
+    check(slow && crystal_khz > 11_900 && crystal_khz < 12_100 && delay >= 10_000 && delay < 10_200 && serial_ok && pll && pll_khz > 47_500 && pll_khz < 48_500 && back && full_khz > chip.SYS_HZ / 1000 - 1000 && full_khz < chip.SYS_HZ / 1000 + 1000)
+}
+
+// The always-on timer: it keeps counting from the low-power oscillator,
+// within 25% of the timer (the oscillator's spread without the OTP
+// calibration), from the crystal again afterwards, and GPIO time
+// references are validated and owned. A 200 ms timed dormant state ends by time on
+// the always-on timer, which counts it while the microsecond timer pauses,
+// and the tick and clk_sys return.
+fn timed_dormant_checks(chip_power: &mut chip.Power, rtc: &mut chip.Rtc, pins: &mut chip.Pins, timer: &mut chip.Timer) {
+    feed_watchdog()
+    set := match rtc.is_set() {
+        ok(value) => value,
+        err(_) => false,
+    }
+    if !set {
+        set = !failed_with(rtc.set_ms(1_800_000_000_000), hal.Error.Timeout)
+    }
+    lposc := !failed_with(rtc.use_low_power_oscillator(), hal.Error.Timeout) && rtc.tick_source() == rp_rtc.TICK_LPOSC
+    first := aon_ms(rtc)
+    begin := timer.now_us()
+    timer.delay_us(300_000)
+    counted := (aon_ms(rtc) - first) * 1000
+    took := timer.now_us() - begin
+    pace := counted > took * 75 / 100 && counted < took * 125 / 100
+    crystal := !failed_with(rtc.use_crystal(), hal.Error.Timeout) && rtc.tick_source() == rp_rtc.TICK_CRYSTAL
+    validated := failed_with(rtc.use_clock_input(pins, 13, 32_768), hal.Error.InvalidInput) && failed_with(rtc.use_clock_input(pins, 12, 1_000), hal.Error.InvalidInput)
+    owned := false
+    match pins.input(12) {
+        ok(pin) => {
+            owned = failed_with(rtc.use_tick_input(pins, 12), hal.Error.Busy) && rtc.tick_source() == rp_rtc.TICK_CRYSTAL
+            pins.release(pin)
+        }
+        err(_) => {}
+    }
+    check(set && lposc && pace && crystal && validated && owned)
+
+    feed_watchdog()
+    wake := power.Wake.new()
+    wake.after_ms(200)
+    before_ms := aon_ms(rtc)
+    before_us := timer.now_us()
+    timed := match chip_power.dormant(&wake) {
+        ok(woken) => woken == power.BY_TIME,
+        err(_) => false,
+    }
+    paused := timer.now_us() - before_us
+    slept := aon_ms(rtc) - before_ms
+    khz := clk_sys_khz()
+    check(timed && slept >= 200 && slept < 300 && paused < 100_000 && rtc.tick_source() == rp_rtc.TICK_CRYSTAL && khz > chip.SYS_HZ / 1000 - 1000 && khz < chip.SYS_HZ / 1000 + 1000)
+}
+
+// The always-on timer's time in milliseconds, 0 if it has none.
+fn aon_ms(rtc: &mut chip.Rtc) -> u64 {
+    return match rtc.now_ms() {
+        ok(value) => value,
+        err(_) => 0,
+    }
+}
+
+// Survives the power-down, which keeps both SRAM domains.
+@section(".noinit")
+static mut POWER_DOWN_MARK: u32 = 0
+const MARK: u32 = 0x5EE0_D0D0
+
+// The last check: power down for 200 ms with both SRAM domains kept, and
+// finish in `power_down_finish` after the restart. The check counts go to
+// the power manager's scratch words, with the always-on timer's time.
+// Core 1, stopped by the earlier checks, waits in the boot ROM.
+fn power_down_check(chip_power: &mut chip.Power, rtc: &mut chip.Rtc) {
+    feed_watchdog()
+    unsafe {
+        chip_power.set_scratch(0, CHECKS)
+        chip_power.set_scratch(1, FAILURES)
+        chip_power.set_scratch(2, MORE_FAILURES)
+        chip_power.set_scratch(3, LAST_FAILURES)
+        chip_power.set_scratch(4, EXTRA_FAILURES)
+        POWER_DOWN_MARK = MARK
+    }
+    now := aon_ms(rtc)
+    chip_power.set_scratch(5, (now & 0xFFFF_FFFF) as u32)
+    chip_power.set_scratch(6, MARK)
+    wake := power.Wake.new()
+    wake.after_ms(200)
+    // Returns only if the power-down fails. The watchdog, which powers
+    // down with the switched core, reports a power-down that never
+    // happens as a hang.
+    match chip_power.power_down(&wake, chip.RETAIN_SRAM0 | chip.RETAIN_SRAM1) {
+        ok() => {}
+        err(_) => {}
+    }
+    chip_power.set_scratch(6, 0)
+    check(false)
+}
+
+// After the power-down's restart: restore the counts and check what the
+// chip kept and why it woke.
+fn power_down_finish(chip_power: &mut chip.Power, rtc: &mut chip.Rtc) {
+    unsafe {
+        CHECKS = chip_power.scratch(0)
+        FAILURES = chip_power.scratch(1)
+        MORE_FAILURES = chip_power.scratch(2)
+        LAST_FAILURES = chip_power.scratch(3)
+        EXTRA_FAILURES = chip_power.scratch(4)
+    }
+    now := (aon_ms(rtc) & 0xFFFF_FFFF) as u32
+    slept := now - chip_power.scratch(5)
+    marked := unsafe {
+        POWER_DOWN_MARK == MARK
+    }
+    chip_power.set_scratch(6, 0)
+    check(chip_power.power_down_wake() == power.BY_TIME && chip_power.retained() == (chip.RETAIN_SRAM0 | chip.RETAIN_SRAM1) && marked && slept >= 200 && slept < 1000 && rtc.tick_source() == rp_rtc.TICK_CRYSTAL)
+    unsafe {
+        POWER_DOWN_MARK = 0
+        store(RECORD + 20, MORE_FAILURES)
+        store(RECORD + 28, LAST_FAILURES)
+        store(RECORD + 96, EXTRA_FAILURES)
+        record(0x600D_0000 | CHECKS, FAILURES)
+    }
+    report()
+}
+
 fn core1_checks(core1: &mut rp_multicore.Core1, fifos: &mut rp_multicore.Fifos, spinlocks: &mut rp_multicore.Spinlocks, timer: &mut chip.Timer) {
     feed_watchdog()
     fifo := fifos.claim()!
@@ -1619,6 +1768,9 @@ fn main() {
     }
     record(RUNNING, 0)
     b := board.take()!
+    if b.power.woke_from_power_down() && b.power.scratch(6) == MARK {
+        power_down_finish(&mut b.power, &mut b.rtc)
+    }
     // Watchdog: reset everything but the oscillators after 3 s. It counts
     // down once per microsecond tick, which board.take() started.
     unsafe {
@@ -1744,6 +1896,8 @@ fn main() {
     core1_checks(&mut b.core1, &mut b.fifos, &mut b.spinlocks, &mut b.timer)
     rng_checks(&mut b.rng)
     power_checks(&mut b.power, &mut b.usb, &mut b.pins, &mut b.timer)
+    system_clock_checks(&mut b.power, &mut b.pins, &mut b.timer)
+    timed_dormant_checks(&mut b.power, &mut b.rtc, &mut b.pins, &mut b.timer)
     watchdog_checks(&mut b.watchdog, &mut b.timer)
     rtc_checks(&mut b.rtc, &mut b.watchdog, &mut b.timer)
     flash_checks(&mut b.flash, &mut b.core1, &mut b.timer)
@@ -1771,6 +1925,7 @@ fn main() {
     elapsed := b.timer.now_us() - start
     check(elapsed >= 10_000 && elapsed < 10_100)
     check(board.NAME.len == 19)
+    power_down_check(&mut b.power, &mut b.rtc)
 
     unsafe {
         control: hal.Reg<u32> = hal.Reg.at(WATCHDOG)
