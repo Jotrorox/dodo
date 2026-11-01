@@ -648,6 +648,7 @@ fn exec_alter(e: &mut Engine, s: usize) -> void!db.Error {
                 schema_update(e, schema_rowid3, name3, name_len2, nd_, nnl, is, isl, false)?
             }
         }
+        rename_table_refs(e, t, name, nl, nd_, nnl, qo, ql)?
         return schema_changed(e)
     }
     if op == 2 {
@@ -718,7 +719,14 @@ fn exec_alter(e: &mut Engine, s: usize) -> void!db.Error {
         nd_ := arena_alloc(e, nnl)?
         move_bytes(e.ws, nn, nd_, nnl)
         let (qo, ql) = quoted_name(e, nd_, nnl)?
-        let (ts, tsl) = rename_tokens(e, sql, sqll, co, cl, qo, ql)?
+        // Like SQLite, a new name typed without quotes replaces unquoted
+        // references as is.
+        bl := if new_name_bare(e, nn, nnl) {
+            nnl
+        } else {
+            0usize
+        }
+        let (ts, tsl) = rename_tokens(e, sql, sqll, co, cl, qo, ql, nd_, bl)?
         let schema_rowid5 = obj_u(e, t, O_ROWNO) as i64
         let name6 = obj_u(e, t, O_NAME)
         let name_len5 = obj_u(e, t, O_NAMEL)
@@ -731,7 +739,7 @@ fn exec_alter(e: &mut Engine, s: usize) -> void!db.Error {
             }
             let sql_value = obj_u(e, j, O_SQL)
             let sql_len = obj_u(e, j, O_SQLL)
-            let (is, isl) = rename_tokens(e, sql_value, sql_len, co, cl, qo, ql)?
+            let (is, isl) = rename_tokens(e, sql_value, sql_len, co, cl, qo, ql, nd_, bl)?
             let schema_rowid6 = obj_u(e, j, O_ROWNO) as i64
             let name8 = obj_u(e, j, O_NAME)
             let name_len7 = obj_u(e, j, O_NAMEL)
@@ -739,6 +747,7 @@ fn exec_alter(e: &mut Engine, s: usize) -> void!db.Error {
             let tbl_len2 = obj_u(e, j, O_TBLL)
             schema_update(e, schema_rowid6, name8, name_len7, tbl2, tbl_len2, is, isl, false)?
         }
+        rename_column_refs(e, t, co, cl, qo, ql, nd_, bl)?
         return schema_changed(e)
     }
     if op == 4 {
@@ -750,51 +759,34 @@ fn exec_alter(e: &mut Engine, s: usize) -> void!db.Error {
     err(fail(e, SQLITE_ERROR, "unsupported ALTER TABLE"))
 }
 
-// Renames identifier tokens equal to `old` that follow the first "(".
-fn rename_tokens(e: &mut Engine, o: usize, l: usize, old: usize, ol: usize, new_o: usize, nl: usize) -> (usize, usize)!db.Error {
-    // Count matches before the opening parenthesis (object names).
-    e.src = o
-    e.src_end = o + l
-    e.pos = o
-    e.ts = o
-    e.tl = 0
-    e.last_end = o
-    next_token(e)
-    skip := 0usize
-    for e.tk != TK_EOF && e.tk != TK_LP {
-        if e.tk == TK_ID || e.tk == TK_QID {
-            io := if e.tk == TK_ID {
-                e.ts
-            } else {
-                e.ts + 1
-            }
-            il := if e.tk == TK_ID {
-                e.tl
-            } else {
-                e.tl - 2
-            }
-            if names_eq(e, io, il, old, ol) {
-                skip += 1
-            }
+// True when the new name in the ALTER statement was typed as a bare
+// identifier.
+fn new_name_bare(e: &Engine, o: usize, l: usize) -> bool {
+    if o == 0 || l == 0 {
+        return false
+    }
+    p := e.ws[o - 1]
+    if p == 34 || p == 39 || p == 96 || p == 91 {
+        return false
+    }
+    for i in 0usize..l {
+        if !is_id_char(e.ws[o + i]) {
+            return false
         }
+    }
+    !is_digit(e.ws[o])
+}
+
+// Renames identifier tokens equal to `old` that follow the first "(".
+fn rename_tokens(e: &mut Engine, o: usize, l: usize, old: usize, ol: usize, qo: usize, ql: usize, bo: usize, bl: usize) -> (usize, usize)!db.Error {
+    tok_start(e, o, l)
+    for e.tk != TK_EOF && e.tk != TK_LP {
         next_token(e)
     }
-    same := names_eq(e, new_o, nl, old, ol)
-    cur_o := o
-    cur_l := l
-    for _ in 0usize..10000 {
-        let (a, b) = find_name_token(e, cur_o, cur_l, skip, old, ol)
-        if b == 0 {
-            break
-        }
-        let (ns, nsl) = splice(e, cur_o, cur_l, a, b, new_o, nl)?
-        cur_o = ns
-        cur_l = nsl
-        if same {
-            skip += 1
-        }
-    }
-    ok((cur_o, cur_l))
+    start := e.ts
+    edits := arena_alloc(e, EDIT_MAX * 8)?
+    n := scan_col_refs(e, o, l, start, old, ol, false, edits)
+    apply_edits(e, o, l, edits, n, qo, ql, bo, bl)
 }
 
 // ---------------------------------------------------------------------------
@@ -1098,7 +1090,29 @@ fn drop_column(e: &mut Engine, t: usize, co: usize, cl: usize) -> void!db.Error 
     e.rtop = save
     let schema_rowid = obj_u(e, t, O_ROWNO) as i64
     schema_update(e, schema_rowid, name, nl, name, nl, ns, len, false)?
-    schema_changed(e)
+    schema_changed(e)?
+    if e.legacy_alter {
+        return ok()
+    }
+    // Views and triggers must not use the dropped column.
+    for v in 0usize..e.schema_objs {
+        k := obj_type(e, v)
+        if k == OT_VIEW {
+            match check_view(e, v) {
+                ok() => {},
+                err(_) => {
+                    let vname = obj_u(e, v, O_NAME)
+                    let vnl = obj_u(e, v, O_NAMEL)
+                    return err(drop_error(e, "view", vname, vnl, co, cl))
+                },
+            }
+        } else if k == OT_TRIGGER && trigger_uses_column(e, v, t, co, cl)? {
+            let tname = obj_u(e, v, O_NAME)
+            let tnl = obj_u(e, v, O_NAMEL)
+            return err(drop_error(e, "trigger", tname, tnl, co, cl))
+        }
+    }
+    ok()
 }
 
 // Like SQLite, ALTER TABLE first checks that the existing schema resolves;
@@ -1116,4 +1130,399 @@ fn check_schema_resolves(e: &mut Engine) -> void!db.Error {
         }
     }
     ok()
+}
+
+// ---------------------------------------------------------------------------
+// Token edits of schema SQL for ALTER TABLE (modern, non-legacy rules):
+// references to a renamed table or column inside views, triggers and
+// foreign keys are rewritten to the new, quoted name.
+
+const EDIT_MAX: usize = 512
+
+fn tok_start(e: &mut Engine, o: usize, l: usize) {
+    e.src = o
+    e.src_end = o + l
+    e.pos = o
+    e.ts = o
+    e.tl = 0
+    e.last_end = o
+    next_token(e)
+}
+
+// The current identifier token's unquoted text.
+fn tok_name(e: &Engine) -> (usize, usize) {
+    if e.tk == TK_QID && e.tl >= 2 {
+        return (e.ts + 1, e.tl - 2)
+    }
+    (e.ts, e.tl)
+}
+
+fn tok_is_name(e: &Engine, name: usize, nl: usize) -> bool {
+    if e.tk != TK_ID && e.tk != TK_QID {
+        return false
+    }
+    let (o, l) = tok_name(e)
+    names_eq(e, o, l, name, nl)
+}
+
+// Edit: [0] start (bit 31 set when the token was quoted), [4] end.
+fn add_edit(e: &mut Engine, edits: usize, n: usize, a: usize, b: usize, quoted: bool) -> usize {
+    if n >= EDIT_MAX {
+        return n
+    }
+    let flag = if quoted {
+        2147483648usize
+    } else {
+        0usize
+    }
+    stu(e.ws, edits + n * 8, a | flag)
+    stu(e.ws, edits + n * 8 + 4, b)
+    n + 1
+}
+
+// Copies [o, o+l) replacing every edit range with the quoted name, or with
+// the bare name (when bl > 0) for tokens that were not quoted.
+fn apply_edits(e: &mut Engine, o: usize, l: usize, edits: usize, n: usize, qo: usize, ql: usize, bo: usize, bl: usize) -> (usize, usize)!db.Error {
+    len := l
+    for i in 0usize..n {
+        raw := ldu(e.ws, edits + i * 8)
+        a := raw & 2147483647
+        b := ldu(e.ws, edits + i * 8 + 4)
+        rl := if bl > 0 && (raw & 2147483648) == 0 {
+            bl
+        } else {
+            ql
+        }
+        len = len - (b - a) + rl
+    }
+    d := arena_alloc(e, len)?
+    src := o
+    k := 0usize
+    for i in 0usize..n {
+        raw := ldu(e.ws, edits + i * 8)
+        a := raw & 2147483647
+        b := ldu(e.ws, edits + i * 8 + 4)
+        move_bytes(e.ws, src, d + k, a - src)
+        k += a - src
+        if bl > 0 && (raw & 2147483648) == 0 {
+            move_bytes(e.ws, bo, d + k, bl)
+            k += bl
+        } else {
+            move_bytes(e.ws, qo, d + k, ql)
+            k += ql
+        }
+        src = b
+    }
+    move_bytes(e.ws, src, d + k, o + l - src)
+    ok((d, len))
+}
+
+fn ends_from(e: &Engine) -> bool {
+    e.tk == TK_SEMI || e.tk == TK_ID && (is_kw(e, "WHERE") || is_kw(e, "GROUP") || is_kw(e, "ORDER") || is_kw(e, "LIMIT") || is_kw(e, "HAVING") || is_kw(e, "WINDOW") || is_kw(e, "UNION") || is_kw(e, "EXCEPT") || is_kw(e, "INTERSECT") || is_kw(e, "ON") || is_kw(e, "USING") || is_kw(e, "SELECT") || is_kw(e, "SET") || is_kw(e, "VALUES") || is_kw(e, "RETURNING"))
+}
+
+// Finds identifier tokens naming table `old` in table positions (after
+// FROM, JOIN, INTO, UPDATE, TABLE, REFERENCES, in a FROM list, in a
+// trigger's ON clause, or qualifying a column). With `header_only` only the
+// trigger's ON clause is considered.
+fn scan_table_refs(e: &mut Engine, o: usize, l: usize, old: usize, ol: usize, edits: usize, header_only: bool) -> usize {
+    tok_start(e, o, l)
+    n := 0usize
+    depth := 0usize
+    in_from := false
+    from_depth := 0usize
+    table_next := false
+    before_begin := true
+    pending_a := 0usize
+    pending_b := 0usize
+    pending_q := false
+    prev_dot := false
+    for e.tk != TK_EOF {
+        if pending_b != 0 {
+            if e.tk == TK_DOT && !header_only {
+                n = add_edit(e, edits, n, pending_a, pending_b, pending_q)
+            }
+            pending_b = 0
+        }
+        if e.tk == TK_ID && is_kw(e, "BEGIN") {
+            before_begin = false
+            if header_only {
+                break
+            }
+        }
+        if e.tk == TK_LP {
+            depth += 1
+        } else if e.tk == TK_RP {
+            if depth > 0 {
+                depth -= 1
+            }
+            if in_from && depth < from_depth {
+                in_from = false
+            }
+        }
+        if tok_is_name(e, old, ol) && !prev_dot {
+            let ta = e.ts
+            let tb = e.ts + e.tl
+            let tq = e.tk == TK_QID
+            if table_next {
+                n = add_edit(e, edits, n, ta, tb, tq)
+            } else {
+                pending_a = ta
+                pending_b = tb
+                pending_q = tq
+            }
+            table_next = false
+            prev_dot = false
+            next_token(e)
+            continue
+        }
+        if in_from && ends_from(e) {
+            in_from = false
+        }
+        was_table_kw := false
+        if e.tk == TK_ID {
+            if before_begin && is_kw(e, "ON") && !in_from {
+                was_table_kw = true
+            } else if !header_only && (is_kw(e, "FROM") || is_kw(e, "JOIN")) {
+                was_table_kw = true
+                in_from = true
+                from_depth = depth
+            } else if !header_only && (is_kw(e, "INTO") || is_kw(e, "UPDATE") || is_kw(e, "TABLE") || is_kw(e, "REFERENCES")) {
+                was_table_kw = true
+            }
+        }
+        if e.tk == TK_COMMA && in_from && depth == from_depth {
+            was_table_kw = true
+        }
+        table_next = was_table_kw
+        prev_dot = e.tk == TK_DOT
+        next_token(e)
+    }
+    if pending_b != 0 && e.tk == TK_DOT && !header_only {
+        n = add_edit(e, edits, n, pending_a, pending_b, pending_q)
+    }
+    n
+}
+
+// Finds identifier tokens equal to column `old` from offset `start` on,
+// skipping function names and, with `skip_newold`, NEW.x / OLD.x.
+fn scan_col_refs(e: &mut Engine, o: usize, l: usize, start: usize, old: usize, ol: usize, skip_newold: bool, edits: usize) -> usize {
+    tok_start(e, o, l)
+    n := 0usize
+    prev_newold := false
+    prev2_newold := false
+    pending_a := 0usize
+    pending_b := 0usize
+    pending_q := false
+    for e.tk != TK_EOF {
+        if pending_b != 0 {
+            if e.tk != TK_LP {
+                n = add_edit(e, edits, n, pending_a, pending_b, pending_q)
+            }
+            pending_b = 0
+        }
+        if e.ts >= start && tok_is_name(e, old, ol) && !(skip_newold && prev2_newold) {
+            pending_a = e.ts
+            pending_b = e.ts + e.tl
+            pending_q = e.tk == TK_QID
+        }
+        // prev2_newold: the token before is "." preceded by NEW or OLD.
+        is_newold := e.tk == TK_ID && (is_kw(e, "NEW") || is_kw(e, "OLD"))
+        prev2_newold = e.tk == TK_DOT && prev_newold
+        prev_newold = is_newold
+        next_token(e)
+    }
+    if pending_b != 0 {
+        n = add_edit(e, edits, n, pending_a, pending_b, pending_q)
+    }
+    n
+}
+
+// Offset just after the object name of a CREATE statement, or after the
+// first AS of a view (the start of its SELECT).
+fn after_object_name(e: &mut Engine, o: usize, l: usize, view: bool) -> usize {
+    tok_start(e, o, l)
+    count := 0usize
+    for e.tk != TK_EOF {
+        if view && e.tk == TK_ID && is_kw(e, "AS") {
+            return e.ts + e.tl
+        }
+        if !view && (e.tk == TK_ID || e.tk == TK_QID || e.tk == TK_STR) && !is_kw(e, "CREATE") && !is_kw(e, "TEMP") && !is_kw(e, "TEMPORARY") && !is_kw(e, "TRIGGER") && !is_kw(e, "IF") && !is_kw(e, "NOT") && !is_kw(e, "EXISTS") {
+            end := e.ts + e.tl
+            next_token(e)
+            if e.tk == TK_DOT {
+                next_token(e)
+                return e.ts + e.tl
+            }
+            return end
+        }
+        count += 1
+        next_token(e)
+    }
+    o + l
+}
+
+fn update_sql(e: &mut Engine, j: usize, tbl: usize, tl: usize, sql: usize, sqll: usize) -> void!db.Error {
+    let row = obj_u(e, j, O_ROWNO) as i64
+    let jn = obj_u(e, j, O_NAME)
+    let jl = obj_u(e, j, O_NAMEL)
+    schema_update(e, row, jn, jl, tbl, tl, sql, sqll, false)
+}
+
+// RENAME TABLE: triggers on the table follow it (tbl_name and ON clause);
+// without legacy_alter_table, references in views, trigger bodies and
+// foreign keys are rewritten as well.
+fn rename_table_refs(e: &mut Engine, t: usize, old: usize, ol: usize, nn: usize, nnl: usize, qo: usize, ql: usize) -> void!db.Error {
+    edits := arena_alloc(e, EDIT_MAX * 8)?
+    for j in 0usize..e.schema_objs {
+        k := obj_type(e, j)
+        if j == t || k == OT_INDEX {
+            continue
+        }
+        sql := obj_u(e, j, O_SQL)
+        sqll := obj_u(e, j, O_SQLL)
+        if sqll == 0 {
+            continue
+        }
+        on_t := k == OT_TRIGGER && obj_u(e, j, O_TABLE) == t
+        if e.legacy_alter && !on_t {
+            continue
+        }
+        let legacy = e.legacy_alter
+        n := scan_table_refs(e, sql, sqll, old, ol, edits, legacy)
+        if n == 0 && !on_t {
+            continue
+        }
+        let (ns, nsl) = apply_edits(e, sql, sqll, edits, n, qo, ql, 0, 0)?
+        let (to, tl) = if on_t {
+            (nn, nnl)
+        } else {
+            (obj_u(e, j, O_TBL), obj_u(e, j, O_TBLL))
+        }
+        update_sql(e, j, to, tl, ns, nsl)?
+    }
+    ok()
+}
+
+// RENAME COLUMN: column references in triggers on the table, and in views
+// and triggers that use the table.
+fn rename_column_refs(e: &mut Engine, t: usize, co: usize, cl: usize, qo: usize, ql: usize, bo: usize, bl: usize) -> void!db.Error {
+    if e.legacy_alter {
+        return ok()
+    }
+    tn := obj_u(e, t, O_NAME)
+    tnl := obj_u(e, t, O_NAMEL)
+    edits := arena_alloc(e, EDIT_MAX * 8)?
+    for j in 0usize..e.schema_objs {
+        k := obj_type(e, j)
+        if k == OT_TABLE && j != t {
+            // Foreign keys: REFERENCES t(col, ...).
+            sql0 := obj_u(e, j, O_SQL)
+            sqll0 := obj_u(e, j, O_SQLL)
+            n0 := scan_fk_cols(e, sql0, sqll0, tn, tnl, co, cl, edits)
+            if n0 > 0 {
+                let (ns0, nsl0) = apply_edits(e, sql0, sqll0, edits, n0, qo, ql, bo, bl)?
+                let jt0 = obj_u(e, j, O_TBL)
+                let jtl0 = obj_u(e, j, O_TBLL)
+                update_sql(e, j, jt0, jtl0, ns0, nsl0)?
+            }
+            continue
+        }
+        if k != OT_TRIGGER && k != OT_VIEW {
+            continue
+        }
+        sql := obj_u(e, j, O_SQL)
+        sqll := obj_u(e, j, O_SQLL)
+        on_t := k == OT_TRIGGER && obj_u(e, j, O_TABLE) == t
+        uses := scan_table_refs(e, sql, sqll, tn, tnl, edits, false) > 0
+        if !on_t && !uses {
+            continue
+        }
+        start := after_object_name(e, sql, sqll, k == OT_VIEW)
+        n := scan_col_refs(e, sql, sqll, start, co, cl, !on_t, edits)
+        if n == 0 {
+            continue
+        }
+        let (ns, nsl) = apply_edits(e, sql, sqll, edits, n, qo, ql, bo, bl)?
+        let jt = obj_u(e, j, O_TBL)
+        let jtl = obj_u(e, j, O_TBLL)
+        update_sql(e, j, jt, jtl, ns, nsl)?
+    }
+    ok()
+}
+
+// DROP COLUMN: triggers must not refer to the dropped column.
+fn trigger_uses_column(e: &mut Engine, j: usize, t: usize, co: usize, cl: usize) -> bool!db.Error {
+    sql := obj_u(e, j, O_SQL)
+    sqll := obj_u(e, j, O_SQLL)
+    tn := obj_u(e, t, O_NAME)
+    tnl := obj_u(e, t, O_NAMEL)
+    on_t := obj_u(e, j, O_TABLE) == t
+    edits := arena_alloc(e, EDIT_MAX * 8)?
+    uses_t := scan_table_refs(e, sql, sqll, tn, tnl, edits, false) > 0
+    if !on_t && !uses_t {
+        return ok(false)
+    }
+    lo := e.node_n
+    save := e.trig_parse
+    e.trig_parse = true
+    res := parse_fragment_stmt(e, sql, sqll)
+    e.trig_parse = save
+    match res {
+        ok(_) => {},
+        err(_) => {
+            e.node_n = lo
+            return ok(false)
+        },
+    }
+    found := false
+    for n in (lo + 1)..(e.node_n + 1) {
+        if nkind(e, n) != N_ID {
+            continue
+        }
+        let no = na(e, n)
+        let nl = nb(e, n)
+        if !names_eq(e, no, nl, co, cl) {
+            continue
+        }
+        q := nc(e, n)
+        ql := ndd(e, n)
+        newold := q != 0 && (name_is(e, q, ql, "new") || name_is(e, q, ql, "old"))
+        if newold && on_t || !newold && uses_t && (q == 0 || names_eq(e, q, ql, tn, tnl)) {
+            found = true
+        }
+    }
+    e.node_n = lo
+    ok(found)
+}
+
+// Column names inside "REFERENCES table(...)" lists naming `col`.
+fn scan_fk_cols(e: &mut Engine, o: usize, l: usize, tn: usize, tnl: usize, col: usize, cl: usize, edits: usize) -> usize {
+    tok_start(e, o, l)
+    n := 0usize
+    for e.tk != TK_EOF {
+        if e.tk == TK_ID && is_kw(e, "REFERENCES") {
+            next_token(e)
+            if !tok_is_name(e, tn, tnl) {
+                continue
+            }
+            next_token(e)
+            if e.tk != TK_LP {
+                continue
+            }
+            next_token(e)
+            for e.tk != TK_EOF && e.tk != TK_RP {
+                if tok_is_name(e, col, cl) {
+                    let a = e.ts
+                    let b = e.ts + e.tl
+                    let q = e.tk == TK_QID
+                    n = add_edit(e, edits, n, a, b, q)
+                }
+                next_token(e)
+            }
+            continue
+        }
+        next_token(e)
+    }
+    n
 }

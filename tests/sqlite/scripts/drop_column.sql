@@ -1,4 +1,5 @@
 -- ALTER TABLE DROP COLUMN and ADD COLUMN text placement.
+pragma legacy_alter_table = off;
 create table t(a integer primary key, b text, c int default 7, d real, e);
 insert into t values (1, 'one', 10, 1.5, x'00ff'), (2, 'two', 20, 2.0, null), (3, null, null, 3, 'three');
 alter table t drop column c;
@@ -67,9 +68,21 @@ alter table many drop column keep;
 select * from many where id = 5;
 rollback;
 select * from many where id = 5;
--- Like SQLite, a drop that breaks a view succeeds, and later ALTERs fail.
+-- Columns used by views and triggers cannot be dropped.
 create table base(k, l, m);
 create view vw as select k, m from base;
 alter table base drop column m;
 alter table base drop column l;
+select sql from sqlite_schema where name = 'base';
+create table p(a, b, c);
+create table q(x, y);
+create trigger tr after insert on p begin insert into q values (new.a, new.c); end;
+alter table p drop column c;
+alter table p drop column b;
+create trigger tq after delete on q begin delete from p where a = old.x; end;
+alter table p drop column a;
+select name, sql from sqlite_schema where name in ('p', 'tr', 'tq') order by name;
+-- With legacy_alter_table, views and triggers are not checked.
+pragma legacy_alter_table = on;
+alter table base drop column m;
 select sql from sqlite_schema where name = 'base';

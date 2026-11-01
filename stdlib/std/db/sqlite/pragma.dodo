@@ -26,6 +26,7 @@ const P_AUTO_VACUUM: usize = 17
 const P_DATABASE_LIST: usize = 18
 const P_TABLE_LIST: usize = 19
 const P_IGNORED: usize = 20
+const P_LEGACY_ALTER: usize = 40
 
 fn pragma_id(e: &Engine, o: usize, l: usize) -> usize {
     if name_is(e, o, l, "user_version") {
@@ -84,6 +85,9 @@ fn pragma_id(e: &Engine, o: usize, l: usize) -> usize {
     }
     if name_is(e, o, l, "table_list") {
         return P_TABLE_LIST
+    }
+    if name_is(e, o, l, "legacy_alter_table") {
+        return P_LEGACY_ALTER
     }
     P_IGNORED
 }
@@ -154,6 +158,9 @@ fn pragma_column_name(id: usize, i: usize) -> &str from(static) {
     }
     if id == P_FOREIGN_KEYS {
         return "foreign_keys"
+    }
+    if id == P_LEGACY_ALTER {
+        return "legacy_alter_table"
     }
     if id == P_INTEGRITY_CHECK {
         return "integrity_check"
@@ -275,6 +282,20 @@ fn exec_pragma(e: &mut Engine, s: usize, resreg: usize) -> void!db.Error {
             "delete"
         }
         set_text_str(e, r, value3)?
+        return prow(e, r, 1)
+    }
+    if id == P_LEGACY_ALTER {
+        if set {
+            v := pragma_int_arg(e, s)?
+            e.legacy_alter = v != 0
+            return ok()
+        }
+        let lv = if e.legacy_alter {
+            1i64
+        } else {
+            0i64
+        }
+        set_int(e, r, lv)
         return prow(e, r, 1)
     }
     if id == P_FOREIGN_KEYS || id == P_AUTO_VACUUM {
