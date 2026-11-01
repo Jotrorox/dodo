@@ -3,6 +3,10 @@ package esp32c6
 import "core/cpu"
 import "core/mmio"
 import "core/ptr"
+import "std/embedded/chip/esp_flash"
+import "std/embedded/chip/esp_rng"
+import "std/embedded/chip/esp_rtc"
+import "std/embedded/chip/esp_watchdog"
 import "std/embedded/executor"
 import "std/embedded/hal"
 import "std/embedded/peripheral/esp_i2c"
@@ -236,6 +240,8 @@ const PCR_CPU_FREQ_CONF: usize = PCR_BASE + 0x118
 const SOC_CLK_SEL: u32 = 0b11 << 16
 const SOC_CLK_PLL: u32 = 1
 const CPU_HS_DIV: u32 = 0xFF << 8
+const PCR_AHB_FREQ_CONF: usize = PCR_BASE + 0x11C
+const AHB_HS_DIV: u32 = 0xFF << 8
 
 // The USB serial port.
 const USB_DEVICE_BASE: usize = 0x6000_F000
@@ -245,6 +251,16 @@ const USB_DEVICE_BASE: usize = 0x6000_F000
 const LP_AON_SYS_CFG: usize = 0x600B_1034
 const FORCE_DOWNLOAD_BOOT: u32 = 1 << 30
 const HPSYS_SW_RESET: u32 = 1 << 31
+
+// Timer group 0, LP_AON, the LP timer, and LP_CLKRST RESET_CAUSE, whose
+// low five bits are the cause of the last reset.
+const TIMG0_BASE: usize = 0x6000_8000
+const LP_AON_BASE: usize = 0x600B_1000
+const LP_TIMER_BASE: usize = 0x600B_0C00
+const LP_CLKRST_RESET_CAUSE: usize = 0x600B_0410
+const RESET_CAUSE: u32 = 0x1F
+const PCR_TIMERGROUP0_CONF: usize = PCR_BASE + 0x03C
+const PCR_TIMERGROUP0_WDT_CLK_CONF: usize = PCR_BASE + 0x044
 
 // Polls before a register that does not change is reported as stuck.
 const ATTEMPTS: u32 = 1_000_000
@@ -348,10 +364,22 @@ pub struct Peripherals {
     pub usb: Usb
     // The DMA controller's channels.
     pub dma: Dma
+    // The random number generator, with the SAR ADC's noise source while
+    // no analog input is claimed; esp_rng documents it.
+    pub rng: esp_rng.Rng
+    // Timer group 0's watchdog, stopped; esp_watchdog documents it.
+    pub watchdog: esp_watchdog.Watchdog
+    // The LP timer as a real-time clock: the time of day, counted in
+    // milliseconds, which survives resets; esp_rtc documents it.
+    pub rtc: esp_rtc.Rtc
+    // The program flash, for storing data above the program; see
+    // std/embedded/chip/esp_flash.
+    pub flash: esp_flash.Flash
 }
 
 // Configure clocks and return the peripherals. A second call returns
-// Error.Busy, so no two owners exist.
+// Error.Busy, so no two owners exist; Timeout if the RTC slow clock does
+// not run.
 pub fn take() -> Peripherals!hal.Error {
     section := hal.Critical.enter()
     // SAFETY: interrupts are masked, so the flag is read and set atomically.
@@ -370,8 +398,33 @@ pub fn take() -> Peripherals!hal.Error {
     unsafe {
         start_clocks()?
         start_timer()
+        start_watchdog_clock()
+    }
+    // SAFETY: TAKEN guarantees one Rng, Watchdog, Rtc, and Flash: the only
+    // users of RNG_DATA and the converter's noise setup, of TIMG0's
+    // watchdog, RTC calibration unit, and LP_AON STORE0, STORE2, and
+    // STORE3, of the LP timer and the record at the top of LP SRAM, and of
+    // the flash above the program.
+    rng := unsafe {
+        esp_rng.Rng.take()
+    }
+    cause := unsafe {
+        mmio.read32(LP_CLKRST_RESET_CAUSE) & RESET_CAUSE
+    }
+    watchdog := unsafe {
+        esp_watchdog.Watchdog.at(TIMG0_BASE, LP_AON_BASE, cause, now_us)
+    }
+    rtc := unsafe {
+        esp_rtc.Rtc.at(LP_TIMER_BASE, esp_rtc.RECORD_ADDRESS, TIMG0_BASE)?
+    }
+    flash := unsafe {
+        esp_flash.Flash.take()
     }
     return ok(Peripherals {
+        rng,
+        watchdog,
+        rtc,
+        flash,
         pins: Pins { taken: 0, buses: 0, pwm_channels: 0, pwm_timers: [0u32; 4], pwm_timer_users: [0u32; 4], analog_inputs: 0 },
         timer: Timer { alarms: 0 },
         usb: Usb { open: false },
@@ -380,21 +433,37 @@ pub fn take() -> Peripherals!hal.Error {
 }
 
 // Run the CPU at 160 MHz: the PLL divided by 3 for the root clock, and by
-// 1 for the CPU. The boot ROM already runs the PLL and the CPU at 80 MHz
-// from it; AHB and APB stay at 40 MHz.
+// 1 for the CPU; AHB and APB at 40 MHz, the root clock divided by 4. The
+// boot ROM never selects the root clock itself: PCR SYSCLK_CONF keeps its
+// selection through the resets that leave the PCR alone, among them the
+// USB serial port's, so the root clock may come from the crystal or from
+// the PLL, which the USB serial port keeps running either way.
 // SAFETY: the caller owns the clock configuration.
 unsafe fn start_clocks() -> void!hal.Error {
     unsafe {
-        sysclk := mmio.read32(PCR_SYSCLK_CONF)
-        if hal.decode(SOC_CLK_SEL, sysclk) != SOC_CLK_PLL {
-            // Not from the boot ROM's direct boot: leave the clocks alone.
-            return err(hal.Error.Unsupported)
-        }
+        bus := mmio.read32(PCR_AHB_FREQ_CONF) & ~AHB_HS_DIV
+        mmio.write32(PCR_AHB_FREQ_CONF, bus | hal.encode(AHB_HS_DIV, 3))
         divider := mmio.read32(PCR_CPU_FREQ_CONF)
         mmio.write32(PCR_CPU_FREQ_CONF, divider & ~CPU_HS_DIV)
+        sysclk := mmio.read32(PCR_SYSCLK_CONF)
+        if hal.decode(SOC_CLK_SEL, sysclk) != SOC_CLK_PLL {
+            mmio.write32(PCR_SYSCLK_CONF, (sysclk & ~SOC_CLK_SEL) | hal.encode(SOC_CLK_SEL, SOC_CLK_PLL))
+        }
         // The boot ROM's delay function counts CPU cycles.
         ets_update_cpu_frequency(CPU_HZ / 1_000_000)
         return ok()
+    }
+}
+
+// Timer group 0, the watchdog's and the RTC calibration unit's: its bus
+// clock on and out of reset (PCR TIMERGROUP0_CONF), and its watchdog clock
+// on, from the 40 MHz crystal (TIMERGROUP0_WDT_CLK_CONF). The boot ROM
+// leaves both so; this keeps them so after Board.power changes clocks.
+// SAFETY: the caller owns timer group 0.
+unsafe fn start_watchdog_clock() {
+    unsafe {
+        mmio.write32(PCR_TIMERGROUP0_CONF, PERIPHERAL_CLOCK)
+        mmio.write32(PCR_TIMERGROUP0_WDT_CLK_CONF, SCLK_ENABLE)
     }
 }
 

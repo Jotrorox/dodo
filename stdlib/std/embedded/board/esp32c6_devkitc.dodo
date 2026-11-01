@@ -2,6 +2,10 @@ package esp32c6_devkitc
 
 import "std/embedded/hal"
 import "std/embedded/chip/esp32c6"
+import "std/embedded/chip/esp_flash"
+import "std/embedded/chip/esp_rng"
+import "std/embedded/chip/esp_rtc"
+import "std/embedded/chip/esp_watchdog"
 
 // Espressif ESP32-C6-DevKitC-1: an ESP32-C6-WROOM-1 module with 8 MiB of
 // flash, an addressable RGB LED (WS2812) on GPIO 8, a BOOT button on GPIO 9,
@@ -71,6 +75,18 @@ pub struct Board {
     // The DMA channels: `channel()` claims one, for copies that run while
     // the program does other work.
     pub dma: esp32c6.Dma
+    // The random number generator: `fill(bytes)`, and hal.random_u32 and
+    // friends over it; fit for keys while no analog input is claimed.
+    pub rng: esp_rng.Rng
+    // The watchdog, stopped: `start(timeout_ms)`, `feed()`, `stop()`,
+    // `reset_reason()`, and scratch words that survive its reset.
+    pub watchdog: esp_watchdog.Watchdog
+    // The real-time clock: the LP timer, counting milliseconds through
+    // resets until the board loses power, with an alarm.
+    pub rtc: esp_rtc.Rtc
+    // The 8 MiB program flash: `region`, `last`, and `free` hand out the
+    // flash above the program, for std/embedded/storage.
+    pub flash: esp_flash.Flash
 }
 
 // Start the chip and claim the LED, off. A second call returns
@@ -78,10 +94,10 @@ pub struct Board {
 pub fn take() -> Board!hal.Error {
     chip := esp32c6.take()?
     leds := chip.pins.ws2812(LED_PIN)?
-    let esp32c6.Peripherals { pins, timer, usb, dma } = chip
+    let esp32c6.Peripherals { pins, timer, usb, dma, rng, watchdog, rtc, flash } = chip
     led := Led { leds, color: LED_ON_COLOR, on: false }
     led.set_low()
-    return ok(Board { led, pins, timer, usb, dma })
+    return ok(Board { led, pins, timer, usb, dma, rng, watchdog, rtc, flash })
 }
 
 // The board's RGB LED: an output pin, on when high, for the board contract

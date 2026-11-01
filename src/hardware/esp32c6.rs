@@ -127,6 +127,16 @@ pub static CHIP: Chip = Chip {
         download_flag: DownloadFlag {
             address: 0x600B_1034,
             mask: 1 << 30,
+            // The RTC watchdog (LP_WDT) off, and the super watchdog fed by
+            // itself, each unlocked with its write key.
+            watchdogs_off: &[
+                (0x600B_1C18, 0x50D8_3AA1, u32::MAX),
+                (0x600B_1C00, 0, u32::MAX),
+                (0x600B_1C18, 0, u32::MAX),
+                (0x600B_1C20, 0x50D8_3AA1, u32::MAX),
+                (0x600B_1C1C, 1 << 18, 1 << 18),
+                (0x600B_1C20, 0, u32::MAX),
+            ],
         },
     },
     pio_version: None,

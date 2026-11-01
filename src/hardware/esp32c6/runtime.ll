@@ -42,6 +42,12 @@
 ;                  Calls Exception_Handler(mcause, mepc, mtval); its weak
 ;                  default reports the exception through the panic hook as
 ;                  `processor exception check failed at mcause:mepc:CAUSE:PC`.
+;   dodo_flash_erase, dodo_flash_program
+;                  Erase or program flash above the program from SRAM, for
+;                  std/embedded/chip/esp_flash: see below.
+;   dodo_flash_image_end, dodo_flash_end
+;                  Where the program image ends in flash and where the
+;                  board's flash ends, as mapped at 0x42000000.
 ;   dodo_board_panic
 ;                  The panic hook: masks interrupts, passes its arguments to
 ;                  dodo_panic_report if the program defines it, and halts.
@@ -186,6 +192,138 @@ module asm "    call Cache_Resume_ICache"
 module asm "    lw ra, 12(sp)"
 module asm "    lw s0, 8(sp)"
 module asm "    addi sp, sp, 16"
+module asm "    ret"
+
+; dodo_flash_erase(offset, count) erases `count` bytes of flash from
+; `offset` (multiples of 4 KiB) sector by sector, and
+; dodo_flash_program(offset, data, count) programs `count` bytes from
+; word-aligned `data` in SRAM (a multiple of 4, within one 256-byte page);
+; both return 0, or 1 if the boot ROM reports an error. The ROM's
+; esp_rom_spiflash_erase_sector and esp_rom_spiflash_write drive the flash
+; through SPI1, during which the cache may not fetch from it over SPI0, so
+; this code runs from SRAM with interrupts masked and the cache suspended,
+; as ESP-IDF's spi_flash_disable_interrupts_caches_and_other_cpu does. The
+; ROM's flash chip record (rom_spiflash_legacy_data) says 2 MiB after
+; direct boot, and the ROM refuses offsets beyond it, so the board's size
+; goes there first. Afterwards the cache resumes and the changed range is
+; invalidated, so reads through the mapping at 0x42000000 see the new
+; contents. The reset handler left SPI1, like SPI0, reading in dual I/O
+; mode (SPI_MEM_CTRL FREAD_DIO), in which the ROM's status register reads
+; return garbage, so its erase would not wait for the flash; SPI1's read
+; mode bits are cleared meanwhile, as the ROM's own page program does, and
+; restored afterwards. SPI0, which the cache reads through, keeps its mode.
+; A flash whose status register has block protection bits set (BP0 to BP4)
+; ignores erases and programs without an error, as the DevKitC-1's arrived:
+; then esp_rom_spiflash_unlock clears them, keeping the QE bit, as esp-hal's
+; esp-storage does. That writes the non-volatile status register once; the
+; bits stay clear afterwards.
+module asm ".section .ramfunc.dodo_flash, \22ax\22, @progbits"
+module asm ".global dodo_flash_erase"
+module asm ".type dodo_flash_erase, @function"
+module asm "dodo_flash_erase:"
+module asm "    mv a3, a1"                                ; count
+module asm "    li a2, 0"                                 ; no data: erase
+module asm "    j 1f"
+module asm ".global dodo_flash_program"
+module asm ".type dodo_flash_program, @function"
+module asm "dodo_flash_program:"
+module asm "    mv a3, a2"                                ; count
+module asm "    mv a2, a1"                                ; data
+module asm "1:  addi sp, sp, -48"
+module asm "    sw ra, 44(sp)"
+module asm "    sw s0, 40(sp)"
+module asm "    sw s1, 36(sp)"
+module asm "    sw s2, 32(sp)"
+module asm "    sw s3, 28(sp)"
+module asm "    sw s4, 24(sp)"
+module asm "    sw s5, 20(sp)"
+module asm "    sw s6, 16(sp)"
+module asm "    mv s1, a0"                                ; offset
+module asm "    mv s2, a2"                                ; data, 0 to erase
+module asm "    mv s3, a3"                                ; count
+module asm "    li s5, 0"                                 ; the result
+module asm "    csrrci s0, mstatus, 8"                    ; mask interrupts
+module asm "    call Cache_Suspend_ICache"
+module asm "    mv s4, a0"                                ; the autoload state to restore
+module asm "    lui t0, %hi(rom_spiflash_legacy_data)"
+module asm "    lw t0, %lo(rom_spiflash_legacy_data)(t0)"
+module asm "    lui t1, %hi(__flash_end)"
+module asm "    addi t1, t1, %lo(__flash_end)"
+module asm "    lui t2, 0x42000"
+module asm "    sub t1, t1, t2"
+module asm "    sw t1, 4(t0)"                             ; chip_size: the board's
+module asm "    lui t0, 0x60003"                          ; SPI1 CTRL: single-line
+module asm "    lw t1, 8(t0)"                             ; reads (FREAD_DUAL, QUAD,
+module asm "    sw t1, 12(sp)"                            ; DIO, and QIO off)
+module asm "    lui t2, 0xfe6fc"
+module asm "    addi t2, t2, -1"
+module asm "    and t1, t1, t2"
+module asm "    sw t1, 8(t0)"
+module asm "    lui t0, %hi(rom_spiflash_legacy_data)"
+module asm "    lw a0, %lo(rom_spiflash_legacy_data)(t0)"
+module asm "    addi a1, sp, 8"
+module asm "    call esp_rom_spiflash_read_status"
+module asm "    bnez a0, 5f"
+module asm "    lw t1, 8(sp)"
+module asm "    andi t1, t1, 0x7c"                        ; BP0 to BP4
+module asm "    beqz t1, 7f"
+module asm "    call esp_rom_spiflash_unlock"
+module asm "    bnez a0, 5f"
+module asm "7:  bnez s2, 3f"
+module asm "    mv s6, s1"                                ; erase: sector by sector
+module asm "    add t0, s1, s3"
+module asm "2:  bgeu s6, t0, 4f"
+module asm "    srli a0, s6, 12"
+module asm "    call esp_rom_spiflash_erase_sector"
+module asm "    bnez a0, 5f"
+module asm "    lui t0, 1"
+module asm "    add s6, s6, t0"
+module asm "    add t0, s1, s3"
+module asm "    j 2b"
+module asm "3:  mv a0, s1"                                ; program
+module asm "    mv a1, s2"
+module asm "    mv a2, s3"
+module asm "    call esp_rom_spiflash_write"
+module asm "    beqz a0, 4f"
+module asm "5:  li s5, 1"
+module asm "4:  lw t1, 12(sp)"                            ; SPI1's read mode back
+module asm "    lui t0, 0x60003"
+module asm "    sw t1, 8(t0)"
+module asm "    mv a0, s4"
+module asm "    call Cache_Resume_ICache"
+module asm "    lui a0, 0x42000"
+module asm "    add a0, a0, s1"
+module asm "    mv a1, s3"
+module asm "    call Cache_Invalidate_Addr"
+module asm "    andi s0, s0, 8"
+module asm "    beqz s0, 6f"
+module asm "    csrsi mstatus, 8"                         ; unmask, if they were
+module asm "6:  mv a0, s5"
+module asm "    lw ra, 44(sp)"
+module asm "    lw s0, 40(sp)"
+module asm "    lw s1, 36(sp)"
+module asm "    lw s2, 32(sp)"
+module asm "    lw s3, 28(sp)"
+module asm "    lw s4, 24(sp)"
+module asm "    lw s5, 20(sp)"
+module asm "    lw s6, 16(sp)"
+module asm "    addi sp, sp, 48"
+module asm "    ret"
+
+; dodo_flash_image_end() and dodo_flash_end(): the linker script's addresses.
+module asm ".section .text.dodo_flash_image_end, \22ax\22, @progbits"
+module asm ".global dodo_flash_image_end"
+module asm ".type dodo_flash_image_end, @function"
+module asm "dodo_flash_image_end:"
+module asm "    lui a0, %hi(__flash_image_end)"
+module asm "    addi a0, a0, %lo(__flash_image_end)"
+module asm "    ret"
+module asm ".section .text.dodo_flash_end, \22ax\22, @progbits"
+module asm ".global dodo_flash_end"
+module asm ".type dodo_flash_end, @function"
+module asm "dodo_flash_end:"
+module asm "    lui a0, %hi(__flash_end)"
+module asm "    addi a0, a0, %lo(__flash_end)"
 module asm "    ret"
 
 ; mtvec in vectored mode: exceptions enter at the base, CPU interrupt n at

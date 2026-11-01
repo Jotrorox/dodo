@@ -100,11 +100,17 @@ pub struct Written {
 /// A register bit that, while set, makes every reset start the boot ROM's
 /// download mode instead of the firmware, such as the ESP32-C6's
 /// LP_AON_SYS_CFG.FORCE_DOWNLOAD_BOOT, which firmware sets to restart into
-/// the bootloader.
+/// the bootloader; and the register writes, `(address, value, mask)`, that
+/// stop the watchdogs a reset into download mode leaves running.
 #[derive(Clone, Copy, Debug)]
 pub struct DownloadFlag {
     pub address: u32,
     pub mask: u32,
+    /// The reset through the chip's own USB serial port resets only the
+    /// digital core, so a watchdog in the low-power domain that firmware
+    /// started keeps counting in download mode and would reset the chip
+    /// while it is flashed, as esptool also knows.
+    pub watchdogs_off: &'static [(u32, u32, u32)],
 }
 
 /// Write `image` to flash offset 0 of the Espressif chip with ID
@@ -126,8 +132,18 @@ pub fn flash(
         ));
     }
     let mut link = Link::open(&port.path)?;
-    link.enter_download_mode(port.native)?;
-    let found = link.chip_id()?;
+    // Stop the watchdogs first, before a running one resets the chip out of
+    // download mode; if one does, start over.
+    let mut attempts = 0;
+    let found = loop {
+        attempts += 1;
+        link.enter_download_mode(port.native)?;
+        match link.stop_watchdogs(download_flag.watchdogs_off) {
+            Ok(()) => break link.chip_id()?,
+            Err(error) if attempts >= 4 => return Err(error),
+            Err(_) => {}
+        }
+    };
     if found != chip_id as u32 {
         return Err(format!(
             "the chip on {} has ID {found}, not {chip_id}; is the right board connected?",
@@ -388,6 +404,18 @@ impl Link {
             "the chip on {} did not enter its download mode; hold the BOOT button while pressing RESET, then run again",
             self.path.display()
         ))
+    }
+
+    /// Write `(address, value, mask)` triples, each answered within 500 ms.
+    fn stop_watchdogs(&mut self, writes: &[(u32, u32, u32)]) -> Result<(), String> {
+        for &(address, value, mask) in writes {
+            let mut write = vec![];
+            for word in [address, value, mask, 0] {
+                write.extend_from_slice(&word.to_le_bytes());
+            }
+            self.command(WRITE_REG, &write, Duration::from_millis(500))?;
+        }
+        Ok(())
     }
 
     fn chip_id(&mut self) -> Result<u32, String> {

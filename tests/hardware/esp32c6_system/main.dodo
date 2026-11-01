@@ -1,0 +1,878 @@
+package main
+
+import "core/mmio"
+import "std/embedded/board"
+import "std/embedded/chip"
+import "std/embedded/chip/esp_flash"
+import "std/embedded/chip/esp_rng"
+import "std/embedded/chip/esp_rtc"
+import "std/embedded/chip/esp_watchdog"
+import "std/embedded/executor"
+import "std/embedded/hal"
+import "std/embedded/storage"
+import "std/embedded/sync"
+import "std/fmt"
+import "std/io"
+
+// Hardware checks of the ESP32-C6 system services on the esp32c6_devkitc
+// board: the random number generator, the watchdog, the real-time clock,
+// the program flash, a std/embedded/storage store on it, std/embedded/sync
+// mutexes shared with an interrupt handler, and an async task under
+// std/embedded/executor. Run with
+//
+//     python3 scripts/test_esp32c6.py --project tests/hardware/esp32c6_system --follow-resets
+//
+// The protocol is the self-test's: after the host sends a byte, `selftest
+// ready`, `check N ok` or `check N FAILED` per check, and `selftest done N`.
+// What survives a reset is checked across four boots. The first, after
+// flashing, runs most checks, keeps values in the RTC, a scratch word, and
+// a store, prints `selftest restarting`, and restarts through the watchdog.
+// The second checks they survived and lets the watchdog time out; the third
+// checks that and panics while the watchdog runs; the fourth checks that
+// the panic ended in a watchdog reset, erases the flash it wrote, and
+// finishes. Watchdog scratch word 0 carries the boot's number.
+
+static mut SERIAL: Option<chip.UsbSerial> = none
+static mut CHECKS: u32 = 0
+
+// Scratch word 0: PHASE_MAGIC plus the number of the next boot.
+const PHASE_MAGIC: u32 = 0x5157_0000
+const PHASE_MASK: u32 = 0xFFFF_0000
+// Scratch word 1: a value that must survive the resets.
+const KEEP: u32 = 0xC0FF_EE42
+// 2026-01-01 00:00:00 UTC.
+const NEW_YEAR_MS: u64 = 1_767_225_600_000
+// The flash this test writes: two sectors below the store's 64 KiB at the
+// end of the flash.
+const STORE_BYTES: u32 = 64 * 1024
+const TEST_BYTES: u32 = 2 * 4096
+
+// LP_CLKRST RESET_CAUSE: power-up and the USB serial port's reset, which
+// flashing sends.
+const RESET_CAUSE: usize = 0x600B_0410
+const CAUSE_POWER_UP: u32 = 0x01
+const CAUSE_USB: u32 = 0x15
+
+fn say(text: &str) {
+    unsafe {
+        match &mut SERIAL {
+            some(serial) => {
+                fmt.printf(serial, "{}", text)!
+                serial.flush()!
+            }
+            none => {}
+        }
+    }
+}
+
+fn say_number(text: &str, value: u64) {
+    unsafe {
+        match &mut SERIAL {
+            some(serial) => {
+                fmt.printf(serial, "{}{}\n", text, value)!
+                serial.flush()!
+            }
+            none => {}
+        }
+    }
+}
+
+fn check(ok: bool) {
+    unsafe {
+        match &mut SERIAL {
+            some(serial) => {
+                if ok {
+                    fmt.printf(serial, "check {} ok\n", CHECKS)!
+                } else {
+                    fmt.printf(serial, "check {} FAILED\n", CHECKS)!
+                }
+                serial.flush()!
+            }
+            none => {}
+        }
+        CHECKS += 1
+    }
+}
+
+fn refused<T>(result: T!hal.Error, expected: hal.Error) -> bool {
+    match result {
+        ok(_) => {
+            return false
+        }
+        err(error) => {
+            return error == expected
+        }
+    }
+}
+
+fn failed_with(result: void!hal.Error, expected: hal.Error) -> bool {
+    match result {
+        ok() => {
+            return false
+        }
+        err(error) => {
+            return error == expected
+        }
+    }
+}
+
+fn succeeded(result: void!hal.Error) -> bool {
+    match result {
+        ok() => {
+            return true
+        }
+        err(error) => {
+            say("error: ")
+            say(hal.error_name(error))
+            say("\n")
+            return false
+        }
+    }
+}
+
+fn stored(result: void!storage.Error) -> bool {
+    match result {
+        ok() => {
+            return true
+        }
+        err(error) => {
+            say("storage error: ")
+            say(storage.error_name(error))
+            say("\n")
+            return false
+        }
+    }
+}
+
+fn read_u32(result: Option<u32>!storage.Error) -> u32 {
+    match result {
+        ok(some(value)) => {
+            return value
+        }
+        ok(none) => {
+            return 0
+        }
+        err(_) => {
+            return 0xFFFF_FFFF
+        }
+    }
+}
+
+fn now_ms(rtc: &mut esp_rtc.Rtc) -> u64 {
+    match rtc.now_ms() {
+        ok(value) => {
+            return value
+        }
+        err(_) => {
+            return 0
+        }
+    }
+}
+
+fn now_refused(rtc: &mut esp_rtc.Rtc) -> bool {
+    match rtc.now_ms() {
+        ok(_) => {
+            return false
+        }
+        err(error) => {
+            return error == hal.Error.Busy
+        }
+    }
+}
+
+fn is_set(rtc: &mut esp_rtc.Rtc) -> bool {
+    match rtc.is_set() {
+        ok(value) => {
+            return value
+        }
+        err(_) => {
+            return false
+        }
+    }
+}
+
+fn fired(rtc: &mut esp_rtc.Rtc) -> bool {
+    match rtc.alarm_fired() {
+        ok(value) => {
+            return value
+        }
+        err(_) => {
+            return false
+        }
+    }
+}
+
+fn wait_us(timer: &mut chip.Timer, microseconds: u32) {
+    timer.delay_us(microseconds)
+}
+
+// Set the pulls of a pin owned by an analog input, from outside the chip
+// package, to put a known voltage on it.
+fn force_pulls(pin: u32, up: bool, down: bool) {
+    unsafe {
+        address := 0x6009_0004 + 4 * pin as usize
+        value := mmio.read32(address) & ~((1u32 << 7) | (1u32 << 8))
+        if up {
+            value |= 1u32 << 8
+        }
+        if down {
+            value |= 1u32 << 7
+        }
+        mmio.write32(address, value)
+    }
+}
+
+fn analog_value(input: &mut chip.Analog) -> u32 {
+    match input.read() {
+        ok(value) => {
+            return value as u32
+        }
+        err(error) => {
+            say("adc read failed: ")
+            say(hal.error_name(error))
+            say("\n")
+            unsafe {
+                say_number(" ctrl ", mmio.read32(0x6000_E000) as u64)
+                say_number(" ctrl2 ", mmio.read32(0x6000_E004) as u64)
+                say_number(" onetime ", mmio.read32(0x6000_E020) as u64)
+                say_number(" int raw ", mmio.read32(0x6000_E044) as u64)
+                say_number(" pcr conf ", mmio.read32(0x6009_6080) as u64)
+                say_number(" pcr clkm ", mmio.read32(0x6009_6084) as u64)
+                say_number(" pad ", mmio.read32(0x6009_0008) as u64)
+            }
+            return 0xFFFF
+        }
+    }
+}
+
+fn flag(value: bool) -> u64 {
+    if value {
+        return 1
+    }
+    return 0
+}
+
+fn count_ones(bytes: &[u8]) -> u32 {
+    ones := 0u32
+    for index in 0..bytes.len {
+        value := bytes[index]
+        for bit in 0u32..8 {
+            if ((value >> bit as u8) & 1) != 0 {
+                ones += 1
+            }
+        }
+    }
+    return ones
+}
+
+fn same_bytes(a: &[u8], b: &[u8]) -> bool {
+    if a.len != b.len {
+        return false
+    }
+    for index in 0..a.len {
+        if a[index] != b[index] {
+            return false
+        }
+    }
+    return true
+}
+
+fn all_erased(bytes: &[u8]) -> bool {
+    for index in 0..bytes.len {
+        if bytes[index] != 0xFF {
+            return false
+        }
+    }
+    return true
+}
+
+// --- Random numbers -------------------------------------------------------
+
+static mut NOISE: [4096]u8 = [0u8; 4096]
+
+// An ADC input on GPIO 1, pulled up and then down: its readings, as
+// high * 10000 + low.
+fn adc_pulls(pins: &mut chip.Pins, timer: &mut chip.Timer) -> u32 {
+    input := pins.analog(1)!
+    force_pulls(1, true, false)
+    timer.delay_us(100)
+    high := analog_value(&mut input)
+    force_pulls(1, false, true)
+    timer.delay_us(100)
+    low := analog_value(&mut input)
+    force_pulls(1, false, false)
+    pins.release_analog(input)
+    return high * 10000 + low
+}
+
+fn rng_checks(rng: &mut esp_rng.Rng, pins: &mut chip.Pins, timer: &mut chip.Timer) {
+    // The ADC before any noise fill, to compare with afterwards.
+    baseline := adc_pulls(pins, timer)
+    say_number("adc pulled up and down before any fill: ", baseline as u64)
+    // Two fills differ and are not constant.
+    first: [64]u8 = [0u8; 64]
+    second: [64]u8 = [0u8; 64]
+    noise := rng.has_noise_source()
+    filled := succeeded(rng.fill(&mut first)) && succeeded(rng.fill(&mut second))
+    check(noise && filled && !same_bytes(&first, &second) && count_ones(&first) > 128 && count_ones(&first) < 384)
+
+    // A simple bit balance over 4096 bytes: 16384 ones expected, with a
+    // standard deviation of 90.5; allow 4.4 of them.
+    start := timer.now_us()
+    balanced := false
+    unsafe {
+        if succeeded(rng.fill(&mut NOISE)) {
+            elapsed := timer.now_us() - start
+            ones := count_ones(&NOISE)
+            say_number("rng ones in 32768 bits: ", ones as u64)
+            say_number("rng 4096 bytes took us: ", elapsed)
+            // And no byte value is far too common.
+            counts: [256]u32 = [0u32; 256]
+            for index in 0usize..4096 {
+                counts[NOISE[index] as usize] += 1
+            }
+            most := 0u32
+            for index in 0usize..256 {
+                if counts[index] > most {
+                    most = counts[index]
+                }
+            }
+            say_number("rng most frequent byte count: ", most as u64)
+            balanced = ones > 15_984 && ones < 16_784 && most < 40
+        }
+    }
+    check(balanced)
+
+    // With the temperature sensor claimed, fills leave the converter alone;
+    // afterwards the noise setup does not disturb the ADC.
+    sensor := pins.temperature()!
+    before := analog_value(&mut sensor)
+    without := rng.has_noise_source()
+    third: [64]u8 = [0u8; 64]
+    plain := succeeded(rng.fill(&mut third)) && !same_bytes(&first, &third)
+    after := analog_value(&mut sensor)
+    say_number("temperature reading before and after a fill: ", (before * 1000 + after) as u64)
+    pins.release_analog(sensor)
+    again := rng.has_noise_source()
+    succeeded(rng.fill(&mut third))
+    // Noise fills leave the converter as they found it: it reads as it did
+    // before them, now and after another fill.
+    pulls := adc_pulls(pins, timer)
+    succeeded(rng.fill(&mut third))
+    later := adc_pulls(pins, timer)
+    say_number("adc pulled up and down after noise fills: ", pulls as u64)
+    say_number("and after one more: ", later as u64)
+    high := pulls / 10000
+    low := pulls % 10000
+    high_later := later / 10000
+    low_later := later % 10000
+    close := before <= after + 3 && after <= before + 3
+    high_before := baseline / 10000
+    low_before := baseline % 10000
+    converted := high + 200 > high_before && high < high_before + 200 && low + 200 > low_before && low < low_before + 200 && high_later + 200 > high_before && high_later < high_before + 200 && low_later + 200 > low_before && low_later < low_before + 200
+    if high_before > 4095 {
+        say("the ADC does not convert on this board now, before any noise fill either\n")
+    }
+    check(!without && plain && close && again && converted)
+
+    // Numbers over the generator.
+    below := true
+    for _ in 0..100 {
+        match hal.random_below(rng, 10) {
+            ok(value) => {
+                below = below && value < 10
+            }
+            err(_) => {
+                below = false
+            }
+        }
+    }
+    one := hal.random_u32(rng)!
+    two := hal.random_u32(rng)!
+    check(below && one != two)
+}
+
+// --- Watchdog -------------------------------------------------------------
+
+fn watchdog_checks(watchdog: &mut esp_watchdog.Watchdog, timer: &mut chip.Timer) {
+    max := watchdog.max_timeout_ms()
+    check(failed_with(watchdog.start(0), hal.Error.InvalidInput) && failed_with(watchdog.start(max + 1), hal.Error.InvalidInput) && max == 3_600_000 && !watchdog.is_running() && watchdog.remaining_us() == 0)
+
+    // Fed every 20 ms, a 100 ms watchdog keeps the chip running.
+    started := succeeded(watchdog.start(100))
+    running := watchdog.is_running() && watchdog.timeout_ms() == 100
+    for _ in 0..15 {
+        timer.delay_ms(20)
+        watchdog.feed()
+    }
+    left := watchdog.remaining_us()
+    timer.delay_ms(30)
+    later := watchdog.remaining_us()
+    say_number("watchdog remaining after a feed, and 30 ms later: ", left as u64 * 1_000_000 + later as u64)
+    check(started && running && left > 95_000 && left <= 100_000 && later > 65_000 && later < 71_000)
+
+    // Stopped, it no longer resets the chip.
+    watchdog.stop()
+    stopped := !watchdog.is_running()
+    timer.delay_ms(200)
+    check(stopped && watchdog.remaining_us() == 0)
+
+    watchdog.set_scratch(1, KEEP)
+    check(watchdog.scratch(1) == KEEP)
+}
+
+// --- Real-time clock and the interrupt it shares --------------------------
+
+// The clock, shared with the LP timer's interrupt handler (LP_RTC_TIMER), how often the
+// handler ran, and when.
+static RTC: sync.Mutex<Option<esp_rtc.Rtc>> = sync.Mutex.new(none)
+static FIRED: sync.Mutex<u32> = sync.Mutex.new(0u32)
+static FIRED_AT: sync.Mutex<u64> = sync.Mutex.new(0u64)
+const ALARM_SIGNAL: executor.Signal = executor.Signal { id: 0 }
+
+fn timer_us() -> u64 {
+    // The system timer's unit 0, as Timer.now_us reads it.
+    unsafe {
+        for {
+            mmio.write32(0x6000_A004, 1u32 << 30)
+            for (mmio.read32(0x6000_A004) & (1u32 << 29)) == 0 {}
+            high := mmio.read32(0x6000_A040)
+            low := mmio.read32(0x6000_A044)
+            if mmio.read32(0x6000_A040) == high {
+                return (((high as u64) << 32) | low as u64) >> 4
+            }
+        }
+    }
+}
+
+@interrupt(LP_RTC_TIMER)
+fn rtc_interrupt() {
+    guard := RTC.lock()
+    if let some(rtc) = guard.get_mut() {
+        rtc.clear_alarm()!
+    }
+    core.drop(guard)
+    count := FIRED.lock()
+    total := *count.get() + 1
+    count.set(total)
+    core.drop(count)
+    when := FIRED_AT.lock()
+    now := timer_us()
+    when.set(now)
+    core.drop(when)
+    ALARM_SIGNAL.raise()
+}
+
+fn fired_count() -> u32 {
+    guard := FIRED.lock()
+    return *guard.get()
+}
+
+fn rtc_checks(timer: &mut chip.Timer) {
+    guard := RTC.lock()
+    if let some(rtc) = guard.get_mut() {
+        hz := rtc.slow_clock_hz()
+        say_number("slow clock hz: ", hz as u64)
+        busy := true
+        if !is_set(rtc) {
+            busy = now_refused(rtc) && failed_with(rtc.set_alarm_ms(NEW_YEAR_MS), hal.Error.Busy)
+        }
+        set := succeeded(rtc.set_ms(NEW_YEAR_MS))
+        shown := now_ms(rtc)
+        check(busy && set && is_set(rtc) && rtc.resolution_ms() == 1 && hz > 100_000 && hz < 200_000 && shown >= NEW_YEAR_MS && shown < NEW_YEAR_MS + 5)
+
+        // Elapsed time against the crystal-driven system timer, over a
+        // second, in microseconds from ticks.
+        ticks := rtc.ticks()
+        begin := timer.now_us()
+        timer.delay_ms(1000)
+        ticks_after := rtc.ticks()
+        crystal := timer.now_us() - begin
+        counted := esp_rtc.ticks_to_us(ticks_after - ticks, rtc.period())
+        difference := 0u64
+        if counted > crystal {
+            difference = counted - crystal
+        } else {
+            difference = crystal - counted
+        }
+        say_number("rtc us over a crystal second: ", counted)
+        say_number("rtc error ppm: ", difference * 1_000_000 / crystal)
+        check(difference * 1000 < crystal)
+
+        // As a date.
+        date := hal.date_time_of_ms(now_ms(rtc))!
+        day := date.date()
+        clock := date.time_of_day()
+        check(day.year() == 2026 && day.month() == 1 && day.day() == 1 && clock.hour() == 0 && clock.minute() == 0 && clock.second() == 1)
+
+        // The alarm fires once its time is reached, and at once for a time
+        // already reached.
+        now := now_ms(rtc)
+        armed := succeeded(rtc.set_alarm_ms(now + 50))
+        early := fired(rtc)
+        timer.delay_ms(45)
+        still_early := fired(rtc)
+        timer.delay_ms(10)
+        on_time := fired(rtc)
+        rtc.clear_alarm()!
+        cleared := !fired(rtc)
+        past := succeeded(rtc.set_alarm_ms(now))
+        timer.delay_us(50)
+        at_once := fired(rtc)
+        rtc.clear_alarm()!
+        check(armed && !early && !still_early && on_time && cleared && past && at_once)
+
+        // Listening, it raises LP_RTC_TIMER; which matrix sources are pending.
+        rtc.listen()
+        now = now_ms(rtc)
+        rtc.set_alarm_ms(now + 1)!
+        timer.delay_ms(3)
+        say_number("pending sources 7 and 15: ", flag(chip.is_pending(chip.LP_TIMER)) * 10 + flag(chip.is_pending(chip.LP_RTC_TIMER)))
+        pending := chip.is_pending(rtc.irq())
+        rtc.clear_alarm()!
+        check(pending && rtc.is_listening() && !chip.is_pending(rtc.irq()))
+    } else {
+        check(false)
+    }
+    core.drop(guard)
+
+    // The handler runs when the alarm fires, about 20 ms from now; it
+    // shares the clock and the counters through mutexes.
+    begin := timer.now_us()
+    armed := false
+    {
+        clock := RTC.lock()
+        if let some(rtc) = clock.get_mut() {
+            target := now_ms(rtc) + 20
+            armed = succeeded(rtc.set_alarm_ms(target))
+            chip.enable(rtc.irq())
+        }
+    }
+    for fired_count() == 0 && timer.now_us() - begin < 100_000 {}
+    took := FIRED_AT.lock()
+    after := 0u64
+    if *took.get() > begin {
+        after = *took.get() - begin
+    }
+    core.drop(took)
+    say_number("alarm handler ran after us: ", after)
+    timer.delay_ms(5)
+    check(armed && fired_count() == 1 && after > 18_000 && after < 23_000)
+
+    // While main holds a mutex, the handler waits: interrupts are masked.
+    {
+        held := FIRED.lock()
+        clock := RTC.lock()
+        if let some(rtc) = clock.get_mut() {
+            target := now_ms(rtc)
+            rtc.set_alarm_ms(target)!
+        }
+        core.drop(clock)
+        timer.delay_ms(5)
+        waited := *held.get() == 1
+        core.drop(held)
+        timer.delay_us(100)
+        check(waited && fired_count() == 2)
+    }
+}
+
+// --- An async task on an alarm clock, woken by the RTC's handler -----------
+
+async fn sleeper(times: &mut[4]u64) {
+    first := await executor.now()
+    times[0] = first
+    for index in 1usize..4 {
+        await executor.sleep_ms(5)
+        now := await executor.now()
+        times[index] = now
+    }
+}
+
+async fn alarm_waiter(woken: &mut u64) {
+    await ALARM_SIGNAL.wait()
+    now := await executor.now()
+    *woken = now
+}
+
+fn executor_checks(timer: &mut chip.Timer) {
+    ALARM_SIGNAL.reset()
+    clock := timer.alarm(0)!
+    times: [4]u64 = [0u64; 4]
+    woken := 0u64
+    start := clock.now_us()
+    woken = start
+    {
+        guard := RTC.lock()
+        if let some(rtc) = guard.get_mut() {
+            target := now_ms(rtc) + 30
+            rtc.set_alarm_ms(target)!
+        }
+    }
+    runner := executor.Executor.new()
+    finished := false
+    {
+        sleeping := sleeper(&mut times)
+        waiting := alarm_waiter(&mut woken)
+        tasks: [2]&mut dyn executor.Task = [&mut sleeping, &mut waiting]
+        finished = runner.run_until(&mut tasks, &mut clock, start + 200_000)
+    }
+    timer.release_alarm(clock)
+    say_number("sleeper took us: ", times[3] - times[0])
+    say_number("rtc alarm woke the task after us: ", woken - start)
+    gaps := times[1] - times[0] >= 5000 && times[2] - times[1] >= 5000 && times[3] - times[1] < 11_000
+    check(finished && gaps && woken - start > 28_000 && woken - start < 33_000 && runner.sleeps() >= 3)
+    chip.disable(chip.LP_RTC_TIMER)
+    guard := RTC.lock()
+    if let some(rtc) = guard.get_mut() {
+        rtc.ignore()
+        rtc.clear_alarm()!
+    }
+}
+
+// --- Program flash and storage --------------------------------------------
+
+static mut PATTERN: [300]u8 = [0u8; 300]
+static mut BACK: [4096]u8 = [0u8; 4096]
+
+fn flash_checks(flash: &mut esp_flash.Flash, timer: &mut chip.Timer) {
+    capacity := flash.capacity()
+    end := flash.program_end()
+    say_number("program end: ", end as u64)
+    check(capacity == 8 * 1024 * 1024 && end > 0 && end % 4096 == 0 && end < 1024 * 1024)
+
+    // Refusals: below the program, misaligned, past the end, empty.
+    refusals := refused(flash.region(end - 4096, 4096), hal.Error.InvalidInput) && refused(flash.region(end + 100, 4096), hal.Error.InvalidInput) && refused(flash.region(capacity - 4096, 8192), hal.Error.InvalidInput) && refused(flash.region(end, 0), hal.Error.InvalidInput)
+    test_start := capacity - STORE_BYTES - TEST_BYTES
+    region := flash.region(test_start, TEST_BYTES)!
+    overlap := refused(flash.region(test_start + 4096, 4096), hal.Error.Busy) && refused(flash.free(), hal.Error.Busy)
+    a := flash.region(end, 4096)!
+    b := flash.region(end + 4096, 4096)!
+    c := flash.region(end + 8192, 4096)!
+    full := refused(flash.region(end + 12288, 4096), hal.Error.Busy)
+    flash.release(a)
+    flash.release(b)
+    flash.release(c)
+    check(refusals && overlap && full && region.capacity() == TEST_BYTES && region.erase_size() == 4096 && region.write_size() == 1)
+
+    // Erase, read back erased, write across a page boundary at an odd
+    // offset, read back through the region and the whole flash's reads.
+    begin := timer.now_us()
+    erased := succeeded(region.erase(0, TEST_BYTES))
+    say_number("erase of 8 KiB took us: ", timer.now_us() - begin)
+    unsafe {
+        erased = erased && succeeded(region.read(0, &mut BACK)) && all_erased(&BACK)
+        for index in 0usize..300 {
+            PATTERN[index] = ((index * 7 + 3) & 255) as u8
+        }
+        written := succeeded(region.write(250, &PATTERN))
+        back: [300]u8 = [0u8; 300]
+        read := succeeded(region.read(250, &mut back)) && same_bytes(&back, &PATTERN)
+        whole := succeeded(flash.read(test_start + 250, &mut back)) && same_bytes(&back, &PATTERN)
+        around: [8]u8 = [0u8; 8]
+        region.read(242, &mut around)!
+        left := all_erased(&around)
+        region.read(550, &mut around)!
+        right := all_erased(&around)
+        // A byte in the second sector, and bits cleared in a written byte.
+        single: [1]u8 = [0x5A]
+        region.write(4096 + 17, &single)!
+        cleared: [1]u8 = [0x0F]
+        region.write(260, &cleared)!
+        both: [1]u8 = [0u8]
+        region.read(4096 + 17, &mut both)!
+        one := both[0] == 0x5A
+        region.read(260, &mut both)!
+        anded := both[0] == (PATTERN[10] & 0x0F)
+        outside := failed_with(region.write(TEST_BYTES - 1, &around), hal.Error.InvalidInput) && failed_with(region.erase(100, 4096), hal.Error.InvalidInput)
+        check(erased && written && read && whole && left && right && one && anded && outside)
+    }
+    flash.release(region)
+}
+
+// The store: 64 KiB at the end of the free flash.
+fn open_store(flash: &mut esp_flash.Flash) -> storage.Store<storage.Region<esp_flash.Region>>!storage.Error {
+    free := match flash.free() {
+        ok(value) => value,
+        err(_) => {
+            return err(storage.Error.Busy)
+        },
+    }
+    window := match storage.Region.last(free, STORE_BYTES) {
+        ok(value) => value,
+        err(_) => {
+            return err(storage.Error.InvalidInput)
+        },
+    }
+    return storage.Store.open(window)
+}
+
+fn close_store(flash: &mut esp_flash.Flash, store: storage.Store<storage.Region<esp_flash.Region>>) {
+    window := store.release()
+    flash.release(window.release())
+}
+
+fn store_checks(flash: &mut esp_flash.Flash) {
+    store := open_store(flash)!
+    cleared := stored(store.clear())
+    value: [5]u8 = [1u8, 2, 3, 4, 5]
+    set := stored(store.set("bytes", &value)) && stored(store.set_u32("boots", 1)) && stored(store.set("gone", &value))
+    removed := match store.remove("gone") {
+        ok(found) => found,
+        err(_) => false,
+    }
+    back: [8]u8 = [0u8; 8]
+    length := match store.get("bytes", &mut back) {
+        ok(some(count)) => count,
+        ok(none) => 0usize,
+        err(_) => 0usize,
+    }
+    gone := match store.contains("gone") {
+        ok(found) => !found,
+        err(_) => false,
+    }
+    check(cleared && set && removed && length == 5 && back[4] == 5 && gone && read_u32(store.get_u32("boots")) == 1)
+    close_store(flash, store)
+}
+
+// After a reset: the store kept its values; count the boot.
+fn store_survived(flash: &mut esp_flash.Flash, boots: u32) -> bool {
+    store := open_store(flash)!
+    back: [8]u8 = [0u8; 8]
+    length := match store.get("bytes", &mut back) {
+        ok(some(count)) => count,
+        ok(none) => 0usize,
+        err(_) => 0usize,
+    }
+    gone := match store.contains("gone") {
+        ok(found) => !found,
+        err(_) => false,
+    }
+    counted := read_u32(store.get_u32("boots"))
+    say_number("boots counted in the store: ", counted as u64)
+    kept := length == 5 && back[0] == 1 && back[4] == 5 && gone && counted == boots
+    kept = kept && stored(store.set_u32("boots", boots + 1))
+    close_store(flash, store)
+    return kept
+}
+
+// Erase what the test wrote, and check it reads erased.
+fn clean_flash(flash: &mut esp_flash.Flash) -> bool {
+    capacity := flash.capacity()
+    start := capacity - STORE_BYTES - TEST_BYTES
+    region := flash.region(start, STORE_BYTES + TEST_BYTES)!
+    clean := succeeded(region.erase(0, STORE_BYTES + TEST_BYTES))
+    offset := 0u32
+    unsafe {
+        for offset < STORE_BYTES + TEST_BYTES {
+            clean = clean && succeeded(region.read(offset, &mut BACK)) && all_erased(&BACK)
+            offset += 4096
+        }
+    }
+    flash.release(region)
+    return clean
+}
+
+// Announce a reset, so the host follows it, and give the USB serial port
+// time to send the line.
+fn announce_restart(timer: &mut chip.Timer) {
+    say("selftest restarting\n")
+    timer.delay_ms(50)
+}
+
+fn main() {
+    b := board.take()!
+    let board.Board { led: board_led, pins: board_pins, timer: board_timer, usb: board_usb, dma: board_dma, rng: board_rng, watchdog: board_watchdog, rtc: board_rtc, flash: board_flash } = b
+    pins := board_pins
+    timer := board_timer
+    usb := board_usb
+    rng := board_rng
+    watchdog := board_watchdog
+    flash := board_flash
+    serial := usb.serial()!
+    poke: [1]u8 = [0]
+    serial.read(&mut poke)!
+    serial.set_crlf(true)
+    unsafe {
+        SERIAL = some(serial)
+    }
+    say("selftest ready\n")
+
+    cause := unsafe {
+        mmio.read32(RESET_CAUSE) & 0x1F
+    }
+    word := watchdog.scratch(0)
+    phase := 0u32
+    if cause != CAUSE_USB && cause != CAUSE_POWER_UP && (word & PHASE_MASK) == PHASE_MAGIC {
+        phase = word & 0xFFFF
+    }
+    say_number("reset cause: ", cause as u64)
+    say_number("boot: ", phase as u64)
+    say("reset reason: ")
+    say(hal.reset_reason_name(watchdog.reset_reason()))
+    say("\n")
+    RTC.set(some(board_rtc))
+
+    if phase == 0 {
+        unsafe {
+            CHECKS = 0
+        }
+        check(watchdog.reset_reason() == hal.ResetReason.Other)
+        rng_checks(&mut rng, &mut pins, &mut timer)
+        watchdog_checks(&mut watchdog, &mut timer)
+        rtc_checks(&mut timer)
+        executor_checks(&mut timer)
+        flash_checks(&mut flash, &mut timer)
+        store_checks(&mut flash)
+        watchdog.set_scratch(0, PHASE_MAGIC | 1)
+        announce_restart(&mut timer)
+        watchdog.restart()
+    }
+    unsafe {
+        CHECKS = 21 + 2 * (phase - 1)
+    }
+    if phase == 1 {
+        guard := RTC.lock()
+        clock_kept := false
+        if let some(rtc) = guard.get_mut() {
+            shown := now_ms(rtc)
+            say_number("rtc after the restart, ms past new year: ", shown - NEW_YEAR_MS)
+            clock_kept = is_set(rtc) && shown > NEW_YEAR_MS + 1000 && shown < NEW_YEAR_MS + 30_000
+        }
+        core.drop(guard)
+        check(watchdog.reset_reason() == hal.ResetReason.Restart && watchdog.scratch(1) == KEEP && clock_kept)
+        check(store_survived(&mut flash, 1))
+        // Now let the watchdog time out.
+        watchdog.set_scratch(0, PHASE_MAGIC | 2)
+        announce_restart(&mut timer)
+        watchdog.start(100)!
+        for {}
+    }
+    if phase == 2 {
+        guard := RTC.lock()
+        clock_kept := false
+        if let some(rtc) = guard.get_mut() {
+            clock_kept = is_set(rtc) && now_ms(rtc) > NEW_YEAR_MS + 1000
+        }
+        core.drop(guard)
+        check(watchdog.reset_reason() == hal.ResetReason.Timeout && watchdog.scratch(1) == KEEP && clock_kept)
+        check(store_survived(&mut flash, 2))
+        // Now panic while the watchdog runs.
+        watchdog.set_scratch(0, PHASE_MAGIC | 3)
+        announce_restart(&mut timer)
+        watchdog.start(300)!
+        core.assert(phase == 0)
+    }
+    // The fourth boot: the panic ended in a watchdog reset. Clean up.
+    check(phase == 3 && watchdog.reset_reason() == hal.ResetReason.Timeout && watchdog.scratch(1) == KEEP)
+    clean := clean_flash(&mut flash)
+    watchdog.set_scratch(0, 0)
+    watchdog.set_scratch(1, 0)
+    guard := RTC.lock()
+    if let some(rtc) = guard.get_mut() {
+        rtc.unset()
+        clean = clean && !is_set(rtc)
+    }
+    core.drop(guard)
+    check(clean && !watchdog.is_running())
+    say_number("selftest done ", 27)
+}

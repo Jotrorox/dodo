@@ -45,6 +45,9 @@ SECTIONS
         __data_end = .;
     } > RAM AT > FLASH
     __data_load = LOADADDR(.data);
+    /* For std/embedded/chip/esp_flash: the flash above the image is free. */
+    __flash_image_end = LOADADDR(.data) + SIZEOF(.data);
+    __flash_end = ORIGIN(FLASH) + LENGTH(FLASH);
 
     .bss (NOLOAD) : ALIGN(4)
     {
@@ -83,13 +86,18 @@ PROVIDE(esp_rom_spiflash_write = 0x4000014c);
 PROVIDE(esp_rom_spiflash_read = 0x40000150);
 PROVIDE(esp_rom_spiflash_unlock = 0x40000154);
 PROVIDE(esp_rom_spiflash_config_clk = 0x40000178);
+PROVIDE(esp_rom_spiflash_read_status = 0x40000180);
 PROVIDE(esp_rom_spiflash_config_readmode = 0x4000017c);
 PROVIDE(spi_common_set_dummy_output = 0x40000190);
 PROVIDE(spi_dummy_len_fix = 0x400001d0);
 PROVIDE(Cache_Suspend_ICache = 0x40000698);
 PROVIDE(Cache_Resume_ICache = 0x4000069c);
 PROVIDE(Cache_Invalidate_ICache_All = 0x4000064c);
+PROVIDE(Cache_Invalidate_Addr = 0x40000648);
 PROVIDE(rom_i2c_readReg = 0x400012bc);
 PROVIDE(rom_i2c_readReg_Mask = 0x400012c8);
 PROVIDE(rom_i2c_writeReg = 0x400012c4);
 PROVIDE(rom_i2c_writeReg_Mask = 0x400012cc);
+
+/* Boot ROM data: a pointer to the ROM's flash chip record. */
+PROVIDE(rom_spiflash_legacy_data = 0x4087ffec);

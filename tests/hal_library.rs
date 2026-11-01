@@ -733,3 +733,25 @@ fn field_values_that_do_not_fit_trap() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn espressif_system_drivers_execute_against_simulated_registers() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let scratch = Scratch::new("esp-system");
+    let source = root.join("tests/stdlib/esp_system_checks.dodo");
+    for optimization in ["0", "3"] {
+        let executable = scratch.0.join(format!(
+            "esp-system-O{optimization}{}",
+            std::env::consts::EXE_SUFFIX
+        ));
+        let args = ["build", source.to_str().unwrap(), "-O", optimization, "-o"];
+        success(
+            &dodo(&args, &executable),
+            "compile Espressif system fixture",
+        );
+        success(
+            &Command::new(&executable).output().unwrap(),
+            "execute Espressif system fixture",
+        );
+    }
+}

@@ -12,7 +12,12 @@ Requires ld.lld. Usage:
                                     [--project DIR]
 
 `--project` runs another firmware project that follows the same protocol;
-its checks are then named by number only. The script holds an exclusive
+its checks are then named by number only. `--follow-resets` lets such a
+project reset the chip on purpose, to check what survives a reset: after it
+prints `selftest restarting`, the script waits for the USB serial port to
+disappear and come back, sends another byte, and keeps reading, until
+`selftest done N`. A panic report after `selftest restarting` is then
+expected too; only one in the last part fails the run. The script holds an exclusive
 lock on the board (DODO_ESP32C6_LOCK, default /tmp/dodo-esp32c6.lock) from
 flashing until the result is read, so several runs, from several checkouts,
 take turns instead of flashing over each other.
@@ -131,16 +136,99 @@ def find_port():
     return None
 
 
-def run(dodo, optimization, port, project=SELFTEST):
+def run(dodo, optimization, port, project=SELFTEST, follow=False):
     lock = open(os.environ.get("DODO_ESP32C6_LOCK", "/tmp/dodo-esp32c6.lock"), "w")
     try:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        return run_locked(dodo, optimization, port, project)
+        return run_locked(dodo, optimization, port, project, follow)
     finally:
         lock.close()
 
 
-def run_locked(dodo, optimization, port, project):
+def current_boot(output):
+    """The output since the last `selftest restarting`, and whether the chip
+    announced one."""
+    marker = output.rfind(b"selftest restarting")
+    if marker < 0:
+        return output, False
+    return output[marker:], True
+
+
+def unexpected_panic(output, follow):
+    """A panic report that ends the run: any, or when following resets, one
+    after the last boot's `selftest ready`, as a panic right after
+    `selftest restarting` is announced."""
+    if not follow:
+        return b"dodo: " in output
+    boot, restarting = current_boot(output)
+    if not restarting:
+        return b"dodo: " in boot
+    ready = boot.find(b"selftest ready")
+    return ready >= 0 and b"dodo: " in boot[ready:]
+
+
+def read_part(fd, follow):
+    """Read the output until `selftest done`, a panic report, or, when
+    following resets, the port going away after `selftest restarting`. A
+    reset that keeps the port, as a watchdog reset does, needs no new port:
+    another byte goes to the new boot. Returns the output and whether the
+    port went away for a restart."""
+    output = b""
+    deadline = time.time() + 30
+    last_poke = 0.0
+    while True:
+        boot, restarting = current_boot(output) if follow else (output, False)
+        if b"selftest done" in boot or unexpected_panic(output, follow):
+            break
+        if time.time() > deadline:
+            break
+        if b"selftest ready" not in boot and time.time() - last_poke > 0.5:
+            try:
+                os.write(fd, b"s")
+            except OSError:
+                if restarting:
+                    return output, True
+                raise
+            last_poke = time.time()
+        ready, _, _ = select.select([fd], [], [], 0.2)
+        if ready:
+            try:
+                data = os.read(fd, 4096)
+            except BlockingIOError:
+                continue
+            except OSError:
+                if restarting:
+                    return output, True
+                raise
+            if not data and restarting:
+                return output, True
+            if follow and b"selftest restarting" in data:
+                deadline = time.time() + 30
+            output += data
+    # A panic report ends with its location; collect the rest of it.
+    end = time.time() + 0.5
+    while time.time() < end:
+        ready, _, _ = select.select([fd], [], [], 0.1)
+        if ready:
+            try:
+                output += os.read(fd, 4096)
+            except OSError:
+                break
+    return output, False
+
+
+def open_retrying(port, seconds):
+    deadline = time.time() + seconds
+    while True:
+        try:
+            return open_port(port)
+        except OSError:
+            if time.time() > deadline:
+                raise
+            time.sleep(0.2)
+
+
+def run_locked(dodo, optimization, port, project, follow=False):
     env = dict(os.environ)
     if port:
         env["DODO_SERIAL_PORT"] = port
@@ -151,44 +239,24 @@ def run_locked(dodo, optimization, port, project):
     port = port or find_port()
     if not port:
         sys.exit("no ESP32-C6 USB serial port found after flashing")
-    deadline = time.time() + 10
-    fd = None
-    while fd is None:
-        try:
-            fd = open_port(port)
-        except OSError:
-            if time.time() > deadline:
-                raise
-            time.sleep(0.2)
-    output = b""
+    parts = []
+    # The self-test waits for a byte before it starts printing.
+    fd = open_retrying(port, 10)
     try:
-        # The self-test waits for a byte before it starts printing.
-        deadline = time.time() + 30
-        last_poke = 0.0
-        while b"selftest done" not in output and b"dodo: " not in output:
-            if time.time() > deadline:
+        while True:
+            output, restarted = read_part(fd, follow)
+            parts.append(output.decode("utf-8", "replace"))
+            if not restarted or len(parts) > 8:
                 break
-            if b"selftest ready" not in output and time.time() - last_poke > 0.5:
-                os.write(fd, b"s")
-                last_poke = time.time()
-            ready, _, _ = select.select([fd], [], [], 0.2)
-            if ready:
-                try:
-                    output += os.read(fd, 4096)
-                except BlockingIOError:
-                    pass
-        # A panic report ends with its location; collect the rest of it.
-        end = time.time() + 0.5
-        while time.time() < end:
-            ready, _, _ = select.select([fd], [], [], 0.1)
-            if ready:
-                try:
-                    output += os.read(fd, 4096)
-                except BlockingIOError:
-                    pass
+            os.close(fd)
+            fd = None
+            # The port disappears while the chip resets; wait for it again.
+            time.sleep(0.5)
+            fd = open_retrying(port or find_port(), 15)
     finally:
-        os.close(fd)
-    return output.decode("utf-8", "replace")
+        if fd is not None:
+            os.close(fd)
+    return parts
 
 
 def main():
@@ -198,12 +266,15 @@ def main():
     parser.add_argument("--port", help="the board's serial port (default: found by USB ID)")
     parser.add_argument("--project", type=Path, default=SELFTEST,
                         help="the firmware project to run (default: the self-test)")
+    parser.add_argument("--follow-resets", action="store_true",
+                        help="keep reading across resets the project announces with `selftest restarting`")
     args = parser.parse_args()
     failed = False
     for level in args.levels or [""]:
         label = f"-O {level}" if level else "default optimization"
         print(f"== ESP32-C6-DevKitC-1 self-test, {label}")
-        text = run(args.dodo, level, args.port, args.project.resolve())
+        parts = run(args.dodo, level, args.port, args.project.resolve(), args.follow_resets)
+        text = "".join(parts)
         names = CHECK_NAMES if args.project.resolve() == SELFTEST else []
         results = {}
         for match in re.finditer(r"check (\d+) (ok|FAILED)", text):
@@ -218,7 +289,12 @@ def main():
             if line and not re.match(r"check \d+ |selftest |dodo: ", line):
                 print(f"     {line}")
         done = re.search(r"selftest done (\d+)", text)
-        panic = re.search(r"dodo: .*", text)
+        last = parts[-1]
+        if args.follow_resets:
+            # Only a panic after the last boot's `selftest ready` counts.
+            boot = last[last.rfind("selftest restarting") + 1:] if "selftest restarting" in last else last
+            last = boot[boot.find("selftest ready"):] if "selftest ready" in boot else ""
+        panic = re.search(r"dodo: .*", last)
         if panic:
             print(f"  panicked: {panic.group(0).strip()}")
             failed = True
