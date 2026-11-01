@@ -1,0 +1,207 @@
+package power
+
+import "std/embedded/hal"
+
+// Low power for firmware: what a core does while it waits, which clocks run,
+// and stopping the chip entirely until a pin wakes it. Every chip package
+// implements the `Power` protocol below, a board hands it out as
+// `Board.power`, and `std/embedded/hal/fake.Power` implements it on a
+// desktop, so power-aware code is written and tested once. Like
+// std/embedded/hal, nothing here allocates or needs a particular chip.
+//
+// Three levels, from the lightest to the deepest:
+//
+// 1. Sleep. The core stops until an interrupt is pending; every clock keeps
+//    running, so peripherals, DMA, and the other core carry on. This is
+//    what `cpu.wait_for_interrupt()`, a timer alarm's `sleep_until`, and the
+//    std/embedded/executor do whenever they wait.
+// 2. Deep sleep. Waiting also stops every clock that is not in the chip's
+//    sleep set, which the program chooses with `set_sleep_clocks`. An
+//    interrupt from a peripheral whose clock still runs, such as a timer
+//    alarm, wakes the core, and the stopped clocks start again before it
+//    runs. `set_mode(Mode.DeepSleep)` makes every later wait a deep sleep,
+//    so an executor deep-sleeps between tasks without being changed:
+//
+//        b.power.set_sleep_clocks(chip.ALARM_CLOCKS)
+//        b.power.set_mode(power.Mode.DeepSleep)
+//        executor.run(&mut tasks, &mut alarm)
+//
+//    On a chip with two cores, the clocks stop only while both cores
+//    deep-sleep, and the mode belongs to the core that sets it.
+// 3. Dormant. `dormant(&wake)` stops every oscillator, so nothing is
+//    clocked and the chip draws the least it can while keeping its memory,
+//    until one of the pin events in `wake` happens. The chip then restarts
+//    its clocks as they were and `dormant` returns the pins that woke it.
+//    Time does not pass for the chip's timers while it is dormant.
+//
+// Clock gating. Apart from sleeping, a chip stops the clocks of peripherals
+// that nothing uses. Clocks are a `Clocks` set of up to 64 gates; the chip
+// package names them, such as rp2040.CLOCK_UART0, and they combine with `|`.
+// `disable_unused_clocks` stops those of every peripheral the chip manages
+// and nothing has claimed, and claiming a peripheral later starts them
+// again, so it is safe to call once at start-up. `disable_clocks` stops
+// others, refusing the clocks the program cannot run without (InvalidInput)
+// and those of a claimed peripheral (Busy). Release a peripheral first;
+// `enable_clocks` starts clocks again.
+//
+// What runs while the program runs and what runs while it deep-sleeps are
+// separate sets: a clock disabled while awake stays stopped in deep sleep,
+// and one missing from the sleep set still runs once the core wakes.
+
+// What a core does when it waits for an interrupt.
+pub enum Mode {
+    // Only the core stops; every clock keeps running. The mode at reset.
+    Sleep,
+    // The clocks outside the sleep set stop too, until the core wakes.
+    DeepSleep
+}
+
+// A set of clock gates, one bit each, named by the chip package.
+pub type Clocks = u64
+
+// The empty set.
+pub const NO_CLOCKS: Clocks = 0
+
+// Pin events that end a dormant state, for `Wake.on`: the pin is low or
+// high, or it fell or rose. The RP2040 and RP2350 number their pin events
+// for `Pin.listen` the same way.
+pub const LEVEL_LOW: u32 = 1 << 0
+pub const LEVEL_HIGH: u32 = 1 << 1
+pub const FALLING_EDGE: u32 = 1 << 2
+pub const RISING_EDGE: u32 = 1 << 3
+const ALL_EVENTS: u32 = 0xF
+
+// The pins a `Wake` can name, 0 to MAX_PINS - 1. Chips with fewer refuse
+// the others in `dormant`.
+pub const MAX_PINS: u32 = 64
+
+// The pin events that end a dormant state:
+//
+//     wake := power.Wake.new()
+//     wake.on(BUTTON_PIN, power.FALLING_EDGE)
+//     woken := b.power.dormant(&wake)!
+//
+// Claim each pin as an input first, with the pull it needs, so its level is
+// defined while the chip is dormant.
+pub struct Wake {
+    events: [64]u8
+
+    // No pins yet.
+    pub fn new() -> Wake {
+        return Wake { events: [0u8; 64] }
+    }
+
+    // Also wake on `events` of `pin`, a combination of LEVEL_LOW,
+    // LEVEL_HIGH, FALLING_EDGE, and RISING_EDGE. Traps if the pin is
+    // MAX_PINS or more, or `events` is empty or names something else.
+    pub fn on(&mut self, pin: u32, events: u32) {
+        core.assert(pin < MAX_PINS)
+        core.assert(events != 0 && (events & ~ALL_EVENTS) == 0)
+        index := pin as usize
+        self.events[index] = self.events[index] | events as u8
+    }
+
+    // Stop waking on any event of `pin`.
+    pub fn forget(&mut self, pin: u32) {
+        core.assert(pin < MAX_PINS)
+        self.events[pin as usize] = 0
+    }
+
+    // The events of `pin` that wake, 0 for none.
+    pub fn events(&self, pin: u32) -> u32 {
+        if pin >= MAX_PINS {
+            return 0
+        }
+        return self.events[pin as usize] as u32
+    }
+
+    // The pins with events, bit n for pin n.
+    pub fn pins(&self) -> u64 {
+        pins := 0u64
+        for index in 0usize..64 {
+            if self.events[index] != 0 {
+                pins |= 1u64 << index as u64
+            }
+        }
+        return pins
+    }
+
+    pub fn is_empty(&self) -> bool {
+        return self.pins() == 0
+    }
+}
+
+// A chip's low-power controls. Chip packages implement it, boards hand it
+// out as `Board.power`, and std/embedded/hal/fake.Power implements it for
+// tests. See the package comment.
+pub interface Power {
+    // What waiting for an interrupt does on the calling core.
+    fn mode(&self) -> Mode
+    // Make every later wait on the calling core, by `sleep`,
+    // `cpu.wait_for_interrupt`, an alarm, or an executor, sleep this deeply.
+    fn set_mode(&mut self, mode: Mode)
+    // Wait once for an interrupt in the current mode. To wait for something
+    // an interrupt handler records, check it inside a `hal.Critical`
+    // section and sleep there: an interrupt that becomes pending in between
+    // still ends the sleep, and its handler runs once the section ends.
+    fn sleep(&mut self)
+
+    // The clocks that run while the program runs.
+    fn enabled_clocks(&self) -> Clocks
+    // Start `clocks` again. Bits the chip does not have are ignored.
+    fn enable_clocks(&mut self, clocks: Clocks)
+    // Stop `clocks` while the program runs. InvalidInput if the chip lacks
+    // one or the program cannot run without it, Busy if a claimed
+    // peripheral uses one; nothing changes then.
+    fn disable_clocks(&mut self, clocks: Clocks) -> void!hal.Error
+    // Stop the clocks of every peripheral the chip manages that nothing has
+    // claimed, and return them. Claiming one starts its clocks again.
+    fn disable_unused_clocks(&mut self) -> Clocks
+
+    // The clocks that keep running while the cores deep-sleep.
+    fn sleep_clocks(&self) -> Clocks
+    // Keep only `clocks` running while the cores deep-sleep. Include the
+    // clocks of whatever should wake the core, such as the chip's
+    // ALARM_CLOCKS for a timer alarm. Bits the chip does not have are
+    // ignored.
+    fn set_sleep_clocks(&mut self, clocks: Clocks)
+
+    // Stop every oscillator until one of `wake`'s events, then restart the
+    // clocks and return the pins whose events woke the chip, bit n for pin
+    // n: none if a level ended before the chip was running again. An edge
+    // or level present already ends it at once. InvalidInput if `wake` is
+    // empty or names a pin the chip lacks, Busy if a running peripheral
+    // cannot be stopped, such as a USB connection, Unsupported if the chip
+    // has no dormant state.
+    fn dormant(&mut self, wake: &Wake) -> u64!hal.Error
+}
+
+// Deep-sleep once with only `keep` running, then restore the mode and sleep
+// set as they were: for a program that otherwise sleeps lightly.
+pub fn deep_sleep<P: Power>(power: &mut P, keep: Clocks) {
+    previous_mode := power.mode()
+    previous_clocks := power.sleep_clocks()
+    power.set_sleep_clocks(keep)
+    power.set_mode(Mode.DeepSleep)
+    power.sleep()
+    power.set_mode(previous_mode)
+    power.set_sleep_clocks(previous_clocks)
+}
+
+// Dormant until `pin` shows `events`: `dormant` with a one-pin Wake.
+pub fn dormant_until<P: Power>(power: &mut P, pin: u32, events: u32) -> u64!hal.Error {
+    wake := Wake.new()
+    wake.on(pin, events)
+    return power.dormant(&wake)
+}
+
+// How many gates `clocks` holds.
+pub fn count(clocks: Clocks) -> u32 {
+    remaining := clocks
+    total := 0u32
+    for remaining != 0 {
+        remaining &= remaining - 1
+        total += 1
+    }
+    return total
+}

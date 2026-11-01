@@ -75,6 +75,9 @@ pub struct Board {
     // data across restarts and reflashing, for example a
     // std/embedded/storage key-value store; see std/embedded/chip/rp_flash.
     pub flash: rp_flash.Flash
+    // Sleep modes, clock gating, and the dormant state, with the
+    // std/embedded/power protocol; see rp2350.Power.
+    pub power: rp2350.Power
 }
 
 // Start the chip with the Pico 2's crystal and claim the LED. A second call
@@ -82,8 +85,8 @@ pub struct Board {
 pub fn take() -> Board!hal.Error {
     chip := rp2350.take(rp2350.Config { crystal_hz: CRYSTAL_HZ })?
     led := chip.pins.output(LED_PIN)?
-    let rp2350.Peripherals { pins, timer, watchdog, usb, dma, core1, fifos, spinlocks, flash } = chip
-    return ok(Board { led, pins, timer, watchdog, usb: Usb { usb }, dma, core1, fifos, spinlocks, flash })
+    let rp2350.Peripherals { pins, timer, watchdog, usb, dma, core1, fifos, spinlocks, power, flash } = chip
+    return ok(Board { led, pins, timer, watchdog, usb: Usb { usb }, dma, core1, fifos, spinlocks, power, flash })
 }
 
 // The USB port, as `b.usb`.

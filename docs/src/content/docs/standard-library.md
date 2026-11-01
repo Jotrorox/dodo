@@ -149,13 +149,16 @@ ports use for transfers that run in the background, their second core,
 with the FIFOs and spinlocks the cores share, through
 `std/embedded/chip/rp_multicore`, their watchdog through
 `std/embedded/chip/rp_watchdog`, and the free flash above the program
-through `std/embedded/chip/rp_flash`. `std/embedded/storage` keeps a
-power-cut-safe key-value store on that flash, or on any device with the
+through `std/embedded/chip/rp_flash`. The clock gating and dormant state both
+chips share are in `std/embedded/chip/rp_power`. `std/embedded/storage` keeps
+a power-cut-safe key-value store on that flash, or on any device with the
 `hal.Flash` protocol.
 `std/embedded/cortex_m` enables, pends, and prioritizes interrupts and runs
 SysTick on any Cortex-M core. `std/embedded/executor` runs several firmware
 tasks on a core, waking each on time or on an interrupt and sleeping
-in between. `std/embedded/wireless/cyw43` drives the Pico 2 W's CYW43439 wireless chip
+in between. `std/embedded/power` is the low-power layer every chip implements:
+sleep and deep sleep modes, clock gating, and a dormant state that pins
+end. `std/embedded/wireless/cyw43` drives the Pico 2 W's CYW43439 wireless chip
 far enough for its LED; Wi-Fi and Bluetooth are not supported yet.
 [Compiler limits](implementation.md) and [container element restrictions](container-elements.md)
 remain relevant: check them when using references or Results as stored elements.
@@ -203,7 +206,7 @@ individual modules and links every public declaration back to its source.
 | [HTTP](http.md), [hosted HTTP/HTTPS](hosted-http.md) | `std/http`, `std/http/client`, `std/http/connection`, `std/http/hosted`, `std/http/https`, `std/http/server` | Protocol/polling portable; hosted/HTTPS explicit. |
 | [MQTT](mqtt.md) | `std/mqtt`, `std/mqtt/app`, `std/mqtt/broker`, `std/mqtt/hosted` | Packets/topics/handlers/test deliveries portable; app, broker, and client hosted. |
 | [Web serving](web.md) | `std/web`, `std/web/application`, `std/web/app`, `std/web/hosted`, `std/web/https`, `std/web/reactor`, `std/web/response`, `std/web/server`, `std/web/static_files`, `std/web/stream`, `std/web/testing` | Routing/registration/composition portable; app/hosted/HTTPS/reactor/static files explicit. |
-| [Hardware and embedded](hardware.md) | `std/embedded/hal`, `std/embedded/hal/fake`, `std/embedded/executor`, `std/embedded/storage`, `std/embedded/board`, `std/embedded/chip`, `std/embedded/peripheral/designware_i2c`, `std/embedded/peripheral/pl022`, `std/embedded/peripheral/pl011`, `std/embedded/wireless/cyw43`, `std/embedded/cortex_m` | `std/embedded/hal` and `std/embedded/executor` are portable, with interrupt masking on bare-metal Cortex-M and RISC-V. `std/embedded/cortex_m` (interrupt controller, SysTick, barriers) runs only on Cortex-M. `std/embedded/board` and `std/embedded/chip` resolve to the firmware build's board and chip packages, such as `std/embedded/board/pico2` and `std/embedded/chip/rp2350`. |
+| [Hardware and embedded](hardware.md) | `std/embedded/hal`, `std/embedded/hal/fake`, `std/embedded/executor`, `std/embedded/power`, `std/embedded/storage`, `std/embedded/board`, `std/embedded/chip`, `std/embedded/peripheral/designware_i2c`, `std/embedded/peripheral/pl022`, `std/embedded/peripheral/pl011`, `std/embedded/wireless/cyw43`, `std/embedded/cortex_m` | `std/embedded/hal`, `std/embedded/executor`, and `std/embedded/power` are portable, with interrupt masking on bare-metal Cortex-M and RISC-V. `std/embedded/cortex_m` (interrupt controller, SysTick, barriers) runs only on Cortex-M. `std/embedded/board` and `std/embedded/chip` resolve to the firmware build's board and chip packages, such as `std/embedded/board/pico2` and `std/embedded/chip/rp2350`. |
 
 ## Implementation and adapter packages
 

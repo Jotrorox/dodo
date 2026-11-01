@@ -100,6 +100,25 @@ fn executor_runs_tasks_against_the_simulated_clock() {
 }
 
 #[test]
+fn power_protocol_and_rp_clock_gating_execute_on_the_host() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let scratch = Scratch::new("power");
+    let source = root.join("tests/stdlib/power_checks.dodo");
+    for optimization in ["0", "3"] {
+        let executable = scratch.0.join(format!(
+            "power-O{optimization}{}",
+            std::env::consts::EXE_SUFFIX
+        ));
+        let args = ["build", source.to_str().unwrap(), "-O", optimization, "-o"];
+        success(&dodo(&args, &executable), "compile power fixture");
+        success(
+            &Command::new(&executable).output().unwrap(),
+            "execute power fixture",
+        );
+    }
+}
+
+#[test]
 fn core1_launch_and_shared_parts_execute_against_a_simulated_boot_rom() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let scratch = Scratch::new("multicore");
@@ -309,6 +328,35 @@ fn interrupt_control_lowers_to_each_architecture_mask() {
     );
     let text = fs::read_to_string(&assembly).unwrap();
     assert!(text.contains("wfi") && text.contains("dmb"), "{text}");
+
+    // Deep sleep and sleep-on-exit change the SCB's SCR at 0xE000ED10.
+    let scr = scratch.write(
+        "scr.dodo",
+        "package scr\nimport \"std/embedded/cortex_m\"\npub fn deeper() -> bool {\n cortex_m.set_deep_sleep(true)\n cortex_m.set_sleep_on_exit(false)\n return cortex_m.deep_sleep()\n}\n",
+    );
+    let assembly = scratch.0.join("scr.s");
+    success(
+        &dodo(
+            &[
+                "build",
+                scr.to_str().unwrap(),
+                "--emit",
+                "asm",
+                "--target",
+                "thumbv6m-none-eabi",
+                "-O",
+                "2",
+                "-o",
+            ],
+            &assembly,
+        ),
+        "emit SCR access",
+    );
+    let text = fs::read_to_string(&assembly).unwrap().to_lowercase();
+    assert!(
+        text.contains("3758157072") || text.contains("0xe000ed10"),
+        "{text}"
+    );
 
     // The core number: Cortex-M asks the chip runtime's dodo_core_id, if
     // there is one, and RISC-V reads mhartid.

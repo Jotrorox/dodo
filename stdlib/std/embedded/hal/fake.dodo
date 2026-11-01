@@ -3,6 +3,7 @@ package fake
 import "core/option"
 import "std/embedded/executor"
 import "std/embedded/hal"
+import "std/embedded/power"
 import "std/io"
 
 // In-memory devices implementing the `std/embedded/hal` protocols. They let
@@ -769,4 +770,160 @@ pub struct Flash {
 
 fn power_of_two(value: u32) -> bool {
     return value != 0 && (value & (value - 1)) == 0
+}
+
+// A chip's low-power controls in memory, implementing std/embedded/power's
+// protocol. Every clock starts running, awake and in deep sleep. The test
+// says which clocks the simulated program cannot run without, which ones
+// the simulated chip manages for peripherals, and which of those are
+// claimed, and the fake records the sleeps and dormant states the code
+// under test asks for. A dormant state ends on the pins given to
+// `wake_next_dormant`; one that nothing could end traps instead of
+// hanging the test.
+pub struct Power {
+    deep: bool
+    enabled: u64
+    sleeping: u64
+    essential: u64
+    managed: u64
+    claimed: u64
+    light_sleeps: u32
+    deep_sleeps: u32
+    dormant_states: u32
+    // The pins and events that end the next dormant state.
+    wake_pins: u64
+    // The events the last dormant state waited for, per pin.
+    requested: [64]u8
+
+    // Clocks 0 to 63 all exist. `essential` cannot be disabled, and
+    // `managed` belong to peripherals, which disable_unused_clocks stops
+    // unless claimed.
+    pub fn new(essential: power.Clocks, managed: power.Clocks) -> Power {
+        return Power {
+            deep: false,
+            enabled: 0xFFFF_FFFF_FFFF_FFFFu64,
+            sleeping: 0xFFFF_FFFF_FFFF_FFFFu64,
+            essential,
+            managed,
+            claimed: 0,
+            light_sleeps: 0,
+            deep_sleeps: 0,
+            dormant_states: 0,
+            wake_pins: 0,
+            requested: [0u8; 64],
+        }
+    }
+
+    // Claim a peripheral's clocks, as a chip does when the program takes
+    // the peripheral: they start and can no longer be disabled.
+    pub fn claim(&mut self, clocks: power.Clocks) {
+        self.claimed |= clocks
+        self.enabled |= clocks
+    }
+
+    // Give a peripheral's clocks back, as a chip does when the program
+    // releases the peripheral.
+    pub fn release(&mut self, clocks: power.Clocks) {
+        self.claimed &= ~clocks
+    }
+
+    pub fn claimed(&self) -> power.Clocks {
+        return self.claimed
+    }
+
+    // End the next dormant state as if `pins` (bit n for pin n) changed;
+    // only those the dormant state waits for wake it.
+    pub fn wake_next_dormant(&mut self, pins: u64) {
+        self.wake_pins = pins
+    }
+
+    // Waits in each mode, and dormant states, so far.
+    pub fn light_sleeps(&self) -> u32 {
+        return self.light_sleeps
+    }
+
+    pub fn deep_sleeps(&self) -> u32 {
+        return self.deep_sleeps
+    }
+
+    pub fn dormant_states(&self) -> u32 {
+        return self.dormant_states
+    }
+
+    // The events of `pin` the last dormant state waited for.
+    pub fn requested_events(&self, pin: u32) -> u32 {
+        if pin >= power.MAX_PINS {
+            return 0
+        }
+        return self.requested[pin as usize] as u32
+    }
+
+    pub fn mode(&self) -> power.Mode {
+        if self.deep {
+            return power.Mode.DeepSleep
+        }
+        return power.Mode.Sleep
+    }
+
+    pub fn set_mode(&mut self, mode: power.Mode) {
+        self.deep = mode == power.Mode.DeepSleep
+    }
+
+    // Returns at once, as if an interrupt were pending, and counts the wait.
+    pub fn sleep(&mut self) {
+        if self.deep {
+            self.deep_sleeps += 1
+        } else {
+            self.light_sleeps += 1
+        }
+    }
+
+    pub fn enabled_clocks(&self) -> power.Clocks {
+        return self.enabled
+    }
+
+    pub fn enable_clocks(&mut self, clocks: power.Clocks) {
+        self.enabled |= clocks
+    }
+
+    pub fn disable_clocks(&mut self, clocks: power.Clocks) -> void!hal.Error {
+        if (clocks & self.essential) != 0 {
+            return err(hal.Error.InvalidInput)
+        }
+        if (clocks & self.claimed) != 0 {
+            return err(hal.Error.Busy)
+        }
+        self.enabled &= ~clocks
+        return ok()
+    }
+
+    pub fn disable_unused_clocks(&mut self) -> power.Clocks {
+        unused := self.managed & ~self.claimed & self.enabled
+        self.enabled &= ~unused
+        return unused
+    }
+
+    pub fn sleep_clocks(&self) -> power.Clocks {
+        return self.sleeping
+    }
+
+    pub fn set_sleep_clocks(&mut self, clocks: power.Clocks) {
+        self.sleeping = clocks
+    }
+
+    pub fn dormant(&mut self, wake: &power.Wake) -> u64!hal.Error {
+        waiting := wake.pins()
+        if waiting == 0 {
+            return err(hal.Error.InvalidInput)
+        }
+        for index in 0u32..64 {
+            self.requested[index as usize] = wake.events(index) as u8
+        }
+        woken := waiting & self.wake_pins
+        // Nothing would ever end this dormant state.
+        core.assert(woken != 0)
+        self.wake_pins = 0
+        self.dormant_states += 1
+        return ok(woken)
+    }
 }
