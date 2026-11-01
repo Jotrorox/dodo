@@ -3,32 +3,221 @@ package lua
 import "core/mem"
 import "core/ptr"
 
-// String objects. (Skeleton: no interning yet; the runtime agent replaces the
-// bodies, keeping the signatures, and interns strings up to SHORTSTR_MAX.)
+// String objects.
+//
+// Short strings (at most SHORTSTR_MAX bytes) are interned in a chained hash
+// table owned by the global state, so two equal short strings are the same
+// object and compare by pointer. Long strings are created fresh each time;
+// their hash is computed lazily (only when used as a table key).
+//
+// The hash is seeded per universe, so table iteration order over string keys
+// is not predictable across runs (as in the reference implementation).
+
+const STRT_MIN_SIZE: i32 = 128
+
+fn str_hash(data: *mut u8, length: usize, seed: u32) -> u32 {
+    unsafe {
+        h := seed ^ core.wrapping_mul((length & 0xFFFFFFFF) as u32, 0x9E3779B1u32)
+        for i in 0usize..length {
+            let b = *ptr.offset(data, i as isize) as u32
+            h = core.wrapping_mul(h ^ b, 16777619u32)
+        }
+        // Final avalanche.
+        h = h ^ (h >> 15)
+        h = core.wrapping_mul(h, 0x2C1B3C6Du32)
+        h = h ^ (h >> 12)
+        return h
+    }
+}
+
+// Hash of any string (computing and caching it for long strings).
+fn str_hash_of(s: *mut LString) -> u32 {
+    unsafe {
+        if (*s).tag == TAG_LONGSTR && (*s).extra == 0 {
+            (*s).hash = str_hash(str_data(s), (*s).length, 0x5bd1e995u32)
+            (*s).extra = 1
+        }
+        return (*s).hash
+    }
+}
+
+fn str_object_size(length: usize) -> usize {
+    unsafe {
+        return mem.size_of::<LString>() + length + 1
+    }
+}
+
+fn str_table_init(L: *mut State) -> void!Throw {
+    unsafe {
+        let g = G(L)
+        let n = STRT_MIN_SIZE as usize
+        let arr = mem_alloc(L, n * 8)? as *mut *mut LString
+        for i in 0usize..n {
+            *ptr.offset(arr, i as isize) = 0 as *mut LString
+        }
+        (*g).strt_hash = arr
+        (*g).strt_size = STRT_MIN_SIZE
+        (*g).strt_nuse = 0
+        return ok()
+    }
+}
+
+fn str_table_free(L: *mut State) {
+    unsafe {
+        let g = G(L)
+        if !ptr.is_null((*g).strt_hash) {
+            mem_free(L, (*g).strt_hash as *mut u8, ((*g).strt_size as usize) * 8)
+            (*g).strt_hash = 0 as *mut *mut LString
+            (*g).strt_size = 0
+        }
+    }
+}
+
+// Rehash the intern table into `newsize` buckets (a power of two).
+fn str_table_resize(L: *mut State, newsize: i32) {
+    unsafe {
+        let g = G(L)
+        let arr = match mem_alloc(L, (newsize as usize) * 8) {
+            ok(p) => p as *mut *mut LString,
+            err(_) => {
+                return
+            },
+        }
+        for i in 0i32..newsize {
+            *ptr.offset(arr, i as isize) = 0 as *mut LString
+        }
+        let mask = (newsize - 1) as u32
+        let old = (*g).strt_hash
+        let oldsize = (*g).strt_size
+        for i in 0i32..oldsize {
+            s := *ptr.offset(old, i as isize)
+            for !ptr.is_null(s) {
+                let nxt = (*s).hnext
+                let slot = ptr.offset(arr, ((*s).hash & mask) as isize)
+                (*s).hnext = *slot
+                *slot = s
+                s = nxt
+            }
+        }
+        mem_free(L, old as *mut u8, (oldsize as usize) * 8)
+        (*g).strt_hash = arr
+        (*g).strt_size = newsize
+    }
+}
+
+// Shrink the intern table when it is mostly empty (called by the collector).
+fn str_table_check_size(L: *mut State) {
+    unsafe {
+        let g = G(L)
+        if (*g).strt_nuse < (*g).strt_size / 4 && (*g).strt_size > STRT_MIN_SIZE {
+            str_table_resize(L, (*g).strt_size / 2)
+        }
+    }
+}
+
+// Unlink a short string from the intern table (it is being freed).
+fn str_remove(L: *mut State, s: *mut LString) {
+    unsafe {
+        let g = G(L)
+        let mask = ((*g).strt_size - 1) as u32
+        p := ptr.offset((*g).strt_hash, ((*s).hash & mask) as isize)
+        for !ptr.is_null(*p) {
+            if *p == s {
+                *p = (*s).hnext
+                (*g).strt_nuse = (*g).strt_nuse - 1
+                return
+            }
+            p = ptr.offset(*p as *mut u8, mem.offset_of::<LString>("hnext") as isize) as *mut *mut LString
+        }
+    }
+}
+
+fn str_alloc(L: *mut State, length: usize, tag: u8, hash: u32) -> (*mut LString)!Throw {
+    unsafe {
+        let o = gc_new(L, str_object_size(length), tag)?
+        let s = o as *mut LString
+        (*s).extra = 0
+        (*s).hash = hash
+        (*s).length = length
+        (*s).hnext = 0 as *mut LString
+        *ptr.offset(str_data(s), length as isize) = 0
+        return ok(s)
+    }
+}
+
+fn str_intern(L: *mut State, bytes: *const u8, length: usize) -> (*mut LString)!Throw {
+    unsafe {
+        let g = G(L)
+        let data = bytes as *mut u8
+        let h = str_hash(data, length, (*g).seed)
+        mask := ((*g).strt_size - 1) as u32
+        s := *ptr.offset((*g).strt_hash, (h & mask) as isize)
+        for !ptr.is_null(s) {
+            if (*s).length == length && (*s).hash == h && mem_equal(str_data(s), data, length) {
+                // A string found dead by an ongoing sweep comes back to life.
+                if gc_is_dead(g, s as *mut GCObject) {
+                    gc_change_white(s as *mut GCObject)
+                }
+                return ok(s)
+            }
+            s = (*s).hnext
+        }
+        if (*g).strt_nuse >= (*g).strt_size {
+            str_table_resize(L, (*g).strt_size * 2)
+            mask = ((*g).strt_size - 1) as u32
+        }
+        let ns = str_alloc(L, length, TAG_SHORTSTR, h)?
+        ptr.copy(data, str_data(ns), length)
+        let slot = ptr.offset((*g).strt_hash, (h & mask) as isize)
+        (*ns).hnext = *slot
+        *slot = ns
+        (*g).strt_nuse = (*g).strt_nuse + 1
+        return ok(ns)
+    }
+}
+
+fn mem_equal(a: *mut u8, b: *mut u8, n: usize) -> bool {
+    unsafe {
+        for i in 0usize..n {
+            if *ptr.offset(a, i as isize) != *ptr.offset(b, i as isize) {
+                return false
+            }
+        }
+        return true
+    }
+}
+
+// A long string with `length` uninitialized bytes, to be filled by the caller
+// before it becomes visible.
+fn str_new_long(L: *mut State, length: usize) -> (*mut LString)!Throw {
+    unsafe {
+        return str_alloc(L, length, TAG_LONGSTR, 0)
+    }
+}
 
 // Create (or find, for short strings) the string with these bytes.
 fn str_new(L: *mut State, bytes: *const u8, len: usize) -> (*mut LString)!Throw {
     unsafe {
-        let size = mem.size_of::<LString>() + len + 1
-        let block = mem_alloc(L, size)?
-        let s = block as *mut LString
-        (*s).next = 0 as *mut GCObject
-        (*s).tag = if len <= SHORTSTR_MAX { TAG_SHORTSTR } else { TAG_LONGSTR }
-        (*s).marked = 0
-        (*s).extra = 0
-        (*s).hash = 0
-        (*s).length = len
-        (*s).hnext = 0 as *mut LString
-        let data = str_data(s)
-        ptr.copy_nonoverlapping(bytes, data, len)
-        *ptr.offset(data, len as isize) = 0
+        if len <= SHORTSTR_MAX {
+            return str_intern(L, bytes, len)
+        }
+        let s = str_new_long(L, len)?
+        ptr.copy(bytes as *mut u8, str_data(s), len)
         return ok(s)
     }
 }
 
 fn str_from(L: *mut State, text: &str) -> (*mut LString)!Throw {
-    let bytes = mem.str_bytes(text)
-    return str_new(L, ptr.as_ptr(bytes), bytes.len)
+    unsafe {
+        let bytes = mem.str_bytes(text)
+        return str_new(L, ptr.as_ptr(bytes), bytes.len)
+    }
+}
+
+fn str_from_bytes(L: *mut State, bytes: &[u8]) -> (*mut LString)!Throw {
+    unsafe {
+        return str_new(L, ptr.as_ptr(bytes), bytes.len)
+    }
 }
 
 // Byte-wise equality (works for both short and long strings).
@@ -37,14 +226,60 @@ fn str_equal(a: *mut LString, b: *mut LString) -> bool {
         if a == b {
             return true
         }
+        if (*a).tag == TAG_SHORTSTR && (*b).tag == TAG_SHORTSTR {
+            return false
+        }
         let n = (*a).length
         if n != (*b).length {
             return false
         }
+        return mem_equal(str_data(a), str_data(b), n)
+    }
+}
+
+// memcmp-style three-way comparison of two strings (bytewise, like strcoll
+// in the C locale; embedded zeros are handled).
+fn str_compare(a: *mut LString, b: *mut LString) -> i32 {
+    unsafe {
+        let la = (*a).length
+        let lb = (*b).length
+        let n = if la < lb {
+            la
+        } else {
+            lb
+        }
         let pa = str_data(a)
         let pb = str_data(b)
         for i in 0usize..n {
-            if *ptr.offset(pa, i as isize) != *ptr.offset(pb, i as isize) {
+            let x = *ptr.offset(pa, i as isize)
+            let y = *ptr.offset(pb, i as isize)
+            if x != y {
+                return if x < y {
+                    -1
+                } else {
+                    1
+                }
+            }
+        }
+        if la == lb {
+            return 0
+        }
+        return if la < lb {
+            -1
+        } else {
+            1
+        }
+    }
+}
+
+// Byte-wise equality of two slices.
+fn slice_eq(a: &[u8], b: &[u8]) -> bool {
+    unsafe {
+        if a.len != b.len {
+            return false
+        }
+        for i in 0usize..a.len {
+            if a[i] != b[i] {
                 return false
             }
         }

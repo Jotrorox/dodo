@@ -1,0 +1,949 @@
+package lua
+
+import "core/mem"
+import "core/ptr"
+
+// Debug information: line numbers, names of functions and variables (found
+// by symbolic execution of the bytecode, for error messages and tracebacks),
+// activation records for the debug API, and the hook machinery.
+
+// Hook masks and events (public values, see api.dodo).
+const HOOK_MASK_CALL: u8 = 1
+const HOOK_MASK_RET: u8 = 2
+const HOOK_MASK_LINE: u8 = 4
+const HOOK_MASK_COUNT: u8 = 8
+const HOOK_CALL: i32 = 0
+const HOOK_RET: i32 = 1
+const HOOK_LINE: i32 = 2
+const HOOK_COUNT: i32 = 3
+const HOOK_TAILCALL: i32 = 4
+
+// Line entries between absolute line anchors.
+const MAX_IWTH_ABS: i32 = 128
+const ABS_LINE_INFO: i8 = -128
+
+// Activation record filled by Cx.get_stack / Cx.get_info and passed to hooks.
+// Text fields are exposed through methods (they view strings owned by the
+// Lua state, valid while the described function is alive).
+pub struct Debug {
+    // Hook event (HOOK_* constants) when passed to a hook.
+    pub event: i32
+    // Current line of the function (-1 when unknown or native).
+    pub currentline: i32
+    pub linedefined: i32
+    pub lastlinedefined: i32
+    // Number of upvalues and fixed parameters.
+    pub nups: u8
+    pub nparams: u8
+    pub isvararg: bool
+    pub istailcall: bool
+    // Transfer information for call/return hooks ('r').
+    pub ftransfer: i32
+    pub ntransfer: i32
+    name_ptr: *const u8
+    name_len: usize
+    namewhat_ptr: *const u8
+    namewhat_len: usize
+    what_ptr: *const u8
+    what_len: usize
+    source_ptr: *const u8
+    source_len: usize
+    short_src: [64]u8
+    short_src_len: usize
+    ci: *mut CallInfo
+
+    // An empty record.
+    pub fn new() -> Debug {
+        unsafe {
+            return Debug { event: 0, currentline: -1, linedefined: -1, lastlinedefined: -1, nups: 0, nparams: 0, isvararg: false, istailcall: false, ftransfer: 0, ntransfer: 0, name_ptr: 0 as *const u8, name_len: 0, namewhat_ptr: 0 as *const u8, namewhat_len: 0, what_ptr: 0 as *const u8, what_len: 0, source_ptr: 0 as *const u8, source_len: 0, short_src: [0u8; 64], short_src_len: 0, ci: 0 as *mut CallInfo }
+        }
+    }
+
+    // Function name ('n'), if known.
+    pub fn name(&self) -> Option<&[u8]> {
+        if ptr.is_null(self.name_ptr) {
+            return none
+        }
+        unsafe {
+            return some(ptr.borrow_slice(self.name_ptr, self.name_len, self))
+        }
+    }
+    // How the name was found ('n'): "global", "local", "method", "field",
+    // "upvalue", "metamethod", "for iterator", "hook" or "".
+    pub fn namewhat(&self) -> &[u8] {
+        if ptr.is_null(self.namewhat_ptr) {
+            return b""
+        }
+        unsafe {
+            return ptr.borrow_slice(self.namewhat_ptr, self.namewhat_len, self)
+        }
+    }
+    // "Lua", "C" or "main" ('S').
+    pub fn what(&self) -> &[u8] {
+        if ptr.is_null(self.what_ptr) {
+            return b""
+        }
+        unsafe {
+            return ptr.borrow_slice(self.what_ptr, self.what_len, self)
+        }
+    }
+    // Chunk source ('S'), e.g. "@file.lua" or "=[C]".
+    pub fn source(&self) -> &[u8] {
+        if ptr.is_null(self.source_ptr) {
+            return b""
+        }
+        unsafe {
+            return ptr.borrow_slice(self.source_ptr, self.source_len, self)
+        }
+    }
+    // Printable source name ('S'), as used in messages.
+    pub fn short_src(&self) -> &[u8] {
+        return self.short_src[0..self.short_src_len]
+    }
+}
+
+fn dbg_set_name(ar: &mut Debug, p: *const u8, n: usize) {
+    unsafe {
+        ar.name_ptr = p
+        ar.name_len = n
+    }
+}
+fn dbg_set_static(s: &str, outp: &mut *const u8, outn: &mut usize) {
+    unsafe {
+        let b = mem.str_bytes(s)
+        *outp = ptr.as_ptr(b)
+        *outn = b.len
+    }
+}
+
+// --- Lines ------------------------------------------------------------------
+
+// Index of the instruction being executed by a Lua frame.
+fn dbg_current_pc(ci: *mut CallInfo) -> i32 {
+    unsafe {
+        let p = ci_proto(ci)
+        return ((((*ci).savedpc as isize) - ((*p).code as isize)) / 4) as i32 - 1
+    }
+}
+
+fn pc_rel(pc: *mut u32, p: *mut Proto) -> i32 {
+    unsafe {
+        unsafe {
+            return ((((pc as isize) - ((*p).code as isize)) / 4) as i32) - 1
+        }
+    }
+}
+
+// Line of instruction `pc` (-1 without line information).
+fn dbg_get_line(p: *mut Proto, pc: i32) -> i32 {
+    unsafe {
+        if ptr.is_null((*p).lineinfo) || (*p).sizelineinfo == 0 {
+            return -1
+        }
+        basepc := -1i32
+        line := (*p).linedefined
+        let n = (*p).sizeabslineinfo
+        if n > 0 && (*(*p).abslineinfo).pc <= pc {
+            // Last anchor at or before pc.
+            i := pc / MAX_IWTH_ABS - 1
+            if i < 0 {
+                i = 0
+            }
+            if i >= n {
+                i = n - 1
+            }
+            for i > 0 && (*ptr.offset((*p).abslineinfo, i as isize)).pc > pc {
+                i -= 1
+            }
+            for i + 1 < n && (*ptr.offset((*p).abslineinfo, (i + 1) as isize)).pc <= pc {
+                i += 1
+            }
+            let a = ptr.offset((*p).abslineinfo, i as isize)
+            basepc = (*a).pc
+            line = (*a).line
+        }
+        for basepc < pc {
+            basepc += 1
+            line += (*ptr.offset((*p).lineinfo, basepc as isize)) as i32
+        }
+        return line
+    }
+}
+
+fn dbg_current_line(ci: *mut CallInfo) -> i32 {
+    unsafe {
+        return dbg_get_line(ci_proto(ci), dbg_current_pc(ci))
+    }
+}
+
+// Whether instructions oldpc and newpc are on different lines.
+fn dbg_changed_line(p: *mut Proto, oldpc: i32, newpc: i32) -> bool {
+    unsafe {
+        if ptr.is_null((*p).lineinfo) {
+            return false
+        }
+        if newpc - oldpc < MAX_IWTH_ABS / 2 {
+            delta := 0i32
+            pc := oldpc
+            for {
+                pc += 1
+                let d = *ptr.offset((*p).lineinfo, pc as isize)
+                if d == ABS_LINE_INFO {
+                    break
+                }
+                delta += d as i32
+                if pc == newpc {
+                    return delta != 0
+                }
+            }
+        }
+        return dbg_get_line(p, oldpc) != dbg_get_line(p, newpc)
+    }
+}
+
+// Append "short_src:line: " for a Lua frame.
+fn dbg_add_where(L: *mut State, ci: *mut CallInfo, b: &mut SBuf) -> void!Throw {
+    unsafe {
+        let p = ci_proto(ci)
+        buf := [0u8; 64]
+        n := 0usize
+        if ptr.is_null((*p).source) {
+            buf[0] = b'?'
+            n = 1
+        } else {
+            n = chunk_id(str_data((*p).source), (*(*p).source).length, ptr.as_mut_ptr(&mut buf))
+        }
+        b.add_raw(ptr.as_ptr(&buf), n)?
+        b.add_char(b':')?
+        b.add_int(dbg_current_line(ci) as i64)?
+        b.add_str(": ")?
+        return ok()
+    }
+}
+
+// --- Symbolic execution -----------------------------------------------------
+
+// Whether opcode `op` writes register A.
+fn op_sets_a(op: u32) -> bool {
+    unsafe {
+        if op <= OP_LOADNIL || op == OP_GETUPVAL {
+            return true
+        }
+        if op >= OP_GETTABUP && op <= OP_GETFIELD {
+            return true
+        }
+        if op == OP_NEWTABLE || op == OP_SELF {
+            return true
+        }
+        if op >= OP_ADDI && op <= OP_SHR {
+            return true
+        }
+        if op >= OP_UNM && op <= OP_CONCAT {
+            return true
+        }
+        if op == OP_TESTSET || op == OP_CALL || op == OP_TAILCALL || op == OP_FORLOOP || op == OP_FORPREP {
+            return true
+        }
+        if op == OP_TFORLOOP || op == OP_CLOSURE || op == OP_VARARG || op == OP_VARARGPREP {
+            return true
+        }
+        return false
+    }
+}
+
+fn proto_code(p: *mut Proto, pc: i32) -> u32 {
+    unsafe {
+        unsafe {
+            return *ptr.offset((*p).code, pc as isize)
+        }
+    }
+}
+
+// Last instruction before `lastpc` that changed register `reg` (-1 if none
+// or if it may have been skipped by a jump).
+fn find_set_reg(p: *mut Proto, lastpc0: i32, reg: i32) -> i32 {
+    unsafe {
+        lastpc := lastpc0
+        let lop = op_code(proto_code(p, lastpc))
+        if lop == OP_MMBIN || lop == OP_MMBINI || lop == OP_MMBINK {
+            lastpc -= 1
+        }
+        setreg := -1i32
+        jmptarget := 0i32
+        for pc in 0i32..lastpc {
+            let i = proto_code(p, pc)
+            let op = op_code(i)
+            let a = arg_a(i)
+            change := false
+            if op == OP_LOADNIL {
+                change = a <= reg && reg <= a + arg_b(i)
+            } else if op == OP_TFORCALL {
+                change = reg >= a + 2
+            } else if op == OP_CALL || op == OP_TAILCALL {
+                change = reg >= a
+            } else if op == OP_JMP {
+                let dest = pc + 1 + arg_sj(i)
+                if dest <= lastpc && dest > jmptarget {
+                    jmptarget = dest
+                }
+            } else {
+                change = op_sets_a(op) && reg == a
+            }
+            if change {
+                setreg = if pc < jmptarget {
+                    -1i32
+                } else {
+                    pc
+                }
+            }
+        }
+        return setreg
+    }
+}
+
+// Result of a name search: kind ("local", "global", ...) and name bytes.
+struct NameInfo {
+    kind: *const u8
+    kind_len: usize
+    name: *const u8
+    name_len: usize
+}
+
+fn ni_new() -> NameInfo {
+    unsafe {
+        unsafe {
+            return NameInfo { kind: 0 as *const u8, kind_len: 0, name: 0 as *const u8, name_len: 0 }
+        }
+    }
+}
+fn ni_set_kind(ni: &mut NameInfo, s: &str) {
+    unsafe {
+        let b = mem.str_bytes(s)
+        ni.kind = ptr.as_ptr(b)
+        ni.kind_len = b.len
+    }
+}
+fn ni_set_name_static(ni: &mut NameInfo, s: &str) {
+    unsafe {
+        let b = mem.str_bytes(s)
+        ni.name = ptr.as_ptr(b)
+        ni.name_len = b.len
+    }
+}
+fn ni_set_name_lstr(ni: &mut NameInfo, s: *mut LString) {
+    unsafe {
+        ni.name = str_data(s) as *const u8
+        ni.name_len = (*s).length
+    }
+}
+fn ni_found(ni: &NameInfo) -> bool {
+    unsafe {
+        return !ptr.is_null(ni.kind)
+    }
+}
+fn ni_name_is(ni: &NameInfo, s: &str) -> bool {
+    unsafe {
+        let b = mem.str_bytes(s)
+        if ptr.is_null(ni.name) || ni.name_len != b.len {
+            return false
+        }
+        unsafe {
+            return mem_equal(ni.name as *mut u8, ptr.as_ptr(b) as *mut u8, b.len)
+        }
+    }
+}
+
+fn upval_name(p: *mut Proto, idx: i32) -> *mut LString {
+    unsafe {
+        if idx < 0 || idx >= (*p).sizeupvalues {
+            return 0 as *mut LString
+        }
+        return (*ptr.offset((*p).upvalues, idx as isize)).name
+    }
+}
+
+// Name of constant `idx` if it is a string ("?" otherwise).
+fn kname(p: *mut Proto, idx: i32, ni: &mut NameInfo) {
+    unsafe {
+        let kv = ptr.offset((*p).k, idx as isize)
+        if val_is_string(kv) {
+            ni_set_name_lstr(ni, val_str(kv))
+        } else {
+            ni_set_name_static(ni, "?")
+        }
+    }
+}
+
+// Name of the value in register `reg` when it is a constant string.
+fn rname(p: *mut Proto, pc: i32, reg: i32, ni: &mut NameInfo) {
+    unsafe {
+        sub := ni_new()
+        get_obj_name(p, pc, reg, &mut sub)
+        if ni_found(&sub) && sub.kind_len == 8 && ni_kind_is(&sub, "constant") {
+            ni.name = sub.name
+            ni.name_len = sub.name_len
+        } else {
+            ni_set_name_static(ni, "?")
+        }
+    }
+}
+
+fn ni_kind_is(ni: &NameInfo, s: &str) -> bool {
+    unsafe {
+        let b = mem.str_bytes(s)
+        if ptr.is_null(ni.kind) || ni.kind_len != b.len {
+            return false
+        }
+        unsafe {
+            return mem_equal(ni.kind as *mut u8, ptr.as_ptr(b) as *mut u8, b.len)
+        }
+    }
+}
+
+// Name of RK(C) of instruction i (constant or register).
+fn rkname(p: *mut Proto, pc: i32, i: u32, ni: &mut NameInfo) {
+    unsafe {
+        let c = arg_c(i)
+        if arg_k(i) {
+            kname(p, c, ni)
+        } else {
+            rname(p, pc, c, ni)
+        }
+    }
+}
+
+// "global" when the indexed table is the _ENV variable, else "field".
+fn is_env(p: *mut Proto, pc: i32, i: u32, isup: bool, ni: &mut NameInfo) {
+    unsafe {
+        let t = arg_b(i)
+        sub := ni_new()
+        if isup {
+            let n = upval_name(p, t)
+            if !ptr.is_null(n) {
+                ni_set_name_lstr(&mut sub, n)
+            }
+        } else {
+            get_obj_name(p, pc, t, &mut sub)
+            // Only a local or an upvalue can be the variable _ENV.
+            if !ni_kind_is(&sub, "local") && !ni_kind_is(&sub, "upvalue") {
+                sub.name = 0 as *const u8
+            }
+        }
+        if ni_name_is(&sub, "_ENV") {
+            ni_set_kind(ni, "global")
+        } else {
+            ni_set_kind(ni, "field")
+        }
+    }
+}
+
+// Describe the value in register `reg` at instruction `lastpc`.
+fn get_obj_name(p: *mut Proto, lastpc: i32, reg: i32, ni: &mut NameInfo) {
+    unsafe {
+        let lname = func_local_name(p, reg + 1, lastpc)
+        if !ptr.is_null(lname) {
+            ni_set_name_lstr(ni, lname)
+            ni_set_kind(ni, "local")
+            return
+        }
+        let pc = find_set_reg(p, lastpc, reg)
+        if pc == -1 {
+            return
+        }
+        let i = proto_code(p, pc)
+        let op = op_code(i)
+        if op == OP_MOVE {
+            let b = arg_b(i)
+            if b < arg_a(i) {
+                get_obj_name(p, pc, b, ni)
+            }
+        } else if op == OP_GETTABUP {
+            kname(p, arg_c(i), ni)
+            is_env(p, pc, i, true, ni)
+        } else if op == OP_GETTABLE {
+            rname(p, pc, arg_c(i), ni)
+            is_env(p, pc, i, false, ni)
+        } else if op == OP_GETI {
+            ni_set_name_static(ni, "integer index")
+            ni_set_kind(ni, "field")
+        } else if op == OP_GETFIELD {
+            kname(p, arg_c(i), ni)
+            is_env(p, pc, i, false, ni)
+        } else if op == OP_GETUPVAL {
+            let n = upval_name(p, arg_b(i))
+            if ptr.is_null(n) {
+                ni_set_name_static(ni, "?")
+            } else {
+                ni_set_name_lstr(ni, n)
+            }
+            ni_set_kind(ni, "upvalue")
+        } else if op == OP_LOADK || op == OP_LOADKX {
+            let b = if op == OP_LOADK {
+                arg_bx(i)
+            } else {
+                arg_ax(proto_code(p, pc + 1))
+            }
+            let kv = ptr.offset((*p).k, b as isize)
+            if val_is_string(kv) {
+                ni_set_name_lstr(ni, val_str(kv))
+                ni_set_kind(ni, "constant")
+            }
+        } else if op == OP_SELF {
+            rkname(p, pc, i, ni)
+            ni_set_kind(ni, "method")
+        }
+    }
+}
+
+// Describe the function called by the instruction at `pc`.
+fn func_name_from_code(L: *mut State, p: *mut Proto, pc: i32, ni: &mut NameInfo) {
+    unsafe {
+        let i = proto_code(p, pc)
+        let op = op_code(i)
+        tm := 0u32
+        if op == OP_CALL || op == OP_TAILCALL {
+            get_obj_name(p, pc, arg_a(i), ni)
+            return
+        }
+        if op == OP_TFORCALL {
+            ni_set_name_static(ni, "for iterator")
+            ni_set_kind(ni, "for iterator")
+            return
+        }
+        if op == OP_SELF || op == OP_GETTABUP || op == OP_GETTABLE || op == OP_GETI || op == OP_GETFIELD {
+            tm = TM_INDEX
+        } else if op == OP_SETTABUP || op == OP_SETTABLE || op == OP_SETI || op == OP_SETFIELD {
+            tm = TM_NEWINDEX
+        } else if op == OP_MMBIN || op == OP_MMBINI || op == OP_MMBINK {
+            tm = arg_c(i) as u32
+        } else if op == OP_UNM {
+            tm = TM_UNM
+        } else if op == OP_BNOT {
+            tm = TM_BNOT
+        } else if op == OP_LEN {
+            tm = TM_LEN
+        } else if op == OP_CONCAT {
+            tm = TM_CONCAT
+        } else if op == OP_EQ {
+            tm = TM_EQ
+        } else if op == OP_LT || op == OP_LTI || op == OP_GTI {
+            tm = TM_LT
+        } else if op == OP_LE || op == OP_LEI || op == OP_GEI {
+            tm = TM_LE
+        } else if op == OP_CLOSE || op == OP_RETURN {
+            tm = TM_CLOSE
+        } else {
+            return
+        }
+        let s = G_tmname(G(L), tm)
+        ni.name = ptr.offset(str_data(s), 2) as *const u8
+        ni.name_len = (*s).length - 2
+        ni_set_kind(ni, "metamethod")
+    }
+}
+
+// Describe the function being called by frame `ci` (the caller).
+fn func_name_from_call(L: *mut State, ci: *mut CallInfo, ni: &mut NameInfo) {
+    unsafe {
+        if ((*ci).callstatus & CIST_HOOKED) != 0 {
+            ni_set_name_static(ni, "?")
+            ni_set_kind(ni, "hook")
+            return
+        }
+        if ((*ci).callstatus & CIST_FIN) != 0 {
+            ni_set_name_static(ni, "__gc")
+            ni_set_kind(ni, "metamethod")
+            return
+        }
+        if ci_is_lua(ci) {
+            func_name_from_code(L, ci_proto(ci), dbg_current_pc(ci), ni)
+        }
+    }
+}
+
+// Name of the function running in frame `ci`, from its caller.
+fn dbg_func_name(L: *mut State, ci: *mut CallInfo, ni: &mut NameInfo) {
+    unsafe {
+        if !ptr.is_null(ci) && ((*ci).callstatus & CIST_TAIL) == 0 && !ptr.is_null((*ci).previous) {
+            func_name_from_call(L, (*ci).previous, ni)
+        }
+    }
+}
+
+fn add_name_info(b: &mut SBuf, ni: &NameInfo) -> void!Throw {
+    unsafe {
+        b.add_str(" (")?
+        b.add_raw(ni.kind, ni.kind_len)?
+        b.add_str(" '")?
+        b.add_raw(ni.name, ni.name_len)?
+        b.add_str("')")?
+        return ok()
+    }
+}
+
+// Append " (kind 'name')" describing value `o` of the running Lua function.
+fn dbg_add_varinfo(L: *mut State, b: &mut SBuf, o: *mut Value) -> void!Throw {
+    unsafe {
+        let ci = (*L).ci
+        if !ci_is_lua(ci) {
+            return ok()
+        }
+        ni := ni_new()
+        let cl = val_gc((*ci).func) as *mut LClosure
+        let p = (*cl).p
+        // An upvalue?
+        for i in 0isize..((*cl).nupvalues as isize) {
+            let uv = lcl_upval(cl, i)
+            if !ptr.is_null(uv) && (*uv).v == o {
+                let n = upval_name(p, i as i32)
+                if ptr.is_null(n) {
+                    ni_set_name_static(&mut ni, "?")
+                } else {
+                    ni_set_name_lstr(&mut ni, n)
+                }
+                ni_set_kind(&mut ni, "upvalue")
+            }
+        }
+        if !ni_found(&ni) {
+            // A register of the frame?
+            let base = ptr.offset((*ci).func, 1)
+            if (o as usize) >= (base as usize) && (o as usize) < ((*ci).top as usize) {
+                let reg = sdiff(o, base) as i32
+                get_obj_name(p, dbg_current_pc(ci), reg, &mut ni)
+            }
+        }
+        if ni_found(&ni) {
+            return add_name_info(b, &ni)
+        }
+        return ok()
+    }
+}
+
+// For call errors: describe the callee from the calling instruction of the
+// current frame. Returns false if nothing is known.
+fn dbg_add_callee_info(L: *mut State, b: &mut SBuf) -> bool!Throw {
+    unsafe {
+        ni := ni_new()
+        func_name_from_call(L, (*L).ci, &mut ni)
+        if ni_found(&ni) {
+            add_name_info(b, &ni)?
+            return ok(true)
+        }
+        return ok(false)
+    }
+}
+
+// --- Activation records -----------------------------------------------------
+
+// Frame `level` levels below the current one (0 = current), or null.
+fn dbg_get_stack(L: *mut State, level0: i32) -> *mut CallInfo {
+    unsafe {
+        if level0 < 0 {
+            return 0 as *mut CallInfo
+        }
+        level := level0
+        ci := (*L).ci
+        let base = L_base_ci(L)
+        for level > 0 && ci != base {
+            level -= 1
+            ci = (*ci).previous
+        }
+        if level == 0 && ci != base {
+            return ci
+        }
+        return 0 as *mut CallInfo
+    }
+}
+
+// Fill `ar` for function value `f` (and frame `ci`, possibly null).
+fn dbg_fill_info(L: *mut State, what: &[u8], ar: &mut Debug, f: *mut Value, ci: *mut CallInfo) -> bool {
+    unsafe {
+        okv := true
+        for idx in 0usize..what.len {
+            let c = what[idx]
+            if c == b'S' {
+                dbg_fill_source(ar, f)
+            } else if c == b'l' {
+                if !ptr.is_null(ci) && ci_is_lua(ci) {
+                    ar.currentline = dbg_current_line(ci)
+                } else {
+                    ar.currentline = -1
+                }
+            } else if c == b'u' {
+                if (*f).tag == TAG_LCLOSURE {
+                    let cl = val_gc(f) as *mut LClosure
+                    ar.nups = (*cl).nupvalues
+                    ar.isvararg = (*(*cl).p).is_vararg != 0
+                    ar.nparams = (*(*cl).p).numparams
+                } else if (*f).tag == TAG_NCLOSURE {
+                    ar.nups = (*(val_gc(f) as *mut NClosure)).nupvalues
+                    ar.isvararg = true
+                    ar.nparams = 0
+                } else {
+                    ar.nups = 0
+                    ar.isvararg = true
+                    ar.nparams = 0
+                }
+            } else if c == b't' {
+                ar.istailcall = !ptr.is_null(ci) && ((*ci).callstatus & CIST_TAIL) != 0
+            } else if c == b'n' {
+                ni := ni_new()
+                dbg_func_name(L, ci, &mut ni)
+                if ni_found(&ni) {
+                    ar.name_ptr = ni.name
+                    ar.name_len = ni.name_len
+                    ar.namewhat_ptr = ni.kind
+                    ar.namewhat_len = ni.kind_len
+                } else {
+                    ar.name_ptr = 0 as *const u8
+                    ar.name_len = 0
+                    dbg_set_static("", &mut ar.namewhat_ptr, &mut ar.namewhat_len)
+                }
+            } else if c == b'r' {
+                if !ptr.is_null(ci) && ((*ci).callstatus & CIST_TRAN) != 0 {
+                    ar.ftransfer = (*ci).ftransfer
+                    ar.ntransfer = (*ci).ntransfer
+                } else {
+                    ar.ftransfer = 0
+                    ar.ntransfer = 0
+                }
+            } else if c == b'L' || c == b'f' {
+                // Handled by the API (they push values).
+            } else {
+                okv = false
+            }
+        }
+        return okv
+    }
+}
+
+fn dbg_fill_source(ar: &mut Debug, f: *mut Value) {
+    unsafe {
+        if (*f).tag != TAG_LCLOSURE {
+            dbg_set_static("=[C]", &mut ar.source_ptr, &mut ar.source_len)
+            let s = b"[C]"
+            for i in 0usize..3 {
+                ar.short_src[i] = s[i]
+            }
+            ar.short_src_len = 3
+            ar.linedefined = -1
+            ar.lastlinedefined = -1
+            dbg_set_static("C", &mut ar.what_ptr, &mut ar.what_len)
+            return
+        }
+        let p = (*(val_gc(f) as *mut LClosure)).p
+        if ptr.is_null((*p).source) {
+            dbg_set_static("=?", &mut ar.source_ptr, &mut ar.source_len)
+        } else {
+            ar.source_ptr = str_data((*p).source) as *const u8
+            ar.source_len = (*(*p).source).length
+        }
+        ar.linedefined = (*p).linedefined
+        ar.lastlinedefined = (*p).lastlinedefined
+        if ar.linedefined == 0 {
+            dbg_set_static("main", &mut ar.what_ptr, &mut ar.what_len)
+        } else {
+            dbg_set_static("Lua", &mut ar.what_ptr, &mut ar.what_len)
+        }
+        ar.short_src_len = chunk_id(ar.source_ptr as *mut u8, ar.source_len, ptr.as_mut_ptr(&mut ar.short_src))
+    }
+}
+
+// Local variable `n` of frame `ci`: its name (static or LString bytes) and
+// stack slot. Returns null slot if there is no such variable.
+fn dbg_find_local(L: *mut State, ci: *mut CallInfo, n: i32, ni: &mut NameInfo) -> *mut Value {
+    unsafe {
+        base := ptr.offset((*ci).func, 1)
+        if ci_is_lua(ci) {
+            if n < 0 {
+                // Vararg values.
+                let p = ci_proto(ci)
+                let nextra = (*ci).nextraargs
+                if (*p).is_vararg != 0 && -n <= nextra {
+                    ni_set_name_static(ni, "(vararg)")
+                    ni_set_kind(ni, "v")
+                    return ptr.offset((*ci).func, -(nextra as isize) - ((n + 1) as isize))
+                }
+                return 0 as *mut Value
+            }
+            let name = func_local_name(ci_proto(ci), n, dbg_current_pc(ci))
+            if !ptr.is_null(name) {
+                ni_set_name_lstr(ni, name)
+                ni_set_kind(ni, "l")
+                return ptr.offset(base, (n - 1) as isize)
+            }
+        }
+        if n <= 0 {
+            return 0 as *mut Value
+        }
+        let limit = if ci == (*L).ci {
+            (*L).top
+        } else {
+            (*(*ci).next).func
+        }
+        if sdiff(limit, base) >= n as isize {
+            if ci_is_lua(ci) {
+                ni_set_name_static(ni, "(temporary)")
+            } else {
+                ni_set_name_static(ni, "(C temporary)")
+            }
+            ni_set_kind(ni, "t")
+            return ptr.offset(base, (n - 1) as isize)
+        }
+        return 0 as *mut Value
+    }
+}
+
+// --- Hooks ------------------------------------------------------------------
+
+fn run_hook(L: *mut State, event: i32, line: i32, ftransfer: i32, ntransfer: i32) -> void!Throw {
+    unsafe {
+        if !(*L).has_hook || (*L).allowhook == 0 {
+            return ok()
+        }
+        let ci = (*L).ci
+        let top = save_stack(L, (*L).top)
+        let ci_top = save_stack(L, (*ci).top)
+        ar := Debug.new()
+        ar.event = event
+        ar.currentline = line
+        ar.ci = ci
+        if ntransfer != 0 {
+            (*ci).callstatus = (*ci).callstatus | CIST_TRAN
+            (*ci).ftransfer = ftransfer
+            (*ci).ntransfer = ntransfer
+        }
+        if ci_is_lua(ci) && ((*L).top as usize) < ((*ci).top as usize) {
+            (*L).top = (*ci).top
+        }
+        stack_check(L, MIN_STACK)?
+        let ci2 = (*L).ci
+        if ((*ci2).top as usize) < (ptr.offset((*L).top, MIN_STACK) as usize) {
+            (*ci2).top = ptr.offset((*L).top, MIN_STACK)
+        }
+        (*L).allowhook = 0
+        (*ci2).callstatus = (*ci2).callstatus | CIST_HOOKED
+        cx := Cx { L: L }
+        let h = (*L).hook
+        match h(&mut cx, &mut ar) {
+            ok() => {},
+            err(e) => {
+                (*L).allowhook = 1
+                (*ci2).callstatus = (*ci2).callstatus & ~(CIST_HOOKED | CIST_TRAN)
+                if e == Throw.Yield && ci_is_lua(ci2) {
+                    // A native hook yielded: when resumed, the interrupted
+                    // instruction runs again (without calling the hook).
+                    (*ci2).callstatus = (*ci2).callstatus | CIST_HOOKYIELD
+                    (*ci2).savedpc = ptr.offset((*ci2).savedpc, -1)
+                    (*L).top = restore_stack(L, top)
+                }
+                return err(e)
+            },
+        }
+        (*L).allowhook = 1
+        (*ci2).top = restore_stack(L, ci_top)
+        (*L).top = restore_stack(L, top)
+        (*ci2).callstatus = (*ci2).callstatus & ~(CIST_HOOKED | CIST_TRAN)
+        return ok()
+    }
+}
+
+// Call hook for a Lua function entering (savedpc at its first instruction).
+fn hook_call_lua(L: *mut State, ci: *mut CallInfo) -> void!Throw {
+    unsafe {
+        (*L).oldpc = 0
+        if ((*L).hookmask & HOOK_MASK_CALL) != 0 {
+            let event = if ((*ci).callstatus & CIST_TAIL) != 0 {
+                HOOK_TAILCALL
+            } else {
+                HOOK_CALL
+            }
+            let p = ci_proto(ci)
+            (*ci).savedpc = ptr.offset((*ci).savedpc, 1)
+            run_hook(L, event, -1, 1, (*p).numparams as i32)?
+            (*ci).savedpc = ptr.offset((*ci).savedpc, -1)
+        }
+        return ok()
+    }
+}
+
+fn hook_call_native(L: *mut State, ci: *mut CallInfo, narg: i32) -> void!Throw {
+    unsafe {
+        return run_hook(L, HOOK_CALL, -1, 1, narg)
+    }
+}
+
+// Return hook (frame `ci` returning `nres` values on top).
+fn hook_return(L: *mut State, ci: *mut CallInfo, nres: i32) -> void!Throw {
+    unsafe {
+        if ((*L).hookmask & HOOK_MASK_RET) != 0 {
+            let firstres = ptr.offset((*L).top, -(nres as isize))
+            delta := 0isize
+            if ci_is_lua(ci) {
+                let p = ci_proto(ci)
+                if (*p).is_vararg != 0 {
+                    delta = ((*ci).nextraargs as isize) + ((*p).numparams as isize) + 1
+                }
+            }
+            (*ci).func = ptr.offset((*ci).func, delta)
+            let ftransfer = sdiff(firstres, (*ci).func) as i32
+            let r = run_hook(L, HOOK_RET, -1, ftransfer, nres)
+            (*ci).func = ptr.offset((*ci).func, -delta)
+            r?
+        }
+        let prev = (*ci).previous
+        if !ptr.is_null(prev) && ci_is_lua(prev) {
+            (*L).oldpc = pc_rel((*prev).savedpc, ci_proto(prev))
+        }
+        return ok()
+    }
+}
+
+// Line and count hooks, called before executing each instruction while
+// hooks are active (`pc` points after the instruction). Returns whether the
+// interpreter must keep tracing.
+fn vm_trace(L: *mut State, ci: *mut CallInfo, pc: *mut u32) -> bool!Throw {
+    unsafe {
+        let mask = (*L).hookmask
+        if (mask & (HOOK_MASK_LINE | HOOK_MASK_COUNT)) == 0 {
+            return ok(mask != 0)
+        }
+        let p = ci_proto(ci)
+        (*ci).savedpc = pc
+        counthook := false
+        if (mask & HOOK_MASK_COUNT) != 0 {
+            (*L).hookcount = (*L).hookcount - 1
+            if (*L).hookcount == 0 {
+                (*L).hookcount = (*L).basehookcount
+                counthook = true
+            }
+        }
+        if !counthook && (mask & HOOK_MASK_LINE) == 0 {
+            return ok(true)
+        }
+        if ((*ci).callstatus & CIST_HOOKYIELD) != 0 {
+            (*ci).callstatus = (*ci).callstatus & ~CIST_HOOKYIELD
+            return ok(true)
+        }
+        if !instr_uses_top(*ptr.offset(pc, -1)) {
+            (*L).top = (*ci).top
+        }
+        if counthook {
+            run_hook(L, HOOK_COUNT, -1, 0, 0)?
+        }
+        if (mask & HOOK_MASK_LINE) != 0 {
+            let oldpc = if (*L).oldpc < (*p).sizecode {
+                (*L).oldpc
+            } else {
+                0i32
+            }
+            let npci = pc_rel(pc, p)
+            if npci <= oldpc || dbg_changed_line(p, oldpc, npci) {
+                let newline = dbg_get_line(p, npci)
+                run_hook(L, HOOK_LINE, newline, 0, 0)?
+            }
+            (*L).oldpc = npci
+        }
+        return ok(true)
+    }
+}

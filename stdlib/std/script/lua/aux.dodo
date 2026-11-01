@@ -1,0 +1,747 @@
+package lua
+
+import "core/mem"
+import "core/ptr"
+import "std/platform/native" as platform_native
+
+// Auxiliary library: argument checking with the reference error formats,
+// metatable registry helpers, library registration, tracebacks, references,
+// a string buffer, file loading, the warning system and process-wide C
+// streams shared by every library that writes to stdout/stderr.
+
+unsafe extern "C" fn fdopen(fd: i32, mode: *const u8) -> *mut u8
+unsafe extern "C" fn fopen(path: *const u8, mode: *const u8) -> *mut u8
+unsafe extern "C" fn fclose(f: *mut u8) -> i32
+unsafe extern "C" fn fread(p: *mut u8, size: usize, n: usize, f: *mut u8) -> usize
+unsafe extern "C" fn fwrite(p: *const u8, size: usize, n: usize, f: *mut u8) -> usize
+unsafe extern "C" fn fflush(f: *mut u8) -> i32
+unsafe extern "C" fn ferror(f: *mut u8) -> i32
+unsafe extern "C" fn strerror(code: i32) -> *const u8
+unsafe extern "C" fn strlen(s: *const u8) -> usize
+
+static mut SYS_STDIN: usize = 0
+static mut SYS_STDOUT: usize = 0
+static mut SYS_STDERR: usize = 0
+
+// C stream (FILE*) for standard input, shared by all states of the process.
+pub fn c_stdin() -> *mut u8 {
+    unsafe {
+        if SYS_STDIN == 0 {
+            SYS_STDIN = fdopen(0, ptr.as_ptr(b"r\0")) as usize
+        }
+        return SYS_STDIN as *mut u8
+    }
+}
+// C stream for standard output (used by print and io.stdout).
+pub fn c_stdout() -> *mut u8 {
+    unsafe {
+        if SYS_STDOUT == 0 {
+            SYS_STDOUT = fdopen(1, ptr.as_ptr(b"w\0")) as usize
+        }
+        return SYS_STDOUT as *mut u8
+    }
+}
+// C stream for standard error (warnings, interpreter messages).
+pub fn c_stderr() -> *mut u8 {
+    unsafe {
+        if SYS_STDERR == 0 {
+            SYS_STDERR = fdopen(2, ptr.as_ptr(b"w\0")) as usize
+        }
+        return SYS_STDERR as *mut u8
+    }
+}
+// Write bytes to standard output (buffered).
+pub fn write_stdout(b: &[u8]) {
+    unsafe {
+        if b.len > 0 {
+            fwrite(ptr.as_ptr(b), 1, b.len, c_stdout())
+        }
+    }
+}
+// Flush the shared standard output stream.
+pub fn flush_stdout() {
+    unsafe {
+        unsafe {
+            fflush(c_stdout())
+        }
+    }
+}
+// Write bytes to standard error (flushed immediately).
+pub fn write_stderr(b: &[u8]) {
+    unsafe {
+        if b.len > 0 {
+            fwrite(ptr.as_ptr(b), 1, b.len, c_stderr())
+        }
+        fflush(c_stderr())
+    }
+}
+fn write_stderr_raw(p: *const u8, n: usize) {
+    unsafe {
+        if n > 0 {
+            fwrite(p, 1, n, c_stderr())
+        }
+        fflush(c_stderr())
+    }
+}
+
+// Code of the last operating-system error (errno on POSIX systems).
+fn os_error_code() -> i32 {
+    let e = platform_native.last_error()
+    return e.code
+}
+
+// Message of the last C library error (errno).
+pub fn last_os_error_message() -> &[u8] from(static) {
+    unsafe {
+        let code = os_error_code()
+        let s = strerror(code)
+        return ptr.borrow_slice(s, strlen(s), b"")
+    }
+}
+
+// --- Warnings ---------------------------------------------------------------
+
+// Default warning behaviour: off until "@on"; pieces of one message are
+// written after a "Lua warning: " prefix and the message ends with a newline.
+fn warn_emit(L: *mut State, msg: &[u8], tocont: bool) {
+    unsafe {
+        let g = G(L)
+        if (*g).has_warnf {
+            cx := Cx { L: L }
+            let f = (*g).warnf
+            f(&mut cx, msg, tocont)
+            return
+        }
+        let cont = ((*g).warn_mode & 2) != 0
+        if !cont && !tocont && msg.len > 0 && msg[0] == b'@' {
+            let rest = msg[1..msg.len]
+            if rest.len == 2 && rest[0] == b'o' && rest[1] == b'n' {
+                (*g).warn_mode = 1
+            } else if rest.len == 3 && rest[0] == b'o' && rest[1] == b'f' && rest[2] == b'f' {
+                (*g).warn_mode = 0
+            }
+            return
+        }
+        if ((*g).warn_mode & 1) != 0 {
+            if !cont {
+                write_stderr(b"Lua warning: ")
+            }
+            write_stderr(msg)
+            if !tocont {
+                write_stderr(b"\n")
+            }
+        }
+        if tocont {
+            (*g).warn_mode = (*g).warn_mode | 2
+        } else {
+            (*g).warn_mode = (*g).warn_mode & 1
+        }
+    }
+}
+
+// --- String buffer ----------------------------------------------------------
+
+// Growable byte buffer for building strings (the analogue of luaL_Buffer).
+// Its memory is accounted to the state; it does not use stack slots.
+pub struct Buffer {
+    b: SBuf
+
+    // An empty buffer accounted to the state of cx.
+    pub fn new(cx: &Cx) -> Buffer {
+        return Buffer { b: SBuf.new(cx.L) }
+    }
+    // Append bytes.
+    pub fn add_bytes(&mut self, s: &[u8]) -> void!Throw {
+        return self.b.add_bytes(s)
+    }
+    // Append UTF-8 text.
+    pub fn add_str(&mut self, s: &str) -> void!Throw {
+        return self.b.add_str(s)
+    }
+    // Append one byte.
+    pub fn add_char(&mut self, c: u8) -> void!Throw {
+        return self.b.add_char(c)
+    }
+    // Append n bytes from a pointer.
+    pub fn add_raw(&mut self, p: *const u8, n: usize) -> void!Throw {
+        return self.b.add_raw(p, n)
+    }
+    // Append an integer in decimal.
+    pub fn add_integer(&mut self, v: i64) -> void!Throw {
+        return self.b.add_int(v)
+    }
+    // Append a float as `tostring` formats it.
+    pub fn add_number(&mut self, v: f64) -> void!Throw {
+        return self.b.add_float(v)
+    }
+    // Append the string form of the value on top of the stack (with
+    // __tostring/__name, like tostring) and pop it.
+    pub fn add_value(&mut self, cx: &mut Cx) -> void!Throw {
+        let s = cx.to_lstring_meta(-1)?
+        self.b.add_raw(s.as_ptr(), s.size())?
+        cx.pop(2)
+        return ok()
+    }
+    // Make room for n bytes and return a pointer to them; commit with
+    // add_size(n) after writing.
+    pub fn prepare(&mut self, n: usize) -> (*mut u8)!Throw {
+        self.b.reserve(n)?
+        unsafe {
+            return ok(ptr.offset(self.b.data, self.b.n as isize))
+        }
+    }
+    // Commit n bytes written after `prepare`.
+    pub fn add_size(&mut self, n: usize) {
+        self.b.n = self.b.n + n
+    }
+    // Remove the last n bytes.
+    pub fn shrink(&mut self, n: usize) {
+        self.b.n = if n > self.b.n {
+            0usize
+        } else {
+            self.b.n - n
+        }
+    }
+    // Current contents.
+    pub fn bytes(&self) -> &[u8] {
+        if self.b.n == 0 {
+            return b""
+        }
+        unsafe {
+            return ptr.borrow_slice(self.b.data as *const u8, self.b.n, self)
+        }
+    }
+    // Number of bytes in the buffer.
+    pub fn size(&self) -> usize {
+        return self.b.n
+    }
+    // Push the contents as a string.
+    pub fn push_result(&mut self, cx: &mut Cx) -> void!Throw {
+        unsafe {
+            return cx.push_raw_bytes(self.b.data as *const u8, self.b.n)
+        }
+    }
+}
+
+// --- Argument checking ------------------------------------------------------
+
+// The function-name part of "bad argument" messages for the running native
+// function: from the call site, else a global name, else "?".
+fn aux_arg_error(cx: &mut Cx, arg0: i32, extramsg: &[u8]) -> Throw {
+    unsafe {
+        arg := arg0
+        ar := Debug.new()
+        if !cx.get_stack(0, &mut ar) {
+            b := SBuf.new(cx.L)
+            match aux_build3(&mut b, "bad argument #", arg as i64, " (", extramsg, ")") {
+                ok() => {},
+                err(e) => {
+                    return e
+                },
+            }
+            return aux_raise(cx, &mut b)
+        }
+        match cx.get_info("n", &mut ar) {
+            ok(_) => {},
+            err(e) => {
+                return e
+            },
+        }
+        let nw = ar.namewhat()
+        if nw.len == 6 && nw[0] == b'm' && nw[1] == b'e' && nw[2] == b't' {
+            arg -= 1
+            if arg == 0 {
+                b := SBuf.new(cx.L)
+                match aux_self_error(&mut b, &ar, extramsg) {
+                    ok() => {},
+                    err(e) => {
+                        return e
+                    },
+                }
+                return aux_raise(cx, &mut b)
+            }
+        }
+        b := SBuf.new(cx.L)
+        match aux_bad_arg_build(cx, &mut b, &ar, arg, extramsg) {
+            ok() => {},
+            err(e) => {
+                return e
+            },
+        }
+        return aux_raise(cx, &mut b)
+    }
+}
+
+fn aux_self_error(b: &mut SBuf, ar: &Debug, extramsg: &[u8]) -> void!Throw {
+    unsafe {
+        b.add_str("calling '")?
+        match ar.name() {
+            some(n) => {
+                b.add_bytes(n)?
+            },
+            none => {
+                b.add_str("?")?
+            },
+        }
+        b.add_str("' on bad self (")?
+        b.add_bytes(extramsg)?
+        b.add_str(")")?
+        return ok()
+    }
+}
+
+fn aux_bad_arg_build(cx: &mut Cx, b: &mut SBuf, ar: &Debug, arg: i32, extramsg: &[u8]) -> void!Throw {
+    unsafe {
+        b.add_str("bad argument #")?
+        b.add_int(arg as i64)?
+        b.add_str(" to '")?
+        match ar.name() {
+            some(n) => {
+                b.add_bytes(n)?
+            },
+            none => {
+                if push_global_func_name(cx, ar.ci)? {
+                    let s = cx.to_lstr(-1)?
+                    match s {
+                        some(v) => {
+                            b.add_raw(v.as_ptr(), v.size())?
+                        },
+                        none => {},
+                    }
+                    cx.pop(1)
+                } else {
+                    b.add_str("?")?
+                }
+            },
+        }
+        b.add_str("' (")?
+        b.add_bytes(extramsg)?
+        b.add_str(")")?
+        return ok()
+    }
+}
+
+fn aux_build3(b: &mut SBuf, a: &str, n: i64, c: &str, d: &[u8], e: &str) -> void!Throw {
+    unsafe {
+        b.add_str(a)?
+        b.add_int(n)?
+        b.add_str(c)?
+        b.add_bytes(d)?
+        b.add_str(e)?
+        return ok()
+    }
+}
+
+// Raise the message in `b` prefixed with the position of the caller of the
+// running native function (like luaL_error).
+fn aux_raise(cx: &mut Cx, b: &mut SBuf) -> Throw {
+    unsafe {
+        w := SBuf.new(cx.L)
+        match aux_where(cx, &mut w, 1) {
+            ok() => {},
+            err(e) => {
+                return e
+            },
+        }
+        match w.add_raw(unsafe {
+            b.data as *const u8
+        }, b.n) {
+            ok() => {},
+            err(e) => {
+                return e
+            },
+        }
+        match w.to_lstring() {
+            ok(s) => {
+                err_set_msg(cx.L, s)
+                return Throw.Runtime
+            },
+            err(e) => {
+                return e
+            },
+        }
+    }
+}
+
+// Append "short_src:line: " for the function at `level`, if it is a Lua
+// function with line information.
+fn aux_where(cx: &mut Cx, b: &mut SBuf, level: i32) -> void!Throw {
+    unsafe {
+        ar := Debug.new()
+        if cx.get_stack(level, &mut ar) {
+            cx.get_info("Sl", &mut ar)?
+            if ar.currentline > 0 {
+                b.add_bytes(ar.short_src())?
+                b.add_char(b':')?
+                b.add_int(ar.currentline as i64)?
+                b.add_str(": ")?
+            }
+        }
+        return ok()
+    }
+}
+
+// Find a "module.name" for the function of frame ci in package.loaded and
+// push it ("_G." prefix removed). False (nothing pushed) if not found.
+fn push_global_func_name(cx: &mut Cx, ci: *mut CallInfo) -> bool!Throw {
+    unsafe {
+        let L = cx.L
+        let top = cx.get_top()
+        // The function.
+        L_push_value(L, (*ci).func)
+        let fidx = cx.get_top()
+        cx.get_field(REGISTRY_INDEX, "_LOADED")?
+        if !cx.is_table(-1) {
+            cx.set_top(top)
+            return ok(false)
+        }
+        let loaded = cx.get_top()
+        cx.push_nil()
+        for cx.next(loaded)? {
+            // key at -2 (module name), module at -1.
+            if cx.type_of(-2) == TSTRING && cx.is_table(-1) {
+                let mod_idx = cx.get_top()
+                cx.push_nil()
+                for cx.next(mod_idx)? {
+                    if cx.type_of(-2) == TSTRING && cx.raw_equal(-1, fidx) {
+                        // Found: "modname.fieldname".
+                        cx.pop(1)
+                        let fname = cx.to_lstr(-1)?
+                        let mname = cx.to_lstr(-3)?
+                        b := SBuf.new(L)
+                        match mname {
+                            some(m) => {
+                                let mb = m.bytes()
+                                let isg = mb.len == 2 && mb[0] == b'_' && mb[1] == b'G'
+                                if !isg {
+                                    b.add_bytes(mb)?
+                                    b.add_char(b'.')?
+                                }
+                            },
+                            none => {},
+                        }
+                        match fname {
+                            some(f) => {
+                                b.add_bytes(f.bytes())?
+                            },
+                            none => {},
+                        }
+                        let s = b.to_lstring()?
+                        cx.set_top(top)
+                        set_str((*L).top, s)
+                        (*L).top = ptr.offset((*L).top, 1)
+                        return ok(true)
+                    }
+                    cx.pop(1)
+                }
+            }
+            cx.pop(1)
+        }
+        cx.set_top(top)
+        return ok(false)
+    }
+}
+
+// Type name for messages: __name metafield, "light userdata", or the type.
+fn aux_typename_for_error(cx: &mut Cx, arg: i32, b: &mut SBuf) -> void!Throw {
+    unsafe {
+        if cx.get_metafield(arg, "__name")? == TSTRING {
+            let s = cx.to_lstr(-1)?
+            match s {
+                some(v) => {
+                    b.add_raw(v.as_ptr(), v.size())?
+                },
+                none => {},
+            }
+            cx.pop(1)
+            return ok()
+        }
+        if cx.type_of(arg) == TLIGHTUSERDATA {
+            return b.add_str("light userdata")
+        }
+        let t = cx.type_of(arg)
+        return b.add_str(cx.type_name(t))
+    }
+}
+
+// Library entry: name and function.
+pub type LibFn = (&str, NativeFn)
+
+// Open every standard library available in this build.
+fn open_all_libs(cx: &mut Cx) -> void!Throw {
+    unsafe {
+        cx.require_lib("_G", open_base, true)?
+        cx.pop(1)
+        cx.require_lib("coroutine", open_coroutine, true)?
+        cx.pop(1)
+        open_other_libs(cx)?
+        return ok()
+    }
+}
+
+// --- Tracebacks -------------------------------------------------------------
+
+const TB_LEVELS1: i32 = 10
+const TB_LEVELS2: i32 = 11
+
+// Highest valid stack level of thread L1.
+fn aux_last_level(L1: &mut Cx) -> i32 {
+    unsafe {
+        ar := Debug.new()
+        li := 1i32
+        le := 1i32
+        for L1.get_stack(le, &mut ar) {
+            li = le
+            le = le * 2
+        }
+        for li < le {
+            let m = (li + le) / 2
+            if L1.get_stack(m, &mut ar) {
+                li = m + 1
+            } else {
+                le = m
+            }
+        }
+        return le - 1
+    }
+}
+
+// Append the description of the function of `ar` for tracebacks.
+fn aux_func_name(cx: &mut Cx, b: &mut SBuf, ar: &Debug) -> void!Throw {
+    unsafe {
+        if push_global_func_name(cx, ar.ci)? {
+            b.add_str("function '")?
+            let s = cx.to_lstr(-1)?
+            match s {
+                some(v) => {
+                    b.add_raw(v.as_ptr(), v.size())?
+                },
+                none => {},
+            }
+            b.add_str("'")?
+            cx.pop(1)
+            return ok()
+        }
+        let nw = ar.namewhat()
+        if nw.len > 0 {
+            b.add_bytes(nw)?
+            b.add_str(" '")?
+            match ar.name() {
+                some(n) => {
+                    b.add_bytes(n)?
+                },
+                none => {
+                    b.add_str("?")?
+                },
+            }
+            b.add_str("'")?
+            return ok()
+        }
+        let w = ar.what()
+        if w.len > 0 && w[0] == b'm' {
+            return b.add_str("main chunk")
+        }
+        if w.len > 0 && w[0] != b'C' {
+            b.add_str("function <")?
+            b.add_bytes(ar.short_src())?
+            b.add_char(b':')?
+            b.add_int(ar.linedefined as i64)?
+            b.add_str(">")?
+            return ok()
+        }
+        return b.add_str("?")
+    }
+}
+
+fn aux_traceback(cx: &mut Cx, L1: &mut Cx, msg: Option<&[u8]>, level0: i32) -> void!Throw {
+    unsafe {
+        b := SBuf.new(cx.L)
+        level := level0
+        let last = aux_last_level(L1)
+        limit2show := if last - level > TB_LEVELS1 + TB_LEVELS2 {
+            TB_LEVELS1
+        } else {
+            -1i32
+        }
+        match msg {
+            some(m) => {
+                b.add_bytes(m)?
+                b.add_char(b'\n')?
+            },
+            none => {},
+        }
+        b.add_str("stack traceback:")?
+        ar := Debug.new()
+        for L1.get_stack(level, &mut ar) {
+            level += 1
+            if limit2show == 0 {
+                let n = last - level - TB_LEVELS2 + 1
+                b.add_str("\n\t...\t(skipping ")?
+                b.add_int(n as i64)?
+                b.add_str(" levels)")?
+                level += n
+            } else {
+                L1.get_info("Slnt", &mut ar)?
+                b.add_str("\n\t")?
+                b.add_bytes(ar.short_src())?
+                b.add_char(b':')?
+                if ar.currentline > 0 {
+                    b.add_int(ar.currentline as i64)?
+                    b.add_char(b':')?
+                }
+                b.add_str(" in ")?
+                aux_func_name(cx, &mut b, &ar)?
+                if ar.istailcall {
+                    b.add_str("\n\t(...tail calls...)")?
+                }
+            }
+            limit2show -= 1
+        }
+        unsafe {
+            return cx.push_raw_bytes(b.data as *const u8, b.n)
+        }
+    }
+}
+
+// --- Loading files ----------------------------------------------------------
+
+fn aux_file_error(cx: &mut Cx, what: &str, fname: &[u8]) -> i32 {
+    unsafe {
+        b := SBuf.new(cx.L)
+        let m = last_os_error_message()
+        match aux_file_error_build(&mut b, what, fname, m) {
+            ok() => {},
+            err(_) => {
+                return ERRMEM
+            },
+        }
+        unsafe {
+            match cx.push_raw_bytes(b.data as *const u8, b.n) {
+                ok() => {},
+                err(_) => {
+                    return ERRMEM
+                },
+            }
+        }
+        return ERRFILE
+    }
+}
+
+fn aux_file_error_build(b: &mut SBuf, what: &str, fname: &[u8], m: &[u8]) -> void!Throw {
+    unsafe {
+        b.add_str("cannot ")?
+        b.add_str(what)?
+        b.add_char(b' ')?
+        b.add_bytes(fname)?
+        b.add_str(": ")?
+        b.add_bytes(m)?
+        return ok()
+    }
+}
+
+fn aux_read_stream(b: &mut SBuf, f: *mut u8) -> bool!Throw {
+    unsafe {
+        for {
+            b.reserve(4096)?
+            let n = fread(ptr.offset(b.data, b.n as isize), 1, 4096, f)
+            b.n = b.n + n
+            if n < 4096 {
+                break
+            }
+        }
+        return ok(ferror(f) == 0)
+    }
+}
+
+fn aux_load_file(cx: &mut Cx, filename: Option<&[u8]>, mode: &[u8]) -> i32 {
+    unsafe {
+        b := SBuf.new(cx.L)
+        name := SBuf.new(cx.L)
+        f := 0 as *mut u8
+        isstdin := true
+        fname: &[u8] = b""
+        match filename {
+            some(fnm) => {
+                isstdin = false
+                fname = fnm
+                match name.add_char(b'@') {
+                    ok() => {},
+                    err(_) => {
+                        return ERRMEM
+                    },
+                }
+                match name.add_bytes(fnm) {
+                    ok() => {},
+                    err(_) => {
+                        return ERRMEM
+                    },
+                }
+                path := SBuf.new(cx.L)
+                match path.add_bytes(fnm) {
+                    ok() => {},
+                    err(_) => {
+                        return ERRMEM
+                    },
+                }
+                match path.add_char(0) {
+                    ok() => {},
+                    err(_) => {
+                        return ERRMEM
+                    },
+                }
+                f = fopen(path.data as *const u8, ptr.as_ptr(b"rb\0"))
+                if ptr.is_null(f) {
+                    return aux_file_error(cx, "open", fnm)
+                }
+            },
+            none => {
+                match name.add_str("=stdin") {
+                    ok() => {},
+                    err(_) => {
+                        return ERRMEM
+                    },
+                }
+                f = c_stdin()
+            },
+        }
+        let r = aux_read_stream(&mut b, f)
+        if !isstdin {
+            fclose(f)
+        }
+        match r {
+            ok(good) => {
+                if !good {
+                    if isstdin {
+                        return aux_file_error(cx, "read", b"stdin")
+                    }
+                    return aux_file_error(cx, "read", fname)
+                }
+            },
+            err(_) => {
+                return ERRMEM
+            },
+        }
+        // Skip a UTF-8 byte-order mark and a first line starting with '#'.
+        start := 0usize
+        let data = b.data
+        if b.n >= 3 && *data == 0xEF && *ptr.offset(data, 1) == 0xBB && *ptr.offset(data, 2) == 0xBF {
+            start = 3
+        }
+        if start < b.n && *ptr.offset(data, start as isize) == b'#' {
+            j := start
+            for j < b.n && *ptr.offset(data, j as isize) != b'\n' {
+                j += 1
+            }
+            if j + 1 < b.n && *ptr.offset(data, (j + 1) as isize) == 0x1b {
+                // Binary chunk after the comment line.
+                start = j + 1
+            } else {
+                // Keep the newline so line numbers stay right.
+                start = j
+            }
+        }
+        let chunk = ptr.borrow_slice(ptr.offset(data, start as isize) as *const u8, b.n - start, &b)
+        let nm = ptr.borrow_slice(name.data as *const u8, name.n, &name)
+        return api_load(cx.L, ptr.as_ptr(chunk), chunk.len, nm, mode)
+    }
+}

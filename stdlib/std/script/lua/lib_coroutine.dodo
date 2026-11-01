@@ -1,0 +1,227 @@
+package lua
+
+import "core/ptr"
+
+// The coroutine library.
+
+const COS_RUN: i32 = 0
+const COS_DEAD: i32 = 1
+const COS_YIELD: i32 = 2
+const COS_NORM: i32 = 3
+
+fn co_status_name(s: i32) -> &str from(static) {
+    unsafe {
+        if s == COS_RUN {
+            return "running"
+        }
+        if s == COS_DEAD {
+            return "dead"
+        }
+        if s == COS_YIELD {
+            return "suspended"
+        }
+        return "normal"
+    }
+}
+
+fn co_get(cx: &mut Cx) -> Cx!Throw {
+    unsafe {
+        match cx.to_thread(1) {
+            some(co) => {
+                return ok(co)
+            },
+            none => {
+                return err(cx.type_error(1, "coroutine"))
+            },
+        }
+    }
+}
+
+// Resume `co` with `narg` arguments from cx's stack; returns the number of
+// results moved to cx, or -1 with the error message on cx's top.
+fn co_aux_resume(cx: &mut Cx, co: &mut Cx, narg: i32) -> i32!Throw {
+    unsafe {
+        if !co.check_stack(narg) {
+            cx.push_str("too many arguments to resume")?
+            return ok(-1)
+        }
+        cx.xmove(co, narg)
+        nres := 0i32
+        let status = cx.resume(co, narg, &mut nres)
+        if status == OK || status == YIELD {
+            if !cx.check_stack(nres + 1) {
+                co.pop(nres)
+                cx.push_str("too many results to resume")?
+                return ok(-1)
+            }
+            co.xmove(cx, nres)
+            return ok(nres)
+        }
+        co.xmove(cx, 1)
+        return ok(-1)
+    }
+}
+
+fn co_resume(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        co := co_get(cx)?
+        let narg = cx.get_top() - 1
+        let r = co_aux_resume(cx, &mut co, narg)?
+        if r < 0 {
+            cx.push_boolean(false)
+            cx.insert(-2)
+            return ok(2)
+        }
+        cx.push_boolean(true)
+        cx.insert(-(r + 1))
+        return ok(r + 1)
+    }
+}
+
+fn co_auxwrap(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        co := Cx { L: 0 as *mut State }
+        match cx.to_thread(upvalue_index(1)) {
+            some(c) => {
+                co = c
+            },
+            none => {
+                return err(cx.error_msg("invalid coroutine"))
+            },
+        }
+        let narg = cx.get_top()
+        let r = co_aux_resume(cx, &mut co, narg)?
+        if r < 0 {
+            stat := co.status()
+            if stat != OK && stat != YIELD {
+                stat = co.close_thread(cx)
+                co.xmove(cx, 1)
+            }
+            if stat != ERRMEM && cx.type_of(-1) == TSTRING {
+                cx.where_(1)?
+                cx.insert(-2)
+                cx.concat(2)?
+            }
+            return err(cx.error())
+        }
+        return ok(r)
+    }
+}
+
+fn co_create(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        cx.check_type(1, TFUNCTION)?
+        nl := cx.new_thread()?
+        cx.push_value(1)
+        cx.xmove(&mut nl, 1)
+        return ok(1)
+    }
+}
+
+fn co_wrap(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        co_create(cx)?
+        cx.push_closure(co_auxwrap, 1)?
+        return ok(1)
+    }
+}
+
+fn co_yield(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        let n = cx.get_top()
+        return err(cx.yield_(n))
+    }
+}
+
+fn co_aux_status(cx: &mut Cx, co: &mut Cx) -> i32 {
+    unsafe {
+        if cx.same_thread(co) {
+            return COS_RUN
+        }
+        let st = co.status()
+        if st == YIELD {
+            return COS_YIELD
+        }
+        if st == OK {
+            ar := Debug.new()
+            if co.get_stack(0, &mut ar) {
+                return COS_NORM
+            }
+            if co.get_top() == 0 {
+                return COS_DEAD
+            }
+            return COS_YIELD
+        }
+        return COS_DEAD
+    }
+}
+
+fn co_status(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        co := co_get(cx)?
+        let s = co_aux_status(cx, &mut co)
+        cx.push_str(co_status_name(s))?
+        return ok(1)
+    }
+}
+
+fn co_running(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        let ismain = cx.push_thread()
+        cx.push_boolean(ismain)
+        return ok(2)
+    }
+}
+
+fn co_isyieldable(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        if cx.is_none(1) {
+            let y = cx.is_yieldable()
+            cx.push_boolean(y)
+        } else {
+            co := co_get(cx)?
+            cx.push_boolean(co.is_yieldable())
+        }
+        return ok(1)
+    }
+}
+
+fn co_close(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        co := co_get(cx)?
+        let s = co_aux_status(cx, &mut co)
+        if s == COS_DEAD || s == COS_YIELD {
+            let st = co.close_thread(cx)
+            if st == OK {
+                cx.push_boolean(true)
+                return ok(1)
+            }
+            cx.push_boolean(false)
+            co.xmove(cx, 1)
+            return ok(2)
+        }
+        b := Buffer.new(cx)
+        b.add_str("cannot close a ")?
+        b.add_str(co_status_name(s))?
+        b.add_str(" coroutine")?
+        return err(cx.error_buffer(&mut b))
+    }
+}
+
+// Open the coroutine library (pushes it).
+pub fn open_coroutine(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        let funcs = [
+            ("create", co_create),
+            ("resume", co_resume),
+            ("running", co_running),
+            ("status", co_status),
+            ("wrap", co_wrap),
+            ("yield", co_yield),
+            ("isyieldable", co_isyieldable),
+            ("close", co_close),
+        ]
+        cx.new_lib(&funcs)?
+        return ok(1)
+    }
+}
