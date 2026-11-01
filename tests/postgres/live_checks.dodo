@@ -1,0 +1,734 @@
+package postgres_live_checks
+
+// Checks for std/db/postgres against a real server. tests/postgres_library.rs
+// starts PostgreSQL in Docker (TLS on, one role per authentication method),
+// replaces the port 55432 and @@CA@@, then builds and runs this program.
+
+import "core/mem"
+import "std/db"
+import "std/db/postgres"
+import "std/console"
+import "std/db/sql"
+import "std/thread"
+
+const CA: &[u8] = b"@@CA@@"
+
+static mut FIRST: [postgres.WORKSPACE_BYTES]u8 = [0u8; postgres.WORKSPACE_BYTES]
+static mut SECOND: [postgres.MIN_WORKSPACE_BYTES]u8 = [0u8; postgres.MIN_WORKSPACE_BYTES]
+static mut THIRD: [postgres.MIN_WORKSPACE_BYTES]u8 = [0u8; postgres.MIN_WORKSPACE_BYTES]
+
+fn same(a: &str, b: &str) -> bool {
+    x := mem.str_bytes(a)
+    y := mem.str_bytes(b)
+    if x.len != y.len {
+        return false
+    }
+    for i in 0usize..x.len {
+        if x[i] != y[i] {
+            return false
+        }
+    }
+    true
+}
+
+fn bytes_same(a: &[u8], b: &[u8]) -> bool {
+    if a.len != b.len {
+        return false
+    }
+    for i in 0usize..a.len {
+        if a[i] != b[i] {
+            return false
+        }
+    }
+    true
+}
+
+fn scram_login_and_value_round_trip() {
+    conn := postgres.connect(b"postgres://dodo:secret@127.0.0.1:55432/dodo?sslmode=disable&application_name=dodo-checks", unsafe {
+        &mut FIRST[..]
+    })!
+    assert(conn.is_open())
+    assert(conn.server_version() >= 100000u32)
+    conn.exec("create temp table t(a int2, b int4, c int8, d float4, e float8, f bool, g bytea, h text, i numeric, j timestamp, k uuid, l jsonb)")!
+    params := [db.Value.Int(-7), db.Value.Int(2147483647), db.Value.Int(-9223372036854775807 - 1), db.Value.Real(1.5),
+    db.Value.Real(-0.1), db.Value.Int(1), db.Value.Bytes(b"\x00\xff\x10"), db.Value.Text("h\xc3\xa9llo"),
+    db.Value.Real(12.25), db.Value.Text("2024-02-29 12:34:56.5"), db.Value.Text("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"),
+    db.Value.Text("{\"k\": [1, 2]}")]
+    n := conn.execute("insert into t values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)", &params)!
+    assert_eq(n, 1u64)
+    nulls := [db.Value.Null, db.Value.Null, db.Value.Null, db.Value.Null, db.Value.Null, db.Value.Null, db.Value.Null,
+    db.Value.Null, db.Value.Null, db.Value.Null, db.Value.Null, db.Value.Null]
+    conn.execute("insert into t values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)", &nulls)!
+    empty: [0]db.Value = []
+    rows := conn.select("select * from t order by a nulls last", &empty)!
+    assert_eq(rows.len(), 12usize)
+    let some(row) = rows.next()! else {
+        assert(false)
+        return
+    }
+    assert(same(row.name(0), "a"))
+    assert(same(row.name(11), "l"))
+    assert_eq(row.int(0), -7i64)
+    assert_eq(row.int(1), 2147483647i64)
+    assert_eq(row.int(2), -9223372036854775807i64 - 1)
+    assert_eq(row.real(3), 1.5)
+    assert_eq(row.real(4), -0.1)
+    assert_eq(row.int(5), 1i64)
+    assert(bytes_same(row.bytes(6), b"\x00\xff\x10"))
+    assert(same(row.text(7), "h\xc3\xa9llo"))
+    assert(same(row.text(8), "12.25"))
+    assert(same(row.text(9), "2024-02-29 12:34:56.5"))
+    assert(same(row.text(10), "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"))
+    assert(same(row.text(11), "{\"k\": [1, 2]}"))
+    match row.get(6)! {
+        db.Value.Bytes(_) => {},
+        _ => assert(false),
+    }
+    let some(nulled) = rows.next()! else {
+        assert(false)
+        return
+    }
+    for i in 0usize..12 {
+        assert(nulled.is_null(i))
+    }
+    match rows.next()! {
+        some(_) => assert(false),
+        none => {},
+    }
+    // The connection is ready for the next statement.
+    count := sql.ScalarInt.new()
+    conn.query("select count(*) from t", &empty, &mut count)!
+    assert_eq(count.value, 2i64)
+    conn.close()!
+    assert(!conn.is_open())
+}
+
+fn every_password_method() {
+    {
+        md5 := postgres.connect(b"postgres://md5user:md5pass@127.0.0.1:55432/dodo?sslmode=disable", unsafe {
+            &mut FIRST[..]
+        })!
+        md5.exec("select 1")!
+    }
+    {
+        clear := postgres.connect(b"postgres://clearuser:clear%40pass@127.0.0.1:55432/dodo?sslmode=disable", unsafe {
+            &mut FIRST[..]
+        })!
+        clear.exec("select 1")!
+    }
+    {
+        trusted := postgres.connect(b"postgresql://trustuser@127.0.0.1:55432/dodo?sslmode=disable", unsafe {
+            &mut FIRST[..]
+        })!
+        trusted.exec("select 1")!
+    }
+}
+
+fn wrong_password_is_an_auth_error() {
+    storage := [0u8; 128]
+    config := postgres.Config.parse(b"postgres://dodo:wrong@127.0.0.1:55432/dodo?sslmode=disable", &mut storage)!
+    conn := postgres.Connection.new(config, unsafe {
+        &mut FIRST[..]
+    })!
+    match conn.open() {
+        ok() => assert(false),
+        err(e) => {
+            assert(e.kind == db.ErrorKind.Auth)
+            assert(same(conn.sqlstate(), "28P01"))
+            assert(mem.str_bytes(conn.message()).len > 0)
+        },
+    }
+    assert(!conn.is_open())
+    // Missing password while the server asks for one.
+    storage2 := [0u8; 128]
+    config2 := postgres.Config.parse(b"postgres://dodo@127.0.0.1:55432/dodo?sslmode=disable", &mut storage2)!
+    conn2 := postgres.Connection.new(config2, unsafe {
+        &mut SECOND[..]
+    })!
+    match conn2.open() {
+        ok() => assert(false),
+        err(e) => assert(e.kind == db.ErrorKind.Auth),
+    }
+}
+
+fn connect_tls(url: &[u8], with_ca: bool) -> void!db.Error {
+    storage := [0u8; 256]
+    config := postgres.Config.parse(url, &mut storage)?
+    if with_ca {
+        config.trust_pem = CA
+    }
+    // A literal-borrowing config cannot share a call with a static
+    // workspace borrow, so this one lives on the stack.
+    workspace := [0u8; postgres.MIN_WORKSPACE_BYTES]
+    conn := postgres.Connection.connect(config, &mut workspace)?
+    conn.exec("select 1")?
+    // ssl_is_used() is true only on an encrypted connection.
+    flag := sql.ScalarInt.new()
+    empty: [0]db.Value = []
+    conn.query("select ssl::int4 from pg_stat_ssl where pid = pg_backend_pid()", &empty, &mut flag)?
+    if flag.value != 1 {
+        return err(db.Error.new(db.ErrorKind.Internal, 0))
+    }
+    conn.close()
+}
+
+fn tls_modes() {
+    connect_tls(b"postgres://dodo:secret@127.0.0.1:55432/dodo?sslmode=require", false)!
+    connect_tls(b"postgres://dodo:secret@127.0.0.1:55432/dodo", false)!
+    connect_tls(b"postgres://dodo:secret@localhost:55432/dodo?sslmode=verify-full", true)!
+    connect_tls(b"postgres://dodo:secret@127.0.0.1:55432/dodo?sslmode=verify-ca", true)!
+    connect_tls(b"postgres://tlsuser:tlspass@127.0.0.1:55432/dodo?sslmode=require", false)!
+    // The certificate names only localhost.
+    match connect_tls(b"postgres://dodo:secret@127.0.0.1:55432/dodo?sslmode=verify-full", true) {
+        ok() => assert(false),
+        err(e) => assert(e.kind == db.ErrorKind.Auth),
+    }
+    // A private CA is not among the system roots.
+    match connect_tls(b"postgres://dodo:secret@localhost:55432/dodo?sslmode=verify-full", false) {
+        ok() => assert(false),
+        err(e) => assert(e.kind == db.ErrorKind.Auth),
+    }
+    // tlsuser may only connect over TLS (pg_hba hostnossl ... reject).
+    storage := [0u8; 128]
+    config := postgres.Config.parse(b"postgres://tlsuser:tlspass@127.0.0.1:55432/dodo?sslmode=disable", &mut storage)!
+    conn := postgres.Connection.new(config, unsafe {
+        &mut FIRST[..]
+    })!
+    match conn.open() {
+        ok() => assert(false),
+        err(e) => assert(e.kind == db.ErrorKind.Auth),
+    }
+}
+
+fn errors_map_to_portable_kinds() {
+    conn := postgres.connect(b"postgres://dodo:secret@127.0.0.1:55432/dodo?sslmode=disable&application_name=dodo-checks", unsafe {
+        &mut FIRST[..]
+    })!
+    conn.exec("create temp table u(id int primary key, email text unique not null, n int check (n > 0))")!
+    p1 := [db.Value.Int(1), db.Value.Text("a@example.com"), db.Value.Int(1)]
+    conn.execute("insert into u values ($1, $2, $3)", &p1)!
+    p2 := [db.Value.Int(2), db.Value.Text("a@example.com"), db.Value.Int(1)]
+    match conn.execute("insert into u values ($1, $2, $3)", &p2) {
+        ok(_) => assert(false),
+        err(e) => {
+            assert(e.kind == db.ErrorKind.Constraint)
+            assert(e.constraint == db.Constraint.Unique)
+            assert(same(conn.sqlstate(), "23505"))
+            assert(mem.str_bytes(conn.detail()).len > 0)
+        },
+    }
+    p3 := [db.Value.Int(3), db.Value.Null, db.Value.Int(1)]
+    match conn.execute("insert into u values ($1, $2, $3)", &p3) {
+        ok(_) => assert(false),
+        err(e) => assert(e.constraint == db.Constraint.NotNull),
+    }
+    p4 := [db.Value.Int(4), db.Value.Text("b@example.com"), db.Value.Int(0)]
+    match conn.execute("insert into u values ($1, $2, $3)", &p4) {
+        ok(_) => assert(false),
+        err(e) => assert(e.constraint == db.Constraint.Check),
+    }
+    empty: [0]db.Value = []
+    // PostgreSQL counts characters; db.Error.position is a byte offset.
+    match conn.execute("select '\xc3\xa9' + from u", &empty) {
+        ok(_) => assert(false),
+        err(e) => {
+            assert(e.kind == db.ErrorKind.Syntax)
+            assert_eq(e.position, 14i32)
+        },
+    }
+    match conn.execute("select * from missing_table", &empty) {
+        ok(_) => assert(false),
+        err(e) => assert(e.kind == db.ErrorKind.Schema),
+    }
+    match conn.exec("select 1; select nope") {
+        ok() => assert(false),
+        err(e) => assert(e.kind == db.ErrorKind.Schema),
+    }
+    // An error after some rows arrives after those rows.
+    rows := conn.select("select 10 / (3 - g) from generate_series(1, 5) g", &empty)!
+    let some(r1) = rows.next()! else {
+        assert(false)
+        return
+    }
+    assert_eq(r1.int(0), 5i64)
+    let some(r2) = rows.next()! else {
+        assert(false)
+        return
+    }
+    assert_eq(r2.int(0), 10i64)
+    match rows.next() {
+        ok(_) => assert(false),
+        err(e) => assert(e.kind == db.ErrorKind.Type),
+    }
+    // COPY is refused cleanly in both protocols.
+    conn.exec("create temp table cp(a int)")!
+    match conn.exec("copy cp from stdin") {
+        ok() => assert(false),
+        err(e) => assert(e.kind == db.ErrorKind.Unsupported),
+    }
+    match conn.execute("copy cp from stdin", &empty) {
+        ok(_) => assert(false),
+        err(e) => assert(e.kind == db.ErrorKind.Unsupported),
+    }
+    match conn.exec("copy (select 1) to stdout") {
+        ok() => assert(false),
+        err(e) => assert(e.kind == db.ErrorKind.Unsupported),
+    }
+    // The connection stays usable after every error.
+    count := sql.ScalarInt.new()
+    conn.query("select count(*) from u", &empty, &mut count)!
+    assert_eq(count.value, 1i64)
+}
+
+fn transactions() {
+    conn := postgres.connect(b"postgres://dodo:secret@127.0.0.1:55432/dodo?sslmode=disable&application_name=dodo-checks", unsafe {
+        &mut FIRST[..]
+    })!
+    conn.exec("create temp table acc(id int primary key, n int)")!
+    conn.begin(db.IsolationLevel.Default)!
+    assert(conn.in_transaction())
+    conn.exec("insert into acc values (1, 10)")!
+    conn.rollback()!
+    assert(!conn.in_transaction())
+    empty: [0]db.Value = []
+    count := sql.ScalarInt.new()
+    conn.query("select count(*) from acc", &empty, &mut count)!
+    assert_eq(count.value, 0i64)
+
+    conn.begin(db.IsolationLevel.Serializable)!
+    conn.exec("insert into acc values (1, 10)")!
+    conn.commit()!
+    count2 := sql.ScalarInt.new()
+    conn.query("select count(*) from acc", &empty, &mut count2)!
+    assert_eq(count2.value, 1i64)
+
+    // A failed statement aborts the transaction; COMMIT then rolls back.
+    conn.begin(db.IsolationLevel.RepeatableRead)!
+    conn.exec("insert into acc values (2, 20)")!
+    match conn.exec("insert into acc values (1, 10)") {
+        ok() => assert(false),
+        err(e) => assert(e.constraint == db.Constraint.Unique),
+    }
+    match conn.execute("select 1", &empty) {
+        ok(_) => assert(false),
+        err(e) => assert(e.kind == db.ErrorKind.Misuse),
+    }
+    match conn.commit() {
+        ok() => assert(false),
+        err(e) => assert(e.kind == db.ErrorKind.Misuse),
+    }
+    assert(!conn.in_transaction())
+    count3 := sql.ScalarInt.new()
+    conn.query("select count(*) from acc", &empty, &mut count3)!
+    assert_eq(count3.value, 1i64)
+}
+
+fn statement_cache() {
+    conn := postgres.connect(b"postgres://dodo:secret@127.0.0.1:55432/dodo?sslmode=disable&application_name=dodo-checks", unsafe {
+        &mut FIRST[..]
+    })!
+    conn.exec("create temp table c(a int)")!
+    conn.exec("insert into c values (1), (2), (3)")!
+    // More distinct statements than cache slots.
+    for i in 0i64..80 {
+        p := [db.Value.Int(i)]
+        total := sql.ScalarInt.new()
+        if i % 2 == 0 {
+            conn.query("select sum(a) + $1::int8 from c", &p, &mut total)!
+        } else {
+            conn.query("select sum(a) - $1::int8 from c", &p, &mut total)!
+        }
+        if i % 2 == 0 {
+            assert_eq(total.value, 6 + i)
+        } else {
+            assert_eq(total.value, 6 - i)
+        }
+        // A statement per iteration that is never reused.
+        p2 := [db.Value.Int(i)]
+        if i < 40 {
+            conn.execute("select $1::int8 + 0 as v0, 1 as w1", &p2)!
+        }
+    }
+    // A cached `select *` survives a column change.
+    empty: [0]db.Value = []
+    rows := conn.select("select * from c order by a", &empty)!
+    assert_eq(rows.len(), 1usize)
+    match rows.next()! {
+        some(_) => {},
+        none => assert(false),
+    }
+    conn.exec("alter table c add column b text default 'x'")!
+    rows2 := conn.select("select * from c order by a", &empty)!
+    assert_eq(rows2.len(), 2usize)
+    let some(row) = rows2.next()! else {
+        assert(false)
+        return
+    }
+    assert(same(row.text(1), "x"))
+    // DISCARD ALL drops every server-side statement.
+    conn.exec("discard all")!
+    conn.exec("create temp table c(a int)")!
+    conn.exec("insert into c values (5)")!
+    total := sql.ScalarInt.new()
+    p := [db.Value.Int(1)]
+    conn.query("select sum(a) + $1::int8 from c", &p, &mut total)!
+    assert_eq(total.value, 6i64)
+
+    // Prepared handles.
+    stmt := conn.prepare("select a * $1::int4 from c")!
+    for i in 1i64..4 {
+        q := [db.Value.Int(i)]
+        found := conn.rows(&stmt, &q)!
+        let some(r) = found.next()! else {
+            assert(false)
+            return
+        }
+        assert_eq(r.int(0), 5 * i)
+    }
+    q2 := [db.Value.Int(1)]
+    assert_eq(conn.run(&stmt, &q2)!, 1u64)
+    match conn.prepare("selec 1") {
+        ok(_) => assert(false),
+        err(e) => assert(e.kind == db.ErrorKind.Syntax),
+    }
+
+    // Without the cache every statement still works (two round trips).
+    storage := [0u8; 128]
+    config := postgres.Config.parse(b"postgres://dodo:secret@127.0.0.1:55432/dodo?sslmode=disable&application_name=dodo-checks", &mut storage)!
+    config.statement_cache = false
+    plain := postgres.Connection.connect(config, unsafe {
+        &mut SECOND[..]
+    })!
+    total2 := sql.ScalarInt.new()
+    p3 := [db.Value.Int(41)]
+    plain.query("select $1::int8 + 1", &p3, &mut total2)!
+    assert_eq(total2.value, 42i64)
+}
+
+fn abandoned_cursors_and_large_rows() {
+    conn := postgres.connect(b"postgres://dodo:secret@127.0.0.1:55432/dodo?sslmode=disable&application_name=dodo-checks", unsafe {
+        &mut FIRST[..]
+    })!
+    empty: [0]db.Value = []
+    rows := conn.select("select g from generate_series(1, 10000) g", &empty)!
+    match rows.next()! {
+        some(r) => assert_eq(r.int(0), 1i64),
+        none => assert(false),
+    }
+    // Dropping the cursor leaves the rest to be skipped.
+    count := sql.ScalarInt.new()
+    conn.query("select 7", &empty, &mut count)!
+    assert_eq(count.value, 7i64)
+    // A row larger than the receive buffer fails with Capacity, and the
+    // connection keeps working.
+    match conn.execute("select repeat('x', 300000)", &empty) {
+        ok(_) => assert(false),
+        err(e) => assert(e.kind == db.ErrorKind.Capacity),
+    }
+    big := sql.Count.new()
+    conn.query("select repeat('x', 20000) from generate_series(1, 50)", &empty, &mut big)!
+    assert_eq(big.rows, 50u64)
+    // Large parameters stream past the send buffer.
+    text := [120u8; 30000]
+    p := [db.Value.Bytes(&text)]
+    length := sql.ScalarInt.new()
+    conn.query("select length($1::bytea)", &p, &mut length)!
+    assert_eq(length.value, 30000i64)
+}
+
+fn parameters_convert_for_their_types() {
+    conn := postgres.connect(b"postgres://dodo:secret@127.0.0.1:55432/dodo?sslmode=disable&application_name=dodo-checks", unsafe {
+        &mut FIRST[..]
+    })!
+    conn.exec("create temp table v(s int2, r numeric, i int4, b bool, f float4)")!
+    over := [db.Value.Int(70000), db.Value.Null, db.Value.Null, db.Value.Null, db.Value.Null]
+    match conn.execute("insert into v values ($1, $2, $3, $4, $5)", &over) {
+        ok(_) => assert(false),
+        err(e) => assert(e.kind == db.ErrorKind.Type),
+    }
+    good := [db.Value.Int(7), db.Value.Real(0.25), db.Value.Text("42"), db.Value.Int(1), db.Value.Int(3)]
+    conn.execute("insert into v values ($1, $2, $3, $4, $5)", &good)!
+    empty: [0]db.Value = []
+    rows := conn.select("select s, r, i, b, f from v", &empty)!
+    let some(row) = rows.next()! else {
+        assert(false)
+        return
+    }
+    assert_eq(row.int(0), 7i64)
+    assert(same(row.text(1), "0.25"))
+    assert_eq(row.int(2), 42i64)
+    assert_eq(row.int(3), 1i64)
+    assert_eq(row.real(4), 3.0)
+    few := [db.Value.Int(1)]
+    match conn.execute("insert into v values ($1, $2, $3, $4, $5)", &few) {
+        ok(_) => assert(false),
+        err(e) => assert(e.kind == db.ErrorKind.Range),
+    }
+    // Parameters past the 64th still convert for their types.
+    many := [db.Value.Null, db.Value.Null, db.Value.Null, db.Value.Null, db.Value.Null, db.Value.Null, db.Value.Null, db.Value.Null, db.Value.Null, db.Value.Null, db.Value.Null, db.Value.Null, db.Value.Null, db.Value.Null, db.Value.Null, db.Value.Null, db.Value.Null, db.Value.Null, db.Value.Null, db.Value.Null, db.Value.Null, db.Value.Null, db.Value.Null, db.Value.Null, db.Value.Null, db.Value.Null, db.Value.Null, db.Value.Null, db.Value.Null, db.Value.Null, db.Value.Null, db.Value.Null, db.Value.Null, db.Value.Null, db.Value.Null, db.Value.Null, db.Value.Null, db.Value.Null, db.Value.Null, db.Value.Null, db.Value.Null, db.Value.Null, db.Value.Null, db.Value.Null, db.Value.Null, db.Value.Null, db.Value.Null, db.Value.Null, db.Value.Null, db.Value.Null, db.Value.Null, db.Value.Null, db.Value.Null, db.Value.Null, db.Value.Null, db.Value.Null, db.Value.Null, db.Value.Null, db.Value.Null, db.Value.Null, db.Value.Null, db.Value.Null, db.Value.Null, db.Value.Null, db.Value.Null, db.Value.Real(3.0), db.Value.Null, db.Value.Null, db.Value.Null, db.Value.Bytes(b"\\x41\x00\xff")]
+    wide := conn.select("select $66::int4, length($70::bytea), $70::bytea, coalesce($1::int4, $2::int4, $3::int4, $4::int4, $5::int4, $6::int4, $7::int4, $8::int4, $9::int4, $10::int4, $11::int4, $12::int4, $13::int4, $14::int4, $15::int4, $16::int4, $17::int4, $18::int4, $19::int4, $20::int4, $21::int4, $22::int4, $23::int4, $24::int4, $25::int4, $26::int4, $27::int4, $28::int4, $29::int4, $30::int4, $31::int4, $32::int4, $33::int4, $34::int4, $35::int4, $36::int4, $37::int4, $38::int4, $39::int4, $40::int4, $41::int4, $42::int4, $43::int4, $44::int4, $45::int4, $46::int4, $47::int4, $48::int4, $49::int4, $50::int4, $51::int4, $52::int4, $53::int4, $54::int4, $55::int4, $56::int4, $57::int4, $58::int4, $59::int4, $60::int4, $61::int4, $62::int4, $63::int4, $64::int4, $65::int4, $67::int4, $68::int4, $69::int4)", &many)!
+    let some(w) = wide.next()! else {
+        assert(false)
+        return
+    }
+    assert_eq(w.int(0), 3i64)
+    assert_eq(w.int(1), 6i64)
+    assert(bytes_same(w.bytes(2), b"\\x41\x00\xff"))
+    assert(w.is_null(3))
+    // Untyped parameters in the select list arrive as text.
+    t := [db.Value.Int(5)]
+    rows2 := conn.select("select $1", &t)!
+    let some(r2) = rows2.next()! else {
+        assert(false)
+        return
+    }
+    assert(same(r2.text(0), "5"))
+}
+
+fn encodings() {
+    conn := postgres.connect(b"postgres://dodo:secret@127.0.0.1:55432/dodo?sslmode=disable&application_name=dodo-checks", unsafe {
+        &mut FIRST[..]
+    })!
+    conn.exec("set client_encoding = 'LATIN1'")!
+    empty: [0]db.Value = []
+    match conn.execute("select 1", &empty) {
+        ok(_) => assert(false),
+        err(e) => assert(e.kind == db.ErrorKind.Unsupported),
+    }
+    conn.exec("set client_encoding = 'UTF8'")!
+    assert_eq(conn.execute("select 1", &empty)!, 1u64)
+}
+
+@derive(Row)
+struct Member {
+    id: i64
+    name: &str
+    @db_name("score")
+    points: Option<f64>
+}
+
+struct Names {
+    total: usize
+
+    pub fn row(&mut self, row: &dyn sql.Row) -> void!db.Error {
+        member := Member.decode_row(row)?
+        self.total += mem.str_bytes(member.name).len
+        ok()
+    }
+}
+
+fn insert_members<C: sql.Conn>(conn: &mut C) -> void!db.Error {
+    m := Member { id: 1, name: "ada", points: some(1.5) }
+    p := m.params()
+    conn.execute("insert into members(id, name, score) values ($1, $2, $3)", &p)?
+    m2 := Member { id: 2, name: "grace", points: none }
+    p2 := m2.params()
+    conn.execute("insert into members(id, name, score) values ($1, $2, $3)", &p2)?
+    ok()
+}
+
+fn generic_code_and_row_derive() {
+    conn := postgres.connect(b"postgres://dodo:secret@127.0.0.1:55432/dodo?sslmode=disable&application_name=dodo-checks", unsafe {
+        &mut FIRST[..]
+    })!
+    conn.exec("create temp table members(id int8 primary key, name text, score float8)")!
+    insert_members(&mut conn)!
+    dynamic: &mut dyn sql.Conn = &mut conn
+    names := Names { total: 0 }
+    empty: [0]db.Value = []
+    dynamic.query("select * from members order by id", &empty, &mut names)!
+    assert_eq(names.total, 8usize)
+    rows := conn.select("select name, score, id from members order by id", &empty)!
+    let some(row) = rows.next()! else {
+        assert(false)
+        return
+    }
+    member := Member.decode_row(&row)!
+    assert_eq(member.id, 1i64)
+    assert(same(member.name, "ada"))
+}
+
+fn notifications() {
+    conn := postgres.connect(b"postgres://dodo:secret@127.0.0.1:55432/dodo?sslmode=disable&application_name=dodo-checks", unsafe {
+        &mut FIRST[..]
+    })!
+    conn.exec("listen jobs")!
+    match conn.notification(0)! {
+        some(_) => assert(false),
+        none => {},
+    }
+    conn.exec("notify jobs, 'one'; notify other, 'skip'; select pg_notify('jobs', 'two')")!
+    let some(n1) = conn.notification(1000)! else {
+        assert(false)
+        return
+    }
+    assert(same(n1.channel, "jobs"))
+    assert(same(n1.payload, "one"))
+    let some(n2) = conn.notification(1000)! else {
+        assert(false)
+        return
+    }
+    assert(same(n2.payload, "two"))
+    // A notification from another session arrives while we wait.
+    other := postgres.connect(b"postgres://dodo:secret@127.0.0.1:55432/dodo?sslmode=disable&application_name=dodo-checks", unsafe {
+        &mut SECOND[..]
+    })!
+    other.exec("notify jobs, 'three'")!
+    let some(n3) = conn.notification(5000)! else {
+        assert(false)
+        return
+    }
+    assert(same(n3.payload, "three"))
+    match conn.notification(50)! {
+        some(_) => assert(false),
+        none => {},
+    }
+    conn.exec("select 1")!
+    // notification(0) looks at the socket of an idle connection.
+    other.exec("notify jobs, 'four'")!
+    thread.sleep_ms(200)
+    let some(n4) = conn.notification(0)! else {
+        assert(false)
+        return
+    }
+    assert(same(n4.payload, "four"))
+    // A returned notification does not survive a reconnect.
+    conn.open()!
+    conn.exec("listen jobs")!
+    other.exec("notify jobs, 'five'")!
+    let some(n5) = conn.notification(5000)! else {
+        assert(false)
+        return
+    }
+    assert(same(n5.payload, "five"))
+}
+
+fn timeouts_and_cancellation() {
+    storage := [0u8; 128]
+    config := postgres.Config.parse(b"postgres://dodo:secret@127.0.0.1:55432/dodo?sslmode=disable&application_name=dodo-checks", &mut storage)!
+    config.timeout_ms = 300
+    conn := postgres.Connection.connect(config.clone(), unsafe {
+        &mut FIRST[..]
+    })!
+    empty: [0]db.Value = []
+    match conn.execute("select pg_sleep(30)", &empty) {
+        ok(_) => assert(false),
+        err(e) => assert(e.kind == db.ErrorKind.Timeout),
+    }
+    // Cancel the statement that is still running, then continue.
+    key := conn.cancel_key()
+    postgres.cancel(&config, &key)!
+    count := sql.ScalarInt.new()
+    conn.query("select 3", &empty, &mut count)!
+    assert_eq(count.value, 3i64)
+    // statement_timeout cancels on the server side.
+    conn.exec("set statement_timeout = 50")!
+    match conn.exec("select pg_sleep(5)") {
+        ok() => assert(false),
+        err(e) => assert(e.kind == db.ErrorKind.Interrupted),
+    }
+    conn.exec("select 1")!
+}
+
+fn pool_reuses_and_replaces_connections() {
+    storage := [0u8; 128]
+    config := postgres.Config.parse(b"postgres://dodo:secret@127.0.0.1:55432/dodo?sslmode=disable&application_name=dodo-checks", &mut storage)!
+    conns := [postgres.Connection.new(config.clone(), unsafe {
+        &mut SECOND[..]
+    })!, postgres.Connection.new(config.clone(), unsafe {
+        &mut THIRD[..]
+    })!]
+    pool := db.Pool.new(&mut conns)!
+    assert_eq(pool.idle(), 2usize)
+    empty: [0]db.Value = []
+    pid := sql.ScalarInt.new()
+    {
+        lease := pool.get()!
+        lease.conn().query("select pg_backend_pid()", &empty, &mut pid)!
+        // Leave a transaction open; returning the connection rolls it back.
+        lease.conn().exec("begin")!
+    }
+    assert_eq(pool.idle(), 2usize)
+    again := sql.ScalarInt.new()
+    {
+        lease := pool.get()!
+        assert(!lease.conn().in_transaction())
+        lease.conn().query("select pg_backend_pid()", &empty, &mut again)!
+    }
+    assert_eq(again.value, pid.value)
+    // Two connections at once through tickets.
+    a := pool.acquire()!
+    b := pool.acquire()!
+    match pool.acquire() {
+        ok(_) => assert(false),
+        err(e) => assert(e.kind == db.ErrorKind.Capacity),
+    }
+    pa := sql.ScalarInt.new()
+    pb := sql.ScalarInt.new()
+    pool.conn(&a).query("select pg_backend_pid()", &empty, &mut pa)!
+    pool.conn(&b).query("select pg_backend_pid()", &empty, &mut pb)!
+    assert(pa.value != pb.value)
+    // Kill one backend; check_on_get replaces it.
+    killer := postgres.connect(b"postgres://dodo:secret@127.0.0.1:55432/dodo?sslmode=disable&application_name=dodo-checks", unsafe {
+        &mut FIRST[..]
+    })!
+    target := [db.Value.Int(pa.value)]
+    killer.execute("select pg_terminate_backend($1::int4)", &target)!
+    pool.release(a)
+    pool.release(b)
+    pool.check_on_get(true)
+    for i in 0usize..4 {
+        lease := pool.get()!
+        lease.conn().exec("select 1")!
+    }
+    // A connection returned in the middle of a long response is closed
+    // rather than drained, and reopened by the next get.
+    before := sql.ScalarInt.new()
+    {
+        lease := pool.get()!
+        lease.conn().query("select pg_backend_pid()", &empty, &mut before)!
+        rows := lease.conn().select("select g, pg_sleep(0.001) from generate_series(1, 100000) g", &empty)!
+        match rows.next()! {
+            some(_) => {},
+            none => assert(false),
+        }
+    }
+    after := sql.ScalarInt.new()
+    {
+        lease := pool.get()!
+        lease.conn().query("select pg_backend_pid()", &empty, &mut after)!
+    }
+    assert(before.value != after.value)
+}
+
+fn main() -> i32 {
+    scram_login_and_value_round_trip()
+    console.println("scram_login_and_value_round_trip ... ok")!
+    every_password_method()
+    console.println("every_password_method ... ok")!
+    wrong_password_is_an_auth_error()
+    console.println("wrong_password_is_an_auth_error ... ok")!
+    tls_modes()
+    console.println("tls_modes ... ok")!
+    errors_map_to_portable_kinds()
+    console.println("errors_map_to_portable_kinds ... ok")!
+    transactions()
+    console.println("transactions ... ok")!
+    statement_cache()
+    console.println("statement_cache ... ok")!
+    abandoned_cursors_and_large_rows()
+    console.println("abandoned_cursors_and_large_rows ... ok")!
+    parameters_convert_for_their_types()
+    console.println("parameters_convert_for_their_types ... ok")!
+    generic_code_and_row_derive()
+    console.println("generic_code_and_row_derive ... ok")!
+    notifications()
+    console.println("notifications ... ok")!
+    timeouts_and_cancellation()
+    console.println("timeouts_and_cancellation ... ok")!
+    pool_reuses_and_replaces_connections()
+    console.println("pool_reuses_and_replaces_connections ... ok")!
+    encodings()
+    console.println("encodings ... ok")!
+    return 0
+}

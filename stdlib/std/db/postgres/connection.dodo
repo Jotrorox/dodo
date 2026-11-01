@@ -1,0 +1,2011 @@
+package postgres
+
+import "core/mem"
+import "core/option"
+import "core/slice"
+import "std/crypto"
+import "std/crypto/openssl" as digest
+import "std/crypto/random"
+import "std/db"
+import "std/db/postgres/protocol"
+import "std/db/sql"
+import "std/hash"
+import "std/io"
+import "std/net"
+import "std/net/native"
+import "std/net/operations"
+import "std/text"
+import "std/tls"
+import "std/tls/openssl"
+import "std/tls/stream"
+
+// A blocking PostgreSQL client (protocol 3.0) over TCP, with optional TLS.
+// Everything lives in the caller's workspace: TLS staging, the send and
+// receive buffers, the statement cache, the current result's column table,
+// queued notifications, and the last error's text. Nothing is allocated
+// except by OpenSSL inside the TLS and hash functions.
+//
+//     conn := postgres.connect(b"postgres://app:secret@localhost/app", workspace)?
+//     params := [db.Value.Int(7)]
+//     rows := conn.select("select id, name from users where team = $1", &params)?
+//     for {
+//         let some(row) = rows.next()? else { break }
+//         ...
+//     }
+
+// Suggested workspace: rows (DataRow messages) up to about 200 KiB.
+pub const WORKSPACE_BYTES: usize = 262144
+pub const MIN_WORKSPACE_BYTES: usize = 65536
+// Server-side prepared statements kept per connection.
+pub const STATEMENT_SLOTS: usize = 32
+// Columns per result.
+pub const MAX_COLUMNS: usize = 256
+
+const TLS_BYTES: usize = 4096
+const NOTES_BYTES: usize = 1024
+const MESSAGE_AT: usize = 0
+const MESSAGE_BYTES: usize = 640
+const DETAIL_AT: usize = 640
+const DETAIL_BYTES: usize = 256
+const HINT_AT: usize = 896
+const HINT_BYTES: usize = 128
+const ENTRY_BYTES: usize = 16
+const NAMES_AT: usize = 4096
+const COLUMN_BYTES: usize = 12288
+// Per slot (and the unnamed statement): which result columns use binary.
+const SLOT_META: usize = 32
+const UNNAMED: usize = 32
+const TEXT_AT: usize = 1056
+const CACHE_BYTES: usize = 19552
+const QUEUE_BYTES: usize = 4096
+const OUTPUT_BYTES: usize = 8192
+const FOREVER: u64 = 18446744073709551615u64
+
+fn failure(kind: db.ErrorKind) -> db.Error {
+    db.Error.new(kind, 0)
+}
+
+fn deadline(now: u64, milliseconds: u64) -> u64 {
+    if milliseconds == 0 || milliseconds > FOREVER - now {
+        return FOREVER
+    }
+    now + milliseconds
+}
+
+fn now_ms() -> u64 {
+    clock := native.MonotonicClock {}
+    clock.now_ms()
+}
+
+fn io_failure(reason: io.Error) -> db.Error {
+    if reason.kind == io.ErrorKind.TimedOut {
+        return db.Error.new(db.ErrorKind.Timeout, reason.code)
+    }
+    if reason.kind == io.ErrorKind.Cancelled {
+        return db.Error.new(db.ErrorKind.Interrupted, reason.code)
+    }
+    db.Error.new(db.ErrorKind.Io, reason.code)
+}
+
+fn net_failure(reason: net.Error, kind: db.ErrorKind) -> db.Error {
+    if reason.kind == net.ErrorKind.TimedOut {
+        return db.Error.new(db.ErrorKind.Timeout, reason.code)
+    }
+    db.Error.new(kind, reason.code)
+}
+
+fn tls_failure(reason: tls.Error) -> db.Error {
+    if reason.kind == tls.ErrorKind.TimedOut {
+        return db.Error.new(db.ErrorKind.Timeout, reason.code)
+    }
+    if reason.kind == tls.ErrorKind.VerificationFailed {
+        return db.Error.new(db.ErrorKind.Auth, reason.code)
+    }
+    if reason.kind == tls.ErrorKind.Transport || reason.kind == tls.ErrorKind.Closed || reason.kind == tls.ErrorKind.Truncated {
+        return db.Error.new(db.ErrorKind.Io, reason.code)
+    }
+    db.Error.new(db.ErrorKind.Connect, reason.code)
+}
+
+// SHA-256, HMAC, PBKDF2 and MD5 from OpenSSL for password authentication.
+struct OpenSslHashes {
+    pub fn sha256(&mut self, data: &[u8]) -> [32]u8!db.Error {
+        match digest.sha256(data) {
+            ok(v) => ok(v),
+            err(reason) => err(db.Error.new(db.ErrorKind.Internal, reason.code)),
+        }
+    }
+
+    pub fn hmac_sha256(&mut self, key: &[u8], data: &[u8]) -> [32]u8!db.Error {
+        match digest.hmac_sha256(key, data) {
+            ok(v) => ok(v),
+            err(reason) => err(db.Error.new(db.ErrorKind.Internal, reason.code)),
+        }
+    }
+
+    pub fn pbkdf2_sha256(&mut self, password: &[u8], salt: &[u8], iterations: u32) -> [32]u8!db.Error {
+        out := [0u8; 32]
+        match digest.pbkdf2_hmac_sha256(password, salt, iterations, &mut out) {
+            ok() => ok(out),
+            err(reason) => err(db.Error.new(db.ErrorKind.Internal, reason.code)),
+        }
+    }
+
+    pub fn md5(&mut self, first: &[u8], second: &[u8]) -> [16]u8!db.Error {
+        match md5_of(first, second) {
+            ok(v) => ok(v),
+            err(reason) => err(db.Error.new(db.ErrorKind.Internal, reason.code)),
+        }
+    }
+}
+
+fn md5_of(first: &[u8], second: &[u8]) -> [16]u8!crypto.Error {
+    h := digest.Md5.new()?
+    h.update(first)?
+    h.update(second)?
+    h.finish()
+}
+
+// The socket, and the TLS state when the connection is encrypted. The TLS
+// stream borrows the socket and staging buffers only during each call.
+struct Link {
+    socket: native.TcpConnection
+    tls: Option<stream.State<openssl.Engine>>
+    secure: bool
+    tls_in: &mut[u8]
+    tls_out: &mut[u8]
+
+    fn close(&mut self) {
+        option.take(&mut self.tls)
+        self.secure = false
+        match self.socket.close() {
+            ok() => {},
+            err(_) => {},
+        }
+    }
+
+    // Reads at least one byte; 0 means the server closed the connection.
+    fn read(&mut self, destination: &mut[u8], until: u64) -> usize!db.Error {
+        if !self.secure {
+            clock := native.MonotonicClock {}
+            cancel := net.NeverCancel {}
+            operation := net.Operation.unlimited()
+            if until != FOREVER {
+                operation = net.Operation.until(until)
+            }
+            match operations.read(&mut self.socket, destination, &operation, &mut clock, &cancel) {
+                ok(n) => {
+                    return ok(n)
+                },
+                err(reason) => {
+                    return err(io_failure(reason))
+                },
+            }
+        }
+        let some(state) = option.take(&mut self.tls) else {
+            return err(failure(db.ErrorKind.Io))
+        }
+        s := stream.Stream.resume(state, &mut self.socket, &mut self.tls_in[..], &mut self.tls_out[..])
+        match s {
+            ok(active) => {
+                result := secure_read(&mut active, destination, until)
+                self.tls = some(active.suspend())
+                result
+            },
+            err(reason) => err(tls_failure(reason)),
+        }
+    }
+
+    fn write_all(&mut self, data: &[u8], until: u64) -> void!db.Error {
+        if !self.secure {
+            clock := native.MonotonicClock {}
+            cancel := net.NeverCancel {}
+            operation := net.Operation.unlimited()
+            if until != FOREVER {
+                operation = net.Operation.until(until)
+            }
+            match operations.write_all(&mut self.socket, data, &operation, &mut clock, &cancel) {
+                ok(_) => {
+                    return ok()
+                },
+                err(reason) => {
+                    return err(io_failure(reason))
+                },
+            }
+        }
+        let some(state) = option.take(&mut self.tls) else {
+            return err(failure(db.ErrorKind.Io))
+        }
+        s := stream.Stream.resume(state, &mut self.socket, &mut self.tls_in[..], &mut self.tls_out[..])
+        match s {
+            ok(active) => {
+                result := secure_write(&mut active, data, until)
+                self.tls = some(active.suspend())
+                result
+            },
+            err(reason) => err(tls_failure(reason)),
+        }
+    }
+
+    fn start_tls(&mut self, engine: openssl.Engine, until: u64) -> void!db.Error {
+        s := stream.Stream.new(engine, &mut self.socket, &mut self.tls_in[..], &mut self.tls_out[..])
+        match s {
+            ok(active) => {
+                result := secure_handshake(&mut active, until)
+                self.tls = some(active.suspend())
+                self.secure = true
+                result
+            },
+            err(reason) => err(tls_failure(reason)),
+        }
+    }
+}
+
+fn secure_wait(s: &mut stream.Stream<openssl.Engine, native.TcpConnection>, until: u64) -> void!db.Error {
+    now := now_ms()
+    if now >= until {
+        return err(failure(db.ErrorKind.Timeout))
+    }
+    match s.pump() {
+        ok(progressed) => {
+            if progressed {
+                return ok()
+            }
+        },
+        err(reason) => {
+            return err(tls_failure(reason))
+        },
+    }
+    interest := net.Interest.Read
+    if s.output_pending() {
+        interest = net.Interest.Write
+    }
+    wait := until - now
+    if wait > 100 {
+        wait = 100
+    }
+    match s.transport().wait_ready(interest, wait as u32) {
+        ok(_) => ok(),
+        err(reason) => {
+            if reason.kind == net.ErrorKind.Interrupted {
+                return ok()
+            }
+            err(net_failure(reason, db.ErrorKind.Io))
+        },
+    }
+}
+
+fn secure_handshake(s: &mut stream.Stream<openssl.Engine, native.TcpConnection>, until: u64) -> void!db.Error {
+    for {
+        match s.handshake() {
+            ok(state) => {
+                if state == tls.State.Ready {
+                    return ok()
+                }
+                if state == tls.State.Closed {
+                    return err(failure(db.ErrorKind.Connect))
+                }
+            },
+            err(reason) => {
+                return err(tls_failure(reason))
+            },
+        }
+        secure_wait(s, until)?
+    }
+}
+
+fn secure_read(s: &mut stream.Stream<openssl.Engine, native.TcpConnection>, destination: &mut[u8], until: u64) -> usize!db.Error {
+    for {
+        match s.poll_read(destination) {
+            ok(progress) => {
+                if progress.transferred != 0 {
+                    return ok(progress.transferred)
+                }
+                if progress.state == io.PollState.Eof {
+                    return ok(0)
+                }
+            },
+            err(reason) => {
+                match s.take_error() {
+                    some(cause) => {
+                        return err(tls_failure(cause))
+                    },
+                    none => {
+                        return err(io_failure(reason))
+                    },
+                }
+            },
+        }
+        secure_wait(s, until)?
+    }
+}
+
+fn secure_write(s: &mut stream.Stream<openssl.Engine, native.TcpConnection>, data: &[u8], until: u64) -> void!db.Error {
+    total := 0usize
+    for total < data.len {
+        match s.poll_write(&data[total..]) {
+            ok(progress) => {
+                total += progress.transferred
+                if progress.transferred == 0 {
+                    secure_wait(s, until)?
+                }
+            },
+            err(reason) => {
+                match s.take_error() {
+                    some(cause) => {
+                        return err(tls_failure(cause))
+                    },
+                    none => {
+                        return err(io_failure(reason))
+                    },
+                }
+            },
+        }
+    }
+    for {
+        match s.flush() {
+            ok(state) => {
+                if state == tls.State.Ready {
+                    return ok()
+                }
+            },
+            err(reason) => {
+                return err(tls_failure(reason))
+            },
+        }
+        secure_wait(s, until)?
+    }
+}
+
+// A complete message in the receive buffer: input[start..start + body].
+struct Message {
+    tag: u8
+    start: usize
+    body: usize
+    // The message did not fit the receive buffer and was skipped.
+    oversize: bool
+}
+
+// Send and receive buffers over the link. Protocol writers stream through
+// `put`; `message` returns one complete backend message at a time, valid
+// until the next call.
+struct Wire {
+    link: Link
+    output: &mut[u8]
+    out_used: usize
+    input: &mut[u8]
+    in_start: usize
+    in_end: usize
+    consumed: usize
+    until: u64
+    broken: bool
+
+    pub fn put(&mut self, data: &[u8]) -> void!db.Error {
+        if data.len > self.output.len - self.out_used {
+            self.flush()?
+            if data.len > self.output.len {
+                until := self.until
+                match self.link.write_all(data, until) {
+                    ok() => {
+                        return ok()
+                    },
+                    err(reason) => {
+                        self.broken = true
+                        return err(reason)
+                    },
+                }
+            }
+        }
+        for i in 0usize..data.len {
+            self.output[self.out_used + i] = data[i]
+        }
+        self.out_used += data.len
+        ok()
+    }
+
+    fn flush(&mut self) -> void!db.Error {
+        if self.out_used == 0 {
+            return ok()
+        }
+        n := self.out_used
+        self.out_used = 0
+        until := self.until
+        match self.link.write_all(&self.output[..n], until) {
+            ok() => ok(),
+            err(reason) => {
+                self.broken = true
+                err(reason)
+            },
+        }
+    }
+
+    fn reset(&mut self) {
+        self.out_used = 0
+        self.in_start = 0
+        self.in_end = 0
+        self.consumed = 0
+        self.broken = false
+    }
+
+    fn fill(&mut self) -> void!db.Error {
+        until := self.until
+        end := self.in_end
+        n := self.link.read(&mut self.input[end..], until)?
+        if n == 0 {
+            self.broken = true
+            return err(failure(db.ErrorKind.Io))
+        }
+        self.in_end += n
+        ok()
+    }
+
+    // Reads and drops `remaining` bytes, keeping whatever follows them.
+    // Any failure here loses the count, so it breaks the connection.
+    fn discard(&mut self, remaining: usize) -> void!db.Error {
+        left := remaining
+        for left > 0 {
+            self.in_start = 0
+            self.in_end = 0
+            match self.fill() {
+                ok() => {},
+                err(reason) => {
+                    self.broken = true
+                    return err(reason)
+                },
+            }
+            if self.in_end > left {
+                self.in_start = left
+                return ok()
+            }
+            left -= self.in_end
+        }
+        self.in_start = 0
+        self.in_end = 0
+        ok()
+    }
+
+    fn message(&mut self) -> Message!db.Error {
+        if self.broken {
+            return err(failure(db.ErrorKind.Io))
+        }
+        self.in_start += self.consumed
+        self.consumed = 0
+        for {
+            available := self.in_end - self.in_start
+            need := 5usize
+            if available >= 5 {
+                f := match protocol.frame(&self.input[self.in_start..self.in_end]) {
+                    ok(some(value)) => value,
+                    ok(none) => {
+                        self.broken = true
+                        return err(protocol.violation())
+                    },
+                    err(reason) => {
+                        self.broken = true
+                        return err(reason)
+                    },
+                }
+                total := 5 + f.body
+                if total <= available {
+                    self.consumed = total
+                    return ok(Message { tag: f.tag, start: self.in_start + 5, body: f.body, oversize: false })
+                }
+                if total > self.input.len {
+                    self.discard(total - available)?
+                    return ok(Message { tag: f.tag, start: 0, body: 0, oversize: true })
+                }
+                need = total
+            }
+            if self.in_start == self.in_end {
+                self.in_start = 0
+                self.in_end = 0
+            } else if self.in_start + need > self.input.len {
+                for i in 0usize..available {
+                    self.input[i] = self.input[self.in_start + i]
+                }
+                self.in_start = 0
+                self.in_end = available
+            }
+            match self.fill() {
+                ok() => {},
+                err(reason) => {
+                    if reason.kind != db.ErrorKind.Timeout {
+                        self.broken = true
+                    }
+                    return err(reason)
+                },
+            }
+        }
+    }
+}
+
+fn rd16(b: &[u8], o: usize) -> usize {
+    ((b[o] as usize) << 8) | (b[o + 1] as usize)
+}
+
+fn wr16(b: &mut[u8], o: usize, v: usize) {
+    b[o] = ((v >> 8) & 255) as u8
+    b[o + 1] = (v & 255) as u8
+}
+
+fn rd32(b: &[u8], o: usize) -> u32 {
+    ((b[o] as u32) << 24) | ((b[o + 1] as u32) << 16) | ((b[o + 2] as u32) << 8) | (b[o + 3] as u32)
+}
+
+fn wr32(b: &mut[u8], o: usize, v: u32) {
+    b[o] = (v >> 24) as u8
+    b[o + 1] = ((v >> 16) & 255) as u8
+    b[o + 2] = ((v >> 8) & 255) as u8
+    b[o + 3] = (v & 255) as u8
+}
+
+// Copies the fields of a RowDescription into the column table: per column
+// a 16-byte entry (name offset u32, name length u16, kind, format, value
+// start u32, value length i32 as u32) and the names after NAMES_AT.
+fn load_columns(body: &[u8], table: &mut[u8]) -> usize!db.Error {
+    fields := protocol.Fields.new(body)?
+    count := fields.count()
+    if count > MAX_COLUMNS {
+        return err(failure(db.ErrorKind.Capacity))
+    }
+    names := NAMES_AT
+    for i in 0usize..count {
+        let some(f) = fields.next()? else {
+            return err(protocol.violation())
+        }
+        name := &body[f.name.start..f.name.end]
+        match text.validate(name) {
+            ok() => {},
+            err(_) => {
+                return err(protocol.violation())
+            },
+        }
+        if name.len > table.len - names || name.len > 65535 {
+            return err(failure(db.ErrorKind.Capacity))
+        }
+        for j in 0usize..name.len {
+            table[names + j] = name[j]
+        }
+        e := i * ENTRY_BYTES
+        wr32(table, e, names as u32)
+        wr16(table, e + 4, name.len)
+        table[e + 6] = protocol.kind_of(f.type_oid)
+        table[e + 7] = f.format as u8
+        names += name.len
+    }
+    ok(count)
+}
+
+// Records where each value of a DataRow lies in the receive buffer.
+fn index_row(body: &[u8], base: usize, table: &mut[u8], count: usize) -> void!db.Error {
+    columns := protocol.Columns.new(body)?
+    if columns.count() != count {
+        return err(protocol.violation())
+    }
+    span := protocol.Span.empty()
+    for i in 0usize..count {
+        e := i * ENTRY_BYTES
+        match columns.next(&mut span)? {
+            some(present) => {
+                if present {
+                    wr32(table, e + 8, (base + span.start) as u32)
+                    wr32(table, e + 12, (span.end - span.start) as u32)
+                } else {
+                    wr32(table, e + 8, 0)
+                    wr32(table, e + 12, 4294967295u32)
+                }
+            },
+            none => {
+                return err(protocol.violation())
+            },
+        }
+    }
+    ok()
+}
+
+// Copies the error text fields into the notes area.
+struct Recorded {
+    code: [5]u8
+    has_code: bool
+    message: usize
+    detail: usize
+    hint: usize
+    position: i32
+}
+
+fn copy_field(body: &[u8], span: &protocol.Span, notes: &mut[u8], at: usize, room: usize) -> usize {
+    n := span.end - span.start
+    if n > room {
+        n = room
+        // Never cut a UTF-8 sequence in half.
+        for n > 0 && (body[span.start + n] & 192) == 128 {
+            n -= 1
+        }
+    }
+    for i in 0usize..n {
+        notes[at + i] = body[span.start + i]
+    }
+    n
+}
+
+fn record(body: &[u8], notes: &mut[u8]) -> Recorded!db.Error {
+    fields := protocol.notice(body)?
+    result := Recorded { code: [0u8; 5], has_code: false, message: 0, detail: 0, hint: 0, position: fields.position }
+    if fields.code.len() == 5 {
+        for i in 0usize..5 {
+            result.code[i] = body[fields.code.start + i]
+        }
+        result.has_code = true
+    }
+    result.message = copy_field(body, &fields.message, notes, MESSAGE_AT, MESSAGE_BYTES)
+    result.detail = copy_field(body, &fields.detail, notes, DETAIL_AT, DETAIL_BYTES)
+    result.hint = copy_field(body, &fields.hint, notes, HINT_AT, HINT_BYTES)
+    ok(result)
+}
+
+fn text_of(bytes: &[u8]) -> &str from(bytes) {
+    match text.validate(bytes) {
+        ok() => unsafe {
+            mem.str_from_utf8(bytes)
+        },
+        err(_) => "",
+    }
+}
+
+fn statement_name(serial: u64, out: &mut[u8]) -> usize {
+    prefix := b"dodo_"
+    for i in 0usize..prefix.len {
+        out[i] = prefix[i]
+    }
+    n := protocol.format_int(serial as i64, &mut out[prefix.len..])
+    prefix.len + n
+}
+
+fn connect_socket(host: &[u8], port: u16, until: u64) -> native.TcpConnection!db.Error {
+    clock := native.MonotonicClock {}
+    cancel := net.NeverCancel {}
+    operation := net.Operation.unlimited()
+    if until != FOREVER {
+        operation = net.Operation.until(until)
+    }
+    address_bytes := [0u8; 384]
+    addresses: native.Addresses
+    match native.resolve(host, port, &mut address_bytes) {
+        ok(value) => {
+            addresses = value
+        },
+        err(reason) => {
+            return err(net_failure(reason, db.ErrorKind.Connect))
+        },
+    }
+    last := net.failure(net.ErrorKind.NameNotFound)
+    for i in 0usize..addresses.len() {
+        match addresses.get(i) {
+            ok(address) => {
+                match native.connect_with(&address, &operation, &mut clock, &cancel) {
+                    ok(socket) => {
+                        return ok(socket)
+                    },
+                    err(reason) => {
+                        last = reason
+                    },
+                }
+            },
+            err(reason) => {
+                last = reason
+            },
+        }
+    }
+    err(net_failure(last, db.ErrorKind.Connect))
+}
+
+fn tls_engine(config: &Config) -> openssl.Engine!db.Error {
+    settings := openssl.Config.client(config.host)
+    settings.trust_pem = config.trust_pem
+    settings.system_roots = config.trust_pem.len == 0
+    match &config.ssl_mode {
+        SslMode.VerifyFull => {},
+        SslMode.VerifyCa => {
+            settings.verify = openssl.Verify.Chain
+        },
+        SslMode.Require => {
+            // As in libpq, require with explicit roots checks the chain.
+            settings.verify = openssl.Verify.None
+            if config.trust_pem.len != 0 {
+                settings.verify = openssl.Verify.Chain
+            }
+        },
+        _ => {
+            settings.verify = openssl.Verify.None
+        },
+    }
+    match openssl.Engine.client(&settings) {
+        ok(engine) => ok(engine),
+        err(reason) => err(tls_failure(reason)),
+    }
+}
+
+// The key that lets another connection cancel this one's running statement.
+pub struct CancelKey {
+    pub process_id: i32
+    pub secret_key: i32
+}
+
+// Asks the server to cancel the statement that the connection identified by
+// `key` is running (if any), over a new connection made with `config`. The
+// cancelled statement fails with ErrorKind.Interrupted (SQLSTATE 57014).
+// Like libpq, this does not wait for the cancellation to take effect.
+pub fn cancel(config: &Config, key: &CancelKey) -> void!db.Error {
+    until := deadline(now_ms(), config.connect_timeout_ms)
+    tls_in := [0u8; TLS_BYTES]
+    tls_out := [0u8; TLS_BYTES]
+    link := Link { socket: connect_socket(config.host, config.port, until)?, tls: none, secure: false,
+    tls_in: &mut tls_in[..], tls_out: &mut tls_out[..] }
+    mode := mode_number(&config.ssl_mode)
+    out := [0u8; 16]
+    // The secret key travels encrypted whenever the server offers TLS.
+    if mode >= 1 {
+        b := protocol.Buffer.new(&mut out)
+        protocol.ssl_request(&mut b)?
+        link.write_all(b.bytes(), until)?
+        answer := [0u8; 1]
+        if link.read(&mut answer, until)? != 1 {
+            link.close()
+            return err(failure(db.ErrorKind.Connect))
+        }
+        if answer[0] == b'S' {
+            link.start_tls(tls_engine(config)?, until)?
+        } else if answer[0] != b'N' || mode >= 2 {
+            link.close()
+            return err(failure(db.ErrorKind.Connect))
+        }
+    }
+    request := protocol.Buffer.new(&mut out)
+    protocol.cancel_request(&mut request, key.process_id, key.secret_key)?
+    link.write_all(request.bytes(), until)?
+    link.close()
+    ok()
+}
+
+pub struct Connection {
+    config: Config
+    wire: Wire
+    cache: &mut[u8]
+    columns: &mut[u8]
+    notes: &mut[u8]
+    queue: &mut[u8]
+    connected: bool
+    status: u8
+    // A response has not been read up to its ReadyForQuery yet.
+    pending: bool
+    utf8: bool
+    process_id: i32
+    secret_key: i32
+    server_version: u32
+    code: [5]u8
+    has_code: bool
+    message_len: usize
+    detail_len: usize
+    hint_len: usize
+    // Result state: failure 0 none, 1 server error (code), 2 local error kind.
+    failure: u8
+    failure_kind: u8
+    failure_position: i32
+    affected: u64
+    rolled_back: bool
+    column_count: usize
+    queue_used: usize
+    // Bytes of the queue entry last returned by `notification`.
+    taken: usize
+    dropped: u64
+    // The current message is a DataRow not yet handed to the caller.
+    held: bool
+    // The response in progress belongs to the extended query protocol.
+    extended: bool
+    // Statement cache: slot i holds statement "dodo_<name[i]>" for the SQL
+    // text cache[TEXT_AT + text_at[i]..][..length[i]], hashed into hash[i];
+    // tick[i] is 0 for an empty slot, else the last use. Each statement's
+    // parameter kinds follow at cache[TEXT_AT + kinds_at[slot]..][..params]
+    // (slot UNNAMED for a statement that is not cached).
+    hash: [32]u64
+    text_at: [32]u32
+    length: [32]u32
+    name: [32]u64
+    tick: [32]u64
+    kinds_at: [33]u32
+    params: [33]u16
+    results: [33]u16
+    text_used: usize
+    clock: u64
+    serial: u64
+
+    // A disconnected connection over `workspace` (at least
+    // MIN_WORKSPACE_BYTES); `open` connects it. Pools hold connections in
+    // this state until they are first needed.
+    pub fn new(config: Config, workspace: &mut[u8]) -> Connection!db.Error from(config, workspace) {
+        if workspace.len < MIN_WORKSPACE_BYTES {
+            return err(failure(db.ErrorKind.Capacity))
+        }
+        let some(slice.SplitMut { left: tls_in, right: r1 }) = slice.split_at_mut(workspace, TLS_BYTES) else {
+            return err(failure(db.ErrorKind.Capacity))
+        }
+        let some(slice.SplitMut { left: tls_out, right: r2 }) = slice.split_at_mut(r1, TLS_BYTES) else {
+            return err(failure(db.ErrorKind.Capacity))
+        }
+        let some(slice.SplitMut { left: notes, right: r3 }) = slice.split_at_mut(r2, NOTES_BYTES) else {
+            return err(failure(db.ErrorKind.Capacity))
+        }
+        let some(slice.SplitMut { left: columns, right: r4 }) = slice.split_at_mut(r3, COLUMN_BYTES) else {
+            return err(failure(db.ErrorKind.Capacity))
+        }
+        let some(slice.SplitMut { left: cache, right: r5 }) = slice.split_at_mut(r4, CACHE_BYTES) else {
+            return err(failure(db.ErrorKind.Capacity))
+        }
+        let some(slice.SplitMut { left: queue, right: r6 }) = slice.split_at_mut(r5, QUEUE_BYTES) else {
+            return err(failure(db.ErrorKind.Capacity))
+        }
+        let some(slice.SplitMut { left: output, right: input }) = slice.split_at_mut(r6, OUTPUT_BYTES) else {
+            return err(failure(db.ErrorKind.Capacity))
+        }
+        link := Link { socket: native.TcpConnection.closed(), tls: none, secure: false, tls_in, tls_out }
+        wire := Wire { link, output, out_used: 0, input, in_start: 0, in_end: 0, consumed: 0, until: FOREVER, broken: false }
+        ok(Connection { config, wire, cache, columns, notes, queue, connected: false, status: protocol.STATUS_IDLE,
+        pending: false, utf8: true, process_id: 0, secret_key: 0, server_version: 0, code: [0u8; 5],
+        has_code: false, message_len: 0, detail_len: 0, hint_len: 0, failure: 0, failure_kind: 0,
+        failure_position: -1, affected: 0, rolled_back: false, column_count: 0, queue_used: 0, taken: 0,
+        dropped: 0, held: false, extended: false,
+        hash: [0u64; 32], text_at: [0u32; 32], length: [0u32; 32], name: [0u64; 32], tick: [0u64; 32], kinds_at: [0u32; 33],
+        params: [0u16; 33], results: [0u16; 33], text_used: 0, clock: 0, serial: 0 })
+    }
+
+    // Connects to the server described by `config`.
+    pub fn connect(config: Config, workspace: &mut[u8]) -> Connection!db.Error from(config, workspace) {
+        conn := Connection.new(config, workspace)?
+        conn.open()?
+        ok(conn)
+    }
+
+    // (Re)connects: closes any current session, then resolves, connects,
+    // negotiates TLS as Config.ssl_mode asks, and authenticates with
+    // SCRAM-SHA-256, md5 or a cleartext password as the server requests.
+    pub fn open(&mut self) -> void!db.Error {
+        self.close()?
+        self.wire.until = deadline(now_ms(), self.config.connect_timeout_ms)
+        mode := mode_number(&self.config.ssl_mode)
+        result := self.attempt(mode >= 1)
+        match result {
+            ok() => {
+                self.wire.until = FOREVER
+                ok()
+            },
+            err(reason) => {
+                // prefer: whatever failed on the encrypted connection is
+                // tried again without TLS, as libpq does.
+                if mode == 1 && self.wire.link.secure && !self.connected {
+                    self.drop_session()
+                    match self.attempt(false) {
+                        ok() => {
+                            self.wire.until = FOREVER
+                            return ok()
+                        },
+                        err(second) => {
+                            self.drop_session()
+                            return err(second)
+                        },
+                    }
+                }
+                self.drop_session()
+                err(reason)
+            },
+        }
+    }
+
+    fn attempt(&mut self, use_tls: bool) -> void!db.Error {
+        self.clear_note()
+        if self.config.user.len == 0 {
+            return err(self.local(db.ErrorKind.Misuse, "no user name given"))
+        }
+        until := self.wire.until
+        socket := connect_socket(self.config.host, self.config.port, until)?
+        self.wire.link.socket = socket
+        self.wire.reset()
+        if use_tls {
+            protocol.ssl_request(&mut self.wire)?
+            self.wire.flush()?
+            answer := [0u8; 1]
+            if self.wire.link.read(&mut answer, until)? != 1 {
+                return err(self.local(db.ErrorKind.Connect, "server closed the connection during TLS negotiation"))
+            }
+            if answer[0] == b'S' {
+                engine := tls_engine(&self.config)?
+                self.wire.link.secure = true
+                self.wire.link.start_tls(engine, until)?
+            } else if answer[0] == b'N' {
+                if mode_number(&self.config.ssl_mode) >= 2 {
+                    return err(self.local(db.ErrorKind.Connect, "server does not support TLS"))
+                }
+            } else {
+                return err(self.local(db.ErrorKind.Protocol, "unexpected answer to the TLS request"))
+            }
+        }
+        protocol.startup(&mut self.wire, self.config.user, self.config.database, self.config.application_name)?
+        self.wire.flush()?
+        self.authenticate()
+    }
+
+    fn authenticate(&mut self) -> void!db.Error {
+        hashes := OpenSslHashes {}
+        scram: Option<protocol.Scram> = none
+        scram_started := false
+        scram_verified := false
+        authenticated := false
+        exchange := [0u8; 512]
+        for {
+            m := self.wire.message()?
+            if m.oversize {
+                return err(protocol.violation())
+            }
+            if m.tag == protocol.AUTHENTICATION {
+                code := protocol.auth_code(self.body(&m))?
+                if code == protocol.AUTH_OK {
+                    if scram_started && !scram_verified {
+                        return err(self.local(db.ErrorKind.Auth, "server skipped SCRAM verification"))
+                    }
+                    authenticated = true
+                } else if scram_started && code != protocol.AUTH_SASL_CONTINUE && code != protocol.AUTH_SASL_FINAL {
+                    // A server that switches methods mid-SCRAM could make
+                    // the client reveal the password.
+                    return err(self.local(db.ErrorKind.Auth, "server changed the authentication method during SCRAM"))
+                } else if code == protocol.AUTH_CLEARTEXT_PASSWORD {
+                    self.need_password()?
+                    protocol.password(&mut self.wire, self.config.password)?
+                    self.wire.flush()?
+                } else if code == protocol.AUTH_MD5_PASSWORD {
+                    self.need_password()?
+                    if m.body != 8 {
+                        return err(protocol.violation())
+                    }
+                    salt := [0u8; 4]
+                    for i in 0usize..4 {
+                        salt[i] = self.wire.input[m.start + 4 + i]
+                    }
+                    response := [0u8; 35]
+                    protocol.md5_password(&mut hashes, self.config.user, self.config.password, &salt, &mut response)?
+                    protocol.password(&mut self.wire, &response)?
+                    self.wire.flush()?
+                } else if code == protocol.AUTH_SASL {
+                    if !protocol.offers_mechanism(self.body(&m), b"SCRAM-SHA-256")? {
+                        return err(self.local(db.ErrorKind.Unsupported, "server offers no supported SASL mechanism"))
+                    }
+                    self.need_password()?
+                    raw := [0u8; 18]
+                    match random.fill(&mut raw) {
+                        ok() => {},
+                        err(_) => {
+                            return err(failure(db.ErrorKind.Internal))
+                        },
+                    }
+                    nonce := [0u8; 24]
+                    protocol.base64_encode(&raw, &mut nonce)
+                    started := protocol.Scram.new(&nonce)?
+                    n := started.client_first(&mut exchange)?
+                    scram = some(started)
+                    scram_started = true
+                    protocol.sasl_initial(&mut self.wire, b"SCRAM-SHA-256", &exchange[..n])?
+                    self.wire.flush()?
+                } else if code == protocol.AUTH_SASL_CONTINUE {
+                    if m.body < 4 || m.body - 4 > 512 {
+                        return err(protocol.violation())
+                    }
+                    server_first := [0u8; 512]
+                    count := m.body - 4
+                    for i in 0usize..count {
+                        server_first[i] = self.wire.input[m.start + 4 + i]
+                    }
+                    let some(state) = option.take(&mut scram) else {
+                        return err(protocol.violation())
+                    }
+                    active := state
+                    n := active.client_final(&mut hashes, self.config.password, &server_first[..count], &mut exchange)?
+                    scram = some(active)
+                    protocol.sasl_response(&mut self.wire, &exchange[..n])?
+                    self.wire.flush()?
+                } else if code == protocol.AUTH_SASL_FINAL {
+                    if m.body < 4 || m.body - 4 > 512 {
+                        return err(protocol.violation())
+                    }
+                    server_final := [0u8; 512]
+                    count := m.body - 4
+                    for i in 0usize..count {
+                        server_final[i] = self.wire.input[m.start + 4 + i]
+                    }
+                    let some(state) = option.take(&mut scram) else {
+                        return err(protocol.violation())
+                    }
+                    active := state
+                    match active.verify(&server_final[..count]) {
+                        ok() => {},
+                        err(reason) => {
+                            return err(self.local_error(reason, "server failed SCRAM verification"))
+                        },
+                    }
+                    scram = some(active)
+                    scram_verified = true
+                } else {
+                    return err(self.local(db.ErrorKind.Unsupported, "server requested an unsupported authentication method"))
+                }
+            } else if m.tag == protocol.ERROR_RESPONSE {
+                e := self.server_error(&m, b"")
+                return err(e)
+            } else if m.tag == protocol.BACKEND_KEY_DATA {
+                key := protocol.key_data(self.body(&m))?
+                self.process_id = key.process_id
+                self.secret_key = key.secret_key
+            } else if m.tag == protocol.READY_FOR_QUERY {
+                if !authenticated {
+                    return err(protocol.violation())
+                }
+                self.status = protocol.ready_status(self.body(&m))?
+                self.connected = true
+                return ok()
+            } else if m.tag == protocol.NEGOTIATE_PROTOCOL_VERSION {
+                // We ask for no protocol extensions; a lower minor version
+                // needs no change.
+            } else if !self.background(&m)? {
+                return err(protocol.violation())
+            }
+        }
+    }
+
+    fn need_password(&mut self) -> void!db.Error {
+        if self.config.password.len == 0 {
+            return err(self.local(db.ErrorKind.Auth, "server requested a password, but none was given"))
+        }
+        ok()
+    }
+
+    fn body(&self, m: &Message) -> &[u8] from(self) {
+        &self.wire.input[m.start..m.start + m.body]
+    }
+
+    // Messages the server may send at any time. Returns false for others.
+    fn background(&mut self, m: &Message) -> bool!db.Error {
+        if m.tag == protocol.NOTICE_RESPONSE {
+            return ok(true)
+        }
+        if m.tag == protocol.PARAMETER_STATUS {
+            if m.oversize {
+                return ok(true)
+            }
+            s := protocol.setting(self.body(m))?
+            name := &self.wire.input[m.start + s.name.start..m.start + s.name.end]
+            value := &self.wire.input[m.start + s.value.start..m.start + s.value.end]
+            if protocol.same(name, b"client_encoding") {
+                self.utf8 = protocol.same(value, b"UTF8")
+            } else if protocol.same(name, b"server_version") {
+                self.server_version = version_number(value)
+            }
+            return ok(true)
+        }
+        if m.tag == protocol.NOTIFICATION_RESPONSE {
+            if m.oversize {
+                self.dropped += 1
+                return ok(true)
+            }
+            self.enqueue(m)?
+            return ok(true)
+        }
+        ok(false)
+    }
+
+    // Queue entry: process id (4), channel length (2), payload length (2),
+    // channel, payload.
+    fn enqueue(&mut self, m: &Message) -> void!db.Error {
+        n := protocol.notification(self.body(m))?
+        channel := n.channel.end - n.channel.start
+        payload := n.payload.end - n.payload.start
+        need := 8 + channel + payload
+        if need > self.queue.len - self.queue_used {
+            self.dropped += 1
+            return ok()
+        }
+        at := self.queue_used
+        wr32(self.queue, at, protocol.signed_bits(n.process_id))
+        wr16(self.queue, at + 4, channel)
+        wr16(self.queue, at + 6, payload)
+        for i in 0usize..channel {
+            self.queue[at + 8 + i] = self.wire.input[m.start + n.channel.start + i]
+        }
+        for i in 0usize..payload {
+            self.queue[at + 8 + channel + i] = self.wire.input[m.start + n.payload.start + i]
+        }
+        self.queue_used += need
+        ok()
+    }
+
+    fn clear_note(&mut self) {
+        self.has_code = false
+        self.message_len = 0
+        self.detail_len = 0
+        self.hint_len = 0
+    }
+
+    fn set_message(&mut self, text: &str) {
+        self.clear_note()
+        b := mem.str_bytes(text)
+        n := b.len
+        if n > MESSAGE_BYTES {
+            n = MESSAGE_BYTES
+        }
+        for i in 0usize..n {
+            self.notes[MESSAGE_AT + i] = b[i]
+        }
+        self.message_len = n
+    }
+
+    // A client-side error with its message.
+    fn local(&mut self, kind: db.ErrorKind, text: &str) -> db.Error {
+        self.set_message(text)
+        db.Error.new(kind, 0)
+    }
+
+    fn local_error(&mut self, reason: db.Error, text: &str) -> db.Error {
+        self.set_message(text)
+        reason
+    }
+
+    // Records an ErrorResponse and returns its portable error.
+    fn server_error(&mut self, m: &Message, sql: &[u8]) -> db.Error {
+        self.clear_note()
+        if m.oversize {
+            return db.Error.new(db.ErrorKind.Capacity, 0)
+        }
+        recorded := record(&self.wire.input[m.start..m.start + m.body], &mut self.notes[..])
+        match recorded {
+            ok(r) => {
+                self.message_len = r.message
+                self.detail_len = r.detail
+                self.hint_len = r.hint
+                self.has_code = r.has_code
+                for i in 0usize..5 {
+                    self.code[i] = r.code[i]
+                }
+                e := protocol.error_for(&self.code)
+                if !self.has_code {
+                    e = db.Error.new(db.ErrorKind.Internal, 0)
+                }
+                e.position = protocol.byte_position(sql, r.position)
+                e
+            },
+            err(reason) => reason,
+        }
+    }
+
+    // Remembers the first ErrorResponse of a response; it is returned once
+    // the response has been read up to ReadyForQuery.
+    fn absorb(&mut self, m: &Message, sql: &[u8]) {
+        if self.failure != 0 {
+            return
+        }
+        e := self.server_error(m, sql)
+        if self.has_code {
+            self.failure = 1
+            self.failure_position = e.position
+        } else {
+            self.failure = 2
+            self.failure_kind = kind_number(&e.kind)
+        }
+    }
+
+    fn drop_session(&mut self) {
+        self.wire.link.close()
+        self.wire.reset()
+        self.connected = false
+        self.pending = false
+        self.status = protocol.STATUS_IDLE
+        self.utf8 = true
+        self.column_count = 0
+        self.queue_used = 0
+        self.taken = 0
+        self.held = false
+        for i in 0usize..STATEMENT_SLOTS {
+            self.tick[i] = 0
+        }
+        self.text_used = 0
+    }
+
+    // Closes the session, telling the server first. The connection can be
+    // reopened with `open`.
+    pub fn close(&mut self) -> void!db.Error {
+        if self.connected && !self.wire.broken {
+            self.wire.until = deadline(now_ms(), 1000)
+            self.wire.out_used = 0
+            match protocol.terminate(&mut self.wire) {
+                ok() => {
+                    match self.wire.flush() {
+                        ok() => {},
+                        err(_) => {},
+                    }
+                },
+                err(_) => {},
+            }
+        }
+        self.drop_session()
+        ok()
+    }
+
+    fn drop(&mut self) {
+        match self.close() {
+            ok() => {},
+            err(_) => {},
+        }
+    }
+
+    // Connected, and not broken by a network failure or protocol error.
+    pub fn is_open(&self) -> bool {
+        self.connected && !self.wire.broken
+    }
+
+    // Inside a transaction block (BEGIN ... COMMIT/ROLLBACK), including one
+    // that failed and now only accepts ROLLBACK.
+    pub fn in_transaction(&self) -> bool {
+        self.status != protocol.STATUS_IDLE
+    }
+
+    // Server version as major * 10000 + minor (170002 for 17.2), 0 if unknown.
+    pub fn server_version(&self) -> u32 {
+        self.server_version
+    }
+
+    pub fn cancel_key(&self) -> CancelKey {
+        CancelKey { process_id: self.process_id, secret_key: self.secret_key }
+    }
+
+    // The server's (or client's) message for the last failure.
+    pub fn message(&self) -> &str {
+        text_of(&self.notes[MESSAGE_AT..MESSAGE_AT + self.message_len])
+    }
+
+    pub fn detail(&self) -> &str {
+        text_of(&self.notes[DETAIL_AT..DETAIL_AT + self.detail_len])
+    }
+
+    pub fn hint(&self) -> &str {
+        text_of(&self.notes[HINT_AT..HINT_AT + self.hint_len])
+    }
+
+    // The SQLSTATE of the last server error ("23505"), empty for client-side
+    // failures. db.Error.code holds the same code packed by
+    // `protocol.sqlstate_number`.
+    pub fn sqlstate(&self) -> &str {
+        if !self.has_code {
+            return ""
+        }
+        text_of(&self.code)
+    }
+
+    // Rows affected by the last completed statement.
+    pub fn changes(&self) -> u64 {
+        self.affected
+    }
+
+    // Prepares for a new request: connected, the previous response read.
+    // Only `exec` (any_encoding) runs while client_encoding is not UTF8, so
+    // a session can set it back.
+    fn begin_request(&mut self, any_encoding: bool) -> void!db.Error {
+        if !self.connected || self.wire.broken {
+            return err(self.local(db.ErrorKind.Io, "connection is not open"))
+        }
+        self.wire.until = deadline(now_ms(), self.config.timeout_ms)
+        self.drain()?
+        if !self.utf8 && !any_encoding {
+            return err(self.local(db.ErrorKind.Unsupported, "client_encoding must stay UTF8"))
+        }
+        self.clear_note()
+        self.failure = 0
+        self.failure_position = -1
+        self.affected = 0
+        self.rolled_back = false
+        ok()
+    }
+
+    // Skips what is left of an abandoned response (a cursor dropped early,
+    // or a request that timed out). Its outcome belonged to that request.
+    fn drain(&mut self) -> void!db.Error {
+        self.held = false
+        for self.pending {
+            match self.step(b"")? {
+                some(_) => {},
+                none => {},
+            }
+        }
+        self.failure = 0
+        ok()
+    }
+
+    // Reads the rest of a response up to ReadyForQuery, dropping rows; then
+    // returns the first error the response carried.
+    fn finish(&mut self, sql: &[u8]) -> void!db.Error {
+        for self.pending {
+            match self.step(sql)? {
+                some(_) => {},
+                none => {},
+            }
+        }
+        self.outcome()
+    }
+
+    fn outcome(&mut self) -> void!db.Error {
+        if self.failure == 1 {
+            e := protocol.error_for(&self.code)
+            e.position = self.failure_position
+            return err(e)
+        }
+        if self.failure == 2 {
+            return err(db.Error.new(kind_from(self.failure_kind), 0))
+        }
+        ok()
+    }
+
+    fn fail_local(&mut self, kind: db.ErrorKind, text: &str) {
+        if self.failure == 0 {
+            self.failure = 2
+            self.failure_kind = kind_number(&kind)
+            self.set_message(text)
+        }
+    }
+
+    // Processes one message of an extended-query or simple-query response.
+    // Returns some(true) at a DataRow (indexed in the column table) and none
+    // once ReadyForQuery ends the response. A failure other than a timeout
+    // leaves the connection out of step with the server, so it breaks it.
+    fn step(&mut self, sql: &[u8]) -> Option<bool>!db.Error {
+        match self.step_once(sql) {
+            ok(value) => ok(value),
+            err(reason) => {
+                if reason.kind != db.ErrorKind.Timeout {
+                    self.wire.broken = true
+                }
+                err(reason)
+            },
+        }
+    }
+
+    fn step_once(&mut self, sql: &[u8]) -> Option<bool>!db.Error {
+        m := self.wire.message()?
+        tag := m.tag
+        if tag == protocol.DATA_ROW {
+            if m.oversize {
+                self.fail_local(db.ErrorKind.Capacity, "row is larger than the receive buffer")
+                return ok(some(false))
+            }
+            if self.failure != 0 {
+                return ok(some(false))
+            }
+            match index_row(&self.wire.input[m.start..m.start + m.body], m.start, &mut self.columns[..], self.column_count) {
+                ok() => {},
+                err(reason) => {
+                    self.wire.broken = true
+                    return err(reason)
+                },
+            }
+            return ok(some(true))
+        }
+        if tag == protocol.ROW_DESCRIPTION {
+            if m.oversize {
+                self.column_count = 0
+                self.fail_local(db.ErrorKind.Capacity, "row description is larger than the receive buffer")
+                return ok(some(false))
+            }
+            match load_columns(&self.wire.input[m.start..m.start + m.body], &mut self.columns[..]) {
+                ok(count) => {
+                    self.column_count = count
+                },
+                err(reason) => {
+                    self.column_count = 0
+                    if reason.kind != db.ErrorKind.Capacity {
+                        self.wire.broken = true
+                        return err(reason)
+                    }
+                    self.fail_local(db.ErrorKind.Capacity, "result has too many columns or too long column names")
+                },
+            }
+            return ok(some(false))
+        }
+        if tag == protocol.READY_FOR_QUERY {
+            self.status = protocol.ready_status(self.body(&m))?
+            self.pending = false
+            return ok(none)
+        }
+        if tag == protocol.COMMAND_COMPLETE {
+            if !m.oversize {
+                t := protocol.command_tag(self.body(&m))?
+                tag_text := &self.wire.input[m.start + t.start..m.start + t.end]
+                self.affected = protocol.affected_rows(tag_text)
+                self.rolled_back = protocol.same(tag_text, b"ROLLBACK")
+            }
+            self.column_count = 0
+            return ok(some(false))
+        }
+        if tag == protocol.ERROR_RESPONSE {
+            self.absorb(&m, sql)
+            return ok(some(false))
+        }
+        if tag == protocol.BIND_COMPLETE || tag == protocol.PARSE_COMPLETE || tag == protocol.CLOSE_COMPLETE ||
+            tag == protocol.NO_DATA || tag == protocol.EMPTY_QUERY_RESPONSE || tag == protocol.PORTAL_SUSPENDED ||
+            tag == protocol.PARAMETER_DESCRIPTION {
+            if tag == protocol.NO_DATA {
+                self.column_count = 0
+            }
+            return ok(some(false))
+        }
+        if tag == protocol.COPY_IN_RESPONSE {
+            // COPY FROM STDIN needs data this API cannot supply: refuse it.
+            self.fail_local(db.ErrorKind.Unsupported, "COPY is not supported")
+            reason := b"COPY is not supported by this client"
+            protocol.put_header(&mut self.wire, 102, reason.len + 1)?
+            protocol.put_cstr(&mut self.wire, reason)?
+            // In the extended protocol the server ignored our Sync during
+            // copy-in mode and now waits for one.
+            if self.extended {
+                protocol.sync(&mut self.wire)?
+            }
+            self.wire.flush()?
+            return ok(some(false))
+        }
+        if tag == protocol.COPY_OUT_RESPONSE || tag == protocol.COPY_DATA || tag == protocol.COPY_DONE ||
+            tag == protocol.COPY_BOTH_RESPONSE {
+            self.fail_local(db.ErrorKind.Unsupported, "COPY is not supported")
+            return ok(some(false))
+        }
+        if self.background(&m)? {
+            return ok(some(false))
+        }
+        self.wire.broken = true
+        err(self.local(db.ErrorKind.Protocol, "unexpected message from the server"))
+    }
+
+    // The cache slot holding a prepared statement for `sql`, preparing it on
+    // the server (one round trip) when it is not cached.
+    fn statement(&mut self, sql: &[u8]) -> usize!db.Error {
+        hasher := hash.Fnv1a64.new()
+        hasher.update(sql)
+        h := hasher.finish()
+        if self.config.statement_cache {
+            for i in 0usize..STATEMENT_SLOTS {
+                at := TEXT_AT + self.text_at[i] as usize
+                if self.tick[i] != 0 && self.hash[i] == h && self.length[i] as usize == sql.len &&
+                    protocol.same(&self.cache[at..at + sql.len], sql) {
+                    self.clock += 1
+                    self.tick[i] = self.clock
+                    return ok(i)
+                }
+            }
+        }
+        slot := UNNAMED
+        if self.config.statement_cache && sql.len <= CACHE_BYTES - TEXT_AT {
+            slot = 0
+            for i in 1usize..STATEMENT_SLOTS {
+                if self.tick[i] < self.tick[slot] {
+                    slot = i
+                }
+            }
+            if self.tick[slot] != 0 {
+                self.close_slot(slot)?
+            }
+        }
+        name := [0u8; 24]
+        name_len := 0usize
+        if slot != UNNAMED {
+            self.serial += 1
+            name_len = statement_name(self.serial, &mut name)
+        }
+        protocol.parse(&mut self.wire, &name[..name_len], sql)?
+        protocol.describe_statement(&mut self.wire, &name[..name_len])?
+        protocol.sync(&mut self.wire)?
+        self.wire.flush()?
+        self.pending = true
+        self.extended = true
+        self.params[slot] = 0
+        self.results[slot] = 0
+        described := match self.describe(slot, sql) {
+            ok(value) => value,
+            err(reason) => {
+                if reason.kind != db.ErrorKind.Timeout {
+                    self.wire.broken = true
+                }
+                return err(reason)
+            },
+        }
+        self.outcome()?
+        if !described {
+            self.wire.broken = true
+            return err(protocol.violation())
+        }
+        if slot != UNNAMED {
+            at := self.text_used
+            for i in 0usize..sql.len {
+                self.cache[TEXT_AT + at + i] = sql[i]
+            }
+            self.text_used += sql.len + self.params[slot] as usize
+            self.hash[slot] = h
+            self.text_at[slot] = at as u32
+            self.length[slot] = sql.len as u32
+            self.name[slot] = self.serial
+            self.clock += 1
+            self.tick[slot] = self.clock
+        }
+        ok(slot)
+    }
+
+    // Reads the response to Parse/Describe/Sync: parameter kinds into the
+    // arena, result formats into the slot. True once the statement's results
+    // were described.
+    fn describe(&mut self, slot: usize, sql: &[u8]) -> bool!db.Error {
+        described := false
+        for self.pending {
+            m := self.wire.message()?
+            if m.tag == protocol.PARAMETER_DESCRIPTION && !m.oversize {
+                if m.body < 2 {
+                    return err(protocol.violation())
+                }
+                count := rd16(self.wire.input, m.start)
+                // The kinds follow the SQL text of a cached statement.
+                reserve := count
+                if slot != UNNAMED {
+                    reserve += sql.len
+                }
+                arena := CACHE_BYTES - TEXT_AT
+                if reserve > arena {
+                    self.fail_local(db.ErrorKind.Capacity, "statement has more parameters than the workspace can describe")
+                } else {
+                    if self.text_used + reserve > arena {
+                        // Out of space: forget every statement and start over.
+                        for i in 0usize..STATEMENT_SLOTS {
+                            if self.tick[i] != 0 {
+                                self.close_slot(i)?
+                            }
+                        }
+                        self.text_used = 0
+                    }
+                    base := self.text_used + reserve - count
+                    params := protocol.parameter_kinds(&self.wire.input[m.start..m.start + m.body],
+                    &mut self.cache[TEXT_AT + base..TEXT_AT + base + count])?
+                    self.params[slot] = params as u16
+                    self.kinds_at[slot] = base as u32
+                }
+            } else if m.tag == protocol.ROW_DESCRIPTION && !m.oversize {
+                results := self.describe_results(slot, &m)?
+                self.results[slot] = results as u16
+                described = true
+            } else if m.tag == protocol.NO_DATA {
+                self.results[slot] = 0
+                described = true
+            } else if m.tag == protocol.ERROR_RESPONSE {
+                self.absorb(&m, sql)
+            } else if m.tag == protocol.READY_FOR_QUERY {
+                self.status = protocol.ready_status(self.body(&m))?
+                self.pending = false
+            } else if m.tag == protocol.PARSE_COMPLETE || m.tag == protocol.CLOSE_COMPLETE {
+            } else if m.oversize {
+                self.fail_local(db.ErrorKind.Capacity, "statement description is larger than the receive buffer")
+            } else if !self.background(&m)? {
+                return err(self.local(db.ErrorKind.Protocol, "unexpected message from the server"))
+            }
+        }
+        ok(described || self.failure != 0)
+    }
+
+    // Marks which result columns of a statement can use the binary format.
+    fn describe_results(&mut self, slot: usize, m: &Message) -> usize!db.Error {
+        bits := slot * SLOT_META
+        for i in 0usize..SLOT_META {
+            self.cache[bits + i] = 0
+        }
+        fields := protocol.Fields.new(&self.wire.input[m.start..m.start + m.body])?
+        count := fields.count()
+        if count > 65535 {
+            return err(protocol.violation())
+        }
+        for i in 0usize..count {
+            let some(f) = fields.next()? else {
+                return err(protocol.violation())
+            }
+            if protocol.kind_of(f.type_oid) != protocol.KIND_TEXT && i < SLOT_META * 8 {
+                self.cache[bits + i / 8] = self.cache[bits + i / 8] | (1u8 << ((i % 8) as u8))
+            }
+        }
+        ok(count)
+    }
+
+    // Queues a Close for a cached statement; it is sent with the next request.
+    fn close_slot(&mut self, slot: usize) -> void!db.Error {
+        name := [0u8; 24]
+        n := statement_name(self.name[slot], &mut name)
+        protocol.close_statement(&mut self.wire, &name[..n])?
+        self.tick[slot] = 0
+        ok()
+    }
+
+    // Sends Bind/Describe/Execute/Sync for a prepared slot.
+    fn start(&mut self, slot: usize, params: &[db.Value]) -> void!db.Error {
+        // Errors before Bind is written leave queued Close messages for the
+        // next request.
+        if params.len != self.params[slot] as usize {
+            return err(self.local(db.ErrorKind.Range, "wrong number of parameters for the statement"))
+        }
+        name := [0u8; 24]
+        name_len := 0usize
+        if slot != UNNAMED {
+            name_len = statement_name(self.name[slot], &mut name)
+        }
+        meta := slot * SLOT_META
+        kinds := TEXT_AT + self.kinds_at[slot] as usize
+        count := self.params[slot] as usize
+        columns := self.results[slot] as usize
+        match protocol.bind(&mut self.wire, b"", &name[..name_len], params, &self.cache[kinds..kinds + count],
+        &self.cache[meta..meta + SLOT_META], columns) {
+            ok() => {},
+            err(reason) => {
+                if self.wire.broken {
+                    return err(reason)
+                }
+                // A parameter that does not fit its type fails before
+                // anything is written.
+                return err(self.local_error(reason, "parameter does not fit the statement's parameter type"))
+            },
+        }
+        protocol.describe_portal(&mut self.wire, b"")?
+        protocol.execute(&mut self.wire, b"", 0)?
+        protocol.sync(&mut self.wire)?
+        self.wire.flush()?
+        self.pending = true
+        self.extended = true
+        self.column_count = 0
+        ok()
+    }
+
+    // Prepares (or finds) and starts a statement. A cached statement that
+    // the server no longer accepts (schema change, DISCARD) is prepared
+    // again once, outside transactions.
+    fn run_statement(&mut self, sql: &[u8], params: &[db.Value]) -> void!db.Error {
+        self.begin_request(false)?
+        slot := self.statement(sql)?
+        self.start(slot, params)?
+        // Read up to the first row (or the end), so errors surface here.
+        for self.pending {
+            match self.step(sql)? {
+                some(row) => {
+                    if row {
+                        self.held = true
+                        return ok()
+                    }
+                },
+                none => {},
+            }
+            if self.column_count != 0 && self.failure == 0 {
+                return ok()
+            }
+        }
+        if self.failure == 1 && slot != UNNAMED && self.status == protocol.STATUS_IDLE && self.stale_statement() {
+            self.close_slot(slot)?
+            self.failure = 0
+            self.clear_note()
+            again := self.statement(sql)?
+            self.start(again, params)?
+            for self.pending {
+                match self.step(sql)? {
+                    some(row) => {
+                        if row {
+                            self.held = true
+                            return ok()
+                        }
+                    },
+                    none => {},
+                }
+                if self.column_count != 0 && self.failure == 0 {
+                    return ok()
+                }
+            }
+        }
+        self.outcome()
+    }
+
+    // The server rejected a cached statement before running it: its plan no
+    // longer matches the schema (0A000 "cached plan must not change result
+    // type"), or it no longer exists (26000, after DISCARD ALL).
+    fn stale_statement(&self) -> bool {
+        if protocol.same(&self.code, b"26000") {
+            return true
+        }
+        protocol.same(&self.code, b"0A000") &&
+            protocol.starts_with(&self.notes[MESSAGE_AT..MESSAGE_AT + self.message_len], b"cached plan must not change result type")
+    }
+
+    // Runs a single statement with parameters ($1, $2, ...) and returns the
+    // number of rows it inserted, updated, deleted or returned.
+    pub fn execute(&mut self, sql: &str, params: &[db.Value]) -> u64!db.Error {
+        text := mem.str_bytes(sql)
+        self.run_statement(text, params)?
+        self.held = false
+        self.finish(text)?
+        ok(self.affected)
+    }
+
+    // Runs a single statement and passes every result row to `sink`. A sink
+    // error stops delivery and is returned after the response is read.
+    pub fn query(&mut self, sql: &str, params: &[db.Value], sink: &mut dyn sql.RowSink) -> void!db.Error {
+        text := mem.str_bytes(sql)
+        self.run_statement(text, params)?
+        sink_failed := false
+        sink_error := db.Error.new(db.ErrorKind.Internal, 0)
+        for {
+            if self.held {
+                self.held = false
+                if !sink_failed {
+                    row := Row { conn: &*self }
+                    match sink.row(&row) {
+                        ok() => {},
+                        err(reason) => {
+                            sink_failed = true
+                            sink_error = reason
+                        },
+                    }
+                }
+            }
+            if !self.pending {
+                break
+            }
+            match self.step(text)? {
+                some(row) => {
+                    self.held = row
+                },
+                none => {},
+            }
+        }
+        self.outcome()?
+        if sink_failed {
+            return err(sink_error)
+        }
+        ok()
+    }
+
+    // Runs a single statement and returns a cursor over its rows.
+    pub fn select(&mut self, sql: &str, params: &[db.Value]) -> Rows!db.Error from(self, sql) {
+        text := mem.str_bytes(sql)
+        self.run_statement(text, params)?
+        ok(Rows { conn: self, sql: text })
+    }
+
+    // Prepares `sql` on the server now (so syntax errors surface here) and
+    // returns a handle for `run` and `rows`. Statements stay cached by text;
+    // one evicted from the cache is prepared again transparently.
+    pub fn prepare(&mut self, sql: &str) -> Statement!db.Error from(sql) {
+        self.begin_request(false)?
+        self.statement(mem.str_bytes(sql))?
+        ok(Statement { sql })
+    }
+
+    pub fn run(&mut self, stmt: &Statement, params: &[db.Value]) -> u64!db.Error {
+        self.execute(stmt.sql, params)
+    }
+
+    pub fn rows(&mut self, stmt: &Statement, params: &[db.Value]) -> Rows!db.Error from(self, stmt) {
+        self.select(stmt.sql, params)
+    }
+
+    // Runs one or more statements separated by semicolons with the simple
+    // query protocol (no parameters), discarding any rows. With several
+    // statements outside a transaction block, the server runs them as one
+    // transaction.
+    pub fn exec(&mut self, sql: &str) -> void!db.Error {
+        self.begin_request(true)?
+        text := mem.str_bytes(sql)
+        protocol.query(&mut self.wire, text)?
+        self.wire.flush()?
+        self.pending = true
+        self.extended = false
+        self.finish(text)
+    }
+
+    pub fn begin(&mut self, level: db.IsolationLevel) -> void!db.Error {
+        match level {
+            db.IsolationLevel.Default => self.exec("BEGIN"),
+            db.IsolationLevel.ReadUncommitted => self.exec("BEGIN ISOLATION LEVEL READ UNCOMMITTED"),
+            db.IsolationLevel.ReadCommitted => self.exec("BEGIN ISOLATION LEVEL READ COMMITTED"),
+            db.IsolationLevel.RepeatableRead => self.exec("BEGIN ISOLATION LEVEL REPEATABLE READ"),
+            db.IsolationLevel.Serializable => self.exec("BEGIN ISOLATION LEVEL SERIALIZABLE"),
+        }
+    }
+
+    // Commits the transaction. A transaction that already failed is rolled
+    // back by the server instead; that is reported as ErrorKind.Misuse.
+    pub fn commit(&mut self) -> void!db.Error {
+        self.exec("COMMIT")?
+        if self.rolled_back {
+            return err(self.local(db.ErrorKind.Misuse, "transaction failed earlier and was rolled back"))
+        }
+        ok()
+    }
+
+    pub fn rollback(&mut self) -> void!db.Error {
+        self.exec("ROLLBACK")
+    }
+
+    // Pool support: a cheap round trip that checks the session is alive.
+    pub fn ping(&mut self) -> void!db.Error {
+        self.exec("")
+    }
+
+    // Pool support: makes the session ready for its next user. An open
+    // transaction is rolled back and queued notifications are dropped; a
+    // connection still receiving an abandoned statement's response is closed
+    // instead of waiting for it (open reconnects). Other session state (SET,
+    // LISTEN, temporary tables) stays.
+    pub fn reset(&mut self) -> void!db.Error {
+        if !self.is_open() {
+            return ok()
+        }
+        if self.pending {
+            return self.close()
+        }
+        self.queue_used = 0
+        self.taken = 0
+        self.begin_request(true)?
+        if self.in_transaction() {
+            self.rollback()?
+        }
+        ok()
+    }
+
+    // The next LISTEN/NOTIFY notification: one that arrived during earlier
+    // requests, or else one that arrives within `timeout_ms` (0 only checks
+    // what has arrived). none when there is none. Notifications that do not
+    // fit the queue are counted in `dropped_notifications`.
+    pub fn notification(&mut self, timeout_ms: u64) -> Option<Notification>!db.Error from(self) {
+        if self.taken > 0 {
+            self.pop_notification()
+        }
+        if self.queue_used == 0 {
+            if !self.connected || self.wire.broken {
+                return err(self.local(db.ErrorKind.Io, "connection is not open"))
+            }
+            self.wire.until = deadline(now_ms(), self.config.timeout_ms)
+            self.drain()?
+            self.wire.until = deadline(now_ms(), timeout_ms)
+            if timeout_ms == 0 {
+                // One look at the socket.
+                self.wire.until = now_ms() + 1
+            }
+            for self.queue_used == 0 {
+                m := match self.wire.message() {
+                    ok(value) => value,
+                    err(reason) => {
+                        self.wire.until = FOREVER
+                        if reason.kind == db.ErrorKind.Timeout {
+                            return ok(none)
+                        }
+                        return err(reason)
+                    },
+                }
+                if !self.background(&m)? {
+                    self.wire.broken = true
+                    self.wire.until = FOREVER
+                    return err(self.local(db.ErrorKind.Protocol, "unexpected message from the server"))
+                }
+            }
+            self.wire.until = FOREVER
+        }
+        channel := rd16(self.queue, 4)
+        payload := rd16(self.queue, 6)
+        self.taken = 8 + channel + payload
+        ok(some(Notification { process_id: protocol.unsigned_bits(rd32(self.queue, 0)),
+        channel: text_of(&self.queue[8..8 + channel]), payload: text_of(&self.queue[8 + channel..8 + channel + payload]) }))
+    }
+
+    fn pop_notification(&mut self) {
+        rest := self.queue_used - self.taken
+        for i in 0usize..rest {
+            self.queue[i] = self.queue[self.taken + i]
+        }
+        self.queue_used = rest
+        self.taken = 0
+    }
+
+    pub fn dropped_notifications(&self) -> u64 {
+        self.dropped
+    }
+}
+
+fn version_number(text: &[u8]) -> u32 {
+    parts := [0u64; 3]
+    part := 0usize
+    for i in 0usize..text.len {
+        c := text[i]
+        if c >= 48 && c <= 57 {
+            if parts[part] < 1000000 {
+                parts[part] = parts[part] * 10 + (c - 48) as u64
+            }
+        } else if c == b'.' && part < 2 {
+            part += 1
+        } else {
+            break
+        }
+    }
+    // 17.2 is 170002; 9.6.24 (before version 10) is 90624.
+    v := parts[0] * 10000 + parts[1]
+    if parts[0] < 10 {
+        v = parts[0] * 10000 + parts[1] * 100 + parts[2]
+    }
+    if v > 4294967295u64 {
+        return 0
+    }
+    v as u32
+}
+
+fn kind_number(kind: &db.ErrorKind) -> u8 {
+    match kind {
+        db.ErrorKind.Connect => 0,
+        db.ErrorKind.Auth => 1,
+        db.ErrorKind.Constraint => 2,
+        db.ErrorKind.Serialization => 3,
+        db.ErrorKind.Busy => 4,
+        db.ErrorKind.Timeout => 5,
+        db.ErrorKind.Syntax => 6,
+        db.ErrorKind.Schema => 7,
+        db.ErrorKind.Type => 8,
+        db.ErrorKind.Range => 9,
+        db.ErrorKind.Protocol => 10,
+        db.ErrorKind.Capacity => 11,
+        db.ErrorKind.Io => 12,
+        db.ErrorKind.Corrupt => 13,
+        db.ErrorKind.ReadOnly => 14,
+        db.ErrorKind.Misuse => 15,
+        db.ErrorKind.Unsupported => 16,
+        db.ErrorKind.Interrupted => 17,
+        db.ErrorKind.Internal => 18,
+    }
+}
+
+fn kind_from(number: u8) -> db.ErrorKind {
+    match number {
+        0 => db.ErrorKind.Connect,
+        1 => db.ErrorKind.Auth,
+        2 => db.ErrorKind.Constraint,
+        3 => db.ErrorKind.Serialization,
+        4 => db.ErrorKind.Busy,
+        5 => db.ErrorKind.Timeout,
+        6 => db.ErrorKind.Syntax,
+        7 => db.ErrorKind.Schema,
+        8 => db.ErrorKind.Type,
+        9 => db.ErrorKind.Range,
+        10 => db.ErrorKind.Protocol,
+        11 => db.ErrorKind.Capacity,
+        12 => db.ErrorKind.Io,
+        13 => db.ErrorKind.Corrupt,
+        14 => db.ErrorKind.ReadOnly,
+        15 => db.ErrorKind.Misuse,
+        16 => db.ErrorKind.Unsupported,
+        17 => db.ErrorKind.Interrupted,
+        _ => db.ErrorKind.Internal,
+    }
+}
+
+// Connects using a postgres:// URL (see Config.parse). Escaped URL parts are
+// decoded into the start of the workspace.
+pub fn connect(url: &[u8], workspace: &mut[u8]) -> Connection!db.Error from(url, workspace) {
+    split := 0usize
+    for i in 0usize..url.len {
+        if url[i] == b'%' {
+            split = url.len
+        }
+    }
+    if split > workspace.len {
+        return err(failure(db.ErrorKind.Capacity))
+    }
+    let some(slice.SplitMut { left: storage, right: rest }) = slice.split_at_mut(workspace, split) else {
+        return err(failure(db.ErrorKind.Capacity))
+    }
+    config := Config.parse(url, storage)?
+    Connection.connect(config, rest)
+}

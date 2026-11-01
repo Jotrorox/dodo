@@ -1,0 +1,197 @@
+package protocol
+
+import "std/db"
+
+// ErrorResponse and NoticeResponse fields. Absent fields are empty spans;
+// `position` is the 1-based character position in the statement, or 0.
+pub struct Notice {
+    pub severity: Span
+    pub code: Span
+    pub message: Span
+    pub detail: Span
+    pub hint: Span
+    pub constraint: Span
+    pub position: i32
+}
+
+pub fn notice(body: &[u8]) -> Notice!db.Error {
+    result := Notice { severity: Span.empty(), code: Span.empty(), message: Span.empty(),
+    detail: Span.empty(), hint: Span.empty(), constraint: Span.empty(), position: 0 }
+    r := Reader.new(body)
+    for {
+        field := r.u8()?
+        if field == 0 {
+            break
+        }
+        value := r.cstr()?
+        match field {
+            b'V' => {
+                result.severity = value
+            },
+            b'S' => {
+                if result.severity.len() == 0 {
+                    result.severity = value
+                }
+            },
+            b'C' => {
+                result.code = value
+            },
+            b'M' => {
+                result.message = value
+            },
+            b'D' => {
+                result.detail = value
+            },
+            b'H' => {
+                result.hint = value
+            },
+            b'n' => {
+                result.constraint = value
+            },
+            b'P' => {
+                result.position = small_number(&body[value.start..value.end])
+            },
+            _ => {},
+        }
+    }
+    ok(result)
+}
+
+fn small_number(text: &[u8]) -> i32 {
+    if text.len == 0 || text.len > 9 {
+        return 0
+    }
+    v := 0i32
+    for i in 0usize..text.len {
+        if text[i] < 48 || text[i] > 57 {
+            return 0
+        }
+        v = v * 10 + (text[i] - 48) as i32
+    }
+    v
+}
+
+// Packs a five-character SQLSTATE into the number stored in db.Error.code:
+// each character is a base-36 digit (0-9, then A-Z), most significant first,
+// so "23505" and "42P01" map to distinct positive numbers. Malformed codes
+// give 0.
+pub fn sqlstate_number(code: &[u8]) -> i32 {
+    if code.len != 5 {
+        return 0
+    }
+    v := 0i32
+    for i in 0usize..5 {
+        c := code[i]
+        digit := 0i32
+        if c >= 48 && c <= 57 {
+            digit = (c - 48) as i32
+        } else if c >= 65 && c <= 90 {
+            digit = (c - 55) as i32
+        } else {
+            return 0
+        }
+        v = v * 36 + digit
+    }
+    v
+}
+
+// The SQLSTATE text of a number made by `sqlstate_number`.
+pub fn sqlstate_text(number: i32, out: &mut[u8]) -> usize {
+    if number <= 0 || number >= 60466176 || out.len < 5 {
+        return 0
+    }
+    v := number
+    for i in 0usize..5 {
+        digit := (v % 36) as u8
+        v = v / 36
+        if digit < 10 {
+            out[4 - i] = 48 + digit
+        } else {
+            out[4 - i] = 55 + digit
+        }
+    }
+    5
+}
+
+fn class(code: &[u8], a: u8, b: u8) -> bool {
+    code[0] == a && code[1] == b
+}
+
+// The portable error for a server SQLSTATE. `code` on the result is
+// `sqlstate_number(code)`.
+pub fn error_for(code: &[u8]) -> db.Error {
+    number := sqlstate_number(code)
+    if number == 0 {
+        return db.Error.new(db.ErrorKind.Protocol, 0)
+    }
+    if class(code, b'2', b'3') {
+        constraint := db.Constraint.Other
+        if same(code, b"23505") {
+            constraint = db.Constraint.Unique
+        } else if same(code, b"23503") {
+            constraint = db.Constraint.ForeignKey
+        } else if same(code, b"23502") {
+            constraint = db.Constraint.NotNull
+        } else if same(code, b"23514") {
+            constraint = db.Constraint.Check
+        }
+        return db.Error.constraint(constraint, number)
+    }
+    db.Error.new(kind_for(code), number)
+}
+
+fn kind_for(code: &[u8]) -> db.ErrorKind {
+    if same(code, b"08P01") {
+        return db.ErrorKind.Protocol
+    }
+    if class(code, b'0', b'8') || same(code, b"3D000") || same(code, b"57P01") ||
+        same(code, b"57P02") || same(code, b"57P03") {
+        return db.ErrorKind.Connect
+    }
+    if class(code, b'2', b'8') || same(code, b"42501") {
+        return db.ErrorKind.Auth
+    }
+    if class(code, b'4', b'0') {
+        return db.ErrorKind.Serialization
+    }
+    if same(code, b"55P03") {
+        return db.ErrorKind.Busy
+    }
+    if same(code, b"57014") {
+        return db.ErrorKind.Interrupted
+    }
+    if same(code, b"25006") {
+        return db.ErrorKind.ReadOnly
+    }
+    if class(code, b'2', b'5') || class(code, b'3', b'4') || class(code, b'2', b'6') {
+        return db.ErrorKind.Misuse
+    }
+    if class(code, b'4', b'2') {
+        if same(code, b"42804") || same(code, b"42846") || same(code, b"42P18") {
+            return db.ErrorKind.Type
+        }
+        if same(code, b"42601") || same(code, b"42602") || same(code, b"42803") || same(code, b"42622") || same(code, b"42939") {
+            return db.ErrorKind.Syntax
+        }
+        if code[2] == b'P' || code[2] == b'7' || code[2] == b'8' {
+            return db.ErrorKind.Schema
+        }
+        return db.ErrorKind.Syntax
+    }
+    if class(code, b'2', b'2') {
+        return db.ErrorKind.Type
+    }
+    if class(code, b'5', b'3') || class(code, b'5', b'4') {
+        return db.ErrorKind.Capacity
+    }
+    if class(code, b'0', b'A') {
+        return db.ErrorKind.Unsupported
+    }
+    if same(code, b"XX001") || same(code, b"XX002") {
+        return db.ErrorKind.Corrupt
+    }
+    if class(code, b'5', b'8') {
+        return db.ErrorKind.Io
+    }
+    db.ErrorKind.Internal
+}
