@@ -4,9 +4,14 @@ and through the Dodo shell (tests/sqlite/shell.dodo), compare every result row,
 then check the Dodo-written database with SQLite's integrity_check and compare
 the final table contents.
 
+Each engine runs in a working directory of its own (WORKDIR/<script>.sqlite.d
+and WORKDIR/<script>.dodo.d), so scripts may ATTACH relative paths; every
+database file both runs leave there is cross-checked like the main database.
+
 Usage: differential.py SHELL_BINARY WORKDIR SCRIPT...
 """
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -59,7 +64,16 @@ def statements(script):
         yield buf
 
 
-def oracle(path, script):
+def oracle(path, script, cwd):
+    here = os.getcwd()
+    os.chdir(cwd)
+    try:
+        return oracle_in(path, script)
+    finally:
+        os.chdir(here)
+
+
+def oracle_in(path, script):
     conn = sqlite3.connect(path, isolation_level=None)
     out = []
     for stmt in statements(script):
@@ -103,8 +117,52 @@ def contents(path):
     return rows, schema, check
 
 
+def normalize(lines, main, d):
+    subs = []
+    for p in (main, d):
+        for q in {p, os.path.realpath(p)}:
+            subs.append((q, "<main>" if p == main else "<dir>"))
+    subs.sort(key=lambda x: -len(x[0]))
+    out = []
+    for line in lines:
+        for q, r in subs:
+            line = line.replace(q, r)
+        out.append(line)
+    return out
+
+
+def fresh_dir(path):
+    if os.path.isdir(path):
+        shutil.rmtree(path)
+    os.makedirs(path)
+    return path
+
+
+def side_files(d):
+    """Files a run left in its directory, ignoring WAL side files (this
+    SQLite keeps them after closing)."""
+    return sorted(f for f in os.listdir(d) if not f.endswith(("-wal", "-shm")))
+
+
+def compare_files(shell, workdir, name, a, b, problems, label):
+    """Cross-checks database files a (SQLite) and b (Dodo)."""
+    ra, sa, _ = contents(a)
+    rb, sb, cb = contents(b)
+    if cb != [("ok",)]:
+        problems.append(f"{label}integrity_check of the Dodo database: {cb}")
+    if len(ra) != len(rb) or not all(same_row(x, y) for x, y in zip(ra, rb)):
+        for x, y in zip(ra, rb):
+            if not same_row(x, y):
+                problems.append(f"{label}content differs: sqlite {x!r} dodo {y!r}")
+                break
+        if len(ra) != len(rb):
+            problems.append(f"{label}content rows: sqlite {len(ra)} dodo {len(rb)}")
+    if sa != sb:
+        problems.append(f"{label}schema differs:\n  sqlite {sa}\n  dodo   {sb}")
+
+
 def main():
-    shell, workdir = sys.argv[1], sys.argv[2]
+    shell, workdir = sys.argv[1], os.path.abspath(sys.argv[2])
     failures = 0
     for script_path in sys.argv[3:]:
         name = os.path.basename(script_path)
@@ -122,9 +180,14 @@ def main():
         for p in (a, a + "-wal", a + "-shm", b, b + "-journal", b + "-wal", b + "-shm"):
             if os.path.exists(p):
                 os.remove(p)
-        expected = "\n".join(oracle(a, script)).splitlines()
-        run = subprocess.run([shell, b, script_path], capture_output=True)
+        da = fresh_dir(os.path.join(workdir, name + ".sqlite.d"))
+        db_ = fresh_dir(os.path.join(workdir, name + ".dodo.d"))
+        expected = "\n".join(oracle(a, script, da)).splitlines()
+        run = subprocess.run([shell, b, os.path.abspath(script_path)], capture_output=True, cwd=db_)
         actual = run.stdout.decode("utf-8", "replace").splitlines()
+        # File names (PRAGMA database_list) differ only by directory.
+        expected = normalize(expected, a, da)
+        actual = normalize(actual, b, db_)
         problems = []
         if run.returncode != 0:
             problems.append(f"shell exited with {run.returncode}: {run.stderr.decode()[-2000:]}")
@@ -138,19 +201,21 @@ def main():
                 if len(problems) > 20:
                     break
         if not problems and os.path.exists(b):
-            ra, sa, _ = contents(a)
-            rb, sb, cb = contents(b)
-            if cb != [("ok",)]:
-                problems.append(f"integrity_check of the Dodo database: {cb}")
-            if len(ra) != len(rb) or not all(same_row(x, y) for x, y in zip(ra, rb)):
-                for x, y in zip(ra, rb):
-                    if not same_row(x, y):
-                        problems.append(f"content differs: sqlite {x!r} dodo {y!r}")
-                        break
-                if len(ra) != len(rb):
-                    problems.append(f"content rows: sqlite {len(ra)} dodo {len(rb)}")
-            if sa != sb:
-                problems.append(f"schema differs:\n  sqlite {sa}\n  dodo   {sb}")
+            compare_files(shell, workdir, name, a, b, problems, "")
+        if not problems:
+            # Attached databases the scripts created (relative paths).
+            fa, fb = side_files(da), side_files(db_)
+            if fa != fb:
+                problems.append(f"files differ: sqlite {fa} dodo {fb}")
+            else:
+                for f in fa:
+                    pa, pb = os.path.join(da, f), os.path.join(db_, f)
+                    if os.path.getsize(pa) == 0 and os.path.getsize(pb) == 0:
+                        continue
+                    if f.endswith("-journal"):
+                        problems.append(f"leftover journal {f}")
+                        continue
+                    compare_files(shell, workdir, name, pa, pb, problems, f + ": ")
         if not problems and os.path.exists(a):
             # Read the SQLite-written database back through Dodo.
             ra, _, _ = contents(a)

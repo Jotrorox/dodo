@@ -356,17 +356,17 @@ fn prepare_one(e: &mut Engine, slot: usize, sql: &str) -> void!db.Error {
         stmt_finish(e, slot, true)?
     }
     // Schema resolution needs the current schema.
-    begin_read(e)?
+    begin_read_all(e)?
     r := load_schema(e)
     match r {
         ok() => {},
         err(reason) => {
-            end_read(e)
+            end_read_all(e)
             return err(reason)
         },
     }
     res := prepare_slot(e, slot, bytes)
-    end_read(e)
+    end_read_all(e)
     res?
     tail := sh(e, slot, SH_TAIL)
     if tail < bytes.len {

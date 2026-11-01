@@ -50,18 +50,7 @@ fn parse_create_trigger(e: &mut Engine) -> usize!db.Error {
         expect_kw(e, "EXISTS")?
         set_flags(e, s, 1)
     }
-    name_start := e.ts
-    let (o, l) = take_name(e)?
-    if e.tk == TK_DOT {
-        next_token(e)
-        name_start = e.ts
-        let (o2, l2) = take_name(e)?
-        set_nf(e, s, 0, o2)
-        set_nf(e, s, 1, l2)
-    } else {
-        set_nf(e, s, 0, o)
-        set_nf(e, s, 1, l)
-    }
+    name_start := take_object_name(e, s)?
     timing := TT_BEFORE
     if accept_kw(e, "BEFORE") {
         timing = TT_BEFORE
@@ -104,6 +93,7 @@ fn parse_create_trigger(e: &mut Engine) -> usize!db.Error {
         let (to2, tl2) = take_name(e)?
         set_nf(e, s, 2, to2)
         set_nf(e, s, 3, tl2)
+        set_schema(e, s, 1, to, tl)?
     } else {
         set_nf(e, s, 2, to)
         set_nf(e, s, 3, tl)
@@ -206,7 +196,9 @@ fn eval_raise(e: &mut Engine, n: usize, dst: usize) -> void!db.Error {
 fn exec_create_trigger(e: &mut Engine, s: usize) -> void!db.Error {
     name := na(e, s)
     nl := nb(e, s)
-    if find_obj(e, OT_TRIGGER, name, nl) != NO_COL {
+    d := stmt_target_db(e, s)
+    enter_db(e, d)?
+    if find_obj(e, d, OT_TRIGGER, name, nl) != NO_COL {
         if (nflags(e, s) & 1) != 0 {
             return ok()
         }
@@ -218,10 +210,38 @@ fn exec_create_trigger(e: &mut Engine, s: usize) -> void!db.Error {
     tn := nc(e, s)
     tl := ndd(e, s)
     timing := nop(e, s) & 3
-    t := find_obj(e, OT_TABLE, tn, tl)
-    v := find_obj(e, OT_VIEW, tn, tl)
+    tq := ndb2_of(e, s)
+    if d != DB_TEMP {
+        // A trigger may only refer to its own database (TEMP triggers
+        // excepted).
+        if tq != NO_DB && tq != d {
+            return err(cross_db_error(e, "trigger", name, nl, tq))
+        }
+        check_fixed_refs(e, "trigger", name, nl, d, true)?
+    }
+    ldb := if d == DB_TEMP {
+        tq
+    } else {
+        d
+    }
+    t := find_obj(e, ldb, OT_TABLE, tn, tl)
+    v := find_obj(e, ldb, OT_VIEW, tn, tl)
+    if t != NO_COL && v != NO_COL {
+        if db_rank(obj_db(e, v)) < db_rank(obj_db(e, t)) {
+            t = NO_COL
+        } else {
+            v = NO_COL
+        }
+    }
     if t == NO_COL && v == NO_COL {
-        return err(fail2(e, SQLITE_ERROR, "no such table: main.", tn, tl))
+        e.msg_len = 0
+        msg_add(e, "no such table: ")
+        let dn = db_name_off(e, d)
+        let dl = db_name_len(e, d)
+        msg_add_ws(e, dn, dl)
+        msg_add(e, ".")
+        msg_add_ws(e, tn, tl)
+        return err(make_error(e, SQLITE_ERROR))
     }
     if reserved_name(e, tn, tl) {
         return err(fail(e, SQLITE_ERROR, "cannot create trigger on system table"))
@@ -246,8 +266,9 @@ fn exec_create_trigger(e: &mut Engine, s: usize) -> void!db.Error {
     schema_changed(e)
 }
 
-// Catalog loading: records the trigger's timing and event.
-fn load_trigger(e: &mut Engine, i: usize) -> void!db.Error {
+// Catalog loading: records the trigger's timing and event. Returns the
+// database its ON clause names (NO_DB when unqualified).
+fn load_trigger(e: &mut Engine, i: usize) -> usize!db.Error {
     sql := obj_u(e, i, O_SQL)
     sqll := obj_u(e, i, O_SQLL)
     let slot = schema_slot(e)
@@ -263,7 +284,7 @@ fn load_trigger(e: &mut Engine, i: usize) -> void!db.Error {
     o := obj(e, i)
     let op = nop(e, s)
     e.ws[o + O_ONCONF] = op
-    ok()
+    ok(ndb2_of(e, s))
 }
 
 fn trigger_op(e: &Engine, i: usize) -> u8 {
@@ -421,7 +442,16 @@ fn compile_trigger(e: &mut Engine, w: usize, t: usize, i: usize, tev: u8, ttm: u
         wget(e, w, W_TOLD)
     }
     conf := wget(e, w, W_CONF) as u8
+    // Non-TEMP triggers name objects of their own database only.
+    save_fix := e.fix_db
+    let tdb = obj_db(e, i)
+    e.fix_db = if tdb == DB_TEMP {
+        NO_DB
+    } else {
+        tdb
+    }
     res2 := resolve_trigger(e, root, conf)
+    e.fix_db = save_fix
     e.trig_t = save_t
     e.trig_new = save_new
     e.trig_old = save_old
@@ -587,8 +617,18 @@ fn run_step(e: &mut Engine, st: usize) -> void!db.Error {
 
 // When `o, l` names a view with an INSTEAD OF trigger for `event`, returns
 // the view object plus one; otherwise 0.
-fn view_target(e: &Engine, o: usize, l: usize, event: u8) -> usize {
-    v := find_obj(e, OT_VIEW, o, l)
+fn view_target(e: &Engine, s: usize, event: u8) -> usize {
+    o := na(e, s)
+    l := nb(e, s)
+    db := lookup_db(e, ndb_of(e, s))
+    v := find_obj(e, db, OT_VIEW, o, l)
+    if v != NO_COL && find_obj(e, db, OT_TABLE, o, l) != NO_COL {
+        // A table of the same name earlier in the search order wins.
+        t := find_obj(e, db, OT_TABLE, o, l)
+        if db_rank(obj_db(e, t)) < db_rank(obj_db(e, v)) {
+            return 0
+        }
+    }
     if v == NO_COL {
         return 0
     }
@@ -622,6 +662,8 @@ fn view_rows_select(e: &mut Engine, s: usize) -> usize!db.Error {
     set_nf(e, src, 0, s_a)
     let s_b = nb(e, s)
     set_nf(e, src, 1, s_b)
+    let vq = ndb_of(e, s)
+    set_ndb(e, src, 0, vq)
     set_nf(e, sel, 1, src)
     rc := new_node(e, N_RESCOL)?
     star := new_node(e, N_STAR)?

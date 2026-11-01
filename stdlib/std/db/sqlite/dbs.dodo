@@ -745,3 +745,424 @@ fn super_delete_if_unused(sup: &[u8]) {
     }
     remove_path(sup)
 }
+
+// ---------------------------------------------------------------------------
+// Statements and databases
+
+// The database a DDL statement (or writing PRAGMA) changes: the named one;
+// for an unqualified CREATE INDEX or CREATE TRIGGER TEMP when the table is a
+// TEMP table, else main; for DROP and ALTER the object's, found in search
+// order.
+fn stmt_target_db(e: &Engine, s: usize) -> usize {
+    k := nkind(e, s)
+    q := ndb_of(e, s)
+    dflt := if q == NO_DB {
+        0usize
+    } else {
+        q
+    }
+    if k == S_CREATE_INDEX {
+        if q != NO_DB {
+            return q
+        }
+        let tn = nc(e, s)
+        let tl = ndd(e, s)
+        t := find_obj(e, NO_DB, OT_TABLE, tn, tl)
+        if t != NO_COL && obj_db(e, t) == DB_TEMP {
+            return DB_TEMP
+        }
+        return 0
+    }
+    if k == S_CREATE_TRIGGER {
+        if q != NO_DB {
+            return q
+        }
+        let tn2 = nc(e, s)
+        let tl2 = ndd(e, s)
+        tq := ndb2_of(e, s)
+        t := find_obj(e, tq, OT_TABLE, tn2, tl2)
+        v := find_obj(e, tq, OT_VIEW, tn2, tl2)
+        best := t
+        if best == NO_COL || v != NO_COL && db_rank(obj_db(e, v)) < db_rank(obj_db(e, best)) {
+            best = v
+        }
+        if best != NO_COL && obj_db(e, best) == DB_TEMP {
+            return DB_TEMP
+        }
+        return 0
+    }
+    if k == S_DROP || k == S_ALTER {
+        op := nop(e, s)
+        kind := if k == S_ALTER || op == 1 {
+            OT_TABLE
+        } else if op == 3 {
+            OT_VIEW
+        } else if op == 4 {
+            OT_TRIGGER
+        } else {
+            OT_INDEX
+        }
+        let name = na(e, s)
+        let nl = nb(e, s)
+        i := find_obj(e, q, kind, name, nl)
+        if i != NO_COL {
+            return obj_db(e, i)
+        }
+        return dflt
+    }
+    dflt
+}
+
+// Makes database d current, opening TEMP on first use.
+fn enter_db(e: &mut Engine, d: usize) -> void!db.Error {
+    if d == DB_TEMP {
+        temp_open(e)?
+    }
+    use_db(e, d)
+    ok()
+}
+
+fn cross_db_error(e: &mut Engine, kind: &str, name: usize, nl: usize, k: usize) -> db.Error {
+    e.msg_len = 0
+    msg_add(e, kind)
+    msg_add(e, " ")
+    msg_add_ws(e, name, nl)
+    msg_add(e, " cannot reference objects in database ")
+    let dn = db_name_off(e, k)
+    let dl = db_name_len(e, k)
+    msg_add_ws(e, dn, dl)
+    make_error(e, SQLITE_ERROR)
+}
+
+// A view or trigger stored in database d (not TEMP) may only name objects of
+// d; trigger bodies may not qualify the tables they write at all.
+fn check_fixed_refs(e: &mut Engine, kind: &str, name: usize, nl: usize, d: usize, trigger: bool) -> void!db.Error {
+    for n in 1usize..(e.node_n + 1) {
+        k := nkind(e, n)
+        q := ndb_of(e, n)
+        if q == NO_DB {
+            continue
+        }
+        if trigger && (k == S_INSERT || k == S_UPDATE || k == S_DELETE) {
+            return err(fail(e, SQLITE_ERROR, "qualified table names are not allowed on INSERT, UPDATE, and DELETE statements within triggers"))
+        }
+        if k == N_SRC && q != d {
+            return err(cross_db_error(e, kind, name, nl, q))
+        }
+    }
+    ok()
+}
+
+// ---------------------------------------------------------------------------
+// ATTACH and DETACH
+
+// Evaluates an ATTACH/DETACH operand as text into the arena.
+fn attach_text(e: &mut Engine, x: usize) -> (usize, usize)!db.Error {
+    save := e.rtop
+    r := reg_push(e)?
+    eval(e, x, r)?
+    if rtype(e, r) == T_NULL {
+        e.rtop = save
+        return ok((0usize, 0usize))
+    }
+    to_text(e, r)?
+    reg_own(e, r)?
+    res := (roff(e, r), rlen(e, r))
+    e.rtop = save
+    ok(res)
+}
+
+fn exec_attach(e: &mut Engine, s: usize) -> void!db.Error {
+    let fx = na(e, s)
+    let (fo, fl) = attach_text(e, fx)?
+    let nx_ = nb(e, s)
+    let (no, nl) = attach_text(e, nx_)?
+    if e.ndb >= DB_MAX {
+        x := fail(e, SQLITE_ERROR, "too many attached databases - max ")
+        msg_add_int(e, MAX_ATTACHED as i64)
+        return err(x)
+    }
+    if db_find(e, no, nl) != NO_DB {
+        e.msg_len = 0
+        msg_add(e, "database ")
+        msg_add_ws(e, no, nl)
+        msg_add(e, " is already in use")
+        return err(make_error(e, SQLITE_ERROR))
+    }
+    memory := fl == 0 || name_is_exact(e, fo, fl, ":memory:")
+    if nl >= NAME_CAP || !memory && fl + 16 > PATH_CAP {
+        return err(fail2(e, SQLITE_ERROR, "unable to open database: ", fo, fl))
+    }
+    // A free name/path area.
+    area := 2usize
+    for a in 2usize..DB_MAX {
+        taken := false
+        for k in 2usize..e.ndb {
+            if e.dbs[k].used && e.dbs[k].area == a {
+                taken = true
+            }
+        }
+        if !taken {
+            area = a
+            break
+        }
+    }
+    k := e.ndb
+    here := e.cur_db
+    db_reset_slot(e, k)
+    e.dbs[k].area = area
+    e.dbs[k].name_len = nl
+    let na_ = name_area(area)
+    move_bytes(e.ws, no, na_, nl)
+    let ro = db_readonly(e, 0)
+    use_db(e, k)
+    e.memory = memory
+    e.readonly = ro
+    e.page_size = 4096
+    e.usable = 4096
+    e.dbs[k].used = true
+    e.ndb += 1
+    if !memory {
+        po := path_area(area)
+        move_bytes(e.ws, fo, po, fl)
+        e.path_off = po
+        e.path_len = fl
+        match db_open_file(e) {
+            ok() => {},
+            err(reason) => {
+                attach_undo(e, k, here)
+                return err(reason)
+            },
+        }
+    }
+    sp_column_unknown(e, k)
+    // Validate the file and read its schema now, as SQLite does.
+    saved_loaded := e.schema_loaded
+    r := attach_check(e)
+    match r {
+        ok() => {},
+        err(reason) => {
+            saved := e.msg_len
+            attach_undo(e, k, here)
+            e.schema_loaded = false
+            e.msg_len = saved
+            if saved == 0 {
+                return err(fail2(e, SQLITE_ERROR, "unable to open database: ", fo, fl))
+            }
+            return err(reason)
+        },
+    }
+    if saved_loaded {
+        e.schema_loaded = false
+    }
+    use_db(e, here)
+    ok()
+}
+
+fn attach_check(e: &mut Engine) -> void!db.Error {
+    want := max_page_size(e)
+    if want > e.slot_ps {
+        resize_slots(e, want)?
+    }
+    begin_read(e)?
+    e.schema_loaded = false
+    r := load_schema(e)
+    end_read(e)
+    r
+}
+
+fn attach_undo(e: &mut Engine, k: usize, here: usize) {
+    use_db(e, k)
+    cache_clear(e)
+    db_close_files(e)
+    use_db(e, here)
+    db_reset_slot(e, k)
+    e.ndb = k
+}
+
+fn db_readonly(e: &Engine, k: usize) -> bool {
+    if k == e.cur_db {
+        return e.readonly
+    }
+    e.dbs[k].readonly
+}
+
+fn db_reset_slot(e: &mut Engine, k: usize) {
+    e.dbs[k] = db_saved_new()
+    e.dfile[k] = none
+    e.djournal[k] = none
+    e.dw[k] = wal_state_new()
+}
+
+fn name_is_exact(e: &Engine, o: usize, l: usize, word: &str) -> bool {
+    bytes_eq(&e.ws[o..o + l], mem_bytes(word))
+}
+
+// Opens (creating) the current database's file and adopts the page size of
+// its header.
+fn db_open_file(e: &mut Engine) -> void!db.Error {
+    let po = e.path_off
+    let pl = e.path_len
+    pws := platform.workspace()
+    options := fs.OpenOptions.new()
+    options.read = true
+    options.write = !e.readonly
+    options.create = !e.readonly
+    let text = path_text(&e.ws[po..po + pl])
+    match fs.File.open_utf8(text, &options, &mut pws) {
+        ok(file) => {
+            e.file = some(file)
+        },
+        err(_) => {
+            return err(fail2(e, SQLITE_CANTOPEN, "unable to open database: ", po, pl))
+        },
+    }
+    hdr := [0u8; 100]
+    got := fio_read(&mut e.file, 0, &mut hdr)
+    if got >= 100 {
+        ps := rd16(&hdr, 16)
+        if ps == 1 {
+            ps = 65536
+        }
+        if ps >= 512 && ps <= 65536 && (ps & (ps - 1)) == 0 {
+            e.page_size = ps
+            e.usable = ps
+        }
+    }
+    let clen = canonical_path(e, po, pl)
+    e.path_len = clen
+    ok()
+}
+
+fn exec_detach(e: &mut Engine, s: usize) -> void!db.Error {
+    let nx_ = nb(e, s)
+    let (no, nl) = attach_text(e, nx_)?
+    k := db_find(e, no, nl)
+    if k == DB_TEMP && !e.dbs[DB_TEMP].used {
+        k = NO_DB
+    }
+    if k == NO_DB {
+        return err(fail2(e, SQLITE_ERROR, "no such database: ", no, nl))
+    }
+    if k < 2 {
+        return err(fail2(e, SQLITE_ERROR, "cannot detach database ", no, nl))
+    }
+    here := e.cur_db
+    use_db(e, k)
+    busy := e.write_txn || read_active(e)
+    if busy {
+        use_db(e, here)
+        e.msg_len = 0
+        msg_add(e, "database ")
+        msg_add_ws(e, no, nl)
+        msg_add(e, " is locked")
+        return err(make_error(e, SQLITE_ERROR))
+    }
+    cache_clear(e)
+    db_close_files(e)
+    use_db(e, 0)
+    // Close the gap: later databases move down one index.
+    last := e.ndb - 1
+    for j in k..last {
+        db_move(e, j, j + 1)
+        f := mem.replace(&mut e.dfile[j + 1], none)
+        e.dfile[j] = f
+        jf := mem.replace(&mut e.djournal[j + 1], none)
+        e.djournal[j] = jf
+        wst := mem.replace(&mut e.dw[j + 1], wal_state_new())
+        e.dw[j] = wst
+    }
+    db_reset_slot(e, last)
+    e.ndb = last
+    db_renumber(e, k)
+    e.schema_loaded = false
+    let back = if here == k {
+        0usize
+    } else if here > k {
+        here - 1
+    } else {
+        here
+    }
+    use_db(e, back)
+    ok()
+}
+
+fn db_move(e: &mut Engine, dst: usize, src: usize) {
+    e.dbs[dst].used = e.dbs[src].used
+    e.dbs[dst].area = e.dbs[src].area
+    e.dbs[dst].name_len = e.dbs[src].name_len
+    e.dbs[dst].memory = e.dbs[src].memory
+    e.dbs[dst].readonly = e.dbs[src].readonly
+    e.dbs[dst].path_off = e.dbs[src].path_off
+    e.dbs[dst].path_len = e.dbs[src].path_len
+    e.dbs[dst].page_size = e.dbs[src].page_size
+    e.dbs[dst].usable = e.dbs[src].usable
+    e.dbs[dst].reserved = e.dbs[src].reserved
+    e.dbs[dst].db_pages = e.dbs[src].db_pages
+    e.dbs[dst].file_pages = e.dbs[src].file_pages
+    e.dbs[dst].disk_pages = e.dbs[src].disk_pages
+    e.dbs[dst].lock = e.dbs[src].lock
+    e.dbs[dst].shared_byte = e.dbs[src].shared_byte
+    e.dbs[dst].write_txn = e.dbs[src].write_txn
+    e.dbs[dst].journal_open = e.dbs[src].journal_open
+    e.dbs[dst].journal_synced = e.dbs[src].journal_synced
+    e.dbs[dst].journal_records = e.dbs[src].journal_records
+    e.dbs[dst].journal_nonce = e.dbs[src].journal_nonce
+    e.dbs[dst].db_written = e.dbs[src].db_written
+    e.dbs[dst].initialized = e.dbs[src].initialized
+    e.dbs[dst].schema_format = e.dbs[src].schema_format
+    e.dbs[dst].change_counter = e.dbs[src].change_counter
+    e.dbs[dst].schema_cookie = e.dbs[src].schema_cookie
+    e.dbs[dst].bm_base = e.dbs[src].bm_base
+    e.dbs[dst].bm_len = e.dbs[src].bm_len
+}
+
+// After database k was detached: references to databases above k (cache
+// slots, savepoint records and levels) move down one index.
+fn db_renumber(e: &mut Engine, k: usize) {
+    for s in 0usize..e.nslots {
+        m := slot_meta(e, s)
+        if ld32(e.ws, m) != 0 {
+            tag := e.ws[m + 5]
+            d := (tag & 127) as usize
+            if d > k {
+                e.ws[m + 5] = (tag & SLOT_JOURNAL) | ((d - 1) as u8)
+            }
+        }
+    }
+    hash_rebuild(e)
+    rec := sj_rec_bytes(e)
+    for i in 0usize..e.sj_used {
+        if i < e.sj_ws_recs {
+            o := e.sj_rec_off + i * rec + 4
+            d := ldu(e.ws, o)
+            if d > k {
+                stu(e.ws, o, d - 1)
+            }
+        } else {
+            pos := ((i - e.sj_ws_recs) as u64) * (rec as u64)
+            tag := [0u8; 8]
+            if sj_file_read_bytes(e, pos, &mut tag) {
+                d2 := ld32(&tag, 4) as usize
+                if d2 > k {
+                    st32(&mut tag, 4, (d2 - 1) as u32)
+                    sj_file_write_bytes(e, pos, &tag)
+                }
+            }
+        }
+    }
+    for i in 0usize..e.sj_ht_cap {
+        o := e.sj_ht_off + i * 8
+        if ld32(e.ws, o) != 0 && (e.ws[o + 6] as usize) > k {
+            e.ws[o + 6] = e.ws[o + 6] - 1
+        }
+    }
+    for i in 0usize..(SP_MAX + 1) {
+        o := sp_entry(e, i) + 12
+        for c in k..(DB_MAX - 1) {
+            let v = ld32(e.ws, o + 4 * (c + 1))
+            st32(e.ws, o + 4 * c, v)
+        }
+        st32(e.ws, o + 4 * (DB_MAX - 1), SP_UNKNOWN)
+    }
+}

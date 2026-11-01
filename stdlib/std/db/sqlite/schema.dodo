@@ -24,6 +24,8 @@ const O_ROWID: usize = 40
 const O_ROWNO: usize = 44
 const O_ONCONF: usize = 48
 const O_NPK: usize = 49
+// The database holding the object.
+const O_DB: usize = 50
 // Partial indexes: the WHERE clause text.
 const O_WHERE: usize = 52
 const O_WHEREL: usize = 56
@@ -77,6 +79,22 @@ fn obj(e: &Engine, i: usize) -> usize {
         return i - LOCAL_OBJ
     }
     e.schema_off + i * OBJ_BYTES
+}
+
+fn obj_db(e: &Engine, i: usize) -> usize {
+    e.ws[obj(e, i) + O_DB] as usize
+}
+
+// Position of database k in the search order of unqualified names: TEMP,
+// main, then attached databases in attach order.
+fn db_rank(k: usize) -> usize {
+    if k == DB_TEMP {
+        return 0
+    }
+    if k == 0 {
+        return 1
+    }
+    k
 }
 
 fn obj_type(e: &Engine, i: usize) -> u8 {
@@ -344,17 +362,41 @@ fn new_obj(e: &mut Engine) -> usize!db.Error {
 }
 
 // Kind 0 finds tables, indexes and views; triggers have their own name
-// space.
-fn find_obj(e: &Engine, kind: u8, name: usize, len: usize) -> usize {
+// space. Looks in database `db`, or with NO_DB in every database in search
+// order (TEMP, main, attached).
+fn find_obj(e: &Engine, db: usize, kind: u8, name: usize, len: usize) -> usize {
+    best := NO_COL
+    best_rank := 1000usize
     for i in 0usize..e.schema_objs {
         let name2 = obj_u(e, i, O_NAME)
         let name_len = obj_u(e, i, O_NAMEL)
         let ty = obj_type(e, i)
         if (kind == 0 && ty != OT_TRIGGER || ty == kind) && names_eq(e, name2, name_len, name, len) {
-            return i
+            d := obj_db(e, i)
+            if db != NO_DB {
+                if d == db {
+                    return i
+                }
+                continue
+            }
+            r := db_rank(d)
+            if r < best_rank {
+                best = i
+                best_rank = r
+            }
         }
     }
-    NO_COL
+    best
+}
+
+// Where to look up a name with schema qualifier `q` (NO_DB if none): the
+// named database, else the one a view or trigger body is bound to, else
+// every database.
+fn lookup_db(e: &Engine, q: usize) -> usize {
+    if q != NO_DB {
+        return q
+    }
+    e.fix_db
 }
 
 fn find_column(e: &Engine, t: usize, name: usize, len: usize) -> usize {
@@ -405,15 +447,112 @@ fn schema_slot(e: &Engine) -> usize {
 // ---------------------------------------------------------------------------
 // Loading
 
+// Loads the catalog of every open database: main, the attached ones, then
+// TEMP (so TEMP triggers come first when triggers are taken newest first).
 fn load_schema(e: &mut Engine) -> void!db.Error {
     if e.schema_loaded {
         return ok()
     }
+    here := e.cur_db
+    r := load_schema_all(e)
+    use_db(e, here)
+    r
+}
+
+fn load_schema_all(e: &mut Engine) -> void!db.Error {
     e.schema_objs = 0
     e.schema_pool = e.schema_off + e.schema_cap
     e.schema_gen += 1
+    for j in 0usize..e.ndb {
+        k := if j == 0 {
+            0usize
+        } else if j + 1 < e.ndb {
+            j + 1
+        } else {
+            DB_TEMP
+        }
+        if !db_used(e, k) {
+            continue
+        }
+        use_db(e, k)
+        load_db_objects(e, k)?
+    }
+    // Pass 2: tables, then indexes and triggers (which refer to tables).
+    for i in 0usize..e.schema_objs {
+        if obj_type(e, i) == OT_TABLE {
+            match load_table(e, i) {
+                ok() => {},
+                err(_) => {
+                    o := obj(e, i)
+                    e.ws[o + O_FLAGS] = e.ws[o + O_FLAGS] | OF_UNSUPPORTED
+                },
+            }
+        }
+    }
+    for i in 0usize..e.schema_objs {
+        k := obj_type(e, i)
+        if k == OT_INDEX || k == OT_TRIGGER {
+            let tbl = obj_u(e, i, O_TBL)
+            let tbl_len = obj_u(e, i, O_TBLL)
+            d := obj_db(e, i)
+            if k == OT_TRIGGER {
+                // TEMP triggers may be on tables of other databases (named
+                // by a qualifier, else found in search order).
+                tdb := d
+                loaded := match load_trigger(e, i) {
+                    ok(q) => {
+                        if d == DB_TEMP {
+                            tdb = q
+                        }
+                        true
+                    },
+                    err(_) => false,
+                }
+                t := find_obj(e, tdb, OT_TABLE, tbl, tbl_len)
+                if t == NO_COL {
+                    t = find_obj(e, tdb, OT_VIEW, tbl, tbl_len)
+                }
+                o := obj(e, i)
+                stu(e.ws, o + O_TABLE, t)
+                if t == NO_COL {
+                    continue
+                }
+                if !loaded {
+                    // Writes must not silently skip a trigger.
+                    ot := obj(e, t)
+                    e.ws[ot + O_FLAGS] = e.ws[ot + O_FLAGS] | OF_HAS_TRIGGER
+                    o3 := obj(e, i)
+                    stu(e.ws, o3 + O_TABLE, NO_COL)
+                }
+                continue
+            }
+            t := find_obj(e, d, OT_TABLE, tbl, tbl_len)
+            o := obj(e, i)
+            stu(e.ws, o + O_TABLE, t)
+            if t == NO_COL {
+                continue
+            }
+            match load_index(e, i, t) {
+                ok() => {
+                    index_add_tail(e, i, t)?
+                },
+                err(_) => {
+                    o2 := obj(e, i)
+                    e.ws[o2 + O_FLAGS] = e.ws[o2 + O_FLAGS] | OF_UNSUPPORTED
+                    ot := obj(e, t)
+                    e.ws[ot + O_FLAGS] = e.ws[ot + O_FLAGS] | OF_UNSUPPORTED_INDEX
+                },
+            }
+        }
+    }
+    e.msg_len = 0
+    e.schema_loaded = true
+    ok()
+}
+
+// Pass 1 for database k (current): one object per sqlite_schema row.
+fn load_db_objects(e: &mut Engine, k: usize) -> void!db.Error {
     if e.db_pages == 0 {
-        e.schema_loaded = true
         return ok()
     }
     format := hdr_get(e, 44)?
@@ -425,7 +564,6 @@ fn load_schema(e: &mut Engine) -> void!db.Error {
     } else {
         format
     }
-    // Pass 1: objects.
     c := NCURSORS - 1
     cur_open(e, c, 1, false)
     mark := e.arena_top
@@ -434,6 +572,8 @@ fn load_schema(e: &mut Engine) -> void!db.Error {
         let (p, n) = cur_payload(e, c)?
         rowno := cur_rowid(e, c)
         i := new_obj(e)?
+        o0 := obj(e, i)
+        e.ws[o0 + O_DB] = k as u8
         record_column(e, p, n, 0, R_TMP)?
         kind := 0u8
         if rtype(e, R_TMP) == T_TEXT {
@@ -495,63 +635,6 @@ fn load_schema(e: &mut Engine) -> void!db.Error {
         more = cur_next(e, c)?
     }
     arena_reset(e, mark)
-    // Pass 2: tables, then indexes (which refer to their tables).
-    for i in 0usize..e.schema_objs {
-        if obj_type(e, i) == OT_TABLE {
-            match load_table(e, i) {
-                ok() => {},
-                err(_) => {
-                    o := obj(e, i)
-                    e.ws[o + O_FLAGS] = e.ws[o + O_FLAGS] | OF_UNSUPPORTED
-                },
-            }
-        }
-    }
-    for i in 0usize..e.schema_objs {
-        k := obj_type(e, i)
-        if k == OT_INDEX || k == OT_TRIGGER {
-            let tbl = obj_u(e, i, O_TBL)
-            let tbl_len = obj_u(e, i, O_TBLL)
-            t := find_obj(e, OT_TABLE, tbl, tbl_len)
-            if t == NO_COL && k == OT_TRIGGER {
-                t = find_obj(e, OT_VIEW, tbl, tbl_len)
-            }
-            o := obj(e, i)
-            stu(e.ws, o + O_TABLE, t)
-            if t == NO_COL {
-                continue
-            }
-            if k == OT_TRIGGER {
-                match load_trigger(e, i) {
-                    ok() => {},
-                    err(_) => {
-                        // Writes must not silently skip a trigger.
-                        ot := obj(e, t)
-                        e.ws[ot + O_FLAGS] = e.ws[ot + O_FLAGS] | OF_HAS_TRIGGER
-                        o3 := obj(e, i)
-                        e.ws[o3 + O_TABLE] = 255
-                        e.ws[o3 + O_TABLE + 1] = 255
-                        e.ws[o3 + O_TABLE + 2] = 255
-                        e.ws[o3 + O_TABLE + 3] = 255
-                    },
-                }
-                continue
-            }
-            match load_index(e, i, t) {
-                ok() => {
-                    index_add_tail(e, i, t)?
-                },
-                err(_) => {
-                    o2 := obj(e, i)
-                    e.ws[o2 + O_FLAGS] = e.ws[o2 + O_FLAGS] | OF_UNSUPPORTED
-                    ot := obj(e, t)
-                    e.ws[ot + O_FLAGS] = e.ws[ot + O_FLAGS] | OF_UNSUPPORTED_INDEX
-                },
-            }
-        }
-    }
-    e.msg_len = 0
-    e.schema_loaded = true
     ok()
 }
 

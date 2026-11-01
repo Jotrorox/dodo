@@ -262,6 +262,21 @@ fn exec_pragma(e: &mut Engine, s: usize, resreg: usize) -> void!db.Error {
     set := nflags(e, s) == 1
     arg := nflags(e, s) != 0
     r := resreg
+    // "PRAGMA schema.name": per-database pragmas act on that database
+    // (main by default); table_info and friends search all of them.
+    pdb := ndb_of(e, s)
+    let target = if pdb == NO_DB {
+        0usize
+    } else {
+        pdb
+    }
+    if target == DB_TEMP && !e.dbs[DB_TEMP].used {
+        temp_open(e)?
+    }
+    use_db(e, target)
+    if id == P_INTEGRITY_CHECK && pdb == NO_DB {
+        return integrity_check_all(e, r)
+    }
     if id == P_USER_VERSION || id == P_APP_ID {
         off := if id == P_USER_VERSION {
             60usize
@@ -437,15 +452,24 @@ fn exec_pragma(e: &mut Engine, s: usize, resreg: usize) -> void!db.Error {
         return prow(e, r, 1)
     }
     if id == P_DATABASE_LIST {
-        set_int(e, r, 0)
-        set_text_str(e, r + 1, "main")?
-        if e.memory {
-            set_text_str(e, r + 2, "")?
-        } else {
-            let path_len2 = e.path_len
-            set_bytes(e, r + 2, T_TEXT, 0, path_len2)
+        for k in 0usize..e.ndb {
+            if !db_used(e, k) {
+                continue
+            }
+            set_int(e, r, k as i64)
+            let no = db_name_off(e, k)
+            let nl = db_name_len(e, k)
+            set_bytes(e, r + 1, T_TEXT, no, nl)
+            if db_is_memory(e, k) {
+                set_text_str(e, r + 2, "")?
+            } else {
+                let po = db_path_off(e, k)
+                let pl = db_path_len(e, k)
+                set_bytes(e, r + 2, T_TEXT, po, pl)
+            }
+            prow(e, r, 3)?
         }
-        return prow(e, r, 3)
+        return ok()
     }
     if id == P_TABLE_INFO || id == P_INDEX_LIST || id == P_INDEX_INFO {
         if !arg {
@@ -455,7 +479,7 @@ fn exec_pragma(e: &mut Engine, s: usize, resreg: usize) -> void!db.Error {
         name := na(e, v)
         nl := nb(e, v)
         if id == P_INDEX_INFO {
-            x := find_obj(e, OT_INDEX, name, nl)
+            x := find_obj(e, pdb, OT_INDEX, name, nl)
             if x == NO_COL {
                 return ok()
             }
@@ -480,7 +504,7 @@ fn exec_pragma(e: &mut Engine, s: usize, resreg: usize) -> void!db.Error {
             }
             return ok()
         }
-        t := find_obj(e, OT_TABLE, name, nl)
+        t := find_obj(e, pdb, OT_TABLE, name, nl)
         if t == NO_COL {
             return ok()
         }
@@ -572,10 +596,13 @@ fn exec_pragma(e: &mut Engine, s: usize, resreg: usize) -> void!db.Error {
     }
     if id == P_TABLE_LIST {
         for j in 0usize..e.schema_objs {
-            if obj_type(e, j) != OT_TABLE {
+            if obj_type(e, j) != OT_TABLE || pdb != NO_DB && obj_db(e, j) != pdb {
                 continue
             }
-            set_text_str(e, r, "main")?
+            let jd = obj_db(e, j)
+            let dno = db_name_off(e, jd)
+            let dnl = db_name_len(e, jd)
+            set_bytes(e, r, T_TEXT, dno, dnl)
             let name5 = obj_u(e, j, O_NAME)
             let name_len4 = obj_u(e, j, O_NAMEL)
             set_bytes(e, r + 1, T_TEXT, name5, name_len4)
@@ -742,6 +769,43 @@ fn ic_tree(e: &mut Engine, map: usize, pgno: u32, r: usize, count: &mut usize, l
     ok((total, 1usize))
 }
 
+// integrity_check without a schema: every database; "ok" once when all
+// of them are.
+fn integrity_check_all(e: &mut Engine, r: usize) -> void!db.Error {
+    // SQLite opens the TEMP database to check it too.
+    temp_open(e)?
+    start := e.sort_top
+    for k in 0usize..e.ndb {
+        if !db_used(e, k) {
+            continue
+        }
+        use_db(e, k)
+        before := e.sort_top
+        integrity_check(e, r)?
+        // Drop this database's lone "ok" row.
+        if e.sort_top > before && ic_was_ok(e, before) {
+            e.sort_top = before
+        }
+    }
+    use_db(e, 0)
+    if e.sort_top == start {
+        set_text_str(e, r, "ok")?
+        prow(e, r, 1)?
+    }
+    ok()
+}
+
+fn ic_was_ok(e: &mut Engine, rec: usize) -> bool {
+    let len = rec_len(e, rec)
+    match record_column(e, rec + 4, len, 0, R_TMP) {
+        ok(_) => {},
+        err(_) => {
+            return false
+        },
+    }
+    rtype(e, R_TMP) == T_TEXT && name_is_exact(e, roff(e, R_TMP), rlen(e, R_TMP), "ok")
+}
+
 fn integrity_check(e: &mut Engine, r: usize) -> void!db.Error {
     count := 0usize
     if e.db_pages == 0 {
@@ -792,7 +856,7 @@ fn integrity_check(e: &mut Engine, r: usize) -> void!db.Error {
     let (_, _) = ic_tree(e, map, 1, r, &mut count, 0)?
     for i in 0usize..e.schema_objs {
         root := obj_root(e, i)
-        if root <= 1 {
+        if root <= 1 || obj_db(e, i) != e.cur_db {
             continue
         }
         k := obj_type(e, i)
@@ -831,6 +895,10 @@ fn integrity_check(e: &mut Engine, r: usize) -> void!db.Error {
 // format version bytes (2 = WAL), as SQLite does. Other modes are accepted
 // as DELETE. In-memory databases always report "memory".
 fn journal_mode_pragma(e: &mut Engine, s: usize) -> &str!db.Error from(static) {
+    if e.cur_db == DB_TEMP {
+        // SQLite keeps TEMP in a temporary file with a rollback journal.
+        return ok("delete")
+    }
     if e.memory {
         return ok("memory")
     }
