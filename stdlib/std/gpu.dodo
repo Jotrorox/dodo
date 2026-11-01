@@ -1,0 +1,1804 @@
+package gpu
+
+import "core/mem"
+import "core/ptr"
+import "std/gpu/hal"
+import "std/gpu/hal/native" as native_hal
+import "std/gpu/hal/opengl" as opengl_hal
+import "std/gpu/hal/vulkan" as vulkan_hal
+
+// Portable GPU computing and rendering on Vulkan, Metal and OpenGL.
+//
+// One API runs on whichever GPU interface the machine has: Metal on macOS,
+// Vulkan on Linux and Windows, and OpenGL 4.5 where Vulkan is missing. The
+// model follows WebGPU: a Device creates buffers, textures, samplers and
+// pipelines; a CommandEncoder records compute passes, render passes and
+// copies; submit() runs them in order. std/gpu checks every call against
+// the rules below before the backend sees it, and keeps every object alive
+// until the GPU has finished with it, so safe code cannot make the GPU read
+// freed memory or write outside a buffer through std/gpu.
+//
+// Resources borrow their device, so the device outlives them. Recording
+// mistakes, such as a draw without a pipeline or a buffer bound without
+// the usage its slot needs, panic like an out-of-bounds index; creating
+// objects and copying data return errors.
+//
+// Shaders are given in each backend's language at once (ShaderSource):
+// SPIR-V words for Vulkan, Metal Shading Language source for Metal, GLSL
+// source for OpenGL. Bindings are numbered slots, the same number in every
+// language. Use a device from the thread that opened it.
+
+pub type Error = hal.Error
+pub type Api = hal.Api
+pub type Limits = hal.Limits
+pub type TextureDescriptor = hal.TextureDescriptor
+pub type SamplerDescriptor = hal.SamplerDescriptor
+pub type Region = hal.Region
+pub type ShaderSource = hal.ShaderSource
+pub type BindingLayout = hal.BindingLayout
+pub type VertexAttribute = hal.VertexAttribute
+pub type VertexBufferLayout = hal.VertexBufferLayout
+pub type ComputePipelineDescriptor = hal.ComputePipelineDescriptor
+pub type RenderPipelineDescriptor = hal.RenderPipelineDescriptor
+
+pub fn error_name(error: Error) -> &str from(static) {
+    match error {
+        Error.NoBackend => {
+            return "NoBackend"
+        }
+        Error.Unsupported => {
+            return "Unsupported"
+        }
+        Error.InvalidInput => {
+            return "InvalidInput"
+        }
+        Error.MissingShader => {
+            return "MissingShader"
+        }
+        Error.InvalidShader => {
+            return "InvalidShader"
+        }
+        Error.OutOfMemory => {
+            return "OutOfMemory"
+        }
+        Error.DeviceLost => {
+            return "DeviceLost"
+        }
+        Error.System => {
+            return "System"
+        }
+    }
+}
+
+pub fn api_name(api: &Api) -> &str from(static) {
+    match api {
+        Api.Vulkan => {
+            return "Vulkan"
+        }
+        Api.Metal => {
+            return "Metal"
+        }
+        Api.OpenGl => {
+            return "OpenGL"
+        }
+    }
+}
+
+// Buffer usages, combined with `|`. A buffer can only be used in the ways
+// it was created for.
+// The source of copies, and readable with read_buffer.
+pub const BUFFER_COPY_SRC: u32 = 1
+// The destination of copies, and writable with write_buffer.
+pub const BUFFER_COPY_DST: u32 = 2
+pub const BUFFER_INDEX: u32 = 4
+pub const BUFFER_VERTEX: u32 = 8
+pub const BUFFER_UNIFORM: u32 = 16
+pub const BUFFER_STORAGE: u32 = 32
+
+// Texture usages, combined with `|`.
+// The source of copies, and readable with read_texture.
+pub const TEXTURE_COPY_SRC: u32 = 1
+// The destination of copies, and writable with write_texture.
+pub const TEXTURE_COPY_DST: u32 = 2
+pub const TEXTURE_SAMPLED: u32 = 4
+pub const TEXTURE_STORAGE: u32 = 8
+// A render pass attachment.
+pub const TEXTURE_RENDER: u32 = 16
+
+// Texture formats.
+pub const FORMAT_NONE: u32 = 0
+pub const FORMAT_R8_UNORM: u32 = 1
+pub const FORMAT_RG8_UNORM: u32 = 2
+pub const FORMAT_RGBA8_UNORM: u32 = 3
+pub const FORMAT_RGBA8_UNORM_SRGB: u32 = 4
+pub const FORMAT_BGRA8_UNORM: u32 = 5
+pub const FORMAT_BGRA8_UNORM_SRGB: u32 = 6
+pub const FORMAT_R16_FLOAT: u32 = 7
+pub const FORMAT_RG16_FLOAT: u32 = 8
+pub const FORMAT_RGBA16_FLOAT: u32 = 9
+pub const FORMAT_R32_FLOAT: u32 = 10
+pub const FORMAT_RG32_FLOAT: u32 = 11
+pub const FORMAT_RGBA32_FLOAT: u32 = 12
+pub const FORMAT_R32_UINT: u32 = 13
+pub const FORMAT_R32_SINT: u32 = 14
+pub const FORMAT_RGBA32_UINT: u32 = 15
+pub const FORMAT_DEPTH32_FLOAT: u32 = 16
+
+// The size of one texel of `format` in bytes, or 0 for an unknown format.
+pub fn texel_size(format: u32) -> u32 {
+    return hal.texel_size(format)
+}
+
+// Shader stages that use a binding, combined with `|`.
+pub const STAGE_VERTEX: u32 = 1
+pub const STAGE_FRAGMENT: u32 = 2
+pub const STAGE_COMPUTE: u32 = 4
+
+// Vertex attribute formats.
+pub const VERTEX_FLOAT32: u32 = 1
+pub const VERTEX_FLOAT32X2: u32 = 2
+pub const VERTEX_FLOAT32X3: u32 = 3
+pub const VERTEX_FLOAT32X4: u32 = 4
+pub const VERTEX_UINT32: u32 = 5
+pub const VERTEX_UINT32X2: u32 = 6
+pub const VERTEX_UINT32X3: u32 = 7
+pub const VERTEX_UINT32X4: u32 = 8
+pub const VERTEX_SINT32: u32 = 9
+pub const VERTEX_SINT32X2: u32 = 10
+pub const VERTEX_SINT32X3: u32 = 11
+pub const VERTEX_SINT32X4: u32 = 12
+pub const VERTEX_UNORM8X4: u32 = 13
+
+pub const TOPOLOGY_TRIANGLE_LIST: u32 = 0
+pub const TOPOLOGY_TRIANGLE_STRIP: u32 = 1
+pub const TOPOLOGY_LINE_LIST: u32 = 2
+pub const TOPOLOGY_LINE_STRIP: u32 = 3
+pub const TOPOLOGY_POINT_LIST: u32 = 4
+
+pub const CULL_NONE: u32 = 0
+pub const CULL_FRONT: u32 = 1
+pub const CULL_BACK: u32 = 2
+
+// The winding of front faces, seen with y pointing up in clip space.
+pub const FRONT_CCW: u32 = 0
+pub const FRONT_CW: u32 = 1
+
+pub const INDEX_UINT16: u32 = 1
+pub const INDEX_UINT32: u32 = 2
+
+pub const BLEND_REPLACE: u32 = 0
+pub const BLEND_ALPHA: u32 = 1
+pub const BLEND_PREMULTIPLIED: u32 = 2
+pub const BLEND_ADDITIVE: u32 = 3
+
+pub const COMPARE_NEVER: u32 = 1
+pub const COMPARE_LESS: u32 = 2
+pub const COMPARE_EQUAL: u32 = 3
+pub const COMPARE_LESS_EQUAL: u32 = 4
+pub const COMPARE_GREATER: u32 = 5
+pub const COMPARE_NOT_EQUAL: u32 = 6
+pub const COMPARE_GREATER_EQUAL: u32 = 7
+pub const COMPARE_ALWAYS: u32 = 8
+
+pub const FILTER_NEAREST: u32 = 0
+pub const FILTER_LINEAR: u32 = 1
+
+pub const ADDRESS_CLAMP: u32 = 0
+pub const ADDRESS_REPEAT: u32 = 1
+pub const ADDRESS_MIRROR: u32 = 2
+
+pub const LOAD_CLEAR: u32 = 0
+pub const LOAD_KEEP: u32 = 1
+
+// Binding slots per pipeline, numbered from 0.
+pub const MAX_SLOTS: u32 = 16
+pub const MAX_VERTEX_BUFFERS: u32 = 8
+pub const MAX_VERTEX_ATTRIBUTES: u32 = 16
+// Buffer offsets bound to a slot are multiples of this.
+pub const BINDING_ALIGNMENT: u64 = 256
+
+// Which backend Device.open tries.
+pub enum Preference {
+    // The operating system's own API (Metal on macOS), then Vulkan, then
+    // OpenGL.
+    Auto,
+    Vulkan,
+    Metal,
+    OpenGl
+}
+
+pub struct Options {
+    pub backend: Preference
+    // Turn on the API's validation where it exists: the Khronos validation
+    // layer for Vulkan when installed, a debug context for OpenGL.
+    pub debug: bool
+
+    pub fn default() -> Options {
+        return Options { backend: Preference.Auto, debug: false }
+    }
+    pub fn with_backend(backend: Preference) -> Options {
+        return Options { backend: backend, debug: false }
+    }
+}
+
+enum Raw {
+    Vulkan(vulkan_hal.Device),
+    Native(native_hal.Device),
+    OpenGl(opengl_hal.Device)
+}
+
+// Objects dropped while the GPU may still use them wait here.
+const GRAVEYARD: usize = 64
+// Marks an object that an open encoder may use.
+const PENDING: u64 = 0xffffffffffffffff
+
+struct Life {
+    open_encoders: u32
+    submitted: u64
+    count: usize
+    object: [64]u32
+    a: [64]u64
+    b: [64]u64
+    c: [64]u64
+    d: [64]u64
+    wait: [64]u64
+}
+
+// A GPU and the queue its work runs on.
+pub struct Device {
+    raw: Raw
+    limits: hal.Limits
+    name: [256]u8
+    name_length: usize
+    life: Life
+
+    // Open a device. With Preference.Auto, tries the operating system's
+    // own API, then Vulkan, then OpenGL. Fails with NoBackend when no
+    // backend could be used and Unsupported when the requested one lacks
+    // what std/gpu needs, such as Vulkan before 1.2 or OpenGL before 4.5.
+    pub fn open(options: Options) -> Device!Error {
+        debug := options.debug
+        match &options.backend {
+            Preference.Vulkan => {
+                return Device.from_raw(Raw.Vulkan(vulkan_hal.Device.open(debug)?))
+            }
+            Preference.Metal => {
+                return Device.from_raw(Raw.Native(native_hal.Device.open(debug)?))
+            }
+            Preference.OpenGl => {
+                return Device.from_raw(Raw.OpenGl(opengl_hal.Device.open(debug)?))
+            }
+            Preference.Auto => {}
+        }
+        // Keep the most telling failure: an error other than a missing
+        // backend explains more.
+        failure := Error.NoBackend
+        match native_hal.Device.open(debug) {
+            ok(device) => {
+                return Device.from_raw(Raw.Native(device))
+            }
+            err(error) => {
+                failure = worse(failure, error)
+            }
+        }
+        match vulkan_hal.Device.open(debug) {
+            ok(device) => {
+                return Device.from_raw(Raw.Vulkan(device))
+            }
+            err(error) => {
+                failure = worse(failure, error)
+            }
+        }
+        match opengl_hal.Device.open(debug) {
+            ok(device) => {
+                return Device.from_raw(Raw.OpenGl(device))
+            }
+            err(error) => {
+                failure = worse(failure, error)
+            }
+        }
+        return err(failure)
+    }
+
+    fn from_raw(raw: Raw) -> Device!Error {
+        device := Device {
+            raw: raw,
+            limits: hal.Limits { max_texture_size: 0, max_buffer_size: 0, max_uniform_binding_size: 0, max_storage_binding_size: 0, max_workgroups: 0, max_workgroup_size_x: 0, max_workgroup_size_y: 0, max_workgroup_size_z: 0, max_workgroup_invocations: 0 },
+            name: [0u8; 256],
+            name_length: 0,
+            life: Life { open_encoders: 0, submitted: 0, count: 0, object: [0u32; 64], a: [0u64; 64], b: [0u64; 64], c: [0u64; 64], d: [0u64; 64], wait: [0u64; 64] }
+        }
+        device.limits = device.raw_limits()
+        name := [0u8; 256]
+        length := device.raw_name(&mut name)
+        // Names are shown as ASCII.
+        for i in 0usize..length {
+            if name[i] >= 128 {
+                name[i] = 63
+            }
+        }
+        device.name = name
+        device.name_length = length
+        return ok(device)
+    }
+
+    // The API this device uses.
+    pub fn api(&self) -> Api {
+        match &self.raw {
+            Raw.Vulkan(raw) => {
+                return raw.api()
+            }
+            Raw.Native(raw) => {
+                return raw.api()
+            }
+            Raw.OpenGl(raw) => {
+                return raw.api()
+            }
+        }
+    }
+
+    // The GPU's name as the driver reports it, such as "Apple M2" or
+    // "llvmpipe (LLVM 19.1.7, 256 bits)".
+    pub fn name(&self) -> &str from(self) {
+        unsafe {
+            return mem.str_from_utf8(&self.name[..self.name_length])
+        }
+    }
+
+    pub fn limits(&self) -> Limits {
+        return self.limits.copy()
+    }
+
+    // A buffer of `size` bytes, initially zero, usable in the ways `usage`
+    // combines (BUFFER_*). Fails with InvalidInput for a zero size, one
+    // above limits().max_buffer_size or an empty or unknown usage.
+    pub fn create_buffer(&self, size: u64, usage: u32) -> Buffer!Error from(self) {
+        if size == 0 || size > self.limits.max_buffer_size || usage == 0 || (usage & ~hal.BUFFER_USAGES) != 0 {
+            return err(Error.InvalidInput)
+        }
+        // Whole words, so that shaders reading u32s stay in bounds.
+        rounded := (size + 3) & ~3u64
+        handle := self.raw_create_buffer(rounded, usage)?
+        return ok(Buffer { device: self, handle: handle, size: size, usage: usage })
+    }
+
+    // A buffer holding a copy of `data`, which must not be empty. The
+    // usage needs no BUFFER_COPY_DST for this first write.
+    pub fn create_buffer_with_data(&self, data: &[u8], usage: u32) -> Buffer!Error from(self) {
+        buffer := self.create_buffer(data.len as u64, usage)?
+        self.raw_write_buffer(&buffer.handle, 0, data)?
+        return ok(buffer)
+    }
+
+    // Copy `data` into `buffer` at `offset`. The write happens after every
+    // submission made before it and before every later one, as if it were
+    // a command of its own. Needs BUFFER_COPY_DST; fails with InvalidInput
+    // when the range does not fit.
+    pub fn write_buffer(&self, buffer: &Buffer, offset: u64, data: &[u8]) -> void!Error {
+        self.check_owner(buffer.device)
+        if (buffer.usage & hal.BUFFER_COPY_DST) == 0 || !fits(offset, data.len as u64, buffer.size) {
+            return err(Error.InvalidInput)
+        }
+        if data.len == 0 {
+            return ok()
+        }
+        return self.raw_write_buffer(&buffer.handle, offset, data)
+    }
+
+    // Copy bytes of `buffer` from `offset` into `out`, after waiting for
+    // every submission made so far. Needs BUFFER_COPY_SRC; fails with
+    // InvalidInput when the range does not fit.
+    pub fn read_buffer(&self, buffer: &Buffer, offset: u64, out: &mut[u8]) -> void!Error {
+        self.check_owner(buffer.device)
+        if (buffer.usage & hal.BUFFER_COPY_SRC) == 0 || !fits(offset, out.len as u64, buffer.size) {
+            return err(Error.InvalidInput)
+        }
+        if out.len == 0 {
+            return ok()
+        }
+        return self.raw_read_buffer(&buffer.handle, offset, out)
+    }
+
+    // A two-dimensional texture. Fails with InvalidInput for a zero size,
+    // one above limits().max_texture_size, an unknown format, or a usage
+    // the format does not allow: depth formats can only be rendered to,
+    // sampled and copied from, and TEXTURE_STORAGE needs one of the
+    // formats every backend can store to (rgba8unorm, rgba16float,
+    // r32float, rg32float, rgba32float, r32uint, r32sint, rgba32uint).
+    pub fn create_texture(&self, descriptor: TextureDescriptor) -> Texture!Error from(self) {
+        width := descriptor.width
+        height := descriptor.height
+        format := descriptor.format
+        usage := descriptor.usage
+        if width == 0 || height == 0 || width > self.limits.max_texture_size || height > self.limits.max_texture_size {
+            return err(Error.InvalidInput)
+        }
+        if format == hal.FORMAT_NONE || format >= hal.FORMAT_COUNT || usage == 0 || (usage & ~hal.TEXTURE_USAGES) != 0 {
+            return err(Error.InvalidInput)
+        }
+        if hal.is_depth(format) && (usage & (hal.TEXTURE_COPY_DST | hal.TEXTURE_STORAGE)) != 0 {
+            return err(Error.InvalidInput)
+        }
+        if (usage & hal.TEXTURE_STORAGE) != 0 && !hal.is_storage(format) {
+            return err(Error.InvalidInput)
+        }
+        handle := self.raw_create_texture(&descriptor)?
+        return ok(Texture { device: self, handle: handle, descriptor: descriptor })
+    }
+
+    // Copy texels from `data` into `region` of `texture`, rows
+    // `bytes_per_row` apart, top row first. Ordered like write_buffer.
+    // Needs TEXTURE_COPY_DST; fails with InvalidInput when the region is
+    // outside the texture, a row is shorter than the region or not a
+    // multiple of the texel size, or `data` is too short.
+    pub fn write_texture(&self, texture: &Texture, region: Region, data: &[u8], bytes_per_row: u32) -> void!Error {
+        self.check_owner(texture.device)
+        if (texture.descriptor.usage & hal.TEXTURE_COPY_DST) == 0 || hal.is_depth(texture.descriptor.format) || !texture_copy_fits(&texture.descriptor, &region, data.len as u64, 0, bytes_per_row) {
+            return err(Error.InvalidInput)
+        }
+        if region.width == 0 || region.height == 0 {
+            return ok()
+        }
+        return self.raw_write_texture(&texture.handle, &texture.descriptor, &region, data, bytes_per_row)
+    }
+
+    // Copy texels of `region` into `out`, rows `bytes_per_row` apart, top
+    // row first, after waiting for every submission made so far. Needs
+    // TEXTURE_COPY_SRC; fails like write_texture.
+    pub fn read_texture(&self, texture: &Texture, region: Region, out: &mut[u8], bytes_per_row: u32) -> void!Error {
+        self.check_owner(texture.device)
+        if (texture.descriptor.usage & hal.TEXTURE_COPY_SRC) == 0 || !texture_copy_fits(&texture.descriptor, &region, out.len as u64, 0, bytes_per_row) {
+            return err(Error.InvalidInput)
+        }
+        if region.width == 0 || region.height == 0 {
+            return ok()
+        }
+        return self.raw_read_texture(&texture.handle, &texture.descriptor, &region, out, bytes_per_row)
+    }
+
+    pub fn create_sampler(&self, descriptor: SamplerDescriptor) -> Sampler!Error from(self) {
+        if descriptor.mag_filter > hal.FILTER_LINEAR || descriptor.min_filter > hal.FILTER_LINEAR || descriptor.address_u > hal.ADDRESS_MIRROR || descriptor.address_v > hal.ADDRESS_MIRROR {
+            return err(Error.InvalidInput)
+        }
+        handle := self.raw_create_sampler(&descriptor)?
+        return ok(Sampler { device: self, handle: handle })
+    }
+
+    // A compute pipeline. Fails with MissingShader when the source has no
+    // code for this device's API, InvalidShader when it does not compile
+    // or lacks the entry point, and InvalidInput for a bad binding layout
+    // or a workgroup size outside the limits.
+    pub fn create_compute_pipeline(&self, descriptor: ComputePipelineDescriptor) -> ComputePipeline!Error from(self) {
+        pipeline := hal.Pipeline.empty()
+        check_bindings(descriptor.bindings, hal.STAGE_COMPUTE, &mut pipeline)?
+        x := descriptor.workgroup_size_x
+        y := descriptor.workgroup_size_y
+        z := descriptor.workgroup_size_z
+        limits := &self.limits
+        if x == 0 || y == 0 || z == 0 || x > limits.max_workgroup_size_x || y > limits.max_workgroup_size_y || z > limits.max_workgroup_size_z {
+            return err(Error.InvalidInput)
+        }
+        if x as u64 * y as u64 * z as u64 > limits.max_workgroup_invocations as u64 {
+            return err(Error.InvalidInput)
+        }
+        if mem.str_bytes(descriptor.entry).len == 0 {
+            return err(Error.InvalidInput)
+        }
+        self.check_source(descriptor.source)?
+        pipeline.workgroup_size_x = x
+        pipeline.workgroup_size_y = y
+        pipeline.workgroup_size_z = z
+        pipeline.handle = self.raw_create_compute_pipeline(&descriptor)?
+        return ok(ComputePipeline { device: self, pipeline: pipeline })
+    }
+
+    // A render pipeline. Fails like create_compute_pipeline, and with
+    // InvalidInput for vertex layouts beyond MAX_VERTEX_BUFFERS or
+    // MAX_VERTEX_ATTRIBUTES, a repeated location, an attribute outside its
+    // stride, a color format that cannot be rendered to (or blended, with
+    // blending on), or a depth format that is not one.
+    pub fn create_render_pipeline(&self, descriptor: RenderPipelineDescriptor) -> RenderPipeline!Error from(self) {
+        pipeline := hal.Pipeline.empty()
+        check_bindings(descriptor.bindings, hal.STAGE_VERTEX | hal.STAGE_FRAGMENT, &mut pipeline)?
+        layouts := descriptor.vertex_buffers
+        if layouts.len > hal.MAX_VERTEX_BUFFERS as usize {
+            return err(Error.InvalidInput)
+        }
+        locations := 0u32
+        attribute_count := 0usize
+        for i in 0usize..layouts.len {
+            layout := &layouts[i]
+            if layout.step > hal.STEP_INSTANCE || layout.stride > 2048 || (layout.stride & 3) != 0 {
+                return err(Error.InvalidInput)
+            }
+            extent := 0u32
+            for j in 0usize..layout.attributes.len {
+                attribute := &layout.attributes[j]
+                size := hal.vertex_size(attribute.format)
+                if size == 0 || attribute.location >= hal.MAX_VERTEX_ATTRIBUTES || (locations >> attribute.location & 1) != 0 || (attribute.offset & 3) != 0 {
+                    return err(Error.InvalidInput)
+                }
+                end := attribute.offset as u64 + size as u64
+                if end > 2048 || (layout.stride != 0 && end > layout.stride as u64) {
+                    return err(Error.InvalidInput)
+                }
+                if end as u32 > extent {
+                    extent = end as u32
+                }
+                locations = locations | (1u32 << attribute.location)
+                attribute_count += 1
+            }
+            // A zero stride repeats one vertex; it still needs its bytes.
+            pipeline.strides[i] = layout.stride
+            pipeline.steps[i] = layout.step
+            pipeline.extents[i] = extent
+        }
+        if attribute_count > hal.MAX_VERTEX_ATTRIBUTES as usize {
+            return err(Error.InvalidInput)
+        }
+        pipeline.vertex_buffer_count = layouts.len as u32
+        color := descriptor.color_format
+        if color == hal.FORMAT_NONE || color >= hal.FORMAT_COUNT || hal.is_depth(color) {
+            return err(Error.InvalidInput)
+        }
+        if descriptor.blend > hal.BLEND_ADDITIVE || (descriptor.blend != hal.BLEND_REPLACE && !hal.is_blendable(color)) {
+            return err(Error.InvalidInput)
+        }
+        if descriptor.depth_format != hal.FORMAT_NONE && !hal.is_depth(descriptor.depth_format) {
+            return err(Error.InvalidInput)
+        }
+        if descriptor.topology > hal.TOPOLOGY_POINT_LIST || descriptor.cull_mode > hal.CULL_BACK || descriptor.front_face > hal.FRONT_CW {
+            return err(Error.InvalidInput)
+        }
+        if descriptor.depth_compare < hal.COMPARE_NEVER || descriptor.depth_compare > hal.COMPARE_ALWAYS {
+            return err(Error.InvalidInput)
+        }
+        if mem.str_bytes(descriptor.vertex_entry).len == 0 || mem.str_bytes(descriptor.fragment_entry).len == 0 {
+            return err(Error.InvalidInput)
+        }
+        self.check_source(descriptor.vertex)?
+        self.check_source(descriptor.fragment)?
+        pipeline.topology = descriptor.topology
+        pipeline.color_format = color
+        pipeline.depth_format = descriptor.depth_format
+        pipeline.handle = self.raw_create_render_pipeline(&descriptor)?
+        return ok(RenderPipeline { device: self, pipeline: pipeline })
+    }
+
+    // Start recording commands.
+    pub fn encoder(&self) -> CommandEncoder!Error from(self) {
+        self.collect(false)
+        handle := self.raw_begin_encoder()?
+        unsafe {
+            (*self.life()).open_encoders += 1
+        }
+        return ok(CommandEncoder { device: self, handle: handle, open: true })
+    }
+
+    // Wait until the GPU has finished everything submitted so far.
+    pub fn wait(&self) -> void!Error {
+        submitted := unsafe {
+            (*self.life()).submitted
+        }
+        if submitted != 0 {
+            self.raw_wait(submitted)?
+        }
+        self.collect(false)
+        return ok()
+    }
+
+    // Destroy dropped objects the GPU has finished with. submit() and
+    // wait() do this too; call it in programs that drop objects and then
+    // submit nothing for a while.
+    pub fn poll(&self) {
+        self.collect(false)
+    }
+
+    fn life(&self) -> *mut Life {
+        unsafe {
+            return ptr.from_ref(&self.life) as *mut Life
+        }
+    }
+
+    fn check_owner(&self, owner: &Device) {
+        assert(ptr.from_ref(owner) == ptr.from_ref(self), "the object belongs to another std/gpu device")
+    }
+
+    fn check_source(&self, source: &ShaderSource) -> void!Error {
+        present := match self.api() {
+            Api.Vulkan => source.spirv.len != 0,
+            Api.Metal => mem.str_bytes(source.msl).len != 0,
+            Api.OpenGl => mem.str_bytes(source.glsl).len != 0,
+        }
+        if !present {
+            return err(Error.MissingShader)
+        }
+        return ok()
+    }
+
+    // An object was dropped: destroy it now if the GPU cannot be using it,
+    // otherwise once it has finished.
+    fn retire(&self, object: u32, handle: &hal.Handle) {
+        life := self.life()
+        open := unsafe {
+            (*life).open_encoders
+        }
+        submitted := unsafe {
+            (*life).submitted
+        }
+        if open == 0 && (submitted == 0 || self.raw_completed() >= submitted) {
+            self.raw_destroy(object, handle)
+            return
+        }
+        wait := submitted
+        if open != 0 {
+            wait = PENDING
+        }
+        self.bury(object, handle, wait)
+    }
+
+    fn bury(&self, object: u32, handle: &hal.Handle, wait: u64) {
+        life := self.life()
+        if unsafe {
+            (*life).count
+        } == GRAVEYARD {
+            self.collect(true)
+        }
+        unsafe {
+            index := (*life).count
+            (*life).object[index] = object
+            (*life).a[index] = handle.a
+            (*life).b[index] = handle.b
+            (*life).c[index] = handle.c
+            (*life).d[index] = handle.d
+            (*life).wait[index] = wait
+            (*life).count = index + 1
+        }
+    }
+
+    // Destroy the objects whose submissions have finished. With `block`,
+    // wait for the GPU to make room when nothing can be destroyed yet.
+    fn collect(&self, block: bool) {
+        life := self.life()
+        if unsafe {
+            (*life).count
+        } == 0 {
+            return
+        }
+        completed := self.raw_completed()
+        if block && unsafe {
+            (*life).open_encoders
+        } == 0 {
+            submitted := unsafe {
+                (*life).submitted
+            }
+            if completed < submitted {
+                // A failed wait means the device is lost: destroying is
+                // then safe anyway.
+                match self.raw_wait(submitted) {
+                    ok() => {}
+                    err(_) => {}
+                }
+            }
+            completed = submitted
+        }
+        kept := 0usize
+        count := unsafe {
+            (*life).count
+        }
+        for i in 0usize..count {
+            wait := unsafe {
+                (*life).wait[i]
+            }
+            handle := unsafe {
+                hal.Handle { a: (*life).a[i], b: (*life).b[i], c: (*life).c[i], d: (*life).d[i] }
+            }
+            object := unsafe {
+                (*life).object[i]
+            }
+            if wait != PENDING && wait <= completed {
+                self.raw_destroy(object, &handle)
+            } else {
+                unsafe {
+                    (*life).object[kept] = object
+                    (*life).a[kept] = handle.a
+                    (*life).b[kept] = handle.b
+                    (*life).c[kept] = handle.c
+                    (*life).d[kept] = handle.d
+                    (*life).wait[kept] = wait
+                }
+                kept += 1
+            }
+        }
+        unsafe {
+            (*life).count = kept
+        }
+        assert(!block || kept < GRAVEYARD, "too many std/gpu objects dropped while command encoders are open")
+    }
+
+    // An encoder was submitted (`index` > 0) or abandoned (0).
+    fn close_encoder(&self, index: u64) {
+        life := self.life()
+        unsafe {
+            if index != 0 {
+                (*life).submitted = index
+            }
+            (*life).open_encoders -= 1
+            if (*life).open_encoders == 0 {
+                // Every encoder that may have used these has been
+                // submitted by now, or abandoned.
+                for i in 0usize..(*life).count {
+                    if (*life).wait[i] == PENDING {
+                        (*life).wait[i] = (*life).submitted
+                    }
+                }
+            }
+        }
+    }
+
+    // Dispatch to the backend.
+
+    fn raw_limits(&self) -> hal.Limits {
+        match &self.raw {
+            Raw.Vulkan(raw) => {
+                return raw.limits()
+            }
+            Raw.Native(raw) => {
+                return raw.limits()
+            }
+            Raw.OpenGl(raw) => {
+                return raw.limits()
+            }
+        }
+    }
+    fn raw_name(&self, out: &mut[u8]) -> usize {
+        match &self.raw {
+            Raw.Vulkan(raw) => {
+                return raw.name(out)
+            }
+            Raw.Native(raw) => {
+                return raw.name(out)
+            }
+            Raw.OpenGl(raw) => {
+                return raw.name(out)
+            }
+        }
+    }
+    fn raw_create_buffer(&self, size: u64, usage: u32) -> hal.Handle!Error {
+        match &self.raw {
+            Raw.Vulkan(raw) => {
+                return raw.create_buffer(size, usage)
+            }
+            Raw.Native(raw) => {
+                return raw.create_buffer(size, usage)
+            }
+            Raw.OpenGl(raw) => {
+                return raw.create_buffer(size, usage)
+            }
+        }
+    }
+    fn raw_write_buffer(&self, buffer: &hal.Handle, offset: u64, data: &[u8]) -> void!Error {
+        match &self.raw {
+            Raw.Vulkan(raw) => {
+                return raw.write_buffer(buffer, offset, data)
+            }
+            Raw.Native(raw) => {
+                return raw.write_buffer(buffer, offset, data)
+            }
+            Raw.OpenGl(raw) => {
+                return raw.write_buffer(buffer, offset, data)
+            }
+        }
+    }
+    fn raw_read_buffer(&self, buffer: &hal.Handle, offset: u64, out: &mut[u8]) -> void!Error {
+        match &self.raw {
+            Raw.Vulkan(raw) => {
+                return raw.read_buffer(buffer, offset, out)
+            }
+            Raw.Native(raw) => {
+                return raw.read_buffer(buffer, offset, out)
+            }
+            Raw.OpenGl(raw) => {
+                return raw.read_buffer(buffer, offset, out)
+            }
+        }
+    }
+    fn raw_create_texture(&self, descriptor: &TextureDescriptor) -> hal.Handle!Error {
+        match &self.raw {
+            Raw.Vulkan(raw) => {
+                return raw.create_texture(descriptor)
+            }
+            Raw.Native(raw) => {
+                return raw.create_texture(descriptor)
+            }
+            Raw.OpenGl(raw) => {
+                return raw.create_texture(descriptor)
+            }
+        }
+    }
+    fn raw_write_texture(&self, texture: &hal.Handle, descriptor: &TextureDescriptor, region: &Region, data: &[u8], bytes_per_row: u32) -> void!Error {
+        match &self.raw {
+            Raw.Vulkan(raw) => {
+                return raw.write_texture(texture, descriptor, region, data, bytes_per_row)
+            }
+            Raw.Native(raw) => {
+                return raw.write_texture(texture, descriptor, region, data, bytes_per_row)
+            }
+            Raw.OpenGl(raw) => {
+                return raw.write_texture(texture, descriptor, region, data, bytes_per_row)
+            }
+        }
+    }
+    fn raw_read_texture(&self, texture: &hal.Handle, descriptor: &TextureDescriptor, region: &Region, out: &mut[u8], bytes_per_row: u32) -> void!Error {
+        match &self.raw {
+            Raw.Vulkan(raw) => {
+                return raw.read_texture(texture, descriptor, region, out, bytes_per_row)
+            }
+            Raw.Native(raw) => {
+                return raw.read_texture(texture, descriptor, region, out, bytes_per_row)
+            }
+            Raw.OpenGl(raw) => {
+                return raw.read_texture(texture, descriptor, region, out, bytes_per_row)
+            }
+        }
+    }
+    fn raw_create_sampler(&self, descriptor: &SamplerDescriptor) -> hal.Handle!Error {
+        match &self.raw {
+            Raw.Vulkan(raw) => {
+                return raw.create_sampler(descriptor)
+            }
+            Raw.Native(raw) => {
+                return raw.create_sampler(descriptor)
+            }
+            Raw.OpenGl(raw) => {
+                return raw.create_sampler(descriptor)
+            }
+        }
+    }
+    fn raw_create_compute_pipeline(&self, descriptor: &ComputePipelineDescriptor) -> hal.Handle!Error {
+        match &self.raw {
+            Raw.Vulkan(raw) => {
+                return raw.create_compute_pipeline(descriptor)
+            }
+            Raw.Native(raw) => {
+                return raw.create_compute_pipeline(descriptor)
+            }
+            Raw.OpenGl(raw) => {
+                return raw.create_compute_pipeline(descriptor)
+            }
+        }
+    }
+    fn raw_create_render_pipeline(&self, descriptor: &RenderPipelineDescriptor) -> hal.Handle!Error {
+        match &self.raw {
+            Raw.Vulkan(raw) => {
+                return raw.create_render_pipeline(descriptor)
+            }
+            Raw.Native(raw) => {
+                return raw.create_render_pipeline(descriptor)
+            }
+            Raw.OpenGl(raw) => {
+                return raw.create_render_pipeline(descriptor)
+            }
+        }
+    }
+    fn raw_destroy(&self, object: u32, handle: &hal.Handle) {
+        match &self.raw {
+            Raw.Vulkan(raw) => {
+                raw.destroy(object, handle)
+            }
+            Raw.Native(raw) => {
+                raw.destroy(object, handle)
+            }
+            Raw.OpenGl(raw) => {
+                raw.destroy(object, handle)
+            }
+        }
+    }
+    fn raw_completed(&self) -> u64 {
+        match &self.raw {
+            Raw.Vulkan(raw) => {
+                return raw.completed()
+            }
+            Raw.Native(raw) => {
+                return raw.completed()
+            }
+            Raw.OpenGl(raw) => {
+                return raw.completed()
+            }
+        }
+    }
+    fn raw_wait(&self, index: u64) -> void!Error {
+        match &self.raw {
+            Raw.Vulkan(raw) => {
+                return raw.wait(index)
+            }
+            Raw.Native(raw) => {
+                return raw.wait(index)
+            }
+            Raw.OpenGl(raw) => {
+                return raw.wait(index)
+            }
+        }
+    }
+    fn raw_begin_encoder(&self) -> hal.Handle!Error {
+        match &self.raw {
+            Raw.Vulkan(raw) => {
+                return raw.begin_encoder()
+            }
+            Raw.Native(raw) => {
+                return raw.begin_encoder()
+            }
+            Raw.OpenGl(raw) => {
+                return raw.begin_encoder()
+            }
+        }
+    }
+    fn raw_submit(&self, encoder: &mut hal.Handle) -> u64!Error {
+        match &self.raw {
+            Raw.Vulkan(raw) => {
+                return raw.submit(encoder)
+            }
+            Raw.Native(raw) => {
+                return raw.submit(encoder)
+            }
+            Raw.OpenGl(raw) => {
+                return raw.submit(encoder)
+            }
+        }
+    }
+    fn raw_begin_compute_pass(&self, encoder: &mut hal.Handle) {
+        match &self.raw {
+            Raw.Vulkan(raw) => {
+                raw.begin_compute_pass(encoder)
+            }
+            Raw.Native(raw) => {
+                raw.begin_compute_pass(encoder)
+            }
+            Raw.OpenGl(raw) => {
+                raw.begin_compute_pass(encoder)
+            }
+        }
+    }
+    fn raw_end_compute_pass(&self, encoder: &mut hal.Handle) {
+        match &self.raw {
+            Raw.Vulkan(raw) => {
+                raw.end_compute_pass(encoder)
+            }
+            Raw.Native(raw) => {
+                raw.end_compute_pass(encoder)
+            }
+            Raw.OpenGl(raw) => {
+                raw.end_compute_pass(encoder)
+            }
+        }
+    }
+    fn raw_begin_render_pass(&self, encoder: &mut hal.Handle, pass: &hal.RenderPassInfo) {
+        match &self.raw {
+            Raw.Vulkan(raw) => {
+                raw.begin_render_pass(encoder, pass)
+            }
+            Raw.Native(raw) => {
+                raw.begin_render_pass(encoder, pass)
+            }
+            Raw.OpenGl(raw) => {
+                raw.begin_render_pass(encoder, pass)
+            }
+        }
+    }
+    fn raw_end_render_pass(&self, encoder: &mut hal.Handle) {
+        match &self.raw {
+            Raw.Vulkan(raw) => {
+                raw.end_render_pass(encoder)
+            }
+            Raw.Native(raw) => {
+                raw.end_render_pass(encoder)
+            }
+            Raw.OpenGl(raw) => {
+                raw.end_render_pass(encoder)
+            }
+        }
+    }
+    fn raw_set_viewport(&self, encoder: &mut hal.Handle, x: f32, y: f32, width: f32, height: f32, min_depth: f32, max_depth: f32) {
+        match &self.raw {
+            Raw.Vulkan(raw) => {
+                raw.set_viewport(encoder, x, y, width, height, min_depth, max_depth)
+            }
+            Raw.Native(raw) => {
+                raw.set_viewport(encoder, x, y, width, height, min_depth, max_depth)
+            }
+            Raw.OpenGl(raw) => {
+                raw.set_viewport(encoder, x, y, width, height, min_depth, max_depth)
+            }
+        }
+    }
+    fn raw_set_scissor(&self, encoder: &mut hal.Handle, x: u32, y: u32, width: u32, height: u32) {
+        match &self.raw {
+            Raw.Vulkan(raw) => {
+                raw.set_scissor(encoder, x, y, width, height)
+            }
+            Raw.Native(raw) => {
+                raw.set_scissor(encoder, x, y, width, height)
+            }
+            Raw.OpenGl(raw) => {
+                raw.set_scissor(encoder, x, y, width, height)
+            }
+        }
+    }
+    fn raw_dispatch(&self, encoder: &mut hal.Handle, state: &mut hal.PassState, x: u32, y: u32, z: u32) {
+        match &self.raw {
+            Raw.Vulkan(raw) => {
+                raw.dispatch(encoder, state, x, y, z)
+            }
+            Raw.Native(raw) => {
+                raw.dispatch(encoder, state, x, y, z)
+            }
+            Raw.OpenGl(raw) => {
+                raw.dispatch(encoder, state, x, y, z)
+            }
+        }
+    }
+    fn raw_draw(&self, encoder: &mut hal.Handle, state: &mut hal.PassState, vertex_count: u32, instance_count: u32, first_vertex: u32, first_instance: u32) {
+        match &self.raw {
+            Raw.Vulkan(raw) => {
+                raw.draw(encoder, state, vertex_count, instance_count, first_vertex, first_instance)
+            }
+            Raw.Native(raw) => {
+                raw.draw(encoder, state, vertex_count, instance_count, first_vertex, first_instance)
+            }
+            Raw.OpenGl(raw) => {
+                raw.draw(encoder, state, vertex_count, instance_count, first_vertex, first_instance)
+            }
+        }
+    }
+    fn raw_draw_indexed(&self, encoder: &mut hal.Handle, state: &mut hal.PassState, index_count: u32, instance_count: u32, first_index: u32, base_vertex: i32, first_instance: u32) {
+        match &self.raw {
+            Raw.Vulkan(raw) => {
+                raw.draw_indexed(encoder, state, index_count, instance_count, first_index, base_vertex, first_instance)
+            }
+            Raw.Native(raw) => {
+                raw.draw_indexed(encoder, state, index_count, instance_count, first_index, base_vertex, first_instance)
+            }
+            Raw.OpenGl(raw) => {
+                raw.draw_indexed(encoder, state, index_count, instance_count, first_index, base_vertex, first_instance)
+            }
+        }
+    }
+    fn raw_copy_buffer(&self, encoder: &mut hal.Handle, source: &hal.Handle, source_offset: u64, destination: &hal.Handle, destination_offset: u64, size: u64) {
+        match &self.raw {
+            Raw.Vulkan(raw) => {
+                raw.copy_buffer(encoder, source, source_offset, destination, destination_offset, size)
+            }
+            Raw.Native(raw) => {
+                raw.copy_buffer(encoder, source, source_offset, destination, destination_offset, size)
+            }
+            Raw.OpenGl(raw) => {
+                raw.copy_buffer(encoder, source, source_offset, destination, destination_offset, size)
+            }
+        }
+    }
+    fn raw_copy_buffer_to_texture(&self, encoder: &mut hal.Handle, source: &hal.Handle, offset: u64, bytes_per_row: u32, destination: &hal.Handle, descriptor: &TextureDescriptor, region: &Region) {
+        match &self.raw {
+            Raw.Vulkan(raw) => {
+                raw.copy_buffer_to_texture(encoder, source, offset, bytes_per_row, destination, descriptor, region)
+            }
+            Raw.Native(raw) => {
+                raw.copy_buffer_to_texture(encoder, source, offset, bytes_per_row, destination, descriptor, region)
+            }
+            Raw.OpenGl(raw) => {
+                raw.copy_buffer_to_texture(encoder, source, offset, bytes_per_row, destination, descriptor, region)
+            }
+        }
+    }
+    fn raw_copy_texture_to_buffer(&self, encoder: &mut hal.Handle, source: &hal.Handle, descriptor: &TextureDescriptor, region: &Region, destination: &hal.Handle, offset: u64, bytes_per_row: u32) {
+        match &self.raw {
+            Raw.Vulkan(raw) => {
+                raw.copy_texture_to_buffer(encoder, source, descriptor, region, destination, offset, bytes_per_row)
+            }
+            Raw.Native(raw) => {
+                raw.copy_texture_to_buffer(encoder, source, descriptor, region, destination, offset, bytes_per_row)
+            }
+            Raw.OpenGl(raw) => {
+                raw.copy_texture_to_buffer(encoder, source, descriptor, region, destination, offset, bytes_per_row)
+            }
+        }
+    }
+
+    fn drop(&mut self) {
+        // Every object borrowing the device is gone; only the graveyard is
+        // left. Destroy it once the GPU is idle.
+        submitted := self.life.submitted
+        if submitted != 0 {
+            match self.raw_wait(submitted) {
+                ok() => {}
+                err(_) => {}
+            }
+        }
+        for i in 0usize..self.life.count {
+            handle := hal.Handle { a: self.life.a[i], b: self.life.b[i], c: self.life.c[i], d: self.life.d[i] }
+            self.raw_destroy(self.life.object[i], &handle)
+        }
+        self.life.count = 0
+    }
+}
+
+// The more informative of two failures to open a backend.
+fn worse(current: Error, next: Error) -> Error {
+    match &next {
+        Error.NoBackend => {
+            return current
+        }
+        Error.Unsupported => {
+            match &current {
+                Error.NoBackend => {
+                    return next
+                }
+                _ => {
+                    return current
+                }
+            }
+        }
+        _ => {
+            match &current {
+                Error.NoBackend => {
+                    return next
+                }
+                Error.Unsupported => {
+                    return next
+                }
+                _ => {
+                    return current
+                }
+            }
+        }
+    }
+}
+
+// Whether [offset, offset + length) lies within `size` bytes.
+fn fits(offset: u64, length: u64, size: u64) -> bool {
+    return length <= size && offset <= size - length
+}
+
+// Whether a copy of `region` between `texture` and `available` bytes
+// starting at `offset`, rows `bytes_per_row` apart, stays in bounds.
+fn texture_copy_fits(texture: &TextureDescriptor, region: &Region, available: u64, offset: u64, bytes_per_row: u32) -> bool {
+    texel := hal.texel_size(texture.format) as u64
+    if region.x as u64 + region.width as u64 > texture.width as u64 || region.y as u64 + region.height as u64 > texture.height as u64 {
+        return false
+    }
+    row := region.width as u64 * texel
+    if (bytes_per_row as u64) < row || bytes_per_row as u64 % texel != 0 {
+        return false
+    }
+    if region.width == 0 || region.height == 0 {
+        return true
+    }
+    needed := (region.height as u64 - 1) * bytes_per_row as u64 + row
+    return fits(offset, needed, available)
+}
+
+// Check a binding layout and record it in `pipeline`.
+fn check_bindings(bindings: &[BindingLayout], allowed: u32, pipeline: &mut hal.Pipeline) -> void!Error {
+    for i in 0usize..bindings.len {
+        binding := &bindings[i]
+        slot := binding.slot
+        if slot >= hal.MAX_SLOTS || pipeline.kinds[slot as usize] != hal.BINDING_NONE {
+            return err(Error.InvalidInput)
+        }
+        if binding.kind == hal.BINDING_NONE || binding.kind > hal.BINDING_STORAGE_TEXTURE {
+            return err(Error.InvalidInput)
+        }
+        if binding.stages == 0 || (binding.stages & ~allowed) != 0 {
+            return err(Error.InvalidInput)
+        }
+        // Storage buffers and textures are writable, which vertex shaders
+        // cannot be on every backend.
+        if (binding.kind == hal.BINDING_STORAGE_BUFFER || binding.kind == hal.BINDING_STORAGE_TEXTURE) && (binding.stages & hal.STAGE_VERTEX) != 0 {
+            return err(Error.InvalidInput)
+        }
+        if binding.kind == hal.BINDING_STORAGE_TEXTURE && !hal.is_storage(binding.format) {
+            return err(Error.InvalidInput)
+        }
+        pipeline.kinds[slot as usize] = binding.kind
+        pipeline.stages[slot as usize] = binding.stages
+        pipeline.formats[slot as usize] = binding.format
+    }
+    return ok()
+}
+
+// GPU memory. Dropping it frees the memory once the GPU has finished every
+// submission that may use it.
+pub struct Buffer {
+    device: &Device
+    handle: hal.Handle
+    size: u64
+    usage: u32
+
+    pub fn size(&self) -> u64 {
+        return self.size
+    }
+    pub fn usage(&self) -> u32 {
+        return self.usage
+    }
+
+    fn drop(&mut self) {
+        self.device.retire(hal.OBJECT_BUFFER, &self.handle)
+    }
+}
+
+// A two-dimensional image on the GPU.
+pub struct Texture {
+    device: &Device
+    handle: hal.Handle
+    descriptor: hal.TextureDescriptor
+
+    pub fn width(&self) -> u32 {
+        return self.descriptor.width
+    }
+    pub fn height(&self) -> u32 {
+        return self.descriptor.height
+    }
+    pub fn format(&self) -> u32 {
+        return self.descriptor.format
+    }
+    pub fn usage(&self) -> u32 {
+        return self.descriptor.usage
+    }
+    // The bytes one row of the whole texture takes, tightly packed.
+    pub fn bytes_per_row(&self) -> u32 {
+        return self.descriptor.width * hal.texel_size(self.descriptor.format)
+    }
+    // The region covering the whole texture.
+    pub fn region(&self) -> Region {
+        return Region { x: 0, y: 0, width: self.descriptor.width, height: self.descriptor.height }
+    }
+
+    fn drop(&mut self) {
+        self.device.retire(hal.OBJECT_TEXTURE, &self.handle)
+    }
+}
+
+pub struct Sampler {
+    device: &Device
+    handle: hal.Handle
+
+    fn drop(&mut self) {
+        self.device.retire(hal.OBJECT_SAMPLER, &self.handle)
+    }
+}
+
+pub struct ComputePipeline {
+    device: &Device
+    pipeline: hal.Pipeline
+
+    fn drop(&mut self) {
+        self.device.retire(hal.OBJECT_COMPUTE_PIPELINE, &self.pipeline.handle)
+    }
+}
+
+pub struct RenderPipeline {
+    device: &Device
+    pipeline: hal.Pipeline
+
+    fn drop(&mut self) {
+        self.device.retire(hal.OBJECT_RENDER_PIPELINE, &self.pipeline.handle)
+    }
+}
+
+// The color attachment of a render pass. LOAD_CLEAR fills it with the
+// clear color first; LOAD_KEEP draws over what it holds.
+pub struct ColorAttachment {
+    pub texture: &Texture
+    pub load: u32
+    pub red: f64
+    pub green: f64
+    pub blue: f64
+    pub alpha: f64
+
+    pub fn clear(texture: &Texture, red: f64, green: f64, blue: f64, alpha: f64) -> ColorAttachment from(texture) {
+        return ColorAttachment { texture: texture, load: hal.LOAD_CLEAR, red: red, green: green, blue: blue, alpha: alpha }
+    }
+    pub fn keep(texture: &Texture) -> ColorAttachment from(texture) {
+        return ColorAttachment { texture: texture, load: hal.LOAD_KEEP, red: 0.0, green: 0.0, blue: 0.0, alpha: 0.0 }
+    }
+}
+
+// The depth attachment of a render pass.
+pub struct DepthAttachment {
+    pub texture: &Texture
+    pub load: u32
+    pub depth: f32
+
+    pub fn clear(texture: &Texture, depth: f32) -> DepthAttachment from(texture) {
+        return DepthAttachment { texture: texture, load: hal.LOAD_CLEAR, depth: depth }
+    }
+    pub fn keep(texture: &Texture) -> DepthAttachment from(texture) {
+        return DepthAttachment { texture: texture, load: hal.LOAD_KEEP, depth: 0.0 }
+    }
+}
+
+// Records commands for the GPU. Nothing runs until submit(); dropping an
+// encoder without submitting discards its commands.
+pub struct CommandEncoder {
+    device: &Device
+    handle: hal.Handle
+    open: bool
+
+    // Record a compute pass. The encoder is busy until the pass ends.
+    pub fn compute_pass(&mut self) -> ComputePass from(self) {
+        device := self.device
+        device.raw_begin_compute_pass(&mut self.handle)
+        return ComputePass { encoder: self, state: hal.PassState.new(), tracked: Tracked.new() }
+    }
+
+    // Record a render pass drawing into `color`. It needs TEXTURE_RENDER
+    // and a color format.
+    pub fn render_pass(&mut self, color: ColorAttachment) -> RenderPass from(self) {
+        return self.begin_render(&color, false, color.texture, hal.LOAD_KEEP, 0.0)
+    }
+
+    // Record a render pass drawing into `color` with the depth buffer
+    // `depth`, a TEXTURE_RENDER depth texture of the same size.
+    pub fn render_pass_with_depth(&mut self, color: ColorAttachment, depth: DepthAttachment) -> RenderPass from(self) {
+        return self.begin_render(&color, true, depth.texture, depth.load, depth.depth)
+    }
+
+    fn begin_render(&mut self, color: &ColorAttachment, has_depth: bool, depth: &Texture, depth_load: u32, clear_depth: f32) -> RenderPass from(self) {
+        device := self.device
+        target := color.texture
+        device.check_owner(target.device)
+        assert((target.descriptor.usage & hal.TEXTURE_RENDER) != 0, "a render pass attachment needs TEXTURE_RENDER")
+        assert(!hal.is_depth(target.descriptor.format), "the color attachment has a depth format")
+        assert(color.load <= hal.LOAD_KEEP && depth_load <= hal.LOAD_KEEP, "unknown load action")
+        tracked := Tracked.new()
+        tracked.color_a = target.handle.a
+        tracked.color_format = target.descriptor.format
+        tracked.depth_format = hal.FORMAT_NONE
+        tracked.width = target.descriptor.width
+        tracked.height = target.descriptor.height
+        info := hal.RenderPassInfo {
+            color: target.handle.copy(),
+            color_format: target.descriptor.format,
+            width: target.descriptor.width,
+            height: target.descriptor.height,
+            load: color.load,
+            clear_red: color.red,
+            clear_green: color.green,
+            clear_blue: color.blue,
+            clear_alpha: color.alpha,
+            has_depth: has_depth,
+            depth: hal.Handle.null(),
+            depth_load: depth_load,
+            clear_depth: clear_depth
+        }
+        if has_depth {
+            device.check_owner(depth.device)
+            assert((depth.descriptor.usage & hal.TEXTURE_RENDER) != 0, "a render pass attachment needs TEXTURE_RENDER")
+            assert(hal.is_depth(depth.descriptor.format), "the depth attachment has a color format")
+            assert(depth.descriptor.width == target.descriptor.width && depth.descriptor.height == target.descriptor.height, "the attachments differ in size")
+            info.depth = depth.handle.copy()
+            tracked.depth_a = depth.handle.a
+            tracked.depth_format = depth.descriptor.format
+        }
+        device.raw_begin_render_pass(&mut self.handle, &info)
+        return RenderPass { encoder: self, state: hal.PassState.new(), tracked: tracked }
+    }
+
+    // Copy `size` bytes between buffers. Offsets and size are multiples
+    // of 4, the source has BUFFER_COPY_SRC, the destination
+    // BUFFER_COPY_DST, and copies within one buffer do not overlap.
+    pub fn copy_buffer(&mut self, source: &Buffer, source_offset: u64, destination: &Buffer, destination_offset: u64, size: u64) {
+        device := self.device
+        device.check_owner(source.device)
+        device.check_owner(destination.device)
+        assert((source.usage & hal.BUFFER_COPY_SRC) != 0, "the copy source needs BUFFER_COPY_SRC")
+        assert((destination.usage & hal.BUFFER_COPY_DST) != 0, "the copy destination needs BUFFER_COPY_DST")
+        assert((source_offset & 3) == 0 && (destination_offset & 3) == 0 && (size & 3) == 0, "buffer copies need offsets and sizes in multiples of 4")
+        assert(fits(source_offset, size, source.size) && fits(destination_offset, size, destination.size), "the copy range lies outside the buffer")
+        if ptr.from_ref(source) == ptr.from_ref(destination) {
+            assert(source_offset + size <= destination_offset || destination_offset + size <= source_offset, "the copy ranges overlap")
+        }
+        if size == 0 {
+            return
+        }
+        device.raw_copy_buffer(&mut self.handle, &source.handle, source_offset, &destination.handle, destination_offset, size)
+    }
+
+    // Copy texels from `source`, starting `offset` bytes in with rows
+    // `bytes_per_row` apart, into `region` of `destination`. The offset
+    // is a multiple of 4 and of the texel size; the rest follows
+    // write_texture.
+    pub fn copy_buffer_to_texture(&mut self, source: &Buffer, offset: u64, bytes_per_row: u32, destination: &Texture, region: Region) {
+        device := self.device
+        device.check_owner(source.device)
+        device.check_owner(destination.device)
+        assert((source.usage & hal.BUFFER_COPY_SRC) != 0, "the copy source needs BUFFER_COPY_SRC")
+        assert((destination.descriptor.usage & hal.TEXTURE_COPY_DST) != 0, "the copy destination needs TEXTURE_COPY_DST")
+        check_texture_copy(&destination.descriptor, &region, source.size, offset, bytes_per_row)
+        if region.width == 0 || region.height == 0 {
+            return
+        }
+        device.raw_copy_buffer_to_texture(&mut self.handle, &source.handle, offset, bytes_per_row, &destination.handle, &destination.descriptor, &region)
+    }
+
+    // Copy texels of `region` of `source` into `destination`, starting
+    // `offset` bytes in with rows `bytes_per_row` apart.
+    pub fn copy_texture_to_buffer(&mut self, source: &Texture, region: Region, destination: &Buffer, offset: u64, bytes_per_row: u32) {
+        device := self.device
+        device.check_owner(source.device)
+        device.check_owner(destination.device)
+        assert((source.descriptor.usage & hal.TEXTURE_COPY_SRC) != 0, "the copy source needs TEXTURE_COPY_SRC")
+        assert((destination.usage & hal.BUFFER_COPY_DST) != 0, "the copy destination needs BUFFER_COPY_DST")
+        check_texture_copy(&source.descriptor, &region, destination.size, offset, bytes_per_row)
+        if region.width == 0 || region.height == 0 {
+            return
+        }
+        device.raw_copy_texture_to_buffer(&mut self.handle, &source.handle, &source.descriptor, &region, &destination.handle, offset, bytes_per_row)
+    }
+
+    // Run the recorded commands after everything submitted before.
+    pub fn submit(self) -> void!Error {
+        device := self.device
+        index := device.raw_submit(&mut self.handle)?
+        self.open = false
+        device.close_encoder(index)
+        device.bury(hal.OBJECT_ENCODER, &self.handle, index)
+        device.collect(false)
+        return ok()
+    }
+
+    fn drop(&mut self) {
+        if self.open {
+            device := self.device
+            device.raw_destroy(hal.OBJECT_ENCODER, &self.handle)
+            device.close_encoder(0)
+        }
+    }
+}
+
+fn check_texture_copy(texture: &TextureDescriptor, region: &Region, buffer_size: u64, offset: u64, bytes_per_row: u32) {
+    texel := hal.texel_size(texture.format) as u64
+    assert(offset % 4 == 0 && offset % texel == 0, "the buffer offset of a texture copy is not a multiple of 4 and of the texel size")
+    assert(!hal.is_depth(texture.format) || (texture.usage & hal.TEXTURE_COPY_DST) == 0, "depth textures cannot be copied into")
+    assert(texture_copy_fits(texture, region, buffer_size, offset, bytes_per_row), "the texture copy lies outside the texture or the buffer, or bytes_per_row is too small or not a multiple of the texel size")
+}
+
+// What a pass knows about the objects bound to it, for checking draws.
+struct Tracked {
+    usage: [16]u32
+    format: [16]u32
+    texture_a: [16]u64
+    vertex_size: [8]u64
+    index_size: u64
+    color_a: u64
+    depth_a: u64
+    color_format: u32
+    depth_format: u32
+    width: u32
+    height: u32
+
+    fn new() -> Tracked {
+        return Tracked { usage: [0u32; 16], format: [0u32; 16], texture_a: [0u64; 16], vertex_size: [0u64; 8], index_size: 0, color_a: 0, depth_a: 0, color_format: 0, depth_format: 0, width: 0, height: 0 }
+    }
+}
+
+fn bind_buffer(state: &mut hal.PassState, tracked: &mut Tracked, slot: u32, buffer: &Buffer, offset: u64, size: u64) {
+    assert(slot < hal.MAX_SLOTS, "binding slot out of range")
+    assert(offset % BINDING_ALIGNMENT == 0, "bound buffer offsets are multiples of BINDING_ALIGNMENT (256)")
+    assert(size != 0 && fits(offset, size, buffer.size), "the bound range lies outside the buffer")
+    index := slot as usize
+    state.bound[index] = hal.BOUND_BUFFER
+    state.object_a[index] = buffer.handle.a
+    state.object_b[index] = buffer.handle.b
+    state.object_c[index] = buffer.handle.c
+    state.sampler[index] = 0
+    state.offset[index] = offset
+    state.size[index] = size
+    state.dirty = state.dirty | (1u32 << slot)
+    tracked.usage[index] = buffer.usage
+    tracked.format[index] = 0
+    tracked.texture_a[index] = 0
+}
+
+fn bind_texture(state: &mut hal.PassState, tracked: &mut Tracked, slot: u32, texture: &Texture, sampler: &hal.Handle, kind: u32) {
+    assert(slot < hal.MAX_SLOTS, "binding slot out of range")
+    index := slot as usize
+    state.bound[index] = kind
+    state.object_a[index] = texture.handle.a
+    state.object_b[index] = texture.handle.b
+    state.object_c[index] = texture.handle.c
+    state.sampler[index] = sampler.a
+    state.offset[index] = 0
+    state.size[index] = 0
+    state.dirty = state.dirty | (1u32 << slot)
+    tracked.usage[index] = texture.descriptor.usage
+    tracked.format[index] = texture.descriptor.format
+    tracked.texture_a[index] = texture.handle.a
+}
+
+// Check that the bound objects fit the pipeline's layout.
+fn check_bound(state: &hal.PassState, tracked: &Tracked, limits: &hal.Limits) {
+    assert(state.has_pipeline, "no pipeline is set")
+    for i in 0usize..16 {
+        kind := state.pipeline.kinds[i]
+        bound := state.bound[i]
+        usage := tracked.usage[i]
+        if kind == hal.BINDING_UNIFORM_BUFFER {
+            assert(bound == hal.BOUND_BUFFER, "the pipeline expects a buffer in a slot that holds none")
+            assert((usage & hal.BUFFER_UNIFORM) != 0, "a uniform buffer slot holds a buffer without BUFFER_UNIFORM")
+            assert(state.size[i] <= limits.max_uniform_binding_size, "the bound uniform range exceeds limits().max_uniform_binding_size")
+        } else if kind == hal.BINDING_STORAGE_BUFFER || kind == hal.BINDING_READ_ONLY_STORAGE_BUFFER {
+            assert(bound == hal.BOUND_BUFFER, "the pipeline expects a buffer in a slot that holds none")
+            assert((usage & hal.BUFFER_STORAGE) != 0, "a storage buffer slot holds a buffer without BUFFER_STORAGE")
+            assert(state.size[i] <= limits.max_storage_binding_size, "the bound storage range exceeds limits().max_storage_binding_size")
+        } else if kind == hal.BINDING_SAMPLED_TEXTURE {
+            assert(bound == hal.BOUND_SAMPLED_TEXTURE, "the pipeline expects a texture and sampler in a slot that holds none")
+            assert((usage & hal.TEXTURE_SAMPLED) != 0, "a sampled texture slot holds a texture without TEXTURE_SAMPLED")
+        } else if kind == hal.BINDING_STORAGE_TEXTURE {
+            assert(bound == hal.BOUND_STORAGE_TEXTURE, "the pipeline expects a storage texture in a slot that holds none")
+            assert((usage & hal.TEXTURE_STORAGE) != 0, "a storage texture slot holds a texture without TEXTURE_STORAGE")
+            assert(tracked.format[i] == state.pipeline.formats[i], "the storage texture's format differs from the layout's")
+        }
+        if kind == hal.BINDING_SAMPLED_TEXTURE || kind == hal.BINDING_STORAGE_TEXTURE {
+            a := tracked.texture_a[i]
+            assert(a != tracked.color_a && (tracked.depth_a == 0 || a != tracked.depth_a), "a texture is bound while it is an attachment of the pass")
+        }
+    }
+}
+
+// A compute pass. It ends when dropped or with end().
+pub struct ComputePass {
+    encoder: &mut CommandEncoder
+    state: hal.PassState
+    tracked: Tracked
+
+    pub fn set_pipeline(&mut self, pipeline: &ComputePipeline) {
+        device := self.encoder.device
+        device.check_owner(pipeline.device)
+        self.state.pipeline = pipeline.pipeline.copy()
+        self.state.has_pipeline = true
+        self.state.pipeline_dirty = true
+        self.state.dirty = 0xffff
+    }
+
+    // Bind all of `buffer` to `slot`.
+    pub fn set_buffer(&mut self, slot: u32, buffer: &Buffer) {
+        self.set_buffer_range(slot, buffer, 0, buffer.size)
+    }
+
+    // Bind `size` bytes of `buffer` from `offset`, a multiple of
+    // BINDING_ALIGNMENT, to `slot`.
+    pub fn set_buffer_range(&mut self, slot: u32, buffer: &Buffer, offset: u64, size: u64) {
+        device := self.encoder.device
+        device.check_owner(buffer.device)
+        bind_buffer(&mut self.state, &mut self.tracked, slot, buffer, offset, size)
+    }
+
+    // Bind `texture`, read through `sampler`, to `slot`.
+    pub fn set_texture(&mut self, slot: u32, texture: &Texture, sampler: &Sampler) {
+        device := self.encoder.device
+        device.check_owner(texture.device)
+        device.check_owner(sampler.device)
+        bind_texture(&mut self.state, &mut self.tracked, slot, texture, &sampler.handle, hal.BOUND_SAMPLED_TEXTURE)
+    }
+
+    // Bind `texture` for reading and writing single texels to `slot`.
+    pub fn set_storage_texture(&mut self, slot: u32, texture: &Texture) {
+        device := self.encoder.device
+        device.check_owner(texture.device)
+        empty := hal.Handle.null()
+        bind_texture(&mut self.state, &mut self.tracked, slot, texture, &empty, hal.BOUND_STORAGE_TEXTURE)
+    }
+
+    // Run x * y * z workgroups of the pipeline's workgroup size. Each
+    // dispatch sees the writes of the ones before it.
+    pub fn dispatch(&mut self, x: u32, y: u32, z: u32) {
+        device := self.encoder.device
+        check_bound(&self.state, &self.tracked, &device.limits)
+        maximum := device.limits.max_workgroups
+        assert(x <= maximum && y <= maximum && z <= maximum, "the dispatch exceeds limits().max_workgroups")
+        if x == 0 || y == 0 || z == 0 {
+            return
+        }
+        device.raw_dispatch(&mut self.encoder.handle, &mut self.state, x, y, z)
+    }
+
+    pub fn end(self) {}
+
+    fn drop(&mut self) {
+        device := self.encoder.device
+        device.raw_end_compute_pass(&mut self.encoder.handle)
+    }
+}
+
+// A render pass. It ends when dropped or with end(). The viewport and
+// scissor start out covering the whole attachment.
+pub struct RenderPass {
+    encoder: &mut CommandEncoder
+    state: hal.PassState
+    tracked: Tracked
+
+    pub fn set_pipeline(&mut self, pipeline: &RenderPipeline) {
+        device := self.encoder.device
+        device.check_owner(pipeline.device)
+        assert(pipeline.pipeline.color_format == self.tracked.color_format, "the pipeline's color format differs from the attachment's")
+        assert(pipeline.pipeline.depth_format == self.tracked.depth_format, "the pipeline's depth format differs from the pass's depth attachment")
+        self.state.pipeline = pipeline.pipeline.copy()
+        self.state.has_pipeline = true
+        self.state.pipeline_dirty = true
+        self.state.dirty = 0xffff
+        self.state.vertex_dirty = 0xff
+        self.state.index_dirty = true
+    }
+
+    pub fn set_buffer(&mut self, slot: u32, buffer: &Buffer) {
+        self.set_buffer_range(slot, buffer, 0, buffer.size)
+    }
+
+    pub fn set_buffer_range(&mut self, slot: u32, buffer: &Buffer, offset: u64, size: u64) {
+        device := self.encoder.device
+        device.check_owner(buffer.device)
+        bind_buffer(&mut self.state, &mut self.tracked, slot, buffer, offset, size)
+    }
+
+    pub fn set_texture(&mut self, slot: u32, texture: &Texture, sampler: &Sampler) {
+        device := self.encoder.device
+        device.check_owner(texture.device)
+        device.check_owner(sampler.device)
+        bind_texture(&mut self.state, &mut self.tracked, slot, texture, &sampler.handle, hal.BOUND_SAMPLED_TEXTURE)
+    }
+
+    pub fn set_storage_texture(&mut self, slot: u32, texture: &Texture) {
+        device := self.encoder.device
+        device.check_owner(texture.device)
+        empty := hal.Handle.null()
+        bind_texture(&mut self.state, &mut self.tracked, slot, texture, &empty, hal.BOUND_STORAGE_TEXTURE)
+    }
+
+    // Read vertex buffer `slot` of the pipeline from `buffer`, starting
+    // `offset` bytes in. It needs BUFFER_VERTEX.
+    pub fn set_vertex_buffer(&mut self, slot: u32, buffer: &Buffer, offset: u64) {
+        device := self.encoder.device
+        device.check_owner(buffer.device)
+        assert(slot < hal.MAX_VERTEX_BUFFERS, "vertex buffer slot out of range")
+        assert((buffer.usage & hal.BUFFER_VERTEX) != 0, "a vertex buffer needs BUFFER_VERTEX")
+        assert(offset % 4 == 0 && offset <= buffer.size, "the vertex buffer offset is past the end or not a multiple of 4")
+        index := slot as usize
+        self.state.vertex_a[index] = buffer.handle.a
+        self.state.vertex_offset[index] = offset
+        self.state.vertex_set = self.state.vertex_set | (1u32 << slot)
+        self.state.vertex_dirty = self.state.vertex_dirty | (1u32 << slot)
+        self.tracked.vertex_size[index] = buffer.size
+    }
+
+    // Read indices of `format` (INDEX_UINT16 or INDEX_UINT32) from
+    // `buffer`, starting `offset` bytes in. It needs BUFFER_INDEX.
+    pub fn set_index_buffer(&mut self, buffer: &Buffer, format: u32, offset: u64) {
+        device := self.encoder.device
+        device.check_owner(buffer.device)
+        assert(format == hal.INDEX_UINT16 || format == hal.INDEX_UINT32, "unknown index format")
+        assert((buffer.usage & hal.BUFFER_INDEX) != 0, "an index buffer needs BUFFER_INDEX")
+        assert(offset % index_size(format) == 0 && offset <= buffer.size, "the index buffer offset is past the end or not a multiple of the index size")
+        self.state.index_a = buffer.handle.a
+        self.state.index_offset = offset
+        self.state.index_format = format
+        self.state.index_set = true
+        self.state.index_dirty = true
+        self.tracked.index_size = buffer.size
+    }
+
+    // Draw into this part of the attachment, in pixels from its top-left
+    // corner, with depths mapped to `min_depth`..`max_depth` (0.0 to 1.0).
+    pub fn set_viewport(&mut self, x: f32, y: f32, width: f32, height: f32, min_depth: f32, max_depth: f32) {
+        assert(width > 0.0 && height > 0.0 && x >= 0.0 && y >= 0.0, "the viewport is empty or starts outside the attachment")
+        assert(x + width <= self.tracked.width as f32 && y + height <= self.tracked.height as f32, "the viewport extends past the attachment")
+        assert(min_depth >= 0.0 && max_depth <= 1.0 && min_depth <= max_depth, "viewport depths lie outside 0.0 to 1.0")
+        device := self.encoder.device
+        device.raw_set_viewport(&mut self.encoder.handle, x, y, width, height, min_depth, max_depth)
+    }
+
+    // Discard pixels outside this rectangle.
+    pub fn set_scissor(&mut self, x: u32, y: u32, width: u32, height: u32) {
+        assert(x as u64 + width as u64 <= self.tracked.width as u64 && y as u64 + height as u64 <= self.tracked.height as u64, "the scissor rectangle extends past the attachment")
+        device := self.encoder.device
+        device.raw_set_scissor(&mut self.encoder.handle, x, y, width, height)
+    }
+
+    // Draw `vertex_count` vertices from `first_vertex`, `instance_count`
+    // times from `first_instance`. Every vertex buffer the pipeline reads
+    // must be set and long enough.
+    pub fn draw(&mut self, vertex_count: u32, instance_count: u32, first_vertex: u32, first_instance: u32) {
+        device := self.encoder.device
+        check_bound(&self.state, &self.tracked, &device.limits)
+        check_vertices(&self.state, &self.tracked, first_vertex as u64 + vertex_count as u64, first_instance as u64 + instance_count as u64)
+        if vertex_count == 0 || instance_count == 0 {
+            return
+        }
+        device.raw_draw(&mut self.encoder.handle, &mut self.state, vertex_count, instance_count, first_vertex, first_instance)
+    }
+
+    // Draw `index_count` indices of the index buffer from `first_index`,
+    // adding `base_vertex` to each. Index values are not checked against
+    // the vertex buffers: an index past their end reads undefined values.
+    pub fn draw_indexed(&mut self, index_count: u32, instance_count: u32, first_index: u32, base_vertex: i32, first_instance: u32) {
+        device := self.encoder.device
+        check_bound(&self.state, &self.tracked, &device.limits)
+        assert(self.state.index_set, "no index buffer is set")
+        needed := self.state.index_offset + (first_index as u64 + index_count as u64) * index_size(self.state.index_format)
+        assert(needed <= self.tracked.index_size, "the indices extend past the end of the index buffer")
+        // Vertices come from the indices; only instance data is checked.
+        check_vertices(&self.state, &self.tracked, 0, first_instance as u64 + instance_count as u64)
+        if index_count == 0 || instance_count == 0 {
+            return
+        }
+        device.raw_draw_indexed(&mut self.encoder.handle, &mut self.state, index_count, instance_count, first_index, base_vertex, first_instance)
+    }
+
+    pub fn end(self) {}
+
+    fn drop(&mut self) {
+        device := self.encoder.device
+        device.raw_end_render_pass(&mut self.encoder.handle)
+    }
+}
+
+fn check_vertices(state: &hal.PassState, tracked: &Tracked, vertices: u64, instances: u64) {
+    pipeline := &state.pipeline
+    for i in 0usize..pipeline.vertex_buffer_count as usize {
+        assert((state.vertex_set >> i as u32 & 1) != 0, "a vertex buffer the pipeline reads is not set")
+        count := vertices
+        if pipeline.steps[i] == hal.STEP_INSTANCE {
+            count = instances
+        }
+        if count != 0 && pipeline.extents[i] != 0 {
+            needed := state.vertex_offset[i] + (count - 1) * pipeline.strides[i] as u64 + pipeline.extents[i] as u64
+            assert(needed <= tracked.vertex_size[i], "the draw reads past the end of a vertex buffer")
+        }
+    }
+}
+
+fn index_size(format: u32) -> u64 {
+    if format == hal.INDEX_UINT16 {
+        return 2
+    }
+    return 4
+}
+
+// The bytes of `values` in native byte order, for write_buffer.
+pub fn f32_bytes(values: &[f32]) -> &[u8] from(values) {
+    unsafe {
+        return ptr.borrow_slice(ptr.as_ptr(values) as *const u8, values.len * 4, values)
+    }
+}
+pub fn u32_bytes(values: &[u32]) -> &[u8] from(values) {
+    unsafe {
+        return ptr.borrow_slice(ptr.as_ptr(values) as *const u8, values.len * 4, values)
+    }
+}
+pub fn i32_bytes(values: &[i32]) -> &[u8] from(values) {
+    unsafe {
+        return ptr.borrow_slice(ptr.as_ptr(values) as *const u8, values.len * 4, values)
+    }
+}
+pub fn u16_bytes(values: &[u16]) -> &[u8] from(values) {
+    unsafe {
+        return ptr.borrow_slice(ptr.as_ptr(values) as *const u8, values.len * 2, values)
+    }
+}
+
+// The bytes of `values` to fill with read_buffer. Any bytes make valid
+// numbers of these types.
+pub fn f32_bytes_mut(values: &mut[f32]) -> &mut[u8] from(values) {
+    unsafe {
+        return ptr.borrow_slice_mut(ptr.as_mut_ptr(values) as *mut u8, values.len * 4, values)
+    }
+}
+pub fn u32_bytes_mut(values: &mut[u32]) -> &mut[u8] from(values) {
+    unsafe {
+        return ptr.borrow_slice_mut(ptr.as_mut_ptr(values) as *mut u8, values.len * 4, values)
+    }
+}
+pub fn i32_bytes_mut(values: &mut[i32]) -> &mut[u8] from(values) {
+    unsafe {
+        return ptr.borrow_slice_mut(ptr.as_mut_ptr(values) as *mut u8, values.len * 4, values)
+    }
+}
