@@ -55,19 +55,20 @@ fn read_be_int(b: &[u8], o: usize, n: usize) -> i64 {
     u2i(v)
 }
 
-// Decodes one field into register `r`. Text/blob reference `o` directly.
-fn decode_field(e: &mut Engine, o: usize, t: u64, r: usize) {
+// Decodes one field into register `r`. Blobs, and text in a UTF-8
+// database, reference `o` directly; UTF-16 text is converted into the arena.
+fn decode_field(e: &mut Engine, o: usize, t: u64, r: usize) -> void!db.Error {
     if t == 0 || t == 10 || t == 11 {
         set_null(e, r)
-        return
+        return ok()
     }
     if t == 8 {
         set_int(e, r, 0)
-        return
+        return ok()
     }
     if t == 9 {
         set_int(e, r, 1)
-        return
+        return ok()
     }
     if t == 7 {
         v := 0u64
@@ -80,19 +81,19 @@ fn decode_field(e: &mut Engine, o: usize, t: u64, r: usize) {
         } else {
             set_real(e, r, f)
         }
-        return
+        return ok()
     }
     if t < 7 {
         let read_be_int2 = read_be_int(e.ws, o, serial_len(t))
         set_int(e, r, read_be_int2)
-        return
+        return ok()
     }
     n := serial_len(t)
     if (t & 1) == 1 {
-        set_bytes(e, r, T_TEXT, o, n)
-    } else {
-        set_bytes(e, r, T_BLOB, o, n)
+        return set_text_from_db(e, r, o, n)
     }
+    set_bytes(e, r, T_BLOB, o, n)
+    ok()
 }
 
 // Reads column `col` of the record at [rec, rec + len) into `r`. Returns
@@ -118,7 +119,7 @@ fn record_column(e: &mut Engine, rec: usize, len: usize, col: usize, r: usize) -
             if body + n > rec + len {
                 return err(corrupt(e))
             }
-            decode_field(e, body, t, r)
+            decode_field(e, body, t, r)?
             return ok(true)
         }
         body += n
@@ -178,6 +179,11 @@ fn reg_serial(e: &Engine, r: usize) -> u64 {
         return 7
     }
     if t == T_TEXT {
+        if e.enc != ENC_UTF8 {
+            let off = roff(e, r)
+            let len = rlen(e, r)
+            return (utf16_len(e.ws, off, len) as u64) * 2 + 13
+        }
         return (rlen(e, r) as u64) * 2 + 13
     }
     (rlen(e, r) as u64) * 2 + 12
@@ -235,6 +241,11 @@ fn record_write(e: &mut Engine, first: usize, n: usize, dst: usize) -> usize {
             let f2u2 = f2u(rreal(e, r))
             write_be(e.ws, body, f2u2, 8)
             body += 8
+        } else if t >= 13 && (t & 1) == 1 && e.enc != ENC_UTF8 {
+            let off = roff(e, r)
+            let len = rlen(e, r)
+            let enc = e.enc
+            body += utf8_to_utf16(e.ws, off, len, body, enc)
         } else if t >= 12 {
             len := rlen(e, r)
             let off = roff(e, r)
@@ -385,6 +396,9 @@ fn reg_compare(e: &Engine, a: usize, b: usize, coll: u8) -> i32 {
         let len = rlen(e, a)
         let off2 = roff(e, b)
         let len2 = rlen(e, b)
+        if coll == COLL_BINARY && e.enc != ENC_UTF8 {
+            return compare_utf16(e, off, len, off2, len2, e.enc)
+        }
         return compare_bytes(e, off, len, off2, len2, coll)
     }
     let off3 = roff(e, a)
@@ -415,11 +429,14 @@ fn record_compare(e: &mut Engine, rec: usize, len: usize, key: usize, nkey: usiz
         if body + n > rec + len {
             return err(corrupt(e))
         }
-        decode_field(e, body, t, R_CMP_A)
+        // UTF-16 text decodes into the arena; release it after comparing.
+        mark := e.arena_top
+        decode_field(e, body, t, R_CMP_A)?
         body += n
         coll := e.ws[info + i * 2]
         desc := e.ws[info + i * 2 + 1] != 0
         c := reg_compare(e, R_CMP_A, key + i, coll)
+        e.arena_top = mark
         if c != 0 {
             return ok(if desc {
                 -c
@@ -456,8 +473,9 @@ fn record_compare2(e: &mut Engine, a: usize, alen: usize, b: usize, blen: usize,
         let (tb, tnb) = get_varint(e.ws, pb)
         pa += tna
         pb += tnb
-        decode_field(e, da, ta, R_CMP_A)
-        decode_field(e, db_, tb, R_CMP_B)
+        mark := e.arena_top
+        decode_field(e, da, ta, R_CMP_A)?
+        decode_field(e, db_, tb, R_CMP_B)?
         da += serial_len(ta)
         db_ += serial_len(tb)
         coll := COLL_BINARY
@@ -467,6 +485,7 @@ fn record_compare2(e: &mut Engine, a: usize, alen: usize, b: usize, blen: usize,
             desc = e.ws[info + i * 2 + 1] != 0
         }
         c := reg_compare(e, R_CMP_A, R_CMP_B, coll)
+        e.arena_top = mark
         if c != 0 {
             return ok(if desc {
                 -c

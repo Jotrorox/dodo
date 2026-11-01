@@ -207,8 +207,8 @@ the two.
 
 **Files.** All page sizes; overflow pages; the freelist; rollback-journal
 transactions with hot-journal recovery; SQLite's lock bytes through
-[`fs.File.try_lock_range`](filesystem.md); UTF-8 databases; schema formats 1
-to 4.
+[`fs.File.try_lock_range`](filesystem.md); UTF-8, UTF-16le, and UTF-16be
+databases; schema formats 1 to 4.
 
 **SQL.** `CREATE`/`DROP` `TABLE`, `INDEX` (including `UNIQUE` and the
 automatic indexes behind `PRIMARY KEY` and `UNIQUE` constraints), and `VIEW`;
@@ -232,7 +232,33 @@ and UPSERT), `UPDATE`, `DELETE`, each with `RETURNING`; `SELECT` with joins
 `last_insert_rowid`, `total_changes`, `sqlite_version`, ...); the aggregates
 `count`, `sum`, `total`, `avg`, `min`, `max`, `group_concat`/`string_agg`
 (with `DISTINCT`); and the date and time functions `date`, `time`,
-`datetime`, `julianday`, `unixepoch`, `strftime` with their modifiers.
+`datetime`, `julianday`, `unixepoch`, `strftime` with their modifiers. The
+`localtime` and `utc` modifiers use the operating system's time zone rules
+(`localtime_r`, or `_localtime64_s` on Windows), as SQLite does, including
+its handling of times in a daylight-saving gap or overlap and its mapping of
+years outside 1970 to 2037 onto a year with the same leap-year position.
+
+**Reals** print and parse exactly as in SQLite 3.53 and later: `CAST` to
+text (`printf('%!.17g')`: 17 significant digits, fewer where they end in a
+run of 9s or 0s and the shorter form reads back), `printf`'s `%f`, `%e`, `%g` (with the `!` and
+`#` flags), `quote`, `round`, and text-to-real conversion all reproduce
+SQLite's own decimal rounding digit for digit, not just correctly rounded
+values. Older SQLite versions round the last digit differently in places.
+
+**Text encodings.** `PRAGMA encoding = 'UTF-16le'` (or `'UTF-16be'`, or
+`'UTF-16'` for the native byte order) before a new database's first table
+creates a UTF-16 database; `PRAGMA encoding` reports the encoding of the
+database, and an existing database keeps its own. Text in records and in
+the schema is stored in the database's encoding, and as in SQLite the
+`BINARY` collation then orders text by its UTF-16 bytes (which differs from
+UTF-8 order for non-ASCII text), while `NOCASE` and `RTRIM` compare UTF-8.
+`hex(text)`, `CAST(text AS BLOB)`, `octet_length`, and blob-to-text
+conversions see UTF-16 bytes; conversions handle invalid sequences as SQLite
+does. The API binds and returns text as UTF-8 for every encoding. One
+difference remains: SQLite keeps the bytes of a blob cast to text in a UTF-16
+database unchanged, while Dodo converts them, so an invalid UTF-16 sequence
+stored that way (an unpaired surrogate or an odd byte count) is normalized
+rather than kept byte for byte.
 
 **Pragmas.** `user_version`, `application_id`, `schema_version`,
 `page_size`, `page_count`, `freelist_count`, `encoding`, `journal_mode`,
@@ -244,11 +270,7 @@ ignored, as SQLite does for unknown pragmas.
 journal_mode=DELETE` in SQLite first), triggers (tables with triggers can be
 read but not written), window functions, `WITHOUT ROWID` and virtual tables,
 `ATTACH`, savepoints, `ALTER TABLE DROP COLUMN`, writes to tables with
-expression or partial indexes, UTF-16 databases, temporary tables, and
-time zones (`localtime` and `utc` leave times in UTC). Reals are printed
-with SQLite 3.47's rule (the shortest of 15 or 17 significant digits that
-round-trips); the 17th digit can occasionally differ from SQLite's own
-conversion.
+expression or partial indexes, and temporary tables.
 
 **Concurrency.** Locks follow SQLite's protocol, so Dodo and SQLite processes
 can use one file safely. As with SQLite's POSIX locking, two connections to

@@ -265,7 +265,47 @@ fn exec_pragma(e: &mut Engine, s: usize, resreg: usize) -> void!db.Error {
         return prow(e, r, 1)
     }
     if id == P_ENCODING {
-        set_text_str(e, r, "UTF-8")?
+        if set {
+            // Only a database that does not exist yet takes a new encoding;
+            // otherwise the file's encoding stays, as in SQLite.
+            if e.db_pages != 0 {
+                return ok()
+            }
+            v := nc(e, s)
+            save := e.rtop
+            ar := reg_push(e)?
+            eval(e, v, ar)?
+            to_text(e, ar)?
+            to := roff(e, ar)
+            tl := rlen(e, ar)
+            enc := 0u8
+            if name_is(e, to, tl, "UTF-8") || name_is(e, to, tl, "UTF8") {
+                enc = ENC_UTF8
+            } else if name_is(e, to, tl, "UTF-16le") || name_is(e, to, tl, "UTF16le") || name_is(e, to, tl, "UTF-16") || name_is(e, to, tl, "UTF16") {
+                // Plain UTF-16 means the native byte order (little endian on
+                // every supported target).
+                enc = ENC_UTF16LE
+            } else if name_is(e, to, tl, "UTF-16be") || name_is(e, to, tl, "UTF16be") {
+                enc = ENC_UTF16BE
+            }
+            if enc == 0 {
+                x := fail2(e, SQLITE_ERROR, "unsupported encoding: ", to, tl)
+                e.rtop = save
+                return err(x)
+            }
+            e.rtop = save
+            e.enc_new = enc
+            e.enc = enc
+            return ok()
+        }
+        let value4 = if e.enc == ENC_UTF16LE {
+            "UTF-16le"
+        } else if e.enc == ENC_UTF16BE {
+            "UTF-16be"
+        } else {
+            "UTF-8"
+        }
+        set_text_str(e, r, value4)?
         return prow(e, r, 1)
     }
     if id == P_JOURNAL_MODE {

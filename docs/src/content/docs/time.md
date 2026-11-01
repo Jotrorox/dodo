@@ -74,6 +74,14 @@ platform errors;
 contracts and returns the maximum u64 on failure, causing deadline checks to
 fail closed. `WallClock` returns UTC timestamps, with no local-time conversion.
 
+`hosted.local_time_fields(seconds, &mut fields)` converts seconds since the
+Unix epoch to local time with the operating system's time zone rules
+(`localtime_r`, or `_localtime64_s` on Windows; `TZ` applies). It writes nine
+`i32` values in `struct tm` order: second, minute, hour, day of month, month
+(0 to 11), year minus 1900, weekday (0 is Sunday), day of year (0 to 365), and
+the daylight-saving flag, and returns `false` when the OS cannot convert the
+time. Compute the UTC offset from the fields if needed.
+
 `Duration.to_millis()` truncates fractional milliseconds. `to_millis_ceil()`
 rounds up; `timeout_millis()` additionally rejects the all-ones infinite-wait
 sentinel. All overflowing conversions fail. These helpers do not sleep.

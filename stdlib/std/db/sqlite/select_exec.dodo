@@ -91,6 +91,8 @@ fn keymap_compare(e: &mut Engine, a: usize, b: usize, map: usize, n: usize) -> i
         f := ld16(e.ws, map + k * 4)
         coll := e.ws[map + k * 4 + 2]
         flags := e.ws[map + k * 4 + 3]
+        // UTF-16 text decodes into the arena; release it after comparing.
+        mark := e.arena_top
         let len = rec_len(e, a)
         record_column(e, a + 4, len, f, R_TMP3)?
         let len2 = rec_len(e, b)
@@ -116,6 +118,7 @@ fn keymap_compare(e: &mut Engine, a: usize, b: usize, map: usize, n: usize) -> i
         } else {
             c = reg_compare(e, R_TMP3, R_TMP4, coll)
         }
+        e.arena_top = mark
         if c != 0 {
             return ok(if (flags & 1) != 0 {
                 -c
