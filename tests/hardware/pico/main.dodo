@@ -13,6 +13,7 @@ import "std/embedded/executor"
 import "std/embedded/hal"
 import "std/embedded/peripheral/pl011"
 import "std/embedded/peripheral/pl022"
+import "std/embedded/power"
 import "std/io"
 import "std/sync/atomic"
 
@@ -1109,6 +1110,104 @@ fn receive(fifo: &mut rp_multicore.Fifo, timer: &mut chip.Timer) -> u32 {
     return STOP_WORD
 }
 
+// The clocks that run now, from the clocks block's ENABLED registers.
+fn running_clocks() -> power.Clocks {
+    unsafe {
+        low: hal.Reg<u32> = hal.Reg.at(0x4000_80B0)
+        high: hal.Reg<u32> = hal.Reg.at(0x4000_80B0 + 4)
+        return (low.read() as u64) | ((high.read() as u64) << 32)
+    }
+}
+
+fn dormant_refused(chip_power: &mut chip.Power, wake: &power.Wake, expected: hal.Error) -> bool {
+    match chip_power.dormant(wake) {
+        ok(_) => {
+            return false
+        }
+        err(error) => {
+            return error == expected
+        }
+    }
+}
+
+fn power_checks(chip_power: &mut chip.Power, usb: &mut board.Usb, pins: &mut chip.Pins, timer: &mut chip.Timer) {
+    // Clock gating: the clocks of released peripherals stop, claiming one
+    // starts its clocks, and claimed and essential clocks are refused.
+    stopped := chip_power.disable_unused_clocks()
+    gated := (stopped & chip.CLOCK_UART1) == chip.CLOCK_UART1 && (stopped & chip.ESSENTIAL_CLOCKS) == 0 && (running_clocks() & stopped) == 0
+    match pins.uart(4, none, 115_200) {
+        ok(port) => {
+            restarted := (running_clocks() & chip.CLOCK_UART1) == chip.CLOCK_UART1
+            busy := failed_with(chip_power.disable_clocks(chip.CLOCK_UART1), hal.Error.Busy)
+            essential := failed_with(chip_power.disable_clocks(chip.CLOCK_GPIO), hal.Error.InvalidInput)
+            pins.release_uart(port)
+            check(gated && restarted && busy && essential)
+        }
+        err(_) => {
+            check(false)
+        }
+    }
+    chip_power.enable_clocks(stopped)
+
+    // A deep sleep with only the timer's clocks wakes on its alarm.
+    match timer.alarm(1) {
+        ok(alarm) => {
+            chip_power.set_sleep_clocks(chip.ALARM_CLOCKS)
+            chip_power.set_mode(power.Mode.DeepSleep)
+            start := timer.now_us()
+            alarm.sleep_until(some(start + 2000))
+            elapsed := timer.now_us() - start
+            deep := chip_power.mode() == power.Mode.DeepSleep && cortex_m.deep_sleep() && chip_power.sleep_clocks() == chip.ALARM_CLOCKS
+            chip_power.set_mode(power.Mode.Sleep)
+            chip_power.set_sleep_clocks(chip.ALL_CLOCKS)
+            timer.release_alarm(alarm)
+            check(deep && !cortex_m.deep_sleep() && elapsed >= 2000 && elapsed < 2300)
+        }
+        err(_) => {
+            check(false)
+        }
+    }
+
+    // Dormant: refused without pins, for a pin the chip lacks, and while
+    // the USB serial port runs; a level already present ends it at once,
+    // and clk_sys is back at full speed.
+    empty := power.Wake.new()
+    outside := power.Wake.new()
+    outside.on(chip.PIN_COUNT, power.LEVEL_HIGH)
+    refused := dormant_refused(chip_power, &empty, hal.Error.InvalidInput) && dormant_refused(chip_power, &outside, hal.Error.InvalidInput)
+    wake := power.Wake.new()
+    wake.on(14, power.LEVEL_HIGH)
+    match usb.serial() {
+        ok(serial) => {
+            refused = refused && dormant_refused(chip_power, &wake, hal.Error.Busy)
+            usb.release_serial(serial)
+        }
+        err(_) => {
+            refused = false
+        }
+    }
+    match pins.output(14) {
+        ok(pin) => {
+            pin.set_high()
+            before := timer.now_us()
+            woke := false
+            match chip_power.dormant(&wake) {
+                ok(pins_woken) => {
+                    woke = pins_woken == 1u64 << 14
+                }
+                err(_) => {}
+            }
+            elapsed := timer.now_us() - before
+            khz := clk_sys_khz()
+            pins.release(pin)
+            check(refused && woke && elapsed < 10_000 && khz == clk_sys_khz() && khz > chip.SYS_HZ / 1000 - 1000 && khz < chip.SYS_HZ / 1000 + 1000)
+        }
+        err(_) => {
+            check(false)
+        }
+    }
+}
+
 fn core1_checks(core1: &mut rp_multicore.Core1, fifos: &mut rp_multicore.Fifos, spinlocks: &mut rp_multicore.Spinlocks, timer: &mut chip.Timer) {
     feed_watchdog()
     fifo := fifos.claim()!
@@ -1348,6 +1447,7 @@ fn main() {
     usb_checks(&mut b.usb, &mut b.pins, &mut b.timer)
     dma_checks(&mut b.dma, &mut b.pins, &mut b.timer)
     core1_checks(&mut b.core1, &mut b.fifos, &mut b.spinlocks, &mut b.timer)
+    power_checks(&mut b.power, &mut b.usb, &mut b.pins, &mut b.timer)
     watchdog_checks(&mut b.watchdog, &mut b.timer)
 
     // Configuration is validated before ownership: an unusable crystal is
