@@ -1,0 +1,357 @@
+package protocol
+
+import "std/db"
+
+// Password authentication without a fixed cryptography backend: the caller
+// supplies the hash functions (the hosted client uses OpenSSL's libcrypto),
+// so this package stays portable.
+pub interface Hashes {
+    fn sha256(&mut self, data: &[u8]) -> [32]u8!db.Error
+    fn hmac_sha256(&mut self, key: &[u8], data: &[u8]) -> [32]u8!db.Error
+    fn pbkdf2_sha256(&mut self, password: &[u8], salt: &[u8], iterations: u32) -> [32]u8!db.Error
+    // MD5 of first followed by second.
+    fn md5(&mut self, first: &[u8], second: &[u8]) -> [16]u8!db.Error
+}
+
+pub const SCRAM_SHA_256: &str = "SCRAM-SHA-256"
+
+fn auth_failure() -> db.Error {
+    db.Error.new(db.ErrorKind.Auth, 0)
+}
+
+// SCRAM-SHA-256 client (RFC 5802, RFC 7677) as PostgreSQL uses it: no
+// channel binding ("n,,"), and the user name is left empty because the
+// server takes it from the startup message.
+//
+//     scram := protocol.Scram.new(nonce)?
+//     n := scram.client_first(&mut out)?          // SASLInitialResponse data
+//     n = scram.client_final(&mut hashes, password, server_first, &mut out)?
+//     scram.verify(server_final)?                 // AuthenticationSASLFinal
+pub struct Scram {
+    nonce: [32]u8
+    nonce_len: usize
+    signature: [32]u8
+    stage: u8
+
+    // `nonce` is the client nonce: 18 to 32 printable ASCII characters other
+    // than ','. Use fresh random bytes from a CSPRNG for every attempt, for
+    // example base64 of 18 random bytes.
+    pub fn new(nonce: &[u8]) -> Scram!db.Error {
+        if nonce.len < 18 || nonce.len > 32 {
+            return err(misuse())
+        }
+        result := Scram { nonce: [0u8; 32], nonce_len: nonce.len, signature: [0u8; 32], stage: 0 }
+        for i in 0usize..nonce.len {
+            c := nonce[i]
+            if c < 33 || c > 126 || c == 44 {
+                return err(misuse())
+            }
+            result.nonce[i] = c
+        }
+        ok(result)
+    }
+
+    // client-first-message: "n,,n=,r=<nonce>".
+    pub fn client_first(&mut self, out: &mut[u8]) -> usize!db.Error {
+        if self.stage != 0 {
+            return err(misuse())
+        }
+        b := Buffer.new(out)
+        b.put(b"n,,")?
+        self.first_bare(&mut b)?
+        self.stage = 1
+        ok(b.used())
+    }
+
+    fn first_bare(&self, b: &mut Buffer) -> void!db.Error {
+        b.put(b"n=,r=")?
+        b.put(&self.nonce[..self.nonce_len])
+    }
+
+    // Reads the server-first-message and writes the client-final-message,
+    // whose proof shows knowledge of `password`. The password is used as
+    // given (SASLprep leaves printable ASCII unchanged).
+    pub fn client_final<K: Hashes>(&mut self, hashes: &mut K, password: &[u8], server_first: &[u8], out: &mut[u8]) -> usize!db.Error {
+        if self.stage != 1 {
+            return err(misuse())
+        }
+        self.stage = 3
+        if server_first.len > 512 {
+            return err(violation())
+        }
+        // r=<client nonce + server nonce>,s=<salt>,i=<iterations>[,ext...]
+        nonce := Span.empty()
+        salt := Span.empty()
+        iterations := 0u32
+        at := 0usize
+        for at < server_first.len {
+            end := at
+            for end < server_first.len && server_first[end] != 44 {
+                end += 1
+            }
+            if end - at < 2 || server_first[at + 1] != 61 {
+                return err(violation())
+            }
+            value := Span { start: at + 2, end }
+            attribute := server_first[at]
+            if attribute == b'm' {
+                return err(db.Error.new(db.ErrorKind.Unsupported, 0))
+            }
+            if attribute == b'r' {
+                nonce = value
+            } else if attribute == b's' {
+                salt = value
+            } else if attribute == b'i' {
+                iterations = parse_iterations(&server_first[value.start..value.end])?
+            }
+            at = end + 1
+        }
+        server_nonce := &server_first[nonce.start..nonce.end]
+        if nonce.len() <= self.nonce_len || !starts_with(server_nonce, &self.nonce[..self.nonce_len]) ||
+            salt.len() == 0 || iterations == 0 {
+            return err(violation())
+        }
+        for i in 0usize..server_nonce.len {
+            if server_nonce[i] < 33 || server_nonce[i] > 126 {
+                return err(violation())
+            }
+        }
+        salt_bytes := [0u8; 384]
+        salt_len := base64_decode(&server_first[salt.start..salt.end], &mut salt_bytes)?
+
+        // AuthMessage = client-first-bare "," server-first "," client-final-without-proof
+        auth := [0u8; 1024]
+        message := Buffer.new(&mut auth)
+        self.first_bare(&mut message)?
+        message.put(b",")?
+        message.put(server_first)?
+        message.put(b",c=biws,r=")?
+        message.put(server_nonce)?
+
+        salted := hashes.pbkdf2_sha256(password, &salt_bytes[..salt_len], iterations)?
+        client_key := hashes.hmac_sha256(&salted, b"Client Key")?
+        stored_key := hashes.sha256(&client_key)?
+        client_signature := hashes.hmac_sha256(&stored_key, message.bytes())?
+        server_key := hashes.hmac_sha256(&salted, b"Server Key")?
+        self.signature = hashes.hmac_sha256(&server_key, message.bytes())?
+        proof := [0u8; 32]
+        for i in 0usize..32 {
+            proof[i] = client_key[i] ^ client_signature[i]
+        }
+        wipe(&mut salted)
+        wipe(&mut client_key)
+        wipe(&mut server_key)
+
+        b := Buffer.new(out)
+        b.put(b"c=biws,r=")?
+        b.put(server_nonce)?
+        b.put(b",p=")?
+        encoded := [0u8; 44]
+        n := base64_encode(&proof, &mut encoded)
+        b.put(&encoded[..n])?
+        self.stage = 2
+        ok(b.used())
+    }
+
+    // Checks the server-final-message ("v=<signature>"), which proves the
+    // server knew the password too. "e=<error>" is an Auth error.
+    pub fn verify(&mut self, server_final: &[u8]) -> void!db.Error {
+        if self.stage != 2 {
+            return err(misuse())
+        }
+        self.stage = 3
+        if starts_with(server_final, b"e=") {
+            return err(auth_failure())
+        }
+        if !starts_with(server_final, b"v=") {
+            return err(violation())
+        }
+        end := 2usize
+        for end < server_final.len && server_final[end] != 44 {
+            end += 1
+        }
+        decoded := [0u8; 48]
+        n := base64_decode(&server_final[2..end], &mut decoded)?
+        if n != 32 {
+            return err(auth_failure())
+        }
+        difference := 0u8
+        for i in 0usize..32 {
+            difference = difference | (decoded[i] ^ self.signature[i])
+        }
+        if difference != 0 {
+            return err(auth_failure())
+        }
+        ok()
+    }
+}
+
+fn wipe(bytes: &mut[u8]) {
+    for i in 0usize..bytes.len {
+        bytes[i] = 0
+    }
+}
+
+fn parse_iterations(text: &[u8]) -> u32!db.Error {
+    if text.len == 0 || text.len > 10 {
+        return err(violation())
+    }
+    v := 0u64
+    for i in 0usize..text.len {
+        if text[i] < 48 || text[i] > 57 {
+            return err(violation())
+        }
+        v = v * 10 + (text[i] - 48) as u64
+    }
+    if v == 0 {
+        return err(violation())
+    }
+    // PostgreSQL defaults to 4096. A count far beyond any real setting would
+    // let a hostile server stall the client inside PBKDF2.
+    if v > 10000000 {
+        return err(db.Error.new(db.ErrorKind.Unsupported, 0))
+    }
+    ok(v as u32)
+}
+
+fn hex_digit(v: u8) -> u8 {
+    if v < 10 {
+        return 48 + v
+    }
+    87 + v
+}
+
+// The md5 password response: "md5" followed by the hex MD5 of (hex MD5 of
+// password + user) + salt, as AuthenticationMD5Password requests. `out`
+// must hold 35 bytes.
+pub fn md5_password<K: Hashes>(hashes: &mut K, user: &[u8], password: &[u8], salt: &[u8], out: &mut[u8]) -> usize!db.Error {
+    if salt.len != 4 || out.len < 35 {
+        return err(misuse())
+    }
+    inner := hashes.md5(password, user)?
+    inner_hex := [0u8; 32]
+    for i in 0usize..16 {
+        inner_hex[2 * i] = hex_digit(inner[i] >> 4)
+        inner_hex[2 * i + 1] = hex_digit(inner[i] & 15)
+    }
+    outer := hashes.md5(&inner_hex, salt)?
+    out[0] = b'm'
+    out[1] = b'd'
+    out[2] = b'5'
+    for i in 0usize..16 {
+        out[3 + 2 * i] = hex_digit(outer[i] >> 4)
+        out[4 + 2 * i] = hex_digit(outer[i] & 15)
+    }
+    ok(35)
+}
+
+fn base64_char(v: u8) -> u8 {
+    if v < 26 {
+        return 65 + v
+    }
+    if v < 52 {
+        return 71 + v
+    }
+    if v < 62 {
+        return v - 4
+    }
+    if v == 62 {
+        return 43
+    }
+    47
+}
+
+fn base64_value(c: u8) -> i32 {
+    if c >= 65 && c <= 90 {
+        return (c - 65) as i32
+    }
+    if c >= 97 && c <= 122 {
+        return (c - 71) as i32
+    }
+    if c >= 48 && c <= 57 {
+        return (c + 4) as i32
+    }
+    if c == 43 {
+        return 62
+    }
+    if c == 47 {
+        return 63
+    }
+    -1
+}
+
+// Standard base64 with padding. `out` must hold 4 * ceil(data.len / 3) bytes.
+pub fn base64_encode(data: &[u8], out: &mut[u8]) -> usize {
+    n := 0usize
+    i := 0usize
+    for i < data.len {
+        a := data[i]
+        b := 0u8
+        c := 0u8
+        if i + 1 < data.len {
+            b = data[i + 1]
+        }
+        if i + 2 < data.len {
+            c = data[i + 2]
+        }
+        out[n] = base64_char(a >> 2)
+        out[n + 1] = base64_char(((a & 3) << 4) | (b >> 4))
+        out[n + 2] = 61
+        out[n + 3] = 61
+        if i + 1 < data.len {
+            out[n + 2] = base64_char(((b & 15) << 2) | (c >> 6))
+        }
+        if i + 2 < data.len {
+            out[n + 3] = base64_char(c & 63)
+        }
+        n += 4
+        i += 3
+    }
+    n
+}
+
+// Decodes standard padded base64 into `out`; malformed input is a Protocol
+// error and output that does not fit is a Capacity error.
+pub fn base64_decode(text: &[u8], out: &mut[u8]) -> usize!db.Error {
+    if text.len % 4 != 0 {
+        return err(violation())
+    }
+    n := 0usize
+    i := 0usize
+    for i < text.len {
+        last := i + 4 == text.len
+        values := [0i32; 4]
+        pad := 0usize
+        for j in 0usize..4 {
+            c := text[i + j]
+            if c == 61 && last && j >= 2 {
+                pad += 1
+                values[j] = 0
+            } else {
+                if pad != 0 {
+                    return err(violation())
+                }
+                v := base64_value(c)
+                if v < 0 {
+                    return err(violation())
+                }
+                values[j] = v
+            }
+        }
+        word := (values[0] << 18) | (values[1] << 12) | (values[2] << 6) | values[3]
+        count := 3 - pad
+        if out.len - n < count {
+            return err(capacity())
+        }
+        out[n] = ((word >> 16) & 255) as u8
+        if count > 1 {
+            out[n + 1] = ((word >> 8) & 255) as u8
+        }
+        if count > 2 {
+            out[n + 2] = (word & 255) as u8
+        }
+        n += count
+        i += 4
+    }
+    ok(n)
+}

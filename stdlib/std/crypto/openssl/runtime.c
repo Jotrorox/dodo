@@ -15,7 +15,7 @@
 #endif
 
 enum { DODO_CRYPTO_OK=0, DODO_CRYPTO_INVALID=-1, DODO_CRYPTO_SHORT=-2, DODO_CRYPTO_ALLOC=-3, DODO_CRYPTO_BACKEND=-9 };
-enum { DODO_CRYPTO_SHA1=1, DODO_CRYPTO_SHA256=2, DODO_CRYPTO_AES128_CFB8=1 };
+enum { DODO_CRYPTO_SHA1=1, DODO_CRYPTO_SHA256=2, DODO_CRYPTO_MD5=3, DODO_CRYPTO_AES128_CFB8=1 };
 enum { DODO_RSA_MIN_BITS=1024, DODO_RSA_MAX_BITS=16384, DODO_RSA_MAX_BYTES=DODO_RSA_MAX_BITS/8 };
 /* EVP lengths are int; feed larger slices in pieces that stay far below it. */
 enum { DODO_CRYPTO_CHUNK=1<<30 };
@@ -29,6 +29,7 @@ int32_t dodo_crypto_error(void) {
 static const EVP_MD *digest_of(int algorithm) {
     if (algorithm == DODO_CRYPTO_SHA1) return EVP_sha1();
     if (algorithm == DODO_CRYPTO_SHA256) return EVP_sha256();
+    if (algorithm == DODO_CRYPTO_MD5) return EVP_md5();
     return NULL;
 }
 
@@ -66,6 +67,20 @@ int32_t dodo_crypto_digest_finish(void *state, unsigned char *output, size_t cap
     unsigned int written = 0;
     if (EVP_DigestFinal_ex(ctx, output, &written) != 1 || written != capacity) return DODO_CRYPTO_BACKEND;
     return EVP_DigestInit_ex2(ctx, md, NULL) == 1 ? DODO_CRYPTO_OK : DODO_CRYPTO_BACKEND;
+}
+
+/* PBKDF2 (RFC 8018) with HMAC-SHA256. The output length selects the derived
+ * key size; OpenSSL bounds the work by the iteration count only. */
+int32_t dodo_crypto_pbkdf2_sha256(const unsigned char *password, size_t password_len,
+                                  const unsigned char *salt, size_t salt_len,
+                                  uint32_t iterations, unsigned char *output, size_t capacity) {
+    if (password_len > INT_MAX || salt_len > INT_MAX || capacity == 0 || capacity > INT_MAX ||
+        iterations == 0 || iterations > INT_MAX) return DODO_CRYPTO_INVALID;
+    ERR_clear_error();
+    if (PKCS5_PBKDF2_HMAC((const char *)(password_len ? password : empty), (int)password_len,
+                          salt_len ? salt : empty, (int)salt_len, (int)iterations, EVP_sha256(),
+                          (int)capacity, output) != 1) return DODO_CRYPTO_BACKEND;
+    return DODO_CRYPTO_OK;
 }
 
 void dodo_crypto_mac_free(void *state) {

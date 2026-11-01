@@ -125,12 +125,12 @@ void *dodo_tls_new(int server, const unsigned char *hostname, size_t hlen,
                   const unsigned char *certificate, size_t clen,
                   const unsigned char *key, size_t klen,
                   const unsigned char *alpn, size_t alen,
-                  int system_roots, int client_auth, int64_t verify_time, int *error) {
+                  int system_roots, int client_auth, int verify, int64_t verify_time, int *error) {
     *error = DODO_TLS_INVALID;
     if ((!server && (!hlen || hlen > 253)) || hlen > 253 ||
         (hlen && memchr(hostname, 0, hlen)) || rlen > DODO_TLS_PEM_LIMIT || clen > DODO_TLS_PEM_LIMIT ||
         klen > DODO_TLS_PEM_LIMIT || !valid_alpn(alpn, alen) || (!!clen != !!klen) ||
-        (server && !clen) || verify_time < -1) return NULL;
+        (server && !clen) || verify_time < -1 || verify < 0 || verify > 2) return NULL;
     ERR_clear_error();
     dodo_tls *s = OPENSSL_zalloc(sizeof(*s));
     if (!s) { *error = DODO_TLS_ALLOC; return NULL; }
@@ -142,7 +142,10 @@ void *dodo_tls_new(int server, const unsigned char *hostname, size_t hlen,
     SSL_CTX_set_verify_depth(s->ctx, 16);
     SSL_CTX_set_session_cache_mode(s->ctx, SSL_SESS_CACHE_OFF);
     SSL_CTX_set_num_tickets(s->ctx, 0);
-    SSL_CTX_set_verify(s->ctx, (!server || client_auth) ?
+    /* Clients: verify 0 checks the chain and the host name, 1 only the chain,
+     * 2 nothing (encryption without authentication, for protocols such as
+     * PostgreSQL's sslmode=require). */
+    SSL_CTX_set_verify(s->ctx, ((!server && verify != 2) || (server && client_auth)) ?
         (SSL_VERIFY_PEER | (server ? SSL_VERIFY_FAIL_IF_NO_PEER_CERT : 0)) : SSL_VERIFY_NONE, NULL);
     if (system_roots && SSL_CTX_set_default_verify_paths(s->ctx) != 1) goto backend_error;
     if (rlen && !load_roots(s->ctx, roots, rlen)) goto backend_error;
@@ -157,7 +160,16 @@ void *dodo_tls_new(int server, const unsigned char *hostname, size_t hlen,
     s->ssl = SSL_new(s->ctx);
     if (!s->ssl) goto backend_error;
     if (verify_time >= 0) X509_VERIFY_PARAM_set_time(SSL_get0_param(s->ssl), (time_t)verify_time);
-    if (!server) {
+    if (!server && verify != 0) {
+        /* Still send SNI for host names, but match no name. */
+        char host[254];
+        memcpy(host, hostname, hlen); host[hlen] = 0;
+        ASN1_OCTET_STRING *ip = a2i_IPADDRESS(host);
+        int is_ip = ip != NULL;
+        ASN1_OCTET_STRING_free(ip);
+        ERR_clear_error();
+        if (!is_ip && !SSL_set_tlsext_host_name(s->ssl, host)) goto backend_error;
+    } else if (!server) {
         char host[254];
         memcpy(host, hostname, hlen); host[hlen] = 0;
         SSL_set_hostflags(s->ssl, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);

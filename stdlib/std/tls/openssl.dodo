@@ -5,6 +5,17 @@ import "std/io"
 import "std/tls"
 import "std/tls/native"
 
+// How a client authenticates the server's certificate.
+pub enum Verify {
+    // Chain to a trusted root and match the configured host name (or IP).
+    Full,
+    // Chain to a trusted root, accepting any name in the certificate.
+    Chain,
+    // Accept any certificate: the connection is encrypted but not
+    // authenticated, so an active attacker can intercept it. Only for
+    // protocols whose configuration explicitly asks for this.
+    None,
+}
 // All configuration bytes are copied/parsed during construction. PEM key bytes
 // remain the caller's secret and must be wiped by the caller when appropriate.
 pub struct Config {
@@ -16,17 +27,20 @@ pub struct Config {
     pub alpn: &[u8]
     pub system_roots: bool
     pub require_client_certificate: bool
+    // Clients only. Peer selects how the server is authenticated; the default,
+    // Verify.Full, checks the certificate chain and the host name.
+    pub verify: Verify
     // -1 uses the backend's platform wall clock; >=0 is explicit Unix seconds.
     pub verification_time: i64
     pub fn client(hostname: &[u8]) -> Config from(hostname) {
         return Config { hostname: hostname, trust_pem: b"", certificate_pem: b"",
         private_key_pem: b"", alpn: b"", system_roots: true,
-        require_client_certificate: false, verification_time: -1 }
+        require_client_certificate: false, verify: Verify.Full, verification_time: -1 }
     }
     pub fn server(certificate: &[u8], key: &[u8]) -> Config from(certificate, key) {
         return Config { hostname: b"", trust_pem: b"", certificate_pem: certificate,
         private_key_pem: key, alpn: b"", system_roots: false,
-        require_client_certificate: false, verification_time: -1 }
+        require_client_certificate: false, verify: Verify.Full, verification_time: -1 }
     }
 }
 fn error(status: i32, code: i32) -> tls.Error {
@@ -179,13 +193,23 @@ fn create(config: &Config, server: bool) -> Engine!tls.Error {
     if config.require_client_certificate {
         auth_flag = 1
     }
+    verify_flag := 0i32
+    match &config.verify {
+        Verify.Full => {}
+        Verify.Chain => {
+            verify_flag = 1
+        }
+        Verify.None => {
+            verify_flag = 2
+        }
+    }
     unsafe {
         handle := native.dodo_tls_new(server_flag,
         ptr.as_ptr(config.hostname), config.hostname.len,
         ptr.as_ptr(config.trust_pem), config.trust_pem.len,
         ptr.as_ptr(config.certificate_pem), config.certificate_pem.len,
         ptr.as_ptr(config.private_key_pem), config.private_key_pem.len,
-        ptr.as_ptr(config.alpn), config.alpn.len, roots_flag, auth_flag,
+        ptr.as_ptr(config.alpn), config.alpn.len, roots_flag, auth_flag, verify_flag,
         config.verification_time, ptr.from_mut(&mut code))
         if ptr.is_null(handle) {
             return err(error(code, code))

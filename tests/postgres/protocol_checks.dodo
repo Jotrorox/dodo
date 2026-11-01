@@ -1,0 +1,257 @@
+package postgres_protocol_checks
+
+// Server-free checks for std/db/postgres/protocol: message encoding, value
+// conversion and error mapping. SCRAM and md5 (which need OpenSSL) are in
+// auth_checks.dodo, the live-server checks in live_checks.dodo; both run
+// through tests/postgres_library.rs.
+
+import "core/mem"
+import "std/db"
+import "std/db/postgres/protocol"
+
+fn same(a: &[u8], b: &[u8]) -> bool {
+    if a.len != b.len {
+        return false
+    }
+    for i in 0usize..a.len {
+        if a[i] != b[i] {
+            return false
+        }
+    }
+    true
+}
+
+@test
+fn encodes_frontend_messages() {
+    out := [0u8; 256]
+    b := protocol.Buffer.new(&mut out)
+    protocol.query(&mut b, b"select 1")!
+    assert(same(b.bytes(), b"Q\x00\x00\x00\x0dselect 1\x00"))
+    b.clear()
+    protocol.sync(&mut b)!
+    protocol.terminate(&mut b)!
+    assert(same(b.bytes(), b"S\x00\x00\x00\x04X\x00\x00\x00\x04"))
+    b.clear()
+    protocol.ssl_request(&mut b)!
+    assert(same(b.bytes(), b"\x00\x00\x00\x08\x04\xd2\x16\x2f"))
+    b.clear()
+    protocol.parse(&mut b, b"s1", b"select $1")!
+    assert(same(b.bytes(), b"P\x00\x00\x00\x13s1\x00select $1\x00\x00\x00"))
+    b.clear()
+    protocol.execute(&mut b, b"", 0)!
+    assert(same(b.bytes(), b"E\x00\x00\x00\x09\x00\x00\x00\x00\x00"))
+    b.clear()
+    protocol.startup(&mut b, b"ada", b"app", b"")!
+    expected := b"\x00\x00\x00\x34\x00\x03\x00\x00user\x00ada\x00database\x00app\x00client_encoding\x00UTF8\x00\x00"
+    assert(same(b.bytes(), expected))
+    // NUL cannot be sent inside a string.
+    b.clear()
+    match protocol.query(&mut b, b"select\x001") {
+        ok() => assert(false),
+        err(e) => assert(e.kind == db.ErrorKind.Misuse),
+    }
+}
+
+@test
+fn buffer_reports_capacity() {
+    out := [0u8; 8]
+    b := protocol.Buffer.new(&mut out)
+    match protocol.query(&mut b, b"select 1") {
+        ok() => assert(false),
+        err(e) => assert(e.kind == db.ErrorKind.Capacity),
+    }
+}
+
+@test
+fn binds_parameters_by_target_type() {
+    out := [0u8; 512]
+    b := protocol.Buffer.new(&mut out)
+    params := [db.Value.Int(7), db.Value.Int(-2), db.Value.Text("hi"), db.Value.Null, db.Value.Bytes(b"\x01\x02"), db.Value.Real(0.5)]
+    kinds := [protocol.KIND_INT4, protocol.KIND_INT8, protocol.KIND_TEXT, protocol.KIND_INT4, protocol.KIND_BYTEA, protocol.KIND_TEXT]
+    bits := [1u8]
+    protocol.bind(&mut b, b"", b"s1", &params, &kinds, &bits, 2)!
+    expected := b"B\x00\x00\x00\x4b\x00s1\x00\x00\x06\x00\x01\x00\x01\x00\x00\x00\x00\x00\x01\x00\x00\x00\x06\x00\x00\x00\x04\x00\x00\x00\x07\x00\x00\x00\x08\xff\xff\xff\xff\xff\xff\xff\xfe\x00\x00\x00\x02hi\xff\xff\xff\xff\x00\x00\x00\x02\x01\x02\x00\x00\x00\x055e-01\x00\x02\x00\x01\x00\x00"
+    assert(same(b.bytes(), expected))
+
+    // Out of range for int2, and a fractional value for an integer.
+    b.clear()
+    small := [db.Value.Int(40000)]
+    int2 := [protocol.KIND_INT2]
+    match protocol.bind(&mut b, b"", b"", &small, &int2, &bits, 0) {
+        ok() => assert(false),
+        err(e) => assert(e.kind == db.ErrorKind.Type),
+    }
+    fraction := [db.Value.Real(1.5)]
+    int8 := [protocol.KIND_INT8]
+    match protocol.bind(&mut b, b"", b"", &fraction, &int8, &bits, 0) {
+        ok() => assert(false),
+        err(e) => assert(e.kind == db.ErrorKind.Type),
+    }
+}
+
+@test
+fn decodes_binary_and_text_values() {
+    match protocol.decode(protocol.KIND_INT2, 1, b"\xff\xfe")! {
+        db.Value.Int(v) => assert_eq(v, -2i64),
+        _ => assert(false),
+    }
+    match protocol.decode(protocol.KIND_INT8, 1, b"\x80\x00\x00\x00\x00\x00\x00\x00")! {
+        db.Value.Int(v) => assert_eq(v, -9223372036854775807i64 - 1),
+        _ => assert(false),
+    }
+    match protocol.decode(protocol.KIND_FLOAT8, 1, b"\x3f\xf8\x00\x00\x00\x00\x00\x00")! {
+        db.Value.Real(v) => assert_eq(v, 1.5),
+        _ => assert(false),
+    }
+    match protocol.decode(protocol.KIND_FLOAT4, 1, b"\x3f\xc0\x00\x00")! {
+        db.Value.Real(v) => assert_eq(v, 1.5),
+        _ => assert(false),
+    }
+    match protocol.decode(protocol.KIND_BOOL, 0, b"t")! {
+        db.Value.Int(v) => assert_eq(v, 1i64),
+        _ => assert(false),
+    }
+    match protocol.decode(protocol.KIND_INT4, 0, b"-42")! {
+        db.Value.Int(v) => assert_eq(v, -42i64),
+        _ => assert(false),
+    }
+    match protocol.decode(protocol.KIND_FLOAT8, 0, b"-Infinity")! {
+        db.Value.Real(v) => assert(v < -1.0e308),
+        _ => assert(false),
+    }
+    match protocol.decode(protocol.KIND_TEXT, 0, b"12.50")! {
+        db.Value.Text(v) => assert(same(mem.str_bytes(v), b"12.50")),
+        _ => assert(false),
+    }
+    match protocol.decode(protocol.KIND_TEXT, 0, b"\xff")! {
+        db.Value.Bytes(v) => assert_eq(v.len, 1usize),
+        _ => assert(false),
+    }
+    match protocol.decode(protocol.KIND_INT4, 1, b"\x00\x01") {
+        ok(_) => assert(false),
+        err(e) => assert(e.kind == db.ErrorKind.Protocol),
+    }
+}
+
+@test
+fn formats_numbers_as_text() {
+    out := [0u8; 32]
+    n := protocol.format_int(-9223372036854775807i64 - 1, &mut out)
+    assert(same(&out[..n], b"-9223372036854775808"))
+    n = protocol.format_real(-0.1, &mut out)
+    assert(same(&out[..n], b"-1e-01"))
+    n = protocol.format_real(12.25, &mut out)
+    assert(same(&out[..n], b"1.225e+01"))
+    n = protocol.format_real(0.30000000000000004, &mut out)
+    assert(same(&out[..n], b"3.0000000000000004e-01"))
+    n = protocol.format_real(5e-324, &mut out)
+    assert(same(&out[..n], b"5e-324"))
+}
+
+@test
+fn parses_backend_messages() {
+    tag := b"INSERT 0 12"
+    assert_eq(protocol.affected_rows(tag), 12u64)
+    assert_eq(protocol.affected_rows(b"CREATE TABLE"), 0u64)
+    assert_eq(protocol.affected_rows(b"UPDATE 3"), 3u64)
+
+    message := b"Z\x00\x00\x00\x05T"
+    let some(f) = protocol.frame(message)! else {
+        assert(false)
+        return
+    }
+    assert_eq(f.tag, protocol.READY_FOR_QUERY)
+    assert_eq(f.body, 1usize)
+    assert_eq(protocol.ready_status(&message[5..])!, protocol.STATUS_TRANSACTION)
+    short := b"Z\x00\x00"
+    match protocol.frame(short)! {
+        some(_) => assert(false),
+        none => {},
+    }
+
+    body := b"SERROR\x00VERROR\x00C23505\x00Mduplicate key\x00Ddetail text\x00nusers_email_key\x00P8\x00\x00"
+    notice := protocol.notice(body)!
+    assert(same(protocol.span_bytes(body, &notice.code), b"23505"))
+    assert(same(protocol.span_bytes(body, &notice.message), b"duplicate key"))
+    assert(same(protocol.span_bytes(body, &notice.constraint), b"users_email_key"))
+    assert_eq(notice.position, 8i32)
+    e := protocol.error_for(b"23505")
+    assert(e.kind == db.ErrorKind.Constraint)
+    assert(e.constraint == db.Constraint.Unique)
+    assert_eq(e.code, protocol.sqlstate_number(b"23505"))
+    text := [0u8; 5]
+    assert_eq(protocol.sqlstate_text(protocol.sqlstate_number(b"42P01"), &mut text), 5usize)
+    assert(same(&text, b"42P01"))
+    assert(kind_is(b"42P01", db.ErrorKind.Schema))
+    assert(kind_is(b"42601", db.ErrorKind.Syntax))
+    assert(kind_is(b"40001", db.ErrorKind.Serialization))
+    assert(kind_is(b"28P01", db.ErrorKind.Auth))
+    assert(kind_is(b"57014", db.ErrorKind.Interrupted))
+
+    sql := b"select '\xc3\xa9', x"
+    assert_eq(protocol.byte_position(sql, 13), 13i32)
+    assert_eq(protocol.byte_position(sql, 0), -1i32)
+
+    sasl := b"\x00\x00\x00\x0aSCRAM-SHA-256-PLUS\x00SCRAM-SHA-256\x00\x00"
+    assert(protocol.offers_mechanism(sasl, b"SCRAM-SHA-256")!)
+    assert(!protocol.offers_mechanism(sasl, b"OAUTHBEARER")!)
+
+    description := b"\x00\x02id\x00\x00\x00\x40\x00\x00\x01\x00\x00\x00\x17\x00\x04\xff\xff\xff\xff\x00\x01name\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x19\xff\xff\xff\xff\xff\xff\x00\x00"
+    fields := protocol.Fields.new(description)!
+    assert_eq(fields.count(), 2usize)
+    let some(first) = fields.next()! else {
+        assert(false)
+        return
+    }
+    assert(same(protocol.span_bytes(description, &first.name), b"id"))
+    assert_eq(first.type_oid, protocol.OID_INT4)
+    assert_eq(first.format, 1u16)
+    let some(second) = fields.next()! else {
+        assert(false)
+        return
+    }
+    assert_eq(protocol.kind_of(second.type_oid), protocol.KIND_TEXT)
+    match fields.next()! {
+        some(_) => assert(false),
+        none => {},
+    }
+
+    row := b"\x00\x02\x00\x00\x00\x01\x41\xff\xff\xff\xff"
+    columns := protocol.Columns.new(row)!
+    span := protocol.Span.empty()
+    match columns.next(&mut span)! {
+        some(present) => {
+            assert(present)
+            assert(same(&row[span.start..span.end], b"A"))
+        },
+        none => assert(false),
+    }
+    match columns.next(&mut span)! {
+        some(present) => assert(!present),
+        none => assert(false),
+    }
+    match columns.next(&mut span)! {
+        some(_) => assert(false),
+        none => {},
+    }
+}
+
+fn kind_is(code: &[u8], kind: db.ErrorKind) -> bool {
+    e := protocol.error_for(code)
+    e.kind == kind
+}
+
+@test
+fn base64_round_trip() {
+    data := b"\x00\xffhello"
+    text := [0u8; 12]
+    n := protocol.base64_encode(data, &mut text)
+    assert(same(&text[..n], b"AP9oZWxsbw=="))
+    back := [0u8; 16]
+    m := protocol.base64_decode(&text[..n], &mut back)!
+    assert(same(&back[..m], data))
+    match protocol.base64_decode(b"A===", &mut back) {
+        ok(_) => assert(false),
+        err(e) => assert(e.kind == db.ErrorKind.Protocol),
+    }
+}

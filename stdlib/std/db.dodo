@@ -1,5 +1,6 @@
 package db
 
+import "core/ptr"
 import "std/io"
 
 // Shared vocabulary for database drivers. This package contains no driver
@@ -190,4 +191,187 @@ pub enum IsolationLevel {
     ReadCommitted,
     RepeatableRead,
     Serializable,
+}
+
+// A fixed set of connections that are opened when first needed, reused,
+// checked, and reset between users. The caller owns the connections (each
+// with its own workspace) and lends them to the pool, so nothing is
+// allocated:
+//
+//     conns := [postgres.Connection.new(config.clone(), first_workspace)?,
+//               postgres.Connection.new(config.clone(), second_workspace)?]
+//     pool := db.Pool.new(&mut conns)?
+//     lease := pool.get()?
+//     lease.conn().execute("update counters set n = n + 1", &none_)?
+//     // dropping the lease resets the connection and returns it
+//
+// A connection type C works with the pool when it has these methods (every
+// network driver in std/db provides them):
+//
+//     fn is_open(&self) -> bool
+//     fn open(&mut self) -> void!db.Error       // connect or reconnect
+//     fn ping(&mut self) -> void!db.Error       // one cheap round trip
+//     fn reset(&mut self) -> void!db.Error      // end leftover transactions
+//     fn close(&mut self) -> void!db.Error
+//
+// The pool serves one execution lane: `get` hands out one connection at a
+// time through a borrow, and `acquire`/`conn`/`release` let code (such as a
+// reactor that interleaves requests) hold several connections at once.
+// Returning a connection calls `reset`; a driver may close a connection
+// there rather than wait for it (the next `get` reopens it).
+pub struct Pool<C> {
+    slots: &mut[C]
+    busy: u64
+    ping_on_get: bool
+
+    // Up to 64 connections. They may start closed; each opens on first use.
+    pub fn new(slots: &mut[C]) -> Pool<C>!Error from(slots) {
+        if slots.len == 0 || slots.len > 64 {
+            return err(Error.new(ErrorKind.Misuse, 0))
+        }
+        ok(Pool<C> { slots, busy: 0, ping_on_get: false })
+    }
+
+    // When enabled, an open connection is pinged before it is handed out and
+    // reopened if the ping fails, so a connection the server dropped while
+    // idle is replaced. Costs one round trip per get.
+    pub fn check_on_get(&mut self, enabled: bool) {
+        self.ping_on_get = enabled
+    }
+
+    pub fn len(&self) -> usize {
+        self.slots.len
+    }
+
+    // Connections not currently lent out.
+    pub fn idle(&self) -> usize {
+        count := 0usize
+        for i in 0usize..self.slots.len {
+            if (self.busy & (1u64 << (i as u64))) == 0 {
+                count += 1
+            }
+        }
+        count
+    }
+
+    // Lends one connection until the lease is dropped. Fails with
+    // ErrorKind.Capacity when every connection is lent out, or with the
+    // driver's error when a connection cannot be opened.
+    pub fn get(&mut self) -> Lease<C>!Error from(self) {
+        index := self.checkout()?
+        ok(Lease<C> { pool: self, index })
+    }
+
+    // Like get, but returns a handle that does not borrow the pool; reach
+    // the connection with `conn` and hand it back with `release`. A ticket
+    // that is dropped without release keeps its connection lent out.
+    pub fn acquire(&mut self) -> Ticket!Error {
+        index := self.checkout()?
+        ok(Ticket { index, pool: self.identity() })
+    }
+
+    // The connection of a ticket from this pool. A ticket from another pool
+    // is a programming error and traps.
+    pub fn conn(&mut self, ticket: &Ticket) -> &mut C from(self) {
+        self.check(ticket)
+        &mut self.slots[ticket.index]
+    }
+
+    pub fn release(&mut self, ticket: Ticket) {
+        self.check(&ticket)
+        self.give_back(ticket.index)
+    }
+
+    fn identity(&self) -> usize {
+        unsafe {
+            ptr.as_ptr(self.slots) as usize
+        }
+    }
+
+    fn check(&self, ticket: &Ticket) {
+        assert(ticket.pool == self.identity() && ticket.index < self.slots.len, "ticket belongs to another pool")
+        assert((self.busy & (1u64 << (ticket.index as u64))) != 0, "ticket was already released")
+    }
+
+    // Closes every connection that is not lent out.
+    pub fn close_idle(&mut self) {
+        for i in 0usize..self.slots.len {
+            if (self.busy & (1u64 << (i as u64))) == 0 && self.slots[i].is_open() {
+                match self.slots[i].close() {
+                    ok() => {},
+                    err(_) => {},
+                }
+            }
+        }
+    }
+
+    fn checkout(&mut self) -> usize!Error {
+        // Prefer a connection that is already open.
+        chosen := self.slots.len
+        for i in 0usize..self.slots.len {
+            if (self.busy & (1u64 << (i as u64))) == 0 {
+                if self.slots[i].is_open() {
+                    chosen = i
+                    break
+                }
+                if chosen == self.slots.len {
+                    chosen = i
+                }
+            }
+        }
+        if chosen == self.slots.len {
+            return err(Error.new(ErrorKind.Capacity, 0))
+        }
+        if !self.slots[chosen].is_open() {
+            self.slots[chosen].open()?
+        } else if self.ping_on_get {
+            match self.slots[chosen].ping() {
+                ok() => {},
+                err(_) => {
+                    self.slots[chosen].open()?
+                },
+            }
+        }
+        self.busy = self.busy | (1u64 << (chosen as u64))
+        ok(chosen)
+    }
+
+    fn give_back(&mut self, index: usize) {
+        if self.slots[index].is_open() {
+            match self.slots[index].reset() {
+                ok() => {},
+                err(_) => {
+                    match self.slots[index].close() {
+                        ok() => {},
+                        err(_) => {},
+                    }
+                },
+            }
+        }
+        self.busy = self.busy & ~(1u64 << (index as u64))
+    }
+}
+
+// A connection lent by Pool.get; dropping it returns the connection.
+pub struct Lease<C> {
+    pool: &mut Pool<C>
+    index: usize
+
+    pub fn conn(&mut self) -> &mut C from(self) {
+        &mut self.pool.slots[self.index]
+    }
+
+    fn drop(&mut self) {
+        self.pool.give_back(self.index)
+    }
+}
+
+// A connection lent by Pool.acquire, identified by its pool and slot.
+pub struct Ticket {
+    index: usize
+    pool: usize
+
+    pub fn slot(&self) -> usize {
+        self.index
+    }
 }
