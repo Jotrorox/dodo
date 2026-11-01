@@ -318,6 +318,113 @@ fn analog_inputs() {
     core.assert_eq(input.read()!, 2048u16)
 }
 
+// A driver that polls a device until it is ready, delaying between polls,
+// and gives up at a deadline: generic over a timer that is both a delay
+// and a counter, as boards' timers are.
+fn wait_ready<B: hal.I2c, T: hal.Delay + hal.Counter>(bus: &mut B, timer: &mut T, timeout_us: u64) -> u32!hal.Error {
+    deadline := hal.Deadline.after(timer, timeout_us)
+    polls := 0u32
+    for {
+        polls += 1
+        if hal.read_register(bus, 0x48, 0x00)? != 0 {
+            return ok(polls)
+        }
+        if deadline.passed(timer) {
+            return err(hal.Error.Timeout)
+        }
+        timer.delay_us(1000)
+    }
+}
+
+// An alarm driver: count how many times a periodic alarm fires while the
+// test moves time on.
+fn arm_periodic<A: hal.Alarm>(alarm: &mut A, period_us: u64) -> void!hal.Error {
+    return hal.schedule_in_us(alarm, period_us)
+}
+
+fn counters_and_alarms() {
+    // Counters: the fake delay's time is the delays so far.
+    delay := fake.Delay.new()
+    core.assert_eq(delay.now_us(), 0u64)
+    delay.delay_us(250)
+    core.assert_eq(hal.elapsed_us(&delay, 100), 150u64)
+    core.assert_eq(hal.elapsed_us(&delay, 900), 0u64)
+    hal.wait_until(&delay, 0)
+
+    // A device that never gets ready times out after 5 polls 1 ms apart.
+    sensor := fake.I2c.new(0x48)
+    match wait_ready(&mut sensor, &mut delay, 4000) {
+        ok(_) => core.assert(false),
+        err(error) => core.assert(error == hal.Error.Timeout),
+    }
+    core.assert_eq(delay.now_us(), 4250u64)
+    sensor.set_register(0x00, 1)
+    core.assert_eq(wait_ready(&mut sensor, &mut delay, 4000)!, 1u32)
+
+    // Deadlines.
+    deadline := hal.Deadline.after(&delay, 500)
+    core.assert_eq(deadline.time_us(), 4750u64)
+    core.assert_eq(deadline.remaining_us(&delay), 500u64)
+    core.assert(!deadline.passed(&delay))
+    delay.delay_us(500)
+    core.assert(deadline.passed(&delay))
+    core.assert_eq(deadline.remaining_us(&delay), 0u64)
+    deadline.wait(&delay)
+    fixed := hal.Deadline.at(7)
+    core.assert_eq(fixed.time_us(), 7u64)
+    // A deadline beyond the end of time saturates instead of wrapping.
+    never := hal.Deadline.after(&delay, 0xFFFF_FFFF_FFFF_FFFFu64)
+    core.assert(!never.passed(&delay))
+
+    // Tickers keep their phase and skip ticks they missed entirely.
+    clock := fake.Clock.new()
+    ticker := hal.Ticker.start(&clock, 1000)
+    core.assert_eq(ticker.next_us(), 1000u64)
+    core.assert(!ticker.ready(&clock))
+    clock.advance(1300)
+    core.assert(ticker.ready(&clock))
+    core.assert(!ticker.ready(&clock))
+    core.assert_eq(ticker.next_us(), 2000u64)
+    clock.advance(2900)
+    core.assert(ticker.ready(&clock))
+    core.assert_eq(ticker.next_us(), 5000u64)
+    clock.advance(800)
+    ticker.wait(&clock)
+    core.assert_eq(ticker.next_us(), 6000u64)
+    core.assert_eq(ticker.period_us(), 1000u64)
+
+    // Alarms: a time ahead fires once it is reached.
+    alarm := fake.Alarm.new()
+    arm_periodic(&mut alarm, 100)!
+    core.assert(alarm.is_armed() && !alarm.fired())
+    alarm.advance(99)
+    core.assert(!alarm.fired())
+    alarm.advance(1)
+    core.assert(alarm.fired() && !alarm.is_armed())
+    hal.wait_for_alarm(&mut alarm)
+    core.assert(!alarm.fired())
+    // A time already reached fires at once.
+    alarm.schedule_at_us(50)!
+    core.assert(alarm.fired())
+    // Scheduling clears an earlier firing; cancelling stops the next one.
+    hal.schedule_in_us(&mut alarm, 10)!
+    core.assert(!alarm.fired())
+    alarm.cancel()
+    alarm.advance(20)
+    core.assert(!alarm.fired())
+    core.assert_eq(alarm.target_us(), 110u64)
+    core.assert_eq(alarm.schedules(), 3u32)
+    alarm.fail_next(hal.Error.InvalidInput)
+    expect_error(arm_periodic(&mut alarm, 5), hal.Error.InvalidInput)
+    core.assert_eq(alarm.schedules(), 3u32)
+    // An alarm is a counter too, and both go through `dyn`.
+    core.assert_eq(hal.elapsed_us(&alarm, 20), 100u64)
+    alarms: [1] &mut dyn hal.Alarm = [&mut alarm]
+    alarms[0].schedule_at_us(200)!
+    counter: &dyn hal.Counter = &clock
+    core.assert_eq(counter.now_us(), 5000u64)
+}
+
 fn critical_sections() {
     outer := hal.Critical.enter()
     inner := hal.Critical.enter()
@@ -333,5 +440,6 @@ fn main() {
     serial_ports()
     pwm_outputs()
     analog_inputs()
+    counters_and_alarms()
     critical_sections()
 }
