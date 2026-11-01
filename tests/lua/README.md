@@ -163,8 +163,11 @@ Scripts are grouped by name prefix:
   `__le` falls back to `not __lt`. The corpus records that behaviour.
 - The expected files were generated on macOS. They avoid known libc
   differences such as `%a` rounding and subnormal formatting.
-- `cli_banner` is the only test that prints the version banner
-  (`Lua 5.4.9  Copyright ...`).
+- `cli_banner` is the only test that prints the version banner. Its
+  expected banner line was edited by hand to our own banner
+  (`Lua 5.4.9  (Dodo std/script/lua implementation)`), since this
+  implementation does not claim Lua.org's copyright; re-apply that edit
+  after regenerating it with `expect`, and expect `diff` to report it.
 
 ## The official test suite (`suite`)
 
