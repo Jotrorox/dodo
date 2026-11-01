@@ -384,7 +384,15 @@ fn db_hook(cx: &mut Cx, ar: &mut Debug) -> void!Throw {
 fn db_is_own_hook(L1: &Cx) -> bool {
     // Function values have no `==`: compare their code addresses.
     unsafe {
-        hv := (*L1.L).hook
+        hv: HookFn = db_hook
+        match L1.get_hook() {
+            some(h) => {
+                hv = h
+            },
+            none => {
+                return false
+            },
+        }
         mine: HookFn = db_hook
         let a = *(ptr.from_mut(&mut hv) as *mut usize)
         let b = *(ptr.from_mut(&mut mine) as *mut usize)

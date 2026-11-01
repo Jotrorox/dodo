@@ -47,6 +47,10 @@ fn ud_gc(cx: &mut lua.Cx) -> i32!lua.Throw {
     return ok(0)
 }
 
+fn count_hook(cx: &mut lua.Cx, ar: &mut lua.Debug) -> void!lua.Throw {
+    return ok()
+}
+
 fn int_or0(o: Option<i64>) -> i64 {
     match o {
         some(v) => {
@@ -203,6 +207,32 @@ fn run() -> void!lua.Throw {
     unsafe {
         check(FINALIZED == 1, "finalizer ran")
     }
+
+    // Hooks: get_hook mirrors lua_gethook.
+    check(!cx.has_hook(), "no hook yet")
+    cx.set_hook(count_hook, lua.MASKCALL | lua.MASKCOUNT, 100)
+    match cx.get_hook() {
+        some(h) => {},
+        none => {
+            check(false, "get_hook returns the hook")
+        },
+    }
+    check(cx.get_hook_mask() == (lua.MASKCALL | lua.MASKCOUNT) && cx.get_hook_count() == 100, "hook mask and count")
+    cx.clear_hook()
+    match cx.get_hook() {
+        some(h) => {
+            check(false, "hook removed")
+        },
+        none => {},
+    }
+
+    // get_info pushes the function once, however often 'f' appears.
+    cx.set_top(0)
+    cx.push_native(add)?
+    ar := lua.Debug.new()
+    let good = cx.get_info(">ffS", &mut ar)?
+    check(good && cx.get_top() == 1 && cx.is_function(1), "get_info pushes 'f' once")
+    cx.set_top(0)
 
     // References.
     cx.push_str("referenced")?
