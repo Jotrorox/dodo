@@ -650,6 +650,180 @@ fn srt_sort(s: &mut SortState, lo0: isize, hi0: isize, depth0: i32) -> void!Thro
     return srt_small(s, lo, hi)
 }
 
+// --- Key sort -----------------------------------------------------------------
+//
+// Arrays whose elements all have one tag and are totally ordered by a 64-bit
+// key (integers; floats without NaN, through an order-preserving key) are
+// sorted without the generic comparison: only the `bits` words move, since
+// every tag is the same.
+
+const SRTK_SMALL: isize = 16
+
+fn srtk_get(a: *mut Value, i: isize) -> i64 {
+    unsafe {
+        return u2i((*ptr.offset(a, i)).bits)
+    }
+}
+
+fn srtk_put(a: *mut Value, i: isize, k: i64) {
+    unsafe {
+        (*ptr.offset(a, i)).bits = i2u(k)
+    }
+}
+
+fn srtk_swap(a: *mut Value, i: isize, j: isize) {
+    unsafe {
+        let pi = ptr.offset(a, i)
+        let pj = ptr.offset(a, j)
+        let b = (*pi).bits
+        (*pi).bits = (*pj).bits
+        (*pj).bits = b
+    }
+}
+
+// Map float bits to integers with the same order (negative floats have
+// their magnitude bits flipped); the mapping is its own inverse.
+fn srtk_float_keys(a: *mut Value, n: isize) {
+    for i in 0isize..n {
+        let k = srtk_get(a, i)
+        if k < 0 {
+            srtk_put(a, i, k ^ 9223372036854775807)
+        }
+    }
+}
+
+fn srtk_insertion(a: *mut Value, lo: isize, hi: isize) {
+    for k in (lo + 1)..(hi + 1) {
+        let x = srtk_get(a, k)
+        j := k
+        for j > lo && x < srtk_get(a, j - 1) {
+            srtk_put(a, j, srtk_get(a, j - 1))
+            j -= 1
+        }
+        srtk_put(a, j, x)
+    }
+}
+
+fn srtk_sift(a: *mut Value, lo: isize, root0: isize, size: isize) {
+    root := root0
+    for {
+        child := 2 * root + 1
+        if child >= size {
+            break
+        }
+        if child + 1 < size && srtk_get(a, lo + child) < srtk_get(a, lo + child + 1) {
+            child += 1
+        }
+        if srtk_get(a, lo + root) >= srtk_get(a, lo + child) {
+            break
+        }
+        srtk_swap(a, lo + root, lo + child)
+        root = child
+    }
+}
+
+fn srtk_heapsort(a: *mut Value, lo: isize, hi: isize) {
+    let count = hi - lo + 1
+    start := count / 2
+    for start > 0 {
+        start -= 1
+        srtk_sift(a, lo, start, count)
+    }
+    end := count - 1
+    for end > 0 {
+        srtk_swap(a, lo, lo + end)
+        srtk_sift(a, lo, 0, end)
+        end -= 1
+    }
+}
+
+fn srtk_median3(a: *mut Value, i: isize, j: isize, k: isize) -> i64 {
+    let x = srtk_get(a, i)
+    let y = srtk_get(a, j)
+    let z = srtk_get(a, k)
+    if x < y {
+        if y < z {
+            return y
+        }
+        if x < z {
+            return z
+        }
+        return x
+    }
+    if x < z {
+        return x
+    }
+    if y < z {
+        return z
+    }
+    return y
+}
+
+fn srtk_sort(a: *mut Value, lo0: isize, hi0: isize, depth0: i32) {
+    lo := lo0
+    hi := hi0
+    depth := depth0
+    for hi - lo + 1 > SRTK_SMALL {
+        if depth == 0 {
+            srtk_heapsort(a, lo, hi)
+            return
+        }
+        depth -= 1
+        let count = hi - lo + 1
+        let mid = lo + count / 2
+        pv := srtk_median3(a, lo, mid, hi)
+        if count > SRT_NINTHER {
+            let d = count / 8
+            let m1 = srtk_median3(a, lo, lo + d, lo + 2 * d)
+            let m3 = srtk_median3(a, hi - 2 * d, hi - d, hi)
+            let m2 = srtk_median3(a, mid - d, mid, mid + d)
+            // Median of the three medians.
+            pv = if m1 < m2 {
+                if m2 < m3 {
+                    m2
+                } else if m1 < m3 {
+                    m3
+                } else {
+                    m1
+                }
+            } else if m1 < m3 {
+                m1
+            } else if m2 < m3 {
+                m3
+            } else {
+                m2
+            }
+        }
+        // Hoare partition around the value pv, which occurs in the range,
+        // so both scans stop inside it.
+        i := lo - 1
+        j := hi + 1
+        for {
+            i += 1
+            for srtk_get(a, i) < pv {
+                i += 1
+            }
+            j -= 1
+            for pv < srtk_get(a, j) {
+                j -= 1
+            }
+            if i >= j {
+                break
+            }
+            srtk_swap(a, i, j)
+        }
+        // [lo, j] <= pv <= [j+1, hi]
+        if j - lo < hi - j {
+            srtk_sort(a, lo, j, depth)
+            lo = j + 1
+        } else {
+            srtk_sort(a, j + 1, hi, depth)
+            hi = j
+        }
+    }
+    srtk_insertion(a, lo, hi)
+}
+
 fn tl_sort(cx: &mut Cx) -> i32!Throw {
     unsafe {
         n: i64 = 0
@@ -685,17 +859,34 @@ fn tl_sort(cx: &mut Cx) -> i32!Throw {
             }
             gc_barrier_back(L, work, dst)
         }
+        // Depth limit 2 * floor(log2 n) before falling back to heapsort.
+        depth := 0i32
+        m := n
+        for m > 1 {
+            depth += 2
+            m = m / 2
+        }
         mode := SRT_FN
         if cx.is_nil(2) {
             nums := true
             strs := true
+            ints := true
+            floats := true
             for i in 0i64..n {
-                let t = (*ptr.offset(a, i as isize)).tag & 15
+                let e = ptr.offset(a, i as isize)
+                let tag = (*e).tag
+                let t = tag & 15
                 if t != TYPE_NUMBER {
                     nums = false
                 }
                 if t != TYPE_STRING {
                     strs = false
+                }
+                if tag != TAG_INT {
+                    ints = false
+                }
+                if tag != TAG_FLOAT || val_float(e) != val_float(e) {
+                    floats = false
                 }
             }
             mode = if nums {
@@ -705,17 +896,21 @@ fn tl_sort(cx: &mut Cx) -> i32!Throw {
             } else {
                 SRT_LT
             }
+            if ints {
+                srtk_sort(a, 0, (n - 1) as isize, depth)
+                mode = -1
+            } else if floats {
+                srtk_float_keys(a, n as isize)
+                srtk_sort(a, 0, (n - 1) as isize, depth)
+                srtk_float_keys(a, n as isize)
+                mode = -1
+            }
         }
-        s := SortState { L: L, a: a, tmp: ptr.offset(a, n as isize), mode: mode, res: false }
-        // Depth limit 2 * floor(log2 n) before falling back to heapsort.
-        depth := 0i32
-        m := n
-        for m > 1 {
-            depth += 2
-            m = m / 2
+        if mode >= 0 {
+            s := SortState { L: L, a: a, tmp: ptr.offset(a, n as isize), mode: mode, res: false }
+            srt_sort(&mut s, 0, (n - 1) as isize, depth)?
+            set_nil(s.tmp)
         }
-        srt_sort(&mut s, 0, (n - 1) as isize, depth)?
-        set_nil(s.tmp)
         // Store the ordered elements back.
         for i in 0i64..n {
             L_push_value(L, ptr.offset(a, i as isize))
