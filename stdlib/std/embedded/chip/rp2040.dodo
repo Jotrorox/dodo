@@ -10,23 +10,25 @@ import "std/embedded/chip/rp_pio"
 import "std/embedded/chip/rp_pwm"
 import "std/embedded/chip/rp_rtc"
 import "std/embedded/chip/rp_usb"
+import "std/embedded/chip/rp_watchdog"
 import "std/embedded/peripheral/designware_i2c"
 import "std/embedded/peripheral/pl011"
 import "std/embedded/peripheral/pl022"
 import "std/embedded/chip/rp_pins"
 
 // Raspberry Pi RP2040 chip support: clocks, resets, GPIO, I2C, SPI, UART,
-// PWM, the ADC, PIO, the microsecond timer, the real-time clock, a USB
-// serial port, the second core, the FIFOs and spinlocks the cores share, and
-// the boot ROM.
+// PWM, the ADC, PIO, the microsecond timer, the real-time clock, the
+// watchdog, a USB serial port, the second core, the FIFOs and spinlocks the
+// cores share, and the boot ROM.
 // `take(config)` brings the chip from its boot state (ring oscillator,
 // peripherals held in reset) to a known configuration and hands out the
 // peripherals once. Pins implement the std/embedded/hal output and input pin
 // protocols, I2C and SPI buses claimed from `Pins` implement the bus
 // protocols, serial ports the std/io Reader and Writer protocols, PWM
 // outputs and ADC inputs the PWM output and analog input protocols, the
-// timer the delay protocol, and the real-time clock the clock and alarm
-// protocols, so portable drivers use them unchanged.
+// timer the delay protocol, the real-time clock the clock and alarm
+// protocols, and the watchdog the watchdog protocol, so portable drivers use
+// them unchanged.
 //
 // Applications normally use a board package instead, which supplies the
 // board's Config and wiring: `import "std/embedded/board"` with
@@ -34,9 +36,10 @@ import "std/embedded/chip/rp_pins"
 // with `chip = "rp2040"`.
 //
 // Clocks after take(): clk_ref = the crystal, clk_sys = 125 MHz from PLL_SYS,
-// clk_peri = clk_sys, a 1 MHz timer tick, and clk_rtc = 31.25 kHz from the
-// crystal, which the RTC divides down to seconds. clk_adc and clk_usb run at
-// 48 MHz from PLL_USB while an ADC input or the USB serial port is claimed.
+// clk_peri = clk_sys, a 1 MHz tick for the timer and the watchdog, and
+// clk_rtc = 31.25 kHz from the crystal, which the RTC divides down to
+// seconds. clk_adc and clk_usb run at 48 MHz from PLL_USB while an ADC input
+// or the USB serial port is claimed.
 // Section numbers below refer to the RP2040 datasheet.
 
 // clk_sys, the processor and peripheral clock, after take().
@@ -132,8 +135,10 @@ const DIVIDE_BY_ONE: u32 = 0x100
 const RTC_BASE: usize = 0x4005_C000
 const RTC_CLOCK_HZ: u32 = 31_250
 
-// The watchdog block generates the timer's 1 MHz tick from clk_ref (4.7).
-const WATCHDOG_TICK: usize = 0x4005_8000 + 0x2C
+// The watchdog (4.7), which also generates the timer's 1 MHz tick from
+// clk_ref.
+const WATCHDOG_BASE: usize = 0x4005_8000
+const WATCHDOG_TICK: usize = WATCHDOG_BASE + 0x2C
 const TICK_ENABLE: u32 = 1 << 9
 
 // Microsecond timer (4.6). The raw registers read without latching.
@@ -266,8 +271,11 @@ pub fn reboot_to_bootloader(activity_led: u32) {
         mask = 1u32 << activity_led
     }
     // SAFETY: the ROM routine takes over the chip and never returns, so no
-    // peripheral owned by this program is used afterwards.
+    // peripheral owned by this program is used afterwards. Clearing the
+    // watchdog's mark makes its resets, into the bootloader and after
+    // flashing, read as Other rather than as the program's.
     unsafe {
+        rp_watchdog.clear_mark(WATCHDOG_BASE)
         dodo_rp2040_reset_usb_boot(mask, 0)
     }
     for {}
@@ -308,6 +316,8 @@ pub struct Peripherals {
     pub timer: Timer
     // The real-time clock: the time of day, counted in seconds.
     pub rtc: Rtc
+    // The watchdog, stopped; rp_watchdog documents it.
+    pub watchdog: rp_watchdog.Watchdog
     pub usb: Usb
     // The DMA controller's channels; rp_dma documents them.
     pub dma: rp_dma.Dma
@@ -363,6 +373,11 @@ pub fn take(config: Config) -> Peripherals!hal.Error {
     bank := unsafe {
         rp_pins.Bank.new(Chip { crystal_hz: crystal })
     }
+    // SAFETY: TAKEN guarantees one Watchdog, and the watchdog tick runs.
+    // Core 1 uses only the power-on state machine's FRCE_OFF register.
+    watchdog := unsafe {
+        rp_watchdog.Watchdog.at(rp_watchdog.RP2040, WATCHDOG_BASE, PSM_BASE)
+    }
     usb := Usb { crystal_hz: crystal, open: false }
     // SAFETY: TAKEN guarantees one Dma, and the controller was just taken
     // out of reset.
@@ -382,7 +397,7 @@ pub fn take(config: Config) -> Peripherals!hal.Error {
         })
     }
     let rp_multicore.Cores { core1, fifos, spinlocks } = cores
-    return ok(Peripherals { pins: Pins { bank }, timer, rtc: Rtc { calendar }, usb, dma, core1, fifos, spinlocks })
+    return ok(Peripherals { pins: Pins { bank }, timer, rtc: Rtc { calendar }, watchdog, usb, dma, core1, fifos, spinlocks })
 }
 
 // SAFETY: the caller owns `address`, a 32-bit RP2040 register.
@@ -496,7 +511,7 @@ unsafe fn start_clocks(crystal_hz: u32) -> void!hal.Error {
         peri.write(0)
         peri.write(CLK_ENABLE)
 
-        // 1 MHz tick for the timer, derived from clk_ref.
+        // 1 MHz tick for the timer and the watchdog, derived from clk_ref.
         tick := reg(WATCHDOG_TICK)
         tick.write(TICK_ENABLE | crystal_hz / 1_000_000)
 

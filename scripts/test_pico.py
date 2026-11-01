@@ -98,6 +98,7 @@ LAST_CHECKS = [
     "core 1 starts, reports its number, and answers over the FIFO; a small stack and a third FIFO end are refused",
     "spinlocks are claimed once and exclude; both cores count 10000 each under one",
     "core 1's executor wakes on the FIFO interrupt; core 1 finishes, stops, and starts again",
+    "watchdog refuses bad timeouts, counts 1 us per us, reloads when fed, holds when stopped; scratch 0 is the record's",
     "real-time clock is set and reads back the time it was given",
     "real-time clock keeps pace with the timer for 1.5 s",
     "real-time clock alarm fires on time and pends its interrupt until cleared",

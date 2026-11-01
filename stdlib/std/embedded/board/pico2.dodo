@@ -5,6 +5,7 @@ import "std/embedded/chip/rp2350"
 import "std/embedded/chip/rp_dma"
 import "std/embedded/chip/rp_multicore"
 import "std/embedded/chip/rp_usb"
+import "std/embedded/chip/rp_watchdog"
 
 // Raspberry Pi Pico 2: an RP2350A with a 12 MHz crystal, 4 MiB of flash, and
 // a green user LED on GP25. Build with `board = "pico2"` and import this
@@ -57,6 +58,10 @@ pub struct Board {
     // The real-time clock, with the hal Rtc and RtcAlarm protocols: the
     // time of day in milliseconds, which keeps counting through resets.
     pub rtc: rp2350.Rtc
+    // The watchdog, stopped until `start(timeout_ms)`: it then resets the
+    // board unless `feed()` is called in time; see
+    // std/embedded/chip/rp_watchdog.
+    pub watchdog: rp_watchdog.Watchdog
     // The USB port: `serial()` makes the board a USB serial port, for
     // printing over the USB cable.
     pub usb: Usb
@@ -75,8 +80,8 @@ pub struct Board {
 pub fn take() -> Board!hal.Error {
     chip := rp2350.take(rp2350.Config { crystal_hz: CRYSTAL_HZ })?
     led := chip.pins.output(LED_PIN)?
-    let rp2350.Peripherals { pins, timer, rtc, usb, dma, core1, fifos, spinlocks } = chip
-    return ok(Board { led, pins, timer, rtc, usb: Usb { usb }, dma, core1, fifos, spinlocks })
+    let rp2350.Peripherals { pins, timer, rtc, watchdog, usb, dma, core1, fifos, spinlocks } = chip
+    return ok(Board { led, pins, timer, rtc, watchdog, usb: Usb { usb }, dma, core1, fifos, spinlocks })
 }
 
 // The USB port, as `b.usb`.

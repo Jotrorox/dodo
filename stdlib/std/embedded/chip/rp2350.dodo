@@ -10,6 +10,7 @@ import "std/embedded/chip/rp_pio"
 import "std/embedded/chip/rp_pwm"
 import "std/embedded/chip/rp_rtc"
 import "std/embedded/chip/rp_usb"
+import "std/embedded/chip/rp_watchdog"
 import "std/embedded/peripheral/designware_i2c"
 import "std/embedded/peripheral/pl011"
 import "std/embedded/peripheral/pl022"
@@ -17,15 +18,17 @@ import "std/embedded/chip/rp_pins"
 
 // Raspberry Pi RP2350 chip support for the Arm cores: clocks, resets, GPIO,
 // I2C, SPI, UART, PWM, the ADC, PIO, the microsecond timer, the always-on
-// timer as a real-time clock, a USB serial port, the second core, the FIFOs and spinlocks the cores share, and the
-// boot ROM. `take(config)` brings the chip from its boot state (ring
+// timer as a real-time clock, the watchdog, a USB serial port, the second
+// core, the FIFOs and spinlocks the cores share, and the boot ROM.
+// `take(config)` brings the chip from its boot state (ring
 // oscillator, peripherals held in reset) to a known configuration and hands
 // out the peripherals once. Pins implement the std/embedded/hal output and
 // input pin protocols, I2C and SPI buses claimed from `Pins` implement the
 // bus protocols, serial ports the std/io Reader and Writer protocols, PWM
 // outputs and ADC inputs the PWM output and analog input protocols, the
-// timer the delay protocol, and the real-time clock the clock and alarm
-// protocols, so portable drivers use them unchanged.
+// timer the delay protocol, the real-time clock the clock and alarm
+// protocols, and the watchdog the watchdog protocol, so portable drivers use
+// them unchanged.
 //
 // Applications normally use a board package instead, which supplies the
 // board's Config and wiring: `import "std/embedded/board"` with
@@ -133,6 +136,9 @@ const TICKS_BASE: usize = 0x4010_8000
 const TICK_TIMER0: usize = TICKS_BASE + 0x18
 const TICK_WATCHDOG: usize = TICKS_BASE + 0x30
 const TICK_ENABLE: u32 = 1 << 0
+
+// The watchdog (12.9).
+const WATCHDOG_BASE: usize = 0x400D_8000
 
 // Microsecond timer TIMER0 (12.8). The raw registers read without latching.
 const TIMER0_BASE: usize = 0x400B_0000
@@ -317,7 +323,10 @@ pub fn reboot_to_bootloader(activity_led: u32) {
     }
     // SAFETY: on success the ROM resets the chip after 10 ms and never
     // returns, so no peripheral owned by this program is used afterwards.
+    // Clearing the watchdog's mark makes that reset, and the one after
+    // flashing, read as Other rather than as the program's.
     unsafe {
+        rp_watchdog.clear_mark(WATCHDOG_BASE)
         dodo_rp2350_rom_call(ROM_REBOOT, REBOOT_TYPE_BOOTSEL | REBOOT_NO_RETURN_ON_SUCCESS, 10, flags, pin)
     }
     for {}
@@ -359,6 +368,8 @@ pub struct Peripherals {
     // The always-on timer as a real-time clock: the time of day, counted in
     // milliseconds, which survives resets.
     pub rtc: Rtc
+    // The watchdog, stopped; rp_watchdog documents it.
+    pub watchdog: rp_watchdog.Watchdog
     pub usb: Usb
     // The DMA controller's channels; rp_dma documents them.
     pub dma: rp_dma.Dma
@@ -414,6 +425,11 @@ pub fn take(config: Config) -> Peripherals!hal.Error {
     bank := unsafe {
         rp_pins.Bank.new(Chip { crystal_hz: crystal })
     }
+    // SAFETY: TAKEN guarantees one Watchdog, and the watchdog tick runs.
+    // Core 1 uses only the power-on state machine's FRCE_OFF register.
+    watchdog := unsafe {
+        rp_watchdog.Watchdog.at(rp_watchdog.RP2350, WATCHDOG_BASE, PSM_BASE)
+    }
     usb := Usb { crystal_hz: crystal, open: false }
     // SAFETY: TAKEN guarantees one Dma, and the controller was just taken
     // out of reset.
@@ -433,7 +449,7 @@ pub fn take(config: Config) -> Peripherals!hal.Error {
         })
     }
     let rp_multicore.Cores { core1, fifos, spinlocks } = cores
-    return ok(Peripherals { pins: Pins { bank }, timer, rtc: Rtc { aon }, usb, dma, core1, fifos, spinlocks })
+    return ok(Peripherals { pins: Pins { bank }, timer, rtc: Rtc { aon }, watchdog, usb, dma, core1, fifos, spinlocks })
 }
 
 // SAFETY: the caller owns `address`, a 32-bit RP2350 register.

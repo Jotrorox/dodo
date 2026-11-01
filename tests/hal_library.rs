@@ -158,6 +158,25 @@ fn real_time_clocks_execute_against_fakes_and_simulated_registers() {
 }
 
 #[test]
+fn watchdog_executes_against_a_simulated_watchdog() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let scratch = Scratch::new("watchdog");
+    let source = root.join("tests/stdlib/watchdog_checks.dodo");
+    for optimization in ["0", "3"] {
+        let executable = scratch.0.join(format!(
+            "watchdog-O{optimization}{}",
+            std::env::consts::EXE_SUFFIX
+        ));
+        let args = ["build", source.to_str().unwrap(), "-O", optimization, "-o"];
+        success(&dodo(&args, &executable), "compile watchdog fixture");
+        success(
+            &Command::new(&executable).output().unwrap(),
+            "execute watchdog fixture",
+        );
+    }
+}
+
+#[test]
 fn dma_channels_and_sessions_execute_against_simulated_controllers() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let scratch = Scratch::new("dma");
