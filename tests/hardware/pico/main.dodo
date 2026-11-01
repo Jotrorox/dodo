@@ -1450,6 +1450,82 @@ fn watchdog_checks(watchdog: &mut rp_watchdog.Watchdog, timer: &mut chip.Timer) 
     check(zero && too_long && started && counted && fed && paused && mapped && watchdog.is_running())
 }
 
+// The time a clock read reports, or 0 if it failed.
+fn time_or_zero(result: u64!hal.Error) -> u64 {
+    match result {
+        ok(value) => {
+            return value
+        }
+        err(_) => {
+            return 0
+        }
+    }
+}
+
+// The real-time clock: set, keeping pace with the timer, and its alarm,
+// whose interrupt stays disabled at the NVIC, so it only pends.
+// The self-test's 3 s watchdog is fed before each wait.
+fn rtc_checks(rtc: &mut chip.Rtc, watchdog: &mut rp_watchdog.Watchdog, timer: &mut chip.Timer) {
+    watchdog.feed()
+    step := rtc.resolution_ms() as u64
+    // 2026-11-01 12:34:56.789 UTC.
+    start := 1_793_536_496_789u64
+    given := match rtc.set_ms(start) {
+        ok() => true,
+        err(_) => false,
+    }
+    set := match rtc.is_set() {
+        ok(value) => value,
+        err(_) => false,
+    }
+    first := time_or_zero(rtc.now_ms())
+    rounded := start - start % step
+    check(given && set && first >= rounded && first <= rounded + step)
+
+    watchdog.feed()
+    before := time_or_zero(rtc.now_ms())
+    timer.delay_ms(1500)
+    after := time_or_zero(rtc.now_ms())
+    check(after >= before && after - before + step >= 1500 && after - before <= 1500 + step)
+
+    irq := rtc.irq()
+    cortex_m.disable(irq)
+    rtc.listen()
+    cortex_m.unpend(irq)
+    armed := match hal.rtc_alarm_in(rtc, 1500) {
+        ok() => true,
+        err(_) => false,
+    }
+    watchdog.feed()
+    begin := timer.now_us()
+    fired := false
+    for !fired && timer.now_us() - begin < 2_500_000 {
+        fired = match rtc.alarm_fired() {
+            ok(value) => value,
+            err(_) => false,
+        }
+    }
+    took := timer.now_us() - begin
+    pending := cortex_m.is_pending(irq)
+    cleared := match rtc.clear_alarm() {
+        ok() => true,
+        err(_) => false,
+    }
+    cortex_m.unpend(irq)
+    still := cortex_m.is_pending(irq)
+    rtc.ignore()
+    quiet := match rtc.alarm_fired() {
+        ok(value) => !value,
+        err(_) => false,
+    }
+    // A clock that counts seconds fires at the second after next.
+    on_time := took >= 1_490_000 && took < 1_520_000
+    if step == 1000 {
+        on_time = took >= 990_000 && took < 2_100_000
+    }
+    check(armed && fired && on_time && pending && cleared && !still && quiet)
+}
+
 fn main() {
     // A previous run hung and the watchdog reset the chip: report it.
     unsafe {
@@ -1588,6 +1664,7 @@ fn main() {
     core1_checks(&mut b.core1, &mut b.fifos, &mut b.spinlocks, &mut b.timer)
     power_checks(&mut b.power, &mut b.usb, &mut b.pins, &mut b.timer)
     watchdog_checks(&mut b.watchdog, &mut b.timer)
+    rtc_checks(&mut b.rtc, &mut b.watchdog, &mut b.timer)
     flash_checks(&mut b.flash, &mut b.core1, &mut b.timer)
 
     // Configuration is validated before ownership: an unusable crystal is

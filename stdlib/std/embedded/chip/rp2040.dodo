@@ -11,6 +11,7 @@ import "std/embedded/chip/rp_multicore"
 import "std/embedded/chip/rp_pio"
 import "std/embedded/chip/rp_power"
 import "std/embedded/chip/rp_pwm"
+import "std/embedded/chip/rp_rtc"
 import "std/embedded/chip/rp_usb"
 import "std/embedded/chip/rp_watchdog"
 import "std/embedded/peripheral/designware_i2c"
@@ -19,17 +20,18 @@ import "std/embedded/peripheral/pl022"
 import "std/embedded/chip/rp_pins"
 
 // Raspberry Pi RP2040 chip support: clocks, resets, GPIO, I2C, SPI, UART,
-// PWM, the ADC, PIO, the microsecond timer, the watchdog, a USB serial port,
-// the second core, the FIFOs and spinlocks the cores share, low power, and
-// the boot ROM.
+// PWM, the ADC, PIO, the microsecond timer, the real-time clock, the
+// watchdog, a USB serial port, the second core, the FIFOs and spinlocks the
+// cores share, low power, and the boot ROM.
 // `take(config)` brings the chip from its boot state (ring oscillator,
 // peripherals held in reset) to a known configuration and hands out the
 // peripherals once. Pins implement the std/embedded/hal output and input pin
 // protocols, I2C and SPI buses claimed from `Pins` implement the bus
 // protocols, serial ports the std/io Reader and Writer protocols, PWM
 // outputs and ADC inputs the PWM output and analog input protocols, the
-// timer the delay protocol, and the watchdog the watchdog protocol, so
-// portable drivers use them unchanged.
+// timer the delay protocol, the real-time clock the clock and alarm
+// protocols, and the watchdog the watchdog protocol, so portable drivers use
+// them unchanged.
 //
 // Applications normally use a board package instead, which supplies the
 // board's Config and wiring: `import "std/embedded/board"` with
@@ -37,9 +39,10 @@ import "std/embedded/chip/rp_pins"
 // with `chip = "rp2040"`.
 //
 // Clocks after take(): clk_ref = the crystal, clk_sys = 125 MHz from PLL_SYS,
-// clk_peri = clk_sys, and a 1 MHz tick for the timer and the watchdog.
-// clk_adc and clk_usb run at 48 MHz from PLL_USB while an ADC input or the
-// USB serial port is claimed.
+// clk_peri = clk_sys, a 1 MHz tick for the timer and the watchdog, and
+// clk_rtc = 31.25 kHz from the crystal, which the RTC divides down to
+// seconds. clk_adc and clk_usb run at 48 MHz from PLL_USB while an ADC input
+// or the USB serial port is claimed.
 // Section numbers below refer to the RP2040 datasheet.
 
 // clk_sys, the processor and peripheral clock, after take().
@@ -122,6 +125,10 @@ const CLK_USB_DIV: usize = CLOCKS_BASE + 0x58
 const CLK_ADC_CTRL: usize = CLOCKS_BASE + 0x60
 const CLK_ADC_DIV: usize = CLOCKS_BASE + 0x64
 const CLK_SYS_RESUS_CTRL: usize = CLOCKS_BASE + 0x78
+const CLK_RTC_CTRL: usize = CLOCKS_BASE + 0x6C
+const CLK_RTC_DIV: usize = CLOCKS_BASE + 0x70
+// clk_rtc's auxiliary source: the crystal.
+const CLK_RTC_AUXSRC_XOSC: u32 = 3 << 5
 const CLK_REF_SRC: u32 = 0b11
 const CLK_REF_SRC_XOSC: u32 = 2
 const CLK_SYS_SRC_AUX: u32 = 1
@@ -130,6 +137,10 @@ const CLK_ENABLE: u32 = 1 << 11
 // Divisors are 24.8 fixed point; 0x100 divides by one.
 const DIVIDE_BY_ONE: u32 = 0x100
 
+// Real-time clock (4.8), counting seconds from clk_rtc. The crystal, a
+// whole number of megahertz, divides down to this exactly.
+const RTC_BASE: usize = 0x4005_C000
+const RTC_CLOCK_HZ: u32 = 31_250
 // Clock gating (2.15.3.5): WAKE_EN0/1 and SLEEP_EN0/1.
 const CLOCKS_WAKE_EN: usize = 0xA0
 const CLOCKS_SLEEP_EN: usize = 0xA8
@@ -362,6 +373,8 @@ pub struct Config {
 pub struct Peripherals {
     pub pins: Pins
     pub timer: Timer
+    // The real-time clock: the time of day, counted in seconds.
+    pub rtc: Rtc
     // The watchdog, stopped; rp_watchdog documents it.
     pub watchdog: rp_watchdog.Watchdog
     pub usb: Usb
@@ -406,7 +419,12 @@ pub fn take(config: Config) -> Peripherals!hal.Error {
     // user of the clock, reset, PLL, and watchdog tick registers.
     unsafe {
         start_clocks(crystal)?
-        reset_blocks(RESET_IO_BANK0 | RESET_PADS_BANK0 | RESET_TIMER | RESET_DMA)?
+        reset_blocks(RESET_IO_BANK0 | RESET_PADS_BANK0 | RESET_TIMER | RESET_DMA | RESET_RTC)?
+    }
+    // SAFETY: TAKEN guarantees one Rtc, and the RTC was just taken out of
+    // reset with clk_rtc running.
+    calendar := unsafe {
+        rp_rtc.Calendar.new(hal.RegisterBlock.at(RTC_BASE), RTC_CLOCK_HZ)?
     }
     // SAFETY: the timer was just taken out of reset; Timer only reads its
     // free-running counter registers.
@@ -448,7 +466,7 @@ pub fn take(config: Config) -> Peripherals!hal.Error {
         rp_flash.Flash.take()
     }
     power := Power { crystal_hz: crystal }
-    return ok(Peripherals { pins: Pins { bank }, timer, watchdog, usb, dma, core1, fifos, spinlocks, power, flash })
+    return ok(Peripherals { pins: Pins { bank }, timer, rtc: Rtc { calendar }, watchdog, usb, dma, core1, fifos, spinlocks, power, flash })
 }
 
 // SAFETY: the caller owns `address`, a 32-bit RP2040 register.
@@ -568,6 +586,19 @@ unsafe fn start_clocks(crystal_hz: u32) -> void!hal.Error {
         // 1 MHz tick for the timer and the watchdog, derived from clk_ref.
         tick := reg(WATCHDOG_TICK)
         tick.write(TICK_ENABLE | crystal_hz / 1_000_000)
+
+        // clk_rtc from the crystal. The generator stops cleanly within
+        // three of its cycles, 12_000 of clk_sys, before its source may
+        // change.
+        rtc_ctrl := reg(CLK_RTC_CTRL)
+        rtc_ctrl.write(0)
+        for _ in 0..4000 {
+            rtc_ctrl.read()
+        }
+        rtc_div := reg(CLK_RTC_DIV)
+        rtc_div.write((crystal_hz / RTC_CLOCK_HZ) << 8)
+        rtc_ctrl.write(CLK_RTC_AUXSRC_XOSC)
+        rtc_ctrl.write(CLK_RTC_AUXSRC_XOSC | CLK_ENABLE)
         return ok()
     }
 }
@@ -1132,6 +1163,71 @@ pub struct Pin {
     // The interrupt pin events raise, IO_IRQ_BANK0, for cortex_m.enable.
     pub fn irq(&self) -> u32 {
         return IO_IRQ_BANK0
+    }
+}
+
+// The real-time clock: a calendar that counts whole seconds from clk_rtc,
+// with an alarm. Implements the std/embedded/hal Rtc and RtcAlarm
+// protocols, so `hal.rtc_now(&mut b.rtc)` reads it as a date and time. It
+// starts unset at every take(), as a reset stops it, and keeps time while
+// the processor sleeps: in deep sleep only with CLOCK_RTC in the power
+// layer's sleep set, and not while the chip is dormant, which stops the
+// crystal. std/embedded/chip/rp_rtc describes its limits. The
+// alarm raises RTC_IRQ while `listen`ing, during the alarm's second, and
+// its handler calls `clear_alarm`.
+pub struct Rtc: hal.Rtc + hal.RtcAlarm {
+    calendar: rp_rtc.Calendar<hal.RegisterBlock>
+
+    pub fn is_set(&mut self) -> bool!hal.Error {
+        return self.calendar.is_set()
+    }
+
+    pub fn now_ms(&mut self) -> u64!hal.Error {
+        return self.calendar.now_ms()
+    }
+
+    // InvalidInput past the year 4095.
+    pub fn set_ms(&mut self, time_ms: u64) -> void!hal.Error {
+        return self.calendar.set_ms(time_ms)
+    }
+
+    // 1000: the RTC counts seconds.
+    pub fn resolution_ms(&self) -> u32 {
+        return self.calendar.resolution_ms()
+    }
+
+    // Fire at the first whole second at or after `time_ms`.
+    pub fn set_alarm_ms(&mut self, time_ms: u64) -> void!hal.Error {
+        return self.calendar.set_alarm_ms(time_ms)
+    }
+
+    pub fn alarm_fired(&mut self) -> bool!hal.Error {
+        return self.calendar.alarm_fired()
+    }
+
+    pub fn clear_alarm(&mut self) -> void!hal.Error {
+        return self.calendar.clear_alarm()
+    }
+
+    // The alarm's interrupt: its number for cortex_m.enable, and its vector
+    // name, RTC_IRQ, for `@interrupt`.
+    pub fn irq(&self) -> u32 {
+        return RTC_IRQ
+    }
+
+    // Raise RTC_IRQ when the alarm fires. Enable it in the NVIC too:
+    // `cortex_m.enable(rtc.irq())`.
+    pub fn listen(&mut self) {
+        self.calendar.listen()
+    }
+
+    // Stop raising the interrupt; alarm_fired still reports.
+    pub fn ignore(&mut self) {
+        self.calendar.ignore()
+    }
+
+    pub fn is_listening(&mut self) -> bool {
+        return self.calendar.is_listening()
     }
 }
 

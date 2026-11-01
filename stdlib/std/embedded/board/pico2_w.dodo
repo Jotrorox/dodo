@@ -68,6 +68,9 @@ pub struct Board {
     pub pins: rp2350.Pins
     // The 1 MHz system timer: delay_us, delay_ms, and now_us.
     pub timer: rp2350.Timer
+    // The real-time clock, with the hal Rtc and RtcAlarm protocols: the
+    // time of day in milliseconds, which keeps counting through resets.
+    pub rtc: rp2350.Rtc
     // The watchdog, stopped until `start(timeout_ms)`: it then resets the
     // board unless `feed()` is called in time; see
     // std/embedded/chip/rp_watchdog.
@@ -106,8 +109,8 @@ pub fn take() -> Board!hal.Error {
     wireless.init(&mut chip.timer)?
     led := Led { wireless, on: false }
     led.set_low()
-    let rp2350.Peripherals { pins, timer, watchdog, usb, dma, core1, fifos, spinlocks, power, flash } = chip
-    return ok(Board { led, pins, timer, watchdog, usb: Usb { usb }, dma, core1, fifos, spinlocks, power, flash })
+    let rp2350.Peripherals { pins, timer, rtc, watchdog, usb, dma, core1, fifos, spinlocks, power, flash } = chip
+    return ok(Board { led, pins, timer, rtc, watchdog, usb: Usb { usb }, dma, core1, fifos, spinlocks, power, flash })
 }
 
 // The LED on the wireless chip's GPIO 0. Implements the std/embedded/hal
