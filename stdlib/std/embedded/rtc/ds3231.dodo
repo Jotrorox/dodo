@@ -23,8 +23,9 @@ import "std/time"
 // chip's alarm 1, which matches the day of the month and the time, so it
 // reaches 28 days ahead at most. While it is armed, the chip's INT/SQW pin,
 // an open-drain output, pulls low when it fires, until clear_alarm; wire it
-// to a GPIO with a pull-up to wake on it. Setting the time past an armed
-// alarm makes alarm_fired true, but does not pull the pin.
+// to a GPIO with a pull-up to wake on it. An alarm for a time already
+// reached, or a time set past an armed alarm, makes alarm_fired true but does
+// not pull the pin.
 
 // The chip's I2C address.
 pub const ADDRESS: u8 = 0x68
@@ -157,27 +158,31 @@ pub struct Clock<B: hal.I2c>: hal.Rtc + hal.RtcAlarm {
     }
 
     // Fire at the first whole second at or after `time_ms`, at most 28
-    // days ahead.
+    // days ahead; a time already reached fires at once.
     pub fn set_alarm_ms(&mut self, time_ms: u64) -> void!hal.Error {
         now := self.now_seconds()?
         target := time_ms / 1000
         if time_ms % 1000 != 0 {
             target += 1
         }
-        if target <= now || target - now > ALARM_REACH_SECONDS {
+        if target > now && target - now > ALARM_REACH_SECONDS {
             return err(hal.Error.InvalidInput)
         }
-        let Calendar { date, year, of_day } = calendar_of(target)?
         control := self.read_register(CONTROL)?
         self.write_register(CONTROL, control & ~ALARM_1_INTERRUPT)?
-        // Every field's mask bit clear: match the day of the month, hours,
-        // minutes, and seconds.
-        command: [5]u8 = [ALARM_1, to_bcd(of_day % 60), to_bcd(of_day / 60 % 60), to_bcd(of_day / 3600), to_bcd(date.day())]
-        self.bus.write(ADDRESS, &command)?
         status := self.read_register(STATUS)?
         self.write_register(STATUS, status & ~ALARM_1_FLAG)?
         self.alarm = target
         self.armed = true
+        if target <= now {
+            // The chip would match this date and time only next month.
+            return ok()
+        }
+        let Calendar { date, year, of_day } = calendar_of(target)?
+        // Every field's mask bit clear: match the day of the month, hours,
+        // minutes, and seconds.
+        command: [5]u8 = [ALARM_1, to_bcd(of_day % 60), to_bcd(of_day / 60 % 60), to_bcd(of_day / 3600), to_bcd(date.day())]
+        self.bus.write(ADDRESS, &command)?
         return self.write_register(CONTROL, control | ALARM_1_INTERRUPT | INTERRUPT_CONTROL)
     }
 

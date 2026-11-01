@@ -122,8 +122,12 @@ fn fake_clocks() {
 
     // Alarms: not in the past, fire at their time, and stay fired.
     noon := unix_ms(2026, 11, 1, 12, 0, 0)
-    expect_error(clock.set_alarm_ms(noon + 1_500), hal.Error.InvalidInput)
-    expect_error(hal.rtc_alarm_in(&mut clock, 0), hal.Error.InvalidInput)
+    // A time already reached fires at once, as for a counter's alarm.
+    clock.set_alarm_ms(noon + 1_500)!
+    core.assert(clock.alarm_fired()!)
+    hal.rtc_alarm_in(&mut clock, 0)!
+    core.assert(clock.alarm_fired()!)
+    clock.clear_alarm()!
     hal.rtc_alarm_in(&mut clock, 250)!
     core.assert(clock.is_armed() && clock.alarm_ms() == noon + 1_750)
     clock.advance(249)
@@ -163,8 +167,10 @@ fn fake_clocks() {
     seconds.set_ms(noon + 999)!
     core.assert_eq(seconds.now_ms()!, noon)
     hal.rtc_alarm_in(&mut seconds, 10)!
-    core.assert(seconds.is_armed() && seconds.alarm_ms() == noon + 1000)
-    expect_error(seconds.set_alarm_ms(noon), hal.Error.InvalidInput)
+    core.assert(seconds.is_armed() && seconds.alarm_ms() == noon + 10)
+    core.assert(!seconds.alarm_fired()!)
+    seconds.advance(1000)
+    core.assert(seconds.alarm_fired()!)
     seconds.clear_alarm()!
 
 }
@@ -404,7 +410,11 @@ fn calendar_rtc() {
     // The alarm fires at the first whole second at or after its time, its
     // interrupt is raised for that second, and it stays fired.
     now_ms := rtc.now_ms()!
-    expect_error(rtc.set_alarm_ms(now_ms), hal.Error.InvalidInput)
+    // A time already reached fires at once and forces the interrupt.
+    rtc.set_alarm_ms(now_ms)!
+    core.assert(rtc.alarm_fired()! && rtc.is_pending())
+    rtc.clear_alarm()!
+    core.assert(!rtc.alarm_fired()! && !rtc.is_pending())
     rtc.listen()
     core.assert(rtc.is_listening())
     rtc.set_alarm_ms(now_ms + 1)!
@@ -630,7 +640,11 @@ fn aon_timer() {
     // The alarm fires at its millisecond and stays fired until cleared,
     // which disarms it.
     now_ms := timer.now_ms()!
-    expect_error(timer.set_alarm_ms(now_ms), hal.Error.InvalidInput)
+    // A time already reached fires at once.
+    timer.set_alarm_ms(now_ms)!
+    core.assert(timer.alarm_fired()!)
+    timer.clear_alarm()!
+    core.assert(!timer.alarm_fired()!)
     timer.listen()
     core.assert(timer.is_listening())
     timer.set_alarm_ms(now_ms + 500)!
@@ -736,8 +750,14 @@ fn ds3231_clock() {
 
     // The alarm: alarm 1 matching the date and time, rounded up to a whole
     // second, reaching 28 days ahead.
-    expect_error(clock.set_alarm_ms(time_ms), hal.Error.InvalidInput)
     expect_error(clock.set_alarm_ms(time_ms + 28 * 86_400_000 + 1000), hal.Error.InvalidInput)
+    // A time already reached fires at once, without arming the chip's alarm,
+    // which would match next month.
+    clock.set_alarm_ms(time_ms)!
+    core.assert(clock.alarm_fired()!)
+    chip = clock.release()
+    core.assert(chip.register(0x0E) == 0x1C && chip.register(0x0F) == 0)
+    clock = ds3231.Clock.new(chip)
     clock.set_alarm_ms(time_ms + 89_500)!
     core.assert(!clock.alarm_fired()!)
     chip = clock.release()

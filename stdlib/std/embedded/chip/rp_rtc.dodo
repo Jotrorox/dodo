@@ -214,15 +214,14 @@ pub struct Calendar<R: hal.Registers>: hal.Rtc + hal.RtcAlarm {
         return err(hal.Error.Timeout)
     }
 
-    // Fire at the first whole second at or after `time_ms`.
+    // Fire at the first whole second at or after `time_ms`. The RTC only
+    // matches its exact second, so a time already reached forces the
+    // interrupt instead.
     pub fn set_alarm_ms(&mut self, time_ms: u64) -> void!hal.Error {
         now := self.now_seconds()?
         target := time_ms / 1000
         if time_ms % 1000 != 0 {
             target += 1
-        }
-        if target <= now {
-            return err(hal.Error.InvalidInput)
         }
         let Fields { date, clock, year } = fields_of(target)?
         self.stop_matching()?
@@ -232,7 +231,12 @@ pub struct Calendar<R: hal.Registers>: hal.Rtc + hal.RtcAlarm {
         self.registers.write(IRQ_SETUP_0 + SET_ALIAS, MATCH_ENA)
         self.alarm = target
         self.armed = true
-        return self.wait_for(IRQ_SETUP_0, MATCH_ACTIVE, true)
+        self.wait_for(IRQ_SETUP_0, MATCH_ACTIVE, true)?
+        // Read again: the second may have passed while the alarm was set.
+        if self.now_seconds()? >= target || target <= now {
+            self.registers.write(RTC_INTF, RTC_IRQ_BIT)
+        }
+        return ok()
     }
 
     // True from the alarm's second until clear_alarm. The RTC raises its
@@ -433,10 +437,11 @@ pub struct AonTimer<R: hal.Registers>: hal.Rtc + hal.RtcAlarm {
         return err(hal.Error.Timeout)
     }
 
+    // The timer's alarm fires once the time is at or past it, so a time
+    // already reached fires at once.
     pub fn set_alarm_ms(&mut self, time_ms: u64) -> void!hal.Error {
-        now := self.now_ms()?
-        if time_ms <= now {
-            return err(hal.Error.InvalidInput)
+        if (self.registers.read(TIMER) & RUN) == 0 {
+            return err(hal.Error.Busy)
         }
         self.disarm()
         self.write_masked(ALARM_TIME_15TO0, (time_ms & 0xFFFF) as u32)
