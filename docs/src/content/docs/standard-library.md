@@ -132,21 +132,25 @@ HTTP/1.1 clients, servers, streaming framing, web routing, and QUIC connections
 and streams **are implemented**.
 HTTP/2, HTTP/3, WebSockets, TOML serialization and chip support beyond
 the RP2040 and RP2350 are remaining work. [`std/embedded/hal`](hardware.md) supplies typed
-registers and portable device protocols; `std/embedded/chip/rp2040` and
+registers and portable device protocols, blocking and polling, including I2C
+and SPI targets, pulse capture, CAN, I2S, and DMA buffer transfers, with
+in-memory fakes in `std/embedded/hal/fake`; `std/embedded/chip/rp2040` and
 `std/embedded/board/pico` support the Raspberry Pi RP2040 and Pico, and
 `std/embedded/chip/rp2350` with `std/embedded/board/pico2` and
 `std/embedded/board/pico2_w` the RP2350, Pico 2, and Pico 2 W, including
 their I2C and SPI buses, as master or target, and serial ports through the
 shared controller drivers in `std/embedded/peripheral` and the pin and
 controller ownership both chips share in `std/embedded/chip/rp_pins`, and
-their PWM outputs and ADC inputs through `std/embedded/chip/rp_pwm` and
+their PWM outputs and inputs and ADC inputs through `std/embedded/chip/rp_pwm` and
 `std/embedded/chip/rp_adc`, their PIO state machines, with programs assembled
-at compile time, through `std/embedded/chip/rp_pio`, a USB serial port on
+at compile time, through `std/embedded/chip/rp_pio`, I2S audio on PIO
+through `std/embedded/chip/rp_i2s`, a USB serial port on
 the board's own USB connector through `std/embedded/chip/rp_usb`, their DMA
 channels through `std/embedded/chip/rp_dma`, which the SPI buses and serial
 ports use for transfers that run in the background, and their second core,
 with the FIFOs and spinlocks the cores share, through
 `std/embedded/chip/rp_multicore`.
+`std/embedded/can/mcp2515` drives the MCP2515 CAN controller over any SPI bus.
 `std/embedded/cortex_m` enables, pends, and prioritizes interrupts and runs
 SysTick on any Cortex-M core. `std/embedded/executor` runs several firmware
 tasks on a core, waking each on time or on an interrupt and sleeping

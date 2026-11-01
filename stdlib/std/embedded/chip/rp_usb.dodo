@@ -1280,7 +1280,7 @@ struct Report {
 // Reader and Writer protocols, so std/fmt prints to it. Every method is
 // safe to call at any time; the interrupt handler serves the host in
 // between.
-pub struct Serial: io.ReadWriter {
+pub struct Serial: hal.Serial + hal.SerialPoll {
     open: bool
 
     // Queue `bytes` for the host and return once they are queued. While no
@@ -1353,6 +1353,27 @@ pub struct Serial: io.ReadWriter {
             state = io.PollState.Pending
         }
         return ok(io.Poll { transferred: queued, state })
+    }
+
+    // `flush` without waiting: true once the host has taken everything
+    // written, or no terminal has the port open. Never fails.
+    pub fn poll_flush(&mut self) -> bool!io.Error {
+        unsent := 0usize
+        connected := false
+        section := hal.Critical.enter()
+        // SAFETY: as in write.
+        unsafe {
+            serve_device()
+            match &mut DEVICE {
+                some(device) => {
+                    unsent = device.unsent()
+                    connected = device.is_connected()
+                }
+                none => {}
+            }
+        }
+        core.drop(section)
+        return ok(unsent == 0 || !connected)
     }
 
     // Wait until the host has taken everything written, while a terminal

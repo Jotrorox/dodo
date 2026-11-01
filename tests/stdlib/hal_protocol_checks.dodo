@@ -1,0 +1,819 @@
+package main
+
+import "core/ptr"
+import "std/embedded/hal"
+import "std/embedded/hal/fake"
+import "std/io"
+
+// Host checks for the std/embedded/hal protocols beyond the basic blocking
+// ones: the polling forms and their blocking adapters, target sides, PWM
+// capture, CAN frames, filters, and bit timing, I2S streams, DMA buffer
+// transfers and the generic DmaStream, each through the fakes and through
+// drivers written once against the protocols.
+
+fn expect_error(result: void!hal.Error, expected: hal.Error) {
+    match result {
+        ok() => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == expected)
+        }
+    }
+}
+
+fn expect_bool_error(result: bool!hal.Error, expected: hal.Error) {
+    match result {
+        ok(_) => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == expected)
+        }
+    }
+}
+
+fn expect_count_error(result: usize!hal.Error, expected: hal.Error) {
+    match result {
+        ok(_) => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == expected)
+        }
+    }
+}
+
+fn bytes_equal(left: &[u8], right: &[u8]) -> bool {
+    if left.len != right.len {
+        return false
+    }
+    for index in 0..left.len {
+        if left[index] != right[index] {
+            return false
+        }
+    }
+    return true
+}
+
+// --- Polled I2C ------------------------------------------------------------
+
+// A driver written against the polling form: reads a 16-bit register pair
+// across polls, as a task would, counting the polls it took.
+struct PolledSensor {
+    command: [1]u8
+    data: [2]u8
+
+    fn new() -> PolledSensor {
+        return PolledSensor { command: [0x10], data: [0, 0] }
+    }
+
+    // One step; some(value) once the read is done.
+    fn poll<B: hal.I2cPoll>(&mut self, bus: &mut B) -> Option<u16>!hal.Error {
+        if !bus.poll_write_read(0x48, &self.command, &mut self.data)? {
+            return ok(none)
+        }
+        return ok(some(((self.data[0] as u16) << 8) | self.data[1] as u16))
+    }
+}
+
+fn polled_i2c() {
+    bus := fake.I2c.new(0x48)
+    bus.set_register(0x10, 0x12)
+    bus.set_register(0x11, 0x34)
+    bus.set_poll_steps(3)
+    sensor := PolledSensor.new()
+    polls := 0u32
+    value := 0u16
+    for {
+        polls += 1
+        match sensor.poll(&mut bus) {
+            ok(some(read)) => {
+                value = read
+                break
+            }
+            ok(none) => {}
+            err(_) => {
+                core.assert(false)
+            }
+        }
+    }
+    core.assert_eq(polls, 3u32)
+    core.assert_eq(value, 0x1234u16)
+    core.assert(!bus.is_busy())
+
+    // A call with other arguments while one runs is refused and the
+    // running transaction continues.
+    payload: [2]u8 = [0x20, 0x55]
+    core.assert(!bus.poll_write(0x48, &payload)!)
+    other: [3]u8 = [0x20, 0x55, 0x66]
+    expect_bool_error(bus.poll_write(0x48, &other), hal.Error.InvalidInput)
+    expect_bool_error(bus.poll_write(0x49, &payload), hal.Error.InvalidInput)
+    core.assert(!bus.poll_write(0x48, &payload)!)
+    core.assert(bus.poll_write(0x48, &payload)!)
+    core.assert_eq(bus.register(0x20), 0x55u8)
+
+    // Cancelled, the next poll starts afresh.
+    core.assert(!bus.poll_write(0x48, &payload)!)
+    bus.cancel()
+    core.assert_eq(bus.cancels(), 1u32)
+    core.assert(!bus.poll_write(0x48, &other)!)
+    bus.cancel()
+
+    // Errors end the transaction.
+    bus.set_poll_steps(1)
+    buffer: [1]u8 = [0]
+    expect_bool_error(bus.poll_read(0x50, &mut buffer), hal.Error.NoAcknowledge)
+    core.assert(!bus.is_busy())
+
+    // Through dyn, and wrapped into the blocking protocol.
+    bus.set_poll_steps(2)
+    dynamic: &mut dyn hal.I2cPoll = &mut bus
+    command: [1]u8 = [0x11]
+    core.assert(!dynamic.poll_write_read(0x48, &command, &mut buffer)!)
+    core.assert(dynamic.poll_write_read(0x48, &command, &mut buffer)!)
+    core.assert_eq(buffer[0], 0x34u8)
+
+    blocking := hal.BlockingI2c.new(bus)
+    core.assert_eq(hal.read_register(&mut blocking, 0x48, 0x10)!, 0x12u8)
+    hal.write_register(&mut blocking, 0x48, 0x30, 0x77)!
+    expect_error(hal.write_register(&mut blocking, 0x40, 0, 0), hal.Error.NoAcknowledge)
+    // A transaction that never finishes within the limit is cancelled.
+    blocking.bus().set_poll_steps(100)
+    blocking.set_poll_limit(10)
+    expect_error(hal.write_register(&mut blocking, 0x48, 0x31, 1), hal.Error.Timeout)
+    bus = blocking.release()
+    core.assert_eq(bus.register(0x30), 0x77u8)
+    core.assert_eq(bus.register(0x31), 0u8)
+    core.assert_eq(bus.cancels(), 3u32)
+    core.assert(!bus.is_busy())
+}
+
+// --- Polled SPI ------------------------------------------------------------
+
+fn polled_spi() {
+    bus := fake.Spi.new()
+    bus.set_poll_chunk(2)
+    reply: [5]u8 = [0, 0xEF, 0x40, 0x18, 0x01]
+    bus.reply_with(&reply)
+
+    flash := hal.SpiDevice.new(fake.Pin.new())
+    command: [1]u8 = [0x9F]
+    id: [4]u8 = [9, 9, 9, 9]
+    polls := 0u32
+    for !flash.poll_write_read(&mut bus, &command, &mut id)! {
+        polls += 1
+        core.assert(flash.is_busy())
+    }
+    // The command and the first two-byte chunk go in the first poll, which
+    // continues into the read at once; the second chunk finishes it.
+    core.assert_eq(polls, 1u32)
+    core.assert(!flash.is_busy())
+    core.assert(id[0] == 0xEF && id[1] == 0x40 && id[2] == 0x18 && id[3] == 0x01)
+    core.assert_eq(bus.sent().len, 5usize)
+    // The read sends zeros.
+    core.assert_eq(bus.sent()[4], 0u8)
+
+    // Exchange in place, and the select pin around the whole transfer.
+    bus.clear()
+    bus.reply_with(&reply)
+    data: [3]u8 = [1, 2, 3]
+    core.assert(!flash.poll_transfer(&mut bus, &mut data)!)
+    core.assert(flash.poll_transfer(&mut bus, &mut data)!)
+    core.assert(data[0] == 0 && data[1] == 0xEF && data[2] == 0x40)
+    pixels: [4]u8 = [1, 2, 3, 4]
+    core.assert(!flash.poll_write(&mut bus, &pixels)!)
+    flash.cancel(&mut bus)
+    core.assert(!bus.is_busy())
+    select := flash.release()
+    core.assert(select.is_high())
+    // High when the device was made, then low and high for each of the
+    // three transactions.
+    core.assert_eq(select.changes(), 7u32)
+
+    // Length mismatches are refused.
+    bus.clear()
+    core.assert(!bus.poll_write(&pixels)!)
+    three: [3]u8 = [0, 0, 0]
+    expect_bool_error(bus.poll_write(&three), hal.Error.InvalidInput)
+    expect_bool_error(bus.poll_transfer(&mut data), hal.Error.InvalidInput)
+    core.assert(bus.poll_write(&pixels)!)
+
+    // Blocking from polling.
+    bus.clear()
+    blocking := hal.BlockingSpi.new(bus)
+    device := hal.SpiDevice.new(fake.Pin.new())
+    device.write(&mut blocking, &pixels)!
+    bus = blocking.release()
+    core.assert(bytes_equal(bus.sent(), &pixels))
+    dynamic: &mut dyn hal.SpiPoll = &mut bus
+    core.assert(!dynamic.poll_write(&pixels)!)
+}
+
+// --- Serial ----------------------------------------------------------------
+
+// A driver written against hal.SerialPoll: sends a whole message across
+// polls.
+fn send_polled<S: hal.SerialPoll>(serial: &mut S, message: &[u8], sent: &mut usize) -> bool!io.Error {
+    for *sent < message.len {
+        progress := serial.poll_write(message[*sent..])?
+        *sent += progress.transferred
+        if progress.state == io.PollState.Pending {
+            return ok(false)
+        }
+    }
+    return serial.poll_flush()
+}
+
+fn flush_twice<S: hal.Serial>(serial: &mut S) -> void!io.Error {
+    io.write_all(serial, b"bye")?
+    serial.flush()?
+    return serial.flush()
+}
+
+fn serial_protocols() {
+    serial := fake.Serial.new()
+    serial.set_write_room(4)
+    serial.set_flush_polls(2)
+    sent := 0usize
+    polls := 0u32
+    for !send_polled(&mut serial, b"hello world", &mut sent)! {
+        polls += 1
+    }
+    // Two polls with a full transmitter, then two while it drains.
+    core.assert_eq(polls, 4u32)
+    core.assert(bytes_equal(serial.sent(), b"hello world"))
+    serial.feed(b"ok")
+    buffer: [8]u8 = [0; 8]
+    progress := serial.poll_read(&mut buffer)!
+    core.assert_eq(progress.transferred, 2usize)
+    progress = serial.poll_read(&mut buffer)!
+    core.assert(progress.state == io.PollState.Pending)
+    serial.clear()
+    flush_twice(&mut serial)!
+    core.assert(bytes_equal(serial.sent(), b"bye"))
+    dynamic: &mut dyn hal.Serial = &mut serial
+    dynamic.flush()!
+}
+
+// --- Targets ---------------------------------------------------------------
+
+// An I2C register device written against hal.I2cTarget: 16 registers
+// behind a pointer the first byte of each write sets.
+struct RegisterDevice {
+    registers: [16]u8
+    pointer: usize
+
+    fn serve<T: hal.I2cTarget>(&mut self, target: &mut T) -> void!hal.Error {
+        buffer: [4]u8 = [0; 4]
+        for {
+            match target.poll(&mut buffer)? {
+                hal.I2cTargetEvent.Write(count, start) => {
+                    first := 0usize
+                    if start {
+                        self.pointer = buffer[0] as usize % 16
+                        first = 1
+                    }
+                    for index in first..count {
+                        self.registers[self.pointer] = buffer[index]
+                        self.pointer = (self.pointer + 1) % 16
+                    }
+                }
+                hal.I2cTargetEvent.Read => {
+                    reply: [2]u8 = [self.registers[self.pointer], self.registers[(self.pointer + 1) % 16]]
+                    taken := target.respond(&reply)?
+                    self.pointer = (self.pointer + taken) % 16
+                }
+                hal.I2cTargetEvent.Stop => {}
+                hal.I2cTargetEvent.Idle => {
+                    return ok()
+                }
+            }
+        }
+    }
+}
+
+fn targets() {
+    target := fake.I2cTarget.new()
+    device := RegisterDevice { registers: [0; 16], pointer: 0 }
+    write: [7]u8 = [2, 10, 11, 12, 13, 14, 15]
+    target.master_write(&write)
+    target.master_stop()
+    select: [1]u8 = [3]
+    target.master_write(&select)
+    target.master_read(3)
+    target.master_stop()
+    device.serve(&mut target)!
+    core.assert(target.is_idle())
+    core.assert(device.registers[2] == 10 && device.registers[7] == 15)
+    received := target.master_received()
+    core.assert_eq(received.len, 3usize)
+    core.assert(received[0] == 11 && received[1] == 12 && received[2] == 13)
+
+    // An empty answer gives the master 0xFF; errors pass through.
+    target.master_read(1)
+    buffer: [4]u8 = [0; 4]
+    match target.poll(&mut buffer)! {
+        hal.I2cTargetEvent.Read => {}
+        _ => {
+            core.assert(false)
+        }
+    }
+    none: [0]u8 = []
+    core.assert_eq(target.respond(&none)!, 0usize)
+    core.assert_eq(target.master_received()[3], 0xFFu8)
+    target.fail_next(hal.Error.Bus)
+    match device.serve(&mut target) {
+        ok() => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == hal.Error.Bus)
+        }
+    }
+    dynamic: &mut dyn hal.I2cTarget = &mut target
+    match dynamic.poll(&mut buffer)! {
+        hal.I2cTargetEvent.Idle => {}
+        _ => {
+            core.assert(false)
+        }
+    }
+
+    spi := fake.SpiTarget.new()
+    answer: [3]u8 = [0xA1, 0xA2, 0xA3]
+    core.assert_eq(spi.queue(&answer)!, 3usize)
+    exchange: [4]u8 = [1, 2, 3, 4]
+    spi.master_exchange(&mut exchange)
+    core.assert(exchange[0] == 0xA1 && exchange[2] == 0xA3 && exchange[3] == 0)
+    incoming: [8]u8 = [0; 8]
+    core.assert_eq(spi.read(&mut incoming)!, 4usize)
+    core.assert(incoming[0] == 1 && incoming[3] == 4)
+    flood: [64]u8 = [7; 64]
+    spi.master_exchange(&mut flood)
+    spi.master_exchange(&mut exchange)
+    big: [64]u8 = [0; 64]
+    core.assert_eq(spi.read(&mut big)!, 64usize)
+    expect_count_error(spi.read(&mut big), hal.Error.Overrun)
+    core.assert_eq(spi.read(&mut big)!, 0usize)
+    target_dyn: &mut dyn hal.SpiTarget = &mut spi
+    core.assert_eq(target_dyn.queue(&answer)!, 3usize)
+}
+
+// --- PWM capture -----------------------------------------------------------
+
+fn pulse_captures() {
+    // 50 Hz servo signal with a 1.5 ms pulse.
+    servo := hal.PulseCapture { period_ns: 20_000_000, high_ns: 1_500_000, cycles: 1 }
+    core.assert_eq(servo.frequency_hz(), 50u32)
+    core.assert_eq(servo.frequency_millihz(), 50_000u64)
+    core.assert_eq(servo.high_us(), 1500u32)
+    core.assert_eq(servo.period_us(), 20_000u32)
+    core.assert_eq(servo.duty(100), 8u32)
+    core.assert_eq(servo.duty(10_000), 750u32)
+    // Averaged over many periods, and fractional frequencies.
+    slow := hal.PulseCapture { period_ns: 3_000_000_000, high_ns: 1_000_000_000, cycles: 4 }
+    core.assert_eq(slow.frequency_millihz(), 333u64)
+    core.assert_eq(slow.frequency_hz(), 0u32)
+    core.assert_eq(slow.duty(3), 1u32)
+    // Very long periods keep their duty.
+    long := hal.PulseCapture { period_ns: 0x10_0000_0000, high_ns: 0x8_0000_0000, cycles: 1 }
+    core.assert_eq(long.duty(1000), 500u32)
+    // A steady line: no frequency, duty by level.
+    high := hal.PulseCapture { period_ns: 10_000_000, high_ns: 10_000_000, cycles: 0 }
+    core.assert_eq(high.frequency_hz(), 0u32)
+    core.assert_eq(high.duty(100), 100u32)
+    low := hal.PulseCapture.new()
+    core.assert_eq(low.duty(100), 0u32)
+    // Fast signals.
+    fast := hal.PulseCapture { period_ns: 40_000, high_ns: 10_000, cycles: 250 }
+    core.assert_eq(fast.frequency_hz(), 25_000u32)
+    core.assert_eq(fast.duty(65535), 16384u32)
+
+    input := fake.PwmInput.new()
+    capture := hal.PulseCapture.new()
+    core.assert(!input.poll_capture(&mut capture)!)
+    input.queue_signal(1000, 25)
+    input.queue(20_000_000, 1_000_000, 1)
+    dynamic: &mut dyn hal.PwmInput = &mut input
+    core.assert(dynamic.poll_capture(&mut capture)!)
+    core.assert_eq(capture.frequency_hz(), 1000u32)
+    core.assert_eq(capture.duty(100), 25u32)
+    second := hal.capture(&mut input, 10)!
+    core.assert_eq(second.high_us(), 1000u32)
+    match hal.capture(&mut input, 10) {
+        ok(_) => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == hal.Error.Timeout)
+        }
+    }
+    input.fail_next(hal.Error.Overrun)
+    expect_bool_error(input.poll_capture(&mut capture), hal.Error.Overrun)
+}
+
+// --- CAN -------------------------------------------------------------------
+
+fn can_frames() {
+    // Data length codes.
+    core.assert_eq(hal.can_dlc_length(8, false), 8usize)
+    core.assert_eq(hal.can_dlc_length(15, false), 8usize)
+    core.assert_eq(hal.can_dlc_length(9, true), 12usize)
+    core.assert_eq(hal.can_dlc_length(12, true), 24usize)
+    core.assert_eq(hal.can_dlc_length(13, true), 32usize)
+    core.assert_eq(hal.can_dlc_length(14, true), 48usize)
+    core.assert_eq(hal.can_dlc_length(15, true), 64usize)
+    for length in 0usize..65 {
+        match hal.can_length_dlc(length) {
+            ok(code) => {
+                core.assert_eq(hal.can_dlc_length(code, true), length)
+            }
+            err(_) => {
+                core.assert(length > 8 && length != 12 && length != 16 && length != 20 && length != 24 && length != 32 && length != 48 && length != 64)
+            }
+        }
+    }
+
+    frame := hal.CanFrame.standard(0x123, b"\x01\x02\x03")!
+    core.assert(frame.id() == 0x123 && !frame.is_extended() && !frame.is_remote() && !frame.is_fd())
+    core.assert_eq(frame.len(), 3usize)
+    core.assert_eq(frame.dlc(), 3u8)
+    core.assert(bytes_equal(frame.bytes(), b"\x01\x02\x03"))
+    match hal.CanFrame.standard(0x800, b"") {
+        ok(_) => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == hal.Error.InvalidInput)
+        }
+    }
+    expect_error(frame.set_data(0x1, false, b"123456789"), hal.Error.InvalidInput)
+    // A refused change leaves the frame as it was.
+    core.assert_eq(frame.id(), 0x123u32)
+    extended := hal.CanFrame.extended(0x1FFF_FFFF, b"")!
+    core.assert(extended.is_extended() && extended.len() == 0)
+    expect_error(extended.set_data(0x2000_0000, true, b""), hal.Error.InvalidInput)
+    remote := hal.CanFrame.new()
+    remote.set_remote(0x7FF, false, 8)!
+    core.assert(remote.is_remote() && remote.len() == 8 && remote.bytes().len == 0)
+    expect_error(remote.set_remote(1, false, 9), hal.Error.InvalidInput)
+    fd := hal.CanFrame.new()
+    payload: [12]u8 = [5; 12]
+    fd.set_fd(0x10, true, &payload, true)!
+    core.assert(fd.is_fd() && fd.bit_rate_switch() && fd.dlc() == 9 && fd.len() == 12)
+    odd: [10]u8 = [0; 10]
+    expect_error(fd.set_fd(0x10, true, &odd, false), hal.Error.InvalidInput)
+    copy := hal.CanFrame.new()
+    copy.copy_from(&fd)
+    core.assert(copy.same(&fd))
+    core.assert(!copy.same(&frame))
+
+    // Filters.
+    exact := hal.CanFilter.exact(0x123, false)
+    core.assert(exact.accepts(&frame))
+    core.assert(!exact.accepts(&extended))
+    range := hal.CanFilter { id: 0x100, mask: 0x700, extended: false }
+    core.assert(range.accepts(&frame))
+    everything := hal.CanFilter.all(true)
+    core.assert(everything.accepts(&extended))
+    core.assert(!everything.accepts(&frame))
+}
+
+fn can_timing() {
+    // An MCP2515-like controller: quanta of 2..128 oscillator cycles in
+    // pairs, segment 1 of 2..16, segment 2 of 2..8, jumps up to 4.
+    mcp := hal.CanTimingLimits { prescaler_min: 2, prescaler_max: 128, prescaler_step: 2, segment1_min: 2, segment1_max: 16, segment2_min: 2, segment2_max: 8, sync_jump_max: 4 }
+    timing := hal.can_timing(16_000_000, 500_000, 875, &mcp)!
+    core.assert_eq(timing.bitrate(16_000_000), 500_000u32)
+    core.assert_eq(timing.prescaler, 2u32)
+    core.assert_eq(timing.quanta(), 16u32)
+    core.assert_eq(timing.segment2, 2u32)
+    core.assert_eq(timing.sample_point_permille(), 875u32)
+    core.assert_eq(timing.sync_jump, 2u32)
+    slow := hal.can_timing(8_000_000, 125_000, 875, &mcp)!
+    core.assert_eq(slow.bitrate(8_000_000), 125_000u32)
+    core.assert_eq(slow.quanta(), 16u32)
+    megabit := hal.can_timing(16_000_000, 1_000_000, 750, &mcp)!
+    core.assert_eq(megabit.bitrate(16_000_000), 1_000_000u32)
+    core.assert_eq(megabit.quanta(), 8u32)
+    core.assert_eq(megabit.sample_point_permille(), 750u32)
+    // Unreachable rates.
+    match hal.can_timing(8_000_000, 1_000_000, 875, &mcp) {
+        ok(found) => {
+            // 4 quanta are below the minimum of 5.
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == hal.Error.InvalidInput)
+        }
+    }
+    match hal.can_timing(16_000_000, 0, 875, &mcp) {
+        ok(_) => {
+            core.assert(false)
+        }
+        err(_) => {}
+    }
+    // A wider controller: 80 MHz, any prescaler up to 1024.
+    wide := hal.CanTimingLimits { prescaler_min: 1, prescaler_max: 1024, prescaler_step: 1, segment1_min: 1, segment1_max: 16, segment2_min: 1, segment2_max: 8, sync_jump_max: 4 }
+    five := hal.can_timing(80_000_000, 500_000, 875, &wide)!
+    core.assert_eq(five.bitrate(80_000_000), 500_000u32)
+    core.assert(five.quanta() >= 16)
+    core.assert(five.sample_point_permille() >= 850 && five.sample_point_permille() <= 900)
+}
+
+// A driver written against hal.Can: answers each request frame 0x100 with
+// a reply on 0x101 that carries the request's first byte plus one.
+fn serve_can<C: hal.Can>(can: &mut C) -> u32!hal.Error {
+    frame := hal.CanFrame.new()
+    served := 0u32
+    for can.poll_receive(&mut frame)? {
+        if frame.id() == 0x100 && !frame.is_extended() && frame.len() >= 1 {
+            reply: [1]u8 = [frame.bytes()[0] + 1]
+            answer := hal.CanFrame.standard(0x101, &reply)?
+            if !can.poll_send(&answer)? {
+                return err(hal.Error.Busy)
+            }
+            served += 1
+        }
+    }
+    return ok(served)
+}
+
+fn can_controllers() {
+    can := fake.Can.new()
+    one := hal.CanFrame.standard(0x100, b"\x07")!
+    two := hal.CanFrame.standard(0x100, b"\x09")!
+    other := hal.CanFrame.extended(0x100, b"\x01")!
+    can.inject(&one)
+    can.inject(&other)
+    can.inject(&two)
+    core.assert_eq(serve_can(&mut can)!, 2u32)
+    core.assert_eq(can.sent_count(), 2usize)
+    core.assert(can.sent(0).id() == 0x101 && can.sent(0).bytes()[0] == 8)
+    core.assert_eq(can.sent(1).bytes()[0], 10u8)
+
+    // Full transmit buffers, loopback, FD, bus-off, overrun.
+    can.set_transmit_room(1)
+    core.assert(can.poll_send(&one)!)
+    core.assert(!can.poll_send(&two)!)
+    can.drain_transmit()
+    hal.send_frame(&mut can, &two, 5)!
+    match hal.send_frame(&mut can, &two, 5) {
+        ok() => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == hal.Error.Timeout)
+        }
+    }
+    can.set_transmit_room(0)
+    can.set_loopback(true)
+    hal.send_frame(&mut can, &other, 1)!
+    received := hal.CanFrame.new()
+    hal.receive_frame(&mut can, &mut received, 1)!
+    core.assert(received.same(&other))
+    expect_error(hal.receive_frame(&mut can, &mut received, 3), hal.Error.Timeout)
+    fd := hal.CanFrame.new()
+    fd.set_fd(0x5, false, b"", false)!
+    expect_bool_error(can.poll_send(&fd), hal.Error.Unsupported)
+    fd_can := fake.Can.new_fd()
+    core.assert(fd_can.poll_send(&fd)!)
+    can.set_error_state(hal.CanErrorState.BusOff)
+    core.assert(can.error_state()! == hal.CanErrorState.BusOff)
+    expect_bool_error(can.poll_send(&one), hal.Error.Bus)
+    can.set_error_state(hal.CanErrorState.Active)
+    can.set_loopback(false)
+    for _ in 0..17 {
+        can.inject(&one)
+    }
+    expect_bool_error(can.poll_receive(&mut received), hal.Error.Overrun)
+    count := 0u32
+    for can.poll_receive(&mut received)! {
+        count += 1
+    }
+    core.assert_eq(count, 16u32)
+    dynamic: &mut dyn hal.Can = &mut can
+    core.assert(dynamic.error_state()! == hal.CanErrorState.Active)
+}
+
+// --- I2S -------------------------------------------------------------------
+
+// A tone generator written against hal.I2sOutput: keeps the stream topped
+// up with a square wave, one poll at a time.
+struct Square {
+    phase: u32
+    period: u32
+
+    fn fill<O: hal.I2sOutput>(&mut self, output: &mut O, frames: usize) -> usize!hal.Error {
+        block: [32]i32 = [0i32; 32]
+        channels := output.channels() as usize
+        count := frames * channels
+        core.assert(count <= 32)
+        for frame in 0..frames {
+            level := hal.sample_from_i16(8000)
+            if self.phase >= self.period / 2 {
+                level = hal.sample_from_i16(-8000)
+            }
+            self.phase = (self.phase + 1) % self.period
+            for channel in 0..channels {
+                block[frame * channels + channel] = level
+            }
+        }
+        return output.poll_write(block[0..count])
+    }
+}
+
+fn i2s_streams() {
+    core.assert_eq(hal.sample_from_i16(-1), -65536i32)
+    core.assert_eq(hal.sample_to_i16(hal.sample_from_i16(12345)), 12345i16)
+    core.assert_eq(hal.sample_to_i16(0x7FFF_FFFF), 0x7FFFi16)
+
+    output := fake.I2sOutput.new(48_000, 2)
+    output.set_room(6)
+    tone := Square { phase: 0, period: 4 }
+    core.assert_eq(tone.fill(&mut output, 4)!, 6usize)
+    core.assert_eq(output.total(), 6usize)
+    core.assert_eq(output.played()[0], hal.sample_from_i16(8000))
+    core.assert_eq(output.played()[4], hal.sample_from_i16(-8000))
+    partial: [3]i32 = [0, 0, 0]
+    expect_count_error(output.poll_write(&partial), hal.Error.InvalidInput)
+    output.set_room(0)
+    samples: [10]i32 = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    hal.write_samples(&mut output, &samples, 2)!
+    core.assert_eq(output.total(), 16usize)
+    dynamic: &mut dyn hal.I2sOutput = &mut output
+    core.assert(dynamic.sample_rate() == 48_000 && dynamic.channels() == 2)
+
+    input := fake.I2sInput.new(16_000, 1)
+    input.feed(&samples)
+    input.set_room(4)
+    first: [8]i32 = [0i32; 8]
+    core.assert_eq(input.poll_read(&mut first)!, 4usize)
+    core.assert_eq(first[3], 4i32)
+    rest: [6]i32 = [0i32; 6]
+    hal.read_samples(&mut input, &mut rest, 2)!
+    core.assert_eq(rest[5], 10i32)
+    expect_error(hal.read_samples(&mut input, &mut rest, 2), hal.Error.Timeout)
+    input.drop_samples()
+    expect_count_error(input.poll_read(&mut first), hal.Error.Overrun)
+    core.assert_eq(input.poll_read(&mut first)!, 0usize)
+    stereo := fake.I2sInput.new(16_000, 2)
+    stereo.feed(&samples)
+    three: [3]i32 = [0i32; 3]
+    // Whole frames only.
+    core.assert_eq(stereo.poll_read(&mut three)!, 2usize)
+}
+
+// --- DMA buffer transfers ---------------------------------------------------
+
+// A driver written against hal.DmaBuffer: sends a message in the
+// background, as a display driver streams pixels.
+fn start_message<T: hal.DmaBuffer>(transfer: &mut T, message: &[u8]) -> void!hal.Error {
+    buffer := transfer.buffer()?
+    for index in 0..message.len {
+        buffer[index] = message[index]
+    }
+    return transfer.start(message.len)
+}
+
+fn dma_buffers() {
+    transfer := fake.DmaBuffer.transmit(16)
+    transfer.set_poll_steps(3)
+    start_message(&mut transfer, b"frame")!
+    core.assert(transfer.is_busy())
+    match transfer.buffer() {
+        ok(_) => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == hal.Error.Busy)
+        }
+    }
+    expect_error(transfer.start(1), hal.Error.Busy)
+    core.assert(!transfer.poll_finish()!)
+    core.assert(!transfer.poll_finish()!)
+    core.assert(transfer.poll_finish()!)
+    core.assert(bytes_equal(transfer.sent(), b"frame"))
+    core.assert(transfer.poll_finish()!)
+    expect_error(transfer.start(0), hal.Error.InvalidInput)
+    expect_error(transfer.start(17), hal.Error.InvalidInput)
+    start_message(&mut transfer, b"x")!
+    transfer.abort()
+    core.assert(!transfer.is_busy())
+    transfer.fail_next(hal.Error.Bus)
+    start_message(&mut transfer, b"y")!
+    expect_error(hal.finish_transfer(&mut transfer), hal.Error.Bus)
+
+    receiver := fake.DmaBuffer.receive(8)
+    receiver.feed(b"abc")
+    receiver.start(4)!
+    hal.finish_transfer(&mut receiver)!
+    buffer := receiver.buffer()!
+    core.assert(buffer[0] == 97 && buffer[2] == 99 && buffer[3] == 0)
+    dynamic: &mut dyn hal.DmaBuffer = &mut receiver
+    core.assert_eq(dynamic.capacity(), 8usize)
+}
+
+fn dma_streams() {
+    channel := fake.DmaChannel.new()
+    // Busy for three is_busy calls: is_busy below, then two polls.
+    channel.set_busy_polls(3)
+    // A variable stands in for a peripheral's data register.
+    register: u32 = 0
+    address := unsafe {
+        ptr.from_mut(&mut register) as usize
+    }
+    // A word-aligned 32-byte buffer within 36 bytes.
+    storage: [36]u8 = [0; 36]
+    skip := (4 - hal.address_of(&storage) % 4) % 4
+    view := &mut storage[skip..skip + 32]
+    stream := hal.DmaStream.transmit(&mut channel, view, address, hal.DmaWidth.Word)!
+    core.assert(!stream.is_receive())
+    core.assert_eq(stream.capacity(), 32usize)
+    bytes := stream.buffer()!
+    bytes[4] = 0x11
+    bytes[5] = 0x22
+    // The last element written stays in the register.
+    stream.start(8)!
+    core.assert(stream.is_busy())
+    core.assert_eq(stream.remaining(), 8usize)
+    expect_error(stream.start(8), hal.Error.Busy)
+    match stream.buffer() {
+        ok(_) => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == hal.Error.Busy)
+        }
+    }
+    core.assert(!stream.poll_finish()!)
+    core.assert(!stream.poll_finish()!)
+    core.assert(stream.poll_finish()!)
+    core.assert_eq(stream.remaining(), 0usize)
+    core.assert_eq(register, 0x2211u32)
+    // Whole elements only, within the buffer.
+    expect_error(stream.start(6), hal.Error.InvalidInput)
+    expect_error(stream.start(36), hal.Error.InvalidInput)
+    expect_error(stream.start(0), hal.Error.InvalidInput)
+    // Errors from the channel end the transfer.
+    channel_error := stream.start(4)
+    channel_error!
+    stream.abort()
+    core.assert(!stream.is_busy())
+    core.drop(stream)
+    core.assert_eq(channel.aborts(), 1u32)
+
+    // Receiving: the register's value lands in every element.
+    register = 0xAB
+    small: [4]u8 = [0; 4]
+    receive := hal.DmaStream.receive(&mut channel, &mut small, address, hal.DmaWidth.Byte)!
+    receive.start(4)!
+    receive.finish()!
+    filled := receive.buffer()!
+    core.assert(filled[0] == 0xAB && filled[3] == 0xAB)
+    core.drop(receive)
+    // The stream holds the channel, so it is set up before.
+    channel.set_busy_polls(0)
+    channel.fail_next()
+    channel.set_max_count(2)
+    failing := hal.DmaStream.receive(&mut channel, &mut small, address, hal.DmaWidth.Byte)!
+    failing.start(2)!
+    expect_error(hal.finish_transfer(&mut failing), hal.Error.Bus)
+    expect_error(failing.start(3), hal.Error.InvalidInput)
+    core.drop(failing)
+
+    // Misaligned or empty buffers, and a busy channel, are refused.
+    odd: [8]u8 = [0; 8]
+    misaligned := (5 - hal.address_of(&odd) % 4) % 4
+    match hal.DmaStream.transmit(&mut channel, &mut odd[misaligned..misaligned + 4], address, hal.DmaWidth.Word) {
+        ok(_) => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == hal.Error.InvalidInput)
+        }
+    }
+
+    // Copies.
+    channel.set_max_count(0xFFFF_FFFF)
+    source: [9]u8 = [1, 2, 3, 4, 5, 6, 7, 8, 9]
+    destination: [9]u8 = [0; 9]
+    hal.dma_copy(&mut channel, &mut destination, &source)!
+    core.assert(bytes_equal(&destination, &source))
+    short: [3]u8 = [0; 3]
+    expect_error(hal.dma_copy(&mut channel, &mut short, &source), hal.Error.InvalidInput)
+}
+
+fn main() {
+    polled_i2c()
+    polled_spi()
+    serial_protocols()
+    targets()
+    pulse_captures()
+    can_frames()
+    can_timing()
+    can_controllers()
+    i2s_streams()
+    dma_buffers()
+    dma_streams()
+}

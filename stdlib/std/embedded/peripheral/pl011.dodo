@@ -25,7 +25,9 @@ import "std/io"
 // are lost and a read reports OVERRUN; with hardware flow control, see
 // `set_flow_control`, the controller asks the other end to pause instead.
 // `Port.dma` lifts the limit: a `DmaPort` receives into a ring buffer by
-// DMA, and writes in the background.
+// DMA, and writes in the background. Ports implement hal.Serial and, with
+// `poll_read`, `poll_write`, and `poll_flush`, which never wait,
+// hal.SerialPoll.
 // `set_break` holds the line low, for protocols that signal with breaks.
 //
 // Waits are counted in status polls, not time. A write, `flush`, and the
@@ -207,7 +209,7 @@ fn line_format(data_bits: u32, parity: Parity, stop_bits: u32) -> u32!hal.Error 
 
 // A serial port on one PL011 with registers R, any hal.Registers. Implements
 // the std/io Reader and Writer interfaces and their polling forms.
-pub struct Controller<R: hal.Registers>: io.ReadWriter {
+pub struct Controller<R: hal.Registers>: hal.Serial + hal.SerialPoll {
     registers: R
     divisors: Divisors
     // Status polls without progress before a wait for output, or for the
@@ -428,6 +430,12 @@ pub struct Controller<R: hal.Registers>: io.ReadWriter {
             return err(io.failure(io.ErrorKind.TimedOut, 0))
         }
         return ok()
+    }
+
+    // `flush` without waiting: true once every byte written has left,
+    // false while some are still queued or being sent.
+    pub fn poll_flush(&mut self) -> bool!io.Error {
+        return ok((self.registers.read(FR) & BUSY) == 0)
     }
 
     // Wait for the first byte, then return what has arrived, up to
@@ -653,7 +661,7 @@ fn ring_bits(address: usize, length: usize) -> u32 {
 // RX_TIMEOUT_INTERRUPT and RX_INTERRUPT as with a polled port. Dropping
 // the DmaPort stops both channels and hands the port back; input still in
 // the ring is lost and output not yet sent is cut short.
-pub struct DmaPort: io.ReadWriter {
+pub struct DmaPort: hal.Serial + hal.SerialPoll {
     registers: &mut dyn hal.Registers
     data: usize
     rx: &mut dyn hal.DmaChannel
@@ -791,6 +799,15 @@ pub struct DmaPort: io.ReadWriter {
 
     // Wait until everything written has left; TimedOut after the poll
     // limit, as on Port.
+    // `flush` without waiting: true once everything written has left the
+    // output buffer and the transmitter.
+    pub fn poll_flush(&mut self) -> bool!io.Error {
+        if self.output_busy() {
+            return ok(false)
+        }
+        return ok((self.registers.read(FR) & BUSY) == 0)
+    }
+
     pub fn flush(&mut self) -> void!io.Error {
         if !self.wait_output() {
             return err(io.failure(io.ErrorKind.TimedOut, 0))
@@ -993,7 +1010,7 @@ pub fn send<R: hal.Registers>(registers: &mut R, bytes: &[u8]) {
 // implements the std/io Reader and Writer protocols like Controller but keeps
 // the register block: `RegisterBlock` trusts its owner with every offset,
 // which only the driver may be.
-pub struct Port: io.ReadWriter {
+pub struct Port: hal.Serial + hal.SerialPoll {
     controller: Controller<hal.RegisterBlock>
 
     // SAFETY: as for hal.RegisterBlock.at, with `base` a PL011 whose reset
@@ -1021,6 +1038,10 @@ pub struct Port: io.ReadWriter {
     // limit.
     pub fn flush(&mut self) -> void!io.Error {
         return self.controller.flush()
+    }
+
+    pub fn poll_flush(&mut self) -> bool!io.Error {
+        return self.controller.poll_flush()
     }
 
     // Bound waits for output, in status polls; see Controller.
