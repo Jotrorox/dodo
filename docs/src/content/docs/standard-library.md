@@ -135,7 +135,8 @@ HTTP/2, HTTP/3, WebSockets, TOML serialization and chip support beyond
 the RP2040 and RP2350 are remaining work. [`std/embedded/hal`](hardware.md) supplies typed
 registers and portable device protocols, blocking and polling, including I2C
 and SPI targets, pulse capture, CAN, I2S, and DMA buffer transfers, with
-in-memory fakes in `std/embedded/hal/fake`; `std/embedded/chip/rp2040` and
+in-memory fakes in `std/embedded/hal/fake` and the serial port protocols in
+`std/embedded/hal/serial`; `std/embedded/chip/rp2040` and
 `std/embedded/board/pico` support the Raspberry Pi RP2040 and Pico, and
 `std/embedded/chip/rp2350` with `std/embedded/board/pico2` and
 `std/embedded/board/pico2_w` the RP2350, Pico 2, and Pico 2 W, including
@@ -204,7 +205,7 @@ individual modules and links every public declaration back to its source.
 | [HTTP](http.md), [hosted HTTP/HTTPS](hosted-http.md) | `std/http`, `std/http/client`, `std/http/connection`, `std/http/hosted`, `std/http/https`, `std/http/server` | Protocol/polling portable; hosted/HTTPS explicit. |
 | [MQTT](mqtt.md) | `std/mqtt`, `std/mqtt/app`, `std/mqtt/broker`, `std/mqtt/hosted` | Packets/topics/handlers/test deliveries portable; app, broker, and client hosted. |
 | [Web serving](web.md) | `std/web`, `std/web/application`, `std/web/app`, `std/web/hosted`, `std/web/https`, `std/web/reactor`, `std/web/response`, `std/web/server`, `std/web/static_files`, `std/web/stream`, `std/web/testing` | Routing/registration/composition portable; app/hosted/HTTPS/reactor/static files explicit. |
-| [Hardware and embedded](hardware.md) | `std/embedded/hal`, `std/embedded/hal/fake`, `std/embedded/executor`, `std/embedded/board`, `std/embedded/chip`, `std/embedded/peripheral/designware_i2c`, `std/embedded/peripheral/pl022`, `std/embedded/peripheral/pl011`, `std/embedded/wireless/cyw43`, `std/embedded/cortex_m` | `std/embedded/hal` and `std/embedded/executor` are portable, with interrupt masking on bare-metal Cortex-M and RISC-V. `std/embedded/cortex_m` (interrupt controller, SysTick, barriers) runs only on Cortex-M. `std/embedded/board` and `std/embedded/chip` resolve to the firmware build's board and chip packages, such as `std/embedded/board/pico2` and `std/embedded/chip/rp2350`. |
+| [Hardware and embedded](hardware.md) | `std/embedded/hal`, `std/embedded/hal/serial`, `std/embedded/hal/fake`, `std/embedded/executor`, `std/embedded/board`, `std/embedded/chip`, `std/embedded/peripheral/designware_i2c`, `std/embedded/peripheral/pl022`, `std/embedded/peripheral/pl011`, `std/embedded/wireless/cyw43`, `std/embedded/can/mcp2515`, `std/embedded/cortex_m` | `std/embedded/hal` and `std/embedded/executor` are portable, with interrupt masking on bare-metal Cortex-M and RISC-V. `std/embedded/cortex_m` (interrupt controller, SysTick, barriers) runs only on Cortex-M. `std/embedded/board` and `std/embedded/chip` resolve to the firmware build's board and chip packages, such as `std/embedded/board/pico2` and `std/embedded/chip/rp2350`. |
 
 ## Implementation and adapter packages
 
