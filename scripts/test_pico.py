@@ -98,6 +98,7 @@ LAST_CHECKS = [
     "core 1 starts, reports its number, and answers over the FIFO; a small stack and a third FIFO end are refused",
     "spinlocks are claimed once and exclude; both cores count 10000 each under one",
     "core 1's executor wakes on the FIFO interrupt; core 1 finishes, stops, and starts again",
+    "watchdog refuses bad timeouts, counts 1 us per us, reloads when fed, holds when stopped; scratch 0 is the record's",
     "flash regions are validated above the program and claimed once; reads match the mapped flash",
     "flash region erases, writes across pages, and reads back while code runs from flash",
     "flash is refused while core 1 runs a task",

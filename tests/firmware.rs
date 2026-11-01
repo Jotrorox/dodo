@@ -96,6 +96,57 @@ fn main() {
     }
 }
 
+// The board watchdog: started, fed through the portable protocol, its reset
+// reason and scratch words read, and a deliberate restart. Needs no linker.
+#[test]
+fn watchdogs_compile_for_every_board() {
+    let scratch = Scratch::new("watchdog");
+    let source = scratch.write(
+        "watchdog.dodo",
+        r#"package main
+import "std/embedded/board"
+import "std/embedded/hal"
+fn keep_alive<W: hal.Watchdog>(dog: &mut W) {
+    dog.feed()
+}
+fn main() {
+    b := board.take()!
+    if b.watchdog.reset_reason() == hal.ResetReason.Timeout {
+        count := b.watchdog.scratch(0)
+        b.watchdog.set_scratch(0, count + 1)
+    }
+    longest := b.watchdog.max_timeout_ms()
+    b.watchdog.start(longest)!
+    for _ in 0..10u32 {
+        b.timer.delay_ms(100)
+        keep_alive(&mut b.watchdog)
+    }
+    if b.watchdog.remaining_us() < 1000 && b.watchdog.is_running() {
+        b.watchdog.stop()
+    }
+    b.watchdog.restart()
+}
+"#,
+    );
+    for board in ["pico", "pico2", "pico2_w"] {
+        for level in ["0", "2"] {
+            let object = scratch.path(&format!("watchdog-{board}-O{level}.o"));
+            stdout(&dodo(&[
+                "build",
+                source.to_str().unwrap(),
+                "--board",
+                board,
+                "-O",
+                level,
+                "--emit",
+                "obj",
+                "-o",
+                &object,
+            ]));
+        }
+    }
+}
+
 // The executor on a board: tasks woken by an alarm, a GPIO edge, and the
 // UART, with the alarm as the executor's clock. Needs no linker.
 #[test]
