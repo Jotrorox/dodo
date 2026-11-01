@@ -1073,7 +1073,9 @@ impl Expander {
                 .filter_map(|operand| match &operand.kind {
                     AsmOperandKind::Out(ty) => Some(Some(ty.clone())),
                     AsmOperandKind::InOut(value) => Some(self.guess(value)),
-                    AsmOperandKind::In(_) => None,
+                    AsmOperandKind::In(_) | AsmOperandKind::Sym(_) | AsmOperandKind::Const(_) => {
+                        None
+                    }
                 })
                 .collect::<Option<Vec<_>>>()
                 .map(asm_result),
@@ -1365,6 +1367,10 @@ impl Expander {
                             self.ty(ty, substitutions, operand.span)?;
                             outputs.push(ty.clone());
                         }
+                        AsmOperandKind::Const(value) => {
+                            self.expression(value, substitutions, None)?;
+                        }
+                        AsmOperandKind::Sym(_) => {}
                     }
                 }
                 let several = outputs.len() > 1;

@@ -1,9 +1,11 @@
 //! Desktop windows: the X11 protocol code and key tables everywhere, code
 //! generation for every hosted target, the C runtime for each window system,
 //! and on Linux real windows on a virtual X server driven with xdotool: one
-//! with a pixel buffer, and GPU windows that OpenGL (Mesa's llvmpipe) and
-//! Vulkan (lavapipe) present into. On macOS the GPU window fixture runs when
-//! DODO_DESKTOP_TESTS is set, since it opens a window on the desktop.
+//! with a pixel buffer, GPU windows that OpenGL (Mesa's llvmpipe) and Vulkan
+//! (lavapipe) present into, and the clipboard, cursor and size controls,
+//! with xclip as the other side of the clipboard. On macOS the GPU window
+//! and desktop fixtures run when DODO_DESKTOP_TESTS is set, since they open
+//! windows on the desktop.
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -84,7 +86,12 @@ fn windows_build_for_every_hosted_target() {
         "x86_64-pc-windows-msvc",
         "x86_64-pc-windows-gnu",
     ] {
-        for fixture in ["window_events", "window_multi", "window_gpu"] {
+        for fixture in [
+            "window_events",
+            "window_multi",
+            "window_gpu",
+            "window_desktop",
+        ] {
             let source = root().join(format!("tests/stdlib/{fixture}.dodo"));
             let object = scratch.0.join(format!("{fixture}-{target}.o"));
             success(
@@ -189,6 +196,38 @@ fn gpu_window_on_the_macos_desktop() {
     success(&output, "run the GPU window fixture");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.starts_with("native AppKit "), "{stdout}");
+    assert!(stdout.ends_with("passed\n"), "{stdout}");
+}
+
+/// The clipboard, every cursor shape, set_size with its limits, and
+/// fullscreen on the macOS desktop. Opt-in, because it shows a window, goes
+/// fullscreen briefly and uses the clipboard; text on the clipboard is put
+/// back afterwards.
+#[cfg(target_os = "macos")]
+#[test]
+fn desktop_basics_on_the_macos_desktop() {
+    if std::env::var_os("DODO_DESKTOP_TESTS").is_none() {
+        eprintln!("skipping: set DODO_DESKTOP_TESTS to open desktop windows");
+        return;
+    }
+    let scratch = Scratch::new("macos-desktop");
+    let executable = scratch.0.join("desktop");
+    build(
+        &root().join("tests/stdlib/window_desktop.dodo"),
+        &executable,
+        "0",
+    );
+    let saved = Command::new("pbpaste").output().unwrap().stdout;
+    let output = Command::new(&executable).output().unwrap();
+    let mut restore = Command::new("pbcopy")
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    use std::io::Write;
+    restore.stdin.take().unwrap().write_all(&saved).unwrap();
+    restore.wait().unwrap();
+    success(&output, "run the desktop fixture");
+    let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.ends_with("passed\n"), "{stdout}");
 }
 
@@ -591,6 +630,143 @@ mod x11 {
         // Both windows got the frame they asked for.
         position("frame main");
         position("frame tools");
+    }
+
+    /// What xclip reads from the clipboard.
+    fn xclip_out(display: &str, args: &[&str]) -> Vec<u8> {
+        let output = Command::new("xclip")
+            .args(["-selection", "clipboard", "-o"])
+            .args(args)
+            .env("DISPLAY", display)
+            .output()
+            .unwrap();
+        success(&output, "xclip -o");
+        output.stdout
+    }
+
+    /// Copy `data` with xclip, which keeps serving it from a background
+    /// process holding no pipe of ours. That process takes the selection
+    /// after the foreground one exits, so give it a moment.
+    fn xclip_in(display: &str, args: &[&str], data: &[u8]) {
+        use std::io::Write;
+        let mut child = Command::new("xclip")
+            .args(["-selection", "clipboard", "-i"])
+            .args(args)
+            .env("DISPLAY", display)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(data).unwrap();
+        assert!(child.wait().unwrap().success(), "xclip -i");
+        sleep(Duration::from_millis(500));
+    }
+
+    /// The clipboard, cursor shapes, set_size with its limits and fullscreen
+    /// on a real window. Without a window manager, fullscreen covers the
+    /// screen by itself. xclip is the other client: it reads what the
+    /// fixture copied, including a text larger than one request, and copies
+    /// a short UTF-8 text, a 5 MB text it sends in increments (INCR) and a
+    /// Latin-1 STRING for the fixture to paste.
+    #[test]
+    fn desktop_basics_under_xvfb() {
+        if !have_window_tools() {
+            return;
+        }
+        let interop = tool("xclip");
+        if !interop {
+            assert!(
+                std::env::var_os("DODO_REQUIRE_WINDOW_TESTS").is_none(),
+                "window tests require xclip"
+            );
+            eprintln!("xclip not installed: checking without another client");
+        }
+        let scratch = Scratch::new("desktop");
+        let executable = scratch.0.join("desktop");
+        build(
+            &root().join("tests/stdlib/window_desktop.dodo"),
+            &executable,
+            "0",
+        );
+        let (_server, display) = start_xvfb(5);
+        let log = scratch.0.join("desktop.log");
+        let args: &[&str] = if interop { &["interop"] } else { &[] };
+        let (app, copied) = launch(&executable, args, &display, &log, "copied");
+        if !interop {
+            let (status, log) = finish(app, &log);
+            assert!(status.success(), "{status}: {log}");
+            assert!(log.ends_with("passed\n"), "{log}");
+            return;
+        }
+        assert!(copied, "{}", fs::read_to_string(&log).unwrap());
+        let targets = String::from_utf8(xclip_out(&display, &["-t", "TARGETS"])).unwrap();
+        assert_eq!(
+            targets.split_whitespace().collect::<Vec<_>>(),
+            ["TARGETS", "UTF8_STRING", "TEXT"]
+        );
+        assert_eq!(xclip_out(&display, &[]), "from dodo ✓".as_bytes());
+
+        let wait_for = |line: &str| {
+            let started = Instant::now();
+            while !fs::read_to_string(&log)
+                .unwrap()
+                .lines()
+                .any(|candidate| candidate == line)
+            {
+                assert!(
+                    started.elapsed() < Duration::from_secs(20),
+                    "no {line:?} in:\n{}",
+                    fs::read_to_string(&log).unwrap()
+                );
+                sleep(Duration::from_millis(50));
+            }
+        };
+        // Keys go to the window under the pointer.
+        xdotool(&display, &["mousemove", "20", "20", "click", "1"]);
+        xdotool(&display, &["key", "t", "h", "a"]);
+        xdotool(&display, &["key", "l"]);
+        wait_for("copied large");
+        let large = xclip_out(&display, &[]);
+        assert_eq!(large.len(), 300_000);
+        assert!(
+            large
+                .iter()
+                .enumerate()
+                .all(|(i, byte)| *byte == b'a' + (i % 26) as u8)
+        );
+
+        xclip_in(&display, &[], "from xclip é".as_bytes());
+        xdotool(&display, &["key", "v"]);
+        wait_for("pasted from xclip é");
+        xclip_in(&display, &[], &vec![b'x'; 5_000_000]);
+        xdotool(&display, &["key", "v"]);
+        wait_for("pasted 5000000 bytes 120 120");
+        xclip_in(&display, &["-t", "STRING"], b"caf\xe9");
+        xdotool(&display, &["key", "v"]);
+        wait_for("pasted café");
+        xdotool(&display, &["key", "Escape"]);
+
+        let (status, log) = finish(app, &log);
+        assert!(status.success(), "{status}: {log}");
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(
+            lines.iter().filter(|line| **line == "cursor").count(),
+            3,
+            "{log}"
+        );
+        for line in [
+            "clipboard round trip",
+            "cursors set",
+            "resized 300 200",
+            "limited 360 230",
+            "limits removed",
+            "fullscreen",
+            "windowed 310 210",
+            "passed",
+        ] {
+            assert!(lines.contains(&line), "missing {line:?} in:\n{log}");
+        }
     }
 
     /// Starts `executable` with `args` on `display`, logging stdout to

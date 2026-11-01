@@ -1,12 +1,14 @@
 //! The firmware runtime's floating-point helpers (src/hardware/arm_float.ll,
-//! under the names arm_float_soft.ll gives them on chips without a
-//! double-precision accelerator) are integer-only IR, so they also compile
-//! for the host. This builds them for the host, links them into a small C
-//! driver, and checks each helper against the host's IEEE 754 hardware on
-//! special values, boundary cases and random operands. Rust's `as`
-//! conversions saturate and map NaN to zero, which is the helpers' contract
-//! too. The RP2350's coprocessor helpers, which must give the same bits, are
-//! checked on a board by scripts/test_rp2350_float.py.
+//! under the names arm_float_soft.ll gives them on chips without faster
+//! versions) are integer-only IR, so they also compile for the host, through
+//! the same optimization as for firmware. This builds them for the host,
+//! links them into a small C driver, and checks each helper against the
+//! host's IEEE 754 hardware on special values, boundary cases and random
+//! operands. Rust's `as` conversions saturate and map NaN to zero, which is
+//! the helpers' contract too. The faster versions must give the same bits:
+//! the RP2040's assembly helpers are checked against these in the emulator
+//! self-test (tests/emulator/selftest.dodo), and the RP2350's coprocessor
+//! helpers on a board by scripts/test_rp2350_float.py.
 #![cfg(unix)]
 use std::fmt::Write as _;
 use std::fs;

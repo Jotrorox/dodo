@@ -1,5 +1,6 @@
 package window
 
+import "core/mem"
 import "std/graphics"
 import "std/time"
 import "std/window/handle"
@@ -25,6 +26,11 @@ import "std/window/raw"
 // user32/gdi32 on Windows. A process has at most one App at a time, and must
 // use it and its windows from the thread that created it; on macOS that has
 // to be the main thread.
+//
+// Desktop programs also get the system clipboard through the App
+// (set_clipboard_text and clipboard_text), standard pointer shapes with
+// set_cursor(), and control over a window's size, size limits and fullscreen
+// state from code.
 //
 // A GPU draws into a window through native_handle(), which hands Vulkan,
 // OpenGL or Metal the window system's own objects. A window opened with
@@ -237,6 +243,196 @@ pub struct Modifiers {
         }
         return self.control()
     }
+}
+
+// A standard mouse pointer shape for set_cursor(). Each system draws its own
+// version, so the pointer looks like the rest of the desktop; on X11 the
+// shapes come from the server's core cursor font, which is plainer than
+// desktop cursor themes.
+pub enum Cursor {
+    // The ordinary arrow.
+    Arrow,
+    // The I-beam over editable or selectable text.
+    Text,
+    // The pointing hand over links and other clickable things.
+    Hand,
+    Crosshair,
+    // Arrows in four directions, for moving something; an open hand on
+    // macOS, which has no such arrow.
+    Move,
+    // Resizing left and right, as over a vertical divider.
+    ResizeEW,
+    // Resizing up and down, as over a horizontal divider.
+    ResizeNS,
+    // Resizing along the diagonal from top left to bottom right.
+    ResizeNWSE,
+    // Resizing along the diagonal from top right to bottom left.
+    ResizeNESW,
+    // The action under the pointer is not possible.
+    NotAllowed,
+    // The program is busy: an hourglass or spinning circle, and on macOS
+    // the arrow with a spinning wheel.
+    Wait
+}
+
+// The ordinal the adapters take, in the order of the variants above.
+fn cursor_code(cursor: &Cursor) -> u32 {
+    match cursor {
+        Cursor.Arrow => {
+            return 0
+        }
+        Cursor.Text => {
+            return 1
+        }
+        Cursor.Hand => {
+            return 2
+        }
+        Cursor.Crosshair => {
+            return 3
+        }
+        Cursor.Move => {
+            return 4
+        }
+        Cursor.ResizeEW => {
+            return 5
+        }
+        Cursor.ResizeNS => {
+            return 6
+        }
+        Cursor.ResizeNWSE => {
+            return 7
+        }
+        Cursor.ResizeNESW => {
+            return 8
+        }
+        Cursor.NotAllowed => {
+            return 9
+        }
+        Cursor.Wait => {
+            return 10
+        }
+    }
+}
+
+// Text read from the clipboard with App.clipboard_text(). It owns its bytes,
+// so it stays valid while the program keeps working with the App.
+pub struct ClipboardText {
+    bytes: heap.Bytes
+
+    // The text, always valid UTF-8: malformed bytes another program put on
+    // the clipboard read as U+FFFD.
+    pub fn as_str(&self) -> &str from(self) {
+        return unsafe {
+            mem.str_from_utf8(self.bytes.view())
+        }
+    }
+    // Its length in bytes.
+    pub fn len(&self) -> usize {
+        return self.bytes.len()
+    }
+    // True when the clipboard held no text.
+    pub fn is_empty(&self) -> bool {
+        return self.bytes.len() == 0
+    }
+}
+
+// The length of the well-formed UTF-8 sequence at `at`, or 0 when the byte
+// there does not start one.
+fn utf8_sequence(bytes: &[u8], at: usize) -> usize {
+    first := bytes[at]
+    if first < 0x80 {
+        return 1
+    }
+    length := 0usize
+    low := 0x80u8
+    high := 0xbfu8
+    if first >= 0xc2 && first <= 0xdf {
+        length = 2
+    } else if first >= 0xe0 && first <= 0xef {
+        length = 3
+        if first == 0xe0 {
+            low = 0xa0
+        } else if first == 0xed {
+            high = 0x9f
+        }
+    } else if first >= 0xf0 && first <= 0xf4 {
+        length = 4
+        if first == 0xf0 {
+            low = 0x90
+        } else if first == 0xf4 {
+            high = 0x8f
+        }
+    } else {
+        return 0
+    }
+    if at + length > bytes.len {
+        return 0
+    }
+    second := bytes[at + 1]
+    if second < low || second > high {
+        return 0
+    }
+    for i in 2usize..length {
+        next := bytes[at + i]
+        if next < 0x80 || next > 0xbf {
+            return 0
+        }
+    }
+    return length
+}
+
+// `bytes` with each byte that starts no well-formed UTF-8 sequence replaced
+// by U+FFFD; `bytes` itself when it is valid already.
+fn repair_utf8(bytes: heap.Bytes) -> heap.Bytes!Error {
+    size := 0usize
+    bad := false
+    {
+        view := bytes.view()
+        at := 0usize
+        for at < view.len {
+            length := utf8_sequence(view, at)
+            if length == 0 {
+                bad = true
+                size += 3
+                at += 1
+            } else {
+                size += length
+                at += length
+            }
+        }
+    }
+    if !bad {
+        return ok(bytes)
+    }
+    repaired := match heap.Bytes.new(size) {
+        some(memory) => memory,
+        none => {
+            return err(Error.OutOfMemory)
+        }
+    }
+    {
+        view := bytes.view()
+        out := repaired.bytes()
+        at := 0usize
+        put := 0usize
+        for at < view.len {
+            length := utf8_sequence(view, at)
+            if length == 0 {
+                out[put] = 0xef
+                out[put + 1] = 0xbf
+                out[put + 2] = 0xbd
+                put += 3
+                at += 1
+            } else {
+                for i in 0usize..length {
+                    out[put + i] = view[at + i]
+                }
+                put += length
+                at += length
+            }
+        }
+    }
+    return ok(repaired)
 }
 
 fn button_from_code(code: u32) -> Button {
@@ -472,7 +668,7 @@ pub struct App {
             backend.Backend.close(id)
             return err(Error.OutOfMemory)
         }
-        win := Window { id: id, pixel_buffer: options.pixel_buffer, pixels: heap.Bytes.empty(), width: 0, height: 0 }
+        win := Window { id: id, pixel_buffer: options.pixel_buffer, pixels: heap.Bytes.empty(), width: 0, height: 0, min_width: 0, min_height: 0, max_width: 0, max_height: 0 }
         if !win.sync() {
             return err(Error.OutOfMemory)
         }
@@ -499,6 +695,38 @@ pub struct App {
             limit = raw.FOREVER - 1
         }
         return self.next(limit)
+    }
+
+    // -- Clipboard --------------------------------------------------------
+
+    // Put `text` on the system clipboard, replacing what it held, for this
+    // and other programs to paste. Line endings are kept as they are.
+    //
+    // On X11 the clipboard is a conversation between programs: the App
+    // keeps the text and hands it to programs that paste while the App's
+    // event loop runs, until another program copies something or the App
+    // closes. A clipboard manager, which most desktops run, keeps the text
+    // available after that.
+    pub fn set_clipboard_text(&mut self, text: &str) -> void!Error {
+        if !self.active {
+            return err(Error.Closed)
+        }
+        return backend.Backend.set_clipboard(mem.str_bytes(text))
+    }
+    // The text on the system clipboard; empty when it holds none, such as
+    // when an image was copied. Text this App copied comes back unchanged.
+    //
+    // On X11 this asks the program that copied for the text and waits for
+    // it, at most a second for each part of a large transfer. Events that
+    // arrive meanwhile are kept and returned by the next wait_event or
+    // poll_event, in order. A program that never answers reads as empty.
+    pub fn clipboard_text(&mut self) -> ClipboardText!Error {
+        if !self.active {
+            return err(Error.Closed)
+        }
+        bytes := backend.Backend.clipboard()?
+        repaired := repair_utf8(bytes)?
+        return ok(ClipboardText { bytes: repaired })
     }
 
     // Close every window and the connection. Later calls fail with Closed;
@@ -596,6 +824,11 @@ pub struct Window {
     pixels: heap.Bytes
     width: u32
     height: u32
+    // The size limits from set_min_size and set_max_size; 0 is no limit.
+    min_width: u32
+    min_height: u32
+    max_width: u32
+    max_height: u32
 
     // The id its events carry.
     pub fn id(&self) -> WindowId {
@@ -724,6 +957,77 @@ pub struct Window {
     pub fn set_cursor_visible(&mut self, visible: bool) -> void!Error {
         return backend.Backend.set_cursor_visible(self.id, visible)
     }
+    // Show `cursor` while the pointer is over the drawing area, until the
+    // next call; new windows show Cursor.Arrow. A pointer hidden with
+    // set_cursor_visible(false) stays hidden and takes the shape when shown
+    // again.
+    pub fn set_cursor(&mut self, cursor: Cursor) -> void!Error {
+        return backend.Backend.set_cursor(self.id, cursor_code(&cursor))
+    }
+
+    // -- Size and fullscreen ------------------------------------------------
+
+    // Resize the drawing area to `width` by `height` in the units of
+    // Options: points on macOS, pixels at the system scale on Windows and
+    // pixels on X11. The size is kept within set_min_size and set_max_size.
+    // The window system may adjust it further, for example to fit the
+    // screen; the size it settles on arrives as a Resize event, after which
+    // size() and canvas() have it. Works on windows the user cannot resize
+    // too. While the window is fullscreen the size applies when it leaves
+    // fullscreen. Fails with InvalidInput for a zero size or one above
+    // MAX_SIZE.
+    pub fn set_size(&mut self, width: u32, height: u32) -> void!Error {
+        if width == 0 || height == 0 || width > MAX_SIZE || height > MAX_SIZE {
+            self.check()?
+            return err(Error.InvalidInput)
+        }
+        return backend.Backend.set_size(self.id, limit(width, self.min_width, self.max_width), limit(height, self.min_height, self.max_height))
+    }
+    // The smallest size the user can shrink the drawing area to, in the
+    // units of set_size; 0 leaves a dimension unlimited, and 0 by 0 removes
+    // the limit. A window smaller than the new minimum grows to it. Fails
+    // with InvalidInput above MAX_SIZE or above a maximum that is set.
+    pub fn set_min_size(&mut self, width: u32, height: u32) -> void!Error {
+        if width > MAX_SIZE || height > MAX_SIZE || (self.max_width != 0 && width > self.max_width) || (self.max_height != 0 && height > self.max_height) {
+            self.check()?
+            return err(Error.InvalidInput)
+        }
+        backend.Backend.set_size_limits(self.id, width, height, self.max_width, self.max_height)?
+        self.min_width = width
+        self.min_height = height
+        return ok()
+    }
+    // The largest size the user can enlarge the drawing area to, in the
+    // units of set_size; 0 leaves a dimension unlimited, and 0 by 0 removes
+    // the limit. A larger window shrinks to it. Fullscreen ignores the
+    // limit. Fails with InvalidInput above MAX_SIZE or below a minimum that
+    // is set.
+    pub fn set_max_size(&mut self, width: u32, height: u32) -> void!Error {
+        if width > MAX_SIZE || height > MAX_SIZE || (width != 0 && width < self.min_width) || (height != 0 && height < self.min_height) {
+            self.check()?
+            return err(Error.InvalidInput)
+        }
+        backend.Backend.set_size_limits(self.id, self.min_width, self.min_height, width, height)?
+        self.max_width = width
+        self.max_height = height
+        return ok()
+    }
+    // Make the window cover its whole screen without a title bar or
+    // borders (true), or return it to its earlier size and place (false).
+    // The new size arrives as a Resize event. macOS animates the change into
+    // a space of its own, as its green title-bar button does; X11 asks the
+    // window manager, and without one covers the screen itself.
+    pub fn set_fullscreen(&mut self, fullscreen: bool) -> void!Error {
+        return backend.Backend.set_fullscreen(self.id, fullscreen)
+    }
+    // Whether the window is fullscreen, or is changing to fullscreen after
+    // set_fullscreen(true). On macOS it also follows the user entering or
+    // leaving fullscreen with the title-bar button; X11 reports what the
+    // program asked for. False once the window is closed.
+    pub fn is_fullscreen(&self) -> bool {
+        return backend.Backend.fullscreen(self.id)
+    }
+
     // -- GPU access -------------------------------------------------------
 
     // The window system's objects behind this window, for creating a Vulkan,
@@ -867,6 +1171,17 @@ pub struct Window {
             }
         }
     }
+}
+
+// `value` kept within `low` and `high`, where 0 is no limit.
+fn limit(value: u32, low: u32, high: u32) -> u32 {
+    if high != 0 && value > high {
+        return high
+    }
+    if value < low {
+        return low
+    }
+    return value
 }
 
 fn smaller(a: u32, b: u32) -> u32 {

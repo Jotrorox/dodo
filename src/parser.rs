@@ -60,7 +60,7 @@ impl Parser {
             depth: 0,
             slice_first: false,
             discarded_tails: HashSet::new(),
-            json_derives: Vec::new(),
+            derive_requests: Vec::new(),
             in_interface: false,
             await_operand: false,
         }
@@ -82,7 +82,7 @@ struct Parser {
     // Explicit semicolons suppress implicit block values without changing the
     // statement AST used by semantic analysis and the backend.
     discarded_tails: HashSet<usize>,
-    json_derives: Vec<crate::json_derive::Derive>,
+    derive_requests: Vec<crate::derive::Request>,
     // Interface methods are signatures without bodies.
     in_interface: bool,
     // Parsing the operand of `await`: a trailing `?` or `!` applies to the
@@ -90,7 +90,7 @@ struct Parser {
     await_operand: bool,
 }
 
-#[derive(Default)]
+#[derive(Default, PartialEq)]
 struct Modifiers {
     printing: Option<Printing>,
     // `@compiler(pio)`: rp_pio's compile-time assembler.
@@ -105,14 +105,16 @@ struct Modifiers {
     repr_c: bool,
     unsafe_send: bool,
     unsafe_sync: bool,
-    derive_json: bool,
-    json_name: Option<String>,
-    json_deny_unknown: bool,
+    // `@derive(...)` names, and attributes owned by a registered derive.
+    derives: Vec<&'static crate::derive::Spec>,
+    derive_attributes: Vec<crate::derive::Attribute>,
     interrupt: Option<String>,
     // `@link_name("symbol")`: the C symbol an extern declaration binds.
     link_name: Option<String>,
     placement: Placement,
     inlining: Inlining,
+    // `@naked`: a function without prologue or epilogue around its assembly.
+    naked: bool,
     // `async fn`: a function whose body may `await`; see std/embedded/executor.
     async_: bool,
 }
@@ -120,6 +122,10 @@ struct Modifiers {
 impl Modifiers {
     fn compiler(&self) -> bool {
         self.printing.is_some() || self.pio || self.wgsl
+    }
+
+    fn derive_syntax(&self) -> bool {
+        !self.derives.is_empty() || !self.derive_attributes.is_empty()
     }
 }
 
@@ -263,6 +269,7 @@ impl Parser {
                 program.import_aliases.len(),
                 program.interfaces.len(),
                 program.aliases.len(),
+                program.global_asm.len(),
             );
             if let Err(error) = self.declaration(&mut program) {
                 if !self.recover {
@@ -279,13 +286,14 @@ impl Parser {
                 program.import_aliases.truncate(lengths.5);
                 program.interfaces.truncate(lengths.6);
                 program.aliases.truncate(lengths.7);
+                program.global_asm.truncate(lengths.8);
                 self.soft_newlines = soft;
                 self.self_type = self_type;
                 self.in_interface = false;
                 self.synchronize(cursor, true);
             }
         }
-        let derives = std::mem::take(&mut self.json_derives);
+        let derives = std::mem::take(&mut self.derive_requests);
         if !derives.is_empty() {
             let identifiers = self
                 .tokens
@@ -295,7 +303,7 @@ impl Parser {
                     _ => None,
                 })
                 .collect();
-            if let Err(error) = crate::json_derive::expand(&mut program, derives, &identifiers) {
+            if let Err(error) = crate::derive::expand(&mut program, derives, &identifiers) {
                 if !self.recover {
                     return Err(error);
                 }
@@ -353,6 +361,12 @@ impl Parser {
         }
         let start = self.span().start;
         let mods = self.modifiers()?;
+        if self.at("asm") {
+            return self.global_asm(program, mods, start);
+        }
+        if mods.naked && !self.at("fn") {
+            return Err(self.error("@naked applies only to functions"));
+        }
         if mods.interrupt.is_some() && !self.at("fn") {
             return Err(self.error("@interrupt applies only to functions"));
         }
@@ -374,9 +388,7 @@ impl Parser {
                 || mods.repr_c
                 || mods.unsafe_send
                 || mods.unsafe_sync
-                || mods.derive_json
-                || mods.json_deny_unknown
-                || mods.json_name.is_some()
+                || mods.derive_syntax()
                 || mods.compiler()
                 || mods.test
                 || mods.ignore.is_some()
@@ -394,9 +406,7 @@ impl Parser {
                 || mods.repr_c
                 || mods.unsafe_send
                 || mods.unsafe_sync
-                || mods.derive_json
-                || mods.json_deny_unknown
-                || mods.json_name.is_some()
+                || mods.derive_syntax()
                 || mods.compiler()
                 || mods.test
                 || mods.ignore.is_some()
@@ -406,11 +416,14 @@ impl Parser {
             program.aliases.push(self.type_alias(mods.public, start)?);
             return Ok(());
         }
-        if (mods.derive_json || mods.json_deny_unknown) && !self.at("struct") {
-            return Err(self.error("@derive(Json) and @json_deny_unknown apply only to structs"));
-        }
-        if mods.json_name.is_some() {
-            return Err(self.error("@json_name applies only to fields of @derive(Json) structs"));
+        if mods.derive_syntax() && !self.at("struct") {
+            if let Some(attribute) = mods.derive_attributes.iter().find(|attribute| {
+                crate::derive::attribute(attribute.name)
+                    .is_some_and(|(_, spec)| spec.target == crate::derive::Target::Field)
+            }) {
+                return Err(field_attribute_misplaced(attribute));
+            }
+            return Err(self.error("@derive and derive attributes apply only to structs"));
         }
         if mods.compiler() && !self.at("fn") {
             return Err(self.error("@compiler applies only to functions"));
@@ -459,10 +472,44 @@ impl Parser {
                 .push(self.constant(mods.public, mods.placement, start)?);
         } else {
             return Err(self.error(
-                "expected `fn`, `struct`, `enum`, `interface`, `type`, `const`, or `static` declaration",
+                "expected `fn`, `struct`, `enum`, `interface`, `type`, `const`, `static`, or `unsafe asm` declaration",
             ));
         }
         Ok(())
+    }
+    /// `unsafe asm("...", operands...)` outside any function: assembly the
+    /// object file contains as written, such as startup code or a table.
+    fn global_asm(
+        &mut self,
+        program: &mut Program,
+        mods: Modifiers,
+        start: usize,
+    ) -> ParseResult<()> {
+        let unsafe_only = Modifiers {
+            unsafe_: true,
+            ..Modifiers::default()
+        };
+        if !mods.unsafe_ {
+            return Err(
+                self.error("global assembly is unchecked code; write it as `unsafe asm(\"...\")`")
+            );
+        }
+        if mods != unsafe_only {
+            return Err(Diagnostic::new(
+                self.since(start),
+                "global assembly takes no attributes or modifiers besides `unsafe`; place code in sections with directives such as `.section`",
+            ));
+        }
+        let asm_start = self.span().start;
+        self.bump();
+        let ExprKind::Asm(asm) = self.inline_asm(asm_start)? else {
+            unreachable!()
+        };
+        program.global_asm.push(GlobalAsm {
+            namespace: String::new(),
+            asm: *asm,
+        });
+        self.end_statement()
     }
 
     // Resume at a statement separator or the next declaration. Always advance
@@ -536,39 +583,61 @@ impl Parser {
             } else if self.eat("@") {
                 let name = self.identifier()?;
                 if name == "derive" {
-                    if mods.derive_json {
-                        return Err(self.error("duplicate @derive(Json) attribute"));
-                    }
                     self.expect("(")?;
-                    if !self.eat("Json") {
-                        return Err(self.error("supported derive: @derive(Json)"));
+                    loop {
+                        let derive = self.identifier()?;
+                        let Some(spec) = crate::derive::find(&derive) else {
+                            return Err(Diagnostic::new(
+                                self.tokens[self.cursor.saturating_sub(1)].span,
+                                format!(
+                                    "unknown derive `{derive}`; supported derives: {}",
+                                    crate::derive::supported_derives()
+                                ),
+                            ));
+                        };
+                        if mods.derives.iter().any(|known| known.name == spec.name) {
+                            return Err(self.error(format!("duplicate @derive({derive})")));
+                        }
+                        mods.derives.push(spec);
+                        if !self.eat(",") || self.at(")") {
+                            break;
+                        }
                     }
                     self.expect(")")?;
-                    mods.derive_json = true;
                     self.newlines();
                     continue;
                 }
-                if name == "json_deny_unknown" {
-                    if mods.json_deny_unknown {
-                        return Err(self.error("duplicate @json_deny_unknown attribute"));
+                if let Some((owner, spec)) = crate::derive::attribute(&name) {
+                    let start = self.previous_start();
+                    if mods
+                        .derive_attributes
+                        .iter()
+                        .any(|known| known.name == spec.name)
+                    {
+                        return Err(self.error(format!("duplicate @{name} attribute")));
                     }
-                    mods.json_deny_unknown = true;
-                    self.newlines();
-                    continue;
-                }
-                if name == "json_name" {
-                    if mods.json_name.is_some() {
-                        return Err(self.error("duplicate @json_name attribute"));
-                    }
-                    self.expect("(")?;
-                    let TokenKind::String(value, false) = self.bump().kind else {
-                        return Err(self.error("@json_name expects a string field name"));
+                    let value = match spec.argument {
+                        crate::derive::Argument::Flag => None,
+                        crate::derive::Argument::Text(expected) => {
+                            self.expect("(")?;
+                            let TokenKind::String(value, false) = self.bump().kind else {
+                                return Err(self.error(format!("@{name} expects {expected}")));
+                            };
+                            let value = String::from_utf8(value).map_err(|_| {
+                                self.error(format!(
+                                    "@{name} of @derive({}) must be UTF-8",
+                                    owner.name
+                                ))
+                            })?;
+                            self.expect(")")?;
+                            Some(value)
+                        }
                     };
-                    mods.json_name = Some(
-                        String::from_utf8(value)
-                            .map_err(|_| self.error("JSON field name must be UTF-8"))?,
-                    );
-                    self.expect(")")?;
+                    mods.derive_attributes.push(crate::derive::Attribute {
+                        name: spec.name,
+                        value,
+                        span: self.since(start),
+                    });
                     self.newlines();
                     continue;
                 }
@@ -651,6 +720,14 @@ impl Parser {
                     } else {
                         Inlining::Always
                     };
+                    self.newlines();
+                    continue;
+                }
+                if name == "naked" {
+                    if mods.naked {
+                        return Err(self.error("duplicate @naked attribute"));
+                    }
+                    mods.naked = true;
                     self.newlines();
                     continue;
                 }
@@ -750,7 +827,9 @@ impl Parser {
                 }
                 if name != "repr" {
                     return Err(self.error(format!(
-                        "unknown attribute `@{name}`; supported: @repr(C), @unsafe_send, @unsafe_sync, @test, @ignore(\"reason\"), @derive(Json), @json_name(\"name\"), @json_deny_unknown, @interrupt(VECTOR), @link_name(\"symbol\"), @section(\"name\"), @align(N), @inline, @inline(never), @cold"
+                        "unknown attribute `@{name}`; supported: @repr(C), @unsafe_send, @unsafe_sync, @test, @ignore(\"reason\"), {}, {}, @interrupt(VECTOR), @link_name(\"symbol\"), @section(\"name\"), @align(N), @inline, @inline(never), @cold, @naked",
+                        crate::derive::supported_derives(),
+                        crate::derive::supported_attributes(),
                     )));
                 }
                 if mods.repr_c {
@@ -846,9 +925,7 @@ impl Parser {
                 || mods.repr_c
                 || mods.unsafe_send
                 || mods.unsafe_sync
-                || mods.derive_json
-                || mods.json_deny_unknown
-                || mods.json_name.is_some()
+                || mods.derive_syntax()
                 || mods.compiler()
                 || mods.test
                 || mods.ignore.is_some()
@@ -1203,8 +1280,19 @@ impl Parser {
         start: usize,
     ) -> ParseResult<()> {
         self.expect("struct")?;
-        if mods.json_deny_unknown && !mods.derive_json {
-            return Err(self.error("@json_deny_unknown requires @derive(Json)"));
+        let mut struct_attributes = Vec::new();
+        for attribute in &mods.derive_attributes {
+            let (owner, spec) = crate::derive::attribute(attribute.name).unwrap();
+            if spec.target == crate::derive::Target::Field {
+                return Err(field_attribute_misplaced(attribute));
+            }
+            if !mods.derives.iter().any(|derive| derive.name == owner.name) {
+                return Err(Diagnostic::new(
+                    attribute.span,
+                    format!("@{} requires @derive({})", attribute.name, owner.name),
+                ));
+            }
+            struct_attributes.push(attribute.clone());
         }
         let name = self.identifier()?;
         let (generics, bounds) = self.generic_params()?;
@@ -1228,22 +1316,30 @@ impl Parser {
         self.expect("{")?;
         self.separators();
         let mut fields = Vec::new();
-        let mut json_names = Vec::new();
+        let mut field_attributes = Vec::new();
         while !self.eat("}") {
             if self.eof() {
                 return Err(self.error("unclosed struct declaration; expected `}`"));
             }
             let field_start = self.span().start;
             let field_mods = self.modifiers()?;
-            if field_mods.derive_json || field_mods.json_deny_unknown {
-                return Err(
-                    self.error("@derive(Json) and @json_deny_unknown apply only to structs")
-                );
+            if !field_mods.derives.is_empty() {
+                return Err(self.error("@derive applies only to structs"));
             }
-            if field_mods.json_name.is_some() && (!mods.derive_json || self.at("fn")) {
-                return Err(
-                    self.error("@json_name applies only to fields of @derive(Json) structs")
-                );
+            for attribute in &field_mods.derive_attributes {
+                let (owner, spec) = crate::derive::attribute(attribute.name).unwrap();
+                if spec.target == crate::derive::Target::Struct {
+                    return Err(Diagnostic::new(
+                        attribute.span,
+                        format!(
+                            "@{} applies only to @derive({}) structs, not to their members",
+                            attribute.name, owner.name
+                        ),
+                    ));
+                }
+                if self.at("fn") || !mods.derives.iter().any(|derive| derive.name == owner.name) {
+                    return Err(field_attribute_misplaced(attribute));
+                }
             }
             if field_mods.compiler() && !self.at("fn") {
                 return Err(self.error("@compiler applies only to functions"));
@@ -1292,7 +1388,7 @@ impl Parser {
                 {
                     return Err(self.error("struct fields only support the `pub` modifier"));
                 }
-                let field_start = if field_mods.json_name.is_some() {
+                let field_start = if !field_mods.derive_attributes.is_empty() {
                     // Attribute text is preserved by the formatter, independently
                     // from the field declaration that follows it.
                     self.span().start
@@ -1300,7 +1396,7 @@ impl Parser {
                     field_start
                 };
                 let (field_name, ty) = self.typed_name()?;
-                json_names.push(field_mods.json_name.unwrap_or_else(|| field_name.clone()));
+                field_attributes.push(field_mods.derive_attributes);
                 fields.push(Field {
                     name: field_name,
                     ty,
@@ -1316,11 +1412,12 @@ impl Parser {
             self.separators();
         }
         self.self_type = None;
-        if mods.derive_json {
-            self.json_derives.push(crate::json_derive::Derive {
+        if !mods.derives.is_empty() {
+            self.derive_requests.push(crate::derive::Request {
                 name: name.clone(),
-                json_names,
-                deny_unknown: mods.json_deny_unknown,
+                derives: mods.derives,
+                attributes: struct_attributes,
+                fields: field_attributes,
             });
         }
         program.structs.push(Struct {
@@ -1542,7 +1639,8 @@ impl Parser {
             None
         } else if self.at("{") {
             let mut body = self.block()?;
-            if ret != Type::Void {
+            // A naked body's assembly returns by itself; it has no tail value.
+            if ret != Type::Void && !mods.naked {
                 self.lower_tail(&mut body, true);
             }
             Some(body)
@@ -1573,6 +1671,28 @@ impl Parser {
                 self.since(start),
                 "@interrupt requires a private, safe, non-generic fn name() with a body and no result; the hardware calls it, so it takes no arguments, and code cannot call it",
             ));
+        }
+        if mods.naked {
+            if !mods.extern_
+                || body.is_none()
+                || !generics.is_empty()
+                || self.self_type.is_some()
+                || mods.async_
+                || mods.test
+                || mods.interrupt.is_some()
+                || mods.inlining != Inlining::Auto
+            {
+                return Err(Diagnostic::new(
+                    self.since(start),
+                    "@naked requires a top-level, non-generic `extern \"C\" fn` with a body; its assembly implements the C calling convention, so it cannot be async, a test, an interrupt handler, or inlined",
+                ));
+            }
+            if body.as_ref().and_then(naked_body).is_none() {
+                return Err(Diagnostic::new(
+                    self.since(start),
+                    "the body of a @naked function is exactly one `unsafe { asm(...) }`; the function has no frame for other statements",
+                ));
+            }
         }
         if mods.inlining != Inlining::Auto && body.is_none() {
             return Err(Diagnostic::new(
@@ -1627,6 +1747,7 @@ impl Parser {
             link_name: mods.link_name,
             placement: mods.placement,
             inlining: mods.inlining,
+            naked: mods.naked,
             async_part: mods.async_.then_some(AsyncPart::Body),
         })
     }
@@ -2849,7 +2970,7 @@ impl Parser {
                 }
                 _ => {
                     return Err(self.error(
-                        "expected an asm operand: in(reg) value, out(reg) Type, inout(reg) value, clobber(\"name\"), or options(...)",
+                        "expected an asm operand: in(reg) value, out(reg) Type, inout(reg) value, sym name, const value, clobber(\"name\"), or options(...)",
                     ));
                 }
             };
@@ -2889,6 +3010,18 @@ impl Parser {
                         span: self.since(operand_start),
                     });
                 }
+                "sym" => asm.operands.push(AsmOperand {
+                    kind: AsmOperandKind::Sym(self.qualified_name().map_err(|_| {
+                        self.error("`sym` expects the name of a function or static, such as `sym reset_handler`")
+                    })?),
+                    register: AsmRegister::Any,
+                    span: self.since(operand_start),
+                }),
+                "const" => asm.operands.push(AsmOperand {
+                    kind: AsmOperandKind::Const(self.expression(true)?),
+                    register: AsmRegister::Any,
+                    span: self.since(operand_start),
+                }),
                 "clobber" => {
                     self.expect("(")?;
                     loop {
@@ -2945,7 +3078,7 @@ impl Parser {
                 _ => {
                     return Err(Diagnostic::new(
                         self.since(operand_start),
-                        "expected an asm operand: in(reg) value, out(reg) Type, inout(reg) value, clobber(\"name\"), or options(...)",
+                        "expected an asm operand: in(reg) value, out(reg) Type, inout(reg) value, sym name, const value, clobber(\"name\"), or options(...)",
                     ));
                 }
             }
@@ -3179,6 +3312,17 @@ fn binary(token: &TokenKind) -> Option<(BinaryOp, u8, u8)> {
     Some((operator, precedence, precedence + 1))
 }
 
+fn field_attribute_misplaced(attribute: &crate::derive::Attribute) -> Diagnostic {
+    let owner = crate::derive::attribute(attribute.name).map_or("", |(owner, _)| owner.name);
+    Diagnostic::new(
+        attribute.span,
+        format!(
+            "@{} applies only to fields of @derive({owner}) structs",
+            attribute.name
+        ),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3332,6 +3476,87 @@ mod tests {
             (
                 "fn f() { asm(\"nop\", sideways(reg) 1) }",
                 "expected an asm operand",
+            ),
+        ] {
+            let error = parse(&format!("package p\n{source}\n")).unwrap_err();
+            assert!(
+                error.message.contains(message),
+                "{source}: {}",
+                error.message
+            );
+        }
+    }
+    #[test]
+    fn global_and_naked_assembly() {
+        let program = parse(
+            "package p\nunsafe asm(\n  \".globl {0}\",\n  \"{0}: movs r0, #{1}\",\n  sym boot.entry,\n  const LIMIT + 1,\n)\n@naked\n@section(\".ramfunc\")\npub extern \"C\" fn trampoline() -> u32 {\n unsafe {\n  asm(\"b {0}\", sym target)\n }\n}\n",
+        )
+        .unwrap();
+        let [global] = program.global_asm.as_slice() else {
+            panic!("one global asm block");
+        };
+        assert_eq!(global.asm.template, ".globl {0}\n{0}: movs r0, #{1}");
+        assert!(
+            matches!(&global.asm.operands[0].kind, AsmOperandKind::Sym(path) if path == "boot.entry")
+        );
+        assert!(matches!(
+            global.asm.operands[1].kind,
+            AsmOperandKind::Const(_)
+        ));
+        let trampoline = &program.functions[0];
+        assert!(trampoline.naked && trampoline.extern_);
+        assert_eq!(trampoline.placement.section.as_deref(), Some(".ramfunc"));
+        // A naked body keeps its form: no tail return is synthesized.
+        let asm = trampoline.naked_asm().expect("naked body");
+        assert!(matches!(&asm.operands[0].kind, AsmOperandKind::Sym(path) if path == "target"));
+        for (source, message) in [
+            ("asm(\"nop\")", "write it as `unsafe asm"),
+            (
+                "pub unsafe asm(\"nop\")",
+                "takes no attributes or modifiers",
+            ),
+            (
+                "@naked\nunsafe asm(\"nop\")",
+                "takes no attributes or modifiers",
+            ),
+            ("unsafe asm(\"nop\", sym)", "`sym` expects the name"),
+            (
+                "@naked\nstatic X: u32 = 1",
+                "@naked applies only to functions",
+            ),
+            (
+                "@naked @naked\nextern \"C\" fn f() { unsafe { asm(\"\") } }",
+                "duplicate @naked",
+            ),
+            ("@naked\nfn f() { unsafe { asm(\"\") } }", "@naked requires"),
+            ("@naked\nextern \"C\" fn f()", "@naked requires"),
+            (
+                "@naked\nextern \"C\" fn f<T>() { unsafe { asm(\"\") } }",
+                "@naked requires",
+            ),
+            (
+                "@naked @cold\nextern \"C\" fn f() { unsafe { asm(\"\") } }",
+                "@naked requires",
+            ),
+            (
+                "@naked\nasync extern \"C\" fn f() { unsafe { asm(\"\") } }",
+                "@naked requires",
+            ),
+            (
+                "struct S {\n @naked\n extern \"C\" fn f() { unsafe { asm(\"\") } }\n}",
+                "@naked requires",
+            ),
+            (
+                "@naked\nextern \"C\" fn f() { asm(\"\") }",
+                "exactly one `unsafe { asm(...) }`",
+            ),
+            (
+                "@naked\nextern \"C\" fn f() { unsafe { asm(\"\") }\n unsafe { asm(\"\") } }",
+                "exactly one",
+            ),
+            (
+                "@naked\nextern \"C\" fn f() { unsafe { x := 1 } }",
+                "exactly one",
             ),
         ] {
             let error = parse(&format!("package p\n{source}\n")).unwrap_err();

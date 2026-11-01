@@ -235,6 +235,7 @@ fn expand_function(function: &Function, future: &str, alias: &str) -> (Struct, V
         link_name: None,
         placement: Placement::default(),
         inlining: crate::ast::Inlining::Auto,
+        naked: false,
         async_part: Some(part),
     };
     let mut parts = vec![method(

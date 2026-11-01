@@ -62,6 +62,7 @@ they are not prerequisites for using the safe entry APIs.
 | React to MQTT messages or publish on a timer | `app.new(id).on(...).every(...).run(url)` from `std/mqtt/app` | [MQTT](mqtt.md) |
 | Run an MQTT broker | `broker.new().run(address)` from `std/mqtt/broker` | [MQTT](mqtt.md#the-broker) |
 | Store data in an SQL database file | `sqlite.Connection.open(path, workspace)` and `execute`/`select` from `std/db/sqlite` | [SQLite databases](sqlite.md) |
+| Map SQL rows to structs | `@derive(Row)`, then `T.decode_row(&row)` and `value.params()` | [SQLite databases](sqlite.md#mapping-rows-to-structs) |
 | Run Lua scripts or plugins inside a program | `lua.Lua.new()`, `open_libs()` and `cx.do_string` from `std/script/lua` | [Embedded scripting with Lua](script.md) |
 
 Use a fresh directory for each copied example and run the commands there.

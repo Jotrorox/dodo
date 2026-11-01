@@ -188,3 +188,42 @@ fn objects_never_reference_unwinding_personality_routines() {
             .collect::<Vec<_>>()
     );
 }
+
+#[test]
+fn result_and_enum_payloads_are_stored_as_integer_words() {
+    // LLVM returns every array element of a first-class aggregate in its own
+    // register. Byte storage made an `i64!E` result need nine values, which
+    // demoted the return to memory and reassembled the payload byte by byte.
+    let mut program = parser::parse(
+        "package payloads\n\
+         pub struct Throw { pub code: i32 }\n\
+         pub enum Mixed { Byte(u8), Pair(u16, u32), Wide(u64) }\n\
+         pub fn wide(x: i64) -> i64!Throw { if x < 0 { return err(Throw { code: 1 }) } return ok(x) }\n\
+         pub fn narrow(x: i32) -> i32!u8 { if x < 0 { return err(1u8) } return ok(x) }\n\
+         pub fn bytes(x: u8) -> u8!u8 { if x == 0 { return err(1u8) } return ok(x) }\n\
+         pub fn mixed(x: u64) -> Mixed { return Mixed.Wide(x) }\n",
+    )
+    .unwrap();
+    sema::check(&mut program).unwrap();
+    // 32-bit targets cap the word at a pointer.
+    for (target, words) in [(None, "1 x i64"), (Some("thumbv6m-none-eabi"), "2 x i32")] {
+        let context = Context::create();
+        let options = Options {
+            target: target.map(Into::into),
+            ..Default::default()
+        };
+        let generated = codegen::generate(&context, &program, &options).unwrap();
+        let ir = generated.module.print_to_string();
+        for expected in [
+            format!("{{ i1, {{ [0 x i64], [{words}] }} }} @dodo.payloads.wide("),
+            "{ i1, { [0 x i32], [1 x i32] } } @dodo.payloads.narrow(".to_string(),
+            "{ i1, { [0 x i8], [1 x i8] } } @dodo.payloads.bytes(".to_string(),
+            format!("%Mixed = type {{ i32, {{ [0 x {{ i64 }}], [{words}] }} }}"),
+        ] {
+            assert!(
+                ir.contains(&expected),
+                "{target:?}: missing `{expected}` in\n{ir}"
+            );
+        }
+    }
+}
