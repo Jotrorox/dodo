@@ -22,6 +22,19 @@
   common pragmas, and SQLite's core, aggregate, and date/time functions with
   its type affinity rules. Differential tests compare results and written
   files against SQLite. See the new [SQLite guide](docs/src/content/docs/sqlite.md).
+- `@derive(Row)` maps structs to SQL rows for any `std/db/sql` driver. It
+  generates `decode_row<R: sql.Row>(row: &R) -> Self!db.Error`, which matches
+  columns by name and borrows text and blobs from the row without copying, and
+  `params(&self) -> [N]db.Value` for statement parameters. Fields can be
+  integers, floats, `bool`, `&str`, `&[u8]`, `Option<T>` for NULL, and custom
+  column types with `decode_value`/`encode_value` methods. `@db_name("column")`
+  renames a column and `@db_flatten` decodes a nested Row struct for joins.
+  Conversions report `db.ErrorKind.Type` errors instead of trapping, and the
+  same helpers (`sql.column`, `sql.int_in`, `sql.text`, ...) are available
+  to hand-written decoders.
+- Derives now go through a small registry in the compiler: `@derive` accepts
+  a list (`@derive(Json, Row)`), and each derive declares the attributes it
+  owns, so misplaced or foreign attributes get precise errors.
 - `fs.File.try_lock_range(start, length, shared)` and `unlock_range` take
   non-blocking advisory byte-range locks (POSIX `fcntl` record locks through
   the fs C adapter, `LockFileEx` on Windows).

@@ -413,9 +413,11 @@ conflicting aliases. Prefer passing state explicitly or using
 | `@unsafe_send`, `@unsafe_sync` | `unsafe struct`: explicit unsafe thread transfer/sharing contract; see [threads](threads.md). |
 | `@test` | Safe nongeneric top-level void function with no parameters; see [testing](testing.md). |
 | `@ignore("reason")` | Test function: skipped unless ignored tests are selected. |
-| `@derive(Json)` | Struct: generate supported JSON methods; see [JSON](json.md). |
+| `@derive(Json, Row)` | Struct: generate methods for each listed derive. `Json` adds JSON codecs, see [JSON](json.md); `Row` maps SQL rows and parameters, see [SQLite](sqlite.md#mapping-rows-to-structs). |
 | `@json_name("name")` | Field of a JSON-derived struct: select its external key. |
 | `@json_deny_unknown` | JSON-derived struct: reject unknown fields. |
+| `@db_name("column")` | Field of a Row-derived struct: select its column name. |
+| `@db_flatten` | Field of a Row-derived struct: decode a nested Row-derived struct from the same row. |
 | `@interrupt(VECTOR)` | Private, safe, nongeneric top-level `fn name()`: the hardware's handler for `VECTOR`; see [interrupts](hardware.md#interrupts). |
 | `@link_name("symbol")` | `extern "C"` prototype: bind `symbol` instead of the function's name; several prototypes may bind one symbol with different signatures; see [FFI](memory-and-ffi.md#struct-layout-and-the-c-abi). |
 | `@section("name")` | Function or `static`: place it in an object file section, and keep it even if unreferenced. |

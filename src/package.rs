@@ -1028,6 +1028,13 @@ fn rename_implicit_imports(program: &mut Program, aliases: &BTreeMap<String, Str
         missing_imports: RefCell::new(BTreeSet::new()),
     };
     for function in &mut program.functions {
+        // Derived methods may bound a generic by an implicitly imported
+        // interface (`R: sql.Row`).
+        for bound in &mut function.bounds {
+            for interface in &mut bound.interfaces {
+                *interface = names.name(interface, &BTreeSet::new());
+            }
+        }
         let generics = function.generics.iter().cloned().collect();
         let mut locals = BTreeSet::new();
         for parameter in &mut function.params {
@@ -1035,6 +1042,9 @@ fn rename_implicit_imports(program: &mut Program, aliases: &BTreeMap<String, Str
             names.ty(&mut parameter.ty, &generics);
         }
         names.ty(&mut function.ret, &generics);
+        for required in &mut function.requires_plain {
+            names.ty(required, &generics);
+        }
         if let Some(body) = &mut function.body {
             names.block(body, &mut locals, &generics);
         }
