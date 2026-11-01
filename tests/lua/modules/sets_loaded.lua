@@ -1,0 +1,3 @@
+-- fixture module that stores its own value in package.loaded and returns nothing
+local name = ...
+package.loaded[name] = {self_registered = true}

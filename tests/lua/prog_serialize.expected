@@ -1,0 +1,81 @@
+@@exit 0
+@@stdout
+== simple: 395 bytes, 3 lines, iso=true
+local t = {}
+return {[-1]="neg",[1]=1,[0x1.8p+0]="float key",[2]=0x1.4p+1,[3]="three",[4]=true,[5]=false,[6]=-0.0,[7]=math.huge,[8]=-math.huge,[9]=math.mininteger,[10]=9223372036854775807,[11]=0x1.999999999999ap-4,[12]=0x1.7e43c8800759cp+996,[13]=0x1p-60,[20]="sparse",["end"]="kw",name="x",nested={deeper={deepest={[1]="bottom"}}},quote="a\"b\\c\
+d\0e\127",["with space"]="y",[true]="bool key"}
+== nan: 39 bytes, 2 lines, iso=true
+nan back:	true	true
+== dag: 102 bytes, 3 lines, iso=true
+local t = {}
+t.t1 = {[1]="shared leaf"}
+return {a=t.t1,b=t.t1,list={[1]=t.t1,[2]=t.t1,[3]={[1]=t.t1}}}
+sharing preserved:	true	true	true
+== cycle: 145 bytes, 6 lines, iso=true
+local t = {}
+t.t2 = {name="n2"}
+t.t1 = {name="n1",next=t.t2}
+t.t2["next"] = t.t1
+t.t1["self"] = t.t1
+return {head=t.t1,items={[1]=t.t1,[2]=t.t2}}
+cycle preserved:	true	true	true
+== selfroot: 116 bytes, 6 lines, iso=true
+local t = {}
+t.t2 = {[1]="k"}
+t.t1 = {holder={[t.t2]=t.t2}}
+t.t1["me"] = t.t1
+t.t1[t.t1] = "root as key"
+return t.t1
+root ok:	true	true	true
+{
+  [-1] = "neg",
+  [1] = 1,
+  [0x1.8p+0] = "float key",
+  [2] = 0x1.4p+1,
+  [3] = "three",
+  [4] = true,
+  [5] = false,
+  [6] = -0.0,
+  [7] = math.huge,
+  [8] = -math.huge,
+  [9] = math.mininteger,
+  [10] = 9223372036854775807,
+  [11] = 0x1.999999999999ap-4,
+  [12] = 0x1.7e43c8800759cp+996,
+  [13] = 0x1p-60,
+  [20] = "sparse",
+  ["end"] = "kw",
+  name = "x",
+  nested = {
+    deeper = {
+      deepest = {...},
+    },
+  },
+  quote = "a\"b\\c\
+d\0e\127",
+  ["with space"] = "y",
+  [true] = "bool key",
+}
+{
+  head = {
+    name = "n1",
+    next = {
+      name = "n2",
+      next = <cycle>,
+    },
+    self = <cycle>,
+  },
+  items = {
+    [1] = {
+      name = "n1",
+      next = {...},
+      self = <cycle>,
+    },
+    [2] = {
+      name = "n2",
+      next = {...},
+    },
+  },
+}
+false	cannot serialize a function
+false	cannot serialize a thread
