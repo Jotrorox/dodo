@@ -84,7 +84,7 @@ module asm "    li t1, 0x600b1c00"                        ; LP_WDT
 module asm "    sw t0, 0x18(t1)"                          ; unlock
 module asm "    sw zero, 0x00(t1)"                        ; CONFIG0: off
 module asm "    sw zero, 0x18(t1)"                        ; lock
-module asm "    li t2, 0x8f1d312a"                        ; super watchdog key
+module asm "    li t2, 0x50d83aa1"                        ; super watchdog key
 module asm "    sw t2, 0x20(t1)"
 module asm "    lw t3, 0x1c(t1)"                          ; SWD_CONF:
 module asm "    li t4, 0x40000"                           ; feed itself

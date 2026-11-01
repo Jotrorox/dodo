@@ -399,6 +399,7 @@ pub fn take() -> Peripherals!hal.Error {
         start_clocks()?
         start_timer()
         start_watchdog_clock()
+        start_modem_clocks()
     }
     // SAFETY: TAKEN guarantees one Rng, Watchdog, Rtc, and Flash: the only
     // users of RNG_DATA and the converter's noise setup, of TIMG0's
@@ -466,6 +467,46 @@ unsafe fn start_watchdog_clock() {
         mmio.write32(PCR_TIMERGROUP0_WDT_CLK_CONF, SCLK_ENABLE)
     }
 }
+
+// The modem clock domain's gating in the PMU's active state, as Espressif's
+// start-up code sets it: the active state's modem gating code
+// (PMU HP_ACTIVE_ICG_MODEM, code 2), and that code ungating the modem APB
+// clock (MODEM_SYSCON CLK_CONF_POWER_ST.CLK_MODEM_APB_ST_MAP) and the LP
+// APB and analog I2C master clocks (MODEM_LPCON CLK_CONF_POWER_ST), applied
+// at once (PMU IMM_MODEM_ICG, IMM_SLEEP_SYSCLK). The analog I2C master
+// reaches the ADC, the temperature sensor's calibration, and the random
+// number generator's noise source. The PMU keeps these through every reset
+// but a power-up, so firmware that changed them, as low-power code does,
+// would otherwise leave the analog bus dead for the next program.
+// SAFETY: the caller owns the PMU's active-state configuration.
+unsafe fn start_modem_clocks() {
+    unsafe {
+        icg := mmio.read32(PMU_HP_ACTIVE_ICG_MODEM) & ~ICG_MODEM_CODE
+        mmio.write32(PMU_HP_ACTIVE_ICG_MODEM, icg | hal.encode(ICG_MODEM_CODE, ICG_MODEM_CODE_ACTIVE))
+        syscon := mmio.read32(MODEM_SYSCON_CLK_CONF_POWER_ST)
+        mmio.write32(MODEM_SYSCON_CLK_CONF_POWER_ST, syscon | hal.encode(MODEM_APB_ST_MAP, ICG_ACTIVE_BIT))
+        lpcon := mmio.read32(MODEM_LPCON_CLK_CONF_POWER_ST)
+        mmio.write32(MODEM_LPCON_CLK_CONF_POWER_ST, lpcon | hal.encode(I2C_MST_ST_MAP, ICG_ACTIVE_BIT) | hal.encode(LP_APB_ST_MAP, ICG_ACTIVE_BIT))
+        mmio.write32(PMU_IMM_MODEM_ICG, UPDATE_DIG_ICG_MODEM)
+        mmio.write32(PMU_IMM_SLEEP_SYSCLK, UPDATE_DIG_ICG_SWITCH)
+    }
+}
+
+const PMU_BASE: usize = 0x600B_0000
+const PMU_HP_ACTIVE_ICG_MODEM: usize = PMU_BASE + 0x0C
+const PMU_IMM_SLEEP_SYSCLK: usize = PMU_BASE + 0xD0
+const PMU_IMM_MODEM_ICG: usize = PMU_BASE + 0xDC
+const ICG_MODEM_CODE: u32 = 0b11 << 30
+const ICG_MODEM_CODE_ACTIVE: u32 = 2
+const UPDATE_DIG_ICG_MODEM: u32 = 1 << 31
+const UPDATE_DIG_ICG_SWITCH: u32 = 1 << 28
+const MODEM_SYSCON_CLK_CONF_POWER_ST: usize = 0x600A_980C
+const MODEM_APB_ST_MAP: u32 = 0xF << 28
+const MODEM_LPCON_CLK_CONF_POWER_ST: usize = 0x600A_F020
+const I2C_MST_ST_MAP: u32 = 0xF << 24
+const LP_APB_ST_MAP: u32 = 0xF << 28
+// The bit of the active state's gating code in a *_ST_MAP field.
+const ICG_ACTIVE_BIT: u32 = 1 << ICG_MODEM_CODE_ACTIVE
 
 // Let unit 0 count and stop it while a debugger halts the core.
 // SAFETY: the caller owns the system timer's configuration.
@@ -809,7 +850,7 @@ pub struct Pins {
         // SAFETY: the claim makes this the pin's only owner; the first input
         // starts the converter.
         unsafe {
-            if self.analog_inputs == 0 {
+            if (self.analog_inputs & ~TEMPERATURE_BIT) == 0 {
                 start_adc()
             }
             address := IO_MUX_BASE + 4 * pin as usize
@@ -1704,6 +1745,8 @@ const PCR_RMT_CONF: usize = PCR_BASE + 0x02C
 const PCR_RMT_SCLK_CONF: usize = PCR_BASE + 0x030
 const PCR_LEDC_CONF: usize = PCR_BASE + 0x034
 const PCR_LEDC_SCLK_CONF: usize = PCR_BASE + 0x038
+const PCR_SARADC_CONF: usize = PCR_BASE + 0x080
+const PCR_SARADC_CLKM_CONF: usize = PCR_BASE + 0x084
 const PCR_TSENS_CLK_CONF: usize = PCR_BASE + 0x088
 const PCR_GDMA_CONF: usize = PCR_BASE + 0x0BC
 const PCR_SPI2_CONF: usize = PCR_BASE + 0x0C0
@@ -2206,6 +2249,14 @@ fn signed_field(value: u32, width: u32) -> i32 {
 // SAFETY: the caller owns the ADC.
 unsafe fn start_adc() {
     unsafe {
+        // The converter's register clock (PCR_SARADC_CONF.SARADC_REG_CLK_EN)
+        // and its function clock (PCR_SARADC_CLKM_CONF.SARADC_CLKM_EN, the
+        // crystal undivided). PCR keeps its contents through the resets that
+        // flashing and the watchdogs cause, so earlier firmware may have
+        // stopped them.
+        mmio.write32(PCR_SARADC_CONF, mmio.read32(PCR_SARADC_CONF) | (1u32 << 2))
+        clocks := mmio.read32(PCR_SARADC_CLKM_CONF) & ~((3u32 << 20) | (0xFFu32 << 12))
+        mmio.write32(PCR_SARADC_CLKM_CONF, clocks | (1u32 << 22))
         control := mmio.read32(SARADC_CTRL)
         mmio.write32(SARADC_CTRL, control | SARADC_FORCED)
         sar_write(2, 6, 4, 1)
