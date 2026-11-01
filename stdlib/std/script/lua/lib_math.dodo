@@ -1,7 +1,643 @@
 package lua
 
-// Stub: replaced by the math library implementation.
+import "core/ptr"
+
+// The math library (Lua 5.4 manual §6.7), including the functions kept by
+// the reference build's 5.3 compatibility option (atan2, cosh, sinh, tanh,
+// pow, frexp, ldexp, log10, deg, rad).
+//
+// Floating-point functions call the platform C library so results are
+// bit-identical to the reference interpreter on the same machine. The
+// pseudo-random generator is xoshiro256** (Blackman and Vigna), seeded and
+// consumed the way Lua 5.4 specifies, so `math.randomseed(n)` reproduces the
+// reference interpreter's sequences.
+
+@link_name("sin")
+unsafe extern "C" fn mth_c_sin(x: f64) -> f64
+@link_name("cos")
+unsafe extern "C" fn mth_c_cos(x: f64) -> f64
+@link_name("tan")
+unsafe extern "C" fn mth_c_tan(x: f64) -> f64
+@link_name("asin")
+unsafe extern "C" fn mth_c_asin(x: f64) -> f64
+@link_name("acos")
+unsafe extern "C" fn mth_c_acos(x: f64) -> f64
+@link_name("atan2")
+unsafe extern "C" fn mth_c_atan2(y: f64, x: f64) -> f64
+@link_name("exp")
+unsafe extern "C" fn mth_c_exp(x: f64) -> f64
+@link_name("log")
+unsafe extern "C" fn mth_c_log(x: f64) -> f64
+@link_name("log2")
+unsafe extern "C" fn mth_c_log2(x: f64) -> f64
+@link_name("log10")
+unsafe extern "C" fn mth_c_log10(x: f64) -> f64
+@link_name("pow")
+unsafe extern "C" fn mth_c_pow(x: f64, y: f64) -> f64
+@link_name("fmod")
+unsafe extern "C" fn mth_c_fmod(x: f64, y: f64) -> f64
+@link_name("sqrt")
+unsafe extern "C" fn mth_c_sqrt(x: f64) -> f64
+@link_name("floor")
+unsafe extern "C" fn mth_c_floor(x: f64) -> f64
+@link_name("ceil")
+unsafe extern "C" fn mth_c_ceil(x: f64) -> f64
+@link_name("fabs")
+unsafe extern "C" fn mth_c_fabs(x: f64) -> f64
+@link_name("sinh")
+unsafe extern "C" fn mth_c_sinh(x: f64) -> f64
+@link_name("cosh")
+unsafe extern "C" fn mth_c_cosh(x: f64) -> f64
+@link_name("tanh")
+unsafe extern "C" fn mth_c_tanh(x: f64) -> f64
+@link_name("frexp")
+unsafe extern "C" fn mth_c_frexp(x: f64, e: *mut i32) -> f64
+@link_name("ldexp")
+unsafe extern "C" fn mth_c_ldexp(x: f64, e: i32) -> f64
+@link_name("time")
+unsafe extern "C" fn mth_c_time(t: *mut i64) -> i64
+
+const MTH_PI: f64 = 3.141592653589793
+
+// --- Argument helpers -------------------------------------------------------
+
+// Float value of argument `arg` (numeric strings convert), raising the
+// standard "number expected" error otherwise. Plain numbers take a fast path.
+fn mth_num(cx: &mut Cx, arg: i32, out: &mut f64) -> void!Throw {
+    unsafe {
+        let v = cx.idx2val(arg)
+        let t = (*v).tag
+        if t == TAG_FLOAT {
+            *out = val_float(v)
+            return ok()
+        }
+        if t == TAG_INT {
+            *out = val_int(v) as f64
+            return ok()
+        }
+        *out = cx.check_number(arg)?
+        return ok()
+    }
+}
+
+// Push a float, as an integer when it has an exact integer representation.
+fn mth_push_numint(cx: &mut Cx, d: f64) {
+    unsafe {
+        n: i64 = 0
+        if flt_to_int(d, ptr.from_mut(&mut n), F2I_EQ) {
+            cx.push_integer(n)
+        } else {
+            cx.push_number(d)
+        }
+    }
+}
+
+fn mth_bits_u(i: i64) -> u64 {
+    return i2u(i)
+}
+
+// --- Basic functions ----------------------------------------------------------
+
+fn mth_abs(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        if cx.is_integer(1) {
+            let n = val_int(cx.idx2val(1))
+            if n < 0 {
+                // The negation of mininteger wraps around to itself.
+                cx.push_integer(core.wrapping_sub(0i64, n))
+            } else {
+                cx.push_integer(n)
+            }
+            return ok(1)
+        }
+        x: f64 = 0.0
+        mth_num(cx, 1, &mut x)?
+        cx.push_number(mth_c_fabs(x))
+        return ok(1)
+    }
+}
+
+fn mth_floor(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        if cx.is_integer(1) {
+            cx.set_top(1)
+            return ok(1)
+        }
+        x: f64 = 0.0
+        mth_num(cx, 1, &mut x)?
+        mth_push_numint(cx, mth_c_floor(x))
+        return ok(1)
+    }
+}
+
+fn mth_ceil(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        if cx.is_integer(1) {
+            cx.set_top(1)
+            return ok(1)
+        }
+        x: f64 = 0.0
+        mth_num(cx, 1, &mut x)?
+        mth_push_numint(cx, mth_c_ceil(x))
+        return ok(1)
+    }
+}
+
+fn mth_fmod(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        if cx.is_integer(1) && cx.is_integer(2) {
+            let m = val_int(cx.idx2val(1))
+            let d = val_int(cx.idx2val(2))
+            if d == 0 {
+                return err(cx.arg_error(2, "zero"))
+            }
+            if d == -1 {
+                // Avoid the overflow of mininteger % -1; the result is 0.
+                cx.push_integer(0)
+            } else {
+                // C remainder: truncated division, sign of the dividend.
+                cx.push_integer(m % d)
+            }
+            return ok(1)
+        }
+        a: f64 = 0.0
+        b: f64 = 0.0
+        mth_num(cx, 1, &mut a)?
+        mth_num(cx, 2, &mut b)?
+        cx.push_number(mth_c_fmod(a, b))
+        return ok(1)
+    }
+}
+
+// Integral part (towards zero) and fractional part.
+fn mth_modf(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        if cx.is_integer(1) {
+            cx.set_top(1)
+            cx.push_number(0.0)
+            return ok(2)
+        }
+        x: f64 = 0.0
+        mth_num(cx, 1, &mut x)?
+        let ip = if x < 0.0 {
+            mth_c_ceil(x)
+        } else {
+            mth_c_floor(x)
+        }
+        mth_push_numint(cx, ip)
+        // Infinities have no fractional part (inf - inf would be NaN).
+        if x == ip {
+            cx.push_number(0.0)
+        } else {
+            cx.push_number(x - ip)
+        }
+        return ok(2)
+    }
+}
+
+fn mth_sqrt(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        x: f64 = 0.0
+        mth_num(cx, 1, &mut x)?
+        cx.push_number(mth_c_sqrt(x))
+        return ok(1)
+    }
+}
+
+fn mth_exp(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        x: f64 = 0.0
+        mth_num(cx, 1, &mut x)?
+        cx.push_number(mth_c_exp(x))
+        return ok(1)
+    }
+}
+
+fn mth_log(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        x: f64 = 0.0
+        mth_num(cx, 1, &mut x)?
+        if cx.is_none_or_nil(2) {
+            cx.push_number(mth_c_log(x))
+            return ok(1)
+        }
+        b: f64 = 0.0
+        mth_num(cx, 2, &mut b)?
+        if b == 2.0 {
+            cx.push_number(mth_c_log2(x))
+        } else if b == 10.0 {
+            cx.push_number(mth_c_log10(x))
+        } else {
+            cx.push_number(mth_c_log(x) / mth_c_log(b))
+        }
+        return ok(1)
+    }
+}
+
+fn mth_sin(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        x: f64 = 0.0
+        mth_num(cx, 1, &mut x)?
+        cx.push_number(mth_c_sin(x))
+        return ok(1)
+    }
+}
+
+fn mth_cos(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        x: f64 = 0.0
+        mth_num(cx, 1, &mut x)?
+        cx.push_number(mth_c_cos(x))
+        return ok(1)
+    }
+}
+
+fn mth_tan(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        x: f64 = 0.0
+        mth_num(cx, 1, &mut x)?
+        cx.push_number(mth_c_tan(x))
+        return ok(1)
+    }
+}
+
+fn mth_asin(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        x: f64 = 0.0
+        mth_num(cx, 1, &mut x)?
+        cx.push_number(mth_c_asin(x))
+        return ok(1)
+    }
+}
+
+fn mth_acos(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        x: f64 = 0.0
+        mth_num(cx, 1, &mut x)?
+        cx.push_number(mth_c_acos(x))
+        return ok(1)
+    }
+}
+
+// atan(y [, x]): the angle of (x, y), x defaulting to 1.
+fn mth_atan(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        y: f64 = 0.0
+        mth_num(cx, 1, &mut y)?
+        x: f64 = 1.0
+        if !cx.is_none_or_nil(2) {
+            mth_num(cx, 2, &mut x)?
+        }
+        cx.push_number(mth_c_atan2(y, x))
+        return ok(1)
+    }
+}
+
+// Integer value of a number or numeric string, else fail.
+fn mth_tointeger(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        match cx.to_integer(1) {
+            some(n) => {
+                cx.push_integer(n)
+            },
+            none => {
+                cx.check_any(1)?
+                cx.push_fail()
+            },
+        }
+        return ok(1)
+    }
+}
+
+fn mth_type(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        if cx.type_of(1) == TNUMBER {
+            if cx.is_integer(1) {
+                cx.push_str("integer")?
+            } else {
+                cx.push_str("float")?
+            }
+            return ok(1)
+        }
+        cx.check_any(1)?
+        cx.push_fail()
+        return ok(1)
+    }
+}
+
+// Unsigned comparison of two integers.
+fn mth_ult(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        let a = cx.check_integer(1)?
+        let b = cx.check_integer(2)?
+        cx.push_boolean(mth_bits_u(a) < mth_bits_u(b))
+        return ok(1)
+    }
+}
+
+// Shared body of max/min: the argument that wins the `<` comparisons
+// (with metamethods; the original value is returned, not a conversion).
+fn mth_extreme(cx: &mut Cx, want_max: bool) -> i32!Throw {
+    unsafe {
+        let n = cx.get_top()
+        cx.arg_check(n >= 1, 1, "value expected")?
+        best := 1i32
+        for i in 2i32..(n + 1) {
+            let better = if want_max {
+                cx.compare(best, i, OPLT)?
+            } else {
+                cx.compare(i, best, OPLT)?
+            }
+            if better {
+                best = i
+            }
+        }
+        cx.push_value(best)
+        return ok(1)
+    }
+}
+
+fn mth_max(cx: &mut Cx) -> i32!Throw {
+    return mth_extreme(cx, true)
+}
+
+fn mth_min(cx: &mut Cx) -> i32!Throw {
+    return mth_extreme(cx, false)
+}
+
+// --- 5.3 compatibility functions ----------------------------------------------
+
+fn mth_cosh(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        x: f64 = 0.0
+        mth_num(cx, 1, &mut x)?
+        cx.push_number(mth_c_cosh(x))
+        return ok(1)
+    }
+}
+
+fn mth_sinh(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        x: f64 = 0.0
+        mth_num(cx, 1, &mut x)?
+        cx.push_number(mth_c_sinh(x))
+        return ok(1)
+    }
+}
+
+fn mth_tanh(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        x: f64 = 0.0
+        mth_num(cx, 1, &mut x)?
+        cx.push_number(mth_c_tanh(x))
+        return ok(1)
+    }
+}
+
+fn mth_pow(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        x: f64 = 0.0
+        y: f64 = 0.0
+        mth_num(cx, 1, &mut x)?
+        mth_num(cx, 2, &mut y)?
+        cx.push_number(mth_c_pow(x, y))
+        return ok(1)
+    }
+}
+
+fn mth_frexp(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        x: f64 = 0.0
+        mth_num(cx, 1, &mut x)?
+        e: i32 = 0
+        let m = mth_c_frexp(x, ptr.from_mut(&mut e))
+        cx.push_number(m)
+        cx.push_integer(e as i64)
+        return ok(2)
+    }
+}
+
+fn mth_ldexp(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        x: f64 = 0.0
+        mth_num(cx, 1, &mut x)?
+        let e = cx.check_integer(2)?
+        // The exponent is passed as a C int: keep its low 32 bits.
+        let low = (mth_bits_u(e) & 0xFFFFFFFF) as u32
+        lv := low
+        let e32 = *(ptr.from_mut(&mut lv) as *mut i32)
+        cx.push_number(mth_c_ldexp(x, e32))
+        return ok(1)
+    }
+}
+
+fn mth_log10(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        x: f64 = 0.0
+        mth_num(cx, 1, &mut x)?
+        cx.push_number(mth_c_log10(x))
+        return ok(1)
+    }
+}
+
+fn mth_deg(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        x: f64 = 0.0
+        mth_num(cx, 1, &mut x)?
+        cx.push_number(x * (180.0 / MTH_PI))
+        return ok(1)
+    }
+}
+
+fn mth_rad(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        x: f64 = 0.0
+        mth_num(cx, 1, &mut x)?
+        cx.push_number(x * (MTH_PI / 180.0))
+        return ok(1)
+    }
+}
+
+// --- Pseudo-random numbers ------------------------------------------------------
+//
+// State: four 64-bit words in a userdata shared (as upvalue 1) by `random`
+// and `randomseed`.
+
+// Rotate left by k (0 < k < 64); the multiplication is a wrapping shift.
+fn rnd_rotl(x: u64, k: u64) -> u64 {
+    return core.wrapping_mul(x, 1u64 << k) | (x >> (64 - k))
+}
+
+// Advance the xoshiro256** state and return the next 64-bit output.
+fn rnd_next(s: *mut u64) -> u64 {
+    unsafe {
+        let p1 = ptr.offset(s, 1)
+        let p2 = ptr.offset(s, 2)
+        let p3 = ptr.offset(s, 3)
+        let s0 = *s
+        let s1 = *p1
+        let s2 = *p2 ^ s0
+        let s3 = *p3 ^ s1
+        let out = core.wrapping_mul(rnd_rotl(core.wrapping_mul(s1, 5u64), 7), 9u64)
+        *s = s0 ^ s3
+        *p1 = s1 ^ s2
+        *p2 = s2 ^ core.wrapping_mul(s1, 1u64 << 17)
+        *p3 = rnd_rotl(s3, 45)
+        return out
+    }
+}
+
+// Seed the generator from two integers and push them (the values that
+// reproduce this sequence when given back to randomseed).
+fn rnd_seed(cx: &mut Cx, s: *mut u64, n1: i64, n2: i64) {
+    unsafe {
+        *s = mth_bits_u(n1)
+        // A non-zero word keeps the state away from the all-zero fixpoint.
+        *ptr.offset(s, 1) = 0xff
+        *ptr.offset(s, 2) = mth_bits_u(n2)
+        *ptr.offset(s, 3) = 0
+        // Discard the first outputs so similar seeds diverge.
+        for i in 0i32..16 {
+            rnd_next(s)
+        }
+        cx.push_integer(n1)
+        cx.push_integer(n2)
+    }
+}
+
+// Seed from the clock and the state's address (not reproducible).
+fn rnd_seed_default(cx: &mut Cx, s: *mut u64) {
+    unsafe {
+        let t = mth_c_time(0 as *mut i64)
+        let a = cx.L as usize as u64
+        rnd_seed(cx, s, t, u2i(a))
+    }
+}
+
+fn rnd_state(cx: &mut Cx) -> *mut u64 {
+    unsafe {
+        return cx.to_userdata(upvalue_index(1)) as *mut u64
+    }
+}
+
+// Map a uniform 64-bit value into [0, n]: mask to the smallest 2^b - 1
+// covering n and redraw while the result falls above n.
+fn rnd_project(ran0: u64, n: u64, s: *mut u64) -> u64 {
+    if (n & core.wrapping_add(n, 1u64)) == 0 {
+        // n + 1 is a power of two (or n is the full range): masking is exact.
+        return ran0 & n
+    }
+    lim := n
+    lim = lim | (lim >> 1)
+    lim = lim | (lim >> 2)
+    lim = lim | (lim >> 4)
+    lim = lim | (lim >> 8)
+    lim = lim | (lim >> 16)
+    lim = lim | (lim >> 32)
+    ran := ran0 & lim
+    for ran > n {
+        ran = rnd_next(s) & lim
+    }
+    return ran
+}
+
+fn mth_random(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        let s = rnd_state(cx)
+        // The state advances even when the arguments turn out to be invalid.
+        let rv = rnd_next(s)
+        low: i64 = 1
+        up: i64 = 0
+        let n = cx.get_top()
+        if n == 0 {
+            // Float in [0, 1) from the top 53 bits.
+            cx.push_number(((rv >> 11) as f64) * (0.5 / 4503599627370496.0))
+            return ok(1)
+        } else if n == 1 {
+            up = cx.check_integer(1)?
+            if up == 0 {
+                cx.push_integer(u2i(rv))
+                return ok(1)
+            }
+        } else if n == 2 {
+            low = cx.check_integer(1)?
+            up = cx.check_integer(2)?
+        } else {
+            return err(cx.error_msg("wrong number of arguments"))
+        }
+        cx.arg_check(low <= up, 1, "interval is empty")?
+        let span = core.wrapping_sub(mth_bits_u(up), mth_bits_u(low))
+        let p = rnd_project(rv, span, s)
+        cx.push_integer(u2i(core.wrapping_add(p, mth_bits_u(low))))
+        return ok(1)
+    }
+}
+
+fn mth_randomseed(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        let s = rnd_state(cx)
+        if cx.is_none(1) {
+            rnd_seed_default(cx, s)
+        } else {
+            let n1 = cx.check_integer(1)?
+            let n2 = cx.opt_integer(2, 0)?
+            rnd_seed(cx, s, n1, n2)
+        }
+        return ok(2)
+    }
+}
+
+// --- Registration ---------------------------------------------------------------
+
 pub fn open_math(cx: &mut Cx) -> i32!Throw {
-    cx.create_table(0, 0)?
-    return ok(1)
+    unsafe {
+        let funcs = [
+            ("abs", mth_abs),
+            ("ceil", mth_ceil),
+            ("floor", mth_floor),
+            ("fmod", mth_fmod),
+            ("modf", mth_modf),
+            ("sqrt", mth_sqrt),
+            ("exp", mth_exp),
+            ("log", mth_log),
+            ("sin", mth_sin),
+            ("cos", mth_cos),
+            ("tan", mth_tan),
+            ("asin", mth_asin),
+            ("acos", mth_acos),
+            ("atan", mth_atan),
+            ("tointeger", mth_tointeger),
+            ("type", mth_type),
+            ("ult", mth_ult),
+            ("max", mth_max),
+            ("min", mth_min),
+            ("atan2", mth_atan),
+            ("cosh", mth_cosh),
+            ("sinh", mth_sinh),
+            ("tanh", mth_tanh),
+            ("pow", mth_pow),
+            ("frexp", mth_frexp),
+            ("ldexp", mth_ldexp),
+            ("log10", mth_log10),
+            ("deg", mth_deg),
+            ("rad", mth_rad),
+        ]
+        cx.create_table(0, 40)?
+        cx.set_funcs(&funcs, 0)?
+        cx.push_number(MTH_PI)
+        cx.set_field(-2, "pi")?
+        cx.push_number(1.0 / 0.0)
+        cx.set_field(-2, "huge")?
+        cx.push_integer(9223372036854775807)
+        cx.set_field(-2, "maxinteger")?
+        cx.push_integer(-9223372036854775807 - 1)
+        cx.set_field(-2, "mininteger")?
+        // Generator state, shared by random and randomseed as upvalue 1.
+        let s = cx.new_userdata(32, 0)? as *mut u64
+        rnd_seed_default(cx, s)
+        cx.pop(2)
+        let rfuncs = [("random", mth_random), ("randomseed", mth_randomseed)]
+        cx.set_funcs(&rfuncs, 1)?
+        return ok(1)
+    }
 }
