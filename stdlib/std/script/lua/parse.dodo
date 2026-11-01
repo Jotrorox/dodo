@@ -198,8 +198,10 @@ fn par_limit(fs: *mut FnState, v: i32, limit: i32, what: &str) -> void!Throw {
 fn par_nest(cx: *mut CompileState) -> void!Throw {
     unsafe {
         (*cx).nlevels = (*cx).nlevels + 1
-        if (*cx).nlevels >= PAR_MAXLEVELS {
-            return err(lx_error(cx, "chunk has too many syntax levels", 0))
+        // Nesting shares the runtime's C-call budget, as each level is a
+        // native recursion; overflow reports like any C stack overflow.
+        if (*cx).nlevels + ((*(*cx).L).n_ccalls as i32) >= PAR_MAXLEVELS {
+            return err(err_runtime((*cx).L, "C stack overflow"))
         }
         return ok()
     }

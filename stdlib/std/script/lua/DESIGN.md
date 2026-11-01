@@ -238,3 +238,20 @@ the collector rules above.
   `HookFn` receiving a `Debug` with `event` and `currentline`),
   `get_upvalue`/`set_upvalue`/`upvalue_id`/`upvalue_join`,
   `get_iuservalue`/`set_iuservalue` and `cx.traceback`.
+
+## Development workflow
+
+* Fast builds: the stdlib is embedded when cargo builds the compiler, so
+  instead of rebuilding it after every edit, build a project whose `lua`
+  entry is a directory symlink to `stdlib/std/script/lua` and that imports
+  `"lua"`: `mkdir /tmp/luadev && ln -s $REPO/stdlib/std/script/lua
+  /tmp/luadev/lua`, copy `examples/lua/main.dodo` there with `import "lua"`,
+  and build it with a release compiler (`cargo build --release`;
+  `target/release/dodo build /tmp/luadev/main.dodo -O 2 -o build/lua` takes
+  ~13 s). File symlinks inside a package directory are not followed.
+* `python3 scripts/test_lua.py fetch` builds the reference PUC Lua 5.4.9 in
+  `target/lua-reference/`; `check --lua build/lua` runs the tests/lua corpus,
+  `suite --lua build/lua` the official test suite, `diff` compares against
+  the reference, `bench` runs benchmarks/lua.
+* The reference is built with LUA_COMPAT_5_3 (the default makefile setting):
+  match it (`math.pow`, `math.ldexp`, ..., `__le` falling back to `not __lt`).

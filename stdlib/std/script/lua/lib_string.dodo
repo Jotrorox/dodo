@@ -1,0 +1,16 @@
+package lua
+
+// Stub: replaced by the string library implementation.
+pub fn open_string(cx: &mut Cx) -> i32!Throw {
+    cx.create_table(0, 0)?
+    // String metatable with arithmetic coercion (see DESIGN.md).
+    cx.create_table(0, 8)?
+    set_string_arith_metamethods(cx)?
+    cx.push_value(-2)
+    cx.set_field(-2, "__index")?
+    cx.push_str("")?
+    cx.push_value(-2)
+    cx.set_metatable(-2)
+    cx.pop(2)
+    return ok(1)
+}
