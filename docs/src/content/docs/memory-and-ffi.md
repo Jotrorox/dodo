@@ -477,6 +477,8 @@ instruction each. Operands follow, then optional clobbers and options:
 | `out(reg) Type` | The template leaves a `Type` in a register; the expression returns it. |
 | `inout(reg) value` | Pass `value` and return the register's final value. |
 | `in("r0") value`, `out("x9") u64`, ... | Use exactly this register, as calling conventions such as a supervisor call require. |
+| `sym name` | Write the symbol of a function or static into the template, such as a call target. |
+| `const value` | Write an integer constant expression into the template, as decimal text. |
 | `clobber("r4", "lr")` | Further registers the template overwrites. |
 | `options(nomem)` | The template reads and writes no memory the program can see. |
 | `options(pure)` | Its only effect is its outputs: it may be removed if they are unused, or merged with an identical one. Needs an output. |
@@ -515,8 +517,85 @@ unlisted register as it found them. Templates use the target assembler's
 syntax: unified syntax on Arm and Thumb, AT&T syntax on x86. A template the
 assembler rejects is a compile error with the assembler's message.
 
+`sym` and `const` operands are text, not registers. `sym name` takes a
+function (including a method or a C function) or a `static`, and writes the
+name the linker sees, including the underscore Mach-O adds; the definition is
+kept even when nothing else uses it. Assembly can only rely on the calling
+convention of `extern "C"` functions. `const` takes any integer constant
+expression and writes its value, so `#{0}` with `const SHIFT + 1` becomes
+`#3`. Neither takes a modifier.
+
 `std/embedded/cortex_m` shows typical uses: `cpsie i`, `wfe`, `dsb`, and
-reading PRIMASK and IPSR. Firmware attributes that go with it,
+reading PRIMASK and IPSR.
+
+## Global assembly
+
+`unsafe asm(...)` at the top level of a file is assembly outside any
+function: startup code, a function written entirely in assembly, or a table.
+Its templates reach the assembler as written, and its operands can only be
+`sym` and `const`:
+
+```dodo
+// AArch64.
+unsafe asm(
+    ".text",
+    ".globl {0}",
+    ".p2align 2",
+    "{0}:",
+    "    lsl x0, x0, #{1}",
+    "    ret",
+    sym times_eight,
+    const 3,
+)
+
+unsafe extern "C" fn times_eight(value: u64) -> u64
+```
+
+Code calls what the assembly defines through an `extern "C"` prototype, like
+any other foreign function. Select a section before emitting code or data:
+which section is in effect at the start is unspecified. Blocks in one file
+are emitted in order. `unsafe` is required and no attributes apply; the
+assembly must not define a symbol a Dodo declaration also defines.
+
+## Naked functions
+
+`@naked` marks an `extern "C"` function whose body is one
+`unsafe { asm(...) }` and which has no prologue or epilogue: no frame, no saved
+registers, and no `return`. The assembly implements the C calling convention
+itself: it finds its arguments where the convention passes them, leaves the
+result in the result register, and returns.
+
+```dodo
+// AArch64.
+@naked
+extern "C" fn add(a: u64, b: u64) -> u64 {
+    unsafe {
+        asm("add x0, x0, x1", "ret")
+    }
+}
+
+// Calls a Dodo function by symbol, saving the link register itself.
+@naked
+extern "C" fn call_bump() -> u64 {
+    unsafe {
+        asm(
+            "stp x29, x30, [sp, #-16]!",
+            "bl {0}",
+            "ldp x29, x30, [sp], #16",
+            "ret",
+            sym bump,
+        )
+    }
+}
+```
+
+The parameters are not variables, so the body can only refer to them through
+the registers and stack slots they arrive in. The assembly takes only `sym`
+and `const` operands, with no clobbers or options, and must not fall off its
+end. A naked function is never inlined, and calling it is calling a C
+function, so it needs an `unsafe` block at the call site. It cannot be
+generic, a method, `async`, a test, or an `@interrupt` handler; `@section` and
+`@align` work as for other functions. Firmware attributes that go with it,
 `@interrupt`, `@section`, and `@align`, are described in
 [hardware and embedded](hardware.md#interrupts).
 

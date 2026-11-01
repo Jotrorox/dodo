@@ -1,8 +1,9 @@
 //! Firmware platforms: board and chip settings, `std/embedded/board` and `std/embedded/chip`
 //! resolution, the embedded chip runtimes, and (when ld.lld is installed)
 //! linking flashable images. Running on a real board is scripts/test_pico.py
-//! (`--board pico`, `--board pico2`, or `--board pico2_w`); running on
-//! emulated chips is scripts/test_emulator.py.
+//! (`--board pico`, `--board pico2`, or `--board pico2_w`) and
+//! scripts/test_arduino_uno.py; running on emulated chips is
+//! scripts/test_emulator.py.
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -1054,7 +1055,11 @@ fn std_board_and_std_chip_follow_the_selected_platform() {
 #[test]
 fn chip_runtimes_provide_startup_and_helper_symbols() {
     let scratch = Scratch::new("runtime");
-    for chip in dodoc::hardware::CHIPS {
+    // The Raspberry Pi chips' runtimes; AVR's has its own test below.
+    for chip in dodoc::hardware::CHIPS
+        .iter()
+        .filter(|chip| chip.name.starts_with("rp"))
+    {
         let object = scratch.0.join(format!("{}.o", chip.name));
         let options = dodoc::codegen::Options {
             target: Some(chip.triple.into()),
@@ -1062,7 +1067,7 @@ fn chip_runtimes_provide_startup_and_helper_symbols() {
             optimization: 2,
             ..Default::default()
         };
-        dodoc::codegen::compile_ir_object(&options, chip.name, chip.runtime, &object).unwrap();
+        dodoc::codegen::compile_ir_object(&options, chip.name, &(chip.runtime)(), &object).unwrap();
         let bytes = fs::read(&object).unwrap();
         let text = String::from_utf8_lossy(&bytes);
         for name in [
@@ -2153,4 +2158,357 @@ fn main() {
             ]));
         }
     }
+}
+
+#[test]
+fn avr_runtime_provides_startup_and_helper_symbols() {
+    let scratch = Scratch::new("avr-runtime");
+    let chip = dodoc::hardware::chip("atmega328p").unwrap();
+    let object = scratch.0.join("atmega328p.o");
+    let options = dodoc::codegen::Options {
+        target: Some(chip.triple.into()),
+        cpu: Some(chip.cpu.into()),
+        optimization: 2,
+        ..Default::default()
+    };
+    dodoc::codegen::compile_ir_object(&options, chip.name, &(chip.runtime)(), &object).unwrap();
+    let bytes = fs::read(&object).unwrap();
+    let text = String::from_utf8_lossy(&bytes);
+    for name in [
+        ".vectors",
+        "__vectors",
+        "__reset",
+        "__do_copy_data",
+        "__do_clear_bss",
+        "__bad_interrupt",
+        chip.panic_hook,
+        "dodo_panic_report",
+        "abort",
+        "TIMER0_OVF",
+        "USART_RX",
+        "dodo_avr_ticks",
+        "dodo_avr_delay_loops",
+        "dodo_avr_flash_byte",
+        "dodo_avr_rx_take",
+        "dodo_avr_eeprom_write",
+        "dodo_avr_watchdog",
+        "memcpy",
+        "memmove",
+        "memset",
+        "memcmp",
+        "__mulsi3",
+        "__muldi3",
+        "__mulosi4",
+        "__mulodi4",
+        "__udivmodqi4",
+        "__divmodhi4",
+        "__udivmodsi4",
+        "__udivdi3",
+        "__moddi3",
+        "__addsf3",
+        "__divsf3",
+        "__ltsf2",
+        "__unordsf2",
+        "__fixsfsi",
+        "__floatundisf",
+        "__adddf3",
+        "__divdf3",
+        "__gedf2",
+        "__extendsfdf2",
+        "__sync_val_compare_and_swap_2",
+        "__sync_lock_test_and_set_1",
+        "__sync_fetch_and_add_4",
+    ] {
+        assert!(text.contains(name), "atmega328p runtime lacks {name}");
+    }
+}
+
+// Function values are word addresses in AVR program memory (address space
+// 1), interrupt handlers use the signal ABI, panic messages stay in flash,
+// and size counts more than speed.
+#[test]
+fn avr_code_generation_keeps_code_and_constants_in_program_memory() {
+    let scratch = Scratch::new("avr-codegen");
+    let source = scratch.write(
+        "main.dodo",
+        r#"package main
+import "std/embedded/board"
+import "std/embedded/hal"
+static mut COUNT: u16 = 0
+fn triple(value: u32) -> u32 {
+    return value * 3
+}
+fn apply(function: fn(u32) -> u32, value: u32) -> u32 {
+    return function(value)
+}
+fn call(function: &dyn fn(u32) -> u32, value: u32) -> u32 {
+    return function(value)
+}
+fn drive(pin: &mut dyn hal.OutputPin) {
+    pin.set_high()
+}
+const TABLE: [1]fn(u32) -> u32 = [triple]
+@interrupt(TIMER1_COMPA)
+fn tick() {
+    unsafe {
+        COUNT += 1
+    }
+}
+fn main() {
+    b := board.take()!
+    offset := apply(TABLE[0], 2) + call(triple, 1)
+    drive(&mut b.led)
+    total := call(fn(x) {
+        x + offset
+    }, 4)
+    values: [2]u32 = [total, 0]
+    b.timer.delay_ms(values[(total & 1) as usize] + 1)
+}
+"#,
+    );
+    let source = source.to_str().unwrap();
+    for level in ["0", "2"] {
+        let ir = scratch.path(&format!("main-O{level}.ll"));
+        stdout(&dodo(&[
+            "build",
+            source,
+            "--board",
+            "arduino_uno",
+            "-O",
+            level,
+            "--emit",
+            "llvm-ir",
+            "-o",
+            &ir,
+        ]));
+        let ir = fs::read_to_string(&ir).unwrap();
+        assert!(ir.contains("target triple = \"avr-none\""), "{ir}");
+        if level == "0" {
+            // Unoptimized, the function table, the closure pair and the
+            // function-to-closure conversion are all still there.
+            assert!(
+                ir.contains("[1 x ptr addrspace(1)] [ptr addrspace(1) @dodo.main.triple]"),
+                "{ir}"
+            );
+            assert!(ir.contains("{ ptr addrspace(1), ptr }"), "{ir}");
+            assert!(
+                ir.contains("ptr inttoptr (i16 ptrtoint (ptr addrspace(1) @dodo.main.triple"),
+                "{ir}"
+            );
+        }
+        assert!(ir.contains("addrspace(1) constant"), "panic text: {ir}");
+        assert!(ir.contains("section \".progmem.data."), "{ir}");
+        assert!(!ir.contains("section \".rodata.panic"), "{ir}");
+        let handler = ir
+            .lines()
+            .find(|line| line.starts_with("define") && line.contains("@TIMER1_COMPA"))
+            .unwrap();
+        let group = handler
+            .split('#')
+            .nth(1)
+            .unwrap()
+            .split(' ')
+            .next()
+            .unwrap();
+        let attributes = ir
+            .lines()
+            .find(|line| line.starts_with(&format!("attributes #{group} ")))
+            .unwrap();
+        assert!(attributes.contains("\"signal\""), "{attributes}");
+        assert!(attributes.contains("optsize"), "{attributes}");
+        let object = scratch.path(&format!("main-O{level}.o"));
+        stdout(&dodo(&[
+            "build",
+            source,
+            "--board",
+            "arduino_uno",
+            "-O",
+            level,
+            "--emit",
+            "obj",
+            "-o",
+            &object,
+        ]));
+    }
+    // Nothing else sets the optimization level, so the board picks 2;
+    // explicit settings still win.
+    let config = stdout(&dodo(&[
+        "build",
+        source,
+        "--board",
+        "arduino_uno",
+        "--print-config",
+    ]));
+    for line in [
+        "triple = \"avr-none\" # board arduino_uno",
+        "cpu = \"atmega328p\" # board arduino_uno",
+        "opt-level = 2 # board arduino_uno",
+        "panic-hook = \"dodo_board_panic\" # board arduino_uno",
+    ] {
+        assert!(config.contains(line), "missing {line:?} in\n{config}");
+    }
+    let config = stdout(&dodo(&[
+        "build",
+        source,
+        "--board",
+        "arduino_uno",
+        "-O",
+        "0",
+        "--print-config",
+    ]));
+    assert!(config.contains("opt-level = 0 # CLI"), "{config}");
+    let config = stdout(&dodo(&[
+        "build",
+        source,
+        "--board",
+        "arduino_uno",
+        "--release",
+        "--print-config",
+    ]));
+    assert!(
+        config.contains("opt-level = 3 # built-in release profile"),
+        "{config}"
+    );
+}
+
+/// The flash contents an Intel HEX file describes, gaps erased.
+fn intel_hex_image(text: &str) -> Vec<u8> {
+    let mut image = vec![];
+    let mut upper = 0usize;
+    for line in text.lines() {
+        let bytes: Vec<u8> = (1..line.len())
+            .step_by(2)
+            .map(|at| u8::from_str_radix(&line[at..at + 2], 16).unwrap())
+            .collect();
+        assert_eq!(
+            bytes.iter().fold(0u8, |sum, b| sum.wrapping_add(*b)),
+            0,
+            "{line}"
+        );
+        let count = bytes[0] as usize;
+        let address = u16::from_be_bytes([bytes[1], bytes[2]]) as usize;
+        let data = &bytes[4..4 + count];
+        match bytes[3] {
+            0 => {
+                let at = upper + address;
+                if image.len() < at + count {
+                    image.resize(at + count, 0xFF);
+                }
+                image[at..at + count].copy_from_slice(data);
+            }
+            1 => return image,
+            4 => upper = (u16::from_be_bytes([data[0], data[1]]) as usize) << 16,
+            kind => panic!("record type {kind}"),
+        }
+    }
+    panic!("no end-of-file record");
+}
+
+/// A linked ATmega328P program: its Intel HEX image starts with the vector
+/// table's jmp instructions, fits below the Uno's bootloader, and holds
+/// `.data`'s load image, whose RAM copy lies in the 2 KiB of SRAM.
+fn check_atmega328p_firmware(elf: &Path) -> Vec<u8> {
+    let bytes = fs::read(elf).unwrap();
+    assert_eq!(&bytes[..4], b"\x7fELF");
+    assert_eq!(u16::from_le_bytes([bytes[18], bytes[19]]), 83, "EM_AVR");
+    let image = intel_hex_image(&fs::read_to_string(elf.with_extension("hex")).unwrap());
+    assert!(image.len() <= 32 * 1024 - 512, "{} bytes", image.len());
+    for vector in 0..26 {
+        let word = u16::from_le_bytes([image[4 * vector], image[4 * vector + 1]]);
+        assert_eq!(word & 0xFE0E, 0x940C, "vector {vector} is not a jmp");
+    }
+    let start = elf_symbol(&bytes, "__data_start").unwrap();
+    let end = elf_symbol(&bytes, "__data_end").unwrap();
+    let load = elf_symbol(&bytes, "__data_load").unwrap() as usize;
+    assert!((0x80_0100..=0x80_0900).contains(&start) && end >= start);
+    assert_eq!(load + (end - start) as usize, image.len().max(load));
+    image
+}
+
+#[test]
+fn arduino_uno_projects_link_to_flashable_firmware() {
+    if !ld_lld() {
+        return;
+    }
+    let scratch = Scratch::new("uno");
+    // Board-generic examples, unchanged, and the hardware self-test.
+    for (source, args, name) in [
+        ("examples/blink", &[][..], "blink"),
+        ("examples/serial_console.dodo", &[][..], "console"),
+        ("examples/usb_serial.dodo", &[][..], "usb"),
+        ("examples/dimmer_board.dodo", &[][..], "dimmer"),
+        ("examples/hal_sensor_board.dodo", &[][..], "sensor"),
+        ("examples/uno_boot_counter.dodo", &[][..], "counter"),
+        ("tests/hardware/arduino_uno", &["-b", "core"][..], "core"),
+        ("tests/hardware/arduino_uno", &["-b", "wide"][..], "wide"),
+        (
+            "tests/hardware/arduino_uno",
+            &["-b", "peripherals"][..],
+            "peripherals",
+        ),
+    ] {
+        let elf = scratch.path(&format!("{name}.elf"));
+        let source = root().join(source);
+        // Manifest targets name the board themselves.
+        let mut command = vec!["build", source.to_str().unwrap()];
+        if args.is_empty() {
+            command.extend_from_slice(&["--board", "arduino_uno"]);
+        }
+        command.extend_from_slice(args);
+        command.extend_from_slice(&["-o", &elf]);
+        let output = dodo(&command);
+        let message = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(output.status.success(), "{command:?}: {message}");
+        assert!(message.contains(".hex"), "{message}");
+        let image = check_atmega328p_firmware(Path::new(&elf));
+        if name == "console" {
+            // Panic messages are in flash, outside `.data`'s load image.
+            let bytes = fs::read(&elf).unwrap();
+            let load = elf_symbol(&bytes, "__data_load").unwrap() as usize;
+            let text = b"index bounds\0";
+            let at = image
+                .windows(text.len())
+                .position(|window| window == text)
+                .expect("panic text in flash");
+            assert!(at < load, "panic text at {at:#x}, .data from {load:#x}");
+        }
+    }
+    // A custom board with only `chip` set gets all 32 KiB.
+    let custom = scratch.write(
+        "custom.dodo",
+        "package main\nimport \"std/embedded/chip\"\nfn main() {\n p := chip.take(chip.Config { cpu_hz: 8_000_000 })!\n led := p.pins.output(chip.PB0)!\n led.set_high()\n}\n",
+    );
+    let elf = scratch.path("custom.elf");
+    let output = dodo(&[
+        "build",
+        custom.to_str().unwrap(),
+        "--chip",
+        "atmega328p",
+        "-o",
+        &elf,
+    ]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    check_atmega328p_firmware(Path::new(&elf));
+    // Constants live in SRAM on AVR: too many fail at the link, naming the
+    // stack they would leave too little room for.
+    let large = scratch.write(
+        "large.dodo",
+        "package main\nimport \"std/embedded/board\"\nstatic TABLE: [30000]u8 = [1u8; 30000]\nfn main() {\n b := board.take()!\n index := b.timer.now_us() as usize % 30000\n b.timer.delay_ms(TABLE[index] as u32)\n}\n",
+    );
+    let error = stderr(&dodo(&[
+        "build",
+        large.to_str().unwrap(),
+        "--board",
+        "arduino_uno",
+        "-o",
+        &scratch.path("large.elf"),
+    ]));
+    assert!(
+        error.contains("RAM: statics and constants leave less than 256 bytes for the stack"),
+        "{error}"
+    );
 }

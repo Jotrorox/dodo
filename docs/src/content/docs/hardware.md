@@ -1550,6 +1550,70 @@ is a memory barrier and is never removed unless `options(nomem)` or
 overwrites. See [memory and foreign calls](memory-and-ffi.md#inline-assembly)
 for the full rules.
 
+### Naked handlers and global assembly
+
+A `@naked` function has no prologue or epilogue, so its assembly sees the
+registers and stack exactly as the caller, or the hardware, left them. That is
+what a fault handler needs to find the stack frame the processor pushed. The
+chip runtime's vector table refers to weak handler symbols, so a C function
+with the vector's name replaces the default:
+
+```dodo
+import "core/ptr"
+
+static mut FAULT_PC: u32 = 0
+
+// Thumb (Cortex-M0+). Bit 2 of EXC_RETURN in lr says which stack the
+// processor pushed r0-r3, r12, lr, pc, and xPSR to.
+@naked
+extern "C" fn HardFault_Handler() {
+    unsafe {
+        asm(
+            "movs r0, #4",
+            "mov r1, lr",
+            "tst r0, r1",
+            "mrs r0, msp",
+            "beq 1f",
+            "mrs r0, psp",
+            "1:",
+            "ldr r1, ={0}",
+            "bx r1",
+            sym record_fault,
+        )
+    }
+}
+
+extern "C" fn record_fault(frame: *const u32) {
+    unsafe {
+        FAULT_PC = ptr.read(ptr.offset(frame, 6))
+    }
+    for {
+    }
+}
+```
+
+`sym record_fault` writes the function's symbol into the template, and
+`const` writes a constant's value. Top-level `unsafe asm(...)` is global
+assembly, for code or data with no Dodo declaration around it. On Cortex-M,
+mark a function label with `.thumb_func` so its address has the Thumb bit set:
+
+```dodo
+unsafe asm(
+    ".section .text.add_three,\"ax\",%progbits",
+    ".global add_three",
+    ".thumb_func",
+    "add_three:",
+    "    adds r0, r0, #{0}",
+    "    bx lr",
+    const 3,
+)
+
+unsafe extern "C" fn add_three(value: u32) -> u32
+```
+
+See [global assembly](memory-and-ffi.md#global-assembly) and
+[naked functions](memory-and-ffi.md#naked-functions) for the rules.
+
 ### Sleeping and other targets
 
 `cpu.wait_for_interrupt()` sleeps until an interrupt is pending, which is the
@@ -1561,6 +1625,7 @@ between filling a DMA buffer and starting the transfer.
 | --- | --- |
 | Arm Cortex-M (`thumbv6m`, `thumbv7m`, `thumbv7em`, `thumbv8m*` with OS `none`) | PRIMASK; `wfi`. |
 | RISC-V machine mode (`riscv32`, `riscv64` with OS `none`) | `mstatus.MIE`; `wfi`. |
+| AVR (`avr`) | The I flag in SREG; `sleep` in the mode SMCR selects (idle by default), with interrupts enabled so a pending one wakes it. |
 | Linux, Windows, macOS, BSDs, WASI | No-op: a hosted program has no interrupts to mask. |
 | Other freestanding targets | Compile error if a reachable function uses them. |
 
@@ -2371,6 +2436,12 @@ Without a manifest, pass `--board pico` to
 `dodo build`, `dodo run`, or `dodo check`. Editors use the manifest's board
 too.
 
+An [Arduino Uno](#the-atmega328p-and-arduino-uno) (`board = "arduino_uno"`)
+needs no button and no other tool: connect it over USB and `dodo run`
+writes the firmware through the board's bootloader itself, the way avrdude
+would, then starts it. `dodo build` writes an `.elf` and an Intel HEX `.hex`
+next to it.
+
 The `board` setting selects the chip's instruction set, its startup code and
 linker script, and the package `std/embedded/board` resolves to. That package is
 `std/embedded/board/pico` here, and every board package offers the same entry points,
@@ -2409,6 +2480,7 @@ import `std/embedded/board`; keep that code in drivers and test them with fakes.
 | `pico` | `rp2040` | `std/embedded/board/pico`: Raspberry Pi Pico, 2 MiB flash, LED on GP25. |
 | `pico2` | `rp2350` | `std/embedded/board/pico2`: Raspberry Pi Pico 2, 4 MiB flash, LED on GP25. |
 | `pico2_w` | `rp2350` | `std/embedded/board/pico2_w`: Raspberry Pi Pico 2 W, 4 MiB flash, LED on the CYW43439 wireless chip. |
+| `arduino_uno` | `atmega328p` | `std/embedded/board/arduino_uno`: Arduino Uno, 31.5 KiB flash below the bootloader, 2 KiB SRAM, LED on D13. |
 
 ### The RP2040 and Raspberry Pi Pico
 
@@ -2421,7 +2493,7 @@ compiler adds what a desktop operating system would otherwise provide:
 | Vector table | Initial stack and reset handler. Every exception and interrupt is a weak default that an `@interrupt(NAME)` handler replaces. The default `USBCTRL_IRQ` serves the [USB serial port](#usb-serial-on-the-rp2040-and-rp2350) while one is open. |
 | Reset handler | Copies initialized statics to RAM, zeroes the rest, and calls `main`. If `main` returns, the core sleeps. |
 | Panic hook | `dodo_board_panic` masks interrupts, writes the failure to the program's [serial ports](#panics-on-the-serial-port) and USB serial port, if it opened any, and halts, keeping an open USB serial port served. Define `extern "C" fn dodo_board_panic(check: *const u8, file: *const u8, line: u32, column: u32)` to report failures differently; it must not return. |
-| Runtime helpers | `memcpy`, `memmove`, `memset`, `memcmp`, the 32- and 64-bit division, 64-bit multiplication, and shift routines the Cortex-M0+ lacks in hardware, and software `f32` and `f64` arithmetic, comparisons, conversions, and `%`, since it has no floating-point unit. Results are correctly rounded IEEE 754, to nearest with ties to even, subnormals included. |
+| Runtime helpers | `memcpy`, `memmove`, `memset`, `memcmp`, the 32- and 64-bit division, 64-bit multiplication, and shift routines the Cortex-M0+ lacks in hardware, and software `f32` and `f64` arithmetic, comparisons, conversions, and `%`, since it has no floating-point unit. Results are correctly rounded IEEE 754, to nearest with ties to even, subnormals included. Addition, subtraction, and multiplication of normal numbers run in hand-written assembly, and division multiplies by a reciprocal. Typical cycles per call, as the RP2040 emulator counts them: `f32` addition 85, multiplication 90, division 280, comparison 50; `f64` addition 130, multiplication 195, division 570, comparison 80. The helpers are optimized whatever the program's `-O` level. |
 | Linker script | Flash at `0x10000000` (size from the board), 264 KiB of RAM, and the stack at the top of RAM; `.ramfunc` and `.noinit` [sections](#sections-and-alignment). |
 
 `std/embedded/chip/rp2040` is the chip support. `rp2040.take(config)` starts the
@@ -2449,7 +2521,7 @@ RP2040's:
 | Vector table | At the start of flash, where the boot ROM enters Arm images. Weak defaults for the Cortex-M33 exceptions (including `SecureFault_Handler`) and all 52 interrupts. |
 | Image definition | The `IMAGE_DEF` block, in the first 4 KiB of flash, that marks the image as a secure Arm RP2350 executable. The boot ROM runs nothing without it. |
 | Reset handler | Clears the stack limit, installs the vector table, enables the FPU and the double-precision coprocessor, initializes RAM, and calls `main`. |
-| Panic hook and helpers | As on the RP2040. The Cortex-M33 divides 32-bit integers in hardware, so only the 64-bit helpers are linked. Its FPU does single precision only, so `f32` arithmetic runs in hardware. `f64` addition, subtraction, multiplication, and division, and conversions between `f64` and `f32` or 32-bit integers, run on the RP2350's double-precision coprocessor (DCP): an `f64` division takes about 90 cycles instead of 1300, an addition about 45 instead of 260. The results are the software helpers' bit for bit: subnormal operands and results, which the coprocessor flushes to zero, are computed in software, and NaN results are the default NaN. The helpers save and restore the coprocessor's state when they interrupt one another, so `f64` works in interrupt handlers. The coprocessor sequences come from the Pico SDK, under its BSD-3-Clause license (`src/hardware/rp2350/LICENSE.pico-sdk`). Comparisons, `%`, conversion from `f32`, and conversions to and from 64-bit integers use the software helpers. |
+| Panic hook and helpers | As on the RP2040. The Cortex-M33 divides 32-bit integers in hardware, so only the 64-bit helpers are linked. Its FPU does single precision only, so `f32` arithmetic runs in hardware. `f64` addition, subtraction, multiplication, and division, and conversions between `f64` and `f32` or 32-bit integers, run on the RP2350's double-precision coprocessor (DCP): an `f64` division takes about 90 cycles instead of 340 in software, an addition about 45 instead of 150. The results are the software helpers' bit for bit: subnormal operands and results, which the coprocessor flushes to zero, are computed in software, and NaN results are the default NaN. The helpers save and restore the coprocessor's state when they interrupt one another, so `f64` works in interrupt handlers. The coprocessor sequences come from the Pico SDK, under its BSD-3-Clause license (`src/hardware/rp2350/LICENSE.pico-sdk`). Comparisons, `%`, conversion from `f32`, and conversions to and from 64-bit integers use the software helpers. |
 | Linker script | Flash at `0x10000000` (size from the board), 520 KiB of RAM, and the stack at the top of RAM; `.ramfunc` and `.noinit` [sections](#sections-and-alignment). |
 
 `std/embedded/chip/rp2350` mirrors the RP2040 package: `rp2350.take(config)`
@@ -2485,6 +2557,77 @@ if b.pins.pin_count() > 30 {
 
 Unlike the RP2040, the RP2350 boot ROM clears RAM when it starts, so nothing
 in RAM survives a reboot into the bootloader.
+
+### The ATmega328P and Arduino Uno
+
+The `atmega328p` chip is an 8-bit AVR, the microcontroller of the Arduino Uno
+and Nano. It compiles for `avr-none` and the `atmega328p` CPU, with 16-bit
+pointers, so `usize` and `isize` are 16 bits wide: an untyped integer
+literal such as `x := 40000` is out of range there, and `u32`, `u64` or an
+explicit suffix says what a program means. AVR keeps code and data apart:
+functions live in flash, and the compiler gives function values the
+program-memory address space, so function pointers, closures, `dyn`
+methods, and `@interrupt` handlers work as on the other chips.
+
+```toml
+[targets.blink]
+entry = "main.dodo"
+board = "arduino_uno"
+```
+
+The [blink program](#boards) runs unchanged. `dodo run`
+finds the board's USB serial port by its USB IDs (the Uno's ATmega16U2, and
+the CH340, FT232R and CP210x adapters of compatible boards; set
+`DODO_SERIAL_PORT` to choose one), resets the board through the port's DTR
+line into its Optiboot bootloader, checks the chip's signature, writes the
+image a 128-byte page at a time, reads every page back to verify it, and
+starts the program. It speaks STK500 version 1, the protocol of avrdude's
+`arduino` programmer, so no avrdude is needed, and flashing a typical
+program takes a few seconds. A program that does not fit the 32,256 bytes
+below the bootloader fails at the link.
+
+| Part | What it does |
+| --- | --- |
+| Vector table | A `jmp` for reset and each of the 25 interrupts. Every handler is weak, so an `@interrupt(NAME)` function replaces it, with the datasheet's vector names: `INT0`, `PCINT0`, `TIMER1_COMPA`, `ADC`, `TWI`, and so on. Handlers save the registers they use and return with `reti`; interrupts stay masked while one runs. |
+| Reset | Clears SREG, sets the stack to the end of SRAM, records the reset flags and turns off a watchdog left running, copies initialized statics and constants to SRAM, zeroes the rest, enables interrupts, and calls `main`. |
+| Time base | `TIMER0_OVF` counts Timer 0 overflows once `take` starts it, as the Arduino core does: `b.timer.now_us()` counts in 4 µs steps at 16 MHz. |
+| Serial input | `USART_RX` moves received bytes into a 32-byte buffer while the serial port is open, so input arrives even while the program is busy. |
+| Panic hook | `dodo_board_panic` masks interrupts, writes the failure to the serial port if the program opened it, and halts. The compiler keeps panic messages in flash, not SRAM, and the hook reads them from there. |
+| Runtime helpers | `memcpy` and friends with AVR's 16-bit sizes; 8- to 64-bit division and 32- and 64-bit multiplication under libgcc's names and calling conventions; `f32` and `f64` arithmetic, comparisons and conversions, correctly rounded IEEE 754 (`f64` is real binary64, unlike avr-gcc's default 32-bit `double`); and the `__sync` helpers behind 8- and 16-bit atomics, which mask interrupts. `f32` arithmetic is native 32-bit code; using `f64` adds several kilobytes. |
+| Linker script | Flash from 0 (31.5 KiB on the Uno), 2 KiB of SRAM, and a check that statics and constants leave at least 256 bytes for the stack. |
+
+Flash and SRAM are small, so the board sets two defaults: it builds at
+`-O 2` unless a profile, the manifest, or `-O` chooses a level (unoptimized
+programs rarely fit), and the compiler optimizes AVR code for size, as
+`-Os` does. String constants and other constants take SRAM, like a C
+program's without `PROGMEM`. Large functions with many locals are costly
+on AVR, whose stack frames grow expensive past 64 bytes; splitting work into
+smaller functions helps.
+
+`std/embedded/chip/atmega328p` numbers pins as Arduino boards do: 0 to 7 are
+PD0 to PD7, 8 to 13 PB0 to PB5, and 14 to 19 PC0 to PC5 (A0 to A5); the
+board package names them `D0` to `D13` and `A0` to `A5`. `take` starts the
+time base and returns the peripherals once:
+
+| Part | Interface |
+| --- | --- |
+| Pins | `output(n)`, `input(n)`, and `input_pull_up(n)`; pins implement the pin protocols and `toggle()`. |
+| Serial port | `uart(1, some(0), baud)` on D1 and D0, which the Uno's USB connector carries; `b.usb.serial()` opens it at 115200 baud with CR LF line ends. Implements the `std/io` Reader and Writer and the serial port protocols, so `std/fmt` prints to it. |
+| I2C | `i2c(18, 19, hz)` on A4 and A5, controller only, with the internal pull-ups on and a time limit on every wait. |
+| SPI | `spi(13, 11, some(12), mode, hz)` on D13, D11 and D12, controller only, at the clock divided by 2 to 128. D10 must stay an output; `select()` hands it out as one device's chip select. The LED shares D13: release it first. |
+| PWM | `pwm(pin, hz)`: D9 and D10 on Timer 1 at any frequency from 1 Hz, with up to 16-bit resolution; D3 and D11 on Timer 2 at the nearest of seven frequencies, 8-bit; D5 and D6 on Timer 0 at its fixed 976 Hz. Two outputs on one timer share its frequency. |
+| Analog | `analog(pin)` on A0 to A5 against the 5 V supply, and `temperature()`, the chip's sensor against its 1.1 V reference; 10-bit, `atmega328p.millicelsius(reading)` converts the sensor's. |
+| Watchdog | `start(timeout_ms)` with the longest of 16 ms to 8 s within the timeout, `feed()`, `stop()`. |
+| EEPROM | `read(offset, buffer)`, `update(offset, bytes)`, which writes only the bytes that change, and the `hal.Flash` protocol. |
+
+The Uno has no random number generator, real-time clock, DMA, second core,
+or low-power controls in its board package, and `std/embedded/storage`'s
+store is larger than its flash. Its bootloader starts the program again
+after a watchdog reset and clears the reset flags first, so
+`board.restart()` restarts the program and `reset_reason()` reads `Other`;
+`dodo run` reaches the bootloader through the reset line instead.
+`scripts/test_arduino_uno.py` runs the board's self-test, which needs nothing
+wired to the board.
 
 ### I2C and SPI on the RP2040 and RP2350
 
@@ -4022,7 +4165,9 @@ entry = "main.dodo"
 chip = "rp2040"
 ```
 
-A chip alone assumes 2 MiB of flash (4 MiB for `chip = "rp2350"`). To give the board a name that
+A chip alone assumes 2 MiB of flash (4 MiB for `chip = "rp2350"`, the whole
+32 KiB for `chip = "atmega328p"`, whose `Config` holds the CPU clock,
+`cpu_hz`, instead of a crystal). To give the board a name that
 `std/embedded/board` resolves to, add it to the compiler (see below).
 
 ### Adding chips and boards
@@ -4043,13 +4188,16 @@ so each new board or chip is a small, self-contained addition:
   `hal.RegisterBlock`. A new controller design is a new package there, with a
   simulated controller to test it on a desktop.
 
-The compiler compiles the runtime itself with the selected target machine, so
-no assembler or C toolchain is involved. `scripts/test_pico.py` (with
-`--board pico`, `--board pico2`, or `--board pico2_w`) shows how to check a chip
-on real hardware, and `scripts/test_rp2350_float.py` checks the RP2350's
+The compiler compiles and optimizes the runtime itself with the selected
+target machine, whatever the program's `-O` level, so no assembler or C
+toolchain is involved. `scripts/test_pico.py` (with
+`--board pico`, `--board pico2`, or `--board pico2_w`) and
+`scripts/test_arduino_uno.py` show how to check a chip on real hardware, and
+`scripts/test_rp2350_float.py` checks the RP2350's
 coprocessor `f64` helpers against the software ones on a board. Without a
 board, `scripts/test_emulator.py` runs the self-test in `tests/emulator` on
-emulated RP2040 and RP2350 chips, as CI does.
+emulated RP2040 and RP2350 chips, as CI does; on the RP2040 it also checks
+the assembly floating-point helpers against the software ones.
 
 ### Unsupported chips
 
@@ -4077,8 +4225,8 @@ dodo build firmware.dodo --emit obj --target thumbv7em-none-eabihf \
 
 ## Current limits
 
-- The boards are `pico`, `pico2`, and `pico2_w`, on the `rp2040` and `rp2350`
-  chips. The chip packages cover clocks, GPIO, I2C, SPI, UART, PWM, the ADC,
+- The boards are `pico`, `pico2`, `pico2_w`, and `arduino_uno`, on the
+  `rp2040`, `rp2350`, and `atmega328p` chips. The Raspberry Pi chip packages cover clocks, GPIO, I2C, SPI, UART, PWM, the ADC,
   PIO, the timer, the real-time clock, the watchdog, DMA, a USB serial port,
   the random number generators, low power, and the second core; other USB
   devices (HID, mass storage, several functions at once) or USB host mode
@@ -4105,12 +4253,8 @@ dodo build firmware.dodo --emit obj --target thumbv7em-none-eabihf \
   LRCLK).
   The Pico 2 W's wireless chip drives only its LED and senses USB power;
   Wi-Fi and Bluetooth need its firmware, which is not loaded yet.
-- The software floating-point helpers are written for correctness, not speed:
-  division, for example, computes one quotient bit per step, and `f32`
-  arithmetic on the Cortex-M0+ goes through `f64`. On the RP2350, `f64`
-  arithmetic runs on the double-precision coprocessor instead. They raise no
-  floating-point exception flags and return the default quiet NaN for every
-  NaN result.
+- The software floating-point helpers raise no floating-point exception
+  flags and return the default quiet NaN for every NaN result.
 - Core 1 runs one task, started from core 0, and the cores share the
   vector table, so an interrupt has one handler for both cores. Executor
   tasks on either core, async or hand-written, are cooperative: there is no
@@ -4125,9 +4269,9 @@ dodo build firmware.dodo --emit obj --target thumbv7em-none-eabihf \
   the executor's signals, so use both from one thread there.
 - On the Cortex-M0+ of the RP2040, atomics only load and store; see
   [sharing state with atomics](#sharing-state-with-atomics).
-- Inline assembly lives inside functions; there is no global or naked
-  assembly, so startup code and vector tables come from the chip runtime or a
-  `@section`-placed static.
+- A naked function or global assembly can replace a vector's default
+  handler or add code the runtime lacks, but the boot sequence and the
+  vector table itself still come from the chip runtime.
 - Low power covers sleep, deep sleep, clock gating, the dormant state
   woken by any GPIO the chip has (GPIO 0 to 47 on the RP2350B) or a timeout,
   the RP2350's power-down states, and a slower system clock. A timed dormant

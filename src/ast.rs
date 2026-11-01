@@ -389,6 +389,19 @@ pub struct Program {
     /// The namespace prefix of `std/embedded/executor`, whose `Context` and
     /// `Poll` types `await` uses; set by package loading when it is loaded.
     pub executor_prefix: Option<String>,
+    /// Top-level `unsafe asm("...")` blocks, in source order: assembly emitted
+    /// into the object file outside any function. Their operands are only
+    /// `sym` and `const`, and they have no clobbers or options.
+    pub global_asm: Vec<GlobalAsm>,
+}
+/// `unsafe asm("...")` at the top level of a file.
+#[derive(Clone, Debug)]
+pub struct GlobalAsm {
+    /// The declaring package's namespace prefix, set by package loading:
+    /// empty in the root package. `sym` operands see this package's private
+    /// declarations.
+    pub namespace: String,
+    pub asm: InlineAsm,
 }
 impl Program {
     /// The qualified name of an item of `std/embedded/executor`.
@@ -537,6 +550,9 @@ pub struct Function {
     /// `@compiler(pio)`: std/embedded/chip/rp_pio's `assemble`, whose calls
     /// are assembled at compile time into a `Program` literal.
     pub pio: bool,
+    /// `@compiler(wgsl)`: std/gpu's `wgsl`, whose calls are translated at
+    /// compile time into a `ShaderSource` literal for every backend.
+    pub wgsl: bool,
     pub generics: Vec<String>,
     pub bounds: Vec<Bound>,
     /// Compiler-generated specialization: declared borrow sources may become
@@ -568,6 +584,10 @@ pub struct Function {
     pub placement: Placement,
     /// `@inline`, `@inline(never)` or `@cold`.
     pub inlining: Inlining,
+    /// `@naked`: an `extern "C"` function whose body is one `unsafe { asm(...) }`
+    /// and which gets no prologue or epilogue; the assembly implements the
+    /// calling convention itself, including the return.
+    pub naked: bool,
     /// The role of a function generated from an `async fn`; see `AsyncPart`.
     pub async_part: Option<AsyncPart>,
 }
@@ -605,11 +625,69 @@ pub enum AsyncPart {
     Drop,
 }
 impl Function {
+    /// The assembly of a `@naked` function: its body is `unsafe { asm(...) }`.
+    pub fn naked_asm(&self) -> Option<&InlineAsm> {
+        self.body
+            .as_ref()
+            .filter(|_| self.naked)
+            .and_then(naked_body)
+    }
+    pub fn naked_asm_mut(&mut self) -> Option<&mut InlineAsm> {
+        if !self.naked {
+            return None;
+        }
+        match self.body.as_deref_mut()? {
+            [
+                Stmt {
+                    kind: StmtKind::Unsafe(inner),
+                    ..
+                },
+            ] => match inner.as_mut_slice() {
+                [
+                    Stmt {
+                        kind:
+                            StmtKind::Expr(Expr {
+                                kind: ExprKind::Asm(asm),
+                                ..
+                            }),
+                        ..
+                    },
+                ] => Some(asm),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
     /// The C symbol of an extern function: its `@link_name`, or its own name.
     pub fn foreign_symbol(&self) -> &str {
         self.link_name
             .as_deref()
             .unwrap_or_else(|| self.name.rsplit('.').next().unwrap_or(&self.name))
+    }
+}
+/// The assembly of a body of the form `unsafe { asm(...) }`, the only form a
+/// `@naked` function's body takes.
+pub fn naked_body(body: &Block) -> Option<&InlineAsm> {
+    match body.as_slice() {
+        [
+            Stmt {
+                kind: StmtKind::Unsafe(inner),
+                ..
+            },
+        ] => match inner.as_slice() {
+            [
+                Stmt {
+                    kind:
+                        StmtKind::Expr(Expr {
+                            kind: ExprKind::Asm(asm),
+                            ..
+                        }),
+                    ..
+                },
+            ] => Some(asm),
+            _ => None,
+        },
+        _ => None,
     }
 }
 /// Linker placement chosen by `@section("name")` and `@align(N)` on functions
@@ -826,7 +904,8 @@ pub enum ExprKind {
         output: Option<String>,
     },
 }
-/// Inline assembly. The template refers to operands as `{0}`, `{1}`, ... in
+/// Inline assembly, and the body of global assembly and naked functions.
+/// The template refers to operands as `{0}`, `{1}`, ... in
 /// the order written (or `{}` for the next one), with an optional LLVM operand
 /// modifier: `{0:w}`. `{{` and `}}` are literal braces. The expression's value
 /// is `void` without outputs, the output's type with one, and a tuple of the
@@ -848,22 +927,46 @@ pub struct InlineAsm {
     pub span: Span,
 }
 impl InlineAsm {
-    /// Input values, in operand order: `in` and `inout` operands.
+    /// Operand expressions, in operand order: the values of `in` and `inout`
+    /// operands, and the constant expressions of `const` operands.
     pub fn inputs(&self) -> impl Iterator<Item = &Expr> {
         self.operands
             .iter()
             .filter_map(|operand| match &operand.kind {
-                AsmOperandKind::In(value) | AsmOperandKind::InOut(value) => Some(value),
-                AsmOperandKind::Out(_) => None,
+                AsmOperandKind::In(value)
+                | AsmOperandKind::InOut(value)
+                | AsmOperandKind::Const(value) => Some(value),
+                AsmOperandKind::Out(_) | AsmOperandKind::Sym(_) => None,
             })
     }
     pub fn inputs_mut(&mut self) -> impl Iterator<Item = &mut Expr> {
         self.operands
             .iter_mut()
             .filter_map(|operand| match &mut operand.kind {
-                AsmOperandKind::In(value) | AsmOperandKind::InOut(value) => Some(value),
-                AsmOperandKind::Out(_) => None,
+                AsmOperandKind::In(value)
+                | AsmOperandKind::InOut(value)
+                | AsmOperandKind::Const(value) => Some(value),
+                AsmOperandKind::Out(_) | AsmOperandKind::Sym(_) => None,
             })
+    }
+    /// The paths of `sym` operands, in operand order.
+    pub fn symbols_mut(&mut self) -> impl Iterator<Item = &mut String> {
+        self.operands
+            .iter_mut()
+            .filter_map(|operand| match &mut operand.kind {
+                AsmOperandKind::Sym(path) => Some(path),
+                _ => None,
+            })
+    }
+    /// Whether every operand is written into the template as text (`sym` and
+    /// `const`), as global and naked assembly require.
+    pub fn textual(&self) -> bool {
+        self.operands.iter().all(|operand| {
+            matches!(
+                operand.kind,
+                AsmOperandKind::Sym(_) | AsmOperandKind::Const(_)
+            )
+        })
     }
     /// Declared `out` types, with the span of their operand.
     pub fn output_types_mut(&mut self) -> impl Iterator<Item = (&mut Type, Span)> {
@@ -882,7 +985,7 @@ impl InlineAsm {
             .filter_map(|operand| match &operand.kind {
                 AsmOperandKind::Out(ty) => Some(ty.clone()),
                 AsmOperandKind::InOut(value) => Some(value.ty.clone()),
-                AsmOperandKind::In(_) => None,
+                AsmOperandKind::In(_) | AsmOperandKind::Sym(_) | AsmOperandKind::Const(_) => None,
             })
             .collect()
     }
@@ -901,6 +1004,13 @@ pub enum AsmOperandKind {
     Out(Type),
     /// `inout(reg) value`: passed in, and its final value returned.
     InOut(Expr),
+    /// `sym path`: the link-time symbol of a function or static, written
+    /// into the template as its assembler name. Semantic analysis qualifies
+    /// the path to the declaration's name.
+    Sym(String),
+    /// `const value`: an integer constant expression, written into the
+    /// template as decimal text.
+    Const(Expr),
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AsmRegister {

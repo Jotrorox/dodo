@@ -703,3 +703,380 @@ fn word_at(elf: &[u8], address: u32) -> Option<u32> {
         (delta + 4 <= size).then(|| word(elf, offset + delta))
     })
 }
+
+/// Host fixtures for global and naked assembly: a global function computing
+/// `value << SHIFT`, a naked `a + b`, and a naked function that calls `bump`
+/// by symbol. Templates are in the C convention of the host.
+fn host_global_and_naked() -> Option<[&'static str; 3]> {
+    let windows = cfg!(windows);
+    match std::env::consts::ARCH {
+        "aarch64" => Some([
+            r#""lsl x0, x0, #{1}", "ret""#,
+            r#""add x0, x0, x1", "ret""#,
+            r#""stp x29, x30, [sp, #-16]!", "bl {0}", "ldp x29, x30, [sp], #16", "ret""#,
+        ]),
+        // 40 bytes keep the stack 16-byte aligned at the call and give
+        // Windows x64 its 32-byte shadow space.
+        "x86_64" if windows => Some([
+            r#""movq %rcx, %rax", "shlq ${1}, %rax", "retq""#,
+            r#""leaq (%rcx,%rdx), %rax", "retq""#,
+            r#""subq $40, %rsp", "callq {0}", "addq $40, %rsp", "retq""#,
+        ]),
+        "x86_64" => Some([
+            r#""movq %rdi, %rax", "shlq ${1}, %rax", "retq""#,
+            r#""leaq (%rdi,%rsi), %rax", "retq""#,
+            r#""subq $40, %rsp", "callq {0}", "addq $40, %rsp", "retq""#,
+        ]),
+        _ => None,
+    }
+}
+
+#[test]
+fn global_and_naked_assembly_run_on_the_host() {
+    let Some([shift, add, call]) = host_global_and_naked() else {
+        eprintln!("skipping: no global or naked assembly fixture for this host");
+        return;
+    };
+    let source = format!(
+        r#"package main
+import "std/console"
+
+const SHIFT: u32 = 2
+static mut CALLS: u64 = 0
+
+// Private, and referenced only by the naked function's assembly.
+fn bump() -> u64 {{
+    unsafe {{
+        CALLS += 1
+        return CALLS * 10
+    }}
+}}
+
+unsafe asm(
+    ".text",
+    ".globl {{0}}",
+    ".p2align 4",
+    "{{0}}:",
+    {shift},
+    sym shift_left,
+    const SHIFT + 1,
+)
+unsafe extern "C" fn shift_left(value: u64) -> u64
+
+@naked
+extern "C" fn add(a: u64, b: u64) -> u64 {{
+    unsafe {{
+        asm({add})
+    }}
+}}
+
+@naked
+extern "C" fn call_bump() -> u64 {{
+    unsafe {{
+        asm({call}, sym bump)
+    }}
+}}
+
+fn main() {{
+    unsafe {{
+        console.printf("{{}} {{}}\n", shift_left(5), add(40, 2))!
+        console.printf("{{}} {{}}\n", call_bump(), call_bump())!
+    }}
+}}
+"#
+    );
+    let scratch = Scratch::new("global-naked");
+    let file = scratch.write("asm.dodo", &source);
+    for level in ["0", "2"] {
+        let executable = scratch.path(&format!("asm-O{level}{}", std::env::consts::EXE_SUFFIX));
+        success(&dodo(&["build", &file, "-O", level, "-o", &executable]));
+        let output = success(&Command::new(&executable).output().unwrap());
+        assert_eq!(output, "40 42\n10 20\n", "-O{level}");
+    }
+}
+
+#[test]
+fn global_and_naked_assembly_mistakes_are_diagnosed() {
+    let scratch = Scratch::new("global-naked-errors");
+    let naked =
+        |body: &str| format!("@naked\nextern \"C\" fn f() {{\n unsafe {{\n  {body}\n }}\n}}");
+    let cases: Vec<(String, &str)> = vec![
+        ("asm(\"nop\")".into(), "write it as `unsafe asm"),
+        (
+            "@section(\".text\")\nunsafe asm(\"nop\")".into(),
+            "takes no attributes or modifiers",
+        ),
+        (
+            "unsafe asm(\"nop\", in(reg) 1u32)".into(),
+            "global asm takes only `sym` and `const` operands",
+        ),
+        (
+            "unsafe asm(\"nop\", clobber(\"r0\"))".into(),
+            "global asm has no clobbers or options",
+        ),
+        (
+            "unsafe asm(\"nop\", options(nomem))".into(),
+            "global asm has no clobbers or options",
+        ),
+        (
+            "unsafe asm(\"{1}\", const 1)".into(),
+            "refers to operand 1, but the asm has 1 operand",
+        ),
+        (
+            "fn g() {}\nunsafe asm(\"{0:w}\", sym g)".into(),
+            "takes no modifier",
+        ),
+        (
+            "const C: u32 = 1\nunsafe asm(\"{0}\", sym C)".into(),
+            "has no storage of its own",
+        ),
+        (
+            "unsafe asm(\"{0}\", sym missing)".into(),
+            "`missing` is not one in scope",
+        ),
+        (
+            "fn id<T>(value: T) -> T { return value }\nunsafe asm(\"{0}\", sym id)".into(),
+            "`sym` needs a non-generic function or a static",
+        ),
+        (
+            "fn g() {\n x := 1u32\n unsafe { asm(\"{0}\", sym x) }\n}".into(),
+            "`x` is not one in scope",
+        ),
+        (
+            "interface Shape {\n fn area(self: &Self) -> u32\n}\nunsafe asm(\"{0}\", sym Shape.area)".into(),
+            "has no symbol of its own",
+        ),
+        (
+            "@interrupt(TIMER_IRQ_0)\nfn alarm() {}\nunsafe asm(\"{0}\", sym alarm)".into(),
+            "interrupt handler",
+        ),
+        (
+            "unsafe asm(\"{0}\", const 1.5)".into(),
+            "must be an integer constant expression",
+        ),
+        (
+            "static mut S: u32 = 0\nunsafe asm(\"{0}\", const S)".into(),
+            "mutable static values cannot be used in constant expressions",
+        ),
+        (
+            "fn g(n: u32) {\n unsafe { asm(\"{0}\", const n) }\n}".into(),
+            "must be an integer constant expression",
+        ),
+        (
+            "@naked\nfn f() {\n unsafe {\n  asm(\"\")\n }\n}".into(),
+            "@naked requires a top-level, non-generic `extern \"C\" fn`",
+        ),
+        (
+            "@naked\nextern \"C\" fn f() {\n asm(\"\")\n}".into(),
+            "exactly one `unsafe { asm(...) }`",
+        ),
+        (
+            naked("asm(\"\", in(reg) 1u32)"),
+            "the asm of a @naked function takes only `sym` and `const` operands",
+        ),
+        (
+            naked("asm(\"\", clobber(\"r0\"))"),
+            "the asm of a @naked function has no clobbers or options",
+        ),
+    ];
+    for (declarations, message) in cases {
+        expect_rejected(
+            &scratch,
+            &format!("package main\n{declarations}\nfn main() {{}}\n"),
+            &[],
+            message,
+        );
+    }
+    // A library's private function is not visible to another package's asm.
+    let library = scratch.0.join("low");
+    fs::create_dir_all(&library).unwrap();
+    scratch.write(
+        "low/low.dodo",
+        "package low\nfn secret() {}\npub fn open() {}\n",
+    );
+    expect_rejected(
+        &scratch,
+        "package main\nimport \"low\"\nunsafe asm(\"{0}\", sym low.secret)\nfn main() { low.open() }\n",
+        &[],
+        "function `low.secret` is private to its package",
+    );
+    // The assembler's rejection is a compile error, not a crash, for global
+    // assembly and naked bodies alike.
+    for source in [
+        "package main\nunsafe asm(\"not_an_instruction r0\")\n",
+        "package main\n@naked\npub extern \"C\" fn f() {\n unsafe {\n  asm(\"not_an_instruction r0\")\n }\n}\n",
+    ] {
+        let error = rejected(
+            &scratch,
+            source,
+            &["--target", "thumbv6m-none-eabi", "--emit", "obj"],
+        );
+        assert!(error.contains("not_an_instruction"), "{error}");
+    }
+}
+
+#[test]
+fn firmware_uses_global_and_naked_assembly() {
+    let scratch = Scratch::new("global-naked-firmware");
+    let thumb = r#"package main
+
+static mut TICKS: u32 = 0
+
+fn tick() {
+    unsafe {
+        TICKS += 1
+    }
+}
+
+unsafe asm(
+    ".section .text.add_three,\"ax\",%progbits",
+    ".global add_three",
+    ".thumb_func",
+    "add_three:",
+    "    adds r0, r0, #{0}",
+    "    bx lr",
+    const 3,
+)
+
+unsafe asm(
+    ".section .rodata.table,\"a\",%progbits",
+    ".global TABLE",
+    "TABLE:",
+    "    .word {0}",
+    "    .word {1}",
+    sym tick,
+    sym TICKS,
+)
+
+@naked
+@section(".ramfunc")
+pub extern "C" fn trampoline() {
+    unsafe {
+        asm("push {{r7, lr}}", "bl {0}", "pop {{r7, pc}}", sym tick)
+    }
+}
+"#;
+    let assembly = emit(
+        &scratch,
+        thumb,
+        "asm",
+        &["--target", "thumbv6m-none-eabi", "-O", "2"],
+    )
+    .replace('\t', " ");
+    for text in [
+        "adds r0, r0, #3",
+        ".long dodo.main.tick",
+        ".long dodo.main.TICKS",
+        // Kept through llvm.used although only the assembly refers to it.
+        "dodo.main.tick:",
+        ".section .ramfunc",
+    ] {
+        assert!(assembly.contains(text), "missing {text}:\n{assembly}");
+    }
+    // No prologue: the template is the whole body, in Thumb.
+    let body = assembly
+        .split("trampoline:")
+        .nth(1)
+        .expect("naked function")
+        .split(".Lfunc_end")
+        .next()
+        .unwrap();
+    let instructions: Vec<&str> = body
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('.') && !line.starts_with('@'))
+        .collect();
+    assert_eq!(
+        instructions,
+        ["push {r7, lr}", "bl dodo.main.tick", "pop {r7, pc}"],
+        "{body}"
+    );
+    assert!(assembly.contains(".thumb_func\ntrampoline:"), "{assembly}");
+    success(&dodo(&[
+        "build",
+        &scratch.write("thumb.dodo", thumb),
+        "--target",
+        "thumbv6m-none-eabi",
+        "--emit",
+        "obj",
+        "-o",
+        &scratch.path("thumb.o"),
+    ]));
+    // RISC-V calls by symbol; Mach-O prefixes C symbols with an underscore.
+    let riscv = emit(
+        &scratch,
+        "package main\nfn work() -> u32 {\n    return 7\n}\n@naked\npub extern \"C\" fn entry() -> u32 {\n    unsafe {\n        asm(\"tail {0}\", sym work)\n    }\n}\nunsafe asm(\".globl two\", \"two:\", \"li a0, {0}\", \"ret\", const 1 << 1)\n",
+        "asm",
+        &["--target", "riscv32-unknown-none-elf", "-O", "2"],
+    )
+    .replace('\t', " ");
+    assert!(riscv.contains("tail dodo.main.work"), "{riscv}");
+    assert!(riscv.contains("li a0, 2"), "{riscv}");
+    let apple = emit(
+        &scratch,
+        "package main\nfn work() -> u64 {\n    return 7\n}\n@naked\npub extern \"C\" fn entry() -> u64 {\n    unsafe {\n        asm(\"jmp {0}\", sym work)\n    }\n}\nunsafe asm(\".globl _two\", \"_two:\", \"movq ${0}, %rax\", \"retq\", const -2)\n",
+        "asm",
+        &["--target", "x86_64-apple-darwin", "-O", "2"],
+    )
+    .replace('\t', " ");
+    assert!(apple.contains("jmp _dodo.main.work"), "{apple}");
+    assert!(apple.contains("movq $-2, %rax"), "{apple}");
+
+    // A naked HardFault handler replaces the runtime's weak default and hands
+    // the stacked frame to an ordinary function.
+    let fault = r#"package main
+import "core/ptr"
+
+static mut FAULT_PC: u32 = 0
+
+@naked
+extern "C" fn HardFault_Handler() {
+    unsafe {
+        asm(
+            "movs r0, #4",
+            "mov r1, lr",
+            "tst r0, r1",
+            "mrs r0, msp",
+            "beq 1f",
+            "mrs r0, psp",
+            "1:",
+            "ldr r1, ={0}",
+            "bx r1",
+            sym record_fault,
+        )
+    }
+}
+
+extern "C" fn record_fault(frame: *const u32) {
+    unsafe {
+        FAULT_PC = ptr.read(ptr.offset(frame, 6))
+    }
+    for {
+    }
+}
+
+fn main() {}
+"#;
+    if !ld_lld() {
+        return;
+    }
+    for board in ["pico", "pico2"] {
+        let elf_path = scratch.path(&format!("fault-{board}.elf"));
+        let file = scratch.write("fault.dodo", fault);
+        success(&dodo(&["build", &file, "--board", board, "-o", &elf_path]));
+        let elf = fs::read(&elf_path).unwrap();
+        let symbol = |name: &str| {
+            elf_symbol(&elf, name).unwrap_or_else(|| panic!("{board}: no symbol {name}"))
+        };
+        let handler = symbol("HardFault_Handler");
+        assert_eq!(handler & 1, 1, "{board}: Thumb handler");
+        assert_eq!(
+            word_at(&elf, symbol("__vector_table") + 3 * 4),
+            Some(handler),
+            "{board}"
+        );
+        // Nine 16-bit or 32-bit instructions, then the literal pool entry.
+        let pool = (handler & !1) + 20;
+        assert_eq!(word_at(&elf, pool), Some(symbol("record_fault")), "{board}");
+    }
+}

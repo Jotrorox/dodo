@@ -139,7 +139,7 @@ fn validate_signature(function: &Function) -> Result<(), Diagnostic> {
         Some("a test cannot be async; run the future with an executor in the test")
     } else if function.interrupt.is_some() {
         Some("an interrupt handler cannot be async; raise a signal for a task instead")
-    } else if function.printing.is_some() || function.pio {
+    } else if function.printing.is_some() || function.pio || function.wgsl {
         Some("@compiler declarations cannot be async")
     } else if !function.placement.is_empty() {
         Some("@section and @align do not apply to async fns")
@@ -217,6 +217,7 @@ fn expand_function(function: &Function, future: &str, alias: &str) -> (Struct, V
         extern_: false,
         printing: None,
         pio: false,
+        wgsl: false,
         generics: function.generics.clone(),
         bounds: function.bounds.clone(),
         generic_instance: false,
@@ -234,6 +235,7 @@ fn expand_function(function: &Function, future: &str, alias: &str) -> (Struct, V
         link_name: None,
         placement: Placement::default(),
         inlining: crate::ast::Inlining::Auto,
+        naked: false,
         async_part: Some(part),
     };
     let mut parts = vec![method(

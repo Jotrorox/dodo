@@ -2,6 +2,89 @@
 
 ## Unreleased
 
+- `gpu.wgsl("...")` writes a std/gpu shader once in WGSL: the compiler
+  translates it into SPIR-V, Metal Shading Language and GLSL 4.50 when the
+  program is built (through the `naga` crate, behind the new default `wgsl`
+  feature), so one source runs on Vulkan, Metal and OpenGL with no shader
+  tools installed. Mistakes are compile errors pointing into the literal.
+  Slot N is `@group(0) @binding(N)`, and a sampled texture's sampler is
+  `@group(1) @binding(N)`. See [Shaders in WGSL](docs/src/content/docs/gpu.md).
+- `gpu.Surface` presents std/gpu frames in std/window windows: a Vulkan
+  swapchain on Linux and Windows, the view's `CAMetalLayer` on macOS, or the
+  window's own OpenGL context (from the new `gpu.Device.open_for_window`).
+  `acquire()` hands out a frame to render into, `present()` shows it, with
+  two or three frames in flight (`gpu.SurfaceOptions`) and `resize()` for
+  window size changes; the new `gpu.Error.Outdated` asks for one. See
+  [Surfaces](docs/src/content/docs/gpu.md) and the new
+  `examples/gpu_window.dodo`.
+- std/gpu no longer waits for the GPU to write data: `write_buffer`,
+  `write_texture` and `create_buffer_with_data` copy into a staging ring and
+  record the copy into a command buffer submitted ahead of the next
+  submission, still ordered as before. On Vulkan, buffers and images are
+  carved out of large memory blocks, buffers live in device memory (mapped on
+  unified-memory GPUs), and reads come back through host-cached memory.
+  `DODO_GPU_UNMAPPED` makes the Vulkan backend take the discrete-GPU paths
+  anywhere, for testing.
+- std/gpu derives barriers from how commands use each buffer and texture
+  instead of placing a full barrier before every pass, copy and dispatch on
+  Vulkan (where render passes now record into secondary command buffers) or
+  after every pass and dispatch on OpenGL. Vulkan command pools are reused.
+- The std/gpu examples write their shaders once in WGSL.
+- Arduino Uno support: `board = "arduino_uno"` (or `--board arduino_uno`) on
+  the new `atmega328p` chip, an 8-bit AVR. `dodo run` flashes the board
+  itself through its Optiboot bootloader over the USB serial port, speaking
+  STK500 version 1 and verifying every page, so avrdude is not needed;
+  `dodo build` writes an `.elf` and an Intel HEX `.hex`.
+  `std/embedded/chip/atmega328p` and `std/embedded/board/arduino_uno` give the
+  board contract's pins, timer, serial port (with a 32-byte interrupt-driven
+  receive buffer), I2C, SPI, PWM on all six PWM pins, the ADC and temperature
+  sensor, the watchdog, and the EEPROM, and board-generic programs such as
+  `examples/blink` and `examples/serial_console.dodo` run unchanged. The
+  compiler's AVR runtime is LLVM IR like the others: startup, a Timer 0 time
+  base, libgcc-compatible division and multiplication helpers, atomics, and
+  correctly rounded `f32` (native 32-bit code) and `f64` arithmetic. Panic
+  messages stay in flash rather than the 2 KiB of SRAM. AVR builds default to
+  `-O 2` and optimize for size. `scripts/test_arduino_uno.py` runs the
+  board's self-test.
+- Function values on targets whose code has its own address space, such as
+  AVR, use that address space: function pointers, closures, `dyn` method
+  tables, and `@interrupt` handlers (which get AVR's signal ABI) compile for
+  AVR, and `core/cpu`'s interrupt control and `wait_for_interrupt` work there.
+
+- `std/window` has the basics desktop programs such as text editors need.
+  `app.set_clipboard_text(text)` and `app.clipboard_text()` copy and paste
+  text through the system clipboard (`NSPasteboard`, the Win32 clipboard,
+  and the X11 CLIPBOARD selection, which the App serves to other programs
+  from its event loop, with large texts in both directions and Latin-1
+  `STRING` from older programs). `win.set_cursor(window.Cursor.Text)` and ten
+  other standard shapes set the pointer over a window. `win.set_size`,
+  `win.set_min_size` and `win.set_max_size` resize a window from code and
+  limit the sizes the user can give it, and `win.set_fullscreen(on)` and
+  `win.is_fullscreen()` switch to fullscreen: a fullscreen space on macOS, a
+  borderless window covering the monitor on Windows, and `_NET_WM_STATE` on
+  X11, where a window without a window manager covers the screen itself. See
+  the [Windows guide](docs/src/content/docs/window.md#clipboard).
+- Global and naked assembly. Top-level `unsafe asm("...")` is emitted into
+  the object file outside any function, for startup code, functions written
+  entirely in assembly, or tables. `@naked` marks an `extern "C"` function
+  whose body is one `unsafe { asm(...) }` and which has no prologue or
+  epilogue, such as a fault handler that reads the stacked frame. Assembly
+  of every kind takes two new operands: `sym name` writes the link symbol
+  of a function or static into the template (with Mach-O's underscore, and
+  keeping the definition even when only assembly uses it), and `const value`
+  writes an integer constant expression. See
+  [global assembly](docs/src/content/docs/memory-and-ffi.md#global-assembly)
+  and [naked functions](docs/src/content/docs/memory-and-ffi.md#naked-functions).
+- Fixed: a struct field named `len` failed code generation ("is not an
+  array or slice") because every `.len` was compiled as a collection length.
+  `len` is now the built-in length only on arrays, slices and strings.
+- Results with a value (`T!E`) and enums with payloads return in registers.
+  The shared payload storage is now made of integer words instead of bytes.
+  Byte storage made an `i64!E` result nine separate return values to LLVM,
+  so it went through a hidden memory slot that the caller reassembled byte
+  by byte. A loop of 300 million non-inlined `i64!E` calls runs in 0.36 s
+  instead of 1.52 s on an M-series Mac. Layout sizes and alignments are
+  unchanged.
 - New database packages. `std/db` holds the shared vocabulary for drivers:
   `db.Error` with portable `db.ErrorKind`s and `db.Constraint`s plus the
   driver's native code, the borrowed `db.Value`, and `db.IsolationLevel`.
@@ -22,6 +105,19 @@
   common pragmas, and SQLite's core, aggregate, and date/time functions with
   its type affinity rules. Differential tests compare results and written
   files against SQLite. See the new [SQLite guide](docs/src/content/docs/sqlite.md).
+- `@derive(Row)` maps structs to SQL rows for any `std/db/sql` driver. It
+  generates `decode_row<R: sql.Row>(row: &R) -> Self!db.Error`, which matches
+  columns by name and borrows text and blobs from the row without copying, and
+  `params(&self) -> [N]db.Value` for statement parameters. Fields can be
+  integers, floats, `bool`, `&str`, `&[u8]`, `Option<T>` for NULL, and custom
+  column types with `decode_value`/`encode_value` methods. `@db_name("column")`
+  renames a column and `@db_flatten` decodes a nested Row struct for joins.
+  Conversions report `db.ErrorKind.Type` errors instead of trapping, and the
+  same helpers (`sql.column`, `sql.int_in`, `sql.text`, ...) are available
+  to hand-written decoders.
+- Derives now go through a small registry in the compiler: `@derive` accepts
+  a list (`@derive(Json, Row)`), and each derive declares the attributes it
+  owns, so misplaced or foreign attributes get precise errors.
 - `fs.File.try_lock_range(start, length, shared)` and `unlock_range` take
   non-blocking advisory byte-range locks (POSIX `fcntl` record locks through
   the fs C adapter, `LockFileEx` on Windows).

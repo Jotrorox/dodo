@@ -3,6 +3,7 @@ package system
 import "core/ptr"
 import "core/mem"
 import "std/window/handle"
+import "std/window/heap"
 import "std/window/raw"
 
 // The window adapter shared by macOS and Windows, whose window systems are
@@ -28,6 +29,13 @@ unsafe extern "C" fn dodo_window_request_frame(id: u32) -> i32
 unsafe extern "C" fn dodo_window_set_animating(animating: u32)
 unsafe extern "C" fn dodo_window_native(id: u32, first: *mut usize, second: *mut usize) -> i32
 unsafe extern "C" fn dodo_window_metal_layer(id: u32, layer: *mut usize) -> i32
+unsafe extern "C" fn dodo_window_set_cursor(id: u32, shape: u32) -> i32
+unsafe extern "C" fn dodo_window_set_size(id: u32, width: u32, height: u32) -> i32
+unsafe extern "C" fn dodo_window_set_size_limits(id: u32, min_width: u32, min_height: u32, max_width: u32, max_height: u32) -> i32
+unsafe extern "C" fn dodo_window_set_fullscreen(id: u32, fullscreen: u32) -> i32
+unsafe extern "C" fn dodo_window_fullscreen(id: u32) -> u32
+unsafe extern "C" fn dodo_window_set_clipboard(text: *const u8, length: usize) -> i32
+unsafe extern "C" fn dodo_window_clipboard(data: *mut usize, length: *mut usize) -> i32
 
 // dodo_window_open flags.
 const RESIZABLE: u32 = 1
@@ -166,6 +174,49 @@ pub struct Backend {
         return status(unsafe {
             dodo_window_set_cursor_visible(id, flag(visible))
         })
+    }
+    pub fn set_cursor(id: u32, shape: u32) -> void!raw.Error {
+        return status(unsafe {
+            dodo_window_set_cursor(id, shape)
+        })
+    }
+    pub fn set_size(id: u32, width: u32, height: u32) -> void!raw.Error {
+        return status(unsafe {
+            dodo_window_set_size(id, width, height)
+        })
+    }
+    pub fn set_size_limits(id: u32, min_width: u32, min_height: u32, max_width: u32, max_height: u32) -> void!raw.Error {
+        return status(unsafe {
+            dodo_window_set_size_limits(id, min_width, min_height, max_width, max_height)
+        })
+    }
+    pub fn set_fullscreen(id: u32, fullscreen: bool) -> void!raw.Error {
+        return status(unsafe {
+            dodo_window_set_fullscreen(id, flag(fullscreen))
+        })
+    }
+    pub fn fullscreen(id: u32) -> bool {
+        return unsafe {
+            dodo_window_fullscreen(id)
+        } != 0
+    }
+    pub fn set_clipboard(text: &[u8]) -> void!raw.Error {
+        return status(unsafe {
+            dodo_window_set_clipboard(ptr.as_ptr(text), text.len)
+        })
+    }
+    // The clipboard's text as UTF-8 in memory from dodo_window_alloc, which
+    // the returned bytes own.
+    pub fn clipboard() -> heap.Bytes!raw.Error {
+        address := 0usize
+        length := 0usize
+        status(unsafe {
+            dodo_window_clipboard(ptr.from_mut(&mut address), ptr.from_mut(&mut length))
+        })?
+        if address == 0 {
+            return ok(heap.Bytes.empty())
+        }
+        return ok(heap.Bytes { address: address, length: length })
     }
     // The window system's objects behind the window: its NSWindow and
     // content view on macOS, its HWND and HINSTANCE on Windows.

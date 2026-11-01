@@ -13,6 +13,21 @@ package hal
 // Objects cross the interface as plain Handles, four words whose meaning
 // each backend defines (a VkBuffer and its memory, a retained MTLBuffer, an
 // OpenGL buffer name). std/gpu never looks inside them.
+//
+// Transfers: a backend whose staged() is true (Vulkan, Metal) leaves
+// write_buffer, read_buffer, write_texture and read_texture to std/gpu,
+// which copies data through mapped BUFFER_UPLOAD and BUFFER_READBACK
+// buffers with copy commands recorded into an upload encoder that is
+// submitted ahead of the next submission. OpenGL, whose driver orders such
+// calls itself, implements them directly.
+//
+// Hazards: std/gpu tracks how each command uses every buffer and texture
+// within an encoder and calls barrier() before a command whose use depends
+// on an earlier one, naming both sides with USE_* bits. Every encoder starts
+// ordered after everything submitted before it, so hazards between
+// submissions never need a barrier call.
+
+import "std/window/handle"
 
 pub enum Error {
     // No GPU API could be used: its library or driver is missing, or it
@@ -30,6 +45,9 @@ pub enum Error {
     OutOfMemory,
     // The GPU stopped responding or was removed; the device is unusable.
     DeviceLost,
+    // A surface no longer matches its window, which was resized or
+    // minimized: resize it to the window's current size.
+    Outdated,
     // Another backend call failed.
     System
 }
@@ -84,6 +102,11 @@ pub const BUFFER_VERTEX: u32 = 8
 pub const BUFFER_UNIFORM: u32 = 16
 pub const BUFFER_STORAGE: u32 = 32
 pub const BUFFER_USAGES: u32 = 63
+// Usages only std/gpu itself asks for, never part of a user's buffer: a
+// mapped staging buffer the CPU writes and copies read (always mapped), and
+// one copies write and the CPU reads, in memory the CPU caches.
+pub const BUFFER_UPLOAD: u32 = 64
+pub const BUFFER_READBACK: u32 = 128
 
 // Texture usages, combined with `|`.
 pub const TEXTURE_COPY_SRC: u32 = 1
@@ -249,6 +272,25 @@ pub const ADDRESS_MIRROR: u32 = 2
 // What a render pass does with an attachment's previous contents.
 pub const LOAD_CLEAR: u32 = 0
 pub const LOAD_KEEP: u32 = 1
+
+// How a command uses a resource, for barrier(). The bits that write are
+// USE_WRITES; a storage binding that may be written counts as both.
+pub const USE_VERTEX_INPUT: u32 = 1
+pub const USE_INDEX: u32 = 2
+// Uniform, storage, sampled or storage-texture reads by a shader stage.
+pub const USE_VERTEX_READ: u32 = 4
+pub const USE_FRAGMENT_READ: u32 = 8
+pub const USE_COMPUTE_READ: u32 = 16
+// Storage buffer or storage texture writes by a shader stage.
+pub const USE_FRAGMENT_WRITE: u32 = 32
+pub const USE_COMPUTE_WRITE: u32 = 64
+// Render pass attachments, which are read (blending, depth tests) and
+// written.
+pub const USE_COLOR: u32 = 128
+pub const USE_DEPTH: u32 = 256
+pub const USE_COPY_SRC: u32 = 512
+pub const USE_COPY_DST: u32 = 1024
+pub const USE_WRITES: u32 = 32 | 64 | 128 | 256 | 1024
 
 // What a device can do. Every backend offers at least the minimums listed
 // in std/gpu's documentation.
@@ -624,24 +666,53 @@ pub struct RenderPassInfo {
     pub clear_depth: f32
 }
 
+// How a surface presents: the size of its images in pixels, whether
+// presenting waits for the display's refresh, and how many frames may be
+// in flight (2 or 3). configure_surface sets `format` to the FORMAT_* of
+// the images it made.
+pub struct SurfaceConfig {
+    pub width: u32
+    pub height: u32
+    pub vsync: bool
+    pub frames: u32
+    pub format: u32
+}
+
 // What std/gpu needs from a backend. Every method except the
-// constructor works on objects this device created; std/gpu destroys an
+// constructors works on objects this device created; std/gpu destroys an
 // object only once the GPU has finished every submission that used it.
 pub interface Backend {
     // Open the backend's preferred GPU. `debug` asks for the API's
     // validation where it exists.
     fn open(debug: bool) -> Self!Error
+    // Open a GPU that can present to `native`'s window. OpenGL makes its
+    // context the window's, which its surface then needs.
+    fn open_for_window(native: &handle.NativeHandle, debug: bool) -> Self!Error
     fn api(&self) -> Api
     fn limits(&self) -> Limits
     // Copy the GPU's name into `out`, cut at a character boundary, and
     // return its length.
     fn name(&self, out: &mut[u8]) -> usize
 
+    // Whether std/gpu stages transfers itself (see the top of this file).
+    fn staged(&self) -> bool
+    // The CPU address of a buffer's memory, or 0 when the CPU cannot map
+    // it. BUFFER_UPLOAD and BUFFER_READBACK buffers are always mapped; on a
+    // GPU with unified memory, ordinary buffers may be too.
+    fn mapped(&self, buffer: &Handle) -> usize
+    // Make the GPU's writes to a mapped buffer visible to the CPU, after
+    // the submission writing them has finished.
+    fn invalidate(&self, buffer: &Handle, offset: u64, size: u64)
+
+    // A buffer, initially zero when it is mapped; std/gpu clears unmapped
+    // ones with clear_buffer before their first use.
     fn create_buffer(&self, size: u64, usage: u32) -> Handle!Error
     // Copy into or out of a buffer. std/gpu has already waited for every
     // submission that may use it.
     fn write_buffer(&self, buffer: &Handle, offset: u64, data: &[u8]) -> void!Error
     fn read_buffer(&self, buffer: &Handle, offset: u64, out: &mut[u8]) -> void!Error
+    // A texture. Staged backends make it usable and zero it with
+    // initialize_texture, which std/gpu records before its first use.
     fn create_texture(&self, descriptor: &TextureDescriptor) -> Handle!Error
     // Copy texels in or out, `bytes_per_row` apart in `data`. Writes are
     // ordered after earlier submissions; reads wait for them.
@@ -676,4 +747,29 @@ pub interface Backend {
     fn copy_buffer(&self, encoder: &mut Handle, source: &Handle, source_offset: u64, destination: &Handle, destination_offset: u64, size: u64)
     fn copy_buffer_to_texture(&self, encoder: &mut Handle, source: &Handle, offset: u64, bytes_per_row: u32, destination: &Handle, descriptor: &TextureDescriptor, region: &Region)
     fn copy_texture_to_buffer(&self, encoder: &mut Handle, source: &Handle, descriptor: &TextureDescriptor, region: &Region, destination: &Handle, offset: u64, bytes_per_row: u32)
+    // Fill `size` bytes of a buffer from `offset` with zeros; both are
+    // multiples of 4.
+    fn clear_buffer(&self, encoder: &mut Handle, buffer: &Handle, offset: u64, size: u64)
+    fn initialize_texture(&self, encoder: &mut Handle, texture: &Handle, descriptor: &TextureDescriptor)
+    // Make the commands recorded next that use resources as `after` says
+    // wait for earlier ones that used them as `before` says, and see their
+    // writes. Inside a render pass, the barrier applies before the pass:
+    // draws of one pass are never ordered against each other.
+    fn barrier(&self, encoder: &mut Handle, before: u32, after: u32)
+
+    // A surface presenting to a window, configured with configure_surface
+    // before its first acquire.
+    fn create_surface(&self, native: &handle.NativeHandle) -> Handle!Error
+    // Make (or remake) a surface's images. std/gpu has waited for every
+    // submission and holds no acquired image.
+    fn configure_surface(&self, surface: &mut Handle, config: &mut SurfaceConfig) -> void!Error
+    // Wait for the surface's next image and describe it in `texture`, a
+    // texture handle valid until the next configure_surface. Returns the
+    // number of a submission the backend made to prepare the image, or 0.
+    // Fails with Outdated when the surface must be configured again.
+    fn acquire(&self, surface: &mut Handle, texture: &mut Handle) -> u64!Error
+    // Show the acquired image after every submission so far, and return
+    // the number of the submission doing so, or 0 when there is none.
+    fn present(&self, surface: &mut Handle) -> u64!Error
+    fn destroy_surface(&self, surface: &Handle)
 }

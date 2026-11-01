@@ -338,3 +338,55 @@ fn metal_draws_into_a_window_on_the_macos_desktop() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.ends_with("passed\n"), "{stdout}");
 }
+
+/// gpu.Surface presents to a window's CAMetalLayer: frame contents, frames
+/// in flight, resizing and staged writes into frames. Opt-in, because it
+/// shows windows.
+#[cfg(target_os = "macos")]
+#[test]
+fn std_gpu_surface_presents_on_the_macos_desktop() {
+    if std::env::var_os("DODO_DESKTOP_TESTS").is_none() {
+        eprintln!("skipping: set DODO_DESKTOP_TESTS to open desktop windows");
+        return;
+    }
+    let scratch = Scratch::new("surface");
+    let executable = scratch.0.join("surface");
+    let source = root().join("tests/stdlib/gpu_surface_checks.dodo");
+    success(
+        &dodo(&[
+            "build",
+            source.to_str().unwrap(),
+            "-O",
+            "0",
+            "-o",
+            executable.to_str().unwrap(),
+        ]),
+        "compile the surface checks",
+    );
+    let output = Command::new(&executable).output().unwrap();
+    success(&output, "run the surface checks");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Metal ok") && stdout.ends_with("passed\n"),
+        "{stdout}"
+    );
+    let window = scratch.0.join("window");
+    success(
+        &dodo(&[
+            "build",
+            root().join("examples/gpu_window.dodo").to_str().unwrap(),
+            "-O",
+            "0",
+            "-o",
+            window.to_str().unwrap(),
+        ]),
+        "compile the window example",
+    );
+    let output = Command::new(&window).arg("60").output().unwrap();
+    success(&output, "run the window example");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.starts_with("Metal on ") && stdout.ends_with("60 frames\n"),
+        "{stdout}"
+    );
+}

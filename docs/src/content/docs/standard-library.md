@@ -62,6 +62,7 @@ they are not prerequisites for using the safe entry APIs.
 | React to MQTT messages or publish on a timer | `app.new(id).on(...).every(...).run(url)` from `std/mqtt/app` | [MQTT](mqtt.md) |
 | Run an MQTT broker | `broker.new().run(address)` from `std/mqtt/broker` | [MQTT](mqtt.md#the-broker) |
 | Store data in an SQL database file | `sqlite.Connection.open(path, workspace)` and `execute`/`select` from `std/db/sqlite` | [SQLite databases](sqlite.md) |
+| Map SQL rows to structs | `@derive(Row)`, then `T.decode_row(&row)` and `value.params()` | [SQLite databases](sqlite.md#mapping-rows-to-structs) |
 | Run Lua scripts or plugins inside a program | `lua.Lua.new()`, `open_libs()` and `cx.do_string` from `std/script/lua` | [Embedded scripting with Lua](script.md) |
 
 Use a fresh directory for each copied example and run the commands there.
@@ -138,7 +139,7 @@ OS/C-library calls may allocate internally even when Dodo storage is fixed.
 HTTP/1.1 clients, servers, streaming framing, web routing, and QUIC connections
 and streams **are implemented**.
 HTTP/2, HTTP/3, WebSockets, TOML serialization and chip support beyond
-the RP2040 and RP2350 are remaining work. [`std/embedded/hal`](hardware.md) supplies typed
+the RP2040, RP2350 and ATmega328P are remaining work. [`std/embedded/hal`](hardware.md) supplies typed
 registers and portable device protocols, blocking and polling, including I2C
 and SPI targets, pulse capture, timers at other rates with compare,
 periodic, and capture channels, CAN, I2S, and DMA buffer transfers, with
@@ -185,6 +186,10 @@ cores through `Mutex<T>` statics. `std/embedded/power` is the low-power layer ev
 sleep and deep sleep modes, clock gating, and a dormant state that pins or
 a timeout end. `std/embedded/wireless/cyw43` drives the Pico 2 W's CYW43439 wireless chip
 far enough for its LED; Wi-Fi and Bluetooth are not supported yet.
+`std/embedded/chip/atmega328p` and `std/embedded/board/arduino_uno` support
+the ATmega328P and Arduino Uno: pins, the serial port, I2C, SPI, PWM, the
+ADC, the watchdog, and the EEPROM, flashed by `dodo run` through the board's
+bootloader.
 `std/embedded/rtc/ds3231` drives a DS3231 battery-backed clock chip on I2C
 through the same real-time clock protocols as the chips' own clocks.
 [Compiler limits](implementation.md) and [container element restrictions](container-elements.md)
@@ -292,6 +297,7 @@ select providers; they are not additional recommended starting paths.
 | `std/script/posix` | Lua host boundary on Linux and macOS (C library streams, processes, time, locale); use [Lua](script.md#platforms). |
 | `std/script/windows` | Lua host boundary on Windows; use [Lua](script.md#platforms). |
 | `std/gpu/hal/vulkan` | `std/gpu`'s Vulkan backend; use [GPU programming](gpu.md). |
+| `std/gpu/hal/vulkan/memory` | The Vulkan backend's memory sub-allocator; use [GPU programming](gpu.md). |
 | `std/gpu/hal/opengl` | `std/gpu`'s OpenGL backend; use [GPU programming](gpu.md). |
 | `std/gpu/hal/macos` | `std/gpu`'s Metal backend, its native one on macOS; use [GPU programming](gpu.md). |
 | `std/gpu/hal/linux` | `std/gpu`'s native backend on Linux, which has none; use [GPU programming](gpu.md). |

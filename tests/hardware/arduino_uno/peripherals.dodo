@@ -1,0 +1,168 @@
+package main
+
+import "checks"
+import "core/mmio"
+import "std/embedded/board"
+import "std/embedded/chip"
+import "std/embedded/hal"
+import "std/fmt"
+
+// Arduino Uno self-test, part three: std/embedded/chip/atmega328p's pins, PWM, analog inputs,
+// EEPROM, watchdog, I2C and SPI, through std/embedded/board/arduino_uno, with
+// nothing wired to the board; see core.dodo for the reporting.
+
+fn drive(pin: &mut dyn hal.OutputPin, high: bool) {
+    if high {
+        pin.set_high()
+    } else {
+        pin.set_low()
+    }
+}
+
+fn main() {
+    b := board.take()!
+    serial := b.usb.serial()!
+    fmt.printf(&mut serial, "\nselftest {} peripherals\n", board.NAME)!
+    checks.check(&mut serial, match board.take() {
+        ok(_) => false,
+        err(error) => error == hal.Error.Busy,
+    }, "second take() is refused", 0)
+    pin_checks(&mut serial, &mut b)
+    pwm_checks(&mut serial, &mut b)
+    analog_checks(&mut serial, &mut b)
+    eeprom_checks(&mut serial, &mut b)
+    watchdog_checks(&mut serial, &mut b)
+    bus_checks(&mut serial, &mut b)
+    let board.Board { led: led, pins: parts, timer: timer, watchdog: watchdog, eeprom: eeprom, usb: usb } = b
+    pins := parts
+    pins.release(led)
+    spi_checks(&mut serial, &mut pins)
+    checks.finish(&mut serial)
+}
+
+// Pins, through the hal protocols too.
+@inline(never)
+fn pin_checks(out: &mut chip.Serial, b: &mut board.Board) {
+    probe := b.pins.output(board.D2)!
+    drive(&mut probe, true)
+    high := probe.is_high()
+    drive(&mut probe, false)
+    checks.check(out, high && !probe.is_high(), "dyn OutputPin drives D2", 0)
+    b.pins.release(probe)
+    button := b.pins.input_pull_up(board.D4)!
+    checks.check(out, button.is_high(), "unconnected input with pull-up reads high", 0)
+    b.pins.release(button)
+    again := b.pins.output(board.D4)
+    checks.check(out, match again {
+        ok(pin) => {
+            b.pins.release(pin)
+            true
+        }
+        err(_) => false,
+    }, "released pin is claimed again", 0)
+}
+
+// PWM: sample the pin's level while it runs at 25 %.
+@inline(never)
+fn pwm_checks(out: &mut chip.Serial, b: &mut board.Board) {
+    pwm := b.pins.pwm(board.D9, 1000)!
+    checks.check(out, pwm.max_duty() == 15_999, "Timer 1 PWM at 1 kHz counts to 15999", pwm.max_duty() as u32)
+    pwm.set_duty(4000)!
+    highs := 0u32
+    for _ in 0..2000 {
+        if (unsafe {
+            mmio.read8(0x23)
+        } & 0x02) != 0 {
+            highs += 1
+        }
+        b.timer.delay_us(7)
+    }
+    checks.check(out, highs >= 400 && highs <= 600, "PWM output is high a quarter of the time", highs)
+    b.pins.release_pwm(pwm)
+    slow := b.pins.pwm(board.D3, 490)!
+    checks.check(out, slow.max_duty() == 255, "Timer 2 PWM has 8 bits", slow.max_duty() as u32)
+    b.pins.release_pwm(slow)
+}
+
+@inline(never)
+fn analog_checks(out: &mut chip.Serial, b: &mut board.Board) {
+    sensor := b.pins.temperature()!
+    reading := sensor.read()!
+    celsius := chip.millicelsius(reading) / 1000
+    checks.check(out, reading >= 250 && reading <= 420, "temperature sensor reads a plausible value", reading as u32)
+    fmt.printf(out, "info temperature {} C (raw {})\n", celsius, reading)!
+    b.pins.release_analog(sensor)
+    input := b.pins.analog(board.A0)!
+    level := input.read()!
+    checks.check(out, level <= 1023, "A0 converts", level as u32)
+    b.pins.release_analog(input)
+    checks.check(out, match b.pins.analog(board.D2) {
+        ok(_) => false,
+        err(error) => error == hal.Error.InvalidInput,
+    }, "D2 has no analog input", 0)
+}
+
+// EEPROM: keep its last block's contents, write a pattern, restore.
+@inline(never)
+fn eeprom_checks(out: &mut chip.Serial, b: &mut board.Board) {
+    saved: [8]u8 = [0u8; 8]
+    b.eeprom.read(1016, &mut saved)!
+    pattern: [8]u8 = [1, 2, 3, 4, 0xA5, 0x5A, 0, 0xFF]
+    b.eeprom.update(1016, &pattern)!
+    back: [8]u8 = [0u8; 8]
+    b.eeprom.read(1016, &mut back)!
+    same := true
+    for index in 0usize..8 {
+        if back[index] != pattern[index] {
+            same = false
+        }
+    }
+    b.eeprom.update(1016, &saved)!
+    checks.check(out, same, "EEPROM keeps written bytes", back[4] as u32)
+    checks.check(out, match b.eeprom.read(1020, &mut back) {
+        ok() => false,
+        err(error) => error == hal.Error.InvalidInput,
+    }, "EEPROM rejects reads past its end", 0)
+}
+
+@inline(never)
+fn watchdog_checks(out: &mut chip.Serial, b: &mut board.Board) {
+    checks.check(out, match b.watchdog.start(10) {
+        ok() => false,
+        err(error) => error == hal.Error.InvalidInput,
+    }, "watchdog rejects a 10 ms timeout", 0)
+    b.watchdog.start(250)!
+    for _ in 0..6 {
+        b.timer.delay_ms(100)
+        b.watchdog.feed()
+    }
+    b.watchdog.stop()
+    b.timer.delay_ms(400)
+    checks.check(out, true, "fed watchdog does not reset the board", 0)
+}
+
+// Buses with nothing attached.
+@inline(never)
+fn bus_checks(out: &mut chip.Serial, b: &mut board.Board) {
+    i2c := b.pins.i2c(board.I2C_SDA_PIN, board.I2C_SCL_PIN, hal.I2C_STANDARD_HZ)!
+    nothing: [2]u8 = [0u8; 2]
+    checks.check(out, match i2c.read(0x50, &mut nothing) {
+        ok() => false,
+        err(error) => error == hal.Error.NoAcknowledge,
+    }, "I2C read from an absent device is NoAcknowledge", 0)
+    checks.check(out, i2c.frequency_hz() == 100_000, "I2C runs at 100 kHz", i2c.frequency_hz())
+    b.pins.release_i2c(i2c)
+    checks.check(out, match b.pins.i2c(board.D2, board.D3, 100_000) {
+        ok(_) => false,
+        err(error) => error == hal.Error.InvalidInput,
+    }, "I2C needs A4 and A5", 0)
+}
+
+@inline(never)
+fn spi_checks(out: &mut chip.Serial, pins: &mut chip.Pins) {
+    spi := pins.spi(board.SPI_CLOCK_PIN, board.SPI_TX_PIN, some(board.SPI_RX_PIN), hal.SpiMode.Mode0, 4_000_000)!
+    bytes: [4]u8 = [1, 2, 3, 4]
+    spi.transfer(&mut bytes)!
+    checks.check(out, spi.frequency_hz() == 4_000_000, "SPI runs at 4 MHz", spi.frequency_hz())
+    pins.release_spi(spi)
+}

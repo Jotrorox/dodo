@@ -11,11 +11,11 @@
 ; pico_double/double_aeabi_dcp.S, copyright 2020 Raspberry Pi (Trading)
 ; Ltd., BSD-3-Clause; see LICENSE.pico-sdk next to this file); dmul and ddiv
 ; do their long multiplications on the CPU in between. The helpers
-; are assembly because these IR files are not optimized: in IR every check
-; would be a call. Cycles per call at 150 MHz with -O2 on everyday operands,
-; against the software helpers: dadd 43 instead of 258, dmul 62 instead of
-; 206, ddiv 89 instead of 1279, i2d 19 instead of 177, d2iz 27 instead of
-; 116, d2f 25 instead of 70.
+; are assembly, as the coprocessor instructions have no IR form. Cycles per
+; call at 150 MHz with -O2 on everyday operands, measured on a board: dadd
+; 43, dmul 62, ddiv 89, i2d 19, d2iz 27, d2f 25. The software helpers take
+; about 150, 205, 340, 45, 30 and 50, as the emulator counts them (it was
+; within 10% of the board for the software helpers' first version).
 ;
 ; The results are the software helpers' bit for bit. The DCP rounds to
 ; nearest, ties to even, like them, but flushes subnormal operands and
@@ -426,3 +426,12 @@ module asm ".thumb_set __truncdfsf2, __aeabi_d2f"
 
 @__aeabi_f2d = weak alias i64 (i32), ptr @dodo_soft_f2d
 @__extendsfdf2 = weak alias i64 (i32), ptr @dodo_soft_f2d
+
+; binary32 addition, subtraction and multiplication run on the FPU; these
+; names are for other LLVM configurations.
+@__aeabi_fadd = weak alias i32 (i32, i32), ptr @dodo_soft_fadd
+@__aeabi_fsub = weak alias i32 (i32, i32), ptr @dodo_soft_fsub
+@__aeabi_fmul = weak alias i32 (i32, i32), ptr @dodo_soft_fmul
+@__addsf3 = weak alias i32 (i32, i32), ptr @dodo_soft_fadd
+@__subsf3 = weak alias i32 (i32, i32), ptr @dodo_soft_fsub
+@__mulsf3 = weak alias i32 (i32, i32), ptr @dodo_soft_fmul

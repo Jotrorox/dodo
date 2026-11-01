@@ -17,7 +17,7 @@ Two small packages sit next to it:
 | Import | Contents |
 | --- | --- |
 | `std/db` | Shared vocabulary for every database driver: `db.Error` (portable `db.ErrorKind`, `db.Constraint`, and the driver's native code), the borrowed `db.Value`, and `db.IsolationLevel`. |
-| `std/db/sql` | Interfaces that every SQL driver matches: `sql.Conn`, `sql.Row`, and `sql.RowSink`, plus the ready-made sinks `sql.Count` and `sql.ScalarInt`. |
+| `std/db/sql` | Interfaces that every SQL driver matches: `sql.Conn`, `sql.Row`, and `sql.RowSink`, the ready-made sinks `sql.Count` and `sql.ScalarInt`, and the value conversions behind `@derive(Row)`. |
 | `std/db/sqlite` | The SQLite driver: `sqlite.Connection`, prepared statements, row cursors. |
 
 ## Quickstart
@@ -115,6 +115,118 @@ and the statement completes when the cursor reaches the end or is dropped.
 
 `conn.changes()`, `conn.total_changes()`, and `conn.last_insert_rowid()`
 report the effects of the last statements, as their SQLite counterparts do.
+
+## Mapping rows to structs
+
+`@derive(Row)` generates the code that turns a result row into a struct and
+a struct into statement parameters. It works with every SQL driver, because
+the generated methods only use `std/db/sql`:
+
+```dodo test
+package notes
+
+import "std/db"
+import "std/db/sqlite"
+
+static mut WORKSPACE: [sqlite.WORKSPACE_BYTES]u8 = [0u8; sqlite.WORKSPACE_BYTES]
+
+@derive(Row)
+struct Note {
+    id: i64
+    title: &str
+    @db_name("stars")
+    rating: u8
+    // NULL becomes none.
+    due: Option<&str>
+}
+
+fn main() -> i32 {
+    conn := sqlite.Connection.open_memory(unsafe { &mut WORKSPACE[..] })!
+    conn.exec("create table notes(id integer primary key, title text, stars int, due text)")!
+
+    note := Note { id: 1, title: "buy milk", rating: 3, due: none }
+    params := note.params()
+    conn.execute("insert into notes(id, title, stars, due) values (?, ?, ?, ?)", &params)!
+
+    none_: [0]db.Value = []
+    rows := conn.select("select * from notes", &none_)!
+    for {
+        let some(row) = rows.next()! else {
+            break
+        }
+        found := Note.decode_row(&row)!
+        assert_eq(found.title, "buy milk")
+        assert_eq(found.rating, 3u8)
+    }
+    return 0
+}
+```
+
+The derive adds two ordinary, type- and borrow-checked methods:
+
+- `decode_row<R: sql.Row>(row: &R) -> Self!db.Error` finds each field's
+  column by name (exact, case-sensitive; `@db_name("column")` overrides the
+  field name) and converts its value. Column order does not matter, and extra
+  columns are ignored. When the statement lists columns in field order, each
+  field costs a single name comparison. `R` can be a driver's row type or
+  `dyn sql.Row`, so a `sql.RowSink` can decode its rows too.
+- `params(&self) -> [N]db.Value` returns the fields in declaration order,
+  ready to pass to `execute`, `run`, or `select`.
+
+`&str` and `&[u8]` fields borrow the row: decoding copies nothing, and the
+compiler rejects code that keeps a decoded struct after the cursor moves on
+or after the workspace goes away. Copy what you need to keep into storage of
+your own.
+
+| Field type | Column value | Parameter |
+| --- | --- | --- |
+| `i64`, `isize`, `i8` to `i32`, `u8` to `u32` | Integer within the field's range | `Int` |
+| `bool` | Integer; nonzero is `true` | `Int` 0 or 1 |
+| `f64`, `f32` | Real or integer (for `f32`, finite and in range) | `Real` |
+| `&str` | Text | `Text` |
+| `&[u8]` | Blob, or the bytes of a text value | `Bytes` |
+| `Option<T>` | `NULL` gives `none`, anything else decodes as `T` | `Null` for `none` |
+| A struct with `decode_value`/`encode_value` | Whatever that struct accepts | `encode_value()` |
+
+`u64` and `usize` are rejected at compile time, because SQL integers are
+signed 64-bit values. A missing column is a `db.ErrorKind.Schema` error. A
+`NULL` in a non-optional field, a value of the wrong type, or a number
+outside the field's range is a `db.ErrorKind.Type` error, never a trap.
+
+For column types of your own, such as money or timestamps, write a struct
+with these two methods and use it as a field type:
+
+```dodo
+pub struct Cents {
+    pub amount: i64
+
+    pub fn decode_value(value: db.Value) -> Self!db.Error {
+        ok(Cents { amount: sql.int(value)? })
+    }
+
+    pub fn encode_value(&self) -> db.Value {
+        db.Value.Int(self.amount)
+    }
+}
+```
+
+Mark a field `@db_flatten` to read a nested `@derive(Row)` struct from the
+same row. This is useful for joins: `select users.*, teams.name as team ...`
+can fill `struct Member { @db_flatten user: User, team: &str }`. A struct with
+flattened fields only gets `decode_row`, because the nested struct's
+parameter count is not known where the outer struct is declared.
+
+The conversions are plain functions in `std/db/sql` (`sql.column`,
+`sql.int`, `sql.int_in`, `sql.real`, `sql.real32`, `sql.boolean`, `sql.text`,
+`sql.bytes`, `sql.is_null`), so a hand-written `decode_row` follows the same
+rules as a derived one:
+
+```dodo
+fn decode_row<R: sql.Row>(row: &R) -> Self!db.Error {
+    count := sql.int(row.get(sql.column(row, "count", 0)?)?)?
+    ok(Totals { count })
+}
+```
 
 ## Transactions
 
