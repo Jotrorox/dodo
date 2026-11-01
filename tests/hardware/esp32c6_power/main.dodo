@@ -527,6 +527,19 @@ fn dormant_checks(b: &mut board.Board) {
     }
     check_later(woken_is(woken, 0) && missed >= 49_000 && missed < 53_000 && lp_elapsed < 200_000)
 
+    // A timeout in the Wake itself, with no pins, ends it as well, and the
+    // result says so with power.BY_TIME.
+    b.power.set_dormant_timeout_us(0)
+    timed := power.Wake.new()
+    timed.after_ms(30)
+    lp_start = b.power.lp_ticks()
+    dormant_crumb(10)
+    woken = b.power.dormant(&timed)
+    dormant_crumb(11)
+    lp_elapsed = (b.power.lp_ticks() - lp_start) * 10_000 / rate
+    note(lp_elapsed as u32)
+    check_later(woken_is(woken, power.BY_TIME) && lp_elapsed >= 29_000 && lp_elapsed < 200_000)
+
     // A pin event in the middle: PIN_B's pad switches to its sleep
     // configuration (IO MUX SLP_SEL), a pull-down, once the chip sleeps,
     // and its low level wakes it.

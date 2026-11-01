@@ -294,8 +294,8 @@ def main():
                     exit_code = 0
                     if source.stem == "console_checks":
                         run_console([wine, str(exe)], env=env, cwd=work)
-                    elif source.stem == "gpu_checks":
-                        # Wine has no GPU std/gpu can use: the fixture must try
+                    elif source.stem in ("gpu_checks", "gpu_surface_checks"):
+                        # Wine has no GPU std/gpu can use: the fixtures must try
                         # every backend, report each failure and exit 2.
                         result = run([wine, str(exe)], env=env, cwd=work, allowed=(0, 2))
                         exit_code = result.returncode
