@@ -13,19 +13,19 @@ grouped under `std/embedded` in layers, on top of two small compiler packages:
 | Layer | Import | What it gives you |
 | --- | --- | --- |
 | Device protocols | `std/embedded/hal` | Pin, delay, I2C, SPI, serial, PWM, analog, CAN, and I2S interfaces that drivers are written against, blocking and polling, with target (slave) sides, pulse capture, and DMA buffer transfers. |
-| Peripheral drivers | `std/embedded/peripheral/...` | I2C, SPI, and UART controller drivers, shared by every chip that contains the controller. |
+| Peripheral drivers | `std/embedded/peripheral/...` | I2C, SPI, UART, and CAN controller drivers, and Espressif's USB serial port, shared by every chip that contains the controller. |
 | Typed registers | `std/embedded/hal` | `hal.Reg<T>` and `hal.RegisterBlock` handles and mask constants for memory-mapped registers. |
 | Interrupts | `std/embedded/hal`, `std/embedded/cortex_m` | `@interrupt` handlers; `hal.Critical`, a section that masks interrupts until it is dropped; `hal.Handler`, a slot for a handler chosen at run time; the Cortex-M interrupt controller and SysTick; the ESP32-C6's interrupt matrix in `std/embedded/chip/esp32c6`. |
 | Tasks | `std/embedded/executor` | Several activities on one core, each woken on time or by an interrupt, with the core asleep in between. |
-| Real-time clocks | `std/embedded/hal`, `std/embedded/chip/rp_rtc`, `std/embedded/rtc/ds3231` | `hal.Rtc` and `hal.RtcAlarm`: the time of day and an alarm, the same on the RP2040's RTC, the RP2350's always-on timer, and a DS3231 clock chip on I2C. |
+| Real-time clocks | `std/embedded/hal`, `std/embedded/chip/rp_rtc`, `std/embedded/rtc/ds3231` | `hal.Rtc` and `hal.RtcAlarm`: the time of day and an alarm, the same on the RP2040's RTC, the RP2350's always-on timer, the ESP32-C6's low-power timer, and a DS3231 clock chip on I2C. |
 | Low power | `std/embedded/power` | Sleep and deep sleep, clock gating, and a dormant state woken by pins, through one `Power` protocol that every chip and the fakes implement. |
-| DMA | `std/embedded/hal`, `std/embedded/chip/rp_dma` | `hal.DmaChannel`, through which drivers move data while the program does other work; the RP2040's and RP2350's channels. |
-| Persistent storage | `std/embedded/hal`, `std/embedded/storage`, `std/embedded/chip/rp_flash` | `hal.Flash`, erasing and writing NOR flash; a power-cut-safe key-value store and flash regions on any such device; the RP2040's and RP2350's program flash. |
+| DMA | `std/embedded/hal`, `std/embedded/chip/rp_dma`, `std/embedded/chip/esp32c6` | `hal.DmaChannel`, through which drivers move data while the program does other work; the RP2040's and RP2350's channels, and the ESP32-C6's. |
+| Persistent storage | `std/embedded/hal`, `std/embedded/storage`, `std/embedded/chip/rp_flash`, `std/embedded/chip/esp_flash` | `hal.Flash`, erasing and writing NOR flash; a power-cut-safe key-value store and flash regions on any such device; the RP2040's, RP2350's, and ESP32-C6's program flash. |
 | Desktop testing | `std/embedded/hal/fake` | In-memory pins, delays, buses, serial ports, flash, a real-time clock, a simulated clock, and simulated power controls that record what a driver did. |
 | Boards | `std/embedded/board` | The selected board: one `take()` and the same LED, pin, timer, and clock fields on every board. |
 | Chip support | `std/embedded/chip` | The selected microcontroller's peripherals, for custom boards. |
 | Wireless chip | `std/embedded/wireless/cyw43` | The CYW43439 on the Pico 2 W: power-up, its gSPI bus, and its GPIO pins. |
-| CAN controllers | `std/embedded/can/mcp2515` | The MCP2515 CAN controller over SPI, as a `hal.Can`. |
+| CAN controllers | `std/embedded/can/mcp2515`, `std/embedded/peripheral/esp_twai` | The MCP2515 CAN controller over SPI and the ESP32-C6's TWAI controllers, as `hal.Can`. |
 | Display panels | `std/embedded/display`, `.../display/st7789`, `.../display/ssd1306` | ST7789 colour and SSD1306 OLED panels as [graphics displays](graphics.md#display-panels), over SPI or I2C. |
 | Raw access | `core/mmio`, `core/cpu`, `asm(...)` | Volatile loads/stores, barriers, interrupt masking, `wfi`, inline assembly. |
 
@@ -139,7 +139,8 @@ fires at once, and one further ahead than the alarm reaches is
 `InvalidInput`. Code polls `fired()`, or the alarm's interrupt runs a
 handler, and either calls `clear()`. Turning that interrupt on is
 chip-specific, as `listen` and `irq` are on the
-[RP2040 and RP2350](#an-interrupt-driven-driver); the protocol only sets
+[RP2040 and RP2350](#an-interrupt-driven-driver) and the
+[ESP32-C6](#interrupts-on-the-esp32-c6); the protocol only sets
 times and reports them. An alarm has `now_us` too, so it is also a counter.
 
 More protocols follow below: [polling forms](#polling-instead-of-waiting)
@@ -159,7 +160,8 @@ errors through layers without conversions, and `==` compares them. Use
 A serial port is just a byte stream. Implement `std/io`'s `write` and `read`
 for a UART and every existing helper works with it, including `io.write_all` and
 [`std/fmt`](formatting.md) output. The RP2040 and RP2350
-[serial ports](#serial-ports-on-the-rp2040-and-rp2350) do exactly that.
+[serial ports](#serial-ports-on-the-rp2040-and-rp2350) and the
+[ESP32-C6's](#the-esp32-c6-and-esp32-c6-devkitc-1) do exactly that.
 
 Code that reads a device and writes to a stream sees both error types. Give it
 an error enum with a variant for each, and `?` wraps either error in its variant
@@ -767,7 +769,8 @@ the clock has already reached fires at once. On clocks that count seconds the
 alarm fires at the start of a second, so `hal.rtc_alarm_in` fires up to a
 second early. Chips raise an interrupt when it fires; their clock types add
 `listen`, `ignore`, and `irq()` for it, as the
-[RP2040 and RP2350](#real-time-clocks-on-the-rp2040-and-rp2350) do.
+[RP2040 and RP2350](#real-time-clocks-on-the-rp2040-and-rp2350) and the
+ESP32-C6's `esp_rtc.Rtc` do.
 
 `std/embedded/rtc/ds3231` drives a DS3231 clock chip on an I2C bus, the
 common battery-backed module, through the same protocols. It counts on its
@@ -1523,8 +1526,8 @@ or busy-waits, delays every other task: split long work into steps with
 ### Running tasks on a board
 
 Put references to the tasks in an array of `&mut dyn executor.Task` and hand
-it to `executor.run` with a clock. On the RP2040 and RP2350 the clock is a
-timer alarm, `b.timer.alarm(n)`:
+it to `executor.run` with a clock. On the RP2040, RP2350, and ESP32-C6 the
+clock is a timer alarm, `b.timer.alarm(n)`:
 
 ```dodo
 fn main() {
@@ -3385,7 +3388,7 @@ partition table, or image header, and the compiler adds the rest:
 | Interrupts | A vectored trap table. Every interrupt source the program enables raises CPU interrupt 1, and the runtime saves the caller-saved registers and calls the handler of each pending source, so an `@interrupt(UART0)` handler is an ordinary function, named after its [source](#interrupts-on-the-esp32-c6). Default handlers halt, except `USB_DEVICE` and the DMA channels' sources, which call `dodo_usb_interrupt` and `dodo_dma_interrupt` if the program defines them. |
 | Exceptions | `Exception_Handler(mcause, mepc, mtval)`; the default reports through the panic hook as `processor exception check failed at mcause:mepc:CAUSE:PC`. |
 | Panic hook | `dodo_board_panic` masks interrupts, writes the failure to the program's [serial ports](#panics-on-the-serial-port) and to the USB serial port while one is open, and halts. As on the Raspberry Pi chips, a program can define its own. |
-| Runtime helpers | `memcpy`, `memmove`, `memset`, `memcmp`, 64-bit division, and software `f32` and `f64` arithmetic, the same code as on the RP2040: the core multiplies and divides 32-bit integers in hardware but has no floating-point unit. |
+| Runtime helpers | `memcpy`, `memmove`, `memset`, `memcmp`, 64-bit division, and software `f32` and `f64` arithmetic, the same code as on the RP2040: the core multiplies and divides 32-bit integers in hardware but has no floating-point unit. `dodo_flash_erase` and `dodo_flash_program` erase and write the flash through the boot ROM's functions from SRAM, for `esp_flash`. |
 | Linker script | Flash at `0x42000000` (size from the board), 505 KiB of SRAM at `0x40800000` up to the boot ROM's data, and the stack at the top; `.ramfunc` and `.noinit` [sections](#sections-and-alignment). Functions placed with `@section` are never inlined into others. The boot ROM's functions are named at their stable jump table entries, such as `software_reset` and `esp_rom_spiflash_read`. |
 
 `dodo run` flashes through the boot ROM's serial protocol, the one esptool
@@ -3398,25 +3401,37 @@ image's, and skips writing when the flash already holds the image. Set
 Flashing needs macOS or Linux; on Windows, write the `.bin` at offset 0 with
 esptool or espflash.
 
-`std/embedded/chip/esp32c6` is the chip support. `esp32c6.take()` raises the
-CPU from the boot ROM's 80 MHz to 160 MHz and hands out the peripherals once:
+`std/embedded/chip/esp32c6` is the chip support. `esp32c6.take()` runs the
+CPU at 160 MHz from the PLL, with the buses at 40 MHz, and hands out the
+peripherals once. The boot ROM never chooses the CPU's clock itself, and the
+chip keeps its clock and power settings through the resets that flashing and
+the watchdogs cause, so `take()` sets them every time instead of relying on
+what earlier firmware left:
 
 | Part | What it does |
 | --- | --- |
-| `p.pins` | GPIO 0 to 23, except GPIO 12 and 13, the USB serial port's lines (GPIO 24 to 30 are the module's flash). The GPIO matrix connects any peripheral signal to any pin, so `i2c`, `spi`, `uart`, `uart_flow`, and `pwm` take any free pins. `Pin` adds `set_pull(up, down)` and `set_open_drain(on)`, and `listen` watches one edge, both edges, or one level. |
-| I2C | One controller (`esp_i2c`), as master, 1 kHz to 1 MHz, with 7- and 10-bit addresses and `probe`; open-drain lines with the pads' pull-ups. Longer transfers run as several queued runs that keep the bus. |
-| SPI | GP-SPI2 (`esp_spi`), as master, from 78.2 kHz to 80 MHz, full duplex in runs of 64 bytes; chip selects are output pins. `set_loopback(true)` reads MISO from the MOSI pin, for self-tests. |
-| Serial ports | UART0 and UART1 (`esp_uart`), 300 to 5 000 000 bit/s, with 128-byte FIFOs, the Reader and Writer protocols, `set_format`, `set_crlf`, `set_break`, `set_loopback`, flow control, and interrupts, as `pl011` offers. |
+| `p.pins` | GPIO 0 to 23, except GPIO 12 and 13, the USB serial port's lines (GPIO 24 to 30 are the module's flash). The GPIO matrix connects any peripheral signal to any pin, so `i2c`, `i2c_target`, `spi`, `spi_with_select`, `spi_target`, `uart`, `uart_flow`, `pwm`, `pwm_input`, `can`, `i2s_output`, and `i2s_input` take any free pins. `Pin` adds `set_pull(up, down)` and `set_open_drain(on)`, and `listen` watches one edge, both edges, or one level. |
+| I2C | One controller (`esp_i2c`), as master, 1 kHz to 1 MHz, with 7- and 10-bit addresses and `probe`; open-drain lines with the pads' pull-ups. Transactions of any length run as runs of up to 31 bytes that keep the bus, blocking or polled (`hal.I2cPoll`, one run per poll). `i2c_target(sda, scl, address, ten_bit, hz)` makes it a target (`hal.I2cTarget`) at a 7- or 10-bit address, stretching the clock while its receive FIFO is full and while a read waits for `respond`. |
+| SPI | GP-SPI2 (`esp_spi`), as master, from 78.2 kHz to 80 MHz, full duplex in runs of 64 bytes, blocking or polled (`hal.SpiPoll`). Chip selects are output pins, or with `spi_with_select(clock, tx, rx, select, mode, hz)` the controller's own CS0, low across a whole transfer. `spi.dma(&mut channel, &mut buffer)` returns a `hal.SpiDma` session over one DMA channel for transfers of up to 32 736 bytes. `spi_target(clock, tx, rx, select, mode)` makes it a target (`hal.SpiTarget`) for transactions of up to 64 bytes. `set_loopback(true)` reads MISO from the MOSI pin, for self-tests. |
+| Serial ports | UART0 and UART1 (`esp_uart`), 300 to 5 000 000 bit/s, with 128-byte FIFOs, the Reader and Writer protocols and `serial.Port` and `serial.PollPort` with `poll_flush`, `set_format`, `set_crlf`, `set_break`, `set_loopback`, flow control, and interrupts, as `pl011` offers. |
+| CAN | TWAI0 and TWAI1 (`esp_twai`), classic CAN up to 1 Mbit/s as `hal.Can`: `pins.can(tx, rx, &config, &filters)` with `esp_twai.Config.new(bitrate)`, normal, self-test, and listen-only modes, one-shot sending, and automatic or manual bus-off recovery. The hardware filter is set to pass a superset of the `hal.CanFilter`s and `poll_receive` checks each frame exactly. With `tx == rx` the controller uses one open-drain pad, for a self-test without a transceiver. CAN FD frames are `Unsupported`. |
+| I2S | I2S0 as controller (`esp_i2s`): `pins.i2s_output(data, bclk, ws, &mut dma, &config)` and `i2s_input(...)` with rp_i2s's `Config` (16-, 24-, or 32-bit samples in 16- or 32-bit slots, mono or stereo, Philips or left- or right-justified), as `hal.I2sOutput` and `hal.I2sInput`. Samples stream through a ring of eight 512-byte DMA buffers; the output plays silence when its queue runs dry, and an input given the output's clock pins shares its clocks, for full-duplex codecs. Standard rates from 8 to 96 kHz are exact. |
+| PWM input | `pins.pwm_input(pin, window_us)` measures a pulse train as `hal.PwmInput` (`esp_capture`): the MCPWM capture unit timestamps edges at 6.25 ns and a pulse counter counts them, so periods are averaged over the window, from 1 µs to 25 s. Exact up to 1 MHz; one input at a time. |
 | PWM | The LED PWM controller's six channels and four timers, 5 Hz to 40 MHz, with up to 16384 duty steps; outputs at the same frequency share a timer. |
 | ADC | ADC1 on GPIO 0 to 6, 12 bits at the largest attenuation, calibrated from the chip's eFuse so that 4095 is 3.3 V: `hal.read_millivolts(&mut input, 3300)`. `temperature()` reads the on-chip sensor; `esp32c6.millicelsius` converts its 8-bit readings. |
 | `p.timer` | The system timer: `now_us`, `now_ticks` (16 MHz), the delay protocol, and three alarms. `alarm.schedule_at(time_us)` takes a 64-bit microsecond time; `sleep_until` makes an alarm the [executor](#tasks-and-the-executor)'s clock. |
-| `p.usb.serial()` | The USB serial port (`esp_usb_serial`): the Reader and Writer protocols over the hardware's 64-byte FIFOs. A write waits for a host that has the port open (DTR on) for up to 50 ms, so printing never stops the program, and keeps the first 64 bytes for a terminal opened later. |
-| `p.dma` | The general DMA controller's three channels, as `hal.DmaChannel`, for copies of up to 32 736 bytes between buffers in SRAM, with `copy`, `set_signal`, and interrupts. Its peripherals take DMA through their own interfaces, not register addresses, so transfers paced by a peripheral are `InvalidInput`. |
+| `p.usb.serial()` | The USB serial port (`esp_usb_serial`): the Reader and Writer protocols and `serial.Port` and `serial.PollPort` over the hardware's 64-byte FIFOs. A write waits for a host that has the port open (DTR on) for up to 50 ms, so printing never stops the program, and keeps the first 64 bytes for a terminal opened later. |
+| `p.dma` | The general DMA controller's three channels, as `hal.DmaChannel`, for copies of up to 32 736 bytes between buffers in SRAM, with `copy`, `set_signal`, and interrupts. Its peripherals take DMA through their own interfaces, not register addresses, so a `hal.DmaTransfer` paced by a peripheral is `InvalidInput`; the SPI bus and I2S streams take a channel instead. |
+| `p.rng` | The hardware random number generator (`esp_rng`), as `hal.Rng`. While no analog input is claimed, each fill turns on the ADC's noise source, which Espressif rates fit for keys; with one claimed, only the internal oscillator's jitter is mixed in, which is not. |
+| `p.watchdog` | Timer group 0's watchdog (`esp_watchdog`), with `rp_watchdog`'s interface: `start(timeout_ms)` up to one hour in 10 µs steps, `feed`, `stop`, `remaining_us`, `restart`, `reset_reason()`, and two `scratch` words that survive its reset. It resets the whole chip, which boots the firmware again, and a panic while it runs ends in a `Timeout` reset. |
+| `p.rtc` | The low-power timer as a real-time clock (`esp_rtc`), with `hal.Rtc` and `hal.RtcAlarm`: milliseconds that keep counting through every reset but a power cycle, like the RP2350's always-on timer. Its slow clock, about 138 kHz, is calibrated against the crystal at `take()` (within a few hundred ppm; it drifts with temperature, and `rtc.calibrate()` measures again). The alarm raises `LP_RTC_TIMER`. |
+| `p.flash` | The program flash above the image (`esp_flash`), with `rp_flash`'s interface: `program_end()`, `region`, `last`, `free`, and `release`, as `hal.Flash` with 4096-byte erases and single-byte writes, for a [`std/embedded/storage`](#persistent-storage) store. Erasing and writing run from SRAM with interrupts masked, at most about 45 ms per sector, and reads through the flash mapping see the new data at once. |
 | `pins.ws2812(pin)` | Up to seven WS2812 addressable LEDs, sent by the remote control peripheral (RMT). |
 | `esp32c6.reboot_to_bootloader()`, `restart()` | Restart into the boot ROM's download mode, or into the firmware. `dodo run` clears the download request when it flashes. |
 
 The ESP32-C6-DevKitC-1's package, `std/embedded/board/esp32c6_devkitc`,
-claims the RGB LED as `b.led`: `set_high` lights it in `LED_ON_COLOR`, a dim
+hands out the board contract's `pins`, `timer`, `usb`, `dma`, `rng`,
+`watchdog`, `rtc`, and `flash`, and claims the RGB LED as `b.led`: `set_high` lights it in `LED_ON_COLOR`, a dim
 white, and `b.led.set_color(0x00_10_00)` shows any color. `BUTTON_PIN` is
 the BOOT button on GPIO 9, low while pressed. The usual bus pins are on the
 J1 header: I2C on GPIO 6 and 7, SPI on GPIO 2, 4, and 5 with GPIO 3 for a
@@ -3509,9 +3524,12 @@ so each new board or chip is a small, self-contained addition:
 
 The compiler compiles the runtime itself with the selected target machine, so
 no assembler or C toolchain is involved. `scripts/test_pico.py` (with
-`--board pico`, `--board pico2`, or `--board pico2_w`) shows how to check a chip
-on real hardware, and `scripts/test_rp2350_float.py` checks the RP2350's
-coprocessor `f64` helpers against the software ones on a board. Without a
+`--board pico`, `--board pico2`, or `--board pico2_w`) and
+`scripts/test_esp32c6.py` show how to check a chip on real hardware, and
+`scripts/test_rp2350_float.py` checks the RP2350's coprocessor `f64` helpers
+against the software ones on a board. `scripts/test_esp32c6.py --project
+tests/hardware/esp32c6_buses` (or `esp32c6_can_audio`, or `esp32c6_system`
+with `--follow-resets`) runs the ESP32-C6's other hardware checks. Without a
 board, `scripts/test_emulator.py` runs the self-test in `tests/emulator` on
 emulated RP2040 and RP2350 chips, as CI does.
 
@@ -3541,13 +3559,23 @@ dodo build firmware.dodo --emit obj --target thumbv7em-none-eabihf \
 
 ## Current limits
 
-- The boards are `pico`, `pico2`, and `pico2_w`, on the `rp2040` and `rp2350`
-  chips. The chip packages cover clocks, GPIO, I2C, SPI, UART, PWM, the ADC,
+- The boards are `pico`, `pico2`, `pico2_w`, and `esp32c6_devkitc`, on the
+  `rp2040`, `rp2350`, and `esp32c6` chips. The Raspberry Pi chip packages
+  cover clocks, GPIO, I2C, SPI, UART, PWM, the ADC,
   PIO, the timer, the real-time clock, the watchdog, DMA, a USB serial port,
   the random number generators, low power, and the second core; other USB
   devices (HID, mass storage, several functions at once) or USB host mode
   are not bundled
   yet. Write them with `hal.Reg` as above.
+- On the ESP32-C6, the radios (Wi-Fi, Bluetooth LE, IEEE 802.15.4) and the
+  low-power core are not supported. The I2C target cannot tell two writes
+  joined by a repeated START apart, and the SPI target exchanges
+  transactions of up to 64 bytes, with time to poll between them. I2S runs
+  as controller only, and one PWM input runs at a time. The real-time clock
+  runs from the internal slow oscillator, which drifts with temperature; a
+  32 kHz crystal is not supported. An ADC input draws enough current while
+  it samples that sources above about 10 kOhm read low. Flashing works from
+  macOS and Linux.
 - PIO state machines move words through their FIFOs by polling or their
   interrupts. DMA can pace transfers by their FIFOs' data requests
   (`rp_dma.request` with `sm.tx_fifo_address()`), and `hal.DmaStream` runs
@@ -3563,9 +3591,9 @@ dodo build firmware.dodo --emit obj --target thumbv7em-none-eabihf \
   as in [an interrupt-driven driver](#an-interrupt-driven-driver), or the
   other end honours RTS. An I2C master is the bus's only master, without high-speed
   mode, which the chips' controllers lack, and cannot send empty transfers.
-  Neither chip has a CAN controller: CAN goes through an external MCP2515
-  on SPI, and I2S through PIO, as master only (the program drives BCLK and
-  LRCLK).
+  Neither Raspberry Pi chip has a CAN controller: CAN goes through an
+  external MCP2515 on SPI, and I2S through PIO, as master only (the program
+  drives BCLK and LRCLK).
   The Pico 2 W's wireless chip drives only its LED and senses USB power;
   Wi-Fi and Bluetooth need its firmware, which is not loaded yet.
 - The software floating-point helpers are written for correctness, not speed:
