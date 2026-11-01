@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+- `async fn` and `await`: an optional concurrency model for firmware on top of
+  `std/embedded/executor`. Calling an async fn returns a future, a struct
+  named after the function (`blink` → `BlinkFuture`) whose `poll` is the
+  executor's task method, so async and hand-written tasks run side by side;
+  `await` waits for another future and yields its `output`. The compiler
+  generates the state machine: the body's locals live in the future, so
+  references between them survive suspensions, and dropping an unfinished
+  future drops what it holds. Methods and generic functions can be async.
+  `await` begins its statement, possibly followed by `?`, `!`, or `as`; a
+  started future traps if polled after moving, and a future that would hold
+  itself is rejected. The executor gains the futures async code waits on:
+  `sleep_ms`, `sleep`, `sleep_until`, `yield_now`, `now`, `Ticker.tick`,
+  `Signal.wait`, `Signal.next_value`, and `select` and `join` for two
+  futures. `examples/async_tasks` is `examples/tasks` written with them.
+- `std/embedded/sync`: `Mutex<T>` shares values between interrupt handlers,
+  tasks, and cores from a plain static, without `static mut` or `unsafe`.
+  `lock()` masks interrupts on this core and returns a guard; `with`,
+  `set`, `replace`, and `try_lock` cover the rest, and locking a mutex this
+  core already holds traps. All mutexes lock through one nesting
+  system-wide section, `sync.enter()`. On the RP2040 and RP2350,
+  `Core1.start` installs hardware spinlock 31 as its cross-core lock, so
+  the same mutex also holds off the other core; spinlock 31 is no longer
+  handed out by `Spinlocks`. `examples/interrupts` uses mutexes now.
+- The RP2350's doorbells: `b.doorbells` on the Pico 2 and Pico 2 W hands out
+  the eight doorbells between the cores. `ring()` interrupts the other core,
+  and `set_signal` makes the runtime's new `SIO_IRQ_BELL` handler raise an
+  executor signal there, to wake a task on the other core without the FIFO.
 - `std/gpu/metal` binds Apple's Metal API on macOS (Apple silicon and Intel)
   entirely in Dodo, with no C runtime: each method is an `objc_msgSend`
   declared with its own signature. It covers devices, command queues,

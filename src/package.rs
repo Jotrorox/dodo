@@ -435,6 +435,12 @@ fn load_internal(
                 item.interior_mutable = item.name == "Atomic";
             }
         }
+        // So do std/embedded/sync's mutexes, inside a critical section.
+        if matches!(&key, ModuleId::Bundled(path) if path == "std/embedded/sync") {
+            for item in &mut module.program.structs {
+                item.interior_mutable = item.name == "Mutex";
+            }
+        }
         let mut visible_packages: BTreeMap<String, String> = module
             .import_aliases
             .iter()
@@ -458,6 +464,9 @@ fn load_internal(
     program.imports.dedup();
     program.interrupt_vectors = platform.map(|platform| platform.chip.interrupts);
     program.pio_version = platform.and_then(|platform| platform.chip.pio_version);
+    program.executor_prefix = prefixes
+        .get(&ModuleId::Bundled("std/embedded/executor".to_owned()))
+        .cloned();
     Ok(Loaded {
         program,
         sources: loader.sources,
