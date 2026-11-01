@@ -1,0 +1,23 @@
+[package]
+name = "dodo-emulator"
+version = "0.0.0"
+publish = false
+edition = "2024"
+description = "Runs Dodo firmware for the Raspberry Pi RP2040 and RP2350 in an emulator"
+license = "BSD-2-Clause"
+
+# Pinned exactly: patches/ applies to these versions, and a new release can
+# change what the emulators model.
+[dependencies]
+rp2040-emu = "=0.1.5"
+rp2350-emu = "=0.2.6"
+
+# Keep the emulators out of the compiler's builds.
+[workspace]
+members = ["."]
+
+# The emulators with the fixes in patches/, unpacked by
+# scripts/test_emulator.py before it builds this runner.
+[patch.crates-io]
+rp2040-emu = { path = "target/patched/rp2040-emu-0.1.5" }
+rp2350-emu = { path = "target/patched/rp2350-emu-0.2.6" }
