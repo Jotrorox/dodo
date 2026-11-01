@@ -822,37 +822,53 @@ fn strlib_match(cx: &mut Cx) -> i32!Throw {
     return sl_find_aux(cx, false)
 }
 
-// gmatch iterator: upvalues 1 = subject, 2 = pattern, 3 = next start offset,
-// 4 = end of the last match (-1: none).
+// gmatch iterator. Like the reference it has three upvalues: 1 = subject,
+// 2 = pattern and 3 = a state userdata (`SL_GM_SIZE` bytes: the next start
+// offset and the end of the last match, -1 for none) whose two user values
+// hold the subject and the pattern actually used, so replacing upvalues
+// through the debug library cannot break the iterator.
+const SL_GM_SIZE: usize = 16
+
 fn sl_gmatch_step(cx: &mut Cx) -> i32!Throw {
     unsafe {
-        let sv = cx.idx2val(upvalue_index(1))
-        let pv = cx.idx2val(upvalue_index(2))
-        let posv = cx.idx2val(upvalue_index(3))
-        let lastv = cx.idx2val(upvalue_index(4))
+        let stv = cx.idx2val(upvalue_index(3))
+        if (*stv).tag != TAG_USERDATA {
+            return ok(0)
+        }
+        let u = val_gc(stv) as *mut Udata
+        if (*u).size != SL_GM_SIZE || (*u).nuvalue != 2 || !ptr.is_null((*u).metatable) {
+            return ok(0)
+        }
+        let sv = udata_uv(u, 0)
+        let pv = udata_uv(u, 1)
+        if !val_is_string(sv) || !val_is_string(pv) {
+            return ok(0)
+        }
+        let posp = udata_data(u) as *mut i64
+        let lastp = ptr.offset(posp, 1)
         let ss = val_str(sv)
         let ps = val_str(pv)
         let s = str_data(ss) as *const u8
         let ls = (*ss).length
         let p = str_data(ps) as *const u8
         let lp = (*ps).length
-        let pos = val_int(posv)
+        let pos = *posp
         if pos > ls as i64 {
             return ok(0)
         }
         m := pat_new(s, ls, p, lp)
         st := 0usize
         let filter = sl_filter(&mut m, 0)
-        let e = sl_search(&mut m, pos as usize, 0, false, val_int(lastv) as isize, &filter, &mut st)
+        let e = sl_search(&mut m, pos as usize, 0, false, *lastp as isize, &filter, &mut st)
         if e == PAT_ERROR {
             return err(cx.error_msg(pat_error_message(&m)))
         }
         if e < 0 {
-            set_int(posv, ls as i64 + 1)
+            *posp = ls as i64 + 1
             return ok(0)
         }
-        set_int(posv, e as i64)
-        set_int(lastv, e as i64)
+        *posp = e as i64
+        *lastp = e as i64
         count := 0i32
         sl_push_captures(cx, &m, st, e as usize, true, &mut count)?
         return ok(count)
@@ -860,23 +876,30 @@ fn sl_gmatch_step(cx: &mut Cx) -> i32!Throw {
 }
 
 fn strlib_gmatch(cx: &mut Cx) -> i32!Throw {
-    s := sl_null()
-    ls := 0usize
-    sl_arg_str(cx, 1, &mut s, &mut ls)?
-    p := sl_null()
-    lp := 0usize
-    sl_arg_str(cx, 2, &mut p, &mut lp)?
-    ia := 0i64
-    sl_opt_int(cx, 3, 1, &mut ia)?
-    init := sl_start_pos(ia, ls) - 1
-    if init > ls as u64 {
-        init = ls as u64 + 1
+    unsafe {
+        s := sl_null()
+        ls := 0usize
+        sl_arg_str(cx, 1, &mut s, &mut ls)?
+        p := sl_null()
+        lp := 0usize
+        sl_arg_str(cx, 2, &mut p, &mut lp)?
+        ia := 0i64
+        sl_opt_int(cx, 3, 1, &mut ia)?
+        init := sl_start_pos(ia, ls) - 1
+        if init > ls as u64 {
+            init = ls as u64 + 1
+        }
+        cx.set_top(2)
+        let data = cx.new_userdata(SL_GM_SIZE, 2)? as *mut i64
+        *data = init as i64
+        *ptr.offset(data, 1) = -1
+        // The userdata is new (white): storing into it needs no barrier.
+        let u = val_gc(cx.idx2val(3)) as *mut Udata
+        set_obj(udata_uv(u, 0), cx.idx2val(1))
+        set_obj(udata_uv(u, 1), cx.idx2val(2))
+        cx.push_closure(sl_gmatch_step, 3)?
+        return ok(1)
     }
-    cx.set_top(2)
-    cx.push_integer(init as i64)
-    cx.push_integer(-1)
-    cx.push_closure(sl_gmatch_step, 4)?
-    return ok(1)
 }
 
 // Append a replacement string, expanding %0-%9 and %%.
