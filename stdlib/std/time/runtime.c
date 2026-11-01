@@ -1,4 +1,6 @@
-/* Hosted clocks use native headers; the portable time family has no C bridge. */
+/* Hosted clocks and local time use native headers; the portable time family
+   has no C bridge. dodo_time_local writes the first nine struct tm fields
+   (sec, min, hour, mday, mon, year, wday, yday, isdst) of a local time. */
 #ifndef _POSIX_C_SOURCE
 #define _POSIX_C_SOURCE 200809L
 #endif
@@ -6,6 +8,7 @@
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <time.h>
 int32_t dodo_time_monotonic(uint64_t *seconds, uint32_t *nanos) {
     LARGE_INTEGER counter, frequency;
     if (!QueryPerformanceFrequency(&frequency) || !QueryPerformanceCounter(&counter)) {
@@ -34,6 +37,15 @@ int32_t dodo_time_wall(int64_t *seconds, uint32_t *nanos) {
     *seconds = (int64_t)(ticks / UINT64_C(10000000)) - INT64_C(11644473600);
     *nanos = (uint32_t)((ticks % UINT64_C(10000000)) * 100); return 0;
 }
+int32_t dodo_time_local(int64_t seconds, int32_t *fields) {
+    struct tm value;
+    __time64_t t = (__time64_t)seconds;
+    if (_localtime64_s(&value, &t)) return 1;
+    fields[0] = value.tm_sec; fields[1] = value.tm_min; fields[2] = value.tm_hour;
+    fields[3] = value.tm_mday; fields[4] = value.tm_mon; fields[5] = value.tm_year;
+    fields[6] = value.tm_wday; fields[7] = value.tm_yday; fields[8] = value.tm_isdst;
+    return 0;
+}
 #else
 #include <errno.h>
 #include <time.h>
@@ -48,5 +60,15 @@ int32_t dodo_time_wall(int64_t *seconds, uint32_t *nanos) {
     if (clock_gettime(CLOCK_REALTIME, &value)) return errno;
     if (value.tv_nsec < 0 || value.tv_nsec >= 1000000000) return EOVERFLOW;
     *seconds = (int64_t)value.tv_sec; *nanos = (uint32_t)value.tv_nsec; return 0;
+}
+int32_t dodo_time_local(int64_t seconds, int32_t *fields) {
+    struct tm value;
+    time_t t = (time_t)seconds;
+    tzset();
+    if (!localtime_r(&t, &value)) return 1;
+    fields[0] = value.tm_sec; fields[1] = value.tm_min; fields[2] = value.tm_hour;
+    fields[3] = value.tm_mday; fields[4] = value.tm_mon; fields[5] = value.tm_year;
+    fields[6] = value.tm_wday; fields[7] = value.tm_yday; fields[8] = value.tm_isdst;
+    return 0;
 }
 #endif
