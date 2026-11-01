@@ -1,6 +1,6 @@
 ---
 title: "Compression"
-description: "Encode and decode DEFLATE, zlib, and gzip with caller-supplied buffers."
+description: "Encode and decode DEFLATE, zlib, and gzip, and decode Brotli, with caller-supplied buffers."
 section: "Standard library"
 order: 144.5
 ---
@@ -19,6 +19,7 @@ package matching the data on the wire:
 
 All three packages use `deflate.Error`, `deflate.Status`, and
 `deflate.Progress`, so code written for one framing works with the others.
+[`std/compress/brotli`](#brotli) decodes the separate Brotli format.
 
 ## Complete buffers
 
@@ -140,3 +141,58 @@ accepted. Call `finish()` and handle its result to write the final block and
 trailer. After a sink error the unwritten compressed bytes are kept, so
 `finish()` can be retried; it reports the compressed bytes written by that
 call.
+
+## Brotli
+
+`std/compress/brotli` decompresses Brotli (RFC 7932) streams, as used by
+HTTP `Content-Encoding: br` and JPEG XL `brob` boxes. It decodes every
+meta-block kind, block types and counts, all literal context modes,
+distance codes and context maps, and the static dictionary with its 121
+word transforms, for window sizes 10 to 24. Large-window Brotli, a
+non-standard extension, fails with `Unsupported`. There is no encoder.
+
+`decompress(input, output)` decodes one complete stream and returns its
+length. The output buffer is also the sliding window, so nothing else is
+needed except 256 KiB of stack workspace for the prefix code tables
+(`STACK_WORKSPACE_LEN` 16-bit words). That covers every stream measured from
+the reference encoder (at most about 80,000 words, for multi-megabyte inputs
+at high quality); a stream needing more fails with `WorkspaceTooSmall`.
+`decompress_with_workspace(input, output, workspace)` takes a caller-owned
+`&mut [u16]` instead, which can live in static storage; `WORKSPACE_LEN`
+words (1.3 MiB) decode every valid stream.
+
+```dodo test
+package main
+
+import "std/compress/brotli"
+
+fn main() {
+    // "hello hello hello", compressed by `brotli -q 11`.
+    packed := [0x1fu8, 0x10, 0x00, 0xf8, 0x8d, 0x94, 0x6e, 0xde, 0x44, 0x55, 0x86, 0x96, 0x6c, 0x20, 0x6f, 0x01, 0x4f, 0x1c, 0x60, 0x1c]
+    text := [0u8; 64]
+    size := brotli.decompress(&packed, &mut text)!
+    core.assert_eq(size, 17usize)
+}
+```
+
+Errors are `Truncated`, `InvalidData`, `OutputFull` (the output is too
+short), `WorkspaceTooSmall`, `WindowTooSmall` and `Unsupported`. Data after
+the end of the stream is `InvalidData`, as with the `brotli` tool. Malformed
+input never traps, and decoding time is bounded by the output size: a
+command that would produce nothing (an empty transformed dictionary word) is
+rejected.
+
+To decompress without holding the whole result, `Decoder.new(input, window,
+workspace)` decodes through a caller ring buffer of at least
+`window_len(input)` bytes: the stream's sliding window (up to
+`MAX_WINDOW_LEN`, 16 MiB), or less when a single meta-block is shorter.
+`read(output)` copies the next bytes into a buffer of any size and returns 0
+at the end of the stream. Unlike the DEFLATE decoders, `Decoder` needs the
+whole compressed input up front. It ignores bytes after the stream, and
+`input_consumed()` reports where the stream ended. Errors are final.
+`decompressed_size(input, window, workspace)` decodes through such a window,
+discarding the data, to size an output buffer.
+
+`scripts/generate_brotli_tables.py` generates the static dictionary, checked
+against RFC 7932's length and CRC-32 and against google/brotli's
+`dictionary.bin`, and the transform and context tables, parsed from the RFC.

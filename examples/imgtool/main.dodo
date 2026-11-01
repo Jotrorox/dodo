@@ -360,6 +360,23 @@ fn invalid(what: &str, value: &str) -> i32!Failure {
     return ok(EXIT_ERROR)
 }
 
+// One metadata line: the stored size and encoding, plus the decoded size
+// of a zlib or Brotli payload up to 64 KiB.
+fn print_item(kind: &str, data: &[u8], item: &meta.Item) -> void!Failure {
+    if item.encoding == meta.ENCODING_ZLIB || item.encoding == meta.ENCODING_BROTLI {
+        decoded := [0u8; 65536]
+        match meta.decode(data, item, &mut decoded) {
+            ok(length) => {
+                console.printf("metadata: {}, {} bytes ({}, {} decoded)\n", kind, item.length, encoding_name(item.encoding), length)?
+                return ok()
+            }
+            err(_) => {}
+        }
+    }
+    console.printf("metadata: {}, {} bytes ({})\n", kind, item.length, encoding_name(item.encoding))?
+    return ok()
+}
+
 fn info(file: &str) -> i32!Failure {
     storage := arena()
     contents := image_alloc.read_file(file, storage.handle())?
@@ -406,15 +423,15 @@ fn info(file: &str) -> i32!Failure {
     console.printf("lossy: {}\nprogressive: {}\n", yes(header.lossy), yes(header.progressive))?
     count := 0u32
     if found.exif.present() {
-        console.printf("metadata: exif, {} bytes ({})\n", found.exif.length, encoding_name(found.exif.encoding))?
+        print_item("exif", data, &found.exif)?
         count += 1
     }
     if found.xmp.present() {
-        console.printf("metadata: xmp, {} bytes ({})\n", found.xmp.length, encoding_name(found.xmp.encoding))?
+        print_item("xmp", data, &found.xmp)?
         count += 1
     }
     if found.icc.present() {
-        console.printf("metadata: icc, {} bytes ({})\n", found.icc.length, encoding_name(found.icc.encoding))?
+        print_item("icc", data, &found.icc)?
         count += 1
     }
     if count == 0 {

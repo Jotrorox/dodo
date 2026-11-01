@@ -1,5 +1,6 @@
 package meta
 
+import "std/compress/brotli"
 import "std/compress/deflate"
 import "std/compress/zlib"
 import "std/image/pixels"
@@ -7,14 +8,16 @@ import "std/image/shared/binary"
 
 // Image metadata located without copying: decoders report EXIF, XMP and ICC
 // payloads as byte ranges of the input file plus how they are encoded.
-// Helpers here read the EXIF orientation and inflate zlib payloads; JPEG XL
-// specific encodings are decoded through std/image or std/image/jxl.
+// Helpers here read the EXIF orientation and decode zlib and Brotli
+// payloads; ICC profiles entropy-coded in a JPEG XL codestream are decoded
+// through std/image or std/image/jxl.
 
 // How an Item's bytes are stored.
 pub const ENCODING_RAW: u8 = 0
 // A zlib stream (PNG iCCP, compressed iTXt).
 pub const ENCODING_ZLIB: u8 = 1
-// Brotli (JPEG XL "brob" boxes).
+// A JPEG XL "brob" box payload: the 4-byte type of the box it replaces
+// ("Exif", "xml ") followed by a Brotli stream of that box's payload.
 pub const ENCODING_BROTLI: u8 = 2
 // Entropy-coded in a JPEG XL codestream (ICC only).
 pub const ENCODING_JXL: u8 = 3
@@ -55,8 +58,13 @@ pub struct Metadata {
     }
 }
 
-// Inflate a zlib-encoded item into `output`, returning the byte count; raw
-// items are copied. Brotli and JPEG XL items fail with Unsupported here.
+// Decode an item into `output`, returning the byte count: raw items are
+// copied, zlib items inflated, Brotli items decompressed (EXIF then starts
+// at the TIFF header, as for raw items; `output` must also hold the 4-byte
+// offset field and any padding before it). Brotli decoding keeps 256 KiB of
+// workspace on the stack (brotli.STACK_WORKSPACE_LEN), enough for every
+// stream measured from the reference encoder; one needing more fails with
+// TooLarge. JPEG XL items fail with Unsupported here.
 pub fn decode(data: &[u8], item: &Item, output: &mut[u8]) -> usize!pixels.Error {
     stored := item.bytes(data)?
     if item.encoding == ENCODING_RAW {
@@ -67,6 +75,9 @@ pub fn decode(data: &[u8], item: &Item, output: &mut[u8]) -> usize!pixels.Error 
             output[i] = stored[i]
         }
         return ok(stored.len)
+    }
+    if item.encoding == ENCODING_BROTLI {
+        return decode_brob(stored, output)
     }
     if item.encoding != ENCODING_ZLIB {
         return err(pixels.Error.Unsupported)
@@ -83,6 +94,61 @@ pub fn decode(data: &[u8], item: &Item, output: &mut[u8]) -> usize!pixels.Error 
                 return err(pixels.Error.Truncated)
             }
             return err(pixels.Error.Malformed)
+        }
+    }
+}
+
+// A brob box payload: the inner box type, then the Brotli stream. An Exif
+// box payload starts with the offset of the TIFF header from the end of
+// that 4-byte field, which is removed.
+fn decode_brob(stored: &[u8], output: &mut[u8]) -> usize!pixels.Error {
+    if stored.len < 4 {
+        return err(pixels.Error.Truncated)
+    }
+    length := match brotli.decompress(&stored[4..], output) {
+        ok(n) => {
+            n
+        }
+        err(error) => {
+            return err(brotli_error(error))
+        }
+    }
+    if stored[0] != b'E' || stored[1] != b'x' || stored[2] != b'i' || stored[3] != b'f' {
+        return ok(length)
+    }
+    if length < 4 {
+        return err(pixels.Error.Malformed)
+    }
+    skip := binary.be32(&output[..length], 0)? as usize
+    if skip > length - 4 {
+        return err(pixels.Error.Malformed)
+    }
+    start := 4 + skip
+    for i in 0usize..length - start {
+        output[i] = output[start + i]
+    }
+    return ok(length - start)
+}
+
+fn brotli_error(error: brotli.Error) -> pixels.Error {
+    match error {
+        brotli.Error.Truncated => {
+            return pixels.Error.Truncated
+        }
+        brotli.Error.OutputFull => {
+            return pixels.Error.BufferTooSmall
+        }
+        brotli.Error.WorkspaceTooSmall => {
+            return pixels.Error.TooLarge
+        }
+        brotli.Error.Unsupported => {
+            return pixels.Error.Unsupported
+        }
+        brotli.Error.WindowTooSmall => {
+            return pixels.Error.BufferTooSmall
+        }
+        brotli.Error.InvalidData => {
+            return pixels.Error.Malformed
         }
     }
 }

@@ -296,9 +296,32 @@ fn metadata_boxes() {
     assert(!m.icc.present())
     compressed := [0u8; FILE_LIMIT]
     compressed_length := read_fixture("meta_brob", ".jxl", &mut compressed)
-    cm := jxl.metadata(&compressed[..compressed_length])!
+    cdata := &compressed[..compressed_length]
+    cm := jxl.metadata(cdata)!
     assert_eq(cm.exif.encoding, meta.ENCODING_BROTLI)
     assert_eq(cm.xmp.encoding, meta.ENCODING_BROTLI)
+    // Decompressed brob payloads equal the uncompressed boxes; EXIF starts
+    // at the TIFF header either way.
+    decoded := [0u8; 4096]
+    exif_length := meta.decode(cdata, &cm.exif, &mut decoded)!
+    assert_eq(exif_length, exif.len)
+    for i in 0usize..exif.len {
+        assert(decoded[i] == exif[i])
+    }
+    assert_eq(meta.exif_orientation(&decoded[..exif_length])!, 1u32)
+    xmp_length := meta.decode(cdata, &cm.xmp, &mut decoded)!
+    assert_eq(xmp_length, xmp.len)
+    for i in 0usize..xmp.len {
+        assert(decoded[i] == xmp[i])
+    }
+    match meta.decode(cdata, &cm.xmp, &mut decoded[..xmp.len - 1]) {
+        ok(_) => {
+            assert(false, "short output accepted")
+        }
+        err(e) => {
+            assert(e == pixels.Error.BufferTooSmall)
+        }
+    }
     bare := [0u8; FILE_LIMIT]
     bare_length := read_fixture("rgb_e1", ".jxl", &mut bare)
     bm := jxl.metadata(&bare[..bare_length])!

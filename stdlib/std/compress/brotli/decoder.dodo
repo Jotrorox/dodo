@@ -388,7 +388,11 @@ pub struct Decoder {
     // Compressed bytes the stream occupies; meaningful once decoding has
     // finished.
     pub fn input_consumed(&self) -> usize {
-        return self.next - ((self.nbits / 8) as usize - self.pad)
+        held := (self.nbits / 8) as usize
+        if self.pad >= held {
+            return self.next
+        }
+        return self.next - (held - self.pad)
     }
     // Decompressed bytes produced so far.
     pub fn produced(&self) -> usize {

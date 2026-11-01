@@ -118,6 +118,8 @@ pub const MAX_FILE_SIZE: u64 = 1073741824
 
 // The largest ICC profile copied from a file: 64 MiB.
 const MAX_ICC_SIZE: usize = 67108864
+// The largest decompressed EXIF payload copied from a file: 16 MiB.
+const MAX_EXIF_SIZE: usize = 16777216
 
 // Codec scratch may be viewed as u32 or f32 words.
 const ALIGNMENT: usize = 16
@@ -674,7 +676,7 @@ pub struct Image<A> {
         return image.decode_frame(data, index, &mut target, work)
     }
     // Copy the EXIF payload and the decoded ICC profile. A payload that
-    // cannot be read (an unsupported encoding, a damaged chunk) is skipped;
+    // cannot be read (a damaged chunk or compressed stream) is skipped;
     // only allocation failures are errors.
     fn adopt_metadata(&mut self, data: &[u8]) -> void!Error {
         self.clear_metadata()?
@@ -686,15 +688,51 @@ pub struct Image<A> {
                 return ok()
             }
         }
-        if found.exif.present() && found.exif.encoding == meta.ENCODING_RAW {
-            match found.exif.bytes(data) {
+        if found.exif.present() {
+            self.adopt_exif(data, &found.exif)?
+        }
+        return self.adopt_icc(data)
+    }
+    // A raw EXIF payload is copied. A compressed one (Brotli in a JPEG XL
+    // brob box) is decoded into a buffer of four times its stored size (at
+    // least 4 KiB), doubled while that is too small, up to MAX_EXIF_SIZE.
+    fn adopt_exif(&mut self, data: &[u8], item: &meta.Item) -> void!Error {
+        if item.encoding == meta.ENCODING_RAW {
+            match item.bytes(data) {
                 ok(stored) => {
                     self.set_exif(stored)?
                 }
                 err(_) => {}
             }
+            return ok()
         }
-        return self.adopt_icc(data)
+        if item.length > MAX_EXIF_SIZE {
+            return ok()
+        }
+        size := 4 * item.length
+        if size < 4096 {
+            size = 4096
+        }
+        for size <= MAX_EXIF_SIZE {
+            buffer := allocate(&self.allocator, size)?
+            outcome := meta.decode(data, item, buffer.slice_mut())
+            match outcome {
+                ok(length) => {
+                    buffer.length = length
+                    previous := mem.replace(&mut self.exif_data, buffer)
+                    release(&self.allocator, previous)
+                    return ok()
+                }
+                err(reason) => {
+                    release(&self.allocator, buffer)
+                    if reason != pixels.Error.BufferTooSmall {
+                        return ok()
+                    }
+                }
+            }
+            size = 2 * size
+        }
+        return ok()
     }
     fn adopt_icc(&mut self, data: &[u8]) -> void!Error {
         encoding := self.source.color.icc_encoding

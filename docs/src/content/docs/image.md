@@ -40,7 +40,7 @@ buffers suit `static mut` storage on small stacks.
 | `std/image/color` | `ColorInfo` (CICP code points, gamma, chromaticities, ICC location), `Orientation`, integer sRGB curves. |
 | `std/image/convert` | Layout conversion, premultiplication, sRGB and linear light. |
 | `std/image/sink` | Where decoders put pixels (`Sink`: `ViewSink`, `CanvasSink`, `NullSink`) and where encoders read them (`Source`: `ViewSource`, `CanvasSource`). |
-| `std/image/meta` | `Metadata` of EXIF, XMP and ICC byte ranges, the EXIF orientation, zlib payloads. |
+| `std/image/meta` | `Metadata` of EXIF, XMP and ICC byte ranges, the EXIF orientation, zlib and Brotli payloads. |
 | `std/image/shared/binary`, `std/image/shared/scratch` | Bounds-checked fields of file data; typed views of one byte scratch buffer. |
 | `std/image/ppm`, `std/image/qoi`, `std/image/bmp`, `std/image/png`, `std/image/jxl` | The codecs, one package per format, with the same shape. |
 | `std/image/jxl/encode` | The JPEG XL lossless encoder. |
@@ -59,7 +59,7 @@ codec packages (see [below](#stdgraphicsimage)).
 | QOI | RGB and RGBA, sRGB or linear | RGB, or RGBA when the source has alpha |
 | BMP | 1, 4 and 8-bit palettes, RLE8 and RLE4; 16, 24 and 32-bit with or without bit-field masks; bottom-up or top-down; OS/2 core, V4 and V5 headers with sRGB or an embedded ICC profile | 24-bit, or 32-bit with a V5 header and alpha mask when the source has alpha |
 | PNG | Every color type and bit depth, `PLTE`, `tRNS`, Adam7, `cICP`, `iCCP`, `sRGB`, `gAMA`, `cHRM`, `cLLi`, `eXIf`, XMP in `iTXt`; APNG animation | Gray, gray+alpha, RGB or RGBA at 8 or 16 bits, or indexed; stored or deflate levels 1 to 9; any filter; Adam7; `sRGB`, `eXIf`, `iCCP` |
-| JPEG XL (`Format.Jxl`) | Bare codestreams and the ISOBMFF container (`jxlc`, split `jxlp`, `Exif`, `xml `, Brotli `brob` boxes reported as such); lossless and lossy modular, VarDCT with every block type, progressive passes and LF frames, recompressed JPEG (4:4:4, 4:2:2, 4:2:0, gray), patches, splines, noise, Gaborish and EPF, upsampling, animation with blending and reference frames, up to 64 extra channels; output U8, U16 or F32 by bit depth, XYB converted to the file's color encoding; embedded ICC profiles via `image.icc` | Lossless modular at efforts 1 to 3: 8 and 16-bit integer or exact 16/32-bit float samples, gray, RGB, alpha; bare codestream or container with `Exif`/`xml ` boxes |
+| JPEG XL (`Format.Jxl`) | Bare codestreams and the ISOBMFF container (`jxlc`, split `jxlp`, `Exif`, `xml `, Brotli-compressed `brob` boxes decoded by `meta.decode`); lossless and lossy modular, VarDCT with every block type, progressive passes and LF frames, recompressed JPEG (4:4:4, 4:2:2, 4:2:0, gray), patches, splines, noise, Gaborish and EPF, upsampling, animation with blending and reference frames, up to 64 extra channels; output U8, U16 or F32 by bit depth, XYB converted to the file's color encoding; embedded ICC profiles via `image.icc` | Lossless modular at efforts 1 to 3: 8 and 16-bit integer or exact 16/32-bit float samples, gray, RGB, alpha; bare codestream or container with `Exif`/`xml ` boxes |
 
 ASCII Netpbm (P1 to P3), P4 bitmaps, and BMP JPEG/PNG compression fail with
 `Unsupported`.
@@ -133,9 +133,15 @@ embedded profile is recorded with `ICC_RAW`. A QOI colorspace byte of 1 and
 every PFM file are linear.
 
 `image.metadata(&data)` returns a `meta.Metadata` whose `exif`, `xmp` and `icc`
-items are byte ranges of `data` with an encoding (`ENCODING_RAW` or
-`ENCODING_ZLIB`); nothing is copied. `item.bytes(&data)` borrows a raw item
-and `meta.decode(&data, &item, &mut output)` inflates or copies one.
+items are byte ranges of `data` with an encoding (`ENCODING_RAW`,
+`ENCODING_ZLIB`, or `ENCODING_BROTLI` for JPEG XL `brob` boxes, whose item
+covers the 4-byte inner box type and the Brotli stream); nothing is copied.
+`item.bytes(&data)` borrows a raw item and `meta.decode(&data, &item, &mut
+output)` copies, inflates or decompresses one with
+[`std/compress/brotli`](compression.md#brotli). A decoded EXIF payload
+starts at the TIFF header whatever its encoding; for a `brob` box `output`
+must also hold the 4-byte offset field that precedes it. Brotli decoding
+keeps 256 KiB of workspace on the stack.
 `image.icc(&data, &mut output, &mut scratch)` returns the decoded ICC profile
 directly; only JPEG XL needs scratch (`image.icc_scratch_size(&data)`). PNG
 finds `eXIf`, `iTXt` with the keyword `XML:com.adobe.xmp`, and `iCCP` before or
@@ -321,9 +327,9 @@ at most 256 colors, as after `quantize`.
 Errors are `image_alloc.Error`: `Image(pixels.Error)`,
 `Allocation(error.AllocError)` or `File(fs.FileError)`, so `?` wraps each in
 a function returning `image_alloc.Error`; `image_alloc.error_name(&error)`
-is a short fixed description. EXIF and ICC payloads that cannot be read (an
-unsupported encoding such as Brotli, a damaged chunk) are skipped rather
-than failing the decode; ICC profiles above 64 MiB and files above
+is a short fixed description. EXIF from Brotli-compressed JPEG XL `brob`
+boxes is decompressed. EXIF and ICC payloads that cannot be read (a damaged
+chunk or compressed stream) are skipped rather than failing the decode; ICC profiles above 64 MiB and files above
 `MAX_FILE_SIZE` (1 GiB) are not loaded.
 
 ## The imgtool example
@@ -341,7 +347,7 @@ dodo build examples/imgtool -o imgtool
 
 | Command | Effect |
 | --- | --- |
-| `info FILE` | Format, size, native layout, bit depth, color (CICP, gamma, ICC), orientation, frames and metadata items. |
+| `info FILE` | Format, size, native layout, bit depth, color (CICP, gamma, ICC), orientation, frames and metadata items (with the decoded size of zlib and Brotli payloads). |
 | `convert IN OUT [--effort N] [--layout L] [--strip]` | Re-encodes as OUT's format; `L` is `gray8`, `graya8`, `rgb8`, `rgba8` or the same with `16`, `f16`, `f32`. |
 | `resize IN OUT WxH [--filter F] [--linear]` | `F` is `nearest`, `box`, `bilinear`, `catmull-rom`, `mitchell` or `lanczos`; a zero side keeps the aspect ratio. |
 | `strip IN OUT` | Re-encodes without EXIF and ICC metadata. |
