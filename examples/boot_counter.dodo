@@ -1,0 +1,41 @@
+package main
+
+import "std/embedded/board"
+import "std/embedded/storage"
+
+// Counts how often the board has started, in a key-value store in the last
+// 64 KiB of its flash, and blinks the LED that many times (up to 10) at each
+// start. Unplug it, plug it back in, and it blinks once more than before;
+// reflashing keeps the count too, as the store sits above the program.
+// Flash it from BOOTSEL mode with
+//
+//     dodo run examples/boot_counter.dodo --board pico
+//
+// (or --board pico2 or pico2_w).
+fn main() {
+    b := board.take()!
+    settings := storage.Store.open(b.flash.last(64 * 1024)!)!
+    boots := 0u32
+    match settings.get_u32("boots") {
+        ok(some(count)) => {
+            boots = count
+        }
+        ok(none) => {}
+        err(_) => {
+            // Unreadable flash: start counting again.
+            settings.clear()!
+        }
+    }
+    boots += 1
+    settings.set_u32("boots", boots)!
+    blinks := boots
+    if blinks > 10 {
+        blinks = 10
+    }
+    for _ in 0..blinks {
+        b.led.toggle()
+        b.timer.delay_ms(150)
+        b.led.toggle()
+        b.timer.delay_ms(250)
+    }
+}

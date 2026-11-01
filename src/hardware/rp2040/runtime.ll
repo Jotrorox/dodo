@@ -16,6 +16,11 @@
 ;   Reset_Handler  Copies .data from flash, zeroes .bss, and calls `main`.
 ;   dodo_rp2040_reset_usb_boot
 ;                  Restarts into the boot ROM's USB bootloader.
+;   dodo_flash_erase, dodo_flash_program
+;                  Erase or program the flash through the boot ROM, from
+;                  SRAM, for std/embedded/chip/rp_flash.
+;   dodo_flash_image_end, dodo_flash_end
+;                  Where the program image and the board's flash end.
 ;   USBCTRL_IRQ    Calls dodo_usb_interrupt if the program defines it:
 ;                  std/embedded/chip/rp_usb does, for the USB serial port.
 ;   DMA_IRQ_0      Calls dodo_dma_interrupt if the program defines it:
@@ -248,6 +253,121 @@ module asm "    blx r2"
 module asm "    mov r2, r0"
 module asm "    pop {r0, r1}"
 module asm "    bx r2"
+module asm "    .ltorg"
+
+; dodo_flash_erase(offset, count) and dodo_flash_program(offset, data, count)
+; erase `count` bytes of flash from `offset` (multiples of 4 KiB), or program
+; them from `data` in SRAM (multiples of 256 bytes), and return 0. The flash
+; cannot execute in place meanwhile, so this code runs from SRAM (.ramfunc)
+; with interrupts masked, and calls only the boot ROM (datasheet 2.8.3):
+; connect_internal_flash, flash_exit_xip, flash_range_erase (64 KiB block
+; erases where aligned, 4 KiB sectors elsewhere) or flash_range_program, and
+; flash_flush_cache. Then the copy of .boot2 taken first, which is position
+; independent and returns when called, sets execute-in-place up again exactly
+; as at boot.
+module asm ".section .ramfunc.dodo_flash, \22ax\22, %progbits"
+module asm ".balign 4"
+module asm ".global dodo_flash_erase"
+module asm ".type dodo_flash_erase, %function"
+module asm ".thumb_func"
+module asm "dodo_flash_erase:"
+module asm "    mov r3, r1"                             ; count
+module asm "    movs r2, #0"                            ; no data
+module asm "    mov r1, r0"                             ; offset
+module asm "    movs r0, #0"                            ; erase
+module asm "    b 1f"
+module asm ".global dodo_flash_program"
+module asm ".type dodo_flash_program, %function"
+module asm ".thumb_func"
+module asm "dodo_flash_program:"
+module asm "    mov r3, r2"                             ; count
+module asm "    mov r2, r1"                             ; data
+module asm "    mov r1, r0"                             ; offset
+module asm "    movs r0, #1"                            ; program
+module asm "1:  push {r4, r5, r6, r7, lr}"
+module asm "    sub sp, #20"                            ; four routines, PRIMASK
+module asm "    mov r4, r0"
+module asm "    mov r5, r1"
+module asm "    mov r6, r2"
+module asm "    mov r7, r3"
+module asm "    mrs r0, primask"
+module asm "    str r0, [sp, #16]"
+module asm "    cpsid i"
+module asm "    ldr r1, =0x4649"                        ; 'I' 'F' connect_internal_flash
+module asm "    bl 8f"
+module asm "    str r0, [sp, #0]"
+module asm "    ldr r1, =0x5845"                        ; 'E' 'X' flash_exit_xip
+module asm "    bl 8f"
+module asm "    str r0, [sp, #4]"
+module asm "    ldr r1, =0x4552"                        ; 'R' 'E' flash_range_erase
+module asm "    cmp r4, #0"
+module asm "    beq 2f"
+module asm "    ldr r1, =0x5052"                        ; 'R' 'P' flash_range_program
+module asm "2:  bl 8f"
+module asm "    str r0, [sp, #8]"
+module asm "    ldr r1, =0x4346"                        ; 'F' 'C' flash_flush_cache
+module asm "    bl 8f"
+module asm "    str r0, [sp, #12]"
+module asm "    ldr r0, =0x10000000"                    ; .boot2, the first 256 bytes
+module asm "    ldr r1, =dodo_rp2040_boot2_copy"
+module asm "    movs r2, #64"
+module asm "3:  ldm r0!, {r3}"
+module asm "    stm r1!, {r3}"
+module asm "    subs r2, #1"
+module asm "    bne 3b"
+module asm "    ldr r0, [sp, #0]"                       ; no flash access from here
+module asm "    blx r0"
+module asm "    ldr r0, [sp, #4]"
+module asm "    blx r0"
+module asm "    cmp r4, #0"
+module asm "    bne 4f"
+module asm "    mov r0, r5"                             ; erase(offset, count,
+module asm "    mov r1, r7"
+module asm "    movs r2, #1"
+module asm "    lsls r2, r2, #16"                       ;   64 KiB blocks,
+module asm "    movs r3, #0xd8"                         ;   block erase command)
+module asm "    b 5f"
+module asm "4:  mov r0, r5"                             ; program(offset, data, count)
+module asm "    mov r1, r6"
+module asm "    mov r2, r7"
+module asm "5:  ldr r4, [sp, #8]"
+module asm "    blx r4"
+module asm "    ldr r0, [sp, #12]"
+module asm "    blx r0"                                 ; also releases chip select
+module asm "    ldr r0, =dodo_rp2040_boot2_copy + 1"
+module asm "    blx r0"                                 ; flash executes in place again
+module asm "    ldr r0, [sp, #16]"
+module asm "    msr primask, r0"
+module asm "    movs r0, #0"
+module asm "    add sp, #20"
+module asm "    pop {r4, r5, r6, r7, pc}"
+module asm "8:  movs r3, #0x14"                         ; rom_table_lookup(table, r1)
+module asm "    ldrh r0, [r3, #0]"
+module asm "    ldrh r2, [r3, #4]"
+module asm "    bx r2"                                  ; returns to the caller
+module asm "    .ltorg"
+
+module asm ".section .bss.dodo_rp2040_boot2_copy, \22aw\22, %nobits"
+module asm ".balign 4"
+module asm "dodo_rp2040_boot2_copy:"
+module asm "    .space 256"
+
+; dodo_flash_image_end() and dodo_flash_end(): the linker script's addresses.
+module asm ".section .text.dodo_flash_image_end, \22ax\22, %progbits"
+module asm ".global dodo_flash_image_end"
+module asm ".type dodo_flash_image_end, %function"
+module asm ".thumb_func"
+module asm "dodo_flash_image_end:"
+module asm "    ldr r0, =__flash_image_end"
+module asm "    bx lr"
+module asm "    .ltorg"
+module asm ".section .text.dodo_flash_end, \22ax\22, %progbits"
+module asm ".global dodo_flash_end"
+module asm ".type dodo_flash_end, %function"
+module asm ".thumb_func"
+module asm "dodo_flash_end:"
+module asm "    ldr r0, =__flash_end"
+module asm "    bx lr"
 module asm "    .ltorg"
 
 module asm ".weak NMI_Handler, HardFault_Handler, SVC_Handler, PendSV_Handler, SysTick_Handler"

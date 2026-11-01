@@ -29,6 +29,24 @@
   are placed in `.data.rel.ro` sections. They were in writable `.rodata`
   sections, which GNU ld merged into the code segment, producing a
   writable and executable segment and a linker warning.
+- Persistent storage for firmware. `hal.Flash` is a device protocol for NOR
+  flash (erase blocks to `0xFF`, then write erased bytes once), and
+  `std/embedded/storage` builds on it: `storage.Store`, a key-value store
+  with text keys and byte values (`get`, `set`, `remove`, `contains`,
+  `len_of`, `get_u32`/`set_u32`, key listing, `clear`), and
+  `storage.Region`, a window of any flash device. The store is a log over
+  2 to 64 erase blocks with even wear and compaction; every record has a
+  CRC-32 and is verified, writes never touch written bytes, and a power cut
+  at any point loses at most the operation in progress. On the RP2040 and
+  RP2350, `b.flash` (`std/embedded/chip/rp_flash`) reads the flash and hands
+  out regions above the program, which reflashing keeps: the chip runtimes
+  erase and program through the boot ROM, from SRAM with execute-in-place
+  restored by a copy of `.boot2` on the RP2040 and through `flash_op` on the
+  RP2350, with interrupts masked, and refuse while core 1 runs a task.
+  `fake.Flash` checks the protocol strictly and can cut the power mid-write
+  for tests, which sweep power cuts over every erase and write of a long run.
+  `examples/boot_counter.dodo` counts restarts, and the Pico self-tests check
+  regions, writes, and a store on the flash.
 - `std/window` supports several windows per process, for dialogs, popups
   and tool windows. This changes the API: a `window.App` connects to the
   window system and runs the one event loop, `app.open(options)` opens any

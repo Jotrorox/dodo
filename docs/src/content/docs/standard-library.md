@@ -157,9 +157,12 @@ ports use for transfers that run in the background, their real-time clocks,
 the RP2040's RTC and the RP2350's always-on timer, through
 `std/embedded/chip/rp_rtc`, and their second core,
 with the FIFOs, spinlocks, and RP2350 doorbells the cores share, through
-`std/embedded/chip/rp_multicore`, and their watchdog through
-`std/embedded/chip/rp_watchdog`. The clock gating and dormant state both
-chips share are in `std/embedded/chip/rp_power`.
+`std/embedded/chip/rp_multicore`, their watchdog through
+`std/embedded/chip/rp_watchdog`, and the free flash above the program
+through `std/embedded/chip/rp_flash`. The clock gating and dormant state both
+chips share are in `std/embedded/chip/rp_power`. `std/embedded/storage` keeps
+a power-cut-safe key-value store on that flash, or on any device with the
+`hal.Flash` protocol.
 `std/embedded/can/mcp2515` drives the MCP2515 CAN controller over any SPI bus.
 `std/embedded/cortex_m` enables, pends, and prioritizes interrupts and runs
 SysTick on any Cortex-M core. `std/embedded/executor` runs several firmware
@@ -220,7 +223,7 @@ individual modules and links every public declaration back to its source.
 | [MQTT](mqtt.md) | `std/mqtt`, `std/mqtt/app`, `std/mqtt/broker`, `std/mqtt/hosted` | Packets/topics/handlers/test deliveries portable; app, broker, and client hosted. |
 | [Web serving](web.md) | `std/web`, `std/web/application`, `std/web/app`, `std/web/hosted`, `std/web/https`, `std/web/reactor`, `std/web/response`, `std/web/server`, `std/web/static_files`, `std/web/stream`, `std/web/testing` | Routing/registration/composition portable; app/hosted/HTTPS/reactor/static files explicit. |
 | [Embedded scripting with Lua](script.md) | `std/script/lua` | Hosted: Linux, macOS, and Windows; `io` and `os` follow the target C library. |
-| [Hardware and embedded](hardware.md) | `std/embedded/hal`, `std/embedded/hal/serial`, `std/embedded/hal/fake`, `std/embedded/executor`, `std/embedded/sync`, `std/embedded/power`, `std/embedded/board`, `std/embedded/chip`, `std/embedded/peripheral/designware_i2c`, `std/embedded/peripheral/pl022`, `std/embedded/peripheral/pl011`, `std/embedded/wireless/cyw43`, `std/embedded/can/mcp2515`, `std/embedded/rtc/ds3231`, `std/embedded/cortex_m` | `std/embedded/hal`, `std/embedded/executor`, `std/embedded/sync`, and `std/embedded/power` are portable, with interrupt masking on bare-metal Cortex-M and RISC-V. `std/embedded/cortex_m` (interrupt controller, SysTick, barriers) runs only on Cortex-M. `std/embedded/board` and `std/embedded/chip` resolve to the firmware build's board and chip packages, such as `std/embedded/board/pico2` and `std/embedded/chip/rp2350`. |
+| [Hardware and embedded](hardware.md) | `std/embedded/hal`, `std/embedded/hal/serial`, `std/embedded/hal/fake`, `std/embedded/executor`, `std/embedded/sync`, `std/embedded/power`, `std/embedded/storage`, `std/embedded/board`, `std/embedded/chip`, `std/embedded/peripheral/designware_i2c`, `std/embedded/peripheral/pl022`, `std/embedded/peripheral/pl011`, `std/embedded/wireless/cyw43`, `std/embedded/can/mcp2515`, `std/embedded/rtc/ds3231`, `std/embedded/cortex_m` | `std/embedded/hal`, `std/embedded/executor`, `std/embedded/sync`, and `std/embedded/power` are portable, with interrupt masking on bare-metal Cortex-M and RISC-V. `std/embedded/cortex_m` (interrupt controller, SysTick, barriers) runs only on Cortex-M. `std/embedded/board` and `std/embedded/chip` resolve to the firmware build's board and chip packages, such as `std/embedded/board/pico2` and `std/embedded/chip/rp2350`. |
 
 ## Implementation and adapter packages
 
