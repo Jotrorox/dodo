@@ -225,6 +225,31 @@ fn rp_wake_registers() {
     core.assert(io.word(0x160) == 0 && io.word(0x164) == 0x0000_0001 && io.word(0x16C) == 0)
 }
 
+// The RP2350B's GPIO 30 to 47 wake it too: six registers from the RP2350's
+// DORMANT_WAKE_INTE0.
+fn rp_wake_high_pins() {
+    io := Block.new()
+    plan := rp_power.Layout {
+        wake_en: 0xAC,
+        sleep_en: 0xB4,
+        rosc_status: 0x1C,
+        dormant_wake_inte: 0x2D8,
+        dormant_wake_ints: 0x308,
+        pin_count: 48,
+    }
+    wake := power.Wake.new()
+    wake.on(47, power.LEVEL_HIGH)
+    wake.on(32, power.FALLING_EDGE)
+    rp_power.check_wake(&wake, 48)!
+    expect_error(rp_power.check_wake(&wake, 30), hal.Error.InvalidInput)
+    rp_power.arm_wake(&mut io, &plan, &wake)
+    core.assert(io.word(0x2E8) == 0x4 && io.word(0x2EC) == 0x2000_0000)
+    io.write(0x31C, 0x2000_0000)
+    core.assert(rp_power.woken_pins(&mut io, &plan, &wake) == 1u64 << 47)
+    rp_power.disarm_wake(&mut io, &plan, &wake)
+    core.assert(io.word(0x2E8) == 0 && io.word(0x2EC) == 0)
+}
+
 fn rp_oscillators() {
     plan := layout()
     xosc := Block.new()
@@ -260,5 +285,6 @@ fn main() {
     fake_power()
     rp_clock_registers()
     rp_wake_registers()
+    rp_wake_high_pins()
     rp_oscillators()
 }

@@ -1335,7 +1335,7 @@ which is open at reset and closed only inside critical sections.
 | --- | --- |
 | `pl011.Port` and `Controller` | `listen(sources)`, `ignore(sources)`, `pending_interrupts()`, and `clear_interrupts(sources)` with `RX_INTERRUPT` (FIFO 3/4 full), `RX_TIMEOUT_INTERRUPT` (bytes waiting for 32 bit times), `TX_INTERRUPT`, and `ERROR_INTERRUPTS`. The receive sources end when reads drain the FIFO. |
 | `Timer.alarm(n)` on the RP2040 and RP2350 | An `Alarm` with the [alarm protocol](#device-protocols): it fires once at `schedule_at_us(time)`, a `now_us()` time up to 2^31 - 1 us (35 minutes) ahead, or at the low 32 bits of the counter with `schedule_at(time)` and `schedule_in(microseconds)`. `listen` raises `alarm.irq()`, and its handler calls `clear`; a time `schedule_at_us` finds already passed raises it at once. `release_alarm` gives it back. With `now_us()` and `sleep_until(deadline)` it is also the [executor](#tasks-and-the-executor)'s clock. |
-| `Pin` on the RP2040 and RP2350 | `listen(events)` raises `IO_IRQ_BANK0` for `chip.RISING_EDGE`, `FALLING_EDGE`, `LEVEL_HIGH`, or `LEVEL_LOW`; `events()` shows them, `clear_events(edges)` acknowledges edges, `ignore(events)` stops. |
+| `Pin` on the RP2040 and RP2350 | `listen(events)` raises `IO_IRQ_BANK0` on the calling core for `chip.RISING_EDGE`, `FALLING_EDGE`, `LEVEL_HIGH`, or `LEVEL_LOW`; `events()` shows them, `clear_events(edges)` acknowledges edges, `ignore(events)` stops. `listen_on(core, events)`, `ignore_on`, and `events_on` name the core. |
 
 ### The Cortex-M core
 
@@ -1683,7 +1683,7 @@ runs a blinking LED, a debounced button, and such a serial console together.
 
 | Interrupt source | Raise it | Acknowledge it |
 | --- | --- | --- |
-| GPIO pin (RP2040, RP2350) | `pin.listen(events)` with `chip.RISING_EDGE`, `FALLING_EDGE`, `LEVEL_HIGH`, `LEVEL_LOW`; all pins share `IO_IRQ_BANK0` (`pin.irq()`) | `pin.events()` shows what is raising it; `pin.clear_events(edges)` clears latched edges. Levels last as long as the level. `ignore(events)` stops. |
+| GPIO pin (RP2040, RP2350) | `pin.listen(events)` with `chip.RISING_EDGE`, `FALLING_EDGE`, `LEVEL_HIGH`, `LEVEL_LOW`, on the calling core; all pins share `IO_IRQ_BANK0` (`pin.irq()`) | `pin.events()` shows what is raising it; `pin.clear_events(edges)` clears latched edges. Levels last as long as the level. `ignore(events)` stops. |
 | Serial port | `port.listen(sources)` | Reading drains the receive sources; `clear_interrupts` the errors. |
 | Timer alarm | `alarm.listen()` | `alarm.clear()`. An alarm used as the executor's clock is busy. |
 | USB serial port | `serial.set_signal(&SIGNAL)`: the port's own interrupt handler raises it | Nothing to acknowledge: read with `poll_read` until it is Pending. |
@@ -1692,6 +1692,29 @@ runs a blinking LED, a debounced button, and such a serial console together.
 
 Several pins share `IO_IRQ_BANK0`, so give them one signal and let each
 task check its own pin's `events()`: raising wakes every waiting task.
+
+Each core has its own pin interrupt enables, and `listen`, `ignore`, and
+`events` act for the core that calls them; `listen_on(core, events)`,
+`ignore_on(core, events)`, and `events_on(core)` name core 0 or 1
+explicitly. The cores share the vector table, so the one
+`@interrupt(IO_IRQ_BANK0)` handler runs on whichever core listens: to handle
+a pin on core 1, move it into core 1's task and call `listen` and
+`cortex_m.enable(chip.IO_IRQ_BANK0)` there. A signal the handler raises then
+belongs to core 1 and wakes that core's executor:
+
+```dodo
+struct Core1Button {
+    pin: chip.Pin
+
+    pub fn run(self) {
+        let Core1Button { pin } = self
+        button := pin
+        button.listen(chip.FALLING_EDGE)          // core 1's enables
+        cortex_m.enable(chip.IO_IRQ_BANK0)       // core 1's NVIC
+        // ... run an executor whose task takes BUTTON ...
+    }
+}
+```
 
 ### Testing tasks on a desktop
 
@@ -2160,8 +2183,29 @@ once. Pins are released from pad isolation when claimed, as the RP2350
 requires. `reboot_to_bootloader(led)` uses the boot ROM's reboot function;
 the activity LED is skipped on chip revision A2, whose boot ROM mishandles it.
 Interrupt handlers and IRQ number constants use the datasheet names, for
-example `TIMER0_IRQ_0` and `IO_IRQ_BANK0`. GPIO 0 to 29 are supported, all of the RP2350A; the RP2350B's
-extra pins are not yet.
+example `TIMER0_IRQ_0` and `IO_IRQ_BANK0`.
+
+Both packages of the chip are supported. `take()` reads the package from
+SYSINFO's `PACKAGE_SEL`, and `pins.pin_count()` (or `rp2350.pin_count()`)
+returns its GPIOs: 30 on the RP2350A (QFN-60, as on the Pico 2), GPIO 0 to
+29, and 48 on the RP2350B (QFN-80), GPIO 0 to 47. `rp2350.PIN_COUNT` is 30,
+the pins every RP2350 has, and `rp2350.MAX_PIN_COUNT` is 48; a claim of a pin
+the package lacks returns `InvalidInput`. On the RP2350B, GPIO 30 to 47
+work like the others: as inputs and outputs (GPIO 32 to 47 through the SIO's
+`GPIO_HI` registers), with pin interrupts and dormant wake-up, and with their
+peripheral functions, which continue the pattern of GPIO 0 to 29: SPI0 on
+GPIO 32 to 39 and SPI1 on 40 to 47, UART0 on 28 to 35 and 44 to 47, UART1 on
+36 to 43, I2C in steps of four as below, and PWM slices 8 to 11, of which
+GPIO n and n + 8 share an output. The ADC still reads GPIO 26 to 29 only.
+
+```dodo
+b := board.take()!
+if b.pins.pin_count() > 30 {
+    // An RP2350B: GPIO 40 and 41 as a serial port (UART1), GPIO 47 an LED.
+    serial := b.pins.uart(40, some(41u32), 115_200)!
+    led := b.pins.output(47)!
+}
+```
 
 Unlike the RP2040, the RP2350 boot ROM clears RAM when it starts, so nothing
 in RAM survives a reboot into the bootloader.
@@ -2179,6 +2223,11 @@ to it:
 | I2C1 | SDA 2, 6, 10, 14, 18, 22, 26; SCL 3, 7, 11, 15, 19, 23, 27 |
 | SPI0 | clock 2, 6, 18, 22; TX 3, 7, 19, 23; RX 0, 4, 16, 20; chip select 1, 5, 17, 21 |
 | SPI1 | clock 10, 14, 26; TX 11, 15, 27; RX 8, 12, 24, 28; chip select 9, 13, 25, 29 |
+
+The RP2350B's GPIO 30 to 47 continue these patterns: I2C0 SDA 32, 36, 40,
+44 and SCL 33, 37, 41, 45; I2C1 SDA 30, 34, 38, 42, 46 and SCL 31, 35, 39,
+43, 47; SPI0 clock 34, 38, TX 35, 39, RX 32, 36, chip select 33, 37; SPI1
+clock 30, 42, 46, TX 31, 43, 47, RX 40, 44, chip select 41, 45.
 
 The pins of one bus must belong to the same controller; otherwise, or for a
 frequency the controller cannot make, the claim is `InvalidInput`. A pin or
@@ -2353,10 +2402,14 @@ is a small command line with echo and backspace.
 | UART0 | 0, 12, 16, 28 | 1, 13, 17, 29 |
 | UART1 | 4, 8, 20, 24 | 5, 9, 21, 25 |
 
+On the RP2350B, UART0 also has TX on 32 and 44 and RX on 33 and 45, and
+UART1 TX on 36 and 40 and RX on 37 and 41.
+
 On the RP2350, TX also works on the pins listed for CTS below and RX on
 those for RTS (its UART_AUX function): UART0 TX on 2, 14, and 18 and RX on
-3, 15, and 19, UART1 TX on 6, 10, 22, and 26 and RX on 7, 11, 23, and 27.
-The two pins must belong to the same UART; otherwise, or for a rate out of
+3, 15, and 19, UART1 TX on 6, 10, 22, and 26 and RX on 7, 11, 23, and 27,
+and on the RP2350B UART0 TX on 30, 34, and 46 and RX on 31, 35, and 47,
+UART1 TX on 38 and 42 and RX on 39 and 43. The two pins must belong to the same UART; otherwise, or for a rate out of
 range, the claim is `InvalidInput`. A pin or UART that is already taken is
 `Busy`.
 
@@ -2762,6 +2815,27 @@ connects GPIO `first` and the `count - 1` after it, which are then taken like
 any claimed pin. A state machine reads any pin whose input is enabled, so a
 pin it only reads can also be claimed with `pins.input(n)`.
 
+A block reaches 32 consecutive GPIOs, its window: GPIO 0 to 31, or on the
+RP2350, whose PIO blocks have a `GPIOBASE` register, GPIO 16 to 47 after
+`pio.set_gpio_base(rp_pio.HIGH_GPIO_BASE)`. The RP2350B's GPIO 32 to 47 need
+the upper window. Choose it before giving the block pins, loading programs,
+or claiming state machines (`Busy` otherwise; `Unsupported` on the RP2040).
+Everything else keeps naming absolute GPIO numbers: `pio_pins`, the
+`Config` pin mappings, `set_pins`, `set_pindirs`, `bypass_input_sync`, and
+`wait gpio` in programs, which the assembler accepts up to GPIO 47 and
+`load` translates into the block's window, as the Pico SDK does. A pin
+outside the window is `InvalidInput`, so one block cannot mix GPIO 0 to 15
+with GPIO 32 to 47:
+
+```dodo
+pio := b.pins.pio(1)!
+pio.set_gpio_base(rp_pio.HIGH_GPIO_BASE)!   // GPIO 16 to 47
+b.pins.pio_pins(&pio, 40, 2)!
+loaded := pio.load(&PULSE)!
+config := loaded.config()
+config.set_sideset_pins(41)!
+```
+
 | `rp_pio.Pio` | Purpose |
 | --- | --- |
 | `load(&program)`, `unload(loaded)` | Load a program at its `.origin` or the highest free slots it fits, relocating its jumps; `Busy` if it does not fit. Returns an `rp_pio.Loaded`, whose `offset()` is its first instruction's address and whose `config()` is a `Config` with the program's settings. |
@@ -2770,6 +2844,7 @@ pin it only reads can also be claimed with `pins.input(n)`.
 | `flags()`, `clear_flags(flags)`, `force_flags(flags)` | The IRQ flags, one bit each. Clearing releases state machines waiting on `irq wait`. |
 | `listen(line, sources)`, `ignore(line, sources)`, `interrupts(line)`, `irq(line)` | Raise interrupt line 0 or 1 for `rp_pio.rx_not_empty(sm)`, `rp_pio.tx_not_full(sm)`, and `rp_pio.flag(n)` sources; `irq(line)` is its number for `cortex_m.enable` and `@interrupt`, such as `PIO0_IRQ_0`. |
 | `bypass_input_sync(pin, on)` | Read a pin without the two-cycle input synchronizer. |
+| `set_gpio_base(base)`, `gpio_base()` | The block's GPIO window: 0 (GPIO 0 to 31) or, on the RP2350, `rp_pio.HIGH_GPIO_BASE` (GPIO 16 to 47). |
 
 | `rp_pio.Config` | Purpose |
 | --- | --- |
@@ -3449,10 +3524,10 @@ dodo build firmware.dodo --emit obj --target thumbv7em-none-eabihf \
 - PIO state machines move words through their FIFOs by polling or their
   interrupts. DMA can pace transfers by their FIFOs' data requests
   (`rp_dma.request` with `sm.tx_fifo_address()`), and `hal.DmaStream` runs
-  a buffer through one, as `rp_i2s.Output.dma` does. Their pin mappings
-  reach GPIO 0 to 31; the
-  RP2350B's GPIO 32 to 47 and the RP2350's GPIOBASE register are not
-  supported. `rp_pio.assemble` takes one program per call.
+  a buffer through one, as `rp_i2s.Output.dma` does. A block's pin
+  mappings reach one 32-GPIO window, GPIO 0 to 31 or (RP2350) 16 to 47, so
+  one block cannot drive GPIO 0 to 15 and 32 to 47 together.
+  `rp_pio.assemble` takes one program per call.
 - PWM inputs measure by counting over windows, as the slices cannot
   timestamp edges; the PWM wrap interrupt is not exposed. ADC reads are
   polled one at a time, without the round-robin sampler, FIFO, or DMA.
@@ -3473,10 +3548,11 @@ dodo build firmware.dodo --emit obj --target thumbv7em-none-eabihf \
   floating-point exception flags and return the default quiet NaN for every
   NaN result.
 - Core 1 runs one task, started from core 0, and the cores share the
-  vector table. Executor tasks on either core, async or hand-written, are
-  cooperative: there is no preemptive scheduler. GPIO events interrupt
-  core 0 only, and the RP2350's RISC-V cores are not supported. A signal
-  belongs to one core; the FIFO or a doorbell carries a wake-up across.
+  vector table, so an interrupt has one handler for both cores. Executor
+  tasks on either core, async or hand-written, are cooperative: there is no
+  preemptive scheduler. The RP2350's RISC-V cores are not supported. A
+  signal belongs to one core; the FIFO or a doorbell carries a wake-up
+  across.
 - An async fn's future must stay in place once started, cannot await
   itself, and is as large as everything its body keeps across an `await`;
   `await` begins its statement. See [async functions](async.md).
@@ -3489,7 +3565,7 @@ dodo build firmware.dodo --emit obj --target thumbv7em-none-eabihf \
   assembly, so startup code and vector tables come from the chip runtime or a
   `@section`-placed static.
 - Low power covers sleep, deep sleep, clock gating, and the dormant state
-  woken by GPIO 0 to 29. The RP2350's power manager states, which switch
+  woken by any GPIO the chip has (GPIO 0 to 47 on the RP2350B). The RP2350's power manager states, which switch
   power domains off, its always-on timer, and waking a dormant chip by time
   (the RP2040's RTC from an external clock, the RP2350's AON timer) are not
   supported. Neither is lowering the system clock to save power. On a dual-core chip,

@@ -506,6 +506,127 @@ fn pio_programs_assemble_only_for_rp_chips() {
 
 // The WS2812 example and the rest of the PIO driver on every board. Needs
 // no linker.
+// GPIOs up to the package's last, PIO windows, and pin interrupts on
+// either core: a core 1 task listens to a pin, and the one IO_IRQ_BANK0
+// handler serves it there. The Pico boards' chips have 30 GPIOs, so the
+// RP2350B's GPIO 30 to 47 are reached only through pin_count().
+#[test]
+fn gpio_banks_and_core1_pin_interrupts_link_for_every_board() {
+    if !ld_lld() {
+        return;
+    }
+    let scratch = Scratch::new("gpio-banks");
+    let source = scratch.write(
+        "gpio.dodo",
+        r#"package main
+import "std/embedded/board"
+import "std/embedded/chip"
+import "std/embedded/chip/rp_pio"
+import "std/embedded/cortex_m"
+import "std/embedded/executor"
+import "std/embedded/hal"
+import "std/embedded/power"
+const EDGE: executor.Signal = executor.Signal { id: 0 }
+const WAITS: rp_pio.Program = rp_pio.assemble(".side_set 1", "    wait 1 gpio 20 side 0", "    in pins, 1     side 1", "    push           side 0")
+@interrupt(IO_IRQ_BANK0)
+fn gpio_interrupt() {
+    // Runs on the core that listens: core 1 here.
+    cortex_m.disable(chip.IO_IRQ_BANK0)
+    EDGE.raise()
+}
+struct Watcher {
+    button: chip.Pin
+    pub fn run(self) {
+        self.button.listen(chip.FALLING_EDGE | chip.RISING_EDGE)
+        cortex_m.enable(self.button.irq())
+        for {
+            if self.button.events_on(1) != 0 {
+                self.button.clear_events(chip.FALLING_EDGE | chip.RISING_EDGE)
+                cortex_m.enable(chip.IO_IRQ_BANK0)
+            }
+        }
+    }
+}
+fn main() {
+    b := board.take()!
+    count := b.pins.pin_count()
+    core.assert(count == chip.pin_count() && (count == chip.PIN_COUNT || count == 48))
+    last := b.pins.input(count - 1)!
+    core.assert(last.number() == count - 1)
+    last.listen_on(0, chip.LEVEL_HIGH)
+    core.assert(last.events_on(0) <= chip.LEVEL_HIGH)
+    last.ignore_on(0, chip.LEVEL_HIGH)
+    b.pins.release(last)
+    match b.pins.output(count) {
+        ok(_) => core.assert(false),
+        err(error) => core.assert(error == hal.Error.InvalidInput),
+    }
+    pio := b.pins.pio(1)!
+    match pio.set_gpio_base(rp_pio.HIGH_GPIO_BASE) {
+        ok() => {}
+        err(error) => core.assert(error == hal.Error.Unsupported),
+    }
+    base := pio.gpio_base()
+    b.pins.pio_pins(&pio, base + 4, 2)!
+    loaded := pio.load(&WAITS)!
+    config := loaded.config()
+    config.set_in_pins(base + 4)!
+    config.set_sideset_pins(base + 5)!
+    config.set_jmp_pin(base + 31)!
+    sm := pio.free_state_machine()!
+    sm.init(&config)
+    sm.set_pindirs(base + 5, 1, 1)
+    pio.bypass_input_sync(base + 4, true)
+    sm.set_enabled(true)
+    pio.release_state_machine(sm)
+    pio.unload(loaded)
+    b.pins.release_pio(pio)
+    wake := power.Wake.new()
+    wake.on(count - 1, power.LEVEL_HIGH)
+    woken := b.power.dormant(&wake)!
+    core.assert(woken <= 1u64 << (count - 1) as u64)
+    button := b.pins.input(15)!
+    stack := [0u64; 256]
+    watching := b.core1.start(&mut stack, Watcher { button })!
+    b.timer.delay_ms(10)
+    watching.stop()
+}
+"#,
+    );
+    // IO_IRQ_BANK0 is IRQ 13 on the RP2040 and 21 on the RP2350; both
+    // cores take it through the one vector table.
+    let boards: [(&str, u32, usize); 3] = [
+        ("pico", 0xE48B_FF56, 13),
+        ("pico2", 0xE48B_FF59, 21),
+        ("pico2_w", 0xE48B_FF59, 21),
+    ];
+    for (board, family, irq) in boards {
+        for level in ["0", "2"] {
+            let elf = scratch.path(&format!("gpio-{board}-O{level}.elf"));
+            build(&[
+                "build",
+                source.to_str().unwrap(),
+                "--board",
+                board,
+                "-O",
+                level,
+                "-o",
+                &elf,
+            ]);
+            let path = Path::new(&elf);
+            let bytes = fs::read(path).unwrap();
+            let handler = elf_symbol(&bytes, "IO_IRQ_BANK0").expect("the handler is linked");
+            let image = flash_image(&fs::read(path.with_extension("uf2")).unwrap(), family);
+            let vectors = elf_symbol(&bytes, "__vector_table").unwrap() as usize - 0x1000_0000;
+            assert_eq!(
+                word(&image, vectors + 4 * (16 + irq)),
+                handler | 1,
+                "{board} -O{level}: IRQ {irq} is the program's IO_IRQ_BANK0 handler"
+            );
+        }
+    }
+}
+
 #[test]
 fn pio_drivers_compile_for_every_board() {
     let scratch = Scratch::new("pio-compile");

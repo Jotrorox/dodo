@@ -46,13 +46,17 @@ import "std/embedded/chip/rp_pins"
 // keeps the boot ROM's execute-in-place setup. Section numbers below refer to
 // the RP2350 datasheet.
 //
-// GPIO 0 to 29 are supported, all the RP2350A (QFN-60) has; the RP2350B's
-// GPIO 30 to 47 are not yet.
+// Both packages are supported: take() reads which one the chip is in from
+// SYSINFO, and `Pins` hands out GPIO 0 to 29 on the RP2350A (QFN-60) and
+// GPIO 0 to 47 on the RP2350B (QFN-80); see pin_count.
 
 // clk_sys, the processor and peripheral clock, after take().
 pub const SYS_HZ: u32 = 150_000_000
-// User GPIOs 0 to 29.
+// User GPIOs 0 to 29, all the RP2350A (QFN-60) has, and the only ones a
+// program for either package can rely on. pin_count() is the chip's own.
 pub const PIN_COUNT: u32 = 30
+// User GPIOs 0 to 47, all the RP2350B (QFN-80) has.
+pub const MAX_PIN_COUNT: u32 = 48
 // PIO blocks 0 to 2.
 pub const PIO_BLOCKS: u32 = 3
 
@@ -277,16 +281,26 @@ pub const ALL_CLOCKS: power.Clocks = 0x7FFF_FFFF_FFFF_FFFF
 // clocks Power.disable_unused_clocks stops while they are held in reset.
 const MANAGED_CLOCKS: power.Clocks = CLOCK_ADC | CLOCK_HSTX | CLOCK_I2C0 | CLOCK_I2C1 | CLOCK_PIO0 | CLOCK_PIO1 | CLOCK_PIO2 | CLOCK_PLL_USB | CLOCK_PWM | CLOCK_SHA256 | CLOCK_SPI0 | CLOCK_SPI1 | CLOCK_TIMER1 | CLOCK_TRNG | CLOCK_UART0 | CLOCK_UART1 | CLOCK_USB
 
-// User bank GPIO control (9.11.1) and pads (9.11.3).
+// SYSINFO, among the system control registers: PACKAGE_SEL's bit 0 is 1
+// in the QFN-60 package (the RP2350A) and 0 in the QFN-80 package (the
+// RP2350B), as the Pico SDK's sysinfo.h describes it and picotool reads it.
+const SYSINFO_PACKAGE_SEL: usize = 0x4000_0004
+const PACKAGE_QFN60: u32 = 1 << 0
+
+// User bank GPIO control (9.11.1) and pads (9.11.3), for GPIO 0 to 47.
 const IO_BANK0_BASE: usize = 0x4002_8000
 const PADS_BANK0_BASE: usize = 0x4003_8000
 const FUNCSEL: u32 = 0b11111
-// GPIO interrupts (9.11.1): four bits per pin, eight pins per register.
-// INTR latches edges (write one to clear) and shows levels; PROC0_INTE
-// selects what raises IO_IRQ_BANK0 on core 0, and PROC0_INTS shows it.
+// GPIO interrupts (9.11.1): four bits per pin, eight pins per register,
+// six registers for GPIO 0 to 47. INTR latches edges (write one to clear)
+// and shows levels; PROC0_INTE selects what raises IO_IRQ_BANK0 on core 0,
+// and PROC0_INTS shows it. Core 1's PROC1_INTE and PROC1_INTS follow
+// CORE_INTERRUPTS later.
 const GPIO_INTR: usize = IO_BANK0_BASE + 0x230
 const GPIO_PROC0_INTE: usize = IO_BANK0_BASE + 0x248
 const GPIO_PROC0_INTS: usize = IO_BANK0_BASE + 0x278
+const CORE_INTERRUPTS: usize = 0x290 - 0x248
+const INTS_FROM_INTE: usize = 0x278 - 0x248
 // GPIO events that end the dormant state (6.5.3), laid out as INTR:
 // offsets in IO_BANK0.
 const GPIO_DORMANT_WAKE_INTE: usize = 0x2D8
@@ -330,8 +344,8 @@ const PIO2_BASE: usize = 0x5040_0000
 const USBCTRL_DPRAM_BASE: usize = 0x5010_0000
 const USBCTRL_REGS_BASE: usize = 0x5011_0000
 
-// Single-cycle I/O (3.1). The GPIO_HI registers for pins 32 and up sit
-// between these.
+// Single-cycle I/O (3.1). Each GPIO_HI register, whose bits 0 to 15 are
+// GPIO 32 to 47, follows its GPIO register for pins 0 to 31 by GPIO_HI.
 const SIO_BASE: usize = 0xD000_0000
 const GPIO_IN: usize = SIO_BASE + 0x004
 const GPIO_OUT_SET: usize = SIO_BASE + 0x018
@@ -339,6 +353,7 @@ const GPIO_OUT_CLR: usize = SIO_BASE + 0x020
 const GPIO_OUT_XOR: usize = SIO_BASE + 0x028
 const GPIO_OE_SET: usize = SIO_BASE + 0x038
 const GPIO_OE_CLR: usize = SIO_BASE + 0x040
+const GPIO_HI: usize = 0x004
 
 // Boot ROM reboot() (5.4.8.24): its lookup code and arguments.
 const ROM_REBOOT: u32 = 0x4252
@@ -368,8 +383,8 @@ static mut TAKEN: bool = false
 // neither does.
 static mut PLL_USB_USERS: u32 = 0
 // The pin the USB bootloader lights while its drive is accessed, after the
-// USB serial port restarts the chip into it; PIN_COUNT for none.
-static mut USB_ACTIVITY_LED: u32 = PIN_COUNT
+// USB serial port restarts the chip into it; MAX_PIN_COUNT for none.
+static mut USB_ACTIVITY_LED: u32 = MAX_PIN_COUNT
 
 // Provided by the compiler's RP2350 firmware runtime: call the boot ROM
 // function with lookup code `code` ('R' | 'B' << 8 for reboot), or return -1
@@ -379,7 +394,7 @@ unsafe extern "C" fn dodo_rp2350_rom_call(code: u32, a0: u32, a1: u32, a2: u32, 
 // Restart into the boot ROM's USB bootloader, as if BOOTSEL were held at
 // power-up: the board reappears as the RP2350 drive and accepts new
 // firmware, for example from `dodo run`. Pin `activity_led`, if below
-// PIN_COUNT, lights while the drive is accessed, except on chip revision
+// pin_count(), lights while the drive is accessed, except on chip revision
 // A2, whose boot ROM mishandles it on the Arm cores (erratum in the Pico
 // SDK's rom_reset_usb_boot). Does not return.
 pub fn reboot_to_bootloader(activity_led: u32) {
@@ -391,7 +406,7 @@ pub fn reboot_to_bootloader(activity_led: u32) {
         version: hal.Reg<u32> = hal.Reg.at(ROM_VERSION_WORD)
         rom_version = version.read() >> 24
     }
-    if activity_led < PIN_COUNT && rom_version > 2 {
+    if activity_led < pin_count() && rom_version > 2 {
         flags = BOOTSEL_GPIO_PIN_SPECIFIED
         pin = activity_led
     }
@@ -425,6 +440,21 @@ pub unsafe fn report_panic(check: *const u8, file: *const u8, line: u32, column:
     unsafe {
         rp_pins.report_panic(check, file, line, column)
     }
+}
+
+// The user GPIOs of this chip's package: PIN_COUNT (30) for the RP2350A
+// (QFN-60), MAX_PIN_COUNT (48) for the RP2350B (QFN-80), from SYSINFO's
+// PACKAGE_SEL. `Pins` hands out GPIO 0 to pin_count() - 1.
+pub fn pin_count() -> u32 {
+    // SAFETY: PACKAGE_SEL is read-only and reading it has no side effects;
+    // the boot ROM takes SYSINFO out of reset, and nothing resets it.
+    selection := unsafe {
+        reg(SYSINFO_PACKAGE_SEL)
+    }
+    if (selection.read() & PACKAGE_QFN60) != 0 {
+        return PIN_COUNT
+    }
+    return MAX_PIN_COUNT
 }
 
 // What the circuit board decides. Board packages pass theirs to `take`.
@@ -506,7 +536,7 @@ pub fn take(config: Config) -> Peripherals!hal.Error {
     // the GPIOs' control and pad registers and the bus controllers are
     // otherwise unused.
     bank := unsafe {
-        rp_pins.Bank.new(Chip { crystal_hz: crystal })
+        rp_pins.Bank.new(Chip { crystal_hz: crystal, pin_count: pin_count() })
     }
     // SAFETY: TAKEN guarantees one Watchdog, and the watchdog tick runs.
     // Core 1 uses only the power-on state machine's FRCE_OFF register.
@@ -679,10 +709,19 @@ unsafe fn start_clocks(crystal_hz: u32) -> void!hal.Error {
     }
 }
 
-// The 30 user GPIOs, and the I2C, SPI, and UART controllers that use them.
-// Each pin and each controller can be taken once, and given back.
+// The user GPIOs, 0 to pin_count() - 1 (29 on the RP2350A, 47 on the
+// RP2350B), and the I2C, SPI, and UART controllers that use them. Each pin
+// and each controller can be taken once, and given back. GPIO 30 to 47
+// carry the same functions in the same pattern as GPIO 0 to 29 (9.4), so
+// the pin rules below continue up to GPIO 47 on the RP2350B.
 pub struct Pins {
     bank: rp_pins.Bank<Chip>
+
+    // The GPIOs this chip's package has: PIN_COUNT on the RP2350A,
+    // MAX_PIN_COUNT on the RP2350B. Claims of higher pins are InvalidInput.
+    pub fn pin_count(&self) -> u32 {
+        return self.bank.pin_count()
+    }
 
     // Claim pin `number` as a push-pull output, initially low.
     pub fn output(&mut self, number: u32) -> Pin!hal.Error {
@@ -702,10 +741,11 @@ pub struct Pins {
     // Give back a pin from `output` or `input`. It stops driving and is
     // disconnected until claimed again, for example as part of a bus.
     pub fn release(&mut self, pin: Pin) {
-        pin.ignore(ALL_EVENTS)
+        pin.ignore_on(0, ALL_EVENTS)
+        pin.ignore_on(1, ALL_EVENTS)
         pin.clear_events(ALL_EVENTS)
         pin.set_as_input()
-        self.bank.release_gpio(pin.mask)
+        self.bank.release_gpio(rp_pins.pin_bit(pin.number))
     }
 
     // Claim pins `sda` and `scl` as an I2C bus with an SCL frequency of
@@ -725,8 +765,9 @@ pub struct Pins {
     // `frequency_hz` (at most SYS_HZ / 2, 75 MHz): `clock` (SCK), `tx`
     // (data out to the devices, MOSI), and `rx` (data in from them, MISO),
     // or none when they only listen. GPIO n carries RX when n % 4 is 0, the
-    // clock when it is 2, and TX when it is 3. GPIO 0 to 7 and 16 to 23
-    // belong to SPI0, GPIO 8 to 15 and 24 to 29 to SPI1. Give each device
+    // clock when it is 2, and TX when it is 3. GPIO 0 to 7, 16 to 23, and
+    // 32 to 39 belong to SPI0, GPIO 8 to 15, 24 to 31, and 40 to 47 to
+    // SPI1. Give each device
     // an output pin as its chip select, through hal.SpiDevice. Errors as for
     // `i2c`.
     pub fn spi(&mut self, clock: u32, tx: u32, rx: Option<u32>, mode: hal.SpiMode, frequency_hz: u32) -> pl022.Bus!hal.Error {
@@ -741,7 +782,9 @@ pub struct Pins {
     // of each through the RP2350's UART_AUX function, on the pins that
     // otherwise carry CTS and RTS): UART0 has TX on 0, 2, 12, 14, 16, 18,
     // and 28 and RX on 1, 3, 13, 15, 17, 19, and 29, UART1 TX on 4, 6, 8,
-    // 10, 20, 22, 24, and 26 and RX on 5, 7, 9, 11, 21, 23, 25, and 27.
+    // 10, 20, 22, 24, and 26 and RX on 5, 7, 9, 11, 21, 23, 25, and 27; on
+    // the RP2350B also UART0 TX on 30, 32, 34, 44, 46 and RX on 31, 33, 35,
+    // 45, 47, UART1 TX on 36, 38, 40, 42 and RX on 37, 39, 41, 43.
     // The port implements the std/io Reader
     // and Writer protocols, so std/fmt prints to it; until it is released,
     // a panic writes its failure message to it before the chip halts.
@@ -755,8 +798,9 @@ pub struct Pins {
     // `uart` with hardware flow control, turned on: `cts` is an input, low
     // while the other end may receive, and `rts` an output, low while this
     // port may. GPIO n carries CTS when n % 4 is 2 and RTS when it is 3, in
-    // the TX and RX pins' group of four: UART0 has CTS on 2, 14, 18 and RTS
-    // on 3, 15, 19, UART1 CTS on 6, 10, 22, 26 and RTS on 7, 11, 23, 27.
+    // the TX and RX pins' group of four: UART0 has CTS on 2, 14, 18 (and
+    // 30, 34, 46) and RTS on 3, 15, 19 (31, 35, 47), UART1 CTS on 6, 10,
+    // 22, 26 (38, 42) and RTS on 7, 11, 23, 27 (39, 43).
     // Errors as for `uart`.
     pub fn uart_flow(&mut self, tx: u32, rx: u32, cts: u32, rts: u32, baud: u32) -> pl011.Port!hal.Error {
         return self.bank.uart_flow(tx, rx, cts, rts, baud)
@@ -765,8 +809,8 @@ pub struct Pins {
     // `spi` with the controller's own chip select on pin `select` as well,
     // for devices in the TI and Microwire frame formats (see
     // pl022.FrameFormat), which need its timing. GPIO n carries it when
-    // n % 4 is 1, in the bus's block of eight: SPI0 on 1, 5, 17, 21, SPI1
-    // on 9, 13, 25, 29. Errors as for `spi`.
+    // n % 4 is 1, in the bus's block of eight: SPI0 on 1, 5, 17, 21 (33,
+    // 37), SPI1 on 9, 13, 25, 29 (41, 45). Errors as for `spi`.
     pub fn spi_with_select(&mut self, clock: u32, tx: u32, rx: Option<u32>, select: u32, mode: hal.SpiMode, frequency_hz: u32) -> pl022.Bus!hal.Error {
         return self.bank.spi_with_select(clock, tx, rx, select, mode, frequency_hz)
     }
@@ -793,9 +837,11 @@ pub struct Pins {
     // `frequency_hz`, from 9 Hz up to SYS_HZ / 2, low until a duty is set.
     // GPIO n is output A (n even) or B (n odd) of PWM slice (n / 2) % 8:
     // GPIO n and n + 16 carry the same output, and the two outputs of a
-    // slice share its frequency. The output implements hal.PwmOutput, with
-    // max_duty() steps up to 65535; rp_pwm documents it. InvalidInput above
-    // GPIO 29 or for a frequency out of range, Busy if the pin or its output
+    // slice share its frequency. On the RP2350B GPIO 32 to 47 are outputs
+    // of slices 8 to 11, 8 + ((n - 32) / 2) % 4, so GPIO n and n + 8 share
+    // one. The output implements hal.PwmOutput, with
+    // max_duty() steps up to 65535; rp_pwm documents it. InvalidInput for a
+    // GPIO the chip lacks or a frequency out of range, Busy if the pin or its output
     // is taken, or if the slice's other output runs at another frequency.
     pub fn pwm(&mut self, pin: u32, frequency_hz: u32) -> rp_pwm.Pwm!hal.Error {
         return self.bank.pwm(pin, frequency_hz)
@@ -811,13 +857,13 @@ pub struct Pins {
 
     // Claim pin `pin`, an odd GPIO, as a PWM input that measures the
     // frequency and duty cycle of the signal on it: GPIO n is input B of
-    // PWM slice (n / 2) % 8, whose counter counts its rising edges and its
+    // its PWM slice (as for `pwm`), whose counter counts its rising edges and its
     // high time in windows of `window_us`, up to 111 ms, two per
     // measurement. Its pull-down holds an unconnected pin low. The input
     // implements hal.PwmInput; rp_pwm.Capture documents the measurement and
-    // its precision. InvalidInput for an even pin, above GPIO 29, or for a
-    // window of 0 or too long, Busy if the pin is taken or either output of
-    // its slice is in use.
+    // its precision. InvalidInput for an even pin, a GPIO the chip lacks,
+    // or a window of 0 or too long, Busy if the pin is taken or either
+    // output of its slice is in use.
     pub fn pwm_input(&mut self, pin: u32, window_us: u32) -> rp_pwm.PwmCapture!hal.Error {
         return self.bank.pwm_input(pin, window_us)
     }
@@ -850,8 +896,11 @@ pub struct Pins {
     // Connect the `count` pins from GPIO `first` to PIO block `pio`, for
     // its state machines to drive through their pin mappings and read.
     // They also read pins claimed in other ways: claim a pin they only
-    // read as an input, for example, to share it. InvalidInput above GPIO
-    // 29 or for a count of 0, Busy if a pin is taken.
+    // read as an input, for example, to share it. A block reaches GPIO 0
+    // to 31, or 16 to 47 once `pio.set_gpio_base(16)` moves its window,
+    // which pins above GPIO 31 on the RP2350B need. InvalidInput for a
+    // GPIO the chip lacks, pins outside the block's window, or a count of
+    // 0, Busy if a pin is taken.
     pub fn pio_pins(&mut self, pio: &rp_pio.Pio, first: u32, count: u32) -> void!hal.Error {
         return self.bank.pio_pins(pio, first, count)
     }
@@ -912,8 +961,13 @@ pub struct Pins {
     }
 
     fn claim(&mut self, number: u32) -> Pin!hal.Error {
-        mask := self.bank.gpio(number)?
+        self.bank.gpio(number)?
         group := 4 * (number / 8) as usize
+        // GPIO 32 to 47 are bits 0 to 15 of the GPIO_HI registers.
+        high := 0usize
+        if number >= 32 {
+            high = GPIO_HI
+        }
         // SAFETY: the bank makes this pin's control and pad registers
         // exclusive to the returned Pin. The SIO output SET/CLR/XOR and
         // output-enable SET/CLR registers are write-only per-bit aliases and IN
@@ -923,17 +977,16 @@ pub struct Pins {
         // INTS is read-only.
         unsafe {
             return ok(Pin {
-                set: reg(GPIO_OUT_SET),
-                clear: reg(GPIO_OUT_CLR),
-                toggle: reg(GPIO_OUT_XOR),
-                input: reg(GPIO_IN),
-                output_enable: reg(GPIO_OE_SET),
-                output_disable: reg(GPIO_OE_CLR),
-                mask,
+                number,
+                set: reg(GPIO_OUT_SET + high),
+                clear: reg(GPIO_OUT_CLR + high),
+                toggle: reg(GPIO_OUT_XOR + high),
+                input: reg(GPIO_IN + high),
+                output_enable: reg(GPIO_OE_SET + high),
+                output_disable: reg(GPIO_OE_CLR + high),
+                mask: 1u32 << (number % 32),
                 raw_events: reg(GPIO_INTR + group),
-                listen_set: reg(GPIO_PROC0_INTE + group + SET_ALIAS),
-                listen_clear: reg(GPIO_PROC0_INTE + group + CLEAR_ALIAS),
-                status: reg(GPIO_PROC0_INTS + group),
+                interrupts: GPIO_PROC0_INTE + group,
                 shift: 4 * (number % 8),
             })
         }
@@ -956,12 +1009,13 @@ pub struct Usb {
     // board into its bootloader. Busy if a port is open, Timeout if PLL_USB
     // or the controller does not start.
     pub fn serial(&mut self) -> rp_usb.Serial!hal.Error {
-        return self.serial_with(rp_usb.default_identity("RP2350"), PIN_COUNT)
+        return self.serial_with(rp_usb.default_identity("RP2350"), MAX_PIN_COUNT)
     }
 
     // `serial`, with the `identity` the host sees, and the pin the USB
     // bootloader lights while its drive is accessed after the host
-    // restarts the board into it, or PIN_COUNT for none. Board packages
+    // restarts the board into it, or a pin the chip lacks, such as
+    // MAX_PIN_COUNT, for none. Board packages
     // pass the default identity with the board's name, and the board's
     // LED.
     pub fn serial_with(&mut self, identity: rp_usb.Identity, activity_led: u32) -> rp_usb.Serial!hal.Error {
@@ -1026,6 +1080,12 @@ fn usb_bootloader() {
 // What rp_pins.Bank needs from this chip. Only the Bank in Pins has one.
 struct Chip {
     crystal_hz: u32
+    // From pin_count(), read once by take().
+    pin_count: u32
+
+    pub fn pin_count(&self) -> u32 {
+        return self.pin_count
+    }
 
     pub fn route(&mut self, number: u32, function: u32, clear: u32, set: u32) {
         // SAFETY: the bank routes only pins it holds.
@@ -1177,20 +1237,26 @@ unsafe fn route(number: u32, function: u32, clear: u32, set: u32) {
 // One GPIO driven by the single-cycle I/O block. Implements the
 // std/embedded/hal output and input pin protocols.
 pub struct Pin {
+    number: u32
     set: hal.Reg<u32>
     clear: hal.Reg<u32>
     toggle: hal.Reg<u32>
     input: hal.Reg<u32>
     output_enable: hal.Reg<u32>
     output_disable: hal.Reg<u32>
+    // The pin's bit in the SIO registers above.
     mask: u32
-    // This pin's interrupt bits: raw events, core 0's enables through the
-    // set and clear aliases, and core 0's status, at `shift`.
+    // This pin's interrupt bits, at `shift`: raw events, and the address
+    // of core 0's PROC0_INTE register for its group of eight pins, which
+    // core 1's and the status registers follow.
     raw_events: hal.Reg<u32>
-    listen_set: hal.Reg<u32>
-    listen_clear: hal.Reg<u32>
-    status: hal.Reg<u32>
+    interrupts: usize
     shift: u32
+
+    // The GPIO number.
+    pub fn number(&self) -> u32 {
+        return self.number
+    }
 
     pub fn set_high(&mut self) {
         self.set.write(self.mask)
@@ -1219,24 +1285,59 @@ pub struct Pin {
         self.output_disable.write(self.mask)
     }
 
-    // Raise IO_IRQ_BANK0 on `events`, any of LEVEL_LOW, LEVEL_HIGH,
-    // FALLING_EDGE, and RISING_EDGE, after forgetting edges seen so far.
-    // Enable the interrupt in the NVIC too: `cortex_m.enable(pin.irq())`.
-    // Every pin shares the one interrupt; its handler tells them apart with
-    // `events`.
+    // Raise IO_IRQ_BANK0 on the calling core on `events`, any of
+    // LEVEL_LOW, LEVEL_HIGH, FALLING_EDGE, and RISING_EDGE, after
+    // forgetting edges seen so far. Enable the interrupt in that core's
+    // NVIC too: `cortex_m.enable(pin.irq())`. Every pin shares the one
+    // interrupt; its handler tells them apart with `events`. Each core has
+    // its own enables, and both cores share the vector table, so the one
+    // `@interrupt(IO_IRQ_BANK0)` handler runs on whichever core listens:
+    // call `listen` and `cortex_m.enable` from code running on core 1 to
+    // handle a pin there.
     pub fn listen(&mut self, events: u32) {
-        self.clear_events(events)
-        self.listen_set.write((events & ALL_EVENTS) << self.shift)
+        self.listen_on(cpu.core_id(), events)
     }
 
-    // Stop raising the interrupt on `events`.
+    // Stop raising the calling core's interrupt on `events`.
     pub fn ignore(&mut self, events: u32) {
-        self.listen_clear.write((events & ALL_EVENTS) << self.shift)
+        self.ignore_on(cpu.core_id(), events)
     }
 
-    // The listened-to events that are raising the interrupt now.
+    // The events the calling core listens to that are raising its
+    // interrupt now.
     pub fn events(&self) -> u32 {
-        return (self.status.read() >> self.shift) & ALL_EVENTS
+        return self.events_on(cpu.core_id())
+    }
+
+    // `listen` for core `core`, 0 or 1, from either core. Another number
+    // traps.
+    pub fn listen_on(&mut self, core: u32, events: u32) {
+        self.clear_events(events)
+        enables := self.core_register(core, SET_ALIAS)
+        enables.write((events & ALL_EVENTS) << self.shift)
+    }
+
+    // `ignore` for core `core`, 0 or 1.
+    pub fn ignore_on(&mut self, core: u32, events: u32) {
+        enables := self.core_register(core, CLEAR_ALIAS)
+        enables.write((events & ALL_EVENTS) << self.shift)
+    }
+
+    // `events` for core `core`, 0 or 1.
+    pub fn events_on(&self, core: u32) -> u32 {
+        status := self.core_register(core, INTS_FROM_INTE)
+        return (status.read() >> self.shift) & ALL_EVENTS
+    }
+
+    // Core `processor`'s INTE register of this pin's group, at `offset`
+    // (an alias, or INTS_FROM_INTE for its INTS).
+    fn core_register(&self, processor: u32, offset: usize) -> hal.Reg<u32> {
+        core.assert(processor < 2)
+        // SAFETY: the pin writes only its own bits, through the set and
+        // clear aliases, and INTS is read-only; see Pins.claim.
+        unsafe {
+            return reg(self.interrupts + CORE_INTERRUPTS * processor as usize + offset)
+        }
     }
 
     // Forget the edges among `events`, acknowledging them; a handler or
@@ -1653,7 +1754,7 @@ pub struct Power: power.Power {
     }
 
     pub fn dormant(&mut self, wake: &power.Wake) -> u64!hal.Error {
-        rp_power.check_wake(wake, PIN_COUNT)?
+        rp_power.check_wake(wake, pin_count())?
         layout := power_layout()
         section := hal.Critical.enter()
         // SAFETY: interrupts are masked, so this core reads the count
@@ -1683,7 +1784,7 @@ fn power_layout() -> rp_power.Layout {
         rosc_status: ROSC_STATUS,
         dormant_wake_inte: GPIO_DORMANT_WAKE_INTE,
         dormant_wake_ints: GPIO_DORMANT_WAKE_INTS,
-        pin_count: PIN_COUNT,
+        pin_count: pin_count(),
     }
 }
 

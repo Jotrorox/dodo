@@ -3,6 +3,7 @@ package main
 import "core/ptr"
 import "std/embedded/board"
 import "core/mem"
+import "core/option"
 import "std/embedded/chip"
 import "std/embedded/chip/rp_adc"
 import "std/embedded/chip/rp_dma"
@@ -1357,6 +1358,85 @@ fn core1_checks(core1: &mut rp_multicore.Core1, fifos: &mut rp_multicore.Fifos, 
     spinlocks.release(lock)
 }
 
+// A pin core 1 listens to raises IO_IRQ_BANK0 on core 1, where the one
+// gpio_event handler runs and raises core 1's EDGE; core 0's stays quiet.
+// The pin goes to core 1 and back through CORE1_PIN, and core 1 reports
+// in CORE1_REPORT (core 1 keeps the FIFO end core1_checks gave it).
+static mut CORE1_PIN: Option<chip.Pin> = none
+static CORE1_REPORT: atomic.Atomic<u32> = atomic.Atomic.new(0u32)
+
+struct Core1Pin {
+    pub fn run(self) {
+        report := 0u32
+        slot := unsafe {
+            option.take(&mut CORE1_PIN)
+        }
+        if let some(pin) = slot {
+            output := pin
+            EDGE.reset()
+            output.listen(chip.RISING_EDGE)
+            cortex_m.unpend(chip.IO_IRQ_BANK0)
+            cortex_m.enable(chip.IO_IRQ_BANK0)
+            output.set_high()
+            spins := 0u32
+            for !EDGE.is_raised() && spins < 100_000 {
+                spins += 1
+            }
+            if EDGE.is_raised() {
+                report |= 1
+            }
+            report |= output.events_on(1) << 4
+            report |= output.events_on(0) << 8
+            output.clear_events(chip.RISING_EDGE)
+            output.ignore(chip.RISING_EDGE)
+            output.set_low()
+            cortex_m.disable(chip.IO_IRQ_BANK0)
+            cortex_m.unpend(chip.IO_IRQ_BANK0)
+            unsafe {
+                CORE1_PIN = some(output)
+            }
+        }
+        match CORE1_REPORT.store(report | (rp_multicore.core_id() << 12), atomic.Ordering.Release) {
+            ok() => {}
+            err(_) => {}
+        }
+    }
+}
+
+fn core1_gpio_checks(core1: &mut rp_multicore.Core1, pins: &mut chip.Pins, timer: &mut chip.Timer) {
+    feed_watchdog()
+    // The Pico boards' chips have 30 GPIOs; on the RP2350 take() reads it
+    // from SYSINFO's PACKAGE_SEL.
+    counted := pins.pin_count() == chip.PIN_COUNT && refused(pins.input(chip.PIN_COUNT), hal.Error.InvalidInput)
+    pin := pins.output(EVENT_PIN)!
+    unsafe {
+        CORE1_PIN = some(pin)
+    }
+    running := unsafe {
+        core1.start(&mut CORE1_STACK, Core1Pin {})!
+    }
+    start := timer.now_us()
+    for !running.is_finished() && timer.now_us() - start < 10_000 {}
+    running.stop()
+    report := 0u32
+    match CORE1_REPORT.load(atomic.Ordering.Acquire) {
+        ok(value) => {
+            report = value
+        }
+        err(_) => {}
+    }
+    quiet := !cortex_m.is_pending(chip.IO_IRQ_BANK0)
+    slot := unsafe {
+        option.take(&mut CORE1_PIN)
+    }
+    returned := false
+    if let some(back) = slot {
+        returned = true
+        pins.release(back)
+    }
+    check(counted && report == ((1u32 << 12) | (chip.RISING_EDGE << 4) | 1) && quiet && returned)
+}
+
 // The program flash and std/embedded/storage on it. The regions sit below
 // the last sector, which the RP2350 self-tests keep their record in.
 fn flash_checks(flash: &mut rp_flash.Flash, core1: &mut rp_multicore.Core1, timer: &mut chip.Timer) {
@@ -1795,6 +1875,7 @@ fn main() {
     usb_checks(&mut b.usb, &mut b.pins, &mut b.timer)
     dma_checks(&mut b.dma, &mut b.pins, &mut b.timer)
     core1_checks(&mut b.core1, &mut b.fifos, &mut b.spinlocks, &mut b.timer)
+    core1_gpio_checks(&mut b.core1, &mut b.pins, &mut b.timer)
     rng_checks(&mut b.rng)
     power_checks(&mut b.power, &mut b.usb, &mut b.pins, &mut b.timer)
     watchdog_checks(&mut b.watchdog, &mut b.timer)

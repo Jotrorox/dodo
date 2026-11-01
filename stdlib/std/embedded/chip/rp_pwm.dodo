@@ -6,8 +6,9 @@ import "std/embedded/hal"
 // datasheet 12.5). Eight slices serve GPIO 0 to 29, each a 16-bit counter
 // with two outputs, A and B: GPIO n is output A of slice (n / 2) % 8 when n
 // is even and output B when it is odd, so GPIO 0 and 16, for example, carry
-// the same output. The RP2350's slices 8 to 11 serve GPIO 32 to 47, which
-// are not supported.
+// the same output. The RP2350's slices 8 to 11 serve the RP2350B's GPIO 32
+// to 47: GPIO n is an output of slice 8 + ((n - 32) / 2) % 4, so GPIO 32
+// and 40 carry the same output (RP2350 datasheet 9.4).
 //
 // A slice counts at clk_sys / divider from 0 to its TOP and wraps. An
 // output is high while the count is below its compare value, so its duty
@@ -41,10 +42,11 @@ const CLEAR_ALIAS: usize = 0x3000
 const ENABLE: u32 = 1 << 0
 const INVERT_A: u32 = 1 << 2
 
-// The slices GPIO 0 to 29 reach.
+// The slices GPIO 0 to 31 reach.
 pub const SLICE_COUNT: u32 = 8
-// The GPIOs with a PWM output.
-pub const PIN_COUNT: u32 = 30
+// The GPIOs with a PWM output, on the chips that have them: GPIO 0 to 47.
+// The chip packages' Pins refuse GPIOs the chip lacks.
+pub const PIN_COUNT: u32 = 48
 
 // The divider is a fixed-point number in sixteenths: 16 divides by one,
 // 4095 by 255 15/16.
@@ -56,6 +58,9 @@ pub const MAX_TOP: u32 = 0xFFFE
 
 // The slice of GPIO `pin`.
 pub fn slice_of(pin: u32) -> u32 {
+    if pin >= 32 {
+        return SLICE_COUNT + ((pin - 32) / 2) % 4
+    }
     return (pin / 2) % SLICE_COUNT
 }
 
@@ -141,7 +146,7 @@ pub struct Channel<R: hal.Registers>: hal.PwmOutput {
     // Start output `output_of(pin)` of slice `slice_of(pin)` at `timing`,
     // low. If the slice's other output is already in use, the slice keeps
     // running and `timing` must be what it runs at: Busy otherwise, and Busy
-    // if this output is in use too. InvalidInput above GPIO 29.
+    // if this output is in use too. InvalidInput above GPIO 47.
     // SAFETY: `registers` must be the PWM block's, out of reset and clocked
     // at timing.clock_hz, and only Channels may use it.
     pub unsafe fn new(registers: R, pin: u32, timing: Timing) -> Channel<R>!hal.Error {
@@ -541,14 +546,15 @@ pub struct Capture<R: hal.Registers> {
     // `slice_of(pin)`, at `now_us`, in windows of `window_us`; see
     // capture_divider for the range. `slices` is the number of slices of
     // the block, 8 on the RP2040 and 12 on the RP2350, which places INTR.
-    // InvalidInput for an even pin (output A cannot count), above GPIO 29,
-    // or for a window out of range; Busy if either output of the slice is
+    // InvalidInput for an even pin (output A cannot count), above GPIO 47
+    // or on a slice the block lacks, or for a window out of range; Busy if
+    // either output of the slice is
     // in use, by a Channel or another Capture.
     // SAFETY: `registers` must be the PWM block's, out of reset and clocked
     // at `clock_hz`, and only Channels and Captures may use it; nothing
     // else may clear the slice's INTR flag.
     pub unsafe fn new(registers: R, slices: u32, clock_hz: u32, pin: u32, window_us: u32, now_us: u64) -> Capture<R>!hal.Error {
-        if pin >= PIN_COUNT || output_of(pin) != 1 {
+        if pin >= PIN_COUNT || output_of(pin) != 1 || slice_of(pin) >= slices {
             return err(hal.Error.InvalidInput)
         }
         level_divider := capture_divider(clock_hz, window_us)?
