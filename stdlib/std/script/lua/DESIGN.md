@@ -226,10 +226,22 @@ the collector rules above.
 * String metatable: lib_string creates it (`__index = string`) and must call
   `set_string_arith_metamethods(cx)` on it: 5.4 converts strings for
   arithmetic through those metamethods, not in the core.
-* Streams: `c_stdin()/c_stdout()/c_stderr()` are the process-wide C `FILE*`
-  shared with `print` and warnings (io.stdout must use them so output stays
-  ordered); `last_os_error_message()`, `cx.file_result(...)`,
-  `cx.exec_result(...)` follow luaL_fileresult/luaL_execresult.
+* Streams: `c_stdin()/c_stdout()/c_stderr()` are the C library's own
+  `stdin`/`stdout`/`stderr`, shared with `print`, warnings and io.stdin/
+  stdout/stderr so output stays ordered; `last_os_error_message()`,
+  `cx.file_result(...)`, `cx.exec_result(...)` follow
+  luaL_fileresult/luaL_execresult (errno is read through the host boundary).
+* Host boundary: C library functions whose names, constants or layouts
+  differ between Linux, macOS and Windows go through `std/script/native`
+  (adapters `std/script/posix.dodo` and `std/script/windows.dodo`, C side in
+  `std/script/runtime.c`, compiled against the target headers): errno,
+  the standard streams, 64-bit seek/tell, setvbuf modes, popen/pclose/system
+  with decoded exit statuses, time/clock/localtime/gmtime/mktime/strftime on
+  an opaque `struct tm`, setlocale categories, tmpname and getenv. Declare
+  directly (`unsafe extern "C" fn`) only functions with the same name and
+  ABI everywhere (fopen, fread, getc, remove, ...), and only once per
+  package: every file shares one namespace, so a second declaration of the
+  same C function in another `lib_*` file is a duplicate.
 * Yields: natives that call Lua and may be interrupted by a yield use
   `cx.call_k` / `cx.pcall_k` with a continuation; plain `cx.call` is
   non-yieldable ("attempt to yield across a C-call boundary").

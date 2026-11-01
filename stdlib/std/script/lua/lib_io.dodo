@@ -94,13 +94,21 @@ fn io_stream_arg(cx: &mut Cx) -> (*mut IoStream)!Throw {
     }
 }
 
-// The open stream of the handle at argument 1.
-fn io_file_arg(cx: &mut Cx) -> (*mut u8)!Throw {
+// The handle at argument 1, which must be open.
+fn io_open_stream_arg(cx: &mut Cx) -> (*mut IoStream)!Throw {
     unsafe {
         let p = io_stream_arg(cx)?
         if (*p).kind == IO_CLOSED {
             return err(cx.error_msg("attempt to use a closed file"))
         }
+        return ok(p)
+    }
+}
+
+// The open stream of the handle at argument 1.
+fn io_file_arg(cx: &mut Cx) -> (*mut u8)!Throw {
+    unsafe {
+        let p = io_open_stream_arg(cx)?
         return ok((*p).f)
     }
 }
@@ -150,16 +158,18 @@ fn io_open_checked(cx: &mut Cx, fname: LuaStr, mode: &[u8]) -> void!Throw {
     }
 }
 
-// Push the default input or output handle and return its stream.
-fn io_default_file(cx: &mut Cx, key: &str) -> (*mut u8)!Throw {
+// Push the default input or output handle (registry `key`) and return its
+// stream; `what` names it in the error for a closed one.
+fn io_default_file(cx: &mut Cx, key: &str, what: &str) -> (*mut u8)!Throw {
     unsafe {
         cx.get_field(REGISTRY_INDEX, key)?
         let p = cx.to_userdata(-1) as *mut IoStream
         if ptr.is_null(p) || (*p).kind == IO_CLOSED {
-            if key.len == IO_INPUT.len {
-                return err(cx.error_msg("default input file is closed"))
-            }
-            return err(cx.error_msg("default output file is closed"))
+            b := Buffer.new(cx)
+            b.add_str("default ")?
+            b.add_str(what)?
+            b.add_str(" file is closed")?
+            return err(cx.error_buffer(&mut b))
         }
         return ok((*p).f)
     }
@@ -411,8 +421,29 @@ fn io_read(cx: &mut Cx, f: *mut u8, first: i32, nargs: i32) -> i32!Throw {
 
 // --- Writing ----------------------------------------------------------------
 
+// Numbers are written with "%d" (integers) or "%.14g" (floats): unlike
+// tostring, an integral float gets no ".0".
+fn io_number_text(cx: &Cx, idx: i32, out: &mut[u8]) -> usize {
+    if cx.is_integer(idx) {
+        match cx.to_integer(idx) {
+            some(v) => {
+                return num_int_to_string(out, v)
+            },
+            none => {},
+        }
+    }
+    match cx.to_number(idx) {
+        some(v) => {
+            return num_format_float(out, v, b'g', 0, -1, 14)
+        },
+        none => {
+            return 0
+        },
+    }
+}
+
 // Write the `nargs` values starting at stack index `arg`; the handle to
-// return is on top. Numbers use "%d" / "%.14g".
+// return is on top.
 fn io_write(cx: &mut Cx, f: *mut u8, arg: i32, nargs: i32) -> i32!Throw {
     unsafe {
         script_host.dodo_script_clear_errno()
@@ -421,23 +452,7 @@ fn io_write(cx: &mut Cx, f: *mut u8, arg: i32, nargs: i32) -> i32!Throw {
             let idx = arg + i
             if cx.type_of(idx) == TNUMBER {
                 tmp := [0u8; 64]
-                n := 0usize
-                match cx.to_integer(idx) {
-                    some(v) => {
-                        if cx.is_integer(idx) {
-                            n = num_int_to_string(&mut tmp, v)
-                        }
-                    },
-                    none => {},
-                }
-                if n == 0 {
-                    match cx.to_number(idx) {
-                        some(v) => {
-                            n = num_format_float(&mut tmp, v, b'g', 0, -1, 14)
-                        },
-                        none => {},
-                    }
-                }
+                let n = io_number_text(cx, idx, &mut tmp)
                 status = status && fwrite(ptr.as_ptr(&tmp), 1, n, f) == n
             } else {
                 let s = cx.check_lstr(idx)?
@@ -513,7 +528,7 @@ fn io_close(cx: &mut Cx) -> i32!Throw {
 
 fn io_flush(cx: &mut Cx) -> i32!Throw {
     unsafe {
-        let f = io_default_file(cx, IO_OUTPUT)?
+        let f = io_default_file(cx, IO_OUTPUT, "output")?
         script_host.dodo_script_clear_errno()
         return cx.file_result(fflush(f) == 0, none)
     }
@@ -625,7 +640,7 @@ fn io_popen(cx: &mut Cx) -> i32!Throw {
 }
 
 fn io_read_default(cx: &mut Cx) -> i32!Throw {
-    let f = io_default_file(cx, IO_INPUT)?
+    let f = io_default_file(cx, IO_INPUT, "input")?
     // The handle pushed above is not a format.
     let nargs = cx.get_top() - 1
     return io_read(cx, f, 1, nargs)
@@ -659,7 +674,7 @@ fn io_type(cx: &mut Cx) -> i32!Throw {
 }
 
 fn io_write_default(cx: &mut Cx) -> i32!Throw {
-    let f = io_default_file(cx, IO_OUTPUT)?
+    let f = io_default_file(cx, IO_OUTPUT, "output")?
     let nargs = cx.get_top() - 1
     return io_write(cx, f, 1, nargs)
 }
@@ -667,8 +682,7 @@ fn io_write_default(cx: &mut Cx) -> i32!Throw {
 // --- File methods -------------------------------------------------------------
 
 fn io_m_close(cx: &mut Cx) -> i32!Throw {
-    io_file_arg(cx)?
-    let p = io_stream_arg(cx)?
+    let p = io_open_stream_arg(cx)?
     return io_close_stream(cx, p)
 }
 

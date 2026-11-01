@@ -112,3 +112,32 @@ It supports `-e`, `-l`, `-i`, `-v`, `-E`, `-W`, `-` and `--`, the global
 `arg` table, `LUA_INIT_5_4`/`LUA_INIT`, binary chunks and scripts that start
 with a `#!` line. Errors are reported on standard error as `lua: message`
 followed by a traceback, with exit status 1.
+
+## Standard libraries and platforms
+
+`open_libs()` opens the base, package, coroutine, string, utf8, table, math,
+io, os and debug libraries. The io and os libraries wrap the C library, so
+they follow its behaviour on each system, as the reference interpreter
+does:
+
+- `io.stdin`, `io.stdout` and `io.stderr` are the C library's standard
+  streams; `print` writes to the same stdout, so output stays ordered, and
+  stderr is unbuffered.
+- `io.popen` and `os.execute` run commands through the system shell
+  (`/bin/sh` on Linux and macOS, `cmd.exe` on Windows). On Linux and macOS a
+  process killed by a signal reports `nil, "signal", signo`; on Windows the
+  status is always the exit code. Pending output is flushed before a
+  command starts.
+- `os.date` accepts the strftime conversions of ISO C99 and POSIX (with the
+  `E` and `O` modifiers) on Linux and macOS, and the conversions of the
+  Windows C runtime (with the `#` flag) on Windows; others raise
+  `invalid conversion specifier`.
+- `os.tmpname` creates the file (`/tmp/lua_XXXXXX`) on Linux and macOS, so
+  the name cannot be taken by another process; on Windows it only returns a
+  name. File positions are 64-bit everywhere.
+- Error results use the C library's messages and errno values, for example
+  `nil, "x.txt: No such file or directory", 2`.
+
+The per-system C differences live in the `std/script/native` adapters, which
+resolve to `std/script/posix` or `std/script/windows` for the compilation
+target.
