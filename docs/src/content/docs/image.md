@@ -111,7 +111,7 @@ a display, or feed an encoder.
 `image.scratch_size(&data, &layout)` is the scratch a decode needs, computed
 from the header before any pixel work: PNG needs two rows of raw image data,
 the other formats none. The zlib decoder adds about 40 KiB of stack, the
-JPEG XL header walks (also `info` and `scratch_size`) about 20 KiB.
+JPEG XL header walks (also `info` and `scratch_size`) about 32 KiB.
 
 Every length and index in a file is checked, so untrusted files never trap.
 Errors are `Truncated`, `Malformed`, `Unsupported`, `TooLarge` (a dimension

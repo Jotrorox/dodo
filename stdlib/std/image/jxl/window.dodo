@@ -112,6 +112,7 @@ fn apply_window(f: &mut FrameHeader, w: &FrameWin) {
 }
 
 // The decode window of frame `f` (whose TOC has been read).
+@inline(never)
 fn frame_window(data: &[u8], h: &ImageHeader, f: &FrameHeader, sk: &mut Skim, win: &mut[u8]) -> FrameWin {
     if f.frame_type == FT_LF {
         return full_window(f)
@@ -181,6 +182,7 @@ struct LfInfo {
 
 // Read LfGlobal up to the global modular transforms (patches, splines and
 // the global tree skipped with the skimmer).
+@inline(never)
 fn lf_global_info(data: &[u8], h: &ImageHeader, f: &FrameHeader, sk: &mut Skim, win: &mut[u8]) -> LfInfo {
     unknown := LfInfo { known: false, windowable: false, tree_nodes: 0 }
     if f.toc_permuted && f.toc_entries > 1 {
@@ -301,6 +303,7 @@ struct TreeCount {
 }
 
 // Count the nodes and leaves of the MA tree at the reader (as read_tree).
+@inline(never)
 fn skim_tree(r: &mut Reader, limit: u64, sk: &mut Skim, win: &mut[u8]) -> TreeCount {
     unknown := TreeCount { known: false, nodes: 0, leaves: 0 }
     code := new_sk_code()
@@ -345,6 +348,7 @@ fn skim_tree(r: &mut Reader, limit: u64, sk: &mut Skim, win: &mut[u8]) -> TreeCo
 }
 
 // Skip the splines at the reader (as splines() without drawing).
+@inline(never)
 fn skim_splines(r: &mut Reader, f: &FrameHeader, sk: &mut Skim, win: &mut[u8]) -> bool {
     code := new_sk_code()
     match sk_read_code(r, 6, &mut code, sk) {
@@ -406,6 +410,7 @@ struct PatchNeed {
 // from `slot` that land in [0, cx) x [0, cy) of the frame, extend `acc` to
 // the farthest slot column and row they read. False when the dictionary
 // cannot be read.
+@inline(never)
 fn skim_patches(r: &mut Reader, h: &ImageHeader, f: &FrameHeader, sk: &mut Skim, win: &mut[u8], slot: u32, cx: u64, cy: u64, acc: &mut PatchNeed) -> bool {
     code := new_sk_code()
     match sk_read_code(r, 10, &mut code, sk) {
@@ -518,6 +523,7 @@ fn patch_reads(data: &[u8], h: &ImageHeader, f: &FrameHeader, sk: &mut Skim, win
     }
 }
 
+@inline(never)
 fn patch_reads_walk(data: &[u8], h: &ImageHeader, f: &FrameHeader, sk: &mut Skim, win: &mut[u8]) -> PatchNeed!pixels.Error {
     acc := PatchNeed { x: 0, y: 0, known: true }
     slot := f.save_as_reference

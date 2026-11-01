@@ -121,8 +121,9 @@ import "std/image/sink"
 // not fit usize (also on 32-bit targets).
 //
 // Stack: the scratch-free entry points (info, metadata, frame_info,
-// scratch_size) keep a 20 KiB skimmer state (skim.dodo) on the stack;
-// decode() and icc() do the same for their header walks.
+// scratch_size) keep the skimmer state (skim.dodo: a 4 KiB table cache and
+// a 12 KiB window) on the stack, about 32 KiB in all with their callees
+// when optimized; decode() and icc() do the same for their header walks.
 //
 // Output samples are in the native layout reported by info(): U8 for
 // integer depths up to 8, U16 up to 16, F32 for float or deeper samples
@@ -150,7 +151,7 @@ pub fn matches(data: &[u8]) -> bool {
 // Image size, native layout, bit depth, color description, orientation and
 // frame count (displayed frames of an animation). Walks every frame header.
 pub fn info(data: &[u8]) -> pixels.Header!pixels.Error {
-    sk := new_skim()
+    sk := Skim { cache: [0u16; SK_CACHE], used: 0 }
     win := [0u8; SK_WINDOW + 8]
     r := open(data)?
     h := read_headers(&mut r, &mut sk, &mut win)?
@@ -178,7 +179,7 @@ fn make_header(h: &ImageHeader, s: &Scan, data_len: usize) -> pixels.Header {
 // coded in the codestream: decode it with icc()).
 pub fn metadata(data: &[u8]) -> meta.Metadata!pixels.Error {
     result := scan_metadata(data)?
-    sk := new_skim()
+    sk := Skim { cache: [0u16; SK_CACHE], used: 0 }
     win := [0u8; SK_WINDOW + 8]
     r := open(data)?
     h := read_headers(&mut r, &mut sk, &mut win)?
@@ -191,7 +192,7 @@ pub fn metadata(data: &[u8]) -> meta.Metadata!pixels.Error {
 // Display time of displayed frame `index`: duration ticks over the
 // animation's ticks per second. Still images report 0/1.
 pub fn frame_info(data: &[u8], index: u32) -> pixels.FrameInfo!pixels.Error {
-    sk := new_skim()
+    sk := Skim { cache: [0u16; SK_CACHE], used: 0 }
     win := [0u8; SK_WINDOW + 8]
     r := open(data)?
     h := read_headers(&mut r, &mut sk, &mut win)?
@@ -456,7 +457,7 @@ fn vardct_bytes(p: &Plan) -> u64 {
 // Bytes of scratch decode() and decode_frame() need for this file
 // (also enough for icc()).
 pub fn scratch_size(data: &[u8]) -> usize!pixels.Error {
-    sk := new_skim()
+    sk := Skim { cache: [0u16; SK_CACHE], used: 0 }
     win := [0u8; SK_WINDOW + 8]
     r := open(data)?
     h := read_headers(&mut r, &mut sk, &mut win)?
@@ -477,7 +478,7 @@ pub fn decode<S: sink.Sink>(data: &[u8], output: &mut S, buffer: &mut[u8]) -> vo
 // animation shows), composited over earlier frames as the format
 // specifies.
 pub fn decode_frame<S: sink.Sink>(data: &[u8], index: u32, output: &mut S, buffer: &mut[u8]) -> void!pixels.Error {
-    sk := new_skim()
+    sk := Skim { cache: [0u16; SK_CACHE], used: 0 }
     win := [0u8; SK_WINDOW + 8]
     r := open(data)?
     h := read_headers(&mut r, &mut sk, &mut win)?
@@ -719,7 +720,7 @@ fn first_needed_frame(data: &[u8], h: &ImageHeader, index: u32, sk: &mut Skim, w
 // Malformed for files without one. `scratch` needs scratch_size(data)
 // bytes.
 pub fn icc(data: &[u8], output: &mut[u8], buffer: &mut[u8]) -> usize!pixels.Error {
-    sk := new_skim()
+    sk := Skim { cache: [0u16; SK_CACHE], used: 0 }
     win := [0u8; SK_WINDOW + 8]
     r := open(data)?
     h := read_headers(&mut r, &mut sk, &mut win)?

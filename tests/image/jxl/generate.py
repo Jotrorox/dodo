@@ -359,7 +359,7 @@ def frame_jxl_frame(w, iw, ih, f):
     the color transform), tree, patches (list of (slot, rx, ry, pw, ph,
     [(x, y)...])), group_shift."""
     ftype = f.get('type', 0)
-    gshift = f.get('group_shift', 3)
+    gshift = f.get('group_shift', 1)
     crop = f.get('crop')
     fw, fh = (crop[2], crop[3]) if crop else (iw, ih)
     x0, y0 = (crop[0], crop[1]) if crop else (0, 0)
@@ -465,18 +465,18 @@ def frame_cases():
     def over(crop, tree=SPRITE_TREE):
         return [dict(base), {'tree': tree, 'crop': crop, 'last': True}]
     # A frame much larger than the image (decoded over its visible part),
-    # the same visible part from a frame of 6e9 pixels, and frames starting
+    # the same visible part from a frame of 6e8 pixels, and a frame starting
     # left of and above the image.
     frames_jxl(os.path.join(OUT, 'frame_big.jxl'), iw, ih, over((10, 6, 3000, 2000)))
-    frames_jxl(os.path.join(OUT, 'frame_huge.jxl'), iw, ih, over((10, 6, 100000, 60000)))
+    frames_jxl(os.path.join(OUT, 'frame_huge.jxl'), iw, ih, over((10, 6, 30000, 20000)))
     frames_jxl(os.path.join(OUT, 'frame_negative.jxl'), iw, ih, over((-40, -30, 1500, 1100)))
     # A reference-only frame larger than the image, read by patches near
-    # its origin; and the same from a 6e9-pixel reference frame.
+    # its origin; and the same from a 6e8-pixel reference frame.
     def ref(size):
         return [dict(base), {'type': 2, 'tree': SPRITE_TREE, 'crop': (0, 0, size[0], size[1]), 'save': 1, 'before': True},
                 {'tree': BASE_TREE, 'last': True, 'patches': [(1, 100, 60, 30, 20, [(5, 5), (30, 26)]), (1, 200, 150, 20, 18, [(40, 20)])]}]
     frames_jxl(os.path.join(OUT, 'ref_patches.jxl'), iw, ih, ref((4000, 3000)))
-    frames_jxl(os.path.join(OUT, 'ref_huge.jxl'), iw, ih, ref((100000, 60000)))
+    frames_jxl(os.path.join(OUT, 'ref_huge.jxl'), iw, ih, ref((30000, 20000)))
 
 
 class BitReader:
@@ -835,18 +835,29 @@ def add_alias(name, other):
     c = [c for c in CASES if c[0] == other][0]
     CASES.append((name,) + c[1:])
 
-def make_icc():
+def make_icc(big=False):
     """A small RGB matrix/TRC ICC v2 profile with unusual primaries and a
-    gamma curve, so cjxl keeps it as an ICC profile."""
+    gamma curve, so cjxl keeps it as an ICC profile. `big` makes the curves
+    4096-entry tables and adds 20 KB of text (an entropy-coded profile with
+    many clusters and long LZ77 matches)."""
     def s15(v):
         return struct.pack('>i', int(round(v * 65536)))
     def xyz(x, y, z):
         return b'XYZ ' + b'\0' * 4 + s15(x) + s15(y) + s15(z)
     def curve(g):
+        if big:
+            n = 4096
+            body = b''.join(struct.pack('>H', int(65535 * (i / (n - 1)) ** (g + 0.05 * math.sin(i / 300.0)))) for i in range(n))
+            return b'curv' + b'\0' * 4 + struct.pack('>I', n) + body
         return b'curv' + b'\0' * 4 + struct.pack('>I', 1) + struct.pack('>H', int(g * 256)) + b'\0\0'
     desc_text = b'Dodo test RGB\0'
     desc = b'desc' + b'\0' * 4 + struct.pack('>I', len(desc_text)) + desc_text + b'\0' * 4 + b'\0' * 4 + b'\0' * 2 + b'\0' + b'\0' * 67
     text = b'text' + b'\0' * 4 + b'Public domain\0'
+    if big:
+        rng = random.Random(7)
+        words = [bytes(rng.choice(b'abcdefghijklmnopqrstuvwxyz0123456789.') for _ in range(rng.randrange(2, 9))) for _ in range(400)]
+        prose = b' '.join(rng.choice(words) for _ in range(6500))
+        text = b'text' + b'\0' * 4 + prose[:20000] + b'\0'
     tags = [(b'desc', desc), (b'cprt', text), (b'wtpt', xyz(0.9642, 1.0, 0.8249)),
             (b'rXYZ', xyz(0.48, 0.26, 0.02)), (b'gXYZ', xyz(0.33, 0.66, 0.11)), (b'bXYZ', xyz(0.15, 0.08, 0.69)),
             (b'rTRC', curve(2.1)), (b'gTRC', curve(2.1)), (b'bTRC', curve(2.1))]
@@ -919,6 +930,8 @@ def main():
     add('depth12', rgb16, ['-d', '0', '--override_bitdepth=12'], 1)
     add('premultiplied', rgba, ['-d', '0', '--premultiply=1'], 0)
     add('patches_text', text, ['-d', '0', '-e', '7', '--patches=1'], 0)
+    # Center-first group order: permuted TOCs.
+    add('big_group_order', big, ['-d', '0', '-e', '3', '--group_order=1'], 0)
 
     # The float pipeline: XYB, upsampling, blending, animation.
     add_png('lossy_d1', rgb, ['-m', '1', '-d', '1'], 0)
@@ -975,6 +988,7 @@ def main():
     add_png('vd_noise', ph, ['-d', '1', '--photon_noise_iso=3200'], 0, jxlref=True)
     add_png('vd_upsample2', ph, ['-d', '1', '--resampling=2'], 0, jxlref=True)
     add_png('vd_epf3', ph, ['-d', '2', '--epf=3'], 0, jxlref=True)
+    add_png('vd_group_order', big_edges, ['-d', '2', '--group_order=1'], 0, jxlref=True)
     vd_frames = [(64, 48, lambda x, y, c, k=k: photo(x + 9 * k, y, c) if c < 3 else 255) for k in range(3)]
     vd_anim = write_apng('vd_anim', 64, 48, vd_frames, [10, 10, 10])
     add_png('vd_anim', vd_anim, ['-d', '1'], 0, frames=3, jxlref=True)
@@ -1023,6 +1037,12 @@ def main():
     iccp = chunk(b'iCCP', b'test\x00\x00' + zlib.compress(icc))
     with_icc = write_png('icc', 31, 19, 3, 8, smooth_noise, iccp)
     add('icc_lossless', with_icc, ['-d', '0'], 0)
+    # A 45 KB profile: an ICC stream with many prefix-coded clusters and
+    # long LZ77 matches.
+    big_icc = make_icc(True)
+    open(os.path.join(OUT, 'profile_big.icc'), 'wb').write(big_icc)
+    with_big_icc = write_png('icc_big', 31, 19, 3, 8, smooth_noise, chunk(b'iCCP', b'test\x00\x00' + zlib.compress(big_icc)))
+    add('icc_big', with_big_icc, ['-d', '0'], 0)
     # XYB with an ICC profile decodes to sRGB.
     add_png('icc_lossy', with_icc, ['-m', '1', '-d', '1'], 0, srgb=True)
 

@@ -5,8 +5,9 @@ import "std/image/pixels"
 // Entropy decoding in small fixed storage, for the walks that run without
 // caller scratch: info(), metadata(), frame_info(), scratch_size() and the
 // planning pass of decode() skip the entropy-coded ICC profile and permuted
-// TOCs and read patch dictionaries with it. The whole state fits a few
-// KiB of stack (see Skim):
+// TOCs and read patch dictionaries, MA trees and splines with it. Its
+// whole state is 16 KiB of stack (a 4 KiB table cache and a 12 KiB window)
+// plus about 1 KiB per Code being read:
 //
 // * A SkCode keeps the context map (at most SK_DIST contexts), the
 //   per-cluster hybrid configs and the bit position of each cluster's
@@ -25,12 +26,13 @@ import "std/image/pixels"
 //   whole stream anyway). Copies from farther back than the window keeps
 //   fail TooLarge (ICC, TOC) or report `too_far` (callers fall back).
 
-// Contexts of a stored context map (ICC: 41 plus the LZ77 distance).
-const SK_DIST: usize = 64
-// Clusters of a SkCode.
-const SK_CLUSTERS: usize = 48
-// u16 words of the table cache.
-const SK_CACHE: usize = 4096
+// Contexts of a stored context map (ICC: 41 plus the LZ77 distance) and
+// clusters of a SkCode.
+const SK_DIST: usize = 42
+const SK_CLUSTERS: usize = 42
+// u16 words of the table cache (two ANS tables of 256 entries, or prefix
+// codes of about 2000 symbols in all; more are rebuilt on demand).
+const SK_CACHE: usize = 2048
 // Bytes of the LZ77 window: 32768 3-bit classes or 2048 whole values.
 const SK_WINDOW: usize = 12288
 
@@ -53,10 +55,6 @@ struct Skim {
     used: usize
 }
 
-fn new_skim() -> Skim {
-    return Skim { cache: [0u16; SK_CACHE], used: 0 }
-}
-
 struct SkCode {
     map: [SK_DIST]u8
     num_dist: u32
@@ -71,17 +69,17 @@ struct SkCode {
     // Bit position of each cluster's prefix code or histogram.
     start: [SK_CLUSTERS]u64
     // Prefix code alphabet size.
-    count: [SK_CLUSTERS]u32
+    count: [SK_CLUSTERS]u16
     // Cache offset + 1 of the built table (0: not built).
-    slot: [SK_CLUSTERS]u32
+    slot: [SK_CLUSTERS]u16
     // Symbol + 1 of a cluster that always yields one symbol (no table).
-    single: [SK_CLUSTERS]u32
+    single: [SK_CLUSTERS]u16
     // Cache words of the cluster's table.
-    words: [SK_CLUSTERS]u32
+    words: [SK_CLUSTERS]u16
 }
 
 fn new_sk_code() -> SkCode {
-    return SkCode { map: [0u8; SK_DIST], num_dist: 0, num_clusters: 0, lz77: false, min_symbol: 0xffffffff, min_length: 0, lz_config: 0, prefix: false, log_alpha: 0, config: [0u32; SK_CLUSTERS], start: [0u64; SK_CLUSTERS], count: [0u32; SK_CLUSTERS], slot: [0u32; SK_CLUSTERS], single: [0u32; SK_CLUSTERS], words: [0u32; SK_CLUSTERS] }
+    return SkCode { map: [0u8; SK_DIST], num_dist: 0, num_clusters: 0, lz77: false, min_symbol: 0xffffffff, min_length: 0, lz_config: 0, prefix: false, log_alpha: 0, config: [0u32; SK_CLUSTERS], start: [0u64; SK_CLUSTERS], count: [0u16; SK_CLUSTERS], slot: [0u16; SK_CLUSTERS], single: [0u16; SK_CLUSTERS], words: [0u16; SK_CLUSTERS] }
 }
 
 // The ICC byte class (0 letter, 1 digit or '.' ',', 2 zero, 3 one,
@@ -340,7 +338,7 @@ fn sk_symbol(code: &mut SkCode, sk: &mut Skim, st: &mut SkStream, r: &mut Reader
         return 0
     }
     if code.single[ci] != 0 && code.prefix {
-        return code.single[ci] - 1
+        return code.single[ci] as u32 - 1
     }
     if code.slot[ci] == 0 {
         e := sk_build(code, sk, r, ci)
@@ -410,7 +408,7 @@ fn sk_build(code: &mut SkCode, sk: &mut Skim, r: &mut Reader, ci: usize) -> u32 
     e := SK_OK
     used := 0usize
     if code.prefix {
-        match sk_prefix_build(r, code.count[ci], &mut sk.cache[base..]) {
+        match sk_prefix_build(r, code.count[ci] as u32, &mut sk.cache[base..]) {
             ok(n) => {
                 used = n
             }
@@ -434,7 +432,7 @@ fn sk_build(code: &mut SkCode, sk: &mut Skim, r: &mut Reader, ci: usize) -> u32 
         return e
     }
     sk.used = base + used
-    code.slot[ci] = (base + 1) as u32
+    code.slot[ci] = (base + 1) as u16
     return SK_OK
 }
 
@@ -522,7 +520,7 @@ fn sk_read_tables(r: &mut Reader, code: &mut SkCode, sk: &mut Skim) -> void!pixe
             if count > 32768 {
                 return err(pixels.Error.Malformed)
             }
-            code.count[c] = count
+            code.count[c] = count as u16
         }
         for c in 0usize..clusters {
             code.start[c] = r.position()
@@ -531,9 +529,9 @@ fn sk_read_tables(r: &mut Reader, code: &mut SkCode, sk: &mut Skim) -> void!pixe
                 continue
             }
             words := 0u32
-            single := sk_prefix_check(r, code.count[c], &mut words)?
-            code.single[c] = single
-            code.words[c] = words
+            single := sk_prefix_check(r, code.count[c] as u32, &mut words)?
+            code.single[c] = single as u16
+            code.words[c] = words as u16
         }
     } else {
         code.log_alpha = 5 + r.bits(2)
@@ -542,7 +540,7 @@ fn sk_read_tables(r: &mut Reader, code: &mut SkCode, sk: &mut Skim) -> void!pixe
         }
         for c in 0usize..clusters {
             code.start[c] = r.position()
-            code.words[c] = sk_ans(r, code.log_alpha, &mut sk.cache)? as u32
+            code.words[c] = sk_ans(r, code.log_alpha, &mut sk.cache)? as u16
         }
     }
     sk.used = 0

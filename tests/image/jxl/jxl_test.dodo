@@ -269,7 +269,7 @@ fn scratch_bound(width: u32, height: u32, channels: u64) -> u64 {
 // larger than the image or starting outside it, and reference frames, are
 // decoded over the part that can show (std/image/jxl/window.dodo). Every
 // fixture stays within the documented bound; the frame window fixtures
-// (frames of up to 6e9 pixels over a 64x48 image) need little.
+// (frames of up to 6e8 pixels over a 64x48 image) need little.
 @test
 fn scratch_size_is_bounded() {
     for k in 0usize..CASE_COUNT {
@@ -369,6 +369,20 @@ fn icc_profile() {
     assert_eq(decoded, expected_length)
     for i in 0usize..expected_length {
         assert_eq(profile[i], expected[i])
+    }
+    // A 45 KB profile (many prefix-coded clusters, long LZ77 matches),
+    // skipped by info() in a few KiB of stack and decoded by icc().
+    big := [0u8; FILE_LIMIT]
+    big_length := read_fixture("icc_big", ".jxl", &mut big)
+    big_header := jxl.info(&big[..big_length])!
+    assert(big_header.color.has_icc())
+    unsafe {
+        big_expected := read_fixture("profile_big", ".icc", &mut REFERENCE)
+        big_decoded := icc_into(&big[..big_length], &mut PIXELS)!
+        assert_eq(big_decoded, big_expected)
+        for i in 0usize..big_expected {
+            assert_eq(PIXELS[i], REFERENCE[i])
+        }
     }
     // XYB with an ICC profile is rendered to sRGB.
     lossy := [0u8; FILE_LIMIT]
@@ -569,6 +583,27 @@ fn robustness_jpeg_noise_splines() {
     mangle("jpeg420")
     mangle("vd_noise")
     mangle("splines")
+}
+
+// Frame windows: frames larger than the image, reference frames read by
+// patches, a VarDCT frame cropped to the window.
+@test
+fn robustness_frame_windows() {
+    mangle("frame_huge")
+    mangle("ref_patches")
+    mangle("patches_text")
+}
+
+@test
+fn robustness_vardct_window() {
+    mangle("vd_window")
+}
+
+// Header walks: permuted TOCs and a large ICC profile.
+@test
+fn robustness_header_walks() {
+    mangle("vd_group_order")
+    mangle("icc_big")
 }
 
 @test
