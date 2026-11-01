@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- `gpu.wgsl("...")` writes a std/gpu shader once in WGSL: the compiler
+  translates it into SPIR-V, Metal Shading Language and GLSL 4.50 when the
+  program is built (through the `naga` crate, behind the new default `wgsl`
+  feature), so one source runs on Vulkan, Metal and OpenGL with no shader
+  tools installed. Mistakes are compile errors pointing into the literal.
+  Slot N is `@group(0) @binding(N)`, and a sampled texture's sampler is
+  `@group(1) @binding(N)`. See [Shaders in WGSL](docs/src/content/docs/gpu.md).
 - New database packages. `std/db` holds the shared vocabulary for drivers:
   `db.Error` with portable `db.ErrorKind`s and `db.Constraint`s plus the
   driver's native code, the borrowed `db.Value`, and `db.IsolationLevel`.

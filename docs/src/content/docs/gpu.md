@@ -217,6 +217,63 @@ The same GLSL also compiles for Vulkan, which needs `gl_VertexIndex` where
 OpenGL has `gl_VertexID`; glslangValidator defines `VULKAN` to tell them
 apart.
 
+## Shaders in WGSL
+
+`gpu.wgsl` takes a shader written once in [WGSL](https://www.w3.org/TR/WGSL/)
+and translates it when the program is compiled, into SPIR-V, Metal Shading
+Language and GLSL 4.50, so one source runs on every backend with no tools to
+install:
+
+```dodo
+fn kernels() -> gpu.ShaderSource from(static) {
+    return gpu.wgsl(
+        "@group(0) @binding(0) var<uniform> a: f32;",
+        "@group(0) @binding(1) var<storage, read> x: array<f32>;",
+        "@group(0) @binding(2) var<storage, read_write> y: array<f32>;",
+        "",
+        "@compute @workgroup_size(64)",
+        "fn saxpy(@builtin(global_invocation_id) id: vec3<u32>) {",
+        "    y[id.x] = a * x[id.x] + y[id.x];",
+        "}"
+    )
+}
+```
+
+The arguments are string literals, one or more, joined with line breaks; a
+mistake in the shader is a compile error that points into the literal. The
+result is an ordinary `ShaderSource` whose SPIR-V lives in static storage,
+so it can be bound to a local (`source := gpu.wgsl(...)`) or returned from a
+function declared `from(static)` as above, and passed to pipeline
+descriptors like any other. A module may hold many entry points; pass the
+WGSL function's name as the entry point, the same on every backend.
+
+Bindings use std/gpu's slots:
+
+| WGSL | std/gpu |
+| --- | --- |
+| `@group(0) @binding(n) var<uniform>` | `BindingLayout.uniform_buffer(n, stages)` |
+| `@group(0) @binding(n) var<storage, read_write>` or `var<storage, read>` | `storage_buffer` or `read_only_storage_buffer` |
+| `@group(0) @binding(n) var t: texture_2d<f32>` and `@group(1) @binding(n) var s: sampler` | `sampled_texture(n, stages)`, bound with `set_texture(n, texture, sampler)` |
+| `@group(0) @binding(n) var t: texture_storage_2d<r32uint, write>` | `storage_texture(n, stages, gpu.FORMAT_R32_UINT)` |
+| `@location(l)` input of a `@vertex` function | `VertexAttribute.new(l, format, offset)` |
+
+So samplers sit in `@group(1)`, at the binding of the texture they are read
+with in `@group(0)`; every other resource is in `@group(0)`, at slots 0 to
+15. Different entry points of one module may use the same slot for
+different resources. Clip space and depth are as WGSL defines them, which is
+what std/gpu uses on every backend. The translation is done by
+[naga](https://github.com/gfx-rs/wgpu/tree/trunk/naga), and refuses what
+some backend cannot run as std/gpu drives it:
+
+- `arrayLength` (Metal would need buffer sizes std/gpu does not pass): put
+  the length in a uniform buffer.
+- Immediate data (push constants): use a uniform buffer.
+- Entry point names Metal reserves, such as `main`, and names that are not
+  ASCII identifiers.
+
+A compiler built without its default `wgsl` feature reports `gpu.wgsl` calls
+as errors; `ShaderSource` with hand-written languages keeps working.
+
 ## Pipelines
 
 ```dodo

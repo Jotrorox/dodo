@@ -24,6 +24,7 @@ pub mod pio;
 pub mod project;
 pub mod sema;
 pub mod toml;
+pub mod wgsl;
 
 #[cfg(any(feature = "llvm", test))]
 mod file_uri;
