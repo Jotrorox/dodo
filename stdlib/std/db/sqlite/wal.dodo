@@ -131,7 +131,7 @@ static mut WAL_USERS: [16]u32 = [0u32; 16]
 fn path_hash(e: &Engine) -> u64 {
     h := 14695981039346656037u64
     for i in 0usize..e.path_len {
-        h = core.wrapping_mul(h ^ (e.ws[i] as u64), 1099511628211u64)
+        h = core.wrapping_mul(h ^ (e.ws[e.path_off + i] as u64), 1099511628211u64)
     }
     if h == 0 {
         1u64
@@ -1440,10 +1440,11 @@ fn wal_append(e: &mut Engine, pgno: u32, src: usize, commit: u32) -> void!db.Err
 // carries the database size), syncs the log and publishes the header.
 fn wal_commit(e: &mut Engine) -> void!db.Error {
     last := e.nslots
+    db := e.cur_db as u8
     for s in 0usize..e.nslots {
         m := slot_meta(e, s)
         pgno := ld32(e.ws, m)
-        if pgno != 0 && e.ws[m + 4] != 0 {
+        if pgno != 0 && e.ws[m + 4] != 0 && e.ws[m + 5] == db {
             if pgno <= e.db_pages {
                 last = s
             } else {
@@ -1458,7 +1459,7 @@ fn wal_commit(e: &mut Engine) -> void!db.Error {
     for s in 0usize..(last + 1) {
         m := slot_meta(e, s)
         pgno := ld32(e.ws, m)
-        if pgno != 0 && e.ws[m + 4] != 0 {
+        if pgno != 0 && e.ws[m + 4] != 0 && e.ws[m + 5] == db {
             let size = if s == last {
                 e.db_pages
             } else {

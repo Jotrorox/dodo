@@ -1,0 +1,747 @@
+package sqlite
+
+import "core/mem"
+import "std/db"
+import "std/fs"
+import "std/platform"
+import "std/platform/error"
+
+// Attached databases. Index 0 is main, 1 the TEMP database (an in-memory
+// database opened on first use), 2.. the attached ones in attach order
+// (DETACH closes the gap, as SQLite does). The Engine's pager fields hold
+// the state of the current database; use_db parks it in `dbs` (scalars) and
+// `dfile`/`djournal`/`dw` (files and WAL state) and brings another one in.
+// Pages of every database share one cache whose slots carry the database
+// index; cursors remember theirs and switch at their entry points.
+
+const DB_MAX: usize = 12
+const DB_TEMP: usize = 1
+const MAX_ATTACHED: usize = 10
+const NO_DB: usize = 255
+const NAME_CAP: usize = 128
+// Names of all databases, then the paths of attached ones (main's path is
+// at offset 0).
+const DB_AREA: usize = 1536
+const DB_AREA_BYTES: usize = 11776
+
+struct DbSaved {
+    used: bool
+    area: usize
+    name_len: usize
+    memory: bool
+    readonly: bool
+    path_off: usize
+    path_len: usize
+    page_size: usize
+    usable: usize
+    reserved: usize
+    db_pages: u32
+    file_pages: u32
+    disk_pages: u32
+    lock: u32
+    shared_byte: u64
+    write_txn: bool
+    journal_open: bool
+    journal_synced: bool
+    journal_records: u32
+    journal_nonce: u32
+    db_written: bool
+    initialized: bool
+    schema_format: u32
+    change_counter: u32
+    schema_cookie: u32
+    bm_base: usize
+    bm_len: usize
+}
+
+fn db_saved_new() -> DbSaved {
+    DbSaved {
+        used: false, area: 0, name_len: 0, memory: false, readonly: false, path_off: 0, path_len: 0,
+        page_size: 4096, usable: 4096, reserved: 0, db_pages: 0, file_pages: 0, disk_pages: 0,
+        lock: 0, shared_byte: 0, write_txn: false, journal_open: false, journal_synced: false,
+        journal_records: 0, journal_nonce: 0, db_written: false, initialized: false,
+        schema_format: 4, change_counter: 0, schema_cookie: 0, bm_base: 0, bm_len: 0,
+    }
+}
+
+fn dbs_new() -> [12]DbSaved {
+    [
+        db_saved_new(), db_saved_new(), db_saved_new(), db_saved_new(), db_saved_new(), db_saved_new(),
+        db_saved_new(), db_saved_new(), db_saved_new(), db_saved_new(), db_saved_new(), db_saved_new(),
+    ]
+}
+
+fn wals_new() -> [12]WalState {
+    [
+        wal_state_new(), wal_state_new(), wal_state_new(), wal_state_new(), wal_state_new(), wal_state_new(),
+        wal_state_new(), wal_state_new(), wal_state_new(), wal_state_new(), wal_state_new(), wal_state_new(),
+    ]
+}
+
+fn name_area(a: usize) -> usize {
+    DB_AREA + a * NAME_CAP
+}
+
+fn path_area(a: usize) -> usize {
+    DB_AREA + DB_MAX * NAME_CAP + (a - 2) * PATH_CAP
+}
+
+// Sets up main (index 0) and the unopened TEMP slot.
+fn dbs_init(e: &mut Engine) {
+    e.dbs[0].used = true
+    e.dbs[0].area = 0
+    e.dbs[1].area = 1
+    e.dbs[1].memory = true
+    e.ndb = 2
+    let n0 = name_area(0)
+    copy_in(e.ws, n0, mem_bytes("main"))
+    e.dbs[0].name_len = 4
+    let n1 = name_area(1)
+    copy_in(e.ws, n1, mem_bytes("temp"))
+    e.dbs[1].name_len = 4
+}
+
+fn save_db(e: &mut Engine) {
+    k := e.cur_db
+    e.dbs[k].memory = e.memory
+    e.dbs[k].readonly = e.readonly
+    e.dbs[k].path_off = e.path_off
+    e.dbs[k].path_len = e.path_len
+    e.dbs[k].page_size = e.page_size
+    e.dbs[k].usable = e.usable
+    e.dbs[k].reserved = e.reserved
+    e.dbs[k].db_pages = e.db_pages
+    e.dbs[k].file_pages = e.file_pages
+    e.dbs[k].disk_pages = e.disk_pages
+    e.dbs[k].lock = e.lock
+    e.dbs[k].shared_byte = e.shared_byte
+    e.dbs[k].write_txn = e.write_txn
+    e.dbs[k].journal_open = e.journal_open
+    e.dbs[k].journal_synced = e.journal_synced
+    e.dbs[k].journal_records = e.journal_records
+    e.dbs[k].journal_nonce = e.journal_nonce
+    e.dbs[k].db_written = e.db_written
+    e.dbs[k].initialized = e.initialized
+    e.dbs[k].schema_format = e.schema_format
+    e.dbs[k].change_counter = e.change_counter
+    e.dbs[k].schema_cookie = e.schema_cookie
+    e.dbs[k].bm_base = e.bm_base
+    e.dbs[k].bm_len = e.bm_len
+}
+
+fn load_db(e: &mut Engine, k: usize) {
+    e.memory = e.dbs[k].memory
+    e.readonly = e.dbs[k].readonly
+    e.path_off = e.dbs[k].path_off
+    e.path_len = e.dbs[k].path_len
+    e.page_size = e.dbs[k].page_size
+    e.usable = e.dbs[k].usable
+    e.reserved = e.dbs[k].reserved
+    e.db_pages = e.dbs[k].db_pages
+    e.file_pages = e.dbs[k].file_pages
+    e.disk_pages = e.dbs[k].disk_pages
+    e.lock = e.dbs[k].lock
+    e.shared_byte = e.dbs[k].shared_byte
+    e.write_txn = e.dbs[k].write_txn
+    e.journal_open = e.dbs[k].journal_open
+    e.journal_synced = e.dbs[k].journal_synced
+    e.journal_records = e.dbs[k].journal_records
+    e.journal_nonce = e.dbs[k].journal_nonce
+    e.db_written = e.dbs[k].db_written
+    e.initialized = e.dbs[k].initialized
+    e.schema_format = e.dbs[k].schema_format
+    e.change_counter = e.dbs[k].change_counter
+    e.schema_cookie = e.dbs[k].schema_cookie
+    e.bm_base = e.dbs[k].bm_base
+    e.bm_len = e.dbs[k].bm_len
+}
+
+// Makes database k current.
+fn use_db(e: &mut Engine, k: usize) {
+    if k == e.cur_db {
+        return
+    }
+    core.assert(k < DB_MAX)
+    save_db(e)
+    c := e.cur_db
+    mem.swap(&mut e.file, &mut e.dfile[c])
+    mem.swap(&mut e.journal, &mut e.djournal[c])
+    mem.swap(&mut e.w, &mut e.dw[c])
+    mem.swap(&mut e.file, &mut e.dfile[k])
+    mem.swap(&mut e.journal, &mut e.djournal[k])
+    mem.swap(&mut e.w, &mut e.dw[k])
+    load_db(e, k)
+    e.cur_db = k
+}
+
+fn db_used(e: &Engine, k: usize) -> bool {
+    k < e.ndb && e.dbs[k].used
+}
+
+fn db_is_memory(e: &Engine, k: usize) -> bool {
+    if k == e.cur_db {
+        return e.memory
+    }
+    e.dbs[k].memory
+}
+
+fn db_writing(e: &Engine, k: usize) -> bool {
+    if k == e.cur_db {
+        return e.write_txn
+    }
+    e.dbs[k].used && e.dbs[k].write_txn
+}
+
+fn db_pages_of(e: &Engine, k: usize) -> u32 {
+    if k == e.cur_db {
+        return e.db_pages
+    }
+    e.dbs[k].db_pages
+}
+
+fn db_page_size(e: &Engine, k: usize) -> usize {
+    if k == e.cur_db {
+        return e.page_size
+    }
+    e.dbs[k].page_size
+}
+
+fn db_path_len(e: &Engine, k: usize) -> usize {
+    if k == e.cur_db {
+        return e.path_len
+    }
+    e.dbs[k].path_len
+}
+
+fn db_path_off(e: &Engine, k: usize) -> usize {
+    if k == e.cur_db {
+        return e.path_off
+    }
+    e.dbs[k].path_off
+}
+
+fn db_wal_open(e: &Engine, k: usize) -> bool {
+    if k == e.cur_db {
+        return e.w.open
+    }
+    e.dw[k].open
+}
+
+fn db_name_off(e: &Engine, k: usize) -> usize {
+    name_area(e.dbs[k].area)
+}
+
+fn db_name_len(e: &Engine, k: usize) -> usize {
+    e.dbs[k].name_len
+}
+
+fn any_write(e: &Engine) -> bool {
+    for k in 0usize..e.ndb {
+        if db_used(e, k) && db_writing(e, k) {
+            return true
+        }
+    }
+    false
+}
+
+// Database index for a schema name (open databases only), or NO_DB.
+// "temp" also names the TEMP database before it is opened when `temp_ok`.
+fn db_find(e: &Engine, o: usize, l: usize) -> usize {
+    for k in 0usize..e.ndb {
+        if k == DB_TEMP {
+            if name_is(e, o, l, "temp") {
+                return DB_TEMP
+            }
+            continue
+        }
+        if !e.dbs[k].used {
+            continue
+        }
+        let no = db_name_off(e, k)
+        let nl = db_name_len(e, k)
+        if names_eq(e, no, nl, o, l) {
+            return k
+        }
+    }
+    if name_is(e, o, l, "main") {
+        return 0
+    }
+    NO_DB
+}
+
+// "<main path><suffix>" (the statement and super-journals are named after
+// the main database).
+fn main_side_path(e: &Engine, suffix: &str, out: &mut[u8]) -> usize {
+    n := db_path_len(e, 0)
+    o := db_path_off(e, 0)
+    for i in 0usize..n {
+        out[i] = e.ws[o + i]
+    }
+    s := mem.str_bytes(suffix)
+    for i in 0usize..s.len {
+        out[n + i] = s[i]
+    }
+    n + s.len
+}
+
+// Opens the TEMP database (in memory) if it is not open yet.
+fn temp_open(e: &mut Engine) -> void!db.Error {
+    if e.dbs[DB_TEMP].used {
+        return ok()
+    }
+    here := e.cur_db
+    use_db(e, DB_TEMP)
+    ps := if e.slot_ps < 4096 {
+        e.slot_ps
+    } else {
+        4096usize
+    }
+    e.memory = true
+    e.readonly = false
+    e.path_off = 0
+    e.path_len = 0
+    e.page_size = ps
+    e.usable = ps
+    e.reserved = 0
+    e.db_pages = 0
+    e.file_pages = 0
+    e.disk_pages = 0
+    e.lock = LOCK_NONE
+    e.write_txn = false
+    e.journal_open = false
+    e.initialized = false
+    e.schema_format = 4
+    e.change_counter = 0
+    e.schema_cookie = 0
+    e.bm_len = 0
+    e.dbs[DB_TEMP].used = true
+    if e.explicit_txn {
+        // A transaction's other databases hold their read locks.
+        e.lock = LOCK_SHARED
+    }
+    init_new_db_state(e)
+    sp_column_unknown(e, DB_TEMP)
+    use_db(e, here)
+    ok()
+}
+
+// Marks database k's size as unknown in every savepoint level.
+fn sp_column_unknown(e: &mut Engine, k: usize) {
+    for i in 0usize..(SP_MAX + 1) {
+        o := sp_entry(e, i) + 12 + 4 * k
+        st32(e.ws, o, SP_UNKNOWN)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Transactions over every database
+
+fn begin_read_all(e: &mut Engine) -> void!db.Error {
+    here := e.cur_db
+    for k in 0usize..e.ndb {
+        if !db_used(e, k) {
+            continue
+        }
+        use_db(e, k)
+        match begin_read(e) {
+            ok() => {},
+            err(reason) => {
+                use_db(e, here)
+                return err(reason)
+            },
+        }
+    }
+    use_db(e, here)
+    ok()
+}
+
+fn end_read_all(e: &mut Engine) {
+    here := e.cur_db
+    for k in 0usize..e.ndb {
+        if db_used(e, k) {
+            use_db(e, k)
+            end_read(e)
+        }
+    }
+    use_db(e, here)
+}
+
+fn unlock_all(e: &mut Engine, keep_shared: bool) {
+    here := e.cur_db
+    for k in 0usize..e.ndb {
+        if db_used(e, k) {
+            use_db(e, k)
+            unlock_to(e, keep_shared)
+        }
+    }
+    use_db(e, here)
+}
+
+fn clear_read_fresh(e: &mut Engine) {
+    e.w.read_fresh = false
+    for k in 0usize..DB_MAX {
+        e.dw[k].read_fresh = false
+    }
+}
+
+// Commits every database's write transaction. When more than one database
+// file (not TEMP, not in-memory, not WAL) changed, a super-journal makes the
+// commit atomic, as in SQLite: its name goes into every journal before any
+// database file is written, and deleting it is the commit point.
+fn commit(e: &mut Engine) -> void!db.Error {
+    here := e.cur_db
+    r := commit_all(e)
+    use_db(e, here)
+    r?
+    sp_reset(e)
+    e.bm_used = 0
+    ok()
+}
+
+fn commit_participant(e: &Engine, k: usize) -> bool {
+    db_used(e, k) && db_writing(e, k) && !db_is_memory(e, k) && !db_wal_open(e, k)
+}
+
+fn commit_all(e: &mut Engine) -> void!db.Error {
+    n := 0usize
+    for k in 0usize..e.ndb {
+        if commit_participant(e, k) {
+            use_db(e, k)
+            if db_changed(e) {
+                n += 1
+            }
+        }
+    }
+    if n >= 2 && !db_is_memory(e, 0) && db_path_len(e, 0) > 0 {
+        return commit_super(e)
+    }
+    for k in 0usize..e.ndb {
+        if db_used(e, k) && db_writing(e, k) {
+            use_db(e, k)
+            commit_db(e)?
+        }
+    }
+    ok()
+}
+
+fn test_abort(e: &Engine, point: u32) {
+    if e.test_crash == point {
+        // Test hook: die like a crashed process (files stay as they are).
+        core.assert(false)
+    }
+}
+
+fn commit_super(e: &mut Engine) -> void!db.Error {
+    // Pick an unused name "<main>-mjXXXXXX9XX".
+    buf := [0u8; 1100]
+    base := main_side_path(e, "-mj", &mut buf)
+    n := base + 9
+    hex := mem_bytes("0123456789ABCDEF")
+    found := false
+    for _ in 0usize..100 {
+        r := next_random(e)
+        for i in 0usize..6 {
+            buf[base + i] = hex[((r >> ((i * 4) as u64)) & 15) as usize]
+        }
+        buf[base + 6] = 57
+        buf[base + 7] = hex[((r >> 32) & 15) as usize]
+        buf[base + 8] = hex[((r >> 36) & 15) as usize]
+        if !path_exists(&buf[..n]) {
+            found = true
+            break
+        }
+    }
+    if !found {
+        return err(fail(e, SQLITE_FULL, "unable to create a super-journal name"))
+    }
+    // Its content: every participant's journal name, NUL terminated.
+    sup := arena_alloc(e, n)?
+    copy_in(e.ws, sup, &buf[..n])
+    sj := create_file(&buf[..n])
+    match &sj {
+        some(_) => {},
+        none => {
+            return err(fail(e, SQLITE_CANTOPEN, "unable to open the super-journal"))
+        },
+    }
+    pos := 0u64
+    good := true
+    for k in 0usize..e.ndb {
+        if !commit_participant(e, k) {
+            continue
+        }
+        use_db(e, k)
+        if !db_changed(e) {
+            continue
+        }
+        jb := [0u8; 1100]
+        jl := side_path(e, "-journal", &mut jb)
+        jb[jl] = 0
+        if !fio_write(&mut sj, pos, &jb[..jl + 1]) {
+            good = false
+        }
+        pos += (jl + 1) as u64
+    }
+    if good && !fio_sync(&mut sj) {
+        good = false
+    }
+    fio_close(&mut sj)
+    if !good {
+        remove_path(&buf[..n])
+        return err(io_fail(e, "disk I/O error (super-journal)"))
+    }
+    test_abort(e, 1)
+    // Journals point at the super-journal; database files are written.
+    first := true
+    failure := false
+    for k in 0usize..e.ndb {
+        if !commit_participant(e, k) {
+            continue
+        }
+        use_db(e, k)
+        if !db_changed(e) {
+            continue
+        }
+        match commit_phase_one(e, sup, n) {
+            ok() => {},
+            err(_) => {
+                failure = true
+                break
+            },
+        }
+        if first {
+            test_abort(e, 2)
+        }
+        first = false
+    }
+    if failure {
+        saved := e.msg_len
+        clean := true
+        for k in 0usize..e.ndb {
+            if db_used(e, k) && db_writing(e, k) {
+                use_db(e, k)
+                match rollback_db(e) {
+                    ok() => {},
+                    err(_) => {
+                        clean = false
+                    },
+                }
+            }
+        }
+        if clean {
+            remove_path(&buf[..n])
+        }
+        e.msg_len = saved
+        return err(make_error(e, SQLITE_IOERR))
+    }
+    // The other databases (TEMP, in-memory, WAL, unchanged) commit alone.
+    for k in 0usize..e.ndb {
+        if db_used(e, k) && db_writing(e, k) && !commit_participant(e, k) {
+            use_db(e, k)
+            commit_db(e)?
+        }
+    }
+    test_abort(e, 3)
+    if !remove_path(&buf[..n]) {
+        return err(io_fail(e, "disk I/O error (super-journal delete)"))
+    }
+    test_abort(e, 4)
+    // Committed: the journals are deleted.
+    result := true
+    for k in 0usize..e.ndb {
+        if db_used(e, k) && db_writing(e, k) {
+            use_db(e, k)
+            match commit_phase_two(e) {
+                ok() => {},
+                err(_) => {
+                    result = false
+                },
+            }
+        }
+    }
+    if !result {
+        return err(make_error(e, SQLITE_IOERR))
+    }
+    ok()
+}
+
+// Rolls back every database's write transaction.
+fn rollback(e: &mut Engine) -> void!db.Error {
+    here := e.cur_db
+    failure := false
+    saved := 0usize
+    for k in 0usize..e.ndb {
+        if db_used(e, k) && db_writing(e, k) {
+            use_db(e, k)
+            match rollback_db(e) {
+                ok() => {},
+                err(_) => {
+                    if !failure {
+                        saved = e.msg_len
+                    }
+                    failure = true
+                },
+            }
+        }
+    }
+    use_db(e, here)
+    sp_reset(e)
+    e.bm_used = 0
+    if failure {
+        e.msg_len = saved
+        return err(make_error(e, SQLITE_IOERR))
+    }
+    ok()
+}
+
+// ---------------------------------------------------------------------------
+// Files by name
+
+fn path_text(b: &[u8]) -> &str {
+    unsafe {
+        mem.str_from_utf8(b)
+    }
+}
+
+fn path_exists(b: &[u8]) -> bool {
+    ws := platform.workspace()
+    match ws.set(path_text(b)) {
+        ok() => {},
+        err(_) => {
+            return false
+        },
+    }
+    match ws.get() {
+        ok(name) => {
+            match fs.metadata(&name) {
+                ok(_) => true,
+                err(_) => false,
+            }
+        },
+        err(_) => false,
+    }
+}
+
+// Removes a file; true when it is gone.
+fn remove_path(b: &[u8]) -> bool {
+    ws := platform.workspace()
+    match ws.set(path_text(b)) {
+        ok() => {},
+        err(_) => {
+            return false
+        },
+    }
+    match ws.get() {
+        ok(name) => {
+            match fs.remove_file(&name) {
+                ok() => true,
+                err(reason) => reason.kind == error.Kind.NotFound,
+            }
+        },
+        err(_) => false,
+    }
+}
+
+fn create_file(b: &[u8]) -> Option<fs.File> {
+    ws := platform.workspace()
+    options := fs.OpenOptions.new()
+    options.read = true
+    options.write = true
+    options.create = true
+    options.exclusive = true
+    match fs.File.open_utf8(path_text(b), &options, &mut ws) {
+        ok(file) => some(file),
+        err(_) => none,
+    }
+}
+
+fn open_existing(b: &[u8]) -> Option<fs.File> {
+    ws := platform.workspace()
+    options := fs.OpenOptions.new()
+    options.read = true
+    match fs.File.open_utf8(path_text(b), &options, &mut ws) {
+        ok(file) => some(file),
+        err(_) => none,
+    }
+}
+
+// Reads the super-journal name at the end of a rollback journal into `out`
+// (see journal_write_super); returns its length, 0 when there is none.
+fn read_super_ptr(f: &mut Option<fs.File>, out: &mut[u8]) -> usize {
+    size := fio_size(f)
+    if size < 16 {
+        return 0
+    }
+    tail := [0u8; 16]
+    if fio_read(f, size - 16, &mut tail) != 16 {
+        return 0
+    }
+    len := rd32(&tail, 0) as u64
+    sum := rd32(&tail, 4)
+    magic := [217u8, 213, 5, 249, 32, 161, 99, 215]
+    for i in 0usize..8 {
+        if tail[8 + i] != magic[i] {
+            return 0
+        }
+    }
+    if len == 0 || len > size - 16 || len as usize >= out.len {
+        return 0
+    }
+    l := len as usize
+    if fio_read(f, size - 16 - len, &mut out[..l]) != (l as isize) {
+        return 0
+    }
+    for i in 0usize..l {
+        sum = core.wrapping_sub(sum, out[i] as u32)
+    }
+    if sum != 0 {
+        return 0
+    }
+    l
+}
+
+// After a journal that named super-journal `sup` was rolled back: deletes
+// the super-journal unless another journal it lists still points at it.
+fn super_delete_if_unused(sup: &[u8]) {
+    sf := open_existing(sup)
+    match &sf {
+        some(_) => {},
+        none => {
+            return
+        },
+    }
+    size := fio_size(&mut sf)
+    content := [0u8; 16384]
+    if size as usize > content.len {
+        fio_close(&mut sf)
+        return
+    }
+    got := fio_read(&mut sf, 0, &mut content[..size as usize])
+    fio_close(&mut sf)
+    if got != (size as isize) {
+        return
+    }
+    start := 0usize
+    for i in 0usize..(size as usize) {
+        if content[i] != 0 {
+            continue
+        }
+        if i > start {
+            child := open_existing(&content[start..i])
+            match &child {
+                some(_) => {
+                    name := [0u8; 1100]
+                    l := read_super_ptr(&mut child, &mut name)
+                    fio_close(&mut child)
+                    if l == sup.len && bytes_eq(&name[..l], sup) {
+                        // Still hot: its own recovery deletes the super-journal.
+                        return
+                    }
+                },
+                none => {},
+            }
+        }
+        start = i + 1
+    }
+    remove_path(sup)
+}
