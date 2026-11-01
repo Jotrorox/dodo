@@ -140,7 +140,8 @@ and streams **are implemented**.
 HTTP/2, HTTP/3, WebSockets, TOML serialization and chip support beyond
 the RP2040 and RP2350 are remaining work. [`std/embedded/hal`](hardware.md) supplies typed
 registers and portable device protocols, blocking and polling, including I2C
-and SPI targets, pulse capture, CAN, I2S, and DMA buffer transfers, with
+and SPI targets, pulse capture, timers at other rates with compare,
+periodic, and capture channels, CAN, I2S, and DMA buffer transfers, with
 in-memory fakes in `std/embedded/hal/fake` and the serial port protocols in
 `std/embedded/hal/serial`; `std/embedded/chip/rp2040` and
 `std/embedded/board/pico` support the Raspberry Pi RP2040 and Pico, and
@@ -149,8 +150,11 @@ in-memory fakes in `std/embedded/hal/fake` and the serial port protocols in
 their I2C and SPI buses, as master or target, and serial ports through the
 shared controller drivers in `std/embedded/peripheral` and the pin and
 controller ownership both chips share in `std/embedded/chip/rp_pins`, and
-their PWM outputs and inputs and ADC inputs through `std/embedded/chip/rp_pwm` and
-`std/embedded/chip/rp_adc`, their random number generators, the RP2040's
+their PWM outputs and inputs, PWM slices as periodic timers, and ADC inputs
+through `std/embedded/chip/rp_pwm` and `std/embedded/chip/rp_adc`, their
+timer alarms as compare channels and periodic timers, and the RP2350's
+second timer, through `std/embedded/chip/rp_timer`, edge capture on PIO
+through `std/embedded/chip/rp_capture`, their random number generators, the RP2040's
 ring oscillator and the RP2350's TRNG, through `std/embedded/chip/rp_rng`,
 their PIO state machines, with programs assembled
 at compile time, through `std/embedded/chip/rp_pio`, I2S audio on PIO

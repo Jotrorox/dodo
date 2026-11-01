@@ -98,6 +98,10 @@ methods implements it and can be passed where a driver expects it:
 | `hal.Delay` | `delay_us(&mut self, microseconds: u32)` |
 | `hal.Counter` | `now_us(&self) -> u64` |
 | `hal.Alarm` | `now_us(&self) -> u64`<br>`schedule_at_us(&mut self, time_us: u64) -> void!hal.Error`<br>`cancel(&mut self)`<br>`fired(&self) -> bool`<br>`clear(&mut self)` |
+| `hal.TickCounter` | `tick_hz(&self) -> u32`<br>`now_ticks(&self) -> u64` |
+| `hal.Compare` | `tick_hz(&self) -> u32`, `now_ticks(&self) -> u64`<br>`schedule_at_ticks(&mut self, ticks: u64) -> void!hal.Error`<br>`cancel(&mut self)`, `fired(&self) -> bool`, `clear(&mut self)`<br>`listen(&mut self)`, `ignore(&mut self)` |
+| `hal.PeriodicTimer` | `tick_hz(&self) -> u32`<br>`start(&mut self, period_ticks: u64) -> void!hal.Error`<br>`cancel(&mut self)`, `poll_periods(&mut self) -> u32`<br>`listen(&mut self)`, `ignore(&mut self)` |
+| `hal.InputCapture` | `tick_hz(&self) -> u32`<br>`poll_event(&mut self, ticks: &mut u64) -> bool!hal.Error`<br>`listen(&mut self)`, `ignore(&mut self)` |
 | `hal.I2c` | `write(&mut self, address: u8, bytes: &[u8]) -> void!hal.Error`<br>`read(&mut self, address: u8, buffer: &mut[u8]) -> void!hal.Error`<br>`write_read(&mut self, address: u8, bytes: &[u8], buffer: &mut[u8]) -> void!hal.Error` |
 | `hal.Spi` | `transfer(&mut self, bytes: &mut[u8]) -> void!hal.Error`<br>`write(&mut self, bytes: &[u8]) -> void!hal.Error` |
 | `hal.PwmOutput` | `max_duty(&self) -> u16`<br>`set_duty(&mut self, duty: u16) -> void!hal.Error` |
@@ -141,6 +145,9 @@ handler, and either calls `clear()`. Turning that interrupt on is
 chip-specific, as `listen` and `irq` are on the
 [RP2040 and RP2350](#an-interrupt-driven-driver); the protocol only sets
 times and reports them. An alarm has `now_us` too, so it is also a counter.
+Hardware timers that count something other than microseconds, compare and
+capture channels, and timers that elapse periodically have protocols of
+their own, in ticks: see [timers at other rates](#timers-at-other-rates).
 
 More protocols follow below: [polling forms](#polling-instead-of-waiting)
 of the buses that never wait, [targets](#being-the-device-targets) for being
@@ -238,6 +245,12 @@ for reproducible tests.
 | `hal.Ticker` | Ticks at a fixed period without drift: `Ticker.start(&counter, period_us)`, then `ready(&counter)` once per tick, or `wait(&counter)`. Ticks missed entirely are skipped. |
 | `hal.schedule_in_us(&mut alarm, us)` | Fire an alarm a number of microseconds from now. |
 | `hal.wait_for_alarm(&mut alarm)` | Busy-wait until an alarm fires, then clear it. |
+| `hal.ticks_to_us(ticks, hz)`, `hal.ticks_to_ns(ticks, hz)`, `hal.us_to_ticks(us, hz)` | Convert [ticks](#timers-at-other-rates) to time, rounding down, and time to ticks, rounding up. |
+| `hal.elapsed_ticks(&counter, since)` | Ticks since an earlier `now_ticks()`; 0 for a count still ahead. |
+| `hal.schedule_in_ticks(&mut channel, ticks)`, `hal.wait_for_compare(&mut channel)` | Fire a compare channel some ticks from now; busy-wait until it fires, then clear it. |
+| `hal.start_periodic_us(&mut timer, us)` | Start a periodic timer at a period in microseconds; `InvalidInput` unless that is a whole number of its ticks. |
+| `hal.wait_periods(&mut timer)` | Busy-wait until a period ends; returns how many did. |
+| `hal.capture_ticks(&mut input, polls)` | Wait for the next event on a capture channel and return its tick count. |
 | `hal.read_register(&mut bus, address, register)` | Read one numbered 8-bit I2C register. |
 | `hal.read_registers(&mut bus, address, first, buffer)` | Read consecutive I2C registers. |
 | `hal.write_register(&mut bus, address, register, value)` | Write one I2C register. |
@@ -311,6 +324,75 @@ start, so the samples do not drift however long each one takes. Firmware
 that runs several such jobs side by side uses the
 [executor](#tasks-and-the-executor) instead, whose tasks sleep rather than
 busy-wait.
+
+### Timers at other rates
+
+`hal.Counter` and `hal.Alarm` count microseconds. Hardware timers often
+count something else, such as the system clock or a divided crystal, so four
+more protocols count ticks at a rate each implementation reports with
+`tick_hz()`, from 0 at a fixed start in a `u64` that never decreases.
+`hal.ticks_to_us` and `hal.us_to_ticks` convert.
+
+- A `hal.TickCounter` is a free-running counter: `now_ticks()`.
+- A `hal.Compare` channel fires once when its counter reaches the count
+  given to `schedule_at_ticks`, as an alarm does, and is a tick counter
+  itself.
+- A `hal.PeriodicTimer` elapses every `period_ticks` after `start`. Each
+  period ends a whole number of periods after the start, so periods do not
+  drift however late they are looked at, and `poll_periods()` says how many
+  ended since the last call: more than 1 means the program missed some,
+  which it learns instead of losing them.
+- A `hal.InputCapture` channel latches the time of each event at its input,
+  such as an edge on a pin, so the time is exact however late
+  `poll_event(&mut ticks)` reads it. `Overrun` reports events lost because
+  they came faster than the channel holds them.
+
+Each raises its interrupt after `listen()`: a compare channel while it has
+fired, until `clear()`; a periodic timer when a period ends, until
+`poll_periods()` acknowledges it; a capture channel while an event waits.
+Which vector that is stays chip-specific, as for alarms. A sampler that
+takes one sample per period, catching up on periods it missed, is generic
+over any periodic timer, and `fake.PeriodicTimer` tests it:
+
+```dodo test
+package sampler
+
+import "std/embedded/hal"
+import "std/embedded/hal/fake"
+
+// Sample every 2 ms; InvalidInput unless the timer makes that exactly.
+pub fn start<P: hal.PeriodicTimer>(timer: &mut P) -> void!hal.Error {
+    return hal.start_periodic_us(timer, 2000)
+}
+
+// The samples due now: one per period that ended, missed ones included.
+pub fn due<P: hal.PeriodicTimer>(timer: &mut P) -> u32 {
+    return timer.poll_periods()
+}
+
+@test
+fn catches_up_on_missed_periods() {
+    timer := fake.PeriodicTimer.new(1_000_000)
+    start(&mut timer)!
+    timer.advance(1999)
+    assert_eq(due(&mut timer), 0u32)
+    timer.advance(1)
+    assert_eq(due(&mut timer), 1u32)
+    timer.advance(6500)
+    assert_eq(due(&mut timer), 3u32)
+    // 2 ms is not a whole number of ticks at 32768 Hz.
+    crystal := fake.PeriodicTimer.new(32_768)
+    match start(&mut crystal) {
+        ok() => assert(false),
+        err(error) => assert(error == hal.Error.InvalidInput),
+    }
+}
+```
+
+On the RP2040 and RP2350, the timer's alarms are compare channels and
+periodic timers, PWM slices periodic timers and tick counters, the RP2350's
+second timer counts at other rates, and PIO state machines capture edges;
+see [timers on the RP2040 and RP2350](#timers-on-the-rp2040-and-rp2350).
 
 ### Several devices on one SPI bus
 
@@ -925,6 +1007,10 @@ which pins can carry which bus.
 | `fake.Pin` | An input/output pin, initially low. | `is_high()`, `changes()` |
 | `fake.Delay` | A delay that returns at once, and a counter whose time is the delays so far. | `elapsed_us()`, `now_us()` |
 | `fake.Alarm` | An alarm on a counter that starts at 0 and moves only on `advance`. It reaches any time ahead. | `advance(us)`, `is_armed()`, `target_us()`, `schedules()`, `fail_next(error)` |
+| `fake.TickCounter` | A [tick counter](#timers-at-other-rates) at a given rate that moves only on `advance`. | `advance(ticks)` |
+| `fake.Compare` | A compare channel on such a counter, reaching any count ahead unless `set_reach(ticks)` limits it. | `advance(ticks)`, `is_armed()`, `is_listening()`, `is_raised()`, `target_ticks()`, `schedules()`, `fail_next(error)` |
+| `fake.PeriodicTimer` | A periodic timer on such a counter, counting every period that ends within an `advance`. | `advance(ticks)`, `is_running()`, `is_raised()`, `next_ticks()`, `set_max_period(ticks)`, `starts()`, `fail_next(error)` |
+| `fake.InputCapture` | A capture channel holding up to `set_depth(n)` events (16 at most); an event that finds it full is lost and the next poll is `Overrun`. | `event(ticks)`, `waiting()`, `is_raised()`, `fail_next(error)` |
 | `fake.I2c` | One device at an address with 256 numbered registers and an auto-incrementing register pointer. Other addresses report `NoAcknowledge`. Also `hal.I2cPoll`: a polled transaction takes `set_poll_steps(n)` polls. | `register(n)`, `set_register(n, v)`, `fail_next(error)`, `set_poll_steps(n)`, `cancels()` |
 | `fake.Spi` | A bus that records sent bytes and answers from a programmed reply. Also `hal.SpiPoll`, moving `set_poll_chunk(n)` bytes per poll. | `sent()`, `clear()`, `reply_with(bytes)`, `set_poll_chunk(n)`, `polls()` |
 | `fake.Serial` | A serial port, `serial.Port` and `serial.PollPort`: it records what is written and reads back bytes given to `feed`, then reports end of input; `poll_read` reports Pending instead. | `sent()`, `clear()`, `feed(bytes)`, `set_write_room(n)`, `set_flush_polls(n)`, `flushes()` |
@@ -942,7 +1028,8 @@ which pins can carry which bus.
 | `fake.Clock` | The [executor](#tasks-and-the-executor)'s clock, and a counter: time jumps ahead when the executor sleeps, and simulated interrupts raise signals. | `now_us()`, `interrupt_at(time, &signal)`, `advance(us)`, `sleeps()`, `idle_us()` |
 
 `fail_next` makes the next I2C transaction, duty change, analog read,
-alarm schedule, clock operation, or random fill fail,
+alarm or compare schedule, periodic start, capture poll, clock operation,
+or random fill fail,
 so error paths are as easy to test as success. The repository's
 `examples/dimmer.dodo` tests an LED dimmer, a knob on an analog input setting
 a PWM output, this way, and `examples/dimmer_board.dodo` runs it unchanged on
@@ -1334,7 +1421,9 @@ which is open at reset and closed only inside critical sections.
 | Driver | Interrupt sources |
 | --- | --- |
 | `pl011.Port` and `Controller` | `listen(sources)`, `ignore(sources)`, `pending_interrupts()`, and `clear_interrupts(sources)` with `RX_INTERRUPT` (FIFO 3/4 full), `RX_TIMEOUT_INTERRUPT` (bytes waiting for 32 bit times), `TX_INTERRUPT`, and `ERROR_INTERRUPTS`. The receive sources end when reads drain the FIFO. |
-| `Timer.alarm(n)` on the RP2040 and RP2350 | An `Alarm` with the [alarm protocol](#device-protocols): it fires once at `schedule_at_us(time)`, a `now_us()` time up to 2^31 - 1 us (35 minutes) ahead, or at the low 32 bits of the counter with `schedule_at(time)` and `schedule_in(microseconds)`. `listen` raises `alarm.irq()`, and its handler calls `clear`; a time `schedule_at_us` finds already passed raises it at once. `release_alarm` gives it back. With `now_us()` and `sleep_until(deadline)` it is also the [executor](#tasks-and-the-executor)'s clock. |
+| `Timer.alarm(n)` on the RP2040 and RP2350 | An `Alarm` with the [alarm protocol](#device-protocols): it fires once at `schedule_at_us(time)`, a `now_us()` time up to 2^31 - 1 us (35 minutes) ahead, or at the low 32 bits of the counter with `schedule_at(time)` and `schedule_in(microseconds)`. `listen` raises `alarm.irq()`, and its handler calls `clear`; a time `schedule_at_us` finds already passed raises it at once. `release_alarm` gives it back. With `now_us()` and `sleep_until(deadline)` it is also the [executor](#tasks-and-the-executor)'s clock. It is a [compare channel and a periodic timer](#timers-on-the-rp2040-and-rp2350) too: after `start(period_us)` its handler calls `poll_periods()` instead of `clear`. |
+| `pins.pwm_timer(slice, hz)` and `pins.pwm(pin, hz)` on the RP2040 and RP2350 | A PWM slice's wrap ends each period: `listen()` on an `rp_pwm.PwmTimer`, or `listen_wrap()` on an output, raises `PWM_IRQ_WRAP` (RP2040) or `PWM_IRQ_WRAP_0` (RP2350), `irq()`, shared by every slice. The handler calls the timer's `poll_periods()` or the output's `clear_wrap()`. |
+| `pins.edge_capture(...)` on the RP2040 and RP2350 | `listen()` raises the PIO block's interrupt line 0, `capture.irq()`, while an edge waits; reading it with `poll_event` acknowledges it. |
 | `Pin` on the RP2040 and RP2350 | `listen(events)` raises `IO_IRQ_BANK0` for `chip.RISING_EDGE`, `FALLING_EDGE`, `LEVEL_HIGH`, or `LEVEL_LOW`; `events()` shows them, `clear_events(edges)` acknowledges edges, `ignore(events)` stops. |
 
 ### The Cortex-M core
@@ -1685,7 +1774,8 @@ runs a blinking LED, a debounced button, and such a serial console together.
 | --- | --- | --- |
 | GPIO pin (RP2040, RP2350) | `pin.listen(events)` with `chip.RISING_EDGE`, `FALLING_EDGE`, `LEVEL_HIGH`, `LEVEL_LOW`; all pins share `IO_IRQ_BANK0` (`pin.irq()`) | `pin.events()` shows what is raising it; `pin.clear_events(edges)` clears latched edges. Levels last as long as the level. `ignore(events)` stops. |
 | Serial port | `port.listen(sources)` | Reading drains the receive sources; `clear_interrupts` the errors. |
-| Timer alarm | `alarm.listen()` | `alarm.clear()`. An alarm used as the executor's clock is busy. |
+| Timer alarm | `alarm.listen()` | `alarm.clear()`, or `alarm.poll_periods()` for a periodic one. An alarm used as the executor's clock is busy. |
+| PWM slice timer (RP2040, RP2350) | `timer.listen()`; all slices share the wrap interrupt (`timer.irq()`) | `timer.poll_periods()`. |
 | USB serial port | `serial.set_signal(&SIGNAL)`: the port's own interrupt handler raises it | Nothing to acknowledge: read with `poll_read` until it is Pending. |
 | DMA channel | `channel.set_signal(&SIGNAL)`: the runtime's `DMA_IRQ_0` handler raises it when a transfer ends | Nothing to acknowledge: check the transfer, for example with `is_busy()`. |
 | Polled I2C transaction | `bus.listen()`: `I2C0_IRQ` or `I2C1_IRQ` whenever a poll can move bytes or the transaction has ended | The next `poll_*` call, which deals with the condition and sets the mask for the next one. |
@@ -2091,7 +2181,7 @@ so changing the board in `dodo.toml` is the only change a program needs:
 | `board.I2C_SDA_PIN`, `board.I2C_SCL_PIN` | The board's usual I2C pins. |
 | `board.SPI_CLOCK_PIN`, `board.SPI_TX_PIN`, `board.SPI_RX_PIN`, `board.SPI_SELECT_PIN` | The board's usual SPI pins, and a free pin for one chip select. |
 | `board.UART_TX_PIN`, `board.UART_RX_PIN` | The board's usual serial port pins. |
-| `b.timer` | The delay and counter protocols, plus `delay_ms(ms)`; `alarm(n)` claims an alarm with the alarm protocol, which can also run the [executor](#tasks-and-the-executor). |
+| `b.timer` | The delay and counter protocols, plus `delay_ms(ms)`; `alarm(n)` claims an alarm with the alarm protocol, which can also run the [executor](#tasks-and-the-executor), and is a [compare channel and periodic timer](#timers-on-the-rp2040-and-rp2350). On the RP2350, `timer1(hz)` starts the second timer at another rate. |
 | `b.rtc` | The chip's [real-time clock](#real-time-clocks-on-the-rp2040-and-rp2350), implementing the clock and alarm protocols. |
 | `b.rng` | The chip's [random number generator](#random-numbers-on-the-rp2040-and-rp2350), implementing the random number generator protocol. |
 | `b.watchdog` | The [watchdog](#the-watchdog-on-the-rp2040-and-rp2350): `start(timeout_ms)`, then `feed()` in time or the board resets; `reset_reason()` tells whether it did. Implements `hal.Watchdog`. |
@@ -2530,6 +2620,138 @@ example to run a USB stack of its own. A custom board that uses
 `std/embedded/chip` directly calls `p.usb.serial()`, named after the chip,
 or `p.usb.serial_with(identity, activity_led)`.
 
+### Timers on the RP2040 and RP2350
+
+The chips have no timer with capture channels, so each of the
+[timer protocols](#timers-at-other-rates) comes from the hardware that does
+the job honestly:
+
+| Hardware | Get it with | Protocols | Ticks |
+| --- | --- | --- | --- |
+| Timer alarms | `b.timer.alarm(n)` | `hal.Alarm`, `hal.Compare`, `hal.PeriodicTimer` | 1 MHz |
+| TIMER1 (RP2350) | `b.timer.timer1(hz)`, then `alarm(n)` | `hal.TickCounter` and `hal.Counter`; its alarms `hal.Compare`, `hal.PeriodicTimer`, and `hal.Alarm` | clk_sys, or the crystal divided by 1 to 511 |
+| A PWM slice | `b.pins.pwm_timer(slice, hz)` | `hal.PeriodicTimer`, `hal.TickCounter` | clk_sys divided by 1 to 255 15/16 |
+| A PIO state machine | `b.pins.edge_capture(&mut pio, pin, edges, hz)` | `hal.InputCapture` | clk_sys / 4 at most |
+
+**Alarms.** Each of the timer's four alarms counts the microsecond timer's
+ticks as a compare channel, `schedule_at_ticks(count)`, the same as
+`schedule_at_us`. `start(period_us)` makes it periodic: it fires at the
+start plus every whole period, up to 2^31 - 1 us. Its interrupt handler
+calls `poll_periods()` instead of `clear()`, which counts the periods that
+ended, so a late handler learns how many it missed, and re-arms the alarm
+for the next one, counted from the start rather than from the handler, so
+the periods never drift. A schedule or `cancel()` ends periodic mode.
+
+```dodo
+package main
+
+import "std/embedded/board"
+import "std/embedded/chip"
+import "std/embedded/cortex_m"
+
+static mut TICK: Option<chip.Alarm> = none
+static mut PERIODS: u32 = 0
+
+// TIMER_IRQ_1 on the RP2040, TIMER0_IRQ_1 on the RP2350.
+@interrupt(TIMER_IRQ_1)
+fn tick() {
+    unsafe {
+        match &mut TICK {
+            some(alarm) => {
+                PERIODS += alarm.poll_periods()
+            }
+            none => {}
+        }
+    }
+}
+
+fn main() {
+    b := board.take()!
+    alarm := b.timer.alarm(1)!
+    alarm.start(1000)!   // every millisecond
+    alarm.listen()
+    irq := alarm.irq()
+    unsafe {
+        TICK = some(alarm)
+    }
+    cortex_m.enable(irq)
+}
+```
+
+**TIMER1.** The RP2350 has a second timer, which `b.timer.timer1(hz)` starts
+from 0 at `chip.SYS_HZ`, counting clk_sys cycles (150 MHz, 6.7 ns each), or
+at the crystal divided by a whole number from 1 to 511 through its own tick
+generator: 12 MHz, 1 MHz, or 100 kHz from the Pico 2's 12 MHz crystal.
+Other rates are `InvalidInput`, and a second claim `Busy`. A `Timer1`
+counts `now_ticks()` and `now_us()`, and `alarm(n)` claims its alarms,
+raising `TIMER1_IRQ_0` to `TIMER1_IRQ_3`, as compare channels and periodic
+timers in its ticks, up to 2^31 - 1 ticks ahead (14 s at 150 MHz), and as
+`hal.Alarm`s in microseconds. Give the alarms back with `release_alarm`,
+then the timer with `b.timer.release_timer1(timer1)`, which holds it in
+reset. To wake from a deep sleep on one of its alarms, keep
+`chip.CLOCK_TIMER1` in the [sleep set](#clock-gating), as `chip.CLOCK_PWM`
+for a PWM slice timer.
+
+**PWM slices.** `b.pins.pwm_timer(slice, hz)` claims a PWM slice with no
+pins as an `rp_pwm.PwmTimer`. It counts at clk_sys divided by a whole number
+of sixteenths from 1 to 255 15/16, such as 125 MHz, 10 MHz, 1 MHz, or
+500 kHz on the RP2040; `rp_pwm.timer_divider` says which rates work. `start(period)` sets a
+period of up to 65536 ticks and at least 8 us; the slice's counter wraps at
+the end of every period in hardware, so periods never drift, and `listen()`
+raises the wrap interrupt, `PWM_IRQ_WRAP` on the RP2040 and
+`PWM_IRQ_WRAP_0` on the RP2350, which every slice shares. The counter has 16
+bits and the wrap flag says only that a wrap happened, so the timer pairs
+the counter with the microsecond timer, which runs from the same crystal:
+the time since the start picks the period, the counter the tick within it.
+`now_ticks()` is therefore a 64-bit count to the tick, down to a clk_sys
+cycle, and `poll_periods()` counts every period however long nobody looked,
+as long as clk_sys keeps the rate the timer was opened at. A timer takes
+both outputs of slices 0 to 7, so their pins cannot be PWM outputs
+meanwhile; the RP2350's slices 8 to 11 reach no pins here and serve only as
+timers. `b.pins.release_pwm_timer(timer)` gives the slice back.
+
+```dodo
+timer := b.pins.pwm_timer(3, 1_000_000)!
+hal.start_periodic_us(&mut timer, 250)!   // 4 kHz, to the microsecond
+for {
+    missed := hal.wait_periods(&mut timer) - 1
+    // ... sample, and account for `missed`
+}
+```
+
+PWM outputs see the same wrap: `listen_wrap()` raises the wrap interrupt at
+the end of each period, `wrapped()` and `clear_wrap()` read and acknowledge
+the slice's flag. A handler that sets the next duty then has a whole period
+to do so, as a duty takes effect at the wrap.
+
+**Edge capture.** `b.pins.edge_capture(&mut pio, pin, edges, hz)` claims a
+GPIO for a PIO block and runs one of its state machines as a capture
+channel, an `rp_capture.EdgeCapture`, for `rp_capture.RISING`, `FALLING`, or
+`BOTH` edges. Its program counts down a register once every four cycles
+while it watches the pin, and on each edge pushes the count and the new
+level into the joined 8-word RX FIFO: the state machine latches the time,
+so `poll_event` returns the edge's exact tick however late it reads it, and
+`rising()` tells which edge it was. A tick is four state machine cycles:
+clk_sys / 4 at most (31.25 MHz on the RP2040, 37.5 MHz on the RP2350), and
+any rate that divides clk_sys / 4 into a whole number of 256ths, such as
+1 MHz. The pin is sampled once per tick through the input synchronizer, so
+a level must last two ticks to be timed to the tick. An edge that finds the
+FIFO full is lost, and the next `poll_event` is `Overrun`; with `RISING` or
+`FALLING`, the other edges still take FIFO room. The pushed count has 31
+bits, and the chip's microsecond timer extends it: read an edge within 69 s
+of it at 31.25 MHz, or 36 minutes at 1 MHz. `start_us()` is tick 0 on the
+microsecond timer. The program takes 14 of the block's 32 instruction
+slots; `b.pins.release_edge_capture(capture, &mut pio)` gives back the
+state machine, the program, and the pin.
+
+```dodo
+pio := b.pins.pio(1)!
+edges := b.pins.edge_capture(&mut pio, 6, rp_capture.BOTH, 1_000_000)!
+rose := hal.capture_ticks(&mut edges, hal.NO_POLL_LIMIT)!
+fell := hal.capture_ticks(&mut edges, hal.NO_POLL_LIMIT)!
+pulse_us := fell - rose   // ticks of 1 MHz
+```
+
 ### PWM and the ADC on the RP2040 and RP2350
 
 `pins.pwm(pin, frequency_hz)` claims any GPIO as a PWM output and returns an
@@ -2576,6 +2798,7 @@ clk_sys. For a divider and TOP of your own,
 | `frequency_hz()`, `timing()` | The frequency, and the divider and TOP. |
 | `set_inverted(on)` | High while the count is at or above the compare value instead of below it. |
 | `pin()`, `slice()`, `output()`, `count()` | The GPIO, slice, output (0 for A), and the counter's value. |
+| `listen_wrap()`, `ignore_wrap()`, `wrapped()`, `clear_wrap()`, `irq()` | The slice's wrap at the end of each period: raise the wrap interrupt, read and acknowledge its flag; see [timers](#timers-on-the-rp2040-and-rp2350). |
 
 `pins.release_pwm(output)` drives the pin low, disconnects it, and stops the
 slice once neither output is in use. The two outputs of a slice write only
@@ -3454,7 +3677,7 @@ dodo build firmware.dodo --emit obj --target thumbv7em-none-eabihf \
   RP2350B's GPIO 32 to 47 and the RP2350's GPIOBASE register are not
   supported. `rp_pio.assemble` takes one program per call.
 - PWM inputs measure by counting over windows, as the slices cannot
-  timestamp edges; the PWM wrap interrupt is not exposed. ADC reads are
+  timestamp edges; PIO edge capture timestamps them instead. ADC reads are
   polled one at a time, without the round-robin sampler, FIFO, or DMA.
 - A serial port keeps no more input than its 32-byte FIFO unless it
   receives [by DMA](#serial-ports-by-dma), a program serves its interrupts,
@@ -3495,10 +3718,15 @@ dodo build firmware.dodo --emit obj --target thumbv7em-none-eabihf \
   supported. Neither is lowering the system clock to save power. On a dual-core chip,
   deep sleep stops the sleep set's other clocks only while both cores
   deep-sleep.
-- The timer protocols count microseconds. Counters at other rates, a
-  timer's capture and compare channels, and periodic hardware timers have no
-  shared protocol; use the chip's own methods, as for the RP2040's and
-  RP2350's alarms, whose interrupts `listen` turns on.
+- Neither chip has a hardware capture unit: capture channels run on a PIO
+  state machine, which timestamps edges in ticks of four of its cycles
+  (clk_sys / 4 at most), holds 8 edges, and needs each level to last two
+  ticks. The PWM slices' compare levels raise no interrupt, so compare
+  channels come from the timer alarms. A PWM slice timer and an edge
+  capture extend their counts with the microsecond timer and assume clk_sys
+  keeps the rate they were opened at. The RP2350's TIMER1 counts clk_sys or
+  the crystal, not a GPIO, and the cores' SysTick timers have no timer
+  protocol.
 - Flash regions erase and write only from core 0, with interrupts masked and
   core 1 stopped; there is no lockout that pauses core 1 in SRAM meanwhile.
   External SPI flash chips have no bundled driver yet, but any driver with
