@@ -913,6 +913,17 @@
   cover 10-bit addressing, both targets, 12-bit and TI frames through the
   SPI loopback, breaks, and the flow control pins, and the desktop models
   gain a DW_apb_i2c target driven by a scripted master.
+- The RP2040's and RP2350's ADC samples by itself: `pins.sampler(inputs,
+  rate_hz)` returns an `rp_adc.AdcSampler` that converts a set of inputs
+  (GPIO 26 to 29 and the temperature sensor) round-robin at 733 to 500 000
+  samples a second into the ADC's FIFO. Polled reads return samples tagged
+  with their input and a conversion-error flag and report FIFO overruns;
+  `set_signal` wakes a task from the `ADC_IRQ_FIFO` interrupt, whose default
+  handler the chip runtimes now provide; and by DMA, paced by the ADC's
+  data request, `capture` fills a buffer of 12-bit or 8-bit samples, `dma`
+  does so in the background, and `stream` keeps filling a ring. Single
+  `pins.analog` inputs keep working and are `Busy` while a sampler holds
+  the converter, and the other way round. See `examples/adc.dodo`.
 
 ## 0.1.5 — 2026-10-12
 
