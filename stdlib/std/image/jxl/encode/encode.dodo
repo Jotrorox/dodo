@@ -13,41 +13,66 @@ import "std/image/shared/scratch"
 //
 // Output is one lossless modular frame (not XYB) as a bare codestream, or in
 // the ISOBMFF container (signature, ftyp, optional jxll/Exif/xml boxes, then
-// jxlc) when asked for or when metadata is attached. Samples keep their
-// precision: U8 and U16 become 8 and 16-bit integer samples; F16 and F32
-// become 16 and 32-bit float samples whose bit patterns are coded exactly.
+// jxlc) when asked for or when EXIF or XMP is attached; an ICC profile goes
+// into the codestream. Samples keep their precision: U8 and U16 become 8 and
+// 16-bit integer samples; F16 and F32 become 16 and 32-bit float samples
+// whose bit patterns are coded exactly.
 // Alpha is an extra channel; premultiplied input is stored unchanged and
 // flagged alpha_associated.
 //
 // Bitstream: 256x256 groups. A single-group image is one section. Larger
-// images get a TOC with LfGlobal (MA tree, prefix codes, palette and the
+// images get a TOC with LfGlobal (MA tree, entropy codes, palette and the
 // global transform header), empty LF group and HfGlobal sections, and one
 // section per group with its rectangle of every channel. One global tree
-// and one set of clustered prefix codes (hybrid integers 4/2/0) serve all
-// groups; they come from a first pass that counts symbols over the whole
-// image, and a second pass writes each group independently. Runs of equal
-// residuals become LZ77 copies at distance 1 (RLE). Channels whose samples
-// share a factor (8-bit data * 257, 12-bit data * 16) code residuals
-// divided by it through the tree leaf multiplier.
+// and one set of clustered entropy codes serve all groups; they come from a
+// first pass that counts symbols over the whole image, and a second pass
+// writes each group independently. Runs of equal residuals become LZ77
+// copies at distance 1 (RLE). Channels whose samples share a factor (8-bit
+// data * 257, 12-bit data * 16) code residuals divided by it through the
+// tree leaf multiplier.
+//
+// Entropy coding (entropy.dodo, ans.dodo, prefix.dodo): effort 1 counts
+// hybrid integer tokens 4/2/0 and writes prefix codes. Effort 2+ counts
+// finer tokens (5/2/2, which keep enough of every residual of 8 and
+// 16-bit samples), clusters the contexts on their 4/2/0 projection, picks
+// each cluster's hybrid integer configuration from 26 candidates by
+// estimated size, and then codes the set with ANS (12-bit distributions
+// stored with the flat, small or general method at the cheapest precision
+// shift, alias tables, a 32-bit rANS state per stream with 16-bit flushes)
+// when that is estimated smaller than prefix codes, likewise for the tree.
+// ANS streams are written in reverse: each stream's tokens are buffered
+// (two words each) and coded when the stream ends.
+//
+// ICC profiles (icc.dodo) are embedded after the image header with
+// libjxl's predictive ICC encoding (header prediction, tag table commands,
+// type and XYZ shortcuts, shuffled mluc text, numeric prediction of curves
+// and CLUTs), LZ77 and per-cluster prefix codes over 41 byte contexts. The
+// encoded profile is regenerated on every pass rather than stored, so its
+// working memory is fixed and carved from the histogram scratch before the
+// image passes start.
 //
 // Effort:
 //   1: fjxl-like: YCoCg for RGB, the clamped gradient predictor, one context
-//      per channel, at most 8 prefix codes.
+//      per channel, at most 8 prefix codes (4/2/0 hybrid integers).
 //   2: palette (up to 1024 colors), the best of three color transforms, the
 //      best of gradient/W/N per channel, contexts from the local gradients
 //      W-NW and NW-N (and the previous channel's residual), up to 32
-//      clustered codes. Choices are estimated by coding sample bands of the
-//      image with the real model.
+//      clustered codes with tuned hybrid integers, ANS when smaller (some
+//      precision shifts). Choices are estimated by coding sample bands of
+//      the image with the real model.
 //   3+: nine color transforms, more predictors including the weighted
-//      (self-correcting) predictor with contexts on its error, and four
-//      times the sample.
+//      (self-correcting) predictor with contexts on its error, four times
+//      the sample, and every ANS precision shift.
 //
 // Memory: encode_scratch_size() bytes of scratch, carved into the i32
 // planes of one group (all channels; 256x256 at most), the context
-// histograms (256 contexts x 272 symbols), cluster sums, prefix code
-// tables, the palette hash and the TOC sizes (4 bytes per group). Planes are
-// bounded by the group size, so scratch stays between about 0.5 and 1.5 MiB
-// for any image. max_encoded_size() bounds the output.
+// histograms (256 contexts x 288 symbols), cluster sums, prefix code
+// tables, the palette hash and the TOC sizes (4 bytes per group); effort 2+
+// adds ANS tables (32 clusters x 9 KiB) and a token buffer of 8 bytes per
+// sample of one group. Planes and tokens are bounded by the group size, so
+// scratch stays between about 0.4 and 1.5 MiB at effort 1 and 0.7 and 4
+// MiB at effort 2+, for any image. max_encoded_size() bounds the output
+// (max_encoded_size_with_metadata() with metadata and ICC profile).
 
 // Default effort for EncodeOptions.new().
 pub const DEFAULT_EFFORT: u32 = 2
@@ -62,8 +87,8 @@ pub struct EncodeOptions {
     // Color description written as the JPEG XL color encoding: CICP
     // primaries and transfer (sRGB, linear, BT.709/601/2020 curves, PQ, HLG,
     // DCI, power-law gamma; BT.709, BT.2020, Display P3, DCI-P3 or custom
-    // chromaticities). Unrepresentable values fall back to sRGB; ICC
-    // profiles are not embedded.
+    // chromaticities). Unrepresentable values fall back to sRGB. Ignored
+    // when an ICC profile is embedded (Metadata.icc).
     pub color: color.ColorInfo
     pub orientation: color.Orientation
 
