@@ -781,6 +781,14 @@ fn apply_platform(r: &mut Resolved, platform: Platform) -> Result<(), String> {
         r.settings.cpu = Some(chip.cpu.into());
         r.origins.insert("cpu".into(), origin.clone());
     }
+    if defaulted(r, "features") && !chip.features.is_empty() {
+        r.settings.features = Some(chip.features.into());
+        r.origins.insert("features".into(), origin.clone());
+    }
+    if defaulted(r, "opt-level") && chip.opt_level != 0 {
+        r.settings.opt_level = Some(chip.opt_level);
+        r.origins.insert("opt-level".into(), origin.clone());
+    }
     if defaulted(r, "panic") {
         r.settings.panic = Some(Panic::Hook(chip.panic_hook.into()));
         r.origins.insert("panic".into(), origin.clone());

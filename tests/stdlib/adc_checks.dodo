@@ -1,0 +1,1224 @@
+package main
+
+import "core/ptr"
+import "std/embedded/chip/rp_adc"
+import "std/embedded/chip/rp_pins"
+import "std/embedded/hal"
+
+// Host checks for the ADC sampler: rp_adc.Sampler, its DMA capture and
+// stream sessions, and rp_pins.Bank's sampler claims, against a model of
+// the RP2040's and RP2350's converter (CS, FCS and its 8-entry FIFO, DIV,
+// INTE, INTS) and a test DMA channel that moves real memory out of the
+// modelled FIFO, paced by its data request. Time passes whenever a driver
+// touches a register or asks the channel how it is doing: each step is 32
+// cycles of the 48 MHz clk_adc, and a conversion takes 96 of them.
+//
+// The model's results tell where they came from: input * 512 plus the
+// conversion's number modulo 512, so a sample whose value / 512 equals its
+// input tag was tagged right, and consecutive values show that no
+// conversion was lost.
+
+// --- The converter -----------------------------------------------------
+
+const STEP: u64 = 32 * 256
+const CONVERSION: u64 = 96 * 256
+// The FIFO's address as the test channel sees it.
+const ADC_FIFO: usize = 0x4004_C00C
+
+static mut CS: u32 = 0
+static mut FCS: u32 = 0
+static mut DIV: u32 = 0
+static mut INTE: u32 = 0
+static mut ENTRIES: [8]u32 = [0u32; 8]
+static mut LEVEL: u32 = 0
+static mut OVERFLOWS: u32 = 0
+// Time in 1/256 clk_adc cycles; the running conversion, when it ends, and
+// when the next may start.
+static mut NOW: u64 = 0
+static mut CONVERTING: bool = false
+static mut DONE_AT: u64 = 0
+static mut NEXT_START: u64 = 0
+// Conversions finished so far, and the number of one to fail (0 for
+// none).
+static mut CONVERSIONS: u32 = 0
+static mut FAIL_AT: u32 = 0
+
+fn reset_model() {
+    unsafe {
+        CS = 0
+        FCS = 0
+        DIV = 0
+        INTE = 0
+        LEVEL = 0
+        OVERFLOWS = 0
+        NOW = 0
+        CONVERTING = false
+        DONE_AT = 0
+        NEXT_START = 0
+        CONVERSIONS = 0
+        FAIL_AT = 0
+    }
+    reset_lane()
+}
+
+fn value_of(input: u32, number: u32) -> u32 {
+    return input * 512 + number % 512
+}
+
+fn period() -> u64 {
+    unsafe {
+        period := DIV as u64 + 256
+        if period < CONVERSION {
+            return CONVERSION
+        }
+        return period
+    }
+}
+
+// One step of the converter, then of the test channel.
+fn step() {
+    unsafe {
+        NOW += STEP
+        if CONVERTING && NOW >= DONE_AT {
+            finish_conversion()
+        }
+        if !CONVERTING && (CS & 1) != 0 && ((CS & (1 << 3)) != 0 && NOW >= NEXT_START || (CS & (1 << 2)) != 0) {
+            CONVERTING = true
+            DONE_AT = NOW + CONVERSION
+            if (CS & (1 << 3)) != 0 {
+                NEXT_START = NOW + period()
+            }
+        }
+    }
+    move_lane()
+}
+
+fn finish_conversion() {
+    unsafe {
+        CONVERTING = false
+        CONVERSIONS += 1
+        input := (CS >> 12) & 0xF
+        value := value_of(input, CONVERSIONS)
+        failed := FAIL_AT != 0 && CONVERSIONS == FAIL_AT
+        CS &= ~((1u32 << 9) | (1u32 << 2))
+        if failed {
+            CS |= (1u32 << 9) | (1u32 << 10)
+        }
+        if (FCS & 1) != 0 {
+            entry := value
+            if (FCS & 2) != 0 {
+                entry = value >> 4
+            }
+            if failed && (FCS & 4) != 0 {
+                entry |= 1u32 << 15
+            }
+            if LEVEL == 8 {
+                FCS |= 1u32 << 11
+                OVERFLOWS += 1
+            } else {
+                ENTRIES[LEVEL as usize] = entry
+                LEVEL += 1
+            }
+        }
+        // The round moves on to the next input in RROBIN.
+        round := (CS >> 16) & 0x1F
+        if round != 0 {
+            next := input
+            for _ in 0..5 {
+                next = (next + 1) % 5
+                if (round & (1u32 << next)) != 0 {
+                    break
+                }
+            }
+            CS = (CS & ~(0xFu32 << 12)) | (next << 12)
+        }
+    }
+}
+
+fn pop() -> u32 {
+    unsafe {
+        if LEVEL == 0 {
+            FCS |= 1u32 << 10
+            return 0
+        }
+        entry := ENTRIES[0]
+        for index in 1..LEVEL as usize {
+            ENTRIES[index - 1] = ENTRIES[index]
+        }
+        LEVEL -= 1
+        return entry
+    }
+}
+
+fn threshold() -> u32 {
+    unsafe {
+        return (FCS >> 24) & 0xF
+    }
+}
+
+fn raised() -> bool {
+    unsafe {
+        return threshold() != 0 && LEVEL >= threshold()
+    }
+}
+
+fn requesting() -> bool {
+    unsafe {
+        return (FCS & 8) != 0 && raised()
+    }
+}
+
+struct AdcView: hal.Registers {
+    pub fn read(&mut self, offset: usize) -> u32 {
+        step()
+        unsafe {
+            if offset == 0x00 {
+                value := CS & ~(1u32 << 8)
+                if (CS & 1) != 0 && !CONVERTING {
+                    value |= 1u32 << 8
+                }
+                return value
+            } else if offset == 0x04 {
+                return 0
+            } else if offset == 0x08 {
+                value := FCS | (LEVEL << 16)
+                if LEVEL == 0 {
+                    value |= 1u32 << 8
+                }
+                if LEVEL == 8 {
+                    value |= 1u32 << 9
+                }
+                return value
+            } else if offset == 0x0C {
+                return pop()
+            } else if offset == 0x10 {
+                return DIV
+            } else if offset == 0x18 {
+                return INTE
+            } else if offset == 0x20 {
+                if raised() {
+                    return INTE & 1
+                }
+                return 0
+            }
+        }
+        core.assert(false)
+        return 0
+    }
+
+    pub fn write(&mut self, offset: usize, value: u32) {
+        step()
+        alias := offset & 0x3000
+        register := offset & 0xFFF
+        unsafe {
+            if register == 0x00 {
+                // The aliases set or clear the read-write bits.
+                stored := CS & ~((1u32 << 8) | (1u32 << 9) | (1u32 << 10))
+                written := value
+                if alias == 0x2000 {
+                    written = stored | value
+                } else if alias == 0x3000 {
+                    written = stored & ~value
+                } else {
+                    core.assert(alias == 0)
+                }
+                // ERR_STICKY clears when written as one.
+                sticky := CS & (1u32 << 10)
+                if (written & (1u32 << 10)) != 0 {
+                    sticky = 0
+                }
+                CS = (written & 0x01FF_F00F) | (CS & (1u32 << 9)) | sticky
+                return
+            }
+            core.assert(alias == 0)
+            if register == 0x08 {
+                flags := FCS & ((1u32 << 10) | (1u32 << 11)) & ~value
+                FCS = (value & 0x0F00_000F) | flags
+            } else if register == 0x10 {
+                DIV = value & 0xFF_FFFF
+                NEXT_START = NOW
+            } else if register == 0x18 {
+                INTE = value & 1
+            } else {
+                core.assert(false)
+            }
+        }
+    }
+}
+
+fn cs() -> u32 {
+    unsafe {
+        return CS
+    }
+}
+
+fn fcs() -> u32 {
+    unsafe {
+        return FCS
+    }
+}
+
+fn level() -> u32 {
+    unsafe {
+        return LEVEL
+    }
+}
+
+fn conversions() -> u32 {
+    unsafe {
+        return CONVERSIONS
+    }
+}
+
+fn fail_at(number: u32) {
+    unsafe {
+        FAIL_AT = number
+    }
+}
+
+// Let `steps` steps pass.
+fn idle(steps: u32) {
+    for _ in 0..steps {
+        step()
+    }
+}
+
+// --- The test channel --------------------------------------------------
+
+static mut LANE_ACTIVE: bool = false
+static mut LANE_DESTINATION: usize = 0
+static mut LANE_REMAINING: u32 = 0
+static mut LANE_SIZE: usize = 2
+static mut LANE_RING_MASK: usize = 0
+static mut LANE_PERIOD: u32 = 1
+static mut LANE_WAIT: u32 = 0
+static mut LANE_STARTS: u32 = 0
+static mut LANE_ABORTS: u32 = 0
+static mut LANE_FAIL: bool = false
+static mut LANE_ERROR: bool = false
+// The first transfer's FCS when it started moving, for checks.
+static mut LANE_FCS: u32 = 0
+
+fn reset_lane() {
+    unsafe {
+        LANE_ACTIVE = false
+        LANE_REMAINING = 0
+        LANE_PERIOD = 1
+        LANE_WAIT = 0
+        LANE_STARTS = 0
+        LANE_ABORTS = 0
+        LANE_FAIL = false
+        LANE_ERROR = false
+        LANE_FCS = 0
+    }
+}
+
+// Move one element out of the FIFO when it requests and the lane's pace
+// allows; a failing lane stops at its first element with a bus error.
+fn move_lane() {
+    unsafe {
+        if !LANE_ACTIVE {
+            return
+        }
+        LANE_WAIT += 1
+        if LANE_WAIT < LANE_PERIOD {
+            return
+        }
+        LANE_WAIT = 0
+        if !requesting() {
+            return
+        }
+        if LANE_FAIL {
+            LANE_FAIL = false
+            LANE_ERROR = true
+            LANE_ACTIVE = false
+            return
+        }
+        LANE_FCS = FCS
+        entry := pop()
+        if LANE_SIZE == 2 {
+            ptr.write(LANE_DESTINATION as *mut u16, (entry & 0xFFFF) as u16)
+        } else {
+            ptr.write(LANE_DESTINATION as *mut u8, (entry & 0xFF) as u8)
+        }
+        next := LANE_DESTINATION + LANE_SIZE
+        if LANE_RING_MASK != 0 {
+            next = (LANE_DESTINATION & ~LANE_RING_MASK) | (next & LANE_RING_MASK)
+        }
+        LANE_DESTINATION = next
+        LANE_REMAINING -= 1
+        if LANE_REMAINING == 0 {
+            LANE_ACTIVE = false
+        }
+    }
+}
+
+struct TestChannel: hal.DmaChannel {
+    max: u32
+
+    pub unsafe fn start(&mut self, transfer: hal.DmaTransfer) -> void!hal.Error {
+        if self.is_busy() {
+            return err(hal.Error.Busy)
+        }
+        if transfer.count > self.max {
+            return err(hal.Error.InvalidInput)
+        }
+        // Transfers from the ADC's FIFO into memory, paced by it.
+        core.assert(transfer.source == ADC_FIFO)
+        core.assert(!transfer.increment_source && transfer.increment_destination)
+        match &transfer.pace {
+            hal.DmaPace.Source => {}
+            _ => {
+                core.assert(false)
+            }
+        }
+        unsafe {
+            LANE_SIZE = hal.dma_width_bytes(&transfer.width)
+            core.assert(LANE_SIZE <= 2)
+            LANE_RING_MASK = 0
+            match &transfer.ring {
+                hal.DmaRing.None => {}
+                hal.DmaRing.Destination(bits) => {
+                    LANE_RING_MASK = (1usize << *bits as usize) - 1
+                }
+                hal.DmaRing.Source(bits) => {
+                    core.assert(false)
+                }
+            }
+            LANE_DESTINATION = transfer.destination
+            LANE_REMAINING = transfer.count
+            LANE_ACTIVE = transfer.count != 0
+            LANE_WAIT = 0
+            LANE_STARTS += 1
+        }
+        return ok()
+    }
+
+    pub fn is_busy(&mut self) -> bool {
+        step()
+        unsafe {
+            return LANE_ACTIVE
+        }
+    }
+
+    pub fn remaining(&mut self) -> u32 {
+        step()
+        unsafe {
+            if !LANE_ACTIVE && !LANE_ERROR {
+                return 0
+            }
+            return LANE_REMAINING
+        }
+    }
+
+    pub fn max_count(&mut self) -> u32 {
+        return self.max
+    }
+
+    pub fn abort(&mut self) {
+        unsafe {
+            if LANE_ACTIVE {
+                LANE_ABORTS += 1
+            }
+            LANE_ACTIVE = false
+        }
+    }
+
+    pub fn take_error(&mut self) -> void!hal.Error {
+        unsafe {
+            if LANE_ERROR {
+                LANE_ERROR = false
+                return err(hal.Error.Bus)
+            }
+        }
+        return ok()
+    }
+}
+
+fn lane_period(steps: u32) {
+    unsafe {
+        LANE_PERIOD = steps
+    }
+}
+
+fn lane_fail() {
+    unsafe {
+        LANE_FAIL = true
+    }
+}
+
+fn lane_starts() -> u32 {
+    unsafe {
+        return LANE_STARTS
+    }
+}
+
+fn lane_aborts() -> u32 {
+    unsafe {
+        return LANE_ABORTS
+    }
+}
+
+fn lane_active() -> bool {
+    unsafe {
+        return LANE_ACTIVE
+    }
+}
+
+fn lane_size() -> usize {
+    unsafe {
+        return LANE_SIZE
+    }
+}
+
+fn lane_fcs() -> u32 {
+    unsafe {
+        return LANE_FCS
+    }
+}
+
+// --- Helpers -------------------------------------------------------------
+
+fn expect_error(result: void!hal.Error, expected: hal.Error) {
+    match result {
+        ok() => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == expected)
+        }
+    }
+}
+
+fn expect_count_error(result: usize!hal.Error, expected: hal.Error) {
+    match result {
+        ok(count) => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == expected)
+        }
+    }
+}
+
+fn expect_divider_error(result: u32!hal.Error) {
+    match result {
+        ok(divider) => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == hal.Error.InvalidInput)
+        }
+    }
+}
+
+fn expect_sampler_error(result: rp_adc.Sampler<AdcView>!hal.Error, expected: hal.Error) {
+    match result {
+        ok(sampler) => {
+            sampler.release()
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == expected)
+        }
+    }
+}
+
+// The sample's value shows the input it came from.
+fn tagged_right(sample: u16) -> bool {
+    return (rp_adc.sample_value(sample) as u32) / 512 == rp_adc.sample_input(sample)
+}
+
+// Each of samples[..count] is tagged right, follows the round through
+// `inputs` from `first`, and is the conversion after the one before it.
+fn check_round(samples: &[u16], count: usize, inputs: u32, first: u32) {
+    input := first
+    for index in 0..count {
+        sample := samples[index]
+        core.assert(tagged_right(sample))
+        core.assert_eq(rp_adc.sample_input(sample), input)
+        core.assert(!rp_adc.sample_failed(sample))
+        if index > 0 {
+            before := (rp_adc.sample_value(samples[index - 1]) as u32) % 512
+            core.assert_eq((rp_adc.sample_value(sample) as u32) % 512, (before + 1) % 512)
+        }
+        input = next_input(inputs, input)
+    }
+}
+
+fn next_input(inputs: u32, input: u32) -> u32 {
+    next := input
+    for _ in 0..5 {
+        next = (next + 1) % 5
+        if (inputs & (1u32 << next)) != 0 {
+            return next
+        }
+    }
+    return input
+}
+
+fn started_sampler(inputs: u32, rate_hz: u32) -> rp_adc.Sampler<AdcView> {
+    reset_model()
+    view := AdcView {}
+    rp_adc.start(&mut view)!
+    return unsafe {
+        rp_adc.Sampler.new(AdcView {}, inputs, rate_hz)!
+    }
+}
+
+// --- Checks ----------------------------------------------------------------
+
+const ROUND: u32 = rp_adc.GPIO26 | rp_adc.GPIO28 | rp_adc.TEMPERATURE
+
+fn rates_and_sets() {
+    core.assert_eq(rp_adc.divider_for(500_000)!, 95u32 * 256)
+    core.assert_eq(rp_adc.divider_for(48_000)!, 999u32 * 256)
+    core.assert_eq(rp_adc.divider_for(10_000)!, 4799u32 * 256)
+    core.assert_eq(rp_adc.divider_for(733)!, 16_763_728u32)
+    // 44.1 kHz: 1088.4354 cycles, rounded to 1/256.
+    core.assert_eq(rp_adc.divider_for(44_100)!, 278_383u32)
+    expect_divider_error(rp_adc.divider_for(732))
+    expect_divider_error(rp_adc.divider_for(500_001))
+    expect_divider_error(rp_adc.divider_for(0))
+    core.assert_eq(rp_adc.rate_of(999 * 256), 48_000u32)
+    core.assert_eq(rp_adc.rate_of(16_763_728), 733u32)
+    core.assert_eq(rp_adc.rate_of(278_383), 44_100u32)
+    // Periods below a conversion run back to back.
+    core.assert_eq(rp_adc.rate_of(0), 500_000u32)
+    core.assert_eq(rp_adc.rate_of(10 * 256), 500_000u32)
+
+    core.assert_eq(rp_adc.input_count(ROUND), 3u32)
+    core.assert_eq(rp_adc.input_at(ROUND, 0), 0u32)
+    core.assert_eq(rp_adc.input_at(ROUND, 1), 2u32)
+    core.assert_eq(rp_adc.input_at(ROUND, 2), 4u32)
+    core.assert_eq(rp_adc.input_at(ROUND, 3), 0u32)
+    core.assert_eq(rp_adc.input_at(ROUND, 3001), 2u32)
+    core.assert_eq(rp_adc.input_at(rp_adc.GPIO29, 7), 3u32)
+    core.assert_eq(rp_adc.pins_of(rp_adc.GPIO26 | rp_adc.GPIO29 | rp_adc.TEMPERATURE), (1u32 << 26) | (1u32 << 29))
+    core.assert_eq(rp_adc.pin_input(27)!, rp_adc.GPIO27)
+    match rp_adc.pin_input(25) {
+        ok(bit) => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == hal.Error.InvalidInput)
+        }
+    }
+    rp_adc.check_inputs(rp_adc.ALL_INPUTS)!
+    expect_error(rp_adc.check_inputs(0), hal.Error.InvalidInput)
+    expect_error(rp_adc.check_inputs(1 << 5), hal.Error.InvalidInput)
+
+    core.assert_eq(rp_adc.sample_value(0xCABC), 0xABCu16)
+    core.assert_eq(rp_adc.sample_input(0xCABC), 4u32)
+    core.assert(rp_adc.sample_failed(0xCABC))
+    core.assert(!rp_adc.sample_failed(0x4ABC))
+
+    // Bad sets and rates are refused before the converter is touched.
+    reset_model()
+    expect_sampler_error(unsafe {
+        rp_adc.Sampler.new(AdcView {}, 0, 10_000)
+    }, hal.Error.InvalidInput)
+    expect_sampler_error(unsafe {
+        rp_adc.Sampler.new(AdcView {}, 0x20, 10_000)
+    }, hal.Error.InvalidInput)
+    expect_sampler_error(unsafe {
+        rp_adc.Sampler.new(AdcView {}, rp_adc.GPIO26, 600_000)
+    }, hal.Error.InvalidInput)
+    core.assert_eq(cs(), 0u32)
+}
+
+fn polled_rounds() {
+    sampler := started_sampler(ROUND, 48_000)
+    // The temperature sensor is powered from the start.
+    core.assert_eq(cs() & 3, 3u32)
+    core.assert(!sampler.is_running())
+    core.assert_eq(sampler.input_count(), 3u32)
+    core.assert_eq(sampler.rate_hz(), 48_000u32)
+    sampler.start()
+    core.assert(sampler.is_running())
+    unsafe {
+        core.assert_eq(DIV, 999u32 * 256)
+    }
+    // The FIFO with error flags, threshold 1; the round from input 0.
+    core.assert_eq(fcs(), 1u32 | 4 | (1u32 << 24))
+    core.assert_eq((cs() >> 16) & 0x1FF, ROUND)
+    core.assert((cs() & (1u32 << 3)) != 0)
+    core.assert_eq(sampler.next_input(), 0u32)
+    samples: [20]u16 = [0u16; 20]
+    sampler.read(&mut samples)!
+    check_round(&samples, 20, ROUND, 0)
+    core.assert_eq(sampler.next_input(), 4u32)
+    // Polled reads go on with the round.
+    more: [5]u16 = [0u16; 5]
+    got := 0usize
+    for got == 0 {
+        got = sampler.poll_read(&mut more)!
+    }
+    core.assert_eq(rp_adc.sample_input(more[0]), 4u32)
+    core.assert(tagged_right(more[0]))
+    // 48 000 conversions a second are 1000 cycles apart: about 31 steps.
+    before := conversions()
+    idle(310)
+    core.assert(conversions() - before >= 9 && conversions() - before <= 11)
+
+    // A failed conversion is flagged in its sample.
+    sampler.stop()
+    sampler.start()
+    fail_at(conversions() + 2)
+    sampler.read(&mut more)!
+    core.assert(!rp_adc.sample_failed(more[0]))
+    core.assert(rp_adc.sample_failed(more[1]))
+    core.assert(!rp_adc.sample_failed(more[2]))
+    core.assert_eq(rp_adc.sample_input(more[1]), 2u32)
+    // Starting again clears the sticky error flag.
+    core.assert((cs() & (1u32 << 10)) != 0)
+    sampler.start()
+    core.assert_eq(cs() & (1u32 << 10), 0u32)
+
+    // Stopping empties the FIFO and ends the round.
+    sampler.stop()
+    core.assert(!sampler.is_running())
+    core.assert_eq(cs() & (1u32 << 3), 0u32)
+    core.assert_eq((cs() >> 16) & 0x1FF, 0u32)
+    core.assert_eq(level(), 0u32)
+    core.assert_eq(fcs() & 0xF, 0u32)
+    stopped := conversions()
+    idle(100)
+    core.assert_eq(conversions(), stopped)
+    core.assert_eq(sampler.poll_read(&mut more)!, 0usize)
+    sampler.set_poll_limit(50)
+    expect_error(sampler.read(&mut more), hal.Error.Timeout)
+
+    // Release powers the sensor down and leaves the converter idle.
+    sampler.listen()
+    sampler.release()
+    core.assert_eq(cs(), 1u32)
+    unsafe {
+        core.assert_eq(DIV, 0u32)
+        core.assert_eq(INTE, 0u32)
+    }
+}
+
+fn single_input_and_rates() {
+    sampler := started_sampler(rp_adc.GPIO28, 500_000)
+    sampler.start()
+    // One input needs no round.
+    core.assert_eq((cs() >> 16) & 0x1FF, 0u32)
+    core.assert_eq((cs() >> 12) & 0xF, 2u32)
+    samples: [12]u16 = [0u16; 12]
+    sampler.read(&mut samples)!
+    check_round(&samples, 12, rp_adc.GPIO28, 2)
+    // At the highest rate, conversions run back to back: 3 steps each.
+    before := conversions()
+    idle(300)
+    core.assert(conversions() - before >= 7)
+    // The rate changes on the fly.
+    sampler.set_rate(10_000)!
+    unsafe {
+        core.assert_eq(DIV, 4799u32 * 256)
+    }
+    sampler.set_divider(0x12_3456)!
+    core.assert_eq(sampler.divider(), 0x12_3456u32)
+    expect_error(sampler.set_divider(0x100_0000), hal.Error.InvalidInput)
+    expect_error(sampler.set_rate(100), hal.Error.InvalidInput)
+    core.assert_eq(sampler.divider(), 0x12_3456u32)
+    sampler.release()
+}
+
+fn overruns_start_over() {
+    sampler := started_sampler(ROUND, 500_000)
+    sampler.start()
+    samples: [8]u16 = [0u16; 8]
+    sampler.read(&mut samples[..2])!
+    // Nobody reads for a while: the FIFO fills and drops results.
+    idle(100)
+    core.assert((fcs() & (1u32 << 11)) != 0)
+    expect_count_error(sampler.poll_read(&mut samples), hal.Error.Overrun)
+    // The sampler started over, at the lowest input.
+    core.assert_eq(fcs() & (1u32 << 11), 0u32)
+    core.assert(sampler.is_running())
+    core.assert_eq(sampler.next_input(), 0u32)
+    sampler.read(&mut samples)!
+    check_round(&samples, 8, ROUND, 0)
+    sampler.release()
+}
+
+fn eight_bits_and_interrupts() {
+    sampler := started_sampler(rp_adc.GPIO27 | rp_adc.GPIO29, 100_000)
+    sampler.start()
+    expect_error(sampler.set_eight_bit(true), hal.Error.Busy)
+    sampler.stop()
+    sampler.set_eight_bit(true)!
+    core.assert(sampler.is_eight_bit())
+    sampler.start()
+    core.assert_eq(fcs() & 0xF, 1u32 | 2 | 4)
+    samples: [6]u16 = [0u16; 6]
+    sampler.read(&mut samples)!
+    for index in 0..6usize {
+        sample := samples[index]
+        input := 1u32 + 2 * (index as u32 % 2)
+        core.assert_eq(rp_adc.sample_input(sample), input)
+        // The value's top bits still show the input: 512 / 16 = 32.
+        core.assert_eq(rp_adc.sample_value(sample) as u32 / 32, input)
+        core.assert(rp_adc.sample_value(sample) <= 255)
+    }
+    sampler.stop()
+
+    expect_error(sampler.set_threshold(0), hal.Error.InvalidInput)
+    expect_error(sampler.set_threshold(9), hal.Error.InvalidInput)
+    sampler.set_threshold(4)!
+    core.assert_eq(sampler.threshold(), 4u32)
+    sampler.listen()
+    core.assert(sampler.is_listening())
+    sampler.start()
+    core.assert_eq(threshold(), 4u32)
+    for level() < 3 {
+        step()
+    }
+    core.assert(!sampler.is_pending())
+    for level() < 4 {
+        step()
+    }
+    core.assert(sampler.is_pending())
+    // Reading ends the interrupt.
+    sampler.read(&mut samples[..4])!
+    core.assert(!sampler.is_pending() || level() >= 4)
+    // A new threshold applies at once, keeping the FIFO's other bits.
+    sampler.set_threshold(8)!
+    core.assert_eq(threshold(), 8u32)
+    core.assert_eq(fcs() & 0xF, 1u32 | 2 | 4)
+    sampler.ignore()
+    core.assert(!sampler.is_listening())
+    sampler.release()
+}
+
+fn dma_captures() {
+    sampler := started_sampler(ROUND, 250_000)
+    channel := TestChannel { max: 0xFFFF_FFFF }
+    samples: [30]u16 = [0u16; 30]
+    sampler.capture_at(ADC_FIFO, &mut channel, &mut samples)!
+    check_round(&samples, 30, ROUND, 0)
+    core.assert_eq(lane_size(), 2usize)
+    // The FIFO raised data requests from one sample on.
+    core.assert_eq(lane_fcs() & 0x0F00_000F, 1u32 | 4 | 8 | (1u32 << 24))
+    // The sampler is stopped again.
+    core.assert(!sampler.is_running())
+    core.assert_eq(cs() & (1u32 << 3), 0u32)
+    core.assert_eq(fcs() & 0xF, 0u32)
+    // Every capture is a fresh round.
+    sampler.capture_at(ADC_FIFO, &mut channel, &mut samples[..7])!
+    check_round(&samples, 7, ROUND, 0)
+    // An empty buffer captures nothing.
+    sampler.capture_at(ADC_FIFO, &mut channel, &mut samples[..0])!
+
+    // A running sampler, a buffer the channel cannot take at once.
+    sampler.start()
+    expect_error(sampler.capture_at(ADC_FIFO, &mut channel, &mut samples), hal.Error.Busy)
+    sampler.stop()
+    short := TestChannel { max: 10 }
+    expect_error(sampler.capture_at(ADC_FIFO, &mut short, &mut samples), hal.Error.InvalidInput)
+
+    // A bus error; a converter that is off, so the channel never moves;
+    // a channel that falls behind, so the FIFO overflows.
+    lane_fail()
+    expect_error(sampler.capture_at(ADC_FIFO, &mut channel, &mut samples), hal.Error.Bus)
+    core.assert_eq(cs() & (1u32 << 3), 0u32)
+    unsafe {
+        CS = 0
+    }
+    sampler.set_poll_limit(200)
+    aborts := lane_aborts()
+    expect_error(sampler.capture_at(ADC_FIFO, &mut channel, &mut samples), hal.Error.Timeout)
+    core.assert_eq(lane_aborts(), aborts + 1)
+    core.assert(!lane_active())
+    unsafe {
+        CS = 1
+    }
+    lane_period(40)
+    sampler.set_poll_limit(hal.DEFAULT_POLL_LIMIT)
+    expect_error(sampler.capture_at(ADC_FIFO, &mut channel, &mut samples), hal.Error.Overrun)
+    core.assert(!lane_active())
+    core.assert_eq(cs() & (1u32 << 3), 0u32)
+    lane_period(1)
+
+    // Eight-bit samples: shifted, untagged.
+    bytes: [24]u8 = [0u8; 24]
+    sampler.capture_bytes_at(ADC_FIFO, &mut channel, &mut bytes)!
+    core.assert_eq(lane_size(), 1usize)
+    core.assert_eq(lane_fcs() & 0xF, 1u32 | 2 | 4 | 8)
+    for index in 0..24usize {
+        core.assert_eq(bytes[index] as u32 / 32, rp_adc.input_at(ROUND, index))
+    }
+    sampler.release()
+}
+
+fn capture_sessions() {
+    sampler := started_sampler(rp_adc.GPIO26 | rp_adc.GPIO27, 100_000)
+    channel := TestChannel { max: 0xFFFF_FFFF }
+    samples: [16]u16 = [0u16; 16]
+    {
+        capture := sampler.dma_at(ADC_FIFO, &mut channel, &mut samples)!
+        core.assert_eq(capture.capacity(), 16usize)
+        expect_error(capture.start(0), hal.Error.InvalidInput)
+        expect_error(capture.start(17), hal.Error.InvalidInput)
+        capture.start(10)!
+        core.assert(capture.is_busy())
+        core.assert(capture.remaining() > 0)
+        expect_error(capture.start(10), hal.Error.Busy)
+        match capture.buffer() {
+            ok(buffer) => {
+                core.assert(false)
+            }
+            err(error) => {
+                core.assert(error == hal.Error.Busy)
+            }
+        }
+        for !capture.poll_finish()! {}
+        core.assert(!capture.is_busy())
+        core.assert_eq(capture.remaining(), 0usize)
+        core.assert_eq(cs() & (1u32 << 3), 0u32)
+        buffer := capture.buffer()!
+        check_round(buffer, 10, rp_adc.GPIO26 | rp_adc.GPIO27, 0)
+        core.assert_eq(buffer[10], 0u16)
+        capture.capture(16)!
+        again := capture.buffer()!
+        check_round(again, 16, rp_adc.GPIO26 | rp_adc.GPIO27, 0)
+        // Aborting stops the channel and the converter.
+        capture.start(16)!
+        capture.abort()
+        core.assert(!lane_active())
+        core.assert_eq(cs() & (1u32 << 3), 0u32)
+        capture.finish()!
+        // Dropping a running session does the same.
+        capture.start(16)!
+    }
+    core.assert(!lane_active())
+    core.assert_eq(cs() & (1u32 << 3), 0u32)
+    core.assert_eq(fcs() & 0xF, 0u32)
+    // The sampler works as before.
+    sampler.start()
+    sampler.read(&mut samples)!
+    check_round(&samples, 16, rp_adc.GPIO26 | rp_adc.GPIO27, 0)
+    // A session needs a stopped sampler.
+    match sampler.dma_at(ADC_FIFO, &mut channel, &mut samples) {
+        ok(capture) => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == hal.Error.Busy)
+        }
+    }
+    sampler.release()
+}
+
+// A 64-byte ring of 32 samples, aligned to its size.
+@align(64)
+static mut RING: [32]u16 = [0u16; 32]
+static mut SMALL: [9]u16 = [0u16; 9]
+
+fn streams() {
+    sampler := started_sampler(ROUND, 100_000)
+    channel := TestChannel { max: 0xFFFF_FFFF }
+    // Fewer than 8 aligned samples is no ring.
+    unsafe {
+        match sampler.stream_at(ADC_FIFO, &mut channel, &mut SMALL[1..8]) {
+            ok(stream) => {
+                core.assert(false)
+            }
+            err(error) => {
+                core.assert(error == hal.Error.InvalidInput)
+            }
+        }
+    }
+    read := 0usize
+    chunk: [7]u16 = [0u16; 7]
+    last: u16 = 0
+    unsafe {
+        stream := sampler.stream_at(ADC_FIFO, &mut channel, &mut RING)!
+        core.assert_eq(stream.ring_size(), 32usize)
+        core.assert(lane_active())
+        // Read 100 samples, round and round the ring, in odd chunks.
+        input := 0u32
+        for read < 100 {
+            got := stream.poll_read(&mut chunk)!
+            for index in 0..got {
+                sample := chunk[index]
+                core.assert(tagged_right(sample))
+                core.assert_eq(rp_adc.sample_input(sample), input)
+                if read > 0 {
+                    core.assert_eq((rp_adc.sample_value(sample) as u32) % 512, ((rp_adc.sample_value(last) as u32) % 512 + 1) % 512)
+                }
+                input = next_input(ROUND, input)
+                last = sample
+                read += 1
+            }
+        }
+        // The program falls behind by more than the ring.
+        for stream.available() < 32 {
+            step()
+        }
+        idle(400)
+        expect_count_error(stream.poll_read(&mut chunk), hal.Error.Overrun)
+        // Reading goes on with the newest samples, still tagged right.
+        got := 0usize
+        for got == 0 {
+            got = stream.poll_read(&mut chunk)!
+        }
+        for index in 0..got {
+            core.assert(tagged_right(chunk[index]))
+        }
+        core.assert_eq(stream.next_input(), next_input(ROUND, rp_adc.sample_input(chunk[got - 1])))
+        stream.read(&mut chunk)!
+        for index in 0..7usize {
+            core.assert(tagged_right(chunk[index]))
+        }
+    }
+    // Dropping the stream stops the channel and the converter.
+    core.assert(!lane_active())
+    core.assert_eq(cs() & (1u32 << 3), 0u32)
+
+    // A transfer that ends in a bus error is reported, and the stream goes
+    // on with the next.
+    lane_fail()
+    unsafe {
+        stream := sampler.stream_at(ADC_FIFO, &mut channel, &mut RING)!
+        failed := false
+        for _ in 0..1000 {
+            if !failed {
+                match stream.poll_read(&mut chunk) {
+                    ok(count) => {
+                        core.assert_eq(count, 0usize)
+                    }
+                    err(error) => {
+                        core.assert(error == hal.Error.Bus)
+                        failed = true
+                    }
+                }
+            }
+        }
+        core.assert(failed && lane_active())
+        stream.read(&mut chunk)!
+        check_round(&chunk, 7, ROUND, 0)
+    }
+
+    // A channel that moves only 20 samples per transfer: the stream starts
+    // the next one and loses nothing while it reads in time.
+    short := TestChannel { max: 20 }
+    unsafe {
+        stream := sampler.stream_at(ADC_FIFO, &mut short, &mut RING)!
+        samples: [9]u16 = [0u16; 9]
+        collected: [60]u16 = [0u16; 60]
+        total := 0usize
+        for total < 60 {
+            got := stream.poll_read(&mut samples)!
+            for index in 0..got {
+                if total < 60 {
+                    collected[total] = samples[index]
+                    total += 1
+                }
+            }
+        }
+        check_round(&collected, 60, ROUND, 0)
+        core.assert(lane_starts() >= 4)
+        // Late after a transfer ends, the FIFO has overflowed: the stream
+        // starts over at the lowest input.
+        for lane_active() {
+            got := stream.poll_read(&mut samples[..1])!
+        }
+        idle(200)
+        core.assert((fcs() & (1u32 << 11)) != 0)
+        expect_count_error(stream.poll_read(&mut samples), hal.Error.Overrun)
+        core.assert_eq(stream.next_input(), 0u32)
+        stream.read(&mut samples)!
+        check_round(&samples, 9, ROUND, 0)
+    }
+    sampler.release()
+}
+
+// --- The pin bank ----------------------------------------------------------
+
+static mut FUNCTIONS: [30]u32 = [0u32; 30]
+static mut PADS: [30]u32 = [0u32; 30]
+static mut ADC_RUNNING: bool = false
+static mut ADC_STARTS: u32 = 0
+// Plain memory standing in for the converter, with its aliases.
+static mut ADC_MEMORY: [4096]u32 = [0u32; 4096]
+
+struct BankChip {
+    pub fn route(&mut self, pin: u32, function: u32, clear: u32, set: u32) {
+        unsafe {
+            FUNCTIONS[pin as usize] = function
+            PADS[pin as usize] = (PADS[pin as usize] & ~clear) | set
+        }
+    }
+
+    pub fn reset(&mut self, controller: u32) -> void!hal.Error {
+        return ok()
+    }
+
+    pub fn hold(&mut self, controller: u32) {}
+
+    pub fn base(&self, controller: u32) -> usize {
+        core.assert(controller == rp_pins.ADC)
+        unsafe {
+            return ptr.from_mut(&mut ADC_MEMORY) as usize
+        }
+    }
+
+    pub fn clock_hz(&self) -> u32 {
+        return 125_000_000
+    }
+
+    pub fn pin_count(&self) -> u32 {
+        return 30
+    }
+
+    pub fn pwm_irq(&self) -> u32 {
+        return 4
+    }
+
+    pub fn pwm_slices(&self) -> u32 {
+        return 8
+    }
+
+    pub fn timer_base(&self) -> usize {
+        return 0
+    }
+
+    pub fn start_adc(&mut self) -> void!hal.Error {
+        unsafe {
+            core.assert(!ADC_RUNNING)
+            ADC_RUNNING = true
+            ADC_STARTS += 1
+        }
+        return ok()
+    }
+
+    pub fn stop_adc(&mut self) {
+        unsafe {
+            core.assert(ADC_RUNNING)
+            ADC_RUNNING = false
+        }
+    }
+
+    pub fn uart_aux(&self) -> bool {
+        return false
+    }
+
+    pub fn pio_blocks(&self) -> u32 {
+        return 2
+    }
+
+    pub fn pio_version(&self) -> u32 {
+        return 0
+    }
+
+    pub fn pio_irq(&self, block: u32) -> u32 {
+        return 7 + 2 * block
+    }
+}
+
+fn adc_running() -> bool {
+    unsafe {
+        return ADC_RUNNING
+    }
+}
+
+fn function(pin: u32) -> u32 {
+    unsafe {
+        return FUNCTIONS[pin as usize]
+    }
+}
+
+fn pad(pin: u32) -> u32 {
+    unsafe {
+        return PADS[pin as usize]
+    }
+}
+
+fn expect_bank_sampler_error(result: rp_adc.AdcSampler!hal.Error, expected: hal.Error) {
+    match result {
+        ok(sampler) => {
+            sampler.release()
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == expected)
+        }
+    }
+}
+
+fn expect_bank_analog_error(result: rp_adc.Analog!hal.Error, expected: hal.Error) {
+    match result {
+        ok(input) => {
+            input.release()
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == expected)
+        }
+    }
+}
+
+fn bank() {
+    bank := unsafe {
+        rp_pins.Bank.new(BankChip {})
+    }
+    unsafe {
+        PADS[26] = (1u32 << 6) | (1u32 << 2)
+    }
+    expect_bank_sampler_error(bank.sampler(0, 10_000, 22), hal.Error.InvalidInput)
+    expect_bank_sampler_error(bank.sampler(rp_adc.GPIO26, 1, 22), hal.Error.InvalidInput)
+    core.assert(!adc_running())
+    sampler := bank.sampler(rp_adc.GPIO26 | rp_adc.GPIO28 | rp_adc.TEMPERATURE, 10_000, 22)!
+    core.assert(adc_running())
+    core.assert_eq(sampler.irq(), 22u32)
+    core.assert_eq(sampler.rate_hz(), 10_000u32)
+    // Its pins are disconnected, with their digital inputs and pulls off.
+    core.assert_eq(function(26), 31u32)
+    core.assert_eq(function(28), 31u32)
+    core.assert_eq(pad(26), 1u32 << 7)
+    // The converter, its pins, and the sensor are taken.
+    expect_bank_analog_error(bank.analog(27), hal.Error.Busy)
+    expect_bank_analog_error(bank.analog(26), hal.Error.Busy)
+    expect_bank_analog_error(bank.temperature(), hal.Error.Busy)
+    expect_bank_sampler_error(bank.sampler(rp_adc.GPIO27, 10_000, 22), hal.Error.Busy)
+    match bank.gpio(28) {
+        ok(mask) => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == hal.Error.Busy)
+        }
+    }
+    // GPIO 27 is still free for other uses.
+    mask := bank.gpio(27)!
+    bank.release_gpio(mask)
+    bank.release_sampler(sampler)
+    core.assert(!adc_running())
+    // An input instead: a sampler would break its conversions.
+    knob := bank.analog(26)!
+    expect_bank_sampler_error(bank.sampler(rp_adc.GPIO28, 10_000, 22), hal.Error.Busy)
+    bank.release_analog(knob)
+    core.assert(!adc_running())
+    // The pins are free again.
+    sensor := bank.sampler(rp_adc.TEMPERATURE | rp_adc.GPIO26, 733, 22)!
+    bank.release_sampler(sensor)
+    mask = bank.gpio(26)!
+    bank.release_gpio(mask)
+    unsafe {
+        core.assert_eq(ADC_STARTS, 3u32)
+    }
+}
+
+fn main() {
+    rates_and_sets()
+    polled_rounds()
+    single_input_and_rates()
+    overruns_start_over()
+    eight_bits_and_interrupts()
+    dma_captures()
+    capture_sessions()
+    streams()
+    bank()
+}

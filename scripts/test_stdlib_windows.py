@@ -195,10 +195,13 @@ def main():
     if kernel32 is None:
         raise SystemExit("MinGW libkernel32.a not found; provide --kernel32 or install the MinGW development files")
     fixtures = [path.resolve() for path in args.fixture] if args.fixture else (
-        # window_events, window_frames and window_multi open real windows; tests/window_library.rs
-        # drives them. The gpu_metal_* fixtures need Metal, which only macOS has.
+        # window_events, window_frames, window_multi and window_desktop open real windows;
+        # tests/window_library.rs drives them. window_desktop also resizes its window and goes
+        # fullscreen, which needs a display. The gpu_metal_* fixtures need Metal, which only
+        # macOS has.
         sorted(path for path in (ROOT / "tests/stdlib").glob("*.dodo")
-               if path.name not in ("window_events.dodo", "window_frames.dodo", "window_multi.dodo")
+               if path.name not in ("window_events.dodo", "window_frames.dodo", "window_multi.dodo",
+                                    "window_desktop.dodo")
                and not path.name.startswith("gpu_metal")) +
         sorted(path for path in (ROOT / "tests/os").glob("*.dodo")
                if "_unix_" not in path.name and path.name not in (
@@ -291,8 +294,8 @@ def main():
                     exit_code = 0
                     if source.stem == "console_checks":
                         run_console([wine, str(exe)], env=env, cwd=work)
-                    elif source.stem == "gpu_checks":
-                        # Wine has no GPU std/gpu can use: the fixture must try
+                    elif source.stem in ("gpu_checks", "gpu_surface_checks"):
+                        # Wine has no GPU std/gpu can use: the fixtures must try
                         # every backend, report each failure and exit 2.
                         result = run([wine, str(exe)], env=env, cwd=work, allowed=(0, 2))
                         exit_code = result.returncode

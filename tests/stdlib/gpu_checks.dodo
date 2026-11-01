@@ -74,6 +74,12 @@ fn checks(device: &gpu.Device) -> void!gpu.Error {
     console.println("  copies")!
     check_lifetimes(device)?
     console.println("  lifetimes")!
+    check_staging(device)?
+    console.println("  staging")!
+    check_large_writes(device)?
+    console.println("  large writes")!
+    check_hazards(device)?
+    console.println("  hazards")!
     return ok()
 }
 
@@ -510,6 +516,176 @@ fn check_lifetimes(device: &gpu.Device) -> void!gpu.Error {
         pass.end()
     }
     device.wait()?
+    return ok()
+}
+
+// Writes wait for nothing: they queue up behind earlier submissions and in
+// front of later ones, in the order they were made.
+fn check_staging(device: &gpu.Device) -> void!gpu.Error {
+    // Many small writes, some to the same words, with no submission
+    // between them.
+    buffer := device.create_buffer(1024, gpu.BUFFER_COPY_DST | gpu.BUFFER_COPY_SRC)?
+    for round in 0u32..4 {
+        for i in 0u32..256 {
+            word := [i * 10 + round]
+            device.write_buffer(&buffer, (i * 4) as u64, gpu.u32_bytes(&word))?
+        }
+    }
+    words := [0u32; 256]
+    device.read_buffer(&buffer, 0, gpu.u32_bytes_mut(&mut words))?
+    for i in 0u32..256 {
+        assert(words[i as usize] == i * 10 + 3, "the last write to a word wins")
+    }
+    // Bytes that are not whole words.
+    bytes := [7u8, 8, 9]
+    device.write_buffer(&buffer, 1, &bytes)?
+    out := [0u8; 5]
+    device.read_buffer(&buffer, 0, &mut out)?
+    assert(out[0] == 3 && out[1] == 7 && out[2] == 8 && out[3] == 9 && out[4] == 13, "unaligned write")
+    // A write made after a command was recorded but before its encoder
+    // was submitted runs first, except on OpenGL, which runs commands as
+    // they are recorded.
+    if !same(api_label(device), "OpenGL") {
+        check_write_before_submit(device)?
+    }
+    // Texture writes to overlapping regions, the later one winning.
+    image := device.create_texture(gpu.TextureDescriptor.new(4, 4, gpu.FORMAT_RGBA8_UNORM, gpu.TEXTURE_COPY_DST | gpu.TEXTURE_COPY_SRC))?
+    reds := [RED; 16]
+    blues := [BLUE; 4]
+    device.write_texture(&image, image.region(), gpu.u32_bytes(&reds), 16)?
+    device.write_texture(&image, gpu.Region.new(1, 1, 2, 2), gpu.u32_bytes(&blues), 8)?
+    texels := [0u8; 64]
+    device.read_texture(&image, image.region(), &mut texels, 16)?
+    expect_pixel(&texels, 4, 0, 0, RED)
+    expect_pixel(&texels, 4, 1, 1, BLUE)
+    expect_pixel(&texels, 4, 2, 2, BLUE)
+    expect_pixel(&texels, 4, 3, 2, RED)
+    return ok()
+}
+
+fn check_write_before_submit(device: &gpu.Device) -> void!gpu.Error {
+    words := [0u32; 256]
+    values := [0u32; 256]
+    source := device.create_buffer_with_data(gpu.u32_bytes(&values), gpu.BUFFER_STORAGE | gpu.BUFFER_COPY_DST)?
+    target := device.create_buffer(1024, gpu.BUFFER_STORAGE | gpu.BUFFER_COPY_SRC)?
+    pipeline := double_pipeline(device)?
+    encoder := device.encoder()?
+    {
+        pass := encoder.compute_pass()
+        pass.set_pipeline(&pipeline)
+        pass.set_buffer(0, &source)
+        pass.set_buffer(1, &target)
+        pass.dispatch(4, 1, 1)
+    }
+    for i in 0usize..256 {
+        values[i] = i as u32 + 5
+    }
+    device.write_buffer(&source, 0, gpu.u32_bytes(&values))?
+    encoder.submit()?
+    device.read_buffer(&target, 0, gpu.u32_bytes_mut(&mut words))?
+    for i in 0usize..256 {
+        assert(words[i] == (i as u32 + 5) * 2, "the submission missed a write made before it")
+    }
+    return ok()
+}
+
+static mut CHUNK: [1048576]u8 = [0u8; 1048576]
+static mut WORDS: [6291456]u32 = [0u32; 6291456]
+
+// More pending data than the staging ring starts with, and writes too
+// large for it.
+fn check_large_writes(device: &gpu.Device) -> void!gpu.Error {
+    buffer := device.create_buffer(1048576, gpu.BUFFER_COPY_DST | gpu.BUFFER_COPY_SRC)?
+    for round in 0usize..24 {
+        fill_chunk(round as u8)
+        write_chunk(device, &buffer)?
+    }
+    out := [0u8; 16]
+    device.read_buffer(&buffer, 1048576 - 16, &mut out)?
+    for i in 0usize..16 {
+        assert(out[i] == 23, "the last of many large writes wins")
+    }
+    big := device.create_buffer(25165824, gpu.BUFFER_COPY_DST | gpu.BUFFER_COPY_SRC)?
+    write_words(device, &big)?
+    probe := [0u32; 4]
+    device.read_buffer(&big, 25165824 - 16, gpu.u32_bytes_mut(&mut probe))?
+    assert(probe[3] == 6291455, "the end of a write larger than the staging ring")
+    device.read_buffer(&big, 4096, gpu.u32_bytes_mut(&mut probe))?
+    assert(probe[0] == 1024, "the middle of a write larger than the staging ring")
+    return ok()
+}
+
+fn fill_chunk(value: u8) {
+    unsafe {
+        for i in 0usize..1048576 {
+            CHUNK[i] = value
+        }
+    }
+}
+
+fn write_chunk(device: &gpu.Device, buffer: &gpu.Buffer) -> void!gpu.Error {
+    unsafe {
+        return device.write_buffer(buffer, 0, &CHUNK)
+    }
+}
+
+fn write_words(device: &gpu.Device, buffer: &gpu.Buffer) -> void!gpu.Error {
+    unsafe {
+        for i in 0usize..6291456 {
+            WORDS[i] = i as u32
+        }
+        return device.write_buffer(buffer, 0, gpu.u32_bytes(&WORDS))
+    }
+}
+
+// Commands of one encoder that depend on each other: a copy feeding
+// vertices, a render pass feeding a sampled texture, and a copy
+// overwriting a texture an earlier pass sampled.
+fn check_hazards(device: &gpu.Device) -> void!gpu.Error {
+    pipeline := color_pipeline(device, false, gpu.CULL_NONE)?
+    // The triangle covering the left half, and a red color for each
+    // corner, reach their vertex buffers by copies in the same encoder.
+    positions := [-1.0f32, 1.0, 0.5, -1.0, -1.0, 0.5, 0.0, 1.0, 0.5, 0.0, 1.0, 0.5, -1.0, -1.0, 0.5, 0.0, -1.0, 0.5]
+    colors := [RED, RED, RED, RED, RED, RED]
+    position_source := device.create_buffer_with_data(gpu.f32_bytes(&positions), gpu.BUFFER_COPY_SRC)?
+    color_source := device.create_buffer_with_data(gpu.u32_bytes(&colors), gpu.BUFFER_COPY_SRC)?
+    position_buffer := device.create_buffer(72, gpu.BUFFER_VERTEX | gpu.BUFFER_COPY_DST)?
+    color_buffer := device.create_buffer(24, gpu.BUFFER_VERTEX | gpu.BUFFER_COPY_DST)?
+    first := device.create_texture(gpu.TextureDescriptor.new(16, 16, gpu.FORMAT_RGBA8_UNORM, gpu.TEXTURE_RENDER | gpu.TEXTURE_SAMPLED | gpu.TEXTURE_COPY_DST | gpu.TEXTURE_COPY_SRC))?
+    second := device.create_texture(gpu.TextureDescriptor.new(16, 16, gpu.FORMAT_RGBA8_UNORM, gpu.TEXTURE_RENDER | gpu.TEXTURE_COPY_SRC))?
+    sampler := device.create_sampler(gpu.SamplerDescriptor.nearest())?
+    fragment := gpu.ShaderSource { spirv: &TEXTURE_FRAGMENT_SPIRV, msl: MSL, glsl: TEXTURE_GLSL }
+    bindings := [gpu.BindingLayout.sampled_texture(0, gpu.STAGE_FRAGMENT)]
+    copier := screen_pipeline(device, &fragment, "texture_fragment", &bindings, gpu.BLEND_REPLACE)?
+    greens := [GREEN; 256]
+    green_source := device.create_buffer_with_data(gpu.u32_bytes(&greens), gpu.BUFFER_COPY_SRC)?
+    encoder := device.encoder()?
+    encoder.copy_buffer(&position_source, 0, &position_buffer, 0, 72)
+    encoder.copy_buffer(&color_source, 0, &color_buffer, 0, 24)
+    {
+        color := gpu.ColorAttachment.clear(&first, 0.0, 0.0, 1.0, 1.0)
+        pass := encoder.render_pass(color)
+        pass.set_pipeline(&pipeline)
+        pass.set_vertex_buffer(0, &position_buffer, 0)
+        pass.set_vertex_buffer(1, &color_buffer, 0)
+        pass.draw(6, 1, 0, 0)
+    }
+    {
+        color := gpu.ColorAttachment.clear(&second, 0.0, 0.0, 0.0, 1.0)
+        pass := encoder.render_pass(color)
+        pass.set_pipeline(&copier)
+        pass.set_texture(0, &first, &sampler)
+        pass.draw(3, 1, 0, 0)
+    }
+    encoder.copy_buffer_to_texture(&green_source, 0, 64, &first, first.region())
+    encoder.submit()?
+    pixels := [0u8; 1024]
+    device.read_texture(&second, second.region(), &mut pixels, 64)?
+    expect_pixel(&pixels, 16, 4, 8, RED)
+    expect_pixel(&pixels, 16, 12, 8, BLUE)
+    device.read_texture(&first, first.region(), &mut pixels, 64)?
+    expect_pixel(&pixels, 16, 4, 8, GREEN)
+    expect_pixel(&pixels, 16, 12, 8, GREEN)
     return ok()
 }
 

@@ -1,0 +1,540 @@
+package main
+
+import "std/embedded/chip/esp_rtc"
+import "std/embedded/chip/esp_watchdog"
+import "std/embedded/hal"
+
+// Host checks for the ESP32-C6 system drivers in std/embedded/chip:
+// esp_watchdog against a model of timer group 0's watchdog (MWDT) and the
+// LP_AON store registers, and esp_rtc against models of the LP timer, its
+// record, and the timer group's RTC calibration unit. The models follow
+// the rules the drivers rely on: the watchdog's registers change only while
+// unlocked with its key and take effect when WDT_CONF_UPDATE_EN latches
+// them; a watchdog reset clears the timer group but keeps LP_AON; the LP
+// timer counts on through resets and only shows its count once latched;
+// its target fires once the count reaches it.
+
+// --- Watchdog -------------------------------------------------------------
+
+const KEY: u32 = 0x50D8_3AA1
+const UPDATE: u32 = 1 << 22
+const WDT_EN: u32 = 1u32 << 31
+
+struct Chip {
+    // The written and the latched WDTCONFIG0 to WDTCONFIG2, and the lock.
+    config: [3]u32
+    active: [3]u32
+    protect: u32
+    // Counts of 10 us since the last feed.
+    counts: u32
+    // LP_AON STORE0 to STORE9.
+    store: [10]u32
+    // LP_CLKRST RESET_CAUSE after the last reset, and the resets so far.
+    cause: u32
+    resets: u32
+    micros: u64
+}
+
+static mut CHIP: Chip = Chip {
+    config: [0u32; 3],
+    active: [0u32; 3],
+    protect: 0,
+    counts: 0,
+    store: [0u32; 10],
+    cause: 0,
+    resets: 0,
+    micros: 0,
+}
+
+fn power_on() {
+    unsafe {
+        CHIP.config = [0u32; 3]
+        CHIP.active = [0u32; 3]
+        CHIP.protect = 0
+        CHIP.counts = 0
+        CHIP.store = [0u32; 10]
+        CHIP.cause = 0x15
+        CHIP.resets = 0
+        CHIP.micros = 0
+    }
+}
+
+fn clock() -> u64 {
+    unsafe {
+        return CHIP.micros
+    }
+}
+
+// A reset with cause `cause`: the timer group's registers clear, LP_AON
+// keeps its words.
+fn reset(cause: u32) {
+    unsafe {
+        CHIP.config = [0u32; 3]
+        CHIP.active = [0u32; 3]
+        CHIP.protect = 0
+        CHIP.counts = 0
+        CHIP.cause = cause
+        CHIP.resets += 1
+    }
+}
+
+fn elapse(microseconds: u32) {
+    unsafe {
+        CHIP.micros += microseconds as u64
+        if (CHIP.active[0] & WDT_EN) == 0 {
+            return
+        }
+        // Stage 0 resets the system, from the crystal through a prescaler
+        // of 400: a count every 10 us.
+        core.assert_eq((CHIP.active[0] >> 29) & 3, 3u32)
+        core.assert((CHIP.active[0] & (1u32 << 21)) != 0)
+        core.assert_eq(CHIP.active[1] >> 16, 400u32)
+        CHIP.counts += microseconds / 10
+        if CHIP.counts >= CHIP.active[2] {
+            reset(0x07)
+        }
+    }
+}
+
+fn resets() -> u32 {
+    unsafe {
+        return CHIP.resets
+    }
+}
+
+// Timer group 0's registers (`aon` false) or LP_AON's.
+struct Registers: hal.Registers {
+    aon: bool
+
+    pub fn read(&mut self, offset: usize) -> u32 {
+        unsafe {
+            if self.aon {
+                return CHIP.store[offset / 4]
+            }
+            core.assert(offset >= 0x48 && offset <= 0x50)
+            return CHIP.config[(offset - 0x48) / 4]
+        }
+    }
+
+    pub fn write(&mut self, offset: usize, value: u32) {
+        unsafe {
+            if self.aon {
+                // Only STORE0, STORE2, and STORE3: the ROM keeps its own
+                // flags in the others.
+                core.assert(offset == 0x00 || offset == 0x08 || offset == 0x0C)
+                CHIP.store[offset / 4] = value
+                return
+            }
+            if offset == 0x64 {
+                CHIP.protect = value
+                return
+            }
+            // Everything else only while unlocked.
+            core.assert_eq(CHIP.protect, KEY)
+            if offset == 0x60 {
+                CHIP.counts = 0
+                return
+            }
+            core.assert(offset >= 0x48 && offset <= 0x50)
+            index := (offset - 0x48) / 4
+            CHIP.config[index] = value & ~UPDATE
+            if index == 0 && (value & UPDATE) != 0 {
+                for slot in 0usize..3 {
+                    CHIP.active[slot] = CHIP.config[slot]
+                }
+            }
+        }
+    }
+}
+
+fn watchdog() -> esp_watchdog.Countdown<Registers> {
+    unsafe {
+        cause := CHIP.cause
+        return esp_watchdog.Countdown.new(Registers { aon: false }, Registers { aon: true }, cause, clock)
+    }
+}
+
+fn refused(result: void!hal.Error, expected: hal.Error) -> bool {
+    match result {
+        ok() => {
+            return false
+        }
+        err(error) => {
+            return error == expected
+        }
+    }
+}
+
+fn keep_alive<W: hal.Watchdog>(dog: &mut W) {
+    dog.feed()
+}
+
+fn watchdog_checks() {
+    power_on()
+    dog := watchdog()
+    core.assert(dog.reset_reason() == hal.ResetReason.Other)
+    core.assert(!dog.is_running())
+    core.assert_eq(dog.timeout_ms(), 0u32)
+    core.assert_eq(dog.remaining_us(), 0u32)
+    core.assert_eq(dog.max_timeout_ms(), esp_watchdog.MAX_TIMEOUT_MS)
+    core.assert(refused(dog.start(0), hal.Error.InvalidInput))
+    core.assert(refused(dog.start(esp_watchdog.MAX_TIMEOUT_MS + 1), hal.Error.InvalidInput))
+    dog.feed()
+    core.assert(!dog.is_running())
+
+    // An hour fits the count.
+    dog.start(esp_watchdog.MAX_TIMEOUT_MS)!
+    core.assert_eq(dog.remaining_us(), 3_600_000_000u32)
+    dog.start(100)!
+    core.assert(dog.is_running())
+    core.assert_eq(dog.timeout_ms(), 100u32)
+    core.assert_eq(dog.remaining_us(), 100_000u32)
+    unsafe {
+        core.assert_eq(CHIP.protect, 0u32)
+    }
+    elapse(60_000)
+    core.assert_eq(dog.remaining_us(), 40_000u32)
+    dog.feed()
+    core.assert_eq(dog.remaining_us(), 100_000u32)
+    elapse(60_000)
+    keep_alive(&mut dog)
+    elapse(99_990)
+    core.assert_eq(resets(), 0u32)
+    core.assert_eq(dog.remaining_us(), 10u32)
+    elapse(10)
+    core.assert_eq(resets(), 1u32)
+
+    // The program starts again: the watchdog's reset, read once.
+    again := watchdog()
+    core.assert(again.reset_reason() == hal.ResetReason.Timeout)
+    core.assert(!again.is_running())
+    // The boot ROM's flash boot protection resets through the same
+    // watchdog, without the mark: Other.
+    reset(0x07)
+    third := watchdog()
+    core.assert(third.reset_reason() == hal.ResetReason.Other)
+
+    // Stopped, it no longer resets the chip; started again, it counts from
+    // the new timeout.
+    third.start(50)!
+    elapse(40_000)
+    third.stop()
+    core.assert(!third.is_running())
+    core.assert_eq(third.remaining_us(), 0u32)
+    elapse(1_000_000)
+    core.assert_eq(resets(), 2u32)
+    third.start(10)!
+    elapse(9_000)
+    third.start(20)!
+    elapse(19_000)
+    core.assert_eq(resets(), 2u32)
+    elapse(1_000)
+    core.assert_eq(resets(), 3u32)
+
+    // restart() resets within one count, running or not.
+    dog = watchdog()
+    core.assert(dog.reset_reason() == hal.ResetReason.Timeout)
+    dog.set_scratch(0, 0x1234_5678)
+    dog.set_scratch(1, 0x9ABC_DEF0)
+    dog.restart()
+    elapse(10)
+    core.assert_eq(resets(), 4u32)
+    dog = watchdog()
+    core.assert(dog.reset_reason() == hal.ResetReason.Restart)
+    core.assert_eq(dog.scratch(0), 0x1234_5678u32)
+    core.assert_eq(dog.scratch(1), 0x9ABC_DEF0u32)
+    unsafe {
+        core.assert_eq(CHIP.store[2], 0x1234_5678u32)
+        core.assert_eq(CHIP.store[3], 0x9ABC_DEF0u32)
+    }
+
+    // Another reset while it ran, such as a software reset or flashing:
+    // Other, and the mark is gone afterwards.
+    dog.start(1000)!
+    reset(0x03)
+    dog = watchdog()
+    core.assert(dog.reset_reason() == hal.ResetReason.Other)
+    unsafe {
+        core.assert_eq(CHIP.store[0], 0u32)
+    }
+    // Power-up clears the scratch words.
+    power_on()
+    dog = watchdog()
+    core.assert_eq(dog.scratch(0), 0u32)
+}
+
+// --- Real-time clock ------------------------------------------------------
+
+// The LP timer, counting slow clock ticks; the record's words; and the
+// calibration unit.
+struct Timer {
+    ticks: u64
+    latched: u64
+    target_low: u32
+    target_high: u32
+    raw: u32
+    enabled: u32
+    // The slow clock's frequency the calibration unit measures, 0 when it
+    // does not run.
+    slow_hz: u64
+    calibration: u32
+    calibration_value: u32
+    calibration_timeout: u32
+    record: [8]u32
+}
+
+static mut TIMER: Timer = Timer {
+    ticks: 0,
+    latched: 0,
+    target_low: 0,
+    target_high: 0,
+    raw: 0,
+    enabled: 0,
+    slow_hz: 136_000,
+    calibration: 0x0001_9000,
+    calibration_value: 0,
+    calibration_timeout: 0,
+    record: [0u32; 8],
+}
+
+const REACHED: u32 = 1u32 << 31
+
+fn fire() {
+    unsafe {
+        if (TIMER.target_high & REACHED) != 0 {
+            target := ((TIMER.target_high as u64 & 0xFFFF) << 32) | TIMER.target_low as u64
+            if TIMER.ticks >= target {
+                TIMER.raw |= REACHED
+            }
+        }
+    }
+}
+
+fn advance(ticks: u64) {
+    unsafe {
+        TIMER.ticks += ticks
+    }
+    fire()
+}
+
+// The LP timer's registers (`record` false) or the record's words.
+struct LpTimer: hal.Registers {
+    record: bool
+
+    pub fn read(&mut self, offset: usize) -> u32 {
+        fire()
+        unsafe {
+            if self.record {
+                return TIMER.record[offset / 4]
+            }
+            if offset == 0x00 {
+                return TIMER.target_low
+            } else if offset == 0x04 {
+                return TIMER.target_high
+            } else if offset == 0x14 {
+                return (TIMER.latched & 0xFFFF_FFFF) as u32
+            } else if offset == 0x18 {
+                return ((TIMER.latched >> 32) & 0xFFFF) as u32
+            } else if offset == 0x28 {
+                return TIMER.raw
+            }
+            core.assert_eq(offset, 0x30usize)
+            return TIMER.enabled
+        }
+    }
+
+    pub fn write(&mut self, offset: usize, value: u32) {
+        unsafe {
+            if self.record {
+                core.assert(offset < 32)
+                TIMER.record[offset / 4] = value
+                return
+            }
+            if offset == 0x00 {
+                TIMER.target_low = value
+            } else if offset == 0x04 {
+                TIMER.target_high = value
+            } else if offset == 0x10 {
+                core.assert_eq(value, 1u32 << 28)
+                TIMER.latched = TIMER.ticks
+            } else if offset == 0x30 {
+                TIMER.enabled = value
+            } else {
+                core.assert_eq(offset, 0x34usize)
+                TIMER.raw &= ~value
+            }
+        }
+        fire()
+    }
+}
+
+// TIMG0's calibration unit: a start counts the crystal's cycles over the
+// slow clock's, ready at the next read.
+struct Calibration: hal.Registers {
+    pub fn read(&mut self, offset: usize) -> u32 {
+        unsafe {
+            if offset == 0x68 {
+                if (TIMER.calibration & (1u32 << 31)) != 0 && TIMER.slow_hz != 0 {
+                    TIMER.calibration |= 1 << 15
+                }
+                return TIMER.calibration
+            } else if offset == 0x6C {
+                return TIMER.calibration_value << 7
+            }
+            core.assert_eq(offset, 0x80usize)
+            if (TIMER.calibration & (1u32 << 31)) != 0 && TIMER.slow_hz == 0 {
+                return TIMER.calibration_timeout | 1
+            }
+            return TIMER.calibration_timeout
+        }
+    }
+
+    pub fn write(&mut self, offset: usize, value: u32) {
+        unsafe {
+            if offset == 0x68 {
+                // Periodic calibration and a start together are no use.
+                core.assert(!((value & (1u32 << 12)) != 0 && (value & (1u32 << 31)) != 0))
+                TIMER.calibration = value & ~(1u32 << 15)
+                cycles := (value >> 16) & 0x7FFF
+                if (value & (1u32 << 31)) != 0 && TIMER.slow_hz != 0 {
+                    // Only the RTC slow clock is measured.
+                    core.assert_eq((value >> 13) & 3, 0u32)
+                    TIMER.calibration_value = (cycles as u64 * 40_000_000 / TIMER.slow_hz) as u32
+                }
+                return
+            }
+            core.assert_eq(offset, 0x80usize)
+            TIMER.calibration_timeout = value & ~1u32
+        }
+    }
+}
+
+fn new_clock(period: u32) -> esp_rtc.Clock<LpTimer> {
+    unsafe {
+        return esp_rtc.Clock.new(LpTimer { record: false }, LpTimer { record: true }, period)
+    }
+}
+
+fn period_of(hz: u64) -> u32 {
+    return ((1_000_000u64 << 19) / hz) as u32
+}
+
+fn now(clock: &mut esp_rtc.Clock<LpTimer>) -> u64 {
+    return clock.now_ms()!
+}
+
+fn rtc_checks() {
+    // Calibration: 1024 cycles of 136 kHz are 301_176 crystal cycles.
+    calibration := Calibration {}
+    period := unsafe {
+        esp_rtc.calibrate(&mut calibration, 1024)!
+    }
+    core.assert(period >= period_of(136_000) - 10 && period <= period_of(136_000) + 10)
+    unsafe {
+        // The periodic calibration the chip starts with is stopped.
+        core.assert_eq(TIMER.calibration & (1u32 << 12), 0u32)
+        TIMER.slow_hz = 0
+        core.assert(match esp_rtc.calibrate(&mut calibration, 1024) {
+            ok(_) => false,
+            err(error) => error == hal.Error.Timeout,
+        })
+        core.assert(match esp_rtc.calibrate(&mut calibration, 0) {
+            ok(_) => false,
+            err(error) => error == hal.Error.InvalidInput,
+        })
+        TIMER.slow_hz = 136_000
+        // LP SRAM holds garbage after power-up.
+        TIMER.record = [0xDEAD_BEEFu32, 1, 2, 3, 4, 5, 6, 7]
+        TIMER.ticks = 0x1_2345_6789
+    }
+
+    // Not set: no time, no alarm.
+    clock := new_clock(period)
+    core.assert(!clock.is_set()!)
+    core.assert_eq(clock.period(), period)
+    core.assert_eq(clock.resolution_ms(), 1u32)
+    core.assert(match clock.now_ms() {
+        ok(_) => false,
+        err(error) => error == hal.Error.Busy,
+    })
+    core.assert(refused(clock.set_alarm_ms(5), hal.Error.Busy))
+
+    // Set, it counts a second per second of ticks.
+    start := 1_767_225_600_000u64
+    clock.set_ms(start)!
+    core.assert(clock.is_set()!)
+    core.assert_eq(now(&mut clock), start)
+    advance(136_000)
+    shown := now(&mut clock)
+    core.assert(shown >= start + 999 && shown <= start + 1001)
+    core.assert_eq(clock.ticks(), 0x1_2345_6789u64 + 136_000)
+
+    // After a reset, with a new calibration, the time goes on from where it
+    // was, converted with the new period from then on.
+    before := now(&mut clock)
+    clock = new_clock(period_of(68_000))
+    core.assert(clock.is_set()!)
+    core.assert_eq(now(&mut clock), before)
+    advance(68_000)
+    shown = now(&mut clock)
+    core.assert(shown >= before + 999 && shown <= before + 1001)
+    // A period of 0 keeps the record's.
+    clock = new_clock(0)
+    core.assert_eq(clock.period(), period_of(68_000))
+    core.assert(refused(clock.set_period(0), hal.Error.InvalidInput))
+    clock.set_period(period_of(136_000))!
+    core.assert_eq(now(&mut clock), shown)
+
+    // The alarm fires once the clock reaches its time, and clears.
+    clock.set_alarm_ms(shown + 50)!
+    core.assert(!clock.alarm_fired()!)
+    advance(136 * 49)
+    core.assert(!clock.alarm_fired()!)
+    advance(136 * 2)
+    core.assert(clock.alarm_fired()!)
+    clock.clear_alarm()!
+    core.assert(!clock.alarm_fired()!)
+    advance(136_000)
+    core.assert(!clock.alarm_fired()!)
+    // A time already reached fires at once.
+    clock.set_alarm_ms(shown)!
+    core.assert(clock.alarm_fired()!)
+    clock.clear_alarm()!
+    // Too far ahead.
+    core.assert(refused(clock.set_alarm_ms(shown + 400 * 86_400_000), hal.Error.InvalidInput))
+
+    // The interrupt.
+    core.assert(!clock.is_listening())
+    clock.listen()
+    core.assert(clock.is_listening())
+    unsafe {
+        core.assert_eq(TIMER.enabled, REACHED)
+    }
+    clock.ignore()
+    core.assert(!clock.is_listening())
+
+    // A damaged record reads as not set, and so does an unset clock.
+    unsafe {
+        TIMER.record[3] ^= 1
+    }
+    clock = new_clock(period)
+    core.assert(!clock.is_set()!)
+    clock.set_ms(start)!
+    core.assert(clock.is_set()!)
+    clock.unset()
+    core.assert(!clock.is_set()!)
+
+    // Conversions over a 48-bit count do not overflow.
+    big := 0xFFFF_FFFF_FFFFu64
+    microseconds := esp_rtc.ticks_to_us(big, period_of(136_000))
+    // The period's rounding is 0.2 ppm: 440 s over the count's 65 years.
+    core.assert(microseconds / 1_000_000 >= big / 136_000 - 1000 && microseconds / 1_000_000 <= big / 136_000 + 1000)
+    half := esp_rtc.ticks_to_us(big / 2, period_of(136_000))
+    core.assert(microseconds >= 2 * half && microseconds <= 2 * half + 8)
+    core.assert_eq(esp_rtc.us_to_ticks(1_000_000, period_of(136_000)) / 10, 13_600u64)
+}
+
+fn main() {
+    watchdog_checks()
+    rtc_checks()
+}

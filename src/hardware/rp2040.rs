@@ -1,25 +1,30 @@
 //! Raspberry Pi RP2040: dual Cortex-M0+, 264 KiB SRAM, external QSPI flash
 //! executed in place, and a boot ROM with a UF2 USB bootloader. The matching
 //! peripheral support is `std/embedded/chip/rp2040`.
-use super::{Chip, ImageFormat, Platform, Region, image::Segment, serial::UsbId};
+use std::borrow::Cow;
+
+use super::{Chip, ImageFormat, InterruptAbi, Platform, Region, image::Segment, serial::UsbId};
 
 pub static CHIP: Chip = Chip {
     name: "rp2040",
     description: "Raspberry Pi RP2040",
     triple: "thumbv6m-none-eabi",
     cpu: "cortex-m0plus",
+    features: "",
     flash_origin: 0x1000_0000,
     default_flash_size: 2 * 1024 * 1024,
     ram: Region {
         origin: 0x2000_0000,
         length: 264 * 1024,
     },
-    runtime: concat!(
-        include_str!("rp2040/runtime.ll"),
-        include_str!("arm_eabi.ll"),
-        include_str!("arm_float.ll"),
-        include_str!("arm_float_soft.ll")
-    ),
+    runtime: || {
+        Cow::Borrowed(concat!(
+            include_str!("rp2040/runtime.ll"),
+            include_str!("arm_eabi.ll"),
+            include_str!("arm_float.ll"),
+            include_str!("rp2040/float.ll")
+        ))
+    },
     linker_script: include_str!("rp2040/link.ld"),
     panic_hook: "dodo_board_panic",
     interrupts: &[
@@ -56,6 +61,8 @@ pub static CHIP: Chip = Chip {
         "I2C1_IRQ",
         "RTC_IRQ",
     ],
+    interrupt_abi: InterruptAbi::Vector,
+    opt_level: 0,
     linker: "ld.lld",
     package: "std/embedded/chip/rp2040",
     image: ImageFormat::Uf2 {

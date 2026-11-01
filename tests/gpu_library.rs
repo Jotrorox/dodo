@@ -78,6 +78,11 @@ fn gpu_builds_for_every_hosted_target() {
         ("checks", root().join("tests/stdlib/gpu_checks.dodo")),
         ("compute", root().join("examples/gpu_compute.dodo")),
         ("triangle", root().join("examples/gpu_triangle.dodo")),
+        ("window", root().join("examples/gpu_window.dodo")),
+        (
+            "surface",
+            root().join("tests/stdlib/gpu_surface_checks.dodo"),
+        ),
     ] {
         for target in HOSTED_TARGETS {
             let object = scratch.0.join(format!("{name}-{target}.o"));
@@ -126,6 +131,31 @@ fn gpu_checks_run_on_every_available_backend() {
                 String::from_utf8_lossy(&output.stderr)
             ),
         }
+    }
+}
+
+/// The checks again with DODO_GPU_UNMAPPED, which makes the Vulkan backend
+/// treat buffers as unmapped, as on a GPU with memory of its own: writes
+/// then go through GPU copies and reads through the host-cached readback
+/// buffer even on unified-memory GPUs. Other backends ignore it.
+#[test]
+fn gpu_checks_pass_with_unmapped_buffers() {
+    let scratch = Scratch::new("unmapped");
+    let program = executable(&scratch, "checks");
+    build(&root().join("tests/stdlib/gpu_checks.dodo"), &program, "0");
+    let output = Command::new(&program)
+        .env("DODO_GPU_UNMAPPED", "1")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    match output.status.code() {
+        Some(0) => assert!(stdout.ends_with("gpu ok\n"), "{stdout}"),
+        Some(2) => assert!(stdout.ends_with("no backend\n"), "{stdout}"),
+        _ => panic!(
+            "gpu checks with unmapped buffers: {}\n{stdout}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        ),
     }
 }
 

@@ -1,0 +1,82 @@
+package checks
+
+import "core/ptr"
+import "std/embedded/chip"
+import "std/fmt"
+
+// What the Arduino Uno self-tests share: reporting a check on the serial
+// port, and values the optimizer cannot see through, so the runtime helpers
+// really run.
+
+static mut PASSED: u16 = 0
+static mut TOTAL: u16 = 0
+
+// Report a check as `ok N name` or `FAIL N name (got detail)`.
+@inline(never)
+pub fn check(out: &mut chip.Serial, passed: bool, name: &str, detail: u32) {
+    number := unsafe {
+        TOTAL += 1
+        TOTAL
+    }
+    if passed {
+        unsafe {
+            PASSED += 1
+        }
+        fmt.printf(out, "ok {} {}\n", number, name)!
+    } else {
+        fmt.printf(out, "FAIL {} {} (got {})\n", number, name, detail)!
+    }
+}
+
+// Report `done PASSED/TOTAL`.
+pub fn finish(out: &mut chip.Serial) {
+    passed := unsafe {
+        PASSED
+    }
+    total := unsafe {
+        TOTAL
+    }
+    fmt.printf(out, "done {}/{}\n", passed, total)!
+}
+
+pub fn opaque32(value: u32) -> u32 {
+    slot := value
+    unsafe {
+        return ptr.read_volatile(ptr.from_ref(&slot))
+    }
+}
+
+pub fn opaque64(value: u64) -> u64 {
+    slot := value
+    unsafe {
+        return ptr.read_volatile(ptr.from_ref(&slot))
+    }
+}
+
+pub fn opaque_i32(value: i32) -> i32 {
+    slot := value
+    unsafe {
+        return ptr.read_volatile(ptr.from_ref(&slot))
+    }
+}
+
+pub fn opaque_i64(value: i64) -> i64 {
+    slot := value
+    unsafe {
+        return ptr.read_volatile(ptr.from_ref(&slot))
+    }
+}
+
+pub fn opaque_f32(value: f32) -> f32 {
+    slot := value
+    unsafe {
+        return ptr.read_volatile(ptr.from_ref(&slot))
+    }
+}
+
+pub fn opaque_f64(value: f64) -> f64 {
+    slot := value
+    unsafe {
+        return ptr.read_volatile(ptr.from_ref(&slot))
+    }
+}

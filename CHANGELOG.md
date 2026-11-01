@@ -41,6 +41,136 @@
   decompress JPEG XL `brob` metadata boxes, `jxl.metadata` reports the
   Exif/XMP inside them, `std/image_alloc` keeps their EXIF, and
   `imgtool info` shows decoded metadata sizes.
+- New board `esp32c6_devkitc`, the Espressif ESP32-C6-DevKitC-1, on the new
+  `esp32c6` chip: the first RISC-V firmware target (`riscv32-unknown-none-elf`,
+  RV32IMAC). The firmware boots through the boot ROM's direct boot, so the
+  image is the linked program from flash offset 0, with no bootloader or
+  partition table, and the runtime starts the chip (watchdogs off, DMA's
+  access to SRAM, flash at 80 MHz dual I/O) and dispatches the 77 interrupt
+  sources to `@interrupt(NAME)` handlers, which are ordinary functions on this
+  chip. `dodo run` flashes through the boot ROM's serial protocol over the
+  chip's own USB serial port or a USB serial adapter, with no button and no
+  external tool, checks the result by MD5, and skips unchanged images.
+  `std/embedded/chip/esp32c6` covers clocks (160 MHz from the PLL, set at
+  every start along with the PMU's active state, which survives resets),
+  GPIO on any pin through the GPIO matrix, the interrupt matrix, I2C and SPI
+  as master, polled (`hal.I2cPoll`, `hal.SpiPoll`), or target
+  (`i2c_target`, `spi_target`), SPI with the controller's own chip select
+  (`spi_with_select`) and by DMA (`hal.SpiDma`), both UARTs and the USB
+  serial port with `serial.Port` and `serial.PollPort`, CAN on both TWAI
+  controllers (`hal.Can`, new driver `std/embedded/peripheral/esp_twai`),
+  I2S audio output and input by DMA (`hal.I2sOutput`, `hal.I2sInput`,
+  `std/embedded/chip/esp_i2s`), PWM outputs and inputs (`hal.PwmInput` on
+  the MCPWM capture unit, `esp_capture`), the ADC calibrated from eFuse, the
+  temperature sensor, the system timer's alarms as executor clocks, DMA
+  copies, and WS2812 LEDs, with new drivers
+  `std/embedded/peripheral/esp_i2c`, `esp_spi`, `esp_uart`, and
+  `esp_usb_serial`. The board contract's `rng` (the hardware generator, fit
+  for keys while no analog input is claimed, `esp_rng`), `watchdog` (timer
+  group 0's, with `rp_watchdog`'s interface, reset reasons, and scratch
+  words, `esp_watchdog`), `rtc` (the low-power timer, which keeps counting
+  through resets, calibrated against the crystal, `esp_rtc`), `flash`
+  (`rp_flash`'s regions above the program, for `std/embedded/storage`,
+  `esp_flash`), and `power` (`std/embedded/power`: clock gating on the 57
+  gates of the clock controller, every `wfi` with the CPU clock stopped,
+  deep sleep as clock gating around each wait through a new weak
+  `dodo_wait_for_interrupt` hook that the compiler calls for `wfi` on
+  RISC-V, and a dormant state in the PMU's light sleep, `esp_power`) are all
+  there. `std/embedded/board/esp32c6_devkitc` makes the RGB LED the board's
+  `led`. The portable board examples build unchanged,
+  `examples/esp32c6_tasks` shows tasks woken by the board's interrupts, and
+  `scripts/test_esp32c6.py` runs a 51-check hardware self-test and, with
+  `--project`, 98 more checks of the buses, CAN, I2S, PWM input, system
+  services, and low power in `tests/hardware/esp32c6_*`, which pass at -O0
+  to -O3.
+- Functions placed with `@section`, such as `@section(".ramfunc")`, are no
+  longer inlined into their callers, which would have run their code from the
+  caller's section instead.
+- 64-bit integer division in firmware takes one 32-bit division when both
+  operands fit in 32 bits, instead of 64 shift-and-subtract steps.
+- `gpu.wgsl("...")` writes a std/gpu shader once in WGSL: the compiler
+  translates it into SPIR-V, Metal Shading Language and GLSL 4.50 when the
+  program is built (through the `naga` crate, behind the new default `wgsl`
+  feature), so one source runs on Vulkan, Metal and OpenGL with no shader
+  tools installed. Mistakes are compile errors pointing into the literal.
+  Slot N is `@group(0) @binding(N)`, and a sampled texture's sampler is
+  `@group(1) @binding(N)`. See [Shaders in WGSL](docs/src/content/docs/gpu.md).
+- `gpu.Surface` presents std/gpu frames in std/window windows: a Vulkan
+  swapchain on Linux and Windows, the view's `CAMetalLayer` on macOS, or the
+  window's own OpenGL context (from the new `gpu.Device.open_for_window`).
+  `acquire()` hands out a frame to render into, `present()` shows it, with
+  two or three frames in flight (`gpu.SurfaceOptions`) and `resize()` for
+  window size changes; the new `gpu.Error.Outdated` asks for one. See
+  [Surfaces](docs/src/content/docs/gpu.md) and the new
+  `examples/gpu_window.dodo`.
+- std/gpu no longer waits for the GPU to write data: `write_buffer`,
+  `write_texture` and `create_buffer_with_data` copy into a staging ring and
+  record the copy into a command buffer submitted ahead of the next
+  submission, still ordered as before. On Vulkan, buffers and images are
+  carved out of large memory blocks, buffers live in device memory (mapped on
+  unified-memory GPUs), and reads come back through host-cached memory.
+  `DODO_GPU_UNMAPPED` makes the Vulkan backend take the discrete-GPU paths
+  anywhere, for testing.
+- std/gpu derives barriers from how commands use each buffer and texture
+  instead of placing a full barrier before every pass, copy and dispatch on
+  Vulkan (where render passes now record into secondary command buffers) or
+  after every pass and dispatch on OpenGL. Vulkan command pools are reused.
+- The std/gpu examples write their shaders once in WGSL.
+- Arduino Uno support: `board = "arduino_uno"` (or `--board arduino_uno`) on
+  the new `atmega328p` chip, an 8-bit AVR. `dodo run` flashes the board
+  itself through its Optiboot bootloader over the USB serial port, speaking
+  STK500 version 1 and verifying every page, so avrdude is not needed;
+  `dodo build` writes an `.elf` and an Intel HEX `.hex`.
+  `std/embedded/chip/atmega328p` and `std/embedded/board/arduino_uno` give the
+  board contract's pins, timer, serial port (with a 32-byte interrupt-driven
+  receive buffer), I2C, SPI, PWM on all six PWM pins, the ADC and temperature
+  sensor, the watchdog, and the EEPROM, and board-generic programs such as
+  `examples/blink` and `examples/serial_console.dodo` run unchanged. The
+  compiler's AVR runtime is LLVM IR like the others: startup, a Timer 0 time
+  base, libgcc-compatible division and multiplication helpers, atomics, and
+  correctly rounded `f32` (native 32-bit code) and `f64` arithmetic. Panic
+  messages stay in flash rather than the 2 KiB of SRAM. AVR builds default to
+  `-O 2` and optimize for size. `scripts/test_arduino_uno.py` runs the
+  board's self-test.
+- Function values on targets whose code has its own address space, such as
+  AVR, use that address space: function pointers, closures, `dyn` method
+  tables, and `@interrupt` handlers (which get AVR's signal ABI) compile for
+  AVR, and `core/cpu`'s interrupt control and `wait_for_interrupt` work there.
+
+- `std/window` has the basics desktop programs such as text editors need.
+  `app.set_clipboard_text(text)` and `app.clipboard_text()` copy and paste
+  text through the system clipboard (`NSPasteboard`, the Win32 clipboard,
+  and the X11 CLIPBOARD selection, which the App serves to other programs
+  from its event loop, with large texts in both directions and Latin-1
+  `STRING` from older programs). `win.set_cursor(window.Cursor.Text)` and ten
+  other standard shapes set the pointer over a window. `win.set_size`,
+  `win.set_min_size` and `win.set_max_size` resize a window from code and
+  limit the sizes the user can give it, and `win.set_fullscreen(on)` and
+  `win.is_fullscreen()` switch to fullscreen: a fullscreen space on macOS, a
+  borderless window covering the monitor on Windows, and `_NET_WM_STATE` on
+  X11, where a window without a window manager covers the screen itself. See
+  the [Windows guide](docs/src/content/docs/window.md#clipboard).
+- Global and naked assembly. Top-level `unsafe asm("...")` is emitted into
+  the object file outside any function, for startup code, functions written
+  entirely in assembly, or tables. `@naked` marks an `extern "C"` function
+  whose body is one `unsafe { asm(...) }` and which has no prologue or
+  epilogue, such as a fault handler that reads the stacked frame. Assembly
+  of every kind takes two new operands: `sym name` writes the link symbol
+  of a function or static into the template (with Mach-O's underscore, and
+  keeping the definition even when only assembly uses it), and `const value`
+  writes an integer constant expression. See
+  [global assembly](docs/src/content/docs/memory-and-ffi.md#global-assembly)
+  and [naked functions](docs/src/content/docs/memory-and-ffi.md#naked-functions).
+- Fixed: a struct field named `len` failed code generation ("is not an
+  array or slice") because every `.len` was compiled as a collection length.
+  `len` is now the built-in length only on arrays, slices and strings.
+- Results with a value (`T!E`) and enums with payloads return in registers.
+  The shared payload storage is now made of integer words instead of bytes.
+  Byte storage made an `i64!E` result nine separate return values to LLVM,
+  so it went through a hidden memory slot that the caller reassembled byte
+  by byte. A loop of 300 million non-inlined `i64!E` calls runs in 0.36 s
+  instead of 1.52 s on an M-series Mac. Layout sizes and alignments are
+  unchanged.
 - New database packages. `std/db` holds the shared vocabulary for drivers:
   `db.Error` with portable `db.ErrorKind`s and `db.Constraint`s plus the
   driver's native code, the borrowed `db.Value`, and `db.IsolationLevel`.
@@ -61,6 +191,19 @@
   common pragmas, and SQLite's core, aggregate, and date/time functions with
   its type affinity rules. Differential tests compare results and written
   files against SQLite. See the new [SQLite guide](docs/src/content/docs/sqlite.md).
+- `@derive(Row)` maps structs to SQL rows for any `std/db/sql` driver. It
+  generates `decode_row<R: sql.Row>(row: &R) -> Self!db.Error`, which matches
+  columns by name and borrows text and blobs from the row without copying, and
+  `params(&self) -> [N]db.Value` for statement parameters. Fields can be
+  integers, floats, `bool`, `&str`, `&[u8]`, `Option<T>` for NULL, and custom
+  column types with `decode_value`/`encode_value` methods. `@db_name("column")`
+  renames a column and `@db_flatten` decodes a nested Row struct for joins.
+  Conversions report `db.ErrorKind.Type` errors instead of trapping, and the
+  same helpers (`sql.column`, `sql.int_in`, `sql.text`, ...) are available
+  to hand-written decoders.
+- Derives now go through a small registry in the compiler: `@derive` accepts
+  a list (`@derive(Json, Row)`), and each derive declares the attributes it
+  owns, so misplaced or foreign attributes get precise errors.
 - `fs.File.try_lock_range(start, length, shared)` and `unlock_range` take
   non-blocking advisory byte-range locks (POSIX `fcntl` record locks through
   the fs C adapter, `LockFileEx` on Windows).
@@ -952,6 +1095,59 @@
   cover 10-bit addressing, both targets, 12-bit and TI frames through the
   SPI loopback, breaks, and the flow control pins, and the desktop models
   gain a DW_apb_i2c target driven by a scripted master.
+- The RP2040's and RP2350's ADC samples by itself: `pins.sampler(inputs,
+  rate_hz)` returns an `rp_adc.AdcSampler` that converts a set of inputs
+  (GPIO 26 to 29 and the temperature sensor) round-robin at 733 to 500 000
+  samples a second into the ADC's FIFO. Polled reads return samples tagged
+  with their input and a conversion-error flag and report FIFO overruns;
+  `set_signal` wakes a task from the `ADC_IRQ_FIFO` interrupt, whose default
+  handler the chip runtimes now provide; and by DMA, paced by the ADC's
+  data request, `capture` fills a buffer of 12-bit or 8-bit samples, `dma`
+  does so in the background, and `stream` keeps filling a ring. Single
+  `pins.analog` inputs keep working and are `Busy` while a sampler holds
+  the converter, and the other way round. See `examples/adc.dodo`.
+- RP2040 and RP2350 flash regions erase and write from either core while
+  the other runs a task: `rp_multicore.lockout()` parks the other core in
+  SRAM with its interrupts masked, through a forced `IO_IRQ_QSPI` that the
+  runtimes' new SRAM handler answers, and reports `Timeout` if it cannot.
+  New `std/embedded/flash/spi_nor` drives JEDEC SPI NOR flash chips (W25Q,
+  GD25Q, MX25L, IS25LP, ...) as a `hal.Flash`, probing them by JEDEC ID and
+  SFDP, with 4-byte addressing above 16 MiB, protection, deep power-down,
+  and reset.
+- The RP2350B's GPIO 30 to 47: `rp2350.take()` reads the package from
+  SYSINFO, and `pins.pin_count()` (30 or 48) bounds every claim, so GPIO 30
+  to 47 work as inputs and outputs, with interrupts, dormant wake-up, and
+  their I2C, SPI, UART, and PWM functions (slices 8 to 11). Pin masks in
+  `rp_pins` are now `u64`. PIO blocks on the RP2350 reach GPIO 16 to 47
+  through `pio.set_gpio_base(rp_pio.HIGH_GPIO_BASE)`; pin mappings and
+  `wait gpio` (now up to GPIO 47) name absolute GPIOs and are translated
+  into the block's window. Pin interrupts work on either core: `listen`,
+  `ignore`, and `events` act for the calling core, and `listen_on`,
+  `ignore_on`, and `events_on` name one.
+- Deeper low power on the RP2040 and RP2350. A `power.Wake` takes a timeout
+  (`wake.after_ms(ms)`, `power.dormant_for`), and `dormant` reports it in
+  bit 63 (`power.BY_TIME`, `power.by_time`; `power.MAX_PINS` is now 63).
+  The RP2040 wakes by its RTC once `b.rtc.use_clock_input(&mut b.pins, 20,
+  32_768)` feeds clk_rtc from a GPIO clock; the RP2350 wakes by its
+  always-on timer, which `b.rtc` can also tick from the low-power
+  oscillator (OTP-calibrated), an external 32 kHz clock, or an external
+  1 kHz tick. `b.power.set_system_hz(hz)` runs clk_sys from the crystal or
+  PLL_SYS at a lower rate and back, refusing while a peripheral whose
+  divider follows clk_sys is claimed. The RP2350's `b.power.power_down(&wake,
+  retain)` switches off the switched core and unkept SRAM through POWMAN
+  until a pin event or a timeout restarts the chip, after which
+  `woke_from_power_down`, `power_down_wake`, `retained`, and `scratch`
+  report and keep state. `fake.Power` simulates timeouts.
+- Timers at other rates: `std/embedded/hal` gains `TickCounter`, `Compare`,
+  `PeriodicTimer`, and `InputCapture`, counting ticks at a rate of their
+  own, with conversion and wait helpers and a fake of each. On the RP2040
+  and RP2350 the timer alarms (now on the shared `rp_timer`) are compare
+  channels and drift-free periodic timers that count missed periods; the
+  RP2350's TIMER1 counts clk_sys or a divided crystal (`timer.timer1(hz)`);
+  PWM slices are periodic timers and 64-bit tick counters
+  (`pins.pwm_timer`), and PWM outputs expose the wrap interrupt; and
+  `rp_capture` timestamps edges on a PIO state machine
+  (`pins.edge_capture`).
 
 ## 0.1.5 — 2026-10-12
 

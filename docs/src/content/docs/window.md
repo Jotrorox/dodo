@@ -1,6 +1,6 @@
 ---
 title: "Windows"
-description: "Open desktop windows on Linux, macOS or Windows, draw into them with std/graphics or the GPU, and handle keyboard and mouse events of all of them in one plain loop."
+description: "Open desktop windows on Linux, macOS or Windows, draw into them with std/graphics or the GPU, handle keyboard and mouse events of all of them in one plain loop, and use the clipboard, cursor shapes, window sizes and fullscreen."
 section: "Standard library"
 order: 160.6
 ---
@@ -104,6 +104,7 @@ borrow the App, so windows can be kept in variables and structs freely.
 | `app.wait_event()` | Waits for the next event of any window. |
 | `app.poll_event()` | The next event if one is pending, else `none`; never waits. |
 | `app.wait_event_timeout(ms)` | Waits at most `ms` milliseconds; `none` when the time passes first. |
+| `app.set_clipboard_text(text)`, `app.clipboard_text()` | Copy text to the system clipboard, or read what it holds; see [Clipboard](#clipboard). |
 | `app.close()` | Closes every window and the connection; dropping the App does the same. |
 
 Each `Window` owns a pixel buffer exactly the size of its drawing area.
@@ -116,7 +117,10 @@ Each `Window` owns a pixel buffer exactly the size of its drawing area.
 | `win.update_all()` | Shows the whole buffer. |
 | `win.request_frame()` | Asks for one `Frame` event when it is time to draw the next frame. |
 | `win.frame_interval()` | The display's refresh period as a `time.Duration`, such as 16.7 ms at 60 Hz. |
-| `win.set_title(title)`, `win.set_cursor_visible(visible)` | Change the title, or hide the pointer over the window. |
+| `win.set_title(title)` | Changes the title. |
+| `win.set_cursor(cursor)`, `win.set_cursor_visible(visible)` | Choose the pointer shape over the window, or hide the pointer; see [Cursor shapes](#cursor-shapes). |
+| `win.set_size(width, height)`, `win.set_min_size(..)`, `win.set_max_size(..)` | Resize the window from code and limit the sizes the user can give it; see [Size, limits and fullscreen](#size-limits-and-fullscreen). |
+| `win.set_fullscreen(on)`, `win.is_fullscreen()` | Cover the whole screen, or return to the window. |
 | `win.close()` | Closes the window; dropping it does the same. |
 
 Drawing changes nothing on screen until `update`. After a `Resize` event,
@@ -294,6 +298,109 @@ there both units are pixels and the scale is always 100.
 Pass `resizable: false` in the options to keep the size fixed; otherwise
 handle `Resize`.
 
+### Size, limits and fullscreen
+
+A program can change a window's size itself. `set_size` and the limits take
+the same units as `Options`. The size the window ends up with always arrives
+as a `Resize` event, in pixels, after which `size()` and `canvas()` have it:
+
+```dodo
+win.set_min_size(400, 300)?     // the user cannot make it smaller
+win.set_max_size(1600, 0)?      // at most 1600 wide, any height
+win.set_size(800, 600)?         // a Resize event follows
+win.set_fullscreen(true)?       // another Resize, to the screen's size
+```
+
+| Call | Does |
+| --- | --- |
+| `win.set_size(width, height)` | Resizes the drawing area, keeping the window's top-left corner in place. Also works on windows opened with `resizable: false`. |
+| `win.set_min_size(width, height)` | The smallest size the user can drag the window to. A smaller window grows to it. |
+| `win.set_max_size(width, height)` | The largest size, also when the window is maximized. A larger window shrinks to it. |
+| `win.set_fullscreen(true)` | Covers the window's screen, without a title bar or borders. |
+| `win.set_fullscreen(false)` | Returns to the size and place the window had before. |
+| `win.is_fullscreen()` | Whether the window is fullscreen, or on its way there. |
+
+A 0 in a limit leaves that dimension unlimited, so `set_max_size(0, 0)`
+removes the maximum. `set_size` keeps within the limits. A zero size, a size
+above `window.MAX_SIZE`, or a minimum above the maximum fails with
+`InvalidInput`.
+
+Fullscreen ignores the limits. A `set_size` while the window is fullscreen
+takes effect when it returns to the window. Each system does fullscreen its
+own way:
+
+- **macOS** animates the window into a space of its own, as the green
+  title-bar button does. `is_fullscreen()` follows the user entering or
+  leaving fullscreen with that button too. Calls made during the animation
+  are carried out once it ends.
+- **Windows** makes the window a borderless window covering its monitor and
+  restores the old frame and placement afterwards.
+- **X11** asks the window manager through the `_NET_WM_STATE` protocol that
+  every current desktop supports. Without a window manager, the window moves
+  to the screen's top-left corner and takes the screen's size itself.
+  `is_fullscreen()` reports what the program asked for, even when the user
+  leaves fullscreen with a window-manager shortcut.
+
+## Clipboard
+
+The clipboard belongs to the App, since it is shared by the whole program:
+
+```dodo
+app.set_clipboard_text("copied from Dodo")?
+pasted := app.clipboard_text()?
+editor.insert(pasted.as_str())
+```
+
+`clipboard_text()` returns a `window.ClipboardText` that owns its bytes:
+`as_str()` borrows the text, `len()` is its length in bytes and `is_empty()`
+says whether the clipboard held any text. When the clipboard holds no text,
+for example after an image was copied, the result is empty rather than an
+error. The text is always valid UTF-8: malformed bytes another program put
+on the clipboard read as U+FFFD. Line endings pass through unchanged, so text
+copied by Windows programs usually has `\r\n` line ends.
+
+A typical editor copies on `modifiers.shortcut()` with `Key.C` and pastes on
+`Key.V`, which is Command on macOS and Control elsewhere.
+
+**X11 has no clipboard service.** Copying makes the App the owner of the
+CLIPBOARD selection. Programs that paste then ask the App for the text, and
+the App answers them from inside `wait_event` and `poll_event`, so the event
+loop has to keep running. The text stays available until another program
+copies something or the App closes. Most desktops run a clipboard manager
+that takes a copy, so the text outlives the App there. Pasting asks the
+current owner and waits for its answer, at most a second for each part of a
+large transfer. Events that arrive meanwhile are kept, in order, for the next
+`wait_event`. A program that never answers reads as an empty clipboard. Text
+of any size works both ways, including the incremental transfers (`INCR`)
+that programs use for large texts, and Latin-1 text from programs that offer
+only `STRING`.
+
+## Cursor shapes
+
+`win.set_cursor(cursor)` sets the pointer shown while the pointer is over the
+window's drawing area. Each system draws its own version of each shape:
+
+| `window.Cursor` | Shows | For |
+| --- | --- | --- |
+| `Arrow` | The ordinary arrow; every window starts with it | Everything else |
+| `Text` | An I-beam | Editable or selectable text |
+| `Hand` | A pointing hand | Links and buttons |
+| `Crosshair` | A crosshair | Precise picking, drawing |
+| `Move` | Four arrows; an open hand on macOS | Dragging something around |
+| `ResizeEW`, `ResizeNS` | Left-right or up-down arrows | Splitters and column edges |
+| `ResizeNWSE`, `ResizeNESW` | Diagonal arrows | Corner handles |
+| `NotAllowed` | A crossed-out circle; a plain circle on X11 | Drop targets that refuse |
+| `Wait` | A busy indicator | Long operations |
+
+The shape stays until the next call, so a text editor sets `Text` when the
+pointer enters the text area and `Arrow` when it moves over a toolbar.
+`set_cursor_visible(false)` hides the pointer whatever its shape, and showing
+it again brings the shape back.
+
+On X11 the shapes come from the X server's built-in cursor font, which looks
+plainer than the themed cursors of current desktops. The arrow is the one the
+desktop set for its own windows, so it matches the theme.
+
 ## Drawing with the GPU
 
 A window can be the target of a GPU API instead of, or as well as, a canvas.
@@ -313,7 +420,12 @@ on resize. `win.has_pixel_buffer()` tells the two kinds apart. Events, frame
 pacing with `request_frame()`, `size()` and `scale()` work the same in both,
 and one App can have windows of both kinds.
 
-[std/gpu/opengl](opengl.md#drawing-into-a-window) takes the handle directly:
+The simplest way to draw is [std/gpu](gpu.md#surfaces): a `gpu.Surface`
+made from the handle presents frames on Metal, Vulkan or OpenGL, whichever
+the machine has, as
+[`examples/gpu_window.dodo`](https://github.com/Jotrorox/dodo/blob/main/examples/gpu_window.dodo)
+shows. The raw APIs take the handle as well;
+[std/gpu/opengl](opengl.md#drawing-into-a-window) takes it directly:
 
 ```dodo
 app := window.App.new()?
@@ -384,6 +496,9 @@ GPU objects does that.
 | Threads | Any one thread, the one that created the App. | The main thread only; elsewhere `App.new` fails with `Unsupported`. | The thread that created the App must open the windows and read their events. |
 | Text input | Latin-1 and Unicode keysyms, Shift, Caps Lock, NumLock and AltGr. Dead keys and compose sequences type nothing. | Characters from the layout, Option combinations included. No input method or dead keys. | Characters from the layout, including dead keys and surrogate pairs. |
 | While resizing | Events keep flowing. | AppKit holds the event loop until the mouse is released, then reports the final size. | Windows holds the event loop until the mouse is released, then reports the size. |
+| Clipboard | The App serves what it copied while its event loop runs; see [Clipboard](#clipboard). | `NSPasteboard`, plain text. | The system clipboard, Unicode text. |
+| Cursor shapes | The X server's core cursor font. | The system cursors; private AppKit ones where macOS has no public shape. | The system cursors. |
+| Fullscreen | `_NET_WM_STATE` through the window manager; without one, the window covers the screen itself. | A fullscreen space, animated. | A borderless window covering the monitor. |
 | Frame timing | The Present extension reports each refresh of each window; servers without it fall back to a 60 Hz timer. `frame_interval()` is measured from Present after about half a second. | A display link per window reports each refresh on macOS 14 and later; older systems use a timer at the screen's refresh rate. Programs are exempt from App Nap while a window waits for a frame. | The compositor's (DWM's) refresh times; a high-resolution timer keeps the waits precise. |
 
 ## Errors
@@ -395,19 +510,20 @@ GPU objects does that.
 | `NoDisplay` | No window system to connect to: no `DISPLAY` on Linux, no desktop session. Also `native_handle()` on Linux without libxcb. |
 | `AlreadyOpen` | Another App exists; a process has one at a time. |
 | `Closed` | The window or its App was closed, or the connection to the window system ended. |
-| `InvalidInput` | A zero size, a size above `window.MAX_SIZE` (16384), or an oversized title. |
+| `InvalidInput` | A zero size, a size above `window.MAX_SIZE` (16384), a minimum size above the maximum, or an oversized title. |
 | `OutOfMemory` | The pixel buffer could not be allocated. |
 | `Protocol` | The X server refused the connection (usually a missing or wrong cookie) or sent something malformed. |
 | `Unsupported` | The X server's default visual is not 24-bit true color, or macOS was used off the main thread. Also `update()` on a window without a pixel buffer, and `metal_layer()` on other systems or on a window with one. |
-| `System` | Another operating-system call failed. |
+| `System` | Another operating-system call failed, such as when another program keeps the clipboard locked on Windows, or the X server refuses the clipboard to the App. |
 
 ## Limits
 
 Windows have no owner relationships yet: a dialog is an ordinary window,
 not kept above the window it belongs to or modal to it, and there are no
-borderless popups or ways to place a window. There is no clipboard, no
-cursor shapes other than hiding the pointer (`set_cursor_visible`), and no
-input methods for Chinese, Japanese or Korean text. A canvas is copied to
+borderless popups or ways to place a window. The clipboard carries plain
+text only, without images or other formats, and there is no drag and drop.
+Custom cursor images and input methods for Chinese, Japanese or Korean text
+are not implemented. A canvas is copied to
 the window system on every `update`; for drawing without that copy, use the
 GPU. Native Wayland and drawing straight to the screen without a desktop
 (DRM/KMS) are not implemented yet.

@@ -1,8 +1,9 @@
 //! Firmware platforms: board and chip settings, `std/embedded/board` and `std/embedded/chip`
 //! resolution, the embedded chip runtimes, and (when ld.lld is installed)
 //! linking flashable images. Running on a real board is scripts/test_pico.py
-//! (`--board pico`, `--board pico2`, or `--board pico2_w`); running on
-//! emulated chips is scripts/test_emulator.py.
+//! (`--board pico`, `--board pico2`, or `--board pico2_w`) and
+//! scripts/test_arduino_uno.py; running on emulated chips is
+//! scripts/test_emulator.py.
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -278,6 +279,181 @@ fn main() {
     }
 }
 
+// The timer protocols at other rates on a board: a timer alarm as a
+// compare channel and as a periodic timer, a PWM slice as a periodic timer
+// and tick counter, a PWM output's wrap interrupt, a PIO edge capture, and
+// on the RP2350 TIMER1, through generic drivers, with interrupt handlers
+// for the alarm and the PWM wrap in the vector table.
+#[test]
+fn timer_channels_link_for_every_board() {
+    if !ld_lld() {
+        return;
+    }
+    let scratch = Scratch::new("timer-channels");
+    let common = r#"package main
+import "std/embedded/board"
+import "std/embedded/chip"
+import "std/embedded/chip/rp_capture"
+import "std/embedded/chip/rp_pwm"
+import "std/embedded/cortex_m"
+import "std/embedded/hal"
+static mut ALARM: Option<chip.Alarm> = none
+static mut TIMER: Option<rp_pwm.PwmTimer> = none
+static mut PERIODS: u32 = 0
+@interrupt(ALARM_VECTOR)
+fn alarm_fired() {
+    unsafe {
+        match &mut ALARM {
+            some(alarm) => {
+                PERIODS += alarm.poll_periods()
+            }
+            none => {}
+        }
+    }
+}
+@interrupt(PWM_VECTOR)
+fn wrapped() {
+    unsafe {
+        match &mut TIMER {
+            some(timer) => {
+                PERIODS += timer.poll_periods()
+            }
+            none => {}
+        }
+    }
+}
+fn measure<C: hal.TickCounter>(counter: &C) -> u64 {
+    start := counter.now_ticks()
+    for hal.elapsed_ticks(counter, start) < 100 {}
+    return hal.ticks_to_ns(hal.elapsed_ticks(counter, start), counter.tick_hz())
+}
+fn pulse<C: hal.Compare>(channel: &mut C) -> void!hal.Error {
+    hal.schedule_in_ticks(channel, 1000)?
+    hal.wait_for_compare(channel)
+    return ok()
+}
+fn every<P: hal.PeriodicTimer>(timer: &mut P, period_us: u64) -> u32!hal.Error {
+    hal.start_periodic_us(timer, period_us)?
+    timer.listen()
+    return ok(hal.wait_periods(timer))
+}
+fn edges<C: hal.InputCapture>(input: &mut C) -> u64!hal.Error {
+    return hal.capture_ticks(input, 1_000_000)
+}
+fn main() {
+    b := board.take()!
+    alarm := b.timer.alarm(1)!
+    pulse(&mut alarm)!
+    core.assert(every(&mut alarm, 500)! >= 1)
+    core.assert(measure(&b.timer) >= 100_000)
+    irq := alarm.irq()
+    unsafe {
+        ALARM = some(alarm)
+    }
+    cortex_m.enable(irq)
+    timer := b.pins.pwm_timer(3, 1_000_000)!
+    core.assert(every(&mut timer, 100)! >= 1)
+    core.assert(measure(&timer) >= 100_000)
+    wrap := timer.irq()
+    unsafe {
+        TIMER = some(timer)
+    }
+    cortex_m.enable(wrap)
+    output := b.pins.pwm(0, 1000)!
+    output.listen_wrap()
+    for !output.wrapped() {}
+    output.clear_wrap()
+    output.ignore_wrap()
+    b.pins.release_pwm(output)
+    pio := b.pins.pio(0)!
+    capture := b.pins.edge_capture(&mut pio, 5, rp_capture.RISING, 1_000_000)!
+    match edges(&mut capture) {
+        ok(ticks) => core.assert(ticks > 0),
+        err(error) => core.assert(error == hal.Error.Timeout),
+    }
+    b.pins.release_edge_capture(capture, &mut pio)
+    b.pins.release_pio(pio)
+    extra(&mut b)
+}
+"#;
+    let rp2040 = "fn extra(b: &mut board.Board) {}\n";
+    let rp2350 = r#"fn extra(b: &mut board.Board) {
+    second := b.timer.timer1(chip.SYS_HZ)!
+    core.assert(measure(&second) >= 100_000)
+    channel := second.alarm(0)!
+    pulse(&mut channel)!
+    core.assert(every(&mut channel, 1000)! >= 1)
+    hal.schedule_in_us(&mut channel, 10)!
+    second.release_alarm(channel)
+    b.timer.release_timer1(second)
+    slow := b.timer.timer1(100_000)!
+    core.assert(slow.tick_hz() == 100_000)
+    b.timer.release_timer1(slow)
+}
+"#;
+    // The alarm's and the PWM wrap's vectors and interrupt numbers.
+    let boards = [
+        (
+            "pico",
+            0xE48B_FF56u32,
+            "TIMER_IRQ_1",
+            1usize,
+            "PWM_IRQ_WRAP",
+            4usize,
+            rp2040,
+        ),
+        (
+            "pico2",
+            0xE48B_FF59,
+            "TIMER0_IRQ_1",
+            1,
+            "PWM_IRQ_WRAP_0",
+            8,
+            rp2350,
+        ),
+        (
+            "pico2_w",
+            0xE48B_FF59,
+            "TIMER0_IRQ_1",
+            1,
+            "PWM_IRQ_WRAP_0",
+            8,
+            rp2350,
+        ),
+    ];
+    for (board, family, alarm, alarm_irq, wrap, wrap_irq, extra) in boards {
+        let text = common
+            .replace("ALARM_VECTOR", alarm)
+            .replace("PWM_VECTOR", wrap)
+            + extra;
+        let source = scratch.write(&format!("timers-{board}.dodo"), &text);
+        for level in ["0", "2"] {
+            let elf = scratch.path(&format!("timers-{board}-O{level}.elf"));
+            build(&[
+                "build",
+                source.to_str().unwrap(),
+                "--board",
+                board,
+                "-O",
+                level,
+                "-o",
+                &elf,
+            ]);
+            let path = Path::new(&elf);
+            let bytes = fs::read(path).unwrap();
+            let image = flash_image(&fs::read(path.with_extension("uf2")).unwrap(), family);
+            let vectors = elf_symbol(&bytes, "__vector_table").unwrap() as usize - 0x1000_0000;
+            for (name, irq) in [(alarm, alarm_irq), (wrap, wrap_irq)] {
+                assert_eq!(
+                    word(&image, vectors + 4 * (16 + irq)),
+                    elf_symbol(&bytes, name).unwrap() | 1,
+                    "{board} -O{level}: {name}"
+                );
+            }
+        }
+    }
+}
+
 // Low power on a board: the chip's Power through the portable protocol
 // and directly, and the example. Needs no linker.
 #[test]
@@ -337,6 +513,124 @@ fn main() {
                     "-o",
                     &object,
                 ]));
+            }
+        }
+    }
+}
+
+// Waking a dormant chip by time, a slower system clock, and the real-time
+// clocks' other tick sources on every board, and the RP2350's power-down
+// states, linked into firmware.
+#[test]
+fn low_power_states_link_for_every_board() {
+    if !ld_lld() {
+        return;
+    }
+    let scratch = Scratch::new("low-power");
+    let portable = scratch.write(
+        "timed.dodo",
+        r#"package main
+import "std/embedded/board"
+import "std/embedded/chip"
+import "std/embedded/hal"
+import "std/embedded/power"
+fn nap<P: power.Power>(chip_power: &mut P, milliseconds: u64) -> bool!hal.Error {
+    woken := power.dormant_for(chip_power, milliseconds)?
+    return ok(power.by_time(woken))
+}
+fn main() {
+    b := board.take()!
+    // A 32.768 kHz oscillator on GPIO 20 keeps the clock running.
+    b.rtc.use_clock_input(&mut b.pins, 20, 32_768)!
+    b.rtc.set_ms(1_800_000_000_000)!
+    crystal := b.power.crystal_hz()
+    b.power.set_system_hz(crystal)!
+    core.assert(b.power.system_hz() == crystal)
+    button := b.pins.input(15)!
+    wake := power.Wake.new()
+    wake.on(15, power.FALLING_EDGE)
+    wake.after_ms(60_000)
+    woken := b.power.dormant(&wake)!
+    core.assert(power.by_time(woken) || power.woken_pins(woken) <= 1u64 << 15)
+    core.assert(nap(&mut b.power, 1000)!)
+    b.power.set_system_hz(chip.SYS_HZ)!
+    serial := b.pins.uart(4, none, 9600)!
+    match b.power.set_system_hz(crystal / 2) {
+        ok() => core.assert(false),
+        err(error) => core.assert(error == hal.Error.Busy),
+    }
+    b.pins.release_uart(serial)
+    b.rtc.release_clock_input(&mut b.pins)!
+    b.pins.release(button)
+}
+"#,
+    );
+    let power_down = scratch.write(
+        "power_down.dodo",
+        r#"package main
+import "std/embedded/board"
+import "std/embedded/chip"
+import "std/embedded/chip/rp_rtc"
+import "std/embedded/hal"
+import "std/embedded/power"
+// Survives the power-down with SRAM0 kept.
+@section(".noinit")
+static mut WAKES: u32 = 0
+fn main() {
+    b := board.take()!
+    if b.power.woke_from_power_down() && (b.power.retained() & chip.RETAIN_SRAM0) != 0 {
+        unsafe {
+            WAKES += 1
+        }
+        core.assert(b.power.power_down_wake() != 0)
+    } else {
+        unsafe {
+            WAKES = 0
+        }
+    }
+    count := b.power.scratch(0)
+    b.power.set_scratch(chip.SCRATCH_WORDS - 1, count + 1)
+    b.rtc.use_low_power_oscillator()!
+    core.assert(b.rtc.tick_source() == rp_rtc.TICK_LPOSC)
+    b.rtc.use_crystal()!
+    if !b.rtc.is_set()! {
+        b.rtc.set_ms(1_800_000_000_000)!
+    }
+    button := b.pins.input(15)!
+    wake := power.Wake.new()
+    wake.on(15, power.FALLING_EDGE)
+    wake.after_ms(3_600_000)
+    match b.power.power_down(&wake, chip.RETAIN_SRAM0) {
+        ok() => {}
+        err(error) => core.assert(error != hal.Error.InvalidInput),
+    }
+    b.pins.release(button)
+}
+"#,
+    );
+    for board in ["pico", "pico2", "pico2_w"] {
+        let mut sources = vec![(portable.as_path(), "timed")];
+        if board != "pico" {
+            sources.push((power_down.as_path(), "power-down"));
+        }
+        for (input, name) in sources {
+            for level in ["0", "2"] {
+                let elf = scratch.path(&format!("{name}-{board}-O{level}.elf"));
+                build(&[
+                    "build",
+                    input.to_str().unwrap(),
+                    "--board",
+                    board,
+                    "-O",
+                    level,
+                    "-o",
+                    &elf,
+                ]);
+                if board == "pico" {
+                    check_rp2040_firmware(Path::new(&elf));
+                } else {
+                    check_rp2350_firmware(Path::new(&elf));
+                }
             }
         }
     }
@@ -506,6 +800,127 @@ fn pio_programs_assemble_only_for_rp_chips() {
 
 // The WS2812 example and the rest of the PIO driver on every board. Needs
 // no linker.
+// GPIOs up to the package's last, PIO windows, and pin interrupts on
+// either core: a core 1 task listens to a pin, and the one IO_IRQ_BANK0
+// handler serves it there. The Pico boards' chips have 30 GPIOs, so the
+// RP2350B's GPIO 30 to 47 are reached only through pin_count().
+#[test]
+fn gpio_banks_and_core1_pin_interrupts_link_for_every_board() {
+    if !ld_lld() {
+        return;
+    }
+    let scratch = Scratch::new("gpio-banks");
+    let source = scratch.write(
+        "gpio.dodo",
+        r#"package main
+import "std/embedded/board"
+import "std/embedded/chip"
+import "std/embedded/chip/rp_pio"
+import "std/embedded/cortex_m"
+import "std/embedded/executor"
+import "std/embedded/hal"
+import "std/embedded/power"
+const EDGE: executor.Signal = executor.Signal { id: 0 }
+const WAITS: rp_pio.Program = rp_pio.assemble(".side_set 1", "    wait 1 gpio 20 side 0", "    in pins, 1     side 1", "    push           side 0")
+@interrupt(IO_IRQ_BANK0)
+fn gpio_interrupt() {
+    // Runs on the core that listens: core 1 here.
+    cortex_m.disable(chip.IO_IRQ_BANK0)
+    EDGE.raise()
+}
+struct Watcher {
+    button: chip.Pin
+    pub fn run(self) {
+        self.button.listen(chip.FALLING_EDGE | chip.RISING_EDGE)
+        cortex_m.enable(self.button.irq())
+        for {
+            if self.button.events_on(1) != 0 {
+                self.button.clear_events(chip.FALLING_EDGE | chip.RISING_EDGE)
+                cortex_m.enable(chip.IO_IRQ_BANK0)
+            }
+        }
+    }
+}
+fn main() {
+    b := board.take()!
+    count := b.pins.pin_count()
+    core.assert(count == chip.pin_count() && (count == chip.PIN_COUNT || count == 48))
+    last := b.pins.input(count - 1)!
+    core.assert(last.number() == count - 1)
+    last.listen_on(0, chip.LEVEL_HIGH)
+    core.assert(last.events_on(0) <= chip.LEVEL_HIGH)
+    last.ignore_on(0, chip.LEVEL_HIGH)
+    b.pins.release(last)
+    match b.pins.output(count) {
+        ok(_) => core.assert(false),
+        err(error) => core.assert(error == hal.Error.InvalidInput),
+    }
+    pio := b.pins.pio(1)!
+    match pio.set_gpio_base(rp_pio.HIGH_GPIO_BASE) {
+        ok() => {}
+        err(error) => core.assert(error == hal.Error.Unsupported),
+    }
+    base := pio.gpio_base()
+    b.pins.pio_pins(&pio, base + 4, 2)!
+    loaded := pio.load(&WAITS)!
+    config := loaded.config()
+    config.set_in_pins(base + 4)!
+    config.set_sideset_pins(base + 5)!
+    config.set_jmp_pin(base + 31)!
+    sm := pio.free_state_machine()!
+    sm.init(&config)
+    sm.set_pindirs(base + 5, 1, 1)
+    pio.bypass_input_sync(base + 4, true)
+    sm.set_enabled(true)
+    pio.release_state_machine(sm)
+    pio.unload(loaded)
+    b.pins.release_pio(pio)
+    wake := power.Wake.new()
+    wake.on(count - 1, power.LEVEL_HIGH)
+    woken := b.power.dormant(&wake)!
+    core.assert(woken <= 1u64 << (count - 1) as u64)
+    button := b.pins.input(15)!
+    stack := [0u64; 256]
+    watching := b.core1.start(&mut stack, Watcher { button })!
+    b.timer.delay_ms(10)
+    watching.stop()
+}
+"#,
+    );
+    // IO_IRQ_BANK0 is IRQ 13 on the RP2040 and 21 on the RP2350; both
+    // cores take it through the one vector table.
+    let boards: [(&str, u32, usize); 3] = [
+        ("pico", 0xE48B_FF56, 13),
+        ("pico2", 0xE48B_FF59, 21),
+        ("pico2_w", 0xE48B_FF59, 21),
+    ];
+    for (board, family, irq) in boards {
+        for level in ["0", "2"] {
+            let elf = scratch.path(&format!("gpio-{board}-O{level}.elf"));
+            build(&[
+                "build",
+                source.to_str().unwrap(),
+                "--board",
+                board,
+                "-O",
+                level,
+                "-o",
+                &elf,
+            ]);
+            let path = Path::new(&elf);
+            let bytes = fs::read(path).unwrap();
+            let handler = elf_symbol(&bytes, "IO_IRQ_BANK0").expect("the handler is linked");
+            let image = flash_image(&fs::read(path.with_extension("uf2")).unwrap(), family);
+            let vectors = elf_symbol(&bytes, "__vector_table").unwrap() as usize - 0x1000_0000;
+            assert_eq!(
+                word(&image, vectors + 4 * (16 + irq)),
+                handler | 1,
+                "{board} -O{level}: IRQ {irq} is the program's IO_IRQ_BANK0 handler"
+            );
+        }
+    }
+}
+
 #[test]
 fn pio_drivers_compile_for_every_board() {
     let scratch = Scratch::new("pio-compile");
@@ -640,37 +1055,62 @@ fn std_board_and_std_chip_follow_the_selected_platform() {
 #[test]
 fn chip_runtimes_provide_startup_and_helper_symbols() {
     let scratch = Scratch::new("runtime");
-    for chip in dodoc::hardware::CHIPS {
+    // The Raspberry Pi chips' runtimes; AVR's has its own test below.
+    for chip in dodoc::hardware::CHIPS
+        .iter()
+        .filter(|chip| chip.name.starts_with("rp"))
+    {
         let object = scratch.0.join(format!("{}.o", chip.name));
         let options = dodoc::codegen::Options {
             target: Some(chip.triple.into()),
             cpu: Some(chip.cpu.into()),
+            features: chip.features.into(),
             optimization: 2,
             ..Default::default()
         };
-        dodoc::codegen::compile_ir_object(&options, chip.name, chip.runtime, &object).unwrap();
+        dodoc::codegen::compile_ir_object(&options, chip.name, &(chip.runtime)(), &object).unwrap();
         let bytes = fs::read(&object).unwrap();
         let text = String::from_utf8_lossy(&bytes);
         for name in [
             "Reset_Handler",
             chip.panic_hook,
             "dodo_panic_report",
-            "USBCTRL_IRQ",
             "dodo_usb_interrupt",
-            "DMA_IRQ_0",
             "dodo_dma_interrupt",
-            "FifoHandler",
-            "dodo_fifo_interrupt",
-            "dodo_core_id",
-            "dodo_core1_trampoline",
-            "dodo_core1_entry",
             "dodo_flash_erase",
             "dodo_flash_program",
             "dodo_flash_image_end",
             "dodo_flash_end",
             "memcpy",
             "memset",
+            "__udivdi3",
         ] {
+            assert!(text.contains(name), "{} runtime lacks {name}", chip.name);
+        }
+        let own: &[&str] = if chip.name.starts_with("rp") {
+            &[
+                "USBCTRL_IRQ",
+                "DMA_IRQ_0",
+                "FifoHandler",
+                "dodo_fifo_interrupt",
+                "dodo_core_id",
+                "dodo_core1_trampoline",
+                "dodo_core1_entry",
+            ]
+        } else {
+            &[
+                ".boot_header",
+                "__vector_table",
+                "dodo_trap_interrupt",
+                "dodo_trap_exception",
+                "dodo_interrupt_table",
+                "dodo_esp32c6_flash_setup",
+                "Exception_Handler",
+                "USB_DEVICE",
+                "DMA_IN_CH0",
+            ]
+        };
+        for name in own {
             assert!(text.contains(name), "{} runtime lacks {name}", chip.name);
         }
     }
@@ -768,6 +1208,141 @@ fn flash_storage_links_for_every_board() {
                 // The RP2350's flash_op restores execute-in-place itself.
                 assert!(symbol("dodo_flash_erase") >= 0x1000_0000);
             }
+            // Regions erase and write under rp_multicore's lockout, whose
+            // handler parks the other core in SRAM.
+            assert!(in_sram(symbol("dodo_lockout_handler")), "{board}");
+            assert!(in_sram(symbol("dodo_lockout_mailbox")), "{board}");
+            assert!(symbol("dodo.main.rp_multicore.lockout") >= 0x1000_0000);
+        }
+    }
+}
+
+/// The lockout handler's code as loaded: the bytes `length` from the start
+/// of `dodo_lockout_handler`, taken from the flash image of `.data`.
+fn lockout_handler_code(elf: &Path, family: u32, length: usize) -> Vec<u8> {
+    let bytes = fs::read(elf).unwrap();
+    let image = flash_image(&fs::read(elf.with_extension("uf2")).unwrap(), family);
+    let symbol = |name: &str| elf_symbol(&bytes, name).unwrap_or_else(|| panic!("{name}"));
+    let handler = symbol("dodo_lockout_handler") & !1;
+    let at = (symbol("__data_load") + handler - symbol("__data_start") - 0x1000_0000) as usize;
+    image[at..at + length].to_vec()
+}
+
+// A flash region erased and written on each core while the other runs a
+// task from flash, and rp_multicore.lockout called directly, on every board:
+// the lockout handler is IO_IRQ_QSPI's vector and runs from SRAM, with its
+// literal pool, which holds IO_QSPI's PROC0_INTF clear alias of the chip.
+#[test]
+fn flash_writes_with_both_cores_running_link_for_every_board() {
+    if !ld_lld() {
+        return;
+    }
+    let scratch = Scratch::new("lockout");
+    let source = scratch.write(
+        "lockout.dodo",
+        r#"package main
+import "std/embedded/board"
+import "std/embedded/chip/rp_flash"
+import "std/embedded/chip/rp_multicore"
+import "std/embedded/hal"
+import "std/embedded/storage"
+
+static mut STACK: [1024]u64 = [0u64; 1024]
+
+struct Writer {
+    region: rp_flash.Region
+
+    pub fn run(self) {
+        let Writer { region } = self
+        match storage.Store.open(region) {
+            ok(store) => {
+                settings := store
+                match settings.set_u32("core", 1) {
+                    ok() => {}
+                    err(_) => {}
+                }
+            }
+            err(_) => {}
+        }
+        match rp_multicore.lockout() {
+            ok(pause) => {
+                core.assert(pause.is_parked())
+            }
+            err(error) => {
+                core.assert(error == hal.Error.Timeout || error == hal.Error.Busy)
+            }
+        }
+    }
+}
+
+fn main() {
+    b := board.take()!
+    capacity := b.flash.capacity()
+    theirs := b.flash.region(capacity - 32 * 1024, 16 * 1024)!
+    mine := b.flash.last(16 * 1024)!
+    running := unsafe {
+        b.core1.start(&mut STACK, Writer { region: theirs })!
+    }
+    store := storage.Store.open(mine)!
+    store.set_u32("core", 0)!
+    pause := rp_multicore.lockout()!
+    inner := rp_multicore.lockout()!
+    core.assert(pause.is_parked() && !inner.is_parked())
+    core.drop(inner)
+    core.drop(pause)
+    running.stop()
+}
+"#,
+    );
+    // IO_IRQ_QSPI, and IO_QSPI's PROC0_INTF clear alias.
+    let boards = [
+        ("pico", 0xE48B_FF56u32, 14usize, 0x4001_B038u32),
+        ("pico2", 0xE48B_FF59, 23, 0x4003_3220),
+        ("pico2_w", 0xE48B_FF59, 23, 0x4003_3220),
+    ];
+    for (board, family, irq, force) in boards {
+        for level in ["0", "2"] {
+            let elf = scratch.path(&format!("lockout-{board}-O{level}.elf"));
+            build(&[
+                "build",
+                source.to_str().unwrap(),
+                "--board",
+                board,
+                "-O",
+                level,
+                "-o",
+                &elf,
+            ]);
+            let path = Path::new(&elf);
+            let bytes = fs::read(path).unwrap();
+            let symbol = |name: &str| {
+                elf_symbol(&bytes, name).unwrap_or_else(|| panic!("{board} lacks {name}"))
+            };
+            let handler = symbol("dodo_lockout_handler");
+            let in_sram = |address: u32| (0x2000_0000..0x2008_2000).contains(&address);
+            assert!(
+                in_sram(handler),
+                "{board} -O{level}: the handler runs from SRAM"
+            );
+            assert!(in_sram(symbol("dodo_lockout_mailbox")));
+            let image = flash_image(&fs::read(path.with_extension("uf2")).unwrap(), family);
+            let vectors = symbol("__vector_table") as usize - 0x1000_0000;
+            assert_eq!(
+                word(&image, vectors + 4 * (16 + irq)),
+                handler | 1,
+                "{board} -O{level}: IO_IRQ_QSPI is the lockout handler"
+            );
+            // Its literals follow its code in SRAM, so it reads nothing from
+            // flash: among them the forced bit's clear alias and the
+            // mailbox.
+            let code = lockout_handler_code(path, family, 0x48);
+            let literals: Vec<u32> = (0..code.len() / 4).map(|at| word(&code, 4 * at)).collect();
+            assert!(
+                literals.contains(&force),
+                "{board} -O{level}: {literals:x?}"
+            );
+            assert!(literals.contains(&symbol("dodo_lockout_mailbox")));
+            assert!(symbol("dodo.main.rp_multicore.lockout") >= 0x1000_0000);
         }
     }
 }
@@ -1227,6 +1802,12 @@ fn two_core_programs_link_for_every_board() {
                 elf_symbol(&bytes, "dodo_core_id").is_some(),
                 "{board} -O{level}"
             );
+            // Core 1 and core 0 listen for the lockout through IO_IRQ_QSPI,
+            // whose handler runs from SRAM.
+            let qspi = if board == "pico" { 14 } else { 23 };
+            let lockout = elf_symbol(&bytes, "dodo_lockout_handler").expect("lockout");
+            assert!((0x2000_0000..0x2008_2000).contains(&lockout), "{board}");
+            assert_eq!(word(&image, vectors + 4 * (16 + qspi)), lockout | 1);
         }
     }
     // Without std/embedded/chip the FIFO stub falls through to DefaultHandler.
@@ -1354,6 +1935,159 @@ fn dma_signals_are_raised_from_the_default_dma_interrupt() {
 }
 
 #[test]
+fn adc_samplers_compile_for_every_board() {
+    let scratch = Scratch::new("adc-sampler");
+    let source = scratch.write(
+        "sampler.dodo",
+        r#"package main
+import "std/embedded/board"
+import "std/embedded/chip/rp_adc"
+import "std/embedded/executor"
+import "std/embedded/hal"
+const READY: executor.Signal = executor.Signal { id: 0 }
+fn main() {
+    b := board.take()!
+    sampler := b.pins.sampler(rp_adc.GPIO26 | rp_adc.GPIO27 | rp_adc.TEMPERATURE, 30_000)!
+    match b.pins.analog(28) {
+        ok(input) => core.assert(false),
+        err(error) => core.assert(error == hal.Error.Busy),
+    }
+    sampler.set_threshold(4)!
+    sampler.set_signal(&READY)
+    sampler.start()
+    samples: [16]u16 = [0; 16]
+    got := sampler.poll_read(&mut samples)!
+    sampler.read(&mut samples)!
+    value := rp_adc.sample_value(samples[0])
+    input := rp_adc.sample_input(samples[0])
+    failed := rp_adc.sample_failed(samples[0])
+    sampler.stop()
+    sampler.clear_signal()
+    channel := b.dma.channel()!
+    capture: [256]u16 = [0; 256]
+    sampler.capture(&mut channel, &mut capture)!
+    bytes: [256]u8 = [0; 256]
+    sampler.capture_bytes(&mut channel, &mut bytes)!
+    {
+        session := sampler.dma(&mut channel, &mut capture)!
+        session.start(128)!
+        session.finish()!
+        first := session.buffer()![0]
+    }
+    ring: [1024]u16 = [0; 1024]
+    {
+        stream := sampler.stream(&mut channel, &mut ring)!
+        stream.read(&mut samples)!
+        size := stream.ring_size()
+    }
+    b.dma.release(channel)
+    b.pins.release_sampler(sampler)
+    knob := b.pins.analog(26)!
+    reading := knob.read()!
+    b.pins.release_analog(knob)
+}
+"#,
+    );
+    for board in ["pico", "pico2", "pico2_w"] {
+        for level in ["0", "2"] {
+            let object = scratch.path(&format!("sampler-{board}-O{level}.o"));
+            stdout(&dodo(&[
+                "build",
+                source.to_str().unwrap(),
+                "--board",
+                board,
+                "-O",
+                level,
+                "--emit",
+                "obj",
+                "-o",
+                &object,
+            ]));
+        }
+    }
+}
+
+#[test]
+fn adc_signals_are_raised_from_the_default_adc_interrupt() {
+    if !ld_lld() {
+        return;
+    }
+    let scratch = Scratch::new("adc");
+    let example = root().join("examples/adc.dodo");
+    // ADC_IRQ_FIFO's vector: IRQ 22 on the RP2040, 35 on the RP2350.
+    let boards = [
+        ("pico", 0xE48B_FF56, 22),
+        ("pico2", 0xE48B_FF59, 35),
+        ("pico2_w", 0xE48B_FF59, 35),
+    ];
+    for (board, family, irq) in boards {
+        for level in ["0", "2"] {
+            let elf = scratch.path(&format!("adc-{board}-O{level}.elf"));
+            build(&[
+                "build",
+                example.to_str().unwrap(),
+                "--board",
+                board,
+                "-O",
+                level,
+                "-o",
+                &elf,
+            ]);
+            let bytes = fs::read(&elf).unwrap();
+            let serve = elf_symbol(&bytes, "dodo_adc_interrupt").expect("the handler is linked");
+            assert_eq!(serve & 1, 1, "{board} -O{level}: a Thumb function");
+            assert_eq!(
+                stub_literal(Path::new(&elf), family, "AdcHandler", 10),
+                serve
+            );
+            let image = flash_image(
+                &fs::read(Path::new(&elf).with_extension("uf2")).unwrap(),
+                family,
+            );
+            let vectors = elf_symbol(&bytes, "__vector_table").unwrap() as usize - 0x1000_0000;
+            assert_eq!(
+                word(&image, vectors + 4 * (16 + irq)),
+                elf_symbol(&bytes, "AdcHandler").unwrap() | 1,
+                "{board} -O{level}: the vector is the runtime's handler"
+            );
+        }
+    }
+    // A program's own handler replaces the runtime's.
+    let own = scratch.write(
+        "own.dodo",
+        "package main\nimport \"std/embedded/board\"\nstatic mut COUNT: u32 = 0\n@interrupt(ADC_IRQ_FIFO)\nfn adc() {\n unsafe {\n  COUNT += 1\n }\n}\nfn main() {\n b := board.take()!\n b.led.toggle()\n}\n",
+    );
+    for (board, family, irq) in [("pico", 0xE48B_FF56, 22), ("pico2", 0xE48B_FF59, 35)] {
+        let elf = scratch.path(&format!("own-{board}.elf"));
+        build(&["build", own.to_str().unwrap(), "--board", board, "-o", &elf]);
+        let bytes = fs::read(&elf).unwrap();
+        let image = flash_image(
+            &fs::read(Path::new(&elf).with_extension("uf2")).unwrap(),
+            family,
+        );
+        let vectors = elf_symbol(&bytes, "__vector_table").unwrap() as usize - 0x1000_0000;
+        let handler = elf_symbol(&bytes, "ADC_IRQ_FIFO").expect("the program's handler");
+        assert_ne!(Some(handler), elf_symbol(&bytes, "AdcHandler"), "{board}");
+        assert_eq!(
+            word(&image, vectors + 4 * (16 + irq)),
+            handler | 1,
+            "{board}"
+        );
+    }
+    // Without std/embedded/chip the stub falls through to DefaultHandler.
+    let bare = scratch.write("bare.dodo", "package main\nfn main() {}\n");
+    for (chip, family) in [("rp2040", 0xE48B_FF56), ("rp2350", 0xE48B_FF59)] {
+        let elf = scratch.path(&format!("bare-{chip}.elf"));
+        build(&["build", bare.to_str().unwrap(), "--chip", chip, "-o", &elf]);
+        assert_eq!(
+            stub_literal(Path::new(&elf), family, "AdcHandler", 10),
+            0,
+            "{chip}"
+        );
+    }
+}
+
+#[test]
 fn random_number_generators_compile_for_every_board() {
     let scratch = Scratch::new("rng-compile");
     let source = scratch.write(
@@ -1445,4 +2179,578 @@ fn main() {
             ]));
         }
     }
+}
+
+fn check_esp32c6_firmware(elf: &Path) {
+    let bytes = fs::read(elf).unwrap();
+    let image = fs::read(elf.with_extension("bin")).unwrap();
+    // RISC-V, entered by the boot ROM's direct boot at flash + 8, after the
+    // marker, which is the ELF's entry.
+    assert_eq!(u16::from_le_bytes([bytes[0x12], bytes[0x13]]), 0xF3);
+    assert_eq!(word(&image, 0), 0xAEDB_041D);
+    assert_eq!(word(&image, 4), 0xAEDB_041D);
+    assert_eq!(word(&bytes, 0x18), 0x4200_0008);
+    assert_eq!(elf_symbol(&bytes, "Reset_Handler"), Some(0x4200_0008));
+    // The vectored trap table mtvec needs, and the routed sources' table.
+    let vector = elf_symbol(&bytes, "__vector_table").expect("trap vector");
+    assert_eq!(vector % 256, 0);
+    assert!(elf_symbol(&bytes, "dodo_interrupt_table").is_some());
+    // The flash setup runs from SRAM, where the image's .data puts it.
+    let setup = elf_symbol(&bytes, "dodo_esp32c6_flash_setup").expect("flash setup");
+    assert!((0x4080_0000..0x4088_0000).contains(&setup), "{setup:#x}");
+    assert!(image.len() < 8 * 1024 * 1024);
+}
+
+fn build_esp32c6(args: &[&str]) {
+    let output = dodo(args);
+    let message = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(output.status.success(), "{args:?}: {message}");
+    assert!(message.contains(".bin"), "{message}");
+}
+
+#[test]
+fn esp32c6_projects_link_to_flashable_firmware() {
+    if !ld_lld() {
+        return;
+    }
+    let scratch = Scratch::new("link-esp32c6");
+    let blink = root().join("examples/blink");
+    let tasks = root().join("examples/esp32c6_tasks");
+    let selftest = root().join("tests/hardware/esp32c6_devkitc");
+    let can_audio = root().join("tests/hardware/esp32c6_can_audio");
+    for (project, name, board) in [
+        (&blink, "blink", &["--board", "esp32c6_devkitc"][..]),
+        (&tasks, "tasks", &[][..]),
+        (&selftest, "selftest", &[][..]),
+        (&can_audio, "can-audio", &[][..]),
+    ] {
+        for level in ["0", "2"] {
+            let elf = scratch.path(&format!("{name}-O{level}.elf"));
+            let mut args = vec!["build", project.to_str().unwrap(), "-O", level, "-o", &elf];
+            args.extend(board);
+            build_esp32c6(&args);
+            check_esp32c6_firmware(Path::new(&elf));
+        }
+    }
+    // The portable examples, unchanged: drivers tested with fakes on the
+    // board's buses, an ADC input and a PWM output, displays, and the
+    // serial consoles.
+    for name in [
+        "hal_sensor_board",
+        "dimmer_board",
+        "thermometer_board",
+        "oled_demo",
+        "serial_console",
+        "usb_serial",
+    ] {
+        let source = root().join(format!("examples/{name}.dodo"));
+        for level in ["0", "2"] {
+            let elf = scratch.path(&format!("{name}-O{level}.elf"));
+            build_esp32c6(&[
+                "build",
+                source.to_str().unwrap(),
+                "--board",
+                "esp32c6_devkitc",
+                "-O",
+                level,
+                "-o",
+                &elf,
+            ]);
+            check_esp32c6_firmware(Path::new(&elf));
+        }
+    }
+    // A custom board with only `chip` set, and the default panic hook's
+    // reporter, which the chip package defines.
+    let custom = scratch.write(
+        "custom.dodo",
+        "package main\nimport \"std/embedded/chip\"\nfn main() {\n p := chip.take()!\n led := p.pins.output(15)!\n led.set_high()\n}\n",
+    );
+    let elf = scratch.path("custom.elf");
+    build_esp32c6(&[
+        "build",
+        custom.to_str().unwrap(),
+        "--chip",
+        "esp32c6",
+        "-o",
+        &elf,
+    ]);
+    check_esp32c6_firmware(Path::new(&elf));
+    let bytes = fs::read(&elf).unwrap();
+    assert!(elf_symbol(&bytes, "dodo_panic_report").is_some());
+    assert!(elf_symbol(&bytes, "dodo_board_panic").is_some());
+}
+
+// The ESP32-C6 runtime saves the registers and calls `@interrupt` handlers
+// as ordinary functions, so they return with `ret`, not `mret`, and names
+// come from the chip's interrupt sources.
+#[test]
+fn esp32c6_interrupt_handlers_are_plain_functions() {
+    let scratch = Scratch::new("esp32c6-interrupts");
+    let source = scratch.write(
+        "main.dodo",
+        "package main\nimport \"std/embedded/chip\"\nstatic mut COUNT: u32 = 0\n@interrupt(GPIO)\nfn edge() {\n    unsafe {\n        COUNT += 1\n    }\n}\nfn main() {\n    chip.enable(chip.GPIO)\n}\n",
+    );
+    let assembly = scratch.path("main.s");
+    stdout(&dodo(&[
+        "build",
+        source.to_str().unwrap(),
+        "--board",
+        "esp32c6_devkitc",
+        "-O",
+        "2",
+        "--emit",
+        "asm",
+        "-o",
+        &assembly,
+    ]));
+    let text = fs::read_to_string(&assembly).unwrap();
+    let handler = text.split("\nGPIO:").nth(1).expect("exported handler");
+    let body = handler.split(".Lfunc_end").next().unwrap();
+    assert!(text.contains(".globl\tGPIO"), "{text}");
+    assert!(body.contains("\tret") && !body.contains("mret"), "{body}");
+
+    let wrong = scratch.write(
+        "wrong.dodo",
+        "package main\n@interrupt(UART0_IRQ)\nfn serial() {}\nfn main() {}\n",
+    );
+    let error = stderr(&dodo(&[
+        "check",
+        wrong.to_str().unwrap(),
+        "--board",
+        "esp32c6_devkitc",
+    ]));
+    assert!(
+        error.contains("unknown interrupt vector `UART0_IRQ` for this chip"),
+        "{error}"
+    );
+}
+
+// Board settings, atomics with the A extension, and the chip's packages.
+#[test]
+fn esp32c6_settings_and_packages_check() {
+    let blink = root().join("examples/blink");
+    let config = stdout(&dodo(&[
+        "build",
+        blink.to_str().unwrap(),
+        "--board",
+        "esp32c6_devkitc",
+        "--print-config",
+    ]));
+    for line in [
+        "triple = \"riscv32-unknown-none-elf\" # board esp32c6_devkitc",
+        "cpu = \"generic-rv32\" # board esp32c6_devkitc",
+        "features = \"+m,+a,+c\" # board esp32c6_devkitc",
+        "panic-hook = \"dodo_board_panic\" # board esp32c6_devkitc",
+    ] {
+        assert!(config.contains(line), "{line}\n{config}");
+    }
+    let scratch = Scratch::new("esp32c6-check");
+    let source = scratch.write(
+        "main.dodo",
+        r#"package main
+import "std/embedded/board"
+import "std/embedded/chip"
+import "std/embedded/hal"
+import "std/sync/atomic"
+static HITS: atomic.Atomic<u32> = atomic.Atomic.new(0u32)
+fn main() {
+    b := board.take()!
+    HITS.fetch_add(1, atomic.Ordering.AcqRel)!
+    i2c := b.pins.i2c(board.I2C_SDA_PIN, board.I2C_SCL_PIN, hal.I2C_FAST_HZ)!
+    spi := b.pins.spi(board.SPI_CLOCK_PIN, board.SPI_TX_PIN, some(board.SPI_RX_PIN), hal.SpiMode.Mode0, 8_000_000)!
+    serial := b.pins.uart(board.UART_TX_PIN, some(board.UART_RX_PIN), 115_200)!
+    output := b.pins.pwm(10, 50)!
+    hal.set_pulse_us(&mut output, 1500, 20_000)!
+    input := b.pins.analog(2)!
+    millivolts := hal.read_millivolts(&mut input, 3300)!
+    sensor := b.pins.temperature()!
+    celsius := chip.millicelsius(sensor.read()!) / 1000
+    channel := b.dma.channel()!
+    source: [4]u8 = [1, 2, 3, 4]
+    target: [4]u8 = [0; 4]
+    channel.copy(&mut target, &source)!
+    usb := b.usb.serial()!
+    b.led.set_color(0x00_10_00)
+    core.assert(millivolts <= 3300 && celsius > -40)
+    b.pins.release_i2c(i2c)
+    b.pins.release_spi(spi)
+    b.pins.release_uart(serial)
+    b.pins.release_pwm(output)
+    b.pins.release_analog(input)
+    b.pins.release_analog(sensor)
+    b.dma.release(channel)
+    b.usb.release_serial(usb)
+}
+"#,
+    );
+    stdout(&dodo(&[
+        "check",
+        source.to_str().unwrap(),
+        "--board",
+        "esp32c6_devkitc",
+    ]));
+    let object = scratch.path("main.o");
+    stdout(&dodo(&[
+        "build",
+        source.to_str().unwrap(),
+        "--board",
+        "esp32c6_devkitc",
+        "--emit",
+        "obj",
+        "-o",
+        &object,
+    ]));
+}
+
+#[test]
+fn avr_runtime_provides_startup_and_helper_symbols() {
+    let scratch = Scratch::new("avr-runtime");
+    let chip = dodoc::hardware::chip("atmega328p").unwrap();
+    let object = scratch.0.join("atmega328p.o");
+    let options = dodoc::codegen::Options {
+        target: Some(chip.triple.into()),
+        cpu: Some(chip.cpu.into()),
+        optimization: 2,
+        ..Default::default()
+    };
+    dodoc::codegen::compile_ir_object(&options, chip.name, &(chip.runtime)(), &object).unwrap();
+    let bytes = fs::read(&object).unwrap();
+    let text = String::from_utf8_lossy(&bytes);
+    for name in [
+        ".vectors",
+        "__vectors",
+        "__reset",
+        "__do_copy_data",
+        "__do_clear_bss",
+        "__bad_interrupt",
+        chip.panic_hook,
+        "dodo_panic_report",
+        "abort",
+        "TIMER0_OVF",
+        "USART_RX",
+        "dodo_avr_ticks",
+        "dodo_avr_delay_loops",
+        "dodo_avr_flash_byte",
+        "dodo_avr_rx_take",
+        "dodo_avr_eeprom_write",
+        "dodo_avr_watchdog",
+        "memcpy",
+        "memmove",
+        "memset",
+        "memcmp",
+        "__mulsi3",
+        "__muldi3",
+        "__mulosi4",
+        "__mulodi4",
+        "__udivmodqi4",
+        "__divmodhi4",
+        "__udivmodsi4",
+        "__udivdi3",
+        "__moddi3",
+        "__addsf3",
+        "__divsf3",
+        "__ltsf2",
+        "__unordsf2",
+        "__fixsfsi",
+        "__floatundisf",
+        "__adddf3",
+        "__divdf3",
+        "__gedf2",
+        "__extendsfdf2",
+        "__sync_val_compare_and_swap_2",
+        "__sync_lock_test_and_set_1",
+        "__sync_fetch_and_add_4",
+    ] {
+        assert!(text.contains(name), "atmega328p runtime lacks {name}");
+    }
+}
+
+// Function values are word addresses in AVR program memory (address space
+// 1), interrupt handlers use the signal ABI, panic messages stay in flash,
+// and size counts more than speed.
+#[test]
+fn avr_code_generation_keeps_code_and_constants_in_program_memory() {
+    let scratch = Scratch::new("avr-codegen");
+    let source = scratch.write(
+        "main.dodo",
+        r#"package main
+import "std/embedded/board"
+import "std/embedded/hal"
+static mut COUNT: u16 = 0
+fn triple(value: u32) -> u32 {
+    return value * 3
+}
+fn apply(function: fn(u32) -> u32, value: u32) -> u32 {
+    return function(value)
+}
+fn call(function: &dyn fn(u32) -> u32, value: u32) -> u32 {
+    return function(value)
+}
+fn drive(pin: &mut dyn hal.OutputPin) {
+    pin.set_high()
+}
+const TABLE: [1]fn(u32) -> u32 = [triple]
+@interrupt(TIMER1_COMPA)
+fn tick() {
+    unsafe {
+        COUNT += 1
+    }
+}
+fn main() {
+    b := board.take()!
+    offset := apply(TABLE[0], 2) + call(triple, 1)
+    drive(&mut b.led)
+    total := call(fn(x) {
+        x + offset
+    }, 4)
+    values: [2]u32 = [total, 0]
+    b.timer.delay_ms(values[(total & 1) as usize] + 1)
+}
+"#,
+    );
+    let source = source.to_str().unwrap();
+    for level in ["0", "2"] {
+        let ir = scratch.path(&format!("main-O{level}.ll"));
+        stdout(&dodo(&[
+            "build",
+            source,
+            "--board",
+            "arduino_uno",
+            "-O",
+            level,
+            "--emit",
+            "llvm-ir",
+            "-o",
+            &ir,
+        ]));
+        let ir = fs::read_to_string(&ir).unwrap();
+        assert!(ir.contains("target triple = \"avr-none\""), "{ir}");
+        if level == "0" {
+            // Unoptimized, the function table, the closure pair and the
+            // function-to-closure conversion are all still there.
+            assert!(
+                ir.contains("[1 x ptr addrspace(1)] [ptr addrspace(1) @dodo.main.triple]"),
+                "{ir}"
+            );
+            assert!(ir.contains("{ ptr addrspace(1), ptr }"), "{ir}");
+            assert!(
+                ir.contains("ptr inttoptr (i16 ptrtoint (ptr addrspace(1) @dodo.main.triple"),
+                "{ir}"
+            );
+        }
+        assert!(ir.contains("addrspace(1) constant"), "panic text: {ir}");
+        assert!(ir.contains("section \".progmem.data."), "{ir}");
+        assert!(!ir.contains("section \".rodata.panic"), "{ir}");
+        let handler = ir
+            .lines()
+            .find(|line| line.starts_with("define") && line.contains("@TIMER1_COMPA"))
+            .unwrap();
+        let group = handler
+            .split('#')
+            .nth(1)
+            .unwrap()
+            .split(' ')
+            .next()
+            .unwrap();
+        let attributes = ir
+            .lines()
+            .find(|line| line.starts_with(&format!("attributes #{group} ")))
+            .unwrap();
+        assert!(attributes.contains("\"signal\""), "{attributes}");
+        assert!(attributes.contains("optsize"), "{attributes}");
+        let object = scratch.path(&format!("main-O{level}.o"));
+        stdout(&dodo(&[
+            "build",
+            source,
+            "--board",
+            "arduino_uno",
+            "-O",
+            level,
+            "--emit",
+            "obj",
+            "-o",
+            &object,
+        ]));
+    }
+    // Nothing else sets the optimization level, so the board picks 2;
+    // explicit settings still win.
+    let config = stdout(&dodo(&[
+        "build",
+        source,
+        "--board",
+        "arduino_uno",
+        "--print-config",
+    ]));
+    for line in [
+        "triple = \"avr-none\" # board arduino_uno",
+        "cpu = \"atmega328p\" # board arduino_uno",
+        "opt-level = 2 # board arduino_uno",
+        "panic-hook = \"dodo_board_panic\" # board arduino_uno",
+    ] {
+        assert!(config.contains(line), "missing {line:?} in\n{config}");
+    }
+    let config = stdout(&dodo(&[
+        "build",
+        source,
+        "--board",
+        "arduino_uno",
+        "-O",
+        "0",
+        "--print-config",
+    ]));
+    assert!(config.contains("opt-level = 0 # CLI"), "{config}");
+    let config = stdout(&dodo(&[
+        "build",
+        source,
+        "--board",
+        "arduino_uno",
+        "--release",
+        "--print-config",
+    ]));
+    assert!(
+        config.contains("opt-level = 3 # built-in release profile"),
+        "{config}"
+    );
+}
+
+/// The flash contents an Intel HEX file describes, gaps erased.
+fn intel_hex_image(text: &str) -> Vec<u8> {
+    let mut image = vec![];
+    let mut upper = 0usize;
+    for line in text.lines() {
+        let bytes: Vec<u8> = (1..line.len())
+            .step_by(2)
+            .map(|at| u8::from_str_radix(&line[at..at + 2], 16).unwrap())
+            .collect();
+        assert_eq!(
+            bytes.iter().fold(0u8, |sum, b| sum.wrapping_add(*b)),
+            0,
+            "{line}"
+        );
+        let count = bytes[0] as usize;
+        let address = u16::from_be_bytes([bytes[1], bytes[2]]) as usize;
+        let data = &bytes[4..4 + count];
+        match bytes[3] {
+            0 => {
+                let at = upper + address;
+                if image.len() < at + count {
+                    image.resize(at + count, 0xFF);
+                }
+                image[at..at + count].copy_from_slice(data);
+            }
+            1 => return image,
+            4 => upper = (u16::from_be_bytes([data[0], data[1]]) as usize) << 16,
+            kind => panic!("record type {kind}"),
+        }
+    }
+    panic!("no end-of-file record");
+}
+
+/// A linked ATmega328P program: its Intel HEX image starts with the vector
+/// table's jmp instructions, fits below the Uno's bootloader, and holds
+/// `.data`'s load image, whose RAM copy lies in the 2 KiB of SRAM.
+fn check_atmega328p_firmware(elf: &Path) -> Vec<u8> {
+    let bytes = fs::read(elf).unwrap();
+    assert_eq!(&bytes[..4], b"\x7fELF");
+    assert_eq!(u16::from_le_bytes([bytes[18], bytes[19]]), 83, "EM_AVR");
+    let image = intel_hex_image(&fs::read_to_string(elf.with_extension("hex")).unwrap());
+    assert!(image.len() <= 32 * 1024 - 512, "{} bytes", image.len());
+    for vector in 0..26 {
+        let word = u16::from_le_bytes([image[4 * vector], image[4 * vector + 1]]);
+        assert_eq!(word & 0xFE0E, 0x940C, "vector {vector} is not a jmp");
+    }
+    let start = elf_symbol(&bytes, "__data_start").unwrap();
+    let end = elf_symbol(&bytes, "__data_end").unwrap();
+    let load = elf_symbol(&bytes, "__data_load").unwrap() as usize;
+    assert!((0x80_0100..=0x80_0900).contains(&start) && end >= start);
+    assert_eq!(load + (end - start) as usize, image.len().max(load));
+    image
+}
+
+#[test]
+fn arduino_uno_projects_link_to_flashable_firmware() {
+    if !ld_lld() {
+        return;
+    }
+    let scratch = Scratch::new("uno");
+    // Board-generic examples, unchanged, and the hardware self-test.
+    for (source, args, name) in [
+        ("examples/blink", &[][..], "blink"),
+        ("examples/serial_console.dodo", &[][..], "console"),
+        ("examples/usb_serial.dodo", &[][..], "usb"),
+        ("examples/dimmer_board.dodo", &[][..], "dimmer"),
+        ("examples/hal_sensor_board.dodo", &[][..], "sensor"),
+        ("examples/uno_boot_counter.dodo", &[][..], "counter"),
+        ("tests/hardware/arduino_uno", &["-b", "core"][..], "core"),
+        ("tests/hardware/arduino_uno", &["-b", "wide"][..], "wide"),
+        (
+            "tests/hardware/arduino_uno",
+            &["-b", "peripherals"][..],
+            "peripherals",
+        ),
+    ] {
+        let elf = scratch.path(&format!("{name}.elf"));
+        let source = root().join(source);
+        // Manifest targets name the board themselves.
+        let mut command = vec!["build", source.to_str().unwrap()];
+        if args.is_empty() {
+            command.extend_from_slice(&["--board", "arduino_uno"]);
+        }
+        command.extend_from_slice(args);
+        command.extend_from_slice(&["-o", &elf]);
+        let output = dodo(&command);
+        let message = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(output.status.success(), "{command:?}: {message}");
+        assert!(message.contains(".hex"), "{message}");
+        let image = check_atmega328p_firmware(Path::new(&elf));
+        if name == "console" {
+            // Panic messages are in flash, outside `.data`'s load image.
+            let bytes = fs::read(&elf).unwrap();
+            let load = elf_symbol(&bytes, "__data_load").unwrap() as usize;
+            let text = b"index bounds\0";
+            let at = image
+                .windows(text.len())
+                .position(|window| window == text)
+                .expect("panic text in flash");
+            assert!(at < load, "panic text at {at:#x}, .data from {load:#x}");
+        }
+    }
+    // A custom board with only `chip` set gets all 32 KiB.
+    let custom = scratch.write(
+        "custom.dodo",
+        "package main\nimport \"std/embedded/chip\"\nfn main() {\n p := chip.take(chip.Config { cpu_hz: 8_000_000 })!\n led := p.pins.output(chip.PB0)!\n led.set_high()\n}\n",
+    );
+    let elf = scratch.path("custom.elf");
+    let output = dodo(&[
+        "build",
+        custom.to_str().unwrap(),
+        "--chip",
+        "atmega328p",
+        "-o",
+        &elf,
+    ]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    check_atmega328p_firmware(Path::new(&elf));
+    // Constants live in SRAM on AVR: too many fail at the link, naming the
+    // stack they would leave too little room for.
+    let large = scratch.write(
+        "large.dodo",
+        "package main\nimport \"std/embedded/board\"\nstatic TABLE: [30000]u8 = [1u8; 30000]\nfn main() {\n b := board.take()!\n index := b.timer.now_us() as usize % 30000\n b.timer.delay_ms(TABLE[index] as u32)\n}\n",
+    );
+    let error = stderr(&dodo(&[
+        "build",
+        large.to_str().unwrap(),
+        "--board",
+        "arduino_uno",
+        "-o",
+        &scratch.path("large.elf"),
+    ]));
+    assert!(
+        error.contains("RAM: statics and constants leave less than 256 bytes for the stack"),
+        "{error}"
+    );
 }

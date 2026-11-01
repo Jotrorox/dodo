@@ -1,0 +1,974 @@
+package esp_i2s
+
+import "core/cpu"
+import "core/mmio"
+import "core/ptr"
+import "std/embedded/hal"
+
+// I2S audio on the ESP32-C6's I2S0 controller, for the esp32c6 chip
+// package: `Output` plays samples to a DAC or amplifier (such as the
+// PCM5102 or MAX98357A) and `Input` records a microphone or ADC (such as the
+// INMP441). The chip package wraps them as `esp32c6.I2sOutput` and
+// `esp32c6.I2sInput`, which implement hal.I2sOutput and hal.I2sInput and
+// are claimed with `Pins.i2s_output` and `Pins.i2s_input`. Both are the
+// controller (master) of the bus: they make the bit clock (BCLK) and word
+// select (WS, LRCLK). An input given the output's clock pins shares the
+// output's clocks instead (the controller's signal loopback, SIG_LOOPBACK,
+// with the receiver as slave), for codecs that take one BCLK and LRCLK for
+// both directions.
+//
+// Framing. As in std/embedded/chip/rp_i2s: every frame carries two slots,
+// left then right, whatever the channel count; a mono output sends each
+// sample in both slots and a mono input keeps the slot Config.channel
+// names. A slot is 32 bit clocks, or 16 for 16-bit samples with
+// Config.slot_bits = 16. Samples go most significant bit first; a 24-bit
+// sample in a 32-bit slot is followed by eight zero bits (Philips and left
+// justified) or preceded by eight copies of its sign bit (right justified).
+// WS is low for the left slot in Philips framing (which also delays the
+// data by one bit clock, TX_MSB_SHIFT) and high for it in left- and
+// right-justified framing (TX_WS_IDLE_POL). The controller runs in its TDM
+// mode with two channels, which is how the ESP32-C6 does standard I2S.
+//
+// Clock. The controller's clock comes from the 160 MHz PLL output through a
+// fractional divider, N + b / a with N 2 to 255 and a up to 511
+// (PCR I2S_TX_CLKM_CONF and I2S_TX_CLKM_DIV_CONF), then an integer divider
+// to the bit clock (TX_BCK_DIV_NUM). `timing` divides to 256 times the
+// sample rate (MCLK, 4 bit clocks in 32-bit slots, 8 in 16-bit ones) where
+// it can, and finds the closest fraction: every standard rate (8, 11.025,
+// 16, 22.05, 32, 44.1, 48, 88.2, and 96 kHz) is then exact, since 160 MHz
+// divided by 256 times a multiple of 11.025 kHz is an integer plus a
+// fraction with a denominator of 441, and the others have denominators of
+// powers of two or 3 times them. Other rates are within a few parts per
+// million (Timing.error_ppm). The fractional divider alternates between N
+// and N + 1 PLL cycles, which gives the master clock up to 6.25 ns of
+// jitter; the bit clock divider halves its share of the period. Rates run
+// from about 600 Hz (MCLK divider at most 255 with BCLK divided by 64) to
+// 625 kHz in 32-bit slots.
+//
+// Queues. Each direction streams through a GDMA channel taken from
+// esp32c6.Dma, over a ring of RING_DESCRIPTORS descriptors of
+// DESCRIPTOR_BYTES each that the channel follows round and round
+// (OUT_LINK, IN_LINK), so samples move in the background.
+// A 32-bit slot takes 4 bytes and a frame of two 16-bit slots 4 bytes, so a
+// descriptor holds 64 frames, or 128 in 16-bit slots: 1.33 ms or 2.67 ms at
+// 48 kHz. The output queues at most RING_DESCRIPTORS - 2 descriptors ahead
+// of the one playing, 8 ms in 32-bit slots at 48 kHz; the input keeps up to
+// RING_DESCRIPTORS complete descriptors for poll_read, 10.7 ms, and returns
+// samples a descriptor at a time, as each one completes.
+//
+// Running dry and overrunning. The channel's interrupt (a DMA_OUT_CHn
+// handler in the runtime, `dma_interrupt` here) zeroes each output
+// descriptor once the channel has read it, so an output whose queue runs
+// dry plays silence, a whole descriptor at a time, and the clocks never
+// stop; samples queued afterwards follow the silence. The output channel
+// does not check descriptor owners, so it never stops; the output depends
+// on its interrupt (enabled by the chip package) being taken within a
+// descriptor's time. The input channel does check them: the channel hands
+// each descriptor back as it fills it (clearing its owner bit), poll_read
+// returns it to the channel once read, and a ring the program did not read
+// in time stops the channel at the first unread descriptor
+// (IN_DSCR_ERR). poll_read then reports hal.Error.Overrun once, drops what
+// the ring held, and restarts the receiver, so the samples that follow
+// begin with a left slot.
+//
+// Register names follow the ESP32-C6 technical reference manual (I2S
+// Controller, GDMA Controller).
+
+const I2S_BASE: usize = 0x6000_C000
+const RX_CONF: usize = I2S_BASE + 0x20
+const TX_CONF: usize = I2S_BASE + 0x24
+const RX_CONF1: usize = I2S_BASE + 0x28
+const TX_CONF1: usize = I2S_BASE + 0x2C
+const RX_TDM_CTRL: usize = I2S_BASE + 0x50
+const TX_TDM_CTRL: usize = I2S_BASE + 0x54
+const RXEOF_NUM: usize = I2S_BASE + 0x64
+const CONF_SIGLE_DATA: usize = I2S_BASE + 0x68
+
+// TX_CONF and RX_CONF: resets of the unit and its FIFO (write to trigger),
+// start, slave mode, register update to the I2S clock domain, PCM bypass,
+// TX_STOP_EN (stop the clocks when the FIFO is empty), left alignment, WS
+// level of the left slot, TDM mode, and in TX_CONF the signal loopback,
+// which gives the receiver the transmitter's BCLK and WS.
+const UNIT_RESET: u32 = 1 << 0
+const FIFO_RESET: u32 = 1 << 1
+const START: u32 = 1 << 2
+const SLAVE: u32 = 1 << 3
+const UPDATE: u32 = 1 << 8
+const MONO_FIRST_VALID: u32 = 1 << 9
+const PCM_BYPASS: u32 = 1 << 12
+const LEFT_ALIGN: u32 = 1 << 15
+const WS_IDLE_HIGH: u32 = 1 << 17
+const TDM: u32 = 1 << 19
+const SIG_LOOPBACK: u32 = 1 << 27
+// TX_CONF1 and RX_CONF1: WS width less one (bits 6-0), BCLK divider less
+// one (12-7), sample bits less one (17-13), half a frame's bits less one
+// (23-18), slot bits less one (28-24), the Philips one-bit delay (29), and
+// in TX_CONF1 BCLK not delayed (30).
+const MSB_SHIFT: u32 = 1 << 29
+const BCK_NO_DELAY: u32 = 1 << 30
+
+// PCR: the transmitter's and receiver's function clocks, each a divider
+// configuration (N in bits 19-12, the source in 21-20, enable in 22) and
+// the fraction's terms (Z, Y, X, and YN1 in bits 8-0, 17-9, 26-18, 27).
+const PCR_I2S_TX_CLKM_CONF: usize = 0x6009_6070
+const PCR_I2S_TX_CLKM_DIV_CONF: usize = 0x6009_6074
+const PCR_I2S_RX_CLKM_CONF: usize = 0x6009_6078
+const PCR_I2S_RX_CLKM_DIV_CONF: usize = 0x6009_607C
+const CLKM_SOURCE_PLL_160M: u32 = 2 << 20
+const CLKM_ENABLE: u32 = 1 << 22
+
+// GDMA: per channel 0xC0 apart, as in esp32c6.
+const GDMA_IN_INT: usize = 0x6008_0000
+const GDMA_OUT_INT: usize = 0x6008_0030
+const GDMA_CHANNEL: usize = 0x6008_0070
+const GDMA_STRIDE: usize = 0xC0
+const IN_CONF0: usize = 0x00
+const IN_CONF1: usize = 0x04
+const IN_LINK: usize = 0x10
+const IN_PERI_SEL: usize = 0x30
+const OUT_CONF0: usize = 0x60
+const OUT_CONF1: usize = 0x64
+const OUT_LINK: usize = 0x70
+const OUT_EOF_DES_ADDR: usize = 0x78
+const OUT_PERI_SEL: usize = 0x90
+const CHANNEL_RESET: u32 = 1 << 0
+// IN_CONF0: burst reads of descriptors and burst data writes. OUT_CONF0:
+// EOF once the data left the channel's FIFO, burst descriptor and data
+// reads.
+const IN_BURSTS: u32 = (1u32 << 2) | (1u32 << 3)
+const OUT_CONF: u32 = (1u32 << 3) | (1u32 << 4) | (1u32 << 5)
+const LINK_ADDRESS: u32 = 0xF_FFFF
+const IN_LINK_STOP: u32 = 1 << 21
+const IN_LINK_START: u32 = 1 << 22
+const OUT_LINK_STOP: u32 = 1 << 20
+const OUT_LINK_START: u32 = 1 << 21
+// Interrupt bits: the input channel met a descriptor it does not own or
+// ran out of them (IN_DSCR_ERR, IN_DSCR_EMPTY), an output descriptor with
+// EOF was read (OUT_EOF).
+const IN_STALLED: u32 = (1u32 << 3) | (1u32 << 4)
+const CHECK_OWNER: u32 = 1 << 12
+const OUT_EOF: u32 = 1 << 1
+const ALL_DMA_INTERRUPTS: u32 = 0x7F
+// I2S0 in GDMA's peripheral selection.
+const PERIPHERAL_I2S: u32 = 3
+// Descriptor word 0: size (11-0), length (23-12), EOF (30), owned by the
+// DMA (31).
+const DESCRIPTOR_OWNED: u32 = 1u32 << 31
+const DESCRIPTOR_EOF: u32 = 1 << 30
+
+// The function clock: the PLL's 160 MHz output.
+pub const CLOCK_HZ: u32 = 160_000_000
+// The ring: descriptors, and bytes in each.
+pub const RING_DESCRIPTORS: u32 = 8
+pub const DESCRIPTOR_BYTES: u32 = 512
+const RING_WORDS: usize = 1024
+const DESCRIPTOR_WORDS: usize = 128
+// No channel.
+const NONE: u32 = 0xFF
+
+// The rings, their descriptors, and the output's GDMA channel, or NONE.
+// COUNTERS: descriptors the output channel has read, and the last one it
+// read.
+static mut TX_RING: [1024]u32 = [0u32; 1024]
+static mut RX_RING: [1024]u32 = [0u32; 1024]
+static mut TX_DESCRIPTORS: [24]u32 = [0u32; 24]
+static mut RX_DESCRIPTORS: [24]u32 = [0u32; 24]
+static mut CHANNELS: [1]u32 = [0xFFu32]
+static mut COUNTERS: [2]u32 = [0u32; 2]
+// The output's BCLK and WS pins (BCLK in bits 15-8), for an input that
+// shares them, or NONE; and its sample rate and slot width.
+static mut OUTPUT_CLOCK: u32 = 0xFF
+static mut OUTPUT_RATE: u32 = 0
+static mut OUTPUT_SLOT: u32 = 0
+
+// The slot a mono input keeps.
+pub enum Channel {
+    Left,
+    Right
+}
+
+// A stream's settings, for Pins.i2s_output and Pins.i2s_input, as in
+// rp_i2s.
+pub struct Config {
+    // Frames per second.
+    pub sample_rate: u32
+    // Bits per sample: 16, 24, or 32.
+    pub bits: u32
+    // Samples per frame in the slices the program passes: 1 or 2. The
+    // wire always carries two slots.
+    pub channels: u32
+    pub format: hal.I2sFormat
+    // Bit clocks per slot: 32, or 16 for 16-bit samples, which halves the
+    // bit clock and doubles the frames the ring holds.
+    pub slot_bits: u32
+    // The slot a mono input keeps; the other is dropped.
+    pub channel: Channel
+
+    // `sample_rate` frames per second of `channels` samples of `bits` bits,
+    // framed as `format`, in 32-bit slots, a mono input keeping the left
+    // slot.
+    pub fn new(sample_rate: u32, bits: u32, channels: u32, format: hal.I2sFormat) -> Config {
+        return Config { sample_rate, bits, channels, format, slot_bits: 32, channel: Channel.Left }
+    }
+}
+
+// A stream's clock: the fractional divider of the 160 MHz clock to MCLK,
+// integer + numerator / denominator, and MCLK's divider to the bit clock.
+pub struct Timing {
+    pub clock_hz: u32
+    // The sample rate asked for.
+    pub sample_rate: u32
+    pub slot_bits: u32
+    pub integer: u32
+    pub numerator: u32
+    pub denominator: u32
+    pub bit_divider: u32
+
+    // The sample rate the dividers give, in millihertz, rounded.
+    pub fn actual_millihertz(&self) -> u64 {
+        cycles := self.cycles_per_frame_scaled()
+        return (self.clock_hz as u64 * 1000 * self.denominator as u64 + cycles / 2) / cycles
+    }
+
+    // The sample rate the dividers give, rounded to whole hertz.
+    pub fn actual_rate(&self) -> u32 {
+        return ((self.actual_millihertz() + 500) / 1000) as u32
+    }
+
+    // How far the actual rate is from the rate asked for, in parts per
+    // million, rounded: positive when it runs fast.
+    pub fn error_ppm(&self) -> i32 {
+        wanted := self.sample_rate as i64 * self.cycles_per_frame_scaled() as i64
+        given := self.clock_hz as i64 * self.denominator as i64
+        difference := (given - wanted) * 1_000_000
+        if difference < 0 {
+            return -((-difference + wanted / 2) / wanted) as i32
+        }
+        return ((difference + wanted / 2) / wanted) as i32
+    }
+
+    // The bit clock the dividers give, rounded to whole hertz.
+    pub fn bit_clock_hz(&self) -> u32 {
+        cycles := (self.integer as u64 * self.denominator as u64 + self.numerator as u64) * self.bit_divider as u64
+        return ((self.clock_hz as u64 * self.denominator as u64 + cycles / 2) / cycles) as u32
+    }
+
+    pub fn copy(&self) -> Timing {
+        return Timing { clock_hz: self.clock_hz, sample_rate: self.sample_rate, slot_bits: self.slot_bits, integer: self.integer, numerator: self.numerator, denominator: self.denominator, bit_divider: self.bit_divider }
+    }
+
+    // Clock cycles per frame, times the denominator.
+    fn cycles_per_frame_scaled(&self) -> u64 {
+        return (self.integer as u64 * self.denominator as u64 + self.numerator as u64) * self.bit_divider as u64 * 2 * self.slot_bits as u64
+    }
+}
+
+// The dividers closest to `sample_rate` frames per second in slots of
+// `slot_bits` (16 or 32) from a clock of `clock_hz`; see "Clock" above.
+// InvalidInput for a rate the dividers cannot reach or another slot width.
+pub fn timing(clock_hz: u32, sample_rate: u32, slot_bits: u32) -> Timing!hal.Error {
+    if sample_rate == 0 || (slot_bits != 16 && slot_bits != 32) {
+        return err(hal.Error.InvalidInput)
+    }
+    bit_clock := sample_rate as u64 * 2 * slot_bits as u64
+    // MCLK at 256 times the sample rate, then a larger or smaller bit
+    // clock divider while the MCLK divider is out of range.
+    divider := 256 / (2 * slot_bits)
+    for divider < 64 && clock_hz as u64 >= 256 * bit_clock * divider as u64 {
+        divider *= 2
+    }
+    for divider > 2 && clock_hz as u64 < 2 * bit_clock * divider as u64 {
+        divider /= 2
+    }
+    master := bit_clock * divider as u64
+    integer := clock_hz as u64 / master
+    if integer < 2 || integer > 255 {
+        return err(hal.Error.InvalidInput)
+    }
+    remainder := clock_hz as u64 % master
+    // The closest fraction b / a, a up to 511, smallest a first.
+    best_a := 1u64
+    best_b := 0u64
+    best_error := remainder
+    if remainder != 0 {
+        for a in 1u64..512 {
+            b := (remainder * a + master / 2) / master
+            if b < a {
+                // |remainder / master - b / a| scaled by master * a.
+                product := b * master
+                miss := 0u64
+                if product > remainder * a {
+                    miss = product - remainder * a
+                } else {
+                    miss = remainder * a - product
+                }
+                // Compare miss / a across denominators.
+                if miss * best_a < best_error * a {
+                    best_a = a
+                    best_b = b
+                    best_error = miss
+                }
+            }
+        }
+    }
+    return ok(Timing { clock_hz, sample_rate, slot_bits, integer: integer as u32, numerator: best_b as u32, denominator: best_a as u32, bit_divider: divider })
+}
+
+// The divider fraction b / a as PCR's DIV_CONF fields: for b <= a / 2,
+// Z = b, Y = a % b, X = a / b - 1, YN1 = 0; above, Z = a - b,
+// Y = a % (a - b), X = a / (a - b) - 1, YN1 = 1; all zero without a
+// fraction.
+pub fn divider_fields(a: u32, b: u32) -> u32 {
+    if b == 0 || a == 0 {
+        return 0
+    }
+    if b <= a / 2 {
+        return ((a / b - 1) << 18) | ((a % b) << 9) | b
+    }
+    rest := a - b
+    return (1u32 << 27) | ((a / rest - 1) << 18) | ((a % rest) << 9) | rest
+}
+
+// A sample as a 32-bit slot's word: its top `bits` bits, or for right
+// justified framing those bits at the bottom with copies of the sign
+// above.
+pub fn slot_word(sample: i32, bits: u32, right_justified: bool) -> u32 {
+    if bits >= 32 {
+        return unsigned(sample)
+    }
+    if right_justified {
+        return unsigned(sample >> (32 - bits) as i32)
+    }
+    return unsigned(sample) & ~(0xFFFF_FFFFu32 >> bits)
+}
+
+// A 32-bit slot's word as a sample, keeping `bits` bits: the top ones, or
+// for right justified framing the bottom ones.
+pub fn slot_sample(word: u32, bits: u32, right_justified: bool) -> i32 {
+    if bits >= 32 {
+        return signed(word)
+    }
+    if right_justified {
+        low := word & (0xFFFF_FFFFu32 >> (32 - bits))
+        return signed(low << (32 - bits))
+    }
+    return signed(word & ~(0xFFFF_FFFFu32 >> bits))
+}
+
+fn unsigned(value: i32) -> u32 {
+    if value < 0 {
+        return (0xFFFF_FFFFu64 - (-(value as i64) - 1) as u64) as u32
+    }
+    return value as u32
+}
+
+fn signed(value: u32) -> i32 {
+    if value >= 0x8000_0000 {
+        return -((0xFFFF_FFFFu32 - value) as i64 + 1) as i32
+    }
+    return value as i32
+}
+
+// Check `config` and find its timing. InvalidInput for a rate out of
+// range, bits other than 16, 24, or 32, more bits than the slot holds, or
+// channels other than 1 or 2.
+pub fn check(config: &Config) -> Timing!hal.Error {
+    if config.channels < 1 || config.channels > 2 || (config.bits != 16 && config.bits != 24 && config.bits != 32) || config.bits > config.slot_bits {
+        return err(hal.Error.InvalidInput)
+    }
+    return timing(CLOCK_HZ, config.sample_rate, config.slot_bits)
+}
+
+// The output's BCLK pin in bits 15-8 and WS pin in bits 7-0 while an
+// output runs, else 0xFF.
+pub fn output_clock_pins() -> u32 {
+    // SAFETY: a word only Output.start and stop write, on this core.
+    unsafe {
+        return OUTPUT_CLOCK
+    }
+}
+
+// The runtime's DMA interrupt handlers call this, through the chip
+// package's dodo_dma_interrupt, before anything else: it zeroes the output
+// descriptors the output channel has read and counts them, acknowledging
+// the interrupt.
+pub fn dma_interrupt() {
+    // SAFETY: the rings' channels and counters, which the streams only read
+    // or change with interrupts masked.
+    unsafe {
+        output := CHANNELS[0]
+        if output != NONE {
+            interrupts := GDMA_OUT_INT + 0x10 * output as usize
+            if (mmio.read32(interrupts + 4) & OUT_EOF) != 0 {
+                mmio.write32(interrupts + 0xC, OUT_EOF)
+                address := mmio.read32(GDMA_CHANNEL + GDMA_STRIDE * output as usize + OUT_EOF_DES_ADDR) as usize
+                first := ptr.as_ptr(&TX_DESCRIPTORS) as usize
+                index := RING_DESCRIPTORS
+                if address >= first {
+                    index = ((address - first) / 12) as u32
+                }
+                if index < RING_DESCRIPTORS {
+                    advance := (index + RING_DESCRIPTORS - COUNTERS[1]) % RING_DESCRIPTORS
+                    for step in 1..advance + 1 {
+                        slot := ((COUNTERS[1] + step) % RING_DESCRIPTORS) as usize
+                        for word in 0..DESCRIPTOR_WORDS {
+                            TX_RING[DESCRIPTOR_WORDS * slot + word] = 0
+                        }
+                    }
+                    COUNTERS[1] = index
+                    COUNTERS[0] = COUNTERS[0] + advance
+                }
+            }
+        }
+    }
+}
+
+// A counter the interrupt handler changes, read as it is now.
+fn counter(index: usize) -> u32 {
+    // SAFETY: a word read; the handler writes whole words.
+    unsafe {
+        return ptr.read_volatile(ptr.as_ptr(&COUNTERS[index..index + 1]))
+    }
+}
+
+// The function clock register values for `timing`.
+fn clock_conf(timing: &Timing) -> u32 {
+    return (timing.integer << 12) | CLKM_SOURCE_PLL_160M | CLKM_ENABLE
+}
+
+// TX_CONF1 or RX_CONF1 for slots of `slot_bits` with BCLK divider
+// `divider`, with the Philips delay if `philips`.
+fn conf1(slot_bits: u32, divider: u32, philips: bool) -> u32 {
+    bits := slot_bits - 1
+    value := bits | ((divider - 1) << 7) | (bits << 13) | (bits << 18) | (bits << 24)
+    if philips {
+        value |= MSB_SHIFT
+    }
+    return value
+}
+
+// Link `count` descriptors of `ring` round in a circle at `descriptors`,
+// each with EOF, the transmit ones with their whole size as length.
+// SAFETY: the caller owns both arrays while the channel uses them.
+unsafe fn link_ring(descriptors: &mut[24]u32, ring: usize, transmit: bool) {
+    first := unsafe {
+        ptr.as_mut_ptr(descriptors) as usize
+    }
+    for index in 0..RING_DESCRIPTORS as usize {
+        word := DESCRIPTOR_BYTES | DESCRIPTOR_EOF | DESCRIPTOR_OWNED
+        if transmit {
+            word |= DESCRIPTOR_BYTES << 12
+        }
+        descriptors[3 * index] = word
+        descriptors[3 * index + 1] = (ring + 4 * DESCRIPTOR_WORDS * index) as u32
+        descriptors[3 * index + 2] = (first + 12 * ((index + 1) % RING_DESCRIPTORS as usize)) as u32
+    }
+}
+
+fn is_philips(format: &hal.I2sFormat) -> bool {
+    match format {
+        hal.I2sFormat.Philips => {
+            return true
+        }
+        _ => {
+            return false
+        }
+    }
+}
+
+fn is_right_justified(format: &hal.I2sFormat) -> bool {
+    match format {
+        hal.I2sFormat.RightJustified => {
+            return true
+        }
+        _ => {
+            return false
+        }
+    }
+}
+
+// Write `value` to a CONF register and latch it into the I2S clock domain.
+// SAFETY: the caller owns the unit.
+unsafe fn update(conf: usize, value: u32) {
+    unsafe {
+        mmio.write32(conf, value)
+        mmio.write32(conf, value | UPDATE)
+        for _ in 0..10_000 {
+            if (mmio.read32(conf) & UPDATE) == 0 {
+                break
+            }
+        }
+    }
+}
+
+// Program a function clock: a temporary divider first, which avoids the
+// controller applying the new divider twice (as esp-hal and ESP-IDF do).
+// SAFETY: the caller owns the clock.
+unsafe fn set_clock(conf: usize, fraction: usize, timing: &Timing, extra: u32) {
+    unsafe {
+        mmio.write32(conf, (2u32 << 12) | CLKM_SOURCE_PLL_160M | extra)
+        mmio.write32(fraction, 1u32 << 9)
+        mmio.write32(fraction, divider_fields(timing.denominator, timing.numerator))
+        mmio.write32(conf, clock_conf(timing) | extra)
+    }
+}
+
+// An I2S output on I2S0's transmitter and one GDMA channel; see the
+// package comment.
+pub struct Output {
+    channel: u32
+    timing: Timing
+    bits: u32
+    channels: u32
+    slot_bits: u32
+    right_justified: bool
+    // Where the next frame goes: an absolute descriptor count, as the
+    // interrupt handler counts the ones played, and a byte offset.
+    write_at: u32
+    write_offset: u32
+
+    // Start the transmitter as master with `config`'s stream through GDMA
+    // channel `channel`, sending zeros until samples are queued; BCLK and WS
+    // are on pins `bclk` and `ws`, which only output_clock_pins reports.
+    // InvalidInput as for `check`.
+    // SAFETY: the caller owns I2S0's transmitter (bus clock on, out of
+    // reset), the GDMA channel, and its DMA_OUT interrupt, which must call
+    // dma_interrupt once enabled; it routes the pins.
+    pub unsafe fn start(channel: u32, bclk: u32, ws: u32, config: &Config) -> Output!hal.Error {
+        timing := check(config)?
+        philips := is_philips(&config.format)
+        right_justified := is_right_justified(&config.format)
+        unsafe {
+            for word in 0..RING_WORDS {
+                TX_RING[word] = 0
+            }
+            link_ring(&mut TX_DESCRIPTORS, ptr.as_ptr(&TX_RING) as usize, true)
+            section := hal.Critical.enter()
+            CHANNELS[0] = channel
+            COUNTERS[0] = 0
+            COUNTERS[1] = RING_DESCRIPTORS - 1
+            OUTPUT_CLOCK = (bclk << 8) | ws
+            OUTPUT_RATE = config.sample_rate
+            OUTPUT_SLOT = config.slot_bits
+            core.drop(section)
+            set_clock(PCR_I2S_TX_CLKM_CONF, PCR_I2S_TX_CLKM_DIV_CONF, &timing, 0)
+            mmio.write32(TX_CONF, UNIT_RESET | FIFO_RESET)
+            mmio.write32(TX_CONF1, conf1(config.slot_bits, timing.bit_divider, philips) | BCK_NO_DELAY)
+            mmio.write32(TX_TDM_CTRL, (1u32 << 16) | 0x3)
+            mmio.write32(CONF_SIGLE_DATA, 0)
+            tx := MONO_FIRST_VALID | PCM_BYPASS | LEFT_ALIGN | TDM
+            if !philips {
+                tx |= WS_IDLE_HIGH
+            }
+            update(TX_CONF, tx)
+            // The channel: peripheral mode, no owner checks, the ring. A
+            // channel set up for copies routes its output to its own input
+            // (IN_CONF0.MEM_TRANS_EN), which must be off.
+            base := GDMA_CHANNEL + GDMA_STRIDE * channel as usize
+            mmio.write32(base + IN_CONF0, 0)
+            mmio.write32(base + OUT_LINK, OUT_LINK_STOP)
+            mmio.write32(base + OUT_CONF0, OUT_CONF | CHANNEL_RESET)
+            mmio.write32(base + OUT_CONF0, OUT_CONF)
+            mmio.write32(base + OUT_CONF1, 0)
+            mmio.write32(base + OUT_PERI_SEL, PERIPHERAL_I2S)
+            interrupts := GDMA_OUT_INT + 0x10 * channel as usize
+            mmio.write32(interrupts + 0xC, ALL_DMA_INTERRUPTS)
+            mmio.write32(interrupts + 8, OUT_EOF)
+            cpu.fence()
+            first := ptr.as_ptr(&TX_DESCRIPTORS) as u32
+            mmio.write32(base + OUT_LINK, (first & LINK_ADDRESS) | OUT_LINK_START)
+            // Let the channel fill the transmit FIFO, then start.
+            for _ in 0..1000 {
+                cpu.fence()
+            }
+            mmio.write32(TX_CONF, tx | START)
+        }
+        return ok(Output { channel, timing, bits: config.bits, channels: config.channels, slot_bits: config.slot_bits, right_justified, write_at: 2, write_offset: 0 })
+    }
+
+    // Frames per second, as asked for; `timing` tells the rate the
+    // dividers give.
+    pub fn sample_rate(&self) -> u32 {
+        return self.timing.sample_rate
+    }
+
+    // Samples per frame: 1 or 2.
+    pub fn channels(&self) -> u32 {
+        return self.channels
+    }
+
+    // Bits per sample: 16, 24, or 32.
+    pub fn bits(&self) -> u32 {
+        return self.bits
+    }
+
+    // Bit clocks per slot: 16 or 32.
+    pub fn slot_bits(&self) -> u32 {
+        return self.slot_bits
+    }
+
+    pub fn timing(&self) -> Timing {
+        return self.timing.copy()
+    }
+
+    // The GDMA channel the output streams through.
+    pub fn dma_channel(&self) -> u32 {
+        return self.channel
+    }
+
+    // Queue `samples` without waiting: as many whole frames as the ring has
+    // room for. Returns how many samples, 0 when the queue is full.
+    // InvalidInput for a slice that is not whole frames.
+    pub fn poll_write(&mut self, samples: &[i32]) -> usize!hal.Error {
+        channels := self.channels as usize
+        if samples.len % channels != 0 {
+            return err(hal.Error.InvalidInput)
+        }
+        played := counter(0)
+        if self.write_at < played + 2 {
+            // Ran dry: the silence played; queue after it.
+            self.write_at = played + 2
+            self.write_offset = 0
+        }
+        frame_bytes := self.frame_bytes()
+        frames := samples.len / channels
+        done := 0usize
+        for done < frames && self.write_at < played + RING_DESCRIPTORS {
+            slot := (self.write_at % RING_DESCRIPTORS) as usize
+            word := DESCRIPTOR_WORDS * slot + (self.write_offset / 4) as usize
+            left := samples[done * channels]
+            right := samples[done * channels + channels - 1]
+            // SAFETY: a descriptor the channel will not read until the
+            // ones before it have played; the handler zeroes only those
+            // it has read.
+            unsafe {
+                if self.slot_bits == 16 {
+                    TX_RING[word] = (unsigned(left) >> 16) | (unsigned(right) & 0xFFFF_0000)
+                } else {
+                    TX_RING[word] = slot_word(left, self.bits, self.right_justified)
+                    TX_RING[word + 1] = slot_word(right, self.bits, self.right_justified)
+                }
+            }
+            done += 1
+            self.write_offset += frame_bytes
+            if self.write_offset >= DESCRIPTOR_BYTES {
+                self.write_offset = 0
+                self.write_at += 1
+            }
+        }
+        cpu.fence()
+        return ok(done * channels)
+    }
+
+    // The frames queued and not yet playing.
+    pub fn queued(&self) -> u32 {
+        played := counter(0)
+        if self.write_at < played + 2 {
+            return 0
+        }
+        return ((self.write_at - played - 2) * DESCRIPTOR_BYTES + self.write_offset) / self.frame_bytes()
+    }
+
+    // The frames the transmitter has taken from the ring since it started,
+    // silence included, a descriptor at a time: a count that rises at the
+    // sample rate.
+    pub fn frames_played(&self) -> u64 {
+        return counter(0) as u64 * (DESCRIPTOR_BYTES / self.frame_bytes()) as u64
+    }
+
+    // Frames per descriptor: 64 in 32-bit slots, 128 in 16-bit ones.
+    pub fn frames_per_descriptor(&self) -> u32 {
+        return DESCRIPTOR_BYTES / self.frame_bytes()
+    }
+
+    // Stop the transmitter and the channel, and turn the function clock
+    // off. Returns the channel's number.
+    pub fn stop(self) -> u32 {
+        // SAFETY: the output owns the transmitter and the channel.
+        unsafe {
+            mmio.write32(TX_CONF, mmio.read32(TX_CONF) & ~START)
+            base := GDMA_CHANNEL + GDMA_STRIDE * self.channel as usize
+            mmio.write32(base + OUT_LINK, OUT_LINK_STOP)
+            interrupts := GDMA_OUT_INT + 0x10 * self.channel as usize
+            mmio.write32(interrupts + 8, 0)
+            mmio.write32(interrupts + 0xC, ALL_DMA_INTERRUPTS)
+            mmio.write32(TX_CONF, UNIT_RESET | FIFO_RESET)
+            mmio.write32(PCR_I2S_TX_CLKM_CONF, mmio.read32(PCR_I2S_TX_CLKM_CONF) & ~CLKM_ENABLE)
+            section := hal.Critical.enter()
+            CHANNELS[0] = NONE
+            OUTPUT_CLOCK = NONE
+            core.drop(section)
+        }
+        return self.channel
+    }
+
+    fn frame_bytes(&self) -> u32 {
+        if self.slot_bits == 16 {
+            return 4
+        }
+        return 8
+    }
+}
+
+// An I2S input on I2S0's receiver and one GDMA channel; see the package
+// comment.
+pub struct Input {
+    channel: u32
+    timing: Timing
+    bits: u32
+    channels: u32
+    slot_bits: u32
+    right_justified: bool
+    right: bool
+    shared: bool
+    // RX_CONF while running, for restarts.
+    rx_conf: u32
+    // Absolute descriptor counts: the next one to read (with a byte offset
+    // into it), and the first one not yet seen complete; descriptor n is
+    // ring slot n % RING_DESCRIPTORS. And descriptors completed in all.
+    read_at: u32
+    read_offset: u32
+    seen: u32
+    completed: u32
+
+    // Start the receiver with `config`'s stream through GDMA channel
+    // `channel`: as master, or with `shared` as slave to the running
+    // output's BCLK and WS. InvalidInput as for `check`, and with `shared`
+    // unless an output runs at the same sample rate and slot width.
+    // SAFETY: the caller owns I2S0's receiver (bus clock on, out of
+    // reset) and the GDMA channel; it routes the pins.
+    pub unsafe fn start(channel: u32, shared: bool, config: &Config) -> Input!hal.Error {
+        timing := check(config)?
+        if shared {
+            // SAFETY: words only Output.start and stop write.
+            matches := unsafe {
+                OUTPUT_CLOCK != NONE && OUTPUT_RATE == config.sample_rate && OUTPUT_SLOT == config.slot_bits
+            }
+            if !matches {
+                return err(hal.Error.InvalidInput)
+            }
+        }
+        philips := is_philips(&config.format)
+        right_justified := is_right_justified(&config.format)
+        right := false
+        match &config.channel {
+            Channel.Right => {
+                right = true
+            }
+            Channel.Left => {}
+        }
+        rx := MONO_FIRST_VALID | PCM_BYPASS | LEFT_ALIGN | TDM
+        if !philips {
+            rx |= WS_IDLE_HIGH
+        }
+        if shared {
+            rx |= SLAVE
+        }
+        unsafe {
+            set_clock(PCR_I2S_RX_CLKM_CONF, PCR_I2S_RX_CLKM_DIV_CONF, &timing, 0)
+            mmio.write32(RX_CONF, UNIT_RESET | FIFO_RESET)
+            mmio.write32(RX_CONF1, conf1(config.slot_bits, timing.bit_divider, philips))
+            mmio.write32(RX_TDM_CTRL, (1u32 << 16) | 0x3)
+            // EOFs as rarely as the field allows; their spacing is a
+            // multiple of a descriptor whether it counts samples or bytes.
+            mmio.write32(RXEOF_NUM, 0xFFF)
+            if shared {
+                tx := mmio.read32(TX_CONF)
+                update(TX_CONF, tx | SIG_LOOPBACK)
+            }
+            update(RX_CONF, rx)
+            base := GDMA_CHANNEL + GDMA_STRIDE * channel as usize
+            mmio.write32(base + IN_CONF1, CHECK_OWNER)
+            mmio.write32(base + IN_PERI_SEL, PERIPHERAL_I2S)
+            mmio.write32(GDMA_IN_INT + 0x10 * channel as usize + 8, 0)
+        }
+        input := Input { channel, timing, bits: config.bits, channels: config.channels, slot_bits: config.slot_bits, right_justified, right, shared, rx_conf: rx, read_at: 0, read_offset: 0, seen: 0, completed: 0 }
+        input.run()
+        return ok(input)
+    }
+
+    // Frames per second, as asked for.
+    pub fn sample_rate(&self) -> u32 {
+        return self.timing.sample_rate
+    }
+
+    pub fn channels(&self) -> u32 {
+        return self.channels
+    }
+
+    pub fn bits(&self) -> u32 {
+        return self.bits
+    }
+
+    pub fn slot_bits(&self) -> u32 {
+        return self.slot_bits
+    }
+
+    pub fn timing(&self) -> Timing {
+        return self.timing.copy()
+    }
+
+    // Whether the input runs on the output's clocks.
+    pub fn is_shared(&self) -> bool {
+        return self.shared
+    }
+
+    // The GDMA channel the input streams through.
+    pub fn dma_channel(&self) -> u32 {
+        return self.channel
+    }
+
+    // The samples received since the last call, as many whole frames as
+    // fit `samples`, a descriptor at a time, without waiting; returns how
+    // many samples. A 24-bit sample comes in the top 24 bits, the bits
+    // below zero. Overrun once after the ring filled up and the channel
+    // stopped: the frames it held are dropped, the receiver restarts, and
+    // the next calls return the samples that follow.
+    pub fn poll_read(&mut self, samples: &mut[i32]) -> usize!hal.Error {
+        if self.stalled() {
+            self.run()
+            return err(hal.Error.Overrun)
+        }
+        self.advance()
+        channels := self.channels as usize
+        frame_bytes := self.frame_bytes()
+        frames := samples.len / channels
+        done := 0usize
+        cpu.fence()
+        for done < frames && self.read_at < self.seen {
+            slot := (self.read_at % RING_DESCRIPTORS) as usize
+            word := DESCRIPTOR_WORDS * slot + (self.read_offset / 4) as usize
+            left := 0i32
+            right := 0i32
+            // SAFETY: a descriptor the channel completed and handed back;
+            // it waits for the owner bit before writing it again.
+            unsafe {
+                if self.slot_bits == 16 {
+                    pair := ptr.read_volatile(ptr.as_ptr(&RX_RING[word..word + 1]))
+                    left = signed((pair & 0xFFFF) << 16)
+                    right = signed(pair & 0xFFFF_0000)
+                } else {
+                    first := ptr.read_volatile(ptr.as_ptr(&RX_RING[word..word + 1]))
+                    second := ptr.read_volatile(ptr.as_ptr(&RX_RING[word + 1..word + 2]))
+                    left = slot_sample(first, self.bits, self.right_justified)
+                    right = slot_sample(second, self.bits, self.right_justified)
+                }
+            }
+            if channels == 2 {
+                samples[2 * done] = left
+                samples[2 * done + 1] = right
+            } else if self.right {
+                samples[done] = right
+            } else {
+                samples[done] = left
+            }
+            done += 1
+            self.read_offset += frame_bytes
+            if self.read_offset >= DESCRIPTOR_BYTES {
+                // Hand the descriptor back to the channel.
+                self.read_offset = 0
+                cpu.fence()
+                // SAFETY: the descriptor is the program's until handed back.
+                unsafe {
+                    ptr.write_volatile(ptr.as_mut_ptr(&mut RX_DESCRIPTORS[3 * slot..3 * slot + 1]), DESCRIPTOR_BYTES | DESCRIPTOR_OWNED)
+                }
+                self.read_at += 1
+            }
+        }
+        return ok(done * channels)
+    }
+
+    // The frames received and not yet read, in completed descriptors.
+    pub fn available(&mut self) -> u32 {
+        self.advance()
+        return ((self.seen - self.read_at) * DESCRIPTOR_BYTES - self.read_offset) / self.frame_bytes()
+    }
+
+    // The frames received since the input started, a descriptor at a time:
+    // a count that rises at the sample rate while the program keeps up.
+    pub fn frames_received(&mut self) -> u64 {
+        self.advance()
+        return self.completed as u64 * (DESCRIPTOR_BYTES / self.frame_bytes()) as u64
+    }
+
+    // Frames per descriptor: 64 in 32-bit slots, 128 in 16-bit ones.
+    pub fn frames_per_descriptor(&self) -> u32 {
+        return DESCRIPTOR_BYTES / self.frame_bytes()
+    }
+
+    // Stop the receiver and the channel, end the signal loopback if
+    // shared, and turn the function clock off. Returns the channel's
+    // number.
+    pub fn stop(self) -> u32 {
+        // SAFETY: the input owns the receiver and the channel.
+        unsafe {
+            mmio.write32(RX_CONF, mmio.read32(RX_CONF) & ~START)
+            base := GDMA_CHANNEL + GDMA_STRIDE * self.channel as usize
+            mmio.write32(base + IN_LINK, IN_LINK_STOP)
+            mmio.write32(GDMA_IN_INT + 0x10 * self.channel as usize + 0xC, ALL_DMA_INTERRUPTS)
+            mmio.write32(RX_CONF, UNIT_RESET | FIFO_RESET)
+            if self.shared {
+                tx := mmio.read32(TX_CONF)
+                update(TX_CONF, tx & ~SIG_LOOPBACK)
+            }
+            mmio.write32(PCR_I2S_RX_CLKM_CONF, mmio.read32(PCR_I2S_RX_CLKM_CONF) & ~CLKM_ENABLE)
+        }
+        return self.channel
+    }
+
+    // Count the descriptors the channel handed back (owner bit clear).
+    fn advance(&mut self) {
+        for self.seen < self.read_at + RING_DESCRIPTORS {
+            slot := (self.seen % RING_DESCRIPTORS) as usize
+            // SAFETY: a word read of a descriptor the channel writes back.
+            word := unsafe {
+                ptr.read_volatile(ptr.as_ptr(&RX_DESCRIPTORS[3 * slot..3 * slot + 1]))
+            }
+            if (word & DESCRIPTOR_OWNED) != 0 {
+                return
+            }
+            self.seen += 1
+            self.completed += 1
+        }
+    }
+
+    // Whether the channel stopped at a descriptor the program had not
+    // handed back (IN_DSCR_ERR or IN_DSCR_EMPTY).
+    fn stalled(&mut self) -> bool {
+        // SAFETY: a read of the channel's raw interrupt bits.
+        unsafe {
+            return (mmio.read32(GDMA_IN_INT + 0x10 * self.channel as usize) & IN_STALLED) != 0
+        }
+    }
+
+    // (Re)start receiving into a fresh ring from its first descriptor.
+    fn run(&mut self) {
+        // SAFETY: the input owns the receiver, the channel, and the ring.
+        unsafe {
+            mmio.write32(RX_CONF, self.rx_conf)
+            base := GDMA_CHANNEL + GDMA_STRIDE * self.channel as usize
+            mmio.write32(base + IN_LINK, IN_LINK_STOP)
+            link_ring(&mut RX_DESCRIPTORS, ptr.as_ptr(&RX_RING) as usize, false)
+            mmio.write32(RX_CONF, self.rx_conf | UNIT_RESET | FIFO_RESET)
+            mmio.write32(base + IN_CONF0, IN_BURSTS | CHANNEL_RESET)
+            mmio.write32(base + IN_CONF0, IN_BURSTS)
+            mmio.write32(GDMA_IN_INT + 0x10 * self.channel as usize + 0xC, ALL_DMA_INTERRUPTS)
+            cpu.fence()
+            first := ptr.as_ptr(&RX_DESCRIPTORS) as u32
+            mmio.write32(base + IN_LINK, (first & LINK_ADDRESS) | IN_LINK_START)
+            mmio.write32(RX_CONF, self.rx_conf | START)
+        }
+        // The ring starts again at slot 0.
+        next := (self.seen / RING_DESCRIPTORS + 1) * RING_DESCRIPTORS
+        self.read_at = next
+        self.seen = next
+        self.read_offset = 0
+    }
+
+    fn frame_bytes(&self) -> u32 {
+        if self.slot_bits == 16 {
+            return 4
+        }
+        return 8
+    }
+}

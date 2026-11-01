@@ -263,6 +263,7 @@ fn program(words: [32]u16, length: u32) -> rp_pio.Program {
         autopull: false,
         pull_threshold: 32,
         set_count: 0,
+        gpio_ranges: 0,
     }
 }
 
@@ -446,8 +447,9 @@ fn unsigned(sample: i32) -> u32 {
 }
 
 // The settings both directions check: InvalidInput for a resolution, slot
-// width, channel count, or pins out of range. Returns the timing.
-fn check(clock_hz: u32, data: u32, clock: u32, config: &Config) -> Timing!hal.Error {
+// width, channel count, or pins out of range: outside the window of PIO
+// GPIOs from `gpio_base`. Returns the timing.
+fn check(clock_hz: u32, data: u32, clock: u32, config: &Config, gpio_base: u32) -> Timing!hal.Error {
     bits := config.bits
     if bits != 16 && bits != 24 && bits != 32 {
         return err(hal.Error.InvalidInput)
@@ -458,7 +460,7 @@ fn check(clock_hz: u32, data: u32, clock: u32, config: &Config) -> Timing!hal.Er
     if config.channels != 1 && config.channels != 2 {
         return err(hal.Error.InvalidInput)
     }
-    if data >= rp_pio.PIN_LIMIT || clock + 1 >= rp_pio.PIN_LIMIT || data == clock || data == clock + 1 {
+    if data < gpio_base || clock < gpio_base || data - gpio_base >= rp_pio.PIN_LIMIT || clock + 1 - gpio_base >= rp_pio.PIN_LIMIT || data == clock || data == clock + 1 {
         return err(hal.Error.InvalidInput)
     }
     return timing(clock_hz, config.sample_rate, config.slot_bits)
@@ -531,7 +533,7 @@ pub struct Output: hal.I2sOutput {
     }
 
     fn start(machine: &mut rp_pio.StateMachine, loaded: &rp_pio.Loaded, data: u32, clock: u32, config: &Config) -> Timing!hal.Error {
-        timing := check(block_clock(loaded)?, data, clock, config)?
+        timing := check(block_clock(loaded)?, data, clock, config, loaded.gpio_base())?
         settings := loaded.config()
         settings.set_out_pins(data, 1)?
         settings.set_sideset_pins(clock)?
@@ -755,7 +757,7 @@ pub struct Input: hal.I2sInput {
     }
 
     fn start(machine: &mut rp_pio.StateMachine, loaded: &rp_pio.Loaded, data: u32, clock: u32, config: &Config) -> Timing!hal.Error {
-        timing := check(block_clock(loaded)?, data, clock, config)?
+        timing := check(block_clock(loaded)?, data, clock, config, loaded.gpio_base())?
         settings := loaded.config()
         settings.set_in_pins(data)?
         settings.set_sideset_pins(clock)?

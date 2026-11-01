@@ -5,6 +5,7 @@ import "core/ptr"
 import "std/gpu/hal"
 import "std/gpu/metal"
 import "std/gpu/metal/objc"
+import "std/window/handle"
 
 // std/gpu's native backend on macOS: Metal, through std/gpu/metal.
 //
@@ -18,11 +19,18 @@ import "std/gpu/metal/objc"
 //                     winding << 16
 //   encoder           a = MTLCommandBuffer, b = the open encoder or 0,
 //                     c = its kind (ENCODER_*)
+//   surface           a = CAMetalLayer, b = the acquired CAMetalDrawable
+//                     or 0, c = the format of its drawables
+//   surface image     a = the drawable's MTLTexture, not retained: the
+//                     drawable keeps it alive
 //
 // Command buffers retain what their commands use, so Metal itself keeps
 // objects alive on the GPU; std/gpu's own tracking still delays their
 // release, which costs nothing here. Each submission signals a shared
-// event with its number, which completed() reads.
+// event with its number, which completed() reads. Buffers use shared
+// storage, which the CPU maps, so std/gpu's staged writes and reads need
+// no extra copies; resources track their own hazards, so barrier() does
+// nothing.
 
 const ENCODER_NONE: u64 = 0
 const ENCODER_COMPUTE: u64 = 1
@@ -57,9 +65,23 @@ pub struct Device: hal.Backend {
         return ok(Device { device: device, queue: queue, event: event, options: options, state: State { submitted: 0, last: 0 } })
     }
 
+    pub fn open_for_window(native: &handle.NativeHandle, debug: bool) -> Device!hal.Error {
+        return Device.open(debug)
+    }
+
     pub fn api(&self) -> hal.Api {
         return hal.Api.Metal
     }
+
+    pub fn staged(&self) -> bool {
+        return true
+    }
+
+    pub fn mapped(&self, buffer: &hal.Handle) -> usize {
+        return buffer.c as usize
+    }
+
+    pub fn invalidate(&self, buffer: &hal.Handle, offset: u64, size: u64) {}
 
     pub fn limits(&self) -> hal.Limits {
         threads := self.device.max_threads_per_threadgroup()
@@ -103,22 +125,13 @@ pub struct Device: hal.Backend {
         return ok(hal.Handle { a: retained(buffer.as_object()), b: 0, c: contents, d: 0 })
     }
 
+    // std/gpu stages every transfer on Metal (staged() is true).
     pub fn write_buffer(&self, buffer: &hal.Handle, offset: u64, data: &[u8]) -> void!hal.Error {
-        self.wait_all()?
-        unsafe {
-            start := buffer.c as usize as *mut u8
-            ptr.copy_nonoverlapping(ptr.as_ptr(data), ptr.offset(start, offset as isize), data.len)
-        }
-        return ok()
+        return err(hal.Error.Unsupported)
     }
 
     pub fn read_buffer(&self, buffer: &hal.Handle, offset: u64, out: &mut[u8]) -> void!hal.Error {
-        self.wait_all()?
-        unsafe {
-            start := buffer.c as usize as *const u8
-            ptr.copy_nonoverlapping(ptr.offset(start, offset as isize), ptr.as_mut_ptr(out), out.len)
-        }
-        return ok()
+        return err(hal.Error.Unsupported)
     }
 
     pub fn create_texture(&self, descriptor: &hal.TextureDescriptor) -> hal.Handle!hal.Error {
@@ -143,58 +156,15 @@ pub struct Device: hal.Backend {
         }
         handle := hal.Handle { a: retained(texture.as_object()), b: 0, c: 0, d: 0 }
         core.drop(pool)
-        // Textures start out zero, as buffers do.
-        size := descriptor.width as u64 * descriptor.height as u64 * hal.texel_size(descriptor.format) as u64
-        if !hal.is_depth(descriptor.format) {
-            self.clear_texture(&handle, descriptor, size)?
-        }
         return ok(handle)
     }
 
     pub fn write_texture(&self, texture: &hal.Handle, descriptor: &hal.TextureDescriptor, region: &hal.Region, data: &[u8], bytes_per_row: u32) -> void!hal.Error {
-        pool := objc.AutoreleasePool.new()
-        needed := copy_size(descriptor, region, bytes_per_row)
-        staging := match self.device.new_buffer_with_bytes(&data[..needed as usize], metal.RESOURCE_STORAGE_MODE_SHARED) {
-            ok(buffer) => buffer,
-            err(_) => {
-                return err(hal.Error.OutOfMemory)
-            }
-        }
-        target := unsafe {
-            metal.Texture.from_object(object(texture.a))
-        }
-        commands := sys(self.queue.command_buffer())?
-        blit := sys(commands.blit_command_encoder())?
-        blit.copy_buffer_to_texture(&staging, 0, bytes_per_row as usize, 0, metal.Size.new(region.width as usize, region.height as usize, 1), &target, 0, 0, metal.Origin.new(region.x as usize, region.y as usize, 0))
-        blit.end_encoding()
-        // The command buffer keeps the staging buffer alive until it is
-        // done, so there is nothing to wait for.
-        self.commit(&commands)
-        core.drop(pool)
-        return ok()
+        return err(hal.Error.Unsupported)
     }
 
     pub fn read_texture(&self, texture: &hal.Handle, descriptor: &hal.TextureDescriptor, region: &hal.Region, out: &mut[u8], bytes_per_row: u32) -> void!hal.Error {
-        pool := objc.AutoreleasePool.new()
-        needed := copy_size(descriptor, region, bytes_per_row)
-        staging := match self.device.new_buffer(needed as usize, metal.RESOURCE_STORAGE_MODE_SHARED) {
-            ok(buffer) => buffer,
-            err(_) => {
-                return err(hal.Error.OutOfMemory)
-            }
-        }
-        source := unsafe {
-            metal.Texture.from_object(object(texture.a))
-        }
-        commands := sys(self.queue.command_buffer())?
-        blit := sys(commands.blit_command_encoder())?
-        blit.copy_texture_to_buffer(&source, 0, 0, metal.Origin.new(region.x as usize, region.y as usize, 0), metal.Size.new(region.width as usize, region.height as usize, 1), &staging, 0, bytes_per_row as usize, 0)
-        blit.end_encoding()
-        self.commit(&commands)
-        lost_void(commands.wait_until_completed())?
-        sys_void(staging.read(0, &mut out[..needed as usize]))?
-        core.drop(pool)
-        return ok()
+        return err(hal.Error.Unsupported)
     }
 
     pub fn create_sampler(&self, descriptor: &hal.SamplerDescriptor) -> hal.Handle!hal.Error {
@@ -568,6 +538,159 @@ pub struct Device: hal.Backend {
         blit.copy_texture_to_buffer(&source_object, 0, 0, metal.Origin.new(region.x as usize, region.y as usize, 0), metal.Size.new(region.width as usize, region.height as usize, 1), &to, offset as usize, bytes_per_row as usize, 0)
     }
 
+    pub fn clear_buffer(&self, encoder: &mut hal.Handle, buffer: &hal.Handle, offset: u64, size: u64) {
+        blit := blit_encoder(encoder)
+        target := unsafe {
+            metal.Buffer.from_object(object(buffer.a))
+        }
+        blit.fill_buffer(&target, offset as usize, size as usize, 0)
+    }
+
+    // Textures start out zero, as buffers do: a blit from a zeroed buffer.
+    // Depth textures are only ever cleared by render passes.
+    pub fn initialize_texture(&self, encoder: &mut hal.Handle, texture: &hal.Handle, descriptor: &hal.TextureDescriptor) {
+        if hal.is_depth(descriptor.format) {
+            return
+        }
+        pool := objc.AutoreleasePool.new()
+        row := descriptor.width as usize * hal.texel_size(descriptor.format) as usize
+        size := row * descriptor.height as usize
+        // The command buffer keeps the buffer alive until it has run.
+        zeros := match self.device.new_buffer(size, metal.RESOURCE_STORAGE_MODE_PRIVATE) {
+            ok(buffer) => buffer,
+            err(_) => {
+                assert(false, "Metal could not allocate a buffer to clear a texture")
+                return
+            }
+        }
+        target := unsafe {
+            metal.Texture.from_object(object(texture.a))
+        }
+        blit := blit_encoder(encoder)
+        blit.fill_buffer(&zeros, 0, size, 0)
+        blit.copy_buffer_to_texture(&zeros, 0, row, 0, metal.Size.new(descriptor.width as usize, descriptor.height as usize, 1), &target, 0, 0, metal.Origin.new(0, 0, 0))
+        core.drop(pool)
+    }
+
+    pub fn barrier(&self, encoder: &mut hal.Handle, before: u32, after: u32) {}
+
+    // A CAMetalLayer on the window's view: the one Window.metal_layer()
+    // attached, or a new one.
+    pub fn create_surface(&self, native: &handle.NativeHandle) -> hal.Handle!hal.Error {
+        view := match native {
+            handle.NativeHandle.AppKit(_, view) => *view,
+            _ => {
+                return err(hal.Error.Unsupported)
+            }
+        }
+        pool := objc.AutoreleasePool.new()
+        view_id := unsafe {
+            view as objc.Id
+        }
+        existing := match objc.selector(b"layer\0") {
+            some(selector) => unsafe {
+                objc.get_object(view_id, selector)
+            },
+            none => none,
+        }
+        reused := 0u64
+        match existing {
+            some(layer) => {
+                match objc.class(b"CAMetalLayer\0") {
+                    some(class) => {
+                        if layer.is_kind_of(class) {
+                            reused = retained(&layer)
+                        }
+                    }
+                    none => {}
+                }
+            }
+            none => {}
+        }
+        if reused != 0 {
+            core.drop(pool)
+            return ok(hal.Handle { a: reused, b: 0, c: 0, d: 0 })
+        }
+        layer := sys(metal.MetalLayer.new())?
+        unsafe {
+            layer.attach_to_view(view_id)
+        }
+        handle := hal.Handle { a: retained(layer.as_object()), b: 0, c: 0, d: 0 }
+        core.drop(pool)
+        return ok(handle)
+    }
+
+    pub fn configure_surface(&self, surface: &mut hal.Handle, config: &mut hal.SurfaceConfig) -> void!hal.Error {
+        pool := objc.AutoreleasePool.new()
+        layer := unsafe {
+            metal.MetalLayer.from_object(object(surface.a))
+        }
+        layer.set_device(&self.device)
+        layer.set_pixel_format(metal.PIXEL_FORMAT_BGRA8_UNORM_SRGB)
+        // Drawables can be blitted to and from, as std/gpu's images can.
+        layer.set_framebuffer_only(false)
+        layer.set_opaque(true)
+        layer.set_drawable_size(config.width as f64, config.height as f64)
+        // One drawable more than frames in flight, which Metal caps at 3.
+        count := config.frames as usize + 1
+        if count > 3 {
+            count = 3
+        }
+        layer.set_maximum_drawable_count(count)
+        layer.set_display_sync_enabled(config.vsync)
+        core.drop(pool)
+        config.format = hal.FORMAT_BGRA8_UNORM_SRGB
+        surface.c = hal.FORMAT_BGRA8_UNORM_SRGB as u64
+        return ok()
+    }
+
+    pub fn acquire(&self, surface: &mut hal.Handle, texture: &mut hal.Handle) -> u64!hal.Error {
+        pool := objc.AutoreleasePool.new()
+        layer := unsafe {
+            metal.MetalLayer.from_object(object(surface.a))
+        }
+        // Waits for a free drawable: Metal's own limit on frames in flight.
+        drawable := match layer.next_drawable() {
+            some(drawable) => drawable,
+            none => {
+                return err(hal.Error.Outdated)
+            }
+        }
+        image := sys(drawable.texture())?
+        texture.a = unsafe {
+            image.as_object().as_ptr() as usize as u64
+        }
+        texture.b = 0
+        texture.c = 0
+        texture.d = 0
+        release(surface.b)
+        surface.b = retained(drawable.as_object())
+        core.drop(pool)
+        return ok(0)
+    }
+
+    pub fn present(&self, surface: &mut hal.Handle) -> u64!hal.Error {
+        if surface.b == 0 {
+            return ok(0)
+        }
+        pool := objc.AutoreleasePool.new()
+        drawable := unsafe {
+            metal.Drawable.from_object(object(surface.b))
+        }
+        commands := sys(self.queue.command_buffer())?
+        commands.present_drawable(&drawable)
+        index := self.commit(&commands)
+        release(surface.b)
+        surface.b = 0
+        core.drop(pool)
+        return ok(index)
+    }
+
+    pub fn destroy_surface(&self, surface: &hal.Handle) {
+        release(surface.b)
+        release(surface.a)
+    }
+
     fn state(&self) -> *mut State {
         unsafe {
             return ptr.from_ref(&self.state) as *mut State
@@ -609,29 +732,6 @@ pub struct Device: hal.Backend {
         result := commands.wait_until_completed()
         core.drop(pool)
         return lost_void(result)
-    }
-
-    // Fill a new texture with zeros through a blit from a zeroed buffer.
-    fn clear_texture(&self, texture: &hal.Handle, descriptor: &hal.TextureDescriptor, size: u64) -> void!hal.Error {
-        pool := objc.AutoreleasePool.new()
-        zeros := match self.device.new_buffer(size as usize, metal.RESOURCE_STORAGE_MODE_PRIVATE) {
-            ok(buffer) => buffer,
-            err(_) => {
-                return err(hal.Error.OutOfMemory)
-            }
-        }
-        target := unsafe {
-            metal.Texture.from_object(object(texture.a))
-        }
-        commands := sys(self.queue.command_buffer())?
-        blit := sys(commands.blit_command_encoder())?
-        blit.fill_buffer(&zeros, 0, size as usize, 0)
-        row := descriptor.width as usize * hal.texel_size(descriptor.format) as usize
-        blit.copy_buffer_to_texture(&zeros, 0, row, 0, metal.Size.new(descriptor.width as usize, descriptor.height as usize, 1), &target, 0, 0, metal.Origin.new(0, 0, 0))
-        blit.end_encoding()
-        self.commit(&commands)
-        core.drop(pool)
-        return ok()
     }
 
     fn library(&self, source: &hal.ShaderSource) -> metal.Library!hal.Error {
@@ -856,12 +956,6 @@ fn apply(render: &metal.RenderCommandEncoder, state: &mut hal.PassState) {
         }
     }
     state.vertex_dirty = 0
-}
-
-// The bytes a texture copy spans in its buffer.
-fn copy_size(descriptor: &hal.TextureDescriptor, region: &hal.Region, bytes_per_row: u32) -> u64 {
-    row := region.width as u64 * hal.texel_size(descriptor.format) as u64
-    return (region.height as u64 - 1) * bytes_per_row as u64 + row
 }
 
 fn pixel_format(format: u32) -> metal.PixelFormat {

@@ -1,0 +1,962 @@
+package esp_i2c
+
+import "std/embedded/hal"
+
+// The I2C controller of Espressif's RISC-V chips (I2C0 of the ESP32-C6, and
+// the same controller in the ESP32-C3, C5, H2, and others), as a bus master
+// or as a target (slave) that another master addresses. `Controller`
+// implements the std/embedded/hal I2C bus protocol and its polling form,
+// hal.I2cPoll, over any hal.Registers: a `hal.RegisterBlock` on the chip,
+// or a simulated controller in a desktop test, so device drivers use it
+// unchanged. `Target` implements hal.I2cTarget.
+//
+// The controller runs a list of up to eight commands (start, write bytes,
+// read bytes, stop, end) from its own registers and moves the bytes through
+// a 32-byte FIFO. A transaction runs as one or more such runs: each but the
+// last ends with an END command, which holds the bus with SCL low until the
+// next run, so the device sees one transaction of any length. The polled
+// methods start a run and return; each later poll checks whether the run
+// is over, collects what it read, and starts the next, so between polls
+// the bus waits with SCL held low, which every device accepts as clock
+// stretching. The blocking methods poll until the transaction ends.
+//
+// Chip packages enable the controller's clock, route SDA and SCL as
+// open-drain lines through the GPIO matrix, and pass the frequency of its
+// function clock. Errors: NoAcknowledge when no device answers its address
+// or a device refuses a data byte, Bus when another master won arbitration,
+// and Timeout when a device holds SCL low for too long or the controller
+// does not finish; the controller's state machine is reset after each, so
+// the next transaction starts afresh.
+//
+// Register names follow the ESP32-C6 technical reference manual (I2C
+// Controller).
+
+const SCL_LOW_PERIOD: usize = 0x00
+// CTR: lines driven open-drain, master mode, start, clock on, reset the
+// state machine, latch the configuration, and a target's automatic
+// transmit start.
+const CTR: usize = 0x04
+const MASTER: u32 = 1 << 4
+const TRANS_START: u32 = 1 << 5
+const CLOCK_ON: u32 = 1 << 8
+const FSM_RESET: u32 = 1 << 10
+const CONF_UPDATE: u32 = 1 << 11
+const TX_AUTO_START: u32 = 1 << 12
+// The reset value's receive-FIFO-full acknowledge level, kept for the
+// master; a target acknowledges with a full FIFO, as it stretches SCL then.
+const RX_FULL_ACK_LEVEL: u32 = 1 << 3
+// SR: as a target, the master reads; the bus is busy; bytes in the receive
+// FIFO; why a target stretches SCL; bytes in the transmit FIFO.
+const SR: usize = 0x08
+const TARGET_READ: u32 = 1 << 1
+const BUS_BUSY: u32 = 1 << 4
+const ADDRESSED: u32 = 1 << 5
+const RX_COUNT: u32 = 0x3F << 8
+const STRETCH_CAUSE: u32 = 0b11 << 14
+const TX_COUNT: u32 = 0x3F << 18
+// TO: give up when SCL stays in one state for 2^value function clock
+// cycles: 2^22, 105 ms at 40 MHz.
+const TO: usize = 0x0C
+const TIMEOUT_ENABLE: u32 = 1 << 5
+const TIMEOUT_EXPONENT: u32 = 22
+// SLAVE_ADDR: a target's address, and its 10-bit addressing.
+const SLAVE_ADDR: usize = 0x10
+const ADDRESS_TEN_BIT: u32 = 1u32 << 31
+// FIFO_CONF: reset both FIFOs, with the reset value's thresholds and FIFO
+// pointer protection.
+const FIFO_CONF: usize = 0x18
+const FIFO_RESET: u32 = 0x7101
+const FIFO_RUN: u32 = 0x4101
+const TX_FIFO_RESET: u32 = 1 << 13
+const DATA: usize = 0x1C
+const INT_RAW: usize = 0x20
+const INT_CLR: usize = 0x24
+const INT_ENA: usize = 0x28
+const RX_OVERFLOW: u32 = 1 << 2
+const END_DETECT: u32 = 1 << 3
+const ARBITRATION_LOST: u32 = 1 << 5
+const TRANS_COMPLETE: u32 = 1 << 7
+const TIME_OUT: u32 = 1 << 8
+const NACK: u32 = 1 << 10
+const SCL_STATE_TIMEOUT: u32 = 1 << 13
+const SCL_MAIN_TIMEOUT: u32 = 1 << 14
+const TARGET_STRETCH: u32 = 1 << 16
+const ALL_INTERRUPTS: u32 = 0x3_FFFF
+const TIMEOUTS: u32 = TIME_OUT | SCL_STATE_TIMEOUT | SCL_MAIN_TIMEOUT
+const SDA_HOLD: usize = 0x30
+const SDA_SAMPLE: usize = 0x34
+// SCL_HIGH_PERIOD: the high time, and from bit 9 the time to wait for SCL
+// to rise before counting it.
+const SCL_HIGH_PERIOD: usize = 0x38
+const SCL_START_HOLD: usize = 0x40
+const SCL_RSTART_SETUP: usize = 0x44
+const SCL_STOP_HOLD: usize = 0x48
+const SCL_STOP_SETUP: usize = 0x4C
+// FILTER_CFG: ignore pulses shorter than 7 function clock cycles on both
+// lines.
+const FILTER_CFG: usize = 0x50
+const FILTERS: u32 = 0x377
+const COMMANDS: usize = 0x58
+const COMMAND_DONE: u32 = 1 << 31
+// SCL_ST_TIME_OUT, SCL_MAIN_ST_TIME_OUT: the state machines' own limits,
+// at their largest.
+const SCL_ST_TIME_OUT: usize = 0x78
+const SCL_MAIN_ST_TIME_OUT: usize = 0x7C
+const STATE_TIMEOUT: u32 = 23
+// SCL_SP_CONF: send SCL pulses, from bit 1 how many, to free a device that
+// holds SDA low; the enable clears itself when they are out.
+const SCL_SP_CONF: usize = 0x80
+const SCL_PULSES: u32 = 1 << 0
+const NINE_PULSES: u32 = 9 << 1
+// SCL_STRETCH_CONF: how long a target waits before it stretches SCL, its
+// stretching on, and the release of a stretch (write one).
+const SCL_STRETCH_CONF: usize = 0x84
+const STRETCH_ON: u32 = 0x3FF | (1 << 10)
+const STRETCH_RELEASE: u32 = 1 << 11
+
+// Commands: the operation from bit 11, the byte count, whether the
+// device's acknowledges are checked, and the acknowledge sent after reads.
+const OP_WRITE: u32 = 1 << 11
+const OP_STOP: u32 = 2 << 11
+const OP_READ: u32 = 3 << 11
+const OP_END: u32 = 4 << 11
+const OP_RSTART: u32 = 6 << 11
+const ACK_CHECK: u32 = 1 << 8
+const SEND_NACK: u32 = 1 << 10
+
+// Bytes in the FIFO, and the most one command moves.
+pub const FIFO_DEPTH: usize = 32
+const CHUNK: usize = 31
+
+// Polls without a run finishing before a blocking transaction is abandoned:
+// far longer than the controller's own timeouts.
+const POLLS: u32 = 5_000_000
+// Status polls for the bus to go idle before it is cleared: about a
+// millisecond, many bit times at 1 kHz.
+const IDLE_POLLS: u32 = 100_000
+
+// A polled transaction's phase: none, running, or ending after a missing
+// acknowledge, while the controller sends the stop.
+const IDLE: u32 = 0
+const RUNNING: u32 = 1
+const ENDING: u32 = 2
+// The run a transaction starts next: the first or a later one of the
+// write part, the first or a later one of the read part.
+const WRITE_FIRST: u32 = 0
+const WRITE_MORE: u32 = 1
+const READ_FIRST: u32 = 2
+const READ_MORE: u32 = 3
+
+// The bus timing for one SCL frequency, from `timing`.
+pub struct Timing {
+    // The function clock it counts.
+    pub clock_hz: u32
+    // Half an SCL period in function clock cycles.
+    pub half_cycle: u32
+    // The resulting SCL frequency.
+    pub frequency_hz: u32
+}
+
+// The timing for an SCL frequency of `frequency_hz` from a function clock
+// of `clock_hz`. InvalidInput above hal.I2C_FAST_PLUS_HZ, or where half a
+// period does not fit the controller's counters (below clock_hz / 1022, or
+// above clock_hz / 20); a chip package divides the clock first for slower
+// buses.
+pub fn timing(clock_hz: u32, frequency_hz: u32) -> Timing!hal.Error {
+    if frequency_hz == 0 || frequency_hz > hal.I2C_FAST_PLUS_HZ {
+        return err(hal.Error.InvalidInput)
+    }
+    half := clock_hz / frequency_hz / 2
+    if half < 10 || half > 511 {
+        return err(hal.Error.InvalidInput)
+    }
+    return ok(Timing { clock_hz, half_cycle: half, frequency_hz: clock_hz / (2 * half) })
+}
+
+// The function clock divider a chip package sets for `frequency_hz` from
+// its source clock: the smallest that keeps half a period within the
+// counters.
+pub fn prescaler(source_hz: u32, frequency_hz: u32) -> u32 {
+    if frequency_hz == 0 {
+        return 1
+    }
+    return source_hz / (frequency_hz * 1024) + 1
+}
+
+// An I2C bus master on one controller with registers R. Implements the
+// std/embedded/hal I2C bus protocol and its polling form.
+pub struct Controller<R: hal.Registers>: hal.I2c + hal.I2cPoll {
+    registers: R
+    timing: Timing
+    // Commands queued for the next run, and how many.
+    commands: [8]u32
+    count: usize
+    // The polled transaction: its phase, its address (the header byte, the
+    // low byte of a 10-bit address), its lengths, the run it starts next,
+    // the bytes of `bytes` sent and of `buffer` received so far, what the
+    // run on the bus reads and whether it ends the transaction, and how
+    // many runs have finished, which blocking waits count as progress.
+    phase: u32
+    header: u8
+    low: u8
+    ten_bit: bool
+    writing: usize
+    reading: usize
+    stage: u32
+    sent: usize
+    received: usize
+    run_reads: usize
+    run_last: bool
+    runs: u32
+
+    // Configure a controller fresh out of reset as a master at the SCL
+    // frequency of `timing`.
+    pub fn new(registers: R, timing: Timing) -> Controller<R> {
+        bus := Controller<R> {
+            registers,
+            timing,
+            commands: [0u32; 8],
+            count: 0,
+            phase: IDLE,
+            header: 0,
+            low: 0,
+            ten_bit: false,
+            writing: 0,
+            reading: 0,
+            stage: WRITE_FIRST,
+            sent: 0,
+            received: 0,
+            run_reads: 0,
+            run_last: false,
+            runs: 0,
+        }
+        bus.registers.write(CTR, MASTER | CLOCK_ON | RX_FULL_ACK_LEVEL)
+        bus.registers.write(INT_ENA, 0)
+        bus.registers.write(FILTER_CFG, FILTERS)
+        bus.registers.write(TO, TIMEOUT_ENABLE | TIMEOUT_EXPONENT)
+        bus.registers.write(SCL_ST_TIME_OUT, STATE_TIMEOUT)
+        bus.registers.write(SCL_MAIN_ST_TIME_OUT, STATE_TIMEOUT)
+        bus.configure()
+        // Start from a reset state machine, as after a failed transaction.
+        bus.registers.write(CTR, MASTER | CLOCK_ON | RX_FULL_ACK_LEVEL | FSM_RESET)
+        bus.reset()
+        return bus
+    }
+
+    // The SCL frequency, the closest the controller makes to the request.
+    pub fn frequency_hz(&self) -> u32 {
+        return self.timing.frequency_hz
+    }
+
+    // Change the SCL frequency, from the same function clock.
+    pub fn set_frequency(&mut self, frequency_hz: u32) -> void!hal.Error {
+        self.timing = timing(self.timing.clock_hz, frequency_hz)?
+        self.configure()
+        return ok()
+    }
+
+    // Change the timing, for a chip package that changes the function
+    // clock too.
+    pub fn set_timing(&mut self, settings: Timing) {
+        self.timing = settings
+        self.configure()
+    }
+
+    // Write `bytes` to the device at `address`, then a STOP, polling the
+    // controller until the transaction ends. Busy while a polled
+    // transaction runs.
+    pub fn write(&mut self, address: u8, bytes: &[u8]) -> void!hal.Error {
+        empty: [0]u8 = []
+        return self.transfer(address_header(address)?, 0, false, bytes, &mut empty)
+    }
+
+    pub fn read(&mut self, address: u8, buffer: &mut[u8]) -> void!hal.Error {
+        empty: [0]u8 = []
+        return self.transfer(address_header(address)?, 0, false, &empty, buffer)
+    }
+
+    // Write `bytes`, then read `buffer.len` bytes after a repeated start,
+    // without releasing the bus.
+    pub fn write_read(&mut self, address: u8, bytes: &[u8], buffer: &mut[u8]) -> void!hal.Error {
+        return self.transfer(address_header(address)?, 0, false, bytes, buffer)
+    }
+
+    // The 10-bit address forms: InvalidInput above 0x3FF.
+    pub fn write_ten_bit(&mut self, address: u16, bytes: &[u8]) -> void!hal.Error {
+        empty: [0]u8 = []
+        return self.transfer(ten_bit_header(address)?, (address & 0xFF) as u8, true, bytes, &mut empty)
+    }
+
+    pub fn read_ten_bit(&mut self, address: u16, buffer: &mut[u8]) -> void!hal.Error {
+        empty: [0]u8 = []
+        return self.transfer(ten_bit_header(address)?, (address & 0xFF) as u8, true, &empty, buffer)
+    }
+
+    pub fn write_read_ten_bit(&mut self, address: u16, bytes: &[u8], buffer: &mut[u8]) -> void!hal.Error {
+        return self.transfer(ten_bit_header(address)?, (address & 0xFF) as u8, true, bytes, buffer)
+    }
+
+    // Whether a device answers `address`: its address, then a stop, with no
+    // data.
+    pub fn probe(&mut self, address: u8) -> bool!hal.Error {
+        nothing: [0]u8 = []
+        empty: [0]u8 = []
+        match self.transfer(address_header(address)?, 0, false, &nothing, &mut empty) {
+            ok() => {
+                return ok(true)
+            }
+            err(error) => {
+                if error == hal.Error.NoAcknowledge {
+                    return ok(false)
+                }
+                return err(error)
+            }
+        }
+    }
+
+    // Advance a write of `bytes` to the device at `address`, then a STOP,
+    // without waiting: false while it runs, true once it has ended; see
+    // hal.I2cPoll. The first call starts the transaction with up to 30
+    // bytes (31 less the address); each later call that finds a run over
+    // starts the next 31, holding SCL low in between. Errors as for
+    // `write`, after which the transaction is over; InvalidInput for a call
+    // whose address or lengths differ from the running transaction's, which
+    // keeps running. The first call waits for a busy bus to go idle, about
+    // a millisecond at most, then clocks a stuck one free, as `write` does;
+    // a failed transaction's recovery waits the same. A transaction whose
+    // device holds SCL low ends with Timeout after about 100 ms, the
+    // controller's own limit.
+    pub fn poll_write(&mut self, address: u8, bytes: &[u8]) -> bool!hal.Error {
+        empty: [0]u8 = []
+        return self.advance(address_header(address)?, 0, false, bytes, &mut empty)
+    }
+
+    // Advance a read of `buffer.len` bytes, as for `poll_write`. Each run
+    // reads up to 31 bytes; they are all in `buffer` once it returns true.
+    pub fn poll_read(&mut self, address: u8, buffer: &mut[u8]) -> bool!hal.Error {
+        empty: [0]u8 = []
+        return self.advance(address_header(address)?, 0, false, &empty, buffer)
+    }
+
+    // Advance `write_read` as one transaction, as for `poll_write` and
+    // `poll_read`: the bytes, a repeated START, and the read.
+    pub fn poll_write_read(&mut self, address: u8, bytes: &[u8], buffer: &mut[u8]) -> bool!hal.Error {
+        return self.advance(address_header(address)?, 0, false, bytes, buffer)
+    }
+
+    // The polled transactions above for a device with a 10-bit address, as
+    // for `write_ten_bit`.
+    pub fn poll_write_ten_bit(&mut self, address: u16, bytes: &[u8]) -> bool!hal.Error {
+        empty: [0]u8 = []
+        return self.advance(ten_bit_header(address)?, (address & 0xFF) as u8, true, bytes, &mut empty)
+    }
+
+    pub fn poll_read_ten_bit(&mut self, address: u16, buffer: &mut[u8]) -> bool!hal.Error {
+        empty: [0]u8 = []
+        return self.advance(ten_bit_header(address)?, (address & 0xFF) as u8, true, &empty, buffer)
+    }
+
+    pub fn poll_write_read_ten_bit(&mut self, address: u16, bytes: &[u8], buffer: &mut[u8]) -> bool!hal.Error {
+        return self.advance(ten_bit_header(address)?, (address & 0xFF) as u8, true, bytes, buffer)
+    }
+
+    // True while a polled transaction runs: from its first poll until a
+    // poll reports its end or it is cancelled.
+    pub fn is_busy(&self) -> bool {
+        return self.phase != IDLE
+    }
+
+    // Abandon the running polled transaction, if any, so the next poll
+    // starts a new one. The run on the bus ends first, at its END or STOP
+    // command: up to 31 bytes' time (2.8 ms at 100 kHz), or the
+    // controller's own timeout. A transaction it left holding the bus then
+    // gets a STOP of its own. Resetting the state machine in the middle of
+    // a run instead can leave the controller hung, so cancel does that
+    // only when the run does not end or the bus failed.
+    pub fn cancel(&mut self) {
+        if self.phase == IDLE {
+            return
+        }
+        self.phase = IDLE
+        if self.wait_run() != END_DETECT {
+            return
+        }
+        // Held at an END, with SCL low: end the transaction with a STOP.
+        self.begin()
+        self.add(OP_STOP)
+        self.execute()
+        if self.wait_run() != TRANS_COMPLETE {
+            return
+        }
+        self.reset()
+    }
+
+    // Give back the registers, with the controller stopped. A polled
+    // transaction still running is cut off.
+    pub fn release(self) -> R {
+        self.registers.write(INT_ENA, 0)
+        self.registers.write(CTR, FSM_RESET)
+        let Controller { registers, timing, commands, count, phase, header, low, ten_bit, writing, reading, stage, sent, received, run_reads, run_last, runs } = self
+        return registers
+    }
+
+    // A whole transaction, polled until it ends: a start and the address
+    // (`header`, and `low` after it for a 10-bit address), `bytes` written,
+    // then after a repeated start `buffer` read, and a stop. A transaction
+    // without bytes or reads only addresses the device. Abandoned with
+    // Timeout once POLLS polls in a row finish no run.
+    fn transfer(&mut self, header: u8, low: u8, ten_bit: bool, bytes: &[u8], buffer: &mut[u8]) -> void!hal.Error {
+        if self.phase != IDLE {
+            return err(hal.Error.Busy)
+        }
+        polls := 0u32
+        runs := self.runs
+        for {
+            if self.advance(header, low, ten_bit, bytes, buffer)? {
+                return ok()
+            }
+            if self.runs != runs {
+                runs = self.runs
+                polls = 0
+            } else {
+                polls += 1
+                if polls >= POLLS {
+                    self.fail()
+                    return err(hal.Error.Timeout)
+                }
+            }
+        }
+    }
+
+    // One poll of a transaction: start it if none runs, else see whether
+    // the run on the bus is over, collect what it read, and start the next.
+    fn advance(&mut self, header: u8, low: u8, ten_bit: bool, bytes: &[u8], buffer: &mut[u8]) -> bool!hal.Error {
+        if self.phase == IDLE {
+            self.wait_idle()
+            self.phase = RUNNING
+            self.header = header
+            self.low = low
+            self.ten_bit = ten_bit
+            self.writing = bytes.len
+            self.reading = buffer.len
+            self.sent = 0
+            self.received = 0
+            self.stage = WRITE_FIRST
+            if bytes.len == 0 && buffer.len > 0 {
+                self.stage = READ_FIRST
+            }
+            self.start_run(bytes)
+            return ok(false)
+        }
+        if header != self.header || low != self.low || ten_bit != self.ten_bit || bytes.len != self.writing || buffer.len != self.reading {
+            return err(hal.Error.InvalidInput)
+        }
+        raw := self.registers.read(INT_RAW)
+        if self.phase == ENDING || (raw & NACK) != 0 {
+            // The controller still ends the transaction on the bus, with
+            // the stop that follows; let it, or its completion would land
+            // in the next transaction.
+            self.phase = ENDING
+            if (raw & (TRANS_COMPLETE | END_DETECT | TIMEOUTS)) == 0 {
+                return ok(false)
+            }
+            self.fail()
+            return err(hal.Error.NoAcknowledge)
+        }
+        if (raw & ARBITRATION_LOST) != 0 {
+            self.fail()
+            return err(hal.Error.Bus)
+        }
+        if (raw & TIMEOUTS) != 0 {
+            self.fail()
+            return err(hal.Error.Timeout)
+        }
+        if (raw & (TRANS_COMPLETE | END_DETECT)) == 0 {
+            return ok(false)
+        }
+        if !self.all_done() {
+            self.fail()
+            return err(hal.Error.Bus)
+        }
+        if self.run_reads > 0 {
+            if hal.decode(RX_COUNT, self.registers.read(SR)) < self.run_reads as u32 {
+                self.fail()
+                return err(hal.Error.Bus)
+            }
+            received := self.received
+            for index in 0..self.run_reads {
+                buffer[received + index] = (self.registers.read(DATA) & 0xFF) as u8
+            }
+            self.received += self.run_reads
+        }
+        self.runs += 1
+        if self.run_last {
+            self.phase = IDLE
+            return ok(true)
+        }
+        self.start_run(bytes)
+        return ok(false)
+    }
+
+    // Queue the transaction's next run, as `stage` says, and start it.
+    fn start_run(&mut self, bytes: &[u8]) {
+        self.begin()
+        self.run_reads = 0
+        self.run_last = false
+        reading := self.reading > 0
+        header := self.header
+        low := self.low
+        if self.stage == WRITE_FIRST || self.stage == WRITE_MORE {
+            room := CHUNK
+            address_bytes := 0u32
+            if self.stage == WRITE_FIRST {
+                // The address, as a write, before the first bytes.
+                self.add(OP_RSTART)
+                self.push(header << 1)
+                address_bytes = 1
+                if self.ten_bit {
+                    self.push(low)
+                    address_bytes = 2
+                }
+                room = CHUNK - address_bytes as usize
+            }
+            count := self.writing - self.sent
+            if count > room {
+                count = room
+            }
+            sent := self.sent
+            for index in 0..count {
+                self.push(bytes[sent + index])
+            }
+            self.add(OP_WRITE | ACK_CHECK | (address_bytes + count as u32))
+            self.sent += count
+            self.stage = WRITE_MORE
+            if self.sent == self.writing {
+                if reading {
+                    self.add(OP_END)
+                    self.stage = READ_FIRST
+                } else {
+                    self.add(OP_STOP)
+                    self.run_last = true
+                }
+            } else {
+                self.add(OP_END)
+            }
+            self.execute()
+            return
+        }
+        if self.stage == READ_FIRST {
+            // A (repeated) start and the address as a read; a 10-bit read
+            // without a write first starts with the whole address as a
+            // write, then repeats only its header.
+            self.add(OP_RSTART)
+            if self.ten_bit && self.writing == 0 {
+                self.push(header << 1)
+                self.push(low)
+                self.add(OP_WRITE | ACK_CHECK | 2)
+                self.add(OP_RSTART)
+            }
+            self.push((header << 1) | 1)
+            self.add(OP_WRITE | ACK_CHECK | 1)
+            self.stage = READ_MORE
+        }
+        count := self.reading - self.received
+        if count <= CHUNK {
+            // Acknowledge all but the final byte, which ends the read.
+            if count > 1 {
+                self.add(OP_READ | (count as u32 - 1))
+            }
+            self.add(OP_READ | SEND_NACK | 1)
+            self.add(OP_STOP)
+            self.run_last = true
+        } else {
+            count = CHUNK
+            self.add(OP_READ | count as u32)
+            self.add(OP_END)
+        }
+        self.run_reads = count
+        self.execute()
+    }
+
+    // Start a run: empty the FIFOs and the command list.
+    fn begin(&mut self) {
+        self.registers.write(INT_CLR, ALL_INTERRUPTS)
+        self.registers.write(FIFO_CONF, FIFO_RESET)
+        self.registers.write(FIFO_CONF, FIFO_RUN)
+        self.count = 0
+    }
+
+    fn push(&mut self, byte: u8) {
+        self.registers.write(DATA, byte as u32)
+    }
+
+    fn add(&mut self, command: u32) {
+        self.commands[self.count] = command
+        self.count += 1
+    }
+
+    // Load the queued commands and start them.
+    fn execute(&mut self) {
+        for index in 0..8usize {
+            command := 0u32
+            if index < self.count {
+                command = self.commands[index]
+            }
+            self.registers.write(COMMANDS + 4 * index, command)
+        }
+        control := self.registers.read(CTR)
+        self.registers.write(CTR, control | CONF_UPDATE)
+        self.registers.write(CTR, control | TRANS_START)
+    }
+
+    // Every queued command up to the stop or end ran.
+    fn all_done(&mut self) -> bool {
+        for index in 0..self.count {
+            command := self.commands[index]
+            if (self.registers.read(COMMANDS + 4 * index) & COMMAND_DONE) == 0 {
+                return false
+            }
+            if command == OP_STOP || command == OP_END {
+                return true
+            }
+        }
+        return true
+    }
+
+    // Wait for the run on the bus to end. TRANS_COMPLETE once it ended with
+    // a STOP (after a missing acknowledge too), END_DETECT if it holds the
+    // bus at an END, and 0 if it did not end or the bus failed, after which
+    // the state machine has been reset, as after any failure.
+    fn wait_run(&mut self) -> u32 {
+        for _ in 0..POLLS {
+            raw := self.registers.read(INT_RAW)
+            if (raw & (ARBITRATION_LOST | TIMEOUTS)) != 0 {
+                break
+            }
+            if (raw & TRANS_COMPLETE) != 0 {
+                return TRANS_COMPLETE
+            }
+            if (raw & END_DETECT) != 0 && (raw & NACK) == 0 {
+                return END_DETECT
+            }
+        }
+        self.recover()
+        return 0
+    }
+
+    // End a failed or abandoned transaction.
+    fn fail(&mut self) {
+        self.phase = IDLE
+        self.recover()
+    }
+
+    // Reset the state machine after a failed transaction, so the next one
+    // starts afresh; the controller sends a stop if it held the bus.
+    fn recover(&mut self) {
+        control := self.registers.read(CTR)
+        self.registers.write(CTR, control | FSM_RESET)
+        self.reset()
+        self.wait_idle()
+    }
+
+    // Wait until the bus is idle: the controller finishes a stop it is
+    // sending after a failed transaction. A bus that stays busy, as when a
+    // device holds SDA low, gets nine SCL pulses and a stop, which free it.
+    fn wait_idle(&mut self) {
+        for _ in 0..IDLE_POLLS {
+            if (self.registers.read(SR) & BUS_BUSY) == 0 {
+                return
+            }
+        }
+        self.registers.write(SCL_SP_CONF, NINE_PULSES | SCL_PULSES)
+        control := self.registers.read(CTR)
+        self.registers.write(CTR, control | CONF_UPDATE)
+        for _ in 0..IDLE_POLLS {
+            if (self.registers.read(SCL_SP_CONF) & SCL_PULSES) == 0 {
+                break
+            }
+        }
+        self.registers.write(SCL_SP_CONF, 0)
+        self.registers.write(CTR, control | FSM_RESET)
+    }
+
+    fn reset(&mut self) {
+        self.registers.write(INT_CLR, ALL_INTERRUPTS)
+        self.registers.write(FIFO_CONF, FIFO_RESET)
+        self.registers.write(FIFO_CONF, FIFO_RUN)
+        for index in 0..8usize {
+            self.registers.write(COMMANDS + 4 * index, 0)
+        }
+    }
+
+    // Write the timing registers for `self.timing` and latch them.
+    fn configure(&mut self) {
+        half := self.timing.half_cycle
+        wait_high := half / 4
+        if self.timing.frequency_hz >= 80_000 {
+            wait_high = half / 2 - 2
+        }
+        self.registers.write(SCL_LOW_PERIOD, half - 1)
+        self.registers.write(SCL_HIGH_PERIOD, (half - wait_high) | (wait_high << 9))
+        self.registers.write(SDA_HOLD, half / 4 - 1)
+        self.registers.write(SDA_SAMPLE, half / 2 - 1)
+        self.registers.write(SCL_RSTART_SETUP, half - 1)
+        self.registers.write(SCL_STOP_SETUP, half - 1)
+        self.registers.write(SCL_START_HOLD, half - 1)
+        self.registers.write(SCL_STOP_HOLD, half - 1)
+        control := self.registers.read(CTR)
+        self.registers.write(CTR, control | CONF_UPDATE)
+    }
+}
+
+// A 7-bit address; InvalidInput above 0x7F.
+fn address_header(address: u8) -> u8!hal.Error {
+    if address > 0x7F {
+        return err(hal.Error.InvalidInput)
+    }
+    return ok(address)
+}
+
+// The first byte of a 10-bit address, 0b11110 and its top two bits, before
+// the read/write bit; InvalidInput above 0x3FF.
+fn ten_bit_header(address: u16) -> u8!hal.Error {
+    if address > 0x3FF {
+        return err(hal.Error.InvalidInput)
+    }
+    return ok((0x78 | (address >> 8)) as u8)
+}
+
+// --- Target (slave) --------------------------------------------------------
+
+// The SLAVE_ADDR value for a target at `address`, a 10-bit address with
+// `ten_bit`. InvalidInput for a 7-bit address the I2C specification
+// reserves (0x00 to 0x07 and 0x78 to 0x7F) or a 10-bit one above 0x3FF.
+// The controller matches a 10-bit address as the two bytes a master sends,
+// stored as the low byte from bit 7 and the header, 0b11110 and the top two
+// bits, below it.
+pub fn target_address(address: u16, ten_bit: bool) -> u32!hal.Error {
+    if ten_bit {
+        if address > 0x3FF {
+            return err(hal.Error.InvalidInput)
+        }
+        header := 0x78u32 | ((address as u32) >> 8)
+        return ok((((address as u32) & 0xFF) << 7) | header | ADDRESS_TEN_BIT)
+    }
+    if address < 0x08 || address > 0x77 {
+        return err(hal.Error.InvalidInput)
+    }
+    return ok(address as u32)
+}
+
+// A target (slave) on an I2C bus, answering a master at one address with
+// one controller with registers R, any hal.Registers; it implements
+// hal.I2cTarget. The program polls for what the master does: written bytes
+// arrive in order, each read waits for `respond`, and a STOP ends the
+// transaction.
+//
+//     match target.poll(&mut buffer)? {
+//         hal.I2cTargetEvent.Write(count, start) => { ... }
+//         hal.I2cTargetEvent.Read => { target.respond(&reply)? }
+//         ...
+//     }
+//
+// The controller stretches SCL (holds it low) while its 32-byte receive
+// FIFO is full and while a read waits for bytes, until a poll or `respond`
+// lets the master go on, so a slow program delays the master but loses
+// nothing. Masters accept such clock stretching unless they give up after
+// a timeout of their own (SMBus allows 25 ms). The controller's state
+// machines give up on a stretch after 2^23 function clock cycles (210 ms
+// from the 40 MHz crystal), so a program must poll at least that often
+// while a master talks to it. `start` marks the first bytes after a STOP
+// or a read; the receive FIFO does not mark repeated starts, so two writes
+// joined by a repeated START arrive as one, and a program that polls more
+// slowly than whole transactions arrive may see the bytes of two write
+// transactions in one Write. Bytes queued by `respond` beyond what the
+// master reads are dropped when it next reads. General calls (address 0)
+// are not acknowledged.
+pub struct Target<R: hal.Registers>: hal.I2cTarget {
+    registers: R
+    // The next written byte begins a write: it follows an address.
+    starting: bool
+    // The master addressed the target since the last STOP.
+    involved: bool
+
+    // Configure a controller fresh out of reset as a target at `address`,
+    // a 10-bit address with `ten_bit`, which must pass `target_address`;
+    // chip packages check it before they take the controller. `timing`, for
+    // the bus's SCL frequency from the controller's function clock, sets
+    // the SDA hold and sample times; a target follows the master's clock
+    // whatever its frequency.
+    pub fn new(registers: R, timing: Timing, address: u16, ten_bit: bool) -> Target<R> {
+        value := 0u32
+        match target_address(address, ten_bit) {
+            ok(address_value) => {
+                value = address_value
+            }
+            err(_) => {
+                core.assert(false)
+            }
+        }
+        target := Target<R> { registers, starting: true, involved: false }
+        target.registers.write(CTR, CLOCK_ON | TX_AUTO_START)
+        target.registers.write(INT_ENA, 0)
+        target.registers.write(FILTER_CFG, FILTERS)
+        // No bit timeout: a target waits for the master however slow.
+        target.registers.write(TO, 0)
+        target.registers.write(SCL_ST_TIME_OUT, STATE_TIMEOUT)
+        target.registers.write(SCL_MAIN_ST_TIME_OUT, STATE_TIMEOUT)
+        half := timing.half_cycle
+        target.registers.write(SDA_HOLD, half / 4 - 1)
+        target.registers.write(SDA_SAMPLE, half / 4 - 1)
+        target.registers.write(SLAVE_ADDR, value)
+        target.registers.write(FIFO_CONF, FIFO_RESET)
+        target.registers.write(FIFO_CONF, FIFO_RUN)
+        target.registers.write(SCL_STRETCH_CONF, STRETCH_ON)
+        target.registers.write(SCL_STRETCH_CONF, STRETCH_ON | STRETCH_RELEASE)
+        target.registers.write(INT_CLR, ALL_INTERRUPTS)
+        target.update()
+        return target
+    }
+
+    // What the master did since the last poll, in order: first the bytes
+    // it wrote, as many as fit `buffer`, then a STOP, then a read that
+    // waits for `respond`. Never waits. A program that polls more slowly
+    // than whole transactions arrive may see one Stop for several; `start`
+    // still marks where each write begins. Overrun if the receive FIFO
+    // overflowed (RXFIFO_OVF), which stretching on a full FIFO prevents;
+    // Bus if the controller lost arbitration or a state machine timed out,
+    // as when the program left a stretch waiting too long.
+    pub fn poll(&mut self, buffer: &mut[u8]) -> hal.I2cTargetEvent!hal.Error {
+        raw := self.registers.read(INT_RAW)
+        if (raw & RX_OVERFLOW) != 0 {
+            self.registers.write(INT_CLR, RX_OVERFLOW)
+            return err(hal.Error.Overrun)
+        }
+        if (raw & (ARBITRATION_LOST | SCL_STATE_TIMEOUT | SCL_MAIN_TIMEOUT)) != 0 {
+            self.registers.write(INT_CLR, ARBITRATION_LOST | SCL_STATE_TIMEOUT | SCL_MAIN_TIMEOUT)
+            return err(hal.Error.Bus)
+        }
+        if (raw & NACK) != 0 {
+            // The master acknowledged no more bytes of a reply.
+            self.registers.write(INT_CLR, NACK)
+        }
+        status := self.registers.read(SR)
+        stretched := (raw & TARGET_STRETCH) != 0
+        cause := hal.decode(STRETCH_CAUSE, status)
+        available := hal.decode(RX_COUNT, status) as usize
+        count := 0usize
+        for count < buffer.len && count < available {
+            buffer[count] = (self.registers.read(DATA) & 0xFF) as u8
+            count += 1
+        }
+        if count > 0 {
+            start := self.starting
+            self.starting = false
+            self.involved = true
+            if stretched && cause == 2 {
+                // The FIFO was full; it has room again.
+                self.release_stretch()
+            }
+            return ok(hal.I2cTargetEvent.Write(count, start))
+        }
+        if available > 0 {
+            // Written bytes wait for a buffer; anything after them is later.
+            return ok(hal.I2cTargetEvent.Idle)
+        }
+        if (raw & TRANS_COMPLETE) != 0 {
+            // A STOP: reported for a transaction that addressed the target,
+            // as the controller flags every STOP on the bus.
+            self.registers.write(INT_CLR, TRANS_COMPLETE)
+            self.starting = true
+            involved := self.involved || (status & ADDRESSED) != 0
+            self.involved = false
+            if involved {
+                return ok(hal.I2cTargetEvent.Stop)
+            }
+            return ok(hal.I2cTargetEvent.Idle)
+        }
+        if !stretched {
+            return ok(hal.I2cTargetEvent.Idle)
+        }
+        if cause == 0 {
+            if (status & TARGET_READ) != 0 {
+                // A new read: drop what earlier replies left queued. Bytes
+                // written after it begin a new write.
+                self.reset_tx()
+                self.involved = true
+                self.starting = true
+                return ok(hal.I2cTargetEvent.Read)
+            }
+            // A new write: its bytes follow once SCL is released.
+            self.starting = true
+            self.involved = true
+            self.release_stretch()
+            return ok(hal.I2cTargetEvent.Idle)
+        }
+        if cause == 1 {
+            // The master reads on and the transmit FIFO is empty.
+            return ok(hal.I2cTargetEvent.Read)
+        }
+        self.release_stretch()
+        return ok(hal.I2cTargetEvent.Idle)
+    }
+
+    // Answer a Read from `poll` with `bytes`, as many as the transmit FIFO
+    // holds; returns how many, and lets the master go on. The master reads
+    // them one by one and may stop early; if it reads on, the next poll
+    // reports another Read. An empty `bytes` sends 0xFF, what the master
+    // would read from an idle bus, so that it is never left waiting, and
+    // returns 0. Never fails: the error is there for hal.I2cTarget.
+    pub fn respond(&mut self, bytes: &[u8]) -> usize!hal.Error {
+        count := 0usize
+        if bytes.len == 0 {
+            self.registers.write(DATA, 0xFF)
+        } else {
+            queued := hal.decode(TX_COUNT, self.registers.read(SR)) as usize
+            for count < bytes.len && queued + count < FIFO_DEPTH {
+                self.registers.write(DATA, bytes[count] as u32)
+                count += 1
+            }
+        }
+        self.release_stretch()
+        return ok(count)
+    }
+
+    // Answer at `address` from the next transaction on, a 10-bit address
+    // with `ten_bit`, as for `target_address`. InvalidInput leaves the
+    // address unchanged.
+    pub fn set_address(&mut self, address: u16, ten_bit: bool) -> void!hal.Error {
+        value := target_address(address, ten_bit)?
+        self.registers.write(SLAVE_ADDR, value)
+        self.update()
+        return ok()
+    }
+
+    // Stop answering and give back the registers, with the state machine
+    // reset and SCL released.
+    pub fn release(self) -> R {
+        self.registers.write(SCL_STRETCH_CONF, STRETCH_RELEASE)
+        self.registers.write(INT_ENA, 0)
+        self.registers.write(CTR, FSM_RESET)
+        let Target { registers, starting, involved } = self
+        return registers
+    }
+
+    // Let the master go on after a stretch.
+    fn release_stretch(&mut self) {
+        self.registers.write(SCL_STRETCH_CONF, STRETCH_ON | STRETCH_RELEASE)
+        self.registers.write(INT_CLR, TARGET_STRETCH)
+        self.update()
+    }
+
+    fn reset_tx(&mut self) {
+        conf := self.registers.read(FIFO_CONF)
+        self.registers.write(FIFO_CONF, conf | TX_FIFO_RESET)
+        self.registers.write(FIFO_CONF, conf & ~TX_FIFO_RESET)
+    }
+
+    fn update(&mut self) {
+        control := self.registers.read(CTR)
+        self.registers.write(CTR, control | CONF_UPDATE)
+    }
+}

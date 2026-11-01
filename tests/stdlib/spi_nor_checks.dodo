@@ -1,0 +1,1014 @@
+package main
+
+import "core/ptr"
+import "std/embedded/flash/spi_nor"
+import "std/embedded/hal"
+import "std/embedded/storage"
+
+// std/embedded/flash/spi_nor against a behavioural SPI NOR chip: probing by
+// JEDEC ID and SFDP, reads, page programs split at page boundaries, sector
+// and block erases, status polling and its limit, write-enable checks,
+// block protection, deep power-down, software reset, 4-byte addressing,
+// and std/embedded/storage on top, through power cuts.
+//
+// `Chip` decodes the SPI commands framed by chip select as a W25Q-class
+// part does: the instruction, then 3 or 4 address bytes, then dummy and
+// data bytes; programs and erases take effect when chip select rises, need
+// the write enable latch, and keep BUSY up for a number of status reads.
+// The driver reaches it through `ModelSpi` (the bus) and `ModelPin` (chip
+// select), which both point at it. Anything the datasheets forbid, such as
+// a command while busy, a program crossing a page, or an unaligned erase,
+// counts as a violation, and every test expects none.
+
+const SECTOR: u32 = 4096
+const BLOCK: u32 = 65536
+
+struct Chip {
+    // The memory array, a buffer of the test's: the model is reached
+    // through raw pointers, so it holds no borrow.
+    memory: *mut u8
+    size: usize
+    id: [3]u8
+    // The SFDP space, all FFh without SFDP.
+    sfdp: [128]u8
+    status: u8
+    // Status reads BUSY stays up for after each program or erase, and
+    // those left; a stuck chip never clears it.
+    busy_reads: u32
+    busy_left: u32
+    stuck: bool
+    // The chip ignores write enable, as with WP# low and the status
+    // register locked.
+    locked: bool
+    // Only 4-byte addresses, for every command.
+    four_only: bool
+    asleep: bool
+    reset_enabled: bool
+    // Transactions after a wake or reset during which the chip does not
+    // answer yet.
+    recovering: u32
+    recovery: u32
+    // The transaction being decoded.
+    selected: bool
+    position: usize
+    command: u8
+    address: u32
+    address_bytes: usize
+    page: [256]u8
+    page_count: usize
+    // Bytes the chip may still change before the power is cut, if a cut is
+    // pending (cut), and whether the power is off.
+    cut: bool
+    budget: u32
+    off: bool
+    // What the driver did.
+    violations: u32
+    programs: u32
+    sector_erases: u32
+    block_erases: u32
+    half_block_erases: u32
+    chip_erases: u32
+    status_reads: u32
+    last_command: u8
+    last_address: u32
+    last_address_bytes: usize
+    resets: u32
+    power_downs: u32
+    wakes: u32
+
+    fn new(memory: &mut[u8], id: u32) -> Chip {
+        for index in 0..memory.len {
+            memory[index] = 0xFF
+        }
+        base := unsafe {
+            ptr.as_mut_ptr(memory)
+        }
+        return Chip {
+            memory: base,
+            size: memory.len,
+            id: [((id >> 16) & 0xFF) as u8, ((id >> 8) & 0xFF) as u8, (id & 0xFF) as u8],
+            sfdp: [0xFF; 128],
+            status: 0,
+            busy_reads: 3,
+            busy_left: 0,
+            stuck: false,
+            locked: false,
+            four_only: false,
+            asleep: false,
+            reset_enabled: false,
+            recovering: 0,
+            recovery: 2,
+            selected: false,
+            position: 0,
+            command: 0,
+            address: 0,
+            address_bytes: 3,
+            page: [0xFF; 256],
+            page_count: 0,
+            cut: false,
+            budget: 0,
+            off: false,
+            violations: 0,
+            programs: 0,
+            sector_erases: 0,
+            block_erases: 0,
+            half_block_erases: 0,
+            chip_erases: 0,
+            status_reads: 0,
+            last_command: 0,
+            last_address: 0,
+            last_address_bytes: 0,
+            resets: 0,
+            power_downs: 0,
+            wakes: 0,
+        }
+    }
+
+    // An SFDP space whose basic table has the density `bits_word` (word 2),
+    // address mode bits `address_mode` (word 1 bits 18-17), and the erase
+    // types of words 8 and 9.
+    fn give_sfdp(&mut self, bits_word: u32, address_mode: u32, erase_types: u32, more_types: u32) {
+        signature: [8]u8 = [0x53, 0x46, 0x44, 0x50, 0x06, 0x01, 0x00, 0xFF]
+        for index in 0usize..8 {
+            self.sfdp[index] = signature[index]
+        }
+        // Parameter header 0: the basic table, version 1.6, 16 words at
+        // 30h.
+        parameter: [8]u8 = [0x00, 0x06, 0x01, 0x10, 0x30, 0x00, 0x00, 0xFF]
+        for index in 0usize..8 {
+            self.sfdp[8 + index] = parameter[index]
+        }
+        words := [0u32; 9]
+        // Word 1: 4 KiB erases with 20h.
+        words[0] = (0xFFF0_20E5 & ~(0x3u32 << 17)) | (address_mode << 17)
+        words[1] = bits_word
+        words[7] = erase_types
+        words[8] = more_types
+        for index in 0usize..9 {
+            for part in 0usize..4 {
+                self.sfdp[0x30 + 4 * index + part] = ((words[index] >> (8 * part) as u32) & 0xFF) as u8
+            }
+        }
+    }
+
+    fn busy(&self) -> bool {
+        return (self.status & 0x01) != 0
+    }
+
+    fn set_busy(&mut self) {
+        self.status |= 0x01
+        self.busy_left = self.busy_reads
+    }
+
+    // The memory byte at `address`; a chip larger than the memory wraps.
+    fn index(&self, address: u32) -> usize {
+        return address as usize % self.size
+    }
+
+    fn load(&self, at: usize) -> u8 {
+        unsafe {
+            return ptr.read(ptr.offset(self.memory, at as isize))
+        }
+    }
+
+    fn store(&mut self, at: usize, value: u8) {
+        unsafe {
+            ptr.write(ptr.offset(self.memory, at as isize), value)
+        }
+    }
+
+    // Change one byte, spending the power-cut budget; false once the power
+    // is cut.
+    fn change(&mut self, address: u32, value: u8) -> bool {
+        if self.cut {
+            if self.budget == 0 {
+                self.off = true
+                self.cut = false
+                return false
+            }
+            self.budget -= 1
+        }
+        at := self.index(address)
+        self.store(at, value)
+        return true
+    }
+
+    // --- SPI side ---
+
+    fn select(&mut self) {
+        if self.selected {
+            self.violations += 1
+        }
+        self.selected = true
+        self.position = 0
+        self.command = 0
+        self.address = 0
+        self.page_count = 0
+    }
+
+    fn exchange(&mut self, byte: u8) -> u8 {
+        if !self.selected {
+            self.violations += 1
+            return 0xFF
+        }
+        position := self.position
+        self.position += 1
+        if self.asleep || self.recovering > 0 {
+            if position == 0 {
+                self.command = byte
+            }
+            return 0xFF
+        }
+        if position == 0 {
+            self.command = byte
+            self.address_bytes = 3
+            if self.four_only || byte == 0x13 || byte == 0x0C || byte == 0x12 || byte == 0x21 || byte == 0x5C || byte == 0xDC {
+                self.address_bytes = 4
+            }
+            if byte == 0x5A {
+                self.address_bytes = 3
+            }
+            // While busy, the chip answers only status reads; the reset and
+            // release commands and the ID read, which a driver sends when it
+            // cannot know, are ignored.
+            if self.busy() && byte != 0x05 && byte != 0x66 && byte != 0x99 && byte != 0xAB && byte != 0x9F {
+                self.violations += 1
+            }
+            return 0xFF
+        }
+        command := self.command
+        if self.busy() && command != 0x05 {
+            return 0xFF
+        }
+        if command == 0x9F {
+            if position <= 3 {
+                return self.id[position - 1]
+            }
+            return 0xFF
+        }
+        if command == 0x05 {
+            self.status_reads += 1
+            answer := self.status
+            if self.busy() && !self.stuck {
+                if self.busy_left <= 1 {
+                    self.status &= ~0x03u8
+                } else {
+                    self.busy_left -= 1
+                }
+            }
+            return answer
+        }
+        if command == 0x01 {
+            if position == 1 {
+                self.address = byte as u32
+            }
+            return 0xFF
+        }
+        // Address bytes.
+        if position <= self.address_bytes {
+            self.address = (self.address << 8) | byte as u32
+            return 0xFF
+        }
+        data := position - 1 - self.address_bytes
+        if command == 0x03 || command == 0x13 {
+            at := self.index(self.address + data as u32)
+            return self.load(at)
+        }
+        if command == 0x0B || command == 0x0C || command == 0x5A {
+            if data == 0 {
+                return 0xFF
+            }
+            if command == 0x5A {
+                at := (self.address as usize + data - 1) % 128
+                return self.sfdp[at]
+            }
+            at := self.index(self.address + data as u32 - 1)
+            return self.load(at)
+        }
+        if command == 0x02 || command == 0x12 {
+            // The page buffer wraps within the page; a driver must not let
+            // it, nor start past the page's end.
+            if (self.address & 0xFF) as usize + data >= 256 {
+                self.violations += 1
+            }
+            slot := ((self.address as usize & 0xFF) + data) & 0xFF
+            self.page[slot] = byte
+            self.page_count += 1
+            return 0xFF
+        }
+        return 0xFF
+    }
+
+    fn deselect(&mut self) {
+        if !self.selected {
+            return
+        }
+        self.selected = false
+        if self.position == 0 {
+            return
+        }
+        command := self.command
+        if self.recovering > 0 {
+            self.recovering -= 1
+            return
+        }
+        if self.asleep {
+            if command == 0xAB {
+                self.asleep = false
+                self.wakes += 1
+                self.recovering = self.recovery
+            }
+            return
+        }
+        if command == 0x66 {
+            self.reset_enabled = true
+            return
+        }
+        if command == 0x99 && self.reset_enabled {
+            self.reset_enabled = false
+            self.status &= ~0x03u8
+            self.busy_left = 0
+            self.recovering = self.recovery
+            self.resets += 1
+            return
+        }
+        self.reset_enabled = false
+        if self.busy() {
+            return
+        }
+        if command == 0x06 {
+            if !self.locked {
+                self.status |= 0x02
+            }
+            return
+        }
+        if command == 0xB9 {
+            self.asleep = true
+            self.power_downs += 1
+            return
+        }
+        if command == 0xAB {
+            return
+        }
+        writes := command == 0x02 || command == 0x12 || command == 0x20 || command == 0x21 || command == 0x52 || command == 0x5C || command == 0xD8 || command == 0xDC || command == 0xC7 || command == 0x01
+        if !writes {
+            return
+        }
+        if (self.status & 0x02) == 0 {
+            // Without the write enable latch the chip ignores it.
+            self.violations += 1
+            return
+        }
+        self.status &= ~0x02u8
+        self.last_command = command
+        self.last_address = self.address
+        self.last_address_bytes = self.address_bytes
+        if command == 0x01 {
+            self.status = (self.status & 0x03) | ((self.address & 0xFF) as u8 & 0xFC)
+            self.set_busy()
+            return
+        }
+        if (self.status & 0x3C) != 0 {
+            // Protected: ignored without a word.
+            return
+        }
+        if command == 0x02 || command == 0x12 {
+            self.programs += 1
+            base := self.address & ~0xFFu32
+            start := (self.address & 0xFF) as usize
+            count := self.page_count
+            if count > 256 {
+                count = 256
+            }
+            for index in 0usize..count {
+                slot := (start + index) & 0xFF
+                address := base + slot as u32
+                at := self.index(address)
+                old := self.load(at)
+                value := old & self.page[slot]
+                if !self.change(address, value) {
+                    return
+                }
+            }
+            self.set_busy()
+            return
+        }
+        size := SECTOR
+        if command == 0x20 || command == 0x21 {
+            self.sector_erases += 1
+        } else if command == 0x52 || command == 0x5C {
+            size = 32768
+            self.half_block_erases += 1
+        } else if command == 0xD8 || command == 0xDC {
+            size = BLOCK
+            self.block_erases += 1
+        } else {
+            self.chip_erases += 1
+            size = self.size as u32
+            self.address = 0
+        }
+        if self.address % size != 0 {
+            self.violations += 1
+        }
+        base := self.address & ~(size - 1)
+        for index in 0u32..size {
+            if !self.change(base + index, 0xFF) {
+                return
+            }
+        }
+        self.set_busy()
+    }
+
+    fn cut_power_after(&mut self, bytes: u32) {
+        self.cut = true
+        self.budget = bytes
+    }
+
+    fn restore_power(&mut self) {
+        self.off = false
+        self.cut = false
+        self.status = 0
+        self.busy_left = 0
+        self.selected = false
+        self.asleep = false
+    }
+}
+
+struct ModelSpi: hal.Spi {
+    chip: *mut Chip
+
+    fn new(chip: &mut Chip) -> ModelSpi {
+        return ModelSpi { chip: ptr.from_mut(chip) }
+    }
+
+    fn model(&mut self) -> &mut Chip from(self) {
+        pointer := self.chip
+        unsafe {
+            return ptr.borrow_mut(pointer, self)
+        }
+    }
+
+    pub fn transfer(&mut self, bytes: &mut[u8]) -> void!hal.Error {
+        chip := self.model()
+        if chip.off {
+            return err(hal.Error.Bus)
+        }
+        for index in 0..bytes.len {
+            bytes[index] = chip.exchange(bytes[index])
+        }
+        return ok()
+    }
+
+    pub fn write(&mut self, bytes: &[u8]) -> void!hal.Error {
+        chip := self.model()
+        if chip.off {
+            return err(hal.Error.Bus)
+        }
+        for index in 0..bytes.len {
+            chip.exchange(bytes[index])
+        }
+        return ok()
+    }
+}
+
+struct ModelPin: hal.OutputPin {
+    chip: *mut Chip
+
+    fn new(chip: &mut Chip) -> ModelPin {
+        return ModelPin { chip: ptr.from_mut(chip) }
+    }
+
+    fn model(&mut self) -> &mut Chip from(self) {
+        pointer := self.chip
+        unsafe {
+            return ptr.borrow_mut(pointer, self)
+        }
+    }
+
+    pub fn set_high(&mut self) {
+        self.model().deselect()
+    }
+
+    pub fn set_low(&mut self) {
+        self.model().select()
+    }
+}
+
+type Nor = spi_nor.Flash<ModelSpi, ModelPin>
+
+fn attach(chip: &mut Chip) -> Nor {
+    return spi_nor.Flash.attach(ModelSpi.new(chip), ModelPin.new(chip))
+}
+
+fn probed(chip: &mut Chip) -> Nor {
+    flash := attach(chip)
+    match flash.probe() {
+        ok() => {}
+        err(error) => {
+            core.assert(false)
+        }
+    }
+    return flash
+}
+
+fn refused(result: void!hal.Error, expected: hal.Error) -> bool {
+    match result {
+        ok() => {
+            return false
+        }
+        err(error) => {
+            return error == expected
+        }
+    }
+}
+
+fn succeeded(result: void!hal.Error) -> bool {
+    match result {
+        ok() => {
+            return true
+        }
+        err(_) => {
+            return false
+        }
+    }
+}
+
+// A W25Q80-class part: 1 MiB, SFDP with 4 KiB (20h), 32 KiB (52h), and
+// 64 KiB (D8h) erases.
+const W25Q80: u32 = 0xEF4014
+const ERASE_TYPES: u32 = 0x520F_200C
+const MORE_TYPES: u32 = 0x0000_D810
+
+fn w25q80(memory: &mut[u8]) -> Chip {
+    chip := Chip.new(memory, W25Q80)
+    chip.give_sfdp(0x007F_FFFF, 0, ERASE_TYPES, MORE_TYPES)
+    return chip
+}
+
+fn probing() {
+    memory := [0u8; 8192]
+    chip := w25q80(&mut memory)
+    // A chip left in deep power-down by a previous run wakes first.
+    chip.asleep = true
+    flash := probed(&mut chip)
+    core.assert(flash.jedec_id() == W25Q80 && flash.manufacturer() == 0xEF)
+    core.assert(flash.capacity() == 1024 * 1024 && flash.erase_size() == SECTOR && flash.write_size() == 1)
+    core.assert(flash.block_size() == BLOCK && !flash.uses_four_byte_addresses())
+    core.assert(chip.wakes == 1 && !chip.asleep && chip.violations == 0)
+}
+
+fn capacity_of(id: u32) -> u32!hal.Error {
+    memory := [0u8; 8192]
+    chip := Chip.new(&mut memory, id)
+    flash := attach(&mut chip)
+    flash.probe()?
+    core.assert(chip.violations == 0)
+    return ok(flash.capacity())
+}
+
+fn probe_failure(id: u32) -> hal.Error {
+    match capacity_of(id) {
+        ok(_) => {
+            core.assert(false)
+            return hal.Error.Bus
+        }
+        err(error) => {
+            return error
+        }
+    }
+}
+
+fn probing_by_id() {
+    // Without SFDP, the ID's capacity code: GD25Q16, 2 MiB; Winbond's codes
+    // above 32 MiB: W25Q512, 64 MiB.
+    core.assert(capacity_of(0xC84015)! == 2 * 1024 * 1024)
+    core.assert(capacity_of(0xEF4020)! == 64 * 1024 * 1024)
+    // A code that names no size; no chip, with MISO high or low.
+    core.assert(probe_failure(0xEF4030) == hal.Error.Unsupported)
+    core.assert(probe_failure(0xFFFFFF) == hal.Error.NoAcknowledge)
+    core.assert(probe_failure(0) == hal.Error.NoAcknowledge)
+
+    memory := [0u8; 8192]
+    big := Chip.new(&mut memory, 0xEF4020)
+    flash := probed(&mut big)
+    core.assert(flash.uses_four_byte_addresses() && flash.erase_size() == SECTOR)
+}
+
+fn naming_the_size() {
+    memory := [0u8; 8192]
+    odd := Chip.new(&mut memory, 0xEF4030)
+    flash := attach(&mut odd)
+    core.assert(refused(flash.probe(), hal.Error.Unsupported))
+    core.assert(flash.capacity() == 0)
+    core.assert(refused(flash.erase(0, SECTOR), hal.Error.InvalidInput))
+    core.assert(succeeded(flash.set_capacity(512 * 1024)))
+    core.assert(refused(flash.set_capacity(1000), hal.Error.InvalidInput))
+    core.assert(refused(flash.set_capacity(32 * 1024 * 1024), hal.Error.InvalidInput))
+    core.assert(succeeded(flash.erase(0, SECTOR)))
+    core.assert(odd.sector_erases == 1 && odd.violations == 0)
+}
+
+fn new_reports_a_missing_chip() {
+    memory := [0u8; 8192]
+    absent := Chip.new(&mut memory, 0xFFFFFF)
+    match spi_nor.Flash.new(ModelSpi.new(&mut absent), ModelPin.new(&mut absent)) {
+        ok(_) => core.assert(false),
+        err(error) => core.assert(error == hal.Error.NoAcknowledge),
+    }
+}
+
+// The geometry from SFDP: a density word, address mode, and erase types.
+fn sfdp_geometry(id: u32, density: u32, types: u32, size: u32, erase: u32, block: u32) -> bool {
+    memory := [0u8; 8192]
+    chip := Chip.new(&mut memory, id)
+    chip.give_sfdp(density, 0, types, 0)
+    flash := probed(&mut chip)
+    return flash.capacity() == size && flash.erase_size() == erase && flash.block_size() == block
+}
+
+fn probing_by_sfdp() {
+    // The density as a power of two, with 4 KiB and 64 KiB erases.
+    core.assert(sfdp_geometry(0xC22016, 0x8000_0016, 0xD810_200C, 512 * 1024, SECTOR, BLOCK))
+    // A part with 64 KiB erases only.
+    core.assert(sfdp_geometry(0x010216, 0x03FF_FFFF, 0x0000_D810, 8 * 1024 * 1024, BLOCK, 0))
+    // An erase still running from before a restart is waited for, though
+    // the chip ignores the ID command meanwhile.
+    memory := [0u8; 8192]
+    late := w25q80(&mut memory)
+    late.set_busy()
+    late.busy_left = 50
+    flash := probed(&mut late)
+    core.assert(late.violations == 0 && !late.busy() && flash.capacity() == 1024 * 1024)
+}
+
+fn reads_writes_and_erases() {
+    memory := [0u8; 262144]
+    chip := w25q80(&mut memory)
+    flash := probed(&mut chip)
+    // Fast read by default.
+    probe := [0u8; 16]
+    flash.read(1000, &mut probe)!
+    for &byte in probe {
+        core.assert(byte == 0xFF)
+    }
+    // 600 bytes from 200 take four page programs: 56, 256, 256, 32.
+    bytes := [0u8; 600]
+    for index in 0usize..600 {
+        bytes[index] = ((index * 13 + 5) & 0xFF) as u8
+    }
+    flash.write(200, &bytes)!
+    core.assert(chip.programs == 4 && chip.violations == 0)
+    back := [0u8; 602]
+    flash.read(199, &mut back)!
+    core.assert(back[0] == 0xFF && back[601] == 0xFF)
+    for index in 0usize..600 {
+        core.assert(back[index + 1] == bytes[index])
+    }
+    // The plain read command gives the same.
+    flash.set_fast_read(false)
+    flash.read(199, &mut back)!
+    core.assert(back[1] == bytes[0] && back[600] == bytes[599] && chip.violations == 0)
+    flash.set_fast_read(true)
+    // One byte, at a page's last byte.
+    one: [1]u8 = [0x5A]
+    flash.write(4095, &one)!
+    flash.read(4095, &mut back[..1])!
+    core.assert(back[0] == 0x5A && chip.programs == 5)
+    // An empty write or read does nothing.
+    empty := [0u8; 0]
+    flash.write(0, &empty)!
+    core.assert(chip.programs == 5)
+
+    // Erases: a 64 KiB block where one is covered, sectors elsewhere.
+    flash.erase(0, BLOCK + 2 * SECTOR)!
+    core.assert(chip.block_erases == 1 && chip.sector_erases == 2 && chip.violations == 0)
+    flash.read(199, &mut back)!
+    for &byte in back {
+        core.assert(byte == 0xFF)
+    }
+    flash.erase(SECTOR, BLOCK)!
+    core.assert(chip.block_erases == 1 && chip.sector_erases == 18)
+    core.assert(chip.last_command == 0x20 && chip.last_address == BLOCK && chip.last_address_bytes == 3)
+    // Busy polling: each program and erase keeps BUSY up for a few reads.
+    chip.busy_reads = 40
+    before := chip.status_reads
+    flash.erase(2 * BLOCK, SECTOR)!
+    core.assert(chip.status_reads - before >= 40 && chip.violations == 0)
+    chip.busy_reads = 3
+
+    // Out of range and misaligned requests change nothing.
+    capacity := flash.capacity()
+    core.assert(refused(flash.erase(100, SECTOR), hal.Error.InvalidInput))
+    core.assert(refused(flash.erase(0, 100), hal.Error.InvalidInput))
+    core.assert(refused(flash.erase(capacity, SECTOR), hal.Error.InvalidInput))
+    core.assert(refused(flash.write(capacity - 1, &bytes[..2]), hal.Error.InvalidInput))
+    core.assert(refused(flash.read(capacity, &mut back[..1]), hal.Error.InvalidInput))
+    flash.read(capacity - 2, &mut back[..2])!
+
+    // A chip erase.
+    flash.write(0, &bytes)!
+    flash.erase_chip()!
+    core.assert(chip.chip_erases == 1)
+    flash.read(0, &mut back)!
+    core.assert(back[0] == 0xFF && back[599] == 0xFF && chip.violations == 0)
+}
+
+fn waiting_and_refusals() {
+    memory := [0u8; 65536]
+    chip := w25q80(&mut memory)
+    flash := probed(&mut chip)
+    bytes: [4]u8 = [1, 2, 3, 4]
+    // BUSY that never clears times out after the poll limit, and the next
+    // operation waits for it again.
+    chip.stuck = true
+    flash.set_poll_limit(100)
+    before := chip.status_reads
+    core.assert(refused(flash.erase(0, SECTOR), hal.Error.Timeout))
+    // One read before the erase, one to check the write enable, then the
+    // limit.
+    core.assert(chip.status_reads - before == 102)
+    core.assert(refused(flash.write(0, &bytes), hal.Error.Timeout))
+    core.assert(flash.is_busy()!)
+    chip.stuck = false
+    chip.busy_left = 1
+    flash.write(0, &bytes)!
+    core.assert(!flash.is_busy()!)
+    flash.set_poll_limit(hal.DEFAULT_POLL_LIMIT)
+    // A chip that ignores write enable: Bus, not silence.
+    chip.locked = true
+    core.assert(refused(flash.write(8, &bytes), hal.Error.Bus))
+    core.assert(refused(flash.erase(0, SECTOR), hal.Error.Bus))
+    chip.locked = false
+    core.assert(chip.violations == 0)
+
+    // Block protection: programs are ignored until unprotect clears the
+    // bits, keeping the others.
+    chip.status = 0x9C
+    core.assert(flash.is_protected()!)
+    flash.unprotect()!
+    core.assert(!flash.is_protected()! && (chip.status & 0x80) != 0 && chip.last_command == 0x01)
+    flash.write(16, &bytes)!
+    check := [0u8; 4]
+    flash.read(16, &mut check)!
+    core.assert(check[3] == 4)
+    // Nothing to clear: no status write.
+    chip.last_command = 0
+    flash.unprotect()!
+    core.assert(chip.last_command == 0)
+    // A locked status register keeps them.
+    chip.status = 0x0C
+    chip.locked = true
+    core.assert(refused(flash.unprotect(), hal.Error.Bus))
+    chip.locked = false
+    chip.status = 0
+    core.assert(chip.violations == 0)
+}
+
+fn power_down_and_reset() {
+    memory := [0u8; 65536]
+    chip := w25q80(&mut memory)
+    flash := probed(&mut chip)
+    bytes: [4]u8 = [9, 8, 7, 6]
+    flash.write(0, &bytes)!
+    flash.power_down()!
+    core.assert(chip.asleep && flash.is_powered_down() && chip.power_downs == 1)
+    // Any operation wakes it, waiting until it answers again.
+    back := [0u8; 4]
+    flash.read(0, &mut back)!
+    core.assert(back[0] == 9 && !chip.asleep && !flash.is_powered_down() && chip.wakes == 1)
+    flash.power_down()!
+    flash.wake()!
+    core.assert(!chip.asleep && chip.wakes == 2)
+    // A chip that never wakes is Timeout, as is one that answers with
+    // another ID.
+    flash.power_down()!
+    chip.recovery = 1_000_000
+    core.assert(refused(flash.wake(), hal.Error.Timeout))
+    chip.recovering = 0
+    chip.recovery = 2
+    chip.id[2] = 0x15
+    core.assert(refused(flash.wake(), hal.Error.Timeout))
+    chip.id[2] = 0x14
+    flash.wake()!
+
+    // A software reset stops an erase in progress.
+    chip.stuck = true
+    chip.set_busy()
+    flash.reset()!
+    core.assert(chip.resets == 1 && !chip.busy())
+    chip.stuck = false
+    flash.write(4, &bytes)!
+    flash.read(4, &mut back)!
+    core.assert(back[3] == 6 && chip.violations == 0)
+}
+
+fn four_byte_addresses() {
+    memory := [0u8; 65536]
+    // A W25Q256-class part: 32 MiB, either address mode.
+    chip := Chip.new(&mut memory, 0xEF4019)
+    chip.give_sfdp(0x0FFF_FFFF, 1, ERASE_TYPES, MORE_TYPES)
+    flash := probed(&mut chip)
+    core.assert(flash.capacity() == 32 * 1024 * 1024 && flash.uses_four_byte_addresses())
+    at := 0x0180_0100u32
+    flash.erase(at - 0x100, SECTOR)!
+    core.assert(chip.last_command == 0x21 && chip.last_address == at - 0x100 && chip.last_address_bytes == 4)
+    bytes: [3]u8 = [0xA1, 0xB2, 0xC3]
+    flash.write(at, &bytes)!
+    core.assert(chip.last_command == 0x12 && chip.last_address == at && chip.last_address_bytes == 4)
+    back := [0u8; 3]
+    flash.read(at, &mut back)!
+    core.assert(back[0] == 0xA1 && back[2] == 0xC3)
+    flash.set_fast_read(false)
+    flash.read(at, &mut back)!
+    core.assert(back[1] == 0xB2)
+    flash.erase(BLOCK * 300, BLOCK)!
+    core.assert(chip.last_command == 0xDC && chip.last_address == BLOCK * 300)
+    core.assert(chip.violations == 0)
+    core.drop(flash)
+
+    // A part with 4-byte addresses only takes the usual commands with them.
+    only := Chip.new(&mut memory, 0xC2201A)
+    only.four_only = true
+    only.give_sfdp(0x1FFF_FFFF, 2, ERASE_TYPES, MORE_TYPES)
+    flash = probed(&mut only)
+    core.assert(flash.capacity() == 64 * 1024 * 1024 && flash.uses_four_byte_addresses())
+    flash.write(0x0300_0010, &bytes)!
+    core.assert(only.last_command == 0x02 && only.last_address == 0x0300_0010 && only.last_address_bytes == 4)
+    flash.read(0x0300_0010, &mut back)!
+    core.assert(back[0] == 0xA1 && only.violations == 0)
+    flash.erase(0x0300_0000, SECTOR)!
+    core.assert(only.last_command == 0x20 && only.last_address_bytes == 4)
+    core.drop(flash)
+
+    // An erase command with no 4-byte form above 16 MiB.
+    strange := Chip.new(&mut memory, 0xEF4019)
+    strange.give_sfdp(0x0FFF_FFFF, 1, 0x0000_810C, 0)
+    flash = attach(&mut strange)
+    core.assert(refused(flash.probe(), hal.Error.Unsupported))
+}
+
+// --- std/embedded/storage on the chip ---
+
+fn value_of(key: u32, version: u32, buffer: &mut[u8]) -> usize {
+    length := 1 + ((key * 7 + version * 3) % 40) as usize
+    for index in 0..length {
+        buffer[index] = ((key * 31 + version * 17 + index as u32) & 0xFF) as u8
+    }
+    return length
+}
+
+fn key_name(key: u32) -> &str from(static) {
+    if key == 0 {
+        return "zero"
+    }
+    if key == 1 {
+        return "one"
+    }
+    if key == 2 {
+        return "two"
+    }
+    return "three"
+}
+
+// True if the store holds version `version` of `key`.
+fn holds(store: &mut storage.Store<storage.Region<Nor>>, key: u32, version: u32) -> bool {
+    expected := [0u8; 64]
+    length := value_of(key, version, &mut expected)
+    actual := [0u8; 64]
+    match store.get(key_name(key), &mut actual) {
+        ok(some(found)) => {
+            if found != length {
+                return false
+            }
+            for index in 0..length {
+                if actual[index] != expected[index] {
+                    return false
+                }
+            }
+            return true
+        }
+        ok(none) => {
+            return false
+        }
+        err(_) => {
+            return false
+        }
+    }
+}
+
+fn store_on_the_chip() {
+    memory := [0u8; 262144]
+    chip := w25q80(&mut memory)
+    flash := probed(&mut chip)
+    // The last 64 KiB of the chip: 16 sectors.
+    region := storage.Region.last(flash, 64 * 1024)!
+    store := storage.Store.open(region)!
+    store.clear()!
+    buffer := [0u8; 64]
+    for version in 0u32..60 {
+        for key in 0u32..4 {
+            length := value_of(key, version, &mut buffer)
+            store.set(key_name(key), &buffer[..length])!
+        }
+    }
+    for key in 0u32..4 {
+        core.assert(holds(&mut store, key, 59))
+    }
+    region = store.release()
+    store = storage.Store.open(region)!
+    for key in 0u32..4 {
+        core.assert(holds(&mut store, key, 59))
+    }
+    core.assert(chip.violations == 0 && chip.programs > 100 && chip.sector_erases > 0)
+}
+
+// Run updates on a store over the chip until the power is cut after
+// `budget` changed bytes, then bring it back, reopen, and check that every
+// key holds its last or its new version. False if the run ended before the
+// cut.
+fn power_cut(budget: u32) -> bool {
+    memory := [0u8; 65536]
+    chip := w25q80(&mut memory)
+    flash := probed(&mut chip)
+    region := storage.Region.new(flash, 0, 4 * SECTOR)!
+    store := storage.Store.open(region)!
+    store.clear()!
+    versions := [0u32; 4]
+    buffer := [0u8; 64]
+    for key in 0u32..4 {
+        length := value_of(key, 0, &mut buffer)
+        store.set(key_name(key), &buffer[..length])!
+    }
+    chip.cut_power_after(budget)
+    cut := false
+    pending := 0u32
+    for step in 0u32..120 {
+        key := step % 4
+        version := versions[key as usize] + 1
+        length := value_of(key, version, &mut buffer)
+        match store.set(key_name(key), &buffer[..length]) {
+            ok() => {
+                versions[key as usize] = version
+            }
+            err(error) => {
+                core.assert(chip.off)
+                cut = true
+                pending = key
+                break
+            }
+        }
+    }
+    chip.restore_power()
+    region = store.release()
+    store = storage.Store.open(region)!
+    for key in 0u32..4 {
+        current := versions[key as usize]
+        kept := holds(&mut store, key, current)
+        if cut && key == pending {
+            kept = kept || holds(&mut store, key, current + 1)
+        }
+        core.assert(kept)
+    }
+    // The store goes on working.
+    length := value_of(3, 1000, &mut buffer)
+    store.set(key_name(3), &buffer[..length])!
+    core.assert(holds(&mut store, 3, 1000))
+    return cut
+}
+
+fn power_cuts() {
+    cuts := 0u32
+    budget := 1u32
+    for budget < 20000 {
+        if power_cut(budget) {
+            cuts += 1
+        }
+        budget = budget * 3 / 2 + 7
+    }
+    core.assert(cuts > 10)
+}
+
+fn release_gives_back_the_bus_and_pin() {
+    memory := [0u8; 65536]
+    chip := w25q80(&mut memory)
+    flash := probed(&mut chip)
+    pieces := flash.release()
+    let (bus, pin) = pieces
+    again := spi_nor.Flash.new(bus, pin)!
+    core.assert(again.capacity() == 1024 * 1024)
+}
+
+fn main() {
+    probing()
+    probing_by_id()
+    naming_the_size()
+    new_reports_a_missing_chip()
+    probing_by_sfdp()
+    reads_writes_and_erases()
+    waiting_and_refusals()
+    power_down_and_reset()
+    four_byte_addresses()
+    store_on_the_chip()
+    power_cuts()
+    release_gives_back_the_bus_and_pin()
+}

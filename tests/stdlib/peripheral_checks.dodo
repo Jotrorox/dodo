@@ -3100,13 +3100,13 @@ fn rp_pin_assignments() {
     // from GPIO 24.
     pins := rp_pins.spi_pins(18, 19, some(16u32))!
     core.assert_eq(pins.controller, 0u32)
-    core.assert_eq(pins.mask, 0xD_0000u32)
+    core.assert_eq(pins.mask, 0xD_0000u64)
     core.assert_eq(rx_pin(pins), 16u32)
     pins = rp_pins.spi_pins(10, 11, some(12u32))!
     core.assert_eq(pins.controller, 1u32)
     pins = rp_pins.spi_pins(26, 27, none)!
     core.assert_eq(pins.controller, 1u32)
-    core.assert_eq(pins.mask, 0xC00_0000u32)
+    core.assert_eq(pins.mask, 0xC00_0000u64)
     core.assert_eq(rx_pin(pins), rp_pins.PIN_COUNT)
     pins = rp_pins.spi_pins(2, 7, some(20u32))!
     core.assert_eq(pins.controller, 0u32)
@@ -3114,7 +3114,17 @@ fn rp_pin_assignments() {
     expect_invalid_spi(rp_pins.spi_pins(18, 11, none))
     expect_invalid_spi(rp_pins.spi_pins(18, 19, some(17u32)))
     expect_invalid_spi(rp_pins.spi_pins(18, 19, some(8u32)))
-    expect_invalid_spi(rp_pins.spi_pins(30, 31, none))
+    expect_invalid_spi(rp_pins.spi_pins(46, 48, none))
+    // The RP2350B's GPIO 30 to 47 continue the pattern: SPI1 up to 31,
+    // SPI0 from 32 to 39, SPI1 from 40 to 47.
+    pins = rp_pins.spi_pins(30, 31, none)!
+    core.assert_eq(pins.controller, 1u32)
+    pins = rp_pins.spi_pins(34, 35, some(32u32))!
+    core.assert(pins.controller == 0 && pins.mask == (0xDu64 << 32))
+    pins = rp_pins.spi_pins(46, 47, some(44u32))!
+    core.assert(pins.controller == 1 && pins.mask == (0xDu64 << 44))
+    expect_invalid_spi(rp_pins.spi_pins(38, 43, none))
+    expect_invalid_spi(rp_pins.spi_pins(42, 43, some(32u32)))
 
     // UART pins come in groups of four, TX first and RX second: UART0,
     // UART1 twice, UART0 twice, UART1 twice, and UART0 on GPIO 28 and 29.
@@ -3133,8 +3143,21 @@ fn rp_pin_assignments() {
     expect_invalid_uart(rp_pins.uart_pins(20, some(17u32)))
     expect_invalid_uart(rp_pins.uart_pins(0, some(2u32)))
     expect_invalid_uart(rp_pins.uart_pins(2, none))
-    expect_invalid_uart(rp_pins.uart_pins(32, none))
-    expect_invalid_uart(rp_pins.uart_pins(28, some(33u32)))
+    expect_invalid_uart(rp_pins.uart_pins(48, none))
+    expect_invalid_uart(rp_pins.uart_pins(36, some(33u32)))
+    // Above GPIO 29 (the RP2350B): UART0 from 28 to 35 and 44 to 47, UART1
+    // from 36 to 43.
+    uart = rp_pins.uart_pins(32, some(33u32))!
+    core.assert(uart.controller == 0 && uart.mask == (0x3u64 << 32))
+    uart = rp_pins.uart_pins(28, some(33u32))!
+    core.assert_eq(uart.controller, 0u32)
+    uart = rp_pins.uart_pins(40, some(37u32))!
+    core.assert_eq(uart.controller, 1u32)
+    uart = rp_pins.uart_pins(44, some(45u32))!
+    core.assert_eq(uart.controller, 0u32)
+    core.assert_eq(rp_pins.i2c_controller(46, 47)!, 1u32)
+    core.assert_eq(rp_pins.i2c_controller(32, 45)!, 0u32)
+    expect_invalid(rp_pins.i2c_controller(48, 49))
 
     // Flow control pins: CTS third and RTS fourth in the group, on the
     // same UART, which need not be the TX and RX pins' group.
@@ -3155,7 +3178,7 @@ fn rp_pin_assignments() {
     aux = rp_pins.uart_aux_pins(26, some(9u32))!
     core.assert(aux.controller == 1 && aux.mask == 0x400_0200 && aux.aux == 0x400_0000)
     aux = rp_pins.uart_aux_pins(0, some(1u32))!
-    core.assert_eq(aux.aux, 0u32)
+    core.assert_eq(aux.aux, 0u64)
     expect_invalid_uart(rp_pins.uart_aux_pins(1, none))
     expect_invalid_uart(rp_pins.uart_aux_pins(2, some(2u32)))
     expect_invalid_uart(rp_pins.uart_aux_pins(2, some(7u32)))
@@ -3163,12 +3186,24 @@ fn rp_pin_assignments() {
 
     // SPI chip selects: the second pin of each group of four, in the
     // controller's blocks.
-    core.assert_eq(rp_pins.spi_select_pin(0, 17)!, 1u32 << 17)
-    core.assert_eq(rp_pins.spi_select_pin(1, 29)!, 1u32 << 29)
-    core.assert_eq(rp_pins.spi_select_pin(0, 1)!, 2u32)
+    core.assert_eq(rp_pins.spi_select_pin(0, 17)!, 1u64 << 17)
+    core.assert_eq(rp_pins.spi_select_pin(1, 29)!, 1u64 << 29)
+    core.assert_eq(rp_pins.spi_select_pin(0, 1)!, 2u64)
+    core.assert_eq(rp_pins.spi_select_pin(0, 33)!, 1u64 << 33)
+    core.assert_eq(rp_pins.spi_select_pin(1, 45)!, 1u64 << 45)
     expect_invalid(rp_pins.spi_select_pin(0, 9))
     expect_invalid(rp_pins.spi_select_pin(1, 16))
-    expect_invalid(rp_pins.spi_select_pin(0, 33))
+    expect_invalid(rp_pins.spi_select_pin(0, 41))
+    expect_invalid(rp_pins.spi_select_pin(1, 49))
+
+    // Flow control and UART_AUX pins above GPIO 29.
+    high_flow := rp_pins.uart_flow_pins(44, 45, 46, 47)!
+    core.assert(high_flow.controller == 0 && high_flow.mask == (0xFu64 << 44))
+    expect_invalid_uart(rp_pins.uart_flow_pins(44, 45, 42, 43))
+    high_aux := rp_pins.uart_aux_pins(30, some(47u32))!
+    core.assert(high_aux.controller == 0 && high_aux.aux == ((1u64 << 30) | (1u64 << 47)))
+    high_aux = rp_pins.uart_aux_pins(38, some(43u32))!
+    core.assert(high_aux.controller == 1 && high_aux.aux == ((1u64 << 38) | (1u64 << 43)))
 }
 
 // --- The RP PWM block ------------------------------------------------------
@@ -3177,8 +3212,11 @@ fn rp_pin_assignments() {
 // Every Channel reaches the one block through its own PwmView, as on the
 // chip, where each holds a register block at the same base. Registers are
 // stored by word, slice * 5 + offset / 4: CSR, DIV, CTR, CC, and TOP.
-const PWM_WORDS: usize = 40
-static mut PWM_REGISTERS: [40]u32 = [0u32; 40]
+// The eight slices' registers, then EN, INTR (write one to clear), and
+// INTE at words 40 to 42.
+const PWM_WORDS: usize = 43
+const PWM_INTR_WORD: usize = 41
+static mut PWM_REGISTERS: [43]u32 = [0u32; 43]
 // Writes through the plain address of a compare register, which would
 // overwrite the other output's half.
 static mut PLAIN_COMPARE_WRITES: u32 = 0
@@ -3190,7 +3228,7 @@ struct PwmView: hal.Registers {
         unsafe {
             value := PWM_REGISTERS[word]
             // The counter advances between reads while the slice runs.
-            if word % 5 == 2 && (PWM_REGISTERS[word - 2] & 1) != 0 {
+            if word < 40 && word % 5 == 2 && (PWM_REGISTERS[word - 2] & 1) != 0 {
                 PWM_REGISTERS[word] = (value + 1) % (PWM_REGISTERS[word + 2] + 1)
             }
             return value
@@ -3202,8 +3240,13 @@ struct PwmView: hal.Registers {
         word := (offset & 0xFFF) / 4
         core.assert(word < PWM_WORDS)
         unsafe {
+            if word == PWM_INTR_WORD {
+                core.assert(alias == 0)
+                PWM_REGISTERS[word] &= ~value
+                return
+            }
             current := PWM_REGISTERS[word]
-            if word % 5 == 3 && alias == 0 {
+            if word < 40 && word % 5 == 3 && alias == 0 {
                 PLAIN_COMPARE_WRITES += 1
             }
             if alias == 0 {
@@ -3217,7 +3260,9 @@ struct PwmView: hal.Registers {
             }
             // CSR has 8 bits, DIV 12, the counter and TOP 16.
             register := word % 5
-            if register == 0 {
+            if word >= 40 {
+                current &= 0xFF
+            } else if register == 0 {
                 current &= 0xFF
             } else if register == 1 {
                 current &= 0xFFF
@@ -3365,7 +3410,7 @@ fn pwm_channels() {
         rp_pwm.Channel.new(PwmView {}, 20, rp_pwm.timing(CLOCK_HZ, 1000)!)
     }, hal.Error.Busy)
     expect_pwm_error(unsafe {
-        rp_pwm.Channel.new(PwmView {}, 30, rp_pwm.timing(CLOCK_HZ, 1000)!)
+        rp_pwm.Channel.new(PwmView {}, 48, rp_pwm.timing(CLOCK_HZ, 1000)!)
     }, hal.Error.InvalidInput)
 
     // Released, B holds its output low and the slice keeps running for A,
@@ -3565,8 +3610,10 @@ fn adc_inputs() {
 
 // What the bank asked of the chip: each pin's function and pad bits, resets
 // pulsed, and controllers held in reset, one bit each.
-static mut FUNCTIONS: [30]u32 = [0u32; 30]
-static mut PADS: [30]u32 = [0u32; 30]
+static mut FUNCTIONS: [48]u32 = [0u32; 48]
+static mut PADS: [48]u32 = [0u32; 48]
+// The fake chip's GPIOs: 30, or the RP2350B's 48.
+static mut PIN_TOTAL: u32 = 30
 static mut RESETS: u32 = 0
 static mut HELD: u32 = 0
 static mut FAIL_RESET: bool = false
@@ -3598,6 +3645,12 @@ const UART0_DATA: usize = 64 * 4
 const UART1_DATA: usize = 64 * 5
 
 struct FakeChip {
+    pub fn pin_count(&self) -> u32 {
+        unsafe {
+            return PIN_TOTAL
+        }
+    }
+
     pub fn route(&mut self, pin: u32, function: u32, clear: u32, set: u32) {
         unsafe {
             FUNCTIONS[pin as usize] = function
@@ -3656,8 +3709,19 @@ struct FakeChip {
     }
 
     // PWM inputs are checked in pwm_capture_checks.dodo.
+    // 12 slices, as on the RP2350, when the chip has the RP2350B's GPIOs,
+    // whose PWM outputs are slices 8 to 11.
     pub fn pwm_slices(&self) -> u32 {
+        unsafe {
+            if PIN_TOTAL > 32 {
+                return 12
+            }
+        }
         return 8
+    }
+
+    pub fn pwm_irq(&self) -> u32 {
+        return 4
     }
 
     pub fn timer_base(&self) -> usize {
@@ -3706,8 +3770,9 @@ fn rp_bank() {
     bank := unsafe {
         rp_pins.Bank.new(FakeChip {})
     }
+    core.assert_eq(bank.pin_count(), 30u32)
     led := bank.gpio(25)!
-    core.assert_eq(led, 1u32 << 25)
+    core.assert_eq(led, 1u64 << 25)
     core.assert_eq(function(25), SIO)
     expect_busy(bank.gpio(25))
     expect_invalid(bank.gpio(30))
@@ -3898,6 +3963,60 @@ fn rp_bank() {
     core.assert(function(13) == DISCONNECTED && function(17) == DISCONNECTED)
 }
 
+// The RP2350B's GPIO 30 to 47: refused by a chip with 30 GPIOs, and
+// claimed, routed, and given back on one with 48, alone and as buses.
+fn rp_bank_high_pins() {
+    unsafe {
+        PIN_TOTAL = 30
+    }
+    bank := unsafe {
+        rp_pins.Bank.new(FakeChip {})
+    }
+    expect_invalid(bank.gpio(30))
+    expect_invalid(bank.i2c(32, 33, hal.I2C_FAST_HZ))
+    // GPIO 28 exists but 33 does not: nothing is taken.
+    expect_invalid(bank.uart(28, some(33u32), 115_200))
+    expect_invalid(bank.pwm(40, 1000))
+    expect_invalid(bank.pwm_input(41, 1000))
+    core.assert_eq(bank.taken(), 0u64)
+
+    unsafe {
+        PIN_TOTAL = 48
+    }
+    core.assert_eq(bank.pin_count(), 48u32)
+    top := bank.gpio(47)!
+    core.assert(top == 1u64 << 47 && function(47) == SIO && bank.taken() == top)
+    expect_invalid(bank.gpio(48))
+    expect_busy(bank.gpio(47))
+    i2c := bank.i2c(32, 33, hal.I2C_FAST_HZ)!
+    core.assert(function(32) == 3 && function(33) == 3)
+    expect_busy(bank.i2c(36, 37, hal.I2C_FAST_HZ))
+    serial := bank.uart(44, some(45u32), 115_200)!
+    core.assert(function(44) == UART && function(45) == UART)
+    unsafe {
+        core.assert((PADS[45] & PULL_UP) != 0)
+    }
+    spi := bank.spi(42, 43, some(40u32), hal.SpiMode.Mode0, 1_000_000)!
+    core.assert(function(40) == 1 && function(42) == 1 && function(43) == 1)
+    expect_busy(bank.spi(46, 47, none, hal.SpiMode.Mode0, 1_000_000))
+    // Slices 8 to 11 serve GPIO 32 to 47, GPIO n and n + 8 one output.
+    core.assert(rp_pwm.slice_of(31) == 7 && rp_pwm.slice_of(32) == 8 && rp_pwm.slice_of(40) == 8 && rp_pwm.slice_of(47) == 11)
+    output := bank.pwm(38, 1000)!
+    core.assert(output.slice() == 11 && output.output() == 0 && function(38) == PWM_FUNCTION)
+    expect_pwm_busy(bank.pwm(46, 1000))
+    bank.release_pwm(output)
+    bank.release_spi(spi)
+    bank.release_uart(serial)
+    bank.release_i2c(i2c)
+    core.assert(function(32) == DISCONNECTED && function(40) == DISCONNECTED && function(45) == DISCONNECTED && function(38) == DISCONNECTED)
+    core.assert_eq(bank.taken(), top)
+    bank.release_gpio(top)
+    core.assert(function(47) == DISCONNECTED && bank.taken() == 0)
+    unsafe {
+        PIN_TOTAL = 30
+    }
+}
+
 const PWM_FUNCTION: u32 = 4
 const INPUT_ENABLE: u32 = 1 << 6
 const OUTPUT_DISABLE: u32 = 1 << 7
@@ -4036,22 +4155,24 @@ fn rp_bank_pwm_and_adc() {
     }
 }
 
-// The UART pin rules exhaustively, and a claim whose reset fails.
+// The UART pin rules exhaustively, up to the RP2350B's GPIO 47, and a
+// claim whose reset fails.
 fn rp_bank_uart_rules() {
-    for tx in 0u32..30 {
-        for rx in 0u32..30 {
-            valid := tx % 4 == 0 && rx % 4 == 1 && ((tx + 4) / 8) % 2 == ((rx + 4) / 8) % 2
+    for tx in 0u32..50 {
+        for rx in 0u32..50 {
+            exists := tx < rp_pins.MAX_PIN_COUNT && rx < rp_pins.MAX_PIN_COUNT
+            valid := exists && tx % 4 == 0 && rx % 4 == 1 && ((tx + 4) / 8) % 2 == ((rx + 4) / 8) % 2
             match rp_pins.uart_pins(tx, some(rx)) {
                 ok(pins) => {
                     core.assert(valid)
                     core.assert_eq(pins.controller, ((tx + 4) / 8) % 2)
-                    core.assert_eq(pins.mask, (1u32 << tx) | (1u32 << rx))
+                    core.assert_eq(pins.mask, rp_pins.pin_bit(tx) | rp_pins.pin_bit(rx))
                 }
                 err(error) => {
                     core.assert(!valid && error == hal.Error.InvalidInput)
                 }
             }
-            aux_valid := (tx % 4 == 0 || tx % 4 == 2) && (rx % 4 == 1 || rx % 4 == 3) && ((tx + 4) / 8) % 2 == ((rx + 4) / 8) % 2
+            aux_valid := exists && (tx % 4 == 0 || tx % 4 == 2) && (rx % 4 == 1 || rx % 4 == 3) && ((tx + 4) / 8) % 2 == ((rx + 4) / 8) % 2
             match rp_pins.uart_aux_pins(tx, some(rx)) {
                 ok(pins) => {
                     core.assert(aux_valid)
@@ -4158,7 +4279,7 @@ fn pio_program(words: &[u16], origin: u32) -> rp_pio.Program {
         instructions[index] = words[index]
     }
     length := words.len as u32
-    return rp_pio.Program { instructions, length, origin, wrap_target: 0, wrap: length - 1, side_set_count: 0, side_set_optional: false, side_set_pindirs: false, version: 0, clock_divider: 256, fifo: rp_pio.FIFO_TXRX, status_select: 0, status_n: 0, in_count: 32, in_right: true, autopush: false, push_threshold: 32, out_count: 0, out_right: true, autopull: false, pull_threshold: 32, set_count: 0 }
+    return rp_pio.Program { instructions, length, origin, wrap_target: 0, wrap: length - 1, side_set_count: 0, side_set_optional: false, side_set_pindirs: false, version: 0, clock_divider: 256, fifo: rp_pio.FIFO_TXRX, status_select: 0, status_n: 0, in_count: 32, in_right: true, autopush: false, push_threshold: 32, out_count: 0, out_right: true, autopull: false, pull_threshold: 32, set_count: 0, gpio_ranges: 0 }
 }
 
 fn expect_failure(result: void!hal.Error, expected: hal.Error) {
@@ -4442,6 +4563,100 @@ fn pio_machines_and_interrupts() {
     older := pio_block(1, 0)
     older.listen(1, rp_pio.flag(3) | rp_pio.flag(4))
     core.assert(pio_word(1, 0x138 + SET) == 0x800 && older.irq(1) == 10)
+}
+
+// A block's GPIO window: 0 to 31, or on the RP2350 16 to 47 through
+// GPIOBASE. Pin mappings, pins set through a state machine, input sync
+// bypass, and `wait gpio` translate absolute GPIO numbers into it.
+fn pio_windows() {
+    pio := pio_block(2, 1)
+    core.assert_eq(pio.gpio_base(), 0u32)
+    expect_failure(pio.set_gpio_base(8), hal.Error.InvalidInput)
+    pio.set_gpio_base(rp_pio.HIGH_GPIO_BASE)!
+    core.assert(pio.gpio_base() == 16 && pio_word(2, 0x168) == 16)
+    // `wait 0 gpio 20` and `wait 1 gpio 40` hold 20 and 8; in the upper
+    // window they become 4 and 24.
+    waits := [0x2014u16, 0x2088]
+    program := pio_program(&waits, rp_pio.ANYWHERE)
+    program.gpio_ranges = rp_pio.GPIOS_16_TO_31 | rp_pio.GPIOS_32_TO_47
+    program.version = 1
+    loaded := pio.load(&program)!
+    core.assert(pio_word(2, PIO_INSTR_MEM + 4 * 30) == 0x2004 && pio_word(2, PIO_INSTR_MEM + 4 * 31) == 0x2098)
+    core.assert(loaded.gpio_base() == 16)
+    // The window is fixed while a program is loaded.
+    expect_failure(pio.set_gpio_base(0), hal.Error.Busy)
+    config := loaded.config()
+    core.assert_eq(config.gpio_base(), 16u32)
+    config.set_out_pins(40, 8)!
+    config.set_set_pins(16, 5)!
+    config.set_in_pins(47)!
+    config.set_sideset_pins(32)!
+    config.set_jmp_pin(20)!
+    expect_failure(config.set_out_pins(15, 1), hal.Error.InvalidInput)
+    expect_failure(config.set_in_pins(48), hal.Error.InvalidInput)
+    expect_failure(config.set_jmp_pin(3), hal.Error.InvalidInput)
+    machine := pio.state_machine(3)!
+    core.assert_eq(machine.gpio_base(), 16u32)
+    machine.init(&config)
+    sm3 := 0x0C8usize + 3 * 0x18
+    core.assert_eq(pio_word(2, sm3 + 0x14), (8u32 << 20) | (31u32 << 15) | (16u32 << 10) | (5u32 << 26) | 24)
+    core.assert_eq((pio_word(2, sm3 + 4) >> 24) & 0x1F, 4u32)
+    // Pins set through the machine: the last `set pins` maps SET to GPIO
+    // 41, local pin 25, which the mapping restored afterwards hides; the
+    // executed instruction shows its level.
+    machine.set_pins(40, 2, 0b10)
+    core.assert(pio_word(2, sm3 + 0x10) == 0xE001 && pio_word(2, sm3 + 0x14) == ((8u32 << 20) | (31u32 << 15) | (16u32 << 10) | (5u32 << 26) | 24))
+    pio.bypass_input_sync(40, true)
+    core.assert_eq(pio_word(2, PIO_SYNC_BYPASS + SET), 1u32 << 24)
+    pio.release_state_machine(machine)
+    pio.unload(loaded)
+    // GPIO 0 to 15 lie outside the upper window, 32 to 47 outside the lower.
+    program.gpio_ranges = rp_pio.GPIOS_0_TO_15
+    expect_invalid(pio.load(&program))
+    pio.set_gpio_base(0)!
+    core.assert(pio.gpio_base() == 0 && pio_word(2, 0x168) == 0)
+    program.gpio_ranges = rp_pio.GPIOS_32_TO_47
+    expect_invalid(pio.load(&program))
+    program.gpio_ranges = rp_pio.GPIOS_0_TO_15 | rp_pio.GPIOS_16_TO_31
+    low := pio.load(&program)!
+    lower := low.config()
+    core.assert(pio_word(2, PIO_INSTR_MEM + 4 * 30) == 0x2014 && lower.gpio_base() == 0)
+    expect_failure(lower.set_in_pins(32), hal.Error.InvalidInput)
+    pio.unload(low)
+    // The RP2040's PIO has no GPIOBASE: its window stays at GPIO 0.
+    older := pio_block(0, 0)
+    expect_failure(older.set_gpio_base(rp_pio.HIGH_GPIO_BASE), hal.Error.Unsupported)
+    older.set_gpio_base(0)!
+    core.assert(older.gpio_base() == 0 && pio_word(0, 0x168) == 0)
+}
+
+// The bank gives a block only pins in its window.
+fn rp_bank_pio_windows() {
+    unsafe {
+        PIN_TOTAL = 48
+    }
+    bank := unsafe {
+        rp_pins.Bank.new(FakeChip {})
+    }
+    pio := bank.pio(2)!
+    // GPIO 30 to 33 cross the lower window's end.
+    expect_failure(bank.pio_pins(&pio, 30, 4), hal.Error.InvalidInput)
+    expect_failure(bank.pio_pins(&pio, 40, 9), hal.Error.InvalidInput)
+    bank.pio_pins(&pio, 20, 2)!
+    // GPIO 20 and 21 suit both windows, so the window can move.
+    pio.set_gpio_base(rp_pio.HIGH_GPIO_BASE)!
+    bank.pio_pins(&pio, 40, 8)!
+    core.assert(function(40) == PIO_FUNCTION + 2 && function(47) == PIO_FUNCTION + 2 && function(20) == PIO_FUNCTION + 2)
+    expect_failure(bank.pio_pins(&pio, 10, 2), hal.Error.InvalidInput)
+    // Pins the block has must stay in the window: moving it back leaves
+    // GPIO 40 to 47 outside, so further pins are refused.
+    pio.set_gpio_base(0)!
+    expect_failure(bank.pio_pins(&pio, 2, 1), hal.Error.InvalidInput)
+    bank.release_pio(pio)
+    core.assert(function(47) == DISCONNECTED && function(20) == DISCONNECTED && bank.taken() == 0)
+    unsafe {
+        PIN_TOTAL = 30
+    }
 }
 
 // The bank hands out each block once, out of reset, with the pins given to
@@ -4819,6 +5034,7 @@ fn main() {
     uart_panic_report()
     rp_pin_assignments()
     rp_bank()
+    rp_bank_high_pins()
     rp_bank_uart_rules()
     pwm_timing()
     pwm_channels()
@@ -4828,7 +5044,9 @@ fn main() {
     trng_generator()
     pio_loading()
     pio_configs()
+    pio_windows()
     pio_fifos()
     pio_machines_and_interrupts()
     rp_bank_pio()
+    rp_bank_pio_windows()
 }

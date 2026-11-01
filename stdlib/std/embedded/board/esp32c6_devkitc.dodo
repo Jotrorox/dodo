@@ -1,0 +1,190 @@
+package esp32c6_devkitc
+
+import "std/embedded/hal"
+import "std/embedded/chip/esp32c6"
+import "std/embedded/chip/esp_flash"
+import "std/embedded/chip/esp_rng"
+import "std/embedded/chip/esp_rtc"
+import "std/embedded/chip/esp_watchdog"
+
+// Espressif ESP32-C6-DevKitC-1: an ESP32-C6-WROOM-1 module with 8 MiB of
+// flash, an addressable RGB LED (WS2812) on GPIO 8, a BOOT button on GPIO 9,
+// and two USB-C connectors: one to the chip's own USB serial port, one to a
+// USB serial adapter on UART0's pins (GPIO 16 and 17). Build with
+// `board = "esp32c6_devkitc"` and import this package as
+// `std/embedded/board`, so the program also builds for other boards:
+//
+//     import "std/embedded/board"
+//
+//     fn main() {
+//         b := board.take()!
+//         for {
+//             b.led.toggle()
+//             b.timer.delay_ms(500)
+//         }
+//     }
+//
+// `dodo run` flashes the board through either connector and restarts it
+// into the new firmware: no button needs to be pressed.
+//
+// It follows the board contract described in std/embedded/hal. The headers
+// carry GPIO 0 to 15 and 18 to 23, and GPIO 16 and 17; GPIO 12 and 13 are
+// the USB connector's data lines, so `b.pins` refuses them. GPIO 8, 9, and
+// 15 are strapping pins: keep GPIO 9 high at reset, or the chip waits in
+// its download mode.
+
+pub const NAME: &str = "ESP32-C6-DevKitC-1"
+// The RGB LED's data line, and the BOOT button, low while pressed.
+pub const LED_PIN: u32 = 8
+pub const BUTTON_PIN: u32 = 9
+// The color the LED shows when `b.led` is on: a dim white, bright enough
+// to see and easy on the eyes.
+pub const LED_ON_COLOR: u32 = 0x10_10_10
+
+// The usual bus pins, from the free pins next to each other on the J1
+// header: I2C on GPIO 6 (SDA) and 7 (SCL), SPI on GPIO 2 (MISO), 4 (SCK),
+// and 5 (MOSI), with GPIO 3 free for a chip select, and a serial port on
+// GPIO 16 (TX) and 17 (RX), which the board's USB serial adapter connects
+// to its second USB connector:
+//
+//     i2c := b.pins.i2c(I2C_SDA_PIN, I2C_SCL_PIN, hal.I2C_FAST_HZ)!
+//     serial := b.pins.uart(UART_TX_PIN, some(UART_RX_PIN), 115_200)!
+//
+// Any other free pins carry the buses too, through the GPIO matrix.
+pub const I2C_SDA_PIN: u32 = 6
+pub const I2C_SCL_PIN: u32 = 7
+pub const SPI_RX_PIN: u32 = 2
+pub const SPI_SELECT_PIN: u32 = 3
+pub const SPI_CLOCK_PIN: u32 = 4
+pub const SPI_TX_PIN: u32 = 5
+pub const UART_TX_PIN: u32 = 16
+pub const UART_RX_PIN: u32 = 17
+
+pub struct Board {
+    // The RGB LED, an output pin that lights it in LED_ON_COLOR when high;
+    // `set_color` shows any color.
+    pub led: Led
+    // The remaining GPIOs, and the buses, serial ports, PWM outputs, ADC
+    // inputs, CAN controllers (`can`), I2S streams (`i2s_output`,
+    // `i2s_input`), and PWM inputs (`pwm_input`) on them; GPIO 8 is already
+    // taken by `led`.
+    pub pins: esp32c6.Pins
+    // The system timer: delay_us, delay_ms, now_us, and alarms.
+    pub timer: esp32c6.Timer
+    // The USB connector next to the RGB LED, marked USB: `serial()` opens
+    // the chip's own USB serial port, for printing over the USB cable.
+    pub usb: esp32c6.Usb
+    // The DMA channels: `channel()` claims one, for copies that run while
+    // the program does other work.
+    pub dma: esp32c6.Dma
+    // The random number generator: `fill(bytes)`, and hal.random_u32 and
+    // friends over it; fit for keys while no analog input is claimed.
+    pub rng: esp_rng.Rng
+    // The watchdog, stopped: `start(timeout_ms)`, `feed()`, `stop()`,
+    // `reset_reason()`, and scratch words that survive its reset.
+    pub watchdog: esp_watchdog.Watchdog
+    // The real-time clock: the LP timer, counting milliseconds through
+    // resets until the board loses power, with an alarm.
+    pub rtc: esp_rtc.Rtc
+    // The 8 MiB program flash: `region`, `last`, and `free` hand out the
+    // flash above the program, for std/embedded/storage.
+    pub flash: esp_flash.Flash
+    // Sleep modes, clock gating, and the dormant state, the
+    // std/embedded/power protocol; see esp32c6.Power.
+    pub power: esp32c6.Power
+}
+
+// Start the chip and claim the LED, off. A second call returns
+// hal.Error.Busy.
+pub fn take() -> Board!hal.Error {
+    chip := esp32c6.take()?
+    leds := chip.pins.ws2812(LED_PIN)?
+    let esp32c6.Peripherals { pins, timer, usb, dma, rng, watchdog, rtc, flash, power } = chip
+    led := Led { leds, color: LED_ON_COLOR, on: false }
+    led.set_low()
+    return ok(Board { led, pins, timer, usb, dma, rng, watchdog, rtc, flash, power })
+}
+
+// The board's RGB LED: an output pin, on when high, for the board contract
+// and portable code, and a color with `set_color`.
+pub struct Led: hal.OutputPin {
+    leds: esp32c6.Ws2812
+    color: u32
+    on: bool
+
+    // Light the LED in its color.
+    pub fn set_high(&mut self) {
+        self.on = true
+        self.show()
+    }
+
+    // Turn the LED off.
+    pub fn set_low(&mut self) {
+        self.on = false
+        self.show()
+    }
+
+    pub fn toggle(&mut self) {
+        self.on = !self.on
+        self.show()
+    }
+
+    // Whether the LED is on.
+    pub fn is_high(&self) -> bool {
+        return self.on
+    }
+
+    // Show `rgb`, a 0xRRGGBB color, and use it from now on when the LED is
+    // set high; 0 turns it off.
+    pub fn set_color(&mut self, rgb: u32) {
+        self.color = rgb & 0xFF_FFFF
+        self.on = self.color != 0
+        self.show()
+    }
+
+    // The color the LED shows when on.
+    pub fn color(&self) -> u32 {
+        return self.color
+    }
+
+    fn show(&mut self) {
+        colors: [1]u32 = [0]
+        if self.on {
+            colors[0] = self.color
+        }
+        // A transmission of 24 bits cannot fail once the driver is claimed;
+        // a timeout would only leave the LED as it was.
+        match self.leds.write(&colors) {
+            ok() => {}
+            err(_) => {}
+        }
+    }
+}
+
+// Write a failed check's message to every serial port claimed from
+// `b.pins.uart` and to the USB serial port, as the default panic hook does
+// before it halts. For a panic hook of your own, for example one that
+// restarts the board:
+//
+//     extern "C" fn dodo_board_panic(check: *const u8, file: *const u8, line: u32, column: u32) {
+//         unsafe {
+//             board.report_panic(check, file, line, column)
+//         }
+//         esp32c6.restart()
+//     }
+//
+// SAFETY: `check` and `file` must be the hook's NUL-terminated strings, and
+// the caller must halt or reset afterwards, as this takes over the ports.
+pub unsafe fn report_panic(check: *const u8, file: *const u8, line: u32, column: u32) {
+    unsafe {
+        esp32c6.report_panic(check, file, line, column)
+    }
+}
+
+// Restart into the boot ROM's download mode, as if BOOT were held at
+// reset: the board waits for a flasher on both USB connectors. `dodo run`
+// resets the board into that mode by itself, so this is rarely needed.
+// Does not return.
+pub fn reboot_to_bootloader() {
+    esp32c6.reboot_to_bootloader()
+}

@@ -3,7 +3,8 @@ package power
 import "std/embedded/hal"
 
 // Low power for firmware: what a core does while it waits, which clocks run,
-// and stopping the chip entirely until a pin wakes it. Every chip package
+// and stopping the chip entirely until a pin or a timeout wakes it. Every
+// chip package
 // implements the `Power` protocol below, a board hands it out as
 // `Board.power`, and `std/embedded/hal/fake.Power` implements it on a
 // desktop, so power-aware code is written and tested once. Like
@@ -30,9 +31,13 @@ import "std/embedded/hal"
 //    deep-sleep, and the mode belongs to the core that sets it.
 // 3. Dormant. `dormant(&wake)` stops every oscillator, so nothing is
 //    clocked and the chip draws the least it can while keeping its memory,
-//    until one of the pin events in `wake` happens. The chip then restarts
-//    its clocks as they were and `dormant` returns the pins that woke it.
-//    Time does not pass for the chip's timers while it is dormant.
+//    until one of the pin events in `wake` happens or its timeout passes.
+//    The chip then restarts its clocks as they were and `dormant` returns
+//    what woke it: the pins, and BY_TIME for the timeout. Time does not pass
+//    for the chip's microsecond timers while it is dormant; a timeout is
+//    counted by a slow clock that keeps running, such as a real-time clock
+//    fed from outside, so it needs the chip set up for that (the chip
+//    package says how).
 //
 // Clock gating. Apart from sleeping, a chip stops the clocks of peripherals
 // that nothing uses. Clocks are a `Clocks` set of up to 64 gates; the chip
@@ -73,22 +78,30 @@ const ALL_EVENTS: u32 = 0xF
 
 // The pins a `Wake` can name, 0 to MAX_PINS - 1. Chips with fewer refuse
 // the others in `dormant`.
-pub const MAX_PINS: u32 = 64
+pub const MAX_PINS: u32 = 63
 
-// The pin events that end a dormant state:
+// The bit of a `dormant` result that says the wake's timeout ended it. The
+// other bits are pins, bit n for pin n, below MAX_PINS.
+pub const BY_TIME: u64 = 1u64 << 63
+
+// The pin events, and the timeout, that end a dormant state:
 //
 //     wake := power.Wake.new()
 //     wake.on(BUTTON_PIN, power.FALLING_EDGE)
+//     wake.after_ms(60_000)
 //     woken := b.power.dormant(&wake)!
+//     if power.by_time(woken) { ... }
 //
 // Claim each pin as an input first, with the pull it needs, so its level is
 // defined while the chip is dormant.
 pub struct Wake {
     events: [64]u8
+    // The timeout in milliseconds, 0 for none.
+    timeout: u64
 
-    // No pins yet.
+    // No pins and no timeout yet.
     pub fn new() -> Wake {
-        return Wake { events: [0u8; 64] }
+        return Wake { events: [0u8; 64], timeout: 0 }
     }
 
     // Also wake on `events` of `pin`, a combination of LEVEL_LOW,
@@ -115,6 +128,25 @@ pub struct Wake {
         return self.events[pin as usize] as u32
     }
 
+    // Also wake once `milliseconds` have passed, counted from the call to
+    // `dormant`, replacing an earlier timeout. A chip whose clock is coarser
+    // than a millisecond rounds it up, so the chip may wake later, never
+    // earlier. Traps for 0.
+    pub fn after_ms(&mut self, milliseconds: u64) {
+        core.assert(milliseconds != 0)
+        self.timeout = milliseconds
+    }
+
+    // Stop waking on a timeout.
+    pub fn forget_timeout(&mut self) {
+        self.timeout = 0
+    }
+
+    // The timeout in milliseconds, 0 for none.
+    pub fn timeout_ms(&self) -> u64 {
+        return self.timeout
+    }
+
     // The pins with events, bit n for pin n.
     pub fn pins(&self) -> u64 {
         pins := 0u64
@@ -126,9 +158,20 @@ pub struct Wake {
         return pins
     }
 
+    // True with neither pins nor a timeout, which nothing could end.
     pub fn is_empty(&self) -> bool {
-        return self.pins() == 0
+        return self.pins() == 0 && self.timeout == 0
     }
+}
+
+// Whether the `dormant` result `woken` says the timeout ended it.
+pub fn by_time(woken: u64) -> bool {
+    return (woken & BY_TIME) != 0
+}
+
+// The pins of the `dormant` result `woken`, without BY_TIME.
+pub fn woken_pins(woken: u64) -> u64 {
+    return woken & ~BY_TIME
 }
 
 // A chip's low-power controls. Chip packages implement it, boards hand it
@@ -166,13 +209,15 @@ pub interface Power {
     // ignored.
     fn set_sleep_clocks(&mut self, clocks: Clocks)
 
-    // Stop every oscillator until one of `wake`'s events, then restart the
-    // clocks and return the pins whose events woke the chip, bit n for pin
-    // n: none if a level ended before the chip was running again. An edge
-    // or level present already ends it at once. InvalidInput if `wake` is
-    // empty or names a pin the chip lacks, Busy if a running peripheral
-    // cannot be stopped, such as a USB connection, Unsupported if the chip
-    // has no dormant state.
+    // Stop every oscillator until one of `wake`'s events or its timeout,
+    // then restart the clocks and return what woke the chip: the pins whose
+    // events did, bit n for pin n (none if a level ended before the chip was
+    // running again), and BY_TIME if the timeout passed. An edge or level
+    // present already ends it at once. InvalidInput if `wake` is empty or
+    // names a pin the chip lacks, Busy if a running peripheral cannot be
+    // stopped, such as a USB connection, or if the clock that would count
+    // the timeout has no time set, Unsupported if the chip has no dormant
+    // state, or for a timeout, no clock that runs while it is dormant.
     fn dormant(&mut self, wake: &Wake) -> u64!hal.Error
 }
 
@@ -192,6 +237,14 @@ pub fn deep_sleep<P: Power>(power: &mut P, keep: Clocks) {
 pub fn dormant_until<P: Power>(power: &mut P, pin: u32, events: u32) -> u64!hal.Error {
     wake := Wake.new()
     wake.on(pin, events)
+    return power.dormant(&wake)
+}
+
+// Dormant for `milliseconds`: `dormant` with only a timeout. Returns
+// BY_TIME once it has passed.
+pub fn dormant_for<P: Power>(power: &mut P, milliseconds: u64) -> u64!hal.Error {
+    wake := Wake.new()
+    wake.after_ms(milliseconds)
     return power.dormant(&wake)
 }
 

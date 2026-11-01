@@ -1,0 +1,505 @@
+package esp_power
+
+import "std/embedded/hal"
+import "std/embedded/power"
+
+// The low-power parts of the ESP32-C6, for std/embedded/chip/esp32c6's
+// std/embedded/power implementation: the peripheral clock gates, the power
+// management unit's (PMU) light sleep, GPIO wakeup, and the low-power
+// timer. Register names follow the ESP32-C6 technical reference manual and
+// Espressif's esp32c6 register descriptions.
+//
+// Clock gates. The system clock controller (PCR) gives each peripheral a
+// bus clock enable, bit 0 of its *_CONF register next to the reset, and
+// usually a function clock enable, bit 22 of its *_SCLK_CONF,
+// *_FUNC_CLK_CONF, or *_CLKM_CONF. Each enable is one gate, numbered in the
+// order of its register: gate n is bit n of a power.Clocks set, and the
+// chip package names the gates of each peripheral (esp32c6.CLOCK_UART0 is
+// gates 0 and 1). A gate counts as running only while all of its bits are
+// set.
+//
+// Light sleep. The PMU switches the high-performance (HP) system between
+// three states, HP_ACTIVE, HP_MODEM, and HP_SLEEP, each with its own power,
+// clock, and regulator configuration. Writing SLP_WAKEUP_CNTL0.SLEEP_REQ
+// makes it enter HP_SLEEP: it stalls the CPU, gates every HP clock (the
+// state's ICG_HP_FUNC and ICG_HP_APB are 0), powers down the crystal, the
+// PLL, and the fast RC oscillator, and lowers the HP regulator to its sleep
+// voltage, keeping the CPU, SRAM, and every register. A wakeup source
+// enabled in SLP_WAKEUP_CNTL2 makes it return to HP_ACTIVE, restoring that
+// state's configuration, and the stalled CPU continues; a source already
+// active and enabled in SLP_WAKEUP_CNTL1 makes it reject the request
+// instead. INT_RAW tells which happened. `configure_sleep` writes the
+// sleep states as Espressif's light sleep does without its radios, and
+// keeps the flash's supply (VDD_SPI) on, so the program runs from flash
+// again at once.
+//
+// The functions take the register blocks as hal.Registers, so desktop
+// tests run them against simulated registers; the chip package passes
+// hal.RegisterBlocks.
+
+// One past the last gate.
+pub const GATE_COUNT: u32 = 57
+
+// Each gate's PCR register offset and enable bits, by gate number.
+const GATE_OFFSET: [57]usize = [0x000usize, 0x004, 0x00C, 0x010, 0x018, 0x020, 0x024, 0x028, 0x02C, 0x030, 0x034, 0x038, 0x03C, 0x040, 0x044, 0x048, 0x04C, 0x050, 0x054, 0x058, 0x05C, 0x060, 0x064, 0x068, 0x06C, 0x070, 0x078, 0x080, 0x084, 0x088, 0x08C, 0x090, 0x094, 0x098, 0x09C, 0x0A0, 0x0A4, 0x0A8, 0x0AC, 0x0B0, 0x0B4, 0x0BC, 0x0C0, 0x0C4, 0x0C8, 0x0CC, 0x0D0, 0x0D8, 0x0E0, 0x0E4, 0x0E8, 0x0EC, 0x0F0, 0x0FC, 0x100, 0x104, 0x108]
+const BUS: u32 = 1 << 0
+const FUNCTION: u32 = 1 << 22
+const GATE_MASK: [57]u32 = [BUS, FUNCTION, BUS, FUNCTION, (1u32 << 0) | (1u32 << 2), BUS, FUNCTION, BUS, BUS, FUNCTION, BUS, FUNCTION, BUS, FUNCTION, FUNCTION, BUS, FUNCTION, FUNCTION, BUS, FUNCTION, BUS, FUNCTION, BUS, FUNCTION, BUS, FUNCTION, FUNCTION, 1u32 << 2, FUNCTION, FUNCTION, BUS, BUS, BUS, BUS, BUS, FUNCTION, BUS, 1u32 << 18, 1u32 << 18, BUS, 0x1D, BUS, BUS, FUNCTION, BUS, BUS, BUS, BUS, BUS, BUS, BUS, FUNCTION, BUS, BUS, BUS, BUS, BUS]
+
+// The gates in `clocks` that run.
+pub fn enabled_clocks<R: hal.Registers>(pcr: &mut R, clocks: power.Clocks) -> power.Clocks {
+    running := 0u64
+    for gate in 0usize..57 {
+        bit := 1u64 << gate as u64
+        if (clocks & bit) != 0 {
+            mask := GATE_MASK[gate]
+            if (pcr.read(GATE_OFFSET[gate]) & mask) == mask {
+                running |= bit
+            }
+        }
+    }
+    return running
+}
+
+// Open the gates in `clocks`; bits past the last gate are ignored. Other
+// fields of the registers stay as they are.
+pub fn start_clocks<R: hal.Registers>(pcr: &mut R, clocks: power.Clocks) {
+    for gate in 0usize..57 {
+        if (clocks & (1u64 << gate as u64)) != 0 {
+            offset := GATE_OFFSET[gate]
+            value := pcr.read(offset) | GATE_MASK[gate]
+            pcr.write(offset, value)
+        }
+    }
+}
+
+// Close the gates in `clocks`.
+pub fn stop_clocks<R: hal.Registers>(pcr: &mut R, clocks: power.Clocks) {
+    for gate in 0usize..57 {
+        if (clocks & (1u64 << gate as u64)) != 0 {
+            offset := GATE_OFFSET[gate]
+            value := pcr.read(offset) & ~GATE_MASK[gate]
+            pcr.write(offset, value)
+        }
+    }
+}
+
+// --- Light sleep through the PMU ------------------------------------------
+
+// HP_ACTIVE as esp-hal's and ESP-IDF's start-up code (pmu_init's
+// HpSystemInit::active) leave it, for `init_active_state`: every HP power
+// domain on (HP_ACTIVE_DIG_POWER 0), every HP clock ungated
+// (HP_ACTIVE_ICG_HP_FUNC and _APB all ones), the radio domain's clock
+// gating code ACTIVE (2) in HP_ACTIVE_ICG_MODEM.DIG_ICG_MODEM_CODE.
+const HP_ACTIVE_DIG_POWER: usize = 0x000
+const HP_ACTIVE_ICG_HP_FUNC: usize = 0x004
+const HP_ACTIVE_ICG_HP_APB: usize = 0x008
+const HP_ACTIVE_ICG_MODEM: usize = 0x00C
+const ICG_MODEM_CODE_ACTIVE: u32 = 2u32 << 30
+// RF_PWC: the analog configuration bus's peripheral side powered
+// (XPD_PERIF_I2C) and out of reset (PERIF_I2C_RSTB).
+const RF_PWC: usize = 0x154
+const PERIF_I2C_ON: u32 = (1u32 << 26) | (1u32 << 27)
+// IMM_MODEM_ICG.UPDATE_DIG_ICG_MODEM_EN: apply the radio domain's gating
+// code now.
+const IMM_MODEM_ICG: usize = 0x0DC
+const UPDATE_MODEM_ICG: u32 = 1 << 31
+
+// Put the PMU's HP_ACTIVE state, which the chip runs in and returns to
+// after every PMU sleep, and the analog bus's power where ESP-IDF's and
+// esp-hal's start-up code put them. These registers are in the always-on
+// domain: a core reset, as `dodo run` does, keeps what an earlier program
+// left, and their power-up values power neither the PLL nor the bias and
+// gate the system clock, the radio domain's clocks, and the analog
+// configuration bus behind the ADC. The regulator settings are left as
+// they are; they are what the chip runs on. The radio domain's clock
+// gating maps must already allow the ACTIVE code (the chip package opens
+// them first), as this applies that code.
+pub fn init_active_state<R: hal.Registers>(pmu: &mut R) {
+    pmu.write(HP_ACTIVE_DIG_POWER, 0)
+    pmu.write(HP_ACTIVE_ICG_HP_FUNC, 0xFFFF_FFFF)
+    pmu.write(HP_ACTIVE_ICG_HP_APB, 0xFFFF_FFFF)
+    pmu.write(HP_ACTIVE_ICG_MODEM, ICG_MODEM_CODE_ACTIVE)
+    ck := pmu.read(HP_ACTIVE_HP_CK_POWER) | ACTIVE_CK_POWER
+    pmu.write(HP_ACTIVE_HP_CK_POWER, ck)
+    bias := pmu.read(HP_ACTIVE_BIAS) | ACTIVE_XPD_BIAS
+    pmu.write(HP_ACTIVE_BIAS, bias)
+    sysclk := pmu.read(HP_ACTIVE_SYSCLK) | ACTIVE_SYSCLK_ON
+    pmu.write(HP_ACTIVE_SYSCLK, sysclk)
+    xtal := pmu.read(HP_ACTIVE_XTAL) | ACTIVE_XPD_XTAL
+    pmu.write(HP_ACTIVE_XTAL, xtal)
+    rf := pmu.read(RF_PWC) | PERIF_I2C_ON
+    pmu.write(RF_PWC, rf)
+    pmu.write(IMM_MODEM_ICG, UPDATE_MODEM_ICG)
+    pmu.write(IMM_SLEEP_SYSCLK, UPDATE_ICG)
+}
+
+// HP_ACTIVE: the state the PMU returns to when the chip wakes. Its reset
+// values power neither the PLL nor the bias and gate the system clock, so
+// a wake with them leaves the chip without the clocks it runs on; ESP-IDF
+// and esp-hal set them at start-up, a bare boot does not.
+const HP_ACTIVE_HP_CK_POWER: usize = 0x014
+const HP_ACTIVE_BIAS: usize = 0x018
+const HP_ACTIVE_SYSCLK: usize = 0x024
+const HP_ACTIVE_XTAL: usize = 0x030
+// The PLL, its I2C interface, and the analog I2C bus powered.
+const ACTIVE_CK_POWER: u32 = (1u32 << 28) | (1u32 << 29) | (1u32 << 30)
+const ACTIVE_XPD_BIAS: u32 = 1 << 25
+// ICG_SYS_CLOCK_EN: the system clock runs.
+const ACTIVE_SYSCLK_ON: u32 = 1 << 27
+const ACTIVE_XPD_XTAL: u32 = 1 << 31
+// HP_SLEEP: power domains, clock gating, the digital system, the analog
+// supplies, and the crystal.
+const HP_SLEEP_DIG_POWER: usize = 0x068
+const HP_SLEEP_ICG_HP_FUNC: usize = 0x06C
+const HP_SLEEP_ICG_HP_APB: usize = 0x070
+const HP_SLEEP_HP_SYS_CNTL: usize = 0x078
+const HP_SLEEP_HP_CK_POWER: usize = 0x07C
+const HP_SLEEP_BIAS: usize = 0x080
+const HP_SLEEP_SYSCLK: usize = 0x08C
+const HP_SLEEP_HP_REGULATOR0: usize = 0x090
+const HP_SLEEP_HP_REGULATOR1: usize = 0x094
+const HP_SLEEP_XTAL: usize = 0x098
+// LP_SLEEP: the low-power system's state while the HP system sleeps.
+const LP_SLEEP_LP_REGULATOR0: usize = 0x0B4
+const LP_SLEEP_XTAL: usize = 0x0BC
+const LP_SLEEP_LP_DIG_POWER: usize = 0x0C0
+const LP_SLEEP_LP_CK_POWER: usize = 0x0C4
+const LP_SLEEP_BIAS: usize = 0x0C8
+const IMM_SLEEP_SYSCLK: usize = 0x0D0
+const SLP_WAKEUP_CNTL0: usize = 0x120
+const SLP_WAKEUP_CNTL1: usize = 0x124
+const SLP_WAKEUP_CNTL2: usize = 0x128
+const SLP_WAKEUP_CNTL3: usize = 0x12C
+const SLP_WAKEUP_CNTL4: usize = 0x130
+const SLP_WAKEUP_CNTL5: usize = 0x134
+const SLP_WAKEUP_CNTL7: usize = 0x13C
+const SLP_WAKEUP_STATUS0: usize = 0x140
+const INT_RAW: usize = 0x15C
+const INT_CLR: usize = 0x168
+const CLK_STATE0: usize = 0x194
+
+// HP_SLEEP_DIG_POWER: VDD_SPI_PD_EN powers the flash down, set at reset;
+// it stays on. The other fields keep their reset values: the radio (modem)
+// domain powers down (WIFI_PD_EN), the CPU, SRAM, and peripherals stay on.
+// The modem domain's registers return to their reset values, among them
+// the clock gating maps that the chip package opens again afterwards.
+const VDD_SPI_POWER_DOWN: u32 = 1 << 21
+// HP_SLEEP_HP_CK_POWER: isolate and keep the analog I2C bus, power the
+// PLL and its I2C interface down.
+const SLEEP_CK_POWER: u32 = (1u32 << 26) | (1u32 << 27) | (1u32 << 28)
+// HP_SLEEP_SYSCLK: the PMU selects the system clock (the crystal) and the
+// clock gating while asleep, and the system clock is gated.
+const SLEEP_SYSCLK: u32 = (1u32 << 28) | (1u32 << 29)
+// HP_SLEEP_HP_SYS_CNTL: wake on UART, pads in their sleep configuration
+// (only those whose IO MUX SLP_SEL is set change), watchdogs paused, CPU
+// stalled.
+const SLEEP_SYS_CNTL: u32 = (1u32 << 24) | (1u32 << 27) | (1u32 << 28) | (1u32 << 29)
+// HP_SLEEP_BIAS and LP_SLEEP_BIAS: bias current off, bias in sleep mode.
+const SLEEP_BIAS: u32 = (1u32 << 30) | (1u32 << 31)
+// HP_SLEEP_HP_REGULATOR0: regulator on at its 0.6 V sleep setting (DBIAS
+// 1), and LP_SLEEP_LP_REGULATOR0 at 0.7 V (DBIAS 12), as Espressif's light
+// sleep sets them once the crystal is off.
+const HP_SLEEP_REGULATOR: u32 = (1u32 << 27) | (1u32 << 18)
+const LP_SLEEP_REGULATOR: u32 = (12u32 << 27) | (1u32 << 22)
+// LP_SLEEP_LP_DIG_POWER: the LP memory in its retention mode.
+const LP_MEMORY_RETENTION: u32 = 1 << 30
+// IMM_SLEEP_SYSCLK.UPDATE_DIG_ICG_SWITCH hands the HP clock gating to the
+// PMU's states; without it the PMU never completes a sleep. The radio
+// domain's gating (IMM_MODEM_ICG) is left alone.
+const UPDATE_ICG: u32 = 1 << 28
+// SLP_WAKEUP_CNTL3: minimum sleeps of 61 slow clock cycles (450 us), and
+// sleep protection for both the HP and LP systems.
+const SLEEP_TIMING: u32 = 61u32 | (61u32 << 8) | (2u32 << 16)
+// SLP_WAKEUP_CNTL5.LP_ANA_WAIT_TARGET, slow clock cycles, and
+// SLP_WAKEUP_CNTL7.ANA_WAIT_TARGET, fast clock cycles: how long the
+// supplies settle before the systems run again, generous for the
+// 154 us both need.
+const LP_ANALOG_WAIT: u32 = 0x20 << 24
+const LP_ANALOG_WAIT_FIELD: u32 = 0xFF << 24
+const HP_ANALOG_WAIT: u32 = 0x1000 << 16
+const SLEEP_REQUEST: u32 = 1 << 31
+const REJECT_ENABLE: u32 = 1 << 31
+const REJECT_CAUSE_CLEAR: u32 = 1 << 31
+// INT_RAW and INT_CLR: the software, rejected, and woken interrupts.
+const INT_SOFTWARE: u32 = 1 << 29
+const INT_REJECTED: u32 = 1 << 30
+const INT_WOKEN: u32 = 1 << 31
+// CLK_STATE0.STABLE_XPD_BBPLL_STATE: the PLL runs and is stable.
+const PLL_STABLE: u32 = 1 << 0
+
+// Wakeup sources, for `sleep`'s masks and `wakeup_cause`.
+pub const WAKE_GPIO: u32 = 1 << 2
+pub const WAKE_LP_TIMER: u32 = 1 << 4
+
+// Polls before a PMU that does not answer is given up on.
+const ATTEMPTS: u32 = 10_000_000
+
+// Write the HP_SLEEP and LP_SLEEP states for a light sleep that keeps the
+// CPU, memory, and registers but stops the crystal, the PLL, and the fast
+// RC oscillator, as esp-hal's and ESP-IDF's light sleep do with the
+// radios off and the flash powered, and make the HP_ACTIVE state the chip
+// wakes into power the PLL, the crystal, and the bias and run the system
+// clock. `save_sleep_state` first, `restore_sleep_state` afterwards.
+pub fn configure_sleep<R: hal.Registers>(pmu: &mut R) {
+    ck := pmu.read(HP_ACTIVE_HP_CK_POWER) | ACTIVE_CK_POWER
+    pmu.write(HP_ACTIVE_HP_CK_POWER, ck)
+    bias := pmu.read(HP_ACTIVE_BIAS) | ACTIVE_XPD_BIAS
+    pmu.write(HP_ACTIVE_BIAS, bias)
+    sysclk := pmu.read(HP_ACTIVE_SYSCLK) | ACTIVE_SYSCLK_ON
+    pmu.write(HP_ACTIVE_SYSCLK, sysclk)
+    xtal := pmu.read(HP_ACTIVE_XTAL) | ACTIVE_XPD_XTAL
+    pmu.write(HP_ACTIVE_XTAL, xtal)
+    dig := pmu.read(HP_SLEEP_DIG_POWER)
+    pmu.write(HP_SLEEP_DIG_POWER, dig & ~VDD_SPI_POWER_DOWN)
+    pmu.write(HP_SLEEP_ICG_HP_FUNC, 0)
+    pmu.write(HP_SLEEP_ICG_HP_APB, 0)
+    pmu.write(HP_SLEEP_HP_SYS_CNTL, SLEEP_SYS_CNTL)
+    pmu.write(HP_SLEEP_HP_CK_POWER, SLEEP_CK_POWER)
+    pmu.write(HP_SLEEP_BIAS, SLEEP_BIAS)
+    pmu.write(HP_SLEEP_SYSCLK, SLEEP_SYSCLK)
+    pmu.write(HP_SLEEP_HP_REGULATOR0, HP_SLEEP_REGULATOR)
+    pmu.write(HP_SLEEP_HP_REGULATOR1, 0)
+    pmu.write(HP_SLEEP_XTAL, 0)
+    pmu.write(LP_SLEEP_LP_REGULATOR0, LP_SLEEP_REGULATOR)
+    pmu.write(LP_SLEEP_XTAL, 0)
+    pmu.write(LP_SLEEP_LP_DIG_POWER, LP_MEMORY_RETENTION)
+    pmu.write(LP_SLEEP_LP_CK_POWER, 0)
+    pmu.write(LP_SLEEP_BIAS, SLEEP_BIAS)
+    pmu.write(SLP_WAKEUP_CNTL3, SLEEP_TIMING)
+    wait := pmu.read(SLP_WAKEUP_CNTL5) & ~LP_ANALOG_WAIT_FIELD
+    pmu.write(SLP_WAKEUP_CNTL5, wait | LP_ANALOG_WAIT)
+    pmu.write(SLP_WAKEUP_CNTL7, HP_ANALOG_WAIT)
+    pmu.write(IMM_SLEEP_SYSCLK, UPDATE_ICG)
+}
+
+// The PMU registers `configure_sleep` and `sleep` write, so that a dormant
+// state leaves the always-on domain as it found it: what a core reset does
+// not reset outlives the program.
+const SAVED: [24]usize = [HP_ACTIVE_HP_CK_POWER, HP_ACTIVE_BIAS, HP_ACTIVE_SYSCLK, HP_ACTIVE_XTAL, HP_SLEEP_DIG_POWER, HP_SLEEP_ICG_HP_FUNC, HP_SLEEP_ICG_HP_APB, HP_SLEEP_HP_SYS_CNTL, HP_SLEEP_HP_CK_POWER, HP_SLEEP_BIAS, HP_SLEEP_SYSCLK, HP_SLEEP_HP_REGULATOR0, HP_SLEEP_HP_REGULATOR1, HP_SLEEP_XTAL, LP_SLEEP_LP_REGULATOR0, LP_SLEEP_XTAL, LP_SLEEP_LP_DIG_POWER, LP_SLEEP_LP_CK_POWER, LP_SLEEP_BIAS, SLP_WAKEUP_CNTL1, SLP_WAKEUP_CNTL2, SLP_WAKEUP_CNTL3, SLP_WAKEUP_CNTL5, SLP_WAKEUP_CNTL7]
+
+pub fn save_sleep_state<R: hal.Registers>(pmu: &mut R, saved: &mut[24]u32) {
+    for index in 0usize..24 {
+        saved[index] = pmu.read(SAVED[index])
+    }
+}
+
+pub fn restore_sleep_state<R: hal.Registers>(pmu: &mut R, saved: &[24]u32) {
+    for index in 0usize..24 {
+        pmu.write(SAVED[index], saved[index])
+    }
+}
+
+// Ask the PMU for a light sleep that `wake`'s sources end, or that it
+// rejects if one of `reject`'s is active already, and wait until it has
+// done either: true if the chip slept, false if the request was rejected.
+// The CPU stalls inside, on the poll of INT_RAW, while the chip sleeps.
+// Timeout if the PMU never answers.
+//
+// SAFETY: `configure_sleep` must have run, interrupts must be masked, the
+// system clock must run from the crystal, and nothing may use the PLL.
+pub unsafe fn sleep<R: hal.Registers>(pmu: &mut R, wake: u32, reject: u32) -> bool!hal.Error {
+    pmu.write(SLP_WAKEUP_CNTL2, wake)
+    reject_enable := 0u32
+    if reject != 0 {
+        reject_enable = REJECT_ENABLE
+    }
+    pmu.write(SLP_WAKEUP_CNTL1, reject_enable | (reject & ~REJECT_ENABLE))
+    pmu.write(SLP_WAKEUP_CNTL4, REJECT_CAUSE_CLEAR)
+    pmu.write(INT_CLR, INT_SOFTWARE | INT_REJECTED | INT_WOKEN)
+    pmu.write(SLP_WAKEUP_CNTL0, SLEEP_REQUEST)
+    for _ in 0..ATTEMPTS {
+        raw := pmu.read(INT_RAW)
+        if (raw & (INT_WOKEN | INT_REJECTED)) != 0 {
+            pmu.write(INT_CLR, INT_REJECTED | INT_WOKEN)
+            return ok((raw & INT_REJECTED) == 0)
+        }
+    }
+    return err(hal.Error.Timeout)
+}
+
+// The wakeup sources that ended the last sleep, as WAKE_ bits.
+pub fn wakeup_cause<R: hal.Registers>(pmu: &mut R) -> u32 {
+    return pmu.read(SLP_WAKEUP_STATUS0)
+}
+
+// Wait until the PLL runs stably again after a sleep. Timeout if it does
+// not.
+pub fn wait_for_pll<R: hal.Registers>(pmu: &mut R) -> void!hal.Error {
+    for _ in 0..ATTEMPTS {
+        if (pmu.read(CLK_STATE0) & PLL_STABLE) != 0 {
+            return ok()
+        }
+    }
+    return err(hal.Error.Timeout)
+}
+
+// LP_CLKRST LP_CLK_CONF.FAST_CLK_SEL: the LP fast clock runs from the
+// crystal divided by 2 when set, from the fast RC oscillator (RC_FAST)
+// when clear. The boot ROM leaves it on the crystal, but the PMU counts its
+// wake sequence in LP fast clock cycles before it starts the crystal
+// again, so a sleep that stops the crystal needs RC_FAST, which the LP
+// system restarts first.
+const LP_CLK_CONF: usize = 0x00
+const FAST_CLK_XTAL_D2: u32 = 1 << 2
+
+// Run the LP fast clock from RC_FAST for a sleep; return the setting for
+// `restore_lp_fast_clock`.
+pub fn use_rc_fast<R: hal.Registers>(lp_clkrst: &mut R) -> u32 {
+    conf := lp_clkrst.read(LP_CLK_CONF)
+    lp_clkrst.write(LP_CLK_CONF, conf & ~FAST_CLK_XTAL_D2)
+    return conf
+}
+
+pub fn restore_lp_fast_clock<R: hal.Registers>(lp_clkrst: &mut R, conf: u32) {
+    lp_clkrst.write(LP_CLK_CONF, conf)
+}
+
+// --- GPIO wakeup ----------------------------------------------------------
+
+// GPIO PINn registers and their fields: the interrupt type (4 for a low
+// level, 5 for a high one), the light-sleep wakeup enable, and the CPU
+// interrupt enable, which the digital wakeup path needs as well. STATUS
+// latches each pin's interrupt condition.
+const GPIO_STATUS: usize = 0x44
+const GPIO_STATUS_W1TC: usize = 0x4C
+const GPIO_IN: usize = 0x3C
+const GPIO_PIN: usize = 0x74
+const PIN_INT_TYPE: u32 = 0b111 << 7
+const PIN_WAKEUP: u32 = 1 << 10
+const PIN_INT_ENABLE: u32 = 1 << 13
+const INT_LOW: u32 = 4
+const INT_HIGH: u32 = 5
+
+// The pins a dormant state can watch, GPIO 0 to PIN_LIMIT - 1: the
+// ESP32-C6's GPIO matrix has 31.
+pub const PIN_LIMIT: u32 = 31
+
+// The pins of `wake` whose level events hold now: they end a dormant state
+// before it starts. `levels` has bit n set while pin n is high.
+pub fn levels_present(wake: &power.Wake, levels: u32) -> u32 {
+    present := 0u32
+    for pin in 0u32..PIN_LIMIT {
+        events := wake.events(pin)
+        high := (levels & (1u32 << pin)) != 0
+        if ((events & power.LEVEL_HIGH) != 0 && high) || ((events & power.LEVEL_LOW) != 0 && !high) {
+            present |= 1u32 << pin
+        }
+    }
+    return present
+}
+
+// The pins of `wake` whose events happened while the chip slept with each
+// pin armed for the opposite of its level in `before`: those in `changed`
+// now show the opposite level, so they show a level event of the new level
+// or the edge between the two; those in `pulsed` showed it and returned,
+// latched in GPIO STATUS, so they also crossed both edges.
+pub fn events_seen(wake: &power.Wake, before: u32, changed: u32, pulsed: u32) -> u32 {
+    seen := 0u32
+    for pin in 0u32..PIN_LIMIT {
+        bit := 1u32 << pin
+        if ((changed | pulsed) & bit) != 0 {
+            events := wake.events(pin)
+            was_high := (before & bit) != 0
+            wanted := power.LEVEL_HIGH | power.RISING_EDGE
+            if was_high {
+                wanted = power.LEVEL_LOW | power.FALLING_EDGE
+            }
+            if (pulsed & bit) != 0 {
+                wanted |= power.RISING_EDGE | power.FALLING_EDGE
+            }
+            if (events & wanted) != 0 {
+                seen |= bit
+            }
+        }
+    }
+    return seen
+}
+
+// Let each of `pins` wake a light sleep when it leaves its level in
+// `levels`: every event a dormant state waits for begins with that change.
+// Saves the pins' PINn registers in `saved` for `disarm_pins`.
+pub fn arm_pins<R: hal.Registers>(gpio: &mut R, pins: u32, levels: u32, saved: &mut[31]u32) {
+    for pin in 0u32..PIN_LIMIT {
+        bit := 1u32 << pin
+        if (pins & bit) != 0 {
+            offset := GPIO_PIN + 4 * pin as usize
+            value := gpio.read(offset)
+            saved[pin as usize] = value
+            kind := INT_HIGH
+            if (levels & bit) != 0 {
+                kind = INT_LOW
+            }
+            gpio.write(offset, (value & ~PIN_INT_TYPE) | (kind << 7) | PIN_WAKEUP | PIN_INT_ENABLE)
+        }
+    }
+    gpio.write(GPIO_STATUS_W1TC, pins)
+}
+
+// The pins of `pins` whose armed level was seen, latched in GPIO STATUS.
+pub fn latched_pins<R: hal.Registers>(gpio: &mut R, pins: u32) -> u32 {
+    return gpio.read(GPIO_STATUS) & pins
+}
+
+// The levels of the GPIOs, bit n set while pin n is high.
+pub fn levels<R: hal.Registers>(gpio: &mut R) -> u32 {
+    return gpio.read(GPIO_IN)
+}
+
+// Undo arm_pins, and clear the conditions it latched.
+pub fn disarm_pins<R: hal.Registers>(gpio: &mut R, pins: u32, saved: &[31]u32) {
+    for pin in 0u32..PIN_LIMIT {
+        if (pins & (1u32 << pin)) != 0 {
+            gpio.write(GPIO_PIN + 4 * pin as usize, saved[pin as usize])
+        }
+    }
+    gpio.write(GPIO_STATUS_W1TC, pins)
+}
+
+// --- The low-power timer --------------------------------------------------
+
+// LP_TIMER: target 0, the update request, the latched count, and the
+// interrupt that ends a sleep. The timer counts the LP slow clock, the
+// RC_SLOW oscillator of about 136 kHz, whatever the HP system does.
+const TAR0_LOW: usize = 0x00
+const TAR0_HIGH: usize = 0x04
+const TARGET_ENABLE: u32 = 1 << 31
+const UPDATE: usize = 0x10
+const MAIN_TIMER_UPDATE: u32 = 1 << 28
+const MAIN_BUF0_LOW: usize = 0x14
+const MAIN_BUF0_HIGH: usize = 0x18
+const TIMER_INT_CLR: usize = 0x34
+const TIMER_SOC_WAKEUP: u32 = 1 << 31
+
+// Target 0 as it was, for `restore_lp_alarm`: the PMU's timer wakeup
+// needs that comparator, which an RTC alarm may be using.
+pub fn save_lp_alarm<R: hal.Registers>(timer: &mut R) -> u64 {
+    return ((timer.read(TAR0_HIGH) as u64) << 32) | timer.read(TAR0_LOW) as u64
+}
+
+pub fn restore_lp_alarm<R: hal.Registers>(timer: &mut R, saved: u64) {
+    timer.write(TAR0_LOW, (saved & 0xFFFF_FFFF) as u32)
+    timer.write(TAR0_HIGH, (saved >> 32) as u32)
+}
+
+// The low-power timer's count, 48 bits of slow clock cycles.
+pub fn lp_ticks<R: hal.Registers>(timer: &mut R) -> u64 {
+    timer.write(UPDATE, MAIN_TIMER_UPDATE)
+    low := timer.read(MAIN_BUF0_LOW) as u64
+    high := (timer.read(MAIN_BUF0_HIGH) & 0xFFFF) as u64
+    return (high << 32) | low
+}
+
+// Wake a sleep with WAKE_LP_TIMER once the count reaches `ticks`.
+pub fn arm_lp_alarm<R: hal.Registers>(timer: &mut R, ticks: u64) {
+    timer.write(TIMER_INT_CLR, TIMER_SOC_WAKEUP)
+    timer.write(TAR0_LOW, (ticks & 0xFFFF_FFFF) as u32)
+    high := ((ticks >> 32) & 0xFFFF) as u32
+    timer.write(TAR0_HIGH, high)
+    timer.write(TAR0_HIGH, high | TARGET_ENABLE)
+}
+
+pub fn disarm_lp_alarm<R: hal.Registers>(timer: &mut R) {
+    timer.write(TAR0_HIGH, 0)
+    timer.write(TIMER_INT_CLR, TIMER_SOC_WAKEUP)
+}

@@ -32,16 +32,47 @@ mod panic;
 use debug::{DebugInfo, SourceMap};
 
 /// Compile LLVM IR text, such as a board runtime, to an object file for the
-/// target in `options`. Only code generation runs, never the IR optimization
-/// pipeline, so hand-written runtime helpers are not rewritten into calls to
-/// the library functions they implement.
+/// target in `options`. The runtime carries no debug information and its
+/// helpers sit on hot paths (software floating point, 64-bit arithmetic), so
+/// it is always fully optimized, whatever the program's optimization level
+/// (for size on AVR).
+/// Every function gets "no-builtins" first, so that the optimizer never
+/// rewrites a helper into a call to the library function it implements,
+/// such as memset's loop into a call to memset.
 pub fn compile_ir_object(options: &Options, name: &str, text: &str, path: &Path) -> Result<()> {
     let context = Context::create();
     let module = Module::parse_ir(&context, name, text)?;
-    let machine = target_machine(options)?;
+    let options = Options {
+        optimization: 3,
+        ..options.clone()
+    };
+    let machine = target_machine(&options)?;
     module.set_triple(&machine.get_triple());
     module.set_data_layout(&machine.get_target_data().get_data_layout());
     module.verify()?;
+    // AVR chips have 32 KiB of flash or less, where O3's inlining and
+    // unrolling cost more than they gain: optimize the runtime for size
+    // (O2 with optsize, which LLVM uses in place of Os).
+    let small = machine
+        .get_triple()
+        .as_str()
+        .to_string_lossy()
+        .starts_with("avr");
+    for function in module.functions() {
+        if function.count_basic_blocks() != 0 {
+            function.add_attribute(
+                AttributeLoc::Function,
+                context.create_string_attribute("no-builtins", ""),
+            );
+            if small {
+                function.add_attribute(
+                    AttributeLoc::Function,
+                    context.create_enum_attribute(Attribute::get_named_enum_kind_id("optsize"), 0),
+                );
+            }
+        }
+    }
+    module.run_passes(if small { "default<O2>" } else { "default<O3>" }, &machine)?;
     function_sections(&module);
     machine.write_to_file(&module, FileType::Object, path)
 }
@@ -95,7 +126,11 @@ fn function_sections(module: &Module<'_>) {
         if global.has_section() || global.is_thread_local() || name.starts_with("llvm.") {
             continue;
         }
-        let kind = if global.is_global_constant() {
+        // Constants in AVR's program memory (address space 1), such as
+        // panic messages: the linker script keeps them in flash.
+        let kind = if global.address_space() != 0 {
+            ".progmem.data."
+        } else if global.is_global_constant() {
             // Code is position independent, so a constant holding addresses
             // needs load-time relocations and LLVM marks its section
             // writable. GNU ld would merge a writable `.rodata.*` into the
@@ -151,6 +186,14 @@ fn mentions_dyn_self(ty: &Type) -> bool {
     matches!(ty, Type::Named(name) if name == "Self")
 }
 
+/// Whether `ty`, seen through any references, has the built-in `len` of an
+/// array, slice or string.
+fn is_collection(mut ty: &Type) -> bool {
+    while let Type::Ref(_, inner) = ty {
+        ty = inner;
+    }
+    matches!(ty, Type::Array(..) | Type::Slice(..) | Type::Str)
+}
 fn error(s: impl std::fmt::Display) -> CodegenError {
     CodegenError(s.to_string())
 }
@@ -187,6 +230,13 @@ pub fn pointer_bits(options: &Options) -> Result<u32> {
         .get_pointer_byte_size()
         * 8)
 }
+/// The program address space a data layout string declares (`P1` on AVR).
+fn program_address_space(layout: &str) -> u32 {
+    layout
+        .split('-')
+        .find_map(|part| part.strip_prefix('P')?.parse().ok())
+        .unwrap_or(0)
+}
 /// Declared for reachable `core/cpu` calls the target cannot lower.
 const UNSUPPORTED_CPU: &str = "dodo.unsupported.cpu.";
 /// Declared for reachable `mem.atomic_*` calls the target cannot lower,
@@ -203,8 +253,26 @@ enum AtomicSupport {
     None,
 }
 
-fn atomic_support(triple: &str) -> AtomicSupport {
+fn atomic_support(triple: &str, features: &str) -> AtomicSupport {
     let arch = triple.split('-').next().unwrap_or_default();
+    // RISC-V cores have atomics with the A extension, as the ESP32-C6 does.
+    if let Some(extensions) = arch
+        .strip_prefix("riscv32")
+        .or_else(|| arch.strip_prefix("riscv64"))
+    {
+        let named = features.split(',').any(|feature| feature == "+a");
+        let removed = features.split(',').any(|feature| feature == "-a");
+        let base = extensions.starts_with('g')
+            || extensions
+                .split('_')
+                .next()
+                .is_some_and(|letters| letters.contains('a'));
+        return if (named || base) && !removed {
+            AtomicSupport::Full
+        } else {
+            AtomicSupport::None
+        };
+    }
     // LLVM spells Apple's AArch64 as `arm64` (and `arm64e`). ARMv7-M,
     // ARMv7E-M, and ARMv8-M (Cortex-M3, M4, M7, M23, M33, M55, M85) have
     // exclusive loads and stores up to 32 bits; the checker limits widths to
@@ -217,13 +285,17 @@ fn atomic_support(triple: &str) -> AtomicSupport {
         AtomicSupport::Full
     } else if arch.starts_with("thumbv6m") {
         AtomicSupport::LoadStore
+    } else if arch == "avr" {
+        // One core: the backend masks interrupts around 8- and 16-bit
+        // operations, and the chip runtime's __sync helpers do the rest.
+        AtomicSupport::Full
     } else {
         AtomicSupport::None
     }
 }
 
-fn unsupported_atomic(op: &str, triple: &str) -> String {
-    if atomic_support(triple) == AtomicSupport::LoadStore {
+fn unsupported_atomic(op: &str, triple: &str, features: &str) -> String {
+    if atomic_support(triple, features) == AtomicSupport::LoadStore {
         format!(
             "atomic `{op}` is not supported for target `{triple}`: ARMv6-M (Cortex-M0 and M0+) has no atomic read-modify-write instructions, only atomic loads and stores; update the value inside a critical section (`hal.Critical`) instead"
         )
@@ -247,6 +319,13 @@ pub fn generate<'ctx>(
     module.set_triple(&machine.get_triple());
     module.set_data_layout(&machine.get_target_data().get_data_layout());
     let bits = machine.get_target_data().get_pointer_byte_size() * 8;
+    let code_space = program_address_space(
+        &machine
+            .get_target_data()
+            .get_data_layout()
+            .as_str()
+            .to_string_lossy(),
+    );
     let sources = SourceMap::new(&options.sources);
     let debug = if options.debug {
         Some(DebugInfo::new(context, &module, options, &sources)?)
@@ -273,6 +352,8 @@ pub fn generate<'ctx>(
         c_abi: HashMap::new(),
         c_result: None,
         bits,
+        features: options.features.clone(),
+        code_space,
         sources,
         debug,
         span: Span::default(),
@@ -288,6 +369,7 @@ pub fn generate<'ctx>(
         link_named: HashSet::new(),
         c_definitions: HashSet::new(),
         trampolines: HashMap::new(),
+        program_strings: HashMap::new(),
         used: vec![],
         frame: None,
         frames: HashMap::new(),
@@ -305,6 +387,7 @@ pub fn generate<'ctx>(
     if options.entry {
         cg.entry(&options.test_functions)?;
     }
+    cg.global_asm()?;
     cg.emit_used();
     cg.mark_nounwind();
     if let Some(debug) = &cg.debug {
@@ -355,6 +438,7 @@ pub fn generate<'ctx>(
         return Err(error(unsupported_atomic(
             &op,
             &triple.as_str().to_string_lossy(),
+            &options.features,
         )));
     }
     function_sections(&cg.module);
@@ -430,6 +514,11 @@ struct Codegen<'a, 'ctx> {
     c_abi: HashMap<String, c_abi::Lowering<'ctx>>,
     c_result: Option<Vec<LlvmType<'ctx>>>,
     bits: u32,
+    // LLVM target features, which decide what RISC-V atomics lower to.
+    features: String,
+    // The address space of code: 1 on AVR, whose program memory is separate
+    // from data memory, 0 elsewhere. Function values live in it.
+    code_space: u32,
     sources: SourceMap<'a>,
     span: Span,
     parameter: u32,
@@ -451,6 +540,8 @@ struct Codegen<'a, 'ctx> {
     /// Extern symbols this module defines.
     c_definitions: HashSet<String>,
     trampolines: HashMap<String, Value<'ctx>>,
+    // Panic messages placed in program memory, by text (AVR).
+    program_strings: HashMap<String, Value<'ctx>>,
     // Definitions with `@section`, kept through `llvm.used`.
     used: Vec<Value<'ctx>>,
     // The async fn poll function being generated, and each future's frame type.
@@ -473,12 +564,14 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             Type::Float(64) => self.context.f64_type(),
             // A `dyn` reference pairs the value's address with its method table;
             // a closure reference pairs its code with its captured environment.
-            Type::Ref(_, t) if matches!(t.as_ref(), Type::Dyn(_) | Type::DynFn(..)) => self
+            Type::Ref(_, t) if matches!(t.as_ref(), Type::Dyn(_)) => self
                 .context
                 .struct_type(&[self.context.ptr_type(0), self.context.ptr_type(0)], false),
-            Type::Ref(..) | Type::Raw(..) | Type::Fn(..) | Type::ExternFn(..) => {
-                self.context.ptr_type(0)
-            }
+            Type::Ref(_, t) if matches!(t.as_ref(), Type::DynFn(..)) => self
+                .context
+                .struct_type(&[self.code_ptr_type(), self.context.ptr_type(0)], false),
+            Type::Fn(..) | Type::ExternFn(..) => self.code_ptr_type(),
+            Type::Ref(..) | Type::Raw(..) => self.context.ptr_type(0),
             Type::Slice(..) | Type::Str => self
                 .context
                 .struct_type(&[self.context.ptr_type(0), self.usize_type()], false),
@@ -528,9 +621,16 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         Ok(self.context.struct_type(&fields, false))
     }
     /// LLVM has no union type. A zero-length array supplies the strictest
-    /// alignment, while bytes preserve every alternative's representation when
-    /// the enclosing aggregate is copied or passed by value. Using a real
-    /// alternative as storage would lose bytes in its padding or narrow fields.
+    /// alignment, while an array of padding-free integers preserves every
+    /// alternative's representation when the enclosing aggregate is copied or
+    /// passed by value. Using a real alternative as storage would lose bytes in
+    /// its padding or narrow fields.
+    ///
+    /// The integers are as wide as the alignment allows, up to a pointer: LLVM
+    /// returns each array element of a first-class aggregate in its own
+    /// register, so byte elements made a `T!E` with an 8-byte payload need
+    /// eight registers, which demoted the return to a hidden memory slot that
+    /// the caller then reassembled byte by byte.
     fn union_storage(&self, alternatives: &[LlvmType<'ctx>]) -> Result<LlvmType<'ctx>> {
         let mut aligner: LlvmType<'ctx> = self.context.i8_type();
         let mut size = 0;
@@ -545,12 +645,39 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         }
         let alignment = u64::from(self.data.get_abi_alignment(&aligner));
         let size = size.div_ceil(alignment) * alignment;
-        let bytes = self.context.i8_type().array_type(
-            u32::try_from(size).map_err(|_| error("payload storage is too large for LLVM"))?,
-        );
+        // Alignments are powers of two, so the word divides the padded size.
+        let word = alignment.min(u64::from(self.bits / 8)).max(1);
+        let words = self
+            .context
+            .custom_width_int_type(std::num::NonZeroU32::new(word as u32 * 8).unwrap())
+            .unwrap()
+            .array_type(
+                u32::try_from(size / word)
+                    .map_err(|_| error("payload storage is too large for LLVM"))?,
+            );
         Ok(self
             .context
-            .struct_type(&[aligner.array_type(0), bytes], false))
+            .struct_type(&[aligner.array_type(0), words], false))
+    }
+    /// The type of a function value: a pointer into code's address space.
+    fn code_ptr_type(&self) -> LlvmType<'ctx> {
+        self.context.ptr_type(self.code_space)
+    }
+    /// A function value carried in a data pointer, such as a closure
+    /// environment, and back. Both are the same size on every target.
+    fn code_as_data(&self, builder: &Builder<'ctx>, code: Value<'ctx>) -> Result<Value<'ctx>> {
+        if self.code_space == 0 {
+            return Ok(code);
+        }
+        let address = builder.build_ptr_to_int(code, self.usize_type(), "code.address")?;
+        builder.build_int_to_ptr(address, self.context.ptr_type(0), "code.data")
+    }
+    fn data_as_code(&self, builder: &Builder<'ctx>, data: Value<'ctx>) -> Result<Value<'ctx>> {
+        if self.code_space == 0 {
+            return Ok(data);
+        }
+        let address = builder.build_ptr_to_int(data, self.usize_type(), "code.address")?;
+        builder.build_int_to_ptr(address, self.code_ptr_type(), "code")
     }
     fn usize_type(&self) -> LlvmType<'ctx> {
         self.context
@@ -643,8 +770,8 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         // Only the tag and active payload are initialized. Inactive bytes are
         // unspecified, so clearing the whole union would add unnecessary stores.
         // Use undef, not poison: aggregate copies may combine inactive bytes with
-        // active ones. Keep union_storage's byte representation to preserve every
-        // initialized byte, including those in another alternative's padding.
+        // active ones. Keep union_storage's padding-free integer words to preserve
+        // every initialized byte, including those in another alternative's padding.
         let value = self
             .builder
             .build_insert_value(ty.get_undef(), tag, 0, "tag")?;
@@ -779,21 +906,47 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                 let indirect = &self.indirect[&f.name].1;
                 self.mark_exclusive_params(function, &params, first, indirect);
             }
-            if f.interrupt.is_some() && self.riscv_bare_metal() {
+            if f.interrupt.is_some()
+                && self.riscv_bare_metal()
+                && !self.program.dispatched_interrupts
+            {
                 // Save every register the handler uses and return with `mret`.
                 function.add_attribute(
                     AttributeLoc::Function,
                     self.context.create_string_attribute("interrupt", "machine"),
                 );
             }
+            if f.interrupt.is_some() && self.code_space != 0 {
+                // AVR vectors jump straight to the handler: save SREG and
+                // every register it uses, keep interrupts masked as the
+                // hardware left them, and return with `reti`.
+                function.add_attribute(
+                    AttributeLoc::Function,
+                    self.context.create_string_attribute("signal", ""),
+                );
+            }
             self.apply_placement(function, &f.placement, f.body.is_some(), 1)?;
+            // A function placed in a section, such as `.ramfunc` to run from
+            // SRAM, must run there: inlined into a caller, its code would run
+            // from the caller's section instead.
+            let placed = f.placement.section.is_some() && f.body.is_some();
             let inlining: &[&str] = match f.inlining {
+                // A naked function's assembly returns from its own frame.
+                Inlining::Auto if f.naked => &["naked", "noinline"],
+                Inlining::Auto | Inlining::Always if placed => &["noinline"],
                 Inlining::Auto => &[],
                 Inlining::Always => &["alwaysinline"],
                 Inlining::Never => &["noinline"],
                 Inlining::Cold => &["cold", "noinline"],
             };
-            for name in inlining {
+            // AVR chips have 32 KiB of flash or less: optimize for size, as
+            // -Os does, inlining only what makes code smaller.
+            let size: &[&str] = if self.code_space != 0 && f.inlining != Inlining::Always {
+                &["optsize"]
+            } else {
+                &[]
+            };
+            for name in inlining.iter().chain(size) {
                 function.add_attribute(
                     AttributeLoc::Function,
                     self.context
@@ -847,7 +1000,13 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         let pointer = self.context.ptr_type(0);
         let array = pointer.array_type(self.used.len() as u32);
         let global = self.module.add_global(array, None, "llvm.used");
-        global.set_initializer(&pointer.const_array(&self.used));
+        // Functions in a separate code address space are listed through casts.
+        let used: Vec<_> = self
+            .used
+            .iter()
+            .map(|value| value.const_address_space_cast(pointer))
+            .collect();
+        global.set_initializer(&pointer.const_array(&used));
         global.set_linkage(LLVMAppendingLinkage);
         global.set_section(Some("llvm.metadata"));
     }
@@ -1027,7 +1186,12 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                 self.fn_pointer(&closure.function)
             }
             ExprKind::Cast(x, t) if t.closure_signature().is_some() => {
-                let pointer = self.constant(x)?;
+                let mut pointer = self.constant(x)?;
+                if self.code_space != 0 {
+                    pointer = pointer
+                        .const_ptr_to_int(self.usize_type())
+                        .const_int_to_ptr(self.context.ptr_type(0));
+                }
                 let (params, ret) = t.callable_signature().unwrap();
                 let trampoline = self.trampoline(params, ret)?;
                 Ok(self.ty(t)?.const_named_struct(&[trampoline, pointer]))
@@ -1102,6 +1266,9 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
     }
 
     fn function(&mut self, f: &Function) -> Result<()> {
+        if let Some(asm) = f.naked_asm() {
+            return self.naked_function(f, asm);
+        }
         let function = self.functions[&f.name];
         self.function = Some(function);
         self.return_type = f.ret.clone();
@@ -2173,7 +2340,9 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                         None,
                     );
                 }
-                if n == "len" {
+                // `len` is only the built-in length of arrays, slices and
+                // strings; on a struct it is an ordinary field.
+                if n == "len" && is_collection(&x.ty) {
                     self.collection(x)?.1
                 } else {
                     let p = self.place(e)?;
@@ -2200,6 +2369,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                 }
                 _ if matches!(x.ty, Type::Fn(..)) => {
                     let pointer = self.expr(x)?;
+                    let pointer = self.code_as_data(&self.builder, pointer)?;
                     let (params, ret) = t.callable_signature().unwrap();
                     let trampoline = self.trampoline(params, ret)?;
                     self.closure_value(trampoline, pointer)?
@@ -2909,7 +3079,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             (Type::Int { .. }, Type::ExternFn(..)) => {
                 Ok(self
                     .builder
-                    .build_int_to_ptr(v, self.context.ptr_type(0), "code")?)
+                    .build_int_to_ptr(v, self.code_ptr_type(), "code")?)
             }
             (Type::ExternFn(..), Type::Int { .. }) => {
                 Ok(self.builder.build_ptr_to_int(v, self.ty(to)?, "address")?)
@@ -2933,8 +3103,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
     /// cannot name separately. `out` operands are early-clobber: the template
     /// may write them before it has read every input.
     fn inline_asm(&mut self, asm: &InlineAsm, ty: &Type) -> Result<Value<'ctx>> {
-        let indices = crate::sema::asm::llvm_operand_indices(asm);
-        let template = crate::sema::asm::llvm_template(&asm.template, &indices).map_err(error)?;
+        let template = self.asm_template(asm, true)?;
         let register = |register: &AsmRegister| match register {
             AsmRegister::Any => "r".to_owned(),
             AsmRegister::Named(name) => format!("{{{}}}", name.to_ascii_lowercase()),
@@ -2944,7 +3113,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         for operand in &asm.operands {
             values.push(match &operand.kind {
                 AsmOperandKind::In(value) | AsmOperandKind::InOut(value) => Some(self.expr(value)?),
-                AsmOperandKind::Out(_) => None,
+                AsmOperandKind::Out(_) | AsmOperandKind::Sym(_) | AsmOperandKind::Const(_) => None,
             });
         }
         let mut constraints = vec![];
@@ -2959,7 +3128,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                     constraints.push(format!("={}", register(&operand.register)));
                     outputs.push(self.ty(&value.ty)?);
                 }
-                AsmOperandKind::In(_) => {}
+                AsmOperandKind::In(_) | AsmOperandKind::Sym(_) | AsmOperandKind::Const(_) => {}
             }
         }
         let mut args = vec![];
@@ -3035,6 +3204,91 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             }
         })
     }
+    /// A checked template with its `sym` and `const` operands written in as
+    /// text, as an LLVM inline asm template (`inline`) or as module-level
+    /// assembly.
+    fn asm_template(&mut self, asm: &InlineAsm, inline: bool) -> Result<String> {
+        let operands = crate::sema::asm::template_operands(asm, |kind| match kind {
+            AsmOperandKind::Sym(path) => self.asm_symbol(path),
+            AsmOperandKind::Const(value) => {
+                crate::sema::asm::constant_operand(value, self.bits).map(|value| value.to_string())
+            }
+            _ => unreachable!("register operands have LLVM operand numbers"),
+        })
+        .map_err(error)?;
+        crate::sema::asm::render_template(&asm.template, &operands, inline).map_err(error)
+    }
+    /// The assembler name of the function or static a `sym` operand names.
+    /// The assembly's reference is invisible to LLVM, so a definition is
+    /// listed in `llvm.used`: it is kept, under this name, even when nothing
+    /// else refers to it.
+    fn asm_symbol(&mut self, path: &str) -> std::result::Result<String, String> {
+        let (value, defined) = if let Some(function) = self.functions.get(path) {
+            let defined = self
+                .program
+                .functions
+                .iter()
+                .any(|f| f.name == path && f.body.is_some());
+            (*function, defined)
+        } else if let Some((global, _)) = self.globals.get(path) {
+            (*global, true)
+        } else {
+            return Err(format!("`sym {path}` names no function or static"));
+        };
+        if defined && !self.used.contains(&value) {
+            self.used.push(value);
+        }
+        let name = value.get_name().to_string_lossy().into_owned();
+        // Mach-O, and COFF on 32-bit x86, prefix C symbols with an underscore.
+        let layout = self.module.get_data_layout();
+        let layout = layout.as_str().to_string_lossy();
+        let prefix = if layout.split('-').any(|part| part == "m:o" || part == "m:x") {
+            "_"
+        } else {
+            ""
+        };
+        let symbol = format!("{prefix}{name}");
+        let plain = symbol
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'$'))
+            && !symbol.starts_with(|c: char| c.is_ascii_digit());
+        Ok(if plain {
+            symbol
+        } else {
+            format!("\"{}\"", symbol.replace('\\', "\\\\").replace('"', "\\\""))
+        })
+    }
+    /// Emit top-level `unsafe asm(...)` blocks as module-level assembly, in
+    /// source order.
+    fn global_asm(&mut self) -> Result<()> {
+        for global in &self.program.global_asm {
+            let mut text = self.asm_template(&global.asm, false)?;
+            text.push('\n');
+            self.module.append_inline_asm(&text);
+        }
+        Ok(())
+    }
+    /// The body of a `@naked` function: its assembly alone, with no prologue
+    /// or epilogue, and nothing after it. The assembly returns by itself.
+    fn naked_function(&mut self, f: &Function, asm: &InlineAsm) -> Result<()> {
+        let function = self.functions[&f.name];
+        self.function = Some(function);
+        self.debug_function(f, function)?;
+        self.location(f.span);
+        self.builder
+            .position_at_end(self.context.append_basic_block(function, "entry"));
+        let template = self.asm_template(asm, true)?;
+        self.location(asm.span);
+        self.builder.build_inline_asm(
+            self.context.void_type().fn_type(&[], false),
+            &template,
+            "",
+            &[],
+            "",
+        )?;
+        self.builder.build_unreachable()?;
+        Ok(())
+    }
     /// Lowers `core/cpu`. Bare-metal Cortex-M and RISC-V (machine mode) use the
     /// architectural interrupt mask; hosted OS targets expose no interrupt mask
     /// to programs, so masking and waiting there are no-ops. Other freestanding
@@ -3066,6 +3320,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             .iter()
             .any(|prefix| arch.starts_with(prefix));
         let riscv = arch.starts_with("riscv32") || arch.starts_with("riscv64");
+        let avr = arch == "avr";
         let void = self.context.void_type();
         if hosted {
             return Ok(match op {
@@ -3073,6 +3328,9 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                 "core_id" => self.context.i32_type().const_zero(),
                 _ => unit,
             });
+        }
+        if avr {
+            return self.avr_cpu(op, argument);
         }
         if !cortex_m && !riscv {
             // Diagnosed after dead-code elimination (see `generate`), so a
@@ -3104,6 +3362,10 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             (self.usize_type(), 8)
         };
         match op {
+            "wait_for_interrupt" if riscv => {
+                self.wait_for_interrupt_hook()?;
+                Ok(unit)
+            }
             "wait_for_interrupt" => {
                 self.builder.build_inline_asm(
                     void.fn_type(&[], false),
@@ -3174,6 +3436,64 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             _ => Err(error(format!("unknown CPU operation `{op}`"))),
         }
     }
+    /// `core/cpu` on AVR: the interrupt flag is SREG bit 7 (I/O address
+    /// 0x3F), and there is a single core.
+    fn avr_cpu(&mut self, op: &str, argument: Option<Value<'ctx>>) -> Result<Value<'ctx>> {
+        let unit = self.context.i8_type().const_zero();
+        let byte = self.context.i8_type();
+        let void = self.context.void_type();
+        match op {
+            "core_id" => Ok(self.context.i32_type().const_zero()),
+            // Set SMCR.SE, keeping the mode the program chose, and sleep
+            // with interrupts enabled, so a pending one wakes the core even
+            // when they were masked; the handler runs before the previous
+            // SREG returns. `sei` takes effect after `sleep` has started, so
+            // no interrupt is lost in between.
+            "wait_for_interrupt" => {
+                self.builder.build_inline_asm(
+                    void.fn_type(&[], false),
+                    "in $0, 0x33\nori $0, 1\nout 0x33, $0\nin $0, 0x3f\nsei\nsleep\nout 0x3f, $0",
+                    "=&d,~{memory}",
+                    &[],
+                    "",
+                )?;
+                Ok(unit)
+            }
+            "disable_interrupts" => {
+                let previous = self.builder.build_inline_asm(
+                    byte.fn_type(&[], false),
+                    "in $0, 0x3f\ncli",
+                    "=r,~{memory}",
+                    &[],
+                    "cpu.previous",
+                )?;
+                let bit = byte.const_int(0x80, false);
+                let masked = self.builder.build_and(previous, bit, "cpu.mask")?;
+                self.builder.build_int_compare(
+                    IntPredicate::LLVMIntNE,
+                    masked,
+                    byte.const_zero(),
+                    "cpu.were_enabled",
+                )
+            }
+            "restore_interrupts" => {
+                let enabled = argument.ok_or_else(|| error("missing interrupt state"))?;
+                let value = self
+                    .builder
+                    .build_int_z_extend(enabled, byte, "cpu.state")?;
+                // Skip `sei` when they were masked.
+                self.builder.build_inline_asm(
+                    void.fn_type(&[byte], false),
+                    "cpse $0, r1\nsei",
+                    "r,~{memory}",
+                    &[value],
+                    "",
+                )?;
+                Ok(unit)
+            }
+            _ => Err(error(format!("unknown CPU operation `{op}`"))),
+        }
+    }
     /// Lowers `cpu.core_id()` on bare metal. RISC-V reads `mhartid`. Cortex-M
     /// has no architectural core number, so a chip runtime with several cores
     /// defines `dodo_core_id`, which is referenced weakly: without one the
@@ -3214,6 +3534,41 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         let phi = self.builder.build_phi(i32_type, "cpu.core")?;
         phi.add_incoming(&[(&i32_type.const_zero(), start), (&number, ask)]);
         Ok(phi)
+    }
+    /// Lowers `cpu.wait_for_interrupt()` on bare-metal RISC-V. The core's
+    /// `wfi` cannot be intercepted in machine mode, and a RISC-V chip has
+    /// no architectural deep sleep like the Cortex-M's SCR.SLEEPDEEP, so a
+    /// chip package that implements one defines `dodo_wait_for_interrupt`,
+    /// which is referenced weakly: std/embedded/chip/esp32c6 stops the
+    /// clocks outside its sleep set around the `wfi` while its power mode is
+    /// deep sleep. Without a definition this is a plain `wfi`.
+    fn wait_for_interrupt_hook(&mut self) -> Result<()> {
+        let void = self.context.void_type();
+        let hook = self
+            .module
+            .lookup_function("dodo_wait_for_interrupt")
+            .unwrap_or_else(|| {
+                self.module.add_function(
+                    "dodo_wait_for_interrupt",
+                    void.fn_type(&[], false),
+                    Some(LLVMExternalWeakLinkage),
+                )
+            });
+        let call = self.bb("wfi.hook");
+        let plain = self.bb("wfi.plain");
+        let done = self.bb("wfi.done");
+        let missing = self.builder.build_is_null(hook, "wfi.missing")?;
+        self.builder
+            .build_conditional_branch(missing, plain, call)?;
+        self.builder.position_at_end(call);
+        self.builder.build_call(hook, &[], "")?;
+        self.builder.build_unconditional_branch(done)?;
+        self.builder.position_at_end(plain);
+        self.builder
+            .build_inline_asm(void.fn_type(&[], false), "wfi", "~{memory}", &[], "")?;
+        self.builder.build_unconditional_branch(done)?;
+        self.builder.position_at_end(done);
+        Ok(())
     }
     fn call(
         &mut self,
@@ -3406,7 +3761,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                     .as_str()
                     .to_string_lossy()
                     .into_owned();
-                let support = atomic_support(&triple);
+                let support = atomic_support(&triple, &self.features);
                 if support == AtomicSupport::None
                     || (support == AtomicSupport::LoadStore
                         && !matches!(operation, "load" | "store"))
@@ -3868,7 +4223,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                 self.dispatch_thunk(&name, method, function, wanted)?
             });
         }
-        let pointer = self.context.ptr_type(0);
+        let pointer = self.code_ptr_type();
         let table_type = pointer.array_type(slots.len() as u32);
         let table = self.module.add_global(
             table_type,
@@ -3976,7 +4331,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         }
         self.transfer(&pending)?;
         let table = table.ok_or_else(|| error("dynamic call without a receiver"))?;
-        let pointer = self.context.ptr_type(0);
+        let pointer = self.code_ptr_type();
         let entry = unsafe {
             self.builder.build_gep(
                 pointer,

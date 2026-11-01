@@ -1,0 +1,266 @@
+package main
+
+import "core/mem"
+import "std/console"
+import "std/env"
+import "std/gpu"
+import "std/platform"
+import "std/window"
+
+// Draw a spinning triangle into a std/window window with std/gpu, on
+// whichever GPU interface the machine has: Metal on macOS, Vulkan or
+// OpenGL elsewhere. One WGSL shader serves all three. gpu.Surface shows
+// the frames, with two in flight; each frame writes the triangle's angle
+// into a uniform buffer, which goes through std/gpu's staging ring without
+// waiting for the GPU. Press Escape or close the window to quit.
+//
+//     dodo run examples/gpu_window.dodo [frames] [vulkan|metal|opengl]
+//
+// With a frame count, the program stops after that many frames.
+
+fn shaders() -> gpu.ShaderSource from(static) {
+    return gpu.wgsl(
+        "struct Spin {",
+        "    angle: f32,",
+        "    aspect: vec2<f32>,",
+        "}",
+        "",
+        "@group(0) @binding(0) var<uniform> spin: Spin;",
+        "",
+        "struct Out {",
+        "    @builtin(position) position: vec4<f32>,",
+        "    @location(0) color: vec3<f32>,",
+        "}",
+        "",
+        "@vertex",
+        "fn spin_vertex(@builtin(vertex_index) id: u32) -> Out {",
+        "    var corners = array<vec2<f32>, 3>(vec2<f32>(-0.6, -0.5), vec2<f32>(0.6, -0.5), vec2<f32>(0.0, 0.7));",
+        "    var colors = array<vec3<f32>, 3>(vec3<f32>(1.0, 0.3, 0.2), vec3<f32>(0.2, 0.9, 0.4), vec3<f32>(0.3, 0.4, 1.0));",
+        "    let c = cos(spin.angle);",
+        "    let s = sin(spin.angle);",
+        "    let p = mat2x2<f32>(c, s, -s, c) * corners[id] * spin.aspect;",
+        "    var out: Out;",
+        "    out.position = vec4<f32>(p, 0.0, 1.0);",
+        "    out.color = colors[id];",
+        "    return out;",
+        "}",
+        "",
+        "@fragment",
+        "fn spin_fragment(in: Out) -> @location(0) vec4<f32> {",
+        "    return vec4<f32>(in.color, 1.0);",
+        "}"
+    )
+}
+
+// The background, #1c2130, as linear values for the sRGB images.
+const BACKGROUND_RED: f64 = 0.011
+const BACKGROUND_GREEN: f64 = 0.0152
+const BACKGROUND_BLUE: f64 = 0.0296
+
+fn draw(device: &gpu.Device, surface: &mut gpu.Surface, pipeline: &gpu.RenderPipeline, uniform: &gpu.Buffer, angle: f32) -> bool!gpu.Error {
+    // Keep the triangle's shape whatever the window's proportions. WGSL
+    // aligns the vec2 to 8 bytes: angle, padding, aspect.
+    width := surface.width() as f32
+    height := surface.height() as f32
+    sx := 1.0f32
+    sy := 1.0f32
+    if width > height {
+        sx = height / width
+    } else if height > 0.0 {
+        sy = width / height
+    }
+    values := [angle, 0.0, sx, sy]
+    device.write_buffer(uniform, 0, gpu.f32_bytes(&values))?
+    frame := match surface.acquire() {
+        ok(frame) => frame,
+        // Minimized, or resized faster than we heard of it: skip a frame.
+        err(gpu.Error.Outdated) => {
+            return ok(false)
+        }
+        err(error) => {
+            return err(error)
+        }
+    }
+    encoder := device.encoder()?
+    {
+        color := gpu.ColorAttachment.clear(frame.texture(), BACKGROUND_RED, BACKGROUND_GREEN, BACKGROUND_BLUE, 1.0)
+        pass := encoder.render_pass(color)
+        pass.set_pipeline(pipeline)
+        pass.set_buffer(0, uniform)
+        pass.draw(3, 1, 0, 0)
+    }
+    encoder.submit()?
+    frame.present()?
+    return ok(true)
+}
+
+fn run(app: &mut window.App, win: &mut window.Window, options: gpu.Options) -> void!gpu.Error {
+    native := match win.native_handle() {
+        ok(native) => native,
+        err(_) => {
+            return err(gpu.Error.Unsupported)
+        }
+    }
+    device := gpu.Device.open_for_window(&native, options)?
+    api := device.api()
+    console.printf("{} on {}\n", gpu.api_name(&api), device.name())!
+    surface := gpu.Surface.create(&device, &native, win.width(), win.height())?
+    source := shaders()
+    bindings := [gpu.BindingLayout.uniform_buffer(0, gpu.STAGE_VERTEX)]
+    descriptor := gpu.RenderPipelineDescriptor.new(&source, "spin_vertex", &source, "spin_fragment", surface.format())
+    descriptor.bindings = &bindings
+    pipeline := device.create_render_pipeline(descriptor)?
+    uniform := device.create_buffer(16, gpu.BUFFER_UNIFORM | gpu.BUFFER_COPY_DST)?
+
+    limit := frame_limit()
+    frames := 0u32
+    period := win.frame_interval()
+    step := 1.2f32 * (period.seconds() as f32 + period.subsec_nanos() as f32 / 1000000000.0)
+    angle := 0.0f32
+    running := asked(win)
+    for running {
+        event := match app.wait_event() {
+            ok(event) => event,
+            err(_) => {
+                break
+            }
+        }
+        match event {
+            window.Event.Close(_) | window.Event.Quit => {
+                running = false
+            }
+            window.Event.Key(_, key) => {
+                if key.key == window.Key.Escape {
+                    running = false
+                }
+            }
+            window.Event.Resize(_, _, _) => {
+                surface.resize(win.width(), win.height())?
+            }
+            window.Event.Frame(_) => {
+                if draw(&device, &mut surface, &pipeline, &uniform, angle)? {
+                    frames += 1
+                    if frames == 1 {
+                        console.println("presented")!
+                    }
+                    if limit != 0 && frames >= limit {
+                        running = false
+                    }
+                }
+                angle += step
+                running = running && asked(win)
+            }
+            _ => {}
+        }
+    }
+    console.printf("{} frames\n", frames)!
+    return ok()
+}
+
+// Ask for the next Frame event; false once the window is gone.
+fn asked(win: &mut window.Window) -> bool {
+    match win.request_frame() {
+        ok() => {
+            return true
+        }
+        err(_) => {
+            return false
+        }
+    }
+}
+
+// Command-line argument `index`, copied into `buffer`: its length, or 0.
+fn argument(index: usize, buffer: &mut[u8]) -> usize {
+    storage := platform.list_workspace()
+    arguments := match env.Arguments.capture(&mut storage, platform.TextPolicy.Strict) {
+        ok(value) => value,
+        err(_) => {
+            return 0
+        }
+    }
+    text := [0u8; 32]
+    match arguments.get(index, &mut text) {
+        ok(some(value)) => {
+            bytes := mem.str_bytes(value)
+            length := bytes.len
+            if length > buffer.len {
+                length = buffer.len
+            }
+            for i in 0usize..length {
+                buffer[i] = bytes[i]
+            }
+            return length
+        }
+        ok(none) => {
+            return 0
+        }
+        err(_) => {
+            return 0
+        }
+    }
+}
+
+// The frame limit from the command line, or 0 for none.
+fn frame_limit() -> u32 {
+    buffer := [0u8; 32]
+    length := argument(1, &mut buffer)
+    limit := 0u32
+    for i in 0usize..length {
+        digit := buffer[i]
+        if digit < 48 || digit > 57 || limit > 100000000 {
+            return 0
+        }
+        limit = limit * 10 + (digit - 48) as u32
+    }
+    return limit
+}
+
+// The backend the command line asks for.
+fn preference() -> gpu.Preference {
+    buffer := [0u8; 32]
+    length := argument(2, &mut buffer)
+    if length == 0 {
+        return gpu.Preference.Auto
+    }
+    if buffer[0] == 118 {
+        return gpu.Preference.Vulkan
+    }
+    if buffer[0] == 109 {
+        return gpu.Preference.Metal
+    }
+    if buffer[0] == 111 {
+        return gpu.Preference.OpenGl
+    }
+    return gpu.Preference.Auto
+}
+
+fn main() -> i32 {
+    app := match window.App.new() {
+        ok(app) => app,
+        err(error) => {
+            console.printf("no window: {}\n", window.error_name(error))!
+            return 1
+        }
+    }
+    win := match app.open(window.Options.gpu("std/gpu", 480, 320)) {
+        ok(win) => win,
+        err(error) => {
+            console.printf("no window: {}\n", window.error_name(error))!
+            return 1
+        }
+    }
+    match run(&mut app, &mut win, gpu.Options.with_backend(preference())) {
+        ok() => {
+            return 0
+        }
+        // No GPU interface that can show a window.
+        err(gpu.Error.NoBackend) => {
+            console.println("NoBackend")!
+            return 2
+        }
+        err(error) => {
+            console.println(gpu.error_name(error))!
+            return 1
+        }
+    }
+}

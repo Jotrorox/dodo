@@ -501,6 +501,21 @@ impl<'ctx> Value<'ctx> {
             Some(Value(LLVMGetOperand(self.0, 0), PhantomData))
         }
     }
+    /// The address space of a global's storage.
+    pub(super) fn address_space(self) -> u32 {
+        unsafe { LLVMGetPointerAddressSpace(LLVMTypeOf(self.0)) }
+    }
+    /// This pointer constant as a pointer of `ty`, which may be in another
+    /// address space.
+    pub(super) fn const_address_space_cast(self, ty: LlvmType<'ctx>) -> Self {
+        Self(unsafe { LLVMConstPointerCast(self.0, ty.0) }, PhantomData)
+    }
+    pub(super) fn const_ptr_to_int(self, ty: LlvmType<'ctx>) -> Self {
+        Self(unsafe { LLVMConstPtrToInt(self.0, ty.0) }, PhantomData)
+    }
+    pub(super) fn const_int_to_ptr(self, ty: LlvmType<'ctx>) -> Self {
+        Self(unsafe { LLVMConstIntToPtr(self.0, ty.0) }, PhantomData)
+    }
     pub(super) fn get_type(self) -> LlvmType<'ctx> {
         LlvmType(
             unsafe {
@@ -722,6 +737,11 @@ impl<'ctx> Module<'ctx> {
         } else {
             Err(error(errors.join("\n")))
         }
+    }
+    /// Append module-level assembly, which the assembler reads as written
+    /// outside any function.
+    pub(super) fn append_inline_asm(&self, assembly: &str) {
+        unsafe { LLVMAppendModuleInlineAsm(self.0, assembly.as_ptr().cast(), assembly.len()) }
     }
     pub(super) fn set_source_file_name(&self, name: &str) {
         unsafe { LLVMSetSourceFileName(self.0, name.as_ptr().cast(), name.len()) }

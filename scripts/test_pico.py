@@ -32,10 +32,30 @@ WIRELESS_CHECKS = [
     "LED is off after 100 toggles",
     "wireless chip pins are taken",
 ]
+# Low-power checks that follow the dormant check, per chip, and the RP2350's
+# last check, which runs after the chip powers down and restarts.
+SYSTEM_CLOCK_CHECK = (
+    "clk_sys runs from the crystal and at 48 MHz; the timer and a slow UART keep "
+    "their rates; a claimed UART refuses a change; back at full speed"
+)
+RP2040_LOW_POWER = [
+    SYSTEM_CLOCK_CHECK,
+    "timed dormant is Unsupported from the crystal, Busy with an RTC clock input but no time; "
+    "the input on GPIO 20 is validated, owned, and given back",
+]
+RP2350_LOW_POWER = [
+    SYSTEM_CLOCK_CHECK,
+    "always-on timer counts from the low-power oscillator, returns to the crystal; "
+    "GPIO time references are validated and owned",
+    "200 ms timed dormant ends by time on the always-on timer while the timer pauses; tick and clk_sys return",
+]
+RP2350_FINAL = [
+    "200 ms power-down restarts the chip by its alarm, keeps SRAM, the scratch words, and the tick",
+]
 BOARDS = {
-    "pico": ("RPI-RP2", 0x2003F000, []),
-    "pico2": ("RP2350", 0x103FF000, []),
-    "pico2_w": ("RP2350", 0x103FF000, WIRELESS_CHECKS),
+    "pico": ("RPI-RP2", 0x2003F000, [], RP2040_LOW_POWER, []),
+    "pico2": ("RP2350", 0x103FF000, [], RP2350_LOW_POWER, RP2350_FINAL),
+    "pico2_w": ("RP2350", 0x103FF000, WIRELESS_CHECKS, RP2350_LOW_POWER, RP2350_FINAL),
 }
 CHECK_NAMES = [
     "second take() is refused",
@@ -95,21 +115,28 @@ LAST_CHECKS = [
     "UART loopback by DMA keeps 100 bytes in the ring until they are read",
     "polled I2C read of an absent device takes many polls and is NoAcknowledge",
     "DMA channels are given back",
+    "ADC sampler owns the converter and its pins; polled reads follow the round at 30 kHz",
+    "ADC FIFO interrupt raises the sampler's signal once 4 samples wait",
+    "ADC captures 1000 samples by DMA in 10 ms, bytes too, and streams 2000 into a ring",
     "core 1 starts, reports its number, and answers over the FIFO; a small stack and a third FIFO end are refused",
     "spinlocks are claimed once and exclude; both cores count 10000 each under one",
     "core 1's executor wakes on the FIFO interrupt; core 1 finishes, stops, and starts again",
+    "core 1 takes IO_IRQ_BANK0 for a pin it listens to; the chip has 30 GPIOs",
     "random number generator fills differing, balanced bytes and seeds a SoftRng",
     "unused clocks stop; claiming starts them; claimed and essential clocks are refused",
     "deep sleep with only the timer's clocks wakes on its alarm",
     "dormant is refused without pins and with USB running; a present level wakes it and clk_sys returns",
+    # The board's low-power checks go here.
     "watchdog refuses bad timeouts, counts 1 us per us, reloads when fed, holds when stopped; scratch 0 is the record's",
     "real-time clock is set and reads back the time it was given",
     "real-time clock keeps pace with the timer for 1.5 s",
     "real-time clock alarm fires on time and pends its interrupt until cleared",
     "flash regions are validated above the program and claimed once; reads match the mapped flash",
     "flash region erases, writes across pages, and reads back while code runs from flash",
-    "flash is refused while core 1 runs a task",
     "key-value store on flash compacts, reopens, and keeps its values",
+    "either core erases and writes flash while the other runs from it",
+    "a lockout parks the other core in SRAM until it is dropped, from either core",
+    "timer channels: an alarm fires as a compare channel and runs periodically in phase, counting missed periods (and TIMER1 keeps pace on the RP2350); a PWM slice timer counts clk_sys against the timer and counts its periods; a PIO edge capture times a toggling pin exactly and reports a full FIFO as Overrun",
     "invalid crystal is rejected",
     "chip take() after board take() is refused",
     "delay_ms(10) lasts 10 ms",
@@ -149,9 +176,17 @@ def read_record(picotool, record):
         return words, data[32:96].split(b"\0")[0].decode(errors="replace")
 
 
+def last_checks(board):
+    """LAST_CHECKS with the board's low-power and final checks."""
+    _, _, _, low_power, final = BOARDS[board]
+    split = LAST_CHECKS.index("dormant is refused without pins and with USB running; a present level wakes it and clk_sys returns") + 1
+    return LAST_CHECKS[:split] + low_power + LAST_CHECKS[split:] + final
+
+
 def run(dodo, picotool, board, level):
-    volume, record, board_checks = BOARDS[board]
+    volume, record, board_checks, _, _ = BOARDS[board]
     check_names = CHECK_NAMES + board_checks
+    final_checks = last_checks(board)
     project = ROOT / "tests/hardware" / board
     if record < 0x20000000:
         # A flash record: erase the previous run's so it cannot be misread.
@@ -194,8 +229,8 @@ def run(dodo, picotool, board, level):
     for index in failed:
         if index < len(check_names):
             name = check_names[index]
-        elif index >= value - len(LAST_CHECKS):
-            name = LAST_CHECKS[index - (value - len(LAST_CHECKS))]
+        elif index >= value - len(final_checks):
+            name = final_checks[index - (value - len(final_checks))]
         else:
             name = "arithmetic helper"
         print(f"  check {index} failed: {name}")
