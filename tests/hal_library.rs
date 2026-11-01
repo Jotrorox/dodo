@@ -182,6 +182,79 @@ fn mcp2515_can_controller_executes_against_a_simulated_chip() {
 }
 
 #[test]
+fn spi_nor_flash_driver_executes_against_a_simulated_chip() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let scratch = Scratch::new("spi-nor");
+    let source = root.join("tests/stdlib/spi_nor_checks.dodo");
+    for optimization in ["0", "3"] {
+        let executable = scratch.0.join(format!(
+            "spi-nor-O{optimization}{}",
+            std::env::consts::EXE_SUFFIX
+        ));
+        let args = ["build", source.to_str().unwrap(), "-O", optimization, "-o"];
+        success(&dodo(&args, &executable), "compile SPI NOR fixture");
+        success(
+            &Command::new(&executable).output().unwrap(),
+            "execute SPI NOR fixture",
+        );
+    }
+
+    // The driver over a chip's real SPI bus and pin types, with a store on
+    // it, for firmware.
+    for (chip, target) in [
+        ("rp2040", "thumbv6m-none-eabi"),
+        ("rp2350", "thumbv8m.main-none-eabi"),
+    ] {
+        let text = format!(
+            "package nor_{chip}\n\
+             import \"std/embedded/chip/{chip}\"\n\
+             import \"std/embedded/flash/spi_nor\"\n\
+             import \"std/embedded/hal\"\n\
+             import \"std/embedded/peripheral/pl022\"\n\
+             import \"std/embedded/storage\"\n\
+             pub fn count(bus: pl022.Bus, select: {chip}.Pin) -> u32!hal.Error {{\n\
+             chip := spi_nor.Flash.new(bus, select)?\n\
+             chip.unprotect()?\n\
+             region := storage.Region.last(chip, 64 * 1024)?\n\
+             match storage.Store.open(region) {{\n\
+             ok(store) => {{\n\
+             log := store\n\
+             match log.set_u32(\"boots\", 1) {{\n\
+             ok() => {{}}\n\
+             err(_) => {{}}\n\
+             }}\n\
+             region = log.release()\n\
+             }}\n\
+             err(_) => {{\n\
+             return err(hal.Error.Bus)\n\
+             }}\n\
+             }}\n\
+             dynamic: &mut dyn hal.Flash = &mut region\n\
+             return ok(dynamic.capacity())\n\
+             }}\n"
+        );
+        let file = scratch.write(&format!("{chip}.dodo"), &text);
+        success(
+            &dodo(
+                &[
+                    "build",
+                    file.to_str().unwrap(),
+                    "--emit",
+                    "obj",
+                    "--target",
+                    target,
+                    "-O",
+                    "2",
+                    "-o",
+                ],
+                &scratch.0.join(format!("{chip}.o")),
+            ),
+            &format!("compile the SPI NOR driver for {chip}"),
+        );
+    }
+}
+
+#[test]
 fn pio_i2s_streams_execute_against_a_simulated_pio_block() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let scratch = Scratch::new("i2s");
