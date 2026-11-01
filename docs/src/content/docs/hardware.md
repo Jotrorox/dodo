@@ -17,8 +17,9 @@ grouped under `std/embedded` in layers, on top of two small compiler packages:
 | Typed registers | `std/embedded/hal` | `hal.Reg<T>` and `hal.RegisterBlock` handles and mask constants for memory-mapped registers. |
 | Interrupts | `std/embedded/hal`, `std/embedded/cortex_m` | `@interrupt` handlers; `hal.Critical`, a section that masks interrupts until it is dropped; `hal.Handler`, a slot for a handler chosen at run time; the Cortex-M interrupt controller and SysTick. |
 | Tasks | `std/embedded/executor` | Several activities on one core, each woken on time or by an interrupt, with the core asleep in between. |
+| Low power | `std/embedded/power` | Sleep and deep sleep, clock gating, and a dormant state woken by pins, through one `Power` protocol that every chip and the fakes implement. |
 | DMA | `std/embedded/hal`, `std/embedded/chip/rp_dma` | `hal.DmaChannel`, through which drivers move data while the program does other work; the RP2040's and RP2350's channels. |
-| Desktop testing | `std/embedded/hal/fake` | In-memory pins, delays, buses, serial ports, and a simulated clock that record what a driver did. |
+| Desktop testing | `std/embedded/hal/fake` | In-memory pins, delays, buses, serial ports, a simulated clock, and simulated power controls that record what a driver did. |
 | Boards | `std/embedded/board` | The selected board: one `take()` and the same LED, pin, and timer fields on every board. |
 | Chip support | `std/embedded/chip` | The selected microcontroller's peripherals, for custom boards. |
 | Wireless chip | `std/embedded/wireless/cyw43` | The CYW43439 on the Pico 2 W: power-up, its gSPI bus, and its GPIO pins. |
@@ -938,7 +939,8 @@ for the full rules.
 ### Sleeping and other targets
 
 `cpu.wait_for_interrupt()` sleeps until an interrupt is pending, which is the
-usual idle loop. `cpu.fence()` is a full hardware memory barrier, for example
+usual idle loop. How deeply it sleeps is set with
+[`std/embedded/power`](#low-power). `cpu.fence()` is a full hardware memory barrier, for example
 between filling a DMA buffer and starting the transfer.
 
 | Target | Critical section and `wait_for_interrupt` |
@@ -1252,6 +1254,136 @@ while nothing has been fed.
   return at once and finish while the task waits.
 - On a desktop, where a critical section excludes nothing, use the executor
   and its signals from one thread.
+
+## Low power
+
+Battery-powered firmware spends most of its time waiting.
+`std/embedded/power` decides how much of the chip keeps running meanwhile.
+Every chip package implements its `power.Power` protocol, every board hands it
+out as `b.power`, and `std/embedded/hal/fake.Power` implements it on a
+desktop. Power-aware code is therefore written and tested once, like a driver.
+
+There are three levels, from the lightest to the deepest:
+
+| Level | What stops | What wakes it | How |
+| --- | --- | --- | --- |
+| Sleep | The core | Any enabled interrupt | `power.Mode.Sleep`, the mode at reset |
+| Deep sleep | The core and every clock outside the sleep set | An interrupt from a peripheral whose clock still runs | `power.Mode.DeepSleep` with `set_sleep_clocks` |
+| Dormant | Every oscillator, and with them every clock | A pin event in a `power.Wake` | `dormant(&wake)` |
+
+### Sleep modes
+
+The mode says what every wait does from now on: `b.power.sleep()`,
+`cpu.wait_for_interrupt()`, a timer alarm's `sleep_until`, and the
+[executor](#tasks-and-the-executor) all honour it. An executor therefore
+deep-sleeps between its tasks without being changed:
+
+```dodo
+import "std/embedded/board"
+import "std/embedded/chip"
+import "std/embedded/executor"
+import "std/embedded/power"
+
+fn main() {
+    b := board.take()!
+    // Only the timer runs while the core sleeps, so its alarm can wake it.
+    b.power.set_sleep_clocks(chip.ALARM_CLOCKS)
+    b.power.set_mode(power.Mode.DeepSleep)
+    clock := b.timer.alarm(0)!
+    // ... tasks as before ...
+    executor.run(&mut tasks, &mut clock)
+}
+```
+
+The sleep set must keep the clocks of whatever should wake the core:
+`chip.ALARM_CLOCKS` for a timer alarm, `chip.CLOCK_GPIO` for a pin interrupt,
+and a peripheral's own constant, such as `chip.CLOCK_UART0`, for its
+interrupts. Add `chip.CLOCK_MEMORY` and `chip.CLOCK_DMA` for DMA that runs
+during the sleep. Every clock is in the sleep set at reset, so a deep sleep
+stops nothing more than a light one until the program says otherwise. When
+the core wakes, the stopped clocks start again before its handler runs.
+`power.deep_sleep(&mut b.power, keep)` deep-sleeps once and then restores the
+previous mode and sleep set.
+
+To wait for something an interrupt handler records, check it inside a
+`hal.Critical` section and sleep there. An interrupt that becomes pending
+between the check and the sleep still ends the sleep, and its handler runs
+once the section ends. The executor does this for you.
+
+### Clock gating
+
+Apart from sleeping, the chip stops the clocks of peripherals that nothing
+uses. Clocks are a `power.Clocks` set, a `u64` with one bit per clock gate.
+The chip package names the gates, such as `chip.CLOCK_UART1` or
+`chip.CLOCK_PIO0`, and they combine with `|`:
+
+```dodo
+stopped := b.power.disable_unused_clocks()   // every unclaimed peripheral
+b.power.disable_clocks(chip.CLOCK_JTAG)!    // one the chip does not claim
+serial := b.pins.uart(4, none, 115_200)!     // UART1's clocks start again
+```
+
+`disable_unused_clocks` stops the clocks of every peripheral the chip claims
+and releases that is not claimed now, and returns them. Claiming one of those
+peripherals starts its clocks again, so calling it once at start-up is safe.
+`disable_clocks` refuses with `InvalidInput` the clocks the program cannot run
+without (`chip.ESSENTIAL_CLOCKS`: memory, flash, the boot ROM, the bus fabric,
+GPIO, and the clock, reset, and oscillator controls), and refuses with `Busy`
+the clocks of a claimed peripheral. Peripherals that are not claimed through
+`Pins`, such as the timer (`chip.CLOCK_TIMER`) and DMA (`chip.CLOCK_DMA`),
+are the program's to stop: their registers stop answering until
+`enable_clocks` starts them again.
+
+### Dormant
+
+`dormant` stops every oscillator. The chip keeps its memory and pin levels
+and draws the least it can until one of the pin events in a `power.Wake`
+happens. The chip then restarts its clocks as they were, and `dormant`
+returns the pins that woke it, bit n for pin n:
+
+```dodo
+button := b.pins.input(15)!
+// Wait for a new press, not one latched earlier.
+button.clear_events(chip.RISING_EDGE)
+wake := power.Wake.new()
+wake.on(15, power.RISING_EDGE)
+woken := b.power.dormant(&wake)!
+```
+
+`power.dormant_until(&mut b.power, pin, events)` is the one-pin shorthand.
+The events are `power.LEVEL_LOW`, `LEVEL_HIGH`, `FALLING_EDGE`, and
+`RISING_EDGE`, numbered as for `Pin.listen`. Claim each wake pin as an input
+first, with the pull it needs, so its level is defined while nothing runs.
+An edge or level that is present already ends the dormant state at once.
+
+On the RP2040 and RP2350, `dormant` runs clk_sys from the crystal, stops
+PLL_SYS, the ring oscillator, and the crystal, and afterwards starts PLL_SYS
+again. Both cores stop. The microsecond timer pauses meanwhile, so `now_us`
+does not count the time spent dormant. `dormant` returns `Busy` while the USB
+serial port or an ADC input runs, because their 48 MHz clock would stop.
+Wait until serial ports have sent their last bytes before calling it. A
+complete example that blinks, deep-sleeps, and goes dormant until a button
+press is `examples/low_power.dodo`.
+
+### Testing power-aware code
+
+`fake.Power.new(essential, managed)` starts with every clock running. It
+refuses to disable `essential` clocks and treats `managed` clocks as
+peripherals that `disable_unused_clocks` stops. Tests can `claim` and
+`release` clocks as a chip does, and choose with `wake_next_dormant(pins)`
+which pins end the next dormant state. A dormant state that nothing could end
+traps instead of hanging the test. The fake counts `light_sleeps`,
+`deep_sleeps`, and `dormant_states`, and reports the `requested_events` of
+each pin.
+
+### Sleep controls of the Cortex-M core
+
+`std/embedded/cortex_m` also exposes the system control register directly.
+`set_deep_sleep(bool)` sets SLEEPDEEP, which the chips' `set_mode` uses.
+`set_sleep_on_exit(bool)` makes the core sleep again whenever its last
+handler returns, for firmware that works only in interrupt handlers.
+`set_event_on_pend(bool)` lets a pending but disabled interrupt end a
+`wait_for_event`. Each core has its own register.
 
 ## Building firmware
 
@@ -2449,9 +2581,9 @@ dodo build firmware.dodo --emit obj --target thumbv7em-none-eabihf \
 
 - The boards are `pico`, `pico2`, and `pico2_w`, on the `rp2040` and `rp2350`
   chips. The chip packages cover clocks, GPIO, I2C, SPI, UART, PWM, the ADC,
-  PIO, the timer, the watchdog, DMA, a USB serial port, and the second core;
-  other USB devices (HID, mass storage, several functions at once) or USB
-  host mode are not bundled
+  PIO, the timer, the watchdog, DMA, a USB serial port, low power, and the
+  second core; other USB devices (HID, mass storage, several functions at
+  once) or USB host mode are not bundled
   yet. Write them with `hal.Reg` as above.
 - PIO state machines move words through their FIFOs by polling or their
   interrupts. DMA can pace transfers by their FIFOs' data requests
@@ -2492,6 +2624,13 @@ dodo build firmware.dodo --emit obj --target thumbv7em-none-eabihf \
 - Inline assembly lives inside functions; there is no global or naked
   assembly, so startup code and vector tables come from the chip runtime or a
   `@section`-placed static.
+- Low power covers sleep, deep sleep, clock gating, and the dormant state
+  woken by GPIO 0 to 29. The RP2350's power manager states, which switch
+  power domains off, its always-on timer, and waking a dormant chip by time
+  (the RP2040's RTC from an external clock, the RP2350's AON timer) are not
+  supported. Neither is lowering the system clock to save power. On a dual-core chip,
+  deep sleep stops the sleep set's other clocks only while both cores
+  deep-sleep.
 - The timer protocols count microseconds. Counters at other rates, a
   timer's capture and compare channels, and periodic hardware timers have no
   shared protocol; use the chip's own methods, as for the RP2040's and

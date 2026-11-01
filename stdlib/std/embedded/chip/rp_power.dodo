@@ -1,0 +1,219 @@
+package rp_power
+
+import "core/cpu"
+import "std/embedded/cortex_m"
+import "std/embedded/hal"
+import "std/embedded/power"
+
+// The low-power parts the RP2040 and RP2350 share, for their chip packages'
+// std/embedded/power implementations (RP2040 datasheet 2.11 and 2.15.3,
+// RP2350 datasheet 6.5 and 8.1.3).
+//
+// Clock gating. The clocks block gates each clock branch, one per
+// peripheral and per clock it uses, with two pairs of 32-bit registers:
+// WAKE_EN0 and WAKE_EN1 hold the branches that run while a core is awake,
+// SLEEP_EN0 and SLEEP_EN1 those that run while both cores deep-sleep (wait
+// with the Cortex-M's SCR.SLEEPDEEP set). Bit n of the first register of a
+// pair is bit n of a power.Clocks set, bit n of the second is bit 32 + n.
+// A core 1 that was never started waits in the boot ROM in deep sleep.
+//
+// Dormant. With clk_ref and clk_sys running from the crystal oscillator
+// (XOSC), writing the "dormant" word to XOSC_DORMANT stops it, and with it
+// every clock, until one of the GPIO events enabled in IO_BANK0's
+// DORMANT_WAKE_INTE registers restarts it: four bits per pin, eight pins
+// per register, in the order of power.LEVEL_LOW, LEVEL_HIGH, FALLING_EDGE,
+// and RISING_EDGE. The ring oscillator (ROSC), which the chips boot from
+// and nothing uses afterwards, is stopped too so that no clock runs, and
+// started again afterwards.
+//
+// The functions take the blocks as hal.Registers, so desktop tests run
+// them against simulated registers; the chip packages pass
+// hal.RegisterBlocks.
+
+// Atomic register aliases (RP2040 datasheet 2.1.2, RP2350 2.1.3).
+const SET_ALIAS: usize = 0x2000
+const CLEAR_ALIAS: usize = 0x3000
+
+// XOSC and ROSC: CTRL's ENABLE field, its values, STATUS's ENABLED and
+// STABLE bits, and the words that stop the oscillator.
+const OSC_CTRL: usize = 0x00
+const OSC_ENABLE: u32 = 0xFFF << 12
+const OSC_ENABLE_VALUE: u32 = 0xFAB
+const OSC_DISABLE_VALUE: u32 = 0xD1E
+const OSC_ENABLED: u32 = 1 << 12
+const OSC_STABLE: u32 = 1 << 31
+const DORMANT_WORD: u32 = 0x636F_6D61
+const XOSC_STATUS: usize = 0x04
+const XOSC_DORMANT: usize = 0x08
+
+// Polls of XOSC_STATUS before a crystal that does not restart is reported:
+// its start-up delay, about 1 ms, is far shorter.
+const ATTEMPTS: u32 = 1_000_000
+
+// The register offsets that differ between the chips.
+pub struct Layout {
+    // In the clocks block: WAKE_EN0 and SLEEP_EN0, each followed by its
+    // second register.
+    pub wake_en: usize
+    pub sleep_en: usize
+    // In the ROSC block: STATUS.
+    pub rosc_status: usize
+    // In IO_BANK0: DORMANT_WAKE_INTE0 and DORMANT_WAKE_INTS0, each the
+    // first of one register per eight pins.
+    pub dormant_wake_inte: usize
+    pub dormant_wake_ints: usize
+    // GPIOs that can wake the chip, 0 to pin_count - 1.
+    pub pin_count: u32
+}
+
+// A clock set from a pair of registers at `offset` and `offset + 4`.
+pub fn read_clocks<R: hal.Registers>(block: &mut R, offset: usize) -> power.Clocks {
+    low := block.read(offset) as u64
+    high := block.read(offset + 4) as u64
+    return low | (high << 32)
+}
+
+// Write a whole clock set to the pair of registers at `offset`.
+pub fn write_clocks<R: hal.Registers>(block: &mut R, offset: usize, clocks: power.Clocks) {
+    block.write(offset, (clocks & 0xFFFF_FFFF) as u32)
+    block.write(offset + 4, (clocks >> 32) as u32)
+}
+
+// Set the bits of `clocks` in the pair at `offset` through the set alias,
+// so other bits, and a concurrent change to them, stay as they are.
+pub fn set_clocks<R: hal.Registers>(block: &mut R, offset: usize, clocks: power.Clocks) {
+    alias_write(block, offset + SET_ALIAS, clocks)
+}
+
+// Clear the bits of `clocks` in the pair at `offset` through the clear alias.
+pub fn clear_clocks<R: hal.Registers>(block: &mut R, offset: usize, clocks: power.Clocks) {
+    alias_write(block, offset + CLEAR_ALIAS, clocks)
+}
+
+fn alias_write<R: hal.Registers>(block: &mut R, offset: usize, clocks: power.Clocks) {
+    low := (clocks & 0xFFFF_FFFF) as u32
+    high := (clocks >> 32) as u32
+    if low != 0 {
+        block.write(offset, low)
+    }
+    if high != 0 {
+        block.write(offset + 4, high)
+    }
+}
+
+// The calling core's mode, from its SCR.SLEEPDEEP.
+pub fn mode() -> power.Mode {
+    if cortex_m.deep_sleep() {
+        return power.Mode.DeepSleep
+    }
+    return power.Mode.Sleep
+}
+
+pub fn set_mode(mode: power.Mode) {
+    cortex_m.set_deep_sleep(mode == power.Mode.DeepSleep)
+}
+
+// Wait once for an interrupt in the calling core's mode.
+pub fn sleep() {
+    cortex_m.data_barrier()
+    cpu.wait_for_interrupt()
+}
+
+// InvalidInput unless `wake` names at least one pin, all below `pin_count`.
+pub fn check_wake(wake: &power.Wake, pin_count: u32) -> void!hal.Error {
+    pins := wake.pins()
+    if pins == 0 {
+        return err(hal.Error.InvalidInput)
+    }
+    if pin_count < 64 && (pins >> pin_count as u64) != 0 {
+        return err(hal.Error.InvalidInput)
+    }
+    return ok()
+}
+
+// The DORMANT_WAKE_INTE bits of `wake`'s pins in register `group`, which
+// holds pins 8 * group to 8 * group + 7.
+fn wake_bits(wake: &power.Wake, group: u32) -> u32 {
+    bits := 0u32
+    for slot in 0u32..8 {
+        bits |= wake.events(8 * group + slot) << (4 * slot)
+    }
+    return bits
+}
+
+// Let `wake`'s events restart a dormant chip, through IO_BANK0's set
+// aliases. Bits of other pins stay as they are.
+pub fn arm_wake<R: hal.Registers>(io: &mut R, layout: &Layout, wake: &power.Wake) {
+    groups := (layout.pin_count + 7) / 8
+    for group in 0u32..groups {
+        bits := wake_bits(wake, group)
+        if bits != 0 {
+            io.write(layout.dormant_wake_inte + SET_ALIAS + 4 * group as usize, bits)
+        }
+    }
+}
+
+// Undo arm_wake.
+pub fn disarm_wake<R: hal.Registers>(io: &mut R, layout: &Layout, wake: &power.Wake) {
+    groups := (layout.pin_count + 7) / 8
+    for group in 0u32..groups {
+        bits := wake_bits(wake, group)
+        if bits != 0 {
+            io.write(layout.dormant_wake_inte + CLEAR_ALIAS + 4 * group as usize, bits)
+        }
+    }
+}
+
+// The pins of `wake` whose events DORMANT_WAKE_INTS shows, bit n for pin n.
+pub fn woken_pins<R: hal.Registers>(io: &mut R, layout: &Layout, wake: &power.Wake) -> u64 {
+    groups := (layout.pin_count + 7) / 8
+    pins := 0u64
+    for group in 0u32..groups {
+        bits := wake_bits(wake, group)
+        if bits != 0 {
+            status := io.read(layout.dormant_wake_ints + 4 * group as usize) & bits
+            for slot in 0u32..8 {
+                if ((status >> (4 * slot)) & 0xF) != 0 {
+                    pins |= 1u64 << (8 * group + slot) as u64
+                }
+            }
+        }
+    }
+    return pins
+}
+
+// Stop the ROSC if it runs, stop the XOSC until a wake event, wait until
+// the crystal is stable again, and restart the ROSC if it ran. Timeout if
+// the crystal does not become stable.
+//
+// SAFETY: clk_ref and clk_sys must run from the XOSC, nothing may use the
+// ROSC or a PLL, interrupts must be masked, and the caller must own both
+// oscillators' registers.
+pub unsafe fn stop_oscillators<X: hal.Registers, O: hal.Registers>(xosc: &mut X, rosc: &mut O, layout: &Layout) -> void!hal.Error {
+    ring_ran := (rosc.read(layout.rosc_status) & OSC_ENABLED) != 0
+    if ring_ran {
+        enable_field(rosc, OSC_DISABLE_VALUE)
+    }
+    // Execution stops on this write until a wake event restarts the XOSC.
+    xosc.write(XOSC_DORMANT, DORMANT_WORD)
+    stable := false
+    for _ in 0..ATTEMPTS {
+        if (xosc.read(XOSC_STATUS) & OSC_STABLE) != 0 {
+            stable = true
+            break
+        }
+    }
+    if ring_ran {
+        enable_field(rosc, OSC_ENABLE_VALUE)
+    }
+    if !stable {
+        return err(hal.Error.Timeout)
+    }
+    return ok()
+}
+
+// Change an oscillator's CTRL.ENABLE field, keeping its frequency range.
+fn enable_field<O: hal.Registers>(oscillator: &mut O, value: u32) {
+    control := oscillator.read(OSC_CTRL)
+    oscillator.write(OSC_CTRL, (control & ~OSC_ENABLE) | (value << 12))
+}
