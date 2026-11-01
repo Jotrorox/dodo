@@ -16,7 +16,9 @@ import "std/window/handle"
 //   compute pipeline  a = MTLComputePipelineState
 //   render pipeline   a = MTLRenderPipelineState, b = MTLDepthStencilState
 //                     or 0, c = primitive type | cull mode << 8 |
-//                     winding << 16
+//                     winding << 16 | depth bias (i32 bits) << 32,
+//                     d = depth bias slope scale (f32 bits) | clamp (f32
+//                     bits) << 32
 //   encoder           a = MTLCommandBuffer, b = the open encoder or 0,
 //                     c = its kind (ENCODER_*)
 //   surface           a = CAMetalLayer, b = the acquired CAMetalDrawable
@@ -95,7 +97,8 @@ pub struct Device: hal.Backend {
             max_workgroup_size_x: threads.width as u32,
             max_workgroup_size_y: threads.height as u32,
             max_workgroup_size_z: threads.depth as u32,
-            max_workgroup_invocations: 1024
+            max_workgroup_invocations: 1024,
+            max_color_attachments: 8
         }
     }
 
@@ -146,8 +149,20 @@ pub struct Device: hal.Backend {
         if (descriptor.usage & hal.TEXTURE_RENDER) != 0 {
             usage = usage | metal.TEXTURE_USAGE_RENDER_TARGET
         }
+        // generate_mipmaps may render or sample the levels.
+        if descriptor.mip_levels > 1 && hal.is_filterable(descriptor.format) {
+            usage = usage | metal.TEXTURE_USAGE_RENDER_TARGET | metal.TEXTURE_USAGE_SHADER_READ
+        }
+        if descriptor.samples > 1 && !self.device.supports_texture_sample_count(descriptor.samples as usize) {
+            return err(hal.Error.Unsupported)
+        }
         info := sys(metal.TextureDescriptor.new_2d(pixel_format(descriptor.format), descriptor.width as usize, descriptor.height as usize, usage))?
         info.set_storage_mode(metal.STORAGE_MODE_PRIVATE)
+        info.set_mipmap_level_count(descriptor.mip_levels as usize)
+        if descriptor.samples > 1 {
+            info.set_texture_type(metal.TEXTURE_TYPE_2D_MULTISAMPLE)
+            info.set_sample_count(descriptor.samples as usize)
+        }
         texture := match self.device.new_texture(&info) {
             ok(texture) => texture,
             err(_) => {
@@ -172,9 +187,21 @@ pub struct Device: hal.Backend {
         info := sys(metal.SamplerDescriptor.new())?
         info.set_mag_filter(filter(descriptor.mag_filter))
         info.set_min_filter(filter(descriptor.min_filter))
+        if descriptor.mipmap_filter == hal.FILTER_LINEAR {
+            info.set_mip_filter(metal.SAMPLER_MIP_FILTER_LINEAR)
+        } else {
+            info.set_mip_filter(metal.SAMPLER_MIP_FILTER_NEAREST)
+        }
+        info.set_lod_min_clamp(descriptor.lod_min)
+        info.set_lod_max_clamp(descriptor.lod_max)
+        info.set_max_anisotropy(descriptor.max_anisotropy as usize)
         info.set_s_address_mode(address(descriptor.address_u))
         info.set_t_address_mode(address(descriptor.address_v))
         info.set_r_address_mode(address(descriptor.address_v))
+        info.set_border_color(descriptor.border as usize)
+        if descriptor.compare != hal.COMPARE_NONE {
+            info.set_compare_function(compare(descriptor.compare))
+        }
         sampler := match self.device.new_sampler_state(&info) {
             ok(sampler) => sampler,
             err(_) => {
@@ -219,20 +246,17 @@ pub struct Device: hal.Backend {
                 return err(hal.Error.InvalidShader)
             }
         }
-        // One source holding both stages compiles once.
-        fragment_library := vertex_library.clone()
-        if ptr.from_ref(descriptor.vertex) != ptr.from_ref(descriptor.fragment) {
-            fragment_library = self.library(descriptor.fragment)?
-        }
-        fragment := match fragment_library.new_function(descriptor.fragment_entry) {
-            ok(function) => function,
-            err(_) => {
-                return err(hal.Error.InvalidShader)
-            }
-        }
+        fragment := self.fragment_function(descriptor, &vertex_library)?
         info := sys(metal.RenderPipelineDescriptor.new())?
         info.set_vertex_function(&vertex)
-        info.set_fragment_function(&fragment)
+        match &fragment {
+            some(function) => {
+                info.set_fragment_function(function)
+            }
+            none => {}
+        }
+        info.set_raster_sample_count(descriptor.samples as usize)
+        info.set_alpha_to_coverage_enabled(descriptor.alpha_to_coverage)
         layouts := descriptor.vertex_buffers
         if layouts.len != 0 {
             vertices := sys(metal.VertexDescriptor.new())?
@@ -251,27 +275,23 @@ pub struct Device: hal.Backend {
             }
             info.set_vertex_descriptor(&vertices)
         }
-        color := sys(info.color_attachment(0))?
-        color.set_pixel_format(pixel_format(descriptor.color_format))
-        if descriptor.blend != hal.BLEND_REPLACE {
-            source := metal.BLEND_FACTOR_ONE
-            destination := metal.BLEND_FACTOR_ONE_MINUS_SOURCE_ALPHA
-            if descriptor.blend == hal.BLEND_ALPHA {
-                source = metal.BLEND_FACTOR_SOURCE_ALPHA
-            } else if descriptor.blend == hal.BLEND_ADDITIVE {
-                destination = metal.BLEND_FACTOR_ONE
+        targets := descriptor.targets
+        for i in 0usize..targets.len {
+            target := &targets[i]
+            color := sys(info.color_attachment(i))?
+            color.set_pixel_format(pixel_format(target.format))
+            color.set_write_mask(write_mask(target.write_mask))
+            blend := &target.blend
+            if blend.enabled() {
+                // hal's factors and operations are numbered as Metal's.
+                color.set_blending_enabled(true)
+                color.set_source_rgb_blend_factor(blend.color_source as usize)
+                color.set_destination_rgb_blend_factor(blend.color_destination as usize)
+                color.set_rgb_blend_operation(blend.color_operation as usize)
+                color.set_source_alpha_blend_factor(blend.alpha_source as usize)
+                color.set_destination_alpha_blend_factor(blend.alpha_destination as usize)
+                color.set_alpha_blend_operation(blend.alpha_operation as usize)
             }
-            color.set_blending_enabled(true)
-            color.set_source_rgb_blend_factor(source)
-            color.set_destination_rgb_blend_factor(destination)
-            color.set_rgb_blend_operation(metal.BLEND_OPERATION_ADD)
-            alpha_source := source
-            if descriptor.blend == hal.BLEND_ALPHA {
-                alpha_source = metal.BLEND_FACTOR_ONE
-            }
-            color.set_source_alpha_blend_factor(alpha_source)
-            color.set_destination_alpha_blend_factor(destination)
-            color.set_alpha_blend_operation(metal.BLEND_OPERATION_ADD)
         }
         depth_state := 0u64
         if descriptor.depth_format != hal.FORMAT_NONE {
@@ -304,8 +324,10 @@ pub struct Device: hal.Backend {
         if descriptor.front_face == hal.FRONT_CW {
             winding = metal.WINDING_CLOCKWISE
         }
-        packed := primitive(descriptor.topology) as u64 | (cull as u64 << 8) | (winding as u64 << 16)
-        handle := hal.Handle { a: retained(state.as_object()), b: depth_state, c: packed, d: 0 }
+        bias := hal.i32_bits(descriptor.depth_bias) as u64
+        packed := primitive(descriptor.topology) as u64 | (cull as u64 << 8) | (winding as u64 << 16) | (bias << 32)
+        slopes := hal.f32_bits(descriptor.depth_bias_slope_scale) as u64 | (hal.f32_bits(descriptor.depth_bias_clamp) as u64 << 32)
+        handle := hal.Handle { a: retained(state.as_object()), b: depth_state, c: packed, d: slopes }
         core.drop(pool)
         return ok(handle)
     }
@@ -389,28 +411,43 @@ pub struct Device: hal.Backend {
                 return
             }
         }
-        match descriptor.color_attachment(0) {
-            ok(color) => {
-                target := unsafe {
-                    metal.Texture.from_object(object(pass.color.a))
+        for i in 0usize..pass.color_count as usize {
+            attachment := &pass.colors[i]
+            match descriptor.color_attachment(i) {
+                ok(color) => {
+                    target := unsafe {
+                        metal.Texture.from_object(object(attachment.texture.a))
+                    }
+                    color.set_texture(&target)
+                    color.set_load_action(load_action(attachment.load))
+                    color.set_clear_color(metal.ClearColor.new(attachment.clear_red, attachment.clear_green, attachment.clear_blue, attachment.clear_alpha))
+                    if attachment.has_resolve {
+                        resolve := unsafe {
+                            metal.Texture.from_object(object(attachment.resolve.a))
+                        }
+                        color.set_resolve_texture(&resolve)
+                        if attachment.store {
+                            color.set_store_action(metal.STORE_ACTION_STORE_AND_MULTISAMPLE_RESOLVE)
+                        } else {
+                            color.set_store_action(metal.STORE_ACTION_MULTISAMPLE_RESOLVE)
+                        }
+                    } else {
+                        color.set_store_action(store_action(attachment.store))
+                    }
                 }
-                color.set_texture(&target)
-                color.set_load_action(load_action(pass.load))
-                color.set_store_action(metal.STORE_ACTION_STORE)
-                color.set_clear_color(metal.ClearColor.new(pass.clear_red, pass.clear_green, pass.clear_blue, pass.clear_alpha))
+                err(_) => {}
             }
-            err(_) => {}
         }
         if pass.has_depth {
             match descriptor.depth_attachment() {
                 ok(depth) => {
                     target := unsafe {
-                        metal.Texture.from_object(object(pass.depth.a))
+                        metal.Texture.from_object(object(pass.depth.texture.a))
                     }
                     depth.set_texture(&target)
-                    depth.set_load_action(load_action(pass.depth_load))
-                    depth.set_store_action(metal.STORE_ACTION_STORE)
-                    depth.set_clear_depth(pass.clear_depth as f64)
+                    depth.set_load_action(load_action(pass.depth.load))
+                    depth.set_store_action(store_action(pass.depth.store))
+                    depth.set_clear_depth(pass.depth.clear_depth as f64)
                 }
                 err(_) => {}
             }
@@ -442,6 +479,11 @@ pub struct Device: hal.Backend {
     pub fn set_scissor(&self, encoder: &mut hal.Handle, x: u32, y: u32, width: u32, height: u32) {
         render := render_encoder(encoder)
         render.set_scissor_rect(metal.ScissorRect.new(x as usize, y as usize, width as usize, height as usize))
+    }
+
+    pub fn set_blend_constant(&self, encoder: &mut hal.Handle, red: f64, green: f64, blue: f64, alpha: f64) {
+        render := render_encoder(encoder)
+        render.set_blend_color(red as f32, green as f32, blue as f32, alpha as f32)
     }
 
     pub fn dispatch(&self, encoder: &mut hal.Handle, state: &mut hal.PassState, x: u32, y: u32, z: u32) {
@@ -524,7 +566,7 @@ pub struct Device: hal.Backend {
         to := unsafe {
             metal.Texture.from_object(object(destination.a))
         }
-        blit.copy_buffer_to_texture(&source_object, offset as usize, bytes_per_row as usize, 0, metal.Size.new(region.width as usize, region.height as usize, 1), &to, 0, 0, metal.Origin.new(region.x as usize, region.y as usize, 0))
+        blit.copy_buffer_to_texture(&source_object, offset as usize, bytes_per_row as usize, 0, metal.Size.new(region.width as usize, region.height as usize, 1), &to, 0, region.level as usize, metal.Origin.new(region.x as usize, region.y as usize, 0))
     }
 
     pub fn copy_texture_to_buffer(&self, encoder: &mut hal.Handle, source: &hal.Handle, descriptor: &hal.TextureDescriptor, region: &hal.Region, destination: &hal.Handle, offset: u64, bytes_per_row: u32) {
@@ -535,7 +577,15 @@ pub struct Device: hal.Backend {
         to := unsafe {
             metal.Buffer.from_object(object(destination.a))
         }
-        blit.copy_texture_to_buffer(&source_object, 0, 0, metal.Origin.new(region.x as usize, region.y as usize, 0), metal.Size.new(region.width as usize, region.height as usize, 1), &to, offset as usize, bytes_per_row as usize, 0)
+        blit.copy_texture_to_buffer(&source_object, 0, region.level as usize, metal.Origin.new(region.x as usize, region.y as usize, 0), metal.Size.new(region.width as usize, region.height as usize, 1), &to, offset as usize, bytes_per_row as usize, 0)
+    }
+
+    pub fn generate_mipmaps(&self, encoder: &mut hal.Handle, texture: &hal.Handle, descriptor: &hal.TextureDescriptor) {
+        blit := blit_encoder(encoder)
+        target := unsafe {
+            metal.Texture.from_object(object(texture.a))
+        }
+        blit.generate_mipmaps(&target)
     }
 
     pub fn clear_buffer(&self, encoder: &mut hal.Handle, buffer: &hal.Handle, offset: u64, size: u64) {
@@ -546,10 +596,17 @@ pub struct Device: hal.Backend {
         blit.fill_buffer(&target, offset as usize, size as usize, 0)
     }
 
-    // Textures start out zero, as buffers do: a blit from a zeroed buffer.
-    // Depth textures are only ever cleared by render passes.
+    // Textures start out zero, as buffers do: every level a blit from a
+    // zeroed buffer. Multisampled textures and depth textures, which blits
+    // cannot write, are cleared by a render pass when they are render
+    // targets; other depth textures can never be written, so nothing reads
+    // what they hold.
     pub fn initialize_texture(&self, encoder: &mut hal.Handle, texture: &hal.Handle, descriptor: &hal.TextureDescriptor) {
-        if hal.is_depth(descriptor.format) {
+        depth := hal.is_depth(descriptor.format)
+        if depth || descriptor.samples > 1 {
+            if (descriptor.usage & hal.TEXTURE_RENDER) != 0 {
+                self.clear_target(encoder, texture, depth)
+            }
             return
         }
         pool := objc.AutoreleasePool.new()
@@ -568,7 +625,61 @@ pub struct Device: hal.Backend {
         }
         blit := blit_encoder(encoder)
         blit.fill_buffer(&zeros, 0, size, 0)
-        blit.copy_buffer_to_texture(&zeros, 0, row, 0, metal.Size.new(descriptor.width as usize, descriptor.height as usize, 1), &target, 0, 0, metal.Origin.new(0, 0, 0))
+        for level in 0u32..descriptor.mip_levels {
+            width := hal.level_size(descriptor.width, level) as usize
+            height := hal.level_size(descriptor.height, level) as usize
+            level_row := width * hal.texel_size(descriptor.format) as usize
+            blit.copy_buffer_to_texture(&zeros, 0, level_row, 0, metal.Size.new(width, height, 1), &target, 0, level as usize, metal.Origin.new(0, 0, 0))
+        }
+        core.drop(pool)
+    }
+
+    // Clear a render target with an empty render pass: zero, or depth 0.
+    fn clear_target(&self, encoder: &mut hal.Handle, texture: &hal.Handle, depth: bool) {
+        pool := objc.AutoreleasePool.new()
+        close(encoder)
+        descriptor := match metal.RenderPassDescriptor.new() {
+            ok(descriptor) => descriptor,
+            err(_) => {
+                assert(false, "Metal could not create a render pass descriptor")
+                return
+            }
+        }
+        target := unsafe {
+            metal.Texture.from_object(object(texture.a))
+        }
+        if depth {
+            match descriptor.depth_attachment() {
+                ok(attachment) => {
+                    attachment.set_texture(&target)
+                    attachment.set_load_action(metal.LOAD_ACTION_CLEAR)
+                    attachment.set_store_action(metal.STORE_ACTION_STORE)
+                    attachment.set_clear_depth(0.0)
+                }
+                err(_) => {}
+            }
+        } else {
+            match descriptor.color_attachment(0) {
+                ok(attachment) => {
+                    attachment.set_texture(&target)
+                    attachment.set_load_action(metal.LOAD_ACTION_CLEAR)
+                    attachment.set_store_action(metal.STORE_ACTION_STORE)
+                    attachment.set_clear_color(metal.ClearColor.new(0.0, 0.0, 0.0, 0.0))
+                }
+                err(_) => {}
+            }
+        }
+        commands := unsafe {
+            metal.CommandBuffer.from_object(object(encoder.a))
+        }
+        match commands.render_command_encoder(&descriptor) {
+            ok(render) => {
+                render.end_encoding()
+            }
+            err(_) => {
+                assert(false, "Metal could not create a render command encoder")
+            }
+        }
         core.drop(pool)
     }
 
@@ -732,6 +843,27 @@ pub struct Device: hal.Backend {
         result := commands.wait_until_completed()
         core.drop(pool)
         return lost_void(result)
+    }
+
+    // A render pipeline's fragment function, compiled from the vertex
+    // stage's library when one source holds both; none for depth-only
+    // pipelines.
+    fn fragment_function(&self, descriptor: &hal.RenderPipelineDescriptor, vertex_library: &metal.Library) -> Option<metal.Function>!hal.Error {
+        if !descriptor.has_fragment() {
+            return ok(none)
+        }
+        fragment_library := vertex_library.clone()
+        if ptr.from_ref(descriptor.vertex) != ptr.from_ref(descriptor.fragment) {
+            fragment_library = self.library(descriptor.fragment)?
+        }
+        match fragment_library.new_function(descriptor.fragment_entry) {
+            ok(function) => {
+                return ok(some(function))
+            }
+            err(_) => {
+                return err(hal.Error.InvalidShader)
+            }
+        }
     }
 
     fn library(&self, source: &hal.ShaderSource) -> metal.Library!hal.Error {
@@ -904,6 +1036,9 @@ fn apply(render: &metal.RenderCommandEncoder, state: &mut hal.PassState) {
         }
         render.set_cull_mode((handle.c >> 8 & 255) as usize)
         render.set_front_facing_winding((handle.c >> 16 & 255) as usize)
+        // Reset by pipelines without a bias, which may follow one with.
+        bias := hal.i32_from_bits((handle.c >> 32) as u32)
+        render.set_depth_bias(bias as f32, hal.f32_from_bits((handle.d & 0xffffffff) as u32), hal.f32_from_bits((handle.d >> 32) as u32))
         state.pipeline_dirty = false
     }
     for slot in 0usize..16 {
@@ -1056,7 +1191,35 @@ fn address(mode: u32) -> metal.SamplerAddressMode {
     if mode == hal.ADDRESS_MIRROR {
         return metal.SAMPLER_ADDRESS_MODE_MIRROR_REPEAT
     }
+    if mode == hal.ADDRESS_BORDER {
+        return metal.SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER_COLOR
+    }
     return metal.SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE
+}
+
+fn store_action(store: bool) -> metal.StoreAction {
+    if store {
+        return metal.STORE_ACTION_STORE
+    }
+    return metal.STORE_ACTION_DONT_CARE
+}
+
+// hal's COLOR_WRITE_* bits run red to alpha from bit 0, Metal's from bit 3.
+fn write_mask(mask: u32) -> metal.ColorWriteMask {
+    out := metal.COLOR_WRITE_MASK_NONE
+    if (mask & hal.COLOR_WRITE_RED) != 0 {
+        out = out | metal.COLOR_WRITE_MASK_RED
+    }
+    if (mask & hal.COLOR_WRITE_GREEN) != 0 {
+        out = out | metal.COLOR_WRITE_MASK_GREEN
+    }
+    if (mask & hal.COLOR_WRITE_BLUE) != 0 {
+        out = out | metal.COLOR_WRITE_MASK_BLUE
+    }
+    if (mask & hal.COLOR_WRITE_ALPHA) != 0 {
+        out = out | metal.COLOR_WRITE_MASK_ALPHA
+    }
+    return out
 }
 
 fn load_action(load: u32) -> metal.LoadAction {

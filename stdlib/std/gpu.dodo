@@ -56,6 +56,8 @@ pub type VertexAttribute = hal.VertexAttribute
 pub type VertexBufferLayout = hal.VertexBufferLayout
 pub type ComputePipelineDescriptor = hal.ComputePipelineDescriptor
 pub type RenderPipelineDescriptor = hal.RenderPipelineDescriptor
+pub type Blend = hal.Blend
+pub type ColorTarget = hal.ColorTarget
 
 // A shader written once in WGSL, translated when the program is compiled
 // into SPIR-V for Vulkan, Metal Shading Language for Metal and GLSL 4.50 for
@@ -166,6 +168,20 @@ pub fn texel_size(format: u32) -> u32 {
     return hal.texel_size(format)
 }
 
+// How many mipmap levels a `width` by `height` texture has at most, down to
+// one texel; TextureDescriptor.mipmapped uses it.
+pub fn mip_level_count(width: u32, height: u32) -> u32 {
+    return hal.mip_level_count(width, height)
+}
+
+// The width (or height) of mipmap `level` of a texture `size` texels wide.
+pub fn level_size(size: u32, level: u32) -> u32 {
+    return hal.level_size(size, level)
+}
+
+// Samples per pixel of a multisampled texture: 4 on every backend.
+pub const MULTISAMPLE_COUNT: u32 = 4
+
 // Shader stages that use a binding, combined with `|`.
 pub const STAGE_VERTEX: u32 = 1
 pub const STAGE_FRAGMENT: u32 = 2
@@ -203,11 +219,47 @@ pub const FRONT_CW: u32 = 1
 pub const INDEX_UINT16: u32 = 1
 pub const INDEX_UINT32: u32 = 2
 
+// Blending presets for RenderPipelineDescriptor.blend: none, straight
+// alpha, premultiplied alpha, additive.
 pub const BLEND_REPLACE: u32 = 0
 pub const BLEND_ALPHA: u32 = 1
 pub const BLEND_PREMULTIPLIED: u32 = 2
 pub const BLEND_ADDITIVE: u32 = 3
 
+// Blend factors for Blend: what the shader's output (source) and the
+// attachment's value (destination) are multiplied by. CONSTANT reads the
+// pass's blend constant.
+pub const BLEND_FACTOR_ZERO: u32 = 0
+pub const BLEND_FACTOR_ONE: u32 = 1
+pub const BLEND_FACTOR_SRC: u32 = 2
+pub const BLEND_FACTOR_ONE_MINUS_SRC: u32 = 3
+pub const BLEND_FACTOR_SRC_ALPHA: u32 = 4
+pub const BLEND_FACTOR_ONE_MINUS_SRC_ALPHA: u32 = 5
+pub const BLEND_FACTOR_DST: u32 = 6
+pub const BLEND_FACTOR_ONE_MINUS_DST: u32 = 7
+pub const BLEND_FACTOR_DST_ALPHA: u32 = 8
+pub const BLEND_FACTOR_ONE_MINUS_DST_ALPHA: u32 = 9
+pub const BLEND_FACTOR_SRC_ALPHA_SATURATED: u32 = 10
+pub const BLEND_FACTOR_CONSTANT: u32 = 11
+pub const BLEND_FACTOR_ONE_MINUS_CONSTANT: u32 = 12
+
+// Blend operations. MIN and MAX ignore the factors.
+pub const BLEND_OP_ADD: u32 = 0
+pub const BLEND_OP_SUBTRACT: u32 = 1
+pub const BLEND_OP_REVERSE_SUBTRACT: u32 = 2
+pub const BLEND_OP_MIN: u32 = 3
+pub const BLEND_OP_MAX: u32 = 4
+
+// The channels a color target writes, combined with `|`.
+pub const COLOR_WRITE_RED: u32 = 1
+pub const COLOR_WRITE_GREEN: u32 = 2
+pub const COLOR_WRITE_BLUE: u32 = 4
+pub const COLOR_WRITE_ALPHA: u32 = 8
+pub const COLOR_WRITE_ALL: u32 = 15
+
+// Depth comparisons, for depth tests and comparison samplers.
+// COMPARE_NONE marks a sampler that does not compare.
+pub const COMPARE_NONE: u32 = 0
 pub const COMPARE_NEVER: u32 = 1
 pub const COMPARE_LESS: u32 = 2
 pub const COMPARE_EQUAL: u32 = 3
@@ -223,6 +275,12 @@ pub const FILTER_LINEAR: u32 = 1
 pub const ADDRESS_CLAMP: u32 = 0
 pub const ADDRESS_REPEAT: u32 = 1
 pub const ADDRESS_MIRROR: u32 = 2
+pub const ADDRESS_BORDER: u32 = 3
+
+// The color a sampler reads outside the texture with ADDRESS_BORDER.
+pub const BORDER_TRANSPARENT_BLACK: u32 = 0
+pub const BORDER_OPAQUE_BLACK: u32 = 1
+pub const BORDER_OPAQUE_WHITE: u32 = 2
 
 pub const LOAD_CLEAR: u32 = 0
 pub const LOAD_KEEP: u32 = 1
@@ -231,6 +289,9 @@ pub const LOAD_KEEP: u32 = 1
 pub const MAX_SLOTS: u32 = 16
 pub const MAX_VERTEX_BUFFERS: u32 = 8
 pub const MAX_VERTEX_ATTRIBUTES: u32 = 16
+// Color attachments of a render pass at most; limits().max_color_attachments
+// says how many the device takes (at least 4).
+pub const MAX_COLOR_ATTACHMENTS: u32 = 8
 // Buffer offsets bound to a slot are multiples of this.
 pub const BINDING_ALIGNMENT: u64 = 256
 
@@ -489,7 +550,7 @@ pub struct Device {
     fn from_raw(raw: Raw) -> Device!Error {
         device := Device {
             raw: raw,
-            limits: hal.Limits { max_texture_size: 0, max_buffer_size: 0, max_uniform_binding_size: 0, max_storage_binding_size: 0, max_workgroups: 0, max_workgroup_size_x: 0, max_workgroup_size_y: 0, max_workgroup_size_z: 0, max_workgroup_invocations: 0 },
+            limits: hal.Limits { max_texture_size: 0, max_buffer_size: 0, max_uniform_binding_size: 0, max_storage_binding_size: 0, max_workgroups: 0, max_workgroup_size_x: 0, max_workgroup_size_y: 0, max_workgroup_size_z: 0, max_workgroup_invocations: 0, max_color_attachments: 0 },
             name: [0u8; 256],
             name_length: 0,
             life: Life { open_encoders: 0, submitted: 0, count: 0, object: [0u32; 64], a: [0u64; 64], b: [0u64; 64], c: [0u64; 64], d: [0u64; 64], wait: [0u64; 64] },
@@ -673,11 +734,16 @@ pub struct Device {
     }
 
     // A two-dimensional texture. Fails with InvalidInput for a zero size,
-    // one above limits().max_texture_size, an unknown format, or a usage
-    // the format does not allow: depth formats can only be rendered to,
-    // sampled and copied from, and TEXTURE_STORAGE needs one of the
-    // formats every backend can store to (rgba8unorm, rgba16float,
-    // r32float, rg32float, rgba32float, r32uint, r32sint, rgba32uint).
+    // one above limits().max_texture_size, an unknown format, a usage the
+    // format does not allow, or a bad mip level or sample count: depth
+    // formats can only be rendered to, sampled and copied from;
+    // TEXTURE_STORAGE needs one of the formats every backend can store to
+    // (rgba8unorm, rgba16float, r32float, rg32float, rgba32float, r32uint,
+    // r32sint, rgba32uint); mip_levels runs from 1 to mip_level_count();
+    // and a multisampled texture (samples MULTISAMPLE_COUNT rather than 1)
+    // has one level, a format other than an integer one, and usage
+    // TEXTURE_RENDER alone. Fails with Unsupported when the GPU lacks the
+    // combination.
     pub fn create_texture(&self, descriptor: TextureDescriptor) -> Texture!Error from(self) {
         width := descriptor.width
         height := descriptor.height
@@ -693,6 +759,12 @@ pub struct Device {
             return err(Error.InvalidInput)
         }
         if (usage & hal.TEXTURE_STORAGE) != 0 && !hal.is_storage(format) {
+            return err(Error.InvalidInput)
+        }
+        if descriptor.mip_levels == 0 || descriptor.mip_levels > hal.mip_level_count(width, height) {
+            return err(Error.InvalidInput)
+        }
+        if descriptor.samples != 1 && (descriptor.samples != hal.MULTISAMPLE_COUNT || descriptor.mip_levels != 1 || usage != hal.TEXTURE_RENDER || hal.is_integer(format)) {
             return err(Error.InvalidInput)
         }
         handle := self.raw_create_texture(&descriptor)?
@@ -765,12 +837,31 @@ pub struct Device {
         return ok()
     }
 
+    // A sampler. Fails with InvalidInput for an unknown filter, address
+    // mode, border color or comparison, a level range that is negative or
+    // runs backwards, or max_anisotropy outside 1 to 16 or above 1 with a
+    // nearest filter. A sampler with a comparison only reads depth textures
+    // in BindingLayout.comparison_texture slots, and only those.
     pub fn create_sampler(&self, descriptor: SamplerDescriptor) -> Sampler!Error from(self) {
-        if descriptor.mag_filter > hal.FILTER_LINEAR || descriptor.min_filter > hal.FILTER_LINEAR || descriptor.address_u > hal.ADDRESS_MIRROR || descriptor.address_v > hal.ADDRESS_MIRROR {
+        if descriptor.mag_filter > hal.FILTER_LINEAR || descriptor.min_filter > hal.FILTER_LINEAR || descriptor.mipmap_filter > hal.FILTER_LINEAR || descriptor.address_u > hal.ADDRESS_BORDER || descriptor.address_v > hal.ADDRESS_BORDER {
+            return err(Error.InvalidInput)
+        }
+        if descriptor.border > hal.BORDER_OPAQUE_WHITE || descriptor.compare > hal.COMPARE_ALWAYS {
+            return err(Error.InvalidInput)
+        }
+        // Written so that NaN fails too.
+        if !(descriptor.lod_min >= 0.0) || !(descriptor.lod_max >= descriptor.lod_min) {
+            return err(Error.InvalidInput)
+        }
+        anisotropy := descriptor.max_anisotropy
+        if anisotropy == 0 || anisotropy > 16 {
+            return err(Error.InvalidInput)
+        }
+        if anisotropy > 1 && (descriptor.mag_filter != hal.FILTER_LINEAR || descriptor.min_filter != hal.FILTER_LINEAR || descriptor.mipmap_filter != hal.FILTER_LINEAR) {
             return err(Error.InvalidInput)
         }
         handle := self.raw_create_sampler(&descriptor)?
-        return ok(Sampler { device: self, handle: handle })
+        return ok(Sampler { device: self, handle: handle, compare: descriptor.compare != hal.COMPARE_NONE })
     }
 
     // A compute pipeline. Fails with MissingShader when the source has no
@@ -804,8 +895,16 @@ pub struct Device {
     // A render pipeline. Fails like create_compute_pipeline, and with
     // InvalidInput for vertex layouts beyond MAX_VERTEX_BUFFERS or
     // MAX_VERTEX_ATTRIBUTES, a repeated location, an attribute outside its
-    // stride, a color format that cannot be rendered to (or blended, with
-    // blending on), or a depth format that is not one.
+    // stride; color targets given both ways, more than
+    // limits().max_color_attachments of them, with a format that cannot be
+    // rendered to (or blended, with blending on) or an unknown blend factor,
+    // operation or write mask; color targets without a fragment stage, or
+    // neither color targets nor depth; a depth format that is not one;
+    // samples other than 1 and MULTISAMPLE_COUNT, multisampled integer
+    // targets or alpha_to_coverage without multisampling; or a depth bias
+    // that is not finite or is set for lines or points. Fails with
+    // Unsupported when the GPU cannot blend targets differently, or clamp
+    // depth bias, and the pipeline asks for it.
     pub fn create_render_pipeline(&self, descriptor: RenderPipelineDescriptor) -> RenderPipeline!Error from(self) {
         pipeline := hal.Pipeline.empty()
         check_bindings(descriptor.bindings, hal.STAGE_VERTEX | hal.STAGE_FRAGMENT, &mut pipeline)?
@@ -846,13 +945,48 @@ pub struct Device {
             return err(Error.InvalidInput)
         }
         pipeline.vertex_buffer_count = layouts.len as u32
-        color := descriptor.color_format
-        if color == hal.FORMAT_NONE || color >= hal.FORMAT_COUNT || hal.is_depth(color) {
+        // The color targets: the one of `color_format`, or `targets`.
+        single := [hal.ColorTarget { format: descriptor.color_format, blend: hal.Blend.preset(descriptor.blend), write_mask: hal.COLOR_WRITE_ALL }]
+        if descriptor.color_format != hal.FORMAT_NONE && (descriptor.targets.len != 0 || descriptor.blend > hal.BLEND_ADDITIVE) {
             return err(Error.InvalidInput)
         }
-        if descriptor.blend > hal.BLEND_ADDITIVE || (descriptor.blend != hal.BLEND_REPLACE && !hal.is_blendable(color)) {
+        if descriptor.color_format == hal.FORMAT_NONE && descriptor.blend != hal.BLEND_REPLACE {
             return err(Error.InvalidInput)
         }
+        targets := if descriptor.color_format != hal.FORMAT_NONE {
+            &single[0..1]
+        } else {
+            descriptor.targets
+        }
+        fragment := descriptor.has_fragment()
+        if targets.len > self.limits.max_color_attachments as usize || (!fragment && targets.len != 0) {
+            return err(Error.InvalidInput)
+        }
+        if targets.len == 0 && descriptor.depth_format == hal.FORMAT_NONE {
+            return err(Error.InvalidInput)
+        }
+        samples := descriptor.samples
+        if samples != 1 && samples != hal.MULTISAMPLE_COUNT {
+            return err(Error.InvalidInput)
+        }
+        if descriptor.alpha_to_coverage && (samples == 1 || targets.len == 0) {
+            return err(Error.InvalidInput)
+        }
+        for i in 0usize..targets.len {
+            target := &targets[i]
+            format := target.format
+            if format == hal.FORMAT_NONE || format >= hal.FORMAT_COUNT || hal.is_depth(format) || target.write_mask > hal.COLOR_WRITE_ALL {
+                return err(Error.InvalidInput)
+            }
+            if !valid_blend(&target.blend) || (target.blend.enabled() && !hal.is_blendable(format)) {
+                return err(Error.InvalidInput)
+            }
+            if samples != 1 && hal.is_integer(format) {
+                return err(Error.InvalidInput)
+            }
+            pipeline.color_formats[i] = format
+        }
+        pipeline.color_count = targets.len as u32
         if descriptor.depth_format != hal.FORMAT_NONE && !hal.is_depth(descriptor.depth_format) {
             return err(Error.InvalidInput)
         }
@@ -862,15 +996,47 @@ pub struct Device {
         if descriptor.depth_compare < hal.COMPARE_NEVER || descriptor.depth_compare > hal.COMPARE_ALWAYS {
             return err(Error.InvalidInput)
         }
-        if mem.str_bytes(descriptor.vertex_entry).len == 0 || mem.str_bytes(descriptor.fragment_entry).len == 0 {
+        biased := descriptor.depth_bias != 0 || descriptor.depth_bias_slope_scale != 0.0 || descriptor.depth_bias_clamp != 0.0
+        if !finite(descriptor.depth_bias_slope_scale) || !finite(descriptor.depth_bias_clamp) {
+            return err(Error.InvalidInput)
+        }
+        if biased && descriptor.topology >= hal.TOPOLOGY_LINE_LIST {
+            return err(Error.InvalidInput)
+        }
+        if mem.str_bytes(descriptor.vertex_entry).len == 0 {
             return err(Error.InvalidInput)
         }
         self.check_source(descriptor.vertex)?
-        self.check_source(descriptor.fragment)?
+        if fragment {
+            self.check_source(descriptor.fragment)?
+        }
+        // Backends see every color target in `targets`.
+        normalized := hal.RenderPipelineDescriptor {
+            vertex: descriptor.vertex,
+            vertex_entry: descriptor.vertex_entry,
+            fragment: descriptor.fragment,
+            fragment_entry: descriptor.fragment_entry,
+            bindings: descriptor.bindings,
+            vertex_buffers: descriptor.vertex_buffers,
+            topology: descriptor.topology,
+            cull_mode: descriptor.cull_mode,
+            front_face: descriptor.front_face,
+            color_format: hal.FORMAT_NONE,
+            blend: hal.BLEND_REPLACE,
+            targets: targets,
+            depth_format: descriptor.depth_format,
+            depth_compare: descriptor.depth_compare,
+            depth_write: descriptor.depth_write,
+            depth_bias: descriptor.depth_bias,
+            depth_bias_slope_scale: descriptor.depth_bias_slope_scale,
+            depth_bias_clamp: descriptor.depth_bias_clamp,
+            samples: samples,
+            alpha_to_coverage: descriptor.alpha_to_coverage
+        }
         pipeline.topology = descriptor.topology
-        pipeline.color_format = color
         pipeline.depth_format = descriptor.depth_format
-        pipeline.handle = self.raw_create_render_pipeline(&descriptor)?
+        pipeline.samples = samples
+        pipeline.handle = self.raw_create_render_pipeline(&normalized)?
         return ok(RenderPipeline { device: self, pipeline: pipeline })
     }
 
@@ -1695,6 +1861,33 @@ pub struct Device {
         }
     }
 
+    fn raw_generate_mipmaps(&self, encoder: &mut hal.Handle, texture: &hal.Handle, descriptor: &TextureDescriptor) {
+        match &self.raw {
+            Raw.Vulkan(raw) => {
+                raw.generate_mipmaps(encoder, texture, descriptor)
+            }
+            Raw.Native(raw) => {
+                raw.generate_mipmaps(encoder, texture, descriptor)
+            }
+            Raw.OpenGl(raw) => {
+                raw.generate_mipmaps(encoder, texture, descriptor)
+            }
+        }
+    }
+    fn raw_set_blend_constant(&self, encoder: &mut hal.Handle, red: f64, green: f64, blue: f64, alpha: f64) {
+        match &self.raw {
+            Raw.Vulkan(raw) => {
+                raw.set_blend_constant(encoder, red, green, blue, alpha)
+            }
+            Raw.Native(raw) => {
+                raw.set_blend_constant(encoder, red, green, blue, alpha)
+            }
+            Raw.OpenGl(raw) => {
+                raw.set_blend_constant(encoder, red, green, blue, alpha)
+            }
+        }
+    }
+
     fn raw_staged(&self) -> bool {
         match &self.raw {
             Raw.Vulkan(raw) => {
@@ -1911,6 +2104,16 @@ fn fits(offset: u64, length: u64, size: u64) -> bool {
     return length <= size && offset <= size - length
 }
 
+// Neither infinite nor NaN.
+fn finite(value: f32) -> bool {
+    return value - value == 0.0
+}
+
+fn valid_blend(blend: &hal.Blend) -> bool {
+    factors := blend.color_source <= hal.BLEND_FACTOR_ONE_MINUS_CONSTANT && blend.color_destination <= hal.BLEND_FACTOR_ONE_MINUS_CONSTANT && blend.alpha_source <= hal.BLEND_FACTOR_ONE_MINUS_CONSTANT && blend.alpha_destination <= hal.BLEND_FACTOR_ONE_MINUS_CONSTANT
+    return factors && blend.color_operation <= hal.BLEND_OP_MAX && blend.alpha_operation <= hal.BLEND_OP_MAX
+}
+
 // The bytes a texture copy of `region` spans, rows `bytes_per_row` apart.
 fn copy_size(texture: &TextureDescriptor, region: &Region, bytes_per_row: u32) -> u64 {
     row := region.width as u64 * hal.texel_size(texture.format) as u64
@@ -1921,7 +2124,12 @@ fn copy_size(texture: &TextureDescriptor, region: &Region, bytes_per_row: u32) -
 // starting at `offset`, rows `bytes_per_row` apart, stays in bounds.
 fn texture_copy_fits(texture: &TextureDescriptor, region: &Region, available: u64, offset: u64, bytes_per_row: u32) -> bool {
     texel := hal.texel_size(texture.format) as u64
-    if region.x as u64 + region.width as u64 > texture.width as u64 || region.y as u64 + region.height as u64 > texture.height as u64 {
+    if region.level >= texture.mip_levels {
+        return false
+    }
+    width := hal.level_size(texture.width, region.level) as u64
+    height := hal.level_size(texture.height, region.level) as u64
+    if region.x as u64 + region.width as u64 > width || region.y as u64 + region.height as u64 > height {
         return false
     }
     row := region.width as u64 * texel
@@ -1943,7 +2151,7 @@ fn check_bindings(bindings: &[BindingLayout], allowed: u32, pipeline: &mut hal.P
         if slot >= hal.MAX_SLOTS || pipeline.kinds[slot as usize] != hal.BINDING_NONE {
             return err(Error.InvalidInput)
         }
-        if binding.kind == hal.BINDING_NONE || binding.kind > hal.BINDING_STORAGE_TEXTURE {
+        if binding.kind == hal.BINDING_NONE || binding.kind > hal.BINDING_COMPARISON_TEXTURE {
             return err(Error.InvalidInput)
         }
         if binding.stages == 0 || (binding.stages & ~allowed) != 0 {
@@ -1984,7 +2192,7 @@ pub struct Buffer {
     }
 }
 
-// A two-dimensional image on the GPU.
+// A two-dimensional image on the GPU, with one or more mipmap levels.
 pub struct Texture {
     device: &Device
     handle: hal.Handle
@@ -2004,13 +2212,27 @@ pub struct Texture {
     pub fn usage(&self) -> u32 {
         return self.descriptor.usage
     }
-    // The bytes one row of the whole texture takes, tightly packed.
+    pub fn mip_levels(&self) -> u32 {
+        return self.descriptor.mip_levels
+    }
+    pub fn samples(&self) -> u32 {
+        return self.descriptor.samples
+    }
+    // The bytes one row of the first level takes, tightly packed.
     pub fn bytes_per_row(&self) -> u32 {
         return self.descriptor.width * hal.texel_size(self.descriptor.format)
     }
-    // The region covering the whole texture.
+    // The bytes one row of mipmap `level` takes, tightly packed.
+    pub fn level_bytes_per_row(&self, level: u32) -> u32 {
+        return hal.level_size(self.descriptor.width, level) * hal.texel_size(self.descriptor.format)
+    }
+    // The region covering the whole first level.
     pub fn region(&self) -> Region {
-        return Region { x: 0, y: 0, width: self.descriptor.width, height: self.descriptor.height }
+        return hal.Region.new(0, 0, self.descriptor.width, self.descriptor.height)
+    }
+    // The region covering all of mipmap `level`.
+    pub fn level_region(&self, level: u32) -> Region {
+        return hal.Region.at_level(level, 0, 0, hal.level_size(self.descriptor.width, level), hal.level_size(self.descriptor.height, level))
     }
 
     fn drop(&mut self) {
@@ -2023,6 +2245,12 @@ pub struct Texture {
 pub struct Sampler {
     device: &Device
     handle: hal.Handle
+    compare: bool
+
+    // Whether the sampler compares, for BindingLayout.comparison_texture.
+    pub fn compares(&self) -> bool {
+        return self.compare
+    }
 
     fn drop(&mut self) {
         self.device.retire(hal.OBJECT_SAMPLER, &self.handle)
@@ -2047,8 +2275,11 @@ pub struct RenderPipeline {
     }
 }
 
-// The color attachment of a render pass. LOAD_CLEAR fills it with the
-// clear color first; LOAD_KEEP draws over what it holds.
+// A color attachment of a render pass. LOAD_CLEAR fills it with the
+// clear color first; LOAD_KEEP draws over what it holds. A multisampled
+// attachment can resolve into a texture of the same size and format with
+// one sample (with_resolve): the average of each pixel's samples is
+// written there when the pass ends.
 pub struct ColorAttachment {
     pub texture: &Texture
     pub load: u32
@@ -2056,12 +2287,26 @@ pub struct ColorAttachment {
     pub green: f64
     pub blue: f64
     pub alpha: f64
+    // Keep what the pass drew (true), or let the GPU drop it, leaving the
+    // contents undefined, which saves memory traffic for multisampled
+    // attachments that are only resolved.
+    pub store: bool
+    pub resolve: &Texture
+    pub has_resolve: bool
 
     pub fn clear(texture: &Texture, red: f64, green: f64, blue: f64, alpha: f64) -> ColorAttachment from(texture) {
-        return ColorAttachment { texture: texture, load: hal.LOAD_CLEAR, red: red, green: green, blue: blue, alpha: alpha }
+        return ColorAttachment { texture: texture, load: hal.LOAD_CLEAR, red: red, green: green, blue: blue, alpha: alpha, store: true, resolve: texture, has_resolve: false }
     }
     pub fn keep(texture: &Texture) -> ColorAttachment from(texture) {
-        return ColorAttachment { texture: texture, load: hal.LOAD_KEEP, red: 0.0, green: 0.0, blue: 0.0, alpha: 0.0 }
+        return ColorAttachment { texture: texture, load: hal.LOAD_KEEP, red: 0.0, green: 0.0, blue: 0.0, alpha: 0.0, store: true, resolve: texture, has_resolve: false }
+    }
+    // Resolve this multisampled attachment into `target` (TEXTURE_RENDER).
+    pub fn with_resolve(self, target: &Texture) -> ColorAttachment from(self, target) {
+        return ColorAttachment { texture: self.texture, load: self.load, red: self.red, green: self.green, blue: self.blue, alpha: self.alpha, store: self.store, resolve: target, has_resolve: true }
+    }
+    // Drop the attachment's contents after the pass (after resolving).
+    pub fn discard(self) -> ColorAttachment from(self) {
+        return ColorAttachment { texture: self.texture, load: self.load, red: self.red, green: self.green, blue: self.blue, alpha: self.alpha, store: false, resolve: self.resolve, has_resolve: self.has_resolve }
     }
 }
 
@@ -2070,14 +2315,23 @@ pub struct DepthAttachment {
     pub texture: &Texture
     pub load: u32
     pub depth: f32
+    // Keep the depths after the pass (true), or let the GPU drop them.
+    pub store: bool
 
     pub fn clear(texture: &Texture, depth: f32) -> DepthAttachment from(texture) {
-        return DepthAttachment { texture: texture, load: hal.LOAD_CLEAR, depth: depth }
+        return DepthAttachment { texture: texture, load: hal.LOAD_CLEAR, depth: depth, store: true }
     }
     pub fn keep(texture: &Texture) -> DepthAttachment from(texture) {
-        return DepthAttachment { texture: texture, load: hal.LOAD_KEEP, depth: 0.0 }
+        return DepthAttachment { texture: texture, load: hal.LOAD_KEEP, depth: 0.0, store: true }
+    }
+    // Drop the depths after the pass: they were only needed for its tests.
+    pub fn discard(self) -> DepthAttachment from(self) {
+        return DepthAttachment { texture: self.texture, load: self.load, depth: self.depth, store: false }
     }
 }
+
+const NO_COLORS: [0]ColorAttachment = []
+const NO_DEPTH: [0]DepthAttachment = []
 
 // Records commands for the GPU. Nothing runs until submit(); dropping an
 // encoder without submitting discards its commands.
@@ -2097,63 +2351,144 @@ pub struct CommandEncoder {
     // Record a render pass drawing into `color`. It needs TEXTURE_RENDER
     // and a color format.
     pub fn render_pass(&mut self, color: ColorAttachment) -> RenderPass from(self) {
-        return self.begin_render(&color, false, color.texture, hal.LOAD_KEEP, 0.0)
+        colors := [color]
+        return self.begin_render(&colors, &NO_DEPTH)
     }
 
     // Record a render pass drawing into `color` with the depth buffer
     // `depth`, a TEXTURE_RENDER depth texture of the same size.
     pub fn render_pass_with_depth(&mut self, color: ColorAttachment, depth: DepthAttachment) -> RenderPass from(self) {
-        return self.begin_render(&color, true, depth.texture, depth.load, depth.depth)
+        colors := [color]
+        depths := [depth]
+        return self.begin_render(&colors, &depths)
     }
 
-    fn begin_render(&mut self, color: &ColorAttachment, has_depth: bool, depth: &Texture, depth_load: u32, clear_depth: f32) -> RenderPass from(self) {
+    // Record a render pass drawing into several color attachments (at most
+    // limits().max_color_attachments) of one size and sample count:
+    // attachment N takes the fragment shader's output at @location(N).
+    pub fn render_pass_targets(&mut self, colors: &[ColorAttachment]) -> RenderPass from(self) {
+        assert(colors.len != 0, "a render pass needs an attachment")
+        return self.begin_render(colors, &NO_DEPTH)
+    }
+
+    pub fn render_pass_targets_with_depth(&mut self, colors: &[ColorAttachment], depth: DepthAttachment) -> RenderPass from(self) {
+        depths := [depth]
+        return self.begin_render(colors, &depths)
+    }
+
+    // Record a render pass that only writes `depth`, drawn with depth-only
+    // pipelines (RenderPipelineDescriptor.depth_only), such as a shadow map.
+    pub fn depth_pass(&mut self, depth: DepthAttachment) -> RenderPass from(self) {
+        depths := [depth]
+        return self.begin_render(&NO_COLORS, &depths)
+    }
+
+    // `depths` holds the depth attachment, or nothing.
+    fn begin_render(&mut self, colors: &[ColorAttachment], depths: &[DepthAttachment]) -> RenderPass from(self) {
         device := self.device
-        target := color.texture
-        device.check_owner(target.device)
-        assert((target.descriptor.usage & hal.TEXTURE_RENDER) != 0, "a render pass attachment needs TEXTURE_RENDER")
-        assert(!hal.is_depth(target.descriptor.format), "the color attachment has a depth format")
-        assert(color.load <= hal.LOAD_KEEP && depth_load <= hal.LOAD_KEEP, "unknown load action")
+        assert(colors.len <= device.limits.max_color_attachments as usize, "the pass has more color attachments than limits().max_color_attachments")
+        first := if colors.len != 0 {
+            colors[0].texture
+        } else {
+            depths[0].texture
+        }
+        width := first.descriptor.width
+        height := first.descriptor.height
+        samples := first.descriptor.samples
+        info := hal.RenderPassInfo.new(width, height, samples)
         tracked := Tracked.new()
-        tracked.color_a = target.handle.a
-        tracked.color_format = target.descriptor.format
+        tracked.width = width
+        tracked.height = height
+        tracked.samples = samples
         tracked.depth_format = hal.FORMAT_NONE
-        tracked.width = target.descriptor.width
-        tracked.height = target.descriptor.height
-        info := hal.RenderPassInfo {
-            color: target.handle.copy(),
-            color_format: target.descriptor.format,
-            width: target.descriptor.width,
-            height: target.descriptor.height,
-            load: color.load,
-            clear_red: color.red,
-            clear_green: color.green,
-            clear_blue: color.blue,
-            clear_alpha: color.alpha,
-            has_depth: has_depth,
-            depth: hal.Handle.null(),
-            depth_load: depth_load,
-            clear_depth: clear_depth
-        }
-        if has_depth {
-            device.check_owner(depth.device)
-            assert((depth.descriptor.usage & hal.TEXTURE_RENDER) != 0, "a render pass attachment needs TEXTURE_RENDER")
-            assert(hal.is_depth(depth.descriptor.format), "the depth attachment has a color format")
-            assert(depth.descriptor.width == target.descriptor.width && depth.descriptor.height == target.descriptor.height, "the attachments differ in size")
-            info.depth = depth.handle.copy()
-            tracked.depth_a = depth.handle.a
-            tracked.depth_format = depth.descriptor.format
-        }
-        device.raw_begin_render_pass(&mut self.handle, &info)
         before := 0u32
         after := 0u32
-        self.hazards.use_resource(target.handle.a ^ TEXTURE_KEY, hal.USE_COLOR, true, &mut before, &mut after)
-        if has_depth {
-            self.hazards.use_resource(depth.handle.a ^ TEXTURE_KEY, hal.USE_DEPTH, true, &mut before, &mut after)
+        for i in 0usize..colors.len {
+            color := &colors[i]
+            target := color.texture
+            device.check_owner(target.device)
+            check_attachment(target, width, height, samples)
+            assert(!hal.is_depth(target.descriptor.format), "the color attachment has a depth format")
+            assert(color.load <= hal.LOAD_KEEP, "unknown load action")
+            tracked.attach(target.handle.a)
+            info.colors[i] = hal.Attachment {
+                texture: target.handle.copy(),
+                format: target.descriptor.format,
+                load: color.load,
+                store: color.store,
+                clear_red: color.red,
+                clear_green: color.green,
+                clear_blue: color.blue,
+                clear_alpha: color.alpha,
+                clear_depth: 0.0,
+                has_resolve: color.has_resolve,
+                resolve: hal.Handle.null()
+            }
+            if color.has_resolve {
+                resolve := color.resolve
+                device.check_owner(resolve.device)
+                assert(samples != 1, "only multisampled attachments resolve")
+                check_attachment(resolve, width, height, 1)
+                assert(resolve.descriptor.format == target.descriptor.format, "the resolve target's format differs from its attachment's")
+                tracked.attach(resolve.handle.a)
+                info.colors[i].resolve = resolve.handle.copy()
+                self.hazards.use_resource(resolve.handle.a ^ TEXTURE_KEY, hal.USE_COLOR, true, &mut before, &mut after)
+            }
+            tracked.color_formats[i] = target.descriptor.format
+            self.hazards.use_resource(target.handle.a ^ TEXTURE_KEY, hal.USE_COLOR, true, &mut before, &mut after)
         }
+        tracked.color_count = colors.len as u32
+        info.color_count = colors.len as u32
+        if depths.len != 0 {
+            depth := &depths[0]
+            texture := depth.texture
+            device.check_owner(texture.device)
+            check_attachment(texture, width, height, samples)
+            assert(hal.is_depth(texture.descriptor.format), "the depth attachment has a color format")
+            assert(depth.load <= hal.LOAD_KEEP, "unknown load action")
+            tracked.attach(texture.handle.a)
+            tracked.depth_format = texture.descriptor.format
+            info.has_depth = true
+            info.depth = hal.Attachment {
+                texture: texture.handle.copy(),
+                format: texture.descriptor.format,
+                load: depth.load,
+                store: depth.store,
+                clear_red: 0.0,
+                clear_green: 0.0,
+                clear_blue: 0.0,
+                clear_alpha: 0.0,
+                clear_depth: depth.depth,
+                has_resolve: false,
+                resolve: hal.Handle.null()
+            }
+            self.hazards.use_resource(texture.handle.a ^ TEXTURE_KEY, hal.USE_DEPTH, true, &mut before, &mut after)
+        }
+        device.raw_begin_render_pass(&mut self.handle, &info)
         if before != 0 {
             device.raw_barrier(&mut self.handle, before, after)
         }
         return RenderPass { encoder: self, state: hal.PassState.new(), tracked: tracked }
+    }
+
+    // Fill every mipmap level of `texture` after the first by filtering
+    // down the one before it, as for a texture whose first level was just
+    // written or rendered. It needs a filterable color format (8-bit and
+    // 16-bit float ones); with one level it does nothing.
+    pub fn generate_mipmaps(&mut self, texture: &Texture) {
+        device := self.device
+        device.check_owner(texture.device)
+        assert(hal.is_filterable(texture.descriptor.format) && texture.descriptor.samples == 1, "generating mipmaps needs a filterable color format")
+        if texture.descriptor.mip_levels < 2 {
+            return
+        }
+        before := 0u32
+        after := 0u32
+        self.hazards.use_resource(texture.handle.a ^ TEXTURE_KEY, hal.USE_COPY_SRC | hal.USE_COPY_DST, true, &mut before, &mut after)
+        if before != 0 {
+            device.raw_barrier(&mut self.handle, before, after)
+        }
+        device.raw_generate_mipmaps(&mut self.handle, &texture.handle, &texture.descriptor)
     }
 
     // Copy `size` bytes between buffers. Offsets and size are multiples
@@ -2245,6 +2580,14 @@ fn copy_hazards(device: &Device, hazards: &mut Hazards, encoder: &mut hal.Handle
     }
 }
 
+// Check one attachment of a pass whose attachments are `width` by
+// `height` with `samples` samples.
+fn check_attachment(texture: &Texture, width: u32, height: u32, samples: u32) {
+    assert((texture.descriptor.usage & hal.TEXTURE_RENDER) != 0, "a render pass attachment needs TEXTURE_RENDER")
+    assert(texture.descriptor.width == width && texture.descriptor.height == height, "the attachments differ in size")
+    assert(texture.descriptor.samples == samples, "the attachments differ in their sample counts")
+}
+
 fn check_texture_copy(texture: &TextureDescriptor, region: &Region, buffer_size: u64, offset: u64, bytes_per_row: u32) {
     texel := hal.texel_size(texture.format) as u64
     assert(offset % 4 == 0 && offset % texel == 0, "the buffer offset of a texture copy is not a multiple of 4 and of the texel size")
@@ -2257,17 +2600,37 @@ struct Tracked {
     usage: [16]u32
     format: [16]u32
     texture_a: [16]u64
+    // The bound sampler compares.
+    comparison: [16]bool
     vertex_size: [8]u64
     index_size: u64
-    color_a: u64
-    depth_a: u64
-    color_format: u32
+    // The handles' first words of every attachment and resolve target.
+    attachments: [17]u64
+    attachment_count: usize
+    color_count: u32
+    color_formats: [8]u32
     depth_format: u32
+    samples: u32
     width: u32
     height: u32
 
     fn new() -> Tracked {
-        return Tracked { usage: [0u32; 16], format: [0u32; 16], texture_a: [0u64; 16], vertex_size: [0u64; 8], index_size: 0, color_a: 0, depth_a: 0, color_format: 0, depth_format: 0, width: 0, height: 0 }
+        return Tracked { usage: [0u32; 16], format: [0u32; 16], texture_a: [0u64; 16], comparison: [false; 16], vertex_size: [0u64; 8], index_size: 0, attachments: [0u64; 17], attachment_count: 0, color_count: 0, color_formats: [0u32; 8], depth_format: 0, samples: 1, width: 0, height: 0 }
+    }
+
+    fn attached(&self, a: u64) -> bool {
+        for i in 0usize..self.attachment_count {
+            if self.attachments[i] == a {
+                return true
+            }
+        }
+        return false
+    }
+
+    fn attach(&mut self, a: u64) {
+        assert(!self.attached(a), "a texture is attached to the pass twice")
+        self.attachments[self.attachment_count] = a
+        self.attachment_count += 1
     }
 }
 
@@ -2280,6 +2643,7 @@ fn bind_buffer(state: &mut hal.PassState, tracked: &mut Tracked, slot: u32, buff
     state.object_a[index] = buffer.handle.a
     state.object_b[index] = buffer.handle.b
     state.object_c[index] = buffer.handle.c
+    state.object_d[index] = buffer.handle.d
     state.sampler[index] = 0
     state.offset[index] = offset
     state.size[index] = size
@@ -2287,15 +2651,17 @@ fn bind_buffer(state: &mut hal.PassState, tracked: &mut Tracked, slot: u32, buff
     tracked.usage[index] = buffer.usage
     tracked.format[index] = 0
     tracked.texture_a[index] = 0
+    tracked.comparison[index] = false
 }
 
-fn bind_texture(state: &mut hal.PassState, tracked: &mut Tracked, slot: u32, texture: &Texture, sampler: &hal.Handle, kind: u32) {
+fn bind_texture(state: &mut hal.PassState, tracked: &mut Tracked, slot: u32, texture: &Texture, sampler: &hal.Handle, compare: bool, kind: u32) {
     assert(slot < hal.MAX_SLOTS, "binding slot out of range")
     index := slot as usize
     state.bound[index] = kind
     state.object_a[index] = texture.handle.a
     state.object_b[index] = texture.handle.b
     state.object_c[index] = texture.handle.c
+    state.object_d[index] = texture.handle.d
     state.sampler[index] = sampler.a
     state.offset[index] = 0
     state.size[index] = 0
@@ -2303,6 +2669,7 @@ fn bind_texture(state: &mut hal.PassState, tracked: &mut Tracked, slot: u32, tex
     tracked.usage[index] = texture.descriptor.usage
     tracked.format[index] = texture.descriptor.format
     tracked.texture_a[index] = texture.handle.a
+    tracked.comparison[index] = compare
 }
 
 // Check that the bound objects fit the pipeline's layout.
@@ -2323,14 +2690,19 @@ fn check_bound(state: &hal.PassState, tracked: &Tracked, limits: &hal.Limits) {
         } else if kind == hal.BINDING_SAMPLED_TEXTURE {
             assert(bound == hal.BOUND_SAMPLED_TEXTURE, "the pipeline expects a texture and sampler in a slot that holds none")
             assert((usage & hal.TEXTURE_SAMPLED) != 0, "a sampled texture slot holds a texture without TEXTURE_SAMPLED")
+            assert(!tracked.comparison[i], "a sampled texture slot holds a comparison sampler (use BindingLayout.comparison_texture)")
+        } else if kind == hal.BINDING_COMPARISON_TEXTURE {
+            assert(bound == hal.BOUND_SAMPLED_TEXTURE, "the pipeline expects a depth texture and comparison sampler in a slot that holds none")
+            assert((usage & hal.TEXTURE_SAMPLED) != 0, "a sampled texture slot holds a texture without TEXTURE_SAMPLED")
+            assert(hal.is_depth(tracked.format[i]), "a comparison texture slot holds a texture without a depth format")
+            assert(tracked.comparison[i], "a comparison texture slot holds a sampler that does not compare")
         } else if kind == hal.BINDING_STORAGE_TEXTURE {
             assert(bound == hal.BOUND_STORAGE_TEXTURE, "the pipeline expects a storage texture in a slot that holds none")
             assert((usage & hal.TEXTURE_STORAGE) != 0, "a storage texture slot holds a texture without TEXTURE_STORAGE")
             assert(tracked.format[i] == state.pipeline.formats[i], "the storage texture's format differs from the layout's")
         }
-        if kind == hal.BINDING_SAMPLED_TEXTURE || kind == hal.BINDING_STORAGE_TEXTURE {
-            a := tracked.texture_a[i]
-            assert(a != tracked.color_a && (tracked.depth_a == 0 || a != tracked.depth_a), "a texture is bound while it is an attachment of the pass")
+        if kind == hal.BINDING_SAMPLED_TEXTURE || kind == hal.BINDING_COMPARISON_TEXTURE || kind == hal.BINDING_STORAGE_TEXTURE {
+            assert(!tracked.attached(tracked.texture_a[i]), "a texture is bound while it is an attachment of the pass")
         }
     }
 }
@@ -2368,7 +2740,7 @@ pub struct ComputePass {
         device := self.encoder.device
         device.check_owner(texture.device)
         device.check_owner(sampler.device)
-        bind_texture(&mut self.state, &mut self.tracked, slot, texture, &sampler.handle, hal.BOUND_SAMPLED_TEXTURE)
+        bind_texture(&mut self.state, &mut self.tracked, slot, texture, &sampler.handle, sampler.compare, hal.BOUND_SAMPLED_TEXTURE)
     }
 
     // Bind `texture` for reading and writing single texels to `slot`.
@@ -2376,7 +2748,7 @@ pub struct ComputePass {
         device := self.encoder.device
         device.check_owner(texture.device)
         empty := hal.Handle.null()
-        bind_texture(&mut self.state, &mut self.tracked, slot, texture, &empty, hal.BOUND_STORAGE_TEXTURE)
+        bind_texture(&mut self.state, &mut self.tracked, slot, texture, &empty, false, hal.BOUND_STORAGE_TEXTURE)
     }
 
     // Run x * y * z workgroups of the pipeline's workgroup size. Each
@@ -2416,8 +2788,16 @@ pub struct RenderPass {
     pub fn set_pipeline(&mut self, pipeline: &RenderPipeline) {
         device := self.encoder.device
         device.check_owner(pipeline.device)
-        assert(pipeline.pipeline.color_format == self.tracked.color_format, "the pipeline's color format differs from the attachment's")
-        assert(pipeline.pipeline.depth_format == self.tracked.depth_format, "the pipeline's depth format differs from the pass's depth attachment")
+        expected := &pipeline.pipeline
+        same := expected.color_count == self.tracked.color_count
+        for i in 0usize..8 {
+            if i < expected.color_count as usize && expected.color_formats[i] != self.tracked.color_formats[i] {
+                same = false
+            }
+        }
+        assert(same, "the pipeline's color formats differ from the pass's color attachments")
+        assert(expected.depth_format == self.tracked.depth_format, "the pipeline's depth format differs from the pass's depth attachment")
+        assert(expected.samples == self.tracked.samples, "the pipeline's sample count differs from the pass's attachments")
         self.state.pipeline = pipeline.pipeline.copy()
         self.state.has_pipeline = true
         self.state.pipeline_dirty = true
@@ -2440,14 +2820,14 @@ pub struct RenderPass {
         device := self.encoder.device
         device.check_owner(texture.device)
         device.check_owner(sampler.device)
-        bind_texture(&mut self.state, &mut self.tracked, slot, texture, &sampler.handle, hal.BOUND_SAMPLED_TEXTURE)
+        bind_texture(&mut self.state, &mut self.tracked, slot, texture, &sampler.handle, sampler.compare, hal.BOUND_SAMPLED_TEXTURE)
     }
 
     pub fn set_storage_texture(&mut self, slot: u32, texture: &Texture) {
         device := self.encoder.device
         device.check_owner(texture.device)
         empty := hal.Handle.null()
-        bind_texture(&mut self.state, &mut self.tracked, slot, texture, &empty, hal.BOUND_STORAGE_TEXTURE)
+        bind_texture(&mut self.state, &mut self.tracked, slot, texture, &empty, false, hal.BOUND_STORAGE_TEXTURE)
     }
 
     // Read vertex buffer `slot` of the pipeline from `buffer`, starting
@@ -2490,6 +2870,13 @@ pub struct RenderPass {
         assert(min_depth >= 0.0 && max_depth <= 1.0 && min_depth <= max_depth, "viewport depths lie outside 0.0 to 1.0")
         device := self.encoder.device
         device.raw_set_viewport(&mut self.encoder.handle, x, y, width, height, min_depth, max_depth)
+    }
+
+    // The color BLEND_FACTOR_CONSTANT reads, until the pass ends; each pass
+    // starts with transparent black.
+    pub fn set_blend_constant(&mut self, red: f64, green: f64, blue: f64, alpha: f64) {
+        device := self.encoder.device
+        device.raw_set_blend_constant(&mut self.encoder.handle, red, green, blue, alpha)
     }
 
     // Discard pixels outside this rectangle.

@@ -60,6 +60,12 @@ fn fixture() -> PathBuf {
     root().join("tests/stdlib/gpu_wgsl_checks.dodo")
 }
 
+/// Mipmaps, shadow maps, depth bias, multisampling, several color targets
+/// and custom blending, with WGSL shaders.
+fn feature_fixture() -> PathBuf {
+    root().join("tests/stdlib/gpu_feature_checks.dodo")
+}
+
 /// The diagnostics of checking `source`, which must fail.
 fn check_fails(scratch: &Scratch, source: &str) -> String {
     let path = scratch.file("main.dodo", source);
@@ -68,8 +74,9 @@ fn check_fails(scratch: &Scratch, source: &str) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
-#[test]
-fn wgsl_checks_run_on_every_available_backend() {
+/// Build `source` at -O`optimization` and run it: it must pass on every
+/// backend it finds and end with `ok_line`, or exit 2 without a backend.
+fn run_fixture(source: &Path, optimization: &str, ok_line: &str) {
     let scratch = Scratch::new("checks");
     let program = scratch
         .0
@@ -77,19 +84,19 @@ fn wgsl_checks_run_on_every_available_backend() {
     success(
         &dodo(&[
             "build",
-            fixture().to_str().unwrap(),
+            source.to_str().unwrap(),
             "-O",
-            "0",
+            optimization,
             "-o",
             program.to_str().unwrap(),
         ]),
-        "compile the WGSL checks",
+        &format!("compile {}", source.display()),
     );
     let output = Command::new(&program).output().unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);
     match output.status.code() {
         Some(0) => {
-            assert!(stdout.ends_with("wgsl ok\n"), "{stdout}");
+            assert!(stdout.ends_with(ok_line), "{stdout}");
             if cfg!(target_os = "macos") {
                 assert!(stdout.contains("Metal ok"), "{stdout}");
             }
@@ -99,7 +106,8 @@ fn wgsl_checks_run_on_every_available_backend() {
             eprintln!("no GPU backend: the shaders were only translated");
         }
         _ => panic!(
-            "wgsl checks: {}\n{stdout}\n{}",
+            "{}: {}\n{stdout}\n{}",
+            source.display(),
             output.status,
             String::from_utf8_lossy(&output.stderr)
         ),
@@ -107,24 +115,38 @@ fn wgsl_checks_run_on_every_available_backend() {
 }
 
 #[test]
+fn wgsl_checks_run_on_every_available_backend() {
+    run_fixture(&fixture(), "0", "wgsl ok\n");
+}
+
+#[test]
+fn feature_checks_run_on_every_available_backend() {
+    for optimization in ["0", "3"] {
+        run_fixture(&feature_fixture(), optimization, "features ok\n");
+    }
+}
+
+#[test]
 fn wgsl_checks_build_for_every_hosted_target() {
     let scratch = Scratch::new("targets");
-    for target in HOSTED_TARGETS {
-        let object = scratch.0.join(format!("checks-{target}.o"));
-        success(
-            &dodo(&[
-                "build",
-                fixture().to_str().unwrap(),
-                "--emit",
-                "obj",
-                "--target",
-                target,
-                "-o",
-                object.to_str().unwrap(),
-            ]),
-            &format!("emit the WGSL checks for {target}"),
-        );
-        assert!(fs::metadata(object).unwrap().len() > 0);
+    for (name, source) in [("checks", fixture()), ("features", feature_fixture())] {
+        for target in HOSTED_TARGETS {
+            let object = scratch.0.join(format!("{name}-{target}.o"));
+            success(
+                &dodo(&[
+                    "build",
+                    source.to_str().unwrap(),
+                    "--emit",
+                    "obj",
+                    "--target",
+                    target,
+                    "-o",
+                    object.to_str().unwrap(),
+                ]),
+                &format!("emit {} for {target}", source.display()),
+            );
+            assert!(fs::metadata(object).unwrap().len() > 0);
+        }
     }
 }
 

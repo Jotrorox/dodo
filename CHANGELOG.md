@@ -49,6 +49,20 @@
   caller's section instead.
 - 64-bit integer division in firmware takes one 32-bit division when both
   operands fit in 32 bits, instead of 64 shift-and-subtract steps.
+- std/gpu renders beyond one blended color target: mipmapped textures
+  (`TextureDescriptor.mipmapped`, `Region.at_level`,
+  `CommandEncoder.generate_mipmaps`), samplers with mipmap filtering, level
+  ranges, anisotropy, border colors and comparisons; depth-only pipelines
+  (`RenderPipelineDescriptor.depth_only`, `CommandEncoder.depth_pass`) with
+  depth bias, read through the new `BindingLayout.comparison_texture` for
+  shadow maps; 4x multisampled render targets that resolve into ordinary
+  textures (`TextureDescriptor.multisampled`, `ColorAttachment.with_resolve`),
+  with alpha-to-coverage; several color targets per pass (`ColorTarget`,
+  `render_pass_targets`, `Limits.max_color_attachments`); and custom blending
+  (`gpu.Blend` factors and operations, write masks, `set_blend_constant`).
+  Attachments can be `discard()`ed after a pass. See
+  [Textures and samplers](docs/src/content/docs/gpu.md) and
+  `tests/stdlib/gpu_feature_checks.dodo`.
 - `gpu.wgsl("...")` writes a std/gpu shader once in WGSL: the compiler
   translates it into SPIR-V, Metal Shading Language and GLSL 4.50 when the
   program is built (through the `naga` crate, behind the new default `wgsl`
