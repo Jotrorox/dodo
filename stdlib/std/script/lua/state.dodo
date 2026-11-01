@@ -158,6 +158,12 @@ struct Global {
     absentkey: Value
     // Allocation limit in bytes (0: unlimited).
     mem_limit: isize
+    // Small-block allocator (mem.dodo): a free list per 16-byte size class,
+    // the unused tail of the newest chunk, and the list of chunks.
+    small_free: [17]*mut u8
+    small_cursor: *mut u8
+    small_end: *mut u8
+    small_chunks: *mut u8
 }
 
 // A Lua thread. `*mut State` is the `L` parameter of every internal function.
@@ -902,6 +908,7 @@ fn state_close(L0: *mut State) -> isize {
             mem_free(L, (*g).mt as *mut u8, 9 * 8)
         }
         let leaked = (*g).total_bytes
+        mem_release_chunks(g)
         let block = ptr.offset(L as *mut u8, -(mem.offset_of::<MainBlock>("l") as isize))
         free(block)
         return leaked
