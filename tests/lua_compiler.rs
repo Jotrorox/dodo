@@ -1,11 +1,11 @@
 //! The Lua compiler in `std/script/lua` must produce the same bytecode,
 //! debug information and syntax errors as the reference `luac` 5.4.
 //!
-//! The test tool in `tests/lua/tool` is assembled with the package sources
-//! (as `tests/lua/build_tool.sh` does) and run over `tests/lua/snippets`
-//! (listings in the `luac -l -l` format) and `tests/lua/errors` (syntax
+//! The test tool in `tests/lua_compiler/tool` is assembled with the package sources
+//! (as `tests/lua_compiler/build_tool.sh` does) and run over `tests/lua_compiler/snippets`
+//! (listings in the `luac -l -l` format) and `tests/lua_compiler/errors` (syntax
 //! error messages). The expected outputs were produced by PUC Lua 5.4.9's
-//! luac with `tests/lua/update_expected.sh`.
+//! luac with `tests/lua_compiler/update_expected.sh`.
 #![cfg(feature = "llvm")]
 
 use std::fs;
@@ -38,8 +38,8 @@ fn build_tool() -> (Workspace, PathBuf) {
             fs::copy(&path, package.join(path.file_name().unwrap())).unwrap();
         }
     }
-    fs::copy(root().join("tests/lua/tool/lua_tool.dodo"), package.join("lua_tool.dodo")).unwrap();
-    fs::copy(root().join("tests/lua/tool/main.dodo"), dir.join("main.dodo")).unwrap();
+    fs::copy(root().join("tests/lua_compiler/tool/lua_tool.dodo"), package.join("lua_tool.dodo")).unwrap();
+    fs::copy(root().join("tests/lua_compiler/tool/main.dodo"), dir.join("main.dodo")).unwrap();
     let tool = dir.join("luatool");
     let output = Command::new(COMPILER)
         .arg("build")
@@ -91,7 +91,7 @@ fn lua_compiler_matches_reference_luac() {
     let (_workspace, tool) = build_tool();
     let mut failures = Vec::new();
 
-    let snippets = root().join("tests/lua/snippets");
+    let snippets = root().join("tests/lua_compiler/snippets");
     for name in lua_sources(&snippets) {
         let output = Command::new(&tool).current_dir(&snippets).arg("-l").arg(&name).output().unwrap();
         let expected = fs::read_to_string(snippets.join(name.replace(".lua", ".expected"))).unwrap();
@@ -104,7 +104,7 @@ fn lua_compiler_matches_reference_luac() {
         }
     }
 
-    let errors = root().join("tests/lua/errors");
+    let errors = root().join("tests/lua_compiler/errors");
     for name in lua_sources(&errors) {
         let output = Command::new(&tool).current_dir(&errors).arg(&name).output().unwrap();
         let expected = fs::read_to_string(errors.join(name.replace(".lua", ".expected"))).unwrap();

@@ -1,6 +1,6 @@
 #!/bin/sh
 # Compare the Dodo Lua compiler with the reference luac on Lua files.
-#   tests/lua/compare.sh LUAC_DIR file.lua...
+#   tests/lua_compiler/compare.sh LUAC_DIR file.lua...
 # For every file: the listings (`luac -l -l`, addresses normalized) and the
 # binary chunks (`luac -o`) must be identical. Prints one line per file.
 luacdir=$1; shift

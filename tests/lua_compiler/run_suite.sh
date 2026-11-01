@@ -3,7 +3,7 @@
 # official Lua test suite three ways -- from source, as a luac-compiled
 # chunk, and as a chunk compiled by the Dodo compiler -- and report the
 # outcome of each.
-#   tests/lua/run_suite.sh LUA_SRC_DIR TESTS_DIR
+#   tests/lua_compiler/run_suite.sh LUA_SRC_DIR TESTS_DIR
 luadir=$1; tests=$2
 root=$(cd "$(dirname "$0")/../.." && pwd)
 tool="$root/target/luatool/luatool"

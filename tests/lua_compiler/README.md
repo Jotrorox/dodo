@@ -27,14 +27,16 @@ information (line info, locals, upvalues) and the same syntax errors.
 
 ## Comparing with a reference Lua
 
-Build PUC Lua 5.4.9 (`make macosx` or `make linux`) somewhere, then:
+Build PUC Lua 5.4.9 (`make macosx` or `make linux`) somewhere; `LUA_SRC_DIR` is
+the directory holding its `lua` and `luac` (for example `lua-5.4.9/src`, or
+`target/lua-reference/bin` once `scripts/test_lua.py fetch` exists). Then:
 
-    tests/lua/build_tool.sh -O2
-    tests/lua/compare.sh LUA_SRC_DIR files.lua...      # listings + binary chunks
-    tests/lua/update_expected.sh LUA_SRC_DIR           # refresh *.expected
-    python3 tests/lua/gen_cases.py OUT && tests/lua/compare.sh LUA_SRC_DIR OUT/*.lua
-    python3 tests/lua/fuzz.py OUT 3000 SEED && tests/lua/compare.sh LUA_SRC_DIR OUT/*.lua
-    tests/lua/run_suite.sh LUA_SRC_DIR LUA_TESTS_DIR   # run the official suite
+    tests/lua_compiler/build_tool.sh -O2
+    tests/lua_compiler/compare.sh LUA_SRC_DIR files.lua...      # listings + binary chunks
+    tests/lua_compiler/update_expected.sh LUA_SRC_DIR           # refresh *.expected
+    python3 tests/lua_compiler/gen_cases.py OUT && tests/lua_compiler/compare.sh LUA_SRC_DIR OUT/*.lua
+    python3 tests/lua_compiler/fuzz.py OUT 3000 SEED && tests/lua_compiler/compare.sh LUA_SRC_DIR OUT/*.lua
+    tests/lua_compiler/run_suite.sh LUA_SRC_DIR LUA_TESTS_DIR   # run the official suite
 
 `compare.sh` requires both the normalized `luac -l -l` listing and the
 `luac -o` binary chunk to be byte-identical (or both compilers to fail with

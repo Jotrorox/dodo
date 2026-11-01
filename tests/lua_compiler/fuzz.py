@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Random Lua program generator for differential testing against luac.
 
-    python3 tests/lua/fuzz.py OUTDIR COUNT [SEED]
+    python3 tests/lua_compiler/fuzz.py OUTDIR COUNT [SEED]
 
 Writes COUNT syntactically valid programs that mix every statement form,
 operators with constants of all kinds (to exercise folding, immediate and

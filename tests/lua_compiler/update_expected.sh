@@ -1,6 +1,6 @@
 #!/bin/sh
 # Regenerate the expected outputs of tests/lua_compiler.rs with a reference
-# PUC Lua 5.4 luac:   tests/lua/update_expected.sh LUAC_DIR
+# PUC Lua 5.4 luac:   tests/lua_compiler/update_expected.sh LUAC_DIR
 # Listings have their addresses replaced by ADDR; error files hold the
 # message without the "luac: " prefix.
 luacdir=$1

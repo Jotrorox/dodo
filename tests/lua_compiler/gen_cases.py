@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Generate Lua sources that exercise compiler limits and edge cases.
 
-    python3 tests/lua/gen_cases.py OUTDIR
+    python3 tests/lua_compiler/gen_cases.py OUTDIR
 
 The files are compared against the reference luac with compare.sh. They are
 generated instead of committed because some are large (constant tables past
