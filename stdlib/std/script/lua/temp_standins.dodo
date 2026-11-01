@@ -52,7 +52,11 @@ fn num_string_to_number(text: &[u8], ival: &mut i64, fval: &mut f64) -> u32 {
     } else {
         for j < n && text[j] >= 48 && text[j] <= 57 {
             let d = (text[j] - 48) as u64
-            let limit = if neg { 9223372036854775808u64 } else { 9223372036854775807u64 }
+            let limit = if neg {
+                9223372036854775808u64
+            } else {
+                9223372036854775807u64
+            }
             if a > (limit - d) / 10 {
                 overflow = true
             }
@@ -68,7 +72,9 @@ fn num_string_to_number(text: &[u8], ival: &mut i64, fval: &mut f64) -> u32 {
         if neg {
             a = core.wrapping_sub(0u64, a)
         }
-        unsafe { *ival = *(ptr.from_ref(&a) as *mut i64) }
+        unsafe {
+            *ival = *(ptr.from_ref(&a) as *mut i64)
+        }
         return 1
     }
     // Float forms (no 'inf'/'nan').

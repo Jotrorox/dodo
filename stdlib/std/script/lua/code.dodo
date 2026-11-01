@@ -163,7 +163,9 @@ fn ex_init(e: *mut CgExp, k: i32, info: i32) {
 }
 
 fn ex_copy(dst: *mut CgExp, src: *mut CgExp) {
-    unsafe { ptr.copy_nonoverlapping(src, dst, 1) }
+    unsafe {
+        ptr.copy_nonoverlapping(src, dst, 1)
+    }
 }
 
 fn ex_swap(a: *mut CgExp, b: *mut CgExp) {
@@ -186,7 +188,9 @@ fn ex_blank() -> CgExp {
 }
 
 fn ex_has_jumps(e: *mut CgExp) -> bool {
-    unsafe { return (*e).t != (*e).f }
+    unsafe {
+        return (*e).t != (*e).f
+    }
 }
 
 fn ex_multret(k: i32) -> bool {
@@ -198,7 +202,9 @@ fn ex_multret(k: i32) -> bool {
 fn cg_f64_bits(x: f64) -> u64 {
     unsafe {
         v := x
-        unsafe { return *(ptr.from_mut(&mut v) as *mut u64) }
+        unsafe {
+            return *(ptr.from_mut(&mut v) as *mut u64)
+        }
     }
 }
 
@@ -259,10 +265,14 @@ fn cg_shiftl(x: i64, y: i64) -> i64 {
 }
 
 fn cg_i2u(x: i64) -> u64 {
-    unsafe { return *(ptr.from_ref(&x) as *mut u64) }
+    unsafe {
+        return *(ptr.from_ref(&x) as *mut u64)
+    }
 }
 fn cg_u2i(x: u64) -> i64 {
-    unsafe { return *(ptr.from_ref(&x) as *mut i64) }
+    unsafe {
+        return *(ptr.from_ref(&x) as *mut i64)
+    }
 }
 
 fn cg_fmod(a: f64, b: f64) -> f64 {
@@ -591,7 +601,9 @@ fn cg_emit_extra(fs: *mut FnState, ax: i32) -> i32!Throw {
 }
 
 fn cg_instr(fs: *mut FnState, pc: i32) -> *mut u32 {
-    unsafe { return ptr.offset((*(*fs).f).code, pc as isize) }
+    unsafe {
+        return ptr.offset((*(*fs).f).code, pc as isize)
+    }
 }
 
 // Position of the previous instruction if no jump target separates it from
@@ -633,7 +645,9 @@ fn cg_need_regs(fs: *mut FnState, n: i32) -> void!Throw {
 fn cg_alloc_regs(fs: *mut FnState, n: i32) -> void!Throw {
     unsafe {
         cg_need_regs(fs, n)?
-        unsafe { (*fs).free_reg = (*fs).free_reg + n }
+        unsafe {
+            (*fs).free_reg = (*fs).free_reg + n
+        }
         return ok()
     }
 }
@@ -844,7 +858,11 @@ fn cg_kc_grow(cx: *mut CompileState) -> void!Throw {
     unsafe {
         let oldcap = (*cx).kc_cap
         let old = (*cx).kc_slots
-        let newcap = if oldcap == 0 { 64usize } else { oldcap * 2 }
+        let newcap = if oldcap == 0 {
+            64usize
+        } else {
+            oldcap * 2
+        }
         let nb = mem_alloc((*cx).L, newcap * mem.size_of::<CgKSlot>())? as *mut CgKSlot
         for i in 0usize..newcap {
             (*ptr.offset(nb, i as isize)).tag = 0
@@ -992,7 +1010,11 @@ fn cg_k_bool(fs: *mut FnState, b: bool) -> i32!Throw {
     unsafe {
         v := Value { bits: 0, tag: 0 }
         set_bool(ptr.from_mut(&mut v), b)
-        let tag = if b { TAG_TRUE } else { TAG_FALSE }
+        let tag = if b {
+            TAG_TRUE
+        } else {
+            TAG_FALSE
+        }
         return cg_k_add(fs, tag, 0, ptr.from_mut(&mut v))
     }
 }
@@ -1528,17 +1550,23 @@ fn cg_is_kshort(fs: *mut FnState, e: *mut CgExp) -> bool {
 }
 
 fn ex_is_kint(e: *mut CgExp) -> bool {
-    unsafe { return (*e).k == EK_KINT && !ex_has_jumps(e) }
+    unsafe {
+        return (*e).k == EK_KINT && !ex_has_jumps(e)
+    }
 }
 
 // Integer constant fitting an unsigned C operand.
 fn ex_is_cint(e: *mut CgExp) -> bool {
-    unsafe { return ex_is_kint(e) && (*e).ival >= 0 && (*e).ival <= MAXARG_C as i64 }
+    unsafe {
+        return ex_is_kint(e) && (*e).ival >= 0 && (*e).ival <= MAXARG_C as i64
+    }
 }
 
 // Integer constant fitting a signed C operand.
 fn ex_is_scint(e: *mut CgExp) -> bool {
-    unsafe { return ex_is_kint(e) && cg_fits_sc((*e).ival) }
+    unsafe {
+        return ex_is_kint(e) && cg_fits_sc((*e).ival)
+    }
 }
 
 // Integer (or integral float) constant fitting a signed immediate; stores
@@ -1721,7 +1749,11 @@ fn cg_compare_order(fs: *mut FnState, opr: i32, e1: *mut CgExp, e2: *mut CgExp) 
             op = OP_LT + (opr - OPR_LT) as u32
         }
         cg_release_both(fs, e1, e2)
-        let c = if isfloat { 1i32 } else { 0i32 }
+        let c = if isfloat {
+            1i32
+        } else {
+            0i32
+        }
         (*e1).info = cg_test_and_jump(fs, op, r1, r2, c, true)?
         (*e1).k = EK_JMP
         return ok()
@@ -1749,7 +1781,11 @@ fn cg_compare_eq(fs: *mut FnState, opr: i32, e1: *mut CgExp, e2: *mut CgExp) -> 
             r2 = cg_to_anyreg(fs, e2)?
         }
         cg_release_both(fs, e1, e2)
-        let c = if isfloat { 1i32 } else { 0i32 }
+        let c = if isfloat {
+            1i32
+        } else {
+            0i32
+        }
         (*e1).info = cg_test_and_jump(fs, op, r1, r2, c, opr == OPR_EQ)?
         (*e1).k = EK_JMP
         return ok()
@@ -1765,7 +1801,11 @@ fn cg_unary(fs: *mut FnState, opr: i32, e: *mut CgExp, line: i32) -> void!Throw 
                 zero.k = EK_KINT
                 zero.ival = 0
             }
-            let fop = if opr == UOPR_MINUS { FOLD_UNM } else { FOLD_BNOT }
+            let fop = if opr == UOPR_MINUS {
+                FOLD_UNM
+            } else {
+                FOLD_BNOT
+            }
             if cg_fold(fop, e, ptr.from_mut(&mut zero)) {
                 return ok()
             }
@@ -1909,7 +1949,11 @@ fn cg_ceil_log2(x: i32) -> i32 {
 // Fill in the NEWTABLE at `pc` (and its EXTRAARG) with the size hints.
 fn cg_table_size(fs: *mut FnState, pc: i32, ra: i32, asize: i32, hsize: i32) {
     unsafe {
-        let rb = if hsize != 0 { cg_ceil_log2(hsize) + 1 } else { 0i32 }
+        let rb = if hsize != 0 {
+            cg_ceil_log2(hsize) + 1
+        } else {
+            0i32
+        }
         let extra = asize / (MAXARG_C + 1)
         let rc = asize % (MAXARG_C + 1)
         let p = cg_instr(fs, pc)
@@ -1922,7 +1966,11 @@ fn cg_table_size(fs: *mut FnState, pc: i32, ra: i32, asize: i32, hsize: i32) {
 // `nelems` is the number of list items before them.
 fn cg_flush_list(fs: *mut FnState, base: i32, nelems: i32, tostore: i32) -> void!Throw {
     unsafe {
-        let n = if tostore == CG_MULTRET { 0i32 } else { tostore }
+        let n = if tostore == CG_MULTRET {
+            0i32
+        } else {
+            tostore
+        }
         if nelems <= MAXARG_C {
             cg_emit_abc(fs, OP_SETLIST, base, n, nelems)?
         } else {

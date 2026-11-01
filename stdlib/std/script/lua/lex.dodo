@@ -215,7 +215,9 @@ fn lmsg_char(m: *mut LexMsg, c: u8) {
 }
 
 fn lmsg_lstr(m: *mut LexMsg, s: *mut LString) {
-    unsafe { lmsg_bytes(m, str_data(s) as *const u8, str_len(s)) }
+    unsafe {
+        lmsg_bytes(m, str_data(s) as *const u8, str_len(s))
+    }
 }
 
 fn lmsg_int(m: *mut LexMsg, v: i64) {
@@ -223,7 +225,11 @@ fn lmsg_int(m: *mut LexMsg, v: i64) {
     n := 0usize
     neg := v < 0
     // Work on the negative value so the minimum integer has no overflow.
-    x := if neg { v } else { 0 - v }
+    x := if neg {
+        v
+    } else {
+        0 - v
+    }
     for {
         let d = 0 - (x % 10)
         digits[n] = 48 + d as u8
@@ -336,7 +342,9 @@ fn lx_error(cx: *mut CompileState, text: &str, token: i32) -> Throw {
 
 // A syntax error near the current token.
 fn lex_error_here(cx: *mut CompileState, text: &str) -> Throw {
-    unsafe { return lx_error(cx, text, (*cx).tk) }
+    unsafe {
+        return lx_error(cx, text, (*cx).tk)
+    }
 }
 
 // A semantic error (no token shown).
@@ -375,7 +383,11 @@ fn lx_strtab_grow(cx: *mut CompileState) -> void!Throw {
     unsafe {
         let oldcap = (*cx).st_cap
         let old = (*cx).st_slots
-        let newcap = if oldcap == 0 { 256usize } else { oldcap * 2 }
+        let newcap = if oldcap == 0 {
+            256usize
+        } else {
+            oldcap * 2
+        }
         let nb = mem_alloc((*cx).L, newcap * mem.size_of::<LexStr>())? as *mut LexStr
         for i in 0usize..newcap {
             (*ptr.offset(nb, i as isize)).s = 0 as *mut LString
@@ -559,13 +571,17 @@ fn lx_plain_run(cx: *mut CompileState, del: i32) -> usize {
 }
 
 fn lx_save_advance(cx: *mut CompileState) -> void!Throw {
-    unsafe { lx_save(cx, (*cx).cur)? }
+    unsafe {
+        lx_save(cx, (*cx).cur)?
+    }
     lx_advance(cx)
     return ok()
 }
 
 fn lx_unsave(cx: *mut CompileState, n: usize) {
-    unsafe { (*cx).nbuf = (*cx).nbuf - n }
+    unsafe {
+        (*cx).nbuf = (*cx).nbuf - n
+    }
 }
 
 // Skip a line break: \n, \r, \n\r or \r\n each count as one.
@@ -671,7 +687,11 @@ fn lx_longstring(cx: *mut CompileState, keep: bool, sep: usize) -> void!Throw {
                 m := lmsg_new((*cx).L)
                 let pm = ptr.from_mut(&mut m)
                 lmsg_begin(cx, pm)
-                lmsg_str(pm, if keep { "unfinished long string (starting at line " } else { "unfinished long comment (starting at line " })
+                lmsg_str(pm, if keep {
+                    "unfinished long string (starting at line "
+                } else {
+                    "unfinished long comment (starting at line "
+                })
                 lmsg_int(pm, startline as i64)
                 lmsg_str(pm, ")")
                 return err(lmsg_raise(cx, pm, TK_EOS))

@@ -75,11 +75,15 @@ struct ParTable {
 // --- Token helpers ---------------------------------------------------------------
 
 fn par_tk(cx: *mut CompileState) -> i32 {
-    unsafe { return (*cx).tk }
+    unsafe {
+        return (*cx).tk
+    }
 }
 
 fn par_fs(cx: *mut CompileState) -> *mut FnState {
-    unsafe { return (*cx).fs }
+    unsafe {
+        return (*cx).fs
+    }
 }
 
 fn par_err_expected(cx: *mut CompileState, token: i32) -> Throw {
@@ -202,18 +206,24 @@ fn par_nest(cx: *mut CompileState) -> void!Throw {
 }
 
 fn par_unnest(cx: *mut CompileState) {
-    unsafe { (*cx).nlevels = (*cx).nlevels - 1 }
+    unsafe {
+        (*cx).nlevels = (*cx).nlevels - 1
+    }
 }
 
 // --- Variables -------------------------------------------------------------------
 
 fn par_var(fs: *mut FnState, vidx: i32) -> *mut ParVar {
-    unsafe { return ptr.offset((*(*fs).cx).actvar, ((*fs).first_local + vidx) as isize) }
+    unsafe {
+        return ptr.offset((*(*fs).cx).actvar, ((*fs).first_local + vidx) as isize)
+    }
 }
 
 // Value of the compile-time constant at absolute index `idx`.
 fn par_const_slot(fs: *mut FnState, idx: i32) -> *mut Value {
-    unsafe { return ptr.offset((*(*fs).cx).actvar, idx as isize) as *mut Value }
+    unsafe {
+        return ptr.offset((*(*fs).cx).actvar, idx as isize) as *mut Value
+    }
 }
 
 // First register above the variables below level `nvar`.
@@ -233,7 +243,9 @@ fn par_reg_level(fs: *mut FnState, nvar: i32) -> i32 {
 
 // Number of registers held by active variables.
 fn par_regs_in_use(fs: *mut FnState) -> i32 {
-    unsafe { return par_reg_level(fs, (*fs).nactvar) }
+    unsafe {
+        return par_reg_level(fs, (*fs).nactvar)
+    }
 }
 
 fn par_local_debug(fs: *mut FnState, vidx: i32) -> *mut LocVar {
@@ -275,7 +287,11 @@ fn par_declare_local(cx: *mut CompileState, name: *mut LString) -> i32!Throw {
         par_limit(fs, (*cx).nactv + 1 - (*fs).first_local, PAR_MAXVARS, "local variables")?
         if (*cx).nactv >= (*cx).capactv {
             let old = (*cx).capactv
-            let newcap = if old == 0 { 32i32 } else { old * 2 }
+            let newcap = if old == 0 {
+                32i32
+            } else {
+                old * 2
+            }
             let esz = mem.size_of::<ParVar>()
             (*cx).actvar = mem_realloc((*cx).L, (*cx).actvar as *mut u8, (old as usize) * esz, (newcap as usize) * esz)? as *mut ParVar
             (*cx).capactv = newcap
@@ -495,7 +511,9 @@ fn par_fit_values(cx: *mut CompileState, nvars: i32, nexps: i32, e: *mut CgExp) 
 // --- Gotos and labels --------------------------------------------------------------
 
 fn par_label_slot(list: *mut ParLabel, i: i32) -> *mut ParLabel {
-    unsafe { return ptr.offset(list, i as isize) }
+    unsafe {
+        return ptr.offset(list, i as isize)
+    }
 }
 
 fn par_err_into_scope(cx: *mut CompileState, gt: *mut ParLabel) -> Throw {
@@ -547,11 +565,27 @@ fn par_find_label(cx: *mut CompileState, name: *mut LString) -> *mut ParLabel {
 
 fn par_add_label(cx: *mut CompileState, isgoto: bool, name: *mut LString, line: i32, pc: i32) -> i32!Throw {
     unsafe {
-        n := if isgoto { (*cx).ngoto } else { (*cx).nlabel }
-        cap := if isgoto { (*cx).capgoto } else { (*cx).caplabel }
-        arr := if isgoto { (*cx).gotos } else { (*cx).labels }
+        n := if isgoto {
+            (*cx).ngoto
+        } else {
+            (*cx).nlabel
+        }
+        cap := if isgoto {
+            (*cx).capgoto
+        } else {
+            (*cx).caplabel
+        }
+        arr := if isgoto {
+            (*cx).gotos
+        } else {
+            (*cx).labels
+        }
         if n >= cap {
-            let newcap = if cap == 0 { 16i32 } else { cap * 2 }
+            let newcap = if cap == 0 {
+                16i32
+            } else {
+                cap * 2
+            }
             let esz = mem.size_of::<ParLabel>()
             arr = mem_realloc((*cx).L, arr as *mut u8, (cap as usize) * esz, (newcap as usize) * esz)? as *mut ParLabel
             if isgoto {
@@ -846,7 +880,9 @@ fn par_keyed_field(cx: *mut CompileState, cc: *mut ParTable) -> void!Throw {
 }
 
 fn par_table_v(cc: *mut ParTable) -> *mut CgExp {
-    unsafe { return ptr.offset(cc as *mut u8, mem.offset_of::<ParTable>("v") as isize) as *mut CgExp }
+    unsafe {
+        return ptr.offset(cc as *mut u8, mem.offset_of::<ParTable>("v") as isize) as *mut CgExp
+    }
 }
 
 // Store the pending list item; flush a full batch with SETLIST.
@@ -1306,7 +1342,9 @@ fn par_block(cx: *mut CompileState) -> void!Throw {
 }
 
 fn par_lhs_v(l: *mut ParLhs) -> *mut CgExp {
-    unsafe { return ptr.offset(l as *mut u8, mem.offset_of::<ParLhs>("v") as isize) as *mut CgExp }
+    unsafe {
+        return ptr.offset(l as *mut u8, mem.offset_of::<ParLhs>("v") as isize) as *mut CgExp
+    }
 }
 
 // In a multiple assignment, a local/upvalue assigned now may be the table
@@ -1572,7 +1610,11 @@ fn par_loop_body(cx: *mut CompileState, base: i32, line: i32, nvars: i32, isgen:
         let fs = par_fs(cx)
         bl := par_fresh_scope()
         par_expect(cx, TK_DO)?
-        let prep = cg_emit_abx(fs, if isgen { OP_TFORPREP } else { OP_FORPREP }, base, 0)?
+        let prep = cg_emit_abx(fs, if isgen {
+            OP_TFORPREP
+        } else {
+            OP_FORPREP
+        }, base, 0)?
         par_open_scope(fs, ptr.from_mut(&mut bl), false)
         par_activate_locals(cx, nvars)?
         cg_alloc_regs(fs, nvars)?
@@ -1583,7 +1625,11 @@ fn par_loop_body(cx: *mut CompileState, base: i32, line: i32, nvars: i32, isgen:
             cg_emit_abc(fs, OP_TFORCALL, base, 0, nvars)?
             cg_line_fix(fs, line)?
         }
-        let endfor = cg_emit_abx(fs, if isgen { OP_TFORLOOP } else { OP_FORLOOP }, base, 0)?
+        let endfor = cg_emit_abx(fs, if isgen {
+            OP_TFORLOOP
+        } else {
+            OP_FORLOOP
+        }, base, 0)?
         par_set_loop_jump(fs, endfor, prep + 1, true)?
         return cg_line_fix(fs, line)
     }

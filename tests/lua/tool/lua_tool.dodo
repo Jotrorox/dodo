@@ -66,7 +66,11 @@ fn lt_hex(m: *mut LexMsg, v: u64) {
     x := v
     for {
         let d = (x & 15) as u8
-        digits[n] = if d < 10 { 48 + d } else { 87 + d }
+        digits[n] = if d < 10 {
+            48 + d
+        } else {
+            87 + d
+        }
         n = n + 1
         x = x >> 4
         if x == 0 {
@@ -80,7 +84,9 @@ fn lt_hex(m: *mut LexMsg, v: u64) {
 }
 
 fn lt_ptr<T>(m: *mut LexMsg, p: *mut T) {
-    unsafe { lt_hex(m, p as usize as u64) }
+    unsafe {
+        lt_hex(m, p as usize as u64)
+    }
 }
 
 // printf("%.14g")
@@ -303,7 +309,11 @@ fn lt_code(m: *mut LexMsg, f: *mut Proto) {
             let sc = arg_sc(i)
             let sbx = arg_sbx(i)
             let isk = arg_k(i)
-            let kn = if isk { 1i32 } else { 0i32 }
+            let kn = if isk {
+                1i32
+            } else {
+                0i32
+            }
             let line = lt_line(f, pc)
             lmsg_str(m, "\t")
             lmsg_int(m, (pc + 1) as i64)
@@ -519,7 +529,11 @@ fn lt_header(m: *mut LexMsg, f: *mut Proto) {
         let src = (*f).source
         let d = str_data(src)
         lmsg_str(m, "\n")
-        lmsg_str(m, if (*f).linedefined == 0 { "main" } else { "function" })
+        lmsg_str(m, if (*f).linedefined == 0 {
+            "main"
+        } else {
+            "function"
+        })
         lmsg_str(m, " <")
         if str_len(src) > 0 && (*d == 64 || *d == 61) {
             lmsg_bytes(m, ptr.offset(d, 1) as *const u8, str_len(src) - 1)
@@ -638,7 +652,11 @@ fn lt_dump_size(m: *mut LexMsg, v: usize) {
     }
     for i in 0usize..n {
         let byte = tmp[n - 1 - i]
-        lmsg_char(m, if i == n - 1 { byte | 128 } else { byte })
+        lmsg_char(m, if i == n - 1 {
+            byte | 128
+        } else {
+            byte
+        })
     }
 }
 
