@@ -69,7 +69,7 @@ fallback to try.
 | --- | --- | --- |
 | `std/crypto` | `Error`, `ErrorKind`, `equal`, `wipe` | Nothing; portable to freestanding targets. |
 | `std/crypto/random` | `fill`, `next_u64`, `below`, `key`, `SystemRandom` | The OS CSPRNG: libc on Linux, Security.framework on macOS, bcrypt on Windows. |
-| `std/crypto/openssl` | `Sha1`, `Sha256`, `HmacSha256`, `Aes128Cfb8`, `RsaPrivateKey`, `RsaPublicKey` | OpenSSL 3.5+ libcrypto, but not libssl. |
+| `std/crypto/openssl` | `Sha1`, `Sha256`, `Md5`, `HmacSha256`, `pbkdf2_hmac_sha256`, `Aes128Cfb8`, `RsaPrivateKey`, `RsaPublicKey` | OpenSSL 3.5+ libcrypto, but not libssl. |
 
 The two hosted packages link separately. A program that needs only random bytes
 does not need OpenSSL installed, and importing `std/crypto/openssl` does not
@@ -129,7 +129,9 @@ starts a new empty message on the same value. Split points never change the
 result.
 
 SHA-1 is not collision resistant. Use it only where a protocol requires it,
-such as Minecraft's server hash.
+such as Minecraft's server hash. `Md5` and `md5(data)` (`[16]u8`) exist for
+the same reason, for PostgreSQL's legacy md5 password authentication; MD5 is
+broken as a hash.
 
 `HmacSha256.new(key)` accepts keys of any length, including empty keys. Keys
 longer than 64 bytes are hashed first, as RFC 2104 specifies. `finish` returns
@@ -137,6 +139,10 @@ the 32-byte tag and keeps the key for the next message. `verify(expected)`
 finishes the message and compares the tag in constant time. A truncated or
 overlong `expected` never matches. `hmac_sha256(key, data)` is the one-shot
 form, suited to Velocity modern forwarding and messaging token MACs.
+
+`pbkdf2_hmac_sha256(password, salt, iterations, &mut output)` derives
+`output.len` bytes with PBKDF2 (RFC 8018) over HMAC-SHA256, as SCRAM
+authentication and many password stores need. `iterations` must be at least 1.
 
 Minecraft prints its server hash as a signed number: the SHA-1 digest read as
 one big-endian two's-complement integer, in hex. This helper reproduces the

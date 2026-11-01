@@ -214,8 +214,13 @@ configuration decisions.
 `openssl.Config.client(hostname)` enables certificate-chain verification and
 requires a nonempty hostname. DNS names use certificate hostname checks with
 partial-label wildcards disabled; IP literals use iPAddress SAN matching. DNS
-names also configure SNI. Verification failure permanently poisons the engine;
-there is no option that silently disables client peer verification. See the
+names also configure SNI. Verification failure permanently poisons the engine.
+Verification stays on unless the configuration explicitly sets `verify`:
+`openssl.Verify.Chain` checks the chain but accepts any name, and
+`openssl.Verify.None` accepts any certificate (encryption without
+authentication). They exist for protocols whose own configuration asks for
+that, such as PostgreSQL's `sslmode=verify-ca` and `sslmode=require`; never
+use them for HTTPS. See the
 [OpenSSL hostname verification API](https://docs.openssl.org/3.5/man3/SSL_set1_host/).
 The caller supplies an ASCII DNS A-label or IP literal; Unicode/IDNA conversion
 belongs to an optional name-processing integration.

@@ -28,12 +28,12 @@ void *__wrap_CRYPTO_zalloc(size_t size, const char *file, int line) {
 #endif
 extern void *dodo_tls_new(int, const unsigned char *, size_t, const unsigned char *, size_t,
                          const unsigned char *, size_t, const unsigned char *, size_t,
-                         const unsigned char *, size_t, int, int, int64_t, int *);
+                         const unsigned char *, size_t, int, int, int, int64_t, int *);
 extern void dodo_tls_free(void *);
 int main(void) {
     int error = 0;
     void *engine = dodo_tls_new(0, (const unsigned char *)"localhost", 9,
-                               NULL, 0, NULL, 0, NULL, 0, NULL, 0, 0, 0, -1, &error);
+                               NULL, 0, NULL, 0, NULL, 0, NULL, 0, 0, 0, 0, -1, &error);
     if (engine || error != -2) { dodo_tls_free(engine); return 1; }
     dodo_tls_free(NULL);
     OPENSSL_cleanup();

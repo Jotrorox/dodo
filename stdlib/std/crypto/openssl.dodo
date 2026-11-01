@@ -11,6 +11,7 @@ import "std/crypto/openssl/native"
 // so the caller may wipe its own key bytes afterwards.
 pub const SHA1_BYTES: usize = 20
 pub const SHA256_BYTES: usize = 32
+pub const MD5_BYTES: usize = 16
 pub const AES128_KEY_BYTES: usize = 16
 pub const AES_IV_BYTES: usize = 16
 pub const RSA_MIN_BITS: u32 = 1024
@@ -20,6 +21,7 @@ pub const PKCS1_OVERHEAD: usize = 11
 
 const SHA1: i32 = 1
 const SHA256: i32 = 2
+const MD5: i32 = 3
 const AES128_CFB8: i32 = 1
 
 fn failure(status: i32) -> crypto.Error {
@@ -93,6 +95,29 @@ pub struct Sha1 {
 }
 pub fn sha1(data: &[u8]) -> [20]u8!crypto.Error {
     hasher := Sha1.new()?
+    hasher.update(data)?
+    return hasher.finish()
+}
+// Incremental MD5. Use it only where a legacy protocol requires it, such as
+// PostgreSQL's md5 password authentication: MD5 is broken as a hash.
+pub struct Md5 {
+    state: Digest
+    pub fn new() -> Md5!crypto.Error {
+        return ok(Md5 { state: Digest.new(MD5)? })
+    }
+    pub fn update(&mut self, data: &[u8]) -> void!crypto.Error {
+        return self.state.update(data)
+    }
+    // Returns the digest of everything since construction or the previous
+    // finish, and starts a new empty message.
+    pub fn finish(&mut self) -> [16]u8!crypto.Error {
+        digest := [0u8; 16]
+        self.state.finish(&mut digest)?
+        return ok(digest)
+    }
+}
+pub fn md5(data: &[u8]) -> [16]u8!crypto.Error {
+    hasher := Md5.new()?
     hasher.update(data)?
     return hasher.finish()
 }
@@ -177,6 +202,16 @@ pub fn hmac_sha256(key: &[u8], data: &[u8]) -> [32]u8!crypto.Error {
     mac := HmacSha256.new(key)?
     mac.update(data)?
     return mac.finish()
+}
+
+// PBKDF2 (RFC 8018) with HMAC-SHA256: derives output.len bytes from a
+// password and salt with the given iteration count (at least 1), as SCRAM
+// and many password stores require. The password is copied into OpenSSL only
+// for the call; wipe the caller's copy when appropriate.
+pub fn pbkdf2_hmac_sha256(password: &[u8], salt: &[u8], iterations: u32, output: &mut[u8]) -> void!crypto.Error {
+    return check(unsafe {
+        native.dodo_crypto_pbkdf2_sha256(ptr.as_ptr(password), password.len, ptr.as_ptr(salt), salt.len, iterations, ptr.as_mut_ptr(output), output.len)
+    })
 }
 
 struct Cipher {

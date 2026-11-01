@@ -1,0 +1,160 @@
+package postgres
+
+import "core/mem"
+import "std/db"
+import "std/db/postgres/protocol"
+import "std/math"
+
+// A statement handle from `Connection.prepare`. It holds the SQL text;
+// the server-side statement lives in the connection's cache.
+pub struct Statement {
+    sql: &str
+
+    pub fn sql(&self) -> &str {
+        self.sql
+    }
+}
+
+// A LISTEN/NOTIFY notification. Its text borrows the connection until the
+// next call.
+pub struct Notification {
+    pub process_id: i32
+    pub channel: &str
+    pub payload: &str
+}
+
+// A cursor over the rows of a running statement. Rows borrow the
+// connection; dropping the cursor early leaves the remaining rows to be
+// skipped by the connection's next request.
+pub struct Rows {
+    conn: &mut Connection
+    sql: &[u8]
+
+    // Advances to the next row; none at the end. A statement that fails
+    // after some rows reports its error here, after those rows.
+    pub fn next(&mut self) -> Option<Row>!db.Error {
+        if self.conn.held {
+            self.conn.held = false
+            return ok(some(Row { conn: &*self.conn }))
+        }
+        for self.conn.pending {
+            match self.conn.step(self.sql)? {
+                some(row) => {
+                    if row {
+                        return ok(some(Row { conn: &*self.conn }))
+                    }
+                },
+                none => {},
+            }
+        }
+        self.conn.outcome()?
+        ok(none)
+    }
+
+    // Number of result columns.
+    pub fn len(&self) -> usize {
+        self.conn.column_count
+    }
+}
+
+// One result row. Text and byte values borrow the receive buffer and stay
+// valid until the cursor advances.
+//
+// Values arrive as follows: bool, int2, int4, int8 and oid as Int (bool is
+// 0 or 1); float4 and float8 as Real; bytea as Bytes; every other type
+// (text, varchar, numeric, date, timestamp, uuid, json, arrays, ...) as
+// Text in PostgreSQL's text format; NULL as Null.
+pub struct Row {
+    conn: &Connection
+
+    pub fn len(&self) -> usize {
+        self.conn.column_count
+    }
+
+    pub fn name(&self, index: usize) -> &str {
+        if index >= self.len() {
+            return ""
+        }
+        e := index * ENTRY_BYTES
+        at := rd32(self.conn.columns, e) as usize
+        n := rd16(self.conn.columns, e + 4)
+        unsafe {
+            mem.str_from_utf8(&self.conn.columns[at..at + n])
+        }
+    }
+
+    pub fn get(&self, index: usize) -> db.Value!db.Error {
+        if index >= self.len() {
+            return err(db.Error.new(db.ErrorKind.Range, 0))
+        }
+        e := index * ENTRY_BYTES
+        length := rd32(self.conn.columns, e + 12)
+        if length == 4294967295u32 {
+            return ok(db.Value.Null)
+        }
+        start := rd32(self.conn.columns, e + 8) as usize
+        kind := self.conn.columns[e + 6]
+        format := self.conn.columns[e + 7] as u16
+        protocol.decode(kind, format, &self.conn.wire.input[start..start + length as usize])
+    }
+
+    pub fn is_null(&self, index: usize) -> bool {
+        if index >= self.len() {
+            return true
+        }
+        rd32(self.conn.columns, index * ENTRY_BYTES + 12) == 4294967295u32
+    }
+
+    // The value's class; Null for NULL and for columns out of range.
+    pub fn value_type(&self, index: usize) -> db.ValueType {
+        match self.get(index) {
+            ok(v) => db.value_type(&v),
+            err(_) => db.ValueType.Null,
+        }
+    }
+
+    // Integers as they are, reals truncated toward zero when in range;
+    // 0 for anything else.
+    pub fn int(&self, index: usize) -> i64 {
+        match self.get(index) {
+            ok(db.Value.Int(v)) => v,
+            ok(db.Value.Real(v)) => {
+                if v == v && v >= -9223372036854775808.0 && v < 9223372036854775808.0 {
+                    return math.trunc(v) as i64
+                }
+                0
+            },
+            ok(_) => 0,
+            err(_) => 0,
+        }
+    }
+
+    // Reals as they are, integers converted; 0.0 for anything else.
+    pub fn real(&self, index: usize) -> f64 {
+        match self.get(index) {
+            ok(db.Value.Real(v)) => v,
+            ok(db.Value.Int(v)) => v as f64,
+            ok(_) => 0.0,
+            err(_) => 0.0,
+        }
+    }
+
+    // Text values (every type without a binary decoding); "" otherwise.
+    pub fn text(&self, index: usize) -> &str {
+        match self.get(index) {
+            ok(db.Value.Text(v)) => v,
+            ok(_) => "",
+            err(_) => "",
+        }
+    }
+
+    // bytea values, or the UTF-8 bytes of text values; empty otherwise.
+    pub fn bytes(&self, index: usize) -> &[u8] {
+        match self.get(index) {
+            ok(db.Value.Bytes(v)) => v,
+            ok(db.Value.Text(v)) => mem.str_bytes(v),
+            ok(_) => b"",
+            err(_) => b"",
+        }
+    }
+}

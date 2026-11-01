@@ -1,0 +1,98 @@
+package postgres_auth_checks
+
+// SCRAM-SHA-256 and md5 password authentication from
+// std/db/postgres/protocol, with OpenSSL's hashes, against values computed
+// with Python's hashlib. Built and run by tests/postgres_library.rs.
+
+import "std/crypto/openssl"
+import "std/db"
+import "std/db/postgres/protocol"
+
+fn same(a: &[u8], b: &[u8]) -> bool {
+    if a.len != b.len {
+        return false
+    }
+    for i in 0usize..a.len {
+        if a[i] != b[i] {
+            return false
+        }
+    }
+    true
+}
+
+fn crypto_error() -> db.Error {
+    db.Error.new(db.ErrorKind.Internal, 0)
+}
+
+struct OpenSslHashes {
+    pub fn sha256(&mut self, data: &[u8]) -> [32]u8!db.Error {
+        match openssl.sha256(data) {
+            ok(v) => ok(v),
+            err(_) => err(crypto_error()),
+        }
+    }
+
+    pub fn hmac_sha256(&mut self, key: &[u8], data: &[u8]) -> [32]u8!db.Error {
+        match openssl.hmac_sha256(key, data) {
+            ok(v) => ok(v),
+            err(_) => err(crypto_error()),
+        }
+    }
+
+    pub fn pbkdf2_sha256(&mut self, password: &[u8], salt: &[u8], iterations: u32) -> [32]u8!db.Error {
+        out := [0u8; 32]
+        match openssl.pbkdf2_hmac_sha256(password, salt, iterations, &mut out) {
+            ok() => ok(out),
+            err(_) => err(crypto_error()),
+        }
+    }
+
+    pub fn md5(&mut self, first: &[u8], second: &[u8]) -> [16]u8!db.Error {
+        h := openssl.Md5.new()!
+        h.update(first)!
+        h.update(second)!
+        ok(h.finish()!)
+    }
+}
+
+fn scram_sha_256_matches_reference() {
+    hashes := OpenSslHashes {}
+    scram := protocol.Scram.new(b"rOprNGfwEbeRWgbNEkqO")!
+    out := [0u8; 256]
+    n := scram.client_first(&mut out)!
+    assert(same(&out[..n], b"n,,n=,r=rOprNGfwEbeRWgbNEkqO"))
+    server_first := b"r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096"
+    n = scram.client_final(&mut hashes, b"pencil", server_first, &mut out)!
+    assert(same(&out[..n], b"c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,p=qvT2SWdEH5Q06albL+hjSYuUhCG7VndFyzIb7CK4n9k="))
+    scram.verify(b"v=3HO6Qt1M4MKJrmlKaoOqLAI0/0TV0HZe7J9H3MBtSOg=")!
+
+    // A server that does not know the password cannot produce the signature.
+    other := protocol.Scram.new(b"rOprNGfwEbeRWgbNEkqO")!
+    other.client_first(&mut out)!
+    other.client_final(&mut hashes, b"pencil", server_first, &mut out)!
+    match other.verify(b"v=AAO6Qt1M4MKJrmlKaoOqLAI0/0TV0HZe7J9H3MBtSOg=") {
+        ok() => assert(false),
+        err(e) => assert(e.kind == db.ErrorKind.Auth),
+    }
+    // The server nonce must extend the client's.
+    third := protocol.Scram.new(b"rOprNGfwEbeRWgbNEkqO")!
+    third.client_first(&mut out)!
+    match third.client_final(&mut hashes, b"pencil", b"r=XXXXNGfwEbeRWgbNEkqO%hv,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096", &mut out) {
+        ok(_) => assert(false),
+        err(e) => assert(e.kind == db.ErrorKind.Protocol),
+    }
+}
+
+fn md5_password_matches_reference() {
+    hashes := OpenSslHashes {}
+    out := [0u8; 35]
+    salt := b"\x01\x02\x03\x04"
+    n := protocol.md5_password(&mut hashes, b"alice", b"secret", salt, &mut out)!
+    assert(same(&out[..n], b"md598a0412b9c31436fc53776e863350083"))
+}
+
+fn main() -> i32 {
+    scram_sha_256_matches_reference()
+    md5_password_matches_reference()
+    return 0
+}
