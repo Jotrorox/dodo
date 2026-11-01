@@ -18,7 +18,7 @@ import "core/ptr"
 // 2. Interrupts. `Critical` masks interrupts on the current core until it is
 //    dropped. It never excludes other threads or cores.
 // 3. Device protocols. The interfaces below (OutputPin, InputPin, Delay, I2c,
-//    Spi, PwmOutput, AnalogInput, and Registers) name what drivers need
+//    Spi, PwmOutput, AnalogInput, Flash, and Registers) name what drivers need
 //    from a device. Any value with
 //    matching methods implements them. Drivers are usually generic over a
 //    bounded parameter, `fn probe<B: hal.I2c>(bus: &mut B)`, which is
@@ -86,6 +86,16 @@ import "core/ptr"
 //                                  port on the board's USB connector with
 //                                  the serial port protocols (Busy if one
 //                                  is open), and release_serial(port)
+//    Board.flash                   the board's program flash: read(offset,
+//                                  buffer), program_end(), the first
+//                                  erase-aligned offset after the program,
+//                                  and region(start, length), last(length),
+//                                  and free() -> region!Error for parts of
+//                                  the flash above it, with the Flash
+//                                  protocol, for std/embedded/storage
+//                                  (InvalidInput below program_end(), Busy
+//                                  if a region overlaps one that is out);
+//                                  release(region) gives one back
 //    Board.dma                     chips with DMA hand out channels with
 //                                  the DmaChannel protocol, as the RP2040
 //                                  and RP2350 do with channel() and
@@ -200,6 +210,43 @@ pub interface AnalogInput {
     // converter.
     fn max_value(&self) -> u16
     fn read(&mut self) -> u16!Error
+}
+
+// The value every byte of erased flash reads as.
+pub const FLASH_ERASED: u8 = 0xFF
+
+// Persistent memory that behaves like NOR flash: the program flash of a
+// microcontroller, an external SPI flash chip, or a region of either. Erasing
+// sets whole blocks to FLASH_ERASED; writing then programs bytes once, and
+// a byte is only written again after its block is erased. Offsets count
+// bytes from the device's start. `std/embedded/storage` builds regions and a
+// key-value store on any value with these methods, and
+// `std/embedded/hal/fake` has one in memory for tests.
+//
+// Every method reports InvalidInput for a range outside the device, or not
+// aligned as below, and leaves the device unchanged. A device may refuse a
+// range it protects, such as the flash holding the running program, with
+// InvalidInput too.
+pub interface Flash {
+    // The device's size in bytes, a multiple of erase_size().
+    fn capacity(&self) -> u32
+    // The bytes one erase covers, a power of two such as 4096. Erases start
+    // and end on multiples of it.
+    fn erase_size(&self) -> u32
+    // The bytes one write covers, a power of two up to 256: 1 when single
+    // bytes can be written, more for devices that program whole words.
+    // Writes start and end on multiples of it.
+    fn write_size(&self) -> u32
+    // Copy `buffer.len` bytes from `offset` into `buffer`; any offset and
+    // length inside the device.
+    fn read(&mut self, offset: u32, buffer: &mut[u8]) -> void!Error
+    // Set the `length` bytes from `offset` to FLASH_ERASED.
+    fn erase(&mut self, offset: u32, length: u32) -> void!Error
+    // Program `bytes` at `offset`. Write only to erased bytes: what writing
+    // over written ones does depends on the device, and some refuse or
+    // corrupt it. An interrupted write or erase, as by a power cut, may leave
+    // any content in the range it covered.
+    fn write(&mut self, offset: u32, bytes: &[u8]) -> void!Error
 }
 
 // A peripheral's 32-bit registers at byte offsets, for peripheral drivers.

@@ -486,6 +486,10 @@ fn chip_runtimes_provide_startup_and_helper_symbols() {
             "dodo_core_id",
             "dodo_core1_trampoline",
             "dodo_core1_entry",
+            "dodo_flash_erase",
+            "dodo_flash_program",
+            "dodo_flash_image_end",
+            "dodo_flash_end",
             "memcpy",
             "memset",
         ] {
@@ -532,6 +536,61 @@ fn chip_runtimes_provide_startup_and_helper_symbols() {
         "fmod",
     ] {
         assert!(text.contains(name), "rp2350 runtime lacks {name}");
+    }
+}
+
+#[test]
+fn flash_storage_links_for_every_board() {
+    if !ld_lld() {
+        return;
+    }
+    let scratch = Scratch::new("storage");
+    let example = root().join("examples/boot_counter.dodo");
+    for (board, flash_size, family) in [
+        ("pico", 2u32 << 20, 0xE48B_FF56),
+        ("pico2", 4 << 20, 0xE48B_FF59),
+        ("pico2_w", 4 << 20, 0xE48B_FF59),
+    ] {
+        for level in ["0", "2"] {
+            let elf = scratch.path(&format!("boot-counter-{board}-O{level}.elf"));
+            build(&[
+                "build",
+                example.to_str().unwrap(),
+                "--board",
+                board,
+                "-O",
+                level,
+                "-o",
+                &elf,
+            ]);
+            let path = Path::new(&elf);
+            if board == "pico" {
+                check_rp2040_firmware(path);
+            } else {
+                check_rp2350_firmware(path);
+            }
+            let bytes = fs::read(path).unwrap();
+            let symbol = |name: &str| {
+                elf_symbol(&bytes, name).unwrap_or_else(|| panic!("{board} lacks {name}"))
+            };
+            // rp_flash sizes the flash from the board and keeps regions above
+            // the image, which ends where the UF2 payload does.
+            assert_eq!(symbol("__flash_end"), 0x1000_0000 + flash_size);
+            let image = flash_image(&fs::read(path.with_extension("uf2")).unwrap(), family);
+            let end = (symbol("__flash_image_end") - 0x1000_0000) as usize;
+            assert_eq!(end.div_ceil(256) * 256, image.len(), "{board}");
+            let in_sram = |address: u32| (0x2000_0000..0x2008_2000).contains(&address);
+            if board == "pico" {
+                // With execute-in-place off, the RP2040 routine and the copy
+                // of .boot2 it restores it with run from SRAM.
+                assert!(in_sram(symbol("dodo_flash_erase")));
+                assert!(in_sram(symbol("dodo_flash_program")));
+                assert!(in_sram(symbol("dodo_rp2040_boot2_copy")));
+            } else {
+                // The RP2350's flash_op restores execute-in-place itself.
+                assert!(symbol("dodo_flash_erase") >= 0x1000_0000);
+            }
+        }
     }
 }
 

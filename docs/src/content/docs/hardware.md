@@ -18,7 +18,8 @@ grouped under `std/embedded` in layers, on top of two small compiler packages:
 | Interrupts | `std/embedded/hal`, `std/embedded/cortex_m` | `@interrupt` handlers; `hal.Critical`, a section that masks interrupts until it is dropped; `hal.Handler`, a slot for a handler chosen at run time; the Cortex-M interrupt controller and SysTick. |
 | Tasks | `std/embedded/executor` | Several activities on one core, each woken on time or by an interrupt, with the core asleep in between. |
 | DMA | `std/embedded/hal`, `std/embedded/chip/rp_dma` | `hal.DmaChannel`, through which drivers move data while the program does other work; the RP2040's and RP2350's channels. |
-| Desktop testing | `std/embedded/hal/fake` | In-memory pins, delays, buses, serial ports, and a simulated clock that record what a driver did. |
+| Persistent storage | `std/embedded/hal`, `std/embedded/storage`, `std/embedded/chip/rp_flash` | `hal.Flash`, erasing and writing NOR flash; a power-cut-safe key-value store and flash regions on any such device; the RP2040's and RP2350's program flash. |
+| Desktop testing | `std/embedded/hal/fake` | In-memory pins, delays, buses, serial ports, flash, and a simulated clock that record what a driver did. |
 | Boards | `std/embedded/board` | The selected board: one `take()` and the same LED, pin, and timer fields on every board. |
 | Chip support | `std/embedded/chip` | The selected microcontroller's peripherals, for custom boards. |
 | Wireless chip | `std/embedded/wireless/cyw43` | The CYW43439 on the Pico 2 W: power-up, its gSPI bus, and its GPIO pins. |
@@ -97,6 +98,7 @@ methods implements it and can be passed where a driver expects it:
 | `hal.PwmOutput` | `max_duty(&self) -> u16`<br>`set_duty(&mut self, duty: u16) -> void!hal.Error` |
 | `hal.AnalogInput` | `max_value(&self) -> u16`<br>`read(&mut self) -> u16!hal.Error` |
 | Serial port | [`io.Reader` and `io.Writer`](io.md) from `std/io`. |
+| `hal.Flash` | `capacity(&self) -> u32`, `erase_size(&self) -> u32`, `write_size(&self) -> u32`<br>`read(&mut self, offset: u32, buffer: &mut[u8]) -> void!hal.Error`<br>`erase(&mut self, offset: u32, length: u32) -> void!hal.Error`<br>`write(&mut self, offset: u32, bytes: &[u8]) -> void!hal.Error` |
 | `hal.Registers` | `read(&mut self, offset: usize) -> u32`<br>`write(&mut self, offset: usize, value: u32)` |
 
 Write drivers against bounded parameters, `fn probe<B: hal.I2c>(bus: &mut B)`,
@@ -1052,6 +1054,117 @@ while nothing has been fed.
 - On a desktop, where a critical section excludes nothing, use the executor
   and its signals from one thread.
 
+## Persistent storage
+
+Data that must outlive a restart, such as settings, calibration values,
+counters, or credentials, goes in flash. `hal.Flash` is the protocol for
+memory that behaves like NOR flash: erasing sets whole blocks of
+`erase_size()` bytes to `0xFF` (`hal.FLASH_ERASED`), and writing then
+programs bytes, in units of `write_size()`, only once until their block is
+erased again. Out-of-range or misaligned requests return
+`hal.Error.InvalidInput`. A board's program flash implements it through
+regions, and so can a driver for an external SPI flash chip.
+
+`std/embedded/storage` builds on any `hal.Flash`:
+
+- `storage.Store` is a key-value store. Keys are text of 1 to 64 bytes
+  (`storage.MAX_KEY_BYTES`); values are any bytes up to `max_value_len`,
+  about one erase block.
+- `storage.Region` is a window of a flash device, itself a `hal.Flash`, for
+  giving a store part of a device.
+
+```dodo
+import "std/embedded/board"
+import "std/embedded/storage"
+
+fn main() {
+    b := board.take()!
+    settings := storage.Store.open(b.flash.last(64 * 1024)!)!
+    boots := 0u32
+    match settings.get_u32("boots") {
+        ok(some(count)) => {
+            boots = count
+        }
+        ok(none) => {}
+        err(_) => {
+            settings.clear()!
+        }
+    }
+    settings.set_u32("boots", boots + 1)!
+}
+```
+
+`get(key, buffer)` copies a value into a buffer and returns its length, or
+`none` for a missing key; `len_of` and `contains` look without copying, and
+`set`, `remove`, and `clear` change the store. `get_u32` and `set_u32` store
+numbers as four little-endian bytes. `next_key` with a `storage.Cursor` lists
+the keys. Errors are `storage.Error`: `Flash` and `Busy` from the device,
+`Full`, `TooLarge` for an overlong key or value, `InvalidInput` for an empty
+key or an unusable device, and `BufferTooSmall`.
+
+The store is a log over the device's erase blocks, of which it needs 2 to 64
+(`storage.MAX_BLOCKS`), each of at least 256 bytes. Every `set` or `remove`
+appends a record to the newest block, and the latest record of a key wins; a
+`set` of the value a key already has writes nothing. When the newest block
+is full, the store moves on to the next one and compacts the oldest block in
+use into it, copying the records still current there, then erases it. Erases
+thus go round all blocks evenly, and one block always stays erased, so a
+store holds somewhat less than its size minus one block. Replacing a value
+needs room for the new record while the old one is still there; `remove`
+works even in a full store.
+
+Every record has a CRC-32 and is read back after it is written, and the store
+writes only to erased bytes, so it also works on flash that cannot write a
+byte twice. A power cut at any moment, even during a compaction, loses at most
+the `set` or `remove` in progress: `Store.open` finds the last intact record
+and finishes or undoes an interrupted compaction. After a failed write,
+the store reads the flash again before its next operation.
+
+Lookups scan the blocks in use, so the store suits small data, up to a few
+hundred kilobytes, that changes now and then, not logs or fast-changing
+values. A compaction holds the device busy for one erase and the copies.
+
+`fake.Flash` from `std/embedded/hal/fake` is flash in a buffer of your own for
+desktop tests. It checks the protocol strictly, refusing misaligned requests
+and writes over bytes that are not erased, counts erases and writes, fails an
+operation on request with `fail_next`, and cuts the power partway through an
+operation with `cut_power_after(bytes)` or just after one with
+`cut_power_after_operations(count)`, until `restore_power`:
+
+```dodo
+@test
+fn settings_survive_a_power_cut() {
+    memory := [0xFFu8; 4096]
+    flash := fake.Flash.new(&mut memory, 1024, 4)
+    store := storage.Store.open(flash)!
+    store.set_u32("volume", 7)!
+    store.flash().cut_power_after(10)
+    match store.set_u32("volume", 8) {
+        ok() => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == storage.Error.Flash)
+        }
+    }
+    store.flash().restore_power()
+    flash = store.release()
+    store = storage.Store.open(flash)!
+    match store.get_u32("volume")! {
+        some(volume) => {
+            core.assert(volume == 7)
+        }
+        none => {
+            core.assert(false)
+        }
+    }
+}
+```
+
+The repository's `tests/stdlib/storage_checks.dodo` cuts the power at every
+erase and write, and every few bytes in between, of a long run of updates,
+and checks that each key keeps its old or new value.
+
 ## Building firmware
 
 ### Boards
@@ -1893,6 +2006,33 @@ up. `start_request(transfer, dreq)` paces by any other request, or by
 `Driver` over any `hal.Registers`, tested against a model of both chips'
 controllers.
 
+### Flash on the RP2040 and RP2350
+
+The board's flash chip holds the program from its start and is otherwise
+free: `b.flash`, a `rp_flash.Flash`, hands out regions of it above the
+program, each a `rp_flash.Region` with the `hal.Flash` protocol, for
+[persistent storage](#persistent-storage). `last(length)` takes the last
+`length` bytes, `region(start, length)` any sectors from `program_end()` on,
+and `free()` all of them; `release(region)` gives one back. A region below
+the program or past the board's flash size (2 MiB on the Pico, 4 MiB on the
+Pico 2) is `InvalidInput`, and one that overlaps a region still out is
+`Busy`. `b.flash.read(offset, buffer)` reads anywhere, the program included.
+
+Flashing a new program through the bootloader rewrites only the program's
+own sectors, so data in a region stays, as long as the program does not grow
+into it. Regions erase 4 KiB sectors, about 50 ms each, and write any bytes,
+filling the rest of each 256-byte page with `0xFF`, which leaves it as it
+was.
+
+Both go through the boot ROM, which takes the flash out of execute-in-place
+mode meanwhile, so nothing may run from or read flash: a region masks
+interrupts on the core that calls it while it works, and on the RP2040 runs
+that part from SRAM. Interrupt handlers wait for up to one sector erase. A
+USB serial port stays connected, as its controller answers the host by itself.
+Core 1 runs from flash too, so a region refuses to erase or write with
+`Busy` on core 1 and while core 1 runs a task: stop it first. DMA transfers
+must not read from flash while a region erases or writes.
+
 ### Two cores on the RP2040 and RP2350
 
 Both chips have two Arm cores that run the same program from the same flash
@@ -2184,6 +2324,10 @@ dodo build firmware.dodo --emit obj --target thumbv7em-none-eabihf \
   `@section`-placed static.
 - Timers have no shared protocol yet. Expose them as methods on your chip's
   types.
+- Flash regions erase and write only from core 0, with interrupts masked and
+  core 1 stopped; there is no lockout that pauses core 1 in SRAM meanwhile.
+  External SPI flash chips have no bundled driver yet, but any driver with
+  the `hal.Flash` methods holds a `storage.Store`.
 - SPI by DMA moves frames of up to 8 bits; wider frames use the word
   methods, which are polled. A queued I2C transaction fits the controller's
   FIFO, 16 commands on both chips; longer transfers use the blocking

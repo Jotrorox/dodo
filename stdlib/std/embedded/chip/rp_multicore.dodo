@@ -101,6 +101,20 @@ const MAX_RESTARTS: u32 = 8
 const NO_SIGNAL: u32 = 0xFFFF_FFFF
 static mut WAKE: [2]u32 = [NO_SIGNAL, NO_SIGNAL]
 
+// True from a successful Core1.start until its Running handle stops core 1.
+static mut CORE1_RUNNING: bool = false
+
+// Whether core 1 runs a task from Core1.start, and so may be executing from
+// flash: rp_flash refuses to erase or write while it does. Core 1 waiting
+// in the boot ROM, before it is started or after it is stopped, does not
+// count.
+pub fn core1_running() -> bool {
+    // SAFETY: a word read; only core 0 writes it, in start and halt.
+    return unsafe {
+        CORE1_RUNNING
+    }
+}
+
 // Provided by the compiler's RP2040 and RP2350 firmware runtimes: where core
 // 1 starts, with the Thumb bit set.
 unsafe extern "C" fn dodo_core1_entry() -> u32
@@ -231,6 +245,10 @@ pub struct Core1 {
             cortex_m.enable(irq)
         }
         result?
+        // SAFETY: start runs on core 0 only, the flag's one writer.
+        unsafe {
+            CORE1_RUNNING = true
+        }
         return ok(Running { core1: self, stack, finished, active: true })
     }
 }
@@ -306,6 +324,7 @@ pub struct Running {
                 ok() => {}
                 err(_) => {}
             }
+            CORE1_RUNNING = false
         }
     }
 

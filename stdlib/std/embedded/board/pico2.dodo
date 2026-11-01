@@ -3,6 +3,7 @@ package pico2
 import "std/embedded/hal"
 import "std/embedded/chip/rp2350"
 import "std/embedded/chip/rp_dma"
+import "std/embedded/chip/rp_flash"
 import "std/embedded/chip/rp_multicore"
 import "std/embedded/chip/rp_usb"
 
@@ -65,6 +66,10 @@ pub struct Board {
     pub core1: rp_multicore.Core1
     pub fifos: rp_multicore.Fifos
     pub spinlocks: rp_multicore.Spinlocks
+    // The program flash: the free flash above `flash.program_end()` keeps
+    // data across restarts and reflashing, for example a
+    // std/embedded/storage key-value store; see std/embedded/chip/rp_flash.
+    pub flash: rp_flash.Flash
 }
 
 // Start the chip with the Pico 2's crystal and claim the LED. A second call
@@ -72,8 +77,8 @@ pub struct Board {
 pub fn take() -> Board!hal.Error {
     chip := rp2350.take(rp2350.Config { crystal_hz: CRYSTAL_HZ })?
     led := chip.pins.output(LED_PIN)?
-    let rp2350.Peripherals { pins, timer, usb, dma, core1, fifos, spinlocks } = chip
-    return ok(Board { led, pins, timer, usb: Usb { usb }, dma, core1, fifos, spinlocks })
+    let rp2350.Peripherals { pins, timer, usb, dma, core1, fifos, spinlocks, flash } = chip
+    return ok(Board { led, pins, timer, usb: Usb { usb }, dma, core1, fifos, spinlocks, flash })
 }
 
 // The USB port, as `b.usb`.

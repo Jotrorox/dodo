@@ -22,6 +22,11 @@
 ;   dodo_rp2350_rom_call
 ;                  Calls a boot ROM function by its two-letter code, for
 ;                  example reboot ('RB') to restart into the USB bootloader.
+;   dodo_flash_erase, dodo_flash_program
+;                  Erase or program the flash through the boot ROM, for
+;                  std/embedded/chip/rp_flash.
+;   dodo_flash_image_end, dodo_flash_end
+;                  Where the program image and the board's flash end.
 ;   USBCTRL_IRQ    Calls dodo_usb_interrupt if the program defines it:
 ;                  std/embedded/chip/rp_usb does, for the USB serial port.
 ;   DMA_IRQ_0      Calls dodo_dma_interrupt if the program defines it:
@@ -278,6 +283,74 @@ module asm "    blx r12"
 module asm "    pop {r4, r5, r6, pc}"
 module asm "1:  mov r0, #-1"
 module asm "    pop {r4, r5, r6, pc}"
+
+; dodo_flash_erase(offset, count) and dodo_flash_program(offset, data, count)
+; erase `count` bytes of flash from `offset` (multiples of 4 KiB), or program
+; them from `data` in SRAM (multiples of 256 bytes), through the boot ROM's
+; flash_op (datasheet 5.4.8) at the flash's runtime address, as a secure
+; caller, with interrupts masked. flash_op leaves execute-in-place mode,
+; works, flushes the cache, and restores it, so this code may run from flash.
+; Returns flash_op's result, 0 on success, or -1 if the ROM lacks it.
+module asm ".section .text.dodo_flash, \22ax\22, %progbits"
+module asm ".global dodo_flash_erase"
+module asm ".type dodo_flash_erase, %function"
+module asm ".thumb_func"
+module asm "dodo_flash_erase:"
+module asm "    mov r2, r1"                             ; size
+module asm "    mov r1, r0"                             ; offset
+module asm "    movs r3, #0"                            ; no buffer
+module asm "    ldr r0, =0x00101"                       ; erase, secure, runtime address
+module asm "    b 1f"
+module asm ".global dodo_flash_program"
+module asm ".type dodo_flash_program, %function"
+module asm ".thumb_func"
+module asm "dodo_flash_program:"
+module asm "    mov r3, r1"                             ; buffer
+module asm "    mov r1, r0"                             ; offset; r2 is the size
+module asm "    ldr r0, =0x10101"                       ; program, secure, runtime address
+module asm "1:  push {r4, r5, r6, r7, r8, lr}"
+module asm "    mrs r8, primask"
+module asm "    cpsid i"
+module asm "    mov r4, r0"
+module asm "    mov r5, r1"
+module asm "    mov r6, r2"
+module asm "    mov r7, r3"
+module asm "    ldr r0, =0x4F46"                        ; 'F' 'O' flash_op
+module asm "    movs r1, #4"                            ; RT_FLAG_FUNC_ARM_SEC
+module asm "    movs r3, #0x16"
+module asm "    ldrh r3, [r3]"                          ; rom_table_lookup
+module asm "    blx r3"
+module asm "    cbz r0, 2f"
+module asm "    mov r12, r0"
+module asm "    mov r0, r4"
+module asm "    ldr r1, =0x10000000"                    ; XIP_BASE
+module asm "    add r1, r5"
+module asm "    mov r2, r6"
+module asm "    mov r3, r7"
+module asm "    blx r12"
+module asm "    b 3f"
+module asm "2:  mov r0, #-1"
+module asm "3:  msr primask, r8"
+module asm "    pop {r4, r5, r6, r7, r8, pc}"
+module asm "    .ltorg"
+
+; dodo_flash_image_end() and dodo_flash_end(): the linker script's addresses.
+module asm ".section .text.dodo_flash_image_end, \22ax\22, %progbits"
+module asm ".global dodo_flash_image_end"
+module asm ".type dodo_flash_image_end, %function"
+module asm ".thumb_func"
+module asm "dodo_flash_image_end:"
+module asm "    ldr r0, =__flash_image_end"
+module asm "    bx lr"
+module asm "    .ltorg"
+module asm ".section .text.dodo_flash_end, \22ax\22, %progbits"
+module asm ".global dodo_flash_end"
+module asm ".type dodo_flash_end, %function"
+module asm ".thumb_func"
+module asm "dodo_flash_end:"
+module asm "    ldr r0, =__flash_end"
+module asm "    bx lr"
+module asm "    .ltorg"
 
 module asm ".weak NMI_Handler, HardFault_Handler, MemManage_Handler, BusFault_Handler"
 module asm ".weak UsageFault_Handler, SecureFault_Handler, SVC_Handler, DebugMon_Handler"

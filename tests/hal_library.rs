@@ -63,6 +63,24 @@ fn registers_protocols_and_fakes_execute_on_the_host() {
 }
 
 #[test]
+fn storage_runs_against_the_fake_flash_and_survives_power_cuts() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let scratch = Scratch::new("storage");
+    let source = root.join("tests/stdlib/storage_checks.dodo");
+    // Unoptimized only: the power-cut sweep runs in seconds either way, and
+    // an optimized build of the fixture takes about a minute.
+    let executable = scratch
+        .0
+        .join(format!("storage{}", std::env::consts::EXE_SUFFIX));
+    let args = ["build", source.to_str().unwrap(), "-O", "0", "-o"];
+    success(&dodo(&args, &executable), "compile storage fixture");
+    success(
+        &Command::new(&executable).output().unwrap(),
+        "execute storage fixture",
+    );
+}
+
+#[test]
 fn executor_runs_tasks_against_the_simulated_clock() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let scratch = Scratch::new("executor");

@@ -5,6 +5,7 @@ import "std/embedded/cortex_m"
 import "std/embedded/hal"
 import "std/embedded/chip/rp_adc"
 import "std/embedded/chip/rp_dma"
+import "std/embedded/chip/rp_flash"
 import "std/embedded/chip/rp_multicore"
 import "std/embedded/chip/rp_pio"
 import "std/embedded/chip/rp_pwm"
@@ -301,6 +302,9 @@ pub struct Peripherals {
     pub core1: rp_multicore.Core1
     pub fifos: rp_multicore.Fifos
     pub spinlocks: rp_multicore.Spinlocks
+    // The program flash, for storing data above the program; see
+    // std/embedded/chip/rp_flash.
+    pub flash: rp_flash.Flash
 }
 
 // Configure clocks, take GPIO, the timer, and DMA out of reset, and return the
@@ -362,7 +366,11 @@ pub fn take(config: Config) -> Peripherals!hal.Error {
         })
     }
     let rp_multicore.Cores { core1, fifos, spinlocks } = cores
-    return ok(Peripherals { pins: Pins { bank }, timer, usb, dma, core1, fifos, spinlocks })
+    // SAFETY: TAKEN guarantees one Flash.
+    flash := unsafe {
+        rp_flash.Flash.take()
+    }
+    return ok(Peripherals { pins: Pins { bank }, timer, usb, dma, core1, fifos, spinlocks, flash })
 }
 
 // SAFETY: the caller owns `address`, a 32-bit RP2040 register.

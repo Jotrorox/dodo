@@ -4,6 +4,7 @@ import "std/embedded/wireless/cyw43"
 import "std/embedded/hal"
 import "std/embedded/chip/rp2350"
 import "std/embedded/chip/rp_dma"
+import "std/embedded/chip/rp_flash"
 import "std/embedded/chip/rp_multicore"
 import "std/embedded/chip/rp_usb"
 
@@ -77,6 +78,10 @@ pub struct Board {
     pub core1: rp_multicore.Core1
     pub fifos: rp_multicore.Fifos
     pub spinlocks: rp_multicore.Spinlocks
+    // The program flash: the free flash above `flash.program_end()` keeps
+    // data across restarts and reflashing, for example a
+    // std/embedded/storage key-value store; see std/embedded/chip/rp_flash.
+    pub flash: rp_flash.Flash
 }
 
 // Start the chip with the Pico 2 W's crystal, power up the wireless chip,
@@ -93,8 +98,8 @@ pub fn take() -> Board!hal.Error {
     wireless.init(&mut chip.timer)?
     led := Led { wireless, on: false }
     led.set_low()
-    let rp2350.Peripherals { pins, timer, usb, dma, core1, fifos, spinlocks } = chip
-    return ok(Board { led, pins, timer, usb: Usb { usb }, dma, core1, fifos, spinlocks })
+    let rp2350.Peripherals { pins, timer, usb, dma, core1, fifos, spinlocks, flash } = chip
+    return ok(Board { led, pins, timer, usb: Usb { usb }, dma, core1, fifos, spinlocks, flash })
 }
 
 // The LED on the wireless chip's GPIO 0. Implements the std/embedded/hal
