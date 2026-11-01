@@ -90,7 +90,7 @@ struct Parser {
     await_operand: bool,
 }
 
-#[derive(Default)]
+#[derive(Default, PartialEq)]
 struct Modifiers {
     printing: Option<Printing>,
     // `@compiler(pio)`: rp_pio's compile-time assembler.
@@ -111,6 +111,8 @@ struct Modifiers {
     link_name: Option<String>,
     placement: Placement,
     inlining: Inlining,
+    // `@naked`: a function without prologue or epilogue around its assembly.
+    naked: bool,
     // `async fn`: a function whose body may `await`; see std/embedded/executor.
     async_: bool,
 }
@@ -261,6 +263,7 @@ impl Parser {
                 program.import_aliases.len(),
                 program.interfaces.len(),
                 program.aliases.len(),
+                program.global_asm.len(),
             );
             if let Err(error) = self.declaration(&mut program) {
                 if !self.recover {
@@ -277,6 +280,7 @@ impl Parser {
                 program.import_aliases.truncate(lengths.5);
                 program.interfaces.truncate(lengths.6);
                 program.aliases.truncate(lengths.7);
+                program.global_asm.truncate(lengths.8);
                 self.soft_newlines = soft;
                 self.self_type = self_type;
                 self.in_interface = false;
@@ -351,6 +355,12 @@ impl Parser {
         }
         let start = self.span().start;
         let mods = self.modifiers()?;
+        if self.at("asm") {
+            return self.global_asm(program, mods, start);
+        }
+        if mods.naked && !self.at("fn") {
+            return Err(self.error("@naked applies only to functions"));
+        }
         if mods.interrupt.is_some() && !self.at("fn") {
             return Err(self.error("@interrupt applies only to functions"));
         }
@@ -457,10 +467,44 @@ impl Parser {
                 .push(self.constant(mods.public, mods.placement, start)?);
         } else {
             return Err(self.error(
-                "expected `fn`, `struct`, `enum`, `interface`, `type`, `const`, or `static` declaration",
+                "expected `fn`, `struct`, `enum`, `interface`, `type`, `const`, `static`, or `unsafe asm` declaration",
             ));
         }
         Ok(())
+    }
+    /// `unsafe asm("...", operands...)` outside any function: assembly the
+    /// object file contains as written, such as startup code or a table.
+    fn global_asm(
+        &mut self,
+        program: &mut Program,
+        mods: Modifiers,
+        start: usize,
+    ) -> ParseResult<()> {
+        let unsafe_only = Modifiers {
+            unsafe_: true,
+            ..Modifiers::default()
+        };
+        if !mods.unsafe_ {
+            return Err(
+                self.error("global assembly is unchecked code; write it as `unsafe asm(\"...\")`")
+            );
+        }
+        if mods != unsafe_only {
+            return Err(Diagnostic::new(
+                self.since(start),
+                "global assembly takes no attributes or modifiers besides `unsafe`; place code in sections with directives such as `.section`",
+            ));
+        }
+        let asm_start = self.span().start;
+        self.bump();
+        let ExprKind::Asm(asm) = self.inline_asm(asm_start)? else {
+            unreachable!()
+        };
+        program.global_asm.push(GlobalAsm {
+            namespace: String::new(),
+            asm: *asm,
+        });
+        self.end_statement()
     }
 
     // Resume at a statement separator or the next declaration. Always advance
@@ -649,6 +693,14 @@ impl Parser {
                     self.newlines();
                     continue;
                 }
+                if name == "naked" {
+                    if mods.naked {
+                        return Err(self.error("duplicate @naked attribute"));
+                    }
+                    mods.naked = true;
+                    self.newlines();
+                    continue;
+                }
                 if name == "section" {
                     if mods.placement.section.is_some() {
                         return Err(self.error("duplicate @section attribute"));
@@ -745,7 +797,7 @@ impl Parser {
                 }
                 if name != "repr" {
                     return Err(self.error(format!(
-                        "unknown attribute `@{name}`; supported: @repr(C), @unsafe_send, @unsafe_sync, @test, @ignore(\"reason\"), @derive(Json), @json_name(\"name\"), @json_deny_unknown, @interrupt(VECTOR), @link_name(\"symbol\"), @section(\"name\"), @align(N), @inline, @inline(never), @cold"
+                        "unknown attribute `@{name}`; supported: @repr(C), @unsafe_send, @unsafe_sync, @test, @ignore(\"reason\"), @derive(Json), @json_name(\"name\"), @json_deny_unknown, @interrupt(VECTOR), @link_name(\"symbol\"), @section(\"name\"), @align(N), @inline, @inline(never), @cold, @naked"
                     )));
                 }
                 if mods.repr_c {
@@ -1537,7 +1589,8 @@ impl Parser {
             None
         } else if self.at("{") {
             let mut body = self.block()?;
-            if ret != Type::Void {
+            // A naked body's assembly returns by itself; it has no tail value.
+            if ret != Type::Void && !mods.naked {
                 self.lower_tail(&mut body, true);
             }
             Some(body)
@@ -1568,6 +1621,28 @@ impl Parser {
                 self.since(start),
                 "@interrupt requires a private, safe, non-generic fn name() with a body and no result; the hardware calls it, so it takes no arguments, and code cannot call it",
             ));
+        }
+        if mods.naked {
+            if !mods.extern_
+                || body.is_none()
+                || !generics.is_empty()
+                || self.self_type.is_some()
+                || mods.async_
+                || mods.test
+                || mods.interrupt.is_some()
+                || mods.inlining != Inlining::Auto
+            {
+                return Err(Diagnostic::new(
+                    self.since(start),
+                    "@naked requires a top-level, non-generic `extern \"C\" fn` with a body; its assembly implements the C calling convention, so it cannot be async, a test, an interrupt handler, or inlined",
+                ));
+            }
+            if body.as_ref().and_then(naked_body).is_none() {
+                return Err(Diagnostic::new(
+                    self.since(start),
+                    "the body of a @naked function is exactly one `unsafe { asm(...) }`; the function has no frame for other statements",
+                ));
+            }
         }
         if mods.inlining != Inlining::Auto && body.is_none() {
             return Err(Diagnostic::new(
@@ -1621,6 +1696,7 @@ impl Parser {
             link_name: mods.link_name,
             placement: mods.placement,
             inlining: mods.inlining,
+            naked: mods.naked,
             async_part: mods.async_.then_some(AsyncPart::Body),
         })
     }
@@ -2843,7 +2919,7 @@ impl Parser {
                 }
                 _ => {
                     return Err(self.error(
-                        "expected an asm operand: in(reg) value, out(reg) Type, inout(reg) value, clobber(\"name\"), or options(...)",
+                        "expected an asm operand: in(reg) value, out(reg) Type, inout(reg) value, sym name, const value, clobber(\"name\"), or options(...)",
                     ));
                 }
             };
@@ -2883,6 +2959,18 @@ impl Parser {
                         span: self.since(operand_start),
                     });
                 }
+                "sym" => asm.operands.push(AsmOperand {
+                    kind: AsmOperandKind::Sym(self.qualified_name().map_err(|_| {
+                        self.error("`sym` expects the name of a function or static, such as `sym reset_handler`")
+                    })?),
+                    register: AsmRegister::Any,
+                    span: self.since(operand_start),
+                }),
+                "const" => asm.operands.push(AsmOperand {
+                    kind: AsmOperandKind::Const(self.expression(true)?),
+                    register: AsmRegister::Any,
+                    span: self.since(operand_start),
+                }),
                 "clobber" => {
                     self.expect("(")?;
                     loop {
@@ -2939,7 +3027,7 @@ impl Parser {
                 _ => {
                     return Err(Diagnostic::new(
                         self.since(operand_start),
-                        "expected an asm operand: in(reg) value, out(reg) Type, inout(reg) value, clobber(\"name\"), or options(...)",
+                        "expected an asm operand: in(reg) value, out(reg) Type, inout(reg) value, sym name, const value, clobber(\"name\"), or options(...)",
                     ));
                 }
             }
@@ -3326,6 +3414,87 @@ mod tests {
             (
                 "fn f() { asm(\"nop\", sideways(reg) 1) }",
                 "expected an asm operand",
+            ),
+        ] {
+            let error = parse(&format!("package p\n{source}\n")).unwrap_err();
+            assert!(
+                error.message.contains(message),
+                "{source}: {}",
+                error.message
+            );
+        }
+    }
+    #[test]
+    fn global_and_naked_assembly() {
+        let program = parse(
+            "package p\nunsafe asm(\n  \".globl {0}\",\n  \"{0}: movs r0, #{1}\",\n  sym boot.entry,\n  const LIMIT + 1,\n)\n@naked\n@section(\".ramfunc\")\npub extern \"C\" fn trampoline() -> u32 {\n unsafe {\n  asm(\"b {0}\", sym target)\n }\n}\n",
+        )
+        .unwrap();
+        let [global] = program.global_asm.as_slice() else {
+            panic!("one global asm block");
+        };
+        assert_eq!(global.asm.template, ".globl {0}\n{0}: movs r0, #{1}");
+        assert!(
+            matches!(&global.asm.operands[0].kind, AsmOperandKind::Sym(path) if path == "boot.entry")
+        );
+        assert!(matches!(
+            global.asm.operands[1].kind,
+            AsmOperandKind::Const(_)
+        ));
+        let trampoline = &program.functions[0];
+        assert!(trampoline.naked && trampoline.extern_);
+        assert_eq!(trampoline.placement.section.as_deref(), Some(".ramfunc"));
+        // A naked body keeps its form: no tail return is synthesized.
+        let asm = trampoline.naked_asm().expect("naked body");
+        assert!(matches!(&asm.operands[0].kind, AsmOperandKind::Sym(path) if path == "target"));
+        for (source, message) in [
+            ("asm(\"nop\")", "write it as `unsafe asm"),
+            (
+                "pub unsafe asm(\"nop\")",
+                "takes no attributes or modifiers",
+            ),
+            (
+                "@naked\nunsafe asm(\"nop\")",
+                "takes no attributes or modifiers",
+            ),
+            ("unsafe asm(\"nop\", sym)", "`sym` expects the name"),
+            (
+                "@naked\nstatic X: u32 = 1",
+                "@naked applies only to functions",
+            ),
+            (
+                "@naked @naked\nextern \"C\" fn f() { unsafe { asm(\"\") } }",
+                "duplicate @naked",
+            ),
+            ("@naked\nfn f() { unsafe { asm(\"\") } }", "@naked requires"),
+            ("@naked\nextern \"C\" fn f()", "@naked requires"),
+            (
+                "@naked\nextern \"C\" fn f<T>() { unsafe { asm(\"\") } }",
+                "@naked requires",
+            ),
+            (
+                "@naked @cold\nextern \"C\" fn f() { unsafe { asm(\"\") } }",
+                "@naked requires",
+            ),
+            (
+                "@naked\nasync extern \"C\" fn f() { unsafe { asm(\"\") } }",
+                "@naked requires",
+            ),
+            (
+                "struct S {\n @naked\n extern \"C\" fn f() { unsafe { asm(\"\") } }\n}",
+                "@naked requires",
+            ),
+            (
+                "@naked\nextern \"C\" fn f() { asm(\"\") }",
+                "exactly one `unsafe { asm(...) }`",
+            ),
+            (
+                "@naked\nextern \"C\" fn f() { unsafe { asm(\"\") }\n unsafe { asm(\"\") } }",
+                "exactly one",
+            ),
+            (
+                "@naked\nextern \"C\" fn f() { unsafe { x := 1 } }",
+                "exactly one",
             ),
         ] {
             let error = parse(&format!("package p\n{source}\n")).unwrap_err();

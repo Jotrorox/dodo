@@ -120,6 +120,15 @@ pub(super) fn resolve(program: &mut Program) -> Check<()> {
             resolver.block(body, &scope, &locals)?;
         }
     }
+    for global in &mut program.global_asm {
+        let scope = Scope {
+            namespace: global.namespace.clone(),
+            generics: HashSet::new(),
+        };
+        for value in global.asm.inputs_mut() {
+            resolver.expr(value, &scope, &HashSet::new())?;
+        }
+    }
     Ok(())
 }
 

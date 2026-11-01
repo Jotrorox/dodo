@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Global and naked assembly. Top-level `unsafe asm("...")` is emitted into
+  the object file outside any function, for startup code, functions written
+  entirely in assembly, or tables. `@naked` marks an `extern "C"` function
+  whose body is one `unsafe { asm(...) }` and which has no prologue or
+  epilogue, such as a fault handler that reads the stacked frame. Assembly
+  of every kind takes two new operands: `sym name` writes the link symbol
+  of a function or static into the template (with Mach-O's underscore, and
+  keeping the definition even when only assembly uses it), and `const value`
+  writes an integer constant expression. See
+  [global assembly](docs/src/content/docs/memory-and-ffi.md#global-assembly)
+  and [naked functions](docs/src/content/docs/memory-and-ffi.md#naked-functions).
 - New database packages. `std/db` holds the shared vocabulary for drivers:
   `db.Error` with portable `db.ErrorKind`s and `db.Constraint`s plus the
   driver's native code, the borrowed `db.Value`, and `db.IsolationLevel`.
