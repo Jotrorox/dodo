@@ -1,0 +1,268 @@
+package esp_flash
+
+import "core/ptr"
+import "std/embedded/hal"
+
+// The ESP32-C6's program flash: the module's SPI flash chip, which also
+// holds the running program, with the API of rp_flash. The chip's take()
+// hands out the `Flash` once; boards pass it on as `b.flash`. It reads the
+// whole flash and hands out regions of the free flash above the program,
+// each a `Region` with the std/embedded/hal Flash protocol, for
+// std/embedded/storage or other data that outlives a restart:
+//
+//     settings := storage.Store.open(b.flash.last(64 * 1024)!)!
+//
+// The program occupies the flash from offset 0 to `program_end()`, so
+// regions start at or above it and storage never overwrites the program.
+// `dodo run` writes only the program's own sectors, so data stored above
+// it survives updates, as long as the program does not grow into it.
+//
+// Reading copies from the flash's mapping at 0x42000000, through the cache,
+// as fast as running code from it; the boot ROM's direct boot maps the
+// whole flash there. Erasing and writing go through the boot ROM's SPI
+// flash functions (esp_rom_spiflash_erase_sector and
+// esp_rom_spiflash_write) on the flash controller's second port, SPI1,
+// while no code or data may be fetched from the flash. The compiler's
+// runtime therefore runs them from SRAM with interrupts masked and the
+// cache suspended (Cache_Suspend_ICache), then resumes it and invalidates
+// the range it changed (Cache_Invalidate_Addr), so reads through the
+// mapping see the new contents. It also tells the ROM the board's flash
+// size first, as direct boot leaves the ROM assuming 2 MiB. DMA transfers
+// must not read from flash meanwhile.
+//
+// An erase covers 4 KiB sectors and takes about 45 ms each, during which
+// interrupts wait; a USB serial port stays connected, as its controller
+// answers the host by itself. Writes may start and end anywhere: the flash
+// programs whole 256-byte pages, so a write pads its partial pages with
+// erased bytes, which leave the flash unchanged. Like all NOR flash, write
+// only to erased bytes; writing clears bits but never sets them. The
+// flash's status register is never written, so a chip whose block
+// protection bits are set refuses erases and writes silently.
+
+// Where the flash appears in the address space.
+pub const MAPPING_BASE: usize = 0x4200_0000
+// The flash's erase size.
+pub const SECTOR_BYTES: u32 = 4096
+// The flash's program size.
+pub const PAGE_BYTES: u32 = 256
+// Regions out at once.
+pub const MAX_REGIONS: u32 = 4
+
+// Provided by the compiler's ESP32-C6 firmware runtime: erase `count`
+// bytes from `offset` (both multiples of SECTOR_BYTES), or program `count`
+// bytes from word-aligned `data` in SRAM at `offset` (multiples of 4 that
+// stay within one page), with interrupts masked; 0 on success. And the
+// flash address where the program image ends and where the board's flash
+// ends.
+unsafe extern "C" fn dodo_flash_erase(offset: u32, count: u32) -> i32
+unsafe extern "C" fn dodo_flash_program(offset: u32, data: *const u32, count: u32) -> i32
+unsafe extern "C" fn dodo_flash_image_end() -> u32
+unsafe extern "C" fn dodo_flash_end() -> u32
+
+// The program flash, from the chip's take().
+pub struct Flash {
+    capacity: u32
+    program_end: u32
+    // The regions out, by start and end; an end of 0 marks a free slot.
+    starts: [4]u32
+    ends: [4]u32
+
+    // The flash, sized from the board's flash size.
+    // SAFETY: call once, from the chip's take(), so that the regions handed
+    // out are the only handles that erase and write the flash.
+    pub unsafe fn take() -> Flash {
+        image := unsafe {
+            dodo_flash_image_end()
+        }
+        end := unsafe {
+            dodo_flash_end()
+        }
+        capacity := end - MAPPING_BASE as u32
+        used := image - MAPPING_BASE as u32
+        program_end := (used + SECTOR_BYTES - 1) & ~(SECTOR_BYTES - 1)
+        if program_end > capacity {
+            program_end = capacity
+        }
+        return Flash { capacity, program_end, starts: [0u32; 4], ends: [0u32; 4] }
+    }
+
+    // The board's flash size in bytes.
+    pub fn capacity(&self) -> u32 {
+        return self.capacity
+    }
+
+    // The first sector after the program: the flash below it holds the
+    // program, the flash from it on is free for regions.
+    pub fn program_end(&self) -> u32 {
+        return self.program_end
+    }
+
+    // Copy `buffer.len` bytes from `offset` into `buffer`, anywhere in the
+    // flash, the program included. InvalidInput past its end.
+    pub fn read(&self, offset: u32, buffer: &mut[u8]) -> void!hal.Error {
+        if offset as u64 + buffer.len as u64 > self.capacity as u64 {
+            return err(hal.Error.InvalidInput)
+        }
+        copy_out(offset, buffer)
+        return ok()
+    }
+
+    // The `length` bytes of flash from `start`, both multiples of
+    // SECTOR_BYTES, to erase and write. InvalidInput unless the region is
+    // nonempty, at or above program_end(), and inside the flash; Busy if it
+    // overlaps a region that is out, or MAX_REGIONS are.
+    pub fn region(&mut self, start: u32, length: u32) -> Region!hal.Error {
+        end := start as u64 + length as u64
+        if length == 0 || start % SECTOR_BYTES != 0 || length % SECTOR_BYTES != 0 || start < self.program_end || end > self.capacity as u64 {
+            return err(hal.Error.InvalidInput)
+        }
+        free := MAX_REGIONS as usize
+        for slot in 0usize..MAX_REGIONS as usize {
+            if self.ends[slot] == 0 {
+                free = slot
+            } else if start < self.ends[slot] && self.starts[slot] < start + length {
+                return err(hal.Error.Busy)
+            }
+        }
+        if free == MAX_REGIONS as usize {
+            return err(hal.Error.Busy)
+        }
+        self.starts[free] = start
+        self.ends[free] = start + length
+        return ok(Region { start, length })
+    }
+
+    // The last `length` bytes of the flash, as `region`.
+    pub fn last(&mut self, length: u32) -> Region!hal.Error {
+        if length > self.capacity {
+            return err(hal.Error.InvalidInput)
+        }
+        start := self.capacity - length
+        return self.region(start, length)
+    }
+
+    // All the free flash, from program_end() to the end, as `region`.
+    pub fn free(&mut self) -> Region!hal.Error {
+        start := self.program_end
+        length := self.capacity - start
+        return self.region(start, length)
+    }
+
+    // Give back a region; its flash keeps its contents.
+    pub fn release(&mut self, region: Region) {
+        for slot in 0usize..MAX_REGIONS as usize {
+            if self.ends[slot] != 0 && self.starts[slot] == region.start {
+                self.ends[slot] = 0
+            }
+        }
+    }
+}
+
+// Part of the program flash, from Flash.region, with the std/embedded/hal
+// Flash protocol. Offsets count from its start.
+pub struct Region: hal.Flash {
+    start: u32
+    length: u32
+
+    // Where the region starts in the flash.
+    pub fn start(&self) -> u32 {
+        return self.start
+    }
+
+    pub fn capacity(&self) -> u32 {
+        return self.length
+    }
+
+    pub fn erase_size(&self) -> u32 {
+        return SECTOR_BYTES
+    }
+
+    // 1: any byte can be written.
+    pub fn write_size(&self) -> u32 {
+        return 1
+    }
+
+    pub fn read(&mut self, offset: u32, buffer: &mut[u8]) -> void!hal.Error {
+        at := self.place(offset, buffer.len as u32)?
+        copy_out(at, buffer)
+        return ok()
+    }
+
+    pub fn erase(&mut self, offset: u32, length: u32) -> void!hal.Error {
+        at := self.place(offset, length)?
+        if offset % SECTOR_BYTES != 0 || length % SECTOR_BYTES != 0 {
+            return err(hal.Error.InvalidInput)
+        }
+        // One sector at a time, so interrupts wait for one erase at most.
+        done := 0u32
+        for done < length {
+            // SAFETY: the region lies in the free flash above the program,
+            // claimed once from Flash.
+            result := unsafe {
+                dodo_flash_erase(at + done, SECTOR_BYTES)
+            }
+            if result != 0 {
+                return err(hal.Error.Bus)
+            }
+            done += SECTOR_BYTES
+        }
+        return ok()
+    }
+
+    pub fn write(&mut self, offset: u32, bytes: &[u8]) -> void!hal.Error {
+        start := self.place(offset, bytes.len as u32)?
+        // One page of words, so the ROM reads it word by word.
+        page: [64]u32 = [0xFFFF_FFFFu32; 64]
+        done := 0u32
+        total := bytes.len as u32
+        for done < total {
+            at := start + done
+            skip := at % PAGE_BYTES
+            count := PAGE_BYTES - skip
+            if count > total - done {
+                count = total - done
+            }
+            // Whole words around the bytes, padded with erased bytes.
+            first := skip & ~3u32
+            last := (skip + count + 3) & ~3u32
+            for index in (first / 4) as usize..(last / 4) as usize {
+                page[index] = 0xFFFF_FFFF
+            }
+            for index in 0..count as usize {
+                position := skip as usize + index
+                shift := 8 * (position % 4) as u32
+                word := page[position / 4] & ~(0xFFu32 << shift)
+                page[position / 4] = word | ((bytes[done as usize + index] as u32) << shift)
+            }
+            // SAFETY: as in erase; the page is in SRAM, on this stack, and
+            // the words written lie within one flash page.
+            result := unsafe {
+                dodo_flash_program(at - skip + first, ptr.offset(ptr.as_ptr(&page), (first / 4) as isize), last - first)
+            }
+            if result != 0 {
+                return err(hal.Error.Bus)
+            }
+            done += count
+        }
+        return ok()
+    }
+
+    // The flash offset of `offset`, after checking that `length` bytes from
+    // it lie inside the region.
+    fn place(&self, offset: u32, length: u32) -> u32!hal.Error {
+        if offset as u64 + length as u64 > self.length as u64 {
+            return err(hal.Error.InvalidInput)
+        }
+        return ok(self.start + offset)
+    }
+}
+
+// Copy flash from `offset` into `buffer`; the range lies inside the flash.
+fn copy_out(offset: u32, buffer: &mut[u8]) {
+    // SAFETY: the bytes lie inside the flash's mapping, which reads like
+    // memory between erases and writes; those run with interrupts masked
+    // on the only core, so none is in progress here.
+    unsafe {
+        ptr.copy_nonoverlapping((MAPPING_BASE + offset as usize) as *const u8, ptr.as_mut_ptr(buffer), buffer.len)
+    }
+}

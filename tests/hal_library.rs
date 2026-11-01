@@ -406,6 +406,50 @@ fn peripheral_drivers_execute_against_simulated_controllers() {
 }
 
 #[test]
+fn espressif_drivers_execute_against_simulated_controllers() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let scratch = Scratch::new("esp-peripheral");
+    let source = root.join("tests/stdlib/esp_peripheral_checks.dodo");
+    for optimization in ["0", "3"] {
+        let executable = scratch.0.join(format!(
+            "esp-peripheral-O{optimization}{}",
+            std::env::consts::EXE_SUFFIX
+        ));
+        let args = ["build", source.to_str().unwrap(), "-O", optimization, "-o"];
+        success(
+            &dodo(&args, &executable),
+            "compile Espressif peripheral fixture",
+        );
+        success(
+            &Command::new(&executable).output().unwrap(),
+            "execute Espressif peripheral fixture",
+        );
+    }
+}
+
+#[test]
+fn espressif_can_audio_and_capture_drivers_execute_against_models() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let scratch = Scratch::new("esp-can-audio");
+    let source = root.join("tests/stdlib/esp_can_audio_checks.dodo");
+    for optimization in ["0", "3"] {
+        let executable = scratch.0.join(format!(
+            "esp-can-audio-O{optimization}{}",
+            std::env::consts::EXE_SUFFIX
+        ));
+        let args = ["build", source.to_str().unwrap(), "-O", optimization, "-o"];
+        success(
+            &dodo(&args, &executable),
+            "compile Espressif CAN, audio, and capture fixture",
+        );
+        success(
+            &Command::new(&executable).output().unwrap(),
+            "execute Espressif CAN, audio, and capture fixture",
+        );
+    }
+}
+
+#[test]
 fn real_time_clocks_execute_against_fakes_and_simulated_registers() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let scratch = Scratch::new("rtc");
@@ -577,6 +621,30 @@ fn interrupt_control_lowers_to_each_architecture_mask() {
     );
     let text = fs::read_to_string(&assembly).unwrap();
     assert!(text.contains("wfi") && text.contains("dmb"), "{text}");
+    // RISC-V waits through the chip's weakly referenced
+    // dodo_wait_for_interrupt, which the ESP32-C6 package defines for its
+    // deep sleep, and fall back to a plain wfi without one.
+    let assembly = scratch.0.join("idle-riscv.s");
+    success(
+        &dodo(
+            &[
+                "build",
+                cpu.to_str().unwrap(),
+                "--emit",
+                "asm",
+                "--target",
+                "riscv32-unknown-none-elf",
+                "-o",
+            ],
+            &assembly,
+        ),
+        "emit RISC-V wait-for-interrupt",
+    );
+    let text = fs::read_to_string(&assembly).unwrap();
+    assert!(
+        text.contains("wfi") && text.contains("dodo_wait_for_interrupt") && text.contains(".weak"),
+        "{text}"
+    );
 
     // Deep sleep and sleep-on-exit change the SCB's SCR at 0xE000ED10.
     let scr = scratch.write(
@@ -710,4 +778,64 @@ fn field_values_that_do_not_fit_trap() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[test]
+fn espressif_system_drivers_execute_against_simulated_registers() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let scratch = Scratch::new("esp-system");
+    let source = root.join("tests/stdlib/esp_system_checks.dodo");
+    for optimization in ["0", "3"] {
+        let executable = scratch.0.join(format!(
+            "esp-system-O{optimization}{}",
+            std::env::consts::EXE_SUFFIX
+        ));
+        let args = ["build", source.to_str().unwrap(), "-O", optimization, "-o"];
+        success(
+            &dodo(&args, &executable),
+            "compile Espressif system fixture",
+        );
+        success(
+            &Command::new(&executable).output().unwrap(),
+            "execute Espressif system fixture",
+        );
+    }
+}
+
+#[test]
+fn espressif_bus_features_execute_against_simulated_controllers() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let scratch = Scratch::new("esp-bus");
+    let source = root.join("tests/stdlib/esp_bus_checks.dodo");
+    for optimization in ["0", "3"] {
+        let executable = scratch.0.join(format!(
+            "esp-bus-O{optimization}{}",
+            std::env::consts::EXE_SUFFIX
+        ));
+        let args = ["build", source.to_str().unwrap(), "-O", optimization, "-o"];
+        success(&dodo(&args, &executable), "compile Espressif bus fixture");
+        success(
+            &Command::new(&executable).output().unwrap(),
+            "execute Espressif bus fixture",
+        );
+    }
+}
+
+#[test]
+fn espressif_low_power_executes_against_simulated_registers() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let scratch = Scratch::new("esp-power");
+    let source = root.join("tests/stdlib/esp_power_checks.dodo");
+    for optimization in ["0", "3"] {
+        let executable = scratch.0.join(format!(
+            "esp-power-O{optimization}{}",
+            std::env::consts::EXE_SUFFIX
+        ));
+        let args = ["build", source.to_str().unwrap(), "-O", optimization, "-o"];
+        success(&dodo(&args, &executable), "compile Espressif power fixture");
+        success(
+            &Command::new(&executable).output().unwrap(),
+            "execute Espressif power fixture",
+        );
+    }
 }

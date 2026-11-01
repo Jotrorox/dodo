@@ -1,0 +1,814 @@
+package main
+
+import "std/embedded/hal"
+import "std/embedded/peripheral/esp_i2c"
+import "std/embedded/peripheral/esp_spi"
+import "std/embedded/peripheral/esp_uart"
+import "std/embedded/peripheral/esp_usb_serial"
+import "std/io"
+
+// Host checks for the Espressif controller drivers in
+// std/embedded/peripheral: esp_uart, esp_i2c, esp_spi, and esp_usb_serial,
+// against behavioural models of the ESP32-C6's UART, I2C controller, GP-SPI2,
+// and USB serial port. The models follow the hardware's rules as the
+// drivers rely on them (FIFO depths, the I2C command list and its done
+// bits, the latch registers) and move data only as status registers are
+// polled, so the drivers' waits are exercised.
+
+// --- UART ----------------------------------------------------------------
+
+const UART_FIFO: usize = 128
+
+struct UartModel {
+    conf0: u32
+    conf1: u32
+    clkdiv: u32
+    int_ena: u32
+    errors: u32
+    tx: [128]u8
+    tx_count: usize
+    shifting: bool
+    shift_value: u8
+    rx: [160]u8
+    rx_count: usize
+    sent: [300]u8
+    sent_count: usize
+    updates: u32
+    // Bytes on their way in, which arrive at the next status read.
+    queued: [160]u8
+    queued_count: usize
+    // Status reads per frame; 0 stalls the transmitter.
+    period: u32
+    reads: u32
+    tx_overflow: bool
+
+    fn new(period: u32) -> UartModel {
+        return UartModel {
+            conf0: 0x0010_001C,
+            conf1: 0x6060,
+            clkdiv: 0x2B6,
+            int_ena: 0,
+            errors: 0,
+            tx: [0; 128],
+            tx_count: 0,
+            shifting: false,
+            shift_value: 0,
+            rx: [0; 160],
+            rx_count: 0,
+            sent: [0; 300],
+            sent_count: 0,
+            updates: 0,
+            queued: [0; 160],
+            queued_count: 0,
+            period,
+            reads: 0,
+            tx_overflow: false,
+        }
+    }
+
+    fn queue(&mut self, bytes: &[u8]) {
+        for index in 0..bytes.len {
+            self.queued[self.queued_count] = bytes[index]
+            self.queued_count += 1
+        }
+    }
+
+    fn arrive(&mut self, byte: u8) {
+        if self.rx_count == UART_FIFO {
+            self.errors |= 1 << 4
+        } else {
+            self.rx[self.rx_count] = byte
+            self.rx_count += 1
+        }
+    }
+
+    fn shift(&mut self) {
+        if self.shifting {
+            if (self.conf0 & (1 << 12)) != 0 {
+                byte := self.shift_value
+                self.arrive(byte)
+            } else {
+                self.sent[self.sent_count] = self.shift_value
+                self.sent_count += 1
+            }
+            self.shifting = false
+        }
+        if self.tx_count > 0 {
+            self.shift_value = self.tx[0]
+            for index in 1..self.tx_count {
+                self.tx[index - 1] = self.tx[index]
+            }
+            self.tx_count -= 1
+            self.shifting = true
+        }
+    }
+
+    pub fn read(&mut self, offset: usize) -> u32 {
+        if offset == 0x00 {
+            core.assert(self.rx_count > 0)
+            byte := self.rx[0]
+            for index in 1..self.rx_count {
+                self.rx[index - 1] = self.rx[index]
+            }
+            self.rx_count -= 1
+            return byte as u32
+        } else if offset == 0x04 {
+            return self.errors
+        } else if offset == 0x08 {
+            return self.errors & self.int_ena
+        } else if offset == 0x0C {
+            return self.int_ena
+        } else if offset == 0x1C {
+            for index in 0..self.queued_count {
+                byte := self.queued[index]
+                self.arrive(byte)
+            }
+            self.queued_count = 0
+            self.reads += 1
+            if self.period != 0 && self.reads % self.period == 0 {
+                self.shift()
+            }
+            return (self.rx_count as u32) | ((self.tx_count as u32) << 16)
+        } else if offset == 0x20 {
+            return self.conf0
+        } else if offset == 0x48 {
+            return 0x0004_0100
+        } else if offset == 0x70 {
+            if self.shifting {
+                return 0x10
+            }
+            return 0
+        } else if offset == 0x98 {
+            return 0
+        }
+        core.assert(false)
+        return 0
+    }
+
+    pub fn write(&mut self, offset: usize, value: u32) {
+        if offset == 0x00 {
+            if self.tx_count == UART_FIFO {
+                self.tx_overflow = true
+            } else {
+                self.tx[self.tx_count] = (value & 0xFF) as u8
+                self.tx_count += 1
+            }
+        } else if offset == 0x0C {
+            self.int_ena = value
+        } else if offset == 0x10 {
+            self.errors &= ~value
+        } else if offset == 0x14 {
+            self.clkdiv = value
+        } else if offset == 0x20 {
+            if (value & (1 << 22)) != 0 {
+                self.rx_count = 0
+            }
+            if (value & (1 << 23)) != 0 {
+                self.tx_count = 0
+            }
+            self.conf0 = value
+        } else if offset == 0x24 {
+            self.conf1 = value
+        } else if offset == 0x98 {
+            core.assert_eq(value, 1u32)
+            self.updates += 1
+        } else if offset == 0x2C || offset == 0x48 || offset == 0x64 {
+        } else {
+            core.assert(false)
+        }
+    }
+}
+
+fn uart_divisors() {
+    standard := esp_uart.divisor(40_000_000, 115_200)!
+    core.assert_eq(standard.sixteenths, 5556u32)
+    core.assert_eq(standard.baud, 115_191u32)
+    fast := esp_uart.divisor(40_000_000, 1_000_000)!
+    core.assert_eq(fast.baud, 1_000_000u32)
+    // A 40 MHz clock divides down to 9766 baud; slower needs a prescaler.
+    expect_invalid(esp_uart.divisor(40_000_000, 9600))
+    expect_invalid(esp_uart.divisor(40_000_000, 30_000_000))
+    expect_invalid(esp_uart.divisor(40_000_000, 0))
+    slow := esp_uart.divisor(20_000_000, 9600)!
+    core.assert_eq(slow.baud, 9600u32)
+}
+
+fn uart_transfers() {
+    port := esp_uart.Controller.new(UartModel.new(3), esp_uart.divisor(40_000_000, 115_200)!)
+    port.set_loopback(true)!
+    // More than the FIFO holds: writes wait for room as frames go out.
+    sent: [200]u8 = [0; 200]
+    for index in 0..200usize {
+        sent[index] = ((index * 7 + 1) & 255) as u8
+    }
+    back: [200]u8 = [0; 200]
+    done := 0usize
+    offset := 0usize
+    for offset < 200 {
+        count := 200 - offset
+        if count > 50 {
+            count = 50
+        }
+        port.write(&sent[offset..offset + count])!
+        port.flush()!
+        done += io.read_exact(&mut port, &mut back[done..done + count])!
+        offset += count
+    }
+    for index in 0..200usize {
+        core.assert_eq(back[index], sent[index])
+    }
+    // Newlines translated both ways.
+    port.set_loopback(false)!
+    port.set_crlf(true)
+    port.write(b"a\nb")!
+    port.flush()!
+    port.set_format(7, esp_uart.Parity.Odd, 2)!
+    expect_error(port.set_format(9, esp_uart.Parity.None, 1), hal.Error.InvalidInput)
+    port.set_baud(1_000_000)!
+    core.assert_eq(port.baud(), 1_000_000u32)
+    model := port.release()
+    core.assert_eq(model.sent_count, 4usize)
+    core.assert(model.sent[0] == 97 && model.sent[1] == 13 && model.sent[2] == 10 && model.sent[3] == 98)
+    // 7 data bits (2), odd parity, two stop bits (3).
+    core.assert_eq(model.conf0 & 0x3F, 0b11_10_1_1u32)
+    core.assert_eq(model.clkdiv, (640u32 >> 4) | ((640u32 & 0xF) << 20))
+    core.assert(!model.tx_overflow && model.updates == 7)
+}
+
+fn uart_reads() {
+    model := UartModel.new(0)
+    model.queue(b"x\r\ny\r")
+    port := esp_uart.Controller.new(model, esp_uart.divisor(40_000_000, 115_200)!)
+    port.set_crlf(true)
+    line: [8]u8 = [0; 8]
+    count := port.read(&mut line)!
+    core.assert_eq(count, 4usize)
+    core.assert(line[0] == 120 && line[1] == 10 && line[2] == 121 && line[3] == 10)
+    port.set_crlf(false)
+
+    // Bytes beyond the 128-byte FIFO are lost and reported once, after the
+    // bytes that arrived before.
+    model = port.release()
+    flood: [130]u8 = [0; 130]
+    for index in 0..130usize {
+        flood[index] = (index & 255) as u8
+    }
+    model.queue(&flood)
+    port = esp_uart.Controller.new(model, esp_uart.divisor(40_000_000, 115_200)!)
+    buffer: [200]u8 = [0; 200]
+    match port.poll_read(&mut buffer) {
+        ok(_) => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert_eq(error.code, esp_uart.OVERRUN)
+            core.assert_eq(error.transferred, 128usize)
+        }
+    }
+    after := port.poll_read(&mut buffer)!
+    core.assert(after.transferred == 0 && after.state == io.PollState.Pending)
+
+    // A transmitter that never drains gives up after the poll limit.
+    port.set_poll_limit(1000)
+    big: [200]u8 = [0; 200]
+    expect_timed_out(port.write(&big), 128)
+}
+
+// --- I2C -----------------------------------------------------------------
+
+const ADDRESS: u32 = 0x400
+const START: u32 = 0x100
+const RESTART: u32 = 0x200
+const STOP: u32 = 0x300
+const DEVICE: u8 = 0x48
+const DEVICE10: u16 = 0x2A5
+
+struct I2cModel {
+    registers: [64]u32
+    tx: [40]u8
+    tx_count: usize
+    rx: [40]u8
+    rx_count: usize
+    raw: u32
+    // The device: a register pointer and 256 registers.
+    memory: [256]u8
+    pointer: usize
+    // Bus events, in order.
+    events: [400]u32
+    event_count: usize
+    // Holding the bus after an END command.
+    held: bool
+    starts: u32
+    lose_arbitration: bool
+    // The transaction's address phase is over, across held runs.
+    addressed: bool
+    ten_bit_low: bool
+
+    fn new() -> I2cModel {
+        memory: [256]u8 = [0; 256]
+        for index in 0..256usize {
+            memory[index] = ((index * 3) & 255) as u8
+        }
+        return I2cModel { registers: [0u32; 64], tx: [0; 40], tx_count: 0, rx: [0; 40], rx_count: 0, raw: 0, memory, pointer: 0, events: [0u32; 400], event_count: 0, held: false, starts: 0, lose_arbitration: false, addressed: false, ten_bit_low: false }
+    }
+
+    fn log(&mut self, event: u32) {
+        self.events[self.event_count] = event
+        self.event_count += 1
+    }
+
+    fn pop(&mut self) -> u8 {
+        core.assert(self.tx_count > 0)
+        byte := self.tx[0]
+        for index in 1..self.tx_count {
+            self.tx[index - 1] = self.tx[index]
+        }
+        self.tx_count -= 1
+        return byte
+    }
+
+    // Run the command list, as a TRANS_START does.
+    fn run(&mut self) {
+        acknowledged := true
+        for index in 0..8usize {
+            command := self.registers[(0x58 / 4) + index]
+            operation := (command >> 11) & 7
+            count := (command & 0xFF) as usize
+            if operation == 6 {
+                if self.lose_arbitration {
+                    self.raw |= 1 << 5
+                    return
+                }
+                if self.held {
+                    self.log(RESTART)
+                } else {
+                    self.log(START)
+                }
+                self.held = true
+                self.starts += 1
+                self.addressed = false
+            } else if operation == 1 {
+                for _ in 0..count {
+                    byte := self.pop()
+                    if !self.addressed {
+                        self.log(ADDRESS | byte as u32)
+                        self.addressed = true
+                        reading := (byte & 1) != 0
+                        header := byte >> 1
+                        if header == DEVICE {
+                            acknowledged = true
+                        } else if header == (0x78 | (DEVICE10 >> 8)) as u8 {
+                            acknowledged = true
+                            self.ten_bit_low = !reading
+                        } else {
+                            acknowledged = false
+                        }
+                    } else if self.ten_bit_low {
+                        self.log(byte as u32)
+                        acknowledged = byte == (DEVICE10 & 0xFF) as u8
+                        self.ten_bit_low = false
+                    } else {
+                        self.log(byte as u32)
+                        if self.registers[63] == 0 {
+                            self.pointer = byte as usize
+                            self.registers[63] = 1
+                        } else {
+                            self.memory[self.pointer & 255] = byte
+                            self.pointer += 1
+                        }
+                    }
+                    if !acknowledged {
+                        self.raw |= 1 << 10
+                        // The controller still sends the stop.
+                        self.log(STOP)
+                        self.held = false
+                        self.raw |= 1 << 7
+                        return
+                    }
+                }
+            } else if operation == 3 {
+                for _ in 0..count {
+                    byte := self.memory[self.pointer & 255]
+                    self.pointer += 1
+                    self.log(0x800 | byte as u32)
+                    self.rx[self.rx_count] = byte
+                    self.rx_count += 1
+                }
+            } else if operation == 2 {
+                self.log(STOP)
+                self.held = false
+                self.registers[63] = 0
+                self.registers[(0x58 / 4) + index] = command | (1u32 << 31)
+                self.raw |= 1 << 7
+                return
+            } else if operation == 4 {
+                self.registers[(0x58 / 4) + index] = command | (1u32 << 31)
+                self.raw |= 1 << 3
+                return
+            }
+            self.registers[(0x58 / 4) + index] = command | (1u32 << 31)
+        }
+    }
+
+    pub fn read(&mut self, offset: usize) -> u32 {
+        if offset == 0x1C {
+            core.assert(self.rx_count > 0)
+            byte := self.rx[0]
+            for index in 1..self.rx_count {
+                self.rx[index - 1] = self.rx[index]
+            }
+            self.rx_count -= 1
+            return byte as u32
+        } else if offset == 0x08 {
+            return (self.rx_count as u32) << 8
+        } else if offset == 0x20 {
+            return self.raw
+        }
+        return self.registers[offset / 4]
+    }
+
+    pub fn write(&mut self, offset: usize, value: u32) {
+        if offset == 0x1C {
+            core.assert(self.tx_count < 32)
+            self.tx[self.tx_count] = (value & 0xFF) as u8
+            self.tx_count += 1
+        } else if offset == 0x24 {
+            self.raw &= ~value
+        } else if offset == 0x18 {
+            if (value & (1 << 12)) != 0 {
+                self.rx_count = 0
+            }
+            if (value & (1 << 13)) != 0 {
+                self.tx_count = 0
+            }
+            self.registers[offset / 4] = value
+        } else if offset == 0x04 {
+            if (value & (1 << 5)) != 0 {
+                self.run()
+            }
+            if (value & (1 << 10)) != 0 {
+                self.held = false
+                self.registers[63] = 0
+            }
+            self.registers[1] = value & ~((1u32 << 5) | (1u32 << 10) | (1u32 << 11))
+        } else {
+            self.registers[offset / 4] = value
+        }
+    }
+}
+
+fn i2c_timing() {
+    standard := esp_i2c.timing(40_000_000, 100_000)!
+    core.assert(standard.half_cycle == 200 && standard.frequency_hz == 100_000)
+    fast := esp_i2c.timing(40_000_000, 400_000)!
+    core.assert(fast.half_cycle == 50 && fast.frequency_hz == 400_000)
+    expect_invalid(esp_i2c.timing(40_000_000, 2_000_000))
+    expect_invalid(esp_i2c.timing(40_000_000, 10_000))
+    core.assert_eq(esp_i2c.prescaler(40_000_000, 10_000), 4u32)
+    slow := esp_i2c.timing(10_000_000, 10_000)!
+    core.assert_eq(slow.frequency_hz, 10_000u32)
+    bus := esp_i2c.Controller.new(I2cModel.new(), standard)
+    model := bus.release()
+    core.assert_eq(model.registers[0], 199u32)
+    core.assert_eq(model.registers[0x38 / 4], 102u32 | (98u32 << 9))
+    core.assert_eq(model.registers[0x30 / 4], 49u32)
+    core.assert_eq(model.registers[0x34 / 4], 99u32)
+}
+
+fn expect_events(model: &I2cModel, expected: &[u32]) {
+    core.assert_eq(model.event_count, expected.len)
+    for index in 0..expected.len {
+        core.assert_eq(model.events[index], expected[index])
+    }
+}
+
+fn i2c_transactions() {
+    bus := esp_i2c.Controller.new(I2cModel.new(), esp_i2c.timing(40_000_000, 400_000)!)
+    // Register 0x10 := 0xAB, 0xCD, then read them back after a restart.
+    bytes: [3]u8 = [0x10, 0xAB, 0xCD]
+    bus.write(DEVICE, &bytes)!
+    pointer: [1]u8 = [0x10]
+    two: [2]u8 = [0, 0]
+    bus.write_read(DEVICE, &pointer, &mut two)!
+    core.assert(two[0] == 0xAB && two[1] == 0xCD)
+    one: [1]u8 = [0]
+    bus.read(DEVICE, &mut one)!
+    model := bus.release()
+    address := (DEVICE as u32) << 1
+    expected: [18]u32 = [
+        START, ADDRESS | address, 0x10, 0xAB, 0xCD, STOP,
+        START, ADDRESS | address, 0x10, RESTART, ADDRESS | address | 1, 0x8AB, 0x8CD, STOP,
+        START, ADDRESS | address | 1, 0x800 | ((0x12 * 3) & 255), STOP,
+    ]
+    expect_events(&model, &expected)
+}
+
+fn i2c_long_transfers() {
+    bus := esp_i2c.Controller.new(I2cModel.new(), esp_i2c.timing(40_000_000, 400_000)!)
+    // 70 bytes after the register number: three runs held together.
+    long: [71]u8 = [0; 71]
+    long[0] = 0x20
+    for index in 1..71usize {
+        long[index] = (index + 100) as u8
+    }
+    bus.write(DEVICE, &long)!
+    pointer: [1]u8 = [0x20]
+    back: [70]u8 = [0; 70]
+    bus.write_read(DEVICE, &pointer, &mut back)!
+    for index in 0..70usize {
+        core.assert_eq(back[index], (index + 101) as u8)
+    }
+    model := bus.release()
+    // One start and one stop per transaction, a restart between the write
+    // and the read of the second.
+    core.assert_eq(model.starts, 3u32)
+    stops := 0u32
+    restarts := 0u32
+    for index in 0..model.event_count {
+        if model.events[index] == STOP {
+            stops += 1
+        } else if model.events[index] == RESTART {
+            restarts += 1
+        }
+    }
+    core.assert(stops == 2 && restarts == 1 && !model.held)
+}
+
+fn i2c_failures() {
+    bus := esp_i2c.Controller.new(I2cModel.new(), esp_i2c.timing(40_000_000, 100_000)!)
+    byte: [1]u8 = [0]
+    expect_error(bus.read(0x50, &mut byte), hal.Error.NoAcknowledge)
+    expect_error(bus.write(0x50, &byte), hal.Error.NoAcknowledge)
+    core.assert(!bus.probe(0x50)! && bus.probe(DEVICE)!)
+    expect_error(bus.write(0x80, &byte), hal.Error.InvalidInput)
+    // The 10-bit device: header and low address byte, then data.
+    data: [2]u8 = [0x05, 0x99]
+    bus.write_ten_bit(DEVICE10, &data)!
+    expect_error(bus.write_ten_bit(0x2A6, &data), hal.Error.NoAcknowledge)
+    expect_error(bus.write_ten_bit(0x400, &data), hal.Error.InvalidInput)
+    model := bus.release()
+    core.assert_eq(model.memory[0x05], 0x99u8)
+    model.lose_arbitration = true
+    bus = esp_i2c.Controller.new(model, esp_i2c.timing(40_000_000, 100_000)!)
+    expect_error(bus.write(DEVICE, &byte), hal.Error.Bus)
+}
+
+// --- SPI -----------------------------------------------------------------
+
+struct SpiModel {
+    registers: [64]u32
+    // What went out, and what comes back: each byte inverted.
+    sent: [300]u8
+    sent_count: usize
+    runs: u32
+    updates: u32
+
+    fn new() -> SpiModel {
+        return SpiModel { registers: [0u32; 64], sent: [0; 300], sent_count: 0, runs: 0, updates: 0 }
+    }
+
+    pub fn read(&mut self, offset: usize) -> u32 {
+        return self.registers[offset / 4]
+    }
+
+    pub fn write(&mut self, offset: usize, value: u32) {
+        if offset == 0x00 {
+            if (value & (1 << 23)) != 0 {
+                self.updates += 1
+            }
+            if (value & (1 << 24)) != 0 {
+                core.assert(self.updates > 0)
+                bits := self.registers[0x1C / 4] + 1
+                core.assert(bits % 8 == 0 && bits <= 512)
+                for index in 0..(bits / 8) as usize {
+                    word := 0x98 / 4 + index / 4
+                    shift := 8 * (index % 4) as u32
+                    byte := ((self.registers[word] >> shift) & 0xFF) as u8
+                    self.sent[self.sent_count] = byte
+                    self.sent_count += 1
+                    self.registers[word] = (self.registers[word] & ~(0xFFu32 << shift)) | (((byte ^ 0xFF) as u32) << shift)
+                }
+                self.runs += 1
+            }
+            self.registers[0] = 0
+        } else {
+            self.registers[offset / 4] = value
+        }
+    }
+}
+
+fn spi_dividers() {
+    one := esp_spi.divider(80_000_000, 1_000_000)!
+    core.assert_eq(one.frequency_hz, 1_000_000u32)
+    core.assert_eq(one.value, 0x0006_74E7u32)
+    ten := esp_spi.divider(80_000_000, 10_000_000)!
+    core.assert(ten.value == 0x0000_70C7 && ten.frequency_hz == 10_000_000)
+    full := esp_spi.divider(80_000_000, 100_000_000)!
+    core.assert(full.value == 1u32 << 31 && full.frequency_hz == 80_000_000)
+    // Never faster than asked.
+    odd := esp_spi.divider(80_000_000, 300_000)!
+    core.assert(odd.frequency_hz <= 300_000 && odd.frequency_hz > 290_000)
+    expect_invalid(esp_spi.divider(80_000_000, 10_000))
+    expect_invalid(esp_spi.divider(80_000_000, 0))
+}
+
+fn spi_transfers() {
+    bus := esp_spi.Controller.new(SpiModel.new(), esp_spi.divider(80_000_000, 8_000_000)!, hal.SpiMode.Mode0)
+    data: [150]u8 = [0; 150]
+    for index in 0..150usize {
+        data[index] = (index + 5) as u8
+    }
+    bus.transfer(&mut data)!
+    for index in 0..150usize {
+        core.assert_eq(data[index], ((index + 5) ^ 0xFF) as u8)
+    }
+    bus.write(b"dodo")!
+    bus.set_mode(hal.SpiMode.Mode2)
+    model := bus.release()
+    // 150 bytes in runs of 64, 64, and 22; the write in one more.
+    core.assert(model.runs == 4 && model.sent_count == 154)
+    core.assert(model.sent[150] == 100 && model.sent[153] == 111)
+    // Mode 2: SCK idles high, data changes on the other edge.
+    core.assert_eq(model.registers[0x20 / 4] & (1u32 << 29), 1u32 << 29)
+    core.assert_eq(model.registers[0x10 / 4] & (1u32 << 9), 1u32 << 9)
+    // Hardware chip selects stay off.
+    core.assert_eq(model.registers[0x20 / 4] & 0x3F, 0x3Fu32)
+}
+
+// --- USB serial port -----------------------------------------------------
+
+struct UsbModel {
+    fifo: [64]u8
+    fifo_count: usize
+    // The host takes the FIFO after WR_DONE when it reads, after `delay`
+    // polls.
+    reading: bool
+    dtr: bool
+    pending: bool
+    delay: u32
+    polls: u32
+    frame: u32
+    received: [400]u8
+    received_count: usize
+    out: [16]u8
+    out_count: usize
+    total_polls: u32
+
+    fn new(reading: bool, dtr: bool) -> UsbModel {
+        return UsbModel { fifo: [0; 64], fifo_count: 0, reading, dtr, pending: false, delay: 5, polls: 0, frame: 0, received: [0; 400], received_count: 0, out: [0; 16], out_count: 0, total_polls: 0 }
+    }
+
+    pub fn read(&mut self, offset: usize) -> u32 {
+        if offset == 0x04 {
+            self.total_polls += 1
+            self.polls += 1
+            if self.polls % 20 == 0 {
+                self.frame += 1
+            }
+            if self.pending && self.reading && self.polls >= self.delay {
+                for index in 0..self.fifo_count {
+                    self.received[self.received_count] = self.fifo[index]
+                    self.received_count += 1
+                }
+                self.fifo_count = 0
+                self.pending = false
+            }
+            value := 0u32
+            if !self.pending && self.fifo_count < 64 {
+                value |= 1 << 1
+            }
+            if self.out_count > 0 {
+                value |= 1 << 2
+            }
+            return value
+        } else if offset == 0x00 {
+            core.assert(self.out_count > 0)
+            byte := self.out[0]
+            for index in 1..self.out_count {
+                self.out[index - 1] = self.out[index]
+            }
+            self.out_count -= 1
+            return byte as u32
+        } else if offset == 0x24 {
+            self.polls += 1
+            if self.polls % 20 == 0 {
+                self.frame += 1
+            }
+            return self.frame & 0x7FF
+        } else if offset == 0x4C {
+            if self.dtr {
+                return 1 << 1
+            }
+            return 0
+        }
+        return 0
+    }
+
+    pub fn write(&mut self, offset: usize, value: u32) {
+        if offset == 0x00 {
+            core.assert(!self.pending && self.fifo_count < 64)
+            self.fifo[self.fifo_count] = (value & 0xFF) as u8
+            self.fifo_count += 1
+        } else if offset == 0x04 {
+            if (value & 1) != 0 && self.fifo_count > 0 {
+                self.pending = true
+                self.polls = 0
+            }
+        }
+    }
+}
+
+fn usb_serial() {
+    // A terminal reads: everything arrives, newlines as CR LF.
+    port := esp_usb_serial.Controller.new(UsbModel.new(true, true))
+    port.set_crlf(true)
+    core.assert(port.is_connected())
+    text: [150]u8 = [65; 150]
+    text[149] = 10
+    port.write(&text)!
+    port.flush()!
+    model := port.release()
+    core.assert_eq(model.received_count, 151usize)
+    core.assert(model.received[149] == 13 && model.received[150] == 10)
+
+    // Nobody reads: the FIFO keeps 64 bytes, and later writes do not wait.
+    port = esp_usb_serial.Controller.new(UsbModel.new(false, false))
+    port.write(&text)!
+    model = port.release()
+    core.assert(model.fifo_count == 64 && model.received_count == 0)
+    polls := model.total_polls
+    port = esp_usb_serial.Controller.new(model)
+    port.write(&text)!
+    model = port.release()
+    core.assert(model.total_polls - polls < 400)
+
+    // A terminal open but stalled: the write gives up after
+    // WRITE_TIMEOUT_FRAMES frames.
+    port = esp_usb_serial.Controller.new(UsbModel.new(false, true))
+    port.write(&text)!
+    model = port.release()
+    core.assert(model.frame > esp_usb_serial.WRITE_TIMEOUT_FRAMES && model.frame < 3 * esp_usb_serial.WRITE_TIMEOUT_FRAMES)
+
+    // Input, with a terminal's Enter key as one newline.
+    model = UsbModel.new(true, true)
+    for &byte in b"ok\r\n" {
+        model.out[model.out_count] = byte
+        model.out_count += 1
+    }
+    port = esp_usb_serial.Controller.new(model)
+    port.set_crlf(true)
+    line: [8]u8 = [0; 8]
+    count := port.read(&mut line)!
+    core.assert(count == 3 && line[0] == 111 && line[1] == 107 && line[2] == 10)
+    empty := port.poll_read(&mut line)!
+    core.assert(empty.transferred == 0 && empty.state == io.PollState.Pending)
+}
+
+// --- Helpers -------------------------------------------------------------
+
+fn expect_invalid<T>(result: T!hal.Error) {
+    match result {
+        ok(_) => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == hal.Error.InvalidInput)
+        }
+    }
+}
+
+fn expect_error(result: void!hal.Error, expected: hal.Error) {
+    match result {
+        ok() => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == expected)
+        }
+    }
+}
+
+fn expect_timed_out(result: usize!io.Error, transferred: usize) {
+    match result {
+        ok(_) => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error.kind == io.ErrorKind.TimedOut)
+            core.assert_eq(error.transferred, transferred)
+        }
+    }
+}
+
+fn main() {
+    uart_divisors()
+    uart_transfers()
+    uart_reads()
+    i2c_timing()
+    i2c_transactions()
+    i2c_long_transfers()
+    i2c_failures()
+    spi_dividers()
+    spi_transfers()
+    usb_serial()
+}

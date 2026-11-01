@@ -25,6 +25,8 @@ use std::path::PathBuf;
 
 mod atmega328p;
 pub mod avr;
+mod esp32c6;
+pub mod esp_flash;
 pub mod image;
 mod rp2040;
 mod rp2350;
@@ -37,6 +39,8 @@ pub struct Chip {
     pub description: &'static str,
     pub triple: &'static str,
     pub cpu: &'static str,
+    /// LLVM target features, such as the RISC-V extensions the core has.
+    pub features: &'static str,
     /// Execute-in-place flash base address.
     pub flash_origin: u32,
     /// Flash size assumed with `chip = NAME` and no board.
@@ -52,6 +56,8 @@ pub struct Chip {
     /// `@interrupt(NAME)`: the core's exceptions, then the chip's interrupts
     /// in IRQ number order. The runtime defines each weakly.
     pub interrupts: &'static [&'static str],
+    /// How the hardware enters `@interrupt` handlers.
+    pub interrupt_abi: InterruptAbi,
     /// The optimization level when no setting chooses one. AVR's 32 KiB of
     /// flash and 2 KiB of SRAM fit few unoptimized programs, so its chips
     /// default to 2; others to the usual 0.
@@ -72,6 +78,19 @@ pub struct Chip {
     pub fixup: Fixup,
 }
 
+/// How a chip's `@interrupt` handlers are entered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InterruptAbi {
+    /// The hardware enters the handler from its vector table: an ordinary
+    /// function on Cortex-M, which stacks registers itself, and a
+    /// machine-mode trap handler that returns with `mret` on RISC-V.
+    Vector,
+    /// The runtime's trap handler saves the registers and calls the handler
+    /// as an ordinary C function, as the ESP32-C6 runtime does for its
+    /// interrupt sources.
+    Dispatched,
+}
+
 /// Changes a chip needs in its linked ELF file, given its loadable segments.
 pub type Fixup = fn(&Platform, &mut [u8], &[image::Segment]) -> Result<(), String>;
 
@@ -86,6 +105,16 @@ pub struct Region {
 pub enum ImageFormat {
     /// USB Flashing Format, with the bootloader drive's INFO_UF2.TXT Board-ID.
     Uf2 { family: u32, drive_id: &'static str },
+    /// The flash contents from offset 0, gaps filled with 0xFF, which `dodo
+    /// run` writes through the boot ROM's serial flasher of an Espressif
+    /// chip with ID `chip_id`, on the chip's own USB serial port `usb` or a
+    /// USB serial adapter, clearing `download_flag` so the chip starts the
+    /// image afterwards.
+    EspFlash {
+        chip_id: u16,
+        usb: serial::UsbId,
+        download_flag: esp_flash::DownloadFlag,
+    },
     /// Intel HEX of the flash contents, which `dodo run` writes through the
     /// board's serial bootloader, speaking STK500 version 1 at `baud` (see
     /// [`stk500`]), to a chip with the device `signature` and flash pages of
@@ -107,7 +136,12 @@ pub struct Board {
     pub package: &'static str,
 }
 
-pub static CHIPS: &[&Chip] = &[&rp2040::CHIP, &rp2350::CHIP, &atmega328p::CHIP];
+pub static CHIPS: &[&Chip] = &[
+    &rp2040::CHIP,
+    &rp2350::CHIP,
+    &esp32c6::CHIP,
+    &atmega328p::CHIP,
+];
 
 pub static BOARDS: &[Board] = &[
     Board {
@@ -130,6 +164,13 @@ pub static BOARDS: &[Board] = &[
         chip: &rp2350::CHIP,
         flash_size: 4 * 1024 * 1024,
         package: "std/embedded/board/pico2_w",
+    },
+    Board {
+        name: "esp32c6_devkitc",
+        description: "Espressif ESP32-C6-DevKitC-1",
+        chip: &esp32c6::CHIP,
+        flash_size: 8 * 1024 * 1024,
+        package: "std/embedded/board/esp32c6_devkitc",
     },
     Board {
         name: "arduino_uno",
@@ -230,6 +271,7 @@ impl Platform {
     pub fn image_extension(&self) -> &'static str {
         match self.chip.image {
             ImageFormat::Uf2 { .. } => "uf2",
+            ImageFormat::EspFlash { .. } => "bin",
             ImageFormat::Stk500 { .. } => "hex",
         }
     }
@@ -255,6 +297,7 @@ impl Platform {
         (self.chip.fixup)(self, elf, &segments)?;
         Ok(match self.chip.image {
             ImageFormat::Uf2 { family, .. } => image::uf2(elf, &segments, family),
+            ImageFormat::EspFlash { .. } => image::flat(elf, &segments, flash.origin),
             ImageFormat::Stk500 { .. } => {
                 avr::intel_hex(&image::flat(elf, &segments, flash.origin), flash.origin)
                     .into_bytes()
@@ -267,6 +310,7 @@ impl Platform {
     pub fn bootloader_drives(&self) -> Vec<PathBuf> {
         match self.chip.image {
             ImageFormat::Uf2 { drive_id, .. } => image::uf2_drives(drive_id),
+            ImageFormat::EspFlash { .. } => vec![],
             ImageFormat::Stk500 { .. } => vec![],
         }
     }
@@ -274,6 +318,7 @@ impl Platform {
     pub fn bootloader_drive_name(&self) -> &'static str {
         match self.chip.image {
             ImageFormat::Uf2 { drive_id, .. } => drive_id,
+            ImageFormat::EspFlash { .. } => "",
             ImageFormat::Stk500 { .. } => "",
         }
     }
@@ -332,7 +377,7 @@ mod tests {
         assert!(
             Platform::select(None, Some("rp2041"))
                 .unwrap_err()
-                .contains("available chips: rp2040, rp2350, atmega328p")
+                .contains("available chips: rp2040, rp2350, esp32c6, atmega328p")
         );
     }
 
@@ -420,14 +465,25 @@ mod tests {
                 .filter(|name| !name.starts_with("dodo_") && !name.starts_with("__"))
                 .collect();
             assert_eq!(weak, chip.interrupts, "{}", chip.name);
-            // Cortex-M tables hold addresses; AVR's hold a jmp per vector.
+            // The ESP32-C6's handlers follow its dispatch table's label;
+            // Cortex-M tables hold addresses, mixing the IRQs with exception
+            // handlers; AVR's hold a jmp per vector.
+            let dispatched = chip.interrupt_abi == InterruptAbi::Dispatched;
             let jumps = runtime
                 .lines()
                 .filter_map(|line| line.strip_prefix("module asm \"    jmp "))
                 .map(|name| name.trim_end_matches('"'))
                 .filter(|&name| name != "__reset");
-            let table: Vec<&str> = runtime
-                .lines()
+            let lines: Vec<&str> = if dispatched {
+                runtime
+                    .lines()
+                    .skip_while(|line| !line.contains("dodo_interrupt_table:"))
+                    .collect()
+            } else {
+                runtime.lines().collect()
+            };
+            let table: Vec<&str> = lines
+                .iter()
                 .filter_map(|line| line.strip_prefix("module asm \"    .word "))
                 .flat_map(|names| {
                     names
@@ -438,7 +494,7 @@ mod tests {
                         .trim_end_matches('"')
                         .split(", ")
                 })
-                .filter(|name| name.contains("_IRQ") || name.starts_with("IRQ"))
+                .filter(|name| dispatched || name.contains("_IRQ") || name.starts_with("IRQ"))
                 .chain(jumps)
                 .collect();
             let irqs: Vec<&str> = chip
@@ -447,8 +503,43 @@ mod tests {
                 .copied()
                 .filter(|name| !name.ends_with("_Handler"))
                 .collect();
+            assert!(!irqs.is_empty(), "{}", chip.name);
             assert_eq!(table, irqs, "{}", chip.name);
         }
+    }
+
+    #[test]
+    fn esp32c6_images_are_flat_and_need_the_direct_boot_marker() {
+        let platform = Platform::select(Some("esp32c6_devkitc"), None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(platform.chip.name, "esp32c6");
+        assert_eq!(platform.image_extension(), "bin");
+        assert!(platform.bootloader_drives().is_empty());
+        let mut head = vec![];
+        head.extend_from_slice(&esp32c6::DIRECT_BOOT_MARKER.to_le_bytes());
+        head.extend_from_slice(&esp32c6::DIRECT_BOOT_MARKER.to_le_bytes());
+        head.extend_from_slice(&[1, 2, 3, 4]);
+        // .data's load image after a gap, which stays erased flash.
+        let mut file = elf(&[(0x4200_0000, &head), (0x4200_0010, &[9, 8])]);
+        let image = platform.finish(&mut file).unwrap();
+        assert_eq!(image.len(), 0x12);
+        assert_eq!(&image[..12], &head[..]);
+        assert_eq!(&image[12..16], &[0xFF; 4]);
+        assert_eq!(&image[16..], &[9, 8]);
+
+        let mut file = elf(&[(0x4200_0000, &[0; 12])]);
+        assert!(
+            platform
+                .finish(&mut file)
+                .unwrap_err()
+                .contains("direct boot marker")
+        );
+        let script = platform.linker_script();
+        assert!(script.contains("FLASH (rx) : ORIGIN = 0x42000000, LENGTH = 0x800000"));
+        assert!(script.contains("RAM (rwx) : ORIGIN = 0x40800000, LENGTH = 0x7e610"));
+        let custom = Platform::select(None, Some("esp32c6")).unwrap().unwrap();
+        assert_eq!(custom.flash().length, 4 * 1024 * 1024);
     }
 
     #[test]

@@ -1,0 +1,495 @@
+package esp_rtc
+
+import "std/embedded/hal"
+
+// The ESP32-C6's real-time clock: its LP timer, a 48-bit counter in the
+// low-power domain that counts the RTC slow clock from power-up and keeps
+// counting while the processor sleeps and through every reset but losing
+// power, like the RP2350's always-on timer. The chip package hands it out
+// as `Peripherals.rtc`, and boards as `Board.rtc`; `Clock` implements the
+// std/embedded/hal Rtc and RtcAlarm protocols, so `hal.rtc_now(&mut b.rtc)`
+// reads it as a date and time.
+//
+// Ticks. The slow clock is the chip's internal RC oscillator (RC_SLOW_CLK),
+// nominally 136 kHz; boards without a 32 kHz crystal, as the DevKitC-1,
+// have nothing better. Its frequency varies by a few percent from chip to
+// chip and with temperature, so the chip package measures it against the
+// 40 MHz crystal at take() (`calibrate`, through TIMG0's RTC calibration
+// unit, over 1024 slow cycles, about 7.5 ms) and converts ticks to time with
+// that period. A tick is about 7.4 us; the clock reports milliseconds, so
+// `resolution_ms` is 1. Between calibrations it drifts as the oscillator
+// does: Espressif specifies no stability for RC_SLOW_CLK, and on the
+// DevKitC-1 it measured within 0.1 % at room temperature over the seconds
+// after calibration, about a minute a day; programs that keep time for
+// days should set it again from a network or a clock chip, or call
+// `calibrate` from time to time, which rebases the clock on the new period
+// so its time does not jump.
+//
+// The epoch. The timer cannot be loaded, so the clock keeps an offset: the
+// tick count and the Unix time in microseconds at which it was last set or
+// rebased, and the period, in a record of eight words at the top of LP
+// SRAM (0x5000_3FE0), which keeps its contents through every reset but
+// losing power, as the timer does. A magic word and a check word tell a
+// valid record from the random contents of LP SRAM after power-up; the
+// clock reads as not set without one. Neither the boot ROM nor the
+// compiler's runtime uses LP SRAM; programs that run code on the LP core
+// must keep clear of its last 32 bytes.
+//
+// The alarm. LP timer target 0 (TAR0) compares with the count and raises
+// the LP timer's interrupt while `listen`ing: source LP_RTC_TIMER (15) in
+// the interrupt matrix, not LP_TIMER (7), as measured on the chip; the
+// handler calls `clear_alarm`. The alarm fires once
+// the count reaches its target; a time already reached fires at once.
+//
+// `Clock` drives the timer over any hal.Registers: hal.RegisterBlocks at the
+// LP timer and the record on the chip, or simulated registers in a desktop
+// test. `Rtc` is the clock on the chip, which the chip package hands out.
+
+// LP timer registers.
+const TAR0_LOW: usize = 0x00
+const TAR0_HIGH: usize = 0x04
+const UPDATE: usize = 0x10
+const MAIN_BUF0_LOW: usize = 0x14
+const MAIN_BUF0_HIGH: usize = 0x18
+const INT_RAW: usize = 0x28
+const INT_ENA: usize = 0x30
+const INT_CLR: usize = 0x34
+// TAR0_HIGH: compare with the target. UPDATE: latch the count into
+// MAIN_BUF0. INT_*: the target was reached.
+const TARGET_ENABLE: u32 = 1u32 << 31
+const LATCH: u32 = 1 << 28
+const TARGET_REACHED: u32 = 1u32 << 31
+// The count's width.
+const COUNT_MASK: u64 = 0xFFFF_FFFF_FFFF
+
+// The record, eight words: MAGIC, the tick count and the Unix time in
+// microseconds when it was set, the period, and a check word.
+const RECORD_MAGIC: usize = 0x00
+const RECORD_TICKS_LOW: usize = 0x04
+const RECORD_TICKS_HIGH: usize = 0x08
+const RECORD_TIME_LOW: usize = 0x0C
+const RECORD_TIME_HIGH: usize = 0x10
+const RECORD_PERIOD: usize = 0x14
+const RECORD_CHECK: usize = 0x18
+const MAGIC: u32 = 0xD0D0_C10C
+const CHECK_SEED: u32 = 0x5EED_1E55
+
+// Periods are microseconds per slow clock tick with this many fraction
+// bits, as Espressif keeps them.
+pub const PERIOD_FRACTION: u32 = 19
+// The nominal period of a 136 kHz RC_SLOW_CLK, before calibrating.
+pub const NOMINAL_PERIOD: u32 = 3_855_059
+
+// The interrupt matrix source the alarm raises: esp32c6.LP_RTC_TIMER.
+pub const ALARM_SOURCE: u32 = 15
+
+// Where the chip keeps the record: the last 32 bytes of LP SRAM.
+pub const RECORD_ADDRESS: usize = 0x5000_3FE0
+
+// TIMG RTC calibration registers, from the timer group's base.
+const RTCCALICFG: usize = 0x68
+const RTCCALICFG1: usize = 0x6C
+const RTCCALICFG2: usize = 0x80
+// RTCCALICFG: start, the slow clock cycles to count, done, which clock,
+// and periodic counting.
+const CALI_START: u32 = 1u32 << 31
+const CALI_MAX: u32 = 0x7FFF << 16
+const CALI_READY: u32 = 1 << 15
+const CALI_CLOCK: u32 = 0b11 << 13
+const CALI_CYCLING: u32 = 1 << 12
+// RTCCALICFG1: the crystal cycles counted. RTCCALICFG2: the timeout limit,
+// its reset cycles, and whether it timed out.
+const CALI_VALUE: u32 = 0x1FF_FFFF << 7
+const CALI_TIMEOUT_LIMIT: u32 = 0x1FF_FFFF << 7
+const CALI_TIMEOUT_RESET: u32 = 0b1111 << 3
+const CALI_TIMED_OUT: u32 = 1 << 0
+// Polls of the calibration unit before Timeout.
+const CALI_POLLS: u32 = 1_000_000
+// Crystal cycles per microsecond.
+const CRYSTAL_MHZ: u64 = 40
+
+// The slow clock cycles take() counts: about 7.5 ms.
+pub const CALIBRATION_CYCLES: u32 = 1024
+
+// Measure the RTC slow clock against the 40 MHz crystal with the timer
+// group's RTC calibration unit at `registers`, over `cycles` (1 to 32767)
+// slow clock cycles, and return its period: microseconds per tick with
+// PERIOD_FRACTION fraction bits. A periodic calibration left running is
+// stopped first. Timeout if the unit never finishes, as when the slow
+// clock does not run; InvalidInput for a cycle count out of range.
+// SAFETY: only the caller may use the group's calibration registers.
+pub unsafe fn calibrate<R: hal.Registers>(registers: &mut R, cycles: u32) -> u32!hal.Error {
+    if cycles == 0 || cycles > 0x7FFF {
+        return err(hal.Error.InvalidInput)
+    }
+    config := registers.read(RTCCALICFG)
+    if (config & CALI_CYCLING) != 0 {
+        // A short timeout ends the periodic count at its next check.
+        registers.write(RTCCALICFG2, hal.encode(CALI_TIMEOUT_LIMIT, 1) | hal.encode(CALI_TIMEOUT_RESET, 3))
+        for _ in 0..CALI_POLLS {
+            if (registers.read(RTCCALICFG) & CALI_READY) != 0 || (registers.read(RTCCALICFG2) & CALI_TIMED_OUT) != 0 {
+                break
+            }
+        }
+        config = registers.read(RTCCALICFG)
+    }
+    config = config & ~(CALI_CYCLING | CALI_START | CALI_CLOCK | CALI_MAX)
+    registers.write(RTCCALICFG, config)
+    // Twice the crystal cycles a 100 kHz slow clock would take, before the
+    // unit gives up.
+    limit := cycles * 800
+    registers.write(RTCCALICFG2, hal.encode(CALI_TIMEOUT_LIMIT, limit) | hal.encode(CALI_TIMEOUT_RESET, 3))
+    registers.write(RTCCALICFG, config | hal.encode(CALI_MAX, cycles) | CALI_START)
+    counted := 0u32
+    for _ in 0..CALI_POLLS {
+        if (registers.read(RTCCALICFG) & CALI_READY) != 0 {
+            counted = hal.decode(CALI_VALUE, registers.read(RTCCALICFG1))
+            break
+        }
+        if (registers.read(RTCCALICFG2) & CALI_TIMED_OUT) != 0 {
+            break
+        }
+    }
+    registers.write(RTCCALICFG, config)
+    if counted == 0 {
+        return err(hal.Error.Timeout)
+    }
+    divider := CRYSTAL_MHZ * cycles as u64
+    period := ((counted as u64 << PERIOD_FRACTION as u64) + divider / 2 - 1) / divider
+    return ok((period & 0xFFFF_FFFF) as u32)
+}
+
+// The microseconds `ticks` slow clock ticks of `period` last, without
+// overflowing for any 48-bit count.
+pub fn ticks_to_us(ticks: u64, period: u32) -> u64 {
+    mask := (1u64 << PERIOD_FRACTION as u64) - 1
+    upper := ticks >> PERIOD_FRACTION as u64
+    lower := ticks & mask
+    return upper * period as u64 + ((lower * period as u64) >> PERIOD_FRACTION as u64)
+}
+
+// The ticks of `period` in `microseconds`, rounded down; `microseconds`
+// is below 2^44, about six months.
+pub fn us_to_ticks(microseconds: u64, period: u32) -> u64 {
+    return (microseconds << PERIOD_FRACTION as u64) / period as u64
+}
+
+// The LP timer over any hal.Registers, with its epoch in a record. Implements
+// hal.Rtc and hal.RtcAlarm with a resolution of one millisecond.
+pub struct Clock<R: hal.Registers>: hal.Rtc + hal.RtcAlarm {
+    timer: R
+    record: R
+    // The period the clock converts with.
+    period: u32
+
+    // Take the LP timer at `timer`, with its record in `record`, and the
+    // slow clock's period `period` as `calibrate` measured it (0 to keep
+    // the period the record has, or NOMINAL_PERIOD without one). A clock
+    // set before a reset keeps its time: it is rebased on the new period
+    // from now on. The alarm is disarmed and its interrupt off.
+    // SAFETY: `timer` must be the LP timer's registers and `record` eight
+    // words that survive resets, and nothing else may write either while
+    // the Clock exists.
+    pub unsafe fn new(timer: R, record: R, period: u32) -> Clock<R> from(timer, record) {
+        clock := Clock<R> { timer, record, period: NOMINAL_PERIOD }
+        clock.disarm()
+        enabled := clock.timer.read(INT_ENA)
+        clock.timer.write(INT_ENA, enabled & ~TARGET_REACHED)
+        if clock.valid() {
+            clock.period = clock.record.read(RECORD_PERIOD)
+            if period != 0 {
+                clock.rebase(period)
+            }
+        } else if period != 0 {
+            clock.period = period
+        }
+        return clock
+    }
+
+    // The slow clock's period the clock converts with: microseconds per
+    // tick with PERIOD_FRACTION fraction bits.
+    pub fn period(&self) -> u32 {
+        return self.period
+    }
+
+    // Convert with `period` from now on, keeping the time the clock shows
+    // now: after a new `calibrate`. InvalidInput for a period of 0.
+    pub fn set_period(&mut self, period: u32) -> void!hal.Error {
+        if period == 0 {
+            return err(hal.Error.InvalidInput)
+        }
+        if self.valid() {
+            self.rebase(period)
+        } else {
+            self.period = period
+        }
+        return ok()
+    }
+
+    // The LP timer's count: slow clock ticks since power-up.
+    pub fn ticks(&mut self) -> u64 {
+        self.timer.write(UPDATE, LATCH)
+        high := self.timer.read(MAIN_BUF0_HIGH) & 0xFFFF
+        low := self.timer.read(MAIN_BUF0_LOW)
+        return ((high as u64) << 32) | low as u64
+    }
+
+    pub fn is_set(&mut self) -> bool!hal.Error {
+        return ok(self.valid())
+    }
+
+    pub fn resolution_ms(&self) -> u32 {
+        return 1
+    }
+
+    // The Unix time in microseconds, while set.
+    fn now_us(&mut self) -> u64 {
+        base := self.word_pair(RECORD_TICKS_LOW)
+        time := self.word_pair(RECORD_TIME_LOW)
+        ticks := self.ticks()
+        return time + ticks_to_us((ticks - base) & COUNT_MASK, self.period)
+    }
+
+    pub fn now_ms(&mut self) -> u64!hal.Error {
+        if !self.valid() {
+            return err(hal.Error.Busy)
+        }
+        return ok(self.now_us() / 1000)
+    }
+
+    // Set the time and start counting from it. The alarm stays armed at its
+    // tick; set it again for a time. InvalidInput past the year 584,000,
+    // where microseconds overflow.
+    pub fn set_ms(&mut self, time_ms: u64) -> void!hal.Error {
+        if time_ms > 0xFFFF_FFFF_FFFF_FFFF / 1000 {
+            return err(hal.Error.InvalidInput)
+        }
+        ticks := self.ticks()
+        period := self.period
+        self.store(ticks, time_ms * 1000, period)
+        return ok()
+    }
+
+    // Fire when the clock reaches `time_ms`. Busy if the clock is not set;
+    // InvalidInput more than six months ahead.
+    pub fn set_alarm_ms(&mut self, time_ms: u64) -> void!hal.Error {
+        if !self.valid() {
+            return err(hal.Error.Busy)
+        }
+        if time_ms > 0xFFFF_FFFF_FFFF_FFFF / 1000 {
+            return err(hal.Error.InvalidInput)
+        }
+        target_us := time_ms * 1000
+        now := self.now_us()
+        ticks := self.ticks()
+        target := ticks
+        if target_us > now {
+            ahead := target_us - now
+            if ahead >= (1u64 << 44) {
+                return err(hal.Error.InvalidInput)
+            }
+            target = ticks + us_to_ticks(ahead, self.period) + 1
+        }
+        self.disarm()
+        self.timer.write(TAR0_LOW, (target & 0xFFFF_FFFF) as u32)
+        self.timer.write(TAR0_HIGH, ((target >> 32) & 0xFFFF) as u32 | TARGET_ENABLE)
+        // The comparator fires once the count reaches the target; one
+        // already passed while this ran fires here.
+        if self.ticks() >= target && (self.timer.read(INT_RAW) & TARGET_REACHED) == 0 {
+            self.disarm()
+            future := self.ticks() + 2
+            self.timer.write(TAR0_LOW, (future & 0xFFFF_FFFF) as u32)
+            self.timer.write(TAR0_HIGH, ((future >> 32) & 0xFFFF) as u32 | TARGET_ENABLE)
+        }
+        return ok()
+    }
+
+    pub fn alarm_fired(&mut self) -> bool!hal.Error {
+        return ok((self.timer.read(INT_RAW) & TARGET_REACHED) != 0)
+    }
+
+    // Disarm the alarm and acknowledge it.
+    pub fn clear_alarm(&mut self) -> void!hal.Error {
+        self.disarm()
+        return ok()
+    }
+
+    // Raise the LP timer's interrupt when the alarm fires.
+    pub fn listen(&mut self) {
+        enabled := self.timer.read(INT_ENA)
+        self.timer.write(INT_ENA, enabled | TARGET_REACHED)
+    }
+
+    // Stop raising the interrupt; alarm_fired still reports.
+    pub fn ignore(&mut self) {
+        enabled := self.timer.read(INT_ENA)
+        self.timer.write(INT_ENA, enabled & ~TARGET_REACHED)
+    }
+
+    pub fn is_listening(&mut self) -> bool {
+        return (self.timer.read(INT_ENA) & TARGET_REACHED) != 0
+    }
+
+    // Forget the time: the clock reads as not set until set_ms.
+    pub fn unset(&mut self) {
+        self.record.write(RECORD_MAGIC, 0)
+        self.record.write(RECORD_CHECK, 0)
+    }
+
+    // Disarm the alarm and stop its interrupt, and give back the registers.
+    // The timer keeps counting, and the record its time.
+    pub fn release(self) -> (R, R) from(self) {
+        self.ignore()
+        self.disarm()
+        let Clock { timer, record, period } = self
+        return (timer, record)
+    }
+
+    fn disarm(&mut self) {
+        self.timer.write(TAR0_HIGH, 0)
+        self.timer.write(INT_CLR, TARGET_REACHED)
+    }
+
+    // Keep the time shown now, from a count with the new period.
+    fn rebase(&mut self, period: u32) {
+        ticks := self.ticks()
+        base := self.word_pair(RECORD_TICKS_LOW)
+        time := self.word_pair(RECORD_TIME_LOW)
+        now := time + ticks_to_us((ticks - base) & COUNT_MASK, self.period)
+        self.store(ticks, now, period)
+    }
+
+    fn word_pair(&mut self, offset: usize) -> u64 {
+        low := self.record.read(offset)
+        high := self.record.read(offset + 4)
+        return ((high as u64) << 32) | low as u64
+    }
+
+    fn store(&mut self, ticks: u64, time_us: u64, period: u32) {
+        self.period = period
+        words: [5]u32 = [(ticks & 0xFFFF_FFFF) as u32, (ticks >> 32) as u32, (time_us & 0xFFFF_FFFF) as u32, (time_us >> 32) as u32, period]
+        // Invalid while it changes, so a reset in between leaves no mix.
+        self.record.write(RECORD_MAGIC, 0)
+        check := CHECK_SEED
+        for index in 0usize..5 {
+            self.record.write(RECORD_TICKS_LOW + 4 * index, words[index])
+            check = check ^ words[index]
+        }
+        self.record.write(RECORD_CHECK, check)
+        self.record.write(RECORD_MAGIC, MAGIC)
+    }
+
+    fn valid(&mut self) -> bool {
+        if self.record.read(RECORD_MAGIC) != MAGIC {
+            return false
+        }
+        check := CHECK_SEED
+        for index in 0usize..5 {
+            check = check ^ self.record.read(RECORD_TICKS_LOW + 4 * index)
+        }
+        return check == self.record.read(RECORD_CHECK) && self.record.read(RECORD_PERIOD) != 0
+    }
+}
+
+// The LP timer on the chip as a real-time clock, which the chip package
+// hands out: a Clock over the LP timer's registers and the record in LP
+// SRAM. Implements hal.Rtc and hal.RtcAlarm.
+pub struct Rtc: hal.Rtc + hal.RtcAlarm {
+    clock: Clock<hal.RegisterBlock>
+    calibration: hal.RegisterBlock
+
+    // The clock over the LP timer at `timer_base` and the record at
+    // `record_base`, calibrated with the RTC calibration unit of the timer
+    // group at `calibration_base`. Timeout if the slow clock does not run.
+    // SAFETY: as for Clock.new and calibrate.
+    pub unsafe fn at(timer_base: usize, record_base: usize, calibration_base: usize) -> Rtc!hal.Error {
+        unsafe {
+            calibration := hal.RegisterBlock.at(calibration_base)
+            period := calibrate(&mut calibration, CALIBRATION_CYCLES)?
+            clock := Clock.new(hal.RegisterBlock.at(timer_base), hal.RegisterBlock.at(record_base), period)
+            return ok(Rtc { clock, calibration })
+        }
+    }
+
+    pub fn is_set(&mut self) -> bool!hal.Error {
+        return self.clock.is_set()
+    }
+
+    pub fn now_ms(&mut self) -> u64!hal.Error {
+        return self.clock.now_ms()
+    }
+
+    pub fn set_ms(&mut self, time_ms: u64) -> void!hal.Error {
+        return self.clock.set_ms(time_ms)
+    }
+
+    // 1: the clock counts milliseconds, from ticks of about 7.4 us.
+    pub fn resolution_ms(&self) -> u32 {
+        return self.clock.resolution_ms()
+    }
+
+    pub fn set_alarm_ms(&mut self, time_ms: u64) -> void!hal.Error {
+        return self.clock.set_alarm_ms(time_ms)
+    }
+
+    pub fn alarm_fired(&mut self) -> bool!hal.Error {
+        return self.clock.alarm_fired()
+    }
+
+    pub fn clear_alarm(&mut self) -> void!hal.Error {
+        return self.clock.clear_alarm()
+    }
+
+    // Measure the slow clock against the crystal again, about 7.5 ms, and
+    // convert with the new period from now on; the time shown does not
+    // jump. Timeout if the slow clock does not run.
+    pub fn calibrate(&mut self) -> void!hal.Error {
+        // SAFETY: the Rtc owns the calibration unit.
+        period := unsafe {
+            calibrate(&mut self.calibration, CALIBRATION_CYCLES)?
+        }
+        return self.clock.set_period(period)
+    }
+
+    // The slow clock's period: microseconds per tick with PERIOD_FRACTION
+    // fraction bits; 1_000_000 << PERIOD_FRACTION over it is its frequency.
+    pub fn period(&self) -> u32 {
+        return self.clock.period()
+    }
+
+    // The slow clock's frequency in hertz, as last calibrated.
+    pub fn slow_clock_hz(&self) -> u32 {
+        return ((1_000_000u64 << PERIOD_FRACTION as u64) / self.clock.period() as u64) as u32
+    }
+
+    // The LP timer's count: slow clock ticks since power-up.
+    pub fn ticks(&mut self) -> u64 {
+        return self.clock.ticks()
+    }
+
+    // Forget the time: the clock reads as not set until set_ms.
+    pub fn unset(&mut self) {
+        self.clock.unset()
+    }
+
+    // The alarm's interrupt: its source number for esp32c6.enable, and its
+    // vector name, LP_RTC_TIMER, for `@interrupt`.
+    pub fn irq(&self) -> u32 {
+        return ALARM_SOURCE
+    }
+
+    // Raise LP_RTC_TIMER when the alarm fires. Route the source too:
+    // `esp32c6.enable(rtc.irq())`.
+    pub fn listen(&mut self) {
+        self.clock.listen()
+    }
+
+    // Stop raising the interrupt; alarm_fired still reports.
+    pub fn ignore(&mut self) {
+        self.clock.ignore()
+    }
+
+    pub fn is_listening(&mut self) -> bool {
+        return self.clock.is_listening()
+    }
+}

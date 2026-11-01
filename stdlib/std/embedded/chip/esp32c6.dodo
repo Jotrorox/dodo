@@ -1,0 +1,4726 @@
+package esp32c6
+
+import "core/cpu"
+import "core/mmio"
+import "core/ptr"
+import "std/embedded/chip/esp_flash"
+import "std/embedded/chip/esp_rng"
+import "std/embedded/chip/esp_rtc"
+import "std/embedded/chip/esp_watchdog"
+import "std/embedded/chip/esp_capture"
+import "std/embedded/chip/esp_i2s"
+import "std/embedded/chip/esp_power"
+import "std/embedded/executor"
+import "std/embedded/hal"
+import "std/embedded/hal/serial"
+import "std/embedded/peripheral/esp_i2c"
+import "std/embedded/peripheral/esp_spi"
+import "std/embedded/peripheral/esp_twai"
+import "std/embedded/peripheral/esp_uart"
+import "std/embedded/peripheral/esp_usb_serial"
+import "std/embedded/power"
+import "std/io"
+
+// Espressif ESP32-C6 chip support for its high-performance RISC-V core:
+// clocks, GPIO through the IO MUX and GPIO matrix, interrupts, the system
+// timer and its alarms, the USB serial port, and the boot ROM; the rest of
+// the package adds I2C, SPI, UART, PWM (LEDC), the ADC and temperature
+// sensor, DMA, an addressable LED driver (RMT), CAN (TWAI), I2S audio,
+// PWM input capture (MCPWM and PCNT), the random number generator, the
+// watchdog, the real-time clock, the flash above the program, and low power
+// (`Power`: clock gating, sleep modes, and a dormant state). `take()` brings the chip
+// from the state the boot ROM leaves it in to a known configuration and
+// hands out the peripherals once. Pins implement the std/embedded/hal output
+// and input pin protocols, I2C and SPI buses claimed from `Pins` implement
+// the bus protocols, serial ports the std/io Reader and Writer protocols,
+// PWM outputs and ADC inputs the PWM output and analog input protocols, CAN
+// controllers, I2S streams, and PWM inputs the CAN, I2S, and PWM input
+// protocols, and the timer implements the delay protocol, so portable
+// drivers use them unchanged.
+//
+// Applications normally use a board package instead: `import
+// "std/embedded/board"` with `board = "esp32c6_devkitc"`, or `import
+// "std/embedded/chip"` for a custom ESP32-C6 board with `chip = "esp32c6"`.
+//
+// Clocks after take(): the CPU at 160 MHz from the 480 MHz PLL, the AHB and
+// APB buses at 40 MHz, and the system timer counting at 16 MHz from the
+// 40 MHz crystal. Peripherals take their clocks from the crystal or the
+// PLL's fixed 80 MHz output, so their rates do not depend on the CPU's. The
+// flash keeps the boot ROM's direct boot setup.
+//
+// The GPIO matrix connects any peripheral signal to any pin, so buses,
+// serial ports, and PWM outputs go on any free pins. GPIO 0 to 23 are
+// supported. GPIO 24 to 30 connect to the flash on ESP32-C6 modules, and
+// GPIO 12 and 13 are the USB serial port's D- and D+, so claiming those is
+// refused while the USB serial port works (see USB_PINS). GPIO 8, 9, and 15
+// are strapping pins, read at reset: GPIO 9 low starts the boot ROM's
+// download mode.
+//
+// Register names follow the ESP32-C6 technical reference manual.
+
+// The CPU clock after take().
+pub const CPU_HZ: u32 = 160_000_000
+// The crystal, which the ESP32-C6 requires to be 40 MHz.
+pub const XTAL_HZ: u32 = 40_000_000
+// The PLL output peripherals use.
+pub const PLL_F80M_HZ: u32 = 80_000_000
+// GPIO 0 to 23: the pins that are not wired to the flash.
+pub const PIN_COUNT: u32 = 24
+// GPIO 12 and 13, the USB serial port's D- and D+.
+pub const USB_PINS: u32 = (1u32 << 12) | (1u32 << 13)
+
+// Interrupt sources, numbered as in the interrupt matrix. Each is also the
+// vector name of its handler, `@interrupt(UART0)`; `enable` routes it to
+// the CPU.
+pub const WIFI_MAC: u32 = 0
+pub const WIFI_MAC_NMI: u32 = 1
+pub const WIFI_PWR: u32 = 2
+pub const WIFI_BB: u32 = 3
+pub const BT_MAC: u32 = 4
+pub const BT_BB: u32 = 5
+pub const BT_BB_NMI: u32 = 6
+pub const LP_TIMER: u32 = 7
+pub const COEX: u32 = 8
+pub const BLE_TIMER: u32 = 9
+pub const BLE_SEC: u32 = 10
+pub const I2C_MASTER: u32 = 11
+pub const ZB_MAC: u32 = 12
+pub const PMU: u32 = 13
+pub const EFUSE: u32 = 14
+pub const LP_RTC_TIMER: u32 = 15
+pub const LP_UART: u32 = 16
+pub const LP_I2C: u32 = 17
+pub const LP_WDT: u32 = 18
+pub const LP_PERI_TIMEOUT: u32 = 19
+pub const LP_APM_M0: u32 = 20
+pub const LP_APM_M1: u32 = 21
+pub const FROM_CPU_INTR0: u32 = 22
+pub const FROM_CPU_INTR1: u32 = 23
+pub const FROM_CPU_INTR2: u32 = 24
+pub const FROM_CPU_INTR3: u32 = 25
+pub const ASSIST_DEBUG: u32 = 26
+pub const TRACE: u32 = 27
+pub const CACHE: u32 = 28
+pub const CPU_PERI_TIMEOUT: u32 = 29
+pub const GPIO: u32 = 30
+pub const GPIO_NMI: u32 = 31
+pub const PAU: u32 = 32
+pub const HP_PERI_TIMEOUT: u32 = 33
+pub const MODEM_PERI_TIMEOUT: u32 = 34
+pub const HP_APM_M0: u32 = 35
+pub const HP_APM_M1: u32 = 36
+pub const HP_APM_M2: u32 = 37
+pub const HP_APM_M3: u32 = 38
+pub const LP_APM0: u32 = 39
+pub const MSPI: u32 = 40
+pub const I2S0: u32 = 41
+pub const UHCI0: u32 = 42
+pub const UART0: u32 = 43
+pub const UART1: u32 = 44
+pub const LEDC: u32 = 45
+pub const TWAI0: u32 = 46
+pub const TWAI1: u32 = 47
+pub const USB_DEVICE: u32 = 48
+pub const RMT: u32 = 49
+pub const I2C_EXT0: u32 = 50
+pub const TG0_T0_LEVEL: u32 = 51
+pub const TG0_T1_LEVEL: u32 = 52
+pub const TG0_WDT_LEVEL: u32 = 53
+pub const TG1_T0_LEVEL: u32 = 54
+pub const TG1_T1_LEVEL: u32 = 55
+pub const TG1_WDT_LEVEL: u32 = 56
+pub const SYSTIMER_TARGET0: u32 = 57
+pub const SYSTIMER_TARGET1: u32 = 58
+pub const SYSTIMER_TARGET2: u32 = 59
+pub const APB_SARADC: u32 = 60
+pub const MCPWM0: u32 = 61
+pub const PCNT: u32 = 62
+pub const PARL_IO: u32 = 63
+pub const SLC0: u32 = 64
+pub const SLC1: u32 = 65
+pub const DMA_IN_CH0: u32 = 66
+pub const DMA_IN_CH1: u32 = 67
+pub const DMA_IN_CH2: u32 = 68
+pub const DMA_OUT_CH0: u32 = 69
+pub const DMA_OUT_CH1: u32 = 70
+pub const DMA_OUT_CH2: u32 = 71
+pub const SPI2: u32 = 72
+pub const AES: u32 = 73
+pub const SHA: u32 = 74
+pub const RSA: u32 = 75
+pub const ECC: u32 = 76
+// Sources 0 to 76.
+pub const SOURCE_COUNT: u32 = 77
+
+// The interrupt matrix: one register per source holding the CPU interrupt
+// it raises, 0 for none, then the sources' levels, 32 per word.
+const INTMTX_BASE: usize = 0x6001_0000
+const INTMTX_STATUS: usize = INTMTX_BASE + 0x134
+// The compiler's runtime routes CPU interrupt 1 at priority 1 and
+// dispatches every source routed to it.
+const CPU_INTERRUPT: u32 = 1
+// INTPRI: writing 1 to CPU_INTR_FROM_CPU_n raises FROM_CPU_INTRn.
+const INTPRI_BASE: usize = 0x600C_5000
+const FROM_CPU_BASE: usize = INTPRI_BASE + 0x90
+
+// GPIO and the GPIO matrix.
+const GPIO_BASE: usize = 0x6009_1000
+const GPIO_OUT_W1TS: usize = GPIO_BASE + 0x08
+const GPIO_OUT_W1TC: usize = GPIO_BASE + 0x0C
+const GPIO_OUT: usize = GPIO_BASE + 0x04
+const GPIO_ENABLE_W1TS: usize = GPIO_BASE + 0x24
+const GPIO_ENABLE_W1TC: usize = GPIO_BASE + 0x28
+const GPIO_IN: usize = GPIO_BASE + 0x3C
+// Latched interrupt events, one bit per pin, and their write-one-to-clear
+// alias.
+const GPIO_STATUS: usize = GPIO_BASE + 0x44
+const GPIO_STATUS_W1TC: usize = GPIO_BASE + 0x4C
+// PINn: open drain, the interrupt type, and the CPU interrupt enable.
+const GPIO_PIN: usize = GPIO_BASE + 0x74
+const PIN_OPEN_DRAIN: u32 = 1 << 2
+const PIN_INT_TYPE: u32 = 0b111 << 7
+const PIN_INT_ENABLE: u32 = 1 << 13
+// FUNCn_IN_SEL_CFG, one per peripheral input signal: the pin, inverted,
+// through the matrix. Pin values 0x38 and 0x3C are constant high and low.
+const GPIO_FUNC_IN: usize = GPIO_BASE + 0x154
+const IN_SEL_MATRIX: u32 = 1 << 7
+const IN_CONSTANT_HIGH: u32 = 0x38
+const IN_CONSTANT_LOW: u32 = 0x3C
+// FUNCn_OUT_SEL_CFG, one per pin: the output signal (128 for the GPIO
+// output register), inverted, and the output enable from the GPIO enable
+// register rather than the peripheral.
+const GPIO_FUNC_OUT: usize = GPIO_BASE + 0x554
+const OUT_SEL_GPIO: u32 = 128
+const OUT_ENABLE_FROM_GPIO: u32 = 1 << 9
+// IO MUX: per pad, pull-down, pull-up, input enable, drive strength, the
+// function (1 selects GPIO), and the input filter.
+const IO_MUX_BASE: usize = 0x6009_0004
+const PAD_PULL_DOWN: u32 = 1 << 7
+const PAD_PULL_UP: u32 = 1 << 8
+const PAD_INPUT: u32 = 1 << 9
+const PAD_DRIVE: u32 = 0b11 << 10
+const PAD_FUNCTION: u32 = 0b111 << 12
+const FUNCTION_GPIO: u32 = 1
+
+// Pin events for `Pin.listen`, `ignore`, `events`, and `clear_events`,
+// as in the Raspberry Pi chip packages: the pin's level is low or high, or
+// it fell or rose. A pin watches one kind at a time: both edges, one edge,
+// or one level.
+pub const LEVEL_LOW: u32 = 1 << 0
+pub const LEVEL_HIGH: u32 = 1 << 1
+pub const FALLING_EDGE: u32 = 1 << 2
+pub const RISING_EDGE: u32 = 1 << 3
+const ALL_EVENTS: u32 = 0xF
+// PINn interrupt types.
+const INT_RISING: u32 = 1
+const INT_FALLING: u32 = 2
+const INT_ANY_EDGE: u32 = 3
+const INT_LOW: u32 = 4
+const INT_HIGH: u32 = 5
+
+// The system timer: unit 0 counts at 16 MHz from the crystal; comparators
+// 0 to 2 fire alarms.
+const SYSTIMER_BASE: usize = 0x6000_A000
+const SYSTIMER_CONF: usize = SYSTIMER_BASE + 0x00
+const SYSTIMER_UNIT0_OP: usize = SYSTIMER_BASE + 0x04
+const UNIT_UPDATE: u32 = 1 << 30
+const UNIT_VALUE_VALID: u32 = 1 << 29
+const SYSTIMER_TARGET: usize = SYSTIMER_BASE + 0x1C
+const SYSTIMER_TARGET_CONF: usize = SYSTIMER_BASE + 0x34
+const SYSTIMER_UNIT0_VALUE_HI: usize = SYSTIMER_BASE + 0x40
+const SYSTIMER_UNIT0_VALUE_LO: usize = SYSTIMER_BASE + 0x44
+const SYSTIMER_COMP_LOAD: usize = SYSTIMER_BASE + 0x50
+const SYSTIMER_INT_ENA: usize = SYSTIMER_BASE + 0x64
+const SYSTIMER_INT_RAW: usize = SYSTIMER_BASE + 0x68
+const SYSTIMER_INT_CLR: usize = SYSTIMER_BASE + 0x6C
+// CONF: comparator n works while bit 24 - n is set.
+const TARGET0_WORK: u32 = 1 << 24
+// Ticks per microsecond, as a shift: 16.
+const TICK_SHIFT: u64 = 4
+// Alarm times are 52-bit tick counts.
+const TICK_MASK: u64 = 0xF_FFFF_FFFF_FFFF
+pub const ALARM_COUNT: u32 = 3
+// The furthest ahead an alarm's sleep goes before waking to check again.
+const MAX_ALARM_SLEEP_US: u64 = 1 << 40
+
+// System clock control (PCR).
+const PCR_BASE: usize = 0x6009_6000
+const PCR_SYSCLK_CONF: usize = PCR_BASE + 0x110
+const PCR_CPU_FREQ_CONF: usize = PCR_BASE + 0x118
+const SOC_CLK_SEL: u32 = 0b11 << 16
+const SOC_CLK_PLL: u32 = 1
+const CPU_HS_DIV: u32 = 0xFF << 8
+const PCR_AHB_FREQ_CONF: usize = PCR_BASE + 0x11C
+const AHB_HS_DIV: u32 = 0xFF << 8
+const SOC_HS_DIV: u32 = 0xFF << 8
+// PMU CLK_STATE0: the PLL is stable and powered.
+const PMU_CLK_STATE0: usize = 0x600B_0194
+const PMU_PLL_RUNS: u32 = (1u32 << 0) | (1u32 << 30)
+
+// The USB serial port.
+const USB_DEVICE_BASE: usize = 0x6000_F000
+
+// LP_AON SYS_CFG: start the boot ROM's download mode at the next reset,
+// and reset the high-performance system.
+const LP_AON_SYS_CFG: usize = 0x600B_1034
+const FORCE_DOWNLOAD_BOOT: u32 = 1 << 30
+const HPSYS_SW_RESET: u32 = 1 << 31
+
+// Timer group 0, LP_AON, the LP timer, and LP_CLKRST RESET_CAUSE, whose
+// low five bits are the cause of the last reset.
+const TIMG0_BASE: usize = 0x6000_8000
+const LP_AON_BASE: usize = 0x600B_1000
+const LP_TIMER_BASE: usize = 0x600B_0C00
+const LP_CLKRST_RESET_CAUSE: usize = 0x600B_0410
+const RESET_CAUSE: u32 = 0x1F
+const PCR_TIMERGROUP0_CONF: usize = PCR_BASE + 0x03C
+const PCR_TIMERGROUP0_WDT_CLK_CONF: usize = PCR_BASE + 0x044
+
+// Polls before a register that does not change is reported as stuck.
+const ATTEMPTS: u32 = 1_000_000
+
+static mut TAKEN: bool = false
+
+// Boot ROM functions, named in the compiler's ESP32-C6 linker script.
+unsafe extern "C" fn software_reset()
+unsafe extern "C" fn ets_delay_us(microseconds: u32)
+unsafe extern "C" fn ets_update_cpu_frequency(megahertz: u32)
+
+// Route interrupt source `source` to the CPU, so its handler runs whenever
+// the peripheral raises it and interrupts are not masked. Sources are
+// level-triggered: the handler must clear its peripheral's condition.
+pub fn enable(source: u32) {
+    core.assert(source < SOURCE_COUNT)
+    // SAFETY: the source's own map register; nothing else writes it.
+    unsafe {
+        mmio.write32(INTMTX_BASE + 4 * source as usize, CPU_INTERRUPT)
+    }
+}
+
+// Stop routing `source` to the CPU. A raised source then stays pending in
+// its peripheral until enabled again.
+pub fn disable(source: u32) {
+    core.assert(source < SOURCE_COUNT)
+    // SAFETY: as in enable.
+    unsafe {
+        mmio.write32(INTMTX_BASE + 4 * source as usize, 0)
+    }
+}
+
+pub fn is_enabled(source: u32) -> bool {
+    core.assert(source < SOURCE_COUNT)
+    // SAFETY: reads the source's map register.
+    unsafe {
+        return mmio.read32(INTMTX_BASE + 4 * source as usize) != 0
+    }
+}
+
+// Whether the peripheral raises `source` now, enabled or not.
+pub fn is_pending(source: u32) -> bool {
+    core.assert(source < SOURCE_COUNT)
+    // SAFETY: reads the matrix's status registers.
+    unsafe {
+        word := mmio.read32(INTMTX_STATUS + 4 * (source / 32) as usize)
+        return (word & (1u32 << (source % 32))) != 0
+    }
+}
+
+// Raise software interrupt FROM_CPU_INTR0 + `number`, 0 to 3, until
+// `unpend`: a handler that runs work later, outside a critical section.
+pub fn pend(number: u32) {
+    core.assert(number < 4)
+    // SAFETY: the software interrupt's own register.
+    unsafe {
+        mmio.write32(FROM_CPU_BASE + 4 * number as usize, 1)
+    }
+}
+
+// Lower software interrupt FROM_CPU_INTR0 + `number`; its handler must.
+pub fn unpend(number: u32) {
+    core.assert(number < 4)
+    // SAFETY: as in pend.
+    unsafe {
+        mmio.write32(FROM_CPU_BASE + 4 * number as usize, 0)
+    }
+}
+
+// Restart into the boot ROM's serial download mode, as if the BOOT button
+// were held at reset: the chip waits on its USB serial port and UART0 for
+// a flasher such as `dodo run`. `dodo run` resets the chip into that mode
+// by itself through the USB serial port, so this is for boards flashed
+// through a USB serial adapter without the reset circuit. Does not return.
+pub fn reboot_to_bootloader() {
+    // SAFETY: the reset ends this program, so nothing it owns is used
+    // afterwards.
+    unsafe {
+        value := mmio.read32(LP_AON_SYS_CFG)
+        mmio.write32(LP_AON_SYS_CFG, value | FORCE_DOWNLOAD_BOOT)
+        software_reset()
+    }
+    for {}
+}
+
+// Restart the chip into the firmware. Does not return.
+pub fn restart() {
+    // SAFETY: as in reboot_to_bootloader.
+    unsafe {
+        value := mmio.read32(LP_AON_SYS_CFG)
+        mmio.write32(LP_AON_SYS_CFG, value & ~FORCE_DOWNLOAD_BOOT)
+        software_reset()
+    }
+    for {}
+}
+
+// The chip's peripherals, handed out once by `take`.
+pub struct Peripherals {
+    pub pins: Pins
+    pub timer: Timer
+    pub usb: Usb
+    // The DMA controller's channels.
+    pub dma: Dma
+    // The random number generator, with the SAR ADC's noise source while
+    // no analog input is claimed; esp_rng documents it.
+    pub rng: esp_rng.Rng
+    // Timer group 0's watchdog, stopped; esp_watchdog documents it.
+    pub watchdog: esp_watchdog.Watchdog
+    // The LP timer as a real-time clock: the time of day, counted in
+    // milliseconds, which survives resets; esp_rtc documents it.
+    pub rtc: esp_rtc.Rtc
+    // The program flash, for storing data above the program; see
+    // std/embedded/chip/esp_flash.
+    pub flash: esp_flash.Flash
+    // Sleep modes, clock gating, and the dormant state; see Power.
+    pub power: Power
+}
+
+// Configure clocks and return the peripherals. A second call returns
+// Error.Busy, so no two owners exist; Timeout if the RTC slow clock does
+// not run.
+pub fn take() -> Peripherals!hal.Error {
+    section := hal.Critical.enter()
+    // SAFETY: interrupts are masked, so the flag is read and set atomically.
+    taken := unsafe {
+        TAKEN
+    }
+    unsafe {
+        TAKEN = true
+    }
+    core.drop(section)
+    if taken {
+        return err(hal.Error.Busy)
+    }
+    // SAFETY: TAKEN guarantees this runs once, so this code is the only
+    // user of the clock and timer configuration.
+    unsafe {
+        start_clocks()?
+        start_timer()
+        start_watchdog_clock()
+        gate_cpu_in_wait()
+        open_modem_clock_gates()
+        pmu := hal.RegisterBlock.at(PMU_BASE)
+        esp_power.init_active_state(&mut pmu)
+    }
+    // SAFETY: TAKEN guarantees one Rng, Watchdog, Rtc, and Flash: the only
+    // users of RNG_DATA and the converter's noise setup, of TIMG0's
+    // watchdog, RTC calibration unit, and LP_AON STORE0, STORE2, and
+    // STORE3, of the LP timer and the record at the top of LP SRAM, and of
+    // the flash above the program.
+    rng := unsafe {
+        esp_rng.Rng.take()
+    }
+    cause := unsafe {
+        mmio.read32(LP_CLKRST_RESET_CAUSE) & RESET_CAUSE
+    }
+    watchdog := unsafe {
+        esp_watchdog.Watchdog.at(TIMG0_BASE, LP_AON_BASE, cause, now_us)
+    }
+    rtc := unsafe {
+        esp_rtc.Rtc.at(LP_TIMER_BASE, esp_rtc.RECORD_ADDRESS, TIMG0_BASE)?
+    }
+    flash := unsafe {
+        esp_flash.Flash.take()
+    }
+    return ok(Peripherals {
+        rng,
+        watchdog,
+        rtc,
+        flash,
+        pins: Pins { taken: 0, buses: 0, pwm_channels: 0, pwm_timers: [0u32; 4], pwm_timer_users: [0u32; 4], analog_inputs: 0 },
+        timer: Timer { alarms: 0 },
+        usb: Usb { open: false },
+        dma: Dma { channels: 0 },
+        power: Power { timeout_us: 0, lp_ticks_per_10ms: 0 },
+    })
+}
+
+// Run the CPU at 160 MHz: the PLL divided by 3 for the root clock, and by
+// 1 for the CPU; AHB and APB at 40 MHz, the root clock divided by 4. The
+// boot ROM never selects the root clock itself: PCR SYSCLK_CONF keeps its
+// selection through the resets that leave the PCR alone, among them the
+// USB serial port's, so the root clock may come from the crystal or from
+// the PLL. Unsupported if the PLL does not run.
+// SAFETY: the caller owns the clock configuration.
+unsafe fn start_clocks() -> void!hal.Error {
+    unsafe {
+        bus := mmio.read32(PCR_AHB_FREQ_CONF) & ~AHB_HS_DIV
+        mmio.write32(PCR_AHB_FREQ_CONF, bus | hal.encode(AHB_HS_DIV, 3))
+        sysclk := mmio.read32(PCR_SYSCLK_CONF)
+        if hal.decode(SOC_CLK_SEL, sysclk) != SOC_CLK_PLL {
+            // The PCR keeps its settings through the resets of `dodo run`,
+            // so whether the boot ROM leaves the root clock on the PLL or
+            // the crystal depends on what ran before. With the PLL powered
+            // and stable (PMU CLK_STATE0), run from it, divided by 3 as the
+            // reset value of SYSCLK_CONF.HS_DIV_NUM says; otherwise leave
+            // the clocks alone.
+            if (mmio.read32(PMU_CLK_STATE0) & PMU_PLL_RUNS) != PMU_PLL_RUNS || hal.decode(SOC_HS_DIV, sysclk) != 2 {
+                return err(hal.Error.Unsupported)
+            }
+            mmio.write32(PCR_SYSCLK_CONF, (sysclk & ~SOC_CLK_SEL) | hal.encode(SOC_CLK_SEL, SOC_CLK_PLL))
+        }
+        divider := mmio.read32(PCR_CPU_FREQ_CONF)
+        mmio.write32(PCR_CPU_FREQ_CONF, divider & ~CPU_HS_DIV)
+        // The boot ROM's delay function counts CPU cycles.
+        ets_update_cpu_frequency(CPU_HZ / 1_000_000)
+        return ok()
+    }
+}
+
+// Timer group 0, the watchdog's and the RTC calibration unit's: its bus
+// clock on and out of reset (PCR TIMERGROUP0_CONF), and its watchdog clock
+// on, from the 40 MHz crystal (TIMERGROUP0_WDT_CLK_CONF). The boot ROM
+// leaves both so; this keeps them so after Board.power changes clocks.
+// SAFETY: the caller owns timer group 0.
+unsafe fn start_watchdog_clock() {
+    unsafe {
+        mmio.write32(PCR_TIMERGROUP0_CONF, PERIPHERAL_CLOCK)
+        mmio.write32(PCR_TIMERGROUP0_WDT_CLK_CONF, SCLK_ENABLE)
+    }
+}
+
+// Let unit 0 count and stop it while a debugger halts the core.
+// SAFETY: the caller owns the system timer's configuration.
+unsafe fn start_timer() {
+    unsafe {
+        conf := mmio.read32(SYSTIMER_CONF)
+        mmio.write32(SYSTIMER_CONF, conf | (1u32 << 30) | (1u32 << 28))
+    }
+}
+
+// The system timer's unit 0 count, in 16 MHz ticks since power-up.
+fn ticks() -> u64 {
+    // SAFETY: unit 0's update and value registers only latch and read the
+    // count. A handler that reads it between the update and the reads
+    // latches a newer count, which is still correct.
+    unsafe {
+        for {
+            mmio.write32(SYSTIMER_UNIT0_OP, UNIT_UPDATE)
+            for (mmio.read32(SYSTIMER_UNIT0_OP) & UNIT_VALUE_VALID) == 0 {}
+            high := mmio.read32(SYSTIMER_UNIT0_VALUE_HI)
+            low := mmio.read32(SYSTIMER_UNIT0_VALUE_LO)
+            if mmio.read32(SYSTIMER_UNIT0_VALUE_HI) == high {
+                return ((high as u64) << 32) | low as u64
+            }
+        }
+    }
+}
+
+// Microseconds since power-up.
+fn now_us() -> u64 {
+    return ticks() >> TICK_SHIFT
+}
+
+// The pins and the controllers that use them. Each pin and each controller
+// can be taken once, and given back.
+pub struct Pins {
+    // Claimed pins, one bit each.
+    taken: u32
+    // Claimed controllers: see the BUS_ constants.
+    buses: u32
+    // LEDC channels in use, one bit each, and per timer its frequency
+    // setting and how many channels use it.
+    pwm_channels: u32
+    pwm_timers: [4]u32
+    pwm_timer_users: [4]u32
+    // ADC inputs in use, one bit per channel, and bit 7 for the
+    // temperature sensor.
+    analog_inputs: u32
+
+    // Claim pin `number` as a push-pull output, initially low.
+    pub fn output(&mut self, number: u32) -> Pin!hal.Error {
+        pin := self.claim(number)?
+        pin.set_low()
+        pin.set_as_output()
+        return ok(pin)
+    }
+
+    // Claim pin `number` as an input, with neither pull-up nor pull-down.
+    pub fn input(&mut self, number: u32) -> Pin!hal.Error {
+        pin := self.claim(number)?
+        pin.set_as_input()
+        return ok(pin)
+    }
+
+    // Give back a pin from `output` or `input`. It stops driving and is
+    // disconnected until claimed again, for example as part of a bus.
+    pub fn release(&mut self, pin: Pin) {
+        pin.ignore(ALL_EVENTS)
+        pin.clear_events(ALL_EVENTS)
+        pin.set_as_input()
+        pin.set_pull(false, false)
+        pin.set_open_drain(false)
+        self.taken &= ~(1u32 << pin.number)
+    }
+
+    // Claim pins `sda` and `scl` as an I2C bus with an SCL frequency of
+    // `frequency_hz`, 1 kHz to hal.I2C_FAST_PLUS_HZ, on the chip's one I2C
+    // controller. Any two pins carry the bus. InvalidInput for a pin that
+    // cannot be claimed, the same pin twice, or a frequency out of range;
+    // Busy if a pin or the controller is taken. The lines are open-drain
+    // with the pads' pull-ups (about 45 kOhm), which keep an idle bus high
+    // but are too weak for fast mode: most sensor boards add 4.7 kOhm
+    // pull-ups, and a bare bus needs them. The esp_i2c driver documents the
+    // bus's errors.
+    pub fn i2c(&mut self, sda: u32, scl: u32, frequency_hz: u32) -> I2c!hal.Error {
+        sda_bit := pin_bit(sda)?
+        scl_bit := pin_bit(scl)?
+        if sda == scl || frequency_hz < 1000 || frequency_hz > hal.I2C_FAST_PLUS_HZ {
+            return err(hal.Error.InvalidInput)
+        }
+        prescale := esp_i2c.prescaler(XTAL_HZ, frequency_hz)
+        timing := esp_i2c.timing(XTAL_HZ / prescale, frequency_hz)?
+        self.take_bus(BUS_I2C, sda_bit | scl_bit)?
+        // SAFETY: the claims make this the controller's and the pins' only
+        // owner.
+        registers := unsafe {
+            connect_i2c(sda, scl, prescale)
+        }
+        bus := esp_i2c.Controller.new(registers, timing)
+        return ok(I2c { bus, sda, scl })
+    }
+
+    // Give back an I2C bus: the controller stops, and its pins are
+    // disconnected but still pulled up, so the bus stays idle.
+    pub fn release_i2c(&mut self, bus: I2c) {
+        let I2c { bus: controller, sda, scl } = bus
+        controller.release()
+        // SAFETY: the bus owned the controller and the pins.
+        unsafe {
+            disconnect_i2c(sda, scl)
+        }
+        self.give_bus(BUS_I2C, (1u32 << sda) | (1u32 << scl))
+    }
+
+    // Claim pins `sda` and `scl` as an I2C target (slave) answering
+    // another master at `address`, a 10-bit address with `ten_bit`, on the
+    // chip's one I2C controller, which is then not a master. `frequency_hz`
+    // is the master's SCL frequency, 1 kHz to hal.I2C_FAST_PLUS_HZ, which
+    // sets the SDA hold and sample times. Any two pins carry the bus, open
+    // drain with the pads' pull-ups, as for `i2c`. InvalidInput for an
+    // address the I2C specification reserves (7-bit 0x00 to 0x07 and 0x78
+    // to 0x7F, 10-bit above 0x3FF), otherwise errors as for `i2c`. The
+    // esp_i2c driver documents the target: it stretches SCL while its
+    // receive FIFO is full or a read waits for `respond`.
+    pub fn i2c_target(&mut self, sda: u32, scl: u32, address: u16, ten_bit: bool, frequency_hz: u32) -> I2cTarget!hal.Error {
+        sda_bit := pin_bit(sda)?
+        scl_bit := pin_bit(scl)?
+        if sda == scl || frequency_hz < 1000 || frequency_hz > hal.I2C_FAST_PLUS_HZ {
+            return err(hal.Error.InvalidInput)
+        }
+        esp_i2c.target_address(address, ten_bit)?
+        prescale := esp_i2c.prescaler(XTAL_HZ, frequency_hz)
+        timing := esp_i2c.timing(XTAL_HZ / prescale, frequency_hz)?
+        self.take_bus(BUS_I2C, sda_bit | scl_bit)?
+        // SAFETY: as in i2c.
+        registers := unsafe {
+            connect_i2c(sda, scl, prescale)
+        }
+        target := esp_i2c.Target.new(registers, timing, address, ten_bit)
+        return ok(I2cTarget { target, sda, scl })
+    }
+
+    // Give back an I2C target from `i2c_target`, as for `release_i2c`.
+    pub fn release_i2c_target(&mut self, target: I2cTarget) {
+        let I2cTarget { target: controller, sda, scl } = target
+        controller.release()
+        // SAFETY: the target owned the controller and the pins.
+        unsafe {
+            disconnect_i2c(sda, scl)
+        }
+        self.give_bus(BUS_I2C, (1u32 << sda) | (1u32 << scl))
+    }
+
+    // Claim pins as an SPI bus in `mode`, clocked at the fastest rate up to
+    // `frequency_hz` (at most PLL_F80M_HZ, 80 MHz; at least 78.2 kHz): `clock`
+    // (SCK), `tx` (MOSI, data from the chip), and `rx` (MISO, data to the
+    // chip), or none for devices that only listen, such as many displays.
+    // Any pins carry the bus. InvalidInput for a pin that cannot be claimed,
+    // the same pin twice, or a frequency out of range; Busy if a pin or the
+    // controller is taken. Chip selects are output pins; see hal.SpiDevice.
+    pub fn spi(&mut self, clock: u32, tx: u32, rx: Option<u32>, mode: hal.SpiMode, frequency_hz: u32) -> Spi!hal.Error {
+        pins := pin_bit(clock)? | pin_bit(tx)?
+        input := PIN_NONE
+        if let some(pin) = rx {
+            pins |= pin_bit(pin)?
+            input = pin
+            if pin == clock || pin == tx {
+                return err(hal.Error.InvalidInput)
+            }
+        }
+        if clock == tx {
+            return err(hal.Error.InvalidInput)
+        }
+        divider := esp_spi.divider(PLL_F80M_HZ, frequency_hz)?
+        self.take_bus(BUS_SPI, pins)?
+        // SAFETY: the claims make this the controller's and the pins' only
+        // owner.
+        registers := unsafe {
+            start_peripheral(PCR_SPI2_CONF)
+            mmio.write32(PCR_SPI2_CLKM_CONF, hal.encode(SCLK_SELECT, 1) | SCLK_ENABLE)
+            gpio_function(clock)
+            gpio_function(tx)
+            route_output(clock, SIGNAL_SPI_CLOCK, false)
+            route_output(tx, SIGNAL_SPI_MOSI, false)
+            if input != PIN_NONE {
+                gpio_function(input)
+                route_input(SIGNAL_SPI_MISO, input)
+            } else {
+                tie_input(SIGNAL_SPI_MISO, false)
+            }
+            hal.RegisterBlock.at(SPI2_BASE)
+        }
+        bus := esp_spi.Controller.new(registers, divider, mode)
+        return ok(Spi { bus, clock, tx, rx: input, select: PIN_NONE })
+    }
+
+    // `spi`, with the controller's own chip select output, CS0 (FSPICS0),
+    // on pin `select` as well: it goes low before each transfer's first
+    // clock edge and rises after its last (the controller's CS setup and
+    // hold phases), and stays low across the 64-byte runs of a longer
+    // transfer, polled, by DMA, or blocking, so a device sees one selection
+    // per transfer; a cancelled transfer raises it too. Any pin
+    // carries it. Use it for one device on the bus; several devices share
+    // a bus through hal.SpiDevice and output pins. Errors as for `spi`, and
+    // InvalidInput if `select` is another of the bus's pins.
+    pub fn spi_with_select(&mut self, clock: u32, tx: u32, rx: Option<u32>, select: u32, mode: hal.SpiMode, frequency_hz: u32) -> Spi!hal.Error {
+        select_bit := pin_bit(select)?
+        input := PIN_NONE
+        if let some(pin) = rx {
+            input = pin
+        }
+        if select == clock || select == tx || select == input {
+            return err(hal.Error.InvalidInput)
+        }
+        if (self.taken & select_bit) != 0 {
+            return err(hal.Error.Busy)
+        }
+        receive: Option<u32> = none
+        if input != PIN_NONE {
+            receive = some(input)
+        }
+        bus := self.spi(clock, tx, receive, mode, frequency_hz)?
+        self.taken |= select_bit
+        bus.bus.set_hardware_select(true)
+        // SAFETY: the claim makes this the pin's only owner.
+        unsafe {
+            gpio_function(select)
+            route_output(select, SIGNAL_SPI_CS0, false)
+        }
+        bus.select = select
+        return ok(bus)
+    }
+
+    // Give back an SPI bus from `spi` or `spi_with_select`: the controller
+    // stops and its pins are disconnected.
+    pub fn release_spi(&mut self, bus: Spi) {
+        let Spi { bus: controller, clock, tx, rx, select } = bus
+        controller.release()
+        pins := (1u32 << clock) | (1u32 << tx)
+        // SAFETY: the bus owned the controller and the pins.
+        unsafe {
+            stop_peripheral(PCR_SPI2_CONF)
+            tie_input(SIGNAL_SPI_MISO, false)
+            disconnect(clock)
+            disconnect(tx)
+            if rx != PIN_NONE {
+                disconnect(rx)
+                pins |= 1u32 << rx
+            }
+            if select != PIN_NONE {
+                disconnect(select)
+                pins |= 1u32 << select
+            }
+        }
+        self.give_bus(BUS_SPI, pins)
+    }
+
+    // Claim pins as an SPI target (slave) in `mode` on the chip's one SPI
+    // controller, GP-SPI2, for another master to clock and select:
+    // `clock` and `select` are inputs, `rx` receives what the master sends
+    // (MOSI), or none, and `tx` answers it (MISO), driven at all times. The
+    // select input is pulled up, so an unconnected one leaves the target
+    // deselected. Any pins carry it. InvalidInput for a pin that cannot be
+    // claimed or the same pin twice; Busy if a pin or the controller is
+    // taken. The esp_spi driver documents the target: it exchanges
+    // transactions of up to 64 bytes, each from the select's falling to its
+    // rising edge.
+    pub fn spi_target(&mut self, clock: u32, tx: u32, rx: Option<u32>, select: u32, mode: hal.SpiMode) -> SpiTarget!hal.Error {
+        input := PIN_NONE
+        if let some(pin) = rx {
+            input = pin
+        }
+        pins := 0u32
+        all := [clock, tx, select, input]
+        for &pin in all {
+            if pin != PIN_NONE {
+                bit := pin_bit(pin)?
+                if (pins & bit) != 0 {
+                    return err(hal.Error.InvalidInput)
+                }
+                pins |= bit
+            }
+        }
+        self.take_bus(BUS_SPI, pins)?
+        // SAFETY: the claims make this the controller's and the pins' only
+        // owner.
+        registers := unsafe {
+            start_peripheral(PCR_SPI2_CONF)
+            mmio.write32(PCR_SPI2_CLKM_CONF, hal.encode(SCLK_SELECT, 1) | SCLK_ENABLE)
+            gpio_function(clock)
+            route_input(SIGNAL_SPI_CLOCK, clock)
+            gpio_function(select)
+            set_pad_pull(select, true, false)
+            route_input(SIGNAL_SPI_CS0, select)
+            gpio_function(tx)
+            route_output(tx, SIGNAL_SPI_MISO, false)
+            if input != PIN_NONE {
+                gpio_function(input)
+                route_input(SIGNAL_SPI_MOSI, input)
+            } else {
+                tie_input(SIGNAL_SPI_MOSI, false)
+            }
+            hal.RegisterBlock.at(SPI2_BASE)
+        }
+        target := esp_spi.Target.new(registers, mode)
+        return ok(SpiTarget { target, clock, tx, rx: input, select })
+    }
+
+    // Give back an SPI target from `spi_target`, as for `release_spi`.
+    pub fn release_spi_target(&mut self, target: SpiTarget) {
+        let SpiTarget { target: controller, clock, tx, rx, select } = target
+        controller.release()
+        pins := 0u32
+        // SAFETY: the target owned the controller and the pins.
+        unsafe {
+            stop_peripheral(PCR_SPI2_CONF)
+            tie_input(SIGNAL_SPI_CLOCK, false)
+            tie_input(SIGNAL_SPI_MOSI, false)
+            tie_input(SIGNAL_SPI_CS0, true)
+            set_pad_pull(select, false, false)
+        }
+        all := [clock, tx, rx, select]
+        for &pin in all {
+            if pin != PIN_NONE {
+                // SAFETY: as above.
+                unsafe {
+                    disconnect(pin)
+                }
+                pins |= 1u32 << pin
+            }
+        }
+        self.give_bus(BUS_SPI, pins)
+    }
+
+    // Claim a serial port on pins `tx` and `rx`, or none to only send, at
+    // `baud`, 300 to 5_000_000 bit/s, 8N1. Any pins carry the port; UART0
+    // serves the first port and UART1 the second. InvalidInput for a pin
+    // that cannot be claimed, the same pin twice, or a baud rate out of
+    // range; Busy if a pin or both controllers are taken. The pins are
+    // pulled up, so a receiver with nothing connected, and the pins once
+    // released, idle high. Panics are reported on the port until it is
+    // released.
+    pub fn uart(&mut self, tx: u32, rx: Option<u32>, baud: u32) -> Uart!hal.Error {
+        return self.open_uart(tx, rx, PIN_NONE, PIN_NONE, baud)
+    }
+
+    // A serial port with hardware flow control: `cts`, an input the other
+    // end holds low while it can take data, and `rts`, an output the port
+    // holds low while its receive FIFO has room. Errors as for `uart`.
+    pub fn uart_flow(&mut self, tx: u32, rx: u32, cts: u32, rts: u32, baud: u32) -> Uart!hal.Error {
+        port := self.open_uart(tx, some(rx), cts, rts, baud)?
+        port.port.set_flow_control(true, true)?
+        return ok(port)
+    }
+
+    // Give back a serial port once everything written is out: the
+    // controller stops, and its pins stay pulled up, so the line idles high.
+    pub fn release_uart(&mut self, port: Uart) {
+        let Uart { port: controller, number, tx, rx, cts, rts } = port
+        controller.release()
+        // SAFETY: the port owned the controller and the pins.
+        unsafe {
+            section := hal.Critical.enter()
+            CONSOLES[number as usize] = 0
+            core.drop(section)
+            stop_peripheral(PCR_UART0_CONF + 0xC * number as usize)
+            tie_input(SIGNAL_UART_RX[number as usize], true)
+            tie_input(SIGNAL_UART_CTS[number as usize], false)
+        }
+        pins := 0u32
+        all := [tx, rx, cts, rts]
+        for &pin in all {
+            if pin != PIN_NONE {
+                // SAFETY: as above.
+                unsafe {
+                    disconnect(pin)
+                }
+                pins |= 1u32 << pin
+            }
+        }
+        self.give_bus(BUS_UART0 << number, pins)
+    }
+
+    // Claim a PWM output on `pin` at `frequency_hz`, 5 Hz to 40 MHz, with
+    // the finest duty steps the frequency allows: 16384 steps up to
+    // 4882 Hz, halving as the frequency doubles. The LED PWM controller has
+    // six channels and four timers; outputs at the same frequency share a
+    // timer. InvalidInput for a pin that cannot be claimed or a frequency
+    // out of range; Busy if the pin, all six channels, or all four timers
+    // are taken.
+    pub fn pwm(&mut self, pin: u32, frequency_hz: u32) -> Pwm!hal.Error {
+        bit := pin_bit(pin)?
+        timing := ledc_timing(frequency_hz)?
+        if (self.taken & bit) != 0 {
+            return err(hal.Error.Busy)
+        }
+        channel := 6u32
+        for index in 0..6u32 {
+            if channel == 6 && (self.pwm_channels & (1u32 << index)) == 0 {
+                channel = index
+            }
+        }
+        // A timer at the same setting, else a free one.
+        timer := 4u32
+        for index in 0..4usize {
+            if timer == 4 && self.pwm_timer_users[index] > 0 && self.pwm_timers[index] == timing {
+                timer = index as u32
+            }
+        }
+        for index in 0..4usize {
+            if timer == 4 && self.pwm_timer_users[index] == 0 {
+                timer = index as u32
+            }
+        }
+        if channel == 6 || timer == 4 {
+            return err(hal.Error.Busy)
+        }
+        first := self.pwm_channels == 0
+        self.taken |= bit
+        self.pwm_channels |= 1u32 << channel
+        // SAFETY: the claims make this the channel's, the timer's, and the
+        // pin's only owner; the first output starts the controller.
+        unsafe {
+            if first {
+                start_peripheral(PCR_LEDC_CONF)
+                mmio.write32(PCR_LEDC_SCLK_CONF, hal.encode(SCLK_SELECT, 1) | SCLK_ENABLE)
+            }
+            if self.pwm_timer_users[timer as usize] == 0 {
+                timer_conf := LEDC_BASE + LEDC_TIMER_CONF + 8 * timer as usize
+                mmio.write32(timer_conf, timing)
+                mmio.write32(timer_conf, timing | LEDC_TIMER_PARA_UP)
+            }
+            self.pwm_timers[timer as usize] = timing
+            self.pwm_timer_users[timer as usize] += 1
+            base := LEDC_BASE + 0x14 * channel as usize
+            mmio.write32(base + LEDC_HPOINT, 0)
+            mmio.write32(base + LEDC_CONF0, timer | LEDC_SIGNAL_OUT)
+            mmio.write32(LEDC_BASE + LEDC_GAMMA_WR_ADDR + 0x10 * channel as usize, 0)
+            gpio_function(pin)
+            route_output(pin, SIGNAL_LEDC + channel, false)
+        }
+        output := Pwm { pin, channel, timer, max_duty: (1u32 << (timing & LEDC_DUTY_RES)) as u16, frequency_hz: ledc_frequency(timing) }
+        output.set_duty(0)!
+        return ok(output)
+    }
+
+    // Give back a PWM output: its pin goes low and is disconnected.
+    pub fn release_pwm(&mut self, output: Pwm) {
+        let Pwm { pin, channel, timer, max_duty, frequency_hz } = output
+        // SAFETY: the output owned its channel and pin.
+        unsafe {
+            base := LEDC_BASE + 0x14 * channel as usize
+            mmio.write32(base + LEDC_CONF0, timer | LEDC_PARA_UP)
+            disconnect(pin)
+        }
+        self.pwm_timer_users[timer as usize] -= 1
+        self.pwm_channels &= ~(1u32 << channel)
+        self.taken &= ~(1u32 << pin)
+        if self.pwm_channels == 0 {
+            // SAFETY: no output uses the controller any more.
+            unsafe {
+                stop_peripheral(PCR_LEDC_CONF)
+            }
+        }
+    }
+
+    // Claim `pin`, GPIO 0 to 6, as an input of the ADC: 12 bits with the
+    // converter's largest attenuation, calibrated from the chip's eFuse so
+    // that 0 is ground and 4095 is 3.3 V, and hal.read_millivolts(&mut
+    // input, 3300) gives millivolts. The converter reaches about 3.25 V.
+    // The pin's digital input and pulls are turned off, so they do not
+    // disturb the voltage; the input draws some current while it samples,
+    // so a source above about 10 kOhm reads low. InvalidInput for another
+    // pin, Busy if the pin is taken.
+    pub fn analog(&mut self, pin: u32) -> Analog!hal.Error {
+        if pin >= ADC_CHANNELS {
+            return err(hal.Error.InvalidInput)
+        }
+        self.reserve(pin)?
+        // SAFETY: the claim makes this the pin's only owner; the first input
+        // starts the converter.
+        unsafe {
+            if (self.analog_inputs & ~TEMPERATURE_BIT) == 0 {
+                claim_clocks(CLOCK_SARADC)
+                start_adc()
+            }
+            address := IO_MUX_BASE + 4 * pin as usize
+            pad := mmio.read32(address) & ~(PAD_FUNCTION | PAD_PULL_UP | PAD_PULL_DOWN | PAD_INPUT)
+            mmio.write32(address, pad | hal.encode(PAD_FUNCTION, FUNCTION_GPIO))
+            mmio.write32(GPIO_ENABLE_W1TC, 1u32 << pin)
+        }
+        self.analog_inputs |= 1u32 << pin
+        return ok(Analog { channel: pin })
+    }
+
+    // Claim the chip's temperature sensor as an analog input: 8-bit
+    // readings that `millicelsius` converts. Busy if claimed.
+    pub fn temperature(&mut self) -> Analog!hal.Error {
+        if (self.analog_inputs & TEMPERATURE_BIT) != 0 {
+            return err(hal.Error.Busy)
+        }
+        self.analog_inputs |= TEMPERATURE_BIT
+        // SAFETY: the claim makes this the sensor's only owner. Its
+        // registers are the ADC's.
+        unsafe {
+            claim_clocks(CLOCK_TSENS | CLOCK_SARADC)
+            mmio.write32(PCR_TSENS_CLK_CONF, TSENS_CLOCK_ENABLE | TSENS_RESET)
+            mmio.write32(PCR_TSENS_CLK_CONF, TSENS_CLOCK_ENABLE)
+            mmio.write32(TSENS_CTRL2, TSENS_FROM_XTAL)
+            value := mmio.read32(TSENS_CTRL)
+            mmio.write32(TSENS_CTRL, value | TSENS_POWER_UP)
+            ets_delay_us(300)
+        }
+        return ok(Analog { channel: TEMPERATURE_CHANNEL })
+    }
+
+    // Give back an analog input; the converter stops with the last one.
+    pub fn release_analog(&mut self, input: Analog) {
+        let Analog { channel } = input
+        if channel == TEMPERATURE_CHANNEL {
+            self.analog_inputs &= ~TEMPERATURE_BIT
+            // SAFETY: the input owned the sensor.
+            unsafe {
+                value := mmio.read32(TSENS_CTRL)
+                mmio.write32(TSENS_CTRL, value & ~TSENS_POWER_UP)
+                release_clocks(CLOCK_TSENS)
+                if self.analog_inputs == 0 {
+                    release_clocks(CLOCK_SARADC)
+                }
+            }
+            return
+        }
+        self.analog_inputs &= ~(1u32 << channel)
+        self.taken &= ~(1u32 << channel)
+        // SAFETY: the input owned its pin.
+        unsafe {
+            gpio_function(channel)
+            if (self.analog_inputs & ~TEMPERATURE_BIT) == 0 {
+                stop_adc()
+            }
+            if self.analog_inputs == 0 {
+                release_clocks(CLOCK_SARADC)
+            }
+        }
+    }
+
+    // Claim `pin` to drive WS2812 addressable LEDs (also sold as NeoPixels,
+    // SK6812, and others with the same protocol), such as the RGB LED of
+    // Espressif's development boards, through the remote control
+    // peripheral's channel 0. InvalidInput for a pin that cannot be
+    // claimed; Busy if the pin or the channel is taken.
+    pub fn ws2812(&mut self, pin: u32) -> Ws2812!hal.Error {
+        bit := pin_bit(pin)?
+        self.take_bus(BUS_RMT, bit)?
+        // SAFETY: the claims make this the channel's and the pin's only
+        // owner.
+        unsafe {
+            start_peripheral(PCR_RMT_CONF)
+            mmio.write32(PCR_RMT_SCLK_CONF, hal.encode(SCLK_SELECT, 1) | SCLK_ENABLE)
+            system := mmio.read32(RMT_BASE + RMT_SYS_CONF)
+            mmio.write32(RMT_BASE + RMT_SYS_CONF, system | RMT_DIRECT_MEMORY | RMT_CLOCK_ON)
+            mmio.write32(RMT_BASE + RMT_CH0_CONF0, RMT_CONF)
+            mmio.write32(RMT_BASE + RMT_CH0_CONF0, RMT_CONF | RMT_CONF_UPDATE)
+            gpio_function(pin)
+            mmio.write32(GPIO_OUT_W1TC, bit)
+            route_output(pin, SIGNAL_RMT0, false)
+        }
+        return ok(Ws2812 { pin })
+    }
+
+    // Give back the LED driver: its pin is disconnected.
+    pub fn release_ws2812(&mut self, leds: Ws2812) {
+        let Ws2812 { pin } = leds
+        // SAFETY: the driver owned the channel and the pin.
+        unsafe {
+            disconnect(pin)
+            stop_peripheral(PCR_RMT_CONF)
+        }
+        self.give_bus(BUS_RMT, 1u32 << pin)
+    }
+
+    // Claim a CAN controller on pins `tx` and `rx`: TWAI0 for the first,
+    // TWAI1 for the second, configured from `config` and `filters`; see
+    // std/embedded/peripheral/esp_twai for the bit timing (from the 40 MHz
+    // crystal), the modes, and how filters map onto the hardware filter.
+    // Any pins carry the bus; wire them to a CAN transceiver's TXD and RXD.
+    // TX drives push-pull, idling recessive (high), and RX has its pull-up,
+    // so it reads a recessive bus with nothing connected. `tx` may equal
+    // `rx`: the pad is then open-drain with its pull-up and the controller
+    // both drives and reads it, which loops a controller to itself for
+    // self-tests and joins controllers wired together without
+    // transceivers. InvalidInput for a pin that cannot be claimed, a bit
+    // rate the controller cannot reach, or filters it does not take; Busy
+    // if a pin or both controllers are taken.
+    pub fn can(&mut self, tx: u32, rx: u32, config: &esp_twai.Config, filters: &[hal.CanFilter]) -> Can!hal.Error {
+        pins := pin_bit(tx)? | pin_bit(rx)?
+        esp_twai.timing(XTAL_HZ, config.bitrate, config.sample_point_permille)?
+        esp_twai.plan_filters(filters)?
+        number := 0u32
+        if (self.buses & BUS_TWAI0) != 0 {
+            number = 1
+        }
+        self.take_bus(BUS_TWAI0 << number, pins)?
+        index := number as usize
+        // SAFETY: the claims make this the controller's and the pins' only
+        // owner.
+        registers := unsafe {
+            start_twai(number)
+            gpio_function(tx)
+            set_pad_pull(tx, true, false)
+            mmio.write32(GPIO_OUT_W1TS, 1u32 << tx)
+            if tx == rx {
+                set_open_drain(tx, true)
+            } else {
+                gpio_function(rx)
+                set_pad_pull(rx, true, false)
+            }
+            route_output(tx, SIGNAL_TWAI[index], false)
+            route_input(SIGNAL_TWAI[index], rx)
+            hal.RegisterBlock.at(TWAI0_BASE + 0x2000 * index)
+        }
+        match esp_twai.Controller.new(registers, XTAL_HZ, config, filters) {
+            ok(controller) => {
+                return ok(Can { can: controller, number, tx, rx })
+            }
+            err(error) => {
+                self.close_can(number, tx, rx)
+                return err(error)
+            }
+        }
+    }
+
+    // Give back a CAN controller: it enters reset mode and stops, and its
+    // pins are disconnected, still pulled up.
+    pub fn release_can(&mut self, can: Can) {
+        let Can { can: controller, number, tx, rx } = can
+        controller.release()
+        self.close_can(number, tx, rx)
+    }
+
+    // Claim an I2S output on I2S0's transmitter: data on `data`, the bit
+    // clock on `bclk`, and word select on `ws`, streaming through a DMA
+    // channel claimed from `dma`; see std/embedded/chip/esp_i2s for the
+    // framing, clock accuracy, and queue. It plays silence until samples
+    // are queued, and whenever the queue runs dry. InvalidInput for a pin
+    // that cannot be claimed, the same pin twice, or settings out of range
+    // (esp_i2s.check); Busy if a pin, the transmitter, or every DMA channel
+    // is taken.
+    pub fn i2s_output(&mut self, data: u32, bclk: u32, ws: u32, dma: &mut Dma, config: &esp_i2s.Config) -> I2sOutput!hal.Error {
+        pins := distinct_pins(data, bclk, ws)?
+        esp_i2s.check(config)?
+        channel := dma.channel()?
+        match self.take_bus(BUS_I2S_OUT, pins) {
+            ok() => {}
+            err(error) => {
+                dma.release(channel)
+                return err(error)
+            }
+        }
+        // SAFETY: the claims make this the transmitter's, the channel's,
+        // and the pins' only owner.
+        started := unsafe {
+            if (self.buses & BUS_I2S_IN) == 0 {
+                start_i2s()
+            }
+            gpio_function(data)
+            gpio_function(bclk)
+            gpio_function(ws)
+            route_output(data, SIGNAL_I2SO_SD, false)
+            route_output(bclk, SIGNAL_I2SO_BCK, false)
+            route_output(ws, SIGNAL_I2SO_WS, false)
+            esp_i2s.Output.start(channel.number, bclk, ws, config)
+        }
+        match started {
+            ok(stream) => {
+                enable(DMA_OUT_CH0 + channel.number)
+                return ok(I2sOutput { stream, dma: channel, data, bclk, ws })
+            }
+            err(error) => {
+                self.close_i2s(BUS_I2S_OUT, pins)
+                dma_memory_mode(&channel)
+                dma.release(channel)
+                return err(error)
+            }
+        }
+    }
+
+    // Give back an I2S output: the transmitter and its DMA channel stop,
+    // the channel goes back to `dma`, and the pins are disconnected. An
+    // input sharing the output's clocks stops receiving; release it first.
+    pub fn release_i2s_output(&mut self, output: I2sOutput, dma: &mut Dma) {
+        let I2sOutput { stream, dma: channel, data, bclk, ws } = output
+        disable(DMA_OUT_CH0 + channel.number)
+        stream.stop()
+        dma_memory_mode(&channel)
+        dma.release(channel)
+        self.close_i2s(BUS_I2S_OUT, (1u32 << data) | (1u32 << bclk) | (1u32 << ws))
+    }
+
+    // Claim an I2S input on I2S0's receiver: data on `data`, streaming
+    // through a DMA channel claimed from `dma`. With the running output's
+    // `bclk` and `ws` pins it shares the output's clocks (the same sample
+    // rate and slot width are then required) and claims only `data`; with
+    // other pins it is a master of its own, making BCLK and WS on them.
+    // Errors as for i2s_output; InvalidInput also for the output's clock
+    // pins with another rate or slot width.
+    pub fn i2s_input(&mut self, data: u32, bclk: u32, ws: u32, dma: &mut Dma, config: &esp_i2s.Config) -> I2sInput!hal.Error {
+        esp_i2s.check(config)?
+        shared := esp_i2s.output_clock_pins() == ((bclk << 8) | ws)
+        pins := pin_bit(data)?
+        if !shared {
+            pins = distinct_pins(data, bclk, ws)?
+        } else if data == bclk || data == ws {
+            return err(hal.Error.InvalidInput)
+        }
+        channel := dma.channel()?
+        match self.take_bus(BUS_I2S_IN, pins) {
+            ok() => {}
+            err(error) => {
+                dma.release(channel)
+                return err(error)
+            }
+        }
+        // SAFETY: the claims make this the receiver's, the channel's, and
+        // the pins' only owner.
+        started := unsafe {
+            if (self.buses & BUS_I2S_OUT) == 0 {
+                start_i2s()
+            }
+            gpio_function(data)
+            route_input(SIGNAL_I2SI_SD, data)
+            if !shared {
+                gpio_function(bclk)
+                gpio_function(ws)
+                route_output(bclk, SIGNAL_I2SI_BCK, false)
+                route_output(ws, SIGNAL_I2SI_WS, false)
+            }
+            esp_i2s.Input.start(channel.number, shared, config)
+        }
+        match started {
+            ok(stream) => {
+                return ok(I2sInput { stream, dma: channel, data, bclk, ws, pins })
+            }
+            err(error) => {
+                self.close_i2s(BUS_I2S_IN, pins)
+                dma_memory_mode(&channel)
+                dma.release(channel)
+                return err(error)
+            }
+        }
+    }
+
+    // Give back an I2S input: the receiver and its DMA channel stop, the
+    // channel goes back to `dma`, and the pins it claimed are disconnected.
+    pub fn release_i2s_input(&mut self, input: I2sInput, dma: &mut Dma) {
+        let I2sInput { stream, dma: channel, data, bclk, ws, pins } = input
+        stream.stop()
+        dma_memory_mode(&channel)
+        dma.release(channel)
+        // SAFETY: the input owned its data pin.
+        unsafe {
+            tie_input(SIGNAL_I2SI_SD, false)
+        }
+        self.close_i2s(BUS_I2S_IN, pins)
+    }
+
+    // Claim `pin` as a PWM input that measures the frequency and duty
+    // cycle of the signal on it in windows of `window_us`, 1 us to 25 s:
+    // the MCPWM capture unit timestamps its edges to 6.25 ns and a PCNT unit
+    // counts its rising edges, from 1 Hz (or slower, with a longer window)
+    // to about 10 MHz; std/embedded/chip/esp_capture documents the
+    // measurement and its precision. The pad never drives and has its
+    // pull-down on, so an unconnected pin reads as a steady low line; an
+    // open-collector signal, such as a fan's tachometer, needs a pull-up
+    // of 10 kOhm or less to 3.3 V. One PWM input at a time. InvalidInput for
+    // a pin that cannot be claimed or a window out of range; Busy if the pin
+    // or the capture unit is taken.
+    pub fn pwm_input(&mut self, pin: u32, window_us: u32) -> esp_capture.PwmCapture!hal.Error {
+        bit := pin_bit(pin)?
+        esp_capture.window_ticks_checked(esp_capture.CLOCK_HZ, window_us)?
+        self.take_bus(BUS_CAPTURE, bit)?
+        // SAFETY: the claims make this the capture unit's, PCNT unit 0's,
+        // and the pin's only owner.
+        started := unsafe {
+            start_capture()
+            gpio_function(pin)
+            set_pad_pull(pin, false, true)
+            route_input(SIGNAL_PWM0_CAP0, pin)
+            route_input(SIGNAL_PWM0_CAP0 + 1, pin)
+            tie_input(SIGNAL_PWM0_CAP0 + 2, false)
+            route_input(SIGNAL_PCNT0_SIG_CH0, pin)
+            tie_input(SIGNAL_PCNT0_SIG_CH0 + 1, false)
+            tie_input(SIGNAL_PCNT0_SIG_CH0 + 2, false)
+            tie_input(SIGNAL_PCNT0_SIG_CH0 + 3, false)
+            esp_capture.PwmCapture.start(pin, window_us)
+        }
+        match started {
+            ok(input) => {
+                return ok(input)
+            }
+            err(error) => {
+                self.close_capture(pin)
+                return err(error)
+            }
+        }
+    }
+
+    // Give back a PWM input from `pwm_input`: the capture unit and the
+    // counter stop, and the pin is disconnected.
+    pub fn release_pwm_input(&mut self, input: esp_capture.PwmCapture) {
+        pin := input.stop()
+        self.close_capture(pin)
+    }
+
+    fn close_can(&mut self, number: u32, tx: u32, rx: u32) {
+        // SAFETY: the controller and the pins were claimed for it.
+        unsafe {
+            stop_twai(number)
+            tie_input(SIGNAL_TWAI[number as usize], true)
+            set_open_drain(tx, false)
+            disconnect(tx)
+            disconnect(rx)
+        }
+        self.give_bus(BUS_TWAI0 << number, (1u32 << tx) | (1u32 << rx))
+    }
+
+    fn close_i2s(&mut self, bus: u32, pins: u32) {
+        for pin in 0..PIN_COUNT {
+            if (pins & (1u32 << pin)) != 0 {
+                // SAFETY: the stream owned its pins.
+                unsafe {
+                    disconnect(pin)
+                }
+            }
+        }
+        self.give_bus(bus, pins)
+        if (self.buses & (BUS_I2S_OUT | BUS_I2S_IN)) == 0 {
+            // SAFETY: no stream uses the controller any more.
+            unsafe {
+                stop_i2s()
+            }
+        }
+    }
+
+    fn close_capture(&mut self, pin: u32) {
+        // SAFETY: the input owned the units and the pin.
+        unsafe {
+            tie_input(SIGNAL_PWM0_CAP0, false)
+            tie_input(SIGNAL_PWM0_CAP0 + 1, false)
+            tie_input(SIGNAL_PCNT0_SIG_CH0, false)
+            set_pad_pull(pin, false, false)
+            disconnect(pin)
+            stop_capture()
+        }
+        self.give_bus(BUS_CAPTURE, 1u32 << pin)
+    }
+
+    fn open_uart(&mut self, tx: u32, rx: Option<u32>, cts: u32, rts: u32, baud: u32) -> Uart!hal.Error {
+        pins := pin_bit(tx)?
+        input := PIN_NONE
+        if let some(pin) = rx {
+            input = pin
+        }
+        others := [input, cts, rts]
+        for &pin in others {
+            if pin != PIN_NONE {
+                bit := pin_bit(pin)?
+                if (pins & bit) != 0 {
+                    return err(hal.Error.InvalidInput)
+                }
+                pins |= bit
+            }
+        }
+        if baud < 300 || baud > 5_000_000 {
+            return err(hal.Error.InvalidInput)
+        }
+        prescale := uart_prescaler(baud)
+        divisor := esp_uart.divisor(XTAL_HZ / prescale, baud)?
+        number := 0u32
+        if (self.buses & BUS_UART0) != 0 {
+            number = 1
+        }
+        self.take_bus(BUS_UART0 << number, pins)?
+        index := number as usize
+        // SAFETY: the claims make this the controller's and the pins' only
+        // owner.
+        registers := unsafe {
+            conf := PCR_UART0_CONF + 0xC * index
+            start_peripheral(conf)
+            mmio.write32(conf + 4, hal.encode(SCLK_DIV_NUM, prescale - 1) | hal.encode(SCLK_SELECT, 3) | SCLK_ENABLE)
+            gpio_function(tx)
+            set_pad_pull(tx, true, false)
+            mmio.write32(GPIO_OUT_W1TS, 1u32 << tx)
+            route_output(tx, SIGNAL_UART_TX[index], false)
+            if input != PIN_NONE {
+                gpio_function(input)
+                set_pad_pull(input, true, false)
+                route_input(SIGNAL_UART_RX[index], input)
+            } else {
+                tie_input(SIGNAL_UART_RX[index], true)
+            }
+            if cts != PIN_NONE {
+                gpio_function(cts)
+                set_pad_pull(cts, true, false)
+                route_input(SIGNAL_UART_CTS[index], cts)
+            } else {
+                tie_input(SIGNAL_UART_CTS[index], false)
+            }
+            if rts != PIN_NONE {
+                gpio_function(rts)
+                route_output(rts, SIGNAL_UART_RTS[index], false)
+            }
+            hal.RegisterBlock.at(UART0_BASE + 0x1000 * index)
+        }
+        port := esp_uart.Controller.new(registers, divisor)
+        // SAFETY: interrupts are masked while the console list changes.
+        unsafe {
+            section := hal.Critical.enter()
+            CONSOLES[index] = UART0_BASE + 0x1000 * index
+            core.drop(section)
+        }
+        return ok(Uart { port, number, tx, rx: input, cts, rts })
+    }
+
+    // Take controller `bus` and the pins in `pins`, all or none.
+    fn take_bus(&mut self, bus: u32, pins: u32) -> void!hal.Error {
+        if (self.buses & bus) != 0 || (self.taken & pins) != 0 {
+            return err(hal.Error.Busy)
+        }
+        self.buses |= bus
+        self.taken |= pins
+        return ok()
+    }
+
+    fn give_bus(&mut self, bus: u32, pins: u32) {
+        self.buses &= ~bus
+        self.taken &= ~pins
+    }
+
+    // Take pin `number` as a GPIO, input enabled and output off.
+    fn claim(&mut self, number: u32) -> Pin!hal.Error {
+        self.reserve(number)?
+        // SAFETY: the claim makes this the pin's only owner.
+        unsafe {
+            gpio_function(number)
+            mmio.write32(GPIO_FUNC_OUT + 4 * number as usize, OUT_SEL_GPIO | OUT_ENABLE_FROM_GPIO)
+        }
+        return ok(Pin { number, mask: 1u32 << number })
+    }
+
+    // Mark pin `number` taken; InvalidInput for a pin that does not exist
+    // or belongs to the flash or the USB serial port, Busy if taken.
+    fn reserve(&mut self, number: u32) -> void!hal.Error {
+        bit := pin_bit(number)?
+        if (self.taken & bit) != 0 {
+            return err(hal.Error.Busy)
+        }
+        self.taken |= bit
+        return ok()
+    }
+}
+
+// The bit of pin `number`; InvalidInput for a pin that cannot be claimed.
+fn pin_bit(number: u32) -> u32!hal.Error {
+    if number >= PIN_COUNT || (USB_PINS & (1u32 << number)) != 0 {
+        return err(hal.Error.InvalidInput)
+    }
+    return ok(1u32 << number)
+}
+
+// Select the GPIO function on pin `number`'s pad, with input enabled,
+// pulls off, and the default drive strength.
+// SAFETY: the caller owns the pin.
+unsafe fn gpio_function(number: u32) {
+    unsafe {
+        address := IO_MUX_BASE + 4 * number as usize
+        pad := mmio.read32(address)
+        pad = (pad & ~(PAD_FUNCTION | PAD_PULL_UP | PAD_PULL_DOWN | PAD_DRIVE)) | hal.encode(PAD_FUNCTION, FUNCTION_GPIO) | PAD_INPUT | hal.encode(PAD_DRIVE, 2)
+        mmio.write32(address, pad)
+    }
+}
+
+// Route peripheral output signal `signal` to pin `number`, the peripheral
+// enabling the output when `peripheral_enable`, else always on.
+// SAFETY: the caller owns the pin.
+unsafe fn route_output(number: u32, signal: u32, peripheral_enable: bool) {
+    unsafe {
+        value := signal
+        if !peripheral_enable {
+            value |= OUT_ENABLE_FROM_GPIO
+            mmio.write32(GPIO_ENABLE_W1TS, 1u32 << number)
+        }
+        mmio.write32(GPIO_FUNC_OUT + 4 * number as usize, value)
+    }
+}
+
+// Feed peripheral input signal `signal` from pin `number`.
+// SAFETY: the caller owns the signal and the pin.
+unsafe fn route_input(signal: u32, number: u32) {
+    unsafe {
+        mmio.write32(GPIO_FUNC_IN + 4 * signal as usize, number | IN_SEL_MATRIX)
+    }
+}
+
+// Feed peripheral input signal `signal` a constant level.
+// SAFETY: the caller owns the signal.
+unsafe fn tie_input(signal: u32, high: bool) {
+    unsafe {
+        if high {
+            mmio.write32(GPIO_FUNC_IN + 4 * signal as usize, IN_CONSTANT_HIGH | IN_SEL_MATRIX)
+        } else {
+            mmio.write32(GPIO_FUNC_IN + 4 * signal as usize, IN_CONSTANT_LOW | IN_SEL_MATRIX)
+        }
+    }
+}
+
+// Disconnect pin `number` from any peripheral: GPIO output off, input on.
+// SAFETY: the caller owns the pin.
+unsafe fn disconnect(number: u32) {
+    unsafe {
+        mmio.write32(GPIO_ENABLE_W1TC, 1u32 << number)
+        mmio.write32(GPIO_FUNC_OUT + 4 * number as usize, OUT_SEL_GPIO | OUT_ENABLE_FROM_GPIO)
+    }
+}
+
+// Set pin `number`'s pulls.
+// SAFETY: the caller owns the pin.
+unsafe fn set_pad_pull(number: u32, up: bool, down: bool) {
+    unsafe {
+        address := IO_MUX_BASE + 4 * number as usize
+        pad := mmio.read32(address) & ~(PAD_PULL_UP | PAD_PULL_DOWN)
+        if up {
+            pad |= PAD_PULL_UP
+        }
+        if down {
+            pad |= PAD_PULL_DOWN
+        }
+        mmio.write32(address, pad)
+    }
+}
+
+// One GPIO. Implements the std/embedded/hal output and input pin protocols.
+pub struct Pin {
+    number: u32
+    mask: u32
+
+    // The GPIO number.
+    pub fn number(&self) -> u32 {
+        return self.number
+    }
+
+    pub fn set_high(&mut self) {
+        // SAFETY: write-one-to-set: only this pin's bit changes.
+        unsafe {
+            mmio.write32(GPIO_OUT_W1TS, self.mask)
+        }
+    }
+
+    pub fn set_low(&mut self) {
+        // SAFETY: write-one-to-clear: only this pin's bit changes.
+        unsafe {
+            mmio.write32(GPIO_OUT_W1TC, self.mask)
+        }
+    }
+
+    pub fn toggle(&mut self) {
+        // SAFETY: reads the output levels; the write changes only this pin.
+        unsafe {
+            if (mmio.read32(GPIO_OUT) & self.mask) != 0 {
+                mmio.write32(GPIO_OUT_W1TC, self.mask)
+            } else {
+                mmio.write32(GPIO_OUT_W1TS, self.mask)
+            }
+        }
+    }
+
+    // The level on the pin, as an input reads it, also while it drives.
+    pub fn is_high(&self) -> bool {
+        // SAFETY: reads the input levels.
+        unsafe {
+            return (mmio.read32(GPIO_IN) & self.mask) != 0
+        }
+    }
+
+    // Drive the pin at its output level, for a line that changes direction
+    // such as a half-duplex data line. Pins claimed as inputs start released.
+    pub fn set_as_output(&mut self) {
+        // SAFETY: write-one-to-set of this pin's output enable.
+        unsafe {
+            mmio.write32(GPIO_ENABLE_W1TS, self.mask)
+        }
+    }
+
+    // Release the pin so another device can drive it; is_high reads it.
+    pub fn set_as_input(&mut self) {
+        // SAFETY: write-one-to-clear of this pin's output enable.
+        unsafe {
+            mmio.write32(GPIO_ENABLE_W1TC, self.mask)
+        }
+    }
+
+    // Turn the pad's pull-up (about 45 kOhm) and pull-down on or off.
+    pub fn set_pull(&mut self, up: bool, down: bool) {
+        // SAFETY: the pin's own pad register.
+        unsafe {
+            set_pad_pull(self.number, up, down)
+        }
+    }
+
+    // Drive only low, and let the pin float when high, for a line other
+    // devices also pull low, such as a bit-banged I2C line.
+    pub fn set_open_drain(&mut self, on: bool) {
+        // SAFETY: the pin's own configuration register.
+        unsafe {
+            address := GPIO_PIN + 4 * self.number as usize
+            value := mmio.read32(address) & ~PIN_OPEN_DRAIN
+            if on {
+                value |= PIN_OPEN_DRAIN
+            }
+            mmio.write32(address, value)
+        }
+    }
+
+    // Raise interrupt source GPIO on `events`, after forgetting events seen
+    // so far. A pin watches one kind: RISING_EDGE | FALLING_EDGE, one edge,
+    // or one level; listening to more keeps the edges, or the high level
+    // over the low one. Route the source too: `esp32c6.enable(pin.irq())`.
+    // Every pin shares the one source; its handler tells them apart with
+    // `events`.
+    pub fn listen(&mut self, events: u32) {
+        kind := 0u32
+        if (events & RISING_EDGE) != 0 && (events & FALLING_EDGE) != 0 {
+            kind = INT_ANY_EDGE
+        } else if (events & RISING_EDGE) != 0 {
+            kind = INT_RISING
+        } else if (events & FALLING_EDGE) != 0 {
+            kind = INT_FALLING
+        } else if (events & LEVEL_HIGH) != 0 {
+            kind = INT_HIGH
+        } else if (events & LEVEL_LOW) != 0 {
+            kind = INT_LOW
+        }
+        self.clear_events(ALL_EVENTS)
+        // SAFETY: the pin's own configuration register.
+        unsafe {
+            address := GPIO_PIN + 4 * self.number as usize
+            value := mmio.read32(address) & ~(PIN_INT_TYPE | PIN_INT_ENABLE)
+            if kind != 0 {
+                value |= hal.encode(PIN_INT_TYPE, kind) | PIN_INT_ENABLE
+            }
+            mmio.write32(address, value)
+        }
+    }
+
+    // Stop raising the interrupt on `events`; the pin stops watching once
+    // none of its kind are left.
+    pub fn ignore(&mut self, events: u32) {
+        watched := self.watched()
+        rest := watched & ~events
+        if rest != watched {
+            self.listen(rest)
+        }
+    }
+
+    // The listened-to events that are raising the interrupt now: the
+    // events the pin watches once one happened, until `clear_events`.
+    pub fn events(&self) -> u32 {
+        // SAFETY: reads the latched events.
+        unsafe {
+            if (mmio.read32(GPIO_STATUS) & self.mask) == 0 {
+                return 0
+            }
+        }
+        return self.watched()
+    }
+
+    // Forget the events seen, acknowledging them; a handler or task must,
+    // or the interrupt stays raised. A level being watched comes back at
+    // once while it lasts.
+    pub fn clear_events(&mut self, events: u32) {
+        if (events & ALL_EVENTS) != 0 {
+            // SAFETY: write-one-to-clear of this pin's latched event.
+            unsafe {
+                mmio.write32(GPIO_STATUS_W1TC, self.mask)
+            }
+        }
+    }
+
+    // The interrupt source pin events raise, GPIO, for esp32c6.enable.
+    pub fn irq(&self) -> u32 {
+        return GPIO
+    }
+
+    // The events the pin's interrupt type watches.
+    fn watched(&self) -> u32 {
+        kind := 0u32
+        // SAFETY: reads the pin's configuration register.
+        unsafe {
+            value := mmio.read32(GPIO_PIN + 4 * self.number as usize)
+            if (value & PIN_INT_ENABLE) != 0 {
+                kind = hal.decode(PIN_INT_TYPE, value)
+            }
+        }
+        if kind == INT_RISING {
+            return RISING_EDGE
+        } else if kind == INT_FALLING {
+            return FALLING_EDGE
+        } else if kind == INT_ANY_EDGE {
+            return RISING_EDGE | FALLING_EDGE
+        } else if kind == INT_LOW {
+            return LEVEL_LOW
+        } else if kind == INT_HIGH {
+            return LEVEL_HIGH
+        }
+        return 0
+    }
+}
+
+// The system timer, counting microseconds since power-up. Implements the
+// std/embedded/hal delay protocol.
+pub struct Timer {
+    // Claimed alarms, one bit each.
+    alarms: u32
+
+    // Claim alarm 0 to 2, to run code at a set time from its interrupt or
+    // to run the executor. Busy if it is claimed already; InvalidInput for
+    // another number.
+    pub fn alarm(&mut self, number: u32) -> Alarm!hal.Error {
+        if number >= ALARM_COUNT {
+            return err(hal.Error.InvalidInput)
+        }
+        bit := 1u32 << number
+        if (self.alarms & bit) != 0 {
+            return err(hal.Error.Busy)
+        }
+        self.alarms |= bit
+        // SAFETY: the alarm's claim keeps the timer's clocks running.
+        unsafe {
+            claim_clocks(CLOCK_SYSTIMER)
+        }
+        alarm := Alarm { number, bit }
+        alarm.cancel()
+        alarm.ignore()
+        alarm.clear()
+        return ok(alarm)
+    }
+
+    // Disarm an alarm, stop its interrupt, and take it back.
+    pub fn release_alarm(&mut self, alarm: Alarm) {
+        alarm.cancel()
+        alarm.ignore()
+        alarm.clear()
+        self.alarms &= ~alarm.bit
+        if self.alarms == 0 {
+            // SAFETY: no alarm uses the timer any more.
+            unsafe {
+                release_clocks(CLOCK_SYSTIMER)
+            }
+        }
+    }
+
+    // Microseconds since power-up.
+    pub fn now_us(&self) -> u64 {
+        return now_us()
+    }
+
+    // The 16 MHz count the microseconds come from, for finer timing.
+    pub fn now_ticks(&self) -> u64 {
+        return ticks()
+    }
+
+    pub fn delay_us(&mut self, microseconds: u32) {
+        end := ticks() + ((microseconds as u64) << TICK_SHIFT)
+        for ticks() < end {}
+    }
+
+    pub fn delay_ms(&mut self, milliseconds: u32) {
+        end := ticks() + ((milliseconds as u64 * 1000) << TICK_SHIFT)
+        for ticks() < end {}
+    }
+}
+
+// One of the system timer's three comparators, claimed with
+// `Timer.alarm(n)`. An alarm fires once when the count reaches the time it
+// was given; with `listen` it raises interrupt source SYSTIMER_TARGET0 + n,
+// whose handler calls `clear` and may schedule the next time. Move it into a
+// `static mut Option<Alarm>` for the handler to use.
+pub struct Alarm {
+    number: u32
+    bit: u32
+
+    // 0 to 2.
+    pub fn number(&self) -> u32 {
+        return self.number
+    }
+
+    // The interrupt source the alarm raises: its number for
+    // esp32c6.enable, and its vector name, SYSTIMER_TARGET0 + n, for
+    // `@interrupt`.
+    pub fn irq(&self) -> u32 {
+        return SYSTIMER_TARGET0 + self.number
+    }
+
+    // Fire when the timer reaches `time_us`, a now_us time, replacing any
+    // earlier time. A time that has passed fires at once.
+    pub fn schedule_at(&mut self, time_us: u64) {
+        target := (time_us << TICK_SHIFT) & TICK_MASK
+        now := ticks()
+        if target <= now {
+            // The comparator fires on equality; one tick ahead is reached
+            // before the write lands.
+            target = now + 2
+        }
+        // SAFETY: the comparator's own registers, and through set and
+        // clear bits of CONF only its own work bit.
+        unsafe {
+            base := SYSTIMER_TARGET + 8 * self.number as usize
+            mmio.write32(base, (target >> 32) as u32)
+            mmio.write32(base + 4, (target & 0xFFFF_FFFF) as u32)
+            // One-shot, compared with unit 0.
+            mmio.write32(SYSTIMER_TARGET_CONF + 4 * self.number as usize, 0)
+            mmio.write32(SYSTIMER_COMP_LOAD + 4 * self.number as usize, 1)
+            section := hal.Critical.enter()
+            conf := mmio.read32(SYSTIMER_CONF)
+            mmio.write32(SYSTIMER_CONF, conf | (TARGET0_WORK >> self.number))
+            core.drop(section)
+        }
+    }
+
+    // Fire `microseconds` from now.
+    pub fn schedule_in(&mut self, microseconds: u32) {
+        self.schedule_at(now_us() + microseconds as u64)
+    }
+
+    // Disarm: a scheduled time no longer fires.
+    pub fn cancel(&mut self) {
+        // SAFETY: clears only this comparator's work bit.
+        unsafe {
+            section := hal.Critical.enter()
+            conf := mmio.read32(SYSTIMER_CONF)
+            mmio.write32(SYSTIMER_CONF, conf & ~(TARGET0_WORK >> self.number))
+            core.drop(section)
+        }
+    }
+
+    // True from scheduling until it fires or is cancelled.
+    pub fn is_armed(&self) -> bool {
+        // SAFETY: reads CONF and the raw interrupt bits.
+        unsafe {
+            working := (mmio.read32(SYSTIMER_CONF) & (TARGET0_WORK >> self.number)) != 0
+            return working && (mmio.read32(SYSTIMER_INT_RAW) & self.bit) == 0
+        }
+    }
+
+    // True once it has fired, until `clear`.
+    pub fn fired(&self) -> bool {
+        // SAFETY: reads the raw interrupt bits.
+        unsafe {
+            return (mmio.read32(SYSTIMER_INT_RAW) & self.bit) != 0
+        }
+    }
+
+    // Acknowledge that it fired. An interrupt handler has to, or the
+    // interrupt stays raised and the handler runs again at once.
+    pub fn clear(&mut self) {
+        // SAFETY: write-one-to-clear of this comparator's bit.
+        unsafe {
+            mmio.write32(SYSTIMER_INT_CLR, self.bit)
+        }
+    }
+
+    // Raise the interrupt when it fires. Route the source too:
+    // `esp32c6.enable(alarm.irq())`.
+    pub fn listen(&mut self) {
+        // SAFETY: changes only this comparator's enable bit.
+        unsafe {
+            section := hal.Critical.enter()
+            mask := mmio.read32(SYSTIMER_INT_ENA)
+            mmio.write32(SYSTIMER_INT_ENA, mask | self.bit)
+            core.drop(section)
+        }
+    }
+
+    // Stop raising the interrupt; `fired` still reports.
+    pub fn ignore(&mut self) {
+        // SAFETY: as in listen.
+        unsafe {
+            section := hal.Critical.enter()
+            mask := mmio.read32(SYSTIMER_INT_ENA)
+            mmio.write32(SYSTIMER_INT_ENA, mask & ~self.bit)
+            core.drop(section)
+        }
+    }
+
+    pub fn is_listening(&self) -> bool {
+        // SAFETY: reads the enable bits.
+        unsafe {
+            return (mmio.read32(SYSTIMER_INT_ENA) & self.bit) != 0
+        }
+    }
+
+    // Microseconds since power-up, as Timer.now_us reads them.
+    pub fn now_us(&self) -> u64 {
+        return now_us()
+    }
+
+    // Sleep (`wfi`) until an interrupt is pending or the timer reaches
+    // `deadline`, a now_us time; none waits for an interrupt only. With
+    // now_us this is the std/embedded/executor clock, so an alarm runs an
+    // executor: `executor.run(&mut tasks, &mut alarm)`. The alarm's
+    // interrupt ends the sleep while interrupts are masked and is cleared
+    // before they are unmasked, so it needs no `@interrupt` handler; other
+    // interrupts' handlers run after the return, or once the caller's own
+    // critical section ends. Leaves the alarm disarmed and not listening.
+    pub fn sleep_until(&mut self, deadline: Option<u64>) {
+        section := hal.Critical.enter()
+        if let some(time) = deadline {
+            now := now_us()
+            if time > now {
+                ahead := time - now
+                if ahead > MAX_ALARM_SLEEP_US {
+                    ahead = MAX_ALARM_SLEEP_US
+                }
+                source := self.irq()
+                self.clear()
+                self.listen()
+                enable(source)
+                self.schedule_at(now + ahead)
+                cpu.wait_for_interrupt()
+                self.cancel()
+                self.ignore()
+                self.clear()
+                disable(source)
+            }
+        } else {
+            cpu.wait_for_interrupt()
+        }
+        core.drop(section)
+    }
+}
+
+// The USB serial port on the chip's USB pins, as `Peripherals.usb`.
+pub struct Usb {
+    open: bool
+
+    // The USB serial port, for printing and reading over the USB cable;
+    // esp_usb_serial documents it. The port is the chip's own, which the
+    // boot ROM also uses, so it is there whether or not the program opens
+    // it, and `dodo run` reaches the chip through it regardless. Busy if a
+    // port is open.
+    pub fn serial(&mut self) -> UsbSerial!hal.Error {
+        if self.open {
+            return err(hal.Error.Busy)
+        }
+        self.open = true
+        // SAFETY: `open` makes this the only handle on the controller.
+        port := unsafe {
+            esp_usb_serial.Controller.new(hal.RegisterBlock.at(USB_DEVICE_BASE))
+        }
+        // SAFETY: interrupts are masked while the reporter is set.
+        unsafe {
+            section := hal.Critical.enter()
+            USB_REPORTS = true
+            core.drop(section)
+        }
+        return ok(UsbSerial { port })
+    }
+
+    // Give back the port.
+    pub fn release_serial(&mut self, serial: UsbSerial) {
+        // SAFETY: as in serial.
+        unsafe {
+            section := hal.Critical.enter()
+            USB_REPORTS = false
+            core.drop(section)
+        }
+        let UsbSerial { port } = serial
+        port.release()
+        self.open = false
+    }
+}
+
+// The USB serial port, as `Usb.serial` hands it out. Implements the std/io
+// Reader and Writer protocols, so std/fmt prints to it, and serial.Port and
+// serial.PollPort.
+pub struct UsbSerial: serial.Port + serial.PollPort {
+    port: esp_usb_serial.Controller<hal.RegisterBlock>
+
+    pub fn write(&mut self, bytes: &[u8]) -> usize!io.Error {
+        return self.port.write(bytes)
+    }
+
+    pub fn poll_write(&mut self, bytes: &[u8]) -> io.Poll!io.Error {
+        return self.port.poll_write(bytes)
+    }
+
+    pub fn flush(&mut self) -> void!io.Error {
+        return self.port.flush()
+    }
+
+    pub fn poll_flush(&mut self) -> bool!io.Error {
+        return self.port.poll_flush()
+    }
+
+    pub fn read(&mut self, buffer: &mut[u8]) -> usize!io.Error {
+        return self.port.read(buffer)
+    }
+
+    pub fn poll_read(&mut self, buffer: &mut[u8]) -> io.Poll!io.Error {
+        return self.port.poll_read(buffer)
+    }
+
+    pub fn set_crlf(&mut self, on: bool) {
+        self.port.set_crlf(on)
+    }
+
+    // Whether a program on the host has the port open (DTR on).
+    pub fn is_connected(&mut self) -> bool {
+        return self.port.is_connected()
+    }
+
+    // Raise interrupt source USB_DEVICE for these esp_usb_serial sources.
+    pub fn listen(&mut self, sources: u32) {
+        self.port.listen(sources)
+    }
+
+    pub fn ignore(&mut self, sources: u32) {
+        self.port.ignore(sources)
+    }
+
+    pub fn pending_interrupts(&mut self) -> u32 {
+        return self.port.pending_interrupts()
+    }
+
+    pub fn clear_interrupts(&mut self, sources: u32) {
+        self.port.clear_interrupts(sources)
+    }
+
+    // The interrupt source the port raises, USB_DEVICE.
+    pub fn irq(&self) -> u32 {
+        return USB_DEVICE
+    }
+}
+
+// Whether panics are reported on the USB serial port: while one is open.
+static mut USB_REPORTS: bool = false
+// The register blocks of the UARTs handed out and not taken back; 0 for
+// none. Panics are reported on them.
+static mut CONSOLES: [2]usize = [0usize; 2]
+// Set once a panic report starts, so a failure while reporting halts
+// instead of reporting again.
+static mut REPORTING: bool = false
+
+// The runtime's default panic hook, dodo_board_panic, calls this weak
+// symbol, if a program defines it, before it halts. Every program that uses
+// this package defines it; it writes nothing until a port is open.
+extern "C" fn dodo_panic_report(check: *const u8, file: *const u8, line: u32, column: u32) {
+    // SAFETY: the compiler passes NUL-terminated strings, and the hook
+    // halts afterwards.
+    unsafe {
+        report_panic(check, file, line, column)
+    }
+}
+
+// Write a failed check's message to every serial port claimed from
+// `pins.uart` and not yet released, and to the USB serial port while one is
+// open, as the default panic hook does before it halts:
+//
+//     dodo: arithmetic overflow check failed at /home/me/blink/main.dodo:12:5
+//
+// Call it from a panic hook of your own that, for example, restarts:
+//
+//     extern "C" fn dodo_board_panic(check: *const u8, file: *const u8, line: u32, column: u32) {
+//         unsafe {
+//             chip.report_panic(check, file, line, column)
+//         }
+//         chip.restart()
+//     }
+//
+// Only the first call reports. Processor exceptions arrive as
+// `processor exception check failed at mcause:mepc:CAUSE:ADDRESS`.
+// SAFETY: `check` and `file` must be the hook's NUL-terminated strings, and
+// the caller must halt or reset afterwards, as this takes over the ports.
+pub unsafe fn report_panic(check: *const u8, file: *const u8, line: u32, column: u32) {
+    unsafe {
+        if REPORTING {
+            return
+        }
+        REPORTING = true
+        stop_dma()
+        report: [256]u8 = [0; 256]
+        length := failure_text(&mut report, check, file, line, column)
+        for index in 0..2usize {
+            if CONSOLES[index] != 0 {
+                registers := hal.RegisterBlock.at(CONSOLES[index])
+                uart_send_report(&mut registers, &report[..length])
+            }
+        }
+        if USB_REPORTS {
+            usb := esp_usb_serial.Controller.new(hal.RegisterBlock.at(USB_DEVICE_BASE))
+            usb.send_report(&report[..length])
+        }
+    }
+}
+
+// The report line of report_panic in `out`; returns its length, cut short
+// to fit.
+// SAFETY: `check` and `file` must be NUL-terminated.
+unsafe fn failure_text(out: &mut[u8], check: *const u8, file: *const u8, line: u32, column: u32) -> usize {
+    length := 0usize
+    length = append(out, length, b"\r\ndodo: ")
+    unsafe {
+        length = append_text(out, length, check)
+        length = append(out, length, b" check failed at ")
+        length = append_text(out, length, file)
+    }
+    length = append(out, length, b":")
+    length = append_number(out, length, line)
+    length = append(out, length, b":")
+    length = append_number(out, length, column)
+    length = append(out, length, b"\r\n")
+    return length
+}
+
+fn append(out: &mut[u8], length: usize, bytes: &[u8]) -> usize {
+    used := length
+    for index in 0..bytes.len {
+        if used == out.len {
+            return used
+        }
+        out[used] = bytes[index]
+        used += 1
+    }
+    return used
+}
+
+// SAFETY: `text` must be NUL-terminated.
+unsafe fn append_text(out: &mut[u8], length: usize, text: *const u8) -> usize {
+    used := length
+    for index in 0..1024isize {
+        byte := unsafe {
+            ptr.read(ptr.offset(text, index))
+        }
+        if byte == 0 || used == out.len {
+            return used
+        }
+        out[used] = byte
+        used += 1
+    }
+    return used
+}
+
+fn append_number(out: &mut[u8], length: usize, value: u32) -> usize {
+    digits: [10]u8 = [0; 10]
+    position := 10usize
+    rest := value
+    for {
+        position -= 1
+        digits[position] = (48 + rest % 10) as u8
+        rest = rest / 10
+        if rest == 0 {
+            break
+        }
+    }
+    return append(out, length, &digits[position..])
+}
+
+// --- Peripheral clocks, controllers, and the GPIO matrix signals ---------
+
+// PCR: per peripheral, a bus clock enable and a reset, then usually its
+// function clock: a divider (DIV_NUM + 1), the source, and an enable.
+const PCR_UART0_CONF: usize = PCR_BASE + 0x000
+const PCR_I2C0_CONF: usize = PCR_BASE + 0x020
+const PCR_I2C0_SCLK_CONF: usize = PCR_BASE + 0x024
+const PCR_RMT_CONF: usize = PCR_BASE + 0x02C
+const PCR_RMT_SCLK_CONF: usize = PCR_BASE + 0x030
+const PCR_LEDC_CONF: usize = PCR_BASE + 0x034
+const PCR_LEDC_SCLK_CONF: usize = PCR_BASE + 0x038
+const PCR_SARADC_CONF: usize = PCR_BASE + 0x080
+const PCR_SARADC_CLKM_CONF: usize = PCR_BASE + 0x084
+const PCR_TSENS_CLK_CONF: usize = PCR_BASE + 0x088
+const PCR_GDMA_CONF: usize = PCR_BASE + 0x0BC
+const PCR_SPI2_CONF: usize = PCR_BASE + 0x0C0
+const PCR_SPI2_CLKM_CONF: usize = PCR_BASE + 0x0C4
+const PCR_TWAI0_CONF: usize = PCR_BASE + 0x05C
+const PCR_I2S_CONF: usize = PCR_BASE + 0x06C
+const PCR_PCNT_CONF: usize = PCR_BASE + 0x094
+const PCR_PWM_CONF: usize = PCR_BASE + 0x09C
+const PCR_PWM_CLK_CONF: usize = PCR_BASE + 0x0A0
+const PERIPHERAL_CLOCK: u32 = 1 << 0
+const PERIPHERAL_RESET: u32 = 1 << 1
+const SCLK_DIV_NUM: u32 = 0xFF << 12
+// The source: 1 is the PLL's 80 MHz output for RMT, LEDC, and SPI2, and 3
+// the crystal for the UARTs; I2C's one bit is 0 for the crystal.
+const SCLK_SELECT: u32 = 0b11 << 20
+const SCLK_ENABLE: u32 = 1 << 22
+const TSENS_CLOCK_ENABLE: u32 = 1 << 22
+const TSENS_RESET: u32 = 1 << 23
+
+const UART0_BASE: usize = 0x6000_0000
+const I2C0_BASE: usize = 0x6000_4000
+const SPI2_BASE: usize = 0x6008_1000
+const TWAI0_BASE: usize = 0x6000_B000
+
+// GPIO matrix signal numbers, inputs and outputs alike.
+const SIGNAL_UART_TX: [2]u32 = [6u32, 9]
+const SIGNAL_UART_RX: [2]u32 = [6u32, 9]
+const SIGNAL_UART_RTS: [2]u32 = [7u32, 10]
+const SIGNAL_UART_CTS: [2]u32 = [7u32, 10]
+const SIGNAL_I2C_SCL: u32 = 45
+const SIGNAL_I2C_SDA: u32 = 46
+const SIGNAL_SPI_CLOCK: u32 = 63
+const SIGNAL_SPI_MISO: u32 = 64
+const SIGNAL_SPI_MOSI: u32 = 65
+const SIGNAL_SPI_CS0: u32 = 68
+const SIGNAL_LEDC: u32 = 0
+const SIGNAL_RMT0: u32 = 71
+// TWAI0 and TWAI1's TX outputs and RX inputs; I2S0's transmitter BCLK, WS,
+// and data outputs, and its receiver's data input and BCLK and WS outputs;
+// the MCPWM's capture inputs 0 to 2; PCNT unit 0's signal and control
+// inputs (channel 0's signal, then channel 1's, then their controls).
+const SIGNAL_TWAI: [2]u32 = [73u32, 77]
+const SIGNAL_I2SO_BCK: u32 = 13
+const SIGNAL_I2SO_WS: u32 = 14
+const SIGNAL_I2SO_SD: u32 = 15
+const SIGNAL_I2SI_SD: u32 = 15
+const SIGNAL_I2SI_BCK: u32 = 16
+const SIGNAL_I2SI_WS: u32 = 17
+const SIGNAL_PWM0_CAP0: u32 = 93
+const SIGNAL_PCNT0_SIG_CH0: u32 = 101
+
+// Controllers in Pins.buses.
+const BUS_UART0: u32 = 1 << 0
+const BUS_I2C: u32 = 1 << 2
+const BUS_SPI: u32 = 1 << 3
+const BUS_RMT: u32 = 1 << 4
+const BUS_TWAI0: u32 = 1 << 16
+const BUS_TWAI1: u32 = 1 << 17
+const BUS_I2S_OUT: u32 = 1 << 18
+const BUS_I2S_IN: u32 = 1 << 19
+const BUS_CAPTURE: u32 = 1 << 20
+// No pin.
+const PIN_NONE: u32 = 0xFF
+
+// Claim the peripheral whose PCR *_CONF register is `conf`: start its
+// clocks, which Power may have stopped, and record the claim, so that
+// Power.disable_unused_clocks leaves them alone and Power.disable_clocks
+// refuses them; then hold it in reset with its clock on, and let it run.
+// Every driver claims its peripheral here, so a new driver needs no more
+// than this call, stop_peripheral, and its line in peripheral_clocks.
+// SAFETY: the caller owns the peripheral.
+unsafe fn start_peripheral(conf: usize) {
+    unsafe {
+        claim_clocks(peripheral_clocks(conf))
+        mmio.write32(conf, PERIPHERAL_CLOCK | PERIPHERAL_RESET)
+        mmio.write32(conf, PERIPHERAL_CLOCK)
+    }
+}
+
+// Hold a peripheral in reset and give up its claim; its clocks keep
+// running until Power stops them.
+// SAFETY: the caller owns the peripheral and no longer uses it.
+unsafe fn stop_peripheral(conf: usize) {
+    unsafe {
+        mmio.write32(conf, PERIPHERAL_CLOCK | PERIPHERAL_RESET)
+        release_clocks(peripheral_clocks(conf))
+    }
+}
+
+// The clock gates of the peripheral whose PCR *_CONF register is `conf`,
+// one line per peripheral the chip can claim: its bus clock and its
+// function clocks.
+fn peripheral_clocks(conf: usize) -> power.Clocks {
+    offset := conf - PCR_BASE
+    if offset == 0x000 {
+        return CLOCK_UART0
+    } else if offset == 0x00C {
+        return CLOCK_UART1
+    } else if offset == 0x020 {
+        return CLOCK_I2C0
+    } else if offset == 0x028 {
+        return CLOCK_UHCI
+    } else if offset == 0x02C {
+        return CLOCK_RMT
+    } else if offset == 0x034 {
+        return CLOCK_LEDC
+    } else if offset == 0x03C {
+        return CLOCK_TIMG0
+    } else if offset == 0x048 {
+        return CLOCK_TIMG1
+    } else if offset == 0x05C {
+        return CLOCK_TWAI0
+    } else if offset == 0x064 {
+        return CLOCK_TWAI1
+    } else if offset == 0x06C {
+        return CLOCK_I2S
+    } else if offset == 0x080 {
+        return CLOCK_SARADC
+    } else if offset == 0x094 {
+        return CLOCK_PCNT
+    } else if offset == 0x098 {
+        return CLOCK_ETM
+    } else if offset == 0x09C {
+        return CLOCK_MCPWM
+    } else if offset == 0x0A4 {
+        return CLOCK_PARLIO
+    } else if offset == 0x0BC {
+        return CLOCK_GDMA
+    } else if offset == 0x0C0 {
+        return CLOCK_SPI2
+    } else if offset == 0x0C8 {
+        return CLOCK_AES
+    } else if offset == 0x0CC {
+        return CLOCK_SHA
+    } else if offset == 0x0D0 {
+        return CLOCK_RSA
+    } else if offset == 0x0D8 {
+        return CLOCK_ECC
+    } else if offset == 0x0E0 {
+        return CLOCK_DS
+    } else if offset == 0x0E4 {
+        return CLOCK_HMAC
+    }
+    return power.NO_CLOCKS
+}
+
+// Record a claim on `clocks` and start them.
+// SAFETY: the caller owns the peripherals that use them.
+unsafe fn claim_clocks(clocks: power.Clocks) {
+    unsafe {
+        section := hal.Critical.enter()
+        CLAIMED_CLOCKS |= clocks
+        pcr := hal.RegisterBlock.at(PCR_BASE)
+        esp_power.start_clocks(&mut pcr, clocks)
+        core.drop(section)
+    }
+}
+
+// Give up the claim on `clocks`.
+// SAFETY: the caller no longer uses the peripherals that use them.
+unsafe fn release_clocks(clocks: power.Clocks) {
+    unsafe {
+        section := hal.Critical.enter()
+        CLAIMED_CLOCKS &= ~clocks
+        core.drop(section)
+    }
+}
+
+// The CAN controllers' clocks: TWAI `number`'s bus clock and reset, then
+// its function clock from the 40 MHz crystal (TWAIn_FUNC_CLK_CONF, source
+// 0), so the bit timing does not depend on the CPU's clock.
+// SAFETY: the caller owns the controller.
+unsafe fn start_twai(number: u32) {
+    unsafe {
+        conf := PCR_TWAI0_CONF + 8 * number as usize
+        start_peripheral(conf)
+        mmio.write32(conf + 4, SCLK_ENABLE)
+    }
+}
+
+// SAFETY: the caller owns the controller and no longer uses it.
+unsafe fn stop_twai(number: u32) {
+    unsafe {
+        conf := PCR_TWAI0_CONF + 8 * number as usize
+        mmio.write32(conf + 4, 0)
+        stop_peripheral(conf)
+    }
+}
+
+// I2S0's bus clock and reset; esp_i2s sets the transmitter's and
+// receiver's function clocks (PCR I2S_TX_CLKM_CONF, I2S_RX_CLKM_CONF).
+// SAFETY: the caller owns the controller.
+unsafe fn start_i2s() {
+    unsafe {
+        start_peripheral(PCR_I2S_CONF)
+    }
+}
+
+// SAFETY: the caller owns the controller and no longer uses it.
+unsafe fn stop_i2s() {
+    unsafe {
+        stop_peripheral(PCR_I2S_CONF)
+    }
+}
+
+// The PWM input's units: the MCPWM's bus clock and reset and its function
+// clock, the 160 MHz PLL output, which its capture timer counts; and the
+// PCNT's.
+// SAFETY: the caller owns both.
+unsafe fn start_capture() {
+    unsafe {
+        start_peripheral(PCR_PWM_CONF)
+        mmio.write32(PCR_PWM_CLK_CONF, hal.encode(SCLK_SELECT, 1) | SCLK_ENABLE)
+        start_peripheral(PCR_PCNT_CONF)
+    }
+}
+
+// SAFETY: the caller owns both and no longer uses them.
+unsafe fn stop_capture() {
+    unsafe {
+        mmio.write32(PCR_PWM_CLK_CONF, 0)
+        stop_peripheral(PCR_PWM_CONF)
+        stop_peripheral(PCR_PCNT_CONF)
+    }
+}
+
+// The bits of three different claimable pins; InvalidInput otherwise.
+fn distinct_pins(first: u32, second: u32, third: u32) -> u32!hal.Error {
+    pins := pin_bit(first)? | pin_bit(second)? | pin_bit(third)?
+    if first == second || first == third || second == third {
+        return err(hal.Error.InvalidInput)
+    }
+    return ok(pins)
+}
+
+// SAFETY: the caller owns pin `number`.
+unsafe fn set_open_drain(number: u32, on: bool) {
+    unsafe {
+        address := GPIO_PIN + 4 * number as usize
+        value := mmio.read32(address) & ~PIN_OPEN_DRAIN
+        if on {
+            value |= PIN_OPEN_DRAIN
+        }
+        mmio.write32(address, value)
+    }
+}
+
+// Start I2C0 with its function clock, the crystal divided by `prescale`,
+// and connect it to pins `sda` and `scl` as open-drain lines with the
+// pads' pull-ups.
+// SAFETY: the caller owns the controller and the pins.
+unsafe fn connect_i2c(sda: u32, scl: u32, prescale: u32) -> hal.RegisterBlock {
+    unsafe {
+        start_peripheral(PCR_I2C0_CONF)
+        mmio.write32(PCR_I2C0_SCLK_CONF, hal.encode(SCLK_DIV_NUM, prescale - 1) | SCLK_ENABLE)
+        gpio_function(sda)
+        set_pad_pull(sda, true, false)
+        set_open_drain(sda, true)
+        gpio_function(scl)
+        set_pad_pull(scl, true, false)
+        set_open_drain(scl, true)
+        route_output(scl, SIGNAL_I2C_SCL, false)
+        route_input(SIGNAL_I2C_SCL, scl)
+        route_output(sda, SIGNAL_I2C_SDA, false)
+        route_input(SIGNAL_I2C_SDA, sda)
+        return hal.RegisterBlock.at(I2C0_BASE)
+    }
+}
+
+// Stop I2C0 and disconnect its pins, which stay pulled up.
+// SAFETY: the caller owned the controller and the pins and no longer uses
+// them.
+unsafe fn disconnect_i2c(sda: u32, scl: u32) {
+    unsafe {
+        stop_peripheral(PCR_I2C0_CONF)
+        tie_input(SIGNAL_I2C_SCL, true)
+        tie_input(SIGNAL_I2C_SDA, true)
+        set_open_drain(sda, false)
+        set_open_drain(scl, false)
+        disconnect(sda)
+        disconnect(scl)
+    }
+}
+
+// The divider of the 40 MHz crystal that leaves `baud` within the UART's
+// 12-bit divisor.
+fn uart_prescaler(baud: u32) -> u32 {
+    return ((XTAL_HZ + 4094) / 4095 + baud - 1) / baud
+}
+
+// An I2C bus, as `Pins.i2c` hands it out. Implements the
+// std/embedded/hal I2C bus protocol and its polling form; esp_i2c
+// documents the methods.
+pub struct I2c: hal.I2c + hal.I2cPoll {
+    bus: esp_i2c.Controller<hal.RegisterBlock>
+    sda: u32
+    scl: u32
+
+    pub fn write(&mut self, address: u8, bytes: &[u8]) -> void!hal.Error {
+        return self.bus.write(address, bytes)
+    }
+
+    pub fn read(&mut self, address: u8, buffer: &mut[u8]) -> void!hal.Error {
+        return self.bus.read(address, buffer)
+    }
+
+    pub fn write_read(&mut self, address: u8, bytes: &[u8], buffer: &mut[u8]) -> void!hal.Error {
+        return self.bus.write_read(address, bytes, buffer)
+    }
+
+    pub fn write_ten_bit(&mut self, address: u16, bytes: &[u8]) -> void!hal.Error {
+        return self.bus.write_ten_bit(address, bytes)
+    }
+
+    pub fn read_ten_bit(&mut self, address: u16, buffer: &mut[u8]) -> void!hal.Error {
+        return self.bus.read_ten_bit(address, buffer)
+    }
+
+    pub fn write_read_ten_bit(&mut self, address: u16, bytes: &[u8], buffer: &mut[u8]) -> void!hal.Error {
+        return self.bus.write_read_ten_bit(address, bytes, buffer)
+    }
+
+    pub fn probe(&mut self, address: u8) -> bool!hal.Error {
+        return self.bus.probe(address)
+    }
+
+    // The polled transactions, which never wait; see esp_i2c.
+    pub fn poll_write(&mut self, address: u8, bytes: &[u8]) -> bool!hal.Error {
+        return self.bus.poll_write(address, bytes)
+    }
+
+    pub fn poll_read(&mut self, address: u8, buffer: &mut[u8]) -> bool!hal.Error {
+        return self.bus.poll_read(address, buffer)
+    }
+
+    pub fn poll_write_read(&mut self, address: u8, bytes: &[u8], buffer: &mut[u8]) -> bool!hal.Error {
+        return self.bus.poll_write_read(address, bytes, buffer)
+    }
+
+    pub fn poll_write_ten_bit(&mut self, address: u16, bytes: &[u8]) -> bool!hal.Error {
+        return self.bus.poll_write_ten_bit(address, bytes)
+    }
+
+    pub fn poll_read_ten_bit(&mut self, address: u16, buffer: &mut[u8]) -> bool!hal.Error {
+        return self.bus.poll_read_ten_bit(address, buffer)
+    }
+
+    pub fn poll_write_read_ten_bit(&mut self, address: u16, bytes: &[u8], buffer: &mut[u8]) -> bool!hal.Error {
+        return self.bus.poll_write_read_ten_bit(address, bytes, buffer)
+    }
+
+    pub fn cancel(&mut self) {
+        self.bus.cancel()
+    }
+
+    // True while a polled transaction runs.
+    pub fn is_busy(&self) -> bool {
+        return self.bus.is_busy()
+    }
+
+    pub fn frequency_hz(&self) -> u32 {
+        return self.bus.frequency_hz()
+    }
+
+    // The interrupt source of the controller, I2C_EXT0.
+    pub fn irq(&self) -> u32 {
+        return I2C_EXT0
+    }
+}
+
+// An SPI bus, as `Pins.spi` and `Pins.spi_with_select` hand it out.
+// Implements the std/embedded/hal SPI bus protocol and its polling form;
+// esp_spi documents the methods. `dma` runs transfers by DMA.
+pub struct Spi: hal.Spi + hal.SpiPoll {
+    bus: esp_spi.Controller<hal.RegisterBlock>
+    clock: u32
+    tx: u32
+    rx: u32
+    select: u32
+
+    pub fn transfer(&mut self, bytes: &mut[u8]) -> void!hal.Error {
+        return self.bus.transfer(bytes)
+    }
+
+    pub fn write(&mut self, bytes: &[u8]) -> void!hal.Error {
+        return self.bus.write(bytes)
+    }
+
+    // The polled transfers, which never wait; see esp_spi.
+    pub fn poll_transfer(&mut self, bytes: &mut[u8]) -> bool!hal.Error {
+        return self.bus.poll_transfer(bytes)
+    }
+
+    pub fn poll_write(&mut self, bytes: &[u8]) -> bool!hal.Error {
+        return self.bus.poll_write(bytes)
+    }
+
+    pub fn cancel(&mut self) {
+        self.bus.cancel()
+    }
+
+    // True while a polled transfer runs.
+    pub fn is_busy(&self) -> bool {
+        return self.bus.is_busy()
+    }
+
+    // Move bytes between `buffer` and the bus by DMA until the returned
+    // SpiDmaBus is dropped: `channel`, which serves both directions, feeds
+    // the controller from the buffer and stores what it receives back into
+    // it, while the processor does other work; see SpiDmaBus. InvalidInput
+    // for an empty buffer or one outside SRAM, such as a constant; Busy if
+    // the channel runs a copy or the bus a polled transfer.
+    pub fn dma(&mut self, channel: &mut DmaChannel, buffer: &mut[u8]) -> SpiDmaBus!hal.Error from(self, channel, buffer) {
+        if buffer.len == 0 || !in_sram(hal.address_of(buffer), buffer.len as u64) {
+            return err(hal.Error.InvalidInput)
+        }
+        if channel.is_busy() || self.bus.is_busy() {
+            return err(hal.Error.Busy)
+        }
+        return ok(SpiDmaBus { bus: &mut self.bus, channel, buffer, running: false, receiving: false, count: 0 })
+    }
+
+    pub fn frequency_hz(&self) -> u32 {
+        return self.bus.frequency_hz()
+    }
+
+    pub fn set_frequency(&mut self, frequency_hz: u32) -> void!hal.Error {
+        return self.bus.set_frequency(frequency_hz)
+    }
+
+    pub fn set_mode(&mut self, mode: hal.SpiMode) {
+        self.bus.set_mode(mode)
+    }
+
+    // Read MISO from the bus's own MOSI pin through the GPIO matrix, so
+    // transfers read back what they send. Meant for self-tests.
+    pub fn set_loopback(&mut self, on: bool) {
+        // SAFETY: the bus owns the MISO signal and its pins.
+        unsafe {
+            if on {
+                route_input(SIGNAL_SPI_MISO, self.tx)
+            } else if self.rx != PIN_NONE {
+                route_input(SIGNAL_SPI_MISO, self.rx)
+            } else {
+                tie_input(SIGNAL_SPI_MISO, false)
+            }
+        }
+    }
+
+    // The interrupt source of the controller, SPI2.
+    pub fn irq(&self) -> u32 {
+        return SPI2
+    }
+}
+
+// A serial port, as `Pins.uart` hands it out. Implements the std/io
+// Reader and Writer protocols and serial.Port and serial.PollPort;
+// esp_uart documents the methods.
+pub struct Uart: serial.Port + serial.PollPort {
+    port: esp_uart.Controller<hal.RegisterBlock>
+    number: u32
+    tx: u32
+    rx: u32
+    cts: u32
+    rts: u32
+
+    pub fn write(&mut self, bytes: &[u8]) -> usize!io.Error {
+        return self.port.write(bytes)
+    }
+
+    pub fn poll_write(&mut self, bytes: &[u8]) -> io.Poll!io.Error {
+        return self.port.poll_write(bytes)
+    }
+
+    pub fn flush(&mut self) -> void!io.Error {
+        return self.port.flush()
+    }
+
+    pub fn poll_flush(&mut self) -> bool!io.Error {
+        return self.port.poll_flush()
+    }
+
+    pub fn read(&mut self, buffer: &mut[u8]) -> usize!io.Error {
+        return self.port.read(buffer)
+    }
+
+    pub fn poll_read(&mut self, buffer: &mut[u8]) -> io.Poll!io.Error {
+        return self.port.poll_read(buffer)
+    }
+
+    pub fn baud(&self) -> u32 {
+        return self.port.baud()
+    }
+
+    // Change the baud rate, 300 to 5_000_000 bit/s, once everything written
+    // is out. InvalidInput or Timeout leaves it unchanged.
+    pub fn set_baud(&mut self, baud: u32) -> void!hal.Error {
+        if baud < 300 || baud > 5_000_000 {
+            return err(hal.Error.InvalidInput)
+        }
+        prescale := uart_prescaler(baud)
+        divisor := esp_uart.divisor(XTAL_HZ / prescale, baud)?
+        self.port.flush()!
+        // SAFETY: the port owns its controller's clock register.
+        unsafe {
+            mmio.write32(PCR_UART0_CONF + 0xC * self.number as usize + 4, hal.encode(SCLK_DIV_NUM, prescale - 1) | hal.encode(SCLK_SELECT, 3) | SCLK_ENABLE)
+        }
+        return self.port.set_divisor(divisor)
+    }
+
+    pub fn set_format(&mut self, data_bits: u32, parity: esp_uart.Parity, stop_bits: u32) -> void!hal.Error {
+        return self.port.set_format(data_bits, parity, stop_bits)
+    }
+
+    pub fn set_crlf(&mut self, on: bool) {
+        self.port.set_crlf(on)
+    }
+
+    pub fn set_loopback(&mut self, on: bool) -> void!hal.Error {
+        return self.port.set_loopback(on)
+    }
+
+    pub fn set_break(&mut self, on: bool) -> void!hal.Error {
+        return self.port.set_break(on)
+    }
+
+    pub fn set_poll_limit(&mut self, polls: u32) {
+        self.port.set_poll_limit(polls)
+    }
+
+    pub fn set_read_poll_limit(&mut self, polls: u32) {
+        self.port.set_read_poll_limit(polls)
+    }
+
+    pub fn listen(&mut self, sources: u32) {
+        self.port.listen(sources)
+    }
+
+    pub fn ignore(&mut self, sources: u32) {
+        self.port.ignore(sources)
+    }
+
+    pub fn pending_interrupts(&mut self) -> u32 {
+        return self.port.pending_interrupts()
+    }
+
+    pub fn clear_interrupts(&mut self, sources: u32) {
+        self.port.clear_interrupts(sources)
+    }
+
+    // 0 for UART0, 1 for UART1.
+    pub fn number(&self) -> u32 {
+        return self.number
+    }
+
+    // The interrupt source of the controller, UART0 or UART1.
+    pub fn irq(&self) -> u32 {
+        return UART0 + self.number
+    }
+}
+
+// Write a panic report to the UART with registers R.
+// SAFETY: the report owns the port from now on.
+unsafe fn uart_send_report<R: hal.Registers>(registers: &mut R, report: &[u8]) {
+    for index in 0..report.len {
+        for _ in 0..1_000_000 {
+            if ((registers.read(0x1C) >> 16) & 0xFF) < 128 {
+                break
+            }
+        }
+        registers.write(0x00, report[index] as u32)
+    }
+    for _ in 0..10_000_000 {
+        if ((registers.read(0x1C) >> 16) & 0xFF) == 0 && ((registers.read(0x70) >> 4) & 0xF) == 0 {
+            break
+        }
+    }
+}
+
+// --- PWM: the LED PWM controller (LEDC), low-speed channels --------------
+
+const LEDC_BASE: usize = 0x6000_7000
+// Per channel, 0x14 apart: the output and its timer, the start of the high
+// part, the duty in sixteenths, and a duty change.
+const LEDC_CONF0: usize = 0x00
+const LEDC_HPOINT: usize = 0x04
+const LEDC_DUTY: usize = 0x08
+const LEDC_CONF1: usize = 0x0C
+const LEDC_SIGNAL_OUT: u32 = 1 << 2
+const LEDC_PARA_UP: u32 = 1 << 4
+const LEDC_DUTY_START: u32 = 1 << 31
+// Per channel, 0x10 apart: one step of duty change, and the table entry.
+const LEDC_GAMMA_WR: usize = 0x100
+const LEDC_GAMMA_WR_ADDR: usize = 0x104
+const LEDC_ONE_STEP: u32 = 0x0020_0003
+// Per timer, 8 apart: the duty resolution in bits, and the divider of the
+// 80 MHz source in 1/256, from bit 5.
+const LEDC_TIMER_CONF: usize = 0xA0
+const LEDC_DUTY_RES: u32 = 0x1F
+const LEDC_TIMER_PARA_UP: u32 = 1 << 26
+const LEDC_MAX_RES: u32 = 14
+
+// A timer setting for `frequency_hz`: the finest resolution whose divider
+// is at least 1, and that divider; InvalidInput where none fits.
+fn ledc_timing(frequency_hz: u32) -> u32!hal.Error {
+    if frequency_hz == 0 || frequency_hz > PLL_F80M_HZ / 2 {
+        return err(hal.Error.InvalidInput)
+    }
+    resolution := LEDC_MAX_RES
+    for resolution > 1 && (frequency_hz as u64 << resolution as u64) > PLL_F80M_HZ as u64 {
+        resolution -= 1
+    }
+    divider := ((PLL_F80M_HZ as u64 << 8) / (frequency_hz as u64 << resolution as u64)) as u32
+    if divider < 256 || divider > 0x3_FFFF {
+        return err(hal.Error.InvalidInput)
+    }
+    return ok(resolution | (divider << 5))
+}
+
+// The frequency a timer setting makes.
+fn ledc_frequency(timing: u32) -> u32 {
+    divider := (timing >> 5) & 0x3_FFFF
+    resolution := timing & LEDC_DUTY_RES
+    return ((PLL_F80M_HZ as u64 << 8) / ((divider as u64) << resolution as u64)) as u32
+}
+
+// A PWM output, as `Pins.pwm` hands it out. Implements the
+// std/embedded/hal PWM output protocol.
+pub struct Pwm: hal.PwmOutput {
+    pin: u32
+    channel: u32
+    timer: u32
+    max_duty: u16
+    frequency_hz: u32
+
+    // The duty that holds the output high: 2 to the timer's resolution.
+    pub fn max_duty(&self) -> u16 {
+        return self.max_duty
+    }
+
+    // Take `duty`, 0 to max_duty(), from the next period on. InvalidInput
+    // above max_duty().
+    pub fn set_duty(&mut self, duty: u16) -> void!hal.Error {
+        if duty > self.max_duty {
+            return err(hal.Error.InvalidInput)
+        }
+        // SAFETY: the output owns its channel's registers.
+        unsafe {
+            base := LEDC_BASE + 0x14 * self.channel as usize
+            mmio.write32(base + LEDC_DUTY, (duty as u32) << 4)
+            mmio.write32(base + LEDC_CONF1, LEDC_DUTY_START)
+            mmio.write32(LEDC_BASE + LEDC_GAMMA_WR + 0x10 * self.channel as usize, LEDC_ONE_STEP)
+            conf := mmio.read32(base + LEDC_CONF0)
+            mmio.write32(base + LEDC_CONF0, conf | LEDC_PARA_UP)
+        }
+        return ok()
+    }
+
+    // The duty in effect, as the controller reports it.
+    pub fn duty(&self) -> u16 {
+        // SAFETY: reads the channel's current duty.
+        unsafe {
+            return ((mmio.read32(LEDC_BASE + 0x14 * self.channel as usize + 0x10) >> 4) & 0xFFFF) as u16
+        }
+    }
+
+    // The output's frequency, the closest the timer makes to the request.
+    pub fn frequency_hz(&self) -> u32 {
+        return self.frequency_hz
+    }
+
+    // The LEDC channel, 0 to 5.
+    pub fn channel(&self) -> u32 {
+        return self.channel
+    }
+
+    pub fn pin(&self) -> u32 {
+        return self.pin
+    }
+}
+
+// --- The ADC (SAR ADC1) and the temperature sensor -----------------------
+
+const APB_SARADC_BASE: usize = 0x6000_E000
+const SARADC_CTRL: usize = APB_SARADC_BASE + 0x00
+// CTRL: force the controller's start and power, gate its clock.
+const SARADC_FORCED: u32 = (1u32 << 0) | (1u32 << 1) | (1u32 << 6) | (3u32 << 27)
+const SARADC_ONETIME: usize = APB_SARADC_BASE + 0x20
+const ONETIME_ADC1: u32 = 1 << 31
+const ONETIME_START: u32 = 1 << 29
+const ONETIME_CHANNEL: u32 = 0xF << 25
+const ONETIME_ATTEN: u32 = 0b11 << 23
+// The largest attenuation, 12 dB: about 0 to 3.3 V.
+const ATTEN_12DB: u32 = 3
+const SARADC_DATA: usize = APB_SARADC_BASE + 0x2C
+const SARADC_INT_RAW: usize = APB_SARADC_BASE + 0x44
+const SARADC_INT_CLR: usize = APB_SARADC_BASE + 0x4C
+const ADC1_DONE: u32 = 1 << 31
+const TSENS_CTRL: usize = APB_SARADC_BASE + 0x58
+const TSENS_CTRL2: usize = APB_SARADC_BASE + 0x5C
+const TSENS_POWER_UP: u32 = 1 << 22
+const TSENS_FROM_XTAL: u32 = 0x0000_C002
+// GPIO 0 to 6 are ADC1 channels 0 to 6.
+const ADC_CHANNELS: u32 = 7
+const TEMPERATURE_CHANNEL: u32 = 7
+const TEMPERATURE_BIT: u32 = 1 << 7
+// Polls before a conversion that does not finish is reported as Timeout.
+const ADC_POLLS: u32 = 100_000
+
+// The analog configuration bus (regi2c), and the ADC's registers on it.
+const MODEM_LPCON_I2C_MST_CLK_CONF: usize = 0x600A_F010
+const MODEM_LPCON_CLK_CONF: usize = 0x600A_F018
+// CLK_CONF_FORCE_ON.CLK_I2C_MST_FO: keep the bus master's clock running
+// whatever the PMU's radio-domain clock gating says; with its power-state
+// maps at their reset value of 0 that gating stops the clock, and the
+// bus's reads return 0 and its writes are lost.
+const MODEM_LPCON_CLK_CONF_FORCE_ON: usize = 0x600A_F01C
+const I2C_MASTER_FORCE_ON: u32 = 1 << 2
+// PMU RF_PWC: power the analog configuration bus's peripheral side
+// (XPD_PERIF_I2C) and release its reset (PERIF_I2C_RSTB), which power-up
+// leaves held; ESP-IDF and esp-hal do this at start-up.
+const PMU_RF_PWC: usize = 0x600B_0154
+const PERIF_I2C_ON: u32 = (1u32 << 26) | (1u32 << 27)
+const I2C_ANA_MST_I2C0_CTRL: usize = 0x600A_F800
+const I2C_ANA_MST_ANA_CONF1: usize = 0x600A_F81C
+const I2C_ANA_MST_ANA_CONF2: usize = 0x600A_F820
+const ANA_SAR_SELECT: u32 = 1 << 11
+const ANA_SAR_ONLY: u32 = 0x00FF_FDFF
+const ANA_BUSY: u32 = 1 << 25
+const ANA_WRITE: u32 = 1 << 24
+const SAR_ADC_BLOCK: u32 = 0x69
+// eFuse: block 1 and block 2's words, for the ADC's calibration.
+const EFUSE_BLOCK1: usize = 0x600B_0844
+const EFUSE_BLOCK2: usize = 0x600B_085C
+
+// Write `value` into bits lsb to msb of register `register` of the ADC on
+// the analog configuration bus.
+// SAFETY: the caller owns the ADC.
+unsafe fn sar_write(register: u32, msb: u32, lsb: u32, value: u32) {
+    unsafe {
+        clock := mmio.read32(MODEM_LPCON_CLK_CONF)
+        mmio.write32(MODEM_LPCON_CLK_CONF, clock | (1u32 << 2))
+        forced := mmio.read32(MODEM_LPCON_CLK_CONF_FORCE_ON)
+        mmio.write32(MODEM_LPCON_CLK_CONF_FORCE_ON, forced | I2C_MASTER_FORCE_ON)
+        rf := mmio.read32(PMU_RF_PWC)
+        mmio.write32(PMU_RF_PWC, rf | PERIF_I2C_ON)
+        source := mmio.read32(MODEM_LPCON_I2C_MST_CLK_CONF)
+        mmio.write32(MODEM_LPCON_I2C_MST_CLK_CONF, source | 1)
+        master := I2C_ANA_MST_I2C0_CTRL
+        if (mmio.read32(I2C_ANA_MST_ANA_CONF2) & ANA_SAR_SELECT) == 0 {
+            master = I2C_ANA_MST_I2C0_CTRL + 4
+        }
+        mmio.write32(I2C_ANA_MST_ANA_CONF1, ANA_SAR_ONLY)
+        wait_analog(master)
+        mmio.write32(master, SAR_ADC_BLOCK | (register << 8))
+        wait_analog(master)
+        old := (mmio.read32(master) >> 16) & 0xFF
+        width := msb - lsb + 1
+        mask := ((1u32 << width) - 1) << lsb
+        data := (old & ~mask) | ((value << lsb) & mask)
+        mmio.write32(I2C_ANA_MST_ANA_CONF1, ANA_SAR_ONLY)
+        mmio.write32(master, SAR_ADC_BLOCK | (register << 8) | (data << 16) | ANA_WRITE)
+        wait_analog(master)
+    }
+}
+
+// SAFETY: reads the analog bus master's status.
+unsafe fn wait_analog(master: usize) {
+    unsafe {
+        for _ in 0..ADC_POLLS {
+            if (mmio.read32(master) & ANA_BUSY) == 0 {
+                return
+            }
+        }
+    }
+}
+
+// Bits `first` to `first + width - 1` of the eFuse block at `block`.
+// SAFETY: reads eFuse words.
+unsafe fn efuse_bits(block: usize, first: u32, width: u32) -> u32 {
+    unsafe {
+        low := mmio.read32(block + 4 * (first / 32) as usize) as u64
+        high := mmio.read32(block + 4 * (first / 32 + 1) as usize) as u64
+        both := (high << 32) | low
+        return ((both >> (first % 32) as u64) & ((1u64 << width as u64) - 1)) as u32
+    }
+}
+
+// Power the converter and load its calibration from eFuse: the initial code
+// for the largest attenuation, which chips with calibration data carry.
+// The calibration from eFuse for the largest attenuation: the millivolts
+// at one reading, and that reading; 0 for chips without calibration data.
+static mut ADC_CAL_MV: u32 = 0
+static mut ADC_CAL_CODE: u32 = 0
+// The full scale readings are scaled to.
+const ADC_FULL_SCALE_MV: u32 = 3300
+
+// A sign-magnitude eFuse field of `width` bits.
+fn signed_field(value: u32, width: u32) -> i32 {
+    magnitude := (value & ((1u32 << (width - 1)) - 1)) as i32
+    if (value & (1u32 << (width - 1))) != 0 {
+        return -magnitude
+    }
+    return magnitude
+}
+
+// SAFETY: the caller owns the ADC.
+unsafe fn start_adc() {
+    unsafe {
+        // The converter's register clock (PCR_SARADC_CONF.SARADC_REG_CLK_EN)
+        // and its function clock (PCR_SARADC_CLKM_CONF.SARADC_CLKM_EN, the
+        // crystal undivided). PCR keeps its contents through the resets that
+        // flashing and the watchdogs cause, so earlier firmware may have
+        // stopped them.
+        mmio.write32(PCR_SARADC_CONF, mmio.read32(PCR_SARADC_CONF) | (1u32 << 2))
+        clocks := mmio.read32(PCR_SARADC_CLKM_CONF) & ~((3u32 << 20) | (0xFFu32 << 12))
+        mmio.write32(PCR_SARADC_CLKM_CONF, clocks | (1u32 << 22))
+        control := mmio.read32(SARADC_CTRL)
+        mmio.write32(SARADC_CTRL, control | SARADC_FORCED)
+        sar_write(2, 6, 4, 1)
+        code := 0u32
+        // Calibration scheme 1 (blocks of version 1) or 2 (later ones), as
+        // Espressif's drivers read them.
+        version := efuse_bits(EFUSE_BLOCK1, 123, 3)
+        if version >= 1 {
+            code = efuse_bits(EFUSE_BLOCK2, 175, 10) + 1600
+            point := 1500i32
+            ADC_CAL_MV = 1370
+            if version >= 2 {
+                point = 2850
+                ADC_CAL_MV = 2800
+            }
+            ADC_CAL_CODE = (point + signed_field(efuse_bits(EFUSE_BLOCK2, 215, 10), 10)) as u32
+        }
+        sar_write(0, 7, 0, code & 0xFF)
+        sar_write(1, 3, 0, code >> 8)
+    }
+}
+
+// A raw conversion of `channel`, calibrated and scaled to 0 at ground and
+// 4095 at ADC_FULL_SCALE_MV.
+fn calibrated(channel: u32, raw: u32) -> u16 {
+    // SAFETY: written once when the converter starts.
+    unsafe {
+        if ADC_CAL_CODE == 0 {
+            return raw as u16
+        }
+        offset := signed_field(efuse_bits(EFUSE_BLOCK2, 225 + 4 * channel, 4), 4)
+        basic := raw as i32 - offset
+        if basic < 0 {
+            basic = 0
+        }
+        millivolts := basic as u32 * ADC_CAL_MV / ADC_CAL_CODE
+        value := millivolts * 4095 / ADC_FULL_SCALE_MV
+        if value > 4095 {
+            value = 4095
+        }
+        return value as u16
+    }
+}
+
+// SAFETY: the caller owns the ADC and no longer uses it.
+unsafe fn stop_adc() {
+    unsafe {
+        control := mmio.read32(SARADC_CTRL)
+        mmio.write32(SARADC_CTRL, control & ~(3u32 << 27))
+    }
+}
+
+// An analog input, as `Pins.analog` or `Pins.temperature` hands it out.
+// Implements the std/embedded/hal analog input protocol. The inputs share
+// the converter, so each read converts inside a critical section, about
+// 50 us; inputs held by an interrupt handler and by the main program then
+// never mix up their conversions.
+pub struct Analog: hal.AnalogInput {
+    channel: u32
+
+    // 4095 for an ADC input, 255 for the temperature sensor.
+    pub fn max_value(&self) -> u16 {
+        if self.channel == TEMPERATURE_CHANNEL {
+            return 255
+        }
+        return 4095
+    }
+
+    // Convert once. Timeout if the converter does not finish.
+    pub fn read(&mut self) -> u16!hal.Error {
+        if self.channel == TEMPERATURE_CHANNEL {
+            // SAFETY: the input owns the sensor.
+            unsafe {
+                return ok((mmio.read32(TSENS_CTRL) & 0xFF) as u16)
+            }
+        }
+        section := hal.Critical.enter()
+        // SAFETY: the converter's one-shot registers, used only inside
+        // critical sections by the inputs.
+        result := unsafe {
+            sample := ONETIME_ADC1 | hal.encode(ONETIME_CHANNEL, self.channel) | hal.encode(ONETIME_ATTEN, ATTEN_12DB)
+            mmio.write32(SARADC_INT_CLR, ADC1_DONE)
+            mmio.write32(SARADC_ONETIME, sample)
+            ets_delay_us(5)
+            mmio.write32(SARADC_ONETIME, sample | ONETIME_START)
+            done := false
+            value := 0u16
+            for _ in 0..ADC_POLLS {
+                if (mmio.read32(SARADC_INT_RAW) & ADC1_DONE) != 0 {
+                    value = (mmio.read32(SARADC_DATA) & 0xFFF) as u16
+                    done = true
+                    break
+                }
+            }
+            mmio.write32(SARADC_INT_CLR, ADC1_DONE)
+            mmio.write32(SARADC_ONETIME, sample)
+            (done, value)
+        }
+        core.drop(section)
+        let (done, value) = result
+        if !done {
+            return err(hal.Error.Timeout)
+        }
+        return ok(calibrated(self.channel, value as u32))
+    }
+
+    // The GPIO, or TEMPERATURE_CHANNEL for the temperature sensor.
+    pub fn channel(&self) -> u32 {
+        return self.channel
+    }
+}
+
+// The temperature in thousandths of a degree Celsius that a reading of the
+// temperature sensor shows: 0.4386 C per step from 7.36 C, as Espressif's
+// drivers convert it. The sensor is accurate to a few degrees.
+pub fn millicelsius(value: u16) -> i32 {
+    return (value as i32 * 4386) / 10 + 7360
+}
+
+// --- Addressable LEDs: the remote control peripheral (RMT) ---------------
+
+const RMT_BASE: usize = 0x6000_6000
+const RMT_CH0_CONF0: usize = 0x10
+const RMT_INT_RAW: usize = 0x38
+const RMT_INT_CLR: usize = 0x44
+const RMT_SYS_CONF: usize = 0x68
+const RMT_RAM: usize = 0x6000_6400
+// CH0_TX_CONF0: start, reset the memory read pointers, idle output low and
+// driven, the clock divider (1), four memory blocks, carrier off, and latch.
+const RMT_START: u32 = 0b111
+const RMT_CONF: u32 = (1u32 << 6) | (1u32 << 8) | (4u32 << 16) | (1u32 << 20)
+const RMT_CONF_UPDATE: u32 = 1 << 24
+const RMT_DIRECT_MEMORY: u32 = 1 << 0
+const RMT_CLOCK_ON: u32 = 1u32 << 31
+const RMT_TX_END: u32 = 1 << 0
+const RMT_TX_ERROR: u32 = 1 << 4
+const RMT_CLEAR: u32 = 0x1111
+// Pulse codes at 80 MHz: a 0 bit is high for 0.4 us and low for 0.85 us, a
+// 1 bit high for 0.8 us and low for 0.45 us; 300 us low latches the colors.
+const WS2812_ZERO: u32 = 0x0044_8020
+const WS2812_ONE: u32 = 0x0024_8040
+const WS2812_LATCH: u32 = 24_000
+// Four memory blocks of 48 codes: 24 per LED, and the latch and the end.
+pub const WS2812_MAX_LEDS: usize = 7
+const RMT_POLLS: u32 = 1_000_000
+
+// WS2812 LEDs on one pin, as `Pins.ws2812` hands them out.
+pub struct Ws2812 {
+    pin: u32
+
+    // Show `colors`, one 0xRRGGBB value per LED along the chain, at most
+    // WS2812_MAX_LEDS, and wait until they are sent. InvalidInput for more;
+    // Timeout if the transmission does not end.
+    pub fn write(&mut self, colors: &[u32]) -> void!hal.Error {
+        if colors.len > WS2812_MAX_LEDS {
+            return err(hal.Error.InvalidInput)
+        }
+        // SAFETY: the driver owns channel 0 and its memory.
+        unsafe {
+            code := 0usize
+            for index in 0..colors.len {
+                rgb := colors[index]
+                // The LEDs take green, red, then blue, most significant bit
+                // first.
+                grb := ((rgb >> 8) & 0xFF00) | ((rgb << 8) & 0xFF_0000) | (rgb & 0xFF)
+                for bit in 0..24u32 {
+                    pulse := WS2812_ZERO
+                    if (grb & (0x80_0000u32 >> bit)) != 0 {
+                        pulse = WS2812_ONE
+                    }
+                    mmio.write32(RMT_RAM + 4 * code, pulse)
+                    code += 1
+                }
+            }
+            mmio.write32(RMT_RAM + 4 * code, WS2812_LATCH)
+            mmio.write32(RMT_RAM + 4 * (code + 1), 0)
+            mmio.write32(RMT_BASE + RMT_INT_CLR, RMT_CLEAR)
+            mmio.write32(RMT_BASE + RMT_CH0_CONF0, RMT_CONF | RMT_CONF_UPDATE)
+            mmio.write32(RMT_BASE + RMT_CH0_CONF0, RMT_CONF | RMT_START)
+            mmio.write32(RMT_BASE + RMT_CH0_CONF0, RMT_CONF | RMT_CONF_UPDATE)
+            for _ in 0..RMT_POLLS {
+                raw := mmio.read32(RMT_BASE + RMT_INT_RAW)
+                if (raw & RMT_TX_ERROR) != 0 {
+                    return err(hal.Error.Bus)
+                }
+                if (raw & RMT_TX_END) != 0 {
+                    return ok()
+                }
+            }
+        }
+        return err(hal.Error.Timeout)
+    }
+
+    pub fn pin(&self) -> u32 {
+        return self.pin
+    }
+}
+
+// --- DMA: the general DMA controller (GDMA), memory to memory ------------
+
+const GDMA_BASE: usize = 0x6008_0000
+const GDMA_IN_INT: usize = GDMA_BASE + 0x00
+const GDMA_OUT_INT: usize = GDMA_BASE + 0x30
+const GDMA_MISC_CONF: usize = GDMA_BASE + 0x64
+const GDMA_CHANNEL: usize = GDMA_BASE + 0x70
+const GDMA_STRIDE: usize = 0xC0
+// Per channel: receive (IN) configuration and link, transmit (OUT) the
+// same, and the peripheral each serves.
+const IN_CONF0: usize = 0x00
+const IN_CONF1: usize = 0x04
+const IN_LINK: usize = 0x10
+const IN_PERI_SEL: usize = 0x30
+const OUT_CONF0: usize = 0x60
+const OUT_CONF1: usize = 0x64
+const OUT_LINK: usize = 0x70
+const OUT_PERI_SEL: usize = 0x90
+const CHANNEL_RESET: u32 = 1 << 0
+const DESCRIPTOR_BURST: u32 = 1 << 2
+const MEMORY_TRANSFER: u32 = 1 << 4
+const OUT_EOF_MODE: u32 = 1 << 3
+const CHECK_OWNER: u32 = 1 << 12
+const LINK_ADDRESS: u32 = 0xF_FFFF
+const IN_LINK_STOP: u32 = 1 << 21
+const IN_LINK_START: u32 = 1 << 22
+const OUT_LINK_STOP: u32 = 1 << 20
+const OUT_LINK_START: u32 = 1 << 21
+// Interrupt registers, 0x10 apart per channel: raw, status, enable, clear.
+const IN_SUCCESS_EOF: u32 = 1 << 1
+const IN_DESCRIPTOR_ERROR: u32 = 1 << 3
+const OUT_DESCRIPTOR_ERROR: u32 = 1 << 2
+const OUT_TOTAL_EOF: u32 = 1 << 3
+const ALL_DMA_INTERRUPTS: u32 = 0x7F
+// The memory-to-memory peripheral number of each channel, and none.
+const MEMORY_PERIPHERAL: [3]u32 = [4u32, 5, 10]
+const NO_PERIPHERAL: u32 = 0x3F
+// GP-SPI2's DMA interface.
+const SPI2_DMA: u32 = 0
+pub const DMA_CHANNELS: u32 = 3
+// Descriptors: size, length, end of frame, and owned by the DMA; then the
+// buffer and the next descriptor. Each covers at most 4092 bytes.
+const DESCRIPTOR_OWNED: u32 = 1u32 << 31
+const DESCRIPTOR_EOF: u32 = 1 << 30
+const DESCRIPTOR_BYTES: usize = 4092
+const DESCRIPTORS: usize = 8
+// The most bytes one transfer moves.
+pub const DMA_MAX_BYTES: usize = DESCRIPTORS * DESCRIPTOR_BYTES
+
+// Per channel, eight transmit then eight receive descriptors of three
+// words, in SRAM where the controller reads them.
+static mut DMA_DESCRIPTORS: [144]u32 = [0u32; 144]
+// Per channel, a spare receive descriptor chained after the last one of a
+// peripheral transfer, and the word it points at: a peripheral marks the
+// end of its data (IN_SUC_EOF) only where a descriptor has room beyond it.
+static mut DMA_EOF_DESCRIPTORS: [9]u32 = [0u32; 9]
+static mut DMA_EOF_SINK: [3]u32 = [0u32; 3]
+// The transfer each channel runs: its byte count and element size, 0 when
+// idle.
+static mut DMA_BYTES: [3]u32 = [0u32; 3]
+static mut DMA_WIDTH: [3]u32 = [1u32; 3]
+// Signals to raise when a channel finishes: the signal's id plus one.
+static mut DMA_SIGNALS: [3]u32 = [0u32; 3]
+static mut DMA_CLAIMED: u32 = 0
+
+// The runtime's DMA_IN_CHn handlers call this weak symbol, which this
+// package defines: it acknowledges each finished channel and raises its
+// signal, if it has one.
+extern "C" fn dodo_dma_interrupt() {
+    // I2S streams first: their channels' interrupts are theirs.
+    esp_i2s.dma_interrupt()
+    // SAFETY: the write-one-to-clear interrupt bits of finished channels.
+    // DMA_SIGNALS changes only with interrupts masked.
+    unsafe {
+        for channel in 0..3usize {
+            status := mmio.read32(GDMA_IN_INT + 0x10 * channel + 4)
+            if (status & IN_SUCCESS_EOF) != 0 {
+                mmio.write32(GDMA_IN_INT + 0x10 * channel + 0xC, IN_SUCCESS_EOF)
+                if DMA_SIGNALS[channel] != 0 {
+                    signal := executor.Signal { id: DMA_SIGNALS[channel] - 1 }
+                    signal.raise()
+                }
+            }
+        }
+    }
+}
+
+// Stop every channel handed out, so none writes to memory any more. The
+// panic report calls it before it writes to the serial ports.
+// SAFETY: the caller must halt or reset afterwards.
+unsafe fn stop_dma() {
+    unsafe {
+        for channel in 0..3u32 {
+            if (DMA_CLAIMED & (1u32 << channel)) != 0 {
+                base := GDMA_CHANNEL + GDMA_STRIDE * channel as usize
+                mmio.write32(base + OUT_LINK, OUT_LINK_STOP)
+                mmio.write32(base + IN_LINK, IN_LINK_STOP)
+            }
+        }
+    }
+}
+
+// Whether `bytes` from `address` lie in the SRAM the DMA controller reaches.
+fn in_sram(address: usize, bytes: u64) -> bool {
+    start := address as u64
+    return start >= 0x4080_0000 && start + bytes <= 0x4088_0000
+}
+
+// Write channel `index`'s descriptors for `bytes` from `source` and to
+// `destination`, in parts of up to 4092 bytes; returns the address of the
+// first transmit descriptor, with the receive ones 96 bytes after it.
+// SAFETY: the caller owns the channel, which must be stopped.
+unsafe fn write_descriptors(index: usize, source: usize, destination: usize, bytes: usize) -> usize {
+    unsafe {
+        first := 48 * index
+        descriptors := ptr.as_mut_ptr(&mut DMA_DESCRIPTORS[first..first + 48]) as usize
+        count := (bytes + DESCRIPTOR_BYTES - 1) / DESCRIPTOR_BYTES
+        for part in 0..count {
+            start := part * DESCRIPTOR_BYTES
+            size := bytes - start
+            if size > DESCRIPTOR_BYTES {
+                size = DESCRIPTOR_BYTES
+            }
+            last := part + 1 == count
+            // Transmit: size and length, the end on the last.
+            out := first + 3 * part
+            word := (size as u32) | ((size as u32) << 12) | DESCRIPTOR_OWNED
+            if last {
+                word |= DESCRIPTOR_EOF
+            }
+            DMA_DESCRIPTORS[out] = word
+            DMA_DESCRIPTORS[out + 1] = (source + start) as u32
+            DMA_DESCRIPTORS[out + 2] = 0
+            if !last {
+                DMA_DESCRIPTORS[out + 2] = (descriptors + 12 * (part + 1)) as u32
+            }
+            // Receive: the buffer's size; the controller fills in the
+            // length.
+            into := first + 24 + 3 * part
+            DMA_DESCRIPTORS[into] = (size as u32) | DESCRIPTOR_OWNED
+            DMA_DESCRIPTORS[into + 1] = (destination + start) as u32
+            DMA_DESCRIPTORS[into + 2] = 0
+            if !last {
+                DMA_DESCRIPTORS[into + 2] = (descriptors + 96 + 12 * (part + 1)) as u32
+            }
+        }
+        return descriptors
+    }
+}
+
+// Set a channel up for copies between buffers, as `Dma.claim` hands it
+// out; a peripheral that streamed through it, such as I2S, puts it back so.
+fn dma_memory_mode(channel: &DmaChannel) {
+    number := channel.number
+    // SAFETY: the channel's own registers.
+    unsafe {
+        base := GDMA_CHANNEL + GDMA_STRIDE * number as usize
+        mmio.write32(base + IN_CONF0, MEMORY_TRANSFER | DESCRIPTOR_BURST)
+        mmio.write32(base + IN_CONF1, CHECK_OWNER)
+        mmio.write32(base + OUT_CONF0, OUT_EOF_MODE | DESCRIPTOR_BURST)
+        mmio.write32(base + OUT_CONF1, CHECK_OWNER)
+        mmio.write32(base + IN_PERI_SEL, MEMORY_PERIPHERAL[number as usize])
+        mmio.write32(base + OUT_PERI_SEL, MEMORY_PERIPHERAL[number as usize])
+    }
+}
+
+// The DMA controller's three channels, handed out once each, as
+// `Peripherals.dma`.
+pub struct Dma {
+    channels: u32
+
+    // Claim a free channel. Busy if all three are taken.
+    pub fn channel(&mut self) -> DmaChannel!hal.Error {
+        for number in 0..DMA_CHANNELS {
+            if (self.channels & (1u32 << number)) == 0 {
+                return self.claim(number)
+            }
+        }
+        return err(hal.Error.Busy)
+    }
+
+    // Claim channel `number`, 0 to 2. Busy if taken, InvalidInput for
+    // another number.
+    pub fn claim(&mut self, number: u32) -> DmaChannel!hal.Error {
+        if number >= DMA_CHANNELS {
+            return err(hal.Error.InvalidInput)
+        }
+        bit := 1u32 << number
+        if (self.channels & bit) != 0 {
+            return err(hal.Error.Busy)
+        }
+        // SAFETY: the claim makes this the channel's only owner; the first
+        // claim starts the controller.
+        unsafe {
+            if self.channels == 0 {
+                start_peripheral(PCR_GDMA_CONF)
+                mmio.write32(GDMA_MISC_CONF, 1)
+                mmio.write32(GDMA_MISC_CONF, 1u32 << 3)
+            }
+            section := hal.Critical.enter()
+            DMA_CLAIMED |= bit
+            DMA_BYTES[number as usize] = 0
+            core.drop(section)
+        }
+        channel := DmaChannel { number }
+        dma_memory_mode(&channel)
+        self.channels |= bit
+        return ok(channel)
+    }
+
+    pub fn is_claimed(&self, number: u32) -> bool {
+        return number < DMA_CHANNELS && (self.channels & (1u32 << number)) != 0
+    }
+
+    // Stop a channel's transfer and take it back.
+    pub fn release(&mut self, channel: DmaChannel) {
+        channel.abort()
+        channel.clear_signal()
+        number := channel.number
+        // SAFETY: the channel was claimed.
+        unsafe {
+            section := hal.Critical.enter()
+            DMA_CLAIMED &= ~(1u32 << number)
+            core.drop(section)
+        }
+        self.channels &= ~(1u32 << number)
+        if self.channels == 0 {
+            // SAFETY: no channel is in use.
+            unsafe {
+                stop_peripheral(PCR_GDMA_CONF)
+            }
+        }
+    }
+}
+
+// One DMA channel, as `Dma.channel` hands it out. Implements
+// hal.DmaChannel for copies between buffers in SRAM: the ESP32-C6's DMA
+// serves peripherals through their own DMA interfaces, not through
+// register addresses, so transfers paced by a peripheral are InvalidInput.
+// Chip drivers that use a peripheral's DMA interface take a channel
+// instead, as `Spi.dma` does.
+pub struct DmaChannel: hal.DmaChannel {
+    number: u32
+
+    // Start moving `bytes` from `source` to the peripheral with DMA
+    // interface `peripheral` (the PERI_SEL numbering: 0 for GP-SPI2) and,
+    // with `receive`, as many from it to `destination`, as the peripheral
+    // asks for them. InvalidInput for 0 bytes, more than DMA_MAX_BYTES, or
+    // a buffer outside SRAM; Busy while a copy runs.
+    // SAFETY: as for start, until `abort`; the peripheral must be set up to
+    // move exactly `bytes`.
+    unsafe fn start_peripheral(&mut self, peripheral: u32, source: usize, destination: usize, bytes: usize, receive: bool) -> void!hal.Error {
+        if bytes == 0 || bytes > DMA_MAX_BYTES || !in_sram(source, bytes as u64) || (receive && !in_sram(destination, bytes as u64)) {
+            return err(hal.Error.InvalidInput)
+        }
+        if self.is_busy() {
+            return err(hal.Error.Busy)
+        }
+        index := self.number as usize
+        // SAFETY: the channel's own descriptors and registers; the caller
+        // keeps the buffers valid.
+        unsafe {
+            descriptors := write_descriptors(index, source, destination, bytes)
+            if receive {
+                spare := 3 * index
+                DMA_EOF_DESCRIPTORS[spare] = 4 | DESCRIPTOR_OWNED
+                DMA_EOF_DESCRIPTORS[spare + 1] = ptr.as_mut_ptr(&mut DMA_EOF_SINK[index..index + 1]) as u32
+                DMA_EOF_DESCRIPTORS[spare + 2] = 0
+                last := 48 * index + 24 + 3 * ((bytes - 1) / DESCRIPTOR_BYTES)
+                DMA_DESCRIPTORS[last + 2] = ptr.as_mut_ptr(&mut DMA_EOF_DESCRIPTORS[spare..spare + 3]) as u32
+            }
+            DMA_BYTES[index] = 0
+            cpu.fence()
+            base := GDMA_CHANNEL + GDMA_STRIDE * index
+            interrupts := 0x10 * index
+            mmio.write32(GDMA_IN_INT + interrupts + 0xC, ALL_DMA_INTERRUPTS)
+            mmio.write32(GDMA_OUT_INT + interrupts + 0xC, ALL_DMA_INTERRUPTS)
+            mmio.write32(base + IN_CONF0, DESCRIPTOR_BURST | CHANNEL_RESET)
+            mmio.write32(base + IN_CONF0, DESCRIPTOR_BURST)
+            mmio.write32(base + OUT_CONF0, OUT_EOF_MODE | DESCRIPTOR_BURST | CHANNEL_RESET)
+            mmio.write32(base + OUT_CONF0, OUT_EOF_MODE | DESCRIPTOR_BURST)
+            mmio.write32(base + OUT_PERI_SEL, peripheral)
+            if receive {
+                mmio.write32(base + IN_PERI_SEL, peripheral)
+                mmio.write32(base + IN_LINK, (((descriptors + 96) as u32) & LINK_ADDRESS) | IN_LINK_START)
+            } else {
+                mmio.write32(base + IN_PERI_SEL, NO_PERIPHERAL)
+            }
+            mmio.write32(base + OUT_LINK, ((descriptors as u32) & LINK_ADDRESS) | OUT_LINK_START)
+        }
+        return ok()
+    }
+
+    // True once a peripheral transfer of `bytes` that receives has stored
+    // all it received: the peripheral marked its end (IN_SUC_EOF), or the
+    // channel has handed back the last receive descriptor, full.
+    fn received(&mut self, bytes: usize) -> bool {
+        if self.finished() {
+            return true
+        }
+        last := 48 * self.number as usize + 24 + 3 * ((bytes - 1) / DESCRIPTOR_BYTES)
+        // SAFETY: reads a descriptor the channel writes back.
+        unsafe {
+            cpu.fence()
+            word := ptr.read_volatile(ptr.as_ptr(&DMA_DESCRIPTORS[last..last + 1]))
+            return (word & DESCRIPTOR_OWNED) == 0
+        }
+    }
+
+    pub fn number(&self) -> u32 {
+        return self.number
+    }
+
+    // The interrupt source a finished transfer raises with `listen`,
+    // DMA_IN_CH0 + n.
+    pub fn irq(&self) -> u32 {
+        return DMA_IN_CH0 + self.number
+    }
+
+    // Start copying `transfer.count` elements from `source` to
+    // `destination`, both incrementing and both in SRAM; the controller
+    // cannot read flash. InvalidInput for a paced or wrapping transfer, one
+    // that does not increment both addresses, an empty one, more than
+    // DMA_MAX_BYTES, or a buffer outside SRAM, such as a constant; Busy
+    // while one runs.
+    // SAFETY: as hal.DmaChannel.start requires.
+    pub unsafe fn start(&mut self, transfer: hal.DmaTransfer) -> void!hal.Error {
+        width := 1u32
+        match &transfer.width {
+            hal.DmaWidth.Byte => {}
+            hal.DmaWidth.HalfWord => {
+                width = 2
+            }
+            hal.DmaWidth.Word => {
+                width = 4
+            }
+        }
+        paced := false
+        match &transfer.pace {
+            hal.DmaPace.Unpaced => {}
+            _ => {
+                paced = true
+            }
+        }
+        wraps := false
+        match &transfer.ring {
+            hal.DmaRing.None => {}
+            _ => {
+                wraps = true
+            }
+        }
+        total := transfer.count as u64 * width as u64
+        if paced || wraps || !transfer.increment_source || !transfer.increment_destination || transfer.count == 0 || total > DMA_MAX_BYTES as u64 || !in_sram(transfer.source, total) || !in_sram(transfer.destination, total) {
+            return err(hal.Error.InvalidInput)
+        }
+        if self.is_busy() {
+            return err(hal.Error.Busy)
+        }
+        bytes := total as usize
+        index := self.number as usize
+        // SAFETY: the channel's own descriptors and registers; the caller
+        // keeps the buffers valid.
+        unsafe {
+            descriptors := write_descriptors(index, transfer.source, transfer.destination, bytes)
+            DMA_BYTES[index] = bytes as u32
+            DMA_WIDTH[index] = width
+            cpu.fence()
+            base := GDMA_CHANNEL + GDMA_STRIDE * index
+            interrupts := 0x10 * index
+            mmio.write32(GDMA_IN_INT + interrupts + 0xC, ALL_DMA_INTERRUPTS)
+            mmio.write32(GDMA_OUT_INT + interrupts + 0xC, ALL_DMA_INTERRUPTS)
+            // Memory to memory, which a peripheral transfer changed.
+            mmio.write32(base + IN_CONF0, MEMORY_TRANSFER | DESCRIPTOR_BURST)
+            mmio.write32(base + OUT_CONF0, OUT_EOF_MODE | DESCRIPTOR_BURST)
+            mmio.write32(base + IN_PERI_SEL, MEMORY_PERIPHERAL[index])
+            mmio.write32(base + OUT_PERI_SEL, MEMORY_PERIPHERAL[index])
+            conf := mmio.read32(base + IN_CONF0)
+            mmio.write32(base + IN_CONF0, conf | CHANNEL_RESET)
+            mmio.write32(base + IN_CONF0, conf)
+            conf = mmio.read32(base + OUT_CONF0)
+            mmio.write32(base + OUT_CONF0, conf | CHANNEL_RESET)
+            mmio.write32(base + OUT_CONF0, conf)
+            mmio.write32(base + IN_LINK, (((descriptors + 96) as u32) & LINK_ADDRESS) | IN_LINK_START)
+            mmio.write32(base + OUT_LINK, ((descriptors as u32) & LINK_ADDRESS) | OUT_LINK_START)
+        }
+        return ok()
+    }
+
+    // True while a transfer is running.
+    pub fn is_busy(&mut self) -> bool {
+        index := self.number as usize
+        // SAFETY: reads the channel's state and interrupt bits.
+        unsafe {
+            if DMA_BYTES[index] == 0 {
+                return false
+            }
+            raw := mmio.read32(GDMA_IN_INT + 0x10 * index)
+            out := mmio.read32(GDMA_OUT_INT + 0x10 * index)
+            if (raw & (IN_SUCCESS_EOF | IN_DESCRIPTOR_ERROR)) != 0 || (out & OUT_DESCRIPTOR_ERROR) != 0 {
+                return false
+            }
+            return true
+        }
+    }
+
+    // The elements the running transfer has yet to write: 0 once it is
+    // done. The controller reports progress per descriptor, 4092 bytes.
+    pub fn remaining(&mut self) -> u32 {
+        if !self.is_busy() {
+            return 0
+        }
+        index := self.number as usize
+        left := 0u32
+        // SAFETY: reads the channel's receive descriptors, which the
+        // controller updates.
+        unsafe {
+            cpu.fence()
+            count := (DMA_BYTES[index] as usize + DESCRIPTOR_BYTES - 1) / DESCRIPTOR_BYTES
+            for part in 0..count {
+                word := ptr.read_volatile(ptr.as_ptr(&DMA_DESCRIPTORS[48 * index + 24 + 3 * part..48 * index + 25 + 3 * part]))
+                if (word & DESCRIPTOR_OWNED) != 0 {
+                    left += word & 0xFFF
+                }
+            }
+            return left / DMA_WIDTH[index]
+        }
+    }
+
+    // The largest count a transfer of bytes may have, DMA_MAX_BYTES; one of
+    // halfwords or words moves the same number of bytes.
+    pub fn max_count(&mut self) -> u32 {
+        return DMA_MAX_BYTES as u32
+    }
+
+    // Stop the running transfer, if any.
+    pub fn abort(&mut self) {
+        index := self.number as usize
+        // SAFETY: the channel's own registers.
+        unsafe {
+            base := GDMA_CHANNEL + GDMA_STRIDE * index
+            mmio.write32(base + OUT_LINK, OUT_LINK_STOP)
+            mmio.write32(base + IN_LINK, IN_LINK_STOP)
+            conf := mmio.read32(base + IN_CONF0)
+            mmio.write32(base + IN_CONF0, conf | CHANNEL_RESET)
+            mmio.write32(base + IN_CONF0, conf)
+            conf = mmio.read32(base + OUT_CONF0)
+            mmio.write32(base + OUT_CONF0, conf | CHANNEL_RESET)
+            mmio.write32(base + OUT_CONF0, conf)
+            DMA_BYTES[index] = 0
+        }
+    }
+
+    // Bus if a transfer since the last call met a descriptor error.
+    pub fn take_error(&mut self) -> void!hal.Error {
+        index := self.number as usize
+        // SAFETY: reads and clears the channel's error bits.
+        unsafe {
+            raw := mmio.read32(GDMA_IN_INT + 0x10 * index)
+            out := mmio.read32(GDMA_OUT_INT + 0x10 * index)
+            if (raw & IN_DESCRIPTOR_ERROR) != 0 || (out & OUT_DESCRIPTOR_ERROR) != 0 {
+                mmio.write32(GDMA_IN_INT + 0x10 * index + 0xC, IN_DESCRIPTOR_ERROR)
+                mmio.write32(GDMA_OUT_INT + 0x10 * index + 0xC, OUT_DESCRIPTOR_ERROR)
+                return err(hal.Error.Bus)
+            }
+        }
+        return ok()
+    }
+
+    // Raise `signal` whenever a transfer on this channel finishes, from
+    // the runtime's DMA interrupt handler, so a task waits for it. Routes
+    // the channel's interrupt.
+    pub fn set_signal(&mut self, signal: &executor.Signal) {
+        section := hal.Critical.enter()
+        // SAFETY: interrupts are masked, which excludes the handler, and
+        // the slot is this channel's.
+        unsafe {
+            DMA_SIGNALS[self.number as usize] = signal.id + 1
+        }
+        self.listen()
+        core.drop(section)
+        enable(self.irq())
+    }
+
+    // Stop raising the signal and the channel's interrupt.
+    pub fn clear_signal(&mut self) {
+        section := hal.Critical.enter()
+        self.ignore()
+        // SAFETY: as in set_signal.
+        unsafe {
+            DMA_SIGNALS[self.number as usize] = 0
+        }
+        core.drop(section)
+    }
+
+    // With `listen`, a finished transfer raises DMA_IN_CH0 + n.
+    pub fn listen(&mut self) {
+        // SAFETY: the channel's own enable register.
+        unsafe {
+            mmio.write32(GDMA_IN_INT + 0x10 * self.number as usize + 8, IN_SUCCESS_EOF)
+        }
+    }
+
+    pub fn ignore(&mut self) {
+        // SAFETY: as in listen.
+        unsafe {
+            mmio.write32(GDMA_IN_INT + 0x10 * self.number as usize + 8, 0)
+        }
+    }
+
+    // True once a transfer has finished, until `clear`.
+    pub fn finished(&mut self) -> bool {
+        // SAFETY: reads the channel's raw interrupt bits.
+        unsafe {
+            return (mmio.read32(GDMA_IN_INT + 0x10 * self.number as usize) & IN_SUCCESS_EOF) != 0
+        }
+    }
+
+    pub fn clear(&mut self) {
+        // SAFETY: write-one-to-clear of the channel's bit.
+        unsafe {
+            mmio.write32(GDMA_IN_INT + 0x10 * self.number as usize + 0xC, IN_SUCCESS_EOF)
+        }
+    }
+
+    // Copy `source` into `destination`, which must have the same length,
+    // and wait until it is done. InvalidInput for different lengths, more
+    // than DMA_MAX_BYTES, or a buffer outside SRAM; Bus on a descriptor
+    // error.
+    pub fn copy(&mut self, destination: &mut[u8], source: &[u8]) -> void!hal.Error {
+        if destination.len != source.len {
+            return err(hal.Error.InvalidInput)
+        }
+        if source.len == 0 {
+            return ok()
+        }
+        transfer := hal.DmaTransfer {
+            source: hal.address_of(source),
+            destination: hal.address_of(destination),
+            count: source.len as u32,
+            width: hal.DmaWidth.Byte,
+            increment_source: true,
+            increment_destination: true,
+            pace: hal.DmaPace.Unpaced,
+            ring: hal.DmaRing.None,
+        }
+        // SAFETY: both buffers stay borrowed until the copy is done, as
+        // this waits for it, and the fences order the processor's own
+        // accesses around the channel's.
+        unsafe {
+            cpu.fence()
+            self.start(transfer)?
+        }
+        for self.is_busy() {}
+        cpu.fence()
+        result := self.take_error()
+        // SAFETY: the transfer is over.
+        unsafe {
+            DMA_BYTES[self.number as usize] = 0
+        }
+        return result
+    }
+}
+
+// --- Bus targets and SPI by DMA ------------------------------------------
+
+// An I2C target (slave), as `Pins.i2c_target` hands it out. Implements
+// hal.I2cTarget; esp_i2c documents the methods.
+pub struct I2cTarget: hal.I2cTarget {
+    target: esp_i2c.Target<hal.RegisterBlock>
+    sda: u32
+    scl: u32
+
+    // What the master did since the last poll, without waiting.
+    pub fn poll(&mut self, buffer: &mut[u8]) -> hal.I2cTargetEvent!hal.Error {
+        return self.target.poll(buffer)
+    }
+
+    // Answer a Read with `bytes`, up to 32; returns how many.
+    pub fn respond(&mut self, bytes: &[u8]) -> usize!hal.Error {
+        return self.target.respond(bytes)
+    }
+
+    // Answer at another address from the next transaction on.
+    pub fn set_address(&mut self, address: u16, ten_bit: bool) -> void!hal.Error {
+        return self.target.set_address(address, ten_bit)
+    }
+
+    // The interrupt source of the controller, I2C_EXT0.
+    pub fn irq(&self) -> u32 {
+        return I2C_EXT0
+    }
+}
+
+// An SPI target (slave), as `Pins.spi_target` hands it out. Implements
+// hal.SpiTarget; esp_spi documents the methods.
+pub struct SpiTarget: hal.SpiTarget {
+    target: esp_spi.Target<hal.RegisterBlock>
+    clock: u32
+    tx: u32
+    rx: u32
+    select: u32
+
+    // Queue bytes for the master's next transactions, up to 64, without
+    // waiting; returns how many.
+    pub fn queue(&mut self, bytes: &[u8]) -> usize!hal.Error {
+        return self.target.queue(bytes)
+    }
+
+    // What the master sent in finished transactions, without waiting.
+    pub fn read(&mut self, buffer: &mut[u8]) -> usize!hal.Error {
+        return self.target.read(buffer)
+    }
+
+    // The bytes queued and not yet sent.
+    pub fn unsent(&self) -> usize {
+        return self.target.unsent()
+    }
+
+    // The interrupt source of the controller, SPI2.
+    pub fn irq(&self) -> u32 {
+        return SPI2
+    }
+}
+
+// An SPI bus master that moves bytes between a buffer it holds and the bus
+// by DMA, from `Spi.dma(channel, buffer)`. A transfer of up to
+// DMA_MAX_BYTES (32_736) runs as one run of the controller, without gaps
+// between bytes and with a hardware chip select low throughout, while the
+// program does other work:
+//
+//     dma := spi.dma(&mut channel, &mut buffer)!
+//     // fill dma.buffer()!, then:
+//     dma.start_transfer(count)!
+//     // ... other work, or return Pending from a task ...
+//     if dma.poll_finish()! { ... read dma.buffer()! ... }
+//
+// The bus holds the controller, the channel, and the buffer until it is
+// dropped, and lends the buffer out only between transfers, so the program
+// never touches memory the channel is moving. The channel's signal
+// (DmaChannel.set_signal) is raised once a `start_transfer`'s last byte is
+// in memory; a `start_write` raises none, as it receives nothing. Dropping
+// the bus aborts a running transfer; the device then saw only part of it.
+// Implements hal.SpiDma.
+pub struct SpiDmaBus: hal.SpiDma {
+    bus: &mut esp_spi.Controller<hal.RegisterBlock>
+    channel: &mut DmaChannel
+    buffer: &mut[u8]
+    // A transfer started and not yet finished, whether it receives, and
+    // its length.
+    running: bool
+    receiving: bool
+    count: usize
+
+    // The buffer, to fill before a transfer or read after one. Busy from
+    // `start_transfer` or `start_write` until it is finished.
+    pub fn buffer(&mut self) -> &mut[u8]!hal.Error from(self) {
+        if self.running {
+            return err(hal.Error.Busy)
+        }
+        return ok(&mut self.buffer[..])
+    }
+
+    // The buffer's length, the most a transfer moves.
+    pub fn capacity(&self) -> usize {
+        return self.buffer.len
+    }
+
+    // Start sending buffer[..count] and replacing each byte with the one
+    // received at the same time, and return at once. InvalidInput for 0,
+    // more than the buffer holds, or more than DMA_MAX_BYTES; Busy until
+    // the last transfer is finished.
+    pub fn start_transfer(&mut self, count: usize) -> void!hal.Error {
+        return self.begin(count, true)
+    }
+
+    // Start sending buffer[..count] and discard what arrives, as for
+    // `start_transfer`; the buffer stays as it is.
+    pub fn start_write(&mut self, count: usize) -> void!hal.Error {
+        return self.begin(count, false)
+    }
+
+    // True while a transfer runs: until the last byte has been sent and,
+    // for `start_transfer`, the last byte received is in memory.
+    pub fn is_busy(&mut self) -> bool {
+        return self.running && !self.done()
+    }
+
+    // Wait until the running transfer is done, if one is, and end it, so
+    // the buffer is free again. Overrun if the channel delivered data too
+    // slowly for the clock, so bytes were lost, which only very fast
+    // clocks with other DMA traffic cause; Bus if the channel hit a
+    // descriptor error. Either way the transfer is over.
+    pub fn finish(&mut self) -> void!hal.Error {
+        for !self.poll_finish()? {}
+        return ok()
+    }
+
+    // Without waiting: true once no transfer runs, ending a transfer that
+    // is done, false while one runs. Errors as for `finish`.
+    pub fn poll_finish(&mut self) -> bool!hal.Error {
+        if !self.running {
+            return ok(true)
+        }
+        if !self.done() {
+            return ok(false)
+        }
+        self.end()?
+        return ok(true)
+    }
+
+    // Stop a running transfer; the device saw only part of it.
+    pub fn abort(&mut self) {
+        if self.running {
+            self.running = false
+            match self.bus.end_dma() {
+                ok() => {}
+                err(_) => {}
+            }
+            self.channel.abort()
+            match self.channel.take_error() {
+                ok() => {}
+                err(_) => {}
+            }
+            cpu.fence()
+        }
+    }
+
+    // `start_transfer`, then `finish`.
+    pub fn transfer(&mut self, count: usize) -> void!hal.Error {
+        self.start_transfer(count)?
+        return self.finish()
+    }
+
+    // `start_write`, then `finish`.
+    pub fn write(&mut self, count: usize) -> void!hal.Error {
+        self.start_write(count)?
+        return self.finish()
+    }
+
+    fn begin(&mut self, count: usize, receive: bool) -> void!hal.Error {
+        if self.running {
+            return err(hal.Error.Busy)
+        }
+        if count == 0 || count > self.buffer.len || count > DMA_MAX_BYTES {
+            return err(hal.Error.InvalidInput)
+        }
+        self.bus.prepare_dma(count, receive)?
+        address := hal.address_of(self.buffer)
+        // The fence makes the buffer's contents visible to the channel.
+        // SAFETY: the buffer stays borrowed by this bus, which lends it out
+        // again only once the channel is done or aborted.
+        cpu.fence()
+        unsafe {
+            match self.channel.start_peripheral(SPI2_DMA, address, address, count, receive) {
+                ok() => {}
+                err(error) => {
+                    match self.bus.end_dma() {
+                        ok() => {}
+                        err(_) => {}
+                    }
+                    return err(error)
+                }
+            }
+        }
+        self.bus.start_dma()
+        self.running = true
+        self.receiving = receive
+        self.count = count
+        return ok()
+    }
+
+    fn done(&mut self) -> bool {
+        if !self.bus.dma_done() {
+            return false
+        }
+        return !self.receiving || self.channel.received(self.count)
+    }
+
+    // End a transfer that is done.
+    fn end(&mut self) -> void!hal.Error {
+        self.running = false
+        cpu.fence()
+        late := false
+        match self.bus.end_dma() {
+            ok() => {}
+            err(_) => {
+                late = true
+            }
+        }
+        channel := self.channel.take_error()
+        self.channel.abort()
+        channel?
+        if late {
+            return err(hal.Error.Overrun)
+        }
+        return ok()
+    }
+
+    fn drop(&mut self) {
+        self.abort()
+    }
+}
+
+// --- CAN (TWAI), I2S, and PWM input --------------------------------------
+
+// A CAN controller, as `Pins.can` hands it out: TWAI0 or TWAI1. Implements
+// the std/embedded/hal CAN protocol; esp_twai documents the methods.
+pub struct Can: hal.Can {
+    can: esp_twai.Controller<hal.RegisterBlock>
+    number: u32
+    tx: u32
+    rx: u32
+
+    pub fn poll_send(&mut self, frame: &hal.CanFrame) -> bool!hal.Error {
+        return self.can.poll_send(frame)
+    }
+
+    pub fn poll_receive(&mut self, frame: &mut hal.CanFrame) -> bool!hal.Error {
+        return self.can.poll_receive(frame)
+    }
+
+    pub fn error_state(&mut self) -> hal.CanErrorState!hal.Error {
+        return self.can.error_state()
+    }
+
+    // Switch modes, keeping the bit timing and filters; frames waiting in
+    // either direction are dropped.
+    pub fn set_mode(&mut self, mode: esp_twai.Mode) {
+        self.can.set_mode(mode)
+    }
+
+    // The transmit and receive error counters.
+    pub fn tec(&mut self) -> u32 {
+        return self.can.tec()
+    }
+
+    pub fn rec(&mut self) -> u32 {
+        return self.can.rec()
+    }
+
+    // The status register, for the bits error_state does not report.
+    pub fn status(&mut self) -> u32 {
+        return self.can.status()
+    }
+
+    // The frames waiting in the receive FIFO, with lost frames' places.
+    pub fn waiting(&mut self) -> u32 {
+        return self.can.waiting()
+    }
+
+    // Whether a frame waits in the transmit buffer.
+    pub fn is_pending(&mut self) -> bool {
+        return self.can.is_pending()
+    }
+
+    // The last bus error captured (ERR_CODE_CAP).
+    pub fn error_code(&mut self) -> u32 {
+        return self.can.error_code()
+    }
+
+    // Cancel the frame waiting to be sent.
+    pub fn abort_pending(&mut self) -> void!hal.Error {
+        return self.can.abort_pending()
+    }
+
+    // Start bus-off recovery, for Config.automatic_recovery off.
+    pub fn recover(&mut self) {
+        self.can.recover()
+    }
+
+    // Raise TWAI0 or TWAI1 (see `irq`) while any of `sources`
+    // (esp_twai.RECEIVE, ...) is pending, and read and clear them.
+    pub fn listen(&mut self, sources: u32) {
+        self.can.listen(sources)
+    }
+
+    pub fn take_interrupts(&mut self) -> u32 {
+        return self.can.take_interrupts()
+    }
+
+    // The controller: 0 for TWAI0, 1 for TWAI1.
+    pub fn number(&self) -> u32 {
+        return self.number
+    }
+
+    // The interrupt source, TWAI0 + number.
+    pub fn irq(&self) -> u32 {
+        return TWAI0 + self.number
+    }
+
+    pub fn tx_pin(&self) -> u32 {
+        return self.tx
+    }
+
+    pub fn rx_pin(&self) -> u32 {
+        return self.rx
+    }
+}
+
+// An I2S output, as `Pins.i2s_output` hands it out. Implements the
+// std/embedded/hal I2S output protocol; esp_i2s documents the methods.
+pub struct I2sOutput: hal.I2sOutput {
+    stream: esp_i2s.Output
+    dma: DmaChannel
+    data: u32
+    bclk: u32
+    ws: u32
+
+    pub fn sample_rate(&self) -> u32 {
+        return self.stream.sample_rate()
+    }
+
+    pub fn channels(&self) -> u32 {
+        return self.stream.channels()
+    }
+
+    pub fn poll_write(&mut self, samples: &[i32]) -> usize!hal.Error {
+        return self.stream.poll_write(samples)
+    }
+
+    pub fn bits(&self) -> u32 {
+        return self.stream.bits()
+    }
+
+    pub fn slot_bits(&self) -> u32 {
+        return self.stream.slot_bits()
+    }
+
+    // The clock dividers and the sample rate they give.
+    pub fn timing(&self) -> esp_i2s.Timing {
+        return self.stream.timing()
+    }
+
+    // The frames queued and not yet playing.
+    pub fn queued(&self) -> u32 {
+        return self.stream.queued()
+    }
+
+    // The frames played since the output started, silence included, a
+    // descriptor at a time.
+    pub fn frames_played(&self) -> u64 {
+        return self.stream.frames_played()
+    }
+
+    pub fn frames_per_descriptor(&self) -> u32 {
+        return self.stream.frames_per_descriptor()
+    }
+
+    // The DMA channel the output streams through.
+    pub fn dma_channel(&self) -> u32 {
+        return self.dma.number
+    }
+
+    pub fn data_pin(&self) -> u32 {
+        return self.data
+    }
+
+    pub fn bclk_pin(&self) -> u32 {
+        return self.bclk
+    }
+
+    pub fn ws_pin(&self) -> u32 {
+        return self.ws
+    }
+}
+
+// An I2S input, as `Pins.i2s_input` hands it out. Implements the
+// std/embedded/hal I2S input protocol; esp_i2s documents the methods.
+pub struct I2sInput: hal.I2sInput {
+    stream: esp_i2s.Input
+    dma: DmaChannel
+    data: u32
+    bclk: u32
+    ws: u32
+    // The pins it claimed: all three, or only data when shared.
+    pins: u32
+
+    pub fn sample_rate(&self) -> u32 {
+        return self.stream.sample_rate()
+    }
+
+    pub fn channels(&self) -> u32 {
+        return self.stream.channels()
+    }
+
+    pub fn poll_read(&mut self, samples: &mut[i32]) -> usize!hal.Error {
+        return self.stream.poll_read(samples)
+    }
+
+    pub fn bits(&self) -> u32 {
+        return self.stream.bits()
+    }
+
+    pub fn slot_bits(&self) -> u32 {
+        return self.stream.slot_bits()
+    }
+
+    pub fn timing(&self) -> esp_i2s.Timing {
+        return self.stream.timing()
+    }
+
+    // Whether the input runs on the output's clocks.
+    pub fn is_shared(&self) -> bool {
+        return self.stream.is_shared()
+    }
+
+    // The frames received and not yet read.
+    pub fn available(&mut self) -> u32 {
+        return self.stream.available()
+    }
+
+    // The frames received since the input started, a descriptor at a time.
+    pub fn frames_received(&mut self) -> u64 {
+        return self.stream.frames_received()
+    }
+
+    pub fn frames_per_descriptor(&self) -> u32 {
+        return self.stream.frames_per_descriptor()
+    }
+
+    pub fn dma_channel(&self) -> u32 {
+        return self.dma.number
+    }
+
+    pub fn data_pin(&self) -> u32 {
+        return self.data
+    }
+
+    pub fn bclk_pin(&self) -> u32 {
+        return self.bclk
+    }
+
+    pub fn ws_pin(&self) -> u32 {
+        return self.ws
+    }
+}
+
+// --- Low power -------------------------------------------------------------
+
+// Clock gates for `Power`, as std/embedded/power.Clocks: one bit per enable
+// in the system clock controller (PCR), numbered in register order (see
+// std/embedded/chip/esp_power). Each peripheral's constant holds every
+// clock it uses: its bus (APB) clock and, where it has them, its function
+// clocks.
+pub const CLOCK_UART0: power.Clocks = (1 << 0) | (1 << 1)
+pub const CLOCK_UART1: power.Clocks = (1 << 2) | (1 << 3)
+// The flash and PSRAM controller, which the program runs from.
+pub const CLOCK_MSPI: power.Clocks = 1 << 4
+pub const CLOCK_I2C0: power.Clocks = (1 << 5) | (1 << 6)
+pub const CLOCK_UHCI: power.Clocks = 1 << 7
+pub const CLOCK_RMT: power.Clocks = (1 << 8) | (1 << 9)
+pub const CLOCK_LEDC: power.Clocks = (1 << 10) | (1 << 11)
+// Timer groups 0 and 1: registers, timer, and watchdog clocks.
+pub const CLOCK_TIMG0: power.Clocks = (1 << 12) | (1 << 13) | (1 << 14)
+pub const CLOCK_TIMG1: power.Clocks = (1 << 15) | (1 << 16) | (1 << 17)
+// The system timer behind Timer and its alarms.
+pub const CLOCK_SYSTIMER: power.Clocks = (1 << 18) | (1 << 19)
+pub const CLOCK_TWAI0: power.Clocks = (1 << 20) | (1 << 21)
+pub const CLOCK_TWAI1: power.Clocks = (1 << 22) | (1 << 23)
+// I2S: registers, transmitter, and receiver.
+pub const CLOCK_I2S: power.Clocks = (1 << 24) | (1 << 25) | (1 << 26)
+// The ADC's controller, whose registers the temperature sensor also uses.
+pub const CLOCK_SARADC: power.Clocks = (1 << 27) | (1 << 28)
+pub const CLOCK_TSENS: power.Clocks = 1 << 29
+// The USB serial port's controller.
+pub const CLOCK_USB_DEVICE: power.Clocks = 1 << 30
+// The interrupt matrix.
+pub const CLOCK_INTMTX: power.Clocks = 1 << 31
+pub const CLOCK_PCNT: power.Clocks = 1 << 32
+pub const CLOCK_ETM: power.Clocks = 1 << 33
+pub const CLOCK_MCPWM: power.Clocks = (1 << 34) | (1 << 35)
+// The parallel IO controller: registers, receiver, and transmitter.
+pub const CLOCK_PARLIO: power.Clocks = (1 << 36) | (1 << 37) | (1 << 38)
+pub const CLOCK_SDIO_SLAVE: power.Clocks = 1 << 39
+// The process, voltage, and temperature monitors.
+pub const CLOCK_PVT: power.Clocks = 1 << 40
+pub const CLOCK_GDMA: power.Clocks = 1 << 41
+pub const CLOCK_SPI2: power.Clocks = (1 << 42) | (1 << 43)
+// The cryptographic accelerators.
+pub const CLOCK_AES: power.Clocks = 1 << 44
+pub const CLOCK_SHA: power.Clocks = 1 << 45
+pub const CLOCK_RSA: power.Clocks = 1 << 46
+pub const CLOCK_ECC: power.Clocks = 1 << 47
+pub const CLOCK_DS: power.Clocks = 1 << 48
+pub const CLOCK_HMAC: power.Clocks = 1 << 49
+// The IO MUX and GPIO matrix: registers and their function clock. GPIO
+// interrupts need them to wake a deep sleep.
+pub const CLOCK_IOMUX: power.Clocks = (1 << 50) | (1 << 51)
+pub const CLOCK_MEM_MONITOR: power.Clocks = 1 << 52
+pub const CLOCK_TRACE: power.Clocks = 1 << 53
+pub const CLOCK_ASSIST_DEBUG: power.Clocks = 1 << 54
+pub const CLOCK_CACHE: power.Clocks = 1 << 55
+// The radio's register bus, which the ADC's calibration also goes through.
+pub const CLOCK_MODEM_APB: power.Clocks = 1 << 56
+// What the timer and its alarms need: keep them in the sleep set to wake
+// from a deep sleep on an alarm, as an executor on an alarm does.
+pub const ALARM_CLOCKS: power.Clocks = CLOCK_SYSTIMER
+// Clocks the program cannot run without, which Power.disable_clocks
+// refuses and a deep sleep never stops: the flash controller and cache the
+// program runs from, the interrupt matrix, the IO MUX and GPIO matrix, the
+// USB serial port, which `dodo run` and the boot ROM reach the chip
+// through, and the radio's register bus.
+pub const ESSENTIAL_CLOCKS: power.Clocks = CLOCK_MSPI | CLOCK_INTMTX | CLOCK_IOMUX | CLOCK_USB_DEVICE | CLOCK_CACHE | CLOCK_MODEM_APB
+// Every gate.
+pub const ALL_CLOCKS: power.Clocks = (1 << 57) - 1
+// The peripherals Power.disable_unused_clocks stops while nothing has
+// claimed them: those the package's drivers claim with start_peripheral,
+// or claim_clocks, and those it has no driver for, which nothing claims.
+// The timer groups (watchdogs), the system timer (Timer.now_us), and the
+// debug blocks are left to the program.
+const MANAGED_CLOCKS: power.Clocks = CLOCK_UART0 | CLOCK_UART1 | CLOCK_I2C0 | CLOCK_UHCI | CLOCK_RMT | CLOCK_LEDC | CLOCK_TWAI0 | CLOCK_TWAI1 | CLOCK_I2S | CLOCK_SARADC | CLOCK_TSENS | CLOCK_PCNT | CLOCK_ETM | CLOCK_MCPWM | CLOCK_PARLIO | CLOCK_SDIO_SLAVE | CLOCK_PVT | CLOCK_GDMA | CLOCK_SPI2 | CLOCK_AES | CLOCK_SHA | CLOCK_RSA | CLOCK_ECC | CLOCK_DS | CLOCK_HMAC
+
+// The clocks of claimed peripherals.
+static mut CLAIMED_CLOCKS: u64 = 0
+// Whether waits deep-sleep, and the clocks that keep running then.
+static mut DEEP_SLEEP: bool = false
+static mut SLEEP_CLOCKS: u64 = 0x1FF_FFFF_FFFF_FFFF
+
+// PCR CPU_WAITI_CONF.CPU_WAIT_MODE_FORCE_ON keeps the CPU's clock running
+// while it waits in `wfi`; the boot ROM leaves it set.
+const PCR_CPU_WAITI_CONF: usize = PCR_BASE + 0x114
+const CPU_WAIT_MODE_FORCE_ON: u32 = 1 << 3
+const PMU_BASE: usize = 0x600B_0000
+const LP_CLKRST_BASE: usize = 0x600B_0400
+const SOC_CLK_XTAL: u32 = 0
+
+// The radio (modem) domain's clock gating maps, MODEM_SYSCON and
+// MODEM_LPCON CLK_CONF_POWER_ST: per clock, the PMU ICG codes (HP_ACTIVE's
+// is HP_ACTIVE_ICG_MODEM) in which it runs. Their reset value 0 stops
+// every one of them, including the analog configuration bus behind the
+// ADC, once the PMU applies a code, as it does after any PMU sleep, and a
+// core reset does not undo that. Let every clock run in the MODEM (1) and
+// ACTIVE (2) codes and stop in the SLEEP code (0), as Espressif's start-up
+// code sets them, whatever an earlier program left.
+const MODEM_SYSCON_CLK_CONF_POWER_ST: usize = 0x600A_980C
+const MODEM_LPCON_CLK_CONF_POWER_ST: usize = 0x600A_F020
+const MODEM_SYSCON_ALL_CODES: u32 = 0x6666_6600
+const MODEM_LPCON_ALL_CODES: u32 = 0x6666_0000
+
+// SAFETY: the caller owns the clock configuration; nothing else uses the
+// radio.
+unsafe fn open_modem_clock_gates() {
+    unsafe {
+        mmio.write32(MODEM_SYSCON_CLK_CONF_POWER_ST, MODEM_SYSCON_ALL_CODES)
+        mmio.write32(MODEM_LPCON_CLK_CONF_POWER_ST, MODEM_LPCON_ALL_CODES)
+    }
+}
+
+// Stop the CPU's clock while it waits for an interrupt, so `wfi` saves
+// power; any interrupt still ends the wait at once.
+// SAFETY: the caller owns the clock configuration.
+unsafe fn gate_cpu_in_wait() {
+    unsafe {
+        waiti := mmio.read32(PCR_CPU_WAITI_CONF)
+        mmio.write32(PCR_CPU_WAITI_CONF, waiti & ~CPU_WAIT_MODE_FORCE_ON)
+    }
+}
+
+// Every `cpu.wait_for_interrupt()` on the ESP32-C6, and so every sleep of
+// an alarm, an executor, and Power.sleep, calls this hook (the compiler
+// references it weakly on RISC-V, as the core has no deep-sleep state of
+// its own). In Mode.Sleep it is a plain `wfi`, during which the CPU's clock
+// stops. In Mode.DeepSleep it also stops every running clock outside the
+// sleep set and the essential ones, waits with interrupts masked, so no
+// handler runs with its peripheral's clock stopped, then starts those
+// clocks again and lets pending handlers run.
+extern "C" fn dodo_wait_for_interrupt() {
+    // SAFETY: interrupts are masked while clocks are stopped, so nothing
+    // runs that uses them; the hook restores exactly the gates it closed.
+    unsafe {
+        if !DEEP_SLEEP {
+            asm("wfi")
+            return
+        }
+        were_enabled := cpu.disable_interrupts()
+        pcr := hal.RegisterBlock.at(PCR_BASE)
+        stopping := ALL_CLOCKS & ~SLEEP_CLOCKS & ~ESSENTIAL_CLOCKS
+        stopped := esp_power.enabled_clocks(&mut pcr, stopping)
+        esp_power.stop_clocks(&mut pcr, stopped)
+        asm("wfi")
+        esp_power.start_clocks(&mut pcr, stopped)
+        cpu.restore_interrupts(were_enabled)
+    }
+}
+
+// Low power, as `Peripherals.power`; implements std/embedded/power's
+// protocol, whose package comment describes the modes.
+//
+// Sleep. Every wait (`wfi`) stops the CPU's clock until an interrupt is
+// pending (PCR CPU_WAITI_CONF), so a light sleep saves power and still
+// wakes within a few microseconds.
+//
+// Deep sleep. The ESP32-C6 has no per-peripheral sleep enables and its
+// core no deep-sleep state, and the PMU's own sleep, which does gate
+// clocks per peripheral, ends only on pins, the low-power timer, and
+// UARTs, not on the system timer's alarms or other interrupts. So in
+// Mode.DeepSleep every wait, through `dodo_wait_for_interrupt`, closes the
+// PCR gates of the running clocks outside the sleep set before its `wfi`
+// and opens them again once an interrupt is pending, with interrupts
+// masked in between. A peripheral whose clock keeps running, such as the
+// system timer for an alarm (ALARM_CLOCKS), or any GPIO, wakes the core;
+// the essential clocks never stop. Every clock starts in the sleep set, so
+// a deep sleep stops nothing more than a light one until
+// `set_sleep_clocks` says otherwise.
+//
+// Clock gating. The constants above name the gates; ESSENTIAL_CLOCKS are
+// refused. Claiming a peripheral starts its clocks, so
+// `disable_unused_clocks` is safe at any time; it stops the peripherals
+// listed in MANAGED_CLOCKS that nothing has claimed, including those the
+// package has no driver for. A timer alarm's claim keeps CLOCK_SYSTIMER
+// running; without one it can be stopped, and Timer.now_us, delays, and
+// alarms then wait for it until it starts again. The PCR keeps its gates
+// through the resets of `dodo run`: the package's own claims start every
+// clock they need, but a program that drives a peripheral directly should
+// call `enable_clocks` first.
+//
+// Dormant. `dormant` asks the PMU for a light sleep: the CPU stalls with
+// its state, SRAM, and every register kept, every HP clock stops, and the
+// crystal, the PLL, and the fast RC oscillator power down, until a pin
+// event. The pins are watched through the GPIO wakeup, which sees levels
+// only: each pin wakes the chip when it leaves its current level, and
+// `dormant` sleeps again until one of the events in the Wake has happened
+// (an edge takes two sleeps when the pin starts at the edge's end level).
+// GPIO 0 to 23 apart from the USB pins can wake it. The system timer
+// pauses meanwhile, so `now_us` does not count the time spent dormant; the
+// low-power timer keeps counting its 136 kHz RC oscillator. The USB
+// connection does not survive the stopped PLL: the host sees the device
+// stop answering and gives up on it. So `dormant` returns Busy while the
+// USB serial port is open and a host has it open; release the port first.
+// After a sleep it detaches the USB device for 100 ms (D+ released) so the
+// host enumerates it again: a program on the host has to open the port
+// anew. Serial ports must have sent their last bytes, and peripherals'
+// clocks from the PLL stop too. Wakes take about 2 ms (the crystal
+// restarts) plus the 100 ms detach.
+//
+// The PMU's registers are in the always-on domain, which the resets of
+// `dodo run` keep, so what one program leaves there, the next finds.
+// `dormant` restores every PMU, LP clock, and LP timer register it
+// changes, and take() puts the PMU's HP_ACTIVE state, the analog bus's
+// power (RF_PWC), and the radio domain's clock gating where ESP-IDF's
+// start-up code puts them (see esp_power.init_active_state), so whatever
+// ran before, the ADC and a dormant state work.
+pub struct Power: power.Power {
+    // The dormant timeout, 0 for none, and the low-power timer's measured
+    // rate.
+    timeout_us: u64
+    lp_ticks_per_10ms: u64
+
+    pub fn mode(&self) -> power.Mode {
+        // SAFETY: a single byte, written only by set_mode.
+        deep := unsafe {
+            DEEP_SLEEP
+        }
+        if deep {
+            return power.Mode.DeepSleep
+        }
+        return power.Mode.Sleep
+    }
+
+    pub fn set_mode(&mut self, mode: power.Mode) {
+        // SAFETY: a single byte, read by the wait hook.
+        unsafe {
+            DEEP_SLEEP = mode == power.Mode.DeepSleep
+        }
+    }
+
+    pub fn sleep(&mut self) {
+        cpu.wait_for_interrupt()
+    }
+
+    pub fn enabled_clocks(&self) -> power.Clocks {
+        // SAFETY: reading the PCR has no side effects.
+        pcr := unsafe {
+            hal.RegisterBlock.at(PCR_BASE)
+        }
+        return esp_power.enabled_clocks(&mut pcr, ALL_CLOCKS)
+    }
+
+    pub fn enable_clocks(&mut self, clocks: power.Clocks) {
+        // SAFETY: the gates change with interrupts masked, by
+        // read-modify-write of their own fields.
+        unsafe {
+            section := hal.Critical.enter()
+            pcr := hal.RegisterBlock.at(PCR_BASE)
+            esp_power.start_clocks(&mut pcr, clocks & ALL_CLOCKS)
+            core.drop(section)
+        }
+    }
+
+    pub fn disable_clocks(&mut self, clocks: power.Clocks) -> void!hal.Error {
+        if (clocks & ~ALL_CLOCKS) != 0 || (clocks & ESSENTIAL_CLOCKS) != 0 {
+            return err(hal.Error.InvalidInput)
+        }
+        section := hal.Critical.enter()
+        // SAFETY: interrupts are masked, so no claim changes meanwhile.
+        claimed := unsafe {
+            CLAIMED_CLOCKS
+        }
+        if (clocks & claimed) != 0 {
+            core.drop(section)
+            return err(hal.Error.Busy)
+        }
+        // SAFETY: as in enable_clocks; no claimed peripheral and nothing
+        // the program needs to run uses `clocks`.
+        unsafe {
+            pcr := hal.RegisterBlock.at(PCR_BASE)
+            esp_power.stop_clocks(&mut pcr, clocks)
+        }
+        core.drop(section)
+        return ok()
+    }
+
+    pub fn disable_unused_clocks(&mut self) -> power.Clocks {
+        section := hal.Critical.enter()
+        // SAFETY: as in disable_clocks.
+        unused := unsafe {
+            pcr := hal.RegisterBlock.at(PCR_BASE)
+            stopping := esp_power.enabled_clocks(&mut pcr, MANAGED_CLOCKS & ~CLAIMED_CLOCKS)
+            esp_power.stop_clocks(&mut pcr, stopping)
+            stopping
+        }
+        core.drop(section)
+        return unused
+    }
+
+    pub fn sleep_clocks(&self) -> power.Clocks {
+        // SAFETY: written only by set_sleep_clocks.
+        unsafe {
+            return SLEEP_CLOCKS
+        }
+    }
+
+    pub fn set_sleep_clocks(&mut self, clocks: power.Clocks) {
+        // SAFETY: read by the wait hook with interrupts masked; a 64-bit
+        // value, so it changes with them masked too.
+        unsafe {
+            section := hal.Critical.enter()
+            SLEEP_CLOCKS = clocks & ALL_CLOCKS
+            core.drop(section)
+        }
+    }
+
+    pub fn dormant(&mut self, wake: &power.Wake) -> u64!hal.Error {
+        pins := dormant_pins(wake)?
+        timeout := 0u64
+        if self.timeout_us != 0 {
+            timeout = self.timeout_us * self.lp_rate() / 10_000
+            if timeout == 0 {
+                timeout = 1
+            }
+        }
+        section := hal.Critical.enter()
+        // SAFETY: interrupts are masked, so the port's state is read
+        // atomically.
+        busy := unsafe {
+            USB_REPORTS && (mmio.read32(USB_DEVICE_BASE + 0x4C) & (1u32 << 1)) != 0
+        }
+        if busy {
+            core.drop(section)
+            return err(hal.Error.Busy)
+        }
+        // SAFETY: Power owns the PMU and the low-power timer; interrupts
+        // stay masked throughout, and the clocks are as take() set them.
+        result := unsafe {
+            go_dormant(wake, pins, timeout)
+        }
+        core.drop(section)
+        return result
+    }
+
+    // Also end a dormant state after `microseconds` of the low-power
+    // timer, 0 (the default) for no limit: `dormant` then returns the pins
+    // that woke the chip, none if the time ran out first. The timer counts
+    // the RC_SLOW oscillator, whose rate the first timed dormant state
+    // measures against the system timer for 10 ms; the time is then
+    // accurate to about 1 %. It uses the timer's target 0 (LP_TIMER TAR0),
+    // the only one the PMU wakes on, and puts back what another user, such
+    // as an RTC alarm, had there; an alarm that falls due during the
+    // dormant state does not end it.
+    pub fn set_dormant_timeout_us(&mut self, microseconds: u64) {
+        self.timeout_us = microseconds
+    }
+
+    // The low-power timer's count of its RC_SLOW oscillator, which keeps
+    // running in a dormant state, and its measured rate in counts per
+    // 10 ms, measured once.
+    pub fn lp_ticks(&self) -> u64 {
+        // SAFETY: latching and reading the count has no other effect.
+        timer := unsafe {
+            hal.RegisterBlock.at(LP_TIMER_BASE)
+        }
+        return esp_power.lp_ticks(&mut timer)
+    }
+
+    pub fn lp_rate(&mut self) -> u64 {
+        if self.lp_ticks_per_10ms == 0 {
+            start_us := now_us()
+            start := self.lp_ticks()
+            for now_us() - start_us < 10_000 {}
+            self.lp_ticks_per_10ms = self.lp_ticks() - start
+        }
+        return self.lp_ticks_per_10ms
+    }
+}
+
+// The pins of `wake`, bit n for pin n; InvalidInput if it has none, or one
+// the chip cannot watch: GPIO 24 and up, and the USB pins.
+fn dormant_pins(wake: &power.Wake) -> u32!hal.Error {
+    all := wake.pins()
+    if all == 0 || (all >> PIN_COUNT as u64) != 0 {
+        return err(hal.Error.InvalidInput)
+    }
+    pins := all as u32
+    if (pins & USB_PINS) != 0 {
+        return err(hal.Error.InvalidInput)
+    }
+    return ok(pins)
+}
+
+// Sleep through the PMU until one of `wake`'s events on `pins`, or until
+// `timeout` low-power timer counts if not 0; return the pins whose events
+// happened.
+// SAFETY: interrupts must be masked, the clocks as take() set them, and
+// the caller must own the PMU, the low-power timer, and the pins.
+unsafe fn go_dormant(wake: &power.Wake, pins: u32, timeout: u64) -> u64!hal.Error {
+    unsafe {
+        pmu := hal.RegisterBlock.at(PMU_BASE)
+        gpio := hal.RegisterBlock.at(GPIO_BASE)
+        timer := hal.RegisterBlock.at(LP_TIMER_BASE)
+        levels := esp_power.levels(&mut gpio)
+        present := esp_power.levels_present(wake, levels) & pins
+        if present != 0 {
+            return ok(present as u64)
+        }
+        lp_clkrst := hal.RegisterBlock.at(LP_CLKRST_BASE)
+        pmu_state: [24]u32 = [0u32; 24]
+        esp_power.save_sleep_state(&mut pmu, &mut pmu_state)
+        alarm_state := esp_power.save_lp_alarm(&mut timer)
+        esp_power.configure_sleep(&mut pmu)
+        lp_clock := esp_power.use_rc_fast(&mut lp_clkrst)
+        sources := esp_power.WAKE_GPIO
+        deadline := 0u64
+        if timeout != 0 {
+            deadline = esp_power.lp_ticks(&mut timer) + timeout
+            esp_power.arm_lp_alarm(&mut timer, deadline)
+            sources |= esp_power.WAKE_LP_TIMER
+        }
+        saved: [31]u32 = [0u32; 31]
+        woken := 0u32
+        failure := 0u32
+        for woken == 0 {
+            esp_power.arm_pins(&mut gpio, pins, levels, &mut saved)
+            sysclk := mmio.read32(PCR_SYSCLK_CONF)
+            mmio.write32(PCR_SYSCLK_CONF, (sysclk & ~SOC_CLK_SEL) | hal.encode(SOC_CLK_SEL, SOC_CLK_XTAL))
+            ets_update_cpu_frequency(XTAL_HZ / 1_000_000)
+            slept := esp_power.sleep(&mut pmu, sources, sources)
+            stable := esp_power.wait_for_pll(&mut pmu)
+            mmio.write32(PCR_SYSCLK_CONF, sysclk)
+            ets_update_cpu_frequency(CPU_HZ / 1_000_000)
+            latched := esp_power.latched_pins(&mut gpio, pins)
+            now_levels := esp_power.levels(&mut gpio)
+            esp_power.disarm_pins(&mut gpio, pins, &saved)
+            if !is_ok_bool(slept) || !is_ok_void(stable) {
+                failure = 1
+                break
+            }
+            changed := (now_levels ^ levels) & pins
+            pulsed := latched & ~changed
+            woken = esp_power.events_seen(wake, levels, changed, pulsed) | (esp_power.levels_present(wake, now_levels) & pins)
+            if timeout != 0 && esp_power.lp_ticks(&mut timer) >= deadline {
+                break
+            }
+            levels = now_levels
+        }
+        if timeout != 0 {
+            esp_power.disarm_lp_alarm(&mut timer)
+            esp_power.restore_lp_alarm(&mut timer, alarm_state)
+        }
+        esp_power.restore_lp_fast_clock(&mut lp_clkrst, lp_clock)
+        esp_power.restore_sleep_state(&mut pmu, &pmu_state)
+        // The modem domain powered down while the chip slept.
+        open_modem_clock_gates()
+        reattach_usb()
+        if failure != 0 {
+            return err(hal.Error.Timeout)
+        }
+        return ok(woken as u64)
+    }
+}
+
+// USB_SERIAL_JTAG CONF0: PAD_PULL_OVERRIDE takes the D+ and D- pulls from
+// the register's own bits instead of the controller, and DP_PULLUP is D+'s
+// pull-up, which tells the host a device is there.
+const USB_CONF0: usize = USB_DEVICE_BASE + 0x18
+const USB_PAD_PULL_OVERRIDE: u32 = 1 << 8
+const USB_DP_PULLUP: u32 = 1 << 9
+// How long D+ stays released, so the host sees the device leave.
+const USB_DETACH_US: u32 = 100_000
+// A dormant state stops the USB serial port's clock; a host sees the
+// device stop answering and gives up on it. Release D+ for a moment, as if
+// the cable were unplugged, so the host enumerates the port again. Without
+// a host this only costs the time.
+// SAFETY: nothing may use the USB serial port meanwhile.
+unsafe fn reattach_usb() {
+    unsafe {
+        conf := mmio.read32(USB_CONF0)
+        mmio.write32(USB_CONF0, (conf | USB_PAD_PULL_OVERRIDE) & ~USB_DP_PULLUP)
+        ets_delay_us(USB_DETACH_US)
+        mmio.write32(USB_CONF0, conf)
+    }
+}
+
+fn is_ok_bool(result: bool!hal.Error) -> bool {
+    match result {
+        ok(_) => {
+            return true
+        }
+        err(_) => {
+            return false
+        }
+    }
+}
+
+fn is_ok_void(result: void!hal.Error) -> bool {
+    match result {
+        ok() => {
+            return true
+        }
+        err(_) => {
+            return false
+        }
+    }
+}

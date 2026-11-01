@@ -253,7 +253,7 @@ const OPTIONS: &[OptionSpec] = &[
         Some("NAME"),
         B | R | C,
         "Platform",
-        "Firmware board, e.g. pico, pico2, pico2_w, or arduino_uno: target, CPU, startup code, linker, flashable image"
+        "Firmware board, e.g. pico, pico2, pico2_w, esp32c6_devkitc, or arduino_uno: target, CPU, startup code, linker, flashable image"
     ),
     option!(
         "chip",

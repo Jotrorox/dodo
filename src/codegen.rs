@@ -253,8 +253,26 @@ enum AtomicSupport {
     None,
 }
 
-fn atomic_support(triple: &str) -> AtomicSupport {
+fn atomic_support(triple: &str, features: &str) -> AtomicSupport {
     let arch = triple.split('-').next().unwrap_or_default();
+    // RISC-V cores have atomics with the A extension, as the ESP32-C6 does.
+    if let Some(extensions) = arch
+        .strip_prefix("riscv32")
+        .or_else(|| arch.strip_prefix("riscv64"))
+    {
+        let named = features.split(',').any(|feature| feature == "+a");
+        let removed = features.split(',').any(|feature| feature == "-a");
+        let base = extensions.starts_with('g')
+            || extensions
+                .split('_')
+                .next()
+                .is_some_and(|letters| letters.contains('a'));
+        return if (named || base) && !removed {
+            AtomicSupport::Full
+        } else {
+            AtomicSupport::None
+        };
+    }
     // LLVM spells Apple's AArch64 as `arm64` (and `arm64e`). ARMv7-M,
     // ARMv7E-M, and ARMv8-M (Cortex-M3, M4, M7, M23, M33, M55, M85) have
     // exclusive loads and stores up to 32 bits; the checker limits widths to
@@ -276,8 +294,8 @@ fn atomic_support(triple: &str) -> AtomicSupport {
     }
 }
 
-fn unsupported_atomic(op: &str, triple: &str) -> String {
-    if atomic_support(triple) == AtomicSupport::LoadStore {
+fn unsupported_atomic(op: &str, triple: &str, features: &str) -> String {
+    if atomic_support(triple, features) == AtomicSupport::LoadStore {
         format!(
             "atomic `{op}` is not supported for target `{triple}`: ARMv6-M (Cortex-M0 and M0+) has no atomic read-modify-write instructions, only atomic loads and stores; update the value inside a critical section (`hal.Critical`) instead"
         )
@@ -334,6 +352,7 @@ pub fn generate<'ctx>(
         c_abi: HashMap::new(),
         c_result: None,
         bits,
+        features: options.features.clone(),
         code_space,
         sources,
         debug,
@@ -419,6 +438,7 @@ pub fn generate<'ctx>(
         return Err(error(unsupported_atomic(
             &op,
             &triple.as_str().to_string_lossy(),
+            &options.features,
         )));
     }
     function_sections(&cg.module);
@@ -494,6 +514,8 @@ struct Codegen<'a, 'ctx> {
     c_abi: HashMap<String, c_abi::Lowering<'ctx>>,
     c_result: Option<Vec<LlvmType<'ctx>>>,
     bits: u32,
+    // LLVM target features, which decide what RISC-V atomics lower to.
+    features: String,
     // The address space of code: 1 on AVR, whose program memory is separate
     // from data memory, 0 elsewhere. Function values live in it.
     code_space: u32,
@@ -884,7 +906,10 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                 let indirect = &self.indirect[&f.name].1;
                 self.mark_exclusive_params(function, &params, first, indirect);
             }
-            if f.interrupt.is_some() && self.riscv_bare_metal() {
+            if f.interrupt.is_some()
+                && self.riscv_bare_metal()
+                && !self.program.dispatched_interrupts
+            {
                 // Save every register the handler uses and return with `mret`.
                 function.add_attribute(
                     AttributeLoc::Function,
@@ -901,9 +926,14 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                 );
             }
             self.apply_placement(function, &f.placement, f.body.is_some(), 1)?;
+            // A function placed in a section, such as `.ramfunc` to run from
+            // SRAM, must run there: inlined into a caller, its code would run
+            // from the caller's section instead.
+            let placed = f.placement.section.is_some() && f.body.is_some();
             let inlining: &[&str] = match f.inlining {
                 // A naked function's assembly returns from its own frame.
                 Inlining::Auto if f.naked => &["naked", "noinline"],
+                Inlining::Auto | Inlining::Always if placed => &["noinline"],
                 Inlining::Auto => &[],
                 Inlining::Always => &["alwaysinline"],
                 Inlining::Never => &["noinline"],
@@ -3332,6 +3362,10 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             (self.usize_type(), 8)
         };
         match op {
+            "wait_for_interrupt" if riscv => {
+                self.wait_for_interrupt_hook()?;
+                Ok(unit)
+            }
             "wait_for_interrupt" => {
                 self.builder.build_inline_asm(
                     void.fn_type(&[], false),
@@ -3500,6 +3534,41 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         let phi = self.builder.build_phi(i32_type, "cpu.core")?;
         phi.add_incoming(&[(&i32_type.const_zero(), start), (&number, ask)]);
         Ok(phi)
+    }
+    /// Lowers `cpu.wait_for_interrupt()` on bare-metal RISC-V. The core's
+    /// `wfi` cannot be intercepted in machine mode, and a RISC-V chip has
+    /// no architectural deep sleep like the Cortex-M's SCR.SLEEPDEEP, so a
+    /// chip package that implements one defines `dodo_wait_for_interrupt`,
+    /// which is referenced weakly: std/embedded/chip/esp32c6 stops the
+    /// clocks outside its sleep set around the `wfi` while its power mode is
+    /// deep sleep. Without a definition this is a plain `wfi`.
+    fn wait_for_interrupt_hook(&mut self) -> Result<()> {
+        let void = self.context.void_type();
+        let hook = self
+            .module
+            .lookup_function("dodo_wait_for_interrupt")
+            .unwrap_or_else(|| {
+                self.module.add_function(
+                    "dodo_wait_for_interrupt",
+                    void.fn_type(&[], false),
+                    Some(LLVMExternalWeakLinkage),
+                )
+            });
+        let call = self.bb("wfi.hook");
+        let plain = self.bb("wfi.plain");
+        let done = self.bb("wfi.done");
+        let missing = self.builder.build_is_null(hook, "wfi.missing")?;
+        self.builder
+            .build_conditional_branch(missing, plain, call)?;
+        self.builder.position_at_end(call);
+        self.builder.build_call(hook, &[], "")?;
+        self.builder.build_unconditional_branch(done)?;
+        self.builder.position_at_end(plain);
+        self.builder
+            .build_inline_asm(void.fn_type(&[], false), "wfi", "~{memory}", &[], "")?;
+        self.builder.build_unconditional_branch(done)?;
+        self.builder.position_at_end(done);
+        Ok(())
     }
     fn call(
         &mut self,
@@ -3692,7 +3761,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                     .as_str()
                     .to_string_lossy()
                     .into_owned();
-                let support = atomic_support(&triple);
+                let support = atomic_support(&triple, &self.features);
                 if support == AtomicSupport::None
                     || (support == AtomicSupport::LoadStore
                         && !matches!(operation, "load" | "store"))

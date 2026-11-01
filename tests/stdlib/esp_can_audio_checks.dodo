@@ -1,0 +1,754 @@
+package main
+
+import "std/embedded/chip/esp_capture"
+import "std/embedded/chip/esp_i2s"
+import "std/embedded/hal"
+import "std/embedded/peripheral/esp_twai"
+
+// Host checks for the ESP32-C6 CAN, audio, and PWM input drivers that do not
+// need the chip: esp_twai against a behavioural model of the TWAI
+// controller, the I2S clock dividers and sample packing of esp_i2s, and the
+// measurement arithmetic of esp_capture. The TWAI model follows the
+// SJA1000-style controller as the driver relies on it: registers that only
+// reset mode may write, the acceptance filter's single and dual modes
+// applied the way the hardware applies them (to either kind of frame), the
+// 64-byte receive FIFO with its overrun marks, one transmit buffer, and
+// bus-off with its recovery. Anything the driver does that the hardware
+// forbids counts as a violation, and every test expects none.
+
+// --- TWAI model ------------------------------------------------------------
+
+const MODE_RESET: u32 = 1
+const MODE_LISTEN: u32 = 2
+const MODE_SELF_TEST: u32 = 4
+const MODE_SINGLE: u32 = 8
+const FIFO_BYTES: usize = 64
+const MAX_ENTRIES: usize = 32
+
+struct TwaiModel {
+    mode: u32
+    timing0: u32
+    timing1: u32
+    warning: u32
+    clock_divider: u32
+    int_ena: u32
+    tec: u32
+    rec: u32
+    // ACR0-3 and AMR0-3.
+    acceptance: [8]u32
+    tx: [13]u8
+    tx_locked: bool
+    last_command: u32
+    // The receive FIFO: entries of frame bytes, each with its length and
+    // whether it is a lost frame's place.
+    fifo: [416]u8
+    lengths: [32]usize
+    missed: [32]bool
+    entries: usize
+    used_bytes: usize
+    overrun: bool
+    // Frames sent onto the bus (Normal mode), and whether another node
+    // acknowledges them.
+    outbox: [416]u8
+    sent: usize
+    acknowledged: bool
+    bus_off: bool
+    // Status reads left until bus-off recovery completes, once started.
+    recovery: u32
+    recovering: bool
+    violations: u32
+
+    fn new() -> TwaiModel {
+        return TwaiModel {
+            mode: MODE_RESET,
+            timing0: 0,
+            timing1: 0,
+            warning: 96,
+            clock_divider: 0,
+            int_ena: 0,
+            tec: 0,
+            rec: 0,
+            acceptance: [0u32; 8],
+            tx: [0u8; 13],
+            tx_locked: false,
+            last_command: 0,
+            fifo: [0u8; 416],
+            lengths: [0usize; 32],
+            missed: [false; 32],
+            entries: 0,
+            used_bytes: 0,
+            overrun: false,
+            outbox: [0u8; 416],
+            sent: 0,
+            acknowledged: true,
+            bus_off: false,
+            recovery: 0,
+            recovering: false,
+            violations: 0,
+        }
+    }
+
+    fn in_reset(&self) -> bool {
+        return (self.mode & MODE_RESET) != 0
+    }
+
+    // A frame arrives from the bus: the acceptance filter, then the FIFO.
+    fn arrive(&mut self, bytes: &[13]u8) {
+        if !self.hardware_accepts(bytes) {
+            return
+        }
+        size := frame_size(bytes)
+        if self.entries == MAX_ENTRIES {
+            return
+        }
+        if self.used_bytes + size > FIFO_BYTES {
+            // Lost: the counter still counts its place.
+            self.lengths[self.entries] = 0
+            self.missed[self.entries] = true
+            self.entries += 1
+            self.overrun = true
+            return
+        }
+        start := 13 * self.entries
+        for index in 0..13usize {
+            self.fifo[start + index] = bytes[index]
+        }
+        self.lengths[self.entries] = size
+        self.missed[self.entries] = false
+        self.entries += 1
+        self.used_bytes += size
+    }
+
+    // The SJA1000 acceptance filter: the same code and mask bits, read as
+    // a standard or an extended frame's fields.
+    fn hardware_accepts(&self, bytes: &[13]u8) -> bool {
+        code := (self.acceptance[0] << 24) | (self.acceptance[1] << 16) | (self.acceptance[2] << 8) | self.acceptance[3]
+        mask := (self.acceptance[4] << 24) | (self.acceptance[5] << 16) | (self.acceptance[6] << 8) | self.acceptance[7]
+        extended := (bytes[0] & 0x80) != 0
+        remote := 0u32
+        if (bytes[0] & 0x40) != 0 {
+            remote = 1
+        }
+        length := (bytes[0] & 0xF) as usize
+        if length > 8 {
+            length = 8
+        }
+        if remote == 1 {
+            length = 0
+        }
+        if (self.mode & MODE_SINGLE) != 0 {
+            if extended {
+                id := ((bytes[1] as u32) << 21) | ((bytes[2] as u32) << 13) | ((bytes[3] as u32) << 5) | ((bytes[4] as u32) >> 3)
+                value := (id << 3) | (remote << 2)
+                return ((value ^ code) & ~mask & 0xFFFF_FFFC) == 0
+            }
+            id := ((bytes[1] as u32) << 3) | ((bytes[2] as u32) >> 5)
+            value := (id << 21) | (remote << 20)
+            care := ~mask & 0xFFF0_0000
+            if length >= 1 {
+                value |= (bytes[3] as u32) << 8
+                care |= ~mask & 0xFF00
+            }
+            if length >= 2 {
+                value |= bytes[4] as u32
+                care |= ~mask & 0xFF
+            }
+            return ((value ^ code) & care) == 0
+        }
+        if extended {
+            top := ((bytes[1] as u32) << 8) | bytes[2] as u32
+            first := (((top << 16) ^ code) & ~mask & 0xFFFF_0000) == 0
+            second := ((top ^ code) & ~mask & 0xFFFF) == 0
+            return first || second
+        }
+        id := ((bytes[1] as u32) << 3) | ((bytes[2] as u32) >> 5)
+        head := (id << 1) | remote
+        value := (head << 20) | (head << 4)
+        care1 := ~mask & 0xFFF0_0000
+        if length >= 1 {
+            value |= ((bytes[3] as u32) >> 4) << 16
+            value |= (bytes[3] as u32) & 0xF
+            care1 |= ~mask & 0x000F_000F
+        }
+        first := ((value ^ code) & care1) == 0
+        second := ((value ^ code) & ~mask & 0xFFF0) == 0
+        return first || second
+    }
+
+    // Recovery advances with each status read, as bus time passes.
+    fn tick(&mut self) {
+        if self.recovering {
+            if self.recovery == 0 {
+                self.recovering = false
+                self.bus_off = false
+                self.tec = 0
+                self.rec = 0
+            } else {
+                self.recovery -= 1
+            }
+        }
+    }
+
+    fn pop(&mut self) {
+        if self.entries == 0 {
+            self.violations += 1
+            return
+        }
+        self.used_bytes -= self.lengths[0]
+        for entry in 1..self.entries {
+            self.lengths[entry - 1] = self.lengths[entry]
+            self.missed[entry - 1] = self.missed[entry]
+            for index in 0..13usize {
+                self.fifo[13 * (entry - 1) + index] = self.fifo[13 * entry + index]
+            }
+        }
+        self.entries -= 1
+    }
+
+    fn transmit(&mut self, command: u32) {
+        if self.tx_locked || self.in_reset() || (self.mode & MODE_LISTEN) != 0 {
+            self.violations += 1
+            return
+        }
+        self.last_command = command
+        if (command & 0x10) != 0 {
+            // Self reception: needs no acknowledge in self-test mode.
+            if (self.mode & MODE_SELF_TEST) == 0 && !self.acknowledged {
+                self.tx_locked = (command & 0x02) == 0
+                return
+            }
+            frame := [0u8; 13]
+            for index in 0..13usize {
+                frame[index] = self.tx[index]
+            }
+            self.arrive(&frame)
+            self.send_out()
+            return
+        }
+        if (self.mode & MODE_SELF_TEST) != 0 || self.acknowledged {
+            self.send_out()
+            return
+        }
+        // Retried until acknowledged, unless one-shot.
+        self.tx_locked = (command & 0x02) == 0
+    }
+
+    fn send_out(&mut self) {
+        if self.sent < 32 {
+            for index in 0..13usize {
+                self.outbox[13 * self.sent + index] = self.tx[index]
+            }
+            self.sent += 1
+        }
+    }
+
+    pub fn read(&mut self, offset: usize) -> u32 {
+        if offset == 0x00 {
+            return self.mode
+        }
+        if offset == 0x08 {
+            self.tick()
+            status := 0u32
+            if self.entries > 0 {
+                status |= 1
+                if self.missed[0] {
+                    status |= 1 << 8
+                }
+            }
+            if self.overrun {
+                status |= 2
+            }
+            if !self.tx_locked {
+                status |= 4 | 8
+            }
+            if self.tec >= self.warning || self.rec >= self.warning {
+                status |= 1 << 6
+            }
+            if self.bus_off {
+                status |= 1 << 7
+            }
+            return status
+        }
+        if offset == 0x38 {
+            return self.rec
+        }
+        if offset == 0x3C {
+            return self.tec
+        }
+        if offset == 0x74 {
+            return self.entries as u32
+        }
+        if offset >= 0x40 && offset < 0x74 {
+            index := (offset - 0x40) / 4
+            if self.in_reset() {
+                if index < 8 {
+                    return self.acceptance[index]
+                }
+                return 0
+            }
+            if self.entries == 0 || self.missed[0] {
+                // Reading an empty or lost entry is a driver bug.
+                self.violations += 1
+                return 0
+            }
+            return self.fifo[index] as u32
+        }
+        return 0
+    }
+
+    pub fn write(&mut self, offset: usize, value: u32) {
+        if offset == 0x00 {
+            if self.bus_off && (self.mode & MODE_RESET) != 0 && (value & MODE_RESET) == 0 {
+                self.recovering = true
+                self.recovery = 5
+            }
+            if (self.mode & MODE_RESET) == 0 && (value & MODE_RESET) == 0 && (value & 0xE) != (self.mode & 0xE) {
+                // Mode bits change only in reset mode.
+                self.violations += 1
+            }
+            if (value & MODE_RESET) != 0 && (self.mode & MODE_RESET) == 0 {
+                // Entering reset mode drops the FIFO and a pending frame.
+                self.entries = 0
+                self.used_bytes = 0
+                self.tx_locked = false
+            }
+            self.mode = value & 0xF
+            return
+        }
+        if offset == 0x04 {
+            if (value & 0x08) != 0 {
+                self.overrun = false
+            }
+            if (value & 0x04) != 0 {
+                self.pop()
+            }
+            if (value & 0x11) != 0 {
+                self.transmit(value)
+            } else if (value & 0x02) != 0 {
+                self.tx_locked = false
+            }
+            return
+        }
+        if offset == 0x10 {
+            self.int_ena = value
+            return
+        }
+        if offset >= 0x40 && offset < 0x74 {
+            index := (offset - 0x40) / 4
+            if self.in_reset() {
+                if index < 8 {
+                    self.acceptance[index] = value & 0xFF
+                } else {
+                    self.violations += 1
+                }
+                return
+            }
+            if self.tx_locked {
+                self.violations += 1
+                return
+            }
+            self.tx[index] = (value & 0xFF) as u8
+            return
+        }
+        // Everything else may only change in reset mode.
+        if !self.in_reset() {
+            self.violations += 1
+            return
+        }
+        if offset == 0x18 {
+            self.timing0 = value
+        } else if offset == 0x1C {
+            self.timing1 = value
+        } else if offset == 0x34 {
+            self.warning = value
+        } else if offset == 0x38 {
+            self.rec = value
+        } else if offset == 0x3C {
+            self.tec = value
+        } else if offset == 0x7C {
+            self.clock_divider = value
+        }
+    }
+}
+
+fn frame_size(bytes: &[13]u8) -> usize {
+    size := 3usize
+    if (bytes[0] & 0x80) != 0 {
+        size = 5
+    }
+    if (bytes[0] & 0x40) == 0 {
+        size += hal.can_dlc_length(bytes[0] & 0xF, false)
+    }
+    return size
+}
+
+fn frame_bytes(frame: &hal.CanFrame) -> [13]u8 {
+    bytes := [0u8; 13]
+    esp_twai.encode_frame(frame, &mut bytes)
+    return bytes
+}
+
+fn expect_error<T>(result: T!hal.Error, expected: hal.Error) {
+    match result {
+        ok(_) => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == expected)
+        }
+    }
+}
+
+fn state_is(can: &mut esp_twai.Controller<TwaiModel>, expected: u32) -> bool {
+    match can.error_state()! {
+        hal.CanErrorState.Active => {
+            return expected == 0
+        }
+        hal.CanErrorState.Passive => {
+            return expected == 1
+        }
+        hal.CanErrorState.BusOff => {
+            return expected == 2
+        }
+    }
+}
+
+fn self_test_config() -> esp_twai.Config {
+    config := esp_twai.Config.new(500_000)
+    config.mode = esp_twai.Mode.SelfTest
+    return config
+}
+
+fn twai_timing() {
+    // 40 MHz: quanta of 4 cycles, 20 per bit, sampling at 85%.
+    fast := esp_twai.timing(40_000_000, 500_000, 875)!
+    core.assert_eq(fast.bitrate, 500_000u32)
+    core.assert_eq(fast.bus_timing_0, (2u32 << 14) | 1)
+    core.assert_eq(fast.bus_timing_1, (2u32 << 4) | 15)
+    core.assert_eq(fast.sample_point_permille, 850u32)
+    rates: [9]u32 = [1_000_000u32, 800_000, 500_000, 250_000, 125_000, 100_000, 50_000, 20_000, 10_000]
+    for &rate in rates {
+        bits := esp_twai.timing(40_000_000, rate, 875)!
+        core.assert_eq(bits.bitrate, rate)
+        core.assert((bits.bus_timing_0 & 0x3FFF) <= 0x3FFF)
+    }
+    slowest := esp_twai.timing(40_000_000, 50, 875)!
+    core.assert_eq(slowest.bitrate, 50u32)
+    expect_error(esp_twai.timing(40_000_000, 40, 875), hal.Error.InvalidInput)
+    expect_error(esp_twai.timing(40_000_000, 3_000_000, 875), hal.Error.InvalidInput)
+}
+
+fn twai_filter_plans() {
+    none: [0]hal.CanFilter = []
+    open := esp_twai.plan_filters(&none)!
+    core.assert(open.single && open.mask == 0xFFFF_FFFF)
+    one: [1]hal.CanFilter = [hal.CanFilter.exact(0x123, false)]
+    plan := esp_twai.plan_filters(&one)!
+    core.assert(!plan.single)
+    core.assert_eq(plan.code, (0x123u32 << 21) | (0x123u32 << 5))
+    core.assert_eq(~plan.mask, (0x7FFu32 << 21) | (0x7FFu32 << 5))
+    long: [1]hal.CanFilter = [hal.CanFilter.exact(0x1ABC_DEF0, true)]
+    exact := esp_twai.plan_filters(&long)!
+    core.assert(exact.single && exact.code == 0x1ABC_DEF0u32 << 3 && ~exact.mask == 0x1FFF_FFFFu32 << 3)
+    too_large: [1]hal.CanFilter = [hal.CanFilter.exact(0x800, false)]
+    expect_error(esp_twai.plan_filters(&too_large), hal.Error.InvalidInput)
+    many: [9]hal.CanFilter = [hal.CanFilter.all(false), hal.CanFilter.all(false), hal.CanFilter.all(false), hal.CanFilter.all(false), hal.CanFilter.all(false), hal.CanFilter.all(false), hal.CanFilter.all(false), hal.CanFilter.all(false), hal.CanFilter.all(false)]
+    expect_error(esp_twai.plan_filters(&many), hal.Error.InvalidInput)
+}
+
+// Every frame in a set of identifiers, standard and extended, data and
+// remote, against the filters: what the controller returns must be exactly
+// what some filter accepts, and the hardware filter must pass at least those.
+fn check_filters(filters: &[hal.CanFilter]) {
+    config := self_test_config()
+    can := esp_twai.Controller.new(TwaiModel.new(), 40_000_000, &config, filters)!
+    ids: [12]u32 = [0u32, 0x123, 0x124, 0x7FF, 0x100, 0x0F0, 0x1ABC_DEF0, 0x1ABC_DEF1, 0x0123_4567, 0x1FFF_FFFF, 0x048D_0000, 0x18FF_0002]
+    payload: [2]u8 = [0x5A, 0xA5]
+    for &id in ids {
+        for kind in 0u32..4 {
+            extended := (kind & 1) != 0
+            remote := (kind & 2) != 0
+            if extended || id <= hal.CAN_MAX_STANDARD_ID {
+                frame := hal.CanFrame.new()
+                if remote {
+                    frame.set_remote(id, extended, 2)!
+                } else {
+                    frame.set_data(id, extended, &payload)!
+                }
+                expected := false
+                for index in 0..filters.len {
+                    if filters[index].accepts(&frame) {
+                        expected = true
+                    }
+                }
+                if filters.len == 0 {
+                    expected = true
+                }
+                core.assert(can.poll_send(&frame)!)
+                back := hal.CanFrame.new()
+                got := can.poll_receive(&mut back)!
+                core.assert(got == expected)
+                if got {
+                    core.assert(back.same(&frame))
+                }
+                core.assert(!can.poll_receive(&mut back)!)
+            }
+        }
+    }
+    model := can.release()
+    core.assert_eq(model.violations, 0u32)
+}
+
+fn twai_filters() {
+    none: [0]hal.CanFilter = []
+    check_filters(&none)
+    one: [1]hal.CanFilter = [hal.CanFilter.exact(0x123, false)]
+    check_filters(&one)
+    three: [3]hal.CanFilter = [hal.CanFilter.exact(0x123, false), hal.CanFilter.exact(0x7FF, false), hal.CanFilter { id: 0x100, mask: 0x700, extended: false }]
+    check_filters(&three)
+    long: [1]hal.CanFilter = [hal.CanFilter.exact(0x1ABC_DEF0, true)]
+    check_filters(&long)
+    longs: [2]hal.CanFilter = [hal.CanFilter.exact(0x1ABC_DEF0, true), hal.CanFilter.exact(0x0123_4567, true)]
+    check_filters(&longs)
+    near: [2]hal.CanFilter = [hal.CanFilter.exact(0x1ABC_DEF0, true), hal.CanFilter.exact(0x1ABC_DEF1, true)]
+    check_filters(&near)
+    mixed: [3]hal.CanFilter = [hal.CanFilter.exact(0x124, false), hal.CanFilter.exact(0x1FFF_FFFF, true), hal.CanFilter.all(true)]
+    check_filters(&mixed)
+    kinds: [2]hal.CanFilter = [hal.CanFilter.all(false), hal.CanFilter.exact(0x18FF_0002, true)]
+    check_filters(&kinds)
+}
+
+fn twai_frames() {
+    config := self_test_config()
+    none: [0]hal.CanFilter = []
+    can := esp_twai.Controller.new(TwaiModel.new(), 40_000_000, &config, &none)!
+    data: [8]u8 = [1, 2, 3, 4, 5, 6, 7, 8]
+    frame := hal.CanFrame.extended(0x1234_5678, &data)!
+    core.assert(can.poll_send(&frame)!)
+    back := hal.CanFrame.new()
+    core.assert(can.poll_receive(&mut back)! && back.same(&frame))
+    empty := hal.CanFrame.standard(0x7FF, &data[0..0])!
+    core.assert(can.poll_send(&empty)!)
+    core.assert(can.poll_receive(&mut back)! && back.same(&empty) && back.len() == 0)
+    remote := hal.CanFrame.new()
+    remote.set_remote(0x55, false, 8)!
+    core.assert(can.poll_send(&remote)!)
+    core.assert(can.poll_receive(&mut back)! && back.is_remote() && back.len() == 8 && back.id() == 0x55)
+    // FD frames: TWAI is classic CAN only.
+    fd := hal.CanFrame.new()
+    fd.set_fd(0x10, false, &data, false)!
+    expect_error(can.poll_send(&fd), hal.Error.Unsupported)
+    // The register image of a standard frame: info, two identifier bytes.
+    image := frame_bytes(&empty)
+    core.assert(image[0] == 0 && image[1] == 0xFF && image[2] == 0xE0)
+    model := can.release()
+    core.assert_eq(model.violations, 0u32)
+    core.assert_eq(model.last_command, 0x10u32)
+    core.assert(model.timing0 == ((2u32 << 14) | 1) && model.timing1 == ((2u32 << 4) | 15) && model.clock_divider == (1u32 << 8))
+    core.assert((model.mode & MODE_RESET) != 0)
+}
+
+fn twai_overrun() {
+    config := self_test_config()
+    none: [0]hal.CanFilter = []
+    model := TwaiModel.new()
+    can := esp_twai.Controller.new(model, 40_000_000, &config, &none)!
+    data: [8]u8 = [9, 8, 7, 6, 5, 4, 3, 2]
+    // Six extended frames of 13 bytes: four fit the 64 bytes.
+    for index in 0u32..6 {
+        frame := hal.CanFrame.extended(0x100 + index, &data)!
+        core.assert(can.poll_send(&frame)!)
+    }
+    back := hal.CanFrame.new()
+    for index in 0u32..4 {
+        core.assert(can.poll_receive(&mut back)!)
+        core.assert_eq(back.id(), 0x100 + index)
+    }
+    expect_error(can.poll_receive(&mut back), hal.Error.Overrun)
+    core.assert(!can.poll_receive(&mut back)!)
+    // It receives again afterwards.
+    frame := hal.CanFrame.standard(0x42, &data)!
+    core.assert(can.poll_send(&frame)!)
+    core.assert(can.poll_receive(&mut back)! && back.same(&frame))
+    model = can.release()
+    core.assert_eq(model.violations, 0u32)
+}
+
+fn twai_errors() {
+    config := esp_twai.Config.new(250_000)
+    none: [0]hal.CanFilter = []
+    can := esp_twai.Controller.new(TwaiModel.new(), 40_000_000, &config, &none)!
+    core.assert(state_is(&mut can, 0))
+    model := can.release()
+    model.mode = 0
+    model.tec = 130
+    can = esp_twai.Controller.attach(model)
+    core.assert(state_is(&mut can, 1))
+    model = can.release()
+    model.mode = 0
+    model.tec = 0
+    model.rec = 128
+    can = esp_twai.Controller.attach(model)
+    core.assert(state_is(&mut can, 1))
+    // Bus-off: the controller entered reset mode; error_state starts
+    // recovery, which completes as bus time passes.
+    model = can.release()
+    model.bus_off = true
+    model.tec = 127
+    model.rec = 0
+    can = esp_twai.Controller.attach(model)
+    data: [1]u8 = [1]
+    frame := hal.CanFrame.standard(0x1, &data)!
+    expect_error(can.poll_send(&frame), hal.Error.Bus)
+    core.assert(state_is(&mut can, 2))
+    for _ in 0..10 {
+        can.status()
+    }
+    core.assert(state_is(&mut can, 0))
+    core.assert(can.poll_send(&frame)!)
+    model = can.release()
+    core.assert_eq(model.violations, 0u32)
+}
+
+fn twai_sending() {
+    config := esp_twai.Config.new(500_000)
+    none: [0]hal.CanFilter = []
+    model := TwaiModel.new()
+    model.acknowledged = false
+    can := esp_twai.Controller.new(model, 40_000_000, &config, &none)!
+    data: [2]u8 = [0xAB, 0xCD]
+    frame := hal.CanFrame.standard(0x321, &data)!
+    // Nobody acknowledges: the frame stays pending.
+    core.assert(can.poll_send(&frame)!)
+    core.assert(can.is_pending())
+    core.assert(!can.poll_send(&frame)!)
+    can.abort_pending()!
+    core.assert(!can.is_pending())
+    model = can.release()
+    core.assert(model.last_command == 0x01 && model.sent == 0 && model.violations == 0)
+    // One-shot sends with an abort request, and the buffer is free after.
+    config.one_shot = true
+    can = esp_twai.Controller.new(model, 40_000_000, &config, &none)!
+    core.assert(can.poll_send(&frame)!)
+    core.assert(!can.is_pending())
+    model = can.release()
+    core.assert(model.last_command == 0x03 && model.violations == 0)
+    // Acknowledged frames go out as the registers describe them.
+    model.acknowledged = true
+    config.one_shot = false
+    can = esp_twai.Controller.new(model, 40_000_000, &config, &none)!
+    core.assert(can.poll_send(&frame)!)
+    model = can.release()
+    core.assert(model.sent == 1 && model.outbox[0] == 2 && model.outbox[1] == 0x64 && model.outbox[2] == 0x20 && model.outbox[3] == 0xAB && model.outbox[4] == 0xCD)
+    // Listen-only never sends.
+    config.mode = esp_twai.Mode.ListenOnly
+    can = esp_twai.Controller.new(model, 40_000_000, &config, &none)!
+    expect_error(can.poll_send(&frame), hal.Error.Unsupported)
+    can.set_mode(esp_twai.Mode.Normal)
+    core.assert(can.poll_send(&frame)!)
+    model = can.release()
+    core.assert(model.sent == 2 && model.violations == 0)
+}
+
+fn twai_checks() {
+    twai_timing()
+    twai_filter_plans()
+    twai_filters()
+    twai_frames()
+    twai_overrun()
+    twai_errors()
+    twai_sending()
+}
+
+// --- I2S -------------------------------------------------------------------
+
+fn i2s_checks() {
+    // Every standard rate is exact from the 160 MHz PLL clock.
+    rates: [9]u32 = [8000u32, 11_025, 16_000, 22_050, 32_000, 44_100, 48_000, 88_200, 96_000]
+    for &rate in rates {
+        wide := esp_i2s.timing(160_000_000, rate, 32)!
+        core.assert_eq(wide.error_ppm(), 0i32)
+        core.assert_eq(wide.actual_millihertz(), rate as u64 * 1000)
+        narrow := esp_i2s.timing(160_000_000, rate, 16)!
+        core.assert_eq(narrow.error_ppm(), 0i32)
+    }
+    cd := esp_i2s.timing(160_000_000, 44_100, 32)!
+    core.assert(cd.integer == 14 && cd.numerator == 76 && cd.denominator == 441 && cd.bit_divider == 4)
+    core.assert_eq(cd.bit_clock_hz(), 2_822_400u32)
+    slow := esp_i2s.timing(160_000_000, 1000, 32)!
+    core.assert(slow.integer <= 255 && slow.error_ppm() == 0)
+    odd := esp_i2s.timing(160_000_000, 12_345, 32)!
+    core.assert(odd.error_ppm() > -5 && odd.error_ppm() < 5)
+    expect_error(esp_i2s.timing(160_000_000, 0, 32), hal.Error.InvalidInput)
+    expect_error(esp_i2s.timing(160_000_000, 48_000, 24), hal.Error.InvalidInput)
+    expect_error(esp_i2s.timing(160_000_000, 2_000_000, 32), hal.Error.InvalidInput)
+    // Divider fields: b <= a / 2 and b > a / 2.
+    low := esp_i2s.divider_fields(441, 76)
+    core.assert_eq(low, (4u32 << 18) | (61u32 << 9) | 76)
+    high := esp_i2s.divider_fields(4, 3)
+    core.assert_eq(high, (1u32 << 27) | (3u32 << 18) | (0u32 << 9) | 1)
+    core.assert_eq(esp_i2s.divider_fields(1, 0), 0u32)
+    // Slot words: the top bits, or right justified with the sign above.
+    core.assert_eq(esp_i2s.slot_word(0x1234_5678, 24, false), 0x1234_5600u32)
+    core.assert_eq(esp_i2s.slot_word(-0x100, 24, true), 0xFFFF_FFFFu32)
+    core.assert_eq(esp_i2s.slot_word(0x7FFF_0000, 16, true), 0x7FFFu32)
+    core.assert_eq(esp_i2s.slot_sample(0x0000_7FFF, 16, true), 0x7FFF_0000i32)
+    core.assert_eq(esp_i2s.slot_sample(0xFFFF_8000, 16, true), -0x8000_0000i32)
+    core.assert_eq(esp_i2s.slot_sample(0x1234_5678, 24, false), 0x1234_5600i32)
+}
+
+// --- PWM input -------------------------------------------------------------
+
+fn capture_checks() {
+    // 40 MHz ticks: a 1 kHz, 25% signal seen over 10 periods.
+    tracker := esp_capture.Tracker.new(40_000_000, 20_000)
+    capture := hal.PulseCapture.new()
+    core.assert(esp_capture.window_ticks(40_000_000, 20_000) == 800_000)
+    // Watching starts at tick 100 with the line low and no edges yet.
+    core.assert(!tracker.update(0, 0, 0, 100, false, false, &mut capture)!)
+    // The first rising edge at 1000 starts the measurement.
+    core.assert(!tracker.update(1, 1000, 0, 2000, true, false, &mut capture)!)
+    // 20 rising edges later, 20 ms after it, with the last fall 10 us
+    // after the last rise.
+    core.assert(tracker.update(21, 1000 + 800_000, 1000 + 800_000 + 10_000, 1000 + 800_000 + 20_000, false, false, &mut capture)!)
+    core.assert(capture.cycles == 20 && capture.period_ns == 1_000_000 && capture.high_ns == 250_000)
+    core.assert_eq(capture.frequency_hz(), 1000u32)
+    core.assert(tracker.needs_restart())
+    // The counter restarts; the last rising edge is the next reference.
+    tracker.restart(0, 1000 + 800_000, 1000 + 800_000 + 20_000, false)
+    core.assert(!tracker.needs_restart())
+    // A fall before the last rise: high is the period less the low time.
+    core.assert(tracker.update(20, 1000 + 1_600_000, 1000 + 1_600_000 - 30_000, 1000 + 1_600_000 + 5, true, false, &mut capture)!)
+    core.assert(capture.cycles == 20 && capture.high_ns == 250_000)
+    // A steady line over a whole window: cycles 0, high all the time.
+    steady := esp_capture.Tracker.new(40_000_000, 1000)
+    core.assert(!steady.update(0, 0, 0, 0, true, false, &mut capture)!)
+    core.assert(steady.update(0, 0, 0, 40_000, true, false, &mut capture)!)
+    core.assert(capture.cycles == 0 && capture.period_ns == 1_000_000 && capture.high_ns == 1_000_000)
+    core.assert(steady.update(0, 0, 0, 80_000, false, false, &mut capture)! && capture.high_ns == 0)
+    // Counter wrap: Overrun, and the next measurement has begun.
+    expect_error(steady.update(5, 100_000, 90_000, 120_000, false, true, &mut capture), hal.Error.Overrun)
+    // Edges read several periods apart (a signal faster than the reads):
+    // the high time is the rise-to-fall time modulo the period.
+    stale := esp_capture.Tracker.new(40_000_000, 1000)
+    stale.restart(1, 0, 0, false)
+    core.assert(stale.update(11, 400_000, 400_000 - 30_000 - 120_000, 400_010, true, false, &mut capture)!)
+    core.assert(capture.cycles == 10 && capture.period_ns == 1_000_000 && capture.high_ns == 250_000)
+    stale.restart(0, 400_000, 400_010, true)
+    core.assert(stale.update(10, 800_000, 800_000 + 10_000 - 3 * 40_000 + 40_000 * 2, 800_000 + 30_000, false, false, &mut capture)!)
+    core.assert(capture.high_ns == 250_000)
+    // Times wrap with the 32-bit capture timer.
+    core.assert_eq(esp_capture.ticks_between(5, 0xFFFF_FFFB), 10u32)
+    wrapping := esp_capture.Tracker.new(40_000_000, 1000)
+    wrapping.restart(1, 0xFFFF_F000, 0xFFFF_F010, true)
+    core.assert(wrapping.update(2, 35_904, 45_904, 55_904, false, false, &mut capture)!)
+    core.assert(capture.cycles == 1 && capture.period_ns == 1_000_000 && capture.high_ns == 250_000)
+    expect_error(esp_capture.window_ticks_checked(40_000_000, 0), hal.Error.InvalidInput)
+    expect_error(esp_capture.window_ticks_checked(160_000_000, 25_000_001), hal.Error.InvalidInput)
+}
+
+fn main() {
+    twai_checks()
+    i2s_checks()
+    capture_checks()
+}

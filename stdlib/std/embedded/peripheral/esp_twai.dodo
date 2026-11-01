@@ -1,0 +1,737 @@
+package esp_twai
+
+import "std/embedded/hal"
+
+// The Two-Wire Automotive Interface (TWAI) controller of Espressif's chips:
+// TWAI0 and TWAI1 of the ESP32-C6, and the one controller of the ESP32-C3,
+// S3, and H2. It is a CAN 2.0B controller modelled on the NXP SJA1000 in
+// its PeliCAN mode: classic CAN frames with standard (11-bit) and extended
+// (29-bit) identifiers at up to 1 Mbit/s, one transmit buffer, a 64-byte
+// receive FIFO, and one acceptance filter. TWAI has no CAN FD. `Controller`
+// implements hal.Can over any hal.Registers: a `hal.RegisterBlock` on the
+// chip, or a simulated controller in a desktop test. Like any CAN
+// controller it needs a transceiver (such as the SN65HVD230 or TJA1051) to
+// reach a real bus; chips can also join several controllers on one wire
+// without transceivers for short links and self-tests (see the chip
+// package).
+//
+//     config := esp_twai.Config.new(500_000)
+//     filters: [1]hal.CanFilter = [hal.CanFilter.exact(0x123, false)]
+//     can := b.pins.can(tx, rx, &config, &filters)!
+//     hal.send_frame(&mut can, &frame, hal.DEFAULT_POLL_LIMIT)!
+//
+// Bit timing. The controller counts time quanta of 2 * (BRP + 1) cycles of
+// its function clock (the 40 MHz crystal on the ESP32-C6), BRP 0 to 16383,
+// and a bit is a sync quantum, segment 1 of 1 to 16 quanta (TSEG1), and
+// segment 2 of 1 to 8 (TSEG2), with a synchronization jump width of 1 to 4
+// (BUS_TIMING_0 and BUS_TIMING_1). `timing` picks them with hal.can_timing
+// within `limits` (segment 1 and 2 at least 2 quanta, as CAN requires for
+// the information processing time): from 40 MHz, 1 Mbit/s, 800, 500, 250,
+// 125, 100, 50, 20, and 10 kbit/s are exact, down to 50 bit/s. Config sets
+// the sample point (875 thousandths unless set) and triple sampling.
+//
+// Modes. Normal mode takes part in the bus. SelfTest mode sends without
+// needing an acknowledge and receives its own frames back through the
+// filters (the self reception request), so one controller checks itself
+// with nothing but its TX pad looped to its RX pad. ListenOnly mode receives
+// without ever driving the bus: no acknowledges, no error frames, and
+// poll_send reports Unsupported. `one_shot` sends each frame once, without
+// the automatic retransmission after an error or lost arbitration.
+//
+// Filters. The hardware has one acceptance filter: 32 code bits and 32 mask
+// bits (ACR0-3, AMR0-3, in the data registers while in reset mode), used
+// either as one filter (single mode: a standard frame's identifier, RTR
+// bit, and first two data bytes, or an extended frame's whole identifier
+// and RTR bit) or as two (dual mode: two standard identifiers, or the top
+// 16 bits of two extended identifiers). It does not tell standard from
+// extended frames: the same bits are compared with either kind's
+// identifier. hal.CanFilter cannot always be expressed exactly, so the
+// controller programs the hardware filter to pass at least every frame the
+// filters pass, and then checks each received frame against the filters in
+// software, so poll_receive returns exactly the frames hal.CanFilter.accepts
+// for some filter. The hardware part only spares the receive FIFO:
+//
+//   no filters       every frame passes
+//   standard only    dual mode: the first filter exactly, the others merged
+//                    into the second hardware filter (only the identifier
+//                    bits all of them agree on are compared)
+//   one extended     single mode, exact for extended frames
+//   extended only    the merged filter in single mode, or the first filter
+//                    and the merged rest on their top 16 bits in dual mode,
+//                    whichever compares more bits
+//   both kinds       dual mode: the merged standard filters in the first,
+//                    the top 12 bits of the merged extended filters in the
+//                    second
+//
+// Frames the software check drops still took room in the FIFO, and every
+// controller acknowledges every valid frame on the bus whatever its filters.
+// Up to MAX_FILTERS filters; InvalidInput for more, or for an identifier
+// too large for its kind.
+//
+// Receiving. The FIFO holds 64 bytes: frames take 3 bytes plus their data
+// (standard) or 5 plus their data (extended), so it holds 5 standard frames
+// of 8 bytes or 4 extended ones. When a frame arrives with the FIFO full it
+// is lost and the controller marks its place (MISS_ST): poll_receive
+// returns the frames before it, then reports Overrun once, and then the
+// frames received after room was made. poll_receive reads at most one
+// frame the filters pass per call, skipping the ones they drop.
+//
+// Sending. There is one transmit buffer: poll_send writes a frame into it
+// and requests transmission, and reports false while the previous frame is
+// still pending. In Normal mode a frame is retried until another node
+// acknowledges it, so on a bus with no other node the buffer stays full;
+// `abort_pending` cancels it.
+//
+// Errors. The transmit and receive error counters (TEC, REC) decide
+// error_state: Passive from 128, and BusOff once TEC passes 255. A bus-off
+// controller enters reset mode and stops; the controller then starts
+// recovery at once (the default, Config.automatic_recovery), or when
+// `recover` is called. Recovery leaves reset mode, after which the
+// controller waits for 128 runs of 11 recessive bits and becomes error
+// active with both counters 0. poll_send reports Bus while bus-off.
+//
+// Register names follow the ESP32-C6 technical reference manual (Two-wire
+// Automotive Interface).
+
+// Registers, 4 bytes apart (the SJA1000's byte registers, one per word).
+const MODE: usize = 0x00
+const CMD: usize = 0x04
+const STATUS: usize = 0x08
+const INT_RAW: usize = 0x0C
+const INT_ENA: usize = 0x10
+const BUS_TIMING_0: usize = 0x18
+const BUS_TIMING_1: usize = 0x1C
+const ERR_CODE_CAP: usize = 0x30
+const ERR_WARNING_LIMIT: usize = 0x34
+const RX_ERR_CNT: usize = 0x38
+const TX_ERR_CNT: usize = 0x3C
+// DATA_0 to DATA_12: the frame in operating mode (the receive buffer when
+// read, the transmit buffer when written), the acceptance code (ACR0-3)
+// and mask (AMR0-3) in DATA_0 to DATA_7 in reset mode.
+const DATA: usize = 0x40
+const RX_MESSAGE_CNT: usize = 0x74
+const CLOCK_DIVIDER: usize = 0x7C
+
+// MODE: reset mode, listen-only mode, self-test mode, and single filter
+// mode.
+const RESET_MODE: u32 = 1 << 0
+const LISTEN_ONLY_MODE: u32 = 1 << 1
+const SELF_TEST_MODE: u32 = 1 << 2
+const SINGLE_FILTER: u32 = 1 << 3
+// CMD: transmission request, abort transmission, release the receive
+// buffer, clear the data overrun flag, and self reception request.
+const TX_REQ: u32 = 1 << 0
+const ABORT_TX: u32 = 1 << 1
+const RELEASE_BUF: u32 = 1 << 2
+const CLR_OVERRUN: u32 = 1 << 3
+const SELF_RX_REQ: u32 = 1 << 4
+// STATUS: a frame waits in the FIFO, data overrun, the transmit buffer is
+// free, the last transmission completed, receiving, transmitting, an error
+// counter reached the warning limit, bus-off, and the frame at the head of
+// the FIFO was lost to an overrun.
+const RX_BUF_ST: u32 = 1 << 0
+const OVERRUN_ST: u32 = 1 << 1
+const TX_BUF_ST: u32 = 1 << 2
+const TX_COMPLETE_ST: u32 = 1 << 3
+const ERR_ST: u32 = 1 << 6
+const BUS_OFF_ST: u32 = 1 << 7
+const MISS_ST: u32 = 1 << 8
+// CLOCK_DIVIDER: the CLKOUT pin off.
+const CLOCK_OFF: u32 = 1 << 8
+// BUS_TIMING_1: sample each bit three times.
+const TRIPLE_SAMPLING: u32 = 1 << 7
+
+// The frame information byte: an extended frame (FF), a remote frame
+// (RTR), and the data length code.
+const FRAME_FORMAT: u8 = 0x80
+const FRAME_REMOTE: u8 = 0x40
+const FRAME_DLC: u8 = 0x0F
+
+// Interrupt sources for listen and take_interrupts (INT_ENA and INT_RAW
+// bits): a frame waits (RIE), the transmit buffer became free (TIE), the
+// error warning or bus-off status changed (EIE), a data overrun (DOIE), the
+// controller became error passive or active again (EPIE), it lost
+// arbitration (ALIE), and it saw a bus error (BEIE).
+pub const RECEIVE: u32 = 1 << 0
+pub const TRANSMIT: u32 = 1 << 1
+pub const ERROR_WARNING: u32 = 1 << 2
+pub const OVERRUN: u32 = 1 << 3
+pub const ERROR_PASSIVE: u32 = 1 << 5
+pub const ARBITRATION_LOST: u32 = 1 << 6
+pub const BUS_ERROR: u32 = 1 << 7
+
+// The most filters a controller takes.
+pub const MAX_FILTERS: usize = 8
+// Status reads before abort_pending gives up with Timeout. Aborting takes
+// effect at once unless a frame is on the bus, which ends within 160 bit
+// times.
+pub const ABORT_POLLS: u32 = 100_000
+// The error warning limit (ERR_WARNING_LIMIT), the counter level that sets
+// STATUS.ERR_ST: the SJA1000's default.
+pub const WARNING_LIMIT: u32 = 96
+
+// Operating modes after configuration.
+pub enum Mode {
+    // Take part in the bus: send, receive, and acknowledge frames.
+    Normal,
+    // Send without needing an acknowledge and receive one's own frames,
+    // through the filters; for checking a controller with its TX looped to
+    // its RX and no other node.
+    SelfTest,
+    // Receive every valid frame but never send, acknowledge, or signal
+    // errors; for monitoring a bus or detecting its bit rate.
+    ListenOnly
+}
+
+// How `Controller.new` and `configure` set the controller up.
+pub struct Config {
+    pub bitrate: u32
+    // Where to sample each bit, in thousandths of the bit; see "Bit
+    // timing".
+    pub sample_point_permille: u32
+    pub mode: Mode
+    // Send each frame once, without retrying after an error or a lost
+    // arbitration. The transmit buffer is free afterwards either way.
+    pub one_shot: bool
+    // Sample each bit three times and take the majority, for slow, noisy
+    // buses; CiA recommends a single sample above 125 kbit/s.
+    pub triple_sampling: bool
+    // Start recovering from bus-off as soon as the controller is seen
+    // bus-off, instead of when `recover` is called.
+    pub automatic_recovery: bool
+
+    // Normal mode at `bitrate`, sampling once at 87.5%, retrying frames,
+    // recovering from bus-off automatically.
+    pub fn new(bitrate: u32) -> Config {
+        return Config { bitrate, sample_point_permille: 875, mode: Mode.Normal, one_shot: false, triple_sampling: false, automatic_recovery: true }
+    }
+}
+
+// The TWAI bit timing registers for one bit rate.
+pub struct Timing {
+    // BUS_TIMING_0: the synchronization jump width less one (bits 15-14)
+    // and the baud rate prescaler BRP (bits 13-0).
+    pub bus_timing_0: u32
+    // BUS_TIMING_1: segment 2 less one (bits 6-4) and segment 1 less one
+    // (bits 3-0); `configure` adds triple sampling (bit 7).
+    pub bus_timing_1: u32
+    // The bit rate the registers give, rounded, and the sample point.
+    pub bitrate: u32
+    pub sample_point_permille: u32
+}
+
+// The ranges hal.can_timing may choose from for TWAI: prescalers of 2 to
+// 32768 clock cycles in steps of 2, segment 1 of 2 to 16 quanta, segment 2
+// of 2 to 8, and a jump width up to 4.
+pub fn limits() -> hal.CanTimingLimits {
+    return hal.CanTimingLimits { prescaler_min: 2, prescaler_max: 32768, prescaler_step: 2, segment1_min: 2, segment1_max: 16, segment2_min: 2, segment2_max: 8, sync_jump_max: 4 }
+}
+
+// The timing registers for `bitrate` from a function clock of `clock_hz`,
+// sampling near `sample_point_permille`; see "Bit timing" above.
+// InvalidInput if no timing reaches the bit rate within 0.5%.
+pub fn timing(clock_hz: u32, bitrate: u32, sample_point_permille: u32) -> Timing!hal.Error {
+    range := limits()
+    bit := hal.can_timing(clock_hz, bitrate, sample_point_permille, &range)?
+    brp := bit.prescaler / 2 - 1
+    zero := (((bit.sync_jump - 1) & 0x3) << 14) | (brp & 0x3FFF)
+    one := (((bit.segment2 - 1) & 0x7) << 4) | ((bit.segment1 - 1) & 0xF)
+    return ok(Timing { bus_timing_0: zero, bus_timing_1: one, bitrate: bit.bitrate(clock_hz), sample_point_permille: bit.sample_point_permille() })
+}
+
+// The hardware acceptance filter: single or dual mode, and the acceptance
+// code and mask as one 32-bit value each, ACR0 and AMR0 in the top byte.
+// Mask bits set are bits the filter ignores (the hardware's sense).
+pub struct FilterPlan {
+    pub single: bool
+    pub code: u32
+    pub mask: u32
+}
+
+// The hardware filter for `filters`; see "Filters" above. InvalidInput for
+// more than MAX_FILTERS filters or an identifier too large for its kind.
+pub fn plan_filters(filters: &[hal.CanFilter]) -> FilterPlan!hal.Error {
+    if filters.len > MAX_FILTERS {
+        return err(hal.Error.InvalidInput)
+    }
+    standard := 0usize
+    extended := 0usize
+    for index in 0..filters.len {
+        filter := &filters[index]
+        if filter.extended {
+            if filter.id > hal.CAN_MAX_EXTENDED_ID {
+                return err(hal.Error.InvalidInput)
+            }
+            extended += 1
+        } else {
+            if filter.id > hal.CAN_MAX_STANDARD_ID {
+                return err(hal.Error.InvalidInput)
+            }
+            standard += 1
+        }
+    }
+    if filters.len == 0 {
+        return ok(FilterPlan { single: true, code: 0, mask: 0xFFFF_FFFF })
+    }
+    if extended == 0 {
+        // Dual mode: the first standard filter, then the rest merged. The
+        // RTR bit and the data nibbles stay unchecked.
+        first := Merge.new()
+        rest := Merge.new()
+        for index in 0..filters.len {
+            if first.count == 0 {
+                first.add(filters[index].id, filters[index].mask & hal.CAN_MAX_STANDARD_ID)
+            } else {
+                rest.add(filters[index].id, filters[index].mask & hal.CAN_MAX_STANDARD_ID)
+            }
+        }
+        if rest.count == 0 {
+            rest.add(first.code, first.care)
+        }
+        code := (first.code << 21) | (rest.code << 5)
+        care := (first.care << 21) | (rest.care << 5)
+        return ok(FilterPlan { single: false, code, mask: ~care })
+    }
+    if standard == 0 {
+        all := Merge.new()
+        first := Merge.new()
+        rest := Merge.new()
+        for index in 0..filters.len {
+            mask := filters[index].mask & hal.CAN_MAX_EXTENDED_ID
+            all.add(filters[index].id, mask)
+            if first.count == 0 {
+                first.add(filters[index].id, mask)
+            } else {
+                rest.add(filters[index].id, mask)
+            }
+        }
+        if rest.count == 0 || count_bits(all.care) >= smaller(count_bits(first.care >> 13), count_bits(rest.care >> 13)) {
+            // Single mode: the identifier in bits 31-3, RTR unchecked.
+            return ok(FilterPlan { single: true, code: all.code << 3, mask: ~(all.care << 3) })
+        }
+        code := ((first.code >> 13) << 16) | ((rest.code >> 13) & 0xFFFF)
+        care := ((first.care >> 13) << 16) | ((rest.care >> 13) & 0xFFFF)
+        return ok(FilterPlan { single: false, code, mask: ~care })
+    }
+    // Both kinds: dual mode, the standard filters in the first hardware
+    // filter and the top 16 bits of the extended ones in the second.
+    short := Merge.new()
+    long := Merge.new()
+    for index in 0..filters.len {
+        if filters[index].extended {
+            long.add(filters[index].id, filters[index].mask & hal.CAN_MAX_EXTENDED_ID)
+        } else {
+            short.add(filters[index].id, filters[index].mask & hal.CAN_MAX_STANDARD_ID)
+        }
+    }
+    // ACR3's low nibble is also the first filter's check of a standard
+    // frame's first data byte, so the extended filter keeps its top 12
+    // bits.
+    code := (short.code << 21) | ((long.code >> 13) & 0xFFF0)
+    care := (short.care << 21) | ((long.care >> 13) & 0xFFF0)
+    return ok(FilterPlan { single: false, code, mask: ~care })
+}
+
+// Filters merged into one code and mask: only the bits every filter checks
+// and agrees on stay checked ("care" bits).
+struct Merge {
+    code: u32
+    care: u32
+    count: u32
+
+    fn new() -> Merge {
+        return Merge { code: 0, care: 0, count: 0 }
+    }
+
+    fn add(&mut self, id: u32, mask: u32) {
+        if self.count == 0 {
+            self.care = mask
+        } else {
+            self.care = self.care & mask & ~(id ^ self.code)
+        }
+        self.code = id & self.care
+        self.count += 1
+    }
+}
+
+fn count_bits(value: u32) -> u32 {
+    count := 0u32
+    rest := value
+    for rest != 0 {
+        rest = rest & (rest - 1)
+        count += 1
+    }
+    return count
+}
+
+fn smaller(a: u32, b: u32) -> u32 {
+    if a < b {
+        return a
+    }
+    return b
+}
+
+// A frame's 13 bytes as the data registers hold it: the frame information,
+// the identifier (2 bytes standard, 4 extended, left-aligned), and the
+// data. Returns how many bytes the frame uses.
+pub fn encode_frame(frame: &hal.CanFrame, bytes: &mut[13]u8) -> usize {
+    info := frame.dlc() & FRAME_DLC
+    if frame.is_remote() {
+        info = info | FRAME_REMOTE
+    }
+    id := frame.id()
+    start := 3usize
+    if frame.is_extended() {
+        info = info | FRAME_FORMAT
+        raw := id << 3
+        bytes[1] = (raw >> 24) as u8
+        bytes[2] = ((raw >> 16) & 0xFF) as u8
+        bytes[3] = ((raw >> 8) & 0xFF) as u8
+        bytes[4] = (raw & 0xFF) as u8
+        start = 5
+    } else {
+        raw := id << 5
+        bytes[1] = ((raw >> 8) & 0xFF) as u8
+        bytes[2] = (raw & 0xFF) as u8
+    }
+    bytes[0] = info
+    data := frame.bytes()
+    for index in 0..data.len {
+        bytes[start + index] = data[index]
+    }
+    return start + data.len
+}
+
+// Make `frame` the frame in `bytes`, as the data registers hold it. A data
+// length code above 8 means 8 bytes, as classic CAN defines it.
+pub fn decode_frame(bytes: &[13]u8, frame: &mut hal.CanFrame) -> void!hal.Error {
+    info := bytes[0]
+    length := hal.can_dlc_length(info & FRAME_DLC, false)
+    extended := (info & FRAME_FORMAT) != 0
+    id := 0u32
+    start := 3usize
+    if extended {
+        raw := ((bytes[1] as u32) << 24) | ((bytes[2] as u32) << 16) | ((bytes[3] as u32) << 8) | bytes[4] as u32
+        id = raw >> 3
+        start = 5
+    } else {
+        id = (((bytes[1] as u32) << 8) | bytes[2] as u32) >> 5
+    }
+    if (info & FRAME_REMOTE) != 0 {
+        return frame.set_remote(id, extended, length)
+    }
+    return frame.set_data(id, extended, bytes[start..start + length])
+}
+
+// A TWAI controller over registers R, from `new` until `release`.
+pub struct Controller<R: hal.Registers>: hal.Can {
+    registers: R
+    // The MODE bits of the operating mode: listen-only or self-test, and
+    // single filter mode.
+    mode_bits: u32
+    one_shot: bool
+    automatic_recovery: bool
+    // The filters, for the software check: identifier and mask, and a bit
+    // per filter for extended ones.
+    filter_ids: [8]u32
+    filter_masks: [8]u32
+    filter_extended: u32
+    filter_count: usize
+
+    // Take registers R of a controller that is already running, keeping
+    // its configuration, with no filters for the software check and
+    // automatic bus-off recovery; `configure` sets it up. Most programs
+    // call `new` instead.
+    pub fn attach(registers: R) -> Controller<R> {
+        can := Controller<R> { registers, mode_bits: 0, one_shot: false, automatic_recovery: true, filter_ids: [0u32; 8], filter_masks: [0u32; 8], filter_extended: 0, filter_count: 0 }
+        can.mode_bits = can.registers.read(MODE) & (LISTEN_ONLY_MODE | SELF_TEST_MODE | SINGLE_FILTER)
+        return can
+    }
+
+    // Configure the controller with registers R, clocked at `clock_hz`
+    // (the 40 MHz crystal on the ESP32-C6), from `config` and `filters`;
+    // see `configure`. InvalidInput as for `configure`, before the
+    // controller is touched.
+    pub fn new(registers: R, clock_hz: u32, config: &Config, filters: &[hal.CanFilter]) -> Controller<R>!hal.Error {
+        can := Controller<R> { registers, mode_bits: 0, one_shot: false, automatic_recovery: true, filter_ids: [0u32; 8], filter_masks: [0u32; 8], filter_extended: 0, filter_count: 0 }
+        can.configure(clock_hz, config, filters)?
+        return ok(can)
+    }
+
+    // Set the controller up from `config` and `filters`: enter reset mode,
+    // which drops a pending frame and the received ones, clear the error
+    // counters, program the bit timing and the acceptance filter, and start
+    // in the configured mode. InvalidInput for a bit rate the controller
+    // cannot reach or filters it does not take (see "Filters"), before the
+    // controller is touched.
+    pub fn configure(&mut self, clock_hz: u32, config: &Config, filters: &[hal.CanFilter]) -> void!hal.Error {
+        bits := timing(clock_hz, config.bitrate, config.sample_point_permille)?
+        plan := plan_filters(filters)?
+        self.filter_count = filters.len
+        self.filter_extended = 0
+        for index in 0..filters.len {
+            self.filter_ids[index] = filters[index].id
+            self.filter_masks[index] = filters[index].mask
+            if filters[index].extended {
+                self.filter_extended |= 1u32 << index as u32
+            }
+        }
+        self.one_shot = config.one_shot
+        self.automatic_recovery = config.automatic_recovery
+        self.mode_bits = mode_bits(&config.mode)
+        if plan.single {
+            self.mode_bits |= SINGLE_FILTER
+        }
+        // Listen-only freezes the receive error counter while it is set.
+        self.registers.write(MODE, RESET_MODE)
+        self.registers.write(MODE, RESET_MODE | LISTEN_ONLY_MODE)
+        self.registers.write(CLOCK_DIVIDER, CLOCK_OFF)
+        self.registers.write(INT_ENA, 0)
+        self.registers.write(TX_ERR_CNT, 0)
+        self.registers.write(RX_ERR_CNT, 0)
+        self.registers.write(ERR_WARNING_LIMIT, WARNING_LIMIT)
+        self.registers.write(BUS_TIMING_0, bits.bus_timing_0)
+        sampling := 0u32
+        if config.triple_sampling {
+            sampling = TRIPLE_SAMPLING
+        }
+        self.registers.write(BUS_TIMING_1, bits.bus_timing_1 | sampling)
+        for index in 0usize..4 {
+            shift := (24 - 8 * index) as u32
+            self.registers.write(DATA + 4 * index, (plan.code >> shift) & 0xFF)
+            self.registers.write(DATA + 16 + 4 * index, (plan.mask >> shift) & 0xFF)
+        }
+        self.registers.write(MODE, RESET_MODE | self.mode_bits)
+        self.registers.write(MODE, self.mode_bits)
+        return ok()
+    }
+
+    // Switch to `mode`, keeping the bit timing and filters. The controller
+    // passes through reset mode, which drops a pending frame and the
+    // frames in the FIFO; the error counters stay.
+    pub fn set_mode(&mut self, mode: Mode) {
+        filter := self.mode_bits & SINGLE_FILTER
+        self.mode_bits = mode_bits(&mode) | filter
+        current := self.registers.read(MODE)
+        self.registers.write(MODE, current | RESET_MODE)
+        self.registers.write(MODE, RESET_MODE | self.mode_bits)
+        self.registers.write(MODE, self.mode_bits)
+    }
+
+    // Queue `frame` in the transmit buffer and request it; see hal.Can and
+    // "Sending" above. False while the previous frame is pending.
+    // Unsupported for an FD frame, as TWAI sends classic CAN only, and in
+    // ListenOnly mode; Bus while the controller is bus-off.
+    pub fn poll_send(&mut self, frame: &hal.CanFrame) -> bool!hal.Error {
+        if frame.is_fd() || (self.mode_bits & LISTEN_ONLY_MODE) != 0 {
+            return err(hal.Error.Unsupported)
+        }
+        status := self.registers.read(STATUS)
+        if (status & BUS_OFF_ST) != 0 || self.in_reset() {
+            self.recover_if_automatic()
+            return err(hal.Error.Bus)
+        }
+        if (status & TX_BUF_ST) == 0 {
+            return ok(false)
+        }
+        bytes := [0u8; 13]
+        used := encode_frame(frame, &mut bytes)
+        for index in 0..used {
+            self.registers.write(DATA + 4 * index, bytes[index] as u32)
+        }
+        command := TX_REQ
+        if (self.mode_bits & SELF_TEST_MODE) != 0 {
+            command = SELF_RX_REQ
+        }
+        if self.one_shot {
+            command |= ABORT_TX
+        }
+        self.registers.write(CMD, command)
+        return ok(true)
+    }
+
+    // Take the oldest received frame the filters pass into `frame`; see
+    // hal.Can and "Receiving" above. False while none waits, and while the
+    // controller is bus-off. Overrun once where frames were lost.
+    pub fn poll_receive(&mut self, frame: &mut hal.CanFrame) -> bool!hal.Error {
+        // Each pass takes one frame from the FIFO, which holds at most 21.
+        for _ in 0u32..32 {
+            if self.in_reset() {
+                self.recover_if_automatic()
+                return ok(false)
+            }
+            status := self.registers.read(STATUS)
+            if (status & RX_BUF_ST) == 0 {
+                if (status & OVERRUN_ST) != 0 {
+                    self.registers.write(CMD, CLR_OVERRUN)
+                    return err(hal.Error.Overrun)
+                }
+                return ok(false)
+            }
+            if (status & MISS_ST) != 0 {
+                // Drop every lost frame's place, then report them once.
+                for _ in 0u32..32 {
+                    self.registers.write(CMD, RELEASE_BUF)
+                    next := self.registers.read(STATUS)
+                    if (next & RX_BUF_ST) == 0 || (next & MISS_ST) == 0 {
+                        break
+                    }
+                }
+                self.registers.write(CMD, CLR_OVERRUN)
+                return err(hal.Error.Overrun)
+            }
+            bytes := [0u8; 13]
+            bytes[0] = (self.registers.read(DATA) & 0xFF) as u8
+            used := 3usize
+            if (bytes[0] & FRAME_FORMAT) != 0 {
+                used = 5
+            }
+            if (bytes[0] & FRAME_REMOTE) == 0 {
+                used += hal.can_dlc_length(bytes[0] & FRAME_DLC, false)
+            }
+            for index in 1..used {
+                bytes[index] = (self.registers.read(DATA + 4 * index) & 0xFF) as u8
+            }
+            self.registers.write(CMD, RELEASE_BUF)
+            decode_frame(&bytes, frame)?
+            if self.passes(frame) {
+                return ok(true)
+            }
+        }
+        return ok(false)
+    }
+
+    // The fault confinement state: BusOff while STATUS.BUS_OFF_ST is set
+    // (starting recovery if automatic), Passive while either error counter
+    // is 128 or more, else Active.
+    pub fn error_state(&mut self) -> hal.CanErrorState!hal.Error {
+        if (self.registers.read(STATUS) & BUS_OFF_ST) != 0 {
+            self.recover_if_automatic()
+            return ok(hal.CanErrorState.BusOff)
+        }
+        if self.tec() >= 128 || self.rec() >= 128 {
+            return ok(hal.CanErrorState.Passive)
+        }
+        return ok(hal.CanErrorState.Active)
+    }
+
+    // The transmit error counter (TEC): error-passive from 128, bus-off
+    // after 255. During bus-off recovery it counts the runs of 11 recessive
+    // bits still to come down from 127.
+    pub fn tec(&mut self) -> u32 {
+        return self.registers.read(TX_ERR_CNT) & 0xFF
+    }
+
+    // The receive error counter (REC): error-passive from 128.
+    pub fn rec(&mut self) -> u32 {
+        return self.registers.read(RX_ERR_CNT) & 0xFF
+    }
+
+    // The status register (STATUS), for the bits error_state does not
+    // report, such as ERR_ST (bit 6: a counter reached WARNING_LIMIT).
+    pub fn status(&mut self) -> u32 {
+        return self.registers.read(STATUS)
+    }
+
+    // The frames waiting in the FIFO, including the places of lost ones
+    // (RX_MESSAGE_CNT).
+    pub fn waiting(&mut self) -> u32 {
+        return self.registers.read(RX_MESSAGE_CNT) & 0x7F
+    }
+
+    // Whether a frame waits in the transmit buffer.
+    pub fn is_pending(&mut self) -> bool {
+        return (self.registers.read(STATUS) & TX_BUF_ST) == 0
+    }
+
+    // The last bus error the controller saw (ERR_CODE_CAP): its segment
+    // (bits 4-0), whether it was receiving (bit 5), and its kind (bits 7-6:
+    // bit, form, stuff, or other error). Reading it lets the controller
+    // capture the next error.
+    pub fn error_code(&mut self) -> u32 {
+        return self.registers.read(ERR_CODE_CAP) & 0xFF
+    }
+
+    // Cancel the frame waiting to be sent (ABORT_TX) and wait until the
+    // transmit buffer is free; a frame already on the bus finishes first.
+    // Timeout after ABORT_POLLS status reads.
+    pub fn abort_pending(&mut self) -> void!hal.Error {
+        self.registers.write(CMD, ABORT_TX)
+        for _ in 0u32..ABORT_POLLS {
+            if (self.registers.read(STATUS) & TX_BUF_ST) != 0 {
+                return ok()
+            }
+        }
+        return err(hal.Error.Timeout)
+    }
+
+    // Start recovering from bus-off: leave the reset mode the controller
+    // entered, so it counts 128 runs of 11 recessive bits and becomes error
+    // active. Does nothing unless the controller is bus-off.
+    pub fn recover(&mut self) {
+        mode := self.registers.read(MODE)
+        if (self.registers.read(STATUS) & BUS_OFF_ST) != 0 && (mode & RESET_MODE) != 0 {
+            self.registers.write(MODE, mode & ~RESET_MODE)
+        }
+    }
+
+    // Raise the controller's interrupt while any of `sources` (RECEIVE,
+    // TRANSMIT, ..., ORed together) is pending; replaces the set listened
+    // to.
+    pub fn listen(&mut self, sources: u32) {
+        self.registers.write(INT_ENA, sources & 0xFF)
+    }
+
+    // The interrupt sources pending among those listened to, which reading
+    // clears, except RECEIVE, which stays while a frame waits.
+    pub fn take_interrupts(&mut self) -> u32 {
+        return self.registers.read(INT_RAW) & 0x1FF
+    }
+
+    // Enter reset mode, which stops the controller, and return its
+    // registers.
+    pub fn release(self) -> R {
+        self.registers.write(INT_ENA, 0)
+        self.registers.write(MODE, RESET_MODE)
+        let Controller { registers, mode_bits, one_shot, automatic_recovery, filter_ids, filter_masks, filter_extended, filter_count } = self
+        return registers
+    }
+
+    fn in_reset(&mut self) -> bool {
+        return (self.registers.read(MODE) & RESET_MODE) != 0
+    }
+
+    fn recover_if_automatic(&mut self) {
+        if self.automatic_recovery {
+            self.recover()
+        }
+    }
+
+    // Whether some filter passes `frame`, or there are none.
+    fn passes(&self, frame: &hal.CanFrame) -> bool {
+        if self.filter_count == 0 {
+            return true
+        }
+        for index in 0..self.filter_count {
+            extended := (self.filter_extended & (1u32 << index as u32)) != 0
+            if frame.is_extended() == extended && (frame.id() & self.filter_masks[index]) == (self.filter_ids[index] & self.filter_masks[index]) {
+                return true
+            }
+        }
+        return false
+    }
+}
+
+fn mode_bits(mode: &Mode) -> u32 {
+    match mode {
+        Mode.Normal => {
+            return 0
+        }
+        Mode.SelfTest => {
+            return SELF_TEST_MODE
+        }
+        Mode.ListenOnly => {
+            return LISTEN_ONLY_MODE
+        }
+    }
+}

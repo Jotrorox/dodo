@@ -3,13 +3,14 @@
 //! through a serial bootloader that speaks STK500 version 1, such as
 //! Optiboot, which the compiler drives itself (`super::stk500`). The matching
 //! peripheral support is `std/embedded/chip/atmega328p`.
-use super::{Chip, ImageFormat, Platform, Region, avr, image::Segment};
+use super::{Chip, ImageFormat, InterruptAbi, Platform, Region, avr, image::Segment};
 
 pub static CHIP: Chip = Chip {
     name: "atmega328p",
     description: "Microchip ATmega328P",
     triple: "avr-none",
     cpu: "atmega328p",
+    features: "",
     flash_origin: 0,
     // The whole flash; boards subtract their bootloader's section.
     default_flash_size: 32 * 1024,
@@ -51,6 +52,7 @@ pub static CHIP: Chip = Chip {
         "SPM_READY",
     ],
     opt_level: 2,
+    interrupt_abi: InterruptAbi::Vector,
     linker: "ld.lld",
     package: "std/embedded/chip/atmega328p",
     image: ImageFormat::Stk500 {

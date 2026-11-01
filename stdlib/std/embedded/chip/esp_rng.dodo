@@ -1,0 +1,302 @@
+package esp_rng
+
+import "core/mmio"
+import "std/embedded/hal"
+
+// The ESP32-C6's random number generator, with the hal.Rng protocol. The
+// chip package hands it out as `Peripherals.rng`, and boards as `Board.rng`.
+//
+// The generator (RNG_DATA in the LP peripheral block) continuously mixes
+// noise into a 32-bit register that `fill` reads, one word at a time. Its
+// main entropy source is noise from the SAR ADC; the radios add theirs
+// while they run, which Dodo never does; and a secondary source, sampling
+// the asynchronous RC_FAST oscillator, is always mixed in. Espressif
+// guarantees true random numbers only with a main source running: they
+// report that the secondary source alone passed the Dieharder tests, but do
+// not guarantee it.
+//
+// So `fill` turns the SAR ADC's noise source on while it runs, as ESP-IDF's
+// bootloader_random_enable and esp-hal's TrngSource do: the converter's
+// digital controller then converts its internal reference continuously,
+// every 5 us, and `fill` reads one word per conversion, about 800 KB a
+// second. Afterwards it restores the converter's registers as it found
+// them. The converter is shared with `Pins.analog` and `Pins.temperature`,
+// whose one-shot conversions and calibration this setup would disturb, so
+// while an analog input or the temperature sensor is claimed `fill` leaves
+// the converter alone and reads the generator with the secondary source
+// only, a word per microsecond. `has_noise_source` tells which applies:
+// with it, the bytes are fit to seed a cryptographic generator or to be
+// used as keys; without it, they suit seeds, nonces for protocols that do
+// not need secrecy, random delays, and games, but not keys.
+//
+// `fill` reports Bus if the generator repeats a word, which a working one
+// does once in 2^32 words. A generator holds no registers of its own beyond
+// RNG_DATA, but its fills borrow the converter, so one exists at a time; it
+// is not shared with interrupt handlers unless moved there.
+
+// The generator's output, in the LP peripheral block, and the block's clock
+// enables.
+const LP_PERI_CLK_EN: usize = 0x600B_2800
+const RNG_CLOCK: u32 = 1 << 24
+const RNG_DATA: usize = 0x600B_2808
+
+// The SAR ADC's clocks in PCR: SARADC_CONF (APB clock bit 2) and
+// SARADC_CLKM_CONF (the converter's clock: on, crystal, no divider).
+const PCR_SARADC_CONF: usize = 0x6009_6080
+const PCR_SARADC_CLKM_CONF: usize = 0x6009_6084
+const SARADC_APB_CLOCK: u32 = 1 << 2
+const SARADC_RESETS: u32 = (1u32 << 1) | (1u32 << 3)
+const CLKM_ENABLE: u32 = 1 << 22
+const CLKM_SELECT: u32 = 0b11 << 20
+const CLKM_DIVIDER: u32 = 0xFF << 12
+
+// The converter's digital controller.
+const SARADC_CTRL: usize = 0x6000_E000
+const SARADC_CTRL2: usize = 0x6000_E004
+const SARADC_PATT_TAB1: usize = 0x6000_E018
+const TSENS_CTRL: usize = 0x6000_E058
+// CTRL: the SAR clock divider, the pattern length, and the forced power
+// that one-shot conversions (Pins.analog) set. CTRL2: the conversion
+// timer's period and enable. TSENS_CTRL: the temperature sensor is on.
+const SAR_CLOCK_DIVIDER: u32 = 0xFF << 7
+const PATTERN_LENGTH: u32 = 0b111 << 15
+const FORCED_POWER: u32 = 0b11 << 27
+const TIMER_TARGET: u32 = 0xFFF << 12
+const TIMER_ENABLE: u32 = 1 << 24
+const TSENS_POWER_UP: u32 = 1 << 22
+
+// Two patterns, as esp-hal sets them: SAR ADC2 channel 9 and ADC1
+// channel 0, both at 2.5 dB, in the table's third and fourth entries.
+const NOISE_PATTERNS: u32 = (((9u32 << 2) | 1) << 12) | (1u32 << 18)
+
+// The analog configuration bus (regi2c) and the SAR ADC's block on it.
+const MODEM_LPCON_I2C_MST_CLK_CONF: usize = 0x600A_F010
+const MODEM_LPCON_CLK_CONF: usize = 0x600A_F018
+const MODEM_LPCON_CLK_CONF_FORCE_ON: usize = 0x600A_F01C
+const I2C_ANA_MST_I2C0_CTRL: usize = 0x600A_F800
+const I2C_ANA_MST_ANA_CONF1: usize = 0x600A_F81C
+const I2C_ANA_MST_ANA_CONF2: usize = 0x600A_F820
+const ANA_SAR_SELECT: u32 = 1 << 11
+const ANA_SAR_ONLY: u32 = 0x00FF_FDFF
+const ANA_BUSY: u32 = 1 << 25
+const ANA_WRITE: u32 = 1 << 24
+const SAR_ADC_BLOCK: u32 = 0x69
+const ANALOG_POLLS: u32 = 100_000
+// Its registers: SAR1 initial code (0, 1), SAR2 initial code (3, 4), and
+// register 7: the internal reference to SAR1 and SAR2 (ENCAL_REF, bits 4
+// and 6), the noise source on (ENT_RTC, bit 3), and DTEST_RTC (bits 0, 1).
+const REGISTER7_MASK: u32 = 0x5B
+
+// The analog register `index`, 0 to 4, of those above, and the value the
+// noise source needs in its bits.
+fn sar_register(index: usize) -> u32 {
+    if index < 2 {
+        return index as u32
+    } else if index < 4 {
+        return index as u32 + 1
+    }
+    return 7
+}
+
+fn noise_value(index: usize) -> u32 {
+    if index == 4 {
+        return 0x5A
+    } else if index % 2 == 0 {
+        return 0x66
+    }
+    return 0x08
+}
+
+// Microseconds between words: one conversion with the noise source, and
+// 40 bus cycles without.
+const NOISE_SPACING_US: u32 = 5
+const PLAIN_SPACING_US: u32 = 1
+
+// Boot ROM delay, which counts CPU cycles.
+unsafe extern "C" fn ets_delay_us(microseconds: u32)
+
+// The chip's random number generator. Implements hal.Rng.
+pub struct Rng: hal.Rng {
+    // The last word read, to catch a stuck generator.
+    last: u32
+    started: bool
+
+    // The generator, with its clock running.
+    // SAFETY: call once, from the chip's take(): `fill` borrows the SAR
+    // ADC whenever no analog input is claimed.
+    pub unsafe fn take() -> Rng {
+        unsafe {
+            clocks := mmio.read32(LP_PERI_CLK_EN)
+            mmio.write32(LP_PERI_CLK_EN, clocks | RNG_CLOCK)
+        }
+        return Rng { last: 0, started: false }
+    }
+
+    // True when `fill` will mix in the SAR ADC's noise, making its bytes
+    // fit for keys: no analog input and not the temperature sensor is
+    // claimed.
+    pub fn has_noise_source(&self) -> bool {
+        // SAFETY: reads the converter's control and the sensor's power.
+        unsafe {
+            return (mmio.read32(SARADC_CTRL) & FORCED_POWER) == 0 && (mmio.read32(TSENS_CTRL) & TSENS_POWER_UP) == 0
+        }
+    }
+
+    // Fill `bytes`, with the SAR ADC's noise source on unless an analog
+    // input is claimed. Bus if the generator repeats a word.
+    pub fn fill(&mut self, bytes: &mut[u8]) -> void!hal.Error {
+        noise := self.has_noise_source()
+        saved: [12]u32 = [0u32; 12]
+        spacing := PLAIN_SPACING_US
+        if noise {
+            // SAFETY: no analog input owns the converter, and the fill
+            // restores what it changes.
+            unsafe {
+                start_noise(&mut saved)
+            }
+            spacing = NOISE_SPACING_US
+        }
+        stuck := false
+        index := 0usize
+        for index < bytes.len {
+            // SAFETY: RNG_DATA is read-only, and the delay only counts.
+            word := unsafe {
+                ets_delay_us(spacing)
+                mmio.read32(RNG_DATA)
+            }
+            if self.started && word == self.last {
+                stuck = true
+            }
+            self.last = word
+            self.started = true
+            for shift in 0u32..4 {
+                if index < bytes.len {
+                    bytes[index] = ((word >> (8 * shift)) & 0xFF) as u8
+                    index += 1
+                }
+            }
+        }
+        if noise {
+            // SAFETY: as above.
+            unsafe {
+                stop_noise(&saved)
+            }
+        }
+        if stuck {
+            return err(hal.Error.Bus)
+        }
+        return ok()
+    }
+}
+
+// Turn the SAR ADC's noise source on, saving the registers it changes in
+// `saved`: the five analog registers, CTRL, CTRL2, PATT_TAB1, and the two
+// clock registers.
+// SAFETY: the caller owns the converter.
+unsafe fn start_noise(saved: &mut[12]u32) {
+    unsafe {
+        saved[5] = mmio.read32(PCR_SARADC_CONF)
+        saved[6] = mmio.read32(PCR_SARADC_CLKM_CONF)
+        mmio.write32(PCR_SARADC_CONF, saved[5] | SARADC_APB_CLOCK)
+        mmio.write32(PCR_SARADC_CLKM_CONF, (saved[6] & ~(CLKM_SELECT | CLKM_DIVIDER)) | CLKM_ENABLE)
+        saved[7] = mmio.read32(SARADC_CTRL)
+        saved[8] = mmio.read32(SARADC_CTRL2)
+        saved[9] = mmio.read32(SARADC_PATT_TAB1)
+        for index in 0usize..5 {
+            register := sar_register(index)
+            old := analog_read(register)
+            saved[index] = old
+            value := noise_value(index)
+            if register == 7 {
+                value = (old & ~REGISTER7_MASK) | value
+            } else if register == 1 || register == 4 {
+                value = (old & ~0xFu32) | value
+            }
+            analog_write(register, value)
+        }
+        mmio.write32(SARADC_PATT_TAB1, NOISE_PATTERNS)
+        control := saved[7] & ~(SAR_CLOCK_DIVIDER | PATTERN_LENGTH)
+        mmio.write32(SARADC_CTRL, control | hal.encode(PATTERN_LENGTH, 1) | hal.encode(SAR_CLOCK_DIVIDER, 15))
+        timer := saved[8] & ~TIMER_TARGET
+        mmio.write32(SARADC_CTRL2, timer | hal.encode(TIMER_TARGET, 200) | TIMER_ENABLE)
+    }
+}
+
+// Turn the noise source off and put the converter back as it was: its
+// analog registers as saved, and its digital controller through a reset,
+// once the conversion in progress is over; otherwise the one-shot
+// conversions of Pins.analog could no longer finish. Nothing claims the converter here,
+// so its idle reset state is what it had.
+// SAFETY: as for start_noise, with what it saved.
+unsafe fn stop_noise(saved: &[12]u32) {
+    unsafe {
+        mmio.write32(SARADC_CTRL2, saved[8] & ~TIMER_ENABLE)
+        // Let the conversion in progress finish; one takes under 5 us.
+        ets_delay_us(4 * NOISE_SPACING_US)
+        for index in 0usize..5 {
+            analog_write(sar_register(index), saved[index])
+        }
+        mmio.write32(PCR_SARADC_CONF, saved[5] | SARADC_APB_CLOCK | SARADC_RESETS)
+        mmio.write32(PCR_SARADC_CONF, (saved[5] | SARADC_APB_CLOCK) & ~SARADC_RESETS)
+        mmio.write32(SARADC_CTRL, saved[7])
+        mmio.write32(SARADC_PATT_TAB1, saved[9])
+        mmio.write32(SARADC_CTRL2, saved[8])
+        mmio.write32(PCR_SARADC_CLKM_CONF, saved[6])
+        mmio.write32(PCR_SARADC_CONF, saved[5])
+    }
+}
+
+// The analog bus master that reaches the SAR ADC, with its clock on.
+// SAFETY: the caller owns the converter's analog registers.
+unsafe fn analog_master() -> usize {
+    unsafe {
+        clock := mmio.read32(MODEM_LPCON_CLK_CONF)
+        mmio.write32(MODEM_LPCON_CLK_CONF, clock | (1u32 << 2))
+        // Kept on even where the PMU gates the radio domain's clocks, or
+        // the bus loses writes (CLK_CONF_FORCE_ON.CLK_I2C_MST_FO).
+        forced := mmio.read32(MODEM_LPCON_CLK_CONF_FORCE_ON)
+        mmio.write32(MODEM_LPCON_CLK_CONF_FORCE_ON, forced | (1u32 << 2))
+        source := mmio.read32(MODEM_LPCON_I2C_MST_CLK_CONF)
+        mmio.write32(MODEM_LPCON_I2C_MST_CLK_CONF, source | 1)
+        if (mmio.read32(I2C_ANA_MST_ANA_CONF2) & ANA_SAR_SELECT) == 0 {
+            return I2C_ANA_MST_I2C0_CTRL + 4
+        }
+        return I2C_ANA_MST_I2C0_CTRL
+    }
+}
+
+// Register `register` of the SAR ADC on the analog bus.
+// SAFETY: as for analog_master.
+unsafe fn analog_read(register: u32) -> u32 {
+    unsafe {
+        master := analog_master()
+        mmio.write32(I2C_ANA_MST_ANA_CONF1, ANA_SAR_ONLY)
+        wait_analog(master)
+        mmio.write32(master, SAR_ADC_BLOCK | (register << 8))
+        wait_analog(master)
+        return (mmio.read32(master) >> 16) & 0xFF
+    }
+}
+
+// Write `value` to register `register` of the SAR ADC.
+// SAFETY: as for analog_master.
+unsafe fn analog_write(register: u32, value: u32) {
+    unsafe {
+        master := analog_master()
+        mmio.write32(I2C_ANA_MST_ANA_CONF1, ANA_SAR_ONLY)
+        wait_analog(master)
+        mmio.write32(master, SAR_ADC_BLOCK | (register << 8) | ((value & 0xFF) << 16) | ANA_WRITE)
+        wait_analog(master)
+    }
+}
+
+// SAFETY: reads the analog bus master's status.
+unsafe fn wait_analog(master: usize) {
+    unsafe {
+        for _ in 0..ANALOG_POLLS {
+            if (mmio.read32(master) & ANA_BUSY) == 0 {
+                return
+            }
+        }
+    }
+}
