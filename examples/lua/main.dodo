@@ -1,0 +1,813 @@
+package main
+
+// Standalone Lua interpreter, equivalent to the reference `lua` program:
+//
+//     lua [options] [script [args]]
+//
+//   -e stat   execute string 'stat'
+//   -i        enter interactive mode after executing 'script'
+//   -l mod    require library 'mod' into global 'mod'
+//   -l g=mod  require library 'mod' into global 'g'
+//   -v        show version information
+//   -E        ignore environment variables
+//   -W        turn warnings on
+//   --        stop handling options
+//   -         stop handling options and execute stdin
+//
+// Build: dodo build examples/lua -O 2 -o build/lua
+
+import "core/mem"
+import "core/ptr"
+import "std/env"
+import "std/platform"
+import "std/script/lua"
+
+unsafe extern "C" fn isatty(fd: i32) -> i32
+unsafe extern "C" fn fgets(buf: *mut u8, n: i32, f: *mut u8) -> *mut u8
+unsafe extern "C" fn fputs(s: *const u8, f: *mut u8) -> i32
+unsafe extern "C" fn fflush(f: *mut u8) -> i32
+
+const MAX_ARGS: usize = 256
+
+// Command-line arguments, copied into owned storage.
+struct Args {
+    data: [65536]u8
+    starts: [256]usize
+    ends: [256]usize
+    count: usize
+
+    fn get(&self, i: usize) -> &[u8] {
+        return self.data[self.starts[i]..self.ends[i]]
+    }
+}
+
+fn collect_os_args(out: &mut Args) {
+    storage := platform.list_workspace()
+    match env.Arguments.capture(&mut storage, platform.TextPolicy.Replace) {
+        ok(arguments) => {
+            a := arguments
+            buf := [0u8; 32768]
+            pos := 0usize
+            for out.count < MAX_ARGS {
+                match a.next(&mut buf) {
+                    ok(v) => {
+                        match v {
+                            some(s) => {
+                                let b = mem.str_bytes(s)
+                                if pos + b.len > out.data.len {
+                                    break
+                                }
+                                out.starts[out.count] = pos
+                                for i in 0usize..b.len {
+                                    out.data[pos + i] = b[i]
+                                }
+                                pos += b.len
+                                out.ends[out.count] = pos
+                                out.count += 1
+                            },
+                            none => { break },
+                        }
+                    },
+                    err(_) => { break },
+                }
+            }
+        },
+        err(_) => {},
+    }
+}
+
+fn eq(a: &[u8], b: &str) -> bool {
+    let bb = mem.str_bytes(b)
+    if a.len != bb.len {
+        return false
+    }
+    for i in 0usize..a.len {
+        if a[i] != bb[i] {
+            return false
+        }
+    }
+    return true
+}
+
+// Interpreter state shared by the helpers.
+struct Prog {
+    name: [512]u8
+    name_len: usize
+    // Messages are printed without the program name inside the REPL.
+    quiet_name: bool
+
+    fn progname(&self) -> &[u8] {
+        return self.name[0..self.name_len]
+    }
+}
+
+fn message(prog: &Prog, msg: &[u8]) {
+    if !prog.quiet_name {
+        lua.write_stderr(prog.progname())
+        lua.write_stderr(b": ")
+    }
+    lua.write_stderr(msg)
+    lua.write_stderr(b"\n")
+}
+
+// Print the error message on top of the stack (if status is an error).
+fn report(cx: &mut lua.Cx, prog: &Prog, status: i32) -> i32 {
+    if status != lua.OK {
+        match cx.to_lstr(-1) {
+            ok(v) => {
+                match v {
+                    some(s) => { message(prog, s.bytes()) },
+                    none => { message(prog, b"(error object is not a string)") },
+                }
+            },
+            err(_) => { message(prog, b"not enough memory") },
+        }
+        cx.pop(1)
+    }
+    return status
+}
+
+// Message handler: add a traceback to string messages; convert other
+// error objects with __tostring or describe their type.
+fn msghandler(cx: &mut lua.Cx) -> i32!lua.Throw {
+    if cx.type_of(1) != lua.TSTRING && cx.type_of(1) != lua.TNUMBER {
+        if cx.call_meta(1, "__tostring")? && cx.type_of(-1) == lua.TSTRING {
+            return ok(1)
+        }
+        b := lua.Buffer.new(cx)
+        b.add_str("(error object is a ")?
+        let t = cx.type_of(1)
+        b.add_str(cx.type_name(t))?
+        b.add_str(" value)")?
+        b.push_result(cx)?
+    } else {
+        cx.push_value(1)
+    }
+    let msg = cx.to_lstr(-1)?
+    match msg {
+        some(m) => {
+            // Traceback of this same thread.
+            co := cx.thread_handle()
+            cx.traceback(&mut co, some(m.bytes()), 1)?
+        },
+        none => {},
+    }
+    return ok(1)
+}
+
+fn docall(cx: &mut lua.Cx, narg: i32, nres: i32) -> i32 {
+    let base = cx.get_top() - narg
+    match cx.push_native(msghandler) {
+        ok() => {},
+        err(_) => { return lua.ERRMEM },
+    }
+    cx.insert(base)
+    let status = cx.pcall(narg, nres, base)
+    cx.remove(base)
+    return status
+}
+
+fn dochunk(cx: &mut lua.Cx, prog: &Prog, status0: i32) -> i32 {
+    status := status0
+    if status == lua.OK {
+        status = docall(cx, 0, 0)
+    }
+    return report(cx, prog, status)
+}
+
+fn dofile(cx: &mut lua.Cx, prog: &Prog, name: Option<&[u8]>) -> i32 {
+    let st = cx.load_file(name, b"bt")
+    return dochunk(cx, prog, st)
+}
+
+fn dostring(cx: &mut lua.Cx, prog: &Prog, s: &[u8], name: &[u8]) -> i32 {
+    let st = cx.load_bytes(s, name, b"bt")
+    return dochunk(cx, prog, st)
+}
+
+// `-l mod` / `-l g=mod`: global[g] = require(mod).
+fn dolibrary(cx: &mut lua.Cx, prog: &Prog, spec: &[u8]) -> i32 {
+    eqpos := spec.len
+    for i in 0usize..spec.len {
+        if spec[i] == b'=' {
+            eqpos = i
+            break
+        }
+    }
+    gname := spec
+    modname := spec
+    if eqpos < spec.len {
+        gname = spec[0..eqpos]
+        modname = spec[eqpos + 1..spec.len]
+    } else {
+        // Without "=": the global name stops at the first '-'.
+        for i in 0usize..spec.len {
+            if spec[i] == b'-' {
+                gname = spec[0..i]
+                break
+            }
+        }
+    }
+    match cx.get_global("require") {
+        ok(_) => {},
+        err(_) => { return report(cx, prog, lua.ERRMEM) },
+    }
+    match cx.push_bytes(modname) {
+        ok() => {},
+        err(_) => { return report(cx, prog, lua.ERRMEM) },
+    }
+    let status = docall(cx, 1, 1)
+    if status == lua.OK {
+        match cx.push_bytes(gname) {
+            ok() => {},
+            err(_) => { return report(cx, prog, lua.ERRMEM) },
+        }
+        cx.insert(-2)
+        cx.push_global_table()
+        cx.insert(-3)
+        match cx.set_table(-3) {
+            ok() => {},
+            err(_) => {},
+        }
+        cx.pop(1)
+    }
+    return report(cx, prog, status)
+}
+
+fn print_version() {
+    lua.write_stdout(mem.str_bytes(lua.COPYRIGHT))
+    lua.write_stdout(b"\n")
+    lua.flush_stdout()
+}
+
+fn print_usage(prog: &Prog, badoption: &[u8]) {
+    lua.write_stderr(prog.progname())
+    lua.write_stderr(b": ")
+    if badoption.len > 1 && (badoption[1] == b'e' || badoption[1] == b'l') {
+        lua.write_stderr(b"'")
+        lua.write_stderr(badoption)
+        lua.write_stderr(b"' needs argument\n")
+    } else {
+        lua.write_stderr(b"unrecognized option '")
+        lua.write_stderr(badoption)
+        lua.write_stderr(b"'\n")
+    }
+    lua.write_stderr(b"usage: ")
+    lua.write_stderr(prog.progname())
+    lua.write_stderr(b" [options] [script [args]]\nAvailable options are:\n  -e stat   execute string 'stat'\n  -i        enter interactive mode after executing 'script'\n  -l mod    require library 'mod' into global 'mod'\n  -l g=mod  require library 'mod' into global 'g'\n  -v        show version information\n  -E        ignore environment variables\n  -W        turn warnings on\n  --        stop handling options\n  -         stop handling options and execute stdin\n")
+}
+
+const HAS_ERROR: i32 = 1
+const HAS_I: i32 = 2
+const HAS_V: i32 = 4
+const HAS_E: i32 = 8
+const HAS_BIGE: i32 = 16
+
+// Scan options; returns the flags and stores the index of the script (or
+// the argument count when there is none) in *first.
+fn collect_args(args: &Args, first: &mut usize) -> i32 {
+    flags := 0i32
+    i := 1usize
+    for i < args.count {
+        *first = i
+        let a = args.get(i)
+        if a.len == 0 || a[0] != b'-' {
+            return flags
+        }
+        if a.len == 1 {
+            // "-": script is stdin.
+            return flags
+        }
+        let c = a[1]
+        if c == b'-' {
+            if a.len != 2 {
+                return HAS_ERROR
+            }
+            *first = i + 1
+            return flags
+        } else if c == b'E' {
+            if a.len != 2 {
+                return HAS_ERROR
+            }
+            flags = flags | HAS_BIGE
+        } else if c == b'W' {
+            if a.len != 2 {
+                return HAS_ERROR
+            }
+        } else if c == b'i' {
+            if a.len != 2 {
+                return HAS_ERROR
+            }
+            flags = flags | HAS_I | HAS_V
+        } else if c == b'v' {
+            if a.len != 2 {
+                return HAS_ERROR
+            }
+            flags = flags | HAS_V
+        } else if c == b'e' || c == b'l' {
+            if c == b'e' {
+                flags = flags | HAS_E
+            }
+            if a.len == 2 {
+                i += 1
+                if i >= args.count || (args.get(i).len > 0 && args.get(i)[0] == b'-') {
+                    return HAS_ERROR
+                }
+            }
+        } else {
+            return HAS_ERROR
+        }
+        i += 1
+    }
+    *first = args.count
+    return flags
+}
+
+// Run -e and -l options (and -W) in order.
+fn run_args(cx: &mut lua.Cx, prog: &Prog, args: &Args, n: usize) -> bool {
+    i := 1usize
+    for i < n {
+        let a = args.get(i)
+        let c = a[1]
+        if c == b'e' || c == b'l' {
+            extra := a[2..a.len]
+            if extra.len == 0 {
+                i += 1
+                extra = args.get(i)
+            }
+            let st = if c == b'e' { dostring(cx, prog, extra, b"=(command line)") } else { dolibrary(cx, prog, extra) }
+            if st != lua.OK {
+                return false
+            }
+        } else if c == b'W' {
+            cx.warning(b"@on", false)
+        }
+        i += 1
+    }
+    return true
+}
+
+// Global `arg`: arg[0] = script, negative indices for the interpreter and
+// its options, positive for the script arguments.
+fn create_arg_table(cx: &mut lua.Cx, args: &Args, script0: usize) -> void!lua.Throw {
+    script := script0
+    if script == args.count {
+        script = 0
+    }
+    let narg = (args.count as i32) - (script as i32) - 1
+    cx.create_table(if narg > 0 { narg } else { 0 }, (script as i32) + 1)?
+    for i in 0usize..args.count {
+        cx.push_bytes(args.get(i))?
+        cx.raw_set_i(-2, (i as i64) - (script as i64))?
+    }
+    return cx.set_global("arg")
+}
+
+fn handle_script(cx: &mut lua.Cx, prog: &Prog, args: &Args, script: usize) -> i32 {
+    let fname = args.get(script)
+    status := 0i32
+    if eq(fname, "-") && (script == 0 || !eq(args.get(script - 1), "--")) {
+        status = cx.load_file(none, b"bt")
+    } else {
+        status = cx.load_file(some(fname), b"bt")
+    }
+    if status == lua.OK {
+        // Push the script arguments.
+        match cx.get_global("arg") {
+            ok(_) => {},
+            err(_) => { return report(cx, prog, lua.ERRMEM) },
+        }
+        n := 0i32
+        match cx.len_of(-1) {
+            ok(v) => { n = v as i32 },
+            err(_) => {},
+        }
+        if !cx.check_stack(n + 3) {
+            cx.pop(1)
+            return report(cx, prog, lua.ERRRUN)
+        }
+        for i in 1i32..(n + 1) {
+            match cx.get_i(-i, i as i64) {
+                ok(_) => {},
+                err(_) => {},
+            }
+        }
+        cx.remove(-n - 1)
+        status = docall(cx, n, lua.MULTRET_ALL)
+    }
+    return report(cx, prog, status)
+}
+
+// --- Interactive mode -------------------------------------------------------
+
+fn get_prompt(cx: &mut lua.Cx, firstline: bool) -> void!lua.Throw {
+    let name = if firstline { "_PROMPT" } else { "_PROMPT2" }
+    if cx.get_global(name)? == lua.TNIL {
+        cx.pop(1)
+        cx.push_str(if firstline { "> " } else { ">> " })?
+    } else {
+        cx.to_lstring_meta(-1)?
+        cx.remove(-2)
+    }
+    return ok()
+}
+
+// Read a line (prompting) and push it; false at end of input.
+fn push_line(cx: &mut lua.Cx, firstline: bool) -> bool {
+    match get_prompt(cx, firstline) {
+        ok() => {},
+        err(_) => { return false },
+    }
+    match cx.to_lstr(-1) {
+        ok(v) => {
+            match v {
+                some(p) => { lua.write_stdout(p.bytes()) },
+                none => {},
+            }
+        },
+        err(_) => {},
+    }
+    lua.flush_stdout()
+    cx.pop(1)
+    buf := [0u8; 512]
+    line := lua.Buffer.new(cx)
+    got := false
+    unsafe {
+        for {
+            let r = fgets(ptr.as_mut_ptr(&mut buf), 512, lua.c_stdin())
+            if ptr.is_null(r) {
+                break
+            }
+            got = true
+            n := 0usize
+            for n < 512 && buf[n] != 0 {
+                n += 1
+            }
+            match line.add_bytes(buf[0..n]) {
+                ok() => {},
+                err(_) => { return false },
+            }
+            if n > 0 && buf[n - 1] == b'\n' {
+                break
+            }
+        }
+    }
+    if !got {
+        return false
+    }
+    let b = line.bytes()
+    l := b.len
+    if l > 0 && b[l - 1] == b'\n' {
+        l -= 1
+    }
+    let text = b[0..l]
+    if firstline && l > 0 && text[0] == b'=' {
+        tmp := lua.Buffer.new(cx)
+        match tmp.add_str("return ") {
+            ok() => {},
+            err(_) => { return false },
+        }
+        match tmp.add_bytes(text[1..l]) {
+            ok() => {},
+            err(_) => { return false },
+        }
+        match tmp.push_result(cx) {
+            ok() => {},
+            err(_) => { return false },
+        }
+    } else {
+        match cx.push_bytes(text) {
+            ok() => {},
+            err(_) => { return false },
+        }
+    }
+    return true
+}
+
+// Try "return <line>;" first.
+fn add_return(cx: &mut lua.Cx) -> i32 {
+    b := lua.Buffer.new(cx)
+    match cx.to_lstr(-1) {
+        ok(v) => {
+            match v {
+                some(s) => {
+                    match b.add_str("return ") {
+                        ok() => {},
+                        err(_) => { return lua.ERRMEM },
+                    }
+                    match b.add_bytes(s.bytes()) {
+                        ok() => {},
+                        err(_) => { return lua.ERRMEM },
+                    }
+                    match b.add_str(";") {
+                        ok() => {},
+                        err(_) => { return lua.ERRMEM },
+                    }
+                },
+                none => {},
+            }
+        },
+        err(_) => { return lua.ERRMEM },
+    }
+    let status = cx.load_bytes(b.bytes(), b"=stdin", b"bt")
+    if status == lua.OK {
+        cx.remove(-2)
+    } else {
+        cx.pop(1)
+    }
+    return status
+}
+
+// A syntax error ending in "<eof>" means the chunk is incomplete.
+fn incomplete(cx: &mut lua.Cx, status: i32) -> bool {
+    if status != lua.ERRSYNTAX {
+        return false
+    }
+    match cx.to_lstr(-1) {
+        ok(v) => {
+            match v {
+                some(s) => {
+                    let m = s.bytes()
+                    let mark = b"<eof>"
+                    if m.len >= mark.len {
+                        okm := true
+                        for i in 0usize..mark.len {
+                            if m[m.len - mark.len + i] != mark[i] {
+                                okm = false
+                            }
+                        }
+                        if okm {
+                            cx.pop(1)
+                            return true
+                        }
+                    }
+                },
+                none => {},
+            }
+        },
+        err(_) => {},
+    }
+    return false
+}
+
+fn multiline(cx: &mut lua.Cx) -> i32 {
+    for {
+        status := lua.OK
+        match cx.to_lstr(1) {
+            ok(v) => {
+                match v {
+                    some(s) => { status = cx.load_bytes(s.bytes(), b"=stdin", b"bt") },
+                    none => { return lua.ERRRUN },
+                }
+            },
+            err(_) => { return lua.ERRMEM },
+        }
+        if !incomplete(cx, status) || !push_line(cx, false) {
+            return status
+        }
+        match cx.push_str("\n") {
+            ok() => {},
+            err(_) => { return lua.ERRMEM },
+        }
+        cx.insert(-2)
+        match cx.concat(3) {
+            ok() => {},
+            err(_) => { return lua.ERRMEM },
+        }
+    }
+}
+
+// Read a complete chunk: returns its load status, or -1 at end of input.
+fn load_line(cx: &mut lua.Cx) -> i32 {
+    cx.set_top(0)
+    if !push_line(cx, true) {
+        return -1
+    }
+    status := add_return(cx)
+    if status != lua.OK {
+        status = multiline(cx)
+    }
+    cx.remove(1)
+    return status
+}
+
+fn print_results(cx: &mut lua.Cx, prog: &Prog) {
+    let n = cx.get_top()
+    if n > 0 {
+        match cx.get_global("print") {
+            ok(_) => {},
+            err(_) => { return },
+        }
+        cx.insert(1)
+        if cx.pcall(n, 0, 0) != lua.OK {
+            b := lua.Buffer.new(cx)
+            match b.add_str("error calling 'print' (") {
+                ok() => {},
+                err(_) => {},
+            }
+            match cx.to_lstr(-1) {
+                ok(v) => {
+                    match v {
+                        some(s) => {
+                            match b.add_bytes(s.bytes()) {
+                                ok() => {},
+                                err(_) => {},
+                            }
+                        },
+                        none => {},
+                    }
+                },
+                err(_) => {},
+            }
+            match b.add_str(")") {
+                ok() => {},
+                err(_) => {},
+            }
+            message(prog, b.bytes())
+        }
+    }
+}
+
+fn do_repl(cx: &mut lua.Cx, prog: &mut Prog) {
+    prog.quiet_name = true
+    for {
+        status := load_line(cx)
+        if status == -1 {
+            break
+        }
+        if status == lua.OK {
+            status = docall(cx, 0, lua.MULTRET_ALL)
+        }
+        if status == lua.OK {
+            print_results(cx, prog)
+        } else {
+            report(cx, prog, status)
+        }
+    }
+    cx.set_top(0)
+    lua.write_stdout(b"\n")
+    lua.flush_stdout()
+    prog.quiet_name = false
+}
+
+// LUA_INIT_5_4 or LUA_INIT: "@file" runs a file, anything else is code.
+fn handle_luainit(cx: &mut lua.Cx, prog: &Prog) -> i32 {
+    ws := env.Workspace.new()
+    out := [0u8; 4096]
+    name := "=LUA_INIT_5_4"
+    value := ""
+    found := false
+    match env.get("LUA_INIT_5_4", &mut out, &mut ws, platform.TextPolicy.Replace) {
+        ok(v) => {
+            match v {
+                some(s) => {
+                    value = s
+                    found = true
+                },
+                none => {},
+            }
+        },
+        err(_) => {},
+    }
+    out2 := [0u8; 4096]
+    if !found {
+        name = "=LUA_INIT"
+        match env.get("LUA_INIT", &mut out2, &mut ws, platform.TextPolicy.Replace) {
+            ok(v) => {
+                match v {
+                    some(s) => {
+                        value = s
+                        found = true
+                    },
+                    none => {},
+                }
+            },
+            err(_) => {},
+        }
+    }
+    if !found {
+        return lua.OK
+    }
+    let b = mem.str_bytes(value)
+    if b.len > 0 && b[0] == b'@' {
+        return dofile(cx, prog, some(b[1..b.len]))
+    }
+    return dostring(cx, prog, b, mem.str_bytes(name))
+}
+
+fn pmain(cx: &mut lua.Cx, prog: &mut Prog, args: &Args) -> bool {
+    script := 0usize
+    let flags = collect_args(args, &mut script)
+    if flags == HAS_ERROR {
+        print_usage(prog, args.get(script))
+        return false
+    }
+    if (flags & HAS_V) != 0 {
+        print_version()
+    }
+    if (flags & HAS_BIGE) != 0 {
+        cx.push_boolean(true)
+        match cx.set_field(lua.REGISTRY_INDEX, "LUA_NOENV") {
+            ok() => {},
+            err(_) => {},
+        }
+    }
+    match cx.open_libs() {
+        ok() => {},
+        err(_) => { return false },
+    }
+    match create_arg_table(cx, args, script) {
+        ok() => {},
+        err(_) => { return false },
+    }
+    cx.gc_restart()
+    cx.gc_generational(0, 0)
+    if (flags & HAS_BIGE) == 0 {
+        if handle_luainit(cx, prog) != lua.OK {
+            return false
+        }
+    }
+    if !run_args(cx, prog, args, script) {
+        return false
+    }
+    if script < args.count {
+        if handle_script(cx, prog, args, script) != lua.OK {
+            return false
+        }
+    }
+    if (flags & HAS_I) != 0 {
+        do_repl(cx, prog)
+    } else if script == args.count && (flags & (HAS_E | HAS_V)) == 0 {
+        unsafe {
+            if isatty(0) != 0 {
+                print_version()
+                do_repl(cx, prog)
+            } else {
+                if dofile(cx, prog, none) != lua.OK {
+                    return false
+                }
+            }
+        }
+    }
+    return true
+}
+
+// The program runs inside a protected native call (like the reference
+// interpreter), so tracebacks end with its "[C]: in ?" frame.
+fn pmain_native(cx: &mut lua.Cx) -> i32!lua.Throw {
+    unsafe {
+        let prog = cx.to_userdata(1) as *mut Prog
+        let args = cx.to_userdata(2) as *mut Args
+        cx.set_top(0)
+        owner1 := 0u8
+        owner2 := 0u8
+        let good = pmain(cx, ptr.borrow_mut(prog, &mut owner1), ptr.borrow(args, &owner2))
+        cx.push_boolean(good)
+        return ok(1)
+    }
+}
+
+fn main() -> i32 {
+    args := Args { data: [0u8; 65536], starts: [0usize; 256], ends: [0usize; 256], count: 0 }
+    collect_os_args(&mut args)
+    prog := Prog { name: [0u8; 512], name_len: 0, quiet_name: false }
+    if args.count > 0 && args.get(0).len > 0 && args.get(0).len < 512 {
+        let n = args.get(0)
+        for i in 0usize..n.len {
+            prog.name[i] = n[i]
+        }
+        prog.name_len = n.len
+    } else {
+        let d = b"lua"
+        for i in 0usize..3 {
+            prog.name[i] = d[i]
+        }
+        prog.name_len = 3
+    }
+    match lua.Lua.new() {
+        ok(state) => {
+            s := state
+            cx := s.cx()
+            match cx.push_native(pmain_native) {
+                ok() => {},
+                err(_) => { return 1 },
+            }
+            unsafe {
+                cx.push_light_userdata(ptr.from_mut(&mut prog) as *mut u8)
+                cx.push_light_userdata(ptr.from_mut(&mut args) as *mut u8)
+            }
+            let status = cx.pcall(2, 1, 0)
+            let good = cx.to_boolean(-1)
+            report(&mut cx, &prog, status)
+            lua.flush_stdout()
+            if status == lua.OK && good {
+                return 0
+            }
+            return 1
+        },
+        err(_) => {
+            message(&prog, b"cannot create state: not enough memory")
+            return 1
+        },
+    }
+}

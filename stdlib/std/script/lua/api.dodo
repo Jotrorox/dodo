@@ -1121,6 +1121,17 @@ pub struct Cx {
         }
     }
 
+    // Another handle on the same thread (for APIs that take a thread
+    // argument, such as traceback, applied to the current thread).
+    pub fn thread_handle(&self) -> Cx {
+        return Cx { L: self.L }
+    }
+
+    // Open every standard library available in this build into the globals.
+    pub fn open_libs(&mut self) -> void!Throw {
+        return open_all_libs(self)
+    }
+
     // Same universe check: whether two handles are the same thread.
     pub fn same_thread(&self, other: &Cx) -> bool {
         return self.L == other.L
