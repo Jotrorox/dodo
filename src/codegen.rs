@@ -492,9 +492,16 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         Ok(self.context.struct_type(&fields, false))
     }
     /// LLVM has no union type. A zero-length array supplies the strictest
-    /// alignment, while bytes preserve every alternative's representation when
-    /// the enclosing aggregate is copied or passed by value. Using a real
-    /// alternative as storage would lose bytes in its padding or narrow fields.
+    /// alignment, while an array of padding-free integers preserves every
+    /// alternative's representation when the enclosing aggregate is copied or
+    /// passed by value. Using a real alternative as storage would lose bytes in
+    /// its padding or narrow fields.
+    ///
+    /// The integers are as wide as the alignment allows, up to a pointer: LLVM
+    /// returns each array element of a first-class aggregate in its own
+    /// register, so byte elements made a `T!E` with an 8-byte payload need
+    /// eight registers, which demoted the return to a hidden memory slot that
+    /// the caller then reassembled byte by byte.
     fn union_storage(&self, alternatives: &[LlvmType<'ctx>]) -> Result<LlvmType<'ctx>> {
         let mut aligner: LlvmType<'ctx> = self.context.i8_type();
         let mut size = 0;
@@ -509,12 +516,19 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         }
         let alignment = u64::from(self.data.get_abi_alignment(&aligner));
         let size = size.div_ceil(alignment) * alignment;
-        let bytes = self.context.i8_type().array_type(
-            u32::try_from(size).map_err(|_| error("payload storage is too large for LLVM"))?,
-        );
+        // Alignments are powers of two, so the word divides the padded size.
+        let word = alignment.min(u64::from(self.bits / 8)).max(1);
+        let words = self
+            .context
+            .custom_width_int_type(std::num::NonZeroU32::new(word as u32 * 8).unwrap())
+            .unwrap()
+            .array_type(
+                u32::try_from(size / word)
+                    .map_err(|_| error("payload storage is too large for LLVM"))?,
+            );
         Ok(self
             .context
-            .struct_type(&[aligner.array_type(0), bytes], false))
+            .struct_type(&[aligner.array_type(0), words], false))
     }
     fn usize_type(&self) -> LlvmType<'ctx> {
         self.context
@@ -607,8 +621,8 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         // Only the tag and active payload are initialized. Inactive bytes are
         // unspecified, so clearing the whole union would add unnecessary stores.
         // Use undef, not poison: aggregate copies may combine inactive bytes with
-        // active ones. Keep union_storage's byte representation to preserve every
-        // initialized byte, including those in another alternative's padding.
+        // active ones. Keep union_storage's padding-free integer words to preserve
+        // every initialized byte, including those in another alternative's padding.
         let value = self
             .builder
             .build_insert_value(ty.get_undef(), tag, 0, "tag")?;

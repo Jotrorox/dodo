@@ -6,6 +6,13 @@
   array or slice") because every `.len` was compiled as a collection length.
   `len` is now the built-in length only on arrays, slices and strings, also
   behind several references (`& &[u8]`).
+- Results with a value (`T!E`) and enums with payloads return in registers.
+  The shared payload storage is now made of integer words instead of bytes.
+  Byte storage made an `i64!E` result nine separate return values to LLVM,
+  so it went through a hidden memory slot that the caller reassembled byte
+  by byte. A loop of 300 million non-inlined `i64!E` calls runs in 0.36 s
+  instead of 1.52 s on an M-series Mac. Layout sizes and alignments are
+  unchanged.
 - `std/graphics` strokes paths: `canvas.stroke_path(&path, &style, color)`
   paints a band of the stroke's width along a path, as borders, chart lines
   and icons need. A `graphics.Stroke` sets the width (in subpixels), miter,
