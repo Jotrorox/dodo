@@ -55,9 +55,10 @@ pub struct RoscSource<R: hal.Registers>: hal.Rng {
     // The generator over the ring oscillator `registers`, whose RANDOMBIT
     // register is at `randombit`: RP2040_RANDOMBIT or RP2350_RANDOMBIT.
     // It only reads that register.
-    // SAFETY: `registers` must be a running ring oscillator's, and nothing
-    // may stop it, change its frequency, or run clk_sys from it while the
-    // generator exists.
+    // SAFETY: `registers` must be a running ring oscillator's, and while the
+    // generator exists nothing may change its frequency, run clk_sys from
+    // it, or stop it except while the cores are stopped too, as a dormant
+    // state does.
     pub unsafe fn new(registers: R, randombit: usize) -> RoscSource<R> {
         return RoscSource<R> { registers, randombit }
     }
