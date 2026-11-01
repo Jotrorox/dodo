@@ -101,10 +101,15 @@ import "std/image/shared/scratch"
 // varblock types and quants, EPF sharpness) coded per LF group in modular
 // streams with their own trees. HF coefficients use the default block
 // context map, the decoder's nonzero-count prediction and contexts and the
-// natural coefficient orders; their tokens (hybrid integers 4/1/0, runs of
-// equal tokens as LZ77 copies) are clustered into at most 32 prefix codes
-// with an MTF + LZ77 coded context map. Alpha stays lossless in the modular
-// stream (global tree and codes, one stream per group).
+// natural coefficient orders; their tokens (counted as hybrid integers
+// 4/1/0) are clustered into at most 32 histograms with an MTF + LZ77 coded
+// context map. Alpha stays lossless in the modular stream (global tree and
+// codes, one stream per group). Entropy coding follows the lossless
+// effort levels: effort 1 writes prefix codes (with runs of more than 4
+// equal HF tokens as LZ77 copies); effort 2+ tunes each cluster's hybrid
+// integer configuration and codes with ANS when that is estimated smaller,
+// for the HF code and every modular stream (LF image, HF metadata, alpha),
+// with HF copies only for runs of more than 96 tokens.
 //
 // Two passes, group by group: the first analyzes each LF group's groups,
 // writes the LF group and counts the HF tokens; after the HF code is built
@@ -122,10 +127,16 @@ import "std/image/shared/scratch"
 //   + 28 b^2 bytes for the LF group (LF image, metadata, block info),
 //     b = min(256, image side in blocks)
 //   + 1 KiB (8-bit) or 256 KiB (16-bit and half-float) linearization table
-//   + 4 bytes per alpha sample of one group,
-// at most about 7 MiB whatever the image size. max_encoded_size() is a
-// true bound (29 bits per HF coefficient, 36 per LF and metadata symbol,
-// the alpha samples' lossless bound, and the coding overhead).
+//   + 4 bytes per alpha sample of one group
+//   + at effort 2+: 288 KiB of ANS tables (32 clusters x 4608 u16; shared
+//     by the LF group streams and the HF code), 288 KiB more for alpha's
+//     code, and 24 b^2 + b^2 / 8 bytes of ANS tokens for the larger LF
+//     group stream (HF and alpha group streams buffer theirs in the HF
+//     histograms, idle by then),
+// at most about 9 MiB whatever the image size (5 MiB for 1366x768 at
+// effort 2). max_encoded_size() is a true bound (31 bits per HF
+// coefficient, 40 per LF and metadata symbol, the alpha samples' lossless
+// bound, and the coding overhead).
 
 // Default effort for EncodeOptions.new().
 pub const DEFAULT_EFFORT: u32 = 2

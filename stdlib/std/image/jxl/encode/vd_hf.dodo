@@ -5,7 +5,8 @@ package encode
 // their entropy code. Every HF token goes through VdHfCoder.token, the one
 // seam between the VarDCT encoder and the entropy coder: in the counting
 // pass it fills context histograms, in the writing pass it emits through a
-// CodeSet (prefix codes today). The code spec is the HfPass histogram set
+// CodeSet (prefix codes, or ANS with per-cluster hybrid integer
+// configurations at effort 2+). The code spec is the HfPass histogram set
 // of 495 x 15 contexts, clustered to at most MAX_CLUSTERS codes, with an
 // MTF + LZ77 coded context map.
 
@@ -19,10 +20,14 @@ const VD_HF_CONTEXTS: usize = 7426
 // LZ77_MIN_SYMBOL + 0..23).
 const VD_HF_LITERALS: usize = 40
 const VD_HF_ALPHA: usize = 64
-// Runs of equal tokens longer than this become LZ77 copies at distance 1
-// (prefix codes cannot spend less than a bit on the frequent zeros); a copy
-// covers at most VD_HF_MAX_COPY tokens.
-const VD_HF_MIN_LENGTH: usize = 4
+// Runs of equal tokens longer than the minimum length become LZ77 copies
+// at distance 1: 4 with prefix codes (which cannot spend less than a bit on
+// the frequent zeros), 96 when the code may be ANS (zeros cost a fraction of
+// a bit in their contexts, and copies would take them out of those
+// statistics). A copy covers at most VD_HF_MAX_COPY tokens.
+const VD_HF_MIN_PREFIX: usize = 4
+const VD_HF_MIN_ANS: usize = 96
+const VD_HF_RUN_SLOTS: usize = 128
 const VD_HF_MAX_COPY: usize = 4096
 const VD_HF_SPLIT: u32 = 4
 const VD_HF_MSB: u32 = 1
@@ -33,70 +38,107 @@ static VD_COEFF_NUM_NONZERO_CONTEXT: [63]u32 = [0, 31, 62, 62, 93, 93, 93, 93, 1
 static VD_DEFAULT_BLOCK_CTX: [39]u8 = [0, 1, 2, 2, 3, 3, 4, 5, 6, 6, 6, 6, 6, 7, 8, 9, 9, 10, 11, 12, 13, 14, 14, 14, 14, 14, 7, 8, 9, 9, 10, 11, 12, 13, 14, 14, 14, 14, 14]
 
 // Counts or writes HF tokens; runs of equal values become LZ77 copies.
+// Counting adds hybrid integer 4/1/0 tokens to hist[ctx * VD_HF_ALPHA..];
+// writing codes each value with its cluster's configuration, prefix codes
+// at once and ANS tokens buffered in `tokens` (two words each, one group's
+// stream) until flush(). `broken` reports a value the code cannot
+// represent or a full token buffer (never expected).
 struct VdHfCoder {
     counting: bool
     hist: &mut[u32]
+    tokens: &mut[u32]
+    count: usize
+    broken: bool
+    min_length: usize
     run_value: u32
     run_count: usize
-    // Contexts of the first VD_HF_MIN_LENGTH + 1 run positions.
-    run_ctx: [8]u32
+    // Contexts of the first min_length + 1 run positions.
+    run_ctx: [VD_HF_RUN_SLOTS]u32
 
-    fn new(counting: bool, hist: &mut[u32]) -> VdHfCoder from(hist) {
-        return VdHfCoder { counting: counting, hist: hist, run_value: 0, run_count: 0, run_ctx: [0u32; 8] }
+    fn new(counting: bool, hist: &mut[u32], tokens: &mut[u32], min_length: usize) -> VdHfCoder from(hist, tokens) {
+        return VdHfCoder { counting: counting, hist: hist, tokens: tokens, count: 0, broken: false, min_length: min_length, run_value: 0, run_count: 0, run_ctx: [0u32; VD_HF_RUN_SLOTS] }
     }
-    fn count(&mut self, ctx: usize, symbol: usize) {
+    fn count_symbol(&mut self, ctx: usize, symbol: usize) {
         at := ctx * VD_HF_ALPHA + symbol
         if self.hist[at] != 0xFFFFFFFF {
             self.hist[at] += 1
         }
     }
-    fn literal(&mut self, codes: &CodeSet, w: &mut BitWriter, ctx: usize, value: u32) {
-        t := hybrid(value as u64, VD_HF_SPLIT, VD_HF_MSB, VD_HF_LSB)
-        token := (t & 0xFFFF) as usize
-        if self.counting {
-            self.count(ctx, token)
+    // Token `symbol` of cluster k with its extra bits (as Emitter.code).
+    fn code(&mut self, codes: &CodeSet, w: &mut BitWriter, k: usize, symbol: usize, nbits: u32, bits: u32) {
+        if symbol >= codes.alphabets[k] as usize {
+            self.broken = true
             return
         }
-        codes.put(w, ctx, token)
-        w.write(((t >> 16) & 255) as u32, t >> 24)
+        if codes.use_ans {
+            if 2 * self.count + 2 > self.tokens.len {
+                self.broken = true
+                return
+            }
+            self.tokens[2 * self.count] = bits
+            self.tokens[2 * self.count + 1] = nbits | ((symbol as u32) << 6) | ((k as u32) << 14)
+            self.count += 1
+            return
+        }
+        if !codes.singles[k] {
+            length := codes.lengths[k * MAX_ALPHA + symbol] as u32
+            if length == 0 {
+                self.broken = true
+                return
+            }
+            w.write(length, codes.codes[k * MAX_ALPHA + symbol] as u64)
+        }
+        w.write(nbits, bits as u64)
     }
-    // A copy of `length` tokens at distance 1, its length coded in ctx.
-    fn copy(&mut self, codes: &CodeSet, w: &mut BitWriter, ctx: usize, length: usize) {
-        t := hybrid((length - VD_HF_MIN_LENGTH) as u64, LZ77_LEN_SPLIT, 0, 0)
-        token := (t & 0xFFFF) as usize
+    fn literal(&mut self, codes: &CodeSet, w: &mut BitWriter, ctx: usize, value: u32) {
         if self.counting {
-            self.count(ctx, VD_HF_LITERALS + token)
-            self.count(VD_HF_DIST, 0)
+            t := hybrid(value as u64, VD_HF_SPLIT, VD_HF_MSB, VD_HF_LSB)
+            self.count_symbol(ctx, (t & 0xFFFF) as usize)
             return
         }
-        codes.put(w, ctx, LZ77_MIN_SYMBOL as usize + token)
-        w.write(((t >> 16) & 255) as u32, t >> 24)
-        codes.put(w, VD_HF_DIST, 0)
+        k := codes.map[ctx] as usize
+        t := hybrid_config(value as u64, codes.configs[k])
+        self.code(codes, w, k, (t & 0xFFFF) as usize, ((t >> 16) & 255) as u32, (t >> 24) as u32)
+    }
+    // A copy of `length` tokens at distance 1 (distance symbol 0: VarDCT
+    // streams have no special distances), its length coded in ctx.
+    fn copy(&mut self, codes: &CodeSet, w: &mut BitWriter, ctx: usize, length: usize) {
+        t := hybrid((length - self.min_length) as u64, LZ77_LEN_SPLIT, 0, 0)
+        token := (t & 0xFFFF) as usize
+        if self.counting {
+            self.count_symbol(ctx, VD_HF_LITERALS + token)
+            self.count_symbol(VD_HF_DIST, 0)
+            return
+        }
+        k := codes.map[ctx] as usize
+        self.code(codes, w, k, LZ77_MIN_SYMBOL as usize + token, ((t >> 16) & 255) as u32, (t >> 24) as u32)
+        dk := codes.map[VD_HF_DIST] as usize
+        d := hybrid_config(0, codes.configs[dk])
+        self.code(codes, w, dk, (d & 0xFFFF) as usize, 0, 0)
     }
     fn token(&mut self, codes: &CodeSet, w: &mut BitWriter, ctx: usize, value: u32) {
         if self.run_count > 0 && value == self.run_value {
-            if self.run_count < 8 {
+            if self.run_count < VD_HF_RUN_SLOTS {
                 self.run_ctx[self.run_count] = ctx as u32
             }
             self.run_count += 1
             if self.run_count == VD_HF_MAX_COPY + 1 {
-                self.flush(codes, w)
+                self.end_run(codes, w)
             }
             return
         }
-        self.flush(codes, w)
+        self.end_run(codes, w)
         self.run_value = value
         self.run_ctx[0] = ctx as u32
         self.run_count = 1
     }
-    // End the pending run (at the end of every group).
-    fn flush(&mut self, codes: &CodeSet, w: &mut BitWriter) {
+    fn end_run(&mut self, codes: &CodeSet, w: &mut BitWriter) {
         n := self.run_count
         if n == 0 {
             return
         }
         value := self.run_value
-        if n - 1 >= VD_HF_MIN_LENGTH {
+        if n - 1 >= self.min_length {
             c0 := self.run_ctx[0] as usize
             c1 := self.run_ctx[1] as usize
             self.literal(codes, w, c0, value)
@@ -108,6 +150,18 @@ struct VdHfCoder {
             }
         }
         self.run_count = 0
+    }
+    // End the group's stream: the pending run, then (writing with ANS) the
+    // buffered tokens.
+    fn flush(&mut self, codes: &CodeSet, w: &mut BitWriter) {
+        self.end_run(codes, w)
+        if self.counting || !codes.use_ans {
+            return
+        }
+        if !write_ans_stream(codes, w, self.tokens, self.count) {
+            self.broken = true
+        }
+        self.count = 0
     }
 }
 
@@ -466,30 +520,17 @@ fn vd_write_context_map(w: &mut BitWriter, map: &[u8], n: usize, clusters: usize
 }
 
 // The HF code spec: LZ77 parameters, the context map, then the prefix
-// codes.
+// codes or ANS distributions with each cluster's hybrid integer
+// configuration.
 fn vd_write_hf_spec(w: &mut BitWriter, set: &CodeSet, mtf: &mut[u8]) {
     w.write(1, 1)
     w.u32(LZ77_MIN_SYMBOL, 224, 0, 512, 0, 4096, 0, 8, 15)
-    w.u32(VD_HF_MIN_LENGTH as u32, 3, 0, 4, 0, 5, 2, 9, 8)
+    w.u32(set.min_length, 3, 0, 4, 0, 5, 2, 9, 8)
     write_config(w, 8, LZ77_LEN_SPLIT, 0, 0)
     vd_write_context_map(w, set.map, set.contexts, set.clusters, mtf)
-    w.write(1, 1)
-    for k in 0usize..set.clusters {
-        write_config(w, 15, set.split, set.msb, set.lsb)
+    log_alpha := 15u32
+    if set.use_ans {
+        log_alpha = set.log_alpha
     }
-    for k in 0usize..set.clusters {
-        alphabet := set.alphabets[k] as u32
-        if alphabet <= 1 {
-            w.write(1, 0)
-        } else {
-            n := floor_log2((alphabet - 1) as u64)
-            w.write(1, 1)
-            w.write(4, n as u64)
-            w.write(n, (alphabet - 1 - (1u32 << n)) as u64)
-        }
-    }
-    for k in 0usize..set.clusters {
-        base := k * MAX_ALPHA
-        write_prefix_code(w, &set.lengths[base..base + MAX_ALPHA], set.alphabets[k] as usize)
-    }
+    set.write_tables(w, set.use_ans, log_alpha)
 }

@@ -473,6 +473,26 @@ fn worst_case_noise_stays_within_max_encoded_size() {
         n := lossy_encode(&view, &options, &mut output[..])
         assert(n > 0)
     }
+    // Full 256x256 groups of noise with alpha: the most HF and alpha tokens
+    // a group stream can buffer for ANS (effort 2+), and the prefix-coded
+    // worst case (effort 1); both must decode.
+    {
+        nw := 300u32
+        nh := 260u32
+        for i in 0usize..(nw * nh * 4) as usize {
+            data[i] = (((i as u64 * 2654435761) >> 11) & 255) as u8
+        }
+        nview := pixels.View.new(&data[..], nw, nh, pixels.Layout.rgba8())!
+        for k in 0usize..2 {
+            options.effort = 1 + k as u32
+            n := lossy_encode(&nview, &options, &mut output[..])
+            if k == 0 {
+                lossy_psnr(&output[..n], &nview, "noise1")
+            } else {
+                lossy_psnr(&output[..n], &nview, "noise2")
+            }
+        }
+    }
     float := unsafe {
         &mut LPIXELS
     }
