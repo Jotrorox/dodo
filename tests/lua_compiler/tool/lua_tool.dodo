@@ -836,8 +836,13 @@ fn lt_err(text: &str) -> i32 {
 
 pub fn tool_main() -> i32 {
     unsafe {
-        let L = malloc(mem.size_of::<State>()) as *mut State
-        ptr.write_bytes(L as *mut u8, 0u8, mem.size_of::<State>())
+        // A real runtime state; collection stays blocked like in the loader,
+        // so every compiled object survives until the tool exits.
+        let L = state_open()
+        if ptr.is_null(L) {
+            return lt_err("luatool: cannot create a Lua state")
+        }
+        (*G(L)).gcstp = (*G(L)).gcstp | GCSTP_GC
         let argcap = 1usize << 20
         let args = malloc(argcap)
         used := 0usize
