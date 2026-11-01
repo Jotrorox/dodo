@@ -11,7 +11,12 @@ CLUT prediction):
   p3-v4.icc     ICC v4 Display P3-like: mluc in two languages, para
   gray.icc      ICC v4 gray: kTRC curv with 256 entries
   lut-rgb.icc   ICC v4 RGB display profile with A2B0/B2A0 lutAToB/lutBToA
-                (curves, matrix, 17^3 16-bit CLUT) beside the matrix/TRC tags
+                (curves, matrix, 17^3 16-bit CLUT) beside the matrix/TRC tags;
+                large enough for LZ77 distances beyond 16384
+  quirks.icc    RGB profile with a gbd element of 14 data bytes (an
+                order-0 prediction of a run that is not a multiple of 4) and
+                a private tag whose size reaches past the end of the profile
+                (libjxl round-trips such profiles)
 
 The profiles are generated (no third-party data), deterministic, and
 released with the tests. Usage: python3 tests/image/jxl_encode/make_icc.py
@@ -220,10 +225,30 @@ def lut_rgb():
     ])
 
 
+def quirks():
+    gbd = b"gbd " + b"\0" * 4 + bytes((i * 37 + 11) & 255 for i in range(14))
+    data = profile([
+        (b"desc", mluc([("en", "US", "Dodo quirks")])),
+        (b"wtpt", xyz(*D50)),
+        (b"rXYZ", xyz(*SRGB_XYZ[0])),
+        (b"gXYZ", xyz(*SRGB_XYZ[1])),
+        (b"bXYZ", xyz(*SRGB_XYZ[2])),
+        (b"rTRC", para_srgb()),
+        (b"gTRC", "rTRC"),
+        (b"bTRC", "rTRC"),
+        (b"gamt", gbd),
+        (b"dodo", text_tag("private")),
+    ])
+    # The last tag entry ("dodo") claims 4096 bytes.
+    count = struct.unpack(">I", data[128:132])[0]
+    entry = 132 + 12 * (count - 1)
+    return data[:entry + 8] + struct.pack(">I", 4096) + data[entry + 12:]
+
+
 def main():
     os.makedirs(OUT, exist_ok=True)
     for name, data in [("srgb-v2", srgb_v2()), ("srgb-v4", srgb_v4()), ("p3-v4", p3_v4()),
-                       ("gray", gray()), ("lut-rgb", lut_rgb())]:
+                       ("gray", gray()), ("lut-rgb", lut_rgb()), ("quirks", quirks())]:
         path = os.path.join(OUT, name + ".icc")
         open(path, "wb").write(data)
         print("%s: %d bytes" % (path, len(data)))

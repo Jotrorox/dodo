@@ -265,37 +265,26 @@ fn predict_header(index: usize, output_size: u64, header: &[u8]) -> u8 {
     return 0
 }
 
-// The byte at position i of a 2- or 4-way shuffled run of `len` bytes.
+// The byte at position i of a 2- or 4-way shuffled run (libjxl Shuffle,
+// the inverse of the encoder's Unshuffle): the encoder read the run in
+// order into the columns of a matrix with ceil(len / width) rows, so byte i
+// sits in column s at row t, where the first len % rows columns hold one
+// byte more than the others.
 fn shuffled(bytes: &[u8], width: usize, i: usize) -> u8 {
     len := bytes.len
-    if width == 2 {
-        height := len / 2
-        odd := len % 2
-        if i == len - 1 && odd != 0 {
-            return bytes[height]
-        }
-        if (i & 1) == 0 {
-            return bytes[i / 2]
-        }
-        return bytes[i / 2 + height + odd]
+    rows := (len + width - 1) / width
+    q := len / rows
+    r := len % rows
+    s := 0usize
+    t := 0usize
+    if i < r * (q + 1) {
+        s = i / (q + 1)
+        t = i % (q + 1)
+    } else {
+        s = r + (i - r * (q + 1)) / q
+        t = (i - r * (q + 1)) % q
     }
-    step := len / 4
-    wide := len % 4
-    if i >= step * 4 {
-        k := i - step * 4 + 1
-        return bytes[(step + 1) * k - 1]
-    }
-    row := i / 4
-    col := i % 4
-    position := row
-    for c in 0usize..col {
-        if c < wide {
-            position += step + 1
-        } else {
-            position += step
-        }
-    }
-    return bytes[position]
+    return bytes[s + t * rows]
 }
 
 // Turn the decoded ICC stream into the profile bytes; returns the length.
@@ -337,7 +326,7 @@ fn decode_icc(stream: &[u8], output: &mut[u8]) -> usize!pixels.Error {
     tags_value := varint(commands, &mut cmd)?
     if tags_value > 0 {
         num_tags := tags_value - 1
-        if (output_size - 128) / 12 < num_tags {
+        if num_tags > 0xffffffff {
             return err(pixels.Error.Malformed)
         }
         out.push32(num_tags as u32)?
@@ -345,7 +334,9 @@ fn decode_icc(stream: &[u8], output: &mut[u8]) -> usize!pixels.Error {
         previous_size := 0u64
         for {
             if cmd >= commands_end {
-                return ok(out.count)
+                // The commands end inside the tag list: the size check below
+                // decides.
+                break
             }
             command := commands[cmd]
             cmd += 1
@@ -380,7 +371,9 @@ fn decode_icc(stream: &[u8], output: &mut[u8]) -> usize!pixels.Error {
             } else if is_xyz {
                 size = 20
             }
-            if start > 0xffffffff || size > 0xffffffff || start + size > output_size {
+            // Tag offsets and sizes need only be 32-bit numbers (libjxl
+            // round-trips profiles whose tags point past their end).
+            if start > 0xffffffff || size > 0xffffffff {
                 return err(pixels.Error.Malformed)
             }
             previous_start = start
@@ -398,7 +391,7 @@ fn decode_icc(stream: &[u8], output: &mut[u8]) -> usize!pixels.Error {
                 out.push32(start as u32)?
                 out.push32(size as u32)?
             } else if tagcode == 3 {
-                if start + size * 3 > 0xffffffff {
+                if start + size * 2 > 0xffffffff {
                     return err(pixels.Error.Malformed)
                 }
                 out.push_tag(&COMMON_TAGS, 6)?
