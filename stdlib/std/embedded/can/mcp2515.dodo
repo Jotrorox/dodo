@@ -1,0 +1,778 @@
+package mcp2515
+
+import "std/embedded/hal"
+
+// The Microchip MCP2515 stand-alone CAN controller, which sits on an SPI
+// bus: the chip on most add-on CAN boards, usually with a TJA1050 or
+// MCP2551 transceiver and an 8 or 16 MHz crystal. `Controller` implements
+// hal.Can over any hal.Spi bus and a chip-select pin, which it owns, so
+// drivers written against the protocol run on boards whose microcontroller
+// has no CAN controller of its own:
+//
+//     bus := b.pins.spi(board.SPI_CLOCK_PIN, board.SPI_TX_PIN, some(board.SPI_RX_PIN), hal.SpiMode.Mode0, 8_000_000)!
+//     config := mcp2515.Config.new(16_000_000, 500_000)
+//     filters: [1]hal.CanFilter = [hal.CanFilter.exact(0x123, false)]
+//     can := mcp2515.Controller.new(bus, b.pins.output(board.SPI_SELECT_PIN)!, &config, &filters)!
+//     hal.send_frame(&mut can, &frame, hal.DEFAULT_POLL_LIMIT)!
+//
+// The chip takes SPI modes 0 and 3 at up to 10 MHz. Every method is one or
+// a few short SPI transactions and returns at once; the only waits are for
+// the chip to change its operating mode, which give up with Timeout after
+// MODE_POLLS reads, so a missing or unpowered chip reports Timeout from
+// `new` rather than hanging. Bus failures are reported as the bus's
+// hal.Error.
+//
+// Bit timing. Config gives the crystal frequency, the bit rate, and the
+// sample point (875 thousandths unless set). The chip counts time quanta of
+// 2 * (BRP + 1) oscillator cycles, BRP 0 to 63, and a bit is a sync quantum,
+// a propagation segment and phase segment 1 of 1 to 8 quanta each, and phase
+// segment 2 of 2 to 8. `timing` picks the timing with hal.can_timing within
+// those limits, then keeps the datasheet's rules (section 5.3): segment 1
+// (propagation plus phase segment 1) at least as long as phase segment 2,
+// which moves a sample point requested below about 50% up to the middle of
+// the bit, and phase segment 2 longer than the synchronization jump width,
+// which is as wide as phase segment 2 less one, phase segment 1, and 4
+// allow. Segment 1 is split in half, the propagation segment taking the
+// smaller half, as Linux's mcp251x driver does, so the registers match the
+// values that driver programs: at 16 MHz, 500 kbit/s is CNF1-3 = 00 B5 01
+// and 125 kbit/s 03 B5 01; at 8 MHz, 125 kbit/s is 01 B5 01. A bit rate no
+// timing reaches within 0.5%, such as 1 Mbit/s from 8 MHz, is InvalidInput.
+//
+// Filters. The chip has two receive buffers: RXB0 with mask RXM0 and
+// filters RXF0-1, and RXB1 with mask RXM1 and filters RXF2-5; a frame goes
+// to the first buffer with a matching filter. A hal.CanFilter's mask covers
+// the identifier bits of its kind, so the controller places each filter
+// under a hardware mask of the 29-bit layout: a standard filter's mask in
+// the top 11 bits (the standard identifier bits, SID10-0) with the 18
+// extended bits clear, an extended filter's mask as it is. Filters with the
+// same hardware mask form a group, which shares one mask register; so a
+// standard and an extended filter share one when the extended mask is the
+// standard mask shifted left by 18, and every filter that passes all
+// frames of its kind (mask 0) is in one group. Each filter's EXIDE bit
+// selects its kind. Then:
+//
+//   no filters     every frame passes: both buffers get mask 0 and filters
+//                  for both kinds
+//   one group      of up to 2 filters: both buffers get all of them; of 3
+//                  to 6, RXB0 gets the first two and RXB1 the last four
+//                  (all of them, for 3 or 4)
+//   two groups     the larger in RXB1 (at most 4 filters), the other in
+//                  RXB0 (at most 2); on equal sizes the group of the first
+//                  filter in RXB0
+//
+// and InvalidInput for more groups or filters than that, or a filter
+// identifier too large for its kind. Mask bits beyond a filter's kind are
+// ignored. Unused filter slots repeat a filter of their buffer's group.
+//
+// Receiving. RXB0 rolls over into RXB1 (BUKT), so two frames wait in the
+// chip before one is lost. A frame lands in RXB1 by rollover only while
+// RXB0 is full, so RXB0 holds the older frame, until the program reads
+// RXB0 while RXB1 is full: then RXB1 holds the older one, and a frame that
+// arrives next in RXB0 is newer. poll_receive keeps track of that and
+// returns frames oldest first whenever both buffers accept the same frames
+// (no filters, or one group of at most 2). A frame that rolls into RXB1
+// while RXB0 is being read is caught by an RX STATUS right after the read;
+// only a program held up between the two for longer than two frames take
+// could see those frames out of order. With filters that send some
+// frames straight to RXB1, a frame there can come out before an older one
+// waiting in RXB0; frames of each buffer keep their order. When a frame
+// arrives with both buffers full it is lost and the chip sets RX0OVR or
+// RX1OVR: the next poll_receive reports Overrun once and clears them, and
+// the frames still in the buffers, older than the lost one, come next.
+//
+// Sending. poll_send loads one of the three transmit buffers and requests
+// it. The chip sends the pending buffer with the highest priority (TXP)
+// first and, of equal priorities, the highest-numbered buffer, so to keep
+// frames in the order they were queued each one gets a free buffer and
+// priority that rank below every pending frame's; the ranks restart at the
+// top whenever nothing is pending. A steady stream thereby uses all three
+// buffers, and after twelve frames without the queue running empty,
+// poll_send reports full until it does. In normal mode a frame is retried
+// until another node acknowledges it (or once, in one-shot mode), so on a
+// bus with no other node poll_send soon reports full for good;
+// `abort_pending` cancels the queue.
+//
+// Interrupts. The chip pulls its INT pin low while an interrupt flag it
+// listens for is set: wire INT to a GPIO, `listen(mcp2515.RECEIVE)`, and a
+// task can wait for the pin's falling edge and then poll_receive until it
+// reports false, which clears the receive flags.
+//
+// Register and instruction names follow the MCP2515 datasheet
+// (DS20001801).
+
+// SPI instructions (datasheet section 12).
+const RESET: u8 = 0xC0
+const READ: u8 = 0x03
+const WRITE: u8 = 0x02
+const BIT_MODIFY: u8 = 0x05
+// READ RX BUFFER from RXBnSIDH; OR in RX_BUFFER1 for RXB1. Raising chip
+// select afterwards clears the buffer's RXnIF.
+const READ_RX_BUFFER: u8 = 0x90
+const RX_BUFFER1: u8 = 0x04
+// LOAD TX BUFFER at TXBnSIDH: OR in 2 * n for TXBn.
+const LOAD_TX_BUFFER: u8 = 0x40
+// REQUEST TO SEND: OR in 1 << n for TXBn.
+const RTS: u8 = 0x80
+const READ_STATUS: u8 = 0xA0
+const RX_STATUS: u8 = 0xB0
+
+// Registers.
+const RXF0SIDH: u8 = 0x00
+const RXF3SIDH: u8 = 0x10
+const CANSTAT: u8 = 0x0E
+const CANCTRL: u8 = 0x0F
+const TEC: u8 = 0x1C
+const REC: u8 = 0x1D
+const RXM0SIDH: u8 = 0x20
+const CNF3: u8 = 0x28
+const CANINTE: u8 = 0x2B
+const CANINTF: u8 = 0x2C
+const EFLG: u8 = 0x2D
+// TXBnCTRL is at TXB0CTRL + 0x10 * n.
+const TXB0CTRL: u8 = 0x30
+const RXB0CTRL: u8 = 0x60
+const RXB1CTRL: u8 = 0x70
+
+// CANCTRL: requested operating mode, abort all pending transmissions, and
+// one-shot mode. CANSTAT: the operating mode the chip is in (OPMOD), in the
+// same bits and encoding.
+const REQOP: u8 = 0xE0
+const ABAT: u8 = 0x10
+const OSM: u8 = 0x08
+const OPMOD: u8 = 0xE0
+const MODE_NORMAL: u8 = 0x00
+const MODE_LOOPBACK: u8 = 0x40
+const MODE_LISTEN_ONLY: u8 = 0x60
+const MODE_CONFIGURATION: u8 = 0x80
+
+// CNF2: segment lengths from CNF3's phase segment 2 (BTLMODE).
+const BTLMODE: u8 = 0x80
+
+// CANINTE / CANINTF bits.
+const RX0IF: u8 = 0x01
+const RX1IF: u8 = 0x02
+
+// EFLG: receive buffer overflows, bus-off, error-passive.
+const RX1OVR: u8 = 0x80
+const RX0OVR: u8 = 0x40
+const TXBO: u8 = 0x20
+const TXEP: u8 = 0x10
+const RXEP: u8 = 0x08
+
+// TXBnCTRL: transmit request and priority.
+const TXREQ: u8 = 0x08
+
+// RXB0CTRL: roll over into RXB1 when RXB0 is full. RXM is left 00, so the
+// filters apply, each to the kind its EXIDE bit selects.
+const BUKT: u8 = 0x04
+
+// Buffer, filter, and mask register bits: in RXBnSIDL a standard remote
+// frame (SRR) and in every SIDL an extended identifier (IDE, EXIDE); in
+// TXBnDLC and RXBnDLC a remote frame (RTR, for received frames only valid
+// with IDE) and the data length code.
+const SRR: u8 = 0x10
+const IDE: u8 = 0x08
+const RTR: u8 = 0x40
+const DLC: u8 = 0x0F
+
+// READ STATUS: TXREQ of TXB0, TXB1, and TXB2 are bits 2, 4, and 6.
+// RX STATUS: a frame waits in RXB1.
+const RX_STATUS_RXB1: u8 = 0x80
+
+// The bytes of a frame in a buffer: SIDH, SIDL, EID8, EID0, DLC, D0-D7.
+const FRAME_BYTES: usize = 13
+
+// Transmit ranks: priority * 3 + buffer number, higher sent first.
+const RANKS: u32 = 12
+
+// Reads of CANSTAT, or of the transmit requests, before a wait for the chip
+// gives up with Timeout. A mode change takes effect at once unless a frame
+// is being sent or received, which ends within 160 bit times, far fewer
+// than this many reads.
+pub const MODE_POLLS: u32 = 1024
+
+// Interrupt sources for listen, ignore, and acknowledge (CANINTE bits): a
+// frame waits in a receive buffer (RX0IE, RX1IE), a transmit buffer sent its
+// frame (TX0IE-TX2IE), and the error flags changed, which includes an
+// overflow (ERRIE).
+pub const RECEIVE: u8 = 0x03
+pub const TRANSMIT: u8 = 0x1C
+pub const ERROR: u8 = 0x20
+
+// Operating modes after configuration.
+pub enum Mode {
+    // Take part in the bus: send, receive, and acknowledge frames.
+    Normal,
+    // Frames sent come straight back to the receive buffers, through the
+    // filters, without reaching the bus; for self-tests.
+    Loopback,
+    // Receive every valid frame but never send, acknowledge, or signal
+    // errors; for monitoring a bus or detecting its bit rate.
+    ListenOnly
+}
+
+// How `Controller.new` and `configure` set the chip up.
+pub struct Config {
+    // The crystal or oscillator on the chip's OSC1 pin, such as 8, 16, or
+    // 20 MHz.
+    pub oscillator_hz: u32
+    pub bitrate: u32
+    // Where to sample each bit, in thousandths of the bit; see "Bit timing".
+    pub sample_point_permille: u32
+    pub mode: Mode
+    // Send each frame once, without retrying after an error or a lost
+    // arbitration (OSM). The transmit buffer is free afterwards either way.
+    pub one_shot: bool
+
+    // Normal mode at `bitrate` from `oscillator_hz`, sampling at 87.5%,
+    // retrying frames.
+    pub fn new(oscillator_hz: u32, bitrate: u32) -> Config {
+        return Config { oscillator_hz, bitrate, sample_point_permille: 875, mode: Mode.Normal, one_shot: false }
+    }
+}
+
+// The MCP2515's bit timing registers for one bit rate.
+pub struct Timing {
+    // Synchronization jump width less one (bits 7-6) and the baud rate
+    // prescaler BRP (bits 5-0).
+    pub cnf1: u8
+    // BTLMODE, then phase segment 1 less one (bits 5-3) and the
+    // propagation segment less one (bits 2-0).
+    pub cnf2: u8
+    // Phase segment 2 less one (bits 2-0).
+    pub cnf3: u8
+}
+
+// The ranges hal.can_timing may choose from for the MCP2515: prescalers of
+// 2 to 128 oscillator cycles in steps of 2, segment 1 of 2 to 16 quanta,
+// segment 2 of 2 to 8, and a jump width up to 4.
+pub fn limits() -> hal.CanTimingLimits {
+    return hal.CanTimingLimits { prescaler_min: 2, prescaler_max: 128, prescaler_step: 2, segment1_min: 2, segment1_max: 16, segment2_min: 2, segment2_max: 8, sync_jump_max: 4 }
+}
+
+// The timing registers for `bitrate` from an oscillator of `oscillator_hz`,
+// sampling near `sample_point_permille`; see "Bit timing" above.
+// InvalidInput if no timing reaches the bit rate within 0.5%.
+pub fn timing(oscillator_hz: u32, bitrate: u32, sample_point_permille: u32) -> Timing!hal.Error {
+    range := limits()
+    bit := hal.can_timing(oscillator_hz, bitrate, sample_point_permille, &range)?
+    segment1 := bit.segment1
+    segment2 := bit.segment2
+    // PropSeg + PS1 >= PS2.
+    if segment1 < segment2 {
+        total := segment1 + segment2
+        segment2 = total / 2
+        segment1 = total - segment2
+    }
+    propagation := segment1 / 2
+    phase1 := segment1 - propagation
+    // PS2 > SJW, and SJW <= PS1.
+    jump := bit.sync_jump
+    if jump >= segment2 {
+        jump = segment2 - 1
+    }
+    if jump > phase1 {
+        jump = phase1
+    }
+    if jump == 0 {
+        jump = 1
+    }
+    brp := bit.prescaler / 2 - 1
+    cnf1 := (((jump - 1) << 6) | brp) & 0xFF
+    cnf2 := (BTLMODE as u32 | ((phase1 - 1) << 3) | (propagation - 1)) & 0xFF
+    cnf3 := (segment2 - 1) & 0x07
+    return ok(Timing { cnf1: cnf1 as u8, cnf2: cnf2 as u8, cnf3: cnf3 as u8 })
+}
+
+// An MCP2515 on SPI bus B, selected by pin P. Owns both, as the hal.Can
+// methods take no bus, and gives them back with `release`.
+pub struct Controller<B: hal.Spi, P: hal.OutputPin>: hal.Can {
+    bus: B
+    device: hal.SpiDevice<P>
+    // The TXP priority last written to each transmit buffer.
+    priorities: [3]u8
+    // RXB1's frame is older than RXB0's, if both are full: RXB0 was read
+    // while RXB1 held a frame.
+    rx1_older: bool
+
+    // Take the bus and the chip-select pin, and deselect the chip, without
+    // talking to it; `configure` sets it up. Most programs call `new`
+    // instead.
+    pub fn attach(bus: B, select: P) -> Controller<B, P> from(bus, select) {
+        device := hal.SpiDevice.new(select)
+        return Controller<B, P> { bus, device, priorities: [0, 0, 0], rx1_older: false }
+    }
+
+    // Attach to the chip and configure it; see `configure`. The bus and pin
+    // are dropped with an error; use attach and configure to keep them.
+    pub fn new(bus: B, select: P, config: &Config, filters: &[hal.CanFilter]) -> Controller<B, P>!hal.Error from(bus, select) {
+        can := Controller.attach(bus, select)
+        can.configure(config, filters)?
+        return ok(can)
+    }
+
+    // Reset the chip and set it up from `config` and `filters`: wait for
+    // configuration mode, program the bit timing, filters, and rollover,
+    // and switch to the configured mode. Frames in the chip are lost.
+    // InvalidInput for a bit rate it cannot reach or filters it cannot
+    // hold (see "Filters"), before the chip is touched; Timeout if the chip
+    // does not reach configuration mode or then the configured mode.
+    pub fn configure(&mut self, config: &Config, filters: &[hal.CanFilter]) -> void!hal.Error {
+        bits := timing(config.oscillator_hz, config.bitrate, config.sample_point_permille)?
+        // RXM0, RXM1, RXF0-2, and RXF3-5, as written below.
+        masks := [0u8; 8]
+        low := [0u8; 12]
+        high := [0u8; 12]
+        plan_filters(filters, &mut masks, &mut low, &mut high)?
+
+        reset: [1]u8 = [RESET]
+        self.device.write(&mut self.bus, &reset)?
+        self.wait_for_mode(MODE_CONFIGURATION)?
+        self.priorities = [0, 0, 0]
+        self.rx1_older = false
+
+        self.write_registers(RXM0SIDH, &masks)?
+        self.write_registers(RXF0SIDH, &low)?
+        self.write_registers(RXF3SIDH, &high)?
+        receive: [1]u8 = [BUKT]
+        self.write_registers(RXB0CTRL, &receive)?
+        receive[0] = 0
+        self.write_registers(RXB1CTRL, &receive)?
+        // CNF3, CNF2, CNF1, then CANINTE and CANINTF cleared.
+        timing_bytes: [5]u8 = [bits.cnf3, bits.cnf2, bits.cnf1, 0, 0]
+        self.write_registers(CNF3, &timing_bytes)?
+
+        one_shot := 0u8
+        if config.one_shot {
+            one_shot = OSM
+        }
+        requested := mode_bits(&config.mode)
+        self.bit_modify(CANCTRL, REQOP | OSM, requested | one_shot)?
+        return self.wait_for_mode(requested)
+    }
+
+    // Switch to `mode`, keeping the configuration. The chip changes mode
+    // only between frames, and Timeout if it has not after MODE_POLLS reads.
+    pub fn set_mode(&mut self, mode: Mode) -> void!hal.Error {
+        requested := mode_bits(&mode)
+        self.bit_modify(CANCTRL, REQOP, requested)?
+        return self.wait_for_mode(requested)
+    }
+
+    // Queue `frame` in a free transmit buffer and request it; see hal.Can
+    // and "Sending" above. False while no buffer can take it in order.
+    // Unsupported for an FD frame, as the chip sends classic CAN only; Bus
+    // while the chip is bus-off (EFLG.TXBO).
+    pub fn poll_send(&mut self, frame: &hal.CanFrame) -> bool!hal.Error {
+        if frame.is_fd() {
+            return err(hal.Error.Unsupported)
+        }
+        flags := self.read_register(EFLG)?
+        if (flags & TXBO) != 0 {
+            return err(hal.Error.Bus)
+        }
+        status := self.status()?
+        // The lowest rank pending, or RANKS if none.
+        lowest := RANKS
+        for buffer in 0usize..3 {
+            if pending(status, buffer) {
+                rank := self.priorities[buffer] as u32 * 3 + buffer as u32
+                if rank < lowest {
+                    lowest = rank
+                }
+            }
+        }
+        if lowest == 0 {
+            return ok(false)
+        }
+        rank := lowest - 1
+        for pending(status, (rank % 3) as usize) {
+            if rank == 0 {
+                return ok(false)
+            }
+            rank -= 1
+        }
+        buffer := (rank % 3) as usize
+        priority := (rank / 3) as u8
+        if self.priorities[buffer] != priority {
+            control: [1]u8 = [priority]
+            self.write_registers(TXB0CTRL + 0x10 * buffer as u8, &control)?
+            self.priorities[buffer] = priority
+        }
+        load := [0u8; 1 + FRAME_BYTES]
+        load[0] = LOAD_TX_BUFFER | (2 * buffer as u8)
+        encode_id(&mut load, 1, frame.id(), frame.is_extended())
+        load[5] = frame.dlc() & DLC
+        length := frame.len()
+        if frame.is_remote() {
+            load[5] = load[5] | RTR
+        } else {
+            bytes := frame.bytes()
+            for index in 0usize..length {
+                load[6 + index] = bytes[index]
+            }
+        }
+        // Only the bytes the frame uses.
+        self.device.write(&mut self.bus, load[0..6 + frame.bytes().len])?
+        request: [1]u8 = [RTS | (1u8 << buffer as u8)]
+        self.device.write(&mut self.bus, &request)?
+        return ok(true)
+    }
+
+    // Take the oldest received frame into `frame`; see hal.Can and
+    // "Receiving" above. False while none waits. Overrun once after frames
+    // were lost, clearing EFLG.RX0OVR and RX1OVR.
+    pub fn poll_receive(&mut self, frame: &mut hal.CanFrame) -> bool!hal.Error {
+        // CANINTF and EFLG.
+        flags := [0u8; 2]
+        self.read_registers(CANINTF, &mut flags)?
+        if (flags[1] & (RX0OVR | RX1OVR)) != 0 {
+            self.bit_modify(EFLG, RX0OVR | RX1OVR, 0)?
+            return err(hal.Error.Overrun)
+        }
+        full0 := (flags[0] & RX0IF) != 0
+        full1 := (flags[0] & RX1IF) != 0
+        if !full0 && !full1 {
+            return ok(false)
+        }
+        buffer := [0u8; FRAME_BYTES]
+        if full1 && (!full0 || self.rx1_older) {
+            read: [1]u8 = [READ_RX_BUFFER | RX_BUFFER1]
+            self.device.write_read(&mut self.bus, &read, &mut buffer)?
+            self.rx1_older = false
+        } else {
+            read: [1]u8 = [READ_RX_BUFFER]
+            self.device.write_read(&mut self.bus, &read, &mut buffer)?
+            if full1 {
+                self.rx1_older = true
+            } else {
+                // A frame may have rolled into RXB1 while RXB0 was read.
+                status := self.rx_status()?
+                self.rx1_older = (status & RX_STATUS_RXB1) != 0
+            }
+        }
+        decode_frame(&buffer, frame)?
+        return ok(true)
+    }
+
+    // The fault confinement state from EFLG: BusOff with TXBO, Passive with
+    // TXEP or RXEP, else Active. SPI errors pass through.
+    pub fn error_state(&mut self) -> hal.CanErrorState!hal.Error {
+        flags := self.read_register(EFLG)?
+        if (flags & TXBO) != 0 {
+            return ok(hal.CanErrorState.BusOff)
+        }
+        if (flags & (TXEP | RXEP)) != 0 {
+            return ok(hal.CanErrorState.Passive)
+        }
+        return ok(hal.CanErrorState.Active)
+    }
+
+    // The transmit error counter (TEC): error-passive from 128, bus-off
+    // after 255.
+    pub fn tec(&mut self) -> u8!hal.Error {
+        return self.read_register(TEC)
+    }
+
+    // The receive error counter (REC): error-passive from 128.
+    pub fn rec(&mut self) -> u8!hal.Error {
+        return self.read_register(REC)
+    }
+
+    // The error flags (EFLG), for the warning bits error_state does not
+    // report.
+    pub fn error_flags(&mut self) -> u8!hal.Error {
+        return self.read_register(EFLG)
+    }
+
+    // Pull INT low while any of `sources` (RECEIVE, TRANSMIT, ERROR, or
+    // several ORed together) has its flag set.
+    pub fn listen(&mut self, sources: u8) -> void!hal.Error {
+        return self.bit_modify(CANINTE, sources, sources)
+    }
+
+    // Stop pulling INT low for `sources`.
+    pub fn ignore(&mut self, sources: u8) -> void!hal.Error {
+        return self.bit_modify(CANINTE, sources, 0)
+    }
+
+    // Whether INT is low now: a source listened to has its flag set.
+    pub fn interrupt_pending(&mut self) -> bool!hal.Error {
+        registers := [0u8; 2]
+        self.read_registers(CANINTE, &mut registers)?
+        return ok((registers[0] & registers[1]) != 0)
+    }
+
+    // Clear the TRANSMIT and ERROR flags among `sources`, which hold INT
+    // low until cleared. The RECEIVE flags are left alone: they clear as
+    // poll_receive takes the frames, and clearing one by hand would drop a
+    // frame.
+    pub fn acknowledge(&mut self, sources: u8) -> void!hal.Error {
+        return self.bit_modify(CANINTF, sources & (TRANSMIT | ERROR), 0)
+    }
+
+    // Cancel every frame waiting to be sent (ABAT) and wait until the chip
+    // has dropped them; a frame already on the bus finishes first. Timeout
+    // after MODE_POLLS reads.
+    pub fn abort_pending(&mut self) -> void!hal.Error {
+        self.bit_modify(CANCTRL, ABAT, ABAT)?
+        for _ in 0u32..MODE_POLLS {
+            status := self.status()?
+            if !pending(status, 0) && !pending(status, 1) && !pending(status, 2) {
+                return self.bit_modify(CANCTRL, ABAT, 0)
+            }
+        }
+        self.bit_modify(CANCTRL, ABAT, 0)?
+        return err(hal.Error.Timeout)
+    }
+
+    // The SPI bus, for other devices on it between CAN calls, each with its
+    // own chip select.
+    pub fn bus(&mut self) -> &mut B from(self) {
+        return &mut self.bus
+    }
+
+    // Give back the bus and the chip-select pin. The chip keeps running.
+    pub fn release(self) -> (B, P) {
+        let Controller { bus, device, priorities, rx1_older } = self
+        return (bus, device.release())
+    }
+
+    fn wait_for_mode(&mut self, mode: u8) -> void!hal.Error {
+        for _ in 0u32..MODE_POLLS {
+            if (self.read_register(CANSTAT)? & OPMOD) == mode {
+                return ok()
+            }
+        }
+        return err(hal.Error.Timeout)
+    }
+
+    fn read_register(&mut self, address: u8) -> u8!hal.Error {
+        value := [0u8; 1]
+        self.read_registers(address, &mut value)?
+        return ok(value[0])
+    }
+
+    fn read_registers(&mut self, address: u8, values: &mut[u8]) -> void!hal.Error {
+        command: [2]u8 = [READ, address]
+        return self.device.write_read(&mut self.bus, &command, values)
+    }
+
+    // At most 16 bytes.
+    fn write_registers(&mut self, address: u8, values: &[u8]) -> void!hal.Error {
+        command := [0u8; 18]
+        command[0] = WRITE
+        command[1] = address
+        for index in 0usize..values.len {
+            command[2 + index] = values[index]
+        }
+        return self.device.write(&mut self.bus, command[0..2 + values.len])
+    }
+
+    fn bit_modify(&mut self, address: u8, mask: u8, value: u8) -> void!hal.Error {
+        command: [4]u8 = [BIT_MODIFY, address, mask, value]
+        return self.device.write(&mut self.bus, &command)
+    }
+
+    fn status(&mut self) -> u8!hal.Error {
+        command: [1]u8 = [READ_STATUS]
+        value := [0u8; 1]
+        self.device.write_read(&mut self.bus, &command, &mut value)?
+        return ok(value[0])
+    }
+
+    fn rx_status(&mut self) -> u8!hal.Error {
+        command: [1]u8 = [RX_STATUS]
+        value := [0u8; 1]
+        self.device.write_read(&mut self.bus, &command, &mut value)?
+        return ok(value[0])
+    }
+}
+
+fn mode_bits(mode: &Mode) -> u8 {
+    match mode {
+        Mode.Normal => {
+            return MODE_NORMAL
+        }
+        Mode.Loopback => {
+            return MODE_LOOPBACK
+        }
+        Mode.ListenOnly => {
+            return MODE_LISTEN_ONLY
+        }
+    }
+}
+
+// Whether READ STATUS shows a transmit request for `buffer`.
+fn pending(status: u8, buffer: usize) -> bool {
+    return (status & (0x04u8 << (2 * buffer as u8))) != 0
+}
+
+// Write identifier `id` as SIDH, SIDL, EID8, EID0 at `bytes[at..at + 4]`,
+// with IDE (EXIDE) set for an extended identifier.
+fn encode_id(bytes: &mut[u8], at: usize, id: u32, extended: bool) {
+    if extended {
+        encode_layout(bytes, at, id)
+        bytes[at + 1] = bytes[at + 1] | IDE
+    } else {
+        encode_layout(bytes, at, (id & hal.CAN_MAX_STANDARD_ID) << 18)
+    }
+}
+
+// Write a 29-bit value in the register layout: bits 28-18 as SID10-0, bits
+// 17-0 as EID17-0.
+fn encode_layout(bytes: &mut[u8], at: usize, value: u32) {
+    standard := (value >> 18) & 0x7FF
+    bytes[at] = ((standard >> 3) & 0xFF) as u8
+    bytes[at + 1] = (((standard & 0x07) << 5) | ((value >> 16) & 0x03)) as u8
+    bytes[at + 2] = ((value >> 8) & 0xFF) as u8
+    bytes[at + 3] = (value & 0xFF) as u8
+}
+
+// The frame in a receive buffer's SIDH to D7.
+fn decode_frame(buffer: &[u8], frame: &mut hal.CanFrame) -> void!hal.Error {
+    standard := ((buffer[0] as u32) << 3) | ((buffer[1] as u32) >> 5)
+    extended := (buffer[1] & IDE) != 0
+    id := standard
+    remote := (buffer[1] & SRR) != 0
+    if extended {
+        id = (standard << 18) | (((buffer[1] as u32) & 0x03) << 16) | ((buffer[2] as u32) << 8) | buffer[3] as u32
+        remote = (buffer[4] & RTR) != 0
+    }
+    length := hal.can_dlc_length(buffer[4] & DLC, false)
+    if remote {
+        return frame.set_remote(id, extended, length)
+    }
+    return frame.set_data(id, extended, buffer[5..5 + length])
+}
+
+// A filter's mask in the 29-bit register layout; see "Filters".
+fn hardware_mask(filter: &hal.CanFilter) -> u32 {
+    if filter.extended {
+        return filter.mask & hal.CAN_MAX_EXTENDED_ID
+    }
+    return (filter.mask & hal.CAN_MAX_STANDARD_ID) << 18
+}
+
+// Fill the mask and filter registers for `filters`: `masks` with RXM0 and
+// RXM1, `low` with RXF0-2, and `high` with RXF3-5; see "Filters".
+fn plan_filters(filters: &[hal.CanFilter], masks: &mut[u8], low: &mut[u8], high: &mut[u8]) -> void!hal.Error {
+    // RXF0-5 as filter indexes; the masks as values.
+    slots := [0usize; 6]
+    mask0 := 0u32
+    mask1 := 0u32
+    if filters.len == 0 {
+        // Every frame: standard and extended filters under mask 0.
+        all := [0u8; 4]
+        everything := [0u8; 4]
+        encode_id(&mut all, 0, 0, false)
+        encode_id(&mut everything, 0, 0, true)
+        for slot in 0usize..6 {
+            source := &all
+            if slot % 2 == 1 {
+                source = &everything
+            }
+            for index in 0usize..4 {
+                if slot < 3 {
+                    low[4 * slot + index] = source[index]
+                } else {
+                    high[4 * (slot - 3) + index] = source[index]
+                }
+            }
+        }
+        encode_layout(masks, 0, 0)
+        encode_layout(masks, 4, 0)
+        return ok()
+    }
+    if filters.len > 6 {
+        return err(hal.Error.InvalidInput)
+    }
+    for index in 0usize..filters.len {
+        filter := &filters[index]
+        limit := hal.CAN_MAX_STANDARD_ID
+        if filter.extended {
+            limit = hal.CAN_MAX_EXTENDED_ID
+        }
+        if filter.id > limit {
+            return err(hal.Error.InvalidInput)
+        }
+    }
+    // The groups in order of their first filter, with their members.
+    first := hardware_mask(&filters[0])
+    second := 0u32
+    groups := 1usize
+    members0 := [0usize; 6]
+    members1 := [0usize; 6]
+    count0 := 0usize
+    count1 := 0usize
+    for index in 0usize..filters.len {
+        mask := hardware_mask(&filters[index])
+        if mask == first {
+            members0[count0] = index
+            count0 += 1
+        } else {
+            if groups == 1 {
+                second = mask
+                groups = 2
+            } else if mask != second {
+                return err(hal.Error.InvalidInput)
+            }
+            members1[count1] = index
+            count1 += 1
+        }
+    }
+    if groups == 1 {
+        mask0 = first
+        mask1 = first
+        // RXB0: the first two; RXB1: the last four, cycled.
+        for slot in 0usize..2 {
+            slots[slot] = members0[slot % count0]
+        }
+        start := 0usize
+        if count0 > 4 {
+            start = count0 - 4
+        }
+        span := count0 - start
+        for slot in 0usize..4 {
+            slots[2 + slot] = members0[start + slot % span]
+        }
+    } else {
+        // The larger group in RXB1; on a tie the first group in RXB0.
+        if count1 >= count0 {
+            if count0 > 2 || count1 > 4 {
+                return err(hal.Error.InvalidInput)
+            }
+            mask0 = first
+            mask1 = second
+            for slot in 0usize..2 {
+                slots[slot] = members0[slot % count0]
+            }
+            for slot in 0usize..4 {
+                slots[2 + slot] = members1[slot % count1]
+            }
+        } else {
+            if count1 > 2 || count0 > 4 {
+                return err(hal.Error.InvalidInput)
+            }
+            mask0 = second
+            mask1 = first
+            for slot in 0usize..2 {
+                slots[slot] = members1[slot % count1]
+            }
+            for slot in 0usize..4 {
+                slots[2 + slot] = members0[slot % count0]
+            }
+        }
+    }
+    encode_layout(masks, 0, mask0)
+    encode_layout(masks, 4, mask1)
+    for slot in 0usize..6 {
+        filter := &filters[slots[slot]]
+        if slot < 3 {
+            encode_id(low, 4 * slot, filter.id, filter.extended)
+        } else {
+            encode_id(high, 4 * (slot - 3), filter.id, filter.extended)
+        }
+    }
+    return ok()
+}

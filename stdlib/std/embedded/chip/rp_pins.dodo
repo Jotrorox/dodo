@@ -196,6 +196,11 @@ fn uart_of(number: u32) -> u32 {
 //        the controller's register block
 //    clock_hz(&self) -> u32
 //        the frequency of the clock that feeds the controllers and PWM
+//    pwm_slices(&self) -> u32
+//        the PWM block's slices: 8 on the RP2040, 12 on the RP2350
+//    timer_base(&self) -> usize
+//        the running microsecond timer that times PWM input windows, with
+//        TIMERAWH and TIMERAWL at 0x24 and 0x28
 //    start_adc(&mut self) -> void!hal.Error
 //        start the ADC's 48 MHz clock, pulse its reset, and rp_adc.start it
 //    stop_adc(&mut self)
@@ -216,7 +221,8 @@ pub struct Bank<C> {
     // The pins of each controller's bus, by controller number; 0 while the
     // controller is free.
     buses: [6]u32
-    // Pins driven by PWM outputs, and ADC inputs in use, one bit each.
+    // Pins driven by PWM outputs or measured by PWM inputs, and ADC inputs
+    // in use, one bit each.
     pwm_pins: u32
     analog_inputs: u32
     // PIO blocks in use, one bit each, and the pins each one drives.
@@ -225,7 +231,8 @@ pub struct Bank<C> {
 
     // SAFETY: C's methods must do what the protocol above says, `base` must
     // name the controller's DW_apb_i2c, PL022, or PL011, the PWM block, the
-    // ADC, or the PIO block, and the bank must be the only bank, and the
+    // ADC, or the PIO block, `timer_base` a running microsecond timer that
+    // nothing changes, and the bank must be the only bank, and the
     // only user of GPIO 0 to 29's control and pad registers, of the
     // controllers, the PWM block, the ADC, and the PIO blocks, and of their
     // resets and clocks.
@@ -449,11 +456,76 @@ pub struct Bank<C> {
     }
 
     // Give back a PWM output from `pwm`: it stops driving its pin, which is
-    // disconnected, and the PWM block is held in reset once no output is
-    // left.
+    // disconnected, and the PWM block is held in reset once no output or
+    // input is left.
     pub fn release_pwm(&mut self, output: rp_pwm.Pwm) {
         mask := 1u32 << output.pin()
         output.release()
+        self.pwm_pins &= ~mask
+        self.disconnect(mask)
+        if self.pwm_pins == 0 {
+            self.chip.hold(PWM)
+        }
+    }
+
+    // Claim pin `pin`, an odd GPIO (output B of slice (pin / 2) % 8), as a
+    // PWM input measuring in windows of `window_us`; see rp_pwm.Capture for
+    // the measurement and its range. The input uses the whole slice, so its
+    // output A is not available while it runs. The pin's pad never drives
+    // and has its pull-down on and pull-up off, so an unconnected pin reads
+    // as a steady low line; an open-collector signal, such as a fan's
+    // tachometer, needs a pull-up of 10 kOhm or less to 3.3 V, which
+    // overrides the pull-down.
+    // InvalidInput for an even pin, above GPIO 29, or for a window out of
+    // range; Busy if the pin is taken or either output of its slice is in
+    // use (GPIO n and n + 16 share a slice).
+    pub fn pwm_input(&mut self, pin: u32, window_us: u32) -> rp_pwm.PwmCapture!hal.Error {
+        if pin >= PIN_COUNT {
+            return err(hal.Error.InvalidInput)
+        }
+        mask := 1u32 << pin
+        self.reserve(mask)?
+        if self.pwm_pins == 0 {
+            match self.chip.reset(PWM) {
+                ok() => {}
+                err(error) => {
+                    self.taken &= ~mask
+                    return err(error)
+                }
+            }
+        }
+        // SAFETY: Bank.new vouches for the base addresses and the timer,
+        // the reset above started the block, and only Channels and Captures
+        // use it.
+        base := self.chip.base(PWM)
+        slices := self.chip.pwm_slices()
+        timer := self.chip.timer_base()
+        clock_hz := self.chip.clock_hz()
+        opened := unsafe {
+            rp_pwm.PwmCapture.at(base, slices, timer, clock_hz, pin, window_us)
+        }
+        match opened {
+            ok(input) => {
+                self.pwm_pins |= mask
+                self.chip.route(pin, FUNCTION_PWM, PAD_PULL_UP, PAD_INPUT_ENABLE | PAD_PULL_DOWN | PAD_OUTPUT_DISABLE)
+                return ok(input)
+            }
+            err(error) => {
+                self.taken &= ~mask
+                if self.pwm_pins == 0 {
+                    self.chip.hold(PWM)
+                }
+                return err(error)
+            }
+        }
+    }
+
+    // Give back a PWM input from `pwm_input`: its slice stops and is free
+    // for outputs again, its pin is disconnected, and the PWM block is held
+    // in reset once no output or input is left.
+    pub fn release_pwm_input(&mut self, input: rp_pwm.PwmCapture) {
+        mask := 1u32 << input.pin()
+        input.release()
         self.pwm_pins &= ~mask
         self.disconnect(mask)
         if self.pwm_pins == 0 {

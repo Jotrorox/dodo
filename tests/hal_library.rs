@@ -63,6 +63,236 @@ fn registers_protocols_and_fakes_execute_on_the_host() {
 }
 
 #[test]
+fn polling_target_capture_can_i2s_and_dma_protocols_execute_with_fakes() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let scratch = Scratch::new("protocols");
+    let source = root.join("tests/stdlib/hal_protocol_checks.dodo");
+    for optimization in ["0", "3"] {
+        let executable = scratch.0.join(format!(
+            "protocols-O{optimization}{}",
+            std::env::consts::EXE_SUFFIX
+        ));
+        let args = ["build", source.to_str().unwrap(), "-O", optimization, "-o"];
+        success(&dodo(&args, &executable), "compile protocol fixture");
+        success(
+            &Command::new(&executable).output().unwrap(),
+            "execute protocol fixture",
+        );
+    }
+}
+
+#[test]
+fn pwm_input_capture_measures_against_a_simulated_slice() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let scratch = Scratch::new("pwm-capture");
+    let source = root.join("tests/stdlib/pwm_capture_checks.dodo");
+    for optimization in ["0", "3"] {
+        let executable = scratch.0.join(format!(
+            "pwm-capture-O{optimization}{}",
+            std::env::consts::EXE_SUFFIX
+        ));
+        let args = ["build", source.to_str().unwrap(), "-O", optimization, "-o"];
+        success(&dodo(&args, &executable), "compile PWM capture fixture");
+        success(
+            &Command::new(&executable).output().unwrap(),
+            "execute PWM capture fixture",
+        );
+    }
+}
+
+#[test]
+fn mcp2515_can_controller_executes_against_a_simulated_chip() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let scratch = Scratch::new("can");
+    let source = root.join("tests/stdlib/can_checks.dodo");
+    for optimization in ["0", "3"] {
+        let executable = scratch.0.join(format!(
+            "can-O{optimization}{}",
+            std::env::consts::EXE_SUFFIX
+        ));
+        let args = ["build", source.to_str().unwrap(), "-O", optimization, "-o"];
+        success(&dodo(&args, &executable), "compile CAN fixture");
+        success(
+            &Command::new(&executable).output().unwrap(),
+            "execute CAN fixture",
+        );
+    }
+
+    // The driver over a chip's real SPI bus and pin types, for firmware.
+    for (chip, target) in [
+        ("rp2040", "thumbv6m-none-eabi"),
+        ("rp2350", "thumbv8m.main-none-eabi"),
+    ] {
+        let text = format!(
+            "package can_{chip}\n\
+             import \"std/embedded/can/mcp2515\"\n\
+             import \"std/embedded/chip/{chip}\"\n\
+             import \"std/embedded/hal\"\n\
+             import \"std/embedded/peripheral/pl022\"\n\
+             pub fn start(bus: pl022.Bus, select: {chip}.Pin) -> mcp2515.Controller<pl022.Bus, {chip}.Pin>!hal.Error {{\n\
+             config := mcp2515.Config.new(16_000_000, 500_000)\n\
+             filters: [2]hal.CanFilter = [hal.CanFilter.exact(0x123, false), hal.CanFilter.all(true)]\n\
+             return mcp2515.Controller.new(bus, select, &config, &filters)\n\
+             }}\n\
+             pub fn echo(can: &mut mcp2515.Controller<pl022.Bus, {chip}.Pin>) -> void!hal.Error {{\n\
+             frame := hal.CanFrame.new()\n\
+             hal.receive_frame(can, &mut frame, hal.DEFAULT_POLL_LIMIT)?\n\
+             dynamic: &mut dyn hal.Can = can\n\
+             hal.send_frame(dynamic, &frame, hal.DEFAULT_POLL_LIMIT)?\n\
+             return ok()\n\
+             }}\n"
+        );
+        let file = scratch.write(&format!("{chip}.dodo"), &text);
+        success(
+            &dodo(
+                &[
+                    "build",
+                    file.to_str().unwrap(),
+                    "--emit",
+                    "obj",
+                    "--target",
+                    target,
+                    "-O",
+                    "2",
+                    "-o",
+                ],
+                &scratch.0.join(format!("{chip}.o")),
+            ),
+            &format!("compile the MCP2515 driver for {chip}"),
+        );
+    }
+}
+
+#[test]
+fn pio_i2s_streams_execute_against_a_simulated_pio_block() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let scratch = Scratch::new("i2s");
+    let source = root.join("tests/stdlib/i2s_checks.dodo");
+    for optimization in ["0", "3"] {
+        let executable = scratch.0.join(format!(
+            "i2s-O{optimization}{}",
+            std::env::consts::EXE_SUFFIX
+        ));
+        let args = ["build", source.to_str().unwrap(), "-O", optimization, "-o"];
+        success(&dodo(&args, &executable), "compile I2S fixture");
+        success(
+            &Command::new(&executable).output().unwrap(),
+            "execute I2S fixture",
+        );
+    }
+}
+
+/// The instruction words of `name`, a `rp_pio.Program` constant in LLVM IR.
+fn program_words(ir: &str, name: &str) -> Vec<u16> {
+    let marker = format!("@dodo.main.{name} = ");
+    let line = ir
+        .lines()
+        .find(|line| line.starts_with(&marker))
+        .unwrap_or_else(|| panic!("{name} missing from the IR"));
+    let start = line.find("[32 x i16] [").unwrap() + "[32 x i16] [".len();
+    let end = start + line[start..].find(']').unwrap();
+    let length_field = &line[end + 1..];
+    let length: usize = length_field
+        .trim_start_matches(", i32 ")
+        .split(',')
+        .next()
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    line[start..end]
+        .split(',')
+        .take(length)
+        .map(|word| {
+            word.trim()
+                .trim_start_matches("i16 ")
+                .parse::<i16>()
+                .unwrap() as u16
+        })
+        .collect()
+}
+
+#[test]
+fn pio_i2s_programs_match_the_compiler_assembler() {
+    // rp_i2s writes its programs as words so that desktop tests can run
+    // them; these are what i2s_checks.dodo expects of it. The compiler's
+    // own assembler must produce the same from the pioasm source.
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let scratch = Scratch::new("i2s-programs");
+    let ir = scratch.0.join("programs.ll");
+    success(
+        &dodo(
+            &[
+                "build",
+                root.join("tests/fixtures/rp_i2s_programs.dodo")
+                    .to_str()
+                    .unwrap(),
+                "--board",
+                "pico",
+                "-O",
+                "0",
+                "--emit",
+                "llvm-ir",
+                "-o",
+            ],
+            &ir,
+        ),
+        "assemble the I2S programs",
+    );
+    let text = fs::read_to_string(&ir).unwrap();
+    let expected: [(&str, &[u16]); 8] = [
+        (
+            "OUT32_PHILIPS",
+            &[
+                0x6101, 0xE95D, 0x6101, 0x0982, 0x7001, 0x1027, 0x1908, 0x99A0, 0x7101, 0xF85D,
+                0xB825, 0x7101, 0x198B, 0x6001, 0x0030, 0x0900, 0x89A0,
+            ],
+        ),
+        (
+            "OUT32_LEFT",
+            &[
+                0x7101, 0xF95D, 0x7101, 0x1982, 0x7001, 0x1027, 0x1908, 0x99A0, 0x6101, 0xE85D,
+                0xA825, 0x6101, 0x098B, 0x6001, 0x0030, 0x0900, 0x89A0,
+            ],
+        ),
+        (
+            "OUT16_PHILIPS",
+            &[
+                0x6101, 0xE94D, 0x6101, 0x0982, 0x7101, 0xF94E, 0x7101, 0x1986, 0x6101, 0x8980,
+            ],
+        ),
+        (
+            "OUT16_LEFT",
+            &[
+                0x7101, 0xF94D, 0x7101, 0x1982, 0x7101, 0xF94E, 0x6101, 0x0986, 0x6101, 0x8980,
+            ],
+        ),
+        (
+            "IN32_LEFT",
+            &[
+                0xF15E, 0x5901, 0x1181, 0x5901, 0xE15E, 0x4901, 0x0185, 0x4901,
+            ],
+        ),
+        (
+            "IN32_PHILIPS",
+            &[
+                0xE15E, 0x4901, 0x0181, 0x4901, 0xF15E, 0x5901, 0x1185, 0x5901,
+            ],
+        ),
+        (
+            "IN16_PHILIPS",
+            &[
+                0xE14E, 0x4901, 0x0181, 0x4901, 0xF14E, 0x5901, 0x1185, 0x5901,
+            ],
+        ),
+        ("EXECS", &[0xA0E3, 0xA02B, 0xE020, 0xE05E]),
+    ];
+    for (name, words) in expected {
+        assert_eq!(program_words(&text, name), words, "{name}");
+    }
+}
+
+#[test]
 fn executor_runs_tasks_against_the_simulated_clock() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let scratch = Scratch::new("executor");
