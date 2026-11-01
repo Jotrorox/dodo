@@ -1,0 +1,261 @@
+package ds3231
+
+import "std/embedded/hal"
+import "std/time"
+
+// Analog Devices (Maxim) DS3231 real-time clock chips on any hal.I2c bus,
+// as on the common ZS-042 and Adafruit modules with a coin-cell holder: a
+// temperature-compensated crystal that keeps time within about a minute a
+// year, on the battery while the board is off. Implements the
+// std/embedded/hal Rtc and RtcAlarm protocols, so code written for a chip's
+// own clock runs on one unchanged:
+//
+//     bus := b.pins.i2c(board.I2C_SDA_PIN, board.I2C_SCL_PIN, hal.I2C_FAST_HZ)!
+//     clock := ds3231.Clock.new(bus)
+//     if !clock.is_set()! {
+//         hal.rtc_set(&mut clock, &start)!
+//     }
+//     now := hal.rtc_now(&mut clock)!
+//
+// The chip counts whole seconds through the years 2000 to 2099. It is
+// unset while its oscillator-stopped flag is up: from its first power-up,
+// and after the battery ran out, until the time is set. The alarm is the
+// chip's alarm 1, which matches the day of the month and the time, so it
+// reaches 28 days ahead at most. While it is armed, the chip's INT/SQW pin,
+// an open-drain output, pulls low when it fires, until clear_alarm; wire it
+// to a GPIO with a pull-up to wake on it. Setting the time past an armed
+// alarm makes alarm_fired true, but does not pull the pin.
+
+// The chip's I2C address.
+pub const ADDRESS: u8 = 0x68
+
+// The first and last years the chip counts.
+pub const FIRST_YEAR: i32 = 2000
+pub const LAST_YEAR: i32 = 2099
+
+// Registers: the time (seconds to year, BCD), alarm 1 (seconds to day),
+// control, and status.
+const SECONDS: u8 = 0x00
+const ALARM_1: u8 = 0x07
+const CONTROL: u8 = 0x0E
+const STATUS: u8 = 0x0F
+
+// The hours register's 12-hour mode and its PM flag; the month register's
+// century flag.
+const TWELVE_HOUR: u8 = 1 << 6
+const PM: u8 = 1 << 5
+const CENTURY: u8 = 1 << 7
+
+// CONTROL: alarm 1 pulls INT/SQW low, INT/SQW is the alarm output rather
+// than a square wave, and the oscillator is stopped on battery power.
+const ALARM_1_INTERRUPT: u8 = 1 << 0
+const INTERRUPT_CONTROL: u8 = 1 << 2
+const STOP_ON_BATTERY: u8 = 1 << 7
+
+// STATUS: alarm 1 matched, and the oscillator stopped since the flag was
+// last cleared.
+const ALARM_1_FLAG: u8 = 1 << 0
+const OSCILLATOR_STOPPED: u8 = 1 << 7
+
+// How far ahead the alarm reaches: the shortest month.
+const ALARM_REACH_SECONDS: u64 = 28 * 86_400
+
+pub struct Clock<B: hal.I2c>: hal.Rtc + hal.RtcAlarm {
+    bus: B
+    // The second the alarm is set for, while it is armed.
+    alarm: u64
+    armed: bool
+
+    // A clock chip at ADDRESS on `bus`. Nothing is sent until it is used.
+    pub fn new(bus: B) -> Clock<B> from(bus) {
+        return Clock<B> { bus, alarm: 0, armed: false }
+    }
+
+    fn read_register(&mut self, register: u8) -> u8!hal.Error {
+        return hal.read_register(&mut self.bus, ADDRESS, register)
+    }
+
+    fn write_register(&mut self, register: u8, value: u8) -> void!hal.Error {
+        return hal.write_register(&mut self.bus, ADDRESS, register, value)
+    }
+
+    // True once the time has been set and the oscillator has run since.
+    pub fn is_set(&mut self) -> bool!hal.Error {
+        status := self.read_register(STATUS)?
+        return ok((status & OSCILLATOR_STOPPED) == 0)
+    }
+
+    pub fn resolution_ms(&self) -> u32 {
+        return 1000
+    }
+
+    fn now_seconds(&mut self) -> u64!hal.Error {
+        registers: [7]u8 = [0; 7]
+        hal.read_registers(&mut self.bus, ADDRESS, SECONDS, &mut registers)?
+        status := self.read_register(STATUS)?
+        if (status & OSCILLATOR_STOPPED) != 0 {
+            return err(hal.Error.Busy)
+        }
+        hours := registers[2]
+        hour := 0u32
+        if (hours & TWELVE_HOUR) != 0 {
+            hour = from_bcd(hours & 0x1F) % 12
+            if (hours & PM) != 0 {
+                hour += 12
+            }
+        } else {
+            hour = from_bcd(hours & 0x3F)
+        }
+        year := FIRST_YEAR + from_bcd(registers[6]) as i32
+        if (registers[5] & CENTURY) != 0 {
+            year += 100
+        }
+        day := match time.Date.new(year, from_bcd(registers[5] & 0x1F), from_bcd(registers[4] & 0x3F)) {
+            ok(value) => value,
+            err(_) => {
+                return err(hal.Error.Bus)
+            },
+        }
+        minute := from_bcd(registers[1] & 0x7F)
+        second := from_bcd(registers[0] & 0x7F)
+        if hour > 23 || minute > 59 || second > 59 {
+            return err(hal.Error.Bus)
+        }
+        return ok(day.days_since_epoch() as u64 * 86_400 + (hour * 3600 + minute * 60 + second) as u64)
+    }
+
+    // The time, read in one transaction so the fields agree. Busy if the
+    // clock is not set.
+    pub fn now_ms(&mut self) -> u64!hal.Error {
+        seconds := self.now_seconds()?
+        return ok(seconds * 1000)
+    }
+
+    // Set the time in 24-hour mode, start the oscillator on battery power
+    // too, and clear the oscillator-stopped flag. InvalidInput outside the
+    // years 2000 to 2099.
+    pub fn set_ms(&mut self, time_ms: u64) -> void!hal.Error {
+        let Calendar { date, year, of_day } = calendar_of(time_ms / 1000)?
+        command: [8]u8 = [
+            SECONDS,
+            to_bcd(of_day % 60),
+            to_bcd(of_day / 60 % 60),
+            to_bcd(of_day / 3600),
+            // The chip only counts the weekday on; 1 is Monday, as in ISO 8601.
+            to_bcd(date.weekday()),
+            to_bcd(date.day()),
+            to_bcd(date.month()),
+            to_bcd((year - FIRST_YEAR) as u32),
+        ]
+        self.bus.write(ADDRESS, &command)?
+        control := self.read_register(CONTROL)?
+        if (control & STOP_ON_BATTERY) != 0 {
+            self.write_register(CONTROL, control & ~STOP_ON_BATTERY)?
+        }
+        status := self.read_register(STATUS)?
+        return self.write_register(STATUS, status & ~OSCILLATOR_STOPPED)
+    }
+
+    // Fire at the first whole second at or after `time_ms`, at most 28
+    // days ahead.
+    pub fn set_alarm_ms(&mut self, time_ms: u64) -> void!hal.Error {
+        now := self.now_seconds()?
+        target := time_ms / 1000
+        if time_ms % 1000 != 0 {
+            target += 1
+        }
+        if target <= now || target - now > ALARM_REACH_SECONDS {
+            return err(hal.Error.InvalidInput)
+        }
+        let Calendar { date, year, of_day } = calendar_of(target)?
+        control := self.read_register(CONTROL)?
+        self.write_register(CONTROL, control & ~ALARM_1_INTERRUPT)?
+        // Every field's mask bit clear: match the day of the month, hours,
+        // minutes, and seconds.
+        command: [5]u8 = [ALARM_1, to_bcd(of_day % 60), to_bcd(of_day / 60 % 60), to_bcd(of_day / 3600), to_bcd(date.day())]
+        self.bus.write(ADDRESS, &command)?
+        status := self.read_register(STATUS)?
+        self.write_register(STATUS, status & ~ALARM_1_FLAG)?
+        self.alarm = target
+        self.armed = true
+        return self.write_register(CONTROL, control | ALARM_1_INTERRUPT | INTERRUPT_CONTROL)
+    }
+
+    pub fn alarm_fired(&mut self) -> bool!hal.Error {
+        if !self.armed {
+            return ok(false)
+        }
+        status := self.read_register(STATUS)?
+        if (status & ALARM_1_FLAG) != 0 {
+            return ok(true)
+        }
+        if (status & OSCILLATOR_STOPPED) != 0 {
+            return ok(false)
+        }
+        now := self.now_seconds()?
+        return ok(now >= self.alarm)
+    }
+
+    // Disarm the alarm and release INT/SQW.
+    pub fn clear_alarm(&mut self) -> void!hal.Error {
+        self.armed = false
+        control := self.read_register(CONTROL)?
+        self.write_register(CONTROL, control & ~ALARM_1_INTERRUPT)?
+        status := self.read_register(STATUS)?
+        return self.write_register(STATUS, status & ~ALARM_1_FLAG)
+    }
+
+    // The chip's temperature sensor, which its crystal compensation uses,
+    // in quarters of a degree Celsius. It measures every 64 seconds.
+    pub fn temperature_quarters(&mut self) -> i32!hal.Error {
+        registers: [2]u8 = [0, 0]
+        hal.read_registers(&mut self.bus, ADDRESS, 0x11, &mut registers)?
+        raw := ((registers[0] as i32) << 2) | (registers[1] >> 6) as i32
+        if raw >= 512 {
+            raw -= 1024
+        }
+        return ok(raw)
+    }
+
+    // Give back the bus. The chip keeps counting, and an armed alarm stays
+    // armed in it.
+    pub fn release(self) -> B from(self) {
+        let Clock { bus, alarm, armed } = self
+        return bus
+    }
+}
+
+struct Calendar {
+    date: time.Date
+    year: i32
+    // Seconds since midnight.
+    of_day: u32
+}
+
+// The date of `seconds` since the epoch; InvalidInput outside the chip's
+// years.
+fn calendar_of(seconds: u64) -> Calendar!hal.Error {
+    days := seconds / 86_400
+    if days > 200_000 {
+        return err(hal.Error.InvalidInput)
+    }
+    date := match time.Date.from_days_since_epoch(days as i64) {
+        ok(value) => value,
+        err(_) => {
+            return err(hal.Error.InvalidInput)
+        },
+    }
+    year := date.year()
+    if year < FIRST_YEAR || year > LAST_YEAR {
+        return err(hal.Error.InvalidInput)
+    }
+    return ok(Calendar { date, year, of_day: (seconds % 86_400) as u32 })
+}
+
+fn to_bcd(value: u32) -> u8 {
+    return (((value / 10) << 4) | (value % 10)) as u8
+}
+
+fn from_bcd(value: u8) -> u32 {
+    return (value >> 4) as u32 * 10 + (value & 0x0F) as u32
+}

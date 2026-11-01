@@ -139,6 +139,25 @@ fn peripheral_drivers_execute_against_simulated_controllers() {
 }
 
 #[test]
+fn real_time_clocks_execute_against_fakes_and_simulated_registers() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let scratch = Scratch::new("rtc");
+    let source = root.join("tests/stdlib/rtc_checks.dodo");
+    for optimization in ["0", "3"] {
+        let executable = scratch.0.join(format!(
+            "rtc-O{optimization}{}",
+            std::env::consts::EXE_SUFFIX
+        ));
+        let args = ["build", source.to_str().unwrap(), "-O", optimization, "-o"];
+        success(&dodo(&args, &executable), "compile rtc fixture");
+        success(
+            &Command::new(&executable).output().unwrap(),
+            "execute rtc fixture",
+        );
+    }
+}
+
+#[test]
 fn dma_channels_and_sessions_execute_against_simulated_controllers() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let scratch = Scratch::new("dma");

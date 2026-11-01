@@ -1250,6 +1250,78 @@ fn core1_checks(core1: &mut rp_multicore.Core1, fifos: &mut rp_multicore.Fifos, 
     spinlocks.release(lock)
 }
 
+// The time a clock read reports, or 0 if it failed.
+fn time_or_zero(result: u64!hal.Error) -> u64 {
+    match result {
+        ok(value) => {
+            return value
+        }
+        err(_) => {
+            return 0
+        }
+    }
+}
+
+// The real-time clock: set, keeping pace with the timer, and its alarm,
+// whose interrupt stays disabled at the NVIC, so it only pends.
+fn rtc_checks(rtc: &mut chip.Rtc, timer: &mut chip.Timer) {
+    step := rtc.resolution_ms() as u64
+    // 2026-11-01 12:34:56.789 UTC.
+    start := 1_793_536_496_789u64
+    given := match rtc.set_ms(start) {
+        ok() => true,
+        err(_) => false,
+    }
+    set := match rtc.is_set() {
+        ok(value) => value,
+        err(_) => false,
+    }
+    first := time_or_zero(rtc.now_ms())
+    rounded := start - start % step
+    check(given && set && first >= rounded && first <= rounded + step)
+
+    before := time_or_zero(rtc.now_ms())
+    timer.delay_ms(1500)
+    after := time_or_zero(rtc.now_ms())
+    check(after >= before && after - before + step >= 1500 && after - before <= 1500 + step)
+
+    irq := rtc.irq()
+    cortex_m.disable(irq)
+    rtc.listen()
+    cortex_m.unpend(irq)
+    armed := match hal.rtc_alarm_in(rtc, 1500) {
+        ok() => true,
+        err(_) => false,
+    }
+    begin := timer.now_us()
+    fired := false
+    for !fired && timer.now_us() - begin < 3_000_000 {
+        fired = match rtc.alarm_fired() {
+            ok(value) => value,
+            err(_) => false,
+        }
+    }
+    took := timer.now_us() - begin
+    pending := cortex_m.is_pending(irq)
+    cleared := match rtc.clear_alarm() {
+        ok() => true,
+        err(_) => false,
+    }
+    cortex_m.unpend(irq)
+    still := cortex_m.is_pending(irq)
+    rtc.ignore()
+    quiet := match rtc.alarm_fired() {
+        ok(value) => !value,
+        err(_) => false,
+    }
+    // A clock that counts seconds fires at the second after next.
+    on_time := took >= 1_490_000 && took < 1_520_000
+    if step == 1000 {
+        on_time = took >= 990_000 && took < 2_100_000
+    }
+    check(armed && fired && on_time && pending && cleared && !still && quiet)
+}
+
 fn main() {
     // A previous run hung and the watchdog reset the chip: report it.
     unsafe {
@@ -1415,6 +1487,7 @@ fn main() {
     usb_checks(&mut b.usb, &mut b.pins, &mut b.timer)
     dma_checks(&mut b.dma, &mut b.pins, &mut b.timer)
     core1_checks(&mut b.core1, &mut b.fifos, &mut b.spinlocks, &mut b.timer)
+    rtc_checks(&mut b.rtc, &mut b.timer)
 
     // Configuration is validated before ownership: an unusable crystal is
     // InvalidInput, a valid one is Busy because the board already took it.
