@@ -18,7 +18,7 @@ import "std/sync/atomic"
 // Emulator self-test for the RP2040 and RP2350 boards: the startup runtime,
 // the runtime's integer and floating-point helpers, interrupts, SysTick, the
 // timer and its alarms, the executor, DMA, PIO, a UART, and core 1 with the
-// FIFOs and spinlocks. CI runs it on emulated chips (scripts/test_emulator.py,
+// FIFOs, spinlocks, and the lockout. CI runs it on emulated chips (scripts/test_emulator.py,
 // emulator/), so it only uses what the emulators model: nothing outside the
 // chip is connected, and timing is checked with the emulators' tolerances.
 // scripts/test_pico.py runs the fuller hardware self-tests in tests/hardware
@@ -792,6 +792,96 @@ fn core1_checks(core1: &mut rp_multicore.Core1, fifos: &mut rp_multicore.Fifos, 
     spinlocks.release(lock)
 }
 
+// The lockout: core 0 parks core 1 in SRAM, whose count stands still
+// meanwhile and goes on afterwards; then core 1 parks core 0 the same way.
+// The emulators model IO_QSPI's forced interrupt but not the flash, so no
+// flash is erased here.
+static SPINS: atomic.Atomic<u32> = atomic.Atomic.new(0u32)
+static TURN: atomic.Atomic<u32> = atomic.Atomic.new(0u32)
+
+fn word_of(word: &atomic.Atomic<u32>) -> u32 {
+    match word.load(atomic.Ordering.Acquire) {
+        ok(value) => {
+            return value
+        }
+        err(_) => {
+            return 0
+        }
+    }
+}
+
+fn set_word(word: &atomic.Atomic<u32>, value: u32) {
+    match word.store(value, atomic.Ordering.Release) {
+        ok() => {}
+        err(_) => {}
+    }
+}
+
+// One more count; only one core counts at a time.
+fn bump() {
+    set_word(&SPINS, word_of(&SPINS) + 1)
+}
+
+// On core 1: count until core 0 hands over, then lock core 0 out and see
+// its count stand still; report in TURN.
+struct Spinner {
+    pub fn run(self) {
+        for word_of(&TURN) == 0 {
+            bump()
+        }
+        report := 2u32
+        match rp_multicore.lockout() {
+            ok(pause) => {
+                before := word_of(&SPINS)
+                still := pause.is_parked()
+                for _ in 0..20_000 {
+                    still = still && word_of(&SPINS) == before
+                }
+                core.drop(pause)
+                if still {
+                    report |= 4
+                }
+            }
+            err(_) => {}
+        }
+        set_word(&TURN, report)
+    }
+}
+
+fn lockout_checks(core1: &mut rp_multicore.Core1, timer: &mut chip.Timer) {
+    set_word(&SPINS, 0)
+    set_word(&TURN, 0)
+    running := unsafe {
+        core1.start(&mut CORE1_STACK, Spinner {})!
+    }
+    start := timer.now_us()
+    for word_of(&SPINS) == 0 && timer.now_us() - start < 10_000 {}
+    counting := word_of(&SPINS) != 0
+    parked := false
+    match rp_multicore.lockout() {
+        ok(pause) => {
+            before := word_of(&SPINS)
+            timer.delay_ms(1)
+            parked = pause.is_parked() && word_of(&SPINS) == before
+            core.drop(pause)
+        }
+        err(_) => {}
+    }
+    after := word_of(&SPINS)
+    start = timer.now_us()
+    for word_of(&SPINS) == after && timer.now_us() - start < 10_000 {}
+    resumed := word_of(&SPINS) != after
+    assert(counting && parked && resumed, "core 0's lockout does not park core 1 in SRAM")
+    set_word(&TURN, 1)
+    start = timer.now_us()
+    for word_of(&TURN) < 2 && timer.now_us() - start < 100_000 {
+        bump()
+    }
+    report := word_of(&TURN)
+    running.stop()
+    assert(report == 6, "core 1's lockout does not park core 0 in SRAM")
+}
+
 // Run the checks and record the outcome. `float64` runs the binary64
 // checks, which an emulator without a faithful double-precision unit skips.
 pub fn run(float64: bool) {
@@ -820,6 +910,8 @@ pub fn run(float64: bool) {
     pio_checks(&mut b.pins, &mut b.timer)
     step()
     core1_checks(&mut b.core1, &mut b.fifos, &mut b.spinlocks, &mut b.timer)
+    step()
+    lockout_checks(&mut b.core1, &mut b.timer)
     b.led.set_low()
     unsafe {
         record(0, FINISHED | STEP)

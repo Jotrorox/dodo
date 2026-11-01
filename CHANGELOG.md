@@ -924,6 +924,14 @@
   does so in the background, and `stream` keeps filling a ring. Single
   `pins.analog` inputs keep working and are `Busy` while a sampler holds
   the converter, and the other way round. See `examples/adc.dodo`.
+- RP2040 and RP2350 flash regions erase and write from either core while
+  the other runs a task: `rp_multicore.lockout()` parks the other core in
+  SRAM with its interrupts masked, through a forced `IO_IRQ_QSPI` that the
+  runtimes' new SRAM handler answers, and reports `Timeout` if it cannot.
+  New `std/embedded/flash/spi_nor` drives JEDEC SPI NOR flash chips (W25Q,
+  GD25Q, MX25L, IS25LP, ...) as a `hal.Flash`, probing them by JEDEC ID and
+  SFDP, with 4-byte addressing above 16 MiB, protection, deep power-down,
+  and reset.
 
 ## 0.1.5 — 2026-10-12
 

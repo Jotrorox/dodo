@@ -1,5 +1,5 @@
 diff --git a/src/bus/mod.rs b/src/bus/mod.rs
-index a295cfd..6565d6b 100644
+index a295cfd..1d240e0 100644
 --- a/src/bus/mod.rs
 +++ b/src/bus/mod.rs
 @@ -67,6 +67,8 @@ pub const SYSCFG_BASE: u32 = 0x4000_4000;
@@ -22,7 +22,22 @@ index a295cfd..6565d6b 100644
      /// PIO0 / PIO1. Wired into the AHB decode at `0x5020_0000` /
      /// `0x5030_0000` (see [`PIO0_BASE`] / [`PIO1_BASE`]); output pins are
      /// merged into [`Self::gpio_in`] by [`crate::Emulator::update_gpio`].
-@@ -497,6 +503,7 @@ impl Bus {
+@@ -475,6 +481,14 @@ pub struct Bus {
+ }
+ 
+ impl Bus {
++    /// IO_QSPI PROC0_INTF or PROC1_INTF (offsets 0x38 and 0x44) is
++    /// nonzero, forcing IO_IRQ_QSPI on that core (RP2040 datasheet
++    /// 2.19.6.2). The registers live in the catch-all store.
++    pub(crate) fn io_qspi_forced(&self, core: usize) -> bool {
++        let address = IO_QSPI_BASE + 0x38 + 12 * core as u32;
++        self.peripheral_regs.get(&address).is_some_and(|&value| value != 0)
++    }
++
+     pub fn new() -> Self {
+         Self {
+             memory: Memory::with_flash(ROM_SIZE, SRAM_SIZE, FLASH_SIZE),
+@@ -497,6 +511,7 @@ impl Bus {
              xip_ctrl_regs: HashMap::new(),
              ssi_regs: HashMap::new(),
              peripheral_regs: HashMap::new(),
@@ -30,7 +45,7 @@ index a295cfd..6565d6b 100644
              pio: [PioBlock::new(), PioBlock::new()],
              watchdog_tick: WatchdogTickRegs::new(),
              timer: TimerRegs::new(),
-@@ -981,6 +988,10 @@ impl Bus {
+@@ -981,6 +996,10 @@ impl Bus {
                      3 => old & !val,
                      _ => val,
                  };
@@ -125,7 +140,7 @@ index a2a00e7..1dd5a8b 100644
          // Deallocate frame on the selected stack.
          if return_to_psp {
 diff --git a/src/lib.rs b/src/lib.rs
-index 4fb2189..f24af7d 100644
+index 4fb2189..b5efcbd 100644
 --- a/src/lib.rs
 +++ b/src/lib.rs
 @@ -691,6 +691,7 @@ impl Emulator {
@@ -136,7 +151,7 @@ index 4fb2189..f24af7d 100644
                  self.maybe_wake_core1(0);
                  c
              } else {
-@@ -823,6 +824,13 @@ impl Emulator {
+@@ -823,6 +824,20 @@ impl Emulator {
      /// `NVIC_IPR` / `NVIC_ISER` (modelled in
      /// `bus/mod.rs::nvic_mmio_write32` + `nvic_mmio_read32`).
      fn drain_pending_irqs_to_cores(&mut self) {
@@ -147,10 +162,17 @@ index 4fb2189..f24af7d 100644
 +                self.bus.irq_pending |= 1u32 << (15 + core);
 +            }
 +        }
++        // IO_IRQ_QSPI (14) is per core: raised on the core whose
++        // PROCn_INTF forces it. QSPI pin events are not modelled.
++        for core in 0..2 {
++            if self.bus.io_qspi_forced(core) {
++                self.bus.nvics[core].set_pending(crate::irq::IRQ_IO_IRQ_QSPI as u8);
++            }
++        }
          if self.bus.irq_pending != 0 {
              let raised = std::mem::replace(&mut self.bus.irq_pending, 0);
              for irq in 0..crate::irq::IRQ_COUNT {
-@@ -1204,6 +1212,21 @@ impl Emulator {
+@@ -1204,6 +1219,21 @@ impl Emulator {
          self.bus.sio.set_handshake_armed(true);
      }
  

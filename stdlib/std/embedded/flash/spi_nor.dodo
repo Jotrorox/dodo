@@ -1,0 +1,747 @@
+package spi_nor
+
+import "std/embedded/hal"
+
+// Serial NOR flash chips on an SPI bus: the JEDEC-standard parts nearly
+// every flash module and breakout carries, such as Winbond W25Q, GigaDevice
+// GD25Q, Macronix MX25L, ISSI IS25LP, Micron MT25Q, XMC, Puya, and many
+// more, from 512 KiB to 2 GiB. `Flash` implements hal.Flash over any
+// hal.Spi bus and a chip-select pin, which it owns, so a std/embedded/storage
+// Store or Region works on an external chip as on a board's program flash:
+//
+//     bus := b.pins.spi(board.SPI_CLOCK_PIN, board.SPI_TX_PIN, some(board.SPI_RX_PIN), hal.SpiMode.Mode0, 20_000_000)!
+//     chip := spi_nor.Flash.new(bus, b.pins.output(board.SPI_SELECT_PIN)!)!
+//     log := storage.Store.open(storage.Region.last(chip, 64 * 1024)!)!
+//
+// The chips take SPI modes 0 and 3, most at up to 50 MHz or more for every
+// command used here. The driver uses only single-wire SPI commands that
+// these families share (JEDEC JESD216 and the parts' datasheets):
+//
+//   9Fh        read JEDEC ID: manufacturer, memory type, capacity code
+//   5Ah        read SFDP, the chip's self-description (JESD216)
+//   0Bh, 03h   fast read (one dummy byte, any clock) or read
+//   06h        write enable, before every program, erase, or status write
+//   02h        page program, up to 256 bytes within one page
+//   20h        sector erase (4 KiB), or the smallest erase SFDP lists
+//   D8h        block erase (64 KiB), where an erase covers a whole block
+//   C7h        chip erase
+//   05h, 01h   read and write status register 1: BUSY, WEL, protection
+//   B9h, ABh   deep power-down and release from it
+//   66h, 99h   software reset
+//
+// Probing. `new` (or `probe` after `attach`) wakes the chip in case a
+// previous run left it in deep power-down, reads its JEDEC ID, and waits for
+// an erase or write from before a restart to finish. A chip that answers
+// only 00h or FFh, as an empty socket or unpowered chip does, is
+// NoAcknowledge. Its size and erase commands come from SFDP when the chip
+// has it, as every part made in the last decade does: the density, the
+// erase types (the smallest becomes erase_size(), normally 4 KiB, and a
+// 64 KiB type speeds up large erases), and whether it takes 4-byte
+// addresses. Without SFDP, the capacity code of the JEDEC ID gives the
+// size: 2^code bytes for codes 10h to 1Fh, and 2^(code - 6) for codes 20h
+// to 22h, the convention Winbond, Micron, and GigaDevice use above 32 MiB;
+// other codes are Unsupported, and `set_capacity` names the size instead.
+//
+// Addresses. Parts up to 16 MiB take 3-byte addresses. Larger ones are
+// addressed with the 4-byte-address commands (13h, 0Ch, 12h, 21h, DCh, and
+// 5Ch for a 32 KiB erase type), which work in either address mode, so the
+// driver never switches the chip's mode and a chip reset by a power glitch
+// or by `reset` still understands it. A part that SFDP says takes only
+// 4-byte addresses gets the ordinary commands with 4 address bytes. An
+// erase command with no known 4-byte form, on a part above 16 MiB, is
+// Unsupported.
+//
+// Waiting. A page program takes up to a few milliseconds, a sector erase
+// up to about half a second, a block erase about two seconds, and a chip
+// erase up to minutes; the driver polls the status register's BUSY bit
+// meanwhile, and gives up with Timeout after `set_poll_limit` polls
+// (hal.DEFAULT_POLL_LIMIT unless set, many seconds at any clock), or
+// CHIP_ERASE_POLLS for a chip erase. Every operation first waits for one
+// still running, such as an erase that timed out. After each write enable
+// it checks the WEL bit, so a chip that refuses writes, held by its WP#
+// pin or absent, is reported as Bus instead of silently ignoring them.
+//
+// Protection. Some parts leave the factory, or a previous program leaves
+// them, with block-protect bits set, and then ignore programs and erases
+// of the protected blocks without reporting it. `is_protected` reports
+// those bits and `unprotect` clears them. SST26 parts, which protect blocks
+// through their own register, are not covered.
+//
+// Power. `power_down` sends the chip to deep power-down, where it draws a
+// microamp or so and ignores every command but the release; any operation
+// afterwards wakes it first, as `wake` does, by releasing it and reading
+// its JEDEC ID back. `reset` restarts the chip: an erase or write in
+// progress stops, leaving its range undefined.
+
+// Instructions.
+const READ_JEDEC_ID: u8 = 0x9F
+const READ_SFDP: u8 = 0x5A
+const READ: u8 = 0x03
+const FAST_READ: u8 = 0x0B
+const READ_4B: u8 = 0x13
+const FAST_READ_4B: u8 = 0x0C
+const WRITE_ENABLE: u8 = 0x06
+const PAGE_PROGRAM: u8 = 0x02
+const PAGE_PROGRAM_4B: u8 = 0x12
+const SECTOR_ERASE: u8 = 0x20
+const SECTOR_ERASE_4B: u8 = 0x21
+const HALF_BLOCK_ERASE: u8 = 0x52
+const HALF_BLOCK_ERASE_4B: u8 = 0x5C
+const BLOCK_ERASE: u8 = 0xD8
+const BLOCK_ERASE_4B: u8 = 0xDC
+const CHIP_ERASE: u8 = 0xC7
+const READ_STATUS: u8 = 0x05
+const WRITE_STATUS: u8 = 0x01
+const POWER_DOWN: u8 = 0xB9
+const RELEASE_POWER_DOWN: u8 = 0xAB
+const RESET_ENABLE: u8 = 0x66
+const RESET: u8 = 0x99
+
+// Status register 1: a program or erase is running (BUSY, also WIP), writes
+// are enabled (WEL), and the block-protect bits (BP0 to BP3, or BP0 to BP2
+// and TB, depending on the family).
+pub const STATUS_BUSY: u8 = 0x01
+pub const STATUS_WRITE_ENABLED: u8 = 0x02
+pub const STATUS_PROTECTION: u8 = 0x3C
+
+// The program size: a page program writes within one page.
+pub const PAGE_BYTES: u32 = 256
+// The usual smallest erase, and the block erase.
+pub const SECTOR_BYTES: u32 = 4096
+pub const BLOCK_BYTES: u32 = 65536
+// The largest part that 3-byte addresses reach.
+pub const THREE_BYTE_LIMIT: u32 = 16 * 1024 * 1024
+
+// Status polls a chip erase waits before Timeout.
+pub const CHIP_ERASE_POLLS: u32 = 0xFFFF_FFFF
+// JEDEC ID reads a wake or reset waits for the chip to answer again before
+// Timeout: release from deep power-down takes at most tens of
+// microseconds, a reset during an erase some milliseconds.
+pub const WAKE_POLLS: u32 = 100_000
+pub const RESET_POLLS: u32 = 1_000_000
+
+// The SFDP header's signature, "SFDP" read as a little-endian word, and the
+// basic flash parameter table's ID.
+const SFDP_SIGNATURE: u32 = 0x5044_4653
+const BASIC_TABLE: u8 = 0x00
+// Basic flash parameter table words read: the first nine, which every
+// revision of JESD216 has.
+const BASIC_WORDS: usize = 9
+
+// A command's opcode and address bytes, the most a command sends before its
+// data.
+const HEADER_BYTES: usize = 6
+
+// One SPI NOR flash chip; see the package comment.
+pub struct Flash<B: hal.Spi, P: hal.OutputPin>: hal.Flash {
+    bus: B
+    device: hal.SpiDevice<P>
+    // The JEDEC ID, manufacturer in bits 23-16, 0 until probed.
+    id: u32
+    capacity: u32
+    // The smallest erase and its command, and a larger block erase, if
+    // the chip has a 64 KiB one (block_size 0 if not).
+    erase_size: u32
+    erase_command: u8
+    block_size: u32
+    block_command: u8
+    // 3 or 4 address bytes, and the commands that go with them.
+    address_bytes: u32
+    read_command: u8
+    fast_read_command: u8
+    program_command: u8
+    fast: bool
+    asleep: bool
+    poll_limit: u32
+
+    // Take the bus and the chip-select pin, and deselect the chip, without
+    // talking to it: capacity() is 0, and every read, erase, or write is
+    // InvalidInput, until `probe` or `set_capacity`. Most programs call
+    // `new` instead.
+    pub fn attach(bus: B, select: P) -> Flash<B, P> from(bus, select) {
+        device := hal.SpiDevice.new(select)
+        return Flash<B, P> {
+            bus,
+            device,
+            id: 0,
+            capacity: 0,
+            erase_size: SECTOR_BYTES,
+            erase_command: SECTOR_ERASE,
+            block_size: BLOCK_BYTES,
+            block_command: BLOCK_ERASE,
+            address_bytes: 3,
+            read_command: READ,
+            fast_read_command: FAST_READ,
+            program_command: PAGE_PROGRAM,
+            fast: true,
+            asleep: false,
+            poll_limit: hal.DEFAULT_POLL_LIMIT,
+        }
+    }
+
+    // Attach to the chip and probe it; see `probe`. The bus and pin are
+    // dropped with an error; use attach and probe to keep them.
+    pub fn new(bus: B, select: P) -> Flash<B, P>!hal.Error from(bus, select) {
+        chip := Flash.attach(bus, select)
+        chip.probe()?
+        return ok(chip)
+    }
+
+    // Wake the chip, read its JEDEC ID, wait until it is idle, and learn
+    // its size, erase commands, and addressing from SFDP or the ID; see
+    // "Probing". NoAcknowledge if no chip answers, Unsupported for a size
+    // it cannot tell or a part it cannot address, Timeout if it stays busy.
+    pub fn probe(&mut self) -> void!hal.Error {
+        self.id = 0
+        self.asleep = true
+        self.wake()?
+        self.wait_ready_limited()?
+        table := [0u32; 9]
+        words := self.basic_table(&mut table)?
+        if words == 0 {
+            return self.geometry_from_id()
+        }
+        return self.geometry_from_sfdp(&table, words)
+    }
+
+    // The JEDEC ID read by `probe`: the manufacturer (EFh Winbond, C8h
+    // GigaDevice, C2h Macronix, 9Dh ISSI, 20h Micron) in bits 23-16, the
+    // memory type in bits 15-8, and the capacity code in bits 7-0. 0 before
+    // probing.
+    pub fn jedec_id(&self) -> u32 {
+        return self.id
+    }
+
+    // The manufacturer byte of the JEDEC ID.
+    pub fn manufacturer(&self) -> u8 {
+        return ((self.id >> 16) & 0xFF) as u8
+    }
+
+    // Read the JEDEC ID from the chip now, as `jedec_id` reports it. A
+    // sleeping chip answers garbage; this does not wake it.
+    pub fn read_jedec_id(&mut self) -> u32!hal.Error {
+        command: [1]u8 = [READ_JEDEC_ID]
+        id := [0u8; 3]
+        self.device.write_read(&mut self.bus, &command, &mut id)?
+        return ok((id[0] as u32) << 16 | (id[1] as u32) << 8 | id[2] as u32)
+    }
+
+    // Copy `buffer.len` bytes of the chip's SFDP data from `address` into
+    // `buffer`, for parameters this driver does not use.
+    pub fn read_sfdp(&mut self, address: u32, buffer: &mut[u8]) -> void!hal.Error {
+        self.awake()?
+        command: [5]u8 = [READ_SFDP, byte(address, 16), byte(address, 8), byte(address, 0), 0]
+        return self.device.write_read(&mut self.bus, &command, buffer)
+    }
+
+    // Take `bytes` as the chip's size, a nonzero multiple of erase_size(),
+    // for a chip whose size neither SFDP nor its ID tells, or to use only
+    // its start. Parts above THREE_BYTE_LIMIT need probing first, so that
+    // 4-byte addressing is chosen.
+    pub fn set_capacity(&mut self, bytes: u32) -> void!hal.Error {
+        if bytes == 0 || bytes % self.erase_size != 0 {
+            return err(hal.Error.InvalidInput)
+        }
+        if bytes > THREE_BYTE_LIMIT && self.address_bytes == 3 {
+            return err(hal.Error.InvalidInput)
+        }
+        self.capacity = bytes
+        return ok()
+    }
+
+    // Read with the plain read command (03h) instead of fast read (0Bh):
+    // only for the rare part without fast read, as plain reads are limited
+    // to lower clock rates.
+    pub fn set_fast_read(&mut self, fast: bool) {
+        self.fast = fast
+    }
+
+    // Give up waiting for a program or erase after `polls` status reads;
+    // hal.NO_POLL_LIMIT waits as long as it takes. A chip erase waits up
+    // to CHIP_ERASE_POLLS whatever the limit, unless it is NO_POLL_LIMIT.
+    pub fn set_poll_limit(&mut self, polls: u32) {
+        self.poll_limit = polls
+    }
+
+    // True if the chip takes 4-byte addresses: parts above 16 MiB.
+    pub fn uses_four_byte_addresses(&self) -> bool {
+        return self.address_bytes == 4
+    }
+
+    // The size of a block erase, used where an erase covers whole blocks,
+    // or 0 if the chip has none beyond erase_size().
+    pub fn block_size(&self) -> u32 {
+        return self.block_size
+    }
+
+    pub fn capacity(&self) -> u32 {
+        return self.capacity
+    }
+
+    pub fn erase_size(&self) -> u32 {
+        return self.erase_size
+    }
+
+    // 1: any byte can be written; writes split at page boundaries.
+    pub fn write_size(&self) -> u32 {
+        return 1
+    }
+
+    pub fn read(&mut self, offset: u32, buffer: &mut[u8]) -> void!hal.Error {
+        self.check(offset, buffer.len as u32, 1)?
+        if buffer.len == 0 {
+            return ok()
+        }
+        self.ready()?
+        header := [0u8; 6]
+        opcode := self.read_command
+        if self.fast {
+            opcode = self.fast_read_command
+        }
+        length := self.header(&mut header, opcode, offset)
+        if self.fast {
+            // One dummy byte.
+            length += 1
+        }
+        return self.device.write_read(&mut self.bus, &header[..length], buffer)
+    }
+
+    // Erase whole blocks where the range covers them and erase_size()
+    // units elsewhere.
+    pub fn erase(&mut self, offset: u32, length: u32) -> void!hal.Error {
+        unit := self.erase_size
+        self.check(offset, length, unit)?
+        self.ready()?
+        done := 0u32
+        for done < length {
+            at := offset + done
+            size := self.erase_size
+            command := self.erase_command
+            if self.block_size != 0 && at % self.block_size == 0 && length - done >= self.block_size {
+                size = self.block_size
+                command = self.block_command
+            }
+            self.enable_writes()?
+            header := [0u8; 6]
+            count := self.header(&mut header, command, at)
+            self.device.write(&mut self.bus, &header[..count])?
+            self.wait_ready_limited()?
+            done += size
+        }
+        return ok()
+    }
+
+    pub fn write(&mut self, offset: u32, bytes: &[u8]) -> void!hal.Error {
+        self.check(offset, bytes.len as u32, 1)?
+        if bytes.len == 0 {
+            return ok()
+        }
+        self.ready()?
+        // The command, then one page's bytes, in one selection.
+        frame := [0u8; 262]
+        done := 0u32
+        total := bytes.len as u32
+        for done < total {
+            at := offset + done
+            count := PAGE_BYTES - at % PAGE_BYTES
+            if count > total - done {
+                count = total - done
+            }
+            program := self.program_command
+            length := self.header(&mut frame, program, at)
+            for index in 0usize..count as usize {
+                frame[length + index] = bytes[done as usize + index]
+            }
+            self.enable_writes()?
+            self.device.write(&mut self.bus, &frame[..length + count as usize])?
+            self.wait_ready_limited()?
+            done += count
+        }
+        return ok()
+    }
+
+    // Erase the whole chip (C7h), which takes from seconds to minutes; see
+    // "Waiting". A chip with any block protected refuses it.
+    pub fn erase_chip(&mut self) -> void!hal.Error {
+        if self.capacity == 0 {
+            return err(hal.Error.InvalidInput)
+        }
+        self.ready()?
+        self.enable_writes()?
+        command: [1]u8 = [CHIP_ERASE]
+        self.device.write(&mut self.bus, &command)?
+        limit := CHIP_ERASE_POLLS
+        if self.poll_limit == hal.NO_POLL_LIMIT {
+            limit = hal.NO_POLL_LIMIT
+        }
+        return self.wait_ready(limit)
+    }
+
+    // Status register 1; see the STATUS_ bits.
+    pub fn status(&mut self) -> u8!hal.Error {
+        self.awake()?
+        return self.read_status()
+    }
+
+    // True while a program or erase runs.
+    pub fn is_busy(&mut self) -> bool!hal.Error {
+        status := self.status()?
+        return ok((status & STATUS_BUSY) != 0)
+    }
+
+    // True if any block-protect bit is set, so that the chip may ignore
+    // programs and erases of some blocks.
+    pub fn is_protected(&mut self) -> bool!hal.Error {
+        status := self.status()?
+        return ok((status & STATUS_PROTECTION) != 0)
+    }
+
+    // Clear the block-protect bits in status register 1, keeping its other
+    // bits, so every block can be programmed and erased. Bus if the chip
+    // keeps them, as when its status register is locked by the WP# pin.
+    pub fn unprotect(&mut self) -> void!hal.Error {
+        self.ready()?
+        status := self.read_status()?
+        if (status & STATUS_PROTECTION) == 0 {
+            return ok()
+        }
+        self.enable_writes()?
+        command: [2]u8 = [WRITE_STATUS, status & ~(STATUS_PROTECTION | STATUS_BUSY | STATUS_WRITE_ENABLED)]
+        self.device.write(&mut self.bus, &command)?
+        self.wait_ready_limited()?
+        after := self.read_status()?
+        if (after & STATUS_PROTECTION) != 0 {
+            return err(hal.Error.Bus)
+        }
+        return ok()
+    }
+
+    // Send the chip to deep power-down, once a running program or erase has
+    // finished; any operation wakes it again.
+    pub fn power_down(&mut self) -> void!hal.Error {
+        self.ready()?
+        command: [1]u8 = [POWER_DOWN]
+        self.device.write(&mut self.bus, &command)?
+        self.asleep = true
+        return ok()
+    }
+
+    // True between power_down and the next operation or wake.
+    pub fn is_powered_down(&self) -> bool {
+        return self.asleep
+    }
+
+    // Release the chip from deep power-down and wait until it answers with
+    // its JEDEC ID again, at most WAKE_POLLS reads. NoAcknowledge if it
+    // never answers with a valid ID (before probing) or Timeout if it never
+    // answers with the probed one.
+    pub fn wake(&mut self) -> void!hal.Error {
+        command: [1]u8 = [RELEASE_POWER_DOWN]
+        self.device.write(&mut self.bus, &command)?
+        self.wait_for_id(WAKE_POLLS)?
+        self.asleep = false
+        return ok()
+    }
+
+    // Restart the chip with the software reset (66h then 99h) and wait
+    // until it answers with its JEDEC ID again, at most RESET_POLLS reads.
+    // A program or erase in progress stops, leaving its range undefined.
+    // The chip also leaves deep power-down; parts that power up protected
+    // are protected again.
+    pub fn reset(&mut self) -> void!hal.Error {
+        enable: [1]u8 = [RESET_ENABLE]
+        self.device.write(&mut self.bus, &enable)?
+        command: [1]u8 = [RESET]
+        self.device.write(&mut self.bus, &command)?
+        self.wait_for_id(RESET_POLLS)?
+        self.asleep = false
+        return ok()
+    }
+
+    // The bus, for other devices on it between operations.
+    pub fn bus(&mut self) -> &mut B from(self) {
+        return &mut self.bus
+    }
+
+    // Give back the bus and the chip-select pin.
+    pub fn release(self) -> (B, P) {
+        let Flash { bus, device, id, capacity, erase_size, erase_command, block_size, block_command, address_bytes, read_command, fast_read_command, program_command, fast, asleep, poll_limit } = self
+        return (bus, device.release())
+    }
+
+    // --- Probing ---
+
+    // Read SFDP's basic flash parameter table into `table`; the number of
+    // words read, 0 if the chip has no SFDP.
+    fn basic_table(&mut self, table: &mut[u32]) -> usize!hal.Error {
+        header := [0u8; 16]
+        self.read_sfdp(0, &mut header)?
+        if word_at(&header, 0) != SFDP_SIGNATURE || header[5] != 1 || header[8] != BASIC_TABLE {
+            return ok(0)
+        }
+        words := header[11] as usize
+        pointer := word_at(&header, 12) & 0x00FF_FFFF
+        if words > BASIC_WORDS {
+            words = BASIC_WORDS
+        }
+        if words < 2 {
+            return ok(0)
+        }
+        bytes := [0u8; 36]
+        self.read_sfdp(pointer, &mut bytes[..4 * words])?
+        for index in 0usize..words {
+            table[index] = word_at(&bytes, 4 * index)
+        }
+        return ok(words)
+    }
+
+    // The geometry from SFDP's basic table of `words` words.
+    fn geometry_from_sfdp(&mut self, table: &[u32], words: usize) -> void!hal.Error {
+        // Word 2: the density in bits, as N - 1, or as log2 N with bit 31.
+        density := table[1]
+        bytes := 0u64
+        if (density & 0x8000_0000) != 0 {
+            exponent := density & 0x7FFF_FFFF
+            if exponent < 3 || exponent > 34 {
+                return err(hal.Error.Unsupported)
+            }
+            bytes = 1u64 << (exponent - 3) as u64
+        } else {
+            bytes = (density as u64 + 1) / 8
+        }
+        if bytes == 0 || bytes > 0x8000_0000 {
+            return err(hal.Error.Unsupported)
+        }
+        // Words 8 and 9: up to four erase types, each a size 2^N (N 0: none)
+        // and a command. The smallest is the erase size; a 64 KiB one the
+        // block erase. Without them, word 1 tells whether 4 KiB erases
+        // (and with which command) exist.
+        smallest := 0u32
+        smallest_command := 0u8
+        block_command := 0u8
+        if words >= 9 {
+            for index in 0usize..4 {
+                pair := (table[7 + index / 2] >> (16 * (index % 2)) as u32) & 0xFFFF
+                exponent := pair & 0xFF
+                if exponent >= 8 && exponent <= 24 {
+                    size := 1u32 << exponent
+                    command := ((pair >> 8) & 0xFF) as u8
+                    if smallest == 0 || size < smallest {
+                        smallest = size
+                        smallest_command = command
+                    }
+                    if size == BLOCK_BYTES {
+                        block_command = command
+                    }
+                }
+            }
+        }
+        if smallest == 0 {
+            if (table[0] & 0x3) == 0x1 {
+                smallest = SECTOR_BYTES
+                smallest_command = ((table[0] >> 8) & 0xFF) as u8
+            } else {
+                smallest = BLOCK_BYTES
+                smallest_command = BLOCK_ERASE
+                block_command = BLOCK_ERASE
+            }
+        }
+        // Word 1 bits 18-17: 3-byte addresses only (00), either (01), or
+        // 4-byte addresses only (10).
+        four_only := ((table[0] >> 17) & 0x3) == 0x2
+        return self.set_geometry(bytes as u32, smallest, smallest_command, block_command, four_only)
+    }
+
+    // The geometry from the JEDEC ID's capacity code.
+    fn geometry_from_id(&mut self) -> void!hal.Error {
+        code := self.id & 0xFF
+        exponent := 0u32
+        if code >= 0x10 && code <= 0x1F {
+            exponent = code
+        } else if code >= 0x20 && code <= 0x22 {
+            exponent = code - 6
+        } else {
+            return err(hal.Error.Unsupported)
+        }
+        return self.set_geometry(1u32 << exponent, SECTOR_BYTES, SECTOR_ERASE, BLOCK_ERASE, false)
+    }
+
+    // Take a chip of `bytes`, erased in units of `erase_size` by
+    // `erase_command` and in 64 KiB blocks by `block_command` (0: none),
+    // choosing its address bytes and commands.
+    fn set_geometry(&mut self, bytes: u32, erase_size: u32, erase_command: u8, block_command: u8, four_only: bool) -> void!hal.Error {
+        if bytes % erase_size != 0 {
+            return err(hal.Error.Unsupported)
+        }
+        erase := erase_command
+        block := block_command
+        self.address_bytes = 3
+        self.read_command = READ
+        self.fast_read_command = FAST_READ
+        self.program_command = PAGE_PROGRAM
+        if bytes > THREE_BYTE_LIMIT || four_only {
+            self.address_bytes = 4
+            if !four_only {
+                // The 4-byte-address commands, in whichever mode the chip is.
+                self.read_command = READ_4B
+                self.fast_read_command = FAST_READ_4B
+                self.program_command = PAGE_PROGRAM_4B
+                erase = four_byte_erase(erase_command)
+                if erase == 0 {
+                    return err(hal.Error.Unsupported)
+                }
+                if block != 0 {
+                    block = four_byte_erase(block_command)
+                }
+            }
+        }
+        self.capacity = bytes
+        self.erase_size = erase_size
+        self.erase_command = erase
+        self.block_size = 0
+        self.block_command = 0
+        if block != 0 && BLOCK_BYTES > erase_size {
+            self.block_size = BLOCK_BYTES
+            self.block_command = block
+        }
+        return ok()
+    }
+
+    // Read the JEDEC ID until it is valid (anything but all zeros or all
+    // ones) and, once probed, the probed one: at most `polls` reads while
+    // the chip does not answer, and while its status shows BUSY, as after
+    // a restart during an erase, which ignores the ID command, as long as
+    // the poll limit allows.
+    fn wait_for_id(&mut self, polls: u32) -> void!hal.Error {
+        silent := 0u32
+        busy := 0u32
+        for {
+            id := self.read_jedec_id()?
+            if id != 0 && id != 0x00FF_FFFF && (self.id == 0 || id == self.id) {
+                self.id = id
+                return ok()
+            }
+            status := self.read_status()?
+            if status != 0xFF && (status & STATUS_BUSY) != 0 {
+                busy += 1
+                if self.poll_limit != hal.NO_POLL_LIMIT && busy >= self.poll_limit {
+                    return err(hal.Error.Timeout)
+                }
+            } else {
+                silent += 1
+                if silent >= polls {
+                    if self.id == 0 {
+                        return err(hal.Error.NoAcknowledge)
+                    }
+                    return err(hal.Error.Timeout)
+                }
+            }
+        }
+    }
+
+    // --- Operations ---
+
+    // InvalidInput unless `length` bytes from `offset` lie inside the chip,
+    // both multiples of `align`.
+    fn check(&self, offset: u32, length: u32, align: u32) -> void!hal.Error {
+        if offset as u64 + length as u64 > self.capacity as u64 || offset % align != 0 || length % align != 0 {
+            return err(hal.Error.InvalidInput)
+        }
+        return ok()
+    }
+
+    // Wake the chip if it sleeps.
+    fn awake(&mut self) -> void!hal.Error {
+        if self.asleep {
+            self.wake()?
+        }
+        return ok()
+    }
+
+    // Wake the chip if it sleeps, and wait for a program or erase still
+    // running.
+    fn ready(&mut self) -> void!hal.Error {
+        self.awake()?
+        return self.wait_ready_limited()
+    }
+
+    fn read_status(&mut self) -> u8!hal.Error {
+        command: [1]u8 = [READ_STATUS]
+        status := [0u8; 1]
+        self.device.write_read(&mut self.bus, &command, &mut status)?
+        return ok(status[0])
+    }
+
+    // Poll BUSY until it clears; Timeout after the poll limit.
+    fn wait_ready_limited(&mut self) -> void!hal.Error {
+        limit := self.poll_limit
+        return self.wait_ready(limit)
+    }
+
+    // Poll BUSY until it clears; Timeout after `limit` polls.
+    fn wait_ready(&mut self, limit: u32) -> void!hal.Error {
+        polls := 0u32
+        for {
+            status := self.read_status()?
+            if (status & STATUS_BUSY) == 0 {
+                return ok()
+            }
+            polls += 1
+            if limit != hal.NO_POLL_LIMIT && polls >= limit {
+                return err(hal.Error.Timeout)
+            }
+        }
+    }
+
+    // Write enable, checked: Bus if the chip does not set WEL.
+    fn enable_writes(&mut self) -> void!hal.Error {
+        command: [1]u8 = [WRITE_ENABLE]
+        self.device.write(&mut self.bus, &command)?
+        status := self.read_status()?
+        if (status & STATUS_WRITE_ENABLED) == 0 {
+            return err(hal.Error.Bus)
+        }
+        return ok()
+    }
+
+    // Write `opcode` and the address `at` into the start of `frame`; the
+    // bytes written.
+    fn header(&self, frame: &mut[u8], opcode: u8, at: u32) -> usize {
+        frame[0] = opcode
+        if self.address_bytes == 4 {
+            frame[1] = byte(at, 24)
+            frame[2] = byte(at, 16)
+            frame[3] = byte(at, 8)
+            frame[4] = byte(at, 0)
+            return 5
+        }
+        frame[1] = byte(at, 16)
+        frame[2] = byte(at, 8)
+        frame[3] = byte(at, 0)
+        return 4
+    }
+}
+
+// The 4-byte-address form of an erase command, or 0 if there is none.
+fn four_byte_erase(command: u8) -> u8 {
+    if command == SECTOR_ERASE || command == SECTOR_ERASE_4B {
+        return SECTOR_ERASE_4B
+    }
+    if command == HALF_BLOCK_ERASE || command == HALF_BLOCK_ERASE_4B {
+        return HALF_BLOCK_ERASE_4B
+    }
+    if command == BLOCK_ERASE || command == BLOCK_ERASE_4B {
+        return BLOCK_ERASE_4B
+    }
+    return 0
+}
+
+// The byte of `value` at bit `shift`.
+fn byte(value: u32, shift: u32) -> u8 {
+    return ((value >> shift) & 0xFF) as u8
+}
+
+// The little-endian word at `at` in `bytes`.
+fn word_at(bytes: &[u8], at: usize) -> u32 {
+    return bytes[at] as u32 | (bytes[at + 1] as u32) << 8 | (bytes[at + 2] as u32) << 16 | (bytes[at + 3] as u32) << 24
+}

@@ -20,7 +20,7 @@ grouped under `std/embedded` in layers, on top of two small compiler packages:
 | Real-time clocks | `std/embedded/hal`, `std/embedded/chip/rp_rtc`, `std/embedded/rtc/ds3231` | `hal.Rtc` and `hal.RtcAlarm`: the time of day and an alarm, the same on the RP2040's RTC, the RP2350's always-on timer, and a DS3231 clock chip on I2C. |
 | Low power | `std/embedded/power` | Sleep and deep sleep, clock gating, and a dormant state woken by pins, through one `Power` protocol that every chip and the fakes implement. |
 | DMA | `std/embedded/hal`, `std/embedded/chip/rp_dma` | `hal.DmaChannel`, through which drivers move data while the program does other work; the RP2040's and RP2350's channels. |
-| Persistent storage | `std/embedded/hal`, `std/embedded/storage`, `std/embedded/chip/rp_flash` | `hal.Flash`, erasing and writing NOR flash; a power-cut-safe key-value store and flash regions on any such device; the RP2040's and RP2350's program flash. |
+| Persistent storage | `std/embedded/hal`, `std/embedded/storage`, `std/embedded/chip/rp_flash`, `std/embedded/flash/spi_nor` | `hal.Flash`, erasing and writing NOR flash; a power-cut-safe key-value store and flash regions on any such device; the RP2040's and RP2350's program flash; external SPI NOR flash chips. |
 | Desktop testing | `std/embedded/hal/fake` | In-memory pins, delays, buses, serial ports, flash, a real-time clock, a simulated clock, and simulated power controls that record what a driver did. |
 | Boards | `std/embedded/board` | The selected board: one `take()` and the same LED, pin, timer, and clock fields on every board. |
 | Chip support | `std/embedded/chip` | The selected microcontroller's peripherals, for custom boards. |
@@ -1789,7 +1789,8 @@ memory that behaves like NOR flash: erasing sets whole blocks of
 programs bytes, in units of `write_size()`, only once until their block is
 erased again. Out-of-range or misaligned requests return
 `hal.Error.InvalidInput`. A board's program flash implements it through
-regions, and so can a driver for an external SPI flash chip.
+regions, and `std/embedded/flash/spi_nor` implements it for
+[external SPI flash chips](#external-spi-flash-chips).
 
 `std/embedded/storage` builds on any `hal.Flash`:
 
@@ -1890,6 +1891,51 @@ fn settings_survive_a_power_cut() {
 The repository's `tests/stdlib/storage_checks.dodo` cuts the power at every
 erase and write, and every few bytes in between, of a long run of updates,
 and checks that each key keeps its old or new value.
+
+### External SPI flash chips
+
+`std/embedded/flash/spi_nor` drives the serial NOR flash chips on flash
+modules and breakouts: Winbond W25Q, GigaDevice GD25Q, Macronix MX25L, ISSI
+IS25LP, Micron MT25Q, and the other parts with the JEDEC-standard SPI
+commands, from 512 KiB to 2 GiB. `spi_nor.Flash` owns an SPI bus and the
+chip-select pin, like the [MCP2515 driver](#can), and is a `hal.Flash`, so a
+store or region works on it as on the program flash:
+
+```dodo
+bus := b.pins.spi(board.SPI_CLOCK_PIN, board.SPI_TX_PIN, some(board.SPI_RX_PIN), hal.SpiMode.Mode0, 20_000_000)!
+chip := spi_nor.Flash.new(bus, b.pins.output(board.SPI_SELECT_PIN)!)!
+log := storage.Store.open(storage.Region.last(chip, 64 * 1024)!)!
+```
+
+`new` wakes the chip from deep power-down, in case a previous run left it
+there, reads its JEDEC ID (`jedec_id()`, `manufacturer()`), waits for an
+erase still running from before a restart, and takes its size, erase sizes,
+and addressing from the chip's SFDP table, or from the ID's capacity code on a
+part without one. An empty socket is `NoAcknowledge`; a size neither tells is
+`Unsupported`, and `attach` with `set_capacity(bytes)` names it instead.
+
+| `spi_nor.Flash` | Purpose |
+| --- | --- |
+| `read`, `write`, `erase` | The `hal.Flash` methods: fast reads (`set_fast_read(false)` for the plain read command), writes of any bytes split at 256-byte pages, and erases of `erase_size()` units (4 KiB) with 64 KiB block erases where the range covers whole blocks. |
+| `erase_chip()` | Erase everything, which takes seconds to minutes. |
+| `status()`, `is_busy()` | Status register 1. Every program and erase polls its BUSY bit, up to `set_poll_limit(polls)` reads (`hal.DEFAULT_POLL_LIMIT`), then reports `Timeout`. |
+| `is_protected()`, `unprotect()` | The block-protect bits some parts ship with, during which programs and erases of those blocks are silently ignored, and clearing them. |
+| `power_down()`, `wake()`, `is_powered_down()` | Deep power-down, a microamp or so; any operation wakes the chip first. |
+| `reset()` | The software reset, which stops an erase or write in progress. |
+| `read_sfdp(address, buffer)`, `uses_four_byte_addresses()`, `block_size()` | SFDP data for other parameters, and the addressing and block erase chosen. |
+| `bus()`, `release()` | The bus between operations, and giving back the bus and pin. |
+
+Parts above 16 MiB get the 4-byte-address commands, which work in either of
+the chip's address modes, so the driver never switches the mode and a chip
+reset by a glitch still understands it. After each write enable the driver
+checks that the chip set its write-enable latch, so a chip held by its WP#
+pin, or missing, reports `Bus` rather than ignoring writes. Only single-wire
+SPI is used; dual and quad reads, SST26 block protection, and erase suspend
+are not.
+
+The repository's `tests/stdlib/spi_nor_checks.dodo` runs the driver against
+a simulated chip that flags any command a datasheet forbids, and a store on
+it through power cuts.
 
 ## Low power
 
@@ -3118,8 +3164,11 @@ mode meanwhile, so nothing may run from or read flash: a region masks
 interrupts on the core that calls it while it works, and on the RP2040 runs
 that part from SRAM. Interrupt handlers wait for up to one sector erase. A
 USB serial port stays connected, as its controller answers the host by itself.
-Core 1 runs from flash too, so a region refuses to erase or write with
-`Busy` on core 1 and while core 1 runs a task: stop it first. DMA transfers
+The other core runs from flash too, so for each sector erase and page write
+a region parks it in SRAM with [`rp_multicore.lockout()`](#the-lockout), if
+it runs: either core may erase and write while the other runs a task. If the
+other core does not answer, for example because it keeps its interrupts
+masked for tens of milliseconds, the region reports `Timeout`. DMA transfers
 must not read from flash while a region erases or writes.
 
 ### Real-time clocks on the RP2040 and RP2350
@@ -3371,6 +3420,37 @@ bell.ring()
 
 A program's own `@interrupt(SIO_IRQ_BELL)` handler replaces the runtime's.
 
+#### The lockout
+
+Both cores execute in place from the flash, which stops answering while it
+erases or writes. `rp_multicore.lockout()` parks the other core in a loop in
+SRAM, with its interrupts masked, until the returned `Lockout` is dropped,
+as pico-sdk's `multicore_lockout` does; flash regions use it, and so can a
+program that takes the flash away by other means:
+
+```dodo
+pause := rp_multicore.lockout()!
+// The other core runs nothing from flash here, and this core's
+// interrupts are masked.
+core.drop(pause)
+```
+
+It forces the other core's `IO_IRQ_QSPI` through IO_QSPI's `PROCn_INTF`
+register, which only that core sees. The chip runtime's handler of that
+interrupt runs from SRAM: it acknowledges through a word in SRAM and spins
+until the lockout ends. Core 1 listens at the most urgent priority from the
+start of its task, and core 0 from `start`, so either core can lock out the
+other. On core 0 it parks core 1 only while core 1 runs a task
+(`is_parked()` is false otherwise), and inside another `Lockout` of the same
+core it changes nothing. The other core answers once it can take the
+interrupt: after a handler of the same priority returns, or a `hal.Critical`
+section, `sync.Mutex`, or spinlock guard ends. If it does not answer within
+`rp_multicore.LOCKOUT_ATTEMPTS` polls (tens of milliseconds), the request is
+withdrawn and `lockout` returns `Timeout`; `Busy` means the other core held
+the lockout itself for that long. A program's own `IO_IRQ_QSPI` handler
+replaces the runtime's and breaks the lockout. DMA transfers are not stopped
+by it.
+
 `examples/two_cores.dodo` searches for primes on core 1 and reports progress
 over USB serial from an executor on core 0, woken through the FIFO, with a
 spinlock around the results both cores read. The ADC and the USB serial port
@@ -3594,10 +3674,12 @@ dodo build firmware.dodo --emit obj --target thumbv7em-none-eabihf \
   timer's capture and compare channels, and periodic hardware timers have no
   shared protocol; use the chip's own methods, as for the RP2040's and
   RP2350's alarms, whose interrupts `listen` turns on.
-- Flash regions erase and write only from core 0, with interrupts masked and
-  core 1 stopped; there is no lockout that pauses core 1 in SRAM meanwhile.
-  External SPI flash chips have no bundled driver yet, but any driver with
-  the `hal.Flash` methods holds a `storage.Store`.
+- Flash regions mask interrupts on the core that erases or writes, and park
+  the other core with `rp_multicore.lockout()`, which needs that core to
+  take `IO_IRQ_QSPI` within tens of milliseconds; DMA transfers reading flash
+  are not paused. `std/embedded/flash/spi_nor` drives external SPI NOR chips
+  over single-wire SPI only, without dual or quad reads, SST26 block
+  protection, or erase suspend.
 - Real-time clocks tick from the crystal: the RP2040's RTC is not clocked
   from a GPIO, nor the RP2350's always-on timer from its low-power
   oscillator or a GPIO, so they stop while the chip is dormant and cannot

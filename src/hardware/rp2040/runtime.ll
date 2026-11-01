@@ -21,6 +21,9 @@
 ;                  SRAM, for std/embedded/chip/rp_flash.
 ;   dodo_flash_image_end, dodo_flash_end
 ;                  Where the program image and the board's flash end.
+;   IO_IRQ_QSPI    dodo_lockout_handler, from SRAM: parks this core while the
+;                  other core erases or writes the flash, for
+;                  std/embedded/chip/rp_multicore's lockout.
 ;   USBCTRL_IRQ    Calls dodo_usb_interrupt if the program defines it:
 ;                  std/embedded/chip/rp_usb does, for the USB serial port.
 ;   DMA_IRQ_0      Calls dodo_dma_interrupt if the program defines it:
@@ -369,6 +372,63 @@ module asm ".balign 4"
 module asm "dodo_rp2040_boot2_copy:"
 module asm "    .space 256"
 
+; The multicore lockout (std/embedded/chip/rp_multicore). While one core
+; erases or writes the flash, the other must not fetch from it, so the first
+; parks the second here, in SRAM (.ramfunc), with its interrupts masked. The
+; requesting core writes a nonzero request number to the mailbox's first
+; word, then forces this core's IO_IRQ_QSPI through IO_QSPI's PROC0_INTF or
+; PROC1_INTF (datasheet 2.19.6.2: INTS = INTR & INTE | INTF), so the vector
+; is fetched while the flash still executes in place. This handler clears
+; the forced bit (SCLK's LEVEL_LOW, bit 0), copies the request into the
+; second word to acknowledge it, and spins until the first word changes.
+; A request withdrawn before the handler ran reads as 0: it returns at
+; once. The mailbox's address comes from dodo_lockout_words.
+module asm ".section .ramfunc.dodo_lockout, \22ax\22, %progbits"
+module asm ".balign 4"
+module asm ".global dodo_lockout_handler"
+module asm ".type dodo_lockout_handler, %function"
+module asm ".thumb_func"
+module asm "dodo_lockout_handler:"
+module asm "    mrs r3, primask"
+module asm "    cpsid i"
+module asm "    ldr r0, =0xd0000000"                    ; SIO CPUID: 0 or 1
+module asm "    ldr r0, [r0]"
+module asm "    movs r1, #12"
+module asm "    muls r1, r0, r1"
+module asm "    ldr r2, =0x4001b038"                    ; IO_QSPI PROC0_INTF, clear alias
+module asm "    adds r2, r2, r1"                        ; PROC1_INTF 12 bytes on
+module asm "    movs r1, #1"
+module asm "    str r1, [r2]"
+module asm "    dsb"
+module asm "    ldr r0, =dodo_lockout_mailbox"
+module asm "    ldr r1, [r0, #0]"                       ; the request
+module asm "    cmp r1, #0"
+module asm "    beq 2f"
+module asm "    dmb"
+module asm "    str r1, [r0, #4]"                       ; acknowledged: parked
+module asm "1:  ldr r2, [r0, #0]"
+module asm "    cmp r2, r1"
+module asm "    beq 1b"
+module asm "2:  dmb"
+module asm "    msr primask, r3"
+module asm "    bx lr"
+module asm "    .ltorg"
+
+module asm ".section .bss.dodo_lockout_mailbox, \22aw\22, %nobits"
+module asm ".balign 4"
+module asm ".global dodo_lockout_mailbox"
+module asm "dodo_lockout_mailbox:"
+module asm "    .space 8"
+
+module asm ".section .text.dodo_lockout_words, \22ax\22, %progbits"
+module asm ".global dodo_lockout_words"
+module asm ".type dodo_lockout_words, %function"
+module asm ".thumb_func"
+module asm "dodo_lockout_words:"
+module asm "    ldr r0, =dodo_lockout_mailbox"
+module asm "    bx lr"
+module asm "    .ltorg"
+
 ; dodo_flash_image_end() and dodo_flash_end(): the linker script's addresses.
 module asm ".section .text.dodo_flash_image_end, \22ax\22, %progbits"
 module asm ".global dodo_flash_image_end"
@@ -409,7 +469,7 @@ module asm ".thumb_set PIO1_IRQ_0, DefaultHandler"
 module asm ".thumb_set PIO1_IRQ_1, DefaultHandler"
 module asm ".thumb_set DMA_IRQ_1, DefaultHandler"
 module asm ".thumb_set IO_IRQ_BANK0, DefaultHandler"
-module asm ".thumb_set IO_IRQ_QSPI, DefaultHandler"
+module asm ".thumb_set IO_IRQ_QSPI, dodo_lockout_handler"
 module asm ".thumb_set SIO_IRQ_PROC0, FifoHandler"
 module asm ".thumb_set SIO_IRQ_PROC1, FifoHandler"
 module asm ".thumb_set CLOCKS_IRQ, DefaultHandler"
