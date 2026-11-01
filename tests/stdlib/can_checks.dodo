@@ -1,0 +1,1922 @@
+package main
+
+import "core/ptr"
+import "std/embedded/can/mcp2515"
+import "std/embedded/hal"
+
+// --- A behavioural MCP2515 -------------------------------------------------
+//
+// `Node` is the chip: a register file, the SPI instruction decoder framed by
+// chip select, operating modes, three transmit buffers that complete when
+// the test lets the node send, and two receive buffers with the masks,
+// filters, rollover, and overflow of the real part. The driver reaches it
+// through `ModelSpi` (the bus) and `ModelPin` (chip select), which both
+// point at the node so the decoder sees transaction boundaries. Anything a
+// driver does that the datasheet forbids, such as writing the bit timing
+// outside configuration mode or a transmit buffer that is pending, counts
+// as a violation, and every test expects none.
+
+const CANSTAT: u8 = 0x0E
+const CANCTRL: u8 = 0x0F
+const TEC: u8 = 0x1C
+const REC: u8 = 0x1D
+const RXM0: u8 = 0x20
+const RXM1: u8 = 0x24
+const CNF3: u8 = 0x28
+const CNF2: u8 = 0x29
+const CNF1: u8 = 0x2A
+const CANINTE: u8 = 0x2B
+const CANINTF: u8 = 0x2C
+const EFLG: u8 = 0x2D
+const RXB0CTRL: u8 = 0x60
+const RXB1CTRL: u8 = 0x70
+
+const CONFIGURATION: u8 = 0x80
+const NORMAL: u8 = 0x00
+const LOOPBACK: u8 = 0x40
+const LISTEN_ONLY: u8 = 0x60
+
+const FRAME: usize = 13
+const OUTBOX: usize = 64
+
+// The first register of RXF0-5.
+fn filter_address(slot: usize) -> u8 {
+    if slot < 3 {
+        return (4 * slot) as u8
+    }
+    return (0x10 + 4 * (slot - 3)) as u8
+}
+
+struct Node {
+    registers: [128]u8
+    selected: bool
+    position: usize
+    command: u8
+    address: u8
+    mask: u8
+    // Receive buffers whose RXnIF clears when chip select rises.
+    release: u8
+    // The mode CANCTRL requests takes effect after this many CANSTAT reads;
+    // never while `stuck`.
+    mode_delay: u32
+    delay_left: u32
+    stuck: bool
+    // No chip: MISO reads high.
+    absent: bool
+    // Another node acknowledges this node's frames in normal mode.
+    acknowledged: bool
+    // The filter that accepted the frame in each receive buffer.
+    hits: [2]u8
+    // Frames sent onto the bus (normal mode), as transmit buffer images.
+    outbox: [832]u8
+    sent: usize
+    // A frame that arrives while the next READ RX BUFFER runs.
+    arrival: [13]u8
+    arriving: bool
+    dropped: u32
+    // The `fail_in`-th SPI call from now fails with Busy.
+    fail_in: u32
+    violations: u32
+    transactions: u32
+    resets: u32
+
+    fn new() -> Node {
+        node := Node { registers: [0; 128], selected: false, position: 0, command: 0, address: 0, mask: 0, release: 0, mode_delay: 0, delay_left: 0, stuck: false, absent: false, acknowledged: true, hits: [0, 0], outbox: [0; 832], sent: 0, arrival: [0; 13], arriving: false, dropped: 0, fail_in: 0, violations: 0, transactions: 0, resets: 0 }
+        node.power_on()
+        return node
+    }
+
+    fn power_on(&mut self) {
+        for index in 0usize..128 {
+            self.registers[index] = 0
+        }
+        self.registers[CANCTRL as usize] = 0x87
+        self.registers[CANSTAT as usize] = CONFIGURATION
+        self.delay_left = 0
+        self.hits = [0, 0]
+    }
+
+    fn mode(&self) -> u8 {
+        return self.registers[CANSTAT as usize] & 0xE0
+    }
+
+    fn register(&self, address: u8) -> u8 {
+        return self.registers[address as usize]
+    }
+
+    fn set(&mut self, address: u8, value: u8) {
+        self.registers[address as usize] = value
+    }
+
+    fn pin_low(&self) -> bool {
+        return self.selected
+    }
+
+    // INT is low while a flag it listens for is set.
+    fn int_low(&self) -> bool {
+        return (self.register(CANINTE) & self.register(CANINTF)) != 0
+    }
+
+    // --- SPI side ---
+
+    fn select(&mut self) {
+        if self.selected {
+            self.violations += 1
+        }
+        self.selected = true
+        self.position = 0
+        self.release = 0
+    }
+
+    fn deselect(&mut self) {
+        if !self.selected {
+            return
+        }
+        self.selected = false
+        self.transactions += 1
+        if self.release != 0 {
+            if self.arriving {
+                // Arrives while the buffer is still full.
+                self.arriving = false
+                image := [0u8; 13]
+                for index in 0usize..FRAME {
+                    image[index] = self.arrival[index]
+                }
+                self.accept(&image)
+            }
+            self.registers[CANINTF as usize] = self.register(CANINTF) & (0xFF ^ self.release)
+            self.release = 0
+        }
+    }
+
+    fn fault(&mut self) -> void!hal.Error {
+        if self.fail_in != 0 {
+            self.fail_in -= 1
+            if self.fail_in == 0 {
+                return err(hal.Error.Busy)
+            }
+        }
+        return ok()
+    }
+
+    fn exchange(&mut self, byte: u8) -> u8 {
+        if !self.selected {
+            self.violations += 1
+            return 0xFF
+        }
+        if self.absent {
+            return 0xFF
+        }
+        position := self.position
+        self.position += 1
+        if position == 0 {
+            self.start(byte)
+            return 0
+        }
+        command := self.command
+        if command == 0x03 {
+            if position == 1 {
+                self.address = byte & 0x7F
+                return 0
+            }
+            address := self.address
+            value := self.read(address)
+            self.address = (self.address + 1) & 0x7F
+            return value
+        }
+        if command == 0x02 {
+            if position == 1 {
+                self.address = byte & 0x7F
+                return 0
+            }
+            address := self.address
+            self.write(address, byte)
+            self.address = (self.address + 1) & 0x7F
+            return 0
+        }
+        if command == 0x05 {
+            if position == 1 {
+                self.address = byte & 0x7F
+            } else if position == 2 {
+                self.mask = byte
+            } else if position == 3 {
+                address := self.address
+                mask := self.mask
+                self.modify(address, mask, byte)
+            } else {
+                self.violations += 1
+            }
+            return 0
+        }
+        if (command & 0xF9) == 0x90 {
+            value := self.registers[self.address as usize]
+            self.address = (self.address + 1) & 0x7F
+            return value
+        }
+        if (command & 0xF8) == 0x40 {
+            address := self.address
+            self.write(address, byte)
+            self.address = (self.address + 1) & 0x7F
+            return 0
+        }
+        if command == 0xA0 {
+            return self.read_status()
+        }
+        if command == 0xB0 {
+            return self.rx_status()
+        }
+        // RESET and RTS take no further bytes.
+        self.violations += 1
+        return 0
+    }
+
+    fn start(&mut self, command: u8) {
+        self.command = command
+        if command == 0xC0 {
+            self.power_on()
+            self.resets += 1
+        } else if (command & 0xF9) == 0x90 {
+            buffer := (command >> 2) & 1
+            data := (command >> 1) & 1
+            self.address = 0x61 + 0x10 * buffer + 5 * data
+            self.release = self.release | (1u8 << buffer)
+        } else if (command & 0xF8) == 0x40 {
+            which := command & 0x07
+            if which >= 6 {
+                self.violations += 1
+            }
+            self.address = 0x31 + 0x10 * (which >> 1) + 5 * (which & 1)
+        } else if (command & 0xF8) == 0x80 {
+            for buffer in 0u8..3 {
+                if (command & (1u8 << buffer)) != 0 {
+                    control := 0x30 + 0x10 * buffer
+                    self.registers[control as usize] = self.register(control) | 0x08
+                }
+            }
+        } else if command != 0x03 && command != 0x02 && command != 0x05 && command != 0xA0 && command != 0xB0 {
+            self.violations += 1
+        }
+    }
+
+    fn read(&mut self, address: u8) -> u8 {
+        low := address & 0x0F
+        if low == 0x0E {
+            self.advance_mode()
+            return self.registers[CANSTAT as usize]
+        }
+        if low == 0x0F {
+            return self.registers[CANCTRL as usize]
+        }
+        return self.registers[address as usize]
+    }
+
+    fn advance_mode(&mut self) {
+        requested := self.register(CANCTRL) & 0xE0
+        if requested == self.mode() || self.stuck {
+            return
+        }
+        if self.delay_left > 0 {
+            self.delay_left -= 1
+            return
+        }
+        self.registers[CANSTAT as usize] = (self.register(CANSTAT) & 0x1F) | requested
+    }
+
+    fn configuration_only(address: u8) -> bool {
+        return address < 0x0C || (address >= 0x10 && address < 0x1C) || (address >= 0x20 && address <= CNF1)
+    }
+
+    fn write(&mut self, address: u8, value: u8) {
+        low := address & 0x0F
+        if low == 0x0E || address == TEC || address == REC {
+            // Read only.
+            self.violations += 1
+            return
+        }
+        if low == 0x0F {
+            previous := self.register(CANCTRL)
+            self.set(CANCTRL, value)
+            if (previous & 0xE0) != (value & 0xE0) {
+                self.delay_left = self.mode_delay
+            }
+            if (value & 0x10) != 0 {
+                // ABAT: drop every pending frame.
+                for buffer in 0u8..3 {
+                    control := 0x30 + 0x10 * buffer
+                    if (self.register(control) & 0x08) != 0 {
+                        self.registers[control as usize] = (self.register(control) & 0xF7) | 0x40
+                    }
+                }
+            }
+            return
+        }
+        if Node.configuration_only(address) {
+            if self.mode() != CONFIGURATION {
+                self.violations += 1
+                return
+            }
+            self.set(address, value)
+            return
+        }
+        if address == EFLG {
+            // Only the overflow flags, and only cleared.
+            old := self.register(EFLG)
+            self.set(EFLG, (old & 0x3F) | (old & value & 0xC0))
+            return
+        }
+        if address >= 0x30 && address < 0x60 {
+            control := address & 0xF0
+            pending := (self.register(control) & 0x08) != 0
+            if address == control {
+                if pending && (value & 0x03) != (self.register(control) & 0x03) {
+                    self.violations += 1
+                }
+                self.registers[control as usize] = (self.register(control) & 0x70) | (value & 0x0B)
+                return
+            }
+            if (address & 0x0F) > 0x0D {
+                self.set(address, value)
+                return
+            }
+            if pending {
+                self.violations += 1
+                return
+            }
+            self.set(address, value)
+            return
+        }
+        if address == RXB0CTRL {
+            self.registers[address as usize] = (self.register(address) & 0x09) | (value & 0x64) | ((value & 0x04) >> 1)
+            return
+        }
+        if address == RXB1CTRL {
+            self.registers[address as usize] = (self.register(address) & 0x0F) | (value & 0x60)
+            return
+        }
+        if (address > RXB0CTRL && address <= 0x6D) || (address > RXB1CTRL && address <= 0x7D) {
+            self.violations += 1
+            return
+        }
+        self.set(address, value)
+    }
+
+    // BIT MODIFY works on the control and flag registers only.
+    fn modify(&mut self, address: u8, mask: u8, value: u8) {
+        low := address & 0x0F
+        allowed := low == 0x0F || address == 0x0C || address == 0x0D || (address >= CNF3 && address <= EFLG) || address == 0x30 || address == 0x40 || address == 0x50 || address == RXB0CTRL || address == RXB1CTRL
+        if !allowed {
+            self.violations += 1
+            return
+        }
+        if Node.configuration_only(address) && self.mode() != CONFIGURATION {
+            self.violations += 1
+            return
+        }
+        current := self.read(address)
+        self.write(address, (current & (0xFF ^ mask)) | (value & mask))
+    }
+
+    fn read_status(&self) -> u8 {
+        flags := self.register(CANINTF)
+        status := flags & 0x03
+        for buffer in 0u8..3 {
+            if (self.register(0x30 + 0x10 * buffer) & 0x08) != 0 {
+                status = status | (0x04u8 << (2 * buffer))
+            }
+            if (flags & (0x04u8 << buffer)) != 0 {
+                status = status | (0x08u8 << (2 * buffer))
+            }
+        }
+        return status
+    }
+
+    fn rx_status(&self) -> u8 {
+        flags := self.register(CANINTF) & 0x03
+        if flags == 0 {
+            return 0
+        }
+        buffer := 1u8
+        if (flags & 1) != 0 {
+            buffer = 0
+        }
+        sidl := self.register(0x62 + 0x10 * buffer)
+        extended := (sidl & 0x08) != 0
+        remote := (sidl & 0x10) != 0
+        if extended {
+            remote = (self.register(0x65 + 0x10 * buffer) & 0x40) != 0
+        }
+        status := flags << 6
+        if extended {
+            status = status | 0x10
+        }
+        if remote {
+            status = status | 0x08
+        }
+        return status | self.hits[buffer as usize]
+    }
+
+    // --- CAN side ---
+
+    // A frame from the bus, as a transmit buffer image, through the masks,
+    // filters, rollover, and overflow.
+    fn accept(&mut self, image: &[u8]) {
+        if self.mode() == CONFIGURATION {
+            self.dropped += 1
+            return
+        }
+        hit0 := self.match_filters(image, 0)
+        hit1 := self.match_filters(image, 1)
+        full0 := (self.register(CANINTF) & 0x01) != 0
+        full1 := (self.register(CANINTF) & 0x02) != 0
+        if hit0 >= 0 {
+            if !full0 {
+                self.load(0, image, hit0 as u8)
+            } else if (self.register(RXB0CTRL) & 0x04) != 0 {
+                if !full1 {
+                    self.load(1, image, 6 + hit0 as u8)
+                } else {
+                    self.overflow(0x80)
+                }
+            } else {
+                self.overflow(0x40)
+            }
+        } else if hit1 >= 0 {
+            if !full1 {
+                self.load(1, image, hit1 as u8)
+            } else {
+                self.overflow(0x80)
+            }
+        } else {
+            self.dropped += 1
+        }
+    }
+
+    fn overflow(&mut self, flag: u8) {
+        self.registers[EFLG as usize] = self.register(EFLG) | flag
+        self.registers[CANINTF as usize] = self.register(CANINTF) | 0x20
+    }
+
+    // The filter of receive buffer `buffer` that passes `image`, or -1.
+    fn match_filters(&self, image: &[u8], buffer: usize) -> i32 {
+        control := self.register(RXB0CTRL + 0x10 * buffer as u8)
+        if (control & 0x60) == 0x60 {
+            return 0
+        }
+        mask := RXM0
+        first := 0usize
+        count := 2usize
+        if buffer == 1 {
+            mask = RXM1
+            first = 2
+            count = 4
+        }
+        for slot in first..first + count {
+            if self.passes(image, mask, filter_address(slot)) {
+                return slot as i32
+            }
+        }
+        return -1
+    }
+
+    fn passes(&self, image: &[u8], mask: u8, filter: u8) -> bool {
+        extended := (image[1] & 0x08) != 0
+        if ((self.register(filter + 1) & 0x08) != 0) != extended {
+            return false
+        }
+        // SID10-0, then EID17-16, EID15-8, EID7-0.
+        if ((image[0] ^ self.register(filter)) & self.register(mask)) != 0 {
+            return false
+        }
+        if ((image[1] ^ self.register(filter + 1)) & self.register(mask + 1) & 0xE0) != 0 {
+            return false
+        }
+        if extended {
+            if ((image[1] ^ self.register(filter + 1)) & self.register(mask + 1) & 0x03) != 0 {
+                return false
+            }
+            return ((image[2] ^ self.register(filter + 2)) & self.register(mask + 2)) == 0 && ((image[3] ^ self.register(filter + 3)) & self.register(mask + 3)) == 0
+        }
+        // Standard frames: EID15-0 filter the first two data bytes.
+        return ((image[5] ^ self.register(filter + 2)) & self.register(mask + 2)) == 0 && ((image[6] ^ self.register(filter + 3)) & self.register(mask + 3)) == 0
+    }
+
+    fn load(&mut self, buffer: u8, image: &[u8], hit: u8) {
+        base := 0x61 + 0x10 * buffer
+        extended := (image[1] & 0x08) != 0
+        remote := (image[4] & 0x40) != 0
+        sidl := image[1] & 0xEB
+        dlc := image[4] & 0x4F
+        if !extended {
+            dlc = image[4] & 0x0F
+            if remote {
+                sidl = sidl | 0x10
+            }
+        }
+        self.set(base, image[0])
+        self.set(base + 1, sidl)
+        self.set(base + 2, image[2])
+        self.set(base + 3, image[3])
+        self.set(base + 4, dlc)
+        for index in 5usize..FRAME {
+            self.set(base + index as u8, image[index])
+        }
+        control := base - 1
+        value := self.register(control) & 0xF4
+        if remote {
+            value = value | 0x08
+        }
+        if buffer == 0 {
+            value = value | (hit & 1)
+        } else {
+            value = value | (hit & 0x07)
+        }
+        self.set(control, value)
+        self.hits[buffer as usize] = hit
+        self.registers[CANINTF as usize] = self.register(CANINTF) | (1u8 << buffer)
+    }
+
+    // The pending transmit buffer the chip sends next: highest TXP, then
+    // highest number; -1 if none.
+    fn next_buffer(&self) -> i32 {
+        best := -1i32
+        best_rank := 0u8
+        for buffer in 0u8..3 {
+            control := self.register(0x30 + 0x10 * buffer)
+            if (control & 0x08) != 0 {
+                rank := (control & 0x03) * 3 + buffer
+                if best < 0 || rank > best_rank {
+                    best = buffer as i32
+                    best_rank = rank
+                }
+            }
+        }
+        return best
+    }
+
+    // Send the next pending frame: in loopback mode back to this node, in
+    // normal mode onto the bus (the outbox) if a node acknowledges it.
+    // Returns whether a frame went out.
+    fn transmit(&mut self) -> bool {
+        mode := self.mode()
+        if (mode != NORMAL && mode != LOOPBACK) || (self.register(EFLG) & 0x20) != 0 {
+            return false
+        }
+        found := self.next_buffer()
+        if found < 0 {
+            return false
+        }
+        buffer := found as u8
+        control := 0x30 + 0x10 * buffer
+        image := [0u8; 13]
+        for index in 0usize..FRAME {
+            image[index] = self.register(control + 1 + index as u8)
+        }
+        if mode == NORMAL && !self.acknowledged {
+            if (self.register(CANCTRL) & 0x08) != 0 {
+                // One-shot: given up, with TXERR.
+                self.registers[control as usize] = (self.register(control) & 0xF7) | 0x10
+            }
+            return false
+        }
+        self.registers[control as usize] = self.register(control) & 0xF7
+        self.registers[CANINTF as usize] = self.register(CANINTF) | (0x04u8 << buffer)
+        if mode == LOOPBACK {
+            self.accept(&image)
+        } else {
+            if self.sent < OUTBOX {
+                for index in 0usize..FRAME {
+                    self.outbox[self.sent * FRAME + index] = image[index]
+                }
+            }
+            self.sent += 1
+        }
+        return true
+    }
+
+    // Send everything pending; the number sent.
+    fn transmit_all(&mut self) -> u32 {
+        count := 0u32
+        for self.transmit() {
+            count += 1
+        }
+        return count
+    }
+
+    // The identifier of the `index`-th frame sent onto the bus.
+    fn sent_id(&self, index: usize) -> u32 {
+        return image_id(self.outbox[index * FRAME..index * FRAME + FRAME])
+    }
+
+    fn force_errors(&mut self, tec: u8, rec: u8, bus_off: bool) {
+        flags := self.register(EFLG) & 0xC0
+        if tec >= 96 {
+            flags = flags | 0x05
+        }
+        if rec >= 96 {
+            flags = flags | 0x03
+        }
+        if tec >= 128 {
+            flags = flags | 0x10
+        }
+        if rec >= 128 {
+            flags = flags | 0x08
+        }
+        if bus_off {
+            flags = flags | 0x20
+        }
+        self.set(TEC, tec)
+        self.set(REC, rec)
+        self.set(EFLG, flags)
+    }
+}
+
+// Carry every frame `sender` sends to `receiver` over a bus between them;
+// the receiver acknowledges in normal mode only.
+fn carry(sender: &mut Node, receiver: &mut Node) -> u32 {
+    sender.acknowledged = receiver.mode() == NORMAL
+    count := 0u32
+    for sender.transmit() {
+        image := [0u8; 13]
+        for index in 0usize..FRAME {
+            image[index] = sender.outbox[(sender.sent - 1) * FRAME + index]
+        }
+        receiver.accept(&image)
+        count += 1
+    }
+    return count
+}
+
+// A frame as a transmit buffer image.
+fn image(id: u32, extended: bool, remote: bool, bytes: &[u8]) -> [13]u8 {
+    result := [0u8; 13]
+    value := id
+    if !extended {
+        value = (id & 0x7FF) << 18
+    }
+    standard := (value >> 18) & 0x7FF
+    result[0] = ((standard >> 3) & 0xFF) as u8
+    result[1] = (((standard & 7) << 5) | ((value >> 16) & 3)) as u8
+    result[2] = ((value >> 8) & 0xFF) as u8
+    result[3] = (value & 0xFF) as u8
+    if extended {
+        result[1] = result[1] | 0x08
+    }
+    result[4] = (bytes.len & 0x0F) as u8
+    if remote {
+        result[4] = result[4] | 0x40
+    } else {
+        for index in 0usize..bytes.len {
+            result[5 + index] = bytes[index]
+        }
+    }
+    return result
+}
+
+fn image_id(bytes: &[u8]) -> u32 {
+    standard := ((bytes[0] as u32) << 3) | ((bytes[1] as u32) >> 5)
+    if (bytes[1] & 0x08) == 0 {
+        return standard
+    }
+    return (standard << 18) | (((bytes[1] as u32) & 3) << 16) | ((bytes[2] as u32) << 8) | bytes[3] as u32
+}
+
+fn arrive(node: &mut Node, id: u32, extended: bool, bytes: &[u8]) {
+    frame := image(id, extended, false, bytes)
+    node.accept(&frame)
+}
+
+struct ModelSpi: hal.Spi {
+    node: *mut Node
+
+    fn new(node: &mut Node) -> ModelSpi {
+        return ModelSpi { node: ptr.from_mut(node) }
+    }
+
+    fn model(&mut self) -> &mut Node from(self) {
+        pointer := self.node
+        unsafe {
+            return ptr.borrow_mut(pointer, self)
+        }
+    }
+
+    pub fn transfer(&mut self, bytes: &mut[u8]) -> void!hal.Error {
+        node := self.model()
+        node.fault()?
+        for index in 0usize..bytes.len {
+            bytes[index] = node.exchange(bytes[index])
+        }
+        return ok()
+    }
+
+    pub fn write(&mut self, bytes: &[u8]) -> void!hal.Error {
+        node := self.model()
+        node.fault()?
+        for index in 0usize..bytes.len {
+            node.exchange(bytes[index])
+        }
+        return ok()
+    }
+}
+
+struct ModelPin: hal.OutputPin {
+    node: *mut Node
+    high: bool
+
+    fn new(node: &mut Node) -> ModelPin {
+        return ModelPin { node: ptr.from_mut(node), high: false }
+    }
+
+    fn model(&mut self) -> &mut Node from(self) {
+        pointer := self.node
+        unsafe {
+            return ptr.borrow_mut(pointer, self)
+        }
+    }
+
+    pub fn set_high(&mut self) {
+        self.high = true
+        self.model().deselect()
+    }
+
+    pub fn set_low(&mut self) {
+        self.high = false
+        self.model().select()
+    }
+}
+
+type Can = mcp2515.Controller<ModelSpi, ModelPin>
+
+fn controller(node: &mut Node, config: &mcp2515.Config, filters: &[hal.CanFilter]) -> Can {
+    match mcp2515.Controller.new(ModelSpi.new(node), ModelPin.new(node), config, filters) {
+        ok(can) => {
+            return can
+        }
+        err(error) => {
+            core.assert(false)
+            return mcp2515.Controller.attach(ModelSpi.new(node), ModelPin.new(node))
+        }
+    }
+}
+
+fn loopback_config() -> mcp2515.Config {
+    config := mcp2515.Config.new(16_000_000, 500_000)
+    config.mode = mcp2515.Mode.Loopback
+    return config
+}
+
+fn no_filters() -> [0]hal.CanFilter {
+    nothing: [0]hal.CanFilter = []
+    return nothing
+}
+
+// --- Result helpers ---------------------------------------------------------
+
+fn expect_error(result: void!hal.Error, expected: hal.Error) {
+    match result {
+        ok() => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == expected)
+        }
+    }
+}
+
+fn expect_send(result: bool!hal.Error, expected: bool) {
+    match result {
+        ok(queued) => {
+            core.assert_eq(queued, expected)
+        }
+        err(_) => {
+            core.assert(false)
+        }
+    }
+}
+
+fn expect_send_error(result: bool!hal.Error, expected: hal.Error) {
+    match result {
+        ok(_) => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == expected)
+        }
+    }
+}
+
+fn send(can: &mut Can, frame: &hal.CanFrame) {
+    expect_send(can.poll_send(frame), true)
+}
+
+fn send_standard(can: &mut Can, id: u32, bytes: &[u8]) {
+    frame := hal.CanFrame.standard(id, bytes)!
+    send(can, &frame)
+}
+
+// The next frame received; it must be there.
+fn receive(can: &mut Can) -> hal.CanFrame {
+    frame := hal.CanFrame.new()
+    match can.poll_receive(&mut frame) {
+        ok(found) => {
+            core.assert(found)
+        }
+        err(_) => {
+            core.assert(false)
+        }
+    }
+    return frame
+}
+
+fn receive_id(can: &mut Can) -> u32 {
+    frame := receive(can)
+    return frame.id()
+}
+
+fn expect_empty(can: &mut Can) {
+    frame := hal.CanFrame.new()
+    match can.poll_receive(&mut frame) {
+        ok(found) => {
+            core.assert(!found)
+        }
+        err(_) => {
+            core.assert(false)
+        }
+    }
+}
+
+fn expect_receive_error(can: &mut Can, expected: hal.Error) {
+    frame := hal.CanFrame.new()
+    match can.poll_receive(&mut frame) {
+        ok(_) => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == expected)
+        }
+    }
+}
+
+fn is_state(state: hal.CanErrorState, expected: hal.CanErrorState) -> bool {
+    return state == expected
+}
+
+// --- hal CAN helpers --------------------------------------------------------
+
+fn dlc_codes() {
+    for code in 0u8..9 {
+        core.assert_eq(hal.can_dlc_length(code, false), code as usize)
+        core.assert_eq(hal.can_dlc_length(code, true), code as usize)
+        core.assert_eq(hal.can_length_dlc(code as usize)!, code)
+    }
+    lengths: [7]usize = [12, 16, 20, 24, 32, 48, 64]
+    for index in 0usize..7 {
+        code := (9 + index) as u8
+        core.assert_eq(hal.can_dlc_length(code, true), lengths[index])
+        core.assert_eq(hal.can_dlc_length(code, false), 8usize)
+        core.assert_eq(hal.can_length_dlc(lengths[index])!, code)
+    }
+    // Only the low four bits count.
+    core.assert_eq(hal.can_dlc_length(0x13, false), 3usize)
+    core.assert_eq(hal.can_dlc_length(0xFF, true), 64usize)
+    lengths_rejected: [6]usize = [9, 13, 25, 33, 63, 65]
+    for index in 0usize..6 {
+        match hal.can_length_dlc(lengths_rejected[index]) {
+            ok(_) => {
+                core.assert(false)
+            }
+            err(error) => {
+                core.assert(error == hal.Error.InvalidInput)
+            }
+        }
+    }
+}
+
+fn frames() {
+    frame := hal.CanFrame.new()
+    core.assert_eq(frame.id(), 0u32)
+    core.assert(!frame.is_extended() && !frame.is_remote() && !frame.is_fd() && !frame.bit_rate_switch())
+    core.assert_eq(frame.len(), 0usize)
+    core.assert_eq(frame.dlc(), 0u8)
+    core.assert_eq(frame.bytes().len, 0usize)
+
+    payload: [8]u8 = [1, 2, 3, 4, 5, 6, 7, 8]
+    standard := hal.CanFrame.standard(0x7FF, &payload)!
+    core.assert_eq(standard.id(), 0x7FFu32)
+    core.assert_eq(standard.len(), 8usize)
+    core.assert_eq(standard.dlc(), 8u8)
+    core.assert_eq(standard.bytes()[7], 8u8)
+    match hal.CanFrame.standard(0x800, &payload) {
+        ok(_) => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == hal.Error.InvalidInput)
+        }
+    }
+    extended := hal.CanFrame.extended(0x1FFF_FFFF, &payload)!
+    core.assert(extended.is_extended())
+    match hal.CanFrame.extended(0x2000_0000, &payload) {
+        ok(_) => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == hal.Error.InvalidInput)
+        }
+    }
+
+    // Rejected changes leave the frame as it was.
+    nine := [0u8; 9]
+    expect_error(standard.set_data(0x10, false, &nine), hal.Error.InvalidInput)
+    expect_error(standard.set_data(0x800, false, &payload), hal.Error.InvalidInput)
+    expect_error(standard.set_remote(0x10, false, 9), hal.Error.InvalidInput)
+    core.assert_eq(standard.id(), 0x7FFu32)
+    core.assert_eq(standard.len(), 8usize)
+    core.assert(!standard.is_remote())
+
+    remote := hal.CanFrame.new()
+    remote.set_remote(0x1234_5678, true, 6)!
+    core.assert(remote.is_remote() && remote.is_extended())
+    core.assert_eq(remote.len(), 6usize)
+    core.assert_eq(remote.dlc(), 6u8)
+    core.assert_eq(remote.bytes().len, 0usize)
+
+    // A data frame that becomes a remote frame and back.
+    reused := hal.CanFrame.standard(0x55, &payload)!
+    reused.set_remote(0x55, false, 2)!
+    core.assert_eq(reused.bytes().len, 0usize)
+    three: [3]u8 = [9, 8, 7]
+    reused.set_data(0x56, false, &three)!
+    core.assert(!reused.is_remote())
+    core.assert_eq(reused.bytes().len, 3usize)
+    core.assert_eq(reused.bytes()[0], 9u8)
+
+    long := [0u8; 64]
+    for index in 0usize..64 {
+        long[index] = index as u8
+    }
+    fd := hal.CanFrame.new()
+    fd.set_fd(0x100, false, &long, true)!
+    core.assert(fd.is_fd() && fd.bit_rate_switch())
+    core.assert_eq(fd.dlc(), 15u8)
+    core.assert_eq(fd.bytes()[63], 63u8)
+    expect_error(fd.set_fd(0x100, false, long[0..13], false), hal.Error.InvalidInput)
+    expect_error(fd.set_fd(0x800, false, long[0..12], false), hal.Error.InvalidInput)
+    fd.set_fd(0x100, true, long[0..12], false)!
+    core.assert_eq(fd.dlc(), 9u8)
+    core.assert(fd.is_extended() && !fd.bit_rate_switch())
+    // A classic frame after an FD one is classic again.
+    fd.set_data(0x100, false, &three)!
+    core.assert(!fd.is_fd() && !fd.bit_rate_switch())
+
+    copy := hal.CanFrame.new()
+    copy.copy_from(&remote)
+    core.assert(copy.same(&remote))
+    core.assert(!copy.same(&standard))
+    copy.copy_from(&standard)
+    core.assert(copy.same(&standard))
+    // Same identifier, different kind.
+    other := hal.CanFrame.extended(0x7FF, &payload)!
+    core.assert(!other.same(&standard))
+    // Remote frames compare by length, not data.
+    first := hal.CanFrame.new()
+    first.set_remote(0x10, false, 4)!
+    second := hal.CanFrame.standard(0x10, &payload)!
+    second.set_remote(0x10, false, 4)!
+    core.assert(first.same(&second))
+}
+
+fn filters() {
+    empty: [0]u8 = []
+    exact := hal.CanFilter.exact(0x123, false)
+    core.assert_eq(exact.mask, 0x7FFu32)
+    hit := hal.CanFrame.standard(0x123, &empty)!
+    miss := hal.CanFrame.standard(0x122, &empty)!
+    other_kind := hal.CanFrame.extended(0x123, &empty)!
+    core.assert(exact.accepts(&hit))
+    core.assert(!exact.accepts(&miss))
+    core.assert(!exact.accepts(&other_kind))
+    wide := hal.CanFilter.exact(0x1ABC_DEF0, true)
+    core.assert_eq(wide.mask, 0x1FFF_FFFFu32)
+    core.assert(!wide.accepts(&other_kind))
+    all := hal.CanFilter.all(true)
+    core.assert(all.accepts(&other_kind))
+    core.assert(!all.accepts(&hit))
+    range := hal.CanFilter { id: 0x120, mask: 0x7F0, extended: false }
+    core.assert(range.accepts(&hit))
+    core.assert(range.accepts(&miss))
+    outside := hal.CanFrame.standard(0x130, &empty)!
+    core.assert(!range.accepts(&outside))
+}
+
+fn timing_limits() -> hal.CanTimingLimits {
+    return mcp2515.limits()
+}
+
+fn bit_timing() {
+    limits := timing_limits()
+    timing := hal.can_timing(16_000_000, 500_000, 875, &limits)!
+    core.assert_eq(timing.prescaler, 2u32)
+    core.assert_eq(timing.segment1, 13u32)
+    core.assert_eq(timing.segment2, 2u32)
+    core.assert_eq(timing.sync_jump, 2u32)
+    core.assert_eq(timing.quanta(), 16u32)
+    core.assert_eq(timing.bitrate(16_000_000), 500_000u32)
+    core.assert_eq(timing.sample_point_permille(), 875u32)
+
+    // 750 at 1 Mbit/s.
+    fast := hal.can_timing(16_000_000, 1_000_000, 750, &limits)!
+    core.assert_eq(fast.quanta(), 8u32)
+    core.assert_eq(fast.sample_point_permille(), 750u32)
+
+    // Not exact, but within 0.5%: 16 MHz / 33.3 kbit/s.
+    close := hal.can_timing(16_000_000, 33_333, 875, &limits)!
+    rate := close.bitrate(16_000_000)
+    core.assert(rate >= 33_166 && rate <= 33_500)
+
+    // A step of 0 counts as 1; odd prescalers are then allowed.
+    odd := hal.CanTimingLimits { prescaler_min: 1, prescaler_max: 64, prescaler_step: 0, segment1_min: 2, segment1_max: 16, segment2_min: 1, segment2_max: 8, sync_jump_max: 4 }
+    three := hal.can_timing(12_000_000, 1_000_000, 750, &odd)!
+    core.assert_eq(three.prescaler * three.quanta(), 12u32)
+
+    match hal.can_timing(16_000_000, 0, 875, &limits) {
+        ok(_) => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == hal.Error.InvalidInput)
+        }
+    }
+    match hal.can_timing(16_000_000, 500_000, 1000, &limits) {
+        ok(_) => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == hal.Error.InvalidInput)
+        }
+    }
+    match hal.can_timing(0, 500_000, 875, &limits) {
+        ok(_) => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == hal.Error.InvalidInput)
+        }
+    }
+    // 8 MHz has too few quanta for 1 Mbit/s; 1% off is too far.
+    match hal.can_timing(8_000_000, 1_000_000, 750, &limits) {
+        ok(_) => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == hal.Error.InvalidInput)
+        }
+    }
+    match hal.can_timing(16_000_000, 101_000 * 5, 875, &limits) {
+        ok(_) => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == hal.Error.InvalidInput)
+        }
+    }
+}
+
+// --- MCP2515 bit timing registers -------------------------------------------
+
+fn expect_registers(oscillator_hz: u32, bitrate: u32, cnf1: u8, cnf2: u8, cnf3: u8) {
+    registers := mcp2515.timing(oscillator_hz, bitrate, 875)!
+    core.assert_eq(registers.cnf1, cnf1)
+    core.assert_eq(registers.cnf2, cnf2)
+    core.assert_eq(registers.cnf3, cnf3)
+}
+
+fn expect_unreachable(oscillator_hz: u32, bitrate: u32) {
+    match mcp2515.timing(oscillator_hz, bitrate, 875) {
+        ok(_) => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == hal.Error.InvalidInput)
+        }
+    }
+}
+
+// The prescaler in quanta, quanta per bit, and quanta before the sample
+// point of CNF1-3, as a check that two register sets time bits alike.
+fn decoded(cnf1: u8, cnf2: u8, cnf3: u8) -> u32 {
+    brp := (cnf1 & 0x3F) as u32
+    propagation := (cnf2 & 0x07) as u32 + 1
+    phase1 := ((cnf2 >> 3) & 0x07) as u32 + 1
+    phase2 := (cnf3 & 0x07) as u32 + 1
+    total := 1 + propagation + phase1 + phase2
+    return (brp << 16) | (total << 8) | (1 + propagation + phase1)
+}
+
+fn registers_table() {
+    // Linux mcp251x at 87.5% (75% at 1 Mbit/s), as `ip -details link`
+    // reports them: 16 MHz.
+    expect_registers(16_000_000, 125_000, 0x03, 0xB5, 0x01)
+    expect_registers(16_000_000, 250_000, 0x01, 0xB5, 0x01)
+    expect_registers(16_000_000, 500_000, 0x00, 0xB5, 0x01)
+    expect_registers(16_000_000, 1_000_000, 0x00, 0x91, 0x01)
+    // 8 MHz.
+    expect_registers(8_000_000, 125_000, 0x01, 0xB5, 0x01)
+    expect_registers(8_000_000, 250_000, 0x00, 0xB5, 0x01)
+    expect_registers(8_000_000, 500_000, 0x00, 0x91, 0x01)
+    expect_unreachable(8_000_000, 1_000_000)
+    // 20 MHz: 16 quanta of 500 ns at 125 kbit/s; 20 quanta at 250 and
+    // 500 kbit/s, sampling at 85% with a jump width of 2; 10 quanta at
+    // 1 Mbit/s, sampling at 80%.
+    expect_registers(20_000_000, 125_000, 0x04, 0xB5, 0x01)
+    expect_registers(20_000_000, 250_000, 0x41, 0xBF, 0x02)
+    expect_registers(20_000_000, 500_000, 0x40, 0xBF, 0x02)
+    expect_registers(20_000_000, 1_000_000, 0x00, 0x9A, 0x01)
+    expect_unreachable(16_000_000, 3_000_000)
+    expect_unreachable(16_000_000, 4_000)
+    expect_unreachable(8_000_000, 0)
+
+    // The Arduino MCP_CAN library's tables, with their sample points: the
+    // same quanta, split differently. 8 MHz, 125 kbit/s: 01 B1 85.
+    slow := mcp2515.timing(8_000_000, 125_000, 625)!
+    core.assert_eq(decoded(slow.cnf1, slow.cnf2, slow.cnf3), decoded(0x01, 0xB1, 0x85))
+    core.assert_eq(slow.cnf1, 0xC1u8)
+    core.assert_eq(slow.cnf2, 0xA3u8)
+    core.assert_eq(slow.cnf3, 0x05u8)
+    // 16 MHz, 500 kbit/s: 00 F0 86.
+    quick := mcp2515.timing(16_000_000, 500_000, 563)!
+    core.assert_eq(decoded(quick.cnf1, quick.cnf2, quick.cnf3), decoded(0x00, 0xF0, 0x86))
+
+    // A sample point before the middle moves there: PropSeg + PS1 >= PS2.
+    early := mcp2515.timing(16_000_000, 500_000, 300)!
+    core.assert_eq(early.cnf1, 0xC0u8)
+    core.assert_eq(early.cnf2, 0x9Bu8)
+    core.assert_eq(early.cnf3, 0x06u8)
+
+    // Every reachable rate keeps the datasheet's rules.
+    oscillators: [3]u32 = [8_000_000, 16_000_000, 20_000_000]
+    rates: [9]u32 = [10_000, 20_000, 50_000, 83_333, 100_000, 125_000, 250_000, 500_000, 1_000_000]
+    points: [4]u32 = [500, 750, 800, 875]
+    for o in 0usize..3 {
+        for r in 0usize..9 {
+            for p in 0usize..4 {
+                match mcp2515.timing(oscillators[o], rates[r], points[p]) {
+                    ok(registers) => {
+                        jump := (registers.cnf1 >> 6) + 1
+                        propagation := (registers.cnf2 & 7) + 1
+                        phase1 := ((registers.cnf2 >> 3) & 7) + 1
+                        phase2 := (registers.cnf3 & 7) + 1
+                        core.assert((registers.cnf2 & 0x80) != 0)
+                        core.assert(propagation + phase1 >= phase2)
+                        core.assert(phase2 > jump)
+                        core.assert(phase1 >= jump)
+                        core.assert(phase2 >= 2)
+                        brp := (registers.cnf1 & 0x3F) as u32
+                        quanta := 1 + propagation as u32 + phase1 as u32 + phase2 as u32
+                        actual := oscillators[o] / (2 * (brp + 1) * quanta)
+                        core.assert(actual * 1000 >= rates[r] * 995 && actual * 1000 <= rates[r] * 1005)
+                    }
+                    err(error) => {
+                        core.assert(error == hal.Error.InvalidInput)
+                    }
+                }
+            }
+        }
+    }
+}
+
+// --- Driver -----------------------------------------------------------------
+
+fn startup() {
+    node := Node.new()
+    nothing := no_filters()
+    config := mcp2515.Config.new(16_000_000, 500_000)
+    can := controller(&mut node, &config, &nothing)
+    core.assert_eq(node.resets, 1u32)
+    core.assert_eq(node.register(CNF1), 0x00u8)
+    core.assert_eq(node.register(CNF2), 0xB5u8)
+    core.assert_eq(node.register(CNF3), 0x01u8)
+    core.assert_eq(node.mode(), NORMAL)
+    core.assert_eq(node.register(CANCTRL) & 0xF8, 0x00u8)
+    // CLKOUT as after reset.
+    core.assert_eq(node.register(CANCTRL) & 0x07, 0x07u8)
+    core.assert_eq(node.register(RXB0CTRL) & 0x64, 0x04u8)
+    core.assert_eq(node.register(RXB1CTRL) & 0x60, 0x00u8)
+    core.assert_eq(node.register(CANINTE), 0u8)
+    core.assert(!node.pin_low())
+    core.assert_eq(node.violations, 0u32)
+    core.assert(is_state(can.error_state()!, hal.CanErrorState.Active))
+
+    // A slow mode change still completes; one-shot mode.
+    slow := Node.new()
+    slow.mode_delay = 20
+    one_shot := mcp2515.Config.new(8_000_000, 125_000)
+    one_shot.one_shot = true
+    one_shot.mode = mcp2515.Mode.ListenOnly
+    listener := controller(&mut slow, &one_shot, &nothing)
+    core.assert_eq(slow.mode(), LISTEN_ONLY)
+    core.assert_eq(slow.register(CANCTRL) & 0x08, 0x08u8)
+    core.assert_eq(slow.register(CNF1), 0x01u8)
+
+    // No chip: MISO reads high, so configuration mode never shows.
+    missing := Node.new()
+    missing.absent = true
+    match mcp2515.Controller.new(ModelSpi.new(&mut missing), ModelPin.new(&mut missing), &config, &nothing) {
+        ok(_) => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == hal.Error.Timeout)
+        }
+    }
+    // A chip that never leaves configuration mode.
+    stuck := Node.new()
+    stuck.stuck = true
+    attached := mcp2515.Controller.attach(ModelSpi.new(&mut stuck), ModelPin.new(&mut stuck))
+    expect_error(attached.configure(&config, &nothing), hal.Error.Timeout)
+    core.assert_eq(stuck.mode(), CONFIGURATION)
+    core.assert(!stuck.pin_low())
+
+    // Unreachable bit rates and impossible filters fail before the chip is
+    // touched.
+    fresh := Node.new()
+    idle := mcp2515.Controller.attach(ModelSpi.new(&mut fresh), ModelPin.new(&mut fresh))
+    unreachable := mcp2515.Config.new(8_000_000, 1_000_000)
+    expect_error(idle.configure(&unreachable, &nothing), hal.Error.InvalidInput)
+    many: [7]hal.CanFilter = [hal.CanFilter.exact(1, false), hal.CanFilter.exact(2, false), hal.CanFilter.exact(3, false), hal.CanFilter.exact(4, false), hal.CanFilter.exact(5, false), hal.CanFilter.exact(6, false), hal.CanFilter.exact(7, false)]
+    expect_error(idle.configure(&config, &many), hal.Error.InvalidInput)
+    core.assert_eq(fresh.transactions, 0u32)
+    core.assert_eq(fresh.resets, 0u32)
+    // Configured again later, it works.
+    idle.configure(&config, &nothing)!
+    core.assert_eq(fresh.mode(), NORMAL)
+    core.assert_eq(fresh.violations + node.violations + slow.violations + stuck.violations, 0u32)
+}
+
+// The filter registers RXF`slot` hold identifier `id` of its kind.
+fn expect_filter(node: &Node, slot: usize, id: u32, extended: bool) {
+    empty: [0]u8 = []
+    frame := image(id, extended, false, &empty)
+    address := filter_address(slot)
+    core.assert_eq(node.register(address), frame[0])
+    core.assert_eq(node.register(address + 1) & 0xEB, frame[1])
+    core.assert_eq(node.register(address + 2), frame[2])
+    core.assert_eq(node.register(address + 3), frame[3])
+}
+
+// Mask register RXM`which` holds `value` in the 29-bit layout.
+fn expect_mask(node: &Node, which: u8, value: u32) {
+    address := RXM0 + 4 * which
+    standard := (value >> 18) & 0x7FF
+    core.assert_eq(node.register(address), ((standard >> 3) & 0xFF) as u8)
+    core.assert_eq(node.register(address + 1) & 0xE3, (((standard & 7) << 5) | ((value >> 16) & 3)) as u8)
+    core.assert_eq(node.register(address + 2), ((value >> 8) & 0xFF) as u8)
+    core.assert_eq(node.register(address + 3), (value & 0xFF) as u8)
+}
+
+fn configure_error(node: &mut Node, filters: &[hal.CanFilter]) {
+    config := loopback_config()
+    can := mcp2515.Controller.attach(ModelSpi.new(node), ModelPin.new(node))
+    expect_error(can.configure(&config, filters), hal.Error.InvalidInput)
+}
+
+fn filter_groups() {
+    empty: [0]u8 = []
+    config := loopback_config()
+    nothing := no_filters()
+
+    // No filters: everything, both kinds, in both buffers.
+    open_node := Node.new()
+    open := controller(&mut open_node, &config, &nothing)
+    expect_mask(&open_node, 0, 0)
+    expect_mask(&open_node, 1, 0)
+    for slot in 0usize..6 {
+        expect_filter(&open_node, slot, 0, slot % 2 == 1)
+    }
+    bytes1: [2]u8 = [0xAAu8, 0x55]
+    arrive(&mut open_node, 0x7FF, false, &bytes1)
+    arrive(&mut open_node, 0x1FFF_FFFF, true, &empty)
+    core.assert_eq(receive_id(&mut open), 0x7FFu32)
+    core.assert_eq(receive_id(&mut open), 0x1FFF_FFFFu32)
+
+    // One group of two: in both buffers, so rollover keeps working.
+    pair_node := Node.new()
+    pair_filters: [2]hal.CanFilter = [hal.CanFilter.exact(0x123, false), hal.CanFilter.exact(0x456, false)]
+    pair := controller(&mut pair_node, &config, &pair_filters)
+    expect_mask(&pair_node, 0, 0x7FFu32 << 18)
+    expect_mask(&pair_node, 1, 0x7FFu32 << 18)
+    expect_filter(&pair_node, 0, 0x123, false)
+    expect_filter(&pair_node, 1, 0x456, false)
+    expect_filter(&pair_node, 2, 0x123, false)
+    expect_filter(&pair_node, 3, 0x456, false)
+    expect_filter(&pair_node, 4, 0x123, false)
+    expect_filter(&pair_node, 5, 0x456, false)
+    // Data bytes do not matter to standard filters.
+    bytes2: [3]u8 = [0xFFu8, 0xEE, 1]
+    arrive(&mut pair_node, 0x123, false, &bytes2)
+    arrive(&mut pair_node, 0x124, false, &empty)
+    arrive(&mut pair_node, 0x123, true, &empty)
+    arrive(&mut pair_node, 0x456, false, &empty)
+    core.assert_eq(pair_node.dropped, 2u32)
+    core.assert_eq(receive_id(&mut pair), 0x123u32)
+    core.assert_eq(receive_id(&mut pair), 0x456u32)
+    expect_empty(&mut pair)
+
+    // Standard and extended filters share a mask when it fits: the
+    // extended mask is the standard one shifted by 18.
+    mixed_node := Node.new()
+    mixed_filters: [2]hal.CanFilter = [hal.CanFilter { id: 0x120, mask: 0x7F0, extended: false }, hal.CanFilter { id: 0x0480_0000, mask: 0x7F0u32 << 18, extended: true }]
+    mixed := controller(&mut mixed_node, &config, &mixed_filters)
+    expect_mask(&mixed_node, 0, 0x7F0u32 << 18)
+    expect_filter(&mixed_node, 0, 0x120, false)
+    expect_filter(&mixed_node, 1, 0x0480_0000, true)
+    arrive(&mut mixed_node, 0x12F, false, &empty)
+    arrive(&mut mixed_node, 0x0483_FFFF, true, &empty)
+    arrive(&mut mixed_node, 0x0500_0000, true, &empty)
+    core.assert_eq(mixed_node.dropped, 1u32)
+    core.assert_eq(receive_id(&mut mixed), 0x12Fu32)
+    core.assert_eq(receive_id(&mut mixed), 0x0483_FFFFu32)
+
+    // Two groups: the larger in RXB1, repeated into its unused slot.
+    two_node := Node.new()
+    two_filters: [4]hal.CanFilter = [hal.CanFilter.all(true), hal.CanFilter.exact(0x100, false), hal.CanFilter.exact(0x101, false), hal.CanFilter.exact(0x102, false)]
+    two := controller(&mut two_node, &config, &two_filters)
+    expect_mask(&two_node, 0, 0)
+    expect_mask(&two_node, 1, 0x7FFu32 << 18)
+    expect_filter(&two_node, 0, 0, true)
+    expect_filter(&two_node, 1, 0, true)
+    expect_filter(&two_node, 2, 0x100, false)
+    expect_filter(&two_node, 3, 0x101, false)
+    expect_filter(&two_node, 4, 0x102, false)
+    expect_filter(&two_node, 5, 0x100, false)
+    arrive(&mut two_node, 0x102, false, &empty)
+    arrive(&mut two_node, 0x0ABC_DEF0, true, &empty)
+    arrive(&mut two_node, 0x103, false, &empty)
+    core.assert_eq(two_node.dropped, 1u32)
+    // Frames of different buffers: RXB0's comes first.
+    core.assert_eq(receive_id(&mut two), 0x0ABC_DEF0u32)
+    core.assert_eq(receive_id(&mut two), 0x102u32)
+
+    // Equal groups: the first filter's group in RXB0.
+    tie_node := Node.new()
+    tie_filters: [2]hal.CanFilter = [hal.CanFilter.exact(0x10, false), hal.CanFilter.all(false)]
+    tie := controller(&mut tie_node, &config, &tie_filters)
+    expect_mask(&tie_node, 0, 0x7FFu32 << 18)
+    expect_mask(&tie_node, 1, 0)
+    expect_filter(&tie_node, 0, 0x10, false)
+    expect_filter(&tie_node, 1, 0x10, false)
+    expect_filter(&tie_node, 5, 0, false)
+
+    // One group of five: RXB0 the first two, RXB1 the last four.
+    five_node := Node.new()
+    five_filters: [5]hal.CanFilter = [hal.CanFilter.exact(1, false), hal.CanFilter.exact(2, false), hal.CanFilter.exact(3, false), hal.CanFilter.exact(4, false), hal.CanFilter.exact(5, false)]
+    five := controller(&mut five_node, &config, &five_filters)
+    expect_filter(&five_node, 0, 1, false)
+    expect_filter(&five_node, 1, 2, false)
+    expect_filter(&five_node, 2, 2, false)
+    expect_filter(&five_node, 5, 5, false)
+    // One group of three: RXB1 holds all three and repeats the first.
+    three_node := Node.new()
+    three_filters: [3]hal.CanFilter = [hal.CanFilter.exact(7, true), hal.CanFilter.exact(8, true), hal.CanFilter.exact(9, true)]
+    three := controller(&mut three_node, &config, &three_filters)
+    expect_mask(&three_node, 1, 0x1FFF_FFFF)
+    expect_filter(&three_node, 2, 7, true)
+    expect_filter(&three_node, 4, 9, true)
+    expect_filter(&three_node, 5, 7, true)
+    arrive(&mut three_node, 9, true, &empty)
+    core.assert_eq(receive_id(&mut three), 9u32)
+
+    // Mask bits beyond the kind are ignored.
+    loose_node := Node.new()
+    loose_filters: [1]hal.CanFilter = [hal.CanFilter { id: 0x7FF, mask: 0xFFFF_FFFF, extended: false }]
+    loose := controller(&mut loose_node, &config, &loose_filters)
+    expect_mask(&loose_node, 0, 0x7FFu32 << 18)
+
+    // Errors.
+    error_node := Node.new()
+    three_groups: [3]hal.CanFilter = [hal.CanFilter.exact(1, false), hal.CanFilter.exact(2, true), hal.CanFilter.all(false)]
+    configure_error(&mut error_node, &three_groups)
+    big_groups: [6]hal.CanFilter = [hal.CanFilter.exact(1, false), hal.CanFilter.exact(2, false), hal.CanFilter.exact(3, false), hal.CanFilter.exact(1, true), hal.CanFilter.exact(2, true), hal.CanFilter.exact(3, true)]
+    configure_error(&mut error_node, &big_groups)
+    five_and_one: [6]hal.CanFilter = [hal.CanFilter.exact(1, false), hal.CanFilter.exact(2, false), hal.CanFilter.exact(3, false), hal.CanFilter.exact(4, false), hal.CanFilter.exact(5, false), hal.CanFilter.all(true)]
+    configure_error(&mut error_node, &five_and_one)
+    too_large: [1]hal.CanFilter = [hal.CanFilter { id: 0x800, mask: 0x7FF, extended: false }]
+    configure_error(&mut error_node, &too_large)
+    too_large_extended: [1]hal.CanFilter = [hal.CanFilter { id: 0x2000_0000, mask: 0, extended: true }]
+    configure_error(&mut error_node, &too_large_extended)
+    // Kinds that cannot share a mask: an extended mask with low bits.
+    unshared: [3]hal.CanFilter = [hal.CanFilter.exact(1, false), hal.CanFilter { id: 0, mask: 0x7FFu32 << 18 | 1, extended: true }, hal.CanFilter.exact(2, true)]
+    configure_error(&mut error_node, &unshared)
+    core.assert_eq(error_node.transactions, 0u32)
+    core.assert_eq(open_node.violations + pair_node.violations + mixed_node.violations + two_node.violations + tie_node.violations + five_node.violations + three_node.violations + loose_node.violations, 0u32)
+}
+
+fn frame_kinds() {
+    empty: [0]u8 = []
+    node := Node.new()
+    config := loopback_config()
+    nothing := no_filters()
+    can := controller(&mut node, &config, &nothing)
+    payload: [8]u8 = [0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, 0x04]
+
+    sent: [6]hal.CanFrame = [hal.CanFrame.standard(0x7FF, &payload)!, hal.CanFrame.extended(0x1ABC_DEF5, payload[0..3])!, hal.CanFrame.standard(0, &empty)!, hal.CanFrame.new(), hal.CanFrame.new(), hal.CanFrame.extended(0x15A5A, payload[0..1])!]
+    sent[3].set_remote(0x321, false, 4)!
+    sent[4].set_remote(0x1234_5678, true, 8)!
+    for index in 0usize..6 {
+        send(&mut can, &sent[index])
+        core.assert_eq(node.transmit_all(), 1u32)
+        got := receive(&mut can)
+        core.assert(got.same(&sent[index]))
+        expect_empty(&mut can)
+    }
+    // The chip's view of a standard remote frame: SRR, RXRTR, RX STATUS.
+    send(&mut can, &sent[3])
+    node.transmit_all()
+    core.assert_eq(node.register(0x62) & 0x18, 0x10u8)
+    core.assert_eq(node.register(RXB0CTRL) & 0x08, 0x08u8)
+    core.assert_eq(node.rx_status(), 0x48u8)
+    receive(&mut can)
+
+    // A received data length code above 8 carries 8 bytes.
+    long := image(0x42, false, false, &payload)
+    long[4] = 0x0F
+    node.accept(&long)
+    got := receive(&mut can)
+    core.assert_eq(got.len(), 8usize)
+    core.assert_eq(got.bytes()[7], 0x04u8)
+
+    // FD frames are not for this chip.
+    fd := hal.CanFrame.new()
+    fd.set_fd(0x10, false, &payload, false)!
+    expect_send_error(can.poll_send(&fd), hal.Error.Unsupported)
+    core.assert_eq(node.violations, 0u32)
+}
+
+// Queue frames 0x100 + n, with some drained by the chip between them, and
+// check they leave in order.
+fn transmit_order() {
+    empty: [0]u8 = []
+    node := Node.new()
+    config := mcp2515.Config.new(16_000_000, 500_000)
+    nothing := no_filters()
+    can := controller(&mut node, &config, &nothing)
+
+    // Three at once fill the three buffers, sent in order.
+    for n in 0u32..3 {
+        send_standard(&mut can, 0x100 + n, &empty)
+    }
+    frame := hal.CanFrame.standard(0x1FF, &empty)!
+    expect_send(can.poll_send(&frame), false)
+    core.assert_eq(node.transmit_all(), 3u32)
+    for n in 0usize..3 {
+        core.assert_eq(node.sent_id(n), 0x100u32 + n as u32)
+    }
+
+    // A long stream with one frame sent between each two queued: the ranks
+    // run down, the queue drains, and they restart.
+    queued := 3u32
+    refused := 0u32
+    for step in 0u32..40 {
+        frame.set_data(0x100 + queued, false, &empty)!
+        match can.poll_send(&frame) {
+            ok(accepted) => {
+                if accepted {
+                    queued += 1
+                } else {
+                    refused += 1
+                    node.transmit_all()
+                }
+            }
+            err(_) => {
+                core.assert(false)
+            }
+        }
+        if step % 2 == 1 {
+            node.transmit()
+        }
+    }
+    node.transmit_all()
+    core.assert(refused > 0)
+    core.assert_eq(node.sent, queued as usize)
+    for n in 0usize..node.sent {
+        core.assert_eq(node.sent_id(n), 0x100u32 + n as u32)
+    }
+
+    // Nobody acknowledges: the buffers stay full and send_frame gives up.
+    node.acknowledged = false
+    for n in 0u32..3 {
+        send_standard(&mut can, 0x200 + n, &empty)
+    }
+    core.assert_eq(node.transmit_all(), 0u32)
+    expect_error(hal.send_frame(&mut can, &frame, 10), hal.Error.Timeout)
+    // Aborting empties them.
+    can.abort_pending()!
+    core.assert_eq(node.read_status() & 0x54, 0u8)
+    core.assert_eq(node.register(CANCTRL) & 0x10, 0u8)
+    node.acknowledged = true
+    send(&mut can, &frame)
+    core.assert_eq(node.transmit_all(), 1u32)
+    core.assert_eq(node.violations, 0u32)
+
+    // One-shot mode: a frame nobody acknowledges is given up, freeing its
+    // buffer.
+    once_node := Node.new()
+    once_config := mcp2515.Config.new(16_000_000, 500_000)
+    once_config.one_shot = true
+    once := controller(&mut once_node, &once_config, &nothing)
+    once_node.acknowledged = false
+    for n in 0u32..6 {
+        send_standard(&mut once, 0x300 + n, &empty)
+        once_node.transmit()
+    }
+    core.assert_eq(once_node.sent, 0usize)
+    core.assert_eq(once_node.violations, 0u32)
+}
+
+fn receive_order() {
+    empty: [0]u8 = []
+    node := Node.new()
+    config := loopback_config()
+    nothing := no_filters()
+    can := controller(&mut node, &config, &nothing)
+
+    // A then B: B rolls over into RXB1.
+    arrive(&mut node, 0xA, false, &empty)
+    arrive(&mut node, 0xB, false, &empty)
+    core.assert_eq(node.register(CANINTF) & 0x03, 0x03u8)
+    core.assert_eq(receive_id(&mut can), 0xAu32)
+    // C lands in RXB0 while B still waits in RXB1: B is older.
+    arrive(&mut node, 0xC, false, &empty)
+    core.assert_eq(receive_id(&mut can), 0xBu32)
+    // D rolls over behind C.
+    arrive(&mut node, 0xD, false, &empty)
+    core.assert_eq(receive_id(&mut can), 0xCu32)
+    core.assert_eq(receive_id(&mut can), 0xDu32)
+    expect_empty(&mut can)
+
+    // E is read from RXB0 while F arrives and rolls over into RXB1, unseen
+    // when E's read began; G then lands in RXB0, and F is still older.
+    arrive(&mut node, 0xE, false, &empty)
+    node.arrival = image(0xF, false, false, &empty)
+    node.arriving = true
+    core.assert_eq(receive_id(&mut can), 0xEu32)
+    arrive(&mut node, 0x10, false, &empty)
+    core.assert_eq(receive_id(&mut can), 0xFu32)
+    core.assert_eq(receive_id(&mut can), 0x10u32)
+    expect_empty(&mut can)
+
+    // A frame sent and received in loopback, through hal.receive_frame.
+    bytes3: [2]u8 = [1u8, 2]
+    send_standard(&mut can, 0x77, &bytes3)
+    node.transmit_all()
+    frame := hal.CanFrame.new()
+    hal.receive_frame(&mut can, &mut frame, 5)!
+    core.assert_eq(frame.id(), 0x77u32)
+    expect_error(hal.receive_frame(&mut can, &mut frame, 5), hal.Error.Timeout)
+    core.assert_eq(node.violations, 0u32)
+}
+
+fn overrun() {
+    empty: [0]u8 = []
+    node := Node.new()
+    config := loopback_config()
+    nothing := no_filters()
+    can := controller(&mut node, &config, &nothing)
+    for n in 0u32..3 {
+        arrive(&mut node, 0x10 + n, false, &empty)
+    }
+    core.assert_eq(node.register(EFLG) & 0xC0, 0x80u8)
+    expect_receive_error(&mut can, hal.Error.Overrun)
+    core.assert_eq(node.register(EFLG) & 0xC0, 0u8)
+    // Once only; the older frames that were kept come next.
+    core.assert_eq(receive_id(&mut can), 0x10u32)
+    core.assert_eq(receive_id(&mut can), 0x11u32)
+    expect_empty(&mut can)
+    // Then everything works as before.
+    arrive(&mut node, 0x20, false, &empty)
+    core.assert_eq(receive_id(&mut can), 0x20u32)
+
+    // Without rollover filters a frame for RXB1 overflows RXB1 alone.
+    split_node := Node.new()
+    split_filters: [2]hal.CanFilter = [hal.CanFilter.exact(1, false), hal.CanFilter.exact(2, true)]
+    split := controller(&mut split_node, &config, &split_filters)
+    arrive(&mut split_node, 2, true, &empty)
+    arrive(&mut split_node, 2, true, &empty)
+    core.assert_eq(split_node.register(EFLG) & 0xC0, 0x80u8)
+    expect_receive_error(&mut split, hal.Error.Overrun)
+    core.assert_eq(receive_id(&mut split), 2u32)
+    expect_empty(&mut split)
+    core.assert_eq(node.violations + split_node.violations, 0u32)
+}
+
+fn error_states() {
+    empty: [0]u8 = []
+    node := Node.new()
+    config := mcp2515.Config.new(16_000_000, 500_000)
+    nothing := no_filters()
+    can := controller(&mut node, &config, &nothing)
+    frame := hal.CanFrame.standard(0x10, &empty)!
+
+    node.force_errors(100, 20, false)
+    core.assert(is_state(can.error_state()!, hal.CanErrorState.Active))
+    core.assert_eq(can.tec()!, 100u8)
+    core.assert_eq(can.rec()!, 20u8)
+    core.assert_eq(can.error_flags()! & 0x07, 0x05u8)
+
+    node.force_errors(20, 130, false)
+    core.assert(is_state(can.error_state()!, hal.CanErrorState.Passive))
+    node.force_errors(140, 0, false)
+    core.assert(is_state(can.error_state()!, hal.CanErrorState.Passive))
+    expect_send(can.poll_send(&frame), true)
+
+    node.force_errors(255, 0, true)
+    core.assert(is_state(can.error_state()!, hal.CanErrorState.BusOff))
+    expect_send_error(can.poll_send(&frame), hal.Error.Bus)
+    expect_error(hal.send_frame(&mut can, &frame, 10), hal.Error.Bus)
+
+    // Recovered.
+    node.force_errors(0, 0, false)
+    core.assert(is_state(can.error_state()!, hal.CanErrorState.Active))
+    core.assert_eq(node.violations, 0u32)
+}
+
+fn modes() {
+    empty: [0]u8 = []
+    node := Node.new()
+    config := mcp2515.Config.new(16_000_000, 500_000)
+    nothing := no_filters()
+    can := controller(&mut node, &config, &nothing)
+    can.set_mode(mcp2515.Mode.Loopback)!
+    core.assert_eq(node.mode(), LOOPBACK)
+    send_standard(&mut can, 0x5, &empty)
+    node.transmit_all()
+    core.assert_eq(receive_id(&mut can), 0x5u32)
+    can.set_mode(mcp2515.Mode.ListenOnly)!
+    core.assert_eq(node.mode(), LISTEN_ONLY)
+    // Listen-only sends nothing.
+    send_standard(&mut can, 0x6, &empty)
+    core.assert_eq(node.transmit_all(), 0u32)
+    can.set_mode(mcp2515.Mode.Normal)!
+    core.assert_eq(node.mode(), NORMAL)
+    core.assert_eq(node.transmit_all(), 1u32)
+    // The configuration survives.
+    core.assert_eq(node.register(CNF2), 0xB5u8)
+    node.stuck = true
+    expect_error(can.set_mode(mcp2515.Mode.Loopback), hal.Error.Timeout)
+    core.assert_eq(node.violations, 0u32)
+}
+
+fn interrupts() {
+    empty: [0]u8 = []
+    node := Node.new()
+    config := loopback_config()
+    nothing := no_filters()
+    can := controller(&mut node, &config, &nothing)
+    core.assert(!can.interrupt_pending()!)
+    can.listen(mcp2515.RECEIVE)!
+    core.assert_eq(node.register(CANINTE), 0x03u8)
+    arrive(&mut node, 0x1, false, &empty)
+    arrive(&mut node, 0x2, false, &empty)
+    core.assert(node.int_low())
+    core.assert(can.interrupt_pending()!)
+    // acknowledge leaves received frames alone.
+    can.acknowledge(mcp2515.RECEIVE | mcp2515.TRANSMIT)!
+    core.assert(can.interrupt_pending()!)
+    receive(&mut can)
+    core.assert(can.interrupt_pending()!)
+    receive(&mut can)
+    core.assert(!can.interrupt_pending()!)
+    core.assert(!node.int_low())
+
+    can.listen(mcp2515.TRANSMIT | mcp2515.ERROR)!
+    core.assert_eq(node.register(CANINTE), 0x3Fu8)
+    can.ignore(mcp2515.RECEIVE)!
+    core.assert_eq(node.register(CANINTE), 0x3Cu8)
+    send_standard(&mut can, 0x3, &empty)
+    node.transmit_all()
+    // Received, but receive is ignored; sent is listened for.
+    core.assert(can.interrupt_pending()!)
+    can.acknowledge(mcp2515.TRANSMIT)!
+    core.assert(!can.interrupt_pending()!)
+    core.assert_eq(node.register(CANINTF) & 0x01, 0x01u8)
+    receive(&mut can)
+    // An overflow raises ERRIF until acknowledged.
+    for n in 0u32..3 {
+        arrive(&mut node, n, false, &empty)
+    }
+    core.assert(can.interrupt_pending()!)
+    expect_receive_error(&mut can, hal.Error.Overrun)
+    core.assert(can.interrupt_pending()!)
+    can.acknowledge(mcp2515.ERROR)!
+    core.assert(!can.interrupt_pending()!)
+    core.assert_eq(node.violations, 0u32)
+}
+
+fn bus_failures() {
+    empty: [0]u8 = []
+    node := Node.new()
+    config := loopback_config()
+    nothing := no_filters()
+    can := controller(&mut node, &config, &nothing)
+    frame := hal.CanFrame.standard(0x10, &empty)!
+
+    // Each SPI call of an operation fails in turn; the error comes back and
+    // the chip is deselected.
+    for call in 1u32..4 {
+        node.fail_in = call
+        match can.poll_send(&frame) {
+            ok(_) => {}
+            err(error) => {
+                core.assert(error == hal.Error.Busy)
+            }
+        }
+        core.assert(!node.pin_low())
+    }
+    node.fail_in = 0
+    node.transmit_all()
+    for call in 1u32..3 {
+        arrive(&mut node, 0x20, false, &empty)
+        node.fail_in = call
+        expect_receive_error(&mut can, hal.Error.Busy)
+        core.assert(!node.pin_low())
+        node.fail_in = 0
+        // Drain.
+        recovered := hal.CanFrame.new()
+        for can.poll_receive(&mut recovered)! {}
+    }
+    node.fail_in = 1
+    match can.error_state() {
+        ok(_) => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == hal.Error.Busy)
+        }
+    }
+    node.fail_in = 1
+    match can.tec() {
+        ok(_) => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == hal.Error.Busy)
+        }
+    }
+    node.fail_in = 1
+    expect_error(can.set_mode(mcp2515.Mode.Normal), hal.Error.Busy)
+    node.fail_in = 2
+    attached := mcp2515.Controller.attach(ModelSpi.new(&mut node), ModelPin.new(&mut node))
+    expect_error(attached.configure(&config, &nothing), hal.Error.Busy)
+    core.assert(!node.pin_low())
+}
+
+// Through `&mut dyn hal.Can`, as a driver chosen at run time sees it.
+fn round_trip(can: &mut dyn hal.Can, id: u32) -> bool {
+    bytes4: [3]u8 = [1u8, 2, 3]
+    frame := hal.CanFrame.extended(id, &bytes4)!
+    match can.poll_send(&frame) {
+        ok(queued) => {
+            if !queued {
+                return false
+            }
+        }
+        err(_) => {
+            return false
+        }
+    }
+    match can.error_state() {
+        ok(state) => {
+            if state != hal.CanErrorState.Active {
+                return false
+            }
+        }
+        err(_) => {
+            return false
+        }
+    }
+    return true
+}
+
+fn take(can: &mut dyn hal.Can, frame: &mut hal.CanFrame) -> bool {
+    match can.poll_receive(frame) {
+        ok(found) => {
+            return found
+        }
+        err(_) => {
+            return false
+        }
+    }
+}
+
+fn dynamic() {
+    node := Node.new()
+    config := loopback_config()
+    nothing := no_filters()
+    can := controller(&mut node, &config, &nothing)
+    {
+        generic: &mut dyn hal.Can = &mut can
+        core.assert(round_trip(generic, 0x1234))
+    }
+    node.transmit_all()
+    frame := hal.CanFrame.new()
+    {
+        generic: &mut dyn hal.Can = &mut can
+        core.assert(take(generic, &mut frame))
+        core.assert(!take(generic, &mut frame))
+    }
+    core.assert_eq(frame.id(), 0x1234u32)
+    core.assert_eq(frame.bytes()[2], 3u8)
+    hal.send_frame(&mut can, &frame, hal.DEFAULT_POLL_LIMIT)!
+    node.transmit_all()
+    hal.receive_frame(&mut can, &mut frame, hal.DEFAULT_POLL_LIMIT)!
+    core.assert(frame.is_extended())
+}
+
+// Two drivers on one bus.
+fn two_nodes() {
+    empty: [0]u8 = []
+    first_node := Node.new()
+    second_node := Node.new()
+    config := mcp2515.Config.new(8_000_000, 250_000)
+    nothing := no_filters()
+    only: [1]hal.CanFilter = [hal.CanFilter { id: 0x100, mask: 0x700, extended: false }]
+    first := controller(&mut first_node, &config, &nothing)
+    second := controller(&mut second_node, &config, &only)
+
+    bytes5: [1]u8 = [0x11u8]
+    send_standard(&mut first, 0x123, &bytes5)
+    bytes6: [1]u8 = [0x22u8]
+    send_standard(&mut first, 0x223, &bytes6)
+    bytes7: [1]u8 = [0x33u8]
+    send_standard(&mut first, 0x1FF, &bytes7)
+    core.assert_eq(carry(&mut first_node, &mut second_node), 3u32)
+    got := receive(&mut second)
+    core.assert_eq(got.id(), 0x123u32)
+    core.assert_eq(got.bytes()[0], 0x11u8)
+    core.assert_eq(receive_id(&mut second), 0x1FFu32)
+    expect_empty(&mut second)
+
+    // And back.
+    remote := hal.CanFrame.new()
+    remote.set_remote(0x7A, false, 2)!
+    send(&mut second, &remote)
+    core.assert_eq(carry(&mut second_node, &mut first_node), 1u32)
+    answer := receive(&mut first)
+    core.assert(answer.same(&remote))
+
+    // A listen-only node does not acknowledge: the frame stays queued.
+    second.set_mode(mcp2515.Mode.ListenOnly)!
+    send_standard(&mut first, 0x150, &empty)
+    core.assert_eq(carry(&mut first_node, &mut second_node), 0u32)
+    core.assert_eq(first_node.read_status() & 0x54, 0x40u8)
+    second.set_mode(mcp2515.Mode.Normal)!
+    core.assert_eq(carry(&mut first_node, &mut second_node), 1u32)
+    core.assert_eq(receive_id(&mut second), 0x150u32)
+    core.assert_eq(first_node.violations + second_node.violations, 0u32)
+}
+
+fn release() {
+    node := Node.new()
+    config := mcp2515.Config.new(16_000_000, 500_000)
+    nothing := no_filters()
+    can := controller(&mut node, &config, &nothing)
+    // Another device on the same bus between CAN calls.
+    other: [2]u8 = [0, 0]
+    before := node.transactions
+    can.bus().write(&other)!
+    // The MCP2515 is not selected, so it ignores the bytes.
+    core.assert_eq(node.violations, 2u32)
+    node.violations = 0
+    core.assert_eq(node.transactions, before)
+    let (bus, pin) = can.release()
+    core.assert(pin.high)
+    // SAFETY: only the addresses are compared.
+    unsafe {
+        core.assert_eq(bus.node as usize, ptr.from_mut(&mut node) as usize)
+        core.assert_eq(pin.node as usize, bus.node as usize)
+    }
+    // Reused for a fresh driver.
+    again := mcp2515.Controller.new(bus, pin, &config, &nothing)!
+    core.assert_eq(node.resets, 2u32)
+    core.assert(is_state(again.error_state()!, hal.CanErrorState.Active))
+}
+
+fn main() {
+    dlc_codes()
+    frames()
+    filters()
+    bit_timing()
+    registers_table()
+    startup()
+    filter_groups()
+    frame_kinds()
+    transmit_order()
+    receive_order()
+    overrun()
+    error_states()
+    modes()
+    interrupts()
+    bus_failures()
+    dynamic()
+    two_nodes()
+    release()
+}

@@ -50,6 +50,9 @@ struct I2cModel {
     spike: u32
     hold: u32
     interrupt_mask: u32
+    // The FIFO thresholds of TX_EMPTY and RX_FULL.
+    tx_threshold: u32
+    rx_threshold: u32
     // COMP_PARAM_1, which encodes the receive and transmit FIFO depths.
     parameters: u32
     rx_depth: usize
@@ -86,7 +89,7 @@ struct I2cModel {
     // Rule violations the driver must never cause.
     tx_overflow: bool
     rx_overflow: bool
-    log: [96]u32
+    log: [192]u32
     log_count: usize
 
     fn new(rx_depth: usize, period: u32) -> I2cModel {
@@ -99,6 +102,8 @@ struct I2cModel {
             spike: 0,
             hold: 0x0001_0001,
             interrupt_mask: 0x8FF,
+            tx_threshold: 0,
+            rx_threshold: 0,
             parameters: ((I2C_FIFO as u32 - 1) << 16) | ((rx_depth as u32 - 1) << 8) | 0x6E,
             rx_depth,
             tx: [0; 16],
@@ -124,13 +129,13 @@ struct I2cModel {
             hold_after_abort: false,
             tx_overflow: false,
             rx_overflow: false,
-            log: [0; 96],
+            log: [0; 192],
             log_count: 0,
         }
     }
 
     fn record(&mut self, event: u32) {
-        core.assert(self.log_count < 96)
+        core.assert(self.log_count < 192)
         self.log[self.log_count] = event
         self.log_count += 1
     }
@@ -266,6 +271,31 @@ struct I2cModel {
         }
     }
 
+    // RAW_INTR_STAT: RX_FULL above the receive threshold, TX_EMPTY at or
+    // below the transmit threshold once the last command is done, TX_ABRT,
+    // and STOP_DET.
+    fn raw(&self) -> u32 {
+        raw := 0u32
+        if self.rx_count > self.rx_threshold as usize {
+            raw |= 1 << 2
+        }
+        if self.tx_count <= self.tx_threshold as usize && (self.con & (1 << 8)) != 0 && !self.stuck {
+            raw |= 1 << 4
+        }
+        if self.aborted {
+            raw |= 1 << 6
+        }
+        if self.stop_detected {
+            raw |= 1 << 9
+        }
+        return raw
+    }
+
+    // The controller's interrupt line: the raw flags INTR_MASK lets through.
+    fn interrupt(&self) -> u32 {
+        return self.raw() & self.interrupt_mask
+    }
+
     // The register block protocol.
     pub fn read(&mut self, offset: usize) -> u32 {
         self.step()
@@ -278,17 +308,7 @@ struct I2cModel {
             self.rx_count -= 1
             return value as u32
         } else if offset == 0x34 {
-            raw := 0u32
-            if self.tx_count == 0 && (self.con & (1 << 8)) != 0 && !self.stuck {
-                raw |= 1 << 4
-            }
-            if self.aborted {
-                raw |= 1 << 6
-            }
-            if self.stop_detected {
-                raw |= 1 << 9
-            }
-            return raw
+            return self.raw()
         } else if offset == 0x40 {
             self.aborted = false
             self.abort_source = 0
@@ -364,6 +384,10 @@ struct I2cModel {
             self.tx_count += 1
             return
         }
+        if offset == 0x30 {
+            self.interrupt_mask = value
+            return
+        }
         // Everything else is configuration, writable only while disabled.
         core.assert(!self.enabled)
         if offset == 0x00 {
@@ -374,10 +398,12 @@ struct I2cModel {
             self.high = value
         } else if offset == 0x20 {
             self.low = value
-        } else if offset == 0x30 {
-            self.interrupt_mask = value
-        } else if offset == 0x38 || offset == 0x3C {
-            core.assert_eq(value, 0u32)
+        } else if offset == 0x38 {
+            core.assert(value < self.rx_depth as u32)
+            self.rx_threshold = value
+        } else if offset == 0x3C {
+            core.assert(value < I2C_FIFO as u32)
+            self.tx_threshold = value
         } else if offset == 0x7C {
             self.hold = value
         } else if offset == 0xA0 {
@@ -460,9 +486,15 @@ fn i2c_configuration() {
     // The receive hold time in the upper half is kept.
     core.assert_eq(model.hold, 0x0001_0026u32)
     core.assert_eq(model.interrupt_mask, 0u32)
+    // TX_EMPTY at half the transmit FIFO, RX_FULL at half the receive FIFO.
+    core.assert_eq(model.tx_threshold, 8u32)
+    core.assert_eq(model.rx_threshold, 7u32)
     core.assert(!model.enabled)
     nothing: [0]u32 = []
     model.expect(&nothing)
+    bus = i2c_bus(I2cModel.new(2, 1))
+    model = bus.release()
+    core.assert_eq(model.rx_threshold, 0u32)
 }
 
 fn i2c_transactions() {
@@ -612,105 +644,401 @@ fn i2c_failures() {
     model.expect(&held_abort)
 }
 
-// Wait for a queued transaction, as a task would across polls.
-fn finish_queued(bus: &mut designware_i2c.Controller<I2cModel>, buffer: &mut[u8]) -> u32!hal.Error {
+fn expect_i2c_poll_error(result: bool!hal.Error, expected: hal.Error) {
+    match result {
+        ok(_) => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == expected)
+        }
+    }
+}
+
+// Poll a transaction until it ends, as a task would across wakeups, through
+// the polling protocol; returns the polls that found it still running.
+fn finish_write(bus: &mut dyn hal.I2cPoll, address: u8, bytes: &[u8]) -> u32!hal.Error {
     polls := 0u32
-    for !bus.poll_finish(buffer)? {
+    for !bus.poll_write(address, bytes)? {
         polls += 1
-        core.assert(polls < 1000)
+        core.assert(polls < 100_000)
     }
     return ok(polls)
 }
 
-fn i2c_queued_transactions() {
+fn finish_read(bus: &mut dyn hal.I2cPoll, address: u8, buffer: &mut[u8]) -> u32!hal.Error {
+    polls := 0u32
+    for !bus.poll_read(address, buffer)? {
+        polls += 1
+        core.assert(polls < 100_000)
+    }
+    return ok(polls)
+}
+
+fn finish_write_read(bus: &mut dyn hal.I2cPoll, address: u8, bytes: &[u8], buffer: &mut[u8]) -> u32!hal.Error {
+    polls := 0u32
+    for !bus.poll_write_read(address, bytes, buffer)? {
+        polls += 1
+        core.assert(polls < 100_000)
+    }
+    return ok(polls)
+}
+
+fn i2c_polled_transactions() {
     model := I2cModel.new(16, 4)
+    model.registers[0x05] = 0x99
     model.registers[0x20] = 0xAB
     model.registers[0x21] = 0xCD
     bus := i2c_bus(model)
-    core.assert_eq(bus.queue_depth(), 16usize)
     bus.listen()
     command: [1]u8 = [0x20]
-    bus.start_write_read(DEVICE, &command, 2)!
+    reply: [2]u8 = [0, 0]
+    core.assert(!bus.poll_write_read(DEVICE, &command, &mut reply)!)
     core.assert(bus.is_busy())
-    // Nothing else gets into the FIFOs meanwhile.
+    // Nothing else gets into the FIFOs meanwhile, and calls that differ
+    // from the running transaction are refused without disturbing it.
     one: [1]u8 = [0x07]
     expect_error(bus.write(DEVICE, &one), hal.Error.Busy)
-    expect_error(bus.start_read(DEVICE, 1), hal.Error.Busy)
-    reply: [2]u8 = [0, 0]
+    expect_error(bus.set_frequency(hal.I2C_STANDARD_HZ), hal.Error.Busy)
+    expect_i2c_poll_error(bus.poll_write_read(0x49, &command, &mut reply), hal.Error.InvalidInput)
+    expect_i2c_poll_error(bus.poll_write_read(0x80, &command, &mut reply), hal.Error.InvalidInput)
+    expect_i2c_poll_error(bus.poll_read(DEVICE, &mut reply), hal.Error.InvalidInput)
+    expect_i2c_poll_error(bus.poll_write_read(DEVICE, &command, &mut one), hal.Error.InvalidInput)
+    expect_i2c_poll_error(bus.poll_write_read_ten_bit(DEVICE as u16, &command, &mut reply), hal.Error.InvalidInput)
+    core.assert(bus.is_busy())
     // The controller works while the program polls.
-    core.assert(finish_queued(&mut bus, &mut reply)! > 0)
+    core.assert(finish_write_read(&mut bus, DEVICE, &command, &mut reply)! > 0)
     core.assert_eq(reply[0], 0xABu8)
     core.assert_eq(reply[1], 0xCDu8)
     core.assert(!bus.is_busy())
-    match bus.poll_finish(&mut reply) {
-        ok(done) => {
-            core.assert(false)
-        }
-        err(error) => {
-            core.assert(error == hal.Error.InvalidInput)
-        }
-    }
     data: [3]u8 = [0x30, 1, 2]
-    bus.start_write(DEVICE, &data)!
-    nothing: [0]u8 = []
-    finish_queued(&mut bus, &mut nothing)!
-    bus.start_read(DEVICE, 1)!
-    finish_queued(&mut bus, &mut one)!
+    finish_write(&mut bus, DEVICE, &data)!
+    finish_read(&mut bus, DEVICE, &mut one)!
     core.assert_eq(one[0], 0x00u8)
     // A missing device ends the transaction with its reason.
-    bus.start_read(0x10, 1)!
-    match finish_queued(&mut bus, &mut one) {
-        ok(polls) => {
+    match finish_read(&mut bus, 0x10, &mut one) {
+        ok(_) => {
             core.assert(false)
         }
         err(error) => {
             core.assert(error == hal.Error.NoAcknowledge)
         }
     }
-    // A buffer shorter than the read still ends the transaction.
-    bus.start_read(DEVICE, 2)!
-    match finish_queued(&mut bus, &mut one) {
-        ok(polls) => {
-            core.assert(false)
-        }
-        err(error) => {
-            core.assert(error == hal.Error.InvalidInput)
-        }
-    }
     core.assert(!bus.is_busy())
-    // More commands than the transmit FIFO takes at once.
-    long: [16]u8 = [0; 16]
-    expect_error(bus.start_write_read(DEVICE, &long, 1), hal.Error.InvalidInput)
-    expect_error(bus.start_read(DEVICE, 17), hal.Error.InvalidInput)
-    expect_error(bus.start_write(DEVICE, &nothing), hal.Error.InvalidInput)
-    // The blocking methods work again in between.
+    // Arguments the controller cannot send start nothing.
+    nothing: [0]u8 = []
+    empty: [0]u8 = []
+    expect_i2c_poll_error(bus.poll_write(DEVICE, &empty), hal.Error.InvalidInput)
+    expect_i2c_poll_error(bus.poll_write_read(DEVICE, &empty, &mut nothing), hal.Error.InvalidInput)
+    expect_i2c_poll_error(bus.poll_read(0x80, &mut one), hal.Error.InvalidInput)
+    expect_i2c_poll_error(bus.poll_read_ten_bit(0x400, &mut one), hal.Error.InvalidInput)
+    core.assert(!bus.is_busy())
+    // The blocking methods work again in between, and so does a device
+    // with a 10-bit address.
     bus.write(DEVICE, &one)!
+    register: [1]u8 = [0x05]
+    value: [1]u8 = [0]
+    for !bus.poll_write_read_ten_bit(DEVICE10, &register, &mut value)! {}
+    core.assert_eq(value[0], 0x99u8)
     model = bus.release()
-    core.assert_eq(model.interrupt_mask, (1u32 << 9) | (1u32 << 6))
+    // Listening, an idle controller lets no interrupt through.
+    core.assert_eq(model.interrupt_mask, 0u32)
     core.assert_eq(model.registers[0x30], 1u8)
     core.assert_eq(model.registers[0x31], 2u8)
     address := ADDRESS | (DEVICE as u32 << 1)
-    queued: [30]u32 = [
+    header := ADDRESS | 0xF4
+    polled: [33]u32 = [
         START, address, 0x20, RESTART, address | 1, 0xAB, 0xCD, STOP,
         START, address, 0x30, 1, 2, STOP,
         START, address | 1, 0x00, STOP,
         START, ADDRESS | 0x21, STOP,
-        START, address | 1, 0x00, 0x00, STOP,
-        START, address, 0x00, STOP
+        START, address, 0x00, STOP,
+        START, header, ADDRESS | 0xA5, 0x05, RESTART, header | 1, 0x99, STOP
     ]
-    model.expect(&queued)
+    model.expect(&polled)
+}
 
-    // A transaction that never ends is cancelled; the bus starts afresh.
-    model.stuck = true
+// The device's registers for the long transfers: 0x40 onwards counts in
+// threes, and the long write stores 199, 198, ... from 0x80.
+fn long_model(burst: bool) -> I2cModel {
+    model := I2cModel.new(4, 7)
+    model.burst = burst
+    for index in 0..40usize {
+        model.registers[0x40 + index] = (3 * index) as u8
+    }
+    return model
+}
+
+fn long_register(index: usize) -> u8 {
+    if index >= 0x80 {
+        return (200 - (index - 0x7F)) as u8
+    }
+    if index >= 0x40 && index < 0x68 {
+        return (3 * (index - 0x40)) as u8
+    }
+    return 0
+}
+
+const LONG_LOG: usize = 123
+
+// The bus log of a long session: a 41-byte write, a register number and a
+// 40-byte read, and a 30-byte read continuing from there, past the end of
+// the counting registers into the written ones.
+fn expect_long_log(model: &mut I2cModel) {
+    address := ADDRESS | (DEVICE as u32 << 1)
+    log: [123]u32 = [0; 123]
+    log[0] = START
+    log[1] = address
+    log[2] = 0x80
+    for index in 1..41usize {
+        log[2 + index] = (200 - index) as u32
+    }
+    log[43] = STOP
+    log[44] = START
+    log[45] = address
+    log[46] = 0x40
+    log[47] = RESTART
+    log[48] = address | 1
+    for index in 0..40usize {
+        log[49 + index] = long_register(0x40 + index) as u32
+    }
+    log[89] = STOP
+    log[90] = START
+    log[91] = address | 1
+    for index in 0..30usize {
+        log[92 + index] = long_register(0x68 + index) as u32
+    }
+    log[122] = STOP
+    model.expect(&log)
+}
+
+fn long_data() -> [41]u8 {
+    data: [41]u8 = [0; 41]
+    data[0] = 0x80
+    for index in 1..41usize {
+        data[index] = (200 - index) as u8
+    }
+    return data
+}
+
+// The long session through the blocking protocol.
+fn long_session<B: hal.I2c>(bus: &mut B) {
+    data := long_data()
+    bus.write(DEVICE, &data)!
+    command: [1]u8 = [0x40]
+    buffer: [40]u8 = [0; 40]
+    bus.write_read(DEVICE, &command, &mut buffer)!
+    more: [30]u8 = [0; 30]
+    bus.read(DEVICE, &mut more)!
+    for index in 0..40usize {
+        core.assert_eq(buffer[index], long_register(0x40 + index))
+    }
+    for index in 0..30usize {
+        core.assert_eq(more[index], long_register(0x68 + index))
+    }
+}
+
+// The long session polled, through dyn; returns the polls it took.
+fn long_polled_session(bus: &mut dyn hal.I2cPoll) -> u32 {
+    data := long_data()
+    polls := finish_write(bus, DEVICE, &data)!
+    command: [1]u8 = [0x40]
+    buffer: [40]u8 = [0; 40]
+    polls += finish_write_read(bus, DEVICE, &command, &mut buffer)!
+    more: [30]u8 = [0; 30]
+    polls += finish_read(bus, DEVICE, &mut more)!
+    for index in 0..40usize {
+        core.assert_eq(buffer[index], long_register(0x40 + index))
+    }
+    for index in 0..30usize {
+        core.assert_eq(more[index], long_register(0x68 + index))
+    }
+    return polls
+}
+
+fn i2c_polled_long_transfers() {
+    // Commands complete slower than the driver queues them, so the
+    // transmit FIFO fills and each poll moves only part of a transfer;
+    // then, with `burst`, the controller works off its whole queue at
+    // once, as while an interrupt delays the CPU, and the reads in flight
+    // must fit the 4-entry receive FIFO. The blocking methods,
+    // hal.BlockingI2c over the polling methods, and the polling methods
+    // themselves put the same bytes on the bus.
+    for variant in 0..2usize {
+        burst := variant == 1
+        bus := i2c_bus(long_model(burst))
+        long_session(&mut bus)
+        model := bus.release()
+        expect_long_log(&mut model)
+
+        blocking := hal.BlockingI2c.new(i2c_bus(long_model(burst)))
+        long_session(&mut blocking)
+        bus = blocking.release()
+        model = bus.release()
+        expect_long_log(&mut model)
+
+        bus = i2c_bus(long_model(burst))
+        bus.listen()
+        core.assert(long_polled_session(&mut bus) > 10)
+        model = bus.release()
+        expect_long_log(&mut model)
+        core.assert_eq(model.interrupt_mask, 0u32)
+        for index in 0..40usize {
+            core.assert_eq(model.registers[0x80 + index], long_register(0x80 + index))
+        }
+    }
+}
+
+fn expect_finish_error(result: u32!hal.Error, expected: hal.Error) {
+    match result {
+        ok(_) => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == expected)
+        }
+    }
+}
+
+fn i2c_polled_failures() {
+    address := ADDRESS | (DEVICE as u32 << 1)
+    data := long_data()
+    one: [1]u8 = [0x07]
+    // The device stops acknowledging in the middle of a long write; the
+    // controller drops the rest and ends with STOP.
+    model := I2cModel.new(16, 3)
+    model.ack_bytes = 20
+    bus := i2c_bus(model)
+    bus.listen()
+    expect_finish_error(finish_write(&mut bus, DEVICE, &data), hal.Error.NoAcknowledge)
+    core.assert(!bus.is_busy())
+    model = bus.release()
+    core.assert_eq(model.interrupt_mask, 0u32)
+    core.assert_eq(model.log_count, 24usize)
+    core.assert(model.log[0] == START && model.log[1] == address && model.log[2] == 0x80)
+    core.assert(model.log[22] == (200 - 20) as u32 && model.log[23] == STOP)
+    model.log_count = 0
+    model.ack_bytes = 0xFFFF_FFFF
+
+    // Another master wins arbitration; then the bus works again.
+    model.lose_arbitration = true
     bus = i2c_bus(model)
-    bus.start_write(DEVICE, &data)!
+    expect_finish_error(finish_write(&mut bus, DEVICE, &one), hal.Error.Bus)
+    finish_write(&mut bus, DEVICE, &one)!
+    model = bus.release()
+    arbitration: [5]u32 = [START, START, address, 0x07, STOP]
+    model.expect(&arbitration)
+
+    // An abort whose STOP never comes, because a device holds SCL low:
+    // the transaction stays unfinished, waiting only for a STOP, until it
+    // is cancelled.
+    model.hold_after_abort = true
+    bus = i2c_bus(model)
+    bus.listen()
     for _ in 0..100 {
-        core.assert(!bus.poll_finish(&mut nothing)!)
+        core.assert(!bus.poll_write(0x10, &one)!)
+    }
+    core.assert(bus.is_busy())
+    model = bus.release()
+    core.assert_eq(model.interrupt_mask, 1u32 << 9)
+    bus = i2c_bus(model)
+    bus.listen()
+    for _ in 0..100 {
+        core.assert(!bus.poll_write(0x10, &one)!)
     }
     bus.cancel()
     core.assert(!bus.is_busy())
     model = bus.release()
+    core.assert(!model.enabled && model.interrupt_mask == 0)
+    model.hold_after_abort = false
+    held: [6]u32 = [START, ADDRESS | 0x20, STOP, START, ADDRESS | 0x20, STOP]
+    model.expect(&held)
+
+    // Cancelled in the middle of a long write, which then ends with STOP;
+    // the next transaction, with other arguments, starts afresh.
+    bus = i2c_bus(model)
+    for _ in 0..3 {
+        core.assert(!bus.poll_write(DEVICE, &data)!)
+    }
+    bus.cancel()
+    core.assert(!bus.is_busy())
+    finish_write(&mut bus, DEVICE, &one)!
+    model = bus.release()
+    count := model.log_count
+    core.assert(count > 8 && count < 48)
+    core.assert(model.log[0] == START && model.log[1] == address && model.log[2] == 0x80)
+    core.assert(model.log[count - 5] == STOP && model.log[count - 4] == START && model.log[count - 3] == address)
+    core.assert(model.log[count - 2] == 0x07 && model.log[count - 1] == STOP)
+    model.log_count = 0
+
+    // A device that holds SCL low: polls never finish, and
+    // hal.BlockingI2c gives up after its poll limit, cancels, and reports
+    // Timeout.
+    model.stuck = true
+    blocking := hal.BlockingI2c.new(i2c_bus(model))
+    blocking.set_poll_limit(1000)
+    expect_error(blocking.write(DEVICE, &one), hal.Error.Timeout)
+    bus = blocking.release()
+    core.assert(!bus.is_busy())
+    model = bus.release()
     core.assert(!model.enabled)
+    core.assert(!model.tx_overflow && !model.rx_overflow)
+}
+
+fn i2c_polled_interrupts() {
+    // A frozen controller completes nothing, so INTR_MASK after one poll
+    // shows what the transaction waits on.
+    model := I2cModel.new(4, 1)
+    model.stuck = true
+    bus := i2c_bus(model)
+    bus.listen()
+    model = bus.release()
+    // Idle: nothing.
+    core.assert_eq(model.interrupt_mask, 0u32)
+    // A long write, 16 bytes queued and 25 to go: room in the transmit
+    // FIFO, the end, or an abort.
+    tx_empty := 1u32 << 4
+    rx_full := 1u32 << 2
+    ended := (1u32 << 6) | (1u32 << 9)
+    data := long_data()
+    bus = i2c_bus(model)
+    bus.listen()
+    core.assert(!bus.poll_write(DEVICE, &data)!)
+    model = bus.release()
+    core.assert_eq(model.interrupt_mask, tx_empty | ended)
+    // A long read: four reads queued fill the receive FIFO's worth, so the
+    // next waits for received bytes, not for room in the transmit FIFO.
+    buffer: [40]u8 = [0; 40]
+    bus = i2c_bus(model)
+    bus.listen()
+    core.assert(!bus.poll_read(DEVICE, &mut buffer)!)
+    model = bus.release()
+    core.assert_eq(model.interrupt_mask, rx_full | ended)
+    // Everything queued: only the end.
+    three: [3]u8 = [1, 2, 3]
+    bus = i2c_bus(model)
+    bus.listen()
+    core.assert(!bus.poll_write(DEVICE, &three)!)
+    model = bus.release()
+    core.assert_eq(model.interrupt_mask, ended)
+    // Not listening, the mask stays clear.
+    bus = i2c_bus(model)
+    bus.listen()
+    bus.ignore()
+    core.assert(!bus.poll_write(DEVICE, &data)!)
+    model = bus.release()
+    core.assert_eq(model.interrupt_mask, 0u32)
+
+    // Once a transaction has ended, nothing is let through, although the
+    // empty transmit FIFO raises TX_EMPTY.
+    model.stuck = false
+    model.log_count = 0
+    bus = i2c_bus(model)
+    bus.listen()
+    finish_write(&mut bus, DEVICE, &three)!
+    model = bus.release()
+    core.assert((model.raw() & tx_empty) != 0)
+    core.assert_eq(model.interrupt(), 0u32)
 }
 
 fn i2c_frequency() {
@@ -803,6 +1131,8 @@ struct I2cTargetModel {
     read_request: bool
     rx_done: bool
     stop_detected: bool
+    // RX_OVER: written bytes were lost.
+    lost: bool
     script: [64]u32
     script_length: usize
     position: usize
@@ -833,6 +1163,7 @@ struct I2cTargetModel {
             read_request: false,
             rx_done: false,
             stop_detected: false,
+            lost: false,
             script: [0; 64],
             script_length: 0,
             position: 0,
@@ -920,6 +1251,9 @@ struct I2cTargetModel {
             return entry
         } else if offset == 0x34 {
             raw := 0u32
+            if self.lost {
+                raw |= 1 << 1
+            }
             if self.read_request {
                 raw |= 1 << 5
             }
@@ -938,6 +1272,9 @@ struct I2cTargetModel {
             self.aborted = false
             self.rx_done = false
             self.stop_detected = false
+            return 0
+        } else if offset == 0x4C {
+            self.lost = false
             return 0
         } else if offset == 0x50 {
             self.read_request = false
@@ -1034,11 +1371,11 @@ struct Registers {
 fn serve(target: &mut designware_i2c.Target<I2cTargetModel>, device: &mut Registers, buffer: &mut[u8], reply_length: usize) {
     idle := 0u32
     for idle < 50 {
-        match target.poll(buffer) {
-            designware_i2c.TargetEvent.Idle => {
+        match target.poll(buffer)! {
+            hal.I2cTargetEvent.Idle => {
                 idle += 1
             }
-            designware_i2c.TargetEvent.Write(count, start) => {
+            hal.I2cTargetEvent.Write(count, start) => {
                 idle = 0
                 first := 0usize
                 if start {
@@ -1051,16 +1388,16 @@ fn serve(target: &mut designware_i2c.Target<I2cTargetModel>, device: &mut Regist
                     device.pointer += 1
                 }
             }
-            designware_i2c.TargetEvent.Read => {
+            hal.I2cTargetEvent.Read => {
                 idle = 0
                 position := device.pointer % 64
                 end := position + reply_length
                 if end > 64 {
                     end = 64
                 }
-                device.pointer += target.respond(&device.memory[position..end])
+                device.pointer += target.respond(&device.memory[position..end])!
             }
-            designware_i2c.TargetEvent.Stop => {
+            hal.I2cTargetEvent.Stop => {
                 idle = 0
                 device.stops += 1
             }
@@ -1132,6 +1469,31 @@ fn i2c_target() {
     // A read without a write first continues where the pointer is, past
     // the eight bytes queued for the read before.
     core.assert_eq(model.received[5], device.memory[0x18])
+
+    // Lost bytes, which the controller cannot lose while it holds SCL on a
+    // full receive FIFO, would be reported once, and the target goes on.
+    model.lost = true
+    target = designware_i2c.Target.new(model, fast_timing(), TARGET_ADDRESS, false)
+    dynamic: &mut dyn hal.I2cTarget = &mut target
+    match dynamic.poll(&mut buffer) {
+        ok(_) => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == hal.Error.Overrun)
+        }
+    }
+    match dynamic.poll(&mut buffer)! {
+        hal.I2cTargetEvent.Idle => {}
+        _ => {
+            core.assert(false)
+        }
+    }
+    // An empty reply answers 0xFF and counts nothing.
+    empty: [0]u8 = []
+    core.assert_eq(dynamic.respond(&empty)!, 0usize)
+    model = target.release()
+    core.assert(!model.lost && model.tx_count == 0)
 
     // A 10-bit address, and a change of address between transactions.
     target = designware_i2c.Target.new(model, fast_timing(), 0x2A5, true)
@@ -1645,6 +2007,110 @@ fn spi_transfers() {
     model = bus.release()
     register_read: [2]u8 = [0x8F, 0]
     model.expect_sent(&register_read)
+}
+
+fn expect_poll_error(result: bool!hal.Error, expected: hal.Error) {
+    match result {
+        ok(_) => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == expected)
+        }
+    }
+}
+
+// Polled transfers (hal.SpiPoll): any length across polls, with the model
+// shifting slower than the driver polls, so each poll moves part of it.
+fn spi_polled() {
+    model := SpiModel.new(3)
+    model.burst = true
+    reply: [20]u8 = [0; 20]
+    for index in 0..20usize {
+        reply[index] = (100 + index) as u8
+    }
+    model.reply_with(&reply)
+    bus := spi_bus(model, hal.SpiMode.Mode0)
+    bytes: [20]u8 = [0; 20]
+    sent: [20]u8 = [0; 20]
+    for index in 0..20usize {
+        bytes[index] = index as u8
+        sent[index] = index as u8
+    }
+    polls := 0u32
+    for !bus.poll_transfer(&mut bytes)! {
+        polls += 1
+        core.assert(bus.is_busy())
+    }
+    core.assert(polls > 2)
+    core.assert(!bus.is_busy())
+    for index in 0..20usize {
+        core.assert_eq(bytes[index], (100 + index) as u8)
+    }
+    model = bus.release()
+    model.expect_sent(&sent)
+
+    // A write returns true only once the last frame has left; calls with
+    // another length or kind are refused while it runs. Frames shift one
+    // every three reads, so a poll leaves most of them for later.
+    model.burst = false
+    bus = spi_bus(model, hal.SpiMode.Mode0)
+    long: [30]u8 = [0; 30]
+    for index in 0..30usize {
+        long[index] = (3 * index) as u8
+    }
+    core.assert(!bus.poll_write(&long)!)
+    short: [3]u8 = [0; 3]
+    expect_poll_error(bus.poll_write(&short), hal.Error.InvalidInput)
+    expect_poll_error(bus.poll_transfer(&mut bytes), hal.Error.InvalidInput)
+    for !bus.poll_write(&long)! {}
+    model = bus.release()
+    model.expect_sent(&long)
+
+    // Cancelled part way, the frames already queued still go out and the
+    // next transfer starts afresh.
+    bus = spi_bus(model, hal.SpiMode.Mode0)
+    core.assert(!bus.poll_write(&long)!)
+    bus.cancel()
+    core.assert(!bus.is_busy())
+    model = bus.release()
+    core.assert(model.sent_count > 0 && model.sent_count < 30)
+    model.sent_count = 0
+    bus = spi_bus(model, hal.SpiMode.Mode0)
+    empty: [0]u8 = []
+    core.assert(bus.poll_write(&empty)!)
+
+    // A device selected around a polled write and read, and the blocking
+    // adapter over the polling form, send what the blocking methods send.
+    flash := hal.SpiDevice.new(fake.Pin.new())
+    model = bus.release()
+    flash_id: [4]u8 = [0, 0xEF, 0x40, 0x18]
+    model.reply_with(&flash_id)
+    bus = spi_bus(model, hal.SpiMode.Mode0)
+    command: [1]u8 = [0x9F]
+    id: [3]u8 = [0, 0, 0]
+    for !flash.poll_write_read(&mut bus, &command, &mut id)! {}
+    core.assert(id[0] == 0xEF && id[2] == 0x18)
+    model = bus.release()
+    id_command: [4]u8 = [0x9F, 0, 0, 0]
+    model.expect_sent(&id_command)
+    model.reply_with(&flash_id)
+    blocking := hal.BlockingSpi.new(spi_bus(model, hal.SpiMode.Mode0))
+    flash.write_read(&mut blocking, &command, &mut id)!
+    core.assert_eq(id[1], 0x40u8)
+    bus = blocking.release()
+    dynamic: &mut dyn hal.SpiPoll = &mut bus
+    core.assert(dynamic.poll_write(&command)! || true)
+    for !bus.poll_write(&command)! {}
+    model = bus.release()
+    two_ids: [5]u8 = [0x9F, 0, 0, 0, 0x9F]
+    model.expect_sent(&two_ids)
+
+    // Frames above 8 bits move with the word methods only.
+    bus = spi_bus(model, hal.SpiMode.Mode0)
+    bus.set_frame_bits(12)!
+    expect_poll_error(bus.poll_write(&command), hal.Error.Unsupported)
+    model = bus.release()
 }
 
 fn spi_overrun() {
@@ -2290,6 +2756,19 @@ fn uart_writes() {
     port.flush()!
     model := port.release()
     model.expect_sent(&text)
+
+    // serial.PollPort: poll_flush reports output still going out, then true
+    // once the last stop bit has left, as flush waits for.
+    port = uart_port(model)
+    core.assert(port.poll_flush()!)
+    port.write(b"abc")!
+    flushes := 0u32
+    for !port.poll_flush()! {
+        flushes += 1
+    }
+    core.assert(flushes > 0)
+    model = port.release()
+    model.expect_sent(b"abc")
 
     // std/fmt prints to a port, and with crlf every newline goes out as
     // CR LF while the count is still of the bytes written.
@@ -3174,6 +3653,15 @@ struct FakeChip {
         return CLOCK_HZ
     }
 
+    // PWM inputs are checked in pwm_capture_checks.dodo.
+    pub fn pwm_slices(&self) -> u32 {
+        return 8
+    }
+
+    pub fn timer_base(&self) -> usize {
+        return 0
+    }
+
     pub fn uart_aux(&self) -> bool {
         unsafe {
             return UART_AUX
@@ -4017,7 +4505,10 @@ fn main() {
     i2c_transactions()
     i2c_long_transfers()
     i2c_failures()
-    i2c_queued_transactions()
+    i2c_polled_transactions()
+    i2c_polled_long_transfers()
+    i2c_polled_failures()
+    i2c_polled_interrupts()
     i2c_frequency()
     i2c_ten_bit()
     i2c_probe()
@@ -4025,6 +4516,7 @@ fn main() {
     spi_divisors()
     spi_configuration()
     spi_transfers()
+    spi_polled()
     spi_overrun()
     spi_frames()
     spi_target()

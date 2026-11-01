@@ -966,6 +966,20 @@ pub struct StateMachine {
         return stalled
     }
 
+    // Whether the program stalled on a full RX FIFO since the last call, as
+    // a blocking `push` or autopush does while the processor reads too
+    // slowly, or dropped a word with `push noblock`; clears the flag. It
+    // writes the flag only when it was set, so a stall that comes after
+    // the read stays set for the next call.
+    pub fn take_rx_stall(&mut self) -> bool {
+        bit := 1u32 << (RX_STALL + self.index)
+        if (self.registers.read(FDEBUG) & bit) == 0 {
+            return false
+        }
+        self.registers.write(FDEBUG, bit)
+        return true
+    }
+
     // Run `instruction` at once, between the program's own, or on a
     // stopped state machine. One that stalls, such as a blocking `pull`,
     // finishes when its condition is met, while the program waits.
