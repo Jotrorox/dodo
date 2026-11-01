@@ -145,6 +145,47 @@ When another process holds a conflicting lock, the operation fails with
 `conn.set_busy_timeout(ms)`, or `PRAGMA busy_timeout = ms` make the
 connection wait and retry for up to that long first.
 
+## WAL mode
+
+`PRAGMA journal_mode = WAL` switches a database file to write-ahead logging,
+exactly as SQLite does (the setting is stored in the file, so it stays on for
+every later connection, Dodo or SQLite). Commits then append the changed
+pages to `<file>-wal` instead of rewriting the database, and readers keep
+reading a consistent snapshot while a writer commits, so readers and the
+single writer no longer block each other.
+
+```dodo
+conn := sqlite.Connection.open("app.db", unsafe { &mut WORKSPACE[..] })?
+conn.exec("pragma journal_mode = wal")?
+```
+
+A checkpoint copies committed pages from the log back into the database
+file. One runs automatically after a commit leaves 1000 or more frames in
+the log (`PRAGMA wal_autocheckpoint = N` changes the threshold; 0 turns it
+off), and when the last connection to the file closes; that connection then
+deletes the `-wal` and `-shm` files. `PRAGMA wal_checkpoint` runs one now and
+returns SQLite's three columns: `busy` (1 if it could not finish because of
+other connections), `log` (frames in the log) and `checkpointed` (frames
+copied so far). The argument selects SQLite's modes: `PASSIVE` (default,
+never waits), `FULL` (waits for the writer and for readers of older
+snapshots, up to the busy timeout), `RESTART` (as `FULL`, then waits until
+the next writer can start the log over) and `TRUNCATE` (as `RESTART`, and
+truncates the log file). `PRAGMA journal_mode = DELETE` returns to rollback
+journaling; it needs every other connection to have closed the file and
+fails with `Busy` otherwise. Neither conversion, nor a checkpoint, can run
+inside a transaction.
+
+In-memory databases ignore the setting and report `memory`, as in SQLite.
+
+Everything follows SQLite's documented formats, so Dodo and SQLite processes
+can work on one WAL database at the same time: the log (frames, salts, and
+checksums in either byte order), the shared `-shm` index with its hash
+tables and read marks, and SQLite's WAL locks on it. Without memory-mapped
+files, the engine reads and writes the index with ordinary file I/O and
+relies on its double header copy, checksums, and retry rules. A connection
+that finds the index stale or damaged (for example after a crash) rebuilds it
+from the log, keeping only committed transactions.
+
 ## Errors
 
 Failures return `db.Error`. Its `kind` is portable (`Syntax`, `Constraint`,
@@ -202,11 +243,13 @@ test suite runs the same SQL scripts through SQLite and through this driver,
 compares every result row, checks the files Dodo writes with SQLite's
 `PRAGMA integrity_check`, and reads SQLite-written files back through Dodo.
 It also covers crash recovery in both directions (each recovers the other's
-interrupted transaction from its hot journal) and the lock protocol between
-the two.
+interrupted transaction from its hot journal or its write-ahead log), the
+lock protocol between the two, and Dodo and SQLite processes reading,
+writing, and checkpointing one WAL database concurrently.
 
 **Files.** All page sizes; overflow pages; the freelist; rollback-journal
-transactions with hot-journal recovery; SQLite's lock bytes through
+transactions with hot-journal recovery; WAL mode with its `-wal` log and
+`-shm` index; SQLite's lock bytes through
 [`fs.File.try_lock_range`](filesystem.md); UTF-8 databases; schema formats 1
 to 4.
 
@@ -235,13 +278,13 @@ and UPSERT), `UPDATE`, `DELETE`, each with `RETURNING`; `SELECT` with joins
 `datetime`, `julianday`, `unixepoch`, `strftime` with their modifiers.
 
 **Pragmas.** `user_version`, `application_id`, `schema_version`,
-`page_size`, `page_count`, `freelist_count`, `encoding`, `journal_mode`,
-`table_info`, `table_list`, `index_list`, `index_info`, `integrity_check`,
+`page_size`, `page_count`, `freelist_count`, `encoding`, `journal_mode`
+(`DELETE` and `WAL`; other rollback modes behave as `DELETE`),
+`wal_checkpoint`, `wal_autocheckpoint`, `table_info`, `table_list`, `index_list`, `index_info`, `integrity_check`,
 `quick_check`, `busy_timeout`, `database_list`; others are accepted and
 ignored, as SQLite does for unknown pragmas.
 
-**Not supported.** WAL-mode databases (convert them with `PRAGMA
-journal_mode=DELETE` in SQLite first), triggers (tables with triggers can be
+**Not supported.** Triggers (tables with triggers can be
 read but not written), window functions, `WITHOUT ROWID` and virtual tables,
 `ATTACH`, savepoints, `ALTER TABLE DROP COLUMN`, writes to tables with
 expression or partial indexes, UTF-16 databases, temporary tables, and
@@ -253,7 +296,11 @@ conversion.
 **Concurrency.** Locks follow SQLite's protocol, so Dodo and SQLite processes
 can use one file safely. As with SQLite's POSIX locking, two connections to
 the same file inside one process interfere: closing either releases the
-other's locks. Open one connection per file per process.
+other's locks. Open one connection per file per process. (In WAL mode the
+engine at least keeps a second connection of the same process from resetting
+the `-shm` index or deleting the log under the first.) The WAL index is
+written in the host's byte order, as SQLite does, so it is shared only
+between processes on the same machine.
 
 ## Complete API reference
 
