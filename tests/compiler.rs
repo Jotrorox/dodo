@@ -2281,6 +2281,178 @@ fn main() -> i32 { score(-128i8) + score(127i8) }
 }
 
 #[test]
+fn pattern_codegen_integer_switch_keeps_first_match_order() {
+    // Leading integer-literal arms become one `switch`; shadowed values keep
+    // their first arm, and a guard or a wide range continues as tests.
+    native_at_all_levels(
+        r#"package switch_dispatch
+fn classify(op: u32) -> i32 {
+    match op {
+        0 => 1,
+        1 | 2 => 2,
+        2 => 99,
+        3..=5 => 3,
+        4 => 98,
+        x if x == 6 => 4,
+        7 => 5,
+        300..=1000 => 6,
+        8 => 8,
+        _ => 7,
+    }
+}
+fn byte(b: u8) -> i32 {
+    match b { 0..=127 => 1, 128..=254 => 2, 255 => 3 }
+}
+fn signed(v: i64) -> i32 {
+    match v {
+        -3 => 1,
+        -2..=2 => 2,
+        9223372036854775807 => 3,
+        -9223372036854775808 => 4,
+        10..20 => 5,
+        _ => 6,
+    }
+}
+fn by_ref(v: &i32) -> i32 {
+    match v { 1 => 10, 2 => 20, 3 => 30, _ => 0 }
+}
+fn statement(v: u16) -> i32 {
+    r := 0i32
+    match v {
+        1 => { r = 1 },
+        2 => { return 2 },
+        3 => { r = 3 },
+        _ => {},
+    }
+    return r
+}
+fn main() -> i32 {
+    if classify(0) != 1 || classify(1) != 2 || classify(2) != 2 || classify(3) != 3 { return 1 }
+    if classify(4) != 3 || classify(5) != 3 || classify(6) != 4 || classify(7) != 5 { return 2 }
+    if classify(8) != 8 || classify(300) != 6 || classify(1000) != 6 || classify(1001) != 7 { return 3 }
+    if classify(299) != 7 || classify(4000000000) != 7 { return 4 }
+    if byte(0) != 1 || byte(127) != 1 || byte(128) != 2 || byte(254) != 2 || byte(255) != 3 { return 5 }
+    if signed(-3) != 1 || signed(-2) != 2 || signed(2) != 2 || signed(3) != 6 { return 6 }
+    if signed(9223372036854775807) != 3 || signed(-9223372036854775807 - 1) != 4 { return 7 }
+    if signed(10) != 5 || signed(19) != 5 || signed(20) != 6 || signed(-4) != 6 { return 8 }
+    x := 2i32
+    if by_ref(&x) != 20 || statement(1) != 1 || statement(2) != 2 || statement(3) != 3 || statement(4) != 0 { return 9 }
+    return 42
+}
+"#,
+        42,
+        "",
+    );
+}
+
+fn emit_ir(source: &str, optimization: u8) -> String {
+    let workspace = Workspace::new();
+    let source = workspace.source(source);
+    let path = workspace.0.join("program.ll");
+    let output = workspace
+        .compiler()
+        .arg("build")
+        .arg(source)
+        .args(["--emit", "llvm-ir", "-O", &optimization.to_string(), "-o"])
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert_success(&output, "emit LLVM IR");
+    fs::read_to_string(path).unwrap()
+}
+
+#[test]
+fn pattern_codegen_integer_arms_dispatch_through_one_switch() {
+    let ir = emit_ir(
+        r#"package dispatch
+pub fn run(op: u32) -> i32 {
+    match op {
+        0 => 10,
+        1 => 11,
+        2 | 3 => 12,
+        4..=6 => 13,
+        _ => 0,
+    }
+}
+"#,
+        0,
+    );
+    let function = ir
+        .split("define ")
+        .find(|f| f.contains("@dodo.dispatch.run("))
+        .expect("run is defined");
+    assert_eq!(function.matches("switch i32").count(), 1, "{function}");
+    assert!(!function.contains("icmp eq i32"), "{function}");
+}
+
+#[test]
+fn inlining_attributes_reach_llvm() {
+    let source = r#"package inlining
+@inline
+fn add1(x: i64) -> i64 { return x + 1 }
+@inline(never)
+pub fn twice(x: i64) -> i64 { return x * 2 }
+@cold
+pub fn fail(x: i64) -> i64 { return x - 1 }
+struct P {
+    v: i64
+    @inline(never)
+    pub fn get(self: &P) -> i64 { return self.v }
+}
+pub fn main() -> i32 {
+    p := P { v: 20 }
+    x := add1(twice(p.get()))
+    if x > 100 { x = fail(x) }
+    return x as i32
+}
+"#;
+    let ir = emit_ir(source, 2);
+    let attributes = |name: &str| {
+        let define = ir
+            .lines()
+            .find(|line| {
+                line.starts_with("define") && line.contains(&format!("@dodo.inlining.{name}("))
+            })
+            .unwrap_or_else(|| panic!("{name} is defined:\n{ir}"));
+        let group = define.rsplit('#').next().unwrap().trim_end_matches(" {");
+        ir.lines()
+            .find(|line| line.starts_with(&format!("attributes #{group} ")))
+            .unwrap()
+            .to_string()
+    };
+    assert!(attributes("twice").contains("noinline"));
+    assert!(attributes("P.get").contains("noinline"));
+    let cold = attributes("fail");
+    assert!(cold.contains("cold") && cold.contains("noinline"), "{cold}");
+    assert!(
+        !ir.lines()
+            .any(|line| line.starts_with("define") && line.contains("@dodo.inlining.add1(")),
+        "@inline function was not inlined:\n{ir}"
+    );
+    native_at_all_levels(&source.replace("pub fn main", "fn main"), 41, "");
+}
+
+#[test]
+fn inlining_attributes_require_function_bodies() {
+    rejects(
+        "package bad\n@inline\nconst X: i32 = 1\nfn main() -> void {}\n",
+        "@inline and @cold apply only to functions",
+    );
+    rejects(
+        "package bad\n@inline(always)\nfn f() -> void {}\nfn main() -> void {}\n",
+        "expected @inline or @inline(never)",
+    );
+    rejects(
+        "package bad\n@cold\nunsafe extern \"C\" fn abs(x: i32) -> i32\nfn main() -> void {}\n",
+        "@inline and @cold apply only to functions with a body",
+    );
+    rejects(
+        "package bad\n@inline\n@cold\nfn f() -> void {}\nfn main() -> void {}\n",
+        "duplicate inlining attribute",
+    );
+}
+
+#[test]
 fn pattern_codegen_recursive_reference_fields_preserve_mutability() {
     native_at_all_levels(
         r#"package reference_fields

@@ -504,6 +504,7 @@ impl Checker<'_> {
             interrupt: None,
             link_name: None,
             placement: Placement::default(),
+            inlining: Inlining::Auto,
         };
         let mut checker = Checker::new(self.context, closure.ret.clone());
         checker.recover = self.recover;

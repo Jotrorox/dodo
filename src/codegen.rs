@@ -13,6 +13,13 @@ use llvm_sys::{
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
+/// A `match` with at least this many integer-literal cases in its leading
+/// arms is dispatched through one LLVM `switch`.
+const MIN_SWITCH_CASES: usize = 3;
+/// Integer range patterns spanning fewer values than this are expanded into
+/// switch cases; a wider range ends the switched prefix of a match.
+const MAX_SWITCH_RANGE: i128 = 256;
+
 mod c_abi;
 mod closures;
 mod debug;
@@ -718,6 +725,19 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                 );
             }
             self.apply_placement(function, &f.placement, f.body.is_some(), 1)?;
+            let inlining: &[&str] = match f.inlining {
+                Inlining::Auto => &[],
+                Inlining::Always => &["alwaysinline"],
+                Inlining::Never => &["noinline"],
+                Inlining::Cold => &["cold", "noinline"],
+            };
+            for name in inlining {
+                function.add_attribute(
+                    AttributeLoc::Function,
+                    self.context
+                        .create_enum_attribute(Attribute::get_named_enum_kind_id(name), 0),
+                );
+            }
             self.functions.insert(f.name.clone(), function);
         }
         Ok(())
@@ -4215,12 +4235,106 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             .unwrap()
             .sort_by_key(|binding| names.iter().position(|name| *name == binding.name));
     }
+    /// Integer values selected by an arm that can join a `switch`: no guard,
+    /// and every alternative is an integer literal or a small range. Values
+    /// are u64 bit patterns like `Pattern::Int`.
+    fn switch_arm_values(arm: &MatchArm, signed: bool) -> Option<Vec<u64>> {
+        if arm.guard.is_some() {
+            return None;
+        }
+        let mut values = vec![];
+        for pattern in Self::pattern_alternatives(&arm.pattern) {
+            match pattern {
+                Pattern::Int(value) => values.push(value),
+                Pattern::Range(lower, upper, inclusive) => {
+                    let widen = |v: u64| if signed { v as i64 as i128 } else { v as i128 };
+                    let lower = widen(lower);
+                    let upper = widen(upper) - if inclusive { 0 } else { 1 };
+                    if upper - lower >= MAX_SWITCH_RANGE {
+                        return None;
+                    }
+                    values.extend((lower..=upper).map(|v| v as u64));
+                }
+                _ => return None,
+            }
+        }
+        Some(values)
+    }
+    /// Dispatch the leading run of integer-literal arms of a match with one
+    /// `switch` (the first arm listing a value wins, as in the test chain).
+    /// Returns how many arms it emitted; the caller continues with the test
+    /// chain for the rest from the switch's default block. A chain of
+    /// compares is left to LLVM to rebuild, which it only does partially for
+    /// large matches such as interpreter dispatch loops.
+    #[allow(clippy::too_many_arguments)]
+    fn match_switch_prefix(
+        &mut self,
+        arms: &[MatchArm],
+        ptr: Value<'ctx>,
+        actual: &Type,
+        borrowed: Option<bool>,
+        owner: &Option<Binding<'ctx>>,
+        end: BasicBlock<'ctx>,
+        reaches_end: &mut bool,
+    ) -> Result<usize> {
+        let probe = Pattern::Int(0);
+        let (place, ty, _) = self.pattern_place(&probe, ptr, actual, None)?;
+        let Type::Int { signed, .. } = ty else {
+            return Ok(0);
+        };
+        let arm_values: Vec<Vec<u64>> = arms
+            .iter()
+            .map_while(|arm| Self::switch_arm_values(arm, signed))
+            .collect();
+        if arm_values.iter().map(Vec::len).sum::<usize>() < MIN_SWITCH_CASES {
+            return Ok(0);
+        }
+        let value_ir = self.load(place, &ty)?;
+        let int_type = value_ir.get_type();
+        let bits = int_type.get_bit_width();
+        let mask = if bits < u64::BITS {
+            (1u64 << bits) - 1
+        } else {
+            u64::MAX
+        };
+        let default = self.bb("match.next");
+        let mut seen = HashSet::new();
+        let mut cases = vec![];
+        let mut targets = vec![];
+        for values in &arm_values {
+            let yes = self.bb("match.pattern");
+            for value in values {
+                if seen.insert(value & mask) {
+                    cases.push((int_type.const_int(*value, false), yes));
+                }
+            }
+            targets.push(yes);
+        }
+        self.builder.build_switch(value_ir, default, &cases)?;
+        for (arm, yes) in arms.iter().zip(targets) {
+            self.builder.position_at_end(yes);
+            self.push_scope();
+            self.pattern_commit(owner)?;
+            self.pattern_bind(&probe, ptr, actual, borrowed, false, None)?;
+            self.block(&arm.body)?;
+            if !self.terminated() {
+                self.cleanup_to(self.scopes.len() - 1)?;
+                self.builder.build_unconditional_branch(end)?;
+                *reaches_end = true;
+            }
+            self.pop_scope();
+        }
+        self.builder.position_at_end(default);
+        Ok(arm_values.len())
+    }
     fn match_stmt(&mut self, value: &Expr, arms: &[MatchArm]) -> Result<()> {
         self.push_scope();
         let (ptr, actual, borrowed, owner) = self.pattern_value(value)?;
         let end = self.bb("match.end");
         let mut reaches_end = false;
-        for arm in arms {
+        let switched =
+            self.match_switch_prefix(arms, ptr, &actual, borrowed, &owner, end, &mut reaches_end)?;
+        for arm in &arms[switched..] {
             let binding_order = arm.pattern.bindings();
             for pattern in Self::pattern_alternatives(&arm.pattern) {
                 let yes = self.bb("match.pattern");

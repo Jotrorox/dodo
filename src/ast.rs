@@ -550,6 +550,22 @@ pub struct Function {
     /// different signatures, as Objective-C does with `objc_msgSend`.
     pub link_name: Option<String>,
     pub placement: Placement,
+    /// `@inline`, `@inline(never)` or `@cold`.
+    pub inlining: Inlining,
+}
+/// Inlining request of a function with a body, applied by optimized builds.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Inlining {
+    /// The optimizer decides.
+    #[default]
+    Auto,
+    /// `@inline`: inline into every caller where possible.
+    Always,
+    /// `@inline(never)`: keep calls as calls.
+    Never,
+    /// `@cold`: rarely executed; never inlined, and paths that call it are
+    /// laid out and optimized as unlikely.
+    Cold,
 }
 impl Function {
     /// The C symbol of an extern function: its `@link_name`, or its own name.
