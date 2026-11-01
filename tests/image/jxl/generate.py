@@ -13,8 +13,10 @@ cjxl (libjxl 0.12) in many configurations, decodes each with djxl, and writes:
 
 Run from anywhere:  python3 tests/image/jxl/generate.py [OUTDIR]
 Needs cjxl, djxl and ffmpeg (JPEG sources) on PATH; the tests themselves do
-not. The splines fixture is written by this script (cjxl never emits
-splines) and decoded by djxl like the others.
+not. The splines, YCbCr and frame window fixtures are written by this
+script (cjxl never emits them) and decoded by djxl like the others (the
+frame_huge and ref_huge cases, too large for djxl, decode like frame_big
+and ref_patches).
 """
 import math, os, struct, subprocess, sys, zlib, random, tempfile
 
@@ -298,6 +300,405 @@ def ycbcr_jxl(path, w, h, modes, extra=0):
     wr.pad()
     open(path, 'wb').write(wr.data() + section)
 
+# Multi-frame codestreams with frames larger than the image, offset frames
+# and reference-only frames read by patches (cjxl writes none of these).
+# Modular 8-bit RGB frames whose samples come from an MA tree with zero
+# residuals: the leaves' code has a single symbol, so channel data costs
+# no bits and a frame of any size takes a few bytes per group.
+
+CROP_DIST = [(0, 8), (256, 11), (2304, 14), (18688, 30)]
+TOC_DIST = [(0, 10), (1024, 14), (17408, 22), (4211712, 30)]
+
+def u32d(w, v, dists):
+    for sel, (off, bits) in enumerate(dists):
+        if v >= off and v - off < (1 << bits):
+            w.u(2, sel); w.u(bits, v - off)
+            return
+    raise ValueError(v)
+
+def zero_code(w, ndist):
+    """A Code whose single cluster always yields symbol 0 (no bits)."""
+    w.u(1, 0)                         # no LZ77
+    if ndist > 1:
+        w.u(1, 1); w.u(2, 0)          # simple context map: all cluster 0
+    w.u(1, 1)                         # prefix codes
+    w.u(4, 0)                         # hybrid config split 0
+    w.u(1, 0)                         # alphabet of one symbol
+
+def tree_tokens(s, tree):
+    """An MA tree from nested tuples ('split', property, value, gt, le) and
+    ('leaf', predictor, offset), in breadth-first order."""
+    spline_code(s, 6)
+    queue = [tree]
+    leaves = 0
+    while queue:
+        node = queue.pop(0)
+        if node[0] == 'split':
+            spline_uint(s, node[1] + 1); spline_uint(s, packed(node[2]))
+            queue.append(node[3]); queue.append(node[4])
+        else:
+            spline_uint(s, 0); spline_uint(s, node[1]); spline_uint(s, packed(node[2]))
+            spline_uint(s, 0); spline_uint(s, 0)
+            leaves += 1
+    zero_code(s, leaves)
+
+def frame_jxl_header(w, iw, ih):
+    w.u(8, 0xFF); w.u(8, 0x0A)
+    w.u(1, 0); w.u(2, 1); w.u(13, ih - 1)
+    w.u(3, 0); w.u(2, 1); w.u(13, iw - 1)
+    w.u(1, 0); w.u(1, 0)              # metadata: not default, no extra fields
+    w.u(1, 0); w.u(2, 0)              # integer samples, 8 bits
+    w.u(1, 1); w.u(2, 0)              # 16-bit buffers, no extra channels
+    w.u(1, 0); w.u(1, 1); w.u(2, 0)   # not XYB, sRGB, no extensions
+    w.u(1, 1)                         # default transform data
+    w.pad()
+
+def frame_jxl_frame(w, iw, ih, f):
+    """One frame. f: dict with type (0 regular, 2 reference-only), crop
+    (x0, y0, width, height) or None, last, save (slot), before (save before
+    the color transform), tree, patches (list of (slot, rx, ry, pw, ph,
+    [(x, y)...])), group_shift."""
+    ftype = f.get('type', 0)
+    gshift = f.get('group_shift', 1)
+    crop = f.get('crop')
+    fw, fh = (crop[2], crop[3]) if crop else (iw, ih)
+    x0, y0 = (crop[0], crop[1]) if crop else (0, 0)
+    last = f.get('last', False)
+    patches = f.get('patches')
+    w.u(1, 0); w.u(2, ftype); w.u(1, 1)
+    if patches:
+        w.u(2, 1); w.u(4, 1)          # flags: patches
+    else:
+        w.u(2, 0)
+    w.u(1, 0)                         # not YCbCr
+    w.u(2, 0)                         # upsampling 1
+    w.u(2, gshift)
+    if ftype != 2:
+        w.u(2, 0)                     # one pass
+    w.u(1, 1 if crop else 0)
+    if crop:
+        if ftype != 2:
+            u32d(w, packed(x0), CROP_DIST); u32d(w, packed(y0), CROP_DIST)
+        u32d(w, fw, CROP_DIST); u32d(w, fh, CROP_DIST)
+    partial = crop is not None and ftype != 2 and (x0 > 0 or y0 > 0 or x0 + fw < iw or y0 + fh < ih)
+    if ftype in (0, 3):
+        w.u(2, 0)                     # replace
+        if partial:
+            w.u(2, f.get('source', 0))
+        w.u(1, 1 if last else 0)
+    if not last:
+        w.u(2, f.get('save', 0))
+        if (ftype in (0, 3) and not partial) or ftype == 2:
+            w.u(1, 1 if f.get('before') else 0)
+    w.u(2, 0)                         # no name
+    w.u(1, 0); w.u(1, 0); w.u(2, 0); w.u(2, 0)  # no Gaborish, no EPF
+    w.u(2, 0)                         # no extensions
+    # Sections.
+    gd = 128 << gshift
+    gx = (fw + gd - 1) // gd
+    gy = (fh + gd - 1) // gd
+    lgx = (fw + 8 * gd - 1) // (8 * gd)
+    lgy = (fh + 8 * gd - 1) // (8 * gd)
+    s = BitWriter()
+    if patches:
+        spline_code(s, 10)
+        spline_uint(s, len(patches))
+        for slot, rx, ry, pw, ph, places in patches:
+            spline_uint(s, slot); spline_uint(s, rx); spline_uint(s, ry)
+            spline_uint(s, pw - 1); spline_uint(s, ph - 1)
+            spline_uint(s, len(places) - 1)
+            px, py = 0, 0
+            for k, (x, y) in enumerate(places):
+                if k == 0:
+                    spline_uint(s, x); spline_uint(s, y)
+                else:
+                    spline_uint(s, packed(x - px)); spline_uint(s, packed(y - py))
+                px, py = x, y
+                spline_uint(s, 1)     # replace
+    s.u(1, 1)                         # default LF dequantization
+    s.u(1, 1)                         # global tree
+    tree_tokens(s, f['tree'])
+    s.u(1, 1); s.u(1, 1); s.u(2, 0)   # global tree, default WP, no transforms
+    sections = [s.data()]
+    if gx * gy > 1:
+        sections += [b''] * (lgx * lgy)   # LF groups: no channels
+        sections += [b'']                 # HfGlobal
+        g = BitWriter()
+        g.u(1, 1); g.u(1, 1); g.u(2, 0)
+        sections += [g.data()] * (gx * gy)
+    w.u(1, 0); w.pad()                # TOC, not permuted
+    for sec in sections:
+        u32d(w, len(sec), TOC_DIST)
+    w.pad()
+    return b''.join(sections)
+
+def frames_jxl(path, iw, ih, frames):
+    w = BitWriter()
+    frame_jxl_header(w, iw, ih)
+    out = b''
+    for f in frames:
+        # Frames start byte aligned: header + TOC, then the sections.
+        hw = BitWriter()
+        data = frame_jxl_frame(hw, iw, ih, f)
+        out += hw.data() + data
+    open(path, 'wb').write(w.data() + out)
+
+# Sample patterns: group-local coordinates (properties 2 = y, 3 = x).
+BASE_TREE = ('split', 0, 1, ('leaf', 0, 90), ('split', 0, 0, ('leaf', 0, 140), ('leaf', 0, 60)))
+
+def stripes(prop, thresholds, values):
+    """Constant leaves over the intervals of `prop` split at `thresholds`."""
+    if len(values) == 1:
+        return ('leaf', 0, values[0])
+    mid = len(thresholds) // 2
+    return ('split', prop, thresholds[mid], stripes(prop, thresholds[mid + 1:], values[mid + 1:]), stripes(prop, thresholds[:mid], values[:mid + 1]))
+
+SPRITE_TREE = ('split', 0, 1,
+               ('split', 3, 110, stripes(2, [62, 66, 152, 158], [20, 230, 70, 250, 140]), stripes(3, [20, 104, 108], [200, 40, 180, 90])),
+               ('split', 0, 0, stripes(2, [10, 40, 64, 70, 74, 155, 160, 170], [15, 95, 175, 35, 255, 115, 55, 205, 135]),
+                stripes(3, [16, 48, 96, 112, 124, 140, 205, 215, 300], [240, 30, 160, 80, 210, 10, 130, 60, 190, 100])))
+
+def frame_cases():
+    """The frame window cases; returns names to add as lossless cases."""
+    iw, ih = 64, 48
+    base = {'tree': BASE_TREE, 'save': 0}
+    def over(crop, tree=SPRITE_TREE):
+        return [dict(base), {'tree': tree, 'crop': crop, 'last': True}]
+    # A frame much larger than the image (decoded over its visible part),
+    # the same visible part from a frame of 6e8 pixels, and a frame starting
+    # left of and above the image.
+    frames_jxl(os.path.join(OUT, 'frame_big.jxl'), iw, ih, over((10, 6, 3000, 2000)))
+    frames_jxl(os.path.join(OUT, 'frame_huge.jxl'), iw, ih, over((10, 6, 30000, 20000)))
+    frames_jxl(os.path.join(OUT, 'frame_negative.jxl'), iw, ih, over((-40, -30, 1500, 1100)))
+    # A reference-only frame larger than the image, read by patches near
+    # its origin; and the same from a 6e8-pixel reference frame.
+    def ref(size):
+        return [dict(base), {'type': 2, 'tree': SPRITE_TREE, 'crop': (0, 0, size[0], size[1]), 'save': 1, 'before': True},
+                {'tree': BASE_TREE, 'last': True, 'patches': [(1, 100, 60, 30, 20, [(5, 5), (30, 26)]), (1, 200, 150, 20, 18, [(40, 20)])]}]
+    frames_jxl(os.path.join(OUT, 'ref_patches.jxl'), iw, ih, ref((4000, 3000)))
+    frames_jxl(os.path.join(OUT, 'ref_huge.jxl'), iw, ih, ref((30000, 20000)))
+
+
+class BitReader:
+    def __init__(self, data, pos=0):
+        self.data = data
+        self.bit = pos * 8
+    def u(self, n):
+        v = 0
+        for i in range(n):
+            byte = self.data[self.bit >> 3] if (self.bit >> 3) < len(self.data) else 0
+            v |= ((byte >> (self.bit & 7)) & 1) << i
+            self.bit += 1
+        return v
+    def u32(self, dists):
+        off, bits = dists[self.u(2)]
+        return off + self.u(bits)
+    def u64(self):
+        sel = self.u(2)
+        if sel == 0:
+            return 0
+        if sel == 1:
+            return 1 + self.u(4)
+        if sel == 2:
+            return 17 + self.u(8)
+        v = self.u(12)
+        shift = 12
+        while self.u(1):
+            if shift == 60:
+                v |= self.u(4) << 60
+                break
+            v |= self.u(8) << shift
+            shift += 8
+        return v
+    def pad(self):
+        self.bit = (self.bit + 7) & ~7
+
+def unpack_signed(v):
+    return v >> 1 if v % 2 == 0 else -((v + 1) >> 1)
+
+def parse_frame(data, pos, iw, ih, xyb=True, animated=True):
+    """Parse a frame header and TOC (no extra channels, no timecodes) of a
+    cjxl file; returns (frame end, header dict)."""
+    r = BitReader(data, pos)
+    f = {'type': 0, 'modular': 0, 'w': iw, 'h': ih, 'x0': 0, 'y0': 0, 'passes': 1, 'up': 1, 'gshift': 1, 'lf_level': 0}
+    if not r.u(1):
+        f['type'] = r.u(2)
+        f['modular'] = r.u(1)
+        f['flags'] = r.u64()
+        if not xyb:
+            f['ycbcr'] = r.u(1)
+            assert not f['ycbcr']
+        if not (f['flags'] & 32):
+            f['up'] = [1, 2, 4, 8][r.u(2)]
+        if f['modular']:
+            f['gshift'] = r.u(2)
+        if not f['modular'] and xyb:
+            r.u(3); r.u(3)
+        if f['type'] != 2:
+            f['passes'] = r.u32([(1, 0), (2, 0), (3, 0), (4, 3)])
+            if f['passes'] != 1:
+                nds = r.u32([(0, 0), (1, 0), (2, 0), (3, 1)])
+                for _ in range(f['passes'] - 1):
+                    r.u(2)
+                for _ in range(nds):
+                    r.u32([(1, 0), (2, 0), (4, 0), (8, 0)])
+                for _ in range(nds):
+                    r.u32([(0, 0), (1, 0), (2, 0), (0, 3)])
+        if f['type'] == 1:
+            f['lf_level'] = r.u32([(1, 0), (2, 0), (3, 0), (4, 0)])
+        if f['type'] != 1:
+            if r.u(1):
+                if f['type'] != 2:
+                    f['x0'] = unpack_signed(r.u32(CROP_DIST))
+                    f['y0'] = unpack_signed(r.u32(CROP_DIST))
+                f['w'] = r.u32(CROP_DIST)
+                f['h'] = r.u32(CROP_DIST)
+        partial = f['x0'] > 0 or f['y0'] > 0 or f['x0'] + f['w'] < iw or f['y0'] + f['h'] < ih
+        last = False
+        mode = 0
+        if f['type'] in (0, 3):
+            mode = r.u32([(0, 0), (1, 0), (2, 0), (3, 2)])
+            if mode == 4:
+                r.u(1)
+            if mode != 0 or partial:
+                r.u(2)
+            if animated:
+                f['duration'] = r.u32([(0, 0), (1, 0), (0, 8), (0, 32)])
+            last = r.u(1)
+        f['last'] = last
+        save = 0
+        if f['type'] != 1 and not last:
+            save = r.u(2)
+        can_ref = not last and f['type'] != 1 and (f.get('duration', 0) == 0 or save != 0)
+        if can_ref and f['type'] in (0, 3) and mode == 0 and not partial:
+            r.u(1)
+        elif f['type'] == 2:
+            r.u(1)
+        name_len = r.u32([(0, 0), (0, 4), (16, 5), (48, 10)])
+        r.u(8 * name_len)
+        if not r.u(1):                # restoration filter
+            gab = r.u(1)
+            if gab and r.u(1):
+                r.u(16 * 6)
+            epf = r.u(2)
+            if epf:
+                if not f['modular'] and r.u(1):
+                    r.u(16 * 8)
+                if r.u(1):
+                    r.u(16 * 5)
+                if r.u(1):
+                    if not f['modular']:
+                        r.u(16)
+                    r.u(16 * 3)
+                if f['modular']:
+                    r.u(16)
+            ext = r.u64()
+            assert ext == 0
+        ext = r.u64()
+        assert ext == 0
+    else:
+        f['last'] = True
+    return r, f
+
+def toc_end(data, bit, f):
+    """The end of the frame whose TOC starts at `bit`, or None."""
+    r = BitReader(data)
+    r.bit = bit
+    gd = 128 << f['gshift'] if f['modular'] else 256
+    sw = (f['w'] + f['up'] - 1) // f['up']
+    sh = (f['h'] + f['up'] - 1) // f['up']
+    gx, gy = (sw + gd - 1) // gd, (sh + gd - 1) // gd
+    lgx, lgy = (sw + 8 * gd - 1) // (8 * gd), (sh + 8 * gd - 1) // (8 * gd)
+    n = 1 if gx * gy == 1 and f['passes'] == 1 else 2 + lgx * lgy + gx * gy * f['passes']
+    if r.u(1):
+        return None                   # permuted
+    r.pad()
+    total = 0
+    for _ in range(n):
+        total += r.u32(TOC_DIST)
+    r.pad()
+    return (r.bit >> 3) + total
+
+def split_frames(data, start, iw, ih):
+    """Byte ranges and headers of the frames of a cjxl animation."""
+    frames = []
+    pos = start
+    while True:
+        r, f = parse_frame(data, pos, iw, ih)
+        end = toc_end(data, r.bit, f)
+        if end is None or end > len(data):
+            raise ValueError('cannot split frames')
+        frames.append((pos, end, f))
+        pos = end
+        if f['last']:
+            return frames
+
+def write_apng_rgb(name, w, h, frames, delays, offsets):
+    """An RGB APNG: frames of (fw, fh, pix), replace blending, no disposal."""
+    out = b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 2, 0, 0, 0))
+    out += chunk(b'acTL', struct.pack('>II', len(frames), 0))
+    seq = 0
+    for i, (fw, fh, pix) in enumerate(frames):
+        ox, oy = offsets[i]
+        out += chunk(b'fcTL', struct.pack('>IIIIIHHBB', seq, fw, fh, ox, oy, delays[i], 100, 0, 0))
+        seq += 1
+        raw = bytearray()
+        for y in range(fh):
+            raw.append(0)
+            for x in range(fw):
+                for c in range(3):
+                    raw.append(pix(x, y, c))
+        data = zlib.compress(bytes(raw), 9)
+        if i == 0:
+            out += chunk(b'IDAT', data)
+        else:
+            out += chunk(b'fdAT', struct.pack('>I', seq) + data)
+            seq += 1
+    out += chunk(b'IEND', b'')
+    path = os.path.join(TMP, name + '.png')
+    open(path, 'wb').write(out)
+    return path
+
+def vardct_window_jxl(path, canvas, frame, origin, distance):
+    """A VarDCT frame larger than the image: cjxl encodes an animation whose
+    second frame is cropped (frame size at origin within a larger first
+    frame); that frame is kept alone under a small XYB animation header."""
+    big = (origin[0] + frame[0] + 16, origin[1] + frame[1] + 16)
+    apng = write_apng_rgb('vd_window_src', big[0], big[1],
+                          [(big[0], big[1], lambda x, y, c: photo(x, y, c)),
+                           (frame[0], frame[1], lambda x, y, c: int(128 + 90 * math.sin(x / 37.0 + c) * math.cos(y / 23.0 - c)) if x < 300 and y < 260 else int(128 + 100 * math.sin(x / 140.0 + c) * math.cos(y / 110.0)))],
+                          [10, 10], [(0, 0), origin])
+    tmp = os.path.join(TMP, 'vd_window_src.jxl')
+    run(['cjxl', apng, tmp, '--quiet', '-d', str(distance)])
+    data = open(tmp, 'rb').read()
+    assert data[:2] == b'\xff\x0a'
+    frames = None
+    for start in range(3, 200):
+        try:
+            got = split_frames(data, start, big[0], big[1])
+        except Exception:
+            continue
+        if len(got) == 2 and got[-1][1] == len(data) and got[1][2]['x0'] == origin[0] and got[1][2]['w'] == frame[0] and not got[1][2]['modular']:
+            frames = got
+            break
+    if frames is None:
+        raise SystemExit('cannot split the cjxl animation')
+    w = BitWriter()
+    w.u(8, 0xFF); w.u(8, 0x0A)
+    w.u(1, 0); w.u(2, 1); w.u(13, canvas[1] - 1)
+    w.u(3, 0); w.u(2, 1); w.u(13, canvas[0] - 1)
+    w.u(1, 0); w.u(1, 1)              # metadata: extra fields
+    w.u(3, 0); w.u(1, 0); w.u(1, 0)   # orientation, no intrinsic size or preview
+    w.u(1, 1); w.u(2, 0); w.u(2, 0); w.u(2, 0); w.u(1, 0)  # animation: 100/1 tps, no timecodes
+    w.u(1, 0); w.u(2, 0)              # integer samples, 8 bits
+    w.u(1, 1); w.u(2, 0)              # 16-bit buffers, no extra channels
+    w.u(1, 1); w.u(1, 1)              # XYB, sRGB
+    w.u(1, 1); w.u(2, 0)              # default tone mapping, no extensions
+    w.u(1, 1)                         # default transform data
+    w.pad()
+    start, end, f = frames[1]
+    open(path, 'wb').write(w.data() + data[start:end])
+
 # ----------------------------------------------------------------------------
 # Encoding and references
 
@@ -421,18 +822,42 @@ def add_png(name, source, args, sample, frames=1, srgb=False, jxlref=False):
             open(os.path.join(OUT, ref + '.png'), 'wb').write(data)
             CASES.append((name, ref, w, h, depth, sample, 1, k, 0))
 
-def make_icc():
+def add_file(name, sample=0):
+    """A lossless case for a codestream written here."""
+    jxl = os.path.join(OUT, name + '.jxl')
+    ref = os.path.join(TMP, name)
+    run(['djxl', jxl, ref + '.pam', '--quiet'])
+    w, h, depth, maxval, vals = read_pam(ref + '.pam')
+    CASES.append((name, '', w, h, depth, sample, 0, 0, fnv(native_bytes(vals, maxval, sample))))
+
+def add_alias(name, other):
+    """A case decoding like `other` (too large for djxl to decode)."""
+    c = [c for c in CASES if c[0] == other][0]
+    CASES.append((name,) + c[1:])
+
+def make_icc(big=False):
     """A small RGB matrix/TRC ICC v2 profile with unusual primaries and a
-    gamma curve, so cjxl keeps it as an ICC profile."""
+    gamma curve, so cjxl keeps it as an ICC profile. `big` makes the curves
+    4096-entry tables and adds 20 KB of text (an entropy-coded profile with
+    many clusters and long LZ77 matches)."""
     def s15(v):
         return struct.pack('>i', int(round(v * 65536)))
     def xyz(x, y, z):
         return b'XYZ ' + b'\0' * 4 + s15(x) + s15(y) + s15(z)
     def curve(g):
+        if big:
+            n = 4096
+            body = b''.join(struct.pack('>H', int(65535 * (i / (n - 1)) ** (g + 0.05 * math.sin(i / 300.0)))) for i in range(n))
+            return b'curv' + b'\0' * 4 + struct.pack('>I', n) + body
         return b'curv' + b'\0' * 4 + struct.pack('>I', 1) + struct.pack('>H', int(g * 256)) + b'\0\0'
     desc_text = b'Dodo test RGB\0'
     desc = b'desc' + b'\0' * 4 + struct.pack('>I', len(desc_text)) + desc_text + b'\0' * 4 + b'\0' * 4 + b'\0' * 2 + b'\0' + b'\0' * 67
     text = b'text' + b'\0' * 4 + b'Public domain\0'
+    if big:
+        rng = random.Random(7)
+        words = [bytes(rng.choice(b'abcdefghijklmnopqrstuvwxyz0123456789.') for _ in range(rng.randrange(2, 9))) for _ in range(400)]
+        prose = b' '.join(rng.choice(words) for _ in range(6500))
+        text = b'text' + b'\0' * 4 + prose[:20000] + b'\0'
     tags = [(b'desc', desc), (b'cprt', text), (b'wtpt', xyz(0.9642, 1.0, 0.8249)),
             (b'rXYZ', xyz(0.48, 0.26, 0.02)), (b'gXYZ', xyz(0.33, 0.66, 0.11)), (b'bXYZ', xyz(0.15, 0.08, 0.69)),
             (b'rTRC', curve(2.1)), (b'gTRC', curve(2.1)), (b'bTRC', curve(2.1))]
@@ -505,6 +930,8 @@ def main():
     add('depth12', rgb16, ['-d', '0', '--override_bitdepth=12'], 1)
     add('premultiplied', rgba, ['-d', '0', '--premultiply=1'], 0)
     add('patches_text', text, ['-d', '0', '-e', '7', '--patches=1'], 0)
+    # Center-first group order: permuted TOCs.
+    add('big_group_order', big, ['-d', '0', '-e', '3', '--group_order=1'], 0)
 
     # The float pipeline: XYB, upsampling, blending, animation.
     add_png('lossy_d1', rgb, ['-m', '1', '-d', '1'], 0)
@@ -561,6 +988,7 @@ def main():
     add_png('vd_noise', ph, ['-d', '1', '--photon_noise_iso=3200'], 0, jxlref=True)
     add_png('vd_upsample2', ph, ['-d', '1', '--resampling=2'], 0, jxlref=True)
     add_png('vd_epf3', ph, ['-d', '2', '--epf=3'], 0, jxlref=True)
+    add_png('vd_group_order', big_edges, ['-d', '2', '--group_order=1'], 0, jxlref=True)
     vd_frames = [(64, 48, lambda x, y, c, k=k: photo(x + 9 * k, y, c) if c < 3 else 255) for k in range(3)]
     vd_anim = write_apng('vd_anim', 64, 48, vd_frames, [10, 10, 10])
     add_png('vd_anim', vd_anim, ['-d', '1'], 0, frames=3, jxlref=True)
@@ -586,6 +1014,17 @@ def main():
     ycbcr_jxl(os.path.join(OUT, 'many_extra.jxl'), 21, 13, [0, 0, 0], 20)
     add_png('many_extra', None, [], 0)
 
+    # Frame windows: frames larger than the image or starting outside it,
+    # and reference-only frames read by patches (written here).
+    frame_cases()
+    add_file('frame_big')
+    add_alias('frame_huge', 'frame_big')
+    add_file('frame_negative')
+    add_file('ref_patches')
+    add_alias('ref_huge', 'ref_patches')
+    vardct_window_jxl(os.path.join(OUT, 'vd_window.jxl'), (160, 120), (1400, 1100), (40, 30), 2)
+    add_png('vd_window', None, [], 0, jxlref=True)
+
     # Metadata and color.
     w, h = 23, 17
     exif = b'MM\x00\x2a\x00\x00\x00\x08\x00\x01\x01\x12\x00\x03\x00\x00\x00\x01\x00\x01\x00\x00\x00\x00\x00\x00'
@@ -598,6 +1037,12 @@ def main():
     iccp = chunk(b'iCCP', b'test\x00\x00' + zlib.compress(icc))
     with_icc = write_png('icc', 31, 19, 3, 8, smooth_noise, iccp)
     add('icc_lossless', with_icc, ['-d', '0'], 0)
+    # A 45 KB profile: an ICC stream with many prefix-coded clusters and
+    # long LZ77 matches.
+    big_icc = make_icc(True)
+    open(os.path.join(OUT, 'profile_big.icc'), 'wb').write(big_icc)
+    with_big_icc = write_png('icc_big', 31, 19, 3, 8, smooth_noise, chunk(b'iCCP', b'test\x00\x00' + zlib.compress(big_icc)))
+    add('icc_big', with_big_icc, ['-d', '0'], 0)
     # XYB with an ICC profile decodes to sRGB.
     add_png('icc_lossy', with_icc, ['-m', '1', '-d', '1'], 0, srgb=True)
 

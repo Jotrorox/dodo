@@ -1,0 +1,1199 @@
+package jxl
+
+import "std/image/pixels"
+
+// Entropy decoding in small fixed storage, for the walks that run without
+// caller scratch: info(), metadata(), frame_info(), scratch_size() and the
+// planning pass of decode() skip the entropy-coded ICC profile and permuted
+// TOCs and read patch dictionaries, MA trees and splines with it. Its
+// whole state is 16 KiB of stack (a 4 KiB table cache and a 12 KiB window)
+// plus about 1 KiB per Code being read:
+//
+// * A SkCode keeps the context map (at most SK_DIST contexts), the
+//   per-cluster hybrid configs and the bit position of each cluster's
+//   prefix code or ANS histogram. Decoding tables are built lazily into a
+//   shared cache of u16 words when a cluster is first used, re-reading
+//   the histogram from the codestream; when the cache is full it is
+//   cleared and rebuilt on demand, so any number of clusters decodes in
+//   bounded storage. Prefix codes are canonical tables (code counts per
+//   length, then the symbols sorted by length; decoding walks the lengths
+//   bit by bit); ANS tables are libjxl's alias tables at 3 words per entry.
+// * The LZ77 window keeps only what a walk needs of each value: 3-bit
+//   classes for the ICC stream (the byte classes its contexts are built
+//   from) and for TOC permutations (the context of the previous entry),
+//   whole values for patch dictionaries, nothing when values are not
+//   needed, or the caller's output buffer itself (icc(), which stores the
+//   whole stream anyway). Copies from farther back than the window keeps
+//   fail TooLarge (ICC, TOC) or report `too_far` (callers fall back).
+
+// Contexts of a stored context map (ICC: 41 plus the LZ77 distance) and
+// clusters of a SkCode.
+const SK_DIST: usize = 42
+const SK_CLUSTERS: usize = 42
+// u16 words of the table cache (two ANS tables of 256 entries, or prefix
+// codes of about 2000 symbols in all; more are rebuilt on demand).
+const SK_CACHE: usize = 2048
+// Bytes of the LZ77 window: 32768 3-bit classes or 2048 whole values.
+const SK_WINDOW: usize = 12288
+
+// Window modes.
+const SK_NONE: u32 = 0
+const SK_FULL: u32 = 1
+const SK_ICC: u32 = 2
+const SK_TOC: u32 = 3
+const SK_STORE: u32 = 4
+
+// Stream error codes.
+const SK_OK: u32 = 0
+const SK_MALFORMED: u32 = 1
+const SK_TOO_LARGE: u32 = 2
+
+// The table cache of a walk (one live SkCode at a time owns it). The
+// window is a separate [SK_WINDOW + 8]u8 buffer.
+struct Skim {
+    cache: [SK_CACHE]u16
+    used: usize
+}
+
+struct SkCode {
+    map: [SK_DIST]u8
+    num_dist: u32
+    num_clusters: u32
+    lz77: bool
+    min_symbol: u32
+    min_length: u32
+    lz_config: u32
+    prefix: bool
+    log_alpha: u32
+    config: [SK_CLUSTERS]u32
+    // Bit position of each cluster's prefix code or histogram.
+    start: [SK_CLUSTERS]u64
+    // Prefix code alphabet size.
+    count: [SK_CLUSTERS]u16
+    // Cache offset + 1 of the built table (0: not built).
+    slot: [SK_CLUSTERS]u16
+    // Symbol + 1 of a cluster that always yields one symbol (no table).
+    single: [SK_CLUSTERS]u16
+    // Cache words of the cluster's table.
+    words: [SK_CLUSTERS]u16
+}
+
+fn new_sk_code() -> SkCode {
+    return SkCode { map: [0u8; SK_DIST], num_dist: 0, num_clusters: 0, lz77: false, min_symbol: 0xffffffff, min_length: 0, lz_config: 0, prefix: false, log_alpha: 0, config: [0u32; SK_CLUSTERS], start: [0u64; SK_CLUSTERS], count: [0u16; SK_CLUSTERS], slot: [0u16; SK_CLUSTERS], single: [0u16; SK_CLUSTERS], words: [0u16; SK_CLUSTERS] }
+}
+
+// The ICC byte class (0 letter, 1 digit or '.' ',', 2 zero, 3 one,
+// 4 up to 15, 5 241 to 254, 6 255, 7 other): the first-byte part of the
+// ICC context; icc_class_p2 maps it to the second-byte part.
+fn icc_class(b: u32) -> u32 {
+    if is_letter(b) {
+        return 0
+    }
+    if is_number(b) {
+        return 1
+    }
+    if b <= 1 {
+        return 2 + b
+    }
+    if b <= 15 {
+        return 4
+    }
+    if b >= 241 && b <= 254 {
+        return 5
+    }
+    if b == 255 {
+        return 6
+    }
+    return 7
+}
+
+fn icc_class_p2(c: u32) -> u32 {
+    if c <= 1 {
+        return c
+    }
+    if c <= 4 {
+        return 2
+    }
+    if c <= 6 {
+        return 3
+    }
+    return 4
+}
+
+// The decoding state of one stream (no references: the window is passed
+// to each call).
+struct SkStream {
+    mode: u32
+    mask: u32
+    state: u32
+    num_to_copy: u32
+    copy_pos: u32
+    num_decoded: u32
+    // The last value came from an LZ77 copy (a class in class modes) of
+    // element `src`.
+    copied: bool
+    src: u32
+    too_far: bool
+    error: u32
+}
+
+// A stream keeping `mode` values in a window of `bytes` bytes.
+fn new_sk_stream(mode: u32, bytes: usize) -> SkStream {
+    entries := 0usize
+    if mode == SK_ICC || mode == SK_TOC {
+        entries = bytes * 8 / 3
+    } else if mode == SK_FULL {
+        entries = bytes / 4
+    }
+    size := 1usize
+    for size * 2 <= entries && size < LZ77_WINDOW_MAX {
+        size *= 2
+    }
+    if entries == 0 {
+        size = 1
+    }
+    return SkStream { mode: mode, mask: (size - 1) as u32, state: 0, num_to_copy: 0, copy_pos: 0, num_decoded: 0, copied: false, src: 0, too_far: false, error: SK_OK }
+}
+
+fn sk_begin(st: &mut SkStream, code: &SkCode, r: &mut Reader) {
+    st.num_to_copy = 0
+    st.copy_pos = 0
+    st.num_decoded = 0
+    st.too_far = false
+    st.state = 0
+    if !code.prefix {
+        low := r.bits(16)
+        st.state = low | (r.bits(16) << 16)
+    }
+}
+
+fn sk_finish(st: &SkStream, code: &SkCode, r: &Reader) -> void!pixels.Error {
+    if st.error == SK_TOO_LARGE || st.too_far {
+        return err(pixels.Error.TooLarge)
+    }
+    if st.error != SK_OK || r.broken {
+        return err(pixels.Error.Malformed)
+    }
+    if r.overrun {
+        return err(pixels.Error.Truncated)
+    }
+    if !code.prefix && st.state != ANS_STATE_FINAL {
+        return err(pixels.Error.Malformed)
+    }
+    return ok()
+}
+
+// Whether the stream is still sound (checked by loops driven by values).
+fn sk_failed(st: &SkStream, r: &Reader) -> bool {
+    return st.error != SK_OK || st.too_far || r.broken || r.overrun
+}
+
+// What the window keeps of `value`.
+fn sk_keep(mode: u32, value: u32) -> u32 {
+    if mode == SK_ICC {
+        return icc_class(value & 255)
+    }
+    if mode == SK_TOC {
+        return permutation_context(value)
+    }
+    return value
+}
+
+fn sk_push(st: &mut SkStream, win: &mut[u8], value: u32) {
+    mode := st.mode
+    if mode == SK_ICC || mode == SK_TOC {
+        bit := (st.num_decoded & st.mask) as usize * 3
+        at := bit >> 3
+        shift := (bit & 7) as u32
+        v := sk_keep(mode, value)
+        pair := (win[at] as u32) | ((win[at + 1] as u32) << 8)
+        pair = (pair & (0xffffffff ^ (7u32 << shift))) | (v << shift)
+        win[at] = (pair & 255) as u8
+        win[at + 1] = ((pair >> 8) & 255) as u8
+    } else if mode == SK_FULL {
+        at := (st.num_decoded & st.mask) as usize * 4
+        win[at] = (value & 255) as u8
+        win[at + 1] = ((value >> 8) & 255) as u8
+        win[at + 2] = ((value >> 16) & 255) as u8
+        win[at + 3] = ((value >> 24) & 255) as u8
+    } else if mode == SK_STORE {
+        at := st.num_decoded as usize
+        if at < win.len {
+            win[at] = (value & 255) as u8
+        }
+    }
+    st.num_decoded = core.wrapping_add(st.num_decoded, 1)
+}
+
+// The next copied element (in the window's representation).
+fn sk_copied(st: &mut SkStream, win: &[u8]) -> u32 {
+    pos := st.copy_pos
+    st.src = pos
+    st.copy_pos = core.wrapping_add(pos, 1)
+    mode := st.mode
+    if pos == st.num_decoded {
+        // Distance 0 (before any symbol): zeros, as in libjxl.
+        return sk_keep(mode, 0)
+    }
+    if mode == SK_ICC || mode == SK_TOC {
+        bit := (pos & st.mask) as usize * 3
+        at := bit >> 3
+        pair := (win[at] as u32) | ((win[at + 1] as u32) << 8)
+        return (pair >> ((bit & 7) as u32)) & 7
+    }
+    if mode == SK_FULL {
+        at := (pos & st.mask) as usize * 4
+        return (win[at] as u32) | ((win[at + 1] as u32) << 8) | ((win[at + 2] as u32) << 16) | ((win[at + 3] as u32) << 24)
+    }
+    if mode == SK_STORE && (pos as usize) < win.len {
+        return win[pos as usize] as u32
+    }
+    return 0
+}
+
+// An integer from context `ctx` (DecodeHybridVarLenUint). Copies set
+// st.copied and yield the window's representation of the value.
+fn sk_read(code: &mut SkCode, sk: &mut Skim, st: &mut SkStream, win: &mut[u8], r: &mut Reader, ctx: u32, dist_mult: u32) -> u32 {
+    if st.num_to_copy > 0 {
+        st.num_to_copy -= 1
+        st.copied = true
+        value := sk_copied(st, win)
+        sk_push_kept(st, win, value)
+        return value
+    }
+    if ctx >= code.num_dist {
+        st.error = SK_MALFORMED
+        return 0
+    }
+    c := code.map[ctx as usize] as u32
+    token := sk_symbol(code, sk, st, r, c)
+    if token >= code.min_symbol {
+        length := hybrid(r, token - code.min_symbol, code.lz_config) as u64 + code.min_length as u64
+        if length > 0xffffffff || length == 0 {
+            st.error = SK_MALFORMED
+            return 0
+        }
+        dc := code.map[(code.num_dist - 1) as usize] as u32
+        dtoken := sk_symbol(code, sk, st, r, dc)
+        distance := hybrid(r, dtoken, code.config[dc as usize]) as u64
+        if dist_mult == 0 {
+            distance += 1
+        } else if distance >= 120 {
+            distance -= 119
+        } else {
+            special := SPECIAL_DISTANCES[distance as usize] as i64
+            d := ((special >> 4) - 7) + dist_mult as i64 * (special & 7)
+            if d < 1 {
+                d = 1
+            }
+            distance = d as u64
+        }
+        if distance > LZ77_WINDOW_MAX as u64 {
+            distance = LZ77_WINDOW_MAX as u64
+        }
+        if distance > st.num_decoded as u64 {
+            distance = st.num_decoded as u64
+        }
+        if st.mode != SK_NONE && st.mode != SK_STORE && distance > st.mask as u64 + 1 {
+            st.too_far = true
+            distance = st.mask as u64 + 1
+        }
+        st.copy_pos = st.num_decoded - distance as u32
+        st.num_to_copy = (length - 1) as u32
+        st.copied = true
+        value := sk_copied(st, win)
+        sk_push_kept(st, win, value)
+        return value
+    }
+    value := hybrid(r, token, code.config[c as usize])
+    st.copied = false
+    if code.lz77 {
+        sk_push(st, win, value)
+    }
+    return value
+}
+
+// Push a value already in the window's representation.
+fn sk_push_kept(st: &mut SkStream, win: &mut[u8], kept: u32) {
+    mode := st.mode
+    if mode == SK_ICC || mode == SK_TOC {
+        bit := (st.num_decoded & st.mask) as usize * 3
+        at := bit >> 3
+        shift := (bit & 7) as u32
+        pair := (win[at] as u32) | ((win[at + 1] as u32) << 8)
+        pair = (pair & (0xffffffff ^ (7u32 << shift))) | ((kept & 7) << shift)
+        win[at] = (pair & 255) as u8
+        win[at + 1] = ((pair >> 8) & 255) as u8
+        st.num_decoded = core.wrapping_add(st.num_decoded, 1)
+        return
+    }
+    sk_push(st, win, kept)
+}
+
+// One token of cluster c (its table built on first use).
+fn sk_symbol(code: &mut SkCode, sk: &mut Skim, st: &mut SkStream, r: &mut Reader, c: u32) -> u32 {
+    ci := c as usize
+    if ci >= code.num_clusters as usize {
+        st.error = SK_MALFORMED
+        return 0
+    }
+    if code.single[ci] != 0 && code.prefix {
+        return code.single[ci] as u32 - 1
+    }
+    if code.slot[ci] == 0 {
+        e := sk_build(code, sk, r, ci)
+        if e != SK_OK {
+            st.error = e
+            return 0
+        }
+    }
+    base := (code.slot[ci] - 1) as usize
+    if code.prefix {
+        v := r.peek(15)
+        first := 0u32
+        index := 0u32
+        cd := 0u32
+        for len in 1u32..16 {
+            cd = cd | ((v >> (len - 1)) & 1)
+            n := sk.cache[base + len as usize] as u32
+            if cd < first + n {
+                r.consume(len)
+                return sk.cache[base + 16 + (index + cd - first) as usize] as u32
+            }
+            index += n
+            first = (first + n) << 1
+            cd = cd << 1
+        }
+        st.error = SK_MALFORMED
+        return 0
+    }
+    state := st.state
+    idx := state & 0xfff
+    shift := 12 - code.log_alpha
+    bucket := (idx >> shift) as usize
+    pos := idx & ((1u32 << shift) - 1)
+    w0 := sk.cache[base + bucket * 3] as u32
+    symbol := bucket as u32
+    extra := 0u32
+    if pos >= (w0 & 255) {
+        symbol = w0 >> 8
+        extra = sk.cache[base + bucket * 3 + 1] as u32
+    }
+    frequency := sk.cache[base + symbol as usize * 3 + 2] as u32
+    state = frequency * (state >> 12) + extra + pos
+    if state < 65536 {
+        state = (state << 16) | r.bits(16)
+    }
+    st.state = state
+    return symbol
+}
+
+// Build the table of cluster ci into the cache, re-reading it from the
+// codestream; clears the cache when it is full.
+fn sk_build(code: &mut SkCode, sk: &mut Skim, r: &mut Reader, ci: usize) -> u32 {
+    need := code.words[ci] as usize
+    if need > SK_CACHE {
+        return SK_TOO_LARGE
+    }
+    if sk.used + need > SK_CACHE {
+        for k in 0usize..SK_CLUSTERS {
+            code.slot[k] = 0
+        }
+        sk.used = 0
+    }
+    base := sk.used
+    resume := r.position()
+    overrun := r.overrun
+    r.seek_bit(code.start[ci])
+    e := SK_OK
+    used := 0usize
+    if code.prefix {
+        match sk_prefix_build(r, code.count[ci] as u32, &mut sk.cache[base..]) {
+            ok(n) => {
+                used = n
+            }
+            err(reason) => {
+                e = sk_code_of(reason)
+            }
+        }
+    } else {
+        match sk_ans(r, code.log_alpha, &mut sk.cache[base..]) {
+            ok(n) => {
+                used = n
+            }
+            err(reason) => {
+                e = sk_code_of(reason)
+            }
+        }
+    }
+    r.seek_bit(resume)
+    r.overrun = overrun
+    if e != SK_OK {
+        return e
+    }
+    sk.used = base + used
+    code.slot[ci] = (base + 1) as u16
+    return SK_OK
+}
+
+fn sk_code_of(reason: pixels.Error) -> u32 {
+    match reason {
+        pixels.Error.TooLarge => {
+            return SK_TOO_LARGE
+        }
+        pixels.Error.BufferTooSmall => {
+            return SK_TOO_LARGE
+        }
+        pixels.Error.Truncated => {
+            return SK_MALFORMED
+        }
+        pixels.Error.Malformed => {
+            return SK_MALFORMED
+        }
+        pixels.Error.Unsupported => {
+            return SK_MALFORMED
+        }
+    }
+}
+
+// Read a Code for `num_dist` contexts: the LZ77 configuration, the context
+// map (nested codes decoded in `sk`), the configs and the position of each
+// cluster's table, validating every table on the way.
+fn sk_read_code(r: &mut Reader, num_dist: u32, code: &mut SkCode, sk: &mut Skim) -> void!pixels.Error {
+    code.num_clusters = 0
+    code.lz77 = r.bit()
+    if code.lz77 {
+        code.min_symbol = r.u32c(dist(224, 0), dist(512, 0), dist(4096, 0), dist(8, 15))
+        code.min_length = r.u32c(dist(3, 0), dist(4, 0), dist(5, 2), dist(9, 8))
+        code.lz_config = read_config(r, 8)?
+    } else {
+        code.min_symbol = 0xffffffff
+        code.min_length = 0
+        code.lz_config = 0
+    }
+    dists := num_dist
+    if code.lz77 {
+        dists += 1
+    }
+    if dists as usize > SK_DIST {
+        return err(pixels.Error.TooLarge)
+    }
+    code.num_dist = dists
+    clusters := sk_cluster_map(r, dists, &mut code.map, true, sk)?
+    if clusters as usize > SK_CLUSTERS {
+        return err(pixels.Error.TooLarge)
+    }
+    code.num_clusters = clusters
+    sk_read_tables(r, code, sk)?
+    sk.used = 0
+    if r.broken {
+        return err(pixels.Error.Malformed)
+    }
+    if r.overrun {
+        return err(pixels.Error.Truncated)
+    }
+    return ok()
+}
+
+// Configs, alphabet sizes and table positions of every cluster; each
+// table is parsed once to validate it and to find the next one.
+fn sk_read_tables(r: &mut Reader, code: &mut SkCode, sk: &mut Skim) -> void!pixels.Error {
+    clusters := code.num_clusters as usize
+    code.prefix = r.bit()
+    for k in 0usize..SK_CLUSTERS {
+        code.slot[k] = 0
+        code.single[k] = 0
+        code.count[k] = 0
+    }
+    sk.used = 0
+    if code.prefix {
+        code.log_alpha = 15
+        for c in 0usize..clusters {
+            code.config[c] = read_config(r, 15)?
+        }
+        for c in 0usize..clusters {
+            count := 1u32
+            if r.bit() {
+                n := r.bits(4)
+                count = 1 + (1u32 << n) + r.bits(n)
+            }
+            if count > 32768 {
+                return err(pixels.Error.Malformed)
+            }
+            code.count[c] = count as u16
+        }
+        for c in 0usize..clusters {
+            code.start[c] = r.position()
+            if code.count[c] == 1 {
+                code.single[c] = 1
+                continue
+            }
+            words := 0u32
+            single := sk_prefix_check(r, code.count[c] as u32, &mut words)?
+            code.single[c] = single as u16
+            code.words[c] = words as u16
+        }
+    } else {
+        code.log_alpha = 5 + r.bits(2)
+        for c in 0usize..clusters {
+            code.config[c] = read_config(r, code.log_alpha)?
+        }
+        for c in 0usize..clusters {
+            code.start[c] = r.position()
+            code.words[c] = sk_ans(r, code.log_alpha, &mut sk.cache)? as u16
+        }
+    }
+    sk.used = 0
+    return ok()
+}
+
+// A context map of `num` entries (stored in map[..num] when `store`);
+// returns the number of clusters (with `store`, checked to be numbered
+// without holes; otherwise the largest entry + 1).
+fn sk_cluster_map(r: &mut Reader, num: u32, map: &mut[u8], store: bool, sk: &mut Skim) -> u32!pixels.Error {
+    if store && num as usize > map.len {
+        return err(pixels.Error.TooLarge)
+    }
+    if num == 1 {
+        if store {
+            map[0] = 0
+        }
+        return ok(1)
+    }
+    highest := 0u32
+    if r.bit() {
+        nbits := r.bits(2)
+        for i in 0usize..num as usize {
+            v := r.bits(nbits)
+            if store {
+                map[i] = v as u8
+            }
+            if v > highest {
+                highest = v
+            }
+        }
+    } else {
+        use_mtf := r.bit()
+        n1 := new_sk_code()
+        sk_read_nested(r, num > 2, &mut n1, sk)?
+        st := new_sk_stream(SK_NONE, 0)
+        empty := [0u8; 8]
+        sk_begin(&mut st, &n1, r)
+        for i in 0usize..num as usize {
+            value := sk_read(&mut n1, sk, &mut st, &mut empty, r, 0, 0)
+            if st.copied {
+                // A copy repeats an earlier entry: it never raises the
+                // largest one.
+                if store {
+                    if i == 0 || st.src as usize >= i {
+                        value = 0
+                    } else {
+                        value = map[st.src as usize] as u32
+                    }
+                } else {
+                    value = 0
+                }
+            }
+            if value >= 256 {
+                return err(pixels.Error.Malformed)
+            }
+            if store {
+                map[i] = value as u8
+            }
+            if value > highest {
+                highest = value
+            }
+            if (i & 1023) == 1023 && sk_failed(&st, r) {
+                break
+            }
+        }
+        sk_finish(&st, &n1, r)?
+        sk.used = 0
+        if store && use_mtf {
+            inverse_mtf(map, num as usize)
+            highest = 0
+            for i in 0usize..num as usize {
+                if map[i] as u32 > highest {
+                    highest = map[i] as u32
+                }
+            }
+        }
+    }
+    if store {
+        seen := [false; 256]
+        for i in 0usize..num as usize {
+            seen[map[i] as usize] = true
+        }
+        for i in 0usize..(highest + 1) as usize {
+            if !seen[i] {
+                return err(pixels.Error.Malformed)
+            }
+        }
+    }
+    return ok(highest + 1)
+}
+
+// A Code for one context (two with LZ77), as used for entropy-coded
+// context maps.
+fn sk_read_nested(r: &mut Reader, allow_lz77: bool, code: &mut SkCode, sk: &mut Skim) -> void!pixels.Error {
+    code.lz77 = r.bit()
+    if code.lz77 {
+        if !allow_lz77 {
+            return err(pixels.Error.Malformed)
+        }
+        code.min_symbol = r.u32c(dist(224, 0), dist(512, 0), dist(4096, 0), dist(8, 15))
+        code.min_length = r.u32c(dist(3, 0), dist(4, 0), dist(5, 2), dist(9, 8))
+        code.lz_config = read_config(r, 8)?
+    } else {
+        code.min_symbol = 0xffffffff
+    }
+    dists := 1u32
+    if code.lz77 {
+        dists = 2
+    }
+    code.num_dist = dists
+    if dists == 1 {
+        code.map[0] = 0
+    } else if r.bit() {
+        nbits := r.bits(2)
+        for i in 0usize..2 {
+            code.map[i] = r.bits(nbits) as u8
+        }
+    } else {
+        use_mtf := r.bit()
+        sub := new_sk_code()
+        if r.bit() {
+            return err(pixels.Error.Malformed)
+        }
+        sub.min_symbol = 0xffffffff
+        sub.num_dist = 1
+        sub.map[0] = 0
+        sub.num_clusters = 1
+        sk_read_tables(r, &mut sub, sk)?
+        st := new_sk_stream(SK_NONE, 0)
+        empty := [0u8; 8]
+        sk_begin(&mut st, &sub, r)
+        for i in 0usize..2 {
+            value := sk_read(&mut sub, sk, &mut st, &mut empty, r, 0, 0)
+            if value >= 256 {
+                return err(pixels.Error.Malformed)
+            }
+            code.map[i] = value as u8
+        }
+        sk_finish(&st, &sub, r)?
+        if use_mtf {
+            inverse_mtf(&mut code.map, 2)
+        }
+    }
+    highest := 0usize
+    seen := [false; 256]
+    for i in 0usize..dists as usize {
+        v := code.map[i] as usize
+        seen[v] = true
+        if v > highest {
+            highest = v
+        }
+    }
+    for i in 0usize..highest + 1 {
+        if !seen[i] {
+            return err(pixels.Error.Malformed)
+        }
+    }
+    code.num_clusters = (highest + 1) as u32
+    sk_read_tables(r, code, sk)?
+    if r.broken {
+        return err(pixels.Error.Malformed)
+    }
+    return ok()
+}
+
+// Skip a Code for `num_dist` contexts without keeping it (any context
+// count): returns its cluster count.
+fn sk_skip_code(r: &mut Reader, num_dist: u32, sk: &mut Skim) -> u32!pixels.Error {
+    lz77 := r.bit()
+    if lz77 {
+        r.u32c(dist(224, 0), dist(512, 0), dist(4096, 0), dist(8, 15))
+        r.u32c(dist(3, 0), dist(4, 0), dist(5, 2), dist(9, 8))
+        read_config(r, 8)?
+    }
+    dists := num_dist as u64
+    if lz77 {
+        dists += 1
+    }
+    if dists > 0xffffffff {
+        return err(pixels.Error.TooLarge)
+    }
+    empty := [0u8; 1]
+    clusters := sk_cluster_map(r, dists as u32, &mut empty, false, sk)?
+    prefix := r.bit()
+    if prefix {
+        for c in 0u32..clusters {
+            read_config(r, 15)?
+        }
+        // Alphabet sizes come first; keep them in the cache (or reparse).
+        counts := [0u32; 256]
+        for c in 0usize..clusters as usize {
+            count := 1u32
+            if r.bit() {
+                n := r.bits(4)
+                count = 1 + (1u32 << n) + r.bits(n)
+            }
+            if count > 32768 {
+                return err(pixels.Error.Malformed)
+            }
+            counts[c] = count
+        }
+        for c in 0usize..clusters as usize {
+            if counts[c] > 1 {
+                words := 0u32
+                sk_prefix_check(r, counts[c], &mut words)?
+            }
+        }
+    } else {
+        log_alpha := 5 + r.bits(2)
+        for c in 0u32..clusters {
+            read_config(r, log_alpha)?
+        }
+        for c in 0u32..clusters {
+            sk_ans(r, log_alpha, &mut sk.cache)?
+        }
+    }
+    sk.used = 0
+    if r.broken {
+        return err(pixels.Error.Malformed)
+    }
+    if r.overrun {
+        return err(pixels.Error.Truncated)
+    }
+    return ok(clusters)
+}
+
+// Validate one prefix code of `count` symbols (count > 1) at the reader:
+// returns the symbol + 1 of a one-symbol code (else 0) and in `words` the
+// cache words its table needs.
+fn sk_prefix_check(r: &mut Reader, count: u32, words: &mut u32) -> u32!pixels.Error {
+    counts := [0u32; 16]
+    empty := [0u16; 1]
+    single := sk_prefix_pass(r, count, &mut empty, false, &mut counts)?
+    used := 0u32
+    for n in 1usize..16 {
+        used += counts[n]
+    }
+    *words = 16 + used
+    return ok(single)
+}
+
+// The canonical table of the prefix code at the reader into out[..]:
+// out[1..16] the code count per length, out[16..] the symbols sorted by
+// length (then value); returns the words used.
+fn sk_prefix_build(r: &mut Reader, count: u32, out: &mut[u16]) -> usize!pixels.Error {
+    start := r.position()
+    counts := [0u32; 16]
+    empty := [0u16; 1]
+    sk_prefix_pass(r, count, &mut empty, false, &mut counts)?
+    used := 0u32
+    for n in 1usize..16 {
+        used += counts[n]
+    }
+    if 16 + used as usize > out.len {
+        return err(pixels.Error.TooLarge)
+    }
+    // Running offsets of each length within the sorted symbols.
+    offsets := [0u32; 16]
+    acc := 0u32
+    out[0] = 0
+    for n in 1usize..16 {
+        offsets[n] = acc
+        acc += counts[n]
+        out[n] = counts[n] as u16
+    }
+    r.seek_bit(start)
+    sk_prefix_pass(r, count, out, true, &mut offsets)?
+    return ok(16 + used as usize)
+}
+
+// One parse of a prefix code. Without `place`, counts[n] receives the
+// number of symbols of length n (validated as a complete code); returns
+// the symbol + 1 of a one-symbol simple code, else 0. With `place`,
+// counts[n] are running output offsets: symbol s of length n goes to
+// out[16 + counts[n]++].
+fn sk_prefix_pass(r: &mut Reader, count: u32, out: &mut[u16], place: bool, counts: &mut[u32]) -> u32!pixels.Error {
+    hskip := r.bits(2)
+    if hskip == 1 {
+        nsym := r.bits(2) + 1
+        symbols := [0u32; 4]
+        width := bits_for(count - 1)
+        for i in 0usize..nsym as usize {
+            symbols[i] = r.bits(width)
+            if symbols[i] >= count {
+                return err(pixels.Error.Malformed)
+            }
+            for j in 0usize..i {
+                if symbols[j] == symbols[i] {
+                    return err(pixels.Error.Malformed)
+                }
+            }
+        }
+        if nsym == 1 {
+            return ok(symbols[0] + 1)
+        }
+        lengths := [0u32; 4]
+        if nsym == 2 {
+            lengths = [1u32, 1, 0, 0]
+        } else if nsym == 3 {
+            lengths = [1u32, 2, 2, 0]
+        } else if r.bit() {
+            lengths = [1u32, 2, 3, 3]
+        } else {
+            lengths = [2u32, 2, 2, 2]
+        }
+        // Canonical order: by length, then by symbol value.
+        for a in 0usize..nsym as usize {
+            for b in a + 1..nsym as usize {
+                if lengths[b] < lengths[a] || (lengths[b] == lengths[a] && symbols[b] < symbols[a]) {
+                    tl := lengths[a]
+                    lengths[a] = lengths[b]
+                    lengths[b] = tl
+                    ts := symbols[a]
+                    symbols[a] = symbols[b]
+                    symbols[b] = ts
+                }
+            }
+        }
+        for a in 0usize..nsym as usize {
+            sk_count_symbol(out, place, counts, lengths[a], symbols[a])
+        }
+        return ok(0)
+    }
+    // Layer 1: code lengths of the 18 code-length symbols.
+    l1 := [0u32; 18]
+    l1_counts := [0u32; 6]
+    total := 0u32
+    i := hskip as usize
+    nonzero := 0u32
+    for i < 18 && total < 32 {
+        v := r.peek(4)
+        entry := L0_TABLE[v as usize]
+        r.consume(entry & 15)
+        length := entry >> 16
+        l1[ZIGZAG_L1[i] as usize] = length
+        l1_counts[length as usize] += 1
+        if length != 0 {
+            total += 32u32 >> length
+            nonzero += 1
+        }
+        i += 1
+    }
+    if nonzero == 0 || (total != 32 && nonzero != 1) {
+        return err(pixels.Error.Malformed)
+    }
+    l1_table := [0u32; 32]
+    if nonzero == 1 {
+        only := 0u32
+        for k in 0usize..18 {
+            if l1[k] != 0 {
+                only = k as u32
+            }
+        }
+        for k in 0usize..32 {
+            l1_table[k] = only << 16
+        }
+    } else {
+        starts := [0u32; 6]
+        for k in 2usize..6 {
+            starts[k] = starts[k - 1] + (l1_counts[k - 1] << (5 - (k - 1) as u32))
+        }
+        for k in 0usize..18 {
+            n := l1[k]
+            if n == 0 {
+                continue
+            }
+            slot := REV5[starts[n as usize] as usize]
+            for slot < 32 {
+                l1_table[slot as usize] = ((k as u32) << 16) | n
+                slot += 1u32 << n
+            }
+            starts[n as usize] += 32u32 >> n
+        }
+    }
+    // Layer 2: the symbol code lengths, run-length coded.
+    previous := 8u32
+    repeat := 0i64
+    total2 := 0u64
+    k := 0usize
+    for k < count as usize && total2 < 32768 {
+        v := r.peek(5)
+        entry := l1_table[v as usize]
+        r.consume(entry & 15)
+        symbol := entry >> 16
+        if symbol < 16 {
+            if symbol != 0 {
+                sk_count_symbol(out, place, counts, symbol, k as u32)
+                total2 += 32768u64 >> (symbol as u64)
+                previous = symbol
+            }
+            k += 1
+            repeat = 0
+        } else if symbol == 16 {
+            if repeat < 0 {
+                repeat = 0
+            }
+            next := 3i64
+            if repeat > 0 {
+                next = 4 * repeat - 5
+            }
+            next += r.bits(2) as i64
+            add := next - repeat
+            if k as i64 + add > count as i64 {
+                return err(pixels.Error.Malformed)
+            }
+            total2 += ((32768 * add) as u64) >> (previous as u64)
+            if place {
+                for j in 0i64..add {
+                    sk_count_symbol(out, true, counts, previous, (k as i64 + j) as u32)
+                }
+            } else {
+                counts[previous as usize] += add as u32
+            }
+            k += add as usize
+            repeat = next
+        } else {
+            if repeat > 0 {
+                repeat = 0
+            }
+            next := -3i64
+            if repeat < 0 {
+                next = 8 * repeat + 13
+            }
+            next -= r.bits(3) as i64
+            add := repeat - next
+            if k as i64 + add > count as i64 {
+                return err(pixels.Error.Malformed)
+            }
+            k += add as usize
+            repeat = next
+        }
+        if r.overrun {
+            return err(pixels.Error.Truncated)
+        }
+    }
+    if total2 != 32768 {
+        return err(pixels.Error.Malformed)
+    }
+    return ok(0)
+}
+
+fn sk_count_symbol(out: &mut[u16], place: bool, counts: &mut[u32], length: u32, symbol: u32) {
+    if place {
+        at := 16 + counts[length as usize] as usize
+        if at < out.len {
+            out[at] = (symbol & 0xffff) as u16
+        }
+    }
+    counts[length as usize] += 1
+}
+
+// The ANS histogram at the reader as an alias table in out[..3 << log_alpha]
+// (per entry: cutoff | right symbol << 8, right offset, own frequency);
+// returns the words used.
+fn sk_ans(r: &mut Reader, log_alpha: u32, out: &mut[u16]) -> usize!pixels.Error {
+    table_size := 1usize << (log_alpha as usize)
+    if 3 * table_size > out.len {
+        return err(pixels.Error.TooLarge)
+    }
+    // Frequencies in word 2, log counts in word 1 meanwhile.
+    for i in 0usize..table_size {
+        out[i * 3] = 0
+        out[i * 3 + 1] = 0
+        out[i * 3 + 2] = 0
+    }
+    if r.bit() {
+        if r.bit() {
+            v0 := read_ans_u8(r) as usize
+            v1 := read_ans_u8(r) as usize
+            if v0 == v1 || v0 >= table_size || v1 >= table_size {
+                return err(pixels.Error.Malformed)
+            }
+            p := r.bits(12)
+            out[v0 * 3 + 2] = p as u16
+            out[v1 * 3 + 2] = (4096 - p) as u16
+        } else {
+            v := read_ans_u8(r) as usize
+            if v >= table_size {
+                return err(pixels.Error.Malformed)
+            }
+            out[v * 3 + 2] = 4096
+        }
+    } else if r.bit() {
+        alphabet := read_ans_u8(r) as usize + 1
+        if alphabet > table_size {
+            return err(pixels.Error.Malformed)
+        }
+        each := 4096 / alphabet as u32
+        leftover := 4096 % alphabet
+        for i in 0usize..alphabet {
+            f := each
+            if i < leftover {
+                f = each + 1
+            }
+            out[i * 3 + 2] = f as u16
+        }
+    } else {
+        len := 0u32
+        for len < 3 && r.bit() {
+            len += 1
+        }
+        shift := r.bits(len) as i32 + (1i32 << (len as i32)) - 1
+        if shift > 13 {
+            return err(pixels.Error.Malformed)
+        }
+        alphabet := read_ans_u8(r) as usize + 3
+        if alphabet > table_size {
+            return err(pixels.Error.Malformed)
+        }
+        omit_log := 0u32
+        omit_pos := 0xffffffffusize
+        i := 0usize
+        for i < alphabet {
+            logc := read_log_count(r)
+            if logc == 13 {
+                repeat := read_ans_u8(r) as usize + 4
+                if i + repeat > alphabet {
+                    return err(pixels.Error.Malformed)
+                }
+                for k in 0usize..repeat {
+                    out[(i + k) * 3 + 1] = 0x100
+                }
+                i += repeat
+                continue
+            }
+            if omit_pos == 0xffffffffusize || logc > omit_log {
+                omit_log = logc
+                omit_pos = i
+            }
+            out[i * 3 + 1] = logc as u16
+            i += 1
+        }
+        if omit_pos == 0xffffffffusize {
+            return err(pixels.Error.Malformed)
+        }
+        if omit_pos + 1 < alphabet && out[(omit_pos + 1) * 3 + 1] == 0x100 {
+            return err(pixels.Error.Malformed)
+        }
+        total := 0u32
+        previous := 0u32
+        for k in 0usize..alphabet {
+            code_value := out[k * 3 + 1] as u32
+            if code_value == 0x100 {
+                out[k * 3 + 2] = previous as u16
+                total += previous
+                if total > 4096 {
+                    return err(pixels.Error.Malformed)
+                }
+                continue
+            }
+            if code_value == 0 || k == omit_pos {
+                previous = 0
+                continue
+            }
+            frequency := 1u32
+            if code_value > 1 {
+                zeros := code_value as i32 - 1
+                bitcount := shift - ((12 - zeros) >> 1)
+                if bitcount < 0 {
+                    bitcount = 0
+                }
+                if bitcount > zeros {
+                    bitcount = zeros
+                }
+                frequency = (1u32 << (zeros as u32)) + (r.bits(bitcount as u32) << ((zeros - bitcount) as u32))
+            }
+            out[k * 3 + 2] = frequency as u16
+            previous = frequency
+            total += frequency
+            if total > 4096 {
+                return err(pixels.Error.Malformed)
+            }
+        }
+        out[omit_pos * 3 + 2] = (4096 - total) as u16
+        for k in 0usize..alphabet {
+            out[k * 3 + 1] = 0
+        }
+    }
+    sk_alias(out, log_alpha)?
+    return ok(3 * table_size)
+}
+
+// Build the alias table in place from the frequencies in word 2 (libjxl's
+// construction, as build_alias in entropy.dodo).
+fn sk_alias(t: &mut[u16], log_alpha: u32) -> void!pixels.Error {
+    table_size := 1usize << (log_alpha as usize)
+    log_bucket := 12 - log_alpha
+    bucket_size := 1u32 << log_bucket
+    single := 0xffffffffusize
+    nonzero := 0usize
+    for i in 0usize..table_size {
+        if t[i * 3 + 2] != 0 {
+            nonzero += 1
+            single = i
+        }
+    }
+    if nonzero == 1 {
+        for j in 0usize..table_size {
+            t[j * 3] = ((single as u32) << 8) as u16
+            t[j * 3 + 1] = ((j as u32) << log_bucket) as u16
+        }
+        return ok()
+    }
+    cutoff := [0u16; 256]
+    empty := 0xffffu32
+    under := empty
+    over := empty
+    // Word 1 links the stacks meanwhile.
+    for i in 0usize..table_size {
+        d := t[i * 3 + 2] as u32
+        cutoff[i] = d as u16
+        if d > bucket_size {
+            t[i * 3 + 1] = over as u16
+            over = i as u32
+        } else if d < bucket_size {
+            t[i * 3 + 1] = under as u16
+            under = i as u32
+        } else {
+            t[i * 3] = ((i as u32) << 8) as u16
+            t[i * 3 + 1] = 0
+        }
+    }
+    for over != empty {
+        if under == empty {
+            break
+        }
+        o := over as usize
+        u := under as usize
+        by := bucket_size - cutoff[u] as u32
+        next_under := t[u * 3 + 1] as u32
+        cutoff[o] = (cutoff[o] as u32 - by) as u16
+        t[u * 3] = ((o as u32) << 8) as u16
+        t[u * 3 + 1] = ((cutoff[o] as u32 - cutoff[u] as u32) & 0xffff) as u16
+        under = next_under
+        if (cutoff[o] as u32) < bucket_size {
+            next_over := t[o * 3 + 1] as u32
+            t[o * 3 + 1] = under as u16
+            under = o as u32
+            over = next_over
+        } else if cutoff[o] as u32 == bucket_size {
+            next_over := t[o * 3 + 1] as u32
+            t[o * 3] = ((o as u32) << 8) as u16
+            t[o * 3 + 1] = 0
+            over = next_over
+        }
+    }
+    for i in 0usize..table_size {
+        c := cutoff[i] as u32
+        if c > 255 {
+            return err(pixels.Error.Malformed)
+        }
+        t[i * 3] = ((t[i * 3] as u32 & 0xff00) | c) as u16
+    }
+    return ok()
+}

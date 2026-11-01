@@ -15,7 +15,11 @@ import "std/image/pixels"
 // them back in place with one temporary row or column. So decoded groups
 // write straight into the frame's buffers and no transform allocates.
 
-// Channel descriptor words: offset, stride, width, height, hshift, vshift.
+// Channel descriptor words: offset, stride, width, height, hshift, vshift,
+// stored width, stored height. A frame decoded through a window (see
+// window.dodo) keeps only the top-left stored part of its channels; the
+// width and height stay the coded ones, which the bitstream structure
+// depends on.
 const CH_STRIDE: usize = 8
 // Transform words: kind, begin_c, num_c, then kind specific values.
 const TR_STRIDE: usize = 8
@@ -76,6 +80,17 @@ struct ChanList {
     fn vshift(&self, i: usize) -> i32 {
         return self.d[i * CH_STRIDE + 5]
     }
+    fn swidth(&self, i: usize) -> usize {
+        return self.d[i * CH_STRIDE + 6] as usize
+    }
+    fn sheight(&self, i: usize) -> usize {
+        return self.d[i * CH_STRIDE + 7] as usize
+    }
+    // Whether only part of channel i is stored.
+    fn windowed(&self, i: usize) -> bool {
+        return self.swidth(i) != self.width(i) || self.sheight(i) != self.height(i)
+    }
+    // A fully stored channel view.
     fn set(&mut self, i: usize, offset: usize, stride: usize, width: usize, height: usize, hshift: i32, vshift: i32) {
         b := i * CH_STRIDE
         self.d[b] = offset as i32
@@ -84,6 +99,19 @@ struct ChanList {
         self.d[b + 3] = height as i32
         self.d[b + 4] = hshift
         self.d[b + 5] = vshift
+        self.d[b + 6] = width as i32
+        self.d[b + 7] = height as i32
+    }
+    fn set_stored(&mut self, i: usize, swidth: usize, sheight: usize) {
+        self.d[i * CH_STRIDE + 6] = swidth as i32
+        self.d[i * CH_STRIDE + 7] = sheight as i32
+    }
+    // After decoding: make the stored part the whole channel.
+    fn collapse(&mut self) {
+        for i in 0usize..self.count {
+            self.d[i * CH_STRIDE + 2] = self.d[i * CH_STRIDE + 6]
+            self.d[i * CH_STRIDE + 3] = self.d[i * CH_STRIDE + 7]
+        }
     }
     fn same_shape(&self, i: usize, j: usize) -> bool {
         return self.width(i) == self.width(j) && self.height(i) == self.height(j) && self.hshift(i) == self.hshift(j) && self.vshift(i) == self.vshift(j)

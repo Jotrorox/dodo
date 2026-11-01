@@ -250,6 +250,53 @@ fn scratch_size_is_exact_and_checked() {
     }
 }
 
+fn same_name(a: &str, b: &str) -> bool {
+    ta := text.Text.from_str(a)
+    tb := text.Text.from_str(b)
+    return ta.equal(&tb)
+}
+
+// The scratch bound documented in image.md: with W' = width + 1100,
+// H' = height + 1100 and C = 3 + extra channels,
+// 64 W' H' C + 5 MiB C + 128 MiB, whatever size the frames claim.
+fn scratch_bound(width: u32, height: u32, channels: u64) -> u64 {
+    w := width as u64 + 1100
+    h := height as u64 + 1100
+    return 64 * w * h * channels + 5 * 1048576 * channels + 128 * 1048576
+}
+
+// scratch_size follows the image header, not the frame headers: frames
+// larger than the image or starting outside it, and reference frames, are
+// decoded over the part that can show (std/image/jxl/window.dodo). Every
+// fixture stays within the documented bound; the frame window fixtures
+// (frames of up to 6e8 pixels over a 64x48 image) need little.
+@test
+fn scratch_size_is_bounded() {
+    for k in 0usize..CASE_COUNT {
+        name := CASE_FILES[k]
+        file := [0u8; FILE_LIMIT]
+        length := read_fixture(name, ".jxl", &mut file)
+        data := &file[..length]
+        header := jxl.info(data)!
+        need := jxl.scratch_size(data)! as u64
+        channels := 3u64
+        if header.has_alpha() {
+            channels = 4
+        }
+        if same_name(name, "many_extra") {
+            channels = 23
+        }
+        assert(need <= scratch_bound(header.width, header.height, channels), name)
+    }
+    names := ["frame_big", "frame_huge", "frame_negative", "ref_patches", "ref_huge", "vd_window"]
+    for n in 0usize..names.len {
+        file := [0u8; FILE_LIMIT]
+        length := read_fixture(names[n], ".jxl", &mut file)
+        need := jxl.scratch_size(&file[..length])!
+        assert(need <= 48 * 1048576, names[n])
+    }
+}
+
 @test
 fn animation_timing() {
     file := [0u8; FILE_LIMIT]
@@ -345,6 +392,20 @@ fn icc_profile() {
     assert_eq(decoded, expected_length)
     for i in 0usize..expected_length {
         assert_eq(profile[i], expected[i])
+    }
+    // A 45 KB profile (many prefix-coded clusters, long LZ77 matches),
+    // skipped by info() in a few KiB of stack and decoded by icc().
+    big := [0u8; FILE_LIMIT]
+    big_length := read_fixture("icc_big", ".jxl", &mut big)
+    big_header := jxl.info(&big[..big_length])!
+    assert(big_header.color.has_icc())
+    unsafe {
+        big_expected := read_fixture("profile_big", ".icc", &mut REFERENCE)
+        big_decoded := icc_into(&big[..big_length], &mut PIXELS)!
+        assert_eq(big_decoded, big_expected)
+        for i in 0usize..big_expected {
+            assert_eq(PIXELS[i], REFERENCE[i])
+        }
     }
     // XYB with an ICC profile is rendered to sRGB.
     lossy := [0u8; FILE_LIMIT]
@@ -545,6 +606,27 @@ fn robustness_jpeg_noise_splines() {
     mangle("jpeg420")
     mangle("vd_noise")
     mangle("splines")
+}
+
+// Frame windows: frames larger than the image, reference frames read by
+// patches, a VarDCT frame cropped to the window.
+@test
+fn robustness_frame_windows() {
+    mangle("frame_huge")
+    mangle("ref_patches")
+    mangle("patches_text")
+}
+
+@test
+fn robustness_vardct_window() {
+    mangle("vd_window")
+}
+
+// Header walks: permuted TOCs and a large ICC profile.
+@test
+fn robustness_header_walks() {
+    mangle("vd_group_order")
+    mangle("icc_big")
 }
 
 @test

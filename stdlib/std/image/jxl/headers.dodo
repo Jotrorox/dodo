@@ -349,8 +349,8 @@ fn read_color_encoding(r: &mut Reader, h: &mut ImageHeader) -> void!pixels.Error
 }
 
 // Parse the headers up to the first frame. The ICC stream, when present, is
-// skipped with `work` (see skip_icc), so the frame offset is known.
-fn read_headers(r: &mut Reader, work: &mut[u8]) -> ImageHeader!pixels.Error {
+// skipped with `sk` and `win` (see skip_icc), so the frame offset is known.
+fn read_headers(r: &mut Reader, sk: &mut Skim, win: &mut[u8]) -> ImageHeader!pixels.Error {
     if r.bits(16) != 0x0aff {
         return err(pixels.Error.Malformed)
     }
@@ -491,7 +491,7 @@ fn read_headers(r: &mut Reader, work: &mut[u8]) -> ImageHeader!pixels.Error {
     }
     h.icc_bit = r.position()
     if h.want_icc {
-        h.icc_enc_size = skip_icc(r, work)?
+        h.icc_enc_size = skip_icc(r, sk, win)?
     }
     r.pad()
     if r.overrun {
