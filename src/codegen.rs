@@ -3030,6 +3030,10 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             (self.usize_type(), 8)
         };
         match op {
+            "wait_for_interrupt" if riscv => {
+                self.wait_for_interrupt_hook()?;
+                Ok(unit)
+            }
             "wait_for_interrupt" => {
                 self.builder.build_inline_asm(
                     void.fn_type(&[], false),
@@ -3140,6 +3144,40 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         let phi = self.builder.build_phi(i32_type, "cpu.core")?;
         phi.add_incoming(&[(&i32_type.const_zero(), start), (&number, ask)]);
         Ok(phi)
+    }
+    /// Lowers `cpu.wait_for_interrupt()` on bare-metal RISC-V. The core's
+    /// `wfi` cannot be intercepted in machine mode, and a RISC-V chip has
+    /// no architectural deep sleep like the Cortex-M's SCR.SLEEPDEEP, so a
+    /// chip package that implements one defines `dodo_wait_for_interrupt`,
+    /// which is referenced weakly: std/embedded/chip/esp32c6 stops the
+    /// clocks outside its sleep set around the `wfi` while its power mode is
+    /// deep sleep. Without a definition this is a plain `wfi`.
+    fn wait_for_interrupt_hook(&mut self) -> Result<()> {
+        let void = self.context.void_type();
+        let hook = self
+            .module
+            .lookup_function("dodo_wait_for_interrupt")
+            .unwrap_or_else(|| {
+                self.module.add_function(
+                    "dodo_wait_for_interrupt",
+                    void.fn_type(&[], false),
+                    Some(LLVMExternalWeakLinkage),
+                )
+            });
+        let call = self.bb("wfi.hook");
+        let plain = self.bb("wfi.plain");
+        let done = self.bb("wfi.done");
+        let missing = self.builder.build_is_null(hook, "wfi.missing")?;
+        self.builder.build_conditional_branch(missing, plain, call)?;
+        self.builder.position_at_end(call);
+        self.builder.build_call(hook, &[], "")?;
+        self.builder.build_unconditional_branch(done)?;
+        self.builder.position_at_end(plain);
+        self.builder
+            .build_inline_asm(void.fn_type(&[], false), "wfi", "~{memory}", &[], "")?;
+        self.builder.build_unconditional_branch(done)?;
+        self.builder.position_at_end(done);
+        Ok(())
     }
     fn call(
         &mut self,

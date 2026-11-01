@@ -3,19 +3,22 @@ package esp32c6
 import "core/cpu"
 import "core/mmio"
 import "core/ptr"
+import "std/embedded/chip/esp_power"
 import "std/embedded/executor"
 import "std/embedded/hal"
 import "std/embedded/peripheral/esp_i2c"
 import "std/embedded/peripheral/esp_spi"
 import "std/embedded/peripheral/esp_uart"
 import "std/embedded/peripheral/esp_usb_serial"
+import "std/embedded/power"
 import "std/io"
 
 // Espressif ESP32-C6 chip support for its high-performance RISC-V core:
 // clocks, GPIO through the IO MUX and GPIO matrix, interrupts, the system
 // timer and its alarms, the USB serial port, and the boot ROM; the rest of
 // the package adds I2C, SPI, UART, PWM (LEDC), the ADC and temperature
-// sensor, DMA, and an addressable LED driver (RMT). `take()` brings the chip
+// sensor, DMA, an addressable LED driver (RMT), and low power (`Power`:
+// clock gating, sleep modes, and a dormant state). `take()` brings the chip
 // from the state the boot ROM leaves it in to a known configuration and
 // hands out the peripherals once. Pins implement the std/embedded/hal output
 // and input pin protocols, I2C and SPI buses claimed from `Pins` implement
@@ -348,6 +351,8 @@ pub struct Peripherals {
     pub usb: Usb
     // The DMA controller's channels.
     pub dma: Dma
+    // Sleep modes, clock gating, and the dormant state; see Power.
+    pub power: Power
 }
 
 // Configure clocks and return the peripherals. A second call returns
@@ -370,12 +375,14 @@ pub fn take() -> Peripherals!hal.Error {
     unsafe {
         start_clocks()?
         start_timer()
+        gate_cpu_in_wait()
     }
     return ok(Peripherals {
         pins: Pins { taken: 0, buses: 0, pwm_channels: 0, pwm_timers: [0u32; 4], pwm_timer_users: [0u32; 4], analog_inputs: 0 },
         timer: Timer { alarms: 0 },
         usb: Usb { open: false },
         dma: Dma { channels: 0 },
+        power: Power { timeout_us: 0, lp_ticks_per_10ms: 0 },
     })
 }
 
@@ -741,6 +748,7 @@ pub struct Pins {
         // starts the converter.
         unsafe {
             if self.analog_inputs == 0 {
+                claim_clocks(CLOCK_SARADC)
                 start_adc()
             }
             address := IO_MUX_BASE + 4 * pin as usize
@@ -759,8 +767,10 @@ pub struct Pins {
             return err(hal.Error.Busy)
         }
         self.analog_inputs |= TEMPERATURE_BIT
-        // SAFETY: the claim makes this the sensor's only owner.
+        // SAFETY: the claim makes this the sensor's only owner. Its
+        // registers are the ADC's.
         unsafe {
+            claim_clocks(CLOCK_TSENS | CLOCK_SARADC)
             mmio.write32(PCR_TSENS_CLK_CONF, TSENS_CLOCK_ENABLE | TSENS_RESET)
             mmio.write32(PCR_TSENS_CLK_CONF, TSENS_CLOCK_ENABLE)
             mmio.write32(TSENS_CTRL2, TSENS_FROM_XTAL)
@@ -780,6 +790,10 @@ pub struct Pins {
             unsafe {
                 value := mmio.read32(TSENS_CTRL)
                 mmio.write32(TSENS_CTRL, value & ~TSENS_POWER_UP)
+                release_clocks(CLOCK_TSENS)
+                if self.analog_inputs == 0 {
+                    release_clocks(CLOCK_SARADC)
+                }
             }
             return
         }
@@ -790,6 +804,9 @@ pub struct Pins {
             gpio_function(channel)
             if (self.analog_inputs & ~TEMPERATURE_BIT) == 0 {
                 stop_adc()
+            }
+            if self.analog_inputs == 0 {
+                release_clocks(CLOCK_SARADC)
             }
         }
     }
@@ -1208,6 +1225,10 @@ pub struct Timer {
             return err(hal.Error.Busy)
         }
         self.alarms |= bit
+        // SAFETY: the alarm's claim keeps the timer's clocks running.
+        unsafe {
+            claim_clocks(CLOCK_SYSTIMER)
+        }
         alarm := Alarm { number, bit }
         alarm.cancel()
         alarm.ignore()
@@ -1221,6 +1242,12 @@ pub struct Timer {
         alarm.ignore()
         alarm.clear()
         self.alarms &= ~alarm.bit
+        if self.alarms == 0 {
+            // SAFETY: no alarm uses the timer any more.
+            unsafe {
+                release_clocks(CLOCK_SYSTIMER)
+            }
+        }
     }
 
     // Microseconds since power-up.
@@ -1674,20 +1701,107 @@ const BUS_RMT: u32 = 1 << 4
 // No pin.
 const PIN_NONE: u32 = 0xFF
 
-// Hold a peripheral in reset with its clock on, then let it run.
+// Claim the peripheral whose PCR *_CONF register is `conf`: start its
+// clocks, which Power may have stopped, and record the claim, so that
+// Power.disable_unused_clocks leaves them alone and Power.disable_clocks
+// refuses them; then hold it in reset with its clock on, and let it run.
+// Every driver claims its peripheral here, so a new driver needs no more
+// than this call, stop_peripheral, and its line in peripheral_clocks.
 // SAFETY: the caller owns the peripheral.
 unsafe fn start_peripheral(conf: usize) {
     unsafe {
+        claim_clocks(peripheral_clocks(conf))
         mmio.write32(conf, PERIPHERAL_CLOCK | PERIPHERAL_RESET)
         mmio.write32(conf, PERIPHERAL_CLOCK)
     }
 }
 
-// Hold a peripheral in reset.
+// Hold a peripheral in reset and give up its claim; its clocks keep
+// running until Power stops them.
 // SAFETY: the caller owns the peripheral and no longer uses it.
 unsafe fn stop_peripheral(conf: usize) {
     unsafe {
         mmio.write32(conf, PERIPHERAL_CLOCK | PERIPHERAL_RESET)
+        release_clocks(peripheral_clocks(conf))
+    }
+}
+
+// The clock gates of the peripheral whose PCR *_CONF register is `conf`,
+// one line per peripheral the chip can claim: its bus clock and its
+// function clocks.
+fn peripheral_clocks(conf: usize) -> power.Clocks {
+    offset := conf - PCR_BASE
+    if offset == 0x000 {
+        return CLOCK_UART0
+    } else if offset == 0x00C {
+        return CLOCK_UART1
+    } else if offset == 0x020 {
+        return CLOCK_I2C0
+    } else if offset == 0x028 {
+        return CLOCK_UHCI
+    } else if offset == 0x02C {
+        return CLOCK_RMT
+    } else if offset == 0x034 {
+        return CLOCK_LEDC
+    } else if offset == 0x03C {
+        return CLOCK_TIMG0
+    } else if offset == 0x048 {
+        return CLOCK_TIMG1
+    } else if offset == 0x05C {
+        return CLOCK_TWAI0
+    } else if offset == 0x064 {
+        return CLOCK_TWAI1
+    } else if offset == 0x06C {
+        return CLOCK_I2S
+    } else if offset == 0x080 {
+        return CLOCK_SARADC
+    } else if offset == 0x094 {
+        return CLOCK_PCNT
+    } else if offset == 0x098 {
+        return CLOCK_ETM
+    } else if offset == 0x09C {
+        return CLOCK_MCPWM
+    } else if offset == 0x0A4 {
+        return CLOCK_PARLIO
+    } else if offset == 0x0BC {
+        return CLOCK_GDMA
+    } else if offset == 0x0C0 {
+        return CLOCK_SPI2
+    } else if offset == 0x0C8 {
+        return CLOCK_AES
+    } else if offset == 0x0CC {
+        return CLOCK_SHA
+    } else if offset == 0x0D0 {
+        return CLOCK_RSA
+    } else if offset == 0x0D8 {
+        return CLOCK_ECC
+    } else if offset == 0x0E0 {
+        return CLOCK_DS
+    } else if offset == 0x0E4 {
+        return CLOCK_HMAC
+    }
+    return power.NO_CLOCKS
+}
+
+// Record a claim on `clocks` and start them.
+// SAFETY: the caller owns the peripherals that use them.
+unsafe fn claim_clocks(clocks: power.Clocks) {
+    unsafe {
+        section := hal.Critical.enter()
+        CLAIMED_CLOCKS |= clocks
+        pcr := hal.RegisterBlock.at(PCR_BASE)
+        esp_power.start_clocks(&mut pcr, clocks)
+        core.drop(section)
+    }
+}
+
+// Give up the claim on `clocks`.
+// SAFETY: the caller no longer uses the peripherals that use them.
+unsafe fn release_clocks(clocks: power.Clocks) {
+    unsafe {
+        section := hal.Critical.enter()
+        CLAIMED_CLOCKS &= ~clocks
+        core.drop(section)
     }
 }
 
@@ -2055,6 +2169,12 @@ const ADC_POLLS: u32 = 100_000
 // The analog configuration bus (regi2c), and the ADC's registers on it.
 const MODEM_LPCON_I2C_MST_CLK_CONF: usize = 0x600A_F010
 const MODEM_LPCON_CLK_CONF: usize = 0x600A_F018
+// CLK_CONF_FORCE_ON.CLK_I2C_MST_FO: keep the bus master's clock running
+// whatever the PMU's radio-domain clock gating says; with its power-state
+// maps at their reset value of 0 that gating stops the clock, and the
+// bus's reads return 0 and its writes are lost.
+const MODEM_LPCON_CLK_CONF_FORCE_ON: usize = 0x600A_F01C
+const I2C_MASTER_FORCE_ON: u32 = 1 << 2
 const I2C_ANA_MST_I2C0_CTRL: usize = 0x600A_F800
 const I2C_ANA_MST_ANA_CONF1: usize = 0x600A_F81C
 const I2C_ANA_MST_ANA_CONF2: usize = 0x600A_F820
@@ -2074,6 +2194,8 @@ unsafe fn sar_write(register: u32, msb: u32, lsb: u32, value: u32) {
     unsafe {
         clock := mmio.read32(MODEM_LPCON_CLK_CONF)
         mmio.write32(MODEM_LPCON_CLK_CONF, clock | (1u32 << 2))
+        forced := mmio.read32(MODEM_LPCON_CLK_CONF_FORCE_ON)
+        mmio.write32(MODEM_LPCON_CLK_CONF_FORCE_ON, forced | I2C_MASTER_FORCE_ON)
         source := mmio.read32(MODEM_LPCON_I2C_MST_CLK_CONF)
         mmio.write32(MODEM_LPCON_I2C_MST_CLK_CONF, source | 1)
         master := I2C_ANA_MST_I2C0_CTRL
@@ -2791,5 +2913,433 @@ pub struct DmaChannel: hal.DmaChannel {
             DMA_BYTES[self.number as usize] = 0
         }
         return result
+    }
+}
+
+// --- Low power -------------------------------------------------------------
+
+// Clock gates for `Power`, as std/embedded/power.Clocks: one bit per enable
+// in the system clock controller (PCR), numbered in register order (see
+// std/embedded/chip/esp_power). Each peripheral's constant holds every
+// clock it uses: its bus (APB) clock and, where it has them, its function
+// clocks.
+pub const CLOCK_UART0: power.Clocks = (1 << 0) | (1 << 1)
+pub const CLOCK_UART1: power.Clocks = (1 << 2) | (1 << 3)
+// The flash and PSRAM controller, which the program runs from.
+pub const CLOCK_MSPI: power.Clocks = 1 << 4
+pub const CLOCK_I2C0: power.Clocks = (1 << 5) | (1 << 6)
+pub const CLOCK_UHCI: power.Clocks = 1 << 7
+pub const CLOCK_RMT: power.Clocks = (1 << 8) | (1 << 9)
+pub const CLOCK_LEDC: power.Clocks = (1 << 10) | (1 << 11)
+// Timer groups 0 and 1: registers, timer, and watchdog clocks.
+pub const CLOCK_TIMG0: power.Clocks = (1 << 12) | (1 << 13) | (1 << 14)
+pub const CLOCK_TIMG1: power.Clocks = (1 << 15) | (1 << 16) | (1 << 17)
+// The system timer behind Timer and its alarms.
+pub const CLOCK_SYSTIMER: power.Clocks = (1 << 18) | (1 << 19)
+pub const CLOCK_TWAI0: power.Clocks = (1 << 20) | (1 << 21)
+pub const CLOCK_TWAI1: power.Clocks = (1 << 22) | (1 << 23)
+// I2S: registers, transmitter, and receiver.
+pub const CLOCK_I2S: power.Clocks = (1 << 24) | (1 << 25) | (1 << 26)
+// The ADC's controller, whose registers the temperature sensor also uses.
+pub const CLOCK_SARADC: power.Clocks = (1 << 27) | (1 << 28)
+pub const CLOCK_TSENS: power.Clocks = 1 << 29
+// The USB serial port's controller.
+pub const CLOCK_USB_DEVICE: power.Clocks = 1 << 30
+// The interrupt matrix.
+pub const CLOCK_INTMTX: power.Clocks = 1 << 31
+pub const CLOCK_PCNT: power.Clocks = 1 << 32
+pub const CLOCK_ETM: power.Clocks = 1 << 33
+pub const CLOCK_MCPWM: power.Clocks = (1 << 34) | (1 << 35)
+// The parallel IO controller: registers, receiver, and transmitter.
+pub const CLOCK_PARLIO: power.Clocks = (1 << 36) | (1 << 37) | (1 << 38)
+pub const CLOCK_SDIO_SLAVE: power.Clocks = 1 << 39
+// The process, voltage, and temperature monitors.
+pub const CLOCK_PVT: power.Clocks = 1 << 40
+pub const CLOCK_GDMA: power.Clocks = 1 << 41
+pub const CLOCK_SPI2: power.Clocks = (1 << 42) | (1 << 43)
+// The cryptographic accelerators.
+pub const CLOCK_AES: power.Clocks = 1 << 44
+pub const CLOCK_SHA: power.Clocks = 1 << 45
+pub const CLOCK_RSA: power.Clocks = 1 << 46
+pub const CLOCK_ECC: power.Clocks = 1 << 47
+pub const CLOCK_DS: power.Clocks = 1 << 48
+pub const CLOCK_HMAC: power.Clocks = 1 << 49
+// The IO MUX and GPIO matrix: registers and their function clock. GPIO
+// interrupts need them to wake a deep sleep.
+pub const CLOCK_IOMUX: power.Clocks = (1 << 50) | (1 << 51)
+pub const CLOCK_MEM_MONITOR: power.Clocks = 1 << 52
+pub const CLOCK_TRACE: power.Clocks = 1 << 53
+pub const CLOCK_ASSIST_DEBUG: power.Clocks = 1 << 54
+pub const CLOCK_CACHE: power.Clocks = 1 << 55
+// The radio's register bus, which the ADC's calibration also goes through.
+pub const CLOCK_MODEM_APB: power.Clocks = 1 << 56
+// What the timer and its alarms need: keep them in the sleep set to wake
+// from a deep sleep on an alarm, as an executor on an alarm does.
+pub const ALARM_CLOCKS: power.Clocks = CLOCK_SYSTIMER
+// Clocks the program cannot run without, which Power.disable_clocks
+// refuses and a deep sleep never stops: the flash controller and cache the
+// program runs from, the interrupt matrix, the IO MUX and GPIO matrix, the
+// USB serial port, which `dodo run` and the boot ROM reach the chip
+// through, and the radio's register bus.
+pub const ESSENTIAL_CLOCKS: power.Clocks = CLOCK_MSPI | CLOCK_INTMTX | CLOCK_IOMUX | CLOCK_USB_DEVICE | CLOCK_CACHE | CLOCK_MODEM_APB
+// Every gate.
+pub const ALL_CLOCKS: power.Clocks = (1 << 57) - 1
+// The peripherals Power.disable_unused_clocks stops while nothing has
+// claimed them: those the package's drivers claim with start_peripheral,
+// or claim_clocks, and those it has no driver for, which nothing claims.
+// The timer groups (watchdogs), the system timer (Timer.now_us), and the
+// debug blocks are left to the program.
+const MANAGED_CLOCKS: power.Clocks = CLOCK_UART0 | CLOCK_UART1 | CLOCK_I2C0 | CLOCK_UHCI | CLOCK_RMT | CLOCK_LEDC | CLOCK_TWAI0 | CLOCK_TWAI1 | CLOCK_I2S | CLOCK_SARADC | CLOCK_TSENS | CLOCK_PCNT | CLOCK_ETM | CLOCK_MCPWM | CLOCK_PARLIO | CLOCK_SDIO_SLAVE | CLOCK_PVT | CLOCK_GDMA | CLOCK_SPI2 | CLOCK_AES | CLOCK_SHA | CLOCK_RSA | CLOCK_ECC | CLOCK_DS | CLOCK_HMAC
+
+// The clocks of claimed peripherals.
+static mut CLAIMED_CLOCKS: u64 = 0
+// Whether waits deep-sleep, and the clocks that keep running then.
+static mut DEEP_SLEEP: bool = false
+static mut SLEEP_CLOCKS: u64 = 0x1FF_FFFF_FFFF_FFFF
+
+// PCR CPU_WAITI_CONF.CPU_WAIT_MODE_FORCE_ON keeps the CPU's clock running
+// while it waits in `wfi`; the boot ROM leaves it set.
+const PCR_CPU_WAITI_CONF: usize = PCR_BASE + 0x114
+const CPU_WAIT_MODE_FORCE_ON: u32 = 1 << 3
+const PMU_BASE: usize = 0x600B_0000
+const LP_TIMER_BASE: usize = 0x600B_0C00
+const LP_CLKRST_BASE: usize = 0x600B_0400
+const SOC_CLK_XTAL: u32 = 0
+
+// Stop the CPU's clock while it waits for an interrupt, so `wfi` saves
+// power; any interrupt still ends the wait at once.
+// SAFETY: the caller owns the clock configuration.
+unsafe fn gate_cpu_in_wait() {
+    unsafe {
+        waiti := mmio.read32(PCR_CPU_WAITI_CONF)
+        mmio.write32(PCR_CPU_WAITI_CONF, waiti & ~CPU_WAIT_MODE_FORCE_ON)
+    }
+}
+
+// Every `cpu.wait_for_interrupt()` on the ESP32-C6, and so every sleep of
+// an alarm, an executor, and Power.sleep, calls this hook (the compiler
+// references it weakly on RISC-V, as the core has no deep-sleep state of
+// its own). In Mode.Sleep it is a plain `wfi`, during which the CPU's clock
+// stops. In Mode.DeepSleep it also stops every running clock outside the
+// sleep set and the essential ones, waits with interrupts masked, so no
+// handler runs with its peripheral's clock stopped, then starts those
+// clocks again and lets pending handlers run.
+extern "C" fn dodo_wait_for_interrupt() {
+    // SAFETY: interrupts are masked while clocks are stopped, so nothing
+    // runs that uses them; the hook restores exactly the gates it closed.
+    unsafe {
+        if !DEEP_SLEEP {
+            asm("wfi")
+            return
+        }
+        were_enabled := cpu.disable_interrupts()
+        pcr := hal.RegisterBlock.at(PCR_BASE)
+        stopping := ALL_CLOCKS & ~SLEEP_CLOCKS & ~ESSENTIAL_CLOCKS
+        stopped := esp_power.enabled_clocks(&mut pcr, stopping)
+        esp_power.stop_clocks(&mut pcr, stopped)
+        asm("wfi")
+        esp_power.start_clocks(&mut pcr, stopped)
+        cpu.restore_interrupts(were_enabled)
+    }
+}
+
+// Low power, as `Peripherals.power`; implements std/embedded/power's
+// protocol, whose package comment describes the modes.
+//
+// Sleep. Every wait (`wfi`) stops the CPU's clock until an interrupt is
+// pending (PCR CPU_WAITI_CONF), so a light sleep saves power and still
+// wakes within a microsecond.
+//
+// Deep sleep. The ESP32-C6 has no per-peripheral sleep enables and its
+// core no deep-sleep state, and the PMU's own sleep, which does gate
+// clocks per peripheral, ends only on pins, the low-power timer, and
+// UARTs, not on the system timer's alarms or other interrupts. So in
+// Mode.DeepSleep every wait, through `dodo_wait_for_interrupt`, closes the
+// PCR gates of the running clocks outside the sleep set before its `wfi`
+// and opens them again once an interrupt is pending, with interrupts
+// masked in between. A peripheral whose clock keeps running, such as the
+// system timer for an alarm (ALARM_CLOCKS), or any GPIO, wakes the core;
+// the essential clocks never stop. Every clock starts in the sleep set, so
+// a deep sleep stops nothing more than a light one until
+// `set_sleep_clocks` says otherwise.
+//
+// Clock gating. The constants above name the gates; ESSENTIAL_CLOCKS are
+// refused. Claiming a peripheral starts its clocks, so
+// `disable_unused_clocks` is safe at any time; it stops the peripherals
+// listed in MANAGED_CLOCKS that nothing has claimed, including those the
+// package has no driver for. A timer alarm's claim keeps CLOCK_SYSTIMER
+// running; without one, stopping it also stops Timer.now_us and its
+// delays.
+//
+// Dormant. `dormant` asks the PMU for a light sleep: the CPU stalls with
+// its state, SRAM, and every register kept, every HP clock stops, and the
+// crystal, the PLL, and the fast RC oscillator power down, until a pin
+// event. The pins are watched through the GPIO wakeup, which sees levels
+// only: each pin wakes the chip when it leaves its current level, and
+// `dormant` sleeps again until one of the events in the Wake has happened
+// (an edge takes two sleeps when the pin starts at the edge's end level).
+// GPIO 0 to 23 apart from the USB pins can wake it. The system timer
+// pauses meanwhile, so `now_us` does not count the time spent dormant; the
+// low-power timer keeps counting its 136 kHz RC oscillator. It returns
+// Busy while the USB serial port is open and a host has it open, as the
+// USB connection does not survive the stopped PLL (the host sees the
+// device stop answering); release the port first. Serial ports must have
+// sent their last bytes, and peripherals' clocks from the PLL stop too.
+pub struct Power: power.Power {
+    // The dormant timeout, 0 for none, and the low-power timer's measured
+    // rate.
+    timeout_us: u64
+    lp_ticks_per_10ms: u64
+
+    pub fn mode(&self) -> power.Mode {
+        // SAFETY: a single byte, written only by set_mode.
+        deep := unsafe {
+            DEEP_SLEEP
+        }
+        if deep {
+            return power.Mode.DeepSleep
+        }
+        return power.Mode.Sleep
+    }
+
+    pub fn set_mode(&mut self, mode: power.Mode) {
+        // SAFETY: a single byte, read by the wait hook.
+        unsafe {
+            DEEP_SLEEP = mode == power.Mode.DeepSleep
+        }
+    }
+
+    pub fn sleep(&mut self) {
+        cpu.wait_for_interrupt()
+    }
+
+    pub fn enabled_clocks(&self) -> power.Clocks {
+        // SAFETY: reading the PCR has no side effects.
+        pcr := unsafe {
+            hal.RegisterBlock.at(PCR_BASE)
+        }
+        return esp_power.enabled_clocks(&mut pcr, ALL_CLOCKS)
+    }
+
+    pub fn enable_clocks(&mut self, clocks: power.Clocks) {
+        // SAFETY: the gates change with interrupts masked, by
+        // read-modify-write of their own fields.
+        unsafe {
+            section := hal.Critical.enter()
+            pcr := hal.RegisterBlock.at(PCR_BASE)
+            esp_power.start_clocks(&mut pcr, clocks & ALL_CLOCKS)
+            core.drop(section)
+        }
+    }
+
+    pub fn disable_clocks(&mut self, clocks: power.Clocks) -> void!hal.Error {
+        if (clocks & ~ALL_CLOCKS) != 0 || (clocks & ESSENTIAL_CLOCKS) != 0 {
+            return err(hal.Error.InvalidInput)
+        }
+        section := hal.Critical.enter()
+        // SAFETY: interrupts are masked, so no claim changes meanwhile.
+        claimed := unsafe {
+            CLAIMED_CLOCKS
+        }
+        if (clocks & claimed) != 0 {
+            core.drop(section)
+            return err(hal.Error.Busy)
+        }
+        // SAFETY: as in enable_clocks; no claimed peripheral and nothing
+        // the program needs to run uses `clocks`.
+        unsafe {
+            pcr := hal.RegisterBlock.at(PCR_BASE)
+            esp_power.stop_clocks(&mut pcr, clocks)
+        }
+        core.drop(section)
+        return ok()
+    }
+
+    pub fn disable_unused_clocks(&mut self) -> power.Clocks {
+        section := hal.Critical.enter()
+        // SAFETY: as in disable_clocks.
+        unused := unsafe {
+            pcr := hal.RegisterBlock.at(PCR_BASE)
+            stopping := esp_power.enabled_clocks(&mut pcr, MANAGED_CLOCKS & ~CLAIMED_CLOCKS)
+            esp_power.stop_clocks(&mut pcr, stopping)
+            stopping
+        }
+        core.drop(section)
+        return unused
+    }
+
+    pub fn sleep_clocks(&self) -> power.Clocks {
+        // SAFETY: written only by set_sleep_clocks.
+        unsafe {
+            return SLEEP_CLOCKS
+        }
+    }
+
+    pub fn set_sleep_clocks(&mut self, clocks: power.Clocks) {
+        // SAFETY: read by the wait hook with interrupts masked; a 64-bit
+        // value, so it changes with them masked too.
+        unsafe {
+            section := hal.Critical.enter()
+            SLEEP_CLOCKS = clocks & ALL_CLOCKS
+            core.drop(section)
+        }
+    }
+
+    pub fn dormant(&mut self, wake: &power.Wake) -> u64!hal.Error {
+        pins := dormant_pins(wake)?
+        timeout := 0u64
+        if self.timeout_us != 0 {
+            timeout = self.timeout_us * self.lp_rate() / 10_000
+            if timeout == 0 {
+                timeout = 1
+            }
+        }
+        section := hal.Critical.enter()
+        // SAFETY: interrupts are masked, so the port's state is read
+        // atomically.
+        busy := unsafe {
+            USB_REPORTS && (mmio.read32(USB_DEVICE_BASE + 0x4C) & (1u32 << 1)) != 0
+        }
+        if busy {
+            core.drop(section)
+            return err(hal.Error.Busy)
+        }
+        // SAFETY: Power owns the PMU and the low-power timer; interrupts
+        // stay masked throughout, and the clocks are as take() set them.
+        result := unsafe {
+            go_dormant(wake, pins, timeout)
+        }
+        core.drop(section)
+        return result
+    }
+
+    // Also end a dormant state after `microseconds` of the low-power
+    // timer, 0 (the default) for no limit: `dormant` then returns the pins
+    // that woke the chip, none if the time ran out first. The timer counts
+    // the RC_SLOW oscillator, whose rate the first timed dormant state
+    // measures against the system timer for 10 ms; the time is then
+    // accurate to about 1 %.
+    pub fn set_dormant_timeout_us(&mut self, microseconds: u64) {
+        self.timeout_us = microseconds
+    }
+
+    // The low-power timer's count of its RC_SLOW oscillator, which keeps
+    // running in a dormant state, and its measured rate in counts per
+    // 10 ms, measured once.
+    pub fn lp_ticks(&self) -> u64 {
+        // SAFETY: latching and reading the count has no other effect.
+        timer := unsafe {
+            hal.RegisterBlock.at(LP_TIMER_BASE)
+        }
+        return esp_power.lp_ticks(&mut timer)
+    }
+
+    pub fn lp_rate(&mut self) -> u64 {
+        if self.lp_ticks_per_10ms == 0 {
+            start_us := now_us()
+            start := self.lp_ticks()
+            for now_us() - start_us < 10_000 {}
+            self.lp_ticks_per_10ms = self.lp_ticks() - start
+        }
+        return self.lp_ticks_per_10ms
+    }
+}
+
+// The pins of `wake`, bit n for pin n; InvalidInput if it has none, or one
+// the chip cannot watch: GPIO 24 and up, and the USB pins.
+fn dormant_pins(wake: &power.Wake) -> u32!hal.Error {
+    all := wake.pins()
+    if all == 0 || (all >> PIN_COUNT as u64) != 0 {
+        return err(hal.Error.InvalidInput)
+    }
+    pins := all as u32
+    if (pins & USB_PINS) != 0 {
+        return err(hal.Error.InvalidInput)
+    }
+    return ok(pins)
+}
+
+// Sleep through the PMU until one of `wake`'s events on `pins`, or until
+// `timeout` low-power timer counts if not 0; return the pins whose events
+// happened.
+// SAFETY: interrupts must be masked, the clocks as take() set them, and
+// the caller must own the PMU, the low-power timer, and the pins.
+unsafe fn go_dormant(wake: &power.Wake, pins: u32, timeout: u64) -> u64!hal.Error {
+    unsafe {
+        pmu := hal.RegisterBlock.at(PMU_BASE)
+        gpio := hal.RegisterBlock.at(GPIO_BASE)
+        timer := hal.RegisterBlock.at(LP_TIMER_BASE)
+        levels := esp_power.levels(&mut gpio)
+        present := esp_power.levels_present(wake, levels) & pins
+        if present != 0 {
+            return ok(present as u64)
+        }
+        lp_clkrst := hal.RegisterBlock.at(LP_CLKRST_BASE)
+        esp_power.configure_sleep(&mut pmu)
+        lp_clock := esp_power.use_rc_fast(&mut lp_clkrst)
+        sources := esp_power.WAKE_GPIO
+        deadline := 0u64
+        if timeout != 0 {
+            deadline = esp_power.lp_ticks(&mut timer) + timeout
+            esp_power.arm_lp_alarm(&mut timer, deadline)
+            sources |= esp_power.WAKE_LP_TIMER
+        }
+        saved: [31]u32 = [0u32; 31]
+        woken := 0u32
+        failure := 0u32
+        for woken == 0 {
+            esp_power.arm_pins(&mut gpio, pins, levels, &mut saved)
+            sysclk := mmio.read32(PCR_SYSCLK_CONF)
+            mmio.write32(PCR_SYSCLK_CONF, (sysclk & ~SOC_CLK_SEL) | hal.encode(SOC_CLK_SEL, SOC_CLK_XTAL))
+            ets_update_cpu_frequency(XTAL_HZ / 1_000_000)
+            slept := esp_power.sleep(&mut pmu, sources, sources)
+            stable := esp_power.wait_for_pll(&mut pmu)
+            mmio.write32(PCR_SYSCLK_CONF, sysclk)
+            ets_update_cpu_frequency(CPU_HZ / 1_000_000)
+            latched := esp_power.latched_pins(&mut gpio, pins)
+            now_levels := esp_power.levels(&mut gpio)
+            esp_power.disarm_pins(&mut gpio, pins, &saved)
+            if !is_ok_bool(slept) || !is_ok_void(stable) {
+                failure = 1
+                break
+            }
+            changed := (now_levels ^ levels) & pins
+            pulsed := latched & ~changed
+            woken = esp_power.events_seen(wake, levels, changed, pulsed) | (esp_power.levels_present(wake, now_levels) & pins)
+            if timeout != 0 && esp_power.lp_ticks(&mut timer) >= deadline {
+                break
+            }
+            levels = now_levels
+        }
+        if timeout != 0 {
+            esp_power.disarm_lp_alarm(&mut timer)
+        }
+        esp_power.restore_lp_fast_clock(&mut lp_clkrst, lp_clock)
+        if failure != 0 {
+            return err(hal.Error.Timeout)
+        }
+        return ok(woken as u64)
+    }
+}
+
+fn is_ok_bool(result: bool!hal.Error) -> bool {
+    match result {
+        ok(_) => {
+            return true
+        }
+        err(_) => {
+            return false
+        }
+    }
+}
+
+fn is_ok_void(result: void!hal.Error) -> bool {
+    match result {
+        ok() => {
+            return true
+        }
+        err(_) => {
+            return false
+        }
     }
 }

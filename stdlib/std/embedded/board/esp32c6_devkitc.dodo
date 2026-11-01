@@ -71,6 +71,9 @@ pub struct Board {
     // The DMA channels: `channel()` claims one, for copies that run while
     // the program does other work.
     pub dma: esp32c6.Dma
+    // Sleep modes, clock gating, and the dormant state, the
+    // std/embedded/power protocol; see esp32c6.Power.
+    pub power: esp32c6.Power
 }
 
 // Start the chip and claim the LED, off. A second call returns
@@ -78,10 +81,10 @@ pub struct Board {
 pub fn take() -> Board!hal.Error {
     chip := esp32c6.take()?
     leds := chip.pins.ws2812(LED_PIN)?
-    let esp32c6.Peripherals { pins, timer, usb, dma } = chip
+    let esp32c6.Peripherals { pins, timer, usb, dma, power } = chip
     led := Led { leds, color: LED_ON_COLOR, on: false }
     led.set_low()
-    return ok(Board { led, pins, timer, usb, dma })
+    return ok(Board { led, pins, timer, usb, dma, power })
 }
 
 // The board's RGB LED: an output pin, on when high, for the board contract
