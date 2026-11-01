@@ -73,7 +73,8 @@ fn unescape(literal: &str) -> Vec<u8> {
 #[test]
 fn generated_dictionary_matches_rfc_7932() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let tables = std::fs::read_to_string(root.join("stdlib/std/compress/brotli/tables.dodo")).unwrap();
+    let tables =
+        std::fs::read_to_string(root.join("stdlib/std/compress/brotli/tables.dodo")).unwrap();
     let line = tables
         .lines()
         .find(|line| line.starts_with("const DICTIONARY: &[u8] = b\""))
@@ -162,8 +163,18 @@ fn brotli_decoder_matches_brotli_tool() {
     );
     let mut rng = Rng(0x2545_f491_4f6c_dd1d);
     let words: Vec<&[u8]> = vec![
-        b"the ", b"of ", b"and ", b"brotli ", b"window ", b"The ", b"dictionary, ",
-        b"compression. ", b"<a href=\"", b"\">", b"information ", b"\n",
+        b"the ",
+        b"of ",
+        b"and ",
+        b"brotli ",
+        b"window ",
+        b"The ",
+        b"dictionary, ",
+        b"compression. ",
+        b"<a href=\"",
+        b"\">",
+        b"information ",
+        b"\n",
     ];
     for case in 0..48 {
         let size = rng.below(40_000) as usize;
@@ -179,7 +190,9 @@ fn brotli_decoder_matches_brotli_tool() {
                 }
                 text
             }
-            2 => (0..size).map(|i| ((i * i) >> 7) as u8 ^ (i as u8)).collect(),
+            2 => (0..size)
+                .map(|i| ((i * i) >> 7) as u8 ^ (i as u8))
+                .collect(),
             _ => {
                 let chunk: Vec<u8> = (0..1 + rng.below(300)).map(|_| rng.next() as u8).collect();
                 chunk.iter().cycle().take(size).copied().collect()
@@ -192,7 +205,10 @@ fn brotli_decoder_matches_brotli_tool() {
         for mode in [0u8, 2, 5] {
             let (code, output) = oracle(&executable, mode, &stream);
             assert_eq!(code, 0, "case {case} q{quality} w{window} mode {mode}");
-            assert!(output == data, "case {case} q{quality} w{window} mode {mode}: output differs");
+            assert!(
+                output == data,
+                "case {case} q{quality} w{window} mode {mode}: output differs"
+            );
         }
         // Corrupted copies: accepted exactly when the tool accepts them,
         // with the same output.
@@ -209,13 +225,23 @@ fn brotli_decoder_matches_brotli_tool() {
                 (10..=15).contains(&code) || code == 0,
                 "case {case}: oracle exit {code}"
             );
-            assert_eq!(code == 0, accepted, "case {case}: verdict differs at byte {at}");
+            assert_eq!(
+                code == 0,
+                accepted,
+                "case {case}: verdict differs at byte {at}"
+            );
             if accepted {
-                assert!(output == expected, "case {case}: output differs at byte {at}");
+                assert!(
+                    output == expected,
+                    "case {case}: output differs at byte {at}"
+                );
                 // Accepted streams decode in the workspace they report.
                 let (exact, again) = oracle(&executable, 5, &broken);
                 assert_eq!(exact, 0, "case {case}: exact workspace fails at byte {at}");
-                assert!(again == expected, "case {case}: exact workspace output differs at byte {at}");
+                assert!(
+                    again == expected,
+                    "case {case}: exact workspace output differs at byte {at}"
+                );
             }
         }
     }
