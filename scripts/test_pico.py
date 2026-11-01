@@ -110,6 +110,7 @@ LAST_CHECKS = [
     "flash region erases, writes across pages, and reads back while code runs from flash",
     "flash is refused while core 1 runs a task",
     "key-value store on flash compacts, reopens, and keeps its values",
+    "timer channels: an alarm fires as a compare channel and runs periodically in phase, counting missed periods (and TIMER1 keeps pace on the RP2350); a PWM slice timer counts clk_sys against the timer and counts its periods; a PIO edge capture times a toggling pin exactly and reports a full FIFO as Overrun",
     "invalid crystal is rejected",
     "chip take() after board take() is refused",
     "delay_ms(10) lasts 10 ms",
