@@ -1,0 +1,1189 @@
+package main
+
+import "std/embedded/board"
+import "std/embedded/chip"
+import "std/embedded/executor"
+import "std/embedded/hal"
+import "std/fmt"
+import "std/io"
+
+// Hardware checks for the ESP32-C6's bus features in
+// std/embedded/chip/esp32c6, std/embedded/peripheral/esp_i2c, and esp_spi:
+// polled I2C and SPI transactions, the I2C and SPI targets, the SPI
+// controller's own chip select, SPI by DMA, and the serial ports'
+// poll_flush. Nothing needs to be wired to the board. The other side of
+// each bus is the program itself, bit-banging on separate pads that reach
+// the controller through the GPIO matrix: a pad's level can be read by any
+// peripheral input and by GPIO_IN, whatever drives it.
+//
+// Same protocol as tests/hardware/esp32c6_devkitc: after the host sends a
+// byte, `selftest ready`, then `check N ok` or `check N FAILED` per check,
+// and `selftest done N`. Run with
+// `python3 scripts/test_esp32c6.py --project tests/hardware/esp32c6_buses`.
+
+static mut CHECKS: u32 = 0
+static mut SERIAL: Option<chip.UsbSerial> = none
+
+fn say(text: &str) {
+    unsafe {
+        match &mut SERIAL {
+            some(serial) => {
+                fmt.printf(serial, "{}", text)!
+                serial.flush()!
+            }
+            none => {}
+        }
+    }
+}
+
+fn say_number(text: &str, value: u32) {
+    unsafe {
+        match &mut SERIAL {
+            some(serial) => {
+                fmt.printf(serial, "{}{}\n", text, value)!
+                serial.flush()!
+            }
+            none => {}
+        }
+    }
+}
+
+fn say_flags(text: &str, a: bool, b: bool, c: bool, d: bool) {
+    unsafe {
+        match &mut SERIAL {
+            some(serial) => {
+                fmt.printf(serial, "{}{} {} {} {}\n", text, a, b, c, d)!
+                serial.flush()!
+            }
+            none => {}
+        }
+    }
+}
+
+fn check(ok: bool) {
+    unsafe {
+        match &mut SERIAL {
+            some(serial) => {
+                if ok {
+                    fmt.printf(serial, "check {} ok\n", CHECKS)!
+                } else {
+                    fmt.printf(serial, "check {} FAILED\n", CHECKS)!
+                }
+                serial.flush()!
+            }
+            none => {}
+        }
+        CHECKS += 1
+    }
+}
+
+fn refused<T>(result: T!hal.Error, expected: hal.Error) -> bool {
+    match result {
+        ok(_) => {
+            return false
+        }
+        err(error) => {
+            return error == expected
+        }
+    }
+}
+
+fn failed_with(result: void!hal.Error, expected: hal.Error) -> bool {
+    match result {
+        ok() => {
+            return false
+        }
+        err(error) => {
+            return error == expected
+        }
+    }
+}
+
+fn report(what: &str, error: hal.Error) {
+    say(what)
+    say(hal.error_name(error))
+    say("\n")
+}
+
+fn level_bit(high: bool) -> u32 {
+    if high {
+        return 1
+    }
+    return 0
+}
+
+// --- Raw GPIO access to pads the buses own --------------------------------
+
+const GPIO_BASE: usize = 0x6009_1000
+
+fn reg(offset: usize) -> hal.Reg<u32> {
+    // SAFETY: the GPIO block's registers; the test owns the pads it uses.
+    unsafe {
+        return hal.Reg.at(GPIO_BASE + offset)
+    }
+}
+
+// The level of pad `pin`, whatever drives it.
+fn pin_level(pin: u32) -> bool {
+    input := reg(0x3C)
+    return input.any(1u32 << pin)
+}
+
+// Drive pad `pin` from the GPIO output register, whatever peripheral reads
+// it, as a bit-banged bus master does.
+fn drive(pin: u32, high: bool) {
+    if high {
+        set := reg(0x08)
+        set.write(1u32 << pin)
+    } else {
+        clear := reg(0x0C)
+        clear.write(1u32 << pin)
+    }
+}
+
+// Let the GPIO output register drive pad `pin`, high at first.
+fn take_pad(pin: u32) {
+    select := reg(0x554 + 4 * pin as usize)
+    select.write(128 | (1u32 << 9))
+    drive(pin, true)
+    enable := reg(0x24)
+    enable.write(1u32 << pin)
+}
+
+fn free_pad(pin: u32) {
+    disable := reg(0x28)
+    disable.write(1u32 << pin)
+}
+
+// Pull pad `pin` low with its pull-down, or let its pull-up raise it: a
+// software device on an open-drain bus line the controller drives too,
+// which reads the line as low while either holds it low.
+fn pull_low(pin: u32, low: bool) {
+    pad := pad_reg(pin)
+    value := pad.read() & ~((1u32 << 7) | (1u32 << 8))
+    if low {
+        value |= 1u32 << 7
+    } else {
+        value |= 1u32 << 8
+    }
+    pad.write(value)
+}
+
+fn pad_reg(pin: u32) -> hal.Reg<u32> {
+    // SAFETY: the pad's IO_MUX register; the test owns the pad.
+    unsafe {
+        return hal.Reg.at(0x6009_0004 + 4 * pin as usize)
+    }
+}
+
+// Feed peripheral input signal `signal` from pad `pin`.
+fn route_input(signal: u32, pin: u32) {
+    select := reg(0x154 + 4 * signal as usize)
+    select.write(pin | (1u32 << 7))
+}
+
+// Latch edges of `kind` on pad `pin` (1 rising, 2 falling) in GPIO_STATUS.
+fn watch(pin: u32, kind: u32) {
+    config := reg(0x74 + 4 * pin as usize)
+    value := config.read() & ~((7u32 << 7) | (0x1Fu32 << 13))
+    config.write(value | (kind << 7) | (1u32 << 13))
+    clear_latch(pin)
+}
+
+fn unwatch(pin: u32) {
+    config := reg(0x74 + 4 * pin as usize)
+    value := config.read() & ~((7u32 << 7) | (0x1Fu32 << 13))
+    config.write(value)
+    clear_latch(pin)
+}
+
+fn latched(pin: u32) -> bool {
+    status := reg(0x44)
+    return status.any(1u32 << pin)
+}
+
+fn clear_latch(pin: u32) {
+    clear := reg(0x4C)
+    clear.write(1u32 << pin)
+}
+
+fn raw_i2c(offset: usize) -> u32 {
+    // SAFETY: reads an I2C0 status register.
+    unsafe {
+        register: hal.Reg<u32> = hal.Reg.at(0x6000_4000 + offset)
+        return register.read()
+    }
+}
+
+const SIGNAL_I2C_SCL: u32 = 45
+const SIGNAL_I2C_SDA: u32 = 46
+
+// The software master's lines on the target's pads: high releases.
+fn master_sda(high: bool) {
+    pull_low(TARGET_SDA, !high)
+}
+
+fn master_scl(high: bool) {
+    pull_low(TARGET_SCL, !high)
+}
+
+// --- Polled I2C master ----------------------------------------------------
+
+// The polled I2C master on pads 6 (SDA) and 7 (SCL): against nothing, then
+// against a software target that reads both pads and answers by pulling
+// SDA low with the pad's pull-down.
+fn i2c_master_checks(pins: &mut chip.Pins, timer: &mut chip.Timer) {
+    i2c := pins.i2c(6, 7, hal.I2C_STANDARD_HZ)!
+    byte: [1]u8 = [0]
+    // No device answers 0x7C: each poll returns at once, and the address
+    // phase, about 100 us at 100 kHz, ends with NoAcknowledge.
+    polls := 0u32
+    start := timer.now_us()
+    nack := false
+    for {
+        match i2c.poll_read(0x7C, &mut byte) {
+            ok(done) => {
+                if done {
+                    break
+                }
+            }
+            err(error) => {
+                nack = error == hal.Error.NoAcknowledge
+                break
+            }
+        }
+        polls += 1
+        if polls == 1 {
+            // Another transaction while this one runs is refused, and this
+            // one keeps running.
+            other: [2]u8 = [0, 0]
+            nack = refused(i2c.poll_read(0x7C, &mut other), hal.Error.InvalidInput)
+        }
+    }
+    elapsed := timer.now_us() - start
+    say_number("polled nack polls ", polls)
+    say_number("polled nack us ", elapsed as u32)
+    register: [1]u8 = [0]
+    write_nack := false
+    for {
+        match i2c.poll_write_read(0x7C, &register, &mut byte) {
+            ok(done) => {
+                if done {
+                    break
+                }
+            }
+            err(error) => {
+                write_nack = error == hal.Error.NoAcknowledge
+                break
+            }
+        }
+    }
+    check(nack && write_nack && polls > 5 && elapsed >= 90 && elapsed < 600 && !i2c.is_busy())
+    // A cancelled transaction leaves the bus usable.
+    long: [40]u8 = [0x55; 40]
+    started := !i2c.poll_write(0x7C, &long)!
+    i2c.cancel()
+    check(started && !i2c.is_busy() && failed_with(i2c.write(0x7C, &register), hal.Error.NoAcknowledge))
+
+    // Against the software target at 5 kHz: 70 bytes written in three
+    // runs, then 70 read back after a repeated start in three more.
+    pins.release_i2c(i2c)
+    slow := pins.i2c(6, 7, 5000)!
+    soft := SoftTarget.new(0x3A)
+    data: [71]u8 = [0; 71]
+    data[0] = 0x20
+    for index in 1..71usize {
+        data[index] = ((index * 7 + 1) & 255) as u8
+    }
+    wrote := false
+    write_polls := 0u32
+    for soft.alive {
+        soft.step()
+        match slow.poll_write(0x3A, &data) {
+            ok(done) => {
+                if done {
+                    wrote = true
+                    break
+                }
+            }
+            err(error) => {
+                report("soft write: ", error)
+                break
+            }
+        }
+        write_polls += 1
+    }
+    // Let the target see the stop.
+    for _ in 0..2000 {
+        soft.step()
+    }
+    if !wrote {
+        say_number("soft steps ", soft.steps)
+        say_number("soft phase ", soft.phase)
+        say_number("soft bits ", soft.bits)
+        say_number("soft value ", soft.value)
+        say_number("soft starts ", soft.starts)
+        say_number("soft written ", soft.written)
+        say_number("write polls ", write_polls)
+        say_number("i2c raw ", raw_i2c(0x20))
+        say_number("i2c sr ", raw_i2c(0x08))
+        input := reg(0x3C)
+        say_number("gpio in ", input.read())
+        slow.cancel()
+    }
+    same := wrote
+    for index in 1..71usize {
+        same = same && soft.memory[0x20 + index - 1] == data[index]
+    }
+    say_number("soft target starts ", soft.starts)
+    say_number("soft target stops ", soft.stops)
+    say_number("soft target bytes ", soft.written)
+    check(same && soft.starts == 1 && soft.restarts == 0 && soft.stops == 1 && soft.written == 71 && write_polls > 3)
+    pointer: [1]u8 = [0x20]
+    back: [70]u8 = [0; 70]
+    read := false
+    for soft.alive {
+        soft.step()
+        match slow.poll_write_read(0x3A, &pointer, &mut back) {
+            ok(done) => {
+                if done {
+                    read = true
+                    break
+                }
+            }
+            err(error) => {
+                report("soft write_read: ", error)
+                break
+            }
+        }
+    }
+    for _ in 0..2000 {
+        soft.step()
+    }
+    same = read
+    for index in 0..70usize {
+        same = same && back[index] == data[index + 1]
+    }
+    say_number("soft target restarts ", soft.restarts)
+    check(same && soft.starts == 2 && soft.restarts == 1 && soft.stops == 2)
+    pins.release_i2c(slow)
+}
+
+// Software target phases.
+const SOFT_IDLE: u32 = 0
+const SOFT_RECEIVE: u32 = 1
+const SOFT_ACK: u32 = 2
+const SOFT_SEND: u32 = 3
+const SOFT_MASTER_ACK: u32 = 4
+
+// An I2C target in software with a register pointer and 256 bytes of
+// memory, decoding SCL (pad 7) and SDA (pad 6) by polling, and answering by
+// pulling SDA low.
+struct SoftTarget {
+    address: u8
+    memory: [256]u8
+    pointer: usize
+    last_scl: bool
+    last_sda: bool
+    phase: u32
+    // Receiving: the byte so far and its bits; whether it is the address,
+    // and whether the next written byte sets the pointer.
+    value: u32
+    bits: u32
+    addressing: bool
+    first_data: bool
+    selected: bool
+    reading: bool
+    // Sending: the byte and the bit on the line.
+    out: u8
+    out_bit: u32
+    acked: bool
+    active: bool
+    starts: u32
+    restarts: u32
+    stops: u32
+    written: u32
+    alive: bool
+    steps: u32
+
+    fn new(address: u8) -> SoftTarget {
+        memory: [256]u8 = [0; 256]
+        return SoftTarget { address, memory, pointer: 0, last_scl: true, last_sda: true, phase: SOFT_IDLE, value: 0, bits: 0, addressing: false, first_data: false, selected: false, reading: false, out: 0, out_bit: 0, acked: false, active: false, starts: 0, restarts: 0, stops: 0, written: 0, alive: true, steps: 0 }
+    }
+
+    fn step(&mut self) {
+        self.steps += 1
+        if self.steps > 3_000_000 {
+            self.alive = false
+        }
+        scl := pin_level(7)
+        sda := pin_level(6)
+        if scl && self.last_scl && sda != self.last_sda {
+            if !sda {
+                // START or repeated START.
+                if self.active {
+                    self.restarts += 1
+                } else {
+                    self.starts += 1
+                }
+                self.active = true
+                self.phase = SOFT_RECEIVE
+                self.addressing = true
+                self.value = 0
+                self.bits = 0
+                pull_low(6, false)
+            } else {
+                self.stops += 1
+                self.active = false
+                self.phase = SOFT_IDLE
+                pull_low(6, false)
+            }
+        } else if scl && !self.last_scl {
+            if self.phase == SOFT_RECEIVE {
+                self.value = (self.value << 1) | level_bit(sda)
+                self.bits += 1
+            } else if self.phase == SOFT_MASTER_ACK {
+                self.acked = !sda
+            }
+        } else if !scl && self.last_scl {
+            if self.phase == SOFT_RECEIVE && self.bits == 8 {
+                byte := (self.value & 0xFF) as u8
+                acknowledge := false
+                if self.addressing {
+                    self.addressing = false
+                    self.selected = (byte >> 1) == self.address
+                    self.reading = (byte & 1) != 0
+                    self.first_data = !self.reading
+                    acknowledge = self.selected
+                } else if self.selected && !self.reading {
+                    if self.first_data {
+                        self.pointer = byte as usize
+                        self.first_data = false
+                    } else {
+                        self.memory[self.pointer & 255] = byte
+                        self.pointer += 1
+                    }
+                    self.written += 1
+                    acknowledge = true
+                }
+                if acknowledge {
+                    pull_low(6, true)
+                    self.phase = SOFT_ACK
+                } else {
+                    self.phase = SOFT_IDLE
+                }
+            } else if self.phase == SOFT_ACK {
+                pull_low(6, false)
+                if self.reading {
+                    self.send_next()
+                } else {
+                    self.phase = SOFT_RECEIVE
+                    self.value = 0
+                    self.bits = 0
+                }
+            } else if self.phase == SOFT_SEND {
+                if self.out_bit == 0 {
+                    pull_low(6, false)
+                    self.phase = SOFT_MASTER_ACK
+                } else {
+                    self.out_bit -= 1
+                    self.put_bit()
+                }
+            } else if self.phase == SOFT_MASTER_ACK {
+                if self.acked {
+                    self.send_next()
+                } else {
+                    pull_low(6, false)
+                    self.phase = SOFT_IDLE
+                }
+            }
+        }
+        self.last_scl = scl
+        self.last_sda = sda
+    }
+
+    fn send_next(&mut self) {
+        self.out = self.memory[self.pointer & 255]
+        self.pointer += 1
+        self.out_bit = 7
+        self.phase = SOFT_SEND
+        self.put_bit()
+    }
+
+    fn put_bit(&mut self) {
+        if ((self.out >> self.out_bit as u8) & 1) != 0 {
+            pull_low(6, false)
+        } else {
+            pull_low(6, true)
+        }
+    }
+}
+
+// --- I2C target -----------------------------------------------------------
+
+// The target on pads 18 (SDA) and 19 (SCL); the software master pulls the
+// same lines low with the pads' pull-downs, a wired AND with the target's
+// open-drain outputs, so the target's stretching holds SCL low for both.
+const TARGET_SDA: u32 = 18
+const TARGET_SCL: u32 = 19
+
+// What the target reported, in TargetRig.log.
+const EVENT_BYTE: u32 = 0x100
+const EVENT_START: u32 = 0x200
+const EVENT_STOP: u32 = 0x300
+const EVENT_READ: u32 = 0x400
+
+// A software master and the target it talks to, which it serves whenever
+// the target stretches SCL.
+struct TargetRig {
+    target: chip.I2cTarget
+    log: [128]u32
+    logged: usize
+    reply: [64]u8
+    reply_length: usize
+    replied: usize
+    stretches: u32
+    failed: bool
+
+    fn record(&mut self, event: u32) {
+        if self.logged < 128 {
+            self.log[self.logged] = event
+            self.logged += 1
+        }
+    }
+
+    // Poll the target once and act on what it reports.
+    fn serve(&mut self) {
+        buffer: [8]u8 = [0; 8]
+        match self.target.poll(&mut buffer) {
+            ok(event) => {
+                match event {
+                    hal.I2cTargetEvent.Write(count, start) => {
+                        if start {
+                            self.record(EVENT_START)
+                        }
+                        for index in 0..count {
+                            self.record(EVENT_BYTE | buffer[index] as u32)
+                        }
+                    }
+                    hal.I2cTargetEvent.Read => {
+                        self.record(EVENT_READ)
+                        rest: [64]u8 = [0; 64]
+                        left := self.reply_length - self.replied
+                        for index in 0..left {
+                            rest[index] = self.reply[self.replied + index]
+                        }
+                        sent := self.target.respond(&rest[..left])!
+                        self.replied += sent
+                    }
+                    hal.I2cTargetEvent.Stop => {
+                        self.record(EVENT_STOP)
+                    }
+                    hal.I2cTargetEvent.Idle => {}
+                }
+            }
+            err(error) => {
+                report("target poll: ", error)
+                self.failed = true
+            }
+        }
+    }
+
+    // Serve until the target is idle and the FIFO empty.
+    fn settle(&mut self) {
+        for _ in 0..200 {
+            self.serve()
+        }
+    }
+
+    // Release SCL and wait until it is high, while the target stretches
+    // it, serving the target meanwhile.
+    fn raise_scl(&mut self, timer: &mut chip.Timer) {
+        master_scl(true)
+        timer.delay_us(2)
+        if !pin_level(TARGET_SCL) {
+            self.stretches += 1
+            polls := 0u32
+            for !pin_level(TARGET_SCL) {
+                self.serve()
+                polls += 1
+                if polls > 100_000 {
+                    say("target holds SCL\n")
+                    self.failed = true
+                    break
+                }
+            }
+            timer.delay_us(2)
+        }
+        timer.delay_us(3)
+    }
+
+    fn lower_scl(&mut self, timer: &mut chip.Timer) {
+        master_scl(false)
+        timer.delay_us(5)
+    }
+
+    fn start(&mut self, timer: &mut chip.Timer) {
+        master_sda(true)
+        timer.delay_us(2)
+        self.raise_scl(timer)
+        master_sda(false)
+        timer.delay_us(5)
+        self.lower_scl(timer)
+    }
+
+    fn stop(&mut self, timer: &mut chip.Timer) {
+        master_sda(false)
+        timer.delay_us(2)
+        self.raise_scl(timer)
+        master_sda(true)
+        timer.delay_us(5)
+    }
+
+    // Send a byte; true if the target acknowledged it.
+    fn send(&mut self, timer: &mut chip.Timer, byte: u8) -> bool {
+        for bit in 0..8u32 {
+            master_sda(((byte >> (7 - bit) as u8) & 1) != 0)
+            timer.delay_us(2)
+            self.raise_scl(timer)
+            self.lower_scl(timer)
+        }
+        master_sda(true)
+        timer.delay_us(2)
+        self.raise_scl(timer)
+        acknowledged := !pin_level(TARGET_SDA)
+        self.lower_scl(timer)
+        return acknowledged
+    }
+
+    // Receive a byte, acknowledging it if `more` follow.
+    fn receive(&mut self, timer: &mut chip.Timer, more: bool) -> u8 {
+        master_sda(true)
+        value := 0u32
+        for _ in 0..8 {
+            timer.delay_us(2)
+            self.raise_scl(timer)
+            value = (value << 1) | level_bit(pin_level(TARGET_SDA))
+            self.lower_scl(timer)
+        }
+        master_sda(!more)
+        timer.delay_us(2)
+        self.raise_scl(timer)
+        self.lower_scl(timer)
+        master_sda(true)
+        return (value & 0xFF) as u8
+    }
+
+    fn expect(&self, events: &[u32]) -> bool {
+        if self.logged != events.len {
+            say_number("events logged ", self.logged as u32)
+            for index in 0..self.logged {
+                say_number("  event ", self.log[index])
+            }
+            return false
+        }
+        for index in 0..events.len {
+            if self.log[index] != events[index] {
+                say_number("event differs at ", index as u32)
+                say_number("  got ", self.log[index])
+                return false
+            }
+        }
+        return true
+    }
+}
+
+fn i2c_target_checks(pins: &mut chip.Pins, timer: &mut chip.Timer) {
+    check(refused(pins.i2c_target(TARGET_SDA, TARGET_SCL, 0x05, false, 100_000), hal.Error.InvalidInput) && refused(pins.i2c_target(TARGET_SDA, TARGET_SCL, 0x400, true, 100_000), hal.Error.InvalidInput) && refused(pins.i2c_target(TARGET_SDA, TARGET_SDA, 0x42, false, 100_000), hal.Error.InvalidInput))
+    target := pins.i2c_target(TARGET_SDA, TARGET_SCL, 0x42, false, 100_000)!
+    busy := refused(pins.i2c(6, 7, 100_000), hal.Error.Busy)
+    timer.delay_us(100)
+    rig := TargetRig { target, log: [0u32; 128], logged: 0, reply: [0; 64], reply_length: 0, replied: 0, stretches: 0, failed: false }
+    rig.settle()
+    rig.logged = 0
+
+    // A write of three bytes.
+    rig.start(timer)
+    acks := rig.send(timer, 0x42 << 1)
+    acks = rig.send(timer, 0x10) && acks
+    acks = rig.send(timer, 0x20) && acks
+    acks = rig.send(timer, 0x30) && acks
+    rig.stop(timer)
+    rig.settle()
+    write_events: [5]u32 = [EVENT_START, EVENT_BYTE | 0x10, EVENT_BYTE | 0x20, EVENT_BYTE | 0x30, EVENT_STOP]
+    wrote := rig.expect(&write_events)
+    say_flags("target write acks, events, ok, busy ", acks, wrote, !rig.failed, busy)
+    say_number("target stretches ", rig.stretches)
+    check(busy && acks && wrote && !rig.failed)
+
+    // A register read: write 0x05, repeated start, read four bytes, which
+    // the target answers while it holds SCL low.
+    rig.logged = 0
+    rig.stretches = 0
+    rig.reply_length = 4
+    rig.replied = 0
+    rig.reply[0] = 0xA1
+    rig.reply[1] = 0xB2
+    rig.reply[2] = 0xC3
+    rig.reply[3] = 0xD4
+    rig.start(timer)
+    acks = rig.send(timer, 0x42 << 1)
+    acks = rig.send(timer, 0x05) && acks
+    rig.start(timer)
+    acks = rig.send(timer, (0x42 << 1) | 1) && acks
+    got: [4]u8 = [0; 4]
+    for index in 0..4usize {
+        got[index] = rig.receive(timer, index < 3)
+    }
+    rig.stop(timer)
+    rig.settle()
+    read_events: [5]u32 = [EVENT_START, EVENT_BYTE | 0x05, EVENT_READ, EVENT_STOP, 0]
+    events_ok := rig.expect(&read_events[..4])
+    data_ok := got[0] == 0xA1 && got[1] == 0xB2 && got[2] == 0xC3 && got[3] == 0xD4
+    say_flags("target read acks, events, data, stretched ", acks, events_ok, data_ok, rig.stretches > 0)
+    check(acks && events_ok && data_ok && rig.stretches > 0 && !rig.failed)
+
+    // 40 bytes each way: beyond the 32-byte FIFOs, so the target stretches
+    // SCL on a full receive FIFO and asks for more of a reply.
+    rig.logged = 0
+    rig.stretches = 0
+    rig.start(timer)
+    acks = rig.send(timer, 0x42 << 1)
+    for index in 0..40u32 {
+        acks = rig.send(timer, (index + 0x40) as u8) && acks
+    }
+    rig.stop(timer)
+    rig.settle()
+    long_ok := rig.logged == 42 && rig.log[0] == EVENT_START && rig.log[41] == EVENT_STOP
+    for index in 0..40usize {
+        long_ok = long_ok && rig.log[index + 1] == (EVENT_BYTE | (index as u32 + 0x40))
+    }
+    if !long_ok {
+        say_number("long write events ", rig.logged as u32)
+    }
+    write_stretches := rig.stretches
+    rig.logged = 0
+    rig.reply_length = 40
+    rig.replied = 0
+    for index in 0..40usize {
+        rig.reply[index] = (index * 3 + 1) as u8
+    }
+    rig.start(timer)
+    acks = rig.send(timer, (0x42 << 1) | 1) && acks
+    long_read := true
+    for index in 0..40usize {
+        long_read = rig.receive(timer, index < 39) == (index * 3 + 1) as u8 && long_read
+    }
+    rig.stop(timer)
+    rig.settle()
+    reads := 0u32
+    for index in 0..rig.logged {
+        if rig.log[index] == EVENT_READ {
+            reads += 1
+        }
+    }
+    say_number("long write stretches ", write_stretches)
+    say_number("long read requests ", reads)
+    say_flags("long acks, write, read, ok ", acks, long_ok, long_read, !rig.failed)
+    check(acks && long_ok && long_read && write_stretches > 0 && reads >= 2 && rig.replied == 40 && !rig.failed)
+
+    // An address alone, as a probe sends it: acknowledged; whether the
+    // target reports its STOP is printed.
+    rig.logged = 0
+    rig.start(timer)
+    probed := rig.send(timer, 0x42 << 1)
+    rig.stop(timer)
+    rig.settle()
+    say_number("probe acknowledged, events ", level_bit(probed) * 100 + rig.logged as u32)
+    // Another address is not acknowledged and reaches nothing; a 10-bit
+    // address is.
+    rig.logged = 0
+    rig.start(timer)
+    other := rig.send(timer, 0x43 << 1)
+    rig.stop(timer)
+    rig.settle()
+    ignored := !other && rig.logged == 0
+    rig.target.set_address(0x2A5, true)!
+    rig.start(timer)
+    header := rig.send(timer, 0xF4)
+    low := rig.send(timer, 0xA5)
+    data := rig.send(timer, 0x77)
+    rig.stop(timer)
+    rig.settle()
+    ten_events: [3]u32 = [EVENT_START, EVENT_BYTE | 0x77, EVENT_STOP]
+    ten_ok := rig.expect(&ten_events)
+    say_flags("ignored, 10-bit header, low, data ", ignored, header, low, data)
+    check(ignored && header && low && data && ten_ok && !rig.failed)
+
+    let TargetRig { target: back, log, logged, reply, reply_length, replied, stretches, failed } = rig
+    pins.release_i2c_target(back)
+    // The controller is a master again afterwards.
+    again := pins.i2c(6, 7, 100_000)!
+    byte: [1]u8 = [0]
+    check(failed_with(again.read(0x7C, &mut byte), hal.Error.NoAcknowledge))
+    pins.release_i2c(again)
+}
+
+// --- SPI master: polling, hardware chip select, DMA -----------------------
+
+const SPI_CLOCK: u32 = 4
+const SPI_TX: u32 = 5
+const SPI_RX: u32 = 2
+const SPI_SELECT: u32 = 3
+
+static mut BIG: [16384]u8 = [0u8; 16384]
+const SPI_DONE: executor.Signal = executor.Signal { id: 0 }
+
+fn spi_master_checks(pins: &mut chip.Pins, timer: &mut chip.Timer, dma: &mut chip.Dma) {
+    spi := pins.spi(SPI_CLOCK, SPI_TX, some(SPI_RX), hal.SpiMode.Mode0, 1_000_000)!
+    spi.set_loopback(true)
+    data: [200]u8 = [0; 200]
+    for index in 0..200usize {
+        data[index] = ((index * 11 + 3) & 255) as u8
+    }
+    polls := 0u32
+    refused_other := false
+    for !spi.poll_transfer(&mut data)! {
+        polls += 1
+        if polls == 1 {
+            short: [3]u8 = [0; 3]
+            refused_other = refused(spi.poll_transfer(&mut short), hal.Error.InvalidInput) && failed_with(spi.transfer(&mut short), hal.Error.Busy)
+        }
+    }
+    same := true
+    for index in 0..200usize {
+        same = same && data[index] == ((index * 11 + 3) & 255) as u8
+    }
+    say_number("polled spi polls ", polls)
+    check(same && refused_other && polls > 100 && !spi.is_busy())
+    started := !spi.poll_write(&data)!
+    spi.cancel()
+    one: [1]u8 = [0x96]
+    spi.transfer(&mut one)!
+    check(started && !spi.is_busy() && one[0] == 0x96)
+
+    // By DMA: 16 KiB at 20 MHz, 6.6 ms, while the program counts, and
+    // the channel's signal from the DMA_IN_CH0 handler.
+    spi.set_frequency(20_000_000)!
+    channel := dma.channel()!
+    SPI_DONE.reset()
+    channel.set_signal(&SPI_DONE)
+    dma_ok := false
+    unsafe {
+        for index in 0..16384usize {
+            BIG[index] = ((index * 7 + (index >> 8)) & 255) as u8
+        }
+        transfers := spi.dma(&mut channel, &mut BIG)!
+        lent := true
+        spins := 0u32
+        start := timer.now_us()
+        match transfers.start_transfer(16384) {
+            ok() => {
+                lent = refused(transfers.buffer(), hal.Error.Busy) && refused_void(transfers.start_write(4), hal.Error.Busy)
+                for transfers.is_busy() {
+                    spins += 1
+                    if spins == 20_000_000 {
+                        say("dma transfer does not end\n")
+                        dump_dma()
+                        transfers.abort()
+                    }
+                }
+            }
+            err(error) => {
+                report("dma start: ", error)
+            }
+        }
+        elapsed := timer.now_us() - start
+        raised := SPI_DONE.is_raised()
+        finished := true
+        match transfers.finish() {
+            ok() => {}
+            err(error) => {
+                report("dma finish: ", error)
+                finished = false
+            }
+        }
+        echoed := transfers.buffer()!
+        looped := true
+        for index in 0..16384usize {
+            looped = looped && echoed[index] == ((index * 7 + (index >> 8)) & 255) as u8
+        }
+        say_number("dma spins ", spins)
+        say_number("dma 16 KiB us ", elapsed as u32)
+        say_flags("dma lent, raised, finished, looped ", lent, raised, finished, looped)
+        dma_ok = lent && raised && finished && looped && spins > 1000 && elapsed >= 6500 && elapsed < 8000
+        // A write leaves the buffer as it is and raises no signal.
+        SPI_DONE.reset()
+        echoed[0] = 0x11
+        wrote := true
+        match transfers.write(1000) {
+            ok() => {}
+            err(error) => {
+                report("dma write: ", error)
+                dump_dma()
+                wrote = false
+            }
+        }
+        kept := wrote && transfers.buffer()![0] == 0x11 && !SPI_DONE.is_raised()
+        refused_size := refused_void(transfers.start_transfer(0), hal.Error.InvalidInput) && refused_void(transfers.start_transfer(16385), hal.Error.InvalidInput)
+        check(dma_ok)
+        check(kept && refused_size && transfers.capacity() == 16384)
+    }
+    channel.clear_signal()
+    // CPU transfers work again after DMA.
+    one[0] = 0x3C
+    spi.transfer(&mut one)!
+    copied: [4]u8 = [0; 4]
+    source: [4]u8 = [1, 2, 3, 4]
+    channel.copy(&mut copied, &source)!
+    check(one[0] == 0x3C && copied[3] == 4)
+    pins.release_spi(spi)
+
+    // The controller's own chip select on pad 3: high when idle, low from
+    // a transfer's first poll to its last, without a rise between the
+    // 64-byte runs, then high again.
+    check(refused(pins.spi_with_select(SPI_CLOCK, SPI_TX, some(SPI_RX), SPI_TX, hal.SpiMode.Mode0, 1_000_000), hal.Error.InvalidInput))
+    selected := pins.spi_with_select(SPI_CLOCK, SPI_TX, some(SPI_RX), SPI_SELECT, hal.SpiMode.Mode0, 1_000_000)!
+    selected.set_loopback(true)
+    idle_high := pin_level(SPI_SELECT)
+    watch(SPI_SELECT, 1)
+    low_throughout := true
+    first := !selected.poll_transfer(&mut data)!
+    low_at_start := !pin_level(SPI_SELECT)
+    begin := timer.now_us()
+    samples := 0u32
+    first_bad := 0u32
+    for !selected.poll_transfer(&mut data)! {
+        samples += 1
+        level := pin_level(SPI_SELECT)
+        rose_now := latched(SPI_SELECT)
+        // The select rises when the last run ends, which can be before
+        // the poll that sees it: 200 bytes take 1.6 ms.
+        if low_throughout && (level || rose_now) {
+            first_bad = (timer.now_us() - begin) as u32
+            low_throughout = first_bad >= 1600
+        }
+    }
+    say_number("cs first rise at us ", first_bad)
+    held := timer.now_us() - begin
+    high_after := pin_level(SPI_SELECT)
+    rose := latched(SPI_SELECT)
+    say_flags("cs idle high, low at start, low throughout, high after ", idle_high, low_at_start, low_throughout, high_after)
+    say_number("cs held us ", held as u32)
+    check(first && idle_high && low_at_start && low_throughout && high_after && rose && samples > 100 && held >= 1600 && held < 2600)
+    // A short blocking transfer: one fall and one rise around it; the
+    // data shifts while selected.
+    // A cancelled long transfer raises the select too.
+    started_long := !selected.poll_write(&data)!
+    low_while := !pin_level(SPI_SELECT)
+    selected.cancel()
+    timer.delay_us(5)
+    say_flags("cs cancel: started, low, high after, idle ", started_long, low_while, pin_level(SPI_SELECT), !selected.is_busy())
+    check(started_long && low_while && pin_level(SPI_SELECT) && !selected.is_busy())
+    watch(SPI_SELECT, 2)
+    four: [4]u8 = [9, 8, 7, 6]
+    selected.transfer(&mut four)!
+    fell := latched(SPI_SELECT)
+    watch(SPI_SELECT, 1)
+    selected.write(&four)!
+    rose = latched(SPI_SELECT)
+    check(fell && rose && pin_level(SPI_SELECT) && four[0] == 9 && four[3] == 6)
+    // By DMA, selected throughout.
+    unsafe {
+        transfers := selected.dma(&mut channel, &mut BIG[..1000])!
+        dma_start := timer.now_us()
+        transfers.start_write(1000)!
+        // 1000 bytes take 8 ms; the select rises as the last one ends.
+        dma_low := true
+        dma_samples := 0u32
+        for transfers.is_busy() {
+            dma_samples += 1
+            if (dma_samples & 15) == 0 && dma_low && pin_level(SPI_SELECT) {
+                rise := timer.now_us() - dma_start
+                say_number("cs dma rise at us ", rise as u32)
+                dma_low = rise >= 8000
+            }
+        }
+        transfers.finish()!
+        say_number("cs dma samples ", dma_samples)
+        check(dma_low && dma_samples > 100 && pin_level(SPI_SELECT))
+    }
+    unwatch(SPI_SELECT)
+    pins.release_spi(selected)
+    dma.release(channel)
+}
+
+fn raw_word(address: usize) -> u32 {
+    // SAFETY: reads a peripheral register for a diagnosis.
+    unsafe {
+        register: hal.Reg<u32> = hal.Reg.at(address)
+        return register.read()
+    }
+}
+
+// Print GP-SPI2's and GDMA channel 0's state.
+fn dump_dma() {
+    say_number("spi cmd ", raw_word(0x6008_1000))
+    say_number("spi user ", raw_word(0x6008_1010))
+    say_number("spi ms_dlen ", raw_word(0x6008_101C))
+    say_number("spi misc ", raw_word(0x6008_1020))
+    say_number("spi dma_conf ", raw_word(0x6008_1030))
+    say_number("spi dma_int_raw ", raw_word(0x6008_103C))
+    say_number("gdma in_int_raw ", raw_word(0x6008_0000))
+    say_number("gdma out_int_raw ", raw_word(0x6008_0030))
+    say_number("gdma in_conf0 ", raw_word(0x6008_0070))
+    say_number("gdma in_link ", raw_word(0x6008_0080))
+    say_number("gdma in_state ", raw_word(0x6008_0084))
+    say_number("gdma in_peri_sel ", raw_word(0x6008_00A0))
+    say_number("gdma out_conf0 ", raw_word(0x6008_00D0))
+    say_number("gdma out_link ", raw_word(0x6008_00E0))
+    say_number("gdma out_state ", raw_word(0x6008_00E4))
+    say_number("gdma out_peri_sel ", raw_word(0x6008_0100))
+}
+
+fn refused_void(result: void!hal.Error, expected: hal.Error) -> bool {
+    return failed_with(result, expected)
+}
+
+// --- SPI target -------------------------------------------------------------
+
+// The target reads SCLK on pad 20, MOSI on pad 21, and the select on pad
+// 23, which the software master drives, and answers on pad 22.
+const TARGET_CLOCK: u32 = 20
+const TARGET_RX: u32 = 21
+const TARGET_TX: u32 = 22
+const TARGET_SELECT: u32 = 23
+
+// Clock a mode 0 transaction: `out` goes to the target, and what it sends
+// back replaces it.
+fn bang_spi(timer: &mut chip.Timer, bytes: &mut[u8]) {
+    drive(TARGET_SELECT, false)
+    timer.delay_us(10)
+    for index in 0..bytes.len {
+        out := bytes[index]
+        value := 0u32
+        for bit in 0..8u32 {
+            drive(TARGET_RX, ((out >> (7 - bit) as u8) & 1) != 0)
+            timer.delay_us(3)
+            drive(TARGET_CLOCK, true)
+            value = (value << 1) | level_bit(pin_level(TARGET_TX))
+            timer.delay_us(3)
+            drive(TARGET_CLOCK, false)
+        }
+        bytes[index] = (value & 0xFF) as u8
+    }
+    timer.delay_us(10)
+    drive(TARGET_SELECT, true)
+    timer.delay_us(10)
+}
+
+fn spi_target_checks(pins: &mut chip.Pins, timer: &mut chip.Timer) {
+    check(refused(pins.spi_target(TARGET_CLOCK, TARGET_TX, some(TARGET_RX), TARGET_CLOCK, hal.SpiMode.Mode0), hal.Error.InvalidInput))
+    target := pins.spi_target(TARGET_CLOCK, TARGET_TX, some(TARGET_RX), TARGET_SELECT, hal.SpiMode.Mode0)!
+    busy := refused(pins.spi(SPI_CLOCK, SPI_TX, none, hal.SpiMode.Mode0, 1_000_000), hal.Error.Busy)
+    take_pad(TARGET_SELECT)
+    take_pad(TARGET_CLOCK)
+    take_pad(TARGET_RX)
+    drive(TARGET_CLOCK, false)
+    timer.delay_us(20)
+    reply: [4]u8 = [0x5A, 0xC3, 0x01, 0x80]
+    queued := target.queue(&reply)!
+    exchange: [4]u8 = [0x11, 0x22, 0x33, 0x44]
+    bang_spi(timer, &mut exchange)
+    timer.delay_us(20)
+    received: [80]u8 = [0; 80]
+    count := target.read(&mut received)!
+    answered := exchange[0] == 0x5A && exchange[1] == 0xC3 && exchange[2] == 0x01 && exchange[3] == 0x80
+    say_number("spi target answer ", ((exchange[0] as u32) << 24) | ((exchange[1] as u32) << 16) | ((exchange[2] as u32) << 8) | exchange[3] as u32)
+    heard := count == 4 && received[0] == 0x11 && received[1] == 0x22 && received[2] == 0x33 && received[3] == 0x44
+    say_number("spi target heard ", count as u32)
+    say_flags("spi target queued, answered, heard, busy ", queued == 4, answered, heard, busy)
+    check(busy && queued == 4 && answered && heard && target.unsent() == 0)
+    // With nothing queued the master reads 0xFF; two transactions wait
+    // for one read.
+    six: [6]u8 = [1, 2, 3, 4, 5, 6]
+    bang_spi(timer, &mut six)
+    first := target.read(&mut received)!
+    two: [2]u8 = [7, 8]
+    bang_spi(timer, &mut two)
+    second := target.read(&mut received)!
+    idle := six[0] == 0xFF && six[5] == 0xFF && two[0] == 0xFF
+    say_number("spi target first ", first as u32)
+    say_number("spi target second ", second as u32)
+    check(idle && first == 6 && received[0] == 7 && second == 2 && received[1] == 8)
+    // A transaction beyond the 64-byte buffer reports Overrun, then the
+    // first 64 bytes.
+    long: [70]u8 = [0x33; 70]
+    bang_spi(timer, &mut long)
+    lost := refused(target.read(&mut received), hal.Error.Overrun)
+    kept := target.read(&mut received)!
+    say_number("spi target kept ", kept as u32)
+    check(lost && kept == 64 && received[63] == 0x33)
+    free_pad(TARGET_SELECT)
+    free_pad(TARGET_CLOCK)
+    free_pad(TARGET_RX)
+    pins.release_spi_target(target)
+}
+
+// --- Serial ports -----------------------------------------------------------
+
+fn serial_checks(pins: &mut chip.Pins, timer: &mut chip.Timer) {
+    // 32 bytes at 115200 baud take 2.8 ms to leave.
+    port := pins.uart(board.UART_TX_PIN, some(board.UART_RX_PIN), 115_200)!
+    text: [32]u8 = [0x55; 32]
+    port.write(&text)!
+    busy := !port.poll_flush()!
+    polls := 0u32
+    start := timer.now_us()
+    for !port.poll_flush()! {
+        polls += 1
+    }
+    elapsed := timer.now_us() - start
+    say_number("uart poll_flush us ", elapsed as u32)
+    check(busy && polls > 100 && elapsed >= 2500 && elapsed < 3200)
+    pins.release_uart(port)
+}
+
+fn usb_flush_check() -> bool {
+    unsafe {
+        match &mut SERIAL {
+            some(serial) => {
+                fmt.printf(serial, "usb poll_flush\n")!
+                for _ in 0..10_000_000 {
+                    if serial.poll_flush()! {
+                        return true
+                    }
+                }
+            }
+            none => {}
+        }
+    }
+    return false
+}
+
+fn main() {
+    b := board.take()!
+    serial := b.usb.serial()!
+    poke: [1]u8 = [0]
+    serial.read(&mut poke)!
+    serial.set_crlf(true)
+    unsafe {
+        SERIAL = some(serial)
+    }
+    say("selftest ready\n")
+
+    i2c_master_checks(&mut b.pins, &mut b.timer)
+    i2c_target_checks(&mut b.pins, &mut b.timer)
+    spi_master_checks(&mut b.pins, &mut b.timer, &mut b.dma)
+    spi_target_checks(&mut b.pins, &mut b.timer)
+    serial_checks(&mut b.pins, &mut b.timer)
+    check(usb_flush_check())
+
+    count := unsafe {
+        CHECKS
+    }
+    say_number("selftest done ", count)
+    for {
+        b.timer.delay_ms(1000)
+    }
+}

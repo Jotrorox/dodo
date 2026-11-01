@@ -1,6 +1,7 @@
 package esp_usb_serial
 
 import "std/embedded/hal"
+import "std/embedded/hal/serial"
 import "std/io"
 
 // The USB serial port Espressif builds into its newer chips (USB-Serial-JTAG
@@ -14,9 +15,10 @@ import "std/io"
 //
 // `Controller` drives one over any hal.Registers: a `hal.RegisterBlock` on
 // the chip, or a simulated controller in a desktop test. It implements the
-// std/io Reader and Writer interfaces and their polling forms. Each
-// direction has a 64-byte FIFO in the controller and nothing beyond it, so
-// a program must read at least every 64 bytes the host sends.
+// std/io Reader and Writer interfaces and the serial port protocols of
+// std/embedded/hal/serial, Port and PollPort. Each direction has a 64-byte
+// FIFO in the controller and nothing beyond it, so a program must read at
+// least every 64 bytes the host sends.
 //
 // Writes go into the transmit FIFO, and the host takes it as one USB
 // packet once it is full or a write ends. While a terminal has the port
@@ -81,8 +83,8 @@ const LINE_FEED: u8 = 10
 const CARRIAGE_RETURN: u8 = 13
 
 // The USB serial port of one controller with registers R. Implements the
-// std/io Reader and Writer interfaces and their polling forms.
-pub struct Controller<R: hal.Registers>: io.ReadWriter {
+// std/io Reader and Writer interfaces and the serial port protocols.
+pub struct Controller<R: hal.Registers>: serial.Port + serial.PollPort {
     registers: R
     // Translate newlines; see set_crlf.
     crlf: bool
@@ -199,6 +201,14 @@ pub struct Controller<R: hal.Registers>: io.ReadWriter {
         self.registers.write(EP1_CONF, WR_DONE)
         self.wait_for_room()
         return ok()
+    }
+
+    // `flush` without waiting: true once the host has taken everything
+    // written, or no terminal has the port open (DTR off). Every write ends
+    // its packet (WR_DONE), and the controller keeps the transmit FIFO
+    // closed (IN_FREE low) until the host has read it. Never fails.
+    pub fn poll_flush(&mut self) -> bool!io.Error {
+        return ok((self.registers.read(EP1_CONF) & IN_FREE) != 0 || !self.is_connected())
     }
 
     // Wait for the first byte, then return what has arrived, up to

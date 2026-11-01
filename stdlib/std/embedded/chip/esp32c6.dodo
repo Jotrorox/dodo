@@ -5,6 +5,7 @@ import "core/mmio"
 import "core/ptr"
 import "std/embedded/executor"
 import "std/embedded/hal"
+import "std/embedded/hal/serial"
 import "std/embedded/peripheral/esp_i2c"
 import "std/embedded/peripheral/esp_spi"
 import "std/embedded/peripheral/esp_uart"
@@ -493,19 +494,7 @@ pub struct Pins {
         // SAFETY: the claims make this the controller's and the pins' only
         // owner.
         registers := unsafe {
-            start_peripheral(PCR_I2C0_CONF)
-            mmio.write32(PCR_I2C0_SCLK_CONF, hal.encode(SCLK_DIV_NUM, prescale - 1) | SCLK_ENABLE)
-            gpio_function(sda)
-            set_pad_pull(sda, true, false)
-            set_open_drain(sda, true)
-            gpio_function(scl)
-            set_pad_pull(scl, true, false)
-            set_open_drain(scl, true)
-            route_output(scl, SIGNAL_I2C_SCL, false)
-            route_input(SIGNAL_I2C_SCL, scl)
-            route_output(sda, SIGNAL_I2C_SDA, false)
-            route_input(SIGNAL_I2C_SDA, sda)
-            hal.RegisterBlock.at(I2C0_BASE)
+            connect_i2c(sda, scl, prescale)
         }
         bus := esp_i2c.Controller.new(registers, timing)
         return ok(I2c { bus, sda, scl })
@@ -518,13 +507,46 @@ pub struct Pins {
         controller.release()
         // SAFETY: the bus owned the controller and the pins.
         unsafe {
-            stop_peripheral(PCR_I2C0_CONF)
-            tie_input(SIGNAL_I2C_SCL, true)
-            tie_input(SIGNAL_I2C_SDA, true)
-            set_open_drain(sda, false)
-            set_open_drain(scl, false)
-            disconnect(sda)
-            disconnect(scl)
+            disconnect_i2c(sda, scl)
+        }
+        self.give_bus(BUS_I2C, (1u32 << sda) | (1u32 << scl))
+    }
+
+    // Claim pins `sda` and `scl` as an I2C target (slave) answering
+    // another master at `address`, a 10-bit address with `ten_bit`, on the
+    // chip's one I2C controller, which is then not a master. `frequency_hz`
+    // is the master's SCL frequency, 1 kHz to hal.I2C_FAST_PLUS_HZ, which
+    // sets the SDA hold and sample times. Any two pins carry the bus, open
+    // drain with the pads' pull-ups, as for `i2c`. InvalidInput for an
+    // address the I2C specification reserves (7-bit 0x00 to 0x07 and 0x78
+    // to 0x7F, 10-bit above 0x3FF), otherwise errors as for `i2c`. The
+    // esp_i2c driver documents the target: it stretches SCL while its
+    // receive FIFO is full or a read waits for `respond`.
+    pub fn i2c_target(&mut self, sda: u32, scl: u32, address: u16, ten_bit: bool, frequency_hz: u32) -> I2cTarget!hal.Error {
+        sda_bit := pin_bit(sda)?
+        scl_bit := pin_bit(scl)?
+        if sda == scl || frequency_hz < 1000 || frequency_hz > hal.I2C_FAST_PLUS_HZ {
+            return err(hal.Error.InvalidInput)
+        }
+        esp_i2c.target_address(address, ten_bit)?
+        prescale := esp_i2c.prescaler(XTAL_HZ, frequency_hz)
+        timing := esp_i2c.timing(XTAL_HZ / prescale, frequency_hz)?
+        self.take_bus(BUS_I2C, sda_bit | scl_bit)?
+        // SAFETY: as in i2c.
+        registers := unsafe {
+            connect_i2c(sda, scl, prescale)
+        }
+        target := esp_i2c.Target.new(registers, timing, address, ten_bit)
+        return ok(I2cTarget { target, sda, scl })
+    }
+
+    // Give back an I2C target from `i2c_target`, as for `release_i2c`.
+    pub fn release_i2c_target(&mut self, target: I2cTarget) {
+        let I2cTarget { target: controller, sda, scl } = target
+        controller.release()
+        // SAFETY: the target owned the controller and the pins.
+        unsafe {
+            disconnect_i2c(sda, scl)
         }
         self.give_bus(BUS_I2C, (1u32 << sda) | (1u32 << scl))
     }
@@ -569,13 +591,50 @@ pub struct Pins {
             hal.RegisterBlock.at(SPI2_BASE)
         }
         bus := esp_spi.Controller.new(registers, divider, mode)
-        return ok(Spi { bus, clock, tx, rx: input })
+        return ok(Spi { bus, clock, tx, rx: input, select: PIN_NONE })
     }
 
-    // Give back an SPI bus: the controller stops and its pins are
-    // disconnected.
+    // `spi`, with the controller's own chip select output, CS0 (FSPICS0),
+    // on pin `select` as well: it goes low before each transfer's first
+    // clock edge and rises after its last (the controller's CS setup and
+    // hold phases), and stays low across the 64-byte runs of a longer
+    // transfer, polled, by DMA, or blocking, so a device sees one selection
+    // per transfer; a cancelled transfer raises it too. Any pin
+    // carries it. Use it for one device on the bus; several devices share
+    // a bus through hal.SpiDevice and output pins. Errors as for `spi`, and
+    // InvalidInput if `select` is another of the bus's pins.
+    pub fn spi_with_select(&mut self, clock: u32, tx: u32, rx: Option<u32>, select: u32, mode: hal.SpiMode, frequency_hz: u32) -> Spi!hal.Error {
+        select_bit := pin_bit(select)?
+        input := PIN_NONE
+        if let some(pin) = rx {
+            input = pin
+        }
+        if select == clock || select == tx || select == input {
+            return err(hal.Error.InvalidInput)
+        }
+        if (self.taken & select_bit) != 0 {
+            return err(hal.Error.Busy)
+        }
+        receive: Option<u32> = none
+        if input != PIN_NONE {
+            receive = some(input)
+        }
+        bus := self.spi(clock, tx, receive, mode, frequency_hz)?
+        self.taken |= select_bit
+        bus.bus.set_hardware_select(true)
+        // SAFETY: the claim makes this the pin's only owner.
+        unsafe {
+            gpio_function(select)
+            route_output(select, SIGNAL_SPI_CS0, false)
+        }
+        bus.select = select
+        return ok(bus)
+    }
+
+    // Give back an SPI bus from `spi` or `spi_with_select`: the controller
+    // stops and its pins are disconnected.
     pub fn release_spi(&mut self, bus: Spi) {
-        let Spi { bus: controller, clock, tx, rx } = bus
+        let Spi { bus: controller, clock, tx, rx, select } = bus
         controller.release()
         pins := (1u32 << clock) | (1u32 << tx)
         // SAFETY: the bus owned the controller and the pins.
@@ -587,6 +646,87 @@ pub struct Pins {
             if rx != PIN_NONE {
                 disconnect(rx)
                 pins |= 1u32 << rx
+            }
+            if select != PIN_NONE {
+                disconnect(select)
+                pins |= 1u32 << select
+            }
+        }
+        self.give_bus(BUS_SPI, pins)
+    }
+
+    // Claim pins as an SPI target (slave) in `mode` on the chip's one SPI
+    // controller, GP-SPI2, for another master to clock and select:
+    // `clock` and `select` are inputs, `rx` receives what the master sends
+    // (MOSI), or none, and `tx` answers it (MISO), driven at all times. The
+    // select input is pulled up, so an unconnected one leaves the target
+    // deselected. Any pins carry it. InvalidInput for a pin that cannot be
+    // claimed or the same pin twice; Busy if a pin or the controller is
+    // taken. The esp_spi driver documents the target: it exchanges
+    // transactions of up to 64 bytes, each from the select's falling to its
+    // rising edge.
+    pub fn spi_target(&mut self, clock: u32, tx: u32, rx: Option<u32>, select: u32, mode: hal.SpiMode) -> SpiTarget!hal.Error {
+        input := PIN_NONE
+        if let some(pin) = rx {
+            input = pin
+        }
+        pins := 0u32
+        all := [clock, tx, select, input]
+        for &pin in all {
+            if pin != PIN_NONE {
+                bit := pin_bit(pin)?
+                if (pins & bit) != 0 {
+                    return err(hal.Error.InvalidInput)
+                }
+                pins |= bit
+            }
+        }
+        self.take_bus(BUS_SPI, pins)?
+        // SAFETY: the claims make this the controller's and the pins' only
+        // owner.
+        registers := unsafe {
+            start_peripheral(PCR_SPI2_CONF)
+            mmio.write32(PCR_SPI2_CLKM_CONF, hal.encode(SCLK_SELECT, 1) | SCLK_ENABLE)
+            gpio_function(clock)
+            route_input(SIGNAL_SPI_CLOCK, clock)
+            gpio_function(select)
+            set_pad_pull(select, true, false)
+            route_input(SIGNAL_SPI_CS0, select)
+            gpio_function(tx)
+            route_output(tx, SIGNAL_SPI_MISO, false)
+            if input != PIN_NONE {
+                gpio_function(input)
+                route_input(SIGNAL_SPI_MOSI, input)
+            } else {
+                tie_input(SIGNAL_SPI_MOSI, false)
+            }
+            hal.RegisterBlock.at(SPI2_BASE)
+        }
+        target := esp_spi.Target.new(registers, mode)
+        return ok(SpiTarget { target, clock, tx, rx: input, select })
+    }
+
+    // Give back an SPI target from `spi_target`, as for `release_spi`.
+    pub fn release_spi_target(&mut self, target: SpiTarget) {
+        let SpiTarget { target: controller, clock, tx, rx, select } = target
+        controller.release()
+        pins := 0u32
+        // SAFETY: the target owned the controller and the pins.
+        unsafe {
+            stop_peripheral(PCR_SPI2_CONF)
+            tie_input(SIGNAL_SPI_CLOCK, false)
+            tie_input(SIGNAL_SPI_MOSI, false)
+            tie_input(SIGNAL_SPI_CS0, true)
+            set_pad_pull(select, false, false)
+        }
+        all := [clock, tx, rx, select]
+        for &pin in all {
+            if pin != PIN_NONE {
+                // SAFETY: as above.
+                unsafe {
+                    disconnect(pin)
+                }
+                pins |= 1u32 << pin
             }
         }
         self.give_bus(BUS_SPI, pins)
@@ -1445,8 +1585,9 @@ pub struct Usb {
 }
 
 // The USB serial port, as `Usb.serial` hands it out. Implements the std/io
-// Reader and Writer protocols, so std/fmt prints to it.
-pub struct UsbSerial: io.ReadWriter {
+// Reader and Writer protocols, so std/fmt prints to it, and serial.Port and
+// serial.PollPort.
+pub struct UsbSerial: serial.Port + serial.PollPort {
     port: esp_usb_serial.Controller<hal.RegisterBlock>
 
     pub fn write(&mut self, bytes: &[u8]) -> usize!io.Error {
@@ -1459,6 +1600,10 @@ pub struct UsbSerial: io.ReadWriter {
 
     pub fn flush(&mut self) -> void!io.Error {
         return self.port.flush()
+    }
+
+    pub fn poll_flush(&mut self) -> bool!io.Error {
+        return self.port.poll_flush()
     }
 
     pub fn read(&mut self, buffer: &mut[u8]) -> usize!io.Error {
@@ -1663,6 +1808,7 @@ const SIGNAL_I2C_SDA: u32 = 46
 const SIGNAL_SPI_CLOCK: u32 = 63
 const SIGNAL_SPI_MISO: u32 = 64
 const SIGNAL_SPI_MOSI: u32 = 65
+const SIGNAL_SPI_CS0: u32 = 68
 const SIGNAL_LEDC: u32 = 0
 const SIGNAL_RMT0: u32 = 71
 
@@ -1703,6 +1849,43 @@ unsafe fn set_open_drain(number: u32, on: bool) {
     }
 }
 
+// Start I2C0 with its function clock, the crystal divided by `prescale`,
+// and connect it to pins `sda` and `scl` as open-drain lines with the
+// pads' pull-ups.
+// SAFETY: the caller owns the controller and the pins.
+unsafe fn connect_i2c(sda: u32, scl: u32, prescale: u32) -> hal.RegisterBlock {
+    unsafe {
+        start_peripheral(PCR_I2C0_CONF)
+        mmio.write32(PCR_I2C0_SCLK_CONF, hal.encode(SCLK_DIV_NUM, prescale - 1) | SCLK_ENABLE)
+        gpio_function(sda)
+        set_pad_pull(sda, true, false)
+        set_open_drain(sda, true)
+        gpio_function(scl)
+        set_pad_pull(scl, true, false)
+        set_open_drain(scl, true)
+        route_output(scl, SIGNAL_I2C_SCL, false)
+        route_input(SIGNAL_I2C_SCL, scl)
+        route_output(sda, SIGNAL_I2C_SDA, false)
+        route_input(SIGNAL_I2C_SDA, sda)
+        return hal.RegisterBlock.at(I2C0_BASE)
+    }
+}
+
+// Stop I2C0 and disconnect its pins, which stay pulled up.
+// SAFETY: the caller owned the controller and the pins and no longer uses
+// them.
+unsafe fn disconnect_i2c(sda: u32, scl: u32) {
+    unsafe {
+        stop_peripheral(PCR_I2C0_CONF)
+        tie_input(SIGNAL_I2C_SCL, true)
+        tie_input(SIGNAL_I2C_SDA, true)
+        set_open_drain(sda, false)
+        set_open_drain(scl, false)
+        disconnect(sda)
+        disconnect(scl)
+    }
+}
+
 // The divider of the 40 MHz crystal that leaves `baud` within the UART's
 // 12-bit divisor.
 fn uart_prescaler(baud: u32) -> u32 {
@@ -1710,8 +1893,9 @@ fn uart_prescaler(baud: u32) -> u32 {
 }
 
 // An I2C bus, as `Pins.i2c` hands it out. Implements the
-// std/embedded/hal I2C bus protocol; esp_i2c documents the methods.
-pub struct I2c: hal.I2c {
+// std/embedded/hal I2C bus protocol and its polling form; esp_i2c
+// documents the methods.
+pub struct I2c: hal.I2c + hal.I2cPoll {
     bus: esp_i2c.Controller<hal.RegisterBlock>
     sda: u32
     scl: u32
@@ -1744,6 +1928,40 @@ pub struct I2c: hal.I2c {
         return self.bus.probe(address)
     }
 
+    // The polled transactions, which never wait; see esp_i2c.
+    pub fn poll_write(&mut self, address: u8, bytes: &[u8]) -> bool!hal.Error {
+        return self.bus.poll_write(address, bytes)
+    }
+
+    pub fn poll_read(&mut self, address: u8, buffer: &mut[u8]) -> bool!hal.Error {
+        return self.bus.poll_read(address, buffer)
+    }
+
+    pub fn poll_write_read(&mut self, address: u8, bytes: &[u8], buffer: &mut[u8]) -> bool!hal.Error {
+        return self.bus.poll_write_read(address, bytes, buffer)
+    }
+
+    pub fn poll_write_ten_bit(&mut self, address: u16, bytes: &[u8]) -> bool!hal.Error {
+        return self.bus.poll_write_ten_bit(address, bytes)
+    }
+
+    pub fn poll_read_ten_bit(&mut self, address: u16, buffer: &mut[u8]) -> bool!hal.Error {
+        return self.bus.poll_read_ten_bit(address, buffer)
+    }
+
+    pub fn poll_write_read_ten_bit(&mut self, address: u16, bytes: &[u8], buffer: &mut[u8]) -> bool!hal.Error {
+        return self.bus.poll_write_read_ten_bit(address, bytes, buffer)
+    }
+
+    pub fn cancel(&mut self) {
+        self.bus.cancel()
+    }
+
+    // True while a polled transaction runs.
+    pub fn is_busy(&self) -> bool {
+        return self.bus.is_busy()
+    }
+
     pub fn frequency_hz(&self) -> u32 {
         return self.bus.frequency_hz()
     }
@@ -1754,13 +1972,15 @@ pub struct I2c: hal.I2c {
     }
 }
 
-// An SPI bus, as `Pins.spi` hands it out. Implements the std/embedded/hal
-// SPI bus protocol; esp_spi documents the methods.
-pub struct Spi: hal.Spi {
+// An SPI bus, as `Pins.spi` and `Pins.spi_with_select` hand it out.
+// Implements the std/embedded/hal SPI bus protocol and its polling form;
+// esp_spi documents the methods. `dma` runs transfers by DMA.
+pub struct Spi: hal.Spi + hal.SpiPoll {
     bus: esp_spi.Controller<hal.RegisterBlock>
     clock: u32
     tx: u32
     rx: u32
+    select: u32
 
     pub fn transfer(&mut self, bytes: &mut[u8]) -> void!hal.Error {
         return self.bus.transfer(bytes)
@@ -1768,6 +1988,40 @@ pub struct Spi: hal.Spi {
 
     pub fn write(&mut self, bytes: &[u8]) -> void!hal.Error {
         return self.bus.write(bytes)
+    }
+
+    // The polled transfers, which never wait; see esp_spi.
+    pub fn poll_transfer(&mut self, bytes: &mut[u8]) -> bool!hal.Error {
+        return self.bus.poll_transfer(bytes)
+    }
+
+    pub fn poll_write(&mut self, bytes: &[u8]) -> bool!hal.Error {
+        return self.bus.poll_write(bytes)
+    }
+
+    pub fn cancel(&mut self) {
+        self.bus.cancel()
+    }
+
+    // True while a polled transfer runs.
+    pub fn is_busy(&self) -> bool {
+        return self.bus.is_busy()
+    }
+
+    // Move bytes between `buffer` and the bus by DMA until the returned
+    // SpiDmaBus is dropped: `channel`, which serves both directions, feeds
+    // the controller from the buffer and stores what it receives back into
+    // it, while the processor does other work; see SpiDmaBus. InvalidInput
+    // for an empty buffer or one outside SRAM, such as a constant; Busy if
+    // the channel runs a copy or the bus a polled transfer.
+    pub fn dma(&mut self, channel: &mut DmaChannel, buffer: &mut[u8]) -> SpiDmaBus!hal.Error from(self, channel, buffer) {
+        if buffer.len == 0 || !in_sram(hal.address_of(buffer), buffer.len as u64) {
+            return err(hal.Error.InvalidInput)
+        }
+        if channel.is_busy() || self.bus.is_busy() {
+            return err(hal.Error.Busy)
+        }
+        return ok(SpiDmaBus { bus: &mut self.bus, channel, buffer, running: false, receiving: false, count: 0 })
     }
 
     pub fn frequency_hz(&self) -> u32 {
@@ -1804,8 +2058,9 @@ pub struct Spi: hal.Spi {
 }
 
 // A serial port, as `Pins.uart` hands it out. Implements the std/io
-// Reader and Writer protocols; esp_uart documents the methods.
-pub struct Uart: io.ReadWriter {
+// Reader and Writer protocols and serial.Port and serial.PollPort;
+// esp_uart documents the methods.
+pub struct Uart: serial.Port + serial.PollPort {
     port: esp_uart.Controller<hal.RegisterBlock>
     number: u32
     tx: u32
@@ -1823,6 +2078,10 @@ pub struct Uart: io.ReadWriter {
 
     pub fn flush(&mut self) -> void!io.Error {
         return self.port.flush()
+    }
+
+    pub fn poll_flush(&mut self) -> bool!io.Error {
+        return self.port.poll_flush()
     }
 
     pub fn read(&mut self, buffer: &mut[u8]) -> usize!io.Error {
@@ -2369,8 +2628,11 @@ const IN_DESCRIPTOR_ERROR: u32 = 1 << 3
 const OUT_DESCRIPTOR_ERROR: u32 = 1 << 2
 const OUT_TOTAL_EOF: u32 = 1 << 3
 const ALL_DMA_INTERRUPTS: u32 = 0x7F
-// The memory-to-memory peripheral number of each channel.
+// The memory-to-memory peripheral number of each channel, and none.
 const MEMORY_PERIPHERAL: [3]u32 = [4u32, 5, 10]
+const NO_PERIPHERAL: u32 = 0x3F
+// GP-SPI2's DMA interface.
+const SPI2_DMA: u32 = 0
 pub const DMA_CHANNELS: u32 = 3
 // Descriptors: size, length, end of frame, and owned by the DMA; then the
 // buffer and the next descriptor. Each covers at most 4092 bytes.
@@ -2384,6 +2646,11 @@ pub const DMA_MAX_BYTES: usize = DESCRIPTORS * DESCRIPTOR_BYTES
 // Per channel, eight transmit then eight receive descriptors of three
 // words, in SRAM where the controller reads them.
 static mut DMA_DESCRIPTORS: [144]u32 = [0u32; 144]
+// Per channel, a spare receive descriptor chained after the last one of a
+// peripheral transfer, and the word it points at: a peripheral marks the
+// end of its data (IN_SUC_EOF) only where a descriptor has room beyond it.
+static mut DMA_EOF_DESCRIPTORS: [9]u32 = [0u32; 9]
+static mut DMA_EOF_SINK: [3]u32 = [0u32; 3]
 // The transfer each channel runs: its byte count and element size, 0 when
 // idle.
 static mut DMA_BYTES: [3]u32 = [0u32; 3]
@@ -2431,6 +2698,48 @@ unsafe fn stop_dma() {
 fn in_sram(address: usize, bytes: u64) -> bool {
     start := address as u64
     return start >= 0x4080_0000 && start + bytes <= 0x4088_0000
+}
+
+// Write channel `index`'s descriptors for `bytes` from `source` and to
+// `destination`, in parts of up to 4092 bytes; returns the address of the
+// first transmit descriptor, with the receive ones 96 bytes after it.
+// SAFETY: the caller owns the channel, which must be stopped.
+unsafe fn write_descriptors(index: usize, source: usize, destination: usize, bytes: usize) -> usize {
+    unsafe {
+        first := 48 * index
+        descriptors := ptr.as_mut_ptr(&mut DMA_DESCRIPTORS[first..first + 48]) as usize
+        count := (bytes + DESCRIPTOR_BYTES - 1) / DESCRIPTOR_BYTES
+        for part in 0..count {
+            start := part * DESCRIPTOR_BYTES
+            size := bytes - start
+            if size > DESCRIPTOR_BYTES {
+                size = DESCRIPTOR_BYTES
+            }
+            last := part + 1 == count
+            // Transmit: size and length, the end on the last.
+            out := first + 3 * part
+            word := (size as u32) | ((size as u32) << 12) | DESCRIPTOR_OWNED
+            if last {
+                word |= DESCRIPTOR_EOF
+            }
+            DMA_DESCRIPTORS[out] = word
+            DMA_DESCRIPTORS[out + 1] = (source + start) as u32
+            DMA_DESCRIPTORS[out + 2] = 0
+            if !last {
+                DMA_DESCRIPTORS[out + 2] = (descriptors + 12 * (part + 1)) as u32
+            }
+            // Receive: the buffer's size; the controller fills in the
+            // length.
+            into := first + 24 + 3 * part
+            DMA_DESCRIPTORS[into] = (size as u32) | DESCRIPTOR_OWNED
+            DMA_DESCRIPTORS[into + 1] = (destination + start) as u32
+            DMA_DESCRIPTORS[into + 2] = 0
+            if !last {
+                DMA_DESCRIPTORS[into + 2] = (descriptors + 96 + 12 * (part + 1)) as u32
+            }
+        }
+        return descriptors
+    }
 }
 
 // The DMA controller's three channels, handed out once each, as
@@ -2511,8 +2820,75 @@ pub struct Dma {
 // hal.DmaChannel for copies between buffers in SRAM: the ESP32-C6's DMA
 // serves peripherals through their own DMA interfaces, not through
 // register addresses, so transfers paced by a peripheral are InvalidInput.
+// Chip drivers that use a peripheral's DMA interface take a channel
+// instead, as `Spi.dma` does.
 pub struct DmaChannel: hal.DmaChannel {
     number: u32
+
+    // Start moving `bytes` from `source` to the peripheral with DMA
+    // interface `peripheral` (the PERI_SEL numbering: 0 for GP-SPI2) and,
+    // with `receive`, as many from it to `destination`, as the peripheral
+    // asks for them. InvalidInput for 0 bytes, more than DMA_MAX_BYTES, or
+    // a buffer outside SRAM; Busy while a copy runs.
+    // SAFETY: as for start, until `abort`; the peripheral must be set up to
+    // move exactly `bytes`.
+    unsafe fn start_peripheral(&mut self, peripheral: u32, source: usize, destination: usize, bytes: usize, receive: bool) -> void!hal.Error {
+        if bytes == 0 || bytes > DMA_MAX_BYTES || !in_sram(source, bytes as u64) || (receive && !in_sram(destination, bytes as u64)) {
+            return err(hal.Error.InvalidInput)
+        }
+        if self.is_busy() {
+            return err(hal.Error.Busy)
+        }
+        index := self.number as usize
+        // SAFETY: the channel's own descriptors and registers; the caller
+        // keeps the buffers valid.
+        unsafe {
+            descriptors := write_descriptors(index, source, destination, bytes)
+            if receive {
+                spare := 3 * index
+                DMA_EOF_DESCRIPTORS[spare] = 4 | DESCRIPTOR_OWNED
+                DMA_EOF_DESCRIPTORS[spare + 1] = ptr.as_mut_ptr(&mut DMA_EOF_SINK[index..index + 1]) as u32
+                DMA_EOF_DESCRIPTORS[spare + 2] = 0
+                last := 48 * index + 24 + 3 * ((bytes - 1) / DESCRIPTOR_BYTES)
+                DMA_DESCRIPTORS[last + 2] = ptr.as_mut_ptr(&mut DMA_EOF_DESCRIPTORS[spare..spare + 3]) as u32
+            }
+            DMA_BYTES[index] = 0
+            cpu.fence()
+            base := GDMA_CHANNEL + GDMA_STRIDE * index
+            interrupts := 0x10 * index
+            mmio.write32(GDMA_IN_INT + interrupts + 0xC, ALL_DMA_INTERRUPTS)
+            mmio.write32(GDMA_OUT_INT + interrupts + 0xC, ALL_DMA_INTERRUPTS)
+            mmio.write32(base + IN_CONF0, DESCRIPTOR_BURST | CHANNEL_RESET)
+            mmio.write32(base + IN_CONF0, DESCRIPTOR_BURST)
+            mmio.write32(base + OUT_CONF0, OUT_EOF_MODE | DESCRIPTOR_BURST | CHANNEL_RESET)
+            mmio.write32(base + OUT_CONF0, OUT_EOF_MODE | DESCRIPTOR_BURST)
+            mmio.write32(base + OUT_PERI_SEL, peripheral)
+            if receive {
+                mmio.write32(base + IN_PERI_SEL, peripheral)
+                mmio.write32(base + IN_LINK, (((descriptors + 96) as u32) & LINK_ADDRESS) | IN_LINK_START)
+            } else {
+                mmio.write32(base + IN_PERI_SEL, NO_PERIPHERAL)
+            }
+            mmio.write32(base + OUT_LINK, ((descriptors as u32) & LINK_ADDRESS) | OUT_LINK_START)
+        }
+        return ok()
+    }
+
+    // True once a peripheral transfer of `bytes` that receives has stored
+    // all it received: the peripheral marked its end (IN_SUC_EOF), or the
+    // channel has handed back the last receive descriptor, full.
+    fn received(&mut self, bytes: usize) -> bool {
+        if self.finished() {
+            return true
+        }
+        last := 48 * self.number as usize + 24 + 3 * ((bytes - 1) / DESCRIPTOR_BYTES)
+        // SAFETY: reads a descriptor the channel writes back.
+        unsafe {
+            cpu.fence()
+            word := ptr.read_volatile(ptr.as_ptr(&DMA_DESCRIPTORS[last..last + 1]))
+            return (word & DESCRIPTOR_OWNED) == 0
+        }
+    }
 
     pub fn number(&self) -> u32 {
         return self.number
@@ -2568,38 +2944,7 @@ pub struct DmaChannel: hal.DmaChannel {
         // SAFETY: the channel's own descriptors and registers; the caller
         // keeps the buffers valid.
         unsafe {
-            first := 48 * index
-            descriptors := ptr.as_mut_ptr(&mut DMA_DESCRIPTORS[first..first + 48]) as usize
-            count := (bytes + DESCRIPTOR_BYTES - 1) / DESCRIPTOR_BYTES
-            for part in 0..count {
-                start := part * DESCRIPTOR_BYTES
-                size := bytes - start
-                if size > DESCRIPTOR_BYTES {
-                    size = DESCRIPTOR_BYTES
-                }
-                last := part + 1 == count
-                // Transmit: size and length, the end on the last.
-                out := first + 3 * part
-                word := (size as u32) | ((size as u32) << 12) | DESCRIPTOR_OWNED
-                if last {
-                    word |= DESCRIPTOR_EOF
-                }
-                DMA_DESCRIPTORS[out] = word
-                DMA_DESCRIPTORS[out + 1] = (transfer.source + start) as u32
-                DMA_DESCRIPTORS[out + 2] = 0
-                if !last {
-                    DMA_DESCRIPTORS[out + 2] = (descriptors + 12 * (part + 1)) as u32
-                }
-                // Receive: the buffer's size; the controller fills in the
-                // length.
-                into := first + 24 + 3 * part
-                DMA_DESCRIPTORS[into] = (size as u32) | DESCRIPTOR_OWNED
-                DMA_DESCRIPTORS[into + 1] = (transfer.destination + start) as u32
-                DMA_DESCRIPTORS[into + 2] = 0
-                if !last {
-                    DMA_DESCRIPTORS[into + 2] = (descriptors + 96 + 12 * (part + 1)) as u32
-                }
-            }
+            descriptors := write_descriptors(index, transfer.source, transfer.destination, bytes)
             DMA_BYTES[index] = bytes as u32
             DMA_WIDTH[index] = width
             cpu.fence()
@@ -2607,6 +2952,11 @@ pub struct DmaChannel: hal.DmaChannel {
             interrupts := 0x10 * index
             mmio.write32(GDMA_IN_INT + interrupts + 0xC, ALL_DMA_INTERRUPTS)
             mmio.write32(GDMA_OUT_INT + interrupts + 0xC, ALL_DMA_INTERRUPTS)
+            // Memory to memory, which a peripheral transfer changed.
+            mmio.write32(base + IN_CONF0, MEMORY_TRANSFER | DESCRIPTOR_BURST)
+            mmio.write32(base + OUT_CONF0, OUT_EOF_MODE | DESCRIPTOR_BURST)
+            mmio.write32(base + IN_PERI_SEL, MEMORY_PERIPHERAL[index])
+            mmio.write32(base + OUT_PERI_SEL, MEMORY_PERIPHERAL[index])
             conf := mmio.read32(base + IN_CONF0)
             mmio.write32(base + IN_CONF0, conf | CHANNEL_RESET)
             mmio.write32(base + IN_CONF0, conf)
@@ -2791,5 +3141,245 @@ pub struct DmaChannel: hal.DmaChannel {
             DMA_BYTES[self.number as usize] = 0
         }
         return result
+    }
+}
+
+// --- Bus targets and SPI by DMA ------------------------------------------
+
+// An I2C target (slave), as `Pins.i2c_target` hands it out. Implements
+// hal.I2cTarget; esp_i2c documents the methods.
+pub struct I2cTarget: hal.I2cTarget {
+    target: esp_i2c.Target<hal.RegisterBlock>
+    sda: u32
+    scl: u32
+
+    // What the master did since the last poll, without waiting.
+    pub fn poll(&mut self, buffer: &mut[u8]) -> hal.I2cTargetEvent!hal.Error {
+        return self.target.poll(buffer)
+    }
+
+    // Answer a Read with `bytes`, up to 32; returns how many.
+    pub fn respond(&mut self, bytes: &[u8]) -> usize!hal.Error {
+        return self.target.respond(bytes)
+    }
+
+    // Answer at another address from the next transaction on.
+    pub fn set_address(&mut self, address: u16, ten_bit: bool) -> void!hal.Error {
+        return self.target.set_address(address, ten_bit)
+    }
+
+    // The interrupt source of the controller, I2C_EXT0.
+    pub fn irq(&self) -> u32 {
+        return I2C_EXT0
+    }
+}
+
+// An SPI target (slave), as `Pins.spi_target` hands it out. Implements
+// hal.SpiTarget; esp_spi documents the methods.
+pub struct SpiTarget: hal.SpiTarget {
+    target: esp_spi.Target<hal.RegisterBlock>
+    clock: u32
+    tx: u32
+    rx: u32
+    select: u32
+
+    // Queue bytes for the master's next transactions, up to 64, without
+    // waiting; returns how many.
+    pub fn queue(&mut self, bytes: &[u8]) -> usize!hal.Error {
+        return self.target.queue(bytes)
+    }
+
+    // What the master sent in finished transactions, without waiting.
+    pub fn read(&mut self, buffer: &mut[u8]) -> usize!hal.Error {
+        return self.target.read(buffer)
+    }
+
+    // The bytes queued and not yet sent.
+    pub fn unsent(&self) -> usize {
+        return self.target.unsent()
+    }
+
+    // The interrupt source of the controller, SPI2.
+    pub fn irq(&self) -> u32 {
+        return SPI2
+    }
+}
+
+// An SPI bus master that moves bytes between a buffer it holds and the bus
+// by DMA, from `Spi.dma(channel, buffer)`. A transfer of up to
+// DMA_MAX_BYTES (32_736) runs as one run of the controller, without gaps
+// between bytes and with a hardware chip select low throughout, while the
+// program does other work:
+//
+//     dma := spi.dma(&mut channel, &mut buffer)!
+//     // fill dma.buffer()!, then:
+//     dma.start_transfer(count)!
+//     // ... other work, or return Pending from a task ...
+//     if dma.poll_finish()! { ... read dma.buffer()! ... }
+//
+// The bus holds the controller, the channel, and the buffer until it is
+// dropped, and lends the buffer out only between transfers, so the program
+// never touches memory the channel is moving. The channel's signal
+// (DmaChannel.set_signal) is raised once a `start_transfer`'s last byte is
+// in memory; a `start_write` raises none, as it receives nothing. Dropping
+// the bus aborts a running transfer; the device then saw only part of it.
+// Implements hal.SpiDma.
+pub struct SpiDmaBus: hal.SpiDma {
+    bus: &mut esp_spi.Controller<hal.RegisterBlock>
+    channel: &mut DmaChannel
+    buffer: &mut[u8]
+    // A transfer started and not yet finished, whether it receives, and
+    // its length.
+    running: bool
+    receiving: bool
+    count: usize
+
+    // The buffer, to fill before a transfer or read after one. Busy from
+    // `start_transfer` or `start_write` until it is finished.
+    pub fn buffer(&mut self) -> &mut[u8]!hal.Error from(self) {
+        if self.running {
+            return err(hal.Error.Busy)
+        }
+        return ok(&mut self.buffer[..])
+    }
+
+    // The buffer's length, the most a transfer moves.
+    pub fn capacity(&self) -> usize {
+        return self.buffer.len
+    }
+
+    // Start sending buffer[..count] and replacing each byte with the one
+    // received at the same time, and return at once. InvalidInput for 0,
+    // more than the buffer holds, or more than DMA_MAX_BYTES; Busy until
+    // the last transfer is finished.
+    pub fn start_transfer(&mut self, count: usize) -> void!hal.Error {
+        return self.begin(count, true)
+    }
+
+    // Start sending buffer[..count] and discard what arrives, as for
+    // `start_transfer`; the buffer stays as it is.
+    pub fn start_write(&mut self, count: usize) -> void!hal.Error {
+        return self.begin(count, false)
+    }
+
+    // True while a transfer runs: until the last byte has been sent and,
+    // for `start_transfer`, the last byte received is in memory.
+    pub fn is_busy(&mut self) -> bool {
+        return self.running && !self.done()
+    }
+
+    // Wait until the running transfer is done, if one is, and end it, so
+    // the buffer is free again. Overrun if the channel delivered data too
+    // slowly for the clock, so bytes were lost, which only very fast
+    // clocks with other DMA traffic cause; Bus if the channel hit a
+    // descriptor error. Either way the transfer is over.
+    pub fn finish(&mut self) -> void!hal.Error {
+        for !self.poll_finish()? {}
+        return ok()
+    }
+
+    // Without waiting: true once no transfer runs, ending a transfer that
+    // is done, false while one runs. Errors as for `finish`.
+    pub fn poll_finish(&mut self) -> bool!hal.Error {
+        if !self.running {
+            return ok(true)
+        }
+        if !self.done() {
+            return ok(false)
+        }
+        self.end()?
+        return ok(true)
+    }
+
+    // Stop a running transfer; the device saw only part of it.
+    pub fn abort(&mut self) {
+        if self.running {
+            self.running = false
+            match self.bus.end_dma() {
+                ok() => {}
+                err(_) => {}
+            }
+            self.channel.abort()
+            match self.channel.take_error() {
+                ok() => {}
+                err(_) => {}
+            }
+            cpu.fence()
+        }
+    }
+
+    // `start_transfer`, then `finish`.
+    pub fn transfer(&mut self, count: usize) -> void!hal.Error {
+        self.start_transfer(count)?
+        return self.finish()
+    }
+
+    // `start_write`, then `finish`.
+    pub fn write(&mut self, count: usize) -> void!hal.Error {
+        self.start_write(count)?
+        return self.finish()
+    }
+
+    fn begin(&mut self, count: usize, receive: bool) -> void!hal.Error {
+        if self.running {
+            return err(hal.Error.Busy)
+        }
+        if count == 0 || count > self.buffer.len || count > DMA_MAX_BYTES {
+            return err(hal.Error.InvalidInput)
+        }
+        self.bus.prepare_dma(count, receive)?
+        address := hal.address_of(self.buffer)
+        // The fence makes the buffer's contents visible to the channel.
+        // SAFETY: the buffer stays borrowed by this bus, which lends it out
+        // again only once the channel is done or aborted.
+        cpu.fence()
+        unsafe {
+            match self.channel.start_peripheral(SPI2_DMA, address, address, count, receive) {
+                ok() => {}
+                err(error) => {
+                    match self.bus.end_dma() {
+                        ok() => {}
+                        err(_) => {}
+                    }
+                    return err(error)
+                }
+            }
+        }
+        self.bus.start_dma()
+        self.running = true
+        self.receiving = receive
+        self.count = count
+        return ok()
+    }
+
+    fn done(&mut self) -> bool {
+        if !self.bus.dma_done() {
+            return false
+        }
+        return !self.receiving || self.channel.received(self.count)
+    }
+
+    // End a transfer that is done.
+    fn end(&mut self) -> void!hal.Error {
+        self.running = false
+        cpu.fence()
+        late := false
+        match self.bus.end_dma() {
+            ok() => {}
+            err(_) => {
+                late = true
+            }
+        }
+        channel := self.channel.take_error()
+        self.channel.abort()
+        channel?
+        if late {
+            return err(hal.Error.Overrun)
+        }
+        return ok()
+    }
+
+    fn drop(&mut self) {
+        self.abort()
     }
 }
