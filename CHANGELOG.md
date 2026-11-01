@@ -29,6 +29,21 @@
   are placed in `.data.rel.ro` sections. They were in writable `.rodata`
   sections, which GNU ld merged into the code segment, producing a
   writable and executable segment and a linker warning.
+- `std/graphics` strokes paths: `canvas.stroke_path(&path, &style, color)`
+  paints a band of the stroke's width along a path, as borders, chart lines
+  and icons need. A `graphics.Stroke` sets the width (in subpixels), miter,
+  round or bevel joins with a miter limit, butt, round or square caps, and a
+  dash pattern with an offset, with the defaults of SVG and the HTML canvas.
+  Open subpaths get caps, `close` joins, zero-length subpaths are dots, and a
+  closed subpath's last dash joins its first. Strokes stay integer-only and
+  exact like fills: a stroke along pixel edges covers whole pixels, and a
+  translucent stroke paints each pixel once where it overlaps itself.
+  `stroke_outline` strokes any `graphics.Outline`, TrueType glyphs included,
+  `gradient_stroke_path` and `gradient_stroke_outline` paint with a gradient,
+  and `graphics.Stroked` is a stroke as an outline of its own for coverage
+  masks. Work follows what is visible: segments, joins, caps and dashes
+  outside the clip rectangle are skipped, even for strokes far wider than
+  the canvas. A new golden image covers every join, cap and dash.
 - Persistent storage for firmware. `hal.Flash` is a device protocol for NOR
   flash (erase blocks to `0xFF`, then write erased bytes once), and
   `std/embedded/storage` builds on it: `storage.Store`, a key-value store
