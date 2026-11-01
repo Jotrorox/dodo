@@ -33,7 +33,11 @@ const G_N: usize = 0
 const G_USED: usize = 4
 const G_RIGHT: usize = 8
 const G_TYPE: usize = 12
-const G_ENTRIES: usize = 16
+// Set once by the layout: entry capacity, data offset, data capacity.
+const G_ECAP: usize = 16
+const G_DOFF: usize = 20
+const G_DCAP: usize = 24
+const G_ENTRIES: usize = 32
 
 fn cur(e: &Engine, c: usize) -> usize {
     core.assert(c < NCURSORS)
@@ -868,12 +872,12 @@ fn build_cell(e: &mut Engine, t: u8, rowid: i64, rec: usize, size: usize, dst: u
 // ---------------------------------------------------------------------------
 // Gather buffers
 
-fn g_entry_cap(e: &Engine) -> usize {
-    (7 * e.page_size - G_ENTRIES) / 8
+fn g_entry_cap(e: &Engine, g: usize) -> usize {
+    ldu(e.ws, g + G_ECAP)
 }
 
 fn g_data(e: &Engine, g: usize) -> usize {
-    g + 7 * e.page_size
+    g + ldu(e.ws, g + G_DOFF)
 }
 
 fn g_reset(e: &mut Engine, g: usize, t: u8, right: u32) {
@@ -887,12 +891,19 @@ fn g_n(e: &Engine, g: usize) -> usize {
     ldu(e.ws, g + G_N)
 }
 
+// Entries hold cell offsets; cells are appended back to back, so a cell's
+// size is the distance to the next one (or to the end of the data).
 fn g_off(e: &Engine, g: usize, i: usize) -> usize {
-    ldu(e.ws, g + G_ENTRIES + i * 8)
+    ldu(e.ws, g + G_ENTRIES + i * 4)
 }
 
 fn g_size(e: &Engine, g: usize, i: usize) -> usize {
-    ldu(e.ws, g + G_ENTRIES + i * 8 + 4)
+    end := if i + 1 < g_n(e, g) {
+        g_off(e, g, i + 1)
+    } else {
+        g_data(e, g) + ldu(e.ws, g + G_USED)
+    }
+    end - g_off(e, g, i)
 }
 
 // Appends a cell. `skip` bytes are dropped from the front of the source;
@@ -905,7 +916,7 @@ fn g_push(e: &mut Engine, g: usize, src: usize, size: usize, skip: usize, with_p
     } else {
         0usize
     }
-    if n >= g_entry_cap(e) || used + total > 6 * e.page_size {
+    if n >= g_entry_cap(e, g) || used + total > ldu(e.ws, g + G_DCAP) {
         return err(corrupt(e))
     }
     dst := g_data(e, g) + used
@@ -915,8 +926,7 @@ fn g_push(e: &mut Engine, g: usize, src: usize, size: usize, skip: usize, with_p
         p += 4
     }
     move_bytes(e.ws, src + skip, p, size - skip)
-    stu(e.ws, g + G_ENTRIES + n * 8, dst)
-    stu(e.ws, g + G_ENTRIES + n * 8 + 4, total)
+    stu(e.ws, g + G_ENTRIES + n * 4, dst)
     stu(e.ws, g + G_N, n + 1)
     stu(e.ws, g + G_USED, used + total)
     ok(dst)

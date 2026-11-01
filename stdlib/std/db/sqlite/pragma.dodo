@@ -251,8 +251,28 @@ fn exec_pragma(e: &mut Engine, s: usize, resreg: usize) -> void!db.Error {
         if set {
             v := pragma_int_arg(e, s)?
             if e.db_pages == 0 && v >= 512 && v <= 65536 && (v & (v - 1)) == 0 {
+                old_ps := e.page_size
                 e.page_size = v as usize
-                layout(e)?
+                match layout_tail(e) {
+                    ok() => {},
+                    err(reason) => {
+                        // Too big for the regions laid out at open: the
+                        // whole workspace is laid out again before the next
+                        // statement (see relayout_workspace).
+                        e.page_size = old_ps
+                        match layout_tail(e) {
+                            ok() => {},
+                            err(_) => {},
+                        }
+                        let fits = e.ws.len >= min_workspace_bytes(v as usize)
+                        if !fits || e.sp_n > 0 {
+                            return err(reason)
+                        }
+                        e.page_size = v as usize
+                        e.relayout = true
+                        e.msg_len = 0
+                    },
+                }
                 cache_clear(e)
             }
             return ok()

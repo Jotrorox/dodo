@@ -740,14 +740,9 @@ fn begin_read(e: &mut Engine) -> void!db.Error {
         npages = (size / (ps as u64)) as u32
     }
     if ps != e.page_size {
-        if e.initialized && e.page_size != 0 && ps != e.page_size {
-            // The cache layout depends on the page size.
-            e.page_size = ps
-            layout(e)?
-        } else {
-            e.page_size = ps
-            layout(e)?
-        }
+        // The cache layout depends on the page size.
+        e.page_size = ps
+        layout_tail(e)?
         cache_clear(e)
     } else if !e.initialized || counter != e.change_counter {
         cache_clear(e)
@@ -857,7 +852,7 @@ fn playback(e: &mut Engine) -> void!db.Error {
             if ps != e.page_size {
                 // The journal decides the page size of the file it restores.
                 e.page_size = ps
-                layout(e)?
+                layout_tail(e)?
                 page = e.scratch_page
             }
         }
@@ -1148,12 +1143,20 @@ fn journal_sync_header(e: &mut Engine) -> void!db.Error {
 
 const SP_MAX: usize = 128
 const SP_ENTRY: usize = 16
-const SP_NAMES: usize = 4096
+const SP_NAMES: usize = 2048
 const SP_UNKNOWN: u32 = 4294967295
 
 fn sj_layout(e: &mut Engine) {
-    cap := 1usize
-    for (cap * 2) * 8 <= e.sj_cap / 8 {
+    // The page hash takes about an eighth of what is left after the stack,
+    // the names and two page records.
+    fixed := SP_MAX * SP_ENTRY + SP_NAMES + 2 * (e.page_size + 4)
+    avail := if e.sj_cap > fixed {
+        e.sj_cap - fixed
+    } else {
+        0usize
+    }
+    cap := 64usize
+    for (cap * 2) * 8 <= avail / 8 {
         cap = cap * 2
     }
     e.sj_ht_cap = cap

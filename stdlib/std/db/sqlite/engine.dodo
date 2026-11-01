@@ -17,7 +17,9 @@ import "std/math"
 // pg_fetch stays valid until the next cache miss evicts the least recently
 // used page, so code re-fetches (a cheap hash lookup) after fetching others.
 
-pub const MIN_WORKSPACE_BYTES: usize = 786432
+// The smallest workspace for databases with 4096-byte pages (SQLite's
+// default); see min_workspace_bytes for other page sizes.
+pub const MIN_WORKSPACE_BYTES: usize = 409600
 pub const WORKSPACE_BYTES: usize = 2097152
 
 const PATH_CAP: usize = 1024
@@ -140,6 +142,8 @@ struct Engine {
     keep_off: usize
     keep_cap: usize
     keep_top: usize
+    tail_off: usize
+    relayout: bool
     gather_a: usize
     gather_b: usize
     meta_off: usize
@@ -602,76 +606,146 @@ fn format_i64(out: &mut[u8], value: i64) -> usize {
 // ---------------------------------------------------------------------------
 // Layout
 
+// Minimum sizes of the regions that grow with the workspace.
+const MIN_SCHEMA: usize = 16384
+const MIN_SLOT: usize = 16384
+const MIN_ARENA: usize = 32768
+const MIN_SORT: usize = 32768
+const MIN_KEEP: usize = 4096
+const MIN_BITMAP: usize = 2048
+const MIN_CACHE_SLOTS: usize = 8
+const STMT_SLOT_COUNT: usize = 8
+
+// Gather buffers (B-tree balancing): A collects the cells of up to three
+// siblings plus their dividers, B one overflowing page plus a new cell.
+// Cells take at least 6 bytes (4 plus a 2-byte pointer), so the entry
+// tables are sized for that many cells.
+fn gather_entries(ps: usize, a: bool) -> usize {
+    if a {
+        ps / 2 + 16
+    } else {
+        ps / 5 + 16
+    }
+}
+
+fn gather_data(ps: usize, a: bool) -> usize {
+    if a {
+        5 * ps + 1024
+    } else {
+        2 * ps + 1024
+    }
+}
+
+fn gather_bytes(ps: usize, a: bool) -> usize {
+    G_ENTRIES + gather_entries(ps, a) * 4 + gather_data(ps, a)
+}
+
+fn sj_meta_bytes() -> usize {
+    SP_MAX * SP_ENTRY + SP_NAMES + 4096
+}
+
+// Workspace bytes that depend on the page size: gather buffers, scratch
+// pages, two statement-journal records, and the smallest page cache.
+fn page_bytes(ps: usize) -> usize {
+    gather_bytes(ps, true) + gather_bytes(ps, false) + 2 * ps + 2 * (ps + 64) + 2 * (ps + 4) + MIN_CACHE_SLOTS * (ps + SLOT_META + 8) + 64 * 4
+}
+
+fn fixed_bytes() -> usize {
+    PATH_CAP + MSG_CAP + NREGS * REG_BYTES + NCURSORS * CURSOR_BYTES + MIN_SCHEMA + (STMT_SLOT_COUNT + 1) * MIN_SLOT + MIN_ARENA + MIN_SORT + MIN_KEEP + MIN_BITMAP + sj_meta_bytes() + 64
+}
+
+// The smallest workspace that can open a database with `page_size`-byte
+// pages (512 to 65536). Larger workspaces cache more pages and hold larger
+// statements, sorts and transactions.
+pub fn min_workspace_bytes(page_size: usize) -> usize {
+    fixed_bytes() + page_bytes(page_size)
+}
+
+fn g_init(e: &mut Engine, g: usize, a: bool) {
+    ps := e.page_size
+    stu(e.ws, g + G_ECAP, gather_entries(ps, a))
+    stu(e.ws, g + G_DOFF, G_ENTRIES + gather_entries(ps, a) * 4)
+    stu(e.ws, g + G_DCAP, gather_data(ps, a))
+}
+
+// Lays out the whole workspace (at open). The regions in front of the
+// gather buffers never move afterwards; layout_tail redoes the rest when a
+// new database picks another page size.
 fn layout(e: &mut Engine) -> void!db.Error {
     total := e.ws.len
-    o := PATH_CAP + MSG_CAP
-    e.schema_cap = total / 16
-    if e.schema_cap < 32768 {
-        e.schema_cap = 32768
+    ps := e.page_size
+    need := fixed_bytes() + page_bytes(ps)
+    if total < need {
+        x := full(e, "workspace too small for this page size (")
+        msg_add_int(e, need as i64)
+        msg_add(e, " bytes needed)")
+        return err(x)
     }
+    // Whatever the minimums leave is shared out in proportion.
+    extra := total - need
+    o := PATH_CAP + MSG_CAP
+    e.schema_cap = MIN_SCHEMA + extra / 16
     e.schema_off = o
     o += e.schema_cap
     // Prepared-statement slots, the transient slot, and the schema slot.
-    e.stmt_slots = 8
-    e.stmt_slot = total / 80
-    if e.stmt_slot < 16384 {
-        e.stmt_slot = 16384
-    }
-    e.stmt_slot = e.stmt_slot / 8 * 8
+    e.stmt_slots = STMT_SLOT_COUNT
+    e.stmt_slot = (MIN_SLOT + extra / 90) / 8 * 8
     e.stmt_off = o
     o += (e.stmt_slots + 1) * e.stmt_slot
     e.reg_off = o
     o += NREGS * REG_BYTES
     e.cur_off = o
     o += NCURSORS * CURSOR_BYTES
-    e.arena_cap = total / 12
-    if e.arena_cap < 32768 {
-        e.arena_cap = 32768
-    }
+    // The value area also holds one page-sized row.
+    e.arena_cap = MIN_ARENA + ps + extra / 12
     e.arena_off = o
     e.arena_top = o
     o += e.arena_cap
-    e.sort_cap = total / 5
-    if e.sort_cap < 32768 {
-        e.sort_cap = 32768
-    }
+    e.sort_cap = MIN_SORT + extra / 5
     e.sort_off = o
     e.sort_top = o
     e.sort_hi = o + e.sort_cap
     o += e.sort_cap
     // Statement-lifetime copies of lookup keys and cached subquery values;
     // kept apart from the sorter, whose record lists must stay contiguous.
-    e.keep_cap = total / 64
-    if e.keep_cap < 16384 {
-        e.keep_cap = 16384
-    }
+    e.keep_cap = MIN_KEEP + extra / 64
     e.keep_off = o
     e.keep_top = o
     o += e.keep_cap
-    e.bitmap_bytes = total / 64
-    if e.bitmap_bytes < 4096 {
-        e.bitmap_bytes = 4096
-    }
+    e.bitmap_bytes = MIN_BITMAP + extra / 64
     e.bitmap_off = o
     o += e.bitmap_bytes
-    e.sj_cap = total / 16
-    if e.sj_cap < SP_MAX * SP_ENTRY + SP_NAMES + 8192 + 2 * (e.page_size + 4) {
-        e.sj_cap = SP_MAX * SP_ENTRY + SP_NAMES + 8192 + 2 * (e.page_size + 4)
-    }
+    e.sj_cap = sj_meta_bytes() + 2 * (ps + 4) + extra / 16
     e.sj_off = o
     o += e.sj_cap
+    e.tail_off = o
+    layout_tail(e)
+}
+
+// Page-size dependent part: gather buffers, scratch pages, memory journal
+// and page cache, from tail_off to the end of the workspace.
+fn layout_tail(e: &mut Engine) -> void!db.Error {
+    total := e.ws.len
+    ps := e.page_size
     sj_layout(e)
-    gather := GATHER_PAGES * e.page_size
+    if e.sj_ws_recs < 2 {
+        return err(full(e, "workspace too small for this page size (statement journal)"))
+    }
+    o := e.tail_off
     e.gather_a = o
-    o += gather
+    o += gather_bytes(ps, true)
     e.gather_b = o
-    o += gather
+    o += gather_bytes(ps, false)
+    let ga = e.gather_a
+    let gb = e.gather_b
+    g_init(e, ga, true)
+    g_init(e, gb, false)
     e.scratch_page = o
-    o += e.page_size
+    o += ps
     e.cell_buf = o
-    o += e.page_size + 64
+    o += ps + 64
     e.cell_buf2 = o
-    o += e.page_size + 64
+    o += ps + 64
     if o >= total {
         return err(full(e, "workspace too small for this page size"))
     }
@@ -679,21 +753,32 @@ fn layout(e: &mut Engine) -> void!db.Error {
     if e.memory {
         // In-memory databases keep rollback images in a memory journal.
         e.mj_cap = remaining / 3
+        floor := MIN_CACHE_SLOTS * (ps + SLOT_META + 8) + 64 * 4
+        if remaining - e.mj_cap < floor {
+            e.mj_cap = if remaining > floor {
+                remaining - floor
+            } else {
+                0usize
+            }
+        }
         e.mj_off = o
         o += e.mj_cap
         remaining = total - o
     }
-    per_slot := e.page_size + SLOT_META + 8
+    per_slot := ps + SLOT_META + 8
     slots := remaining / per_slot
-    if slots < 24 {
+    if slots < MIN_CACHE_SLOTS {
         return err(full(e, "workspace too small for the page cache"))
     }
     hash_cap := 1usize
     for hash_cap < slots * 2 {
         hash_cap = hash_cap * 2
     }
-    for slots * SLOT_META + hash_cap * 4 + slots * e.page_size > remaining {
+    for slots * SLOT_META + hash_cap * 4 + slots * ps > remaining {
         slots -= 1
+    }
+    if slots < MIN_CACHE_SLOTS {
+        return err(full(e, "workspace too small for the page cache"))
     }
     e.nslots = slots
     e.meta_off = o
@@ -702,7 +787,7 @@ fn layout(e: &mut Engine) -> void!db.Error {
     e.hash_cap = hash_cap
     o += hash_cap * 4
     e.cache_off = o
-    e.cache_end = o + slots * e.page_size
+    e.cache_end = o + slots * ps
     let meta_off2 = e.meta_off
     let cache_off2 = e.cache_off - e.meta_off
     zero_bytes(e.ws, meta_off2, cache_off2)

@@ -437,7 +437,46 @@ fn reals_format_like_sqlite() {
     }
 }
 
-static mut SMALL: [sqlite.MIN_WORKSPACE_BYTES]u8 = [0u8; sqlite.MIN_WORKSPACE_BYTES]
+static mut SMALL: [1048576]u8 = [0u8; 1048576]
+static mut MINIMAL: [sqlite.MIN_WORKSPACE_BYTES]u8 = [0u8; sqlite.MIN_WORKSPACE_BYTES]
+static mut DEFAULT: [sqlite.WORKSPACE_BYTES]u8 = [0u8; sqlite.WORKSPACE_BYTES]
+
+// The minimum workspace runs ordinary statements; 64 KiB pages fit in the
+// default workspace.
+@test
+fn minimum_and_large_page_workspaces() {
+    assert(sqlite.min_workspace_bytes(4096) <= sqlite.MIN_WORKSPACE_BYTES)
+    assert(sqlite.min_workspace_bytes(65536) <= sqlite.WORKSPACE_BYTES)
+    small_path := "dodo_sqlite_min_checks.db"
+    remove(small_path)
+    conn := sqlite.Connection.open(small_path, unsafe {
+        &mut MINIMAL[..]
+    })!
+    conn.exec("create table t(a integer primary key, b text); create index tb on t(b)")!
+    conn.exec("with recursive n(i) as (select 1 union all select i + 1 from n where i < 300) insert into t(b) select printf('row %d', i) from n")!
+    none_: [0]db.Value = []
+    total := sql.ScalarInt.new()
+    conn.query("select count(*) from t where b like 'row 1%'", &none_, &mut total)!
+    assert_eq(total.value, 111i64)
+    conn.close()!
+    remove(small_path)
+    path := "dodo_sqlite_64k_checks.db"
+    remove(path)
+    big := sqlite.Connection.open(path, unsafe {
+        &mut DEFAULT[..]
+    })!
+    big.exec("pragma page_size = 65536")!
+    big.exec("create table t(a integer primary key, b blob)")!
+    big.exec("insert into t(b) values (zeroblob(5000)), (zeroblob(30000)), (x'00ff')")!
+    blobs := sql.ScalarInt.new()
+    big.query("select sum(length(b)) from t", &none_, &mut blobs)!
+    assert_eq(blobs.value, 35002i64)
+    size := sql.ScalarInt.new()
+    big.query("pragma page_size", &none_, &mut size)!
+    assert_eq(size.value, 65536i64)
+    big.close()!
+    remove(path)
+}
 
 // A transaction much larger than a tiny page cache spills pages (including
 // newly allocated ones) to the file before commit; it must commit and roll

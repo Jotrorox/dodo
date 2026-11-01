@@ -281,11 +281,19 @@ fn stmt_start(e: &mut Engine, slot: usize, params: &[db.Value]) -> void!db.Error
     }
     e.error_offset = -1
     e.raise_kind = 0
+    if e.relayout {
+        relayout_workspace(e)?
+    }
     activate(e, slot)
     kind := sh(e, slot, SH_KIND) as u8
     root := sh(e, slot, SH_ROOT)
     // Transaction control runs outside the autocommit logic.
     if kind == S_BEGIN || kind == S_COMMIT || kind == S_ROLLBACK || kind == S_EMPTY || kind == S_VACUUM || kind == S_SAVEPOINT || kind == S_RELEASE {
+        if sh(e, slot, SH_GEN) == 4294967295 {
+            // Moved by relayout_workspace; these need no schema.
+            compile_slot(e, slot)?
+            activate(e, slot)
+        }
         sh_set(e, slot, SH_STATE, ST_RUNNING)
         e.active = slot
         return ok()
@@ -682,4 +690,45 @@ fn column_name(e: &Engine, slot: usize, i: usize) -> (usize, usize) {
         return (0usize, 0usize)
     }
     (ldu(e.ws, names + i * 8), ldu(e.ws, names + i * 8 + 4))
+}
+
+// Lays the whole workspace out again for a new page size chosen by PRAGMA
+// page_size before the database was created. Prepared statements keep their
+// SQL (parked at the end of the workspace, inside the empty page cache) and
+// are recompiled when next run.
+fn relayout_workspace(e: &mut Engine) -> void!db.Error {
+    e.relayout = false
+    old_off := e.stmt_off
+    old_slot := e.stmt_slot
+    n := e.stmt_slots + 1
+    park := e.ws.len
+    for s in 0usize..n {
+        base := old_off + s * old_slot
+        len := SLOT_SQL + ldu(e.ws, base + SH_SQLLEN)
+        park -= old_slot
+        move_bytes(e.ws, base, park, if len < old_slot {
+            len
+        } else {
+            old_slot
+        })
+    }
+    layout(e)?
+    e.schema_loaded = false
+    p := e.ws.len
+    for s in 0usize..n {
+        p -= old_slot
+        len := SLOT_SQL + ldu(e.ws, p + SH_SQLLEN)
+        base := e.stmt_off + s * e.stmt_slot
+        if len + 1024 > e.stmt_slot {
+            // No longer fits: the handle is retired.
+            zero_bytes(e.ws, base, SLOT_SQL)
+            continue
+        }
+        move_bytes(e.ws, p, base, len)
+        // Force recompilation.
+        stu(e.ws, base + SH_GEN, 4294967295)
+        stu(e.ws, base + SH_STATE, ST_IDLE)
+    }
+    cache_clear(e)
+    ok()
 }
