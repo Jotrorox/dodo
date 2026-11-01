@@ -117,6 +117,17 @@ struct Engine {
     sj_active: bool
     sj_overflow: bool
     sj_pages: u32
+    sj_stmt_first: usize
+    sj_ht_off: usize
+    sj_ht_cap: usize
+    sj_ht_n: usize
+    sj_rec_off: usize
+    sj_ws_recs: usize
+    sjf: Option<fs.File>
+    sj_file_open: bool
+    sp_n: usize
+    sp_names_used: usize
+    sp_txn: bool
     gather_a: usize
     gather_b: usize
     meta_off: usize
@@ -623,8 +634,12 @@ fn layout(e: &mut Engine) -> void!db.Error {
     e.bitmap_off = o
     o += e.bitmap_bytes
     e.sj_cap = total / 16
+    if e.sj_cap < SP_MAX * SP_ENTRY + SP_NAMES + 8192 + 2 * (e.page_size + 4) {
+        e.sj_cap = SP_MAX * SP_ENTRY + SP_NAMES + 8192 + 2 * (e.page_size + 4)
+    }
     e.sj_off = o
     o += e.sj_cap
+    sj_layout(e)
     gather := GATHER_PAGES * e.page_size
     e.gather_a = o
     o += gather

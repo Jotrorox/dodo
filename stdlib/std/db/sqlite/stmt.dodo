@@ -280,7 +280,7 @@ fn stmt_start(e: &mut Engine, slot: usize, params: &[db.Value]) -> void!db.Error
     kind := sh(e, slot, SH_KIND) as u8
     root := sh(e, slot, SH_ROOT)
     // Transaction control runs outside the autocommit logic.
-    if kind == S_BEGIN || kind == S_COMMIT || kind == S_ROLLBACK || kind == S_EMPTY || kind == S_VACUUM {
+    if kind == S_BEGIN || kind == S_COMMIT || kind == S_ROLLBACK || kind == S_EMPTY || kind == S_VACUUM || kind == S_SAVEPOINT || kind == S_RELEASE {
         sh_set(e, slot, SH_STATE, ST_RUNNING)
         e.active = slot
         return ok()
@@ -511,14 +511,47 @@ fn step_inner(e: &mut Engine, slot: usize) -> bool!db.Error {
         }
         commit(e)?
         e.explicit_txn = false
+        sp_reset(e)
         unlock_to(e, false)
+    } else if kind == S_ROLLBACK && nop(e, root) == 1 {
+        let name = na(e, root)
+        let nl = nb(e, root)
+        k := sp_find(e, name, nl)
+        if k == NO_COL {
+            return err(fail2(e, SQLITE_ERROR, "no such savepoint: ", name, nl))
+        }
+        sp_rollback_to(e, k)?
     } else if kind == S_ROLLBACK {
         if !e.explicit_txn {
             return err(fail(e, SQLITE_ERROR, "cannot rollback - no transaction is active"))
         }
         e.explicit_txn = false
         rollback(e)?
+        sp_reset(e)
         unlock_to(e, false)
+    } else if kind == S_SAVEPOINT {
+        if !e.explicit_txn {
+            e.explicit_txn = true
+            e.sp_txn = true
+        }
+        let name2 = na(e, root)
+        let nl2 = nb(e, root)
+        sp_push(e, name2, nl2)?
+    } else if kind == S_RELEASE {
+        let name3 = na(e, root)
+        let nl3 = nb(e, root)
+        k := sp_find(e, name3, nl3)
+        if k == NO_COL {
+            return err(fail2(e, SQLITE_ERROR, "no such savepoint: ", name3, nl3))
+        }
+        if k == 0 && e.sp_txn {
+            commit(e)?
+            e.explicit_txn = false
+            sp_reset(e)
+            unlock_to(e, false)
+        } else {
+            sp_release(e, k)
+        }
     }
     ok(false)
 }

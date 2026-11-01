@@ -99,6 +99,8 @@ const S_ALTER: u8 = 51
 const S_EMPTY: u8 = 52
 const S_VACUUM: u8 = 53
 const S_CREATE_VIEW: u8 = 54
+const S_SAVEPOINT: u8 = 55
+const S_RELEASE: u8 = 56
 
 // Operators.
 const OP_OR: u8 = 1
@@ -2914,13 +2916,30 @@ fn parse_statement(e: &mut Engine) -> usize!db.Error {
     }
     if accept_kw(e, "ROLLBACK") {
         accept_kw(e, "TRANSACTION")
-        if is_kw(e, "TO") {
-            return err(fail(e, SQLITE_ERROR, "savepoints are not supported"))
+        s := new_node(e, S_ROLLBACK)?
+        if accept_kw(e, "TO") {
+            accept_kw(e, "SAVEPOINT")
+            let (o, l) = take_name(e)?
+            set_op(e, s, 1)
+            set_nf(e, s, 0, o)
+            set_nf(e, s, 1, l)
         }
-        return new_node(e, S_ROLLBACK)
+        return ok(s)
     }
-    if is_kw(e, "SAVEPOINT") || is_kw(e, "RELEASE") {
-        return err(fail(e, SQLITE_ERROR, "savepoints are not supported"))
+    if accept_kw(e, "SAVEPOINT") {
+        s := new_node(e, S_SAVEPOINT)?
+        let (o, l) = take_name(e)?
+        set_nf(e, s, 0, o)
+        set_nf(e, s, 1, l)
+        return ok(s)
+    }
+    if accept_kw(e, "RELEASE") {
+        accept_kw(e, "SAVEPOINT")
+        s := new_node(e, S_RELEASE)?
+        let (o, l) = take_name(e)?
+        set_nf(e, s, 0, o)
+        set_nf(e, s, 1, l)
+        return ok(s)
     }
     if accept_kw(e, "PRAGMA") {
         return parse_pragma(e)

@@ -1034,7 +1034,7 @@ fn pg_write(e: &mut Engine, pgno: u32) -> usize!db.Error {
             bitmap_set(e, pgno)
         }
     }
-    if e.sj_active {
+    if e.sj_active || e.sp_n > 0 {
         stmt_save(e, pgno)?
     }
     d2 := pg_fetch(e, pgno)?
@@ -1131,43 +1131,408 @@ fn journal_sync_header(e: &mut Engine) -> void!db.Error {
 }
 
 // ---------------------------------------------------------------------------
-// Statement journal: page images saved at the first change within a
-// statement inside an explicit transaction, so a failing statement can be
-// undone without abandoning the transaction.
+// Savepoint and statement journal. Each savepoint (and the statement running
+// inside an explicit transaction, as an anonymous innermost level) saves the
+// image a page had when the level began, the first time the page changes
+// within that level. Records are appended in time order, so every level owns
+// a contiguous suffix of them; RELEASE simply forgets level boundaries and
+// ROLLBACK TO restores the level's suffix, newest first (the oldest image of
+// a page wins). Records live in the workspace region; when it is full, a
+// file database continues in a "<db>-stmtjrnl" spill file that is deleted
+// when the transaction ends.
+//
+// Region layout: savepoint stack | savepoint names | page hash | records.
+// Stack entry: [0] name offset, [4] name length, [8] first record, [12]
+// database size when the savepoint began (SP_UNKNOWN until a write starts).
+// Page hash entry: [0] page number, [4] newest level that saved the page.
 
-fn stmt_begin(e: &mut Engine) {
-    e.sj_used = 0
-    e.sj_overflow = false
-    e.sj_pages = e.db_pages
-    e.sj_active = e.explicit_txn && e.write_txn
+const SP_MAX: usize = 128
+const SP_ENTRY: usize = 16
+const SP_NAMES: usize = 4096
+const SP_UNKNOWN: u32 = 4294967295
+
+fn sj_layout(e: &mut Engine) {
+    cap := 1usize
+    for (cap * 2) * 8 <= e.sj_cap / 8 {
+        cap = cap * 2
+    }
+    e.sj_ht_cap = cap
+    e.sj_ht_off = e.sj_off + SP_MAX * SP_ENTRY + SP_NAMES
+    e.sj_rec_off = e.sj_ht_off + cap * 8
+    rec := e.page_size + 4
+    end := e.sj_off + e.sj_cap
+    e.sj_ws_recs = if end > e.sj_rec_off {
+        (end - e.sj_rec_off) / rec
+    } else {
+        0usize
+    }
 }
 
+fn sp_entry(e: &Engine, k: usize) -> usize {
+    e.sj_off + k * SP_ENTRY
+}
+
+fn sj_top_level(e: &Engine) -> usize {
+    if e.sj_active {
+        return e.sp_n + 1
+    }
+    e.sp_n
+}
+
+fn sj_top_pages(e: &Engine) -> u32 {
+    if e.sj_active {
+        return e.sj_pages
+    }
+    ld32(e.ws, sp_entry(e, e.sp_n - 1) + 12)
+}
+
+fn sj_ht_find(e: &Engine, pgno: u32) -> usize {
+    mask := e.sj_ht_cap - 1
+    h := ((pgno as usize) * 2654435761) & mask
+    for _ in 0usize..e.sj_ht_cap {
+        o := e.sj_ht_off + h * 8
+        p := ld32(e.ws, o)
+        if p == pgno || p == 0 {
+            return o
+        }
+        h = (h + 1) & mask
+    }
+    0
+}
+
+fn sj_ht_level(e: &Engine, pgno: u32) -> usize {
+    o := sj_ht_find(e, pgno)
+    if o == 0 || ld32(e.ws, o) != pgno {
+        return 0
+    }
+    ldu(e.ws, o + 4)
+}
+
+fn sj_ht_set(e: &mut Engine, pgno: u32, level: usize) {
+    o := sj_ht_find(e, pgno)
+    if o == 0 {
+        return
+    }
+    if ld32(e.ws, o) == 0 {
+        if (e.sj_ht_n + 1) * 2 > e.sj_ht_cap {
+            // Full: later lookups miss and may save redundant images, which
+            // is harmless because the oldest image wins on rollback.
+            return
+        }
+        e.sj_ht_n += 1
+        st32(e.ws, o, pgno)
+    }
+    stu(e.ws, o + 4, level)
+}
+
+// Lowers every hash level >= `lowest` to `to` (0 forgets the page).
+fn sj_ht_lower(e: &mut Engine, lowest: usize, to: usize) {
+    for i in 0usize..e.sj_ht_cap {
+        o := e.sj_ht_off + i * 8
+        if ld32(e.ws, o) != 0 && ldu(e.ws, o + 4) >= lowest {
+            stu(e.ws, o + 4, to)
+        }
+    }
+}
+
+fn sj_clear(e: &mut Engine) {
+    if e.sj_ht_n > 0 {
+        let ht = e.sj_ht_off
+        let bytes = e.sj_ht_cap * 8
+        zero_bytes(e.ws, ht, bytes)
+        e.sj_ht_n = 0
+    }
+    e.sj_used = 0
+    e.sj_overflow = false
+    sj_file_close(e)
+}
+
+fn sj_file_close(e: &mut Engine) {
+    if !e.sj_file_open {
+        return
+    }
+    match &mut e.sjf {
+        some(f) => {
+            match f.close() {
+                ok() => {},
+                err(_) => {},
+            }
+        },
+        none => {},
+    }
+    e.sjf = none
+    e.sj_file_open = false
+    buf := [0u8; 1100]
+    n := side_path(e, "-stmtjrnl", &mut buf)
+    text := unsafe {
+        mem.str_from_utf8(&buf[..n])
+    }
+    ws := platform.workspace()
+    match ws.set(text) {
+        ok() => {
+            match ws.get() {
+                ok(name) => {
+                    match fs.remove_file(&name) {
+                        ok() => {},
+                        err(_) => {},
+                    }
+                },
+                err(_) => {},
+            }
+        },
+        err(_) => {},
+    }
+}
+
+fn sj_file_open_now(e: &mut Engine) -> bool {
+    if e.sj_file_open {
+        return true
+    }
+    if e.memory || e.path_len == 0 {
+        return false
+    }
+    buf := [0u8; 1100]
+    n := side_path(e, "-stmtjrnl", &mut buf)
+    text := unsafe {
+        mem.str_from_utf8(&buf[..n])
+    }
+    ws := platform.workspace()
+    options := fs.OpenOptions.new()
+    options.read = true
+    options.write = true
+    options.create = true
+    options.truncate = true
+    match fs.File.open_utf8(text, &options, &mut ws) {
+        ok(file) => {
+            e.sjf = some(file)
+            e.sj_file_open = true
+            true
+        },
+        err(_) => false,
+    }
+}
+
+// Writes `len` workspace bytes at `src` to the spill file at `pos`.
+fn sj_file_write(e: &mut Engine, pos: u64, src: usize, len: usize) -> bool {
+    good := false
+    match &mut e.sjf {
+        some(f) => {
+            match f.seek(pos as usize) {
+                ok(_) => {
+                    good = true
+                },
+                err(_) => {},
+            }
+            put := 0usize
+            for good && put < len {
+                match f.write(&e.ws[src + put..src + len]) {
+                    ok(n) => {
+                        if n == 0 {
+                            good = false
+                        }
+                        put += n
+                    },
+                    err(_) => {
+                        good = false
+                    },
+                }
+            }
+        },
+        none => {},
+    }
+    good
+}
+
+fn sj_file_write_bytes(e: &mut Engine, pos: u64, src: &[u8]) -> bool {
+    good := false
+    match &mut e.sjf {
+        some(f) => {
+            match f.seek(pos as usize) {
+                ok(_) => {
+                    good = true
+                },
+                err(_) => {},
+            }
+            put := 0usize
+            for good && put < src.len {
+                match f.write(&src[put..]) {
+                    ok(n) => {
+                        if n == 0 {
+                            good = false
+                        }
+                        put += n
+                    },
+                    err(_) => {
+                        good = false
+                    },
+                }
+            }
+        },
+        none => {},
+    }
+    good
+}
+
+fn sj_file_read_bytes(e: &mut Engine, pos: u64, dst: &mut[u8]) -> bool {
+    good := false
+    match &mut e.sjf {
+        some(f) => {
+            match f.seek(pos as usize) {
+                ok(_) => {
+                    good = true
+                },
+                err(_) => {},
+            }
+            got := 0usize
+            for good && got < dst.len {
+                match f.read(&mut dst[got..]) {
+                    ok(n) => {
+                        if n == 0 {
+                            good = false
+                        }
+                        got += n
+                    },
+                    err(_) => {
+                        good = false
+                    },
+                }
+            }
+        },
+        none => {},
+    }
+    good
+}
+
+fn sj_file_read(e: &mut Engine, pos: u64, dst: usize, len: usize) -> bool {
+    good := false
+    match &mut e.sjf {
+        some(f) => {
+            match f.seek(pos as usize) {
+                ok(_) => {
+                    good = true
+                },
+                err(_) => {},
+            }
+            got := 0usize
+            for good && got < len {
+                match f.read(&mut e.ws[dst + got..dst + len]) {
+                    ok(n) => {
+                        if n == 0 {
+                            good = false
+                        }
+                        got += n
+                    },
+                    err(_) => {
+                        good = false
+                    },
+                }
+            }
+        },
+        none => {},
+    }
+    good
+}
+
+// Statement level: begins with every statement of a write transaction
+// that is explicit (BEGIN or SAVEPOINT).
+fn stmt_begin(e: &mut Engine) {
+    if e.sp_n == 0 {
+        sj_clear(e)
+    }
+    e.sj_pages = e.db_pages
+    e.sj_active = e.explicit_txn && e.write_txn
+    e.sj_stmt_first = e.sj_used
+}
+
+// Saves page `pgno` for the innermost level if this is its first change
+// within that level.
 fn stmt_save(e: &mut Engine, pgno: u32) -> void!db.Error {
-    if e.sj_overflow {
+    level := sj_top_level(e)
+    if level == 0 || e.sj_overflow {
         return ok()
     }
-    if pgno > e.sj_pages {
+    if pgno > sj_top_pages(e) {
         return ok()
     }
-    // Already saved during this statement?
+    if sj_ht_level(e, pgno) == level {
+        return ok()
+    }
     rec := e.page_size + 4
-    o := 0usize
-    for o < e.sj_used {
-        if ld32(e.ws, e.sj_off + o) == pgno {
+    i := e.sj_used
+    d := pg_fetch(e, pgno)?
+    if i < e.sj_ws_recs {
+        dst := e.sj_rec_off + i * rec
+        st32(e.ws, dst, pgno)
+        let page_size2 = e.page_size
+        move_bytes(e.ws, d, dst + 4, page_size2)
+    } else {
+        good := sj_file_open_now(e)
+        if good {
+            pos := ((i - e.sj_ws_recs) as u64) * (rec as u64)
+            tag := [0u8; 4]
+            st32(&mut tag, 0, pgno)
+            good = sj_file_write_bytes(e, pos, &tag)
+            if good {
+                d2 := pg_fetch(e, pgno)?
+                let page_size3 = e.page_size
+                good = sj_file_write(e, pos + 4, d2, page_size3)
+            }
+        }
+        if !good {
+            if e.sp_n > 0 {
+                return err(full(e, "savepoint journal (transaction too large for the workspace)"))
+            }
+            // Without savepoints a failing statement rolls back the whole
+            // transaction instead.
+            e.sj_overflow = true
             return ok()
         }
-        o += rec
     }
-    if e.sj_used + rec > e.sj_cap {
-        e.sj_overflow = true
-        return ok()
+    e.sj_used = i + 1
+    sj_ht_set(e, pgno, level)
+    ok()
+}
+
+// Restores records [first, sj_used) newest first, truncates them, and
+// shrinks the database to `pages`.
+fn sj_restore(e: &mut Engine, first: usize, pages: u32) -> void!db.Error {
+    rec := e.page_size + 4
+    i := e.sj_used
+    for i > first {
+        i -= 1
+        if i < e.sj_ws_recs {
+            o := e.sj_rec_off + i * rec
+            pgno := ld32(e.ws, o)
+            d := pg_fetch(e, pgno)?
+            let src = e.sj_rec_off + i * rec + 4
+            let page_size2 = e.page_size
+            move_bytes(e.ws, src, d, page_size2)
+            let slot = hash_find(e, pgno) - 1
+            e.ws[slot_meta(e, slot) + 4] = 1
+        } else {
+            pos := ((i - e.sj_ws_recs) as u64) * (rec as u64)
+            tag := [0u8; 4]
+            if !sj_file_read_bytes(e, pos, &mut tag) {
+                return err(io_fail(e, "disk I/O error (savepoint journal read)"))
+            }
+            pgno := ld32(&tag, 0)
+            d := pg_fetch(e, pgno)?
+            let page_size3 = e.page_size
+            if !sj_file_read(e, pos + 4, d, page_size3) {
+                return err(io_fail(e, "disk I/O error (savepoint journal read)"))
+            }
+            let slot2 = hash_find(e, pgno) - 1
+            e.ws[slot_meta(e, slot2) + 4] = 1
+        }
     }
-    d := pg_fetch(e, pgno)?
-    dst := e.sj_off + e.sj_used
-    st32(e.ws, dst, pgno)
-    let page_size2 = e.page_size
-    move_bytes(e.ws, d, dst + 4, page_size2)
-    e.sj_used += rec
+    e.sj_used = first
+    if pages != SP_UNKNOWN && pages < e.db_pages {
+        for p in (pages + 1)..(e.db_pages + 1) {
+            cache_drop(e, p)
+        }
+        e.db_pages = pages
+    }
+    e.schema_loaded = false
     ok()
 }
 
@@ -1177,34 +1542,113 @@ fn stmt_rollback(e: &mut Engine) -> bool!db.Error {
     if !e.sj_active {
         return ok(false)
     }
+    level := e.sp_n + 1
     e.sj_active = false
     if e.sj_overflow {
         return ok(false)
     }
-    rec := e.page_size + 4
-    o := 0usize
-    for o < e.sj_used {
-        pgno := ld32(e.ws, e.sj_off + o)
-        d := pg_fetch(e, pgno)?
-        let sj_off2 = e.sj_off + o + 4
-        let page_size2 = e.page_size
-        move_bytes(e.ws, sj_off2, d, page_size2)
-        let hash_find2 = hash_find(e, pgno) - 1
-        e.ws[slot_meta(e, hash_find2) + 4] = 1
-        o += rec
-    }
-    // Pages appended during the statement are discarded.
-    for p in (e.sj_pages + 1)..(e.db_pages + 1) {
-        cache_drop(e, p)
-    }
-    e.db_pages = e.sj_pages
-    e.schema_loaded = false
+    let first = e.sj_stmt_first
+    let pages = e.sj_pages
+    sj_restore(e, first, pages)?
+    sj_ht_lower(e, level, 0)
     ok(true)
 }
 
+// Ends the statement level; its records now belong to the enclosing
+// savepoint, if any.
 fn stmt_end(e: &mut Engine) {
+    if e.sj_active && e.sp_n > 0 {
+        let level = e.sp_n + 1
+        let to = e.sp_n
+        sj_ht_lower(e, level, to)
+    }
     e.sj_active = false
-    e.sj_used = 0
+    if e.sp_n == 0 {
+        sj_clear(e)
+    }
+}
+
+// Forgets every savepoint (transaction end).
+fn sp_reset(e: &mut Engine) {
+    e.sp_n = 0
+    e.sp_names_used = 0
+    e.sp_txn = false
+    e.sj_active = false
+    sj_clear(e)
+}
+
+// Fills in the database size of savepoints opened before the write
+// transaction began.
+fn sp_write_started(e: &mut Engine) {
+    for k in 0usize..e.sp_n {
+        o := sp_entry(e, k) + 12
+        if ld32(e.ws, o) == SP_UNKNOWN {
+            let pages = e.db_pages
+            st32(e.ws, o, pages)
+        }
+    }
+}
+
+fn sp_find(e: &Engine, name: usize, nl: usize) -> usize {
+    k := e.sp_n
+    for k > 0 {
+        k -= 1
+        o := sp_entry(e, k)
+        let so = ldu(e.ws, o)
+        let sl = ldu(e.ws, o + 4)
+        if names_eq(e, so, sl, name, nl) {
+            return k
+        }
+    }
+    NO_COL
+}
+
+fn sp_push(e: &mut Engine, name: usize, nl: usize) -> void!db.Error {
+    if e.sp_n >= SP_MAX || e.sp_names_used + nl > SP_NAMES {
+        return err(fail(e, SQLITE_FULL, "too many savepoints"))
+    }
+    dst := e.sj_off + SP_MAX * SP_ENTRY + e.sp_names_used
+    move_bytes(e.ws, name, dst, nl)
+    o := sp_entry(e, e.sp_n)
+    stu(e.ws, o, dst)
+    stu(e.ws, o + 4, nl)
+    let used = e.sj_used
+    stu(e.ws, o + 8, used)
+    let pages = if e.write_txn {
+        e.db_pages
+    } else {
+        SP_UNKNOWN
+    }
+    st32(e.ws, o + 12, pages)
+    e.sp_names_used += nl
+    e.sp_n += 1
+    ok()
+}
+
+// RELEASE: drops savepoint k and every later one.
+fn sp_release(e: &mut Engine, k: usize) {
+    if k > 0 {
+        sj_ht_lower(e, k + 1, k)
+    }
+    e.sp_names_used = ldu(e.ws, sp_entry(e, k)) - (e.sj_off + SP_MAX * SP_ENTRY)
+    e.sp_n = k
+    if k == 0 {
+        sj_clear(e)
+    }
+}
+
+// ROLLBACK TO: undoes every change since savepoint k began; k stays open.
+fn sp_rollback_to(e: &mut Engine, k: usize) -> void!db.Error {
+    o := sp_entry(e, k)
+    first := ldu(e.ws, o + 8)
+    pages := ld32(e.ws, o + 12)
+    e.sp_names_used = ldu(e.ws, o) + ldu(e.ws, o + 4) - (e.sj_off + SP_MAX * SP_ENTRY)
+    e.sp_n = k + 1
+    if e.write_txn {
+        sj_restore(e, first, pages)?
+    }
+    sj_ht_lower(e, k + 1, 0)
+    ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -1227,6 +1671,7 @@ fn begin_write(e: &mut Engine) -> void!db.Error {
     e.mj_used = 0
     e.file_pages = e.db_pages
     e.disk_pages = e.db_pages
+    sp_write_started(e)
     n := (e.db_pages as usize) / 8 + 1
     let bitmap_off2 = e.bitmap_off
     let value = if n < e.bitmap_bytes {
@@ -1345,6 +1790,7 @@ fn commit(e: &mut Engine) -> void!db.Error {
     e.journal_open = false
     e.file_pages = e.db_pages
     e.mj_used = 0
+    sp_reset(e)
     let explicit_txn2 = e.explicit_txn
     unlock_to(e, explicit_txn2)
     ok()
@@ -1355,7 +1801,7 @@ fn rollback(e: &mut Engine) -> void!db.Error {
         return ok()
     }
     e.write_txn = false
-    e.sj_active = false
+    sp_reset(e)
     if e.memory {
         // Restore saved images, newest first so the oldest image wins.
         rec := e.page_size + 4
