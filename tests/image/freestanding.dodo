@@ -1,0 +1,79 @@
+package main
+
+import "std/graphics"
+import "std/image"
+import "std/image/pixels"
+import "std/image/png"
+import "std/image/sink"
+
+// Exercises std/image and the codec packages without an OS, allocator or
+// files, so tests/image_codecs_library.rs can build it for a browser
+// (wasm32) and a Cortex-M0+ (thumbv6m) and run it on the host.
+
+static mut SCRATCH: [400000]u8 = [0u8; 400000]
+static mut OUTPUT: [4096]u8 = [0u8; 4096]
+
+fn run() -> u32!pixels.Error {
+    data := [0u8; 6 * 4 * 4]
+    for i in 0usize..data.len {
+        data[i] = ((i * 29) & 255) as u8
+    }
+    source := pixels.View.new(&data, 6, 4, pixels.Layout.rgba8())!
+    options := image.EncodeOptions.new()
+    total := 0u32
+    formats := [0u32, 1, 2, 3]
+    for f in 0usize..formats.len {
+        format := pixels.Format.Png
+        if f == 1 {
+            format = pixels.Format.Qoi
+        } else if f == 2 {
+            format = pixels.Format.Bmp
+        } else if f == 3 {
+            format = pixels.Format.Ppm
+        }
+        unsafe {
+            length := image.encode(format, &source, &options, &mut OUTPUT, &mut SCRATCH)?
+            encoded := &OUTPUT[..length]
+            header := image.info(encoded)?
+            decoded := [0u8; 6 * 4 * 8]
+            target := pixels.ViewMut.new(&mut decoded, 6, 4, pixels.Layout.rgba16())?
+            image.decode(encoded, &mut target, &mut SCRATCH)?
+            for i in 0usize..data.len {
+                if decoded[i * 2 + 1] != data[i] {
+                    return err(pixels.Error.Malformed)
+                }
+            }
+            canvas_pixels := [0u8; 6 * 4 * 2]
+            canvas := graphics.canvas(&mut canvas_pixels, 6, 4, graphics.PixelFormat.Rgb565)!
+            image.draw(encoded, &mut canvas, 0, 0, &mut SCRATCH)?
+            null_sink := sink.NullSink.new()
+            image.decode_frame_into(encoded, 0, &mut null_sink, &mut SCRATCH)?
+            total += header.width + null_sink.rects as u32 * 0
+        }
+    }
+    unsafe {
+        frame := png.EncodeOptions.new()
+        frame.palette = true
+        frame.interlace = true
+        length := png.encode(&source, &frame, &mut OUTPUT, &mut SCRATCH)?
+        found := image.metadata(&OUTPUT[..length])?
+        if found.exif.present() {
+            return err(pixels.Error.Malformed)
+        }
+    }
+    return ok(total)
+}
+
+fn main() -> i32 {
+    match run() {
+        ok(total) => {
+            if total == 24 {
+                return 0
+            }
+            return 2
+        }
+        err(_) => {
+            return 1
+        }
+    }
+}

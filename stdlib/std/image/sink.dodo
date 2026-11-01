@@ -118,3 +118,92 @@ pub struct NullSink {
         return ok()
     }
 }
+
+// ---------------------------------------------------------------------------
+// Sources
+
+// Where encoders read pixels. An encoder asks for the source's layout to pick
+// its output format (channel count, 8 or 16-bit), then loads runs of pixels
+// as straight RGBA. ViewSource reads a pixels.View in any layout and
+// CanvasSource a graphics.Canvas in any pixel format; both are integer-only.
+pub interface Source {
+    fn width(&self) -> u32
+    fn height(&self) -> u32
+    // The layout that holds the source's samples without loss.
+    fn layout(&self) -> pixels.Layout
+    // `count` pixels of row y from column x as straight 8-bit RGBA in
+    // out[..4 * count]. The caller keeps x + count <= width and y < height.
+    fn load_rgba8(&self, x: u32, y: u32, count: usize, out: &mut[u8])
+    // The same as straight 16-bit RGBA.
+    fn load_rgba16(&self, x: u32, y: u32, count: usize, out: &mut[u16])
+}
+
+// Reads a View, converting with convert.load_rgba8 and load_rgba16.
+pub struct ViewSource {
+    view: &pixels.View
+
+    pub fn new(view: &pixels.View) -> ViewSource from(view) {
+        return ViewSource { view: view }
+    }
+    pub fn width(&self) -> u32 {
+        return self.view.width()
+    }
+    pub fn height(&self) -> u32 {
+        return self.view.height()
+    }
+    pub fn layout(&self) -> pixels.Layout {
+        return self.view.layout().clone()
+    }
+    pub fn load_rgba8(&self, x: u32, y: u32, count: usize, out: &mut[u8]) {
+        convert.load_rgba8(self.view.row(y), self.view.layout(), x as usize, count, out)
+    }
+    pub fn load_rgba16(&self, x: u32, y: u32, count: usize, out: &mut[u16]) {
+        convert.load_rgba16(self.view.row(y), self.view.layout(), x as usize, count, out)
+    }
+}
+
+// Reads a canvas from its top-left pixel, wherever its origin is, as 8-bit
+// RGBA (formats without alpha read as opaque).
+pub struct CanvasSource {
+    canvas: &graphics.Canvas
+
+    pub fn new(canvas: &graphics.Canvas) -> CanvasSource from(canvas) {
+        return CanvasSource { canvas: canvas }
+    }
+    pub fn width(&self) -> u32 {
+        return self.canvas.width()
+    }
+    pub fn height(&self) -> u32 {
+        return self.canvas.height()
+    }
+    pub fn layout(&self) -> pixels.Layout {
+        return pixels.Layout.rgba8()
+    }
+    pub fn load_rgba8(&self, x: u32, y: u32, count: usize, out: &mut[u8]) {
+        bounds := self.canvas.bounds()
+        py := (bounds.y as i64 + y as i64) as i32
+        for i in 0usize..count {
+            px := (bounds.x as i64 + x as i64 + i as i64) as i32
+            color := graphics.TRANSPARENT
+            match self.canvas.color_at(px, py) {
+                some(value) => {
+                    color = value
+                }
+                none => {}
+            }
+            out[i * 4] = graphics.red(color)
+            out[i * 4 + 1] = graphics.green(color)
+            out[i * 4 + 2] = graphics.blue(color)
+            out[i * 4 + 3] = graphics.alpha(color)
+        }
+    }
+    pub fn load_rgba16(&self, x: u32, y: u32, count: usize, out: &mut[u16]) {
+        narrow := [0u8; 4]
+        for i in 0usize..count {
+            self.load_rgba8(x + i as u32, y, 1, &mut narrow)
+            for k in 0usize..4 {
+                out[i * 4 + k] = narrow[k] as u16 * 257
+            }
+        }
+    }
+}

@@ -1,0 +1,635 @@
+package ops
+
+import "core/slice"
+import "std/image/convert"
+import "std/image/pixels"
+import "std/image/shared/scratch" as carve
+
+// Color quantization: palettes, remapping to a palette with dithering, and
+// bit-depth reduction.
+//
+// palette() builds up to 256 RGBA colors for an image in any layout (read as
+// straight 8-bit RGBA). It lists the image's distinct colors first; when
+// there are no more than max_colors they are the palette, exactly. Otherwise
+// it runs median cut over the distinct colors weighted by pixel count, in
+// an alpha-weighted space (red, green and blue multiplied by alpha, plus
+// alpha), so transparent pixels' colors do not take palette entries and
+// colors are matched as they look. The box with the largest product of
+// pixel count and widest channel range is split at the weighted median of
+// that channel. Each entry is the alpha-weighted mean of its box.
+//
+// remap() replaces every pixel by the index of its nearest palette entry,
+// optionally dithered: Floyd-Steinberg error diffusion (serpentine, errors
+// in 1/16 steps, color errors scaled by alpha so invisible pixels push no
+// error), or an ordered 8x8 Bayer pattern on red, green and blue (not
+// alpha) with amplitude 255 / cbrt(palette size), one palette step for an
+// evenly spread palette. nearest_color() measures distance in the same
+// alpha-weighted space, breaking ties by straight color, so an exact entry
+// always wins; remap() caches results in scratch.
+//
+// reduce_depth() posterizes each channel to a number of bits (5, 6, 5 for
+// RGB565) with the same dithering choices, writing a target in any layout.
+// Everything is integer arithmetic.
+
+pub enum Dither {
+    None,
+    FloydSteinberg,
+    // 8x8 Bayer matrix.
+    Ordered
+}
+
+const DITHER_NONE: u32 = 0
+const DITHER_DIFFUSION: u32 = 1
+const DITHER_ORDERED: u32 = 2
+
+fn dither_code(dither: &Dither) -> u32 {
+    match dither {
+        Dither.None => {
+            return DITHER_NONE
+        }
+        Dither.FloydSteinberg => {
+            return DITHER_DIFFUSION
+        }
+        Dither.Ordered => {
+            return DITHER_ORDERED
+        }
+    }
+}
+
+pub const MAX_PALETTE: usize = 256
+
+// Entries in remap()'s nearest-color cache.
+const CACHE_ENTRIES: usize = 1024
+
+static BAYER8: [64]u8 = [
+    0, 32, 8, 40, 2, 34, 10, 42,
+    48, 16, 56, 24, 50, 18, 58, 26,
+    12, 44, 4, 36, 14, 46, 6, 38,
+    60, 28, 52, 20, 62, 30, 54, 22,
+    3, 35, 11, 43, 1, 33, 9, 41,
+    51, 19, 59, 27, 49, 17, 57, 25,
+    15, 47, 7, 39, 13, 45, 5, 37,
+    63, 31, 55, 23, 61, 29, 53, 21
+]
+
+// ---------------------------------------------------------------------------
+// Palettes
+
+fn pixel_count(width: u32, height: u32) -> usize!pixels.Error {
+    return pixels.checked(width as usize, height as usize, 0)
+}
+
+// Scratch bytes palette() needs for a width x height image.
+pub fn palette_scratch_size(width: u32, height: u32) -> usize!pixels.Error {
+    count := pixel_count(width, height)?
+    part := carve.size(count, 4)?
+    return carve.add(part, part)
+}
+
+fn pack(r: u8, g: u8, b: u8, a: u8) -> u32 {
+    return ((r as u32) << 24) | ((g as u32) << 16) | ((b as u32) << 8) | a as u32
+}
+
+fn key_channel(key: u32, channel: usize) -> u32 {
+    return (key >> (24 - 8 * channel as u32)) & 255
+}
+
+// Channel of the alpha-weighted space: colors times alpha, then alpha.
+fn weighted_channel(key: u32, channel: usize) -> u32 {
+    a := key & 255
+    if channel == 3 {
+        return a
+    }
+    return (key_channel(key, channel) * a + 127) / 255
+}
+
+fn sift_down(keys: &mut[u32], counts: &mut[u32], base: usize, root: usize, length: usize, channel: usize) {
+    node := root
+    for {
+        child := 2 * node + 1
+        if child >= length {
+            return
+        }
+        if child + 1 < length && sort_key(keys[base + child + 1], channel) > sort_key(keys[base + child], channel) {
+            child += 1
+        }
+        if sort_key(keys[base + node], channel) >= sort_key(keys[base + child], channel) {
+            return
+        }
+        swap_entries(keys, counts, base + node, base + child)
+        node = child
+    }
+}
+
+// channel 4 sorts by the whole key.
+fn sort_key(key: u32, channel: usize) -> u32 {
+    if channel == 4 {
+        return key
+    }
+    return weighted_channel(key, channel)
+}
+
+fn swap_entries(keys: &mut[u32], counts: &mut[u32], a: usize, b: usize) {
+    t := keys[a]
+    keys[a] = keys[b]
+    keys[b] = t
+    c := counts[a]
+    counts[a] = counts[b]
+    counts[b] = c
+}
+
+// Heap sort keys[base..base + length] (with their counts) by sort_key.
+fn sort_entries(keys: &mut[u32], counts: &mut[u32], base: usize, length: usize, channel: usize) {
+    if length < 2 {
+        return
+    }
+    root := length / 2
+    for root > 0 {
+        root -= 1
+        sift_down(keys, counts, base, root, length, channel)
+    }
+    end := length
+    for end > 1 {
+        end -= 1
+        swap_entries(keys, counts, base, base + end)
+        sift_down(keys, counts, base, 0, end, channel)
+    }
+}
+
+// The widest channel of a box and the box's score.
+struct BoxStats {
+    channel: usize
+    score: u64
+}
+
+fn box_stats(keys: &[u32], counts: &[u32], start: usize, end: usize) -> BoxStats {
+    if end - start < 2 {
+        return BoxStats { channel: 0, score: 0 }
+    }
+    low := [255u32, 255, 255, 255]
+    high := [0u32, 0, 0, 0]
+    weight := 0u64
+    for i in start..end {
+        for c in 0usize..4 {
+            v := weighted_channel(keys[i], c)
+            if v < low[c] {
+                low[c] = v
+            }
+            if v > high[c] {
+                high[c] = v
+            }
+        }
+        weight += counts[i] as u64
+    }
+    best := 0usize
+    for c in 1usize..4 {
+        if high[c] - low[c] > high[best] - low[best] {
+            best = c
+        }
+    }
+    return BoxStats { channel: best, score: (high[best] - low[best]) as u64 * weight }
+}
+
+// The alpha-weighted mean color of a box, written as palette entry `slot`.
+fn box_color(keys: &[u32], counts: &[u32], start: usize, end: usize, output: &mut[u8], slot: usize) {
+    weight := 0u64
+    alpha := 0u64
+    colors := [0u64, 0, 0]
+    plain := [0u64, 0, 0]
+    for i in start..end {
+        n := counts[i] as u64
+        a := (keys[i] & 255) as u64
+        weight += n
+        alpha += n * a
+        for c in 0usize..3 {
+            v := key_channel(keys[i], c) as u64
+            colors[c] += n * a * v
+            plain[c] += n * v
+        }
+    }
+    for c in 0usize..3 {
+        if alpha > 0 {
+            output[slot * 4 + c] = ((colors[c] + alpha / 2) / alpha) as u8
+        } else {
+            output[slot * 4 + c] = ((plain[c] + weight / 2) / weight) as u8
+        }
+    }
+    output[slot * 4 + 3] = ((alpha + weight / 2) / weight) as u8
+}
+
+// Build a palette of at most max_colors (1 to 256) RGBA quads in
+// palette_out and return how many entries it has. Images with no more
+// distinct colors than max_colors get exactly those colors, in ascending
+// RGBA order. An empty image gives 0 entries.
+pub fn palette(source: &pixels.View, max_colors: usize, palette_out: &mut[u8], work: &mut[u8]) -> usize!pixels.Error {
+    if max_colors == 0 || max_colors > MAX_PALETTE {
+        return err(pixels.Error.Malformed)
+    }
+    if palette_out.len < 4 * max_colors {
+        return err(pixels.Error.BufferTooSmall)
+    }
+    width := source.width()
+    height := source.height()
+    count := pixel_count(width, height)?
+    if count == 0 {
+        return ok(0)
+    }
+    part := carve.size(count, 4)?
+    let slice.SplitMut { left: a, right: b } = carve.split(work, part)?
+    if b.len < part {
+        return err(pixels.Error.BufferTooSmall)
+    }
+    keys := carve.u32s(a)
+    counts := carve.u32s(b)
+    layout := source.layout().clone()
+    buffer := [0u8; 256]
+    n := 0usize
+    for y in 0u32..height {
+        line := source.row(y)
+        x := 0usize
+        for x < width as usize {
+            chunk := width as usize - x
+            if chunk > BATCH {
+                chunk = BATCH
+            }
+            convert.load_rgba8(line, &layout, x, chunk, &mut buffer)
+            for i in 0usize..chunk {
+                keys[n] = pack(buffer[i * 4], buffer[i * 4 + 1], buffer[i * 4 + 2], buffer[i * 4 + 3])
+                counts[n] = 1
+                n += 1
+            }
+            x += chunk
+        }
+    }
+    sort_entries(keys, counts, 0, n, 4)
+    // Merge runs of equal keys.
+    unique := 1usize
+    for i in 1usize..n {
+        if keys[i] == keys[unique - 1] {
+            if counts[unique - 1] < 0xffffffff {
+                counts[unique - 1] += 1
+            }
+        } else {
+            keys[unique] = keys[i]
+            counts[unique] = 1
+            unique += 1
+        }
+    }
+    if unique <= max_colors {
+        for i in 0usize..unique {
+            for c in 0usize..4 {
+                palette_out[i * 4 + c] = key_channel(keys[i], c) as u8
+            }
+        }
+        return ok(unique)
+    }
+    // Median cut.
+    starts := [0u32; 256]
+    ends := [0u32; 256]
+    channels := [0u8; 256]
+    scores := [0u64; 256]
+    ends[0] = unique as u32
+    first := box_stats(keys, counts, 0, unique)
+    channels[0] = first.channel as u8
+    scores[0] = first.score
+    boxes := 1usize
+    for boxes < max_colors {
+        best := 0usize
+        for i in 1usize..boxes {
+            if scores[i] > scores[best] {
+                best = i
+            }
+        }
+        if scores[best] == 0 {
+            break
+        }
+        start := starts[best] as usize
+        end := ends[best] as usize
+        channel := channels[best] as usize
+        sort_entries(keys, counts, start, end - start, channel)
+        total := 0u64
+        for i in start..end {
+            total += counts[i] as u64
+        }
+        running := 0u64
+        split := start + 1
+        for i in start..end {
+            running += counts[i] as u64
+            if 2 * running >= total {
+                split = i + 1
+                break
+            }
+        }
+        if split >= end {
+            split = end - 1
+        }
+        if split <= start {
+            split = start + 1
+        }
+        ends[best] = split as u32
+        starts[boxes] = split as u32
+        ends[boxes] = end as u32
+        left := box_stats(keys, counts, start, split)
+        channels[best] = left.channel as u8
+        scores[best] = left.score
+        right := box_stats(keys, counts, split, end)
+        channels[boxes] = right.channel as u8
+        scores[boxes] = right.score
+        boxes += 1
+    }
+    for i in 0usize..boxes {
+        box_color(keys, counts, starts[i] as usize, ends[i] as usize, palette_out, i)
+    }
+    return ok(boxes)
+}
+
+// ---------------------------------------------------------------------------
+// Nearest colors
+
+// Distance between two colors: the alpha-weighted difference above bit 18,
+// the straight difference as a tie-breaker below it. Zero only for equal
+// colors.
+fn color_distance(palette: &[u8], entry: usize, r: u32, g: u32, b: u32, a: u32, limit: u64) -> u64 {
+    p := entry * 4
+    pa := palette[p + 3] as u32
+    da := (a as i64 - pa as i64) * 255
+    primary := (da * da) as u64
+    if (primary << 18) > limit {
+        return primary << 18
+    }
+    sr := palette[p] as i64
+    sg := palette[p + 1] as i64
+    sb := palette[p + 2] as i64
+    dr := r as i64 * a as i64 - sr * pa as i64
+    dg := g as i64 * a as i64 - sg * pa as i64
+    db := b as i64 * a as i64 - sb * pa as i64
+    primary += (dr * dr + dg * dg + db * db) as u64
+    if (primary << 18) > limit {
+        return primary << 18
+    }
+    er := r as i64 - sr
+    eg := g as i64 - sg
+    eb := b as i64 - sb
+    return (primary << 18) + (er * er + eg * eg + eb * eb) as u64
+}
+
+// The index of the palette entry (RGBA quads) nearest to a straight color.
+// An empty palette gives 0.
+pub fn nearest_color(palette: &[u8], r: u8, g: u8, b: u8, a: u8) -> usize {
+    entries := palette.len / 4
+    best := 0usize
+    limit := 0xffffffffffffffffu64
+    for i in 0usize..entries {
+        d := color_distance(palette, i, r as u32, g as u32, b as u32, a as u32, limit)
+        if d < limit {
+            limit = d
+            best = i
+            if d == 0 {
+                return i
+            }
+        }
+    }
+    return best
+}
+
+// Nearest entry through a direct-mapped cache of (key, index + 1) pairs.
+fn cached_nearest(palette: &[u8], cache: &mut[u32], r: u8, g: u8, b: u8, a: u8) -> usize {
+    key := pack(r, g, b, a)
+    slot := ((core.wrapping_mul(key, 2654435761u32) >> 22) as usize) % CACHE_ENTRIES
+    if cache[2 * slot + 1] != 0 && cache[2 * slot] == key {
+        return cache[2 * slot + 1] as usize - 1
+    }
+    index := nearest_color(palette, r, g, b, a)
+    cache[2 * slot] = key
+    cache[2 * slot + 1] = index as u32 + 1
+    return index
+}
+
+// Scratch bytes remap() needs for a source `width` pixels wide.
+pub fn remap_scratch_size(width: u32) -> usize!pixels.Error {
+    line := carve.size(4 * width as usize, 1)?
+    errors := carve.size(pixels.checked(8, width as usize + 2, 0)?, 4)?
+    cache := carve.size(2 * CACHE_ENTRIES, 4)?
+    return carve.add(carve.add(line, errors)?, cache)
+}
+
+fn integer_cube_root(n: usize) -> u32 {
+    root := 1u32
+    for ((root + 1) * (root + 1) * (root + 1)) as usize <= n {
+        root += 1
+    }
+    return root
+}
+
+fn clamp8(value: i32) -> u8 {
+    if value <= 0 {
+        return 0
+    }
+    if value >= 255 {
+        return 255
+    }
+    return value as u8
+}
+
+// Replace each pixel of `source` by the index of a palette entry (RGBA
+// quads, 1 to 256 of them), row by row into indices[..width * height].
+pub fn remap(source: &pixels.View, palette: &[u8], indices: &mut[u8], dither: Dither, work: &mut[u8]) -> void!pixels.Error {
+    entries := palette.len / 4
+    if entries == 0 || entries > MAX_PALETTE || palette.len % 4 != 0 {
+        return err(pixels.Error.Malformed)
+    }
+    width := source.width() as usize
+    height := source.height()
+    count := pixel_count(source.width(), height)?
+    if indices.len < count {
+        return err(pixels.Error.BufferTooSmall)
+    }
+    line_size := carve.size(4 * width, 1)?
+    error_size := carve.size(8 * (width + 2), 4)?
+    let slice.SplitMut { left: a, right: rest } = carve.split(work, line_size)?
+    let slice.SplitMut { left: b, right: c } = carve.split(rest, error_size)?
+    if c.len < carve.size(2 * CACHE_ENTRIES, 4)? {
+        return err(pixels.Error.BufferTooSmall)
+    }
+    line := a
+    errors := carve.i32s(b)
+    cache := carve.u32s(c)
+    for i in 0usize..2 * CACHE_ENTRIES {
+        cache[i] = 0
+    }
+    for i in 0usize..8 * (width + 2) {
+        errors[i] = 0
+    }
+    code := dither_code(&dither)
+    spread := 255i32 / integer_cube_root(entries) as i32
+    layout := source.layout().clone()
+    row_errors := 4 * (width + 2)
+    for y in 0u32..height {
+        convert.load_rgba8(source.row(y), &layout, 0, width, line)
+        out := y as usize * width
+        // Floyd-Steinberg: this row's errors at `current`, the next row's at
+        // `below`, both offset by one pixel for the borders.
+        current := (y as usize % 2) * row_errors
+        below := row_errors - current
+        reverse := code == DITHER_DIFFUSION && y % 2 == 1
+        for step in 0usize..width {
+            x := step
+            if reverse {
+                x = width - 1 - step
+            }
+            p := x * 4
+            r := line[p] as i32
+            g := line[p + 1] as i32
+            b := line[p + 2] as i32
+            a := line[p + 3] as i32
+            if code == DITHER_ORDERED {
+                offset := ((2 * BAYER8[(y as usize % 8) * 8 + x % 8] as i32 + 1) - 64) * spread / 128
+                r += offset
+                g += offset
+                b += offset
+            } else if code == DITHER_DIFFUSION {
+                e := current + (x + 1) * 4
+                r += (errors[e] + 8) >> 4
+                g += (errors[e + 1] + 8) >> 4
+                b += (errors[e + 2] + 8) >> 4
+                a += (errors[e + 3] + 8) >> 4
+            }
+            wanted := [clamp8(r), clamp8(g), clamp8(b), clamp8(a)]
+            index := cached_nearest(palette, cache, wanted[0], wanted[1], wanted[2], wanted[3])
+            indices[out + x] = index as u8
+            if code == DITHER_DIFFUSION {
+                diffuse(errors, current, below, x, width, reverse, &wanted, palette, index)
+            }
+        }
+        if code == DITHER_DIFFUSION {
+            for i in 0usize..row_errors {
+                errors[current + i] = 0
+            }
+        }
+    }
+    return ok()
+}
+
+// Spread the error of pixel x (wanted minus chosen palette color) to the
+// pixels not yet visited: 7/16 ahead, 3/16, 5/16 and 1/16 on the next row.
+fn diffuse(errors: &mut[i32], current: usize, below: usize, x: usize, width: usize, reverse: bool, wanted: &[u8], palette: &[u8], index: usize) {
+    alpha := wanted[3] as i32
+    ahead := x + 2
+    behind := x
+    if reverse {
+        ahead = x
+        behind = x + 2
+    }
+    for c in 0usize..4 {
+        e := wanted[c] as i32 - palette[index * 4 + c] as i32
+        if c < 3 {
+            e = e * alpha / 255
+        }
+        errors[current + ahead * 4 + c] += 7 * e
+        errors[below + behind * 4 + c] += 3 * e
+        errors[below + (x + 1) * 4 + c] += 5 * e
+        errors[below + ahead * 4 + c] += e
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Bit depth
+
+// Scratch bytes reduce_depth() needs for an image `width` pixels wide.
+pub fn reduce_depth_scratch_size(width: u32) -> usize!pixels.Error {
+    line := carve.size(4 * width as usize, 2)?
+    errors := carve.size(pixels.checked(8, width as usize + 2, 0)?, 4)?
+    return carve.add(line, errors)
+}
+
+// Posterize `source` into `target` (same size, any layout) keeping
+// red_bits, green_bits, blue_bits and alpha_bits (1 to 16 each) of every
+// channel; levels are spread evenly over the full range, so 5 bits gives
+// 0, 65535 / 31, ... With 8-bit targets and 8 bits nothing changes.
+pub fn reduce_depth(source: &pixels.View, target: &mut pixels.ViewMut, red_bits: u32, green_bits: u32, blue_bits: u32, alpha_bits: u32, dither: Dither, work: &mut[u8]) -> void!pixels.Error {
+    same_size(source, target)?
+    bits := [red_bits, green_bits, blue_bits, alpha_bits]
+    levels := [0u64; 4]
+    for c in 0usize..4 {
+        if bits[c] == 0 || bits[c] > 16 {
+            return err(pixels.Error.Malformed)
+        }
+        levels[c] = (1u64 << bits[c] as u64) - 1
+    }
+    width := source.width() as usize
+    height := source.height()
+    line_size := carve.size(4 * width, 2)?
+    error_size := carve.size(8 * (width + 2), 4)?
+    let slice.SplitMut { left: a, right: b } = carve.split(work, line_size)?
+    if b.len < error_size {
+        return err(pixels.Error.BufferTooSmall)
+    }
+    line := carve.u16s(a)
+    errors := carve.i32s(b)
+    for i in 0usize..8 * (width + 2) {
+        errors[i] = 0
+    }
+    code := dither_code(&dither)
+    source_layout := source.layout().clone()
+    target_layout := target.layout().clone()
+    row_errors := 4 * (width + 2)
+    for y in 0u32..height {
+        convert.load_rgba16(source.row(y), &source_layout, 0, width, line)
+        current := (y as usize % 2) * row_errors
+        below := row_errors - current
+        reverse := code == DITHER_DIFFUSION && y % 2 == 1
+        for step in 0usize..width {
+            x := step
+            if reverse {
+                x = width - 1 - step
+            }
+            p := x * 4
+            alpha := line[p + 3] as i64
+            threshold := 64u64
+            if code == DITHER_ORDERED {
+                threshold = 2 * BAYER8[(y as usize % 8) * 8 + x % 8] as u64 + 1
+            }
+            for c in 0usize..4 {
+                v := line[p + c] as i64
+                if code == DITHER_DIFFUSION {
+                    v += (errors[current + (x + 1) * 4 + c] as i64 + 8) >> 4
+                    if v < 0 {
+                        v = 0
+                    } else if v > 65535 {
+                        v = 65535
+                    }
+                }
+                l := levels[c]
+                q := (v as u64 * l * 128 + threshold * 65535) / (65535 * 128)
+                if q > l {
+                    q = l
+                }
+                result := (q * 65535 + l / 2) / l
+                line[p + c] = result as u16
+                if code == DITHER_DIFFUSION {
+                    e := v - result as i64
+                    if c < 3 {
+                        e = e * alpha / 65535
+                    }
+                    ahead := x + 2
+                    behind := x
+                    if reverse {
+                        ahead = x
+                        behind = x + 2
+                    }
+                    errors[current + ahead * 4 + c] += (7 * e) as i32
+                    errors[below + behind * 4 + c] += (3 * e) as i32
+                    errors[below + (x + 1) * 4 + c] += (5 * e) as i32
+                    errors[below + ahead * 4 + c] += e as i32
+                }
+            }
+        }
+        if code == DITHER_DIFFUSION {
+            for i in 0usize..row_errors {
+                errors[current + i] = 0
+            }
+        }
+        convert.store_rgba16(line, target.row_mut(y), &target_layout, 0, width)
+    }
+    return ok()
+}

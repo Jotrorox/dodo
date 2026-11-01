@@ -83,8 +83,13 @@ pub fn f32_bits_to_half(bits: u32) -> u16 {
     exponent := ((bits >> 23) & 255) as i32
     mantissa := bits & 0x7fffff
     if exponent == 255 {
+        // NaN keeps the top of its payload, so f16 -> f32 -> f16 is exact.
         if mantissa != 0 {
-            return (sign | 0x7e00) as u16
+            payload := mantissa >> 13
+            if payload == 0 {
+                payload = 0x200
+            }
+            return (sign | 0x7c00 | payload) as u16
         }
         return (sign | 0x7c00) as u16
     }

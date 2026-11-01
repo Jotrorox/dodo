@@ -1,0 +1,243 @@
+package jxl
+
+import "std/image/convert"
+import "std/image/pixels"
+import "std/image/sink"
+
+// Output: the native layout reported by info(), and conversion of decoded
+// samples into rects for the sink, either straight from the modular arena
+// (lossless-style frames) or from the float canvas.
+
+// Rect size used for output; groups larger than this are split.
+const TILE: usize = 256
+
+// The native layout: Gray/GrayAlpha/Rgb/Rgba from the color space and the
+// first alpha channel; U8 for integer depths up to 8, U16 up to 16, F32 for
+// float samples and deeper integers. XYB (lossy) images use the declared
+// depth too, matching what djxl writes by default.
+fn native_layout(h: &ImageHeader) -> pixels.Layout {
+    alpha := h.alpha_channel()
+    channels := 3usize
+    if h.is_gray() {
+        channels = 1
+    }
+    bits := h.bits
+    float := h.exp_bits > 0
+    premultiplied := false
+    if alpha < MAX_EXTRA {
+        channels += 1
+        if h.ec_bits[alpha] > bits {
+            bits = h.ec_bits[alpha]
+        }
+        if h.ec_exp_bits[alpha] > 0 {
+            float = true
+        }
+        premultiplied = h.ec_associated[alpha]
+    }
+    sample := pixels.SAMPLE_U8
+    if float || bits > 16 {
+        sample = pixels.SAMPLE_F32
+    } else if bits > 8 {
+        sample = pixels.SAMPLE_U16
+    }
+    return pixels.Layout.from_codes(channels, sample, premultiplied)
+}
+
+// An integer sample of `bits` bits as a native sample code value: U8 and
+// U16 rescale to their full range with rounding.
+fn scale_int(v: i32, bits: u32, sample: u32) -> u32 {
+    max := (1i64 << (bits as i64)) - 1
+    x := v as i64
+    if x < 0 {
+        x = 0
+    }
+    if x > max {
+        x = max
+    }
+    if sample == pixels.SAMPLE_U8 {
+        if bits == 8 {
+            return x as u32
+        }
+        return ((x * 255 + max / 2) / max) as u32
+    }
+    if bits == 16 {
+        return x as u32
+    }
+    return ((x * 65535 + max / 2) / max) as u32
+}
+
+// A modular sample as f32: integers normalized to 0..1, floats decoded
+// from their custom format.
+fn sample_to_float(v: i32, bits: u32, exp_bits: u32) -> f32 {
+    if exp_bits == 0 {
+        max := ((1u64 << (bits as u64)) - 1) as f64
+        return (v as f64 / max) as f32
+    }
+    return custom_float(v, bits, exp_bits)
+}
+
+// A float sample of `bits` bits with `exp_bits` exponent bits, converted
+// exactly through its bit pattern (Inf, NaN payloads and subnormals kept).
+fn custom_float(v: i32, bits: u32, exp_bits: u32) -> f32 {
+    raw := (v as i64 & 0xffffffff) as u32
+    if bits == 32 && exp_bits == 8 {
+        return convert.f32_from_bits(raw)
+    }
+    if exp_bits == 0 || exp_bits > 8 || bits <= exp_bits || bits > 32 {
+        return 0.0
+    }
+    mantissa_bits := bits - exp_bits - 1
+    sign := ((raw >> (bits - 1)) & 1) << 31
+    exponent := (raw >> mantissa_bits) & ((1u32 << exp_bits) - 1)
+    mantissa := raw & ((1u32 << mantissa_bits) - 1)
+    // Mantissa bits aligned to the f32 mantissa.
+    m32 := 0u32
+    if mantissa_bits <= 23 {
+        m32 = mantissa << (23 - mantissa_bits)
+    } else {
+        m32 = mantissa >> (mantissa_bits - 23)
+    }
+    if exp_bits == 8 {
+        return convert.f32_from_bits(sign | (exponent << 23) | m32)
+    }
+    all_ones := (1u32 << exp_bits) - 1
+    if exponent == all_ones {
+        return convert.f32_from_bits(sign | 0x7f800000 | m32)
+    }
+    bias := (1u32 << (exp_bits - 1)) - 1
+    if exponent != 0 {
+        return convert.f32_from_bits(sign | ((exponent + 127 - bias) << 23) | m32)
+    }
+    if mantissa == 0 {
+        return convert.f32_from_bits(sign)
+    }
+    // Subnormal: mantissa * 2^(1 - bias - mantissa_bits) as an f32 normal.
+    top := 31u32
+    for (mantissa >> top) == 0 {
+        top -= 1
+    }
+    e32 := top + 128 - bias - mantissa_bits
+    frac := mantissa ^ (1u32 << top)
+    f := 0u32
+    if top <= 23 {
+        f = frac << (23 - top)
+    } else {
+        f = frac >> (top - 23)
+    }
+    return convert.f32_from_bits(sign | (e32 << 23) | f)
+}
+
+// f64 to f32 without trapping: NaN stays NaN, out-of-range values become
+// infinities.
+fn narrow64(v: f64) -> f32 {
+    if !(v == v) {
+        return convert.f32_from_bits(0x7fc00000)
+    }
+    if v > 3.4028234663852886e38 {
+        return convert.f32_from_bits(0x7f800000)
+    }
+    if v < -3.4028234663852886e38 {
+        return convert.f32_from_bits(0xff800000)
+    }
+    return v as f32
+}
+
+fn pow2(e: i32) -> f64 {
+    v := 1.0f64
+    if e >= 0 {
+        for i in 0i32..e {
+            v *= 2.0
+        }
+    } else {
+        for i in 0i32..-e {
+            v *= 0.5
+        }
+    }
+    return v
+}
+
+fn put_sample(row: &mut[u8], at: usize, sample: u32, value: u32) {
+    if sample == pixels.SAMPLE_U8 {
+        row[at] = (value & 255) as u8
+    } else if sample == pixels.SAMPLE_U16 {
+        row[at] = (value & 255) as u8
+        row[at + 1] = ((value >> 8) & 255) as u8
+    } else {
+        pixels.put32(row, at, value)
+    }
+}
+
+// Emit a frame straight from the arena: channels 0..color are the color
+// samples (1 or 3), the alpha extra channel follows the image header.
+fn emit_direct<S: sink.Sink>(output: &mut S, h: &ImageHeader, f: &FrameHeader, work: &ModularWork, gch: &ChanList, layout: &pixels.Layout, tile: &mut[u8]) -> void!pixels.Error {
+    color := f.color_channels as usize
+    channels := layout.channel_count()
+    sample := layout.sample_code()
+    size := layout.sample_bytes()
+    bpp := layout.bytes_per_pixel()
+    alpha := h.alpha_channel()
+    has_alpha := alpha < MAX_EXTRA && layout.has_alpha()
+    width := h.width as usize
+    height := h.height as usize
+    tile_dim := f.group_dim as usize
+    if tile_dim > TILE {
+        tile_dim = TILE
+    }
+    // Source channel per output component.
+    src := [0usize; 4]
+    bits := [0u32; 4]
+    exps := [0u32; 4]
+    out_color := channels
+    if has_alpha {
+        out_color = channels - 1
+    }
+    for k in 0usize..out_color {
+        if color == 1 {
+            src[k] = 0
+        } else {
+            src[k] = k
+        }
+        bits[k] = h.bits
+        exps[k] = h.exp_bits
+    }
+    if has_alpha {
+        src[channels - 1] = color + alpha
+        bits[channels - 1] = h.ec_bits[alpha]
+        exps[channels - 1] = h.ec_exp_bits[alpha]
+    }
+    ty := 0usize
+    for ty < height {
+        th := height - ty
+        if th > tile_dim {
+            th = tile_dim
+        }
+        tx := 0usize
+        for tx < width {
+            tw := width - tx
+            if tw > tile_dim {
+                tw = tile_dim
+            }
+            row_bytes := tw * bpp
+            for y in 0usize..th {
+                for k in 0usize..channels {
+                    c := src[k]
+                    base := gch.offset(c) + (ty + y) * gch.stride(c) + tx
+                    for x in 0usize..tw {
+                        v := work.arena[base + x]
+                        at := y * row_bytes + x * bpp + k * size
+                        if sample == pixels.SAMPLE_F32 {
+                            put_sample(tile, at, sample, convert.f32_bits(sample_to_float(v, bits[k], exps[k])))
+                        } else {
+                            put_sample(tile, at, sample, scale_int(v, bits[k], sample))
+                        }
+                    }
+                }
+            }
+            view := pixels.View.new(&tile[..row_bytes * th], tw as u32, th as u32, layout.clone())?
+            output.rect(tx as u32, ty as u32, &view)?
+            tx += tw
+        }
+        ty += th
+    }
+    return ok()
+}

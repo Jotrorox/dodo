@@ -450,6 +450,89 @@ fn portable_package_dependencies_are_independent_and_reserved() {
             "std/embedded/display/ssd1306",
             vec!["alloc/", "std/io", "std/platform", "std/graphics/"],
         ),
+        // The image codecs stay freestanding: caller storage, no files.
+        (
+            "std/image",
+            vec!["alloc/", "std/fs", "std/platform", "std/io"],
+        ),
+        (
+            "std/image/pixels",
+            vec!["alloc/", "std/fs", "std/platform", "std/io", "std/graphics"],
+        ),
+        (
+            "std/image/color",
+            vec![
+                "alloc/",
+                "std/fs",
+                "std/platform",
+                "std/io",
+                "std/image/pixels",
+                "std/image/sink",
+            ],
+        ),
+        (
+            "std/image/convert",
+            vec!["alloc/", "std/fs", "std/platform", "std/io", "std/graphics"],
+        ),
+        (
+            "std/image/sink",
+            vec!["alloc/", "std/fs", "std/platform", "std/io"],
+        ),
+        (
+            "std/image/meta",
+            vec!["alloc/", "std/fs", "std/platform", "std/io", "std/graphics"],
+        ),
+        (
+            "std/image/png",
+            vec!["alloc/", "std/fs", "std/platform", "std/io"],
+        ),
+        (
+            "std/image/bmp",
+            vec!["alloc/", "std/fs", "std/platform", "std/io"],
+        ),
+        (
+            "std/image/qoi",
+            vec!["alloc/", "std/fs", "std/platform", "std/io"],
+        ),
+        (
+            "std/image/ppm",
+            vec!["alloc/", "std/fs", "std/platform", "std/io"],
+        ),
+        (
+            "std/image/jxl",
+            vec!["alloc/", "std/fs", "std/platform", "std/io"],
+        ),
+        (
+            "std/image/jxl/encode",
+            vec!["alloc/", "std/fs", "std/platform", "std/io"],
+        ),
+        (
+            "std/image/shared/isobmff",
+            vec!["alloc/", "std/fs", "std/platform", "std/io", "std/graphics"],
+        ),
+        // Pixel operations need only the data model.
+        (
+            "std/image/ops",
+            vec![
+                "alloc/",
+                "std/fs",
+                "std/platform",
+                "std/io",
+                "std/image/png",
+                "std/image/jxl",
+            ],
+        ),
+        // Owned images add allocation and files, nothing else hosted.
+        (
+            "std/image_alloc",
+            vec![
+                "std/net",
+                "std/process",
+                "std/thread",
+                "std/window",
+                "std/http",
+            ],
+        ),
     ] {
         let source = workspace.write(
             "main.dodo",
@@ -468,12 +551,13 @@ fn portable_package_dependencies_are_independent_and_reserved() {
                 "{import} unexpectedly depends on {forbidden}"
             );
         }
-        assert!(
-            loaded
-                .sources
-                .iter()
-                .any(|source| source.path.ends_with(format!("{import}.dodo")))
-        );
+        assert!(loaded.sources.iter().any(|source| {
+            source.path.ends_with(format!("{import}.dodo"))
+                || source
+                    .path
+                    .to_string_lossy()
+                    .contains(&format!("{import}/"))
+        }));
         assert!(
             loaded
                 .sources

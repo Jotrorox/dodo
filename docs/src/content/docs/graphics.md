@@ -19,7 +19,7 @@ microcontrollers:
 | `std/graphics` | `Canvas`, colors, rectangles, drawing, antialiased paths and shapes, gradients, text rendering, the `Display` protocol, band rendering. |
 | `std/graphics/font` | Built-in 6x8 and 8x16 bitmap fonts for ASCII and Latin-1. |
 | `std/graphics/truetype` | TrueType (`.ttf`, `.ttc`) fonts drawn antialiased at any size. |
-| `std/graphics/image` | PPM, QOI, BMP and PNG decoding and encoding into caller buffers. |
+| `std/graphics/image` | PPM, QOI, BMP and PNG decoding onto canvases and encoding from them; the full codecs are in [std/image](image.md). |
 | `std/graphics/fake` | An in-memory `Display` for tests. |
 | `std/embedded/display` | The SPI and I2C links that panel drivers talk over. |
 | `std/embedded/display/st7789` | ST7789 colour TFT and IPS panels, RGB565 over SPI. |
@@ -649,8 +649,12 @@ cache per font.
 
 ## Images
 
-`std/graphics/image` decodes from a byte slice and encodes into a byte buffer;
-read and write files with [std/fs](filesystem.md) or embed the bytes.
+`std/graphics/image` decodes image files onto canvases and encodes canvases
+into files, from and into byte buffers; read and write files with
+[std/fs](filesystem.md) or embed the bytes. It is a thin layer over the codec
+packages of [std/image](image.md), which add every pixel layout (16-bit and
+float included), color information, EXIF/XMP/ICC metadata, APNG frames and
+encoder options. Like the rest of the family it needs no floating point.
 
 ```dodo
 header := image.info(&data)?              // format, width, height, has_alpha
@@ -661,25 +665,27 @@ image.draw(&data, &mut canvas, 10, 10)?   // straight onto an existing canvas
 
 | Format | Decodes | Encodes |
 | --- | --- | --- |
-| Netpbm | Binary PPM (P6) and PGM (P5), any maxval, comments | P6, `ppm_size` bytes |
+| Netpbm | Binary PPM (P6) and PGM (P5), any maxval, comments; PAM (P7) and PFM | P6, `ppm_size` bytes |
 | QOI | RGB and RGBA | RGBA, at most `qoi_max_size` bytes |
-| BMP | Uncompressed 1, 4, 8-bit palettes; 16, 24, 32-bit with or without bit-field masks; bottom-up or top-down | 24-bit, `bmp_size` bytes |
-| PNG | Every color type and bit depth (gray, RGB, palette, gray and RGB with alpha; 1 to 16 bits), `tRNS` transparency, Adam7 interlacing | 8-bit RGBA: uncompressed, `png_size` bytes; or compressed, at most `png_compressed_max_size` bytes |
+| BMP | 1, 4, 8-bit palettes, RLE8 and RLE4; 16, 24, 32-bit with or without bit-field masks; bottom-up or top-down | 24-bit, `bmp_size` bytes |
+| PNG | Every color type and bit depth (gray, RGB, palette, gray and RGB with alpha; 1 to 16 bits), `tRNS` transparency, Adam7 interlacing; the default image of an APNG | 8-bit RGBA: uncompressed, `png_size` bytes; or compressed, at most `png_compressed_max_size` bytes |
 
-PPM and BMP encoding drop alpha; QOI and PNG keep it. Errors are `Truncated`,
-`Malformed`, `Unsupported` (ASCII PPM, compressed BMP, an unknown critical PNG
-chunk), `TooLarge`, and `BufferTooSmall`. Every length is checked before use,
-so untrusted files are safe to decode; a failure part-way through `draw` can
-leave part of the image drawn.
+PPM and BMP encoding drop alpha; QOI and PNG keep it. Errors are those of
+std/image (`image.Error` is `pixels.Error`): `Truncated`, `Malformed`,
+`Unsupported` (ASCII PPM, an unknown critical PNG chunk), `TooLarge`, and
+`BufferTooSmall`. Every length is checked before use, so untrusted files are
+safe to decode; a failure part-way through `draw` can leave part of the image
+drawn.
 
-PNG decoding checks every chunk's CRC and the zlib Adler-32, skips unknown
-ancillary chunks, and rounds 16-bit samples to 8 bits. Gamma, chromaticity and
-color profile chunks are ignored, so samples are taken as sRGB. Unfiltering
-needs two rows of raw image data: `decode` and `draw` keep
-`image.PNG_SCRATCH_LEN` (16 KiB) bytes of them on the stack and fail with
-`BufferTooSmall` for wider rows, such as RGBA wider than 2047 pixels. Pass
-your own storage of `image.png_scratch_size(&data)` bytes to `decode_png` or
-`draw_png` instead. The zlib decoder adds about 40 KiB of stack either way.
+Colors are converted to 8 bits as they are drawn: 16-bit samples are rounded,
+and color information is not applied, so samples are taken as sRGB. PNG
+decoding checks every chunk's CRC and the zlib Adler-32, and skips unknown
+ancillary chunks. Unfiltering needs two rows of raw image data: `decode` and
+`draw` keep `image.PNG_SCRATCH_LEN` (16 KiB) bytes of them on the stack and
+fail with `BufferTooSmall` for wider rows, such as RGBA wider than 2047
+pixels. Pass your own storage of `image.png_scratch_size(&data)` bytes to
+`decode_png` or `draw_png` instead. The zlib decoder adds about 40 KiB of
+stack either way.
 
 ```dodo
 scratch := [0u8; 32768]                   // png_scratch_size(&data) or more

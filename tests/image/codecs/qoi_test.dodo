@@ -1,0 +1,143 @@
+package codecs
+
+import "std/image/qoi"
+
+// QOI decoding of fixtures to native Rgb8/Rgba8, the linear colorspace,
+// encoder round trips and malformed input.
+
+fn qoi_native(name: &str, raw: &str, channels: usize, linear: bool) {
+    file_storage := [0u8; RASTER_FILE_LIMIT]
+    raw_storage := [0u8; RASTER_FILE_LIMIT]
+    pixel_storage := [0u8; RASTER_PIXEL_LIMIT]
+    length := raster_read(name, &mut file_storage)
+    raw_length := raster_read(raw, &mut raw_storage)
+    file := &file_storage[..length]
+    assert(qoi.matches(file), name)
+    header := qoi.info(file)!
+    assert(header.format == pixels.Format.Qoi, name)
+    assert(header.native.channel_count() == channels && header.native.sample_code() == pixels.SAMPLE_U8, name)
+    assert(header.color.is_linear() == linear, name)
+    assert_eq(qoi.scratch_size(file)!, 0usize)
+    found := qoi.metadata(file)!
+    assert(!found.exif.present() && !found.icc.present(), name)
+    capture := RasterCapture.new(&mut pixel_storage)
+    empty := [0u8; 0]
+    qoi.decode(file, &mut capture, &mut empty)!
+    assert(capture.pixels == header.width as u64 * header.height as u64, name)
+    raster_same(&pixel_storage[..raster_size(&header)], &raw_storage[..raw_length], name)
+}
+
+@test
+fn qoi_fixtures_decode_to_native_layouts() {
+    qoi_native("qoi_linear.qoi", "qoi_linear.raw", 3, true)
+    qoi_native("qoi_rgba.qoi", "qoi_rgba.raw", 4, false)
+}
+
+fn qoi_round_trip(layout: &pixels.Layout, channels: u32, linear: bool, width: u32, height: u32) {
+    source_storage := [0u8; RASTER_PIXEL_LIMIT]
+    encoded := [0u8; RASTER_FILE_LIMIT]
+    decoded := [0u8; RASTER_PIXEL_LIMIT]
+    size := pixels.bytes_needed(width, height, layout)!
+    raster_pattern(&mut source_storage, width, height, layout, channels + width)
+    // Runs and repeats exercise the RUN and INDEX operations.
+    bpp := layout.bytes_per_pixel()
+    for i in bpp * 3..bpp * 9 {
+        if i < size {
+            source_storage[i] = source_storage[i % bpp]
+        }
+    }
+    source := pixels.View.new(&source_storage[..size], width, height, layout.clone())!
+    options := qoi.EncodeOptions.new()
+    options.channels = channels
+    options.linear = linear
+    bound := qoi.max_encoded_size(width, height, layout, &options)!
+    assert_eq(qoi.encode_scratch_size(width, height, layout, &options)!, 0usize)
+    empty := [0u8; 0]
+    length := qoi.encode(&source, &options, &mut encoded, &mut empty)!
+    assert(length <= bound)
+    match qoi.encode(&source, &options, &mut encoded[..length - 1], &mut empty) {
+        ok(_) => {
+            assert(false, "a short output must be rejected")
+        }
+        err(reason) => {
+            assert(reason == pixels.Error.BufferTooSmall)
+        }
+    }
+    header := qoi.info(&encoded[..length])!
+    expected_channels := channels as usize
+    if channels == 0 {
+        expected_channels = 3
+        if layout.has_alpha() {
+            expected_channels = 4
+        }
+    }
+    assert(header.native.channel_count() == expected_channels)
+    assert(header.color.is_linear() == linear)
+    capture := RasterCapture.new(&mut decoded)
+    qoi.decode(&encoded[..length], &mut capture, &mut empty)!
+    raster_expect(&source, &decoded, &header.native, "qoi round trip")
+}
+
+@test
+fn qoi_encoders_round_trip() {
+    for k in 0usize..RASTER_LAYOUTS {
+        layout := raster_layouts(k)
+        qoi_round_trip(&layout, 0, false, 70, 5)
+        qoi_round_trip(&layout, 3, true, 9, 4)
+        qoi_round_trip(&layout, 4, false, 1, 1)
+    }
+    // The bound for 4 channels is the old qoi_max_size.
+    options := qoi.EncodeOptions.new()
+    layout := pixels.Layout.rgba8()
+    assert_eq(qoi.max_encoded_size(12, 10, &layout, &options)!, 622usize)
+    options.channels = 5
+    match qoi.max_encoded_size(12, 10, &layout, &options) {
+        ok(_) => {
+            assert(false)
+        }
+        err(reason) => {
+            assert(reason == pixels.Error.Unsupported)
+        }
+    }
+}
+
+fn qoi_expect_error(data: &[u8], expected: pixels.Error) {
+    match qoi.info(data) {
+        ok(_) => {
+            assert(false, "bad header accepted")
+        }
+        err(reason) => {
+            assert(reason == expected, pixels.error_name(reason))
+        }
+    }
+}
+
+@test
+fn qoi_rejects_malformed_files() {
+    qoi_expect_error(b"qoif\x00\x00\x00\x01", pixels.Error.Truncated)
+    qoi_expect_error(b"qoif\x00\x00\x00\x01\x00\x00\x00\x01\x05\x00", pixels.Error.Malformed)
+    qoi_expect_error(b"qoif\x00\x00\x00\x01\x00\x00\x00\x01\x03\x02", pixels.Error.Malformed)
+    qoi_expect_error(b"qoif\x7f\xff\xff\xff\x00\x00\x00\x01\x04\x00", pixels.Error.TooLarge)
+    qoi_expect_error(b"qoix\x00\x00\x00\x01\x00\x00\x00\x01\x03\x00", pixels.Error.Malformed)
+
+    // Every prefix of a file fails cleanly or decodes; none traps.
+    file_storage := [0u8; RASTER_FILE_LIMIT]
+    names := ["qoi_rgba.qoi", "qoi_linear.qoi"]
+    empty := [0u8; 0]
+    for n in 0usize..names.len {
+        length := raster_read(names[n], &mut file_storage)
+        for cut in 0usize..length + 1 {
+            data := &file_storage[..cut]
+            null_sink := sink.NullSink.new()
+            match qoi.decode(data, &mut null_sink, &mut empty) {
+                ok() => {
+                    // The end marker is not needed once every pixel is read.
+                    assert(cut + 8 >= length, names[n])
+                }
+                err(reason) => {
+                    assert(reason == pixels.Error.Truncated, names[n])
+                }
+            }
+        }
+    }
+}

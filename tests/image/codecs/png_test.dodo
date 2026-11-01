@@ -1,0 +1,747 @@
+package codecs
+
+import "std/checksum"
+import "std/compress/deflate"
+import "std/image"
+import "std/image/color"
+import "std/image/convert"
+import "std/image/meta"
+import "std/image/pixels"
+import "std/image/png"
+import "std/image/sink"
+import "std/text"
+
+// PNG and APNG decoding against tests/image/codecs/fixtures/png_* (written
+// by generate_png.py): native layouts, color chunks, metadata, animation
+// compositing; then encoder round trips in every layout and option, and
+// truncated or corrupted input.
+
+static mut PNG_SCRATCH: [400000]u8 = [0u8; 400000]
+static mut PNG_PROFILE: [70000]u8 = [0u8; 70000]
+static mut PNG_BACK: [70000]u8 = [0u8; 70000]
+const PNG_SCRATCH_LEN: usize = 400000
+
+// The static buffers are reached only through these functions: a string
+// literal and a mutable static used in one function conflict.
+fn png_frame<S: sink.Sink>(data: &[u8], index: u32, output: &mut S, length: usize) -> void!pixels.Error {
+    unsafe {
+        return png.decode_frame(data, index, output, &mut PNG_SCRATCH[..length])
+    }
+}
+
+fn png_image_frame(data: &[u8], index: u32, target: &mut pixels.ViewMut, length: usize) -> void!pixels.Error {
+    unsafe {
+        return image.decode_frame(data, index, target, &mut PNG_SCRATCH[..length])
+    }
+}
+
+fn png_encode_static(source: &pixels.View, options: &png.EncodeOptions, output: &mut[u8], length: usize) -> usize!pixels.Error {
+    unsafe {
+        return png.encode(source, options, output, &mut PNG_SCRATCH[..length])
+    }
+}
+
+fn png_encode_metadata_static(source: &pixels.View, options: &png.EncodeOptions, exif: &[u8], output: &mut[u8]) -> usize!pixels.Error {
+    unsafe {
+        return png.encode_with_metadata(source, options, exif, &PNG_PROFILE, output, &mut PNG_SCRATCH)
+    }
+}
+
+fn png_fill_profile() {
+    unsafe {
+        for i in 0usize..PNG_PROFILE.len {
+            PNG_PROFILE[i] = (i % 251) as u8
+        }
+    }
+}
+
+fn png_check_profile(encoded: &[u8]) {
+    unsafe {
+        none := [0u8; 1]
+        assert_eq(image.icc(encoded, &mut PNG_BACK, &mut none[..0])!, 70000usize)
+        for i in 0usize..70000 {
+            assert(PNG_BACK[i] == PNG_PROFILE[i])
+        }
+    }
+}
+
+// Decode fixture `name` and compare its native pixels with NAME.raw.
+fn png_native(name: &str, channels: usize, sample: u32, depth: u32, progressive: bool) {
+    file := [0u8; RASTER_FILE_LIMIT]
+    raw := [0u8; RASTER_FILE_LIMIT]
+    decoded := [0u8; RASTER_PIXEL_LIMIT]
+    length := png_fixture(name, ".png", &mut file)
+    raw_length := png_fixture(name, ".raw", &mut raw)
+    data := &file[..length]
+    assert(png.matches(data), name)
+    header := png.info(data)!
+    assert(header.format == pixels.Format.Png, name)
+    assert(header.native.channel_count() == channels && header.native.sample_code() == sample, name)
+    assert(header.bit_depth == depth && header.progressive == progressive, name)
+    assert(!header.animated && header.frames == 1, name)
+    need := png.scratch_size(data)!
+    scratch := [0u8; 512]
+    assert(need <= scratch.len, name)
+    capture := RasterCapture.new(&mut decoded)
+    png.decode(data, &mut capture, &mut scratch[..need])!
+    assert(capture.pixels >= header.width as u64 * header.height as u64, name)
+    raster_same(&decoded[..raster_size(&header)], &raw[..raw_length], name)
+    null_sink := sink.NullSink.new()
+    match png.decode(data, &mut null_sink, &mut scratch[..need - 1]) {
+        ok() => {
+            assert(false, name)
+        }
+        err(reason) => {
+            assert(reason == pixels.Error.BufferTooSmall, name)
+        }
+    }
+    // Through std/image into every layout, against the native pixels
+    // converted with std/image/convert.
+    native := pixels.View.new(&raw[..raw_length], header.width, header.height, header.native.clone())!
+    for k in 0usize..RASTER_LAYOUTS {
+        layout := raster_layouts(k)
+        converted := [0u8; RASTER_PIXEL_LIMIT * 2]
+        target := pixels.ViewMut.new(&mut converted, header.width, header.height, layout.clone())!
+        assert(image.scratch_size(data, &layout)! == need, name)
+        image.decode(data, &mut target, &mut scratch)!
+        raster_expect(&native, &converted, &layout, name)
+    }
+}
+
+fn png_fixture(name: &str, extension: &str, output: &mut[u8]) -> usize {
+    storage := [0u8; 128]
+    builder := text.Builder.new(&mut storage)
+    base := text.Text.from_str(name)
+    builder.append(&base)!
+    suffix := text.Text.from_str(extension)
+    builder.append(&suffix)!
+    built := builder.as_text()
+    return raster_read(built.as_str(), output)
+}
+
+@test
+fn png_fixtures_decode_to_native_layouts() {
+    png_native("png_gray1", 1, pixels.SAMPLE_U8, 1, false)
+    png_native("png_gray2_trns", 2, pixels.SAMPLE_U8, 2, false)
+    png_native("png_gray4", 1, pixels.SAMPLE_U8, 4, false)
+    png_native("png_gray8_trns", 2, pixels.SAMPLE_U8, 8, false)
+    png_native("png_gray16", 1, pixels.SAMPLE_U16, 16, false)
+    png_native("png_gray16_trns", 2, pixels.SAMPLE_U16, 16, false)
+    png_native("png_gray16_adam7_trns", 2, pixels.SAMPLE_U16, 16, true)
+    png_native("png_gray_alpha8", 2, pixels.SAMPLE_U8, 8, false)
+    png_native("png_gray_alpha16", 2, pixels.SAMPLE_U16, 16, false)
+    png_native("png_rgb8_trns", 4, pixels.SAMPLE_U8, 8, false)
+    png_native("png_rgb16", 3, pixels.SAMPLE_U16, 16, false)
+    png_native("png_rgb16_trns", 4, pixels.SAMPLE_U16, 16, false)
+    png_native("png_rgba16", 4, pixels.SAMPLE_U16, 16, false)
+    png_native("png_rgba16_adam7", 4, pixels.SAMPLE_U16, 16, true)
+    png_native("png_palette2", 3, pixels.SAMPLE_U8, 2, false)
+    png_native("png_palette4_trns", 4, pixels.SAMPLE_U8, 4, false)
+    png_native("png_palette8_adam7_trns", 4, pixels.SAMPLE_U8, 8, true)
+    png_native("png_color_cicp", 3, pixels.SAMPLE_U8, 8, false)
+}
+
+fn png_header(name: &str) -> pixels.Header {
+    file := [0u8; RASTER_FILE_LIMIT]
+    length := png_fixture(name, ".png", &mut file)
+    return png.info(&file[..length])!
+}
+
+@test
+fn png_color_chunks_fill_color_info() {
+    untagged := png_header("png_gray16")
+    assert(!untagged.color.tagged && untagged.color.is_srgb())
+
+    cicp := png_header("png_color_cicp")
+    assert(cicp.color.tagged)
+    assert(cicp.color.primaries == color.PRIMARIES_BT2020 && cicp.color.transfer == color.TRANSFER_PQ)
+    assert(cicp.color.matrix == color.MATRIX_IDENTITY && cicp.color.full_range && cicp.color.is_hdr())
+    assert(cicp.color.gamma == 0)
+
+    srgb := png_header("png_color_srgb")
+    assert(srgb.color.tagged && srgb.color.is_srgb())
+    assert(srgb.color.intent == color.INTENT_SATURATION && srgb.color.gamma == 0)
+
+    gamma := png_header("png_color_gama_chrm")
+    assert(gamma.color.tagged && gamma.color.gamma == 45455)
+    assert(gamma.color.transfer == color.TRANSFER_GAMMA22)
+    assert(gamma.color.custom_primaries && gamma.color.primaries == color.PRIMARIES_BT709)
+    assert(gamma.color.white_x == 31270 && gamma.color.blue_y == 6000)
+
+    file := [0u8; RASTER_FILE_LIMIT]
+    length := png_fixture("png_color_iccp", ".png", &mut file)
+    data := &file[..length]
+    icc := png.info(data)!
+    assert(icc.color.tagged && icc.color.has_icc() && !icc.color.is_srgb())
+    assert(icc.color.icc_encoding == color.ICC_ZLIB)
+    assert(icc.color.intensity_target == 1000)
+    // The profile range is the zlib stream after "dodo test\0" and the
+    // method byte.
+    assert(data[icc.color.icc_offset - 2] == 0 && data[icc.color.icc_offset] == 0x78)
+    profile := [0u8; 512]
+    none := [0u8; 1]
+    count := image.icc(data, &mut profile, &mut none[..0])!
+    assert_eq(count, 300usize)
+    for i in 0usize..count {
+        assert(profile[i] as usize == ((i * 7 + 3) & 255))
+    }
+    match image.icc(data, &mut profile[..299], &mut none[..0]) {
+        ok(_) => {
+            assert(false, "a short profile buffer must be rejected")
+        }
+        err(reason) => {
+            assert(reason == pixels.Error.BufferTooSmall)
+        }
+    }
+    found := png.metadata(data)!
+    assert(found.icc.present() && found.icc.encoding == meta.ENCODING_ZLIB)
+    assert(found.icc.offset == icc.color.icc_offset && found.icc.length == icc.color.icc_length)
+    other := [0u8; 64]
+    gray_length := png_fixture("png_gray16", ".png", &mut file)
+    assert_eq(image.icc(&file[..gray_length], &mut other, &mut none[..0])!, 0usize)
+}
+
+static PNG_XMP: [67]u8 = [
+    b'<', b'x', b':', b'x', b'm', b'p', b'm', b'e', b't', b'a', b' ', b'x', b'm', b'l', b'n', b's',
+    b':', b'x', b'=', b'"', b'a', b'd', b'o', b'b', b'e', b':', b'n', b's', b':', b'm', b'e', b't',
+    b'a', b'/', b'"', b'>', b'<', b'd', b'o', b'd', b'o', b'>', b'i', b'm', b'a', b'g', b'e', b'<',
+    b'/', b'd', b'o', b'd', b'o', b'>', b'<', b'/', b'x', b':', b'x', b'm', b'p', b'm', b'e', b't',
+    b'a', b'>', 0
+]
+
+fn png_check_xmp(data: &[u8], item: &meta.Item) {
+    text := [0u8; 256]
+    count := meta.decode(data, item, &mut text)!
+    assert_eq(count, 66usize)
+    for i in 0usize..count {
+        assert(text[i] == PNG_XMP[i])
+    }
+}
+
+@test
+fn png_metadata_ranges_and_orientation() {
+    file := [0u8; RASTER_FILE_LIMIT]
+    length := png_fixture("png_exif_before", ".png", &mut file)
+    data := &file[..length]
+    header := png.info(data)!
+    assert(header.orientation == color.Orientation.Rotate180)
+    found := png.metadata(data)!
+    assert(found.exif.present() && found.exif.encoding == meta.ENCODING_RAW && found.exif.length == 26)
+    exif := found.exif.bytes(data)!
+    assert(exif[0] == b'I' && exif[1] == b'I' && exif[2] == 42)
+    assert(found.xmp.present() && found.xmp.encoding == meta.ENCODING_ZLIB)
+    png_check_xmp(data, &found.xmp)
+    assert(!found.icc.present())
+    same := image.metadata(data)!
+    assert(same.exif.offset == found.exif.offset && same.xmp.offset == found.xmp.offset)
+
+    // EXIF after the image data still sets the orientation.
+    length = png_fixture("png_exif_after", ".png", &mut file)
+    late := &file[..length]
+    turned := png.info(late)!
+    assert(turned.orientation == color.Orientation.Rotate90)
+    assert(turned.display_width() == turned.height && turned.display_height() == turned.width)
+    after := png.metadata(late)!
+    assert(after.exif.present() && after.exif.length == 26)
+    assert(late[after.exif.offset] == b'M' && late[after.exif.offset + 2] == 0)
+    assert(after.xmp.present() && after.xmp.encoding == meta.ENCODING_RAW)
+    png_check_xmp(late, &after.xmp)
+    // The image itself is unaffected.
+    raw := [0u8; 64]
+    raw_length := png_fixture("png_color_cicp", ".raw", &mut raw)
+    decoded := [0u8; 64]
+    capture := RasterCapture.new(&mut decoded)
+    scratch := [0u8; 64]
+    png.decode(late, &mut capture, &mut scratch)!
+    raster_same(&decoded[..raw_length], &raw[..raw_length], "exif after")
+    // Without the tail, the file still decodes (and loses the orientation).
+    cut := length - 12 - 38
+    unturned := png.info(&late[..cut])!
+    assert(unturned.orientation == color.Orientation.Identity)
+}
+
+// Decode every frame of an APNG and compare with NAME.fK.raw; decode() is
+// the default image, NAME.raw.
+fn png_frames(name: &str, frames: u32, loops: u32) {
+    file := [0u8; RASTER_FILE_LIMIT]
+    expected := [0u8; RASTER_FILE_LIMIT]
+    decoded := [0u8; RASTER_PIXEL_LIMIT]
+    length := png_fixture(name, ".png", &mut file)
+    data := &file[..length]
+    header := png.info(data)!
+    assert(header.animated && header.frames == frames && header.loops == loops, name)
+    rgba8 := pixels.Layout.rgba8()
+    rgba16 := pixels.Layout.rgba16()
+    assert(header.native.equals(&rgba8), name)
+    assert_eq(image.frame_count(data)!, frames)
+    need := png.frame_scratch_size(data)!
+    assert_eq(need, png.scratch_size(data)! + 2usize * header.width as usize * header.height as usize * 8)
+    for k in 0u32..frames {
+        suffixes := [".f0.raw", ".f1.raw", ".f2.raw", ".f3.raw", ".f4.raw"]
+        expected_length := png_fixture(name, suffixes[k as usize], &mut expected)
+        capture := RasterCapture.new(&mut decoded)
+        unsafe {
+            png_frame(data, k, &mut capture, need)!
+        }
+        assert(capture.layout.equals(&rgba16), name)
+        raster_same(&decoded[..expected_length], &expected[..expected_length], name)
+        // Through std/image into 8-bit RGBA.
+        narrow := [0u8; RASTER_PIXEL_LIMIT]
+        target := pixels.ViewMut.new(&mut narrow, header.width, header.height, pixels.Layout.rgba8())!
+        unsafe {
+            png_image_frame(data, k, &mut target, need)!
+        }
+        wide := pixels.View.new(&expected[..expected_length], header.width, header.height, pixels.Layout.rgba16())!
+        raster_expect(&wide, &narrow, &rgba8, name)
+    }
+    null_sink := sink.NullSink.new()
+    unsafe {
+        match png_frame(data, 0, &mut null_sink, need - 1) {
+            ok() => {
+                assert(false, name)
+            }
+            err(reason) => {
+                assert(reason == pixels.Error.BufferTooSmall, name)
+            }
+        }
+        match png_frame(data, frames, &mut null_sink, need) {
+            ok() => {
+                assert(false, name)
+            }
+            err(reason) => {
+                assert(reason == pixels.Error.Malformed, name)
+            }
+        }
+    }
+    raw_length := png_fixture(name, ".raw", &mut expected)
+    capture := RasterCapture.new(&mut decoded)
+    scratch := [0u8; 256]
+    png.decode(data, &mut capture, &mut scratch)!
+    raster_same(&decoded[..raw_length], &expected[..raw_length], name)
+}
+
+@test
+fn png_animation_composites_frames() {
+    png_frames("png_apng_default", 5, 3)
+    png_frames("png_apng_hidden", 2, 0)
+
+    file := [0u8; RASTER_FILE_LIMIT]
+    length := png_fixture("png_apng_default", ".png", &mut file)
+    data := &file[..length]
+    timing := png.frame_info(data, 0)!
+    assert(timing.numerator == 1 && timing.denominator == 10 && timing.milliseconds() == 100)
+    // A zero denominator means hundredths.
+    timing = png.frame_info(data, 1)!
+    assert(timing.numerator == 20 && timing.denominator == 100)
+    timing = image.frame_info(data, 2)!
+    assert(timing.numerator == 3 && timing.denominator == 4 && timing.milliseconds() == 750)
+    match png.frame_info(data, 5) {
+        ok(_) => {
+            assert(false)
+        }
+        err(reason) => {
+            assert(reason == pixels.Error.Malformed)
+        }
+    }
+
+    // A broken sequence number fails the frame that needs it.
+    length = png_fixture("png_apng_badseq", ".png", &mut file)
+    bad := &file[..length]
+    null_sink := sink.NullSink.new()
+    unsafe {
+        png_frame(bad, 1, &mut null_sink, PNG_SCRATCH_LEN)!
+        match png_frame(bad, 2, &mut null_sink, PNG_SCRATCH_LEN) {
+            ok() => {
+                assert(false)
+            }
+            err(reason) => {
+                assert(reason == pixels.Error.Malformed)
+            }
+        }
+    }
+    scratch := [0u8; 256]
+    png.decode(bad, &mut null_sink, &mut scratch)!
+
+    // Still images have one frame.
+    length = png_fixture("png_rgb16", ".png", &mut file)
+    still := &file[..length]
+    assert_eq(image.frame_count(still)!, 1u32)
+    timing = image.frame_info(still, 0)!
+    assert(timing.numerator == 0)
+    assert_eq(png.frame_scratch_size(still)!, png.scratch_size(still)!)
+}
+
+// ---------------------------------------------------------------------------
+// Encoder
+
+fn png_layouts(k: usize) -> pixels.Layout {
+    if k < RASTER_LAYOUTS {
+        return raster_layouts(k)
+    }
+    if k == RASTER_LAYOUTS {
+        return pixels.Layout.from_codes(2, pixels.SAMPLE_U16, false)
+    }
+    return pixels.Layout.from_codes(4, pixels.SAMPLE_F16, false)
+}
+
+const PNG_LAYOUTS: usize = RASTER_LAYOUTS + 2
+
+// The layout the encoder writes for a source layout.
+fn png_written(layout: &pixels.Layout) -> pixels.Layout {
+    sample := pixels.SAMPLE_U16
+    if layout.sample_code() == pixels.SAMPLE_U8 {
+        sample = pixels.SAMPLE_U8
+    }
+    return pixels.Layout.from_codes(layout.channel_count(), sample, false)
+}
+
+fn png_round_trip(source: &pixels.View, options: &png.EncodeOptions, name: &str) -> usize {
+    output := [0u8; RASTER_FILE_LIMIT * 2]
+    decoded := [0u8; RASTER_PIXEL_LIMIT * 2]
+    width := source.width()
+    height := source.height()
+    layout := source.layout().clone()
+    bound := png.max_encoded_size(width, height, &layout, options)!
+    assert(bound <= output.len, name)
+    length := 0usize
+    unsafe {
+        need := png.encode_scratch_size(width, height, &layout, options)!
+        if options.level == 0 {
+            assert(need == 0, name)
+        }
+        length = png_encode_static(source, options, &mut output, need)!
+    }
+    assert(length <= bound, name)
+    if options.level == 0 && !options.palette {
+        assert(length == bound, name)
+    }
+    data := &output[..length]
+    header := png.info(data)!
+    assert(header.width == width && header.height == height && header.progressive == options.interlace, name)
+    written := png_written(&layout)
+    if !options.palette {
+        assert(header.native.equals(&written), name)
+    }
+    capture := RasterCapture.new(&mut decoded)
+    scratch := [0u8; 4096]
+    png.decode(data, &mut capture, &mut scratch)!
+    raster_expect(source, &decoded, &header.native, name)
+    return length
+}
+
+@test
+fn png_encoder_round_trips_every_layout_and_option() {
+    source_storage := [0u8; RASTER_PIXEL_LIMIT]
+    levels := [0u32, 1, 9]
+    for k in 0usize..PNG_LAYOUTS {
+        layout := png_layouts(k)
+        width := 13u32
+        height := 7u32
+        size := pixels.bytes_needed(width, height, &layout)!
+        raster_pattern(&mut source_storage, width, height, &layout, k as u32 + 3)
+        source := pixels.View.new(&source_storage[..size], width, height, layout.clone())!
+        for l in 0usize..levels.len {
+            for filter in 0u32..6 {
+                for interlace in 0usize..2 {
+                    options := png.EncodeOptions.new()
+                    options.level = levels[l]
+                    options.filter = filter
+                    options.interlace = interlace == 1
+                    png_round_trip(&source, &options, "round trip")
+                }
+            }
+        }
+    }
+    // One pixel, and a strided crop of a larger view.
+    pixel := [9u8, 8, 7, 6]
+    single := pixels.View.new(&pixel, 1, 1, pixels.Layout.rgba8())!
+    options := png.EncodeOptions.new()
+    png_round_trip(&single, &options, "one pixel")
+    options.interlace = true
+    png_round_trip(&single, &options, "one interlaced pixel")
+    layout := pixels.Layout.rgb16()
+    raster_pattern(&mut source_storage, 40, 20, &layout, 77)
+    whole := pixels.View.new(&source_storage[..40 * 20 * 6], 40, 20, layout.clone())!
+    crop := whole.sub(3, 5, 31, 9)!
+    png_round_trip(&crop, &options, "crop")
+
+    // Bad options and sizes.
+    output := [0u8; 256]
+    bad := png.EncodeOptions.new()
+    bad.level = 10
+    unsafe {
+        match png_encode_static(&single, &bad, &mut output, PNG_SCRATCH_LEN) {
+            ok(_) => {
+                assert(false)
+            }
+            err(reason) => {
+                assert(reason == pixels.Error.Unsupported)
+            }
+        }
+    }
+    bad.level = 6
+    bad.filter = 6
+    rgba8 := pixels.Layout.rgba8()
+    match png.max_encoded_size(1, 1, &rgba8, &bad) {
+        ok(_) => {
+            assert(false)
+        }
+        err(reason) => {
+            assert(reason == pixels.Error.Unsupported)
+        }
+    }
+    match png.max_encoded_size(0, 4, &rgba8, &options) {
+        ok(_) => {
+            assert(false)
+        }
+        err(reason) => {
+            assert(reason == pixels.Error.Unsupported)
+        }
+    }
+    stored := png.EncodeOptions.new()
+    stored.level = 0
+    exact := png.max_encoded_size(1, 1, &rgba8, &stored)!
+    empty := [0u8; 1]
+    match png.encode(&single, &stored, &mut output[..exact - 1], &mut empty[..0]) {
+        ok(_) => {
+            assert(false)
+        }
+        err(reason) => {
+            assert(reason == pixels.Error.BufferTooSmall)
+        }
+    }
+    // Deflate needs its scratch.
+    scratch := [0u8; 1000]
+    match png.encode(&single, &options, &mut output, &mut scratch) {
+        ok(_) => {
+            assert(false)
+        }
+        err(reason) => {
+            assert(reason == pixels.Error.BufferTooSmall)
+        }
+    }
+    // A compressible image is much smaller than its stored form.
+    flat := [0u8; 64 * 32 * 3]
+    for i in 0usize..flat.len {
+        flat[i] = ((i / 3 / 64) * 8) as u8
+    }
+    smooth := pixels.View.new(&flat, 64, 32, pixels.Layout.rgb8())!
+    compressed := png_round_trip(&smooth, &options, "smooth")
+    full := png_round_trip(&smooth, &stored, "smooth stored")
+    assert(compressed * 10 < full)
+}
+
+fn png_palette_case(colors: u32, alpha: bool, interlace: bool, expected_depth: u32) {
+    data := [0u8; 23 * 12 * 4]
+    for i in 0usize..23 * 12 {
+        c := ((i * 7) % colors as usize) as u32
+        data[i * 4] = ((c * 41) & 255) as u8
+        data[i * 4 + 1] = ((c * 13) & 255) as u8
+        data[i * 4 + 2] = (c / 2) as u8
+        data[i * 4 + 3] = 255
+        if alpha && c % 3 == 1 {
+            data[i * 4 + 3] = ((c * 5) & 255) as u8
+        }
+    }
+    source := pixels.View.new(&data, 23, 12, pixels.Layout.rgba8())!
+    options := png.EncodeOptions.new()
+    options.palette = true
+    options.interlace = interlace
+    output := [0u8; RASTER_FILE_LIMIT]
+    length := 0usize
+    unsafe {
+        length = png_encode_static(&source, &options, &mut output, PNG_SCRATCH_LEN)!
+    }
+    header := png.info(&output[..length])!
+    assert(header.bit_depth == expected_depth, "palette depth")
+    rgba8 := pixels.Layout.rgba8()
+    rgb8 := pixels.Layout.rgb8()
+    if colors > 256 || alpha {
+        assert(header.native.equals(&rgba8), "palette fallback or tRNS")
+    } else {
+        assert(header.native.equals(&rgb8), "opaque palette")
+    }
+    decoded := [0u8; 23 * 12 * 4]
+    capture := RasterCapture.new(&mut decoded)
+    scratch := [0u8; 512]
+    png.decode(&output[..length], &mut capture, &mut scratch)!
+    raster_expect(&source, &decoded, &header.native, "palette pixels")
+    stored := png.EncodeOptions.new()
+    stored.level = 0
+    stored.palette = true
+    unsafe {
+        length = png_encode_static(&source, &stored, &mut output, PNG_SCRATCH_LEN)!
+    }
+    assert(length <= png.max_encoded_size(23, 12, &rgba8, &stored)!)
+    capture = RasterCapture.new(&mut decoded)
+    png.decode(&output[..length], &mut capture, &mut scratch)!
+    raster_expect(&source, &decoded, &header.native, "stored palette pixels")
+}
+
+@test
+fn png_encoder_writes_palettes() {
+    png_palette_case(2, false, false, 1)
+    png_palette_case(3, false, true, 2)
+    png_palette_case(5, true, false, 4)
+    png_palette_case(16, true, true, 4)
+    png_palette_case(200, true, false, 8)
+    png_palette_case(253, false, true, 8)
+    png_palette_case(300, false, false, 8)
+}
+
+@test
+fn png_encoder_writes_color_and_metadata() {
+    data := [0u8; 5 * 3 * 3]
+    for i in 0usize..data.len {
+        data[i] = ((i * 11) & 255) as u8
+    }
+    source := pixels.View.new(&data, 5, 3, pixels.Layout.rgb8())!
+    exif := [b'M', b'M', 0, 42, 0, 0, 0, 8, 0, 1, 1, 0x12, 0, 3, 0, 0, 0, 1, 0, 8, 0, 0, 0, 0, 0, 0]
+    png_fill_profile()
+    output := [0u8; 90000]
+    levels := [0u32, 6]
+    for l in 0usize..2 {
+        options := png.EncodeOptions.new()
+        options.level = levels[l]
+        options.srgb_chunk = true
+        rgb8 := pixels.Layout.rgb8()
+        bound := png.max_encoded_size(5, 3, &rgb8, &options)! + png.metadata_size(exif.len, 70000)!
+        length := 0usize
+        unsafe {
+            length = png_encode_metadata_static(&source, &options, &exif, &mut output)!
+        }
+        assert(length <= bound)
+        if l == 0 {
+            // Stored output without sRGB (an ICC profile replaces it).
+            assert(length == bound - 13)
+        }
+        encoded := &output[..length]
+        header := png.info(encoded)!
+        assert(header.orientation == color.Orientation.Rotate270)
+        assert(header.color.has_icc() && header.color.tagged)
+        found := png.metadata(encoded)!
+        bytes := found.exif.bytes(encoded)!
+        raster_same(bytes, &exif, "exif")
+        png_check_profile(encoded)
+        // Only sRGB.
+        unsafe {
+            length = png_encode_static(&source, &options, &mut output, PNG_SCRATCH_LEN)!
+        }
+        tagged := png.info(&output[..length])!
+        assert(tagged.color.tagged && tagged.color.is_srgb() && !tagged.color.has_icc())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Damaged input
+
+// Every prefix fails cleanly or decodes; none traps.
+fn png_prefixes(name: &str) {
+    file := [0u8; RASTER_FILE_LIMIT]
+    length := png_fixture(name, ".png", &mut file)
+    scratch := [0u8; 512]
+    decoded := false
+    for cut in 0usize..length + 1 {
+        data := &file[..cut]
+        null_sink := sink.NullSink.new()
+        match png.decode(data, &mut null_sink, &mut scratch) {
+            ok() => {
+                decoded = true
+            }
+            err(reason) => {
+                // Once the image data is complete, longer prefixes decode.
+                assert(!decoded, name)
+                assert(reason == pixels.Error.Truncated || reason == pixels.Error.Malformed, name)
+            }
+        }
+        if cut + 12 >= length {
+            assert(decoded, name)
+        }
+        match png.info(data) {
+            ok(_) => {}
+            err(_) => {}
+        }
+        match png.metadata(data) {
+            ok(_) => {}
+            err(_) => {}
+        }
+        match png.frame_info(data, 1) {
+            ok(_) => {}
+            err(_) => {}
+        }
+        unsafe {
+            match png_frame(data, 2, &mut null_sink, PNG_SCRATCH_LEN) {
+                ok() => {}
+                err(_) => {}
+            }
+        }
+    }
+}
+
+@test
+fn png_prefixes_fail_cleanly() {
+    png_prefixes("png_rgba16_adam7")
+    png_prefixes("png_palette4_trns")
+    png_prefixes("png_color_iccp")
+    png_prefixes("png_exif_after")
+    png_prefixes("png_apng_default")
+    png_prefixes("png_apng_hidden")
+}
+
+// Recompute the CRC of every whole chunk, so mutations reach the decoder.
+fn png_repair(data: &mut[u8], length: usize) {
+    offset := 8usize
+    for offset + 12 <= length {
+        size := ((data[offset] as usize) << 24) | ((data[offset + 1] as usize) << 16) | ((data[offset + 2] as usize) << 8) | (data[offset + 3] as usize)
+        if size > length - offset - 12 {
+            return
+        }
+        crc := checksum.crc32(&data[offset + 4..offset + 8 + size])
+        end := offset + 8 + size
+        data[end] = (crc >> 24) as u8
+        data[end + 1] = ((crc >> 16) & 255) as u8
+        data[end + 2] = ((crc >> 8) & 255) as u8
+        data[end + 3] = (crc & 255) as u8
+        offset = end + 4
+    }
+}
+
+@test
+fn png_mutations_never_trap() {
+    file := [0u8; RASTER_FILE_LIMIT]
+    names := ["png_apng_default", "png_gray16_adam7_trns", "png_exif_before"]
+    state := 0x2545f491u32
+    for n in 0usize..names.len {
+        length := png_fixture(names[n], ".png", &mut file)
+        data := [0u8; RASTER_FILE_LIMIT]
+        for _ in 0u32..300 {
+            for i in 0usize..length {
+                data[i] = file[i]
+            }
+            state = state ^ core.wrapping_mul(state, 8192)
+            state = state ^ (state >> 17)
+            state = state ^ core.wrapping_mul(state, 32)
+            for c in 0u32..state % 3 + 1 {
+                position := ((state >> (c * 7)) as usize * 31 + c as usize) % length
+                data[position] = ((state >> (c * 5)) & 255) as u8
+            }
+            png_repair(&mut data, length)
+            null_sink := sink.NullSink.new()
+            scratch := [0u8; 512]
+            match png.decode(&data[..length], &mut null_sink, &mut scratch) {
+                ok() => {}
+                err(_) => {}
+            }
+            match png.metadata(&data[..length]) {
+                ok(_) => {}
+                err(_) => {}
+            }
+            unsafe {
+                match png_frame(&data[..length], state % 5, &mut null_sink, PNG_SCRATCH_LEN) {
+                    ok() => {}
+                    err(_) => {}
+                }
+            }
+        }
+    }
+}

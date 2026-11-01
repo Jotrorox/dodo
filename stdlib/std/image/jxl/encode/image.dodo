@@ -1,0 +1,407 @@
+package encode
+
+import "std/image/pixels"
+
+// From pixels to modular channels: sample extraction, the color transforms,
+// palette indices, and the global and group streams.
+
+// One stored sample as a modular value: integers as is, floats as their
+// bit pattern (binary16 as 0..65535, binary32 as a signed 32-bit integer).
+fn sample_value(row: &[u8], index: usize, sample: u32) -> i32 {
+    if sample == pixels.SAMPLE_U8 {
+        return row[index] as i32
+    }
+    if sample == pixels.SAMPLE_F32 {
+        bits := pixels.get32(row, index * 4)
+        if bits >= 0x80000000 {
+            return (bits as i64 - 0x100000000) as i32
+        }
+        return bits as i32
+    }
+    return pixels.get16(row, index * 2) as i32
+}
+
+// Forward reversible color transform `rct` (permutation * 7 + type) of
+// one pixel in place; the decoder applies the inverse.
+fn forward_rct(rct: i32, px: &mut[i64]) {
+    p := rct / 7
+    t := rct % 7
+    a := p % 3
+    b := (p + 1 + p / 3) % 3
+    c := (p + 2 - p / 3) % 3
+    first := px[a as usize]
+    second := px[b as usize]
+    third := px[c as usize]
+    if t == 6 {
+        co := first - third
+        tmp := third + (co >> 1)
+        cg := second - tmp
+        px[0] = tmp + (cg >> 1)
+        px[1] = co
+        px[2] = cg
+        return
+    }
+    if (t >> 1) == 1 {
+        second = second - first
+    } else if (t >> 1) == 2 {
+        second = second - ((first + third) >> 1)
+    }
+    if (t & 1) == 1 {
+        third = third - first
+    }
+    px[0] = first
+    px[1] = second
+    px[2] = third
+}
+
+// Fill the modular channels of the rect (x0, y0, gw, gh) into planes from
+// `base`: one gw * gh plane per channel, or a single index plane with a
+// palette. Returns the number of planes.
+fn fill_rect(source: &pixels.View, plan: &Plan, words: &[u32], x0: usize, y0: usize, gw: usize, gh: usize, planes: &mut[i32], base: usize) -> usize {
+    channels := plan.channels
+    size := gw * gh
+    wide := plan.sample != pixels.SAMPLE_U8
+    for y in 0usize..gh {
+        row := source.row((y0 + y) as u32)
+        for x in 0usize..gw {
+            at := base + y * gw + x
+            if plan.palette > 0 {
+                planes[at] = palette_index(words, pixel_key(row, x0 + x, channels, wide))
+                continue
+            }
+            px := [0i64; 4]
+            for c in 0usize..channels {
+                px[c] = sample_value(row, (x0 + x) * channels + c, plan.sample) as i64
+            }
+            if plan.rct >= 0 {
+                forward_rct(plan.rct, &mut px)
+            }
+            for c in 0usize..channels {
+                planes[at + c * size] = px[c] as i32
+            }
+        }
+    }
+    if plan.palette > 0 {
+        return 1
+    }
+    return channels
+}
+
+// The palette meta channel: nb_colours wide, one row per channel.
+fn fill_palette(plan: &Plan, words: &[u32], planes: &mut[i32], base: usize) {
+    for c in 0usize..plan.channels {
+        for i in 0usize..plan.palette {
+            planes[base + c * plan.palette + i] = words[c * MAX_PALETTE + i] as i32
+        }
+    }
+}
+
+fn write_global_header(w: &mut BitWriter, plan: &Plan) {
+    // Global tree, default weighted-predictor parameters.
+    w.write(1, 1)
+    w.write(1, 1)
+    count := 0u32
+    if plan.palette > 0 || plan.rct >= 0 {
+        count = 1
+    }
+    w.u32(count, 0, 0, 1, 0, 2, 4, 18, 8)
+    if plan.palette > 0 {
+        w.write(2, 1)
+        w.u32(0, 0, 3, 8, 3, 72, 10, 1096, 13)
+        w.u32(plan.channels as u32, 1, 0, 3, 0, 4, 0, 1, 13)
+        w.u32(plan.palette as u32, 0, 8, 256, 10, 1280, 12, 5376, 16)
+        w.u32(0, 0, 0, 1, 8, 257, 10, 1281, 16)
+        w.write(4, 0)
+    } else if plan.rct >= 0 {
+        w.write(2, 0)
+        w.u32(0, 0, 3, 8, 3, 72, 10, 1096, 13)
+        w.u32(plan.rct as u32, 6, 0, 0, 2, 2, 4, 10, 6)
+    }
+}
+
+fn single_group(plan: &Plan) -> bool {
+    return plan.groups_x == 1 && plan.groups_y == 1
+}
+
+// The global modular stream: its header, the palette, and for a
+// single-group image every channel.
+fn code_global(source: &pixels.View, plan: &Plan, tree: &Tree, planes: &mut[i32], words: &[u32], e: &mut Emitter, set: &CodeSet, w: &mut BitWriter) {
+    write_global_header(w, plan)
+    stream := Stream.new(0)
+    base := 0usize
+    if plan.palette > 0 {
+        fill_palette(plan, words, planes, 0)
+        stream.add(0, plan.palette, plan.channels)
+        base = plan.palette * plan.channels
+    }
+    if single_group(plan) {
+        count := fill_rect(source, plan, words, 0, 0, plan.width, plan.height, planes, base)
+        for c in 0usize..count {
+            stream.add(base + c * plan.width * plan.height, plan.width, plan.height)
+        }
+    }
+    code_stream(planes, &stream, tree, e, set, w)
+}
+
+// Stream index of group g (single pass).
+fn group_stream_id(plan: &Plan, g: usize) -> u32 {
+    return (1 + 3 * plan.lf_groups + 17 + g) as u32
+}
+
+fn code_group(source: &pixels.View, plan: &Plan, tree: &Tree, planes: &mut[i32], words: &[u32], g: usize, e: &mut Emitter, set: &CodeSet, w: &mut BitWriter) {
+    gx := g % plan.groups_x
+    gy := g / plan.groups_x
+    x0 := gx * 256
+    y0 := gy * 256
+    gw := plan.width - x0
+    if gw > 256 {
+        gw = 256
+    }
+    gh := plan.height - y0
+    if gh > 256 {
+        gh = 256
+    }
+    // Group header: global tree, default WP, no transforms.
+    w.write(1, 1)
+    w.write(1, 1)
+    w.write(2, 0)
+    code_rect(source, plan, tree, planes, words, x0, y0, gw, gh, group_stream_id(plan, g), e, set, w)
+}
+
+// The channels of one rectangle as a group stream.
+fn code_rect(source: &pixels.View, plan: &Plan, tree: &Tree, planes: &mut[i32], words: &[u32], x0: usize, y0: usize, gw: usize, gh: usize, id: u32, e: &mut Emitter, set: &CodeSet, w: &mut BitWriter) {
+    count := fill_rect(source, plan, words, x0, y0, gw, gh, planes, 0)
+    stream := Stream.new(id)
+    for c in 0usize..count {
+        stream.add(c * gw * gh, gw, gh)
+    }
+    code_stream(planes, &stream, tree, e, set, w)
+}
+
+// Every stream of the image, in codestream order.
+fn code_image(source: &pixels.View, plan: &Plan, tree: &Tree, planes: &mut[i32], words: &[u32], e: &mut Emitter, set: &CodeSet, w: &mut BitWriter, groups_only: bool) {
+    if !groups_only {
+        code_global(source, plan, tree, planes, words, e, set, w)
+    }
+    if !single_group(plan) {
+        for g in 0usize..plan.groups_x * plan.groups_y {
+            code_group(source, plan, tree, planes, words, g, e, set, w)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Trees
+
+// The tree for a plan. Image channels (numbered from `first` in their
+// stream) get per-channel leaves, refined by local activity at effort 2+.
+fn build_tree(plan: &Plan, tree: &mut Tree) {
+    image_channels := plan.channels
+    if plan.palette > 0 {
+        image_channels = 1
+    }
+    if plan.palette == 0 {
+        image_tree(plan, tree, 0, image_channels as u32)
+        return
+    }
+    meta := tree.leaf(PRED_W)
+    if single_group(plan) {
+        index := image_tree(plan, tree, 1, 1)
+        tree.node(PROP_CHANNEL, 0, index, meta)
+    } else {
+        index := image_tree(plan, tree, 0, 1)
+        tree.node(PROP_STREAM, 0, index, meta)
+    }
+}
+
+fn image_tree(plan: &Plan, tree: &mut Tree, first: u32, count: u32) -> usize {
+    if count == 1 {
+        return channel_subtree(plan, tree, first, 0)
+    }
+    half := count / 2
+    low := image_tree_range(plan, tree, first, 0, half)
+    high := image_tree_range(plan, tree, first, half, count - half)
+    return tree.node(PROP_CHANNEL, (first + half - 1) as i32, high, low)
+}
+
+fn image_tree_range(plan: &Plan, tree: &mut Tree, first: u32, start: u32, count: u32) -> usize {
+    if count == 1 {
+        return channel_subtree(plan, tree, first + start, start)
+    }
+    half := count / 2
+    low := image_tree_range(plan, tree, first, start, half)
+    high := image_tree_range(plan, tree, first, start + half, count - half)
+    return tree.node(PROP_CHANNEL, (first + start + half - 1) as i32, high, low)
+}
+
+// Leaves for one image channel; `local` is its index among image channels.
+fn channel_subtree(plan: &Plan, tree: &mut Tree, channel: u32, local: u32) -> usize {
+    predictor := plan.predictors[local as usize]
+    if !plan.contexts {
+        tree.leaf_mul = channel_factor(plan, local as usize) as i32
+        node := tree.leaf(predictor)
+        tree.leaf_mul = 1
+        return node
+    }
+    shift := 0u32
+    if plan.bits > 8 {
+        shift = plan.bits - 8
+    }
+    if predictor == PRED_WEIGHTED {
+        return wp_subtree(tree, shift)
+    }
+    if plan.palette > 0 {
+        return index_subtree(tree, predictor)
+    }
+    // Samples with a common factor code their residuals divided by it.
+    tree.leaf_mul = channel_factor(plan, local as usize) as i32
+    node := sample_subtree(plan, tree, local, predictor, shift)
+    tree.leaf_mul = 1
+    return node
+}
+
+fn sample_subtree(plan: &Plan, tree: &mut Tree, local: u32, predictor: u32, shift: u32) -> usize {
+    if plan.refs && local > 0 {
+        quiet := activity_subtree(tree, predictor, shift)
+        busy := activity_subtree(tree, predictor, shift)
+        return tree.node(PROP_PREV_ABS_RESIDUAL, 3i32 << (shift as i32), busy, quiet)
+    }
+    return activity_subtree(tree, predictor, shift)
+}
+
+// Buckets of a signed property: cuts[i] separates bucket i (values <=
+// cuts[i]) from bucket i + 1. Built as a balanced search.
+fn bucket_tree(tree: &mut Tree, property: i32, cuts: &[i32], lo: usize, hi: usize, predictor: u32) -> usize {
+    if lo == hi {
+        return tree.leaf(predictor)
+    }
+    mid := (lo + hi) / 2
+    low := bucket_tree(tree, property, cuts, lo, mid, predictor)
+    high := bucket_tree(tree, property, cuts, mid + 1, hi, predictor)
+    return tree.node(property, cuts[mid], high, low)
+}
+
+// Contexts by the local gradients W - NW and NW - N.
+fn activity_subtree(tree: &mut Tree, predictor: u32, shift: u32) -> usize {
+    cuts := [-6i32, -2, 1, 5]
+    scaled(&mut cuts, shift)
+    return grid(tree, &cuts, 0, 4, predictor)
+}
+
+fn grid(tree: &mut Tree, cuts: &[i32], lo: usize, hi: usize, predictor: u32) -> usize {
+    if lo == hi {
+        return bucket_tree(tree, PROP_NW_N, cuts, 0, 4, predictor)
+    }
+    mid := (lo + hi) / 2
+    low := grid(tree, cuts, lo, mid, predictor)
+    high := grid(tree, cuts, mid + 1, hi, predictor)
+    return tree.node(PROP_W_NW, cuts[mid], high, low)
+}
+
+// Palette indices: contexts by the signs of W - NW, NW - N and N - NE,
+// which tell flat areas and edge directions apart.
+fn index_subtree(tree: &mut Tree, predictor: u32) -> usize {
+    return sign_grid(tree, 0, predictor)
+}
+
+fn sign_grid(tree: &mut Tree, level: u32, predictor: u32) -> usize {
+    if level == 3 {
+        return tree.leaf(predictor)
+    }
+    property := PROP_W_NW
+    if level == 1 {
+        property = PROP_NW_N
+    } else if level == 2 {
+        property = PROP_N_NE
+    }
+    negative := sign_grid(tree, level + 1, predictor)
+    zero := sign_grid(tree, level + 1, predictor)
+    positive := sign_grid(tree, level + 1, predictor)
+    rest := tree.node(property, -1, zero, negative)
+    return tree.node(property, 0, positive, rest)
+}
+
+// Contexts by the weighted predictor's maximum error (1/8 units).
+fn wp_subtree(tree: &mut Tree, shift: u32) -> usize {
+    cuts := [-500i32, -392, -255, -191, -127, -95, -63, -47, -31, -23, -15, -11, -7, -4, -3, -1, 0, 1, 3, 5, 7, 11, 15, 23, 31, 47, 63, 95, 127, 191, 255, 392, 500]
+    scaled(&mut cuts, shift)
+    return bucket_tree(tree, PROP_WP_ERROR, &cuts, 0, 33, PRED_WEIGHTED)
+}
+
+// Scale cuts for deeper samples (negative cuts keep their -1 offset).
+fn scaled(cuts: &mut[i32], shift: u32) {
+    for i in 0usize..cuts.len {
+        c := cuts[i]
+        if c < 0 {
+            cuts[i] = ((c + 1) << (shift as i32)) - 1
+        } else {
+            cuts[i] = c << (shift as i32)
+        }
+    }
+}
+
+// Per modular channel, a factor of every value, from the source channels'
+// common factors carried through the color transform: differences keep the
+// common factor of both sides, halving keeps half of an even factor.
+fn channel_factor(plan: &Plan, local: usize) -> u32 {
+    factors := [1u32; 5]
+    if plan.palette > 0 {
+        return 1
+    }
+    for c in 0usize..plan.channels {
+        factors[c] = plan.source_factors[c]
+    }
+    if plan.rct >= 0 {
+        rct_factors(plan, &mut factors)
+    }
+    return factors[local]
+}
+
+fn rct_factors(plan: &Plan, factors: &mut[u32]) {
+    p := plan.rct / 7
+    t := plan.rct % 7
+    fa := plan.source_factors[(p % 3) as usize]
+    fb := plan.source_factors[((p + 1 + p / 3) % 3) as usize]
+    fc := plan.source_factors[((p + 2 - p / 3) % 3) as usize]
+    if t == 6 {
+        co := gcd(fa, fc)
+        tmp := gcd(fc, half(co))
+        cg := gcd(fb, tmp)
+        factors[0] = gcd(tmp, half(cg))
+        factors[1] = co
+        factors[2] = cg
+        return
+    }
+    second := fb
+    if (t >> 1) == 1 {
+        second = gcd(fb, fa)
+    } else if (t >> 1) == 2 {
+        second = gcd(fb, half(gcd(fa, fc)))
+    }
+    third := fc
+    if (t & 1) == 1 {
+        third = gcd(fc, fa)
+    }
+    factors[0] = fa
+    factors[1] = second
+    factors[2] = third
+}
+
+fn gcd(a: u32, b: u32) -> u32 {
+    x := a
+    y := b
+    for y != 0 {
+        t := x % y
+        x = y
+        y = t
+    }
+    return x
+}
+
+// A factor of x >> 1 given a factor of x.
+fn half(f: u32) -> u32 {
+    if (f & 1) == 0 {
+        return f / 2
+    }
+    return 1
+}

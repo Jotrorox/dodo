@@ -1,0 +1,531 @@
+package image
+
+import "core/mem"
+import "std/graphics"
+import "std/image/bmp"
+import "std/image/color"
+import "std/image/jxl"
+import "std/image/jxl/encode" as jxl_encode
+import "std/image/meta"
+import "std/image/pixels"
+import "std/image/png"
+import "std/image/ppm"
+import "std/image/qoi"
+import "std/image/sink"
+
+// Image files with caller-supplied storage only: no allocation, no files,
+// no foreign code. This package identifies a file by its signature and
+// forwards to the codec package for its format (std/image/ppm, qoi, bmp,
+// png, jxl; JPEG XL encoding uses std/image/jxl/encode).
+//
+//     header := image.info(&data)?                       // size, layout, color
+//     need := image.scratch_size(&data, &layout)?
+//     target := pixels.ViewMut.new(&mut storage, header.width, header.height, layout)?
+//     image.decode(&data, &mut target, &mut scratch[..need])?
+//
+// Decoding converts from the file's native layout (header.native) into the
+// target's layout; decode_into() hands native pixels to any sink.Sink
+// instead. Encoders read a pixels.View in any layout.
+
+// The errors of every codec: Truncated, Malformed, Unsupported, TooLarge,
+// BufferTooSmall.
+pub type Error = pixels.Error
+pub type Format = pixels.Format
+
+// The format of `data` from its signature, without validating the rest.
+// Unknown data fails with Unsupported.
+pub fn detect(data: &[u8]) -> pixels.Format!pixels.Error {
+    if png.matches(data) {
+        return ok(pixels.Format.Png)
+    }
+    if qoi.matches(data) {
+        return ok(pixels.Format.Qoi)
+    }
+    if bmp.matches(data) {
+        return ok(pixels.Format.Bmp)
+    }
+    if ppm.matches(data) {
+        return ok(pixels.Format.Ppm)
+    }
+    if jxl.matches(data) {
+        return ok(pixels.Format.Jxl)
+    }
+    return err(pixels.Error.Unsupported)
+}
+
+// The file's header: size, native layout, bit depth, color description,
+// orientation and animation.
+pub fn info(data: &[u8]) -> pixels.Header!pixels.Error {
+    match detect(data)? {
+        pixels.Format.Ppm => {
+            return ppm.info(data)
+        }
+        pixels.Format.Qoi => {
+            return qoi.info(data)
+        }
+        pixels.Format.Bmp => {
+            return bmp.info(data)
+        }
+        pixels.Format.Png => {
+            return png.info(data)
+        }
+        pixels.Format.Jxl => {
+            return jxl.info(data)
+        }
+    }
+}
+
+// Where the file's EXIF, XMP and ICC payloads are (see meta.Item).
+pub fn metadata(data: &[u8]) -> meta.Metadata!pixels.Error {
+    match detect(data)? {
+        pixels.Format.Ppm => {
+            return ppm.metadata(data)
+        }
+        pixels.Format.Qoi => {
+            return qoi.metadata(data)
+        }
+        pixels.Format.Bmp => {
+            return bmp.metadata(data)
+        }
+        pixels.Format.Png => {
+            return png.metadata(data)
+        }
+        pixels.Format.Jxl => {
+            return jxl.metadata(data)
+        }
+    }
+}
+
+// The embedded ICC profile, decoded into `output` (PNG iCCP is inflated,
+// BMP profiles are copied, JPEG XL profiles are entropy-decoded); returns
+// its length, 0 when there is none. `scratch` needs icc_scratch_size(data)
+// bytes (zero except for JPEG XL).
+pub fn icc(data: &[u8], output: &mut[u8], scratch: &mut[u8]) -> usize!pixels.Error {
+    header := info(data)?
+    found := header.color.clone()
+    if found.icc_encoding == color.ICC_NONE {
+        return ok(0)
+    }
+    if found.icc_encoding == color.ICC_JXL {
+        return jxl.icc(data, output, scratch)
+    }
+    item := meta.Item { offset: found.icc_offset, length: found.icc_length, encoding: meta.ENCODING_RAW }
+    if found.icc_encoding == color.ICC_ZLIB {
+        item.encoding = meta.ENCODING_ZLIB
+    } else if found.icc_encoding != color.ICC_RAW {
+        return err(pixels.Error.Unsupported)
+    }
+    return meta.decode(data, &item, output)
+}
+
+// Bytes of scratch decode() and decode_into() need for `data`. `target` is
+// the layout decode() will write; the current codecs convert row by row and
+// need the same scratch for every target.
+pub fn scratch_size(data: &[u8], target: &pixels.Layout) -> usize!pixels.Error {
+    match detect(data)? {
+        pixels.Format.Ppm => {
+            return ppm.scratch_size(data)
+        }
+        pixels.Format.Qoi => {
+            return qoi.scratch_size(data)
+        }
+        pixels.Format.Bmp => {
+            return bmp.scratch_size(data)
+        }
+        pixels.Format.Png => {
+            return png.scratch_size(data)
+        }
+        pixels.Format.Jxl => {
+            return jxl.scratch_size(data)
+        }
+    }
+}
+
+// Decode `data` into `target`, converting to its layout. The target must be
+// at least as large as the image; the image's top-left pixel lands at the
+// target's. An animation decodes to its default image.
+pub fn decode(data: &[u8], target: &mut pixels.ViewMut, scratch: &mut[u8]) -> void!pixels.Error {
+    output := sink.ViewSink.new(target)
+    return decode_into(data, &mut output, scratch)
+}
+
+// Decode `data` into any sink, in the native layout of info(data).
+pub fn decode_into<S: sink.Sink>(data: &[u8], output: &mut S, scratch: &mut[u8]) -> void!pixels.Error {
+    match detect(data)? {
+        pixels.Format.Ppm => {
+            return ppm.decode(data, output, scratch)
+        }
+        pixels.Format.Qoi => {
+            return qoi.decode(data, output, scratch)
+        }
+        pixels.Format.Bmp => {
+            return bmp.decode(data, output, scratch)
+        }
+        pixels.Format.Png => {
+            return png.decode(data, output, scratch)
+        }
+        pixels.Format.Jxl => {
+            return jxl.decode(data, output, scratch)
+        }
+    }
+}
+
+// Decode `data` onto a canvas with the image's top-left corner at (x, y),
+// converted to straight 8-bit RGBA and stored (not blended); pixels outside
+// the canvas or its clip are skipped.
+pub fn draw(data: &[u8], canvas: &mut graphics.Canvas, x: i32, y: i32, scratch: &mut[u8]) -> void!pixels.Error {
+    output := sink.CanvasSink.new(canvas, x, y)
+    return decode_into(data, &mut output, scratch)
+}
+
+// Bytes of scratch icc() needs for `data`.
+pub fn icc_scratch_size(data: &[u8]) -> usize!pixels.Error {
+    if jxl.matches(data) {
+        return jxl.scratch_size(data)
+    }
+    return ok(0)
+}
+
+// ---------------------------------------------------------------------------
+// Animation. Still images have one frame of zero duration.
+
+pub fn frame_count(data: &[u8]) -> u32!pixels.Error {
+    header := info(data)?
+    return ok(header.frames)
+}
+
+// How long frame `index` shows.
+pub fn frame_info(data: &[u8], index: u32) -> pixels.FrameInfo!pixels.Error {
+    match detect(data)? {
+        pixels.Format.Png => {
+            return png.frame_info(data, index)
+        }
+        pixels.Format.Jxl => {
+            return jxl.frame_info(data, index)
+        }
+        _ => {
+            info(data)?
+            if index != 0 {
+                return err(pixels.Error.Malformed)
+            }
+            return ok(pixels.FrameInfo { numerator: 0, denominator: 1 })
+        }
+    }
+}
+
+// Bytes of scratch decode_frame() needs.
+pub fn frame_scratch_size(data: &[u8]) -> usize!pixels.Error {
+    match detect(data)? {
+        pixels.Format.Png => {
+            return png.frame_scratch_size(data)
+        }
+        pixels.Format.Jxl => {
+            return jxl.scratch_size(data)
+        }
+        _ => {
+            layout := pixels.Layout.rgba8()
+            return scratch_size(data, &layout)
+        }
+    }
+}
+
+// Render frame `index` as a viewer shows it (earlier frames composited
+// underneath) into `target`, converting to its layout.
+pub fn decode_frame(data: &[u8], index: u32, target: &mut pixels.ViewMut, scratch: &mut[u8]) -> void!pixels.Error {
+    output := sink.ViewSink.new(target)
+    return decode_frame_into(data, index, &mut output, scratch)
+}
+
+// Render frame `index` into a sink. Animated PNG frames arrive as one
+// Rgba16 rect covering the canvas; frame 0 of a still image is decode_into().
+pub fn decode_frame_into<S: sink.Sink>(data: &[u8], index: u32, output: &mut S, scratch: &mut[u8]) -> void!pixels.Error {
+    match detect(data)? {
+        pixels.Format.Png => {
+            return png.decode_frame(data, index, output, scratch)
+        }
+        pixels.Format.Jxl => {
+            return jxl.decode_frame(data, index, output, scratch)
+        }
+        _ => {
+            if index != 0 {
+                info(data)?
+                return err(pixels.Error.Malformed)
+            }
+            return decode_into(data, output, scratch)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Encoding
+
+// Format-independent encoder settings, mapped onto each codec's options.
+// Every format written today is lossless, so quality and lossless only
+// matter for lossy formats.
+pub struct EncodeOptions {
+    // 0 to 100 for lossy formats; higher is better.
+    pub quality: u32
+    // Prefer a lossless encoding where the format offers both.
+    pub lossless: bool
+    // 1 (fastest) to 9 (smallest); PNG uses it as the deflate level, and 0
+    // writes stored PNG blocks.
+    pub effort: u32
+    // Write the EXIF and ICC payloads given to encode_with_metadata.
+    pub keep_metadata: bool
+    // PNG: write an indexed PNG when an 8-bit source has at most 256 RGBA
+    // colors (see ops.palette and ops.remap to reduce it that far).
+    pub palette: bool
+
+    pub fn new() -> EncodeOptions {
+        return EncodeOptions { quality: 90, lossless: true, effort: 6, keep_metadata: true, palette: false }
+    }
+}
+
+// Generic effort 1-2 is JPEG XL effort 1, 3-6 effort 2, 7-9 effort 3.
+fn jxl_options(options: &EncodeOptions) -> jxl_encode.EncodeOptions {
+    result := jxl_encode.EncodeOptions.new()
+    if options.effort <= 2 {
+        result.effort = 1
+    } else if options.effort <= 6 {
+        result.effort = 2
+    } else {
+        result.effort = 3
+    }
+    return result
+}
+
+// A canvas whose pixels are already RGBA8 or gray8 is encoded in place.
+fn encode_canvas_jxl(canvas: &graphics.Canvas, options: &EncodeOptions, output: &mut[u8], scratch: &mut[u8]) -> usize!pixels.Error {
+    layout := pixels.Layout.rgba8()
+    match canvas.format() {
+        graphics.PixelFormat.Rgba8888 => {}
+        graphics.PixelFormat.Gray8 => {
+            layout = pixels.Layout.gray8()
+        }
+        _ => {
+            return err(pixels.Error.Unsupported)
+        }
+    }
+    source := pixels.View.with_stride(canvas.pixels(), canvas.width(), canvas.height(), canvas.stride(), layout)?
+    codec := jxl_options(options)
+    return jxl_encode.encode(&source, &codec, output, scratch)
+}
+
+fn png_options(options: &EncodeOptions) -> png.EncodeOptions {
+    result := png.EncodeOptions.new()
+    level := options.effort
+    if level > 9 {
+        level = 9
+    }
+    result.level = level
+    result.palette = options.palette
+    return result
+}
+
+// An upper bound on the bytes encode() writes for `source`.
+pub fn max_encoded_size(format: pixels.Format, source: &pixels.View, options: &EncodeOptions) -> usize!pixels.Error {
+    return max_encoded_size_for(format, source.width(), source.height(), source.layout(), options)
+}
+
+// The same for a width x height source in `layout`.
+pub fn max_encoded_size_for(format: pixels.Format, width: u32, height: u32, layout: &pixels.Layout, options: &EncodeOptions) -> usize!pixels.Error {
+    match format {
+        pixels.Format.Ppm => {
+            codec := ppm.EncodeOptions.new()
+            return ppm.max_encoded_size(width, height, layout, &codec)
+        }
+        pixels.Format.Qoi => {
+            codec := qoi.EncodeOptions.new()
+            return qoi.max_encoded_size(width, height, layout, &codec)
+        }
+        pixels.Format.Bmp => {
+            codec := bmp.EncodeOptions.new()
+            return bmp.max_encoded_size(width, height, layout, &codec)
+        }
+        pixels.Format.Png => {
+            codec := png_options(options)
+            return png.max_encoded_size(width, height, layout, &codec)
+        }
+        pixels.Format.Jxl => {
+            codec := jxl_options(options)
+            return jxl_encode.max_encoded_size(width, height, layout, &codec)
+        }
+    }
+}
+
+// Bytes encode_with_metadata() may add for EXIF and ICC payloads of these
+// sizes (zero for formats that do not store them).
+pub fn metadata_size(format: pixels.Format, exif_len: usize, icc_len: usize) -> usize!pixels.Error {
+    match format {
+        pixels.Format.Png => {
+            return png.metadata_size(exif_len, icc_len)
+        }
+        pixels.Format.Jxl => {
+            if exif_len == 0 {
+                return ok(0)
+            }
+            // Container signature, ftyp, Exif and codestream box headers.
+            return pixels.checked(1, exif_len, 128)
+        }
+        _ => {
+            return ok(0)
+        }
+    }
+}
+
+// Bytes of scratch encode() needs for `source`.
+pub fn encode_scratch_size(format: pixels.Format, source: &pixels.View, options: &EncodeOptions) -> usize!pixels.Error {
+    width := source.width()
+    height := source.height()
+    match format {
+        pixels.Format.Ppm => {
+            codec := ppm.EncodeOptions.new()
+            return ppm.encode_scratch_size(width, height, source.layout(), &codec)
+        }
+        pixels.Format.Qoi => {
+            codec := qoi.EncodeOptions.new()
+            return qoi.encode_scratch_size(width, height, source.layout(), &codec)
+        }
+        pixels.Format.Bmp => {
+            codec := bmp.EncodeOptions.new()
+            return bmp.encode_scratch_size(width, height, source.layout(), &codec)
+        }
+        pixels.Format.Png => {
+            codec := png_options(options)
+            return png.encode_scratch_size(width, height, source.layout(), &codec)
+        }
+        pixels.Format.Jxl => {
+            codec := jxl_options(options)
+            return jxl_encode.encode_scratch_size(width, height, source.layout(), &codec)
+        }
+    }
+}
+
+// Encode `source` (any layout) as `format` into `output` and return the
+// byte count. Each codec picks the closest stored form: PNG writes gray,
+// gray+alpha, RGB or RGBA at 8 or 16 bits; PPM writes P5, P6, P7 or PFM;
+// QOI writes RGB or RGBA; BMP writes 24 or 32-bit.
+pub fn encode(format: pixels.Format, source: &pixels.View, options: &EncodeOptions, output: &mut[u8], scratch: &mut[u8]) -> usize!pixels.Error {
+    nothing := [0u8; 1]
+    return encode_with_metadata(format, source, options, &nothing[..0], &nothing[..0], output, scratch)
+}
+
+// encode() with an EXIF payload (TIFF-structured) and an ICC profile, each
+// written when not empty, options.keep_metadata is set and the format can
+// store it (PNG: eXIf and iCCP). The output may need metadata_size() more
+// bytes than max_encoded_size().
+pub fn encode_with_metadata(format: pixels.Format, source: &pixels.View, options: &EncodeOptions, exif: &[u8], icc: &[u8], output: &mut[u8], scratch: &mut[u8]) -> usize!pixels.Error {
+    match format {
+        pixels.Format.Ppm => {
+            codec := ppm.EncodeOptions.new()
+            return ppm.encode(source, &codec, output, scratch)
+        }
+        pixels.Format.Qoi => {
+            codec := qoi.EncodeOptions.new()
+            return qoi.encode(source, &codec, output, scratch)
+        }
+        pixels.Format.Bmp => {
+            codec := bmp.EncodeOptions.new()
+            return bmp.encode(source, &codec, output, scratch)
+        }
+        pixels.Format.Png => {
+            codec := png_options(options)
+            if options.keep_metadata {
+                return png.encode_with_metadata(source, &codec, exif, icc, output, scratch)
+            }
+            return png.encode(source, &codec, output, scratch)
+        }
+        pixels.Format.Jxl => {
+            codec := jxl_options(options)
+            if options.keep_metadata && exif.len > 0 {
+                nothing := [0u8; 1]
+                boxes := jxl_encode.Metadata.new(exif, &nothing[..0])
+                return jxl_encode.encode_with_metadata(source, &codec, &boxes, output, scratch)
+            }
+            return jxl_encode.encode(source, &codec, output, scratch)
+        }
+    }
+}
+
+// Encode a canvas, read from its top-left pixel as 8-bit RGBA; size the
+// output with max_encoded_size_for(format, width, height,
+// pixels.Layout.rgba8(), options).
+pub fn encode_canvas(format: pixels.Format, canvas: &graphics.Canvas, options: &EncodeOptions, output: &mut[u8], scratch: &mut[u8]) -> usize!pixels.Error {
+    source := sink.CanvasSource.new(canvas)
+    match format {
+        pixels.Format.Ppm => {
+            codec := ppm.EncodeOptions.new()
+            return ppm.encode_from(&source, &codec, output, scratch)
+        }
+        pixels.Format.Qoi => {
+            codec := qoi.EncodeOptions.new()
+            return qoi.encode_from(&source, &codec, output, scratch)
+        }
+        pixels.Format.Bmp => {
+            codec := bmp.EncodeOptions.new()
+            return bmp.encode_from(&source, &codec, output, scratch)
+        }
+        pixels.Format.Png => {
+            codec := png_options(options)
+            return png.encode_from(&source, &codec, output, scratch)
+        }
+        pixels.Format.Jxl => {
+            return encode_canvas_jxl(canvas, options, output, scratch)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// File names
+
+// The format for a file name's extension, or a bare extension such as
+// extension() returns, compared without case: png and apng; qoi; bmp and
+// dib; ppm, pgm, pnm, pam and pfm; jxl.
+pub fn format_from_extension(name: &str) -> pixels.Format!pixels.Error {
+    bytes := mem.str_bytes(name)
+    start := 0usize
+    for i in 0usize..bytes.len {
+        if bytes[i] == b'.' {
+            start = i + 1
+        }
+    }
+    suffix := &bytes[start..]
+    if same(suffix, b"png") || same(suffix, b"apng") {
+        return ok(pixels.Format.Png)
+    }
+    if same(suffix, b"qoi") {
+        return ok(pixels.Format.Qoi)
+    }
+    if same(suffix, b"bmp") || same(suffix, b"dib") {
+        return ok(pixels.Format.Bmp)
+    }
+    if same(suffix, b"ppm") || same(suffix, b"pgm") || same(suffix, b"pnm") || same(suffix, b"pam") || same(suffix, b"pfm") {
+        return ok(pixels.Format.Ppm)
+    }
+    if same(suffix, b"jxl") {
+        return ok(pixels.Format.Jxl)
+    }
+    return err(pixels.Error.Unsupported)
+}
+
+// ASCII case-insensitive equality with a lowercase word.
+fn same(text: &[u8], word: &[u8]) -> bool {
+    if text.len != word.len {
+        return false
+    }
+    for i in 0usize..text.len {
+        c := text[i]
+        if c >= b'A' && c <= b'Z' {
+            c = c + 32
+        }
+        if c != word[i] {
+            return false
+        }
+    }
+    return true
+}
+
+// The usual file extension for `format`, without the dot.
+pub fn extension(format: &pixels.Format) -> &str from(static) {
+    return pixels.format_name(format)
+}

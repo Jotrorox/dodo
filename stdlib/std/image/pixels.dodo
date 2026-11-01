@@ -580,10 +580,16 @@ pub struct FrameInfo {
     pub numerator: u32
     pub denominator: u32
 
+    // The duration rounded to milliseconds, saturating at 0xffffffff
+    // (frame timing comes from the file: 2^32 - 1 seconds fit a FrameInfo).
     pub fn milliseconds(&self) -> u32 {
         if self.denominator == 0 {
             return 0
         }
-        return ((self.numerator as u64 * 1000 + self.denominator as u64 / 2) / self.denominator as u64) as u32
+        value := (self.numerator as u64 * 1000 + self.denominator as u64 / 2) / self.denominator as u64
+        if value > 0xffffffff {
+            return 0xffffffff
+        }
+        return value as u32
     }
 }

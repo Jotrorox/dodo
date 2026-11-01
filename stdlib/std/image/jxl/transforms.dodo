@@ -1,0 +1,644 @@
+package jxl
+
+import "std/image/pixels"
+
+// Modular transforms: reading them with their effect on the channel list
+// (forward "meta" step), decoding a modular stream, and the inverse
+// transforms RCT, Palette (with delta entries and the implicit palette) and
+// Squeeze (default or explicit parameters).
+
+fn read_transforms(r: &mut Reader, ch: &mut ChanList, tr: &mut TrList, stash: &mut ChanList, work: &mut ModularWork) -> void!pixels.Error {
+    count := r.u32c(dist(0, 0), dist(1, 0), dist(2, 4), dist(18, 8))
+    if count > 512 {
+        return err(pixels.Error.Malformed)
+    }
+    for t in 0u32..count {
+        kind := r.bits(2)
+        if kind == 0 {
+            begin := r.u32c(dist(0, 3), dist(8, 6), dist(72, 10), dist(1096, 13)) as usize
+            rct_type := r.u32c(dist(6, 0), dist(0, 2), dist(2, 4), dist(10, 6))
+            if rct_type >= 42 || begin + 3 > ch.count {
+                return err(pixels.Error.Malformed)
+            }
+            if !ch.same_shape(begin, begin + 1) || !ch.same_shape(begin, begin + 2) {
+                return err(pixels.Error.Malformed)
+            }
+            tr.push(TR_RCT, begin as i32, 3, rct_type as i32, 0, 0, 0, 0)?
+        } else if kind == 1 {
+            begin := r.u32c(dist(0, 3), dist(8, 6), dist(72, 10), dist(1096, 13)) as usize
+            num_c := r.u32c(dist(1, 0), dist(3, 0), dist(4, 0), dist(1, 13)) as usize
+            nb_colours := r.u32c(dist(0, 8), dist(256, 10), dist(1280, 12), dist(5376, 16))
+            nb_deltas := r.u32c(dist(0, 0), dist(1, 8), dist(257, 10), dist(1281, 16))
+            d_pred := r.bits(4)
+            if d_pred >= 14 || begin + num_c > ch.count || r.overrun {
+                return err(pixels.Error.Malformed)
+            }
+            end := begin + num_c
+            if begin < ch.nb_meta {
+                if end > ch.nb_meta {
+                    return err(pixels.Error.Malformed)
+                }
+                ch.nb_meta = ch.nb_meta + 2 - num_c
+            } else {
+                ch.nb_meta += 1
+            }
+            for i in begin + 1..end {
+                if ch.width(i) != ch.width(begin) || ch.height(i) != ch.height(begin) {
+                    return err(pixels.Error.Malformed)
+                }
+            }
+            // Members leave the list (kept for the inverse); the index
+            // channel stays at `begin`.
+            for i in begin + 1..end {
+                stash.push_from(ch, i)?
+            }
+            for i in begin + 1..end {
+                ch.remove(begin + 1)
+            }
+            size := nb_colours as u64 + nb_deltas as u64
+            meta := work.alloc(size * num_c as u64)?
+            ch.insert(0)?
+            ch.set(0, meta, size as usize, size as usize, num_c, -1, -1)
+            tr.push(TR_PALETTE, begin as i32, num_c as i32, nb_colours as i32, nb_deltas as i32, d_pred as i32, 0, 0)?
+        } else if kind == 2 {
+            num_sq := r.u32c(dist(0, 0), dist(1, 4), dist(9, 6), dist(41, 8))
+            if num_sq == 0 {
+                default_squeeze(ch, tr)?
+            } else {
+                for i in 0u32..num_sq {
+                    horizontal := r.bit()
+                    in_place := r.bit()
+                    begin := r.u32c(dist(0, 3), dist(8, 6), dist(72, 10), dist(1096, 13))
+                    num_c := r.u32c(dist(1, 0), dist(2, 0), dist(3, 0), dist(4, 4))
+                    h := 0i32
+                    if horizontal {
+                        h = 1
+                    }
+                    p := 0i32
+                    if in_place {
+                        p = 1
+                    }
+                    meta_squeeze(ch, begin as usize, num_c as usize, horizontal, in_place)?
+                    tr.push(TR_SQUEEZE, begin as i32, num_c as i32, h, p, 0, 0, 0)?
+                }
+            }
+        } else {
+            return err(pixels.Error.Malformed)
+        }
+        if r.overrun {
+            return err(pixels.Error.Truncated)
+        }
+    }
+    return ok()
+}
+
+fn default_squeeze(ch: &mut ChanList, tr: &mut TrList) -> void!pixels.Error {
+    first := ch.nb_meta
+    if first >= ch.count {
+        return err(pixels.Error.Malformed)
+    }
+    count := ch.count
+    w := ch.width(first)
+    h := ch.height(first)
+    if count - first >= 3 && ch.width(first + 1) == w && ch.height(first + 1) == h {
+        meta_squeeze(ch, first + 1, 2, true, false)?
+        tr.push(TR_SQUEEZE, (first + 1) as i32, 2, 1, 0, 0, 0, 0)?
+        meta_squeeze(ch, first + 1, 2, false, false)?
+        tr.push(TR_SQUEEZE, (first + 1) as i32, 2, 0, 0, 0, 0, 0)?
+    }
+    num_c := count - first
+    if h >= w && h > 8 {
+        meta_squeeze(ch, first, num_c, false, true)?
+        tr.push(TR_SQUEEZE, first as i32, num_c as i32, 0, 1, 0, 0, 0)?
+        h = (h + 1) / 2
+    }
+    for w > 8 || h > 8 {
+        if w > 8 {
+            meta_squeeze(ch, first, num_c, true, true)?
+            tr.push(TR_SQUEEZE, first as i32, num_c as i32, 1, 1, 0, 0, 0)?
+            w = (w + 1) / 2
+        }
+        if h > 8 {
+            meta_squeeze(ch, first, num_c, false, true)?
+            tr.push(TR_SQUEEZE, first as i32, num_c as i32, 0, 1, 0, 0, 0)?
+            h = (h + 1) / 2
+        }
+    }
+    return ok()
+}
+
+// Split channels begin..begin + num_c into average and residual views.
+fn meta_squeeze(ch: &mut ChanList, begin: usize, num_c: usize, horizontal: bool, in_place: bool) -> void!pixels.Error {
+    end := begin + num_c
+    if end > ch.count || num_c == 0 {
+        return err(pixels.Error.Malformed)
+    }
+    if begin < ch.nb_meta {
+        if !in_place || end > ch.nb_meta {
+            return err(pixels.Error.Malformed)
+        }
+        ch.nb_meta += num_c
+    }
+    // Residual views go after `end` (in place) or to the end of the list.
+    insert_at := ch.count
+    if in_place {
+        insert_at = end
+    }
+    for i in 0usize..num_c {
+        c := begin + i
+        w := ch.width(c)
+        h := ch.height(c)
+        hs := ch.hshift(c)
+        vs := ch.vshift(c)
+        if w == 0 || h == 0 || hs > 30 || vs > 30 {
+            return err(pixels.Error.Malformed)
+        }
+        off := ch.offset(c)
+        stride := ch.stride(c)
+        if horizontal {
+            keep := (w + 1) / 2
+            nhs := hs
+            if hs >= 0 {
+                nhs = hs + 1
+            }
+            ch.set(c, off, stride, keep, h, nhs, vs)
+            ch.insert(insert_at + i)?
+            ch.set(insert_at + i, off + keep, stride, w / 2, h, nhs, vs)
+        } else {
+            keep := (h + 1) / 2
+            nvs := vs
+            if vs >= 0 {
+                nvs = vs + 1
+            }
+            ch.set(c, off, stride, w, keep, hs, nvs)
+            ch.insert(insert_at + i)?
+            ch.set(insert_at + i, off + keep * stride, stride, w, h / 2, hs, nvs)
+        }
+    }
+    return ok()
+}
+
+// Decode one modular stream: header, tree and channels. In the global
+// stream decoding stops at the first non-meta channel larger than a
+// group; returns how many channels of `ch` were covered.
+fn decode_stream(r: &mut Reader, work: &mut ModularWork, gcode: &Code, lcode: &mut Code, tcode: &mut Code, n1: &mut Code, n2: &mut Code, window: &mut[u32], ch: &mut ChanList, tr: &mut TrList, stash: &mut ChanList, wp: &mut[i32], is_global: bool, group_dim: usize, stream_index: u32) -> usize!pixels.Error {
+    use_global := r.bit()
+    read_wp_header(r, wp)
+    read_transforms(r, ch, tr, stash, work)?
+    end := 0usize
+    num := 0usize
+    dist_mult := 0usize
+    samples := 0u64
+    for i in 0usize..ch.count {
+        w := ch.width(i)
+        h := ch.height(i)
+        if is_global && i >= ch.nb_meta && (w > group_dim || h > group_dim) {
+            break
+        }
+        end = i + 1
+        if w == 0 || h == 0 {
+            continue
+        }
+        num += 1
+        if w > dist_mult {
+            dist_mult = w
+        }
+        samples += w as u64 * h as u64
+    }
+    if num == 0 {
+        return ok(end)
+    }
+    if dist_mult > 2097152 {
+        dist_mult = 2097152
+    }
+    if !use_global {
+        limit := 1024 + samples
+        if limit > 1048576 {
+            limit = 1048576
+        }
+        work.ltree_nodes = read_tree(r, limit, work.ltree, tcode, n1, n2, window, lcode)?
+    } else if work.gtree_nodes == 0 {
+        return err(pixels.Error.Malformed)
+    }
+    use_wp := false
+    refs := 0usize
+    if use_global {
+        use_wp = tree_uses_wp(work.gtree, work.gtree_nodes)
+        refs = tree_refs(work.gtree, work.gtree_nodes)
+    } else {
+        use_wp = tree_uses_wp(work.ltree, work.ltree_nodes)
+        refs = tree_refs(work.ltree, work.ltree_nodes)
+    }
+    stream := Stream.new(window)
+    if use_global {
+        stream.begin(gcode, r)
+    } else {
+        stream.begin(lcode, r)
+    }
+    for i in 0usize..end {
+        w := ch.width(i)
+        h := ch.height(i)
+        if w == 0 || h == 0 {
+            continue
+        }
+        job := ChannelJob { off: ch.offset(i), stride: ch.stride(i), width: w, height: h, channel_index: i as i64, stream_index: stream_index as i64, dist_mult: dist_mult as u32, use_wp: use_wp, num_refs: 0, ref_off: [0usize; MAX_REFS], ref_stride: [0usize; MAX_REFS] }
+        if refs > 0 {
+            j := i
+            for j > 0 && job.num_refs < refs {
+                j -= 1
+                if ch.same_shape(i, j) {
+                    job.ref_off[job.num_refs] = ch.offset(j)
+                    job.ref_stride[job.num_refs] = ch.stride(j)
+                    job.num_refs += 1
+                }
+            }
+        }
+        if use_global {
+            decode_channel(work, true, gcode, &mut stream, r, &job, wp)?
+        } else {
+            decode_channel(work, false, lcode, &mut stream, r, &job, wp)?
+        }
+    }
+    if use_global {
+        stream.finish(gcode)?
+    } else {
+        stream.finish(lcode)?
+    }
+    return ok(end)
+}
+
+// Undo every transform of `tr`, last first.
+fn inverse_transforms(work: &mut ModularWork, ch: &mut ChanList, tr: &mut TrList, stash: &mut ChanList, wp: &[i32], bits: u32) -> void!pixels.Error {
+    i := tr.count
+    for i > 0 {
+        i -= 1
+        kind := tr.get(i, 0)
+        begin := tr.get(i, 1) as usize
+        num_c := tr.get(i, 2) as usize
+        if kind == TR_RCT {
+            inverse_rct(work.arena, ch, begin, tr.get(i, 3))
+        } else if kind == TR_PALETTE {
+            inverse_palette(work, ch, stash, begin, num_c, tr.get(i, 3), tr.get(i, 4), tr.get(i, 5), wp, bits)?
+        } else {
+            inverse_squeeze(work, ch, begin, num_c, tr.get(i, 3) == 1, tr.get(i, 4) == 1)?
+        }
+    }
+    tr.count = 0
+    return ok()
+}
+
+fn inverse_rct(a: &mut[i32], ch: &ChanList, begin: usize, rct_type: i32) {
+    if rct_type == 0 {
+        return
+    }
+    permutation := (rct_type / 7) as usize
+    custom := rct_type % 7
+    o0 := begin + permutation % 3
+    o1 := begin + (permutation + 1 + permutation / 3) % 3
+    o2 := begin + (permutation + 2 - permutation / 3) % 3
+    w := ch.width(begin)
+    h := ch.height(begin)
+    second := custom >> 1
+    third := custom & 1
+    for y in 0usize..h {
+        p0 := ch.offset(begin) + y * ch.stride(begin)
+        p1 := ch.offset(begin + 1) + y * ch.stride(begin + 1)
+        p2 := ch.offset(begin + 2) + y * ch.stride(begin + 2)
+        q0 := ch.offset(o0) + y * ch.stride(o0)
+        q1 := ch.offset(o1) + y * ch.stride(o1)
+        q2 := ch.offset(o2) + y * ch.stride(o2)
+        for x in 0usize..w {
+            v0 := a[p0 + x]
+            v1 := a[p1 + x]
+            v2 := a[p2 + x]
+            r0 := v0
+            r1 := v1
+            r2 := v2
+            if custom == 6 {
+                tmp := core.wrapping_sub(v0, v2 >> 1)
+                g := core.wrapping_add(v2, tmp)
+                b := core.wrapping_sub(tmp, v1 >> 1)
+                r0 = core.wrapping_add(b, v1)
+                r1 = g
+                r2 = b
+            } else {
+                if third == 1 {
+                    r2 = core.wrapping_add(v2, v0)
+                }
+                if second == 1 {
+                    r1 = core.wrapping_add(v1, v0)
+                } else if second == 2 {
+                    r1 = core.wrapping_add(v1, core.wrapping_add(v0, r2) >> 1)
+                }
+            }
+            a[q0 + x] = r0
+            a[q1 + x] = r1
+            a[q2 + x] = r2
+        }
+    }
+}
+
+// The palette value of `index` for component c (implicit entries
+// included).
+fn palette_value(a: &[i32], meta_off: usize, meta_stride: usize, size: i64, index: i64, c: usize, bit_depth: u32) -> i64 {
+    if index < 0 {
+        if c >= 3 {
+            return 0
+        }
+        i := -(index + 1)
+        i = i % 143
+        entry := ((i + 1) >> 1) as usize
+        v := DELTA_PALETTE[entry * 3 + c] as i64
+        if (i & 1) == 0 {
+            v = -v
+        }
+        if bit_depth > 8 {
+            v = v << ((bit_depth - 8) as i64)
+        }
+        return v
+    }
+    if index >= size {
+        if c >= 3 {
+            return 0
+        }
+        i := index - size
+        full := (1i64 << (bit_depth as i64)) - 1
+        if i < 64 {
+            i = i >> ((2 * c) as i64)
+            extra := 0i64
+            if bit_depth >= 3 {
+                extra = 1i64 << ((bit_depth - 3) as i64)
+            } else {
+                extra = 1
+            }
+            return (((i % 4) * full) >> 2) + extra
+        }
+        i -= 64
+        if c == 1 {
+            i = i / 5
+        } else if c == 2 {
+            i = i / 25
+        }
+        return ((i % 5) * full) >> 2
+    }
+    return a[meta_off + c * meta_stride + index as usize] as i64
+}
+
+fn inverse_palette(work: &mut ModularWork, ch: &mut ChanList, stash: &mut ChanList, begin: usize, num_c: usize, nb_colours: i32, nb_deltas: i32, d_pred: i32, wp_params: &[i32], bits: u32) -> void!pixels.Error {
+    if ch.count < 2 || ch.nb_meta < 1 || begin + 1 >= ch.count || stash.count + 1 < num_c {
+        return err(pixels.Error.Malformed)
+    }
+    meta_off := ch.offset(0)
+    meta_stride := ch.stride(0)
+    size := ch.width(0) as i64
+    c0 := begin + 1
+    if c0 >= ch.nb_meta {
+        ch.nb_meta -= 1
+    } else {
+        if ch.nb_meta + num_c < 2 {
+            return err(pixels.Error.Malformed)
+        }
+        ch.nb_meta = ch.nb_meta + num_c - 2
+    }
+    ch.remove(0)
+    // Members back after the index channel.
+    first := stash.count - (num_c - 1)
+    for k in 0usize..num_c - 1 {
+        ch.insert(begin + 1 + k)?
+        stash.copy_to(first + k, ch, begin + 1 + k)
+    }
+    stash.count = first
+    bit_depth := bits
+    if bit_depth > 24 {
+        bit_depth = 24
+    }
+    w := ch.width(begin)
+    h := ch.height(begin)
+    if w == 0 || h == 0 {
+        return ok()
+    }
+    index_off := ch.offset(begin)
+    index_stride := ch.stride(begin)
+    if nb_deltas == 0 && d_pred == 0 && num_c == 1 {
+        for y in 0usize..h {
+            row := index_off + y * index_stride
+            for x in 0usize..w {
+                index := work.arena[row + x] as i64
+                if size == 0 {
+                    work.arena[row + x] = 0
+                    continue
+                }
+                if index < 0 {
+                    index = 0
+                }
+                if index > size - 1 {
+                    index = size - 1
+                }
+                work.arena[row + x] = work.arena[meta_off + index as usize]
+            }
+        }
+        return ok()
+    }
+    use_wp := d_pred == 6
+    if use_wp && (w > work.wp_err.len || w * 4 > work.wp_sub.len) {
+        return err(pixels.Error.TooLarge)
+    }
+    // Components 1.. first, then component 0 in place over the indices.
+    for step in 0usize..num_c {
+        c := step + 1
+        if c == num_c {
+            c = 0
+        }
+        out_off := ch.offset(begin + c)
+        out_stride := ch.stride(begin + c)
+        wp := Wp.new(w, wp_params)
+        if use_wp {
+            reset_wp_rows(work.wp_err, work.wp_sub, w)
+        }
+        for y in 0usize..h {
+            for x in 0usize..w {
+                index := work.arena[index_off + y * index_stride + x] as i64
+                value := palette_value(work.arena, meta_off, meta_stride, size, index, c, bit_depth)
+                if index < nb_deltas as i64 || use_wp {
+                    p := out_off + y * out_stride + x
+                    left := 0i64
+                    if x > 0 {
+                        left = work.arena[p - 1] as i64
+                    } else if y > 0 {
+                        left = work.arena[p - out_stride] as i64
+                    }
+                    top := left
+                    if y > 0 {
+                        top = work.arena[p - out_stride] as i64
+                    }
+                    topleft := left
+                    if x > 0 && y > 0 {
+                        topleft = work.arena[p - out_stride - 1] as i64
+                    }
+                    topright := top
+                    if x + 1 < w && y > 0 {
+                        topright = work.arena[p - out_stride + 1] as i64
+                    }
+                    toptop := top
+                    if y > 1 {
+                        toptop = work.arena[p - 2 * out_stride] as i64
+                    }
+                    leftleft := left
+                    if x > 1 {
+                        leftleft = work.arena[p - 2] as i64
+                    }
+                    toprightright := topright
+                    if x + 2 < w && y > 0 {
+                        toprightright = work.arena[p - out_stride + 2] as i64
+                    }
+                    if use_wp {
+                        wp.predict(top, topleft, topright, left, toptop)
+                    }
+                    if index < nb_deltas as i64 {
+                        value += predict(d_pred, left, top, topleft, topright, toptop, leftleft, toprightright, wp.prediction)
+                    }
+                }
+                stored := wrap_i32(value)
+                work.arena[out_off + y * out_stride + x] = stored
+                if use_wp {
+                    wp.record(stored as i64, work.wp_err, work.wp_sub)
+                }
+            }
+        }
+    }
+    return ok()
+}
+
+fn tendency(a: i64, b: i64, c: i64) -> i64 {
+    if a >= b && b >= c {
+        x := (4 * a - 3 * c - b + 6) / 12
+        if x - (x & 1) > 2 * (a - b) {
+            x = 2 * (a - b) + 1
+        }
+        if x + (x & 1) > 2 * (b - c) {
+            x = 2 * (b - c)
+        }
+        return x
+    }
+    if a <= b && b <= c {
+        x := (4 * a - 3 * c - b - 6) / 12
+        if x + (x & 1) < 2 * (a - b) {
+            x = 2 * (a - b) - 1
+        }
+        if x - (x & 1) < 2 * (b - c) {
+            x = 2 * (b - c)
+        }
+        return x
+    }
+    return 0
+}
+
+fn inverse_squeeze(work: &mut ModularWork, ch: &mut ChanList, begin: usize, num_c: usize, horizontal: bool, in_place: bool) -> void!pixels.Error {
+    end := begin + num_c
+    if end > ch.count || ch.count < num_c * 2 {
+        return err(pixels.Error.Malformed)
+    }
+    residuals := ch.count - num_c
+    if in_place {
+        residuals = end
+    }
+    if residuals + num_c > ch.count || residuals < end {
+        return err(pixels.Error.Malformed)
+    }
+    for i in 0usize..num_c {
+        c := begin + i
+        rc := residuals + i
+        off := ch.offset(c)
+        stride := ch.stride(c)
+        w1 := ch.width(c)
+        h1 := ch.height(c)
+        if horizontal {
+            w2 := ch.width(rc)
+            if ch.offset(rc) != off + w1 || ch.height(rc) != h1 || w2 > w1 || w1 > w2 + 1 {
+                return err(pixels.Error.Malformed)
+            }
+            total := w1 + w2
+            if total > work.temp.len {
+                return err(pixels.Error.TooLarge)
+            }
+            for y in 0usize..h1 {
+                row := off + y * stride
+                for x in 0usize..total {
+                    work.temp[x] = work.arena[row + x]
+                }
+                avg := work.temp[0] as i64
+                left := avg
+                for x in 0usize..w2 {
+                    next_avg := avg
+                    if x + 1 < w1 {
+                        next_avg = work.temp[x + 1] as i64
+                    }
+                    diff := work.temp[w1 + x] as i64 + tendency(left, avg, next_avg)
+                    first := avg + diff / 2
+                    second := first - diff
+                    work.arena[row + 2 * x] = wrap_i32(first)
+                    work.arena[row + 2 * x + 1] = wrap_i32(second)
+                    avg = next_avg
+                    left = second
+                }
+                if (total & 1) == 1 {
+                    work.arena[row + total - 1] = work.temp[w1 - 1]
+                }
+            }
+            hs := ch.hshift(c)
+            if hs >= 1 {
+                hs -= 1
+            }
+            vs := ch.vshift(c)
+            ch.set(c, off, stride, total, h1, hs, vs)
+        } else {
+            h2 := ch.height(rc)
+            if ch.offset(rc) != off + h1 * stride || ch.width(rc) != w1 || h2 > h1 || h1 > h2 + 1 {
+                return err(pixels.Error.Malformed)
+            }
+            total := h1 + h2
+            if total > work.temp.len {
+                return err(pixels.Error.TooLarge)
+            }
+            for x in 0usize..w1 {
+                for y in 0usize..total {
+                    work.temp[y] = work.arena[off + y * stride + x]
+                }
+                avg := work.temp[0] as i64
+                top := avg
+                for y in 0usize..h2 {
+                    next_avg := avg
+                    if y + 1 < h1 {
+                        next_avg = work.temp[y + 1] as i64
+                    }
+                    diff := work.temp[h1 + y] as i64 + tendency(top, avg, next_avg)
+                    first := avg + diff / 2
+                    second := first - diff
+                    work.arena[off + 2 * y * stride + x] = wrap_i32(first)
+                    work.arena[off + (2 * y + 1) * stride + x] = wrap_i32(second)
+                    avg = next_avg
+                    top = second
+                }
+                if (total & 1) == 1 {
+                    work.arena[off + (total - 1) * stride + x] = work.temp[h1 - 1]
+                }
+            }
+            vs := ch.vshift(c)
+            if vs >= 1 {
+                vs -= 1
+            }
+            hs := ch.hshift(c)
+            ch.set(c, off, stride, w1, total, hs, vs)
+        }
+    }
+    for i in 0usize..num_c {
+        ch.remove(residuals)
+    }
+    if begin < ch.nb_meta {
+        if ch.nb_meta < num_c {
+            return err(pixels.Error.Malformed)
+        }
+        ch.nb_meta -= num_c
+    }
+    return ok()
+}
