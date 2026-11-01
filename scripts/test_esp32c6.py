@@ -9,6 +9,13 @@ to be wired to the board, and no button needs to be pressed.
 Requires ld.lld. Usage:
 
     python3 scripts/test_esp32c6.py [--dodo target/debug/dodo] [-O LEVEL ...] [--port PORT]
+                                    [--project DIR]
+
+`--project` runs another firmware project that follows the same protocol;
+its checks are then named by number only. The script holds an exclusive
+lock on the board (DODO_ESP32C6_LOCK, default /tmp/dodo-esp32c6.lock) from
+flashing until the result is read, so several runs, from several checkouts,
+take turns instead of flashing over each other.
 
 The self-test (tests/hardware/esp32c6_devkitc/main.dodo) waits for this
 script to send a byte, so no output is lost before the port is open, then
@@ -17,6 +24,7 @@ prints one line per check, `check N ok` or `check N FAILED`, and finally
 CHECK_NAMES and exits nonzero if any failed.
 """
 import argparse
+import fcntl
 import os
 import re
 import select
@@ -123,14 +131,23 @@ def find_port():
     return None
 
 
-def run(dodo, optimization, port):
+def run(dodo, optimization, port, project=SELFTEST):
+    lock = open(os.environ.get("DODO_ESP32C6_LOCK", "/tmp/dodo-esp32c6.lock"), "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        return run_locked(dodo, optimization, port, project)
+    finally:
+        lock.close()
+
+
+def run_locked(dodo, optimization, port, project):
     env = dict(os.environ)
     if port:
         env["DODO_SERIAL_PORT"] = port
-    command = [dodo, "run", str(SELFTEST)]
+    command = [dodo, "run", str(project)]
     if optimization:
         command += ["-O", optimization]
-    subprocess.run(command, check=True, cwd=SELFTEST, env=env)
+    subprocess.run(command, check=True, cwd=project, env=env)
     port = port or find_port()
     if not port:
         sys.exit("no ESP32-C6 USB serial port found after flashing")
@@ -179,17 +196,20 @@ def main():
     parser.add_argument("--dodo", default=str(ROOT / "target/debug/dodo"))
     parser.add_argument("-O", dest="levels", action="append", default=[])
     parser.add_argument("--port", help="the board's serial port (default: found by USB ID)")
+    parser.add_argument("--project", type=Path, default=SELFTEST,
+                        help="the firmware project to run (default: the self-test)")
     args = parser.parse_args()
     failed = False
     for level in args.levels or [""]:
         label = f"-O {level}" if level else "default optimization"
         print(f"== ESP32-C6-DevKitC-1 self-test, {label}")
-        text = run(args.dodo, level, args.port)
+        text = run(args.dodo, level, args.port, args.project.resolve())
+        names = CHECK_NAMES if args.project.resolve() == SELFTEST else []
         results = {}
         for match in re.finditer(r"check (\d+) (ok|FAILED)", text):
             results[int(match.group(1))] = match.group(2) == "ok"
         for number in sorted(results):
-            name = CHECK_NAMES[number] if number < len(CHECK_NAMES) else f"check {number}"
+            name = names[number] if number < len(names) else f"check {number}"
             status = "ok" if results[number] else "FAILED"
             print(f"  {number:2} {status:6} {name}")
             failed |= not results[number]
@@ -206,7 +226,7 @@ def main():
             print("  no result: the self-test hung; its output was:")
             print("    " + text.replace("\n", "\n    "))
             failed = True
-        elif int(done.group(1)) != len(CHECK_NAMES):
+        elif names and int(done.group(1)) != len(names):
             print(f"  ran {done.group(1)} checks, expected {len(CHECK_NAMES)}")
             failed = True
     sys.exit(1 if failed else 0)
