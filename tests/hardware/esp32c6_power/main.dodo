@@ -1,0 +1,647 @@
+package main
+
+import "core/mem"
+import "std/embedded/board"
+import "std/embedded/chip"
+import "std/embedded/executor"
+import "std/embedded/hal"
+import "std/embedded/power"
+import "std/fmt"
+
+// Hardware checks of the ESP32-C6's low power, std/embedded/chip/esp32c6's
+// Power as `Board.power`: clock gating (a stopped peripheral stops,
+// essential and claimed clocks are refused, claiming starts clocks again),
+// light sleep (the CPU's clock stops in `wfi`, alarms wake it on time),
+// deep sleep under an alarm, an executor, and a GPIO interrupt (clocks
+// outside the sleep set stop), and the dormant state (a level already
+// present, a timeout, and a pin that changes while the chip sleeps).
+// Nothing needs to be wired to the board: the pin wake comes from a pad's
+// sleep configuration (IO MUX SLP_SEL), a pull-down that takes over once
+// the chip sleeps.
+//
+// Results go to the chip's USB serial port, which
+// `scripts/test_esp32c6.py --project tests/hardware/esp32c6_power
+// --reconnect` reads: after the host sends a byte, `selftest ready`, then
+// `check N ok` or `check N FAILED` per check, and `selftest done N`. The
+// dormant checks drop the USB connection, so the program prints `selftest
+// waiting`, the host lets go of the port, the checks run, the port comes
+// back, and after another byte from the host `selftest resumed` and their
+// results follow.
+
+static mut CHECKS: u32 = 0
+static mut SERIAL: Option<chip.UsbSerial> = none
+// Results of the checks that run while the port is released, in LP SRAM:
+// the number of checks before them, then counts, results, and notes, one
+// word each.
+const RESULTS: usize = 0x5000_3E00
+const RESULT_WORDS: usize = 16
+static mut GPIO_EDGES: u32 = 0
+
+fn say_number(text: &str, value: u32) {
+    unsafe {
+        match &mut SERIAL {
+            some(serial) => {
+                fmt.printf(serial, "{}{}\n", text, value)!
+                serial.flush()!
+            }
+            none => {}
+        }
+    }
+}
+
+fn say(text: &str) {
+    unsafe {
+        match &mut SERIAL {
+            some(serial) => {
+                fmt.printf(serial, "{}", text)!
+                serial.flush()!
+            }
+            none => {}
+        }
+    }
+}
+
+fn flags(text: &str, a: bool, b: bool, c: bool, d: bool, e: bool, f: bool) {
+    value := 0u32
+    all := [a, b, c, d, e, f]
+    for index in 0usize..6 {
+        if all[index] {
+            value |= 1u32 << index as u32
+        }
+    }
+    say_number(text, value)
+}
+
+fn check(ok: bool) {
+    unsafe {
+        match &mut SERIAL {
+            some(serial) => {
+                if ok {
+                    fmt.printf(serial, "check {} ok\n", CHECKS)!
+                } else {
+                    fmt.printf(serial, "check {} FAILED\n", CHECKS)!
+                }
+                serial.flush()!
+            }
+            none => {}
+        }
+        CHECKS += 1
+    }
+}
+
+// Record a check's result while the port is released.
+fn check_later(ok: bool) {
+    count := read(RESULTS + 8) as usize
+    value := 0u32
+    if ok {
+        value = 1
+    }
+    write(RESULTS + 16 + 4 * count, value)
+    write(RESULTS + 8, (count + 1) as u32)
+}
+
+fn note(value: u32) {
+    count := read(RESULTS + 12) as usize
+    if count < RESULT_WORDS {
+        write(RESULTS + 16 + 4 * (RESULT_WORDS + count), value)
+        write(RESULTS + 12, (count + 1) as u32)
+    }
+}
+
+// Report the dormant checks once the host has the port again.
+fn report_results(b: &mut board.Board) {
+    open_serial(b)
+    say("selftest resumed\n")
+    unsafe {
+        CHECKS = read(RESULTS + 4)
+    }
+    notes := read(RESULTS + 12) as usize
+    for index in 0usize..notes {
+        say_number("note ", read(RESULTS + 16 + 4 * (RESULT_WORDS + index)))
+    }
+    later := read(RESULTS + 8) as usize
+    for index in 0usize..later {
+        check(read(RESULTS + 16 + 4 * index) == 1)
+    }
+    // Every gate open, as the PCR's reset leaves them.
+    b.power.enable_clocks(chip.ALL_CLOCKS)
+    unsafe {
+        say_number("selftest done ", CHECKS)
+    }
+}
+
+fn refused<T>(result: T!hal.Error, expected: hal.Error) -> bool {
+    match result {
+        ok(_) => {
+            return false
+        }
+        err(error) => {
+            return error == expected
+        }
+    }
+}
+
+fn failed_with(result: void!hal.Error, expected: hal.Error) -> bool {
+    match result {
+        ok() => {
+            return false
+        }
+        err(error) => {
+            return error == expected
+        }
+    }
+}
+
+fn read(address: usize) -> u32 {
+    unsafe {
+        register: hal.Reg<u32> = hal.Reg.at(address)
+        return register.read()
+    }
+}
+
+fn write(address: usize, value: u32) {
+    unsafe {
+        register: hal.Reg<u32> = hal.Reg.at(address)
+        register.write(value)
+    }
+}
+
+// The CPU's cycle counter: custom CSRs on the ESP32-C6.
+fn start_cycles() {
+    unsafe {
+        asm("csrw 0x7e0, {0}", in(reg) 1u32)
+        asm("csrw 0x7e1, {0}", in(reg) 1u32)
+        asm("csrw 0x7e2, {0}", in(reg) 0u32)
+    }
+}
+
+fn cycles() -> u32 {
+    unsafe {
+        return asm("csrr {0}, 0x7e2", out(reg) u32)
+    }
+}
+
+// Timer group 1's timer 0, counting microseconds from the crystal: a
+// peripheral whose count shows whether its clocks ran.
+const TIMG1: usize = 0x6000_9000
+
+fn start_timg1() {
+    write(TIMG1 + 0xFC, read(TIMG1 + 0xFC) | (1u32 << 30) | (1u32 << 31))
+    write(TIMG1 + 0x00, (1u32 << 31) | (1u32 << 30) | (40u32 << 13))
+}
+
+fn timg1_us() -> u32 {
+    write(TIMG1 + 0x0C, 1u32 << 31)
+    for _ in 0..1000 {
+        if (read(TIMG1 + 0x0C) & (1u32 << 31)) == 0 {
+            break
+        }
+    }
+    return read(TIMG1 + 0x04)
+}
+
+// Free pins on the DevKitC-1.
+const PIN_A: u32 = 10
+const PIN_B: u32 = 11
+const PIN_C: u32 = 18
+
+@interrupt(GPIO)
+fn gpio_edge() {
+    unsafe {
+        GPIO_EDGES += 1
+    }
+    // Clear PIN_C's latched edge.
+    write(0x6009_104C, 1u32 << PIN_C)
+}
+
+// Progress through the dormant checks, in LP SRAM, which a reset keeps:
+// should one hang (the LP watchdog below then resets the chip), the next
+// run prints where it stopped.
+const PROGRESS: usize = 0x5000_3F40
+
+fn dormant_crumb(value: u32) {
+    write(PROGRESS, 0xD0D0_0000 | value)
+}
+
+fn clock_checks(b: &mut board.Board) {
+    // Defaults, and validation.
+    p := &mut b.power
+    enabled := p.enabled_clocks()
+    check(p.mode() == power.Mode.Sleep && p.sleep_clocks() == chip.ALL_CLOCKS && (enabled & chip.ESSENTIAL_CLOCKS) == chip.ESSENTIAL_CLOCKS)
+    essential := failed_with(p.disable_clocks(chip.CLOCK_MSPI), hal.Error.InvalidInput) && failed_with(p.disable_clocks(chip.CLOCK_USB_DEVICE | chip.CLOCK_TIMG1), hal.Error.InvalidInput)
+    unknown := failed_with(p.disable_clocks(1u64 << 60), hal.Error.InvalidInput)
+    // The LED's driver claims the RMT.
+    claimed := failed_with(p.disable_clocks(chip.CLOCK_RMT), hal.Error.Busy)
+    timg1_on := (p.enabled_clocks() & chip.CLOCK_TIMG1) == chip.CLOCK_TIMG1
+    flags("refusals ", essential, unknown, claimed, timg1_on, true, true)
+    check(essential && unknown && claimed && timg1_on)
+
+    // A stopped peripheral stops counting; started again, it continues.
+    start_timg1()
+    first := timg1_us()
+    b.timer.delay_us(1000)
+    running := timg1_us() - first
+    p.disable_clocks(chip.CLOCK_TIMG1)!
+    off := (p.enabled_clocks() & chip.CLOCK_TIMG1) == 0
+    b.timer.delay_us(1000)
+    p.enable_clocks(chip.CLOCK_TIMG1)
+    resumed := timg1_us()
+    stopped := resumed - first - running
+    b.timer.delay_us(1000)
+    again := timg1_us() - resumed
+    say_number("timg1 us running ", running)
+    say_number("timg1 us while stopped ", stopped)
+    say_number("timg1 us restarted ", again)
+    check(off && running >= 990 && running < 1100 && stopped < 100 && again >= 990 && again < 1100)
+
+    // The system timer: with its clocks stopped, its count stands still.
+    alarm_free := (p.enabled_clocks() & chip.CLOCK_SYSTIMER) == chip.CLOCK_SYSTIMER
+    p.disable_clocks(chip.CLOCK_SYSTIMER)!
+    start_cycles()
+    for cycles() < 1_600_000 {}
+    p.enable_clocks(chip.CLOCK_SYSTIMER)
+    before := b.timer.now_us()
+    start_cycles()
+    for cycles() < 1_600_000 {}
+    after := b.timer.now_us()
+    say_number("systimer us over 10 ms of cycles ", (after - before) as u32)
+    check(alarm_free && after - before >= 9_900 && after - before < 10_200)
+
+    // Unused clocks stop; claiming a peripheral starts its clocks again.
+    before_unused := p.enabled_clocks()
+    say_number("enabled clocks low ", (before_unused & 0xFFFF_FFFF) as u32)
+    say_number("enabled clocks high ", (before_unused >> 32) as u32)
+    unused := p.disable_unused_clocks()
+    // The PCR keeps its gates through the flasher's reset, so what still
+    // runs depends on the previous program; turn on what this checks.
+    expected := chip.CLOCK_UART1 | chip.CLOCK_I2C0 | chip.CLOCK_SPI2 | chip.CLOCK_GDMA | chip.CLOCK_LEDC | chip.CLOCK_SARADC
+    p.enable_clocks(expected)
+    unused |= p.disable_unused_clocks()
+    stayed := (unused & (chip.CLOCK_RMT | chip.ESSENTIAL_CLOCKS | chip.CLOCK_SYSTIMER | chip.CLOCK_TIMG0)) == 0
+    say_number("unused clocks low ", (unused & 0xFFFF_FFFF) as u32)
+    say_number("unused clocks high ", (unused >> 32) as u32)
+    check((unused & expected) == expected && stayed && (p.enabled_clocks() & expected) == 0 && p.disable_unused_clocks() == 0)
+
+    i2c := b.pins.i2c(board.I2C_SDA_PIN, board.I2C_SCL_PIN, hal.I2C_STANDARD_HZ)!
+    byte: [1]u8 = [0]
+    nack := failed_with(i2c.read(0x7C, &mut byte), hal.Error.NoAcknowledge)
+    busy := failed_with(p.disable_clocks(chip.CLOCK_I2C0), hal.Error.Busy)
+    spi := b.pins.spi(board.SPI_CLOCK_PIN, board.SPI_TX_PIN, some(board.SPI_RX_PIN), hal.SpiMode.Mode0, 1_000_000)!
+    spi.set_loopback(true)
+    data: [4]u8 = [1u8, 2, 3, 4]
+    spi.transfer(&mut data)!
+    looped := data[0] == 1 && data[3] == 4
+    dma := b.dma.channel()!
+    source: [64]u8 = [7u8; 64]
+    target: [64]u8 = [0u8; 64]
+    dma.copy(&mut target, &source)!
+    copied := target[63] == 7
+    input := b.pins.analog(1)!
+    adc_ok := adc_reads(&mut input)
+    b.pins.release_analog(input)
+    running_again := (p.enabled_clocks() & (chip.CLOCK_I2C0 | chip.CLOCK_SPI2 | chip.CLOCK_GDMA)) == (chip.CLOCK_I2C0 | chip.CLOCK_SPI2 | chip.CLOCK_GDMA)
+    flags("claimed again ", nack, busy, looped, copied, adc_ok, running_again)
+    check(nack && busy && looped && copied && adc_ok && running_again)
+    b.pins.release_i2c(i2c)
+    b.pins.release_spi(spi)
+    b.dma.release(dma)
+    released := p.disable_unused_clocks()
+    say_number("released clocks low ", (released & 0xFFFF_FFFF) as u32)
+    say_number("released clocks high ", (released >> 32) as u32)
+    check((released & (chip.CLOCK_I2C0 | chip.CLOCK_SPI2 | chip.CLOCK_GDMA | chip.CLOCK_SARADC)) == (chip.CLOCK_I2C0 | chip.CLOCK_SPI2 | chip.CLOCK_GDMA | chip.CLOCK_SARADC))
+}
+
+fn adc_reads(input: &mut chip.Analog) -> bool {
+    match input.read() {
+        ok(value) => {
+            say_number("adc read ", value as u32)
+            return true
+        }
+        err(error) => {
+            say("adc read failed: ")
+            say(hal.error_name(error))
+            say("\n")
+            return false
+        }
+    }
+}
+
+fn sleep_checks(b: &mut board.Board) {
+    alarm := b.timer.alarm(0)!
+    // Light sleep: the CPU's clock stops in `wfi`, and the alarm wakes it
+    // on time.
+    alarm.sleep_until(some(b.timer.now_us() + 500))
+    start := b.timer.now_us()
+    start_cycles()
+    alarm.sleep_until(some(start + 1000))
+    counted := cycles()
+    slept := b.timer.now_us() - start
+    say_number("light sleep 1000 us took us ", slept as u32)
+    say_number("cycles counted while asleep ", counted)
+    check(slept >= 1000 && slept < 1030 && counted < 20_000)
+
+    // Deep sleep: clocks outside the sleep set stop while the core waits,
+    // and the alarm still wakes it on time.
+    p := &mut b.power
+    p.set_sleep_clocks(chip.ALARM_CLOCKS)
+    p.set_mode(power.Mode.DeepSleep)
+    deep := p.mode() == power.Mode.DeepSleep && p.sleep_clocks() == chip.ALARM_CLOCKS
+    start_timg1()
+    begin := timg1_us()
+    start = b.timer.now_us()
+    alarm.sleep_until(some(start + 5000))
+    slept = b.timer.now_us() - start
+    counted_deep := timg1_us() - begin
+    awake := (p.enabled_clocks() & chip.CLOCK_TIMG1) == chip.CLOCK_TIMG1
+    say_number("deep sleep 5000 us took us ", slept as u32)
+    say_number("timg1 us during deep sleep ", counted_deep)
+    check(deep && awake && slept >= 5000 && slept < 5100 && counted_deep < 500)
+
+    // In the sleep set, a clock keeps running through a deep sleep.
+    p.set_sleep_clocks(chip.ALARM_CLOCKS | chip.CLOCK_TIMG1)
+    begin = timg1_us()
+    start = b.timer.now_us()
+    alarm.sleep_until(some(start + 5000))
+    kept := timg1_us() - begin
+    say_number("timg1 us during deep sleep, kept ", kept)
+    check(kept >= 4900 && kept < 5300)
+
+    // An executor deep-sleeps between tasks and wakes on its alarm.
+    p.set_sleep_clocks(chip.ALARM_CLOCKS)
+    ticks := Ticks { ticker: executor.Ticker.every(1000), count: 0 }
+    runner := executor.Executor.new()
+    start = b.timer.now_us()
+    finished := false
+    {
+        tasks: [1]&mut dyn executor.Task = [&mut ticks]
+        finished = runner.run_until(&mut tasks, &mut alarm, start + 20_000)
+    }
+    elapsed := b.timer.now_us() - start
+    say_number("executor: 5 ticks of 1 ms in deep sleep took us ", elapsed as u32)
+    check(finished && ticks.count == 5 && elapsed >= 5000 && elapsed < 5500 && runner.sleeps() >= 5)
+
+    // A GPIO interrupt from a running peripheral ends a deep sleep: a PWM
+    // output's edges, read back through its pad.
+    pwm := b.pins.pwm(PIN_C, 1000)!
+    half := pwm.max_duty() / 2
+    pwm.set_duty(half)!
+    p.set_sleep_clocks(chip.ALARM_CLOCKS | chip.CLOCK_LEDC)
+    unsafe {
+        GPIO_EDGES = 0
+    }
+    // PIN_C: rising edge interrupt to the CPU, input enabled.
+    pad := 0x6009_0004 + 4 * PIN_C as usize
+    write(pad, read(pad) | (1u32 << 9))
+    pin_reg := 0x6009_1074 + 4 * PIN_C as usize
+    write(pin_reg, (read(pin_reg) & ~(0b111u32 << 7)) | (1u32 << 7) | (1u32 << 13))
+    write(0x6009_104C, 1u32 << PIN_C)
+    chip.enable(chip.GPIO)
+    start = b.timer.now_us()
+    section := hal.Critical.enter()
+    edges := unsafe {
+        GPIO_EDGES
+    }
+    if edges == 0 {
+        alarm.sleep_until(some(start + 50_000))
+    }
+    core.drop(section)
+    elapsed = b.timer.now_us() - start
+    chip.disable(chip.GPIO)
+    write(pin_reg, read(pin_reg) & ~((0b111u32 << 7) | (1u32 << 13)))
+    edges = unsafe {
+        GPIO_EDGES
+    }
+    say_number("deep sleep ended by GPIO after us ", elapsed as u32)
+    check(edges >= 1 && elapsed < 2000)
+    b.pins.release_pwm(pwm)
+
+    // Back to light sleep for the rest.
+    p.set_mode(power.Mode.Sleep)
+    p.set_sleep_clocks(chip.ALL_CLOCKS)
+    // One deep sleep that an alarm interrupt ends, taken with interrupts
+    // masked so no handler is needed.
+    section = hal.Critical.enter()
+    alarm.clear()
+    alarm.listen()
+    chip.enable(alarm.irq())
+    start = b.timer.now_us()
+    alarm.schedule_at(start + 1000)
+    power.deep_sleep(p, chip.ALARM_CLOCKS)
+    elapsed = b.timer.now_us() - start
+    alarm.cancel()
+    alarm.ignore()
+    alarm.clear()
+    chip.disable(alarm.irq())
+    core.drop(section)
+    say_number("power.deep_sleep with an alarm took us ", elapsed as u32)
+    check(p.mode() == power.Mode.Sleep && p.sleep_clocks() == chip.ALL_CLOCKS && elapsed >= 1000 && elapsed < 1100)
+    b.timer.release_alarm(alarm)
+}
+
+// Finishes on its fifth tick.
+struct Ticks {
+    ticker: executor.Ticker
+    count: u32
+
+    pub fn poll(&mut self, cx: &mut executor.Context) -> executor.Poll {
+        if self.ticker.ready(cx) {
+            self.count += 1
+            if self.count == 5 {
+                return executor.Poll.Ready
+            }
+        }
+        return executor.Poll.Pending
+    }
+}
+
+fn dormant_validation(p: &mut chip.Power) {
+    empty := power.Wake.new()
+    flash := power.Wake.new()
+    flash.on(24, power.LEVEL_LOW)
+    usb := power.Wake.new()
+    usb.on(12, power.LEVEL_LOW)
+    check(refused(p.dormant(&empty), hal.Error.InvalidInput) && refused(p.dormant(&flash), hal.Error.InvalidInput) && refused(p.dormant(&usb), hal.Error.InvalidInput))
+    // The port is open, and the host has it open.
+    connected := power.Wake.new()
+    connected.on(PIN_A, power.LEVEL_LOW)
+    check(refused(p.dormant(&connected), hal.Error.Busy))
+}
+
+// The LP watchdog, as a safety net while the chip goes dormant: should a
+// dormant state never end, its first stage resets the whole chip (RTC
+// reset) after about 3 s, instead of leaving the board unreachable.
+const LP_WDT: usize = 0x600B_1C00
+
+fn arm_safety_net() {
+    write(LP_WDT + 0x18, 0x50D8_3AA1)
+    write(LP_WDT + 0x04, 400_000)
+    write(LP_WDT + 0x00, (1u32 << 31) | (4u32 << 28) | (7u32 << 16) | (7u32 << 13))
+    write(LP_WDT + 0x14, 1u32 << 31)
+    write(LP_WDT + 0x18, 0)
+}
+
+fn disarm_safety_net() {
+    write(LP_WDT + 0x18, 0x50D8_3AA1)
+    write(LP_WDT + 0x00, 0)
+    write(LP_WDT + 0x18, 0)
+}
+
+// The dormant checks, with the USB serial port released.
+fn dormant_checks(b: &mut board.Board) {
+    arm_safety_net()
+    a := b.pins.input(PIN_A)!
+    a.set_pull(true, false)
+    bb := b.pins.input(PIN_B)!
+    bb.set_pull(true, false)
+    b.timer.delay_us(100)
+
+    // A level already present ends it at once.
+    present := power.Wake.new()
+    present.on(PIN_A, power.LEVEL_HIGH)
+    dormant_crumb(2)
+    woken := b.power.dormant(&present)
+    dormant_crumb(3)
+    check_later(woken_is(woken, 1u64 << PIN_A as u64))
+
+    // Nothing happens: the timeout ends it, the system timer pauses, the
+    // low-power timer counts on.
+    quiet := power.Wake.new()
+    quiet.on(PIN_A, power.FALLING_EDGE)
+    b.power.set_dormant_timeout_us(50_000)
+    rate := b.power.lp_rate()
+    lp_start := b.power.lp_ticks()
+    start := b.timer.now_us()
+    dormant_crumb(4)
+    woken = b.power.dormant(&quiet)
+    dormant_crumb(5)
+    hp_elapsed := b.timer.now_us() - start
+    lp_elapsed := (b.power.lp_ticks() - lp_start) * 10_000 / rate
+    note(rate as u32)
+    note(hp_elapsed as u32)
+    note(lp_elapsed as u32)
+    // The system timer misses the time dormant; afterwards the USB port
+    // is attached again (100 ms), which both timers count.
+    missed := 0u64
+    if lp_elapsed > hp_elapsed {
+        missed = lp_elapsed - hp_elapsed
+    }
+    check_later(woken_is(woken, 0) && missed >= 49_000 && missed < 53_000 && lp_elapsed < 200_000)
+
+    // A pin event in the middle: PIN_B's pad switches to its sleep
+    // configuration (IO MUX SLP_SEL), a pull-down, once the chip sleeps,
+    // and its low level wakes it.
+    pad := 0x6009_0004 + 4 * PIN_B as usize
+    saved := read(pad)
+    write(pad, saved | (1u32 << 1) | (1u32 << 2) | (1u32 << 4))
+    low := power.Wake.new()
+    low.on(PIN_B, power.LEVEL_LOW)
+    b.power.set_dormant_timeout_us(200_000)
+    lp_start = b.power.lp_ticks()
+    dormant_crumb(6)
+    start = b.timer.now_us()
+    woken = b.power.dormant(&low)
+    dormant_crumb(7)
+    hp_elapsed = b.timer.now_us() - start
+    lp_elapsed = (b.power.lp_ticks() - lp_start) * 10_000 / rate
+    missed = 0
+    if lp_elapsed > hp_elapsed {
+        missed = lp_elapsed - hp_elapsed
+    }
+    cause := read(0x600B_0140)
+    write(pad, saved)
+    note(missed as u32)
+    note(cause)
+    bits := woken_bits(woken)
+    note(bits)
+    check_later(bits != 0xEEEE_0000 && missed < 20_000 && (cause & (1u32 << 2)) != 0)
+
+    // The clocks are back: the CPU runs at 160 MHz.
+    begin := b.timer.now_us()
+    start_cycles()
+    b.timer.delay_ms(10)
+    counted := cycles()
+    elapsed := b.timer.now_us() - begin
+    note(counted)
+    check_later(counted > 1_580_000 && counted < 1_620_000 && elapsed >= 10_000 && elapsed < 10_100)
+    b.power.set_dormant_timeout_us(0)
+    b.pins.release(a)
+    b.pins.release(bb)
+    disarm_safety_net()
+}
+
+fn woken_is(result: u64!hal.Error, expected: u64) -> bool {
+    match result {
+        ok(pins) => {
+            return pins == expected
+        }
+        err(_) => {
+            return false
+        }
+    }
+}
+
+fn woken_bits(result: u64!hal.Error) -> u32 {
+    match result {
+        ok(pins) => {
+            return pins as u32
+        }
+        err(error) => {
+            return 0xEEEE_0000
+        }
+    }
+}
+
+fn open_serial(b: &mut board.Board) {
+    serial := b.usb.serial()!
+    // Wait for the host's byte, so no output is lost before the port is
+    // open.
+    poke: [1]u8 = [0]
+    serial.read(&mut poke)!
+    for _ in 0..5000 {
+        if serial.is_connected() {
+            break
+        }
+        b.timer.delay_ms(1)
+    }
+    serial.set_crlf(true)
+    unsafe {
+        SERIAL = some(serial)
+    }
+}
+
+fn close_serial(b: &mut board.Board) {
+    taken := unsafe {
+        mem.replace(&mut SERIAL, none)
+    }
+    match taken {
+        some(serial) => {
+            b.usb.release_serial(serial)
+        }
+        none => {}
+    }
+}
+
+fn main() {
+    b := board.take()!
+    open_serial(&mut b)
+    say("selftest ready\n")
+    say_number("previous dormant progress ", read(PROGRESS))
+    write(PROGRESS, 0)
+    clock_checks(&mut b)
+    sleep_checks(&mut b)
+    dormant_validation(&mut b.power)
+    // The dormant checks drop the USB connection: the host lets go of the
+    // port, they run with it released, and once the port is attached to
+    // the host again they are reported.
+    say("selftest waiting: the dormant checks run with the port released\n")
+    b.timer.delay_ms(500)
+    close_serial(&mut b)
+    unsafe {
+        write(RESULTS + 4, CHECKS)
+    }
+    write(RESULTS + 8, 0)
+    write(RESULTS + 12, 0)
+    dormant_checks(&mut b)
+    dormant_crumb(8)
+    report_results(&mut b)
+}

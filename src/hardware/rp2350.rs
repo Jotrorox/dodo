@@ -6,13 +6,14 @@
 //! cores, the default.
 use std::borrow::Cow;
 
-use super::{Chip, ImageFormat, Platform, Region, image::Segment, serial::UsbId};
+use super::{Chip, ImageFormat, InterruptAbi, Platform, Region, image::Segment, serial::UsbId};
 
 pub static CHIP: Chip = Chip {
     name: "rp2350",
     description: "Raspberry Pi RP2350",
     triple: "thumbv8m.main-none-eabi",
     cpu: "cortex-m33",
+    features: "",
     flash_origin: 0x1000_0000,
     default_flash_size: 4 * 1024 * 1024,
     ram: Region {
@@ -88,6 +89,7 @@ pub static CHIP: Chip = Chip {
         "POWMAN_IRQ_POW",
         "POWMAN_IRQ_TIMER",
     ],
+    interrupt_abi: InterruptAbi::Vector,
     opt_level: 0,
     linker: "ld.lld",
     package: "std/embedded/chip/rp2350",

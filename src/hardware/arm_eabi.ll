@@ -1,6 +1,7 @@
-; Arm EABI runtime helpers shared by the Cortex-M chip runtimes. The compiler
-; appends this file to a chip's startup runtime (see `src/hardware/CHIP.rs`),
-; so it is compiled for that chip's target and CPU.
+; Arm EABI runtime helpers shared by the Cortex-M chip runtimes, and by the
+; ESP32-C6's, which calls the same GNU names. The compiler appends this file
+; to a chip's startup runtime (see `src/hardware/CHIP.rs`), so it is
+; compiled for that chip's target and CPU.
 ;
 ; memcpy, memmove, memset, memcmp, bcmp and the integer division,
 ; multiplication, and shift helpers that LLVM calls, under both their GNU and
@@ -246,11 +247,26 @@ define weak { i32, i32 } @__aeabi_idivmod(i32 %n, i32 %d) #0 {
 
 ; ---------------------------------------------------------------------------
 ; 64-bit division, the same algorithm. Only constant 64-bit shifts are used,
-; which Armv6-M lowers inline.
+; which Armv6-M lowers inline. Operands that both fit in 32 bits, as most
+; do, take one 32-bit division instead: an instruction on the RP2350 and the
+; ESP32-C6, and half the steps of this loop through __udivsi3 on the RP2040.
 
 define internal { i64, i64 } @udivmod64(i64 %n, i64 %d) #0 {
 entry:
-  br label %loop
+  %both = or i64 %n, %d
+  %small = icmp ult i64 %both, 4294967296
+  br i1 %small, label %narrow, label %loop
+narrow:
+  %n32 = trunc i64 %n to i32
+  %d32 = trunc i64 %d to i32
+  %q32 = udiv i32 %n32, %d32
+  %product = mul i32 %q32, %d32
+  %r32 = sub i32 %n32, %product
+  %q.narrow = zext i32 %q32 to i64
+  %r.narrow = zext i32 %r32 to i64
+  %narrow.q = insertvalue { i64, i64 } poison, i64 %q.narrow, 0
+  %narrow.result = insertvalue { i64, i64 } %narrow.q, i64 %r.narrow, 1
+  ret { i64, i64 } %narrow.result
 loop:
   %i = phi i32 [ 64, %entry ], [ %i.next, %loop ]
   %num = phi i64 [ %n, %entry ], [ %num.next, %loop ]

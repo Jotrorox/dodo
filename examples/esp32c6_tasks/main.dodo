@@ -1,0 +1,150 @@
+package main
+
+import "std/embedded/board"
+import "std/embedded/chip"
+import "std/embedded/executor"
+import "std/embedded/peripheral/esp_usb_serial"
+import "std/fmt"
+
+// Three tasks share the ESP32-C6's core with std/embedded/executor, and it
+// sleeps whenever none of them has work:
+//
+// - the RGB LED steps through a color wheel ten times a second;
+// - the BOOT button counts presses, ignoring the contacts' bounce, woken by
+//   the GPIO interrupt;
+// - a console on the USB serial port echoes what is typed, answers each
+//   line with the uptime, and reports button presses, woken by the port's
+//   interrupt and by the button task.
+//
+// Flash it and open the port the board's USB connector appears as:
+//
+//     dodo run examples/esp32c6_tasks
+//     picocom /dev/ttyACM0
+//
+// (`screen /dev/cu.usbmodem*` on macOS). Interrupt handlers do the least
+// they can: stop routing their interrupt and raise a signal. The task that
+// owns the peripheral then does the work and routes the interrupt again,
+// so peripherals stay owned by one task and need no `static mut`.
+
+const DEBOUNCE_MS: u32 = 50
+const NEWLINE: u8 = 0x0A
+
+// Signals, numbered for the whole program.
+const TYPED: executor.Signal = executor.Signal { id: 0 }
+const BUTTON: executor.Signal = executor.Signal { id: 1 }
+const PRESSES: executor.Signal = executor.Signal { id: 2 }
+
+@interrupt(USB_DEVICE)
+fn typed() {
+    chip.disable(chip.USB_DEVICE)
+    TYPED.raise()
+}
+
+@interrupt(GPIO)
+fn button_edge() {
+    chip.disable(chip.GPIO)
+    BUTTON.raise()
+}
+
+// The LED walks round a dim color wheel.
+struct Wheel {
+    led: &mut board.Led
+    ticker: executor.Ticker
+    step: u32
+
+    pub fn poll(&mut self, cx: &mut executor.Context) -> executor.Poll {
+        if self.ticker.ready(cx) {
+            self.step = (self.step + 1) % 48
+            self.led.set_color(wheel(self.step))
+        }
+        return executor.Poll.Pending
+    }
+}
+
+// A color of 48 around red, green, and blue, at a sixteenth of full
+// brightness.
+fn wheel(step: u32) -> u32 {
+    part := step % 16
+    if step < 16 {
+        return ((15 - part) << 16) | (part << 8)
+    } else if step < 32 {
+        return ((15 - part) << 8) | part
+    }
+    return (part << 16) | (15 - part)
+}
+
+// Counts presses of the BOOT button, which pulls GPIO 9 low.
+struct Button {
+    pin: chip.Pin
+    debounce: executor.Timer
+    presses: u32
+
+    pub fn poll(&mut self, cx: &mut executor.Context) -> executor.Poll {
+        if BUTTON.take(cx) {
+            // Ignore the bounce of the contacts, then look again.
+            self.debounce.start_ms(cx, DEBOUNCE_MS)
+        }
+        if self.debounce.expired(cx) {
+            if !self.pin.is_high() {
+                self.presses += 1
+                PRESSES.send(self.presses)
+            }
+            self.pin.clear_events(chip.FALLING_EDGE)
+            chip.enable(chip.GPIO)
+        }
+        return executor.Poll.Pending
+    }
+}
+
+// Echoes lines typed on the USB serial port and answers them.
+struct Console {
+    serial: chip.UsbSerial
+    line: [64]u8
+    length: usize
+
+    pub fn poll(&mut self, cx: &mut executor.Context) -> executor.Poll {
+        if let some(presses) = PRESSES.receive(cx) {
+            fmt.printf(&mut self.serial, "\nbutton pressed {} times\n> ", presses)!
+        }
+        if TYPED.take(cx) {
+            buffer: [16]u8 = [0; 16]
+            got := self.serial.poll_read(&mut buffer)!
+            for index in 0..got.transferred {
+                byte := buffer[index]
+                if byte == NEWLINE {
+                    fmt.printf(&mut self.serial, "\n{} bytes at {} ms\n> ", self.length, cx.now_us() / 1000)!
+                    self.length = 0
+                } else if self.length < 64 {
+                    self.line[self.length] = byte
+                    self.length += 1
+                    echo: [1]u8 = [byte]
+                    self.serial.write(&echo)!
+                }
+            }
+            self.serial.clear_interrupts(esp_usb_serial.RX_INTERRUPT)
+            chip.enable(chip.USB_DEVICE)
+        }
+        return executor.Poll.Pending
+    }
+}
+
+fn main() {
+    b := board.take()!
+    serial := b.usb.serial()!
+    serial.set_crlf(true)
+    fmt.printf(&mut serial, "{}: type a line, or press BOOT\n> ", board.NAME)!
+    serial.listen(esp_usb_serial.RX_INTERRUPT)
+    chip.enable(chip.USB_DEVICE)
+
+    pin := b.pins.input(board.BUTTON_PIN)!
+    pin.set_pull(true, false)
+    pin.listen(chip.FALLING_EDGE)
+    chip.enable(chip.GPIO)
+
+    clock := b.timer.alarm(0)!
+    wheel_task := Wheel { led: &mut b.led, ticker: executor.Ticker.every_ms(100), step: 0 }
+    button := Button { pin, debounce: executor.Timer.new(), presses: 0 }
+    console := Console { serial, line: [0; 64], length: 0 }
+    tasks: [3]&mut dyn executor.Task = [&mut wheel_task, &mut button, &mut console]
+    executor.run(&mut tasks, &mut clock)
+}

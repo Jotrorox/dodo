@@ -1,0 +1,319 @@
+package esp_watchdog
+
+import "std/embedded/hal"
+
+// The ESP32-C6's watchdog, with the API of rp_watchdog: once started, it
+// resets the chip unless the program feeds it within its timeout, so
+// firmware that hangs restarts instead of staying stuck. The chip package
+// hands it out as `Peripherals.watchdog`, stopped, and boards as
+// `Board.watchdog`. Timeouts run from 1 ms to MAX_TIMEOUT_MS, an hour, in
+// steps of 10 us.
+//
+// Which watchdog. The ESP32-C6 has three: the main system watchdog timers
+// (MWDT) of timer groups 0 and 1, and the RTC watchdog (RWDT) in the
+// low-power domain. This is timer group 0's MWDT (TIMG0 WDTCONFIG0 to
+// WDTWPROTECT), with stage 0 set to reset the system: the CPU, the
+// high-performance peripherals and SRAM, and the cache and flash
+// controller, but not the USB serial port's controller, whose connection
+// to the host stays up. The boot ROM then starts the flashed firmware by
+// direct boot, as at power up, and prints its boot banner (rst:0x7,
+// TG0_WDT_HPSYS) on that connection. The MWDT counts the 40 MHz crystal, so its timeouts are exact without
+// calibrating a clock, and it sits in the high-performance domain, so every
+// reset stops it, including the one `dodo run` and other flashers send
+// through the USB serial port to start the ROM's download mode. The RWDT,
+// in contrast, keeps running through that reset, and the ROM's download
+// mode does not stop it, so a running RWDT would reset the chip in the
+// middle of flashing it. The low-power domain, with the real-time clock
+// and the scratch words, survives the MWDT's reset. The compiler's runtime
+// turns all three watchdogs off at boot, before `main`.
+//
+// A panic halts the program with interrupts masked; the watchdog keeps
+// counting, so a panic while it runs ends in a reset that reads as Timeout,
+// as on the RP chips. The count does not pause while a debugger halts the
+// core.
+//
+// Reset reasons. `reset_reason` derives the cause of the last reset from
+// LP_CLKRST RESET_CAUSE, which reads 0x07 after an MWDT0 reset. The boot
+// ROM arms the same watchdog in its flash boot protection, so, as rp_watchdog
+// does, `start` and `restart` leave a mark in LP_AON STORE0 that the chip's
+// take() reads and clears: an MWDT0 reset reads as Timeout, or as Restart
+// after `restart`, only with that mark. Every other reset, among them
+// power-up, the reset pin, `esp32c6.restart` and `reboot_to_bootloader`,
+// a debugger, and flashing, reads as Other.
+//
+// Scratch words. The two `scratch` words are LP_AON STORE2 and STORE3,
+// in the always-on domain, so they survive every reset but losing power.
+// The boot ROM keeps its own flags in STORE4 to STORE9: the crystal
+// frequency and log settings, the deep sleep wake stub (STORE5 to STORE7),
+// and a light sleep wake address it jumps to at every boot (STORE8 and
+// STORE9); ESP-IDF keeps the RTC clock's calibration in STORE1. Neither
+// the ROM nor the compiler's runtime touches STORE0, STORE2, or STORE3.
+//
+// `Countdown` drives the watchdog over any hal.Registers: hal.RegisterBlocks
+// at TIMG0 and LP_AON on the chip, or simulated registers in a desktop test.
+// The chip package hands out a `Watchdog`, the countdown on the chip. Both
+// implement hal.Watchdog.
+
+// Timer group registers, from the group's base.
+const WDTCONFIG0: usize = 0x48
+const WDTCONFIG1: usize = 0x4C
+const WDTCONFIG2: usize = 0x50
+const WDTFEED: usize = 0x60
+const WDTWPROTECT: usize = 0x64
+
+// WDTCONFIG0: count, stage 0's action, latch the configuration, count the
+// crystal, the lengths of the reset pulses, and the flash boot protection.
+const WDT_EN: u32 = 1 << 31
+const STAGE0: u32 = 0b11 << 29
+const UPDATE: u32 = 1 << 22
+const USE_XTAL: u32 = 1 << 21
+const CPU_RESET_LENGTH: u32 = 0b111 << 18
+const SYS_RESET_LENGTH: u32 = 0b111 << 15
+// Stage actions: reset the system.
+const RESET_SYSTEM: u32 = 3
+// WDTCONFIG1: the clock's prescaler, and restart its divider.
+const PRESCALE: u32 = 0xFFFF << 16
+const DIVIDER_RESET: u32 = 1 << 0
+// WDTWPROTECT: the key that unlocks the watchdog's registers.
+const KEY: u32 = 0x50D8_3AA1
+
+// The 40 MHz crystal divided by 400: one count every 10 us.
+const CRYSTAL_DIVIDER: u32 = 400
+const COUNTS_PER_MS: u32 = 100
+
+// The longest timeout `start` accepts, in milliseconds: an hour.
+pub const MAX_TIMEOUT_MS: u32 = 3_600_000
+
+// LP_AON registers, from its base: the mark, and the scratch words.
+const MARK: usize = 0x00
+const SCRATCH0: usize = 0x08
+pub const SCRATCH_WORDS: u32 = 2
+
+// Marks: the watchdog runs, or restart() is resetting the chip.
+const STARTED: u32 = 0x6AB7_3121
+const RESTARTING: u32 = 0x6AB7_3122
+
+// LP_CLKRST RESET_CAUSE's cause of a timer group 0 watchdog reset.
+pub const CAUSE_MWDT0: u32 = 0x07
+
+// Reason codes: Other, Timeout, and Restart.
+const OTHER: u32 = 0
+const TIMEOUT: u32 = 1
+const RESTART: u32 = 2
+
+// The watchdog over any hal.Registers. Implements hal.Watchdog.
+pub struct Countdown<R: hal.Registers>: hal.Watchdog {
+    timer: R
+    store: R
+    // Microseconds on a clock that counts on while the watchdog does.
+    clock: fn() -> u64
+    // The timeout `start` was last given, 0 before.
+    timeout_ms: u32
+    // When it was last started or fed, on `clock`.
+    fed_at_us: u64
+    // Why the chip last reset, read by `new`.
+    reason: u32
+
+    // The watchdog of the timer group with registers `timer`, stopped, with
+    // its mark and scratch words in `store`, LP_AON's registers. `cause` is
+    // the cause of the last reset from LP_CLKRST RESET_CAUSE; with the mark
+    // it gives reset_reason(), and the mark is then cleared. `clock` reads
+    // microseconds, for remaining_us().
+    // SAFETY: the group's watchdog clock must count the 40 MHz crystal,
+    // and only this Countdown may use the group's watchdog registers and
+    // LP_AON STORE0, STORE2, and STORE3.
+    pub unsafe fn new(timer: R, store: R, cause: u32, clock: fn() -> u64) -> Countdown<R> {
+        countdown := Countdown<R> { timer, store, clock, timeout_ms: 0, fed_at_us: 0, reason: OTHER }
+        countdown.stop()
+        mark := countdown.store.read(MARK)
+        if cause == CAUSE_MWDT0 {
+            if mark == STARTED {
+                countdown.reason = TIMEOUT
+            } else if mark == RESTARTING {
+                countdown.reason = RESTART
+            }
+        }
+        countdown.store.write(MARK, 0)
+        return countdown
+    }
+
+    // Start counting down from `timeout_ms` milliseconds, or restart with
+    // this timeout if it runs already. InvalidInput for 0 or more than
+    // max_timeout_ms().
+    pub fn start(&mut self, timeout_ms: u32) -> void!hal.Error {
+        if timeout_ms == 0 || timeout_ms > MAX_TIMEOUT_MS {
+            return err(hal.Error.InvalidInput)
+        }
+        self.timeout_ms = timeout_ms
+        self.store.write(MARK, STARTED)
+        self.run(timeout_ms * COUNTS_PER_MS)
+        return ok()
+    }
+
+    // Count down from the timeout again. Does nothing while stopped.
+    pub fn feed(&mut self) {
+        if self.timeout_ms != 0 && self.is_running() {
+            self.timer.write(WDTWPROTECT, KEY)
+            self.timer.write(WDTFEED, 1)
+            self.timer.write(WDTWPROTECT, 0)
+            clock := self.clock
+            self.fed_at_us = clock()
+        }
+    }
+
+    // Stop counting down. The chip is no longer reset, until `start`.
+    pub fn stop(&mut self) {
+        self.timer.write(WDTWPROTECT, KEY)
+        self.timer.write(WDTCONFIG0, 0)
+        self.timer.write(WDTCONFIG0, UPDATE)
+        self.timer.write(WDTWPROTECT, 0)
+    }
+
+    // True from `start` until `stop`.
+    pub fn is_running(&mut self) -> bool {
+        return (self.timer.read(WDTCONFIG0) & WDT_EN) != 0
+    }
+
+    // The timeout `start` was last given, in milliseconds; 0 before.
+    pub fn timeout_ms(&self) -> u32 {
+        return self.timeout_ms
+    }
+
+    // The longest timeout `start` accepts: MAX_TIMEOUT_MS, an hour.
+    pub fn max_timeout_ms(&self) -> u32 {
+        return MAX_TIMEOUT_MS
+    }
+
+    // Microseconds until the watchdog resets the chip, if it is running;
+    // 0 while it is stopped. The watchdog's count cannot be read, so this
+    // counts from the last `start` or `feed` on the clock.
+    pub fn remaining_us(&mut self) -> u32 {
+        if self.timeout_ms == 0 || !self.is_running() {
+            return 0
+        }
+        clock := self.clock
+        elapsed := clock() - self.fed_at_us
+        total := self.timeout_ms as u64 * 1000
+        if elapsed >= total {
+            return 0
+        }
+        return (total - elapsed) as u32
+    }
+
+    // Why the chip last reset: Timeout if this watchdog was not fed in
+    // time or a panic halted the program while it ran, Restart after
+    // `restart`, and Other after power-up, the reset pin, a software reset,
+    // a debugger, or flashing.
+    pub fn reset_reason(&self) -> hal.ResetReason {
+        if self.reason == TIMEOUT {
+            return hal.ResetReason.Timeout
+        } else if self.reason == RESTART {
+            return hal.ResetReason.Restart
+        }
+        return hal.ResetReason.Other
+    }
+
+    // Scratch word `index`, below SCRATCH_WORDS: whatever the program last
+    // stored there, before or after any reset; 0 after power-up. Traps for
+    // another index.
+    pub fn scratch(&mut self, index: u32) -> u32 {
+        core.assert(index < SCRATCH_WORDS)
+        return self.store.read(SCRATCH0 + 4 * index as usize)
+    }
+
+    // Store `value` in scratch word `index`, below SCRATCH_WORDS, where it
+    // survives every reset but losing power. Traps for another index.
+    pub fn set_scratch(&mut self, index: u32, value: u32) {
+        core.assert(index < SCRATCH_WORDS)
+        self.store.write(SCRATCH0 + 4 * index as usize, value)
+    }
+
+    // Reset the chip through the watchdog now, as a timeout would but
+    // within 10 us, whether it is running or not. reset_reason() then reads
+    // Restart. On the chip the reset follows; this returns only to a
+    // simulation.
+    pub fn restart(&mut self) {
+        self.store.write(MARK, RESTARTING)
+        self.run(1)
+    }
+
+    // Configure stage 0 to reset the system after `counts` of 10 us, and
+    // start counting from 0.
+    fn run(&mut self, counts: u32) {
+        config := WDT_EN | hal.encode(STAGE0, RESET_SYSTEM) | USE_XTAL | CPU_RESET_LENGTH | SYS_RESET_LENGTH
+        self.timer.write(WDTWPROTECT, KEY)
+        self.timer.write(WDTCONFIG0, 0)
+        self.timer.write(WDTCONFIG0, UPDATE)
+        self.timer.write(WDTCONFIG1, hal.encode(PRESCALE, CRYSTAL_DIVIDER) | DIVIDER_RESET)
+        self.timer.write(WDTCONFIG2, counts)
+        self.timer.write(WDTFEED, 1)
+        self.timer.write(WDTCONFIG0, config)
+        self.timer.write(WDTCONFIG0, config | UPDATE)
+        self.timer.write(WDTWPROTECT, 0)
+        clock := self.clock
+        self.fed_at_us = clock()
+    }
+}
+
+// The watchdog on the chip: a Countdown over TIMG0's and LP_AON's
+// registers, which the chip package hands out. Implements hal.Watchdog.
+pub struct Watchdog: hal.Watchdog {
+    countdown: Countdown<hal.RegisterBlock>
+
+    // Countdown.new over the timer group at `timer_base` and LP_AON at
+    // `store_base`.
+    // SAFETY: as for Countdown.new.
+    pub unsafe fn at(timer_base: usize, store_base: usize, cause: u32, clock: fn() -> u64) -> Watchdog {
+        unsafe {
+            timer := hal.RegisterBlock.at(timer_base)
+            store := hal.RegisterBlock.at(store_base)
+            return Watchdog { countdown: Countdown.new(timer, store, cause, clock) }
+        }
+    }
+
+    pub fn start(&mut self, timeout_ms: u32) -> void!hal.Error {
+        return self.countdown.start(timeout_ms)
+    }
+
+    pub fn feed(&mut self) {
+        self.countdown.feed()
+    }
+
+    pub fn stop(&mut self) {
+        self.countdown.stop()
+    }
+
+    pub fn is_running(&mut self) -> bool {
+        return self.countdown.is_running()
+    }
+
+    pub fn timeout_ms(&self) -> u32 {
+        return self.countdown.timeout_ms()
+    }
+
+    pub fn max_timeout_ms(&self) -> u32 {
+        return self.countdown.max_timeout_ms()
+    }
+
+    pub fn remaining_us(&mut self) -> u32 {
+        return self.countdown.remaining_us()
+    }
+
+    pub fn reset_reason(&self) -> hal.ResetReason {
+        return self.countdown.reset_reason()
+    }
+
+    pub fn scratch(&mut self, index: u32) -> u32 {
+        return self.countdown.scratch(index)
+    }
+
+    pub fn set_scratch(&mut self, index: u32, value: u32) {
+        self.countdown.set_scratch(index, value)
+    }
+
+    // Reset the chip through the watchdog now. Does not return.
+    pub fn restart(&mut self) {
+        self.countdown.restart()
+        for {}
+    }
+}

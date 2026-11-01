@@ -1064,6 +1064,7 @@ fn chip_runtimes_provide_startup_and_helper_symbols() {
         let options = dodoc::codegen::Options {
             target: Some(chip.triple.into()),
             cpu: Some(chip.cpu.into()),
+            features: chip.features.into(),
             optimization: 2,
             ..Default::default()
         };
@@ -1074,22 +1075,42 @@ fn chip_runtimes_provide_startup_and_helper_symbols() {
             "Reset_Handler",
             chip.panic_hook,
             "dodo_panic_report",
-            "USBCTRL_IRQ",
             "dodo_usb_interrupt",
-            "DMA_IRQ_0",
             "dodo_dma_interrupt",
-            "FifoHandler",
-            "dodo_fifo_interrupt",
-            "dodo_core_id",
-            "dodo_core1_trampoline",
-            "dodo_core1_entry",
             "dodo_flash_erase",
             "dodo_flash_program",
             "dodo_flash_image_end",
             "dodo_flash_end",
             "memcpy",
             "memset",
+            "__udivdi3",
         ] {
+            assert!(text.contains(name), "{} runtime lacks {name}", chip.name);
+        }
+        let own: &[&str] = if chip.name.starts_with("rp") {
+            &[
+                "USBCTRL_IRQ",
+                "DMA_IRQ_0",
+                "FifoHandler",
+                "dodo_fifo_interrupt",
+                "dodo_core_id",
+                "dodo_core1_trampoline",
+                "dodo_core1_entry",
+            ]
+        } else {
+            &[
+                ".boot_header",
+                "__vector_table",
+                "dodo_trap_interrupt",
+                "dodo_trap_exception",
+                "dodo_interrupt_table",
+                "dodo_esp32c6_flash_setup",
+                "Exception_Handler",
+                "USB_DEVICE",
+                "DMA_IN_CH0",
+            ]
+        };
+        for name in own {
             assert!(text.contains(name), "{} runtime lacks {name}", chip.name);
         }
     }
@@ -2158,6 +2179,227 @@ fn main() {
             ]));
         }
     }
+}
+
+fn check_esp32c6_firmware(elf: &Path) {
+    let bytes = fs::read(elf).unwrap();
+    let image = fs::read(elf.with_extension("bin")).unwrap();
+    // RISC-V, entered by the boot ROM's direct boot at flash + 8, after the
+    // marker, which is the ELF's entry.
+    assert_eq!(u16::from_le_bytes([bytes[0x12], bytes[0x13]]), 0xF3);
+    assert_eq!(word(&image, 0), 0xAEDB_041D);
+    assert_eq!(word(&image, 4), 0xAEDB_041D);
+    assert_eq!(word(&bytes, 0x18), 0x4200_0008);
+    assert_eq!(elf_symbol(&bytes, "Reset_Handler"), Some(0x4200_0008));
+    // The vectored trap table mtvec needs, and the routed sources' table.
+    let vector = elf_symbol(&bytes, "__vector_table").expect("trap vector");
+    assert_eq!(vector % 256, 0);
+    assert!(elf_symbol(&bytes, "dodo_interrupt_table").is_some());
+    // The flash setup runs from SRAM, where the image's .data puts it.
+    let setup = elf_symbol(&bytes, "dodo_esp32c6_flash_setup").expect("flash setup");
+    assert!((0x4080_0000..0x4088_0000).contains(&setup), "{setup:#x}");
+    assert!(image.len() < 8 * 1024 * 1024);
+}
+
+fn build_esp32c6(args: &[&str]) {
+    let output = dodo(args);
+    let message = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(output.status.success(), "{args:?}: {message}");
+    assert!(message.contains(".bin"), "{message}");
+}
+
+#[test]
+fn esp32c6_projects_link_to_flashable_firmware() {
+    if !ld_lld() {
+        return;
+    }
+    let scratch = Scratch::new("link-esp32c6");
+    let blink = root().join("examples/blink");
+    let tasks = root().join("examples/esp32c6_tasks");
+    let selftest = root().join("tests/hardware/esp32c6_devkitc");
+    let can_audio = root().join("tests/hardware/esp32c6_can_audio");
+    for (project, name, board) in [
+        (&blink, "blink", &["--board", "esp32c6_devkitc"][..]),
+        (&tasks, "tasks", &[][..]),
+        (&selftest, "selftest", &[][..]),
+        (&can_audio, "can-audio", &[][..]),
+    ] {
+        for level in ["0", "2"] {
+            let elf = scratch.path(&format!("{name}-O{level}.elf"));
+            let mut args = vec!["build", project.to_str().unwrap(), "-O", level, "-o", &elf];
+            args.extend(board);
+            build_esp32c6(&args);
+            check_esp32c6_firmware(Path::new(&elf));
+        }
+    }
+    // The portable examples, unchanged: drivers tested with fakes on the
+    // board's buses, an ADC input and a PWM output, displays, and the
+    // serial consoles.
+    for name in [
+        "hal_sensor_board",
+        "dimmer_board",
+        "thermometer_board",
+        "oled_demo",
+        "serial_console",
+        "usb_serial",
+    ] {
+        let source = root().join(format!("examples/{name}.dodo"));
+        for level in ["0", "2"] {
+            let elf = scratch.path(&format!("{name}-O{level}.elf"));
+            build_esp32c6(&[
+                "build",
+                source.to_str().unwrap(),
+                "--board",
+                "esp32c6_devkitc",
+                "-O",
+                level,
+                "-o",
+                &elf,
+            ]);
+            check_esp32c6_firmware(Path::new(&elf));
+        }
+    }
+    // A custom board with only `chip` set, and the default panic hook's
+    // reporter, which the chip package defines.
+    let custom = scratch.write(
+        "custom.dodo",
+        "package main\nimport \"std/embedded/chip\"\nfn main() {\n p := chip.take()!\n led := p.pins.output(15)!\n led.set_high()\n}\n",
+    );
+    let elf = scratch.path("custom.elf");
+    build_esp32c6(&[
+        "build",
+        custom.to_str().unwrap(),
+        "--chip",
+        "esp32c6",
+        "-o",
+        &elf,
+    ]);
+    check_esp32c6_firmware(Path::new(&elf));
+    let bytes = fs::read(&elf).unwrap();
+    assert!(elf_symbol(&bytes, "dodo_panic_report").is_some());
+    assert!(elf_symbol(&bytes, "dodo_board_panic").is_some());
+}
+
+// The ESP32-C6 runtime saves the registers and calls `@interrupt` handlers
+// as ordinary functions, so they return with `ret`, not `mret`, and names
+// come from the chip's interrupt sources.
+#[test]
+fn esp32c6_interrupt_handlers_are_plain_functions() {
+    let scratch = Scratch::new("esp32c6-interrupts");
+    let source = scratch.write(
+        "main.dodo",
+        "package main\nimport \"std/embedded/chip\"\nstatic mut COUNT: u32 = 0\n@interrupt(GPIO)\nfn edge() {\n    unsafe {\n        COUNT += 1\n    }\n}\nfn main() {\n    chip.enable(chip.GPIO)\n}\n",
+    );
+    let assembly = scratch.path("main.s");
+    stdout(&dodo(&[
+        "build",
+        source.to_str().unwrap(),
+        "--board",
+        "esp32c6_devkitc",
+        "-O",
+        "2",
+        "--emit",
+        "asm",
+        "-o",
+        &assembly,
+    ]));
+    let text = fs::read_to_string(&assembly).unwrap();
+    let handler = text.split("\nGPIO:").nth(1).expect("exported handler");
+    let body = handler.split(".Lfunc_end").next().unwrap();
+    assert!(text.contains(".globl\tGPIO"), "{text}");
+    assert!(body.contains("\tret") && !body.contains("mret"), "{body}");
+
+    let wrong = scratch.write(
+        "wrong.dodo",
+        "package main\n@interrupt(UART0_IRQ)\nfn serial() {}\nfn main() {}\n",
+    );
+    let error = stderr(&dodo(&[
+        "check",
+        wrong.to_str().unwrap(),
+        "--board",
+        "esp32c6_devkitc",
+    ]));
+    assert!(
+        error.contains("unknown interrupt vector `UART0_IRQ` for this chip"),
+        "{error}"
+    );
+}
+
+// Board settings, atomics with the A extension, and the chip's packages.
+#[test]
+fn esp32c6_settings_and_packages_check() {
+    let blink = root().join("examples/blink");
+    let config = stdout(&dodo(&[
+        "build",
+        blink.to_str().unwrap(),
+        "--board",
+        "esp32c6_devkitc",
+        "--print-config",
+    ]));
+    for line in [
+        "triple = \"riscv32-unknown-none-elf\" # board esp32c6_devkitc",
+        "cpu = \"generic-rv32\" # board esp32c6_devkitc",
+        "features = \"+m,+a,+c\" # board esp32c6_devkitc",
+        "panic-hook = \"dodo_board_panic\" # board esp32c6_devkitc",
+    ] {
+        assert!(config.contains(line), "{line}\n{config}");
+    }
+    let scratch = Scratch::new("esp32c6-check");
+    let source = scratch.write(
+        "main.dodo",
+        r#"package main
+import "std/embedded/board"
+import "std/embedded/chip"
+import "std/embedded/hal"
+import "std/sync/atomic"
+static HITS: atomic.Atomic<u32> = atomic.Atomic.new(0u32)
+fn main() {
+    b := board.take()!
+    HITS.fetch_add(1, atomic.Ordering.AcqRel)!
+    i2c := b.pins.i2c(board.I2C_SDA_PIN, board.I2C_SCL_PIN, hal.I2C_FAST_HZ)!
+    spi := b.pins.spi(board.SPI_CLOCK_PIN, board.SPI_TX_PIN, some(board.SPI_RX_PIN), hal.SpiMode.Mode0, 8_000_000)!
+    serial := b.pins.uart(board.UART_TX_PIN, some(board.UART_RX_PIN), 115_200)!
+    output := b.pins.pwm(10, 50)!
+    hal.set_pulse_us(&mut output, 1500, 20_000)!
+    input := b.pins.analog(2)!
+    millivolts := hal.read_millivolts(&mut input, 3300)!
+    sensor := b.pins.temperature()!
+    celsius := chip.millicelsius(sensor.read()!) / 1000
+    channel := b.dma.channel()!
+    source: [4]u8 = [1, 2, 3, 4]
+    target: [4]u8 = [0; 4]
+    channel.copy(&mut target, &source)!
+    usb := b.usb.serial()!
+    b.led.set_color(0x00_10_00)
+    core.assert(millivolts <= 3300 && celsius > -40)
+    b.pins.release_i2c(i2c)
+    b.pins.release_spi(spi)
+    b.pins.release_uart(serial)
+    b.pins.release_pwm(output)
+    b.pins.release_analog(input)
+    b.pins.release_analog(sensor)
+    b.dma.release(channel)
+    b.usb.release_serial(usb)
+}
+"#,
+    );
+    stdout(&dodo(&[
+        "check",
+        source.to_str().unwrap(),
+        "--board",
+        "esp32c6_devkitc",
+    ]));
+    let object = scratch.path("main.o");
+    stdout(&dodo(&[
+        "build",
+        source.to_str().unwrap(),
+        "--board",
+        "esp32c6_devkitc",
+        "--emit",
+        "obj",
+        "-o",
+        &object,
+    ]));
 }
 
 #[test]

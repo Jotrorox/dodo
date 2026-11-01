@@ -467,6 +467,8 @@ fn load_internal(
     program.imports.dedup();
     program.interrupt_vectors = platform.map(|platform| platform.chip.interrupts);
     program.pio_version = platform.and_then(|platform| platform.chip.pio_version);
+    program.dispatched_interrupts = platform
+        .is_some_and(|platform| platform.chip.interrupt_abi == hardware::InterruptAbi::Dispatched);
     program.executor_prefix = prefixes
         .get(&ModuleId::Bundled("std/embedded/executor".to_owned()))
         .cloned();
