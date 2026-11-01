@@ -1,0 +1,46 @@
+package main
+
+import "checks"
+import "std/embedded/board"
+import "std/embedded/chip"
+import "std/fmt"
+
+// Arduino Uno self-test, part two: the runtime's 64-bit integer and binary64
+// helpers, with nothing wired to the board; see core.dodo for the
+// reporting.
+
+fn main() {
+    b := board.take()!
+    serial := b.usb.serial()!
+    fmt.printf(&mut serial, "\nselftest {} wide\n", board.NAME)!
+    wide_checks(&mut serial)
+    double_checks(&mut serial)
+    fmt.printf(&mut serial, "fmt {} {}\n", 18_446_744_073_709_551_615u64, -9_223_372_036_854_775_807i64)!
+    checks.finish(&mut serial)
+}
+
+@inline(never)
+fn wide_checks(out: &mut chip.Serial) {
+    wide := checks.opaque64(0x0123_4567_89AB_CDEF) / checks.opaque64(0x1_0000_0001)
+    remainder := checks.opaque64(0x0123_4567_89AB_CDEF) % checks.opaque64(0x1_0000_0001)
+    checks.check(out, wide == 0x0123_4567 && remainder == 0x8888_8888, "64-bit division", wide as u32)
+    wide_product := checks.opaque64(3_037_000_499) * checks.opaque64(3_037_000_499)
+    checks.check(out, wide_product == 9_223_372_030_926_249_001, "64-bit multiplication", (wide_product >> 32) as u32)
+    signed_wide := checks.opaque_i64(-9_000_000_000) / checks.opaque_i64(7)
+    checks.check(out, signed_wide == -1_285_714_285, "signed 64-bit division", 0)
+    shifted := checks.opaque64(1) << (checks.opaque32(40) as u64)
+    checks.check(out, shifted == 0x100_0000_0000, "64-bit shift", (shifted >> 32) as u32)
+}
+
+@inline(never)
+fn double_checks(out: &mut chip.Serial) {
+    precise := checks.opaque_f64(1.0) / checks.opaque_f64(3.0)
+    checks.check(out, precise * 3.0 == 1.0 && precise > 0.333333333333 && precise < 0.333333333334, "f64 is binary64", 0)
+    converted := (checks.opaque_f64(-12345.75) as i32)
+    widened := checks.opaque_i32(-7) as f64
+    checks.check(out, converted == -12345 && widened == -7.0, "f64 and integer conversions", 0)
+    narrowed := checks.opaque_f64(2.5) as f32
+    checks.check(out, narrowed == 2.5 && (narrowed as f64) == 2.5, "f32 and f64 conversions", 0)
+    sum := checks.opaque_f64(0.1) + checks.opaque_f64(0.2)
+    checks.check(out, sum > 0.30000000000000004 - 0.000000000000001 && sum != 0.3, "f64 addition rounds as binary64", 0)
+}

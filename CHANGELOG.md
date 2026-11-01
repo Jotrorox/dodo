@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+- Arduino Uno support: `board = "arduino_uno"` (or `--board arduino_uno`) on
+  the new `atmega328p` chip, an 8-bit AVR. `dodo run` flashes the board
+  itself through its Optiboot bootloader over the USB serial port, speaking
+  STK500 version 1 and verifying every page, so avrdude is not needed;
+  `dodo build` writes an `.elf` and an Intel HEX `.hex`.
+  `std/embedded/chip/atmega328p` and `std/embedded/board/arduino_uno` give the
+  board contract's pins, timer, serial port (with a 32-byte interrupt-driven
+  receive buffer), I2C, SPI, PWM on all six PWM pins, the ADC and temperature
+  sensor, the watchdog, and the EEPROM, and board-generic programs such as
+  `examples/blink` and `examples/serial_console.dodo` run unchanged. The
+  compiler's AVR runtime is LLVM IR like the others: startup, a Timer 0 time
+  base, libgcc-compatible division and multiplication helpers, atomics, and
+  correctly rounded `f32` (native 32-bit code) and `f64` arithmetic. Panic
+  messages stay in flash rather than the 2 KiB of SRAM. AVR builds default to
+  `-O 2` and optimize for size. `scripts/test_arduino_uno.py` runs the
+  board's self-test.
+- Function values on targets whose code has its own address space, such as
+  AVR, use that address space: function pointers, closures, `dyn` method
+  tables, and `@interrupt` handlers (which get AVR's signal ABI) compile for
+  AVR, and `core/cpu`'s interrupt control and `wait_for_interrupt` work there.
+
 - `std/window` has the basics desktop programs such as text editors need.
   `app.set_clipboard_text(text)` and `app.clipboard_text()` copy and paste
   text through the system clipboard (`NSPasteboard`, the Win32 clipboard,

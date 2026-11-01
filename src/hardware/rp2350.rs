@@ -4,6 +4,8 @@
 //!
 //! The RP2350 can also boot its Hazard3 RISC-V cores; Dodo builds for the Arm
 //! cores, the default.
+use std::borrow::Cow;
+
 use super::{Chip, ImageFormat, Platform, Region, image::Segment, serial::UsbId};
 
 pub static CHIP: Chip = Chip {
@@ -17,12 +19,14 @@ pub static CHIP: Chip = Chip {
         origin: 0x2000_0000,
         length: 520 * 1024,
     },
-    runtime: concat!(
-        include_str!("rp2350/runtime.ll"),
-        include_str!("arm_eabi.ll"),
-        include_str!("arm_float.ll"),
-        include_str!("rp2350/dcp.ll")
-    ),
+    runtime: || {
+        Cow::Borrowed(concat!(
+            include_str!("rp2350/runtime.ll"),
+            include_str!("arm_eabi.ll"),
+            include_str!("arm_float.ll"),
+            include_str!("rp2350/dcp.ll")
+        ))
+    },
     linker_script: include_str!("rp2350/link.ld"),
     panic_hook: "dodo_board_panic",
     interrupts: &[
@@ -84,6 +88,7 @@ pub static CHIP: Chip = Chip {
         "POWMAN_IRQ_POW",
         "POWMAN_IRQ_TIMER",
     ],
+    opt_level: 0,
     linker: "ld.lld",
     package: "std/embedded/chip/rp2350",
     image: ImageFormat::Uf2 {

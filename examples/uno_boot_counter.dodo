@@ -1,0 +1,48 @@
+package main
+
+import "std/embedded/board"
+import "std/embedded/chip"
+import "std/fmt"
+
+// Counts how often an Arduino Uno has started, in its EEPROM, which keeps
+// the count without power and across reflashing, and reports it on the USB
+// serial port together with the chip's temperature. Flash it and watch the
+// port (opening the port restarts the board, so each look counts once):
+//
+//     dodo run examples/uno_boot_counter.dodo --board arduino_uno
+//     screen /dev/cu.usbmodem* 115200
+//
+// The LED blinks the count, up to 10 times. The count sits in the EEPROM's
+// first four bytes; a fresh chip reads 0xFF there, which counts as 0.
+fn main() {
+    b := board.take()!
+    serial := b.usb.serial()!
+    stored: [4]u8 = [0u8; 4]
+    b.eeprom.read(0, &mut stored)!
+    boots := (stored[0] as u32) | (stored[1] as u32) << 8 | (stored[2] as u32) << 16 | (stored[3] as u32) << 24
+    if boots == 0xFFFF_FFFF {
+        boots = 0
+    }
+    boots += 1
+    for index in 0usize..4 {
+        stored[index] = ((boots >> (8 * index as u32)) & 255) as u8
+    }
+    // update writes only the bytes that change, sparing the EEPROM.
+    b.eeprom.update(0, &stored)!
+
+    sensor := b.pins.temperature()!
+    reading := sensor.read()!
+    celsius := chip.millicelsius(reading) / 1000
+    fmt.printf(&mut serial, "{} started {} times; chip at about {} C\n", board.NAME, boots, celsius)!
+
+    blinks := boots
+    if blinks > 10 {
+        blinks = 10
+    }
+    for _ in 0..blinks {
+        b.led.set_high()
+        b.timer.delay_ms(150)
+        b.led.set_low()
+        b.timer.delay_ms(250)
+    }
+}
