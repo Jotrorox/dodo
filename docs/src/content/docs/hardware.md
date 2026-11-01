@@ -17,10 +17,11 @@ grouped under `std/embedded` in layers, on top of two small compiler packages:
 | Typed registers | `std/embedded/hal` | `hal.Reg<T>` and `hal.RegisterBlock` handles and mask constants for memory-mapped registers. |
 | Interrupts | `std/embedded/hal`, `std/embedded/cortex_m` | `@interrupt` handlers; `hal.Critical`, a section that masks interrupts until it is dropped; `hal.Handler`, a slot for a handler chosen at run time; the Cortex-M interrupt controller and SysTick. |
 | Tasks | `std/embedded/executor` | Several activities on one core, each woken on time or by an interrupt, with the core asleep in between. |
+| Real-time clocks | `std/embedded/hal`, `std/embedded/chip/rp_rtc`, `std/embedded/rtc/ds3231` | `hal.Rtc` and `hal.RtcAlarm`: the time of day and an alarm, the same on the RP2040's RTC, the RP2350's always-on timer, and a DS3231 clock chip on I2C. |
 | Low power | `std/embedded/power` | Sleep and deep sleep, clock gating, and a dormant state woken by pins, through one `Power` protocol that every chip and the fakes implement. |
 | DMA | `std/embedded/hal`, `std/embedded/chip/rp_dma` | `hal.DmaChannel`, through which drivers move data while the program does other work; the RP2040's and RP2350's channels. |
-| Desktop testing | `std/embedded/hal/fake` | In-memory pins, delays, buses, serial ports, a simulated clock, and simulated power controls that record what a driver did. |
-| Boards | `std/embedded/board` | The selected board: one `take()` and the same LED, pin, and timer fields on every board. |
+| Desktop testing | `std/embedded/hal/fake` | In-memory pins, delays, buses, serial ports, a real-time clock, a simulated clock, and simulated power controls that record what a driver did. |
+| Boards | `std/embedded/board` | The selected board: one `take()` and the same LED, pin, timer, and clock fields on every board. |
 | Chip support | `std/embedded/chip` | The selected microcontroller's peripherals, for custom boards. |
 | Wireless chip | `std/embedded/wireless/cyw43` | The CYW43439 on the Pico 2 W: power-up, its gSPI bus, and its GPIO pins. |
 | CAN controllers | `std/embedded/can/mcp2515` | The MCP2515 CAN controller over SPI, as a `hal.Can`. |
@@ -100,6 +101,8 @@ methods implements it and can be passed where a driver expects it:
 | `hal.Spi` | `transfer(&mut self, bytes: &mut[u8]) -> void!hal.Error`<br>`write(&mut self, bytes: &[u8]) -> void!hal.Error` |
 | `hal.PwmOutput` | `max_duty(&self) -> u16`<br>`set_duty(&mut self, duty: u16) -> void!hal.Error` |
 | `hal.AnalogInput` | `max_value(&self) -> u16`<br>`read(&mut self) -> u16!hal.Error` |
+| `hal.Rtc` | `is_set(&mut self) -> bool!hal.Error`<br>`now_ms(&mut self) -> u64!hal.Error`<br>`set_ms(&mut self, time_ms: u64) -> void!hal.Error`<br>`resolution_ms(&self) -> u32` |
+| `hal.RtcAlarm` | `set_alarm_ms(&mut self, time_ms: u64) -> void!hal.Error`<br>`alarm_fired(&mut self) -> bool!hal.Error`<br>`clear_alarm(&mut self) -> void!hal.Error` |
 | Serial port | [`io.Reader` and `io.Writer`](io.md) from `std/io`; `serial.Port` adds `flush(&mut self) -> void!io.Error`. |
 | `hal.Registers` | `read(&mut self, offset: usize) -> u32`<br>`write(&mut self, offset: usize, value: u32)` |
 
@@ -116,7 +119,8 @@ way, with its frequency, and the protocol then only sets its duty cycle: the
 output is high for `duty / max_duty()` of each period, so 0 holds it low and
 `max_duty()` holds it high. An analog input reads 0 at ground and
 `max_value()`, such as 4095 for a 12-bit converter, at the converter's
-reference voltage. `hal.I2C_STANDARD_HZ`,
+reference voltage. A [real-time clock](#real-time-clocks) counts
+milliseconds since the Unix epoch. `hal.I2C_STANDARD_HZ`,
 `hal.I2C_FAST_HZ`, and `hal.I2C_FAST_PLUS_HZ` name the usual I2C speeds.
 The register block protocol is for [peripheral drivers](#register-blocks)
 rather than device drivers.
@@ -140,10 +144,10 @@ the device on an I2C or SPI bus, [pulse measurement](#measuring-pulses),
 [CAN](#can), [I2S audio](#i2s-audio), and [DMA buffer
 transfers](#transfers-in-the-background-dma).
 
-Pins, delays, and counters cannot fail. Alarm, bus, PWM, and analog
+Pins, delays, and counters cannot fail. Alarm, bus, PWM, analog, and clock
 operations return
 `hal.Error`, one shared enum, because such a device may itself sit on a bus,
-as a PWM controller chip on I2C does: `Timeout`, `NoAcknowledge`, `Bus`,
+as a PWM controller chip or a clock chip on I2C does: `Timeout`, `NoAcknowledge`, `Bus`,
 `Overrun`, `Busy`, `InvalidInput`, and `Unsupported`. Every driver and chip uses the same error type, so `?` passes
 errors through layers without conversions, and `==` compares them. Use
 `hal.error_name(error)` for a log message.
@@ -192,6 +196,9 @@ bus and a memory buffer.
 | `hal.set_duty_fraction(&mut output, numerator, denominator)` | Set a PWM duty cycle to a fraction, rounded to the nearest step. |
 | `hal.set_pulse_us(&mut output, pulse_us, period_us)` | Set a PWM pulse length, as for a servo: `set_pulse_us(&mut servo, 1500, 20_000)` centres one on a 50 Hz output. |
 | `hal.read_millivolts(&mut input, reference_mv)` | Read an analog input as millivolts. |
+| `hal.rtc_now(&mut clock)`, `hal.rtc_set(&mut clock, &date_time)` | Read or set a real-time clock as a UTC `time.DateTime`. |
+| `hal.rtc_alarm_at(&mut clock, &date_time)`, `hal.rtc_alarm_in(&mut clock, ms)` | Set a clock's alarm for a date and time, or some milliseconds from now. |
+| `hal.date_time_of_ms(ms)`, `hal.ms_of_date_time(&date_time)` | Convert between Unix milliseconds and a `time.DateTime`. |
 | `hal.SpiDevice<P>` | One SPI device and its chip-select pin; see below. |
 | `hal.BlockingI2c<B>`, `hal.BlockingSpi<B>` | The blocking protocol over a polling bus; see [polling](#polling-instead-of-waiting). |
 | `hal.capture(&mut input, polls)` | Wait for a pulse measurement. |
@@ -644,6 +651,89 @@ it, and the stream implements `hal.DmaBuffer`. The peripheral's driver turns
 the peripheral's DMA requests on and off around it. `hal.dma_copy(&mut
 channel, &mut destination, &source)` copies memory with any channel.
 
+### Real-time clocks
+
+A real-time clock keeps the time of day in a counter that runs while the
+processor sleeps, and sometimes through resets or on a backup battery. The
+protocol is the same whatever counts: `hal.Rtc` reads and sets the time
+as milliseconds since the Unix epoch, 1970-01-01 00:00:00 UTC, the count a
+[`time.Timestamp`](time.md) holds, and `hal.RtcAlarm` fires once when the
+clock reaches a time. Every chip below implements both, so a program
+that keeps time moves between them unchanged:
+
+| Clock | Counts | Range | Keeps time |
+| --- | --- | --- | --- |
+| `rp2040.Rtc`, `b.rtc` on the Pico | Seconds | Years 1970 to 4095 | While the chip is powered; a reset stops it. |
+| `rp2350.Rtc`, `b.rtc` on the Pico 2 and Pico 2 W | Milliseconds | 64 bits | Through resets that leave the always-on power domain running, such as the watchdog's. |
+| `ds3231.Clock` on any `hal.I2c` | Seconds | Years 2000 to 2099 | On its backup battery while the board is off. |
+| `fake.Rtc` | Milliseconds, or coarser steps | 64 bits | As a test says. |
+
+A clock runs only once its time is set. Until then, and again after it lost
+power, `is_set()` is false and `now_ms()` reports `Busy`, so firmware sets the
+clock once, from the network, a GPS, or the user, and later boots keep the
+time where the clock allows it. A clock that counts whole seconds reports whole
+seconds; `resolution_ms()` says how long a step is, and `set_ms` rounds
+down to one.
+
+`hal.rtc_now` and `hal.rtc_set` convert to and from a UTC
+`time.DateTime`, so the calendar never has to be done by hand. Shift by a
+time zone's offset with the `DateTime` methods:
+
+```dodo test
+package clock_example
+
+import "std/embedded/hal"
+import "std/embedded/hal/fake"
+import "std/time"
+
+// Seconds since midnight, from any clock.
+fn seconds_today<R: hal.Rtc>(clock: &mut R) -> u32!hal.Error {
+    now := hal.rtc_now(clock)?
+    return ok(now.time_of_day().seconds_since_midnight())
+}
+
+fn main() {
+    clock := fake.Rtc.new()
+    assert(!clock.is_set()!)
+    start := time.DateTime.new(time.Date.new(2026, 11, 1)!, time.TimeOfDay.new(8, 30, 0, 0)!)
+    hal.rtc_set(&mut clock, &start)!
+    clock.advance(90_000)
+    assert_eq(seconds_today(&mut clock)!, 30_690u32)
+
+    hal.rtc_alarm_in(&mut clock, 60_000)!
+    clock.advance(59_999)
+    assert(!clock.alarm_fired()!)
+    clock.advance(1)
+    assert(clock.alarm_fired()!)
+    clock.clear_alarm()!
+}
+```
+
+An alarm fires when `now_ms()` reaches its time, also when the time is set
+past it, and stays fired until `clear_alarm`. As for a counter's alarm, a time
+the clock has already reached fires at once. On clocks that count seconds the
+alarm fires at the start of a second, so `hal.rtc_alarm_in` fires up to a
+second early. Chips raise an interrupt when it fires; their clock types add
+`listen`, `ignore`, and `irq()` for it, as the
+[RP2040 and RP2350](#real-time-clocks-on-the-rp2040-and-rp2350) do.
+
+`std/embedded/rtc/ds3231` drives a DS3231 clock chip on an I2C bus, the
+common battery-backed module, through the same protocols. It counts on its
+battery while the board is off, so a board without an always-on domain of its
+own can copy the time into its chip's clock at start-up:
+
+```dodo
+bus := b.pins.i2c(board.I2C_SDA_PIN, board.I2C_SCL_PIN, hal.I2C_FAST_HZ)!
+battery := ds3231.Clock.new(bus)
+if battery.is_set()! {
+    b.rtc.set_ms(battery.now_ms()!)!
+}
+```
+
+Its alarm, the chip's alarm 1, matches the day of the month and the time,
+so it reaches 28 days ahead; while armed, it pulls the chip's INT/SQW pin
+low when it fires, which a GPIO with a pull-up can wait on.
+
 ## A complete driver
 
 Drivers usually own their bus while they are in use and give it back with a
@@ -788,6 +878,7 @@ which pins can carry which bus.
 | `fake.Serial` | A serial port, `serial.Port` and `serial.PollPort`: it records what is written and reads back bytes given to `feed`, then reports end of input; `poll_read` reports Pending instead. | `sent()`, `clear()`, `feed(bytes)`, `set_write_room(n)`, `set_flush_polls(n)`, `flushes()` |
 | `fake.Pwm` | A PWM output with a given `max_duty`, initially at duty 0. | `duty()`, `changes()`, `fail_next(error)` |
 | `fake.Analog` | An analog input with a given `max_value` that reads the value given to `set`, after any given to `queue`, one per read. | `set(value)`, `queue(values)`, `reads()`, `fail_next(error)` |
+| `fake.Rtc` | A [real-time clock](#real-time-clocks) with an alarm, unset until set, counting milliseconds (`new()`) or coarser steps (`with_resolution(ms)`). Time passes only by `advance`. | `advance(ms)`, `lose_power()`, `is_armed()`, `alarm_ms()`, `fail_next(error)` |
 | `fake.I2cTarget` | An I2C target and the master that talks to it, played by the test: the master's writes, reads, and STOPs come out of `poll` in order. | `master_write(bytes)`, `master_read(count)`, `master_stop()`, `master_received()`, `is_idle()`, `fail_next(error)` |
 | `fake.SpiTarget` | An SPI target and the master that clocks it. | `master_exchange(bytes)`, `queued()` |
 | `fake.PwmInput` | A pulse input that reports queued measurements, one per poll. | `queue(period_ns, high_ns, cycles)`, `queue_signal(hz, percent)`, `fail_next(error)` |
@@ -797,8 +888,8 @@ which pins can carry which bus.
 | `fake.DmaChannel` | A DMA channel that runs transfers in host memory, for testing code written against `hal.DmaChannel`, such as `hal.DmaStream`. | `set_busy_polls(n)`, `set_max_count(n)`, `starts()`, `aborts()`, `fail_next()` |
 | `fake.Clock` | The [executor](#tasks-and-the-executor)'s clock, and a counter: time jumps ahead when the executor sleeps, and simulated interrupts raise signals. | `now_us()`, `interrupt_at(time, &signal)`, `advance(us)`, `sleeps()`, `idle_us()` |
 
-`fail_next` makes the next I2C transaction, duty change, analog read, or
-alarm schedule fail,
+`fail_next` makes the next I2C transaction, duty change, analog read,
+alarm schedule, or clock operation fail,
 so error paths are as easy to test as success. The repository's
 `examples/dimmer.dodo` tests an LED dimmer, a knob on an analog input setting
 a PWM output, this way, and `examples/dimmer_board.dodo` runs it unchanged on
@@ -1713,6 +1804,7 @@ so changing the board in `dodo.toml` is the only change a program needs:
 | `board.SPI_CLOCK_PIN`, `board.SPI_TX_PIN`, `board.SPI_RX_PIN`, `board.SPI_SELECT_PIN` | The board's usual SPI pins, and a free pin for one chip select. |
 | `board.UART_TX_PIN`, `board.UART_RX_PIN` | The board's usual serial port pins. |
 | `b.timer` | The delay and counter protocols, plus `delay_ms(ms)`; `alarm(n)` claims an alarm with the alarm protocol, which can also run the [executor](#tasks-and-the-executor). |
+| `b.rtc` | The chip's [real-time clock](#real-time-clocks-on-the-rp2040-and-rp2350), implementing the clock and alarm protocols. |
 | `b.watchdog` | The [watchdog](#the-watchdog-on-the-rp2040-and-rp2350): `start(timeout_ms)`, then `feed()` in time or the board resets; `reset_reason()` tells whether it did. Implements `hal.Watchdog`. |
 | `b.dma` | The [DMA channels](#dma-on-the-rp2040-and-rp2350): `channel()` claims one, `release(channel)` gives it back. Buses and serial ports take them for transfers that run while the program does other work. |
 | `b.usb.serial()` | A [USB serial port](#usb-serial-on-the-rp2040-and-rp2350) on the board's USB connector, implementing the `std/io` Reader and Writer, for printing over the USB cable; `b.usb.serial_with(identity)` sets its [USB identity](#usb-identity), and `b.usb.release_serial(port)` gives it back. |
@@ -2588,6 +2680,63 @@ up. `start_request(transfer, dreq)` paces by any other request, or by
 `Driver` over any `hal.Registers`, tested against a model of both chips'
 controllers.
 
+### Real-time clocks on the RP2040 and RP2350
+
+`b.rtc` is each chip's [real-time clock](#real-time-clocks), handed out by
+`take()` with `rp2040.Rtc` and `rp2350.Rtc` as its types. Both implement
+`hal.Rtc` and `hal.RtcAlarm`, and the register-level drivers behind them,
+generic over a register block for desktop tests, are in
+`std/embedded/chip/rp_rtc`:
+
+- The **RP2040's RTC** is a calendar of year, month, day, hours, minutes,
+  and seconds. `take()` clocks it at 31.25 kHz from the crystal and leaves it
+  unset; a reset stops it, so every boot starts unset. It counts leap years
+  every fourth year only, so a clock running from 2099 into 2100 needs its
+  time set again after February 2100; setting a time in such a year tells it.
+  Its alarm compares every field with the time.
+- The **RP2350's always-on timer** is the power manager's 64-bit millisecond
+  counter, ticking from the crystal. It sits in the always-on power domain:
+  once set, it keeps counting through the resets that leave that domain
+  running, such as the watchdog's, and a later `take()` finds it still set.
+  It stops when the chip loses power.
+
+The alarm raises the clock's interrupt while `listen`ing: `RTC_IRQ` on the
+RP2040, during the alarm's second, and `POWMAN_IRQ_TIMER` on the RP2350,
+until `clear_alarm`. `rtc.irq()` gives its number for
+[`std/embedded/cortex_m`](#the-cortex-m-core). To sleep until the alarm,
+enable the interrupt inside a critical section: its arrival ends `wfi` while
+interrupts are masked, so no handler runs and the same code works on both
+chips:
+
+```dodo
+b.rtc.listen()
+hal.rtc_alarm_in(&mut b.rtc, 60_000)!
+irq := b.rtc.irq()
+section := hal.Critical.enter()
+cortex_m.enable(irq)
+for !b.rtc.alarm_fired()! {
+    cpu.wait_for_interrupt()
+}
+b.rtc.clear_alarm()!
+cortex_m.disable(irq)
+cortex_m.unpend(irq)
+core.drop(section)
+```
+
+An `@interrupt(RTC_IRQ)` or `@interrupt(POWMAN_IRQ_TIMER)` handler instead
+has to call `clear_alarm`, or the interrupt stays raised; move the clock into
+a `static mut Option<rp2040.Rtc>` for it, as for a [timer
+alarm](#an-interrupt-driven-driver).
+
+With [low power](#low-power), the RP2040's RTC keeps counting in deep
+sleep only if its clock is in the sleep set, as in
+`b.power.set_sleep_clocks(rp2040.ALARM_CLOCKS | rp2040.CLOCK_RTC)`; its alarm
+then wakes the core like a timer alarm. The RP2350's always-on timer needs no
+gate and counts through deep sleep. Both tick from the crystal, which
+`b.power.dormant` stops, so neither counts while the chip is dormant, nor can
+its alarm end a dormant state; set the clock again from another source
+afterwards if the time matters.
+
 ### Two cores on the RP2040 and RP2350
 
 Both chips have two Arm cores that run the same program from the same flash
@@ -2890,9 +3039,9 @@ dodo build firmware.dodo --emit obj --target thumbv7em-none-eabihf \
 
 - The boards are `pico`, `pico2`, and `pico2_w`, on the `rp2040` and `rp2350`
   chips. The chip packages cover clocks, GPIO, I2C, SPI, UART, PWM, the ADC,
-  PIO, the timer, the watchdog, DMA, a USB serial port, low power, and the
-  second core; other USB devices (HID, mass storage, several functions at
-  once) or USB host mode are not bundled
+  PIO, the timer, the real-time clock, the watchdog, DMA, a USB serial port,
+  low power, and the second core; other USB devices (HID, mass storage,
+  several functions at once) or USB host mode are not bundled
   yet. Write them with `hal.Reg` as above.
 - PIO state machines move words through their FIFOs by polling or their
   interrupts. DMA can pace transfers by their FIFOs' data requests
@@ -2941,6 +3090,10 @@ dodo build firmware.dodo --emit obj --target thumbv7em-none-eabihf \
   timer's capture and compare channels, and periodic hardware timers have no
   shared protocol; use the chip's own methods, as for the RP2040's and
   RP2350's alarms, whose interrupts `listen` turns on.
+- Real-time clocks tick from the crystal: the RP2040's RTC is not clocked
+  from a GPIO, nor the RP2350's always-on timer from its low-power
+  oscillator or a GPIO, so they stop while the chip is dormant and cannot
+  wake it, and the RP2350's power-down states are not supported.
 - SPI by DMA and polled SPI transfers move frames of up to 8 bits; wider
   frames use the word methods, which wait. The ADC is not read by DMA yet,
   and channel signals come only from `DMA_IRQ_0`.
