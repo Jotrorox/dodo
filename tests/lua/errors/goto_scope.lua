@@ -1,0 +1,1 @@
+do goto l end local x ::l:: print(x)
