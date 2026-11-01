@@ -64,7 +64,9 @@ pub struct Debug {
         if ptr.is_null(self.name_ptr) {
             return none
         }
-        unsafe { return some(ptr.borrow_slice(self.name_ptr, self.name_len, self)) }
+        unsafe {
+            return some(ptr.borrow_slice(self.name_ptr, self.name_len, self))
+        }
     }
     // How the name was found ('n'): "global", "local", "method", "field",
     // "upvalue", "metamethod", "for iterator", "hook" or "".
@@ -72,21 +74,27 @@ pub struct Debug {
         if ptr.is_null(self.namewhat_ptr) {
             return b""
         }
-        unsafe { return ptr.borrow_slice(self.namewhat_ptr, self.namewhat_len, self) }
+        unsafe {
+            return ptr.borrow_slice(self.namewhat_ptr, self.namewhat_len, self)
+        }
     }
     // "Lua", "C" or "main" ('S').
     pub fn what(&self) -> &[u8] {
         if ptr.is_null(self.what_ptr) {
             return b""
         }
-        unsafe { return ptr.borrow_slice(self.what_ptr, self.what_len, self) }
+        unsafe {
+            return ptr.borrow_slice(self.what_ptr, self.what_len, self)
+        }
     }
     // Chunk source ('S'), e.g. "@file.lua" or "=[C]".
     pub fn source(&self) -> &[u8] {
         if ptr.is_null(self.source_ptr) {
             return b""
         }
-        unsafe { return ptr.borrow_slice(self.source_ptr, self.source_len, self) }
+        unsafe {
+            return ptr.borrow_slice(self.source_ptr, self.source_len, self)
+        }
     }
     // Printable source name ('S'), as used in messages.
     pub fn short_src(&self) -> &[u8] {
@@ -120,7 +128,9 @@ fn dbg_current_pc(ci: *mut CallInfo) -> i32 {
 
 fn pc_rel(pc: *mut u32, p: *mut Proto) -> i32 {
     unsafe {
-        unsafe { return ((((pc as isize) - ((*p).code as isize)) / 4) as i32) - 1 }
+        unsafe {
+            return ((((pc as isize) - ((*p).code as isize)) / 4) as i32) - 1
+        }
     }
 }
 
@@ -243,7 +253,9 @@ fn op_sets_a(op: u32) -> bool {
 
 fn proto_code(p: *mut Proto, pc: i32) -> u32 {
     unsafe {
-        unsafe { return *ptr.offset((*p).code, pc as isize) }
+        unsafe {
+            return *ptr.offset((*p).code, pc as isize)
+        }
     }
 }
 
@@ -278,7 +290,11 @@ fn find_set_reg(p: *mut Proto, lastpc0: i32, reg: i32) -> i32 {
                 change = op_sets_a(op) && reg == a
             }
             if change {
-                setreg = if pc < jmptarget { -1i32 } else { pc }
+                setreg = if pc < jmptarget {
+                    -1i32
+                } else {
+                    pc
+                }
             }
         }
         return setreg
@@ -295,7 +311,9 @@ struct NameInfo {
 
 fn ni_new() -> NameInfo {
     unsafe {
-        unsafe { return NameInfo { kind: 0 as *const u8, kind_len: 0, name: 0 as *const u8, name_len: 0 } }
+        unsafe {
+            return NameInfo { kind: 0 as *const u8, kind_len: 0, name: 0 as *const u8, name_len: 0 }
+        }
     }
 }
 fn ni_set_kind(ni: &mut NameInfo, s: &str) {
@@ -329,7 +347,9 @@ fn ni_name_is(ni: &NameInfo, s: &str) -> bool {
         if ptr.is_null(ni.name) || ni.name_len != b.len {
             return false
         }
-        unsafe { return mem_equal(ni.name as *mut u8, ptr.as_ptr(b) as *mut u8, b.len) }
+        unsafe {
+            return mem_equal(ni.name as *mut u8, ptr.as_ptr(b) as *mut u8, b.len)
+        }
     }
 }
 
@@ -374,7 +394,9 @@ fn ni_kind_is(ni: &NameInfo, s: &str) -> bool {
         if ptr.is_null(ni.kind) || ni.kind_len != b.len {
             return false
         }
-        unsafe { return mem_equal(ni.kind as *mut u8, ptr.as_ptr(b) as *mut u8, b.len) }
+        unsafe {
+            return mem_equal(ni.kind as *mut u8, ptr.as_ptr(b) as *mut u8, b.len)
+        }
     }
 }
 
@@ -402,7 +424,8 @@ fn is_env(p: *mut Proto, pc: i32, i: u32, isup: bool, ni: &mut NameInfo) {
             }
         } else {
             get_obj_name(p, pc, t, &mut sub)
-            if !ni_found(&sub) {
+            // Only a local or an upvalue can be the variable _ENV.
+            if !ni_kind_is(&sub, "local") && !ni_kind_is(&sub, "upvalue") {
                 sub.name = 0 as *const u8
             }
         }
@@ -455,7 +478,11 @@ fn get_obj_name(p: *mut Proto, lastpc: i32, reg: i32, ni: &mut NameInfo) {
             }
             ni_set_kind(ni, "upvalue")
         } else if op == OP_LOADK || op == OP_LOADKX {
-            let b = if op == OP_LOADK { arg_bx(i) } else { arg_ax(proto_code(p, pc + 1)) }
+            let b = if op == OP_LOADK {
+                arg_bx(i)
+            } else {
+                arg_ax(proto_code(p, pc + 1))
+            }
             let kv = ptr.offset((*p).k, b as isize)
             if val_is_string(kv) {
                 ni_set_name_lstr(ni, val_str(kv))
@@ -749,7 +776,11 @@ fn dbg_find_local(L: *mut State, ci: *mut CallInfo, n: i32, ni: &mut NameInfo) -
         if n <= 0 {
             return 0 as *mut Value
         }
-        let limit = if ci == (*L).ci { (*L).top } else { (*(*ci).next).func }
+        let limit = if ci == (*L).ci {
+            (*L).top
+        } else {
+            (*(*ci).next).func
+        }
         if sdiff(limit, base) >= n as isize {
             if ci_is_lua(ci) {
                 ni_set_name_static(ni, "(temporary)")
@@ -794,7 +825,21 @@ fn run_hook(L: *mut State, event: i32, line: i32, ftransfer: i32, ntransfer: i32
         (*ci2).callstatus = (*ci2).callstatus | CIST_HOOKED
         cx := Cx { L: L }
         let h = (*L).hook
-        h(&mut cx, &mut ar)?
+        match h(&mut cx, &mut ar) {
+            ok() => {},
+            err(e) => {
+                (*L).allowhook = 1
+                (*ci2).callstatus = (*ci2).callstatus & ~(CIST_HOOKED | CIST_TRAN)
+                if e == Throw.Yield && ci_is_lua(ci2) {
+                    // A native hook yielded: when resumed, the interrupted
+                    // instruction runs again (without calling the hook).
+                    (*ci2).callstatus = (*ci2).callstatus | CIST_HOOKYIELD
+                    (*ci2).savedpc = ptr.offset((*ci2).savedpc, -1)
+                    (*L).top = restore_stack(L, top)
+                }
+                return err(e)
+            },
+        }
         (*L).allowhook = 1
         (*ci2).top = restore_stack(L, ci_top)
         (*L).top = restore_stack(L, top)
@@ -808,7 +853,11 @@ fn hook_call_lua(L: *mut State, ci: *mut CallInfo) -> void!Throw {
     unsafe {
         (*L).oldpc = 0
         if ((*L).hookmask & HOOK_MASK_CALL) != 0 {
-            let event = if ((*ci).callstatus & CIST_TAIL) != 0 { HOOK_TAILCALL } else { HOOK_CALL }
+            let event = if ((*ci).callstatus & CIST_TAIL) != 0 {
+                HOOK_TAILCALL
+            } else {
+                HOOK_CALL
+            }
             let p = ci_proto(ci)
             (*ci).savedpc = ptr.offset((*ci).savedpc, 1)
             run_hook(L, event, -1, 1, (*p).numparams as i32)?
@@ -883,7 +932,11 @@ fn vm_trace(L: *mut State, ci: *mut CallInfo, pc: *mut u32) -> bool!Throw {
             run_hook(L, HOOK_COUNT, -1, 0, 0)?
         }
         if (mask & HOOK_MASK_LINE) != 0 {
-            let oldpc = if (*L).oldpc < (*p).sizecode { (*L).oldpc } else { 0i32 }
+            let oldpc = if (*L).oldpc < (*p).sizecode {
+                (*L).oldpc
+            } else {
+                0i32
+            }
             let npci = pc_rel(pc, p)
             if npci <= oldpc || dbg_changed_line(p, oldpc, npci) {
                 let newline = dbg_get_line(p, npci)

@@ -65,10 +65,14 @@ fn collect_os_args(out: &mut Args) {
                                 out.ends[out.count] = pos
                                 out.count += 1
                             },
-                            none => { break },
+                            none => {
+                                break
+                            },
                         }
                     },
-                    err(_) => { break },
+                    err(_) => {
+                        break
+                    },
                 }
             }
         },
@@ -116,11 +120,17 @@ fn report(cx: &mut lua.Cx, prog: &Prog, status: i32) -> i32 {
         match cx.to_lstr(-1) {
             ok(v) => {
                 match v {
-                    some(s) => { message(prog, s.bytes()) },
-                    none => { message(prog, b"(error object is not a string)") },
+                    some(s) => {
+                        message(prog, s.bytes())
+                    },
+                    none => {
+                        message(prog, b"(error object is not a string)")
+                    },
                 }
             },
-            err(_) => { message(prog, b"not enough memory") },
+            err(_) => {
+                message(prog, b"not enough memory")
+            },
         }
         cx.pop(1)
     }
@@ -159,7 +169,9 @@ fn docall(cx: &mut lua.Cx, narg: i32, nres: i32) -> i32 {
     let base = cx.get_top() - narg
     match cx.push_native(msghandler) {
         ok() => {},
-        err(_) => { return lua.ERRMEM },
+        err(_) => {
+            return lua.ERRMEM
+        },
     }
     cx.insert(base)
     let status = cx.pcall(narg, nres, base)
@@ -210,17 +222,23 @@ fn dolibrary(cx: &mut lua.Cx, prog: &Prog, spec: &[u8]) -> i32 {
     }
     match cx.get_global("require") {
         ok(_) => {},
-        err(_) => { return report(cx, prog, lua.ERRMEM) },
+        err(_) => {
+            return report(cx, prog, lua.ERRMEM)
+        },
     }
     match cx.push_bytes(modname) {
         ok() => {},
-        err(_) => { return report(cx, prog, lua.ERRMEM) },
+        err(_) => {
+            return report(cx, prog, lua.ERRMEM)
+        },
     }
     let status = docall(cx, 1, 1)
     if status == lua.OK {
         match cx.push_bytes(gname) {
             ok() => {},
-            err(_) => { return report(cx, prog, lua.ERRMEM) },
+            err(_) => {
+                return report(cx, prog, lua.ERRMEM)
+            },
         }
         cx.insert(-2)
         cx.push_global_table()
@@ -335,7 +353,11 @@ fn run_args(cx: &mut lua.Cx, prog: &Prog, args: &Args, n: usize) -> bool {
                 i += 1
                 extra = args.get(i)
             }
-            let st = if c == b'e' { dostring(cx, prog, extra, b"=(command line)") } else { dolibrary(cx, prog, extra) }
+            let st = if c == b'e' {
+                dostring(cx, prog, extra, b"=(command line)")
+            } else {
+                dolibrary(cx, prog, extra)
+            }
             if st != lua.OK {
                 return false
             }
@@ -355,7 +377,11 @@ fn create_arg_table(cx: &mut lua.Cx, args: &Args, script0: usize) -> void!lua.Th
         script = 0
     }
     let narg = (args.count as i32) - (script as i32) - 1
-    cx.create_table(if narg > 0 { narg } else { 0 }, (script as i32) + 1)?
+    cx.create_table(if narg > 0 {
+        narg
+    } else {
+        0
+    }, (script as i32) + 1)?
     for i in 0usize..args.count {
         cx.push_bytes(args.get(i))?
         cx.raw_set_i(-2, (i as i64) - (script as i64))?
@@ -375,11 +401,15 @@ fn handle_script(cx: &mut lua.Cx, prog: &Prog, args: &Args, script: usize) -> i3
         // Push the script arguments.
         match cx.get_global("arg") {
             ok(_) => {},
-            err(_) => { return report(cx, prog, lua.ERRMEM) },
+            err(_) => {
+                return report(cx, prog, lua.ERRMEM)
+            },
         }
         n := 0i32
         match cx.len_of(-1) {
-            ok(v) => { n = v as i32 },
+            ok(v) => {
+                n = v as i32
+            },
             err(_) => {},
         }
         if !cx.check_stack(n + 3) {
@@ -401,10 +431,18 @@ fn handle_script(cx: &mut lua.Cx, prog: &Prog, args: &Args, script: usize) -> i3
 // --- Interactive mode -------------------------------------------------------
 
 fn get_prompt(cx: &mut lua.Cx, firstline: bool) -> void!lua.Throw {
-    let name = if firstline { "_PROMPT" } else { "_PROMPT2" }
+    let name = if firstline {
+        "_PROMPT"
+    } else {
+        "_PROMPT2"
+    }
     if cx.get_global(name)? == lua.TNIL {
         cx.pop(1)
-        cx.push_str(if firstline { "> " } else { ">> " })?
+        cx.push_str(if firstline {
+            "> "
+        } else {
+            ">> "
+        })?
     } else {
         cx.to_lstring_meta(-1)?
         cx.remove(-2)
@@ -416,12 +454,16 @@ fn get_prompt(cx: &mut lua.Cx, firstline: bool) -> void!lua.Throw {
 fn push_line(cx: &mut lua.Cx, firstline: bool) -> bool {
     match get_prompt(cx, firstline) {
         ok() => {},
-        err(_) => { return false },
+        err(_) => {
+            return false
+        },
     }
     match cx.to_lstr(-1) {
         ok(v) => {
             match v {
-                some(p) => { lua.write_stdout(p.bytes()) },
+                some(p) => {
+                    lua.write_stdout(p.bytes())
+                },
                 none => {},
             }
         },
@@ -445,7 +487,9 @@ fn push_line(cx: &mut lua.Cx, firstline: bool) -> bool {
             }
             match line.add_bytes(buf[0..n]) {
                 ok() => {},
-                err(_) => { return false },
+                err(_) => {
+                    return false
+                },
             }
             if n > 0 && buf[n - 1] == b'\n' {
                 break
@@ -465,20 +509,28 @@ fn push_line(cx: &mut lua.Cx, firstline: bool) -> bool {
         tmp := lua.Buffer.new(cx)
         match tmp.add_str("return ") {
             ok() => {},
-            err(_) => { return false },
+            err(_) => {
+                return false
+            },
         }
         match tmp.add_bytes(text[1..l]) {
             ok() => {},
-            err(_) => { return false },
+            err(_) => {
+                return false
+            },
         }
         match tmp.push_result(cx) {
             ok() => {},
-            err(_) => { return false },
+            err(_) => {
+                return false
+            },
         }
     } else {
         match cx.push_bytes(text) {
             ok() => {},
-            err(_) => { return false },
+            err(_) => {
+                return false
+            },
         }
     }
     return true
@@ -493,26 +545,34 @@ fn add_return(cx: &mut lua.Cx) -> i32 {
                 some(s) => {
                     match b.add_str("return ") {
                         ok() => {},
-                        err(_) => { return lua.ERRMEM },
+                        err(_) => {
+                            return lua.ERRMEM
+                        },
                     }
                     match b.add_bytes(s.bytes()) {
                         ok() => {},
-                        err(_) => { return lua.ERRMEM },
+                        err(_) => {
+                            return lua.ERRMEM
+                        },
                     }
                     match b.add_str(";") {
                         ok() => {},
-                        err(_) => { return lua.ERRMEM },
+                        err(_) => {
+                            return lua.ERRMEM
+                        },
                     }
                 },
                 none => {},
             }
         },
-        err(_) => { return lua.ERRMEM },
+        err(_) => {
+            return lua.ERRMEM
+        },
     }
+    // On success the stack holds the line and the function (the caller
+    // removes the line); on failure drop the error message.
     let status = cx.load_bytes(b.bytes(), b"=stdin", b"bt")
-    if status == lua.OK {
-        cx.remove(-2)
-    } else {
+    if status != lua.OK {
         cx.pop(1)
     }
     return status
@@ -556,23 +616,33 @@ fn multiline(cx: &mut lua.Cx) -> i32 {
         match cx.to_lstr(1) {
             ok(v) => {
                 match v {
-                    some(s) => { status = cx.load_bytes(s.bytes(), b"=stdin", b"bt") },
-                    none => { return lua.ERRRUN },
+                    some(s) => {
+                        status = cx.load_bytes(s.bytes(), b"=stdin", b"bt")
+                    },
+                    none => {
+                        return lua.ERRRUN
+                    },
                 }
             },
-            err(_) => { return lua.ERRMEM },
+            err(_) => {
+                return lua.ERRMEM
+            },
         }
         if !incomplete(cx, status) || !push_line(cx, false) {
             return status
         }
         match cx.push_str("\n") {
             ok() => {},
-            err(_) => { return lua.ERRMEM },
+            err(_) => {
+                return lua.ERRMEM
+            },
         }
         cx.insert(-2)
         match cx.concat(3) {
             ok() => {},
-            err(_) => { return lua.ERRMEM },
+            err(_) => {
+                return lua.ERRMEM
+            },
         }
     }
 }
@@ -596,7 +666,9 @@ fn print_results(cx: &mut lua.Cx, prog: &Prog) {
     if n > 0 {
         match cx.get_global("print") {
             ok(_) => {},
-            err(_) => { return },
+            err(_) => {
+                return
+            },
         }
         cx.insert(1)
         if cx.pcall(n, 0, 0) != lua.OK {
@@ -714,11 +786,15 @@ fn pmain(cx: &mut lua.Cx, prog: &mut Prog, args: &Args) -> bool {
     }
     match cx.open_libs() {
         ok() => {},
-        err(_) => { return false },
+        err(_) => {
+            return false
+        },
     }
     match create_arg_table(cx, args, script) {
         ok() => {},
-        err(_) => { return false },
+        err(_) => {
+            return false
+        },
     }
     cx.gc_restart()
     cx.gc_generational(0, 0)
@@ -790,7 +866,9 @@ fn main() -> i32 {
             cx := s.cx()
             match cx.push_native(pmain_native) {
                 ok() => {},
-                err(_) => { return 1 },
+                err(_) => {
+                    return 1
+                },
             }
             unsafe {
                 cx.push_light_userdata(ptr.from_mut(&mut prog) as *mut u8)

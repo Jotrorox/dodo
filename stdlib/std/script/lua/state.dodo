@@ -153,6 +153,8 @@ struct Global {
     warnf: WarnFn
     // Value returned for absent table keys.
     absentkey: Value
+    // Allocation limit in bytes (0: unlimited).
+    mem_limit: isize
 }
 
 // A Lua thread. `*mut State` is the `L` parameter of every internal function.
@@ -213,53 +215,73 @@ struct MainBlock {
 
 fn G(L: *mut State) -> *mut Global {
     unsafe {
-        unsafe { return (*L).global }
+        unsafe {
+            return (*L).global
+        }
     }
 }
 fn L_errobj(L: *mut State) -> *mut Value {
     unsafe {
-        unsafe { return ptr.offset(L as *mut u8, mem.offset_of::<State>("errobj") as isize) as *mut Value }
+        unsafe {
+            return ptr.offset(L as *mut u8, mem.offset_of::<State>("errobj") as isize) as *mut Value
+        }
     }
 }
 fn L_base_ci(L: *mut State) -> *mut CallInfo {
     unsafe {
-        unsafe { return ptr.offset(L as *mut u8, mem.offset_of::<State>("base_ci") as isize) as *mut CallInfo }
+        unsafe {
+            return ptr.offset(L as *mut u8, mem.offset_of::<State>("base_ci") as isize) as *mut CallInfo
+        }
     }
 }
 fn G_registry(g: *mut Global) -> *mut Value {
     unsafe {
-        unsafe { return ptr.offset(g as *mut u8, mem.offset_of::<Global>("registry") as isize) as *mut Value }
+        unsafe {
+            return ptr.offset(g as *mut u8, mem.offset_of::<Global>("registry") as isize) as *mut Value
+        }
     }
 }
 fn G_nilvalue(g: *mut Global) -> *mut Value {
     unsafe {
-        unsafe { return ptr.offset(g as *mut u8, mem.offset_of::<Global>("nilvalue") as isize) as *mut Value }
+        unsafe {
+            return ptr.offset(g as *mut u8, mem.offset_of::<Global>("nilvalue") as isize) as *mut Value
+        }
     }
 }
 fn G_absent(g: *mut Global) -> *mut Value {
     unsafe {
-        unsafe { return ptr.offset(g as *mut u8, mem.offset_of::<Global>("absentkey") as isize) as *mut Value }
+        unsafe {
+            return ptr.offset(g as *mut u8, mem.offset_of::<Global>("absentkey") as isize) as *mut Value
+        }
     }
 }
 fn G_tmname(g: *mut Global, event: u32) -> *mut LString {
     unsafe {
-        unsafe { return *ptr.offset((*g).tmname, event as isize) }
+        unsafe {
+            return *ptr.offset((*g).tmname, event as isize)
+        }
     }
 }
 fn G_mt(g: *mut Global, t: u8) -> *mut Table {
     unsafe {
-        unsafe { return *ptr.offset((*g).mt, t as isize) }
+        unsafe {
+            return *ptr.offset((*g).mt, t as isize)
+        }
     }
 }
 fn G_set_mt(g: *mut Global, t: u8, mt: *mut Table) {
     unsafe {
-        unsafe { *ptr.offset((*g).mt, t as isize) = mt }
+        unsafe {
+            *ptr.offset((*g).mt, t as isize) = mt
+        }
     }
 }
 // The state is completely built (registry and preallocated objects exist).
 fn G_complete(g: *mut Global) -> bool {
     unsafe {
-        unsafe { return (*g).nilvalue.tag == TAG_NIL }
+        unsafe {
+            return (*g).nilvalue.tag == TAG_NIL
+        }
     }
 }
 
@@ -268,24 +290,32 @@ fn G_complete(g: *mut Global) -> bool {
 // p + n Values.
 fn sv(p: *mut Value, n: isize) -> *mut Value {
     unsafe {
-        unsafe { return ptr.offset(p, n) }
+        unsafe {
+            return ptr.offset(p, n)
+        }
     }
 }
 // a - b, in Values.
 fn sdiff(a: *mut Value, b: *mut Value) -> isize {
     unsafe {
-        unsafe { return ((a as isize) - (b as isize)) >> 4 }
+        unsafe {
+            return ((a as isize) - (b as isize)) >> 4
+        }
     }
 }
 // Stack offset of a slot (stable across reallocation).
 fn save_stack(L: *mut State, p: *mut Value) -> isize {
     unsafe {
-        unsafe { return sdiff(p, (*L).stack) }
+        unsafe {
+            return sdiff(p, (*L).stack)
+        }
     }
 }
 fn restore_stack(L: *mut State, off: isize) -> *mut Value {
     unsafe {
-        unsafe { return ptr.offset((*L).stack, off) }
+        unsafe {
+            return ptr.offset((*L).stack, off)
+        }
     }
 }
 fn L_push_value(L: *mut State, v: *mut Value) {
@@ -305,7 +335,9 @@ fn L_push_nil(L: *mut State) {
 
 fn stack_relocate(p: *mut Value, oldstack: *mut Value, newstack: *mut Value) -> *mut Value {
     unsafe {
-        unsafe { return ptr.offset(newstack, sdiff(p, oldstack)) }
+        unsafe {
+            return ptr.offset(newstack, sdiff(p, oldstack))
+        }
     }
 }
 
@@ -316,7 +348,11 @@ fn stack_realloc(L: *mut State, newsize: isize) -> void!Throw {
         let oldsize = (*L).stack_size
         let oldstack = (*L).stack
         let newstack = mem_alloc(L, (newsize as usize) * 16)? as *mut Value
-        let keep = if oldsize < newsize { oldsize } else { newsize }
+        let keep = if oldsize < newsize {
+            oldsize
+        } else {
+            newsize
+        }
         ptr.copy_nonoverlapping(oldstack, newstack, keep as usize)
         for i in keep..newsize {
             (*ptr.offset(newstack, i)).tag = TAG_NIL
@@ -343,7 +379,9 @@ fn stack_realloc(L: *mut State, newsize: isize) -> void!Throw {
 
 fn stack_in_use_size(L: *mut State) -> isize {
     unsafe {
-        unsafe { return (*L).stack_size - EXTRA_STACK }
+        unsafe {
+            return (*L).stack_size - EXTRA_STACK
+        }
     }
 }
 
@@ -493,7 +531,9 @@ fn ci_shrink(L: *mut State) {
 
 fn ci_is_lua(ci: *mut CallInfo) -> bool {
     unsafe {
-        unsafe { return ((*ci).callstatus & CIST_NATIVE) == 0 }
+        unsafe {
+            return ((*ci).callstatus & CIST_NATIVE) == 0
+        }
     }
 }
 
@@ -502,7 +542,11 @@ fn ci_is_lua(ci: *mut CallInfo) -> bool {
 fn tbc_push(L: *mut State, off: isize) -> void!Throw {
     unsafe {
         if (*L).tbc_count == (*L).tbc_cap {
-            let ncap = if (*L).tbc_cap == 0 { 8isize } else { (*L).tbc_cap * 2 }
+            let ncap = if (*L).tbc_cap == 0 {
+                8isize
+            } else {
+                (*L).tbc_cap * 2
+            }
             let block = mem_realloc(L, (*L).tbc as *mut u8, ((*L).tbc_cap as usize) * 8, (ncap as usize) * 8)?
             (*L).tbc = block as *mut isize
             (*L).tbc_cap = ncap
@@ -651,7 +695,7 @@ fn thread_reset(L: *mut State, status0: i32) -> i32 {
         (*L).status = ST_OK
         status = do_close_protected(L, 1, status)
         if status != ST_OK as i32 {
-            set_error_obj(L, status, ptr.offset((*L).stack, 1))
+            move_error_obj(L, status, ptr.offset((*L).stack, 1))
         } else {
             (*L).top = ptr.offset((*L).stack, 1)
         }
@@ -675,8 +719,12 @@ fn set_error_obj(L: *mut State, status: i32, oldtop: *mut Value) {
             set_str(oldtop, (*G(L)).memerrmsg)
         } else if status == ST_ERRERR as i32 {
             match str_from(L, "error in error handling") {
-                ok(s) => { set_str(oldtop, s) },
-                err(_) => { set_str(oldtop, (*G(L)).memerrmsg) },
+                ok(s) => {
+                    set_str(oldtop, s)
+                },
+                err(_) => {
+                    set_str(oldtop, (*G(L)).memerrmsg)
+                },
             }
         } else if status == ST_OK as i32 {
             (*oldtop).tag = TAG_NIL
@@ -690,11 +738,21 @@ fn set_error_obj(L: *mut State, status: i32, oldtop: *mut Value) {
 fn throw_status(t: Throw) -> i32 {
     unsafe {
         match t {
-            Throw.Runtime => { return ST_ERRRUN as i32 },
-            Throw.Syntax => { return ST_ERRSYNTAX as i32 },
-            Throw.Memory => { return ST_ERRMEM as i32 },
-            Throw.Handler => { return ST_ERRERR as i32 },
-            Throw.Yield => { return ST_YIELD as i32 },
+            Throw.Runtime => {
+                return ST_ERRRUN as i32
+            },
+            Throw.Syntax => {
+                return ST_ERRSYNTAX as i32
+            },
+            Throw.Memory => {
+                return ST_ERRMEM as i32
+            },
+            Throw.Handler => {
+                return ST_ERRERR as i32
+            },
+            Throw.Yield => {
+                return ST_YIELD as i32
+            },
         }
     }
 }
@@ -762,8 +820,8 @@ fn state_make_seed(L: *mut State) -> u32 {
         let addr = L as usize
         local := 0u64
         let laddr = ptr.from_mut(&mut local) as usize
-        let t = time(0 as *mut i64)
-        let mixed = (addr as u64) ^ ((laddr as u64) << 7) ^ (t as u64)
+        let t = i2u(time(0 as *mut i64))
+        let mixed = (addr as u64) ^ core.wrapping_mul(laddr as u64, 128u64) ^ (t as u64)
         let h = core.wrapping_mul(mixed ^ (mixed >> 29), 0x9E3779B97F4A7C15u64)
         return ((h >> 32) ^ (h & 0xFFFFFFFF)) as u32
     }
@@ -804,8 +862,10 @@ fn state_build(L: *mut State) -> void!Throw {
     }
 }
 
-// Close a universe: run pending finalizers, free every object.
-fn state_close(L0: *mut State) {
+// Close a universe: run pending finalizers, free every object. Returns the
+// number of bytes still accounted after freeing everything (0 unless
+// something leaked).
+fn state_close(L0: *mut State) -> isize {
     unsafe {
         let g = G(L0)
         let L = (*g).mainthread
@@ -829,7 +889,9 @@ fn state_close(L0: *mut State) {
         if !ptr.is_null((*g).mt) {
             mem_free(L, (*g).mt as *mut u8, 9 * 8)
         }
+        let leaked = (*g).total_bytes
         let block = ptr.offset(L as *mut u8, -(mem.offset_of::<MainBlock>("l") as isize))
         free(block)
+        return leaked
     }
 }

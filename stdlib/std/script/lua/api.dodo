@@ -27,9 +27,12 @@ import "core/ptr"
 pub fn version() -> &str from(static) {
     return "Lua 5.4"
 }
+// Version number (major * 100 + minor).
 pub const VERSION_NUM: i32 = 504
+// Release string of the implemented reference version.
 pub const RELEASE: &str = "Lua 5.4.9"
-pub const COPYRIGHT: &str = "Lua 5.4.9  Copyright (C) 1994-2025 Lua.org, PUC-Rio"
+// Banner printed by the standalone interpreter (-v).
+pub const COPYRIGHT: &str = "Lua 5.4.9  Copyright (C) 1994-2026 Lua.org, PUC-Rio"
 
 // Signature of native functions callable from Lua. The function receives
 // its arguments on the stack (1..get_top()) and returns the number of
@@ -38,24 +41,38 @@ pub type NativeFn = fn(&mut Cx) -> i32!Throw
 
 // Status codes.
 pub const OK: i32 = 0
+// The thread is suspended (yielded).
 pub const YIELD: i32 = 1
+// Runtime error.
 pub const ERRRUN: i32 = 2
+// Syntax error while loading a chunk.
 pub const ERRSYNTAX: i32 = 3
+// Memory allocation error.
 pub const ERRMEM: i32 = 4
+// Error while running the message handler.
 pub const ERRERR: i32 = 5
 // Extra status of loadfile: the file could not be opened/read.
 pub const ERRFILE: i32 = 6
 
 // Basic types (type_of results).
 pub const TNONE: i32 = -1
+// nil
 pub const TNIL: i32 = 0
+// boolean
 pub const TBOOLEAN: i32 = 1
+// light userdata (a raw pointer)
 pub const TLIGHTUSERDATA: i32 = 2
+// number (integer or float)
 pub const TNUMBER: i32 = 3
+// string
 pub const TSTRING: i32 = 4
+// table
 pub const TTABLE: i32 = 5
+// function (Lua or native)
 pub const TFUNCTION: i32 = 6
+// full userdata
 pub const TUSERDATA: i32 = 7
+// thread (coroutine)
 pub const TTHREAD: i32 = 8
 
 // "All results" for calls.
@@ -64,53 +81,81 @@ pub const MULTRET_ALL: i32 = -1
 // Pseudo-index of the registry, and of the upvalues of the running native
 // closure (upvalue_index(1) is the first upvalue).
 pub const REGISTRY_INDEX: i32 = -1001000
+// Pseudo-index of upvalue i (1-based) of the running native closure.
 pub fn upvalue_index(i: i32) -> i32 {
     return REGISTRY_INDEX - i
 }
 // Registry slots.
 pub const RIDX_MAINTHREAD: i64 = 1
+// Registry slot of the globals table.
 pub const RIDX_GLOBALS: i64 = 2
 
-// Arithmetic operators for Cx.arith.
+// Arithmetic operators for Cx.arith: addition (+).
 pub const OPADD: i32 = 0
+// Subtraction (-).
 pub const OPSUB: i32 = 1
+// Multiplication (*).
 pub const OPMUL: i32 = 2
+// Floor modulo (%).
 pub const OPMOD: i32 = 3
+// Exponentiation (^).
 pub const OPPOW: i32 = 4
+// Float division (/).
 pub const OPDIV: i32 = 5
+// Floor division (//).
 pub const OPIDIV: i32 = 6
+// Bitwise and (&).
 pub const OPBAND: i32 = 7
+// Bitwise or (|).
 pub const OPBOR: i32 = 8
+// Bitwise exclusive or (~).
 pub const OPBXOR: i32 = 9
+// Left shift (<<).
 pub const OPSHL: i32 = 10
+// Right shift (>>).
 pub const OPSHR: i32 = 11
+// Negation (unary -).
 pub const OPUNM: i32 = 12
+// Bitwise not (unary ~).
 pub const OPBNOT: i32 = 13
 
-// Comparison operators for Cx.compare.
+// Comparison operators for Cx.compare: equality (==).
 pub const OPEQ: i32 = 0
+// Less than (<).
 pub const OPLT: i32 = 1
+// Less or equal (<=).
 pub const OPLE: i32 = 2
 
 // Hook masks and events.
 pub const MASKCALL: i32 = 1
+// Hook mask bit: function returns.
 pub const MASKRET: i32 = 2
+// Hook mask bit: new source lines.
 pub const MASKLINE: i32 = 4
+// Hook mask bit: every `count` instructions.
 pub const MASKCOUNT: i32 = 8
+// Hook event: call.
 pub const HOOKCALL: i32 = 0
+// Hook event: return.
 pub const HOOKRET: i32 = 1
+// Hook event: new line.
 pub const HOOKLINE: i32 = 2
+// Hook event: instruction count.
 pub const HOOKCOUNT: i32 = 3
+// Hook event: tail call.
 pub const HOOKTAILCALL: i32 = 4
 
 // Reference values of Cx.reference.
 pub const NOREF: i32 = -2
+// Reference returned for nil values.
 pub const REFNIL: i32 = -1
 
 static mut NONE_VALUE: Value = Value { bits: 0, tag: 0 }
 
 fn none_value() -> *mut Value {
-    unsafe { return ptr.from_mut(&mut NONE_VALUE) }
+    unsafe {
+        return ptr.from_mut(&mut NONE_VALUE)
+    }
 }
 
 // A view of a Lua string's bytes. It stays valid while the string is
@@ -122,7 +167,9 @@ pub struct LuaStr {
 
     // The bytes (without the terminating NUL the runtime keeps after them).
     pub fn bytes(&self) -> &[u8] {
-        unsafe { return ptr.borrow_slice(self.p, self.n, self) }
+        unsafe {
+            return ptr.borrow_slice(self.p, self.n, self)
+        }
     }
     // Number of bytes.
     pub fn size(&self) -> usize {
@@ -135,7 +182,9 @@ pub struct LuaStr {
 }
 
 fn lstr_of(s: *mut LString) -> LuaStr {
-    unsafe { return LuaStr { p: str_data(s) as *const u8, n: (*s).length } }
+    unsafe {
+        return LuaStr { p: str_data(s) as *const u8, n: (*s).length }
+    }
 }
 
 // --- The universe -----------------------------------------------------------
@@ -171,7 +220,9 @@ pub struct Lua {
 
     // Bytes currently allocated by the state.
     pub fn memory_in_use(&self) -> usize {
-        unsafe { return (*G(self.L)).total_bytes as usize }
+        unsafe {
+            return (*G(self.L)).total_bytes as usize
+        }
     }
 
     // Install a warning function (replacing the default one, which writes
@@ -184,10 +235,37 @@ pub struct Lua {
         }
     }
 
+    // Limit the memory the state may allocate (0: unlimited). Allocations
+    // beyond the limit first trigger an emergency collection, then raise
+    // "not enough memory".
+    pub fn set_memory_limit(&mut self, limit: usize) {
+        unsafe {
+            (*G(self.L)).mem_limit = limit as isize
+        }
+    }
+
+    // Close the state now (running pending finalizers) and return the
+    // number of bytes that were not released (0 when nothing leaked).
+    pub fn close(&mut self) -> usize {
+        if ptr.is_null(self.L) {
+            return 0
+        }
+        let leaked = state_close(self.L)
+        unsafe {
+            self.L = 0 as *mut State
+        }
+        if leaked < 0 {
+            return 0
+        }
+        return leaked as usize
+    }
+
     fn drop(&mut self) {
         if !ptr.is_null(self.L) {
             state_close(self.L)
-            unsafe { self.L = 0 as *mut State }
+            unsafe {
+                self.L = 0 as *mut State
+            }
         }
     }
 }
@@ -237,14 +315,18 @@ pub struct Cx {
     }
 
     fn api_incr_top(&mut self) {
-        unsafe { (*self.L).top = ptr.offset((*self.L).top, 1) }
+        unsafe {
+            (*self.L).top = ptr.offset((*self.L).top, 1)
+        }
     }
 
     // --- Basic stack manipulation ---
 
     // Index of the top element (= number of elements in the frame).
     pub fn get_top(&self) -> i32 {
-        unsafe { return sdiff((*self.L).top, (*(*self.L).ci).func) as i32 - 1 }
+        unsafe {
+            return sdiff((*self.L).top, (*(*self.L).ci).func) as i32 - 1
+        }
     }
 
     // Set the top (non-negative: absolute; negative: relative). New slots
@@ -292,7 +374,9 @@ pub struct Cx {
                 } else {
                     match stack_grow(L, n as isize) {
                         ok() => {},
-                        err(_) => { res = false },
+                        err(_) => {
+                            res = false
+                        },
                     }
                 }
             }
@@ -317,7 +401,11 @@ pub struct Cx {
             let L = self.L
             let t = ptr.offset((*L).top, -1)
             let p = self.idx2val(idx)
-            let m = if n >= 0 { ptr.offset(t, -(n as isize)) } else { ptr.offset(p, -(n as isize) - 1) }
+            let m = if n >= 0 {
+                ptr.offset(t, -(n as isize))
+            } else {
+                ptr.offset(p, -(n as isize) - 1)
+            }
             api_reverse(p, m)
             api_reverse(ptr.offset(m, 1), t)
             api_reverse(p, t)
@@ -372,21 +460,25 @@ pub struct Cx {
 
     // --- Push ---
 
+    // Push nil.
     pub fn push_nil(&mut self) {
         L_push_nil(self.L)
     }
+    // Push a boolean.
     pub fn push_boolean(&mut self, b: bool) {
         unsafe {
             set_bool((*self.L).top, b)
             self.api_incr_top()
         }
     }
+    // Push an integer.
     pub fn push_integer(&mut self, n: i64) {
         unsafe {
             set_int((*self.L).top, n)
             self.api_incr_top()
         }
     }
+    // Push a float.
     pub fn push_number(&mut self, n: f64) {
         unsafe {
             set_float((*self.L).top, n)
@@ -403,6 +495,7 @@ pub struct Cx {
             return ok()
         }
     }
+    // Push a string from UTF-8 text.
     pub fn push_str(&mut self, s: &str) -> void!Throw {
         return self.push_bytes(mem.str_bytes(s))
     }
@@ -416,6 +509,7 @@ pub struct Cx {
             return ok()
         }
     }
+    // Push a light userdata (a raw pointer value).
     pub fn push_light_userdata(&mut self, p: *mut u8) {
         unsafe {
             set_lightud((*self.L).top, p)
@@ -430,6 +524,11 @@ pub struct Cx {
     pub fn push_closure(&mut self, f: NativeFn, n: i32) -> void!Throw {
         unsafe {
             let L = self.L
+            if n == 0 {
+                set_lightfn((*L).top, f)
+                self.api_incr_top()
+                return ok()
+            }
             let cl = nclosure_new(L, f, n as u8)?
             (*L).top = ptr.offset((*L).top, -(n as isize))
             for i in 0isize..(n as isize) {
@@ -449,6 +548,7 @@ pub struct Cx {
             return (*G(self.L)).mainthread == self.L
         }
     }
+    // Push the globals table.
     pub fn push_global_table(&mut self) {
         unsafe {
             let reg = val_gc(G_registry(G(self.L))) as *mut Table
@@ -463,6 +563,7 @@ pub struct Cx {
 
     // --- Type queries ---
 
+    // Type of the value at idx (TNONE for an invalid index).
     pub fn type_of(&self, idx: i32) -> i32 {
         unsafe {
             let v = self.idx2val(idx)
@@ -472,33 +573,42 @@ pub struct Cx {
             return ((*v).tag & 15) as i32
         }
     }
+    // Name of a type code ("no value" for TNONE).
     pub fn type_name(&self, t: i32) -> &str from(static) {
         if t < 0 {
             return "no value"
         }
         return type_name(t as u8)
     }
+    // The index is not valid (above the top).
     pub fn is_none(&self, idx: i32) -> bool {
         return self.type_of(idx) == TNONE
     }
+    // The value is nil.
     pub fn is_nil(&self, idx: i32) -> bool {
         return self.type_of(idx) == TNIL
     }
+    // The index is not valid (above the top).
     pub fn is_none_or_nil(&self, idx: i32) -> bool {
         return self.type_of(idx) <= 0
     }
+    // The value is a boolean.
     pub fn is_boolean(&self, idx: i32) -> bool {
         return self.type_of(idx) == TBOOLEAN
     }
+    // The value is a table.
     pub fn is_table(&self, idx: i32) -> bool {
         return self.type_of(idx) == TTABLE
     }
+    // The value is a function.
     pub fn is_function(&self, idx: i32) -> bool {
         return self.type_of(idx) == TFUNCTION
     }
+    // The value is a thread.
     pub fn is_thread(&self, idx: i32) -> bool {
         return self.type_of(idx) == TTHREAD
     }
+    // The value is a light userdata.
     pub fn is_light_userdata(&self, idx: i32) -> bool {
         return self.type_of(idx) == TLIGHTUSERDATA
     }
@@ -507,8 +617,12 @@ pub struct Cx {
         let t = self.type_of(idx)
         return t == TUSERDATA || t == TLIGHTUSERDATA
     }
+    // The value is a native (Dodo) function.
     pub fn is_native_function(&self, idx: i32) -> bool {
-        unsafe { return (*self.idx2val(idx)).tag == TAG_NCLOSURE }
+        unsafe {
+            let t = (*self.idx2val(idx)).tag
+            return t == TAG_NCLOSURE || t == TAG_LIGHTFN
+        }
     }
     // A number or a string convertible to a number.
     pub fn is_number(&self, idx: i32) -> bool {
@@ -522,10 +636,15 @@ pub struct Cx {
     }
     // An integer value (not a float).
     pub fn is_integer(&self, idx: i32) -> bool {
-        unsafe { return (*self.idx2val(idx)).tag == TAG_INT }
+        unsafe {
+            return (*self.idx2val(idx)).tag == TAG_INT
+        }
     }
+    // The thread can yield here.
     pub fn is_yieldable(&self) -> bool {
-        unsafe { return (*self.L).nny == 0 }
+        unsafe {
+            return (*self.L).nny == 0
+        }
     }
 
     // --- Conversions ---
@@ -546,6 +665,7 @@ pub struct Cx {
         }
         return none
     }
+    // Truth value (false only for nil and false).
     pub fn to_boolean(&self, idx: i32) -> bool {
         return !val_is_falsy(self.idx2val(idx))
     }
@@ -605,7 +725,7 @@ pub struct Cx {
             if t == TAG_USERDATA || t == TAG_LIGHTUD {
                 return self.to_userdata(idx) as *const u8
             }
-            if (t & COLLECTABLE) != 0 {
+            if (t & COLLECTABLE) != 0 || t == TAG_LIGHTFN {
                 return val_ptr(v) as *const u8
             }
             return 0 as *const u8
@@ -628,12 +748,16 @@ pub struct Cx {
             if (*v).tag == TAG_NCLOSURE {
                 return some((*(val_gc(v) as *mut NClosure)).f)
             }
+            if (*v).tag == TAG_LIGHTFN {
+                return some(val_lightfn(v))
+            }
             return none
         }
     }
 
     // --- Comparison and arithmetic ---
 
+    // Primitive equality (no __eq).
     pub fn raw_equal(&self, i1: i32, i2: i32) -> bool {
         let a = self.idx2val(i1)
         let b = self.idx2val(i2)
@@ -743,7 +867,9 @@ pub struct Cx {
     }
 
     fn finish_get_type(&self) -> i32 {
-        unsafe { return ((*ptr.offset((*self.L).top, -1)).tag & 15) as i32 }
+        unsafe {
+            return ((*ptr.offset((*self.L).top, -1)).tag & 15) as i32
+        }
     }
 
     // Push t[k] (t at idx, k popped from the top), with metamethods.
@@ -761,6 +887,35 @@ pub struct Cx {
         let a = self.abs_index(idx)
         self.push_str(name)?
         return self.get_table(a)
+    }
+    // Push t[name] for a byte-string name.
+    pub fn get_field_bytes(&mut self, idx: i32, name: &[u8]) -> i32!Throw {
+        let a = self.abs_index(idx)
+        self.push_bytes(name)?
+        return self.get_table(a)
+    }
+    // t[name] = v (v popped) for a byte-string name.
+    pub fn set_field_bytes(&mut self, idx: i32, name: &[u8]) -> void!Throw {
+        let a = self.abs_index(idx)
+        self.push_bytes(name)?
+        self.insert(-2)
+        return self.set_table(a)
+    }
+    // Push the global with a byte-string name.
+    pub fn get_global_bytes(&mut self, name: &[u8]) -> i32!Throw {
+        self.push_global_table()
+        self.push_bytes(name)?
+        let r = self.get_table(-2)?
+        self.remove(-2)
+        return ok(r)
+    }
+    // Set the global with a byte-string name to the popped value.
+    pub fn set_global_bytes(&mut self, name: &[u8]) -> void!Throw {
+        self.push_global_table()
+        self.insert(-2)
+        self.set_field_bytes(-2, name)?
+        self.pop(1)
+        return ok()
     }
     // Push t[n].
     pub fn get_i(&mut self, idx: i32, n: i64) -> i32!Throw {
@@ -810,7 +965,9 @@ pub struct Cx {
     }
 
     fn table_at(&self, idx: i32) -> *mut Table {
-        unsafe { return val_gc(self.idx2val(idx)) as *mut Table }
+        unsafe {
+            return val_gc(self.idx2val(idx)) as *mut Table
+        }
     }
 
     // Raw t[k] (k popped, value pushed); t must be a table.
@@ -1100,7 +1257,9 @@ pub struct Cx {
 
     // Thread status (OK, YIELD or an error status).
     pub fn status(&self) -> i32 {
-        unsafe { return (*self.L).status as i32 }
+        unsafe {
+            return (*self.L).status as i32
+        }
     }
 
     // Push a new coroutine; returns its handle.
@@ -1163,9 +1322,13 @@ pub struct Cx {
     pub fn gc_collect(&mut self) {
         gc_full(self.L, false)
     }
+    // Stop the collector (emergency collections still run).
     pub fn gc_stop(&mut self) {
-        unsafe { (*G(self.L)).gcstp = GCSTP_USR }
+        unsafe {
+            (*G(self.L)).gcstp = GCSTP_USR
+        }
     }
+    // Restart the collector.
     pub fn gc_restart(&mut self) {
         unsafe {
             let g = G(self.L)
@@ -1173,12 +1336,17 @@ pub struct Cx {
             (*g).gcstp = 0
         }
     }
+    // Whether the collector is running.
     pub fn gc_is_running(&self) -> bool {
-        unsafe { return (*G(self.L)).gcstp == 0 }
+        unsafe {
+            return (*G(self.L)).gcstp == 0
+        }
     }
     // Memory in use, in bytes.
     pub fn gc_count_bytes(&self) -> usize {
-        unsafe { return (*G(self.L)).total_bytes as usize }
+        unsafe {
+            return (*G(self.L)).total_bytes as usize
+        }
     }
     // One step (`kb`: extra kilobytes of debt, 0 for a basic step); true if
     // a cycle finished.
@@ -1190,7 +1358,11 @@ pub struct Cx {
     pub fn gc_incremental(&mut self, pause: i32, stepmul: i32, stepsize: i32) -> &str from(static) {
         unsafe {
             let g = G(self.L)
-            let prev = if (*g).gckind == GC_KIND_GEN { "generational" } else { "incremental" }
+            let prev = if (*g).gckind == GC_KIND_GEN {
+                "generational"
+            } else {
+                "incremental"
+            }
             if pause != 0 {
                 (*g).gcpause = (pause / 4) * 4
             }
@@ -1208,7 +1380,11 @@ pub struct Cx {
     pub fn gc_generational(&mut self, minormul: i32, majormul: i32) -> &str from(static) {
         unsafe {
             let g = G(self.L)
-            let prev = if (*g).gckind == GC_KIND_GEN { "generational" } else { "incremental" }
+            let prev = if (*g).gckind == GC_KIND_GEN {
+                "generational"
+            } else {
+                "incremental"
+            }
             if minormul != 0 {
                 (*g).gen_minormul = minormul
             }
@@ -1428,14 +1604,23 @@ pub struct Cx {
             (*self.L).hookcount = 0
         }
     }
+    // Current hook mask.
     pub fn get_hook_mask(&self) -> i32 {
-        unsafe { return (*self.L).hookmask as i32 }
+        unsafe {
+            return (*self.L).hookmask as i32
+        }
     }
+    // Current hook count.
     pub fn get_hook_count(&self) -> i32 {
-        unsafe { return (*self.L).basehookcount }
+        unsafe {
+            return (*self.L).basehookcount
+        }
     }
+    // Whether a hook is installed.
     pub fn has_hook(&self) -> bool {
-        unsafe { return (*self.L).has_hook }
+        unsafe {
+            return (*self.L).has_hook
+        }
     }
 
     // --- Loading ---
@@ -1473,6 +1658,7 @@ pub struct Cx {
     pub fn arg_error(&mut self, arg: i32, msg: &str) -> Throw {
         return aux_arg_error(self, arg, mem.str_bytes(msg))
     }
+    // arg_error with a byte-string message.
     pub fn arg_error_bytes(&mut self, arg: i32, msg: &[u8]) -> Throw {
         return aux_arg_error(self, arg, msg)
     }
@@ -1481,18 +1667,26 @@ pub struct Cx {
         b := SBuf.new(self.L)
         match b.add_str(tname) {
             ok() => {},
-            err(e) => { return e },
+            err(e) => {
+                return e
+            },
         }
         match b.add_str(" expected, got ") {
             ok() => {},
-            err(e) => { return e },
+            err(e) => {
+                return e
+            },
         }
         match aux_typename_for_error(self, arg, &mut b) {
             ok() => {},
-            err(e) => { return e },
+            err(e) => {
+                return e
+            },
         }
         let n = b.n
-        unsafe { return aux_arg_error(self, arg, ptr.borrow_slice(b.data as *const u8, n, &b)) }
+        unsafe {
+            return aux_arg_error(self, arg, ptr.borrow_slice(b.data as *const u8, n, &b))
+        }
     }
     fn tag_error(&mut self, arg: i32, t: i32) -> Throw {
         return self.type_error(arg, type_name(t as u8))
@@ -1511,9 +1705,12 @@ pub struct Cx {
         }
         return ok()
     }
+    // Integer argument (integral floats and numeric strings convert).
     pub fn check_integer(&mut self, arg: i32) -> i64!Throw {
         match self.to_integer(arg) {
-            some(v) => { return ok(v) },
+            some(v) => {
+                return ok(v)
+            },
             none => {
                 if self.is_number(arg) {
                     return err(self.arg_error(arg, "number has no integer representation"))
@@ -1522,18 +1719,25 @@ pub struct Cx {
             },
         }
     }
+    // Optional integer argument.
     pub fn opt_integer(&mut self, arg: i32, def: i64) -> i64!Throw {
         if self.is_none_or_nil(arg) {
             return ok(def)
         }
         return self.check_integer(arg)
     }
+    // Number argument (numeric strings convert).
     pub fn check_number(&mut self, arg: i32) -> f64!Throw {
         match self.to_number(arg) {
-            some(v) => { return ok(v) },
-            none => { return err(self.tag_error(arg, TNUMBER)) },
+            some(v) => {
+                return ok(v)
+            },
+            none => {
+                return err(self.tag_error(arg, TNUMBER))
+            },
         }
     }
+    // Optional number argument.
     pub fn opt_number(&mut self, arg: i32, def: f64) -> f64!Throw {
         if self.is_none_or_nil(arg) {
             return ok(def)
@@ -1543,8 +1747,12 @@ pub struct Cx {
     // String argument (numbers are converted in place).
     pub fn check_lstr(&mut self, arg: i32) -> LuaStr!Throw {
         match self.to_lstr(arg)? {
-            some(s) => { return ok(s) },
-            none => { return err(self.tag_error(arg, TSTRING)) },
+            some(s) => {
+                return ok(s)
+            },
+            none => {
+                return err(self.tag_error(arg, TSTRING))
+            },
         }
     }
     // Optional string argument with a static default.
@@ -1554,12 +1762,14 @@ pub struct Cx {
         }
         return self.check_lstr(arg)
     }
+    // Raise "value expected" if the argument is absent.
     pub fn check_any(&mut self, arg: i32) -> void!Throw {
         if self.type_of(arg) == TNONE {
             return err(self.arg_error(arg, "value expected"))
         }
         return ok()
     }
+    // Raise a type error unless the argument has type t.
     pub fn check_type(&mut self, arg: i32, t: i32) -> void!Throw {
         if self.type_of(arg) != t {
             return err(self.tag_error(arg, t))
@@ -1585,7 +1795,9 @@ pub struct Cx {
         b.add_bytes(nb)?
         b.add_str("'")?
         let n = b.n
-        unsafe { return err(aux_arg_error(self, arg, ptr.borrow_slice(b.data as *const u8, n, &b))) }
+        unsafe {
+            return err(aux_arg_error(self, arg, ptr.borrow_slice(b.data as *const u8, n, &b)))
+        }
     }
     // Grow the stack or raise "stack overflow (msg)".
     pub fn check_stack_msg(&mut self, n: i32, msg: &str) -> void!Throw {
@@ -1607,15 +1819,20 @@ pub struct Cx {
         b := SBuf.new(self.L)
         match b.add_str(msg) {
             ok() => {},
-            err(e) => { return e },
+            err(e) => {
+                return e
+            },
         }
         return aux_raise(self, &mut b)
     }
+    // error_msg with a byte-string message.
     pub fn error_bytes(&mut self, msg: &[u8]) -> Throw {
         b := SBuf.new(self.L)
         match b.add_bytes(msg) {
             ok() => {},
-            err(e) => { return e },
+            err(e) => {
+                return e
+            },
         }
         return aux_raise(self, &mut b)
     }
@@ -1627,7 +1844,9 @@ pub struct Cx {
     pub fn where_(&mut self, level: i32) -> void!Throw {
         b := SBuf.new(self.L)
         aux_where(self, &mut b, level)?
-        unsafe { return self.push_raw_bytes(b.data as *const u8, b.n) }
+        unsafe {
+            return self.push_raw_bytes(b.data as *const u8, b.n)
+        }
     }
     // Push field `event` of the metatable of obj; returns its type (TNIL,
     // pushing nothing, when absent).
@@ -1682,7 +1901,9 @@ pub struct Cx {
                 if tt == TSTRING {
                     let s = self.to_lstr(-1)?
                     match s {
-                        some(v) => { b.add_raw(v.as_ptr(), v.size())? },
+                        some(v) => {
+                            b.add_raw(v.as_ptr(), v.size())?
+                        },
                         none => {},
                     }
                 } else {
@@ -1692,13 +1913,21 @@ pub struct Cx {
                     self.pop(1)
                 }
                 b.add_str(": ")?
-                unsafe { b.add_pointer(self.to_pointer(idx) as *mut u8)? }
-                unsafe { self.push_raw_bytes(b.data as *const u8, b.n)? }
+                unsafe {
+                    b.add_pointer(self.to_pointer(idx) as *mut u8)?
+                }
+                unsafe {
+                    self.push_raw_bytes(b.data as *const u8, b.n)?
+                }
             }
         }
         match self.to_lstr(-1)? {
-            some(s) => { return ok(s) },
-            none => { return err(self.error_msg("'__tostring' must return a string")) },
+            some(s) => {
+                return ok(s)
+            },
+            none => {
+                return err(self.error_msg("'__tostring' must return a string"))
+            },
         }
     }
     // Length of the value at idx (with __len) as an integer.
@@ -1709,7 +1938,9 @@ pub struct Cx {
                 self.pop(1)
                 return ok(v)
             },
-            none => { return err(self.error_msg("object length is not an integer")) },
+            none => {
+                return err(self.error_msg("object length is not an integer"))
+            },
         }
     }
     // Create (or find) registry[tname] as a metatable with __name = tname
@@ -1750,7 +1981,9 @@ pub struct Cx {
                 }
             }
         }
-        unsafe { return ok(0 as *mut u8) }
+        unsafe {
+            return ok(0 as *mut u8)
+        }
     }
     // Like test_udata, raising a type error on mismatch.
     pub fn check_udata(&mut self, arg: i32, tname: &str) -> (*mut u8)!Throw {
@@ -1828,7 +2061,9 @@ pub struct Cx {
         self.raw_get_i(t, 0)
         r := 0i32
         match self.to_integer(-1) {
-            some(v) => { r = v as i32 },
+            some(v) => {
+                r = v as i32
+            },
             none => {},
         }
         self.pop(1)
@@ -1882,13 +2117,32 @@ pub struct Cx {
                 i += 1
             }
         }
-        unsafe { return self.push_raw_bytes(b.data as *const u8, b.n) }
+        unsafe {
+            return self.push_raw_bytes(b.data as *const u8, b.n)
+        }
+    }
+    // Results of a process operation (luaL_execresult): `exited` tells
+    // whether the process terminated normally (with exit status `code`) or
+    // by a signal (number `code`). Pushes true|fail, "exit"|"signal", code.
+    pub fn exec_result(&mut self, exited: bool, code: i64) -> i32!Throw {
+        if exited && code == 0 {
+            self.push_boolean(true)
+        } else {
+            self.push_fail()
+        }
+        if exited {
+            self.push_str("exit")?
+        } else {
+            self.push_str("signal")?
+        }
+        self.push_integer(code)
+        return ok(3)
     }
     // Results of a file operation (luaL_fileresult): true, or
     // fail, "fname: message", errno.
     pub fn file_result(&mut self, success: bool, fname: Option<&[u8]>) -> i32!Throw {
         unsafe {
-            let code = dodo_platform_errno()
+            let code = os_error_code()
             if success {
                 self.push_boolean(true)
                 return ok(1)
@@ -2015,7 +2269,9 @@ fn api_load(L: *mut State, data: *const u8, size: usize, chunkname: &[u8], mode:
         let top_off = save_stack(L, (*L).top)
         let r = load_chunk(L, data, size, chunkname, mode)
         match r {
-            ok() => { return ST_OK as i32 },
+            ok() => {
+                return ST_OK as i32
+            },
             err(e) => {
                 let st = throw_status(e)
                 (*L).top = restore_stack(L, top_off)
@@ -2047,7 +2303,9 @@ fn load_chunk(L: *mut State, data: *const u8, size: usize, chunkname: &[u8], mod
         p := 0 as *mut Proto
         if isbinary {
             match undump(L, data, size, name) {
-                ok(x) => { p = x },
+                ok(x) => {
+                    p = x
+                },
                 err(e) => {
                     (*g).gcstp = oldstp
                     return err(e)
@@ -2055,7 +2313,9 @@ fn load_chunk(L: *mut State, data: *const u8, size: usize, chunkname: &[u8], mod
             }
         } else {
             match compile(L, data as *mut u8, size, name) {
-                ok(x) => { p = x },
+                ok(x) => {
+                    p = x
+                },
                 err(e) => {
                     (*g).gcstp = oldstp
                     return err(e)
@@ -2104,11 +2364,17 @@ fn load_mode_error(L: *mut State, kind: &str, mode: &[u8]) -> Throw {
     b := SBuf.new(L)
     match load_mode_error_build(&mut b, kind, mode) {
         ok() => {},
-        err(e) => { return e },
+        err(e) => {
+            return e
+        },
     }
     match b.to_lstring() {
-        ok(s) => { err_set_msg(L, s) },
-        err(e) => { return e },
+        ok(s) => {
+            err_set_msg(L, s)
+        },
+        err(e) => {
+            return e
+        },
     }
     return Throw.Syntax
 }

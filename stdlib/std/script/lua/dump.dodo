@@ -104,17 +104,29 @@ fn dp_function(b: &mut SBuf, f: *mut Proto, psource: *mut LString, strip: bool) 
             dp_function(b, *ptr.offset((*f).p, i as isize), (*f).source, strip)?
         }
         // Debug information.
-        let nli = if strip { 0i32 } else { (*f).sizelineinfo }
+        let nli = if strip {
+            0i32
+        } else {
+            (*f).sizelineinfo
+        }
         dp_int(b, nli)?
         b.add_raw((*f).lineinfo as *const u8, nli as usize)?
-        let nabs = if strip { 0i32 } else { (*f).sizeabslineinfo }
+        let nabs = if strip {
+            0i32
+        } else {
+            (*f).sizeabslineinfo
+        }
         dp_int(b, nabs)?
         for i in 0i32..nabs {
             let a = ptr.offset((*f).abslineinfo, i as isize)
             dp_int(b, (*a).pc)?
             dp_int(b, (*a).line)?
         }
-        let nloc = if strip { 0i32 } else { (*f).sizelocvars }
+        let nloc = if strip {
+            0i32
+        } else {
+            (*f).sizelocvars
+        }
         dp_int(b, nloc)?
         for i in 0i32..nloc {
             let v = ptr.offset((*f).locvars, i as isize)
@@ -122,7 +134,11 @@ fn dp_function(b: &mut SBuf, f: *mut Proto, psource: *mut LString, strip: bool) 
             dp_int(b, (*v).startpc)?
             dp_int(b, (*v).endpc)?
         }
-        let nupn = if strip { 0i32 } else { (*f).sizeupvalues }
+        let nupn = if strip {
+            0i32
+        } else {
+            (*f).sizeupvalues
+        }
         dp_int(b, nupn)?
         for i in 0i32..nupn {
             dp_string(b, (*ptr.offset((*f).upvalues, i as isize)).name)?

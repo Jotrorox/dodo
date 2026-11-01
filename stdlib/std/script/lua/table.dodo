@@ -36,6 +36,8 @@ struct Table {
     flags: u8
     lsizenode: u8
     asize: u32
+    // Last border found in the array part (a hint for `#t`).
+    lenhint: u32
     array: *mut Value
     node: *mut Node
     // Free-position cursor (moves downwards); null for the shared dummy node.
@@ -59,43 +61,59 @@ unsafe extern "C" fn frexp(x: f64, e: *mut i32) -> f64
 
 fn dummy_node() -> *mut Node {
     unsafe {
-        unsafe { return ptr.from_mut(&mut DUMMY_NODE) }
+        unsafe {
+            return ptr.from_mut(&mut DUMMY_NODE)
+        }
     }
 }
 
 fn gnode(t: *mut Table, i: isize) -> *mut Node {
     unsafe {
-        unsafe { return ptr.offset((*t).node, i) }
+        unsafe {
+            return ptr.offset((*t).node, i)
+        }
     }
 }
 fn node_val(n: *mut Node) -> *mut Value {
     unsafe {
-        unsafe { return n as *mut Value }
+        unsafe {
+            return n as *mut Value
+        }
     }
 }
 fn node_size(t: *mut Table) -> isize {
     unsafe {
-        unsafe { return 1isize << ((*t).lsizenode as isize) }
+        unsafe {
+            return 1isize << ((*t).lsizenode as isize)
+        }
     }
 }
 fn tab_is_dummy(t: *mut Table) -> bool {
     unsafe {
-        unsafe { return ptr.is_null((*t).lastfree) }
+        unsafe {
+            return ptr.is_null((*t).lastfree)
+        }
     }
 }
 fn node_next(n: *mut Node) -> *mut Node {
     unsafe {
-        unsafe { return ptr.offset(n, (*n).next as isize) }
+        unsafe {
+            return ptr.offset(n, (*n).next as isize)
+        }
     }
 }
 fn val_is_empty(v: *mut Value) -> bool {
     unsafe {
-        unsafe { return ((*v).tag & 15) == TYPE_NIL }
+        unsafe {
+            return ((*v).tag & 15) == TYPE_NIL
+        }
     }
 }
 fn absent_key() -> *mut Value {
     unsafe {
-        unsafe { return ptr.from_mut(&mut ABSENT_VALUE) }
+        unsafe {
+            return ptr.from_mut(&mut ABSENT_VALUE)
+        }
     }
 }
 
@@ -119,19 +137,25 @@ fn node_set_key(n: *mut Node, key: *mut Value) {
 fn f2bits(f: f64) -> u64 {
     unsafe {
         x := f
-        unsafe { return *(ptr.from_mut(&mut x) as *mut u64) }
+        unsafe {
+            return *(ptr.from_mut(&mut x) as *mut u64)
+        }
     }
 }
 fn i2u(i: i64) -> u64 {
     unsafe {
         x := i
-        unsafe { return *(ptr.from_mut(&mut x) as *mut u64) }
+        unsafe {
+            return *(ptr.from_mut(&mut x) as *mut u64)
+        }
     }
 }
 fn u2i(u: u64) -> i64 {
     unsafe {
         x := u
-        unsafe { return *(ptr.from_mut(&mut x) as *mut i64) }
+        unsafe {
+            return *(ptr.from_mut(&mut x) as *mut i64)
+        }
     }
 }
 
@@ -144,6 +168,7 @@ fn tab_new(L: *mut State) -> (*mut Table)!Throw {
         (*t).flags = TM_CACHE_MASK
         (*t).lsizenode = 0
         (*t).asize = 0
+        (*t).lenhint = 0
         (*t).array = 0 as *mut Value
         (*t).node = dummy_node()
         (*t).lastfree = 0 as *mut Node
@@ -216,7 +241,9 @@ fn float_hash(n: f64) -> u64 {
 
 fn hash_pointer(t: *mut Table, p: *mut u8) -> *mut Node {
     unsafe {
-        unsafe { return hash_mod(t, ((p as usize) & 0xFFFFFFFF) as u64) }
+        unsafe {
+            return hash_mod(t, ((p as usize) & 0xFFFFFFFF) as u64)
+        }
     }
 }
 
@@ -283,7 +310,12 @@ fn node_key_equals(n: *mut Node, key: *mut Value, dead_ok: bool) -> bool {
 fn tab_get_int(t: *mut Table, key: i64) -> *mut Value {
     unsafe {
         let idx = core.wrapping_sub(i2u(key), 1)
+        if idx < ((*t).lenhint as u64) {
+            return ptr.offset((*t).array, idx as isize)
+        }
         if idx < ((*t).asize as u64) {
+            // Accessing above the length hint moves it (see tab_length).
+            (*t).lenhint = key as u32
             return ptr.offset((*t).array, idx as isize)
         }
         n := hash_int(t, key)
@@ -463,7 +495,9 @@ fn tab_new_key(L: *mut State, t: *mut Table, key0: *mut Value, val: *mut Value) 
 
 fn node_offset(a: *mut Node, b: *mut Node) -> i32 {
     unsafe {
-        unsafe { return ((((a as isize) - (b as isize)) / (NODE_SIZE as isize))) as i32 }
+        unsafe {
+            return ((((a as isize) - (b as isize)) / (NODE_SIZE as isize))) as i32
+        }
     }
 }
 
@@ -678,7 +712,9 @@ fn tab_resize(L: *mut State, t: *mut Table, newasize: u32, nhsize: u32) -> void!
                 newarray = 0 as *mut Value
             } else {
                 match mem_alloc(L, (newasize as usize) * 16) {
-                    ok(p) => { newarray = p as *mut Value },
+                    ok(p) => {
+                        newarray = p as *mut Value
+                    },
                     err(e) => {
                         if newnsize > 0 {
                             mem_free(L, newnode as *mut u8, (newnsize as usize) * NODE_SIZE)
@@ -686,7 +722,11 @@ fn tab_resize(L: *mut State, t: *mut Table, newasize: u32, nhsize: u32) -> void!
                         return err(e)
                     },
                 }
-                let keep = if oldasize < newasize { oldasize } else { newasize }
+                let keep = if oldasize < newasize {
+                    oldasize
+                } else {
+                    newasize
+                }
                 if keep > 0 {
                     ptr.copy_nonoverlapping(oldarray, newarray, keep as usize)
                 }
@@ -701,6 +741,7 @@ fn tab_resize(L: *mut State, t: *mut Table, newasize: u32, nhsize: u32) -> void!
         let oldnsize = node_size(t)
         (*t).array = newarray
         (*t).asize = newasize
+        (*t).lenhint = newasize
         (*t).node = newnode
         (*t).lsizenode = newlsize
         if newnsize > 0 {
@@ -740,69 +781,118 @@ fn tab_resize(L: *mut State, t: *mut Table, newasize: u32, nhsize: u32) -> void!
 // Resize only the array part (used by SETLIST and the API).
 fn tab_resize_array(L: *mut State, t: *mut Table, newasize: u32) -> void!Throw {
     unsafe {
-        let nh = if tab_is_dummy(t) { 0u32 } else { node_size(t) as u32 }
+        let nh = if tab_is_dummy(t) {
+            0u32
+        } else {
+            node_size(t) as u32
+        }
         return tab_resize(L, t, newasize, nh)
     }
 }
 
 // --- Length -----------------------------------------------------------------
 
+fn is_pow2(x: u32) -> bool {
+    return x != 0 && (x & (x - 1)) == 0
+}
+
+// Border search in the array: `lo` is 0 or a present index, `hi` an absent
+// one; returns some border between them.
+fn array_border(arr: *mut Value, lo0: u32, hi0: u32) -> u32 {
+    unsafe {
+        lo := lo0
+        hi := hi0
+        for hi - lo > 1 {
+            let m = lo + (hi - lo) / 2
+            if val_is_empty(ptr.offset(arr, (m - 1) as isize)) {
+                hi = m
+            } else {
+                lo = m
+            }
+        }
+        return lo
+    }
+}
+
+// Unbounded search in the hash part: `j` is present (or 0 with t[1]
+// present); doubles until an absent index, then binary-searches.
+fn hash_border(t: *mut Table, j0: u64) -> u64 {
+    i := 0u64
+    j := j0
+    if j == 0 {
+        j = 1
+    }
+    for {
+        i = j
+        if j <= 4611686018427387903u64 {
+            j = j * 2
+        } else {
+            j = 9223372036854775807u64
+            if val_is_empty(tab_get_int(t, j as i64)) {
+                break
+            }
+            return j
+        }
+        if val_is_empty(tab_get_int(t, j as i64)) {
+            break
+        }
+    }
+    for j - i > 1 {
+        let m = i + (j - i) / 2
+        if val_is_empty(tab_get_int(t, m as i64)) {
+            j = m
+        } else {
+            i = m
+        }
+    }
+    return i
+}
+
 // Some border of the table: an index n with t[n] ~= nil and t[n+1] == nil
-// (or 0 when t[1] == nil).
+// (or 0 when t[1] == nil). Which border is returned for tables with holes
+// follows the reference implementation: `lenhint` remembers a border inside
+// the array part (it equals asize unless a border was found below it), and
+// is only moved when the array size is a power of two.
 fn tab_length(t: *mut Table) -> u64 {
     unsafe {
         let asize = (*t).asize
         let arr = (*t).array
-        if asize > 0 && val_is_empty(ptr.offset(arr, (asize - 1) as isize)) {
-            // The border is in the array part.
-            if asize >= 2 && !val_is_empty(ptr.offset(arr, (asize - 2) as isize)) {
-                return (asize - 1) as u64
-            }
-            lo := 0u32
-            hi := asize
-            for hi - lo > 1 {
-                let m = lo + (hi - lo) / 2
-                if val_is_empty(ptr.offset(arr, (m - 1) as isize)) {
-                    hi = m
-                } else {
-                    lo = m
-                }
-            }
-            return lo as u64
+        limit := (*t).lenhint
+        if limit > asize {
+            limit = asize
+            (*t).lenhint = asize
         }
+        if limit > 0 && val_is_empty(ptr.offset(arr, (limit - 1) as isize)) {
+            // A border lies below the hint.
+            if limit >= 2 && !val_is_empty(ptr.offset(arr, (limit - 2) as isize)) {
+                if is_pow2(asize) && !is_pow2(limit - 1) {
+                    (*t).lenhint = limit - 1
+                }
+                return (limit - 1) as u64
+            }
+            let border = array_border(arr, 0, limit)
+            if is_pow2(asize) && border > asize / 2 {
+                (*t).lenhint = border
+            }
+            return border as u64
+        }
+        if limit != asize {
+            // The hint is present: is the next slot a border?
+            if val_is_empty(ptr.offset(arr, limit as isize)) {
+                return limit as u64
+            }
+            if val_is_empty(ptr.offset(arr, (asize - 1) as isize)) {
+                let border = array_border(arr, limit, asize)
+                (*t).lenhint = border
+                return border as u64
+            }
+            (*t).lenhint = asize
+        }
+        // The array part is full (or empty): continue in the hash part.
         if tab_is_dummy(t) || val_is_empty(tab_get_int(t, (asize as i64) + 1)) {
             return asize as u64
         }
-        // Probe the hash part with doubling, then binary search.
-        i := asize as u64
-        j := i
-        if j == 0 {
-            j = 1
-        }
-        for {
-            i = j
-            if j <= 4611686018427387903u64 {
-                j = j * 2
-            } else {
-                j = 9223372036854775807u64
-                if val_is_empty(tab_get_int(t, j as i64)) {
-                    break
-                }
-                return j
-            }
-            if val_is_empty(tab_get_int(t, j as i64)) {
-                break
-            }
-        }
-        for j - i > 1 {
-            let m = i + (j - i) / 2
-            if val_is_empty(tab_get_int(t, m as i64)) {
-                j = m
-            } else {
-                i = m
-            }
-        }
-        return i
+        return hash_border(t, asize as u64)
     }
 }
 

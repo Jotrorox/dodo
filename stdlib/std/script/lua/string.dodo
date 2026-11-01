@@ -79,7 +79,9 @@ fn str_table_resize(L: *mut State, newsize: i32) {
         let g = G(L)
         let arr = match mem_alloc(L, (newsize as usize) * 8) {
             ok(p) => p as *mut *mut LString,
-            err(_) => { return },
+            err(_) => {
+                return
+            },
         }
         for i in 0i32..newsize {
             *ptr.offset(arr, i as isize) = 0 as *mut LString
@@ -241,27 +243,32 @@ fn str_compare(a: *mut LString, b: *mut LString) -> i32 {
     unsafe {
         let la = (*a).length
         let lb = (*b).length
-        let n = if la < lb { la } else { lb }
+        let n = if la < lb {
+            la
+        } else {
+            lb
+        }
         let pa = str_data(a)
         let pb = str_data(b)
         for i in 0usize..n {
             let x = *ptr.offset(pa, i as isize)
             let y = *ptr.offset(pb, i as isize)
             if x != y {
-                return if x < y { -1 } else { 1 }
+                return if x < y {
+                    -1
+                } else {
+                    1
+                }
             }
         }
         if la == lb {
             return 0
         }
-        return if la < lb { -1 } else { 1 }
-    }
-}
-
-// View of a string's bytes, valid while the string is alive.
-fn str_bytes(s: *mut LString) -> &[u8] from(static) {
-    unsafe {
-        return ptr.borrow_slice(str_data(s) as *const u8, (*s).length, b"")
+        return if la < lb {
+            -1
+        } else {
+            1
+        }
     }
 }
 

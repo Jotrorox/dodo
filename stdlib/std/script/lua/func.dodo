@@ -5,6 +5,22 @@ import "core/ptr"
 
 // Prototypes, closures, upvalues and full userdata.
 
+// Light native function: a native function without upvalues stored
+// directly in a Value (not collectable; equal values have the same function).
+const TAG_LIGHTFN: u8 = 0x26
+
+fn set_lightfn(v: *mut Value, f: NativeFn) {
+    unsafe {
+        *(v as *mut NativeFn) = f
+        (*v).tag = TAG_LIGHTFN
+    }
+}
+fn val_lightfn(v: *mut Value) -> NativeFn {
+    unsafe {
+        return *(v as *mut NativeFn)
+    }
+}
+
 // Upvalue: while open it points at a stack slot of its thread; when closed
 // it owns the value.
 struct UpVal {
@@ -52,28 +68,38 @@ struct Udata {
 
 fn upval_value(uv: *mut UpVal) -> *mut Value {
     unsafe {
-        unsafe { return ptr.offset(uv as *mut u8, mem.offset_of::<UpVal>("value") as isize) as *mut Value }
+        unsafe {
+            return ptr.offset(uv as *mut u8, mem.offset_of::<UpVal>("value") as isize) as *mut Value
+        }
     }
 }
 fn upval_is_open(uv: *mut UpVal) -> bool {
     unsafe {
-        unsafe { return (*uv).v != upval_value(uv) }
+        unsafe {
+            return (*uv).v != upval_value(uv)
+        }
     }
 }
 
 fn lcl_upvals(cl: *mut LClosure) -> *mut *mut UpVal {
     unsafe {
-        unsafe { return ptr.offset(cl as *mut u8, mem.size_of::<LClosure>() as isize) as *mut *mut UpVal }
+        unsafe {
+            return ptr.offset(cl as *mut u8, mem.size_of::<LClosure>() as isize) as *mut *mut UpVal
+        }
     }
 }
 fn lcl_upval(cl: *mut LClosure, i: isize) -> *mut UpVal {
     unsafe {
-        unsafe { return *ptr.offset(lcl_upvals(cl), i) }
+        unsafe {
+            return *ptr.offset(lcl_upvals(cl), i)
+        }
     }
 }
 fn ncl_upvalues(cl: *mut NClosure) -> *mut Value {
     unsafe {
-        unsafe { return ptr.offset(cl as *mut u8, mem.size_of::<NClosure>() as isize) as *mut Value }
+        unsafe {
+            return ptr.offset(cl as *mut u8, mem.size_of::<NClosure>() as isize) as *mut Value
+        }
     }
 }
 fn lcl_size(n: u8) -> usize {
@@ -100,12 +126,16 @@ fn udata_mem_size(nuv: u16, size: usize) -> usize {
 }
 fn udata_uv(u: *mut Udata, i: isize) -> *mut Value {
     unsafe {
-        unsafe { return ptr.offset(ptr.offset(u as *mut u8, mem.size_of::<Udata>() as isize) as *mut Value, i) }
+        unsafe {
+            return ptr.offset(ptr.offset(u as *mut u8, mem.size_of::<Udata>() as isize) as *mut Value, i)
+        }
     }
 }
 fn udata_data(u: *mut Udata) -> *mut u8 {
     unsafe {
-        unsafe { return ptr.offset(u as *mut u8, udata_header_size((*u).nuvalue) as isize) }
+        unsafe {
+            return ptr.offset(u as *mut u8, udata_header_size((*u).nuvalue) as isize)
+        }
     }
 }
 

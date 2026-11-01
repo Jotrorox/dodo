@@ -24,11 +24,17 @@ fn ud_error(S: &mut LoadState, why: &str) -> Throw {
         r := ud_error_build(&mut b, d, len, why)
         match r {
             ok() => {},
-            err(e) => { return e },
+            err(e) => {
+                return e
+            },
         }
         match b.to_lstring() {
-            ok(s) => { err_set_msg(S.L, s) },
-            err(e) => { return e },
+            ok(s) => {
+                err_set_msg(S.L, s)
+            },
+            err(e) => {
+                return e
+            },
         }
         return Throw.Syntax
     }
@@ -55,7 +61,9 @@ fn ud_block(S: &mut LoadState, out: *mut u8, n: usize) -> void!Throw {
         if S.size - S.pos < n {
             return err(ud_error(S, "truncated chunk"))
         }
-        unsafe { ptr.copy_nonoverlapping(ptr.offset(S.data, S.pos as isize), out, n) }
+        unsafe {
+            ptr.copy_nonoverlapping(ptr.offset(S.data, S.pos as isize), out, n)
+        }
         S.pos = S.pos + n
         return ok()
     }

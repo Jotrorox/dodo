@@ -27,8 +27,12 @@ fn co_status_name(s: i32) -> &str from(static) {
 fn co_get(cx: &mut Cx) -> Cx!Throw {
     unsafe {
         match cx.to_thread(1) {
-            some(co) => { return ok(co) },
-            none => { return err(cx.type_error(1, "coroutine")) },
+            some(co) => {
+                return ok(co)
+            },
+            none => {
+                return err(cx.type_error(1, "coroutine"))
+            },
         }
     }
 }
@@ -78,8 +82,12 @@ fn co_auxwrap(cx: &mut Cx) -> i32!Throw {
     unsafe {
         co := Cx { L: 0 as *mut State }
         match cx.to_thread(upvalue_index(1)) {
-            some(c) => { co = c },
-            none => { return err(cx.error_msg("invalid coroutine")) },
+            some(c) => {
+                co = c
+            },
+            none => {
+                return err(cx.error_msg("invalid coroutine"))
+            },
         }
         let narg = cx.get_top()
         let r = co_aux_resume(cx, &mut co, narg)?

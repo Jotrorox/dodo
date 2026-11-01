@@ -18,7 +18,6 @@ unsafe extern "C" fn fflush(f: *mut u8) -> i32
 unsafe extern "C" fn ferror(f: *mut u8) -> i32
 unsafe extern "C" fn strerror(code: i32) -> *const u8
 unsafe extern "C" fn strlen(s: *const u8) -> usize
-unsafe extern "C" fn dodo_platform_errno() -> i32
 
 static mut SYS_STDIN: usize = 0
 static mut SYS_STDOUT: usize = 0
@@ -59,9 +58,12 @@ pub fn write_stdout(b: &[u8]) {
         }
     }
 }
+// Flush the shared standard output stream.
 pub fn flush_stdout() {
     unsafe {
-        unsafe { fflush(c_stdout()) }
+        unsafe {
+            fflush(c_stdout())
+        }
     }
 }
 // Write bytes to standard error (flushed immediately).
@@ -82,10 +84,16 @@ fn write_stderr_raw(p: *const u8, n: usize) {
     }
 }
 
+// Code of the last operating-system error (errno on POSIX systems).
+fn os_error_code() -> i32 {
+    let e = platform_native.last_error()
+    return e.code
+}
+
 // Message of the last C library error (errno).
 pub fn last_os_error_message() -> &[u8] from(static) {
     unsafe {
-        let code = dodo_platform_errno()
+        let code = os_error_code()
         let s = strerror(code)
         return ptr.borrow_slice(s, strlen(s), b"")
     }
@@ -138,24 +146,31 @@ fn warn_emit(L: *mut State, msg: &[u8], tocont: bool) {
 pub struct Buffer {
     b: SBuf
 
+    // An empty buffer accounted to the state of cx.
     pub fn new(cx: &Cx) -> Buffer {
         return Buffer { b: SBuf.new(cx.L) }
     }
+    // Append bytes.
     pub fn add_bytes(&mut self, s: &[u8]) -> void!Throw {
         return self.b.add_bytes(s)
     }
+    // Append UTF-8 text.
     pub fn add_str(&mut self, s: &str) -> void!Throw {
         return self.b.add_str(s)
     }
+    // Append one byte.
     pub fn add_char(&mut self, c: u8) -> void!Throw {
         return self.b.add_char(c)
     }
+    // Append n bytes from a pointer.
     pub fn add_raw(&mut self, p: *const u8, n: usize) -> void!Throw {
         return self.b.add_raw(p, n)
     }
+    // Append an integer in decimal.
     pub fn add_integer(&mut self, v: i64) -> void!Throw {
         return self.b.add_int(v)
     }
+    // Append a float as `tostring` formats it.
     pub fn add_number(&mut self, v: f64) -> void!Throw {
         return self.b.add_float(v)
     }
@@ -171,28 +186,40 @@ pub struct Buffer {
     // add_size(n) after writing.
     pub fn prepare(&mut self, n: usize) -> (*mut u8)!Throw {
         self.b.reserve(n)?
-        unsafe { return ok(ptr.offset(self.b.data, self.b.n as isize)) }
+        unsafe {
+            return ok(ptr.offset(self.b.data, self.b.n as isize))
+        }
     }
+    // Commit n bytes written after `prepare`.
     pub fn add_size(&mut self, n: usize) {
         self.b.n = self.b.n + n
     }
     // Remove the last n bytes.
     pub fn shrink(&mut self, n: usize) {
-        self.b.n = if n > self.b.n { 0usize } else { self.b.n - n }
+        self.b.n = if n > self.b.n {
+            0usize
+        } else {
+            self.b.n - n
+        }
     }
     // Current contents.
     pub fn bytes(&self) -> &[u8] {
         if self.b.n == 0 {
             return b""
         }
-        unsafe { return ptr.borrow_slice(self.b.data as *const u8, self.b.n, self) }
+        unsafe {
+            return ptr.borrow_slice(self.b.data as *const u8, self.b.n, self)
+        }
     }
+    // Number of bytes in the buffer.
     pub fn size(&self) -> usize {
         return self.b.n
     }
     // Push the contents as a string.
     pub fn push_result(&mut self, cx: &mut Cx) -> void!Throw {
-        unsafe { return cx.push_raw_bytes(self.b.data as *const u8, self.b.n) }
+        unsafe {
+            return cx.push_raw_bytes(self.b.data as *const u8, self.b.n)
+        }
     }
 }
 
@@ -208,13 +235,17 @@ fn aux_arg_error(cx: &mut Cx, arg0: i32, extramsg: &[u8]) -> Throw {
             b := SBuf.new(cx.L)
             match aux_build3(&mut b, "bad argument #", arg as i64, " (", extramsg, ")") {
                 ok() => {},
-                err(e) => { return e },
+                err(e) => {
+                    return e
+                },
             }
             return aux_raise(cx, &mut b)
         }
         match cx.get_info("n", &mut ar) {
             ok(_) => {},
-            err(e) => { return e },
+            err(e) => {
+                return e
+            },
         }
         let nw = ar.namewhat()
         if nw.len == 6 && nw[0] == b'm' && nw[1] == b'e' && nw[2] == b't' {
@@ -223,7 +254,9 @@ fn aux_arg_error(cx: &mut Cx, arg0: i32, extramsg: &[u8]) -> Throw {
                 b := SBuf.new(cx.L)
                 match aux_self_error(&mut b, &ar, extramsg) {
                     ok() => {},
-                    err(e) => { return e },
+                    err(e) => {
+                        return e
+                    },
                 }
                 return aux_raise(cx, &mut b)
             }
@@ -231,7 +264,9 @@ fn aux_arg_error(cx: &mut Cx, arg0: i32, extramsg: &[u8]) -> Throw {
         b := SBuf.new(cx.L)
         match aux_bad_arg_build(cx, &mut b, &ar, arg, extramsg) {
             ok() => {},
-            err(e) => { return e },
+            err(e) => {
+                return e
+            },
         }
         return aux_raise(cx, &mut b)
     }
@@ -241,8 +276,12 @@ fn aux_self_error(b: &mut SBuf, ar: &Debug, extramsg: &[u8]) -> void!Throw {
     unsafe {
         b.add_str("calling '")?
         match ar.name() {
-            some(n) => { b.add_bytes(n)? },
-            none => { b.add_str("?")? },
+            some(n) => {
+                b.add_bytes(n)?
+            },
+            none => {
+                b.add_str("?")?
+            },
         }
         b.add_str("' on bad self (")?
         b.add_bytes(extramsg)?
@@ -257,12 +296,16 @@ fn aux_bad_arg_build(cx: &mut Cx, b: &mut SBuf, ar: &Debug, arg: i32, extramsg: 
         b.add_int(arg as i64)?
         b.add_str(" to '")?
         match ar.name() {
-            some(n) => { b.add_bytes(n)? },
+            some(n) => {
+                b.add_bytes(n)?
+            },
             none => {
                 if push_global_func_name(cx, ar.ci)? {
                     let s = cx.to_lstr(-1)?
                     match s {
-                        some(v) => { b.add_raw(v.as_ptr(), v.size())? },
+                        some(v) => {
+                            b.add_raw(v.as_ptr(), v.size())?
+                        },
                         none => {},
                     }
                     cx.pop(1)
@@ -296,18 +339,26 @@ fn aux_raise(cx: &mut Cx, b: &mut SBuf) -> Throw {
         w := SBuf.new(cx.L)
         match aux_where(cx, &mut w, 1) {
             ok() => {},
-            err(e) => { return e },
+            err(e) => {
+                return e
+            },
         }
-        match w.add_raw(unsafe { b.data as *const u8 }, b.n) {
+        match w.add_raw(unsafe {
+            b.data as *const u8
+        }, b.n) {
             ok() => {},
-            err(e) => { return e },
+            err(e) => {
+                return e
+            },
         }
         match w.to_lstring() {
             ok(s) => {
                 err_set_msg(cx.L, s)
                 return Throw.Runtime
             },
-            err(e) => { return e },
+            err(e) => {
+                return e
+            },
         }
     }
 }
@@ -370,7 +421,9 @@ fn push_global_func_name(cx: &mut Cx, ci: *mut CallInfo) -> bool!Throw {
                             none => {},
                         }
                         match fname {
-                            some(f) => { b.add_bytes(f.bytes())? },
+                            some(f) => {
+                                b.add_bytes(f.bytes())?
+                            },
                             none => {},
                         }
                         let s = b.to_lstring()?
@@ -395,7 +448,9 @@ fn aux_typename_for_error(cx: &mut Cx, arg: i32, b: &mut SBuf) -> void!Throw {
         if cx.get_metafield(arg, "__name")? == TSTRING {
             let s = cx.to_lstr(-1)?
             match s {
-                some(v) => { b.add_raw(v.as_ptr(), v.size())? },
+                some(v) => {
+                    b.add_raw(v.as_ptr(), v.size())?
+                },
                 none => {},
             }
             cx.pop(1)
@@ -458,7 +513,9 @@ fn aux_func_name(cx: &mut Cx, b: &mut SBuf, ar: &Debug) -> void!Throw {
             b.add_str("function '")?
             let s = cx.to_lstr(-1)?
             match s {
-                some(v) => { b.add_raw(v.as_ptr(), v.size())? },
+                some(v) => {
+                    b.add_raw(v.as_ptr(), v.size())?
+                },
                 none => {},
             }
             b.add_str("'")?
@@ -470,8 +527,12 @@ fn aux_func_name(cx: &mut Cx, b: &mut SBuf, ar: &Debug) -> void!Throw {
             b.add_bytes(nw)?
             b.add_str(" '")?
             match ar.name() {
-                some(n) => { b.add_bytes(n)? },
-                none => { b.add_str("?")? },
+                some(n) => {
+                    b.add_bytes(n)?
+                },
+                none => {
+                    b.add_str("?")?
+                },
             }
             b.add_str("'")?
             return ok()
@@ -497,7 +558,11 @@ fn aux_traceback(cx: &mut Cx, L1: &mut Cx, msg: Option<&[u8]>, level0: i32) -> v
         b := SBuf.new(cx.L)
         level := level0
         let last = aux_last_level(L1)
-        limit2show := if last - level > TB_LEVELS1 + TB_LEVELS2 { TB_LEVELS1 } else { -1i32 }
+        limit2show := if last - level > TB_LEVELS1 + TB_LEVELS2 {
+            TB_LEVELS1
+        } else {
+            -1i32
+        }
         match msg {
             some(m) => {
                 b.add_bytes(m)?
@@ -532,7 +597,9 @@ fn aux_traceback(cx: &mut Cx, L1: &mut Cx, msg: Option<&[u8]>, level0: i32) -> v
             }
             limit2show -= 1
         }
-        unsafe { return cx.push_raw_bytes(b.data as *const u8, b.n) }
+        unsafe {
+            return cx.push_raw_bytes(b.data as *const u8, b.n)
+        }
     }
 }
 
@@ -544,12 +611,16 @@ fn aux_file_error(cx: &mut Cx, what: &str, fname: &[u8]) -> i32 {
         let m = last_os_error_message()
         match aux_file_error_build(&mut b, what, fname, m) {
             ok() => {},
-            err(_) => { return ERRMEM },
+            err(_) => {
+                return ERRMEM
+            },
         }
         unsafe {
             match cx.push_raw_bytes(b.data as *const u8, b.n) {
                 ok() => {},
-                err(_) => { return ERRMEM },
+                err(_) => {
+                    return ERRMEM
+                },
             }
         }
         return ERRFILE
@@ -595,20 +666,28 @@ fn aux_load_file(cx: &mut Cx, filename: Option<&[u8]>, mode: &[u8]) -> i32 {
                 fname = fnm
                 match name.add_char(b'@') {
                     ok() => {},
-                    err(_) => { return ERRMEM },
+                    err(_) => {
+                        return ERRMEM
+                    },
                 }
                 match name.add_bytes(fnm) {
                     ok() => {},
-                    err(_) => { return ERRMEM },
+                    err(_) => {
+                        return ERRMEM
+                    },
                 }
                 path := SBuf.new(cx.L)
                 match path.add_bytes(fnm) {
                     ok() => {},
-                    err(_) => { return ERRMEM },
+                    err(_) => {
+                        return ERRMEM
+                    },
                 }
                 match path.add_char(0) {
                     ok() => {},
-                    err(_) => { return ERRMEM },
+                    err(_) => {
+                        return ERRMEM
+                    },
                 }
                 f = fopen(path.data as *const u8, ptr.as_ptr(b"rb\0"))
                 if ptr.is_null(f) {
@@ -618,7 +697,9 @@ fn aux_load_file(cx: &mut Cx, filename: Option<&[u8]>, mode: &[u8]) -> i32 {
             none => {
                 match name.add_str("=stdin") {
                     ok() => {},
-                    err(_) => { return ERRMEM },
+                    err(_) => {
+                        return ERRMEM
+                    },
                 }
                 f = c_stdin()
             },
@@ -636,7 +717,9 @@ fn aux_load_file(cx: &mut Cx, filename: Option<&[u8]>, mode: &[u8]) -> i32 {
                     return aux_file_error(cx, "read", fname)
                 }
             },
-            err(_) => { return ERRMEM },
+            err(_) => {
+                return ERRMEM
+            },
         }
         // Skip a UTF-8 byte-order mark and a first line starting with '#'.
         start := 0usize

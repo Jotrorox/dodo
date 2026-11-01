@@ -88,69 +88,95 @@ fn gc_init_global(g: *mut Global) {
 
 fn is_white(o: *mut GCObject) -> bool {
     unsafe {
-        unsafe { return ((*o).marked & WHITEBITS) != 0 }
+        unsafe {
+            return ((*o).marked & WHITEBITS) != 0
+        }
     }
 }
 fn is_black(o: *mut GCObject) -> bool {
     unsafe {
-        unsafe { return ((*o).marked & BLACKBIT) != 0 }
+        unsafe {
+            return ((*o).marked & BLACKBIT) != 0
+        }
     }
 }
 fn is_gray(o: *mut GCObject) -> bool {
     unsafe {
-        unsafe { return ((*o).marked & (WHITEBITS | BLACKBIT)) == 0 }
+        unsafe {
+            return ((*o).marked & (WHITEBITS | BLACKBIT)) == 0
+        }
     }
 }
 fn other_white(g: *mut Global) -> u8 {
     unsafe {
-        unsafe { return (*g).currentwhite ^ WHITEBITS }
+        unsafe {
+            return (*g).currentwhite ^ WHITEBITS
+        }
     }
 }
 fn current_white(g: *mut Global) -> u8 {
     unsafe {
-        unsafe { return (*g).currentwhite & WHITEBITS }
+        unsafe {
+            return (*g).currentwhite & WHITEBITS
+        }
     }
 }
 // Dead: marked with the white of the previous cycle (only meaningful while
 // sweeping).
 fn gc_is_dead(g: *mut Global, o: *mut GCObject) -> bool {
     unsafe {
-        unsafe { return ((*o).marked & other_white(g) & WHITEBITS) != 0 }
+        unsafe {
+            return ((*o).marked & other_white(g) & WHITEBITS) != 0
+        }
     }
 }
 fn gc_change_white(o: *mut GCObject) {
     unsafe {
-        unsafe { (*o).marked = (*o).marked ^ WHITEBITS }
+        unsafe {
+            (*o).marked = (*o).marked ^ WHITEBITS
+        }
     }
 }
 fn set_gray(o: *mut GCObject) {
     unsafe {
-        unsafe { (*o).marked = (*o).marked & ~(WHITEBITS | BLACKBIT) }
+        unsafe {
+            (*o).marked = (*o).marked & ~(WHITEBITS | BLACKBIT)
+        }
     }
 }
 fn set_black(o: *mut GCObject) {
     unsafe {
-        unsafe { (*o).marked = ((*o).marked & ~WHITEBITS) | BLACKBIT }
+        unsafe {
+            (*o).marked = ((*o).marked & ~WHITEBITS) | BLACKBIT
+        }
     }
 }
 fn make_white(g: *mut Global, o: *mut GCObject) {
     unsafe {
-        unsafe { (*o).marked = ((*o).marked & ~(WHITEBITS | BLACKBIT)) | current_white(g) }
+        unsafe {
+            (*o).marked = ((*o).marked & ~(WHITEBITS | BLACKBIT)) | current_white(g)
+        }
     }
 }
 fn keep_invariant(g: *mut Global) -> bool {
     unsafe {
-        unsafe { return (*g).gcstate <= GCS_ATOMIC }
+        unsafe {
+            return (*g).gcstate <= GCS_ATOMIC
+        }
     }
 }
 fn is_sweep_phase(g: *mut Global) -> bool {
     unsafe {
-        unsafe { return (*g).gcstate >= GCS_SWPALLGC && (*g).gcstate <= GCS_SWPEND }
+        unsafe {
+            return (*g).gcstate >= GCS_SWPALLGC && (*g).gcstate <= GCS_SWPEND
+        }
     }
 }
 fn value_is_white(v: *mut Value) -> bool {
     unsafe {
-        unsafe { return ((*v).tag & COLLECTABLE) != 0 && is_white(val_gc(v)) }
+        unsafe {
+            return ((*v).tag & COLLECTABLE) != 0 && is_white(val_gc(v))
+        }
     }
 }
 
@@ -308,7 +334,9 @@ fn mark_object(g: *mut Global, o: *mut GCObject) {
 
 fn gray_list(g: *mut Global) -> *mut *mut GCObject {
     unsafe {
-        unsafe { return ptr.offset(g as *mut u8, mem.offset_of::<Global>("gray") as isize) as *mut *mut GCObject }
+        unsafe {
+            return ptr.offset(g as *mut u8, mem.offset_of::<Global>("gray") as isize) as *mut *mut GCObject
+        }
     }
 }
 
@@ -528,7 +556,11 @@ fn traverse_table(g: *mut Global, t: *mut Table) -> isize {
         } else {
             link_gclist(t as *mut GCObject, list_ptr(g, 3))
         }
-        return 1 + ((*t).asize as isize) + (if tab_is_dummy(t) { 0isize } else { node_size(t) })
+        return 1 + ((*t).asize as isize) + (if tab_is_dummy(t) {
+            0isize
+        } else {
+            node_size(t)
+        })
     }
 }
 
@@ -986,7 +1018,7 @@ fn sweep_step(L: *mut State, nextstate: u8, nextlist: *mut *mut GCObject) -> isi
         if !ptr.is_null((*g).sweepgc) {
             done := 0isize
             (*g).sweepgc = sweep_list(L, (*g).sweepgc, GC_SWEEP_MAX, ptr.from_mut(&mut done))
-            return done * 4 + 1
+            return GC_SWEEP_MAX
         }
         (*g).gcstate = nextstate
         (*g).sweepgc = nextlist
@@ -1101,6 +1133,8 @@ fn single_step(L: *mut State) -> isize {
             if (*g).gcemergency == 0 {
                 str_table_check_size(L)
             }
+            // Live memory after freeing this cycle's garbage.
+            (*g).gc_estimate = (*g).total_bytes
             (*g).gcstate = GCS_CALLFIN
             return 1
         }
@@ -1177,8 +1211,10 @@ fn gc_step(L: *mut State) {
         if debt < stepsize {
             debt = stepsize
         }
-        // Work units are roughly "slots"; one slot ~ 16 bytes.
-        let todo = (debt / 16) * stepmul / 100 + 1
+        // Work units are roughly "slots" (16 bytes) traversed or objects
+        // swept; each step pays the debt plus one step size, both scaled by
+        // the step multiplier.
+        let todo = (debt / 16) * stepmul + (stepsize / 16) * stepmul
         work := 0isize
         for {
             work += single_step(L)
@@ -1217,7 +1253,11 @@ fn gc_full(L: *mut State, emergency: bool) {
         let g = G(L)
         let oldstp = (*g).gcstp
         (*g).gcstp = GCSTP_GC
-        (*g).gcemergency = if emergency { 1u8 } else { 0u8 }
+        (*g).gcemergency = if emergency {
+            1u8
+        } else {
+            0u8
+        }
         if keep_invariant(g) {
             // Discard the partial marking: sweep everything to white.
             enter_sweep(L)
@@ -1239,7 +1279,8 @@ fn gc_full(L: *mut State, emergency: bool) {
 fn gc_emergency(L: *mut State) -> bool {
     unsafe {
         let g = G(L)
-        if !G_complete(g) || (*g).gcstp != 0 || (*g).gcemergency != 0 || (*g).gc_running_fin != 0 {
+        // A user "stop" does not prevent emergency collections.
+        if !G_complete(g) || ((*g).gcstp & ~GCSTP_USR) != 0 || (*g).gcemergency != 0 || (*g).gc_running_fin != 0 {
             return false
         }
         if (*g).gcstate == GCS_ATOMIC {
@@ -1296,7 +1337,11 @@ fn gc_user_step(L: *mut State, kb: i64) -> bool {
             set_debt(g, 0)
             gc_step(L)
         } else {
-            let add = if kb > 9007199254740991 / 1024 { 9007199254740991isize } else { (kb as isize) * 1024 }
+            let add = if kb > 9007199254740991 / 1024 {
+                9007199254740991isize
+            } else {
+                (kb as isize) * 1024
+            }
             let debt = add + (*g).gc_debt
             set_debt(g, debt)
             didstep = debt > 0

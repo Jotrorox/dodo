@@ -41,10 +41,18 @@ fn mem_error(L: *mut State) -> Throw {
 // that mem_free accepts). Raises Throw.Memory on failure.
 fn mem_alloc(L: *mut State, size: usize) -> (*mut u8)!Throw {
     unsafe {
-        let n = if size == 0 { 1usize } else { size }
-        block := malloc(n)
+        let n = if size == 0 {
+            1usize
+        } else {
+            size
+        }
+        block := if mem_over_limit(L, size as isize) {
+            0 as *mut u8
+        } else {
+            malloc(n)
+        }
         if ptr.is_null(block) {
-            if gc_emergency(L) {
+            if gc_emergency(L) && !mem_over_limit(L, size as isize) {
                 block = malloc(n)
             }
             if ptr.is_null(block) {
@@ -56,15 +64,39 @@ fn mem_alloc(L: *mut State, size: usize) -> (*mut u8)!Throw {
     }
 }
 
+// Whether growing by `delta` bytes would exceed the configured limit.
+fn mem_over_limit(L: *mut State, delta: isize) -> bool {
+    unsafe {
+        let g = G(L)
+        return (*g).mem_limit > 0 && delta > 0 && (*g).total_bytes + delta > (*g).mem_limit
+    }
+}
+
 // Resize a block previously returned by mem_alloc/mem_realloc (or null with
 // old_size 0). Raises Throw.Memory on failure, leaving the old block intact.
 fn mem_realloc(L: *mut State, block: *mut u8, old_size: usize, new_size: usize) -> (*mut u8)!Throw {
     unsafe {
-        let n = if new_size == 0 { 1usize } else { new_size }
-        grown := if ptr.is_null(block) { malloc(n) } else { realloc(block, n) }
+        let n = if new_size == 0 {
+            1usize
+        } else {
+            new_size
+        }
+        let delta = (new_size as isize) - (old_size as isize)
+        grown := 0 as *mut u8
+        if !mem_over_limit(L, delta) {
+            grown = if ptr.is_null(block) {
+                malloc(n)
+            } else {
+                realloc(block, n)
+            }
+        }
         if ptr.is_null(grown) {
-            if gc_emergency(L) {
-                grown = if ptr.is_null(block) { malloc(n) } else { realloc(block, n) }
+            if gc_emergency(L) && !mem_over_limit(L, delta) {
+                grown = if ptr.is_null(block) {
+                    malloc(n)
+                } else {
+                    realloc(block, n)
+                }
             }
             if ptr.is_null(grown) {
                 return err(mem_error(L))

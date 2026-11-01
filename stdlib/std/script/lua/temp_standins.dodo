@@ -17,7 +17,7 @@ fn compile(L: *mut State, source: *mut u8, length: usize, chunkname: *mut LStrin
     }
 }
 
-fn sti_put(out: &mut [u8], at: usize, c: u8) -> usize {
+fn sti_put(out: &mut[u8], at: usize, c: u8) -> usize {
     unsafe {
         if at < out.len {
             out[at] = c
@@ -27,13 +27,17 @@ fn sti_put(out: &mut [u8], at: usize, c: u8) -> usize {
 }
 
 // Decimal form of an integer.
-fn num_int_to_string(out: &mut [u8], v: i64) -> usize {
+fn num_int_to_string(out: &mut[u8], v: i64) -> usize {
     unsafe {
         digits := [0u8; 24]
         nd := 0usize
         neg := v < 0
         // Work with negative values so the minimum integer needs no special case.
-        x := if neg { v } else { -v }
+        x := if neg {
+            v
+        } else {
+            -v
+        }
         if x == 0 {
             digits[0] = b'0'
             nd = 1
@@ -57,7 +61,7 @@ fn num_int_to_string(out: &mut [u8], v: i64) -> usize {
 }
 
 // Format a float with `prec` significant digits like C's "%.{prec}g".
-fn sti_format_g(out: &mut [u8], v0: f64, prec: i32) -> usize {
+fn sti_format_g(out: &mut[u8], v0: f64, prec: i32) -> usize {
     unsafe {
         at := 0usize
         v := v0
@@ -95,11 +99,19 @@ fn sti_format_g(out: &mut [u8], v0: f64, prec: i32) -> usize {
         // Digits via scaling by a power of ten computed exactly where possible.
         digits := [0u8; 40]
         let p10 = sti_pow10(prec - 1 - e)
-        scaled := if prec - 1 - e >= 0 { v * p10 } else { v / sti_pow10(e - prec + 1) }
+        scaled := if prec - 1 - e >= 0 {
+            v * p10
+        } else {
+            v / sti_pow10(e - prec + 1)
+        }
         r := sti_round(scaled)
         if r >= sti_pow10(prec) {
             e += 1
-            scaled = if prec - 1 - e >= 0 { v * sti_pow10(prec - 1 - e) } else { v / sti_pow10(e - prec + 1) }
+            scaled = if prec - 1 - e >= 0 {
+                v * sti_pow10(prec - 1 - e)
+            } else {
+                v / sti_pow10(e - prec + 1)
+            }
             r = sti_round(scaled)
         }
         // r is an integer with `prec` digits.
@@ -200,7 +212,7 @@ fn sti_floor(x: f64) -> f64 {
 }
 
 // Lua `tostring` of a float: "%.14g", plus ".0" when it looks like an integer.
-fn num_float_to_string(out: &mut [u8], v: f64) -> usize {
+fn num_float_to_string(out: &mut[u8], v: f64) -> usize {
     unsafe {
         n := sti_format_g(out, v, 14)
         looks_int := true
@@ -277,7 +289,11 @@ fn num_string_to_number(text: &[u8], ival: &mut i64, fval: &mut f64) -> u32 {
             }
             if p == j && any {
                 let v = u2i(acc)
-                *ival = if neg { core.wrapping_sub(0i64, v) } else { v }
+                *ival = if neg {
+                    core.wrapping_sub(0i64, v)
+                } else {
+                    v
+                }
                 return 1
             }
             isint = false
@@ -375,19 +391,27 @@ fn num_string_to_int_base(text: &[u8], base: i64, out: &mut i64) -> bool {
         if !any || i != n {
             return false
         }
-        *out = if neg { core.wrapping_sub(0i64, acc) } else { acc }
+        *out = if neg {
+            core.wrapping_sub(0i64, acc)
+        } else {
+            acc
+        }
         return true
     }
 }
 
 // Printf-style formatting used by string.format (stand-in: %g/%d only).
-fn num_format_float(out: &mut [u8], v: f64, conv: u8, flags: u32, width: i32, precision: i32) -> usize {
+fn num_format_float(out: &mut[u8], v: f64, conv: u8, flags: u32, width: i32, precision: i32) -> usize {
     unsafe {
-        return sti_format_g(out, v, if precision < 0 { 6 } else { precision })
+        return sti_format_g(out, v, if precision < 0 {
+            6
+        } else {
+            precision
+        })
     }
 }
 
-fn num_format_int(out: &mut [u8], v: i64, conv: u8, flags: u32, width: i32, precision: i32) -> usize {
+fn num_format_int(out: &mut[u8], v: i64, conv: u8, flags: u32, width: i32, precision: i32) -> usize {
     unsafe {
         return num_int_to_string(out, v)
     }

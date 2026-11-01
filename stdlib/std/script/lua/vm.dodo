@@ -82,7 +82,11 @@ fn vm_to_number(v: *mut Value, out: *mut f64) -> bool {
             tmp := Value { bits: 0, tag: 0 }
             let n = ptr.from_mut(&mut tmp)
             if str_to_number_value(v, n) {
-                *out = if (*n).tag == TAG_INT { val_int(n) as f64 } else { val_float(n) }
+                *out = if (*n).tag == TAG_INT {
+                    val_int(n) as f64
+                } else {
+                    val_float(n)
+                }
                 return true
             }
         }
@@ -225,7 +229,9 @@ fn vm_pow(a: f64, b: f64) -> f64 {
 
 fn vm_idiv_float(a: f64, b: f64) -> f64 {
     unsafe {
-        unsafe { return floor(a / b) }
+        unsafe {
+            return floor(a / b)
+        }
     }
 }
 
@@ -241,7 +247,7 @@ fn vm_shiftl(x: i64, y: i64) -> i64 {
         if y >= 64 {
             return 0
         }
-        return u2i(i2u(x) << (y as u64))
+        return u2i(core.wrapping_mul(i2u(x), 1u64 << (y as u64)))
     }
 }
 
@@ -453,12 +459,16 @@ fn num_le(a: *mut Value, b: *mut Value) -> bool {
 
 fn both_numbers(a: *mut Value, b: *mut Value) -> bool {
     unsafe {
-        unsafe { return ((*a).tag & 15) == TYPE_NUMBER && ((*b).tag & 15) == TYPE_NUMBER }
+        unsafe {
+            return ((*a).tag & 15) == TYPE_NUMBER && ((*b).tag & 15) == TYPE_NUMBER
+        }
     }
 }
 fn both_strings(a: *mut Value, b: *mut Value) -> bool {
     unsafe {
-        unsafe { return ((*a).tag & 15) == TYPE_STRING && ((*b).tag & 15) == TYPE_STRING }
+        unsafe {
+            return ((*a).tag & 15) == TYPE_STRING && ((*b).tag & 15) == TYPE_STRING
+        }
     }
 }
 
@@ -493,7 +503,9 @@ fn for_error(L: *mut State, v: *mut Value, what: &str) -> Throw {
         b := SBuf.new(L)
         match for_error_build(L, &mut b, v, what) {
             ok() => {},
-            err(e) => { return e },
+            err(e) => {
+                return e
+            },
         }
         return err_raise_buf(L, &mut b)
     }
@@ -514,7 +526,11 @@ fn for_error_build(L: *mut State, b: &mut SBuf, v: *mut Value, what: &str) -> vo
 // not run at all.
 fn for_limit(L: *mut State, init: i64, lim: *mut Value, out: *mut i64, step: i64) -> bool!Throw {
     unsafe {
-        if !vm_to_integer(lim, out, if step < 0 { F2I_CEIL } else { F2I_FLOOR }) {
+        if !vm_to_integer(lim, out, if step < 0 {
+            F2I_CEIL
+        } else {
+            F2I_FLOOR
+        }) {
             flim: f64 = 0.0
             if !vm_to_number(lim, ptr.from_mut(&mut flim)) {
                 return err(for_error(L, lim, "limit"))
@@ -584,7 +600,11 @@ fn vm_forprep(L: *mut State, ra: *mut Value) -> bool!Throw {
         if fstep == 0.0 {
             return err(err_runtime(L, "'for' step is zero"))
         }
-        let skip = if fstep > 0.0 { flimit < finit } else { finit < flimit }
+        let skip = if fstep > 0.0 {
+            flimit < finit
+        } else {
+            finit < flimit
+        }
         if skip {
             return ok(true)
         }
@@ -632,7 +652,11 @@ fn vm_get_varargs(L: *mut State, ci: *mut CallInfo, ra_off: isize, wanted0: i32)
         }
         let ra = restore_stack(L, ra_off)
         let src = ptr.offset((*ci).func, -(nextra as isize))
-        let n = if wanted < nextra { wanted } else { nextra }
+        let n = if wanted < nextra {
+            wanted
+        } else {
+            nextra
+        }
         for i in 0isize..(n as isize) {
             set_obj(ptr.offset(ra, i), ptr.offset(src, i))
         }
@@ -713,9 +737,14 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
             pc := (*ci).savedpc
             base := ptr.offset((*ci).func, 1)
             trap := (*L).hookmask != 0
-            if trap && pc == (*proto).code && (*proto).is_vararg == 0 {
-                hook_call_lua(L, ci)?
-                base = ptr.offset((*ci).func, 1)
+            if trap && pc == (*proto).code {
+                if (*proto).is_vararg != 0 {
+                    // Hooks start after VARARGPREP.
+                    trap = false
+                } else {
+                    hook_call_lua(L, ci)?
+                    base = ptr.offset((*ci).func, 1)
+                }
             }
             for {
                 let i = *pc
@@ -869,7 +898,11 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                         // SETTABUP
                         let upv = (*lcl_upval(cl, ((i >> 7) & 255) as isize)).v
                         let key = ptr.offset(k, ((i >> 16) & 255) as isize)
-                        let rc = if ((i >> 15) & 1) != 0 { ptr.offset(k, (i >> 24) as isize) } else { ptr.offset(base, (i >> 24) as isize) }
+                        let rc = if ((i >> 15) & 1) != 0 {
+                            ptr.offset(k, (i >> 24) as isize)
+                        } else {
+                            ptr.offset(base, (i >> 24) as isize)
+                        }
                         slot := 0 as *mut Value
                         if (*upv).tag == TAG_TABLE {
                             slot = tab_get_shortstr(val_gc(upv) as *mut Table, val_str(key))
@@ -888,7 +921,11 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                     16 => {
                         // SETTABLE
                         let rb = ptr.offset(base, ((i >> 16) & 255) as isize)
-                        let rc = if ((i >> 15) & 1) != 0 { ptr.offset(k, (i >> 24) as isize) } else { ptr.offset(base, (i >> 24) as isize) }
+                        let rc = if ((i >> 15) & 1) != 0 {
+                            ptr.offset(k, (i >> 24) as isize)
+                        } else {
+                            ptr.offset(base, (i >> 24) as isize)
+                        }
                         slot := 0 as *mut Value
                         if (*ra).tag == TAG_TABLE {
                             let t = val_gc(ra) as *mut Table
@@ -912,7 +949,11 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                     17 => {
                         // SETI
                         let b = ((i >> 16) & 255) as i64
-                        let rc = if ((i >> 15) & 1) != 0 { ptr.offset(k, (i >> 24) as isize) } else { ptr.offset(base, (i >> 24) as isize) }
+                        let rc = if ((i >> 15) & 1) != 0 {
+                            ptr.offset(k, (i >> 24) as isize)
+                        } else {
+                            ptr.offset(base, (i >> 24) as isize)
+                        }
                         slot := 0 as *mut Value
                         if (*ra).tag == TAG_TABLE {
                             slot = tab_get_int(val_gc(ra) as *mut Table, b)
@@ -934,7 +975,11 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                     18 => {
                         // SETFIELD
                         let key = ptr.offset(k, ((i >> 16) & 255) as isize)
-                        let rc = if ((i >> 15) & 1) != 0 { ptr.offset(k, (i >> 24) as isize) } else { ptr.offset(base, (i >> 24) as isize) }
+                        let rc = if ((i >> 15) & 1) != 0 {
+                            ptr.offset(k, (i >> 24) as isize)
+                        } else {
+                            ptr.offset(base, (i >> 24) as isize)
+                        }
                         slot := 0 as *mut Value
                         if (*ra).tag == TAG_TABLE {
                             slot = tab_get_shortstr(val_gc(ra) as *mut Table, val_str(key))
@@ -968,6 +1013,8 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                         if b != 0 || c != 0 {
                             tab_resize(L, t, c, b)?
                         }
+                        // Registers above ra are dead here: not roots.
+                        (*L).top = ptr.offset(ra, 1)
                         gc_check(L)
                         (*L).top = (*ci).top
                         base = ptr.offset((*ci).func, 1)
@@ -976,7 +1023,11 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                     20 => {
                         // SELF
                         let rb = ptr.offset(base, ((i >> 16) & 255) as isize)
-                        let rc = if ((i >> 15) & 1) != 0 { ptr.offset(k, (i >> 24) as isize) } else { ptr.offset(base, (i >> 24) as isize) }
+                        let rc = if ((i >> 15) & 1) != 0 {
+                            ptr.offset(k, (i >> 24) as isize)
+                        } else {
+                            ptr.offset(base, (i >> 24) as isize)
+                        }
                         set_obj(ptr.offset(ra, 1), rb)
                         slot := 0 as *mut Value
                         if (*rb).tag == TAG_TABLE {
@@ -1069,10 +1120,10 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                                 pc = ptr.offset(pc, 1)
                             } else {
                                 (*ci).savedpc = pc
-                            (*L).top = (*ci).top
-                            if vm_arith_num(L, arith_op_event(i & 127), rb, rc, ra)? {
-                                pc = ptr.offset(pc, 1)
-                            }
+                                (*L).top = (*ci).top
+                                if vm_arith_num(L, arith_op_event(i & 127), rb, rc, ra)? {
+                                    pc = ptr.offset(pc, 1)
+                                }
                             }
                         }
                     },
@@ -1088,10 +1139,10 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                                 pc = ptr.offset(pc, 1)
                             } else {
                                 (*ci).savedpc = pc
-                            (*L).top = (*ci).top
-                            if vm_arith_num(L, arith_op_event(i & 127), rb, rc, ra)? {
-                                pc = ptr.offset(pc, 1)
-                            }
+                                (*L).top = (*ci).top
+                                if vm_arith_num(L, arith_op_event(i & 127), rb, rc, ra)? {
+                                    pc = ptr.offset(pc, 1)
+                                }
                             }
                         }
                     },
@@ -1107,10 +1158,10 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                                 pc = ptr.offset(pc, 1)
                             } else {
                                 (*ci).savedpc = pc
-                            (*L).top = (*ci).top
-                            if vm_arith_num(L, arith_op_event(i & 127), rb, rc, ra)? {
-                                pc = ptr.offset(pc, 1)
-                            }
+                                (*L).top = (*ci).top
+                                if vm_arith_num(L, arith_op_event(i & 127), rb, rc, ra)? {
+                                    pc = ptr.offset(pc, 1)
+                                }
                             }
                         }
                     },
@@ -1131,10 +1182,10 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                                 pc = ptr.offset(pc, 1)
                             } else {
                                 (*ci).savedpc = pc
-                            (*L).top = (*ci).top
-                            if vm_arith_num(L, arith_op_event(i & 127), rb, rc, ra)? {
-                                pc = ptr.offset(pc, 1)
-                            }
+                                (*L).top = (*ci).top
+                                if vm_arith_num(L, arith_op_event(i & 127), rb, rc, ra)? {
+                                    pc = ptr.offset(pc, 1)
+                                }
                             }
                         }
                     },
@@ -1254,10 +1305,10 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                                 pc = ptr.offset(pc, 1)
                             } else {
                                 (*ci).savedpc = pc
-                            (*L).top = (*ci).top
-                            if vm_arith_num(L, arith_op_event(i & 127), rb, rc, ra)? {
-                                pc = ptr.offset(pc, 1)
-                            }
+                                (*L).top = (*ci).top
+                                if vm_arith_num(L, arith_op_event(i & 127), rb, rc, ra)? {
+                                    pc = ptr.offset(pc, 1)
+                                }
                             }
                         }
                     },
@@ -1273,10 +1324,10 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                                 pc = ptr.offset(pc, 1)
                             } else {
                                 (*ci).savedpc = pc
-                            (*L).top = (*ci).top
-                            if vm_arith_num(L, arith_op_event(i & 127), rb, rc, ra)? {
-                                pc = ptr.offset(pc, 1)
-                            }
+                                (*L).top = (*ci).top
+                                if vm_arith_num(L, arith_op_event(i & 127), rb, rc, ra)? {
+                                    pc = ptr.offset(pc, 1)
+                                }
                             }
                         }
                     },
@@ -1292,10 +1343,10 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                                 pc = ptr.offset(pc, 1)
                             } else {
                                 (*ci).savedpc = pc
-                            (*L).top = (*ci).top
-                            if vm_arith_num(L, arith_op_event(i & 127), rb, rc, ra)? {
-                                pc = ptr.offset(pc, 1)
-                            }
+                                (*L).top = (*ci).top
+                                if vm_arith_num(L, arith_op_event(i & 127), rb, rc, ra)? {
+                                    pc = ptr.offset(pc, 1)
+                                }
                             }
                         }
                     },
@@ -1316,10 +1367,10 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                                 pc = ptr.offset(pc, 1)
                             } else {
                                 (*ci).savedpc = pc
-                            (*L).top = (*ci).top
-                            if vm_arith_num(L, arith_op_event(i & 127), rb, rc, ra)? {
-                                pc = ptr.offset(pc, 1)
-                            }
+                                (*L).top = (*ci).top
+                                if vm_arith_num(L, arith_op_event(i & 127), rb, rc, ra)? {
+                                    pc = ptr.offset(pc, 1)
+                                }
                             }
                         }
                     },
@@ -1469,9 +1520,11 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                         let n = ((i >> 16) & 255) as i32
                         (*L).top = ptr.offset(ra, n as isize)
                         (*ci).savedpc = pc
+                        let raoff = sdiff(ra, (*L).stack)
                         vm_concat(L, n)?
-                        (*L).top = (*ci).top
+                        (*L).top = ptr.offset((*L).stack, raoff + 1)
                         gc_check(L)
+                        (*L).top = (*ci).top
                         base = ptr.offset((*ci).func, 1)
                         trap = (*L).hookmask != 0
                     },
@@ -1593,11 +1646,27 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                         if (*ra).tag == TAG_INT {
                             let a = val_int(ra)
                             let b = im as i64
-                            cond = if op == 62 { a < b } else if op == 63 { a <= b } else if op == 64 { a > b } else { a >= b }
+                            cond = if op == 62 {
+                                a < b
+                            } else if op == 63 {
+                                a <= b
+                            } else if op == 64 {
+                                a > b
+                            } else {
+                                a >= b
+                            }
                         } else if (*ra).tag == TAG_FLOAT {
                             let a = val_float(ra)
                             let b = im as f64
-                            cond = if op == 62 { a < b } else if op == 63 { a <= b } else if op == 64 { a > b } else { a >= b }
+                            cond = if op == 62 {
+                                a < b
+                            } else if op == 63 {
+                                a <= b
+                            } else if op == 64 {
+                                a > b
+                            } else {
+                                a >= b
+                            }
                         } else {
                             let isf = (i >> 24) != 0
                             (*ci).savedpc = pc
@@ -1629,11 +1698,27 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                         if (*ra).tag == TAG_INT {
                             let a = val_int(ra)
                             let b = im as i64
-                            cond = if op == 62 { a < b } else if op == 63 { a <= b } else if op == 64 { a > b } else { a >= b }
+                            cond = if op == 62 {
+                                a < b
+                            } else if op == 63 {
+                                a <= b
+                            } else if op == 64 {
+                                a > b
+                            } else {
+                                a >= b
+                            }
                         } else if (*ra).tag == TAG_FLOAT {
                             let a = val_float(ra)
                             let b = im as f64
-                            cond = if op == 62 { a < b } else if op == 63 { a <= b } else if op == 64 { a > b } else { a >= b }
+                            cond = if op == 62 {
+                                a < b
+                            } else if op == 63 {
+                                a <= b
+                            } else if op == 64 {
+                                a > b
+                            } else {
+                                a >= b
+                            }
                         } else {
                             let isf = (i >> 24) != 0
                             (*ci).savedpc = pc
@@ -1665,11 +1750,27 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                         if (*ra).tag == TAG_INT {
                             let a = val_int(ra)
                             let b = im as i64
-                            cond = if op == 62 { a < b } else if op == 63 { a <= b } else if op == 64 { a > b } else { a >= b }
+                            cond = if op == 62 {
+                                a < b
+                            } else if op == 63 {
+                                a <= b
+                            } else if op == 64 {
+                                a > b
+                            } else {
+                                a >= b
+                            }
                         } else if (*ra).tag == TAG_FLOAT {
                             let a = val_float(ra)
                             let b = im as f64
-                            cond = if op == 62 { a < b } else if op == 63 { a <= b } else if op == 64 { a > b } else { a >= b }
+                            cond = if op == 62 {
+                                a < b
+                            } else if op == 63 {
+                                a <= b
+                            } else if op == 64 {
+                                a > b
+                            } else {
+                                a >= b
+                            }
                         } else {
                             let isf = (i >> 24) != 0
                             (*ci).savedpc = pc
@@ -1701,11 +1802,27 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                         if (*ra).tag == TAG_INT {
                             let a = val_int(ra)
                             let b = im as i64
-                            cond = if op == 62 { a < b } else if op == 63 { a <= b } else if op == 64 { a > b } else { a >= b }
+                            cond = if op == 62 {
+                                a < b
+                            } else if op == 63 {
+                                a <= b
+                            } else if op == 64 {
+                                a > b
+                            } else {
+                                a >= b
+                            }
                         } else if (*ra).tag == TAG_FLOAT {
                             let a = val_float(ra)
                             let b = im as f64
-                            cond = if op == 62 { a < b } else if op == 63 { a <= b } else if op == 64 { a > b } else { a >= b }
+                            cond = if op == 62 {
+                                a < b
+                            } else if op == 63 {
+                                a <= b
+                            } else if op == 64 {
+                                a > b
+                            } else {
+                                a >= b
+                            }
                         } else {
                             let isf = (i >> 24) != 0
                             (*ci).savedpc = pc
@@ -1758,6 +1875,40 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                             (*L).top = ptr.offset(ra, b)
                         }
                         (*ci).savedpc = pc
+                        if (*ra).tag == TAG_LCLOSURE {
+                            // Lua function: push its frame here (the common case
+                            // of precall, inlined).
+                            let p = (*(val_gc(ra) as *mut LClosure)).p
+                            let fsize = (*p).maxstacksize as isize
+                            func := ra
+                            if sdiff((*L).stack_last, (*L).top) <= fsize {
+                                let off = sdiff(func, (*L).stack)
+                                stack_grow(L, fsize)?
+                                func = ptr.offset((*L).stack, off)
+                            }
+                            nci := (*ci).next
+                            if ptr.is_null(nci) {
+                                nci = ci_extend(L, ci)?
+                            }
+                            (*L).ci = nci
+                            (*nci).nresults = nresults
+                            (*nci).callstatus = 0
+                            (*nci).func = func
+                            (*nci).top = ptr.offset(func, 1 + fsize)
+                            (*nci).savedpc = (*p).code
+                            let narg = sdiff((*L).top, func) - 1
+                            let nfix = (*p).numparams as isize
+                            if narg < nfix {
+                                top := (*L).top
+                                for j in narg..nfix {
+                                    (*top).tag = TAG_NIL
+                                    top = ptr.offset(top, 1)
+                                }
+                                (*L).top = top
+                            }
+                            ci = nci
+                            break
+                        }
                         precall(L, ra, nresults)?
                         let newci = (*L).ci
                         if newci == ci {
@@ -1772,7 +1923,11 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                         // TAILCALL
                         b := ((i >> 16) & 255) as i32
                         let nparams1 = (i >> 24) as i32
-                        let delta = if nparams1 != 0 { (*ci).nextraargs + nparams1 } else { 0i32 }
+                        let delta = if nparams1 != 0 {
+                            (*ci).nextraargs + nparams1
+                        } else {
+                            0i32
+                        }
                         if b != 0 {
                             (*L).top = ptr.offset(ra, b as isize)
                         } else {
@@ -1888,7 +2043,11 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                             let step = val_float(ptr.offset(ra, 2))
                             let limit = val_float(ptr.offset(ra, 1))
                             let idx = val_float(ra) + step
-                            let cont = if step > 0.0 { idx <= limit } else { limit <= idx }
+                            let cont = if step > 0.0 {
+                                idx <= limit
+                            } else {
+                                limit <= idx
+                            }
                             if cont {
                                 *(ra as *mut f64) = idx
                                 set_float(ptr.offset(ra, 3), idx)
@@ -1966,7 +2125,9 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                         (*ci).savedpc = pc
                         (*L).top = (*ci).top
                         func_push_closure(L, p, cl, base, ra)?
+                        (*L).top = ptr.offset(ra, 1)
                         gc_check(L)
+                        (*L).top = (*ci).top
                         base = ptr.offset((*ci).func, 1)
                         trap = (*L).hookmask != 0
                     },
@@ -1986,8 +2147,8 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                         trap = (*L).hookmask != 0
                         if trap {
                             hook_call_lua(L, ci)?
-                            // The line hook must see the first real instruction as new.
-                            (*L).oldpc = 0
+                            // The next instruction is seen as a new line.
+                            (*L).oldpc = 1
                             base = ptr.offset((*ci).func, 1)
                         }
                     },

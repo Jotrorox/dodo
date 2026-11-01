@@ -200,3 +200,41 @@ float `370.5`, then the number of upvalues of the main function (one byte) and
 the main function. Sizes are written as variable-length unsigned integers
 (7 bits per byte, most significant group first, the last byte has bit 7 set).
 `string.dump(f, strip)` and `load` must round-trip with PUC Lua 5.4.
+
+## Runtime notes for library authors
+
+The standard libraries (`lib_*.dodo`) are native functions written against
+the public API in api.dodo/aux.dodo (`Cx`, `Buffer`, `LuaStr`), which mirrors
+the C API (`cx.check_integer` ~ `luaL_checkinteger`, `cx.get_field` ~
+`lua_getfield`, ...). Being in the same package they may also use internal
+functions for hot paths (`tab_get_int`, `tab_set_int`, `str_new`, ...), with
+the collector rules above.
+
+* Signature: `fn name(cx: &mut Cx) -> i32!Throw`; return the number of
+  results pushed. Raise with `return err(cx.error_msg("..."))` (adds the
+  caller's position like `luaL_error`), `cx.arg_error(n, "...")`,
+  `cx.type_error(n, "tname")` or `return err(cx.error())` for the value on
+  top. Argument errors name the function from the call site, else from
+  `package.loaded` (`'table.sort'`), else `?`.
+* Strings: `cx.check_lstr(n)` / `cx.to_lstr(n)` return a `LuaStr` view whose
+  bytes stay valid while the value stays on the stack; it does not borrow
+  `cx`. Build results with `Buffer` (Dodo-owned, freed on drop) and
+  `buf.push_result(cx)`.
+* Registration: `cx.new_lib(&[("name", f), ...])` or `cx.set_funcs(...)`
+  (with upvalues); `open_all_libs` (aux.dodo) calls `require_lib` for each
+  library — add new libraries there.
+* String metatable: lib_string creates it (`__index = string`) and must call
+  `set_string_arith_metamethods(cx)` on it: 5.4 converts strings for
+  arithmetic through those metamethods, not in the core.
+* Streams: `c_stdin()/c_stdout()/c_stderr()` are the process-wide C `FILE*`
+  shared with `print` and warnings (io.stdout must use them so output stays
+  ordered); `last_os_error_message()`, `cx.file_result(...)`,
+  `cx.exec_result(...)` follow luaL_fileresult/luaL_execresult.
+* Yields: natives that call Lua and may be interrupted by a yield use
+  `cx.call_k` / `cx.pcall_k` with a continuation; plain `cx.call` is
+  non-yieldable ("attempt to yield across a C-call boundary").
+* `lib_debug` builds on `cx.get_stack`, `cx.get_info` (with `'>'`, `'f'`,
+  `'L'`), `cx.get_local`/`set_local`/`get_param_name`, `cx.set_hook` (a
+  `HookFn` receiving a `Debug` with `event` and `currentline`),
+  `get_upvalue`/`set_upvalue`/`upvalue_id`/`upvalue_join`,
+  `get_iuservalue`/`set_iuservalue` and `cx.traceback`.

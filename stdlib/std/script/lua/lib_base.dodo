@@ -286,7 +286,9 @@ fn base_tonumber(cx: &mut Cx) -> i32!Throw {
 
 fn base_gc_result(cx: &mut Cx) -> bool {
     unsafe {
-        unsafe { return ((*G(cx.L)).gcstp & GCSTP_GC) != 0 }
+        unsafe {
+            return ((*G(cx.L)).gcstp & GCSTP_GC) != 0
+        }
     }
 }
 
@@ -351,7 +353,9 @@ fn base_load_aux(cx: &mut Cx, status: i32, envidx: i32) -> i32!Throw {
                 cx.push_value(envidx)
                 match cx.set_upvalue(-2, 1) {
                     some(_) => {},
-                    none => { cx.pop(1) },
+                    none => {
+                        cx.pop(1)
+                    },
                 }
             }
             return ok(1)
@@ -364,7 +368,11 @@ fn base_load_aux(cx: &mut Cx, status: i32, envidx: i32) -> i32!Throw {
 
 fn base_load(cx: &mut Cx) -> i32!Throw {
     unsafe {
-        let envidx = if !cx.is_none(4) { 4i32 } else { 0i32 }
+        let envidx = if !cx.is_none(4) {
+            4i32
+        } else {
+            0i32
+        }
         let mode = cx.opt_lstr(3, b"bt")?
         if cx.type_of(1) == TSTRING || cx.type_of(1) == TNUMBER {
             let s = cx.check_lstr(1)?
@@ -379,7 +387,10 @@ fn base_load(cx: &mut Cx) -> i32!Throw {
         for {
             cx.check_stack_msg(2, "too many nested functions")?
             cx.push_value(1)
-            let st = cx.pcall(0, 1, 0)
+            // The reader runs under the current message handler (like the
+            // reference parser, which keeps it while reading).
+            let L = cx.L
+            let st = do_pcall_raw(L, save_stack(L, ptr.offset((*L).top, -1)), 1, (*L).errfunc)
             if st != OK {
                 return base_load_aux(cx, st, envidx)
             }
@@ -387,11 +398,13 @@ fn base_load(cx: &mut Cx) -> i32!Throw {
                 cx.pop(1)
                 break
             }
-            if cx.type_of(-1) != TSTRING {
+            if !cx.is_string(-1) {
                 cx.pop(1)
                 let e = cx.error_msg("reader function must return a string")
                 if e == Throw.Runtime {
-                    unsafe { L_push_value(cx.L, L_errobj(cx.L)) }
+                    unsafe {
+                        L_push_value(cx.L, L_errobj(cx.L))
+                    }
                     return base_load_aux(cx, ERRRUN, envidx)
                 }
                 return err(e)
@@ -416,7 +429,11 @@ fn base_load(cx: &mut Cx) -> i32!Throw {
 
 fn base_loadfile(cx: &mut Cx) -> i32!Throw {
     unsafe {
-        let envidx = if !cx.is_none(3) { 3i32 } else { 0i32 }
+        let envidx = if !cx.is_none(3) {
+            3i32
+        } else {
+            0i32
+        }
         let mode = cx.opt_lstr(2, b"bt")?
         st := 0i32
         if cx.is_none_or_nil(1) {
