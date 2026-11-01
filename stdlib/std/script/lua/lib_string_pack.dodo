@@ -82,113 +82,62 @@ fn pk_size_limit(cx: &mut Cx, st: &mut PkState, def: i32, out: &mut i32) -> void
     return ok()
 }
 
+// Option byte -> kind (bits 0-3; 11/12 endianness, 13 '!', 15 invalid),
+// default size (bits 4-7) and numeric suffix (bits 8-9: 1 size limit, 2 'c' count).
+const PK_OPTIONS: [256]u16 = [
+    15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
+    15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
+    10, 397, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
+    15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 11, 11, 12, 15,
+    15, 15, 17, 15, 15, 15, 15, 15, 33, 321, 129, 15, 129, 15, 15, 15,
+    15, 15, 15, 15, 129, 15, 15, 15, 9, 15, 15, 15, 15, 15, 15, 15,
+    15, 15, 16, 517, 132, 15, 66, 15, 32, 320, 128, 15, 128, 15, 131, 15,
+    15, 15, 15, 390, 15, 15, 15, 15, 24, 15, 7, 15, 15, 15, 15, 15,
+    15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
+    15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
+    15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
+    15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
+    15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
+    15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
+    15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
+    15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
+]
+
 // Read the next option: its kind and size.
 fn pk_option(cx: &mut Cx, st: &mut PkState, kind: &mut u32, size: &mut i32) -> void!Throw {
     let opt = pk_peek(st)
     st.at += 1
-    *size = 0
+    let info = PK_OPTIONS[opt as usize] as u32
+    let k = info & 15
+    sz := ((info >> 4) & 15) as i32
+    let num = info >> 8
+    if num == 1 {
+        pk_size_limit(cx, st, sz, &mut sz)?
+    } else if num == 2 {
+        sz = pk_number(st, -1)
+        if sz == -1 {
+            return err(cx.error_msg("missing size for format option 'c'"))
+        }
+    }
+    if k <= PK_NOP {
+        *kind = k
+        *size = sz
+        return ok()
+    }
     *kind = PK_NOP
-    match opt {
-        b'b' => {
-            *size = 1
-            *kind = PK_INT
-        },
-        b'B' => {
-            *size = 1
-            *kind = PK_UINT
-        },
-        b'h' => {
-            *size = 2
-            *kind = PK_INT
-        },
-        b'H' => {
-            *size = 2
-            *kind = PK_UINT
-        },
-        b'l' => {
-            *size = 8
-            *kind = PK_INT
-        },
-        b'j' => {
-            *size = 8
-            *kind = PK_INT
-        },
-        b'L' => {
-            *size = 8
-            *kind = PK_UINT
-        },
-        b'J' => {
-            *size = 8
-            *kind = PK_UINT
-        },
-        b'T' => {
-            *size = 8
-            *kind = PK_UINT
-        },
-        b'f' => {
-            *size = 4
-            *kind = PK_FLOAT
-        },
-        b'n' => {
-            *size = 8
-            *kind = PK_NUMBER
-        },
-        b'd' => {
-            *size = 8
-            *kind = PK_DOUBLE
-        },
-        b'i' => {
-            pk_size_limit(cx, st, 4, size)?
-            *kind = PK_INT
-        },
-        b'I' => {
-            pk_size_limit(cx, st, 4, size)?
-            *kind = PK_UINT
-        },
-        b's' => {
-            pk_size_limit(cx, st, 8, size)?
-            *kind = PK_STRING
-        },
-        b'c' => {
-            let n = pk_number(st, -1)
-            if n == -1 {
-                return err(cx.error_msg("missing size for format option 'c'"))
-            }
-            *size = n
-            *kind = PK_CHAR
-        },
-        b'z' => {
-            *kind = PK_ZSTR
-        },
-        b'x' => {
-            *size = 1
-            *kind = PK_PADDING
-        },
-        b'X' => {
-            *kind = PK_PADDALIGN
-        },
-        b' ' => {},
-        b'<' => {
-            st.little = true
-        },
-        b'=' => {
-            st.little = true
-        },
-        b'>' => {
-            st.little = false
-        },
-        b'!' => {
-            ma := 0i32
-            pk_size_limit(cx, st, PK_NATIVE_ALIGN, &mut ma)?
-            st.maxalign = ma
-        },
-        _ => {
-            b := Buffer.new(cx)
-            b.add_str("invalid format option '")?
-            b.add_char(opt)?
-            b.add_str("'")?
-            return err(cx.error_buffer(&mut b))
-        },
+    *size = 0
+    if k == 11 {
+        st.little = true
+    } else if k == 12 {
+        st.little = false
+    } else if k == 13 {
+        st.maxalign = sz
+    } else {
+        b := Buffer.new(cx)
+        b.add_str("invalid format option '")?
+        b.add_char(opt)?
+        b.add_str("'")?
+        return err(cx.error_buffer(&mut b))
     }
     return ok()
 }
@@ -488,7 +437,7 @@ fn strlib_unpack(cx: &mut Cx) -> i32!Throw {
             return err(cx.arg_error(2, "data string too short"))
         }
         pos = pos + ntoalign
-        cx.check_stack_msg(2, "too many results")?
+        sl_check_stack(cx, 2, "too many results")?
         n += 1
         let at = sl_at(data, pos)
         if kind == PK_INT || kind == PK_UINT {

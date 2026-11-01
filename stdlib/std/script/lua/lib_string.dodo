@@ -89,35 +89,58 @@ fn sl_find_plain(s: *const u8, ls: usize, needle: *const u8, ln: usize, first: u
     return -1
 }
 
+// Stack slot of argument `arg` (> 0) of the running native function, or
+// null when the argument is absent.
+fn sl_slot(cx: &Cx, arg: i32) -> *mut Value {
+    unsafe {
+        let L = cx.L
+        let v = ptr.offset((*(*L).ci).func, arg as isize)
+        if (v as usize) < ((*L).top as usize) {
+            return v
+        }
+        return 0 as *mut Value
+    }
+}
+
 // String argument `arg` (numbers are converted in place) as pointer + size.
 fn sl_arg_str(cx: &mut Cx, arg: i32, p: &mut *const u8, n: &mut usize) -> void!Throw {
     unsafe {
-        let v = cx.idx2val(arg)
-        let t = (*v).tag
-        if t == TAG_SHORTSTR || t == TAG_LONGSTR {
-            let s = val_str(v)
-            *p = str_data(s) as *const u8
-            *n = (*s).length
-            return ok()
+        let v = sl_slot(cx, arg)
+        if !ptr.is_null(v) {
+            let t = (*v).tag
+            if t == TAG_SHORTSTR || t == TAG_LONGSTR {
+                let s = val_str(v)
+                *p = str_data(s) as *const u8
+                *n = (*s).length
+                return ok()
+            }
         }
-        let s = cx.check_lstr(arg)?
-        *p = s.as_ptr()
-        *n = s.size()
-        return ok()
+        return sl_arg_str_slow(cx, arg, p, n)
     }
+}
+
+fn sl_arg_str_slow(cx: &mut Cx, arg: i32, p: &mut *const u8, n: &mut usize) -> void!Throw {
+    let s = cx.check_lstr(arg)?
+    *p = s.as_ptr()
+    *n = s.size()
+    return ok()
 }
 
 // Integer argument (luaL_checkinteger) with a fast path for integers.
 fn sl_arg_int(cx: &mut Cx, arg: i32, out: &mut i64) -> void!Throw {
     unsafe {
-        let v = cx.idx2val(arg)
-        if (*v).tag == TAG_INT {
+        let v = sl_slot(cx, arg)
+        if !ptr.is_null(v) && (*v).tag == TAG_INT {
             *out = val_int(v)
             return ok()
         }
-        *out = cx.check_integer(arg)?
-        return ok()
+        return sl_arg_int_slow(cx, arg, out)
     }
+}
+
+fn sl_arg_int_slow(cx: &mut Cx, arg: i32, out: &mut i64) -> void!Throw {
+    *out = cx.check_integer(arg)?
+    return ok()
 }
 
 // Number argument (luaL_checknumber) with a fast path for numbers.
@@ -138,7 +161,11 @@ fn sl_arg_num(cx: &mut Cx, arg: i32) -> f64!Throw {
 // Optional integer argument (luaL_optinteger) with a fast path.
 fn sl_opt_int(cx: &mut Cx, arg: i32, def: i64, out: &mut i64) -> void!Throw {
     unsafe {
-        let v = cx.idx2val(arg)
+        let v = sl_slot(cx, arg)
+        if ptr.is_null(v) {
+            *out = def
+            return ok()
+        }
         let t = (*v).tag
         if t == TAG_INT {
             *out = val_int(v)
@@ -148,8 +175,7 @@ fn sl_opt_int(cx: &mut Cx, arg: i32, def: i64, out: &mut i64) -> void!Throw {
             *out = def
             return ok()
         }
-        *out = cx.check_integer(arg)?
-        return ok()
+        return sl_arg_int_slow(cx, arg, out)
     }
 }
 
@@ -181,6 +207,18 @@ fn sl_end_pos(pos: i64, len: usize) -> u64 {
         return 0
     }
     return (l + pos + 1) as u64
+}
+
+// luaL_checkstack with an inline fast path.
+fn sl_check_stack(cx: &mut Cx, n: i32, msg: &str) -> void!Throw {
+    unsafe {
+        let L = cx.L
+        let top = (*L).top
+        if sdiff((*L).stack_last, top) > n as isize && ((*(*L).ci).top as usize) >= (ptr.offset(top, n as isize) as usize) {
+            return ok()
+        }
+    }
+    return cx.check_stack_msg(n, msg)
 }
 
 // Push a string object created by the caller.
@@ -704,7 +742,7 @@ fn sl_push_captures(cx: &mut Cx, m: &PatMatcher, ws: usize, we: usize, whole: bo
     if nlevels == 0 && whole {
         nlevels = 1
     }
-    cx.check_stack_msg(nlevels as i32, "too many captures")?
+    sl_check_stack(cx, nlevels as i32, "too many captures")?
     for i in 0usize..nlevels {
         sl_push_capture(cx, m, i, ws, we)?
     }
