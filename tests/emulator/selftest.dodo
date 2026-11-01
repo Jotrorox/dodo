@@ -17,9 +17,10 @@ import "std/sync/atomic"
 
 // Emulator self-test for the RP2040 and RP2350 boards: the startup runtime,
 // the runtime's integer and floating-point helpers, interrupts, SysTick, the
-// timer and its alarms, the executor, DMA, PIO, a UART, and core 1 with the
-// FIFOs, spinlocks, and the lockout. CI runs it on emulated chips (scripts/test_emulator.py,
-// emulator/), so it only uses what the emulators model: nothing outside the
+// timer and its alarms, the executor, DMA, the ADC sampler, PIO (and the
+// RP2350's PIO GPIO window), GPIO interrupt enables per core, a UART, and
+// core 1 with the FIFOs, spinlocks, and the lockout. CI runs it on emulated
+// chips (scripts/test_emulator.py, emulator/), so it only uses what the emulators model: nothing outside the
 // chip is connected, and timing is checked with the emulators' tolerances.
 // scripts/test_pico.py runs the fuller hardware self-tests in tests/hardware
 // on real boards.
@@ -76,6 +77,18 @@ extern "C" fn dodo_board_panic(check: *const u8, file: *const u8, line: u32, col
 fn refused<T>(result: T!hal.Error, expected: hal.Error) -> bool {
     match result {
         ok(_) => {
+            return false
+        }
+        err(error) => {
+            return error == expected
+        }
+    }
+}
+
+// A void operation failed with `expected`.
+fn failed_with(result: void!hal.Error, expected: hal.Error) -> bool {
+    match result {
+        ok() => {
             return false
         }
         err(error) => {
@@ -580,6 +593,88 @@ const ECHO: rp_pio.Program = rp_pio.assemble(
     ".wrap",
 )
 
+// GPIOs: the package's count (both emulated boards' chips have 30), and
+// each core's own interrupt enables. The emulators raise no GPIO
+// interrupts, so only the PROCn_INTE registers are checked.
+fn gpio_checks(pins: &mut chip.Pins) {
+    assert(pins.pin_count() == chip.PIN_COUNT && chip.pin_count() == chip.PIN_COUNT, "the chip has 30 GPIOs")
+    assert(refused(pins.output(chip.PIN_COUNT), hal.Error.InvalidInput), "GPIO 30 is refused")
+    // IO_BANK0's PROC0_INTE and PROC1_INTE for GPIO 8 to 15.
+    proc0 := 0x4001_4104usize
+    proc1 := 0x4001_4134usize
+    if chip.IO_IRQ_BANK0 != 13 {
+        proc0 = 0x4002_824Cusize
+        proc1 = 0x4002_8294usize
+    }
+    pin := pins.input(13)!
+    assert(pin.number() == 13, "the pin knows its number")
+    pin.listen_on(1, chip.LEVEL_HIGH)
+    pin.listen(chip.RISING_EDGE)
+    enabled := unsafe {
+        (mmio.read32(proc0) >> 20) == chip.RISING_EDGE && (mmio.read32(proc1) >> 20) == chip.LEVEL_HIGH
+    }
+    assert(enabled, "listen enables the calling core's interrupt, listen_on another's")
+    pins.release(pin)
+    released := unsafe {
+        mmio.read32(proc0) == 0 && mmio.read32(proc1) == 0
+    }
+    assert(released, "a released pin listens on neither core")
+}
+
+// The RP2350's PIO window from GPIO 16: one state machine drives GPIO 21
+// through the translated SET mapping, and another waits for it with
+// `wait 1 gpio 21`, translated when loaded. The RP2040 has no window.
+const WAIT_HIGH: rp_pio.Program = rp_pio.assemble(
+    "    wait 1 gpio 21",
+    "    mov isr, ~null",
+    "    push block",
+    "    wait 0 gpio 21",
+)
+
+fn pio_window_checks(pins: &mut chip.Pins, timer: &mut chip.Timer) {
+    pio := pins.pio(1)!
+    if pio.version() == 0 {
+        assert(failed_with(pio.set_gpio_base(rp_pio.HIGH_GPIO_BASE), hal.Error.Unsupported), "the RP2040's PIO has no window")
+        pins.release_pio(pio)
+        return
+    }
+    pio.set_gpio_base(rp_pio.HIGH_GPIO_BASE)!
+    assert(pio.gpio_base() == 16 && failed_with(pins.pio_pins(&pio, 14, 2), hal.Error.InvalidInput), "the upper window starts at GPIO 16")
+    pins.pio_pins(&pio, 20, 2)!
+    waiting := pio.load(&WAIT_HIGH)!
+    driver := pio.state_machine(0)!
+    waiter := pio.state_machine(1)!
+    driver.set_pindirs(21, 1, 1)
+    driver.set_pins(21, 1, 0)
+    config := waiting.config()
+    waiter.init(&config)
+    waiter.set_enabled(true)
+    start := timer.now_us()
+    for timer.now_us() - start < 200 {}
+    pad_low := unsafe {
+        (mmio.read32(0xD000_0004) & (1u32 << 21)) == 0
+    }
+    low := waiter.is_rx_empty() && pad_low
+    driver.set_pins(21, 1, 1)
+    start = timer.now_us()
+    received := false
+    for !received && timer.now_us() - start < 1000 {
+        if let some(word) = waiter.try_get() {
+            received = word == 0xFFFF_FFFF
+        }
+    }
+    high := unsafe {
+        (mmio.read32(0xD000_0004) & (1u32 << 21)) != 0
+    }
+    assert(low && received && high, "a PIO block in the upper window drives and waits on GPIO 21")
+    driver.set_pins(21, 1, 0)
+    driver.set_pindirs(21, 1, 0)
+    pio.release_state_machine(waiter)
+    pio.release_state_machine(driver)
+    pio.unload(waiting)
+    pins.release_pio(pio)
+}
+
 fn pio_checks(pins: &mut chip.Pins, timer: &mut chip.Timer) {
     pio := pins.pio(0)!
     echo := pio.load(&ECHO)!
@@ -908,6 +1003,10 @@ pub fn run(float64: bool) {
     uart_checks(&mut b.pins)
     step()
     pio_checks(&mut b.pins, &mut b.timer)
+    step()
+    gpio_checks(&mut b.pins)
+    step()
+    pio_window_checks(&mut b.pins, &mut b.timer)
     step()
     core1_checks(&mut b.core1, &mut b.fifos, &mut b.spinlocks, &mut b.timer)
     step()

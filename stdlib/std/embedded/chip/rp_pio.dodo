@@ -45,6 +45,20 @@ import "std/embedded/hal"
 // RX FIFO registers, `irq` and `wait irq` on the neighbouring blocks'
 // flags, `wait jmppin`, and more `.fifo` and `.mov_status` choices.
 //
+// A block reaches 32 consecutive GPIOs, its window: GPIO 0 to 31, or on
+// the RP2350, whose PIO has a GPIOBASE register (datasheet 11.5.1, version
+// 1), GPIO 16 to 47 once `Pio.set_gpio_base(16)` moves it, which the
+// RP2350B's GPIO 32 to 47 need. Pin mappings, `wait gpio`, and the
+// StateMachine methods that take pins all name absolute GPIO numbers; the
+// driver translates them into the block's window and refuses pins outside
+// it with InvalidInput, so one program and config serve either window:
+//
+//     pio := b.pins.pio(1)!
+//     pio.set_gpio_base(16)!               // GPIO 16 to 47
+//     b.pins.pio_pins(&pio, 40, 2)!        // GPIO 40 and 41 belong to PIO1
+//
+// Choose the window before loading programs or claiming state machines.
+//
 // The registers are shared by a block's state machines; each StateMachine
 // changes only its own bits of the shared ones, through the block's atomic
 // set, clear, and XOR aliases. Programs a state machine runs belong to the
@@ -62,6 +76,8 @@ const IRQ: usize = 0x030
 const IRQ_FORCE: usize = 0x034
 const INPUT_SYNC_BYPASS: usize = 0x038
 const INSTR_MEM0: usize = 0x048
+// The RP2350's window base: 0 or 16, only bit 4 writable.
+const GPIOBASE: usize = 0x168
 // The interrupt registers follow the state machines' on the RP2040 and the
 // RP2350's RX FIFO registers on the RP2350.
 const INTR_V0: usize = 0x128
@@ -145,12 +161,23 @@ const PULL_NOBLOCK: u16 = 0x8080
 const OUT_NULL_32: u16 = 0x6060
 // The opcode bits; 0 for JMP.
 const OPCODE: u16 = 0xE000
+// WAIT with its source field: `wait gpio` when masked to WAIT_GPIO.
+const WAIT_SOURCE: u16 = 0xE060
+const WAIT_GPIO: u16 = 0x2000
 
 // Instruction slots in a block, and state machines.
 pub const INSTRUCTION_COUNT: u32 = 32
 pub const MACHINE_COUNT: u32 = 4
-// The GPIO numbers a state machine's pin mappings reach.
+// The GPIOs a block's window spans: its pin mappings reach PIN_LIMIT
+// consecutive GPIOs from its GPIO base.
 pub const PIN_LIMIT: u32 = 32
+// The GPIO base of the RP2350's upper window, GPIO 16 to 47.
+pub const HIGH_GPIO_BASE: u32 = 16
+// Program.gpio_ranges bits: a `wait gpio` names a GPIO from 0 to 15, 16 to
+// 31, or 32 to 47.
+pub const GPIOS_0_TO_15: u32 = 1 << 0
+pub const GPIOS_16_TO_31: u32 = 1 << 1
+pub const GPIOS_32_TO_47: u32 = 1 << 2
 // Program.origin of a program that loads at any address.
 pub const ANYWHERE: u32 = 0xFFFF_FFFF
 
@@ -234,6 +261,10 @@ pub struct Program {
     pub pull_threshold: u32
     // `.set`: the pins SET drives, 0 to 5.
     pub set_count: u32
+    // The GPIO ranges its `wait gpio` instructions name, GPIOS_0_TO_15 to
+    // GPIOS_32_TO_47; they hold the low five bits of the GPIO number, and
+    // loading translates them into the block's window.
+    pub gpio_ranges: u32
 }
 
 // Assemble a PIO program when the firmware is compiled, from string
@@ -252,6 +283,9 @@ pub fn assemble(source: &str) -> Program
 pub struct Config {
     clock_hz: u32
     version: u32
+    // The window base of the block the program was loaded into; pin fields
+    // hold GPIO numbers relative to it.
+    gpio_base: u32
     start: u32
     clkdiv: u32
     execctrl: u32
@@ -295,23 +329,33 @@ pub struct Config {
         return ((self.clock_hz as u64 * 256 + divider / 2) / divider) as u32
     }
 
+    // The GPIO base of the block's window the config was made for: 0, or
+    // HIGH_GPIO_BASE. The set_ methods below refuse pins outside it.
+    pub fn gpio_base(&self) -> u32 {
+        return self.gpio_base
+    }
+
     // OUT and `mov pins` drive `count` pins from GPIO `first`, wrapping
-    // after GPIO 31. InvalidInput for a pin above 31 or more than 32 pins.
+    // at the end of the block's window (after GPIO 31, or 47 in the upper
+    // window). InvalidInput for a pin outside the window or more than 32
+    // pins.
     pub fn set_out_pins(&mut self, first: u32, count: u32) -> void!hal.Error {
-        if first >= PIN_LIMIT || count > 32 {
+        if count > 32 {
             return err(hal.Error.InvalidInput)
         }
-        self.pinctrl = with_field(self.pinctrl, OUT_BASE, first)
+        pin := self.window_pin(first)?
+        self.pinctrl = with_field(self.pinctrl, OUT_BASE, pin)
         self.pinctrl = with_field(self.pinctrl, OUT_COUNT, count)
         return ok()
     }
 
     // SET drives `count` pins, up to five, from GPIO `first`.
     pub fn set_set_pins(&mut self, first: u32, count: u32) -> void!hal.Error {
-        if first >= PIN_LIMIT || count > 5 {
+        if count > 5 {
             return err(hal.Error.InvalidInput)
         }
-        self.pinctrl = with_field(self.pinctrl, SET_BASE, first)
+        pin := self.window_pin(first)?
+        self.pinctrl = with_field(self.pinctrl, SET_BASE, pin)
         self.pinctrl = with_field(self.pinctrl, SET_COUNT, count)
         return ok()
     }
@@ -320,10 +364,8 @@ pub struct Config {
     // read any GPIO with its input enabled, whichever function drives it:
     // pins given to the block, and pins claimed as inputs, for example.
     pub fn set_in_pins(&mut self, first: u32) -> void!hal.Error {
-        if first >= PIN_LIMIT {
-            return err(hal.Error.InvalidInput)
-        }
-        self.pinctrl = with_field(self.pinctrl, IN_BASE, first)
+        pin := self.window_pin(first)?
+        self.pinctrl = with_field(self.pinctrl, IN_BASE, pin)
         return ok()
     }
 
@@ -347,19 +389,15 @@ pub struct Config {
     // Side-set drives pins from GPIO `first`; the program's `.side_set`
     // decides how many.
     pub fn set_sideset_pins(&mut self, first: u32) -> void!hal.Error {
-        if first >= PIN_LIMIT {
-            return err(hal.Error.InvalidInput)
-        }
-        self.pinctrl = with_field(self.pinctrl, SIDESET_BASE, first)
+        pin := self.window_pin(first)?
+        self.pinctrl = with_field(self.pinctrl, SIDESET_BASE, pin)
         return ok()
     }
 
     // `jmp pin` branches on GPIO `pin`, and `wait jmppin` waits on it.
     pub fn set_jmp_pin(&mut self, pin: u32) -> void!hal.Error {
-        if pin >= PIN_LIMIT {
-            return err(hal.Error.InvalidInput)
-        }
-        self.execctrl = with_field(self.execctrl, JMP_PIN, pin)
+        index := self.window_pin(pin)?
+        self.execctrl = with_field(self.execctrl, JMP_PIN, index)
         return ok()
     }
 
@@ -476,6 +514,7 @@ pub struct Config {
         return Config {
             clock_hz: self.clock_hz,
             version: self.version,
+            gpio_base: self.gpio_base,
             start: self.start,
             clkdiv: self.clkdiv,
             execctrl: self.execctrl,
@@ -483,6 +522,21 @@ pub struct Config {
             pinctrl: self.pinctrl,
         }
     }
+
+    // GPIO `pin` as the block sees it, relative to its window base.
+    // InvalidInput outside the window.
+    fn window_pin(&self, pin: u32) -> u32!hal.Error {
+        return window_index(self.gpio_base, pin)
+    }
+}
+
+// GPIO `pin` relative to window base `base`. InvalidInput outside the
+// window.
+fn window_index(base: u32, pin: u32) -> u32!hal.Error {
+    if pin < base || pin - base >= PIN_LIMIT {
+        return err(hal.Error.InvalidInput)
+    }
+    return ok(pin - base)
 }
 
 // `value` with field `mask` holding `field`.
@@ -517,9 +571,15 @@ pub struct Loaded {
 
     // The settings the program asks for: its wrap, side-set, and the
     // `.clock_div`, `.fifo`, `.mov_status`, `.in`, `.out`, and `.set`
-    // directives, starting at its first instruction. Pins start at GPIO 0.
+    // directives, starting at its first instruction. Pins start at the
+    // first GPIO of the block's window.
     pub fn config(&self) -> Config {
         return self.config.copy()
+    }
+
+    // The GPIO base of the block's window when the program was loaded.
+    pub fn gpio_base(&self) -> u32 {
+        return self.config.gpio_base
     }
 }
 
@@ -531,6 +591,8 @@ pub struct Pio {
     version: u32
     clock_hz: u32
     irq: u32
+    // The first GPIO of the block's window: 0 or HIGH_GPIO_BASE.
+    gpio_base: u32
     // Instruction slots and state machines in use, one bit each.
     memory: u32
     machines: u32
@@ -542,7 +604,7 @@ pub struct Pio {
     // StateMachines it hands out may use it.
     pub unsafe fn at(base: usize, number: u32, version: u32, clock_hz: u32, irq: u32) -> Pio {
         unsafe {
-            return Pio { registers: hal.RegisterBlock.at(base), number, version, clock_hz, irq, memory: 0, machines: 0 }
+            return Pio { registers: hal.RegisterBlock.at(base), number, version, clock_hz, irq, gpio_base: 0, memory: 0, machines: 0 }
         }
     }
 
@@ -561,9 +623,41 @@ pub struct Pio {
         return self.memory
     }
 
+    // The first GPIO of the block's window: 0 (GPIO 0 to 31), as after
+    // reset, or HIGH_GPIO_BASE (GPIO 16 to 47).
+    pub fn gpio_base(&self) -> u32 {
+        return self.gpio_base
+    }
+
+    // Move the block's window to start at GPIO `base`: 0, or on the
+    // RP2350 HIGH_GPIO_BASE, so that its pin mappings reach GPIO 16 to 47.
+    // Choose it before giving the block pins (Pins.pio_pins), loading
+    // programs, or claiming state machines, whose pins it would move.
+    // InvalidInput for another base, Unsupported for HIGH_GPIO_BASE on the
+    // RP2040, Busy while a program is loaded or a state machine claimed.
+    pub fn set_gpio_base(&mut self, base: u32) -> void!hal.Error {
+        if base != 0 && base != HIGH_GPIO_BASE {
+            return err(hal.Error.InvalidInput)
+        }
+        if self.version == 0 {
+            if base != 0 {
+                return err(hal.Error.Unsupported)
+            }
+            return ok()
+        }
+        if self.memory != 0 || self.machines != 0 {
+            return err(hal.Error.Busy)
+        }
+        self.registers.write(GPIOBASE, base)
+        self.gpio_base = base
+        return ok()
+    }
+
     // Load `program` into free instruction slots: at its `.origin`, or
-    // else at the highest free addresses it fits. Busy if it does not fit,
-    // InvalidInput for an empty program or one longer than 32 instructions,
+    // else at the highest free addresses it fits. Its `wait gpio`
+    // instructions are translated into the block's window. Busy if it does
+    // not fit, InvalidInput for an empty program, one longer than 32
+    // instructions, or one that waits on a GPIO outside the window,
     // Unsupported for an RP2350 program on the RP2040.
     pub fn load(&mut self, program: &Program) -> Loaded!hal.Error {
         length := program.length
@@ -572,6 +666,11 @@ pub struct Pio {
         }
         if program.version > self.version {
             return err(hal.Error.Unsupported)
+        }
+        // GPIO 0 to 15 lie outside the upper window, 32 to 47 outside the
+        // lower one.
+        if (self.gpio_base == 0 && (program.gpio_ranges & GPIOS_32_TO_47) != 0) || (self.gpio_base != 0 && (program.gpio_ranges & GPIOS_0_TO_15) != 0) {
+            return err(hal.Error.InvalidInput)
         }
         mask := 0xFFFF_FFFFu32 >> (32 - length)
         offset := 0u32
@@ -602,6 +701,11 @@ pub struct Pio {
             word := program.instructions[index as usize]
             if (word & OPCODE) == JMP {
                 word += offset as u16
+            } else if (word & WAIT_SOURCE) == WAIT_GPIO && self.gpio_base != 0 {
+                // The index holds the GPIO number's low five bits: 16 to 31
+                // and 32 to 47 become 0 to 15 and 16 to 31 of the upper
+                // window by flipping bit 4, as the Pico SDK does.
+                word ^= HIGH_GPIO_BASE as u16
             }
             self.registers.write(INSTR_MEM0 + 4 * (offset + index) as usize, word as u32)
         }
@@ -635,7 +739,7 @@ pub struct Pio {
         registers := unsafe {
             hal.RegisterBlock.at(self.registers.base())
         }
-        return ok(StateMachine { registers, block: self.number, index, sm: SM0 + SM_STRIDE * index as usize, version: self.version, clock_hz: self.clock_hz })
+        return ok(StateMachine { registers, block: self.number, index, sm: SM0 + SM_STRIDE * index as usize, version: self.version, clock_hz: self.clock_hz, gpio_base: self.gpio_base })
     }
 
     // Claim the lowest-numbered free state machine. Busy if all four are
@@ -721,13 +825,15 @@ pub struct Pio {
 
     // Read GPIO `pin` straight from the pad, without the two-cycle input
     // synchronizer, if `bypass`: faster for clocked inputs, and safe only
-    // for signals synchronous to the system clock.
+    // for signals synchronous to the system clock. The pin must lie in the
+    // block's window; another traps.
     pub fn bypass_input_sync(&mut self, pin: u32, bypass: bool) {
-        core.assert(pin < PIN_LIMIT)
+        core.assert(pin >= self.gpio_base && pin - self.gpio_base < PIN_LIMIT)
+        bit := 1u32 << (pin - self.gpio_base)
         if bypass {
-            self.registers.write(INPUT_SYNC_BYPASS + SET_ALIAS, 1u32 << pin)
+            self.registers.write(INPUT_SYNC_BYPASS + SET_ALIAS, bit)
         } else {
-            self.registers.write(INPUT_SYNC_BYPASS + CLEAR_ALIAS, 1u32 << pin)
+            self.registers.write(INPUT_SYNC_BYPASS + CLEAR_ALIAS, bit)
         }
     }
 
@@ -779,6 +885,7 @@ pub struct Pio {
         config := Config {
             clock_hz: self.clock_hz,
             version: self.version,
+            gpio_base: self.gpio_base,
             start: offset,
             clkdiv: 0,
             execctrl,
@@ -803,6 +910,8 @@ pub struct StateMachine {
     sm: usize
     version: u32
     clock_hz: u32
+    // Its block's window base, fixed while the state machine is claimed.
+    gpio_base: u32
 
     // 0 to 3, within its block.
     pub fn index(&self) -> u32 {
@@ -814,11 +923,19 @@ pub struct StateMachine {
         return self.block
     }
 
+    // Its block's window base, as Pio.gpio_base.
+    pub fn gpio_base(&self) -> u32 {
+        return self.gpio_base
+    }
+
     // Stop the state machine and set it up with `config`: its settings
     // apply, its FIFOs and their error flags clear, its state (shift
     // counters, delay, stall) resets, and it jumps to the config's start.
     // Its X, Y, ISR, and OSR keep their values. Start it with set_enabled.
+    // The config must come from a program loaded into a block with the
+    // same window (Config.gpio_base); another traps.
     pub fn init(&mut self, config: &Config) {
+        core.assert(config.gpio_base == self.gpio_base)
         self.set_enabled(false)
         self.registers.write(self.sm + CLKDIV, config.clkdiv)
         self.registers.write(self.sm + EXECCTRL, config.execctrl)
@@ -1010,9 +1127,10 @@ pub struct StateMachine {
     }
 
     // Drive the `count` pins from GPIO `first` to the levels in `levels`,
-    // bit 0 for `first`, through the state machine. Use it before starting
-    // a program, to give its pins defined levels; the pins must belong to
-    // the block (Pins.pio_pins).
+    // bit 0 for `first`, through the state machine, wrapping at the end of
+    // the block's window. Use it before starting a program, to give its
+    // pins defined levels; the pins must belong to the block
+    // (Pins.pio_pins). `first` outside the window traps.
     pub fn set_pins(&mut self, first: u32, count: u32, levels: u32) {
         self.set_each(SET_PINS, first, count, levels)
     }
@@ -1065,12 +1183,12 @@ pub struct StateMachine {
     // Execute `set pins` or `set pindirs` once per pin, with SET mapped to
     // that pin alone, then restore the pin mapping and sticky output.
     fn set_each(&mut self, instruction: u16, first: u32, count: u32, values: u32) {
-        core.assert(first < PIN_LIMIT && count <= 32)
+        core.assert(first >= self.gpio_base && first - self.gpio_base < PIN_LIMIT && count <= 32)
         pinctrl := self.registers.read(self.sm + PINCTRL)
         execctrl := self.registers.read(self.sm + EXECCTRL)
         self.registers.write(self.sm + EXECCTRL + CLEAR_ALIAS, OUT_STICKY)
         for offset in 0..count {
-            pin := (first + offset) % PIN_LIMIT
+            pin := (first - self.gpio_base + offset) % PIN_LIMIT
             self.registers.write(self.sm + PINCTRL, hal.encode(SET_COUNT, 1) | hal.encode(SET_BASE, pin))
             self.exec(instruction | ((values >> offset) & 1) as u16)
         }

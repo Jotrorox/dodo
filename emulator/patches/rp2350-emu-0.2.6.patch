@@ -471,3 +471,29 @@ index ef7de49..02127ca 100644
 +        assert_eq!(c.regs.r[2], 7);
 +    }
 +}
+diff --git a/src/bus/peripherals.rs b/src/bus/peripherals.rs
+--- a/src/bus/peripherals.rs
++++ b/src/bus/peripherals.rs
+@@ -57,7 +57,7 @@
+     //
+     //   0x00 CHIP_ID      — REVISION[31:28] | PART[27:12]
+     //                       | MANUFACTURER[11:1] | STOP_BIT[0]
+-    //   0x04 PACKAGE_SEL  — 0 = RP2350A (QFN60), 1 = RP2350B (QFN80)
++    //   0x04 PACKAGE_SEL  — 1 = RP2350A (QFN60), 0 = RP2350B (QFN80)
+     //   0x08 PLATFORM     — bit 0 = FPGA, bit 1 = ASIC
+     //   0x14 GITREF_RP2350 — 32-bit git-sha prefix (chip-revision-specific)
+     //
+@@ -87,9 +87,10 @@
+             // Silicon-scenario observe mask 0x0FFF_FFFF drops the REV
+             // nibble (varies by die).
+             0x000 => 0x0000_4927,
+-            // PACKAGE_SEL: RP2350A (Pico 2 baseline). Datasheet §12.11.2
+-            // and SDK `SYSINFO_PACKAGE_SEL_RESET = 0x0`.
+-            0x004 => 0x0000_0000,
++            // PACKAGE_SEL: RP2350A (Pico 2 baseline), QFN60. The SDK's
++            // sysinfo.h reads "0 = QFN80, 1 = QFN60", and picotool reports
++            // a nonzero PACKAGE_SEL as QFN60 (dodo patch).
++            0x004 => 0x0000_0001,
+             // PLATFORM: live RP2354 silicon reads 0 (V12 Stage 3,
+             // probe E46410955F614129). The pico-sdk header
+             // `SYSINFO_PLATFORM_RESET = 0x0` was right all along; V11

@@ -101,6 +101,7 @@ LAST_CHECKS = [
     "core 1 starts, reports its number, and answers over the FIFO; a small stack and a third FIFO end are refused",
     "spinlocks are claimed once and exclude; both cores count 10000 each under one",
     "core 1's executor wakes on the FIFO interrupt; core 1 finishes, stops, and starts again",
+    "core 1 takes IO_IRQ_BANK0 for a pin it listens to; the chip has 30 GPIOs",
     "random number generator fills differing, balanced bytes and seeds a SoftRng",
     "unused clocks stop; claiming starts them; claimed and essential clocks are refused",
     "deep sleep with only the timer's clocks wakes on its alarm",

@@ -251,9 +251,12 @@ const FUNCSEL: u32 = 0b11111
 // GPIO interrupts (2.19.6.2): four bits per pin, eight pins per register.
 // INTR latches edges (write one to clear) and shows levels; PROC0_INTE
 // selects what raises IO_IRQ_BANK0 on core 0, and PROC0_INTS shows it.
+// Core 1's PROC1_INTE and PROC1_INTS follow CORE_INTERRUPTS later.
 const GPIO_INTR: usize = IO_BANK0_BASE + 0x0F0
 const GPIO_PROC0_INTE: usize = IO_BANK0_BASE + 0x100
 const GPIO_PROC0_INTS: usize = IO_BANK0_BASE + 0x120
+const CORE_INTERRUPTS: usize = 0x130 - 0x100
+const INTS_FROM_INTE: usize = 0x120 - 0x100
 // GPIO events that end the dormant state (2.11.5), laid out as INTR.
 const GPIO_DORMANT_WAKE_INTE: usize = 0x160
 const GPIO_DORMANT_WAKE_INTS: usize = 0x180
@@ -620,10 +623,21 @@ unsafe fn start_clocks(crystal_hz: u32) -> void!hal.Error {
     }
 }
 
+// The user GPIOs: PIN_COUNT, as rp2350.pin_count() for the RP2350's
+// packages, so portable code asks either chip the same way.
+pub fn pin_count() -> u32 {
+    return PIN_COUNT
+}
+
 // The 30 user GPIOs, and the I2C, SPI, and UART controllers that use them.
 // Each pin and each controller can be taken once, and given back.
 pub struct Pins {
     bank: rp_pins.Bank<Chip>
+
+    // The GPIOs the chip has: PIN_COUNT.
+    pub fn pin_count(&self) -> u32 {
+        return self.bank.pin_count()
+    }
 
     // Claim pin `number` as a push-pull output, initially low.
     pub fn output(&mut self, number: u32) -> Pin!hal.Error {
@@ -643,10 +657,11 @@ pub struct Pins {
     // Give back a pin from `output` or `input`. It stops driving and is
     // disconnected until claimed again, for example as part of a bus.
     pub fn release(&mut self, pin: Pin) {
-        pin.ignore(ALL_EVENTS)
+        pin.ignore_on(0, ALL_EVENTS)
+        pin.ignore_on(1, ALL_EVENTS)
         pin.clear_events(ALL_EVENTS)
         pin.set_as_input()
-        self.bank.release_gpio(pin.mask)
+        self.bank.release_gpio(rp_pins.pin_bit(pin.number))
     }
 
     // Claim pins `sda` and `scl` as an I2C bus with an SCL frequency of
@@ -868,7 +883,7 @@ pub struct Pins {
     }
 
     fn claim(&mut self, number: u32) -> Pin!hal.Error {
-        mask := self.bank.gpio(number)?
+        self.bank.gpio(number)?
         group := 4 * (number / 8) as usize
         // SAFETY: the bank makes this pin's control and pad registers
         // exclusive to the returned Pin. The SIO output SET/CLR/XOR and
@@ -879,17 +894,16 @@ pub struct Pins {
         // INTS is read-only.
         unsafe {
             return ok(Pin {
+                number,
                 set: reg(GPIO_OUT_SET),
                 clear: reg(GPIO_OUT_CLR),
                 toggle: reg(GPIO_OUT_XOR),
                 input: reg(GPIO_IN),
                 output_enable: reg(GPIO_OE_SET),
                 output_disable: reg(GPIO_OE_CLR),
-                mask,
+                mask: 1u32 << number,
                 raw_events: reg(GPIO_INTR + group),
-                listen_set: reg(GPIO_PROC0_INTE + group + SET_ALIAS),
-                listen_clear: reg(GPIO_PROC0_INTE + group + CLEAR_ALIAS),
-                status: reg(GPIO_PROC0_INTS + group),
+                interrupts: GPIO_PROC0_INTE + group,
                 shift: 4 * (number % 8),
             })
         }
@@ -982,6 +996,10 @@ fn usb_bootloader() {
 // What rp_pins.Bank needs from this chip. Only the Bank in Pins has one.
 struct Chip {
     crystal_hz: u32
+
+    pub fn pin_count(&self) -> u32 {
+        return PIN_COUNT
+    }
 
     pub fn route(&mut self, number: u32, function: u32, clear: u32, set: u32) {
         // SAFETY: the bank routes only pins it holds.
@@ -1127,6 +1145,7 @@ unsafe fn route(number: u32, function: u32, clear: u32, set: u32) {
 // One GPIO driven by the single-cycle I/O block. Implements the
 // std/embedded/hal output and input pin protocols.
 pub struct Pin {
+    number: u32
     set: hal.Reg<u32>
     clear: hal.Reg<u32>
     toggle: hal.Reg<u32>
@@ -1134,13 +1153,17 @@ pub struct Pin {
     output_enable: hal.Reg<u32>
     output_disable: hal.Reg<u32>
     mask: u32
-    // This pin's interrupt bits: raw events, core 0's enables through the
-    // set and clear aliases, and core 0's status, at `shift`.
+    // This pin's interrupt bits, at `shift`: raw events, and the address
+    // of core 0's PROC0_INTE register for its group of eight pins, which
+    // core 1's and the status registers follow.
     raw_events: hal.Reg<u32>
-    listen_set: hal.Reg<u32>
-    listen_clear: hal.Reg<u32>
-    status: hal.Reg<u32>
+    interrupts: usize
     shift: u32
+
+    // The GPIO number.
+    pub fn number(&self) -> u32 {
+        return self.number
+    }
 
     pub fn set_high(&mut self) {
         self.set.write(self.mask)
@@ -1169,24 +1192,59 @@ pub struct Pin {
         self.output_disable.write(self.mask)
     }
 
-    // Raise IO_IRQ_BANK0 on `events`, any of LEVEL_LOW, LEVEL_HIGH,
-    // FALLING_EDGE, and RISING_EDGE, after forgetting edges seen so far.
-    // Enable the interrupt in the NVIC too: `cortex_m.enable(pin.irq())`.
-    // Every pin shares the one interrupt; its handler tells them apart with
-    // `events`.
+    // Raise IO_IRQ_BANK0 on the calling core on `events`, any of
+    // LEVEL_LOW, LEVEL_HIGH, FALLING_EDGE, and RISING_EDGE, after
+    // forgetting edges seen so far. Enable the interrupt in that core's
+    // NVIC too: `cortex_m.enable(pin.irq())`. Every pin shares the one
+    // interrupt; its handler tells them apart with `events`. Each core has
+    // its own enables, and both cores share the vector table, so the one
+    // `@interrupt(IO_IRQ_BANK0)` handler runs on whichever core listens:
+    // call `listen` and `cortex_m.enable` from code running on core 1 to
+    // handle a pin there.
     pub fn listen(&mut self, events: u32) {
-        self.clear_events(events)
-        self.listen_set.write((events & ALL_EVENTS) << self.shift)
+        self.listen_on(cpu.core_id(), events)
     }
 
-    // Stop raising the interrupt on `events`.
+    // Stop raising the calling core's interrupt on `events`.
     pub fn ignore(&mut self, events: u32) {
-        self.listen_clear.write((events & ALL_EVENTS) << self.shift)
+        self.ignore_on(cpu.core_id(), events)
     }
 
-    // The listened-to events that are raising the interrupt now.
+    // The events the calling core listens to that are raising its
+    // interrupt now.
     pub fn events(&self) -> u32 {
-        return (self.status.read() >> self.shift) & ALL_EVENTS
+        return self.events_on(cpu.core_id())
+    }
+
+    // `listen` for core `core`, 0 or 1, from either core. Another number
+    // traps.
+    pub fn listen_on(&mut self, core: u32, events: u32) {
+        self.clear_events(events)
+        enables := self.core_register(core, SET_ALIAS)
+        enables.write((events & ALL_EVENTS) << self.shift)
+    }
+
+    // `ignore` for core `core`, 0 or 1.
+    pub fn ignore_on(&mut self, core: u32, events: u32) {
+        enables := self.core_register(core, CLEAR_ALIAS)
+        enables.write((events & ALL_EVENTS) << self.shift)
+    }
+
+    // `events` for core `core`, 0 or 1.
+    pub fn events_on(&self, core: u32) -> u32 {
+        status := self.core_register(core, INTS_FROM_INTE)
+        return (status.read() >> self.shift) & ALL_EVENTS
+    }
+
+    // Core `processor`'s INTE register of this pin's group, at `offset`
+    // (an alias, or INTS_FROM_INTE for its INTS).
+    fn core_register(&self, processor: u32, offset: usize) -> hal.Reg<u32> {
+        core.assert(processor < 2)
+        // SAFETY: the pin writes only its own bits, through the set and
+        // clear aliases, and INTS is read-only; see Pins.claim.
+        unsafe {
+            return reg(self.interrupts + CORE_INTERRUPTS * processor as usize + offset)
+        }
     }
 
     // Forget the edges among `events`, acknowledging them; a handler or

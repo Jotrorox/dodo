@@ -932,6 +932,16 @@
   GD25Q, MX25L, IS25LP, ...) as a `hal.Flash`, probing them by JEDEC ID and
   SFDP, with 4-byte addressing above 16 MiB, protection, deep power-down,
   and reset.
+- The RP2350B's GPIO 30 to 47: `rp2350.take()` reads the package from
+  SYSINFO, and `pins.pin_count()` (30 or 48) bounds every claim, so GPIO 30
+  to 47 work as inputs and outputs, with interrupts, dormant wake-up, and
+  their I2C, SPI, UART, and PWM functions (slices 8 to 11). Pin masks in
+  `rp_pins` are now `u64`. PIO blocks on the RP2350 reach GPIO 16 to 47
+  through `pio.set_gpio_base(rp_pio.HIGH_GPIO_BASE)`; pin mappings and
+  `wait gpio` (now up to GPIO 47) name absolute GPIOs and are translated
+  into the block's window. Pin interrupts work on either core: `listen`,
+  `ignore`, and `events` act for the calling core, and `listen_on`,
+  `ignore_on`, and `events_on` name one.
 
 ## 0.1.5 — 2026-10-12
 

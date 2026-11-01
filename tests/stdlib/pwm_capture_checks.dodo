@@ -657,7 +657,9 @@ fn claims() {
     // Only odd pins, output B, count.
     expect_capture_error(open_result(2, 10_000), hal.Error.InvalidInput)
     expect_capture_error(open_result(30, 10_000), hal.Error.InvalidInput)
-    expect_capture_error(open_result(31, 10_000), hal.Error.InvalidInput)
+    expect_capture_error(open_result(49, 10_000), hal.Error.InvalidInput)
+    // GPIO 33 is output B of slice 8, which only a 12-slice block has.
+    expect_capture_error(open_result(33, 10_000), hal.Error.InvalidInput)
     expect_capture_error(open_result(3, 0), hal.Error.InvalidInput)
     expect_capture_error(open_result(3, 200_000), hal.Error.InvalidInput)
 
@@ -811,6 +813,10 @@ static mut BLOCK_MEMORY: [4096]u32 = [0u32; 4096]
 static mut TIMER_MEMORY: [16]u32 = [0u32; 16]
 
 struct BankChip {
+    pub fn pin_count(&self) -> u32 {
+        return 30
+    }
+
     pub fn route(&mut self, pin: u32, function: u32, clear: u32, set: u32) {
         unsafe {
             FUNCTIONS[pin as usize] = function
