@@ -410,7 +410,8 @@ pub struct Peripherals {
     // The program flash, for storing data above the program; see
     // std/embedded/chip/rp_flash.
     pub flash: rp_flash.Flash
-    // Sleep modes, clock gating, and the dormant state; see Power.
+    // Sleep modes, clock gating, the dormant state, and the system clock's
+    // rate; see Power.
     pub power: Power
 }
 
@@ -965,8 +966,9 @@ pub struct Usb {
     // working while the program busy-waits; a program's own USBCTRL_IRQ
     // handler replaces that. Until it is released, a panic is reported on
     // it, and a host that sets 1200 baud, as `dodo run` does, restarts the
-    // board into its bootloader. Busy if a port is open, Timeout if PLL_USB
-    // or the controller does not start.
+    // board into its bootloader. Busy if a port is open or clk_sys runs at
+    // 48 MHz or less (Power.set_system_hz), Timeout if PLL_USB or the
+    // controller does not start.
     pub fn serial(&mut self) -> rp_usb.Serial!hal.Error {
         return self.serial_with(rp_usb.default_identity("RP2040"), PIN_COUNT)
     }
@@ -1354,7 +1356,10 @@ pub struct Rtc: hal.Rtc + hal.RtcAlarm {
     // Stop the RTC, switch clk_rtc to auxiliary source `source` divided by
     // `divider`, and let the RTC count from the `clock_hz` result.
     fn switch_clock(&mut self, source: u32, divider: u32, clock_hz: u32) -> void!hal.Error {
-        running := self.calendar.pause()?
+        running := self.calendar.is_set()?
+        // Without a signal on a clock input the RTC cannot stop: it takes
+        // the request once the new clock runs.
+        first := self.calendar.pause()
         // The generator stops cleanly within three cycles of its old clock,
         // before its source may change (2.15.3.2).
         settle := 3 * (system_hz() / self.clock_hz) + 16
@@ -1371,6 +1376,17 @@ pub struct Rtc: hal.Rtc + hal.RtcAlarm {
             control.write(source | CLK_ENABLE)
         }
         self.clock_hz = clock_hz
+        match first {
+            ok(_) => {}
+            err(_) => {
+                match self.calendar.pause() {
+                    ok(_) => {}
+                    err(error) => {
+                        return err(error)
+                    }
+                }
+            }
+        }
         return self.calendar.resume(clock_hz, running)
     }
 

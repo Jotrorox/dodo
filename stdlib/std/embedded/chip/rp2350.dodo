@@ -497,7 +497,8 @@ pub struct Peripherals {
     // The program flash, for storing data above the program; see
     // std/embedded/chip/rp_flash.
     pub flash: rp_flash.Flash
-    // Sleep modes, clock gating, and the dormant state; see Power.
+    // Sleep modes, clock gating, the dormant state, power-down, and the
+    // system clock's rate; see Power.
     pub power: Power
 }
 
@@ -597,8 +598,23 @@ pub fn take(config: Config) -> Peripherals!hal.Error {
         rp_flash.Flash.take()
     }
     power := Power { crystal_hz: crystal, powered_down: down.happened, woken: down.woken, retained: down.retained }
+    pins := Pins { bank }
     rtc := Rtc { aon, crystal_hz: crystal, external: false, clock_pin: none }
-    return ok(Peripherals { pins: Pins { bank }, timer, rtc, watchdog, usb, dma, rng, core1, fifos, spinlocks, doorbells, power, flash })
+    // A GPIO time reference kept from before the reset: its pad was reset,
+    // so claim the pin again, which lets the clock through, and give it to
+    // the Rtc.
+    tick := rtc.aon.tick_source()
+    if tick == rp_rtc.TICK_CLOCK_INPUT || tick == rp_rtc.TICK_INPUT {
+        reference := rtc.aon.reference_pin()
+        match pins.input(reference) {
+            ok(input) => {
+                rtc.external = true
+                rtc.clock_pin = some(input)
+            }
+            err(_) => {}
+        }
+    }
+    return ok(Peripherals { pins, timer, rtc, watchdog, usb, dma, rng, core1, fifos, spinlocks, doorbells, power, flash })
 }
 
 // SAFETY: the caller owns `address`, a 32-bit RP2350 register.
@@ -1078,8 +1094,9 @@ pub struct Usb {
     // working while the program busy-waits; a program's own USBCTRL_IRQ
     // handler replaces that. Until it is released, a panic is reported on
     // it, and a host that sets 1200 baud, as `dodo run` does, restarts the
-    // board into its bootloader. Busy if a port is open, Timeout if PLL_USB
-    // or the controller does not start.
+    // board into its bootloader. Busy if a port is open or clk_sys runs at
+    // 48 MHz or less (Power.set_system_hz), Timeout if PLL_USB or the
+    // controller does not start.
     pub fn serial(&mut self) -> rp_usb.Serial!hal.Error {
         return self.serial_with(rp_usb.default_identity("RP2350"), PIN_COUNT)
     }
@@ -1486,7 +1503,9 @@ pub struct Rtc: hal.Rtc + hal.RtcAlarm {
     }
 
     // Tick from the crystal again and give back the pin of
-    // `use_clock_input` or `use_tick_input`; nothing happens without one.
+    // `use_clock_input` or `use_tick_input`, or of a reference that take()
+    // found still in use after a reset and claimed again; nothing happens
+    // without one.
     pub fn release_clock_input(&mut self, pins: &mut Pins) -> void!hal.Error {
         if let some(input) = option.take(&mut self.clock_pin) {
             result := self.aon.use_crystal(self.crystal_hz)

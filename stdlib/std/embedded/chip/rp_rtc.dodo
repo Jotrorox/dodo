@@ -563,6 +563,20 @@ pub struct AonTimer<R: hal.Registers>: hal.Rtc + hal.RtcAlarm {
         return TICK_LPOSC
     }
 
+    // The GPIO that EXT_TIME_REF selects as the time reference, for a tick
+    // of TICK_CLOCK_INPUT or TICK_INPUT: 12, 20, 14, or 22.
+    pub fn reference_pin(&mut self) -> u32 {
+        source := self.registers.read(EXT_TIME_REF) & EXT_SOURCE
+        if source == 0 {
+            return 12
+        } else if source == 1 {
+            return 20
+        } else if source == 2 {
+            return 14
+        }
+        return 22
+    }
+
     // Stop a running timer for a change that needs it stopped, keeping its
     // time, and return whether it ran. A few microseconds are lost.
     fn pause(&mut self) -> bool {
