@@ -1389,16 +1389,6 @@ fn flash_checks(flash: &mut rp_flash.Flash, core1: &mut rp_multicore.Core1, time
     }
     check(blank && same && mapped_byte == bytes[299] && edge && erased && clk_sys_khz() > 0)
 
-    // Core 1 may run from flash, so no erase or write while it runs.
-    feed_watchdog()
-    running := unsafe {
-        core1.start(&mut CORE1_STACK, Flag {})!
-    }
-    busy := refused_flash(area.erase(0, rp_flash.SECTOR_BYTES), hal.Error.Busy) && refused_flash(area.write(0, &tail), hal.Error.Busy)
-    running.stop()
-    area.write(0, &tail)!
-    check(busy)
-
     // A key-value store over the region: 300 updates of a 100-byte value
     // compact its four sectors twice over.
     feed_watchdog()
@@ -1454,17 +1444,137 @@ fn flash_checks(flash: &mut rp_flash.Flash, core1: &mut rp_multicore.Core1, time
     kept = kept && again.start() == end
     flash.release(again)
     check(kept)
+    flash_lockout_checks(flash, core1, timer)
 }
 
-fn refused_flash(result: void!hal.Error, expected: hal.Error) -> bool {
-    match result {
-        ok() => {
-            return false
+// Core 1 counts in SPINS while core 0 erases and writes; TURN hands over to
+// core 1's side of the lockout checks and brings back its report.
+static SPINS: atomic.Atomic<u32> = atomic.Atomic.new(0u32)
+static TURN: atomic.Atomic<u32> = atomic.Atomic.new(0u32)
+const PARKED_CORE0: u32 = 4
+const WROTE_FROM_CORE1: u32 = 8
+
+fn load_word(word: &atomic.Atomic<u32>) -> u32 {
+    match word.load(atomic.Ordering.Acquire) {
+        ok(value) => {
+            return value
         }
-        err(error) => {
-            return error == expected
+        err(_) => {
+            return 0
         }
     }
+}
+
+fn store_word(word: &atomic.Atomic<u32>, value: u32) {
+    match word.store(value, atomic.Ordering.Release) {
+        ok() => {}
+        err(_) => {}
+    }
+}
+
+// One more count, from code in flash: only one core counts at a time.
+fn spin() {
+    store_word(&SPINS, load_word(&SPINS) + 1)
+}
+
+// Erase the region's first sector and write and read back three bytes.
+fn rewrite(region: &mut rp_flash.Region) -> bool {
+    pattern: [3]u8 = [0x11, 0x22, 0x33]
+    back := [0u8; 3]
+    match rewrite_bytes(region, &pattern, &mut back) {
+        ok() => {
+            return back[0] == 0x11 && back[1] == 0x22 && back[2] == 0x33
+        }
+        err(_) => {
+            return false
+        }
+    }
+}
+
+fn rewrite_bytes(region: &mut rp_flash.Region, pattern: &[u8], back: &mut[u8]) -> void!hal.Error {
+    region.erase(0, rp_flash.SECTOR_BYTES)?
+    region.write(100, pattern)?
+    region.read(100, back)?
+    return ok()
+}
+
+// On core 1: count until core 0 hands over, then lock core 0 out and see its
+// count stand still, then erase and write a region of its own while core 0
+// counts from flash, and report both in TURN.
+struct FlashWorker {
+    region: rp_flash.Region
+
+    pub fn run(self) {
+        let FlashWorker { region } = self
+        own := region
+        for load_word(&TURN) == 0 {
+            spin()
+        }
+        report := 2u32
+        match rp_multicore.lockout() {
+            ok(pause) => {
+                before := load_word(&SPINS)
+                still := pause.is_parked()
+                for _ in 0..200_000 {
+                    still = still && load_word(&SPINS) == before
+                }
+                core.drop(pause)
+                if still {
+                    report |= PARKED_CORE0
+                }
+            }
+            err(_) => {}
+        }
+        if rewrite(&mut own) {
+            report |= WROTE_FROM_CORE1
+        }
+        store_word(&TURN, report)
+    }
+}
+
+// Either core erases and writes the flash while the other runs from it:
+// rp_multicore's lockout parks the other core in SRAM meanwhile, its count
+// standing still, and lets it go on afterwards. Core 1 keeps its region.
+fn flash_lockout_checks(flash: &mut rp_flash.Flash, core1: &mut rp_multicore.Core1, timer: &mut chip.Timer) {
+    feed_watchdog()
+    start := flash.capacity() - 5 * rp_flash.SECTOR_BYTES
+    area := flash.region(start, rp_flash.SECTOR_BYTES)!
+    other := flash.region(start - rp_flash.SECTOR_BYTES, rp_flash.SECTOR_BYTES)!
+    store_word(&SPINS, 0)
+    store_word(&TURN, 0)
+    running := unsafe {
+        core1.start(&mut CORE1_STACK, FlashWorker { region: other })!
+    }
+    timer.delay_ms(1)
+    counting := load_word(&SPINS) > 0
+    written := rewrite(&mut area)
+    moved := load_word(&SPINS)
+    timer.delay_ms(1)
+    resumed := load_word(&SPINS) != moved
+    parked := false
+    match rp_multicore.lockout() {
+        ok(pause) => {
+            before := load_word(&SPINS)
+            timer.delay_ms(2)
+            parked = pause.is_parked() && load_word(&SPINS) == before
+            core.drop(pause)
+        }
+        err(_) => {}
+    }
+    after := load_word(&SPINS)
+    timer.delay_ms(1)
+    parked = parked && load_word(&SPINS) != after
+    // Core 1's turn, while core 0 counts from flash.
+    store_word(&TURN, 1)
+    begin := timer.now_us()
+    for load_word(&TURN) < 2 && timer.now_us() - begin < 1_000_000 {
+        spin()
+    }
+    report := load_word(&TURN)
+    running.stop()
+    flash.release(area)
+    check(counting && written && resumed && (report & WROTE_FROM_CORE1) != 0)
+    check(parked && (report & PARKED_CORE0) != 0)
 }
 
 // Random numbers: the board's generator fills two 64-byte buffers that

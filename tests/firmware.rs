@@ -768,6 +768,141 @@ fn flash_storage_links_for_every_board() {
                 // The RP2350's flash_op restores execute-in-place itself.
                 assert!(symbol("dodo_flash_erase") >= 0x1000_0000);
             }
+            // Regions erase and write under rp_multicore's lockout, whose
+            // handler parks the other core in SRAM.
+            assert!(in_sram(symbol("dodo_lockout_handler")), "{board}");
+            assert!(in_sram(symbol("dodo_lockout_mailbox")), "{board}");
+            assert!(symbol("dodo.main.rp_multicore.lockout") >= 0x1000_0000);
+        }
+    }
+}
+
+/// The lockout handler's code as loaded: the bytes `length` from the start
+/// of `dodo_lockout_handler`, taken from the flash image of `.data`.
+fn lockout_handler_code(elf: &Path, family: u32, length: usize) -> Vec<u8> {
+    let bytes = fs::read(elf).unwrap();
+    let image = flash_image(&fs::read(elf.with_extension("uf2")).unwrap(), family);
+    let symbol = |name: &str| elf_symbol(&bytes, name).unwrap_or_else(|| panic!("{name}"));
+    let handler = symbol("dodo_lockout_handler") & !1;
+    let at = (symbol("__data_load") + handler - symbol("__data_start") - 0x1000_0000) as usize;
+    image[at..at + length].to_vec()
+}
+
+// A flash region erased and written on each core while the other runs a
+// task from flash, and rp_multicore.lockout called directly, on every board:
+// the lockout handler is IO_IRQ_QSPI's vector and runs from SRAM, with its
+// literal pool, which holds IO_QSPI's PROC0_INTF clear alias of the chip.
+#[test]
+fn flash_writes_with_both_cores_running_link_for_every_board() {
+    if !ld_lld() {
+        return;
+    }
+    let scratch = Scratch::new("lockout");
+    let source = scratch.write(
+        "lockout.dodo",
+        r#"package main
+import "std/embedded/board"
+import "std/embedded/chip/rp_flash"
+import "std/embedded/chip/rp_multicore"
+import "std/embedded/hal"
+import "std/embedded/storage"
+
+static mut STACK: [1024]u64 = [0u64; 1024]
+
+struct Writer {
+    region: rp_flash.Region
+
+    pub fn run(self) {
+        let Writer { region } = self
+        match storage.Store.open(region) {
+            ok(store) => {
+                settings := store
+                match settings.set_u32("core", 1) {
+                    ok() => {}
+                    err(_) => {}
+                }
+            }
+            err(_) => {}
+        }
+        match rp_multicore.lockout() {
+            ok(pause) => {
+                core.assert(pause.is_parked())
+            }
+            err(error) => {
+                core.assert(error == hal.Error.Timeout || error == hal.Error.Busy)
+            }
+        }
+    }
+}
+
+fn main() {
+    b := board.take()!
+    capacity := b.flash.capacity()
+    theirs := b.flash.region(capacity - 32 * 1024, 16 * 1024)!
+    mine := b.flash.last(16 * 1024)!
+    running := unsafe {
+        b.core1.start(&mut STACK, Writer { region: theirs })!
+    }
+    store := storage.Store.open(mine)!
+    store.set_u32("core", 0)!
+    pause := rp_multicore.lockout()!
+    inner := rp_multicore.lockout()!
+    core.assert(pause.is_parked() && !inner.is_parked())
+    core.drop(inner)
+    core.drop(pause)
+    running.stop()
+}
+"#,
+    );
+    // IO_IRQ_QSPI, and IO_QSPI's PROC0_INTF clear alias.
+    let boards = [
+        ("pico", 0xE48B_FF56u32, 14usize, 0x4001_B038u32),
+        ("pico2", 0xE48B_FF59, 23, 0x4003_3220),
+        ("pico2_w", 0xE48B_FF59, 23, 0x4003_3220),
+    ];
+    for (board, family, irq, force) in boards {
+        for level in ["0", "2"] {
+            let elf = scratch.path(&format!("lockout-{board}-O{level}.elf"));
+            build(&[
+                "build",
+                source.to_str().unwrap(),
+                "--board",
+                board,
+                "-O",
+                level,
+                "-o",
+                &elf,
+            ]);
+            let path = Path::new(&elf);
+            let bytes = fs::read(path).unwrap();
+            let symbol = |name: &str| {
+                elf_symbol(&bytes, name).unwrap_or_else(|| panic!("{board} lacks {name}"))
+            };
+            let handler = symbol("dodo_lockout_handler");
+            let in_sram = |address: u32| (0x2000_0000..0x2008_2000).contains(&address);
+            assert!(
+                in_sram(handler),
+                "{board} -O{level}: the handler runs from SRAM"
+            );
+            assert!(in_sram(symbol("dodo_lockout_mailbox")));
+            let image = flash_image(&fs::read(path.with_extension("uf2")).unwrap(), family);
+            let vectors = symbol("__vector_table") as usize - 0x1000_0000;
+            assert_eq!(
+                word(&image, vectors + 4 * (16 + irq)),
+                handler | 1,
+                "{board} -O{level}: IO_IRQ_QSPI is the lockout handler"
+            );
+            // Its literals follow its code in SRAM, so it reads nothing from
+            // flash: among them the forced bit's clear alias and the
+            // mailbox.
+            let code = lockout_handler_code(path, family, 0x48);
+            let literals: Vec<u32> = (0..code.len() / 4).map(|at| word(&code, 4 * at)).collect();
+            assert!(
+                literals.contains(&force),
+                "{board} -O{level}: {literals:x?}"
+            );
+            assert!(literals.contains(&symbol("dodo_lockout_mailbox")));
+            assert!(symbol("dodo.main.rp_multicore.lockout") >= 0x1000_0000);
         }
     }
 }
@@ -1227,6 +1362,12 @@ fn two_core_programs_link_for_every_board() {
                 elf_symbol(&bytes, "dodo_core_id").is_some(),
                 "{board} -O{level}"
             );
+            // Core 1 and core 0 listen for the lockout through IO_IRQ_QSPI,
+            // whose handler runs from SRAM.
+            let qspi = if board == "pico" { 14 } else { 23 };
+            let lockout = elf_symbol(&bytes, "dodo_lockout_handler").expect("lockout");
+            assert!((0x2000_0000..0x2008_2000).contains(&lockout), "{board}");
+            assert_eq!(word(&image, vectors + 4 * (16 + qspi)), lockout | 1);
         }
     }
     // Without std/embedded/chip the FIFO stub falls through to DefaultHandler.

@@ -470,6 +470,10 @@ pub fn take(config: Config) -> Peripherals!hal.Error {
             core1_fifo_irq: SIO_IRQ_PROC1,
             reserved_locks: RESERVED_SPINLOCKS,
             doorbell_irq: none,
+            // IO_QSPI at 0x40018000, PROC0_INTF at 0x38, and SCLK's
+            // LEVEL_LOW bit (datasheet 2.19.6.2), as the runtime's
+            // dodo_lockout_handler expects.
+            lockout: rp_multicore.LockoutLine { qspi_base: 0x4001_8000, force: 0x38, bit: 1, irq: IO_IRQ_QSPI },
         })
     }
     // The RP2040 has no doorbells.
