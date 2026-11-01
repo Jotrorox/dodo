@@ -250,6 +250,24 @@ pub struct Lua {
         }
     }
 
+    // Testing aid: make the collector work at every check point (where it
+    // may run), not only when the allocation debt asks for it. Level 0 turns
+    // this off, 1 runs one incremental step and 2 a full collection at each
+    // check point. Programs behave the same, only (much) slower; this shakes
+    // out missing write barriers and unanchored objects in native code.
+    pub fn set_gc_stress(&mut self, level: i32) {
+        unsafe {
+            lvl := level
+            if lvl < 0 {
+                lvl = 0
+            }
+            if lvl > 2 {
+                lvl = 2
+            }
+            (*G(self.L)).gc_stress = lvl as u8
+        }
+    }
+
     // Close the state now (running pending finalizers) and return the
     // number of bytes that were not released (0 when nothing leaked).
     pub fn close(&mut self) -> usize {
@@ -1527,15 +1545,21 @@ pub struct Cx {
             }
             let opts = w[start..w.len]
             let res = dbg_fill_info(L, opts, ar, f, ci)
+            // 'f' and 'L' push one value each, however often they appear.
+            wants_f := false
+            wants_l := false
             for i in 0usize..opts.len {
                 if opts[i] == b'f' {
-                    self.push_raw(f)
+                    wants_f = true
+                } else if opts[i] == b'L' {
+                    wants_l = true
                 }
             }
-            for i in 0usize..opts.len {
-                if opts[i] == b'L' {
-                    api_collect_valid_lines(L, f)?
-                }
+            if wants_f {
+                self.push_raw(f)
+            }
+            if wants_l {
+                api_collect_valid_lines(L, f)?
             }
             return ok(res)
         }
@@ -1626,6 +1650,15 @@ pub struct Cx {
             (*self.L).hookmask = 0
             (*self.L).basehookcount = 0
             (*self.L).hookcount = 0
+        }
+    }
+    // The installed hook function (lua_gethook), or none.
+    pub fn get_hook(&self) -> Option<HookFn> {
+        unsafe {
+            if (*self.L).has_hook {
+                return some((*self.L).hook)
+            }
+            return none
         }
     }
     // Current hook mask.

@@ -459,7 +459,9 @@ fn tab_new_key(L: *mut State, t: *mut Table, key0: *mut Value, val: *mut Value) 
             let f = get_free_pos(t)
             if ptr.is_null(f) {
                 tab_rehash(L, t, key)?
-                return tab_set_raw(L, t, key, val)
+                // The key may now live in the array part: tab_set (not
+                // tab_set_raw), because `t` may be black and `val` white.
+                return tab_set(L, t, key, val)
             }
             othern := main_position_of_node(t, mp)
             if othern != mp {

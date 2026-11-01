@@ -42,6 +42,17 @@ CI runs the same check without Python: `cargo test --test lua_corpus` builds
 expected file (`tests/lua_corpus.rs` ports the directives, environment and
 stderr rules below). It also builds and runs `examples/lua_embed`.
 
+Two more tools look for differences the corpus does not cover:
+
+```sh
+# Collector stress: a GC step (1) or a full collection (2) at every check
+# point; only finalizer timing may change (meta_gc differs at level 2)
+DODO_LUA_GC_STRESS=1 python3 scripts/test_lua.py check
+
+# Differential fuzzing of runtime semantics against the reference
+python3 scripts/lua_fuzz.py run --count 2000 --seed 7 [--gc-stress 1]
+```
+
 `--lua` defaults to `build/lua`; `--lua ref` means the reference build.
 Arguments to `check`, `diff` and `expect` can be paths, directories, test
 names, or name prefixes (`coro_` runs every `coro_*.lua`).
@@ -76,6 +87,7 @@ first line of code:
 | `--! cmd: -e "print(1)" - a` | the complete argument list; no script name is added, and `{script}` expands to the file name |
 | `--! stdin: fixtures/in.txt` | file fed to stdin, relative to `tests/lua`; `{script}` feeds the test itself (for `lua -`) |
 | `--! stderr: full` | compare all of stderr; `message` (default) cuts it at the traceback, `ignore` skips it |
+| `--! env: DODO_LUA_GC_STRESS=1` | extra environment variables (the stress setting makes our collector work at every check point; the reference ignores it) |
 
 ### `.expected` format
 

@@ -283,5 +283,15 @@ the collector rules above.
   `target/lua-reference/`; `check --lua build/lua` runs the tests/lua corpus,
   `suite --lua build/lua` the official test suite, `diff` compares against
   the reference, `bench` runs benchmarks/lua.
+* GC stress testing: `Lua.set_gc_stress(1)` makes the collector run one
+  incremental step at every check point and `set_gc_stress(2)` a full
+  collection (the stand-alone interpreter reads `DODO_LUA_GC_STRESS=1|2`).
+  Programs must behave the same apart from finalizer timing; a difference
+  means a missing barrier or an unanchored object. Run the corpus with
+  `DODO_LUA_GC_STRESS=1 python3 scripts/test_lua.py check` (level 2 changes
+  when finalizers run, so `meta_gc` legitimately differs there).
+* `python3 scripts/lua_fuzz.py run --count N --seed S` diffs randomly
+  generated programs (runtime semantics, not syntax) against the reference;
+  `--gc-stress 1` runs ours under the stress mode.
 * The reference is built with LUA_COMPAT_5_3 (the default makefile setting):
   match it (`math.pow`, `math.ldexp`, ..., `__le` falling back to `not __lt`).

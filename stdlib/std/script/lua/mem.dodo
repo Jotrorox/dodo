@@ -39,8 +39,15 @@ fn mem_error(L: *mut State) -> Throw {
 
 // Allocate `size` bytes (size may be 0, which returns a non-null dummy or null
 // that mem_free accepts). Raises Throw.Memory on failure.
+// Requests at least this large cannot succeed (and would not fit the
+// signed byte accounting): they fail like an exhausted allocator.
+const MEM_MAX_BLOCK: usize = 0x4000000000000000
+
 fn mem_alloc(L: *mut State, size: usize) -> (*mut u8)!Throw {
     unsafe {
+        if size >= MEM_MAX_BLOCK {
+            return err(mem_error(L))
+        }
         let n = if size == 0 {
             1usize
         } else {
@@ -76,6 +83,9 @@ fn mem_over_limit(L: *mut State, delta: isize) -> bool {
 // old_size 0). Raises Throw.Memory on failure, leaving the old block intact.
 fn mem_realloc(L: *mut State, block: *mut u8, old_size: usize, new_size: usize) -> (*mut u8)!Throw {
     unsafe {
+        if new_size >= MEM_MAX_BLOCK {
+            return err(mem_error(L))
+        }
         let n = if new_size == 0 {
             1usize
         } else {

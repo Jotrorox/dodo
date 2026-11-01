@@ -747,6 +747,28 @@ fn do_repl(cx: &mut lua.Cx, prog: &mut Prog) {
     prog.quiet_name = false
 }
 
+// Testing aid: DODO_LUA_GC_STRESS=1 runs a collector step, =2 a full
+// collection, at every collector check point (see Lua.set_gc_stress).
+fn gc_stress_level() -> i32 {
+    ws := env.Workspace.new()
+    out := [0u8; 16]
+    match env.get("DODO_LUA_GC_STRESS", &mut out, &mut ws, platform.TextPolicy.Replace) {
+        ok(v) => {
+            match v {
+                some(s) => {
+                    let b = mem.str_bytes(s)
+                    if b.len == 1 && b[0] >= b'0' && b[0] <= b'2' {
+                        return (b[0] - b'0') as i32
+                    }
+                },
+                none => {},
+            }
+        },
+        err(_) => {},
+    }
+    return 0
+}
+
 // LUA_INIT_5_4 or LUA_INIT: "@file" runs a file, anything else is code.
 fn handle_luainit(cx: &mut lua.Cx, prog: &Prog) -> i32 {
     ws := env.Workspace.new()
@@ -888,6 +910,7 @@ fn main() -> i32 {
     match lua.Lua.new() {
         ok(state) => {
             s := state
+            s.set_gc_stress(gc_stress_level())
             cx := s.cx()
             match cx.push_native(pmain_native) {
                 ok() => {},

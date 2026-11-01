@@ -10,12 +10,8 @@ import "core/ptr"
 // a value take a direct path (a raw access there is indistinguishable from a
 // metamethod-respecting one).
 //
-// `sort` copies the elements into a private, collector-anchored array, sorts
-// it with an introspective quicksort (median-of-three / ninther pivots,
-// insertion sort for short runs, heapsort when recursion gets too deep) and
-// stores the result back. Scans that rely on sentinel elements report an
-// inconsistent comparison function ("invalid order function for sorting")
-// instead of running past their bounds.
+// `sort` permutes the table in place with the reference interpreter's
+// sequence of reads, writes and comparisons (see "sort" below).
 
 // What a table argument must support (see tl_check_table).
 const TL_READ: i32 = 1
@@ -365,74 +361,107 @@ fn tl_unpack(cx: &mut Cx) -> i32!Throw {
 }
 
 // --- sort ------------------------------------------------------------------------
+//
+// `sort` permutes the table in place. It reads elements with `lua_geti` and
+// writes them with `lua_seti` semantics (so `__index` / `__newindex` apply to
+// missing elements) and keeps the elements it is working on on the Lua stack.
+// The algorithm is a quicksort whose sequence of element reads, writes and
+// comparisons is the one the reference interpreter performs: each round
+// orders a[lo], a[mid], a[up], moves the median (the pivot) to a[up-1],
+// partitions a[lo+1 .. up-2] with two scans, recurses into the smaller side
+// and loops on the larger one. A comparator's side effects, the table
+// contents after an error and the metamethod calls therefore match. Scans
+// that run off their range report an inconsistent comparison function
+// ("invalid order function for sorting").
 
-// Comparison strategies: numbers natively, strings natively, the generic
-// `<` with metamethods, or a Lua comparison function (stack index 2).
-const SRT_NUM: i32 = 0
-const SRT_STR: i32 = 1
-const SRT_LT: i32 = 2
-const SRT_FN: i32 = 3
-
-// Partitions at most this long are finished by insertion sort.
-const SRT_SMALL: isize = 10
-// Partitions longer than this use a ninther (median of three medians).
-const SRT_NINTHER: isize = 128
+// Ranges at least this long may use a randomised pivot (after a badly
+// unbalanced partition).
+const SRT_RANLIMIT: i64 = 100
 
 struct SortState {
     L: *mut State
-    // Element k (0-based) of the array being sorted.
-    a: *mut Value
-    // A scratch slot of the anchored array (insertion sort's hole value).
-    tmp: *mut Value
-    mode: i32
-    // Result of the last srt_less.
-    res: bool
+    // The table being sorted (stack index 1), or null for a proxy object.
+    h: *mut Table
+    // Whether stack index 2 holds a comparison function.
+    has_fn: bool
+    // Pivot randomisation (0 until a partition came out badly unbalanced).
+    rnd: u64
 }
 
-fn srt_at(a: *mut Value, i: isize) -> *mut Value {
+// Push a[i].
+fn srt_get(s: &mut SortState, i: i64) -> void!Throw {
     unsafe {
-        return ptr.offset(a, i)
+        let h = s.h
+        if !ptr.is_null(h) {
+            let slot = tab_get_int(h, i)
+            if !val_is_empty(slot) {
+                let L = s.L
+                set_obj((*L).top, slot)
+                (*L).top = ptr.offset((*L).top, 1)
+                return ok()
+            }
+        }
+        cx := Cx { L: s.L }
+        cx.get_i(1, i)?
+        return ok()
     }
 }
 
-fn srt_swap(x: *mut Value, y: *mut Value) {
+// a[i] = the value on top of the stack (popped).
+fn srt_set(s: &mut SortState, i: i64) -> void!Throw {
     unsafe {
-        let b = (*x).bits
-        let t = (*x).tag
-        (*x).bits = (*y).bits
-        (*x).tag = (*y).tag
-        (*y).bits = b
-        (*y).tag = t
+        let h = s.h
+        if !ptr.is_null(h) {
+            let slot = tab_get_int(h, i)
+            if !val_is_empty(slot) {
+                let L = s.L
+                let v = ptr.offset((*L).top, -1)
+                set_obj(slot, v)
+                gc_barrier_back(L, h, v)
+                (*L).top = v
+                return ok()
+            }
+        }
+        cx := Cx { L: s.L }
+        return tl_seti(&mut cx, 1, i)
     }
 }
 
-// s.res = x < y under the active comparison.
-fn srt_less(s: &mut SortState, x: *mut Value, y: *mut Value) -> void!Throw {
+// a[i] = the value on top (popped), then a[j] = the next one (popped).
+fn srt_set2(s: &mut SortState, i: i64, j: i64) -> void!Throw {
+    srt_set(s, i)?
+    return srt_set(s, j)
+}
+
+fn srt_pop(s: &mut SortState, n: isize) {
     unsafe {
-        let mode = s.mode
-        if mode == SRT_NUM {
-            s.res = num_lt(x, y)
-            return ok()
-        }
-        if mode == SRT_STR {
-            s.res = str_compare(val_str(x), val_str(y)) < 0
-            return ok()
-        }
+        (*s.L).top = ptr.offset((*s.L).top, -n)
+    }
+}
+
+// Whether the stack value at offset xi from the top is less than the one at
+// offset yi (both negative).
+fn srt_lt(s: &mut SortState, xi: isize, yi: isize) -> bool!Throw {
+    unsafe {
         let L = s.L
-        if mode == SRT_LT {
-            s.res = vm_less_than(L, x, y)?
-            return ok()
-        }
         let top = (*L).top
+        let x = ptr.offset(top, xi)
+        let y = ptr.offset(top, yi)
+        if !s.has_fn {
+            if (*x).tag == TAG_INT && (*y).tag == TAG_INT {
+                return ok(val_int(x) < val_int(y))
+            }
+            return vm_less_than(L, x, y)
+        }
         set_obj(top, ptr.offset((*(*L).ci).func, 2))
         set_obj(ptr.offset(top, 1), x)
         set_obj(ptr.offset(top, 2), y)
         (*L).top = ptr.offset(top, 3)
         call_noyield(L, top, 1)?
         let r = ptr.offset((*L).top, -1)
-        s.res = !val_is_falsy(r)
+        let res = !val_is_falsy(r)
         (*L).top = r
-        return ok()
+        return ok(res)
     }
 }
 
@@ -441,213 +470,125 @@ fn srt_invalid(s: &mut SortState) -> Throw {
     return cx.error_msg("invalid order function for sorting")
 }
 
-// Order a[i] <= a[j] <= a[k].
-fn srt_sort3(s: &mut SortState, i: isize, j: isize, k: isize) -> void!Throw {
-    let a = s.a
-    let pi = srt_at(a, i)
-    let pj = srt_at(a, j)
-    let pk = srt_at(a, k)
-    srt_less(s, pj, pi)?
-    if s.res {
-        srt_swap(pi, pj)
-    }
-    srt_less(s, pk, pj)?
-    if s.res {
-        srt_swap(pj, pk)
-        srt_less(s, pj, pi)?
-        if s.res {
-            srt_swap(pi, pj)
-        }
-    }
-    return ok()
-}
-
-// Insertion sort of a[first..hi], where a[sent..first-1] is already in
-// order and a[sent] is not greater than any element of the range: moving an
-// element below it means the comparison function is inconsistent.
-fn srt_insertion(s: &mut SortState, sent: isize, first: isize, hi: isize) -> void!Throw {
-    unsafe {
-        let a = s.a
-        let tmp = s.tmp
-        k := first
-        for k <= hi {
-            let pk = srt_at(a, k)
-            srt_less(s, pk, srt_at(a, k - 1))?
-            if s.res {
-                if k - 1 == sent {
-                    return err(srt_invalid(s))
-                }
-                set_obj(tmp, pk)
-                set_obj(pk, srt_at(a, k - 1))
-                j := k - 1
-                for {
-                    srt_less(s, tmp, srt_at(a, j - 1))?
-                    if !s.res {
-                        break
-                    }
-                    if j - 1 == sent {
-                        return err(srt_invalid(s))
-                    }
-                    set_obj(srt_at(a, j), srt_at(a, j - 1))
-                    j -= 1
-                }
-                set_obj(srt_at(a, j), tmp)
-            }
-            k += 1
-        }
-        return ok()
-    }
-}
-
-// Finish a short range a[lo..hi].
-fn srt_small(s: &mut SortState, lo: isize, hi: isize) -> void!Throw {
-    let a = s.a
-    let count = hi - lo + 1
-    if count < 2 {
-        return ok()
-    }
-    if lo > 0 {
-        // a[lo-1] is a pivot already in its final place below this range.
-        return srt_insertion(s, lo - 1, lo + 1, hi)
-    }
-    if count == 2 {
-        let p0 = srt_at(a, lo)
-        let p1 = srt_at(a, lo + 1)
-        srt_less(s, p1, p0)?
-        if s.res {
-            srt_swap(p0, p1)
-        }
-        return ok()
-    }
-    if count == 3 {
-        return srt_sort3(s, lo, lo + 1, lo + 2)
-    }
-    // Leftmost range: bring its minimum to the front to act as sentinel.
-    best := lo
-    for i in (lo + 1)..(hi + 1) {
-        srt_less(s, srt_at(a, i), srt_at(a, best))?
-        if s.res {
-            best = i
-        }
-    }
-    srt_swap(srt_at(a, lo), srt_at(a, best))
-    return srt_insertion(s, lo, lo + 1, hi)
-}
-
-// Partition a[lo..hi] around a median pivot; returns the pivot's final index.
-fn srt_partition(s: &mut SortState, lo: isize, hi: isize, out: &mut isize) -> void!Throw {
-    let a = s.a
-    let count = hi - lo + 1
-    let mid = lo + count / 2
-    if count > SRT_NINTHER {
-        let d = count / 8
-        srt_sort3(s, lo, lo + d, lo + 2 * d)?
-        srt_sort3(s, mid - d, mid, mid + d)?
-        srt_sort3(s, hi - 2 * d, hi - d, hi)?
-        srt_sort3(s, lo + d, mid, hi - d)?
-    }
-    // a[lo] <= pivot <= a[hi]: both ends bound the scans below.
-    srt_sort3(s, lo, mid, hi)?
-    let pv = srt_at(a, hi - 1)
-    srt_swap(srt_at(a, mid), pv)
+// Partition a[lo..up]; the pivot is in a[up-1] and on top of the stack,
+// a[lo] is not greater and a[up] not less than it. Returns the pivot's final
+// index; the stack is back to its state before the pivot was pushed.
+fn srt_partition(s: &mut SortState, lo: i64, up: i64) -> i64!Throw {
     i := lo
-    j := hi - 1
+    j := up - 1
     for {
+        // Stack: P. Find a[i] >= P.
         for {
             i += 1
-            srt_less(s, srt_at(a, i), pv)?
-            if !s.res {
+            srt_get(s, i)?
+            if !srt_lt(s, -1, -2)? {
                 break
             }
-            if i == hi - 1 {
-                // The pivot compared less than itself.
+            if i == up - 1 {
+                // a[up-1] (the pivot itself) compared less than the pivot.
                 return err(srt_invalid(s))
             }
+            srt_pop(s, 1)
         }
+        // Stack: P a[i]. Find a[j] <= P.
         for {
             j -= 1
-            srt_less(s, pv, srt_at(a, j))?
-            if !s.res {
+            srt_get(s, j)?
+            if !srt_lt(s, -3, -1)? {
                 break
             }
             if j < i {
-                // Everything below i was already found not greater.
+                // a[i-1] was already found not greater than the pivot.
                 return err(srt_invalid(s))
             }
+            srt_pop(s, 1)
         }
-        if j <= i {
-            break
+        // Stack: P a[i] a[j].
+        if j < i {
+            srt_pop(s, 1)
+            // a[up-1] = a[i], a[i] = P.
+            srt_set2(s, up - 1, i)?
+            return ok(i)
         }
-        srt_swap(srt_at(a, i), srt_at(a, j))
+        // a[i] = a[j], a[j] = a[i]; P stays.
+        srt_set2(s, i, j)?
     }
-    srt_swap(srt_at(a, i), pv)
-    *out = i
-    return ok()
 }
 
-// Heapsort fallback for a[lo..hi] (bounded work for adversarial inputs).
-fn srt_sift(s: &mut SortState, lo: isize, root0: isize, size: isize) -> void!Throw {
-    let a = s.a
-    root := root0
-    for {
-        child := 2 * root + 1
-        if child >= size {
+fn srt_sort(s: &mut SortState, lo0: i64, up0: i64) -> void!Throw {
+    lo := lo0
+    up := up0
+    for lo < up {
+        // Order a[lo] <= a[up].
+        srt_get(s, lo)?
+        srt_get(s, up)?
+        if srt_lt(s, -1, -2)? {
+            srt_set2(s, lo, up)?
+        } else {
+            srt_pop(s, 2)
+        }
+        if up - lo == 1 {
             break
         }
-        if child + 1 < size {
-            srt_less(s, srt_at(a, lo + child), srt_at(a, lo + child + 1))?
-            if s.res {
-                child += 1
+        p := lo + (up - lo) / 2
+        if up - lo >= SRT_RANLIMIT && s.rnd != 0 {
+            let r4 = ((up - lo) / 4) as u64
+            p = ((s.rnd % (r4 * 2)) as i64) + lo + (r4 as i64)
+        }
+        // Order a[lo] <= a[p] <= a[up].
+        srt_get(s, p)?
+        srt_get(s, lo)?
+        if srt_lt(s, -2, -1)? {
+            srt_set2(s, p, lo)?
+        } else {
+            srt_pop(s, 1)
+            srt_get(s, up)?
+            if srt_lt(s, -1, -2)? {
+                srt_set2(s, p, up)?
+            } else {
+                srt_pop(s, 2)
             }
         }
-        srt_less(s, srt_at(a, lo + root), srt_at(a, lo + child))?
-        if !s.res {
+        if up - lo == 2 {
             break
         }
-        srt_swap(srt_at(a, lo + root), srt_at(a, lo + child))
-        root = child
-    }
-    return ok()
-}
-
-fn srt_heapsort(s: &mut SortState, lo: isize, hi: isize) -> void!Throw {
-    let a = s.a
-    let count = hi - lo + 1
-    start := count / 2
-    for start > 0 {
-        start -= 1
-        srt_sift(s, lo, start, count)?
-    }
-    end := count - 1
-    for end > 0 {
-        srt_swap(srt_at(a, lo), srt_at(a, lo + end))
-        srt_sift(s, lo, 0, end)?
-        end -= 1
-    }
-    return ok()
-}
-
-fn srt_sort(s: &mut SortState, lo0: isize, hi0: isize, depth0: i32) -> void!Throw {
-    lo := lo0
-    hi := hi0
-    depth := depth0
-    for hi - lo + 1 > SRT_SMALL {
-        if depth == 0 {
-            return srt_heapsort(s, lo, hi)
+        // Pivot P = a[p]; swap a[p] and a[up-1], keeping P on the stack.
+        srt_get(s, p)?
+        unsafe {
+            let L = s.L
+            L_push_value(L, ptr.offset((*L).top, -1))
         }
-        depth -= 1
-        p: isize = 0
-        srt_partition(s, lo, hi, &mut p)?
+        srt_get(s, up - 1)?
+        srt_set2(s, p, up - 1)?
+        let pv = srt_partition(s, lo, up)?
         // Recurse into the smaller side, iterate on the larger one.
-        if p - lo < hi - p {
-            srt_sort(s, lo, p - 1, depth)?
-            lo = p + 1
+        n: i64 = 0
+        if pv - lo < up - pv {
+            srt_sort(s, lo, pv - 1)?
+            n = pv - lo
+            lo = pv + 1
         } else {
-            srt_sort(s, p + 1, hi, depth)?
-            hi = p - 1
+            srt_sort(s, pv + 1, up)?
+            n = up - pv
+            up = pv - 1
+        }
+        if up > lo && (up - lo) / 128 > n {
+            // Badly unbalanced: pick later pivots pseudo-randomly.
+            s.rnd = srt_mix(s.rnd ^ i2u(lo) ^ (i2u(up) << 32))
         }
     }
-    return srt_small(s, lo, hi)
+    return ok()
+}
+
+fn srt_mix(x0: u64) -> u64 {
+    x := core.wrapping_add(x0, 0x9e3779b97f4a7c15u64)
+    x = core.wrapping_mul(x ^ (x >> 30), 0xbf58476d1ce4e5b9u64)
+    x = core.wrapping_mul(x ^ (x >> 27), 0x94d049bb133111ebu64)
+    x = x ^ (x >> 31)
+    if x == 0 {
+        return 1
+    }
+    return x
 }
 
 // --- Key sort -----------------------------------------------------------------
@@ -658,6 +599,8 @@ fn srt_sort(s: &mut SortState, lo0: isize, hi0: isize, depth0: i32) -> void!Thro
 // every tag is the same.
 
 const SRTK_SMALL: isize = 16
+// Partitions longer than this use a ninther (median of three medians).
+const SRT_NINTHER: isize = 128
 
 fn srtk_get(a: *mut Value, i: isize) -> i64 {
     unsafe {
@@ -838,84 +781,49 @@ fn tl_sort(cx: &mut Cx) -> i32!Throw {
         cx.set_top(2)
         cx.check_stack_msg(8, "")?
         let L = cx.L
-        // Anchored work array (stack index 3): n elements plus a scratch slot.
-        cx.create_table(0, 0)?
-        let work = tl_table_at(cx, 3)
-        tab_resize(L, work, (n + 1) as u32, 0)?
-        let a = (*work).array
-        for i in 0i64..n {
-            let dst = ptr.offset(a, i as isize)
-            let h = tl_table_at(cx, 1)
-            src := 0 as *mut Value
-            if !ptr.is_null(h) {
-                src = tab_get_int(h, i + 1)
-            }
-            if !ptr.is_null(src) && !val_is_empty(src) {
-                set_obj(dst, src)
-            } else {
-                cx.get_i(1, i + 1)?
-                set_obj(dst, ptr.offset((*L).top, -1))
-                cx.pop(1)
-            }
-            gc_barrier_back(L, work, dst)
-        }
-        // Depth limit 2 * floor(log2 n) before falling back to heapsort.
-        depth := 0i32
-        m := n
-        for m > 1 {
-            depth += 2
-            m = m / 2
-        }
-        mode := SRT_FN
-        if cx.is_nil(2) {
-            nums := true
-            strs := true
+        let has_fn = !cx.is_nil(2)
+        let h = tl_table_at(cx, 1)
+        if !has_fn && !ptr.is_null(h) && n <= ((*h).asize as i64) {
+            // Elements 1..n in the array part, all integers or all floats
+            // (no NaN, no negative zero): every comparison is native and
+            // equal elements are indistinguishable, so any correct sort
+            // gives the same table and nothing else is observable.
+            let a = (*h).array
             ints := true
             floats := true
             for i in 0i64..n {
                 let e = ptr.offset(a, i as isize)
                 let tag = (*e).tag
-                let t = tag & 15
-                if t != TYPE_NUMBER {
-                    nums = false
-                }
-                if t != TYPE_STRING {
-                    strs = false
-                }
                 if tag != TAG_INT {
                     ints = false
                 }
-                if tag != TAG_FLOAT || val_float(e) != val_float(e) {
+                if tag != TAG_FLOAT || val_float(e) != val_float(e) || (*e).bits == 0x8000000000000000u64 {
                     floats = false
                 }
+                if !ints && !floats {
+                    break
+                }
             }
-            mode = if nums {
-                SRT_NUM
-            } else if strs {
-                SRT_STR
-            } else {
-                SRT_LT
-            }
-            if ints {
+            if ints || floats {
+                // Depth limit 2 * floor(log2 n) before falling back to heapsort.
+                depth := 0i32
+                m := n
+                for m > 1 {
+                    depth += 2
+                    m = m / 2
+                }
+                if floats {
+                    srtk_float_keys(a, n as isize)
+                }
                 srtk_sort(a, 0, (n - 1) as isize, depth)
-                mode = -1
-            } else if floats {
-                srtk_float_keys(a, n as isize)
-                srtk_sort(a, 0, (n - 1) as isize, depth)
-                srtk_float_keys(a, n as isize)
-                mode = -1
+                if floats {
+                    srtk_float_keys(a, n as isize)
+                }
+                return ok(0)
             }
         }
-        if mode >= 0 {
-            s := SortState { L: L, a: a, tmp: ptr.offset(a, n as isize), mode: mode, res: false }
-            srt_sort(&mut s, 0, (n - 1) as isize, depth)?
-            set_nil(s.tmp)
-        }
-        // Store the ordered elements back.
-        for i in 0i64..n {
-            L_push_value(L, ptr.offset(a, i as isize))
-            tl_seti(cx, 1, i + 1)?
-        }
+        s := SortState { L: L, h: h, has_fn: has_fn, rnd: 0 }
+        srt_sort(&mut s, 1, n)?
         return ok(0)
     }
 }

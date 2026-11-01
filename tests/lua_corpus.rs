@@ -86,6 +86,8 @@ struct Directives {
     cmd: Option<Vec<String>>,
     stdin: Option<String>,
     stderr: StderrMode,
+    /// Extra environment variables (`--! env: NAME=value ...`).
+    env: Vec<(String, String)>,
 }
 
 #[derive(Debug, Default, PartialEq, Clone, Copy)]
@@ -184,6 +186,15 @@ fn parse_directives(path: &Path) -> Directives {
                     _ => panic!("{}: bad stderr directive {value:?}", path.display()),
                 }
             }
+            "env" => {
+                for item in shell_split(value) {
+                    let Some((name, val)) = item.split_once('=').filter(|(n, _)| !n.is_empty())
+                    else {
+                        panic!("{}: bad env directive {item:?}", path.display())
+                    };
+                    d.env.push((name.to_string(), val.to_string()));
+                }
+            }
             _ => panic!("{}: unknown directive {key:?}", path.display()),
         }
     }
@@ -222,7 +233,7 @@ fn kill(child: &mut Child) {
     let _ = child.kill();
 }
 
-fn run(argv: &[String], cwd: &Path, stdin: Vec<u8>) -> Run {
+fn run(argv: &[String], cwd: &Path, stdin: Vec<u8>, env: &[(String, String)]) -> Run {
     let mut command = Command::new(&argv[0]);
     command
         .args(&argv[1..])
@@ -234,6 +245,7 @@ fn run(argv: &[String], cwd: &Path, stdin: Vec<u8>) -> Run {
         command.env_remove(name);
     }
     command.envs(TEST_ENV);
+    command.envs(env.iter().map(|(name, value)| (name, value)));
     #[cfg(unix)]
     std::os::unix::process::CommandExt::process_group(&mut command, 0);
     let mut child = command.spawn().unwrap();
@@ -291,7 +303,7 @@ fn run_script(lua: &Path, script: &Path) -> (Run, StderrMode) {
             argv.extend(d.args.iter().cloned());
         }
     }
-    (run(&argv, dir, stdin), d.stderr)
+    (run(&argv, dir, stdin, &d.env), d.stderr)
 }
 
 fn replace_all(haystack: &[u8], needle: &[u8], with: &[u8]) -> Vec<u8> {

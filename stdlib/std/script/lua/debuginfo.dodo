@@ -333,10 +333,17 @@ fn ni_set_name_static(ni: &mut NameInfo, s: &str) {
         ni.name_len = b.len
     }
 }
+// Names are C strings in the reference (messages format them with %s), so
+// they end at the first NUL byte.
 fn ni_set_name_lstr(ni: &mut NameInfo, s: *mut LString) {
     unsafe {
-        ni.name = str_data(s) as *const u8
-        ni.name_len = (*s).length
+        let d = str_data(s) as *const u8
+        n := 0usize
+        for n < (*s).length && *ptr.offset(d, n as isize) != 0 {
+            n += 1
+        }
+        ni.name = d
+        ni.name_len = n
     }
 }
 fn ni_found(ni: &NameInfo) -> bool {

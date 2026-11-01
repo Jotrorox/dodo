@@ -350,12 +350,17 @@ fn really_mark(g: *mut Global, o: *mut GCObject) {
         if t == TAG_UPVAL {
             let uv = o as *mut UpVal
             if upval_is_open(uv) {
-                // Open upvalues stay gray; their thread marks the value.
+                // Open upvalues stay gray (their slot changes without
+                // barriers, so the thread revisits it atomically), but the
+                // current value is marked now: the thread itself may be
+                // reachable only through such an upvalue (a coroutine that
+                // refers to itself), and remark_upvals runs before the
+                // grayagain objects that may lead here are re-traversed.
                 set_gray(o)
             } else {
                 set_black(o)
-                mark_value(g, (*uv).v)
             }
+            mark_value(g, (*uv).v)
             return
         }
         if t == TAG_USERDATA {
@@ -1242,8 +1247,33 @@ fn gc_check(L: *mut State) {
         let g = G(L)
         if (*g).gc_debt > 0 {
             gc_step(L)
+        } else if (*g).gc_stress != 0 {
+            gc_stress_step(L)
         }
         (*g).young_mark = (*g).allgc
+    }
+}
+
+// Testing aid (see Lua.set_gc_stress): collector work at a check point that
+// the allocation debt alone would not trigger, to expose missing barriers
+// and anchors. Never used unless an embedder (or the stand-alone
+// interpreter's DODO_LUA_GC_STRESS variable) asks for it.
+fn gc_stress_step(L: *mut State) {
+    unsafe {
+        let g = G(L)
+        if (*g).gcstp != 0 || (*g).gc_running_fin != 0 {
+            return
+        }
+        if (*g).gc_stress >= 2 {
+            gc_full(L, false)
+            return
+        }
+        (*g).gcstp = GCSTP_GC
+        single_step(L)
+        if (*g).gcstate == GCS_PAUSE {
+            set_pause(g)
+        }
+        (*g).gcstp = 0
     }
 }
 
