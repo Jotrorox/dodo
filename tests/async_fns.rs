@@ -178,6 +178,11 @@ fn misuse_of_async_and_await_is_diagnosed() {
         ),
         (
             "check",
+            "@inline\nasync fn tick() {}\nfn main() {}",
+            "@inline and @cold do not apply to async fns",
+        ),
+        (
+            "check",
             "async struct Wrong { x: u32 }\nfn main() {}",
             "`async` applies only to functions",
         ),

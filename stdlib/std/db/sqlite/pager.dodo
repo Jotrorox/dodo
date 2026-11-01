@@ -1,0 +1,1516 @@
+package sqlite
+
+import "core/mem"
+import "std/db"
+import "std/fs"
+import "std/platform"
+import "std/platform/error"
+import "std/thread"
+
+// Pager: page cache, rollback journal, file locking, freelist.
+//
+// The rollback journal and the lock bytes follow SQLite's documented file
+// format, so SQLite and this engine can share a database file and recover
+// each other's interrupted transactions.
+
+const WRITER_VERSION: u32 = 3045000
+
+// Slot metadata: [0..4] page number (0 = free), [4] dirty, [8..16] stamp.
+
+fn slot_meta(e: &Engine, s: usize) -> usize {
+    e.meta_off + s * SLOT_META
+}
+
+fn slot_data(e: &Engine, s: usize) -> usize {
+    e.cache_off + s * e.page_size
+}
+
+fn hash_slot(e: &Engine, pgno: u32) -> usize {
+    (core.wrapping_mul(pgno, 2654435761u32) as usize) & (e.hash_cap - 1)
+}
+
+fn hash_find(e: &Engine, pgno: u32) -> usize {
+    h := hash_slot(e, pgno)
+    for {
+        v := ldu(e.ws, e.hash_off + h * 4)
+        if v == 0 {
+            return 0
+        }
+        if ld32(e.ws, slot_meta(e, v - 1)) == pgno {
+            return v
+        }
+        h = (h + 1) & (e.hash_cap - 1)
+    }
+}
+
+fn hash_insert(e: &mut Engine, pgno: u32, s: usize) {
+    h := hash_slot(e, pgno)
+    for ldu(e.ws, e.hash_off + h * 4) != 0 {
+        h = (h + 1) & (e.hash_cap - 1)
+    }
+    let hash_off2 = e.hash_off + h * 4
+    stu(e.ws, hash_off2, s + 1)
+}
+
+fn hash_remove(e: &mut Engine, pgno: u32) {
+    h := hash_slot(e, pgno)
+    for {
+        v := ldu(e.ws, e.hash_off + h * 4)
+        if v == 0 {
+            return
+        }
+        if ld32(e.ws, slot_meta(e, v - 1)) == pgno {
+            break
+        }
+        h = (h + 1) & (e.hash_cap - 1)
+    }
+    // Backward-shift deletion keeps probe chains intact.
+    let hash_off2 = e.hash_off + h * 4
+    stu(e.ws, hash_off2, 0)
+    j := h
+    for {
+        j = (j + 1) & (e.hash_cap - 1)
+        v := ldu(e.ws, e.hash_off + j * 4)
+        if v == 0 {
+            return
+        }
+        let ld322 = ld32(e.ws, slot_meta(e, v - 1))
+        home := hash_slot(e, ld322)
+        // Move the entry back if its home is cyclically outside (h, j].
+        between := false
+        if h <= j {
+            between = home > h && home <= j
+        } else {
+            between = home > h || home <= j
+        }
+        if !between {
+            let hash_off3 = e.hash_off + h * 4
+            stu(e.ws, hash_off3, v)
+            let hash_off4 = e.hash_off + j * 4
+            stu(e.ws, hash_off4, 0)
+            h = j
+        }
+    }
+}
+
+fn cache_clear(e: &mut Engine) {
+    for s in 0usize..e.nslots {
+        m := slot_meta(e, s)
+        st32(e.ws, m, 0)
+        e.ws[m + 4] = 0
+    }
+    let hash_off2 = e.hash_off
+    let hash_cap2 = e.hash_cap * 4
+    zero_bytes(e.ws, hash_off2, hash_cap2)
+}
+
+fn cache_drop(e: &mut Engine, pgno: u32) {
+    v := hash_find(e, pgno)
+    if v != 0 {
+        hash_remove(e, pgno)
+        m := slot_meta(e, v - 1)
+        st32(e.ws, m, 0)
+        e.ws[m + 4] = 0
+    }
+}
+
+// ---------------------------------------------------------------------------
+// File access
+
+fn file_read(e: &mut Engine, pos: u64, dst: usize, len: usize) -> usize!db.Error {
+    failed := false
+    got := 0usize
+    match &mut e.file {
+        some(f) => {
+            match f.seek(pos as usize) {
+                ok(_) => {},
+                err(_) => {
+                    failed = true
+                },
+            }
+            for !failed && got < len {
+                match f.read(&mut e.ws[dst + got..dst + len]) {
+                    ok(n) => {
+                        if n == 0 {
+                            break
+                        }
+                        got += n
+                    },
+                    err(_) => {
+                        failed = true
+                    },
+                }
+            }
+        },
+        none => {},
+    }
+    if failed {
+        return err(io_fail(e, "disk I/O error (read)"))
+    }
+    ok(got)
+}
+
+fn file_write(e: &mut Engine, pos: u64, src: usize, len: usize) -> void!db.Error {
+    failed := false
+    put := 0usize
+    match &mut e.file {
+        some(f) => {
+            match f.seek(pos as usize) {
+                ok(_) => {},
+                err(_) => {
+                    failed = true
+                },
+            }
+            for !failed && put < len {
+                match f.write(&e.ws[src + put..src + len]) {
+                    ok(n) => {
+                        if n == 0 {
+                            failed = true
+                        }
+                        put += n
+                    },
+                    err(_) => {
+                        failed = true
+                    },
+                }
+            }
+        },
+        none => {},
+    }
+    if failed {
+        return err(io_fail(e, "disk I/O error (write)"))
+    }
+    ok()
+}
+
+fn file_size(e: &mut Engine) -> u64!db.Error {
+    size := 0u64
+    failed := false
+    match &e.file {
+        some(f) => {
+            match f.metadata() {
+                ok(m) => {
+                    size = m.size
+                },
+                err(_) => {
+                    failed = true
+                },
+            }
+        },
+        none => {},
+    }
+    if failed {
+        return err(io_fail(e, "disk I/O error (fstat)"))
+    }
+    ok(size)
+}
+
+fn file_sync(e: &mut Engine) -> void!db.Error {
+    failed := false
+    match &mut e.file {
+        some(f) => {
+            match f.sync() {
+                ok() => {},
+                err(_) => {
+                    failed = true
+                },
+            }
+        },
+        none => {},
+    }
+    if failed {
+        return err(io_fail(e, "disk I/O error (fsync)"))
+    }
+    ok()
+}
+
+fn file_truncate(e: &mut Engine, size: u64) -> void!db.Error {
+    failed := false
+    match &mut e.file {
+        some(f) => {
+            match f.set_len(size) {
+                ok() => {},
+                err(_) => {
+                    failed = true
+                },
+            }
+        },
+        none => {},
+    }
+    if failed {
+        return err(io_fail(e, "disk I/O error (truncate)"))
+    }
+    ok()
+}
+
+fn jread(e: &mut Engine, pos: u64, dst: usize, len: usize) -> usize!db.Error {
+    failed := false
+    got := 0usize
+    match &mut e.journal {
+        some(f) => {
+            match f.seek(pos as usize) {
+                ok(_) => {},
+                err(_) => {
+                    failed = true
+                },
+            }
+            for !failed && got < len {
+                match f.read(&mut e.ws[dst + got..dst + len]) {
+                    ok(n) => {
+                        if n == 0 {
+                            break
+                        }
+                        got += n
+                    },
+                    err(_) => {
+                        failed = true
+                    },
+                }
+            }
+        },
+        none => {},
+    }
+    if failed {
+        return err(io_fail(e, "disk I/O error (journal read)"))
+    }
+    ok(got)
+}
+
+fn jwrite_bytes(e: &mut Engine, pos: u64, src: &[u8]) -> void!db.Error {
+    failed := false
+    put := 0usize
+    match &mut e.journal {
+        some(f) => {
+            match f.seek(pos as usize) {
+                ok(_) => {},
+                err(_) => {
+                    failed = true
+                },
+            }
+            for !failed && put < src.len {
+                match f.write(&src[put..]) {
+                    ok(n) => {
+                        if n == 0 {
+                            failed = true
+                        }
+                        put += n
+                    },
+                    err(_) => {
+                        failed = true
+                    },
+                }
+            }
+        },
+        none => {
+            failed = true
+        },
+    }
+    if failed {
+        return err(io_fail(e, "disk I/O error (journal write)"))
+    }
+    ok()
+}
+
+fn jwrite(e: &mut Engine, pos: u64, src: usize, len: usize) -> void!db.Error {
+    failed := false
+    put := 0usize
+    match &mut e.journal {
+        some(f) => {
+            match f.seek(pos as usize) {
+                ok(_) => {},
+                err(_) => {
+                    failed = true
+                },
+            }
+            for !failed && put < len {
+                match f.write(&e.ws[src + put..src + len]) {
+                    ok(n) => {
+                        if n == 0 {
+                            failed = true
+                        }
+                        put += n
+                    },
+                    err(_) => {
+                        failed = true
+                    },
+                }
+            }
+        },
+        none => {
+            failed = true
+        },
+    }
+    if failed {
+        return err(io_fail(e, "disk I/O error (journal write)"))
+    }
+    ok()
+}
+
+fn jsync(e: &mut Engine) -> void!db.Error {
+    failed := false
+    match &mut e.journal {
+        some(f) => {
+            match f.sync() {
+                ok() => {},
+                err(_) => {
+                    failed = true
+                },
+            }
+        },
+        none => {},
+    }
+    if failed {
+        return err(io_fail(e, "disk I/O error (journal fsync)"))
+    }
+    ok()
+}
+
+fn jsize(e: &mut Engine) -> u64 {
+    size := 0u64
+    match &e.journal {
+        some(f) => {
+            match f.metadata() {
+                ok(m) => {
+                    size = m.size
+                },
+                err(_) => {},
+            }
+        },
+        none => {},
+    }
+    size
+}
+
+fn journal_close(e: &mut Engine) {
+    match &mut e.journal {
+        some(f) => {
+            match f.close() {
+                ok() => {},
+                err(_) => {},
+            }
+        },
+        none => {},
+    }
+    e.journal = none
+}
+
+// Builds "<path><suffix>" in `out` and returns its length.
+fn side_path(e: &Engine, suffix: &str, out: &mut[u8]) -> usize {
+    n := e.path_len
+    for i in 0usize..n {
+        out[i] = e.ws[i]
+    }
+    s := mem.str_bytes(suffix)
+    for i in 0usize..s.len {
+        out[n + i] = s[i]
+    }
+    n + s.len
+}
+
+fn journal_exists(e: &mut Engine) -> bool {
+    buf := [0u8; 1100]
+    n := side_path(e, "-journal", &mut buf)
+    text := unsafe {
+        mem.str_from_utf8(&buf[..n])
+    }
+    ws := platform.workspace()
+    match ws.set(text) {
+        ok() => {},
+        err(_) => {
+            return false
+        },
+    }
+    match ws.get() {
+        ok(name) => {
+            match fs.metadata(&name) {
+                ok(m) => {
+                    return m.size > 0
+                },
+                err(_) => {
+                    return false
+                },
+            }
+        },
+        err(_) => {
+            return false
+        },
+    }
+}
+
+fn journal_open_file(e: &mut Engine, create: bool) -> void!db.Error {
+    buf := [0u8; 1100]
+    n := side_path(e, "-journal", &mut buf)
+    text := unsafe {
+        mem.str_from_utf8(&buf[..n])
+    }
+    ws := platform.workspace()
+    options := fs.OpenOptions.new()
+    options.read = true
+    options.write = true
+    options.create = create
+    options.truncate = create
+    match fs.File.open_utf8(text, &options, &mut ws) {
+        ok(file) => {
+            e.journal = some(file)
+        },
+        err(_) => {
+            return err(fail(e, SQLITE_CANTOPEN, "unable to open the rollback journal"))
+        },
+    }
+    ok()
+}
+
+fn journal_delete(e: &mut Engine) -> void!db.Error {
+    journal_close(e)
+    buf := [0u8; 1100]
+    n := side_path(e, "-journal", &mut buf)
+    text := unsafe {
+        mem.str_from_utf8(&buf[..n])
+    }
+    ws := platform.workspace()
+    failed := false
+    match ws.set(text) {
+        ok() => {},
+        err(_) => {
+            failed = true
+        },
+    }
+    if !failed {
+        match ws.get() {
+            ok(name) => {
+                match fs.remove_file(&name) {
+                    ok() => {},
+                    err(reason) => {
+                        if reason.kind != error.Kind.NotFound {
+                            failed = true
+                        }
+                    },
+                }
+            },
+            err(_) => {
+                failed = true
+            },
+        }
+    }
+    if failed {
+        return err(io_fail(e, "disk I/O error (journal delete)"))
+    }
+    ok()
+}
+
+// ---------------------------------------------------------------------------
+// Locks: SQLite's lock-byte protocol. SHARED is a read lock on the
+// 510-byte shared range, RESERVED a write lock on the reserved byte, and
+// EXCLUSIVE adds write locks on the pending byte and the shared range.
+
+fn try_lock(e: &mut Engine, start: u64, len: u64, shared: bool) -> bool!db.Error {
+    got := false
+    failed := false
+    match &mut e.file {
+        some(f) => {
+            match f.try_lock_range(start, len, shared) {
+                ok(v) => {
+                    got = v
+                },
+                err(_) => {
+                    failed = true
+                },
+            }
+        },
+        none => {
+            got = true
+        },
+    }
+    if failed {
+        return err(io_fail(e, "disk I/O error (lock)"))
+    }
+    ok(got)
+}
+
+fn unlock(e: &mut Engine, start: u64, len: u64) {
+    match &mut e.file {
+        some(f) => {
+            match f.unlock_range(start, len) {
+                ok() => {},
+                err(_) => {},
+            }
+        },
+        none => {},
+    }
+}
+
+fn busy(e: &mut Engine) -> db.Error {
+    fail(e, SQLITE_BUSY, "database is locked")
+}
+
+fn lock_shared(e: &mut Engine) -> void!db.Error {
+    if e.memory || e.lock >= LOCK_SHARED {
+        e.lock = if e.lock >= LOCK_SHARED {
+            e.lock
+        } else {
+            LOCK_SHARED
+        }
+        return ok()
+    }
+    attempts := 0u32
+    for {
+        // A pending writer (write lock on the pending byte) blocks new readers.
+        if try_lock(e, PENDING_BYTE, 1, true)? {
+            got := try_lock(e, SHARED_FIRST, SHARED_SIZE, true)?
+            unlock(e, PENDING_BYTE, 1)
+            if got {
+                break
+            }
+        }
+        attempts += 1
+        if attempts > e.busy_retries {
+            return err(busy(e))
+        }
+        pause()
+    }
+    e.lock = LOCK_SHARED
+    ok()
+}
+
+fn lock_reserved(e: &mut Engine) -> void!db.Error {
+    if e.memory || e.lock >= LOCK_RESERVED {
+        e.lock = if e.lock >= LOCK_RESERVED {
+            e.lock
+        } else {
+            LOCK_RESERVED
+        }
+        return ok()
+    }
+    attempts := 0u32
+    for {
+        if try_lock(e, RESERVED_BYTE, 1, false)? {
+            break
+        }
+        attempts += 1
+        if attempts > e.busy_retries {
+            return err(busy(e))
+        }
+        pause()
+    }
+    e.lock = LOCK_RESERVED
+    ok()
+}
+
+fn lock_exclusive(e: &mut Engine) -> void!db.Error {
+    if e.memory || e.lock >= LOCK_EXCLUSIVE {
+        e.lock = LOCK_EXCLUSIVE
+        return ok()
+    }
+    if !try_lock(e, PENDING_BYTE, 1, false)? {
+        return err(busy(e))
+    }
+    // Upgrade the shared range to a write lock; this fails while another
+    // process reads. (Windows cannot convert locks, so release first; the
+    // pending lock keeps new readers out meanwhile.)
+    attempts := 0u32
+    for {
+        unlock(e, SHARED_FIRST, SHARED_SIZE)
+        if try_lock(e, SHARED_FIRST, SHARED_SIZE, false)? {
+            break
+        }
+        if !try_lock(e, SHARED_FIRST, SHARED_SIZE, true)? {
+            // Lost the read lock entirely; give up the attempt.
+            unlock(e, PENDING_BYTE, 1)
+            return err(busy(e))
+        }
+        attempts += 1
+        if attempts > e.busy_retries {
+            unlock(e, PENDING_BYTE, 1)
+            return err(busy(e))
+        }
+        pause()
+    }
+    e.lock = LOCK_EXCLUSIVE
+    ok()
+}
+
+// One busy-wait step: 1 ms, so the retry count is a timeout in milliseconds.
+fn pause() {
+    thread.sleep_ms(1)
+}
+
+// Drops to SHARED (keep_shared) or no lock.
+fn unlock_to(e: &mut Engine, keep_shared: bool) {
+    if e.memory {
+        e.lock = if keep_shared {
+            LOCK_SHARED
+        } else {
+            LOCK_NONE
+        }
+        return
+    }
+    if e.lock >= LOCK_EXCLUSIVE {
+        unlock(e, SHARED_FIRST, SHARED_SIZE)
+        if keep_shared {
+            match try_lock(e, SHARED_FIRST, SHARED_SIZE, true) {
+                ok(_) => {},
+                err(_) => {},
+            }
+        }
+        unlock(e, PENDING_BYTE, 1)
+    } else if !keep_shared && e.lock >= LOCK_SHARED {
+        unlock(e, SHARED_FIRST, SHARED_SIZE)
+    }
+    if e.lock >= LOCK_RESERVED {
+        unlock(e, RESERVED_BYTE, 1)
+    }
+    e.lock = if keep_shared && e.lock >= LOCK_SHARED {
+        LOCK_SHARED
+    } else {
+        LOCK_NONE
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Opening and the read transaction
+
+// Reads the header and starts a read transaction. Detects changes made by
+// other connections and rolls back hot journals.
+fn begin_read(e: &mut Engine) -> void!db.Error {
+    if e.write_txn || (e.lock >= LOCK_SHARED && e.explicit_txn) {
+        return ok()
+    }
+    if e.memory {
+        if !e.initialized {
+            init_new_db_state(e)
+        }
+        e.lock = LOCK_SHARED
+        return ok()
+    }
+    lock_shared(e)?
+    if !e.readonly && journal_exists(e) {
+        recover_hot_journal(e)?
+    }
+    size := file_size(e)?
+    if size < 100 {
+        if !e.initialized || e.db_pages != 0 {
+            cache_clear(e)
+            e.schema_loaded = false
+        }
+        init_new_db_state(e)
+        return ok()
+    }
+    hdr := PATH_CAP
+    // Read the 100-byte header into the message area (it is not in use).
+    got := file_read(e, 0, hdr, 100)?
+    if got < 100 {
+        return err(fail(e, SQLITE_NOTADB, "file is not a database"))
+    }
+    magic := "SQLite format 3"
+    mb := mem.str_bytes(magic)
+    for i in 0usize..15 {
+        if e.ws[hdr + i] != mb[i] {
+            return err(fail(e, SQLITE_NOTADB, "file is not a database"))
+        }
+    }
+    if e.ws[hdr + 15] != 0 {
+        return err(fail(e, SQLITE_NOTADB, "file is not a database"))
+    }
+    ps := rd16(e.ws, hdr + 16)
+    if ps == 1 {
+        ps = 65536
+    }
+    if ps < 512 || ps > 65536 || (ps & (ps - 1)) != 0 {
+        return err(fail(e, SQLITE_NOTADB, "file is not a database"))
+    }
+    write_version := e.ws[hdr + 18]
+    read_version := e.ws[hdr + 19]
+    if read_version > 2 {
+        return err(fail(e, SQLITE_CANTOPEN, "unsupported file format"))
+    }
+    if read_version == 2 || write_version == 2 {
+        return err(fail(e, SQLITE_CANTOPEN, "WAL-mode databases are not supported; run PRAGMA journal_mode=DELETE first"))
+    }
+    if e.ws[hdr + 21] != 64 || e.ws[hdr + 22] != 32 || e.ws[hdr + 23] != 32 {
+        return err(fail(e, SQLITE_NOTADB, "file is not a database"))
+    }
+    if rd32(e.ws, hdr + 56) > 1 {
+        return err(fail(e, SQLITE_CANTOPEN, "only UTF-8 databases are supported"))
+    }
+    reserved := e.ws[hdr + 20] as usize
+    counter := rd32(e.ws, hdr + 24)
+    cookie := rd32(e.ws, hdr + 40)
+    npages := rd32(e.ws, hdr + 28)
+    if npages == 0 || rd32(e.ws, hdr + 92) != counter {
+        npages = (size / (ps as u64)) as u32
+    }
+    if ps != e.page_size {
+        if e.initialized && e.page_size != 0 && ps != e.page_size {
+            // The cache layout depends on the page size.
+            e.page_size = ps
+            layout(e)?
+        } else {
+            e.page_size = ps
+            layout(e)?
+        }
+        cache_clear(e)
+    } else if !e.initialized || counter != e.change_counter {
+        cache_clear(e)
+    }
+    if !e.initialized || cookie != e.schema_cookie || counter != e.change_counter {
+        if cookie != e.schema_cookie || !e.initialized {
+            e.schema_loaded = false
+        }
+    }
+    e.reserved = reserved
+    e.usable = ps - reserved
+    e.change_counter = counter
+    e.schema_cookie = cookie
+    e.schema_format = rd32(e.ws, hdr + 44)
+    e.db_pages = npages
+    e.file_pages = npages
+    e.initialized = true
+    ok()
+}
+
+fn init_new_db_state(e: &mut Engine) {
+    if !e.initialized {
+        e.change_counter = 0
+        e.schema_cookie = 0
+    }
+    e.reserved = 0
+    e.usable = e.page_size
+    e.db_pages = 0
+    e.file_pages = 0
+    e.schema_format = 4
+    e.initialized = true
+}
+
+fn end_read(e: &mut Engine) {
+    if e.write_txn || e.explicit_txn {
+        return
+    }
+    unlock_to(e, false)
+}
+
+fn recover_hot_journal(e: &mut Engine) -> void!db.Error {
+    // Not hot while another process holds RESERVED (it is mid-transaction).
+    if !try_lock(e, RESERVED_BYTE, 1, false)? {
+        return ok()
+    }
+    e.lock = LOCK_RESERVED
+    match lock_exclusive(e) {
+        ok() => {},
+        err(reason) => {
+            unlock(e, RESERVED_BYTE, 1)
+            e.lock = LOCK_SHARED
+            return err(reason)
+        },
+    }
+    journal_open_file(e, false)?
+    playback(e)?
+    journal_delete(e)?
+    cache_clear(e)
+    e.schema_loaded = false
+    unlock_to(e, true)
+    ok()
+}
+
+// Replays a rollback journal into the database file. The page images are
+// staged through the scratch page.
+fn playback(e: &mut Engine) -> void!db.Error {
+    hdr := PATH_CAP
+    jlen := jsize(e)
+    magic := [217u8, 213, 5, 249, 32, 161, 99, 215]
+    // A journal is a sequence of segments, each a sector-sized header
+    // followed by its records; SQLite starts a new segment whenever it syncs
+    // the journal mid-transaction.
+    off := 0u64
+    first := true
+    have_header := false
+    initial := 0u32
+    sector := 512u64
+    ps := e.page_size
+    page := e.scratch_page
+    for {
+        if off + 28 > jlen {
+            break
+        }
+        got := jread(e, off, hdr, 28)?
+        if got < 28 {
+            break
+        }
+        good := true
+        for i in 0usize..8 {
+            if e.ws[hdr + i] != magic[i] {
+                good = false
+            }
+        }
+        if !good {
+            break
+        }
+        nrec := rd32(e.ws, hdr + 8)
+        nonce := rd32(e.ws, hdr + 12)
+        if first {
+            have_header = true
+            initial = rd32(e.ws, hdr + 16)
+            sector = rd32(e.ws, hdr + 20) as u64
+            ps = rd32(e.ws, hdr + 24) as usize
+            if ps == 0 || ps > 65536 || (ps & (ps - 1)) != 0 || sector < 32 || sector > 65536 {
+                return ok()
+            }
+            if ps != e.page_size {
+                // The journal decides the page size of the file it restores.
+                e.page_size = ps
+                layout(e)?
+                page = e.scratch_page
+            }
+        }
+        rec := (ps as u64) + 8
+        pos := off + sector
+        if nrec == 4294967295u32 {
+            nrec = if jlen > pos {
+                ((jlen - pos) / rec) as u32
+            } else {
+                0u32
+            }
+        }
+        stop := false
+        for _ in 0u32..nrec {
+            if pos + rec > jlen {
+                stop = true
+                break
+            }
+            tag := PATH_CAP + 32
+            jread(e, pos, tag, 4)?
+            pgno := rd32(e.ws, tag)
+            jread(e, pos + 4, page, ps)?
+            jread(e, pos + 4 + (ps as u64), tag + 4, 4)?
+            sum := nonce
+            k := ps - 200
+            for k > 0 {
+                sum = core.wrapping_add(sum, e.ws[page + k] as u32)
+                if k < 200 {
+                    break
+                }
+                k -= 200
+            }
+            if sum != rd32(e.ws, tag + 4) {
+                stop = true
+                break
+            }
+            if pgno != 0 && pgno <= initial {
+                file_write(e, ((pgno - 1) as u64) * (ps as u64), page, ps)?
+            }
+            pos += rec
+        }
+        if stop || nrec == 0 {
+            break
+        }
+        // The next segment starts at the next sector boundary.
+        off = (pos + sector - 1) / sector * sector
+        first = false
+    }
+    if !have_header {
+        return ok()
+    }
+    file_truncate(e, (initial as u64) * (ps as u64))?
+    file_sync(e)?
+    ok()
+}
+
+// ---------------------------------------------------------------------------
+// Page access
+
+fn pending_page(e: &Engine) -> u32 {
+    ((PENDING_BYTE / (e.page_size as u64)) + 1) as u32
+}
+
+fn pick_victim(e: &mut Engine) -> usize!db.Error {
+    best := e.nslots
+    best_stamp := 18446744073709551615u64
+    for s in 0usize..e.nslots {
+        m := slot_meta(e, s)
+        if ld32(e.ws, m) == 0 {
+            return ok(s)
+        }
+        if e.memory {
+            continue
+        }
+        st := ld64(e.ws, m + 8)
+        if st < best_stamp {
+            best_stamp = st
+            best = s
+        }
+    }
+    if best == e.nslots {
+        return err(full(e, "page cache (in-memory database is full)"))
+    }
+    m := slot_meta(e, best)
+    pgno := ld32(e.ws, m)
+    if e.ws[m + 4] != 0 {
+        spill(e, best)?
+    }
+    hash_remove(e, pgno)
+    st32(e.ws, m, 0)
+    ok(best)
+}
+
+// Writes a dirty page to the database file before the transaction commits.
+fn spill(e: &mut Engine, s: usize) -> void!db.Error {
+    journal_sync_header(e)?
+    lock_exclusive(e)?
+    m := slot_meta(e, s)
+    pgno := ld32(e.ws, m)
+    let value = ((pgno - 1) as u64) * (e.page_size as u64)
+    let data = slot_data(e, s)
+    let page_size2 = e.page_size
+    file_write(e, value, data, page_size2)?
+    e.ws[m + 4] = 0
+    e.db_written = true
+    if pgno > e.disk_pages {
+        e.disk_pages = pgno
+    }
+    ok()
+}
+
+// Returns the workspace offset of page `pgno`'s data.
+fn pg_fetch(e: &mut Engine, pgno: u32) -> usize!db.Error {
+    if pgno == 0 || pgno > e.db_pages {
+        return err(corrupt(e))
+    }
+    e.stamp += 1
+    v := hash_find(e, pgno)
+    if v != 0 {
+        let meta = slot_meta(e, v - 1) + 8
+        let stamp2 = e.stamp
+        st64(e.ws, meta, stamp2)
+        return ok(slot_data(e, v - 1))
+    }
+    s := pick_victim(e)?
+    m := slot_meta(e, s)
+    d := slot_data(e, s)
+    // Pages of the file: those that existed when the transaction began and
+    // new ones that were spilled to the file under cache pressure.
+    if !e.memory && (pgno <= e.file_pages || pgno <= e.disk_pages) {
+        let value = ((pgno - 1) as u64) * (e.page_size as u64)
+        let page_size2 = e.page_size
+        got := file_read(e, value, d, page_size2)?
+        if got < e.page_size {
+            let page_size3 = e.page_size - got
+            zero_bytes(e.ws, d + got, page_size3)
+        }
+    } else {
+        let page_size4 = e.page_size
+        zero_bytes(e.ws, d, page_size4)
+    }
+    st32(e.ws, m, pgno)
+    e.ws[m + 4] = 0
+    let stamp3 = e.stamp
+    st64(e.ws, m + 8, stamp3)
+    hash_insert(e, pgno, s)
+    ok(d)
+}
+
+fn bitmap_test(e: &Engine, pgno: u32) -> bool {
+    bit := pgno as usize
+    (e.ws[e.bitmap_off + bit / 8] & ((1u8 << ((bit % 8) as u8)))) != 0
+}
+
+fn bitmap_set(e: &mut Engine, pgno: u32) {
+    bit := pgno as usize
+    o := e.bitmap_off + bit / 8
+    e.ws[o] = e.ws[o] | (1u8 << ((bit % 8) as u8))
+}
+
+// Makes page `pgno` writable: journals its original content and marks it
+// dirty. Returns the data offset.
+fn pg_write(e: &mut Engine, pgno: u32) -> usize!db.Error {
+    core.assert(e.write_txn)
+    d := pg_fetch(e, pgno)?
+    v := hash_find(e, pgno)
+    m := slot_meta(e, v - 1)
+    if pgno <= e.file_pages {
+        if (pgno as usize) / 8 >= e.bitmap_bytes {
+            return err(full(e, "journal bitmap (database too large for this workspace)"))
+        }
+        if !bitmap_test(e, pgno) {
+            journal_page(e, pgno, d)?
+            bitmap_set(e, pgno)
+        }
+    }
+    if e.sj_active {
+        stmt_save(e, pgno)?
+    }
+    d2 := pg_fetch(e, pgno)?
+    let hash_find2 = hash_find(e, pgno) - 1
+    e.ws[slot_meta(e, hash_find2) + 4] = 1
+    if m != 0 {
+        ok(d2)
+    } else {
+        ok(d2)
+    }
+}
+
+fn journal_page(e: &mut Engine, pgno: u32, d: usize) -> void!db.Error {
+    if e.memory {
+        need := e.page_size + 4
+        if e.mj_used + need > e.mj_cap {
+            return err(full(e, "memory journal (transaction too large for an in-memory database)"))
+        }
+        o := e.mj_off + e.mj_used
+        st32(e.ws, o, pgno)
+        let page_size2 = e.page_size
+        move_bytes(e.ws, d, o + 4, page_size2)
+        e.mj_used += need
+        return ok()
+    }
+    if !e.journal_open {
+        journal_start(e)?
+    }
+    ps := e.page_size
+    pos := 512u64 + (e.journal_records as u64) * ((ps as u64) + 8)
+    tag := [0u8; 4]
+    tag[0] = ((pgno >> 24) & 255) as u8
+    tag[1] = ((pgno >> 16) & 255) as u8
+    tag[2] = ((pgno >> 8) & 255) as u8
+    tag[3] = (pgno & 255) as u8
+    jwrite_bytes(e, pos, &tag)?
+    d2 := pg_fetch(e, pgno)?
+    jwrite(e, pos + 4, d2, ps)?
+    sum := e.journal_nonce
+    k := ps - 200
+    for k > 0 {
+        sum = core.wrapping_add(sum, e.ws[d2 + k] as u32)
+        if k < 200 {
+            break
+        }
+        k -= 200
+    }
+    tag[0] = ((sum >> 24) & 255) as u8
+    tag[1] = ((sum >> 16) & 255) as u8
+    tag[2] = ((sum >> 8) & 255) as u8
+    tag[3] = (sum & 255) as u8
+    jwrite_bytes(e, pos + 4 + (ps as u64), &tag)?
+    e.journal_records += 1
+    e.journal_synced = false
+    ok()
+}
+
+fn journal_start(e: &mut Engine) -> void!db.Error {
+    journal_open_file(e, true)?
+    let value = (next_random(e) & 0xffffffffu64) as u32
+    e.journal_nonce = value
+    header := [0u8; 512]
+    magic := [217u8, 213, 5, 249, 32, 161, 99, 215]
+    for i in 0usize..8 {
+        header[i] = magic[i]
+    }
+    wr32(&mut header, 12, e.journal_nonce)
+    wr32(&mut header, 16, e.file_pages)
+    wr32(&mut header, 20, 512)
+    wr32(&mut header, 24, e.page_size as u32)
+    jwrite_bytes(e, 0, &header)?
+    e.journal_open = true
+    e.journal_records = 0
+    e.journal_synced = false
+    ok()
+}
+
+// Makes the journal durable before the database file is modified: sync the
+// records, then publish the record count in the header, then sync again.
+fn journal_sync_header(e: &mut Engine) -> void!db.Error {
+    if e.memory || e.journal_synced {
+        return ok()
+    }
+    if !e.journal_open {
+        journal_start(e)?
+    }
+    jsync(e)?
+    count := [0u8; 4]
+    wr32(&mut count, 0, e.journal_records)
+    jwrite_bytes(e, 8, &count)?
+    jsync(e)?
+    e.journal_synced = true
+    ok()
+}
+
+// ---------------------------------------------------------------------------
+// Statement journal: page images saved at the first change within a
+// statement inside an explicit transaction, so a failing statement can be
+// undone without abandoning the transaction.
+
+fn stmt_begin(e: &mut Engine) {
+    e.sj_used = 0
+    e.sj_overflow = false
+    e.sj_pages = e.db_pages
+    e.sj_active = e.explicit_txn && e.write_txn
+}
+
+fn stmt_save(e: &mut Engine, pgno: u32) -> void!db.Error {
+    if e.sj_overflow {
+        return ok()
+    }
+    if pgno > e.sj_pages {
+        return ok()
+    }
+    // Already saved during this statement?
+    rec := e.page_size + 4
+    o := 0usize
+    for o < e.sj_used {
+        if ld32(e.ws, e.sj_off + o) == pgno {
+            return ok()
+        }
+        o += rec
+    }
+    if e.sj_used + rec > e.sj_cap {
+        e.sj_overflow = true
+        return ok()
+    }
+    d := pg_fetch(e, pgno)?
+    dst := e.sj_off + e.sj_used
+    st32(e.ws, dst, pgno)
+    let page_size2 = e.page_size
+    move_bytes(e.ws, d, dst + 4, page_size2)
+    e.sj_used += rec
+    ok()
+}
+
+// Undoes the current statement. Returns false when the statement journal
+// overflowed and the whole transaction must be rolled back instead.
+fn stmt_rollback(e: &mut Engine) -> bool!db.Error {
+    if !e.sj_active {
+        return ok(false)
+    }
+    e.sj_active = false
+    if e.sj_overflow {
+        return ok(false)
+    }
+    rec := e.page_size + 4
+    o := 0usize
+    for o < e.sj_used {
+        pgno := ld32(e.ws, e.sj_off + o)
+        d := pg_fetch(e, pgno)?
+        let sj_off2 = e.sj_off + o + 4
+        let page_size2 = e.page_size
+        move_bytes(e.ws, sj_off2, d, page_size2)
+        let hash_find2 = hash_find(e, pgno) - 1
+        e.ws[slot_meta(e, hash_find2) + 4] = 1
+        o += rec
+    }
+    // Pages appended during the statement are discarded.
+    for p in (e.sj_pages + 1)..(e.db_pages + 1) {
+        cache_drop(e, p)
+    }
+    e.db_pages = e.sj_pages
+    e.schema_loaded = false
+    ok(true)
+}
+
+fn stmt_end(e: &mut Engine) {
+    e.sj_active = false
+    e.sj_used = 0
+}
+
+// ---------------------------------------------------------------------------
+// Write transactions
+
+fn begin_write(e: &mut Engine) -> void!db.Error {
+    if e.write_txn {
+        return ok()
+    }
+    if e.readonly {
+        return err(fail(e, SQLITE_READONLY, "attempt to write a readonly database"))
+    }
+    begin_read(e)?
+    lock_reserved(e)?
+    e.write_txn = true
+    e.db_written = false
+    e.journal_open = false
+    e.journal_synced = false
+    e.journal_records = 0
+    e.mj_used = 0
+    e.file_pages = e.db_pages
+    e.disk_pages = e.db_pages
+    n := (e.db_pages as usize) / 8 + 1
+    let bitmap_off2 = e.bitmap_off
+    let value = if n < e.bitmap_bytes {
+        n
+    } else {
+        e.bitmap_bytes
+    }
+    zero_bytes(e.ws, bitmap_off2, value)
+    if e.db_pages == 0 {
+        create_page1(e)?
+    }
+    ok()
+}
+
+// Formats page 1 of a new database: header plus an empty sqlite_schema leaf.
+fn create_page1(e: &mut Engine) -> void!db.Error {
+    e.db_pages = 1
+    d := pg_write(e, 1)?
+    let page_size2 = e.page_size
+    zero_bytes(e.ws, d, page_size2)
+    magic := mem.str_bytes("SQLite format 3")
+    copy_in(e.ws, d, magic)
+    ps := if e.page_size == 65536 {
+        1usize
+    } else {
+        e.page_size
+    }
+    wr16(e.ws, d + 16, ps)
+    e.ws[d + 18] = 1
+    e.ws[d + 19] = 1
+    e.ws[d + 20] = 0
+    e.ws[d + 21] = 64
+    e.ws[d + 22] = 32
+    e.ws[d + 23] = 32
+    let change_counter2 = e.change_counter
+    wr32(e.ws, d + 24, change_counter2)
+    wr32(e.ws, d + 28, 1)
+    let schema_cookie2 = e.schema_cookie
+    wr32(e.ws, d + 40, schema_cookie2)
+    wr32(e.ws, d + 44, 4)
+    wr32(e.ws, d + 56, 1)
+    let change_counter3 = e.change_counter
+    wr32(e.ws, d + 92, change_counter3)
+    wr32(e.ws, d + 96, WRITER_VERSION)
+    e.ws[d + 100] = 13
+    let page_size3 = e.page_size
+    wr16(e.ws, d + 105, page_size3)
+    e.schema_format = 4
+    e.usable = e.page_size
+    e.reserved = 0
+    ok()
+}
+
+fn any_dirty(e: &Engine) -> bool {
+    for s in 0usize..e.nslots {
+        m := slot_meta(e, s)
+        if ld32(e.ws, m) != 0 && e.ws[m + 4] != 0 {
+            return true
+        }
+    }
+    false
+}
+
+fn commit(e: &mut Engine) -> void!db.Error {
+    if !e.write_txn {
+        return ok()
+    }
+    changed := e.db_written || e.db_pages != e.file_pages || any_dirty(e)
+    if changed {
+        d := pg_write(e, 1)?
+        counter := core.wrapping_add(rd32(e.ws, d + 24), 1u32)
+        wr32(e.ws, d + 24, counter)
+        let db_pages2 = e.db_pages
+        wr32(e.ws, d + 28, db_pages2)
+        wr32(e.ws, d + 92, counter)
+        wr32(e.ws, d + 96, WRITER_VERSION)
+        e.change_counter = counter
+        e.schema_cookie = rd32(e.ws, d + 40)
+        if !e.memory {
+            journal_sync_header(e)?
+            lock_exclusive(e)?
+            for s in 0usize..e.nslots {
+                m := slot_meta(e, s)
+                pgno := ld32(e.ws, m)
+                if pgno != 0 && e.ws[m + 4] != 0 {
+                    if pgno <= e.db_pages {
+                        let value = ((pgno - 1) as u64) * (e.page_size as u64)
+                        let data = slot_data(e, s)
+                        let page_size2 = e.page_size
+                        file_write(e, value, data, page_size2)?
+                    }
+                    e.ws[m + 4] = 0
+                }
+            }
+            if e.db_pages < e.file_pages || e.db_written {
+                let value2 = (e.db_pages as u64) * (e.page_size as u64)
+                file_truncate(e, value2)?
+            }
+            file_sync(e)?
+            journal_delete(e)?
+        } else {
+            for s in 0usize..e.nslots {
+                m := slot_meta(e, s)
+                e.ws[m + 4] = 0
+                if ld32(e.ws, m) > e.db_pages {
+                    let ld322 = ld32(e.ws, m)
+                    hash_remove(e, ld322)
+                    st32(e.ws, m, 0)
+                }
+            }
+        }
+    } else if e.journal_open {
+        journal_delete(e)?
+    }
+    e.write_txn = false
+    e.journal_open = false
+    e.file_pages = e.db_pages
+    e.mj_used = 0
+    let explicit_txn2 = e.explicit_txn
+    unlock_to(e, explicit_txn2)
+    ok()
+}
+
+fn rollback(e: &mut Engine) -> void!db.Error {
+    if !e.write_txn {
+        return ok()
+    }
+    e.write_txn = false
+    e.sj_active = false
+    if e.memory {
+        // Restore saved images, newest first so the oldest image wins.
+        rec := e.page_size + 4
+        n := e.mj_used / rec
+        for k in 0usize..n {
+            o := e.mj_off + (n - 1 - k) * rec
+            pgno := ld32(e.ws, o)
+            v := hash_find(e, pgno)
+            if v != 0 {
+                let data = slot_data(e, v - 1)
+                let page_size2 = e.page_size
+                move_bytes(e.ws, o + 4, data, page_size2)
+            }
+        }
+        for s in 0usize..e.nslots {
+            m := slot_meta(e, s)
+            e.ws[m + 4] = 0
+            if ld32(e.ws, m) > e.file_pages {
+                let ld322 = ld32(e.ws, m)
+                hash_remove(e, ld322)
+                st32(e.ws, m, 0)
+            }
+        }
+        e.mj_used = 0
+        e.db_pages = e.file_pages
+        if e.db_pages == 0 {
+            cache_clear(e)
+        }
+    } else {
+        failure := false
+        if e.db_written && e.journal_open {
+            match jsync(e) {
+                ok() => {},
+                err(_) => {
+                    failure = true
+                },
+            }
+            match playback(e) {
+                ok() => {},
+                err(_) => {
+                    failure = true
+                },
+            }
+        }
+        cache_clear(e)
+        if e.journal_open || journal_exists(e) {
+            match journal_delete(e) {
+                ok() => {},
+                err(_) => {
+                    failure = true
+                },
+            }
+        }
+        e.journal_open = false
+        e.db_pages = e.file_pages
+        if failure {
+            unlock_to(e, false)
+            return err(io_fail(e, "disk I/O error during rollback"))
+        }
+    }
+    e.schema_loaded = false
+    let explicit_txn2 = e.explicit_txn
+    unlock_to(e, explicit_txn2)
+    ok()
+}
+
+// ---------------------------------------------------------------------------
+// Header fields (page 1)
+
+fn hdr_get(e: &mut Engine, off: usize) -> u32!db.Error {
+    if e.db_pages == 0 {
+        return ok(0)
+    }
+    d := pg_fetch(e, 1)?
+    ok(rd32(e.ws, d + off))
+}
+
+fn hdr_set(e: &mut Engine, off: usize, v: u32) -> void!db.Error {
+    d := pg_write(e, 1)?
+    wr32(e.ws, d + off, v)
+    ok()
+}
+
+// ---------------------------------------------------------------------------
+// Freelist
+
+fn alloc_page(e: &mut Engine) -> u32!db.Error {
+    free_count := hdr_get(e, 36)?
+    trunk := hdr_get(e, 32)?
+    if free_count > 0 && trunk != 0 {
+        if trunk > e.db_pages {
+            return err(corrupt(e))
+        }
+        t := pg_fetch(e, trunk)?
+        leaves := rd32(e.ws, t + 4)
+        if leaves > 0 {
+            t2 := pg_write(e, trunk)?
+            leaf := rd32(e.ws, t2 + 8 + ((leaves - 1) as usize) * 4)
+            wr32(e.ws, t2 + 4, leaves - 1)
+            hdr_set(e, 36, free_count - 1)?
+            if leaf == 0 || leaf > e.db_pages {
+                return err(corrupt(e))
+            }
+            d := pg_write(e, leaf)?
+            let page_size2 = e.page_size
+            zero_bytes(e.ws, d, page_size2)
+            return ok(leaf)
+        }
+        // The trunk itself becomes the allocated page.
+        next := rd32(e.ws, t)
+        hdr_set(e, 32, next)?
+        hdr_set(e, 36, free_count - 1)?
+        d := pg_write(e, trunk)?
+        let page_size3 = e.page_size
+        zero_bytes(e.ws, d, page_size3)
+        return ok(trunk)
+    }
+    pgno := e.db_pages + 1
+    if pgno == pending_page(e) {
+        pgno += 1
+    }
+    if pgno > 2147483646u32 {
+        return err(fail(e, SQLITE_FULL, "database or disk is full"))
+    }
+    e.db_pages = pgno
+    d := pg_write(e, pgno)?
+    let page_size4 = e.page_size
+    zero_bytes(e.ws, d, page_size4)
+    ok(pgno)
+}
+
+fn free_page(e: &mut Engine, pgno: u32) -> void!db.Error {
+    if pgno < 2 || pgno > e.db_pages {
+        return err(corrupt(e))
+    }
+    free_count := hdr_get(e, 36)?
+    trunk := hdr_get(e, 32)?
+    max_leaves := (e.usable / 4 - 8) as u32
+    if trunk != 0 {
+        t := pg_fetch(e, trunk)?
+        leaves := rd32(e.ws, t + 4)
+        if leaves < max_leaves {
+            t2 := pg_write(e, trunk)?
+            wr32(e.ws, t2 + 8 + (leaves as usize) * 4, pgno)
+            wr32(e.ws, t2 + 4, leaves + 1)
+            hdr_set(e, 36, free_count + 1)?
+            return ok()
+        }
+    }
+    d := pg_write(e, pgno)?
+    let page_size2 = e.page_size
+    zero_bytes(e.ws, d, page_size2)
+    wr32(e.ws, d, trunk)
+    wr32(e.ws, d + 4, 0)
+    hdr_set(e, 32, pgno)?
+    hdr_set(e, 36, free_count + 1)?
+    ok()
+}

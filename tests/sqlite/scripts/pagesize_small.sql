@@ -1,0 +1,16 @@
+pragma page_size = 512;
+create table t(id integer primary key, a text, b blob);
+create index ta on t(a);
+insert into t(a, b) values ('alpha', cast(substr(replace(hex(zeroblob(600)), '00', 'ab12'), 1, 1000) as blob)), ('beta', x'00112233445566778899'), ('gamma', zeroblob(3000));
+insert into t(a, b) select a || '2', b from t;
+insert into t(a, b) select a || '3', b from t;
+insert into t(a, b) select a || '4', b from t;
+insert into t(a, b) select a || '5', b from t;
+insert into t(a, b) select a || '6', b from t;
+select count(*), sum(length(b)) from t;
+select a from t where a like 'beta%' order by a limit 5;
+delete from t where id % 4 = 1;
+update t set a = upper(a) where id % 3 = 0;
+select count(*), min(a), max(a) from t;
+pragma page_size;
+pragma integrity_check;

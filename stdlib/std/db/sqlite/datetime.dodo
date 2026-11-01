@@ -1,0 +1,698 @@
+package sqlite
+
+import "std/db"
+import "std/time/hosted"
+
+// Date and time functions: date(), time(), datetime(), julianday(),
+// unixepoch(), strftime(), and CURRENT_DATE/TIME/TIMESTAMP. Times are kept
+// as a Julian day number in milliseconds, using Meeus' calendar algorithms.
+// All times are UTC; the 'localtime' and 'utc' modifiers are accepted and
+// leave the value unchanged.
+
+struct DateTime {
+    jd: i64
+    valid: bool
+    subsec: bool
+}
+
+const MS_PER_DAY: i64 = 86400000
+// Julian day of 1970-01-01 00:00:00 in milliseconds.
+const UNIX_EPOCH_JD: i64 = 210866760000000
+
+fn ymd_to_jd(year: i64, month: i64, day: i64) -> i64 {
+    y := year
+    m := month
+    if m <= 2 {
+        y -= 1
+        m += 12
+    }
+    a := y / 100
+    b := 2 - a + a / 4
+    x1 := 36525 * (y + 4716) / 100
+    x2 := 306001 * (m + 1) / 10000
+    // (x1 + x2 + day + b - 1524.5) days, in milliseconds.
+    (x1 + x2 + day + b - 1525) * MS_PER_DAY + MS_PER_DAY / 2
+}
+
+// (year, month, day) of a Julian day in milliseconds.
+fn jd_to_ymd(jd: i64) -> (i64, i64, i64) {
+    z := (jd + 43200000) / MS_PER_DAY
+    alpha := ((z as f64 - 1867216.25) / 36524.25) as i64
+    a := z + 1 + alpha - alpha / 4
+    b := a + 1524
+    c := ((b as f64 - 122.1) / 365.25) as i64
+    d := (36525 * (c & 32767)) / 100
+    e2 := ((b - d) as f64 / 30.6001) as i64
+    x1 := (30.6001 * (e2 as f64)) as i64
+    day := b - d - x1
+    month := if e2 < 14 {
+        e2 - 1
+    } else {
+        e2 - 13
+    }
+    year := if month > 2 {
+        c - 4716
+    } else {
+        c - 4715
+    }
+    (year, month, day)
+}
+
+// Milliseconds since midnight.
+fn jd_day_ms(jd: i64) -> i64 {
+    (jd + 43200000) % MS_PER_DAY
+}
+
+fn now_jd(e: &mut Engine) -> i64 {
+    clock := hosted.WallClock.new()
+    match clock.wall_now() {
+        ok(ts) => {
+            UNIX_EPOCH_JD + ts.seconds() * 1000 + ((ts.subsec_nanos() / 1000000) as i64)
+        },
+        err(_) => UNIX_EPOCH_JD,
+    }
+}
+
+// Parses up to `n` digits at p; returns (value, next) or (-1, p).
+fn digits(e: &Engine, p: usize, end: usize, n: usize) -> (i64, usize) {
+    v := 0i64
+    k := 0usize
+    q := p
+    for k < n && q < end && is_digit(e.ws[q]) {
+        v = v * 10 + ((e.ws[q] - 48) as i64)
+        q += 1
+        k += 1
+    }
+    if k != n {
+        return (-1i64, p)
+    }
+    (v, q)
+}
+
+// Parses "HH:MM[:SS[.SSS]]" at p; returns (ms since midnight, next) or -1.
+fn parse_hms(e: &Engine, p: usize, end: usize) -> (i64, usize) {
+    let (h, q1) = digits(e, p, end, 2)
+    if h < 0 || h > 24 || q1 >= end || e.ws[q1] != 58 {
+        return (-1i64, p)
+    }
+    let (m, q2) = digits(e, q1 + 1, end, 2)
+    if m < 0 || m > 59 {
+        return (-1i64, p)
+    }
+    ms := h * 3600000 + m * 60000
+    q := q2
+    if q < end && e.ws[q] == 58 {
+        let (s, q3) = digits(e, q + 1, end, 2)
+        if s < 0 || s > 59 {
+            return (-1i64, p)
+        }
+        ms += s * 1000
+        q = q3
+        if q < end && e.ws[q] == 46 && q + 1 < end && is_digit(e.ws[q + 1]) {
+            q += 1
+            scale := 100i64
+            for q < end && is_digit(e.ws[q]) {
+                ms += ((e.ws[q] - 48) as i64) * scale
+                scale = scale / 10
+                q += 1
+            }
+        }
+    }
+    (ms, q)
+}
+
+// Parses an optional time zone suffix: Z or [+-]HH:MM. Returns (offset ms
+// to subtract, next) or (0, p).
+fn parse_tz(e: &Engine, p: usize, end: usize) -> (i64, usize, bool) {
+    q := p
+    for q < end && e.ws[q] == 32 {
+        q += 1
+    }
+    if q >= end {
+        return (0i64, q, true)
+    }
+    b := e.ws[q]
+    if b == 90 || b == 122 {
+        return (0i64, q + 1, true)
+    }
+    if b != 43 && b != 45 {
+        return (0i64, q, false)
+    }
+    let (h, q1) = digits(e, q + 1, end, 2)
+    if h < 0 || q1 >= end || e.ws[q1] != 58 {
+        return (0i64, q, false)
+    }
+    let (m, q2) = digits(e, q1 + 1, end, 2)
+    if m < 0 {
+        return (0i64, q, false)
+    }
+    off := (h * 60 + m) * 60000
+    (if b == 45 {
+        -off
+    } else {
+        off
+    }, q2, true)
+}
+
+// Parses a time value text into milliseconds Julian day.
+fn parse_time_value(e: &mut Engine, o: usize, l: usize) -> DateTime {
+    end := o + l
+    p := o
+    for p < end && e.ws[p] == 32 {
+        p += 1
+    }
+    for end > p && e.ws[end - 1] == 32 {
+        end -= 1
+    }
+    if name_is(e, p, end - p, "now") {
+        return DateTime { jd: now_jd(e), valid: true, subsec: false }
+    }
+    // YYYY-MM-DD
+    neg := false
+    q := p
+    if q < end && e.ws[q] == 45 {
+        neg = true
+        q += 1
+    }
+    let (y, q1) = digits(e, q, end, 4)
+    if y >= 0 && q1 < end && e.ws[q1] == 45 {
+        let (mo, q2) = digits(e, q1 + 1, end, 2)
+        if mo < 1 || mo > 12 || q2 >= end || e.ws[q2] != 45 {
+            return invalid_dt()
+        }
+        let (d, q3) = digits(e, q2 + 1, end, 2)
+        if d < 1 || d > 31 {
+            return invalid_dt()
+        }
+        yy := if neg {
+            -y
+        } else {
+            y
+        }
+        jd := ymd_to_jd(yy, mo, d)
+        r := q3
+        if r < end && (e.ws[r] == 32 || e.ws[r] == 84 || e.ws[r] == 116) {
+            r += 1
+            for r < end && e.ws[r] == 32 {
+                r += 1
+            }
+            let (ms, r2) = parse_hms(e, r, end)
+            if ms < 0 {
+                return invalid_dt()
+            }
+            jd += ms
+            r = r2
+        }
+        let (off, r3, okz) = parse_tz(e, r, end)
+        if !okz || r3 != end {
+            return invalid_dt()
+        }
+        return DateTime { jd: jd - off, valid: true, subsec: false }
+    }
+    // HH:MM[:SS[.SSS]] (on 2000-01-01)
+    let (ms, r) = parse_hms(e, p, end)
+    if ms >= 0 {
+        let (off, r2, okz) = parse_tz(e, r, end)
+        if !okz || r2 != end {
+            return invalid_dt()
+        }
+        return DateTime { jd: ymd_to_jd(2000, 1, 1) + ms - off, valid: true, subsec: false }
+    }
+    // A number: Julian day.
+    let (k, i, f, whole) = parse_number(e, p, end - p)
+    if k != 0 && whole {
+        v := if k == 1 {
+            i as f64
+        } else {
+            f
+        }
+        return jd_from_days(v)
+    }
+    invalid_dt()
+}
+
+fn invalid_dt() -> DateTime {
+    DateTime { jd: 0, valid: false, subsec: false }
+}
+
+fn jd_from_days(v: f64) -> DateTime {
+    if v != v || v < 0.0 || v > 5373484.4999 {
+        return invalid_dt()
+    }
+    DateTime { jd: (v * 86400000.0 + 0.5) as i64, valid: true, subsec: false }
+}
+
+// Applies one modifier. Returns false when it is not understood.
+fn apply_modifier(e: &mut Engine, dt: &mut DateTime, o: usize, l: usize, first: bool, raw: f64, raw_numeric: bool) -> bool {
+    end := o + l
+    p := o
+    for p < end && e.ws[p] == 32 {
+        p += 1
+    }
+    for end > p && e.ws[end - 1] == 32 {
+        end -= 1
+    }
+    n := end - p
+    if name_is(e, p, n, "localtime") || name_is(e, p, n, "utc") {
+        return true
+    }
+    if name_is(e, p, n, "subsec") || name_is(e, p, n, "subsecond") {
+        dt.subsec = true
+        return true
+    }
+    if name_is(e, p, n, "unixepoch") || name_is(e, p, n, "auto") || name_is(e, p, n, "julianday") {
+        if !first || !raw_numeric {
+            return false
+        }
+        if name_is(e, p, n, "julianday") {
+            return true
+        }
+        if name_is(e, p, n, "auto") && raw >= 0.0 && raw <= 5373484.4999 {
+            return true
+        }
+        if raw < -210866760000.0 || raw > 253402300799.0 {
+            dt.valid = false
+            return true
+        }
+        dt.jd = UNIX_EPOCH_JD + ((raw * 1000.0) + if raw < 0.0 {
+            -0.5
+        } else {
+            0.5
+        }) as i64
+        dt.valid = true
+        return true
+    }
+    if name_is(e, p, n, "start of day") {
+        dt.jd -= jd_day_ms(dt.jd)
+        return true
+    }
+    if name_is(e, p, n, "start of month") || name_is(e, p, n, "start of year") {
+        let (y, m, _) = jd_to_ymd(dt.jd)
+        dt.jd = ymd_to_jd(y, if name_is(e, p, n, "start of year") {
+            1i64
+        } else {
+            m
+        }, 1)
+        return true
+    }
+    if n > 8 && name_is(e, p, 8, "weekday ") {
+        let (k, i, _, whole) = parse_number(e, p + 8, n - 8)
+        if k != 1 || !whole || i < 0 || i > 6 {
+            return false
+        }
+        // 0 = Sunday. Day of week of the Julian day: (Z + 1) % 7.
+        z := (dt.jd + 43200000) / MS_PER_DAY
+        wd := (z + 1) % 7
+        diff := (i - wd + 7) % 7
+        dt.jd += diff * MS_PER_DAY
+        return true
+    }
+    // [+-]NNN unit, or [+-]YYYY-MM-DD HH:MM:SS shifts.
+    let (k, i, f, _) = parse_number(e, p, n)
+    if k == 0 {
+        return false
+    }
+    amount := if k == 1 {
+        i as f64
+    } else {
+        f
+    }
+    q := p
+    if q < end && (e.ws[q] == 43 || e.ws[q] == 45) {
+        q += 1
+    }
+    for q < end && (is_digit(e.ws[q]) || e.ws[q] == 46) {
+        q += 1
+    }
+    for q < end && e.ws[q] == 32 {
+        q += 1
+    }
+    unit := q
+    ul := end - q
+    if ul > 0 && e.ws[end - 1] == 115 {
+        ul -= 1
+    }
+    if name_is(e, unit, ul, "day") {
+        dt.jd += (amount * 86400000.0) as i64
+        return true
+    }
+    if name_is(e, unit, ul, "hour") {
+        dt.jd += (amount * 3600000.0) as i64
+        return true
+    }
+    if name_is(e, unit, ul, "minute") {
+        dt.jd += (amount * 60000.0) as i64
+        return true
+    }
+    if name_is(e, unit, ul, "second") {
+        dt.jd += (amount * 1000.0 + if amount < 0.0 {
+            -0.5
+        } else {
+            0.5
+        }) as i64
+        return true
+    }
+    if name_is(e, unit, ul, "month") || name_is(e, unit, ul, "year") {
+        months := if name_is(e, unit, ul, "year") {
+            (amount as i64) * 12
+        } else {
+            amount as i64
+        }
+        let (y, m, d) = jd_to_ymd(dt.jd)
+        tod := jd_day_ms(dt.jd)
+        total := y * 12 + (m - 1) + months
+        ny := if total >= 0 {
+            total / 12
+        } else {
+            (total - 11) / 12
+        }
+        nm := total - ny * 12 + 1
+        // Day overflow rolls into the next month, as in SQLite.
+        dt.jd = ymd_to_jd(ny, nm, 1) + (d - 1) * MS_PER_DAY + tod
+        frac := amount - (amount as i64) as f64
+        if frac != 0.0 && name_is(e, unit, ul, "month") {
+            dt.jd += (frac * 30.0 * 86400000.0) as i64
+        }
+        return true
+    }
+    false
+}
+
+fn pad2(out: &mut[u8], o: usize, v: i64) -> usize {
+    out[o] = 48 + ((v / 10 % 10) as u8)
+    out[o + 1] = 48 + ((v % 10) as u8)
+    o + 2
+}
+
+fn put_year(out: &mut[u8], o: usize, y: i64) -> usize {
+    p := o
+    v := y
+    if v < 0 {
+        out[p] = 45
+        p += 1
+        v = -v
+    }
+    out[p] = 48 + ((v / 1000 % 10) as u8)
+    out[p + 1] = 48 + ((v / 100 % 10) as u8)
+    out[p + 2] = 48 + ((v / 10 % 10) as u8)
+    out[p + 3] = 48 + ((v % 10) as u8)
+    p + 4
+}
+
+fn put_date(out: &mut[u8], o: usize, jd: i64) -> usize {
+    let (y, m, d) = jd_to_ymd(jd)
+    p := put_year(out, o, y)
+    out[p] = 45
+    p = pad2(out, p + 1, m)
+    out[p] = 45
+    pad2(out, p + 1, d)
+}
+
+fn put_time(out: &mut[u8], o: usize, jd: i64, subsec: bool) -> usize {
+    ms := jd_day_ms(jd)
+    p := pad2(out, o, ms / 3600000)
+    out[p] = 58
+    p = pad2(out, p + 1, ms / 60000 % 60)
+    out[p] = 58
+    p = pad2(out, p + 1, ms / 1000 % 60)
+    if subsec {
+        out[p] = 46
+        out[p + 1] = 48 + ((ms / 100 % 10) as u8)
+        out[p + 2] = 48 + ((ms / 10 % 10) as u8)
+        out[p + 3] = 48 + ((ms % 10) as u8)
+        p += 4
+    }
+    p
+}
+
+fn day_of_year(jd: i64) -> i64 {
+    let (y, _, _) = jd_to_ymd(jd)
+    (jd - ymd_to_jd(y, 1, 1)) / MS_PER_DAY
+}
+
+fn day_of_week(jd: i64) -> i64 {
+    ((jd + 43200000) / MS_PER_DAY + 1) % 7
+}
+
+fn date_function(e: &mut Engine, id: usize, a: usize, argc: usize, dst: usize) -> void!db.Error {
+    first := 0usize
+    fmt := 0usize
+    fmt_len := 0usize
+    if id == F_STRFTIME {
+        if rtype(e, a) == T_NULL {
+            set_null(e, dst)
+            return ok()
+        }
+        to_text(e, a)?
+        fmt = roff(e, a)
+        fmt_len = rlen(e, a)
+        first = 1
+    }
+    dt := DateTime { jd: now_jd(e), valid: true, subsec: false }
+    raw := 0.0
+    raw_numeric := false
+    if id == F_CURRENT_TIMESTAMP || id == F_CURRENT_DATE || id == F_CURRENT_TIME {
+        // Fixed per statement in SQLite; the current time is close enough.
+    } else if argc > first {
+        v := a + first
+        t := rtype(e, v)
+        if t == T_NULL {
+            set_null(e, dst)
+            return ok()
+        }
+        if t == T_INT || t == T_REAL {
+            raw = to_real(e, v)
+            raw_numeric = true
+            dt = jd_from_days(raw)
+        } else {
+            to_text(e, v)?
+            let off = roff(e, v)
+            let len = rlen(e, v)
+            dt = parse_time_value(e, off, len)
+            if dt.valid {
+                let off2 = roff(e, v)
+                let len2 = rlen(e, v)
+                let (k, i, f, whole) = parse_number(e, off2, len2)
+                if k != 0 && whole {
+                    raw = if k == 1 {
+                        i as f64
+                    } else {
+                        f
+                    }
+                    raw_numeric = true
+                }
+            }
+        }
+        for k in (first + 1)..argc {
+            r := a + k
+            if rtype(e, r) == T_NULL {
+                set_null(e, dst)
+                return ok()
+            }
+            to_text(e, r)?
+            let off3 = roff(e, r)
+            let len3 = rlen(e, r)
+            if !apply_modifier(e, &mut dt, off3, len3, k == first + 1, raw, raw_numeric) {
+                set_null(e, dst)
+                return ok()
+            }
+        }
+    }
+    if !dt.valid {
+        set_null(e, dst)
+        return ok()
+    }
+    out := [0u8; 64]
+    if id == F_DATE || id == F_CURRENT_DATE {
+        n := put_date(&mut out, 0, dt.jd)
+        return set_text_bytes(e, dst, &out[..n])
+    }
+    if id == F_TIME || id == F_CURRENT_TIME {
+        n := put_time(&mut out, 0, dt.jd, dt.subsec)
+        return set_text_bytes(e, dst, &out[..n])
+    }
+    if id == F_DATETIME || id == F_CURRENT_TIMESTAMP {
+        n := put_date(&mut out, 0, dt.jd)
+        out[n] = 32
+        m := put_time(&mut out, n + 1, dt.jd, dt.subsec)
+        return set_text_bytes(e, dst, &out[..m])
+    }
+    if id == F_JULIANDAY {
+        set_real(e, dst, (dt.jd as f64) / 86400000.0)
+        return ok()
+    }
+    if id == F_UNIXEPOCH {
+        ms := dt.jd - UNIX_EPOCH_JD
+        if dt.subsec {
+            set_real(e, dst, (ms as f64) / 1000.0)
+        } else {
+            set_int(e, dst, if ms >= 0 {
+                ms / 1000
+            } else {
+                (ms - 999) / 1000
+            })
+        }
+        return ok()
+    }
+    // strftime
+    start := e.arena_top
+    i := 0usize
+    for i < fmt_len {
+        c := e.ws[fmt + i]
+        if c != 37 || i + 1 >= fmt_len {
+            out_byte(e, c)?
+            i += 1
+            continue
+        }
+        spec := e.ws[fmt + i + 1]
+        i += 2
+        n := 0usize
+        let (y, m, d) = jd_to_ymd(dt.jd)
+        ms := jd_day_ms(dt.jd)
+        if spec == 100 {
+            n = pad2(&mut out, 0, d)
+        } else if spec == 101 {
+            out[0] = if d < 10 {
+                32u8
+            } else {
+                48 + ((d / 10) as u8)
+            }
+            out[1] = 48 + ((d % 10) as u8)
+            n = 2
+        } else if spec == 102 {
+            n = pad2(&mut out, 0, ms / 1000 % 60)
+            out[n] = 46
+            out[n + 1] = 48 + ((ms / 100 % 10) as u8)
+            out[n + 2] = 48 + ((ms / 10 % 10) as u8)
+            out[n + 3] = 48 + ((ms % 10) as u8)
+            n += 4
+        } else if spec == 70 {
+            n = put_date(&mut out, 0, dt.jd)
+        } else if spec == 72 {
+            n = pad2(&mut out, 0, ms / 3600000)
+        } else if spec == 107 || spec == 108 || spec == 73 {
+            h := ms / 3600000
+            if spec != 107 {
+                h = h % 12
+                if h == 0 {
+                    h = 12
+                }
+            }
+            if spec == 73 {
+                n = pad2(&mut out, 0, h)
+            } else {
+                out[0] = if h < 10 {
+                    32u8
+                } else {
+                    48 + ((h / 10) as u8)
+                }
+                out[1] = 48 + ((h % 10) as u8)
+                n = 2
+            }
+        } else if spec == 106 {
+            doy := day_of_year(dt.jd) + 1
+            out[0] = 48 + ((doy / 100) as u8)
+            n = pad2(&mut out, 1, doy % 100)
+        } else if spec == 74 {
+            buf := [0u8; 48]
+            n2 := real_text((dt.jd as f64) / 86400000.0, &mut buf)
+            // %J prints the Julian day number with up to 16 digits, no ".0".
+            l := n2
+            if l > 2 && buf[l - 2] == 46 && buf[l - 1] == 48 {
+                l -= 2
+            }
+            for k in 0usize..l {
+                out[k] = buf[k]
+            }
+            n = l
+        } else if spec == 109 {
+            n = pad2(&mut out, 0, m)
+        } else if spec == 77 {
+            n = pad2(&mut out, 0, ms / 60000 % 60)
+        } else if spec == 112 || spec == 80 {
+            pm := ms >= 43200000
+            out[0] = if pm {
+                if spec == 112 {
+                    80u8
+                } else {
+                    112u8
+                }
+            } else {
+                if spec == 112 {
+                    65u8
+                } else {
+                    97u8
+                }
+            }
+            out[1] = if spec == 112 {
+                77u8
+            } else {
+                109u8
+            }
+            n = 2
+        } else if spec == 82 {
+            n = pad2(&mut out, 0, ms / 3600000)
+            out[n] = 58
+            n = pad2(&mut out, n + 1, ms / 60000 % 60)
+        } else if spec == 115 {
+            secs := (dt.jd - UNIX_EPOCH_JD)
+            n = format_i64(&mut out, if secs >= 0 {
+                secs / 1000
+            } else {
+                (secs - 999) / 1000
+            })
+        } else if spec == 83 {
+            n = pad2(&mut out, 0, ms / 1000 % 60)
+        } else if spec == 84 {
+            n = put_time(&mut out, 0, dt.jd, false)
+        } else if spec == 117 {
+            wd := day_of_week(dt.jd)
+            out[0] = 48 + ((if wd == 0 {
+                7i64
+            } else {
+                wd
+            }) as u8)
+            n = 1
+        } else if spec == 119 {
+            out[0] = 48 + (day_of_week(dt.jd) as u8)
+            n = 1
+        } else if spec == 87 || spec == 85 {
+            // Week of year, weeks starting Monday (%W) or Sunday (%U).
+            doy := day_of_year(dt.jd)
+            wd := day_of_week(dt.jd)
+            adj := if spec == 87 {
+                (wd + 6) % 7
+            } else {
+                wd
+            }
+            n = pad2(&mut out, 0, (doy + 7 - adj) / 7)
+        } else if spec == 86 || spec == 71 || spec == 103 {
+            // ISO 8601 week-numbering: the week with the year's first Thursday.
+            wd := (day_of_week(dt.jd) + 6) % 7
+            thursday := dt.jd + (3 - wd) * MS_PER_DAY
+            let (ty, _, _) = jd_to_ymd(thursday)
+            if spec == 86 {
+                week := (thursday - ymd_to_jd(ty, 1, 1)) / MS_PER_DAY / 7 + 1
+                n = pad2(&mut out, 0, week)
+            } else if spec == 71 {
+                n = put_year(&mut out, 0, ty)
+            } else {
+                n = pad2(&mut out, 0, ty % 100)
+            }
+        } else if spec == 89 {
+            n = put_year(&mut out, 0, y)
+        } else if spec == 37 {
+            out[0] = 37
+            n = 1
+        } else {
+            set_null(e, dst)
+            return ok()
+        }
+        for k in 0usize..n {
+            out_byte(e, out[k])?
+        }
+    }
+    let arena_top2 = e.arena_top - start
+    set_bytes(e, dst, T_TEXT, start, arena_top2)
+    ok()
+}

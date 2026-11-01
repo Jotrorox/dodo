@@ -1,0 +1,1389 @@
+package lua
+
+import "core/mem"
+import "core/ptr"
+
+// Incremental tri-color mark & sweep collector.
+//
+// Colors live in GCObject.marked: one of two white bits (which white is
+// "current" flips at the end of each mark phase), a black bit, and gray
+// meaning "neither white nor black". Gray objects wait in `g.gray` (or
+// `g.grayagain` for objects that must be revisited atomically: threads,
+// weak tables, and tables hit by a backward barrier).
+//
+// Cycle: Pause -> Propagate (incremental marking) -> Atomic (finish marking,
+// weak tables, separate objects to finalize) -> sweep allgc / finobj /
+// tobefnz (incremental, frees objects of the old white) -> CallFin (runs
+// pending finalizers, a few per step) -> Pause.
+//
+// The collector only runs at check points (gc_check) where every live object
+// is reachable from the roots, except for emergency collections triggered by
+// a failed allocation: those additionally treat every object created since
+// the last check point as a root (`young_mark`), never run finalizers and
+// never move stacks.
+
+const WHITE0: u8 = 1
+const WHITE1: u8 = 2
+const WHITEBITS: u8 = 3
+const BLACKBIT: u8 = 4
+// The object is registered for finalization (it lives in finobj/tobefnz).
+const FINALIZEDBIT: u8 = 8
+
+const GCS_PROPAGATE: u8 = 0
+const GCS_ENTERATOMIC: u8 = 1
+const GCS_ATOMIC: u8 = 2
+const GCS_SWPALLGC: u8 = 3
+const GCS_SWPFINOBJ: u8 = 4
+const GCS_SWPTOBEFNZ: u8 = 5
+const GCS_SWPEND: u8 = 6
+const GCS_CALLFIN: u8 = 7
+const GCS_PAUSE: u8 = 8
+
+// gcstp bits.
+const GCSTP_USR: u8 = 1
+const GCSTP_GC: u8 = 2
+const GCSTP_CLS: u8 = 4
+// Collection not possible yet (state being built).
+const GCSTP_INIT: u8 = 8
+
+const GC_KIND_INC: u8 = 0
+const GC_KIND_GEN: u8 = 1
+
+const GC_SWEEP_MAX: isize = 100
+const GC_FIN_MAX: i32 = 10
+const GC_FIN_COST: isize = 50
+
+fn gc_init_global(g: *mut Global) {
+    unsafe {
+        (*g).currentwhite = WHITE0
+        (*g).gcstate = GCS_PAUSE
+        (*g).gckind = GC_KIND_INC
+        (*g).gcstp = GCSTP_INIT
+        (*g).gcemergency = 0
+        (*g).gc_running_fin = 0
+        (*g).gcpause = 200
+        (*g).gcstepmul = 100
+        (*g).gcstepsize = 13
+        (*g).gen_minormul = 20
+        (*g).gen_majormul = 100
+        (*g).allgc = 0 as *mut GCObject
+        (*g).finobj = 0 as *mut GCObject
+        (*g).gray = 0 as *mut GCObject
+        (*g).grayagain = 0 as *mut GCObject
+        (*g).weak = 0 as *mut GCObject
+        (*g).ephemeron = 0 as *mut GCObject
+        (*g).allweak = 0 as *mut GCObject
+        (*g).tobefnz = 0 as *mut GCObject
+        (*g).fixedgc = 0 as *mut GCObject
+        (*g).young_mark = 0 as *mut GCObject
+        (*g).sweepgc = 0 as *mut *mut GCObject
+        (*g).twups = 0 as *mut State
+        (*g).gc_debt = 0
+        (*g).total_bytes = 0
+        (*g).gc_estimate = 0
+    }
+}
+
+// --- Colors -----------------------------------------------------------------
+
+fn is_white(o: *mut GCObject) -> bool {
+    unsafe {
+        unsafe {
+            return ((*o).marked & WHITEBITS) != 0
+        }
+    }
+}
+fn is_black(o: *mut GCObject) -> bool {
+    unsafe {
+        unsafe {
+            return ((*o).marked & BLACKBIT) != 0
+        }
+    }
+}
+fn is_gray(o: *mut GCObject) -> bool {
+    unsafe {
+        unsafe {
+            return ((*o).marked & (WHITEBITS | BLACKBIT)) == 0
+        }
+    }
+}
+fn other_white(g: *mut Global) -> u8 {
+    unsafe {
+        unsafe {
+            return (*g).currentwhite ^ WHITEBITS
+        }
+    }
+}
+fn current_white(g: *mut Global) -> u8 {
+    unsafe {
+        unsafe {
+            return (*g).currentwhite & WHITEBITS
+        }
+    }
+}
+// Dead: marked with the white of the previous cycle (only meaningful while
+// sweeping).
+fn gc_is_dead(g: *mut Global, o: *mut GCObject) -> bool {
+    unsafe {
+        unsafe {
+            return ((*o).marked & other_white(g) & WHITEBITS) != 0
+        }
+    }
+}
+fn gc_change_white(o: *mut GCObject) {
+    unsafe {
+        unsafe {
+            (*o).marked = (*o).marked ^ WHITEBITS
+        }
+    }
+}
+fn set_gray(o: *mut GCObject) {
+    unsafe {
+        unsafe {
+            (*o).marked = (*o).marked & ~(WHITEBITS | BLACKBIT)
+        }
+    }
+}
+fn set_black(o: *mut GCObject) {
+    unsafe {
+        unsafe {
+            (*o).marked = ((*o).marked & ~WHITEBITS) | BLACKBIT
+        }
+    }
+}
+fn make_white(g: *mut Global, o: *mut GCObject) {
+    unsafe {
+        unsafe {
+            (*o).marked = ((*o).marked & ~(WHITEBITS | BLACKBIT)) | current_white(g)
+        }
+    }
+}
+fn keep_invariant(g: *mut Global) -> bool {
+    unsafe {
+        unsafe {
+            return (*g).gcstate <= GCS_ATOMIC
+        }
+    }
+}
+fn is_sweep_phase(g: *mut Global) -> bool {
+    unsafe {
+        unsafe {
+            return (*g).gcstate >= GCS_SWPALLGC && (*g).gcstate <= GCS_SWPEND
+        }
+    }
+}
+fn value_is_white(v: *mut Value) -> bool {
+    unsafe {
+        unsafe {
+            return ((*v).tag & COLLECTABLE) != 0 && is_white(val_gc(v))
+        }
+    }
+}
+
+// --- Object creation --------------------------------------------------------
+
+fn gc_link(L: *mut State, o: *mut GCObject) {
+    unsafe {
+        let g = G(L)
+        (*o).marked = current_white(g)
+        (*o).next = (*g).allgc
+        (*g).allgc = o
+    }
+}
+
+// Allocate a collectable object of `size` bytes and link it into allgc.
+fn gc_new(L: *mut State, size: usize, tag: u8) -> (*mut GCObject)!Throw {
+    unsafe {
+        let o = mem_alloc(L, size)? as *mut GCObject
+        (*o).tag = tag
+        gc_link(L, o)
+        return ok(o)
+    }
+}
+
+// Make a just-created object permanent (never collected). It must be the
+// most recently created object.
+fn gc_fix(L: *mut State, o: *mut GCObject) {
+    unsafe {
+        let g = G(L)
+        if (*g).allgc != o {
+            return
+        }
+        if (*g).young_mark == o {
+            (*g).young_mark = (*o).next
+        }
+        (*g).allgc = (*o).next
+        (*o).next = (*g).fixedgc
+        (*g).fixedgc = o
+        set_gray(o)
+    }
+}
+
+// The object's gray-list link.
+fn gclist_of(o: *mut GCObject) -> *mut *mut GCObject {
+    unsafe {
+        let t = (*o).tag
+        off := 0usize
+        if t == TAG_TABLE {
+            off = mem.offset_of::<Table>("gclist")
+        } else if t == TAG_LCLOSURE {
+            off = mem.offset_of::<LClosure>("gclist")
+        } else if t == TAG_NCLOSURE {
+            off = mem.offset_of::<NClosure>("gclist")
+        } else if t == TAG_THREAD {
+            off = mem.offset_of::<State>("gclist")
+        } else if t == TAG_PROTO {
+            off = mem.offset_of::<Proto>("gclist")
+        } else {
+            off = mem.offset_of::<Udata>("gclist")
+        }
+        return ptr.offset(o as *mut u8, off as isize) as *mut *mut GCObject
+    }
+}
+
+fn link_gclist(o: *mut GCObject, list: *mut *mut GCObject) {
+    unsafe {
+        *gclist_of(o) = *list
+        *list = o
+        set_gray(o)
+    }
+}
+
+// --- Barriers ---------------------------------------------------------------
+
+@cold
+fn barrier_forward(L: *mut State, o: *mut GCObject, v: *mut GCObject) {
+    unsafe {
+        let g = G(L)
+        if keep_invariant(g) {
+            really_mark(g, v)
+        } else {
+            // Sweeping: whiten the parent to avoid further barriers.
+            make_white(g, o)
+        }
+    }
+}
+
+// `o` now refers to the collectable value `v`.
+@inline
+fn gc_barrier(L: *mut State, o: *mut GCObject, v: *mut Value) {
+    unsafe {
+        if ((*v).tag & COLLECTABLE) != 0 && is_black(o) && is_white(val_gc(v)) {
+            barrier_forward(L, o, val_gc(v))
+        }
+    }
+}
+
+fn gc_barrier_obj(L: *mut State, o: *mut GCObject, v: *mut GCObject) {
+    unsafe {
+        if is_black(o) && is_white(v) {
+            barrier_forward(L, o, v)
+        }
+    }
+}
+
+@cold
+fn barrier_back_now(L: *mut State, t: *mut GCObject) {
+    unsafe {
+        let g = G(L)
+        link_gclist(t, ptr.offset(g as *mut u8, mem.offset_of::<Global>("grayagain") as isize) as *mut *mut GCObject)
+    }
+}
+
+// Table `t` now holds the value `v`.
+@inline
+fn gc_barrier_back(L: *mut State, t: *mut Table, v: *mut Value) {
+    unsafe {
+        if ((*v).tag & COLLECTABLE) != 0 && is_black(t as *mut GCObject) && is_white(val_gc(v)) {
+            barrier_back_now(L, t as *mut GCObject)
+        }
+    }
+}
+
+fn gc_barrier_back_key(L: *mut State, t: *mut Table, key: *mut Value, v: *mut Value) {
+    unsafe {
+        if is_black(t as *mut GCObject) && (value_is_white(key) || value_is_white(v)) {
+            barrier_back_now(L, t as *mut GCObject)
+        }
+    }
+}
+
+// An open upvalue was closed: its value is now owned by the upvalue.
+fn gc_barrier_upval_close(L: *mut State, uv: *mut UpVal) {
+    unsafe {
+        let o = uv as *mut GCObject
+        if !is_white(o) {
+            set_black(o)
+            gc_barrier(L, o, (*uv).v)
+        }
+    }
+}
+
+// --- Marking ----------------------------------------------------------------
+
+fn mark_value(g: *mut Global, v: *mut Value) {
+    unsafe {
+        if ((*v).tag & COLLECTABLE) != 0 && is_white(val_gc(v)) {
+            really_mark(g, val_gc(v))
+        }
+    }
+}
+fn mark_object(g: *mut Global, o: *mut GCObject) {
+    unsafe {
+        if !ptr.is_null(o) && is_white(o) {
+            really_mark(g, o)
+        }
+    }
+}
+
+fn gray_list(g: *mut Global) -> *mut *mut GCObject {
+    unsafe {
+        unsafe {
+            return ptr.offset(g as *mut u8, mem.offset_of::<Global>("gray") as isize) as *mut *mut GCObject
+        }
+    }
+}
+
+fn really_mark(g: *mut Global, o: *mut GCObject) {
+    unsafe {
+        let t = (*o).tag
+        if t == TAG_SHORTSTR || t == TAG_LONGSTR {
+            set_black(o)
+            return
+        }
+        if t == TAG_UPVAL {
+            let uv = o as *mut UpVal
+            if upval_is_open(uv) {
+                // Open upvalues stay gray (their slot changes without
+                // barriers, so the thread revisits it atomically), but the
+                // current value is marked now: the thread itself may be
+                // reachable only through such an upvalue (a coroutine that
+                // refers to itself), and remark_upvals runs before the
+                // grayagain objects that may lead here are re-traversed.
+                set_gray(o)
+            } else {
+                set_black(o)
+            }
+            mark_value(g, (*uv).v)
+            return
+        }
+        if t == TAG_USERDATA {
+            let u = o as *mut Udata
+            if (*u).nuvalue == 0 {
+                mark_object(g, (*u).metatable as *mut GCObject)
+                set_black(o)
+                return
+            }
+        }
+        link_gclist(o, gray_list(g))
+    }
+}
+
+// Weak mode of a table: bit 1 weak keys, bit 2 weak values.
+fn table_weak_mode(g: *mut Global, t: *mut Table) -> i32 {
+    unsafe {
+        let mt = (*t).metatable
+        if ptr.is_null(mt) {
+            return 0
+        }
+        let tm = meta_fast_tm(g, mt, TM_MODE)
+        if ptr.is_null(tm) || !((*tm).tag == TAG_SHORTSTR || (*tm).tag == TAG_LONGSTR) {
+            return 0
+        }
+        let s = val_str(tm)
+        mode := 0i32
+        let d = str_data(s)
+        for i in 0usize..(*s).length {
+            let c = *ptr.offset(d, i as isize)
+            if c == b'k' {
+                mode = mode | 1
+            } else if c == b'v' {
+                mode = mode | 2
+            }
+        }
+        return mode
+    }
+}
+
+// A removed entry: its collectable key becomes a dead key.
+fn clear_key(n: *mut Node) {
+    unsafe {
+        if ((*n).key_tag & COLLECTABLE) != 0 {
+            (*n).key_tag = TAG_DEADKEY
+        }
+    }
+}
+
+// Whether a weak reference to `v` must be cleared (strings are values and
+// are never cleared; they get marked instead).
+fn is_cleared(g: *mut Global, v: *mut Value) -> bool {
+    unsafe {
+        if ((*v).tag & COLLECTABLE) == 0 {
+            return false
+        }
+        let o = val_gc(v)
+        if (*v).tag == TAG_SHORTSTR || (*v).tag == TAG_LONGSTR {
+            mark_object(g, o)
+            return false
+        }
+        return is_white(o)
+    }
+}
+fn is_cleared_key(g: *mut Global, n: *mut Node) -> bool {
+    unsafe {
+        tmp := Value { bits: 0, tag: 0 }
+        let k = ptr.from_mut(&mut tmp)
+        node_get_key(n, k)
+        return is_cleared(g, k)
+    }
+}
+
+fn list_ptr(g: *mut Global, name: i32) -> *mut *mut GCObject {
+    unsafe {
+        off := mem.offset_of::<Global>("grayagain")
+        if name == 1 {
+            off = mem.offset_of::<Global>("weak")
+        } else if name == 2 {
+            off = mem.offset_of::<Global>("ephemeron")
+        } else if name == 3 {
+            off = mem.offset_of::<Global>("allweak")
+        }
+        return ptr.offset(g as *mut u8, off as isize) as *mut *mut GCObject
+    }
+}
+
+fn traverse_strong_table(g: *mut Global, t: *mut Table) {
+    unsafe {
+        for i in 0isize..((*t).asize as isize) {
+            mark_value(g, ptr.offset((*t).array, i))
+        }
+        if tab_is_dummy(t) {
+            return
+        }
+        tmp := Value { bits: 0, tag: 0 }
+        let k = ptr.from_mut(&mut tmp)
+        let size = node_size(t)
+        for j in 0isize..size {
+            let n = gnode(t, j)
+            if val_is_empty(node_val(n)) {
+                clear_key(n)
+            } else {
+                node_get_key(n, k)
+                mark_value(g, k)
+                mark_value(g, node_val(n))
+            }
+        }
+    }
+}
+
+fn traverse_weak_values(g: *mut Global, t: *mut Table) {
+    unsafe {
+        hasclears := false
+        for i in 0isize..((*t).asize as isize) {
+            if value_is_white(ptr.offset((*t).array, i)) {
+                hasclears = true
+            }
+        }
+        if !tab_is_dummy(t) {
+            tmp := Value { bits: 0, tag: 0 }
+            let k = ptr.from_mut(&mut tmp)
+            let size = node_size(t)
+            for j in 0isize..size {
+                let n = gnode(t, j)
+                if val_is_empty(node_val(n)) {
+                    clear_key(n)
+                } else {
+                    node_get_key(n, k)
+                    mark_value(g, k)
+                    if !hasclears && is_cleared(g, node_val(n)) {
+                        hasclears = true
+                    }
+                }
+            }
+        }
+        if (*g).gcstate == GCS_ATOMIC {
+            if hasclears {
+                link_gclist(t as *mut GCObject, list_ptr(g, 1))
+            }
+        } else {
+            link_gclist(t as *mut GCObject, list_ptr(g, 0))
+        }
+    }
+}
+
+// Traverse an ephemeron table; returns true if any value got marked.
+fn traverse_ephemeron(g: *mut Global, t: *mut Table) -> bool {
+    unsafe {
+        marked := false
+        hasclears := false
+        hasww := false
+        for i in 0isize..((*t).asize as isize) {
+            let v = ptr.offset((*t).array, i)
+            if value_is_white(v) {
+                marked = true
+                really_mark(g, val_gc(v))
+            }
+        }
+        if !tab_is_dummy(t) {
+            let size = node_size(t)
+            for j in 0isize..size {
+                let n = gnode(t, j)
+                if val_is_empty(node_val(n)) {
+                    clear_key(n)
+                } else if is_cleared_key(g, n) {
+                    hasclears = true
+                    if value_is_white(node_val(n)) {
+                        hasww = true
+                    }
+                } else if value_is_white(node_val(n)) {
+                    marked = true
+                    really_mark(g, val_gc(node_val(n)))
+                }
+            }
+        }
+        if (*g).gcstate == GCS_PROPAGATE {
+            link_gclist(t as *mut GCObject, list_ptr(g, 0))
+        } else if hasww {
+            link_gclist(t as *mut GCObject, list_ptr(g, 2))
+        } else if hasclears {
+            link_gclist(t as *mut GCObject, list_ptr(g, 3))
+        }
+        return marked
+    }
+}
+
+fn traverse_table(g: *mut Global, t: *mut Table) -> isize {
+    unsafe {
+        mark_object(g, (*t).metatable as *mut GCObject)
+        let mode = table_weak_mode(g, t)
+        if mode == 0 {
+            traverse_strong_table(g, t)
+        } else if mode == 2 {
+            traverse_weak_values(g, t)
+        } else if mode == 1 {
+            traverse_ephemeron(g, t)
+        } else {
+            link_gclist(t as *mut GCObject, list_ptr(g, 3))
+        }
+        return 1 + ((*t).asize as isize) + (if tab_is_dummy(t) {
+            0isize
+        } else {
+            node_size(t)
+        })
+    }
+}
+
+fn traverse_proto(g: *mut Global, p: *mut Proto) -> isize {
+    unsafe {
+        mark_object(g, (*p).source as *mut GCObject)
+        for i in 0i32..(*p).sizek {
+            mark_value(g, ptr.offset((*p).k, i as isize))
+        }
+        for i in 0i32..(*p).sizeupvalues {
+            mark_object(g, (*ptr.offset((*p).upvalues, i as isize)).name as *mut GCObject)
+        }
+        for i in 0i32..(*p).sizep {
+            mark_object(g, *ptr.offset((*p).p, i as isize) as *mut GCObject)
+        }
+        for i in 0i32..(*p).sizelocvars {
+            mark_object(g, (*ptr.offset((*p).locvars, i as isize)).name as *mut GCObject)
+        }
+        return 1 + ((*p).sizek as isize) + ((*p).sizeupvalues as isize) + ((*p).sizep as isize) + ((*p).sizelocvars as isize)
+    }
+}
+
+fn traverse_thread(g: *mut Global, th: *mut State) -> isize {
+    unsafe {
+        let stack = (*th).stack
+        if (*g).gcstate == GCS_PROPAGATE {
+            // Stacks change without barriers: revisit atomically.
+            link_gclist(th as *mut GCObject, list_ptr(g, 0))
+        }
+        if ptr.is_null(stack) {
+            return 1
+        }
+        o := stack
+        let top = (*th).top
+        for (o as usize) < (top as usize) {
+            mark_value(g, o)
+            o = ptr.offset(o, 1)
+        }
+        uv := (*th).openupval
+        for !ptr.is_null(uv) {
+            mark_object(g, uv as *mut GCObject)
+            uv = (*uv).open_next
+        }
+        mark_value(g, L_errobj(th))
+        if (*g).gcstate == GCS_ATOMIC {
+            // Clear the dead part of the stack.
+            let lim = ptr.offset((*th).stack_last, EXTRA_STACK)
+            for (o as usize) < (lim as usize) {
+                (*o).tag = TAG_NIL
+                o = ptr.offset(o, 1)
+            }
+            if (*th).twups == th && !ptr.is_null((*th).openupval) {
+                (*th).twups = (*g).twups
+                (*g).twups = th
+            }
+        } else if (*g).gcemergency == 0 {
+            stack_shrink(th)
+        }
+        return 1 + sdiff(top, stack)
+    }
+}
+
+// Pop one gray object, blacken it and traverse its references.
+fn propagate_mark(g: *mut Global) -> isize {
+    unsafe {
+        let o = (*g).gray
+        set_black(o)
+        *gray_list(g) = *gclist_of(o)
+        let t = (*o).tag
+        if t == TAG_TABLE {
+            return traverse_table(g, o as *mut Table)
+        }
+        if t == TAG_LCLOSURE {
+            let cl = o as *mut LClosure
+            mark_object(g, (*cl).p as *mut GCObject)
+            for i in 0isize..((*cl).nupvalues as isize) {
+                mark_object(g, lcl_upval(cl, i) as *mut GCObject)
+            }
+            return 1 + ((*cl).nupvalues as isize)
+        }
+        if t == TAG_NCLOSURE {
+            let cl = o as *mut NClosure
+            for i in 0isize..((*cl).nupvalues as isize) {
+                mark_value(g, ptr.offset(ncl_upvalues(cl), i))
+            }
+            return 1 + ((*cl).nupvalues as isize)
+        }
+        if t == TAG_PROTO {
+            return traverse_proto(g, o as *mut Proto)
+        }
+        if t == TAG_THREAD {
+            return traverse_thread(g, o as *mut State)
+        }
+        // Userdata with user values.
+        let u = o as *mut Udata
+        mark_object(g, (*u).metatable as *mut GCObject)
+        for i in 0isize..((*u).nuvalue as isize) {
+            mark_value(g, udata_uv(u, i))
+        }
+        return 1 + ((*u).nuvalue as isize)
+    }
+}
+
+fn propagate_all(g: *mut Global) -> isize {
+    unsafe {
+        work := 0isize
+        for !ptr.is_null((*g).gray) {
+            work += propagate_mark(g)
+        }
+        return work
+    }
+}
+
+// Mark values of ephemerons whose keys became marked, until nothing changes.
+fn converge_ephemerons(g: *mut Global) {
+    unsafe {
+        for {
+            changed := false
+            next := (*g).ephemeron
+            (*g).ephemeron = 0 as *mut GCObject
+            for !ptr.is_null(next) {
+                let w = next
+                next = *gclist_of(w)
+                set_black(w)
+                if traverse_ephemeron(g, w as *mut Table) {
+                    propagate_all(g)
+                    changed = true
+                }
+            }
+            if !changed {
+                break
+            }
+        }
+    }
+}
+
+// Mark the values of open upvalues of unmarked threads (closures may still
+// use them) and drop such threads from the twups list.
+fn remark_upvals(g: *mut Global) -> isize {
+    unsafe {
+        work := 0isize
+        p := ptr.offset(g as *mut u8, mem.offset_of::<Global>("twups") as isize) as *mut *mut State
+        for !ptr.is_null(*p) {
+            let th = *p
+            work += 1
+            if !is_white(th as *mut GCObject) && !ptr.is_null((*th).openupval) {
+                p = ptr.offset(th as *mut u8, mem.offset_of::<State>("twups") as isize) as *mut *mut State
+            } else {
+                *p = (*th).twups
+                (*th).twups = th
+                uv := (*th).openupval
+                for !ptr.is_null(uv) {
+                    work += 1
+                    if !is_white(uv as *mut GCObject) {
+                        mark_value(g, (*uv).v)
+                    }
+                    uv = (*uv).open_next
+                }
+            }
+        }
+        return work
+    }
+}
+
+fn mark_metatables(g: *mut Global) {
+    unsafe {
+        for i in 0u8..9 {
+            mark_object(g, G_mt(g, i) as *mut GCObject)
+        }
+    }
+}
+
+fn mark_roots(g: *mut Global) {
+    unsafe {
+        mark_object(g, (*g).mainthread as *mut GCObject)
+        mark_value(g, G_registry(g))
+        mark_metatables(g)
+    }
+}
+
+// In emergency collections, objects created since the last check point may
+// be referenced only from Dodo locals: treat them as roots.
+fn mark_young(g: *mut Global) {
+    unsafe {
+        o := (*g).allgc
+        for !ptr.is_null(o) && o != (*g).young_mark {
+            mark_object(g, o)
+            o = (*o).next
+        }
+    }
+}
+
+fn mark_being_finalized(g: *mut Global) {
+    unsafe {
+        o := (*g).tobefnz
+        for !ptr.is_null(o) {
+            mark_object(g, o)
+            o = (*o).next
+        }
+    }
+}
+
+fn restart_collection(g: *mut Global) {
+    unsafe {
+        (*g).gray = 0 as *mut GCObject
+        (*g).grayagain = 0 as *mut GCObject
+        (*g).weak = 0 as *mut GCObject
+        (*g).allweak = 0 as *mut GCObject
+        (*g).ephemeron = 0 as *mut GCObject
+        mark_roots(g)
+        mark_being_finalized(g)
+    }
+}
+
+// --- Weak table clearing ----------------------------------------------------
+
+fn clear_by_keys(g: *mut Global, list: *mut GCObject) {
+    unsafe {
+        l := list
+        for !ptr.is_null(l) {
+            let t = l as *mut Table
+            if !tab_is_dummy(t) {
+                let size = node_size(t)
+                for j in 0isize..size {
+                    let n = gnode(t, j)
+                    if !val_is_empty(node_val(n)) && is_cleared_key(g, n) {
+                        (*node_val(n)).tag = TAG_EMPTY
+                    }
+                    if val_is_empty(node_val(n)) {
+                        clear_key(n)
+                    }
+                }
+            }
+            l = (*t).gclist
+        }
+    }
+}
+
+fn clear_by_values(g: *mut Global, list: *mut GCObject, until: *mut GCObject) {
+    unsafe {
+        l := list
+        for l != until && !ptr.is_null(l) {
+            let t = l as *mut Table
+            for i in 0isize..((*t).asize as isize) {
+                let v = ptr.offset((*t).array, i)
+                if is_cleared(g, v) {
+                    (*v).tag = TAG_EMPTY
+                }
+            }
+            if !tab_is_dummy(t) {
+                let size = node_size(t)
+                for j in 0isize..size {
+                    let n = gnode(t, j)
+                    if is_cleared(g, node_val(n)) {
+                        (*node_val(n)).tag = TAG_EMPTY
+                    }
+                    if val_is_empty(node_val(n)) {
+                        clear_key(n)
+                    }
+                }
+            }
+            l = (*t).gclist
+        }
+    }
+}
+
+// --- Finalization lists -----------------------------------------------------
+
+// Register `o` for finalization if its new metatable `mt` has __gc.
+fn gc_check_finalizer(L: *mut State, o: *mut GCObject, mt: *mut Table) {
+    unsafe {
+        let g = G(L)
+        if ((*o).marked & FINALIZEDBIT) != 0 || ptr.is_null(mt) || ((*g).gcstp & GCSTP_CLS) != 0 {
+            return
+        }
+        if ptr.is_null(meta_fast_tm(g, mt, TM_GC)) {
+            return
+        }
+        if is_sweep_phase(g) {
+            make_white(g, o)
+        }
+        if (*g).young_mark == o {
+            (*g).young_mark = (*o).next
+        }
+        // Unlink from allgc.
+        p := ptr.offset(g as *mut u8, mem.offset_of::<Global>("allgc") as isize) as *mut *mut GCObject
+        for !ptr.is_null(*p) && *p != o {
+            p = ptr.offset(*p as *mut u8, 0) as *mut *mut GCObject
+        }
+        if ptr.is_null(*p) {
+            return
+        }
+        // If the sweep cursor points at o's link, move it to the predecessor's.
+        if (*g).sweepgc == (ptr.offset(o as *mut u8, 0) as *mut *mut GCObject) {
+            (*g).sweepgc = p
+        }
+        *p = (*o).next
+        (*o).next = (*g).finobj
+        (*g).finobj = o
+        (*o).marked = (*o).marked | FINALIZEDBIT
+    }
+}
+
+// Move unreachable (white) objects with finalizers, or all of them, from
+// finobj to the end of tobefnz.
+fn separate_to_be_finalized(g: *mut Global, all: bool) {
+    unsafe {
+        lastnext := ptr.offset(g as *mut u8, mem.offset_of::<Global>("tobefnz") as isize) as *mut *mut GCObject
+        for !ptr.is_null(*lastnext) {
+            lastnext = ptr.offset(*lastnext as *mut u8, 0) as *mut *mut GCObject
+        }
+        p := ptr.offset(g as *mut u8, mem.offset_of::<Global>("finobj") as isize) as *mut *mut GCObject
+        for !ptr.is_null(*p) {
+            let o = *p
+            if !(is_white(o) || all) {
+                p = ptr.offset(o as *mut u8, 0) as *mut *mut GCObject
+            } else {
+                *p = (*o).next
+                (*o).next = *lastnext
+                *lastnext = o
+                lastnext = ptr.offset(o as *mut u8, 0) as *mut *mut GCObject
+            }
+        }
+    }
+}
+
+// --- Sweeping ---------------------------------------------------------------
+
+fn free_object(L: *mut State, o: *mut GCObject) {
+    unsafe {
+        let t = (*o).tag
+        if t == TAG_SHORTSTR {
+            let s = o as *mut LString
+            str_remove(L, s)
+            mem_free(L, o as *mut u8, str_object_size((*s).length))
+        } else if t == TAG_LONGSTR {
+            mem_free(L, o as *mut u8, str_object_size((*(o as *mut LString)).length))
+        } else if t == TAG_TABLE {
+            tab_free(L, o as *mut Table)
+        } else if t == TAG_LCLOSURE {
+            mem_free(L, o as *mut u8, lcl_size((*(o as *mut LClosure)).nupvalues))
+        } else if t == TAG_NCLOSURE {
+            mem_free(L, o as *mut u8, ncl_size((*(o as *mut NClosure)).nupvalues))
+        } else if t == TAG_USERDATA {
+            let u = o as *mut Udata
+            mem_free(L, o as *mut u8, udata_mem_size((*u).nuvalue, (*u).size))
+        } else if t == TAG_THREAD {
+            thread_free(L, o as *mut State)
+        } else if t == TAG_UPVAL {
+            let uv = o as *mut UpVal
+            if upval_is_open(uv) {
+                upval_unlink(uv)
+            }
+            mem_free(L, o as *mut u8, mem.size_of::<UpVal>())
+        } else if t == TAG_PROTO {
+            proto_free(L, o as *mut Proto)
+        }
+    }
+}
+
+// Sweep up to `count` objects of the list at `p`: free dead ones and whiten
+// survivors. Returns the position to continue from (null when done).
+fn sweep_list(L: *mut State, p0: *mut *mut GCObject, count: isize, done: *mut isize) -> *mut *mut GCObject {
+    unsafe {
+        let g = G(L)
+        let ow = other_white(g)
+        let white = current_white(g)
+        p := p0
+        i := 0isize
+        for !ptr.is_null(*p) && i < count {
+            let curr = *p
+            let marked = (*curr).marked
+            if (marked & ow & WHITEBITS) != 0 {
+                *p = (*curr).next
+                free_object(L, curr)
+            } else {
+                (*curr).marked = (marked & ~(WHITEBITS | BLACKBIT)) | white
+                p = ptr.offset(curr as *mut u8, 0) as *mut *mut GCObject
+            }
+            i += 1
+        }
+        *done = i
+        if ptr.is_null(*p) {
+            return 0 as *mut *mut GCObject
+        }
+        return p
+    }
+}
+
+// Advance the sweep cursor past at least one live object.
+fn sweep_to_live(L: *mut State, p0: *mut *mut GCObject) -> *mut *mut GCObject {
+    unsafe {
+        p := p0
+        n := 0isize
+        for {
+            let old = p
+            p = sweep_list(L, p, 1, ptr.from_mut(&mut n))
+            if p != old {
+                return p
+            }
+        }
+    }
+}
+
+fn enter_sweep(L: *mut State) {
+    unsafe {
+        let g = G(L)
+        (*g).gcstate = GCS_SWPALLGC
+        n := 0isize
+        (*g).sweepgc = sweep_list(L, ptr.offset(g as *mut u8, mem.offset_of::<Global>("allgc") as isize) as *mut *mut GCObject, 1, ptr.from_mut(&mut n))
+    }
+}
+
+fn atomic(L: *mut State) -> isize {
+    unsafe {
+        let g = G(L)
+        let grayagain = (*g).grayagain
+        (*g).grayagain = 0 as *mut GCObject
+        (*g).gcstate = GCS_ATOMIC
+        work := 0isize
+        mark_object(g, L as *mut GCObject)
+        mark_roots(g)
+        if (*g).gcemergency != 0 {
+            mark_young(g)
+        }
+        work += propagate_all(g)
+        work += remark_upvals(g)
+        work += propagate_all(g)
+        (*g).gray = grayagain
+        work += propagate_all(g)
+        converge_ephemerons(g)
+        // Every strongly reachable object is marked now.
+        clear_by_values(g, (*g).weak, 0 as *mut GCObject)
+        clear_by_values(g, (*g).allweak, 0 as *mut GCObject)
+        let origweak = (*g).weak
+        let origall = (*g).allweak
+        separate_to_be_finalized(g, false)
+        mark_being_finalized(g)
+        work += propagate_all(g)
+        converge_ephemerons(g)
+        // Resurrected objects are marked: clear dead keys, and values that
+        // became weak-referenced during resurrection.
+        clear_by_keys(g, (*g).ephemeron)
+        clear_by_keys(g, (*g).allweak)
+        clear_by_values(g, (*g).weak, origweak)
+        clear_by_values(g, (*g).allweak, origall)
+        (*g).currentwhite = other_white(g)
+        return work
+    }
+}
+
+fn sweep_step(L: *mut State, nextstate: u8, nextlist: *mut *mut GCObject) -> isize {
+    unsafe {
+        let g = G(L)
+        if !ptr.is_null((*g).sweepgc) {
+            done := 0isize
+            (*g).sweepgc = sweep_list(L, (*g).sweepgc, GC_SWEEP_MAX, ptr.from_mut(&mut done))
+            return GC_SWEEP_MAX
+        }
+        (*g).gcstate = nextstate
+        (*g).sweepgc = nextlist
+        return 1
+    }
+}
+
+// --- Finalizers -------------------------------------------------------------
+
+fn gc_call_one_finalizer(L: *mut State) {
+    unsafe {
+        let g = G(L)
+        let o = (*g).tobefnz
+        (*g).tobefnz = (*o).next
+        (*o).next = (*g).allgc
+        (*g).allgc = o
+        (*o).marked = (*o).marked & ~FINALIZEDBIT
+        if is_sweep_phase(g) {
+            make_white(g, o)
+        }
+        tmp := Value { bits: 0, tag: 0 }
+        let obj = ptr.from_mut(&mut tmp)
+        set_gc(obj, o, (*o).tag)
+        let tm = meta_get_tm_by_obj(L, obj, TM_GC)
+        if val_is_nil(tm) {
+            return
+        }
+        // Run the finalizer protected, without hooks and collection.
+        let oldallow = (*L).allowhook
+        let oldstp = (*g).gcstp
+        (*g).gcstp = (*g).gcstp | GCSTP_GC
+        (*L).allowhook = 0
+        status := 0i32
+        match stack_check(L, 2) {
+            ok() => {
+                set_obj((*L).top, tm)
+                set_obj(ptr.offset((*L).top, 1), obj)
+                (*L).top = ptr.offset((*L).top, 2)
+                (*(*L).ci).callstatus = (*(*L).ci).callstatus | CIST_FIN
+                status = do_pcall_raw(L, save_stack(L, ptr.offset((*L).top, -2)), 0, 0)
+                (*(*L).ci).callstatus = (*(*L).ci).callstatus & ~CIST_FIN
+            },
+            err(e) => {
+                status = throw_status(e)
+                L_push_value(L, L_errobj(L))
+            },
+        }
+        (*L).allowhook = oldallow
+        (*g).gcstp = oldstp
+        if status != ST_OK as i32 {
+            warn_error(L, "__gc")
+            (*L).top = ptr.offset((*L).top, -1)
+        }
+    }
+}
+
+fn call_pending_finalizers(L: *mut State, max: i32) -> i32 {
+    unsafe {
+        let g = G(L)
+        n := 0i32
+        for !ptr.is_null((*g).tobefnz) && n < max {
+            gc_call_one_finalizer(L)
+            n += 1
+        }
+        return n
+    }
+}
+
+fn call_all_pending_finalizers(L: *mut State) {
+    unsafe {
+        let g = G(L)
+        for !ptr.is_null((*g).tobefnz) {
+            gc_call_one_finalizer(L)
+        }
+    }
+}
+
+// --- Steps ------------------------------------------------------------------
+
+fn single_step(L: *mut State) -> isize {
+    unsafe {
+        let g = G(L)
+        let st = (*g).gcstate
+        if st == GCS_PAUSE {
+            restart_collection(g)
+            (*g).gcstate = GCS_PROPAGATE
+            return 1
+        }
+        if st == GCS_PROPAGATE {
+            if ptr.is_null((*g).gray) {
+                (*g).gcstate = GCS_ENTERATOMIC
+                return 0
+            }
+            return propagate_mark(g)
+        }
+        if st == GCS_ENTERATOMIC {
+            let work = atomic(L)
+            enter_sweep(L)
+            (*g).gc_estimate = (*g).total_bytes
+            return work
+        }
+        if st == GCS_SWPALLGC {
+            return sweep_step(L, GCS_SWPFINOBJ, ptr.offset(g as *mut u8, mem.offset_of::<Global>("finobj") as isize) as *mut *mut GCObject)
+        }
+        if st == GCS_SWPFINOBJ {
+            return sweep_step(L, GCS_SWPTOBEFNZ, ptr.offset(g as *mut u8, mem.offset_of::<Global>("tobefnz") as isize) as *mut *mut GCObject)
+        }
+        if st == GCS_SWPTOBEFNZ {
+            return sweep_step(L, GCS_SWPEND, 0 as *mut *mut GCObject)
+        }
+        if st == GCS_SWPEND {
+            if (*g).gcemergency == 0 {
+                str_table_check_size(L)
+            }
+            // Live memory after freeing this cycle's garbage.
+            (*g).gc_estimate = (*g).total_bytes
+            (*g).gcstate = GCS_CALLFIN
+            return 1
+        }
+        // GCS_CALLFIN
+        if !ptr.is_null((*g).tobefnz) && (*g).gcemergency == 0 {
+            (*g).gcstate = GCS_PAUSE
+            (*g).gc_running_fin = 1
+            let n = call_pending_finalizers(L, GC_FIN_MAX)
+            (*g).gc_running_fin = 0
+            if !ptr.is_null((*g).tobefnz) {
+                (*g).gcstate = GCS_CALLFIN
+            }
+            return (n as isize) * GC_FIN_COST
+        }
+        (*g).gcstate = GCS_PAUSE
+        return 0
+    }
+}
+
+fn run_until_state(L: *mut State, state: u8) {
+    unsafe {
+        let g = G(L)
+        for (*g).gcstate != state {
+            single_step(L)
+        }
+    }
+}
+
+fn set_debt(g: *mut Global, debt0: isize) {
+    unsafe {
+        debt := debt0
+        let tb = (*g).total_bytes
+        if debt < tb - 9223372036854775807 {
+            debt = tb - 9223372036854775807
+        }
+        (*g).gc_debt = debt
+    }
+}
+
+// After a cycle: allow allocating until the heap grows by `gcpause` percent.
+fn set_pause(g: *mut Global) {
+    unsafe {
+        let pause = (*g).gcpause as isize
+        estimate := (*g).gc_estimate / 100
+        if estimate < 1 {
+            estimate = 1
+        }
+        threshold := estimate * pause
+        if pause > 0 && threshold / pause != estimate {
+            threshold = 9223372036854775807
+        }
+        if threshold < (*g).total_bytes / 100 * 101 && pause >= 100 {
+            threshold = (*g).total_bytes / 100 * 101
+        }
+        set_debt(g, (*g).total_bytes - threshold)
+    }
+}
+
+// One incremental step, sized by the allocation debt.
+@cold
+fn gc_step(L: *mut State) {
+    unsafe {
+        let g = G(L)
+        if (*g).gcstp != 0 || (*g).gc_running_fin != 0 {
+            set_debt(g, -2000)
+            return
+        }
+        (*g).gcstp = GCSTP_GC
+        let stepsize = 1isize << ((*g).gcstepsize as isize)
+        stepmul := (*g).gcstepmul as isize
+        if stepmul < 40 {
+            stepmul = 40
+        }
+        debt := (*g).gc_debt
+        if debt < stepsize {
+            debt = stepsize
+        }
+        // Work units are roughly "slots" (16 bytes) traversed or objects
+        // swept; each step pays the debt plus one step size, both scaled by
+        // the step multiplier.
+        let todo = (debt / 16) * stepmul + (stepsize / 16) * stepmul
+        work := 0isize
+        for {
+            work += single_step(L)
+            if (*g).gcstate == GCS_PAUSE || work >= todo {
+                break
+            }
+        }
+        if (*g).gcstate == GCS_PAUSE {
+            set_pause(g)
+        } else {
+            set_debt(g, -stepsize)
+        }
+        if (*g).gckind == GC_KIND_GEN && (*g).gcstate != GCS_PAUSE && stepmul > 0 {
+            // Generational mode is emulated by finishing cycles eagerly.
+            run_until_state(L, GCS_PAUSE)
+            set_pause(g)
+        }
+        (*g).gcstp = 0
+    }
+}
+
+// Collector check point: everything live must be reachable from the roots.
+@inline
+fn gc_check(L: *mut State) {
+    unsafe {
+        let g = G(L)
+        if (*g).gc_debt > 0 {
+            gc_step(L)
+        } else if (*g).gc_stress != 0 {
+            gc_stress_step(L)
+        }
+        (*g).young_mark = (*g).allgc
+    }
+}
+
+// Testing aid (see Lua.set_gc_stress): collector work at a check point that
+// the allocation debt alone would not trigger, to expose missing barriers
+// and anchors. Never used unless an embedder (or the stand-alone
+// interpreter's DODO_LUA_GC_STRESS variable) asks for it.
+fn gc_stress_step(L: *mut State) {
+    unsafe {
+        let g = G(L)
+        if (*g).gcstp != 0 || (*g).gc_running_fin != 0 {
+            return
+        }
+        if (*g).gc_stress >= 2 {
+            gc_full(L, false)
+            return
+        }
+        (*g).gcstp = GCSTP_GC
+        single_step(L)
+        if (*g).gcstate == GCS_PAUSE {
+            set_pause(g)
+        }
+        (*g).gcstp = 0
+    }
+}
+
+// Full collection. Emergency collections never run finalizers.
+fn gc_full(L: *mut State, emergency: bool) {
+    unsafe {
+        let g = G(L)
+        let oldstp = (*g).gcstp
+        (*g).gcstp = GCSTP_GC
+        (*g).gcemergency = if emergency {
+            1u8
+        } else {
+            0u8
+        }
+        if keep_invariant(g) {
+            // Discard the partial marking: sweep everything to white.
+            enter_sweep(L)
+        }
+        run_until_state(L, GCS_PAUSE)
+        run_until_state(L, GCS_CALLFIN)
+        run_until_state(L, GCS_PAUSE)
+        (*g).gcemergency = 0
+        (*g).gcstp = oldstp
+        set_pause(g)
+        if !emergency {
+            (*g).young_mark = (*g).allgc
+        }
+    }
+}
+
+// Called by mem.dodo when the system allocator fails; true if a collection
+// ran (so the allocation should be retried).
+fn gc_emergency(L: *mut State) -> bool {
+    unsafe {
+        let g = G(L)
+        // A user "stop" does not prevent emergency collections.
+        if !G_complete(g) || ((*g).gcstp & ~GCSTP_USR) != 0 || (*g).gcemergency != 0 || (*g).gc_running_fin != 0 {
+            return false
+        }
+        if (*g).gcstate == GCS_ATOMIC {
+            return false
+        }
+        gc_full(L, true)
+        return true
+    }
+}
+
+// Free every object (closing the state): finalizers first.
+fn gc_free_all(L: *mut State) {
+    unsafe {
+        let g = G(L)
+        if G_complete(g) {
+            (*g).gcstp = GCSTP_CLS
+            separate_to_be_finalized(g, true)
+            call_all_pending_finalizers(L)
+        }
+        (*g).gcstp = GCSTP_CLS
+        free_list(L, (*g).allgc)
+        (*g).allgc = 0 as *mut GCObject
+        free_list(L, (*g).finobj)
+        (*g).finobj = 0 as *mut GCObject
+        free_list(L, (*g).tobefnz)
+        (*g).tobefnz = 0 as *mut GCObject
+        free_list(L, (*g).fixedgc)
+        (*g).fixedgc = 0 as *mut GCObject
+    }
+}
+
+fn free_list(L: *mut State, list: *mut GCObject) {
+    unsafe {
+        let mainth = (*G(L)).mainthread as *mut GCObject
+        o := list
+        for !ptr.is_null(o) {
+            let nxt = (*o).next
+            if o != mainth {
+                free_object(L, o)
+            }
+            o = nxt
+        }
+    }
+}
+
+// collectgarbage("step") semantics: returns true at the end of a cycle.
+fn gc_user_step(L: *mut State, kb: i64) -> bool {
+    unsafe {
+        let g = G(L)
+        let oldstp = (*g).gcstp
+        (*g).gcstp = 0
+        didstep := true
+        if kb == 0 {
+            set_debt(g, 0)
+            gc_step(L)
+        } else {
+            let add = if kb > 9007199254740991 / 1024 {
+                9007199254740991isize
+            } else {
+                (kb as isize) * 1024
+            }
+            let debt = add + (*g).gc_debt
+            set_debt(g, debt)
+            didstep = debt > 0
+            gc_check(L)
+        }
+        (*g).gcstp = oldstp
+        return didstep && (*g).gcstate == GCS_PAUSE
+    }
+}

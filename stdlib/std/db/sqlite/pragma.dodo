@@ -1,0 +1,690 @@
+package sqlite
+
+import "std/db"
+
+// PRAGMA statements. Result rows are materialized as records on the sort
+// stack and stepped like a sorted result.
+
+const P_NONE: usize = 0
+const P_USER_VERSION: usize = 1
+const P_APP_ID: usize = 2
+const P_SCHEMA_VERSION: usize = 3
+const P_PAGE_SIZE: usize = 4
+const P_PAGE_COUNT: usize = 5
+const P_FREELIST_COUNT: usize = 6
+const P_ENCODING: usize = 7
+const P_JOURNAL_MODE: usize = 8
+const P_FOREIGN_KEYS: usize = 9
+const P_TABLE_INFO: usize = 10
+const P_INDEX_LIST: usize = 11
+const P_INDEX_INFO: usize = 12
+const P_INTEGRITY_CHECK: usize = 13
+const P_SYNCHRONOUS: usize = 14
+const P_CACHE_SIZE: usize = 15
+const P_BUSY_TIMEOUT: usize = 16
+const P_AUTO_VACUUM: usize = 17
+const P_DATABASE_LIST: usize = 18
+const P_TABLE_LIST: usize = 19
+const P_IGNORED: usize = 20
+
+fn pragma_id(e: &Engine, o: usize, l: usize) -> usize {
+    if name_is(e, o, l, "user_version") {
+        return P_USER_VERSION
+    }
+    if name_is(e, o, l, "application_id") {
+        return P_APP_ID
+    }
+    if name_is(e, o, l, "schema_version") {
+        return P_SCHEMA_VERSION
+    }
+    if name_is(e, o, l, "page_size") {
+        return P_PAGE_SIZE
+    }
+    if name_is(e, o, l, "page_count") {
+        return P_PAGE_COUNT
+    }
+    if name_is(e, o, l, "freelist_count") {
+        return P_FREELIST_COUNT
+    }
+    if name_is(e, o, l, "encoding") {
+        return P_ENCODING
+    }
+    if name_is(e, o, l, "journal_mode") {
+        return P_JOURNAL_MODE
+    }
+    if name_is(e, o, l, "foreign_keys") {
+        return P_FOREIGN_KEYS
+    }
+    if name_is(e, o, l, "table_info") || name_is(e, o, l, "table_xinfo") {
+        return P_TABLE_INFO
+    }
+    if name_is(e, o, l, "index_list") {
+        return P_INDEX_LIST
+    }
+    if name_is(e, o, l, "index_info") {
+        return P_INDEX_INFO
+    }
+    if name_is(e, o, l, "integrity_check") || name_is(e, o, l, "quick_check") {
+        return P_INTEGRITY_CHECK
+    }
+    if name_is(e, o, l, "synchronous") {
+        return P_SYNCHRONOUS
+    }
+    if name_is(e, o, l, "cache_size") {
+        return P_CACHE_SIZE
+    }
+    if name_is(e, o, l, "busy_timeout") {
+        return P_BUSY_TIMEOUT
+    }
+    if name_is(e, o, l, "auto_vacuum") {
+        return P_AUTO_VACUUM
+    }
+    if name_is(e, o, l, "database_list") {
+        return P_DATABASE_LIST
+    }
+    if name_is(e, o, l, "table_list") {
+        return P_TABLE_LIST
+    }
+    P_IGNORED
+}
+
+fn pragma_columns(id: usize) -> usize {
+    if id == P_TABLE_INFO {
+        return 6
+    }
+    if id == P_INDEX_LIST {
+        return 5
+    }
+    if id == P_INDEX_INFO || id == P_DATABASE_LIST {
+        return 3
+    }
+    if id == P_TABLE_LIST {
+        return 6
+    }
+    if id == P_IGNORED {
+        return 0
+    }
+    1
+}
+
+fn pragma_column_name(id: usize, i: usize) -> &str from(static) {
+    if id == P_TABLE_INFO {
+        names := ["cid", "name", "type", "notnull", "dflt_value", "pk"]
+        return names[i]
+    }
+    if id == P_INDEX_LIST {
+        names := ["seq", "name", "unique", "origin", "partial"]
+        return names[i]
+    }
+    if id == P_INDEX_INFO {
+        names := ["seqno", "cid", "name"]
+        return names[i]
+    }
+    if id == P_DATABASE_LIST {
+        names := ["seq", "name", "file"]
+        return names[i]
+    }
+    if id == P_TABLE_LIST {
+        names := ["schema", "name", "type", "ncol", "wr", "strict"]
+        return names[i]
+    }
+    if id == P_USER_VERSION {
+        return "user_version"
+    }
+    if id == P_APP_ID {
+        return "application_id"
+    }
+    if id == P_SCHEMA_VERSION {
+        return "schema_version"
+    }
+    if id == P_PAGE_SIZE {
+        return "page_size"
+    }
+    if id == P_PAGE_COUNT {
+        return "page_count"
+    }
+    if id == P_FREELIST_COUNT {
+        return "freelist_count"
+    }
+    if id == P_ENCODING {
+        return "encoding"
+    }
+    if id == P_JOURNAL_MODE {
+        return "journal_mode"
+    }
+    if id == P_FOREIGN_KEYS {
+        return "foreign_keys"
+    }
+    if id == P_INTEGRITY_CHECK {
+        return "integrity_check"
+    }
+    if id == P_SYNCHRONOUS {
+        return "synchronous"
+    }
+    if id == P_CACHE_SIZE {
+        return "cache_size"
+    }
+    if id == P_BUSY_TIMEOUT {
+        return "timeout"
+    }
+    if id == P_AUTO_VACUUM {
+        return "auto_vacuum"
+    }
+    ""
+}
+
+// True when the pragma modifies the database (needs a write transaction).
+fn pragma_writes(e: &Engine, s: usize) -> bool {
+    let s_a = na(e, s)
+    let s_b = nb(e, s)
+    id := pragma_id(e, s_a, s_b)
+    nflags(e, s) == 1 && (id == P_USER_VERSION || id == P_APP_ID)
+}
+
+fn pragma_int_arg(e: &mut Engine, s: usize) -> i64!db.Error {
+    v := nc(e, s)
+    save := e.rtop
+    r := reg_push(e)?
+    eval(e, v, r)?
+    x := 0i64
+    if rtype(e, r) == T_TEXT {
+        to := roff(e, r)
+        tl := rlen(e, r)
+        if name_is(e, to, tl, "on") || name_is(e, to, tl, "true") || name_is(e, to, tl, "yes") || name_is(e, to, tl, "full") || name_is(e, to, tl, "normal") {
+            x = 1
+        } else {
+            x = to_int(e, r)
+        }
+    } else {
+        x = to_int(e, r)
+    }
+    e.rtop = save
+    ok(x)
+}
+
+// Pushes one row; registers r..r+n hold the values.
+fn prow(e: &mut Engine, r: usize, n: usize) -> void!db.Error {
+    sort_push(e, r, n)?
+    ok()
+}
+
+// Runs the pragma; returns (records start) and leaves records on the stack.
+fn exec_pragma(e: &mut Engine, s: usize, resreg: usize) -> void!db.Error {
+    let s_a = na(e, s)
+    let s_b = nb(e, s)
+    id := pragma_id(e, s_a, s_b)
+    set := nflags(e, s) == 1
+    arg := nflags(e, s) != 0
+    r := resreg
+    if id == P_USER_VERSION || id == P_APP_ID {
+        off := if id == P_USER_VERSION {
+            60usize
+        } else {
+            68usize
+        }
+        if set {
+            v := pragma_int_arg(e, s)?
+            hdr_set(e, off, (i2u(v) & 0xffffffffu64) as u32)?
+            return ok()
+        }
+        v := hdr_get(e, off)?
+        set_int(e, r, u2i(v as u64) - if v >= 2147483648 {
+            4294967296i64
+        } else {
+            0i64
+        })
+        return prow(e, r, 1)
+    }
+    if id == P_SCHEMA_VERSION {
+        v := hdr_get(e, 40)?
+        set_int(e, r, v as i64)
+        return prow(e, r, 1)
+    }
+    if id == P_PAGE_SIZE {
+        if set {
+            v := pragma_int_arg(e, s)?
+            if e.db_pages == 0 && v >= 512 && v <= 65536 && (v & (v - 1)) == 0 {
+                e.page_size = v as usize
+                layout(e)?
+                cache_clear(e)
+            }
+            return ok()
+        }
+        let value = e.page_size as i64
+        set_int(e, r, value)
+        return prow(e, r, 1)
+    }
+    if id == P_PAGE_COUNT {
+        let value2 = e.db_pages as i64
+        set_int(e, r, value2)
+        return prow(e, r, 1)
+    }
+    if id == P_FREELIST_COUNT {
+        v := hdr_get(e, 36)?
+        set_int(e, r, v as i64)
+        return prow(e, r, 1)
+    }
+    if id == P_ENCODING {
+        set_text_str(e, r, "UTF-8")?
+        return prow(e, r, 1)
+    }
+    if id == P_JOURNAL_MODE {
+        let value3 = if e.memory {
+            "memory"
+        } else {
+            "delete"
+        }
+        set_text_str(e, r, value3)?
+        return prow(e, r, 1)
+    }
+    if id == P_FOREIGN_KEYS || id == P_AUTO_VACUUM {
+        if set {
+            return ok()
+        }
+        set_int(e, r, 0)
+        return prow(e, r, 1)
+    }
+    if id == P_SYNCHRONOUS {
+        if set {
+            return ok()
+        }
+        set_int(e, r, 2)
+        return prow(e, r, 1)
+    }
+    if id == P_CACHE_SIZE {
+        if set {
+            return ok()
+        }
+        let value4 = -((e.nslots * e.page_size / 1024) as i64)
+        set_int(e, r, value4)
+        return prow(e, r, 1)
+    }
+    if id == P_BUSY_TIMEOUT {
+        if set {
+            v := pragma_int_arg(e, s)?
+            e.busy_retries = if v <= 0 {
+                0u32
+            } else if v > 100000 {
+                100000u32
+            } else {
+                v as u32
+            }
+        }
+        let value5 = e.busy_retries as i64
+        set_int(e, r, value5)
+        return prow(e, r, 1)
+    }
+    if id == P_DATABASE_LIST {
+        set_int(e, r, 0)
+        set_text_str(e, r + 1, "main")?
+        if e.memory {
+            set_text_str(e, r + 2, "")?
+        } else {
+            let path_len2 = e.path_len
+            set_bytes(e, r + 2, T_TEXT, 0, path_len2)
+        }
+        return prow(e, r, 3)
+    }
+    if id == P_TABLE_INFO || id == P_INDEX_LIST || id == P_INDEX_INFO {
+        if !arg {
+            return ok()
+        }
+        v := nc(e, s)
+        name := na(e, v)
+        nl := nb(e, v)
+        if id == P_INDEX_INFO {
+            x := find_obj(e, OT_INDEX, name, nl)
+            if x == NO_COL {
+                return ok()
+            }
+            t := obj_u(e, x, O_TABLE)
+            for k in 0usize..obj_ncol(e, x) {
+                c := idx_col(e, x, k)
+                set_int(e, r, k as i64)
+                if c == NO_COL {
+                    set_int(e, r + 1, -1)
+                    set_null(e, r + 2)
+                } else {
+                    set_int(e, r + 1, c as i64)
+                    cr := col_rec(e, t, c)
+                    let name2 = ldu(e.ws, cr + K_NAME)
+                    let name_len = ldu(e.ws, cr + K_NAMEL)
+                    set_bytes(e, r + 2, T_TEXT, name2, name_len)
+                }
+                prow(e, r, 3)?
+            }
+            return ok()
+        }
+        t := find_obj(e, OT_TABLE, name, nl)
+        if t == NO_COL {
+            return ok()
+        }
+        if id == P_TABLE_INFO {
+            pkpos := 0i64
+            for c in 0usize..obj_ncol(e, t) {
+                cr := col_rec(e, t, c)
+                set_int(e, r, c as i64)
+                let name3 = ldu(e.ws, cr + K_NAME)
+                let name_len2 = ldu(e.ws, cr + K_NAMEL)
+                set_bytes(e, r + 1, T_TEXT, name3, name_len2)
+                to := ldu(e.ws, cr + K_TYPE)
+                tl := ldu(e.ws, cr + K_TYPEL)
+                if name_is(e, to, tl, "INT") || name_is(e, to, tl, "INTEGER") || name_is(e, to, tl, "REAL") || name_is(e, to, tl, "TEXT") || name_is(e, to, tl, "BLOB") || name_is(e, to, tl, "ANY") {
+                    // Standard type names are reported in upper case.
+                    u := arena_alloc(e, tl)?
+                    for i in 0usize..tl {
+                        b := e.ws[to + i]
+                        e.ws[u + i] = if b >= 97 && b <= 122 {
+                            b - 32
+                        } else {
+                            b
+                        }
+                    }
+                    set_bytes(e, r + 2, T_TEXT, u, tl)
+                } else {
+                    set_bytes(e, r + 2, T_TEXT, to, tl)
+                }
+                flags := e.ws[cr + K_FLAGS] as usize
+                set_int(e, r + 3, if (flags & CF_NOTNULL) != 0 {
+                    1i64
+                } else {
+                    0i64
+                })
+                if e.ws[cr + K_HASDFLT] != 0 {
+                    let default = ldu(e.ws, cr + K_DFLT)
+                    let default_len = ldu(e.ws, cr + K_DFLTL)
+                    set_bytes(e, r + 4, T_TEXT, default, default_len)
+                } else {
+                    set_null(e, r + 4)
+                }
+                if (flags & CF_PK) != 0 {
+                    pkpos += 1
+                    let pk_position2 = pk_position(e, t, c)
+                    set_int(e, r + 5, pk_position2)
+                } else {
+                    set_int(e, r + 5, 0)
+                }
+                prow(e, r, 6)?
+            }
+            return ok()
+        }
+        // index_list: newest first, like SQLite.
+        k := 0i64
+        j := e.schema_objs
+        for j > 0 {
+            j -= 1
+            if obj_type(e, j) != OT_INDEX || obj_u(e, j, O_TABLE) != t {
+                continue
+            }
+            set_int(e, r, k)
+            let name4 = obj_u(e, j, O_NAME)
+            let name_len3 = obj_u(e, j, O_NAMEL)
+            set_bytes(e, r + 1, T_TEXT, name4, name_len3)
+            let value6 = if (obj_flags(e, j) & OF_UNIQUE) != 0 {
+                1i64
+            } else {
+                0i64
+            }
+            set_int(e, r + 2, value6)
+            origin := if (obj_flags(e, j) & OF_PK) != 0 {
+                "pk"
+            } else if (obj_flags(e, j) & OF_AUTO) != 0 {
+                "u"
+            } else {
+                "c"
+            }
+            set_text_str(e, r + 3, origin)?
+            set_int(e, r + 4, 0)
+            prow(e, r, 5)?
+            k += 1
+        }
+        return ok()
+    }
+    if id == P_TABLE_LIST {
+        for j in 0usize..e.schema_objs {
+            if obj_type(e, j) != OT_TABLE {
+                continue
+            }
+            set_text_str(e, r, "main")?
+            let name5 = obj_u(e, j, O_NAME)
+            let name_len4 = obj_u(e, j, O_NAMEL)
+            set_bytes(e, r + 1, T_TEXT, name5, name_len4)
+            set_text_str(e, r + 2, "table")?
+            let ncols = obj_ncol(e, j) as i64
+            set_int(e, r + 3, ncols)
+            set_int(e, r + 4, 0)
+            set_int(e, r + 5, 0)
+            prow(e, r, 6)?
+        }
+        return ok()
+    }
+    if id == P_INTEGRITY_CHECK {
+        return integrity_check(e, r)
+    }
+    ok()
+}
+
+// 1-based position of column c in the table's primary key.
+fn pk_position(e: &Engine, t: usize, c: usize) -> i64 {
+    // Use the order of the PRIMARY KEY autoindex when there is one.
+    for j in 0usize..e.schema_objs {
+        if obj_type(e, j) == OT_INDEX && obj_u(e, j, O_TABLE) == t && (obj_flags(e, j) & OF_PK) != 0 {
+            for k in 0usize..obj_ncol(e, j) {
+                if idx_col(e, j, k) == c {
+                    return (k + 1) as i64
+                }
+            }
+        }
+    }
+    1
+}
+
+// ---------------------------------------------------------------------------
+// integrity_check: page accounting, cell bounds, key order, uniform depth,
+// freelist, and index entry counts.
+
+fn ic_msg(e: &mut Engine, r: usize, text: &str, pgno: u32, count: &mut usize) -> void!db.Error {
+    if *count >= 100 {
+        return ok()
+    }
+    e.msg_len = 0
+    if pgno != 0 {
+        msg_add(e, "Page ")
+        msg_add_int(e, pgno as i64)
+        msg_add(e, ": ")
+    }
+    msg_add(e, text)
+    let msg_len2 = e.msg_len
+    o := arena_alloc(e, msg_len2)?
+    let msg_len3 = e.msg_len
+    move_bytes(e.ws, PATH_CAP, o, msg_len3)
+    let msg_len4 = e.msg_len
+    set_bytes(e, r, T_TEXT, o, msg_len4)
+    e.msg_len = 0
+    *count += 1
+    prow(e, r, 1)
+}
+
+fn ic_mark(e: &mut Engine, map: usize, pgno: u32, r: usize, count: &mut usize) -> bool!db.Error {
+    if pgno == 0 || pgno > e.db_pages {
+        ic_msg(e, r, "invalid page number", pgno, count)?
+        return ok(false)
+    }
+    o := map + (pgno as usize) / 8
+    bit := 1u8 << ((pgno % 8) as u8)
+    if (e.ws[o] & bit) != 0 {
+        ic_msg(e, r, "page referenced more than once", pgno, count)?
+        return ok(false)
+    }
+    e.ws[o] = e.ws[o] | bit
+    ok(true)
+}
+
+// Checks a b-tree; returns (entries, depth).
+fn ic_tree(e: &mut Engine, map: usize, pgno: u32, r: usize, count: &mut usize, level: usize) -> (u64, usize)!db.Error {
+    if level > MAX_DEPTH {
+        ic_msg(e, r, "tree too deep", pgno, count)?
+        return ok((0u64, 0usize))
+    }
+    if !ic_mark(e, map, pgno, r, count)? {
+        return ok((0u64, 0usize))
+    }
+    d := pg_fetch(e, pgno)?
+    ho := hoff(pgno)
+    t := e.ws[d + ho]
+    if t != 2 && t != 5 && t != 10 && t != 13 {
+        ic_msg(e, r, "invalid page type", pgno, count)?
+        return ok((0u64, 0usize))
+    }
+    n := pg_ncells(e, d, ho)
+    hs := hdr_size(t)
+    if ho + hs + 2 * n > e.usable {
+        ic_msg(e, r, "too many cells", pgno, count)?
+        return ok((0u64, 0usize))
+    }
+    total := 0u64
+    depth_seen := NO_COL
+    prev_key := -9223372036854775807i64 - 1
+    for i in 0usize..n {
+        d2 := pg_fetch(e, pgno)?
+        cell := cell_at(e, d2, ho, t, i)
+        if cell < d2 + ho + hs + 2 * n || cell >= d2 + e.usable {
+            ic_msg(e, r, "cell pointer out of range", pgno, count)?
+            continue
+        }
+        if cell + cell_size(e, cell, t) > d2 + e.usable {
+            ic_msg(e, r, "cell extends past the page", pgno, count)?
+            continue
+        }
+        if t == 13 || t == 5 {
+            let (_, _, _, key) = cell_info(e, cell, t)
+            if i > 0 && key <= prev_key {
+                ic_msg(e, r, "rowids out of order", pgno, count)?
+            }
+            prev_key = key
+        }
+        if t != 5 {
+            // Overflow chain.
+            let (size, off, local, _) = cell_info(e, cell, t)
+            if (local as u64) < size {
+                next := rd32(e.ws, cell + off + local)
+                need := ((size - (local as u64)) + ((e.usable - 4) as u64) - 1) / ((e.usable - 4) as u64)
+                for _ in 0u64..need {
+                    if !ic_mark(e, map, next, r, count)? {
+                        break
+                    }
+                    od := pg_fetch(e, next)?
+                    next = rd32(e.ws, od)
+                }
+            }
+            total += 1
+        }
+        if !is_leaf(t) {
+            d3 := pg_fetch(e, pgno)?
+            child := rd32(e.ws, cell_at(e, d3, ho, t, i))
+            let (cn, cd) = ic_tree(e, map, child, r, count, level + 1)?
+            total += cn
+            if depth_seen == NO_COL {
+                depth_seen = cd
+            } else if cd != depth_seen {
+                ic_msg(e, r, "child page depth differs", pgno, count)?
+            }
+        }
+    }
+    if !is_leaf(t) {
+        d4 := pg_fetch(e, pgno)?
+        right := rd32(e.ws, d4 + ho + 8)
+        let (cn, cd) = ic_tree(e, map, right, r, count, level + 1)?
+        total += cn
+        if depth_seen != NO_COL && cd != depth_seen {
+            ic_msg(e, r, "child page depth differs", pgno, count)?
+        }
+        depth_seen = cd
+        return ok((total, depth_seen + 1))
+    }
+    ok((total, 1usize))
+}
+
+fn integrity_check(e: &mut Engine, r: usize) -> void!db.Error {
+    count := 0usize
+    if e.db_pages == 0 {
+        set_text_str(e, r, "ok")?
+        return prow(e, r, 1)
+    }
+    bytes := (e.db_pages as usize) / 8 + 1
+    // The page map lives in the arena; result records go on the sort stack.
+    map := arena_alloc(e, bytes)?
+    zero_bytes(e.ws, map, bytes)
+    // The pending-byte page is never used.
+    pp := pending_page(e)
+    if pp <= e.db_pages {
+        o := map + (pp as usize) / 8
+        e.ws[o] = e.ws[o] | (1u8 << ((pp % 8) as u8))
+    }
+    // Freelist.
+    trunk := hdr_get(e, 32)?
+    free_total := hdr_get(e, 36)?
+    seen := 0u32
+    guard := 0u32
+    for trunk != 0 && guard < e.db_pages {
+        if !ic_mark(e, map, trunk, r, &mut count)? {
+            break
+        }
+        seen += 1
+        d := pg_fetch(e, trunk)?
+        leaves := rd32(e.ws, d + 4)
+        if (leaves as usize) > e.usable / 4 - 2 {
+            ic_msg(e, r, "freelist trunk has too many leaves", trunk, &mut count)?
+            break
+        }
+        for k in 0u32..leaves {
+            d2 := pg_fetch(e, trunk)?
+            leaf := rd32(e.ws, d2 + 8 + (k as usize) * 4)
+            ic_mark(e, map, leaf, r, &mut count)?
+            seen += 1
+        }
+        d3 := pg_fetch(e, trunk)?
+        trunk = rd32(e.ws, d3)
+        guard += 1
+    }
+    if seen != free_total {
+        e.msg_len = 0
+        ic_msg(e, r, "freelist count does not match the header", 0, &mut count)?
+    }
+    // Every b-tree, starting with sqlite_schema.
+    let (_, _) = ic_tree(e, map, 1, r, &mut count, 0)?
+    for i in 0usize..e.schema_objs {
+        root := obj_root(e, i)
+        if root <= 1 {
+            continue
+        }
+        k := obj_type(e, i)
+        if k != OT_TABLE && k != OT_INDEX {
+            continue
+        }
+        let (n, _) = ic_tree(e, map, root, r, &mut count, 0)?
+        if k == OT_INDEX {
+            t := obj_u(e, i, O_TABLE)
+            if t != NO_COL {
+                let root2 = obj_root(e, t)
+                rows := btree_count(e, root2, MAX_DEPTH)?
+                if rows != n {
+                    e.msg_len = 0
+                    ic_msg(e, r, "wrong # of entries in index", root, &mut count)?
+                }
+            }
+        }
+    }
+    // Pages never referenced.
+    for p in 1u32..(e.db_pages + 1) {
+        o := map + (p as usize) / 8
+        if (e.ws[o] & (1u8 << ((p % 8) as u8))) == 0 {
+            ic_msg(e, r, "never used", p, &mut count)?
+        }
+    }
+    if count == 0 {
+        set_text_str(e, r, "ok")?
+        prow(e, r, 1)?
+    }
+    ok()
+}

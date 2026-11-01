@@ -110,6 +110,7 @@ struct Modifiers {
     // `@link_name("symbol")`: the C symbol an extern declaration binds.
     link_name: Option<String>,
     placement: Placement,
+    inlining: Inlining,
     // `async fn`: a function whose body may `await`; see std/embedded/executor.
     async_: bool,
 }
@@ -358,6 +359,9 @@ impl Parser {
         }
         if mods.link_name.is_some() && !self.at("fn") {
             return Err(self.error("@link_name applies only to extern \"C\" functions"));
+        }
+        if mods.inlining != Inlining::Auto && !self.at("fn") {
+            return Err(self.error("@inline and @cold apply only to functions"));
         }
         if !mods.placement.is_empty() && !self.at("fn") && !self.at("static") && !self.at("const") {
             return Err(self.error("@section and @align apply only to functions and statics"));
@@ -625,6 +629,26 @@ impl Parser {
                     self.newlines();
                     continue;
                 }
+                if name == "inline" || name == "cold" {
+                    if mods.inlining != Inlining::Auto {
+                        return Err(self.error(
+                            "duplicate inlining attribute; use one of @inline, @inline(never), or @cold",
+                        ));
+                    }
+                    mods.inlining = if name == "cold" {
+                        Inlining::Cold
+                    } else if self.eat("(") {
+                        if self.identifier().ok().as_deref() != Some("never") {
+                            return Err(self.error("expected @inline or @inline(never)"));
+                        }
+                        self.expect(")")?;
+                        Inlining::Never
+                    } else {
+                        Inlining::Always
+                    };
+                    self.newlines();
+                    continue;
+                }
                 if name == "section" {
                     if mods.placement.section.is_some() {
                         return Err(self.error("duplicate @section attribute"));
@@ -721,7 +745,7 @@ impl Parser {
                 }
                 if name != "repr" {
                     return Err(self.error(format!(
-                        "unknown attribute `@{name}`; supported: @repr(C), @unsafe_send, @unsafe_sync, @test, @ignore(\"reason\"), @derive(Json), @json_name(\"name\"), @json_deny_unknown, @interrupt(VECTOR), @link_name(\"symbol\"), @section(\"name\"), @align(N)"
+                        "unknown attribute `@{name}`; supported: @repr(C), @unsafe_send, @unsafe_sync, @test, @ignore(\"reason\"), @derive(Json), @json_name(\"name\"), @json_deny_unknown, @interrupt(VECTOR), @link_name(\"symbol\"), @section(\"name\"), @align(N), @inline, @inline(never), @cold"
                     )));
                 }
                 if mods.repr_c {
@@ -1225,6 +1249,9 @@ impl Parser {
             if field_mods.interrupt.is_some() {
                 return Err(self.error("@interrupt applies only to top-level functions"));
             }
+            if field_mods.inlining != Inlining::Auto && !self.at("fn") {
+                return Err(self.error("@inline and @cold apply only to functions"));
+            }
             if field_mods.async_ && !self.at("fn") {
                 return Err(self.error("`async` applies only to functions"));
             }
@@ -1542,6 +1569,12 @@ impl Parser {
                 "@interrupt requires a private, safe, non-generic fn name() with a body and no result; the hardware calls it, so it takes no arguments, and code cannot call it",
             ));
         }
+        if mods.inlining != Inlining::Auto && body.is_none() {
+            return Err(Diagnostic::new(
+                self.since(start),
+                "@inline and @cold apply only to functions with a body",
+            ));
+        }
         if mods.link_name.is_some() && (!mods.extern_ || body.is_some()) {
             return Err(Diagnostic::new(
                 self.since(start),
@@ -1587,6 +1620,7 @@ impl Parser {
             interrupt: mods.interrupt,
             link_name: mods.link_name,
             placement: mods.placement,
+            inlining: mods.inlining,
             async_part: mods.async_.then_some(AsyncPart::Body),
         })
     }

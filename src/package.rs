@@ -580,6 +580,7 @@ impl Loader<'_> {
                 | "gpu/opengl"
                 | "gpu/hal"
                 | "dylib"
+                | "script"
         ) || !matches!(selector, "native" | "posix" | "linux" | "macos" | "windows")
         {
             return Ok(import.to_owned());

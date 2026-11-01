@@ -1,0 +1,1 @@
+local a <close> = nil; a = 1

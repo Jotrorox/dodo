@@ -1,0 +1,228 @@
+package lua
+
+// Instruction encoding: the Lua 5.4 virtual machine instruction set and
+// layout, so binary chunks produced by `luac` 5.4 load unchanged.
+//
+// 32-bit instructions, low bits first:
+//   iABC:  op:7 | A:8 | k:1 | B:8 | C:8
+//   iABx:  op:7 | A:8 | Bx:17
+//   iAsBx: op:7 | A:8 | sBx:17   (Bx minus OFFSET_SBX)
+//   iAx:   op:7 | Ax:25
+//   isJ:   op:7 | sJ:25          (Ax minus OFFSET_SJ)
+// Signed B/C operands of the immediate forms (sB, sC) are stored with an
+// offset of OFFSET_SC. See DESIGN.md for the semantics of every opcode.
+
+const SIZE_OP: u32 = 7
+const SIZE_A: u32 = 8
+const SIZE_B: u32 = 8
+const SIZE_C: u32 = 8
+const SIZE_BX: u32 = 17
+const SIZE_AX: u32 = 25
+const POS_A: u32 = 7
+const POS_K: u32 = 15
+const POS_B: u32 = 16
+const POS_C: u32 = 24
+const POS_BX: u32 = 15
+const POS_AX: u32 = 7
+
+const MAXARG_A: i32 = 255
+const MAXARG_B: i32 = 255
+const MAXARG_C: i32 = 255
+const MAXARG_BX: i32 = 131071
+const MAXARG_AX: i32 = 33554431
+const OFFSET_SBX: i32 = 65535
+const OFFSET_SJ: i32 = 16777215
+const OFFSET_SC: i32 = 127
+// Registers addressable by an instruction (A is 8 bits).
+const MAX_REGS: i32 = 255
+// Fields flushed per SETLIST batch by the compiler.
+const FIELDS_PER_FLUSH: i32 = 50
+
+const OP_MOVE: u32 = 0
+const OP_LOADI: u32 = 1
+const OP_LOADF: u32 = 2
+const OP_LOADK: u32 = 3
+const OP_LOADKX: u32 = 4
+const OP_LOADFALSE: u32 = 5
+const OP_LFALSESKIP: u32 = 6
+const OP_LOADTRUE: u32 = 7
+const OP_LOADNIL: u32 = 8
+const OP_GETUPVAL: u32 = 9
+const OP_SETUPVAL: u32 = 10
+const OP_GETTABUP: u32 = 11
+const OP_GETTABLE: u32 = 12
+const OP_GETI: u32 = 13
+const OP_GETFIELD: u32 = 14
+const OP_SETTABUP: u32 = 15
+const OP_SETTABLE: u32 = 16
+const OP_SETI: u32 = 17
+const OP_SETFIELD: u32 = 18
+const OP_NEWTABLE: u32 = 19
+const OP_SELF: u32 = 20
+const OP_ADDI: u32 = 21
+const OP_ADDK: u32 = 22
+const OP_SUBK: u32 = 23
+const OP_MULK: u32 = 24
+const OP_MODK: u32 = 25
+const OP_POWK: u32 = 26
+const OP_DIVK: u32 = 27
+const OP_IDIVK: u32 = 28
+const OP_BANDK: u32 = 29
+const OP_BORK: u32 = 30
+const OP_BXORK: u32 = 31
+const OP_SHRI: u32 = 32
+const OP_SHLI: u32 = 33
+const OP_ADD: u32 = 34
+const OP_SUB: u32 = 35
+const OP_MUL: u32 = 36
+const OP_MOD: u32 = 37
+const OP_POW: u32 = 38
+const OP_DIV: u32 = 39
+const OP_IDIV: u32 = 40
+const OP_BAND: u32 = 41
+const OP_BOR: u32 = 42
+const OP_BXOR: u32 = 43
+const OP_SHL: u32 = 44
+const OP_SHR: u32 = 45
+const OP_MMBIN: u32 = 46
+const OP_MMBINI: u32 = 47
+const OP_MMBINK: u32 = 48
+const OP_UNM: u32 = 49
+const OP_BNOT: u32 = 50
+const OP_NOT: u32 = 51
+const OP_LEN: u32 = 52
+const OP_CONCAT: u32 = 53
+const OP_CLOSE: u32 = 54
+const OP_TBC: u32 = 55
+const OP_JMP: u32 = 56
+const OP_EQ: u32 = 57
+const OP_LT: u32 = 58
+const OP_LE: u32 = 59
+const OP_EQK: u32 = 60
+const OP_EQI: u32 = 61
+const OP_LTI: u32 = 62
+const OP_LEI: u32 = 63
+const OP_GTI: u32 = 64
+const OP_GEI: u32 = 65
+const OP_TEST: u32 = 66
+const OP_TESTSET: u32 = 67
+const OP_CALL: u32 = 68
+const OP_TAILCALL: u32 = 69
+const OP_RETURN: u32 = 70
+const OP_RETURN0: u32 = 71
+const OP_RETURN1: u32 = 72
+const OP_FORLOOP: u32 = 73
+const OP_FORPREP: u32 = 74
+const OP_TFORPREP: u32 = 75
+const OP_TFORCALL: u32 = 76
+const OP_TFORLOOP: u32 = 77
+const OP_SETLIST: u32 = 78
+const OP_CLOSURE: u32 = 79
+const OP_VARARG: u32 = 80
+const OP_VARARGPREP: u32 = 81
+const OP_EXTRAARG: u32 = 82
+const NUM_OPCODES: u32 = 83
+
+// Tag-method events in the order the MMBIN* instructions encode them in C
+// (and the order of `TM_*` names in DESIGN.md).
+const TM_INDEX: u32 = 0
+const TM_NEWINDEX: u32 = 1
+const TM_GC: u32 = 2
+const TM_MODE: u32 = 3
+const TM_LEN: u32 = 4
+const TM_EQ: u32 = 5
+const TM_ADD: u32 = 6
+const TM_SUB: u32 = 7
+const TM_MUL: u32 = 8
+const TM_MOD: u32 = 9
+const TM_POW: u32 = 10
+const TM_DIV: u32 = 11
+const TM_IDIV: u32 = 12
+const TM_BAND: u32 = 13
+const TM_BOR: u32 = 14
+const TM_BXOR: u32 = 15
+const TM_SHL: u32 = 16
+const TM_SHR: u32 = 17
+const TM_UNM: u32 = 18
+const TM_BNOT: u32 = 19
+const TM_LT: u32 = 20
+const TM_LE: u32 = 21
+const TM_CONCAT: u32 = 22
+const TM_CALL: u32 = 23
+const TM_CLOSE: u32 = 24
+const TM_N: u32 = 25
+
+fn op_code(i: u32) -> u32 {
+    return i & 127
+}
+fn arg_a(i: u32) -> i32 {
+    return ((i >> POS_A) & 255) as i32
+}
+fn arg_b(i: u32) -> i32 {
+    return ((i >> POS_B) & 255) as i32
+}
+fn arg_c(i: u32) -> i32 {
+    return (i >> POS_C) as i32
+}
+fn arg_k(i: u32) -> bool {
+    return ((i >> POS_K) & 1) != 0
+}
+fn arg_sb(i: u32) -> i32 {
+    return arg_b(i) - OFFSET_SC
+}
+fn arg_sc(i: u32) -> i32 {
+    return arg_c(i) - OFFSET_SC
+}
+fn arg_bx(i: u32) -> i32 {
+    return (i >> POS_BX) as i32
+}
+fn arg_sbx(i: u32) -> i32 {
+    return arg_bx(i) - OFFSET_SBX
+}
+fn arg_ax(i: u32) -> i32 {
+    return (i >> POS_AX) as i32
+}
+fn arg_sj(i: u32) -> i32 {
+    return arg_ax(i) - OFFSET_SJ
+}
+
+fn encode_abc(op: u32, a: i32, b: i32, c: i32, k: bool) -> u32 {
+    kbit := 0u32
+    if k {
+        kbit = 1
+    }
+    return op | ((a as u32) << POS_A) | (kbit << POS_K) | ((b as u32) << POS_B) | ((c as u32) << POS_C)
+}
+fn encode_abx(op: u32, a: i32, bx: i32) -> u32 {
+    return op | ((a as u32) << POS_A) | ((bx as u32) << POS_BX)
+}
+fn encode_asbx(op: u32, a: i32, sbx: i32) -> u32 {
+    return encode_abx(op, a, sbx + OFFSET_SBX)
+}
+fn encode_ax(op: u32, ax: i32) -> u32 {
+    return op | ((ax as u32) << POS_AX)
+}
+fn encode_sj(op: u32, sj: i32) -> u32 {
+    return op | (((sj + OFFSET_SJ) as u32) << POS_AX)
+}
+fn set_arg_a(i: u32, a: i32) -> u32 {
+    return (i & ~(255u32 << POS_A)) | ((a as u32) << POS_A)
+}
+fn set_arg_b(i: u32, b: i32) -> u32 {
+    return (i & ~(255u32 << POS_B)) | ((b as u32) << POS_B)
+}
+fn set_arg_c(i: u32, c: i32) -> u32 {
+    return (i & ~(255u32 << POS_C)) | ((c as u32) << POS_C)
+}
+fn set_arg_k(i: u32, k: bool) -> u32 {
+    if k {
+        return i | (1u32 << POS_K)
+    }
+    return i & ~(1u32 << POS_K)
+}
+fn set_arg_bx(i: u32, bx: i32) -> u32 {
+    return (i & 32767) | ((bx as u32) << POS_BX)
+}
+fn set_arg_sj(i: u32, sj: i32) -> u32 {
+    return (i & 127) | (((sj + OFFSET_SJ) as u32) << POS_AX)
+}

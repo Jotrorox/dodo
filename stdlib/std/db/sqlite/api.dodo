@@ -1,0 +1,610 @@
+package sqlite
+
+import "core/mem"
+import "std/db"
+import "std/db/sql"
+import "std/text"
+
+// Public API. A Connection owns one database file (or an in-memory
+// database) and works entirely inside the caller's workspace:
+//
+//     static mut WORKSPACE: [sqlite.WORKSPACE_BYTES]u8 = [0u8; sqlite.WORKSPACE_BYTES]
+//     conn := sqlite.Connection.open("app.db", unsafe { &mut WORKSPACE[..] })?
+//     conn.exec("create table if not exists users(id integer primary key, name text)")?
+//     conn.execute("insert into users(name) values (?)", &[db.Value.Text("ada")])?
+//     rows := conn.select("select id, name from users", &[])?
+//     for {
+//         let some(row) = rows.next()? else { break }
+//         id := row.int(0)
+//     }
+//
+// The file format, rollback journal and locking protocol are SQLite's, so
+// the same file can be used by SQLite itself.
+
+pub struct Options {
+    pub read_only: bool
+    pub create: bool
+    // How long to wait for another process's conflicting lock before
+    // failing with ErrorKind.Busy (0 = fail immediately).
+    pub busy_timeout_ms: u32
+    // Page size for a newly created database file.
+    pub page_size: u32
+
+    pub fn new() -> Options {
+        Options { read_only: false, create: true, busy_timeout_ms: 0, page_size: 4096 }
+    }
+}
+
+// A prepared statement handle. It stays valid until finalized or until the
+// connection reuses its slot (prepared statements are cached in a fixed
+// number of slots; preparing more evicts the least recently used one).
+pub struct Statement {
+    slot: usize
+    serial: usize
+}
+
+pub const STATEMENT_SLOTS: usize = 7
+
+pub struct Connection {
+    e: Engine
+
+    pub fn open(path: &str, workspace: &mut[u8]) -> Connection!db.Error from(workspace) {
+        options := Options.new()
+        Connection.open_with(path, workspace, &options)
+    }
+
+    pub fn open_memory(workspace: &mut[u8]) -> Connection!db.Error from(workspace) {
+        options := Options.new()
+        Connection.open_with(":memory:", workspace, &options)
+    }
+
+    pub fn open_with(path: &str, workspace: &mut[u8], options: &Options) -> Connection!db.Error from(workspace) {
+        e := engine_new(workspace)
+        e.readonly = options.read_only
+        e.create = options.create
+        e.busy_retries = options.busy_timeout_ms
+        ps := options.page_size as usize
+        if ps >= 512 && ps <= 65536 && (ps & (ps - 1)) == 0 {
+            e.page_size = ps
+            e.usable = ps
+        }
+        engine_open(&mut e, path)?
+        // Validate the file now so a bad path or a non-database fails early.
+        begin_read(&mut e)?
+        r := load_schema(&mut e)
+        end_read(&mut e)
+        r?
+        ok(Connection { e })
+    }
+
+    // Closes the database. Uncommitted work is rolled back.
+    pub fn close(&mut self) -> void!db.Error {
+        if self.e.active != NO_COL {
+            a := self.e.active
+            stmt_fail(&mut self.e, a)
+        }
+        self.e.explicit_txn = false
+        engine_close(&mut self.e)
+    }
+
+    fn drop(&mut self) {
+        if self.e.file_open() {
+            match self.close() {
+                ok() => {},
+                err(_) => {},
+            }
+        }
+    }
+
+    // Text of the most recent error, in SQLite's wording.
+    pub fn message(&self) -> &str {
+        b := &self.e.ws[PATH_CAP..PATH_CAP + self.e.msg_len]
+        match text.validate(b) {
+            ok() => unsafe {
+                mem.str_from_utf8(b)
+            },
+            err(_) => "error",
+        }
+    }
+
+    pub fn changes(&self) -> u64 {
+        self.e.changes
+    }
+
+    pub fn total_changes(&self) -> u64 {
+        self.e.total_changes
+    }
+
+    pub fn last_insert_rowid(&self) -> i64 {
+        self.e.last_rowid
+    }
+
+    // True inside BEGIN ... COMMIT/ROLLBACK.
+    pub fn in_transaction(&self) -> bool {
+        self.e.explicit_txn
+    }
+
+    // Waits up to `milliseconds` for other processes' locks (like
+    // sqlite3_busy_timeout).
+    pub fn set_busy_timeout(&mut self, milliseconds: u32) {
+        self.e.busy_retries = milliseconds
+    }
+
+    // Runs every statement in `sql`, discarding result rows.
+    pub fn exec(&mut self, sql: &str) -> void!db.Error {
+        bytes := mem.str_bytes(sql)
+        start := 0usize
+        for start < bytes.len {
+            slot := transient_slot(&self.e)
+            prepare_slot(&mut self.e, slot, &bytes[start..])?
+            tail := sh(&self.e, slot, SH_TAIL)
+            empty := tail == 0
+            none_: [0]db.Value = []
+            run_to_end(&mut self.e, slot, &none_)?
+            if empty {
+                break
+            }
+            start += tail
+        }
+        ok()
+    }
+
+    // Length in bytes of the first statement of `sql`, including its
+    // terminating semicolon and trailing whitespace (like the tail pointer
+    // of sqlite3_prepare). Zero when `sql` holds no statement.
+    pub fn statement_length(&mut self, sql: &str) -> usize!db.Error {
+        all := mem.str_bytes(sql)
+        slot := transient_slot(&self.e)
+        base := slot_base(&self.e, slot)
+        room := self.e.stmt_slot - SLOT_SQL - 64
+        bytes := if all.len > room {
+            &all[..room]
+        } else {
+            all
+        }
+        if self.e.active == slot {
+            stmt_finish(&mut self.e, slot, true)?
+        }
+        sh_set(&mut self.e, slot, SH_INUSE, 0)
+        copy_in(self.e.ws, base + SLOT_SQL, bytes)
+        e := &mut self.e
+        e.src = base + SLOT_SQL
+        e.src_end = e.src + bytes.len
+        e.pos = e.src
+        e.ts = e.src
+        e.tl = 0
+        next_token(e)
+        if e.tk == TK_EOF {
+            return ok(0)
+        }
+        // A CREATE TRIGGER body could contain semicolons; triggers are not
+        // supported, so the first top-level semicolon ends the statement.
+        for e.tk != TK_EOF && e.tk != TK_SEMI {
+            next_token(e)
+        }
+        if e.tk != TK_SEMI && bytes.len < all.len {
+            return err(fail(e, SQLITE_TOOBIG, "statement too long for the statement workspace"))
+        }
+        if e.tk == TK_SEMI {
+            next_token(e)
+        }
+        ok(e.ts - e.src)
+    }
+
+    // Runs one statement and returns the number of rows it changed.
+    pub fn execute(&mut self, sql: &str, params: &[db.Value]) -> u64!db.Error {
+        slot := transient_slot(&self.e)
+        prepare_one(&mut self.e, slot, sql)?
+        run_to_end(&mut self.e, slot, params)?
+        ok(self.e.changes)
+    }
+
+    // Runs one statement and passes each row to `sink`.
+    pub fn query(&mut self, sql: &str, params: &[db.Value], sink: &mut dyn sql.RowSink) -> void!db.Error {
+        slot := transient_slot(&self.e)
+        prepare_one(&mut self.e, slot, sql)?
+        stmt_start(&mut self.e, slot, params)?
+        for {
+            if !stmt_step(&mut self.e, slot)? {
+                break
+            }
+            row := Row { e: &self.e, slot }
+            match sink.row(&row) {
+                ok() => {},
+                err(reason) => {
+                    stmt_fail(&mut self.e, slot)
+                    return err(reason)
+                },
+            }
+        }
+        ok()
+    }
+
+    pub fn begin(&mut self, level: db.IsolationLevel) -> void!db.Error {
+        // SQLite transactions are serializable; IMMEDIATE takes the write
+        // lock up front so a later write cannot fail with Busy midway.
+        match level {
+            db.IsolationLevel.Serializable => self.exec("BEGIN IMMEDIATE"),
+            _ => self.exec("BEGIN"),
+        }
+    }
+
+    pub fn commit(&mut self) -> void!db.Error {
+        self.exec("COMMIT")
+    }
+
+    pub fn rollback(&mut self) -> void!db.Error {
+        self.exec("ROLLBACK")
+    }
+
+    // Runs a query and returns a cursor over its rows. Rows borrow the
+    // connection; the statement completes when the cursor is exhausted or
+    // dropped.
+    pub fn select(&mut self, sql: &str, params: &[db.Value]) -> Rows!db.Error {
+        slot := transient_slot(&self.e)
+        prepare_one(&mut self.e, slot, sql)?
+        stmt_start(&mut self.e, slot, params)?
+        ok(Rows { e: &mut self.e, slot })
+    }
+
+    // Prepares a statement for repeated execution.
+    pub fn prepare(&mut self, sql: &str) -> Statement!db.Error {
+        slot := pick_slot(&mut self.e)
+        prepare_one(&mut self.e, slot, sql)?
+        serial := sh(&self.e, slot, SH_SERIAL) + 1
+        sh_set(&mut self.e, slot, SH_SERIAL, serial)
+        ok(Statement { slot, serial })
+    }
+
+    // Releases a prepared statement's slot.
+    pub fn finalize(&mut self, stmt: Statement) {
+        if self.valid(&stmt) {
+            if self.e.active == stmt.slot {
+                match stmt_finish(&mut self.e, stmt.slot, true) {
+                    ok() => {},
+                    err(_) => {},
+                }
+            }
+            sh_set(&mut self.e, stmt.slot, SH_INUSE, 0)
+        }
+    }
+
+    fn valid(&self, stmt: &Statement) -> bool {
+        stmt.slot < STATEMENT_SLOTS && sh(&self.e, stmt.slot, SH_INUSE) != 0 && sh(&self.e, stmt.slot, SH_SERIAL) == stmt.serial
+    }
+
+    // Executes a prepared statement, returning the number of changed rows.
+    pub fn run(&mut self, stmt: &Statement, params: &[db.Value]) -> u64!db.Error {
+        if !self.valid(stmt) {
+            return err(fail(&mut self.e, SQLITE_MISUSE, "statement is no longer valid"))
+        }
+        run_to_end(&mut self.e, stmt.slot, params)?
+        ok(self.e.changes)
+    }
+
+    // Executes a prepared query and returns a cursor over its rows.
+    pub fn rows(&mut self, stmt: &Statement, params: &[db.Value]) -> Rows!db.Error {
+        if !self.valid(stmt) {
+            return err(fail(&mut self.e, SQLITE_MISUSE, "statement is no longer valid"))
+        }
+        touch_slot(&mut self.e, stmt.slot)
+        stmt_start(&mut self.e, stmt.slot, params)?
+        ok(Rows { e: &mut self.e, slot: stmt.slot })
+    }
+
+    // Number of result columns of a prepared statement.
+    pub fn column_count(&self, stmt: &Statement) -> usize {
+        if !self.valid(stmt) {
+            return 0
+        }
+        sh(&self.e, stmt.slot, SH_NCOL)
+    }
+
+    // Number of parameters of a prepared statement (the largest index).
+    pub fn parameter_count(&self, stmt: &Statement) -> usize {
+        if !self.valid(stmt) {
+            return 0
+        }
+        sh(&self.e, stmt.slot, SH_NPARAM)
+    }
+
+    // 1-based index of a named parameter (":name", "@name", "$name"), or 0.
+    pub fn parameter_index(&self, stmt: &Statement, name: &str) -> usize {
+        if !self.valid(stmt) {
+            return 0
+        }
+        base := slot_base(&self.e, stmt.slot)
+        n := sh(&self.e, stmt.slot, SH_NAMED)
+        b := mem.str_bytes(name)
+        for k in 0usize..n {
+            o := base + SLOT_NAMED + k * 12
+            off := ldu(self.e.ws, o)
+            len := ldu(self.e.ws, o + 4)
+            if len == b.len {
+                same := true
+                for i in 0usize..len {
+                    if self.e.ws[off + i] != b[i] {
+                        same = false
+                    }
+                }
+                if same {
+                    return ldu(self.e.ws, o + 8)
+                }
+            }
+        }
+        0
+    }
+}
+
+fn prepare_one(e: &mut Engine, slot: usize, sql: &str) -> void!db.Error {
+    bytes := mem.str_bytes(sql)
+    if e.active == slot {
+        stmt_finish(e, slot, true)?
+    }
+    // Schema resolution needs the current schema.
+    begin_read(e)?
+    r := load_schema(e)
+    match r {
+        ok() => {},
+        err(reason) => {
+            end_read(e)
+            return err(reason)
+        },
+    }
+    res := prepare_slot(e, slot, bytes)
+    end_read(e)
+    res?
+    tail := sh(e, slot, SH_TAIL)
+    if tail < bytes.len {
+        // Only whitespace and comments may follow.
+        let base = slot_base(e, slot) + SLOT_SQL + tail
+        e.src = base
+        let base2 = slot_base(e, slot) + SLOT_SQL + bytes.len
+        e.src_end = base2
+        e.pos = e.src
+        e.ts = e.src
+        e.tl = 0
+        next_token(e)
+        if e.tk != TK_EOF {
+            return err(fail(e, SQLITE_ERROR, "only one statement is allowed here; use exec for scripts"))
+        }
+    }
+    ok()
+}
+
+fn run_to_end(e: &mut Engine, slot: usize, params: &[db.Value]) -> void!db.Error {
+    stmt_start(e, slot, params)?
+    for stmt_step(e, slot)? {
+    }
+    ok()
+}
+
+fn transient_slot(e: &Engine) -> usize {
+    STATEMENT_SLOTS
+}
+
+fn touch_slot(e: &mut Engine, slot: usize) {
+    e.stamp += 1
+    v := e.stamp as usize
+    sh_set(e, slot, SH_LRU, v)
+}
+
+// A free slot, or the least recently used prepared statement.
+fn pick_slot(e: &mut Engine) -> usize {
+    best := 0usize
+    best_lru := 18446744073709551615usize
+    for s in 0usize..STATEMENT_SLOTS {
+        if sh(e, s, SH_INUSE) == 0 {
+            touch_slot(e, s)
+            return s
+        }
+        lru := sh(e, s, SH_LRU)
+        if lru < best_lru && e.active != s {
+            best_lru = lru
+            best = s
+        }
+    }
+    touch_slot(e, best)
+    best
+}
+
+// A cursor over the rows of a running statement.
+pub struct Rows {
+    e: &mut Engine
+    slot: usize
+
+    // Advances to the next row; none at the end.
+    pub fn next(&mut self) -> Option<Row>!db.Error {
+        if !stmt_step(self.e, self.slot)? {
+            return ok(none)
+        }
+        ok(some(Row { e: &*self.e, slot: self.slot }))
+    }
+
+    pub fn len(&self) -> usize {
+        sh(self.e, self.slot, SH_NCOL)
+    }
+
+    fn drop(&mut self) {
+        if self.e.active == self.slot {
+            match stmt_finish(self.e, self.slot, true) {
+                ok() => {},
+                err(_) => {},
+            }
+        }
+    }
+}
+
+// One result row. Text and blob values borrow the workspace and stay valid
+// until the cursor advances.
+pub struct Row {
+    e: &Engine
+    slot: usize
+
+    pub fn len(&self) -> usize {
+        sh(self.e, self.slot, SH_NCOL)
+    }
+
+    pub fn name(&self, index: usize) -> &str {
+        if index >= self.len() {
+            return ""
+        }
+        kind := sh(self.e, self.slot, SH_KIND) as u8
+        if kind == S_PRAGMA {
+            return pragma_column_name(sh(self.e, self.slot, SH_PRAGMA), index)
+        }
+        let (o, l) = column_name(self.e, self.slot, index)
+        if l == 0 {
+            return "rowid"
+        }
+        b := &self.e.ws[o..o + l]
+        match text.validate(b) {
+            ok() => unsafe {
+                mem.str_from_utf8(b)
+            },
+            err(_) => "",
+        }
+    }
+
+    pub fn get(&self, index: usize) -> db.Value!db.Error {
+        if index >= self.len() {
+            return err(db.Error.new(db.ErrorKind.Range, SQLITE_RANGE))
+        }
+        r := column_reg(self.e, self.slot, index)
+        t := rtype(self.e, r)
+        if t == T_NULL {
+            return ok(db.Value.Null)
+        }
+        if t == T_INT {
+            return ok(db.Value.Int(rint(self.e, r)))
+        }
+        if t == T_REAL {
+            return ok(db.Value.Real(rreal(self.e, r)))
+        }
+        o := roff(self.e, r)
+        b := &self.e.ws[o..o + rlen(self.e, r)]
+        if t == T_TEXT {
+            match text.validate(b) {
+                ok() => {
+                    return ok(db.Value.Text(unsafe {
+                        mem.str_from_utf8(b)
+                    }))
+                },
+                err(_) => {},
+            }
+        }
+        ok(db.Value.Bytes(b))
+    }
+
+    pub fn is_null(&self, index: usize) -> bool {
+        index >= self.len() || rtype(self.e, column_reg(self.e, self.slot, index)) == T_NULL
+    }
+
+    pub fn value_type(&self, index: usize) -> db.ValueType {
+        if index >= self.len() {
+            return db.ValueType.Null
+        }
+        t := rtype(self.e, column_reg(self.e, self.slot, index))
+        if t == T_INT {
+            return db.ValueType.Int
+        }
+        if t == T_REAL {
+            return db.ValueType.Real
+        }
+        if t == T_TEXT {
+            return db.ValueType.Text
+        }
+        if t == T_BLOB {
+            return db.ValueType.Bytes
+        }
+        db.ValueType.Null
+    }
+
+    // Integer value with SQLite's conversion rules (NULL is 0).
+    pub fn int(&self, index: usize) -> i64 {
+        if index >= self.len() {
+            return 0
+        }
+        to_int(self.e, column_reg(self.e, self.slot, index))
+    }
+
+    // Real value with SQLite's conversion rules (NULL is 0.0).
+    pub fn real(&self, index: usize) -> f64 {
+        if index >= self.len() {
+            return 0.0
+        }
+        to_real(self.e, column_reg(self.e, self.slot, index))
+    }
+
+    // Text value: empty for NULL and for numbers (use get or text_into to
+    // format numbers) and for bytes that are not valid UTF-8.
+    pub fn text(&self, index: usize) -> &str {
+        if index >= self.len() {
+            return ""
+        }
+        r := column_reg(self.e, self.slot, index)
+        t := rtype(self.e, r)
+        if t != T_TEXT && t != T_BLOB {
+            return ""
+        }
+        o := roff(self.e, r)
+        b := &self.e.ws[o..o + rlen(self.e, r)]
+        match text.validate(b) {
+            ok() => unsafe {
+                mem.str_from_utf8(b)
+            },
+            err(_) => "",
+        }
+    }
+
+    // Raw bytes of a text or blob value (empty otherwise).
+    pub fn bytes(&self, index: usize) -> &[u8] {
+        if index >= self.len() {
+            return &self.e.ws[0..0]
+        }
+        r := column_reg(self.e, self.slot, index)
+        t := rtype(self.e, r)
+        if t != T_TEXT && t != T_BLOB {
+            return &self.e.ws[0..0]
+        }
+        o := roff(self.e, r)
+        &self.e.ws[o..o + rlen(self.e, r)]
+    }
+
+    // Writes the value as text (numbers formatted as SQLite does) into
+    // `out`; returns the length, or none if it does not fit.
+    pub fn text_into(&self, index: usize, out: &mut[u8]) -> Option<usize> {
+        if index >= self.len() {
+            return none
+        }
+        r := column_reg(self.e, self.slot, index)
+        t := rtype(self.e, r)
+        buf := [0u8; 48]
+        n := 0usize
+        if t == T_NULL {
+            return some(0usize)
+        }
+        if t == T_INT {
+            n = format_i64(&mut buf, rint(self.e, r))
+        } else if t == T_REAL {
+            n = real_text(rreal(self.e, r), &mut buf)
+        } else {
+            l := rlen(self.e, r)
+            if l > out.len {
+                return none
+            }
+            o := roff(self.e, r)
+            for i in 0usize..l {
+                out[i] = self.e.ws[o + i]
+            }
+            return some(l)
+        }
+        if n > out.len {
+            return none
+        }
+        for i in 0usize..n {
+            out[i] = buf[i]
+        }
+        some(n)
+    }
+}

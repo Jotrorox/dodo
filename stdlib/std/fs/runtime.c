@@ -132,4 +132,24 @@ int32_t dodo_fs_rename_exclusive(const unsigned char *old, const unsigned char *
     return renameat2(AT_FDCWD, (const char *)old, AT_FDCWD, (const char *)new, RENAME_NOREPLACE);
 #endif
 }
+
+/* POSIX record locks (fcntl F_SETLK, non-blocking). fcntl is variadic, so
+ * Dodo reaches it through this wrapper. kind: 0 unlock, 1 shared (read),
+ * 2 exclusive (write). Returns 0 on success, 1 when another process holds
+ * a conflicting lock, -1 on other errors (errno set). */
+int32_t dodo_fs_lock(int32_t fd, int32_t kind, int64_t start, int64_t length) {
+    struct flock lock;
+    lock.l_type = kind == 0 ? F_UNLCK : (kind == 1 ? F_RDLCK : F_WRLCK);
+    lock.l_whence = SEEK_SET;
+    lock.l_start = (off_t)start;
+    lock.l_len = (off_t)length;
+    lock.l_pid = 0;
+    if (fcntl(fd, F_SETLK, &lock) == 0) {
+        return 0;
+    }
+    if (errno == EACCES || errno == EAGAIN) {
+        return 1;
+    }
+    return -1;
+}
 #endif

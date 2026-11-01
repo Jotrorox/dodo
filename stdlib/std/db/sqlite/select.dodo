@@ -1,0 +1,2045 @@
+package sqlite
+
+import "std/db"
+
+// SELECT: name resolution, planning, and a resumable nested-loop executor
+// with a sorter for ORDER BY, DISTINCT, GROUP BY and compound queries.
+
+const N_ALIAS: u8 = 36
+
+// Select info block (allocated in the statement pool, pointer in the
+// select node's field g).
+const I_NLEV: usize = 0
+const I_RESREG: usize = 4
+const I_NRES: usize = 8
+const I_AGG: usize = 12
+const I_AGGLIST: usize = 16
+const I_NAGG: usize = 20
+const I_NGROUP: usize = 24
+const I_NSLOT: usize = 28
+const I_SLOTS: usize = 32
+const I_NORDER: usize = 36
+const I_ORDINFO: usize = 40
+const I_GRPINFO: usize = 44
+const I_MODE: usize = 48
+const I_WHERE: usize = 52
+const I_FINAL: usize = 56
+const I_PHASE: usize = 60
+const I_POS: usize = 64
+const I_N: usize = 68
+const I_IDX: usize = 72
+const I_MARK: usize = 76
+const I_LIMIT: usize = 80
+const I_OFFSET: usize = 88
+const I_DONE: usize = 96
+const I_GOPEN: usize = 97
+const I_STARTED: usize = 98
+const I_PREV: usize = 124
+const I_PREVLEN: usize = 104
+const I_LASTREC: usize = 108
+const I_LASTLEN: usize = 112
+const I_AGGMARK: usize = 116
+const I_RESINFO: usize = 120
+const I_GIDX: usize = 100
+const I_GN: usize = 128
+const I_GPOS: usize = 132
+const I_NFINAL: usize = 136
+const I_GFIRST: usize = 140
+const I_MINMAX: usize = 144
+const I_LEVELS: usize = 152
+const LEVEL_BYTES: usize = 48
+
+// Level fields.
+const L_CUR: usize = 0
+const L_TABLE: usize = 4
+const L_PLAN: usize = 8
+const L_KEYS: usize = 12
+const L_INDEX: usize = 16
+const L_ICUR: usize = 20
+const L_NEQ: usize = 24
+const L_ON: usize = 28
+const L_TERMS: usize = 32
+const L_NTERMS: usize = 36
+const L_STATE: usize = 40
+const L_MATCHED: usize = 41
+const L_LEFT: usize = 42
+const L_NULLROW: usize = 43
+const L_KEYREG: usize = 44
+
+const PLAN_SCAN: usize = 0
+const PLAN_ROWID: usize = 1
+const PLAN_INDEX: usize = 2
+const PLAN_RANGE: usize = 3
+const PLAN_SUBQ: usize = 4
+const PLAN_QUEUE: usize = 5
+const QUEUE_SOURCE: usize = 4294967294
+
+const MODE_STREAM: usize = 0
+const MODE_SORT: usize = 1
+
+const AGG_NONE: usize = 0
+const AGG_SIMPLE: usize = 1
+const AGG_GROUP: usize = 2
+
+fn sinfo(e: &Engine, s: usize) -> usize {
+    ng(e, s)
+}
+
+fn lev(e: &Engine, info: usize, l: usize) -> usize {
+    info + I_LEVELS + l * LEVEL_BYTES
+}
+
+fn iget(e: &Engine, info: usize, f: usize) -> usize {
+    ldu(e.ws, info + f)
+}
+
+fn iset(e: &mut Engine, info: usize, f: usize, v: usize) {
+    stu(e.ws, info + f, v)
+}
+
+// ---------------------------------------------------------------------------
+// Resolution context: a stack of FROM lists for correlated name lookup.
+
+fn alloc_cursor(e: &mut Engine) -> usize!db.Error {
+    if e.cur_alloc >= NCURSORS - 1 {
+        return err(fail(e, SQLITE_ERROR, "too many tables in one statement"))
+    }
+    c := e.cur_alloc
+    e.cur_alloc += 1
+    ok(c)
+}
+
+fn alloc_regs(e: &mut Engine, n: usize) -> usize!db.Error {
+    if e.reg_alloc + n >= REG_LIMIT - 64 {
+        return err(fail(e, SQLITE_ERROR, "statement too complex (too many registers)"))
+    }
+    r := e.reg_alloc
+    e.reg_alloc += n
+    ok(r)
+}
+
+fn no_such_column(e: &mut Engine, n: usize) -> db.Error {
+    e.msg_len = 0
+    msg_add(e, "no such column: ")
+    if nc(e, n) != 0 {
+        let n_c = nc(e, n)
+        let n_d = ndd(e, n)
+        msg_add_ws(e, n_c, n_d)
+        msg_add(e, ".")
+    }
+    let n_a = na(e, n)
+    let n_b = nb(e, n)
+    msg_add_ws(e, n_a, n_b)
+    make_error(e, SQLITE_ERROR)
+}
+
+// Looks a column name up in the FROM list `src`. Returns (src node, col)
+// with col = NO_COL for rowid, or src = 0 when not found. Sets `ambiguous`.
+fn lookup_in(e: &mut Engine, src: usize, n: usize) -> (usize, usize, bool) {
+    qo := nc(e, n)
+    ql := ndd(e, n)
+    name := na(e, n)
+    nl := nb(e, n)
+    found := 0usize
+    found_col := NO_COL
+    ambiguous := false
+    s := src
+    for s != 0 {
+        t := ng(e, s)
+        if ql != 0 {
+            let s_c = nc(e, s)
+            let s_d = ndd(e, s)
+            let s_a = na(e, s)
+            let s_b = nb(e, s)
+            matches := if ndd(e, s) != 0 {
+                names_eq(e, s_c, s_d, qo, ql)
+            } else {
+                names_eq(e, s_a, s_b, qo, ql)
+            }
+            if !matches {
+                s = nnext(e, s)
+                continue
+            }
+        }
+        c := find_column(e, t, name, nl)
+        if c != NO_COL {
+            if found != 0 && !using_merged(e, s, name, nl) {
+                ambiguous = true
+            }
+            if found == 0 {
+                found = s
+                found_col = c
+            }
+        } else if is_rowid_name(e, name, nl) && found == 0 {
+            found = s
+            found_col = NO_COL
+        }
+        s = nnext(e, s)
+    }
+    (found, found_col, ambiguous)
+}
+
+// A column named in USING of a later source is shared, not ambiguous.
+fn using_merged(e: &Engine, s: usize, name: usize, nl: usize) -> bool {
+    u := nff(e, s)
+    for u != 0 {
+        let u_a = na(e, u)
+        let u_b = nb(e, u)
+        if names_eq(e, u_a, u_b, name, nl) {
+            return true
+        }
+        u = nnext(e, u)
+    }
+    false
+}
+
+fn ctx_push(e: &mut Engine, src: usize, sel: usize) -> void!db.Error {
+    if e.ctx_n >= 16 {
+        return err(fail(e, SQLITE_ERROR, "subqueries nested too deeply"))
+    }
+    o := e.ctx_off + e.ctx_n * 8
+    stu(e.ws, o, src)
+    stu(e.ws, o + 4, sel)
+    e.ctx_n += 1
+    ok()
+}
+
+fn ctx_pop(e: &mut Engine) {
+    e.ctx_n -= 1
+}
+
+// Resolves an expression tree in place. `sel` (or 0) is the select whose
+// result aliases may be referenced; `allow_agg` permits aggregates.
+fn resolve_expr(e: &mut Engine, n: usize, sel: usize, allow_agg: bool) -> void!db.Error {
+    if n == 0 {
+        return ok()
+    }
+    k := nkind(e, n)
+    if k == N_ID {
+        // CHECK constraints: names refer to the new row's registers.
+        let n_c = nc(e, n)
+        let n_d = ndd(e, n)
+        if e.regctx_t != NO_COL && e.excluded_base != 0 && nc(e, n) != 0 && name_is(e, n_c, n_d, "excluded") {
+            // UPSERT: excluded.col is the row that failed to insert.
+            t := e.regctx_t
+            let n_a = na(e, n)
+            let n_b = nb(e, n)
+            c := find_column(e, t, n_a, n_b)
+            let n_a2 = na(e, n)
+            let n_b2 = nb(e, n)
+            if c == NO_COL && !is_rowid_name(e, n_a2, n_b2) {
+                return err(no_such_column(e, n))
+            }
+            set_kind(e, n, N_REG)
+            let excluded_base2 = e.excluded_base + if c == NO_COL {
+                obj_ncol(e, t)
+            } else {
+                c
+            }
+            set_nf(e, n, 0, excluded_base2)
+            return ok()
+        }
+        if e.regctx_t != NO_COL {
+            t := e.regctx_t
+            let n_c2 = nc(e, n)
+            let n_d2 = ndd(e, n)
+            let name2 = obj_u(e, t, O_NAME)
+            let name_len = obj_u(e, t, O_NAMEL)
+            if nc(e, n) == 0 || names_eq(e, n_c2, n_d2, name2, name_len) {
+                let n_a3 = na(e, n)
+                let n_b3 = nb(e, n)
+                c := find_column(e, t, n_a3, n_b3)
+                let n_a4 = na(e, n)
+                let n_b4 = nb(e, n)
+                if c != NO_COL || is_rowid_name(e, n_a4, n_b4) {
+                    set_kind(e, n, N_REG)
+                    let regctx_base2 = e.regctx_base + if c == NO_COL {
+                        obj_ncol(e, t)
+                    } else {
+                        c
+                    }
+                    set_nf(e, n, 0, regctx_base2)
+                    return ok()
+                }
+            }
+        }
+        // Innermost context first.
+        depth := e.ctx_n
+        for depth > 0 {
+            depth -= 1
+            o := e.ctx_off + depth * 8
+            src := ldu(e.ws, o)
+            let (s, col, amb) = lookup_in(e, src, n)
+            if amb {
+                e.msg_len = 0
+                msg_add(e, "ambiguous column name: ")
+                let n_a5 = na(e, n)
+                let n_b5 = nb(e, n)
+                msg_add_ws(e, n_a5, n_b5)
+                return err(make_error(e, SQLITE_ERROR))
+            }
+            if s != 0 {
+                if depth < e.min_ctx {
+                    e.min_ctx = depth
+                }
+                set_kind(e, n, N_COL)
+                cursor := (nx(e, s) & 0xffffffffu64) as usize
+                t := ng(e, s)
+                set_nf(e, n, 0, cursor)
+                set_nf(e, n, 1, col)
+                set_nf(e, n, 2, t)
+                set_nf(e, n, 3, 0)
+                return ok()
+            }
+        }
+        // Result alias of the current select.
+        if sel != 0 && nc(e, n) == 0 {
+            rc := na(e, sel)
+            for rc != 0 {
+                let rc_b = nb(e, rc)
+                let rc_c = nc(e, rc)
+                let n_a6 = na(e, n)
+                let n_b6 = nb(e, n)
+                if nb(e, rc) != 0 && names_eq(e, rc_b, rc_c, n_a6, n_b6) {
+                    set_kind(e, n, N_ALIAS)
+                    let rc_a = na(e, rc)
+                    set_nf(e, n, 0, rc_a)
+                    return ok()
+                }
+                rc = nnext(e, rc)
+            }
+        }
+        // "string" in double quotes that names nothing is a string literal.
+        if nc(e, n) == 0 && na(e, n) > 0 && e.ws[na(e, n) - 1] == 34 {
+            set_kind(e, n, N_STR)
+            return ok()
+        }
+        return err(no_such_column(e, n))
+    }
+    if k == N_FUNC {
+        let name = na(e, n)
+        let len = nb(e, n)
+        args := nc(e, n)
+        nargs := list_len(e, args)
+        flags := nflags(e, n)
+        if (flags & 4) != 0 {
+            // CURRENT_TIMESTAMP and friends.
+            let (id, _, _) = func_lookup(e, name, len, 0, false)
+            set_nf(e, n, 3, id)
+            return ok()
+        }
+        let (id, lo, hi) = func_lookup(e, name, len, nargs, (flags & 2) != 0)
+        if id == 0 {
+            e.msg_len = 0
+            msg_add(e, "no such function: ")
+            msg_add_ws(e, name, len)
+            return err(make_error(e, SQLITE_ERROR))
+        }
+        if nargs < lo || nargs > hi {
+            e.msg_len = 0
+            msg_add(e, "wrong number of arguments to function ")
+            msg_add_ws(e, name, len)
+            msg_add(e, "()")
+            return err(make_error(e, SQLITE_ERROR))
+        }
+        set_nf(e, n, 3, id)
+        if is_aggregate_id(id) {
+            if !allow_agg {
+                e.msg_len = 0
+                msg_add(e, "misuse of aggregate function ")
+                msg_add_ws(e, name, len)
+                msg_add(e, "()")
+                return err(make_error(e, SQLITE_ERROR))
+            }
+            set_kind(e, n, N_AGG)
+            a := args
+            for a != 0 {
+                resolve_expr(e, a, sel, false)?
+                a = nnext(e, a)
+            }
+            regs := alloc_regs(e, 4)?
+            set_nf(e, n, 4, regs)
+            // Register with the select being resolved.
+            agg_register(e, n)?
+            return ok()
+        }
+        if (flags & 1) != 0 {
+            return err(fail(e, SQLITE_ERROR, "DISTINCT is only valid in aggregate functions"))
+        }
+        a := args
+        for a != 0 {
+            resolve_expr(e, a, sel, allow_agg)?
+            a = nnext(e, a)
+        }
+        return ok()
+    }
+    if k == N_SUBQ || k == N_EXISTS || k == N_INSEL {
+        if k == N_INSEL {
+            let n_a7 = na(e, n)
+            resolve_expr(e, n_a7, sel, allow_agg)?
+        }
+        save_aggs := e.agg_list
+        save_nagg := e.agg_n
+        save_min := e.min_ctx
+        my_depth := e.ctx_n
+        e.min_ctx = NO_COL
+        let n_b7 = nb(e, n)
+        resolve_select(e, n_b7)?
+        correlated := e.min_ctx < my_depth
+        if e.min_ctx < save_min {
+            save_min = e.min_ctx
+        }
+        e.min_ctx = save_min
+        e.agg_list = save_aggs
+        e.agg_n = save_nagg
+        s := nb(e, n)
+        if !correlated && k != N_INSEL {
+            r := alloc_regs(e, 1)?
+            set_nf(e, n, 4, r)
+            o := nd(e, n)
+            e.ws[o + 2] = 1
+            e.ws[o + 3] = 0
+            subq_register(e, n)?
+        }
+        let info_value = sinfo(e, s)
+        if k != N_EXISTS && iget(e, info_value, I_NRES) != 1 {
+            return err(fail(e, SQLITE_ERROR, "sub-select returns more than 1 column"))
+        }
+        return ok()
+    }
+    if k == N_CASE {
+        let n_a8 = na(e, n)
+        resolve_expr(e, n_a8, sel, allow_agg)?
+        w := nb(e, n)
+        for w != 0 {
+            let w_a = na(e, w)
+            resolve_expr(e, w_a, sel, allow_agg)?
+            let w_b = nb(e, w)
+            resolve_expr(e, w_b, sel, allow_agg)?
+            w = nnext(e, w)
+        }
+        let n_c3 = nc(e, n)
+        return resolve_expr(e, n_c3, sel, allow_agg)
+    }
+    if k == N_INLIST {
+        let n_a9 = na(e, n)
+        resolve_expr(e, n_a9, sel, allow_agg)?
+        item := nb(e, n)
+        for item != 0 {
+            resolve_expr(e, item, sel, allow_agg)?
+            item = nnext(e, item)
+        }
+        return ok()
+    }
+    if k == N_BINARY || k == N_LIKE || k == N_BETWEEN {
+        let n_a10 = na(e, n)
+        resolve_expr(e, n_a10, sel, allow_agg)?
+        let n_b8 = nb(e, n)
+        resolve_expr(e, n_b8, sel, allow_agg)?
+        if k != N_BINARY {
+            let n_c4 = nc(e, n)
+            resolve_expr(e, n_c4, sel, allow_agg)?
+        }
+        return ok()
+    }
+    if k == N_UNARY || k == N_CAST || k == N_COLLATE || k == N_ISNULL {
+        let n_a11 = na(e, n)
+        return resolve_expr(e, n_a11, sel, allow_agg)
+    }
+    ok()
+}
+
+fn subq_register(e: &mut Engine, n: usize) -> void!db.Error {
+    if e.subq_n >= 32 {
+        // Not cached; it is simply evaluated every time.
+        o := nd(e, n)
+        e.ws[o + 2] = 0
+        return ok()
+    }
+    if e.subq_list == 0 {
+        let pool_alloc2 = pool_alloc(e, 128)?
+        e.subq_list = pool_alloc2
+    }
+    let o = e.subq_list + e.subq_n * 4
+    stu(e.ws, o, n)
+    e.subq_n += 1
+    ok()
+}
+
+fn resolve_compound(e: &mut Engine, s: usize) -> void!db.Error {
+    arm := s
+    nres := NO_COL
+    for arm != 0 {
+        resolve_core(e, arm, false)?
+        let info_value = sinfo(e, arm)
+        n := iget(e, info_value, I_NRES)
+        if nres != NO_COL && n != nres {
+            return err(fail(e, SQLITE_ERROR, "SELECTs to the left and right of UNION do not have the same number of result columns"))
+        }
+        nres = n
+        arm = nnext(e, arm)
+    }
+    info := sinfo(e, s)
+    iset(e, info, I_MODE, MODE_SORT)
+    ext := ndd(e, s)
+    if ext == 0 {
+        return ok()
+    }
+    o := nc(e, ext)
+    for o != 0 {
+        x := na(e, o)
+        coll := 255usize
+        if nkind(e, x) == N_COLLATE {
+            coll = nb(e, x)
+            x = na(e, x)
+        }
+        k := NO_COL
+        if nkind(e, x) == N_INT {
+            v := u2i(nx(e, x))
+            if v >= 1 && (v as usize) <= nres {
+                k = (v as usize) - 1
+            }
+        } else if nkind(e, x) == N_ID && nc(e, x) == 0 {
+            rc := na(e, s)
+            i := 0usize
+            for rc != 0 {
+                ex := na(e, rc)
+                hit := false
+                let rc_b = nb(e, rc)
+                let rc_c = nc(e, rc)
+                let x_a = na(e, x)
+                let x_b = nb(e, x)
+                if nb(e, rc) != 0 && names_eq(e, rc_b, rc_c, x_a, x_b) {
+                    hit = true
+                } else if nkind(e, ex) == N_COL && nb(e, ex) != NO_COL {
+                    let ex_c = nc(e, ex)
+                    let ex_b = nb(e, ex)
+                    r := col_rec(e, ex_c, ex_b)
+                    let name = ldu(e.ws, r + K_NAME)
+                    let name_len = ldu(e.ws, r + K_NAMEL)
+                    let x_a2 = na(e, x)
+                    let x_b2 = nb(e, x)
+                    hit = names_eq(e, name, name_len, x_a2, x_b2)
+                }
+                if hit {
+                    k = i
+                    break
+                }
+                i += 1
+                rc = nnext(e, rc)
+            }
+        }
+        if k == NO_COL {
+            return err(fail(e, SQLITE_ERROR, "ORDER BY term does not match any column in the result set"))
+        }
+        if coll == 255 {
+            rc := na(e, s)
+            for _ in 0usize..k {
+                rc = nnext(e, rc)
+            }
+            let rc_a = na(e, rc)
+            let (c, _) = expr_collation(e, rc_a)
+            coll = c as usize
+        }
+        set_nf(e, o, 4, k)
+        set_nf(e, o, 1, coll)
+        o = nnext(e, o)
+    }
+    let ext_d = ndd(e, ext)
+    resolve_expr(e, ext_d, 0, false)?
+    let ext_e = ne_(e, ext)
+    resolve_expr(e, ext_e, 0, false)?
+    ok()
+}
+
+fn agg_register(e: &mut Engine, n: usize) -> void!db.Error {
+    if e.agg_n >= 64 {
+        return err(fail(e, SQLITE_ERROR, "too many aggregate functions"))
+    }
+    if e.agg_list == 0 {
+        let pool_alloc2 = pool_alloc(e, 256)?
+        e.agg_list = pool_alloc2
+    }
+    let o = e.agg_list + e.agg_n * 4
+    stu(e.ws, o, n)
+    e.agg_n += 1
+    ok()
+}
+
+// Splits an AND tree into terms appended to the pool array at `out`.
+fn split_and(e: &mut Engine, n: usize, out: usize, count: usize, cap: usize) -> usize {
+    if n == 0 {
+        return count
+    }
+    if nkind(e, n) == N_BINARY && nop(e, n) == OP_AND {
+        let n_a = na(e, n)
+        c := split_and(e, n_a, out, count, cap)
+        let n_b = nb(e, n)
+        return split_and(e, n_b, out, c, cap)
+    }
+    if count < cap {
+        stu(e.ws, out + count * 4, n)
+    }
+    count + 1
+}
+
+// Highest level (0-based) of the current select referenced by an
+// expression; NO_COL when it references none; 1000 for unknown.
+fn max_level(e: &Engine, n: usize, info: usize, nlev: usize) -> usize {
+    if n == 0 {
+        return NO_COL
+    }
+    k := nkind(e, n)
+    if k == N_COL || k == N_SLOT {
+        c := na(e, n)
+        for l in 0usize..nlev {
+            if ldu(e.ws, lev(e, info, l) + L_CUR) == c {
+                return l
+            }
+        }
+        return NO_COL
+    }
+    if k == N_SUBQ || k == N_EXISTS || k == N_INSEL || k == N_AGG || k == N_ALIAS {
+        return 1000
+    }
+    if k == N_FUNC {
+        id := ndd(e, n)
+        if id == F_RANDOM || id == F_RANDOMBLOB || id == F_CHANGES || id == F_LAST_ROWID || id == F_TOTAL_CHANGES {
+            return 1000
+        }
+    }
+    m := NO_COL
+    sub := [na(e, n), nb(e, n), nc(e, n)]
+    lists := k == N_FUNC || k == N_INLIST || k == N_CASE
+    if k == N_FUNC {
+        a := nc(e, n)
+        for a != 0 {
+            v := max_level(e, a, info, nlev)
+            m = max_lv(m, v)
+            a = nnext(e, a)
+        }
+        return m
+    }
+    if k == N_INLIST {
+        let n_a = na(e, n)
+        m = max_level(e, n_a, info, nlev)
+        item := nb(e, n)
+        for item != 0 {
+            m = max_lv(m, max_level(e, item, info, nlev))
+            item = nnext(e, item)
+        }
+        return m
+    }
+    if k == N_CASE {
+        let n_a2 = na(e, n)
+        m = max_level(e, n_a2, info, nlev)
+        w := nb(e, n)
+        for w != 0 {
+            let w_a = na(e, w)
+            m = max_lv(m, max_level(e, w_a, info, nlev))
+            let w_b = nb(e, w)
+            m = max_lv(m, max_level(e, w_b, info, nlev))
+            w = nnext(e, w)
+        }
+        let n_c = nc(e, n)
+        return max_lv(m, max_level(e, n_c, info, nlev))
+    }
+    if lists {
+        return m
+    }
+    if k == N_BINARY || k == N_LIKE || k == N_BETWEEN {
+        for i in 0usize..3 {
+            if i == 2 && k == N_BINARY {
+                break
+            }
+            m = max_lv(m, max_level(e, sub[i], info, nlev))
+        }
+        return m
+    }
+    if k == N_UNARY || k == N_CAST || k == N_COLLATE || k == N_ISNULL {
+        let n_a3 = na(e, n)
+        return max_level(e, n_a3, info, nlev)
+    }
+    m
+}
+
+fn max_lv(a: usize, b: usize) -> usize {
+    if a == NO_COL {
+        return b
+    }
+    if b == NO_COL {
+        return a
+    }
+    if a > b {
+        a
+    } else {
+        b
+    }
+}
+
+// ---------------------------------------------------------------------------
+// resolve_select
+
+fn resolve_select(e: &mut Engine, s: usize) -> void!db.Error {
+    // Compound arms are resolved independently; ORDER BY/LIMIT of the
+    // compound live on the first arm.
+    if nnext(e, s) != 0 {
+        return resolve_compound(e, s)
+    }
+    resolve_core(e, s, true)
+}
+
+fn resolve_core(e: &mut Engine, s: usize, own_order: bool) -> void!db.Error {
+    // FROM sources.
+    let s_b = nb(e, s)
+    nlev := list_len(e, s_b)
+    if nlev > 32 {
+        return err(fail(e, SQLITE_ERROR, "at most 32 tables in a join"))
+    }
+    info := pool_alloc(e, I_LEVELS + nlev * LEVEL_BYTES)?
+    zero_bytes(e.ws, info, I_LEVELS + nlev * LEVEL_BYTES)
+    set_nf(e, s, 6, info)
+    iset(e, info, I_NLEV, nlev)
+    src := nb(e, s)
+    l := 0usize
+    for src != 0 {
+        sub := (nx(e, src) >> 32) as usize
+        t := NO_COL
+        queue := false
+        if sub != 0 {
+            t = subquery_obj(e, sub, 0, src)?
+        } else {
+            let tn = na(e, src)
+            let tl = nb(e, src)
+            ci := cte_find(e, tn, tl)
+            if ci != NO_COL {
+                let (cs, ct) = cte_source(e, ci, src)?
+                if cs == QUEUE_SOURCE {
+                    queue = true
+                } else {
+                    sub = cs
+                }
+                t = ct
+            } else {
+                t = find_obj(e, OT_TABLE, tn, tl)
+                if t == NO_COL {
+                    v := find_obj(e, OT_VIEW, tn, tl)
+                    if v != NO_COL {
+                        let (vsel, vcols) = view_select(e, v)?
+                        sub = vsel
+                        t = subquery_obj(e, sub, vcols, src)?
+                    } else if name_is(e, tn, tl, "sqlite_schema") || name_is(e, tn, tl, "sqlite_master") {
+                        t = schema_table_obj(e)?
+                    } else {
+                        e.msg_len = 0
+                        msg_add(e, "no such table: ")
+                        msg_add_ws(e, tn, tl)
+                        return err(make_error(e, SQLITE_ERROR))
+                    }
+                }
+            }
+        }
+        if (obj_flags(e, t) & OF_UNSUPPORTED) != 0 {
+            return err(fail(e, SQLITE_ERROR, "table uses unsupported features"))
+        }
+        c := alloc_cursor(e)?
+        set_nf(e, src, 6, t)
+        set_x(e, src, (c as u64) | ((sub as u64) << 32))
+        lv := lev(e, info, l)
+        stu(e.ws, lv + L_CUR, c)
+        stu(e.ws, lv + L_TABLE, t)
+        if sub != 0 {
+            stu(e.ws, lv + L_PLAN, PLAN_SUBQ)
+            stu(e.ws, lv + L_KEYS, sub)
+        }
+        if queue {
+            stu(e.ws, lv + L_PLAN, PLAN_QUEUE)
+        }
+        let value = if nop(e, src) == 1 {
+            1u8
+        } else {
+            0u8
+        }
+        e.ws[lv + L_LEFT] = value
+        l += 1
+        src = nnext(e, src)
+    }
+    let s_b2 = nb(e, s)
+    ctx_push(e, s_b2, s)?
+    save_aggs := e.agg_list
+    save_nagg := e.agg_n
+    e.agg_list = 0
+    e.agg_n = 0
+    // USING clauses become ON terms.
+    src = nb(e, s)
+    l = 0
+    for src != 0 {
+        u := nff(e, src)
+        for u != 0 {
+            on := using_term(e, s, src, l, u)?
+            prev := ne_(e, src)
+            if prev == 0 {
+                set_nf(e, src, 4, on)
+            } else {
+                both := binary(e, OP_AND, prev, on)?
+                set_nf(e, src, 4, both)
+            }
+            u = nnext(e, u)
+        }
+        l += 1
+        src = nnext(e, src)
+    }
+    // Expand * and resolve result columns.
+    expand_stars(e, s)?
+    let s_a = na(e, s)
+    nres := list_len(e, s_a)
+    iset(e, info, I_NRES, nres)
+    rc := na(e, s)
+    for rc != 0 {
+        let rc_a = na(e, rc)
+        resolve_expr(e, rc_a, s, true)?
+        rc = nnext(e, rc)
+    }
+    resreg := alloc_regs(e, nres)?
+    iset(e, info, I_RESREG, resreg)
+    // ON, WHERE, GROUP BY, HAVING, ORDER BY.
+    src = nb(e, s)
+    for src != 0 {
+        let src_e = ne_(e, src)
+        resolve_expr(e, src_e, s, false)?
+        src = nnext(e, src)
+    }
+    let s_c = nc(e, s)
+    resolve_expr(e, s_c, s, false)?
+    ext := ndd(e, s)
+    ngroup := 0usize
+    if ext != 0 {
+        g := na(e, ext)
+        for g != 0 {
+            resolve_order_item(e, s, g, false)?
+            ngroup += 1
+            g = nnext(e, g)
+        }
+        let ext_b = nb(e, ext)
+        resolve_expr(e, ext_b, s, true)?
+        if own_order {
+            o := nc(e, ext)
+            for o != 0 {
+                resolve_order_item(e, s, o, true)?
+                o = nnext(e, o)
+            }
+            let ext_d = ndd(e, ext)
+            resolve_expr(e, ext_d, 0, false)?
+            let ext_e = ne_(e, ext)
+            resolve_expr(e, ext_e, 0, false)?
+        }
+    }
+    iset(e, info, I_NGROUP, ngroup)
+    let agg_list2 = e.agg_list
+    iset(e, info, I_AGGLIST, agg_list2)
+    let agg_n2 = e.agg_n
+    iset(e, info, I_NAGG, agg_n2)
+    // A single min() or max() decides which row bare columns come from.
+    nminmax := 0usize
+    which := 0usize
+    for i in 0usize..e.agg_n {
+        an := ldu(e.ws, e.agg_list + i * 4)
+        id := ndd(e, an)
+        if id == A_MIN || id == A_MAX {
+            nminmax += 1
+            which = an
+        }
+    }
+    iset(e, info, I_MINMAX, if nminmax == 1 {
+        which
+    } else {
+        0usize
+    })
+    if ngroup > 0 {
+        iset(e, info, I_AGG, AGG_GROUP)
+    } else if e.agg_n > 0 {
+        iset(e, info, I_AGG, AGG_SIMPLE)
+    } else if ext != 0 && nb(e, ext) != 0 {
+        return err(fail(e, SQLITE_ERROR, "a GROUP BY clause is required before HAVING"))
+    }
+    e.agg_list = save_aggs
+    e.agg_n = save_nagg
+    ctx_pop(e)
+    plan_select(e, s, info)?
+    ok()
+}
+
+// Name of result column `rc` of a select: alias, column name, or the
+// expression text.
+fn result_name(e: &Engine, rc: usize) -> (usize, usize) {
+    x := na(e, rc)
+    if nb(e, rc) != 0 {
+        return (nb(e, rc), nc(e, rc))
+    }
+    if nkind(e, x) == N_COL && nb(e, x) != NO_COL && nc(e, x) != NO_COL {
+        let x_c = nc(e, x)
+        let x_b = nb(e, x)
+        r := col_rec(e, x_c, x_b)
+        return (ldu(e.ws, r + K_NAME), ldu(e.ws, r + K_NAMEL))
+    }
+    (ndd(e, rc), ne_(e, rc))
+}
+
+// Resolves a FROM subquery (or view body) and builds a statement-local
+// table object describing its result columns.
+fn subquery_obj(e: &mut Engine, sub: usize, cols: usize, src: usize) -> usize!db.Error {
+    e.view_depth += 1
+    if e.view_depth > 16 {
+        e.view_depth -= 1
+        return err(fail(e, SQLITE_ERROR, "views or subqueries nested too deeply"))
+    }
+    r := resolve_select(e, sub)
+    e.view_depth -= 1
+    r?
+    select_obj(e, sub, cols, src)
+}
+
+// A statement-local table object for the result columns of resolved
+// select `sub`.
+fn select_obj(e: &mut Engine, sub: usize, cols: usize, src: usize) -> usize!db.Error {
+    info := sinfo(e, sub)
+    nres := iget(e, info, I_NRES)
+    if cols != 0 && list_len(e, cols) != nres {
+        e.msg_len = 0
+        msg_add(e, "expected ")
+        let count = list_len(e, cols) as i64
+        msg_add_int(e, count)
+        msg_add(e, " columns for view but got ")
+        msg_add_int(e, nres as i64)
+        return err(make_error(e, SQLITE_ERROR))
+    }
+    o := pool_alloc(e, OBJ_BYTES + nres * COL_BYTES)?
+    zero_bytes(e.ws, o, OBJ_BYTES + nres * COL_BYTES)
+    colrecs := o + OBJ_BYTES
+    rc := na(e, sub)
+    id := cols
+    for k in 0usize..nres {
+        r := colrecs + k * COL_BYTES
+        no := 0usize
+        nl := 0usize
+        if id != 0 {
+            no = na(e, id)
+            nl = nb(e, id)
+        } else {
+            let (a, b) = result_name(e, rc)
+            no = a
+            nl = b
+        }
+        stu(e.ws, r + K_NAME, no)
+        stu(e.ws, r + K_NAMEL, nl)
+        x := na(e, rc)
+        let aff = expr_affinity(e, x)
+        e.ws[r + K_AFF] = aff
+        let (coll, _) = expr_collation(e, x)
+        e.ws[r + K_COLL] = coll
+        rc = nnext(e, rc)
+        if id != 0 {
+            id = nnext(e, id)
+        }
+    }
+    e.ws[o + O_TYPE] = OT_TABLE
+    st16(e.ws, o + O_NCOL, nres)
+    stu(e.ws, o + O_COLS, colrecs)
+    stu(e.ws, o + O_ROWID, NO_COL)
+    an := if ndd(e, src) != 0 {
+        nc(e, src)
+    } else {
+        na(e, src)
+    }
+    al := if ndd(e, src) != 0 {
+        ndd(e, src)
+    } else {
+        nb(e, src)
+    }
+    stu(e.ws, o + O_NAME, an)
+    stu(e.ws, o + O_NAMEL, al)
+    ok(LOCAL_OBJ + o)
+}
+
+fn cte_find(e: &Engine, o: usize, l: usize) -> usize {
+    i := e.cte_n
+    for i > 0 {
+        i -= 1
+        c := cte_entry(e, i)
+        let ldu2 = ldu(e.ws, c)
+        let ldu3 = ldu(e.ws, c + 4)
+        if names_eq(e, ldu2, ldu3, o, l) {
+            return i
+        }
+    }
+    NO_COL
+}
+
+// Resolves a FROM reference to common table expression `ci`. Returns
+// (subquery, table object), or (QUEUE_SOURCE, object) for the recursive
+// self-reference inside a WITH RECURSIVE body.
+fn cte_source(e: &mut Engine, ci: usize, src: usize) -> (usize, usize)!db.Error {
+    c := cte_entry(e, ci)
+    flags := ldu(e.ws, c + 20)
+    if (flags & 2) != 0 {
+        if (flags & 1) == 0 {
+            e.msg_len = 0
+            msg_add(e, "circular reference: ")
+            let ldu2 = ldu(e.ws, c)
+            let ldu3 = ldu(e.ws, c + 4)
+            msg_add_ws(e, ldu2, ldu3)
+            return err(make_error(e, SQLITE_ERROR))
+        }
+        q := ldu(e.ws, c + 28)
+        if q == 0 {
+            body := ldu(e.ws, c + 24)
+            if body == 0 || sinfo(e, body) == 0 {
+                return err(fail(e, SQLITE_ERROR, "recursive reference in the initial select of a common table expression"))
+            }
+            let cols = ldu(e.ws, c + 8)
+            q = select_obj(e, body, cols, src)?
+            let c2 = cte_entry(e, ci)
+            stu(e.ws, c2 + 28, q)
+        }
+        let c3 = cte_entry(e, ci)
+        let ldu4 = ldu(e.ws, c3 + 20) | 4
+        stu(e.ws, c3 + 20, ldu4)
+        return ok((QUEUE_SOURCE, q))
+    }
+    // Parse the body again so this reference gets its own parse tree.
+    sql := ldu(e.ws, c + 12)
+    sqll := ldu(e.ws, c + 16)
+    cols := ldu(e.ws, c + 8)
+    save_src := e.src
+    save_end := e.src_end
+    save_pos := e.pos
+    save_tk := e.tk
+    save_ts := e.ts
+    save_tl := e.tl
+    r := parse_fragment_stmt(e, sql, sqll)
+    e.src = save_src
+    e.src_end = save_end
+    e.pos = save_pos
+    e.tk = save_tk
+    e.ts = save_ts
+    e.tl = save_tl
+    sub := r?
+    let c4 = cte_entry(e, ci)
+    stu(e.ws, c4 + 20, flags | 2)
+    stu(e.ws, c4 + 24, sub)
+    stu(e.ws, c4 + 28, 0)
+    res := subquery_obj(e, sub, cols, src)
+    let c5 = cte_entry(e, ci)
+    after := ldu(e.ws, c5 + 20)
+    stu(e.ws, c5 + 20, after & 1)
+    t := res?
+    if (after & 4) != 0 {
+        // WITH RECURSIVE: the last arm must be the only recursive one and
+        // be joined by UNION or UNION ALL.
+        last := sub
+        for nnext(e, last) != 0 {
+            last = nnext(e, last)
+        }
+        if last == sub || (nop(e, last) != 1 && nop(e, last) != 2) {
+            return err(fail(e, SQLITE_ERROR, "recursive common table expressions need the form initial UNION [ALL] recursive"))
+        }
+        let flags2 = nflags(e, sub) | 16
+        set_flags(e, sub, flags2)
+    }
+    ok((sub, t))
+}
+
+// Parses a view's definition into this statement: (select, column list).
+fn view_select(e: &mut Engine, v: usize) -> (usize, usize)!db.Error {
+    sql := obj_u(e, v, O_SQL)
+    sqll := obj_u(e, v, O_SQLL)
+    save_src := e.src
+    save_end := e.src_end
+    save_pos := e.pos
+    save_tk := e.tk
+    save_ts := e.ts
+    save_tl := e.tl
+    r := parse_fragment_stmt(e, sql, sqll)
+    e.src = save_src
+    e.src_end = save_end
+    e.pos = save_pos
+    e.tk = save_tk
+    e.ts = save_ts
+    e.tl = save_tl
+    vs := r?
+    if nkind(e, vs) != S_CREATE_VIEW {
+        return err(corrupt(e))
+    }
+    ok((ndd(e, vs), nc(e, vs)))
+}
+
+fn schema_table_obj(e: &mut Engine) -> usize!db.Error {
+    // A synthetic catalog entry for sqlite_schema (root page 1).
+    for i in 0usize..e.schema_objs {
+        if obj_type(e, i) == OT_TABLE && obj_root(e, i) == 1 {
+            return ok(i)
+        }
+    }
+    i := new_obj(e)?
+    names := ["type", "name", "tbl_name", "rootpage", "sql"]
+    cols := schema_alloc(e, 5 * COL_BYTES)?
+    zero_bytes(e.ws, cols, 5 * COL_BYTES)
+    for k in 0usize..5 {
+        b := mem_bytes(names[k])
+        d := schema_alloc(e, b.len)?
+        copy_in(e.ws, d, b)
+        stu(e.ws, cols + k * COL_BYTES + K_NAME, d)
+        stu(e.ws, cols + k * COL_BYTES + K_NAMEL, b.len)
+        e.ws[cols + k * COL_BYTES + K_AFF] = if k == 3 {
+            AFF_INTEGER
+        } else {
+            AFF_TEXT
+        }
+    }
+    nm := mem_bytes("sqlite_schema")
+    d := schema_alloc(e, nm.len)?
+    copy_in(e.ws, d, nm)
+    o := obj(e, i)
+    e.ws[o + O_TYPE] = OT_TABLE
+    st16(e.ws, o + O_NCOL, 5)
+    st32(e.ws, o + O_ROOT, 1)
+    stu(e.ws, o + O_NAME, d)
+    stu(e.ws, o + O_NAMEL, nm.len)
+    stu(e.ws, o + O_TBL, d)
+    stu(e.ws, o + O_TBLL, nm.len)
+    stu(e.ws, o + O_COLS, cols)
+    stu(e.ws, o + O_ROWID, NO_COL)
+    ok(i)
+}
+
+// USING(col): left side is the nearest earlier source with that column.
+fn using_term(e: &mut Engine, s: usize, right: usize, rl: usize, u: usize) -> usize!db.Error {
+    rt := ng(e, right)
+    let u_a = na(e, u)
+    let u_b = nb(e, u)
+    rc := find_column(e, rt, u_a, u_b)
+    if rc == NO_COL {
+        return err(fail(e, SQLITE_ERROR, "cannot join using column - column not present in both tables"))
+    }
+    left := 0usize
+    lcol := NO_COL
+    p := nb(e, s)
+    k := 0usize
+    for p != 0 && k < rl {
+        let p_g = ng(e, p)
+        let u_a2 = na(e, u)
+        let u_b2 = nb(e, u)
+        c := find_column(e, p_g, u_a2, u_b2)
+        if c != NO_COL {
+            left = p
+            lcol = c
+        }
+        p = nnext(e, p)
+        k += 1
+    }
+    if left == 0 {
+        return err(fail(e, SQLITE_ERROR, "cannot join using column - column not present in both tables"))
+    }
+    a := new_node(e, N_COL)?
+    let value = (nx(e, left) & 0xffffffffu64) as usize
+    set_nf(e, a, 0, value)
+    set_nf(e, a, 1, lcol)
+    let left_g = ng(e, left)
+    set_nf(e, a, 2, left_g)
+    b := new_node(e, N_COL)?
+    let value2 = (nx(e, right) & 0xffffffffu64) as usize
+    set_nf(e, b, 0, value2)
+    set_nf(e, b, 1, rc)
+    set_nf(e, b, 2, rt)
+    binary(e, OP_EQ, a, b)
+}
+
+fn expand_stars(e: &mut Engine, s: usize) -> void!db.Error {
+    head := 0usize
+    tail := 0usize
+    rc := na(e, s)
+    for rc != 0 {
+        next := nnext(e, rc)
+        x := na(e, rc)
+        if nkind(e, x) != N_STAR {
+            set_next(e, rc, 0)
+            let (h, t) = list_append(e, head, tail, rc)
+            head = h
+            tail = t
+            rc = next
+            continue
+        }
+        qo := na(e, x)
+        ql := nb(e, x)
+        any := false
+        src := nb(e, s)
+        for src != 0 {
+            if ql != 0 {
+                let src_c = nc(e, src)
+                let src_d = ndd(e, src)
+                let src_a = na(e, src)
+                let src_b = nb(e, src)
+                matches := if ndd(e, src) != 0 {
+                    names_eq(e, src_c, src_d, qo, ql)
+                } else {
+                    names_eq(e, src_a, src_b, qo, ql)
+                }
+                if !matches {
+                    src = nnext(e, src)
+                    continue
+                }
+            }
+            t := ng(e, src)
+            for c in 0usize..obj_ncol(e, t) {
+                // USING columns of later sources appear once.
+                r := col_rec(e, t, c)
+                let cn = ldu(e.ws, r + K_NAME)
+                let cl = ldu(e.ws, r + K_NAMEL)
+                if ql == 0 && using_merged(e, src, cn, cl) {
+                    continue
+                }
+                col := new_node(e, N_COL)?
+                let value = (nx(e, src) & 0xffffffffu64) as usize
+                set_nf(e, col, 0, value)
+                set_nf(e, col, 1, c)
+                set_nf(e, col, 2, t)
+                item := new_node(e, N_RESCOL)?
+                set_nf(e, item, 0, col)
+                set_nf(e, item, 1, cn)
+                set_nf(e, item, 2, cl)
+                let (h, tl) = list_append(e, head, tail, item)
+                head = h
+                tail = tl
+                any = true
+            }
+            src = nnext(e, src)
+        }
+        if !any {
+            if ql != 0 {
+                e.msg_len = 0
+                msg_add(e, "no such table: ")
+                msg_add_ws(e, qo, ql)
+                return err(make_error(e, SQLITE_ERROR))
+            }
+            return err(fail(e, SQLITE_ERROR, "no tables specified"))
+        }
+        rc = next
+    }
+    set_nf(e, s, 0, head)
+    ok()
+}
+
+// ORDER BY / GROUP BY item: column number, result alias, or expression.
+fn resolve_order_item(e: &mut Engine, s: usize, item: usize, is_order: bool) -> void!db.Error {
+    x := na(e, item)
+    if nkind(e, x) == N_INT {
+        k := u2i(nx(e, x))
+        let s_a = na(e, s)
+        nres := list_len(e, s_a)
+        if k < 1 || (k as usize) > nres {
+            e.msg_len = 0
+            msg_add(e, if is_order {
+                "ORDER BY term out of range - should be between 1 and "
+            } else {
+                "GROUP BY term out of range - should be between 1 and "
+            })
+            msg_add_int(e, nres as i64)
+            return err(make_error(e, SQLITE_ERROR))
+        }
+        rc := na(e, s)
+        for _ in 1usize..(k as usize) {
+            rc = nnext(e, rc)
+        }
+        set_kind(e, x, N_ALIAS)
+        let rc_a = na(e, rc)
+        set_nf(e, x, 0, rc_a)
+        return ok()
+    }
+    let x_a = na(e, x)
+    if nkind(e, x) == N_COLLATE && nkind(e, x_a) == N_INT {
+        inner := na(e, x)
+        k := u2i(nx(e, inner))
+        rc := na(e, s)
+        nres := list_len(e, rc)
+        if k >= 1 && (k as usize) <= nres {
+            for _ in 1usize..(k as usize) {
+                rc = nnext(e, rc)
+            }
+            set_kind(e, inner, N_ALIAS)
+            let rc_a2 = na(e, rc)
+            set_nf(e, inner, 0, rc_a2)
+            return ok()
+        }
+    }
+    resolve_expr(e, x, s, is_order)
+}
+
+// ---------------------------------------------------------------------------
+// Planning
+
+fn plan_select(e: &mut Engine, s: usize, info: usize) -> void!db.Error {
+    nlev := iget(e, info, I_NLEV)
+    // WHERE terms.
+    wterms := pool_alloc(e, 256)?
+    let s_c = nc(e, s)
+    nw := split_and(e, s_c, wterms, 0, 64)
+    if nw > 64 {
+        nw = 64
+        // Extra terms stay in the final check via the full WHERE.
+        let s_c2 = nc(e, s)
+        iset(e, info, I_FINAL, s_c2)
+    }
+    iset(e, info, I_WHERE, wterms)
+    used := pool_alloc(e, 64)?
+    zero_bytes(e.ws, used, 64)
+    src := nb(e, s)
+    for l in 0usize..nlev {
+        lv := lev(e, info, l)
+        let src_e = ne_(e, src)
+        stu(e.ws, lv + L_ON, src_e)
+        left := e.ws[lv + L_LEFT] != 0
+        // Candidate equality terms: ON terms of this level, and WHERE terms
+        // unless this level is the right side of a LEFT JOIN.
+        oterms := pool_alloc(e, 128)?
+        let src_e2 = ne_(e, src)
+        no := split_and(e, src_e2, oterms, 0, 32)
+        if no > 32 {
+            no = 32
+        }
+        choose_plan(e, info, l, oterms, no, if left {
+            0usize
+        } else {
+            wterms
+        }, if left {
+            0usize
+        } else {
+            nw
+        })?
+        src = nnext(e, src)
+    }
+    // Assign WHERE terms to the earliest level where they can be checked;
+    // terms on the right side of a LEFT JOIN wait for the final check.
+    final_terms := pool_alloc(e, 256)?
+    nfinal := 0usize
+    for l in 0usize..nlev {
+        lv := lev(e, info, l)
+        arr := pool_alloc(e, 256)?
+        stu(e.ws, lv + L_TERMS, arr)
+        stu(e.ws, lv + L_NTERMS, 0)
+    }
+    for i in 0usize..nw {
+        t := ldu(e.ws, wterms + i * 4)
+        m := max_level(e, t, info, nlev)
+        if m == NO_COL && nlev > 0 {
+            m = 0
+        }
+        target := NO_COL
+        if m != 1000 && m != NO_COL && m < nlev {
+            // The term can be checked at level m unless m (or an earlier
+            // level the term depends on) is a LEFT JOIN right side.
+            if e.ws[lev(e, info, m) + L_LEFT] == 0 {
+                target = m
+            }
+        }
+        if target == NO_COL {
+            stu(e.ws, final_terms + nfinal * 4, t)
+            nfinal += 1
+        } else {
+            lv := lev(e, info, target)
+            cnt := ldu(e.ws, lv + L_NTERMS)
+            let arr = ldu(e.ws, lv + L_TERMS)
+            stu(e.ws, arr + cnt * 4, t)
+            stu(e.ws, lv + L_NTERMS, cnt + 1)
+        }
+    }
+    // Store the final check list as a pseudo-level array in I_WHERE/I_FINAL.
+    iset(e, info, I_WHERE, final_terms)
+    iset(e, info, I_NFINAL, nfinal)
+    if nlev == 0 && nw > 0 {
+        iset(e, info, I_NFINAL, nw)
+        iset(e, info, I_WHERE, wterms)
+    }
+    plan_output(e, s, info)
+}
+
+// Picks the access path for level l from equality terms.
+fn choose_plan(e: &mut Engine, info: usize, l: usize, a: usize, na_: usize, b: usize, nb_: usize) -> void!db.Error {
+    lv := lev(e, info, l)
+    if ldu(e.ws, lv + L_PLAN) == PLAN_SUBQ || ldu(e.ws, lv + L_PLAN) == PLAN_QUEUE {
+        return ok()
+    }
+    c := ldu(e.ws, lv + L_CUR)
+    t := ldu(e.ws, lv + L_TABLE)
+    nlev := iget(e, info, I_NLEV)
+    // Rowid equality.
+    for pass in 0usize..2 {
+        arr := if pass == 0 {
+            a
+        } else {
+            b
+        }
+        cnt := if pass == 0 {
+            na_
+        } else {
+            nb_
+        }
+        for i in 0usize..cnt {
+            term := ldu(e.ws, arr + i * 4)
+            let (col, other) = eq_term_side(e, term, c, info, l, nlev)
+            if other != 0 && (col == NO_COL || col == rowid_col(e, t)) && col != NO_COL - 1 {
+                stu(e.ws, lv + L_PLAN, PLAN_ROWID)
+                stu(e.ws, lv + L_KEYS, other)
+                return ok()
+            }
+        }
+    }
+    // Index equality on leading columns.
+    best := NO_COL
+    best_n := 0usize
+    best_keys := 0usize
+    x := next_index_of(e, t, NO_COL)
+    for x != NO_COL {
+        keys := pool_alloc(e, 4 * 33)?
+        nk := 0usize
+        ncols := obj_ncol(e, x)
+        for k in 0usize..ncols {
+            want := idx_col(e, x, k)
+            found := 0usize
+            for pass in 0usize..2 {
+                arr := if pass == 0 {
+                    a
+                } else {
+                    b
+                }
+                cnt := if pass == 0 {
+                    na_
+                } else {
+                    nb_
+                }
+                for i in 0usize..cnt {
+                    if found != 0 {
+                        break
+                    }
+                    term := ldu(e.ws, arr + i * 4)
+                    let (col, other) = eq_term_side(e, term, c, info, l, nlev)
+                    if other != 0 && col == want && want != NO_COL {
+                        // Collation of the comparison must match the index.
+                        let term_a = na(e, term)
+                        let term_b = nb(e, term)
+                        coll := binary_collation(e, term_a, term_b)
+                        if coll == e.ws[col_rec(e, x, k) + K_COLL] && index_affinity_ok(e, t, col, other) {
+                            found = other
+                        }
+                    }
+                }
+            }
+            if found == 0 {
+                break
+            }
+            stu(e.ws, keys + nk * 4, found)
+            nk += 1
+            if nk >= 32 {
+                break
+            }
+        }
+        unique_full := nk == ncols && (obj_flags(e, x) & OF_UNIQUE) != 0
+        if nk > best_n || (nk == best_n && nk > 0 && unique_full) {
+            best = x
+            best_n = nk
+            best_keys = keys
+        }
+        x = next_index_of(e, t, x)
+    }
+    if best != NO_COL && best_n > 0 {
+        stu(e.ws, lv + L_PLAN, PLAN_INDEX)
+        stu(e.ws, lv + L_INDEX, best)
+        stu(e.ws, lv + L_KEYS, best_keys)
+        stu(e.ws, lv + L_NEQ, best_n)
+        kr := alloc_regs(e, best_n)?
+        stu(e.ws, lv + L_KEYREG, kr)
+        ic := alloc_cursor(e)?
+        stu(e.ws, lv + L_ICUR, ic)
+        return ok()
+    }
+    // Rowid lower bound.
+    for pass in 0usize..2 {
+        arr := if pass == 0 {
+            a
+        } else {
+            b
+        }
+        cnt := if pass == 0 {
+            na_
+        } else {
+            nb_
+        }
+        for i in 0usize..cnt {
+            term := ldu(e.ws, arr + i * 4)
+            if nkind(e, term) != N_BINARY {
+                continue
+            }
+            op := nop(e, term)
+            if op != OP_GT && op != OP_GE && op != OP_LT && op != OP_LE {
+                continue
+            }
+            lhs := na(e, term)
+            rhs := nb(e, term)
+            if is_rowid_ref(e, lhs, c, t) && depends_before(e, rhs, info, l, nlev) && (op == OP_GT || op == OP_GE) {
+                stu(e.ws, lv + L_PLAN, PLAN_RANGE)
+                stu(e.ws, lv + L_KEYS, term)
+                return ok()
+            }
+            if is_rowid_ref(e, rhs, c, t) && depends_before(e, lhs, info, l, nlev) && (op == OP_LT || op == OP_LE) {
+                stu(e.ws, lv + L_PLAN, PLAN_RANGE)
+                stu(e.ws, lv + L_KEYS, term)
+                return ok()
+            }
+        }
+    }
+    stu(e.ws, lv + L_PLAN, PLAN_SCAN)
+    ok()
+}
+
+fn is_rowid_ref(e: &Engine, n: usize, c: usize, t: usize) -> bool {
+    nkind(e, n) == N_COL && na(e, n) == c && (nb(e, n) == NO_COL || nb(e, n) == rowid_col(e, t))
+}
+
+fn index_affinity_ok(e: &Engine, t: usize, col: usize, other: usize) -> bool {
+    ca := col_aff(e, t, col)
+    oa := expr_affinity(e, other)
+    if ca == AFF_BLOB {
+        return oa == AFF_NONE || oa == AFF_BLOB
+    }
+    if ca == AFF_TEXT {
+        return !is_numeric_aff(oa)
+    }
+    true
+}
+
+// True when `n` only depends on levels before l (or on nothing).
+fn depends_before(e: &Engine, n: usize, info: usize, l: usize, nlev: usize) -> bool {
+    m := max_level(e, n, info, nlev)
+    if m == 1000 {
+        return false
+    }
+    m == NO_COL || m < l
+}
+
+// For `col = expr` (either orientation) on cursor c: returns (column,
+// expr) when expr only depends on earlier levels; expr 0 otherwise.
+fn eq_term_side(e: &Engine, term: usize, c: usize, info: usize, l: usize, nlev: usize) -> (usize, usize) {
+    if nkind(e, term) != N_BINARY || (nop(e, term) != OP_EQ && nop(e, term) != OP_IS) {
+        return (NO_COL - 1, 0usize)
+    }
+    if nop(e, term) == OP_IS {
+        return (NO_COL - 1, 0usize)
+    }
+    lhs := na(e, term)
+    rhs := nb(e, term)
+    if nkind(e, lhs) == N_COL && na(e, lhs) == c && depends_before(e, rhs, info, l, nlev) {
+        return (nb(e, lhs), rhs)
+    }
+    if nkind(e, rhs) == N_COL && na(e, rhs) == c && depends_before(e, lhs, info, l, nlev) {
+        return (nb(e, rhs), lhs)
+    }
+    (NO_COL - 1, 0usize)
+}
+
+// Decides the output mode and converts columns to slots for aggregates.
+fn plan_output(e: &mut Engine, s: usize, info: usize) -> void!db.Error {
+    ext := ndd(e, s)
+    order := if ext != 0 {
+        nc(e, ext)
+    } else {
+        0usize
+    }
+    distinct := (nflags(e, s) & 1) != 0
+    norder := list_len(e, order)
+    iset(e, info, I_NORDER, norder)
+    if order != 0 || distinct {
+        iset(e, info, I_MODE, MODE_SORT)
+    }
+    nres := iget(e, info, I_NRES)
+    // Key info for the final sorter: order keys then result columns.
+    oinfo := pool_alloc(e, (norder + nres + 1) * 2)?
+    o := order
+    k := 0usize
+    for o != 0 {
+        x := na(e, o)
+        let (coll, _) = expr_collation(e, x)
+        e.ws[oinfo + k * 2] = coll
+        flags := nflags(e, o)
+        e.ws[oinfo + k * 2 + 1] = if (flags & 1) != 0 {
+            1u8
+        } else {
+            0u8
+        }
+        if (flags & 2) != 0 && (flags & 1) == 0 {
+            e.ws[oinfo + k * 2 + 1] = e.ws[oinfo + k * 2 + 1] | 2
+        }
+        if (flags & 4) != 0 && (flags & 1) != 0 {
+            e.ws[oinfo + k * 2 + 1] = e.ws[oinfo + k * 2 + 1] | 4
+        }
+        k += 1
+        o = nnext(e, o)
+    }
+    rc := na(e, s)
+    for rc != 0 {
+        let rc_a = na(e, rc)
+        let (coll, _) = expr_collation(e, rc_a)
+        e.ws[oinfo + k * 2] = coll
+        e.ws[oinfo + k * 2 + 1] = 0
+        k += 1
+        rc = nnext(e, rc)
+    }
+    iset(e, info, I_ORDINFO, oinfo)
+    agg := iget(e, info, I_AGG)
+    if agg == AGG_NONE {
+        return ok()
+    }
+    // Slots: every column referenced by the select's own expressions.
+    let value = if ext != 0 {
+        na(e, ext)
+    } else {
+        0usize
+    }
+    e.group_list = value
+    slots := pool_alloc(e, 4 * 256)?
+    iset(e, info, I_SLOTS, slots)
+    iset(e, info, I_NSLOT, 0)
+    rc = na(e, s)
+    for rc != 0 {
+        let rc_a2 = na(e, rc)
+        slotify(e, rc_a2, info)?
+        rc = nnext(e, rc)
+    }
+    if ext != 0 {
+        g := na(e, ext)
+        for g != 0 {
+            let g_a = na(e, g)
+            slotify(e, g_a, info)?
+            g = nnext(e, g)
+        }
+        let ext_b = nb(e, ext)
+        slotify(e, ext_b, info)?
+        o = nc(e, ext)
+        for o != 0 {
+            let o_a = na(e, o)
+            slotify(e, o_a, info)?
+            o = nnext(e, o)
+        }
+    }
+    ngroup := iget(e, info, I_NGROUP)
+    ginfo := pool_alloc(e, (ngroup + 1) * 2)?
+    g := if ext != 0 {
+        na(e, ext)
+    } else {
+        0usize
+    }
+    k = 0
+    for g != 0 {
+        let g_a2 = na(e, g)
+        let (coll, _) = expr_collation(e, g_a2)
+        e.ws[ginfo + k * 2] = coll
+        // With as many ORDER BY as GROUP BY terms, SQLite sorts the groups
+        // in the ORDER BY directions.
+        e.ws[ginfo + k * 2 + 1] = if norder == ngroup {
+            e.ws[oinfo + k * 2 + 1] & 1
+        } else {
+            0u8
+        }
+        k += 1
+        g = nnext(e, g)
+    }
+    iset(e, info, I_GRPINFO, ginfo)
+    ok()
+}
+
+fn slot_is_group_key(e: &Engine, info: usize, c: usize, col: usize) -> bool {
+    g := e.group_list
+    for g != 0 {
+        x := na(e, g)
+        if (nkind(e, x) == N_COL || nkind(e, x) == N_SLOT) && na(e, x) == c && nb(e, x) == col {
+            return true
+        }
+        g = nnext(e, g)
+    }
+    false
+}
+
+// Turns N_COL nodes of this select's cursors into N_SLOT nodes that read
+// the materialized record when one is current (and the cursor otherwise).
+fn slotify(e: &mut Engine, n: usize, info: usize) -> void!db.Error {
+    if n == 0 {
+        return ok()
+    }
+    k := nkind(e, n)
+    if k == N_COL {
+        nlev := iget(e, info, I_NLEV)
+        c := na(e, n)
+        mine := false
+        for l in 0usize..nlev {
+            if ldu(e.ws, lev(e, info, l) + L_CUR) == c {
+                mine = true
+            }
+        }
+        if !mine {
+            return ok()
+        }
+        slots := iget(e, info, I_SLOTS)
+        ns := iget(e, info, I_NSLOT)
+        idx := NO_COL
+        for i in 0usize..ns {
+            other := ldu(e.ws, slots + i * 4)
+            if na(e, other) == c && nb(e, other) == nb(e, n) {
+                idx = i
+            }
+        }
+        if idx == NO_COL {
+            if ns >= 256 {
+                return err(fail(e, SQLITE_ERROR, "too many columns in an aggregate query"))
+            }
+            idx = ns
+            stu(e.ws, slots + ns * 4, n)
+            iset(e, info, I_NSLOT, ns + 1)
+        }
+        // Keep cursor/column/table for the fallback; e = slot index.
+        aff := expr_affinity(e, n)
+        let (coll, _) = expr_collation(e, n)
+        let n_b = nb(e, n)
+        key := slot_is_group_key(e, info, c, n_b)
+        set_kind(e, n, N_SLOT)
+        let iget2 = iget(e, info, I_NGROUP) + idx
+        set_nf(e, n, 4, iget2)
+        set_nf(e, n, 3, (aff as usize) | ((coll as usize) << 8) | (if key {
+            65536usize
+        } else {
+            0usize
+        }))
+        return ok()
+    }
+    if k == N_SUBQ || k == N_EXISTS || k == N_INSEL {
+        if k == N_INSEL {
+            let n_a = na(e, n)
+            slotify(e, n_a, info)?
+        }
+        return ok()
+    }
+    if k == N_FUNC || k == N_AGG {
+        a := nc(e, n)
+        for a != 0 {
+            slotify(e, a, info)?
+            a = nnext(e, a)
+        }
+        return ok()
+    }
+    if k == N_CASE {
+        let n_a2 = na(e, n)
+        slotify(e, n_a2, info)?
+        w := nb(e, n)
+        for w != 0 {
+            let w_a = na(e, w)
+            slotify(e, w_a, info)?
+            let w_b = nb(e, w)
+            slotify(e, w_b, info)?
+            w = nnext(e, w)
+        }
+        let n_c = nc(e, n)
+        return slotify(e, n_c, info)
+    }
+    if k == N_INLIST {
+        let n_a3 = na(e, n)
+        slotify(e, n_a3, info)?
+        item := nb(e, n)
+        for item != 0 {
+            slotify(e, item, info)?
+            item = nnext(e, item)
+        }
+        return ok()
+    }
+    if k == N_BINARY || k == N_LIKE || k == N_BETWEEN {
+        let n_a4 = na(e, n)
+        slotify(e, n_a4, info)?
+        let n_b2 = nb(e, n)
+        slotify(e, n_b2, info)?
+        if k != N_BINARY {
+            let n_c2 = nc(e, n)
+            slotify(e, n_c2, info)?
+        }
+        return ok()
+    }
+    if k == N_UNARY || k == N_CAST || k == N_COLLATE || k == N_ISNULL {
+        let n_a5 = na(e, n)
+        return slotify(e, n_a5, info)
+    }
+    ok()
+}
+
+// ---------------------------------------------------------------------------
+// Execution: levels
+
+fn level_reset(e: &mut Engine, info: usize) {
+    nlev := iget(e, info, I_NLEV)
+    for l in 0usize..nlev {
+        lv := lev(e, info, l)
+        e.ws[lv + L_STATE] = 0
+        e.ws[lv + L_MATCHED] = 0
+        e.ws[lv + L_NULLROW] = 0
+        c := ldu(e.ws, lv + L_CUR)
+        t := ldu(e.ws, lv + L_TABLE)
+        if ldu(e.ws, lv + L_PLAN) == PLAN_SUBQ || ldu(e.ws, lv + L_PLAN) == PLAN_QUEUE {
+            cur_open(e, c, 0, false)
+            stu(e.ws, lv + L_INDEX, 0)
+            continue
+        }
+        let root = obj_root(e, t)
+        cur_open(e, c, root, false)
+        if ldu(e.ws, lv + L_PLAN) == PLAN_INDEX {
+            x := ldu(e.ws, lv + L_INDEX)
+            ic := ldu(e.ws, lv + L_ICUR)
+            open_index_cursor(e, ic, x)
+        }
+    }
+}
+
+fn open_index_cursor(e: &mut Engine, ic: usize, x: usize) {
+    let root = obj_root(e, x)
+    cur_open(e, ic, root, true)
+    o := cur(e, ic)
+    n := obj_ncol(e, x)
+    for k in 0usize..n {
+        if k < 31 {
+            r := col_rec(e, x, k)
+            e.ws[o + C_INFO + k * 2] = e.ws[r + K_COLL]
+            e.ws[o + C_INFO + k * 2 + 1] = e.ws[r + K_DESC]
+        }
+    }
+    kk := if n < 31 {
+        n
+    } else {
+        31usize
+    }
+    e.ws[o + C_INFO + kk * 2] = COLL_BINARY
+    e.ws[o + C_INFO + kk * 2 + 1] = 0
+    stu(e.ws, o + C_NKEY, n + 1)
+}
+
+// Positions level l on its first (first=true) or next candidate row.
+fn level_move(e: &mut Engine, info: usize, l: usize, first: bool) -> bool!db.Error {
+    lv := lev(e, info, l)
+    c := ldu(e.ws, lv + L_CUR)
+    plan := ldu(e.ws, lv + L_PLAN)
+    if plan == PLAN_SCAN {
+        if first {
+            return cur_first(e, c)
+        }
+        return cur_next(e, c)
+    }
+    if plan == PLAN_QUEUE {
+        // The current row of a recursive common table expression.
+        if !first || e.queue_rec == 0 {
+            set_state(e, c, ST_EOF)
+            return ok(false)
+        }
+        rec := e.queue_rec
+        set_state(e, c, ST_VALID)
+        co := cur(e, c)
+        stu(e.ws, co + C_PAYOFF, rec + 4)
+        let len = ldu(e.ws, rec)
+        stu(e.ws, co + C_PAYLEN, len)
+        e.ws[co + C_PAYVALID] = 1
+        st64(e.ws, co + C_ROWID, 1u64)
+        return ok(true)
+    }
+    if plan == PLAN_SUBQ {
+        if ldu(e.ws, lv + L_INDEX) == 0 {
+            materialize_level(e, info, l)?
+        }
+        pos := if first {
+            0usize
+        } else {
+            ldu(e.ws, lv + L_ICUR) + 1
+        }
+        stu(e.ws, lv + L_ICUR, pos)
+        if pos >= ldu(e.ws, lv + L_NEQ) {
+            set_state(e, c, ST_EOF)
+            return ok(false)
+        }
+        rec := ldu(e.ws, ldu(e.ws, lv + L_INDEX) + pos * 4)
+        set_state(e, c, ST_VALID)
+        co := cur(e, c)
+        stu(e.ws, co + C_PAYOFF, rec + 4)
+        let len = ldu(e.ws, rec)
+        stu(e.ws, co + C_PAYLEN, len)
+        e.ws[co + C_PAYVALID] = 1
+        st64(e.ws, co + C_ROWID, (pos + 1) as u64)
+        return ok(true)
+    }
+    if plan == PLAN_ROWID {
+        if !first {
+            set_state(e, c, ST_EOF)
+            return ok(false)
+        }
+        save := e.rtop
+        r := reg_push(e)?
+        let keys2 = ldu(e.ws, lv + L_KEYS)
+        eval(e, keys2, r)?
+        compare_affinity(e, r, AFF_NUMERIC)?
+        t := rtype(e, r)
+        found := false
+        if t == T_INT {
+            let value = rint(e, r)
+            found = seek_rowid(e, c, value)?
+        } else if t == T_REAL {
+            let (exact, iv) = real_as_int(rreal(e, r))
+            if exact {
+                found = seek_rowid(e, c, iv)?
+            }
+        }
+        e.rtop = save
+        if !found {
+            set_state(e, c, ST_EOF)
+        }
+        return ok(found)
+    }
+    if plan == PLAN_RANGE {
+        if !first {
+            if !cur_next(e, c)? {
+                return ok(false)
+            }
+            return range_upper_ok(e, info, l)
+        }
+        term := ldu(e.ws, lv + L_KEYS)
+        op := nop(e, term)
+        bound := if op == OP_GT || op == OP_GE {
+            nb(e, term)
+        } else {
+            na(e, term)
+        }
+        inclusive := op == OP_GE || op == OP_LE
+        save := e.rtop
+        r := reg_push(e)?
+        eval(e, bound, r)?
+        compare_affinity(e, r, AFF_NUMERIC)?
+        t := rtype(e, r)
+        if t == T_NULL || t == T_TEXT || t == T_BLOB {
+            e.rtop = save
+            if t == T_NULL {
+                set_state(e, c, ST_EOF)
+                return ok(false)
+            }
+            // Text compares greater than every integer rowid.
+            set_state(e, c, ST_EOF)
+            return ok(false)
+        }
+        start := 0i64
+        if t == T_INT {
+            v := rint(e, r)
+            if inclusive {
+                start = v
+            } else if v == 9223372036854775807 {
+                e.rtop = save
+                set_state(e, c, ST_EOF)
+                return ok(false)
+            } else {
+                start = v + 1
+            }
+        } else {
+            f := rreal(e, r)
+            if f >= 9223372036854775807.0 {
+                e.rtop = save
+                set_state(e, c, ST_EOF)
+                return ok(false)
+            }
+            if f < -9223372036854775807.0 {
+                start = -9223372036854775807i64 - 1
+            } else {
+                iv := real_to_int(f)
+                start = if (iv as f64) < f || (!inclusive && (iv as f64) == f) {
+                    iv + 1
+                } else {
+                    iv
+                }
+            }
+        }
+        e.rtop = save
+        found := seek_rowid(e, c, start)?
+        if !found {
+            if !settle_forward(e, c)? {
+                return ok(false)
+            }
+        }
+        return ok(true)
+    }
+    // PLAN_INDEX
+    ic := ldu(e.ws, lv + L_ICUR)
+    x := ldu(e.ws, lv + L_INDEX)
+    t := ldu(e.ws, lv + L_TABLE)
+    neq := ldu(e.ws, lv + L_NEQ)
+    keys := ldu(e.ws, lv + L_KEYS)
+    key := e.rtop
+    if first {
+        for k in 0usize..neq {
+            r := reg_push(e)?
+            if r != key + k {
+                return err(fail(e, SQLITE_INTERNAL, "register stack"))
+            }
+        }
+        for k in 0usize..neq {
+            ex := ldu(e.ws, keys + k * 4)
+            eval(e, ex, key + k)?
+            if rtype(e, key + k) == T_NULL {
+                e.rtop = key
+                set_state(e, ic, ST_EOF)
+                set_state(e, c, ST_EOF)
+                return ok(false)
+            }
+            col := idx_col(e, x, k)
+            aff := col_aff(e, t, col)
+            if is_numeric_aff(aff) {
+                compare_affinity(e, key + k, AFF_NUMERIC)?
+            } else if aff == AFF_TEXT {
+                compare_affinity(e, key + k, AFF_TEXT)?
+            }
+        }
+        // Keep the key in registers owned by the level (copied to the arena).
+        kb := ldu(e.ws, lv + L_KEYREG)
+        for k in 0usize..neq {
+            copy_reg(e, kb + k, key + k)
+            reg_keep(e, kb + k)?
+        }
+        e.rtop = key
+        cmp := seek_index(e, ic, kb, neq)?
+        if cmp != 0 {
+            set_state(e, c, ST_EOF)
+            return ok(false)
+        }
+    } else {
+        if !cur_next(e, ic)? {
+            set_state(e, c, ST_EOF)
+            return ok(false)
+        }
+        kb := ldu(e.ws, lv + L_KEYREG)
+        let (p, n) = cur_payload(e, ic)?
+        let info2 = cur(e, ic) + C_INFO
+        if record_compare(e, p, n, kb, neq, info2)? != 0 {
+            set_state(e, ic, ST_EOF)
+            set_state(e, c, ST_EOF)
+            return ok(false)
+        }
+    }
+    // Rowid is the last field of the index record.
+    let (p, n) = cur_payload(e, ic)?
+    nf := record_count(e, p, n)
+    record_column(e, p, n, nf - 1, R_TMP)?
+    let value2 = rint(e, R_TMP)
+    if !seek_rowid(e, c, value2)? {
+        return err(corrupt(e))
+    }
+    ok(true)
+}
+
+// Upper bound of a rowid range scan: stop once the bound fails.
+fn range_upper_ok(e: &mut Engine, info: usize, l: usize) -> bool!db.Error {
+    ok(true)
+}

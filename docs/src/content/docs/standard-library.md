@@ -50,6 +50,7 @@ they are not prerequisites for using the safe entry APIs.
 | Load, resize and save an image file | `image_alloc.load`, `picture.resize` and `picture.save_auto` | [Images](image.md#owned-images-and-files) |
 | Draw smooth shapes, gradients, or TrueType text | `canvas.aa_fill_circle`, `graphics.Gradient`, `truetype.Font.new` | [Graphics](graphics.md#antialiased-drawing) |
 | Open windows | `window.App.new`, `app.open` and `win.canvas()` | [Windows](window.md) |
+| Draw into a window with the GPU | `window.Options.gpu`, `win.native_handle()`, `opengl.Context.create_for_window` | [Windows](window.md#drawing-with-the-gpu) |
 | Render with the GPU through OpenGL | `opengl.Context.create`, `opengl.Target.new` and the `gl` commands | [OpenGL](opengl.md) |
 | Compute or render on any GPU | `gpu.Device.open`, `device.encoder()` and `encoder.submit()` | [GPU programming](gpu.md) |
 | Run a shader on the GPU (macOS) | `metal.Device.system_default` and `new_library_with_source` | [Metal](metal.md) |
@@ -60,6 +61,8 @@ they are not prerequisites for using the safe entry APIs.
 | Serve a route | `app.new().get(...).run(...)` from `std/web/app` | [Web applications](web.md) |
 | React to MQTT messages or publish on a timer | `app.new(id).on(...).every(...).run(url)` from `std/mqtt/app` | [MQTT](mqtt.md) |
 | Run an MQTT broker | `broker.new().run(address)` from `std/mqtt/broker` | [MQTT](mqtt.md#the-broker) |
+| Store data in an SQL database file | `sqlite.Connection.open(path, workspace)` and `execute`/`select` from `std/db/sqlite` | [SQLite databases](sqlite.md) |
+| Run Lua scripts or plugins inside a program | `lua.Lua.new()`, `open_libs()` and `cx.do_string` from `std/script/lua` | [Embedded scripting with Lua](script.md) |
 
 Use a fresh directory for each copied example and run the commands there.
 A marked `dodo test` example also runs through
@@ -203,7 +206,7 @@ individual modules and links every public declaration back to its source.
 | [Hashing and checksums](hash.md) | `std/checksum`, `std/hash` | Portable. |
 | [Graphics](graphics.md) | `std/graphics`, `std/graphics/fake`, `std/graphics/font`, `std/graphics/image`, `std/graphics/truetype`; panels in `std/embedded/display`, `std/embedded/display/st7789`, `std/embedded/display/ssd1306` | Portable; caller-supplied pixel and file buffers. |
 | [Images](image.md) | `std/image`, `std/image/pixels`, `std/image/color`, `std/image/convert`, `std/image/sink`, `std/image/meta`, `std/image/ops`, `std/image/shared/binary`, `std/image/shared/scratch`, `std/image/shared/isobmff`, `std/image/ppm`, `std/image/qoi`, `std/image/bmp`, `std/image/png`, `std/image/jxl`, `std/image/jxl/encode`; owned images and files in `std/image_alloc` | Portable with caller-supplied pixel, scratch and file buffers; `std/image_alloc` adds an explicit allocator and hosted files. |
-| [Windows](window.md) | `std/window`, `std/window/x11` | Hosted: X11 on Linux, AppKit on macOS, Win32 on Windows; the X11 protocol code is portable. |
+| [Windows](window.md) | `std/window`, `std/window/x11`, `std/window/handle` | Hosted: X11 on Linux, AppKit on macOS, Win32 on Windows; the X11 protocol code and the native handle type are portable. |
 | [OpenGL](opengl.md) | `std/gpu/opengl`, `std/gpu/opengl/gl` | Hosted: EGL on Linux, CGL on macOS, WGL on Windows, loaded at run time; the generated binding is portable. |
 | [Metal](metal.md) | `std/gpu/metal`, `std/gpu/metal/objc` | macOS only (Apple silicon and Intel); links Metal, QuartzCore and Foundation. |
 | [GPU programming](gpu.md) | `std/gpu`, `std/gpu/hal` | Hosted: Metal on macOS, Vulkan on Linux and Windows, OpenGL 4.5 where Vulkan is missing; nothing beyond Metal is linked. |
@@ -223,7 +226,9 @@ individual modules and links every public declaration back to its source.
 | [QUIC](quic.md) | `std/quic`, `std/quic/openssl` | Error and state vocabulary portable; OpenSSL endpoints hosted. |
 | [HTTP](http.md), [hosted HTTP/HTTPS](hosted-http.md) | `std/http`, `std/http/client`, `std/http/connection`, `std/http/hosted`, `std/http/https`, `std/http/server` | Protocol/polling portable; hosted/HTTPS explicit. |
 | [MQTT](mqtt.md) | `std/mqtt`, `std/mqtt/app`, `std/mqtt/broker`, `std/mqtt/hosted` | Packets/topics/handlers/test deliveries portable; app, broker, and client hosted. |
+| [SQLite databases](sqlite.md) | `std/db`, `std/db/sql`, `std/db/sqlite` | Vocabulary and interfaces portable; the SQLite driver is hosted (files) and written entirely in Dodo. |
 | [Web serving](web.md) | `std/web`, `std/web/application`, `std/web/app`, `std/web/hosted`, `std/web/https`, `std/web/reactor`, `std/web/response`, `std/web/server`, `std/web/static_files`, `std/web/stream`, `std/web/testing` | Routing/registration/composition portable; app/hosted/HTTPS/reactor/static files explicit. |
+| [Embedded scripting with Lua](script.md) | `std/script/lua` | Hosted: Linux, macOS, and Windows; `io` and `os` follow the target C library. |
 | [Hardware and embedded](hardware.md) | `std/embedded/hal`, `std/embedded/hal/serial`, `std/embedded/hal/fake`, `std/embedded/executor`, `std/embedded/sync`, `std/embedded/power`, `std/embedded/storage`, `std/embedded/board`, `std/embedded/chip`, `std/embedded/peripheral/designware_i2c`, `std/embedded/peripheral/pl022`, `std/embedded/peripheral/pl011`, `std/embedded/wireless/cyw43`, `std/embedded/can/mcp2515`, `std/embedded/rtc/ds3231`, `std/embedded/cortex_m` | `std/embedded/hal`, `std/embedded/executor`, `std/embedded/sync`, and `std/embedded/power` are portable, with interrupt masking on bare-metal Cortex-M and RISC-V. `std/embedded/cortex_m` (interrupt controller, SysTick, barriers) runs only on Cortex-M. `std/embedded/board` and `std/embedded/chip` resolve to the firmware build's board and chip packages, such as `std/embedded/board/pico2` and `std/embedded/chip/rp2350`. |
 
 ## Implementation and adapter packages
@@ -276,6 +281,8 @@ select providers; they are not additional recommended starting paths.
 | `std/gpu/opengl/macos` | CGL context adapter; use [OpenGL](opengl.md). |
 | `std/gpu/opengl/windows` | WGL context adapter; use [OpenGL](opengl.md). |
 | `std/gpu/opengl/common` | Error type and helpers the adapters share; use [OpenGL](opengl.md). |
+| `std/script/posix` | Lua host boundary on Linux and macOS (C library streams, processes, time, locale); use [Lua](script.md#platforms). |
+| `std/script/windows` | Lua host boundary on Windows; use [Lua](script.md#platforms). |
 | `std/gpu/hal/vulkan` | `std/gpu`'s Vulkan backend; use [GPU programming](gpu.md). |
 | `std/gpu/hal/opengl` | `std/gpu`'s OpenGL backend; use [GPU programming](gpu.md). |
 | `std/gpu/hal/macos` | `std/gpu`'s Metal backend, its native one on macOS; use [GPU programming](gpu.md). |
@@ -287,7 +294,7 @@ Virtual imports `std/platform/native`, `std/fs/native`, `std/env/native`,
 `std/process/native`, `std/signal/native`, `std/thread/native`, `std/sync/native`, `std/net/native`,
 `std/time/native`, `std/tls/native`, `std/quic/native`, `std/crypto/native`,
 `std/crypto/openssl/native`, `std/web/native`, `std/window/native`,
-`std/gpu/opengl/native` and `std/gpu/hal/native` select compatible providers. `std/platform/native` exposes advanced native values;
+`std/gpu/opengl/native`, `std/gpu/hal/native` and `std/script/native` select compatible providers. `std/platform/native` exposes advanced native values;
 `std/net/native` is also the public socket entry point. Explicit `linux`/`windows`
 imports are for matching-target integrations. `runtime.c` files are embedded
 implementation boundaries, not Dodo imports.

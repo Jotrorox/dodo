@@ -1,0 +1,77 @@
+package sql
+
+import "std/db"
+
+// Shared interfaces for SQL drivers. Every SQL driver's connection matches
+// `Conn` structurally, so generic code (`<C: sql.Conn>`, specialized with no
+// overhead) and runtime-selected code (`&mut dyn sql.Conn`) work with any of
+// them. Rows are delivered to a visitor because a method cannot return "some
+// driver's row type"; the row and its borrowed values are valid only during
+// the visitor call.
+
+pub interface Row {
+    // Number of result columns.
+    fn len(&self) -> usize
+    // Column name as written in the statement (or its alias).
+    fn name(&self, index: usize) -> &str
+    // Column value. Text and Bytes borrow the driver's workspace.
+    fn get(&self, index: usize) -> db.Value!db.Error
+}
+
+pub interface RowSink {
+    fn row(&mut self, row: &dyn Row) -> void!db.Error
+}
+
+pub interface Conn {
+    // Runs one statement and returns the number of rows it changed.
+    fn execute(&mut self, sql: &str, params: &[db.Value]) -> u64!db.Error
+    // Runs one statement and passes every result row to `sink`.
+    fn query(&mut self, sql: &str, params: &[db.Value], sink: &mut dyn RowSink) -> void!db.Error
+    fn begin(&mut self, level: db.IsolationLevel) -> void!db.Error
+    fn commit(&mut self) -> void!db.Error
+    fn rollback(&mut self) -> void!db.Error
+}
+
+// Ready-made sinks for the common shapes.
+
+// Counts rows and discards them.
+pub struct Count {
+    pub rows: u64
+
+    pub fn new() -> Count {
+        Count { rows: 0 }
+    }
+
+    pub fn row(&mut self, row: &dyn Row) -> void!db.Error {
+        self.rows += 1
+        ok()
+    }
+}
+
+// Captures the first column of the first row as an integer. NULL leaves
+// `found` false; other non-integer values are a Type error.
+pub struct ScalarInt {
+    pub value: i64
+    pub found: bool
+
+    pub fn new() -> ScalarInt {
+        ScalarInt { value: 0, found: false }
+    }
+
+    pub fn row(&mut self, row: &dyn Row) -> void!db.Error {
+        if self.found || row.len() == 0 {
+            return ok()
+        }
+        match row.get(0)? {
+            db.Value.Null => {},
+            db.Value.Int(v) => {
+                self.value = v
+                self.found = true
+            },
+            _ => {
+                return err(db.Error.new(db.ErrorKind.Type, 20))
+            },
+        }
+        ok()
+    }
+}

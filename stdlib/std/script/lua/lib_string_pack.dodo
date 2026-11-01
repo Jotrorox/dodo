@@ -1,0 +1,480 @@
+package lua
+
+import "core/mem"
+import "core/ptr"
+
+// string.pack, string.packsize and string.unpack (reference manual 6.4.2).
+//
+// A format is read option by option (it ends at its first NUL byte, as in C).
+// Every option has a size and an alignment (normally its size, capped by the
+// maximum set with '!'); 'X' takes the alignment of the following option and
+// 'c' strings are never aligned. Integers of up to 16 bytes are supported:
+// packing sign-extends beyond 8 bytes, unpacking checks that the extra bytes
+// are a pure sign extension.
+
+const PK_INT: u32 = 0
+const PK_UINT: u32 = 1
+const PK_FLOAT: u32 = 2
+const PK_NUMBER: u32 = 3
+const PK_DOUBLE: u32 = 4
+const PK_CHAR: u32 = 5
+const PK_STRING: u32 = 6
+const PK_ZSTR: u32 = 7
+const PK_PADDING: u32 = 8
+const PK_PADDALIGN: u32 = 9
+const PK_NOP: u32 = 10
+
+const PK_MAXINTSIZE: i32 = 16
+// Native maximum alignment (the largest scalar alignment, 8 on 64-bit hosts).
+const PK_NATIVE_ALIGN: i32 = 8
+
+// Parsing state of one format string.
+struct PkState {
+    fmt: *const u8
+    // Bytes up to the first NUL.
+    flen: usize
+    at: usize
+    little: bool
+    maxalign: i32
+}
+
+fn pk_state(fmt: *const u8, n: usize) -> PkState {
+    return PkState {
+        fmt: fmt, flen: sl_find_byte(fmt, 0, n, 0), at: 0, little: true, maxalign: 1,
+    }
+}
+
+fn pk_peek(st: &PkState) -> u8 {
+    if st.at < st.flen {
+        return sl_load(st.fmt, st.at)
+    }
+    return 0
+}
+
+// A decimal count, or `def` when none follows; stops before overflowing int.
+fn pk_number(st: &mut PkState, def: i32) -> i32 {
+    c := pk_peek(st)
+    if c < b'0' || c > b'9' {
+        return def
+    }
+    a := 0i32
+    for {
+        a = a * 10 + (c - b'0') as i32
+        st.at += 1
+        c = pk_peek(st)
+        if c < b'0' || c > b'9' || a > 214748363 {
+            break
+        }
+    }
+    return a
+}
+
+fn pk_size_limit(cx: &mut Cx, st: &mut PkState, def: i32, out: &mut i32) -> void!Throw {
+    let sz = pk_number(st, def)
+    if sz > PK_MAXINTSIZE || sz <= 0 {
+        b := Buffer.new(cx)
+        b.add_str("integral size (")?
+        b.add_integer(sz as i64)?
+        b.add_str(") out of limits [1,16]")?
+        return err(cx.error_buffer(&mut b))
+    }
+    *out = sz
+    return ok()
+}
+
+// Option byte -> kind (bits 0-3; 11/12 endianness, 13 '!', 15 invalid),
+// default size (bits 4-7) and numeric suffix (bits 8-9: 1 size limit, 2 'c' count).
+const PK_OPTIONS: [256]u16 = [
+    15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
+    15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
+    10, 397, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
+    15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 11, 11, 12, 15,
+    15, 15, 17, 15, 15, 15, 15, 15, 33, 321, 129, 15, 129, 15, 15, 15,
+    15, 15, 15, 15, 129, 15, 15, 15, 9, 15, 15, 15, 15, 15, 15, 15,
+    15, 15, 16, 517, 132, 15, 66, 15, 32, 320, 128, 15, 128, 15, 131, 15,
+    15, 15, 15, 390, 15, 15, 15, 15, 24, 15, 7, 15, 15, 15, 15, 15,
+    15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
+    15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
+    15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
+    15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
+    15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
+    15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
+    15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
+    15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
+]
+
+// Read the next option: its kind and size.
+fn pk_option(cx: &mut Cx, st: &mut PkState, kind: &mut u32, size: &mut i32) -> void!Throw {
+    let opt = pk_peek(st)
+    st.at += 1
+    let info = PK_OPTIONS[opt as usize] as u32
+    let k = info & 15
+    sz := ((info >> 4) & 15) as i32
+    let num = info >> 8
+    if num == 1 {
+        pk_size_limit(cx, st, sz, &mut sz)?
+    } else if num == 2 {
+        sz = pk_number(st, -1)
+        if sz == -1 {
+            return err(cx.error_msg("missing size for format option 'c'"))
+        }
+    }
+    if k <= PK_NOP {
+        *kind = k
+        *size = sz
+        return ok()
+    }
+    *kind = PK_NOP
+    *size = 0
+    if k == 11 {
+        st.little = true
+    } else if k == 12 {
+        st.little = false
+    } else if k == 13 {
+        st.maxalign = sz
+    } else {
+        b := Buffer.new(cx)
+        b.add_str("invalid format option '")?
+        b.add_char(opt)?
+        b.add_str("'")?
+        return err(cx.error_buffer(&mut b))
+    }
+    return ok()
+}
+
+// Read the next option with the padding needed to align it at `total`.
+fn pk_details(cx: &mut Cx, st: &mut PkState, total: usize, kind: &mut u32, size: &mut i32, ntoalign: &mut usize) -> void!Throw {
+    pk_option(cx, st, kind, size)?
+    align := *size
+    if *kind == PK_PADDALIGN {
+        bad := pk_peek(st) == 0
+        if !bad {
+            nk := 0u32
+            pk_option(cx, st, &mut nk, &mut align)?
+            bad = nk == PK_CHAR || align == 0
+        }
+        if bad {
+            return err(cx.arg_error(1, "invalid next option for option 'X'"))
+        }
+    }
+    *ntoalign = 0
+    if align > 1 && *kind != PK_CHAR {
+        if align > st.maxalign {
+            align = st.maxalign
+        }
+        if (align & (align - 1)) != 0 {
+            return err(cx.arg_error(1, "format asks for alignment not power of 2"))
+        }
+        let a = align as usize
+        *ntoalign = (a - (total & (a - 1))) & (a - 1)
+    }
+    return ok()
+}
+
+// Append `size` bytes of the integer n (two's complement, sign-extended past
+// 8 bytes when neg).
+fn pk_add_int(b: &mut SlBuf, n: u64, little: bool, size: usize, neg: bool) -> void!Throw {
+    dst := sl_null_mut()
+    b.room(size, &mut dst)?
+    v := n
+    for i in 0usize..size {
+        byte := 0u8
+        if i < 8 {
+            byte = (v & 255) as u8
+            v = v >> 8
+        } else if neg {
+            byte = 255
+        }
+        if little {
+            sl_store(dst, i, byte)
+        } else {
+            sl_store(dst, size - 1 - i, byte)
+        }
+    }
+    b.add_size(size)
+    return ok()
+}
+
+fn pk_add_zeros(b: &mut SlBuf, n: usize) -> void!Throw {
+    if n == 0 {
+        return ok()
+    }
+    dst := sl_null_mut()
+    b.room(n, &mut dst)?
+    unsafe {
+        ptr.write_bytes(dst, 0u8, n)
+    }
+    b.add_size(n)
+    return ok()
+}
+
+// Append the low `size` bytes of bits (8 or 4 bytes of a float).
+fn pk_add_bits(b: &mut SlBuf, bits: u64, little: bool, size: usize) -> void!Throw {
+    return pk_add_int(b, bits, little, size, false)
+}
+
+// f64 -> binary32 bits with C's (float) conversion (round to nearest even,
+// overflow to infinity, NaN kept quiet).
+fn pk_f32_bits(f: f64) -> u64 {
+    let bits = num_f64_bits(f)
+    let sign = (bits >> 32) & 0x80000000
+    if f != f {
+        return sign | 0x7fc00000 | ((bits >> 29) & 0x3fffff)
+    }
+    let mag = if f < 0.0 {
+        -f
+    } else {
+        f
+    }
+    if mag >= 3.4028235677973366e38 {
+        return sign | 0x7f800000
+    }
+    if mag > 3.4028234663852886e38 {
+        return sign | 0x7f7fffff
+    }
+    let x = f as f32
+    let r = unsafe {
+        ptr.read_unaligned(ptr.from_ref(&x) as *const u32)
+    }
+    return r as u64
+}
+
+fn pk_load_bits(p: *const u8, little: bool, size: usize) -> u64 {
+    v := 0u64
+    for k in 0usize..size {
+        let i = size - 1 - k
+        let c = if little {
+            sl_load(p, i)
+        } else {
+            sl_load(p, size - 1 - i)
+        }
+        v = (v << 8) | c as u64
+    }
+    return v
+}
+
+fn strlib_pack(cx: &mut Cx) -> i32!Throw {
+    fp := sl_null()
+    fl := 0usize
+    sl_arg_str(cx, 1, &mut fp, &mut fl)?
+    // Like the reference, a nil sits right after the arguments, so a missing
+    // argument is reported as "got nil".
+    cx.push_nil()
+    st := pk_state(fp, fl)
+    arg := 1i32
+    total := 0usize
+    stk := mem.uninit::<[256]u8>()
+    b := SlBuf.new(cx.L, unsafe {
+        mem.uninit_as_mut_ptr(&mut stk) as *mut u8
+    }, 256)
+    for st.at < st.flen {
+        kind := 0u32
+        size := 0i32
+        ntoalign := 0usize
+        pk_details(cx, &mut st, total, &mut kind, &mut size, &mut ntoalign)?
+        let sz = size as usize
+        total = total + ntoalign + sz
+        pk_add_zeros(&mut b, ntoalign)?
+        arg += 1
+        if kind == PK_INT || kind == PK_UINT {
+            n := 0i64
+            sl_arg_int(cx, arg, &mut n)?
+            let un = num_i64_as_u64(n)
+            if kind == PK_INT {
+                if sz < 8 {
+                    let lim = 1i64 << (sz * 8 - 1) as i64
+                    if n < -lim || n >= lim {
+                        return err(cx.arg_error(arg, "integer overflow"))
+                    }
+                }
+                pk_add_int(&mut b, un, st.little, sz, n < 0)?
+            } else {
+                if sz < 8 && un >= (1u64 << (sz * 8) as u64) {
+                    return err(cx.arg_error(arg, "unsigned overflow"))
+                }
+                pk_add_int(&mut b, un, st.little, sz, false)?
+            }
+        } else if kind == PK_FLOAT {
+            let f = sl_arg_num(cx, arg)?
+            pk_add_bits(&mut b, pk_f32_bits(f), st.little, 4)?
+        } else if kind == PK_NUMBER || kind == PK_DOUBLE {
+            let f = sl_arg_num(cx, arg)?
+            pk_add_bits(&mut b, num_f64_bits(f), st.little, 8)?
+        } else if kind == PK_CHAR {
+            sp := sl_null()
+            sn := 0usize
+            sl_arg_str(cx, arg, &mut sp, &mut sn)?
+            if sn > sz {
+                return err(cx.arg_error(arg, "string longer than given size"))
+            }
+            b.add_raw(sp, sn)?
+            pk_add_zeros(&mut b, sz - sn)?
+        } else if kind == PK_STRING {
+            sp := sl_null()
+            sn := 0usize
+            sl_arg_str(cx, arg, &mut sp, &mut sn)?
+            if sz < 8 && (sn as u64) >= (1u64 << (sz * 8) as u64) {
+                return err(cx.arg_error(arg, "string length does not fit in given size"))
+            }
+            pk_add_int(&mut b, sn as u64, st.little, sz, false)?
+            b.add_raw(sp, sn)?
+            total = total + sn
+        } else if kind == PK_ZSTR {
+            sp := sl_null()
+            sn := 0usize
+            sl_arg_str(cx, arg, &mut sp, &mut sn)?
+            if sl_find_byte(sp, 0, sn, 0) < sn {
+                return err(cx.arg_error(arg, "string contains zeros"))
+            }
+            b.add_raw(sp, sn)?
+            b.add_char(0)?
+            total = total + sn + 1
+        } else {
+            if kind == PK_PADDING {
+                b.add_char(0)?
+            }
+            arg -= 1
+        }
+    }
+    b.push(cx)?
+    return ok(1)
+}
+
+fn strlib_packsize(cx: &mut Cx) -> i32!Throw {
+    fp := sl_null()
+    fl := 0usize
+    sl_arg_str(cx, 1, &mut fp, &mut fl)?
+    st := pk_state(fp, fl)
+    total := 0u64
+    for st.at < st.flen {
+        kind := 0u32
+        size := 0i32
+        ntoalign := 0usize
+        pk_details(cx, &mut st, total as usize, &mut kind, &mut size, &mut ntoalign)?
+        if kind == PK_STRING || kind == PK_ZSTR {
+            return err(cx.arg_error(1, "variable-length format"))
+        }
+        let sz = size as u64 + ntoalign as u64
+        if total > STRLIB_MAXSIZE - sz {
+            return err(cx.arg_error(1, "format result too large"))
+        }
+        total = total + sz
+    }
+    cx.push_integer(total as i64)
+    return ok(1)
+}
+
+// Integer of `size` bytes at p (sign-extended when signed); sizes above 8 must
+// only carry sign-extension bytes.
+fn pk_read_int(cx: &mut Cx, p: *const u8, little: bool, size: usize, signed: bool, out: &mut i64) -> void!Throw {
+    let limit = if size <= 8 {
+        size
+    } else {
+        8usize
+    }
+    res := 0u64
+    for k in 0usize..limit {
+        let i = limit - 1 - k
+        let c = if little {
+            sl_load(p, i)
+        } else {
+            sl_load(p, size - 1 - i)
+        }
+        res = (res << 8) | c as u64
+    }
+    if size < 8 {
+        if signed {
+            let mask = 1u64 << (size * 8 - 1) as u64
+            res = core.wrapping_sub(res ^ mask, mask)
+        }
+    } else if size > 8 {
+        let fill = if !signed || num_u64_as_i64(res) >= 0 {
+            0u8
+        } else {
+            255u8
+        }
+        for i in limit..size {
+            let c = if little {
+                sl_load(p, i)
+            } else {
+                sl_load(p, size - 1 - i)
+            }
+            if c != fill {
+                b := Buffer.new(cx)
+                b.add_integer(size as i64)?
+                b.add_str("-byte integer does not fit into Lua Integer")?
+                return err(cx.error_buffer(&mut b))
+            }
+        }
+    }
+    *out = num_u64_as_i64(res)
+    return ok()
+}
+
+fn strlib_unpack(cx: &mut Cx) -> i32!Throw {
+    fp := sl_null()
+    fl := 0usize
+    sl_arg_str(cx, 1, &mut fp, &mut fl)?
+    data := sl_null()
+    ld := 0usize
+    sl_arg_str(cx, 2, &mut data, &mut ld)?
+    ia := 0i64
+    sl_opt_int(cx, 3, 1, &mut ia)?
+    let pos1 = sl_start_pos(ia, ld) - 1
+    if pos1 > ld as u64 {
+        return err(cx.arg_error(3, "initial position out of string"))
+    }
+    pos := pos1 as usize
+    st := pk_state(fp, fl)
+    n := 0i32
+    for st.at < st.flen {
+        kind := 0u32
+        size := 0i32
+        ntoalign := 0usize
+        pk_details(cx, &mut st, pos, &mut kind, &mut size, &mut ntoalign)?
+        let sz = size as usize
+        if (ntoalign as u64) + (sz as u64) > (ld - pos) as u64 {
+            return err(cx.arg_error(2, "data string too short"))
+        }
+        pos = pos + ntoalign
+        sl_check_stack(cx, 2, "too many results")?
+        n += 1
+        let at = sl_at(data, pos)
+        if kind == PK_INT || kind == PK_UINT {
+            v := 0i64
+            pk_read_int(cx, at, st.little, sz, kind == PK_INT, &mut v)?
+            cx.push_integer(v)
+        } else if kind == PK_FLOAT {
+            let bits = pk_load_bits(at, st.little, 4) as u32
+            let f = unsafe {
+                ptr.read_unaligned(ptr.from_ref(&bits) as *const f32)
+            }
+            cx.push_number(f as f64)
+        } else if kind == PK_NUMBER || kind == PK_DOUBLE {
+            cx.push_number(num_f64_from_bits(pk_load_bits(at, st.little, 8)))
+        } else if kind == PK_CHAR {
+            cx.push_raw_bytes(at, sz)?
+        } else if kind == PK_STRING {
+            v := 0i64
+            pk_read_int(cx, at, st.little, sz, false, &mut v)?
+            let len = num_i64_as_u64(v)
+            if len > (ld - pos - sz) as u64 {
+                return err(cx.arg_error(2, "data string too short"))
+            }
+            cx.push_raw_bytes(sl_at(data, pos + sz), len as usize)?
+            pos = pos + len as usize
+        } else if kind == PK_ZSTR {
+            let len = sl_find_byte(data, pos, ld, 0) - pos
+            if pos + len >= ld {
+                return err(cx.arg_error(2, "unfinished string for format 'z'"))
+            }
+            cx.push_raw_bytes(at, len)?
+            pos = pos + len + 1
+        } else {
+            n -= 1
+        }
+        pos = pos + sz
+    }
+    cx.push_integer(pos as i64 + 1)
+    return ok(n + 1)
+}

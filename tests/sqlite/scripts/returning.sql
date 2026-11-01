@@ -1,0 +1,10 @@
+create table r(id integer primary key, name text, qty int default 1);
+insert into r(name) values ('a'), ('b') returning id, name, qty;
+insert into r(name, qty) values ('c', 5) returning *;
+insert into r(name) values ('d') returning id * 10 as tenx, upper(name);
+update r set qty = qty + 1 where id <= 2 returning id, qty;
+delete from r where qty = 2 returning name;
+select * from r order by id;
+insert into r(id, name) values (1, 'z') on conflict(id) do update set name = excluded.name returning id, name;
+delete from r returning id;
+select count(*) from r;

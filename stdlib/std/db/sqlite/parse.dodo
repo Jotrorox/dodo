@@ -1,0 +1,2942 @@
+package sqlite
+
+import "std/db"
+import "std/text"
+
+// Tokenizer and recursive-descent parser for SQLite's SQL dialect. The parse
+// tree lives in the statement slot as fixed 48-byte nodes:
+//   [0] kind [1] op [2..4] flags [4..32] a b c d e f g [32] next [40..48] x
+// Node 0 means "none". Strings are (workspace offset, length) pairs.
+
+const NODE: usize = 48
+
+// Token kinds.
+const TK_EOF: u8 = 0
+const TK_ID: u8 = 1
+const TK_STR: u8 = 2
+const TK_BLOB: u8 = 3
+const TK_INT: u8 = 4
+const TK_FLOAT: u8 = 5
+const TK_VAR: u8 = 6
+const TK_QID: u8 = 7
+const TK_LP: u8 = 10
+const TK_RP: u8 = 11
+const TK_COMMA: u8 = 12
+const TK_SEMI: u8 = 13
+const TK_DOT: u8 = 14
+const TK_PLUS: u8 = 15
+const TK_MINUS: u8 = 16
+const TK_STAR: u8 = 17
+const TK_SLASH: u8 = 18
+const TK_PERCENT: u8 = 19
+const TK_CONCAT: u8 = 20
+const TK_BITAND: u8 = 21
+const TK_BITOR: u8 = 22
+const TK_LSHIFT: u8 = 23
+const TK_RSHIFT: u8 = 24
+const TK_BITNOT: u8 = 25
+const TK_LT: u8 = 26
+const TK_LE: u8 = 27
+const TK_GT: u8 = 28
+const TK_GE: u8 = 29
+const TK_EQ: u8 = 30
+const TK_NE: u8 = 31
+const TK_ARROW: u8 = 32
+const TK_ARROW2: u8 = 33
+const TK_ILLEGAL: u8 = 99
+
+// Expression nodes.
+const N_NULL: u8 = 1
+const N_INT: u8 = 2
+const N_REAL: u8 = 3
+const N_STR: u8 = 4
+const N_BLOB: u8 = 5
+const N_PARAM: u8 = 6
+const N_COL: u8 = 7
+const N_ID: u8 = 8
+const N_UNARY: u8 = 9
+const N_BINARY: u8 = 10
+const N_LIKE: u8 = 11
+const N_BETWEEN: u8 = 12
+const N_INLIST: u8 = 13
+const N_INSEL: u8 = 14
+const N_EXISTS: u8 = 15
+const N_SUBQ: u8 = 16
+const N_CASE: u8 = 17
+const N_CAST: u8 = 18
+const N_FUNC: u8 = 19
+const N_COLLATE: u8 = 20
+const N_ISNULL: u8 = 21
+const N_SLOT: u8 = 22
+const N_STAR: u8 = 23
+const N_WHEN: u8 = 24
+const N_RESCOL: u8 = 25
+const N_SRC: u8 = 26
+const N_ORDER: u8 = 27
+const N_SELEXT: u8 = 28
+const N_ROW: u8 = 29
+const N_SET: u8 = 30
+const N_COLDEF: u8 = 31
+const N_TCONS: u8 = 32
+const N_AGG: u8 = 33
+const N_TRUE: u8 = 34
+const N_REG: u8 = 35
+const N_UPSERT: u8 = 37
+
+// Statements.
+const S_SELECT: u8 = 40
+const S_INSERT: u8 = 41
+const S_UPDATE: u8 = 42
+const S_DELETE: u8 = 43
+const S_CREATE_TABLE: u8 = 44
+const S_CREATE_INDEX: u8 = 45
+const S_DROP: u8 = 46
+const S_BEGIN: u8 = 47
+const S_COMMIT: u8 = 48
+const S_ROLLBACK: u8 = 49
+const S_PRAGMA: u8 = 50
+const S_ALTER: u8 = 51
+const S_EMPTY: u8 = 52
+const S_VACUUM: u8 = 53
+const S_CREATE_VIEW: u8 = 54
+
+// Operators.
+const OP_OR: u8 = 1
+const OP_AND: u8 = 2
+const OP_EQ: u8 = 3
+const OP_NE: u8 = 4
+const OP_LT: u8 = 5
+const OP_LE: u8 = 6
+const OP_GT: u8 = 7
+const OP_GE: u8 = 8
+const OP_IS: u8 = 9
+const OP_ISNOT: u8 = 10
+const OP_BITAND: u8 = 11
+const OP_BITOR: u8 = 12
+const OP_LSHIFT: u8 = 13
+const OP_RSHIFT: u8 = 14
+const OP_ADD: u8 = 15
+const OP_SUB: u8 = 16
+const OP_MUL: u8 = 17
+const OP_DIV: u8 = 18
+const OP_MOD: u8 = 19
+const OP_CONCAT: u8 = 20
+const OP_NEG: u8 = 21
+const OP_PLUS: u8 = 22
+const OP_BITNOT: u8 = 23
+const OP_NOT: u8 = 24
+
+// Conflict resolution.
+const OE_ABORT: u8 = 0
+const OE_ROLLBACK: u8 = 1
+const OE_FAIL: u8 = 2
+const OE_IGNORE: u8 = 3
+const OE_REPLACE: u8 = 4
+
+// Column definition flags.
+const CF_NOTNULL: usize = 1
+const CF_PK: usize = 2
+const CF_UNIQUE: usize = 4
+const CF_AUTOINC: usize = 8
+const CF_PKDESC: usize = 16
+const CF_HIDDEN: usize = 32
+
+// ---------------------------------------------------------------------------
+// Nodes
+
+fn nd(e: &Engine, n: usize) -> usize {
+    e.node_off + n * NODE
+}
+
+fn nkind(e: &Engine, n: usize) -> u8 {
+    if n == 0 {
+        return 0
+    }
+    e.ws[nd(e, n)]
+}
+
+fn nop(e: &Engine, n: usize) -> u8 {
+    e.ws[nd(e, n) + 1]
+}
+
+fn nflags(e: &Engine, n: usize) -> usize {
+    ld16(e.ws, nd(e, n) + 2)
+}
+
+fn nf(e: &Engine, n: usize, field: usize) -> usize {
+    ldu(e.ws, nd(e, n) + 4 + field * 4)
+}
+
+fn na(e: &Engine, n: usize) -> usize {
+    nf(e, n, 0)
+}
+
+fn nb(e: &Engine, n: usize) -> usize {
+    nf(e, n, 1)
+}
+
+fn nc(e: &Engine, n: usize) -> usize {
+    nf(e, n, 2)
+}
+
+fn ndd(e: &Engine, n: usize) -> usize {
+    nf(e, n, 3)
+}
+
+fn ne_(e: &Engine, n: usize) -> usize {
+    nf(e, n, 4)
+}
+
+fn nff(e: &Engine, n: usize) -> usize {
+    nf(e, n, 5)
+}
+
+fn ng(e: &Engine, n: usize) -> usize {
+    nf(e, n, 6)
+}
+
+fn nnext(e: &Engine, n: usize) -> usize {
+    ldu(e.ws, nd(e, n) + 32)
+}
+
+fn nx(e: &Engine, n: usize) -> u64 {
+    ld64(e.ws, nd(e, n) + 40)
+}
+
+fn set_kind(e: &mut Engine, n: usize, k: u8) {
+    o := nd(e, n)
+    e.ws[o] = k
+}
+
+fn set_op(e: &mut Engine, n: usize, v: u8) {
+    o := nd(e, n)
+    e.ws[o + 1] = v
+}
+
+fn set_flags(e: &mut Engine, n: usize, v: usize) {
+    o := nd(e, n)
+    st16(e.ws, o + 2, v)
+}
+
+fn set_nf(e: &mut Engine, n: usize, field: usize, v: usize) {
+    o := nd(e, n) + 4 + field * 4
+    stu(e.ws, o, v)
+}
+
+fn set_next(e: &mut Engine, n: usize, v: usize) {
+    o := nd(e, n) + 32
+    stu(e.ws, o, v)
+}
+
+fn set_x(e: &mut Engine, n: usize, v: u64) {
+    o := nd(e, n) + 40
+    st64(e.ws, o, v)
+}
+
+fn new_node(e: &mut Engine, kind: u8) -> usize!db.Error {
+    n := e.node_n + 1
+    if e.node_off + (n + 1) * NODE > e.pool_lo {
+        return err(fail(e, SQLITE_TOOBIG, "statement too complex for the statement workspace"))
+    }
+    e.node_n = n
+    o := nd(e, n)
+    zero_bytes(e.ws, o, NODE)
+    e.ws[o] = kind
+    ok(n)
+}
+
+fn pool_alloc(e: &mut Engine, len: usize) -> usize!db.Error {
+    if e.pool_lo < len || e.pool_lo - len < e.node_off + (e.node_n + 2) * NODE {
+        return err(fail(e, SQLITE_TOOBIG, "statement too complex for the statement workspace"))
+    }
+    e.pool_lo -= len
+    ok(e.pool_lo)
+}
+
+// Appends `item` to a list whose head and tail are tracked by the caller.
+fn list_append(e: &mut Engine, head: usize, tail: usize, item: usize) -> (usize, usize) {
+    if head == 0 {
+        return (item, item)
+    }
+    set_next(e, tail, item)
+    (head, item)
+}
+
+fn list_len(e: &Engine, head: usize) -> usize {
+    n := 0usize
+    p := head
+    for p != 0 {
+        n += 1
+        p = nnext(e, p)
+    }
+    n
+}
+
+// ---------------------------------------------------------------------------
+// Tokenizer
+
+fn is_id_start(b: u8) -> bool {
+    (b >= 97 && b <= 122) || (b >= 65 && b <= 90) || b == 95 || b >= 128
+}
+
+fn is_id_char(b: u8) -> bool {
+    is_id_start(b) || (b >= 48 && b <= 57) || b == 36
+}
+
+fn is_digit(b: u8) -> bool {
+    b >= 48 && b <= 57
+}
+
+fn is_space(b: u8) -> bool {
+    b == 32 || b == 9 || b == 10 || b == 13 || b == 12 || b == 11
+}
+
+fn is_hex(b: u8) -> bool {
+    is_digit(b) || (b >= 97 && b <= 102) || (b >= 65 && b <= 70)
+}
+
+fn ch(e: &Engine, p: usize) -> u8 {
+    if p < e.src_end {
+        e.ws[p]
+    } else {
+        0
+    }
+}
+
+// Advances to the next token: sets tk, ts, tl.
+fn next_token(e: &mut Engine) {
+    e.last_end = e.ts + e.tl
+    p := e.pos
+    // Skip whitespace and comments.
+    for p < e.src_end {
+        b := e.ws[p]
+        if is_space(b) {
+            p += 1
+        } else if b == 45 && ch(e, p + 1) == 45 {
+            for p < e.src_end && e.ws[p] != 10 {
+                p += 1
+            }
+        } else if b == 47 && ch(e, p + 1) == 42 {
+            p += 2
+            for p < e.src_end && !(e.ws[p] == 42 && ch(e, p + 1) == 47) {
+                p += 1
+            }
+            p = if p + 2 <= e.src_end {
+                p + 2
+            } else {
+                e.src_end
+            }
+        } else {
+            break
+        }
+    }
+    e.ts = p
+    if p >= e.src_end {
+        e.tk = TK_EOF
+        e.tl = 0
+        e.pos = p
+        return
+    }
+    b := e.ws[p]
+    k := TK_ILLEGAL
+    q := p + 1
+    if is_id_start(b) {
+        if (b == 120 || b == 88) && ch(e, p + 1) == 39 {
+            // Blob literal x'..'
+            q = p + 2
+            for q < e.src_end && e.ws[q] != 39 {
+                q += 1
+            }
+            k = if q < e.src_end {
+                TK_BLOB
+            } else {
+                TK_ILLEGAL
+            }
+            q = if q < e.src_end {
+                q + 1
+            } else {
+                q
+            }
+        } else {
+            for q < e.src_end && is_id_char(e.ws[q]) {
+                q += 1
+            }
+            k = TK_ID
+        }
+    } else if is_digit(b) || (b == 46 && is_digit(ch(e, p + 1))) {
+        k = TK_INT
+        if b == 48 && (ch(e, p + 1) == 120 || ch(e, p + 1) == 88) && is_hex(ch(e, p + 2)) {
+            q = p + 2
+            for q < e.src_end && is_hex(e.ws[q]) {
+                q += 1
+            }
+        } else {
+            q = p
+            for q < e.src_end && (is_digit(e.ws[q]) || e.ws[q] == 95) {
+                q += 1
+            }
+            if ch(e, q) == 46 {
+                k = TK_FLOAT
+                q += 1
+                for q < e.src_end && (is_digit(e.ws[q]) || (e.ws[q] == 95 && q > 0 && is_digit(e.ws[q - 1]))) {
+                    q += 1
+                }
+            }
+            if (ch(e, q) == 101 || ch(e, q) == 69) && (is_digit(ch(e, q + 1)) || ((ch(e, q + 1) == 43 || ch(e, q + 1) == 45) && is_digit(ch(e, q + 2)))) {
+                k = TK_FLOAT
+                q += 2
+                for q < e.src_end && is_digit(e.ws[q]) {
+                    q += 1
+                }
+            }
+        }
+        if q < e.src_end && is_id_char(e.ws[q]) {
+            k = TK_ILLEGAL
+            for q < e.src_end && is_id_char(e.ws[q]) {
+                q += 1
+            }
+        }
+    } else if b == 39 {
+        q = p + 1
+        for {
+            if q >= e.src_end {
+                k = TK_ILLEGAL
+                break
+            }
+            if e.ws[q] == 39 {
+                if ch(e, q + 1) == 39 {
+                    q += 2
+                    continue
+                }
+                q += 1
+                k = TK_STR
+                break
+            }
+            q += 1
+        }
+    } else if b == 34 || b == 96 || b == 91 {
+        close := if b == 91 {
+            93u8
+        } else {
+            b
+        }
+        q = p + 1
+        for {
+            if q >= e.src_end {
+                k = TK_ILLEGAL
+                break
+            }
+            if e.ws[q] == close {
+                if close != 93 && ch(e, q + 1) == close {
+                    q += 2
+                    continue
+                }
+                q += 1
+                k = TK_QID
+                break
+            }
+            q += 1
+        }
+    } else if b == 63 {
+        q = p + 1
+        for q < e.src_end && is_digit(e.ws[q]) {
+            q += 1
+        }
+        k = TK_VAR
+    } else if b == 58 || b == 64 || b == 36 {
+        q = p + 1
+        for q < e.src_end && is_id_char(e.ws[q]) {
+            q += 1
+        }
+        k = if q > p + 1 {
+            TK_VAR
+        } else {
+            TK_ILLEGAL
+        }
+    } else if b == 40 {
+        k = TK_LP
+    } else if b == 41 {
+        k = TK_RP
+    } else if b == 44 {
+        k = TK_COMMA
+    } else if b == 59 {
+        k = TK_SEMI
+    } else if b == 46 {
+        k = TK_DOT
+    } else if b == 43 {
+        k = TK_PLUS
+    } else if b == 45 {
+        if ch(e, p + 1) == 62 {
+            if ch(e, p + 2) == 62 {
+                k = TK_ARROW2
+                q = p + 3
+            } else {
+                k = TK_ARROW
+                q = p + 2
+            }
+        } else {
+            k = TK_MINUS
+        }
+    } else if b == 42 {
+        k = TK_STAR
+    } else if b == 47 {
+        k = TK_SLASH
+    } else if b == 37 {
+        k = TK_PERCENT
+    } else if b == 124 {
+        if ch(e, p + 1) == 124 {
+            k = TK_CONCAT
+            q = p + 2
+        } else {
+            k = TK_BITOR
+        }
+    } else if b == 38 {
+        k = TK_BITAND
+    } else if b == 126 {
+        k = TK_BITNOT
+    } else if b == 60 {
+        n1 := ch(e, p + 1)
+        if n1 == 61 {
+            k = TK_LE
+            q = p + 2
+        } else if n1 == 62 {
+            k = TK_NE
+            q = p + 2
+        } else if n1 == 60 {
+            k = TK_LSHIFT
+            q = p + 2
+        } else {
+            k = TK_LT
+        }
+    } else if b == 62 {
+        n1 := ch(e, p + 1)
+        if n1 == 61 {
+            k = TK_GE
+            q = p + 2
+        } else if n1 == 62 {
+            k = TK_RSHIFT
+            q = p + 2
+        } else {
+            k = TK_GT
+        }
+    } else if b == 61 {
+        k = TK_EQ
+        if ch(e, p + 1) == 61 {
+            q = p + 2
+        }
+    } else if b == 33 {
+        if ch(e, p + 1) == 61 {
+            k = TK_NE
+            q = p + 2
+        }
+    }
+    e.tk = k
+    e.tl = q - p
+    e.pos = q
+}
+
+// Case-insensitive keyword test on the current token.
+fn is_kw(e: &Engine, word: &str) -> bool {
+    if e.tk != TK_ID {
+        return false
+    }
+    w := mem_bytes(word)
+    if w.len != e.tl {
+        return false
+    }
+    for i in 0usize..w.len {
+        if fold(e.ws[e.ts + i]) != fold(w[i]) {
+            return false
+        }
+    }
+    true
+}
+
+fn accept_kw(e: &mut Engine, word: &str) -> bool {
+    if is_kw(e, word) {
+        next_token(e)
+        return true
+    }
+    false
+}
+
+fn accept(e: &mut Engine, k: u8) -> bool {
+    if e.tk == k {
+        next_token(e)
+        return true
+    }
+    false
+}
+
+fn syntax_error(e: &mut Engine) -> db.Error {
+    e.error_offset = (e.ts - e.src) as i32
+    if e.tk == TK_EOF {
+        return fail(e, SQLITE_ERROR, "incomplete input")
+    }
+    e.msg_len = 0
+    msg_add(e, "near \"")
+    n := if e.tl > 40 {
+        40usize
+    } else {
+        e.tl
+    }
+    let ts2 = e.ts
+    msg_add_ws(e, ts2, n)
+    msg_add(e, "\": syntax error")
+    make_error(e, SQLITE_ERROR)
+}
+
+fn expect(e: &mut Engine, k: u8) -> void!db.Error {
+    if !accept(e, k) {
+        return err(syntax_error(e))
+    }
+    ok()
+}
+
+fn expect_kw(e: &mut Engine, word: &str) -> void!db.Error {
+    if !accept_kw(e, word) {
+        return err(syntax_error(e))
+    }
+    ok()
+}
+
+// Words that cannot be used as bare column names or aliases.
+fn is_reserved(e: &Engine) -> bool {
+    if e.tk != TK_ID {
+        return false
+    }
+    words := ["SELECT", "FROM", "WHERE", "GROUP", "ORDER", "HAVING", "LIMIT", "OFFSET",
+    "UNION", "EXCEPT", "INTERSECT", "ON", "USING", "JOIN", "INNER", "LEFT", "CROSS",
+    "NATURAL", "OUTER", "AND", "OR", "NOT", "AS", "BY", "INTO", "VALUES", "SET",
+    "CASE", "WHEN", "THEN", "ELSE", "END", "IS", "IN", "LIKE", "GLOB", "BETWEEN",
+    "ESCAPE", "COLLATE", "NULL", "DEFAULT", "ISNULL", "NOTNULL", "CREATE", "DROP",
+    "INSERT", "UPDATE", "DELETE", "REPLACE", "TABLE", "INDEX", "PRIMARY", "UNIQUE",
+    "CHECK", "REFERENCES", "CONSTRAINT", "FOREIGN", "EXISTS", "CAST", "ALL",
+    "DISTINCT", "RETURNING", "WINDOW", "FILTER", "OVER", "RIGHT", "FULL", "TO", "ADD", "ASC", "DESC"]
+    for i in 0usize..words.len {
+        if is_kw(e, words[i]) {
+            return true
+        }
+    }
+    false
+}
+
+// ---------------------------------------------------------------------------
+// Names and literals
+
+// Returns (offset, length) of the current identifier, unquoting into the
+// pool when needed, and advances.
+fn take_name(e: &mut Engine) -> (usize, usize)!db.Error {
+    if e.tk == TK_ID {
+        r := (e.ts, e.tl)
+        next_token(e)
+        return ok(r)
+    }
+    if e.tk == TK_STR || e.tk == TK_QID {
+        q := e.ws[e.ts]
+        close := if q == 91 {
+            93u8
+        } else {
+            q
+        }
+        start := e.ts + 1
+        end := e.ts + e.tl - 1
+        doubled := false
+        if close != 93 {
+            for i in start..end {
+                if e.ws[i] == close {
+                    doubled = true
+                }
+            }
+        }
+        if !doubled {
+            next_token(e)
+            return ok((start, end - start))
+        }
+        dst := pool_alloc(e, end - start)?
+        n := 0usize
+        i := start
+        for i < end {
+            b := e.ws[i]
+            e.ws[dst + n] = b
+            n += 1
+            if b == close {
+                i += 2
+            } else {
+                i += 1
+            }
+        }
+        next_token(e)
+        return ok((dst, n))
+    }
+    err(syntax_error(e))
+}
+
+fn is_name_token(e: &Engine) -> bool {
+    (e.tk == TK_ID && !is_reserved(e)) || e.tk == TK_QID || e.tk == TK_STR
+}
+
+fn names_eq(e: &Engine, a: usize, an: usize, b: usize, bn: usize) -> bool {
+    if an != bn {
+        return false
+    }
+    for i in 0usize..an {
+        if fold(e.ws[a + i]) != fold(e.ws[b + i]) {
+            return false
+        }
+    }
+    true
+}
+
+fn name_is(e: &Engine, a: usize, an: usize, word: &str) -> bool {
+    w := mem_bytes(word)
+    if an != w.len {
+        return false
+    }
+    for i in 0usize..an {
+        if fold(e.ws[a + i]) != fold(w[i]) {
+            return false
+        }
+    }
+    true
+}
+
+fn string_literal(e: &mut Engine) -> usize!db.Error {
+    start := e.ts + 1
+    end := e.ts + e.tl - 1
+    doubled := false
+    for i in start..end {
+        if e.ws[i] == 39 {
+            doubled = true
+        }
+    }
+    n := new_node(e, N_STR)?
+    if !doubled {
+        set_nf(e, n, 0, start)
+        set_nf(e, n, 1, end - start)
+        next_token(e)
+        return ok(n)
+    }
+    dst := pool_alloc(e, end - start)?
+    len := 0usize
+    i := start
+    for i < end {
+        b := e.ws[i]
+        e.ws[dst + len] = b
+        len += 1
+        i += if b == 39 {
+            2usize
+        } else {
+            1usize
+        }
+    }
+    set_nf(e, n, 0, dst)
+    set_nf(e, n, 1, len)
+    next_token(e)
+    ok(n)
+}
+
+fn hexval(b: u8) -> u8 {
+    if b >= 48 && b <= 57 {
+        return b - 48
+    }
+    if b >= 97 {
+        return b - 87
+    }
+    b - 55
+}
+
+fn blob_literal(e: &mut Engine) -> usize!db.Error {
+    start := e.ts + 2
+    end := e.ts + e.tl - 1
+    if (end - start) % 2 != 0 {
+        return err(fail(e, SQLITE_ERROR, "malformed blob literal"))
+    }
+    for i in start..end {
+        if !is_hex(e.ws[i]) {
+            return err(fail(e, SQLITE_ERROR, "malformed blob literal"))
+        }
+    }
+    len := (end - start) / 2
+    dst := pool_alloc(e, len)?
+    for i in 0usize..len {
+        e.ws[dst + i] = hexval(e.ws[start + 2 * i]) * 16 + hexval(e.ws[start + 2 * i + 1])
+    }
+    n := new_node(e, N_BLOB)?
+    set_nf(e, n, 0, dst)
+    set_nf(e, n, 1, len)
+    next_token(e)
+    ok(n)
+}
+
+fn number_literal(e: &mut Engine, negate: bool) -> usize!db.Error {
+    start := e.ts
+    len := e.tl
+    if e.tk == TK_INT && len > 2 && e.ws[start] == 48 && (e.ws[start + 1] == 120 || e.ws[start + 1] == 88) {
+        if len - 2 > 16 {
+            return err(fail(e, SQLITE_ERROR, "hex literal too big"))
+        }
+        v := 0u64
+        for i in start + 2..start + len {
+            v = (v << 4) | (hexval(e.ws[i]) as u64)
+        }
+        n := new_node(e, N_INT)?
+        iv := u2i(v)
+        if negate {
+            if iv == -9223372036854775807 - 1 {
+                set_kind(e, n, N_REAL)
+                set_x(e, n, f2u(9223372036854775808.0))
+            } else {
+                iv = -iv
+            }
+        }
+        set_x(e, n, i2u(iv))
+        next_token(e)
+        return ok(n)
+    }
+    // Copy without '_' separators.
+    buf := [0u8; 400]
+    m := 0usize
+    for i in start..start + len {
+        b := e.ws[i]
+        if b != 95 && m < 400 {
+            buf[m] = b
+            m += 1
+        }
+    }
+    if e.tk == TK_INT {
+        v := 0u64
+        overflow := false
+        for i in 0usize..m {
+            d := (buf[i] - 48) as u64
+            if v > (18446744073709551615u64 - d) / 10 {
+                overflow = true
+                break
+            }
+            v = v * 10 + d
+        }
+        limit := if negate {
+            9223372036854775808u64
+        } else {
+            9223372036854775807u64
+        }
+        if !overflow && v <= limit {
+            n := new_node(e, N_INT)?
+            iv := if v == 9223372036854775808u64 {
+                -9223372036854775807i64 - 1
+            } else if negate {
+                -(v as i64)
+            } else {
+                v as i64
+            }
+            set_x(e, n, i2u(iv))
+            next_token(e)
+            return ok(n)
+        }
+    }
+    f := match text.parse_f64(&buf[..m]) {
+        ok(v) => v,
+        err(_) => 1.0e308 * 10.0,
+    }
+    n := new_node(e, N_REAL)?
+    set_x(e, n, f2u(if negate {
+        -f
+    } else {
+        f
+    }))
+    next_token(e)
+    ok(n)
+}
+
+fn param_node(e: &mut Engine) -> usize!db.Error {
+    n := new_node(e, N_PARAM)?
+    b := e.ws[e.ts]
+    idx := 0usize
+    if b == 63 {
+        if e.tl == 1 {
+            idx = e.nparam + 1
+        } else {
+            for i in e.ts + 1..e.ts + e.tl {
+                idx = idx * 10 + ((e.ws[i] - 48) as usize)
+                if idx > 32766 {
+                    return err(fail(e, SQLITE_RANGE, "variable number must be between ?1 and ?32766"))
+                }
+            }
+            if idx == 0 {
+                return err(fail(e, SQLITE_RANGE, "variable number must be between ?1 and ?32766"))
+            }
+        }
+    } else {
+        // Named parameter: same name, same index.
+        found := 0usize
+        for k in 0usize..e.named_n {
+            o := e.named_off + k * 12
+            let ldu2 = ldu(e.ws, o)
+            let ldu3 = ldu(e.ws, o + 4)
+            let ts2 = e.ts
+            let tl2 = e.tl
+            if names_eq_exact(e, ldu2, ldu3, ts2, tl2) {
+                found = ldu(e.ws, o + 8)
+            }
+        }
+        if found == 0 {
+            if e.named_n >= 64 {
+                return err(fail(e, SQLITE_RANGE, "too many named parameters"))
+            }
+            idx = e.nparam + 1
+            o := e.named_off + e.named_n * 12
+            let ts3 = e.ts
+            stu(e.ws, o, ts3)
+            let tl3 = e.tl
+            stu(e.ws, o + 4, tl3)
+            stu(e.ws, o + 8, idx)
+            e.named_n += 1
+        } else {
+            idx = found
+        }
+    }
+    if idx > e.nparam {
+        e.nparam = idx
+    }
+    set_nf(e, n, 0, idx)
+    next_token(e)
+    ok(n)
+}
+
+fn names_eq_exact(e: &Engine, a: usize, an: usize, b: usize, bn: usize) -> bool {
+    if an != bn {
+        return false
+    }
+    for i in 0usize..an {
+        if e.ws[a + i] != e.ws[b + i] {
+            return false
+        }
+    }
+    true
+}
+
+// ---------------------------------------------------------------------------
+// Expressions
+
+fn binary(e: &mut Engine, op: u8, l: usize, r: usize) -> usize!db.Error {
+    n := new_node(e, N_BINARY)?
+    set_op(e, n, op)
+    set_nf(e, n, 0, l)
+    set_nf(e, n, 1, r)
+    ok(n)
+}
+
+fn unary(e: &mut Engine, op: u8, a: usize) -> usize!db.Error {
+    n := new_node(e, N_UNARY)?
+    set_op(e, n, op)
+    set_nf(e, n, 0, a)
+    ok(n)
+}
+
+fn parse_expr(e: &mut Engine) -> usize!db.Error {
+    e.depth += 1
+    if e.depth > 200 {
+        return err(fail(e, SQLITE_ERROR, "expression tree is too large"))
+    }
+    r := parse_or(e)
+    e.depth -= 1
+    r
+}
+
+fn parse_or(e: &mut Engine) -> usize!db.Error {
+    l := parse_and(e)?
+    for accept_kw(e, "OR") {
+        r := parse_and(e)?
+        l = binary(e, OP_OR, l, r)?
+    }
+    ok(l)
+}
+
+fn parse_and(e: &mut Engine) -> usize!db.Error {
+    l := parse_not(e)?
+    for accept_kw(e, "AND") {
+        r := parse_not(e)?
+        l = binary(e, OP_AND, l, r)?
+    }
+    ok(l)
+}
+
+fn parse_not(e: &mut Engine) -> usize!db.Error {
+    if is_kw(e, "NOT") {
+        // NOT EXISTS is handled by the primary parser through NOT + EXISTS.
+        next_token(e)
+        a := parse_not(e)?
+        return unary(e, OP_NOT, a)
+    }
+    parse_equality(e)
+}
+
+fn parse_equality(e: &mut Engine) -> usize!db.Error {
+    l := parse_compare(e)?
+    for {
+        if e.tk == TK_EQ {
+            next_token(e)
+            r := parse_compare(e)?
+            l = binary(e, OP_EQ, l, r)?
+        } else if e.tk == TK_NE {
+            next_token(e)
+            r := parse_compare(e)?
+            l = binary(e, OP_NE, l, r)?
+        } else if is_kw(e, "IS") {
+            next_token(e)
+            op := OP_IS
+            if accept_kw(e, "NOT") {
+                op = OP_ISNOT
+            }
+            if accept_kw(e, "DISTINCT") {
+                expect_kw(e, "FROM")?
+                op = if op == OP_IS {
+                    OP_ISNOT
+                } else {
+                    OP_IS
+                }
+            }
+            r := parse_compare(e)?
+            l = binary(e, op, l, r)?
+        } else if is_kw(e, "ISNULL") {
+            next_token(e)
+            n := new_node(e, N_ISNULL)?
+            set_nf(e, n, 0, l)
+            l = n
+        } else if is_kw(e, "NOTNULL") {
+            next_token(e)
+            n := new_node(e, N_ISNULL)?
+            set_flags(e, n, 1)
+            set_nf(e, n, 0, l)
+            l = n
+        } else {
+            not := false
+            save_pos := e.pos
+            save_ts := e.ts
+            save_tl := e.tl
+            save_tk := e.tk
+            if is_kw(e, "NOT") {
+                next_token(e)
+                not = true
+                if accept_kw(e, "NULL") {
+                    n := new_node(e, N_ISNULL)?
+                    set_flags(e, n, 1)
+                    set_nf(e, n, 0, l)
+                    l = n
+                    continue
+                }
+            }
+            if is_kw(e, "BETWEEN") {
+                next_token(e)
+                lo := parse_compare(e)?
+                expect_kw(e, "AND")?
+                hi := parse_compare(e)?
+                n := new_node(e, N_BETWEEN)?
+                set_flags(e, n, if not {
+                    1usize
+                } else {
+                    0usize
+                })
+                set_nf(e, n, 0, l)
+                set_nf(e, n, 1, lo)
+                set_nf(e, n, 2, hi)
+                l = n
+            } else if is_kw(e, "IN") {
+                next_token(e)
+                l = parse_in(e, l, not)?
+            } else if is_kw(e, "LIKE") || is_kw(e, "GLOB") || is_kw(e, "REGEXP") || is_kw(e, "MATCH") {
+                glob := is_kw(e, "GLOB")
+                if is_kw(e, "REGEXP") || is_kw(e, "MATCH") {
+                    return err(fail(e, SQLITE_ERROR, "REGEXP and MATCH are not supported"))
+                }
+                next_token(e)
+                pat := parse_compare(e)?
+                esc := 0usize
+                if accept_kw(e, "ESCAPE") {
+                    esc = parse_compare(e)?
+                }
+                n := new_node(e, N_LIKE)?
+                set_op(e, n, if glob {
+                    1u8
+                } else {
+                    0u8
+                })
+                set_flags(e, n, if not {
+                    1usize
+                } else {
+                    0usize
+                })
+                set_nf(e, n, 0, l)
+                set_nf(e, n, 1, pat)
+                set_nf(e, n, 2, esc)
+                l = n
+            } else {
+                if not {
+                    // Not a postfix NOT: give the token back.
+                    e.pos = save_pos
+                    e.ts = save_ts
+                    e.tl = save_tl
+                    e.tk = save_tk
+                }
+                return ok(l)
+            }
+        }
+    }
+}
+
+fn parse_in(e: &mut Engine, lhs: usize, not: bool) -> usize!db.Error {
+    if e.tk != TK_LP {
+        // IN table-name is not supported.
+        return err(syntax_error(e))
+    }
+    next_token(e)
+    if is_kw(e, "SELECT") || is_kw(e, "WITH") || is_kw(e, "VALUES") {
+        s := parse_select(e)?
+        expect(e, TK_RP)?
+        n := new_node(e, N_INSEL)?
+        set_flags(e, n, if not {
+            1usize
+        } else {
+            0usize
+        })
+        set_nf(e, n, 0, lhs)
+        set_nf(e, n, 1, s)
+        return ok(n)
+    }
+    head := 0usize
+    tail := 0usize
+    if e.tk != TK_RP {
+        for {
+            x := parse_expr(e)?
+            let (h, t) = list_append(e, head, tail, x)
+            head = h
+            tail = t
+            if !accept(e, TK_COMMA) {
+                break
+            }
+        }
+    }
+    expect(e, TK_RP)?
+    n := new_node(e, N_INLIST)?
+    set_flags(e, n, if not {
+        1usize
+    } else {
+        0usize
+    })
+    set_nf(e, n, 0, lhs)
+    set_nf(e, n, 1, head)
+    ok(n)
+}
+
+fn parse_compare(e: &mut Engine) -> usize!db.Error {
+    l := parse_bits(e)?
+    for {
+        op := 0u8
+        if e.tk == TK_LT {
+            op = OP_LT
+        } else if e.tk == TK_LE {
+            op = OP_LE
+        } else if e.tk == TK_GT {
+            op = OP_GT
+        } else if e.tk == TK_GE {
+            op = OP_GE
+        } else {
+            return ok(l)
+        }
+        next_token(e)
+        r := parse_bits(e)?
+        l = binary(e, op, l, r)?
+    }
+}
+
+fn parse_bits(e: &mut Engine) -> usize!db.Error {
+    l := parse_add(e)?
+    for {
+        op := 0u8
+        if e.tk == TK_BITAND {
+            op = OP_BITAND
+        } else if e.tk == TK_BITOR {
+            op = OP_BITOR
+        } else if e.tk == TK_LSHIFT {
+            op = OP_LSHIFT
+        } else if e.tk == TK_RSHIFT {
+            op = OP_RSHIFT
+        } else {
+            return ok(l)
+        }
+        next_token(e)
+        r := parse_add(e)?
+        l = binary(e, op, l, r)?
+    }
+}
+
+fn parse_add(e: &mut Engine) -> usize!db.Error {
+    l := parse_mul(e)?
+    for {
+        op := 0u8
+        if e.tk == TK_PLUS {
+            op = OP_ADD
+        } else if e.tk == TK_MINUS {
+            op = OP_SUB
+        } else {
+            return ok(l)
+        }
+        next_token(e)
+        r := parse_mul(e)?
+        l = binary(e, op, l, r)?
+    }
+}
+
+fn parse_mul(e: &mut Engine) -> usize!db.Error {
+    l := parse_concat(e)?
+    for {
+        op := 0u8
+        if e.tk == TK_STAR {
+            op = OP_MUL
+        } else if e.tk == TK_SLASH {
+            op = OP_DIV
+        } else if e.tk == TK_PERCENT {
+            op = OP_MOD
+        } else {
+            return ok(l)
+        }
+        next_token(e)
+        r := parse_concat(e)?
+        l = binary(e, op, l, r)?
+    }
+}
+
+fn parse_concat(e: &mut Engine) -> usize!db.Error {
+    l := parse_unary(e)?
+    for {
+        if e.tk == TK_CONCAT {
+            next_token(e)
+            r := parse_unary(e)?
+            l = binary(e, OP_CONCAT, l, r)?
+        } else if e.tk == TK_ARROW || e.tk == TK_ARROW2 {
+            return err(fail(e, SQLITE_ERROR, "JSON operators are not supported"))
+        } else {
+            return ok(l)
+        }
+    }
+}
+
+fn parse_unary(e: &mut Engine) -> usize!db.Error {
+    if e.tk == TK_MINUS {
+        next_token(e)
+        if e.tk == TK_INT || e.tk == TK_FLOAT {
+            n := number_literal(e, true)?
+            return parse_postfix(e, n)
+        }
+        a := parse_unary(e)?
+        return unary(e, OP_NEG, a)
+    }
+    if e.tk == TK_PLUS {
+        next_token(e)
+        a := parse_unary(e)?
+        return unary(e, OP_PLUS, a)
+    }
+    if e.tk == TK_BITNOT {
+        next_token(e)
+        a := parse_unary(e)?
+        return unary(e, OP_BITNOT, a)
+    }
+    p := parse_primary(e)?
+    parse_postfix(e, p)
+}
+
+fn parse_postfix(e: &mut Engine, n: usize) -> usize!db.Error {
+    x := n
+    for is_kw(e, "COLLATE") {
+        next_token(e)
+        let (o, l) = take_name(e)?
+        coll := collation_id(e, o, l)
+        if coll == 255 {
+            e.msg_len = 0
+            msg_add(e, "no such collation sequence: ")
+            msg_add_ws(e, o, l)
+            return err(make_error(e, SQLITE_ERROR))
+        }
+        c := new_node(e, N_COLLATE)?
+        set_nf(e, c, 0, x)
+        set_nf(e, c, 1, coll as usize)
+        x = c
+    }
+    ok(x)
+}
+
+fn collation_id(e: &Engine, o: usize, l: usize) -> u8 {
+    if name_is(e, o, l, "BINARY") {
+        return COLL_BINARY
+    }
+    if name_is(e, o, l, "NOCASE") {
+        return COLL_NOCASE
+    }
+    if name_is(e, o, l, "RTRIM") {
+        return COLL_RTRIM
+    }
+    255
+}
+
+fn parse_primary(e: &mut Engine) -> usize!db.Error {
+    k := e.tk
+    if k == TK_INT || k == TK_FLOAT {
+        return number_literal(e, false)
+    }
+    if k == TK_STR {
+        return string_literal(e)
+    }
+    if k == TK_BLOB {
+        return blob_literal(e)
+    }
+    if k == TK_VAR {
+        return param_node(e)
+    }
+    if k == TK_LP {
+        next_token(e)
+        if is_kw(e, "SELECT") || is_kw(e, "WITH") || is_kw(e, "VALUES") {
+            s := parse_select(e)?
+            expect(e, TK_RP)?
+            n := new_node(e, N_SUBQ)?
+            set_nf(e, n, 1, s)
+            return ok(n)
+        }
+        x := parse_expr(e)?
+        if e.tk == TK_COMMA {
+            return err(fail(e, SQLITE_ERROR, "row values are not supported"))
+        }
+        expect(e, TK_RP)?
+        return ok(x)
+    }
+    if k == TK_ID {
+        if is_kw(e, "NULL") {
+            next_token(e)
+            return new_node(e, N_NULL)
+        }
+        if is_kw(e, "TRUE") || is_kw(e, "FALSE") {
+            v := is_kw(e, "TRUE")
+            next_token(e)
+            n := new_node(e, N_INT)?
+            set_x(e, n, if v {
+                1u64
+            } else {
+                0u64
+            })
+            return ok(n)
+        }
+        if is_kw(e, "CAST") {
+            next_token(e)
+            expect(e, TK_LP)?
+            x := parse_expr(e)?
+            expect_kw(e, "AS")?
+            let (ts, tl) = parse_type_name(e)?
+            expect(e, TK_RP)?
+            n := new_node(e, N_CAST)?
+            set_nf(e, n, 0, x)
+            let type_affinity2 = type_affinity(e, ts, tl) as usize
+            set_nf(e, n, 1, type_affinity2)
+            return ok(n)
+        }
+        if is_kw(e, "CASE") {
+            return parse_case(e)
+        }
+        if is_kw(e, "EXISTS") {
+            next_token(e)
+            expect(e, TK_LP)?
+            s := parse_select(e)?
+            expect(e, TK_RP)?
+            n := new_node(e, N_EXISTS)?
+            set_nf(e, n, 1, s)
+            return ok(n)
+        }
+        if is_kw(e, "CURRENT_TIMESTAMP") || is_kw(e, "CURRENT_DATE") || is_kw(e, "CURRENT_TIME") {
+            n := new_node(e, N_FUNC)?
+            let ts2 = e.ts
+            set_nf(e, n, 0, ts2)
+            let tl2 = e.tl
+            set_nf(e, n, 1, tl2)
+            set_flags(e, n, 4)
+            next_token(e)
+            return ok(n)
+        }
+        if is_kw(e, "RAISE") {
+            return err(fail(e, SQLITE_ERROR, "RAISE is only valid in triggers"))
+        }
+        if is_reserved(e) && !((is_kw(e, "REPLACE") || is_kw(e, "LIKE") || is_kw(e, "GLOB")) && next_is_lparen(e)) {
+            return err(syntax_error(e))
+        }
+    }
+    if k == TK_ID || k == TK_QID {
+        let (o, l) = take_name(e)?
+        if e.tk == TK_LP && k == TK_ID {
+            return parse_function(e, o, l)
+        }
+        if e.tk == TK_DOT {
+            next_token(e)
+            if e.tk == TK_STAR {
+                return err(syntax_error(e))
+            }
+            let (o2, l2) = take_name(e)?
+            if e.tk == TK_DOT {
+                // schema.table.column: only "main" is supported.
+                next_token(e)
+                let (o3, l3) = take_name(e)?
+                n := new_node(e, N_ID)?
+                set_nf(e, n, 0, o3)
+                set_nf(e, n, 1, l3)
+                set_nf(e, n, 2, o2)
+                set_nf(e, n, 3, l2)
+                return ok(n)
+            }
+            n := new_node(e, N_ID)?
+            set_nf(e, n, 0, o2)
+            set_nf(e, n, 1, l2)
+            set_nf(e, n, 2, o)
+            set_nf(e, n, 3, l)
+            return ok(n)
+        }
+        n := new_node(e, N_ID)?
+        set_nf(e, n, 0, o)
+        set_nf(e, n, 1, l)
+        return ok(n)
+    }
+    err(syntax_error(e))
+}
+
+fn parse_function(e: &mut Engine, o: usize, l: usize) -> usize!db.Error {
+    next_token(e)
+    n := new_node(e, N_FUNC)?
+    set_nf(e, n, 0, o)
+    set_nf(e, n, 1, l)
+    flags := 0usize
+    if e.tk == TK_STAR {
+        next_token(e)
+        flags = 2
+    } else if e.tk != TK_RP {
+        if accept_kw(e, "DISTINCT") {
+            flags = 1
+        } else {
+            accept_kw(e, "ALL")
+        }
+        head := 0usize
+        tail := 0usize
+        for {
+            x := parse_expr(e)?
+            let (h, t) = list_append(e, head, tail, x)
+            head = h
+            tail = t
+            if !accept(e, TK_COMMA) {
+                break
+            }
+        }
+        set_nf(e, n, 2, head)
+        if is_kw(e, "ORDER") {
+            return err(fail(e, SQLITE_ERROR, "ORDER BY in aggregate arguments is not supported"))
+        }
+    }
+    expect(e, TK_RP)?
+    if is_kw(e, "FILTER") || is_kw(e, "OVER") {
+        return err(fail(e, SQLITE_ERROR, "window functions and FILTER are not supported"))
+    }
+    set_flags(e, n, flags)
+    ok(n)
+}
+
+fn parse_case(e: &mut Engine) -> usize!db.Error {
+    next_token(e)
+    n := new_node(e, N_CASE)?
+    if !is_kw(e, "WHEN") {
+        base := parse_expr(e)?
+        set_nf(e, n, 0, base)
+    }
+    head := 0usize
+    tail := 0usize
+    for accept_kw(e, "WHEN") {
+        cond := parse_expr(e)?
+        expect_kw(e, "THEN")?
+        res := parse_expr(e)?
+        w := new_node(e, N_WHEN)?
+        set_nf(e, w, 0, cond)
+        set_nf(e, w, 1, res)
+        let (h, t) = list_append(e, head, tail, w)
+        head = h
+        tail = t
+    }
+    if head == 0 {
+        return err(syntax_error(e))
+    }
+    set_nf(e, n, 1, head)
+    if accept_kw(e, "ELSE") {
+        el := parse_expr(e)?
+        set_nf(e, n, 2, el)
+    }
+    expect_kw(e, "END")?
+    ok(n)
+}
+
+// Type name: identifiers optionally followed by (n) or (n, m). Returns the
+// text span.
+fn parse_type_name(e: &mut Engine) -> (usize, usize)!db.Error {
+    start := e.ts
+    end := e.ts
+    if e.tk != TK_ID && e.tk != TK_QID && e.tk != TK_STR {
+        return ok((start, 0usize))
+    }
+    for (e.tk == TK_ID && !is_type_stop(e)) || e.tk == TK_QID {
+        end = e.ts + e.tl
+        next_token(e)
+    }
+    if e.tk == TK_LP {
+        next_token(e)
+        for e.tk != TK_RP && e.tk != TK_EOF {
+            next_token(e)
+        }
+        end = e.ts + e.tl
+        expect(e, TK_RP)?
+    }
+    ok((start, end - start))
+}
+
+fn is_type_stop(e: &Engine) -> bool {
+    is_kw(e, "PRIMARY") || is_kw(e, "NOT") || is_kw(e, "NULL") || is_kw(e, "UNIQUE") ||
+        is_kw(e, "CHECK") || is_kw(e, "DEFAULT") || is_kw(e, "COLLATE") || is_kw(e, "REFERENCES") ||
+        is_kw(e, "CONSTRAINT") || is_kw(e, "GENERATED") || is_kw(e, "AS")
+}
+
+// Affinity of a declared type, by SQLite's substring rules.
+fn type_affinity(e: &Engine, o: usize, l: usize) -> u8 {
+    if contains_ci(e, o, l, "INT") {
+        return AFF_INTEGER
+    }
+    if contains_ci(e, o, l, "CHAR") || contains_ci(e, o, l, "CLOB") || contains_ci(e, o, l, "TEXT") {
+        return AFF_TEXT
+    }
+    if l == 0 || contains_ci(e, o, l, "BLOB") {
+        return AFF_BLOB
+    }
+    if contains_ci(e, o, l, "REAL") || contains_ci(e, o, l, "FLOA") || contains_ci(e, o, l, "DOUB") {
+        return AFF_REAL
+    }
+    AFF_NUMERIC
+}
+
+fn contains_ci(e: &Engine, o: usize, l: usize, word: &str) -> bool {
+    w := mem_bytes(word)
+    if w.len > l {
+        return false
+    }
+    for i in 0usize..(l - w.len + 1) {
+        hit := true
+        for j in 0usize..w.len {
+            if fold(e.ws[o + i + j]) != fold(w[j]) {
+                hit = false
+                break
+            }
+        }
+        if hit {
+            return true
+        }
+    }
+    false
+}
+
+// ---------------------------------------------------------------------------
+// SELECT
+
+// CTE table entries (32 bytes): name off, name len, column list node,
+// body text off, body text len, flags (1 recursive, 2 being resolved,
+// 4 referenced recursively), body select node, queue table object.
+const CTE_BYTES: usize = 32
+const CTE_MAX: usize = 64
+
+fn cte_entry(e: &Engine, i: usize) -> usize {
+    e.cte_off + i * CTE_BYTES
+}
+
+// WITH [RECURSIVE] name [(columns)] AS [[NOT] MATERIALIZED] (select), ...
+// The body is kept as text and parsed again at every reference, so each
+// reference gets its own parse tree (like a view).
+fn parse_with(e: &mut Engine) -> void!db.Error {
+    expect_kw(e, "WITH")?
+    recursive := accept_kw(e, "RECURSIVE")
+    for {
+        let (o, l) = take_name(e)?
+        cols := 0usize
+        if accept(e, TK_LP) {
+            head := 0usize
+            tail := 0usize
+            for {
+                let (co, cl) = take_name(e)?
+                id := new_node(e, N_ID)?
+                set_nf(e, id, 0, co)
+                set_nf(e, id, 1, cl)
+                let (h, t) = list_append(e, head, tail, id)
+                head = h
+                tail = t
+                if !accept(e, TK_COMMA) {
+                    break
+                }
+            }
+            expect(e, TK_RP)?
+            cols = head
+        }
+        expect_kw(e, "AS")?
+        accept_kw(e, "NOT")
+        accept_kw(e, "MATERIALIZED")
+        expect(e, TK_LP)?
+        start := e.ts
+        parse_select(e)?
+        end := e.ts
+        expect(e, TK_RP)?
+        if e.cte_off == 0 {
+            let pool_alloc2 = pool_alloc(e, CTE_MAX * CTE_BYTES)?
+            e.cte_off = pool_alloc2
+            e.cte_n = 0
+        }
+        if e.cte_n >= CTE_MAX {
+            return err(fail(e, SQLITE_ERROR, "too many common table expressions"))
+        }
+        let cte_n2 = e.cte_n
+        c := cte_entry(e, cte_n2)
+        stu(e.ws, c, o)
+        stu(e.ws, c + 4, l)
+        stu(e.ws, c + 8, cols)
+        stu(e.ws, c + 12, start)
+        stu(e.ws, c + 16, end - start)
+        stu(e.ws, c + 20, if recursive {
+            1usize
+        } else {
+            0usize
+        })
+        stu(e.ws, c + 24, 0)
+        stu(e.ws, c + 28, 0)
+        e.cte_n += 1
+        if !accept(e, TK_COMMA) {
+            return ok()
+        }
+    }
+}
+
+fn parse_select(e: &mut Engine) -> usize!db.Error {
+    if is_kw(e, "WITH") {
+        parse_with(e)?
+    }
+    first := parse_select_core(e)?
+    last := first
+    for {
+        op := 0u8
+        if is_kw(e, "UNION") {
+            next_token(e)
+            op = if accept_kw(e, "ALL") {
+                2u8
+            } else {
+                1u8
+            }
+        } else if is_kw(e, "INTERSECT") {
+            next_token(e)
+            op = 3
+        } else if is_kw(e, "EXCEPT") {
+            next_token(e)
+            op = 4
+        } else {
+            break
+        }
+        next := parse_select_core(e)?
+        set_op(e, next, op)
+        set_next(e, last, next)
+        last = next
+    }
+    // ORDER BY / LIMIT apply to the whole compound.
+    order := 0usize
+    if is_kw(e, "ORDER") {
+        next_token(e)
+        expect_kw(e, "BY")?
+        order = parse_order_list(e)?
+    }
+    limit := 0usize
+    offset := 0usize
+    if accept_kw(e, "LIMIT") {
+        limit = parse_expr(e)?
+        if accept_kw(e, "OFFSET") {
+            offset = parse_expr(e)?
+        } else if accept(e, TK_COMMA) {
+            offset = limit
+            limit = parse_expr(e)?
+        }
+    }
+    if order != 0 || limit != 0 {
+        ext := nd_ext(e, first)?
+        set_nf(e, ext, 2, order)
+        set_nf(e, ext, 3, limit)
+        set_nf(e, ext, 4, offset)
+    }
+    ok(first)
+}
+
+fn nd_ext(e: &mut Engine, s: usize) -> usize!db.Error {
+    x := ndd(e, s)
+    if x != 0 {
+        return ok(x)
+    }
+    n := new_node(e, N_SELEXT)?
+    set_nf(e, s, 3, n)
+    ok(n)
+}
+
+fn parse_order_list(e: &mut Engine) -> usize!db.Error {
+    head := 0usize
+    tail := 0usize
+    for {
+        x := parse_expr(e)?
+        o := new_node(e, N_ORDER)?
+        set_nf(e, o, 0, x)
+        flags := 0usize
+        if accept_kw(e, "DESC") {
+            flags = 1
+        } else {
+            accept_kw(e, "ASC")
+        }
+        if accept_kw(e, "NULLS") {
+            if accept_kw(e, "LAST") {
+                flags = flags | 2
+            } else {
+                expect_kw(e, "FIRST")?
+                flags = flags | 4
+            }
+        }
+        set_flags(e, o, flags)
+        let (h, t) = list_append(e, head, tail, o)
+        head = h
+        tail = t
+        if !accept(e, TK_COMMA) {
+            return ok(head)
+        }
+    }
+}
+
+fn parse_select_core(e: &mut Engine) -> usize!db.Error {
+    s := new_node(e, S_SELECT)?
+    if accept_kw(e, "VALUES") {
+        // VALUES (..), (..) as a select: rows chained as UNION ALL.
+        first := 0usize
+        for {
+            row := if first == 0 {
+                s
+            } else {
+                new_node(e, S_SELECT)?
+            }
+            expect(e, TK_LP)?
+            head := 0usize
+            tail := 0usize
+            for {
+                x := parse_expr(e)?
+                rc := new_node(e, N_RESCOL)?
+                set_nf(e, rc, 0, x)
+                let (h, t) = list_append(e, head, tail, rc)
+                head = h
+                tail = t
+                if !accept(e, TK_COMMA) {
+                    break
+                }
+            }
+            expect(e, TK_RP)?
+            set_nf(e, row, 0, head)
+            set_flags(e, row, 8)
+            if first != 0 {
+                set_op(e, row, 2)
+                p := first
+                for nnext(e, p) != 0 {
+                    p = nnext(e, p)
+                }
+                set_next(e, p, row)
+            } else {
+                first = row
+            }
+            if !accept(e, TK_COMMA) {
+                break
+            }
+        }
+        return ok(s)
+    }
+    expect_kw(e, "SELECT")?
+    if accept_kw(e, "DISTINCT") {
+        set_flags(e, s, 1)
+    } else {
+        accept_kw(e, "ALL")
+    }
+    // Result columns.
+    head := 0usize
+    tail := 0usize
+    for {
+        rc := new_node(e, N_RESCOL)?
+        if e.tk == TK_STAR {
+            next_token(e)
+            st := new_node(e, N_STAR)?
+            set_nf(e, rc, 0, st)
+        } else if (e.tk == TK_ID || e.tk == TK_QID) && peek_dot_star(e) {
+            let (o, l) = take_name(e)?
+            next_token(e)
+            next_token(e)
+            st := new_node(e, N_STAR)?
+            set_nf(e, st, 0, o)
+            set_nf(e, st, 1, l)
+            set_nf(e, rc, 0, st)
+        } else {
+            start := e.ts
+            x := parse_expr(e)?
+            set_nf(e, rc, 0, x)
+            // Default name is the expression text.
+            set_nf(e, rc, 3, start)
+            let last_end2 = e.last_end - start
+            set_nf(e, rc, 4, last_end2)
+            if accept_kw(e, "AS") {
+                let (o, l) = take_name(e)?
+                set_nf(e, rc, 1, o)
+                set_nf(e, rc, 2, l)
+            } else if is_name_token(e) && e.tk != TK_STR {
+                let (o, l) = take_name(e)?
+                set_nf(e, rc, 1, o)
+                set_nf(e, rc, 2, l)
+            }
+        }
+        let (h, t) = list_append(e, head, tail, rc)
+        head = h
+        tail = t
+        if !accept(e, TK_COMMA) {
+            break
+        }
+    }
+    set_nf(e, s, 0, head)
+    if accept_kw(e, "FROM") {
+        src := parse_from(e)?
+        set_nf(e, s, 1, src)
+    }
+    if accept_kw(e, "WHERE") {
+        w := parse_expr(e)?
+        set_nf(e, s, 2, w)
+    }
+    if is_kw(e, "GROUP") {
+        next_token(e)
+        expect_kw(e, "BY")?
+        gh := 0usize
+        gt := 0usize
+        for {
+            x := parse_expr(e)?
+            o := new_node(e, N_ORDER)?
+            set_nf(e, o, 0, x)
+            let (h, t) = list_append(e, gh, gt, o)
+            gh = h
+            gt = t
+            if !accept(e, TK_COMMA) {
+                break
+            }
+        }
+        ext := nd_ext(e, s)?
+        set_nf(e, ext, 0, gh)
+        if accept_kw(e, "HAVING") {
+            hv := parse_expr(e)?
+            set_nf(e, ext, 1, hv)
+        }
+    } else if is_kw(e, "HAVING") {
+        next_token(e)
+        hv := parse_expr(e)?
+        ext := nd_ext(e, s)?
+        set_nf(e, ext, 1, hv)
+    }
+    if is_kw(e, "WINDOW") {
+        return err(fail(e, SQLITE_ERROR, "window functions are not supported"))
+    }
+    ok(s)
+}
+
+// True when the token after the current one is the keyword `word`.
+fn next_is_kw(e: &mut Engine, word: &str) -> bool {
+    save_pos := e.pos
+    save_ts := e.ts
+    save_tl := e.tl
+    save_tk := e.tk
+    save_last := e.last_end
+    next_token(e)
+    r := is_kw(e, word)
+    e.pos = save_pos
+    e.ts = save_ts
+    e.tl = save_tl
+    e.tk = save_tk
+    e.last_end = save_last
+    r
+}
+
+fn next_is_lparen(e: &Engine) -> bool {
+    p := e.pos
+    for p < e.src_end && is_space(e.ws[p]) {
+        p += 1
+    }
+    p < e.src_end && e.ws[p] == 40
+}
+
+fn peek_dot_star(e: &mut Engine) -> bool {
+    save_pos := e.pos
+    save_ts := e.ts
+    save_tl := e.tl
+    save_tk := e.tk
+    next_token(e)
+    r := false
+    if e.tk == TK_DOT {
+        next_token(e)
+        r = e.tk == TK_STAR
+    }
+    e.pos = save_pos
+    e.ts = save_ts
+    e.tl = save_tl
+    e.tk = save_tk
+    r
+}
+
+fn parse_from(e: &mut Engine) -> usize!db.Error {
+    head := 0usize
+    tail := 0usize
+    jt := 0u8
+    for {
+        src := new_node(e, N_SRC)?
+        set_op(e, src, jt)
+        is_sub := false
+        if e.tk == TK_LP {
+            next_token(e)
+            if !(is_kw(e, "SELECT") || is_kw(e, "VALUES") || is_kw(e, "WITH")) {
+                return err(fail(e, SQLITE_ERROR, "parenthesized joins are not supported"))
+            }
+            sub := parse_select(e)?
+            expect(e, TK_RP)?
+            set_x(e, src, (sub as u64) << 32)
+            is_sub = true
+        }
+        if is_sub {
+            // Alias handling below.
+        } else {
+            let (o, l) = take_name(e)?
+            if e.tk == TK_DOT {
+                next_token(e)
+                if !name_is(e, o, l, "main") {
+                    e.msg_len = 0
+                    msg_add(e, "unknown database ")
+                    msg_add_ws(e, o, l)
+                    return err(make_error(e, SQLITE_ERROR))
+                }
+                let (o2, l2) = take_name(e)?
+                set_nf(e, src, 0, o2)
+                set_nf(e, src, 1, l2)
+            } else {
+                set_nf(e, src, 0, o)
+                set_nf(e, src, 1, l)
+            }
+            if e.tk == TK_LP {
+                return err(fail(e, SQLITE_ERROR, "table-valued functions are not supported"))
+            }
+        }
+        if accept_kw(e, "AS") {
+            let (ao, al) = take_name(e)?
+            set_nf(e, src, 2, ao)
+            set_nf(e, src, 3, al)
+        } else if is_name_token(e) && e.tk != TK_STR {
+            let (ao, al) = take_name(e)?
+            set_nf(e, src, 2, ao)
+            set_nf(e, src, 3, al)
+        }
+        if is_kw(e, "INDEXED") {
+            next_token(e)
+            expect_kw(e, "BY")?
+            take_name(e)?
+        } else if is_kw(e, "NOT") {
+            next_token(e)
+            expect_kw(e, "INDEXED")?
+        }
+        if is_kw(e, "ON") && !next_is_kw(e, "CONFLICT") {
+            next_token(e)
+            on := parse_expr(e)?
+            set_nf(e, src, 4, on)
+        } else if accept_kw(e, "USING") {
+            expect(e, TK_LP)?
+            uh := 0usize
+            ut := 0usize
+            for {
+                let (uo, ul) = take_name(e)?
+                id := new_node(e, N_ID)?
+                set_nf(e, id, 0, uo)
+                set_nf(e, id, 1, ul)
+                let (h, t) = list_append(e, uh, ut, id)
+                uh = h
+                ut = t
+                if !accept(e, TK_COMMA) {
+                    break
+                }
+            }
+            expect(e, TK_RP)?
+            set_nf(e, src, 5, uh)
+        }
+        let (h, t) = list_append(e, head, tail, src)
+        head = h
+        tail = t
+        // Join operator.
+        if accept(e, TK_COMMA) {
+            jt = 0
+            continue
+        }
+        natural := accept_kw(e, "NATURAL")
+        if natural {
+            return err(fail(e, SQLITE_ERROR, "NATURAL joins are not supported"))
+        }
+        if accept_kw(e, "LEFT") {
+            accept_kw(e, "OUTER")
+            expect_kw(e, "JOIN")?
+            jt = 1
+            continue
+        }
+        if accept_kw(e, "INNER") {
+            expect_kw(e, "JOIN")?
+            jt = 0
+            continue
+        }
+        if accept_kw(e, "CROSS") {
+            expect_kw(e, "JOIN")?
+            jt = 2
+            continue
+        }
+        if is_kw(e, "RIGHT") || is_kw(e, "FULL") {
+            return err(fail(e, SQLITE_ERROR, "RIGHT and FULL joins are not supported"))
+        }
+        if accept_kw(e, "JOIN") {
+            jt = 0
+            continue
+        }
+        return ok(head)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Statements
+
+fn parse_conflict(e: &mut Engine) -> u8!db.Error {
+    if accept_kw(e, "ROLLBACK") {
+        return ok(OE_ROLLBACK)
+    }
+    if accept_kw(e, "ABORT") {
+        return ok(OE_ABORT)
+    }
+    if accept_kw(e, "FAIL") {
+        return ok(OE_FAIL)
+    }
+    if accept_kw(e, "IGNORE") {
+        return ok(OE_IGNORE)
+    }
+    if accept_kw(e, "REPLACE") {
+        return ok(OE_REPLACE)
+    }
+    err(syntax_error(e))
+}
+
+// RETURNING expr [[AS] alias], ... | *: result columns kept in field x.
+fn parse_returning(e: &mut Engine, s: usize) -> void!db.Error {
+    head := 0usize
+    tail := 0usize
+    for {
+        rc := new_node(e, N_RESCOL)?
+        if e.tk == TK_STAR {
+            next_token(e)
+            st := new_node(e, N_STAR)?
+            set_nf(e, rc, 0, st)
+        } else {
+            start := e.ts
+            x := parse_expr(e)?
+            set_nf(e, rc, 0, x)
+            set_nf(e, rc, 3, start)
+            let last_end2 = e.last_end - start
+            set_nf(e, rc, 4, last_end2)
+            if accept_kw(e, "AS") {
+                let (o, l) = take_name(e)?
+                set_nf(e, rc, 1, o)
+                set_nf(e, rc, 2, l)
+            } else if is_name_token(e) && e.tk != TK_STR {
+                let (o, l) = take_name(e)?
+                set_nf(e, rc, 1, o)
+                set_nf(e, rc, 2, l)
+            }
+        }
+        let (h, t) = list_append(e, head, tail, rc)
+        head = h
+        tail = t
+        if !accept(e, TK_COMMA) {
+            break
+        }
+    }
+    set_x(e, s, head as u64)
+    ok()
+}
+
+fn parse_insert(e: &mut Engine) -> usize!db.Error {
+    s := new_node(e, S_INSERT)?
+    if accept_kw(e, "REPLACE") {
+        set_op(e, s, OE_REPLACE)
+    } else {
+        expect_kw(e, "INSERT")?
+        if accept_kw(e, "OR") {
+            c := parse_conflict(e)?
+            set_op(e, s, c)
+        }
+    }
+    expect_kw(e, "INTO")?
+    let (o, l) = take_name(e)?
+    if e.tk == TK_DOT {
+        next_token(e)
+        let (o2, l2) = take_name(e)?
+        set_nf(e, s, 0, o2)
+        set_nf(e, s, 1, l2)
+    } else {
+        set_nf(e, s, 0, o)
+        set_nf(e, s, 1, l)
+    }
+    if accept_kw(e, "AS") {
+        take_name(e)?
+    }
+    if e.tk == TK_LP {
+        next_token(e)
+        head := 0usize
+        tail := 0usize
+        for {
+            let (co, cl) = take_name(e)?
+            id := new_node(e, N_ID)?
+            set_nf(e, id, 0, co)
+            set_nf(e, id, 1, cl)
+            let (h, t) = list_append(e, head, tail, id)
+            head = h
+            tail = t
+            if !accept(e, TK_COMMA) {
+                break
+            }
+        }
+        expect(e, TK_RP)?
+        set_nf(e, s, 2, head)
+    }
+    if accept_kw(e, "DEFAULT") {
+        expect_kw(e, "VALUES")?
+        set_flags(e, s, 1)
+    } else if is_kw(e, "VALUES") {
+        next_token(e)
+        rh := 0usize
+        rt := 0usize
+        for {
+            expect(e, TK_LP)?
+            row := new_node(e, N_ROW)?
+            head := 0usize
+            tail := 0usize
+            for {
+                x := parse_expr(e)?
+                let (h, t) = list_append(e, head, tail, x)
+                head = h
+                tail = t
+                if !accept(e, TK_COMMA) {
+                    break
+                }
+            }
+            expect(e, TK_RP)?
+            set_nf(e, row, 0, head)
+            let (h2, t2) = list_append(e, rh, rt, row)
+            rh = h2
+            rt = t2
+            if !accept(e, TK_COMMA) {
+                break
+            }
+        }
+        set_nf(e, s, 3, rh)
+    } else {
+        sel := parse_select(e)?
+        set_nf(e, s, 4, sel)
+    }
+    if accept_kw(e, "ON") {
+        expect_kw(e, "CONFLICT")?
+        u := new_node(e, N_UPSERT)?
+        if accept(e, TK_LP) {
+            head := 0usize
+            tail := 0usize
+            for {
+                x := parse_expr(e)?
+                if nkind(e, x) == N_COLLATE {
+                    x = na(e, x)
+                }
+                if nkind(e, x) != N_ID || nc(e, x) != 0 {
+                    return err(fail(e, SQLITE_ERROR, "ON CONFLICT targets must be column names"))
+                }
+                accept_kw(e, "ASC")
+                accept_kw(e, "DESC")
+                let (h, t) = list_append(e, head, tail, x)
+                head = h
+                tail = t
+                if !accept(e, TK_COMMA) {
+                    break
+                }
+            }
+            expect(e, TK_RP)?
+            set_nf(e, u, 0, head)
+            if accept_kw(e, "WHERE") {
+                w := parse_expr(e)?
+                set_nf(e, u, 1, w)
+            }
+        }
+        expect_kw(e, "DO")?
+        if accept_kw(e, "NOTHING") {
+            set_op(e, u, 0)
+        } else {
+            expect_kw(e, "UPDATE")?
+            expect_kw(e, "SET")?
+            set_op(e, u, 1)
+            head := 0usize
+            tail := 0usize
+            for {
+                let (co, cl) = take_name(e)?
+                expect(e, TK_EQ)?
+                x := parse_expr(e)?
+                st := new_node(e, N_SET)?
+                set_nf(e, st, 0, co)
+                set_nf(e, st, 1, cl)
+                set_nf(e, st, 2, x)
+                let (h, t) = list_append(e, head, tail, st)
+                head = h
+                tail = t
+                if !accept(e, TK_COMMA) {
+                    break
+                }
+            }
+            set_nf(e, u, 3, head)
+            if accept_kw(e, "WHERE") {
+                w := parse_expr(e)?
+                set_nf(e, u, 4, w)
+            }
+        }
+        if is_kw(e, "ON") {
+            return err(fail(e, SQLITE_ERROR, "only one ON CONFLICT clause is supported"))
+        }
+        set_nf(e, s, 5, u)
+    }
+    if accept_kw(e, "RETURNING") {
+        parse_returning(e, s)?
+    }
+    ok(s)
+}
+
+fn parse_update(e: &mut Engine) -> usize!db.Error {
+    s := new_node(e, S_UPDATE)?
+    if accept_kw(e, "OR") {
+        c := parse_conflict(e)?
+        set_op(e, s, c)
+    }
+    let (o, l) = take_name(e)?
+    if e.tk == TK_DOT {
+        next_token(e)
+        let (o2, l2) = take_name(e)?
+        set_nf(e, s, 0, o2)
+        set_nf(e, s, 1, l2)
+    } else {
+        set_nf(e, s, 0, o)
+        set_nf(e, s, 1, l)
+    }
+    if accept_kw(e, "AS") {
+        return err(fail(e, SQLITE_ERROR, "aliases in UPDATE are not supported"))
+    }
+    expect_kw(e, "SET")?
+    head := 0usize
+    tail := 0usize
+    for {
+        if e.tk == TK_LP {
+            return err(fail(e, SQLITE_ERROR, "row-value assignment is not supported"))
+        }
+        let (co, cl) = take_name(e)?
+        expect(e, TK_EQ)?
+        x := parse_expr(e)?
+        st := new_node(e, N_SET)?
+        set_nf(e, st, 0, co)
+        set_nf(e, st, 1, cl)
+        set_nf(e, st, 2, x)
+        let (h, t) = list_append(e, head, tail, st)
+        head = h
+        tail = t
+        if !accept(e, TK_COMMA) {
+            break
+        }
+    }
+    set_nf(e, s, 2, head)
+    if is_kw(e, "FROM") {
+        return err(fail(e, SQLITE_ERROR, "UPDATE FROM is not supported"))
+    }
+    if accept_kw(e, "WHERE") {
+        w := parse_expr(e)?
+        set_nf(e, s, 3, w)
+    }
+    if accept_kw(e, "RETURNING") {
+        parse_returning(e, s)?
+    }
+    ok(s)
+}
+
+fn parse_delete(e: &mut Engine) -> usize!db.Error {
+    s := new_node(e, S_DELETE)?
+    expect_kw(e, "FROM")?
+    let (o, l) = take_name(e)?
+    if e.tk == TK_DOT {
+        next_token(e)
+        let (o2, l2) = take_name(e)?
+        set_nf(e, s, 0, o2)
+        set_nf(e, s, 1, l2)
+    } else {
+        set_nf(e, s, 0, o)
+        set_nf(e, s, 1, l)
+    }
+    if accept_kw(e, "WHERE") {
+        w := parse_expr(e)?
+        set_nf(e, s, 3, w)
+    }
+    if accept_kw(e, "RETURNING") {
+        parse_returning(e, s)?
+    }
+    ok(s)
+}
+
+// Skips a parenthesized group (used for constraint clauses we accept but
+// do not enforce, such as REFERENCES ... and GENERATED ... AS (...)).
+fn skip_parens(e: &mut Engine) -> void!db.Error {
+    if e.tk != TK_LP {
+        return ok()
+    }
+    level := 0usize
+    for {
+        if e.tk == TK_EOF {
+            return err(syntax_error(e))
+        }
+        if e.tk == TK_LP {
+            level += 1
+        } else if e.tk == TK_RP {
+            level -= 1
+            if level == 0 {
+                next_token(e)
+                return ok()
+            }
+        }
+        next_token(e)
+    }
+}
+
+fn skip_references(e: &mut Engine) -> void!db.Error {
+    // REFERENCES table [(cols)] [ON ... | MATCH name | DEFERRABLE ...]*
+    take_name(e)?
+    skip_parens(e)?
+    for {
+        if accept_kw(e, "ON") {
+            next_token(e)
+            if accept_kw(e, "SET") {
+                next_token(e)
+            } else if accept_kw(e, "NO") {
+                next_token(e)
+            } else {
+                next_token(e)
+            }
+        } else if accept_kw(e, "MATCH") {
+            next_token(e)
+        } else if accept_kw(e, "NOT") {
+            expect_kw(e, "DEFERRABLE")?
+            if accept_kw(e, "INITIALLY") {
+                next_token(e)
+            }
+        } else if accept_kw(e, "DEFERRABLE") {
+            if accept_kw(e, "INITIALLY") {
+                next_token(e)
+            }
+        } else {
+            return ok()
+        }
+    }
+}
+
+fn parse_create(e: &mut Engine, sql_start: usize) -> usize!db.Error {
+    expect_kw(e, "CREATE")?
+    if is_kw(e, "TEMP") || is_kw(e, "TEMPORARY") {
+        return err(fail(e, SQLITE_ERROR, "temporary tables are not supported"))
+    }
+    unique := accept_kw(e, "UNIQUE")
+    if is_kw(e, "INDEX") {
+        next_token(e)
+        return parse_create_index(e, unique, sql_start)
+    }
+    if unique {
+        return err(syntax_error(e))
+    }
+    if is_kw(e, "VIEW") {
+        next_token(e)
+        return parse_create_view(e)
+    }
+    if is_kw(e, "TRIGGER") || is_kw(e, "VIRTUAL") {
+        return err(fail(e, SQLITE_ERROR, "triggers and virtual tables are not supported"))
+    }
+    expect_kw(e, "TABLE")?
+    s := new_node(e, S_CREATE_TABLE)?
+    if accept_kw(e, "IF") {
+        expect_kw(e, "NOT")?
+        expect_kw(e, "EXISTS")?
+        set_flags(e, s, 1)
+    }
+    name_start := e.ts
+    let (o, l) = take_name(e)?
+    if e.tk == TK_DOT {
+        next_token(e)
+        name_start = e.ts
+        let (o2, l2) = take_name(e)?
+        set_nf(e, s, 0, o2)
+        set_nf(e, s, 1, l2)
+    } else {
+        set_nf(e, s, 0, o)
+        set_nf(e, s, 1, l)
+    }
+    set_nf(e, s, 4, name_start)
+    if is_kw(e, "AS") {
+        return err(fail(e, SQLITE_ERROR, "CREATE TABLE ... AS SELECT is not supported"))
+    }
+    expect(e, TK_LP)?
+    ch_ := 0usize
+    ct := 0usize
+    th := 0usize
+    tt := 0usize
+    for {
+        if is_kw(e, "CONSTRAINT") || is_kw(e, "PRIMARY") || is_kw(e, "UNIQUE") || is_kw(e, "CHECK") || is_kw(e, "FOREIGN") {
+            tc := parse_table_constraint(e)?
+            if tc != 0 {
+                let (h, t) = list_append(e, th, tt, tc)
+                th = h
+                tt = t
+            }
+        } else {
+            if th != 0 {
+                return err(syntax_error(e))
+            }
+            cd := parse_column_def(e)?
+            let (h, t) = list_append(e, ch_, ct, cd)
+            ch_ = h
+            ct = t
+        }
+        if !accept(e, TK_COMMA) {
+            break
+        }
+    }
+    expect(e, TK_RP)?
+    set_nf(e, s, 2, ch_)
+    set_nf(e, s, 3, th)
+    // Table options.
+    for {
+        if accept_kw(e, "WITHOUT") {
+            return err(fail(e, SQLITE_ERROR, "WITHOUT ROWID tables are not supported"))
+        }
+        if accept_kw(e, "STRICT") {
+            let flags = nflags(e, s) | 2
+            set_flags(e, s, flags)
+        }
+        if !accept(e, TK_COMMA) {
+            break
+        }
+    }
+    let last_end2 = e.last_end
+    set_nf(e, s, 5, last_end2)
+    ok(s)
+}
+
+fn parse_column_def(e: &mut Engine) -> usize!db.Error {
+    cd := new_node(e, N_COLDEF)?
+    let (o, l) = take_name(e)?
+    set_nf(e, cd, 0, o)
+    set_nf(e, cd, 1, l)
+    let (ts, tl) = parse_type_name(e)?
+    set_nf(e, cd, 2, ts)
+    set_nf(e, cd, 3, tl)
+    flags := 0usize
+    for {
+        if accept_kw(e, "CONSTRAINT") {
+            take_name(e)?
+            continue
+        }
+        if accept_kw(e, "PRIMARY") {
+            expect_kw(e, "KEY")?
+            flags = flags | CF_PK
+            if accept_kw(e, "DESC") {
+                flags = flags | CF_PKDESC
+            } else {
+                accept_kw(e, "ASC")
+            }
+            if accept_kw(e, "ON") {
+                expect_kw(e, "CONFLICT")?
+                c := parse_conflict(e)?
+                set_op(e, cd, c)
+            }
+            if accept_kw(e, "AUTOINCREMENT") {
+                flags = flags | CF_AUTOINC
+            }
+            continue
+        }
+        if accept_kw(e, "NOT") {
+            expect_kw(e, "NULL")?
+            flags = flags | CF_NOTNULL
+            if accept_kw(e, "ON") {
+                expect_kw(e, "CONFLICT")?
+                parse_conflict(e)?
+            }
+            continue
+        }
+        if accept_kw(e, "NULL") {
+            continue
+        }
+        if accept_kw(e, "UNIQUE") {
+            flags = flags | CF_UNIQUE
+            if accept_kw(e, "ON") {
+                expect_kw(e, "CONFLICT")?
+                parse_conflict(e)?
+            }
+            continue
+        }
+        if accept_kw(e, "CHECK") {
+            expect(e, TK_LP)?
+            x := parse_expr(e)?
+            expect(e, TK_RP)?
+            prev := ng(e, cd)
+            if prev == 0 {
+                set_nf(e, cd, 6, x)
+            } else {
+                both := binary(e, OP_AND, prev, x)?
+                set_nf(e, cd, 6, both)
+            }
+            continue
+        }
+        if accept_kw(e, "DEFAULT") {
+            start := e.ts
+            x := 0usize
+            if e.tk == TK_LP {
+                next_token(e)
+                x = parse_expr(e)?
+                expect(e, TK_RP)?
+            } else if e.tk == TK_MINUS || e.tk == TK_PLUS {
+                x = parse_unary(e)?
+            } else if e.tk == TK_ID && !is_kw(e, "NULL") && !is_kw(e, "TRUE") && !is_kw(e, "FALSE") && !is_kw(e, "CURRENT_TIMESTAMP") && !is_kw(e, "CURRENT_DATE") && !is_kw(e, "CURRENT_TIME") {
+                // A bare identifier default is taken as a string.
+                n := new_node(e, N_STR)?
+                let ts2 = e.ts
+                set_nf(e, n, 0, ts2)
+                let tl2 = e.tl
+                set_nf(e, n, 1, tl2)
+                next_token(e)
+                x = n
+            } else {
+                x = parse_primary(e)?
+            }
+            set_nf(e, cd, 4, x)
+            let value = ((start as u64) << 32) | ((e.last_end - start) as u64)
+            set_x(e, cd, value)
+            continue
+        }
+        if accept_kw(e, "COLLATE") {
+            let (co, cl) = take_name(e)?
+            coll := collation_id(e, co, cl)
+            if coll == 255 {
+                e.msg_len = 0
+                msg_add(e, "no such collation sequence: ")
+                msg_add_ws(e, co, cl)
+                return err(make_error(e, SQLITE_ERROR))
+            }
+            set_nf(e, cd, 5, coll as usize + 1)
+            continue
+        }
+        if accept_kw(e, "REFERENCES") {
+            skip_references(e)?
+            continue
+        }
+        if accept_kw(e, "GENERATED") {
+            return err(fail(e, SQLITE_ERROR, "generated columns are not supported"))
+        }
+        if is_kw(e, "AS") {
+            return err(fail(e, SQLITE_ERROR, "generated columns are not supported"))
+        }
+        break
+    }
+    set_flags(e, cd, flags)
+    ok(cd)
+}
+
+fn parse_table_constraint(e: &mut Engine) -> usize!db.Error {
+    if accept_kw(e, "CONSTRAINT") {
+        take_name(e)?
+    }
+    tc := new_node(e, N_TCONS)?
+    if accept_kw(e, "PRIMARY") {
+        expect_kw(e, "KEY")?
+        set_op(e, tc, 1)
+    } else if accept_kw(e, "UNIQUE") {
+        set_op(e, tc, 2)
+    } else if accept_kw(e, "CHECK") {
+        set_op(e, tc, 3)
+        expect(e, TK_LP)?
+        x := parse_expr(e)?
+        expect(e, TK_RP)?
+        set_nf(e, tc, 4, x)
+        return ok(tc)
+    } else if accept_kw(e, "FOREIGN") {
+        expect_kw(e, "KEY")?
+        skip_parens(e)?
+        expect_kw(e, "REFERENCES")?
+        skip_references(e)?
+        return ok(0)
+    } else {
+        return err(syntax_error(e))
+    }
+    expect(e, TK_LP)?
+    head := 0usize
+    tail := 0usize
+    for {
+        let (o, l) = take_name(e)?
+        item := new_node(e, N_ORDER)?
+        id := new_node(e, N_ID)?
+        set_nf(e, id, 0, o)
+        set_nf(e, id, 1, l)
+        set_nf(e, item, 0, id)
+        if accept_kw(e, "COLLATE") {
+            let (co, cl) = take_name(e)?
+            coll := collation_id(e, co, cl)
+            if coll == 255 {
+                return err(fail(e, SQLITE_ERROR, "no such collation sequence"))
+            }
+            set_nf(e, item, 1, coll as usize + 1)
+        }
+        if accept_kw(e, "DESC") {
+            set_flags(e, item, 1)
+        } else {
+            accept_kw(e, "ASC")
+        }
+        if accept_kw(e, "AUTOINCREMENT") {
+            let flags = nflags(e, item) | 8
+            set_flags(e, item, flags)
+        }
+        let (h, t) = list_append(e, head, tail, item)
+        head = h
+        tail = t
+        if !accept(e, TK_COMMA) {
+            break
+        }
+    }
+    expect(e, TK_RP)?
+    set_nf(e, tc, 0, head)
+    if accept_kw(e, "ON") {
+        expect_kw(e, "CONFLICT")?
+        c := parse_conflict(e)?
+        set_nf(e, tc, 5, c as usize + 1)
+    }
+    ok(tc)
+}
+
+fn parse_create_index(e: &mut Engine, unique: bool, sql_start: usize) -> usize!db.Error {
+    s := new_node(e, S_CREATE_INDEX)?
+    flags := if unique {
+        2usize
+    } else {
+        0usize
+    }
+    if accept_kw(e, "IF") {
+        expect_kw(e, "NOT")?
+        expect_kw(e, "EXISTS")?
+        flags = flags | 1
+    }
+    set_flags(e, s, flags)
+    name_start := e.ts
+    let (o, l) = take_name(e)?
+    if e.tk == TK_DOT {
+        next_token(e)
+        name_start = e.ts
+        let (o2, l2) = take_name(e)?
+        set_nf(e, s, 0, o2)
+        set_nf(e, s, 1, l2)
+    } else {
+        set_nf(e, s, 0, o)
+        set_nf(e, s, 1, l)
+    }
+    set_nf(e, s, 5, name_start)
+    expect_kw(e, "ON")?
+    let (to, tl) = take_name(e)?
+    set_nf(e, s, 2, to)
+    set_nf(e, s, 3, tl)
+    expect(e, TK_LP)?
+    head := 0usize
+    tail := 0usize
+    for {
+        x := parse_expr(e)?
+        item := new_node(e, N_ORDER)?
+        // COLLATE on an index column is parsed as an expression postfix.
+        if nkind(e, x) == N_COLLATE {
+            let nb2 = nb(e, x) + 1
+            set_nf(e, item, 1, nb2)
+            x = na(e, x)
+        }
+        set_nf(e, item, 0, x)
+        if accept_kw(e, "DESC") {
+            set_flags(e, item, 1)
+        } else {
+            accept_kw(e, "ASC")
+        }
+        let (h, t) = list_append(e, head, tail, item)
+        head = h
+        tail = t
+        if !accept(e, TK_COMMA) {
+            break
+        }
+    }
+    expect(e, TK_RP)?
+    set_nf(e, s, 4, head)
+    if accept_kw(e, "WHERE") {
+        return err(fail(e, SQLITE_ERROR, "partial indexes are not supported"))
+    }
+    let last_end2 = e.last_end
+    set_nf(e, s, 6, last_end2)
+    ok(s)
+}
+
+fn parse_create_view(e: &mut Engine) -> usize!db.Error {
+    s := new_node(e, S_CREATE_VIEW)?
+    if accept_kw(e, "IF") {
+        expect_kw(e, "NOT")?
+        expect_kw(e, "EXISTS")?
+        set_flags(e, s, 1)
+    }
+    name_start := e.ts
+    let (o, l) = take_name(e)?
+    if e.tk == TK_DOT {
+        next_token(e)
+        name_start = e.ts
+        let (o2, l2) = take_name(e)?
+        set_nf(e, s, 0, o2)
+        set_nf(e, s, 1, l2)
+    } else {
+        set_nf(e, s, 0, o)
+        set_nf(e, s, 1, l)
+    }
+    set_nf(e, s, 4, name_start)
+    if accept(e, TK_LP) {
+        head := 0usize
+        tail := 0usize
+        for {
+            let (co, cl) = take_name(e)?
+            id := new_node(e, N_ID)?
+            set_nf(e, id, 0, co)
+            set_nf(e, id, 1, cl)
+            let (h, t) = list_append(e, head, tail, id)
+            head = h
+            tail = t
+            if !accept(e, TK_COMMA) {
+                break
+            }
+        }
+        expect(e, TK_RP)?
+        set_nf(e, s, 2, head)
+    }
+    expect_kw(e, "AS")?
+    sel := parse_select(e)?
+    set_nf(e, s, 3, sel)
+    let last_end2 = e.last_end
+    set_nf(e, s, 5, last_end2)
+    ok(s)
+}
+
+fn parse_drop(e: &mut Engine) -> usize!db.Error {
+    expect_kw(e, "DROP")?
+    s := new_node(e, S_DROP)?
+    if accept_kw(e, "TABLE") {
+        set_op(e, s, 1)
+    } else if accept_kw(e, "INDEX") {
+        set_op(e, s, 2)
+    } else if accept_kw(e, "VIEW") {
+        set_op(e, s, 3)
+    } else if accept_kw(e, "TRIGGER") {
+        return err(fail(e, SQLITE_ERROR, "triggers are not supported"))
+    } else {
+        return err(syntax_error(e))
+    }
+    if accept_kw(e, "IF") {
+        expect_kw(e, "EXISTS")?
+        set_flags(e, s, 1)
+    }
+    let (o, l) = take_name(e)?
+    if e.tk == TK_DOT {
+        next_token(e)
+        let (o2, l2) = take_name(e)?
+        set_nf(e, s, 0, o2)
+        set_nf(e, s, 1, l2)
+    } else {
+        set_nf(e, s, 0, o)
+        set_nf(e, s, 1, l)
+    }
+    ok(s)
+}
+
+fn parse_pragma(e: &mut Engine) -> usize!db.Error {
+    s := new_node(e, S_PRAGMA)?
+    let (o, l) = take_name(e)?
+    if e.tk == TK_DOT {
+        next_token(e)
+        let (o2, l2) = take_name(e)?
+        set_nf(e, s, 0, o2)
+        set_nf(e, s, 1, l2)
+    } else {
+        set_nf(e, s, 0, o)
+        set_nf(e, s, 1, l)
+    }
+    if accept(e, TK_EQ) {
+        v := parse_pragma_value(e)?
+        set_nf(e, s, 2, v)
+        set_flags(e, s, 1)
+    } else if accept(e, TK_LP) {
+        v := parse_pragma_value(e)?
+        expect(e, TK_RP)?
+        set_nf(e, s, 2, v)
+        set_flags(e, s, 2)
+    }
+    ok(s)
+}
+
+fn parse_pragma_value(e: &mut Engine) -> usize!db.Error {
+    if e.tk == TK_ID && !is_kw(e, "NULL") {
+        n := new_node(e, N_STR)?
+        let ts2 = e.ts
+        set_nf(e, n, 0, ts2)
+        let tl2 = e.tl
+        set_nf(e, n, 1, tl2)
+        next_token(e)
+        return ok(n)
+    }
+    if e.tk == TK_MINUS {
+        next_token(e)
+        return number_literal(e, true)
+    }
+    if e.tk == TK_PLUS {
+        next_token(e)
+    }
+    parse_primary(e)
+}
+
+fn parse_alter(e: &mut Engine) -> usize!db.Error {
+    expect_kw(e, "ALTER")?
+    expect_kw(e, "TABLE")?
+    s := new_node(e, S_ALTER)?
+    let (o, l) = take_name(e)?
+    set_nf(e, s, 0, o)
+    set_nf(e, s, 1, l)
+    if accept_kw(e, "RENAME") {
+        if accept_kw(e, "TO") {
+            set_op(e, s, 1)
+            let (no, nl) = take_name(e)?
+            set_nf(e, s, 2, no)
+            set_nf(e, s, 3, nl)
+            return ok(s)
+        }
+        accept_kw(e, "COLUMN")
+        set_op(e, s, 3)
+        let (co, cl) = take_name(e)?
+        expect_kw(e, "TO")?
+        let (no, nl) = take_name(e)?
+        set_nf(e, s, 2, no)
+        set_nf(e, s, 3, nl)
+        set_nf(e, s, 4, co)
+        set_nf(e, s, 5, cl)
+        return ok(s)
+    }
+    if accept_kw(e, "ADD") {
+        accept_kw(e, "COLUMN")
+        set_op(e, s, 2)
+        start := e.ts
+        cd := parse_column_def(e)?
+        set_nf(e, s, 4, cd)
+        set_nf(e, s, 5, start)
+        let last_end2 = e.last_end
+        set_nf(e, s, 6, last_end2)
+        return ok(s)
+    }
+    if accept_kw(e, "DROP") {
+        return err(fail(e, SQLITE_ERROR, "ALTER TABLE DROP COLUMN is not supported"))
+    }
+    err(syntax_error(e))
+}
+
+// Parses one statement starting at the current token. Returns the root.
+fn parse_statement(e: &mut Engine) -> usize!db.Error {
+    start := e.ts
+    if accept_kw(e, "EXPLAIN") {
+        return err(fail(e, SQLITE_ERROR, "EXPLAIN is not supported"))
+    }
+    if is_kw(e, "WITH") {
+        parse_with(e)?
+        if !(is_kw(e, "SELECT") || is_kw(e, "VALUES") || is_kw(e, "INSERT") || is_kw(e, "REPLACE") || is_kw(e, "UPDATE") || is_kw(e, "DELETE")) {
+            return err(syntax_error(e))
+        }
+    }
+    if is_kw(e, "SELECT") || is_kw(e, "VALUES") {
+        return parse_select(e)
+    }
+    if is_kw(e, "INSERT") || is_kw(e, "REPLACE") {
+        return parse_insert(e)
+    }
+    if accept_kw(e, "UPDATE") {
+        return parse_update(e)
+    }
+    if accept_kw(e, "DELETE") {
+        return parse_delete(e)
+    }
+    if is_kw(e, "CREATE") {
+        return parse_create(e, start)
+    }
+    if is_kw(e, "DROP") {
+        return parse_drop(e)
+    }
+    if is_kw(e, "ALTER") {
+        return parse_alter(e)
+    }
+    if accept_kw(e, "BEGIN") {
+        s := new_node(e, S_BEGIN)?
+        if accept_kw(e, "IMMEDIATE") {
+            set_op(e, s, 1)
+        } else if accept_kw(e, "EXCLUSIVE") {
+            set_op(e, s, 2)
+        } else {
+            accept_kw(e, "DEFERRED")
+        }
+        accept_kw(e, "TRANSACTION")
+        return ok(s)
+    }
+    if accept_kw(e, "COMMIT") || accept_kw(e, "END") {
+        accept_kw(e, "TRANSACTION")
+        return new_node(e, S_COMMIT)
+    }
+    if accept_kw(e, "ROLLBACK") {
+        accept_kw(e, "TRANSACTION")
+        if is_kw(e, "TO") {
+            return err(fail(e, SQLITE_ERROR, "savepoints are not supported"))
+        }
+        return new_node(e, S_ROLLBACK)
+    }
+    if is_kw(e, "SAVEPOINT") || is_kw(e, "RELEASE") {
+        return err(fail(e, SQLITE_ERROR, "savepoints are not supported"))
+    }
+    if accept_kw(e, "PRAGMA") {
+        return parse_pragma(e)
+    }
+    if accept_kw(e, "VACUUM") {
+        return new_node(e, S_VACUUM)
+    }
+    if is_kw(e, "ANALYZE") || is_kw(e, "REINDEX") {
+        next_token(e)
+        for e.tk != TK_EOF && e.tk != TK_SEMI {
+            next_token(e)
+        }
+        return new_node(e, S_EMPTY)
+    }
+    if is_kw(e, "ATTACH") || is_kw(e, "DETACH") {
+        return err(fail(e, SQLITE_ERROR, "ATTACH and DETACH are not supported"))
+    }
+    err(syntax_error(e))
+}

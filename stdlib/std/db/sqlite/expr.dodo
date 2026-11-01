@@ -1,0 +1,1587 @@
+package sqlite
+
+import "std/db"
+import "std/float_decimal"
+import "std/text"
+
+// Expression evaluation: SQLite's type affinity, comparison, arithmetic and
+// conversion rules. Results go to registers; text/blob results live in the
+// arena until the next row.
+
+// ---------------------------------------------------------------------------
+// Number <-> text
+
+fn is_space_b(b: u8) -> bool {
+    b == 32 || b == 9 || b == 10 || b == 13 || b == 12 || b == 11
+}
+
+// Parses a numeric prefix of [o, o+n). Returns (kind, int, real, consumed,
+// whole) where kind is 0 none, 1 integer, 2 real; `whole` is true when the
+// entire text (ignoring surrounding spaces) is the number.
+fn parse_number(e: &Engine, o: usize, n: usize) -> (u8, i64, f64, bool) {
+    p := o
+    end := o + n
+    for p < end && is_space_b(e.ws[p]) {
+        p += 1
+    }
+    start := p
+    neg := false
+    if p < end && (e.ws[p] == 43 || e.ws[p] == 45) {
+        neg = e.ws[p] == 45
+        p += 1
+    }
+    digits_start := p
+    v := 0u64
+    overflow := false
+    for p < end && is_digit(e.ws[p]) {
+        d := (e.ws[p] - 48) as u64
+        if v > (18446744073709551615u64 - d) / 10 {
+            overflow = true
+        } else {
+            v = v * 10 + d
+        }
+        p += 1
+    }
+    int_digits := p - digits_start
+    is_real := false
+    frac_digits := 0usize
+    if p < end && e.ws[p] == 46 {
+        q := p + 1
+        for q < end && is_digit(e.ws[q]) {
+            q += 1
+        }
+        frac_digits = q - p - 1
+        if int_digits > 0 || frac_digits > 0 {
+            is_real = true
+            p = q
+        }
+    }
+    if int_digits == 0 && frac_digits == 0 {
+        return (0u8, 0i64, 0.0, false)
+    }
+    if p < end && (e.ws[p] == 101 || e.ws[p] == 69) {
+        q := p + 1
+        if q < end && (e.ws[q] == 43 || e.ws[q] == 45) {
+            q += 1
+        }
+        if q < end && is_digit(e.ws[q]) {
+            for q < end && is_digit(e.ws[q]) {
+                q += 1
+            }
+            is_real = true
+            p = q
+        }
+    }
+    num_end := p
+    for p < end && is_space_b(e.ws[p]) {
+        p += 1
+    }
+    whole := p == end
+    if !is_real {
+        limit := if neg {
+            9223372036854775808u64
+        } else {
+            9223372036854775807u64
+        }
+        if !overflow && v <= limit {
+            iv := if v == 9223372036854775808u64 {
+                -9223372036854775807i64 - 1
+            } else if neg {
+                -(v as i64)
+            } else {
+                v as i64
+            }
+            return (1u8, iv, iv as f64, whole)
+        }
+    }
+    f := parse_real_text(e, start, num_end - start)
+    (2u8, 0i64, f, whole)
+}
+
+fn parse_real_text(e: &Engine, o: usize, n: usize) -> f64 {
+    buf := [0u8; 400]
+    m := 0usize
+    for i in 0usize..n {
+        if m < 400 {
+            buf[m] = e.ws[o + i]
+            m += 1
+        }
+    }
+    neg := m > 0 && buf[0] == 45
+    match text.parse_f64(&buf[..m]) {
+        ok(v) => v,
+        err(_) => if neg {
+            -1.0e308 * 10.0
+        } else {
+            1.0e308 * 10.0
+        },
+    }
+}
+
+// Writes the SQLite text form of a real into `out` (at least 40 bytes).
+fn real_text(f: f64, out: &mut[u8]) -> usize {
+    if f != f {
+        return copy_str(out, 0, "NaN")
+    }
+    if f > 1.7976931348623157e308 {
+        return copy_str(out, 0, "Inf")
+    }
+    if f < -1.7976931348623157e308 {
+        return copy_str(out, 0, "-Inf")
+    }
+    if f == 0.0 {
+        return copy_str(out, 0, "0.0")
+    }
+    neg := f < 0.0
+    a := if neg {
+        -f
+    } else {
+        f
+    }
+    sci := [0u8; 40]
+    n := sci_digits(a, 14, &mut sci)
+    if parse_back(&sci, n) != a {
+        n = sci_digits(a, 16, &mut sci)
+    }
+    // sci = d.ddddde[+-]XX
+    digits := [0u8; 20]
+    nd := 0usize
+    i := 0usize
+    for i < n && sci[i] != 101 {
+        if sci[i] != 46 {
+            digits[nd] = sci[i]
+            nd += 1
+        }
+        i += 1
+    }
+    i += 1
+    eneg := sci[i] == 45
+    i += 1
+    x := 0i32
+    for i < n {
+        x = x * 10 + ((sci[i] - 48) as i32)
+        i += 1
+    }
+    if eneg {
+        x = -x
+    }
+    for nd > 1 && digits[nd - 1] == 48 {
+        nd -= 1
+    }
+    o := 0usize
+    if neg {
+        out[0] = 45
+        o = 1
+    }
+    if x < -4 || x >= 17 {
+        out[o] = digits[0]
+        out[o + 1] = 46
+        o += 2
+        if nd > 1 {
+            for k in 1usize..nd {
+                out[o] = digits[k]
+                o += 1
+            }
+        } else {
+            out[o] = 48
+            o += 1
+        }
+        out[o] = 101
+        out[o + 1] = if x < 0 {
+            45u8
+        } else {
+            43u8
+        }
+        o += 2
+        ax := if x < 0 {
+            -x
+        } else {
+            x
+        }
+        if ax >= 100 {
+            out[o] = 48 + ((ax / 100) as u8)
+            o += 1
+        }
+        out[o] = 48 + (((ax / 10) % 10) as u8)
+        out[o + 1] = 48 + ((ax % 10) as u8)
+        return o + 2
+    }
+    if x >= 0 {
+        ip := (x as usize) + 1
+        for k in 0usize..ip {
+            out[o] = if k < nd {
+                digits[k]
+            } else {
+                48u8
+            }
+            o += 1
+        }
+        out[o] = 46
+        o += 1
+        if nd > ip {
+            for k in ip..nd {
+                out[o] = digits[k]
+                o += 1
+            }
+        } else {
+            out[o] = 48
+            o += 1
+        }
+        return o
+    }
+    out[o] = 48
+    out[o + 1] = 46
+    o += 2
+    zeros := (-x - 1) as usize
+    for _ in 0usize..zeros {
+        out[o] = 48
+        o += 1
+    }
+    for k in 0usize..nd {
+        out[o] = digits[k]
+        o += 1
+    }
+    o
+}
+
+fn sci_digits(a: f64, precision: usize, out: &mut[u8]) -> usize {
+    match float_decimal.convert(out, a, precision, true) {
+        ok(n) => n,
+        err(_) => 0,
+    }
+}
+
+fn parse_back(b: &[u8], n: usize) -> f64 {
+    match text.parse_f64(&b[..n]) {
+        ok(v) => v,
+        err(_) => 0.0,
+    }
+}
+
+fn copy_str(out: &mut[u8], o: usize, s: &str) -> usize {
+    b := mem_bytes(s)
+    for i in 0usize..b.len {
+        out[o + i] = b[i]
+    }
+    o + b.len
+}
+
+// ---------------------------------------------------------------------------
+// Conversions in registers
+
+fn set_text_bytes(e: &mut Engine, r: usize, bytes: &[u8]) -> void!db.Error {
+    o := arena_alloc(e, bytes.len)?
+    copy_in(e.ws, o, bytes)
+    set_bytes(e, r, T_TEXT, o, bytes.len)
+    ok()
+}
+
+fn set_text_str(e: &mut Engine, r: usize, s: &str) -> void!db.Error {
+    set_text_bytes(e, r, mem_bytes(s))
+}
+
+// Converts a register to text in place (numbers are formatted).
+fn to_text(e: &mut Engine, r: usize) -> void!db.Error {
+    t := rtype(e, r)
+    if t == T_INT {
+        buf := [0u8; 24]
+        n := format_i64(&mut buf, rint(e, r))
+        return set_text_bytes(e, r, &buf[..n])
+    }
+    if t == T_REAL {
+        buf := [0u8; 48]
+        n := real_text(rreal(e, r), &mut buf)
+        return set_text_bytes(e, r, &buf[..n])
+    }
+    if t == T_BLOB {
+        o := reg_at(e, r)
+        e.ws[o] = T_TEXT
+    }
+    ok()
+}
+
+// CAST(x AS INTEGER) semantics.
+fn to_int(e: &Engine, r: usize) -> i64 {
+    t := rtype(e, r)
+    if t == T_INT {
+        return rint(e, r)
+    }
+    if t == T_REAL {
+        return real_to_int(rreal(e, r))
+    }
+    if t == T_TEXT || t == T_BLOB {
+        let off = roff(e, r)
+        let len = rlen(e, r)
+        let (k, i, f, _) = parse_number(e, off, len)
+        if k == 1 {
+            return i
+        }
+        if k == 2 {
+            return real_to_int(f)
+        }
+    }
+    0
+}
+
+fn real_to_int(f: f64) -> i64 {
+    if f != f {
+        return 0
+    }
+    if f <= -9223372036854775808.0 {
+        return -9223372036854775807 - 1
+    }
+    if f >= 9223372036854775807.0 {
+        return 9223372036854775807
+    }
+    f as i64
+}
+
+fn to_real(e: &Engine, r: usize) -> f64 {
+    t := rtype(e, r)
+    if t == T_REAL {
+        return rreal(e, r)
+    }
+    if t == T_INT {
+        return rint(e, r) as f64
+    }
+    if t == T_TEXT || t == T_BLOB {
+        let off = roff(e, r)
+        let len = rlen(e, r)
+        let (k, i, f, _) = parse_number(e, off, len)
+        if k == 1 {
+            return i as f64
+        }
+        if k == 2 {
+            return f
+        }
+    }
+    0.0
+}
+
+// Converts to a number for arithmetic (numeric prefix of text).
+fn to_numeric(e: &mut Engine, r: usize) {
+    t := rtype(e, r)
+    if t == T_TEXT || t == T_BLOB {
+        let off = roff(e, r)
+        let len = rlen(e, r)
+        let (k, i, f, _) = parse_number(e, off, len)
+        if k == 1 {
+            set_int(e, r, i)
+        } else if k == 2 {
+            set_real(e, r, f)
+        } else {
+            set_int(e, r, 0)
+        }
+    }
+}
+
+// Real that is an exact integer in range becomes an integer.
+fn real_as_int(f: f64) -> (bool, i64) {
+    if f >= -9223372036854775808.0 && f < 9223372036854775808.0 {
+        i := f as i64
+        if (i as f64) == f {
+            return (true, i)
+        }
+    }
+    (false, 0i64)
+}
+
+// Applies a column affinity to the value in register r.
+fn apply_affinity(e: &mut Engine, r: usize, aff: u8) -> void!db.Error {
+    t := rtype(e, r)
+    if aff == AFF_TEXT {
+        if t == T_INT || t == T_REAL {
+            to_text(e, r)?
+        }
+        return ok()
+    }
+    if aff == AFF_NUMERIC || aff == AFF_INTEGER || aff == AFF_REAL {
+        if t == T_TEXT {
+            let off = roff(e, r)
+            let len = rlen(e, r)
+            let (k, i, f, whole) = parse_number(e, off, len)
+            if whole {
+                if k == 1 {
+                    set_int(e, r, i)
+                } else if k == 2 {
+                    let (exact, iv) = real_as_int(f)
+                    if exact && aff != AFF_REAL && !looks_like_huge(f) {
+                        set_int(e, r, iv)
+                    } else {
+                        set_real(e, r, f)
+                    }
+                }
+            }
+        }
+        if aff == AFF_REAL && rtype(e, r) == T_INT {
+            v := rint(e, r) as f64
+            set_real(e, r, v)
+        }
+        if aff != AFF_REAL && rtype(e, r) == T_REAL {
+            let (exact, iv) = real_as_int(rreal(e, r))
+            if exact && !looks_like_huge(rreal(e, r)) {
+                set_int(e, r, iv)
+            }
+        }
+    }
+    ok()
+}
+
+fn looks_like_huge(f: f64) -> bool {
+    f >= 9223372036854775807.0 || f <= -9223372036854775808.0
+}
+
+// Numeric affinity for comparisons: only well-formed numeric text converts.
+fn compare_affinity(e: &mut Engine, r: usize, aff: u8) -> void!db.Error {
+    t := rtype(e, r)
+    if aff == AFF_TEXT {
+        if t == T_INT || t == T_REAL {
+            to_text(e, r)?
+        }
+        return ok()
+    }
+    if t == T_TEXT {
+        let off = roff(e, r)
+        let len = rlen(e, r)
+        let (k, i, f, whole) = parse_number(e, off, len)
+        if whole {
+            if k == 1 {
+                set_int(e, r, i)
+            } else if k == 2 {
+                set_real(e, r, f)
+            }
+        }
+    }
+    ok()
+}
+
+fn is_numeric_aff(a: u8) -> bool {
+    a == AFF_NUMERIC || a == AFF_INTEGER || a == AFF_REAL
+}
+
+// ---------------------------------------------------------------------------
+// Static expression properties
+
+fn expr_affinity(e: &Engine, n: usize) -> u8 {
+    k := nkind(e, n)
+    if k == N_COL {
+        t := nc(e, n)
+        col := nb(e, n)
+        if col == NO_COL || t == NO_COL {
+            return AFF_INTEGER
+        }
+        return col_aff(e, t, col)
+    }
+    if k == N_CAST {
+        return nb(e, n) as u8
+    }
+    if k == N_COLLATE {
+        let n_a = na(e, n)
+        return expr_affinity(e, n_a)
+    }
+    if k == N_SLOT {
+        return (ndd(e, n) & 255) as u8
+    }
+    if k == N_SUBQ {
+        s := nb(e, n)
+        rc := na(e, s)
+        if rc != 0 {
+            let rc_a = na(e, rc)
+            return expr_affinity(e, rc_a)
+        }
+    }
+    AFF_NONE
+}
+
+// (collation, explicit)
+fn expr_collation(e: &Engine, n: usize) -> (u8, u8) {
+    k := nkind(e, n)
+    if k == N_COLLATE {
+        return (nb(e, n) as u8, 2u8)
+    }
+    if k == N_ALIAS {
+        let n_a = na(e, n)
+        return expr_collation(e, n_a)
+    }
+    if k == N_COL {
+        t := nc(e, n)
+        col := nb(e, n)
+        if col != NO_COL && t != NO_COL {
+            return (col_coll(e, t, col), 1u8)
+        }
+        return (COLL_BINARY, 1u8)
+    }
+    if k == N_SLOT {
+        return (((ndd(e, n) >> 8) & 255) as u8, 1u8)
+    }
+    if k == N_UNARY || k == N_BINARY {
+        if k == N_BINARY && nop(e, n) == OP_CONCAT {
+            let n_a2 = na(e, n)
+            let (c1, x1) = expr_collation(e, n_a2)
+            if x1 != 0 {
+                return (c1, x1)
+            }
+            let n_b = nb(e, n)
+            return expr_collation(e, n_b)
+        }
+    }
+    (COLL_BINARY, 0u8)
+}
+
+fn binary_collation(e: &Engine, l: usize, r: usize) -> u8 {
+    let (lc, lx) = expr_collation(e, l)
+    let (rc, rx) = expr_collation(e, r)
+    if lx == 2 {
+        return lc
+    }
+    if rx == 2 {
+        return rc
+    }
+    if lx == 1 {
+        return lc
+    }
+    if rx == 1 {
+        return rc
+    }
+    COLL_BINARY
+}
+
+// ---------------------------------------------------------------------------
+// Register stack for temporaries
+
+fn reg_push(e: &mut Engine) -> usize!db.Error {
+    if e.rtop >= REG_LIMIT {
+        return err(fail(e, SQLITE_ERROR, "expression too complex"))
+    }
+    r := e.rtop
+    e.rtop += 1
+    ok(r)
+}
+
+// Truth value: 0 false, 1 true, 2 NULL.
+fn truth(e: &Engine, r: usize) -> u8 {
+    t := rtype(e, r)
+    if t == T_NULL {
+        return 2
+    }
+    if t == T_INT {
+        return if rint(e, r) != 0 {
+            1u8
+        } else {
+            0u8
+        }
+    }
+    if t == T_REAL {
+        return if rreal(e, r) != 0.0 {
+            1u8
+        } else {
+            0u8
+        }
+    }
+    if to_real(e, r) != 0.0 {
+        1u8
+    } else {
+        0u8
+    }
+}
+
+fn set_bool(e: &mut Engine, r: usize, v: u8) {
+    if v == 2 {
+        set_null(e, r)
+    } else {
+        set_int(e, r, v as i64)
+    }
+}
+
+// Evaluates an expression and returns its truth value.
+fn eval_truth(e: &mut Engine, n: usize) -> u8!db.Error {
+    save := e.rtop
+    r := reg_push(e)?
+    eval(e, n, r)?
+    v := truth(e, r)
+    e.rtop = save
+    ok(v)
+}
+
+// ---------------------------------------------------------------------------
+// Evaluation
+
+fn eval(e: &mut Engine, n: usize, dst: usize) -> void!db.Error {
+    k := nkind(e, n)
+    if k == N_COL {
+        return eval_column(e, n, dst)
+    }
+    if k == N_INT {
+        let u2i2 = u2i(nx(e, n))
+        set_int(e, dst, u2i2)
+        return ok()
+    }
+    if k == N_STR {
+        let n_a = na(e, n)
+        let n_b = nb(e, n)
+        set_bytes(e, dst, T_TEXT, n_a, n_b)
+        return ok()
+    }
+    if k == N_NULL || k == 0 {
+        set_null(e, dst)
+        return ok()
+    }
+    if k == N_REAL {
+        let u2f2 = u2f(nx(e, n))
+        set_real(e, dst, u2f2)
+        return ok()
+    }
+    if k == N_BLOB {
+        let n_a2 = na(e, n)
+        let n_b2 = nb(e, n)
+        set_bytes(e, dst, T_BLOB, n_a2, n_b2)
+        return ok()
+    }
+    if k == N_PARAM {
+        let param_reg2 = e.param_reg + na(e, n) - 1
+        copy_reg(e, dst, param_reg2)
+        return ok()
+    }
+    if k == N_REG {
+        let n_a3 = na(e, n)
+        copy_reg(e, dst, n_a3)
+        return ok()
+    }
+    if k == N_SLOT {
+        return eval_slot(e, n, dst)
+    }
+    if k == N_BINARY {
+        return eval_binary(e, n, dst)
+    }
+    if k == N_UNARY {
+        return eval_unary(e, n, dst)
+    }
+    if k == N_COLLATE {
+        let n_a4 = na(e, n)
+        return eval(e, n_a4, dst)
+    }
+    if k == N_ISNULL {
+        let n_a5 = na(e, n)
+        eval(e, n_a5, dst)?
+        isnull := rtype(e, dst) == T_NULL
+        not := nflags(e, n) != 0
+        set_int(e, dst, if isnull != not {
+            1i64
+        } else {
+            0i64
+        })
+        return ok()
+    }
+    if k == N_BETWEEN {
+        return eval_between(e, n, dst)
+    }
+    if k == N_INLIST {
+        return eval_inlist(e, n, dst)
+    }
+    if k == N_LIKE {
+        return eval_like(e, n, dst)
+    }
+    if k == N_CASE {
+        return eval_case(e, n, dst)
+    }
+    if k == N_CAST {
+        let n_a6 = na(e, n)
+        eval(e, n_a6, dst)?
+        let nb2 = nb(e, n) as u8
+        return cast_to(e, dst, nb2)
+    }
+    if k == N_FUNC {
+        return eval_function(e, n, dst)
+    }
+    if k == N_AGG {
+        return agg_value(e, n, dst)
+    }
+    if k == N_SUBQ || k == N_EXISTS || k == N_INSEL {
+        return eval_subquery(e, n, dst)
+    }
+    if k == N_ALIAS {
+        let n_a7 = na(e, n)
+        return eval(e, n_a7, dst)
+    }
+    err(fail(e, SQLITE_INTERNAL, "unexpected expression node"))
+}
+
+fn eval_column(e: &mut Engine, n: usize, dst: usize) -> void!db.Error {
+    c := na(e, n)
+    col := nb(e, n)
+    t := nc(e, n)
+    co := cur(e, c)
+    if e.ws[co + C_NULLROW] != 0 || e.ws[co + C_STATE] != ST_VALID {
+        set_null(e, dst)
+        return ok()
+    }
+    if col == NO_COL || (t != NO_COL && col == rowid_col(e, t)) {
+        let rowid = cur_rowid(e, c)
+        set_int(e, dst, rowid)
+        return ok()
+    }
+    let (p, len) = cur_payload(e, c)?
+    if !record_column(e, p, len, col, dst)? {
+        return column_default(e, t, col, dst)
+    }
+    if t != NO_COL && rtype(e, dst) == T_INT && col_aff(e, t, col) == AFF_REAL {
+        v := rint(e, dst) as f64
+        set_real(e, dst, v)
+    }
+    ok()
+}
+
+// Value of a column missing from a short record (added by ALTER TABLE).
+fn column_default(e: &mut Engine, t: usize, col: usize, dst: usize) -> void!db.Error {
+    set_null(e, dst)
+    if t == NO_COL {
+        return ok()
+    }
+    r := col_rec(e, t, col)
+    if e.ws[r + K_HASDFLT] == 0 {
+        return ok()
+    }
+    let o = ldu(e.ws, r + K_DFLT)
+    let l = ldu(e.ws, r + K_DFLTL)
+    eval_constant_text(e, o, l, dst)?
+    aff := col_aff(e, t, col)
+    apply_affinity(e, dst, aff)
+}
+
+// Evaluates a constant expression given as SQL text (column defaults).
+fn eval_constant_text(e: &mut Engine, o: usize, l: usize, dst: usize) -> void!db.Error {
+    // Parse in the schema slot, preserving the active statement's state.
+    save_sb := e.sb
+    save_node_off := e.node_off
+    save_node_n := e.node_n
+    save_pool := e.pool_lo
+    save_src := e.src
+    save_end := e.src_end
+    save_pos := e.pos
+    save_tk := e.tk
+    save_ts := e.ts
+    save_tl := e.tl
+    save_last := e.last_end
+    // Copy the text into the arena so the parse can reference it.
+    t := arena_alloc(e, l)?
+    move_bytes(e.ws, o, t, l)
+    let schema_slot2 = schema_slot(e)
+    begin_parse(e, schema_slot2, t, l)
+    res := parse_expr(e)
+    ok_ := false
+    match res {
+        ok(x) => {
+            match eval(e, x, dst) {
+                ok() => {
+                    ok_ = true
+                },
+                err(_) => {},
+            }
+        },
+        err(_) => {},
+    }
+    e.sb = save_sb
+    e.node_off = save_node_off
+    e.node_n = save_node_n
+    e.pool_lo = save_pool
+    e.src = save_src
+    e.src_end = save_end
+    e.pos = save_pos
+    e.tk = save_tk
+    e.ts = save_ts
+    e.tl = save_tl
+    e.last_end = save_last
+    if !ok_ {
+        set_null(e, dst)
+    }
+    reg_own(e, dst)
+}
+
+fn eval_slot(e: &mut Engine, n: usize, dst: usize) -> void!db.Error {
+    // Column materialized into the current sorter record.
+    slot := ne_(e, n)
+    if e.slot_rec == 0 {
+        return eval_column(e, n, dst)
+    }
+    rec := e.slot_rec
+    len := e.slot_len
+    if (ndd(e, n) & 65536) != 0 && e.slot_first != 0 {
+        // GROUP BY key columns take the value of the group's first row.
+        rec = e.slot_first
+        len = e.slot_first_len
+    }
+    record_column(e, rec, len, slot, dst)?
+    ok()
+}
+
+fn eval_unary(e: &mut Engine, n: usize, dst: usize) -> void!db.Error {
+    op := nop(e, n)
+    if op == OP_NOT {
+        let n_a = na(e, n)
+        v := eval_truth(e, n_a)?
+        set_bool(e, dst, if v == 2 {
+            2u8
+        } else {
+            1 - v
+        })
+        return ok()
+    }
+    let n_a2 = na(e, n)
+    eval(e, n_a2, dst)?
+    t := rtype(e, dst)
+    if t == T_NULL {
+        return ok()
+    }
+    if op == OP_PLUS {
+        return ok()
+    }
+    if op == OP_BITNOT {
+        v := to_int(e, dst)
+        set_int(e, dst, -1 - v)
+        return ok()
+    }
+    // Negation.
+    to_numeric(e, dst)
+    if rtype(e, dst) == T_INT {
+        v := rint(e, dst)
+        if v == -9223372036854775807 - 1 {
+            set_real(e, dst, 9223372036854775808.0)
+        } else {
+            set_int(e, dst, -v)
+        }
+    } else {
+        v := rreal(e, dst)
+        set_real(e, dst, -v)
+    }
+    ok()
+}
+
+fn eval_binary(e: &mut Engine, n: usize, dst: usize) -> void!db.Error {
+    op := nop(e, n)
+    l := na(e, n)
+    r := nb(e, n)
+    if op == OP_AND || op == OP_OR {
+        a := eval_truth(e, l)?
+        if op == OP_AND && a == 0 {
+            set_int(e, dst, 0)
+            return ok()
+        }
+        if op == OP_OR && a == 1 {
+            set_int(e, dst, 1)
+            return ok()
+        }
+        b := eval_truth(e, r)?
+        if op == OP_AND {
+            set_bool(e, dst, if b == 0 {
+                0u8
+            } else if a == 2 || b == 2 {
+                2u8
+            } else {
+                1u8
+            })
+        } else {
+            set_bool(e, dst, if b == 1 {
+                1u8
+            } else if a == 2 || b == 2 {
+                2u8
+            } else {
+                0u8
+            })
+        }
+        return ok()
+    }
+    save := e.rtop
+    rr := reg_push(e)?
+    eval(e, l, dst)?
+    eval(e, r, rr)?
+    res := binary_values(e, op, l, r, dst, rr)
+    e.rtop = save
+    res
+}
+
+// Applies operator `op` to registers a (left) and b (right), result in a.
+fn binary_values(e: &mut Engine, op: u8, ln: usize, rn: usize, a: usize, b: usize) -> void!db.Error {
+    if op >= OP_EQ && op <= OP_ISNOT {
+        v := compare_values(e, op, ln, rn, a, b)?
+        set_bool(e, a, v)
+        return ok()
+    }
+    if rtype(e, a) == T_NULL || rtype(e, b) == T_NULL {
+        set_null(e, a)
+        return ok()
+    }
+    if op == OP_CONCAT {
+        to_text(e, a)?
+        to_text(e, b)?
+        la := rlen(e, a)
+        lb := rlen(e, b)
+        o := arena_alloc(e, la + lb)?
+        let sa = roff(e, a)
+        move_bytes(e.ws, sa, o, la)
+        let sb = roff(e, b)
+        move_bytes(e.ws, sb, o + la, lb)
+        set_bytes(e, a, T_TEXT, o, la + lb)
+        return ok()
+    }
+    if op == OP_BITAND || op == OP_BITOR || op == OP_LSHIFT || op == OP_RSHIFT {
+        x := to_int(e, a)
+        y := to_int(e, b)
+        set_int(e, a, bit_op(op, x, y))
+        return ok()
+    }
+    to_numeric(e, a)
+    to_numeric(e, b)
+    if rtype(e, a) == T_INT && rtype(e, b) == T_INT {
+        x := rint(e, a)
+        y := rint(e, b)
+        if op == OP_ADD {
+            let (v, ovf) = add_i64(x, y)
+            if !ovf {
+                set_int(e, a, v)
+                return ok()
+            }
+        } else if op == OP_SUB {
+            let (v, ovf) = sub_i64(x, y)
+            if !ovf {
+                set_int(e, a, v)
+                return ok()
+            }
+        } else if op == OP_MUL {
+            let (v, ovf) = mul_i64(x, y)
+            if !ovf {
+                set_int(e, a, v)
+                return ok()
+            }
+        } else if op == OP_DIV {
+            if y == 0 {
+                set_null(e, a)
+                return ok()
+            }
+            if !(x == -9223372036854775807 - 1 && y == -1) {
+                set_int(e, a, x / y)
+                return ok()
+            }
+        } else if op == OP_MOD {
+            if y == 0 {
+                set_null(e, a)
+                return ok()
+            }
+            if y == -1 {
+                set_int(e, a, 0)
+                return ok()
+            }
+            set_int(e, a, x % y)
+            return ok()
+        }
+    }
+    x := to_real(e, a)
+    y := to_real(e, b)
+    v := 0.0
+    if op == OP_ADD {
+        v = x + y
+    } else if op == OP_SUB {
+        v = x - y
+    } else if op == OP_MUL {
+        v = x * y
+    } else if op == OP_DIV {
+        if y == 0.0 {
+            set_null(e, a)
+            return ok()
+        }
+        v = x / y
+    } else if op == OP_MOD {
+        // Remainder of the integer parts, as a real.
+        xi := real_to_int(x)
+        yi := real_to_int(y)
+        if yi == 0 {
+            set_null(e, a)
+            return ok()
+        }
+        if yi == -1 {
+            v = 0.0
+        } else {
+            v = (xi % yi) as f64
+        }
+        if rtype(e, a) == T_INT && rtype(e, b) == T_INT {
+            set_int(e, a, real_to_int(v))
+            return ok()
+        }
+        set_real(e, a, v)
+        return ok()
+    }
+    if v != v {
+        set_null(e, a)
+        return ok()
+    }
+    set_real(e, a, v)
+    ok()
+}
+
+fn add_i64(x: i64, y: i64) -> (i64, bool) {
+    if (y > 0 && x > 9223372036854775807 - y) || (y < 0 && x < -9223372036854775807 - 1 - y) {
+        return (0i64, true)
+    }
+    (x + y, false)
+}
+
+fn sub_i64(x: i64, y: i64) -> (i64, bool) {
+    if (y < 0 && x > 9223372036854775807 + y) || (y > 0 && x < -9223372036854775807 - 1 + y) {
+        return (0i64, true)
+    }
+    (x - y, false)
+}
+
+fn mul_i64(x: i64, y: i64) -> (i64, bool) {
+    if x == 0 || y == 0 {
+        return (0i64, false)
+    }
+    p := core.wrapping_mul(x, y)
+    if x == -1 && y == -9223372036854775807 - 1 {
+        return (0i64, true)
+    }
+    if y == -1 && x == -9223372036854775807 - 1 {
+        return (0i64, true)
+    }
+    if p / y != x {
+        return (0i64, true)
+    }
+    (p, false)
+}
+
+fn bit_op(op: u8, x: i64, y: i64) -> i64 {
+    ux := i2u(x)
+    uy := i2u(y)
+    if op == OP_BITAND {
+        return u2i(ux & uy)
+    }
+    if op == OP_BITOR {
+        return u2i(ux | uy)
+    }
+    // Shifts: a negative count shifts the other way.
+    left := op == OP_LSHIFT
+    count := y
+    if count < 0 {
+        left = !left
+        count = if count < -64 {
+            64i64
+        } else {
+            -count
+        }
+    }
+    if count >= 64 {
+        if left || x >= 0 {
+            return 0
+        }
+        return -1
+    }
+    if left {
+        return u2i(core.wrapping_mul(ux, 1u64 << (count as u64)))
+    }
+    if x >= 0 {
+        return u2i(ux >> (count as u64))
+    }
+    // Arithmetic shift right.
+    if count == 0 {
+        return x
+    }
+    r := ux >> (count as u64)
+    fill := 18446744073709551615u64 - ((1u64 << (64 - count as u64)) - 1)
+    u2i(r | fill)
+}
+
+// Comparison with SQLite's affinity and collation rules. Returns 0/1/2.
+fn compare_values(e: &mut Engine, op: u8, ln: usize, rn: usize, a: usize, b: usize) -> u8!db.Error {
+    ta := rtype(e, a)
+    tb := rtype(e, b)
+    if op == OP_IS || op == OP_ISNOT {
+        if ta == T_NULL || tb == T_NULL {
+            same := ta == tb
+            return ok(if same == (op == OP_IS) {
+                1u8
+            } else {
+                0u8
+            })
+        }
+    } else if ta == T_NULL || tb == T_NULL {
+        return ok(2)
+    }
+    la := expr_affinity(e, ln)
+    ra := expr_affinity(e, rn)
+    if is_numeric_aff(la) && !is_numeric_aff(ra) {
+        compare_affinity(e, b, AFF_NUMERIC)?
+    } else if is_numeric_aff(ra) && !is_numeric_aff(la) {
+        compare_affinity(e, a, AFF_NUMERIC)?
+    } else if la == AFF_TEXT && (ra == AFF_NONE || ra == AFF_BLOB) {
+        compare_affinity(e, b, AFF_TEXT)?
+    } else if ra == AFF_TEXT && (la == AFF_NONE || la == AFF_BLOB) {
+        compare_affinity(e, a, AFF_TEXT)?
+    }
+    coll := binary_collation(e, ln, rn)
+    c := reg_compare(e, a, b, coll)
+    r := false
+    if op == OP_EQ || op == OP_IS {
+        r = c == 0
+    } else if op == OP_NE || op == OP_ISNOT {
+        r = c != 0
+    } else if op == OP_LT {
+        r = c < 0
+    } else if op == OP_LE {
+        r = c <= 0
+    } else if op == OP_GT {
+        r = c > 0
+    } else {
+        r = c >= 0
+    }
+    ok(if r {
+        1u8
+    } else {
+        0u8
+    })
+}
+
+fn eval_between(e: &mut Engine, n: usize, dst: usize) -> void!db.Error {
+    save := e.rtop
+    lo := reg_push(e)?
+    hi := reg_push(e)?
+    x := reg_push(e)?
+    let n_a = na(e, n)
+    eval(e, n_a, x)?
+    copy_reg(e, dst, x)
+    let n_b = nb(e, n)
+    eval(e, n_b, lo)?
+    let n_a2 = na(e, n)
+    let n_b2 = nb(e, n)
+    v1 := compare_values(e, OP_GE, n_a2, n_b2, dst, lo)?
+    copy_reg(e, dst, x)
+    let n_c = nc(e, n)
+    eval(e, n_c, hi)?
+    let n_a3 = na(e, n)
+    let n_c2 = nc(e, n)
+    v2 := compare_values(e, OP_LE, n_a3, n_c2, dst, hi)?
+    v := if v1 == 0 || v2 == 0 {
+        0u8
+    } else if v1 == 2 || v2 == 2 {
+        2u8
+    } else {
+        1u8
+    }
+    if nflags(e, n) != 0 && v != 2 {
+        v = 1 - v
+    }
+    set_bool(e, dst, v)
+    e.rtop = save
+    ok()
+}
+
+fn eval_inlist(e: &mut Engine, n: usize, dst: usize) -> void!db.Error {
+    save := e.rtop
+    x := reg_push(e)?
+    y := reg_push(e)?
+    t := reg_push(e)?
+    lhs := na(e, n)
+    eval(e, lhs, x)?
+    not := nflags(e, n) != 0
+    item := nb(e, n)
+    if item == 0 {
+        set_int(e, dst, if not {
+            1i64
+        } else {
+            0i64
+        })
+        e.rtop = save
+        return ok()
+    }
+    if rtype(e, x) == T_NULL {
+        set_null(e, dst)
+        e.rtop = save
+        return ok()
+    }
+    saw_null := false
+    found := false
+    for item != 0 {
+        eval(e, item, y)?
+        copy_reg(e, t, x)
+        // The IN operator compares with the left operand's affinity.
+        let value = if expr_affinity(e, lhs) == AFF_NONE {
+            item
+        } else {
+            lhs
+        }
+        v := compare_values(e, OP_EQ, lhs, value, t, y)?
+        if v == 1 {
+            found = true
+            break
+        }
+        if v == 2 {
+            saw_null = true
+        }
+        item = nnext(e, item)
+    }
+    v := if found {
+        1u8
+    } else if saw_null {
+        2u8
+    } else {
+        0u8
+    }
+    if not && v != 2 {
+        v = 1 - v
+    }
+    set_bool(e, dst, v)
+    e.rtop = save
+    ok()
+}
+
+fn eval_case(e: &mut Engine, n: usize, dst: usize) -> void!db.Error {
+    save := e.rtop
+    base := na(e, n)
+    w := nb(e, n)
+    if base != 0 {
+        b := reg_push(e)?
+        y := reg_push(e)?
+        eval(e, base, b)?
+        for w != 0 {
+            let w_a = na(e, w)
+            eval(e, w_a, y)?
+            copy_reg(e, dst, b)
+            let w_a2 = na(e, w)
+            if compare_values(e, OP_EQ, base, w_a2, dst, y)? == 1 {
+                e.rtop = save
+                let w_b = nb(e, w)
+                return eval(e, w_b, dst)
+            }
+            w = nnext(e, w)
+        }
+    } else {
+        for w != 0 {
+            let w_a3 = na(e, w)
+            if eval_truth(e, w_a3)? == 1 {
+                e.rtop = save
+                let w_b2 = nb(e, w)
+                return eval(e, w_b2, dst)
+            }
+            w = nnext(e, w)
+        }
+    }
+    e.rtop = save
+    el := nc(e, n)
+    if el != 0 {
+        return eval(e, el, dst)
+    }
+    set_null(e, dst)
+    ok()
+}
+
+fn cast_to(e: &mut Engine, r: usize, aff: u8) -> void!db.Error {
+    t := rtype(e, r)
+    if t == T_NULL {
+        return ok()
+    }
+    if aff == AFF_TEXT {
+        return to_text(e, r)
+    }
+    if aff == AFF_BLOB {
+        if t == T_INT || t == T_REAL {
+            to_text(e, r)?
+        }
+        o := reg_at(e, r)
+        e.ws[o] = T_BLOB
+        return ok()
+    }
+    if aff == AFF_INTEGER {
+        v := to_int(e, r)
+        set_int(e, r, v)
+        return ok()
+    }
+    if aff == AFF_REAL {
+        v := to_real(e, r)
+        set_real(e, r, v)
+        return ok()
+    }
+    // NUMERIC
+    if t == T_TEXT || t == T_BLOB {
+        let off = roff(e, r)
+        let len = rlen(e, r)
+        let (k, i, f, _) = parse_number(e, off, len)
+        if k == 1 {
+            set_int(e, r, i)
+        } else if k == 2 {
+            let (exact, iv) = real_as_int(f)
+            if exact && !looks_like_huge(f) {
+                set_int(e, r, iv)
+            } else {
+                set_real(e, r, f)
+            }
+        } else {
+            set_int(e, r, 0)
+        }
+    }
+    ok()
+}
+
+// ---------------------------------------------------------------------------
+// LIKE and GLOB
+
+fn utf8_len(b: u8) -> usize {
+    if b < 128 {
+        return 1
+    }
+    if b >= 240 {
+        return 4
+    }
+    if b >= 224 {
+        return 3
+    }
+    if b >= 192 {
+        return 2
+    }
+    1
+}
+
+fn utf8_at(e: &Engine, o: usize, end: usize) -> (u32, usize) {
+    b := e.ws[o]
+    n := utf8_len(b)
+    if o + n > end {
+        return (b as u32, 1usize)
+    }
+    if n == 1 {
+        return (b as u32, 1usize)
+    }
+    v := (b as u32) & (if n == 2 {
+        31u32
+    } else if n == 3 {
+        15u32
+    } else {
+        7u32
+    })
+    for i in 1usize..n {
+        v = (v << 6) | ((e.ws[o + i] & 63) as u32)
+    }
+    (v, n)
+}
+
+fn fold_cp(c: u32) -> u32 {
+    if c >= 65 && c <= 90 {
+        return c + 32
+    }
+    c
+}
+
+// LIKE (case-insensitive for ASCII) with optional escape character.
+fn like_match(e: &Engine, p: usize, pend: usize, s: usize, send: usize, esc: u32, nocase: bool) -> bool {
+    pi := p
+    si := s
+    for pi < pend {
+        let (c, cn) = utf8_at(e, pi, pend)
+        if c == esc && esc != 0 {
+            pi += cn
+            if pi >= pend {
+                return false
+            }
+            let (lit, ln) = utf8_at(e, pi, pend)
+            if si >= send {
+                return false
+            }
+            let (sc, sn) = utf8_at(e, si, send)
+            if (if nocase {
+                fold_cp(lit) != fold_cp(sc)
+            } else {
+                lit != sc
+            }) {
+                return false
+            }
+            pi += ln
+            si += sn
+            continue
+        }
+        if c == 37 {
+            // '%': collapse runs of % and _.
+            for pi < pend && (e.ws[pi] == 37 || e.ws[pi] == 95) {
+                if e.ws[pi] == 95 {
+                    if si >= send {
+                        return false
+                    }
+                    let (_, sn) = utf8_at(e, si, send)
+                    si += sn
+                }
+                pi += 1
+            }
+            if pi >= pend {
+                return true
+            }
+            for si <= send {
+                if like_match(e, pi, pend, si, send, esc, nocase) {
+                    return true
+                }
+                if si >= send {
+                    return false
+                }
+                let (_, sn) = utf8_at(e, si, send)
+                si += sn
+            }
+            return false
+        }
+        if si >= send {
+            return false
+        }
+        let (sc, sn) = utf8_at(e, si, send)
+        if c != 95 {
+            if nocase {
+                if fold_cp(c) != fold_cp(sc) {
+                    return false
+                }
+            } else if c != sc {
+                return false
+            }
+        }
+        pi += cn
+        si += sn
+    }
+    si >= send
+}
+
+fn glob_match(e: &Engine, p: usize, pend: usize, s: usize, send: usize) -> bool {
+    pi := p
+    si := s
+    for pi < pend {
+        let (c, cn) = utf8_at(e, pi, pend)
+        if c == 42 {
+            for pi < pend && (e.ws[pi] == 42 || e.ws[pi] == 63) {
+                if e.ws[pi] == 63 {
+                    if si >= send {
+                        return false
+                    }
+                    let (_, sn) = utf8_at(e, si, send)
+                    si += sn
+                }
+                pi += 1
+            }
+            if pi >= pend {
+                return true
+            }
+            for si <= send {
+                if glob_match(e, pi, pend, si, send) {
+                    return true
+                }
+                if si >= send {
+                    return false
+                }
+                let (_, sn) = utf8_at(e, si, send)
+                si += sn
+            }
+            return false
+        }
+        if si >= send {
+            return false
+        }
+        let (sc, sn) = utf8_at(e, si, send)
+        if c == 63 {
+            pi += cn
+            si += sn
+            continue
+        }
+        if c == 91 {
+            // Character class [...] with ranges and ^ negation.
+            q := pi + 1
+            invert := false
+            if q < pend && e.ws[q] == 94 {
+                invert = true
+                q += 1
+            }
+            matched := false
+            first := true
+            prev := 0u32
+            for q < pend && (first || e.ws[q] != 93) {
+                let (cc, ccn) = utf8_at(e, q, pend)
+                if cc == 45 && !first && q + 1 < pend && e.ws[q + 1] != 93 {
+                    let (hi, hin) = utf8_at(e, q + 1, pend)
+                    if sc >= prev && sc <= hi {
+                        matched = true
+                    }
+                    q += 1 + hin
+                    first = false
+                    continue
+                }
+                if cc == sc {
+                    matched = true
+                }
+                prev = cc
+                q += ccn
+                first = false
+            }
+            if q >= pend {
+                return false
+            }
+            if matched == invert {
+                return false
+            }
+            pi = q + 1
+            si += sn
+            continue
+        }
+        if c != sc {
+            return false
+        }
+        pi += cn
+        si += sn
+    }
+    si >= send
+}
+
+fn eval_like(e: &mut Engine, n: usize, dst: usize) -> void!db.Error {
+    save := e.rtop
+    s := reg_push(e)?
+    p := reg_push(e)?
+    x := reg_push(e)?
+    let n_a = na(e, n)
+    eval(e, n_a, s)?
+    let n_b = nb(e, n)
+    eval(e, n_b, p)?
+    esc := 0u32
+    if nc(e, n) != 0 {
+        let n_c = nc(e, n)
+        eval(e, n_c, x)?
+        if rtype(e, x) == T_NULL {
+            set_null(e, dst)
+            e.rtop = save
+            return ok()
+        }
+        to_text(e, x)?
+        let xo = roff(e, x)
+        let xl = rlen(e, x)
+        let (cp, cn) = utf8_at(e, xo, xo + xl)
+        if xl == 0 || cn != xl {
+            e.rtop = save
+            return err(fail(e, SQLITE_ERROR, "ESCAPE expression must be a single character"))
+        }
+        esc = cp
+    }
+    if rtype(e, s) == T_NULL || rtype(e, p) == T_NULL {
+        set_null(e, dst)
+        e.rtop = save
+        return ok()
+    }
+    to_text(e, s)?
+    to_text(e, p)?
+    po := roff(e, p)
+    so := roff(e, s)
+    m := if nop(e, n) == 1 {
+        let value = po + rlen(e, p)
+        let value2 = so + rlen(e, s)
+        glob_match(e, po, value, so, value2)
+    } else {
+        let value3 = po + rlen(e, p)
+        let value4 = so + rlen(e, s)
+        like_match(e, po, value3, so, value4, esc, true)
+    }
+    if nflags(e, n) != 0 {
+        m = !m
+    }
+    set_int(e, dst, if m {
+        1i64
+    } else {
+        0i64
+    })
+    e.rtop = save
+    ok()
+}

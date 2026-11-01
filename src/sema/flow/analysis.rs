@@ -73,7 +73,15 @@ fn static_loan(span: Span) -> Loan {
     }
 }
 
+fn is_literal(loan: &Loan) -> bool {
+    loan.root == 0 && loan.fields.first().is_some_and(|f| f == "<literal>")
+}
+
 fn overlaps(a: &Loan, b: &Loan) -> bool {
+    // String literals are immutable program data: no access can conflict.
+    if is_literal(a) || is_literal(b) {
+        return false;
+    }
     a.root == b.root
         && a.fields
             .iter()
@@ -771,7 +779,12 @@ impl<'a> Analysis<'a> {
             Operation::Require(place) => self.require(*place, span, state, check),
             Operation::Constant { target } => state[target.0] = Slot::initialized(vec![]),
             Operation::Static { target } => {
-                state[target.0] = Slot::initialized(vec![static_loan(span)]);
+                // A string literal is immutable program data: it is never the
+                // storage of a (mutable) static, so it must not overlap one
+                // (see `overlaps`).
+                let mut loan = static_loan(span);
+                loan.fields.push("<literal>".into());
+                state[target.0] = Slot::initialized(vec![loan]);
             }
             Operation::Borrow {
                 target,

@@ -257,6 +257,17 @@ not independently persist the parent directory entry. Linux directory handles
 can be synced. Windows directory persistence is not offered as a capability.
 No operation implicitly syncs on drop.
 
+`File.try_lock_range(start, length, shared)` takes a non-blocking advisory
+byte-range lock, shared (read) or exclusive (write), and returns `false` when
+another process holds a conflicting lock; `unlock_range(start, length)`
+releases it. POSIX uses `fcntl` record locks, so the locks interoperate with
+other programs that lock the same file the same way (SQLite does); locking a
+range the process already holds converts it, and closing any descriptor of the
+file releases all of the process's locks on it. Windows uses `LockFileEx`,
+whose locks other handles cannot override. The range may extend past the end
+of the file. [std/db/sqlite](sqlite.md) uses these locks to share databases
+with SQLite.
+
 `File` owns one `native.Handle`. Moving transfers ownership. `close()`
 invalidates the owner before the native call and reports errors; it is safe to
 call again. Destruction closes once and discards unreportable close errors.

@@ -1,0 +1,1 @@
+local x <const> = {}; x = 2

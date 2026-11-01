@@ -4,8 +4,7 @@
 
 - Fixed: a struct field named `len` failed code generation ("is not an
   array or slice") because every `.len` was compiled as a collection length.
-  `len` is now the built-in length only on arrays, slices and strings, also
-  behind several references (`& &[u8]`).
+  `len` is now the built-in length only on arrays, slices and strings.
 - Results with a value (`T!E`) and enums with payloads return in registers.
   The shared payload storage is now made of integer words instead of bytes.
   Byte storage made an `i64!E` result nine separate return values to LLVM,
@@ -13,6 +12,86 @@
   by byte. A loop of 300 million non-inlined `i64!E` calls runs in 0.36 s
   instead of 1.52 s on an M-series Mac. Layout sizes and alignments are
   unchanged.
+- New database packages. `std/db` holds the shared vocabulary for drivers:
+  `db.Error` with portable `db.ErrorKind`s and `db.Constraint`s plus the
+  driver's native code, the borrowed `db.Value`, and `db.IsolationLevel`.
+  `std/db/sql` defines the `sql.Conn`, `sql.Row`, and `sql.RowSink`
+  interfaces that every SQL driver matches, so generic code
+  (`<C: sql.Conn>`) and runtime-selected code (`&mut dyn sql.Conn`) work with
+  any of them.
+- `std/db/sqlite` is an SQLite-compatible database engine written entirely in
+  Dodo, with no native library: it reads and writes SQLite 3 database files
+  (every page size, overflow pages, freelist, rollback journal with hot-journal
+  recovery, and SQLite's locking protocol), so the same file can be used by
+  SQLite itself at the same time. It runs inside a caller-owned workspace and
+  never allocates. SQL support covers tables, indexes (including SQLite's
+  automatic indexes), views, joins, subqueries, compound selects, common table
+  expressions including `WITH RECURSIVE`, aggregates, `GROUP BY`/`HAVING`,
+  `ORDER BY`/`LIMIT`, UPSERT, `RETURNING`, constraints with conflict clauses,
+  `AUTOINCREMENT`, `ALTER TABLE`, transactions with statement-level rollback,
+  common pragmas, and SQLite's core, aggregate, and date/time functions with
+  its type affinity rules. Differential tests compare results and written
+  files against SQLite. See the new [SQLite guide](docs/src/content/docs/sqlite.md).
+- `fs.File.try_lock_range(start, length, shared)` and `unlock_range` take
+  non-blocking advisory byte-range locks (POSIX `fcntl` record locks through
+  the fs C adapter, `LockFileEx` on Windows).
+- String literals no longer conflict with borrows of `static mut` storage
+  (for example passing `"literal"` while holding `&mut WORKSPACE[..]`).
+- `.len` and indexing through a reference to a slice or string (such as the
+  `&&[u8]` a `match &value` binds) no longer fail in code generation.
+
+- `std/script/lua` is a complete Lua 5.4 implementation written in Dodo,
+  for embedding scripts, configuration and plugins in Dodo programs. It
+  follows PUC Lua 5.4.9, including its error messages and the
+  `LUA_COMPAT_5_3` behaviour of a default build, passes the official Lua
+  5.4.9 test suite (except the parts that need the internal `T` library),
+  and loads binary chunks from the reference `luac` 5.4. All standard
+  libraries are included; `io` and `os` wrap the target's C library on
+  Linux, macOS and Windows. The embedding API mirrors the Lua C API: a stack,
+  native functions (`lua.NativeFn`) with argument checking, protected calls,
+  userdata with metatables, coroutines with continuations, Dodo modules for
+  `require` (`preload_module`), memory limits, warnings, hooks and Ctrl-C
+  interrupts. There is no C API, so C modules cannot be loaded. At `-O 2`
+  it runs the `benchmarks/lua` set about 18% faster than the reference
+  interpreter. `examples/lua` builds a standalone `lua` interpreter
+  equivalent to the reference one, and `examples/lua_embed` shows embedding;
+  the [Lua guide](https://jotrorox.github.io/dodo/script/) covers both.
+  `tests/lua_corpus.rs` runs the `tests/lua` corpus against output recorded
+  from the reference interpreter.
+- Functions take `@inline`, `@inline(never)` and `@cold` attributes, which
+  optimized builds apply. A `match` on integer literals compiles to one LLVM
+  `switch`, and an interpreter loop of the shape `for { ...; match <u8> { ... } }`
+  with at least 16 literal arms dispatches through a table of block addresses
+  (threaded dispatch).
+- On Linux, constants that hold addresses (such as a `const NAME: &str`)
+  are placed in `.data.rel.ro` sections. They were in writable `.rodata`
+  sections, which GNU ld merged into the code segment, producing a
+  writable and executable segment and a linker warning.
+- GPUs draw straight into `std/window` windows:
+  - `win.native_handle()` returns a `window.NativeHandle` (defined in the
+    new, dependency-free `std/window/handle`): `Xcb(connection, window,
+    screen, visual)` on Linux, `AppKit(window, view)` on macOS and
+    `Win32(hwnd, instance)` on Windows. On Linux the first call loads
+    `libxcb.so.1` at run time and opens a second connection to the X
+    server, since Vulkan and EGL cannot use std/window's own socket;
+    programs that never ask still need nothing beyond libc. Every window of
+    the `App` shares that connection, which closes with the `App`.
+  - `window.Options.gpu(title, width, height)` opens a window without a
+    pixel buffer, and `Options` gains the `pixel_buffer` field (struct
+    literals must now set it). Its
+    `canvas()` is empty and `update()` fails with `Unsupported`.
+    `win.has_pixel_buffer()` tells the two kinds apart.
+  - `win.metal_layer()` gives a GPU window's view a `CAMetalLayer` on macOS,
+    for Metal and Vulkan's `VK_EXT_metal_surface`. std/window keeps its
+    drawable size and contents scale in step with the window.
+  - `opengl.Context.create_for_window(&native, options)` draws into a
+    window's framebuffer 0 through EGL's XCB platform (or Xlib and EGL's X11
+    platform), an `NSOpenGLContext` or WGL, with `swap_buffers()`,
+    `set_swap_interval()` and `update_surface()`.
+  - `examples/opengl_window.dodo` now presents its frames directly instead of
+    reading them back through the CPU, and `examples/vulkan_window.dodo` and
+    `examples/metal_window.dodo` draw a spinning triangle with Vulkan (XCB,
+    Win32 and Metal surfaces, rebuilding the swapchain on resize) and Metal.
 - `std/graphics` strokes paths: `canvas.stroke_path(&path, &style, color)`
   paints a band of the stroke's width along a path, as borders, chart lines
   and icons need. A `graphics.Stroke` sets the width (in subpixels), miter,

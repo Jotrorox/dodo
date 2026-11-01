@@ -1,0 +1,66 @@
+-- Lexer: numeric literals (decimal, hex, hex floats, exponents, overflow)
+local function show(label, v)
+  print(label, math.type(v), v)
+end
+
+show("int", 3)
+show("int 345", 345)
+show("hex ff", 0xff)
+show("hex mixed", 0xBEBADA)
+show("hex upper X", 0XA)
+show("float 3.0", 3.0)
+show("float 3.1416", 3.1416)
+show("exp", 314.16e-2)
+show("exp upper", 0.31416E1)
+show("exp no dot", 34e1)
+show("exp plus", 1e+2)
+show("dot leading", .5)
+show("dot trailing", 5.)
+show("exp zero", 3e0)
+show("leading zeros", 007)
+show("leading zeros float", 007.5)
+show("hex frac", 0x0.1E)
+show("hex exp", 0xA23p-4)
+show("hex pi", 0X1.921FB54442D18P+1)
+show("hex p4", 0x1p4)
+show("hex .8", 0x.8)
+show("hex A.8p1", 0xA.8p1)
+show("hex 1.", 0x1.)
+show("hex P upper", 0x1P-2)
+show("hex exp decimal digits", 0x1p10)
+show("hex big exponent", 0x1p62)
+
+-- integer limits
+show("maxint", 9223372036854775807)
+show("maxint+1 literal", 9223372036854775808)
+show("neg maxint+1 literal", -9223372036854775808)
+show("mininteger expr", -9223372036854775807 - 1)
+show("huge decimal", 100000000000000000000)
+show("hex all ones", 0xffffffffffffffff)
+show("hex 7f..", 0x7fffffffffffffff)
+show("hex 80..", 0x8000000000000000)
+show("hex wraps 2^64", 0x10000000000000000)
+show("hex wraps +1", 0x10000000000000001)
+show("hex long", 0x123456789abcdef0123)
+print("0xffffffffffffffff == -1", 0xffffffffffffffff == -1)
+print("0x8000000000000000 == mininteger", 0x8000000000000000 == math.mininteger)
+
+-- float extremes
+show("1e308", 1e308)
+print("1e309 is inf", 1e309 == math.huge)
+print("1e-400 is zero", 1e-400 == 0, math.type(1e-400))
+print("0x1p-1074 > 0", 0x1p-1074 > 0, 0x1p-1074 / 2 == 0)
+print("2^53 literal", 9007199254740993 == 9007199254740993.0, math.type(9007199254740993))
+show("float big int value", 9007199254740993.0)
+
+-- numerals next to operators and concatenation
+print(1 .. 2, 1.5 .. "", 0x10 .. "")
+print(3-1, 3 - -1, 2^-1, -2^2, 0xA-1)
+print(1e1-1, 0x1p1+1)
+print(-0x7fffffffffffffff - 1 == math.mininteger)
+
+-- loading numerals from strings
+for _, s in ipairs{"0x1P+4", "1E-2", "0x.0p0", "00.0", "0e0", "0x0", "1e+0", "0xA.", ".0e1"} do
+  local v = load("return " .. s)()
+  print(s, math.type(v), v)
+end

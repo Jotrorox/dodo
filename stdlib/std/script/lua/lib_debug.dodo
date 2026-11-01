@@ -1,0 +1,575 @@
+package lua
+
+import "core/ptr"
+
+// The debug library (Lua 5.4 Reference Manual §6.10): introspection of
+// stack frames, locals, upvalues and functions, the Lua-level hook
+// interface, metatables/user values without restrictions, and tracebacks.
+//
+// Functions that inspect a stack accept an optional thread as their first
+// argument; `arg` below is 1 when it was given (and 0 otherwise), so the
+// remaining arguments are at arg+1, arg+2, ...
+//
+// Hooks set with debug.sethook are kept in the registry table "_HOOKKEY"
+// (weak keys), indexed by thread; the native hook `db_hook` installed on
+// the thread looks its Lua function up there and calls it with the event
+// name and, for line events, the line number.
+
+@link_name("fgets")
+unsafe extern "C" fn db_fgets(buf: *mut u8, n: i32, f: *mut u8) -> *mut u8
+
+// Narrow an integer argument the way a C `(int)` conversion does
+// (two's-complement truncation), as the reference library does for levels,
+// indices and counts.
+fn db_int(v: i64) -> i32 {
+    let m = 4294967296i64
+    r := ((v % m) + m) % m
+    if r >= 2147483648 {
+        r -= m
+    }
+    return r as i32
+}
+
+// Thread argument handling: the thread to operate on (the given one or the
+// caller's) and the offset of the remaining arguments.
+fn db_thread(cx: &mut Cx, arg: &mut i32) -> Cx {
+    match cx.to_thread(1) {
+        some(t) => {
+            *arg = 1
+            return t
+        },
+        none => {
+            *arg = 0
+            return cx.thread_handle()
+        },
+    }
+}
+
+// Make room for n values on another thread's stack.
+fn db_check_stack(cx: &mut Cx, L1: &mut Cx, n: i32) -> void!Throw {
+    if !cx.same_thread(L1) && !L1.check_stack(n) {
+        return err(cx.error_msg("stack overflow"))
+    }
+    return ok()
+}
+
+// Move the value on top of L1 to the top of cx (nothing when they are the
+// same thread).
+fn db_move_to(cx: &mut Cx, L1: &mut Cx) {
+    if !cx.same_thread(L1) {
+        L1.xmove(cx, 1)
+    }
+}
+
+// Push thread L1 on cx's stack.
+fn db_push_thread(cx: &mut Cx, L1: &mut Cx) -> void!Throw {
+    db_check_stack(cx, L1, 1)?
+    L1.push_thread()
+    db_move_to(cx, L1)
+    return ok()
+}
+
+fn db_getregistry(cx: &mut Cx) -> i32!Throw {
+    cx.push_value(REGISTRY_INDEX)
+    return ok(1)
+}
+
+fn db_getmetatable(cx: &mut Cx) -> i32!Throw {
+    cx.check_any(1)?
+    if !cx.get_metatable(1) {
+        cx.push_nil()
+    }
+    return ok(1)
+}
+
+fn db_setmetatable(cx: &mut Cx) -> i32!Throw {
+    let t = cx.type_of(2)
+    cx.arg_expected(t == TNIL || t == TTABLE, 2, "nil or table")?
+    cx.set_top(2)
+    cx.set_metatable(1)
+    return ok(1)
+}
+
+fn db_getuservalue(cx: &mut Cx) -> i32!Throw {
+    let n = db_int(cx.opt_integer(2, 1)?)
+    if cx.type_of(1) != TUSERDATA {
+        cx.push_fail()
+        return ok(1)
+    }
+    if cx.get_iuservalue(1, n) != TNONE {
+        cx.push_boolean(true)
+        return ok(2)
+    }
+    return ok(1)
+}
+
+fn db_setuservalue(cx: &mut Cx) -> i32!Throw {
+    let n = db_int(cx.opt_integer(3, 1)?)
+    cx.check_type(1, TUSERDATA)?
+    cx.check_any(2)?
+    cx.set_top(2)
+    if !cx.set_iuservalue(1, n) {
+        cx.push_fail()
+    }
+    return ok(1)
+}
+
+// Whether option character c occurs in opts.
+fn db_has_opt(opts: &[u8], c: u8) -> bool {
+    for i in 0usize..opts.len {
+        if opts[i] == c {
+            return true
+        }
+    }
+    return false
+}
+
+fn db_set_int(cx: &mut Cx, k: &str, v: i64) -> void!Throw {
+    cx.push_integer(v)
+    return cx.set_field(-2, k)
+}
+
+fn db_set_bool(cx: &mut Cx, k: &str, v: bool) -> void!Throw {
+    cx.push_boolean(v)
+    return cx.set_field(-2, k)
+}
+
+fn db_set_bytes(cx: &mut Cx, k: &str, v: &[u8]) -> void!Throw {
+    cx.push_bytes(v)?
+    return cx.set_field(-2, k)
+}
+
+// debug.getinfo([thread,] f [, what])
+fn db_getinfo(cx: &mut Cx) -> i32!Throw {
+    arg := 0i32
+    L1 := db_thread(cx, &mut arg)
+    let ostr = cx.opt_lstr(arg + 2, b"flnSrtu")?
+    let opts = pkg_cstr(ostr.bytes())
+    db_check_stack(cx, &mut L1, 3)?
+    cx.arg_check(opts.len == 0 || opts[0] != b'>', arg + 2, "invalid option '>'")?
+    ar := Debug.new()
+    fv := Value { bits: 0, tag: 0 }
+    ci := unsafe {
+        0 as *mut CallInfo
+    }
+    unsafe {
+        if cx.is_function(arg + 1) {
+            set_obj(ptr.from_mut(&mut fv), cx.idx2val(arg + 1))
+        } else {
+            let level = db_int(cx.check_integer(arg + 1)?)
+            if !L1.get_stack(level, &mut ar) {
+                cx.push_fail()
+                return ok(1)
+            }
+            ci = ar.ci
+            set_obj(ptr.from_mut(&mut fv), (*ci).func)
+        }
+        let f = ptr.from_mut(&mut fv)
+        if !dbg_fill_info(L1.L, opts, &mut ar, f, ci) {
+            return err(cx.arg_error(arg + 2, "invalid option"))
+        }
+        cx.create_table(0, 16)?
+        if db_has_opt(opts, b'S') {
+            db_set_bytes(cx, "source", ar.source())?
+            db_set_bytes(cx, "short_src", ar.short_src())?
+            db_set_int(cx, "linedefined", ar.linedefined as i64)?
+            db_set_int(cx, "lastlinedefined", ar.lastlinedefined as i64)?
+            db_set_bytes(cx, "what", ar.what())?
+        }
+        if db_has_opt(opts, b'l') {
+            db_set_int(cx, "currentline", ar.currentline as i64)?
+        }
+        if db_has_opt(opts, b'u') {
+            db_set_int(cx, "nups", ar.nups as i64)?
+            db_set_int(cx, "nparams", ar.nparams as i64)?
+            db_set_bool(cx, "isvararg", ar.isvararg)?
+        }
+        if db_has_opt(opts, b'n') {
+            match ar.name() {
+                some(n) => {
+                    db_set_bytes(cx, "name", n)?
+                },
+                none => {},
+            }
+            db_set_bytes(cx, "namewhat", ar.namewhat())?
+        }
+        if db_has_opt(opts, b'r') {
+            db_set_int(cx, "ftransfer", ar.ftransfer as i64)?
+            db_set_int(cx, "ntransfer", ar.ntransfer as i64)?
+        }
+        if db_has_opt(opts, b't') {
+            db_set_bool(cx, "istailcall", ar.istailcall)?
+        }
+        if db_has_opt(opts, b'L') {
+            api_collect_valid_lines(cx.L, f)?
+            cx.set_field(-2, "activelines")?
+        }
+        if db_has_opt(opts, b'f') {
+            cx.push_raw(f)
+            cx.set_field(-2, "func")?
+        }
+    }
+    return ok(1)
+}
+
+// debug.getlocal([thread,] f, local)
+fn db_getlocal(cx: &mut Cx) -> i32!Throw {
+    arg := 0i32
+    L1 := db_thread(cx, &mut arg)
+    let nvar = db_int(cx.check_integer(arg + 2)?)
+    if cx.is_function(arg + 1) {
+        // Parameter names of a function (no values: it is not running).
+        cx.push_value(arg + 1)
+        match cx.get_param_name(nvar) {
+            some(name) => {
+                cx.push_raw_bytes(name.as_ptr(), name.size())?
+            },
+            none => {
+                cx.push_nil()
+            },
+        }
+        return ok(1)
+    }
+    let level = db_int(cx.check_integer(arg + 1)?)
+    ar := Debug.new()
+    if !L1.get_stack(level, &mut ar) {
+        return err(cx.arg_error(arg + 1, "level out of range"))
+    }
+    db_check_stack(cx, &mut L1, 1)?
+    match L1.get_local(&ar, nvar) {
+        some(name) => {
+            db_move_to(cx, &mut L1)
+            cx.push_raw_bytes(name.as_ptr(), name.size())?
+            cx.rotate(-2, 1)
+            return ok(2)
+        },
+        none => {
+            cx.push_fail()
+            return ok(1)
+        },
+    }
+}
+
+// debug.setlocal([thread,] level, local, value)
+fn db_setlocal(cx: &mut Cx) -> i32!Throw {
+    arg := 0i32
+    L1 := db_thread(cx, &mut arg)
+    let level = db_int(cx.check_integer(arg + 1)?)
+    let nvar = db_int(cx.check_integer(arg + 2)?)
+    ar := Debug.new()
+    if !L1.get_stack(level, &mut ar) {
+        return err(cx.arg_error(arg + 1, "level out of range"))
+    }
+    cx.check_any(arg + 3)?
+    cx.set_top(arg + 3)
+    db_check_stack(cx, &mut L1, 1)?
+    if !cx.same_thread(&L1) {
+        cx.xmove(&mut L1, 1)
+    }
+    match L1.set_local(&ar, nvar) {
+        some(name) => {
+            cx.push_raw_bytes(name.as_ptr(), name.size())?
+        },
+        none => {
+            cx.push_nil()
+        },
+    }
+    return ok(1)
+}
+
+// debug.getupvalue(f, up)
+fn db_getupvalue(cx: &mut Cx) -> i32!Throw {
+    let n = db_int(cx.check_integer(2)?)
+    cx.check_type(1, TFUNCTION)?
+    match cx.get_upvalue(1, n) {
+        some(name) => {
+            cx.push_raw_bytes(name.as_ptr(), name.size())?
+            cx.insert(-2)
+            return ok(2)
+        },
+        none => {
+            return ok(0)
+        },
+    }
+}
+
+// debug.setupvalue(f, up, value)
+fn db_setupvalue(cx: &mut Cx) -> i32!Throw {
+    cx.check_any(3)?
+    let n = db_int(cx.check_integer(2)?)
+    cx.check_type(1, TFUNCTION)?
+    match cx.set_upvalue(1, n) {
+        some(name) => {
+            cx.push_raw_bytes(name.as_ptr(), name.size())?
+            return ok(1)
+        },
+        none => {
+            return ok(0)
+        },
+    }
+}
+
+// Identity of upvalue (argnup) of function (argf), null if there is none;
+// with `strict`, a missing upvalue is an argument error.
+fn db_check_upval(cx: &mut Cx, argf: i32, argnup: i32, strict: bool, nup: &mut i32) -> (*mut u8)!Throw {
+    *nup = db_int(cx.check_integer(argnup)?)
+    cx.check_type(argf, TFUNCTION)?
+    let id = cx.upvalue_id(argf, *nup)
+    if strict {
+        cx.arg_check(!ptr.is_null(id), argnup, "invalid upvalue index")?
+    }
+    return ok(id)
+}
+
+// debug.upvalueid(f, n)
+fn db_upvalueid(cx: &mut Cx) -> i32!Throw {
+    n := 0i32
+    let id = db_check_upval(cx, 1, 2, false, &mut n)?
+    if ptr.is_null(id) {
+        cx.push_fail()
+    } else {
+        cx.push_light_userdata(id)
+    }
+    return ok(1)
+}
+
+// debug.upvaluejoin(f1, n1, f2, n2)
+fn db_upvaluejoin(cx: &mut Cx) -> i32!Throw {
+    n1 := 0i32
+    n2 := 0i32
+    db_check_upval(cx, 1, 2, true, &mut n1)?
+    db_check_upval(cx, 3, 4, true, &mut n2)?
+    let c1 = cx.is_native_function(1)
+    cx.arg_check(!c1, 1, "Lua function expected")?
+    let c3 = cx.is_native_function(3)
+    cx.arg_check(!c3, 3, "Lua function expected")?
+    cx.upvalue_join(1, n1, 3, n2)
+    return ok(0)
+}
+
+// --- Hooks ------------------------------------------------------------------
+
+// Native hook installed by debug.sethook: calls hooktable[thread] with the
+// event name and the line (nil except for line events).
+fn db_hook(cx: &mut Cx, ar: &mut Debug) -> void!Throw {
+    cx.get_field(REGISTRY_INDEX, "_HOOKKEY")?
+    if !cx.is_table(-1) {
+        return ok()
+    }
+    cx.push_thread()
+    if cx.raw_get(-2) == TFUNCTION {
+        let ev = ar.event
+        if ev == HOOKCALL {
+            cx.push_str("call")?
+        } else if ev == HOOKRET {
+            cx.push_str("return")?
+        } else if ev == HOOKLINE {
+            cx.push_str("line")?
+        } else if ev == HOOKCOUNT {
+            cx.push_str("count")?
+        } else {
+            cx.push_str("tail call")?
+        }
+        if ar.currentline >= 0 {
+            cx.push_integer(ar.currentline as i64)
+        } else {
+            cx.push_nil()
+        }
+        cx.call(2, 0)?
+    }
+    return ok()
+}
+
+// Whether thread L1's hook is the one installed by debug.sethook.
+fn db_is_own_hook(L1: &Cx) -> bool {
+    // Function values have no `==`: compare their code addresses.
+    unsafe {
+        hv: HookFn = db_hook
+        match L1.get_hook() {
+            some(h) => {
+                hv = h
+            },
+            none => {
+                return false
+            },
+        }
+        mine: HookFn = db_hook
+        let a = *(ptr.from_mut(&mut hv) as *mut usize)
+        let b = *(ptr.from_mut(&mut mine) as *mut usize)
+        return a == b
+    }
+}
+
+// debug.sethook([thread,] hook, mask [, count])
+fn db_sethook(cx: &mut Cx) -> i32!Throw {
+    arg := 0i32
+    L1 := db_thread(cx, &mut arg)
+    mask := 0i32
+    count := 0i32
+    if cx.is_none_or_nil(arg + 1) {
+        cx.set_top(arg + 1)
+    } else {
+        let smask = cx.check_lstr(arg + 2)?
+        cx.check_type(arg + 1, TFUNCTION)?
+        count = db_int(cx.opt_integer(arg + 3, 0)?)
+        let m = pkg_cstr(smask.bytes())
+        if db_has_opt(m, b'c') {
+            mask = mask | MASKCALL
+        }
+        if db_has_opt(m, b'r') {
+            mask = mask | MASKRET
+        }
+        if db_has_opt(m, b'l') {
+            mask = mask | MASKLINE
+        }
+        if count > 0 {
+            mask = mask | MASKCOUNT
+        }
+    }
+    if !cx.get_subtable(REGISTRY_INDEX, "_HOOKKEY")? {
+        // New hook table: weak keys, being its own metatable.
+        cx.push_str("k")?
+        cx.set_field(-2, "__mode")?
+        cx.push_value(-1)
+        cx.set_metatable(-2)
+    }
+    db_push_thread(cx, &mut L1)?
+    cx.push_value(arg + 1)
+    cx.raw_set(-3)?
+    if mask == 0 {
+        L1.clear_hook()
+    } else {
+        L1.set_hook(db_hook, mask, count)
+    }
+    return ok(0)
+}
+
+// debug.gethook([thread])
+fn db_gethook(cx: &mut Cx) -> i32!Throw {
+    arg := 0i32
+    L1 := db_thread(cx, &mut arg)
+    if !L1.has_hook() {
+        cx.push_fail()
+        return ok(1)
+    }
+    let mask = L1.get_hook_mask()
+    if !db_is_own_hook(&L1) {
+        cx.push_str("external hook")?
+    } else {
+        cx.get_field(REGISTRY_INDEX, "_HOOKKEY")?
+        db_push_thread(cx, &mut L1)?
+        cx.raw_get(-2)
+        cx.remove(-2)
+    }
+    b := Buffer.new(cx)
+    if (mask & MASKCALL) != 0 {
+        b.add_char(b'c')?
+    }
+    if (mask & MASKRET) != 0 {
+        b.add_char(b'r')?
+    }
+    if (mask & MASKLINE) != 0 {
+        b.add_char(b'l')?
+    }
+    b.push_result(cx)?
+    cx.push_integer(L1.get_hook_count() as i64)
+    return ok(3)
+}
+
+// --- Interaction and tracebacks ---------------------------------------------
+
+// debug.debug(): run lines read from standard input until "cont".
+fn db_debug(cx: &mut Cx) -> i32!Throw {
+    buf := [0u8; 250]
+    for {
+        write_stderr(b"lua_debug> ")
+        unsafe {
+            let p = db_fgets(ptr.as_mut_ptr(&mut buf), 250, c_stdin())
+            if ptr.is_null(p) {
+                return ok(0)
+            }
+        }
+        n := 0usize
+        for n < 250 && buf[n] != 0 {
+            n += 1
+        }
+        let line = buf[0..n]
+        if n == 5 && line[0] == b'c' && line[1] == b'o' && line[2] == b'n' && line[3] == b't' && line[4] == b'\n' {
+            return ok(0)
+        }
+        st := cx.load_bytes(line, b"=(debug command)", b"bt")
+        if st == OK {
+            st = cx.pcall(0, 0, 0)
+        }
+        if st != OK {
+            let s = cx.to_lstring_meta(-1)?
+            write_stderr(pkg_cstr(s.bytes()))
+            write_stderr(b"\n")
+        }
+        cx.set_top(0)
+    }
+}
+
+// debug.traceback([thread,] [message [, level]])
+fn db_traceback(cx: &mut Cx) -> i32!Throw {
+    arg := 0i32
+    L1 := db_thread(cx, &mut arg)
+    match cx.to_lstr(arg + 1)? {
+        some(m) => {
+            let dl = if cx.same_thread(&L1) {
+                1i64
+            } else {
+                0i64
+            }
+            let level = db_int(cx.opt_integer(arg + 2, dl)?)
+            cx.traceback(&mut L1, some(pkg_cstr(m.bytes())), level)?
+        },
+        none => {
+            if !cx.is_none_or_nil(arg + 1) {
+                // Not a string: returned untouched.
+                cx.push_value(arg + 1)
+                return ok(1)
+            }
+            let dl = if cx.same_thread(&L1) {
+                1i64
+            } else {
+                0i64
+            }
+            let level = db_int(cx.opt_integer(arg + 2, dl)?)
+            cx.traceback(&mut L1, none, level)?
+        },
+    }
+    return ok(1)
+}
+
+// debug.setcstacklimit(limit): deprecated in 5.4; does nothing and returns
+// the fixed C-stack limit of the reference implementation (200).
+fn db_setcstacklimit(cx: &mut Cx) -> i32!Throw {
+    cx.check_integer(1)?
+    cx.push_integer(200)
+    return ok(1)
+}
+
+pub fn open_debug(cx: &mut Cx) -> i32!Throw {
+    let funcs = [
+        ("debug", db_debug),
+        ("getuservalue", db_getuservalue),
+        ("gethook", db_gethook),
+        ("getinfo", db_getinfo),
+        ("getlocal", db_getlocal),
+        ("getregistry", db_getregistry),
+        ("getmetatable", db_getmetatable),
+        ("getupvalue", db_getupvalue),
+        ("upvaluejoin", db_upvaluejoin),
+        ("upvalueid", db_upvalueid),
+        ("setuservalue", db_setuservalue),
+        ("sethook", db_sethook),
+        ("setlocal", db_setlocal),
+        ("setmetatable", db_setmetatable),
+        ("setupvalue", db_setupvalue),
+        ("traceback", db_traceback),
+        ("setcstacklimit", db_setcstacklimit),
+    ]
+    cx.new_lib(&funcs)?
+    return ok(1)
+}

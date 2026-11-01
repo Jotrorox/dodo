@@ -1,0 +1,1104 @@
+package lua
+
+import "core/mem"
+import "core/ptr"
+
+// The string library (reference manual section 6.4): byte/char/len/sub/rep/
+// reverse/lower/upper/dump, the pattern functions find/match/gmatch/gsub
+// (over pattern.dodo), and the string metatable. string.format lives in
+// lib_string_format.dodo, pack/packsize/unpack in lib_string_pack.dodo.
+//
+// Hot paths read string arguments straight from their stack slots and build
+// results in place: results longer than SHORTSTR_MAX are allocated as long
+// strings (anchored on the stack at once) and filled directly; shorter ones
+// are assembled in a small local array and interned.
+
+@link_name("memcmp")
+unsafe extern "C" fn strlib_memcmp(a: *const u8, b: *const u8, n: usize) -> i32
+@link_name("memchr")
+unsafe extern "C" fn strlib_memchr(s: *const u8, c: i32, n: usize) -> *mut u8
+
+// Largest string the library builds (the reference limits sizes to INT_MAX).
+const STRLIB_MAXSIZE: u64 = 2147483647
+
+// --- Small helpers ------------------------------------------------------------
+
+fn sl_load(base: *const u8, i: usize) -> u8 {
+    return unsafe {
+        *ptr.offset(base, i as isize)
+    }
+}
+
+fn sl_store(base: *mut u8, i: usize, c: u8) {
+    unsafe {
+        *ptr.offset(base, i as isize) = c
+    }
+}
+
+fn sl_at(base: *const u8, i: usize) -> *const u8 {
+    return unsafe {
+        ptr.offset(base, i as isize)
+    }
+}
+
+// Offset of `p` from `base` (p >= base).
+fn sl_diff(p: *const u8, base: *const u8) -> usize {
+    return unsafe {
+        (p as usize) - (base as usize)
+    }
+}
+
+// First occurrence of byte c in base[lo..to], or `to`.
+fn sl_find_byte(base: *const u8, lo: usize, to: usize, c: u8) -> usize {
+    if lo >= to {
+        return to
+    }
+    unsafe {
+        let q = strlib_memchr(sl_at(base, lo), c as i32, to - lo) as *const u8
+        if ptr.is_null(q) {
+            return to
+        }
+        return sl_diff(q, base)
+    }
+}
+
+// First occurrence of needle in s[first..] (memchr on its first byte, then
+// memcmp), or -1. An empty needle is found at `first`.
+fn sl_find_plain(s: *const u8, ls: usize, needle: *const u8, ln: usize, first: usize) -> isize {
+    if ln == 0 {
+        return first as isize
+    }
+    if ln > ls || first > ls - ln {
+        return -1
+    }
+    let head = sl_load(needle, 0)
+    let last = ls - ln
+    at := first
+    for at <= last {
+        at = sl_find_byte(s, at, last + 1, head)
+        if at > last {
+            return -1
+        }
+        if ln == 1 || unsafe {
+            strlib_memcmp(sl_at(s, at + 1), sl_at(needle, 1), ln - 1)
+        } == 0 {
+            return at as isize
+        }
+        at += 1
+    }
+    return -1
+}
+
+// Stack slot of argument `arg` (> 0) of the running native function, or
+// null when the argument is absent.
+fn sl_slot(cx: &Cx, arg: i32) -> *mut Value {
+    unsafe {
+        let L = cx.L
+        let v = ptr.offset((*(*L).ci).func, arg as isize)
+        if (v as usize) < ((*L).top as usize) {
+            return v
+        }
+        return 0 as *mut Value
+    }
+}
+
+// String argument `arg` (numbers are converted in place) as pointer + size.
+fn sl_arg_str(cx: &mut Cx, arg: i32, p: &mut *const u8, n: &mut usize) -> void!Throw {
+    unsafe {
+        let v = sl_slot(cx, arg)
+        if !ptr.is_null(v) {
+            let t = (*v).tag
+            if t == TAG_SHORTSTR || t == TAG_LONGSTR {
+                let s = val_str(v)
+                *p = str_data(s) as *const u8
+                *n = (*s).length
+                return ok()
+            }
+        }
+        return sl_arg_str_slow(cx, arg, p, n)
+    }
+}
+
+fn sl_arg_str_slow(cx: &mut Cx, arg: i32, p: &mut *const u8, n: &mut usize) -> void!Throw {
+    let s = cx.check_lstr(arg)?
+    *p = s.as_ptr()
+    *n = s.size()
+    return ok()
+}
+
+// Integer argument (luaL_checkinteger) with a fast path for integers.
+fn sl_arg_int(cx: &mut Cx, arg: i32, out: &mut i64) -> void!Throw {
+    unsafe {
+        let v = sl_slot(cx, arg)
+        if !ptr.is_null(v) && (*v).tag == TAG_INT {
+            *out = val_int(v)
+            return ok()
+        }
+        return sl_arg_int_slow(cx, arg, out)
+    }
+}
+
+fn sl_arg_int_slow(cx: &mut Cx, arg: i32, out: &mut i64) -> void!Throw {
+    *out = cx.check_integer(arg)?
+    return ok()
+}
+
+// Number argument (luaL_checknumber) with a fast path for numbers.
+fn sl_arg_num(cx: &mut Cx, arg: i32) -> f64!Throw {
+    unsafe {
+        let v = cx.idx2val(arg)
+        let t = (*v).tag
+        if t == TAG_FLOAT {
+            return ok(val_float(v))
+        }
+        if t == TAG_INT {
+            return ok(val_int(v) as f64)
+        }
+        return cx.check_number(arg)
+    }
+}
+
+// Optional integer argument (luaL_optinteger) with a fast path.
+fn sl_opt_int(cx: &mut Cx, arg: i32, def: i64, out: &mut i64) -> void!Throw {
+    unsafe {
+        let v = sl_slot(cx, arg)
+        if ptr.is_null(v) {
+            *out = def
+            return ok()
+        }
+        let t = (*v).tag
+        if t == TAG_INT {
+            *out = val_int(v)
+            return ok()
+        }
+        if (t & 15) == TYPE_NIL {
+            *out = def
+            return ok()
+        }
+        return sl_arg_int_slow(cx, arg, out)
+    }
+}
+
+// A start position as a 1-based offset clamped below at 1 (may exceed len).
+fn sl_start_pos(pos: i64, len: usize) -> u64 {
+    if pos > 0 {
+        return pos as u64
+    }
+    if pos == 0 {
+        return 1
+    }
+    let l = len as i64
+    if pos < -l {
+        return 1
+    }
+    return (l + pos + 1) as u64
+}
+
+// An end position clamped to [0, len].
+fn sl_end_pos(pos: i64, len: usize) -> u64 {
+    let l = len as i64
+    if pos > l {
+        return len as u64
+    }
+    if pos >= 0 {
+        return pos as u64
+    }
+    if pos < -l {
+        return 0
+    }
+    return (l + pos + 1) as u64
+}
+
+// luaL_checkstack with an inline fast path.
+fn sl_check_stack(cx: &mut Cx, n: i32, msg: &str) -> void!Throw {
+    unsafe {
+        let L = cx.L
+        let top = (*L).top
+        if sdiff((*L).stack_last, top) > n as isize && ((*(*L).ci).top as usize) >= (ptr.offset(top, n as isize) as usize) {
+            return ok()
+        }
+    }
+    return cx.check_stack_msg(n, msg)
+}
+
+// Push a string object created by the caller.
+fn sl_push_obj(cx: &mut Cx, s: *mut LString) {
+    unsafe {
+        let L = cx.L
+        set_str((*L).top, s)
+        (*L).top = ptr.offset((*L).top, 1)
+    }
+}
+
+// Start building a result of n bytes: returns where to write them. Long
+// results are allocated (and pushed) at once; short ones are written to `tmp`
+// (SHORTSTR_MAX bytes) and interned by sl_end_result.
+fn sl_begin_result(cx: &mut Cx, n: usize, tmp: *mut u8, out: &mut *mut u8) -> void!Throw {
+    if n <= SHORTSTR_MAX {
+        *out = tmp
+        return ok()
+    }
+    let s = str_new_long(cx.L, n)?
+    sl_push_obj(cx, s)
+    *out = str_data(s)
+    return ok()
+}
+
+fn sl_end_result(cx: &mut Cx, n: usize, tmp: *mut u8) -> void!Throw {
+    if n <= SHORTSTR_MAX {
+        let s = str_new(cx.L, unsafe {
+            tmp as *const u8
+        }, n)?
+        sl_push_obj(cx, s)
+    }
+    gc_check(cx.L)
+    return ok()
+}
+
+// Output builder that writes into caller-provided (stack) storage and moves
+// to a heap SBuf only when that fills up, so typical results cost no malloc.
+struct SlBuf {
+    stk: *mut u8
+    stk_cap: usize
+    // Bytes used in the stack storage (while not spilled).
+    used: usize
+    heap: SBuf
+    spilled: bool
+
+    fn new(L: *mut State, stk: *mut u8, cap: usize) -> SlBuf {
+        return SlBuf { stk: stk, stk_cap: cap, used: 0, heap: SBuf.new(L), spilled: false }
+    }
+
+    // Room for `extra` more bytes; *out points at it. Commit with add_size.
+    fn room(&mut self, extra: usize, out: &mut *mut u8) -> void!Throw {
+        if !self.spilled {
+            if self.used + extra <= self.stk_cap {
+                *out = unsafe {
+                    ptr.offset(self.stk, self.used as isize)
+                }
+                return ok()
+            }
+            self.heap.reserve(self.used + extra)?
+            unsafe {
+                ptr.copy_nonoverlapping(self.stk, self.heap.data, self.used)
+            }
+            self.heap.n = self.used
+            self.spilled = true
+        }
+        self.heap.reserve(extra)?
+        *out = unsafe {
+            ptr.offset(self.heap.data, self.heap.n as isize)
+        }
+        return ok()
+    }
+
+    fn add_size(&mut self, k: usize) {
+        if self.spilled {
+            self.heap.n = self.heap.n + k
+        } else {
+            self.used = self.used + k
+        }
+    }
+
+    fn add_raw(&mut self, p: *const u8, k: usize) -> void!Throw {
+        if k == 0 {
+            return ok()
+        }
+        dst := sl_null_mut()
+        self.room(k, &mut dst)?
+        unsafe {
+            ptr.copy_nonoverlapping(p as *mut u8, dst, k)
+        }
+        self.add_size(k)
+        return ok()
+    }
+
+    fn add_char(&mut self, c: u8) -> void!Throw {
+        if !self.spilled && self.used < self.stk_cap {
+            sl_store(self.stk, self.used, c)
+            self.used = self.used + 1
+            return ok()
+        }
+        dst := sl_null_mut()
+        self.room(1, &mut dst)?
+        sl_store(dst, 0, c)
+        self.add_size(1)
+        return ok()
+    }
+
+    fn add_str(&mut self, s: &str) -> void!Throw {
+        let b = mem.str_bytes(s)
+        return self.add_raw(ptr.as_ptr(b), b.len)
+    }
+
+    fn add_int(&mut self, v: i64) -> void!Throw {
+        dst := sl_null_mut()
+        self.room(24, &mut dst)?
+        let k = unsafe {
+            num_int_to_string(ptr.borrow_slice_mut(dst, 24, self), v)
+        }
+        self.add_size(k)
+        return ok()
+    }
+
+    fn add_float(&mut self, v: f64) -> void!Throw {
+        dst := sl_null_mut()
+        self.room(64, &mut dst)?
+        let k = unsafe {
+            num_float_to_string(ptr.borrow_slice_mut(dst, 64, self), v)
+        }
+        self.add_size(k)
+        return ok()
+    }
+
+    // printf-style integer / float conversions (see number.dodo).
+    fn add_fmt_int(&mut self, v: i64, conv: u8, flags: u32, width: i32, prec: i32) -> void!Throw {
+        dst := sl_null_mut()
+        self.room(NUM_BUFFER, &mut dst)?
+        let k = unsafe {
+            num_format_int(ptr.borrow_slice_mut(dst, NUM_BUFFER, self), v, conv, flags, width, prec)
+        }
+        self.add_size(k)
+        return ok()
+    }
+
+    // Formats with the locale's radix character, like C's printf.
+    fn add_fmt_float(&mut self, v: f64, conv: u8, flags: u32, width: i32, prec: i32) -> void!Throw {
+        dst := sl_null_mut()
+        self.room(NUM_BUFFER, &mut dst)?
+        let k = unsafe {
+            let out = ptr.borrow_slice_mut(dst, NUM_BUFFER, self)
+            let n = num_format_float(out, v, conv, flags, width, prec)
+            num_localize(out, n)
+            n
+        }
+        self.add_size(k)
+        return ok()
+    }
+
+    // Formats with '.' whatever the locale (for %q, which must reload).
+    fn add_fmt_float_c(&mut self, v: f64, conv: u8, flags: u32, width: i32, prec: i32) -> void!Throw {
+        dst := sl_null_mut()
+        self.room(NUM_BUFFER, &mut dst)?
+        let k = unsafe {
+            num_format_float(ptr.borrow_slice_mut(dst, NUM_BUFFER, self), v, conv, flags, width, prec)
+        }
+        self.add_size(k)
+        return ok()
+    }
+
+    fn size(&self) -> usize {
+        if self.spilled {
+            return self.heap.n
+        }
+        return self.used
+    }
+
+    // Push the contents as a string.
+    fn push(&mut self, cx: &mut Cx) -> void!Throw {
+        let L = cx.L
+        let s = if self.spilled {
+            str_new(L, unsafe {
+                self.heap.data as *const u8
+            }, self.heap.n)?
+        } else {
+            str_new(L, unsafe {
+                self.stk as *const u8
+            }, self.used)?
+        }
+        sl_push_obj(cx, s)
+        gc_check(L)
+        return ok()
+    }
+}
+
+// --- Basic functions ----------------------------------------------------------
+
+fn strlib_len(cx: &mut Cx) -> i32!Throw {
+    p := sl_null()
+    n := 0usize
+    sl_arg_str(cx, 1, &mut p, &mut n)?
+    cx.push_integer(n as i64)
+    return ok(1)
+}
+
+fn strlib_sub(cx: &mut Cx) -> i32!Throw {
+    p := sl_null()
+    l := 0usize
+    sl_arg_str(cx, 1, &mut p, &mut l)?
+    i := 0i64
+    sl_arg_int(cx, 2, &mut i)?
+    j := 0i64
+    sl_opt_int(cx, 3, -1, &mut j)?
+    let start = sl_start_pos(i, l)
+    let end = sl_end_pos(j, l)
+    if start > end {
+        cx.push_raw_bytes(p, 0)?
+    } else if start == 1 && end == l as u64 && cx.type_of(1) == TSTRING {
+        cx.push_value(1)
+    } else {
+        cx.push_raw_bytes(sl_at(p, (start - 1) as usize), (end - start + 1) as usize)?
+    }
+    return ok(1)
+}
+
+fn strlib_reverse(cx: &mut Cx) -> i32!Throw {
+    p := sl_null()
+    l := 0usize
+    sl_arg_str(cx, 1, &mut p, &mut l)?
+    tmp := [0u8; 40]
+    dst := sl_null_mut()
+    sl_begin_result(cx, l, ptr.as_mut_ptr(&mut tmp), &mut dst)?
+    for i in 0usize..l {
+        sl_store(dst, l - 1 - i, sl_load(p, i))
+    }
+    sl_end_result(cx, l, ptr.as_mut_ptr(&mut tmp))?
+    return ok(1)
+}
+
+fn sl_case(cx: &mut Cx, upper: bool) -> i32!Throw {
+    p := sl_null()
+    l := 0usize
+    sl_arg_str(cx, 1, &mut p, &mut l)?
+    tmp := [0u8; 40]
+    dst := sl_null_mut()
+    sl_begin_result(cx, l, ptr.as_mut_ptr(&mut tmp), &mut dst)?
+    let lo = if upper {
+        b'a'
+    } else {
+        b'A'
+    }
+    for i in 0usize..l {
+        let c = sl_load(p, i)
+        if c >= lo && c <= lo + 25 {
+            sl_store(dst, i, c ^ 32)
+        } else {
+            sl_store(dst, i, c)
+        }
+    }
+    sl_end_result(cx, l, ptr.as_mut_ptr(&mut tmp))?
+    return ok(1)
+}
+
+fn strlib_lower(cx: &mut Cx) -> i32!Throw {
+    return sl_case(cx, false)
+}
+
+fn strlib_upper(cx: &mut Cx) -> i32!Throw {
+    return sl_case(cx, true)
+}
+
+fn strlib_rep(cx: &mut Cx) -> i32!Throw {
+    p := sl_null()
+    l := 0usize
+    sl_arg_str(cx, 1, &mut p, &mut l)?
+    n := 0i64
+    sl_arg_int(cx, 2, &mut n)?
+    sp := sl_null()
+    lsep := 0usize
+    if !cx.is_none_or_nil(3) {
+        sl_arg_str(cx, 3, &mut sp, &mut lsep)?
+    }
+    if n <= 0 {
+        cx.push_raw_bytes(p, 0)?
+        return ok(1)
+    }
+    let unit = (l as u64) + (lsep as u64)
+    if unit > STRLIB_MAXSIZE / (n as u64) {
+        return err(cx.error_msg("resulting string too large"))
+    }
+    let total = ((n as u64) * unit - (lsep as u64)) as usize
+    if total == 0 {
+        cx.push_raw_bytes(p, 0)?
+        return ok(1)
+    }
+    tmp := [0u8; 40]
+    dst := sl_null_mut()
+    sl_begin_result(cx, total, ptr.as_mut_ptr(&mut tmp), &mut dst)?
+    unsafe {
+        // One period (s .. sep), cut at the end, then double the filled prefix:
+        // the result is periodic with period l + lsep.
+        filled := if l < total {
+            l
+        } else {
+            total
+        }
+        ptr.copy_nonoverlapping(p as *mut u8, dst, filled)
+        if filled < total && lsep > 0 {
+            let k = if lsep < total - filled {
+                lsep
+            } else {
+                total - filled
+            }
+            ptr.copy_nonoverlapping(sp as *mut u8, ptr.offset(dst, filled as isize), k)
+            filled = filled + k
+        }
+        for filled < total {
+            let chunk = if filled < total - filled {
+                filled
+            } else {
+                total - filled
+            }
+            ptr.copy_nonoverlapping(dst, ptr.offset(dst, filled as isize), chunk)
+            filled = filled + chunk
+        }
+    }
+    sl_end_result(cx, total, ptr.as_mut_ptr(&mut tmp))?
+    return ok(1)
+}
+
+fn strlib_byte(cx: &mut Cx) -> i32!Throw {
+    p := sl_null()
+    l := 0usize
+    sl_arg_str(cx, 1, &mut p, &mut l)?
+    pi := 0i64
+    sl_opt_int(cx, 2, 1, &mut pi)?
+    let posi = sl_start_pos(pi, l)
+    j := 0i64
+    sl_opt_int(cx, 3, pi, &mut j)?
+    let pose = sl_end_pos(j, l)
+    if posi > pose {
+        return ok(0)
+    }
+    if pose - posi >= 2147483647 {
+        return err(cx.error_msg("string slice too long"))
+    }
+    let n = (pose - posi) as i32 + 1
+    cx.check_stack_msg(n, "string slice too long")?
+    unsafe {
+        let L = cx.L
+        top := (*L).top
+        let base = (posi - 1) as usize
+        for i in 0usize..(n as usize) {
+            set_int(top, sl_load(p, base + i) as i64)
+            top = ptr.offset(top, 1)
+        }
+        (*L).top = top
+    }
+    return ok(n)
+}
+
+fn strlib_char(cx: &mut Cx) -> i32!Throw {
+    let n = cx.get_top()
+    let count = n as usize
+    tmp := [0u8; 40]
+    dst := sl_null_mut()
+    if count <= SHORTSTR_MAX {
+        dst = ptr.as_mut_ptr(&mut tmp)
+    } else {
+        let s = str_new_long(cx.L, count)?
+        sl_push_obj(cx, s)
+        dst = str_data(s)
+    }
+    for i in 1i32..(n + 1) {
+        c := 0i64
+        sl_arg_int(cx, i, &mut c)?
+        if c < 0 || c > 255 {
+            return err(cx.arg_error(i, "value out of range"))
+        }
+        sl_store(dst, (i - 1) as usize, c as u8)
+    }
+    sl_end_result(cx, count, ptr.as_mut_ptr(&mut tmp))?
+    return ok(1)
+}
+
+fn strlib_dump(cx: &mut Cx) -> i32!Throw {
+    let strip = cx.to_boolean(2)
+    cx.check_type(1, TFUNCTION)?
+    cx.set_top(1)
+    if !cx.dump(strip)? {
+        return err(cx.error_msg("unable to dump given function"))
+    }
+    return ok(1)
+}
+
+// --- Pattern matching ---------------------------------------------------------
+
+// A cheap test every match start must pass, derived from the first pattern
+// item (after leading captures): a literal byte, a class %x, or a set [..],
+// not followed by a quantifier that allows zero repetitions. Positions failing
+// the test fail the first item immediately in the matcher too (without any
+// error), so skipping them changes nothing but speed.
+const SL_FILTER_NONE: u32 = 0
+const SL_FILTER_BYTE: u32 = 1
+const SL_FILTER_CLASS: u32 = 2
+const SL_FILTER_SET: u32 = 3
+
+struct SlFilter {
+    kind: u32
+    // The literal byte or class letter.
+    c: u8
+    // Pattern offsets of a set's '[' and closing ']'.
+    p: usize
+    close: usize
+}
+
+fn sl_filter(m: &mut PatMatcher, pat_start: usize) -> SlFilter {
+    f := SlFilter { kind: SL_FILTER_NONE, c: 0, p: 0, close: 0 }
+    let pat = m.pat
+    let lp = m.pat_len
+    q := pat_start
+    // Skip up to 31 leading captures ('(' or a position capture "()").
+    opened := 0usize
+    for q < lp && sl_load(pat, q) == b'(' && opened < 31 {
+        if q + 1 < lp && sl_load(pat, q + 1) == b')' {
+            q += 2
+        } else {
+            q += 1
+        }
+        opened += 1
+    }
+    if q >= lp {
+        return f
+    }
+    let c = sl_load(pat, q)
+    item_end := q + 1
+    if c == b'%' {
+        if q + 1 >= lp {
+            return f
+        }
+        let cl = sl_load(pat, q + 1)
+        if cl == b'b' || cl == b'f' || (cl >= b'0' && cl <= b'9') {
+            return f
+        }
+        f.kind = SL_FILTER_CLASS
+        f.c = cl
+        item_end = q + 2
+    } else if c == b'[' {
+        let e = pat_item_end(m, q)
+        if e < 0 {
+            return f
+        }
+        f.kind = SL_FILTER_SET
+        f.p = q
+        f.close = e as usize - 1
+        item_end = e as usize
+    } else if c == b'(' || c == b')' || c == b'.' || c == b']' || c == b'$' || c == b'^' {
+        return f
+    } else {
+        f.kind = SL_FILTER_BYTE
+        f.c = c
+    }
+    if item_end < lp {
+        let r = sl_load(pat, item_end)
+        if r == b'*' || r == b'?' || r == b'-' {
+            f.kind = SL_FILTER_NONE
+        }
+    }
+    return f
+}
+
+// First offset >= s (below the subject length) passing the filter, or the
+// subject length.
+fn sl_next_candidate(m: &PatMatcher, f: &SlFilter, s0: usize) -> usize {
+    let n = m.src_len
+    let src = m.src
+    s := s0
+    if f.kind == SL_FILTER_BYTE {
+        return sl_find_byte(src, s, n, f.c)
+    }
+    if f.kind == SL_FILTER_CLASS {
+        let cl = f.c
+        for s < n && !pat_escape_matches(sl_load(src, s), cl) {
+            s += 1
+        }
+        return s
+    }
+    for s < n && !pat_set_matches(m, sl_load(src, s), f.p, f.close) {
+        s += 1
+    }
+    return s
+}
+
+// pat_search, skipping start offsets that fail the filter. Same results.
+fn sl_search(m: &mut PatMatcher, first: usize, pat_start: usize, anchored: bool, last: isize, f: &SlFilter, start: &mut usize) -> isize {
+    if anchored || f.kind == SL_FILTER_NONE {
+        return pat_search(m, first, pat_start, anchored, last, start)
+    }
+    let n = m.src_len
+    s := first
+    for s < n {
+        s = sl_next_candidate(m, f, s)
+        if s >= n {
+            break
+        }
+        let e = pat_match_at(m, s, pat_start)
+        if e == PAT_ERROR {
+            return PAT_ERROR
+        }
+        if e >= 0 && e != last {
+            *start = s
+            return e
+        }
+        s += 1
+    }
+    return PAT_NO_MATCH
+}
+
+fn sl_push_capture(cx: &mut Cx, m: &PatMatcher, i: usize, ws: usize, we: usize) -> void!Throw {
+    st := 0usize
+    sz := 0usize
+    let kind = pat_capture(m, i, ws, we, &mut st, &mut sz)
+    if kind == PAT_KIND_STRING {
+        return cx.push_raw_bytes(sl_at(m.src, st), sz)
+    }
+    if kind == PAT_KIND_POSITION {
+        cx.push_integer((st + 1) as i64)
+        return ok()
+    }
+    if kind == PAT_KIND_UNFINISHED {
+        return err(cx.error_msg("unfinished capture"))
+    }
+    return err(cx.error_msg(pat_capture_index_message(i + 1)))
+}
+
+// Push the captures of the last match (the whole match [ws, we) when there
+// are none and `whole` is set); returns how many were pushed.
+fn sl_push_captures(cx: &mut Cx, m: &PatMatcher, ws: usize, we: usize, whole: bool, count: &mut i32) -> void!Throw {
+    nlevels := pat_capture_count(m)
+    if nlevels == 0 && whole {
+        nlevels = 1
+    }
+    sl_check_stack(cx, nlevels as i32, "too many captures")?
+    for i in 0usize..nlevels {
+        sl_push_capture(cx, m, i, ws, we)?
+    }
+    *count = nlevels as i32
+    return ok()
+}
+
+fn sl_find_aux(cx: &mut Cx, find: bool) -> i32!Throw {
+    s := sl_null()
+    ls := 0usize
+    sl_arg_str(cx, 1, &mut s, &mut ls)?
+    p := sl_null()
+    lp := 0usize
+    sl_arg_str(cx, 2, &mut p, &mut lp)?
+    ia := 0i64
+    sl_opt_int(cx, 3, 1, &mut ia)?
+    let init1 = sl_start_pos(ia, ls)
+    if init1 - 1 > ls as u64 {
+        cx.push_fail()
+        return ok(1)
+    }
+    let init = (init1 - 1) as usize
+    if find && (cx.to_boolean(4) || pat_is_plain(p, lp)) {
+        let r = sl_find_plain(s, ls, p, lp, init)
+        if r >= 0 {
+            cx.push_integer(r as i64 + 1)
+            cx.push_integer(r as i64 + lp as i64)
+            return ok(2)
+        }
+    } else {
+        let anchor = pat_anchor_offset(p, lp)
+        m := pat_new(s, ls, p, lp)
+        st := 0usize
+        let filter = sl_filter(&mut m, anchor)
+        let e = sl_search(&mut m, init, anchor, anchor == 1, -1, &filter, &mut st)
+        if e == PAT_ERROR {
+            return err(cx.error_msg(pat_error_message(&m)))
+        }
+        if e >= 0 {
+            count := 0i32
+            if find {
+                cx.push_integer(st as i64 + 1)
+                cx.push_integer(e as i64)
+                sl_push_captures(cx, &m, st, e as usize, false, &mut count)?
+                return ok(count + 2)
+            }
+            sl_push_captures(cx, &m, st, e as usize, true, &mut count)?
+            return ok(count)
+        }
+    }
+    cx.push_fail()
+    return ok(1)
+}
+
+fn strlib_find(cx: &mut Cx) -> i32!Throw {
+    return sl_find_aux(cx, true)
+}
+
+fn strlib_match(cx: &mut Cx) -> i32!Throw {
+    return sl_find_aux(cx, false)
+}
+
+// gmatch iterator. Like the reference it has three upvalues: 1 = subject,
+// 2 = pattern and 3 = a state userdata (`SL_GM_SIZE` bytes: the next start
+// offset and the end of the last match, -1 for none) whose two user values
+// hold the subject and the pattern actually used, so replacing upvalues
+// through the debug library cannot break the iterator.
+const SL_GM_SIZE: usize = 16
+
+fn sl_gmatch_step(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        let stv = cx.idx2val(upvalue_index(3))
+        if (*stv).tag != TAG_USERDATA {
+            return ok(0)
+        }
+        let u = val_gc(stv) as *mut Udata
+        if (*u).size != SL_GM_SIZE || (*u).nuvalue != 2 || !ptr.is_null((*u).metatable) {
+            return ok(0)
+        }
+        let sv = udata_uv(u, 0)
+        let pv = udata_uv(u, 1)
+        if !val_is_string(sv) || !val_is_string(pv) {
+            return ok(0)
+        }
+        let posp = udata_data(u) as *mut i64
+        let lastp = ptr.offset(posp, 1)
+        let ss = val_str(sv)
+        let ps = val_str(pv)
+        let s = str_data(ss) as *const u8
+        let ls = (*ss).length
+        let p = str_data(ps) as *const u8
+        let lp = (*ps).length
+        let pos = *posp
+        if pos > ls as i64 {
+            return ok(0)
+        }
+        m := pat_new(s, ls, p, lp)
+        st := 0usize
+        let filter = sl_filter(&mut m, 0)
+        let e = sl_search(&mut m, pos as usize, 0, false, *lastp as isize, &filter, &mut st)
+        if e == PAT_ERROR {
+            return err(cx.error_msg(pat_error_message(&m)))
+        }
+        if e < 0 {
+            *posp = ls as i64 + 1
+            return ok(0)
+        }
+        *posp = e as i64
+        *lastp = e as i64
+        count := 0i32
+        sl_push_captures(cx, &m, st, e as usize, true, &mut count)?
+        return ok(count)
+    }
+}
+
+fn strlib_gmatch(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        s := sl_null()
+        ls := 0usize
+        sl_arg_str(cx, 1, &mut s, &mut ls)?
+        p := sl_null()
+        lp := 0usize
+        sl_arg_str(cx, 2, &mut p, &mut lp)?
+        ia := 0i64
+        sl_opt_int(cx, 3, 1, &mut ia)?
+        init := sl_start_pos(ia, ls) - 1
+        if init > ls as u64 {
+            init = ls as u64 + 1
+        }
+        cx.set_top(2)
+        let data = cx.new_userdata(SL_GM_SIZE, 2)? as *mut i64
+        *data = init as i64
+        *ptr.offset(data, 1) = -1
+        // The userdata is new (white): storing into it needs no barrier.
+        let u = val_gc(cx.idx2val(3)) as *mut Udata
+        set_obj(udata_uv(u, 0), cx.idx2val(1))
+        set_obj(udata_uv(u, 1), cx.idx2val(2))
+        cx.push_closure(sl_gmatch_step, 3)?
+        return ok(1)
+    }
+}
+
+// Append a replacement string, expanding %0-%9 and %%.
+fn sl_add_repl_string(cx: &mut Cx, b: &mut SlBuf, m: &PatMatcher, rp: *const u8, rl: usize, ws: usize, we: usize) -> void!Throw {
+    i := 0usize
+    for i < rl {
+        let q = sl_find_byte(rp, i, rl, b'%')
+        b.add_raw(sl_at(rp, i), q - i)?
+        if q >= rl {
+            return ok()
+        }
+        // The reference reads the terminating NUL after a final '%'.
+        let c = if q + 1 < rl {
+            sl_load(rp, q + 1)
+        } else {
+            0u8
+        }
+        if c == b'%' {
+            b.add_char(b'%')?
+        } else if c == b'0' {
+            b.add_raw(sl_at(m.src, ws), we - ws)?
+        } else if c >= b'1' && c <= b'9' {
+            let idx = (c - b'1') as usize
+            st := 0usize
+            sz := 0usize
+            let kind = pat_capture(m, idx, ws, we, &mut st, &mut sz)
+            if kind == PAT_KIND_STRING {
+                b.add_raw(sl_at(m.src, st), sz)?
+            } else if kind == PAT_KIND_POSITION {
+                b.add_int((st + 1) as i64)?
+            } else if kind == PAT_KIND_UNFINISHED {
+                return err(cx.error_msg("unfinished capture"))
+            } else {
+                return err(cx.error_msg(pat_capture_index_message(idx + 1)))
+            }
+        } else {
+            return err(cx.error_msg("invalid use of '%' in replacement string"))
+        }
+        i = q + 2
+    }
+    return ok()
+}
+
+// Append the replacement for the match [ws, we) given by a function or a
+// table (argument 3); sets *changed unless the result is false/nil.
+fn sl_add_repl_value(cx: &mut Cx, b: &mut SlBuf, m: &PatMatcher, ws: usize, we: usize, is_func: bool, changed: &mut bool) -> void!Throw {
+    if is_func {
+        cx.push_value(3)
+        count := 0i32
+        sl_push_captures(cx, m, ws, we, true, &mut count)?
+        cx.call(count, 1)?
+    } else {
+        sl_push_capture(cx, m, 0, ws, we)?
+        cx.get_table(3)?
+    }
+    unsafe {
+        let v = cx.idx2val(-1)
+        if val_is_falsy(v) {
+            cx.pop(1)
+            return b.add_raw(sl_at(m.src, ws), we - ws)
+        }
+        let t = (*v).tag
+        if t == TAG_SHORTSTR || t == TAG_LONGSTR {
+            let s = val_str(v)
+            b.add_raw(str_data(s) as *const u8, (*s).length)?
+        } else if t == TAG_INT {
+            b.add_int(val_int(v))?
+        } else if t == TAG_FLOAT {
+            b.add_float(val_float(v))?
+        } else {
+            let tn = cx.type_name(cx.type_of(-1))
+            eb := Buffer.new(cx)
+            eb.add_str("invalid replacement value (a ")?
+            eb.add_str(tn)?
+            eb.add_str(")")?
+            return err(cx.error_buffer(&mut eb))
+        }
+        cx.pop(1)
+        *changed = true
+        return ok()
+    }
+}
+
+fn strlib_gsub(cx: &mut Cx) -> i32!Throw {
+    src := sl_null()
+    srcl := 0usize
+    sl_arg_str(cx, 1, &mut src, &mut srcl)?
+    p := sl_null()
+    lp := 0usize
+    sl_arg_str(cx, 2, &mut p, &mut lp)?
+    let tr = cx.type_of(3)
+    max_s := 0i64
+    sl_opt_int(cx, 4, srcl as i64 + 1, &mut max_s)?
+    if !(tr == TNUMBER || tr == TSTRING || tr == TFUNCTION || tr == TTABLE) {
+        return err(cx.type_error(3, "string/function/table"))
+    }
+    rp := sl_null()
+    rl := 0usize
+    let is_string = tr == TNUMBER || tr == TSTRING
+    plain_repl := false
+    if is_string {
+        sl_arg_str(cx, 3, &mut rp, &mut rl)?
+        plain_repl = sl_find_byte(rp, 0, rl, b'%') >= rl
+    }
+    let anchor = pat_anchor_offset(p, lp)
+    m := pat_new(src, srcl, p, lp)
+    let filter = sl_filter(&mut m, anchor)
+    stk := mem.uninit::<[1024]u8>()
+    b := SlBuf.new(cx.L, unsafe {
+        mem.uninit_as_mut_ptr(&mut stk) as *mut u8
+    }, 1024)
+    pos := 0usize
+    last := -1isize
+    n := 0i64
+    changed := false
+    for n < max_s {
+        st := 0usize
+        let e = sl_search(&mut m, pos, anchor, anchor == 1, last, &filter, &mut st)
+        if e == PAT_ERROR {
+            return err(cx.error_msg(pat_error_message(&m)))
+        }
+        if e < 0 {
+            break
+        }
+        let eu = e as usize
+        b.add_raw(sl_at(src, pos), st - pos)?
+        n += 1
+        if plain_repl {
+            b.add_raw(rp, rl)?
+            changed = true
+        } else if is_string {
+            sl_add_repl_string(cx, &mut b, &m, rp, rl, st, eu)?
+            changed = true
+        } else {
+            sl_add_repl_value(cx, &mut b, &m, st, eu, tr == TFUNCTION, &mut changed)?
+        }
+        pos = eu
+        last = e
+        if anchor == 1 {
+            break
+        }
+    }
+    if !changed {
+        cx.push_value(1)
+    } else {
+        b.add_raw(sl_at(src, pos), srcl - pos)?
+        b.push(cx)?
+    }
+    cx.push_integer(n)
+    return ok(2)
+}
+
+// --- Library ------------------------------------------------------------------
+
+pub fn open_string(cx: &mut Cx) -> i32!Throw {
+    let funcs = [
+        ("byte", strlib_byte),
+        ("char", strlib_char),
+        ("dump", strlib_dump),
+        ("find", strlib_find),
+        ("gmatch", strlib_gmatch),
+        ("gsub", strlib_gsub),
+        ("len", strlib_len),
+        ("lower", strlib_lower),
+        ("match", strlib_match),
+        ("rep", strlib_rep),
+        ("reverse", strlib_reverse),
+        ("sub", strlib_sub),
+        ("upper", strlib_upper),
+        ("pack", strlib_pack),
+        ("packsize", strlib_packsize),
+        ("unpack", strlib_unpack),
+    ]
+    cx.new_lib(&funcs)?
+    // format keeps the interned "__tostring" as an upvalue for its fast path.
+    cx.push_str("__tostring")?
+    cx.push_closure(strlib_format, 1)?
+    cx.set_field(-2, "format")?
+    // The string metatable: __index = string plus the arithmetic coercion
+    // metamethods (strings convert for arithmetic through these).
+    cx.create_table(0, 9)?
+    set_string_arith_metamethods(cx)?
+    cx.push_value(-2)
+    cx.set_field(-2, "__index")?
+    cx.push_str("")?
+    cx.push_value(-2)
+    cx.set_metatable(-2)
+    cx.pop(2)
+    return ok(1)
+}
+
+fn sl_null() -> *const u8 {
+    return unsafe {
+        0 as *const u8
+    }
+}
+
+fn sl_null_mut() -> *mut u8 {
+    return unsafe {
+        0 as *mut u8
+    }
+}

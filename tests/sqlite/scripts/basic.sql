@@ -1,0 +1,15 @@
+create table t(a integer primary key, b text, c real);
+insert into t(b, c) values ('one', 1.5);
+insert into t(b, c) values ('two', 2.25);
+insert into t values (10, 'ten', 10);
+select * from t;
+select a, b from t where a > 1;
+select count(*), sum(c), avg(c), min(b), max(b) from t;
+select b from t order by b desc;
+select b, length(b) from t order by length(b), b;
+update t set c = c * 2 where a = 1;
+select * from t;
+delete from t where b = 'two';
+select * from t;
+select 1 + 2, 'a' || 'b', 7 / 2, 7.0 / 2, 7 % 3, -5 / 2;
+select null, typeof(null), typeof(1), typeof(1.5), typeof('x'), typeof(x'01');

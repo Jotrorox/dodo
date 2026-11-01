@@ -245,7 +245,41 @@ if let some(drawable) = layer.next_drawable() {
 ```
 
 `attach_to_view` makes the layer the backing layer of an AppKit `NSView`.
-[std/window](window.md) draws with the CPU and does not yet hand out its view.
+
+### Presenting to a window
+
+A [std/window](window.md#drawing-with-the-gpu) window opened with
+`window.Options.gpu()` gives its view a `CAMetalLayer` through
+`win.metal_layer()`. The view keeps the layer; wrap a reference of your own
+and render into its drawables:
+
+```dodo
+app := window.App.new()?
+win := app.open(window.Options.gpu("Metal", 480, 320))?
+address := win.metal_layer()?
+// A second reference to the layer, released when `layer` is dropped.
+object := match unsafe {
+    objc.Object.retain(address as objc.Id)
+}
+{
+    some(object) => object,
+    none => {
+        return err(Failure.NoLayer)
+    }
+}
+layer := unsafe {
+    metal.MetalLayer.from_object(object)
+}
+layer.set_device(&device)
+layer.set_pixel_format(metal.PIXEL_FORMAT_BGRA8_UNORM)
+```
+
+`std/window` keeps the layer's drawable size at the window's size in pixels
+and its contents scale at the display's, so a frame needs no sizing of its
+own: take `next_drawable()` on each `Event.Frame` that `win.request_frame()`
+asked for, render into its texture and `present_drawable` it.
+[`examples/metal_window.dodo`](https://github.com/Jotrorox/dodo/blob/main/examples/metal_window.dodo)
+draws a spinning triangle this way.
 
 ## Extending the bindings
 

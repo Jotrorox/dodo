@@ -1,0 +1,734 @@
+package sqlite
+
+import "std/db"
+
+// In-memory catalog of sqlite_schema. Objects are fixed records growing up
+// from schema_off; strings and column arrays grow down from the end.
+
+const OBJ_BYTES: usize = 64
+const COL_BYTES: usize = 32
+
+const O_TYPE: usize = 0
+const O_FLAGS: usize = 1
+const O_NCOL: usize = 2
+const O_ROOT: usize = 4
+const O_NAME: usize = 8
+const O_NAMEL: usize = 12
+const O_TBL: usize = 16
+const O_TBLL: usize = 20
+const O_SQL: usize = 24
+const O_SQLL: usize = 28
+const O_COLS: usize = 32
+const O_TABLE: usize = 36
+const O_ROWID: usize = 40
+const O_ROWNO: usize = 44
+const O_ONCONF: usize = 48
+const O_NPK: usize = 49
+
+const OT_TABLE: u8 = 1
+const OT_INDEX: u8 = 2
+const OT_VIEW: u8 = 3
+const OT_TRIGGER: u8 = 4
+
+const OF_UNIQUE: u8 = 1
+const OF_AUTO: u8 = 2
+const OF_AUTOINC: u8 = 4
+const OF_UNSUPPORTED: u8 = 8
+const OF_PK: u8 = 16
+const OF_HAS_TRIGGER: u8 = 32
+const OF_UNSUPPORTED_INDEX: u8 = 64
+
+// Column record.
+const K_NAME: usize = 0
+const K_NAMEL: usize = 4
+const K_AFF: usize = 8
+const K_FLAGS: usize = 9
+const K_COLL: usize = 10
+const K_HASDFLT: usize = 11
+const K_DFLT: usize = 12
+const K_DFLTL: usize = 16
+const K_TYPE: usize = 20
+const K_TYPEL: usize = 24
+// Index column record: table column (0xffffffff = rowid), desc, coll.
+const K_COL: usize = 0
+const K_DESC: usize = 8
+
+const NO_COL: usize = 4294967295
+
+// Statement-local objects (FROM subqueries, views) are records in the
+// statement pool, encoded as LOCAL_OBJ + workspace offset.
+const LOCAL_OBJ: usize = 2147483648
+
+fn obj(e: &Engine, i: usize) -> usize {
+    if i >= LOCAL_OBJ {
+        return i - LOCAL_OBJ
+    }
+    e.schema_off + i * OBJ_BYTES
+}
+
+fn obj_type(e: &Engine, i: usize) -> u8 {
+    e.ws[obj(e, i) + O_TYPE]
+}
+
+fn obj_flags(e: &Engine, i: usize) -> u8 {
+    e.ws[obj(e, i) + O_FLAGS]
+}
+
+fn obj_ncol(e: &Engine, i: usize) -> usize {
+    ld16(e.ws, obj(e, i) + O_NCOL)
+}
+
+fn obj_root(e: &Engine, i: usize) -> u32 {
+    ld32(e.ws, obj(e, i) + O_ROOT)
+}
+
+fn obj_u(e: &Engine, i: usize, field: usize) -> usize {
+    ldu(e.ws, obj(e, i) + field)
+}
+
+fn col_rec(e: &Engine, i: usize, c: usize) -> usize {
+    obj_u(e, i, O_COLS) + c * COL_BYTES
+}
+
+fn rowid_col(e: &Engine, t: usize) -> usize {
+    obj_u(e, t, O_ROWID)
+}
+
+fn col_aff(e: &Engine, t: usize, c: usize) -> u8 {
+    e.ws[col_rec(e, t, c) + K_AFF]
+}
+
+fn col_coll(e: &Engine, t: usize, c: usize) -> u8 {
+    e.ws[col_rec(e, t, c) + K_COLL]
+}
+
+fn col_flags(e: &Engine, t: usize, c: usize) -> usize {
+    e.ws[col_rec(e, t, c) + K_FLAGS] as usize
+}
+
+fn idx_col(e: &Engine, x: usize, k: usize) -> usize {
+    ldu(e.ws, col_rec(e, x, k) + K_COL)
+}
+
+fn schema_alloc(e: &mut Engine, len: usize) -> usize!db.Error {
+    lo := e.schema_off + e.schema_objs * OBJ_BYTES
+    if e.schema_pool < lo + len + OBJ_BYTES {
+        return err(full(e, "schema (too many tables or columns)"))
+    }
+    e.schema_pool -= len
+    ok(e.schema_pool)
+}
+
+fn schema_copy(e: &mut Engine, src: usize, len: usize) -> usize!db.Error {
+    dst := schema_alloc(e, len)?
+    move_bytes(e.ws, src, dst, len)
+    ok(dst)
+}
+
+fn new_obj(e: &mut Engine) -> usize!db.Error {
+    lo := e.schema_off + (e.schema_objs + 1) * OBJ_BYTES
+    if lo > e.schema_pool {
+        return err(full(e, "schema (too many objects)"))
+    }
+    i := e.schema_objs
+    e.schema_objs += 1
+    let obj2 = obj(e, i)
+    zero_bytes(e.ws, obj2, OBJ_BYTES)
+    ok(i)
+}
+
+fn find_obj(e: &Engine, kind: u8, name: usize, len: usize) -> usize {
+    for i in 0usize..e.schema_objs {
+        let name2 = obj_u(e, i, O_NAME)
+        let name_len = obj_u(e, i, O_NAMEL)
+        if (kind == 0 || obj_type(e, i) == kind) && names_eq(e, name2, name_len, name, len) {
+            return i
+        }
+    }
+    NO_COL
+}
+
+fn find_column(e: &Engine, t: usize, name: usize, len: usize) -> usize {
+    n := obj_ncol(e, t)
+    for c in 0usize..n {
+        r := col_rec(e, t, c)
+        let name2 = ldu(e.ws, r + K_NAME)
+        let name_len = ldu(e.ws, r + K_NAMEL)
+        if names_eq(e, name2, name_len, name, len) {
+            return c
+        }
+    }
+    NO_COL
+}
+
+fn is_rowid_name(e: &Engine, o: usize, l: usize) -> bool {
+    name_is(e, o, l, "rowid") || name_is(e, o, l, "oid") || name_is(e, o, l, "_rowid_")
+}
+
+// ---------------------------------------------------------------------------
+// Statement slot used to parse schema SQL.
+
+fn begin_parse(e: &mut Engine, slot: usize, src: usize, len: usize) {
+    base := e.stmt_off + slot * e.stmt_slot
+    e.sb = base
+    e.src = src
+    e.src_end = src + len
+    e.pos = src
+    e.ts = src
+    e.tl = 0
+    e.last_end = src
+    e.node_off = base + 512
+    e.node_n = 0
+    e.pool_lo = base + e.stmt_slot
+    e.nparam = 0
+    e.named_n = 0
+    e.named_off = base + 128
+    e.depth = 0
+    e.cte_off = 0
+    e.cte_n = 0
+    next_token(e)
+}
+
+fn schema_slot(e: &Engine) -> usize {
+    e.stmt_slots
+}
+
+// ---------------------------------------------------------------------------
+// Loading
+
+fn load_schema(e: &mut Engine) -> void!db.Error {
+    if e.schema_loaded {
+        return ok()
+    }
+    e.schema_objs = 0
+    e.schema_pool = e.schema_off + e.schema_cap
+    e.schema_gen += 1
+    if e.db_pages == 0 {
+        e.schema_loaded = true
+        return ok()
+    }
+    format := hdr_get(e, 44)?
+    if format > 4 {
+        return err(fail(e, SQLITE_ERROR, "unsupported file format"))
+    }
+    e.schema_format = if format == 0 {
+        4u32
+    } else {
+        format
+    }
+    // Pass 1: objects.
+    c := NCURSORS - 1
+    cur_open(e, c, 1, false)
+    mark := e.arena_top
+    more := cur_first(e, c)?
+    for more {
+        let (p, n) = cur_payload(e, c)?
+        rowno := cur_rowid(e, c)
+        i := new_obj(e)?
+        record_column(e, p, n, 0, R_TMP)?
+        kind := 0u8
+        if rtype(e, R_TMP) == T_TEXT {
+            to := roff(e, R_TMP)
+            tl := rlen(e, R_TMP)
+            if name_is(e, to, tl, "table") {
+                kind = OT_TABLE
+            } else if name_is(e, to, tl, "index") {
+                kind = OT_INDEX
+            } else if name_is(e, to, tl, "view") {
+                kind = OT_VIEW
+            } else if name_is(e, to, tl, "trigger") {
+                kind = OT_TRIGGER
+            }
+        }
+        o := obj(e, i)
+        e.ws[o + O_TYPE] = kind
+        stu(e.ws, o + O_ROWNO, rowno as usize)
+        record_column(e, p, n, 1, R_TMP)?
+        if rtype(e, R_TMP) == T_TEXT {
+            let src = roff(e, R_TMP)
+            let len = rlen(e, R_TMP)
+            d := schema_copy(e, src, len)?
+            o2 := obj(e, i)
+            stu(e.ws, o2 + O_NAME, d)
+            stu(e.ws, o2 + O_NAMEL, len)
+        }
+        record_column(e, p, n, 2, R_TMP)?
+        if rtype(e, R_TMP) == T_TEXT {
+            let src = roff(e, R_TMP)
+            let len = rlen(e, R_TMP)
+            d := schema_copy(e, src, len)?
+            o2 := obj(e, i)
+            stu(e.ws, o2 + O_TBL, d)
+            stu(e.ws, o2 + O_TBLL, len)
+        }
+        record_column(e, p, n, 3, R_TMP)?
+        root := if rtype(e, R_TMP) == T_INT {
+            rint(e, R_TMP)
+        } else {
+            0i64
+        }
+        o3 := obj(e, i)
+        st32(e.ws, o3 + O_ROOT, if root > 0 && root < 4294967296 {
+            root as u32
+        } else {
+            0u32
+        })
+        record_column(e, p, n, 4, R_TMP)?
+        if rtype(e, R_TMP) == T_TEXT {
+            let src = roff(e, R_TMP)
+            let len = rlen(e, R_TMP)
+            d := schema_copy(e, src, len)?
+            o2 := obj(e, i)
+            stu(e.ws, o2 + O_SQL, d)
+            stu(e.ws, o2 + O_SQLL, len)
+        }
+        arena_reset(e, mark)
+        more = cur_next(e, c)?
+    }
+    arena_reset(e, mark)
+    // Pass 2: tables, then indexes (which refer to their tables).
+    for i in 0usize..e.schema_objs {
+        if obj_type(e, i) == OT_TABLE {
+            match load_table(e, i) {
+                ok() => {},
+                err(_) => {
+                    o := obj(e, i)
+                    e.ws[o + O_FLAGS] = e.ws[o + O_FLAGS] | OF_UNSUPPORTED
+                },
+            }
+        }
+    }
+    for i in 0usize..e.schema_objs {
+        k := obj_type(e, i)
+        if k == OT_INDEX || k == OT_TRIGGER {
+            let tbl = obj_u(e, i, O_TBL)
+            let tbl_len = obj_u(e, i, O_TBLL)
+            t := find_obj(e, OT_TABLE, tbl, tbl_len)
+            o := obj(e, i)
+            stu(e.ws, o + O_TABLE, t)
+            if t == NO_COL {
+                continue
+            }
+            if k == OT_TRIGGER {
+                ot := obj(e, t)
+                e.ws[ot + O_FLAGS] = e.ws[ot + O_FLAGS] | OF_HAS_TRIGGER
+                continue
+            }
+            match load_index(e, i, t) {
+                ok() => {},
+                err(_) => {
+                    o2 := obj(e, i)
+                    e.ws[o2 + O_FLAGS] = e.ws[o2 + O_FLAGS] | OF_UNSUPPORTED
+                    ot := obj(e, t)
+                    e.ws[ot + O_FLAGS] = e.ws[ot + O_FLAGS] | OF_UNSUPPORTED_INDEX
+                },
+            }
+        }
+    }
+    e.msg_len = 0
+    e.schema_loaded = true
+    ok()
+}
+
+// Builds the column array of table object `i` from its CREATE TABLE text.
+fn load_table(e: &mut Engine, i: usize) -> void!db.Error {
+    sql := obj_u(e, i, O_SQL)
+    sqll := obj_u(e, i, O_SQLL)
+    if sqll == 0 {
+        // sqlite_schema itself is never listed; tables always have SQL.
+        return err(corrupt(e))
+    }
+    let schema_slot2 = schema_slot(e)
+    begin_parse(e, schema_slot2, sql, sqll)
+    s := parse_statement(e)?
+    if nkind(e, s) != S_CREATE_TABLE {
+        return err(corrupt(e))
+    }
+    table_from_ast(e, i, s)
+}
+
+// Fills the catalog record of table `i` from a CREATE TABLE parse tree.
+fn table_from_ast(e: &mut Engine, i: usize, s: usize) -> void!db.Error {
+    let s_c = nc(e, s)
+    ncol := list_len(e, s_c)
+    if ncol > 2000 {
+        return err(fail(e, SQLITE_ERROR, "too many columns"))
+    }
+    cols := schema_alloc(e, ncol * COL_BYTES)?
+    zero_bytes(e.ws, cols, ncol * COL_BYTES)
+    o := obj(e, i)
+    st16(e.ws, o + O_NCOL, ncol)
+    stu(e.ws, o + O_COLS, cols)
+    stu(e.ws, o + O_ROWID, NO_COL)
+    cd := nc(e, s)
+    k := 0usize
+    npk := 0usize
+    for cd != 0 {
+        r := cols + k * COL_BYTES
+        let name_src = na(e, cd)
+        let name_len = nb(e, cd)
+        // Duplicate column names are an error.
+        for j in 0usize..k {
+            rj := cols + j * COL_BYTES
+            let name2 = ldu(e.ws, rj + K_NAME)
+            let name_len2 = ldu(e.ws, rj + K_NAMEL)
+            if names_eq(e, name2, name_len2, name_src, name_len) {
+                e.msg_len = 0
+                msg_add(e, "duplicate column name: ")
+                msg_add_ws(e, name_src, name_len)
+                return err(make_error(e, SQLITE_ERROR))
+            }
+        }
+        d := schema_copy(e, name_src, name_len)?
+        stu(e.ws, r + K_NAME, d)
+        stu(e.ws, r + K_NAMEL, name_len)
+        let ts = nc(e, cd)
+        let tl = ndd(e, cd)
+        aff := type_affinity(e, ts, tl)
+        e.ws[r + K_AFF] = aff
+        if tl > 0 {
+            td := schema_copy(e, ts, tl)?
+            stu(e.ws, r + K_TYPE, td)
+            stu(e.ws, r + K_TYPEL, tl)
+        }
+        flags := nflags(e, cd)
+        e.ws[r + K_FLAGS] = (flags & 255) as u8
+        coll := nff(e, cd)
+        e.ws[r + K_COLL] = if coll > 0 {
+            (coll - 1) as u8
+        } else {
+            COLL_BINARY
+        }
+        if ne_(e, cd) != 0 {
+            span := nx(e, cd)
+            let start = (span >> 32) as usize
+            let len = (span & 0xffffffffu64) as usize
+            dd := schema_copy(e, start, len)?
+            e.ws[r + K_HASDFLT] = 1
+            stu(e.ws, r + K_DFLT, dd)
+            stu(e.ws, r + K_DFLTL, len)
+        }
+        if (flags & CF_PK) != 0 {
+            npk += 1
+            if (flags & CF_AUTOINC) != 0 {
+                e.ws[o + O_FLAGS] = e.ws[o + O_FLAGS] | OF_AUTOINC
+            }
+        }
+        k += 1
+        cd = nnext(e, cd)
+    }
+    // Table constraints: PRIMARY KEY(...) marks its columns.
+    tc := ndd(e, s)
+    pk_list := 0usize
+    for tc != 0 {
+        if nop(e, tc) == 1 {
+            if npk > 0 || pk_list != 0 {
+                e.msg_len = 0
+                msg_add(e, "table has more than one primary key")
+                return err(make_error(e, SQLITE_ERROR))
+            }
+            pk_list = na(e, tc)
+            item := pk_list
+            for item != 0 {
+                id := na(e, item)
+                let id_a = na(e, id)
+                let id_b = nb(e, id)
+                c := find_column(e, i, id_a, id_b)
+                if c == NO_COL {
+                    e.msg_len = 0
+                    msg_add(e, "no such column: ")
+                    let id_a2 = na(e, id)
+                    let id_b2 = nb(e, id)
+                    msg_add_ws(e, id_a2, id_b2)
+                    return err(make_error(e, SQLITE_ERROR))
+                }
+                rc := col_rec(e, i, c)
+                e.ws[rc + K_FLAGS] = e.ws[rc + K_FLAGS] | (CF_PK as u8)
+                if (nflags(e, item) & 8) != 0 {
+                    e.ws[o + O_FLAGS] = e.ws[o + O_FLAGS] | OF_AUTOINC
+                }
+                item = nnext(e, item)
+            }
+        }
+        tc = nnext(e, tc)
+    }
+    // Rowid alias: a single INTEGER PRIMARY KEY column ("INTEGER PRIMARY
+    // KEY DESC" as a column constraint is, historically, not an alias).
+    pkc := NO_COL
+    pkcount := 0usize
+    for c in 0usize..ncol {
+        if (col_flags(e, i, c) & CF_PK) != 0 {
+            pkc = c
+            pkcount += 1
+        }
+    }
+    if pkcount == 1 {
+        r := col_rec(e, i, pkc)
+        let type_value = ldu(e.ws, r + K_TYPE)
+        let type_len = ldu(e.ws, r + K_TYPEL)
+        is_int := name_is(e, type_value, type_len, "INTEGER")
+        desc_col := pk_list == 0 && (col_flags(e, i, pkc) & CF_PKDESC) != 0
+        if is_int && !desc_col {
+            stu(e.ws, o + O_ROWID, pkc)
+        }
+    }
+    e.ws[o + O_NPK] = pkcount as u8
+    ok()
+}
+
+// Index object `x` on table `t`.
+fn load_index(e: &mut Engine, x: usize, t: usize) -> void!db.Error {
+    sql := obj_u(e, x, O_SQL)
+    sqll := obj_u(e, x, O_SQLL)
+    if sqll == 0 {
+        return load_autoindex(e, x, t)
+    }
+    let schema_slot2 = schema_slot(e)
+    begin_parse(e, schema_slot2, sql, sqll)
+    s := parse_statement(e)?
+    if nkind(e, s) != S_CREATE_INDEX {
+        return err(corrupt(e))
+    }
+    index_from_ast(e, x, t, s)
+}
+
+fn index_from_ast(e: &mut Engine, x: usize, t: usize, s: usize) -> void!db.Error {
+    let s_e = ne_(e, s)
+    n := list_len(e, s_e)
+    cols := schema_alloc(e, n * COL_BYTES)?
+    zero_bytes(e.ws, cols, n * COL_BYTES)
+    o := obj(e, x)
+    st16(e.ws, o + O_NCOL, n)
+    stu(e.ws, o + O_COLS, cols)
+    if (nflags(e, s) & 2) != 0 {
+        e.ws[o + O_FLAGS] = e.ws[o + O_FLAGS] | OF_UNIQUE
+    }
+    item := ne_(e, s)
+    k := 0usize
+    for item != 0 {
+        ex := na(e, item)
+        if nkind(e, ex) != N_ID || nc(e, ex) != 0 {
+            return err(fail(e, SQLITE_ERROR, "indexes on expressions are not supported"))
+        }
+        let ex_a = na(e, ex)
+        let ex_b = nb(e, ex)
+        c := find_column(e, t, ex_a, ex_b)
+        if c == NO_COL {
+            let ex_a2 = na(e, ex)
+            let ex_b2 = nb(e, ex)
+            if is_rowid_name(e, ex_a2, ex_b2) {
+                c = NO_COL
+            } else {
+                e.msg_len = 0
+                msg_add(e, "no such column: ")
+                let ex_a3 = na(e, ex)
+                let ex_b3 = nb(e, ex)
+                msg_add_ws(e, ex_a3, ex_b3)
+                return err(make_error(e, SQLITE_ERROR))
+            }
+        }
+        r := cols + k * COL_BYTES
+        stu(e.ws, r + K_COL, c)
+        let value = if (nflags(e, item) & 1) != 0 {
+            1u8
+        } else {
+            0u8
+        }
+        e.ws[r + K_DESC] = value
+        coll := nb(e, item)
+        if coll > 0 {
+            e.ws[r + K_COLL] = (coll - 1) as u8
+        } else if c != NO_COL {
+            let col_coll2 = col_coll(e, t, c)
+            e.ws[r + K_COLL] = col_coll2
+        }
+        k += 1
+        item = nnext(e, item)
+    }
+    ok()
+}
+
+// Autoindex N of table t: the N-th PRIMARY KEY/UNIQUE constraint in
+// declaration order (column constraints, then table constraints), skipping
+// an INTEGER PRIMARY KEY and constraints identical to an earlier one.
+fn load_autoindex(e: &mut Engine, x: usize, t: usize) -> void!db.Error {
+    name := obj_u(e, x, O_NAME)
+    namel := obj_u(e, x, O_NAMEL)
+    num := 0usize
+    p := namel
+    mul := 1usize
+    for p > 0 && is_digit(e.ws[name + p - 1]) {
+        num += ((e.ws[name + p - 1] - 48) as usize) * mul
+        mul *= 10
+        p -= 1
+    }
+    if num == 0 {
+        return err(corrupt(e))
+    }
+    e.auto_target = x
+    sql := obj_u(e, t, O_SQL)
+    sqll := obj_u(e, t, O_SQLL)
+    let schema_slot2 = schema_slot(e)
+    begin_parse(e, schema_slot2, sql, sqll)
+    s := parse_statement(e)?
+    found := autoindex_constraint(e, t, s, num)?
+    if found == 0 {
+        return err(corrupt(e))
+    }
+    ok()
+}
+
+// Walks the constraints of CREATE TABLE `s`; when the `num`-th autoindex
+// constraint is reached, writes its columns into object x (found by name
+// in the caller) and returns 1. With num == 0 nothing is written and the
+// number of autoindexes is returned.
+fn autoindex_constraint(e: &mut Engine, t: usize, s: usize, num: usize) -> usize!db.Error {
+    count := 0usize
+    ipk := rowid_col(e, t)
+    // Column constraints.
+    cd := nc(e, s)
+    k := 0usize
+    for cd != 0 {
+        flags := nflags(e, cd)
+        if (flags & CF_PK) != 0 && k != ipk {
+            count += 1
+            if count == num {
+                write_auto_cols1(e, t, k, true)?
+                return ok(1)
+            }
+        }
+        if (flags & CF_UNIQUE) != 0 {
+            if !auto_duplicate1(e, t, s, k, count) {
+                count += 1
+                if count == num {
+                    write_auto_cols1(e, t, k, false)?
+                    return ok(1)
+                }
+            }
+        }
+        k += 1
+        cd = nnext(e, cd)
+    }
+    tc := ndd(e, s)
+    for tc != 0 {
+        op := nop(e, tc)
+        if op == 1 || op == 2 {
+            let tc_a = na(e, tc)
+            single := nnext(e, tc_a) == 0
+            skip := false
+            if op == 1 && single && ipk != NO_COL {
+                let tc_a2 = na(e, tc)
+                id := na(e, tc_a2)
+                let id_a = na(e, id)
+                let id_b = nb(e, id)
+                if find_column(e, t, id_a, id_b) == ipk {
+                    skip = true
+                }
+            }
+            if !skip {
+                count += 1
+                if count == num {
+                    write_auto_list(e, t, tc, op == 1)?
+                    return ok(1)
+                }
+            }
+        }
+        tc = nnext(e, tc)
+    }
+    if num == 0 {
+        return ok(count)
+    }
+    ok(0)
+}
+
+fn auto_duplicate1(e: &Engine, t: usize, s: usize, k: usize, count: usize) -> bool {
+    // A column UNIQUE on the column that is also the (non-integer) column
+    // PRIMARY KEY duplicates it.
+    flags := col_flags(e, t, k)
+    (flags & CF_PK) != 0 && rowid_col(e, t) != k
+}
+
+fn current_index_obj(e: &Engine) -> usize {
+    e.auto_target
+}
+
+fn write_auto_cols1(e: &mut Engine, t: usize, c: usize, pk: bool) -> void!db.Error {
+    x := current_index_obj(e)
+    cols := schema_alloc(e, COL_BYTES)?
+    zero_bytes(e.ws, cols, COL_BYTES)
+    o := obj(e, x)
+    st16(e.ws, o + O_NCOL, 1)
+    stu(e.ws, o + O_COLS, cols)
+    e.ws[o + O_FLAGS] = e.ws[o + O_FLAGS] | OF_UNIQUE | OF_AUTO | (if pk {
+        OF_PK
+    } else {
+        0u8
+    })
+    stu(e.ws, cols + K_COL, c)
+    let col_coll2 = col_coll(e, t, c)
+    e.ws[cols + K_COLL] = col_coll2
+    if pk && (col_flags(e, t, c) & CF_PKDESC) != 0 {
+        e.ws[cols + K_DESC] = 1
+    }
+    ok()
+}
+
+fn write_auto_list(e: &mut Engine, t: usize, tc: usize, pk: bool) -> void!db.Error {
+    x := current_index_obj(e)
+    let tc_a = na(e, tc)
+    n := list_len(e, tc_a)
+    cols := schema_alloc(e, n * COL_BYTES)?
+    zero_bytes(e.ws, cols, n * COL_BYTES)
+    o := obj(e, x)
+    st16(e.ws, o + O_NCOL, n)
+    stu(e.ws, o + O_COLS, cols)
+    e.ws[o + O_FLAGS] = e.ws[o + O_FLAGS] | OF_UNIQUE | OF_AUTO | (if pk {
+        OF_PK
+    } else {
+        0u8
+    })
+    item := na(e, tc)
+    k := 0usize
+    for item != 0 {
+        id := na(e, item)
+        let id_a = na(e, id)
+        let id_b = nb(e, id)
+        c := find_column(e, t, id_a, id_b)
+        if c == NO_COL {
+            return err(corrupt(e))
+        }
+        r := cols + k * COL_BYTES
+        stu(e.ws, r + K_COL, c)
+        coll := nb(e, item)
+        let value = if coll > 0 {
+            (coll - 1) as u8
+        } else {
+            col_coll(e, t, c)
+        }
+        e.ws[r + K_COLL] = value
+        let value2 = if (nflags(e, item) & 1) != 0 {
+            1u8
+        } else {
+            0u8
+        }
+        e.ws[r + K_DESC] = value2
+        k += 1
+        item = nnext(e, item)
+    }
+    ok()
+}
+
+// Indexes of table t, in schema order.
+fn next_index_of(e: &Engine, t: usize, after: usize) -> usize {
+    start := if after == NO_COL {
+        0usize
+    } else {
+        after + 1
+    }
+    for i in start..e.schema_objs {
+        if obj_type(e, i) == OT_INDEX && obj_u(e, i, O_TABLE) == t && (obj_flags(e, i) & OF_UNSUPPORTED) == 0 {
+            return i
+        }
+    }
+    NO_COL
+}

@@ -1,0 +1,1825 @@
+package sqlite
+
+import "std/db"
+import "std/float_decimal"
+
+// Built-in scalar and aggregate functions.
+
+const F_ABS: usize = 1
+const F_CHANGES: usize = 2
+const F_CHAR: usize = 3
+const F_COALESCE: usize = 4
+const F_GLOB: usize = 5
+const F_HEX: usize = 6
+const F_IFNULL: usize = 7
+const F_IIF: usize = 8
+const F_INSTR: usize = 9
+const F_LAST_ROWID: usize = 10
+const F_LENGTH: usize = 11
+const F_LIKE: usize = 12
+const F_LOWER: usize = 13
+const F_LTRIM: usize = 14
+const F_MAX: usize = 15
+const F_MIN: usize = 16
+const F_NULLIF: usize = 17
+const F_PRINTF: usize = 18
+const F_QUOTE: usize = 19
+const F_RANDOM: usize = 20
+const F_RANDOMBLOB: usize = 21
+const F_REPLACE: usize = 22
+const F_ROUND: usize = 23
+const F_RTRIM: usize = 24
+const F_SIGN: usize = 25
+const F_VERSION: usize = 26
+const F_SUBSTR: usize = 27
+const F_TOTAL_CHANGES: usize = 28
+const F_TRIM: usize = 29
+const F_TYPEOF: usize = 30
+const F_UNHEX: usize = 31
+const F_UNICODE: usize = 32
+const F_UPPER: usize = 33
+const F_ZEROBLOB: usize = 34
+const F_CONCAT: usize = 35
+const F_CONCAT_WS: usize = 36
+const F_OCTET_LENGTH: usize = 37
+const F_LIKELY: usize = 38
+const F_DATE: usize = 40
+const F_TIME: usize = 41
+const F_DATETIME: usize = 42
+const F_JULIANDAY: usize = 43
+const F_STRFTIME: usize = 44
+const F_UNIXEPOCH: usize = 45
+const F_CURRENT_TIMESTAMP: usize = 46
+const F_CURRENT_DATE: usize = 47
+const F_CURRENT_TIME: usize = 48
+
+const A_COUNT: usize = 100
+const A_COUNT_STAR: usize = 101
+const A_SUM: usize = 102
+const A_TOTAL: usize = 103
+const A_AVG: usize = 104
+const A_MIN: usize = 105
+const A_MAX: usize = 106
+const A_GROUP_CONCAT: usize = 107
+
+pub const SQLITE_VERSION_TEXT: &str = "3.45.0"
+
+// Resolves a function name. Returns (id, min args, max args), id 0 if unknown.
+fn func_lookup(e: &Engine, o: usize, l: usize, nargs: usize, star: bool) -> (usize, usize, usize) {
+    if star {
+        if name_is(e, o, l, "count") {
+            return (A_COUNT_STAR, 0usize, 0usize)
+        }
+        return (0usize, 0usize, 0usize)
+    }
+    if name_is(e, o, l, "count") {
+        return (A_COUNT, 0usize, 1usize)
+    }
+    if name_is(e, o, l, "max") {
+        return (if nargs == 1 {
+            A_MAX
+        } else {
+            F_MAX
+        }, 1usize, 1000usize)
+    }
+    if name_is(e, o, l, "min") {
+        return (if nargs == 1 {
+            A_MIN
+        } else {
+            F_MIN
+        }, 1usize, 1000usize)
+    }
+    if name_is(e, o, l, "sum") {
+        return (A_SUM, 1usize, 1usize)
+    }
+    if name_is(e, o, l, "total") {
+        return (A_TOTAL, 1usize, 1usize)
+    }
+    if name_is(e, o, l, "avg") {
+        return (A_AVG, 1usize, 1usize)
+    }
+    if name_is(e, o, l, "group_concat") || name_is(e, o, l, "string_agg") {
+        return (A_GROUP_CONCAT, if name_is(e, o, l, "string_agg") {
+            2usize
+        } else {
+            1usize
+        }, 2usize)
+    }
+    if name_is(e, o, l, "abs") {
+        return (F_ABS, 1usize, 1usize)
+    }
+    if name_is(e, o, l, "changes") {
+        return (F_CHANGES, 0usize, 0usize)
+    }
+    if name_is(e, o, l, "char") {
+        return (F_CHAR, 0usize, 1000usize)
+    }
+    if name_is(e, o, l, "coalesce") {
+        return (F_COALESCE, 2usize, 1000usize)
+    }
+    if name_is(e, o, l, "glob") {
+        return (F_GLOB, 2usize, 2usize)
+    }
+    if name_is(e, o, l, "hex") {
+        return (F_HEX, 1usize, 1usize)
+    }
+    if name_is(e, o, l, "ifnull") {
+        return (F_IFNULL, 2usize, 2usize)
+    }
+    if name_is(e, o, l, "iif") || name_is(e, o, l, "if") {
+        return (F_IIF, 3usize, 3usize)
+    }
+    if name_is(e, o, l, "instr") {
+        return (F_INSTR, 2usize, 2usize)
+    }
+    if name_is(e, o, l, "last_insert_rowid") {
+        return (F_LAST_ROWID, 0usize, 0usize)
+    }
+    if name_is(e, o, l, "length") {
+        return (F_LENGTH, 1usize, 1usize)
+    }
+    if name_is(e, o, l, "like") {
+        return (F_LIKE, 2usize, 3usize)
+    }
+    if name_is(e, o, l, "lower") {
+        return (F_LOWER, 1usize, 1usize)
+    }
+    if name_is(e, o, l, "ltrim") {
+        return (F_LTRIM, 1usize, 2usize)
+    }
+    if name_is(e, o, l, "nullif") {
+        return (F_NULLIF, 2usize, 2usize)
+    }
+    if name_is(e, o, l, "printf") || name_is(e, o, l, "format") {
+        return (F_PRINTF, 1usize, 1000usize)
+    }
+    if name_is(e, o, l, "quote") {
+        return (F_QUOTE, 1usize, 1usize)
+    }
+    if name_is(e, o, l, "random") {
+        return (F_RANDOM, 0usize, 0usize)
+    }
+    if name_is(e, o, l, "randomblob") {
+        return (F_RANDOMBLOB, 1usize, 1usize)
+    }
+    if name_is(e, o, l, "replace") {
+        return (F_REPLACE, 3usize, 3usize)
+    }
+    if name_is(e, o, l, "round") {
+        return (F_ROUND, 1usize, 2usize)
+    }
+    if name_is(e, o, l, "rtrim") {
+        return (F_RTRIM, 1usize, 2usize)
+    }
+    if name_is(e, o, l, "sign") {
+        return (F_SIGN, 1usize, 1usize)
+    }
+    if name_is(e, o, l, "sqlite_version") {
+        return (F_VERSION, 0usize, 0usize)
+    }
+    if name_is(e, o, l, "substr") || name_is(e, o, l, "substring") {
+        return (F_SUBSTR, 2usize, 3usize)
+    }
+    if name_is(e, o, l, "total_changes") {
+        return (F_TOTAL_CHANGES, 0usize, 0usize)
+    }
+    if name_is(e, o, l, "trim") {
+        return (F_TRIM, 1usize, 2usize)
+    }
+    if name_is(e, o, l, "typeof") {
+        return (F_TYPEOF, 1usize, 1usize)
+    }
+    if name_is(e, o, l, "unhex") {
+        return (F_UNHEX, 1usize, 2usize)
+    }
+    if name_is(e, o, l, "unicode") {
+        return (F_UNICODE, 1usize, 1usize)
+    }
+    if name_is(e, o, l, "upper") {
+        return (F_UPPER, 1usize, 1usize)
+    }
+    if name_is(e, o, l, "zeroblob") {
+        return (F_ZEROBLOB, 1usize, 1usize)
+    }
+    if name_is(e, o, l, "concat") {
+        return (F_CONCAT, 1usize, 1000usize)
+    }
+    if name_is(e, o, l, "concat_ws") {
+        return (F_CONCAT_WS, 2usize, 1000usize)
+    }
+    if name_is(e, o, l, "octet_length") {
+        return (F_OCTET_LENGTH, 1usize, 1usize)
+    }
+    if name_is(e, o, l, "likely") || name_is(e, o, l, "unlikely") {
+        return (F_LIKELY, 1usize, 1usize)
+    }
+    if name_is(e, o, l, "likelihood") {
+        return (F_LIKELY, 2usize, 2usize)
+    }
+    if name_is(e, o, l, "date") {
+        return (F_DATE, 0usize, 1000usize)
+    }
+    if name_is(e, o, l, "time") {
+        return (F_TIME, 0usize, 1000usize)
+    }
+    if name_is(e, o, l, "datetime") {
+        return (F_DATETIME, 0usize, 1000usize)
+    }
+    if name_is(e, o, l, "julianday") {
+        return (F_JULIANDAY, 0usize, 1000usize)
+    }
+    if name_is(e, o, l, "strftime") {
+        return (F_STRFTIME, 1usize, 1000usize)
+    }
+    if name_is(e, o, l, "unixepoch") {
+        return (F_UNIXEPOCH, 0usize, 1000usize)
+    }
+    if name_is(e, o, l, "current_timestamp") {
+        return (F_CURRENT_TIMESTAMP, 0usize, 0usize)
+    }
+    if name_is(e, o, l, "current_date") {
+        return (F_CURRENT_DATE, 0usize, 0usize)
+    }
+    if name_is(e, o, l, "current_time") {
+        return (F_CURRENT_TIME, 0usize, 0usize)
+    }
+    (0usize, 0usize, 0usize)
+}
+
+fn is_aggregate_id(id: usize) -> bool {
+    id >= 100
+}
+
+// ---------------------------------------------------------------------------
+// Scalar functions
+
+fn eval_function(e: &mut Engine, n: usize, dst: usize) -> void!db.Error {
+    id := ndd(e, n)
+    // Lazily evaluated functions.
+    if id == F_COALESCE || id == F_IFNULL {
+        a := nc(e, n)
+        for a != 0 {
+            eval(e, a, dst)?
+            if rtype(e, dst) != T_NULL {
+                return ok()
+            }
+            a = nnext(e, a)
+        }
+        return ok()
+    }
+    if id == F_IIF {
+        a := nc(e, n)
+        if eval_truth(e, a)? == 1 {
+            let next = nnext(e, a)
+            return eval(e, next, dst)
+        }
+        let next2 = nnext(e, a)
+        let next3 = nnext(e, next2)
+        return eval(e, next3, dst)
+    }
+    if id == F_LIKELY {
+        let n_c = nc(e, n)
+        return eval(e, n_c, dst)
+    }
+    save := e.rtop
+    first := e.rtop
+    argc := 0usize
+    a := nc(e, n)
+    for a != 0 {
+        r := reg_push(e)?
+        eval(e, a, r)?
+        argc += 1
+        a = nnext(e, a)
+    }
+    res := scalar(e, id, first, argc, dst, n)
+    e.rtop = save
+    res
+}
+
+fn arg_text(e: &mut Engine, r: usize) -> void!db.Error {
+    to_text(e, r)
+}
+
+fn scalar(e: &mut Engine, id: usize, a: usize, argc: usize, dst: usize, n: usize) -> void!db.Error {
+    if id == F_ABS {
+        t := rtype(e, a)
+        if t == T_NULL {
+            set_null(e, dst)
+        } else if t == T_INT {
+            v := rint(e, a)
+            if v == -9223372036854775807 - 1 {
+                return err(fail(e, SQLITE_ERROR, "integer overflow"))
+            }
+            set_int(e, dst, if v < 0 {
+                -v
+            } else {
+                v
+            })
+        } else {
+            f := to_real(e, a)
+            set_real(e, dst, if f < 0.0 {
+                -f
+            } else {
+                f
+            })
+        }
+        return ok()
+    }
+    if id == F_CHANGES {
+        let value = e.changes as i64
+        set_int(e, dst, value)
+        return ok()
+    }
+    if id == F_TOTAL_CHANGES {
+        let value2 = e.total_changes as i64
+        set_int(e, dst, value2)
+        return ok()
+    }
+    if id == F_LAST_ROWID {
+        let last_rowid2 = e.last_rowid
+        set_int(e, dst, last_rowid2)
+        return ok()
+    }
+    if id == F_VERSION {
+        return set_text_str(e, dst, SQLITE_VERSION_TEXT)
+    }
+    if id == F_RANDOM {
+        v := next_random(e)
+        set_int(e, dst, u2i(v))
+        return ok()
+    }
+    if id == F_TYPEOF {
+        t := rtype(e, a)
+        s := if t == T_NULL {
+            "null"
+        } else if t == T_INT {
+            "integer"
+        } else if t == T_REAL {
+            "real"
+        } else if t == T_TEXT {
+            "text"
+        } else {
+            "blob"
+        }
+        return set_text_str(e, dst, s)
+    }
+    if id == F_MAX || id == F_MIN {
+        best := a
+        for i in 0usize..argc {
+            if rtype(e, a + i) == T_NULL {
+                set_null(e, dst)
+                return ok()
+            }
+        }
+        coll := COLL_BINARY
+        arg := nc(e, n)
+        for arg != 0 {
+            let (cc, cx) = expr_collation(e, arg)
+            if cx != 0 {
+                coll = cc
+                break
+            }
+            arg = nnext(e, arg)
+        }
+        for i in 1usize..argc {
+            c := reg_compare(e, a + i, best, coll)
+            if (id == F_MAX && c > 0) || (id == F_MIN && c < 0) {
+                best = a + i
+            }
+        }
+        copy_reg(e, dst, best)
+        return ok()
+    }
+    if id == F_NULLIF {
+        let n_c = nc(e, n)
+        let n_c2 = nc(e, n)
+        let next = nnext(e, n_c2)
+        coll := binary_collation(e, n_c, next)
+        if rtype(e, a) != T_NULL && rtype(e, a + 1) != T_NULL && reg_compare(e, a, a + 1, coll) == 0 {
+            set_null(e, dst)
+        } else {
+            copy_reg(e, dst, a)
+        }
+        return ok()
+    }
+    // Remaining functions return NULL for a NULL first argument, except
+    // those with their own rules below.
+    if id == F_CHAR {
+        o := arena_alloc(e, argc * 4)?
+        len := 0usize
+        for i in 0usize..argc {
+            cp := to_int(e, a + i)
+            len += put_utf8(e, o + len, if cp < 0 || cp > 1114111 {
+                65533u32
+            } else {
+                cp as u32
+            })
+        }
+        set_bytes(e, dst, T_TEXT, o, len)
+        return ok()
+    }
+    if id == F_CONCAT || id == F_CONCAT_WS {
+        start := if id == F_CONCAT_WS {
+            1usize
+        } else {
+            0usize
+        }
+        if id == F_CONCAT_WS && rtype(e, a) == T_NULL {
+            set_null(e, dst)
+            return ok()
+        }
+        if id == F_CONCAT_WS {
+            to_text(e, a)?
+        }
+        total := 0usize
+        for i in start..argc {
+            if rtype(e, a + i) != T_NULL {
+                to_text(e, a + i)?
+                total += rlen(e, a + i) + if id == F_CONCAT_WS {
+                    rlen(e, a)
+                } else {
+                    0usize
+                }
+            }
+        }
+        o := arena_alloc(e, total)?
+        len := 0usize
+        firstv := true
+        for i in start..argc {
+            if rtype(e, a + i) != T_NULL {
+                if id == F_CONCAT_WS && !firstv {
+                    let so = roff(e, a)
+                    let sl = rlen(e, a)
+                    move_bytes(e.ws, so, o + len, sl)
+                    len += sl
+                }
+                let vo = roff(e, a + i)
+                let vl = rlen(e, a + i)
+                move_bytes(e.ws, vo, o + len, vl)
+                len += vl
+                firstv = false
+            }
+        }
+        set_bytes(e, dst, T_TEXT, o, len)
+        return ok()
+    }
+    if id == F_PRINTF {
+        return printf(e, a, argc, dst)
+    }
+    if id == F_QUOTE {
+        return quote(e, a, dst)
+    }
+    if id == F_ZEROBLOB {
+        len := to_int(e, a)
+        if len < 0 {
+            len = 0
+        }
+        if len > 1000000000 {
+            return err(fail(e, SQLITE_TOOBIG, "string or blob too big"))
+        }
+        o := arena_alloc(e, len as usize)?
+        zero_bytes(e.ws, o, len as usize)
+        set_bytes(e, dst, T_BLOB, o, len as usize)
+        return ok()
+    }
+    if id == F_RANDOMBLOB {
+        len := to_int(e, a)
+        if len < 1 {
+            len = 1
+        }
+        if len > 1000000000 {
+            return err(fail(e, SQLITE_TOOBIG, "string or blob too big"))
+        }
+        o := arena_alloc(e, len as usize)?
+        for i in 0usize..(len as usize) {
+            v := next_random(e)
+            e.ws[o + i] = (v & 255) as u8
+        }
+        set_bytes(e, dst, T_BLOB, o, len as usize)
+        return ok()
+    }
+    if id == F_LIKE || id == F_GLOB {
+        if rtype(e, a) == T_NULL || rtype(e, a + 1) == T_NULL {
+            set_null(e, dst)
+            return ok()
+        }
+        to_text(e, a)?
+        to_text(e, a + 1)?
+        esc := 0u32
+        if argc == 3 {
+            to_text(e, a + 2)?
+            let xo = roff(e, a + 2)
+            let xl = rlen(e, a + 2)
+            let (cp, cn) = utf8_at(e, xo, xo + xl)
+            if xl == 0 || cn != xl {
+                return err(fail(e, SQLITE_ERROR, "ESCAPE expression must be a single character"))
+            }
+            esc = cp
+        }
+        po := roff(e, a)
+        pl := rlen(e, a)
+        so := roff(e, a + 1)
+        sl := rlen(e, a + 1)
+        m := if id == F_GLOB {
+            glob_match(e, po, po + pl, so, so + sl)
+        } else {
+            like_match(e, po, po + pl, so, so + sl, esc, true)
+        }
+        set_int(e, dst, if m {
+            1i64
+        } else {
+            0i64
+        })
+        return ok()
+    }
+    if id >= F_DATE && id <= F_CURRENT_TIME {
+        return date_function(e, id, a, argc, dst)
+    }
+    if id == F_HEX && rtype(e, a) == T_NULL {
+        set_bytes(e, dst, T_TEXT, 0, 0)
+        return ok()
+    }
+    if rtype(e, a) == T_NULL {
+        set_null(e, dst)
+        return ok()
+    }
+    if id == F_LENGTH {
+        t := rtype(e, a)
+        if t == T_BLOB {
+            let len2 = rlen(e, a) as i64
+            set_int(e, dst, len2)
+            return ok()
+        }
+        to_text(e, a)?
+        o := roff(e, a)
+        l := rlen(e, a)
+        count := 0i64
+        for i in 0usize..l {
+            b := e.ws[o + i]
+            if b == 0 {
+                break
+            }
+            if (b & 192) != 128 {
+                count += 1
+            }
+        }
+        set_int(e, dst, count)
+        return ok()
+    }
+    if id == F_OCTET_LENGTH {
+        if rtype(e, a) != T_BLOB {
+            to_text(e, a)?
+        }
+        let len3 = rlen(e, a) as i64
+        set_int(e, dst, len3)
+        return ok()
+    }
+    if id == F_UPPER || id == F_LOWER {
+        to_text(e, a)?
+        l := rlen(e, a)
+        o := arena_alloc(e, l)?
+        src := roff(e, a)
+        for i in 0usize..l {
+            b := e.ws[src + i]
+            if id == F_UPPER && b >= 97 && b <= 122 {
+                b -= 32
+            } else if id == F_LOWER && b >= 65 && b <= 90 {
+                b += 32
+            }
+            e.ws[o + i] = b
+        }
+        set_bytes(e, dst, T_TEXT, o, l)
+        return ok()
+    }
+    if id == F_HEX {
+        if rtype(e, a) != T_BLOB {
+            to_text(e, a)?
+        }
+        l := rlen(e, a)
+        o := arena_alloc(e, l * 2)?
+        src := roff(e, a)
+        digits := mem_bytes("0123456789ABCDEF")
+        for i in 0usize..l {
+            b := e.ws[src + i]
+            e.ws[o + 2 * i] = digits[(b >> 4) as usize]
+            e.ws[o + 2 * i + 1] = digits[(b & 15) as usize]
+        }
+        set_bytes(e, dst, T_TEXT, o, l * 2)
+        return ok()
+    }
+    if id == F_UNHEX {
+        to_text(e, a)?
+        l := rlen(e, a)
+        src := roff(e, a)
+        o := arena_alloc(e, l / 2 + 1)?
+        n2 := 0usize
+        i := 0usize
+        for i < l {
+            b := e.ws[src + i]
+            if !is_hex(b) {
+                // Characters from the optional second argument are skipped.
+                skip := false
+                if argc == 2 && rtype(e, a + 1) != T_NULL {
+                    to_text(e, a + 1)?
+                    so := roff(e, a + 1)
+                    for k in 0usize..rlen(e, a + 1) {
+                        if e.ws[so + k] == b {
+                            skip = true
+                        }
+                    }
+                }
+                if skip {
+                    i += 1
+                    continue
+                }
+                set_null(e, dst)
+                return ok()
+            }
+            if i + 1 >= l || !is_hex(e.ws[src + i + 1]) {
+                set_null(e, dst)
+                return ok()
+            }
+            e.ws[o + n2] = hexval(b) * 16 + hexval(e.ws[src + i + 1])
+            n2 += 1
+            i += 2
+        }
+        set_bytes(e, dst, T_BLOB, o, n2)
+        return ok()
+    }
+    if id == F_UNICODE {
+        to_text(e, a)?
+        if rlen(e, a) == 0 {
+            set_null(e, dst)
+            return ok()
+        }
+        let uo = roff(e, a)
+        let ul = rlen(e, a)
+        let (cp, _) = utf8_at(e, uo, uo + ul)
+        set_int(e, dst, cp as i64)
+        return ok()
+    }
+    if id == F_SIGN {
+        t := rtype(e, a)
+        if t == T_TEXT || t == T_BLOB {
+            let off = roff(e, a)
+            let len4 = rlen(e, a)
+            let (k, i, f, whole) = parse_number(e, off, len4)
+            if k == 0 || !whole {
+                set_null(e, dst)
+                return ok()
+            }
+            v := if k == 1 {
+                i as f64
+            } else {
+                f
+            }
+            set_int(e, dst, if v > 0.0 {
+                1i64
+            } else if v < 0.0 {
+                -1i64
+            } else {
+                0i64
+            })
+            return ok()
+        }
+        v := to_real(e, a)
+        set_int(e, dst, if v > 0.0 {
+            1i64
+        } else if v < 0.0 {
+            -1i64
+        } else {
+            0i64
+        })
+        return ok()
+    }
+    if id == F_ROUND {
+        digits := 0i64
+        if argc == 2 {
+            if rtype(e, a + 1) == T_NULL {
+                set_null(e, dst)
+                return ok()
+            }
+            digits = to_int(e, a + 1)
+        }
+        if digits < 0 {
+            digits = 0
+        }
+        if digits > 30 {
+            digits = 30
+        }
+        f := to_real(e, a)
+        set_real(e, dst, round_real(f, digits as usize))
+        return ok()
+    }
+    if id == F_INSTR {
+        if rtype(e, a + 1) == T_NULL {
+            set_null(e, dst)
+            return ok()
+        }
+        blob := rtype(e, a) == T_BLOB && rtype(e, a + 1) == T_BLOB
+        if !blob {
+            to_text(e, a)?
+            to_text(e, a + 1)?
+        }
+        h := roff(e, a)
+        hl := rlen(e, a)
+        nn := roff(e, a + 1)
+        nl := rlen(e, a + 1)
+        pos := 0i64
+        chars := 1i64
+        if nl <= hl {
+            for i in 0usize..(hl - nl + 1) {
+                hit := true
+                for j in 0usize..nl {
+                    if e.ws[h + i + j] != e.ws[nn + j] {
+                        hit = false
+                        break
+                    }
+                }
+                if hit {
+                    pos = chars
+                    break
+                }
+                if blob || (e.ws[h + i] & 192) != 128 {
+                    if i + 1 < hl && (blob || (e.ws[h + i + 1] & 192) != 128) {
+                        chars += 1
+                    }
+                }
+            }
+        }
+        set_int(e, dst, pos)
+        return ok()
+    }
+    if id == F_SUBSTR {
+        return substr(e, a, argc, dst)
+    }
+    if id == F_REPLACE {
+        if rtype(e, a + 1) == T_NULL || rtype(e, a + 2) == T_NULL {
+            set_null(e, dst)
+            return ok()
+        }
+        to_text(e, a)?
+        to_text(e, a + 1)?
+        to_text(e, a + 2)?
+        s := roff(e, a)
+        sl := rlen(e, a)
+        p := roff(e, a + 1)
+        pl := rlen(e, a + 1)
+        r := roff(e, a + 2)
+        rl := rlen(e, a + 2)
+        if pl == 0 {
+            copy_reg(e, dst, a)
+            return ok()
+        }
+        // Count matches to size the output.
+        count := 0usize
+        i := 0usize
+        for i + pl <= sl {
+            if bytes_at(e, s + i, p, pl) {
+                count += 1
+                i += pl
+            } else {
+                i += 1
+            }
+        }
+        out_len := sl + count * rl - count * pl
+        o := arena_alloc(e, out_len)?
+        i = 0
+        k := 0usize
+        for i < sl {
+            if i + pl <= sl && bytes_at(e, s + i, p, pl) {
+                move_bytes(e.ws, r, o + k, rl)
+                k += rl
+                i += pl
+            } else {
+                e.ws[o + k] = e.ws[s + i]
+                k += 1
+                i += 1
+            }
+        }
+        set_bytes(e, dst, T_TEXT, o, out_len)
+        return ok()
+    }
+    if id == F_TRIM || id == F_LTRIM || id == F_RTRIM {
+        to_text(e, a)?
+        set_chars := 0usize
+        set_len := 1usize
+        space := [32u8]
+        if argc == 2 {
+            if rtype(e, a + 1) == T_NULL {
+                set_null(e, dst)
+                return ok()
+            }
+            to_text(e, a + 1)?
+            set_chars = roff(e, a + 1)
+            set_len = rlen(e, a + 1)
+        }
+        s := roff(e, a)
+        start := 0usize
+        end := rlen(e, a)
+        if id != F_RTRIM {
+            for start < end && in_set(e, e.ws[s + start], set_chars, set_len, &space) {
+                start += 1
+            }
+        }
+        if id != F_LTRIM {
+            for end > start && in_set(e, e.ws[s + end - 1], set_chars, set_len, &space) {
+                end -= 1
+            }
+        }
+        set_bytes(e, dst, T_TEXT, s + start, end - start)
+        return ok()
+    }
+    err(fail(e, SQLITE_INTERNAL, "unknown function"))
+}
+
+fn in_set(e: &Engine, b: u8, set_off: usize, set_len: usize, space: &[u8]) -> bool {
+    if set_off == 0 {
+        return b == space[0]
+    }
+    for i in 0usize..set_len {
+        if e.ws[set_off + i] == b {
+            return true
+        }
+    }
+    false
+}
+
+fn bytes_at(e: &Engine, a: usize, b: usize, n: usize) -> bool {
+    for i in 0usize..n {
+        if e.ws[a + i] != e.ws[b + i] {
+            return false
+        }
+    }
+    true
+}
+
+fn put_utf8(e: &mut Engine, o: usize, cp: u32) -> usize {
+    if cp < 128 {
+        e.ws[o] = cp as u8
+        return 1
+    }
+    if cp < 2048 {
+        e.ws[o] = (192 | (cp >> 6)) as u8
+        e.ws[o + 1] = (128 | (cp & 63)) as u8
+        return 2
+    }
+    if cp < 65536 {
+        e.ws[o] = (224 | (cp >> 12)) as u8
+        e.ws[o + 1] = (128 | ((cp >> 6) & 63)) as u8
+        e.ws[o + 2] = (128 | (cp & 63)) as u8
+        return 3
+    }
+    e.ws[o] = (240 | (cp >> 18)) as u8
+    e.ws[o + 1] = (128 | ((cp >> 12) & 63)) as u8
+    e.ws[o + 2] = (128 | ((cp >> 6) & 63)) as u8
+    e.ws[o + 3] = (128 | (cp & 63)) as u8
+    4
+}
+
+fn round_real(f: f64, digits: usize) -> f64 {
+    if f != f {
+        return f
+    }
+    neg := f < 0.0
+    a := if neg {
+        -f
+    } else {
+        f
+    }
+    if a >= 4503599627370496.0 {
+        return f
+    }
+    if digits == 0 {
+        r := ((a + 0.5) as i64) as f64
+        return if neg {
+            -r
+        } else {
+            r
+        }
+    }
+    buf := [0u8; 400]
+    n := match float_decimal.convert(&mut buf, a, digits, false) {
+        ok(v) => v,
+        err(_) => 0,
+    }
+    if n == 0 {
+        return f
+    }
+    v := parse_back(&buf, n)
+    if neg {
+        -v
+    } else {
+        v
+    }
+}
+
+fn substr(e: &mut Engine, a: usize, argc: usize, dst: usize) -> void!db.Error {
+    if rtype(e, a + 1) == T_NULL || (argc == 3 && rtype(e, a + 2) == T_NULL) {
+        set_null(e, dst)
+        return ok()
+    }
+    blob := rtype(e, a) == T_BLOB
+    if !blob {
+        to_text(e, a)?
+    }
+    s := roff(e, a)
+    sl := rlen(e, a)
+    // Length in characters (bytes for blobs).
+    total := 0i64
+    if blob {
+        total = sl as i64
+    } else {
+        for i in 0usize..sl {
+            if (e.ws[s + i] & 192) != 128 {
+                total += 1
+            }
+        }
+    }
+    p1 := to_int(e, a + 1)
+    p2 := if argc == 3 {
+        to_int(e, a + 2)
+    } else {
+        total + 1
+    }
+    if p1 < 0 {
+        p1 += total
+        if p1 < 0 {
+            p2 += p1
+            if p2 < 0 {
+                p2 = 0
+            }
+            p1 = 0
+        }
+    } else if p1 > 0 {
+        p1 -= 1
+    } else if p2 > 0 {
+        p2 -= 1
+    }
+    if p2 < 0 {
+        // Negative length: characters before p1.
+        p1 += p2
+        if p1 < 0 {
+            p2 = p2 - p1
+            p1 = 0
+        }
+        p2 = -p2
+        if p1 + p2 > total {
+            p2 = total - p1
+        }
+    }
+    if p1 > total {
+        p1 = total
+    }
+    if p1 + p2 > total {
+        p2 = total - p1
+    }
+    if p2 < 0 {
+        p2 = 0
+    }
+    start := char_offset(e, s, sl, p1 as usize, blob)
+    end := char_offset(e, s, sl, (p1 + p2) as usize, blob)
+    set_bytes(e, dst, if blob {
+        T_BLOB
+    } else {
+        T_TEXT
+    }, s + start, end - start)
+    ok()
+}
+
+fn char_offset(e: &Engine, s: usize, sl: usize, chars: usize, blob: bool) -> usize {
+    if blob {
+        return if chars < sl {
+            chars
+        } else {
+            sl
+        }
+    }
+    count := 0usize
+    for i in 0usize..sl {
+        if (e.ws[s + i] & 192) != 128 {
+            if count == chars {
+                return i
+            }
+            count += 1
+        }
+    }
+    sl
+}
+
+fn quote(e: &mut Engine, a: usize, dst: usize) -> void!db.Error {
+    t := rtype(e, a)
+    if t == T_NULL {
+        return set_text_str(e, dst, "NULL")
+    }
+    if t == T_INT || t == T_REAL {
+        copy_reg(e, dst, a)
+        return to_text(e, dst)
+    }
+    l := rlen(e, a)
+    s := roff(e, a)
+    if t == T_BLOB {
+        o := arena_alloc(e, l * 2 + 3)?
+        e.ws[o] = 88
+        e.ws[o + 1] = 39
+        digits := mem_bytes("0123456789ABCDEF")
+        for i in 0usize..l {
+            b := e.ws[s + i]
+            e.ws[o + 2 + 2 * i] = digits[(b >> 4) as usize]
+            e.ws[o + 3 + 2 * i] = digits[(b & 15) as usize]
+        }
+        e.ws[o + 2 + 2 * l] = 39
+        set_bytes(e, dst, T_TEXT, o, l * 2 + 3)
+        return ok()
+    }
+    quotes := 0usize
+    for i in 0usize..l {
+        if e.ws[s + i] == 39 {
+            quotes += 1
+        }
+    }
+    o := arena_alloc(e, l + quotes + 2)?
+    e.ws[o] = 39
+    k := 1usize
+    for i in 0usize..l {
+        b := e.ws[s + i]
+        e.ws[o + k] = b
+        k += 1
+        if b == 39 {
+            e.ws[o + k] = 39
+            k += 1
+        }
+    }
+    e.ws[o + k] = 39
+    set_bytes(e, dst, T_TEXT, o, k + 1)
+    ok()
+}
+
+// printf(format, ...): %d %i %u %f %e %E %g %G %s %z %q %Q %w %x %X %o %c %%
+// with flags - + space 0 and width/precision (including *).
+fn printf(e: &mut Engine, a: usize, argc: usize, dst: usize) -> void!db.Error {
+    if rtype(e, a) == T_NULL {
+        set_null(e, dst)
+        return ok()
+    }
+    to_text(e, a)?
+    f := roff(e, a)
+    fl := rlen(e, a)
+    start := e.arena_top
+    argi := 1usize
+    i := 0usize
+    for i < fl {
+        c := e.ws[f + i]
+        if c != 37 {
+            out_byte(e, c)?
+            i += 1
+            continue
+        }
+        i += 1
+        if i >= fl {
+            break
+        }
+        left := false
+        plus := false
+        space := false
+        zero := false
+        for i < fl {
+            fc := e.ws[f + i]
+            if fc == 45 {
+                left = true
+            } else if fc == 43 {
+                plus = true
+            } else if fc == 32 {
+                space = true
+            } else if fc == 48 {
+                zero = true
+            } else if fc == 35 || fc == 44 || fc == 33 {
+            } else {
+                break
+            }
+            i += 1
+        }
+        width := 0usize
+        if i < fl && e.ws[f + i] == 42 {
+            if argi < argc {
+                w := to_int(e, a + argi)
+                argi += 1
+                if w < 0 {
+                    left = true
+                    w = -w
+                }
+                width = if w > 1000 {
+                    1000usize
+                } else {
+                    w as usize
+                }
+            }
+            i += 1
+        } else {
+            for i < fl && is_digit(e.ws[f + i]) {
+                width = width * 10 + ((e.ws[f + i] - 48) as usize)
+                if width > 1000 {
+                    width = 1000
+                }
+                i += 1
+            }
+        }
+        precision := 0usize
+        has_prec := false
+        if i < fl && e.ws[f + i] == 46 {
+            has_prec = true
+            i += 1
+            if i < fl && e.ws[f + i] == 42 {
+                if argi < argc {
+                    p := to_int(e, a + argi)
+                    argi += 1
+                    precision = if p < 0 {
+                        0usize
+                    } else if p > 300 {
+                        300usize
+                    } else {
+                        p as usize
+                    }
+                }
+                i += 1
+            } else {
+                for i < fl && is_digit(e.ws[f + i]) {
+                    precision = precision * 10 + ((e.ws[f + i] - 48) as usize)
+                    if precision > 300 {
+                        precision = 300
+                    }
+                    i += 1
+                }
+            }
+        }
+        // Length modifiers are accepted and ignored.
+        for i < fl && (e.ws[f + i] == 108 || e.ws[f + i] == 104) {
+            i += 1
+        }
+        if i >= fl {
+            break
+        }
+        conv := e.ws[f + i]
+        i += 1
+        if conv == 37 {
+            out_byte(e, 37)?
+            continue
+        }
+        arg := 0usize
+        have := false
+        if argi < argc {
+            arg = a + argi
+            have = true
+            argi += 1
+        }
+        piece := [0u8; 400]
+        pn := 0usize
+        neg := false
+        if conv == 100 || conv == 105 || conv == 117 {
+            v := if have {
+                to_int(e, arg)
+            } else {
+                0i64
+            }
+            if conv == 117 && v < 0 {
+                v = 0
+            }
+            neg = v < 0
+            m := i2u(v)
+            if neg {
+                m = (18446744073709551615u64 - m) + 1
+            }
+            pn = format_u64(&mut piece, m)
+            if has_prec {
+                pn = pad_digits(&mut piece, pn, precision)
+            }
+        } else if conv == 120 || conv == 88 || conv == 111 {
+            v := if have {
+                to_int(e, arg)
+            } else {
+                0i64
+            }
+            m := i2u(v)
+            base := if conv == 111 {
+                8u64
+            } else {
+                16u64
+            }
+            digits := if conv == 88 {
+                mem_bytes("0123456789ABCDEF")
+            } else {
+                mem_bytes("0123456789abcdef")
+            }
+            tmp := [0u8; 24]
+            tn := 0usize
+            if m == 0 {
+                tmp[0] = 48
+                tn = 1
+            }
+            for m != 0 {
+                tmp[tn] = digits[(m % base) as usize]
+                m = m / base
+                tn += 1
+            }
+            for k in 0usize..tn {
+                piece[k] = tmp[tn - 1 - k]
+            }
+            pn = tn
+        } else if conv == 102 || conv == 101 || conv == 69 || conv == 103 || conv == 71 {
+            v := if have {
+                to_real(e, arg)
+            } else {
+                0.0
+            }
+            if v != v {
+                pn = copy_str(&mut piece, 0, "NaN")
+            } else {
+                neg = v < 0.0
+                av := if neg {
+                    -v
+                } else {
+                    v
+                }
+                prec := if has_prec {
+                    precision
+                } else {
+                    6usize
+                }
+                if av > 1.7976931348623157e308 {
+                    pn = copy_str(&mut piece, 0, "Inf")
+                } else if conv == 102 {
+                    pn = match float_decimal.convert(&mut piece, av, prec, false) {
+                        ok(n2) => n2,
+                        err(_) => 0,
+                    }
+                } else if conv == 101 || conv == 69 {
+                    pn = match float_decimal.convert(&mut piece, av, prec, true) {
+                        ok(n2) => n2,
+                        err(_) => 0,
+                    }
+                    if conv == 69 {
+                        for k in 0usize..pn {
+                            if piece[k] == 101 {
+                                piece[k] = 69
+                            }
+                        }
+                    }
+                } else {
+                    pn = format_g(&mut piece, av, if prec == 0 {
+                        1usize
+                    } else {
+                        prec
+                    }, conv == 71)
+                }
+            }
+        } else if conv == 99 {
+            if have {
+                to_text(e, arg)?
+                if rlen(e, arg) > 0 {
+                    let co = roff(e, arg)
+                    let value = co + rlen(e, arg)
+                    let (_, cn) = utf8_at(e, co, value)
+                    for k in 0usize..cn {
+                        piece[k] = e.ws[co + k]
+                    }
+                    pn = cn
+                }
+            }
+        } else if conv == 115 || conv == 122 || conv == 113 || conv == 81 || conv == 119 {
+            // Strings are written directly (they may be long).
+            if conv == 81 && (!have || rtype(e, arg) == T_NULL) {
+                emit_padded_str(e, "NULL", width, left)?
+                continue
+            }
+            slen := 0usize
+            so := 0usize
+            if have && rtype(e, arg) != T_NULL {
+                to_text(e, arg)?
+                so = roff(e, arg)
+                slen = rlen(e, arg)
+            }
+            if has_prec && precision < slen {
+                slen = char_offset(e, so, slen, precision, false)
+            }
+            extra := 0usize
+            if conv == 113 || conv == 81 || conv == 119 {
+                q := if conv == 119 {
+                    34u8
+                } else {
+                    39u8
+                }
+                for k in 0usize..slen {
+                    if e.ws[so + k] == q {
+                        extra += 1
+                    }
+                }
+                if conv == 81 {
+                    extra += 2
+                }
+            }
+            total := slen + extra
+            if !left {
+                for _ in total..width {
+                    out_byte(e, 32)?
+                }
+            }
+            if conv == 81 {
+                out_byte(e, 39)?
+            }
+            q := if conv == 119 {
+                34u8
+            } else {
+                39u8
+            }
+            for k in 0usize..slen {
+                b := e.ws[so + k]
+                out_byte(e, b)?
+                if (conv == 113 || conv == 81 || conv == 119) && b == q {
+                    out_byte(e, b)?
+                }
+            }
+            if conv == 81 {
+                out_byte(e, 39)?
+            }
+            if left {
+                for _ in total..width {
+                    out_byte(e, 32)?
+                }
+            }
+            continue
+        } else {
+            continue
+        }
+        sign := 0u8
+        if neg {
+            sign = 45
+        } else if plus && (conv == 100 || conv == 105 || conv == 102 || conv == 101 || conv == 69 || conv == 103 || conv == 71) {
+            sign = 43
+        } else if space && (conv == 100 || conv == 105 || conv == 102 || conv == 101 || conv == 103) {
+            sign = 32
+        }
+        total := pn + if sign != 0 {
+            1usize
+        } else {
+            0usize
+        }
+        if !left && !zero {
+            for _ in total..width {
+                out_byte(e, 32)?
+            }
+        }
+        if sign != 0 {
+            out_byte(e, sign)?
+        }
+        if !left && zero {
+            for _ in total..width {
+                out_byte(e, 48)?
+            }
+        }
+        for k in 0usize..pn {
+            out_byte(e, piece[k])?
+        }
+        if left {
+            for _ in total..width {
+                out_byte(e, 32)?
+            }
+        }
+    }
+    let arena_top2 = e.arena_top - start
+    set_bytes(e, dst, T_TEXT, start, arena_top2)
+    ok()
+}
+
+fn emit_padded_str(e: &mut Engine, s: &str, width: usize, left: bool) -> void!db.Error {
+    b := mem_bytes(s)
+    if !left {
+        for _ in b.len..width {
+            out_byte(e, 32)?
+        }
+    }
+    for k in 0usize..b.len {
+        out_byte(e, b[k])?
+    }
+    if left {
+        for _ in b.len..width {
+            out_byte(e, 32)?
+        }
+    }
+    ok()
+}
+
+fn out_byte(e: &mut Engine, b: u8) -> void!db.Error {
+    o := arena_alloc(e, 1)?
+    e.ws[o] = b
+    ok()
+}
+
+fn format_u64(out: &mut[u8], v: u64) -> usize {
+    tmp := [0u8; 24]
+    n := 0usize
+    x := v
+    if x == 0 {
+        tmp[0] = 48
+        n = 1
+    }
+    for x != 0 {
+        tmp[n] = 48 + ((x % 10) as u8)
+        x = x / 10
+        n += 1
+    }
+    for i in 0usize..n {
+        out[i] = tmp[n - 1 - i]
+    }
+    n
+}
+
+fn pad_digits(out: &mut[u8], n: usize, precision: usize) -> usize {
+    if n >= precision || precision > 300 {
+        return n
+    }
+    shift := precision - n
+    for k in 0usize..n {
+        out[precision - 1 - k] = out[n - 1 - k]
+    }
+    for k in 0usize..shift {
+        out[k] = 48
+    }
+    precision
+}
+
+// %g: precision significant digits, trailing zeros removed.
+fn format_g(out: &mut[u8], v: f64, precision: usize, upper: bool) -> usize {
+    if v == 0.0 {
+        out[0] = 48
+        return 1
+    }
+    sci := [0u8; 400]
+    n := match float_decimal.convert(&mut sci, v, precision - 1, true) {
+        ok(x) => x,
+        err(_) => 0,
+    }
+    // Exponent.
+    k := 0usize
+    for k < n && sci[k] != 101 {
+        k += 1
+    }
+    x := 0i32
+    j := k + 2
+    for j < n {
+        x = x * 10 + ((sci[j] - 48) as i32)
+        j += 1
+    }
+    if sci[k + 1] == 45 {
+        x = -x
+    }
+    if x < -4 || x >= (precision as i32) {
+        // Scientific with trailing zeros stripped from the mantissa.
+        m := k
+        if m > 1 {
+            for m > 1 && sci[m - 1] == 48 {
+                m -= 1
+            }
+            if sci[m - 1] == 46 {
+                m -= 1
+            }
+        }
+        o := 0usize
+        for t in 0usize..m {
+            out[o] = sci[t]
+            o += 1
+        }
+        for t in k..n {
+            out[o] = if sci[t] == 101 && upper {
+                69u8
+            } else {
+                sci[t]
+            }
+            o += 1
+        }
+        return o
+    }
+    frac := (precision as i32) - 1 - x
+    p := if frac < 0 {
+        0usize
+    } else {
+        frac as usize
+    }
+    m := match float_decimal.convert(out, v, p, false) {
+        ok(y) => y,
+        err(_) => 0,
+    }
+    if p > 0 {
+        for m > 1 && out[m - 1] == 48 {
+            m -= 1
+        }
+        if out[m - 1] == 46 {
+            m -= 1
+        }
+    }
+    m
+}
+
+// ---------------------------------------------------------------------------
+// Aggregates. Each aggregate node owns four registers at nf(e, n, 4):
+//   count/sum:   r0 count, r1 integer sum, r2 real sum, r3 compensation
+//   min/max:     r0 best value, r1 has value
+//   group_concat r0 text, r1 count
+// The flags byte of r1 (offset 1) records "real seen" (1) and integer
+// overflow (2) for sums.
+
+fn agg_reset(e: &mut Engine, n: usize) {
+    b := ne_(e, n)
+    set_int(e, b, 0)
+    set_int(e, b + 1, 0)
+    set_real(e, b + 2, 0.0)
+    set_real(e, b + 3, 0.0)
+    id := ndd(e, n)
+    if id == A_MIN || id == A_MAX || id == A_GROUP_CONCAT {
+        set_null(e, b)
+    }
+    // Distinct bookkeeping: count of stored values in r3's integer slot.
+    let reg = reg_at(e, b + 3) + 16
+    st64(e.ws, reg, 0)
+}
+
+fn agg_copy_value(e: &mut Engine, dst: usize, src: usize) -> void!db.Error {
+    copy_reg(e, dst, src)
+    t := rtype(e, src)
+    if t == T_TEXT || t == T_BLOB {
+        len := rlen(e, src)
+        o := agg_alloc(e, len)?
+        let so = roff(e, src)
+        move_bytes(e.ws, so, o, len)
+        set_bytes(e, dst, t, o, len)
+    }
+    ok()
+}
+
+fn agg_alloc(e: &mut Engine, len: usize) -> usize!db.Error {
+    if e.agg_top + len > e.agg_end {
+        return err(full(e, "aggregate workspace (group_concat or DISTINCT values too large)"))
+    }
+    o := e.agg_top
+    e.agg_top += len
+    ok(o)
+}
+
+// DISTINCT aggregates: remembers values in the aggregate area as a list of
+// [type u8, len u32, payload] entries; returns true if `r` was seen before.
+fn agg_seen(e: &mut Engine, n: usize, r: usize) -> bool!db.Error {
+    b := ne_(e, n)
+    list := ldu(e.ws, reg_at(e, b + 3) + 16)
+    // Walk the list.
+    p := list
+    coll := COLL_BINARY
+    a := nc(e, n)
+    if a != 0 {
+        let (c, _) = expr_collation(e, a)
+        coll = c
+    }
+    for p != 0 {
+        let t = e.ws[p]
+        let next = ldu(e.ws, p + 4)
+        let len = ldu(e.ws, p + 8)
+        if t == T_INT || t == T_REAL {
+            o := reg_at(e, R_CMP_B)
+            e.ws[o] = t
+            let ld642 = ld64(e.ws, p + 12)
+            st64(e.ws, o + 8, ld642)
+        } else {
+            set_bytes(e, R_CMP_B, t, p + 12, len)
+        }
+        if reg_compare(e, r, R_CMP_B, coll) == 0 {
+            return ok(true)
+        }
+        p = next
+    }
+    t := rtype(e, r)
+    len := if t == T_TEXT || t == T_BLOB {
+        rlen(e, r)
+    } else {
+        8usize
+    }
+    o := agg_alloc(e, 12 + len)?
+    e.ws[o] = t
+    stu(e.ws, o + 4, list)
+    stu(e.ws, o + 8, len)
+    if t == T_TEXT || t == T_BLOB {
+        let so = roff(e, r)
+        move_bytes(e.ws, so, o + 12, len)
+    } else {
+        let bits = ld64(e.ws, reg_at(e, r) + 8)
+        st64(e.ws, o + 12, bits)
+    }
+    let h = reg_at(e, b + 3) + 16
+    stu(e.ws, h, o)
+    ok(false)
+}
+
+fn agg_step(e: &mut Engine, n: usize) -> void!db.Error {
+    id := ndd(e, n)
+    b := ne_(e, n)
+    if id == A_COUNT_STAR {
+        v := rint(e, b) + 1
+        set_int(e, b, v)
+        return ok()
+    }
+    save := e.rtop
+    x := reg_push(e)?
+    sep := reg_push(e)?
+    a := nc(e, n)
+    if a != 0 {
+        eval(e, a, x)?
+    } else {
+        set_int(e, x, 1)
+    }
+    if rtype(e, x) == T_NULL {
+        e.rtop = save
+        return ok()
+    }
+    if (nflags(e, n) & 1) != 0 {
+        if agg_seen(e, n, x)? {
+            e.rtop = save
+            return ok()
+        }
+    }
+    if id == A_COUNT {
+        v := rint(e, b) + 1
+        set_int(e, b, v)
+    } else if id == A_SUM || id == A_TOTAL || id == A_AVG {
+        c := rint(e, b) + 1
+        set_int(e, b, c)
+        flags := e.ws[reg_at(e, b + 1) + 1]
+        to_numeric_for_sum(e, x)
+        if rtype(e, x) == T_INT && (flags & 1) == 0 {
+            let (s, ovf) = add_i64(rint(e, b + 1), rint(e, x))
+            if ovf {
+                flags = flags | 3
+                // Continue as a real sum from the exact integer sum so far.
+                let value = rint(e, b + 1) as f64
+                kbn_add(e, b, value)
+                let value2 = rint(e, x) as f64
+                kbn_add(e, b, value2)
+            } else {
+                set_int(e, b + 1, s)
+            }
+        } else {
+            if (flags & 1) == 0 {
+                flags = flags | 1
+                let value3 = rint(e, b + 1) as f64
+                kbn_add(e, b, value3)
+            }
+            let to_real2 = to_real(e, x)
+            kbn_add(e, b, to_real2)
+        }
+        o := reg_at(e, b + 1)
+        e.ws[o + 1] = flags
+    } else if id == A_MIN || id == A_MAX {
+        coll := COLL_BINARY
+        if a != 0 {
+            let (cc, _) = expr_collation(e, a)
+            coll = cc
+        }
+        better := rtype(e, b) == T_NULL
+        if !better {
+            c := reg_compare(e, x, b, coll)
+            better = (id == A_MIN && c < 0) || (id == A_MAX && c > 0)
+        }
+        if better {
+            agg_copy_value(e, b, x)?
+            e.agg_hit = n
+        }
+    } else if id == A_GROUP_CONCAT {
+        to_text(e, x)?
+        sep_len := 1usize
+        sep_off := 0usize
+        if nnext(e, a) != 0 {
+            let next = nnext(e, a)
+            eval(e, next, sep)?
+            if rtype(e, sep) == T_NULL {
+                sep_len = 0
+            } else {
+                to_text(e, sep)?
+                sep_off = roff(e, sep)
+                sep_len = rlen(e, sep)
+            }
+        }
+        count := rint(e, b + 1)
+        if rtype(e, b) == T_NULL {
+            agg_copy_value(e, b, x)?
+        } else {
+            // Append: keep the text contiguous at the top of the area.
+            old := roff(e, b)
+            oldlen := rlen(e, b)
+            xl := rlen(e, x)
+            add := sep_len + xl
+            if old + oldlen != e.agg_top {
+                no := agg_alloc(e, oldlen)?
+                move_bytes(e.ws, old, no, oldlen)
+                old = no
+            }
+            agg_alloc(e, add)?
+            if sep_off == 0 {
+                if sep_len == 1 {
+                    e.ws[old + oldlen] = 44
+                }
+            } else {
+                move_bytes(e.ws, sep_off, old + oldlen, sep_len)
+            }
+            let xo = roff(e, x)
+            move_bytes(e.ws, xo, old + oldlen + sep_len, xl)
+            set_bytes(e, b, T_TEXT, old, oldlen + add)
+        }
+        set_int(e, b + 1, count + 1)
+    }
+    e.rtop = save
+    ok()
+}
+
+fn to_numeric_for_sum(e: &mut Engine, r: usize) {
+    t := rtype(e, r)
+    if t == T_TEXT || t == T_BLOB {
+        let off = roff(e, r)
+        let len = rlen(e, r)
+        let (k, i, f, _) = parse_number(e, off, len)
+        if k == 1 {
+            set_int(e, r, i)
+        } else if k == 2 {
+            set_real(e, r, f)
+        } else {
+            set_int(e, r, 0)
+        }
+    }
+}
+
+// Kahan-Babuska-Neumaier compensated summation into r2 (sum), r3 (error).
+fn kbn_add(e: &mut Engine, b: usize, v: f64) {
+    s := rreal(e, b + 2)
+    c := rreal(e, b + 3)
+    t := s + v
+    if (if s < 0.0 {
+        -s
+    } else {
+        s
+    }) >= (if v < 0.0 {
+        -v
+    } else {
+        v
+    }) {
+        c += (s - t) + v
+    } else {
+        c += (v - t) + s
+    }
+    o2 := reg_at(e, b + 2)
+    st64(e.ws, o2 + 8, f2u(t))
+    o3 := reg_at(e, b + 3)
+    st64(e.ws, o3 + 8, f2u(c))
+}
+
+fn agg_value(e: &mut Engine, n: usize, dst: usize) -> void!db.Error {
+    id := ndd(e, n)
+    b := ne_(e, n)
+    if id == A_COUNT || id == A_COUNT_STAR {
+        let value = rint(e, b)
+        set_int(e, dst, value)
+        return ok()
+    }
+    if id == A_SUM || id == A_TOTAL || id == A_AVG {
+        count := rint(e, b)
+        flags := e.ws[reg_at(e, b + 1) + 1]
+        if id == A_SUM {
+            if count == 0 {
+                set_null(e, dst)
+                return ok()
+            }
+            if (flags & 2) != 0 {
+                return err(fail(e, SQLITE_ERROR, "integer overflow"))
+            }
+            if (flags & 1) != 0 {
+                let value2 = rreal(e, b + 2) + rreal(e, b + 3)
+                set_real(e, dst, value2)
+            } else {
+                let value3 = rint(e, b + 1)
+                set_int(e, dst, value3)
+            }
+            return ok()
+        }
+        total := if (flags & 1) != 0 {
+            rreal(e, b + 2) + rreal(e, b + 3)
+        } else {
+            rint(e, b + 1) as f64
+        }
+        if id == A_TOTAL {
+            set_real(e, dst, total)
+            return ok()
+        }
+        if count == 0 {
+            set_null(e, dst)
+            return ok()
+        }
+        set_real(e, dst, total / (count as f64))
+        return ok()
+    }
+    copy_reg(e, dst, b)
+    ok()
+}

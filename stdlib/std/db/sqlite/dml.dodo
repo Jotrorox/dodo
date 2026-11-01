@@ -1,0 +1,1364 @@
+package sqlite
+
+import "std/db"
+
+// INSERT, UPDATE, DELETE and the constraint checks they share.
+
+// Write-statement info block (statement node field g).
+const W_TABLE: usize = 0
+const W_CUR: usize = 4
+const W_NCOL: usize = 8
+const W_BASE: usize = 12
+const W_COLMAP: usize = 16
+const W_NLIST: usize = 20
+const W_DEFAULTS: usize = 24
+const W_IDX: usize = 28
+const W_NIDX: usize = 32
+const W_CHECKS: usize = 36
+const W_SEL: usize = 40
+const W_SETS: usize = 44
+const W_NSET: usize = 48
+const W_KEYREG: usize = 52
+const W_OLD: usize = 56
+const W_CONF: usize = 60
+const W_SEQ: usize = 64
+const W_SEQCUR: usize = 68
+const W_UPSERT: usize = 72
+const W_RET: usize = 76
+const W_RETREG: usize = 80
+const W_NRET: usize = 84
+const W_BYTES: usize = 88
+
+const ROWID_TARGET: usize = 4294967294
+
+fn wget(e: &Engine, w: usize, f: usize) -> usize {
+    ldu(e.ws, w + f)
+}
+
+// Parses SQL text (schema pool) as one expression appended to the current
+// statement's nodes.
+fn parse_fragment_expr(e: &mut Engine, o: usize, l: usize) -> usize!db.Error {
+    e.src = o
+    e.src_end = o + l
+    e.pos = o
+    e.ts = o
+    e.tl = 0
+    e.last_end = o
+    next_token(e)
+    parse_expr(e)
+}
+
+fn parse_fragment_stmt(e: &mut Engine, o: usize, l: usize) -> usize!db.Error {
+    e.src = o
+    e.src_end = o + l
+    e.pos = o
+    e.ts = o
+    e.tl = 0
+    e.last_end = o
+    next_token(e)
+    parse_statement(e)
+}
+
+fn table_for_write(e: &mut Engine, o: usize, l: usize) -> usize!db.Error {
+    t := find_obj(e, OT_TABLE, o, l)
+    if t == NO_COL {
+        if find_obj(e, OT_VIEW, o, l) != NO_COL {
+            e.msg_len = 0
+            msg_add(e, "cannot modify ")
+            msg_add_ws(e, o, l)
+            msg_add(e, " because it is a view")
+            return err(make_error(e, SQLITE_ERROR))
+        }
+        if name_is(e, o, l, "sqlite_schema") || name_is(e, o, l, "sqlite_master") {
+            return err(fail(e, SQLITE_ERROR, "table sqlite_master may not be modified"))
+        }
+        e.msg_len = 0
+        msg_add(e, "no such table: ")
+        msg_add_ws(e, o, l)
+        return err(make_error(e, SQLITE_ERROR))
+    }
+    flags := obj_flags(e, t)
+    if (flags & OF_UNSUPPORTED) != 0 {
+        return err(fail(e, SQLITE_ERROR, "table uses unsupported features"))
+    }
+    if (flags & OF_HAS_TRIGGER) != 0 {
+        return err(fail(e, SQLITE_ERROR, "tables with triggers cannot be modified by this driver"))
+    }
+    if (flags & OF_UNSUPPORTED_INDEX) != 0 {
+        return err(fail(e, SQLITE_ERROR, "table has an index this driver cannot maintain (expression or partial index)"))
+    }
+    ok(t)
+}
+
+// Common setup: registers, cursors, indexes, CHECK constraints.
+fn write_info(e: &mut Engine, s: usize, t: usize) -> usize!db.Error {
+    w := pool_alloc(e, W_BYTES)?
+    zero_bytes(e.ws, w, W_BYTES)
+    set_nf(e, s, 6, w)
+    ncol := obj_ncol(e, t)
+    stu(e.ws, w + W_TABLE, t)
+    stu(e.ws, w + W_NCOL, ncol)
+    base := alloc_regs(e, ncol + 1)?
+    stu(e.ws, w + W_BASE, base)
+    old := alloc_regs(e, ncol + 1)?
+    stu(e.ws, w + W_OLD, old)
+    keys := alloc_regs(e, 34)?
+    stu(e.ws, w + W_KEYREG, keys)
+    c := alloc_cursor(e)?
+    stu(e.ws, w + W_CUR, c)
+    // Index cursors.
+    nidx := 0usize
+    x := next_index_of(e, t, NO_COL)
+    for x != NO_COL {
+        nidx += 1
+        x = next_index_of(e, t, x)
+    }
+    arr := pool_alloc(e, nidx * 8 + 4)?
+    x = next_index_of(e, t, NO_COL)
+    k := 0usize
+    for x != NO_COL {
+        ic := alloc_cursor(e)?
+        stu(e.ws, arr + k * 8, x)
+        stu(e.ws, arr + k * 8 + 4, ic)
+        k += 1
+        x = next_index_of(e, t, x)
+    }
+    stu(e.ws, w + W_IDX, arr)
+    stu(e.ws, w + W_NIDX, nidx)
+    let nop2 = nop(e, s) as usize
+    stu(e.ws, w + W_CONF, nop2)
+    // CHECK constraints: re-parse the table definition here and resolve
+    // column names to the new-row registers.
+    sql := obj_u(e, t, O_SQL)
+    sqll := obj_u(e, t, O_SQLL)
+    checks := 0usize
+    if sqll > 0 && t_has_check(e, sql, sqll) {
+        ct := parse_fragment_stmt(e, sql, sqll)?
+        cd := nc(e, ct)
+        for cd != 0 {
+            if ng(e, cd) != 0 {
+                let cd_g = ng(e, cd)
+                checks = add_check(e, checks, cd_g)?
+            }
+            cd = nnext(e, cd)
+        }
+        tc := ndd(e, ct)
+        for tc != 0 {
+            if nop(e, tc) == 3 {
+                let tc_e = ne_(e, tc)
+                checks = add_check(e, checks, tc_e)?
+            }
+            tc = nnext(e, tc)
+        }
+        if checks != 0 {
+            e.regctx_t = t
+            e.regctx_base = base
+            res := resolve_expr(e, checks, 0, false)
+            e.regctx_t = NO_COL
+            res?
+        }
+    }
+    stu(e.ws, w + W_CHECKS, checks)
+    // AUTOINCREMENT bookkeeping.
+    if (obj_flags(e, t) & OF_AUTOINC) != 0 && rowid_col(e, t) != NO_COL {
+        seq := find_obj(e, OT_TABLE, 0, 0)
+        seqname := mem_bytes("sqlite_sequence")
+        for i in 0usize..e.schema_objs {
+            let name = obj_u(e, i, O_NAME)
+            let name_len = obj_u(e, i, O_NAMEL)
+            if obj_type(e, i) == OT_TABLE && name_is(e, name, name_len, "sqlite_sequence") {
+                seq = i
+            }
+        }
+        if seq != NO_COL && seqname.len > 0 {
+            stu(e.ws, w + W_SEQ, seq + 1)
+            sc := alloc_cursor(e)?
+            stu(e.ws, w + W_SEQCUR, sc)
+        }
+    }
+    ok(w)
+}
+
+fn t_has_check(e: &Engine, o: usize, l: usize) -> bool {
+    contains_ci(e, o, l, "CHECK")
+}
+
+fn add_check(e: &mut Engine, head: usize, x: usize) -> usize!db.Error {
+    if head == 0 {
+        return ok(x)
+    }
+    binary(e, OP_AND, head, x)
+}
+
+fn open_write_cursors(e: &mut Engine, w: usize) {
+    t := wget(e, w, W_TABLE)
+    c := wget(e, w, W_CUR)
+    let root = obj_root(e, t)
+    cur_open(e, c, root, false)
+    arr := wget(e, w, W_IDX)
+    for k in 0usize..wget(e, w, W_NIDX) {
+        x := ldu(e.ws, arr + k * 8)
+        ic := ldu(e.ws, arr + k * 8 + 4)
+        open_index_cursor(e, ic, x)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// INSERT
+
+fn resolve_insert(e: &mut Engine, s: usize) -> void!db.Error {
+    let s_a = na(e, s)
+    let s_b = nb(e, s)
+    t := table_for_write(e, s_a, s_b)?
+    w := write_info(e, s, t)?
+    ncol := obj_ncol(e, t)
+    ipk := rowid_col(e, t)
+    // Target list.
+    list := nc(e, s)
+    nlist := if list == 0 {
+        ncol
+    } else {
+        list_len(e, list)
+    }
+    colmap := pool_alloc(e, nlist * 4 + 4)?
+    seen := pool_alloc(e, ncol + 1)?
+    zero_bytes(e.ws, seen, ncol + 1)
+    if list == 0 {
+        for i in 0usize..ncol {
+            stu(e.ws, colmap + i * 4, if i == ipk {
+                ROWID_TARGET
+            } else {
+                i
+            })
+        }
+    } else {
+        id := list
+        k := 0usize
+        for id != 0 {
+            let id_a = na(e, id)
+            let id_b = nb(e, id)
+            c := find_column(e, t, id_a, id_b)
+            if c == NO_COL {
+                let id_a2 = na(e, id)
+                let id_b2 = nb(e, id)
+                if is_rowid_name(e, id_a2, id_b2) {
+                    stu(e.ws, colmap + k * 4, ROWID_TARGET)
+                } else {
+                    e.msg_len = 0
+                    msg_add(e, "table ")
+                    let name = obj_u(e, t, O_NAME)
+                    let name_len = obj_u(e, t, O_NAMEL)
+                    msg_add_ws(e, name, name_len)
+                    msg_add(e, " has no column named ")
+                    let id_a3 = na(e, id)
+                    let id_b3 = nb(e, id)
+                    msg_add_ws(e, id_a3, id_b3)
+                    return err(make_error(e, SQLITE_ERROR))
+                }
+            } else {
+                stu(e.ws, colmap + k * 4, if c == ipk {
+                    ROWID_TARGET
+                } else {
+                    c
+                })
+                e.ws[seen + c] = 1
+            }
+            k += 1
+            id = nnext(e, id)
+        }
+    }
+    stu(e.ws, w + W_COLMAP, colmap)
+    stu(e.ws, w + W_NLIST, nlist)
+    // Defaults for columns not in the list.
+    defaults := pool_alloc(e, ncol * 4 + 4)?
+    zero_bytes(e.ws, defaults, ncol * 4 + 4)
+    for c in 0usize..ncol {
+        if (list == 0 && (nflags(e, s) & 1) == 0) || e.ws[seen + c] != 0 {
+            continue
+        }
+        r := col_rec(e, t, c)
+        if e.ws[r + K_HASDFLT] != 0 {
+            let o = ldu(e.ws, r + K_DFLT)
+            let l = ldu(e.ws, r + K_DFLTL)
+            x := parse_fragment_expr(e, o, l)?
+            resolve_expr(e, x, 0, false)?
+            stu(e.ws, defaults + c * 4, x)
+        }
+    }
+    // Defaults also apply to NOT NULL columns under OR REPLACE.
+    for c in 0usize..ncol {
+        if ldu(e.ws, defaults + c * 4) == 0 {
+            r := col_rec(e, t, c)
+            if e.ws[r + K_HASDFLT] != 0 {
+                let o = ldu(e.ws, r + K_DFLT)
+                let l = ldu(e.ws, r + K_DFLTL)
+                x := parse_fragment_expr(e, o, l)?
+                resolve_expr(e, x, 0, false)?
+                stu(e.ws, defaults + c * 4, x | 2147483648)
+            }
+        }
+    }
+    stu(e.ws, w + W_DEFAULTS, defaults)
+    if nff(e, s) != 0 {
+        resolve_upsert(e, s, w, t)?
+    }
+    // Values.
+    if (nflags(e, s) & 1) != 0 {
+        return ok()
+    }
+    rows := ndd(e, s)
+    if rows != 0 {
+        row := rows
+        for row != 0 {
+            let row_a = na(e, row)
+            n := list_len(e, row_a)
+            if n != nlist {
+                e.msg_len = 0
+                if list == 0 {
+                    msg_add(e, "table ")
+                    let name2 = obj_u(e, t, O_NAME)
+                    let name_len2 = obj_u(e, t, O_NAMEL)
+                    msg_add_ws(e, name2, name_len2)
+                    msg_add(e, " has ")
+                    msg_add_int(e, ncol as i64)
+                    msg_add(e, " columns but ")
+                    msg_add_int(e, n as i64)
+                    msg_add(e, " values were supplied")
+                } else {
+                    msg_add_int(e, n as i64)
+                    msg_add(e, " values for ")
+                    msg_add_int(e, nlist as i64)
+                    msg_add(e, " columns")
+                }
+                return err(make_error(e, SQLITE_ERROR))
+            }
+            x := na(e, row)
+            for x != 0 {
+                resolve_expr(e, x, 0, false)?
+                x = nnext(e, x)
+            }
+            row = nnext(e, row)
+        }
+        return ok()
+    }
+    sel := ne_(e, s)
+    resolve_select(e, sel)?
+    if select_ncols(e, sel) != nlist {
+        e.msg_len = 0
+        msg_add(e, "table ")
+        let name3 = obj_u(e, t, O_NAME)
+        let name_len3 = obj_u(e, t, O_NAMEL)
+        msg_add_ws(e, name3, name_len3)
+        msg_add(e, " has ")
+        msg_add_int(e, nlist as i64)
+        msg_add(e, " columns but ")
+        let select_ncols2 = select_ncols(e, sel) as i64
+        msg_add_int(e, select_ncols2)
+        msg_add(e, " values were supplied")
+        return err(make_error(e, SQLITE_ERROR))
+    }
+    ok()
+}
+
+// RETURNING: resolves the result columns against the new row registers
+// (INSERT, UPDATE) or the old row registers (DELETE). Returns the result
+// register base and count.
+fn resolve_returning(e: &mut Engine, s: usize, deleting: bool) -> (usize, usize)!db.Error {
+    w := sget_w(e, s)
+    t := wget(e, w, W_TABLE)
+    head := nx(e, s) as usize
+    // Expand * into the table's columns.
+    out := 0usize
+    tail := 0usize
+    rc := head
+    for rc != 0 {
+        next := nnext(e, rc)
+        set_next(e, rc, 0)
+        let rc_a = na(e, rc)
+        if nkind(e, rc_a) == N_STAR {
+            for c in 0usize..obj_ncol(e, t) {
+                r := col_rec(e, t, c)
+                id := new_node(e, N_ID)?
+                let cn = ldu(e.ws, r + K_NAME)
+                let cl = ldu(e.ws, r + K_NAMEL)
+                set_nf(e, id, 0, cn)
+                set_nf(e, id, 1, cl)
+                item := new_node(e, N_RESCOL)?
+                set_nf(e, item, 0, id)
+                set_nf(e, item, 1, cn)
+                set_nf(e, item, 2, cl)
+                let (h, tl) = list_append(e, out, tail, item)
+                out = h
+                tail = tl
+            }
+        } else {
+            let (h, tl) = list_append(e, out, tail, rc)
+            out = h
+            tail = tl
+        }
+        rc = next
+    }
+    set_x(e, s, out as u64)
+    n := list_len(e, out)
+    e.regctx_t = t
+    let value = if deleting {
+        wget(e, w, W_OLD)
+    } else {
+        wget(e, w, W_BASE)
+    }
+    e.regctx_base = value
+    rc = out
+    for rc != 0 {
+        let rc_a2 = na(e, rc)
+        match resolve_expr(e, rc_a2, 0, false) {
+            ok() => {},
+            err(reason) => {
+                e.regctx_t = NO_COL
+                return err(reason)
+            },
+        }
+        rc = nnext(e, rc)
+    }
+    e.regctx_t = NO_COL
+    resreg := alloc_regs(e, n)?
+    stu(e.ws, w + W_RET, out)
+    stu(e.ws, w + W_RETREG, resreg)
+    stu(e.ws, w + W_NRET, n)
+    ok((resreg, n))
+}
+
+// Appends one RETURNING row for the row just written or deleted.
+fn push_returning(e: &mut Engine, w: usize) -> void!db.Error {
+    head := wget(e, w, W_RET)
+    if head == 0 {
+        return ok()
+    }
+    r := wget(e, w, W_RETREG)
+    k := 0usize
+    rc := head
+    for rc != 0 {
+        let rc_a = na(e, rc)
+        eval(e, rc_a, r + k)?
+        k += 1
+        rc = nnext(e, rc)
+    }
+    sort_push(e, r, k)?
+    ok()
+}
+
+// Upsert info: [0] target (index object, ROWID_TARGET, or NO_COL for any
+// constraint), [4] action (0 nothing, 1 update), [8] sets array, [12] count,
+// [16] WHERE of DO UPDATE.
+fn resolve_upsert(e: &mut Engine, s: usize, w: usize, t: usize) -> void!db.Error {
+    u := nff(e, s)
+    info := pool_alloc(e, 20)?
+    zero_bytes(e.ws, info, 20)
+    stu(e.ws, w + W_UPSERT, info)
+    target := NO_COL
+    tl := na(e, u)
+    if tl != 0 {
+        n := list_len(e, tl)
+        ipk := rowid_col(e, t)
+        to := na(e, tl)
+        tlen := nb(e, tl)
+        c0 := find_column(e, t, to, tlen)
+        if n == 1 && ((c0 == ipk && ipk != NO_COL) || (c0 == NO_COL && is_rowid_name(e, to, tlen))) {
+            target = ROWID_TARGET
+        } else {
+            x := next_index_of(e, t, NO_COL)
+            for x != NO_COL {
+                if (obj_flags(e, x) & OF_UNIQUE) != 0 && obj_ncol(e, x) == n {
+                    all := true
+                    id := tl
+                    for id != 0 {
+                        let id_a = na(e, id)
+                        let id_b = nb(e, id)
+                        c := find_column(e, t, id_a, id_b)
+                        found := false
+                        for k in 0usize..n {
+                            if idx_col(e, x, k) == c && c != NO_COL {
+                                found = true
+                            }
+                        }
+                        if !found {
+                            all = false
+                        }
+                        id = nnext(e, id)
+                    }
+                    if all {
+                        target = x
+                        break
+                    }
+                }
+                x = next_index_of(e, t, x)
+            }
+            if target == NO_COL {
+                return err(fail(e, SQLITE_ERROR, "ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint"))
+            }
+        }
+    }
+    stu(e.ws, info, target)
+    let nop2 = nop(e, u) as usize
+    stu(e.ws, info + 4, nop2)
+    if nop(e, u) == 0 {
+        return ok()
+    }
+    // DO UPDATE: names refer to the existing row, excluded.* to the new one.
+    let u_d = ndd(e, u)
+    nset := list_len(e, u_d)
+    sets := pool_alloc(e, nset * 8 + 4)?
+    st := ndd(e, u)
+    k := 0usize
+    e.regctx_t = t
+    let old = wget(e, w, W_OLD)
+    e.regctx_base = old
+    let base = wget(e, w, W_BASE)
+    e.excluded_base = base
+    for st != 0 {
+        let st_a = na(e, st)
+        let st_b = nb(e, st)
+        col := find_column(e, t, st_a, st_b)
+        if col == NO_COL || col == rowid_col(e, t) {
+            let st_a2 = na(e, st)
+            let st_b2 = nb(e, st)
+            if col == NO_COL && !is_rowid_name(e, st_a2, st_b2) {
+                e.regctx_t = NO_COL
+                e.excluded_base = 0
+                e.msg_len = 0
+                msg_add(e, "no such column: ")
+                let st_a3 = na(e, st)
+                let st_b3 = nb(e, st)
+                msg_add_ws(e, st_a3, st_b3)
+                return err(make_error(e, SQLITE_ERROR))
+            }
+            col = ROWID_TARGET
+        }
+        let st_c = nc(e, st)
+        match resolve_expr(e, st_c, 0, false) {
+            ok() => {},
+            err(reason) => {
+                e.regctx_t = NO_COL
+                e.excluded_base = 0
+                return err(reason)
+            },
+        }
+        stu(e.ws, sets + k * 8, col)
+        let st_c2 = nc(e, st)
+        stu(e.ws, sets + k * 8 + 4, st_c2)
+        k += 1
+        st = nnext(e, st)
+    }
+    wr := ne_(e, u)
+    if wr != 0 {
+        match resolve_expr(e, wr, 0, false) {
+            ok() => {},
+            err(reason) => {
+                e.regctx_t = NO_COL
+                e.excluded_base = 0
+                return err(reason)
+            },
+        }
+    }
+    e.regctx_t = NO_COL
+    e.excluded_base = 0
+    stu(e.ws, info + 8, sets)
+    stu(e.ws, info + 12, nset)
+    stu(e.ws, info + 16, wr)
+    ok()
+}
+
+// True when the upsert clause of `w` handles a conflict on `target`.
+fn upsert_applies(e: &Engine, w: usize, target: usize) -> bool {
+    info := wget(e, w, W_UPSERT)
+    if info == 0 {
+        return false
+    }
+    want := ldu(e.ws, info)
+    want == NO_COL || want == target
+}
+
+// Resolves a conflict with existing row `r` by the upsert action. The insert
+// itself never happens.
+fn do_upsert(e: &mut Engine, w: usize, r: i64) -> void!db.Error {
+    info := wget(e, w, W_UPSERT)
+    if ldu(e.ws, info + 4) == 0 {
+        return ok()
+    }
+    t := wget(e, w, W_TABLE)
+    c := wget(e, w, W_CUR)
+    base := wget(e, w, W_BASE)
+    old := wget(e, w, W_OLD)
+    ncol := wget(e, w, W_NCOL)
+    ipk := rowid_col(e, t)
+    if !seek_rowid(e, c, r)? {
+        return err(corrupt(e))
+    }
+    let (p, len) = cur_payload(e, c)?
+    for i in 0usize..ncol {
+        if i == ipk {
+            set_int(e, old + i, r)
+        } else if !record_column(e, p, len, i, old + i)? {
+            column_default(e, t, i, old + i)?
+        }
+        reg_own(e, old + i)?
+    }
+    set_int(e, old + ncol, r)
+    for i in 0usize..(ncol + 1) {
+        reg_own(e, base + i)?
+    }
+    wr := ldu(e.ws, info + 16)
+    if wr != 0 && eval_truth(e, wr)? != 1 {
+        return ok()
+    }
+    sets := ldu(e.ws, info + 8)
+    nset := ldu(e.ws, info + 12)
+    save := e.rtop
+    first := e.rtop
+    for k in 0usize..nset {
+        reg := reg_push(e)?
+        let ldu2 = ldu(e.ws, sets + k * 8 + 4)
+        eval(e, ldu2, reg)?
+    }
+    // The updated row: the old values with the assignments applied.
+    for i in 0usize..(ncol + 1) {
+        copy_reg(e, base + i, old + i)
+    }
+    for k in 0usize..nset {
+        col := ldu(e.ws, sets + k * 8)
+        if col == ROWID_TARGET {
+            copy_reg(e, base + ncol, first + k)
+            if ipk != NO_COL {
+                copy_reg(e, base + ipk, first + k)
+            }
+        } else {
+            copy_reg(e, base + col, first + k)
+        }
+    }
+    for i in 0usize..(ncol + 1) {
+        reg_own(e, base + i)?
+    }
+    e.rtop = save
+    last := e.last_rowid
+    write_row(e, w, OE_ABORT, true, r)?
+    e.last_rowid = last
+    ok()
+}
+
+fn set_target(e: &mut Engine, w: usize, k: usize, src: usize) {
+    base := wget(e, w, W_BASE)
+    ncol := wget(e, w, W_NCOL)
+    target := ldu(e.ws, wget(e, w, W_COLMAP) + k * 4)
+    if target == ROWID_TARGET {
+        copy_reg(e, base + ncol, src)
+    } else {
+        copy_reg(e, base + target, src)
+    }
+}
+
+fn clear_row(e: &mut Engine, w: usize) {
+    base := wget(e, w, W_BASE)
+    ncol := wget(e, w, W_NCOL)
+    for i in 0usize..(ncol + 1) {
+        set_null(e, base + i)
+    }
+}
+
+// Fills unspecified columns from defaults.
+fn fill_defaults(e: &mut Engine, w: usize, given: usize) -> void!db.Error {
+    base := wget(e, w, W_BASE)
+    ncol := wget(e, w, W_NCOL)
+    defaults := wget(e, w, W_DEFAULTS)
+    for c in 0usize..ncol {
+        x := ldu(e.ws, defaults + c * 4)
+        if x != 0 && (x & 2147483648) == 0 {
+            eval(e, x, base + c)?
+        }
+    }
+    if given == 0 {
+        return ok()
+    }
+    ok()
+}
+
+fn exec_insert(e: &mut Engine, s: usize) -> void!db.Error {
+    w := sget_w(e, s)
+    open_write_cursors(e, w)
+    conf := wget(e, w, W_CONF) as u8
+    nlist := wget(e, w, W_NLIST)
+    e.ret_start = e.sort_top
+    if (nflags(e, s) & 1) != 0 {
+        mark := e.arena_top
+        clear_row(e, w)
+        fill_defaults(e, w, 0)?
+        write_row(e, w, conf, false, 0)?
+        arena_reset(e, mark)
+        return ok()
+    }
+    rows := ndd(e, s)
+    if rows != 0 {
+        row := rows
+        for row != 0 {
+            mark := e.arena_top
+            clear_row(e, w)
+            fill_defaults(e, w, 1)?
+            save := e.rtop
+            tmp := reg_push(e)?
+            x := na(e, row)
+            k := 0usize
+            for x != 0 {
+                eval(e, x, tmp)?
+                set_target(e, w, k, tmp)
+                k += 1
+                x = nnext(e, x)
+            }
+            e.rtop = save
+            write_row(e, w, conf, false, 0)?
+            arena_reset(e, mark)
+            row = nnext(e, row)
+        }
+        return ok()
+    }
+    // INSERT ... SELECT: materialize first (the source may be the target).
+    sel := ne_(e, s)
+    select_reset(e, sel)
+    resreg := select_resreg(e, sel)
+    start := e.sort_top
+    hi := e.sort_hi
+    mark := e.arena_top
+    got := select_next(e, sel)?
+    lend := list_begin(e)
+    for got {
+        rec := sort_push(e, resreg, nlist)?
+        list_push(e, rec)?
+        arena_reset(e, mark)
+        got = select_next(e, sel)?
+    }
+    let (idx, n) = list_finish(e, lend)
+    e.ret_start = e.sort_top
+    for i in 0usize..n {
+        p := ldu(e.ws, idx + i * 4)
+        mark := e.arena_top
+        clear_row(e, w)
+        fill_defaults(e, w, 1)?
+        for k in 0usize..nlist {
+            let len = rec_len(e, p)
+            record_column(e, p + 4, len, k, R_TMP)?
+            set_target(e, w, k, R_TMP)
+        }
+        write_row(e, w, conf, false, 0)?
+        arena_reset(e, mark)
+    }
+    e.sort_hi = hi
+    ok()
+}
+
+fn sget_w(e: &Engine, s: usize) -> usize {
+    ng(e, s)
+}
+
+// ---------------------------------------------------------------------------
+// Row writing with constraints
+
+fn constraint_fail(e: &mut Engine, code: i32, kind: &str, t: usize, cols: usize, ncols: usize, x: usize) -> db.Error {
+    e.msg_len = 0
+    msg_add(e, kind)
+    msg_add(e, " constraint failed: ")
+    tn := obj_u(e, t, O_NAME)
+    tl := obj_u(e, t, O_NAMEL)
+    if x == NO_COL {
+        // Single column `cols`.
+        msg_add_ws(e, tn, tl)
+        msg_add(e, ".")
+        if cols == NO_COL {
+            msg_add(e, "rowid")
+        } else {
+            r := col_rec(e, t, cols)
+            let name = ldu(e.ws, r + K_NAME)
+            let name_len = ldu(e.ws, r + K_NAMEL)
+            msg_add_ws(e, name, name_len)
+        }
+    } else {
+        for k in 0usize..ncols {
+            if k > 0 {
+                msg_add(e, ", ")
+            }
+            msg_add_ws(e, tn, tl)
+            msg_add(e, ".")
+            c := idx_col(e, x, k)
+            if c == NO_COL {
+                msg_add(e, "rowid")
+            } else {
+                r := col_rec(e, t, c)
+                let name2 = ldu(e.ws, r + K_NAME)
+                let name_len2 = ldu(e.ws, r + K_NAMEL)
+                msg_add_ws(e, name2, name_len2)
+            }
+        }
+    }
+    make_error(e, code)
+}
+
+// Builds the key registers of index x from the row registers; returns
+// false if any key column is NULL.
+fn index_key(e: &mut Engine, w: usize, x: usize, row: usize, rowid: i64) -> bool {
+    keys := wget(e, w, W_KEYREG)
+    ncol := wget(e, w, W_NCOL)
+    t := wget(e, w, W_TABLE)
+    n := obj_ncol(e, x)
+    any_null := false
+    for k in 0usize..n {
+        c := idx_col(e, x, k)
+        if c == NO_COL || c == rowid_col(e, t) {
+            set_int(e, keys + k, rowid)
+        } else {
+            copy_reg(e, keys + k, row + c)
+            if rtype(e, keys + k) == T_NULL {
+                any_null = true
+            }
+        }
+    }
+    set_int(e, keys + n, rowid)
+    if ncol == 0 {
+        return !any_null
+    }
+    !any_null
+}
+
+// Inserts the row in the W_BASE registers. Returns false when skipped by
+// OR IGNORE. For updates, `old_rowid` is the row being replaced (already
+// checked but not yet deleted).
+fn write_row(e: &mut Engine, w: usize, conf: u8, update: bool, old_rowid: i64) -> bool!db.Error {
+    t := wget(e, w, W_TABLE)
+    c := wget(e, w, W_CUR)
+    base := wget(e, w, W_BASE)
+    ncol := wget(e, w, W_NCOL)
+    ipk := rowid_col(e, t)
+    rid := base + ncol
+    seq_obj := wget(e, w, W_SEQ)
+    seq_value := 0i64
+    seq_rowid := 0i64
+    // Rowid.
+    if rtype(e, rid) != T_NULL {
+        compare_affinity(e, rid, AFF_NUMERIC)?
+        if rtype(e, rid) == T_REAL {
+            let (exact, iv) = real_as_int(rreal(e, rid))
+            if exact {
+                set_int(e, rid, iv)
+            }
+        }
+        if rtype(e, rid) != T_INT {
+            return err(fail(e, SQLITE_MISMATCH, "datatype mismatch"))
+        }
+    }
+    if seq_obj != 0 {
+        let (sv, sr) = read_sequence(e, w)?
+        seq_value = sv
+        seq_rowid = sr
+    }
+    if rtype(e, rid) == T_NULL {
+        next := 1i64
+        if cur_last(e, c)? {
+            maxr := cur_rowid(e, c)
+            if maxr == 9223372036854775807 {
+                if seq_obj != 0 {
+                    return err(fail(e, SQLITE_FULL, "database or disk is full"))
+                }
+                // Try random rowids.
+                found := false
+                for _ in 0usize..100 {
+                    cand := u2i(next_random(e) >> 1)
+                    if cand > 0 && !seek_rowid(e, c, cand)? {
+                        next = cand
+                        found = true
+                        break
+                    }
+                }
+                if !found {
+                    return err(fail(e, SQLITE_FULL, "database or disk is full"))
+                }
+            } else {
+                next = maxr + 1
+            }
+        }
+        if seq_obj != 0 && seq_value >= next {
+            if seq_value == 9223372036854775807 {
+                return err(fail(e, SQLITE_FULL, "database or disk is full"))
+            }
+            next = seq_value + 1
+        }
+        set_int(e, rid, next)
+    }
+    rowid := rint(e, rid)
+    // SQLite advances the AUTOINCREMENT sequence as soon as a rowid is
+    // chosen, even when OR IGNORE then skips the row.
+    if seq_obj != 0 && rowid > seq_value {
+        write_sequence(e, w, rowid, seq_rowid)?
+        seq_value = rowid
+        if seq_rowid == 0 {
+            let (sv, sr) = read_sequence(e, w)?
+            seq_value = sv
+            seq_rowid = sr
+        }
+    }
+    // Affinity.
+    for i in 0usize..ncol {
+        if i != ipk {
+            let affinity = col_aff(e, t, i)
+            apply_affinity(e, base + i, affinity)?
+        }
+    }
+    if ipk != NO_COL {
+        set_int(e, base + ipk, rowid)
+    }
+    // NOT NULL.
+    defaults := wget(e, w, W_DEFAULTS)
+    for i in 0usize..ncol {
+        if i == ipk || (col_flags(e, t, i) & CF_NOTNULL) == 0 || rtype(e, base + i) != T_NULL {
+            continue
+        }
+        if conf == OE_IGNORE {
+            return ok(false)
+        }
+        dx := if defaults != 0 {
+            ldu(e.ws, defaults + i * 4) & 2147483647
+        } else {
+            0usize
+        }
+        if conf == OE_REPLACE && dx != 0 {
+            eval(e, dx, base + i)?
+            let affinity2 = col_aff(e, t, i)
+            apply_affinity(e, base + i, affinity2)?
+            if rtype(e, base + i) != T_NULL {
+                continue
+            }
+        }
+        return err(constraint_fail(e, SQLITE_CONSTRAINT_NOTNULL, "NOT NULL", t, i, 0, NO_COL))
+    }
+    // CHECK.
+    checks := wget(e, w, W_CHECKS)
+    if checks != 0 {
+        if eval_truth(e, checks)? == 0 {
+            if conf == OE_IGNORE {
+                return ok(false)
+            }
+            e.msg_len = 0
+            msg_add(e, "CHECK constraint failed: ")
+            let name = obj_u(e, t, O_NAME)
+            let name_len = obj_u(e, t, O_NAMEL)
+            msg_add_ws(e, name, name_len)
+            return err(make_error(e, SQLITE_CONSTRAINT_CHECK))
+        }
+    }
+    // Rowid uniqueness.
+    if !update || rowid != old_rowid {
+        if seek_rowid(e, c, rowid)? {
+            if !update && upsert_applies(e, w, ROWID_TARGET) {
+                do_upsert(e, w, rowid)?
+                return ok(false)
+            }
+            if conf == OE_IGNORE {
+                return ok(false)
+            }
+            if conf == OE_REPLACE {
+                delete_row(e, w, rowid)?
+            } else {
+                return err(constraint_fail(e, SQLITE_CONSTRAINT_PRIMARYKEY, "UNIQUE", t, ipk, 0, NO_COL))
+            }
+        }
+    }
+    // UNIQUE indexes.
+    arr := wget(e, w, W_IDX)
+    nidx := wget(e, w, W_NIDX)
+    keys := wget(e, w, W_KEYREG)
+    for k in 0usize..nidx {
+        x := ldu(e.ws, arr + k * 8)
+        if (obj_flags(e, x) & OF_UNIQUE) == 0 {
+            continue
+        }
+        ic := ldu(e.ws, arr + k * 8 + 4)
+        n := obj_ncol(e, x)
+        if !index_key(e, w, x, base, rowid) {
+            continue
+        }
+        for {
+            if seek_index(e, ic, keys, n)? != 0 {
+                break
+            }
+            let (p, len) = cur_payload(e, ic)?
+            nf := record_count(e, p, len)
+            record_column(e, p, len, nf - 1, R_TMP)?
+            other := rint(e, R_TMP)
+            if other == rowid || (update && other == old_rowid) {
+                break
+            }
+            if !update && upsert_applies(e, w, x) {
+                do_upsert(e, w, other)?
+                return ok(false)
+            }
+            if conf == OE_IGNORE {
+                return ok(false)
+            }
+            if conf == OE_REPLACE {
+                delete_row(e, w, other)?
+                index_key(e, w, x, base, rowid)
+                continue
+            }
+            code := if (obj_flags(e, x) & OF_PK) != 0 {
+                SQLITE_CONSTRAINT_PRIMARYKEY
+            } else {
+                SQLITE_CONSTRAINT_UNIQUE
+            }
+            return err(constraint_fail(e, code, "UNIQUE", t, 0, n, x))
+        }
+    }
+    if update {
+        delete_row(e, w, old_rowid)?
+    }
+    store_row(e, w, rowid)?
+    ok(true)
+}
+
+fn store_row(e: &mut Engine, w: usize, rowid: i64) -> void!db.Error {
+    t := wget(e, w, W_TABLE)
+    c := wget(e, w, W_CUR)
+    base := wget(e, w, W_BASE)
+    ncol := wget(e, w, W_NCOL)
+    ipk := rowid_col(e, t)
+    // The INTEGER PRIMARY KEY column is stored as NULL (it is the rowid).
+    if ipk != NO_COL {
+        set_null(e, base + ipk)
+    }
+    size := record_size(e, base, ncol)
+    rec := arena_alloc(e, size)?
+    record_write(e, base, ncol, rec)
+    if ipk != NO_COL {
+        set_int(e, base + ipk, rowid)
+    }
+    table_insert(e, c, rowid, rec, size)?
+    arr := wget(e, w, W_IDX)
+    keys := wget(e, w, W_KEYREG)
+    for k in 0usize..wget(e, w, W_NIDX) {
+        x := ldu(e.ws, arr + k * 8)
+        ic := ldu(e.ws, arr + k * 8 + 4)
+        n := obj_ncol(e, x)
+        index_key(e, w, x, base, rowid)
+        for i in 0usize..n {
+            c2 := idx_col(e, x, i)
+            if c2 != NO_COL && c2 != ipk {
+                let affinity = col_aff(e, t, c2)
+                apply_affinity(e, keys + i, affinity)?
+            }
+        }
+        isize := record_size(e, keys, n + 1)
+        irec := arena_alloc(e, isize)?
+        record_write(e, keys, n + 1, irec)
+        index_insert(e, ic, irec, isize)?
+    }
+    e.changes += 1
+    e.last_rowid = rowid
+    push_returning(e, w)
+}
+
+// Deletes row `rowid` and its index entries.
+fn delete_row(e: &mut Engine, w: usize, rowid: i64) -> void!db.Error {
+    t := wget(e, w, W_TABLE)
+    c := wget(e, w, W_CUR)
+    old := wget(e, w, W_OLD)
+    ncol := wget(e, w, W_NCOL)
+    if !seek_rowid(e, c, rowid)? {
+        return ok()
+    }
+    ipk := rowid_col(e, t)
+    let (p, len) = cur_payload(e, c)?
+    for i in 0usize..ncol {
+        if i == ipk {
+            set_int(e, old + i, rowid)
+        } else if !record_column(e, p, len, i, old + i)? {
+            column_default(e, t, i, old + i)?
+        }
+        reg_own(e, old + i)?
+    }
+    arr := wget(e, w, W_IDX)
+    keys := wget(e, w, W_KEYREG)
+    for k in 0usize..wget(e, w, W_NIDX) {
+        x := ldu(e.ws, arr + k * 8)
+        ic := ldu(e.ws, arr + k * 8 + 4)
+        n := obj_ncol(e, x)
+        index_key(e, w, x, old, rowid)
+        if seek_index(e, ic, keys, n + 1)? == 0 {
+            cur_delete(e, ic)?
+        }
+    }
+    if seek_rowid(e, c, rowid)? {
+        cur_delete(e, c)?
+    }
+    ok()
+}
+
+// sqlite_sequence: (name, seq) rows.
+fn read_sequence(e: &mut Engine, w: usize) -> (i64, i64)!db.Error {
+    seq := wget(e, w, W_SEQ) - 1
+    sc := wget(e, w, W_SEQCUR)
+    t := wget(e, w, W_TABLE)
+    let root = obj_root(e, seq)
+    cur_open(e, sc, root, false)
+    more := cur_first(e, sc)?
+    for more {
+        let (p, n) = cur_payload(e, sc)?
+        record_column(e, p, n, 0, R_TMP)?
+        let off = roff(e, R_TMP)
+        let len = rlen(e, R_TMP)
+        let name = obj_u(e, t, O_NAME)
+        let name_len = obj_u(e, t, O_NAMEL)
+        if rtype(e, R_TMP) == T_TEXT && names_eq_exact(e, off, len, name, name_len) {
+            record_column(e, p, n, 1, R_TMP)?
+            return ok((to_int(e, R_TMP), cur_rowid(e, sc)))
+        }
+        more = cur_next(e, sc)?
+    }
+    ok((0i64, 0i64))
+}
+
+fn write_sequence(e: &mut Engine, w: usize, value: i64, row: i64) -> void!db.Error {
+    seq := wget(e, w, W_SEQ) - 1
+    sc := wget(e, w, W_SEQCUR)
+    t := wget(e, w, W_TABLE)
+    let root = obj_root(e, seq)
+    cur_open(e, sc, root, false)
+    rowid := row
+    if rowid == 0 {
+        rowid = 1
+        if cur_last(e, sc)? {
+            rowid = cur_rowid(e, sc) + 1
+        }
+    }
+    save := e.rtop
+    r := reg_push(e)?
+    r2 := reg_push(e)?
+    if r2 != r + 1 {
+        return err(fail(e, SQLITE_INTERNAL, "register stack"))
+    }
+    let name = obj_u(e, t, O_NAME)
+    let name_len = obj_u(e, t, O_NAMEL)
+    set_bytes(e, r, T_TEXT, name, name_len)
+    set_int(e, r2, value)
+    size := record_size(e, r, 2)
+    rec := arena_alloc(e, size)?
+    record_write(e, r, 2, rec)
+    e.rtop = save
+    table_insert(e, sc, rowid, rec, size)
+}
+
+// ---------------------------------------------------------------------------
+// UPDATE and DELETE: a synthesized "SELECT rowid FROM t WHERE ..." finds the
+// rows first; changes are applied afterwards.
+
+fn synth_select(e: &mut Engine, s: usize, t: usize) -> usize!db.Error {
+    sel := new_node(e, S_SELECT)?
+    src := new_node(e, N_SRC)?
+    let s_a = na(e, s)
+    set_nf(e, src, 0, s_a)
+    let s_b = nb(e, s)
+    set_nf(e, src, 1, s_b)
+    set_nf(e, sel, 1, src)
+    rc := new_node(e, N_RESCOL)?
+    ph := new_node(e, N_NULL)?
+    set_nf(e, rc, 0, ph)
+    set_nf(e, sel, 0, rc)
+    let s_d = ndd(e, s)
+    set_nf(e, sel, 2, s_d)
+    resolve_select(e, sel)?
+    // The result is the rowid of the scanned table.
+    set_kind(e, ph, N_COL)
+    c := (nx(e, src) & 0xffffffffu64) as usize
+    set_nf(e, ph, 0, c)
+    set_nf(e, ph, 1, NO_COL)
+    set_nf(e, ph, 2, t)
+    ok(sel)
+}
+
+fn resolve_update(e: &mut Engine, s: usize) -> void!db.Error {
+    let s_a = na(e, s)
+    let s_b = nb(e, s)
+    t := table_for_write(e, s_a, s_b)?
+    w := write_info(e, s, t)?
+    sel := synth_select(e, s, t)?
+    stu(e.ws, w + W_SEL, sel)
+    ncol := obj_ncol(e, t)
+    // SET targets resolve against the scanned table.
+    let s_c = nc(e, s)
+    nset := list_len(e, s_c)
+    sets := pool_alloc(e, nset * 8 + 4)?
+    st := nc(e, s)
+    k := 0usize
+    src := nb(e, sel)
+    ctx_push(e, src, 0)?
+    for st != 0 {
+        let st_a = na(e, st)
+        let st_b = nb(e, st)
+        col := find_column(e, t, st_a, st_b)
+        if col == NO_COL {
+            let st_a2 = na(e, st)
+            let st_b2 = nb(e, st)
+            if is_rowid_name(e, st_a2, st_b2) {
+                col = ROWID_TARGET
+            } else {
+                ctx_pop(e)
+                e.msg_len = 0
+                msg_add(e, "no such column: ")
+                let st_a3 = na(e, st)
+                let st_b3 = nb(e, st)
+                msg_add_ws(e, st_a3, st_b3)
+                return err(make_error(e, SQLITE_ERROR))
+            }
+        } else if col == rowid_col(e, t) {
+            col = ROWID_TARGET
+        }
+        let st_c = nc(e, st)
+        match resolve_expr(e, st_c, 0, false) {
+            ok() => {},
+            err(reason) => {
+                ctx_pop(e)
+                return err(reason)
+            },
+        }
+        stu(e.ws, sets + k * 8, col)
+        let st_c2 = nc(e, st)
+        stu(e.ws, sets + k * 8 + 4, st_c2)
+        k += 1
+        st = nnext(e, st)
+    }
+    ctx_pop(e)
+    stu(e.ws, w + W_SETS, sets)
+    stu(e.ws, w + W_NSET, nset)
+    if ncol == 0 {
+        return err(corrupt(e))
+    }
+    ok()
+}
+
+// Collects matching rowids on the sort stack; returns (start, count).
+fn collect_rowids(e: &mut Engine, sel: usize) -> (usize, usize)!db.Error {
+    select_reset(e, sel)
+    resreg := select_resreg(e, sel)
+    start := e.sort_top
+    n := 0usize
+    mark := e.arena_top
+    for select_next(e, sel)? {
+        o := sort_alloc(e, 8)?
+        let bits = i2u(rint(e, resreg))
+        st64(e.ws, o, bits)
+        n += 1
+        arena_reset(e, mark)
+    }
+    ok((start, n))
+}
+
+fn exec_update(e: &mut Engine, s: usize) -> void!db.Error {
+    w := sget_w(e, s)
+    sel := wget(e, w, W_SEL)
+    let (start, n) = collect_rowids(e, sel)?
+    e.ret_start = e.sort_top
+    // Rows were collected; open the write cursors (the scan used its own).
+    open_write_cursors(e, w)
+    t := wget(e, w, W_TABLE)
+    base := wget(e, w, W_BASE)
+    ncol := wget(e, w, W_NCOL)
+    ipk := rowid_col(e, t)
+    conf := wget(e, w, W_CONF) as u8
+    sets := wget(e, w, W_SETS)
+    nset := wget(e, w, W_NSET)
+    sinfo_ := sinfo(e, sel)
+    scan := ldu(e.ws, lev(e, sinfo_, 0) + L_CUR)
+    for i in 0usize..n {
+        rowid := u2i(ld64(e.ws, start + i * 8))
+        mark := e.arena_top
+        let root = obj_root(e, t)
+        cur_open(e, scan, root, false)
+        if !seek_rowid(e, scan, rowid)? {
+            continue
+        }
+        // Start from the old values.
+        let (p, len) = cur_payload(e, scan)?
+        for k in 0usize..ncol {
+            if k == ipk {
+                set_int(e, base + k, rowid)
+            } else if !record_column(e, p, len, k, base + k)? {
+                column_default(e, t, k, base + k)?
+            }
+        }
+        set_int(e, base + ncol, rowid)
+        // Evaluate every SET expression against the old row first.
+        save := e.rtop
+        first := e.rtop
+        for k in 0usize..nset {
+            r := reg_push(e)?
+            let ldu2 = ldu(e.ws, sets + k * 8 + 4)
+            eval(e, ldu2, r)?
+        }
+        for k in 0usize..nset {
+            col := ldu(e.ws, sets + k * 8)
+            if col == ROWID_TARGET {
+                copy_reg(e, base + ncol, first + k)
+                if ipk != NO_COL {
+                    copy_reg(e, base + ipk, first + k)
+                }
+            } else {
+                copy_reg(e, base + col, first + k)
+            }
+        }
+        for k in 0usize..(ncol + 1) {
+            reg_own(e, base + k)?
+        }
+        e.rtop = save
+        if rtype(e, base + ncol) == T_NULL {
+            return err(fail(e, SQLITE_MISMATCH, "datatype mismatch"))
+        }
+        write_row(e, w, conf, true, rowid)?
+        arena_reset(e, mark)
+    }
+    ok()
+}
+
+fn resolve_delete(e: &mut Engine, s: usize) -> void!db.Error {
+    let s_a = na(e, s)
+    let s_b = nb(e, s)
+    t := table_for_write(e, s_a, s_b)?
+    w := write_info(e, s, t)?
+    sel := synth_select(e, s, t)?
+    stu(e.ws, w + W_SEL, sel)
+    ok()
+}
+
+fn exec_delete(e: &mut Engine, s: usize) -> void!db.Error {
+    w := sget_w(e, s)
+    t := wget(e, w, W_TABLE)
+    if ndd(e, s) == 0 && wget(e, w, W_RET) == 0 {
+        // DELETE without WHERE: clear the table and its indexes.
+        let root = obj_root(e, t)
+        count := btree_count(e, root, MAX_DEPTH)?
+        let root2 = obj_root(e, t)
+        btree_clear(e, root2)?
+        arr := wget(e, w, W_IDX)
+        for k in 0usize..wget(e, w, W_NIDX) {
+            x := ldu(e.ws, arr + k * 8)
+            let root3 = obj_root(e, x)
+            btree_clear(e, root3)?
+        }
+        e.changes += count
+        return ok()
+    }
+    sel := wget(e, w, W_SEL)
+    let (start, n) = collect_rowids(e, sel)?
+    e.ret_start = e.sort_top
+    open_write_cursors(e, w)
+    for i in 0usize..n {
+        rowid := u2i(ld64(e.ws, start + i * 8))
+        mark := e.arena_top
+        delete_row(e, w, rowid)?
+        e.changes += 1
+        push_returning(e, w)?
+        arena_reset(e, mark)
+    }
+    ok()
+}

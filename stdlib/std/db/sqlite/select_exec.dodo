@@ -1,0 +1,1329 @@
+package sqlite
+
+import "std/db"
+
+// SELECT execution: joins, aggregation, sorting, compounds, subqueries.
+
+// ---------------------------------------------------------------------------
+// Sorter: records are appended as [u32 length][record] on the sort stack.
+// A key map is an array of 4-byte entries: field u16, collation, flags
+// (1 descending, 2 nulls last, 4 nulls first).
+
+fn sort_push(e: &mut Engine, first: usize, n: usize) -> usize!db.Error {
+    size := record_size(e, first, n)
+    if e.sort_top + 4 + size > e.sort_hi {
+        return err(full(e, "sorter (result too large to sort or group in this workspace)"))
+    }
+    o := e.sort_top
+    stu(e.ws, o, size)
+    record_write(e, first, n, o + 4)
+    e.sort_top += 4 + size
+    ok(o)
+}
+
+fn sort_alloc(e: &mut Engine, len: usize) -> usize!db.Error {
+    if e.sort_top + len > e.sort_hi {
+        return err(full(e, "sorter (result too large to sort or group in this workspace)"))
+    }
+    o := e.sort_top
+    e.sort_top += len
+    ok(o)
+}
+
+// Record lists: offsets pushed downward from sort_hi, so records and other
+// sort-stack data can interleave freely. list_finish returns the offsets in
+// insertion order.
+fn list_begin(e: &Engine) -> usize {
+    e.sort_hi
+}
+
+fn list_push(e: &mut Engine, v: usize) -> void!db.Error {
+    if e.sort_hi < e.sort_top + 4 {
+        return err(full(e, "sorter (too many rows)"))
+    }
+    e.sort_hi -= 4
+    let o = e.sort_hi
+    stu(e.ws, o, v)
+    ok()
+}
+
+fn list_finish(e: &mut Engine, end: usize) -> (usize, usize) {
+    base := e.sort_hi
+    n := (end - base) / 4
+    i := 0usize
+    j := n
+    for i + 1 < j {
+        a := ldu(e.ws, base + i * 4)
+        b := ldu(e.ws, base + (j - 1) * 4)
+        stu(e.ws, base + i * 4, b)
+        stu(e.ws, base + (j - 1) * 4, a)
+        i += 1
+        j -= 1
+    }
+    (base, n)
+}
+
+fn rec_len(e: &Engine, r: usize) -> usize {
+    ldu(e.ws, r)
+}
+
+// Builds a key map for fields [start, start + n) from (coll, flags) pairs.
+fn keymap_range(e: &mut Engine, start: usize, n: usize, info: usize) -> usize!db.Error {
+    m := sort_alloc(e, n * 4 + 4)?
+    for k in 0usize..n {
+        st16(e.ws, m + k * 4, start + k)
+        e.ws[m + k * 4 + 2] = if info != 0 {
+            e.ws[info + k * 2]
+        } else {
+            COLL_BINARY
+        }
+        e.ws[m + k * 4 + 3] = if info != 0 {
+            e.ws[info + k * 2 + 1]
+        } else {
+            0u8
+        }
+    }
+    ok(m)
+}
+
+fn keymap_compare(e: &mut Engine, a: usize, b: usize, map: usize, n: usize) -> i32!db.Error {
+    for k in 0usize..n {
+        f := ld16(e.ws, map + k * 4)
+        coll := e.ws[map + k * 4 + 2]
+        flags := e.ws[map + k * 4 + 3]
+        let len = rec_len(e, a)
+        record_column(e, a + 4, len, f, R_TMP3)?
+        let len2 = rec_len(e, b)
+        record_column(e, b + 4, len2, f, R_TMP4)?
+        na_ := rtype(e, R_TMP3) == T_NULL
+        nb_ := rtype(e, R_TMP4) == T_NULL
+        c := 0i32
+        if (na_ || nb_) && (flags & 6) != 0 {
+            if na_ && nb_ {
+                c = 0
+            } else {
+                // NULLS LAST/FIRST override the default placement.
+                nulls_last := (flags & 2) != 0
+                c = if na_ == nulls_last {
+                    1i32
+                } else {
+                    -1i32
+                }
+                if (flags & 1) != 0 {
+                    c = -c
+                }
+            }
+        } else {
+            c = reg_compare(e, R_TMP3, R_TMP4, coll)
+        }
+        if c != 0 {
+            return ok(if (flags & 1) != 0 {
+                -c
+            } else {
+                c
+            })
+        }
+    }
+    ok(0)
+}
+
+// Stable bottom-up merge sort of n record offsets at idx.
+fn sort_records(e: &mut Engine, idx: usize, n: usize, map: usize, nkeys: usize) -> void!db.Error {
+    if n < 2 {
+        return ok()
+    }
+    tmp := sort_alloc(e, n * 4)?
+    src := idx
+    dst := tmp
+    width := 1usize
+    for width < n {
+        i := 0usize
+        for i < n {
+            mid := if i + width < n {
+                i + width
+            } else {
+                n
+            }
+            hi := if i + 2 * width < n {
+                i + 2 * width
+            } else {
+                n
+            }
+            l := i
+            r := mid
+            k := i
+            for l < mid && r < hi {
+                a := ldu(e.ws, src + l * 4)
+                b := ldu(e.ws, src + r * 4)
+                if keymap_compare(e, b, a, map, nkeys)? < 0 {
+                    stu(e.ws, dst + k * 4, b)
+                    r += 1
+                } else {
+                    stu(e.ws, dst + k * 4, a)
+                    l += 1
+                }
+                k += 1
+            }
+            for l < mid {
+                v := ldu(e.ws, src + l * 4)
+                stu(e.ws, dst + k * 4, v)
+                l += 1
+                k += 1
+            }
+            for r < hi {
+                v := ldu(e.ws, src + r * 4)
+                stu(e.ws, dst + k * 4, v)
+                r += 1
+                k += 1
+            }
+            i += 2 * width
+        }
+        t := src
+        src = dst
+        dst = t
+        width = width * 2
+    }
+    if src != idx {
+        move_bytes(e.ws, src, idx, n * 4)
+    }
+    e.sort_top = tmp
+    ok()
+}
+
+// Sorts record offsets numerically (restores insertion order).
+fn sort_offsets(e: &mut Engine, idx: usize, n: usize) {
+    // Insertion sort is fine for kept subsets; use shell gaps for speed.
+    gap := n / 2
+    for gap > 0 {
+        for i in gap..n {
+            v := ldu(e.ws, idx + i * 4)
+            j := i
+            for j >= gap && ldu(e.ws, idx + (j - gap) * 4) > v {
+                w := ldu(e.ws, idx + (j - gap) * 4)
+                stu(e.ws, idx + j * 4, w)
+                j -= gap
+            }
+            stu(e.ws, idx + j * 4, v)
+        }
+        gap = gap / 2
+    }
+}
+
+// Collects the offsets of records pushed between `start` and the stack top
+// into a new index array. Returns (index, count).
+fn index_records(e: &mut Engine, start: usize, end: usize) -> (usize, usize)!db.Error {
+    n := 0usize
+    p := start
+    for p < end {
+        n += 1
+        p += 4 + rec_len(e, p)
+    }
+    idx := sort_alloc(e, n * 4)?
+    p = start
+    k := 0usize
+    for p < end {
+        stu(e.ws, idx + k * 4, p)
+        k += 1
+        p += 4 + rec_len(e, p)
+    }
+    ok((idx, n))
+}
+
+// Keeps the first record of each run of equal keys. Returns the new count.
+fn dedupe(e: &mut Engine, idx: usize, n: usize, map: usize, nkeys: usize) -> usize!db.Error {
+    if n == 0 {
+        return ok(0)
+    }
+    k := 1usize
+    for i in 1usize..n {
+        a := ldu(e.ws, idx + (k - 1) * 4)
+        b := ldu(e.ws, idx + i * 4)
+        if keymap_compare(e, a, b, map, nkeys)? != 0 {
+            stu(e.ws, idx + k * 4, b)
+            k += 1
+        }
+    }
+    ok(k)
+}
+
+// ---------------------------------------------------------------------------
+// Joins
+
+fn check_level_terms(e: &mut Engine, info: usize, l: usize) -> bool!db.Error {
+    lv := lev(e, info, l)
+    on := ldu(e.ws, lv + L_ON)
+    if on != 0 && e.ws[lv + L_NULLROW] == 0 {
+        if eval_truth(e, on)? != 1 {
+            return ok(false)
+        }
+    }
+    ok(true)
+}
+
+fn check_where_terms(e: &mut Engine, info: usize, l: usize) -> bool!db.Error {
+    lv := lev(e, info, l)
+    n := ldu(e.ws, lv + L_NTERMS)
+    arr := ldu(e.ws, lv + L_TERMS)
+    for i in 0usize..n {
+        let ldu2 = ldu(e.ws, arr + i * 4)
+        if eval_truth(e, ldu2)? != 1 {
+            return ok(false)
+        }
+    }
+    ok(true)
+}
+
+fn set_nullrow(e: &mut Engine, info: usize, l: usize, on: bool) {
+    lv := lev(e, info, l)
+    e.ws[lv + L_NULLROW] = if on {
+        1u8
+    } else {
+        0u8
+    }
+    c := ldu(e.ws, lv + L_CUR)
+    co := cur(e, c)
+    e.ws[co + C_NULLROW] = if on {
+        1u8
+    } else {
+        0u8
+    }
+}
+
+// Advances the nested loop to the next combination that passes the ON
+// conditions and per-level WHERE terms.
+fn join_next(e: &mut Engine, info: usize) -> bool!db.Error {
+    nlev := iget(e, info, I_NLEV)
+    if nlev == 0 {
+        if e.ws[info + I_STARTED] != 0 {
+            return ok(false)
+        }
+        e.ws[info + I_STARTED] = 1
+        return ok(true)
+    }
+    l := 0usize
+    advance := false
+    if e.ws[info + I_STARTED] == 0 {
+        e.ws[info + I_STARTED] = 1
+        l = 0
+    } else {
+        l = nlev - 1
+        advance = true
+    }
+    for {
+        lv := lev(e, info, l)
+        got := false
+        if advance && e.ws[lv + L_NULLROW] != 0 {
+            // The null row was this level's last candidate.
+            set_nullrow(e, info, l, false)
+            got = false
+        } else {
+            first := e.ws[lv + L_STATE] == 0
+            if first {
+                e.ws[lv + L_STATE] = 1
+                e.ws[lv + L_MATCHED] = 0
+            }
+            got = level_move(e, info, l, first)?
+            for got {
+                mark := e.arena_top
+                if check_level_terms(e, info, l)? {
+                    e.ws[lv + L_MATCHED] = 1
+                    if check_where_terms(e, info, l)? {
+                        break
+                    }
+                }
+                arena_reset(e, mark)
+                got = level_move(e, info, l, false)?
+            }
+            if !got && e.ws[lv + L_LEFT] != 0 && e.ws[lv + L_MATCHED] == 0 {
+                set_nullrow(e, info, l, true)
+                e.ws[lv + L_MATCHED] = 1
+                got = check_where_terms(e, info, l)?
+                if !got {
+                    set_nullrow(e, info, l, false)
+                }
+            }
+        }
+        if got {
+            if l == nlev - 1 {
+                return ok(true)
+            }
+            l += 1
+            lv2 := lev(e, info, l)
+            e.ws[lv2 + L_STATE] = 0
+            set_nullrow(e, info, l, false)
+            advance = false
+            continue
+        }
+        // Level exhausted.
+        e.ws[lv + L_STATE] = 0
+        if l == 0 {
+            return ok(false)
+        }
+        l -= 1
+        advance = true
+    }
+}
+
+fn check_final(e: &mut Engine, info: usize) -> bool!db.Error {
+    n := iget(e, info, I_NFINAL)
+    arr := iget(e, info, I_WHERE)
+    for i in 0usize..n {
+        let ldu2 = ldu(e.ws, arr + i * 4)
+        if eval_truth(e, ldu2)? != 1 {
+            return ok(false)
+        }
+    }
+    full_where := iget(e, info, I_FINAL)
+    if full_where != 0 {
+        if eval_truth(e, full_where)? != 1 {
+            return ok(false)
+        }
+    }
+    ok(true)
+}
+
+fn compute_results(e: &mut Engine, s: usize, info: usize) -> void!db.Error {
+    r := iget(e, info, I_RESREG)
+    rc := na(e, s)
+    k := 0usize
+    for rc != 0 {
+        let rc_a = na(e, rc)
+        eval(e, rc_a, r + k)?
+        k += 1
+        rc = nnext(e, rc)
+    }
+    ok()
+}
+
+// ---------------------------------------------------------------------------
+// Rows before ORDER BY / DISTINCT / LIMIT
+
+fn aggs_reset(e: &mut Engine, info: usize) {
+    list := iget(e, info, I_AGGLIST)
+    n := iget(e, info, I_NAGG)
+    for i in 0usize..n {
+        let ldu2 = ldu(e.ws, list + i * 4)
+        agg_reset(e, ldu2)
+    }
+    let aggmark = iget(e, info, I_AGGMARK)
+    e.agg_top = aggmark
+}
+
+fn aggs_step(e: &mut Engine, info: usize) -> void!db.Error {
+    list := iget(e, info, I_AGGLIST)
+    n := iget(e, info, I_NAGG)
+    for i in 0usize..n {
+        let ldu2 = ldu(e.ws, list + i * 4)
+        agg_step(e, ldu2)?
+    }
+    ok()
+}
+
+// Writes the slot values of the current row (group keys first) to the sorter.
+fn push_slot_record(e: &mut Engine, s: usize, info: usize) -> usize!db.Error {
+    ngroup := iget(e, info, I_NGROUP)
+    nslot := iget(e, info, I_NSLOT)
+    save := e.rtop
+    base := e.rtop
+    for _ in 0usize..(ngroup + nslot) {
+        reg_push(e)?
+    }
+    ext := ndd(e, s)
+    g := if ext != 0 {
+        na(e, ext)
+    } else {
+        0usize
+    }
+    k := 0usize
+    for g != 0 {
+        let g_a = na(e, g)
+        eval(e, g_a, base + k)?
+        k += 1
+        g = nnext(e, g)
+    }
+    slots := iget(e, info, I_SLOTS)
+    for i in 0usize..nslot {
+        n := ldu(e.ws, slots + i * 4)
+        // Read the underlying column (N_SLOT falls back to its cursor).
+        eval_column(e, n, base + ngroup + i)?
+    }
+    r := sort_push(e, base, ngroup + nslot)?
+    e.rtop = save
+    ok(r)
+}
+
+fn having_ok(e: &mut Engine, s: usize) -> bool!db.Error {
+    ext := ndd(e, s)
+    if ext == 0 || nb(e, ext) == 0 {
+        return ok(true)
+    }
+    let ext_b = nb(e, ext)
+    ok(eval_truth(e, ext_b)? == 1)
+}
+
+// Produces the next row (results computed) of a simple select core.
+fn raw_next(e: &mut Engine, s: usize, info: usize) -> bool!db.Error {
+    agg := iget(e, info, I_AGG)
+    if agg == AGG_NONE {
+        for {
+            if !join_next(e, info)? {
+                return ok(false)
+            }
+            mark := e.arena_top
+            if check_final(e, info)? {
+                compute_results(e, s, info)?
+                return ok(true)
+            }
+            arena_reset(e, mark)
+        }
+    }
+    if e.ws[info + I_DONE] != 0 {
+        return ok(false)
+    }
+    if agg == AGG_SIMPLE {
+        e.ws[info + I_DONE] = 1
+        aggs_reset(e, info)
+        nslot := iget(e, info, I_NSLOT)
+        last := 0usize
+        base := e.sort_top
+        e.slot_rec = 0
+        mark := e.arena_top
+        for join_next(e, info)? {
+            if check_final(e, info)? {
+                e.agg_hit = 0
+                aggs_step(e, info)?
+                // Bare columns come from the first row, or from the row
+                // holding the extreme of a single min()/max().
+                minmax := iget(e, info, I_MINMAX)
+                if nslot > 0 && (last == 0 || (minmax != 0 && e.agg_hit == minmax)) {
+                    e.sort_top = base
+                    last = push_slot_record(e, s, info)?
+                }
+            }
+            arena_reset(e, mark)
+        }
+        if last != 0 {
+            e.slot_rec = last + 4
+            let len = rec_len(e, last)
+            e.slot_len = len
+        } else {
+            e.slot_rec = 0
+        }
+        // No GROUP BY: one row, unless HAVING rejects it.
+        if !having_ok(e, s)? {
+            return ok(false)
+        }
+        compute_results(e, s, info)?
+        own_results(e, info)?
+        return ok(true)
+    }
+    // GROUP BY.
+    ngroup := iget(e, info, I_NGROUP)
+    prepare_group(e, s, info)?
+    idx := iget(e, info, I_GIDX)
+    n := iget(e, info, I_GN)
+    map := iget(e, info, I_PREVLEN)
+    for {
+        pos := iget(e, info, I_GPOS)
+        if e.ws[info + I_GOPEN] == 2 {
+            aggs_reset(e, info)
+            e.ws[info + I_GOPEN] = 0
+        }
+        if pos < n {
+            rec := ldu(e.ws, idx + pos * 4)
+            prev := iget(e, info, I_PREV)
+            if e.ws[info + I_GOPEN] == 1 && keymap_compare(e, prev, rec, map, ngroup)? != 0 {
+                if finish_group(e, s, info, prev)? {
+                    return ok(true)
+                }
+                continue
+            }
+            if e.ws[info + I_GOPEN] == 0 {
+                iset(e, info, I_GFIRST, rec)
+            }
+            e.slot_rec = rec + 4
+            let len2 = rec_len(e, rec)
+            e.slot_len = len2
+            e.slot_first = 0
+            mark := e.arena_top
+            e.agg_hit = 0
+            aggs_step(e, info)?
+            minmax := iget(e, info, I_MINMAX)
+            if minmax != 0 && e.agg_hit == minmax {
+                iset(e, info, I_GFIRST, rec)
+            }
+            arena_reset(e, mark)
+            iset(e, info, I_PREV, rec)
+            e.ws[info + I_GOPEN] = 1
+            iset(e, info, I_GPOS, pos + 1)
+            continue
+        }
+        if e.ws[info + I_GOPEN] == 1 {
+            prev := iget(e, info, I_PREV)
+            e.ws[info + I_DONE] = 1
+            if finish_group(e, s, info, prev)? {
+                return ok(true)
+            }
+        }
+        e.ws[info + I_DONE] = 1
+        return ok(false)
+    }
+}
+
+fn carve_agg_area(e: &mut Engine, info: usize) {
+    free := e.sort_hi - e.sort_top
+    slab := free / 4
+    e.agg_top = e.sort_top
+    e.agg_end = e.sort_top + slab
+    e.sort_top += slab
+    let mark = e.agg_top
+    iset(e, info, I_AGGMARK, mark)
+}
+
+fn finish_group(e: &mut Engine, s: usize, info: usize, prev: usize) -> bool!db.Error {
+    // Bare columns: the group's first row (or its min()/max() row).
+    first := iget(e, info, I_GFIRST)
+    e.slot_rec = first + 4
+    let fl = rec_len(e, first)
+    e.slot_len = fl
+    e.slot_first = 0
+    e.ws[info + I_GOPEN] = 2
+    if !having_ok(e, s)? {
+        return ok(false)
+    }
+    compute_results(e, s, info)?
+    own_results(e, info)?
+    ok(true)
+}
+
+// Copies result values out of the aggregate area into the arena.
+fn own_results(e: &mut Engine, info: usize) -> void!db.Error {
+    r := iget(e, info, I_RESREG)
+    n := iget(e, info, I_NRES)
+    for k in 0usize..n {
+        reg_own(e, r + k)?
+    }
+    ok()
+}
+
+// ---------------------------------------------------------------------------
+// select_next: final stage with ORDER BY / DISTINCT / LIMIT / OFFSET
+
+fn select_reset(e: &mut Engine, s: usize) {
+    p := s
+    for p != 0 {
+        info := sinfo(e, p)
+        e.ws[info + I_PHASE] = 0
+        e.ws[info + I_DONE] = 0
+        e.ws[info + I_STARTED] = 0
+        e.ws[info + I_GOPEN] = 0
+        iset(e, info, I_POS, 0)
+        level_reset(e, info)
+        p = nnext(e, p)
+    }
+    info0 := sinfo(e, s)
+    e.ws[info0 + I_PHASE + 1] = 0
+    let sort_top2 = e.sort_top
+    iset(e, info0, I_MARK, sort_top2)
+    st64(e.ws, info0 + I_LIMIT, i2u(-1))
+    st64(e.ws, info0 + I_OFFSET, 0)
+}
+
+fn eval_limit(e: &mut Engine, s: usize) -> void!db.Error {
+    info := sinfo(e, s)
+    ext := ndd(e, s)
+    if ext == 0 {
+        return ok()
+    }
+    save := e.rtop
+    r := reg_push(e)?
+    if ndd(e, ext) != 0 {
+        let ext_d = ndd(e, ext)
+        eval(e, ext_d, r)?
+        if rtype(e, r) != T_NULL {
+            compare_affinity(e, r, AFF_NUMERIC)?
+            if rtype(e, r) != T_INT {
+                e.rtop = save
+                return err(fail(e, SQLITE_MISMATCH, "datatype mismatch"))
+            }
+            let bits = i2u(rint(e, r))
+            st64(e.ws, info + I_LIMIT, bits)
+        }
+    }
+    if ne_(e, ext) != 0 {
+        let ext_e = ne_(e, ext)
+        eval(e, ext_e, r)?
+        if rtype(e, r) != T_NULL {
+            compare_affinity(e, r, AFF_NUMERIC)?
+            if rtype(e, r) != T_INT {
+                e.rtop = save
+                return err(fail(e, SQLITE_MISMATCH, "datatype mismatch"))
+            }
+            v := rint(e, r)
+            st64(e.ws, info + I_OFFSET, i2u(if v < 0 {
+                0i64
+            } else {
+                v
+            }))
+        }
+    }
+    e.rtop = save
+    ok()
+}
+
+fn select_resreg(e: &Engine, s: usize) -> usize {
+    let info_value = sinfo(e, s)
+    iget(e, info_value, I_RESREG)
+}
+
+fn select_ncols(e: &Engine, s: usize) -> usize {
+    let info_value = sinfo(e, s)
+    iget(e, info_value, I_NRES)
+}
+
+// Next output row of select s (results in its result registers).
+fn select_next(e: &mut Engine, s: usize) -> bool!db.Error {
+    info := sinfo(e, s)
+    stage := e.ws[info + I_PHASE + 1]
+    if stage == 0 {
+        e.ws[info + I_PHASE + 1] = 1
+        eval_limit(e, s)?
+        materialize_sources(e, info)?
+        if iget(e, info, I_AGG) == AGG_SIMPLE {
+            carve_agg_area(e, info)
+        }
+        if nnext(e, s) != 0 || iget(e, info, I_MODE) == MODE_SORT {
+            materialize(e, s)?
+            e.ws[info + I_PHASE + 1] = 2
+        }
+    }
+    limit := u2i(ld64(e.ws, info + I_LIMIT))
+    for {
+        if limit == 0 {
+            return ok(false)
+        }
+        got := false
+        if e.ws[info + I_PHASE + 1] == 2 {
+            got = sorted_next(e, s)?
+        } else {
+            got = raw_next(e, s, info)?
+        }
+        if !got {
+            return ok(false)
+        }
+        offset := u2i(ld64(e.ws, info + I_OFFSET))
+        if offset > 0 {
+            st64(e.ws, info + I_OFFSET, i2u(offset - 1))
+            continue
+        }
+        if limit > 0 {
+            st64(e.ws, info + I_LIMIT, i2u(limit - 1))
+        }
+        return ok(true)
+    }
+}
+
+// Runs the select (and compound arms) into sorted, deduplicated records.
+fn materialize(e: &mut Engine, s: usize) -> void!db.Error {
+    info := sinfo(e, s)
+    nres := iget(e, info, I_NRES)
+    ext := ndd(e, s)
+    order := if ext != 0 {
+        nc(e, ext)
+    } else {
+        0usize
+    }
+    norder := list_len(e, order)
+    resreg := iget(e, info, I_RESREG)
+    if nnext(e, s) != 0 {
+        return materialize_compound(e, s)
+    }
+    distinct := (nflags(e, s) & 1) != 0
+    prepare_group(e, s, info)?
+    // Records: [order keys..., results...].
+    lend := list_begin(e)
+    for {
+        mark := e.arena_top
+        if !raw_next(e, s, info)? {
+            break
+        }
+        save := e.rtop
+        base := e.rtop
+        for _ in 0usize..(norder + nres) {
+            reg_push(e)?
+        }
+        o := order
+        k := 0usize
+        for o != 0 {
+            let o_a = na(e, o)
+            eval(e, o_a, base + k)?
+            k += 1
+            o = nnext(e, o)
+        }
+        for i in 0usize..nres {
+            copy_reg(e, base + norder + i, resreg + i)
+        }
+        rec := sort_push(e, base, norder + nres)?
+        list_push(e, rec)?
+        e.rtop = save
+        arena_reset(e, mark)
+    }
+    let (idx, n) = list_finish(e, lend)
+    oinfo := iget(e, info, I_ORDINFO)
+    cnt := n
+    if distinct {
+        dmap := keymap_range(e, norder, nres, oinfo + norder * 2)?
+        sort_records(e, idx, n, dmap, nres)?
+        cnt = dedupe(e, idx, n, dmap, nres)?
+        sort_offsets(e, idx, cnt)
+    }
+    if norder > 0 {
+        omap := keymap_range(e, 0, norder, oinfo)?
+        sort_records(e, idx, cnt, omap, norder)?
+    }
+    iset(e, info, I_IDX, idx)
+    iset(e, info, I_N, cnt)
+    iset(e, info, I_POS, 0)
+    iset(e, info, I_LASTREC, norder)
+    ok()
+}
+
+fn sorted_next(e: &mut Engine, s: usize) -> bool!db.Error {
+    info := sinfo(e, s)
+    pos := iget(e, info, I_POS)
+    if pos >= iget(e, info, I_N) {
+        return ok(false)
+    }
+    iset(e, info, I_POS, pos + 1)
+    rec := ldu(e.ws, iget(e, info, I_IDX) + pos * 4)
+    skip := iget(e, info, I_LASTREC)
+    nres := iget(e, info, I_NRES)
+    resreg := iget(e, info, I_RESREG)
+    for i in 0usize..nres {
+        let len = rec_len(e, rec)
+        record_column(e, rec + 4, len, skip + i, resreg + i)?
+    }
+    ok(true)
+}
+
+// Compound selects: every arm's rows become records [results..., arm];
+// set operations are applied left to right on sorted runs.
+fn materialize_compound(e: &mut Engine, s: usize) -> void!db.Error {
+    info := sinfo(e, s)
+    nres := iget(e, info, I_NRES)
+    resreg := iget(e, info, I_RESREG)
+    // Run 0: the first arm.
+    run_end := collect_arm(e, s, 0)?
+    let (idx0, n0) = list_finish(e, run_end)
+    idx := idx0
+    n := n0
+    first_op := true
+    arm := nnext(e, s)
+    map := keymap_range(e, 0, nres, 0)?
+    for arm != 0 {
+        op := nop(e, arm)
+        aend := collect_arm(e, arm, 1)?
+        let (aidx, an) = list_finish(e, aend)
+        // Combined index: current run followed by the arm's records.
+        comb := sort_alloc(e, (n + an) * 4)?
+        move_bytes(e.ws, idx, comb, n * 4)
+        move_bytes(e.ws, aidx, comb + n * 4, an * 4)
+        total := n + an
+        if op == 2 {
+            idx = comb
+            n = total
+        } else {
+            sort_records(e, comb, total, map, nres)?
+            out := sort_alloc(e, total * 4)?
+            k := 0usize
+            i := 0usize
+            for i < total {
+                j := i + 1
+                left := false
+                right := false
+                r0 := ldu(e.ws, comb + i * 4)
+                for j < total {
+                    rj := ldu(e.ws, comb + j * 4)
+                    if keymap_compare(e, r0, rj, map, nres)? != 0 {
+                        break
+                    }
+                    j += 1
+                }
+                for t in i..j {
+                    rt := ldu(e.ws, comb + t * 4)
+                    side := record_side(e, rt, nres)?
+                    if side == 0 {
+                        left = true
+                    } else {
+                        right = true
+                    }
+                }
+                keep := if op == 1 {
+                    true
+                } else if op == 3 {
+                    left && right
+                } else {
+                    left && !right
+                }
+                if keep {
+                    stu(e.ws, out + k * 4, r0)
+                    k += 1
+                }
+                i = j
+            }
+            idx = out
+            n = k
+            // Members of the new run are all "left" for the next operation.
+            for t in 0usize..n {
+                r := ldu(e.ws, idx + t * 4)
+                set_record_side(e, r, nres)?
+            }
+        }
+        if op == 2 {
+            for t in 0usize..n {
+                r := ldu(e.ws, idx + t * 4)
+                set_record_side(e, r, nres)?
+            }
+        }
+        first_op = false
+        arm = nnext(e, arm)
+    }
+    if first_op {
+        return err(fail(e, SQLITE_INTERNAL, "compound without arms"))
+    }
+    // ORDER BY of the compound refers to result columns.
+    ext := ndd(e, s)
+    order := if ext != 0 {
+        nc(e, ext)
+    } else {
+        0usize
+    }
+    norder := list_len(e, order)
+    if norder > 0 {
+        omap := sort_alloc(e, norder * 4)?
+        o := order
+        k := 0usize
+        for o != 0 {
+            let ldu2 = ldu(e.ws, nd(e, o) + 4 + 4 * 4)
+            st16(e.ws, omap + k * 4, ldu2)
+            let nb2 = nb(e, o) as u8
+            e.ws[omap + k * 4 + 2] = nb2
+            flags := nflags(e, o)
+            e.ws[omap + k * 4 + 3] = (flags & 1) as u8 | (if (flags & 2) != 0 {
+                2u8
+            } else {
+                0u8
+            }) | (if (flags & 4) != 0 {
+                4u8
+            } else {
+                0u8
+            })
+            k += 1
+            o = nnext(e, o)
+        }
+        sort_offsets(e, idx, n)
+        sort_records(e, idx, n, omap, norder)?
+    } else if !all_union_all(e, s) {
+        // SQLite returns set-operation results in sorted order.
+    } else {
+        sort_offsets(e, idx, n)
+    }
+    iset(e, info, I_IDX, idx)
+    iset(e, info, I_N, n)
+    iset(e, info, I_POS, 0)
+    iset(e, info, I_LASTREC, 0)
+    if resreg == 0 {
+        return err(fail(e, SQLITE_INTERNAL, "compound registers"))
+    }
+    ok()
+}
+
+fn all_union_all(e: &Engine, s: usize) -> bool {
+    p := nnext(e, s)
+    for p != 0 {
+        if nop(e, p) != 2 {
+            return false
+        }
+        p = nnext(e, p)
+    }
+    true
+}
+
+// Appends every row of `arm` as [results..., side]; returns where the
+// arm's records start.
+fn collect_arm(e: &mut Engine, arm: usize, side: i64) -> usize!db.Error {
+    ainfo := sinfo(e, arm)
+    nres := iget(e, ainfo, I_NRES)
+    resreg := iget(e, ainfo, I_RESREG)
+    prepare_group(e, arm, ainfo)?
+    materialize_sources(e, ainfo)?
+    lend := list_begin(e)
+    for {
+        mark := e.arena_top
+        if !raw_next(e, arm, ainfo)? {
+            break
+        }
+        save := e.rtop
+        base := e.rtop
+        for _ in 0usize..(nres + 1) {
+            reg_push(e)?
+        }
+        for i in 0usize..nres {
+            copy_reg(e, base + i, resreg + i)
+        }
+        set_int(e, base + nres, side)
+        rec := sort_push(e, base, nres + 1)?
+        list_push(e, rec)?
+        e.rtop = save
+        arena_reset(e, mark)
+    }
+    ok(lend)
+}
+
+fn record_side(e: &mut Engine, r: usize, nres: usize) -> i64!db.Error {
+    let len = rec_len(e, r)
+    record_column(e, r + 4, len, nres, R_TMP)?
+    ok(rint(e, R_TMP))
+}
+
+// Rewrites the side field (the record's last, a 1-byte int 0/1) to 0.
+fn set_record_side(e: &mut Engine, r: usize, nres: usize) -> void!db.Error {
+    rec := r + 4
+    let (hsize, hn) = get_varint(e.ws, rec)
+    p := rec + hn
+    body := rec + (hsize as usize)
+    for i in 0usize..nres {
+        let (t, tn) = get_varint(e.ws, p)
+        p += tn
+        body += serial_len(t)
+    }
+    let (t, _) = get_varint(e.ws, p)
+    // Side values are 0/1: serial type 8/9 (format 4) or 1 (one byte).
+    if t == 8 || t == 9 {
+        e.ws[p] = 8
+    } else if t == 1 {
+        e.ws[body] = 0
+    }
+    ok()
+}
+
+// ---------------------------------------------------------------------------
+// Subqueries in expressions
+
+fn eval_subquery(e: &mut Engine, n: usize, dst: usize) -> void!db.Error {
+    k := nkind(e, n)
+    s := nb(e, n)
+    // Uncorrelated scalar and EXISTS subqueries are evaluated once.
+    cached := e.ws[nd(e, n) + 3]
+    if cached == 1 && k != N_INSEL {
+        r := nf(e, n, 4)
+        copy_reg(e, dst, r)
+        return ok()
+    }
+    save_sort := e.sort_top
+    save_hi := e.sort_hi
+    save_agg_top := e.agg_top
+    save_agg_end := e.agg_end
+    save_slot := e.slot_rec
+    save_slot_len := e.slot_len
+    e.slot_rec = 0
+    select_reset(e, s)
+    resreg := select_resreg(e, s)
+    result := 0u8
+    if k == N_EXISTS {
+        found := select_next(e, s)?
+        set_int(e, dst, if found {
+            1i64
+        } else {
+            0i64
+        })
+    } else if k == N_SUBQ {
+        if select_next(e, s)? {
+            copy_reg(e, dst, resreg)
+        } else {
+            set_null(e, dst)
+        }
+    } else {
+        // x IN (SELECT ...)
+        save := e.rtop
+        x := reg_push(e)?
+        t := reg_push(e)?
+        lhs := na(e, n)
+        eval(e, lhs, x)?
+        not := nflags(e, n) != 0
+        if rtype(e, x) == T_NULL {
+            // NULL IN (empty) is false; otherwise NULL.
+            any := select_next(e, s)?
+            if any {
+                set_null(e, dst)
+            } else {
+                set_int(e, dst, if not {
+                    1i64
+                } else {
+                    0i64
+                })
+            }
+        } else {
+            saw_null := false
+            found := false
+            let s_a = na(e, s)
+            rnode := na(e, s_a)
+            loop_mark := e.arena_top
+            for select_next(e, s)? {
+                copy_reg(e, t, x)
+                v := compare_values(e, OP_EQ, lhs, rnode, t, resreg)?
+                if v == 1 {
+                    found = true
+                    break
+                }
+                if v == 2 {
+                    saw_null = true
+                }
+                arena_reset(e, loop_mark)
+            }
+            v := if found {
+                1u8
+            } else if saw_null {
+                2u8
+            } else {
+                0u8
+            }
+            if not && v != 2 {
+                v = 1 - v
+            }
+            set_bool(e, dst, v)
+        }
+        e.rtop = save
+        result = 1
+    }
+    reg_own(e, dst)?
+    e.sort_top = save_sort
+    e.sort_hi = save_hi
+    e.agg_top = save_agg_top
+    e.agg_end = save_agg_end
+    e.slot_rec = save_slot
+    e.slot_len = save_slot_len
+    if result == 0 && e.ws[nd(e, n) + 2] == 1 {
+        // Cache the value of an uncorrelated subquery for this execution.
+        r := nf(e, n, 4)
+        if r != 0 {
+            copy_reg(e, r, dst)
+            reg_keep(e, r)?
+            o := nd(e, n)
+            e.ws[o + 3] = 1
+        }
+    }
+    ok()
+}
+
+// GROUP BY phase 1: materialize [group keys, slots] records and sort them.
+fn prepare_group(e: &mut Engine, s: usize, info: usize) -> void!db.Error {
+    if iget(e, info, I_AGG) != AGG_GROUP || e.ws[info + I_PHASE] != 0 {
+        return ok()
+    }
+    ngroup := iget(e, info, I_NGROUP)
+    e.slot_rec = 0
+    {
+        e.ws[info + I_PHASE] = 1
+        materialize_sources(e, info)?
+        lend := list_begin(e)
+        mark := e.arena_top
+        for join_next(e, info)? {
+            if check_final(e, info)? {
+                rec := push_slot_record(e, s, info)?
+                list_push(e, rec)?
+            }
+            arena_reset(e, mark)
+        }
+        let (idx, n) = list_finish(e, lend)
+        let grpinfo = iget(e, info, I_GRPINFO)
+        map := keymap_range(e, 0, ngroup, grpinfo)?
+        sort_records(e, idx, n, map, ngroup)?
+        iset(e, info, I_GIDX, idx)
+        iset(e, info, I_GN, n)
+        iset(e, info, I_GPOS, 0)
+        iset(e, info, I_PREV, 0)
+        iset(e, info, I_PREVLEN, map)
+        // A fixed aggregate area above the sorted data; later records
+        // (ORDER BY of the groups) go above it.
+        carve_agg_area(e, info)
+        aggs_reset(e, info)
+        e.ws[info + I_GOPEN] = 0
+    }
+    ok()
+}
+
+// Runs the subquery of a FROM level once per execution into a record list.
+fn materialize_level(e: &mut Engine, info: usize, l: usize) -> void!db.Error {
+    lv := lev(e, info, l)
+    sub := ldu(e.ws, lv + L_KEYS)
+    if (nflags(e, sub) & 16) != 0 {
+        return materialize_recursive(e, info, l, sub)
+    }
+    save_agg_top := e.agg_top
+    save_agg_end := e.agg_end
+    save_slot := e.slot_rec
+    save_slot_len := e.slot_len
+    e.slot_rec = 0
+    select_reset(e, sub)
+    nres := select_ncols(e, sub)
+    resreg := select_resreg(e, sub)
+    // The first row may build the subquery's own sorted lists; start this
+    // list only afterwards so the two never interleave.
+    mark := e.arena_top
+    got := select_next(e, sub)?
+    lend := list_begin(e)
+    for got {
+        rec := sort_push(e, resreg, nres)?
+        list_push(e, rec)?
+        arena_reset(e, mark)
+        got = select_next(e, sub)?
+    }
+    let (idx, n) = list_finish(e, lend)
+    lv2 := lev(e, info, l)
+    stu(e.ws, lv2 + L_INDEX, idx)
+    stu(e.ws, lv2 + L_NEQ, n)
+    e.agg_top = save_agg_top
+    e.agg_end = save_agg_end
+    e.slot_rec = save_slot
+    e.slot_len = save_slot_len
+    ok()
+}
+
+// Materializes every FROM subquery of a select before its own rows are
+// collected, so their records never interleave with the select's.
+fn materialize_sources(e: &mut Engine, info: usize) -> void!db.Error {
+    nlev := iget(e, info, I_NLEV)
+    for l in 0usize..nlev {
+        lv := lev(e, info, l)
+        if ldu(e.ws, lv + L_PLAN) == PLAN_SUBQ && ldu(e.ws, lv + L_INDEX) == 0 {
+            materialize_level(e, info, l)?
+        }
+    }
+    ok()
+}
+
+// Rows of one compound arm (no ORDER BY/LIMIT of its own).
+fn arm_reset(e: &mut Engine, arm: usize) {
+    info := sinfo(e, arm)
+    e.ws[info + I_PHASE] = 0
+    e.ws[info + I_DONE] = 0
+    e.ws[info + I_STARTED] = 0
+    e.ws[info + I_GOPEN] = 0
+    iset(e, info, I_POS, 0)
+    level_reset(e, info)
+}
+
+// Appends record `rec` to the list ending at `lend` unless (for UNION) an
+// equal record is already there. Returns true when appended.
+fn queue_add(e: &mut Engine, lend: usize, count: usize, resreg: usize, nres: usize, distinct: bool, map: usize) -> bool!db.Error {
+    rec := sort_push(e, resreg, nres)?
+    if distinct {
+        for i in 0usize..count {
+            other := ldu(e.ws, lend - 4 * (i + 1))
+            if keymap_compare(e, other, rec, map, nres)? == 0 {
+                return ok(false)
+            }
+        }
+    }
+    list_push(e, rec)?
+    ok(true)
+}
+
+// WITH RECURSIVE: initial rows seed a queue; each queued row is fed to the
+// recursive arm (through its PLAN_QUEUE source) and its results are queued
+// in turn. LIMIT/OFFSET of the body bound the rows produced.
+fn materialize_recursive(e: &mut Engine, info: usize, l: usize, sub: usize) -> void!db.Error {
+    save_agg_top := e.agg_top
+    save_agg_end := e.agg_end
+    save_slot := e.slot_rec
+    save_slot_len := e.slot_len
+    save_queue := e.queue_rec
+    e.slot_rec = 0
+    last := sub
+    for nnext(e, last) != 0 {
+        last = nnext(e, last)
+    }
+    distinct := nop(e, last) == 1
+    sinfo_ := sinfo(e, sub)
+    st64(e.ws, sinfo_ + I_LIMIT, i2u(-1))
+    st64(e.ws, sinfo_ + I_OFFSET, 0)
+    eval_limit(e, sub)?
+    limit := u2i(ld64(e.ws, sinfo_ + I_LIMIT))
+    offset := u2i(ld64(e.ws, sinfo_ + I_OFFSET))
+    nres := select_ncols(e, sub)
+    map := keymap_range(e, 0, nres, 0)?
+    lend := list_begin(e)
+    count := 0usize
+    // Initial arms.
+    arm := sub
+    for arm != last {
+        arm_reset(e, arm)
+        ainfo := sinfo(e, arm)
+        prepare_group(e, arm, ainfo)?
+        materialize_sources(e, ainfo)?
+        resreg := iget(e, ainfo, I_RESREG)
+        mark := e.arena_top
+        for raw_next(e, arm, ainfo)? {
+            if queue_add(e, lend, count, resreg, nres, distinct, map)? {
+                count += 1
+            }
+            arena_reset(e, mark)
+        }
+        arm = nnext(e, arm)
+    }
+    // Recursive arm, once per queued row.
+    linfo := sinfo(e, last)
+    resreg := iget(e, linfo, I_RESREG)
+    pos := 0usize
+    for pos < count {
+        if limit >= 0 && (count as i64) >= limit + offset {
+            break
+        }
+        e.queue_rec = ldu(e.ws, lend - 4 * (pos + 1))
+        pos += 1
+        arm_reset(e, last)
+        prepare_group(e, last, linfo)?
+        materialize_sources(e, linfo)?
+        mark := e.arena_top
+        for raw_next(e, last, linfo)? {
+            if queue_add(e, lend, count, resreg, nres, distinct, map)? {
+                count += 1
+            }
+            arena_reset(e, mark)
+            if limit >= 0 && (count as i64) >= limit + offset {
+                break
+            }
+        }
+    }
+    let (idx, n) = list_finish(e, lend)
+    first := if offset > 0 {
+        offset as usize
+    } else {
+        0usize
+    }
+    shown := if first >= n {
+        0usize
+    } else {
+        n - first
+    }
+    if limit >= 0 && (limit as usize) < shown {
+        shown = limit as usize
+    }
+    lv := lev(e, info, l)
+    stu(e.ws, lv + L_INDEX, idx + (if first < n {
+        first
+    } else {
+        n
+    }) * 4)
+    stu(e.ws, lv + L_NEQ, shown)
+    if shown == 0 && idx == 0 {
+        stu(e.ws, lv + L_INDEX, 1)
+    }
+    e.agg_top = save_agg_top
+    e.agg_end = save_agg_end
+    e.slot_rec = save_slot
+    e.slot_len = save_slot_len
+    e.queue_rec = save_queue
+    ok()
+}
