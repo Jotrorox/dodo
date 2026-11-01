@@ -1619,6 +1619,10 @@ fn agg_seen(e: &mut Engine, n: usize, r: usize) -> bool!db.Error {
 fn agg_step(e: &mut Engine, n: usize) -> void!db.Error {
     id := ndd(e, n)
     b := ne_(e, n)
+    let filter = nff(e, n)
+    if filter != 0 && eval_truth(e, filter)? != 1 {
+        return ok()
+    }
     if id == A_COUNT_STAR {
         v := rint(e, b) + 1
         set_int(e, b, v)

@@ -384,6 +384,12 @@ fn check_final(e: &mut Engine, info: usize) -> bool!db.Error {
 
 fn compute_results(e: &mut Engine, s: usize, info: usize) -> void!db.Error {
     r := iget(e, info, I_RESREG)
+    if win_collecting(e, info) {
+        for k in 0usize..iget(e, info, I_NRES) {
+            set_null(e, r + k)
+        }
+        return ok()
+    }
     rc := na(e, s)
     k := 0usize
     for rc != 0 {
@@ -740,9 +746,14 @@ fn materialize(e: &mut Engine, s: usize) -> void!db.Error {
     }
     distinct := (nflags(e, s) & 1) != 0
     prepare_group(e, s, info)?
-    // Records: [order keys..., results...].
+    // Records: [order keys..., results...]. Window queries collect their
+    // rows in window.dodo.
     lend := list_begin(e)
-    for {
+    win_rows := iget(e, info, I_WIN) != 0
+    if win_rows {
+        lend = window_rows(e, s, info, 0, 0)?
+    }
+    for !win_rows {
         mark := e.arena_top
         if !raw_next(e, s, info)? {
             break
@@ -957,6 +968,9 @@ fn collect_arm(e: &mut Engine, arm: usize, side: i64) -> usize!db.Error {
     resreg := iget(e, ainfo, I_RESREG)
     prepare_group(e, arm, ainfo)?
     materialize_sources(e, ainfo)?
+    if iget(e, ainfo, I_WIN) != 0 {
+        return window_rows(e, arm, ainfo, 1, side)
+    }
     lend := list_begin(e)
     for {
         mark := e.arena_top

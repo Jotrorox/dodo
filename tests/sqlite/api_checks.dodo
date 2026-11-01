@@ -489,3 +489,38 @@ fn large_transactions_spill_and_recover() {
     conn.close()!
     remove(path)
 }
+
+// Window queries materialize their rows; running out of sorter space is a
+// clean Capacity error and the connection stays usable.
+@test
+fn window_query_too_large_is_a_capacity_error() {
+    conn := sqlite.Connection.open_memory(workspace())!
+    none_: [0]db.Value = []
+    big := "with recursive c(i) as (select 1 union all select i + 1 from c where i < 20000) select i, group_concat(printf('%050d', i)) over (order by i) from c"
+    failed := false
+    match conn.select(big, &none_) {
+        ok(rows) => {
+            for {
+                match rows.next() {
+                    ok(some(_)) => {},
+                    ok(none) => {
+                        break
+                    },
+                    err(e) => {
+                        assert(e.kind == db.ErrorKind.Capacity)
+                        failed = true
+                        break
+                    },
+                }
+            }
+        },
+        err(e) => {
+            assert(e.kind == db.ErrorKind.Capacity)
+            failed = true
+        },
+    }
+    assert(failed)
+    total := sql.ScalarInt.new()
+    conn.query("select sum(r) from (select row_number() over (order by x desc) r from (select 1 x union all select 2 union all select 3))", &none_, &mut total)!
+    assert_eq(total.value, 6i64)
+}

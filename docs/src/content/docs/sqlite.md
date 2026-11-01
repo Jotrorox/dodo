@@ -231,8 +231,26 @@ and UPSERT), `UPDATE`, `DELETE`, each with `RETURNING`; `SELECT` with joins
 `char`, `zeroblob`, `concat`, `concat_ws`, `octet_length`, `changes`,
 `last_insert_rowid`, `total_changes`, `sqlite_version`, ...); the aggregates
 `count`, `sum`, `total`, `avg`, `min`, `max`, `group_concat`/`string_agg`
-(with `DISTINCT`); and the date and time functions `date`, `time`,
-`datetime`, `julianday`, `unixepoch`, `strftime` with their modifiers.
+(with `DISTINCT` and `FILTER (WHERE ...)`); and the date and time functions
+`date`, `time`, `datetime`, `julianday`, `unixepoch`, `strftime` with their
+modifiers.
+
+**Window functions.** `fn(...) [FILTER (WHERE ...)] OVER (...)` and
+`OVER name` with `WINDOW name AS (...)` clauses (a definition may build on an
+earlier one); `PARTITION BY`, `ORDER BY` (with `NULLS FIRST/LAST` and
+collations), and `ROWS`, `RANGE` (numeric offsets on one `ORDER BY` term), or
+`GROUPS` frames with `UNBOUNDED PRECEDING`, `n PRECEDING`, `CURRENT ROW`,
+`n FOLLOWING`, `UNBOUNDED FOLLOWING` and `EXCLUDE NO OTHERS`/`CURRENT
+ROW`/`GROUP`/`TIES`. The functions are `row_number`, `rank`, `dense_rank`,
+`percent_rank`, `cume_dist`, `ntile`, `lag`, `lead`, `first_value`,
+`last_value`, `nth_value`, and every aggregate above (without `DISTINCT`).
+Windows run over the rows left after `WHERE`, `GROUP BY` and `HAVING`
+(aggregates may appear in window arguments), may be used in `ORDER BY`, and
+combine with `DISTINCT`, `LIMIT`, compound selects, subqueries, views, and
+CTEs. Default frames, error messages, row order, and the results of sliding
+frames (including SQLite's incremental `sum` and `group_concat` behaviour)
+follow SQLite. A window query materializes its rows in the sorter, so the
+workspace bounds its size.
 
 **Pragmas.** `user_version`, `application_id`, `schema_version`,
 `page_size`, `page_count`, `freelist_count`, `encoding`, `journal_mode`,
@@ -242,7 +260,7 @@ ignored, as SQLite does for unknown pragmas.
 
 **Not supported.** WAL-mode databases (convert them with `PRAGMA
 journal_mode=DELETE` in SQLite first), triggers (tables with triggers can be
-read but not written), window functions, `WITHOUT ROWID` and virtual tables,
+read but not written), `WITHOUT ROWID` and virtual tables,
 `ATTACH`, savepoints, `ALTER TABLE DROP COLUMN`, writes to tables with
 expression or partial indexes, UTF-16 databases, temporary tables, and
 time zones (`localtime` and `utc` leave times in UTC). Reals are printed

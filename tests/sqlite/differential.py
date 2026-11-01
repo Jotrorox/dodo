@@ -114,10 +114,12 @@ def main():
         problems = []
         if run.returncode != 0:
             problems.append(f"shell exited with {run.returncode}: {run.stderr.decode()[-2000:]}")
+        # "-- compare-errors" makes error messages count, not just errors.
+        exact_errors = "-- compare-errors" in script.split("\n", 2)[:2]
         for i in range(max(len(expected), len(actual))):
             e = expected[i] if i < len(expected) else "<missing>"
             g = actual[i] if i < len(actual) else "<missing>"
-            if e.startswith("ERROR") and g.startswith("ERROR"):
+            if e.startswith("ERROR") and g.startswith("ERROR") and not exact_errors:
                 continue
             if not same_row(e, g):
                 problems.append(f"row {i}: expected {e!r}, got {g!r}")
