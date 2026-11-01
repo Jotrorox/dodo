@@ -51,7 +51,7 @@ import "std/embedded/chip/rp_pins"
 // Section numbers below refer to the RP2350 datasheet.
 //
 // Both packages are supported: take() reads which one the chip is in from
-// SYSINFO, and `Pins` hands out GPIO 0 to 29 on the RP2350A (QFN-60) and
+// the OTP (or SYSINFO), and `Pins` hands out GPIO 0 to 29 on the RP2350A (QFN-60) and
 // GPIO 0 to 47 on the RP2350B (QFN-80); see pin_count.
 
 // clk_sys, the processor and peripheral clock, after take().
@@ -320,9 +320,14 @@ pub const ALL_CLOCKS: power.Clocks = 0x7FFF_FFFF_FFFF_FFFF
 // clocks Power.disable_unused_clocks stops while they are held in reset.
 const MANAGED_CLOCKS: power.Clocks = CLOCK_ADC | CLOCK_HSTX | CLOCK_I2C0 | CLOCK_I2C1 | CLOCK_PIO0 | CLOCK_PIO1 | CLOCK_PIO2 | CLOCK_PLL_USB | CLOCK_PWM | CLOCK_SHA256 | CLOCK_SPI0 | CLOCK_SPI1 | CLOCK_TIMER1 | CLOCK_TRNG | CLOCK_UART0 | CLOCK_UART1 | CLOCK_USB
 
-// SYSINFO, among the system control registers: PACKAGE_SEL's bit 0 is 1
-// in the QFN-60 package (the RP2350A) and 0 in the QFN-80 package (the
-// RP2350B), as the Pico SDK's sysinfo.h describes it and picotool reads it.
+// The package, for pin_count. OTP row NUM_GPIOS (0x18, read through the
+// ECC data window at OTP_DATA_BASE) holds the user GPIO count, 30 or 48,
+// programmed in manufacturing; picotool trusts it over PACKAGE_SEL, which
+// reads 0 (QFN-80) on A2 silicon in either package, as on a Pico 2 W.
+// SYSINFO's PACKAGE_SEL, bit 0 set for the QFN-60 package as the Pico SDK's
+// sysinfo.h describes it, is the fallback for a chip whose row holds
+// neither count.
+const OTP_NUM_GPIOS_ROW: usize = 0x18
 const SYSINFO_PACKAGE_SEL: usize = 0x4000_0004
 const PACKAGE_QFN60: u32 = 1 << 0
 
@@ -489,9 +494,19 @@ pub unsafe fn report_panic(check: *const u8, file: *const u8, line: u32, column:
 }
 
 // The user GPIOs of this chip's package: PIN_COUNT (30) for the RP2350A
-// (QFN-60), MAX_PIN_COUNT (48) for the RP2350B (QFN-80), from SYSINFO's
-// PACKAGE_SEL. `Pins` hands out GPIO 0 to pin_count() - 1.
+// (QFN-60), MAX_PIN_COUNT (48) for the RP2350B (QFN-80), from the OTP's
+// NUM_GPIOS row, or SYSINFO's PACKAGE_SEL if the row holds neither.
+// `Pins` hands out GPIO 0 to pin_count() - 1.
 pub fn pin_count() -> u32 {
+    // SAFETY: the OTP's ECC data window is readable by Secure code, and
+    // reading a row has no side effects.
+    programmed := unsafe {
+        row: hal.Reg<u16> = hal.Reg.at(OTP_DATA_BASE + 2 * OTP_NUM_GPIOS_ROW)
+        row.read() as u32
+    }
+    if programmed == PIN_COUNT || programmed == MAX_PIN_COUNT {
+        return programmed
+    }
     // SAFETY: PACKAGE_SEL is read-only and reading it has no side effects;
     // the boot ROM takes SYSINFO out of reset, and nothing resets it.
     selection := unsafe {

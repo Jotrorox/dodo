@@ -904,17 +904,16 @@ fn adc_round(samples: &[u16], count: usize) -> bool {
 fn adc_sampler_checks(dma: &mut rp_dma.Dma, pins: &mut chip.Pins, timer: &mut chip.Timer) {
     sampler := pins.sampler(ADC_ROUND, 30_000)!
     owned := refused(pins.analog(28), hal.Error.Busy) && refused(pins.temperature(), hal.Error.Busy) && refused(pins.output(26), hal.Error.Busy) && refused(pins.sampler(rp_adc.GPIO28, 30_000), hal.Error.Busy)
-    // 300 samples at 30 000 a second take 10 ms.
-    samples: [30]u16 = [0; 30]
+    // 300 samples at 30 000 a second take 10 ms. They are checked once
+    // all are in: checking each batch between reads, at -O0, takes longer
+    // than the FIFO holds samples, which `read` rightly reports as Overrun.
+    samples: [300]u16 = [0; 300]
     sampler.start()
     start := timer.now_us()
-    polled := true
-    for _ in 0..10u32 {
-        sampler.read(&mut samples)!
-        polled = polled && adc_round(&samples, 30)
-    }
+    sampler.read(&mut samples)!
     elapsed := timer.now_us() - start
     sampler.stop()
+    polled := adc_round(&samples, 300)
     check(owned && polled && sampler.rate_hz() == 30_000 && elapsed >= 9_800 && elapsed < 10_300)
 
     // The FIFO interrupt raises the signal once 4 samples wait, 133 us in.
@@ -1014,7 +1013,7 @@ fn dma_checks(dma: &mut rp_dma.Dma, pins: &mut chip.Pins, timer: &mut chip.Timer
         transfers := spi.dma(&mut first, &mut second, &mut buffer)!
         bytes := transfers.buffer()!
         for index in 0..64usize {
-            bytes[index] = (index * 5 + 1) as u8
+            bytes[index] = ((index * 5 + 1) & 255) as u8
         }
         transfers.start_transfer(64)!
         lent := refused(transfers.buffer(), hal.Error.Busy)
@@ -1027,7 +1026,7 @@ fn dma_checks(dma: &mut rp_dma.Dma, pins: &mut chip.Pins, timer: &mut chip.Timer
         echoed := transfers.buffer()!
         looped := true
         for index in 0..64usize {
-            looped = looped && echoed[index] == (index * 5 + 1) as u8
+            looped = looped && echoed[index] == ((index * 5 + 1) & 255) as u8
         }
         check(lent && spins > 1000 && raised && looped)
     }
