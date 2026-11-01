@@ -786,6 +786,19 @@ pub struct Pins {
         return self.bank.pwm_divided(pin, divider, top)
     }
 
+    // Claim pin `pin`, an odd GPIO, as a PWM input that measures the
+    // frequency and duty cycle of the signal on it: GPIO n is input B of
+    // PWM slice (n / 2) % 8, whose counter counts its rising edges and its
+    // high time in windows of `window_us`, up to 111 ms, two per
+    // measurement. Its pull-down holds an unconnected pin low. The input
+    // implements hal.PwmInput; rp_pwm.Capture documents the measurement and
+    // its precision. InvalidInput for an even pin, above GPIO 29, or for a
+    // window of 0 or too long, Busy if the pin is taken or either output of
+    // its slice is in use.
+    pub fn pwm_input(&mut self, pin: u32, window_us: u32) -> rp_pwm.PwmCapture!hal.Error {
+        return self.bank.pwm_input(pin, window_us)
+    }
+
     // Claim pin `pin`, GPIO 26 to 29 (ADC inputs 0 to 3), as an analog
     // input, with its digital input and pulls turned off. It implements
     // hal.AnalogInput: 12-bit polled reads, 0 to 4095 for 0 V to the ADC's
@@ -830,6 +843,11 @@ pub struct Pins {
     // Give back a PWM output. Its pin stops driving and is disconnected.
     pub fn release_pwm(&mut self, output: rp_pwm.Pwm) {
         self.bank.release_pwm(output)
+    }
+
+    // Give back a PWM input. Its slice stops and its pin is disconnected.
+    pub fn release_pwm_input(&mut self, input: rp_pwm.PwmCapture) {
+        self.bank.release_pwm_input(input)
     }
 
     // Give back an analog input or the temperature sensor; the ADC and its
@@ -1036,6 +1054,14 @@ struct Chip {
 
     pub fn clock_hz(&self) -> u32 {
         return SYS_HZ
+    }
+
+    pub fn pwm_slices(&self) -> u32 {
+        return 12
+    }
+
+    pub fn timer_base(&self) -> usize {
+        return TIMER0_BASE
     }
 
     pub fn start_adc(&mut self) -> void!hal.Error {

@@ -16,6 +16,57 @@
   unused bytes for the next fill. A stopped source reports `Timeout` and
   failing health checks `Bus`. Both drivers are generic over
   `hal.Registers` and tested against simulated registers on the desktop.
+- `std/embedded/hal` settles its device protocols before a second chip
+  vendor arrives, so drivers written now keep working:
+  - Polling forms of the buses, `hal.I2cPoll`, `hal.SpiPoll`, and, in the
+    new `std/embedded/hal/serial` (which keeps `hal` free of `std/io`),
+    `serial.PollPort`, never wait: each call does what the hardware allows
+    and returns true once the operation has finished, keeping its state in
+    the bus rather than in borrowed buffers, so transactions may be any
+    length and run across an executor task's polls. `hal.BlockingI2c` and
+    `hal.BlockingSpi` turn a polling-only controller into a blocking one, and
+    `hal.SpiDevice` keeps a device selected across polls. `serial.Port` adds
+    `flush` to std/io's streams.
+  - Target sides: `hal.I2cTarget` with `hal.I2cTargetEvent`, and
+    `hal.SpiTarget`.
+  - Pulse measurement: `hal.PwmInput` and `hal.PulseCapture` (period, high
+    time, frequency, duty).
+  - CAN: `hal.Can`, `hal.CanFrame` (standard, extended, remote, and CAN FD
+    frames, checked as they are set), `hal.CanFilter`, `hal.CanErrorState`,
+    and `hal.can_timing`, which computes bit timing within any controller's
+    limits.
+  - I2S: `hal.I2sOutput` and `hal.I2sInput` with MSB-aligned `i32` samples
+    and `hal.I2sFormat`.
+  - Background transfers: `hal.DmaBuffer` and `hal.SpiDma` for sessions that
+    hold a buffer, `hal.DmaStream`, the DMA-backed session every peripheral
+    driver needs, written once against `hal.DmaChannel`, and `hal.dma_copy`.
+  - Helpers that wait with a poll limit: `hal.capture`, `hal.send_frame`,
+    `hal.receive_frame`, `hal.write_samples`, `hal.read_samples`, and
+    `hal.finish_transfer`.
+  - `std/embedded/hal/fake` gains a fake for every new protocol, polled
+    modes for `fake.I2c`, `fake.Spi`, and `fake.Serial`, and
+    `fake.DmaChannel`, which runs DMA transfers in host memory.
+- The RP2040 and RP2350 implement the new protocols: the DesignWare I2C
+  bus `hal.I2cPoll` for transactions of any length (replacing the
+  FIFO-sized `start_*`/`poll_finish` methods), with an interrupt whenever a
+  poll can make progress; I2C targets `hal.I2cTarget` (the driver's own
+  `TargetEvent` is gone); PL022 SPI buses `hal.SpiPoll`, targets
+  `hal.SpiTarget`, and `pl022.DmaBus` `hal.SpiDma` with `poll_finish` and
+  `abort`; serial ports and the USB serial port `serial.Port` and
+  `serial.PollPort` with `poll_flush`.
+- `pins.pwm_input(pin, window_us)` measures pulses on an odd GPIO with a PWM
+  slice's counting modes, as a `hal.PwmInput`: the frequency and duty of a
+  PWM signal, a fan's tachometer, or a servo pulse, to within microseconds.
+- `std/embedded/chip/rp_i2s` plays and records I2S audio on PIO, as
+  `hal.I2sOutput` and `hal.I2sInput`: Philips, left- and right-justified
+  framing, 16 to 32-bit samples, mono or stereo, a fractional clock reported
+  with its error in ppm, silence instead of swapped channels when the queue
+  runs dry, and playback by DMA through `hal.DmaStream`.
+- `std/embedded/can/mcp2515` drives the MCP2515 CAN controller over any SPI
+  bus as a `hal.Can`, so boards without a CAN controller, such as the Pico,
+  get CAN: bit timing from the crystal, filters mapped onto its masks,
+  frames sent and received in order, overrun and error states, and its
+  interrupt pin.
 - `std/embedded/power` is one low-power layer for every chip: sleep and deep
   sleep modes that every wait honours, including timer alarms and the
   executor; clock gating with `power.Clocks` sets; and a dormant state, with
@@ -393,11 +444,10 @@
   returns a `pl011.DmaPort`, a `std/io` Reader and Writer that receives into
   a ring buffer of up to 32 KiB, so input is no longer limited to the
   32-byte FIFO between reads, and writes in the background.
-- Queued I2C transactions: `start_write`, `start_read`, and
-  `start_write_read` put a transaction of up to 16 commands into the
-  controller's FIFO and return; `poll_finish` collects it without waiting,
-  `listen` raises the controller's interrupt when it ends, and `cancel`
-  aborts it.
+- Polled I2C transactions: the DesignWare controller implements
+  `hal.I2cPoll`, whose `poll_write`, `poll_read`, and `poll_write_read` run
+  transactions of any length across polls; `listen` raises the controller's
+  interrupt whenever a poll can make progress, and `cancel` aborts one.
 - `examples/dma.dodo` runs a DMA serial console that polls ten times a
   second next to a task streaming SPI frames by DMA. The board self-tests
   check DMA copies, SPI and UART loopback by DMA, and queued I2C reads, and
