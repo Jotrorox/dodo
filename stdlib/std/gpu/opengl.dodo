@@ -5,19 +5,24 @@ import "core/ptr"
 import "std/gpu/opengl/common"
 import "std/gpu/opengl/gl"
 import "std/gpu/opengl/native" as backend
+import "std/window/handle"
 
-// OpenGL contexts without a window, and offscreen render targets.
+// OpenGL contexts, offscreen or drawing into a std/window window, and
+// offscreen render targets.
 //
 // This package creates a context and loads the raw OpenGL binding,
-// std/gpu/opengl/gl, with its entry points. Draw with the gl package's
-// commands into a Target, then read the pixels back, for example to show
-// them in a std/window canvas or save them with std/graphics/image.
+// std/gpu/opengl/gl, with its entry points. A context made with
+// create_for_window draws into the window's default framebuffer, 0, and
+// shows each frame with swap_buffers(). One made with create has no window:
+// draw into a Target, then read the pixels back, for example to save them
+// with std/graphics/image.
 //
 // Everything is written in Dodo and talks to each operating system's own
 // OpenGL interface, loaded when a context is created: EGL on Linux (Mesa or
-// a vendor driver, without an X server), CGL on macOS and WGL on Windows. A
-// program links no OpenGL library, so it starts on machines without one and
-// can choose another renderer when create() fails.
+// a vendor driver, without an X server for offscreen contexts), CGL on macOS
+// (with NSOpenGLContext for windows) and WGL on Windows. A program links no
+// OpenGL library, so it starts on machines without one and can choose
+// another renderer when create() fails.
 //
 // OpenGL state belongs to the thread a context is current on. create() makes
 // the new context current on the calling thread; with several contexts, call
@@ -71,8 +76,8 @@ pub struct Options {
     }
 }
 
-// An OpenGL context with no window. Dropping it destroys the context and,
-// when it was current, clears the gl package's entry points.
+// An OpenGL context, offscreen or for a window. Dropping it destroys the
+// context and, when it was current, clears the gl package's entry points.
 pub struct Context {
     backend: backend.Backend
     major: u32
@@ -92,6 +97,33 @@ pub struct Context {
             return err(Error.InvalidInput)
         }
         system := backend.Backend.create(options.major, options.minor, options.debug)?
+        return Context.adopt(system, &options)
+    }
+
+    // Create a context that draws into a window, make it current on the
+    // calling thread and load the gl package. `native` comes from
+    // std/window's Window.native_handle(); a window opened with
+    // window.Options.gpu() has no pixel buffer to waste. Framebuffer 0 is
+    // then the window's drawing area, double buffered with 8-bit color, a
+    // 24-bit depth and an 8-bit stencil buffer, in pixels: the size
+    // win.size() reports, which on a high-density display is larger than
+    // the size the window was opened with. swap_buffers() shows each frame.
+    //
+    // Linux uses EGL on the window's libxcb connection (or an Xlib one when
+    // the driver lacks EGL_EXT_platform_xcb), macOS an NSOpenGLContext on the
+    // window's view, which must be used from the main thread, and Windows
+    // WGL on the window's device context. Fails with InvalidInput for a
+    // handle of another window system, besides the errors of create(). The
+    // window must stay open until the context is dropped.
+    pub fn create_for_window(native: &handle.NativeHandle, options: Options) -> Context!Error {
+        if !defined(options.major, options.minor) {
+            return err(Error.InvalidInput)
+        }
+        system := backend.Backend.create_for_window(native, options.major, options.minor, options.debug)?
+        return Context.adopt(system, &options)
+    }
+
+    fn adopt(system: backend.Backend, options: &Options) -> Context!Error {
         serial := unsafe {
             NEXT_SERIAL += 1
             NEXT_SERIAL
@@ -105,6 +137,32 @@ pub struct Context {
             return err(Error.Unsupported)
         }
         return ok(context)
+    }
+
+    // Show the frame drawn into a window context's framebuffer 0, waiting
+    // for the display's refresh as set_swap_interval() says. The context
+    // must be current. Fails with Unsupported for a context without a
+    // window, and System when the window is gone.
+    pub fn swap_buffers(&self) -> void!Error {
+        return self.backend.swap_buffers()
+    }
+
+    // How many display refreshes each swap_buffers() waits for: 1, the
+    // usual default, ties frames to the display, 0 swaps at once. Fails with
+    // Unsupported for a context without a window or a driver that cannot
+    // change it.
+    pub fn set_swap_interval(&self, interval: i32) -> void!Error {
+        if interval < 0 {
+            return err(Error.InvalidInput)
+        }
+        return self.backend.set_swap_interval(interval)
+    }
+
+    // Tell a window context that the window was resized, so its framebuffer
+    // takes the new size; call it on every window.Event.Resize. Only macOS
+    // needs it, but it costs nothing elsewhere.
+    pub fn update_surface(&self) {
+        self.backend.update_surface()
     }
 
     // Make this context current on the calling thread and point the gl

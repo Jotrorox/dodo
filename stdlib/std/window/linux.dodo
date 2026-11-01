@@ -2,6 +2,8 @@ package linux
 
 import "core/ptr"
 import "core/mem"
+import "std/dylib"
+import "std/window/handle"
 import "std/window/heap"
 import "std/window/raw"
 import "std/window/x11"
@@ -14,6 +16,12 @@ import "std/window/x11"
 // The process's one connection lives in a static, with a Slot per open
 // window; Backend's associated functions act on it, so windows need no
 // reference to the App that opened them.
+//
+// GPU APIs cannot use that socket: Vulkan and EGL take a libxcb or Xlib
+// connection. native_handle() therefore loads libxcb at run time and opens a
+// second connection to the same server; X11 resource ids are valid on every
+// connection, so the GPU presents into these windows through it. Programs
+// that never ask for a handle need nothing beyond libc.
 
 unsafe extern "C" fn dodo_window_claim() -> i32
 unsafe extern "C" fn dodo_window_release()
@@ -34,6 +42,24 @@ const OUTPUT: usize = 262144
 const NO_REPLY: u32 = 0xffffffff
 
 const EVENTS: u32 = 0x1 | 0x2 | 0x4 | 0x8 | 0x20 | 0x40 | 0x8000 | 0x20000 | 0x200000
+
+type XcbConnect = extern "C" fn(*const u8, *mut i32) -> *mut u8
+type XcbConnectionHasError = extern "C" fn(*mut u8) -> i32
+type XcbDisconnect = extern "C" fn(*mut u8)
+
+// libxcb stays loaded once opened, like every library std/dylib opens.
+fn symbol(library: &dylib.Library, name: &[u8]) -> usize {
+    match library.symbol(name) {
+        ok(address) => {
+            return unsafe {
+                address as usize
+            }
+        }
+        err(_) => {
+            return 0
+        }
+    }
+}
 
 fn modifiers(state: u32) -> u32 {
     bits := 0u32
@@ -99,6 +125,8 @@ struct Slot {
     pixel_width: u32
     pixel_height: u32
     mouse_inside: bool
+    // Opened without a pixel buffer, for drawing with the GPU.
+    gpu: bool
     // An earlier refresh Present reported, its time in microseconds and
     // frame counter, to measure the refresh period in nanoseconds against.
     base_ust: u64
@@ -109,7 +137,7 @@ struct Slot {
 // Window ids are never reused within a process, across connections too.
 static mut NEXT_ID: u32 = 1
 
-static mut CONNECTION: Connection = Connection { active: false, socket: -1, input: heap.Bytes { address: 0, length: 0 }, input_start: 0, input_end: 0, output: heap.Bytes { address: 0, length: 0 }, output_length: 0, mapping: heap.Bytes { address: 0, length: 0 }, mapping_first: 0, mapping_count: 0, per_keycode: 0, mapping_sequence: NO_REPLY, root: 0, depth: 24, max_request: 0, id_base: 0, id_step: 1, id_count: 0, blank_cursor: 0, wm_protocols: 0, wm_delete: 0, net_wm_name: 0, utf8_string: 0, sequence: 0, pending_text: 0, pending_window: 0, repeat_keycode: 0, present_opcode: 0, present_serial: 0, windows: heap.Table<Slot> { address: 0, count: 0, capacity: 0 } }
+static mut CONNECTION: Connection = Connection { active: false, socket: -1, input: heap.Bytes { address: 0, length: 0 }, input_start: 0, input_end: 0, output: heap.Bytes { address: 0, length: 0 }, output_length: 0, mapping: heap.Bytes { address: 0, length: 0 }, mapping_first: 0, mapping_count: 0, per_keycode: 0, mapping_sequence: NO_REPLY, root: 0, depth: 24, visual: 0, max_request: 0, id_base: 0, id_step: 1, id_count: 0, blank_cursor: 0, wm_protocols: 0, wm_delete: 0, net_wm_name: 0, utf8_string: 0, sequence: 0, pending_text: 0, pending_window: 0, repeat_keycode: 0, present_opcode: 0, present_serial: 0, xcb: 0, xcb_screen: 0, xcb_disconnect: 0, windows: heap.Table<Slot> { address: 0, count: 0, capacity: 0 } }
 
 struct Connection {
     active: bool
@@ -126,6 +154,8 @@ struct Connection {
     mapping_sequence: u32
     root: u32
     depth: u32
+    // The root window's visual, which every window uses.
+    visual: u32
     max_request: usize
     id_base: u32
     id_step: u32
@@ -144,6 +174,11 @@ struct Connection {
     // The Present extension's major opcode, or 0 without it.
     present_opcode: u8
     present_serial: u32
+    // The libxcb connection native_handle() opened, its screen and its
+    // xcb_disconnect, or 0 before the first handle.
+    xcb: usize
+    xcb_screen: u32
+    xcb_disconnect: usize
     windows: heap.Table<Slot>
 
     // Connect to the server named by DISPLAY.
@@ -181,6 +216,7 @@ struct Connection {
         self.input_start = total
         self.root = setup.root
         self.depth = setup.root_depth
+        self.visual = setup.root_visual
         self.max_request = setup.max_request
         self.id_base = setup.id_base
         // Resource ids step by the lowest bit of the mask.
@@ -208,7 +244,7 @@ struct Connection {
     }
 
     // Create, describe and map a window; returns its id.
-    fn open(&mut self, title: &str, width: u32, height: u32, resizable: bool) -> u32!raw.Error {
+    fn open(&mut self, title: &str, width: u32, height: u32, resizable: bool, pixel_buffer: bool) -> u32!raw.Error {
         if !self.active {
             return err(raw.Error.Closed)
         }
@@ -254,7 +290,7 @@ struct Connection {
         unsafe {
             NEXT_ID += 1
         }
-        if !self.windows.push(Slot { id: id, window: window, gc: gc, width: width, height: height, pixels: 0, pixel_width: 0, pixel_height: 0, mouse_inside: false, base_ust: 0, base_msc: 0, period: 0 }) {
+        if !self.windows.push(Slot { id: id, window: window, gc: gc, width: width, height: height, pixels: 0, pixel_width: 0, pixel_height: 0, mouse_inside: false, gpu: !pixel_buffer, base_ust: 0, base_msc: 0, period: 0 }) {
             self.destroy(window, gc)
             return err(raw.Error.OutOfMemory)
         }
@@ -303,6 +339,7 @@ struct Connection {
 
     // Close the socket, which destroys every window, and release the claim.
     fn disconnect(&mut self) {
+        self.disconnect_xcb()
         if self.socket >= 0 {
             unsafe {
                 dodo_window_x11_close(self.socket)
@@ -936,8 +973,70 @@ struct Connection {
         let some(index) = self.slot(id) else {
             return err(raw.Error.Closed)
         }
+        if self.windows.view()[index].gpu {
+            return err(raw.Error.Unsupported)
+        }
         self.put(index, x, y, width, height)?
         return self.flush()
+    }
+
+    // The window and the libxcb connection for GPU APIs, opened on the first
+    // call. GPU drivers act on the window through that other connection, so
+    // the window must exist on the server first.
+    fn native_handle(&mut self, id: u32) -> handle.NativeHandle!raw.Error {
+        let some(index) = self.slot(id) else {
+            return err(raw.Error.Closed)
+        }
+        window := self.windows.view()[index].window
+        self.flush()?
+        if self.xcb == 0 {
+            self.connect_xcb()?
+        }
+        return ok(handle.NativeHandle.Xcb(self.xcb, window, self.xcb_screen, self.visual))
+    }
+    fn connect_xcb(&mut self) -> void!raw.Error {
+        library := match dylib.open(b"libxcb.so.1\0") {
+            ok(library) => library,
+            err(_) => {
+                return err(raw.Error.NoDisplay)
+            }
+        }
+        connect := symbol(&library, b"xcb_connect\0")
+        has_error := symbol(&library, b"xcb_connection_has_error\0")
+        disconnect := symbol(&library, b"xcb_disconnect\0")
+        if connect == 0 || has_error == 0 || disconnect == 0 {
+            return err(raw.Error.NoDisplay)
+        }
+        screen := 0i32
+        connection := unsafe {
+            open_connection := connect as XcbConnect
+            open_connection(0usize as *const u8, ptr.from_mut(&mut screen)) as usize
+        }
+        // xcb_connect never returns null; a failed connection reports an
+        // error and must still be disconnected.
+        self.xcb = connection
+        self.xcb_disconnect = disconnect
+        failed := unsafe {
+            check := has_error as XcbConnectionHasError
+            check(connection as *mut u8)
+        }
+        if failed != 0 || screen < 0 {
+            self.disconnect_xcb()
+            return err(raw.Error.NoDisplay)
+        }
+        self.xcb_screen = screen as u32
+        return ok()
+    }
+    fn disconnect_xcb(&mut self) {
+        if self.xcb != 0 {
+            unsafe {
+                close := self.xcb_disconnect as XcbDisconnect
+                close(self.xcb as *mut u8)
+            }
+        }
+        self.xcb = 0
+        self.xcb_screen = 0
+        self.xcb_disconnect = 0
     }
 
     fn set_title(&mut self, id: u32, title: &str) -> void!raw.Error {
@@ -1022,7 +1121,7 @@ fn allocate(length: usize) -> heap.Bytes!raw.Error {
 
 // A fresh, unconnected state.
 fn fresh() -> Connection {
-    return Connection { active: false, socket: -1, input: heap.Bytes.empty(), input_start: 0, input_end: 0, output: heap.Bytes.empty(), output_length: 0, mapping: heap.Bytes.empty(), mapping_first: 0, mapping_count: 0, per_keycode: 0, mapping_sequence: NO_REPLY, root: 0, depth: 24, max_request: 0, id_base: 0, id_step: 1, id_count: 0, blank_cursor: 0, wm_protocols: 0, wm_delete: 0, net_wm_name: 0, utf8_string: 0, sequence: 0, pending_text: 0, pending_window: 0, repeat_keycode: 0, present_opcode: 0, present_serial: 0, windows: heap.Table<Slot> { address: 0, count: 0, capacity: 0 } }
+    return Connection { active: false, socket: -1, input: heap.Bytes.empty(), input_start: 0, input_end: 0, output: heap.Bytes.empty(), output_length: 0, mapping: heap.Bytes.empty(), mapping_first: 0, mapping_count: 0, per_keycode: 0, mapping_sequence: NO_REPLY, root: 0, depth: 24, visual: 0, max_request: 0, id_base: 0, id_step: 1, id_count: 0, blank_cursor: 0, wm_protocols: 0, wm_delete: 0, net_wm_name: 0, utf8_string: 0, sequence: 0, pending_text: 0, pending_window: 0, repeat_keycode: 0, present_opcode: 0, present_serial: 0, xcb: 0, xcb_screen: 0, xcb_disconnect: 0, windows: heap.Table<Slot> { address: 0, count: 0, capacity: 0 } }
 }
 
 // The std/window adapter: the process's connection and its windows by id.
@@ -1054,9 +1153,9 @@ pub struct Backend {
             CONNECTION.disconnect()
         }
     }
-    pub fn open(title: &str, width: u32, height: u32, resizable: bool) -> u32!raw.Error {
+    pub fn open(title: &str, width: u32, height: u32, resizable: bool, pixel_buffer: bool) -> u32!raw.Error {
         unsafe {
-            return CONNECTION.open(title, width, height, resizable)
+            return CONNECTION.open(title, width, height, resizable, pixel_buffer)
         }
     }
     pub fn close(id: u32) {
@@ -1086,6 +1185,21 @@ pub struct Backend {
                 records[index].pixel_height = height
             }
         }
+    }
+    // The X11 window and a libxcb connection to its server, for GPU APIs.
+    pub fn native_handle(id: u32) -> handle.NativeHandle!raw.Error {
+        unsafe {
+            return CONNECTION.native_handle(id)
+        }
+    }
+    // Metal layers are macOS only.
+    pub fn metal_layer(id: u32) -> usize!raw.Error {
+        unsafe {
+            if let some(_) = CONNECTION.slot(id) {
+                return err(raw.Error.Unsupported)
+            }
+        }
+        return err(raw.Error.Closed)
     }
     // X11 has no system-wide scale.
     pub fn scale_percent(id: u32) -> u32 {
