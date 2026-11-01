@@ -253,7 +253,9 @@ fn int_shiftl(x: i64, y: i64) -> i64 {
     if y >= 64 {
         return 0
     }
-    return u64_to_i64(ux << (y as u64))
+    // Checked shifts trap when bits fall off: drop them first.
+    let keep = 0xFFFFFFFFFFFFFFFFu64 >> (y as u64)
+    return u64_to_i64((ux & keep) << (y as u64))
 }
 
 fn i64_to_u64(x: i64) -> u64 {
