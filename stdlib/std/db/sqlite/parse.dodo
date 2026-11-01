@@ -2438,7 +2438,10 @@ fn parse_create(e: &mut Engine, sql_start: usize) -> usize!db.Error {
     // Table options.
     for {
         if accept_kw(e, "WITHOUT") {
-            return err(fail(e, SQLITE_ERROR, "WITHOUT ROWID tables are not supported"))
+            expect_kw(e, "ROWID")?
+            let flags0 = nflags(e, s) | 4
+            set_flags(e, s, flags0)
+            continue
         }
         if accept_kw(e, "STRICT") {
             let flags = nflags(e, s) | 2

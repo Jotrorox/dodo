@@ -27,6 +27,11 @@ const O_NPK: usize = 49
 // Partial indexes: the WHERE clause text.
 const O_WHERE: usize = 52
 const O_WHEREL: usize = 56
+// WITHOUT ROWID tables: the PRIMARY KEY as index column records.
+const O_PKCOLS: usize = 60
+// Indexes of WITHOUT ROWID tables: number of PRIMARY KEY columns appended
+// to the key (they take the place of the rowid).
+const O_NTAIL: usize = 40
 
 const OT_TABLE: u8 = 1
 const OT_INDEX: u8 = 2
@@ -40,6 +45,7 @@ const OF_UNSUPPORTED: u8 = 8
 const OF_PK: u8 = 16
 const OF_HAS_TRIGGER: u8 = 32
 const OF_UNSUPPORTED_INDEX: u8 = 64
+const OF_WR: u8 = 128
 
 // Column record.
 const K_NAME: usize = 0
@@ -52,6 +58,8 @@ const K_DFLT: usize = 12
 const K_DFLTL: usize = 16
 const K_TYPE: usize = 20
 const K_TYPEL: usize = 24
+// WITHOUT ROWID tables: the column's field number in the stored record.
+const K_RECPOS: usize = 28
 // Index column record: table column (0xffffffff = rowid), desc, coll.
 const K_COL: usize = 0
 const K_DESC: usize = 8
@@ -113,6 +121,199 @@ fn col_flags(e: &Engine, t: usize, c: usize) -> usize {
 
 fn idx_col(e: &Engine, x: usize, k: usize) -> usize {
     ldu(e.ws, col_rec(e, x, k) + K_COL)
+}
+
+fn is_wr(e: &Engine, t: usize) -> bool {
+    t != NO_COL && (obj_flags(e, t) & OF_WR) != 0 && obj_type(e, t) == OT_TABLE
+}
+
+// Field number of column c in the table's records.
+fn rec_pos(e: &Engine, t: usize, c: usize) -> usize {
+    if t != NO_COL && (obj_flags(e, t) & OF_WR) != 0 {
+        return ld16(e.ws, col_rec(e, t, c) + K_RECPOS)
+    }
+    c
+}
+
+fn pk_count(e: &Engine, t: usize) -> usize {
+    e.ws[obj(e, t) + O_NPK] as usize
+}
+
+// PRIMARY KEY column record k of a WITHOUT ROWID table.
+fn pk_rec(e: &Engine, t: usize, k: usize) -> usize {
+    obj_u(e, t, O_PKCOLS) + k * COL_BYTES
+}
+
+fn pk_col(e: &Engine, t: usize, k: usize) -> usize {
+    ldu(e.ws, pk_rec(e, t, k) + K_COL)
+}
+
+// Index tail: for WITHOUT ROWID tables the PRIMARY KEY columns not already
+// in the key (with their collation and order), else the rowid.
+fn index_ntail(e: &Engine, x: usize) -> usize {
+    t := obj_u(e, x, O_TABLE)
+    if is_wr(e, t) {
+        return obj_u(e, x, O_NTAIL)
+    }
+    1
+}
+
+// Table column of tail field j of index x (WITHOUT ROWID tables).
+fn tail_col(e: &Engine, x: usize, j: usize) -> usize {
+    idx_col(e, x, obj_ncol(e, x) + j)
+}
+
+// Reads column c of a table record.
+fn row_column(e: &mut Engine, t: usize, p: usize, len: usize, c: usize, dst: usize) -> bool!db.Error {
+    let pos = rec_pos(e, t, c)
+    record_column(e, p, len, pos, dst)
+}
+
+// Appends the PRIMARY KEY tail to index x of a WITHOUT ROWID table. The
+// column records are copied after the key columns (the array is rebuilt
+// one record longer per tail column); O_NCOL keeps counting key columns.
+fn index_add_tail(e: &mut Engine, x: usize, t: usize) -> void!db.Error {
+    if !is_wr(e, t) {
+        return ok()
+    }
+    n := obj_ncol(e, x)
+    npk := pk_count(e, t)
+    cols := schema_alloc(e, (n + npk) * COL_BYTES)?
+    old := obj_u(e, x, O_COLS)
+    move_bytes(e.ws, old, cols, n * COL_BYTES)
+    zero_bytes(e.ws, cols + n * COL_BYTES, npk * COL_BYTES)
+    ntail := 0usize
+    for k in 0usize..npk {
+        pr := pk_rec(e, t, k)
+        pc := ldu(e.ws, pr + K_COL)
+        pcoll := e.ws[pr + K_COLL]
+        dup := false
+        for i in 0usize..n {
+            r := cols + i * COL_BYTES
+            if ldu(e.ws, r + K_COL) == pc && e.ws[r + K_COLL] == pcoll {
+                dup = true
+            }
+        }
+        if dup {
+            continue
+        }
+        r2 := cols + (n + ntail) * COL_BYTES
+        stu(e.ws, r2 + K_COL, pc)
+        e.ws[r2 + K_COLL] = pcoll
+        let pdesc = e.ws[pr + K_DESC]
+        e.ws[r2 + K_DESC] = pdesc
+        ntail += 1
+    }
+    o := obj(e, x)
+    stu(e.ws, o + O_COLS, cols)
+    stu(e.ws, o + O_NTAIL, ntail)
+    ok()
+}
+
+// WITHOUT ROWID: builds the PRIMARY KEY records and the record layout
+// (PRIMARY KEY columns first, then the others in table order).
+fn wr_setup(e: &mut Engine, i: usize, s: usize, pk_list: usize) -> void!db.Error {
+    o := obj(e, i)
+    if (e.ws[o + O_FLAGS] & OF_AUTOINC) != 0 {
+        return err(fail(e, SQLITE_ERROR, "AUTOINCREMENT not allowed on WITHOUT ROWID tables"))
+    }
+    ncol := obj_ncol(e, i)
+    // Collect the PRIMARY KEY columns in key order.
+    cnt := if pk_list != 0 {
+        list_len(e, pk_list)
+    } else {
+        0usize
+    }
+    for c in 0usize..ncol {
+        if pk_list == 0 && (col_flags(e, i, c) & CF_PK) != 0 {
+            cnt += 1
+        }
+    }
+    if cnt == 0 {
+        let tn = obj_u(e, i, O_NAME)
+        let tl = obj_u(e, i, O_NAMEL)
+        return err(fail2(e, SQLITE_ERROR, "PRIMARY KEY missing on table ", tn, tl))
+    }
+    pks := schema_alloc(e, cnt * COL_BYTES)?
+    zero_bytes(e.ws, pks, cnt * COL_BYTES)
+    npk := 0usize
+    if pk_list != 0 {
+        item := pk_list
+        for item != 0 {
+            id := na(e, item)
+            let ia = na(e, id)
+            let ib = nb(e, id)
+            c := find_column(e, i, ia, ib)
+            coll := nb(e, item)
+            let cc = if coll > 0 {
+                (coll - 1) as u8
+            } else {
+                col_coll(e, i, c)
+            }
+            dup := false
+            for k in 0usize..npk {
+                if ldu(e.ws, pks + k * COL_BYTES + K_COL) == c {
+                    dup = true
+                }
+            }
+            if !dup {
+                r := pks + npk * COL_BYTES
+                stu(e.ws, r + K_COL, c)
+                e.ws[r + K_COLL] = cc
+                let dsc = if (nflags(e, item) & 1) != 0 {
+                    1u8
+                } else {
+                    0u8
+                }
+                e.ws[r + K_DESC] = dsc
+                npk += 1
+            }
+            item = nnext(e, item)
+        }
+    } else {
+        for c in 0usize..ncol {
+            if (col_flags(e, i, c) & CF_PK) != 0 {
+                r := pks + npk * COL_BYTES
+                stu(e.ws, r + K_COL, c)
+                let cc2 = col_coll(e, i, c)
+                e.ws[r + K_COLL] = cc2
+                let dsc2 = if (col_flags(e, i, c) & CF_PKDESC) != 0 {
+                    1u8
+                } else {
+                    0u8
+                }
+                e.ws[r + K_DESC] = dsc2
+                npk += 1
+            }
+        }
+    }
+    o2 := obj(e, i)
+    e.ws[o2 + O_FLAGS] = e.ws[o2 + O_FLAGS] | OF_WR
+    e.ws[o2 + O_NPK] = npk as u8
+    stu(e.ws, o2 + O_PKCOLS, pks)
+    stu(e.ws, o2 + O_ROWID, NO_COL)
+    // Record layout; PRIMARY KEY columns are NOT NULL.
+    for k in 0usize..npk {
+        c := ldu(e.ws, pks + k * COL_BYTES + K_COL)
+        r := col_rec(e, i, c)
+        st16(e.ws, r + K_RECPOS, k)
+        e.ws[r + K_FLAGS] = e.ws[r + K_FLAGS] | (CF_NOTNULL as u8)
+    }
+    pos := npk
+    for c in 0usize..ncol {
+        is_pk := false
+        for k in 0usize..npk {
+            if ldu(e.ws, pks + k * COL_BYTES + K_COL) == c {
+                is_pk = true
+            }
+        }
+        if !is_pk {
+            r := col_rec(e, i, c)
+            st16(e.ws, r + K_RECPOS, pos)
+            pos += 1
+        }
+    }
+    ok()
 }
 
 fn schema_alloc(e: &mut Engine, len: usize) -> usize!db.Error {
@@ -337,7 +538,9 @@ fn load_schema(e: &mut Engine) -> void!db.Error {
                 continue
             }
             match load_index(e, i, t) {
-                ok() => {},
+                ok() => {
+                    index_add_tail(e, i, t)?
+                },
                 err(_) => {
                     o2 := obj(e, i)
                     e.ws[o2 + O_FLAGS] = e.ws[o2 + O_FLAGS] | OF_UNSUPPORTED
@@ -495,6 +698,9 @@ fn table_from_ast(e: &mut Engine, i: usize, s: usize) -> void!db.Error {
         }
     }
     e.ws[o + O_NPK] = pkcount as u8
+    if (nflags(e, s) & 4) != 0 {
+        return wr_setup(e, i, s, pk_list)
+    }
     ok()
 }
 
@@ -784,4 +990,38 @@ fn next_index_of(e: &Engine, t: usize, after: usize) -> usize {
         }
     }
     NO_COL
+}
+
+// Number of the PRIMARY KEY among a table's automatic indexes (0 if none);
+// a WITHOUT ROWID table's PRIMARY KEY is the table itself and has no
+// separate index, but still takes its number.
+fn autoindex_pk_number(e: &Engine, t: usize, s: usize) -> usize {
+    count := 0usize
+    ipk := rowid_col(e, t)
+    cd := nc(e, s)
+    k := 0usize
+    for cd != 0 {
+        flags := nflags(e, cd)
+        if (flags & CF_PK) != 0 && k != ipk {
+            count += 1
+            return count
+        }
+        if (flags & CF_UNIQUE) != 0 && !auto_duplicate1(e, t, s, k, count) {
+            count += 1
+        }
+        k += 1
+        cd = nnext(e, cd)
+    }
+    tc := ndd(e, s)
+    for tc != 0 {
+        op := nop(e, tc)
+        if op == 1 {
+            return count + 1
+        }
+        if op == 2 {
+            count += 1
+        }
+        tc = nnext(e, tc)
+    }
+    0
 }

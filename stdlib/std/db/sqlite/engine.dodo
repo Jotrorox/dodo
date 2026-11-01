@@ -137,6 +137,9 @@ struct Engine {
     raise_kind: u8
     last_changes: u64
     legacy_alter: bool
+    keep_off: usize
+    keep_cap: usize
+    keep_top: usize
     gather_a: usize
     gather_b: usize
     meta_off: usize
@@ -636,6 +639,15 @@ fn layout(e: &mut Engine) -> void!db.Error {
     e.sort_top = o
     e.sort_hi = o + e.sort_cap
     o += e.sort_cap
+    // Statement-lifetime copies of lookup keys and cached subquery values;
+    // kept apart from the sorter, whose record lists must stay contiguous.
+    e.keep_cap = total / 64
+    if e.keep_cap < 16384 {
+        e.keep_cap = 16384
+    }
+    e.keep_off = o
+    e.keep_top = o
+    o += e.keep_cap
     e.bitmap_bytes = total / 64
     if e.bitmap_bytes < 4096 {
         e.bitmap_bytes = 4096
@@ -806,22 +818,27 @@ fn reg_own(e: &mut Engine, r: usize) -> void!db.Error {
     ok()
 }
 
-// Like reg_own, but the copy lives on the sort stack and survives until the
+// Like reg_own, but the copy lives in the keep area and survives until the
 // statement finishes (the arena is reset at every step).
 fn reg_keep(e: &mut Engine, r: usize) -> void!db.Error {
     t := rtype(e, r)
     if t == T_TEXT || t == T_BLOB {
         len := rlen(e, r)
-        if e.sort_top + len > e.sort_hi {
-            return err(full(e, "sorter (key values)"))
-        }
-        e.sort_hi -= len
-        dst := e.sort_hi
+        dst := keep_alloc(e, len)?
         src := roff(e, r)
         move_bytes(e.ws, src, dst, len)
         set_bytes(e, r, t, dst, len)
     }
     ok()
+}
+
+fn keep_alloc(e: &mut Engine, len: usize) -> usize!db.Error {
+    if e.keep_top + len > e.keep_off + e.keep_cap {
+        return err(full(e, "key value area (lookup keys too long)"))
+    }
+    o := e.keep_top
+    e.keep_top += len
+    ok(o)
 }
 
 fn next_random(e: &mut Engine) -> u64 {

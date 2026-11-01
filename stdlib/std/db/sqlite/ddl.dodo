@@ -146,14 +146,23 @@ fn exec_create_table(e: &mut Engine, s: usize) -> void!db.Error {
     }
     nauto := autoindex_constraint(e, t, s, 0)?
     autoinc := (obj_flags(e, t) & OF_AUTOINC) != 0
+    wr := is_wr(e, t)
+    skip_auto := if wr {
+        autoindex_pk_number(e, t, s)
+    } else {
+        0usize
+    }
     e.schema_objs -= 1
     let s_e = ne_(e, s)
     let s_f = nff(e, s)
     let (sql, sqll) = normalized_sql(e, "CREATE TABLE ", s_e, s_f)?
-    root := btree_create(e, false)?
+    root := btree_create(e, wr)?
     schema_insert(e, "table", name, nl, name, nl, root, sql, sqll)?
     // Automatic indexes for PRIMARY KEY and UNIQUE constraints.
     for k in 1usize..(nauto + 1) {
+        if k == skip_auto {
+            continue
+        }
         buf := [0u8; 300]
         b := mem_bytes("sqlite_autoindex_")
         m := 0usize
@@ -268,6 +277,7 @@ fn exec_create_index(e: &mut Engine, s: usize) -> void!db.Error {
             return err(reason)
         },
     }
+    index_add_tail(e, x, t)?
     unique := (nflags(e, s) & 2) != 0
     prefix := if unique {
         "CREATE UNIQUE INDEX "
@@ -283,15 +293,16 @@ fn exec_create_index(e: &mut Engine, s: usize) -> void!db.Error {
     // Populate from the table.
     tc := SCHEMA_CUR - 1
     ic := SCHEMA_CUR - 2
-    let root2 = obj_root(e, t)
-    cur_open(e, tc, root2, false)
+    open_table_cursor(e, tc, t)
     open_index_cursor(e, ic, x)
     n := obj_ncol(e, x)
+    nt := index_ntail(e, x)
+    wr := is_wr(e, t)
     ipk := rowid_col(e, t)
     ncol := obj_ncol(e, t)
     save := e.rtop
     keys := e.rtop
-    for _ in 0usize..(n + 1) {
+    for _ in 0usize..(n + nt) {
         reg_push(e)?
     }
     // Expression and partial indexes evaluate against the whole row.
@@ -314,20 +325,27 @@ fn exec_create_index(e: &mut Engine, s: usize) -> void!db.Error {
     more := cur_first(e, tc)?
     for more {
         mark := e.arena_top
-        rowid := cur_rowid(e, tc)
+        rowid := if wr {
+            0i64
+        } else {
+            cur_rowid(e, tc)
+        }
         let (p, len) = cur_payload(e, tc)?
         any_null := false
         skip := false
-        if exprs != 0 {
+        full := exprs != 0 || wr
+        if full {
             for c2 in 0usize..ncol {
                 if c2 == ipk {
                     set_int(e, base + c2, rowid)
-                } else if !record_column(e, p, len, c2, base + c2)? {
+                } else if !row_column(e, t, p, len, c2, base + c2)? {
                     column_default(e, t, c2, base + c2)?
                 }
                 reg_own(e, base + c2)?
             }
             set_int(e, base + ncol, rowid)
+        }
+        if exprs != 0 {
             cond := ldu(e.ws, exprs + n * 4)
             if cond != 0 && eval_truth(e, cond)? != 1 {
                 skip = true
@@ -348,7 +366,7 @@ fn exec_create_index(e: &mut Engine, s: usize) -> void!db.Error {
             } else if c == NO_COL || c == ipk {
                 set_int(e, keys + k, rowid)
             } else {
-                if exprs != 0 {
+                if full {
                     copy_reg(e, keys + k, base + c)
                 } else if !record_column(e, p, len, c, keys + k)? {
                     column_default(e, t, c, keys + k)?
@@ -358,7 +376,14 @@ fn exec_create_index(e: &mut Engine, s: usize) -> void!db.Error {
                 }
             }
         }
-        set_int(e, keys + n, rowid)
+        if wr {
+            for j in 0usize..nt {
+                let tcol = tail_col(e, x, j)
+                copy_reg(e, keys + n + j, base + tcol)
+            }
+        } else {
+            set_int(e, keys + n, rowid)
+        }
         if skip {
             arena_reset(e, mark)
             more = cur_next(e, tc)?
@@ -371,9 +396,9 @@ fn exec_create_index(e: &mut Engine, s: usize) -> void!db.Error {
                 return err(constraint_fail(e, SQLITE_CONSTRAINT_UNIQUE, "UNIQUE", t, 0, n, x))
             }
         }
-        size := record_size(e, keys, n + 1)
+        size := record_size(e, keys, n + nt)
         rec := arena_alloc(e, size)?
-        record_write(e, keys, n + 1, rec)
+        record_write(e, keys, n + nt, rec)
         index_insert(e, ic, rec, size)?
         arena_reset(e, mark)
         // The table cursor is unaffected by index inserts; continue.
@@ -1054,6 +1079,65 @@ fn drop_column(e: &mut Engine, t: usize, co: usize, cl: usize) -> void!db.Error 
     // Rewrite the rows first, while the catalog still describes them.
     root := obj_root(e, t)
     cur := SCHEMA_CUR - 1
+    if is_wr(e, t) {
+        wr_drop_field(e, t, c, cur)?
+    } else {
+        rewrite_without(e, t, c, cur, root)?
+    }
+    let schema_rowid = obj_u(e, t, O_ROWNO) as i64
+    schema_update(e, schema_rowid, name, nl, name, nl, ns, len, false)?
+    schema_changed(e)?
+    return drop_column_checks(e, t, co, cl)
+}
+
+// Rewrites every row of WITHOUT ROWID table t without column c.
+fn wr_drop_field(e: &mut Engine, t: usize, c: usize, cur: usize) -> void!db.Error {
+    ncol := obj_ncol(e, t)
+    npk := pk_count(e, t)
+    open_table_cursor(e, cur, t)
+    save := e.rtop
+    base := e.rtop
+    for _ in 0usize..(2 * ncol + npk + 1) {
+        reg_push(e)?
+    }
+    out := base + ncol + 1
+    key := out + ncol
+    more := cur_first(e, cur)?
+    for more {
+        mark := e.arena_top
+        wr_load_row(e, t, cur, base)?
+        k := 0usize
+        for q in 0usize..ncol {
+            for col in 0usize..ncol {
+                if rec_pos(e, t, col) == q && col != c {
+                    copy_reg(e, out + k, base + col)
+                    k += 1
+                }
+            }
+        }
+        for j in 0usize..npk {
+            let pc = pk_col(e, t, j)
+            copy_reg(e, key + j, base + pc)
+        }
+        size := record_size(e, out, ncol - 1)
+        rec := arena_alloc(e, size)?
+        record_write(e, out, ncol - 1, rec)
+        cur_delete(e, cur)?
+        index_insert(e, cur, rec, size)?
+        if seek_index(e, cur, key, npk)? != 0 {
+            e.rtop = save
+            return err(corrupt(e))
+        }
+        arena_reset(e, mark)
+        more = cur_next(e, cur)?
+    }
+    e.rtop = save
+    ok()
+}
+
+// Rewrites every row of rowid table t without column c.
+fn rewrite_without(e: &mut Engine, t: usize, c: usize, cur: usize, root: u32) -> void!db.Error {
+    ncol := obj_ncol(e, t)
     cur_open(e, cur, root, false)
     save := e.rtop
     base := e.rtop
@@ -1088,9 +1172,10 @@ fn drop_column(e: &mut Engine, t: usize, co: usize, cl: usize) -> void!db.Error 
         more = cur_next(e, cur)?
     }
     e.rtop = save
-    let schema_rowid = obj_u(e, t, O_ROWNO) as i64
-    schema_update(e, schema_rowid, name, nl, name, nl, ns, len, false)?
-    schema_changed(e)?
+    ok()
+}
+
+fn drop_column_checks(e: &mut Engine, t: usize, co: usize, cl: usize) -> void!db.Error {
     if e.legacy_alter {
         return ok()
     }

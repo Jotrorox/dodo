@@ -73,14 +73,28 @@ def oracle(path, script):
     return out
 
 
+def table_query(conn, t):
+    """SELECT for every row of table t in a stable order: rowid order, or
+    for WITHOUT ROWID tables the order of all columns."""
+    q = '"' + t.replace('"', '""') + '"'
+    try:
+        conn.execute(f"select rowid from {q} limit 0")
+        return f"select * from {q} order by rowid"
+    except sqlite3.Error:
+        # The planner may scan a covering index instead of the table, so
+        # order by every column.
+        n = len(conn.execute(f"select * from {q} limit 0").description)
+        order = ", ".join(str(i + 1) for i in range(n))
+        return f"select * from {q} order by {order}"
+
+
 def contents(path):
     conn = sqlite3.connect(path)
     rows = []
     tables = [r[0] for r in conn.execute(
         "select name from sqlite_schema where type='table' order by name")]
     for t in tables:
-        q = '"' + t.replace('"', '""') + '"'
-        for row in conn.execute(f"select * from {q} order by rowid"):
+        for row in conn.execute(table_query(conn, t)):
             rows.append(t + ": " + "|".join(fmt(conn, v) for v in row))
     schema = [r for r in conn.execute(
         "select type, name, tbl_name, sql from sqlite_schema order by name")]
@@ -143,19 +157,18 @@ def main():
             conn = sqlite3.connect(a)
             tables = [r[0] for r in conn.execute(
                 "select name from sqlite_schema where type='table' order by name")]
+            queries = [table_query(conn, t) for t in tables]
             conn.close()
             dump = os.path.join(workdir, name + ".dump.sql")
             with open(dump, "w", encoding="utf-8") as f:
-                for t in tables:
-                    q = '"' + t.replace('"', '""') + '"'
-                    f.write(f"select * from {q} order by rowid;\n")
+                for query in queries:
+                    f.write(query + ";\n")
             run = subprocess.run([shell, a, dump], capture_output=True)
             got = run.stdout.decode("utf-8", "replace")
             want = []
             conn = sqlite3.connect(a)
-            for t in tables:
-                q = '"' + t.replace('"', '""') + '"'
-                for row in conn.execute(f"select * from {q} order by rowid"):
+            for query in queries:
+                for row in conn.execute(query):
                     want.append("|".join(fmt(conn, v) for v in row))
             conn.close()
             gl, wl = got.splitlines(), "\n".join(want).splitlines()

@@ -495,6 +495,13 @@ fn exec_pragma(e: &mut Engine, s: usize, resreg: usize) -> void!db.Error {
 
 // 1-based position of column c in the table's primary key.
 fn pk_position(e: &Engine, t: usize, c: usize) -> i64 {
+    if is_wr(e, t) {
+        for k in 0usize..pk_count(e, t) {
+            if pk_col(e, t, k) == c {
+                return (k + 1) as i64
+            }
+        }
+    }
     // Use the order of the PRIMARY KEY autoindex when there is one.
     for j in 0usize..e.schema_objs {
         if obj_type(e, j) == OT_INDEX && obj_u(e, j, O_TABLE) == t && (obj_flags(e, j) & OF_PK) != 0 {

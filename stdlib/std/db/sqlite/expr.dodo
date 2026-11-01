@@ -724,7 +724,12 @@ fn eval_column(e: &mut Engine, n: usize, dst: usize) -> void!db.Error {
         return ok()
     }
     let (p, len) = cur_payload(e, c)?
-    if !record_column(e, p, len, col, dst)? {
+    pos := if t != NO_COL && (obj_flags(e, t) & OF_WR) != 0 {
+        rec_pos(e, t, col)
+    } else {
+        col
+    }
+    if !record_column(e, p, len, pos, dst)? {
         return column_default(e, t, col, dst)
     }
     if t != NO_COL && rtype(e, dst) == T_INT && col_aff(e, t, col) == AFF_REAL {

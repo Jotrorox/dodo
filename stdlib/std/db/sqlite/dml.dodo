@@ -32,6 +32,9 @@ const W_NTRIG: usize = 92
 const W_TNEW: usize = 96
 const W_VIEW: usize = 100
 const W_TOLD: usize = 104
+// WITHOUT ROWID tables: 3 x npk registers: the identity (PRIMARY KEY) of
+// the row being changed, the new row's key, and a conflicting row's key.
+const W_PK: usize = 108
 const W_BYTES: usize = 112
 
 const ROWID_TARGET: usize = 4294967294
@@ -114,7 +117,12 @@ fn write_info(e: &mut Engine, s: usize, t: usize) -> usize!db.Error {
     stu(e.ws, w + W_BASE, base)
     old := alloc_regs(e, ncol + 1)?
     stu(e.ws, w + W_OLD, old)
-    keys := alloc_regs(e, 34)?
+    let npk_w = pk_count(e, t)
+    keys := alloc_regs(e, 34 + npk_w)?
+    if is_wr(e, t) {
+        let pkr = alloc_regs(e, 3 * npk_w)?
+        stu(e.ws, w + W_PK, pkr)
+    }
     stu(e.ws, w + W_KEYREG, keys)
     c := alloc_cursor(e)?
     stu(e.ws, w + W_CUR, c)
@@ -212,8 +220,7 @@ fn add_check(e: &mut Engine, head: usize, x: usize) -> usize!db.Error {
 fn open_write_cursors(e: &mut Engine, w: usize) {
     t := wget(e, w, W_TABLE)
     c := wget(e, w, W_CUR)
-    let root = obj_root(e, t)
-    cur_open(e, c, root, false)
+    open_table_cursor(e, c, t)
     arr := wget(e, w, W_IDX)
     for k in 0usize..wget(e, w, W_NIDX) {
         x := ldu(e.ws, arr + k * IDX_ENTRY)
@@ -511,7 +518,9 @@ fn resolve_upsert(e: &mut Engine, s: usize, w: usize, t: usize) -> void!db.Error
         to := na(e, tl)
         tlen := nb(e, tl)
         c0 := find_column(e, t, to, tlen)
-        if n == 1 && ((c0 == ipk && ipk != NO_COL) || (c0 == NO_COL && is_rowid_name(e, to, tlen))) {
+        if is_wr(e, t) && wr_list_is_pk(e, t, tl) {
+            target = ROWID_TARGET
+        } else if n == 1 && ((c0 == ipk && ipk != NO_COL) || (c0 == NO_COL && is_rowid_name(e, to, tlen))) {
             target = ROWID_TARGET
         } else {
             x := next_index_of(e, t, NO_COL)
@@ -639,19 +648,27 @@ fn do_upsert(e: &mut Engine, w: usize, r: i64) -> void!db.Error {
     old := wget(e, w, W_OLD)
     ncol := wget(e, w, W_NCOL)
     ipk := rowid_col(e, t)
-    if !seek_rowid(e, c, r)? {
-        return err(corrupt(e))
-    }
-    let (p, len) = cur_payload(e, c)?
-    for i in 0usize..ncol {
-        if i == ipk {
-            set_int(e, old + i, r)
-        } else if !record_column(e, p, len, i, old + i)? {
-            column_default(e, t, i, old + i)?
+    if is_wr(e, t) {
+        let pk = wget(e, w, W_PK)
+        if !wr_seek(e, c, t, pk)? {
+            return err(corrupt(e))
         }
-        reg_own(e, old + i)?
+        wr_load_row(e, t, c, old)?
+    } else {
+        if !seek_rowid(e, c, r)? {
+            return err(corrupt(e))
+        }
+        let (p, len) = cur_payload(e, c)?
+        for i in 0usize..ncol {
+            if i == ipk {
+                set_int(e, old + i, r)
+            } else if !record_column(e, p, len, i, old + i)? {
+                column_default(e, t, i, old + i)?
+            }
+            reg_own(e, old + i)?
+        }
+        set_int(e, old + ncol, r)
     }
-    set_int(e, old + ncol, r)
     for i in 0usize..(ncol + 1) {
         reg_own(e, base + i)?
     }
@@ -982,7 +999,14 @@ fn index_key(e: &mut Engine, w: usize, k0: usize, row: usize, rowid: i64, old: b
             }
         }
     }
-    set_int(e, keys + n, rowid)
+    if is_wr(e, t) {
+        for j in 0usize..index_ntail(e, x) {
+            let tc = tail_col(e, x, j)
+            copy_reg(e, keys + n + j, row + tc)
+        }
+    } else {
+        set_int(e, keys + n, rowid)
+    }
     ok(!any_null)
 }
 
@@ -999,6 +1023,10 @@ fn write_row(e: &mut Engine, w: usize, conf: u8, update: bool, old_rowid: i64) -
     seq_obj := wget(e, w, W_SEQ)
     seq_value := 0i64
     seq_rowid := 0i64
+    wr := is_wr(e, t)
+    if wr {
+        set_null(e, rid)
+    }
     if !update && has_triggers(e, w, trig_mask(TE_INSERT, TT_BEFORE)) {
         // NEW for BEFORE INSERT: values with affinity applied; an automatic
         // rowid reads as -1.
@@ -1011,7 +1039,7 @@ fn write_row(e: &mut Engine, w: usize, conf: u8, update: bool, old_rowid: i64) -
             }
         }
         copy_reg(e, tnew + ncol, rid)
-        if rtype(e, tnew + ncol) == T_NULL {
+        if rtype(e, tnew + ncol) == T_NULL && !wr {
             set_int(e, tnew + ncol, -1)
         } else {
             compare_affinity(e, tnew + ncol, AFF_NUMERIC)?
@@ -1030,7 +1058,7 @@ fn write_row(e: &mut Engine, w: usize, conf: u8, update: bool, old_rowid: i64) -
         }
     }
     // Rowid.
-    if rtype(e, rid) != T_NULL {
+    if !wr && rtype(e, rid) != T_NULL {
         compare_affinity(e, rid, AFF_NUMERIC)?
         if rtype(e, rid) == T_REAL {
             let (exact, iv) = real_as_int(rreal(e, rid))
@@ -1047,7 +1075,7 @@ fn write_row(e: &mut Engine, w: usize, conf: u8, update: bool, old_rowid: i64) -
         seq_value = sv
         seq_rowid = sr
     }
-    if rtype(e, rid) == T_NULL {
+    if !wr && rtype(e, rid) == T_NULL {
         next := 1i64
         if cur_last(e, c)? {
             maxr := cur_rowid(e, c)
@@ -1080,7 +1108,11 @@ fn write_row(e: &mut Engine, w: usize, conf: u8, update: bool, old_rowid: i64) -
         }
         set_int(e, rid, next)
     }
-    rowid := rint(e, rid)
+    rowid := if wr {
+        0i64
+    } else {
+        rint(e, rid)
+    }
     // SQLite advances the AUTOINCREMENT sequence as soon as a rowid is
     // chosen, even when OR IGNORE then skips the row.
     if seq_obj != 0 && rowid > seq_value {
@@ -1143,8 +1175,32 @@ fn write_row(e: &mut Engine, w: usize, conf: u8, update: bool, old_rowid: i64) -
             return err(make_error(e, SQLITE_CONSTRAINT_CHECK))
         }
     }
-    // Rowid uniqueness.
-    if !update || rowid != old_rowid {
+    // Rowid (or WITHOUT ROWID primary key) uniqueness.
+    if wr {
+        pk := wget(e, w, W_PK)
+        npk := pk_count(e, t)
+        newk := pk + npk
+        for k in 0usize..npk {
+            let pc = pk_col(e, t, k)
+            copy_reg(e, newk + k, base + pc)
+        }
+        if wr_seek(e, c, t, newk)? && !(update && wr_same_key(e, t, newk, pk)) {
+            if !update && upsert_applies(e, w, ROWID_TARGET) {
+                wr_set_identity(e, w, newk)
+                do_upsert(e, w, 0)?
+                return ok(false)
+            }
+            if conf == OE_IGNORE {
+                return ok(false)
+            }
+            if conf == OE_REPLACE {
+                wr_delete_by(e, w, newk)?
+            } else {
+                conf_mark(e, conf)
+                return err(wr_pk_fail(e, t))
+            }
+        }
+    } else if !update || rowid != old_rowid {
         if seek_rowid(e, c, rowid)? {
             if !update && upsert_applies(e, w, ROWID_TARGET) {
                 do_upsert(e, w, rowid)?
@@ -1183,13 +1239,27 @@ fn write_row(e: &mut Engine, w: usize, conf: u8, update: bool, old_rowid: i64) -
                 break
             }
             let (p, len) = cur_payload(e, ic)?
-            nf := record_count(e, p, len)
-            record_column(e, p, len, nf - 1, R_TMP)?
-            other := rint(e, R_TMP)
-            if other == rowid || (update && other == old_rowid) {
-                break
+            other := 0i64
+            otherk := 0usize
+            if wr {
+                otherk = wget(e, w, W_PK) + 2 * pk_count(e, t)
+                index_entry_pk(e, x, t, p, len, otherk)?
+                let oldk = wget(e, w, W_PK)
+                if update && wr_same_key(e, t, otherk, oldk) {
+                    break
+                }
+            } else {
+                nf := record_count(e, p, len)
+                record_column(e, p, len, nf - 1, R_TMP)?
+                other = rint(e, R_TMP)
+                if other == rowid || (update && other == old_rowid) {
+                    break
+                }
             }
             if !update && upsert_applies(e, w, x) {
+                if wr {
+                    wr_set_identity(e, w, otherk)
+                }
                 do_upsert(e, w, other)?
                 return ok(false)
             }
@@ -1197,6 +1267,11 @@ fn write_row(e: &mut Engine, w: usize, conf: u8, update: bool, old_rowid: i64) -
                 return ok(false)
             }
             if conf == OE_REPLACE {
+                if wr {
+                    wr_delete_by(e, w, otherk)?
+                    index_key(e, w, k, base, rowid, false)?
+                    continue
+                }
                 delete_row(e, w, other)?
                 index_key(e, w, k, base, rowid, false)?
                 continue
@@ -1240,17 +1315,36 @@ fn store_row(e: &mut Engine, w: usize, rowid: i64) -> void!db.Error {
     base := wget(e, w, W_BASE)
     ncol := wget(e, w, W_NCOL)
     ipk := rowid_col(e, t)
-    // The INTEGER PRIMARY KEY column is stored as NULL (it is the rowid).
-    if ipk != NO_COL {
-        set_null(e, base + ipk)
+    wr := is_wr(e, t)
+    if wr {
+        // Fields in record order: PRIMARY KEY columns first.
+        save := e.rtop
+        tmp := e.rtop
+        for _ in 0usize..ncol {
+            reg_push(e)?
+        }
+        for col in 0usize..ncol {
+            let pos = rec_pos(e, t, col)
+            copy_reg(e, tmp + pos, base + col)
+        }
+        wsize := record_size(e, tmp, ncol)
+        wrec := arena_alloc(e, wsize)?
+        record_write(e, tmp, ncol, wrec)
+        e.rtop = save
+        index_insert(e, c, wrec, wsize)?
+    } else {
+        // The INTEGER PRIMARY KEY column is stored as NULL (it is the rowid).
+        if ipk != NO_COL {
+            set_null(e, base + ipk)
+        }
+        size := record_size(e, base, ncol)
+        rec := arena_alloc(e, size)?
+        record_write(e, base, ncol, rec)
+        if ipk != NO_COL {
+            set_int(e, base + ipk, rowid)
+        }
+        table_insert(e, c, rowid, rec, size)?
     }
-    size := record_size(e, base, ncol)
-    rec := arena_alloc(e, size)?
-    record_write(e, base, ncol, rec)
-    if ipk != NO_COL {
-        set_int(e, base + ipk, rowid)
-    }
-    table_insert(e, c, rowid, rec, size)?
     arr := wget(e, w, W_IDX)
     keys := wget(e, w, W_KEYREG)
     for k in 0usize..wget(e, w, W_NIDX) {
@@ -1268,19 +1362,26 @@ fn store_row(e: &mut Engine, w: usize, rowid: i64) -> void!db.Error {
                 apply_affinity(e, keys + i, affinity)?
             }
         }
-        isize := record_size(e, keys, n + 1)
+        nt := index_ntail(e, x)
+        isize := record_size(e, keys, n + nt)
         irec := arena_alloc(e, isize)?
-        record_write(e, keys, n + 1, irec)
+        record_write(e, keys, n + nt, irec)
         index_insert(e, ic, irec, isize)?
     }
     e.changes += 1
-    e.last_rowid = rowid
+    if !wr {
+        e.last_rowid = rowid
+    }
     push_returning(e, w)
 }
 
 // Deletes row `rowid` and its index entries.
 fn delete_row(e: &mut Engine, w: usize, rowid: i64) -> void!db.Error {
     t := wget(e, w, W_TABLE)
+    if is_wr(e, t) {
+        let pk = wget(e, w, W_PK)
+        return wr_delete_by(e, w, pk)
+    }
     c := wget(e, w, W_CUR)
     old := wget(e, w, W_OLD)
     ncol := wget(e, w, W_NCOL)
@@ -1298,6 +1399,18 @@ fn delete_row(e: &mut Engine, w: usize, rowid: i64) -> void!db.Error {
         reg_own(e, old + i)?
     }
     set_int(e, old + ncol, rowid)
+    delete_index_entries(e, w, rowid)?
+    if seek_rowid(e, c, rowid)? {
+        cur_delete(e, c)?
+    }
+    ok()
+}
+
+// Removes the index entries of the row in the W_OLD registers.
+fn delete_index_entries(e: &mut Engine, w: usize, rowid: i64) -> void!db.Error {
+    t := wget(e, w, W_TABLE)
+    old := wget(e, w, W_OLD)
+    ipk := rowid_col(e, t)
     arr := wget(e, w, W_IDX)
     keys := wget(e, w, W_KEYREG)
     for k in 0usize..wget(e, w, W_NIDX) {
@@ -1315,12 +1428,10 @@ fn delete_row(e: &mut Engine, w: usize, rowid: i64) -> void!db.Error {
                 apply_affinity(e, keys + i, affinity)?
             }
         }
-        if seek_index(e, ic, keys, n + 1)? == 0 {
+        let nt = index_ntail(e, x)
+        if seek_index(e, ic, keys, n + nt)? == 0 {
             cur_delete(e, ic)?
         }
-    }
-    if seek_rowid(e, c, rowid)? {
-        cur_delete(e, c)?
     }
     ok()
 }
@@ -1391,19 +1502,44 @@ fn synth_select(e: &mut Engine, s: usize, t: usize) -> usize!db.Error {
     let s_b = nb(e, s)
     set_nf(e, src, 1, s_b)
     set_nf(e, sel, 1, src)
-    rc := new_node(e, N_RESCOL)?
-    ph := new_node(e, N_NULL)?
-    set_nf(e, rc, 0, ph)
-    set_nf(e, sel, 0, rc)
+    // The result is the rowid of the scanned table, or the PRIMARY KEY of
+    // a WITHOUT ROWID table.
+    nres := if is_wr(e, t) {
+        pk_count(e, t)
+    } else {
+        1usize
+    }
+    head := 0usize
+    tail := 0usize
+    for _ in 0usize..nres {
+        rc := new_node(e, N_RESCOL)?
+        ph := new_node(e, N_NULL)?
+        set_nf(e, rc, 0, ph)
+        let (h, tl) = list_append(e, head, tail, rc)
+        head = h
+        tail = tl
+    }
+    set_nf(e, sel, 0, head)
     let s_d = ndd(e, s)
     set_nf(e, sel, 2, s_d)
     resolve_select(e, sel)?
-    // The result is the rowid of the scanned table.
-    set_kind(e, ph, N_COL)
     c := (nx(e, src) & 0xffffffffu64) as usize
-    set_nf(e, ph, 0, c)
-    set_nf(e, ph, 1, NO_COL)
-    set_nf(e, ph, 2, t)
+    rc2 := head
+    k := 0usize
+    for rc2 != 0 {
+        ph2 := na(e, rc2)
+        set_kind(e, ph2, N_COL)
+        set_nf(e, ph2, 0, c)
+        let col = if is_wr(e, t) {
+            pk_col(e, t, k)
+        } else {
+            NO_COL
+        }
+        set_nf(e, ph2, 1, col)
+        set_nf(e, ph2, 2, t)
+        k += 1
+        rc2 = nnext(e, rc2)
+    }
     ok(sel)
 }
 
@@ -1544,11 +1680,17 @@ fn exec_update(e: &mut Engine, s: usize) -> void!db.Error {
     has_before := has_triggers(e, w, trig_mask(TE_UPDATE, TT_BEFORE))
     has_after := has_triggers(e, w, trig_mask(TE_UPDATE, TT_AFTER))
     sel := wget(e, w, W_SEL)
-    let (start, n) = collect_rowids(e, sel)?
+    t := wget(e, w, W_TABLE)
+    wr := is_wr(e, t)
+    let (start, n) = if wr {
+        let npk0 = pk_count(e, t)
+        wr_collect(e, sel, npk0)?
+    } else {
+        collect_rowids(e, sel)?
+    }
     e.ret_start = e.sort_top
     // Rows were collected; open the write cursors (the scan used its own).
     open_write_cursors(e, w)
-    t := wget(e, w, W_TABLE)
     base := wget(e, w, W_BASE)
     ncol := wget(e, w, W_NCOL)
     ipk := rowid_col(e, t)
@@ -1557,24 +1699,37 @@ fn exec_update(e: &mut Engine, s: usize) -> void!db.Error {
     nset := wget(e, w, W_NSET)
     sinfo_ := sinfo(e, sel)
     scan := ldu(e.ws, lev(e, sinfo_, 0) + L_CUR)
+    pk := wget(e, w, W_PK)
     for i in 0usize..n {
-        rowid := u2i(ld64(e.ws, start + i * 8))
         mark := e.arena_top
-        let root = obj_root(e, t)
-        cur_open(e, scan, root, false)
-        if !seek_rowid(e, scan, rowid)? {
-            continue
-        }
-        // Start from the old values.
-        let (p, len) = cur_payload(e, scan)?
-        for k in 0usize..ncol {
-            if k == ipk {
-                set_int(e, base + k, rowid)
-            } else if !record_column(e, p, len, k, base + k)? {
-                column_default(e, t, k, base + k)?
+        rowid := 0i64
+        if wr {
+            let krec = ldu(e.ws, start + i * 4)
+            wr_take_identity(e, w, krec)?
+            open_table_cursor(e, scan, t)
+            if !wr_seek(e, scan, t, pk)? {
+                arena_reset(e, mark)
+                continue
             }
+            wr_load_row(e, t, scan, base)?
+        } else {
+            rowid = u2i(ld64(e.ws, start + i * 8))
+            let root = obj_root(e, t)
+            cur_open(e, scan, root, false)
+            if !seek_rowid(e, scan, rowid)? {
+                continue
+            }
+            // Start from the old values.
+            let (p, len) = cur_payload(e, scan)?
+            for k in 0usize..ncol {
+                if k == ipk {
+                    set_int(e, base + k, rowid)
+                } else if !record_column(e, p, len, k, base + k)? {
+                    column_default(e, t, k, base + k)?
+                }
+            }
+            set_int(e, base + ncol, rowid)
         }
-        set_int(e, base + ncol, rowid)
         if has_before || has_after {
             load_trigger_old(e, w, base)?
         }
@@ -1601,7 +1756,7 @@ fn exec_update(e: &mut Engine, s: usize) -> void!db.Error {
             reg_own(e, base + k)?
         }
         e.rtop = save
-        if rtype(e, base + ncol) == T_NULL {
+        if !wr && rtype(e, base + ncol) == T_NULL {
             return err(fail(e, SQLITE_MISMATCH, "datatype mismatch"))
         }
         if has_before {
@@ -1617,9 +1772,13 @@ fn exec_update(e: &mut Engine, s: usize) -> void!db.Error {
             }
             // The trigger may have deleted the row or changed the columns
             // this UPDATE does not assign.
-            let root2 = obj_root(e, t)
-            cur_open(e, scan, root2, false)
-            if !seek_rowid(e, scan, rowid)? {
+            open_table_cursor(e, scan, t)
+            still := if wr {
+                wr_seek(e, scan, t, pk)?
+            } else {
+                seek_rowid(e, scan, rowid)?
+            }
+            if !still {
                 arena_reset(e, mark)
                 continue
             }
@@ -1634,7 +1793,7 @@ fn exec_update(e: &mut Engine, s: usize) -> void!db.Error {
                 if assigned || k == ipk {
                     continue
                 }
-                if !record_column(e, p2, len2, k, base + k)? {
+                if !row_column(e, t, p2, len2, k, base + k)? {
                     column_default(e, t, k, base + k)?
                 }
                 reg_own(e, base + k)?
@@ -1696,13 +1855,30 @@ fn exec_delete(e: &mut Engine, s: usize) -> void!db.Error {
         return ok()
     }
     sel := wget(e, w, W_SEL)
-    let (start, n) = collect_rowids(e, sel)?
+    wr := is_wr(e, t)
+    let (start, n) = if wr {
+        let npk0 = pk_count(e, t)
+        wr_collect(e, sel, npk0)?
+    } else {
+        collect_rowids(e, sel)?
+    }
     e.ret_start = e.sort_top
     open_write_cursors(e, w)
     c := wget(e, w, W_CUR)
+    pk := wget(e, w, W_PK)
     for i in 0usize..n {
-        rowid := u2i(ld64(e.ws, start + i * 8))
         mark := e.arena_top
+        rowid := 0i64
+        if wr {
+            let krec = ldu(e.ws, start + i * 4)
+            wr_take_identity(e, w, krec)?
+            if !wr_seek(e, c, t, pk)? {
+                arena_reset(e, mark)
+                continue
+            }
+        } else {
+            rowid = u2i(ld64(e.ws, start + i * 8))
+        }
         if has_before || has_after {
             if !load_old_row(e, w, rowid)? {
                 arena_reset(e, mark)
@@ -1716,7 +1892,12 @@ fn exec_delete(e: &mut Engine, s: usize) -> void!db.Error {
                 arena_reset(e, mark)
                 continue
             }
-            if !seek_rowid(e, c, rowid)? {
+            still := if wr {
+                wr_seek(e, c, t, pk)?
+            } else {
+                seek_rowid(e, c, rowid)?
+            }
+            if !still {
                 arena_reset(e, mark)
                 continue
             }
@@ -1738,6 +1919,14 @@ fn load_old_row(e: &mut Engine, w: usize, rowid: i64) -> bool!db.Error {
     c := wget(e, w, W_CUR)
     old := wget(e, w, W_OLD)
     ncol := wget(e, w, W_NCOL)
+    if is_wr(e, t) {
+        let pk = wget(e, w, W_PK)
+        if !wr_seek(e, c, t, pk)? {
+            return ok(false)
+        }
+        wr_load_row(e, t, c, old)?
+        return ok(true)
+    }
     if !seek_rowid(e, c, rowid)? {
         return ok(false)
     }

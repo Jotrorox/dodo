@@ -47,7 +47,7 @@ const I_NFINAL: usize = 136
 const I_GFIRST: usize = 140
 const I_MINMAX: usize = 144
 const I_LEVELS: usize = 152
-const LEVEL_BYTES: usize = 48
+const LEVEL_BYTES: usize = 56
 
 // Level fields.
 const L_CUR: usize = 0
@@ -65,6 +65,9 @@ const L_MATCHED: usize = 41
 const L_LEFT: usize = 42
 const L_NULLROW: usize = 43
 const L_KEYREG: usize = 44
+// Buffer (in the keep area) for the text of the level's lookup keys.
+const L_KBUF: usize = 48
+const L_KCAP: usize = 52
 
 const PLAN_SCAN: usize = 0
 const PLAN_ROWID: usize = 1
@@ -170,7 +173,7 @@ fn lookup_in(e: &mut Engine, src: usize, n: usize) -> (usize, usize, bool) {
                 found = s
                 found_col = c
             }
-        } else if is_rowid_name(e, name, nl) && found == 0 {
+        } else if is_rowid_name(e, name, nl) && found == 0 && !is_wr(e, t) {
             found = s
             found_col = NO_COL
         }
@@ -1487,6 +1490,58 @@ fn choose_plan(e: &mut Engine, info: usize, l: usize, a: usize, na_: usize, b: u
         }
         x = next_index_of(e, t, x)
     }
+    // A WITHOUT ROWID table is itself an index on its PRIMARY KEY: such a
+    // plan has L_INDEX equal to the table and uses the table cursor.
+    if is_wr(e, t) {
+        keys := pool_alloc(e, 4 * 33)?
+        nk := 0usize
+        for k in 0usize..pk_count(e, t) {
+            want := pk_col(e, t, k)
+            found := 0usize
+            for pass in 0usize..2 {
+                arr := if pass == 0 {
+                    a
+                } else {
+                    b
+                }
+                cnt := if pass == 0 {
+                    na_
+                } else {
+                    nb_
+                }
+                for i in 0usize..cnt {
+                    if found != 0 {
+                        break
+                    }
+                    term := ldu(e.ws, arr + i * 4)
+                    let (col, other) = eq_term_side(e, term, c, info, l, nlev)
+                    if other != 0 && col == want {
+                        let term_a = na(e, term)
+                        let term_b = nb(e, term)
+                        coll := binary_collation(e, term_a, term_b)
+                        if coll == e.ws[pk_rec(e, t, k) + K_COLL] && index_affinity_ok(e, t, col, other) {
+                            found = other
+                        }
+                    }
+                }
+            }
+            if found == 0 || nk >= 32 {
+                break
+            }
+            stu(e.ws, keys + nk * 4, found)
+            nk += 1
+        }
+        if nk > 0 && (nk == pk_count(e, t) || nk >= best_n) {
+            stu(e.ws, lv + L_PLAN, PLAN_INDEX)
+            stu(e.ws, lv + L_INDEX, t)
+            stu(e.ws, lv + L_KEYS, keys)
+            stu(e.ws, lv + L_NEQ, nk)
+            kr := alloc_regs(e, nk)?
+            stu(e.ws, lv + L_KEYREG, kr)
+            stu(e.ws, lv + L_ICUR, c)
+            return ok()
+        }
+    }
     if best != NO_COL && best_n > 0 {
         stu(e.ws, lv + L_PLAN, PLAN_INDEX)
         stu(e.ws, lv + L_INDEX, best)
@@ -1822,6 +1877,8 @@ fn level_reset(e: &mut Engine, info: usize) {
         e.ws[lv + L_STATE] = 0
         e.ws[lv + L_MATCHED] = 0
         e.ws[lv + L_NULLROW] = 0
+        stu(e.ws, lv + L_KBUF, 0)
+        stu(e.ws, lv + L_KCAP, 0)
         c := ldu(e.ws, lv + L_CUR)
         t := ldu(e.ws, lv + L_TABLE)
         if ldu(e.ws, lv + L_PLAN) == PLAN_SUBQ || ldu(e.ws, lv + L_PLAN) == PLAN_QUEUE {
@@ -1829,9 +1886,8 @@ fn level_reset(e: &mut Engine, info: usize) {
             stu(e.ws, lv + L_INDEX, 0)
             continue
         }
-        let root = obj_root(e, t)
-        cur_open(e, c, root, false)
-        if ldu(e.ws, lv + L_PLAN) == PLAN_INDEX {
+        open_table_cursor(e, c, t)
+        if ldu(e.ws, lv + L_PLAN) == PLAN_INDEX && ldu(e.ws, lv + L_INDEX) != t {
             x := ldu(e.ws, lv + L_INDEX)
             ic := ldu(e.ws, lv + L_ICUR)
             open_index_cursor(e, ic, x)
@@ -1844,21 +1900,86 @@ fn open_index_cursor(e: &mut Engine, ic: usize, x: usize) {
     cur_open(e, ic, root, true)
     o := cur(e, ic)
     n := obj_ncol(e, x)
-    for k in 0usize..n {
+    t := obj_u(e, x, O_TABLE)
+    // Key columns, then the rowid or, for WITHOUT ROWID tables, the
+    // PRIMARY KEY tail (stored right after the key column records).
+    total := n + index_ntail(e, x)
+    wr := is_wr(e, t)
+    for k in 0usize..total {
         if k < 31 {
-            r := col_rec(e, x, k)
-            e.ws[o + C_INFO + k * 2] = e.ws[r + K_COLL]
-            e.ws[o + C_INFO + k * 2 + 1] = e.ws[r + K_DESC]
+            if k < n || wr {
+                r := col_rec(e, x, k)
+                e.ws[o + C_INFO + k * 2] = e.ws[r + K_COLL]
+                e.ws[o + C_INFO + k * 2 + 1] = e.ws[r + K_DESC]
+            } else {
+                e.ws[o + C_INFO + k * 2] = COLL_BINARY
+                e.ws[o + C_INFO + k * 2 + 1] = 0
+            }
         }
     }
-    kk := if n < 31 {
-        n
-    } else {
-        31usize
+    stu(e.ws, o + C_NKEY, total)
+}
+
+// Opens a cursor on a table: rowid tables are table b-trees; WITHOUT ROWID
+// tables are index b-trees ordered by their PRIMARY KEY.
+fn open_table_cursor(e: &mut Engine, c: usize, t: usize) {
+    let root = obj_root(e, t)
+    if !is_wr(e, t) {
+        cur_open(e, c, root, false)
+        return
     }
-    e.ws[o + C_INFO + kk * 2] = COLL_BINARY
-    e.ws[o + C_INFO + kk * 2 + 1] = 0
-    stu(e.ws, o + C_NKEY, n + 1)
+    cur_open(e, c, root, true)
+    o := cur(e, c)
+    npk := pk_count(e, t)
+    ncol := obj_ncol(e, t)
+    for k in 0usize..ncol {
+        if k < 31 {
+            if k < npk {
+                r := pk_rec(e, t, k)
+                e.ws[o + C_INFO + k * 2] = e.ws[r + K_COLL]
+                e.ws[o + C_INFO + k * 2 + 1] = e.ws[r + K_DESC]
+            } else {
+                e.ws[o + C_INFO + k * 2] = COLL_BINARY
+                e.ws[o + C_INFO + k * 2 + 1] = 0
+            }
+        }
+    }
+    stu(e.ws, o + C_NKEY, ncol)
+}
+
+// Extracts the PRIMARY KEY of a WITHOUT ROWID table from an entry of index
+// x into registers dst.
+fn index_entry_pk(e: &mut Engine, x: usize, t: usize, p: usize, len: usize, dst: usize) -> void!db.Error {
+    n := obj_ncol(e, x)
+    nt := index_ntail(e, x)
+    for k in 0usize..pk_count(e, t) {
+        pc := pk_col(e, t, k)
+        pcoll := e.ws[pk_rec(e, t, k) + K_COLL]
+        field := NO_COL
+        for j in 0usize..nt {
+            if tail_col(e, x, j) == pc {
+                field = n + j
+            }
+        }
+        if field == NO_COL {
+            for i in 0usize..n {
+                if idx_col(e, x, i) == pc && e.ws[col_rec(e, x, i) + K_COLL] == pcoll {
+                    field = i
+                }
+            }
+        }
+        if field == NO_COL {
+            return err(corrupt(e))
+        }
+        record_column(e, p, len, field, dst + k)?
+    }
+    ok()
+}
+
+// Positions a WITHOUT ROWID table cursor on the row with key registers key.
+fn wr_seek(e: &mut Engine, c: usize, t: usize, key: usize) -> bool!db.Error {
+    let npk = pk_count(e, t)
+    ok(seek_index(e, c, key, npk)? == 0)
 }
 
 // Positions level l on its first (first=true) or next candidate row.
@@ -2031,7 +2152,11 @@ fn level_move(e: &mut Engine, info: usize, l: usize, first: bool) -> bool!db.Err
                 set_state(e, c, ST_EOF)
                 return ok(false)
             }
-            col := idx_col(e, x, k)
+            col := if x == t {
+                pk_col(e, t, k)
+            } else {
+                idx_col(e, x, k)
+            }
             aff := col_aff(e, t, col)
             if is_numeric_aff(aff) {
                 compare_affinity(e, key + k, AFF_NUMERIC)?
@@ -2039,11 +2164,37 @@ fn level_move(e: &mut Engine, info: usize, l: usize, first: bool) -> bool!db.Err
                 compare_affinity(e, key + k, AFF_TEXT)?
             }
         }
-        // Keep the key in registers owned by the level (copied to the arena).
+        // Keep the key in registers owned by the level; their text lives in
+        // the level's buffer, reused for every lookup of this level.
         kb := ldu(e.ws, lv + L_KEYREG)
+        need := 0usize
         for k in 0usize..neq {
             copy_reg(e, kb + k, key + k)
-            reg_keep(e, kb + k)?
+            kt := rtype(e, kb + k)
+            if kt == T_TEXT || kt == T_BLOB {
+                need += rlen(e, kb + k)
+            }
+        }
+        if need > ldu(e.ws, lv + L_KCAP) {
+            cap := if need < 64 {
+                128usize
+            } else {
+                need * 2
+            }
+            let buf = keep_alloc(e, cap)?
+            stu(e.ws, lv + L_KBUF, buf)
+            stu(e.ws, lv + L_KCAP, cap)
+        }
+        kp := ldu(e.ws, lv + L_KBUF)
+        for k in 0usize..neq {
+            kt2 := rtype(e, kb + k)
+            if kt2 == T_TEXT || kt2 == T_BLOB {
+                let src = roff(e, kb + k)
+                let len = rlen(e, kb + k)
+                move_bytes(e.ws, src, kp, len)
+                set_bytes(e, kb + k, kt2, kp, len)
+                kp += len
+            }
         }
         e.rtop = key
         cmp := seek_index(e, ic, kb, neq)?
@@ -2064,6 +2215,25 @@ fn level_move(e: &mut Engine, info: usize, l: usize, first: bool) -> bool!db.Err
             set_state(e, c, ST_EOF)
             return ok(false)
         }
+    }
+    if x == t {
+        // The PRIMARY KEY plan positions the table cursor itself.
+        return ok(true)
+    }
+    if is_wr(e, t) {
+        let (pw, nw) = cur_payload(e, ic)?
+        save2 := e.rtop
+        kw := e.rtop
+        for _ in 0usize..pk_count(e, t) {
+            reg_push(e)?
+        }
+        index_entry_pk(e, x, t, pw, nw, kw)?
+        found := wr_seek(e, c, t, kw)?
+        e.rtop = save2
+        if !found {
+            return err(corrupt(e))
+        }
+        return ok(true)
     }
     // Rowid is the last field of the index record.
     let (p, n) = cur_payload(e, ic)?
