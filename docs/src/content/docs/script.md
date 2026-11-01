@@ -19,6 +19,7 @@ code and documentation written for it translate directly.
 | Expose a Dodo function to Lua | a `lua.NativeFn` and `cx.push_native` / `cx.set_global` |
 | Call a Lua function from Dodo | `cx.get_global(...)`, push arguments, `cx.pcall(...)` |
 | Check and convert arguments in a native function | `cx.check_integer`, `cx.check_lstr`, `cx.opt_number`, ... |
+| Make a Dodo module available to `require` | `cx.preload_module("name", open_fn)` |
 | Store Dodo data in Lua | `cx.new_userdata(size, user_values)` with a metatable |
 | Run the standalone interpreter | `dodo build examples/lua -O 2 -o build/lua` |
 
@@ -81,6 +82,33 @@ Every operation that can raise a Lua error (allocation, metamethods, calls)
 returns `T!lua.Throw`; propagate it with `?`. From embedding code, run Lua
 through `pcall`, which returns a status (`lua.OK`, `lua.ERRRUN`, ...) and
 leaves the error object on the stack.
+
+## Native modules and `require`
+
+`require` follows the reference searchers: `package.preload`, Lua files along
+`package.path`, then the two C searchers along `package.cpath`. There is no C
+API, so C libraries cannot be loaded: the C searchers still list the files
+they try, a file that exists fails with `dynamic libraries not enabled; check
+your Lua installation`, and `package.loadlib` returns `nil`, that message and
+`"absent"`, as in a reference build without dynamic-library support.
+`package.path` and `package.cpath` come from `LUA_PATH_5_4`/`LUA_PATH` and
+`LUA_CPATH_5_4`/`LUA_CPATH` (`;;` stands for the default path) unless the
+registry field `LUA_NOENV` is true (the interpreter's `-E`).
+
+Modules written in Dodo are registered with `cx.preload_module` (or
+`state.preload_module`), before or after `open_libs`. The opener is called
+like a module loader, with the module name and `":preload:"`, and its result
+is cached in `package.loaded`:
+
+```dodo
+fn open_greet(cx: &mut lua.Cx) -> i32!lua.Throw {
+    let funcs = [("hello", greet_hello)]
+    cx.new_lib(&funcs)?
+    return ok(1)
+}
+
+state.preload_module("greet", open_greet)?   // Lua: local greet = require "greet"
+```
 
 ## Coroutines and continuations
 

@@ -239,6 +239,24 @@ the collector rules above.
   `get_upvalue`/`set_upvalue`/`upvalue_id`/`upvalue_join`,
   `get_iuservalue`/`set_iuservalue` and `cx.traceback`.
 
+* `lib_package`: `require`, the searchers and the path lookups take the
+  package table as upvalue 1; `package.loaded`/`preload` are the registry
+  tables `_LOADED`/`_PRELOAD`. There is no C API, so the C searchers and
+  `loadlib` behave like a reference build without dlopen (message
+  `dynamic libraries not enabled; check your Lua installation`, error kind
+  `absent`). Embedders register Dodo modules with `Cx.preload_module`.
+  Names and paths are cut at the first NUL like the C strings of the
+  reference (`pkg_cstr`).
+* `lib_debug`: Lua hooks live in the registry table `_HOOKKEY` (weak keys,
+  indexed by thread) and run through the native hook `db_hook`; an error
+  raised in a hook leaves the hooked frame marked `CIST_HOOKED` until the
+  catching protected call unwinds it, so message handlers see
+  `in hook '?'` as in the reference.
+* C library functions declared by a library file use `@link_name` with a
+  file-prefixed Dodo name (e.g. `pkg_getenv`, `db_fgets`): a package may
+  declare each name only once, and several library files need the same C
+  functions.
+
 ## Development workflow
 
 * Fast builds: the stdlib is embedded when cargo builds the compiler, so
