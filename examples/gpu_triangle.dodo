@@ -168,7 +168,14 @@ fn run() -> void!gpu.Error {
     device := gpu.Device.open(gpu.Options.default())?
     api := device.api()
     console.printf("{}: {}\n", gpu.api_name(&api), device.name())!
-    win := match window.open(window.Options { title: "std/gpu", width: WIDTH, height: HEIGHT, resizable: false }) {
+    app := match window.App.new() {
+        ok(app) => app,
+        err(error) => {
+            console.println(window.error_name(error))!
+            return ok()
+        }
+    }
+    win := match app.open(window.Options { title: "std/gpu", width: WIDTH, height: HEIGHT, resizable: false }) {
         ok(win) => win,
         err(error) => {
             console.println(window.error_name(error))!
@@ -206,18 +213,18 @@ fn run() -> void!gpu.Error {
         &mut FRAME[..(width * height * 4) as usize]
     }
     angle := 0.0f32
+    win.request_frame()!
     for {
-        match win.wait_event_until_frame() {
-            ok(some(window.Event.Close)) => {
+        match app.wait_event() {
+            ok(window.Event.Close(_) | window.Event.Quit) => {
                 return ok()
             }
-            ok(some(window.Event.Key(key))) => {
+            ok(window.Event.Key(_, key)) => {
                 if key.key == window.Key.Escape {
                     return ok()
                 }
             }
-            ok(some(_)) => {}
-            ok(none) => {
+            ok(window.Event.Frame(_)) => {
                 values := [angle, WIDTH as f32 / HEIGHT as f32]
                 device.write_buffer(&frame_data, 0, gpu.f32_bytes(&values))?
                 encoder := device.encoder()?
@@ -236,8 +243,10 @@ fn run() -> void!gpu.Error {
                 canvas.blit(&image, 0, 0)
                 dirty := canvas.take_dirty()
                 win.update(dirty)!
+                win.request_frame()!
                 angle += 0.02
             }
+            ok(_) => {}
             err(_) => {
                 return ok()
             }

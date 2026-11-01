@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- `std/window` supports several windows per process, for dialogs, popups
+  and tool windows. This changes the API: a `window.App` connects to the
+  window system and runs the one event loop, `app.open(options)` opens any
+  number of windows, and `app.wait_event()`, `poll_event()` and
+  `wait_event_timeout()` return the events of all of them. Every `Event`
+  variant now starts with the `WindowId` of its window (`win.id()`,
+  `window.event_window(&event)`); ids are never reused within a process.
+  Animation asks per window: `win.request_frame()` delivers one
+  `Event.Frame(id)` at that window's next display refresh, with the same
+  pacing as before, replacing `wait_event_until_frame()`. Command-Q on macOS
+  now reports the app-level `Event.Quit` instead of closing the window.
+  Windows do not borrow their App, and each owns its pixel buffer, which is
+  only resized inside the window's own calls. `window.open` is gone; use
+  `window.App.new()?` and `app.open(...)`. `examples/window_palette.dodo`
+  paints with colors picked in a second window.
+- Fixed: X11 focus events took their mode from the wrong byte, so focus
+  changes caused by pointer and keyboard grabs were reported too.
 - `async fn` and `await`: an optional concurrency model for firmware on top of
   `std/embedded/executor`. Calling an async fn returns a future, a struct
   named after the function (`blink` → `BlinkFuture`) whose `poll` is the

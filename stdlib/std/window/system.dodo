@@ -5,28 +5,26 @@ import "core/mem"
 import "std/window/raw"
 
 // The window adapter shared by macOS and Windows, whose window systems are
-// reached through the C runtime in runtime.c. The runtime keeps the single
-// window's state and pixel buffer; a Backend is the handle to it.
+// reached through the C runtime in runtime.c. The runtime keeps the
+// process's connection and a record per window, found by its id; Backend
+// only forwards to it.
 
-unsafe extern "C" fn dodo_window_open(title: *const u8, title_length: usize, width: u32, height: u32, resizable: u32, handle: *mut isize) -> i32
-unsafe extern "C" fn dodo_window_close(handle: isize)
-unsafe extern "C" fn dodo_window_next_event(handle: isize, milliseconds: u32, event: *mut raw.Event) -> i32
-unsafe extern "C" fn dodo_window_buffer(handle: isize, pixels: *mut *mut u8, width: *mut u32, height: *mut u32, stride: *mut usize)
-unsafe extern "C" fn dodo_window_present(handle: isize, x: i32, y: i32, width: u32, height: u32) -> i32
-unsafe extern "C" fn dodo_window_set_title(handle: isize, title: *const u8, title_length: usize) -> i32
-unsafe extern "C" fn dodo_window_set_cursor_visible(handle: isize, visible: u32) -> i32
-unsafe extern "C" fn dodo_window_scale_percent(handle: isize) -> u32
+unsafe extern "C" fn dodo_window_connect() -> i32
+unsafe extern "C" fn dodo_window_disconnect()
+unsafe extern "C" fn dodo_window_open(title: *const u8, title_length: usize, width: u32, height: u32, resizable: u32, id: *mut u32) -> i32
+unsafe extern "C" fn dodo_window_close(id: u32)
+unsafe extern "C" fn dodo_window_size(id: u32, width: *mut u32, height: *mut u32) -> i32
+unsafe extern "C" fn dodo_window_attach(id: u32, pixels: *mut u8, width: u32, height: u32)
+unsafe extern "C" fn dodo_window_next_event(milliseconds: u32, event: *mut raw.Event) -> i32
+unsafe extern "C" fn dodo_window_present(id: u32, x: i32, y: i32, width: u32, height: u32) -> i32
+unsafe extern "C" fn dodo_window_set_title(id: u32, title: *const u8, title_length: usize) -> i32
+unsafe extern "C" fn dodo_window_set_cursor_visible(id: u32, visible: u32) -> i32
+unsafe extern "C" fn dodo_window_scale_percent(id: u32) -> u32
 unsafe extern "C" fn dodo_window_clock() -> u64
-unsafe extern "C" fn dodo_window_frame_period(handle: isize) -> u64
-unsafe extern "C" fn dodo_window_next_vblank(handle: isize, now: u64) -> u64
-unsafe extern "C" fn dodo_window_request_frame(handle: isize) -> i32
-unsafe extern "C" fn dodo_window_set_animating(handle: isize, animating: u32)
-
-fn null() -> *mut u8 {
-    unsafe {
-        return 0usize as *mut u8
-    }
-}
+unsafe extern "C" fn dodo_window_frame_period(id: u32) -> u64
+unsafe extern "C" fn dodo_window_next_vblank(id: u32, now: u64) -> u64
+unsafe extern "C" fn dodo_window_request_frame(id: u32) -> i32
+unsafe extern "C" fn dodo_window_set_animating(animating: u32)
 
 fn flag(value: bool) -> u32 {
     if value {
@@ -35,125 +33,99 @@ fn flag(value: bool) -> u32 {
     return 0
 }
 
-pub struct Backend {
-    handle: isize
-    pixels: *mut u8
-    width: u32
-    height: u32
-    stride: usize
+fn status(code: i32) -> void!raw.Error {
+    if code != 0 {
+        return err(raw.from_code(code))
+    }
+    return ok()
+}
 
-    pub fn open(title: &str, width: u32, height: u32, resizable: bool) -> Backend!raw.Error {
-        handle := 0isize
+pub struct Backend {
+    pub fn connect() -> void!raw.Error {
+        return status(unsafe {
+            dodo_window_connect()
+        })
+    }
+    // Close every window and the connection.
+    pub fn disconnect() {
+        unsafe {
+            dodo_window_disconnect()
+        }
+    }
+    // Open a window and return its id.
+    pub fn open(title: &str, width: u32, height: u32, resizable: bool) -> u32!raw.Error {
+        id := 0u32
         text := mem.str_bytes(title)
+        status(unsafe {
+            dodo_window_open(ptr.as_ptr(text), text.len, width, height, flag(resizable), ptr.from_mut(&mut id))
+        })?
+        return ok(id)
+    }
+    // Closing an unknown or closed window does nothing.
+    pub fn close(id: u32) {
+        unsafe {
+            dodo_window_close(id)
+        }
+    }
+    // The drawing area's size in pixels as of the last event; false once
+    // the window is closed.
+    pub fn size(id: u32, width: &mut u32, height: &mut u32) -> bool {
         code := unsafe {
-            dodo_window_open(ptr.as_ptr(text), text.len, width, height, flag(resizable), ptr.from_mut(&mut handle))
+            dodo_window_size(id, ptr.from_mut(width), ptr.from_mut(height))
         }
-        if code != 0 {
-            return err(raw.from_code(code))
-        }
-        backend := Backend { handle: handle, pixels: null(), width: 0, height: 0, stride: 0 }
-        backend.refresh()
-        return ok(backend)
+        return code == 0
     }
-    fn refresh(&mut self) {
-        pixels := null()
-        width := 0u32
-        height := 0u32
-        stride := 0usize
+    // The pixel buffer to repaint from, `width` * `height` BGRA pixels that
+    // stay valid until the next attach or close.
+    pub fn attach(id: u32, pixels: *mut u8, width: u32, height: u32) {
         unsafe {
-            dodo_window_buffer(self.handle, ptr.from_mut(&mut pixels), ptr.from_mut(&mut width), ptr.from_mut(&mut height), ptr.from_mut(&mut stride))
+            dodo_window_attach(id, pixels, width, height)
         }
-        self.pixels = pixels
-        self.width = width
-        self.height = height
-        self.stride = stride
     }
-    pub fn width(&self) -> u32 {
-        return self.width
-    }
-    pub fn height(&self) -> u32 {
-        return self.height
-    }
-    pub fn stride(&self) -> usize {
-        return self.stride
-    }
-    pub fn scale_percent(&self) -> u32 {
-        if self.handle == 0 {
-            return 100
-        }
+    pub fn scale_percent(id: u32) -> u32 {
         return unsafe {
-            dodo_window_scale_percent(self.handle)
+            dodo_window_scale_percent(id)
         }
     }
-    // The runtime keeps a nonnull buffer of stride * height bytes, replaced
-    // only inside next_event, which cannot run while this borrow is live.
-    pub fn pixels(&mut self) -> &mut[u8] from(self) {
-        unsafe {
-            pointer := self.pixels
-            length := self.stride * self.height as usize
-            return ptr.borrow_slice_mut(pointer, length, self)
-        }
-    }
-    pub fn next_event(&mut self, milliseconds: u32, event: &mut raw.Event) -> bool!raw.Error {
-        if self.handle == 0 {
-            return err(raw.Error.Closed)
-        }
+    // The next event of any window, waiting up to `milliseconds`.
+    pub fn next_event(milliseconds: u32, event: &mut raw.Event) -> bool!raw.Error {
         result := unsafe {
-            dodo_window_next_event(self.handle, milliseconds, ptr.from_mut(event))
+            dodo_window_next_event(milliseconds, ptr.from_mut(event))
         }
-        // Pumping the window system may have resized the buffer, even when
-        // the event returned is not the resize.
-        self.refresh()
         if result < 0 {
             return err(raw.from_code(-result))
         }
         return ok(result != 0)
     }
-    pub fn present(&mut self, x: i32, y: i32, width: u32, height: u32) -> void!raw.Error {
-        if self.handle == 0 {
-            return err(raw.Error.Closed)
-        }
-        code := unsafe {
-            dodo_window_present(self.handle, x, y, width, height)
-        }
-        if code != 0 {
-            return err(raw.from_code(code))
-        }
-        return ok()
+    pub fn present(id: u32, x: i32, y: i32, width: u32, height: u32) -> void!raw.Error {
+        return status(unsafe {
+            dodo_window_present(id, x, y, width, height)
+        })
     }
     // Monotonic nanoseconds, the clock of next_vblank and frame pacing.
-    pub fn clock(&self) -> u64 {
+    pub fn clock() -> u64 {
         return unsafe {
             dodo_window_clock()
         }
     }
     // Nanoseconds per display refresh, or 0 when unknown.
-    pub fn frame_period(&self) -> u64 {
-        if self.handle == 0 {
-            return 0
-        }
+    pub fn frame_period(id: u32) -> u64 {
         return unsafe {
-            dodo_window_frame_period(self.handle)
+            dodo_window_frame_period(id)
         }
     }
     // The clock() time of the first display refresh after `now`, or 0 when
     // unknown. Windows reads it from the compositor.
-    pub fn next_vblank(&mut self, now: u64) -> u64 {
-        if self.handle == 0 {
-            return 0
-        }
+    pub fn next_vblank(id: u32, now: u64) -> u64 {
         return unsafe {
-            dodo_window_next_vblank(self.handle, now)
+            dodo_window_next_vblank(id, now)
         }
     }
-    // Ask for a FRAME event at the next refresh: macOS 14 and later have a
-    // display link for it. False when there is no such source.
-    pub fn request_frame(&mut self) -> bool!raw.Error {
-        if self.handle == 0 {
-            return err(raw.Error.Closed)
-        }
+    // Ask for a FRAME event at the window's next refresh: macOS 14 and later
+    // have a display link for it. False when there is no such source.
+    pub fn request_frame(id: u32) -> bool!raw.Error {
         result := unsafe {
-            dodo_window_request_frame(self.handle)
+            dodo_window_request_frame(id)
         }
         if result < 0 {
             return err(raw.from_code(-result))
@@ -161,51 +133,20 @@ pub struct Backend {
         return ok(result != 0)
     }
     // While animating, macOS must not throttle the program with App Nap.
-    pub fn set_animating(&mut self, animating: bool) {
-        if self.handle == 0 {
-            return
-        }
+    pub fn set_animating(animating: bool) {
         unsafe {
-            dodo_window_set_animating(self.handle, flag(animating))
+            dodo_window_set_animating(flag(animating))
         }
     }
-    pub fn set_title(&mut self, title: &str) -> void!raw.Error {
-        if self.handle == 0 {
-            return err(raw.Error.Closed)
-        }
+    pub fn set_title(id: u32, title: &str) -> void!raw.Error {
         text := mem.str_bytes(title)
-        code := unsafe {
-            dodo_window_set_title(self.handle, ptr.as_ptr(text), text.len)
-        }
-        if code != 0 {
-            return err(raw.from_code(code))
-        }
-        return ok()
+        return status(unsafe {
+            dodo_window_set_title(id, ptr.as_ptr(text), text.len)
+        })
     }
-    pub fn set_cursor_visible(&mut self, visible: bool) -> void!raw.Error {
-        if self.handle == 0 {
-            return err(raw.Error.Closed)
-        }
-        code := unsafe {
-            dodo_window_set_cursor_visible(self.handle, flag(visible))
-        }
-        if code != 0 {
-            return err(raw.from_code(code))
-        }
-        return ok()
-    }
-    pub fn close(&mut self) {
-        if self.handle == 0 {
-            return
-        }
-        unsafe {
-            dodo_window_close(self.handle)
-        }
-        // A closed handle reports an empty buffer at a valid address.
-        self.handle = 0
-        self.refresh()
-    }
-    fn drop(&mut self) {
-        self.close()
+    pub fn set_cursor_visible(id: u32, visible: bool) -> void!raw.Error {
+        return status(unsafe {
+            dodo_window_set_cursor_visible(id, flag(visible))
+        })
     }
 }
