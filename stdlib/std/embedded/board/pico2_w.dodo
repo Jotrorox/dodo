@@ -84,11 +84,13 @@ pub struct Board {
     // The random number generator, the RP2350's TRNG, fit for
     // cryptographic keys; std/embedded/chip/rp_rng documents it.
     pub rng: rp_rng.Trng
-    // The second core, `start`ed with a task of its own, and the FIFOs and
-    // spinlocks the two cores share; see std/embedded/chip/rp_multicore.
+    // The second core, `start`ed with a task of its own, and the FIFOs,
+    // spinlocks, and doorbells the two cores share; see
+    // std/embedded/chip/rp_multicore.
     pub core1: rp_multicore.Core1
     pub fifos: rp_multicore.Fifos
     pub spinlocks: rp_multicore.Spinlocks
+    pub doorbells: rp_multicore.Doorbells
     // Sleep modes, clock gating, and the dormant state, with the
     // std/embedded/power protocol; see rp2350.Power.
     pub power: rp2350.Power
@@ -108,8 +110,8 @@ pub fn take() -> Board!hal.Error {
     wireless.init(&mut chip.timer)?
     led := Led { wireless, on: false }
     led.set_low()
-    let rp2350.Peripherals { pins, timer, rtc, watchdog, usb, dma, rng, core1, fifos, spinlocks, power } = chip
-    return ok(Board { led, pins, timer, rtc, watchdog, usb: Usb { usb }, dma, rng, core1, fifos, spinlocks, power })
+    let rp2350.Peripherals { pins, timer, rtc, watchdog, usb, dma, rng, core1, fifos, spinlocks, doorbells, power } = chip
+    return ok(Board { led, pins, timer, rtc, watchdog, usb: Usb { usb }, dma, rng, core1, fifos, spinlocks, doorbells, power })
 }
 
 // The LED on the wireless chip's GPIO 0. Implements the std/embedded/hal

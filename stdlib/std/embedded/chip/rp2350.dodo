@@ -449,11 +449,12 @@ pub struct Peripherals {
     // The random number generator, the TRNG: about 20 KB a second, fit
     // for cryptographic keys; rp_rng documents it.
     pub rng: rp_rng.Trng
-    // Core 1, which runs a task once started, and the FIFOs and spinlocks
-    // the two cores share; see std/embedded/chip/rp_multicore.
+    // Core 1, which runs a task once started, and the FIFOs, spinlocks, and
+    // doorbells the two cores share; see std/embedded/chip/rp_multicore.
     pub core1: rp_multicore.Core1
     pub fifos: rp_multicore.Fifos
     pub spinlocks: rp_multicore.Spinlocks
+    pub doorbells: rp_multicore.Doorbells
     // Sleep modes, clock gating, and the dormant state; see Power.
     pub power: Power
 }
@@ -529,11 +530,12 @@ pub fn take(config: Config) -> Peripherals!hal.Error {
             core0_fifo_irq: SIO_IRQ_FIFO,
             core1_fifo_irq: SIO_IRQ_FIFO,
             reserved_locks: RESERVED_SPINLOCKS,
+            doorbell_irq: some(SIO_IRQ_BELL),
         })
     }
-    let rp_multicore.Cores { core1, fifos, spinlocks } = cores
+    let rp_multicore.Cores { core1, fifos, spinlocks, doorbells } = cores
     power := Power { crystal_hz: crystal }
-    return ok(Peripherals { pins: Pins { bank }, timer, rtc: Rtc { aon }, watchdog, usb, dma, rng, core1, fifos, spinlocks, power })
+    return ok(Peripherals { pins: Pins { bank }, timer, rtc: Rtc { aon }, watchdog, usb, dma, rng, core1, fifos, spinlocks, doorbells, power })
 }
 
 // SAFETY: the caller owns `address`, a 32-bit RP2350 register.
