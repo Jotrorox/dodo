@@ -1354,6 +1354,159 @@ fn dma_signals_are_raised_from_the_default_dma_interrupt() {
 }
 
 #[test]
+fn adc_samplers_compile_for_every_board() {
+    let scratch = Scratch::new("adc-sampler");
+    let source = scratch.write(
+        "sampler.dodo",
+        r#"package main
+import "std/embedded/board"
+import "std/embedded/chip/rp_adc"
+import "std/embedded/executor"
+import "std/embedded/hal"
+const READY: executor.Signal = executor.Signal { id: 0 }
+fn main() {
+    b := board.take()!
+    sampler := b.pins.sampler(rp_adc.GPIO26 | rp_adc.GPIO27 | rp_adc.TEMPERATURE, 30_000)!
+    match b.pins.analog(28) {
+        ok(input) => core.assert(false),
+        err(error) => core.assert(error == hal.Error.Busy),
+    }
+    sampler.set_threshold(4)!
+    sampler.set_signal(&READY)
+    sampler.start()
+    samples: [16]u16 = [0; 16]
+    got := sampler.poll_read(&mut samples)!
+    sampler.read(&mut samples)!
+    value := rp_adc.sample_value(samples[0])
+    input := rp_adc.sample_input(samples[0])
+    failed := rp_adc.sample_failed(samples[0])
+    sampler.stop()
+    sampler.clear_signal()
+    channel := b.dma.channel()!
+    capture: [256]u16 = [0; 256]
+    sampler.capture(&mut channel, &mut capture)!
+    bytes: [256]u8 = [0; 256]
+    sampler.capture_bytes(&mut channel, &mut bytes)!
+    {
+        session := sampler.dma(&mut channel, &mut capture)!
+        session.start(128)!
+        session.finish()!
+        first := session.buffer()![0]
+    }
+    ring: [1024]u16 = [0; 1024]
+    {
+        stream := sampler.stream(&mut channel, &mut ring)!
+        stream.read(&mut samples)!
+        size := stream.ring_size()
+    }
+    b.dma.release(channel)
+    b.pins.release_sampler(sampler)
+    knob := b.pins.analog(26)!
+    reading := knob.read()!
+    b.pins.release_analog(knob)
+}
+"#,
+    );
+    for board in ["pico", "pico2", "pico2_w"] {
+        for level in ["0", "2"] {
+            let object = scratch.path(&format!("sampler-{board}-O{level}.o"));
+            stdout(&dodo(&[
+                "build",
+                source.to_str().unwrap(),
+                "--board",
+                board,
+                "-O",
+                level,
+                "--emit",
+                "obj",
+                "-o",
+                &object,
+            ]));
+        }
+    }
+}
+
+#[test]
+fn adc_signals_are_raised_from_the_default_adc_interrupt() {
+    if !ld_lld() {
+        return;
+    }
+    let scratch = Scratch::new("adc");
+    let example = root().join("examples/adc.dodo");
+    // ADC_IRQ_FIFO's vector: IRQ 22 on the RP2040, 35 on the RP2350.
+    let boards = [
+        ("pico", 0xE48B_FF56, 22),
+        ("pico2", 0xE48B_FF59, 35),
+        ("pico2_w", 0xE48B_FF59, 35),
+    ];
+    for (board, family, irq) in boards {
+        for level in ["0", "2"] {
+            let elf = scratch.path(&format!("adc-{board}-O{level}.elf"));
+            build(&[
+                "build",
+                example.to_str().unwrap(),
+                "--board",
+                board,
+                "-O",
+                level,
+                "-o",
+                &elf,
+            ]);
+            let bytes = fs::read(&elf).unwrap();
+            let serve = elf_symbol(&bytes, "dodo_adc_interrupt").expect("the handler is linked");
+            assert_eq!(serve & 1, 1, "{board} -O{level}: a Thumb function");
+            assert_eq!(
+                stub_literal(Path::new(&elf), family, "AdcHandler", 10),
+                serve
+            );
+            let image = flash_image(
+                &fs::read(Path::new(&elf).with_extension("uf2")).unwrap(),
+                family,
+            );
+            let vectors = elf_symbol(&bytes, "__vector_table").unwrap() as usize - 0x1000_0000;
+            assert_eq!(
+                word(&image, vectors + 4 * (16 + irq)),
+                elf_symbol(&bytes, "AdcHandler").unwrap() | 1,
+                "{board} -O{level}: the vector is the runtime's handler"
+            );
+        }
+    }
+    // A program's own handler replaces the runtime's.
+    let own = scratch.write(
+        "own.dodo",
+        "package main\nimport \"std/embedded/board\"\nstatic mut COUNT: u32 = 0\n@interrupt(ADC_IRQ_FIFO)\nfn adc() {\n unsafe {\n  COUNT += 1\n }\n}\nfn main() {\n b := board.take()!\n b.led.toggle()\n}\n",
+    );
+    for (board, family, irq) in [("pico", 0xE48B_FF56, 22), ("pico2", 0xE48B_FF59, 35)] {
+        let elf = scratch.path(&format!("own-{board}.elf"));
+        build(&["build", own.to_str().unwrap(), "--board", board, "-o", &elf]);
+        let bytes = fs::read(&elf).unwrap();
+        let image = flash_image(
+            &fs::read(Path::new(&elf).with_extension("uf2")).unwrap(),
+            family,
+        );
+        let vectors = elf_symbol(&bytes, "__vector_table").unwrap() as usize - 0x1000_0000;
+        let handler = elf_symbol(&bytes, "ADC_IRQ_FIFO").expect("the program's handler");
+        assert_ne!(Some(handler), elf_symbol(&bytes, "AdcHandler"), "{board}");
+        assert_eq!(
+            word(&image, vectors + 4 * (16 + irq)),
+            handler | 1,
+            "{board}"
+        );
+    }
+    // Without std/embedded/chip the stub falls through to DefaultHandler.
+    let bare = scratch.write("bare.dodo", "package main\nfn main() {}\n");
+    for (chip, family) in [("rp2040", 0xE48B_FF56), ("rp2350", 0xE48B_FF59)] {
+        let elf = scratch.path(&format!("bare-{chip}.elf"));
+        build(&["build", bare.to_str().unwrap(), "--chip", chip, "-o", &elf]);
+        assert_eq!(
+            stub_literal(Path::new(&elf), family, "AdcHandler", 10),
+            0,
+            "{chip}"
+        );
+    }
+}
+
+#[test]
 fn random_number_generators_compile_for_every_board() {
     let scratch = Scratch::new("rng-compile");
     let source = scratch.write(

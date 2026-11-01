@@ -26,6 +26,9 @@
 ;   DMA_IRQ_0      Calls dodo_dma_interrupt if the program defines it:
 ;                  std/embedded/chip/rp_dma does, to raise the signals of
 ;                  finished DMA channels.
+;   ADC_IRQ_FIFO   Calls dodo_adc_interrupt if the program defines it:
+;                  std/embedded/chip/rp_adc does, to raise the signal of
+;                  an ADC sampler.
 ;   SIO_IRQ_PROC0, SIO_IRQ_PROC1
 ;                  Each core's FIFO interrupt: calls dodo_fifo_interrupt if
 ;                  the program defines it. std/embedded/chip/rp_multicore
@@ -180,6 +183,20 @@ module asm ".type FifoHandler, %function"
 module asm ".thumb_func"
 module asm "FifoHandler:"
 module asm "    ldr r0, =dodo_fifo_interrupt"
+module asm "    cmp r0, #0"
+module asm "    bne 1f"
+module asm "    ldr r0, =DefaultHandler"
+module asm "1:  bx r0"
+module asm "    .ltorg"
+
+; ADC_IRQ_FIFO likewise tail-calls the weak dodo_adc_interrupt, which
+; std/embedded/chip/rp_adc defines to raise a sampler's signal.
+module asm ".section .text.AdcHandler, \22ax\22, %progbits"
+module asm ".weak dodo_adc_interrupt"
+module asm ".type AdcHandler, %function"
+module asm ".thumb_func"
+module asm "AdcHandler:"
+module asm "    ldr r0, =dodo_adc_interrupt"
 module asm "    cmp r0, #0"
 module asm "    bne 1f"
 module asm "    ldr r0, =DefaultHandler"
@@ -400,7 +417,7 @@ module asm ".thumb_set SPI0_IRQ, DefaultHandler"
 module asm ".thumb_set SPI1_IRQ, DefaultHandler"
 module asm ".thumb_set UART0_IRQ, DefaultHandler"
 module asm ".thumb_set UART1_IRQ, DefaultHandler"
-module asm ".thumb_set ADC_IRQ_FIFO, DefaultHandler"
+module asm ".thumb_set ADC_IRQ_FIFO, AdcHandler"
 module asm ".thumb_set I2C0_IRQ, DefaultHandler"
 module asm ".thumb_set I2C1_IRQ, DefaultHandler"
 module asm ".thumb_set RTC_IRQ, DefaultHandler"

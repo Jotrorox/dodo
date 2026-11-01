@@ -2650,6 +2650,99 @@ releasing the last with `pins.release_analog(input)` stops both. The sensor
 is accurate to a few degrees and depends on the reference voltage; on the
 Pico and Pico 2, GP29 reads a third of the supply voltage VSYS.
 
+#### Sampling the ADC
+
+`pins.sampler(inputs, rate_hz)` claims the whole ADC as an
+`rp_adc.AdcSampler`, which converts by itself: the inputs of a set such as
+`rp_adc.GPIO26 | rp_adc.GPIO27 | rp_adc.TEMPERATURE` one after the other,
+round and round, at `rate_hz` conversions a second in all (733 to
+500 000; three inputs at 30 000 are 10 000 each), into the ADC's 8-sample
+FIFO. Read them by polling, from the FIFO interrupt, or by DMA:
+
+```dodo
+package main
+
+import "std/embedded/board"
+import "std/embedded/chip/rp_adc"
+
+fn main() {
+    b := board.take()!
+    sampler := b.pins.sampler(rp_adc.GPIO26 | rp_adc.TEMPERATURE, 20_000)!
+    sampler.start()
+    samples: [16]u16 = [0; 16]
+    sampler.read(&mut samples)!        // waits for 16 samples, 0.8 ms
+    for index in 0..samples.len {
+        sample := samples[index]
+        if rp_adc.sample_input(sample) == rp_adc.TEMPERATURE_INPUT {
+            celsius := rp_adc.millicelsius(rp_adc.sample_value(sample), 3300) / 1000
+        }
+    }
+    sampler.stop()
+    // 512 samples by DMA, half from each input, in order: GP26 first.
+    channel := b.dma.channel()!
+    burst: [512]u16 = [0; 512]
+    sampler.capture(&mut channel, &mut burst)!
+}
+```
+
+The FIFO does not tell which input a result came from, so the sampler
+counts: `start` empties the FIFO and begins with the set's lowest input,
+and each sample comes from the next input in the set after the one before.
+Samples come out tagged: `rp_adc.sample_value(sample)` is the 12-bit
+value, `rp_adc.sample_input(sample)` the input, 0 to 3 for GPIO 26 to 29
+and 4 for the sensor, and `rp_adc.sample_failed(sample)` is true if the
+converter flagged the conversion. `rp_adc.input_at(inputs, i)` tells
+which input the `i`th sample of a capture comes from.
+
+| `rp_adc.AdcSampler` | Purpose |
+| --- | --- |
+| `start()`, `stop()`, `is_running()` | Start converting, or start over from the lowest input; stop, dropping what the FIFO holds. |
+| `poll_read(samples)` | Without waiting: move the samples the FIFO holds into `samples`; returns how many. |
+| `read(samples)` | Fill `samples`, waiting; `Timeout` after the poll limit (`set_poll_limit`) passes without a sample. |
+| `available()`, `next_input()` | The samples waiting, and the input of the next one. |
+| `set_rate(hz)`, `set_divider(div)`, `rate_hz()`, `divider()` | The rate, or the DIV register's period of 1 + `div` / 256 cycles of the 48 MHz clock, from now on. |
+| `set_eight_bit(on)` | Shift samples to 8 bits (0 to 255); `Busy` while running. |
+| `set_threshold(level)`, `listen()`, `ignore()`, `is_pending()`, `irq()` | Raise `ADC_IRQ_FIFO` while `level` samples (1 to 8) wait, for an `@interrupt` handler of your own. |
+| `set_signal(&SIGNAL)`, `clear_signal()` | Raise an [executor signal](#waking-tasks-from-interrupts) from the default `ADC_IRQ_FIFO` handler instead; each read lets it through again. |
+| `capture(&mut channel, &mut samples)` | Fill a `[u16]` buffer by DMA from a fresh round and wait, tagged as above. |
+| `capture_bytes(&mut channel, &mut bytes)` | The same with eight-bit samples in a `[u8]` buffer, untagged. |
+| `dma(&mut channel, &mut samples)` | A `rp_adc.Capture` session that captures in the background, as below. |
+| `stream(&mut channel, &mut ring)` | A `rp_adc.Stream` that keeps sampling into a ring, as below. |
+
+A program that falls more than 8 samples behind loses some: the next
+`poll_read` or `read` reports `Overrun` once, drops what the FIFO held, and
+starts over from the lowest input, so later samples are tagged right
+again. At high rates, use DMA, which keeps up at 500 000 samples a second:
+the channel moves each result as the FIFO's data request raises it.
+
+`sampler.dma(&mut channel, &mut samples)` returns an `rp_adc.Capture`,
+which holds the sampler, the channel, and the buffer, like the
+[SPI session](#spi-transfers-by-dma): `start(count)` captures `count`
+samples from a fresh round and returns at once, `poll_finish()` and
+`finish()` end it, tagging the samples, `buffer()` lends the buffer out
+between captures (`Busy` meanwhile), and `abort()` or dropping the
+session stops it. The channel's signal tells a task when a capture is
+done. `sampler.stream(&mut channel, &mut ring)` returns an `rp_adc.Stream`
+that keeps converting into a ring, as a [serial port by
+DMA](#serial-ports-by-dma) keeps its input: `poll_read` and `read` return
+tagged samples at the program's own pace; samples not read when the ring
+comes round again are lost, and the next read reports `Overrun` and goes
+on with the newest, still tagged right. The ring is the largest block of
+`ring` whose size in bytes is a power of two and whose address is a
+multiple of it (`ring_size()` in samples, at least 8): a static of N
+samples with `@align(2 * N)` gives all N. A task polls a stream on a
+ticker. Both sessions take a stopped sampler and leave it stopped.
+
+The sampler and single inputs share one converter, whose round a single
+conversion would break, so `pins.analog` and `pins.temperature` are
+`Busy` while a sampler is claimed, and `pins.sampler` while any of them
+is. `pins.release_sampler(sampler)` gives the sampler and its pins back,
+and stops the ADC and PLL_USB. The sampler is `rp_adc.Sampler` over any
+`hal.Registers`, tested against a model of the converter, and the
+repository's
+[`examples/adc.dodo`](https://github.com/Jotrorox/dodo/blob/main/examples/adc.dodo)
+captures a burst by DMA, then wakes a task with the sampler's signal.
+
 ### Random numbers on the RP2040 and RP2350
 
 `b.rng`, or `Peripherals.rng` from the chip package, is each chip's best
@@ -2876,6 +2969,7 @@ peripheral's data requests, so a FIFO never overflows or runs dry:
 | --- | --- | --- |
 | SPI bus | `bus.dma(&mut tx, &mut rx, &mut buffer)`, a `pl022.DmaBus` | Transfers to and from a buffer, without gaps between frames at any clock rate. |
 | Serial port | `port.dma(&mut rx, &mut ring, &mut tx, &mut output)`, a `pl011.DmaPort` | Reception into a ring buffer of up to 32 KiB, and writes. |
+| ADC sampler | `sampler.dma(&mut channel, &mut samples)`, an `rp_adc.Capture`, or `sampler.stream(&mut channel, &mut ring)`, an `rp_adc.Stream` | Captures of samples into a buffer, or a stream of them into a ring; see [sampling the ADC](#sampling-the-adc). |
 
 A session borrows the peripheral, its channels, and its buffers until it is
 dropped, which stops its transfers and gives them back: the borrow checker
@@ -3454,8 +3548,9 @@ dodo build firmware.dodo --emit obj --target thumbv7em-none-eabihf \
   RP2350B's GPIO 32 to 47 and the RP2350's GPIOBASE register are not
   supported. `rp_pio.assemble` takes one program per call.
 - PWM inputs measure by counting over windows, as the slices cannot
-  timestamp edges; the PWM wrap interrupt is not exposed. ADC reads are
-  polled one at a time, without the round-robin sampler, FIFO, or DMA.
+  timestamp edges; the PWM wrap interrupt is not exposed. The ADC serves
+  either single inputs or one sampler at a time, and a sampler's inputs
+  are fixed when it is claimed.
 - A serial port keeps no more input than its 32-byte FIFO unless it
   receives [by DMA](#serial-ports-by-dma), a program serves its interrupts,
   as in [an interrupt-driven driver](#an-interrupt-driven-driver), or the
@@ -3508,7 +3603,7 @@ dodo build firmware.dodo --emit obj --target thumbv7em-none-eabihf \
   oscillator or a GPIO, so they stop while the chip is dormant and cannot
   wake it, and the RP2350's power-down states are not supported.
 - SPI by DMA and polled SPI transfers move frames of up to 8 bits; wider
-  frames use the word methods, which wait. The ADC is not read by DMA yet,
-  and channel signals come only from `DMA_IRQ_0`.
+  frames use the word methods, which wait. Channel signals come only from
+  `DMA_IRQ_0`.
 
 For raw register and pointer contracts, see [memory and foreign calls](memory-and-ffi.md).

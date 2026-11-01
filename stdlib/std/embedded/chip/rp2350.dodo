@@ -838,6 +838,18 @@ pub struct Pins {
         return self.bank.temperature()
     }
 
+    // Claim the ADC as a sampler that converts `inputs`, a set such as
+    // rp_adc.GPIO26 | rp_adc.TEMPERATURE, one after the other at `rate_hz`
+    // conversions a second in all (733 to 500 000), into its FIFO, for
+    // polled, interrupt-driven, or DMA reads; rp_adc.Sampler documents it.
+    // Its pins are claimed as analog inputs. InvalidInput for an empty set
+    // or a rate out of range, Busy if a pin is taken or an analog input or
+    // the temperature sensor is claimed, as they share the converter;
+    // Timeout if the ADC does not start.
+    pub fn sampler(&mut self, inputs: rp_adc.Inputs, rate_hz: u32) -> rp_adc.AdcSampler!hal.Error {
+        return self.bank.sampler(inputs, rate_hz, ADC_IRQ_FIFO)
+    }
+
     // Claim PIO block `number`, 0 to 2, with its four state machines
     // stopped, for programs from rp_pio.assemble; rp_pio documents it. Its
     // state machines run at up to SYS_HZ instructions a second and drive
@@ -877,6 +889,12 @@ pub struct Pins {
     // clock stop once no input is left.
     pub fn release_analog(&mut self, input: rp_adc.Analog) {
         self.bank.release_analog(input)
+    }
+
+    // Give back the ADC's sampler: it stops, its pins are disconnected,
+    // and the ADC and its clock stop.
+    pub fn release_sampler(&mut self, sampler: rp_adc.AdcSampler) {
+        self.bank.release_sampler(sampler)
     }
 
     // Give back an I2C bus. Its controller is held in reset and its pins are

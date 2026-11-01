@@ -941,6 +941,105 @@ fn usb_checks(usb: &mut board.Usb, pins: &mut chip.Pins, timer: &mut chip.Timer)
     check(owned && configured && quick && shared)
 }
 
+const ADC_SAMPLES: executor.Signal = executor.Signal { id: 29 }
+const ADC_ROUND: u32 = rp_adc.GPIO26 | rp_adc.GPIO27 | rp_adc.TEMPERATURE
+// Buffers for adc_sampler_checks, static to keep them off the stack: a
+// capture, and a stream's ring of 512 samples, aligned to its size.
+static mut ADC_CAPTURE: [1000]u16 = [0u16; 1000]
+@align(1024)
+static mut ADC_RING: [512]u16 = [0u16; 512]
+
+// Samples follow the round of ADC_ROUND from GPIO 26, none failed, and
+// those of the temperature sensor read 0 to 70 C.
+fn adc_round(samples: &[u16], count: usize) -> bool {
+    good := true
+    for index in 0..count {
+        sample := samples[index]
+        input := rp_adc.sample_input(sample)
+        good = good && input == rp_adc.input_at(ADC_ROUND, index) && !rp_adc.sample_failed(sample)
+        if input == rp_adc.TEMPERATURE_INPUT {
+            celsius := rp_adc.millicelsius(rp_adc.sample_value(sample), 3300)
+            good = good && celsius > 0 && celsius < 70_000
+        }
+    }
+    return good
+}
+
+// The ADC's sampler with nothing connected to GP26 and GP27 (3 checks):
+// ownership, polled reads at its rate, the FIFO interrupt's signal, and
+// DMA captures and a stream at 100 000 samples a second.
+fn adc_sampler_checks(dma: &mut rp_dma.Dma, pins: &mut chip.Pins, timer: &mut chip.Timer) {
+    sampler := pins.sampler(ADC_ROUND, 30_000)!
+    owned := refused(pins.analog(28), hal.Error.Busy) && refused(pins.temperature(), hal.Error.Busy) && refused(pins.output(26), hal.Error.Busy) && refused(pins.sampler(rp_adc.GPIO28, 30_000), hal.Error.Busy)
+    // 300 samples at 30 000 a second take 10 ms.
+    samples: [30]u16 = [0; 30]
+    sampler.start()
+    start := timer.now_us()
+    polled := true
+    for _ in 0..10u32 {
+        sampler.read(&mut samples)!
+        polled = polled && adc_round(&samples, 30)
+    }
+    elapsed := timer.now_us() - start
+    sampler.stop()
+    check(owned && polled && sampler.rate_hz() == 30_000 && elapsed >= 9_800 && elapsed < 10_300)
+
+    // The FIFO interrupt raises the signal once 4 samples wait, 133 us in.
+    sampler.set_threshold(4)!
+    sampler.set_signal(&ADC_SAMPLES)
+    cx := executor.Context.new(0)
+    stale := ADC_SAMPLES.take(&mut cx)
+    sampler.start()
+    start = timer.now_us()
+    raised := false
+    for !raised && timer.now_us() - start < 2000 {
+        raised = ADC_SAMPLES.take(&mut cx)
+    }
+    waited := timer.now_us() - start
+    got := sampler.poll_read(&mut samples)!
+    sampler.stop()
+    sampler.clear_signal()
+    sampler.set_threshold(1)!
+    check(raised && waited >= 100 && waited < 300 && got >= 4)
+
+    // 1000 samples at 100 000 a second by DMA take 10 ms; eight-bit
+    // samples too; and a stream keeps 2000 samples coming while they are
+    // polled.
+    sampler.set_rate(100_000)!
+    channel := dma.channel()!
+    captured := false
+    timed := false
+    streamed := false
+    unsafe {
+        start = timer.now_us()
+        sampler.capture(&mut channel, &mut ADC_CAPTURE)!
+        elapsed = timer.now_us() - start
+        captured = adc_round(&ADC_CAPTURE, 1000) && !sampler.is_running()
+        timed = elapsed >= 9_900 && elapsed < 10_300
+        bytes: [64]u8 = [0; 64]
+        sampler.capture_bytes(&mut channel, &mut bytes)!
+        stream := sampler.stream(&mut channel, &mut ADC_RING)!
+        total := 0usize
+        streamed = stream.ring_size() == 512
+        start = timer.now_us()
+        for total < 2000 && timer.now_us() - start < 100_000 {
+            got = stream.poll_read(&mut samples)!
+            for index in 0..got {
+                input := rp_adc.sample_input(samples[index])
+                streamed = streamed && input == rp_adc.input_at(ADC_ROUND, total)
+                total += 1
+            }
+        }
+        streamed = streamed && total >= 2000
+    }
+    dma.release(channel)
+    pins.release_sampler(sampler)
+    knob := pins.analog(26)!
+    single := knob.read()! <= 4095
+    pins.release_analog(knob)
+    check(captured && timed && streamed && single)
+}
+
 const DMA_DONE: executor.Signal = executor.Signal { id: 30 }
 
 // DMA: the claim API, copies, and SPI, UART, and I2C transfers that run
@@ -1794,6 +1893,7 @@ fn main() {
     pio_checks(&mut b.pins, &mut b.timer)
     usb_checks(&mut b.usb, &mut b.pins, &mut b.timer)
     dma_checks(&mut b.dma, &mut b.pins, &mut b.timer)
+    adc_sampler_checks(&mut b.dma, &mut b.pins, &mut b.timer)
     core1_checks(&mut b.core1, &mut b.fifos, &mut b.spinlocks, &mut b.timer)
     rng_checks(&mut b.rng)
     power_checks(&mut b.power, &mut b.usb, &mut b.pins, &mut b.timer)
