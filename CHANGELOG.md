@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- `std/embedded/hal` gains a shared timer protocol: `Counter` (`now_us`), a
+  free-running microsecond count, and `Alarm` (`now_us`, `schedule_at_us`,
+  `cancel`, `fired`, `clear`), a one-shot compare that fires at once for a
+  time already reached. `hal.Deadline` and `hal.Ticker` give drivers
+  timeouts and drift-free periodic work on any counter, with
+  `elapsed_us`, `wait_until`, `schedule_in_us`, and `wait_for_alarm`
+  helpers. Board timers are counters, and the RP2040 and RP2350 alarms
+  implement the alarm protocol for times up to 35 minutes ahead, forcing
+  their interrupt when a time has passed before the alarm was armed.
+  `std/embedded/hal/fake` gains `Alarm`, and `fake.Delay` is a counter whose
+  time is the delays asked of it, so timeouts are tested without waiting.
 - Watchdog for the RP2040 and RP2350: `b.watchdog` on every board (and
   `watchdog` in the chips' `Peripherals`) is a `std/embedded/chip/rp_watchdog`
   `Watchdog`. It is stopped after `take()`. `start(timeout_ms)` makes it reset
