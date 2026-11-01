@@ -428,6 +428,28 @@ fn espressif_drivers_execute_against_simulated_controllers() {
 }
 
 #[test]
+fn espressif_can_audio_and_capture_drivers_execute_against_models() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let scratch = Scratch::new("esp-can-audio");
+    let source = root.join("tests/stdlib/esp_can_audio_checks.dodo");
+    for optimization in ["0", "3"] {
+        let executable = scratch.0.join(format!(
+            "esp-can-audio-O{optimization}{}",
+            std::env::consts::EXE_SUFFIX
+        ));
+        let args = ["build", source.to_str().unwrap(), "-O", optimization, "-o"];
+        success(
+            &dodo(&args, &executable),
+            "compile Espressif CAN, audio, and capture fixture",
+        );
+        success(
+            &Command::new(&executable).output().unwrap(),
+            "execute Espressif CAN, audio, and capture fixture",
+        );
+    }
+}
+
+#[test]
 fn real_time_clocks_execute_against_fakes_and_simulated_registers() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let scratch = Scratch::new("rtc");

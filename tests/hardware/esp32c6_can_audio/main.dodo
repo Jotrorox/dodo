@@ -1,0 +1,595 @@
+package main
+
+import "std/embedded/board"
+import "std/embedded/chip"
+import "std/embedded/chip/esp_i2s"
+import "std/embedded/hal"
+import "std/embedded/peripheral/esp_twai"
+import "std/fmt"
+
+// Hardware checks for the ESP32-C6's CAN controllers (TWAI), I2S, and PWM
+// input on the `esp32c6_devkitc` board. Nothing needs to be wired: signals
+// loop between peripherals inside the chip through the GPIO matrix, since a
+// pad's output can be read back by any peripheral input with the pad's
+// input enabled. Where a check needs one peripheral to read another's pad,
+// it claims both on pins of their own and then points the reading
+// peripheral's input signal at the other pad (`route_in`).
+//
+// Results go to the chip's USB serial port, which `scripts/test_esp32c6.py
+// --project tests/hardware/esp32c6_can_audio` reads, in the protocol of
+// tests/hardware/esp32c6_devkitc: after the host sends a byte, `selftest
+// ready`, then `check N ok` or `check N FAILED` per check with diagnostic
+// lines, and `selftest done N`.
+
+static mut CHECKS: u32 = 0
+static mut SERIAL: Option<chip.UsbSerial> = none
+// Samples sent and received by the I2S loopback.
+static mut SENT: [512]i32 = [0i32; 512]
+static mut RECEIVED: [2048]i32 = [0i32; 2048]
+
+fn say(text: &str) {
+    unsafe {
+        match &mut SERIAL {
+            some(serial) => {
+                fmt.printf(serial, "{}", text)!
+                serial.flush()!
+            }
+            none => {}
+        }
+    }
+}
+
+fn say_values(text: &str, a: u64, b: u64, c: u64) {
+    unsafe {
+        match &mut SERIAL {
+            some(serial) => {
+                fmt.printf(serial, "{}{} {} {}\n", text, a, b, c)!
+                serial.flush()!
+            }
+            none => {}
+        }
+    }
+}
+
+fn flag(value: bool) -> u64 {
+    if value {
+        return 1
+    }
+    return 0
+}
+
+fn check(ok: bool) {
+    unsafe {
+        match &mut SERIAL {
+            some(serial) => {
+                if ok {
+                    fmt.printf(serial, "check {} ok\n", CHECKS)!
+                } else {
+                    fmt.printf(serial, "check {} FAILED\n", CHECKS)!
+                }
+                serial.flush()!
+            }
+            none => {}
+        }
+        CHECKS += 1
+    }
+}
+
+fn refused<T>(result: T!hal.Error, expected: hal.Error) -> bool {
+    match result {
+        ok(_) => {
+            return false
+        }
+        err(error) => {
+            return error == expected
+        }
+    }
+}
+
+// Feed peripheral input signal `signal` from pad `pad`, whatever drives it.
+fn route_in(signal: u32, pad: u32) {
+    // SAFETY: the test owns the peripherals whose inputs it moves.
+    unsafe {
+        input: hal.Reg<u32> = hal.Reg.at(0x6009_1154 + 4 * signal as usize)
+        input.write(pad | 0x80)
+    }
+}
+
+// Pins with nothing on the DevKitC-1's circuit.
+const PIN_A: u32 = 2
+const PIN_B: u32 = 3
+const PIN_C: u32 = 4
+const PIN_D: u32 = 5
+const PIN_E: u32 = 6
+const PIN_F: u32 = 7
+const PIN_G: u32 = 10
+const PIN_H: u32 = 11
+
+// GPIO matrix input signals the checks move.
+const TWAI0_RX: u32 = 73
+const TWAI1_RX: u32 = 77
+const I2SI_SD: u32 = 15
+const PWM0_CAP0: u32 = 93
+const PWM0_CAP1: u32 = 94
+const PCNT0_SIG_CH0: u32 = 101
+
+// --- CAN -------------------------------------------------------------------
+
+fn send_and_wait(can: &mut chip.Can, frame: &hal.CanFrame, timer: &mut chip.Timer) -> bool {
+    match can.poll_send(frame) {
+        ok(queued) => {
+            if !queued {
+                return false
+            }
+        }
+        err(_) => {
+            return false
+        }
+    }
+    for _ in 0..1000 {
+        if !can.is_pending() {
+            return true
+        }
+        timer.delay_us(10)
+    }
+    return false
+}
+
+fn receive_same(can: &mut chip.Can, expected: &hal.CanFrame) -> bool {
+    back := hal.CanFrame.new()
+    match can.poll_receive(&mut back) {
+        ok(got) => {
+            return got && back.same(expected)
+        }
+        err(_) => {
+            return false
+        }
+    }
+}
+
+fn nothing_waits(can: &mut chip.Can) -> bool {
+    back := hal.CanFrame.new()
+    match can.poll_receive(&mut back) {
+        ok(got) => {
+            return !got
+        }
+        err(_) => {
+            return false
+        }
+    }
+}
+
+fn state_code(can: &mut chip.Can) -> u32 {
+    match can.error_state() {
+        ok(state) => {
+            match state {
+                hal.CanErrorState.Active => {
+                    return 0
+                }
+                hal.CanErrorState.Passive => {
+                    return 1
+                }
+                hal.CanErrorState.BusOff => {
+                    return 2
+                }
+            }
+        }
+        err(_) => {
+            return 9
+        }
+    }
+}
+
+fn can_checks(b: &mut board.Board) {
+    none: [0]hal.CanFilter = []
+    config := esp_twai.Config.new(500_000)
+    config.mode = esp_twai.Mode.SelfTest
+    // Validation.
+    fast := esp_twai.Config.new(3_000_000)
+    many: [9]hal.CanFilter = [hal.CanFilter.all(false), hal.CanFilter.all(false), hal.CanFilter.all(false), hal.CanFilter.all(false), hal.CanFilter.all(false), hal.CanFilter.all(false), hal.CanFilter.all(false), hal.CanFilter.all(false), hal.CanFilter.all(false)]
+    check(refused(b.pins.can(12, PIN_A, &config, &none), hal.Error.InvalidInput) && refused(b.pins.can(PIN_A, PIN_A, &fast, &none), hal.Error.InvalidInput) && refused(b.pins.can(PIN_A, PIN_A, &config, &many), hal.Error.InvalidInput))
+
+    // Self-test on one open-drain pad: TX loops to RX, no acknowledge
+    // needed. Standard and extended, data and remote frames.
+    can := b.pins.can(PIN_A, PIN_A, &config, &none)!
+    data: [8]u8 = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]
+    standard := hal.CanFrame.standard(0x123, &data[0..3])!
+    extended := hal.CanFrame.extended(0x1ABC_DEF0, &data)!
+    remote := hal.CanFrame.new()
+    remote.set_remote(0x7FF, false, 4)!
+    long_remote := hal.CanFrame.new()
+    long_remote.set_remote(0x1000_0001, true, 0)!
+    sent := send_and_wait(&mut can, &standard, &mut b.timer) && send_and_wait(&mut can, &extended, &mut b.timer) && send_and_wait(&mut can, &remote, &mut b.timer) && send_and_wait(&mut can, &long_remote, &mut b.timer)
+    received := receive_same(&mut can, &standard) && receive_same(&mut can, &extended) && receive_same(&mut can, &remote) && receive_same(&mut can, &long_remote) && nothing_waits(&mut can)
+    say_values("can self-test sent, received, number ", flag(sent), flag(received), can.number() as u64)
+    check(sent && received && can.number() == 0 && state_code(&mut can) == 0 && can.tec() == 0)
+
+    // The receive FIFO: six extended 8-byte frames, four fit; the lost
+    // ones are reported once, after the frames before them.
+    fifo_ok := true
+    for index in 0u32..6 {
+        frame := hal.CanFrame.extended(0x100 + index, &data)!
+        fifo_ok = fifo_ok && send_and_wait(&mut can, &frame, &mut b.timer)
+    }
+    waiting := can.waiting()
+    order := true
+    for index in 0u32..4 {
+        frame := hal.CanFrame.extended(0x100 + index, &data)!
+        order = order && receive_same(&mut can, &frame)
+    }
+    back := hal.CanFrame.new()
+    overrun := refused(can.poll_receive(&mut back), hal.Error.Overrun)
+    after := nothing_waits(&mut can) && send_and_wait(&mut can, &standard, &mut b.timer) && receive_same(&mut can, &standard)
+    say_values("can fifo waiting, order, overrun ", waiting as u64, flag(order), flag(overrun))
+    check(fifo_ok && order && overrun && after)
+
+    // FD frames and the second controller; a third is refused.
+    fd := hal.CanFrame.new()
+    fd.set_fd(0x10, false, &data, false)!
+    unsupported := refused(can.poll_send(&fd), hal.Error.Unsupported)
+    second := b.pins.can(PIN_B, PIN_B, &config, &none)!
+    third := refused(b.pins.can(PIN_C, PIN_C, &config, &none), hal.Error.Busy)
+    check(unsupported && second.number() == 1 && third && refused(b.pins.output(PIN_A), hal.Error.Busy))
+    b.pins.release_can(second)
+    b.pins.release_can(can)
+
+    // Filters: one standard, one extended identifier; frames of other
+    // identifiers and kinds are dropped, by the hardware filter or the
+    // software check.
+    filters: [2]hal.CanFilter = [hal.CanFilter.exact(0x123, false), hal.CanFilter.exact(0x1ABC_DEF0, true)]
+    can = b.pins.can(PIN_A, PIN_A, &config, &filters)!
+    other := hal.CanFrame.standard(0x124, &data[0..1])!
+    same_bits := hal.CanFrame.extended(0x123, &data[0..1])!
+    long_other := hal.CanFrame.extended(0x1ABC_DEF1, &data[0..2])!
+    filtered := send_and_wait(&mut can, &other, &mut b.timer) && send_and_wait(&mut can, &standard, &mut b.timer) && send_and_wait(&mut can, &same_bits, &mut b.timer) && send_and_wait(&mut can, &long_other, &mut b.timer) && send_and_wait(&mut can, &extended, &mut b.timer)
+    passed := receive_same(&mut can, &standard) && receive_same(&mut can, &extended) && nothing_waits(&mut can)
+    check(filtered && passed)
+    b.pins.release_can(can)
+
+    // Error states: normal mode with nothing acknowledging and the RX pad
+    // pulled up, so every bit the controller sends dominant reads back
+    // recessive. Each bit error adds 8 to TEC: error passive from 128,
+    // bus-off past 255. Recovery then counts 128 runs of 11 recessive bits
+    // on the idle line.
+    normal := esp_twai.Config.new(125_000)
+    normal.automatic_recovery = false
+    can = b.pins.can(PIN_B, PIN_C, &normal, &none)!
+    start_state := state_code(&mut can)
+    can.poll_send(&standard)!
+    passive_seen := false
+    bus_off_seen := false
+    start := b.timer.now_us()
+    for b.timer.now_us() - start < 200_000 && !bus_off_seen {
+        state := state_code(&mut can)
+        if state == 1 {
+            passive_seen = true
+        }
+        if state == 2 {
+            bus_off_seen = true
+        }
+    }
+    bus_off_us := b.timer.now_us() - start
+    refused_send := refused(can.poll_send(&standard), hal.Error.Bus)
+    can.recover()
+    recovered := false
+    start = b.timer.now_us()
+    for b.timer.now_us() - start < 200_000 && !recovered {
+        recovered = state_code(&mut can) == 0
+    }
+    recovery_us := b.timer.now_us() - start
+    say_values("can passive, bus-off us, recovery us ", flag(passive_seen), bus_off_us, recovery_us)
+    check(start_state == 0 && passive_seen && bus_off_seen && refused_send && recovered && recovery_us > 5_000 && can.tec() == 0)
+    b.pins.release_can(can)
+
+    // Two controllers on one bus, a real acknowledged exchange. A GPIO
+    // pad has one output, so the bus is a wired AND in software: TWAI0
+    // and TWAI1 drive their TX pads, the CPU drives a third pad low while
+    // either TX is low, and both RX inputs read that pad.
+    slow := esp_twai.Config.new(50_000)
+    first := b.pins.can(PIN_D, PIN_E, &slow, &none)!
+    second = b.pins.can(PIN_F, PIN_G, &slow, &none)!
+    bus := b.pins.output(PIN_H)!
+    bus.set_high()
+    route_in(TWAI0_RX, PIN_H)
+    route_in(TWAI1_RX, PIN_H)
+    hello: [4]u8 = [0xCA, 0xFE, 0xBA, 0xBE]
+    request := hal.CanFrame.extended(0x18DA_F110, &hello)!
+    reply := hal.CanFrame.standard(0x7E8, &hello[0..2])!
+    there := exchange(&mut first, &mut second, &request) && exchange(&mut second, &mut first, &reply)
+    say_values("can exchange tec, rec, ok ", (first.tec() + second.tec()) as u64, (first.rec() + second.rec()) as u64, flag(there))
+    check(there && first.tec() == 0 && second.tec() == 0 && state_code(&mut first) == 0)
+    b.pins.release(bus)
+    b.pins.release_can(first)
+    b.pins.release_can(second)
+}
+
+// Send `frame` from `sender` to `receiver` over the software wired AND:
+// true once the receiver has it and the sender saw the acknowledge.
+fn exchange(sender: &mut chip.Can, receiver: &mut chip.Can, frame: &hal.CanFrame) -> bool {
+    tx_mask := (1u32 << sender.tx_pin()) | (1u32 << receiver.tx_pin())
+    bus_mask := 1u32 << PIN_H
+    match sender.poll_send(frame) {
+        ok(queued) => {
+            if !queued {
+                return false
+            }
+        }
+        err(_) => {
+            return false
+        }
+    }
+    // SAFETY: the test owns PIN_H and only reads the TX pads.
+    unsafe {
+        input: hal.Reg<u32> = hal.Reg.at(0x6009_103C)
+        set: hal.Reg<u32> = hal.Reg.at(0x6009_1008)
+        clear: hal.Reg<u32> = hal.Reg.at(0x6009_100C)
+        for _ in 0..100 {
+            section := hal.Critical.enter()
+            for _ in 0..2000 {
+                if (input.read() & tx_mask) == tx_mask {
+                    set.write(bus_mask)
+                } else {
+                    clear.write(bus_mask)
+                }
+            }
+            core.drop(section)
+            if !sender.is_pending() && receiver.waiting() > 0 {
+                return receive_same(receiver, frame)
+            }
+        }
+    }
+    return false
+}
+
+// --- I2S -------------------------------------------------------------------
+
+// A sample pattern: distinct in every frame and both slots, using all bits.
+fn pattern(index: u32, bits: u32) -> i32 {
+    word := (index * 0x9E37_79B9) ^ 0x5A5A_A5A5
+    if (index & 1) != 0 {
+        word = ~word
+    }
+    sample := esp_i2s.slot_sample(word, bits, false)
+    return sample
+}
+
+// Play `frames` frames of the pattern and record them back through the
+// shared input on the output's data pad; true if the recording contains
+// them in order, left and right in place, with silence before and after.
+fn loopback(b: &mut board.Board, config: &esp_i2s.Config, frames: u32) -> bool {
+    output := b.pins.i2s_output(PIN_A, PIN_B, PIN_C, &mut b.dma, config)!
+    input := b.pins.i2s_input(PIN_D, PIN_B, PIN_C, &mut b.dma, config)!
+    route_in(I2SI_SD, PIN_A)
+    shared := input.is_shared()
+    count := (frames * 2) as usize
+    unsafe {
+        for index in 0..count {
+            SENT[index] = pattern(index as u32, config.bits)
+        }
+    }
+    // Let silence play first, then queue everything.
+    b.timer.delay_ms(5)
+    queued := 0usize
+    got := 0usize
+    start := b.timer.now_us()
+    for got < 2048 && b.timer.now_us() - start < 200_000 {
+        if queued < count {
+            queued += unsafe {
+                output.poll_write(&SENT[queued..count])!
+            }
+        }
+        match unsafe { input.poll_read(&mut RECEIVED[got..2048]) } {
+            ok(n) => {
+                got += n
+            }
+            err(_) => {
+                got = 2048
+            }
+        }
+    }
+    b.pins.release_i2s_input(input, &mut b.dma)
+    b.pins.release_i2s_output(output, &mut b.dma)
+    // Find the first frame, then compare.
+    found := 2048usize
+    unsafe {
+        for at in 0usize..(2048 - count) / 2 {
+            if found == 2048 && RECEIVED[2 * at] == SENT[0] && RECEIVED[2 * at + 1] == SENT[1] {
+                found = 2 * at
+            }
+        }
+        if found == 2048 || got < 2048 || !shared {
+            say_values("i2s not found, got, shared ", found as u64, got as u64, flag(shared))
+            say_values("i2s first received ", RECEIVED[200] as u32 as u64, RECEIVED[201] as u32 as u64, SENT[0] as u32 as u64)
+            return false
+        }
+        same := true
+        for index in 0..count {
+            if RECEIVED[found + index] != SENT[index] {
+                same = false
+            }
+        }
+        silent := found >= 2 && RECEIVED[found - 1] == 0 && RECEIVED[found - 2] == 0 && RECEIVED[found + count] == 0 && RECEIVED[found + count + 1] == 0
+        say_values("i2s loopback found at, same, silent ", found as u64, flag(same), flag(silent))
+        return same && silent
+    }
+}
+
+// The rate at which `frames_received` rises, in millihertz, measured
+// against the system timer between two descriptor completions about
+// 200 ms apart.
+fn measured_rate(b: &mut board.Board, input: &mut chip.I2sInput) -> u64 {
+    first := input.frames_received()
+    for input.frames_received() == first {}
+    start := b.timer.now_us()
+    begin := input.frames_received()
+    b.timer.delay_ms(200)
+    last := input.frames_received()
+    for input.frames_received() == last {}
+    end := b.timer.now_us()
+    frames := input.frames_received() - begin
+    return frames * 1_000_000_000 / (end - start)
+}
+
+fn i2s_checks(b: &mut board.Board) {
+    // Validation.
+    bad_bits := esp_i2s.Config.new(48_000, 20, 2, hal.I2sFormat.Philips)
+    bad_rate := esp_i2s.Config.new(2_000_000, 32, 2, hal.I2sFormat.Philips)
+    good := esp_i2s.Config.new(48_000, 32, 2, hal.I2sFormat.Philips)
+    check(refused(b.pins.i2s_output(PIN_A, PIN_B, PIN_C, &mut b.dma, &bad_bits), hal.Error.InvalidInput) && refused(b.pins.i2s_output(PIN_A, PIN_B, PIN_C, &mut b.dma, &bad_rate), hal.Error.InvalidInput) && refused(b.pins.i2s_output(PIN_A, PIN_A, PIN_C, &mut b.dma, &good), hal.Error.InvalidInput) && refused(b.pins.i2s_output(12, PIN_B, PIN_C, &mut b.dma, &good), hal.Error.InvalidInput))
+
+    // Loopbacks: Philips 32-bit stereo at 48 kHz, left-justified 16-bit
+    // slots at 16 kHz, right-justified 24-bit samples at 44.1 kHz.
+    check(loopback(b, &good, 200))
+    narrow := esp_i2s.Config.new(16_000, 16, 2, hal.I2sFormat.LeftJustified)
+    narrow.slot_bits = 16
+    check(loopback(b, &narrow, 200))
+    right := esp_i2s.Config.new(44_100, 24, 2, hal.I2sFormat.RightJustified)
+    check(loopback(b, &right, 200))
+
+    // Rates against the system timer: 44.1 kHz, exact from the PLL, and
+    // the output's count agrees; a master input runs at 8 kHz on its own
+    // clocks.
+    cd := esp_i2s.Config.new(44_100, 16, 2, hal.I2sFormat.Philips)
+    output := b.pins.i2s_output(PIN_A, PIN_B, PIN_C, &mut b.dma, &cd)!
+    input := b.pins.i2s_input(PIN_D, PIN_B, PIN_C, &mut b.dma, &cd)!
+    busy := refused(b.pins.i2s_output(PIN_E, PIN_F, PIN_G, &mut b.dma, &cd), hal.Error.Busy)
+    rate := measured_rate(b, &mut input)
+    played := output.frames_played()
+    received := input.frames_received()
+    say_values("i2s 44.1k rate mHz, played, received ", rate, played, received)
+    timing := output.timing()
+    check(busy && rate > 44_090_000 && rate < 44_110_000 && timing.error_ppm() == 0)
+
+    // The input's ring fills up when nobody reads it: one Overrun, then
+    // samples again.
+    b.timer.delay_ms(30)
+    samples := [0i32; 64]
+    overrun := refused(input.poll_read(&mut samples), hal.Error.Overrun)
+    again := 0usize
+    start := b.timer.now_us()
+    for again == 0 && b.timer.now_us() - start < 20_000 {
+        again = input.poll_read(&mut samples)!
+    }
+    check(overrun && again > 0)
+    b.pins.release_i2s_input(input, &mut b.dma)
+    b.pins.release_i2s_output(output, &mut b.dma)
+
+    phone := esp_i2s.Config.new(8000, 16, 1, hal.I2sFormat.Philips)
+    master := b.pins.i2s_input(PIN_D, PIN_E, PIN_F, &mut b.dma, &phone)!
+    phone_rate := measured_rate(b, &mut master)
+    say_values("i2s master input 8k rate mHz, shared ", phone_rate, flag(master.is_shared()), 0)
+    check(!master.is_shared() && phone_rate > 7_998_000 && phone_rate < 8_002_000)
+    b.pins.release_i2s_input(master, &mut b.dma)
+
+    // Every DMA channel is back.
+    one := b.dma.channel()!
+    two := b.dma.channel()!
+    three := b.dma.channel()!
+    copied := [0u8; 16]
+    source := [7u8; 16]
+    three.copy(&mut copied, &source)!
+    check(copied[15] == 7)
+    b.dma.release(one)
+    b.dma.release(two)
+    b.dma.release(three)
+}
+
+// --- PWM input -------------------------------------------------------------
+
+// Measure the chip's own PWM output: LEDC on PIN_A, the capture input
+// claimed on PIN_B and pointed at PIN_A.
+fn measure(b: &mut board.Board, frequency: u32, percent: u32, window_us: u32, capture: &mut hal.PulseCapture) -> bool {
+    output := b.pins.pwm(PIN_A, frequency)!
+    duty := (output.max_duty() as u32 * percent / 100) as u16
+    output.set_duty(duty)!
+    input := b.pins.pwm_input(PIN_B, window_us)!
+    route_in(PWM0_CAP0, PIN_A)
+    route_in(PWM0_CAP1, PIN_A)
+    route_in(PCNT0_SIG_CH0, PIN_A)
+    // The first measurement may span the moment the inputs moved.
+    found := 0u32
+    start := b.timer.now_us()
+    limit := 3 * window_us as u64 + 200_000
+    for found < 2 && b.timer.now_us() - start < limit {
+        match input.poll_capture(capture) {
+            ok(done) => {
+                if done {
+                    found += 1
+                }
+            }
+            err(_) => {}
+        }
+    }
+    b.pins.release_pwm_input(input)
+    b.pins.release_pwm(output)
+    say_values("pwm in Hz, period ns, high ns ", frequency as u64, capture.period_ns, capture.high_ns)
+    return found == 2
+}
+
+fn near(value: u64, expected: u64, permille: u64) -> bool {
+    margin := expected * permille / 1000
+    return value + margin >= expected && value <= expected + margin
+}
+
+fn pwm_checks(b: &mut board.Board) {
+    check(refused(b.pins.pwm_input(PIN_B, 0), hal.Error.InvalidInput) && refused(b.pins.pwm_input(12, 1000), hal.Error.InvalidInput))
+    input := b.pins.pwm_input(PIN_B, 1000)!
+    check(refused(b.pins.pwm_input(PIN_C, 1000), hal.Error.Busy) && refused(b.pins.output(PIN_B), hal.Error.Busy) && input.pin() == PIN_B)
+    b.pins.release_pwm_input(input)
+
+    capture := hal.PulseCapture.new()
+    // 1 kHz at 25%: periods averaged over a 20 ms window.
+    slow := measure(b, 1000, 25, 20_000, &mut capture)
+    check(slow && near(capture.period_ns, 1_000_000, 1) && capture.cycles >= 19 && capture.duty(100) == 25)
+    // 100 kHz at 50%.
+    mid := measure(b, 100_000, 50, 5000, &mut capture)
+    check(mid && near(capture.period_ns, 10_000, 1) && capture.cycles >= 400 && capture.duty(100) == 50)
+    // 1 MHz at 75% (64 duty steps).
+    fast := measure(b, 1_000_000, 75, 2000, &mut capture)
+    check(fast && capture.frequency_hz() == 1_000_000 && capture.cycles >= 1000 && near(capture.high_ns, 750, 40))
+    // 4 MHz at 25% (16 duty steps): the high time is 62.5 ns, timed to
+    // 25 ns.
+    faster := measure(b, 4_000_000, 25, 1000, &mut capture)
+    check(faster && capture.frequency_hz() == 4_000_000 && capture.high_ns >= 50 && capture.high_ns <= 75)
+    // 10 Hz at 10%: single periods, 100 ms each, in a 150 ms window.
+    crawl := measure(b, 10, 10, 150_000, &mut capture)
+    check(crawl && capture.cycles == 1 && near(capture.period_ns, 100_000_000, 1) && near(capture.high_ns, 10_000_000, 2))
+    // Steady lines: duty 0 and 100% give windows with cycles 0.
+    low := measure(b, 1000, 0, 5000, &mut capture)
+    low_ok := low && capture.cycles == 0 && capture.high_ns == 0 && near(capture.period_ns, 5_000_000, 50)
+    high := measure(b, 1000, 100, 5000, &mut capture)
+    check(low_ok && high && capture.cycles == 0 && capture.high_ns == capture.period_ns && capture.duty(100) == 100)
+}
+
+fn main() {
+    b := board.take()!
+    serial := b.usb.serial()!
+    poke: [1]u8 = [0]
+    serial.read(&mut poke)!
+    serial.set_crlf(true)
+    unsafe {
+        SERIAL = some(serial)
+    }
+    say("selftest ready\n")
+
+    can_checks(&mut b)
+    i2s_checks(&mut b)
+    pwm_checks(&mut b)
+
+    count := unsafe {
+        CHECKS
+    }
+    unsafe {
+        match &mut SERIAL {
+            some(serial) => {
+                fmt.printf(serial, "selftest done {}\n", count)!
+                serial.flush()!
+            }
+            none => {}
+        }
+    }
+    b.led.set_color(0x00_10_00)
+    for {
+        b.timer.delay_ms(1000)
+    }
+}

@@ -1504,10 +1504,12 @@ fn esp32c6_projects_link_to_flashable_firmware() {
     let blink = root().join("examples/blink");
     let tasks = root().join("examples/esp32c6_tasks");
     let selftest = root().join("tests/hardware/esp32c6_devkitc");
+    let can_audio = root().join("tests/hardware/esp32c6_can_audio");
     for (project, name, board) in [
         (&blink, "blink", &["--board", "esp32c6_devkitc"][..]),
         (&tasks, "tasks", &[][..]),
         (&selftest, "selftest", &[][..]),
+        (&can_audio, "can-audio", &[][..]),
     ] {
         for level in ["0", "2"] {
             let elf = scratch.path(&format!("{name}-O{level}.elf"));

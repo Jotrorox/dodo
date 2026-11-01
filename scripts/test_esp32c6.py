@@ -177,6 +177,13 @@ def run_locked(dodo, optimization, port, project):
                     output += os.read(fd, 4096)
                 except BlockingIOError:
                     pass
+                except OSError:
+                    # DODO_ESP32C6_KEEP_OUTPUT=1: report what arrived before
+                    # the board left the USB bus (it reset) instead of failing.
+                    if not os.environ.get("DODO_ESP32C6_KEEP_OUTPUT"):
+                        raise
+                    output += b"\n(board disconnected)\n"
+                    break
         # A panic report ends with its location; collect the rest of it.
         end = time.time() + 0.5
         while time.time() < end:
@@ -186,6 +193,10 @@ def run_locked(dodo, optimization, port, project):
                     output += os.read(fd, 4096)
                 except BlockingIOError:
                     pass
+                except OSError:
+                    if not os.environ.get("DODO_ESP32C6_KEEP_OUTPUT"):
+                        raise
+                    break
     finally:
         os.close(fd)
     return output.decode("utf-8", "replace")
