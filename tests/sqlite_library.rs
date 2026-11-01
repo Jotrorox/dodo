@@ -41,16 +41,12 @@ fn success(output: Output, context: &str) {
 }
 
 fn python_with_sqlite() -> Option<&'static str> {
-    for python in ["python3", "python"] {
-        if Command::new(python)
+    ["python3", "python"].into_iter().find(|python| {
+        Command::new(python)
             .args(["-c", "import sqlite3"])
             .output()
             .is_ok_and(|o| o.status.success())
-        {
-            return Some(python);
-        }
-    }
-    None
+    })
 }
 
 fn build_shell(workspace: &Path, optimization: &str) -> PathBuf {
