@@ -1,0 +1,165 @@
+package heap
+
+import "core/mem"
+import "core/ptr"
+
+// Memory from the window runtime's C heap, for the pixel buffers and window
+// tables std/window and its adapters keep. Dodo has no global heap, and both
+// may live in statics, so addresses are kept as integers.
+
+unsafe extern "C" fn dodo_window_alloc(bytes: usize) -> *mut u8
+unsafe extern "C" fn dodo_window_free(memory: *mut u8)
+unsafe extern "C" fn dodo_window_empty() -> *mut u8
+
+// Zeroed bytes owned by this value and freed with it. An empty block has a
+// valid address too, as a Dodo slice needs one.
+pub struct Bytes {
+    // Public only so a static can start empty: all zero. Use the methods.
+    pub address: usize
+    pub length: usize
+
+    // `length` zero bytes; none when the memory is not available.
+    pub fn new(length: usize) -> Option<Bytes> {
+        pointer := unsafe {
+            dodo_window_alloc(length)
+        }
+        if ptr.is_null(pointer) {
+            return none
+        }
+        address := unsafe {
+            pointer as usize
+        }
+        return some(Bytes { address: address, length: length })
+    }
+    pub fn empty() -> Bytes {
+        return Bytes { address: 0, length: 0 }
+    }
+    pub fn len(&self) -> usize {
+        return self.length
+    }
+    pub fn pointer(&self) -> *mut u8 {
+        if self.address == 0 {
+            return unsafe {
+                dodo_window_empty()
+            }
+        }
+        return unsafe {
+            self.address as *mut u8
+        }
+    }
+    pub fn bytes(&mut self) -> &mut[u8] from(self) {
+        unsafe {
+            pointer := self.pointer()
+            length := self.length
+            return ptr.borrow_slice_mut(pointer, length, self)
+        }
+    }
+    pub fn view(&self) -> &[u8] from(self) {
+        unsafe {
+            return ptr.borrow_slice(self.pointer() as *const u8, self.length, self)
+        }
+    }
+    fn drop(&mut self) {
+        if self.address != 0 {
+            unsafe {
+                dodo_window_free(self.address as *mut u8)
+            }
+            self.address = 0
+            self.length = 0
+        }
+    }
+}
+
+// A growable array of plain records, such as one per open window. The
+// order is not kept: remove() moves the last record into the hole.
+pub struct Table<T> {
+    // Public only so a static can start empty: all zero. Use the methods.
+    pub address: usize
+    pub count: usize
+    pub capacity: usize
+
+    pub fn new() -> Table<T> {
+        return Table<T> { address: 0, count: 0, capacity: 0 }
+    }
+    pub fn len(&self) -> usize {
+        return self.count
+    }
+    pub fn records(&mut self) -> &mut[T] from(self) requires_plain(T) {
+        unsafe {
+            pointer := self.base()
+            count := self.count
+            return ptr.borrow_slice_mut(pointer, count, self)
+        }
+    }
+    pub fn view(&self) -> &[T] from(self) requires_plain(T) {
+        unsafe {
+            return ptr.borrow_slice(self.base() as *const T, self.count, self)
+        }
+    }
+    // Append a record; false when memory runs out.
+    pub fn push(&mut self, record: T) -> bool requires_plain(T) {
+        if self.count == self.capacity {
+            capacity := self.capacity * 2 + 4
+            size := mem.size_of::<T>()
+            next := unsafe {
+                dodo_window_alloc(capacity * size)
+            }
+            if ptr.is_null(next) {
+                return false
+            }
+            unsafe {
+                if self.address != 0 {
+                    ptr.copy_nonoverlapping(self.address as *const u8, next, self.count * size)
+                    dodo_window_free(self.address as *mut u8)
+                }
+                self.address = next as usize
+            }
+            self.capacity = capacity
+        }
+        unsafe {
+            ptr.write(ptr.offset(self.base(), self.count as isize), record)
+        }
+        self.count += 1
+        return true
+    }
+    // Remove the record at `index`, replacing it with the last one.
+    pub fn remove(&mut self, index: usize) requires_plain(T) {
+        if index >= self.count {
+            return
+        }
+        last := self.count - 1
+        if index != last {
+            size := mem.size_of::<T>()
+            unsafe {
+                base := self.address as *mut u8
+                ptr.copy_nonoverlapping(ptr.offset(base, (last * size) as isize) as *const u8, ptr.offset(base, (index * size) as isize), size)
+            }
+        }
+        self.count = last
+    }
+    // Remove every record and free the memory.
+    pub fn clear(&mut self) {
+        if self.address != 0 {
+            unsafe {
+                dodo_window_free(self.address as *mut u8)
+            }
+        }
+        self.address = 0
+        self.count = 0
+        self.capacity = 0
+    }
+    fn base(&self) -> *mut T {
+        if self.address == 0 {
+            // An empty table still needs an aligned, nonnull address.
+            return unsafe {
+                mem.align_of::<T>() as *mut T
+            }
+        }
+        return unsafe {
+            self.address as *mut T
+        }
+    }
+    fn drop(&mut self) {
+        self.clear()
+    }
+}

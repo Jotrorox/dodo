@@ -1,14 +1,16 @@
 ---
 title: "Windows"
-description: "Open a desktop window on Linux, macOS or Windows, draw into it with std/graphics, and handle keyboard and mouse events in a plain loop."
+description: "Open desktop windows on Linux, macOS or Windows, draw into them with std/graphics, and handle keyboard and mouse events of all of them in one plain loop."
 section: "Standard library"
 order: 160.6
 ---
 
-`std/window` opens a desktop window whose drawing area is a
-[std/graphics](graphics.md) canvas. Events are read in an ordinary loop, so
-there are no callbacks to register. It uses only what each operating system
-ships, so there is nothing to install and no build flag to set:
+`std/window` opens desktop windows whose drawing areas are
+[std/graphics](graphics.md) canvases. A program opens as many windows as it
+needs, such as a main window, dialogs and tool windows, and reads the events
+of all of them in one ordinary loop, so there are no callbacks to register.
+It uses only what each operating system ships, so there is nothing to
+install and no build flag to set:
 
 | System | Window system | Linked |
 | --- | --- | --- |
@@ -32,7 +34,8 @@ import "std/graphics/font"
 import "std/window"
 
 fn run() -> void!window.Error {
-    win := window.open(window.Options.new("Hello", 480, 240))?
+    app := window.App.new()?
+    win := app.open(window.Options.new("Hello", 480, 240))?
     // 2 on a Retina display, whose canvas has twice the pixels per side.
     scale := win.scale()
     label := font.medium().scaled(scale)
@@ -44,11 +47,11 @@ fn run() -> void!window.Error {
         dirty := canvas.take_dirty()
         win.update(dirty)?
 
-        match win.wait_event()? {
-            window.Event.Close => {
+        match app.wait_event()? {
+            window.Event.Close(_) | window.Event.Quit => {
                 return ok()
             }
-            window.Event.Key(key) => {
+            window.Event.Key(_, key) => {
                 if key.key == window.Key.Escape {
                     return ok()
                 }
@@ -75,73 +78,136 @@ dodo run hello_window.dodo
 ```
 
 A 480x240 window titled "Hello" opens with a yellow disk and a line of
-text. It closes, and the program exits 0, when you press Escape or click the
-window's close button. Exit 1 means no window could be opened, for example
-because the program runs over SSH without X forwarding.
+text. It closes, and the program exits 0, when you press Escape, click the
+window's close button or press Command-Q on macOS. Exit 1 means no window
+could be opened, for example because the program runs over SSH without X
+forwarding.
 
-The program redraws after every event. Programs that animate use
-`wait_event_until_frame` instead, which also says when the next frame is due;
+The program redraws after every event. Programs that animate ask for `Frame`
+events instead, which say when the next frame is due;
 `examples/window.dodo` in the repository is a bouncing ball that does.
 
-## The main loop
+## Apps and windows
 
-A `Window` owns a pixel buffer exactly the size of its drawing area.
+A `window.App` is the program's connection to the window system and the
+event loop of every window opened on it. A process has one App at a time:
+`App.new()` fails with `AlreadyOpen` while another exists. `app.open(options)`
+opens a window and returns a `Window`, which draws on its own and does not
+borrow the App, so windows can be kept in variables and structs freely.
 
 | Call | Does |
 | --- | --- |
+| `window.App.new()` | Connects to the window system. |
+| `app.open(options)` | Opens and shows a window. |
+| `app.wait_event()` | Waits for the next event of any window. |
+| `app.poll_event()` | The next event if one is pending, else `none`; never waits. |
+| `app.wait_event_timeout(ms)` | Waits at most `ms` milliseconds; `none` when the time passes first. |
+| `app.close()` | Closes every window and the connection; dropping the App does the same. |
+
+Each `Window` owns a pixel buffer exactly the size of its drawing area.
+
+| Call | Does |
+| --- | --- |
+| `win.id()` | The `WindowId` its events carry. |
 | `win.canvas()` | Lends the buffer out as a `graphics.Canvas` in `Bgra8888`. It keeps its contents between frames. |
 | `win.update(dirty)` | Shows the `dirty` part of the buffer, usually what `canvas.take_dirty()` returned. |
 | `win.update_all()` | Shows the whole buffer. |
-| `win.wait_event()` | Waits for the next event. |
-| `win.poll_event()` | The next event if one is pending, else `none`; never waits. |
-| `win.wait_event_timeout(ms)` | Waits at most `ms` milliseconds; `none` when the time passes first. |
-| `win.wait_event_until_frame()` | Waits for the next event or the next frame; `none` when it is time to draw. |
+| `win.request_frame()` | Asks for one `Frame` event when it is time to draw the next frame. |
 | `win.frame_interval()` | The display's refresh period as a `time.Duration`, such as 16.7 ms at 60 Hz. |
+| `win.set_title(title)`, `win.set_cursor_visible(visible)` | Change the title, or hide the pointer over the window. |
+| `win.close()` | Closes the window; dropping it does the same. |
 
-Drawing changes nothing on screen until `update`. The canvas borrows the
-window, so its last use must come before the next event call; the borrow
-checker enforces that. This matters because a resize replaces the buffer
-inside the event call.
+Drawing changes nothing on screen until `update`. After a `Resize` event,
+the next `canvas()` has the new size and keeps the old picture in its
+top-left corner; the buffer is only ever replaced inside the window's own
+calls, never while a canvas borrows it.
+
+A window closed by `close()`, or left over after its App closed, fails with
+`Closed`, reports a size of 0 by 0 and lends out an empty canvas.
+
+## Several windows
+
+Every event names its window: each variant of `Event` starts with a
+`WindowId`, and `window.event_window(&event)` reads it from any event. Compare
+it with `win.id()` to route the event, or match it in a pattern. Ids are
+never reused within a process, so a late event of a window you closed cannot
+be mistaken for one of a newer window.
+
+```dodo
+app := window.App.new()?
+main := app.open(window.Options.new("Main", 640, 480))?
+tools := app.open(window.Options { title: "Tools", width: 160, height: 320, resizable: false })?
+for {
+    event := app.wait_event()?
+    from_tools := window.event_window(&event) == tools.id()
+    match event {
+        window.Event.Close(id) => {
+            if id == main.id() {
+                return ok()
+            }
+            tools.close()
+        }
+        window.Event.MouseButton(_, button) => {
+            if from_tools {
+                // ... pick a tool ...
+            } else {
+                // ... use it on the main window ...
+            }
+        }
+        _ => {}
+    }
+}
+```
+
+Open a dialog by calling `app.open` when it is needed and close it, or let
+it drop, when it is done; the other windows keep running meanwhile. The
+first window appears where the system places new windows, centered on
+macOS; later ones cascade from it. `examples/window_palette.dodo` paints on
+one window with colors picked in a second.
 
 ### Animation
 
-An animation draws once per display refresh. `wait_event_until_frame()`
-returns each event as it arrives and `none` when the next frame is due, so
-the loop handles events until `none`, then draws:
+An animation draws once per display refresh. `win.request_frame()` asks for
+one `Frame` event; the loop draws when it arrives and asks again:
 
 ```dodo
+win.request_frame()?
 for {
-    match win.wait_event_until_frame()? {
-        some(window.Event.Close) => {
+    match app.wait_event()? {
+        window.Event.Close(_) | window.Event.Quit => {
             return ok()
         }
-        some(_) => {
-            // ... handle the event ...
-        }
-        none => {
+        window.Event.Frame(_) => {
             canvas := win.canvas()
             // ... draw the next frame ...
             dirty := canvas.take_dirty()
             win.update(dirty)?
+            win.request_frame()?
+        }
+        _ => {
+            // ... handle the event ...
         }
     }
 }
 ```
 
-Frames are due `frame_interval()` apart, at a fixed pace however many events
-arrive: moving the mouse over the window does not hold frames back. Where
-the window system reports the display's refreshes, frames follow them (see
-the platform notes); elsewhere a timer at the refresh rate keeps the pace. A
-frame that takes longer than one refresh skips the refreshes it missed
-instead of making the next frames late. A hidden or minimized window, whose
-display stops reporting refreshes, still gets a frame every two intervals.
+Frames come `frame_interval()` apart, at a fixed pace however many events
+arrive: moving the mouse over the window does not hold frames back, because
+a frame that is due comes before any other event. Where the window system
+reports the display's refreshes, frames follow them (see the platform
+notes); elsewhere a timer at the refresh rate keeps the pace. A frame that
+takes longer than one refresh skips the refreshes it missed instead of
+making the next frames late. A hidden or minimized window, whose display
+stops reporting refreshes, still gets a frame every two intervals. Each
+window asks for its own frames, so an animated window and a still one, or two
+windows on displays with different refresh rates, can share one loop.
 
 Advance animations by `frame_interval()` per frame, or by the time measured
 with `std/time`, rather than by a fixed step: displays refresh at 60, 120,
 144 Hz or more, and the same step per frame would run twice as fast on a
 120 Hz display.
 
-Call `wait_event()` when there is nothing left to animate, so the program
+Stop asking for frames when there is nothing left to animate, so the program
 sleeps until the next event.
 
 ### Drawing into your own canvas
@@ -171,17 +237,22 @@ right size.
 
 ## Events
 
+Every variant but `Quit` starts with the `WindowId` of its window, left out
+below.
+
 | Event | Meaning |
 | --- | --- |
-| `Close` | The user asked to close the window: its close button, Alt-F4, or Command-Q. The window stays open until you call `close()` or drop it, so you can still ask whether to save. |
-| `Resize(width, height)` | The drawing area has a new size in pixels. The buffer already has it and keeps the old picture in its top-left corner; redraw and `update_all()`. |
-| `Focus(focused)` | The window gained or lost keyboard focus. |
-| `Key(KeyEvent)` | A key went down (`pressed`), auto-repeated (`repeat`), or came up. |
-| `Text(code_point)` | A character typed through the keyboard layout. |
-| `MouseMove(x, y)` | The pointer moved inside the drawing area. |
-| `MouseButton(ButtonEvent)` | `Left`, `Middle`, `Right`, `Back` or `Forward` went down or up at `x`, `y`. |
-| `MouseLeave` | The pointer left the drawing area. |
-| `Scroll(dx, dy)` | A wheel or trackpad scrolled; 120 units per wheel notch, positive `dy` scrolls down. |
+| `Close(id)` | The user asked to close the window: its close button or Alt-F4. The window stays open until you call `close()` or drop it, so you can still ask whether to save. |
+| `Resize(id, width, height)` | The drawing area has a new size in pixels. The next `canvas()` has it and keeps the old picture in its top-left corner; redraw and `update_all()`. |
+| `Focus(id, focused)` | The window gained or lost keyboard focus. |
+| `Key(id, KeyEvent)` | A key went down (`pressed`), auto-repeated (`repeat`), or came up, in the focused window. |
+| `Text(id, code_point)` | A character typed through the keyboard layout. |
+| `MouseMove(id, x, y)` | The pointer moved inside the drawing area. |
+| `MouseButton(id, ButtonEvent)` | `Left`, `Middle`, `Right`, `Back` or `Forward` went down or up at `x`, `y`. |
+| `MouseLeave(id)` | The pointer left the drawing area. |
+| `Scroll(id, dx, dy)` | A wheel or trackpad scrolled; 120 units per wheel notch, positive `dy` scrolls down. |
+| `Frame(id)` | Time to draw the frame `request_frame()` asked for. |
+| `Quit` | The user asked the whole application to quit: Command-Q or the Quit menu item on macOS. Other systems close windows one at a time and never send it. |
 
 Coordinates are pixels from the drawing area's top-left corner. While a
 button is held, moves keep arriving outside the window, with coordinates that
@@ -226,10 +297,10 @@ handle `Resize`.
 | | Linux (X11) | macOS | Windows |
 | --- | --- | --- | --- |
 | Finding the display | `DISPLAY`, then the cookie for it in `XAUTHORITY` or `~/.Xauthority`. Local displays use the Unix socket, `host:N` uses TCP, so SSH X forwarding works. | The logged-in GUI session. | The interactive desktop. |
-| Threads | Any one thread. | The main thread only; elsewhere `open` fails with `Unsupported`. | The thread that opened the window must read its events. |
+| Threads | Any one thread, the one that created the App. | The main thread only; elsewhere `App.new` fails with `Unsupported`. | The thread that created the App must open the windows and read their events. |
 | Text input | Latin-1 and Unicode keysyms, Shift, Caps Lock, NumLock and AltGr. Dead keys and compose sequences type nothing. | Characters from the layout, Option combinations included. No input method or dead keys. | Characters from the layout, including dead keys and surrogate pairs. |
 | While resizing | Events keep flowing. | AppKit holds the event loop until the mouse is released, then reports the final size. | Windows holds the event loop until the mouse is released, then reports the size. |
-| Frame timing | The Present extension reports each refresh; servers without it fall back to a 60 Hz timer. `frame_interval()` is measured from Present after about half a second. | A display link reports each refresh on macOS 14 and later; older systems use a timer at the screen's refresh rate. Animating programs are exempt from App Nap until they call `wait_event()`. | The compositor's (DWM's) refresh times; a high-resolution timer keeps the waits precise. |
+| Frame timing | The Present extension reports each refresh of each window; servers without it fall back to a 60 Hz timer. `frame_interval()` is measured from Present after about half a second. | A display link per window reports each refresh on macOS 14 and later; older systems use a timer at the screen's refresh rate. Programs are exempt from App Nap while a window waits for a frame. | The compositor's (DWM's) refresh times; a high-resolution timer keeps the waits precise. |
 
 ## Errors
 
@@ -238,8 +309,8 @@ handle `Resize`.
 | Error | When |
 | --- | --- |
 | `NoDisplay` | No window system to connect to: no `DISPLAY` on Linux, no desktop session. |
-| `AlreadyOpen` | Another window is open; a process has one at a time. |
-| `Closed` | The window was closed, or the connection to the window system ended. |
+| `AlreadyOpen` | Another App exists; a process has one at a time. |
+| `Closed` | The window or its App was closed, or the connection to the window system ended. |
 | `InvalidInput` | A zero size, a size above `window.MAX_SIZE` (16384), or an oversized title. |
 | `OutOfMemory` | The pixel buffer could not be allocated. |
 | `Protocol` | The X server refused the connection (usually a missing or wrong cookie) or sent something malformed. |
@@ -248,8 +319,10 @@ handle `Resize`.
 
 ## Limits
 
-One window per process. There is no clipboard, no cursor shapes other than
-hiding the pointer (`set_cursor_visible`), no input methods for Chinese,
-Japanese or Korean text, and no GPU path: frames are copied to the window
-system on every `update`. Native Wayland and drawing straight to the screen
-without a desktop (DRM/KMS) are not implemented yet.
+Windows have no owner relationships yet: a dialog is an ordinary window,
+not kept above the window it belongs to or modal to it, and there are no
+borderless popups or ways to place a window. There is no clipboard, no
+cursor shapes other than hiding the pointer (`set_cursor_visible`), no input
+methods for Chinese, Japanese or Korean text, and no GPU path: frames are
+copied to the window system on every `update`. Native Wayland and drawing
+straight to the screen without a desktop (DRM/KMS) are not implemented yet.

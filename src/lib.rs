@@ -4,6 +4,7 @@
 //! and editor analysis without LLVM. The `llvm` feature enables native codegen
 //! and the LSP server, which uses LLVM to validate compilation targets.
 pub mod ast;
+mod async_desugar;
 pub mod cli;
 #[cfg(feature = "llvm")]
 pub mod codegen;

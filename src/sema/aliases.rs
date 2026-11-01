@@ -244,6 +244,7 @@ fn expression_names(expression: &Expr, names: &mut HashSet<String>) {
         | ExprKind::Unary(_, value)
         | ExprKind::Try(value)
         | ExprKind::Unwrap(value)
+        | ExprKind::Await { value, .. }
         | ExprKind::Field(value, _) => expression_names(value, names),
         ExprKind::Binary(_, a, b) | ExprKind::Index(a, b) | ExprKind::Range(a, b) => {
             expression_names(a, names);
@@ -697,9 +698,10 @@ impl Resolver {
                 self.ty(ty, scope, span, &mut vec![])?;
                 self.expr(value, scope, locals)?;
             }
-            ExprKind::Unary(_, value) | ExprKind::Try(value) | ExprKind::Unwrap(value) => {
-                self.expr(value, scope, locals)?
-            }
+            ExprKind::Unary(_, value)
+            | ExprKind::Try(value)
+            | ExprKind::Unwrap(value)
+            | ExprKind::Await { value, .. } => self.expr(value, scope, locals)?,
             ExprKind::Binary(_, a, b) | ExprKind::Index(a, b) | ExprKind::Range(a, b) => {
                 self.expr(a, scope, locals)?;
                 self.expr(b, scope, locals)?;
