@@ -1,0 +1,390 @@
+package rp_capture
+
+import "std/embedded/chip/rp_pio"
+import "std/embedded/hal"
+
+// Input capture on the RP2040 and RP2350, which have no capture unit: no
+// timer latches its count on a pin's edge, and the PWM slices only count
+// edges (rp_pwm.Capture). A PIO state machine can, though, and this package
+// runs one as a capture channel with the hal.InputCapture protocol. Its
+// program counts down X once every four of its cycles while it watches a
+// pin, and on each edge pushes the count and the new level to the RX FIFO:
+//
+//     ; X counts down from all ones once per 4 cycles; Y holds 1; JMP PIN
+//     ; is the input.
+//     .wrap_target
+//     low:                    ; the pin was low
+//         jmp x-- low_1       ; cycle 1: count
+//     low_1:
+//         jmp pin rose        ; cycle 2: high now?
+//         jmp low [1]         ; cycles 3 and 4
+//     rose:
+//         in y, 1             ; cycle 3: level 1
+//         in x, 31            ; cycle 4: the count's low 31 bits
+//         jmp x-- rose_1      ; cycle 1
+//     rose_1:
+//         push noblock        ; cycle 2
+//     stay:
+//         jmp high [1]        ; cycles 3 and 4
+//     high:                   ; the pin was high
+//         jmp x-- high_1      ; cycle 1: count
+//     high_1:
+//         jmp pin stay        ; cycle 2: still high?
+//         in null, 1          ; cycle 3: level 0
+//         in x, 31            ; cycle 4
+//         jmp x-- fell_1      ; cycle 1
+//     fell_1:
+//         push noblock [2]    ; cycles 2 to 4
+//     .wrap
+//
+// Every path through a 4-cycle step decrements X exactly once, so the count
+// is the time in steps since the state machine started, exactly: the
+// pushed word is the hardware's latch, and a program that reads it late
+// still gets the edge's time. `jmp x--` to the next instruction decrements
+// whatever X holds, and the wrap from the last instruction to the first
+// costs no cycle. X starts at all ones, so the count never relies on what
+// `jmp x--` does to an X of 0 within the first 2^32 steps (the hardware
+// decrements it to all ones, as the datasheets describe; the picoem
+// emulators leave it at 0). The ISR shifts left, so a word holds the new level in bit
+// 31 and the count's low 31 bits below it.
+//
+// What that means for a capture:
+//
+// - Resolution: a tick is 4 state machine cycles, clk_sys / 4 at most:
+//   31.25 MHz (32 ns) at the RP2040's 125 MHz, 37.5 MHz (26.7 ns) at the
+//   RP2350's 150 MHz. A divider in 256ths slows the state machine for
+//   coarser ticks; fractional dividers spread their cycles unevenly, so a
+//   tick may then be one clk_sys cycle early or late, but ticks never
+//   drift. The pin passes the input synchronizer, which delays every edge
+//   by the same two clk_sys cycles.
+// - Short pulses: the pin is sampled once per tick, except in the tick
+//   after an edge, which pushes it. A level must last two ticks to be timed
+//   to the tick; one that lasts less may be timed a tick late, and one
+//   shorter than a tick may be missed.
+// - Depth: the joined RX FIFO holds 8 edges. An edge that finds it full is
+//   dropped and the state machine notes the stall, which poll_event reports
+//   as Overrun; the timing of later edges is unaffected.
+// - Range: the words carry 31 bits of the count, which wraps after 2^31
+//   ticks: 69 s at 31.25 MHz, 36 minutes at 1 MHz. poll_event extends the
+//   count to 64 bits with the chip's microsecond timer, which runs from the
+//   same crystal as clk_sys: an edge must be read within a wrap, less a
+//   millisecond, of happening.
+//
+// With RISING or FALLING, edges the other way are still pushed but not
+// reported, so the FIFO holds 4 of the edges that count, rather than 8.
+
+// The edges to report: rising, falling, or both.
+pub const RISING: u32 = 1
+pub const FALLING: u32 = 2
+pub const BOTH: u32 = 3
+
+// The program's length and the address of `high`, relative to its start.
+const LENGTH: u32 = 14
+const HIGH: u32 = 8
+// Instructions executed on the stopped state machine: `set y, 1`,
+// `mov x, ~null`, and `jmp pin` (with its target added).
+const SET_Y_1: u16 = 0xE041
+const MOV_X_ONES: u16 = 0xA02B
+const JMP_PIN: u16 = 0x00C0
+// The low 31 bits of a pushed word: the count's.
+const COUNT_MASK: u64 = 0x7FFF_FFFF
+// The PIO blocks' RXF0 and their interrupt line 0 enables: IRQ0_INTE at
+// 0x12C on the RP2040 (version 0, RP2040 datasheet 3.7) and 0x170 on the
+// RP2350 (version 1, RP2350 datasheet 11.7).
+const RXF0: usize = 0x020
+const IRQ0_INTE_V0: usize = 0x12C
+const IRQ0_INTE_V1: usize = 0x170
+const SET_ALIAS: usize = 0x2000
+const CLEAR_ALIAS: usize = 0x3000
+
+// The capture program's instructions, in the order shown above, with jump
+// targets relative to its first instruction.
+pub fn program_words() -> [32]u16 {
+    words := [0u16; 32]
+    words[0] = 0x0041
+    words[1] = 0x00C3
+    words[2] = 0x0100
+    words[3] = 0x4041
+    words[4] = 0x403F
+    words[5] = 0x0046
+    words[6] = 0x8000
+    words[7] = 0x0108
+    words[8] = 0x0049
+    words[9] = 0x00C7
+    words[10] = 0x4061
+    words[11] = 0x403F
+    words[12] = 0x004D
+    words[13] = 0x8200
+    return words
+}
+
+// The capture program: its instructions, wrap, a joined RX FIFO, and a
+// left-shifting ISR.
+pub fn program() -> rp_pio.Program {
+    return rp_pio.Program {
+        instructions: program_words(),
+        length: LENGTH,
+        origin: rp_pio.ANYWHERE,
+        wrap_target: 0,
+        wrap: LENGTH - 1,
+        side_set_count: 0,
+        side_set_optional: false,
+        side_set_pindirs: false,
+        version: 0,
+        gpio_ranges: 0,
+        clock_divider: 256,
+        fifo: rp_pio.FIFO_RX,
+        status_select: 0,
+        status_n: 0,
+        in_count: 32,
+        in_right: false,
+        autopush: false,
+        push_threshold: 32,
+        out_count: 0,
+        out_right: true,
+        autopull: false,
+        pull_threshold: 32,
+        set_count: 0,
+    }
+}
+
+// The state machine divider, in 256ths, for ticks of `tick_hz` from a PIO
+// clocked at `clock_hz`: clock_hz / (4 * tick_hz), which must be a whole
+// number of 256ths from 1 to 65535 255/256. At 125 MHz, for example,
+// 31.25 MHz, 10 MHz, or 1 MHz. InvalidInput otherwise.
+pub fn divider(clock_hz: u32, tick_hz: u32) -> u32!hal.Error {
+    scaled := clock_hz as u64 * 64
+    if tick_hz == 0 || scaled % tick_hz as u64 != 0 {
+        return err(hal.Error.InvalidInput)
+    }
+    value := scaled / tick_hz as u64
+    if value < 256 || value > 0xFF_FFFF {
+        return err(hal.Error.InvalidInput)
+    }
+    return ok(value as u32)
+}
+
+// Whether a pushed word records a rising edge (the level after it is 1).
+pub fn word_rising(word: u32) -> bool {
+    return (word >> 31) != 0
+}
+
+// The count of a pushed word, modulo 2^31: the steps since the start, as X
+// counted down from all ones.
+pub fn word_count(word: u32) -> u64 {
+    return (COUNT_MASK - (word as u64 & COUNT_MASK)) & COUNT_MASK
+}
+
+// The full count of an edge whose count modulo 2^31 is `count`, given that
+// it happened at most `latest` ticks after the start: the largest such
+// count up to `latest`. A count beyond `latest`, which only an estimate off
+// by more than its slack gives, is taken as is.
+pub fn extend(count: u64, latest: u64) -> u64 {
+    behind := core.wrapping_sub(latest, count) & COUNT_MASK
+    if behind > latest {
+        return count
+    }
+    return latest - behind
+}
+
+// A capture channel on a PIO state machine; see the package comment.
+// Implements hal.InputCapture.
+pub struct EdgeCapture: hal.InputCapture {
+    machine: rp_pio.StateMachine
+    loaded: rp_pio.Loaded
+    pin: u32
+    edges: u32
+    hz: u32
+    irq: u32
+    // When the state machine started, on the microsecond timer, whose raw
+    // registers these are.
+    start_us: u64
+    high: hal.Reg<u32>
+    low: hal.Reg<u32>
+    // The block's IRQ0_INTE, through its set and clear aliases, and this
+    // state machine's RX-not-empty bit in it.
+    listening: hal.Reg<u32>
+    listen_set: hal.Reg<u32>
+    listen_clear: hal.Reg<u32>
+    source: u32
+    rising: bool
+
+    // Capture `edges` (RISING, FALLING, or BOTH) on GPIO `pin` with a free
+    // state machine of `pio`, clocked at `clock_hz`, in ticks of `tick_hz`
+    // (see `divider`). The program takes 14 of the block's 32 instruction
+    // slots. The pin must be readable: claimed for the block or as an
+    // input. InvalidInput for a pin outside the block's GPIO window
+    // (Pio.set_gpio_base), other edges,
+    // or a rate `divider` refuses; Busy if the block has no free state
+    // machine or room for the program.
+    // SAFETY: `timer` must be the base address of the chip's running
+    // microsecond timer, whose TIMERAWH and TIMERAWL are at 0x24 and 0x28,
+    // and `clock_hz` the PIO's clock, from the same crystal.
+    pub unsafe fn new(pio: &mut rp_pio.Pio, pin: u32, edges: u32, clock_hz: u32, tick_hz: u32, timer: usize) -> EdgeCapture!hal.Error {
+        window := pio.gpio_base()
+        if pin < window || pin - window >= rp_pio.PIN_LIMIT || edges == 0 || edges > BOTH {
+            return err(hal.Error.InvalidInput)
+        }
+        value := divider(clock_hz, tick_hz)?
+        code := program()
+        loaded := pio.load(&code)?
+        machine := match pio.free_state_machine() {
+            ok(found) => found,
+            err(error) => {
+                pio.unload(loaded)
+                return err(error)
+            },
+        }
+        config := loaded.config()
+        // Neither fails: the pin and divider were checked above.
+        config.set_jmp_pin(pin)!
+        config.set_divider(value)!
+        machine.init(&config)
+        machine.exec(SET_Y_1)
+        machine.exec(MOV_X_ONES)
+        // Start in `high` if the pin is high now, so a level present at the
+        // start is no edge.
+        machine.exec(JMP_PIN | (loaded.offset() + HIGH) as u16)
+        index := machine.index()
+        base := machine.rx_fifo_address() - RXF0 - 4 * index as usize
+        inte := base + IRQ0_INTE_V0
+        if pio.version() != 0 {
+            inte = base + IRQ0_INTE_V1
+        }
+        irq := pio.irq(0)
+        unsafe {
+            high: hal.Reg<u32> = hal.Reg.at(timer + 0x24)
+            low: hal.Reg<u32> = hal.Reg.at(timer + 0x28)
+            section := hal.Critical.enter()
+            machine.set_enabled(true)
+            start := read_timer(&high, &low)
+            core.drop(section)
+            return ok(EdgeCapture {
+                machine,
+                loaded,
+                pin,
+                edges,
+                hz: tick_hz,
+                irq,
+                start_us: start,
+                high,
+                low,
+                listening: hal.Reg.at(inte),
+                listen_set: hal.Reg.at(inte + SET_ALIAS),
+                listen_clear: hal.Reg.at(inte + CLEAR_ALIAS),
+                source: rp_pio.rx_not_empty(index),
+                rising: false,
+            })
+        }
+    }
+
+    pub fn tick_hz(&self) -> u32 {
+        return self.hz
+    }
+
+    // The earliest edge not yet reported, as hal.InputCapture.poll_event:
+    // its tick count since the capture started. Overrun if the FIFO was
+    // full when an edge came, so that edge was lost; the edges still in
+    // the FIFO follow.
+    pub fn poll_event(&mut self, ticks: &mut u64) -> bool!hal.Error {
+        if self.machine.take_rx_stall() {
+            return err(hal.Error.Overrun)
+        }
+        for {
+            word := 0u32
+            match self.machine.try_get() {
+                some(value) => {
+                    word = value
+                }
+                none => {
+                    return ok(false)
+                }
+            }
+            rising := word_rising(word)
+            wanted := RISING
+            if !rising {
+                wanted = FALLING
+            }
+            if (self.edges & wanted) != 0 {
+                // The latest the edge can be: now, by the microsecond
+                // timer, and a millisecond's slack for its resolution.
+                now := read_timer(&self.high, &self.low)
+                elapsed := 0u64
+                if now > self.start_us {
+                    elapsed = now - self.start_us
+                }
+                latest := hal.us_to_ticks(elapsed + 1000, self.hz)
+                *ticks = extend(word_count(word), latest)
+                self.rising = rising
+                return ok(true)
+            }
+        }
+    }
+
+    // Whether the edge poll_event last reported rose.
+    pub fn rising(&self) -> bool {
+        return self.rising
+    }
+
+    // The microsecond timer's time when the capture started, tick 0: an
+    // edge at `ticks` came at start_us() + hal.ticks_to_us(ticks, tick_hz).
+    pub fn start_us(&self) -> u64 {
+        return self.start_us
+    }
+
+    pub fn pin(&self) -> u32 {
+        return self.pin
+    }
+
+    pub fn edges(&self) -> u32 {
+        return self.edges
+    }
+
+    // The state machine, 0 to 3, within its block.
+    pub fn machine_index(&self) -> u32 {
+        return self.machine.index()
+    }
+
+    // The block's interrupt line 0, which `listen` raises: its number for
+    // cortex_m.enable, and its vector name, PIOn_IRQ_0, for `@interrupt`.
+    pub fn irq(&self) -> u32 {
+        return self.irq
+    }
+
+    // Raise the block's interrupt line 0 while an edge waits in the FIFO,
+    // including edges `edges` leaves out, which poll_event then drops.
+    pub fn listen(&mut self) {
+        source := self.source
+        self.listen_set.write(source)
+    }
+
+    pub fn ignore(&mut self) {
+        source := self.source
+        self.listen_clear.write(source)
+    }
+
+    pub fn is_listening(&self) -> bool {
+        return (self.listening.read() & self.source) != 0
+    }
+
+    // Stop the state machine and give it and the program back to `pio`,
+    // the block it came from.
+    pub fn release(self, pio: &mut rp_pio.Pio) {
+        self.ignore()
+        let EdgeCapture { machine, loaded, pin, edges, hz, irq, start_us, high, low, listening, listen_set, listen_clear, source, rising } = self
+        pio.release_state_machine(machine)
+        pio.unload(loaded)
+    }
+}
+
+// The timer's 64-bit microsecond count, read high, low, high again until
+// the high word holds still.
+fn read_timer(high: &hal.Reg<u32>, low: &hal.Reg<u32>) -> u64 {
+    for {
+        upper := high.read()
+        lower := low.read()
+        if high.read() == upper {
+            return ((upper as u64) << 32) | lower as u64
+        }
+    }
+}

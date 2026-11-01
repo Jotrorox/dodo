@@ -2567,7 +2567,15 @@ pub fn main() -> i32 {
                 line.starts_with("define") && line.contains(&format!("@dodo.inlining.{name}("))
             })
             .unwrap_or_else(|| panic!("{name} is defined:\n{ir}"));
-        let group = define.rsplit('#').next().unwrap().trim_end_matches(" {");
+        // ELF targets place each function in its own section after the
+        // group: `#0 section ".text.name" {`.
+        let group: String = define
+            .rsplit('#')
+            .next()
+            .unwrap()
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
         ir.lines()
             .find(|line| line.starts_with(&format!("attributes #{group} ")))
             .unwrap()

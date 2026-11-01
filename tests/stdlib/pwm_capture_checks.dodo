@@ -214,7 +214,8 @@ struct PwmView: hal.Registers {
     pub fn read(&mut self, offset: usize) -> u32 {
         core.assert(offset < 0x1000 && offset % 4 == 0)
         word := offset / 4
-        core.assert(word <= interrupt_word())
+        // INTE, the wrap interrupt enables, follows INTR.
+        core.assert(word <= interrupt_word() + 1)
         catch_up()
         unsafe {
             return REGISTERS[word]
@@ -224,9 +225,20 @@ struct PwmView: hal.Registers {
     pub fn write(&mut self, offset: usize, value: u32) {
         alias := offset & 0x3000
         word := (offset & 0xFFF) / 4
-        core.assert(word <= interrupt_word())
+        core.assert(word <= interrupt_word() + 1)
         catch_up()
         unsafe {
+            if word == interrupt_word() + 1 {
+                // INTE: plain storage, through the set and clear aliases.
+                if alias == 0x2000 {
+                    REGISTERS[word] |= value
+                } else if alias == 0x3000 {
+                    REGISTERS[word] &= ~value
+                } else {
+                    REGISTERS[word] = value
+                }
+                return
+            }
             if word == interrupt_word() {
                 // INTR: write 1 to clear, only through the plain address.
                 core.assert(alias == 0)
@@ -657,7 +669,9 @@ fn claims() {
     // Only odd pins, output B, count.
     expect_capture_error(open_result(2, 10_000), hal.Error.InvalidInput)
     expect_capture_error(open_result(30, 10_000), hal.Error.InvalidInput)
-    expect_capture_error(open_result(31, 10_000), hal.Error.InvalidInput)
+    expect_capture_error(open_result(49, 10_000), hal.Error.InvalidInput)
+    // GPIO 33 is output B of slice 8, which only a 12-slice block has.
+    expect_capture_error(open_result(33, 10_000), hal.Error.InvalidInput)
     expect_capture_error(open_result(3, 0), hal.Error.InvalidInput)
     expect_capture_error(open_result(3, 200_000), hal.Error.InvalidInput)
 
@@ -811,6 +825,10 @@ static mut BLOCK_MEMORY: [4096]u32 = [0u32; 4096]
 static mut TIMER_MEMORY: [16]u32 = [0u32; 16]
 
 struct BankChip {
+    pub fn pin_count(&self) -> u32 {
+        return 30
+    }
+
     pub fn route(&mut self, pin: u32, function: u32, clear: u32, set: u32) {
         unsafe {
             FUNCTIONS[pin as usize] = function
@@ -845,6 +863,10 @@ struct BankChip {
 
     pub fn pwm_slices(&self) -> u32 {
         return 8
+    }
+
+    pub fn pwm_irq(&self) -> u32 {
+        return 4
     }
 
     pub fn timer_base(&self) -> usize {

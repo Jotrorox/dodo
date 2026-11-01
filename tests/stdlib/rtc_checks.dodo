@@ -481,13 +481,17 @@ fn expect_calendar_error(result: rp_rtc.Calendar<CalendarModel>!hal.Error, expec
 
 // The power manager's timer registers, with the set and clear aliases. Every
 // write must carry the password. The counter runs from ELAPSED_MS while RUN
-// is set.
+// is set. The tick-source switches show at once, and the frequency and
+// time-reference registers check the datasheet's rules for writing them.
 struct AonModel: hal.Registers {
     timer: u32
     set_time: [4]u32
     alarm_time: [4]u32
     xosc_khz: u32
     xosc_frac: u32
+    lposc_khz: u32
+    lposc_frac: u32
+    ext_time_ref: u32
     inte: u32
     base: u64
     since: u64
@@ -496,7 +500,10 @@ struct AonModel: hal.Registers {
     frozen: bool
 
     fn new() -> AonModel {
-        return AonModel { timer: 0, set_time: [0u32; 4], alarm_time: [0u32; 4], xosc_khz: 12_000, xosc_frac: 0, inte: 0, base: 0, since: 0, writes: 0, frozen: false }
+        return AonModel {
+            timer: 0, set_time: [0u32; 4], alarm_time: [0u32; 4], xosc_khz: 12_000, xosc_frac: 0, lposc_khz: 32, lposc_frac: 0xC49C, ext_time_ref: 0, inte: 0, base: 0, since: 0,
+            writes: 0, frozen: false,
+        }
     }
 
     fn running(&self) -> bool {
@@ -539,8 +546,25 @@ struct AonModel: hal.Registers {
         if offset == 0x88 {
             return self.timer
         }
+        if offset == 0x4C {
+            return self.ext_time_ref
+        }
+        if offset == 0x50 {
+            return self.lposc_khz
+        }
+        if offset == 0x54 {
+            return self.lposc_frac
+        }
+        if offset >= 0x78 && offset <= 0x84 {
+            return self.alarm_time[(offset - 0x78) / 4]
+        }
         core.assert_eq(offset, 0xE4usize)
         return self.inte
+    }
+
+    // The USING_ bit `using` alone of the tick sources.
+    fn tick(&mut self, using: u32) {
+        self.timer = (self.timer & ~(0xFu32 << 16)) | using
     }
 
     pub fn write(&mut self, offset: usize, value: u32) {
@@ -554,21 +578,29 @@ struct AonModel: hal.Registers {
             core.assert(alias != 0)
             self.update()
             was_running := self.running()
+            current := self.now()
             if alias == 0x2000 {
-                if (bits & (1u32 << 9)) != 0 {
-                    // USE_XOSC switches the tick and clears itself.
-                    self.timer |= 1 << 16
+                // USE_LPOSC, USE_XOSC, and USE_GPIO_1KHZ switch the tick
+                // and clear themselves.
+                if (bits & (1u32 << 8)) != 0 {
+                    self.tick(1 << 17)
                 }
-                self.timer |= bits & ((1u32 << 1) | (1u32 << 4))
+                if (bits & (1u32 << 9)) != 0 {
+                    self.tick(1 << 16)
+                }
+                if (bits & (1u32 << 10)) != 0 {
+                    self.tick(1 << 18)
+                }
+                self.timer |= bits & ((1u32 << 1) | (1u32 << 4) | (1u32 << 5))
             } else {
                 core.assert_eq(alias, 0x3000usize)
-                self.timer &= ~(bits & ((1u32 << 1) | (1u32 << 4) | (1u32 << 6)))
+                self.timer &= ~(bits & ((1u32 << 1) | (1u32 << 4) | (1u32 << 5) | (1u32 << 6)))
             }
             if !was_running && self.running() && !self.frozen {
                 self.base = AonModel.join(&self.set_time)
                 self.since = elapsed()
             } else if was_running && !self.running() {
-                self.base = self.now()
+                self.base = current
             }
             self.update()
             return
@@ -582,8 +614,29 @@ struct AonModel: hal.Registers {
             }
             return
         }
+        if register == 0x4C {
+            next := bits
+            if alias == 0x2000 {
+                next = self.ext_time_ref | bits
+            } else if alias == 0x3000 {
+                next = self.ext_time_ref & ~bits
+            }
+            // DRIVE_LPCK changes only while the timer is stopped.
+            if ((next ^ self.ext_time_ref) & (1u32 << 4)) != 0 {
+                core.assert(!self.running())
+            }
+            self.ext_time_ref = next & 0x13
+            return
+        }
         core.assert_eq(alias, 0usize)
-        if register == 0x58 || register == 0x5C {
+        if register == 0x50 || register == 0x54 {
+            core.assert(!self.running() || (self.timer & (1u32 << 16)) != 0)
+            if register == 0x50 {
+                self.lposc_khz = bits
+            } else {
+                self.lposc_frac = bits
+            }
+        } else if register == 0x58 || register == 0x5C {
             core.assert(!self.running() || (self.timer & (1u32 << 16)) == 0)
             if register == 0x58 {
                 self.xosc_khz = bits
@@ -711,6 +764,199 @@ fn aon_timer() {
     expect_error(timer.set_ms(5_000_000), hal.Error.Timeout)
 }
 
+// The tick sources, each keeping the time.
+fn aon_tick_sources() {
+    core.assert(rp_rtc.ext_time_source(12)! == 0 && rp_rtc.ext_time_source(20)! == 1)
+    core.assert(rp_rtc.ext_time_source(14)! == 2 && rp_rtc.ext_time_source(22)! == 3)
+    match rp_rtc.ext_time_source(13) {
+        ok(_) => core.assert(false),
+        err(error) => core.assert(error == hal.Error.InvalidInput),
+    }
+
+    timer := unsafe {
+        rp_rtc.AonTimer.new(AonModel.new(), 12_000_000)!
+    }
+    core.assert(timer.tick_source() == rp_rtc.TICK_CRYSTAL)
+    time_ms := unix_ms(2026, 11, 1, 9, 0, 0)
+    timer.set_ms(time_ms)!
+    advance(1000)
+    // The low-power oscillator at a measured frequency.
+    timer.use_lposc(32_100)!
+    core.assert(timer.tick_source() == rp_rtc.TICK_LPOSC)
+    core.assert_eq(timer.now_ms()!, time_ms + 1000)
+    expect_error(timer.use_lposc(1_999), hal.Error.InvalidInput)
+    expect_error(timer.use_lposc(64_000), hal.Error.InvalidInput)
+    // A new frequency while ticking from it stops the timer meanwhile.
+    timer.use_lposc(31_000)!
+    advance(500)
+    core.assert_eq(timer.now_ms()!, time_ms + 1500)
+    // An external 32 kHz clock replaces the oscillator.
+    timer.use_clock_input(1, 32_768)!
+    core.assert(timer.tick_source() == rp_rtc.TICK_CLOCK_INPUT)
+    advance(250)
+    core.assert_eq(timer.now_ms()!, time_ms + 1750)
+    expect_error(timer.use_clock_input(4, 32_768), hal.Error.InvalidInput)
+    expect_error(timer.use_clock_input(0, 1_000), hal.Error.InvalidInput)
+    model := timer.release()
+    core.assert(model.ext_time_ref == (1u32 | (1u32 << 4)) && model.lposc_khz == 32 && model.lposc_frac == 50_331)
+    timer = unsafe {
+        rp_rtc.AonTimer.new(model, 12_000_000)!
+    }
+    // An external 1 kHz tick, then the crystal again.
+    timer.use_tick_input(3)!
+    core.assert(timer.tick_source() == rp_rtc.TICK_INPUT)
+    core.assert_eq(timer.now_ms()!, time_ms + 1750)
+    expect_error(timer.use_tick_input(5), hal.Error.InvalidInput)
+    timer.use_clock_input(2, 32_768)!
+    timer.use_crystal(12_000_000)!
+    core.assert(timer.tick_source() == rp_rtc.TICK_CRYSTAL)
+    advance(250)
+    core.assert_eq(timer.now_ms()!, time_ms + 2000)
+    expect_error(timer.use_crystal(1_500), hal.Error.InvalidInput)
+    // A crystal of another frequency while ticking from the crystal.
+    timer.use_crystal(16_000_000)!
+    model = timer.release()
+    core.assert((model.ext_time_ref & (1u32 << 4)) == 0 && model.xosc_khz == 16_000 && (model.timer & (1u32 << 16)) != 0)
+}
+
+// A timed dormant state borrows the alarm and the tick, and gives back the
+// program's.
+fn aon_dormant_alarm() {
+    stopped := AonModel.new()
+    refused := unsafe {
+        rp_rtc.aon_borrow_alarm(&mut stopped, 1000, 32_768)
+    }
+    match refused {
+        ok(_) => core.assert(false),
+        err(error) => core.assert(error == hal.Error.Busy),
+    }
+
+    // Running from the crystal, with the program's alarm an hour ahead and
+    // its interrupt on.
+    model := AonModel.new()
+    model.base = unix_ms(2026, 11, 1, 10, 0, 0)
+    model.since = elapsed()
+    model.timer = (1u32 << 1) | (1u32 << 4) | (1u32 << 16)
+    program := model.base + 3_600_000
+    model.alarm_time = [((program >> 48) & 0xFFFF) as u32, ((program >> 32) & 0xFFFF) as u32, ((program >> 16) & 0xFFFF) as u32, (program & 0xFFFF) as u32]
+    model.inte = 2
+    saved := unsafe {
+        rp_rtc.aon_borrow_alarm(&mut model, 5000, 32_500)!
+    }
+    core.assert((model.timer & (1u32 << 17)) != 0 && model.lposc_khz == 32 && model.lposc_frac == 32_768)
+    core.assert(model.inte == 0 && AonModel.join(&model.alarm_time) == model.now() + 5000)
+    core.assert(!rp_rtc.aon_alarm_fired(&mut model))
+    advance(4999)
+    core.assert(!rp_rtc.aon_alarm_fired(&mut model))
+    advance(1)
+    core.assert(rp_rtc.aon_alarm_fired(&mut model))
+    unsafe {
+        rp_rtc.aon_return_alarm(&mut model, saved)!
+    }
+    core.assert((model.timer & (1u32 << 16)) != 0 && model.inte == 2)
+    core.assert(AonModel.join(&model.alarm_time) == program && (model.timer & (1u32 << 4)) != 0)
+    core.assert(!rp_rtc.aon_alarm_fired(&mut model))
+    // The program's alarm still fires at its time.
+    advance(3_600_000)
+    core.assert(rp_rtc.aon_alarm_fired(&mut model))
+
+    // A tick from the oscillator stays; no alarm to give back.
+    quiet := AonModel.new()
+    quiet.timer = (1u32 << 1) | (1u32 << 17)
+    kept := unsafe {
+        rp_rtc.aon_borrow_alarm(&mut quiet, 10, 0)!
+    }
+    core.assert(quiet.lposc_khz == 32 && quiet.lposc_frac == 0xC49C)
+    unsafe {
+        rp_rtc.aon_return_alarm(&mut quiet, kept)!
+    }
+    core.assert((quiet.timer & ((1u32 << 4) | (1u32 << 16))) == 0 && (quiet.timer & (1u32 << 17)) != 0)
+}
+
+// The RP2040's RTC on another clock, and a timed dormant state's alarm.
+fn calendar_clocks() {
+    core.assert_eq(rp_rtc.calendar_divider(32_768)!, 1u32)
+    core.assert_eq(rp_rtc.calendar_divider(65_536)!, 1u32)
+    core.assert_eq(rp_rtc.calendar_divider(1_000_000)!, 16u32)
+    core.assert_eq(rp_rtc.calendar_divider(12_000_000)!, 192u32)
+    refused := [999u32, 65_537]
+    for &input in refused {
+        match rp_rtc.calendar_divider(input) {
+            ok(_) => core.assert(false),
+            err(error) => core.assert(error == hal.Error.InvalidInput),
+        }
+    }
+
+    rtc := unsafe {
+        rp_rtc.Calendar.new(CalendarModel.new(), 31_250)!
+    }
+    // A stopped RTC changes its clock and stays stopped.
+    core.assert(!rtc.pause()!)
+    rtc.resume(32_768, false)!
+    core.assert(!rtc.is_set()!)
+    // A running one keeps its time, which holds while it is paused.
+    time_ms := unix_ms(2026, 11, 1, 12, 0, 0)
+    rtc.set_ms(time_ms)!
+    advance(5_000)
+    running := rtc.pause()!
+    core.assert(running)
+    expect_time_error(rtc.now_ms(), hal.Error.Busy)
+    advance(10_000)
+    expect_error(rtc.resume(0, running), hal.Error.InvalidInput)
+    expect_error(rtc.resume(70_000, running), hal.Error.InvalidInput)
+    rtc.resume(32_768, running)!
+    core.assert_eq(rtc.now_ms()!, time_ms + 5_000)
+    model := rtc.release()
+    core.assert_eq(model.clock_divider, 32_767u32)
+
+    // Borrowing needs a running RTC.
+    unset := unsafe {
+        rp_rtc.calendar_borrow_alarm(&mut model, 1000)
+    }
+    match unset {
+        ok(_) => core.assert(false),
+        err(error) => core.assert(error == hal.Error.Busy),
+    }
+    // Running, with the program's alarm armed and its interrupt forced.
+    now := time_ms / 1000
+    model.enabled = true
+    model.base = now
+    model.since = elapsed()
+    alarm := CalendarModel.fields(now + 3600)
+    setup_0 := alarm[0] | (7u32 << 24) | (1u32 << 28)
+    setup_1 := (alarm[1] & ~(7u32 << 24)) | (7u32 << 28)
+    model.irq_setup_0 = setup_0
+    model.irq_setup_1 = setup_1
+    model.inte = 0
+    model.intf = 1
+    // 2.5 s, rounded up to whole seconds, and one more, as the current
+    // second has begun already.
+    saved := unsafe {
+        rp_rtc.calendar_borrow_alarm(&mut model, 2_500)!
+    }
+    core.assert(model.inte == 1 && model.intf == 0 && (model.irq_setup_0 & (1u32 << 28)) != 0)
+    core.assert(!rp_rtc.calendar_alarm_due(&mut model, &saved) && !model.matching())
+    advance(3_000)
+    core.assert(!rp_rtc.calendar_alarm_due(&mut model, &saved))
+    advance(1_000)
+    core.assert(rp_rtc.calendar_alarm_due(&mut model, &saved) && model.matching())
+    unsafe {
+        rp_rtc.calendar_return_alarm(&mut model, saved)!
+    }
+    core.assert(model.irq_setup_0 == setup_0 && model.irq_setup_1 == setup_1 && model.inte == 0 && model.intf == 1)
+    // Without an alarm of the program's, none comes back.
+    model.irq_setup_0 = 0
+    model.irq_setup_1 = 0
+    model.intf = 0
+    saved = unsafe {
+        rp_rtc.calendar_borrow_alarm(&mut model, 1)!
+    }
+    unsafe {
+        rp_rtc.calendar_return_alarm(&mut model, saved)!
+    }
+    core.assert(model.irq_setup_0 == 0 && model.irq_setup_1 == 0 && model.inte == 0)
+}
+
 // --- A DS3231 on I2C ---------------------------------------------------------
 
 fn ds3231_clock() {
@@ -818,5 +1064,8 @@ fn main() {
     fake_clocks()
     calendar_rtc()
     aon_timer()
+    aon_tick_sources()
+    aon_dormant_alarm()
+    calendar_clocks()
     ds3231_clock()
 }

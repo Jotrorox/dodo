@@ -1,0 +1,838 @@
+package main
+
+import "std/embedded/chip/rp_capture"
+import "std/embedded/chip/rp_pio"
+import "std/embedded/chip/rp_pwm"
+import "std/embedded/chip/rp_timer"
+import "std/embedded/hal"
+import "std/embedded/hal/fake"
+
+// Host checks for the timer protocols at other rates: hal.TickCounter,
+// hal.Compare, hal.PeriodicTimer, and hal.InputCapture, their helpers and
+// fakes; the RP2040 and RP2350 timer alarms (rp_timer.Alarm) as compare
+// channels and periodic timers against a model of the timer block; and PWM
+// slices as periodic timers and counters (rp_pwm.SliceTimer) against a
+// model of the PWM block whose counters run from simulated time, paired
+// with the timer model's microsecond count; and the words, timestamps, and
+// dividers of the PIO capture channel (rp_capture), whose program
+// tests/hal_library.rs checks against the compiler's assembler.
+
+fn expect_error(result: void!hal.Error, expected: hal.Error) {
+    match result {
+        ok() => core.assert(false),
+        err(error) => core.assert(error == expected),
+    }
+}
+
+fn expect_ticks_error(result: u64!hal.Error, expected: hal.Error) {
+    match result {
+        ok(_) => core.assert(false),
+        err(error) => core.assert(error == expected),
+    }
+}
+
+// --- Helpers and fakes ---------------------------------------------------------
+
+// Generic drivers over each protocol.
+fn elapsed_us_of<C: hal.TickCounter>(counter: &C, since: u64) -> u64 {
+    return hal.ticks_to_us(hal.elapsed_ticks(counter, since), counter.tick_hz())
+}
+
+fn pulse_in<C: hal.Compare>(channel: &mut C, ticks: u64) -> void!hal.Error {
+    channel.listen()
+    return hal.schedule_in_ticks(channel, ticks)
+}
+
+fn every_ms<P: hal.PeriodicTimer>(timer: &mut P) -> void!hal.Error {
+    timer.listen()
+    return hal.start_periodic_us(timer, 1000)
+}
+
+fn conversions() {
+    core.assert_eq(hal.ticks_to_us(125_000_000, 125_000_000), 1_000_000u64)
+    core.assert_eq(hal.ticks_to_us(124, 125_000_000), 0u64)
+    core.assert_eq(hal.ticks_to_us(125, 125_000_000), 1u64)
+    core.assert_eq(hal.ticks_to_us(7, 0), 0u64)
+    core.assert_eq(hal.ticks_to_ns(3, 150_000_000), 20u64)
+    core.assert_eq(hal.ticks_to_ns(1, 3), 333_333_333u64)
+    // Large counts neither overflow nor lose their low part.
+    core.assert_eq(hal.ticks_to_us(0xFFFF_FFFF_FFFF_FFFFu64, 1_000_000), 0xFFFF_FFFF_FFFF_FFFFu64)
+    core.assert_eq(hal.ticks_to_us(150_000_000u64 * 86_400 * 365 + 150, 150_000_000), 1_000_000u64 * 86_400 * 365 + 1)
+    core.assert_eq(hal.ticks_to_ns(0xFFFF_FFFF_FFFF_FFFFu64, 1_000), 0xFFFF_FFFF_FFFF_FFFFu64)
+    // Microseconds to ticks round up, so a wait lasts at least that long.
+    core.assert_eq(hal.us_to_ticks(10, 125_000_000), 1250u64)
+    core.assert_eq(hal.us_to_ticks(1, 32_768), 1u64)
+    core.assert_eq(hal.us_to_ticks(1_000_000, 32_768), 32_768u64)
+    core.assert_eq(hal.us_to_ticks(30, 32_768), 1u64)
+    core.assert_eq(hal.us_to_ticks(31, 32_768), 2u64)
+    core.assert_eq(hal.us_to_ticks(0xFFFF_FFFF_FFFF_FFFFu64, 150_000_000), 0xFFFF_FFFF_FFFF_FFFFu64)
+}
+
+fn tick_counters() {
+    counter := fake.TickCounter.new(32_768)
+    core.assert_eq(counter.tick_hz(), 32_768u32)
+    counter.advance(65_536)
+    core.assert_eq(counter.now_ticks(), 65_536u64)
+    core.assert_eq(elapsed_us_of(&counter, 32_768), 1_000_000u64)
+    core.assert_eq(hal.elapsed_ticks(&counter, 70_000), 0u64)
+    dynamic: &dyn hal.TickCounter = &counter
+    core.assert_eq(dynamic.now_ticks(), 65_536u64)
+}
+
+fn compare_channels() {
+    channel := fake.Compare.new(10_000_000)
+    pulse_in(&mut channel, 100)!
+    core.assert(channel.is_armed() && channel.is_listening() && !channel.fired())
+    core.assert_eq(channel.target_ticks(), 100u64)
+    channel.advance(99)
+    core.assert(!channel.fired() && !channel.is_raised())
+    channel.advance(1)
+    core.assert(channel.fired() && channel.is_raised() && !channel.is_armed())
+    hal.wait_for_compare(&mut channel)
+    core.assert(!channel.fired() && !channel.is_raised())
+    // A count already reached fires at once.
+    channel.schedule_at_ticks(5)!
+    core.assert(channel.fired())
+    // Scheduling clears an earlier firing; cancelling stops the next one.
+    hal.schedule_in_ticks(&mut channel, 10)!
+    core.assert(!channel.fired())
+    channel.cancel()
+    channel.advance(20)
+    core.assert(!channel.fired())
+    // A narrower compare register reaches less far.
+    channel.set_reach(0xFFFF)
+    expect_error(hal.schedule_in_ticks(&mut channel, 0x1_0000), hal.Error.InvalidInput)
+    hal.schedule_in_ticks(&mut channel, 0xFFFF)!
+    core.assert_eq(channel.schedules(), 4u32)
+    channel.fail_next(hal.Error.Bus)
+    expect_error(channel.schedule_at_ticks(0), hal.Error.Bus)
+    channel.ignore()
+    core.assert(!channel.is_listening())
+    // Through `dyn`, and as a tick counter.
+    core.assert_eq(hal.elapsed_ticks(&channel, 20), 100u64)
+    channels: [1]&mut dyn hal.Compare = [&mut channel]
+    channels[0].schedule_at_ticks(200)!
+}
+
+fn periodic_timers() {
+    timer := fake.PeriodicTimer.new(1_000_000)
+    every_ms(&mut timer)!
+    core.assert(timer.is_running() && timer.is_listening())
+    core.assert_eq(timer.period_ticks(), 1000u64)
+    core.assert_eq(timer.poll_periods(), 0u32)
+    timer.advance(999)
+    core.assert(!timer.is_raised())
+    timer.advance(1)
+    core.assert(timer.is_raised())
+    core.assert_eq(timer.poll_periods(), 1u32)
+    core.assert(!timer.is_raised())
+    // A late poll counts the periods it missed, and the phase holds.
+    timer.advance(3500)
+    core.assert_eq(hal.wait_periods(&mut timer), 3u32)
+    core.assert_eq(timer.next_ticks(), 5000u64)
+    timer.advance(500)
+    core.assert_eq(timer.poll_periods(), 1u32)
+    // Cancelling stops it and forgets what was not polled.
+    timer.advance(1000)
+    timer.cancel()
+    timer.advance(5000)
+    core.assert_eq(timer.poll_periods(), 0u32)
+    // Periods must be whole ticks to be exact, and within the timer's
+    // range.
+    slow := fake.PeriodicTimer.new(32_768)
+    expect_error(hal.start_periodic_us(&mut slow, 1000), hal.Error.InvalidInput)
+    hal.start_periodic_us(&mut slow, 15_625)!
+    core.assert_eq(slow.period_ticks(), 512u64)
+    expect_error(hal.start_periodic_us(&mut slow, 0), hal.Error.InvalidInput)
+    slow.set_max_period(256)
+    expect_error(slow.start(512), hal.Error.InvalidInput)
+    expect_error(slow.start(0), hal.Error.InvalidInput)
+    slow.fail_next(hal.Error.Busy)
+    expect_error(slow.start(100), hal.Error.Busy)
+    core.assert_eq(slow.starts(), 1u32)
+    timer.advance(25)
+    timers: [1]&mut dyn hal.PeriodicTimer = [&mut timer]
+    timers[0].start(10)!
+    core.assert_eq(timers[0].poll_periods(), 0u32)
+}
+
+fn capture_channels() {
+    input := fake.InputCapture.new(1_000_000)
+    input.listen()
+    ticks := 0u64
+    core.assert(!input.poll_event(&mut ticks)!)
+    expect_ticks_error(hal.capture_ticks(&mut input, 5), hal.Error.Timeout)
+    input.event(120)
+    input.event(250)
+    core.assert(input.is_raised())
+    core.assert_eq(hal.capture_ticks(&mut input, 5)!, 120u64)
+    core.assert_eq(hal.capture_ticks(&mut input, hal.NO_POLL_LIMIT)!, 250u64)
+    core.assert(!input.is_raised())
+    // A full channel loses events and reports it once; those it held are
+    // still read in order.
+    input.set_depth(2)
+    input.event(300)
+    input.event(400)
+    input.event(500)
+    core.assert_eq(input.waiting(), 2usize)
+    expect_ticks_error(hal.capture_ticks(&mut input, 5), hal.Error.Overrun)
+    core.assert_eq(hal.capture_ticks(&mut input, 5)!, 300u64)
+    core.assert_eq(hal.capture_ticks(&mut input, 5)!, 400u64)
+    input.fail_next(hal.Error.Bus)
+    expect_ticks_error(hal.capture_ticks(&mut input, 5), hal.Error.Bus)
+    input.ignore()
+    core.assert(!input.is_listening())
+    inputs: [1]&mut dyn hal.InputCapture = [&mut input]
+    core.assert(!inputs[0].poll_event(&mut ticks)!)
+}
+
+// --- The timer block model -----------------------------------------------------
+
+// A timer block: the 64-bit count, the alarms' targets, ARMED, and the
+// interrupt registers at the chip's INTR offset. Writes to ALARMn arm the
+// alarm; `advance` moves the count on and fires every armed alarm whose
+// target the low 32 bits pass, as the hardware compares for equality.
+static mut TIMER_NOW: u64 = 0
+static mut TIMER_TARGETS: [4]u32 = [0u32; 4]
+static mut TIMER_ARMED: u32 = 0
+static mut TIMER_INTR: u32 = 0
+static mut TIMER_INTE: u32 = 0
+static mut TIMER_INTF: u32 = 0
+static mut TIMER_INTR_OFFSET: usize = 0x34
+static mut TIMER_ALARM_WRITES: u32 = 0
+
+fn reset_timer(intr: usize, now: u64) {
+    unsafe {
+        TIMER_NOW = now
+        TIMER_ARMED = 0
+        TIMER_INTR = 0
+        TIMER_INTE = 0
+        TIMER_INTF = 0
+        TIMER_INTR_OFFSET = intr
+        TIMER_ALARM_WRITES = 0
+    }
+}
+
+fn advance_timer(ticks: u64) {
+    unsafe {
+        before := TIMER_NOW
+        for number in 0usize..4 {
+            bit := 1u32 << number as u32
+            if (TIMER_ARMED & bit) != 0 {
+                // Ticks from the next one until the low 32 bits equal the
+                // target.
+                low := ((before + 1) & 0xFFFF_FFFF) as u32
+                distance := core.wrapping_sub(TIMER_TARGETS[number], low) as u64
+                if distance < ticks {
+                    TIMER_ARMED &= ~bit
+                    TIMER_INTR |= bit
+                }
+            }
+        }
+        TIMER_NOW = before + ticks
+    }
+}
+
+fn timer_word(offset: usize) -> u32 {
+    view := TimerView {}
+    return view.read(offset)
+}
+
+fn alarm_writes() -> u32 {
+    unsafe {
+        return TIMER_ALARM_WRITES
+    }
+}
+
+struct TimerView: rp_timer.Block {
+    pub fn read(&self, offset: usize) -> u32 {
+        unsafe {
+            intr := TIMER_INTR_OFFSET
+            if offset >= 0x10 && offset < 0x20 {
+                return TIMER_TARGETS[(offset - 0x10) / 4]
+            } else if offset == 0x20 {
+                return TIMER_ARMED
+            } else if offset == 0x24 {
+                return (TIMER_NOW >> 32) as u32
+            } else if offset == 0x28 {
+                return (TIMER_NOW & 0xFFFF_FFFF) as u32
+            } else if offset == intr {
+                return TIMER_INTR
+            } else if offset == intr + 4 {
+                return TIMER_INTE
+            } else if offset == intr + 8 {
+                return TIMER_INTF
+            } else if offset == intr + 12 {
+                return (TIMER_INTR | TIMER_INTF) & TIMER_INTE
+            }
+            core.assert(false)
+            return 0
+        }
+    }
+
+    pub fn write(&mut self, offset: usize, value: u32) {
+        alias := offset & 0x3000
+        register := offset & 0xFFF
+        unsafe {
+            intr := TIMER_INTR_OFFSET
+            if register >= 0x10 && register < 0x20 {
+                core.assert(alias == 0)
+                number := (register - 0x10) / 4
+                TIMER_TARGETS[number] = value
+                TIMER_ARMED |= 1u32 << number as u32
+                TIMER_ALARM_WRITES += 1
+            } else if register == 0x20 {
+                // Writing one disarms.
+                core.assert(alias == 0)
+                TIMER_ARMED &= ~value
+            } else if register == intr {
+                // Write one to clear.
+                core.assert(alias == 0)
+                TIMER_INTR &= ~value
+            } else if register == intr + 4 {
+                TIMER_INTE = apply(TIMER_INTE, alias, value)
+            } else if register == intr + 8 {
+                TIMER_INTF = apply(TIMER_INTF, alias, value)
+            } else {
+                core.assert(false)
+            }
+        }
+    }
+}
+
+// A register write through the plain address or an atomic alias.
+fn apply(current: u32, alias: usize, value: u32) -> u32 {
+    if alias == 0 {
+        return value
+    } else if alias == 0x1000 {
+        return current ^ value
+    } else if alias == 0x2000 {
+        return current | value
+    }
+    return current & ~value
+}
+
+fn alarm_on(intr: usize, number: u32, tick_hz: u32) -> rp_timer.Alarm<TimerView> {
+    return unsafe {
+        rp_timer.Alarm.new(TimerView {}, intr, number, tick_hz)
+    }
+}
+
+fn timer_alarms(intr: usize) {
+    // Near the low 32 bits' wrap, so targets wrap too.
+    reset_timer(intr, 0x1_FFFF_FF00)
+    alarm := alarm_on(intr, 2, 1_000_000)
+    core.assert_eq(alarm.number(), 2u32)
+    core.assert_eq(alarm.tick_hz(), 1_000_000u32)
+    core.assert_eq(alarm.now_ticks(), 0x1_FFFF_FF00u64)
+    core.assert_eq(alarm.now(), 0xFFFF_FF00u32)
+
+    // A compare channel: a count ahead fires once it is reached.
+    pulse_in(&mut alarm, 0x200)!
+    core.assert_eq(timer_word(0x18), 0x100u32)
+    core.assert(alarm.is_armed() && alarm.is_listening() && !alarm.fired())
+    core.assert_eq(timer_word(intr + 4), 4u32)
+    advance_timer(0x1FF)
+    core.assert(!alarm.fired())
+    advance_timer(1)
+    core.assert(alarm.fired() && !alarm.is_armed())
+    core.assert_eq(timer_word(intr + 12), 4u32)
+    alarm.clear()
+    core.assert(!alarm.fired())
+    // A count already reached is forced at once, through INTF.
+    alarm.schedule_at_ticks(5)!
+    core.assert(alarm.fired() && !alarm.is_armed())
+    core.assert_eq(timer_word(intr + 8), 4u32)
+    alarm.clear()
+    core.assert_eq(timer_word(intr + 8), 0u32)
+    // Reach: below 2^31 ticks ahead.
+    now := alarm.now_ticks()
+    expect_error(alarm.schedule_at_ticks(now + rp_timer.MAX_AHEAD + 1), hal.Error.InvalidInput)
+    alarm.schedule_at_ticks(now + rp_timer.MAX_AHEAD)!
+    alarm.cancel()
+    core.assert(!alarm.is_armed())
+    advance_timer(rp_timer.MAX_AHEAD + 1)
+    core.assert(!alarm.fired())
+    // The raw target.
+    alarm.schedule_in(10)
+    core.assert_eq(timer_word(0x18), core.wrapping_add(alarm.now(), 10))
+    alarm.cancel()
+
+    // A periodic timer: periods end a whole number of periods after the
+    // start, however late they are polled.
+    start := alarm.now_ticks()
+    expect_error(alarm.start(0), hal.Error.InvalidInput)
+    expect_error(alarm.start(rp_timer.MAX_AHEAD + 1), hal.Error.InvalidInput)
+    alarm.start(1000)!
+    core.assert(alarm.is_periodic() && alarm.is_armed())
+    core.assert_eq(alarm.period_ticks(), 1000u64)
+    core.assert_eq(alarm.next_ticks(), start + 1000)
+    core.assert_eq(alarm.poll_periods(), 0u32)
+    advance_timer(1000)
+    core.assert(alarm.fired())
+    core.assert_eq(alarm.poll_periods(), 1u32)
+    core.assert(!alarm.fired() && alarm.is_armed())
+    core.assert_eq(alarm.next_ticks(), start + 2000)
+    core.assert_eq(timer_word(0x18), ((start + 2000) & 0xFFFF_FFFF) as u32)
+    // Polled 300 ticks late: the next target keeps the phase.
+    advance_timer(1300)
+    core.assert_eq(alarm.poll_periods(), 1u32)
+    core.assert_eq(alarm.next_ticks(), start + 3000)
+    // Polled two and a half periods later: three ended, two of them
+    // missed.
+    advance_timer(3200)
+    core.assert_eq(alarm.poll_periods(), 3u32)
+    core.assert_eq(alarm.next_ticks(), start + 6000)
+    // A poll exactly at the next end.
+    advance_timer(500)
+    core.assert(alarm.fired())
+    core.assert_eq(hal.wait_periods(&mut alarm), 1u32)
+    core.assert_eq(alarm.next_ticks(), start + 7000)
+    // A schedule or cancel ends periodic mode.
+    alarm.cancel()
+    core.assert(!alarm.is_periodic() && !alarm.is_armed())
+    advance_timer(5000)
+    core.assert_eq(alarm.poll_periods(), 0u32)
+    alarm.start(10)!
+    alarm.schedule_in(100)
+    core.assert(!alarm.is_periodic())
+
+    // Through the protocols.
+    every_ms(&mut alarm)!
+    core.assert_eq(alarm.period_ticks(), 1000u64)
+    advance_timer(2500)
+    timers: [1]&mut dyn hal.PeriodicTimer = [&mut alarm]
+    core.assert_eq(timers[0].poll_periods(), 2u32)
+
+    // Release disarms, stops the interrupt, and clears the firing.
+    advance_timer(600)
+    core.assert(alarm.fired())
+    view := alarm.release()
+    core.assert_eq(view.read(0x20) & 4, 0u32)
+    core.assert_eq(view.read(intr), 0u32)
+    core.assert_eq(view.read(intr + 4), 0u32)
+
+    // Another alarm on the same block touches only its own bits.
+    first := alarm_on(intr, 0, 1_000_000)
+    second := alarm_on(intr, 3, 1_000_000)
+    first.listen()
+    second.listen()
+    hal.schedule_in_ticks(&mut first, 10)!
+    hal.schedule_in_ticks(&mut second, 20)!
+    advance_timer(10)
+    core.assert(first.fired() && !second.fired())
+    first.clear()
+    advance_timer(10)
+    core.assert(second.fired() && !first.fired())
+    second.ignore()
+    core.assert_eq(timer_word(intr + 4), 1u32)
+    first.release()
+    second.release()
+    core.assert(alarm_writes() > 0)
+}
+
+// --- The PWM block model -------------------------------------------------------
+
+// A PWM block clocked at 125 MHz, whose slices count while enabled: from
+// BASE_COUNT at BASE_NS, one count per DIV / 16 cycles, wrapping after TOP.
+// A wrap sets the slice's INTR flag (write one to clear). Reads are pure,
+// so the counts and flags are worked out from simulated time; the timer
+// model's microsecond count is that same time, rounded down, as the chips'
+// timers and clk_sys both run from the crystal.
+const PWM_HZ: u32 = 125_000_000
+static mut NOW_NS: u64 = 0
+static mut SLICES: u32 = 8
+static mut CSR: [12]u32 = [0u32; 12]
+static mut DIV: [12]u32 = [16u32; 12]
+static mut TOP: [12]u32 = [0xFFFFu32; 12]
+static mut CC: [12]u32 = [0u32; 12]
+static mut BASE_COUNT: [12]u64 = [0u64; 12]
+static mut BASE_NS: [12]u64 = [0u64; 12]
+// Wraps counted when the flag was last cleared, and a flag set before the
+// counter was last reloaded.
+static mut CLEARED_WRAPS: [12]u64 = [0u64; 12]
+static mut STICKY: [12]bool = [false; 12]
+static mut PWM_INTE: u32 = 0
+
+fn reset_pwm(slices: u32, now_ns: u64) {
+    unsafe {
+        NOW_NS = now_ns
+        SLICES = slices
+        for slice in 0usize..12 {
+            CSR[slice] = 0
+            DIV[slice] = 16
+            TOP[slice] = 0xFFFF
+            CC[slice] = 0
+            BASE_COUNT[slice] = 0
+            BASE_NS[slice] = now_ns
+            CLEARED_WRAPS[slice] = 0
+            STICKY[slice] = false
+        }
+        PWM_INTE = 0
+        TIMER_NOW = now_ns / 1000
+    }
+}
+
+fn advance_ns(nanoseconds: u64) {
+    unsafe {
+        NOW_NS += nanoseconds
+        TIMER_NOW = NOW_NS / 1000
+    }
+}
+
+// Counts since the base, unwrapped.
+fn pwm_total(slice: usize) -> u64 {
+    unsafe {
+        if (CSR[slice] & 1) == 0 {
+            return BASE_COUNT[slice]
+        }
+        // 125 MHz is 2 sixteenths of a cycle per nanosecond.
+        return BASE_COUNT[slice] + (NOW_NS - BASE_NS[slice]) * 2 / DIV[slice] as u64
+    }
+}
+
+fn pwm_wraps(slice: usize) -> u64 {
+    unsafe {
+        return pwm_total(slice) / (TOP[slice] as u64 + 1)
+    }
+}
+
+fn pwm_flag(slice: usize) -> bool {
+    unsafe {
+        return STICKY[slice] || pwm_wraps(slice) > CLEARED_WRAPS[slice]
+    }
+}
+
+// Reload the counter at `count`, keeping a flag that was set.
+fn pwm_reload(slice: usize, count: u64) {
+    unsafe {
+        STICKY[slice] = pwm_flag(slice)
+        BASE_COUNT[slice] = count
+        BASE_NS[slice] = NOW_NS
+        CLEARED_WRAPS[slice] = 0
+    }
+}
+
+fn pwm_intr_offset() -> usize {
+    unsafe {
+        return rp_pwm.interrupt_offset(SLICES)
+    }
+}
+
+fn pwm_csr(slice: usize) -> u32 {
+    unsafe {
+        return CSR[slice]
+    }
+}
+
+fn pwm_inte() -> u32 {
+    unsafe {
+        return PWM_INTE
+    }
+}
+
+// The PWM model, or with `clock` the timer model, as one block type, since
+// a SliceTimer reads both through the same type.
+struct PwmView: rp_timer.Block {
+    clock: bool
+
+    pub fn read(&self, offset: usize) -> u32 {
+        if self.clock {
+            view := TimerView {}
+            return view.read(offset)
+        }
+        intr := pwm_intr_offset()
+        unsafe {
+            if offset < 0x14 * SLICES as usize {
+                slice := offset / 0x14
+                register := offset % 0x14
+                if register == 0 {
+                    return CSR[slice]
+                } else if register == 4 {
+                    return DIV[slice]
+                } else if register == 8 {
+                    return (pwm_total(slice) % (TOP[slice] as u64 + 1)) as u32
+                } else if register == 0xC {
+                    return CC[slice]
+                }
+                return TOP[slice]
+            } else if offset == intr {
+                flags := 0u32
+                for slice in 0usize..12 {
+                    if pwm_flag(slice) {
+                        flags |= 1u32 << slice as u32
+                    }
+                }
+                return flags
+            } else if offset == intr + 4 {
+                return PWM_INTE
+            }
+            core.assert(false)
+            return 0
+        }
+    }
+
+    pub fn write(&mut self, offset: usize, value: u32) {
+        core.assert(!self.clock)
+        alias := offset & 0x3000
+        register := offset & 0xFFF
+        intr := pwm_intr_offset()
+        unsafe {
+            if register < 0x14 * SLICES as usize {
+                core.assert(alias == 0)
+                slice := register / 0x14
+                field := register % 0x14
+                if field == 0 {
+                    // Enabling or disabling keeps the count and the flag.
+                    count := pwm_total(slice)
+                    flag := pwm_flag(slice)
+                    CSR[slice] = value & 0xFF
+                    BASE_COUNT[slice] = count
+                    BASE_NS[slice] = NOW_NS
+                    STICKY[slice] = flag
+                    CLEARED_WRAPS[slice] = count / (TOP[slice] as u64 + 1)
+                } else if field == 4 {
+                    core.assert((CSR[slice] & 1) == 0)
+                    DIV[slice] = value & 0xFFF
+                } else if field == 8 {
+                    pwm_reload(slice, (value & 0xFFFF) as u64)
+                } else if field == 0xC {
+                    CC[slice] = value
+                } else {
+                    // TOP changes only while stopped here, and the counter
+                    // is reloaded after it.
+                    core.assert((CSR[slice] & 1) == 0)
+                    TOP[slice] = value & 0xFFFF
+                }
+            } else if register == intr {
+                core.assert(alias == 0)
+                for slice in 0usize..12 {
+                    if (value & (1u32 << slice as u32)) != 0 {
+                        STICKY[slice] = false
+                        CLEARED_WRAPS[slice] = pwm_wraps(slice)
+                    }
+                }
+            } else if register == intr + 4 {
+                PWM_INTE = apply(PWM_INTE, alias, value)
+            } else {
+                core.assert(false)
+            }
+        }
+    }
+}
+
+fn expect_timer_error(result: rp_pwm.SliceTimer<PwmView>!hal.Error, expected: hal.Error) {
+    match result {
+        ok(timer) => {
+            timer.release()
+            core.assert(false)
+        }
+        err(error) => core.assert(error == expected),
+    }
+}
+
+fn slice_timer(slices: u32, slice: u32, tick_hz: u32) -> rp_pwm.SliceTimer<PwmView>!hal.Error {
+    return unsafe {
+        rp_pwm.SliceTimer.new(PwmView { clock: false }, PwmView { clock: true }, slices, PWM_HZ, slice, tick_hz)
+    }
+}
+
+fn extending_counts() {
+    // The elapsed time picks the period; the count the place in it.
+    core.assert_eq(rp_pwm.extend_count(1234, 570, 1250, 125_000_000), 154_320u64)
+    core.assert_eq(rp_pwm.extend_count(0, 0, 1250, 125_000_000), 0u64)
+    // A microsecond either way still lands on the right period.
+    core.assert_eq(rp_pwm.extend_count(9, 1249, 1250, 125_000_000), 1249u64)
+    core.assert_eq(rp_pwm.extend_count(11, 1, 1250, 125_000_000), 1251u64)
+    core.assert_eq(rp_pwm.extend_count(10, 1, 1250, 125_000_000), 1251u64)
+    core.assert_eq(rp_pwm.extend_count(9, 1, 1250, 125_000_000), 1251u64)
+    // Counts that the time has not reached yet stay in the first period.
+    core.assert_eq(rp_pwm.extend_count(0, 1000, 1250, 125_000_000), 1000u64)
+    // Long times.
+    core.assert_eq(rp_pwm.extend_count(3_600_000_000, 0, 65_536, 125_000_000), 450_000_000_000u64 / 65_536 * 65_536)
+}
+
+fn dividers() {
+    core.assert_eq(rp_pwm.timer_divider(125_000_000, 125_000_000)!, 16u32)
+    core.assert_eq(rp_pwm.timer_divider(125_000_000, 1_000_000)!, 2000u32)
+    core.assert_eq(rp_pwm.timer_divider(125_000_000, 10_000_000)!, 200u32)
+    core.assert_eq(rp_pwm.timer_divider(150_000_000, 600_000)!, 4000u32)
+    match rp_pwm.timer_divider(125_000_000, 3_000_000) {
+        ok(_) => core.assert(false),
+        err(error) => core.assert(error == hal.Error.InvalidInput),
+    }
+    match rp_pwm.timer_divider(125_000_000, 250_000_000) {
+        ok(_) => core.assert(false),
+        err(error) => core.assert(error == hal.Error.InvalidInput),
+    }
+    match rp_pwm.timer_divider(125_000_000, 100_000) {
+        ok(_) => core.assert(false),
+        err(error) => core.assert(error == hal.Error.InvalidInput),
+    }
+    match rp_pwm.timer_divider(125_000_000, 0) {
+        ok(_) => core.assert(false),
+        err(error) => core.assert(error == hal.Error.InvalidInput),
+    }
+}
+
+fn slice_timers(slices: u32) {
+    reset_timer(rp_timer.RP2040_INTR, 0)
+    // Start mid-microsecond, so the timer's count is behind the slice's.
+    reset_pwm(slices, 5_000_500)
+    timer := slice_timer(slices, 3, 10_000_000)!
+    core.assert_eq(rp_pwm.claimed(), 3u32 << 6)
+    core.assert(!timer.is_running())
+    core.assert_eq(timer.slice(), 3u32)
+    core.assert_eq(timer.tick_hz(), 10_000_000u32)
+    core.assert_eq(timer.now_ticks(), 0u64)
+    core.assert_eq(timer.poll_periods(), 0u32)
+    // The slice is taken, by timers and outputs alike.
+    expect_timer_error(slice_timer(slices, 3, PWM_HZ), hal.Error.Busy)
+    expect_timer_error(slice_timer(slices, slices, PWM_HZ), hal.Error.InvalidInput)
+    expect_timer_error(slice_timer(slices, 2, 3_000_000), hal.Error.InvalidInput)
+    core.assert_eq(rp_pwm.claimed(), 3u32 << 6)
+
+    // Periods: 1 to 65536 ticks, at least 8 us.
+    expect_error(timer.start(0), hal.Error.InvalidInput)
+    expect_error(timer.start(65_537), hal.Error.InvalidInput)
+    expect_error(timer.start(79), hal.Error.InvalidInput)
+    every_ms(&mut timer)!
+    core.assert(timer.is_running() && timer.is_listening())
+    core.assert_eq(pwm_inte(), 1u32 << 3)
+    core.assert_eq(timer.period_ticks(), 10_000u64)
+    core.assert_eq(pwm_csr(3), 1u32)
+
+    // 1.234567 ms later: 12345 ticks, one period ended.
+    advance_ns(1_234_567)
+    core.assert_eq(timer.now_ticks(), 12_345u64)
+    core.assert_eq(timer.count(), 2345u32)
+    core.assert(timer.wrapped())
+    core.assert_eq(timer.poll_periods(), 1u32)
+    core.assert(!timer.wrapped())
+    core.assert_eq(timer.poll_periods(), 0u32)
+    // Periods missed while nothing polled are all counted, after any
+    // delay.
+    advance_ns(7_000_000_000)
+    core.assert_eq(timer.now_ticks(), 70_012_345u64)
+    core.assert_eq(timer.poll_periods(), 7000u32)
+    advance_ns(765_433)
+    core.assert_eq(hal.wait_periods(&mut timer), 1u32)
+    core.assert_eq(timer.now_ticks(), 70_020_000u64)
+    // Through a period boundary in steps of 1 ns, ticks never go back and
+    // the period is counted once.
+    counted := 0u32
+    last := timer.now_ticks()
+    for _ in 0..2000 {
+        advance_ns(1)
+        ticks := timer.now_ticks()
+        core.assert(ticks >= last)
+        last = ticks
+        counted += timer.poll_periods()
+    }
+    core.assert_eq(counted, 0u32)
+    advance_ns(998_000)
+    for _ in 0..2000 {
+        advance_ns(1)
+        ticks := timer.now_ticks()
+        core.assert(ticks >= last)
+        last = ticks
+        counted += timer.poll_periods()
+    }
+    core.assert_eq(counted, 1u32)
+
+    // Cancel holds the count; a restart carries on from it.
+    timer.cancel()
+    held := timer.now_ticks()
+    core.assert_eq(pwm_csr(3), 0u32)
+    advance_ns(5_000_000)
+    core.assert_eq(timer.now_ticks(), held)
+    core.assert_eq(timer.poll_periods(), 0u32)
+    timer.start(1250)!
+    advance_ns(125_000)
+    core.assert_eq(timer.now_ticks(), held + 1250)
+    core.assert_eq(timer.poll_periods(), 1u32)
+    timer.ignore()
+    core.assert_eq(pwm_inte(), 0u32)
+
+    // Release gives the slice back.
+    timer.release()
+    core.assert_eq(rp_pwm.claimed(), 0u32)
+    core.assert_eq(pwm_csr(3), 0u32)
+
+    // At 1 MHz, as a hal.PeriodicTimer through `dyn`; on the RP2350 the
+    // slices beyond the pins count too.
+    last_slice := slices - 1
+    micro := slice_timer(slices, last_slice, 1_000_000)!
+    expect_error(micro.start(7), hal.Error.InvalidInput)
+    timers: [1]&mut dyn hal.PeriodicTimer = [&mut micro]
+    timers[0].start(8)!
+    advance_ns(100_000)
+    core.assert_eq(timers[0].poll_periods(), 12u32)
+    counter: &dyn hal.TickCounter = &micro
+    core.assert_eq(counter.now_ticks(), 100u64)
+    micro.release()
+    core.assert_eq(rp_pwm.claimed(), 0u32)
+}
+
+// --- PIO capture ---------------------------------------------------------------
+
+fn pio_capture() {
+    // The program, as tests/hal_library.rs expects the assembler to make it.
+    expected := [0x0041u16, 0x00C3, 0x0100, 0x4041, 0x403F, 0x0046, 0x8000, 0x0108, 0x0049, 0x00C7, 0x4061, 0x403F, 0x004D, 0x8200]
+    program := rp_capture.program()
+    core.assert_eq(program.length, 14u32)
+    core.assert_eq(program.wrap_target, 0u32)
+    core.assert_eq(program.wrap, 13u32)
+    core.assert_eq(program.fifo, rp_pio.FIFO_RX)
+    core.assert(!program.in_right && !program.autopush)
+    for index in 0usize..14 {
+        core.assert_eq(program.instructions[index], expected[index])
+    }
+    for index in 14usize..32 {
+        core.assert_eq(program.instructions[index], 0u16)
+    }
+    // Words: the level in bit 31, and X, counting down from all ones,
+    // below it.
+    core.assert(rp_capture.word_rising(0x8000_0000))
+    core.assert(!rp_capture.word_rising(0x7FFF_FFFF))
+    core.assert_eq(rp_capture.word_count(0x7FFF_FFFF), 0u64)
+    core.assert_eq(rp_capture.word_count(0xFFFF_FFFE), 1u64)
+    core.assert_eq(rp_capture.word_count(0x7FFF_FF9B), 100u64)
+    core.assert_eq(rp_capture.word_count(0x0000_0000), 0x7FFF_FFFFu64)
+    core.assert_eq(rp_capture.word_count(0x8000_0001), 0x7FFF_FFFEu64)
+    // Extension: the largest count up to the latest possible one.
+    core.assert_eq(rp_capture.extend(100, 1100), 100u64)
+    core.assert_eq(rp_capture.extend(100, 0x8000_0000 + 1100), 0x8000_0064u64)
+    core.assert_eq(rp_capture.extend(0x7FFF_FFF0, 0x8000_0010), 0x7FFF_FFF0u64)
+    core.assert_eq(rp_capture.extend(5, 0x3_0000_0004), 0x2_8000_0005u64)
+    core.assert_eq(rp_capture.extend(5, 0x3_0000_0005), 0x3_0000_0005u64)
+    // A count beyond the estimate, as in the first ticks, is taken as is.
+    core.assert_eq(rp_capture.extend(2000, 1000), 2000u64)
+    // Dividers, in 256ths of four cycles per tick.
+    core.assert_eq(rp_capture.divider(125_000_000, 31_250_000)!, 256u32)
+    core.assert_eq(rp_capture.divider(125_000_000, 1_000_000)!, 8000u32)
+    core.assert_eq(rp_capture.divider(150_000_000, 37_500_000)!, 256u32)
+    core.assert_eq(rp_capture.divider(150_000_000, 10_000_000)!, 960u32)
+    rates := [62_500_000u32, 0, 3, 30_000_000]
+    for index in 0usize..4 {
+        match rp_capture.divider(125_000_000, rates[index]) {
+            ok(_) => core.assert(false),
+            err(error) => core.assert(error == hal.Error.InvalidInput),
+        }
+    }
+}
+
+fn main() {
+    conversions()
+    tick_counters()
+    compare_channels()
+    periodic_timers()
+    capture_channels()
+    timer_alarms(rp_timer.RP2040_INTR)
+    timer_alarms(rp_timer.RP2350_INTR)
+    extending_counts()
+    dividers()
+    slice_timers(8)
+    slice_timers(12)
+    pio_capture()
+}

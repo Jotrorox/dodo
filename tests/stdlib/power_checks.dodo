@@ -6,8 +6,9 @@ import "std/embedded/hal/fake"
 import "std/embedded/power"
 
 // std/embedded/power on the host: wake sets, the portable helpers over
-// hal/fake's Power, and the RP2040 and RP2350's shared clock-gating and
-// dormant code against simulated register blocks.
+// hal/fake's Power, and the RP2040 and RP2350's shared clock-gating,
+// dormant, system-clock, and power-down code against simulated register
+// blocks.
 
 const UART: power.Clocks = (1 << 38) | (1 << 39)
 const SPI: power.Clocks = (1 << 24) | (1 << 25)
@@ -92,12 +93,24 @@ fn wake_sets() {
     core.assert(wake.is_empty() && wake.pins() == 0 && wake.events(3) == 0)
     wake.on(3, power.FALLING_EDGE)
     wake.on(3, power.LEVEL_HIGH)
-    wake.on(63, power.RISING_EDGE)
+    wake.on(62, power.RISING_EDGE)
     core.assert(wake.events(3) == (power.FALLING_EDGE | power.LEVEL_HIGH))
-    core.assert(wake.events(63) == power.RISING_EDGE && wake.events(64) == 0)
-    core.assert(wake.pins() == ((1u64 << 3) | (1u64 << 63)) && !wake.is_empty())
+    core.assert(wake.events(62) == power.RISING_EDGE && wake.events(63) == 0 && wake.events(64) == 0)
+    core.assert(wake.pins() == ((1u64 << 3) | (1u64 << 62)) && !wake.is_empty())
     wake.forget(3)
-    core.assert(wake.events(3) == 0 && wake.pins() == 1u64 << 63)
+    core.assert(wake.events(3) == 0 && wake.pins() == 1u64 << 62)
+
+    // A timeout alone is enough; bit 63 of a result is the timeout.
+    timed := power.Wake.new()
+    core.assert(timed.timeout_ms() == 0)
+    timed.after_ms(1500)
+    core.assert(!timed.is_empty() && timed.pins() == 0 && timed.timeout_ms() == 1500)
+    timed.after_ms(20)
+    core.assert(timed.timeout_ms() == 20)
+    timed.forget_timeout()
+    core.assert(timed.is_empty())
+    core.assert(power.by_time(power.BY_TIME | 1) && !power.by_time(1u64 << 62))
+    core.assert(power.woken_pins(power.BY_TIME | 6) == 6 && power.MAX_PINS == 63)
 
     core.assert(power.count(power.NO_CLOCKS) == 0)
     core.assert(power.count(UART | SPI | TIMER) == 5)
@@ -171,6 +184,34 @@ fn fake_power() {
     chip.wake_next_dormant((1u64 << 9) | (1u64 << 12))
     woken = chip.dormant(&wake)!
     core.assert(woken == ((1u64 << 9) | (1u64 << 12)) && chip.requested_events(7) == 0)
+
+    // Timeouts: a pin that changes first wins, else the timeout ends it.
+    wake.after_ms(250)
+    chip.wake_next_dormant(1u64 << 12)
+    woken = chip.dormant(&wake)!
+    core.assert(woken == 1u64 << 12 && chip.requested_timeout_ms() == 250 && chip.dormant_ms() == 0)
+    woken = chip.dormant(&wake)!
+    core.assert(woken == power.BY_TIME && chip.dormant_ms() == 250)
+    woken = power.dormant_for(&mut chip, 1000)!
+    core.assert(power.by_time(woken) && power.woken_pins(woken) == 0 && chip.dormant_ms() == 1250)
+    core.assert(chip.requested_events(9) == 0 && chip.dormant_states() == 5)
+    // A chip whose clocks all stop, or whose clock has no time.
+    chip.refuse_timeouts(false)
+    expect_wake_error(power.dormant_for(&mut chip, 10), hal.Error.Unsupported)
+    chip.refuse_timeouts(true)
+    expect_wake_error(power.dormant_for(&mut chip, 10), hal.Error.Busy)
+    chip.wake_next_dormant(1u64 << 7)
+    woken = power.dormant_until(&mut chip, 7, power.LEVEL_LOW)!
+    core.assert(woken == 1u64 << 7)
+    chip.accept_timeouts()
+    core.assert(power.dormant_for(&mut chip, 10)! == power.BY_TIME)
+}
+
+fn expect_wake_error(result: u64!hal.Error, expected: hal.Error) {
+    match result {
+        ok(_) => core.assert(false),
+        err(error) => core.assert(error == expected),
+    }
 }
 
 fn rp_clock_registers() {
@@ -201,6 +242,9 @@ fn rp_wake_registers() {
     expect_error(rp_power.check_wake(&wake, 30), hal.Error.InvalidInput)
     rp_power.check_wake(&wake, 48)!
     wake.forget(30)
+    timed := power.Wake.new()
+    timed.after_ms(5)
+    rp_power.check_wake(&timed, 30)!
     wake.on(0, power.LEVEL_LOW)
     wake.on(7, power.RISING_EDGE)
     wake.on(9, power.FALLING_EDGE | power.LEVEL_HIGH)
@@ -223,6 +267,31 @@ fn rp_wake_registers() {
 
     rp_power.disarm_wake(&mut io, &plan, &wake)
     core.assert(io.word(0x160) == 0 && io.word(0x164) == 0x0000_0001 && io.word(0x16C) == 0)
+}
+
+// The RP2350B's GPIO 30 to 47 wake it too: six registers from the RP2350's
+// DORMANT_WAKE_INTE0.
+fn rp_wake_high_pins() {
+    io := Block.new()
+    plan := rp_power.Layout {
+        wake_en: 0xAC,
+        sleep_en: 0xB4,
+        rosc_status: 0x1C,
+        dormant_wake_inte: 0x2D8,
+        dormant_wake_ints: 0x308,
+        pin_count: 48,
+    }
+    wake := power.Wake.new()
+    wake.on(47, power.LEVEL_HIGH)
+    wake.on(32, power.FALLING_EDGE)
+    rp_power.check_wake(&wake, 48)!
+    expect_error(rp_power.check_wake(&wake, 30), hal.Error.InvalidInput)
+    rp_power.arm_wake(&mut io, &plan, &wake)
+    core.assert(io.word(0x2E8) == 0x4 && io.word(0x2EC) == 0x2000_0000)
+    io.write(0x31C, 0x2000_0000)
+    core.assert(rp_power.woken_pins(&mut io, &plan, &wake) == 1u64 << 47)
+    rp_power.disarm_wake(&mut io, &plan, &wake)
+    core.assert(io.word(0x2E8) == 0 && io.word(0x2EC) == 0)
 }
 
 fn rp_oscillators() {
@@ -255,10 +324,300 @@ fn rp_oscillators() {
     core.assert(off.writes == 0 && quiet_xosc.writes == 1)
 }
 
+// --- The system clock ---------------------------------------------------------
+
+fn expect_plan(plan: rp_power.SystemClock, hz: u32, from_pll: bool, vco_hz: u32, post1: u32, post2: u32, divider: u32) {
+    core.assert_eq(plan.hz, hz)
+    core.assert(plan.from_pll == from_pll)
+    core.assert_eq(plan.vco_hz, vco_hz)
+    core.assert_eq(plan.post1, post1)
+    core.assert_eq(plan.post2, post2)
+    core.assert_eq(plan.divider, divider)
+}
+
+fn expect_no_plan(result: rp_power.SystemClock!hal.Error) {
+    match result {
+        ok(_) => core.assert(false),
+        err(error) => core.assert(error == hal.Error.InvalidInput),
+    }
+}
+
+// The RP2040's PLL plan, as rp2040.Power.set_system_hz asks for it.
+fn rp2040_plan(hz: u32) -> rp_power.SystemClock!hal.Error {
+    return rp_power.plan_system_clock(12_000_000, hz, 1_500_000_000, 6, 2, 125_000_000)
+}
+
+fn system_clocks() {
+    // The default keeps take()'s settings on either chip.
+    expect_plan(rp2040_plan(125_000_000)!, 125_000_000, true, 1_500_000_000, 6, 2, 1)
+    expect_plan(rp_power.plan_system_clock(12_000_000, 150_000_000, 1_500_000_000, 5, 2, 150_000_000)!, 150_000_000, true, 1_500_000_000, 5, 2, 1)
+    // Whole-number fractions of the crystal stop PLL_SYS.
+    expect_plan(rp2040_plan(12_000_000)!, 12_000_000, false, 0, 1, 1, 1)
+    expect_plan(rp2040_plan(6_000_000)!, 6_000_000, false, 0, 1, 1, 2)
+    expect_plan(rp2040_plan(46_875)!, 46_875, false, 0, 1, 1, 256)
+    // Other rates take the slowest VCO that reaches them, larger post
+    // divider first.
+    expect_plan(rp2040_plan(48_000_000)!, 48_000_000, true, 768_000_000, 4, 4, 1)
+    expect_plan(rp2040_plan(100_000_000)!, 100_000_000, true, 900_000_000, 3, 3, 1)
+    expect_plan(rp2040_plan(120_000_000)!, 120_000_000, true, 840_000_000, 7, 1, 1)
+    // Too fast, nothing, and rates neither reaches.
+    expect_no_plan(rp2040_plan(133_000_000))
+    expect_no_plan(rp2040_plan(0))
+    expect_no_plan(rp2040_plan(7_000_000))
+    expect_no_plan(rp2040_plan(12_000_000 / 257 + 1))
+    // A crystal below the PLL's 5 MHz reference reaches only its own
+    // fractions and the default.
+    expect_no_plan(rp_power.plan_system_clock(1_000_000, 48_000_000, 1_500_000_000, 6, 2, 125_000_000))
+    expect_plan(rp_power.plan_system_clock(1_000_000, 500_000, 1_500_000_000, 6, 2, 125_000_000)!, 500_000, false, 0, 1, 1, 2)
+}
+
+// --- RP2350 power-down ---------------------------------------------------------
+
+const STATE: usize = 0x38
+const AON_TIMER: usize = 0x88
+const PWRUP0: usize = 0x8C
+const RECORD: usize = 0xCC
+const INTE: usize = 0xE4
+const STATE_WAITING: u32 = 1 << 12
+
+// The power manager's registers, with the set and clear aliases. Writes to
+// the protected registers, up to 0xAC, must carry the password. STATE
+// answers a request as told; AON_TIMER's tick switches show at once.
+struct PowmanModel: hal.Registers {
+    words: [64]u32
+    time: u64
+    // A power-up request is pending, the state is invalid, or the power
+    // manager never waits for the processors.
+    pending: bool
+    bad: bool
+    stalled: bool
+
+    fn new() -> PowmanModel {
+        return PowmanModel { words: [0u32; 64], time: 0, pending: false, bad: false, stalled: false }
+    }
+
+    fn word(&self, offset: usize) -> u32 {
+        return self.words[offset / 4]
+    }
+
+    fn set_word(&mut self, offset: usize, value: u32) {
+        self.words[offset / 4] = value
+    }
+
+    pub fn read(&mut self, offset: usize) -> u32 {
+        if offset == 0x70 {
+            return (self.time >> 32) as u32
+        }
+        if offset == 0x74 {
+            return (self.time & 0xFFFF_FFFF) as u32
+        }
+        return self.word(offset)
+    }
+
+    pub fn write(&mut self, offset: usize, value: u32) {
+        alias := offset & 0x3000
+        register := offset & 0xFFF
+        bits := value
+        if register <= 0xAC {
+            core.assert_eq(value >> 16, 0x5AFEu32)
+            bits = value & 0xFFFF
+        }
+        index := register / 4
+        if register == STATE && alias == 0 {
+            request := (bits >> 4) & 0xF
+            state := (self.words[index] & ~(0xF0u32 | STATE_WAITING)) | (request << 4)
+            if self.pending {
+                state |= 1 << 8
+            } else if self.bad {
+                state |= 1 << 10
+            } else if request != 0 && !self.stalled {
+                state |= STATE_WAITING
+            }
+            self.words[index] = state
+            return
+        }
+        if register == AON_TIMER && alias == 0x2000 {
+            if (bits & (1u32 << 8)) != 0 {
+                self.words[index] = (self.words[index] & ~(1u32 << 16)) | (1u32 << 17)
+            }
+            if (bits & (1u32 << 9)) != 0 {
+                self.words[index] = (self.words[index] & ~(1u32 << 17)) | (1u32 << 16)
+            }
+            self.words[index] |= bits & ~((1u32 << 8) | (1u32 << 9))
+            return
+        }
+        if alias == 0x2000 {
+            self.words[index] |= bits
+        } else if alias == 0x3000 {
+            self.words[index] &= ~bits
+        } else {
+            core.assert_eq(alias, 0usize)
+            self.words[index] = bits
+        }
+    }
+}
+
+fn expect_plan_error(result: rp_power.PowerDown!hal.Error) {
+    match result {
+        ok(_) => core.assert(false),
+        err(error) => core.assert(error == hal.Error.InvalidInput),
+    }
+}
+
+fn power_down_plans() {
+    wake := power.Wake.new()
+    expect_plan_error(rp_power.plan_power_down(&wake, 30))
+    wake.on(30, power.LEVEL_LOW)
+    expect_plan_error(rp_power.plan_power_down(&wake, 30))
+    wake.forget(30)
+    // One PWRUP source per pin event: level or edge, low or high.
+    wake.on(3, power.FALLING_EDGE)
+    wake.on(7, power.LEVEL_HIGH | power.RISING_EDGE)
+    wake.after_ms(5000)
+    plan := rp_power.plan_power_down(&wake, 30)!
+    core.assert(plan.count == 3 && plan.timeout_ms == 5000)
+    core.assert(plan.sources[0] == (3u32 | (1u32 << 8)))
+    core.assert(plan.sources[1] == (7u32 | (1u32 << 7)))
+    core.assert(plan.sources[2] == (7u32 | (1u32 << 7) | (1u32 << 8)))
+    wake.on(9, power.LEVEL_LOW)
+    plan = rp_power.plan_power_down(&wake, 30)!
+    core.assert(plan.count == 4 && plan.sources[3] == 9)
+    // Five events are more than POWMAN has sources for.
+    wake.on(10, power.RISING_EDGE)
+    expect_plan_error(rp_power.plan_power_down(&wake, 30))
+    // A timeout alone needs no source.
+    timed := power.Wake.new()
+    timed.after_ms(1)
+    plan = rp_power.plan_power_down(&timed, 30)!
+    core.assert(plan.count == 0 && plan.timeout_ms == 1)
+}
+
+fn expect_power_down(model: &mut PowmanModel, plan: &rp_power.PowerDown, retain: u32, expected: hal.Error) {
+    // SAFETY: simulated registers.
+    result := unsafe {
+        rp_power.enter_power_down(model, plan, retain, 0, 0)
+    }
+    expect_error(result, expected)
+}
+
+fn power_down_registers() {
+    wake := power.Wake.new()
+    wake.on(3, power.FALLING_EDGE)
+    wake.on(7, power.LEVEL_HIGH | power.RISING_EDGE)
+    wake.after_ms(5000)
+    plan := rp_power.plan_power_down(&wake, 30)!
+
+    model := PowmanModel.new()
+    // The always-on timer runs from the crystal; the boot vector and a
+    // fourth source are set from before.
+    model.set_word(AON_TIMER, (1u32 << 1) | (1u32 << 16))
+    model.set_word(0xD0, 0xB007_C0D3)
+    model.set_word(PWRUP0 + 12, 0x41)
+    // SAFETY: simulated registers.
+    unsafe {
+        rp_power.enter_power_down(&mut model, &plan, rp_power.DOMAIN_SRAM0, 0x1_E240, 32_500)!
+    }
+    core.assert(model.word(0xA4) == 1 && (model.word(0x04) & (1u32 << 13)) != 0)
+    // SRAM0 stays as it is at power-up, SRAM1 powers up.
+    core.assert((model.word(0x34) & 3) == 2)
+    core.assert(model.word(0xD0) == 0 && model.word(0xDC) == 0)
+    core.assert(model.word(RECORD) == (0xD0D0_0000u32 | rp_power.DOMAIN_SRAM0 | (1u32 << 8)))
+    core.assert(model.word(PWRUP0) == (3u32 | (1u32 << 8) | (1u32 << 6)))
+    core.assert(model.word(PWRUP0 + 4) == (7u32 | (1u32 << 7) | (1u32 << 6)))
+    core.assert(model.word(PWRUP0 + 8) == (7u32 | (1u32 << 7) | (1u32 << 8) | (1u32 << 6)))
+    core.assert(model.word(PWRUP0 + 12) == 1)
+    // The tick moved to the low-power oscillator at its frequency, and the
+    // alarm powers the chip up.
+    timer := model.word(AON_TIMER)
+    core.assert((timer & (1u32 << 17)) != 0 && (timer & (1u32 << 16)) == 0)
+    core.assert(model.word(0x50) == 32 && model.word(0x54) == 32_768)
+    core.assert((timer & ((1u32 << 4) | (1u32 << 5))) == ((1u32 << 4) | (1u32 << 5)))
+    core.assert(model.word(0x78) == 0 && model.word(0x7C) == 0 && model.word(0x80) == 1 && model.word(0x84) == 0xE240)
+    // The switched core, the XIP cache, and SRAM1 go down.
+    state := model.word(STATE)
+    core.assert(((state >> 4) & 0xF) == 0xD && (state & STATE_WAITING) != 0)
+    core.assert((model.word(INTE) & (1u32 << 3)) != 0)
+    core.assert(!rp_power.power_down_cancelled(&mut model))
+
+    // A power-up request while waiting cancels it.
+    model.set_word(STATE, state | (1u32 << 9))
+    core.assert(rp_power.power_down_cancelled(&mut model))
+    rp_power.cancel_power_down(&mut model)
+    core.assert(model.word(RECORD) == 0 && (model.word(INTE) & (1u32 << 3)) == 0)
+    core.assert((model.word(PWRUP0) & (1u32 << 6)) == 0 && (model.word(PWRUP0 + 8) & (1u32 << 6)) == 0)
+    core.assert((model.word(AON_TIMER) & ((1u32 << 4) | (1u32 << 5))) == 0)
+
+    // Refusals undo the sources.
+    pins := power.Wake.new()
+    pins.on(5, power.LEVEL_LOW)
+    plan = rp_power.plan_power_down(&pins, 30)!
+    ignoring := PowmanModel.new()
+    ignoring.pending = true
+    expect_power_down(&mut ignoring, &plan, rp_power.DOMAIN_SRAM1, hal.Error.Busy)
+    core.assert(ignoring.word(RECORD) == 0 && (ignoring.word(PWRUP0) & (1u32 << 6)) == 0)
+    refusing := PowmanModel.new()
+    refusing.bad = true
+    expect_power_down(&mut refusing, &plan, 0, hal.Error.InvalidInput)
+    stalled := PowmanModel.new()
+    stalled.stalled = true
+    expect_power_down(&mut stalled, &plan, 0, hal.Error.Timeout)
+    core.assert(((stalled.word(STATE) >> 4) & 0xF) == 0)
+    expect_power_down(&mut stalled, &plan, rp_power.DOMAIN_XIP, hal.Error.InvalidInput)
+
+    // Nothing kept, no timeout, a tick from the oscillator already.
+    quiet := PowmanModel.new()
+    quiet.set_word(AON_TIMER, (1u32 << 1) | (1u32 << 17))
+    // SAFETY: simulated registers.
+    unsafe {
+        rp_power.enter_power_down(&mut quiet, &plan, 0, 0, 32_500)!
+    }
+    core.assert(quiet.word(RECORD) == 0xD0D0_0000 && quiet.word(0x50) == 0)
+    core.assert((quiet.word(0x34) & 3) == 0 && ((quiet.word(STATE) >> 4) & 0xF) == 0xF)
+    core.assert((quiet.word(AON_TIMER) & (1u32 << 5)) == 0 && quiet.word(PWRUP0) == (5u32 | (1u32 << 6)))
+}
+
+fn power_down_wakes() {
+    model := PowmanModel.new()
+    model.set_word(RECORD, 0xD0D0_0000u32 | rp_power.DOMAIN_SRAM0 | (1u32 << 8))
+    model.set_word(0x2C, 1u32 << 25)
+    model.set_word(PWRUP0, 3u32 | (1u32 << 8) | (1u32 << 6))
+    model.set_word(PWRUP0 + 4, 7u32 | (1u32 << 7) | (1u32 << 6))
+    model.set_word(AON_TIMER, (1u32 << 1) | (1u32 << 5))
+    // PWRUP1 and the alarm powered the chip up.
+    model.set_word(0xA0, (1u32 << 2) | (1u32 << 6))
+    // SAFETY: simulated registers.
+    found := unsafe {
+        rp_power.take_power_down_wake(&mut model)
+    }
+    core.assert(found.happened && found.woken == ((1u64 << 7) | power.BY_TIME))
+    core.assert(found.retained == rp_power.DOMAIN_SRAM0 && found.crystal_tick)
+    core.assert(model.word(RECORD) == 0 && (model.word(PWRUP0) & (1u32 << 6)) == 0 && (model.word(PWRUP0 + 4) & (1u32 << 6)) == 0)
+    core.assert((model.word(AON_TIMER) & (1u32 << 5)) == 0)
+    // The next reset finds no record.
+    // SAFETY: simulated registers.
+    again := unsafe {
+        rp_power.take_power_down_wake(&mut model)
+    }
+    core.assert(!again.happened && again.woken == 0 && again.retained == 0 && !again.crystal_tick)
+    // A record, but the reset was another one, such as the watchdog's.
+    model.set_word(RECORD, 0xD0D0_0003)
+    model.set_word(0x2C, 1u32 << 28)
+    // SAFETY: simulated registers.
+    other := unsafe {
+        rp_power.take_power_down_wake(&mut model)
+    }
+    core.assert(!other.happened && model.word(RECORD) == 0)
+}
+
 fn main() {
     wake_sets()
     fake_power()
     rp_clock_registers()
     rp_wake_registers()
+    rp_wake_high_pins()
     rp_oscillators()
+    system_clocks()
+    power_down_plans()
+    power_down_registers()
+    power_down_wakes()
 }
