@@ -59,7 +59,7 @@ codec packages (see [below](#stdgraphicsimage)).
 | QOI | RGB and RGBA, sRGB or linear | RGB, or RGBA when the source has alpha |
 | BMP | 1, 4 and 8-bit palettes, RLE8 and RLE4; 16, 24 and 32-bit with or without bit-field masks; bottom-up or top-down; OS/2 core, V4 and V5 headers with sRGB or an embedded ICC profile | 24-bit, or 32-bit with a V5 header and alpha mask when the source has alpha |
 | PNG | Every color type and bit depth, `PLTE`, `tRNS`, Adam7, `cICP`, `iCCP`, `sRGB`, `gAMA`, `cHRM`, `cLLi`, `eXIf`, XMP in `iTXt`; APNG animation | Gray, gray+alpha, RGB or RGBA at 8 or 16 bits, or indexed; stored or deflate levels 1 to 9; any filter; Adam7; `sRGB`, `eXIf`, `iCCP` |
-| JPEG XL (`Format.Jxl`) | Bare codestreams and the ISOBMFF container (`jxlc`, split `jxlp`, `Exif`, `xml `, Brotli-compressed `brob` boxes decoded by `meta.decode`); lossless and lossy modular, VarDCT with every block type, progressive passes and LF frames, recompressed JPEG (4:4:4, 4:2:2, 4:2:0, gray), patches, splines, noise, Gaborish and EPF, upsampling, animation with blending and reference frames, up to 4096 extra channels (each decodable on its own, spot colors rendered); output U8, U16 or F32 by bit depth, XYB converted to the file's color encoding; embedded ICC profiles via `image.icc` | Lossless modular at efforts 1 to 3: 8 and 16-bit integer or exact 16/32-bit float samples, gray, RGB, alpha; prefix codes (effort 1) or ANS when smaller (efforts 2 and 3); embedded ICC profiles; or lossy VarDCT in XYB at a Butteraugli distance (efforts 1 to 9: adaptive quantization, Gaborish, varblocks up to 64x64, chroma from luma; prefix codes; alpha kept lossless); bare codestream or container with `Exif`/`xml ` boxes |
+| JPEG XL (`Format.Jxl`) | Bare codestreams and the ISOBMFF container (`jxlc`, split `jxlp`, `Exif`, `xml `, Brotli-compressed `brob` boxes decoded by `meta.decode`); lossless and lossy modular, VarDCT with every block type, progressive passes and LF frames, recompressed JPEG (4:4:4, 4:2:2, 4:2:0, gray), patches, splines, noise, Gaborish and EPF, upsampling, animation with blending and reference frames, up to 4096 extra channels (each decodable on its own, spot colors rendered); output U8, U16 or F32 by bit depth, XYB converted to the file's color encoding; embedded ICC profiles via `image.icc` (lossy files with a profile decode to sRGB) | Lossless modular at efforts 1 to 3: 8 and 16-bit integer or exact 16/32-bit float samples, gray, RGB, alpha; or lossy VarDCT in XYB at a Butteraugli distance (efforts 1 to 9: adaptive quantization, Gaborish, varblocks up to 64x64, chroma from luma; alpha kept lossless); prefix codes (effort 1) or tuned hybrid integers and ANS when smaller (effort 2 and up); embedded RGB and gray ICC profiles (lossy: samples converted to XYB through the profile); bare codestream or container with `Exif`/`xml ` boxes |
 
 ASCII Netpbm (P1 to P3), P4 bitmaps, and BMP JPEG/PNG compression fail with
 `Unsupported`.
@@ -144,7 +144,11 @@ starts at the TIFF header whatever its encoding; for a `brob` box `output`
 must also hold the 4-byte offset field that precedes it. Brotli decoding
 keeps 256 KiB of workspace on the stack.
 `image.icc(&data, &mut output, &mut scratch)` returns the decoded ICC profile
-directly; only JPEG XL needs scratch (`image.icc_scratch_size(&data)`). PNG
+directly; only JPEG XL needs scratch (`image.icc_scratch_size(&data)`). It
+is the profile of the decoded pixels: lossy (XYB) JPEG XL files with an
+embedded profile decode to sRGB, so `header.color` is sRGB and `image.icc`
+returns 0 for them, while `image.metadata` lists the profile and `jxl.icc`
+extracts it. PNG
 finds `eXIf`, `iTXt` with the keyword `XML:com.adobe.xmp`, and `iCCP` before or
 after the image data. `header.orientation` comes from the EXIF orientation tag;
 `header.display_width()` and `display_height()` account for it.
@@ -183,14 +187,14 @@ the table above lists; float sources are clamped to 0.0 to 1.0 except in PFM.
 - `image.encode_scratch_size(format, &source, &options)` is the scratch
   `encode` needs: the deflate encoder's buffer and workspace for compressed
   PNG (about 350 KiB), JPEG XL's group planes and histograms plus, at effort
-  2 and up, ANS tables and a token buffer (about 0.4 to 4 MiB), nothing
-  otherwise.
+  2 and up, ANS tables and a token buffer (about 0.4 to 4 MiB lossless, 3 to
+  9 MiB lossy), nothing otherwise.
 - `image.encode_with_metadata(format, &source, &options, &exif, &icc, ...)`
   also writes a TIFF-structured EXIF payload and an ICC profile where the
   format stores them (PNG `eXIf` and `iCCP`; JPEG XL an `Exif` box and the
   embedded profile, left out when it is not an RGB or gray profile matching
-  the image); add `image.metadata_size(format, exif.len, icc.len)` to the
-  output size.
+  the image, or when lossy encoding cannot convert from it, see below); add
+  `image.metadata_size(format, exif.len, icc.len)` to the output size.
 - `image.encode_canvas` encodes a graphics canvas, read as 8-bit RGBA.
 
 `image.format_from_extension("photo.png")` and `image.extension(&format)` map
@@ -224,7 +228,7 @@ The codec options:
 | `std/image/ppm` | `kind`: `KIND_AUTO`, `KIND_PGM` (P5), `KIND_PPM` (P6), `KIND_PAM` (P7), `KIND_PFM`. |
 | `std/image/qoi` | `channels` (0 for automatic, 3 or 4), `linear` (the colorspace byte). |
 | `std/image/bmp` | `alpha`: write 32-bit with alpha when the source has it (default), or always 24-bit. |
-| `std/image/jxl/encode` | `lossless` (default true) and `distance` (Butteraugli distance of lossy encoding, default 1.0, 0.05 to 25; `EncodeOptions.lossy(d)`, `distance_from_quality(q)` maps cjxl's 0 to 100 quality), `effort` (lossless 1 to 3, higher values behave like 3: 1 uses prefix codes, 2 and 3 tune the hybrid integer coding per cluster and switch to ANS when that is smaller; lossy 1 to 9: 1 DCT8 with uniform quantization, 2 adds adaptive quantization, inverse Gaborish and chroma from luma, 3 to 6 the varblock search up to 32x32 and per-block quant adjustment, 7 to 9 also 64x64), `container` (ISOBMFF boxes instead of a bare codestream), `color` (a `ColorInfo` written as the JPEG XL color encoding), `orientation`. `encode_with_metadata` adds `Exif` and `xml ` boxes and embeds `Metadata.with_icc(exif, xmp, icc)`'s ICC profile (predictively coded as in libjxl; it then replaces `color`; an RGB profile for RGB(A), gray for gray, else `Unsupported`; `icc_fits` checks; lossless only); size with `max_encoded_size_with_metadata`. |
+| `std/image/jxl/encode` | `lossless` (default true) and `distance` (Butteraugli distance of lossy encoding, default 1.0, 0.05 to 25; `EncodeOptions.lossy(d)`, `distance_from_quality(q)` maps cjxl's 0 to 100 quality), `effort` (lossless 1 to 3, higher values behave like 3: 1 uses prefix codes, 2 and 3 tune the hybrid integer coding per cluster and switch to ANS when that is smaller; lossy 1 to 9: 1 DCT8 with uniform quantization, 2 adds adaptive quantization, inverse Gaborish and chroma from luma, 3 to 6 the varblock search up to 32x32 and per-block quant adjustment, 7 to 9 also 64x64; lossy entropy coding follows the lossless levels, prefix codes at 1, tuned hybrid integers and ANS when smaller from 2), `container` (ISOBMFF boxes instead of a bare codestream), `color` (a `ColorInfo` written as the JPEG XL color encoding), `orientation`. `encode_with_metadata` adds `Exif` and `xml ` boxes and embeds `Metadata.with_icc(exif, xmp, icc)`'s ICC profile (predictively coded as in libjxl; it then replaces `color`; an RGB profile for RGB(A), gray for gray, else `Unsupported`; `icc_fits` checks). Lossy encoding converts the samples to XYB through the profile as a color management system reads it (the AToB lookup table of its rendering intent, else its matrix/TRC model or gray curve; relative colorimetric) and embeds it as libjxl does, so decoders with color management render into it; profiles it cannot convert from give `Unsupported` (`icc_usable(icc, layout, options)` checks both). Size with `max_encoded_size_with_metadata`. |
 | `std/image/png` | `level` (0 stored, 1 to 9 deflate), `filter` (`FILTER_NONE` to `FILTER_PAETH`, or `FILTER_ADAPTIVE`), `interlace` (Adam7), `palette` (an indexed PNG of 1 to 8 bits with `tRNS` when an 8-bit source has at most 256 RGBA colors), `srgb_chunk`. |
 
 `std/image/jxl` adds `frame_info` and `decode_frame` for animations, `icc`
@@ -427,12 +431,16 @@ and JPEG XL have frames (`decode_frame`). Lossy JPEG XL matches libjxl's
 adaptive LF smoothing follow current libjxl, which smooths each channel at
 its own size (`djxl` 0.12 cannot decode them); subsampled frames with
 varblocks larger than 8x8 are invalid and fail `Malformed`, as in libjxl.
-The JPEG XL encoder embeds only RGB and gray ICC profiles (no CMYK), in
-lossless mode only. Lossy encoding uses prefix codes (no ANS), keeps alpha
-lossless, uses the default dequantization matrices, natural coefficient
-orders and the 8x8 DCT only among the 8x8 transforms (no DCT4, AFV or
-identity blocks), and analyzes every group twice (once only in images up to
-2048x2048 pixels). JPEG XL scratch follows the image header, not
+The JPEG XL encoder embeds only RGB and gray ICC profiles (no CMYK). Lossy
+encoding with a profile needs one it can convert from: an AToB lookup table
+of type lutAtoB, lut16 or lut8 (XYZ or Lab connection space), a matrix/TRC
+RGB profile, or a gray profile's curve; profiles with float DToB tables,
+gray profiles with lookup tables and anything else fail `Unsupported`
+(`std/image` leaves them out). The conversion is relative colorimetric,
+ignoring white points. Lossy encoding keeps alpha lossless, uses the
+default dequantization matrices, natural coefficient orders and the 8x8 DCT
+only among the 8x8 transforms (no DCT4, AFV or identity blocks), and
+analyzes every group twice (once only in images up to 2048x2048 pixels). JPEG XL scratch follows the image header, not
 the frame sizes a file claims: each frame is decoded over the part that
 can reach the output, so with W' = width + 1100, H' = height + 1100 and
 C = 3 + extra channels (all of them, up to 4096), `scratch_size` stays
