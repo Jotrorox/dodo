@@ -684,8 +684,12 @@ fn vm_finish_op(L: *mut State, ci: *mut CallInfo) -> void!Throw {
             (*L).top = ptr.offset((*L).top, -1)
             set_obj(ptr.offset(base, arg_a(inst) as isize), (*L).top)
         } else if op == OP_LT || op == OP_LE || op == OP_LTI || op == OP_LEI || op == OP_GTI || op == OP_GEI || op == OP_EQ {
-            let res = !val_is_falsy(ptr.offset((*L).top, -1))
+            res := !val_is_falsy(ptr.offset((*L).top, -1))
             (*L).top = ptr.offset((*L).top, -1)
+            if ((*ci).callstatus & CIST_LEQ) != 0 {
+                (*ci).callstatus = (*ci).callstatus & ~CIST_LEQ
+                res = !res
+            }
             if res != arg_k(inst) {
                 (*ci).savedpc = ptr.offset((*ci).savedpc, 1)
             }

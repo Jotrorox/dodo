@@ -328,6 +328,21 @@ fn meta_call_order(L: *mut State, p1: *mut Value, p2: *mut Value, event: u32) ->
         if val_is_nil(tm) {
             tm = meta_get_tm_by_obj(L, p2, event)
         }
+        if val_is_nil(tm) && event == TM_LE {
+            // LUA_COMPAT_LT_LE (on in the reference build): a <= b is
+            // not (b < a) when only __lt exists.
+            tm = meta_get_tm_by_obj(L, p2, TM_LT)
+            if val_is_nil(tm) {
+                tm = meta_get_tm_by_obj(L, p1, TM_LT)
+            }
+            if !val_is_nil(tm) {
+                let ci = (*L).ci
+                (*ci).callstatus = (*ci).callstatus | CIST_LEQ
+                let res = meta_call_tm_bool(L, tm, p2, p1)?
+                (*ci).callstatus = (*ci).callstatus & ~CIST_LEQ
+                return ok(!res)
+            }
+        }
         if val_is_nil(tm) {
             return err(err_order(L, p1, p2))
         }
