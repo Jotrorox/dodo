@@ -728,6 +728,15 @@ fn capture_checks() {
     core.assert(steady.update(0, 0, 0, 80_000, false, false, &mut capture)! && capture.high_ns == 0)
     // Counter wrap: Overrun, and the next measurement has begun.
     expect_error(steady.update(5, 100_000, 90_000, 120_000, false, true, &mut capture), hal.Error.Overrun)
+    // Edges read several periods apart (a signal faster than the reads):
+    // the high time is the rise-to-fall time modulo the period.
+    stale := esp_capture.Tracker.new(40_000_000, 1000)
+    stale.restart(1, 0, 0, false)
+    core.assert(stale.update(11, 400_000, 400_000 - 30_000 - 120_000, 400_010, true, false, &mut capture)!)
+    core.assert(capture.cycles == 10 && capture.period_ns == 1_000_000 && capture.high_ns == 250_000)
+    stale.restart(0, 400_000, 400_010, true)
+    core.assert(stale.update(10, 800_000, 800_000 + 10_000 - 3 * 40_000 + 40_000 * 2, 800_000 + 30_000, false, false, &mut capture)!)
+    core.assert(capture.high_ns == 250_000)
     // Times wrap with the 32-bit capture timer.
     core.assert_eq(esp_capture.ticks_between(5, 0xFFFF_FFFB), 10u32)
     wrapping := esp_capture.Tracker.new(40_000_000, 1000)

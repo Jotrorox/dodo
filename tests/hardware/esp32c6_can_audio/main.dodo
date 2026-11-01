@@ -296,15 +296,32 @@ fn can_checks(b: &mut board.Board) {
     bus.set_high()
     route_in(TWAI0_RX, PIN_H)
     route_in(TWAI1_RX, PIN_H)
+    // A controller takes part only after 11 recessive bits of idle bus
+    // (550 us at 20 kbit/s); before that it acknowledges nothing.
+    b.timer.delay_ms(2)
     hello: [4]u8 = [0xCA, 0xFE, 0xBA, 0xBE]
     request := hal.CanFrame.extended(0x18DA_F110, &hello)!
     reply := hal.CanFrame.standard(0x7E8, &hello[0..2])!
     there := exchange(&mut first, &mut second, &request) && exchange(&mut second, &mut first, &reply)
     say_values("can exchange tec, tec, ok ", first.tec() as u64, second.tec() as u64, flag(there))
+    say_values("can exchange error codes ", first.error_code() as u64, second.error_code() as u64, 0)
     check(there && first.tec() == 0 && second.tec() == 0 && state_code(&mut first) == 0)
     b.pins.release(bus)
     b.pins.release_can(first)
     b.pins.release_can(second)
+}
+
+// The system timer in microseconds, without a Timer.
+fn timer_now() -> u64 {
+    // SAFETY: unit 0's update and value registers only latch the count.
+    unsafe {
+        update: hal.Reg<u32> = hal.Reg.at(0x6000_A004)
+        high: hal.Reg<u32> = hal.Reg.at(0x6000_A040)
+        low: hal.Reg<u32> = hal.Reg.at(0x6000_A044)
+        update.write(1u32 << 30)
+        for (update.read() & (1u32 << 29)) == 0 {}
+        return ((high.read() as u64) << 32 | low.read() as u64) >> 4
+    }
 }
 
 // Send `frame` from `sender` to `receiver` over the software wired AND:
@@ -312,34 +329,51 @@ fn can_checks(b: &mut board.Board) {
 fn exchange(sender: &mut chip.Can, receiver: &mut chip.Can, frame: &hal.CanFrame) -> bool {
     tx_mask := (1u32 << sender.tx_pin()) | (1u32 << receiver.tx_pin())
     bus_mask := 1u32 << PIN_H
-    match sender.poll_send(frame) {
-        ok(queued) => {
-            if !queued {
-                return false
-            }
-        }
-        err(_) => {
-            return false
-        }
-    }
-    // SAFETY: the test owns PIN_H and only reads the TX pads.
+    // SAFETY: the test owns PIN_H and only reads the TX pads and the
+    // controllers' status registers.
     unsafe {
         input: hal.Reg<u32> = hal.Reg.at(0x6009_103C)
         set: hal.Reg<u32> = hal.Reg.at(0x6009_1008)
         clear: hal.Reg<u32> = hal.Reg.at(0x6009_100C)
-        for _ in 0..100 {
-            section := hal.Critical.enter()
-            for _ in 0..5000 {
-                if (input.read() & tx_mask) == tx_mask {
-                    set.write(bus_mask)
-                } else {
-                    clear.write(bus_mask)
+        // The sender's STATUS (transmit buffer free, bit 2) and the
+        // receiver's RX_MESSAGE_CNT, read between bus updates.
+        sent: hal.Reg<u32> = hal.Reg.at(0x6000_B008 + 0x2000 * sender.number() as usize)
+        waiting: hal.Reg<u32> = hal.Reg.at(0x6000_B074 + 0x2000 * receiver.number() as usize)
+        done := false
+        rounds := 0u32
+        begin := timer_now()
+        section := hal.Critical.enter()
+        for round in 0u32..2_000_000 {
+            rounds = round
+            if round == 0 {
+                // Request the frame from inside the loop, so the bus
+                // follows the start of frame at once.
+                match sender.poll_send(frame) {
+                    ok(queued) => {
+                        if !queued {
+                            break
+                        }
+                    }
+                    err(_) => {
+                        break
+                    }
                 }
             }
-            core.drop(section)
-            if !sender.is_pending() && receiver.waiting() > 0 {
-                return receive_same(receiver, frame)
+            if (input.read() & tx_mask) == tx_mask {
+                set.write(bus_mask)
+            } else {
+                clear.write(bus_mask)
             }
+            if (round & 63) == 0 && (sent.read() & 4) != 0 && (waiting.read() & 0x7F) != 0 {
+                done = true
+                break
+            }
+        }
+        set.write(bus_mask)
+        core.drop(section)
+        say_values("can bus loop rounds, us ", rounds as u64, timer_now() - begin, 0)
+        if done {
+            return receive_same(receiver, frame)
         }
     }
     return false
@@ -425,22 +459,6 @@ fn loopback(b: &mut board.Board, config: &esp_i2s.Config, frames: u32) -> bool {
         say_values("i2s loopback found at, same, silent ", found as u64, flag(same), flag(silent))
         return same && silent
     }
-}
-
-fn peek(address: usize) -> u64 {
-    unsafe {
-        register: hal.Reg<u32> = hal.Reg.at(address)
-        return register.read() as u64
-    }
-}
-
-// Diagnostics: the output's GDMA channel and the I2S transmitter.
-fn dump(channel: u32, played: u64) {
-    base := 0x6008_0070 + 0xC0 * channel as usize
-    say_values("dma link, state, dscr ", peek(base + 0x70), peek(base + 0x74), peek(base + 0x80))
-    say_values("dma raw, conf0, peri ", peek(0x6008_0030 + 0x10 * channel as usize), peek(base + 0x60), peek(base + 0x90))
-    say_values("i2s state, conf, conf1 ", peek(0x6000_C06C), peek(0x6000_C024), peek(0x6000_C02C))
-    say_values("pcr clkm, div, played ", peek(0x6009_6070), peek(0x6009_6074), played)
 }
 
 // WS and data at each rising edge of BCLK, bit 0 and bit 1.
@@ -535,25 +553,38 @@ fn wire_check(b: &mut board.Board, config: &esp_i2s.Config, left: i32, right: i3
 // timer: frames read between two descriptor completions about 800 ms
 // apart, reading all the while (an input nobody reads stops).
 fn measured_rate(b: &mut board.Board, input: &mut chip.I2sInput) -> u64 {
-    samples := [0i32; 256]
-    channels := input.channels() as u64
-    // Drain what waits, then catch a completion.
-    for input.poll_read(&mut samples)! > 0 {}
-    for input.poll_read(&mut samples)! == 0 {}
-    start := b.timer.now_us()
-    frames := 0u64
-    end := start
-    for end - start < 800_000 {
-        got := input.poll_read(&mut samples)!
-        if got > 0 {
-            frames += got as u64 / channels
-            end = b.timer.now_us()
+    samples := [0i32; 1024]
+    per := input.frames_per_descriptor() as u64
+    // Time completions in a tight loop; drain only right after one, so a
+    // drain never delays the next detection.
+    previous := input.frames_received()
+    start := 0u64
+    first := 0u64
+    end := 0u64
+    last := 0u64
+    for {
+        now_frames := input.frames_received()
+        if now_frames != previous {
+            now := b.timer.now_us()
+            if start == 0 {
+                start = now
+                first = now_frames
+            } else {
+                end = now
+                last = now_frames
+            }
+            previous = now_frames
+            if end > start && end - start >= 800_000 {
+                break
+            }
+            // Drain while the next descriptor fills.
+            for input.poll_read(&mut samples)! > 0 {}
         }
     }
-    // Finish the last batch, so `frames` ends on a descriptor boundary.
-    for input.poll_read(&mut samples)! > 0 {}
-    remainder := frames % input.frames_per_descriptor() as u64
-    frames -= remainder
+    frames := last - first
+    if frames % per != 0 {
+        return 0
+    }
     return frames * 1_000_000_000 / (end - start)
 }
 

@@ -29,12 +29,18 @@ import "std/embedded/hal"
 // slow signal is exact to 6.25 ns, and averaging over many cycles makes a
 // fast signal's period finer still (6.25 ns / cycles): a 1 MHz signal
 // measured over a 10 ms window averages 10000 periods, to under a
-// picosecond. The high time is the last period's, to 6.25 ns. Signals up
-// to about 10 MHz count (the PCNT
-// needs a high and low phase of a few APB cycles each, and its glitch
-// filter is off); at the fastest, a poll may need several tries to read
-// a consistent snapshot. A period up to the window can be measured, and
-// windows run from 1 us to 25 s (WINDOW_MAX_US), within the capture
+// picosecond. The high time is the last period's, to 6.25 ns, taken as the
+// time from the latest rising to the latest falling edge modulo the
+// period, so it holds however many periods lie between them. A consistent
+// reading needs a period longer than the four register reads, about
+// 0.3 us at -O2 and 1 us at -O0; on the ESP32-C6-DevKitC-1, 10 Hz, 1 kHz,
+// 100 kHz, and 1 MHz measured exactly at every optimization level, and
+// slower signals only need a longer window. Faster signals, up to about 10 MHz (the PCNT needs a
+// high and low phase of a few APB cycles each; its glitch filter is off),
+// use the last try's reading, whose count can be off by the few edges that
+// came during the reads: a 4 MHz signal measured within 0.5% over a 1 ms
+// window, with its high time exact. A period up to the window can be
+// measured, and windows run from 1 us to 25 s (WINDOW_MAX_US), within the capture
 // timer's wrap; a signal slower than the window gives measurements with
 // cycles 0 in between (see hal.PulseCapture). Polls must come at least
 // every 32767 rising edges (32 ms at 1 MHz), or the counter wraps and the
