@@ -80,6 +80,20 @@ fn mth_num(cx: &mut Cx, arg: i32, out: &mut f64) -> void!Throw {
     }
 }
 
+// Integer value of argument `arg` (as check_integer), with a fast path for
+// plain integers.
+fn mth_int(cx: &mut Cx, arg: i32, out: &mut i64) -> void!Throw {
+    unsafe {
+        let v = cx.idx2val(arg)
+        if (*v).tag == TAG_INT {
+            *out = val_int(v)
+            return ok()
+        }
+        *out = cx.check_integer(arg)?
+        return ok()
+    }
+}
+
 // Push a float, as an integer when it has an exact integer representation.
 fn mth_push_numint(cx: &mut Cx, d: f64) {
     unsafe {
@@ -343,10 +357,19 @@ fn mth_extreme(cx: &mut Cx, want_max: bool) -> i32!Throw {
         cx.arg_check(n >= 1, 1, "value expected")?
         best := 1i32
         for i in 2i32..(n + 1) {
-            let better = if want_max {
-                cx.compare(best, i, OPLT)?
+            let vb = cx.idx2val(best)
+            let vi = cx.idx2val(i)
+            better := false
+            if both_numbers(vb, vi) {
+                better = if want_max {
+                    num_lt(vb, vi)
+                } else {
+                    num_lt(vi, vb)
+                }
+            } else if want_max {
+                better = cx.compare(best, i, OPLT)?
             } else {
-                cx.compare(i, best, OPLT)?
+                better = cx.compare(i, best, OPLT)?
             }
             if better {
                 best = i
@@ -516,7 +539,8 @@ fn rnd_seed_default(cx: &mut Cx, s: *mut u64) {
 
 fn rnd_state(cx: &mut Cx) -> *mut u64 {
     unsafe {
-        return cx.to_userdata(upvalue_index(1)) as *mut u64
+        let uv = cx.idx2val(upvalue_index(1))
+        return udata_data(val_gc(uv) as *mut Udata) as *mut u64
     }
 }
 
@@ -554,18 +578,20 @@ fn mth_random(cx: &mut Cx) -> i32!Throw {
             cx.push_number(((rv >> 11) as f64) * (0.5 / 4503599627370496.0))
             return ok(1)
         } else if n == 1 {
-            up = cx.check_integer(1)?
+            mth_int(cx, 1, &mut up)?
             if up == 0 {
                 cx.push_integer(u2i(rv))
                 return ok(1)
             }
         } else if n == 2 {
-            low = cx.check_integer(1)?
-            up = cx.check_integer(2)?
+            mth_int(cx, 1, &mut low)?
+            mth_int(cx, 2, &mut up)?
         } else {
             return err(cx.error_msg("wrong number of arguments"))
         }
-        cx.arg_check(low <= up, 1, "interval is empty")?
+        if low > up {
+            return err(cx.arg_error(1, "interval is empty"))
+        }
         let span = core.wrapping_sub(mth_bits_u(up), mth_bits_u(low))
         let p = rnd_project(rv, span, s)
         cx.push_integer(u2i(core.wrapping_add(p, mth_bits_u(low))))
