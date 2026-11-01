@@ -6,27 +6,27 @@ import "core/ptr"
 // Code generator: turns the parser's expression descriptions into Lua 5.4
 // instructions. The parser (parse.dodo) drives it; every routine here works
 // on the function being compiled (`FnState`) and on expression descriptors
-// (`Exp`) whose code generation may be delayed so that operands can become
+// (`CgExp`) whose code generation may be delayed so that operands can become
 // immediates or constants, results can land directly in their final
 // register, and boolean expressions can be compiled as jumps.
 //
 // Jump lists: a pending jump is a JMP whose sJ field links to the next jump
-// of the same list (an offset of NO_JUMP ends the list). A conditional jump
+// of the same list (an offset of CG_NO_JUMP ends the list). A conditional jump
 // is a test/comparison instruction followed by such a JMP.
 
-const NO_JUMP: i32 = -1
+const CG_NO_JUMP: i32 = -1
 // "No register" marker for TESTSET patching (a register that never exists).
-const NO_REG: i32 = 255
+const CG_NO_REG: i32 = 255
 // Constant indices usable directly as an RK operand.
-const MAXINDEXRK: i32 = 255
+const CG_MAXINDEXRK: i32 = 255
 // Number of results "all of them" (calls, varargs, returns).
-const LUA_MULTRET: i32 = -1
+const CG_MULTRET: i32 = -1
 // lineinfo marker of an instruction whose line is in abslineinfo.
-const ABSLINEINFO: i32 = -128
+const CG_ABSLINEINFO: i32 = -128
 // At most this many relative entries between two absolute ones.
-const MAXIWTHABS: i32 = 128
-// Registers available to a function (the A field is 8 bits; 255 = NO_REG).
-const MAXREGS: i32 = 255
+const CG_MAXIWTHABS: i32 = 128
+// Registers available to a function (the A field is 8 bits; 255 = CG_NO_REG).
+const CG_MAXREGS: i32 = 255
 
 // Expression kinds. The order matters: the variable kinds form the range
 // EK_LOCAL..EK_INDEXSTR and the indexed kinds EK_INDEXED..EK_INDEXSTR.
@@ -100,7 +100,7 @@ const UOPR_LEN: i32 = 3
 const UOPR_NONE: i32 = 4
 
 // An expression whose code may not have been generated yet.
-struct Exp {
+struct CgExp {
     k: i32
     info: i32
     ridx: i32
@@ -121,8 +121,8 @@ struct Exp {
 struct FnState {
     f: *mut Proto
     prev: *mut FnState
-    cx: *mut Cmp
-    scope: *mut Scope
+    cx: *mut CompileState
+    scope: *mut ParScope
     // Next instruction position.
     pc: i32
     // Last position that is a jump target.
@@ -153,49 +153,49 @@ unsafe extern "C" fn cg_c_floor(x: f64) -> f64
 
 // --- Expression descriptor helpers -----------------------------------------
 
-fn exp_init(e: *mut Exp, k: i32, info: i32) {
+fn ex_init(e: *mut CgExp, k: i32, info: i32) {
     unsafe {
         (*e).k = k
         (*e).info = info
-        (*e).t = NO_JUMP
-        (*e).f = NO_JUMP
+        (*e).t = CG_NO_JUMP
+        (*e).f = CG_NO_JUMP
     }
 }
 
-fn exp_copy(dst: *mut Exp, src: *mut Exp) {
+fn ex_copy(dst: *mut CgExp, src: *mut CgExp) {
     unsafe { ptr.copy_nonoverlapping(src, dst, 1) }
 }
 
-fn exp_swap(a: *mut Exp, b: *mut Exp) {
+fn ex_swap(a: *mut CgExp, b: *mut CgExp) {
     unsafe {
-        tmp := exp_blank()
+        tmp := ex_blank()
         let pt = ptr.from_mut(&mut tmp)
-        exp_copy(pt, a)
-        exp_copy(a, b)
-        exp_copy(b, pt)
+        ex_copy(pt, a)
+        ex_copy(a, b)
+        ex_copy(b, pt)
     }
 }
 
-fn exp_blank() -> Exp {
+fn ex_blank() -> CgExp {
     unsafe {
-        return Exp {
+        return CgExp {
             k: EK_VOID, info: 0, ridx: 0, vidx: 0, tab: 0, key: 0, ival: 0, nval: 0.0,
-            sval: 0 as *mut LString, t: NO_JUMP, f: NO_JUMP,
+            sval: 0 as *mut LString, t: CG_NO_JUMP, f: CG_NO_JUMP,
         }
     }
 }
 
-fn exp_has_jumps(e: *mut Exp) -> bool {
+fn ex_has_jumps(e: *mut CgExp) -> bool {
     unsafe { return (*e).t != (*e).f }
 }
 
-fn exp_multret(k: i32) -> bool {
+fn ex_multret(k: i32) -> bool {
     return k == EK_CALL || k == EK_VARARG
 }
 
 // --- Numbers -----------------------------------------------------------------
 
-fn f64_bits(x: f64) -> u64 {
+fn cg_f64_bits(x: f64) -> u64 {
     unsafe {
         v := x
         unsafe { return *(ptr.from_mut(&mut v) as *mut u64) }
@@ -204,7 +204,7 @@ fn f64_bits(x: f64) -> u64 {
 
 // Exact float -> integer conversion (no rounding); false if `n` is not
 // integral or does not fit.
-fn flt_to_int_exact(n: f64, out: *mut i64) -> bool {
+fn cg_flt_to_int(n: f64, out: *mut i64) -> bool {
     unsafe {
         let fl = cg_c_floor(n)
         if fl != n {
@@ -219,7 +219,7 @@ fn flt_to_int_exact(n: f64, out: *mut i64) -> bool {
 }
 
 // Lua integer modulus (floored); n != 0.
-fn int_mod(m: i64, n: i64) -> i64 {
+fn cg_imod(m: i64, n: i64) -> i64 {
     if n == -1 {
         return 0
     }
@@ -231,7 +231,7 @@ fn int_mod(m: i64, n: i64) -> i64 {
 }
 
 // Lua integer floor division; n != 0.
-fn int_idiv(m: i64, n: i64) -> i64 {
+fn cg_idiv(m: i64, n: i64) -> i64 {
     if n == -1 {
         return core.wrapping_sub(0i64, m)
     }
@@ -242,30 +242,30 @@ fn int_idiv(m: i64, n: i64) -> i64 {
     return q
 }
 
-fn int_shiftl(x: i64, y: i64) -> i64 {
-    let ux = i64_to_u64(x)
+fn cg_shiftl(x: i64, y: i64) -> i64 {
+    let ux = cg_i2u(x)
     if y < 0 {
         if y <= -64 {
             return 0
         }
-        return u64_to_i64(ux >> ((0 - y) as u64))
+        return cg_u2i(ux >> ((0 - y) as u64))
     }
     if y >= 64 {
         return 0
     }
     // Checked shifts trap when bits fall off: drop them first.
     let keep = 0xFFFFFFFFFFFFFFFFu64 >> (y as u64)
-    return u64_to_i64((ux & keep) << (y as u64))
+    return cg_u2i((ux & keep) << (y as u64))
 }
 
-fn i64_to_u64(x: i64) -> u64 {
+fn cg_i2u(x: i64) -> u64 {
     unsafe { return *(ptr.from_ref(&x) as *mut u64) }
 }
-fn u64_to_i64(x: u64) -> i64 {
+fn cg_u2i(x: u64) -> i64 {
     unsafe { return *(ptr.from_ref(&x) as *mut i64) }
 }
 
-fn flt_mod(a: f64, b: f64) -> f64 {
+fn cg_fmod(a: f64, b: f64) -> f64 {
     unsafe {
         m := cg_c_fmod(a, b)
         if (m > 0.0 && b < 0.0) || (m < 0.0 && b > 0.0) {
@@ -276,13 +276,13 @@ fn flt_mod(a: f64, b: f64) -> f64 {
 }
 
 // A numeric operand of constant folding.
-struct Num {
+struct CgNum {
     isint: bool
     i: i64
     n: f64
 }
 
-fn num_tofloat(x: *mut Num) -> f64 {
+fn cg_num_tofloat(x: *mut CgNum) -> f64 {
     unsafe {
         if (*x).isint {
             return (*x).i as f64
@@ -291,24 +291,24 @@ fn num_tofloat(x: *mut Num) -> f64 {
     }
 }
 
-fn num_toint(x: *mut Num, out: *mut i64) -> bool {
+fn cg_num_toint(x: *mut CgNum, out: *mut i64) -> bool {
     unsafe {
         if (*x).isint {
             *out = (*x).i
             return true
         }
-        return flt_to_int_exact((*x).n, out)
+        return cg_flt_to_int((*x).n, out)
     }
 }
 
 // Fold `a op b` into `res`; false if the operation could raise an error
 // or the operands are not numbers of the right kind.
-fn num_arith(op: i32, a: *mut Num, b: *mut Num, res: *mut Num) -> bool {
+fn cg_num_arith(op: i32, a: *mut CgNum, b: *mut CgNum, res: *mut CgNum) -> bool {
     unsafe {
         if op == OPR_BAND || op == OPR_BOR || op == OPR_BXOR || op == OPR_SHL || op == OPR_SHR || op == FOLD_BNOT {
             x := 0i64
             y := 0i64
-            if !num_toint(a, ptr.from_mut(&mut x)) || !num_toint(b, ptr.from_mut(&mut y)) {
+            if !cg_num_toint(a, ptr.from_mut(&mut x)) || !cg_num_toint(b, ptr.from_mut(&mut y)) {
                 return false
             }
             (*res).isint = true
@@ -319,17 +319,17 @@ fn num_arith(op: i32, a: *mut Num, b: *mut Num, res: *mut Num) -> bool {
             } else if op == OPR_BXOR {
                 (*res).i = x ^ y
             } else if op == OPR_SHL {
-                (*res).i = int_shiftl(x, y)
+                (*res).i = cg_shiftl(x, y)
             } else if op == OPR_SHR {
-                (*res).i = int_shiftl(x, core.wrapping_sub(0i64, y))
+                (*res).i = cg_shiftl(x, core.wrapping_sub(0i64, y))
             } else {
                 (*res).i = x ^ -1
             }
             return true
         }
         if op == OPR_DIV || op == OPR_POW {
-            let x = num_tofloat(a)
-            let y = num_tofloat(b)
+            let x = cg_num_tofloat(a)
+            let y = cg_num_tofloat(b)
             (*res).isint = false
             if op == OPR_DIV {
                 (*res).n = x / y
@@ -351,16 +351,16 @@ fn num_arith(op: i32, a: *mut Num, b: *mut Num, res: *mut Num) -> bool {
             } else if op == OPR_MUL {
                 (*res).i = core.wrapping_mul(x, y)
             } else if op == OPR_MOD {
-                (*res).i = int_mod(x, y)
+                (*res).i = cg_imod(x, y)
             } else if op == OPR_IDIV {
-                (*res).i = int_idiv(x, y)
+                (*res).i = cg_idiv(x, y)
             } else {
                 (*res).i = core.wrapping_sub(0i64, x)
             }
             return true
         }
-        let x = num_tofloat(a)
-        let y = num_tofloat(b)
+        let x = cg_num_tofloat(a)
+        let y = cg_num_tofloat(b)
         (*res).isint = false
         if op == OPR_ADD {
             (*res).n = x + y
@@ -369,7 +369,7 @@ fn num_arith(op: i32, a: *mut Num, b: *mut Num, res: *mut Num) -> bool {
         } else if op == OPR_MUL {
             (*res).n = x * y
         } else if op == OPR_MOD {
-            (*res).n = flt_mod(x, y)
+            (*res).n = cg_fmod(x, y)
         } else if op == OPR_IDIV {
             (*res).n = cg_c_floor(x / y)
         } else {
@@ -380,9 +380,9 @@ fn num_arith(op: i32, a: *mut Num, b: *mut Num, res: *mut Num) -> bool {
 }
 
 // If `e` is a numeral without jumps, store it into `out` and return true.
-fn exp_numeral(e: *mut Exp, out: *mut Num) -> bool {
+fn ex_numeral(e: *mut CgExp, out: *mut CgNum) -> bool {
     unsafe {
-        if exp_has_jumps(e) {
+        if ex_has_jumps(e) {
             return false
         }
         if (*e).k == EK_KINT {
@@ -399,32 +399,32 @@ fn exp_numeral(e: *mut Exp, out: *mut Num) -> bool {
     }
 }
 
-fn exp_is_numeral(e: *mut Exp) -> bool {
+fn ex_is_numeral(e: *mut CgExp) -> bool {
     unsafe {
-        n := Num { isint: false, i: 0, n: 0.0 }
-        return exp_numeral(e, ptr.from_mut(&mut n))
+        n := CgNum { isint: false, i: 0, n: 0.0 }
+        return ex_numeral(e, ptr.from_mut(&mut n))
     }
 }
 
 // Try to fold `e1 op e2` into e1. Folding is refused when it could raise an
 // error at run time (division by zero, non-integral bitwise operands) and
 // when the result would be NaN or a float zero (whose sign could be lost).
-fn cg_fold(op: i32, e1: *mut Exp, e2: *mut Exp) -> bool {
+fn cg_fold(op: i32, e1: *mut CgExp, e2: *mut CgExp) -> bool {
     unsafe {
-        a := Num { isint: false, i: 0, n: 0.0 }
-        b := Num { isint: false, i: 0, n: 0.0 }
-        r := Num { isint: false, i: 0, n: 0.0 }
+        a := CgNum { isint: false, i: 0, n: 0.0 }
+        b := CgNum { isint: false, i: 0, n: 0.0 }
+        r := CgNum { isint: false, i: 0, n: 0.0 }
         let pa = ptr.from_mut(&mut a)
         let pb = ptr.from_mut(&mut b)
-        if !exp_numeral(e1, pa) || !exp_numeral(e2, pb) {
+        if !ex_numeral(e1, pa) || !ex_numeral(e2, pb) {
             return false
         }
         if op == OPR_DIV || op == OPR_IDIV || op == OPR_MOD {
-            if num_tofloat(pb) == 0.0 {
+            if cg_num_tofloat(pb) == 0.0 {
                 return false
             }
         }
-        if !num_arith(op, pa, pb, ptr.from_mut(&mut r)) {
+        if !cg_num_arith(op, pa, pb, ptr.from_mut(&mut r)) {
             return false
         }
         if r.isint {
@@ -496,7 +496,7 @@ fn cg_line_add(fs: *mut FnState, line: i32) -> void!Throw {
         } else {
             let old = (*fs).since_abs
             (*fs).since_abs = old + 1
-            if old >= MAXIWTHABS {
+            if old >= CG_MAXIWTHABS {
                 absolute = true
             }
         }
@@ -509,7 +509,7 @@ fn cg_line_add(fs: *mut FnState, line: i32) -> void!Throw {
             (*slot).pc = pc
             (*slot).line = line
             (*fs).nabs = (*fs).nabs + 1
-            diff = ABSLINEINFO
+            diff = CG_ABSLINEINFO
             (*fs).since_abs = 1
         }
         cap2 := (*f).sizelineinfo
@@ -528,12 +528,12 @@ fn cg_line_drop(fs: *mut FnState) {
         let f = (*fs).f
         let pc = (*fs).pc - 1
         let d = *ptr.offset((*f).lineinfo, pc as isize) as i32
-        if d != ABSLINEINFO {
+        if d != CG_ABSLINEINFO {
             (*fs).prevline = (*fs).prevline - d
             (*fs).since_abs = (*fs).since_abs - 1
         } else {
             (*fs).nabs = (*fs).nabs - 1
-            (*fs).since_abs = MAXIWTHABS + 1
+            (*fs).since_abs = CG_MAXIWTHABS + 1
         }
     }
 }
@@ -617,7 +617,7 @@ fn cg_need_regs(fs: *mut FnState, n: i32) -> void!Throw {
     unsafe {
         let top = (*fs).free_reg + n
         if top > (*(*fs).f).maxstacksize as i32 {
-            if top >= MAXREGS {
+            if top >= CG_MAXREGS {
                 return err(lex_error_here((*fs).cx, "function or expression needs too many registers"))
             }
             (*(*fs).f).maxstacksize = top as u8
@@ -653,7 +653,7 @@ fn cg_release_pair(fs: *mut FnState, r1: i32, r2: i32) {
     }
 }
 
-fn cg_release_exp(fs: *mut FnState, e: *mut Exp) {
+fn cg_release_exp(fs: *mut FnState, e: *mut CgExp) {
     unsafe {
         if (*e).k == EK_FIXED {
             cg_release_reg(fs, (*e).info)
@@ -661,7 +661,7 @@ fn cg_release_exp(fs: *mut FnState, e: *mut Exp) {
     }
 }
 
-fn cg_release_both(fs: *mut FnState, e1: *mut Exp, e2: *mut Exp) {
+fn cg_release_both(fs: *mut FnState, e1: *mut CgExp, e2: *mut CgExp) {
     unsafe {
         r1 := -1i32
         r2 := -1i32
@@ -680,8 +680,8 @@ fn cg_release_both(fs: *mut FnState, e1: *mut Exp, e2: *mut Exp) {
 fn cg_next_jump(fs: *mut FnState, pc: i32) -> i32 {
     unsafe {
         let off = arg_sj(*cg_instr(fs, pc))
-        if off == NO_JUMP {
-            return NO_JUMP
+        if off == CG_NO_JUMP {
+            return CG_NO_JUMP
         }
         return pc + 1 + off
     }
@@ -701,16 +701,16 @@ fn cg_set_target(fs: *mut FnState, pc: i32, dest: i32) -> void!Throw {
 
 // Append list l2 to list l1; returns the head of the combined list.
 fn cg_join_lists(fs: *mut FnState, l1: i32, l2: i32) -> i32!Throw {
-    if l2 == NO_JUMP {
+    if l2 == CG_NO_JUMP {
         return ok(l1)
     }
-    if l1 == NO_JUMP {
+    if l1 == CG_NO_JUMP {
         return ok(l2)
     }
     last := l1
     for {
         let next = cg_next_jump(fs, last)
-        if next == NO_JUMP {
+        if next == CG_NO_JUMP {
             break
         }
         last = next
@@ -720,7 +720,7 @@ fn cg_join_lists(fs: *mut FnState, l1: i32, l2: i32) -> i32!Throw {
 }
 
 fn cg_emit_jump(fs: *mut FnState) -> i32!Throw {
-    return cg_emit(fs, encode_sj(OP_JMP, NO_JUMP))
+    return cg_emit(fs, encode_sj(OP_JMP, CG_NO_JUMP))
 }
 
 fn cg_return(fs: *mut FnState, first: i32, nret: i32) -> void!Throw {
@@ -747,7 +747,7 @@ fn cg_mark_target(fs: *mut FnState) -> i32 {
     }
 }
 
-fn op_is_test(op: u32) -> bool {
+fn cg_op_is_test(op: u32) -> bool {
     return (op >= OP_EQ && op <= OP_TESTSET)
 }
 
@@ -755,7 +755,7 @@ fn op_is_test(op: u32) -> bool {
 fn cg_jump_test(fs: *mut FnState, pc: i32) -> *mut u32 {
     unsafe {
         let p = cg_instr(fs, pc)
-        if pc >= 1 && op_is_test(op_code(*ptr.offset(p, -1))) {
+        if pc >= 1 && cg_op_is_test(op_code(*ptr.offset(p, -1))) {
             return ptr.offset(p, -1)
         }
         return p
@@ -771,7 +771,7 @@ fn cg_retarget_test(fs: *mut FnState, node: i32, reg: i32) -> bool {
         if op_code(i) != OP_TESTSET {
             return false
         }
-        if reg != NO_REG && reg != arg_b(i) {
+        if reg != CG_NO_REG && reg != arg_b(i) {
             *p = set_arg_a(i, reg)
         } else {
             *p = encode_abc(OP_TEST, arg_b(i), 0, 0, arg_k(i))
@@ -782,8 +782,8 @@ fn cg_retarget_test(fs: *mut FnState, node: i32, reg: i32) -> bool {
 
 fn cg_drop_values(fs: *mut FnState, list: i32) {
     l := list
-    for l != NO_JUMP {
-        cg_retarget_test(fs, l, NO_REG)
+    for l != CG_NO_JUMP {
+        cg_retarget_test(fs, l, CG_NO_REG)
         l = cg_next_jump(fs, l)
     }
 }
@@ -792,7 +792,7 @@ fn cg_drop_values(fs: *mut FnState, list: i32) {
 // their value in `reg`; the others go to `dtarget`.
 fn cg_resolve_jumps(fs: *mut FnState, list: i32, vtarget: i32, reg: i32, dtarget: i32) -> void!Throw {
     l := list
-    for l != NO_JUMP {
+    for l != CG_NO_JUMP {
         let next = cg_next_jump(fs, l)
         if cg_retarget_test(fs, l, reg) {
             cg_set_target(fs, l, vtarget)?
@@ -805,7 +805,7 @@ fn cg_resolve_jumps(fs: *mut FnState, list: i32, vtarget: i32, reg: i32, dtarget
 }
 
 fn cg_jumps_to(fs: *mut FnState, list: i32, target: i32) -> void!Throw {
-    return cg_resolve_jumps(fs, list, target, NO_REG, target)
+    return cg_resolve_jumps(fs, list, target, CG_NO_REG, target)
 }
 
 fn cg_jumps_here(fs: *mut FnState, list: i32) -> void!Throw {
@@ -823,25 +823,25 @@ fn cg_jump_back(fs: *mut FnState, target: i32) -> void!Throw {
 // The constant cache maps a key to the index it was last given in some
 // function's constant list; it is shared by all functions of the chunk, so a
 // hit is only used after checking it against the current function's list.
-struct KSlot {
+struct CgKSlot {
     bits: u64
     tag: u8
     idx: i32
 }
 
-const KKEY_NIL: u8 = 0x7E
+const CG_KKEY_NIL: u8 = 0x7E
 
-fn kc_hash(tag: u8, bits: u64) -> u64 {
+fn cg_kc_hash(tag: u8, bits: u64) -> u64 {
     let h = core.wrapping_mul(bits ^ ((tag as u64) << 56), 0x9E3779B97F4A7C15u64)
     return h ^ (h >> 29)
 }
 
-fn kc_grow(cx: *mut Cmp) -> void!Throw {
+fn cg_kc_grow(cx: *mut CompileState) -> void!Throw {
     unsafe {
         let oldcap = (*cx).kc_cap
         let old = (*cx).kc_slots
         let newcap = if oldcap == 0 { 64usize } else { oldcap * 2 }
-        let nb = mem_alloc((*cx).L, newcap * mem.size_of::<KSlot>())? as *mut KSlot
+        let nb = mem_alloc((*cx).L, newcap * mem.size_of::<CgKSlot>())? as *mut CgKSlot
         for i in 0usize..newcap {
             (*ptr.offset(nb, i as isize)).tag = 0
         }
@@ -849,7 +849,7 @@ fn kc_grow(cx: *mut Cmp) -> void!Throw {
         for i in 0usize..oldcap {
             let s = ptr.offset(old, i as isize)
             if (*s).tag != 0 {
-                h := (kc_hash((*s).tag, (*s).bits) as usize) & mask
+                h := (cg_kc_hash((*s).tag, (*s).bits) as usize) & mask
                 for (*ptr.offset(nb, h as isize)).tag != 0 {
                     h = (h + 1) & mask
                 }
@@ -860,7 +860,7 @@ fn kc_grow(cx: *mut Cmp) -> void!Throw {
             }
         }
         if oldcap != 0 {
-            mem_free((*cx).L, old as *mut u8, oldcap * mem.size_of::<KSlot>())
+            mem_free((*cx).L, old as *mut u8, oldcap * mem.size_of::<CgKSlot>())
         }
         (*cx).kc_slots = nb
         (*cx).kc_cap = newcap
@@ -869,13 +869,13 @@ fn kc_grow(cx: *mut Cmp) -> void!Throw {
 }
 
 // Find (or create, with idx -1) the cache slot of a key.
-fn kc_slot(cx: *mut Cmp, tag: u8, bits: u64) -> (*mut KSlot)!Throw {
+fn cg_kc_slot(cx: *mut CompileState, tag: u8, bits: u64) -> (*mut CgKSlot)!Throw {
     unsafe {
         if ((*cx).kc_count + 1) * 2 > (*cx).kc_cap {
-            kc_grow(cx)?
+            cg_kc_grow(cx)?
         }
         let mask = (*cx).kc_cap - 1
-        h := (kc_hash(tag, bits) as usize) & mask
+        h := (cg_kc_hash(tag, bits) as usize) & mask
         for {
             let s = ptr.offset((*cx).kc_slots, h as isize)
             if (*s).tag == 0 {
@@ -893,7 +893,7 @@ fn kc_slot(cx: *mut Cmp, tag: u8, bits: u64) -> (*mut KSlot)!Throw {
     }
 }
 
-fn k_same(a: *mut Value, b: *mut Value) -> bool {
+fn cg_k_same(a: *mut Value, b: *mut Value) -> bool {
     unsafe {
         let t = (*a).tag
         if t != (*b).tag {
@@ -916,9 +916,9 @@ fn k_same(a: *mut Value, b: *mut Value) -> bool {
 fn cg_k_add(fs: *mut FnState, tag: u8, bits: u64, v: *mut Value) -> i32!Throw {
     unsafe {
         let f = (*fs).f
-        let slot = kc_slot((*fs).cx, tag, bits)?
+        let slot = cg_kc_slot((*fs).cx, tag, bits)?
         let old = (*slot).idx
-        if old >= 0 && old < (*fs).nk && k_same(ptr.offset((*f).k, old as isize), v) {
+        if old >= 0 && old < (*fs).nk && cg_k_same(ptr.offset((*f).k, old as isize), v) {
             return ok(old)
         }
         let n = (*fs).nk
@@ -948,7 +948,7 @@ fn cg_k_int(fs: *mut FnState, n: i64) -> i32!Throw {
     unsafe {
         v := Value { bits: 0, tag: 0 }
         set_int(ptr.from_mut(&mut v), n)
-        return cg_k_add(fs, TAG_INT, i64_to_u64(n), ptr.from_mut(&mut v))
+        return cg_k_add(fs, TAG_INT, cg_i2u(n), ptr.from_mut(&mut v))
     }
 }
 
@@ -957,10 +957,10 @@ fn cg_k_int(fs: *mut FnState, n: i64) -> i32!Throw {
 fn cg_k_floatkey(fs: *mut FnState, key: f64, v: *mut Value) -> i32!Throw {
     unsafe {
         ik := 0i64
-        if flt_to_int_exact(key, ptr.from_mut(&mut ik)) {
-            return cg_k_add(fs, TAG_INT, i64_to_u64(ik), v)
+        if cg_flt_to_int(key, ptr.from_mut(&mut ik)) {
+            return cg_k_add(fs, TAG_INT, cg_i2u(ik), v)
         }
-        return cg_k_add(fs, TAG_FLOAT, f64_bits(key), v)
+        return cg_k_add(fs, TAG_FLOAT, cg_f64_bits(key), v)
     }
 }
 
@@ -971,7 +971,7 @@ fn cg_k_float(fs: *mut FnState, r: f64) -> i32!Throw {
         v := Value { bits: 0, tag: 0 }
         set_float(ptr.from_mut(&mut v), r)
         ik := 0i64
-        if !flt_to_int_exact(r, ptr.from_mut(&mut ik)) {
+        if !cg_flt_to_int(r, ptr.from_mut(&mut ik)) {
             return cg_k_floatkey(fs, r, ptr.from_mut(&mut v))
         }
         // 2^-52: the smallest fraction still significant next to 1.0.
@@ -997,21 +997,21 @@ fn cg_k_nil(fs: *mut FnState) -> i32!Throw {
     unsafe {
         v := Value { bits: 0, tag: 0 }
         set_nil(ptr.from_mut(&mut v))
-        return cg_k_add(fs, KKEY_NIL, 0, ptr.from_mut(&mut v))
+        return cg_k_add(fs, CG_KKEY_NIL, 0, ptr.from_mut(&mut v))
     }
 }
 
 // sC/sB immediate range: [-127, 128].
-fn fits_sc(i: i64) -> bool {
+fn cg_fits_sc(i: i64) -> bool {
     return i >= -OFFSET_SC as i64 && i <= (MAXARG_C - OFFSET_SC) as i64
 }
 
-fn fits_sbx(i: i64) -> bool {
+fn cg_fits_sbx(i: i64) -> bool {
     return i >= -OFFSET_SBX as i64 && i <= (MAXARG_BX - OFFSET_SBX) as i64
 }
 
 fn cg_load_int(fs: *mut FnState, reg: i32, i: i64) -> void!Throw {
-    if fits_sbx(i) {
+    if cg_fits_sbx(i) {
         cg_emit_asbx(fs, OP_LOADI, reg, i as i32)?
     } else {
         let k = cg_k_int(fs, i)?
@@ -1023,7 +1023,7 @@ fn cg_load_int(fs: *mut FnState, reg: i32, i: i64) -> void!Throw {
 fn cg_load_float(fs: *mut FnState, reg: i32, n: f64) -> void!Throw {
     unsafe {
         fi := 0i64
-        if flt_to_int_exact(n, ptr.from_mut(&mut fi)) && fits_sbx(fi) {
+        if cg_flt_to_int(n, ptr.from_mut(&mut fi)) && cg_fits_sbx(fi) {
             cg_emit_asbx(fs, OP_LOADF, reg, fi as i32)?
         } else {
             let k = cg_k_float(fs, n)?
@@ -1065,7 +1065,7 @@ fn cg_load_nils(fs: *mut FnState, first: i32, n: i32) -> void!Throw {
 // --- Discharging expressions ------------------------------------------------
 
 // Turn a constant Value into the equivalent constant expression.
-fn exp_set_const(v: *mut Value, e: *mut Exp) {
+fn ex_set_const(v: *mut Value, e: *mut CgExp) {
     unsafe {
         let t = (*v).tag
         if t == TAG_INT {
@@ -1088,9 +1088,9 @@ fn exp_set_const(v: *mut Value, e: *mut Exp) {
 }
 
 // If `e` is a compile-time constant value, store it into `v`.
-fn cg_const_value(fs: *mut FnState, e: *mut Exp, v: *mut Value) -> bool {
+fn cg_const_value(fs: *mut FnState, e: *mut CgExp, v: *mut Value) -> bool {
     unsafe {
-        if exp_has_jumps(e) {
+        if ex_has_jumps(e) {
             return false
         }
         let k = (*e).k
@@ -1116,7 +1116,7 @@ fn cg_const_value(fs: *mut FnState, e: *mut Exp, v: *mut Value) -> bool {
 }
 
 // Fix a multi-result expression (call or vararg) to `nresults` results.
-fn cg_set_nresults(fs: *mut FnState, e: *mut Exp, nresults: i32) -> void!Throw {
+fn cg_set_nresults(fs: *mut FnState, e: *mut CgExp, nresults: i32) -> void!Throw {
     unsafe {
         let p = cg_instr(fs, (*e).info)
         *p = set_arg_c(*p, nresults + 1)
@@ -1128,12 +1128,12 @@ fn cg_set_nresults(fs: *mut FnState, e: *mut Exp, nresults: i32) -> void!Throw {
     }
 }
 
-fn cg_set_allresults(fs: *mut FnState, e: *mut Exp) -> void!Throw {
-    return cg_set_nresults(fs, e, LUA_MULTRET)
+fn cg_set_allresults(fs: *mut FnState, e: *mut CgExp) -> void!Throw {
+    return cg_set_nresults(fs, e, CG_MULTRET)
 }
 
 // Make a multi-result expression produce exactly one value.
-fn cg_single_result(fs: *mut FnState, e: *mut Exp) {
+fn cg_single_result(fs: *mut FnState, e: *mut CgExp) {
     unsafe {
         if (*e).k == EK_CALL {
             (*e).k = EK_FIXED
@@ -1146,7 +1146,7 @@ fn cg_single_result(fs: *mut FnState, e: *mut Exp) {
     }
 }
 
-fn cg_string_to_k(fs: *mut FnState, e: *mut Exp) -> void!Throw {
+fn cg_string_to_k(fs: *mut FnState, e: *mut CgExp) -> void!Throw {
     unsafe {
         (*e).info = cg_k_string(fs, (*e).sval)?
         (*e).k = EK_K
@@ -1156,11 +1156,11 @@ fn cg_string_to_k(fs: *mut FnState, e: *mut Exp) -> void!Throw {
 
 // Make sure `e` is no longer a variable: its value is a constant, in a
 // register, or computed by a relocatable instruction.
-fn cg_read_var(fs: *mut FnState, e: *mut Exp) -> void!Throw {
+fn cg_read_var(fs: *mut FnState, e: *mut CgExp) -> void!Throw {
     unsafe {
         let k = (*e).k
         if k == EK_CONST {
-            exp_set_const(par_const_slot(fs, (*e).info), e)
+            ex_set_const(par_const_slot(fs, (*e).info), e)
         } else if k == EK_LOCAL {
             (*e).info = (*e).ridx
             (*e).k = EK_FIXED
@@ -1190,7 +1190,7 @@ fn cg_read_var(fs: *mut FnState, e: *mut Exp) -> void!Throw {
 }
 
 // Put the value of `e` (ignoring its jump lists) into register `reg`.
-fn cg_place(fs: *mut FnState, e: *mut Exp, reg: i32) -> void!Throw {
+fn cg_place(fs: *mut FnState, e: *mut CgExp, reg: i32) -> void!Throw {
     unsafe {
         cg_read_var(fs, e)?
         let k = (*e).k
@@ -1226,7 +1226,7 @@ fn cg_place(fs: *mut FnState, e: *mut Exp, reg: i32) -> void!Throw {
     }
 }
 
-fn cg_place_any(fs: *mut FnState, e: *mut Exp) -> void!Throw {
+fn cg_place_any(fs: *mut FnState, e: *mut CgExp) -> void!Throw {
     unsafe {
         if (*e).k != EK_FIXED {
             cg_alloc_regs(fs, 1)?
@@ -1245,7 +1245,7 @@ fn cg_bool_target(fs: *mut FnState, a: i32, op: u32) -> i32!Throw {
 fn cg_list_needs_bool(fs: *mut FnState, list: i32) -> bool {
     unsafe {
         l := list
-        for l != NO_JUMP {
+        for l != CG_NO_JUMP {
             if op_code(*cg_jump_test(fs, l)) != OP_TESTSET {
                 return true
             }
@@ -1256,17 +1256,17 @@ fn cg_list_needs_bool(fs: *mut FnState, list: i32) -> bool {
 }
 
 // Put the complete value of `e`, including its jump lists, into `reg`.
-fn cg_to_reg(fs: *mut FnState, e: *mut Exp, reg: i32) -> void!Throw {
+fn cg_to_reg(fs: *mut FnState, e: *mut CgExp, reg: i32) -> void!Throw {
     unsafe {
         cg_place(fs, e, reg)?
         if (*e).k == EK_JMP {
             (*e).t = cg_join_lists(fs, (*e).t, (*e).info)?
         }
-        if exp_has_jumps(e) {
-            pos_f := NO_JUMP
-            pos_t := NO_JUMP
+        if ex_has_jumps(e) {
+            pos_f := CG_NO_JUMP
+            pos_t := CG_NO_JUMP
             if cg_list_needs_bool(fs, (*e).t) || cg_list_needs_bool(fs, (*e).f) {
-                fj := NO_JUMP
+                fj := CG_NO_JUMP
                 if (*e).k != EK_JMP {
                     fj = cg_emit_jump(fs)?
                 }
@@ -1278,15 +1278,15 @@ fn cg_to_reg(fs: *mut FnState, e: *mut Exp, reg: i32) -> void!Throw {
             cg_resolve_jumps(fs, (*e).f, end, reg, pos_f)?
             cg_resolve_jumps(fs, (*e).t, end, reg, pos_t)?
         }
-        (*e).f = NO_JUMP
-        (*e).t = NO_JUMP
+        (*e).f = CG_NO_JUMP
+        (*e).t = CG_NO_JUMP
         (*e).info = reg
         (*e).k = EK_FIXED
         return ok()
     }
 }
 
-fn cg_to_nextreg(fs: *mut FnState, e: *mut Exp) -> void!Throw {
+fn cg_to_nextreg(fs: *mut FnState, e: *mut CgExp) -> void!Throw {
     unsafe {
         cg_read_var(fs, e)?
         cg_release_exp(fs, e)
@@ -1295,11 +1295,11 @@ fn cg_to_nextreg(fs: *mut FnState, e: *mut Exp) -> void!Throw {
     }
 }
 
-fn cg_to_anyreg(fs: *mut FnState, e: *mut Exp) -> i32!Throw {
+fn cg_to_anyreg(fs: *mut FnState, e: *mut CgExp) -> i32!Throw {
     unsafe {
         cg_read_var(fs, e)?
         if (*e).k == EK_FIXED {
-            if !exp_has_jumps(e) {
+            if !ex_has_jumps(e) {
                 return ok((*e).info)
             }
             if (*e).info >= par_regs_in_use(fs) {
@@ -1313,18 +1313,18 @@ fn cg_to_anyreg(fs: *mut FnState, e: *mut Exp) -> i32!Throw {
     }
 }
 
-fn cg_to_reg_or_upval(fs: *mut FnState, e: *mut Exp) -> void!Throw {
+fn cg_to_reg_or_upval(fs: *mut FnState, e: *mut CgExp) -> void!Throw {
     unsafe {
-        if (*e).k != EK_UPVAL || exp_has_jumps(e) {
+        if (*e).k != EK_UPVAL || ex_has_jumps(e) {
             cg_to_anyreg(fs, e)?
         }
         return ok()
     }
 }
 
-fn cg_to_value(fs: *mut FnState, e: *mut Exp) -> void!Throw {
+fn cg_to_value(fs: *mut FnState, e: *mut CgExp) -> void!Throw {
     unsafe {
-        if (*e).k == EK_JMP || exp_has_jumps(e) {
+        if (*e).k == EK_JMP || ex_has_jumps(e) {
             cg_to_anyreg(fs, e)?
         } else {
             cg_read_var(fs, e)?
@@ -1334,9 +1334,9 @@ fn cg_to_value(fs: *mut FnState, e: *mut Exp) -> void!Throw {
 }
 
 // Try to make `e` a K expression with an index usable as an RK operand.
-fn cg_try_konst(fs: *mut FnState, e: *mut Exp) -> bool!Throw {
+fn cg_try_konst(fs: *mut FnState, e: *mut CgExp) -> bool!Throw {
     unsafe {
-        if exp_has_jumps(e) {
+        if ex_has_jumps(e) {
             return ok(false)
         }
         let k = (*e).k
@@ -1358,7 +1358,7 @@ fn cg_try_konst(fs: *mut FnState, e: *mut Exp) -> bool!Throw {
         } else {
             return ok(false)
         }
-        if idx <= MAXINDEXRK {
+        if idx <= CG_MAXINDEXRK {
             (*e).k = EK_K
             (*e).info = idx
             return ok(true)
@@ -1368,7 +1368,7 @@ fn cg_try_konst(fs: *mut FnState, e: *mut Exp) -> bool!Throw {
 }
 
 // Make `e` an RK operand; true if it became a constant.
-fn cg_to_rk(fs: *mut FnState, e: *mut Exp) -> bool!Throw {
+fn cg_to_rk(fs: *mut FnState, e: *mut CgExp) -> bool!Throw {
     if cg_try_konst(fs, e)? {
         return ok(true)
     }
@@ -1376,7 +1376,7 @@ fn cg_to_rk(fs: *mut FnState, e: *mut Exp) -> bool!Throw {
     return ok(false)
 }
 
-fn cg_emit_store_rk(fs: *mut FnState, op: u32, a: i32, b: i32, ec: *mut Exp) -> void!Throw {
+fn cg_emit_store_rk(fs: *mut FnState, op: u32, a: i32, b: i32, ec: *mut CgExp) -> void!Throw {
     unsafe {
         let isk = cg_to_rk(fs, ec)?
         cg_emit_abck(fs, op, a, b, (*ec).info, isk)?
@@ -1385,7 +1385,7 @@ fn cg_emit_store_rk(fs: *mut FnState, op: u32, a: i32, b: i32, ec: *mut Exp) -> 
 }
 
 // Store the value of `ex` into the variable `var`.
-fn cg_store(fs: *mut FnState, var: *mut Exp, ex: *mut Exp) -> void!Throw {
+fn cg_store(fs: *mut FnState, var: *mut CgExp, ex: *mut CgExp) -> void!Throw {
     unsafe {
         let k = (*var).k
         if k == EK_LOCAL {
@@ -1410,7 +1410,7 @@ fn cg_store(fs: *mut FnState, var: *mut Exp, ex: *mut Exp) -> void!Throw {
 }
 
 // e:key(...) -- SELF puts the method and the receiver in two new registers.
-fn cg_method(fs: *mut FnState, e: *mut Exp, key: *mut Exp) -> void!Throw {
+fn cg_method(fs: *mut FnState, e: *mut CgExp, key: *mut CgExp) -> void!Throw {
     unsafe {
         cg_to_anyreg(fs, e)?
         let ereg = (*e).info
@@ -1424,7 +1424,7 @@ fn cg_method(fs: *mut FnState, e: *mut Exp, key: *mut Exp) -> void!Throw {
     }
 }
 
-fn cg_invert_test(fs: *mut FnState, e: *mut Exp) {
+fn cg_invert_test(fs: *mut FnState, e: *mut CgExp) {
     unsafe {
         let p = cg_jump_test(fs, (*e).info)
         *p = set_arg_k(*p, !arg_k(*p))
@@ -1433,7 +1433,7 @@ fn cg_invert_test(fs: *mut FnState, e: *mut Exp) {
 
 // Emit a jump taken when `e` equals `cond`; a preceding NOT is folded away
 // by testing its operand with the opposite condition.
-fn cg_test_jump(fs: *mut FnState, e: *mut Exp, cond: bool) -> i32!Throw {
+fn cg_test_jump(fs: *mut FnState, e: *mut CgExp, cond: bool) -> i32!Throw {
     unsafe {
         if (*e).k == EK_ANYDEST {
             let ie = *cg_instr(fs, (*e).info)
@@ -1444,52 +1444,52 @@ fn cg_test_jump(fs: *mut FnState, e: *mut Exp, cond: bool) -> i32!Throw {
         }
         cg_place_any(fs, e)?
         cg_release_exp(fs, e)
-        return cg_test_and_jump(fs, OP_TESTSET, NO_REG, (*e).info, 0, cond)
+        return cg_test_and_jump(fs, OP_TESTSET, CG_NO_REG, (*e).info, 0, cond)
     }
 }
 
 // Fall through when `e` is true; jump (via e.f) when it is false.
-fn cg_cond_true(fs: *mut FnState, e: *mut Exp) -> void!Throw {
+fn cg_cond_true(fs: *mut FnState, e: *mut CgExp) -> void!Throw {
     unsafe {
         cg_read_var(fs, e)?
-        pc := NO_JUMP
+        pc := CG_NO_JUMP
         let k = (*e).k
         if k == EK_JMP {
             cg_invert_test(fs, e)
             pc = (*e).info
         } else if k == EK_K || k == EK_KFLT || k == EK_KINT || k == EK_KSTR || k == EK_TRUE {
-            pc = NO_JUMP
+            pc = CG_NO_JUMP
         } else {
             pc = cg_test_jump(fs, e, false)?
         }
         (*e).f = cg_join_lists(fs, (*e).f, pc)?
         cg_jumps_here(fs, (*e).t)?
-        (*e).t = NO_JUMP
+        (*e).t = CG_NO_JUMP
         return ok()
     }
 }
 
 // Fall through when `e` is false; jump (via e.t) when it is true.
-fn cg_cond_false(fs: *mut FnState, e: *mut Exp) -> void!Throw {
+fn cg_cond_false(fs: *mut FnState, e: *mut CgExp) -> void!Throw {
     unsafe {
         cg_read_var(fs, e)?
-        pc := NO_JUMP
+        pc := CG_NO_JUMP
         let k = (*e).k
         if k == EK_JMP {
             pc = (*e).info
         } else if k == EK_NIL || k == EK_FALSE {
-            pc = NO_JUMP
+            pc = CG_NO_JUMP
         } else {
             pc = cg_test_jump(fs, e, true)?
         }
         (*e).t = cg_join_lists(fs, (*e).t, pc)?
         cg_jumps_here(fs, (*e).f)?
-        (*e).f = NO_JUMP
+        (*e).f = CG_NO_JUMP
         return ok()
     }
 }
 
-fn cg_not(fs: *mut FnState, e: *mut Exp) -> void!Throw {
+fn cg_not(fs: *mut FnState, e: *mut CgExp) -> void!Throw {
     unsafe {
         let k = (*e).k
         if k == EK_NIL || k == EK_FALSE {
@@ -1514,42 +1514,42 @@ fn cg_not(fs: *mut FnState, e: *mut Exp) -> void!Throw {
 }
 
 // Is `e` a short-string constant usable as a B/C operand?
-fn cg_is_kshort(fs: *mut FnState, e: *mut Exp) -> bool {
+fn cg_is_kshort(fs: *mut FnState, e: *mut CgExp) -> bool {
     unsafe {
-        if (*e).k != EK_K || exp_has_jumps(e) || (*e).info > MAXARG_B {
+        if (*e).k != EK_K || ex_has_jumps(e) || (*e).info > MAXARG_B {
             return false
         }
         return (*ptr.offset((*(*fs).f).k, (*e).info as isize)).tag == TAG_SHORTSTR
     }
 }
 
-fn exp_is_kint(e: *mut Exp) -> bool {
-    unsafe { return (*e).k == EK_KINT && !exp_has_jumps(e) }
+fn ex_is_kint(e: *mut CgExp) -> bool {
+    unsafe { return (*e).k == EK_KINT && !ex_has_jumps(e) }
 }
 
 // Integer constant fitting an unsigned C operand.
-fn exp_is_cint(e: *mut Exp) -> bool {
-    unsafe { return exp_is_kint(e) && (*e).ival >= 0 && (*e).ival <= MAXARG_C as i64 }
+fn ex_is_cint(e: *mut CgExp) -> bool {
+    unsafe { return ex_is_kint(e) && (*e).ival >= 0 && (*e).ival <= MAXARG_C as i64 }
 }
 
 // Integer constant fitting a signed C operand.
-fn exp_is_scint(e: *mut Exp) -> bool {
-    unsafe { return exp_is_kint(e) && fits_sc((*e).ival) }
+fn ex_is_scint(e: *mut CgExp) -> bool {
+    unsafe { return ex_is_kint(e) && cg_fits_sc((*e).ival) }
 }
 
 // Integer (or integral float) constant fitting a signed immediate; stores
 // the encoded operand and whether it was a float.
-fn exp_is_simm(e: *mut Exp, imm: *mut i32, isfloat: *mut bool) -> bool {
+fn ex_is_simm(e: *mut CgExp, imm: *mut i32, isfloat: *mut bool) -> bool {
     unsafe {
         i := 0i64
         if (*e).k == EK_KINT {
             i = (*e).ival
-        } else if (*e).k == EK_KFLT && flt_to_int_exact((*e).nval, ptr.from_mut(&mut i)) {
+        } else if (*e).k == EK_KFLT && cg_flt_to_int((*e).nval, ptr.from_mut(&mut i)) {
             *isfloat = true
         } else {
             return false
         }
-        if !exp_has_jumps(e) && fits_sc(i) {
+        if !ex_has_jumps(e) && cg_fits_sc(i) {
             *imm = (i as i32) + OFFSET_SC
             return true
         }
@@ -1558,7 +1558,7 @@ fn exp_is_simm(e: *mut Exp, imm: *mut i32, isfloat: *mut bool) -> bool {
 }
 
 // Turn `t` (a table in a register or upvalue) into the indexed variable t[k].
-fn cg_index(fs: *mut FnState, t: *mut Exp, k: *mut Exp) -> void!Throw {
+fn cg_index(fs: *mut FnState, t: *mut CgExp, k: *mut CgExp) -> void!Throw {
     unsafe {
         if (*k).k == EK_KSTR {
             cg_string_to_k(fs, k)?
@@ -1580,7 +1580,7 @@ fn cg_index(fs: *mut FnState, t: *mut Exp, k: *mut Exp) -> void!Throw {
         if cg_is_kshort(fs, k) {
             (*t).key = (*k).info
             (*t).k = EK_INDEXSTR
-        } else if exp_is_cint(k) {
+        } else if ex_is_cint(k) {
             (*t).key = (*k).ival as i32
             (*t).k = EK_INDEXI
         } else {
@@ -1593,7 +1593,7 @@ fn cg_index(fs: *mut FnState, t: *mut Exp, k: *mut Exp) -> void!Throw {
 
 // --- Operators ---------------------------------------------------------------
 
-fn cg_unary_value(fs: *mut FnState, op: u32, e: *mut Exp, line: i32) -> void!Throw {
+fn cg_unary_value(fs: *mut FnState, op: u32, e: *mut CgExp, line: i32) -> void!Throw {
     unsafe {
         let r = cg_to_anyreg(fs, e)?
         cg_release_exp(fs, e)
@@ -1604,7 +1604,7 @@ fn cg_unary_value(fs: *mut FnState, op: u32, e: *mut Exp, line: i32) -> void!Thr
 }
 
 // Emit `op A v1 v2` followed by its metamethod fallback `mmop`.
-fn cg_emit_arith(fs: *mut FnState, e1: *mut Exp, e2: *mut Exp, op: u32, v2: i32, flip: bool, line: i32, mmop: u32, event: u32) -> void!Throw {
+fn cg_emit_arith(fs: *mut FnState, e1: *mut CgExp, e2: *mut CgExp, op: u32, v2: i32, flip: bool, line: i32, mmop: u32, event: u32) -> void!Throw {
     unsafe {
         let v1 = cg_to_anyreg(fs, e1)?
         let pc = cg_emit_abck(fs, op, 0, v1, v2, false)?
@@ -1617,19 +1617,19 @@ fn cg_emit_arith(fs: *mut FnState, e1: *mut Exp, e2: *mut Exp, op: u32, v2: i32,
     }
 }
 
-fn cg_arith_regs(fs: *mut FnState, opr: i32, e1: *mut Exp, e2: *mut Exp, line: i32) -> void!Throw {
+fn cg_arith_regs(fs: *mut FnState, opr: i32, e1: *mut CgExp, e2: *mut CgExp, line: i32) -> void!Throw {
     let v2 = cg_to_anyreg(fs, e2)?
     return cg_emit_arith(fs, e1, e2, OP_ADD + opr as u32, v2, false, line, OP_MMBIN, TM_ADD + opr as u32)
 }
 
-fn cg_arith_imm(fs: *mut FnState, op: u32, e1: *mut Exp, e2: *mut Exp, flip: bool, line: i32, event: u32) -> void!Throw {
+fn cg_arith_imm(fs: *mut FnState, op: u32, e1: *mut CgExp, e2: *mut CgExp, flip: bool, line: i32, event: u32) -> void!Throw {
     unsafe {
         let v2 = ((*e2).ival as i32) + OFFSET_SC
         return cg_emit_arith(fs, e1, e2, op, v2, flip, line, OP_MMBINI, event)
     }
 }
 
-fn cg_arith_k(fs: *mut FnState, opr: i32, e1: *mut Exp, e2: *mut Exp, flip: bool, line: i32) -> void!Throw {
+fn cg_arith_k(fs: *mut FnState, opr: i32, e1: *mut CgExp, e2: *mut CgExp, flip: bool, line: i32) -> void!Throw {
     unsafe {
         return cg_emit_arith(fs, e1, e2, OP_ADDK + opr as u32, (*e2).info, flip, line, OP_MMBINK, TM_ADD + opr as u32)
     }
@@ -1637,13 +1637,13 @@ fn cg_arith_k(fs: *mut FnState, opr: i32, e1: *mut Exp, e2: *mut Exp, flip: bool
 
 // Code `e1 op -I` for a small integer constant I (subtraction as an
 // addition, left shift as a right shift); the metamethod keeps I.
-fn cg_arith_negimm(fs: *mut FnState, e1: *mut Exp, e2: *mut Exp, op: u32, line: i32, event: u32) -> bool!Throw {
+fn cg_arith_negimm(fs: *mut FnState, e1: *mut CgExp, e2: *mut CgExp, op: u32, line: i32, event: u32) -> bool!Throw {
     unsafe {
-        if !exp_is_kint(e2) {
+        if !ex_is_kint(e2) {
             return ok(false)
         }
         let i2 = (*e2).ival
-        if !(fits_sc(i2) && fits_sc(-i2)) {
+        if !(cg_fits_sc(i2) && cg_fits_sc(-i2)) {
             return ok(false)
         }
         let v2 = i2 as i32
@@ -1654,38 +1654,38 @@ fn cg_arith_negimm(fs: *mut FnState, e1: *mut Exp, e2: *mut Exp, op: u32, line: 
     }
 }
 
-fn cg_arith_nok(fs: *mut FnState, opr: i32, e1: *mut Exp, e2: *mut Exp, flip: bool, line: i32) -> void!Throw {
+fn cg_arith_nok(fs: *mut FnState, opr: i32, e1: *mut CgExp, e2: *mut CgExp, flip: bool, line: i32) -> void!Throw {
     if flip {
-        exp_swap(e1, e2)
+        ex_swap(e1, e2)
     }
     return cg_arith_regs(fs, opr, e1, e2, line)
 }
 
-fn cg_arith_any(fs: *mut FnState, opr: i32, e1: *mut Exp, e2: *mut Exp, flip: bool, line: i32) -> void!Throw {
-    if exp_is_numeral(e2) && cg_try_konst(fs, e2)? {
+fn cg_arith_any(fs: *mut FnState, opr: i32, e1: *mut CgExp, e2: *mut CgExp, flip: bool, line: i32) -> void!Throw {
+    if ex_is_numeral(e2) && cg_try_konst(fs, e2)? {
         return cg_arith_k(fs, opr, e1, e2, flip, line)
     }
     return cg_arith_nok(fs, opr, e1, e2, flip, line)
 }
 
 // '+' and '*': a constant first operand is moved second.
-fn cg_arith_swap(fs: *mut FnState, opr: i32, e1: *mut Exp, e2: *mut Exp, line: i32) -> void!Throw {
+fn cg_arith_swap(fs: *mut FnState, opr: i32, e1: *mut CgExp, e2: *mut CgExp, line: i32) -> void!Throw {
     flip := false
-    if exp_is_numeral(e1) {
-        exp_swap(e1, e2)
+    if ex_is_numeral(e1) {
+        ex_swap(e1, e2)
         flip = true
     }
-    if opr == OPR_ADD && exp_is_scint(e2) {
+    if opr == OPR_ADD && ex_is_scint(e2) {
         return cg_arith_imm(fs, OP_ADDI, e1, e2, flip, line, TM_ADD)
     }
     return cg_arith_any(fs, opr, e1, e2, flip, line)
 }
 
-fn cg_arith_bits(fs: *mut FnState, opr: i32, e1: *mut Exp, e2: *mut Exp, line: i32) -> void!Throw {
+fn cg_arith_bits(fs: *mut FnState, opr: i32, e1: *mut CgExp, e2: *mut CgExp, line: i32) -> void!Throw {
     unsafe {
         flip := false
         if (*e1).k == EK_KINT {
-            exp_swap(e1, e2)
+            ex_swap(e1, e2)
             flip = true
         }
         if (*e2).k == EK_KINT && cg_try_konst(fs, e2)? {
@@ -1696,18 +1696,18 @@ fn cg_arith_bits(fs: *mut FnState, opr: i32, e1: *mut Exp, e2: *mut Exp, line: i
 }
 
 // '<' and '<=' (operands already swapped for '>' and '>=').
-fn cg_compare_order(fs: *mut FnState, opr: i32, e1: *mut Exp, e2: *mut Exp) -> void!Throw {
+fn cg_compare_order(fs: *mut FnState, opr: i32, e1: *mut CgExp, e2: *mut CgExp) -> void!Throw {
     unsafe {
         imm := 0i32
         isfloat := false
         r1 := 0i32
         r2 := 0i32
         op := OP_LT
-        if exp_is_simm(e2, ptr.from_mut(&mut imm), ptr.from_mut(&mut isfloat)) {
+        if ex_is_simm(e2, ptr.from_mut(&mut imm), ptr.from_mut(&mut isfloat)) {
             r1 = cg_to_anyreg(fs, e1)?
             r2 = imm
             op = OP_LTI + (opr - OPR_LT) as u32
-        } else if exp_is_simm(e1, ptr.from_mut(&mut imm), ptr.from_mut(&mut isfloat)) {
+        } else if ex_is_simm(e1, ptr.from_mut(&mut imm), ptr.from_mut(&mut isfloat)) {
             r1 = cg_to_anyreg(fs, e2)?
             r2 = imm
             op = OP_GTI + (opr - OPR_LT) as u32
@@ -1724,17 +1724,17 @@ fn cg_compare_order(fs: *mut FnState, opr: i32, e1: *mut Exp, e2: *mut Exp) -> v
     }
 }
 
-fn cg_compare_eq(fs: *mut FnState, opr: i32, e1: *mut Exp, e2: *mut Exp) -> void!Throw {
+fn cg_compare_eq(fs: *mut FnState, opr: i32, e1: *mut CgExp, e2: *mut CgExp) -> void!Throw {
     unsafe {
         imm := 0i32
         isfloat := false
         r2 := 0i32
         op := OP_EQ
         if (*e1).k != EK_FIXED {
-            exp_swap(e1, e2)
+            ex_swap(e1, e2)
         }
         let r1 = cg_to_anyreg(fs, e1)?
-        if exp_is_simm(e2, ptr.from_mut(&mut imm), ptr.from_mut(&mut isfloat)) {
+        if ex_is_simm(e2, ptr.from_mut(&mut imm), ptr.from_mut(&mut isfloat)) {
             op = OP_EQI
             r2 = imm
         } else if cg_to_rk(fs, e2)? {
@@ -1752,11 +1752,11 @@ fn cg_compare_eq(fs: *mut FnState, opr: i32, e1: *mut Exp, e2: *mut Exp) -> void
     }
 }
 
-fn cg_unary(fs: *mut FnState, opr: i32, e: *mut Exp, line: i32) -> void!Throw {
+fn cg_unary(fs: *mut FnState, opr: i32, e: *mut CgExp, line: i32) -> void!Throw {
     unsafe {
         cg_read_var(fs, e)?
         if opr == UOPR_MINUS || opr == UOPR_BNOT {
-            zero := exp_blank()
+            zero := ex_blank()
             unsafe {
                 zero.k = EK_KINT
                 zero.ival = 0
@@ -1775,7 +1775,7 @@ fn cg_unary(fs: *mut FnState, opr: i32, e: *mut Exp, line: i32) -> void!Throw {
 }
 
 // First operand of a binary operator, before the second one is read.
-fn cg_binary_left(fs: *mut FnState, opr: i32, v: *mut Exp) -> void!Throw {
+fn cg_binary_left(fs: *mut FnState, opr: i32, v: *mut CgExp) -> void!Throw {
     unsafe {
         cg_read_var(fs, v)?
         if opr == OPR_AND {
@@ -1788,20 +1788,20 @@ fn cg_binary_left(fs: *mut FnState, opr: i32, v: *mut Exp) -> void!Throw {
             return cg_to_nextreg(fs, v)
         }
         if opr <= OPR_SHR {
-            if !exp_is_numeral(v) {
+            if !ex_is_numeral(v) {
                 cg_to_anyreg(fs, v)?
             }
             return ok()
         }
         if opr == OPR_EQ || opr == OPR_NE {
-            if !exp_is_numeral(v) {
+            if !ex_is_numeral(v) {
                 cg_to_rk(fs, v)?
             }
             return ok()
         }
         imm := 0i32
         isfloat := false
-        if !exp_is_simm(v, ptr.from_mut(&mut imm), ptr.from_mut(&mut isfloat)) {
+        if !ex_is_simm(v, ptr.from_mut(&mut imm), ptr.from_mut(&mut isfloat)) {
             cg_to_anyreg(fs, v)?
         }
         return ok()
@@ -1809,7 +1809,7 @@ fn cg_binary_left(fs: *mut FnState, opr: i32, v: *mut Exp) -> void!Throw {
 }
 
 // e1 .. e2, merging into the CONCAT of e2 when e2 is itself a concatenation.
-fn cg_concat_values(fs: *mut FnState, e1: *mut Exp, e2: *mut Exp, line: i32) -> void!Throw {
+fn cg_concat_values(fs: *mut FnState, e1: *mut CgExp, e2: *mut CgExp, line: i32) -> void!Throw {
     unsafe {
         let prev = cg_mergeable_prev(fs)
         if prev >= 0 {
@@ -1828,7 +1828,7 @@ fn cg_concat_values(fs: *mut FnState, e1: *mut Exp, e2: *mut Exp, line: i32) -> 
 }
 
 // Complete a binary operation once both operands are known.
-fn cg_binary(fs: *mut FnState, opr: i32, e1: *mut Exp, e2: *mut Exp, line: i32) -> void!Throw {
+fn cg_binary(fs: *mut FnState, opr: i32, e1: *mut CgExp, e2: *mut CgExp, line: i32) -> void!Throw {
     unsafe {
         cg_read_var(fs, e2)?
         if opr <= OPR_SHR && cg_fold(opr, e1, e2) {
@@ -1836,12 +1836,12 @@ fn cg_binary(fs: *mut FnState, opr: i32, e1: *mut Exp, e2: *mut Exp, line: i32) 
         }
         if opr == OPR_AND {
             (*e2).f = cg_join_lists(fs, (*e2).f, (*e1).f)?
-            exp_copy(e1, e2)
+            ex_copy(e1, e2)
             return ok()
         }
         if opr == OPR_OR {
             (*e2).t = cg_join_lists(fs, (*e2).t, (*e1).t)?
-            exp_copy(e1, e2)
+            ex_copy(e1, e2)
             return ok()
         }
         if opr == OPR_CONCAT {
@@ -1864,8 +1864,8 @@ fn cg_binary(fs: *mut FnState, opr: i32, e1: *mut Exp, e2: *mut Exp, line: i32) 
             return cg_arith_bits(fs, opr, e1, e2, line)
         }
         if opr == OPR_SHL {
-            if exp_is_scint(e1) {
-                exp_swap(e1, e2)
+            if ex_is_scint(e1) {
+                ex_swap(e1, e2)
                 return cg_arith_imm(fs, OP_SHLI, e1, e2, true, line, TM_SHL)
             }
             if cg_arith_negimm(fs, e1, e2, OP_SHRI, line, TM_SHL)? {
@@ -1874,7 +1874,7 @@ fn cg_binary(fs: *mut FnState, opr: i32, e1: *mut Exp, e2: *mut Exp, line: i32) 
             return cg_arith_regs(fs, opr, e1, e2, line)
         }
         if opr == OPR_SHR {
-            if exp_is_scint(e2) {
+            if ex_is_scint(e2) {
                 return cg_arith_imm(fs, OP_SHRI, e1, e2, false, line, TM_SHR)
             }
             return cg_arith_regs(fs, opr, e1, e2, line)
@@ -1883,7 +1883,7 @@ fn cg_binary(fs: *mut FnState, opr: i32, e1: *mut Exp, e2: *mut Exp, line: i32) 
             return cg_compare_eq(fs, opr, e1, e2)
         }
         if opr == OPR_GT || opr == OPR_GE {
-            exp_swap(e1, e2)
+            ex_swap(e1, e2)
             return cg_compare_order(fs, opr - OPR_GT + OPR_LT, e1, e2)
         }
         return cg_compare_order(fs, opr, e1, e2)
@@ -1892,7 +1892,7 @@ fn cg_binary(fs: *mut FnState, opr: i32, e1: *mut Exp, e2: *mut Exp, line: i32) 
 
 // --- Tables -------------------------------------------------------------------
 
-fn ceil_log2(x: i32) -> i32 {
+fn cg_ceil_log2(x: i32) -> i32 {
     l := 0i32
     v := x - 1
     for v > 0 {
@@ -1905,7 +1905,7 @@ fn ceil_log2(x: i32) -> i32 {
 // Fill in the NEWTABLE at `pc` (and its EXTRAARG) with the size hints.
 fn cg_table_size(fs: *mut FnState, pc: i32, ra: i32, asize: i32, hsize: i32) {
     unsafe {
-        let rb = if hsize != 0 { ceil_log2(hsize) + 1 } else { 0i32 }
+        let rb = if hsize != 0 { cg_ceil_log2(hsize) + 1 } else { 0i32 }
         let extra = asize / (MAXARG_C + 1)
         let rc = asize % (MAXARG_C + 1)
         let p = cg_instr(fs, pc)
@@ -1914,11 +1914,11 @@ fn cg_table_size(fs: *mut FnState, pc: i32, ra: i32, asize: i32, hsize: i32) {
     }
 }
 
-// Store `tostore` values (LUA_MULTRET: up to the top) after table `base`;
+// Store `tostore` values (CG_MULTRET: up to the top) after table `base`;
 // `nelems` is the number of list items before them.
 fn cg_flush_list(fs: *mut FnState, base: i32, nelems: i32, tostore: i32) -> void!Throw {
     unsafe {
-        let n = if tostore == LUA_MULTRET { 0i32 } else { tostore }
+        let n = if tostore == CG_MULTRET { 0i32 } else { tostore }
         if nelems <= MAXARG_C {
             cg_emit_abc(fs, OP_SETLIST, base, n, nelems)?
         } else {

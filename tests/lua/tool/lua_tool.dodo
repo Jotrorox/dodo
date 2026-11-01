@@ -46,7 +46,7 @@ const LT_EVENTS: [25]&str = [
     "__concat", "__call", "__close",
 ]
 
-fn lt_flush(m: *mut MsgBuf, fd: i32) {
+fn lt_flush(m: *mut LexMsg, fd: i32) {
     unsafe {
         off := 0usize
         for off < (*m).n {
@@ -60,7 +60,7 @@ fn lt_flush(m: *mut MsgBuf, fd: i32) {
     }
 }
 
-fn lt_hex(m: *mut MsgBuf, v: u64) {
+fn lt_hex(m: *mut LexMsg, v: u64) {
     digits: [20]u8 = [0u8; 20]
     n := 0usize
     x := v
@@ -73,34 +73,34 @@ fn lt_hex(m: *mut MsgBuf, v: u64) {
             break
         }
     }
-    msg_str(m, "0x")
+    lmsg_str(m, "0x")
     for i in 0usize..n {
-        msg_char(m, digits[n - 1 - i])
+        lmsg_char(m, digits[n - 1 - i])
     }
 }
 
-fn lt_ptr<T>(m: *mut MsgBuf, p: *mut T) {
+fn lt_ptr<T>(m: *mut LexMsg, p: *mut T) {
     unsafe { lt_hex(m, p as usize as u64) }
 }
 
 // printf("%.14g")
-fn lt_g14(m: *mut MsgBuf, v: f64) {
+fn lt_g14(m: *mut LexMsg, v: f64) {
     unsafe {
         if v != v {
-            msg_str(m, "nan")
+            lmsg_str(m, "nan")
             return
         }
         x := v
-        if f64_bits(v) >> 63 != 0 {
-            msg_char(m, 45)
+        if cg_f64_bits(v) >> 63 != 0 {
+            lmsg_char(m, 45)
             x = -v
         }
         if x == 1.0 / 0.0 {
-            msg_str(m, "inf")
+            lmsg_str(m, "inf")
             return
         }
         if x == 0.0 {
-            msg_char(m, 48)
+            lmsg_char(m, 48)
             return
         }
         out: [400]u8 = [0u8; 400]
@@ -129,8 +129,8 @@ fn lt_g14(m: *mut MsgBuf, v: f64) {
             if last > 0 && out[last - 1] == 46 {
                 last = last - 1
             }
-            msg_bytes(m, ptr.as_ptr(&out), last)
-            msg_bytes(m, ptr.offset(ptr.as_ptr(&out), epos as isize), n - epos)
+            lmsg_bytes(m, ptr.as_ptr(&out), last)
+            lmsg_bytes(m, ptr.offset(ptr.as_ptr(&out), epos as isize), n - epos)
             return
         }
         let prec = (13 - ex) as usize
@@ -144,57 +144,57 @@ fn lt_g14(m: *mut MsgBuf, v: f64) {
                 last = last - 1
             }
         }
-        msg_bytes(m, ptr.as_ptr(&out), last)
+        lmsg_bytes(m, ptr.as_ptr(&out), last)
     }
 }
 
-fn lt_pstring(m: *mut MsgBuf, s: *mut LString) {
+fn lt_pstring(m: *mut LexMsg, s: *mut LString) {
     unsafe {
-        msg_char(m, 34)
+        lmsg_char(m, 34)
         let d = str_data(s)
         for i in 0usize..str_len(s) {
             let c = *ptr.offset(d, i as isize)
             if c == 34 {
-                msg_str(m, "\\\"")
+                lmsg_str(m, "\\\"")
             } else if c == 92 {
-                msg_str(m, "\\\\")
+                lmsg_str(m, "\\\\")
             } else if c == 7 {
-                msg_str(m, "\\a")
+                lmsg_str(m, "\\a")
             } else if c == 8 {
-                msg_str(m, "\\b")
+                lmsg_str(m, "\\b")
             } else if c == 12 {
-                msg_str(m, "\\f")
+                lmsg_str(m, "\\f")
             } else if c == 10 {
-                msg_str(m, "\\n")
+                lmsg_str(m, "\\n")
             } else if c == 13 {
-                msg_str(m, "\\r")
+                lmsg_str(m, "\\r")
             } else if c == 9 {
-                msg_str(m, "\\t")
+                lmsg_str(m, "\\t")
             } else if c == 11 {
-                msg_str(m, "\\v")
+                lmsg_str(m, "\\v")
             } else if c >= 32 && c <= 126 {
-                msg_char(m, c)
+                lmsg_char(m, c)
             } else {
-                msg_char(m, 92)
-                msg_char(m, 48 + c / 100)
-                msg_char(m, 48 + (c / 10) % 10)
-                msg_char(m, 48 + c % 10)
+                lmsg_char(m, 92)
+                lmsg_char(m, 48 + c / 100)
+                lmsg_char(m, 48 + (c / 10) % 10)
+                lmsg_char(m, 48 + c % 10)
             }
         }
-        msg_char(m, 34)
+        lmsg_char(m, 34)
     }
 }
 
-fn lt_const(m: *mut MsgBuf, f: *mut Proto, i: i32) {
+fn lt_const(m: *mut LexMsg, f: *mut Proto, i: i32) {
     unsafe {
         let o = ptr.offset((*f).k, i as isize)
         let t = (*o).tag
         if t == TAG_NIL {
-            msg_str(m, "nil")
+            lmsg_str(m, "nil")
         } else if t == TAG_FALSE {
-            msg_str(m, "false")
+            lmsg_str(m, "false")
         } else if t == TAG_TRUE {
-            msg_str(m, "true")
+            lmsg_str(m, "true")
         } else if t == TAG_FLOAT {
             let start = (*m).n
             lt_g14(m, val_float(o))
@@ -206,43 +206,43 @@ fn lt_const(m: *mut MsgBuf, f: *mut Proto, i: i32) {
                 }
             }
             if plain {
-                msg_str(m, ".0")
+                lmsg_str(m, ".0")
             }
         } else if t == TAG_INT {
-            msg_int(m, val_int(o))
+            lmsg_int(m, val_int(o))
         } else if t == TAG_SHORTSTR || t == TAG_LONGSTR {
             lt_pstring(m, val_str(o))
         } else {
-            msg_str(m, "?")
+            lmsg_str(m, "?")
         }
     }
 }
 
-fn lt_ktype(m: *mut MsgBuf, f: *mut Proto, i: i32) {
+fn lt_ktype(m: *mut LexMsg, f: *mut Proto, i: i32) {
     unsafe {
         let t = (*ptr.offset((*f).k, i as isize)).tag
         if t == TAG_NIL {
-            msg_str(m, "N")
+            lmsg_str(m, "N")
         } else if t == TAG_FALSE || t == TAG_TRUE {
-            msg_str(m, "B")
+            lmsg_str(m, "B")
         } else if t == TAG_FLOAT {
-            msg_str(m, "F")
+            lmsg_str(m, "F")
         } else if t == TAG_INT {
-            msg_str(m, "I")
+            lmsg_str(m, "I")
         } else {
-            msg_str(m, "S")
+            lmsg_str(m, "S")
         }
-        msg_str(m, "\t")
+        lmsg_str(m, "\t")
     }
 }
 
-fn lt_upname(m: *mut MsgBuf, f: *mut Proto, i: i32) {
+fn lt_upname(m: *mut LexMsg, f: *mut Proto, i: i32) {
     unsafe {
         let s = (*ptr.offset((*f).upvalues, i as isize)).name
         if ptr.is_null(s) {
-            msg_str(m, "-")
+            lmsg_str(m, "-")
         } else {
-            msg_lstr(m, s)
+            lmsg_lstr(m, s)
         }
     }
 }
@@ -270,25 +270,25 @@ fn lt_line(f: *mut Proto, pc: i32) -> i32 {
     }
 }
 
-fn lt_ints(m: *mut MsgBuf, a: i32, b: i32) {
-    msg_int(m, a as i64)
-    msg_char(m, 32)
-    msg_int(m, b as i64)
+fn lt_ints(m: *mut LexMsg, a: i32, b: i32) {
+    lmsg_int(m, a as i64)
+    lmsg_char(m, 32)
+    lmsg_int(m, b as i64)
 }
 
-fn lt_ints3(m: *mut MsgBuf, a: i32, b: i32, c: i32) {
+fn lt_ints3(m: *mut LexMsg, a: i32, b: i32, c: i32) {
     lt_ints(m, a, b)
-    msg_char(m, 32)
-    msg_int(m, c as i64)
+    lmsg_char(m, 32)
+    lmsg_int(m, c as i64)
 }
 
-fn lt_kflag(m: *mut MsgBuf, k: bool) {
+fn lt_kflag(m: *mut LexMsg, k: bool) {
     if k {
-        msg_str(m, "k")
+        lmsg_str(m, "k")
     }
 }
 
-fn lt_code(m: *mut MsgBuf, f: *mut Proto) {
+fn lt_code(m: *mut LexMsg, f: *mut Proto) {
     unsafe {
         let code = (*f).code
         for pc in 0..(*f).sizecode {
@@ -305,23 +305,23 @@ fn lt_code(m: *mut MsgBuf, f: *mut Proto) {
             let isk = arg_k(i)
             let kn = if isk { 1i32 } else { 0i32 }
             let line = lt_line(f, pc)
-            msg_str(m, "\t")
-            msg_int(m, (pc + 1) as i64)
-            msg_str(m, "\t")
+            lmsg_str(m, "\t")
+            lmsg_int(m, (pc + 1) as i64)
+            lmsg_str(m, "\t")
             if line > 0 {
-                msg_str(m, "[")
-                msg_int(m, line as i64)
-                msg_str(m, "]\t")
+                lmsg_str(m, "[")
+                lmsg_int(m, line as i64)
+                lmsg_str(m, "]\t")
             } else {
-                msg_str(m, "[-]\t")
+                lmsg_str(m, "[-]\t")
             }
             let name = LT_OPNAMES[o as usize]
-            msg_str(m, name)
+            lmsg_str(m, name)
             let nl = mem.str_bytes(name).len
             for p in nl..9 {
-                msg_char(m, 32)
+                lmsg_char(m, 32)
             }
-            msg_str(m, "\t")
+            lmsg_str(m, "\t")
             extra := 0i32
             if pc + 1 < (*f).sizecode {
                 extra = arg_ax(*ptr.offset(code, (pc + 1) as isize))
@@ -332,101 +332,101 @@ fn lt_code(m: *mut MsgBuf, f: *mut Proto) {
                 lt_ints(m, a, sbx)
             } else if o == OP_LOADK {
                 lt_ints(m, a, bx)
-                msg_str(m, "\t; ")
+                lmsg_str(m, "\t; ")
                 lt_const(m, f, bx)
             } else if o == OP_LOADKX {
-                msg_int(m, a as i64)
-                msg_str(m, "\t; ")
+                lmsg_int(m, a as i64)
+                lmsg_str(m, "\t; ")
                 lt_const(m, f, extra)
             } else if o == OP_LOADFALSE || o == OP_LFALSESKIP || o == OP_LOADTRUE || o == OP_CLOSE || o == OP_TBC || o == OP_RETURN1 || o == OP_VARARGPREP {
-                msg_int(m, a as i64)
+                lmsg_int(m, a as i64)
             } else if o == OP_LOADNIL {
                 lt_ints(m, a, b)
-                msg_str(m, "\t; ")
-                msg_int(m, (b + 1) as i64)
-                msg_str(m, " out")
+                lmsg_str(m, "\t; ")
+                lmsg_int(m, (b + 1) as i64)
+                lmsg_str(m, " out")
             } else if o == OP_GETUPVAL || o == OP_SETUPVAL {
                 lt_ints(m, a, b)
-                msg_str(m, "\t; ")
+                lmsg_str(m, "\t; ")
                 lt_upname(m, f, b)
             } else if o == OP_GETTABUP {
                 lt_ints3(m, a, b, c)
-                msg_str(m, "\t; ")
+                lmsg_str(m, "\t; ")
                 lt_upname(m, f, b)
-                msg_str(m, " ")
+                lmsg_str(m, " ")
                 lt_const(m, f, c)
             } else if o == OP_GETTABLE || o == OP_GETI || (o >= OP_ADD && o <= OP_SHR) {
                 lt_ints3(m, a, b, c)
             } else if o == OP_GETFIELD || (o >= OP_ADDK && o <= OP_BXORK) {
                 lt_ints3(m, a, b, c)
-                msg_str(m, "\t; ")
+                lmsg_str(m, "\t; ")
                 lt_const(m, f, c)
             } else if o == OP_SETTABUP {
                 lt_ints3(m, a, b, c)
                 lt_kflag(m, isk)
-                msg_str(m, "\t; ")
+                lmsg_str(m, "\t; ")
                 lt_upname(m, f, a)
-                msg_str(m, " ")
+                lmsg_str(m, " ")
                 lt_const(m, f, b)
                 if isk {
-                    msg_str(m, " ")
+                    lmsg_str(m, " ")
                     lt_const(m, f, c)
                 }
             } else if o == OP_SETTABLE || o == OP_SETI || o == OP_SELF {
                 lt_ints3(m, a, b, c)
                 lt_kflag(m, isk)
                 if isk {
-                    msg_str(m, "\t; ")
+                    lmsg_str(m, "\t; ")
                     lt_const(m, f, c)
                 }
             } else if o == OP_SETFIELD {
                 lt_ints3(m, a, b, c)
                 lt_kflag(m, isk)
-                msg_str(m, "\t; ")
+                lmsg_str(m, "\t; ")
                 lt_const(m, f, b)
                 if isk {
-                    msg_str(m, " ")
+                    lmsg_str(m, " ")
                     lt_const(m, f, c)
                 }
             } else if o == OP_NEWTABLE {
                 lt_ints3(m, a, b, c)
-                msg_str(m, "\t; ")
-                msg_int(m, (c + extra * (MAXARG_C + 1)) as i64)
+                lmsg_str(m, "\t; ")
+                lmsg_int(m, (c + extra * (MAXARG_C + 1)) as i64)
             } else if o == OP_ADDI || o == OP_SHRI || o == OP_SHLI {
                 lt_ints3(m, a, b, sc)
             } else if o == OP_MMBIN {
                 lt_ints3(m, a, b, c)
-                msg_str(m, "\t; ")
-                msg_str(m, LT_EVENTS[c as usize])
+                lmsg_str(m, "\t; ")
+                lmsg_str(m, LT_EVENTS[c as usize])
             } else if o == OP_MMBINI {
                 lt_ints3(m, a, sb, c)
-                msg_char(m, 32)
-                msg_int(m, kn as i64)
-                msg_str(m, "\t; ")
-                msg_str(m, LT_EVENTS[c as usize])
+                lmsg_char(m, 32)
+                lmsg_int(m, kn as i64)
+                lmsg_str(m, "\t; ")
+                lmsg_str(m, LT_EVENTS[c as usize])
                 if isk {
-                    msg_str(m, " flip")
+                    lmsg_str(m, " flip")
                 }
             } else if o == OP_MMBINK {
                 lt_ints3(m, a, b, c)
-                msg_char(m, 32)
-                msg_int(m, kn as i64)
-                msg_str(m, "\t; ")
-                msg_str(m, LT_EVENTS[c as usize])
-                msg_str(m, " ")
+                lmsg_char(m, 32)
+                lmsg_int(m, kn as i64)
+                lmsg_str(m, "\t; ")
+                lmsg_str(m, LT_EVENTS[c as usize])
+                lmsg_str(m, " ")
                 lt_const(m, f, b)
                 if isk {
-                    msg_str(m, " flip")
+                    lmsg_str(m, " flip")
                 }
             } else if o == OP_JMP {
-                msg_int(m, arg_sj(i) as i64)
-                msg_str(m, "\t; to ")
-                msg_int(m, (arg_sj(i) + pc + 2) as i64)
+                lmsg_int(m, arg_sj(i) as i64)
+                lmsg_str(m, "\t; to ")
+                lmsg_int(m, (arg_sj(i) + pc + 2) as i64)
             } else if o == OP_EQ || o == OP_LT || o == OP_LE || o == OP_TESTSET {
                 lt_ints3(m, a, b, kn)
             } else if o == OP_EQK {
                 lt_ints3(m, a, b, kn)
-                msg_str(m, "\t; ")
+                lmsg_str(m, "\t; ")
                 lt_const(m, f, b)
             } else if o >= OP_EQI && o <= OP_GEI {
                 lt_ints3(m, a, sb, kn)
@@ -434,184 +434,184 @@ fn lt_code(m: *mut MsgBuf, f: *mut Proto) {
                 lt_ints(m, a, kn)
             } else if o == OP_CALL {
                 lt_ints3(m, a, b, c)
-                msg_str(m, "\t; ")
+                lmsg_str(m, "\t; ")
                 if b == 0 {
-                    msg_str(m, "all in ")
+                    lmsg_str(m, "all in ")
                 } else {
-                    msg_int(m, (b - 1) as i64)
-                    msg_str(m, " in ")
+                    lmsg_int(m, (b - 1) as i64)
+                    lmsg_str(m, " in ")
                 }
                 if c == 0 {
-                    msg_str(m, "all out")
+                    lmsg_str(m, "all out")
                 } else {
-                    msg_int(m, (c - 1) as i64)
-                    msg_str(m, " out")
+                    lmsg_int(m, (c - 1) as i64)
+                    lmsg_str(m, " out")
                 }
             } else if o == OP_TAILCALL {
                 lt_ints3(m, a, b, c)
                 lt_kflag(m, isk)
-                msg_str(m, "\t; ")
-                msg_int(m, (b - 1) as i64)
-                msg_str(m, " in")
+                lmsg_str(m, "\t; ")
+                lmsg_int(m, (b - 1) as i64)
+                lmsg_str(m, " in")
             } else if o == OP_RETURN {
                 lt_ints3(m, a, b, c)
                 lt_kflag(m, isk)
-                msg_str(m, "\t; ")
+                lmsg_str(m, "\t; ")
                 if b == 0 {
-                    msg_str(m, "all out")
+                    lmsg_str(m, "all out")
                 } else {
-                    msg_int(m, (b - 1) as i64)
-                    msg_str(m, " out")
+                    lmsg_int(m, (b - 1) as i64)
+                    lmsg_str(m, " out")
                 }
             } else if o == OP_RETURN0 {
             } else if o == OP_FORLOOP || o == OP_TFORLOOP {
                 lt_ints(m, a, bx)
-                msg_str(m, "\t; to ")
-                msg_int(m, (pc - bx + 2) as i64)
+                lmsg_str(m, "\t; to ")
+                lmsg_int(m, (pc - bx + 2) as i64)
             } else if o == OP_FORPREP {
                 lt_ints(m, a, bx)
-                msg_str(m, "\t; exit to ")
-                msg_int(m, (pc + bx + 3) as i64)
+                lmsg_str(m, "\t; exit to ")
+                lmsg_int(m, (pc + bx + 3) as i64)
             } else if o == OP_TFORPREP {
                 lt_ints(m, a, bx)
-                msg_str(m, "\t; to ")
-                msg_int(m, (pc + bx + 2) as i64)
+                lmsg_str(m, "\t; to ")
+                lmsg_int(m, (pc + bx + 2) as i64)
             } else if o == OP_TFORCALL {
                 lt_ints(m, a, c)
             } else if o == OP_SETLIST {
                 lt_ints3(m, a, b, c)
                 if isk {
-                    msg_str(m, "\t; ")
-                    msg_int(m, (c + extra * (MAXARG_C + 1)) as i64)
+                    lmsg_str(m, "\t; ")
+                    lmsg_int(m, (c + extra * (MAXARG_C + 1)) as i64)
                 }
             } else if o == OP_CLOSURE {
                 lt_ints(m, a, bx)
-                msg_str(m, "\t; ")
+                lmsg_str(m, "\t; ")
                 lt_ptr(m, *ptr.offset((*f).p, bx as isize))
             } else if o == OP_VARARG {
                 lt_ints(m, a, c)
-                msg_str(m, "\t; ")
+                lmsg_str(m, "\t; ")
                 if c == 0 {
-                    msg_str(m, "all out")
+                    lmsg_str(m, "all out")
                 } else {
-                    msg_int(m, (c - 1) as i64)
-                    msg_str(m, " out")
+                    lmsg_int(m, (c - 1) as i64)
+                    lmsg_str(m, " out")
                 }
             } else if o == OP_EXTRAARG {
-                msg_int(m, ax as i64)
+                lmsg_int(m, ax as i64)
             }
-            msg_str(m, "\n")
+            lmsg_str(m, "\n")
         }
     }
 }
 
-fn lt_plural(m: *mut MsgBuf, n: i32, word: &str) {
-    msg_int(m, n as i64)
-    msg_str(m, " ")
-    msg_str(m, word)
+fn lt_plural(m: *mut LexMsg, n: i32, word: &str) {
+    lmsg_int(m, n as i64)
+    lmsg_str(m, " ")
+    lmsg_str(m, word)
     if n != 1 {
-        msg_str(m, "s")
+        lmsg_str(m, "s")
     }
 }
 
-fn lt_header(m: *mut MsgBuf, f: *mut Proto) {
+fn lt_header(m: *mut LexMsg, f: *mut Proto) {
     unsafe {
         let src = (*f).source
         let d = str_data(src)
-        msg_str(m, "\n")
-        msg_str(m, if (*f).linedefined == 0 { "main" } else { "function" })
-        msg_str(m, " <")
+        lmsg_str(m, "\n")
+        lmsg_str(m, if (*f).linedefined == 0 { "main" } else { "function" })
+        lmsg_str(m, " <")
         if str_len(src) > 0 && (*d == 64 || *d == 61) {
-            msg_bytes(m, ptr.offset(d, 1) as *const u8, str_len(src) - 1)
+            lmsg_bytes(m, ptr.offset(d, 1) as *const u8, str_len(src) - 1)
         } else if str_len(src) > 0 && *d == 27 {
-            msg_str(m, "(bstring)")
+            lmsg_str(m, "(bstring)")
         } else {
-            msg_str(m, "(string)")
+            lmsg_str(m, "(string)")
         }
-        msg_str(m, ":")
-        msg_int(m, (*f).linedefined as i64)
-        msg_str(m, ",")
-        msg_int(m, (*f).lastlinedefined as i64)
-        msg_str(m, "> (")
+        lmsg_str(m, ":")
+        lmsg_int(m, (*f).linedefined as i64)
+        lmsg_str(m, ",")
+        lmsg_int(m, (*f).lastlinedefined as i64)
+        lmsg_str(m, "> (")
         lt_plural(m, (*f).sizecode, "instruction")
-        msg_str(m, " at ")
+        lmsg_str(m, " at ")
         lt_ptr(m, f)
-        msg_str(m, ")\n")
-        msg_int(m, (*f).numparams as i64)
+        lmsg_str(m, ")\n")
+        lmsg_int(m, (*f).numparams as i64)
         if (*f).is_vararg != 0 {
-            msg_str(m, "+")
+            lmsg_str(m, "+")
         }
-        msg_str(m, " param")
+        lmsg_str(m, " param")
         if (*f).numparams != 1 {
-            msg_str(m, "s")
+            lmsg_str(m, "s")
         }
-        msg_str(m, ", ")
+        lmsg_str(m, ", ")
         lt_plural(m, (*f).maxstacksize as i32, "slot")
-        msg_str(m, ", ")
+        lmsg_str(m, ", ")
         lt_plural(m, (*f).sizeupvalues, "upvalue")
-        msg_str(m, ", ")
+        lmsg_str(m, ", ")
         lt_plural(m, (*f).sizelocvars, "local")
-        msg_str(m, ", ")
+        lmsg_str(m, ", ")
         lt_plural(m, (*f).sizek, "constant")
-        msg_str(m, ", ")
+        lmsg_str(m, ", ")
         lt_plural(m, (*f).sizep, "function")
-        msg_str(m, "\n")
+        lmsg_str(m, "\n")
     }
 }
 
-fn lt_debug(m: *mut MsgBuf, f: *mut Proto) {
+fn lt_debug(m: *mut LexMsg, f: *mut Proto) {
     unsafe {
-        msg_str(m, "constants (")
-        msg_int(m, (*f).sizek as i64)
-        msg_str(m, ") for ")
+        lmsg_str(m, "constants (")
+        lmsg_int(m, (*f).sizek as i64)
+        lmsg_str(m, ") for ")
         lt_ptr(m, f)
-        msg_str(m, ":\n")
+        lmsg_str(m, ":\n")
         for i in 0..(*f).sizek {
-            msg_str(m, "\t")
-            msg_int(m, i as i64)
-            msg_str(m, "\t")
+            lmsg_str(m, "\t")
+            lmsg_int(m, i as i64)
+            lmsg_str(m, "\t")
             lt_ktype(m, f, i)
             lt_const(m, f, i)
-            msg_str(m, "\n")
+            lmsg_str(m, "\n")
         }
-        msg_str(m, "locals (")
-        msg_int(m, (*f).sizelocvars as i64)
-        msg_str(m, ") for ")
+        lmsg_str(m, "locals (")
+        lmsg_int(m, (*f).sizelocvars as i64)
+        lmsg_str(m, ") for ")
         lt_ptr(m, f)
-        msg_str(m, ":\n")
+        lmsg_str(m, ":\n")
         for i in 0..(*f).sizelocvars {
             let lv = ptr.offset((*f).locvars, i as isize)
-            msg_str(m, "\t")
-            msg_int(m, i as i64)
-            msg_str(m, "\t")
-            msg_lstr(m, (*lv).name)
-            msg_str(m, "\t")
-            msg_int(m, ((*lv).startpc + 1) as i64)
-            msg_str(m, "\t")
-            msg_int(m, ((*lv).endpc + 1) as i64)
-            msg_str(m, "\n")
+            lmsg_str(m, "\t")
+            lmsg_int(m, i as i64)
+            lmsg_str(m, "\t")
+            lmsg_lstr(m, (*lv).name)
+            lmsg_str(m, "\t")
+            lmsg_int(m, ((*lv).startpc + 1) as i64)
+            lmsg_str(m, "\t")
+            lmsg_int(m, ((*lv).endpc + 1) as i64)
+            lmsg_str(m, "\n")
         }
-        msg_str(m, "upvalues (")
-        msg_int(m, (*f).sizeupvalues as i64)
-        msg_str(m, ") for ")
+        lmsg_str(m, "upvalues (")
+        lmsg_int(m, (*f).sizeupvalues as i64)
+        lmsg_str(m, ") for ")
         lt_ptr(m, f)
-        msg_str(m, ":\n")
+        lmsg_str(m, ":\n")
         for i in 0..(*f).sizeupvalues {
             let u = ptr.offset((*f).upvalues, i as isize)
-            msg_str(m, "\t")
-            msg_int(m, i as i64)
-            msg_str(m, "\t")
+            lmsg_str(m, "\t")
+            lmsg_int(m, i as i64)
+            lmsg_str(m, "\t")
             lt_upname(m, f, i)
-            msg_str(m, "\t")
-            msg_int(m, (*u).instack as i64)
-            msg_str(m, "\t")
-            msg_int(m, (*u).index as i64)
-            msg_str(m, "\n")
+            lmsg_str(m, "\t")
+            lmsg_int(m, (*u).instack as i64)
+            lmsg_str(m, "\t")
+            lmsg_int(m, (*u).index as i64)
+            lmsg_str(m, "\n")
         }
     }
 }
 
-fn lt_function(m: *mut MsgBuf, f: *mut Proto) {
+fn lt_function(m: *mut LexMsg, f: *mut Proto) {
     unsafe {
         lt_header(m, f)
         lt_code(m, f)
@@ -624,7 +624,7 @@ fn lt_function(m: *mut MsgBuf, f: *mut Proto) {
 
 // --- Binary chunks ------------------------------------------------------------------
 
-fn dw_size(m: *mut MsgBuf, v: usize) {
+fn lt_dump_size(m: *mut LexMsg, v: usize) {
     tmp: [12]u8 = [0u8; 12]
     n := 0usize
     x := v
@@ -638,107 +638,107 @@ fn dw_size(m: *mut MsgBuf, v: usize) {
     }
     for i in 0usize..n {
         let byte = tmp[n - 1 - i]
-        msg_char(m, if i == n - 1 { byte | 128 } else { byte })
+        lmsg_char(m, if i == n - 1 { byte | 128 } else { byte })
     }
 }
 
-fn dw_raw8(m: *mut MsgBuf, v: u64) {
+fn lt_dump_raw8(m: *mut LexMsg, v: u64) {
     for i in 0u64..8 {
-        msg_char(m, ((v >> (i * 8)) & 255) as u8)
+        lmsg_char(m, ((v >> (i * 8)) & 255) as u8)
     }
 }
 
-fn dw_string(m: *mut MsgBuf, s: *mut LString) {
+fn lt_dump_string(m: *mut LexMsg, s: *mut LString) {
     unsafe {
         if ptr.is_null(s) {
-            dw_size(m, 0)
+            lt_dump_size(m, 0)
             return
         }
-        dw_size(m, str_len(s) + 1)
-        msg_lstr(m, s)
+        lt_dump_size(m, str_len(s) + 1)
+        lmsg_lstr(m, s)
     }
 }
 
-fn dw_function(m: *mut MsgBuf, f: *mut Proto, psource: *mut LString) {
+fn lt_dump_function(m: *mut LexMsg, f: *mut Proto, psource: *mut LString) {
     unsafe {
         if (*f).source == psource {
-            dw_string(m, 0 as *mut LString)
+            lt_dump_string(m, 0 as *mut LString)
         } else {
-            dw_string(m, (*f).source)
+            lt_dump_string(m, (*f).source)
         }
-        dw_size(m, (*f).linedefined as usize)
-        dw_size(m, (*f).lastlinedefined as usize)
-        msg_char(m, (*f).numparams)
-        msg_char(m, (*f).is_vararg)
-        msg_char(m, (*f).maxstacksize)
-        dw_size(m, (*f).sizecode as usize)
+        lt_dump_size(m, (*f).linedefined as usize)
+        lt_dump_size(m, (*f).lastlinedefined as usize)
+        lmsg_char(m, (*f).numparams)
+        lmsg_char(m, (*f).is_vararg)
+        lmsg_char(m, (*f).maxstacksize)
+        lt_dump_size(m, (*f).sizecode as usize)
         for i in 0..(*f).sizecode {
             let ins = *ptr.offset((*f).code, i as isize)
             for b in 0u32..4 {
-                msg_char(m, ((ins >> (b * 8)) & 255) as u8)
+                lmsg_char(m, ((ins >> (b * 8)) & 255) as u8)
             }
         }
-        dw_size(m, (*f).sizek as usize)
+        lt_dump_size(m, (*f).sizek as usize)
         for i in 0..(*f).sizek {
             let o = ptr.offset((*f).k, i as isize)
             let t = (*o).tag
-            msg_char(m, t & 0x3f)
+            lmsg_char(m, t & 0x3f)
             if t == TAG_FLOAT || t == TAG_INT {
-                dw_raw8(m, (*o).bits)
+                lt_dump_raw8(m, (*o).bits)
             } else if t == TAG_SHORTSTR || t == TAG_LONGSTR {
-                dw_string(m, val_str(o))
+                lt_dump_string(m, val_str(o))
             }
         }
-        dw_size(m, (*f).sizeupvalues as usize)
+        lt_dump_size(m, (*f).sizeupvalues as usize)
         for i in 0..(*f).sizeupvalues {
             let u = ptr.offset((*f).upvalues, i as isize)
-            msg_char(m, (*u).instack)
-            msg_char(m, (*u).index)
-            msg_char(m, (*u).kind)
+            lmsg_char(m, (*u).instack)
+            lmsg_char(m, (*u).index)
+            lmsg_char(m, (*u).kind)
         }
-        dw_size(m, (*f).sizep as usize)
+        lt_dump_size(m, (*f).sizep as usize)
         for i in 0..(*f).sizep {
-            dw_function(m, *ptr.offset((*f).p, i as isize), (*f).source)
+            lt_dump_function(m, *ptr.offset((*f).p, i as isize), (*f).source)
         }
-        dw_size(m, (*f).sizelineinfo as usize)
+        lt_dump_size(m, (*f).sizelineinfo as usize)
         for i in 0..(*f).sizelineinfo {
             let li = *ptr.offset((*f).lineinfo, i as isize)
-            msg_char(m, (li as i32 & 255) as u8)
+            lmsg_char(m, (li as i32 & 255) as u8)
         }
-        dw_size(m, (*f).sizeabslineinfo as usize)
+        lt_dump_size(m, (*f).sizeabslineinfo as usize)
         for i in 0..(*f).sizeabslineinfo {
             let a = ptr.offset((*f).abslineinfo, i as isize)
-            dw_size(m, (*a).pc as usize)
-            dw_size(m, (*a).line as usize)
+            lt_dump_size(m, (*a).pc as usize)
+            lt_dump_size(m, (*a).line as usize)
         }
-        dw_size(m, (*f).sizelocvars as usize)
+        lt_dump_size(m, (*f).sizelocvars as usize)
         for i in 0..(*f).sizelocvars {
             let lv = ptr.offset((*f).locvars, i as isize)
-            dw_string(m, (*lv).name)
-            dw_size(m, (*lv).startpc as usize)
-            dw_size(m, (*lv).endpc as usize)
+            lt_dump_string(m, (*lv).name)
+            lt_dump_size(m, (*lv).startpc as usize)
+            lt_dump_size(m, (*lv).endpc as usize)
         }
-        dw_size(m, (*f).sizeupvalues as usize)
+        lt_dump_size(m, (*f).sizeupvalues as usize)
         for i in 0..(*f).sizeupvalues {
-            dw_string(m, (*ptr.offset((*f).upvalues, i as isize)).name)
+            lt_dump_string(m, (*ptr.offset((*f).upvalues, i as isize)).name)
         }
     }
 }
 
-fn dw_chunk(m: *mut MsgBuf, f: *mut Proto) {
+fn lt_dump_chunk(m: *mut LexMsg, f: *mut Proto) {
     unsafe {
-        msg_str(m, "\x1bLua")
-        msg_char(m, 0x54)
-        msg_char(m, 0)
+        lmsg_str(m, "\x1bLua")
+        lmsg_char(m, 0x54)
+        lmsg_char(m, 0)
         let data = b"\x19\x93\r\n\x1a\n"
-        msg_bytes(m, ptr.as_ptr(data), data.len)
-        msg_char(m, 4)
-        msg_char(m, 8)
-        msg_char(m, 8)
-        dw_raw8(m, 0x5678)
-        dw_raw8(m, f64_bits(370.5))
-        msg_char(m, (*f).sizeupvalues as u8)
-        dw_function(m, f, 0 as *mut LString)
+        lmsg_bytes(m, ptr.as_ptr(data), data.len)
+        lmsg_char(m, 4)
+        lmsg_char(m, 8)
+        lmsg_char(m, 8)
+        lt_dump_raw8(m, 0x5678)
+        lt_dump_raw8(m, cg_f64_bits(370.5))
+        lmsg_char(m, (*f).sizeupvalues as u8)
+        lt_dump_function(m, f, 0 as *mut LString)
     }
 }
 
@@ -807,10 +807,10 @@ fn lt_atoi(p: *mut u8) -> i32 {
 
 fn lt_err(text: &str) -> i32 {
     unsafe {
-        m := msg_new(0 as *mut State)
+        m := lmsg_new(0 as *mut State)
         let pm = ptr.from_mut(&mut m)
-        msg_str(pm, text)
-        msg_str(pm, "\n")
+        lmsg_str(pm, text)
+        lmsg_str(pm, "\n")
         lt_flush(pm, 2)
         return 1
     }
@@ -884,28 +884,28 @@ pub fn tool_main() -> i32 {
                     fp = p
                 },
                 err(_) => {
-                    m := msg_new(L)
+                    m := lmsg_new(L)
                     let pm = ptr.from_mut(&mut m)
-                    msg_str(pm, "luatool: ")
+                    lmsg_str(pm, "luatool: ")
                     let ev = ptr.offset(L as *mut u8, mem.offset_of::<State>("errobj") as isize) as *mut Value
                     if ((*ev).tag & 15) == TYPE_STRING {
-                        msg_lstr(pm, val_str(ev))
+                        lmsg_lstr(pm, val_str(ev))
                     } else {
-                        msg_str(pm, "not enough memory")
+                        lmsg_str(pm, "not enough memory")
                     }
-                    msg_str(pm, "\n")
+                    lmsg_str(pm, "\n")
                     lt_flush(pm, 2)
                     return 1
                 },
             }
         }
         let t1 = lt_clock()
-        m := msg_new(L)
+        m := lmsg_new(L)
         let pm = ptr.from_mut(&mut m)
         if times > 1 {
-            msg_str(pm, "compile time per run (us): ")
-            msg_int(pm, ((t1 - t0) / (times as u64)) as i64)
-            msg_str(pm, "\n")
+            lmsg_str(pm, "compile time per run (us): ")
+            lmsg_int(pm, ((t1 - t0) / (times as u64)) as i64)
+            lmsg_str(pm, "\n")
             lt_flush(pm, 2)
         }
         if listing {
@@ -913,7 +913,7 @@ pub fn tool_main() -> i32 {
             lt_flush(pm, 1)
         }
         if !ptr.is_null(outpath) {
-            dw_chunk(pm, fp)
+            lt_dump_chunk(pm, fp)
             let fd = lt_creat(outpath as *const u8, 420)
             if fd < 0 {
                 return lt_err("luatool: cannot open output")

@@ -212,6 +212,10 @@ class Gen:
                 self.labels += 1
                 lb = "B%d" % self.labels
                 return "do\n::%s::\n%s\nif %s then goto %s end\nend" % (lb, self.block(scope, 2), self.cond(scope), lb)
+            if r < 0.95:
+                # Many distinct constants push later ones past the RK range.
+                base = self.r.randint(0, 1000)
+                return "local big = {" + ", ".join("%d.5" % (base + i) for i in range(self.r.randint(200, 300))) + "}"
             return "%s = %s" % (self.target(scope), self.expr(scope, 1))
         finally:
             self.depth -= 1

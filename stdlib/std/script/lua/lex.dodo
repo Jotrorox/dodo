@@ -70,7 +70,7 @@ struct LexStr {
 
 // Whole-compilation state: scanner, string table, constant cache and the
 // parser's shared lists (active variables, pending gotos, visible labels).
-struct Cmp {
+struct CompileState {
     L: *mut State
     src: *mut u8
     srclen: usize
@@ -102,7 +102,7 @@ struct Cmp {
     st_slots: *mut LexStr
     st_cap: usize
     st_count: usize
-    kc_slots: *mut KSlot
+    kc_slots: *mut CgKSlot
     kc_cap: usize
     kc_count: usize
     name_env: *mut LString
@@ -111,13 +111,13 @@ struct Cmp {
     name_forstate: *mut LString
     // Parser state.
     fs: *mut FnState
-    actvar: *mut VarDesc
+    actvar: *mut ParVar
     nactv: i32
     capactv: i32
-    gotos: *mut LabelDesc
+    gotos: *mut ParLabel
     ngoto: i32
     capgoto: i32
-    labels: *mut LabelDesc
+    labels: *mut ParLabel
     nlabel: i32
     caplabel: i32
     // Syntactic nesting depth (bounded like the C stack of the reference).
@@ -157,7 +157,7 @@ fn lx_isnewline(c: i32) -> bool {
 // --- Error messages ------------------------------------------------------------
 
 // A growable message under construction.
-struct MsgBuf {
+struct LexMsg {
     L: *mut State
     p: *mut u8
     n: usize
@@ -165,13 +165,13 @@ struct MsgBuf {
     oom: bool
 }
 
-fn msg_new(L: *mut State) -> MsgBuf {
+fn lmsg_new(L: *mut State) -> LexMsg {
     unsafe {
-        return MsgBuf { L: L, p: 0 as *mut u8, n: 0, cap: 0, oom: false }
+        return LexMsg { L: L, p: 0 as *mut u8, n: 0, cap: 0, oom: false }
     }
 }
 
-fn msg_bytes(m: *mut MsgBuf, src: *const u8, count: usize) {
+fn lmsg_bytes(m: *mut LexMsg, src: *const u8, count: usize) {
     unsafe {
         if (*m).oom {
             return
@@ -200,25 +200,25 @@ fn msg_bytes(m: *mut MsgBuf, src: *const u8, count: usize) {
     }
 }
 
-fn msg_str(m: *mut MsgBuf, s: &str) {
+fn lmsg_str(m: *mut LexMsg, s: &str) {
     unsafe {
         let b = mem.str_bytes(s)
-        msg_bytes(m, ptr.as_ptr(b), b.len)
+        lmsg_bytes(m, ptr.as_ptr(b), b.len)
     }
 }
 
-fn msg_char(m: *mut MsgBuf, c: u8) {
+fn lmsg_char(m: *mut LexMsg, c: u8) {
     unsafe {
         ch := c
-        msg_bytes(m, ptr.from_ref(&ch), 1)
+        lmsg_bytes(m, ptr.from_ref(&ch), 1)
     }
 }
 
-fn msg_lstr(m: *mut MsgBuf, s: *mut LString) {
-    unsafe { msg_bytes(m, str_data(s) as *const u8, str_len(s)) }
+fn lmsg_lstr(m: *mut LexMsg, s: *mut LString) {
+    unsafe { lmsg_bytes(m, str_data(s) as *const u8, str_len(s)) }
 }
 
-fn msg_int(m: *mut MsgBuf, v: i64) {
+fn lmsg_int(m: *mut LexMsg, v: i64) {
     digits: [24]u8 = [0u8; 24]
     n := 0usize
     neg := v < 0
@@ -234,14 +234,14 @@ fn msg_int(m: *mut MsgBuf, v: i64) {
         }
     }
     if neg {
-        msg_char(m, 45)
+        lmsg_char(m, 45)
     }
     for i in 0usize..n {
-        msg_char(m, digits[n - 1 - i])
+        lmsg_char(m, digits[n - 1 - i])
     }
 }
 
-fn msg_free(m: *mut MsgBuf) {
+fn lmsg_free(m: *mut LexMsg) {
     unsafe {
         if (*m).cap != 0 {
             mem_free((*m).L, (*m).p, (*m).cap)
@@ -251,45 +251,45 @@ fn msg_free(m: *mut MsgBuf) {
 }
 
 // Start a positioned message: "chunkid:line: ".
-fn msg_begin(cx: *mut Cmp, m: *mut MsgBuf) {
+fn lmsg_begin(cx: *mut CompileState, m: *mut LexMsg) {
     unsafe {
         out: [64]u8 = [0u8; 64]
         let src = (*cx).source
         let n = chunk_id(str_data(src), str_len(src), ptr.as_mut_ptr(&mut out))
-        msg_bytes(m, ptr.as_ptr(&out), n)
-        msg_char(m, 58)
-        msg_int(m, (*cx).line as i64)
-        msg_str(m, ": ")
+        lmsg_bytes(m, ptr.as_ptr(&out), n)
+        lmsg_char(m, 58)
+        lmsg_int(m, (*cx).line as i64)
+        lmsg_str(m, ": ")
     }
 }
 
 // Append the printable form of a token: 'x' for symbols and reserved
 // words, '<\N>' for control characters, the class name for the others.
-fn lx_token2str(m: *mut MsgBuf, token: i32) {
+fn lx_token2str(m: *mut LexMsg, token: i32) {
     if token < 257 {
         if lx_isprint(token) {
-            msg_char(m, 39)
-            msg_char(m, token as u8)
-            msg_char(m, 39)
+            lmsg_char(m, 39)
+            lmsg_char(m, token as u8)
+            lmsg_char(m, 39)
         } else {
-            msg_str(m, "'<\\")
-            msg_int(m, token as i64)
-            msg_str(m, ">'")
+            lmsg_str(m, "'<\\")
+            lmsg_int(m, token as i64)
+            lmsg_str(m, ">'")
         }
         return
     }
     let s = LX_TOKEN_NAMES[(token - 257) as usize]
     if token < TK_EOS {
-        msg_char(m, 39)
-        msg_str(m, s)
-        msg_char(m, 39)
+        lmsg_char(m, 39)
+        lmsg_str(m, s)
+        lmsg_char(m, 39)
     } else {
-        msg_str(m, s)
+        lmsg_str(m, s)
     }
 }
 
 // Like lx_token2str, but names, strings and numerals show their text.
-fn lx_txttoken(cx: *mut Cmp, m: *mut MsgBuf, token: i32) {
+fn lx_txttoken(cx: *mut CompileState, m: *mut LexMsg, token: i32) {
     unsafe {
         if token == TK_NAME || token == TK_STRING || token == TK_FLT || token == TK_INT {
             // The text is cut at an embedded zero byte, like a C string.
@@ -297,9 +297,9 @@ fn lx_txttoken(cx: *mut Cmp, m: *mut MsgBuf, token: i32) {
             for n < (*cx).nbuf && *ptr.offset((*cx).buf, n as isize) != 0 {
                 n = n + 1
             }
-            msg_char(m, 39)
-            msg_bytes(m, (*cx).buf as *const u8, n)
-            msg_char(m, 39)
+            lmsg_char(m, 39)
+            lmsg_bytes(m, (*cx).buf as *const u8, n)
+            lmsg_char(m, 39)
             return
         }
         lx_token2str(m, token)
@@ -307,40 +307,40 @@ fn lx_txttoken(cx: *mut Cmp, m: *mut MsgBuf, token: i32) {
 }
 
 // Finish a message (adding " near <token>" unless token is 0) and raise it.
-fn msg_raise(cx: *mut Cmp, m: *mut MsgBuf, token: i32) -> Throw {
+fn lmsg_raise(cx: *mut CompileState, m: *mut LexMsg, token: i32) -> Throw {
     unsafe {
         if token != 0 {
-            msg_str(m, " near ")
+            lmsg_str(m, " near ")
             lx_txttoken(cx, m, token)
         }
         if (*m).oom {
-            msg_free(m)
+            lmsg_free(m)
             return Throw.Memory
         }
         let t = err_syntax((*cx).L, (*m).p as *const u8, (*m).n)
-        msg_free(m)
+        lmsg_free(m)
         return t
     }
 }
 
 // A lexical error at the current line, near `token`.
-fn lx_error(cx: *mut Cmp, text: &str, token: i32) -> Throw {
+fn lx_error(cx: *mut CompileState, text: &str, token: i32) -> Throw {
     unsafe {
-        m := msg_new((*cx).L)
+        m := lmsg_new((*cx).L)
         let pm = ptr.from_mut(&mut m)
-        msg_begin(cx, pm)
-        msg_str(pm, text)
-        return msg_raise(cx, pm, token)
+        lmsg_begin(cx, pm)
+        lmsg_str(pm, text)
+        return lmsg_raise(cx, pm, token)
     }
 }
 
 // A syntax error near the current token.
-fn lex_error_here(cx: *mut Cmp, text: &str) -> Throw {
+fn lex_error_here(cx: *mut CompileState, text: &str) -> Throw {
     unsafe { return lx_error(cx, text, (*cx).tk) }
 }
 
 // A semantic error (no token shown).
-fn lex_semerror(cx: *mut Cmp, text: &str) -> Throw {
+fn lex_semerror(cx: *mut CompileState, text: &str) -> Throw {
     return lx_error(cx, text, 0)
 }
 
@@ -348,14 +348,14 @@ fn lex_semerror(cx: *mut Cmp, text: &str) -> Throw {
 fn lex_limit_error(fs: *mut FnState, what: &str, limit: i32) -> Throw {
     unsafe {
         let cx = (*fs).cx
-        m := msg_new((*cx).L)
+        m := lmsg_new((*cx).L)
         let pm = ptr.from_mut(&mut m)
-        msg_str(pm, "too many ")
-        msg_str(pm, what)
-        msg_str(pm, " (limit is ")
-        msg_int(pm, limit as i64)
-        msg_str(pm, ")")
-        return msg_raise(cx, pm, 0)
+        lmsg_str(pm, "too many ")
+        lmsg_str(pm, what)
+        lmsg_str(pm, " (limit is ")
+        lmsg_int(pm, limit as i64)
+        lmsg_str(pm, ")")
+        return lmsg_raise(cx, pm, 0)
     }
 }
 
@@ -371,7 +371,7 @@ fn lx_hash(p: *mut u8, n: usize) -> u32 {
     }
 }
 
-fn lx_strtab_grow(cx: *mut Cmp) -> void!Throw {
+fn lx_strtab_grow(cx: *mut CompileState) -> void!Throw {
     unsafe {
         let oldcap = (*cx).st_cap
         let old = (*cx).st_slots
@@ -404,7 +404,7 @@ fn lx_strtab_grow(cx: *mut Cmp) -> void!Throw {
 }
 
 // The unique string with these bytes; `tok` receives its reserved-word token (or 0).
-fn lx_intern(cx: *mut Cmp, p: *mut u8, n: usize, tok: *mut i32) -> (*mut LString)!Throw {
+fn lx_intern(cx: *mut CompileState, p: *mut u8, n: usize, tok: *mut i32) -> (*mut LString)!Throw {
     unsafe {
         if ((*cx).st_count + 1) * 2 > (*cx).st_cap {
             lx_strtab_grow(cx)?
@@ -445,7 +445,7 @@ fn lx_intern(cx: *mut Cmp, p: *mut u8, n: usize, tok: *mut i32) -> (*mut LString
     }
 }
 
-fn lx_intern_str(cx: *mut Cmp, text: &str) -> (*mut LString)!Throw {
+fn lx_intern_str(cx: *mut CompileState, text: &str) -> (*mut LString)!Throw {
     unsafe {
         let b = mem.str_bytes(text)
         t := 0i32
@@ -454,7 +454,7 @@ fn lx_intern_str(cx: *mut Cmp, text: &str) -> (*mut LString)!Throw {
 }
 
 // Enter the reserved words (marked with their tokens) and the fixed names.
-fn lx_init_names(cx: *mut Cmp) -> void!Throw {
+fn lx_init_names(cx: *mut CompileState) -> void!Throw {
     unsafe {
         for i in 0usize..22 {
             let s = lx_intern_str(cx, LX_TOKEN_NAMES[i])?
@@ -477,7 +477,7 @@ fn lx_init_names(cx: *mut Cmp) -> void!Throw {
 
 // --- Reading characters -----------------------------------------------------------
 
-fn lx_advance(cx: *mut Cmp) {
+fn lx_advance(cx: *mut CompileState) {
     unsafe {
         let p = (*cx).pos
         if p < (*cx).srclen {
@@ -489,7 +489,7 @@ fn lx_advance(cx: *mut Cmp) {
     }
 }
 
-fn lx_save(cx: *mut Cmp, c: i32) -> void!Throw {
+fn lx_save(cx: *mut CompileState, c: i32) -> void!Throw {
     unsafe {
         if (*cx).nbuf >= (*cx).capbuf {
             let old = (*cx).capbuf
@@ -508,7 +508,7 @@ fn lx_save(cx: *mut Cmp, c: i32) -> void!Throw {
 
 // Append the `n` source bytes starting at the current character and move
 // past them (the caller has checked they need no special treatment).
-fn lx_save_run(cx: *mut Cmp, n: usize) -> void!Throw {
+fn lx_save_run(cx: *mut CompileState, n: usize) -> void!Throw {
     unsafe {
         let need = (*cx).nbuf + n
         if need > (*cx).capbuf {
@@ -531,7 +531,7 @@ fn lx_save_run(cx: *mut Cmp, n: usize) -> void!Throw {
 
 // Length of the run of bytes from the current character on for which
 // are name characters (at least 1: the current character starts a name).
-fn lx_ident_run(cx: *mut Cmp) -> usize {
+fn lx_ident_run(cx: *mut CompileState) -> usize {
     unsafe {
         let start = (*cx).pos - 1
         i := (*cx).pos
@@ -543,7 +543,7 @@ fn lx_ident_run(cx: *mut Cmp) -> usize {
 }
 
 // Run of plain string characters: not the delimiter, a backslash or a line break.
-fn lx_plain_run(cx: *mut Cmp, del: i32) -> usize {
+fn lx_plain_run(cx: *mut CompileState, del: i32) -> usize {
     unsafe {
         let start = (*cx).pos - 1
         i := (*cx).pos
@@ -558,18 +558,18 @@ fn lx_plain_run(cx: *mut Cmp, del: i32) -> usize {
     }
 }
 
-fn lx_save_advance(cx: *mut Cmp) -> void!Throw {
+fn lx_save_advance(cx: *mut CompileState) -> void!Throw {
     unsafe { lx_save(cx, (*cx).cur)? }
     lx_advance(cx)
     return ok()
 }
 
-fn lx_unsave(cx: *mut Cmp, n: usize) {
+fn lx_unsave(cx: *mut CompileState, n: usize) {
     unsafe { (*cx).nbuf = (*cx).nbuf - n }
 }
 
 // Skip a line break: \n, \r, \n\r or \r\n each count as one.
-fn lx_newline(cx: *mut Cmp) -> void!Throw {
+fn lx_newline(cx: *mut CompileState) -> void!Throw {
     unsafe {
         let old = (*cx).cur
         lx_advance(cx)
@@ -588,7 +588,7 @@ fn lx_newline(cx: *mut Cmp) -> void!Throw {
 
 // Read a numeral: digits, letters, dots and exponent signs right after an
 // exponent mark; the text is then converted (and rejected if malformed).
-fn lx_numeral(cx: *mut Cmp) -> i32!Throw {
+fn lx_numeral(cx: *mut CompileState) -> i32!Throw {
     unsafe {
         e1 := 69i32
         e2 := 101i32
@@ -637,7 +637,7 @@ fn lx_numeral(cx: *mut Cmp) -> i32!Throw {
 // At '[' or ']': read the bracket and its '='s. Returns level + 2 for a
 // well-formed long bracket, 1 for a lone bracket, 0 for '[=' without the
 // second bracket.
-fn lx_skipsep(cx: *mut Cmp) -> usize!Throw {
+fn lx_skipsep(cx: *mut CompileState) -> usize!Throw {
     unsafe {
         count := 0usize
         let s = (*cx).cur
@@ -658,7 +658,7 @@ fn lx_skipsep(cx: *mut Cmp) -> usize!Throw {
 
 // Read a long string (or comment, when `keep` is false) after its opening
 // bracket of `sep` (= level + 2); a newline right after it is dropped.
-fn lx_longstring(cx: *mut Cmp, keep: bool, sep: usize) -> void!Throw {
+fn lx_longstring(cx: *mut CompileState, keep: bool, sep: usize) -> void!Throw {
     unsafe {
         let startline = (*cx).line
         lx_save_advance(cx)?
@@ -668,13 +668,13 @@ fn lx_longstring(cx: *mut Cmp, keep: bool, sep: usize) -> void!Throw {
         for {
             let c = (*cx).cur
             if c == LX_EOZ {
-                m := msg_new((*cx).L)
+                m := lmsg_new((*cx).L)
                 let pm = ptr.from_mut(&mut m)
-                msg_begin(cx, pm)
-                msg_str(pm, if keep { "unfinished long string (starting at line " } else { "unfinished long comment (starting at line " })
-                msg_int(pm, startline as i64)
-                msg_str(pm, ")")
-                return err(msg_raise(cx, pm, TK_EOS))
+                lmsg_begin(cx, pm)
+                lmsg_str(pm, if keep { "unfinished long string (starting at line " } else { "unfinished long comment (starting at line " })
+                lmsg_int(pm, startline as i64)
+                lmsg_str(pm, ")")
+                return err(lmsg_raise(cx, pm, TK_EOS))
             }
             if c == 93 {
                 if lx_skipsep(cx)? == sep {
@@ -703,7 +703,7 @@ fn lx_longstring(cx: *mut Cmp, keep: bool, sep: usize) -> void!Throw {
 
 // Raise an escape-sequence error unless `good`; the offending character
 // becomes part of the quoted text.
-fn lx_esccheck(cx: *mut Cmp, good: bool, text: &str) -> void!Throw {
+fn lx_esccheck(cx: *mut CompileState, good: bool, text: &str) -> void!Throw {
     unsafe {
         if !good {
             if (*cx).cur != LX_EOZ {
@@ -715,7 +715,7 @@ fn lx_esccheck(cx: *mut Cmp, good: bool, text: &str) -> void!Throw {
     }
 }
 
-fn lx_gethexa(cx: *mut Cmp) -> i32!Throw {
+fn lx_gethexa(cx: *mut CompileState) -> i32!Throw {
     unsafe {
         lx_save_advance(cx)?
         lx_esccheck(cx, lx_isxdigit((*cx).cur), "hexadecimal digit expected")?
@@ -723,7 +723,7 @@ fn lx_gethexa(cx: *mut Cmp) -> i32!Throw {
     }
 }
 
-fn lx_hexaesc(cx: *mut Cmp) -> i32!Throw {
+fn lx_hexaesc(cx: *mut CompileState) -> i32!Throw {
     r := lx_gethexa(cx)?
     r = (r << 4) + lx_gethexa(cx)?
     lx_unsave(cx, 2)
@@ -731,7 +731,7 @@ fn lx_hexaesc(cx: *mut Cmp) -> i32!Throw {
 }
 
 // \u{XXX}: append the UTF-8 encoding (up to 6 bytes, values below 2^31).
-fn lx_utf8esc(cx: *mut Cmp) -> void!Throw {
+fn lx_utf8esc(cx: *mut CompileState) -> void!Throw {
     unsafe {
         removed := 4usize
         lx_save_advance(cx)?
@@ -773,7 +773,7 @@ fn lx_utf8esc(cx: *mut Cmp) -> void!Throw {
     }
 }
 
-fn lx_decesc(cx: *mut Cmp) -> i32!Throw {
+fn lx_decesc(cx: *mut CompileState) -> i32!Throw {
     unsafe {
         r := 0i32
         i := 0usize
@@ -790,7 +790,7 @@ fn lx_decesc(cx: *mut Cmp) -> i32!Throw {
 
 // A short string delimited by `del`. The buffer keeps the delimiters (for
 // error messages) and the decoded contents.
-fn lx_shortstring(cx: *mut Cmp, del: i32) -> void!Throw {
+fn lx_shortstring(cx: *mut CompileState, del: i32) -> void!Throw {
     unsafe {
         lx_save_advance(cx)?
         for (*cx).cur != del {
@@ -869,7 +869,7 @@ fn lx_shortstring(cx: *mut Cmp, del: i32) -> void!Throw {
 // --- The scanner -----------------------------------------------------------------
 
 // Scan the next token; its value goes to the sc_* fields.
-fn lx_scan(cx: *mut Cmp) -> i32!Throw {
+fn lx_scan(cx: *mut CompileState) -> i32!Throw {
     unsafe {
         (*cx).nbuf = 0
         for {
@@ -994,7 +994,7 @@ fn lx_scan(cx: *mut Cmp) -> i32!Throw {
 }
 
 // Move to the next token.
-fn lex_next(cx: *mut Cmp) -> void!Throw {
+fn lex_next(cx: *mut CompileState) -> void!Throw {
     unsafe {
         (*cx).lastline = (*cx).line
         if (*cx).ak != TK_EOS {
@@ -1015,7 +1015,7 @@ fn lex_next(cx: *mut Cmp) -> void!Throw {
 }
 
 // Scan the token after the current one without consuming it.
-fn lex_lookahead(cx: *mut Cmp) -> i32!Throw {
+fn lex_lookahead(cx: *mut CompileState) -> i32!Throw {
     unsafe {
         let t = lx_scan(cx)?
         (*cx).ak = t
