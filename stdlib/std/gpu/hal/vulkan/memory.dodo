@@ -57,6 +57,8 @@ pub struct Allocation {
     pub offset: u64
     pub mapped: usize
     pub id: u64
+    // The memory type's VkMemoryPropertyFlags.
+    pub flags: u32
 }
 
 struct Blocks {
@@ -208,7 +210,8 @@ pub struct Allocator {
         for i in 0usize..count {
             if unsafe {
                 ((*b).flags[i] & FLAG_USED) != 0
-            } {
+            }
+            {
                 self.release(fns, device, i)
             }
         }
@@ -313,13 +316,17 @@ pub struct Allocator {
             address = (mapped + offset) as usize
         }
         id := ((block as u64) << 48) | ((offset / GRANULE) << 24) | (size / GRANULE)
+        type_index := unsafe {
+            (*b).type_index[block]
+        }
         return Allocation {
             memory: unsafe {
                 (*b).memory[block]
             },
             offset: offset,
             mapped: address,
-            id: id
+            id: id,
+            flags: self.properties.memory_types[type_index as usize].property_flags
         }
     }
 
@@ -334,7 +341,8 @@ pub struct Allocator {
         for i in 0usize..count {
             if slot == MAX_BLOCKS && unsafe {
                 ((*b).flags[i] & FLAG_USED) == 0
-            } {
+            }
+            {
                 slot = i
             }
         }

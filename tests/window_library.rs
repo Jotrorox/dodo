@@ -770,4 +770,99 @@ mod x11 {
         assert!(status.success(), "{status}: {log}");
         assert!(log.contains("150 frames"), "{log}");
     }
+
+    /// Whether a color is within `slack` of `wanted` in every channel.
+    fn near(color: u32, wanted: u32, slack: i32) -> bool {
+        (0..3).all(|shift| {
+            let a = (color >> (shift * 8) & 0xff) as i32;
+            let b = (wanted >> (shift * 8) & 0xff) as i32;
+            (a - b).abs() <= slack
+        })
+    }
+
+    /// gpu.Surface presents examples/gpu_window.dodo on Vulkan and OpenGL,
+    /// follows a resize, and shows the triangle the right way up.
+    #[test]
+    fn std_gpu_surface_presents_under_xvfb() {
+        if !have_window_tools() {
+            return;
+        }
+        let scratch = Scratch::new("xvfb-gpu-surface");
+        let executable = scratch.0.join("gpu_window");
+        build(&root().join("examples/gpu_window.dodo"), &executable, "0");
+        let (_server, display) = start_xvfb(5);
+        for (backend, required) in [
+            ("vulkan", "DODO_REQUIRE_VULKAN_TESTS"),
+            ("opengl", "DODO_REQUIRE_OPENGL_TESTS"),
+        ] {
+            let required = std::env::var_os(required).is_some();
+            let log = scratch.0.join(format!("{backend}.log"));
+            let (app, shown) = launch(&executable, &["200", backend], &display, &log, "presented");
+            if !shown {
+                let (status, log) = finish(app, &log);
+                let missing = (status.code() == Some(2) && log.ends_with("NoBackend\n"))
+                    || (status.code() == Some(1) && log.ends_with("Unsupported\n"));
+                assert!(missing, "{backend}: {status}: {log}");
+                assert!(!required, "{backend} is required but unavailable: {log}");
+                eprintln!("skipping {backend}: {}", log.trim());
+                continue;
+            }
+            sleep(Duration::from_millis(300));
+            // #1c2130 behind the triangle, which always covers the centre.
+            let background = 0x1c2130;
+            let corner = screen_pixel(&display, 3, 3);
+            assert!(near(corner, background, 2), "{backend} corner {corner:06x}");
+            let centre = screen_pixel(&display, 240, 160);
+            assert!(
+                !near(centre, background, 8),
+                "{backend} centre {centre:06x}"
+            );
+            let window = xdotool(&display, &["search", "--class", "Dodo"]);
+            let window = window.lines().next().unwrap().to_owned();
+            xdotool(&display, &["windowsize", &window, "600", "200"]);
+            sleep(Duration::from_millis(500));
+            let edge = screen_pixel(&display, 590, 190);
+            assert!(
+                near(edge, background, 2),
+                "{backend} after resizing {edge:06x}"
+            );
+            let (status, log) = finish(app, &log);
+            assert!(status.success(), "{backend}: {status}: {log}");
+            assert!(log.contains("200 frames"), "{log}");
+        }
+    }
+
+    /// The gpu.Surface checks: frame contents, frames in flight, resizing
+    /// and staged writes into frames, on every backend that presents.
+    #[test]
+    fn std_gpu_surface_checks_pass_under_xvfb() {
+        if !have_window_tools() {
+            return;
+        }
+        let required = std::env::var_os("DODO_REQUIRE_VULKAN_TESTS").is_some()
+            || std::env::var_os("DODO_REQUIRE_OPENGL_TESTS").is_some();
+        let scratch = Scratch::new("xvfb-gpu-surface-checks");
+        let executable = scratch.0.join("surface");
+        build(
+            &root().join("tests/stdlib/gpu_surface_checks.dodo"),
+            &executable,
+            "0",
+        );
+        let (_server, display) = start_xvfb(6);
+        let output = Command::new(&executable)
+            .env("DISPLAY", &display)
+            .env_remove("XAUTHORITY")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        match output.status.code() {
+            Some(0) => assert!(stdout.ends_with("passed\n"), "{stdout}"),
+            Some(2) if !required => eprintln!("skipping: no backend presents: {stdout}"),
+            _ => panic!(
+                "surface checks: {}\n{stdout}\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        }
+    }
 }

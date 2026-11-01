@@ -15,9 +15,10 @@ import "std/window/handle"
 //
 // - Memory comes from std/gpu/hal/vulkan/memory, which carves buffers and
 //   images out of a few large blocks per memory type. Buffers live in
-//   device-local memory, mapped as well on GPUs with unified memory;
-//   std/gpu stages writes and reads through BUFFER_UPLOAD (host-coherent)
-//   and BUFFER_READBACK (host-cached) buffers.
+//   device-local memory, mapped as well on GPUs with unified memory where
+//   it is coherent and cached; std/gpu stages writes and reads of the
+//   others through BUFFER_UPLOAD (host-coherent) and BUFFER_READBACK
+//   (host-cached) buffers.
 // - Images stay in VK_IMAGE_LAYOUT_GENERAL for their whole life, except
 //   swapchain images, which move to PRESENT_SRC_KHR to be shown.
 // - Every command buffer begins with one memory barrier that orders it
@@ -49,6 +50,7 @@ import "std/window/handle"
 
 unsafe extern "C" fn malloc(size: usize) -> *mut u8
 unsafe extern "C" fn free(block: *mut u8)
+unsafe extern "C" fn getenv(name: *const u8) -> *const u8
 
 // Encoders kept for reuse once their submissions finish.
 const SPARE_RECORDINGS: usize = 16
@@ -152,6 +154,10 @@ pub struct Device: hal.Backend {
     // the device can make swapchains.
     surfaces: u32
     swapchains: bool
+    // DODO_GPU_UNMAPPED is set: ordinary buffers count as unmapped, as on a
+    // GPU with memory of its own, even where the CPU could map them. It
+    // lets tests run std/gpu's staging and readback copies on any GPU.
+    unmapped: bool
     state: State
 
     pub fn open(debug: bool) -> Device!hal.Error {
@@ -252,12 +258,20 @@ pub struct Device: hal.Backend {
         }
         // New buffers read as zero, as on every backend: mapped ones are
         // cleared here, std/gpu clears the others with clear_buffer.
-        if allocation.mapped != 0 {
+        mapped := allocation.mapped
+        // std/gpu reads mapped buffers directly and writes new ones
+        // directly: only worth it, and only correct without flushes, in
+        // coherent memory the CPU caches. Others go through copies.
+        cached := vk.MEMORY_PROPERTY_HOST_COHERENT_BIT | vk.MEMORY_PROPERTY_HOST_CACHED_BIT
+        if kind == memory.KIND_BUFFER && (self.unmapped || (allocation.flags & cached) != cached) {
+            mapped = 0
+        }
+        if mapped != 0 {
             unsafe {
-                ptr.write_bytes(allocation.mapped as *mut u8, 0u8, size as usize)
+                ptr.write_bytes(mapped as *mut u8, 0u8, size as usize)
             }
         }
-        return ok(hal.Handle { a: buffer, b: allocation.id, c: allocation.mapped as u64, d: 0 })
+        return ok(hal.Handle { a: buffer, b: allocation.id, c: mapped as u64, d: 0 })
     }
 
     // std/gpu stages every transfer on Vulkan (staged() is true).
@@ -1316,10 +1330,17 @@ pub struct Device: hal.Backend {
         } == hal.FORMAT_NONE {
             self.choose_format(swap)?
         }
-        // A current extent of 0xffffffff lets the swapchain pick the size.
+        // A current extent of 0xffffffff lets the swapchain pick the size;
+        // a requested size of 0 means the window shows nothing.
         width := capabilities.current_extent.width
         height := capabilities.current_extent.height
-        if width == 0xffffffff {
+        requested := unsafe {
+            (*swap).requested_width == 0 || (*swap).requested_height == 0
+        }
+        if requested {
+            width = 0
+            height = 0
+        } else if width == 0xffffffff {
             width = clamp(unsafe {
                 (*swap).requested_width
             }, capabilities.min_image_extent.width, capabilities.max_image_extent.width)
@@ -1774,6 +1795,9 @@ fn open_device(window: Option<&handle.NativeHandle>, debug: bool) -> Device!hal.
         max_allocation: choice.max_allocation,
         surfaces: surfaces,
         swapchains: choice.swapchain,
+        unmapped: unsafe {
+            getenv(ptr.as_ptr(b"DODO_GPU_UNMAPPED\0")) as usize != 0
+        },
         state: State { submitted: 0, spare: [0u64; 16], spare_count: 0 }
     })
 }

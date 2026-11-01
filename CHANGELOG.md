@@ -9,6 +9,27 @@
   tools installed. Mistakes are compile errors pointing into the literal.
   Slot N is `@group(0) @binding(N)`, and a sampled texture's sampler is
   `@group(1) @binding(N)`. See [Shaders in WGSL](docs/src/content/docs/gpu.md).
+- `gpu.Surface` presents std/gpu frames in std/window windows: a Vulkan
+  swapchain on Linux and Windows, the view's `CAMetalLayer` on macOS, or the
+  window's own OpenGL context (from the new `gpu.Device.open_for_window`).
+  `acquire()` hands out a frame to render into, `present()` shows it, with
+  two or three frames in flight (`gpu.SurfaceOptions`) and `resize()` for
+  window size changes; the new `gpu.Error.Outdated` asks for one. See
+  [Surfaces](docs/src/content/docs/gpu.md) and the new
+  `examples/gpu_window.dodo`.
+- std/gpu no longer waits for the GPU to write data: `write_buffer`,
+  `write_texture` and `create_buffer_with_data` copy into a staging ring and
+  record the copy into a command buffer submitted ahead of the next
+  submission, still ordered as before. On Vulkan, buffers and images are
+  carved out of large memory blocks, buffers live in device memory (mapped on
+  unified-memory GPUs), and reads come back through host-cached memory.
+  `DODO_GPU_UNMAPPED` makes the Vulkan backend take the discrete-GPU paths
+  anywhere, for testing.
+- std/gpu derives barriers from how commands use each buffer and texture
+  instead of placing a full barrier before every pass, copy and dispatch on
+  Vulkan (where render passes now record into secondary command buffers) or
+  after every pass and dispatch on OpenGL. Vulkan command pools are reused.
+- The std/gpu examples write their shaders once in WGSL.
 - New database packages. `std/db` holds the shared vocabulary for drivers:
   `db.Error` with portable `db.ErrorKind`s and `db.Constraint`s plus the
   driver's native code, the borrowed `db.Value`, and `db.IsolationLevel`.

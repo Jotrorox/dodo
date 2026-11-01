@@ -313,7 +313,12 @@ on resize. `win.has_pixel_buffer()` tells the two kinds apart. Events, frame
 pacing with `request_frame()`, `size()` and `scale()` work the same in both,
 and one App can have windows of both kinds.
 
-[std/gpu/opengl](opengl.md#drawing-into-a-window) takes the handle directly:
+The simplest way to draw is [std/gpu](gpu.md#surfaces): a `gpu.Surface`
+made from the handle presents frames on Metal, Vulkan or OpenGL, whichever
+the machine has, as
+[`examples/gpu_window.dodo`](https://github.com/Jotrorox/dodo/blob/main/examples/gpu_window.dodo)
+shows. The raw APIs take the handle as well;
+[std/gpu/opengl](opengl.md#drawing-into-a-window) takes it directly:
 
 ```dodo
 app := window.App.new()?
