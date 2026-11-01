@@ -913,6 +913,14 @@
   cover 10-bit addressing, both targets, 12-bit and TI frames through the
   SPI loopback, breaks, and the flow control pins, and the desktop models
   gain a DW_apb_i2c target driven by a scripted master.
+- RP2040 and RP2350 flash regions erase and write from either core while
+  the other runs a task: `rp_multicore.lockout()` parks the other core in
+  SRAM with its interrupts masked, through a forced `IO_IRQ_QSPI` that the
+  runtimes' new SRAM handler answers, and reports `Timeout` if it cannot.
+  New `std/embedded/flash/spi_nor` drives JEDEC SPI NOR flash chips (W25Q,
+  GD25Q, MX25L, IS25LP, ...) as a `hal.Flash`, probing them by JEDEC ID and
+  SFDP, with 4-byte addressing above 16 MiB, protection, deep power-down,
+  and reset.
 
 ## 0.1.5 — 2026-10-12
 
