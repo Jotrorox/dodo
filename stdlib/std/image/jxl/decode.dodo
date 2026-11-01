@@ -128,11 +128,12 @@ pub fn matches(data: &[u8]) -> bool {
 // Image size, native layout, bit depth, color description, orientation and
 // frame count (displayed frames of an animation). Walks every frame header.
 pub fn info(data: &[u8]) -> pixels.Header!pixels.Error {
-    work := [0u8; SCAN_BYTES]
+    sk := new_skim()
+    win := [0u8; SK_WINDOW + 8]
     r := open(data)?
-    h := read_headers(&mut r, &mut work)?
+    h := read_headers(&mut r, &mut sk, &mut win)?
     s := new_scan()
-    walk_frames(&mut r, &h, &mut s, &mut work)?
+    walk_frames(&mut r, &h, &mut s, &mut sk, &mut win)?
     return ok(make_header(&h, &s, data.len))
 }
 
@@ -155,9 +156,10 @@ fn make_header(h: &ImageHeader, s: &Scan, data_len: usize) -> pixels.Header {
 // coded in the codestream: decode it with icc()).
 pub fn metadata(data: &[u8]) -> meta.Metadata!pixels.Error {
     result := scan_metadata(data)?
-    work := [0u8; SCAN_BYTES]
+    sk := new_skim()
+    win := [0u8; SK_WINDOW + 8]
     r := open(data)?
-    h := read_headers(&mut r, &mut work)?
+    h := read_headers(&mut r, &mut sk, &mut win)?
     if h.want_icc {
         result.icc = meta.Item { offset: 0, length: data.len, encoding: meta.ENCODING_JXL }
     }
@@ -167,11 +169,12 @@ pub fn metadata(data: &[u8]) -> meta.Metadata!pixels.Error {
 // Display time of displayed frame `index`: duration ticks over the
 // animation's ticks per second. Still images report 0/1.
 pub fn frame_info(data: &[u8], index: u32) -> pixels.FrameInfo!pixels.Error {
-    work := [0u8; SCAN_BYTES]
+    sk := new_skim()
+    win := [0u8; SK_WINDOW + 8]
     r := open(data)?
-    h := read_headers(&mut r, &mut work)?
+    h := read_headers(&mut r, &mut sk, &mut win)?
     r.seek_byte(h.frames_byte)
-    skip_preview(&mut r, &h, &mut work)?
+    skip_preview(&mut r, &h, &mut sk, &mut win)?
     shown := 0u32
     count := 0u32
     for {
@@ -179,7 +182,7 @@ pub fn frame_info(data: &[u8], index: u32) -> pixels.FrameInfo!pixels.Error {
             return err(pixels.Error.TooLarge)
         }
         f := read_frame_header(&mut r, &h)?
-        scan_toc(&mut r, &mut f, &mut work)?
+        scan_toc(&mut r, &mut f, &mut sk, &mut win)?
         count += 1
         if f.is_keyframe() {
             if shown == index {
@@ -208,13 +211,13 @@ pub fn frame_info(data: &[u8], index: u32) -> pixels.FrameInfo!pixels.Error {
     return err(pixels.Error.Malformed)
 }
 
-fn skip_preview(r: &mut Reader, h: &ImageHeader, work: &mut[u8]) -> void!pixels.Error {
+fn skip_preview(r: &mut Reader, h: &ImageHeader, sk: &mut Skim, win: &mut[u8]) -> void!pixels.Error {
     if h.have_preview {
         preview := h.clone_header()
         preview.width = h.preview_width
         preview.height = h.preview_height
         f := read_frame_header(r, &preview)?
-        scan_toc(r, &mut f, work)?
+        scan_toc(r, &mut f, sk, win)?
         r.seek_byte64(f.end())
     }
     return ok()
@@ -329,7 +332,7 @@ fn plan(h: &ImageHeader, s: &Scan) -> Plan!pixels.Error {
     p := Plan { window: fit(window)?, gdist: fit(gtree / 2 + 2)?, ldist: fit(ltree / 2 + 2)?, gtree: fit(gtree)?, ltree: fit(ltree)?, wp_width: fit(wp_width)?, temp: fit(temp)?, toc: fit(s.max_toc as u64)?, arena: fit(arena)?, planes: (3 + nec) as usize, frame_pixels: 0, canvas_pixels: 0, slot_pixels: [0usize; 4], ftemp: 0, noise: 0, splines: s.any_splines, tile: 0, float_path: s.float_path, vd_planes: 0, vd_blocks: 0, vd_tiles: 0, hdist: 0, lf_slot: [0usize; 3], total: 0 }
     layout := native_layout(h)
     p.tile = TILE * TILE * layout.bytes_per_pixel()
-    total := SCAN_BYTES + 64
+    total := 64usize
     total = checked_add(total, p.window as u64 * 4 + 8)?
     total = checked_add(total, code_bytes(p.gdist, CODE_POOL) as u64)?
     total = checked_add(total, code_bytes(p.ldist, CODE_POOL) as u64)?
@@ -390,8 +393,8 @@ fn plan(h: &ImageHeader, s: &Scan) -> Plan!pixels.Error {
         }
     }
     total = checked_add(total, vardct_bytes(&p))?
-    // icc() needs the scan area and the encoded profile.
-    icc_total := checked_add(SCAN_BYTES + 64, h.icc_enc_size)?
+    // icc() needs the encoded profile.
+    icc_total := checked_add(64, h.icc_enc_size)?
     if icc_total > total {
         total = icc_total
     }
@@ -431,11 +434,12 @@ fn vardct_bytes(p: &Plan) -> u64 {
 // Bytes of scratch decode() and decode_frame() need for this file
 // (also enough for icc()).
 pub fn scratch_size(data: &[u8]) -> usize!pixels.Error {
-    work := [0u8; SCAN_BYTES]
+    sk := new_skim()
+    win := [0u8; SK_WINDOW + 8]
     r := open(data)?
-    h := read_headers(&mut r, &mut work)?
+    h := read_headers(&mut r, &mut sk, &mut win)?
     s := new_scan()
-    walk_frames(&mut r, &h, &mut s, &mut work)?
+    walk_frames(&mut r, &h, &mut s, &mut sk, &mut win)?
     p := plan(&h, &s)?
     return ok(p.total)
 }
@@ -451,26 +455,24 @@ pub fn decode<S: sink.Sink>(data: &[u8], output: &mut S, buffer: &mut[u8]) -> vo
 // animation shows), composited over earlier frames as the format
 // specifies.
 pub fn decode_frame<S: sink.Sink>(data: &[u8], index: u32, output: &mut S, buffer: &mut[u8]) -> void!pixels.Error {
-    if buffer.len < SCAN_BYTES + 64 {
-        return err(pixels.Error.BufferTooSmall)
-    }
-    let slice.SplitMut { left: work, right: rest } = scratch.split(buffer, SCAN_BYTES)?
+    sk := new_skim()
+    win := [0u8; SK_WINDOW + 8]
     r := open(data)?
-    h := read_headers(&mut r, work)?
+    h := read_headers(&mut r, &mut sk, &mut win)?
     s := new_scan()
-    walk_frames(&mut r, &h, &mut s, work)?
+    walk_frames(&mut r, &h, &mut s, &mut sk, &mut win)?
     if index >= s.displayed {
         return err(pixels.Error.Malformed)
     }
     p := plan(&h, &s)?
-    if p.total > rest.len + SCAN_BYTES {
+    if p.total > buffer.len {
         return err(pixels.Error.BufferTooSmall)
     }
-    first := first_needed_frame(data, &h, index, work)?
+    first := first_needed_frame(data, &h, index, &mut sk, &mut win)?
     header := make_header(&h, &s, data.len)
     layout := header.native.clone()
     output.begin(&header)?
-    return run(data, &h, &p, index, first, output, rest, &layout)
+    return run(data, &h, &p, index, first, output, buffer, &layout)
 }
 
 // Carve the scratch and decode frames up to displayed frame `index`.
@@ -616,10 +618,10 @@ fn run<S: sink.Sink>(data: &[u8], h: &ImageHeader, p: &Plan, index: u32, first: 
 // displayed frame `index`: the last earlier frame that replaces the whole
 // canvas without patches, provided no frame after it reads a reference slot
 // written before it; otherwise 0.
-fn first_needed_frame(data: &[u8], h: &ImageHeader, index: u32, work: &mut[u8]) -> u32!pixels.Error {
+fn first_needed_frame(data: &[u8], h: &ImageHeader, index: u32, sk: &mut Skim, win: &mut[u8]) -> u32!pixels.Error {
     r := open(data)?
     r.seek_byte(h.frames_byte)
-    skip_preview(&mut r, h, work)?
+    skip_preview(&mut r, h, sk, win)?
     candidate := 0u32
     usable := true
     written := [false; 4]
@@ -634,7 +636,7 @@ fn first_needed_frame(data: &[u8], h: &ImageHeader, index: u32, work: &mut[u8]) 
             return err(pixels.Error.TooLarge)
         }
         f := read_frame_header(&mut r, h)?
-        scan_toc(&mut r, &mut f, work)?
+        scan_toc(&mut r, &mut f, sk, win)?
         patches := (f.flags & FLAG_PATCHES) != 0
         if f.is_normal() && !f.needs_blending(h.num_extra) && !patches {
             candidate = frame
@@ -692,16 +694,14 @@ fn first_needed_frame(data: &[u8], h: &ImageHeader, index: u32, work: &mut[u8]) 
 // Malformed for files without one. `scratch` needs scratch_size(data)
 // bytes.
 pub fn icc(data: &[u8], output: &mut[u8], buffer: &mut[u8]) -> usize!pixels.Error {
-    if buffer.len < SCAN_BYTES + 64 {
-        return err(pixels.Error.BufferTooSmall)
-    }
-    let slice.SplitMut { left: work, right: encoded } = scratch.split(buffer, SCAN_BYTES)?
+    sk := new_skim()
+    win := [0u8; SK_WINDOW + 8]
     r := open(data)?
-    h := read_headers(&mut r, work)?
+    h := read_headers(&mut r, &mut sk, &mut win)?
     if !h.want_icc {
         return err(pixels.Error.Malformed)
     }
     r.seek_bit(h.icc_bit)
-    length := read_icc_stream(&mut r, work, encoded, true)?
-    return decode_icc(&encoded[..length as usize], output)
+    length := read_icc_stream(&mut r, &mut sk, &mut win, buffer, true)?
+    return decode_icc(&buffer[..length as usize], output)
 }

@@ -1,15 +1,10 @@
 package jxl
 
-import "core/slice"
 import "std/image/pixels"
-import "std/image/shared/scratch"
 
 // Walking the frames of a file from their headers and TOCs only, to count
 // them and to size every buffer decode() needs before any pixel work.
 
-// Bytes of stack working storage for skipping an ICC stream or a permuted
-// TOC while scanning.
-const SCAN_BYTES: usize = 200704
 const MAX_FRAMES: u32 = 1048576
 
 struct Scan {
@@ -114,36 +109,77 @@ fn direct_frame(h: &ImageHeader, f: &FrameHeader) -> bool {
     return true
 }
 
-fn scan_toc(r: &mut Reader, f: &mut FrameHeader, work: &mut[u8]) -> void!pixels.Error {
-    let slice.SplitMut { left: code_bytes_0, right: rest } = scratch.split(work, code_bytes(9, 8 * 512))?
-    let slice.SplitMut { left: n1_bytes, right: rest2 } = scratch.split(rest, code_bytes(2, NESTED_POOL))?
-    let slice.SplitMut { left: n2_bytes, right: window_bytes } = scratch.split(rest2, code_bytes(2, NESTED_POOL))?
-    code := carve_code(code_bytes_0, 9)?
-    n1 := carve_code(n1_bytes, 2)?
-    n2 := carve_code(n2_bytes, 2)?
-    window := scratch.u32s(window_bytes)
-    empty := [0u32; 1]
-    read_toc(r, f, &mut empty, &mut code, &mut n1, &mut n2, window)?
+// Skip the TOC at the reader (like read_toc without storing it), a
+// permutation decoded with the skimmer.
+fn scan_toc(r: &mut Reader, f: &mut FrameHeader, sk: &mut Skim, win: &mut[u8]) -> void!pixels.Error {
+    entries := f.toc_entries as usize
+    f.toc_permuted = r.bit()
+    if f.toc_permuted {
+        skip_permutation(r, entries, sk, win)?
+    }
+    r.pad()
+    total := 0u64
+    for i in 0usize..entries {
+        total += r.u32c(dist(0, 10), dist(1024, 14), dist(17408, 22), dist(4211712, 30)) as u64
+    }
+    r.pad()
+    if r.overrun {
+        return err(pixels.Error.Truncated)
+    }
+    if r.broken {
+        return err(pixels.Error.Malformed)
+    }
+    f.data_start = r.byte_position()
+    f.data_size = total
+    if total > 0xffffffff {
+        return err(pixels.Error.TooLarge)
+    }
     return ok()
 }
 
-// Parse the headers and walk every frame.
-fn scan_file(data: &[u8], work: &mut[u8]) -> Scan!pixels.Error {
-    r := open(data)?
-    h := read_headers(&mut r, work)?
-    s := new_scan()
-    walk_frames(&mut r, &h, &mut s, work)?
-    return ok(s)
+// Skip a Lehmer-coded TOC permutation of `size` entries. The window keeps
+// the context class of each entry; entries that LZ77 copies are not
+// range-checked here (decode() checks them when it reads the TOC).
+fn skip_permutation(r: &mut Reader, size: usize, sk: &mut Skim, win: &mut[u8]) -> void!pixels.Error {
+    code := new_sk_code()
+    sk_read_code(r, 8, &mut code, sk)?
+    st := new_sk_stream(SK_TOC, SK_WINDOW)
+    sk_begin(&mut st, &code, r)
+    end := sk_read(&mut code, sk, &mut st, win, r, permutation_context(size as u32), 0) as usize
+    if st.copied {
+        // A copy before any value repeats zeros.
+        end = 0
+    }
+    if end > size {
+        return err(pixels.Error.Malformed)
+    }
+    previous := 0u32
+    for k in 0usize..end {
+        value := sk_read(&mut code, sk, &mut st, win, r, previous, 0)
+        if st.copied {
+            previous = value
+        } else {
+            if value as usize >= size - k {
+                return err(pixels.Error.Malformed)
+            }
+            previous = permutation_context(value)
+        }
+        if (k & 1023) == 1023 && sk_failed(&st, r) {
+            break
+        }
+    }
+    sk_finish(&st, &code, r)?
+    return ok()
 }
 
-fn walk_frames(r: &mut Reader, h: &ImageHeader, s: &mut Scan, work: &mut[u8]) -> void!pixels.Error {
+fn walk_frames(r: &mut Reader, h: &ImageHeader, s: &mut Scan, sk: &mut Skim, win: &mut[u8]) -> void!pixels.Error {
     r.seek_byte(h.frames_byte)
     if h.have_preview {
         preview := h.clone_header()
         preview.width = h.preview_width
         preview.height = h.preview_height
         f := read_frame_header(r, &preview)?
-        scan_toc(r, &mut f, work)?
+        scan_toc(r, &mut f, sk, win)?
         r.seek_byte64(f.end())
     }
     for {
@@ -151,7 +187,7 @@ fn walk_frames(r: &mut Reader, h: &ImageHeader, s: &mut Scan, work: &mut[u8]) ->
             return err(pixels.Error.TooLarge)
         }
         f := read_frame_header(r, h)?
-        scan_toc(r, &mut f, work)?
+        scan_toc(r, &mut f, sk, win)?
         s.frames += 1
         if f.is_keyframe() {
             s.displayed += 1
