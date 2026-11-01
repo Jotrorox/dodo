@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.6 — 2026-11-01
+## 0.1.6 — 2026-11-02
 
 Dodo 0.1.6 grows the language with interfaces and `dyn` references, function
 values and closures, tuples, type aliases, `async fn` and `await`, inline and

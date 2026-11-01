@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.6 — 2026-11-01
+## 0.1.6 — 2026-11-02
 
 - Highlight `interface`, `type`, `dyn`, `async`, `await`, and `asm`, the
   names declared by `interface` and `type`, and tuple fields such as `.0`.
