@@ -52,10 +52,26 @@ import "std/image/shared/scratch"
 // Default effort for EncodeOptions.new().
 pub const DEFAULT_EFFORT: u32 = 2
 
+// Default Butteraugli distance of lossy encoding (cjxl's default, about
+// quality 90).
+pub const DEFAULT_DISTANCE: f32 = 1.0
+
 // Encoder settings.
 pub struct EncodeOptions {
-    // 1 (fastest) to 9; values above 3 currently behave like 3, 0 like 1.
+    // 1 (fastest) to 9. Lossless: values above 3 currently behave like 3,
+    // 0 like 1. Lossy: 1 DCT8 with uniform quantization; 2 adds adaptive
+    // quantization, inverse Gaborish and chroma-from-luma; 3-6 add the
+    // varblock search (DCT8 to DCT32 and rectangles) and per-block quant
+    // adjustment; 7-9 also try 64x64 varblocks.
     pub effort: u32
+    // Lossless modular coding (the default). When false, a lossy VarDCT
+    // frame in XYB is written at `distance`; alpha stays lossless.
+    pub lossless: bool
+    // Target Butteraugli distance of lossy coding: 1.0 is visually
+    // lossless, 0.5 very high quality, 3 to 8 small files. Clamped to
+    // 0.05..25; zero or less means lossless. distance_from_quality() maps
+    // a 0..100 quality the way cjxl does.
+    pub distance: f32
     // Wrap the codestream in the ISOBMFF container. Implied when metadata
     // is attached (encode_with_metadata).
     pub container: bool
@@ -68,7 +84,17 @@ pub struct EncodeOptions {
     pub orientation: color.Orientation
 
     pub fn new() -> EncodeOptions {
-        return EncodeOptions { effort: DEFAULT_EFFORT, container: false, color: color.ColorInfo.srgb(), orientation: color.Orientation.Identity }
+        return EncodeOptions { effort: DEFAULT_EFFORT, lossless: true, distance: DEFAULT_DISTANCE, container: false, color: color.ColorInfo.srgb(), orientation: color.Orientation.Identity }
+    }
+    // Lossy settings at Butteraugli distance `distance`.
+    pub fn lossy(distance: f32) -> EncodeOptions {
+        options := EncodeOptions.new()
+        options.lossless = false
+        options.distance = distance
+        return options
+    }
+    fn is_lossy(&self) -> bool {
+        return !self.lossless && (self.distance > 0.0 || !(self.distance == self.distance))
     }
 }
 
@@ -234,6 +260,9 @@ fn codestream_bound(width: u32, height: u32, layout: &pixels.Layout) -> usize!pi
 // far smaller, and encode() reports BufferTooSmall rather than overrunning a
 // smaller buffer.
 pub fn max_encoded_size(width: u32, height: u32, layout: &pixels.Layout, options: &EncodeOptions) -> usize!pixels.Error {
+    if options.is_lossy() {
+        return vd_max_encoded_size(width, height, layout, options, b"", b"")
+    }
     bound := codestream_bound(width, height, layout)?
     prefix := container_prefix(options, b"", b"", bound, needs_level10(width, height, layout))?
     return pixels.checked(1, bound, prefix)
@@ -241,6 +270,9 @@ pub fn max_encoded_size(width: u32, height: u32, layout: &pixels.Layout, options
 
 // max_encoded_size() including the metadata boxes.
 pub fn max_encoded_size_with_metadata(width: u32, height: u32, layout: &pixels.Layout, options: &EncodeOptions, metadata: &Metadata) -> usize!pixels.Error {
+    if options.is_lossy() {
+        return vd_max_encoded_size(width, height, layout, options, metadata.exif, metadata.xmp)
+    }
     bound := codestream_bound(width, height, layout)?
     prefix := container_prefix(options, metadata.exif, metadata.xmp, bound, needs_level10(width, height, layout))?
     return pixels.checked(1, bound, prefix)
@@ -264,6 +296,9 @@ const SUM_WORDS: usize = MAX_CLUSTERS * MAX_ALPHA
 
 // Bytes of scratch encode() needs for this image and options.
 pub fn encode_scratch_size(width: u32, height: u32, layout: &pixels.Layout, options: &EncodeOptions) -> usize!pixels.Error {
+    if options.is_lossy() {
+        return vd_scratch_size(width, height, layout, options)
+    }
     check_size(width, height)?
     total := scratch.size(plane_words(width, height, layout), 4)?
     total = scratch.add(total, scratch.size(HIST_WORDS, 4)?)?
@@ -291,6 +326,9 @@ pub fn encode_with_metadata(source: &pixels.View, options: &EncodeOptions, metad
 }
 
 fn encode_boxes(source: &pixels.View, options: &EncodeOptions, exif: &[u8], xmp: &[u8], output: &mut[u8], scratch_bytes: &mut[u8]) -> usize!pixels.Error {
+    if options.is_lossy() {
+        return vd_encode(source, options, exif, xmp, output, scratch_bytes)
+    }
     width := source.width()
     height := source.height()
     layout := source.layout()
@@ -353,7 +391,7 @@ fn encode_boxes(source: &pixels.View, options: &EncodeOptions, exif: &[u8], xmp:
     if output.len < base {
         return err(pixels.Error.BufferTooSmall)
     }
-    shape := Shape { width: width, height: height, color_channels: plan.color_channels, alpha: plan.alpha, bits: plan.bits, float: plan.float, alpha_associated: plan.premultiplied, orientation: color.exif_value(&options.orientation) }
+    shape := Shape { width: width, height: height, color_channels: plan.color_channels, alpha: plan.alpha, bits: plan.bits, float: plan.float, alpha_associated: plan.premultiplied, orientation: color.exif_value(&options.orientation), xyb: false }
     entries := toc_entries(plan.width, plan.height)
     // First attempt: leave room for the largest TOC, write the sections,
     // then move them down behind the real TOC.

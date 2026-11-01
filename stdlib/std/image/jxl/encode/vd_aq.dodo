@@ -1,0 +1,415 @@
+package encode
+
+import "std/image/convert"
+
+// Lossy encoding: the adaptive quantization field (a port of libjxl's
+// InitialQuantField / AdaptiveQuantizationMap: local contrast masking
+// from the Y channel at 4x4 resolution, fuzzy erosion, then per-block
+// gamma, high-frequency and blue modulations), the per-pixel masking field
+// the varblock search weighs distortion with, and inverse Gaborish.
+//
+// Everything works on one group's XYB planes with a border of VD_BORDER
+// pixels (vd_load_xyb), so results only depend on source pixels and match
+// whatever group order computes them.
+
+const VD_BORDER: usize = 8
+
+const VD_INV_LOG2E: f32 = 0.6931471805599453
+const VD_SG_MUL: f32 = 226.77216153508914
+const VD_SG_RET_MUL: f32 = 0.17625116011548317
+const VD_SG_V_OFFSET: f32 = 7.7825991679894591
+
+// libjxl's RatioOfDerivativesOfCubicRootToSimpleGamma: den / num, or
+// num / den when inverted.
+@inline
+fn vd_gamma_ratio(value: f32, invert: bool) -> f32 {
+    v := value
+    if v < 0.0 {
+        v = 0.0
+    }
+    eps := 0.01f32
+    num_mul := VD_SG_RET_MUL * 3.0 * VD_SG_MUL
+    v_offset := VD_SG_V_OFFSET * VD_INV_LOG2E + eps
+    den_mul := VD_INV_LOG2E * VD_SG_MUL
+    v2 := v * v
+    num := num_mul * v2 + eps
+    den := den_mul * v * v2 + v_offset
+    if invert {
+        return num / den
+    }
+    return den / num
+}
+
+// Square root for v >= 0 (bit estimate and Newton steps).
+@inline
+fn vd_sqrt(v: f32) -> f32 {
+    if v <= 0.0 {
+        return 0.0
+    }
+    bits := convert.f32_bits(v)
+    y := convert.f32_from_bits((bits >> 1) + 532487669)
+    y = 0.5 * (y + v / y)
+    y = 0.5 * (y + v / y)
+    y = 0.5 * (y + v / y)
+    return y
+}
+
+@inline
+fn vd_masking_sqrt(v: f32) -> f32 {
+    // 0.25 * sqrt(v * sqrt(211.66567973503678e8) + 27.505837037000106)
+    return 0.25 * vd_sqrt(v * 145487.34643776988 + 27.505837037000106)
+}
+
+// libjxl's ComputeMask.
+fn vd_compute_mask(out_val: f32) -> f32 {
+    base := -0.7647f32
+    mul4 := 9.4708735624378946f32
+    mul2 := 17.35036561631863f32
+    offset2 := 302.59587815579727f32
+    mul3 := 6.7943250517376494f32
+    offset3 := 3.7179635626140772f32
+    offset4 := 0.25f32 * offset3
+    mul0 := 0.80061762862741759f32
+    v1 := out_val * mul0
+    if v1 < 0.001 {
+        v1 = 0.001
+    }
+    v2 := 1.0f32 / (v1 + offset2)
+    v3 := 1.0f32 / (v1 * v1 + offset3)
+    v4 := 1.0f32 / (v1 * v1 + offset4)
+    return base + mul4 * v4 + mul2 * v2 + mul3 * v3
+}
+
+// Insert v among the four smallest values seen so far.
+fn vd_store_min4(v: f32, m: &mut[f32]) {
+    if v < m[3] {
+        if v < m[0] {
+            m[3] = m[2]
+            m[2] = m[1]
+            m[1] = m[0]
+            m[0] = v
+        } else if v < m[1] {
+            m[3] = m[2]
+            m[2] = m[1]
+            m[1] = v
+        } else if v < m[2] {
+            m[3] = m[2]
+            m[2] = v
+        } else {
+            m[3] = v
+        }
+    }
+}
+
+// Geometry of one group inside the image, in 8x8 blocks.
+struct VdGroup {
+    // Pixel origin and block counts of the group.
+    x0: usize
+    y0: usize
+    bw: usize
+    bh: usize
+    // Planes of the bordered XYB buffer: stride and plane size; the group
+    // pixel (x, y) is at (y + VD_BORDER) * stride + x + VD_BORDER.
+    stride: usize
+    plane: usize
+    // The group touches the image's left / top / right / bottom edge
+    // (of the image padded to whole blocks).
+    left: bool
+    top: bool
+    right: bool
+    bottom: bool
+}
+
+// The quant field of every block of the group into qf[by * g.bw + bx]
+// (libjxl's AdaptiveQuantizationMap for `distance`, scaled by `scale`).
+// `cells` holds (2 bw + 2) x (2 bh + 2) floats.
+fn vd_quant_field(g: &VdGroup, xyb: &[f32], distance: f32, scale: f32, cells: &mut[f32], qf: &mut[f32]) {
+    plane := g.plane
+    stride := g.stride
+    cw := 2 * g.bw + 2
+    ch := 2 * g.bh + 2
+    match_gamma_offset := 0.019f32
+    limit := 0.2f32
+    // Pre-erosion cells (one cell of border; image edges clamp below).
+    for cy in 0usize..ch {
+        for cx in 0usize..cw {
+            sum := 0.0f32
+            for dy in 0usize..4 {
+                // Pixel row relative to the buffer origin.
+                py := VD_BORDER + cy * 4 + dy - 4
+                row := plane + py * stride
+                for dx in 0usize..4 {
+                    px := VD_BORDER + cx * 4 + dx - 4
+                    o := row + px
+                    v := xyb[o]
+                    base := 0.25f32 * (xyb[o + stride] + xyb[o - stride] + xyb[o - 1] + xyb[o + 1])
+                    gammac := vd_gamma_ratio(v + match_gamma_offset, false)
+                    diff := gammac * (v - base)
+                    diff = diff * diff
+                    if diff >= limit {
+                        diff = limit
+                    }
+                    sum += vd_masking_sqrt(diff)
+                }
+            }
+            cells[cy * cw + cx] = sum * 0.25
+        }
+    }
+    // Clamp at image edges: the border cells repeat the edge cells.
+    if g.left {
+        for cy in 0usize..ch {
+            cells[cy * cw] = cells[cy * cw + 1]
+        }
+    }
+    if g.right {
+        for cy in 0usize..ch {
+            cells[cy * cw + cw - 1] = cells[cy * cw + cw - 2]
+        }
+    }
+    if g.top {
+        for cx in 0usize..cw {
+            cells[cx] = cells[cw + cx]
+        }
+    }
+    if g.bottom {
+        for cx in 0usize..cw {
+            cells[(ch - 1) * cw + cx] = cells[(ch - 2) * cw + cx]
+        }
+    }
+    // Fuzzy erosion: a weighted sum of the four smallest values of each
+    // 3x3 neighbourhood, summed over the 2x2 cells of a block.
+    mul_base := [0.125f32, 0.1, 0.09, 0.06]
+    mul_add := [0.0f32, -0.1, -0.09, -0.06]
+    mix := 0.0f32
+    if distance < 2.0 {
+        mix = (2.0 - distance) * 0.5
+    }
+    kmul := [0.0f32; 4]
+    norm := 0.0f32
+    for i in 0usize..4 {
+        kmul[i] = mul_base[i] + mix * mul_add[i]
+        norm += kmul[i]
+    }
+    for i in 0usize..4 {
+        kmul[i] = kmul[i] * 0.29959705784054957 / norm
+    }
+    for by in 0usize..g.bh {
+        for bx in 0usize..g.bw {
+            total := 0.0f32
+            for sy in 0usize..2 {
+                for sx in 0usize..2 {
+                    cy := 1 + by * 2 + sy
+                    cx := 1 + bx * 2 + sx
+                    at := cy * cw + cx
+                    m := [cells[at], cells[at - 1], cells[at + 1], cells[at - cw - 1]]
+                    // Sort the first four.
+                    for i in 0usize..3 {
+                        for j in i + 1..4 {
+                            if m[i] > m[j] {
+                                tmp := m[i]
+                                m[i] = m[j]
+                                m[j] = tmp
+                            }
+                        }
+                    }
+                    vd_store_min4(cells[at - cw], &mut m)
+                    vd_store_min4(cells[at - cw + 1], &mut m)
+                    vd_store_min4(cells[at + cw - 1], &mut m)
+                    vd_store_min4(cells[at + cw], &mut m)
+                    vd_store_min4(cells[at + cw + 1], &mut m)
+                    total += kmul[0] * m[0] + kmul[1] * m[1] + kmul[2] * m[2] + kmul[3] * m[3]
+                }
+            }
+            qf[by * g.bw + bx] = total
+        }
+    }
+    // Per-block modulations.
+    base_level := 0.48f32 * scale
+    dampen := 1.0f32
+    if distance >= 2.0 {
+        dampen = 1.0 - (distance - 2.0) / 12.0
+        if dampen < 0.0 {
+            dampen = 0.0
+        }
+    }
+    mul := scale * dampen
+    add := (1.0 - dampen) * base_level
+    for by in 0usize..g.bh {
+        for bx in 0usize..g.bw {
+            mask_val := vd_compute_mask(qf[by * g.bw + bx])
+            o0 := (VD_BORDER + by * 8) * stride + VD_BORDER + bx * 8
+            // Gamma modulation.
+            ratio := 0.0f32
+            for dy in 0usize..8 {
+                for dx in 0usize..8 {
+                    o := o0 + dy * stride + dx
+                    iny := xyb[plane + o] + 0.16
+                    inx := xyb[o]
+                    ratio += vd_gamma_ratio(iny - inx, true) + vd_gamma_ratio(iny + inx, true)
+                }
+            }
+            ratio = ratio * (0.5 / 64.0)
+            mask_val = 0.1005613337192697f32 * vd_fast_log2f(ratio) + mask_val
+            // High-frequency modulation.
+            sum_y := 0.0f32
+            valmin := 0.0206f32
+            for dy in 0usize..8 {
+                for dx in 0usize..8 {
+                    o := plane + o0 + dy * stride + dx
+                    p := xyb[o]
+                    if dx < 7 {
+                        d := p - xyb[o + 1]
+                        if d < 0.0 {
+                            d = -d
+                        }
+                        if d > valmin {
+                            d = valmin
+                        }
+                        sum_y += d
+                    }
+                    if dy < 7 {
+                        d := p - xyb[o + stride]
+                        if d < 0.0 {
+                            d = -d
+                        }
+                        if d > valmin {
+                            d = valmin
+                        }
+                        sum_y += d
+                    }
+                }
+            }
+            hf := mask_val + sum_y * -0.38 + 0.42
+            // Blue modulation.
+            blue_limit := 0.010474084867598155f32
+            blue := 0.0f32
+            for dy in 0usize..8 {
+                for dx in 0usize..8 {
+                    o := o0 + dy * stride + dx
+                    px := xyb[o]
+                    if px < 0.0 {
+                        px = -px
+                    }
+                    effective := xyb[plane + o] + 0.0031994768654636393 + px
+                    pb := xyb[2 * plane + o]
+                    if pb > effective {
+                        d := pb - effective
+                        if d > blue_limit {
+                            d = blue_limit
+                        }
+                        blue += d
+                    }
+                }
+            }
+            if blue >= 32.0 * blue_limit {
+                blue = 64.0 * blue_limit - blue
+            }
+            if blue >= 15.463398341612438 * blue_limit {
+                blue = 15.463398341612438 * blue_limit
+            }
+            blue_val := blue * 0.90590804735610064 + mask_val
+            out := hf
+            if blue_val < out {
+                out = blue_val
+            }
+            qf[by * g.bw + bx] = vd_fast_pow2f(out * 1.442695041) * mul + add
+        }
+    }
+}
+
+// The masking field at pixel resolution for the varblock search: the
+// inverse of the local contrast, blurred by a symmetric 5x5 kernel. Into
+// mask[y * mw + x] for the group's padded pixels (mw = 8 bw); `tmp` holds
+// (8 bw + 4) x (8 bh + 4) floats.
+fn vd_mask1x1(g: &VdGroup, xyb: &[f32], tmp: &mut[f32], mask: &mut[f32]) {
+    plane := g.plane
+    stride := g.stride
+    pw := g.bw * 8
+    ph := g.bh * 8
+    tw := pw + 4
+    for y in 0usize..ph + 4 {
+        for x in 0usize..tw {
+            o := plane + (VD_BORDER + y - 2) * stride + VD_BORDER + x - 2
+            v := xyb[o]
+            base := 0.25f32 * (xyb[o + stride] + xyb[o - stride] + xyb[o - 1] + xyb[o + 1])
+            gammac := vd_gamma_ratio(v + 0.019, false)
+            diff := gammac * (v - base)
+            if diff < 0.0 {
+                diff = -diff
+            }
+            // log1p(diff) through the fast log2.
+            diff = vd_fast_log2f(1.0 + diff) * VD_INV_LOG2E
+            tmp[y * tw + x] = 1.0 / (diff + 0.01)
+        }
+    }
+    k := [0.364911248f32, 0.05, 0.1688888021, 0.221069183, 0.306563504]
+    sum := 1.0f32 + 4.0 * (k[0] + k[1] + k[2] + k[4] + 2.0 * k[3])
+    norm := 1.0f32 / sum
+    wc := norm
+    wr := norm * k[0]
+    wbig := norm * k[2]
+    wd := norm * k[1]
+    wdd := norm * k[4]
+    wl := norm * k[3]
+    for y in 0usize..ph {
+        for x in 0usize..pw {
+            o := (y + 2) * tw + x + 2
+            v := wc * tmp[o]
+            v += wr * (tmp[o - 1] + tmp[o + 1] + tmp[o - tw] + tmp[o + tw])
+            v += wbig * (tmp[o - 2] + tmp[o + 2] + tmp[o - 2 * tw] + tmp[o + 2 * tw])
+            v += wd * (tmp[o - tw - 1] + tmp[o - tw + 1] + tmp[o + tw - 1] + tmp[o + tw + 1])
+            v += wdd * (tmp[o - 2 * tw - 2] + tmp[o - 2 * tw + 2] + tmp[o + 2 * tw - 2] + tmp[o + 2 * tw + 2])
+            v += wl * (tmp[o - 2 * tw - 1] + tmp[o - 2 * tw + 1] + tmp[o + 2 * tw - 1] + tmp[o + 2 * tw + 1] + tmp[o - tw - 2] + tmp[o - tw + 2] + tmp[o + tw - 2] + tmp[o + tw + 2])
+            mask[y * pw + x] = v
+        }
+    }
+}
+
+// Inverse Gaborish (libjxl's 5x5 approximation) over the group's padded
+// pixels, in place; the two pixels around them keep their original values
+// and feed the filter. `ring` holds 3 x stride floats.
+fn vd_gaborish_inverse(g: &VdGroup, xyb: &mut[f32], ring: &mut[f32]) {
+    stride := g.stride
+    pw := g.bw * 8
+    ph := g.bh * 8
+    k := [-0.09495815671340026f32, -0.041031725066768575, 0.013710004822696948, 0.006510206083837737, -0.0014789063378272242]
+    sum := 1.0f32 + 4.0 * (k[0] + k[1] + k[2] + k[4] + 2.0 * k[3])
+    norm := 1.0f32 / sum
+    wc := norm
+    wr := norm * k[0]
+    wbig := norm * k[2]
+    wd := norm * k[1]
+    wdd := norm * k[4]
+    wl := norm * k[3]
+    for c in 0usize..3 {
+        base := c * g.plane
+        // ring[(r % 3) * stride..] keeps original row r (buffer rows).
+        for i in 0usize..2 {
+            r := VD_BORDER - 2 + i
+            for x in 0usize..stride {
+                ring[(r % 3) * stride + x] = xyb[base + r * stride + x]
+            }
+        }
+        for y in 0usize..ph {
+            r := VD_BORDER + y
+            row0 := ((r - 2) % 3) * stride
+            row1 := ((r - 1) % 3) * stride
+            row2 := (r % 3) * stride
+            for x in 0usize..stride {
+                ring[row2 + x] = xyb[base + r * stride + x]
+            }
+            row3 := base + (r + 1) * stride
+            row4 := base + (r + 2) * stride
+            for x in 0usize..pw {
+                cx := VD_BORDER + x
+                v := wc * ring[row2 + cx]
+                v += wr * (ring[row2 + cx - 1] + ring[row2 + cx + 1] + ring[row1 + cx] + xyb[row3 + cx])
+                v += wbig * (ring[row2 + cx - 2] + ring[row2 + cx + 2] + ring[row0 + cx] + xyb[row4 + cx])
+                v += wd * (ring[row1 + cx - 1] + ring[row1 + cx + 1] + xyb[row3 + cx - 1] + xyb[row3 + cx + 1])
+                v += wdd * (ring[row0 + cx - 2] + ring[row0 + cx + 2] + xyb[row4 + cx - 2] + xyb[row4 + cx + 2])
+                v += wl * (ring[row0 + cx - 1] + ring[row0 + cx + 1] + xyb[row4 + cx - 1] + xyb[row4 + cx + 1] + ring[row1 + cx - 2] + ring[row1 + cx + 2] + xyb[row3 + cx - 2] + xyb[row3 + cx + 2])
+                xyb[base + r * stride + cx] = v
+            }
+        }
+    }
+}
