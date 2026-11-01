@@ -79,6 +79,7 @@ fn run(db_path: &str, script: &[u8]) -> i32 {
         },
     }
     rest := text
+    crash_point := 0u32
     for {
         n := match conn.statement_length(rest) {
             ok(v) => v,
@@ -104,9 +105,14 @@ fn run(db_path: &str, script: &[u8]) -> i32 {
                         ok(some(row)) => {
                             // Test hooks: "__crash__" aborts without closing the
                             // database (leaving any journal hot); "__sleep__", n
-                            // pauses n milliseconds while locks are held.
+                            // pauses n milliseconds while locks are held;
+                            // "__crash_commit__", n aborts at point n of the
+                            // next multi-file commit.
                             if row.len() > 0 && same(row.text(0), "__crash__") {
                                 core.assert(false)
+                            }
+                            if row.len() > 1 && same(row.text(0), "__crash_commit__") {
+                                crash_point = row.int(1) as u32
                             }
                             if row.len() > 1 && same(row.text(0), "__sleep__") {
                                 thread.sleep_ms(row.int(1) as u32)
@@ -138,6 +144,9 @@ fn run(db_path: &str, script: &[u8]) -> i32 {
                     }
                 }
                 core.drop(rows)
+                if crash_point != 0 {
+                    conn.set_crash_point_for_testing(crash_point)
+                }
                 if failed {
                     match out.print("ERROR: ") {
                         ok(_) => {},

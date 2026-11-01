@@ -125,6 +125,14 @@ pub struct Connection {
         self.e.explicit_txn
     }
 
+    // Test hook for crash-recovery tests: the process aborts at `point` of
+    // the next multi-file commit (1: super-journal written, 2: first
+    // database file written, 3: all files written, 4: super-journal
+    // deleted). 0 disables it.
+    pub fn set_crash_point_for_testing(&mut self, point: u32) {
+        self.e.test_crash = point
+    }
+
     // Waits up to `milliseconds` for other processes' locks (like
     // sqlite3_busy_timeout).
     pub fn set_busy_timeout(&mut self, milliseconds: u32) {

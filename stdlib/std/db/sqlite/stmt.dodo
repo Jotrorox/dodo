@@ -321,6 +321,14 @@ fn stmt_start(e: &mut Engine, slot: usize, params: &[db.Value]) -> void!db.Error
             compile_slot(e, slot)?
             activate(e, slot)
         }
+        // ATTACH and DETACH evaluate expressions.
+        e.sort_top = e.sort_off
+        e.sort_hi = e.sort_off + e.sort_cap
+        e.keep_top = e.keep_off
+        e.arena_top = e.arena_off
+        e.arena_base = e.arena_top
+        let regtop0 = sh(e, slot, SH_REGTOP)
+        e.rtop = regtop0
         sh_set(e, slot, SH_STATE, ST_RUNNING)
         e.active = slot
         return ok()

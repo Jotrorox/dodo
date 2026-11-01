@@ -444,4 +444,172 @@ os._exit(0)
     keeper.close()
     check(r == (3002, sum(range(3000)) + 7 + 10 + 8) and ok == "ok", f"SQLite agrees after the {victim} crash: {r} {ok}")
 
+# ---------------------------------------------------------------------------
+# Transactions over several database files (ATTACH): the super-journal
+# protocol makes the commit atomic across files, and both engines recover
+# the other's interrupted commit.
+
+
+def two_files(tag):
+    main, aux = fresh(f"mj_{tag}_main.db"), fresh(f"mj_{tag}_aux.db")
+    for p in os.listdir(WORK):
+        if p.startswith(f"mj_{tag}_main.db-mj"):
+            os.remove(os.path.join(WORK, p))
+    c = sqlite3.connect(main, isolation_level=None)
+    c.execute("attach ? as aux", (aux,))
+    c.execute("create table t(id integer primary key, data blob)")
+    c.execute("create table aux.u(id integer primary key, data blob)")
+    c.execute("begin")
+    for i in range(300):
+        c.execute("insert into t values (?, ?)", (i, bytes([i % 251]) * 700))
+        c.execute("insert into aux.u values (?, ?)", (i, bytes([i % 13]) * 900))
+    c.execute("commit")
+    c.close()
+    return main, aux
+
+
+TWO_TXN = "begin;\nupdate t set data = zeroblob(700) where id % 2 = 0;\ninsert into t values (1000, x'aa');\nupdate aux.u set data = zeroblob(900) where id % 3 = 0;\ninsert into aux.u values (1000, x'bb');\ncommit;\n"
+
+
+def two_state(main, aux):
+    """(rows in t, rows in u, both integrity checks) as SQLite sees them."""
+    c = sqlite3.connect(main, isolation_level=None)
+    c.execute("attach ? as aux", (aux,))
+    r = (c.execute("select count(*), sum(length(data)) from t").fetchone(),
+         c.execute("select count(*), sum(length(data)) from aux.u").fetchone(),
+         c.execute("pragma main.integrity_check").fetchone()[0],
+         c.execute("pragma aux.integrity_check").fetchone()[0])
+    c.close()
+    return r
+
+
+def leftovers(main, aux):
+    return sorted(p for p in os.listdir(WORK)
+                  if p.startswith(os.path.basename(main) + "-") or p.startswith(os.path.basename(aux) + "-"))
+
+
+main, aux = two_files("ref")
+old = two_state(main, aux)
+out = shell(main, f"attach '{aux}' as aux;\n" + TWO_TXN)
+new = two_state(main, aux)
+check(out.returncode == 0 and new[:2] == ((301, 300 * 700 + 1), (301, 300 * 900 + 1)) and new[2:] == ("ok", "ok") and leftovers(main, aux) == [],
+      f"Dodo commits a transaction over two files: {new}")
+
+# Dodo dies at each point of its commit; SQLite, then Dodo, recover.
+POINTS = {1: "super-journal written", 2: "first file written", 3: "both files written", 4: "super-journal deleted"}
+for point, what in POINTS.items():
+    for recoverer in ("sqlite", "dodo"):
+        main, aux = two_files(f"p{point}{recoverer}")
+        out = shell(main, f"attach '{aux}' as aux;\nselect '__crash_commit__', {point};\n" + TWO_TXN)
+        files = leftovers(main, aux)
+        sup = [p for p in files if "-mj" in p]
+        if recoverer == "sqlite":
+            got = two_state(main, aux)
+        else:
+            r = shell(main, f"attach '{aux}' as aux;\nselect count(*), sum(length(data)) from t;\nselect count(*), sum(length(data)) from aux.u;\n")
+            got = two_state(main, aux)
+            check(out_lines(r) == [f"{got[0][0]}|{got[0][1]}", f"{got[1][0]}|{got[1][1]}"], f"Dodo reads its recovered files: {out_lines(r)}")
+        want = new if point == 4 else old
+        # A crash right after the super-journal was written orphans it (in
+        # SQLite too: no journal points at it yet).
+        clean = [p for p in leftovers(main, aux) if "-mj" not in p] == [] and (point == 1 or [p for p in leftovers(main, aux) if "-mj" in p] == [])
+        check(out.returncode != 0 and len(sup) == (0 if point == 4 else 1) and got[:2] == want[:2] and got[2:] == ("ok", "ok") and clean,
+              f"Dodo crashed at '{what}'; {recoverer} recovered atomically: {got[:2]} (files {files} -> {leftovers(main, aux)})")
+
+# Recovering one file at a time: the super-journal stays until the last
+# journal that names it is rolled back.
+main, aux = two_files("split")
+shell(main, f"attach '{aux}' as aux;\nselect '__crash_commit__', 3;\n" + TWO_TXN)
+r1 = shell(aux, "select count(*) from u;\n")
+sup_after_one = [p for p in leftovers(main, aux) if "-mj" in p]
+r2 = shell(main, "select count(*) from t;\n")
+check(out_lines(r1) == ["300"] and len(sup_after_one) == 1 and out_lines(r2) == ["300"] and leftovers(main, aux) == [],
+      f"Dodo recovers the files separately; the super-journal goes with the last one: {sup_after_one} -> {leftovers(main, aux)}")
+
+# SQLite dies inside its own multi-file commit. Python's sqlite3 cannot stop
+# there, so a small interposer library makes unlink() of a chosen file kill
+# the process (macOS: DYLD interposing, needs a Python outside SIP; Linux:
+# LD_PRELOAD).
+INTERPOSER = r"""
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#ifdef __APPLE__
+static int crash_unlink(const char *path) {
+    const char *tag = getenv("CRASH_UNLINK");
+    if (tag && strstr(path, tag)) _exit(0);
+    return unlink(path);
+}
+__attribute__((used)) static struct { const void *n; const void *o; } interposers[]
+    __attribute__((section("__DATA,__interpose"))) = { { (const void *)crash_unlink, (const void *)unlink } };
+#else
+#define _GNU_SOURCE
+#include <dlfcn.h>
+int unlink(const char *path) {
+    const char *tag = getenv("CRASH_UNLINK");
+    if (tag && strstr(path, tag)) _exit(0);
+    int (*real)(const char *) = (int (*)(const char *))dlsym(RTLD_NEXT, "unlink");
+    return real(path);
+}
+#endif
+"""
+
+
+def interposed_python():
+    """(python, environment variable, library) for crash injection, or None."""
+    cc = shutil.which("cc")
+    if cc is None:
+        return None
+    src = os.path.join(WORK, "crash_unlink.c")
+    with open(src, "w") as f:
+        f.write(INTERPOSER)
+    if sys.platform == "darwin":
+        lib = os.path.join(WORK, "crash_unlink.dylib")
+        if subprocess.run([cc, "-dynamiclib", "-o", lib, src]).returncode != 0:
+            return None
+        # System Pythons are SIP-protected and ignore DYLD_INSERT_LIBRARIES.
+        for py in ("/opt/homebrew/bin/python3", "/usr/local/bin/python3", sys.executable):
+            if os.path.exists(py) and not py.startswith("/usr/bin"):
+                return (py, "DYLD_INSERT_LIBRARIES", lib)
+        return None
+    lib = os.path.join(WORK, "crash_unlink.so")
+    if subprocess.run([cc, "-shared", "-fPIC", "-o", lib, src, "-ldl"]).returncode != 0:
+        return None
+    return (sys.executable, "LD_PRELOAD", lib)
+
+
+SQLITE_TWO_TXN = """
+import sqlite3, sys
+c = sqlite3.connect(sys.argv[1], isolation_level=None)
+c.execute("attach ? as aux", (sys.argv[2],))
+c.execute("begin")
+c.execute("update t set data = zeroblob(700) where id % 2 = 0")
+c.execute("insert into t values (1000, x'aa')")
+c.execute("update aux.u set data = zeroblob(900) where id % 3 = 0")
+c.execute("insert into aux.u values (1000, x'bb')")
+c.execute("commit")
+print("committed", flush=True)
+"""
+
+inj = interposed_python()
+if inj is None:
+    print("skip SQLite multi-file crash injection (no compiler or no interposable Python)")
+else:
+    py, var, lib = inj
+    for target, label, committed in (("-mj", "before deleting its super-journal", False),
+                                     ("_main.db-journal", "after deleting its super-journal", True)):
+        main, aux = two_files("sq" + ("c" if committed else "r"))
+        env = dict(os.environ, CRASH_UNLINK=target)
+        env[var] = lib
+        run = subprocess.run([py, "-c", SQLITE_TWO_TXN, main, aux], capture_output=True, env=env)
+        crashed = b"committed" not in run.stdout
+        files = leftovers(main, aux)
+        has_sup = any("-mj" in p for p in files)
+        r = shell(main, f"attach '{aux}' as aux;\nselect count(*), sum(length(data)) from t;\nselect count(*), sum(length(data)) from aux.u;\n")
+        got = two_state(main, aux)
+        want = new if committed else old
+        check(crashed and has_sup != committed and got == want and leftovers(main, aux) == []
+              and out_lines(r) == [f"{want[0][0]}|{want[0][1]}", f"{want[1][0]}|{want[1][1]}"],
+              f"SQLite crashed {label}; Dodo recovered: {out_lines(r)} (files {files})")
+
 sys.exit(1 if failures else 0)
