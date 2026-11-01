@@ -141,7 +141,8 @@ and streams **are implemented**.
 HTTP/2, HTTP/3, WebSockets, TOML serialization and chip support beyond
 the RP2040, RP2350, ESP32-C6, and ATmega328P are remaining work. [`std/embedded/hal`](hardware.md) supplies typed
 registers and portable device protocols, blocking and polling, including I2C
-and SPI targets, pulse capture, CAN, I2S, and DMA buffer transfers, with
+and SPI targets, pulse capture, timers at other rates with compare,
+periodic, and capture channels, CAN, I2S, and DMA buffer transfers, with
 in-memory fakes in `std/embedded/hal/fake` and the serial port protocols in
 `std/embedded/hal/serial`; `std/embedded/chip/rp2040` and
 `std/embedded/board/pico` support the Raspberry Pi RP2040 and Pico, and
@@ -150,8 +151,13 @@ in-memory fakes in `std/embedded/hal/fake` and the serial port protocols in
 their I2C and SPI buses, as master or target, and serial ports through the
 shared controller drivers in `std/embedded/peripheral` and the pin and
 controller ownership both chips share in `std/embedded/chip/rp_pins`, and
-their PWM outputs and inputs and ADC inputs through `std/embedded/chip/rp_pwm` and
-`std/embedded/chip/rp_adc`, their random number generators, the RP2040's
+their PWM outputs and inputs, PWM slices as periodic timers, and ADC inputs
+through `std/embedded/chip/rp_pwm` and `std/embedded/chip/rp_adc`, which also
+runs the ADC by itself, sampling inputs round-robin into its FIFO for polled,
+interrupt-driven, or DMA reads, their timer alarms as compare channels and
+periodic timers, and the RP2350's second timer, through
+`std/embedded/chip/rp_timer`, edge capture on PIO through
+`std/embedded/chip/rp_capture`, their random number generators, the RP2040's
 ring oscillator and the RP2350's TRNG, through `std/embedded/chip/rp_rng`,
 their PIO state machines, with programs assembled
 at compile time, through `std/embedded/chip/rp_pio`, I2S audio on PIO
@@ -164,10 +170,12 @@ the RP2040's RTC and the RP2350's always-on timer, through
 with the FIFOs, spinlocks, and RP2350 doorbells the cores share, through
 `std/embedded/chip/rp_multicore`, their watchdog through
 `std/embedded/chip/rp_watchdog`, and the free flash above the program
-through `std/embedded/chip/rp_flash`. The clock gating and dormant state both
-chips share are in `std/embedded/chip/rp_power`. `std/embedded/storage` keeps
+through `std/embedded/chip/rp_flash`. The clock gating, dormant state,
+system-clock rates, and RP2350 power-down states both chips share are in
+`std/embedded/chip/rp_power`. `std/embedded/storage` keeps
 a power-cut-safe key-value store on that flash, or on any device with the
-`hal.Flash` protocol.
+`hal.Flash` protocol, such as an external SPI NOR flash chip driven by
+`std/embedded/flash/spi_nor`.
 `std/embedded/chip/esp32c6` with `std/embedded/board/esp32c6_devkitc`
 supports the Espressif ESP32-C6 and ESP32-C6-DevKitC-1: GPIO through the
 GPIO matrix, its interrupt matrix, I2C and SPI as master, polled, or target
@@ -188,8 +196,8 @@ tasks on a core, waking each on time or on an interrupt and sleeping
 in between; tasks are hand-written or [`async fn`s](async.md).
 `std/embedded/sync` shares values between interrupt handlers, tasks, and
 cores through `Mutex<T>` statics. `std/embedded/power` is the low-power layer every chip implements:
-sleep and deep sleep modes, clock gating, and a dormant state that pins
-end. `std/embedded/wireless/cyw43` drives the Pico 2 W's CYW43439 wireless chip
+sleep and deep sleep modes, clock gating, and a dormant state that pins or
+a timeout end. `std/embedded/wireless/cyw43` drives the Pico 2 W's CYW43439 wireless chip
 far enough for its LED; Wi-Fi and Bluetooth are not supported yet.
 `std/embedded/chip/atmega328p` and `std/embedded/board/arduino_uno` support
 the ATmega328P and Arduino Uno: pins, the serial port, I2C, SPI, PWM, the
@@ -247,7 +255,7 @@ individual modules and links every public declaration back to its source.
 | [SQLite databases](sqlite.md) | `std/db`, `std/db/sql`, `std/db/sqlite` | Vocabulary and interfaces portable; the SQLite driver is hosted (files) and written entirely in Dodo. |
 | [Web serving](web.md) | `std/web`, `std/web/application`, `std/web/app`, `std/web/hosted`, `std/web/https`, `std/web/reactor`, `std/web/response`, `std/web/server`, `std/web/static_files`, `std/web/stream`, `std/web/testing` | Routing/registration/composition portable; app/hosted/HTTPS/reactor/static files explicit. |
 | [Embedded scripting with Lua](script.md) | `std/script/lua` | Hosted: Linux, macOS, and Windows; `io` and `os` follow the target C library. |
-| [Hardware and embedded](hardware.md) | `std/embedded/hal`, `std/embedded/hal/serial`, `std/embedded/hal/fake`, `std/embedded/executor`, `std/embedded/sync`, `std/embedded/power`, `std/embedded/storage`, `std/embedded/board`, `std/embedded/chip`, `std/embedded/peripheral/designware_i2c`, `std/embedded/peripheral/pl022`, `std/embedded/peripheral/pl011`, `std/embedded/peripheral/esp_i2c`, `std/embedded/peripheral/esp_spi`, `std/embedded/peripheral/esp_uart`, `std/embedded/peripheral/esp_usb_serial`, `std/embedded/peripheral/esp_twai`, `std/embedded/wireless/cyw43`, `std/embedded/can/mcp2515`, `std/embedded/rtc/ds3231`, `std/embedded/cortex_m` | `std/embedded/hal`, `std/embedded/executor`, `std/embedded/sync`, and `std/embedded/power` are portable, with interrupt masking on bare-metal Cortex-M and RISC-V. `std/embedded/cortex_m` (interrupt controller, SysTick, barriers) runs only on Cortex-M. `std/embedded/board` and `std/embedded/chip` resolve to the firmware build's board and chip packages, such as `std/embedded/board/pico2` and `std/embedded/chip/rp2350`, or `std/embedded/board/esp32c6_devkitc` and `std/embedded/chip/esp32c6`. |
+| [Hardware and embedded](hardware.md) | `std/embedded/hal`, `std/embedded/hal/serial`, `std/embedded/hal/fake`, `std/embedded/executor`, `std/embedded/sync`, `std/embedded/power`, `std/embedded/storage`, `std/embedded/flash/spi_nor`, `std/embedded/board`, `std/embedded/chip`, `std/embedded/peripheral/designware_i2c`, `std/embedded/peripheral/pl022`, `std/embedded/peripheral/pl011`, `std/embedded/peripheral/esp_i2c`, `std/embedded/peripheral/esp_spi`, `std/embedded/peripheral/esp_uart`, `std/embedded/peripheral/esp_usb_serial`, `std/embedded/peripheral/esp_twai`, `std/embedded/wireless/cyw43`, `std/embedded/can/mcp2515`, `std/embedded/rtc/ds3231`, `std/embedded/cortex_m` | `std/embedded/hal`, `std/embedded/executor`, `std/embedded/sync`, and `std/embedded/power` are portable, with interrupt masking on bare-metal Cortex-M and RISC-V. `std/embedded/cortex_m` (interrupt controller, SysTick, barriers) runs only on Cortex-M. `std/embedded/board` and `std/embedded/chip` resolve to the firmware build's board and chip packages, such as `std/embedded/board/pico2` and `std/embedded/chip/rp2350`, or `std/embedded/board/esp32c6_devkitc` and `std/embedded/chip/esp32c6`. |
 
 ## Implementation and adapter packages
 

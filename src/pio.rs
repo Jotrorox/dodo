@@ -45,6 +45,11 @@ pub struct Program {
     pub output: Shift,
     /// `.set`: the pins SET drives, 0 unless given.
     pub set_count: u32,
+    /// The GPIO ranges `wait gpio` instructions name, one bit per 16 GPIOs:
+    /// bit 0 for GPIO 0 to 15, bit 1 for 16 to 31, bit 2 for 32 to 47. The
+    /// instructions hold the low five bits of the GPIO number; the loader
+    /// translates them into the PIO block's GPIO window (RP2350 GPIOBASE).
+    pub gpio_ranges: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1262,6 +1267,7 @@ impl Assembler {
                 threshold: 32,
             },
             set_count: 0,
+            gpio_ranges: 0,
         };
         let mut seen: [Option<Pos>; 9] = [None; 9];
         let [
@@ -1398,6 +1404,14 @@ impl Assembler {
                         need_v1(pos, what)?;
                         used_v1 = true;
                     }
+                    if let Instr::Wait(_, WaitSource::Gpio(index)) = &instruction.instr {
+                        let gpio = self.ranged(index, 0, 47, "the GPIO number")?;
+                        if gpio >= 32 {
+                            need_v1(index.pos(), "`wait gpio` above GPIO 31")?;
+                            used_v1 = true;
+                        }
+                        result.gpio_ranges |= 1 << (gpio / 16);
+                    }
                     match &instruction.instr {
                         Instr::Push { .. } => {
                             fifo_users.push((instruction.pos, "push", &[Fifo::TxRx, Fifo::Rx]))
@@ -1461,7 +1475,9 @@ impl Assembler {
                     None => 1,
                 };
                 let (source, index) = match source {
-                    WaitSource::Gpio(index) => (0, self.ranged(index, 0, 31, "the GPIO number")?),
+                    WaitSource::Gpio(index) => {
+                        (0, self.ranged(index, 0, 47, "the GPIO number")? & 31)
+                    }
                     WaitSource::Pin(index) => (1, self.ranged(index, 0, 31, "the pin number")?),
                     WaitSource::Irq(kind, index) => (
                         2,
@@ -1763,6 +1779,7 @@ mod tests {
             ".fifo txget\nmov osr, rxfifo[y]",
             ".mov_status irq set 1\nnop",
             ".in 4\nnop",
+            "wait 1 gpio 40",
         ] {
             let message = error(source, 0);
             assert!(
@@ -1775,6 +1792,18 @@ mod tests {
         assert!(error(".pio_version 0\nmov pindirs, x", 1).contains("declares .pio_version 0"));
         assert!(error(".pio_version rp2350\nnop", 0).contains("has version 0"));
         assert_eq!(assemble(".pio_version 1\nnop", 1).unwrap().version, 0);
+    }
+
+    #[test]
+    fn wait_gpio_records_its_gpio_ranges() {
+        // The index keeps the GPIO number's low five bits; gpio_ranges says
+        // which 16-GPIO range each `wait gpio` named, for the loader.
+        let program = assemble("wait 1 gpio 5\nwait 0 gpio 20\nwait 1 gpio 40", 1).unwrap();
+        assert_eq!(program.instructions, [0x2085, 0x2014, 0x2088]);
+        assert_eq!((program.gpio_ranges, program.version), (0b111, 1));
+        let low = assemble("wait 1 gpio 31\nwait 1 pin 3", 0).unwrap();
+        assert_eq!((low.gpio_ranges, low.version), (0b010, 0));
+        assert!(error("wait 1 gpio 48", 1).contains("the GPIO number"));
     }
 
     #[test]

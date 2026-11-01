@@ -122,6 +122,7 @@ fn program_literal(name: &str, program: &pio::Program, span: Span) -> ExprKind {
         ("autopull", boolean(program.output.auto)),
         ("pull_threshold", int(program.output.threshold)),
         ("set_count", int(program.set_count)),
+        ("gpio_ranges", int(program.gpio_ranges)),
     ];
     ExprKind::Struct(
         name.to_owned(),

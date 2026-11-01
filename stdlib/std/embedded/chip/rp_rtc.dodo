@@ -13,13 +13,21 @@ import "std/time"
 // from a clock of up to 65536 Hz. It counts years up to 4095 and keeps leap
 // years, but only every fourth year: 2100, which is not one, needs the
 // time set again after February 2100. Its alarm compares every field with
-// the time, so it matches for one second.
+// the time, so it matches for one second. Its clock, clk_rtc, comes from
+// the crystal or from a clock on a GPIO (`pause` and `resume` change it);
+// only the GPIO's keeps running while the chip is dormant, so that the
+// alarm can end the dormant state (4.8.5.5).
 //
 // `AonTimer` is the RP2350's always-on timer in the power manager (RP2350
-// datasheet 6.5): a 64-bit millisecond counter in the always-on power
+// datasheet 12.10): a 64-bit millisecond counter in the always-on power
 // domain, which keeps counting while the processors sleep and through
 // resets, until the chip loses power. Its 1 kHz tick comes from the
-// crystal. Its alarm fires once the counter is at or past the alarm time.
+// crystal (as take() sets it up), from the 32 kHz low-power oscillator
+// (LPOSC), from an external 32 kHz clock that replaces the LPOSC, or from
+// an external 1 kHz tick, the last three on GPIO 12, 14, 20, or 22. All
+// but the crystal keep running while the chip is dormant or powered down,
+// so that the alarm can end those states. Its alarm fires once the
+// counter is at or past the alarm time.
 //
 // The clocks count Unix time, milliseconds since 1970-01-01 00:00:00 UTC,
 // as the hal protocols do.
@@ -79,6 +87,11 @@ const RTC_IRQ_BIT: u32 = 1 << 0
 // The RTC's largest year and clock.
 pub const CALENDAR_LAST_YEAR: i32 = 4095
 pub const CALENDAR_MAX_HZ: u32 = 65_536
+// The slowest clock `calendar_divider` accepts: the RTC takes a few of its
+// cycles to apply each change, which this code waits for.
+pub const CALENDAR_MIN_HZ: u32 = 1_000
+// clk_rtc's divider has 24 integer bits.
+const RTC_DIVIDER_MAX: u32 = 0xFF_FFFF
 
 // RP2350 power manager registers. Every write carries the password in its
 // upper half, or the power manager ignores it.
@@ -97,6 +110,9 @@ const ALARM_TIME_31TO16: usize = 0x80
 const ALARM_TIME_15TO0: usize = 0x84
 const TIMER: usize = 0x88
 const POWMAN_INTE: usize = 0xE4
+const EXT_TIME_REF: usize = 0x4C
+const LPOSC_FREQ_KHZ_INT: usize = 0x50
+const LPOSC_FREQ_KHZ_FRAC: usize = 0x54
 
 // TIMER: counting, the alarm compares, the alarm fired (write one to
 // clear), switch the tick to the crystal (clears itself), and ticking from
@@ -107,6 +123,33 @@ const ALARM_ENAB: u32 = 1 << 4
 const ALARM: u32 = 1 << 6
 const USE_XOSC: u32 = 1 << 9
 const USING_XOSC: u32 = 1 << 16
+// The other tick sources (12.10.5): switch to the LPOSC, or to a 1 kHz tick
+// on the selected GPIO (both clear themselves), and running from them.
+const USE_LPOSC: u32 = 1 << 8
+const USE_GPIO_1KHZ: u32 = 1 << 10
+const USING_LPOSC: u32 = 1 << 17
+const USING_GPIO_1KHZ: u32 = 1 << 18
+
+// EXT_TIME_REF (12.10.7): which of the four GPIOs is the time reference,
+// and whether it replaces the LPOSC as the low-power clock. DRIVE_LPCK may
+// only change while RUN is clear.
+const EXT_SOURCE: u32 = 0x3
+const DRIVE_LPCK: u32 = 1 << 4
+
+// AonTimer.tick_source values.
+pub const TICK_CRYSTAL: u32 = 1
+pub const TICK_LPOSC: u32 = 2
+// An external clock on a GPIO in place of the LPOSC.
+pub const TICK_CLOCK_INPUT: u32 = 3
+// An external 1 kHz tick on a GPIO.
+pub const TICK_INPUT: u32 = 4
+
+// The LPOSC's nominal frequency, and the frequencies AonTimer accepts for
+// it or a clock in its place: its divider has a 6-bit integer part, in
+// kilohertz, of at least 2 (12.10.5.2).
+pub const LPOSC_HZ: u32 = 32_768
+pub const LPOSC_MIN_HZ: u32 = 2_000
+pub const LPOSC_MAX_HZ: u32 = 63_999
 
 // INTE: the timer's alarm raises POWMAN_IRQ_TIMER.
 const INTE_TIMER: u32 = 1 << 1
@@ -273,6 +316,32 @@ pub struct Calendar<R: hal.Registers>: hal.Rtc + hal.RtcAlarm {
     // past it.
     pub fn is_pending(&mut self) -> bool {
         return (self.registers.read(RTC_INTR) & RTC_IRQ_BIT) != 0 || (self.registers.read(RTC_INTF) & RTC_IRQ_BIT) != 0
+    }
+
+    // Stop counting, so that its clock can change, and return whether it
+    // was running. The time holds meanwhile; a stopped RTC has none.
+    pub fn pause(&mut self) -> bool!hal.Error {
+        control := self.registers.read(CTRL)
+        self.registers.write(CTRL, control & FORCE_NOT_LEAP_YEAR)
+        self.wait_for(CTRL, RTC_ACTIVE, false)?
+        return ok((control & RTC_ACTIVE) != 0)
+    }
+
+    // Count from a `clock_hz` clock from now on, and run again if
+    // `running`, from the time it held: up to a second is lost, as the
+    // RTC's divider starts again. InvalidInput for a clock of 0 or above
+    // CALENDAR_MAX_HZ; nothing changes then.
+    pub fn resume(&mut self, clock_hz: u32, running: bool) -> void!hal.Error {
+        if clock_hz == 0 || clock_hz > CALENDAR_MAX_HZ {
+            return err(hal.Error.InvalidInput)
+        }
+        self.registers.write(CLKDIV_M1, clock_hz - 1)
+        if running {
+            leap := self.registers.read(CTRL) & FORCE_NOT_LEAP_YEAR
+            self.registers.write(CTRL, leap | RTC_ENABLE)
+            self.wait_for(CTRL, RTC_ACTIVE, true)?
+        }
+        return ok()
     }
 
     // Stop the clock and the alarm, and give back the registers.
@@ -477,6 +546,179 @@ pub struct AonTimer<R: hal.Registers>: hal.Rtc + hal.RtcAlarm {
         return (self.registers.read(POWMAN_INTE) & INTE_TIMER) != 0
     }
 
+    // Where the tick comes from: TICK_CRYSTAL, TICK_LPOSC,
+    // TICK_CLOCK_INPUT, or TICK_INPUT. A stopped timer reports the source
+    // it starts from.
+    pub fn tick_source(&mut self) -> u32 {
+        timer := self.registers.read(TIMER)
+        if (timer & USING_GPIO_1KHZ) != 0 {
+            return TICK_INPUT
+        }
+        if (timer & USING_XOSC) != 0 {
+            return TICK_CRYSTAL
+        }
+        if (self.registers.read(EXT_TIME_REF) & DRIVE_LPCK) != 0 {
+            return TICK_CLOCK_INPUT
+        }
+        return TICK_LPOSC
+    }
+
+    // The GPIO that EXT_TIME_REF selects as the time reference, for a tick
+    // of TICK_CLOCK_INPUT or TICK_INPUT: 12, 20, 14, or 22.
+    pub fn reference_pin(&mut self) -> u32 {
+        source := self.registers.read(EXT_TIME_REF) & EXT_SOURCE
+        if source == 0 {
+            return 12
+        } else if source == 1 {
+            return 20
+        } else if source == 2 {
+            return 14
+        }
+        return 22
+    }
+
+    // Stop a running timer for a change that needs it stopped, keeping its
+    // time, and return whether it ran. A few microseconds are lost.
+    fn pause(&mut self) -> bool {
+        if (self.registers.read(TIMER) & RUN) == 0 {
+            return false
+        }
+        self.write_masked(TIMER + CLEAR_ALIAS, RUN)
+        now := self.read_time()
+        self.load(now)
+        return true
+    }
+
+    // Load SET_TIME, which takes effect when RUN is set.
+    fn load(&mut self, time_ms: u64) {
+        self.write_masked(SET_TIME_15TO0, (time_ms & 0xFFFF) as u32)
+        self.write_masked(SET_TIME_31TO16, ((time_ms >> 16) & 0xFFFF) as u32)
+        self.write_masked(SET_TIME_47TO32, ((time_ms >> 32) & 0xFFFF) as u32)
+        self.write_masked(SET_TIME_63TO48, (time_ms >> 48) as u32)
+    }
+
+    // Set the tick-source switch `select`, run again if `paused`, and wait
+    // until a running timer shows `using`.
+    fn select(&mut self, select: u32, using: u32, paused: bool) -> void!hal.Error {
+        self.write_masked(TIMER + SET_ALIAS, select)
+        if paused {
+            self.write_masked(TIMER + SET_ALIAS, RUN)
+        }
+        if (self.registers.read(TIMER) & RUN) == 0 {
+            return ok()
+        }
+        for _ in 0..ATTEMPTS {
+            if (self.registers.read(TIMER) & using) != 0 {
+                return ok()
+            }
+        }
+        return err(hal.Error.Timeout)
+    }
+
+    // Stop a GPIO from driving the low-power clock, which needs the timer
+    // stopped; return whether it ran.
+    fn internal_lpck(&mut self) -> bool {
+        if (self.registers.read(EXT_TIME_REF) & DRIVE_LPCK) == 0 {
+            return false
+        }
+        paused := self.pause()
+        self.write_masked(EXT_TIME_REF + CLEAR_ALIAS, DRIVE_LPCK)
+        return paused
+    }
+
+    // Tick from a `crystal_hz` crystal, as take() sets up: the most
+    // precise source, but the crystal stops while the chip is dormant or
+    // powered down. InvalidInput for a crystal below 2 kHz or above
+    // 65.5 MHz, Timeout if the switch never shows.
+    pub fn use_crystal(&mut self, crystal_hz: u32) -> void!hal.Error {
+        khz := crystal_hz / 1000
+        if khz < 2 || khz > 0xFFFF {
+            return err(hal.Error.InvalidInput)
+        }
+        frac := (crystal_hz % 1000) * 65_536 / 1000
+        paused := self.internal_lpck()
+        if self.registers.read(XOSC_FREQ_KHZ_INT) != khz || self.registers.read(XOSC_FREQ_KHZ_FRAC) != frac {
+            // The frequency may change only while the crystal is not the
+            // tick of a running timer.
+            if (self.registers.read(TIMER) & USING_XOSC) != 0 && self.pause() {
+                paused = true
+            }
+            self.write_masked(XOSC_FREQ_KHZ_INT, khz)
+            self.write_masked(XOSC_FREQ_KHZ_FRAC, frac)
+        }
+        return self.select(USE_XOSC, USING_XOSC, paused)
+    }
+
+    // Tick from the on-chip low-power oscillator, running at `lposc_hz`:
+    // LPOSC_HZ nominally, but it varies by up to 20% between chips and with
+    // voltage and temperature, so pass a measured frequency, such as the
+    // one each RP2350 stores in OTP (the chip package reads it). It keeps
+    // running while the chip is dormant or powered down. InvalidInput
+    // outside LPOSC_MIN_HZ to LPOSC_MAX_HZ, Timeout if the switch never
+    // shows.
+    pub fn use_lposc(&mut self, lposc_hz: u32) -> void!hal.Error {
+        if lposc_hz < LPOSC_MIN_HZ || lposc_hz > LPOSC_MAX_HZ {
+            return err(hal.Error.InvalidInput)
+        }
+        paused := self.internal_lpck()
+        paused = self.set_lposc_hz(lposc_hz, paused)
+        return self.select(USE_LPOSC, USING_LPOSC, paused)
+    }
+
+    // Write the low-power clock's frequency if it changes, pausing a timer
+    // that ticks from it; return whether the timer is paused.
+    fn set_lposc_hz(&mut self, lposc_hz: u32, paused: bool) -> bool {
+        khz := lposc_hz / 1000
+        frac := (lposc_hz % 1000) * 65_536 / 1000
+        if self.registers.read(LPOSC_FREQ_KHZ_INT) == khz && self.registers.read(LPOSC_FREQ_KHZ_FRAC) == frac {
+            return paused
+        }
+        // Only while the timer is stopped or ticks from the crystal.
+        result := paused
+        if (self.registers.read(TIMER) & USING_XOSC) == 0 && self.pause() {
+            result = true
+        }
+        self.write_masked(LPOSC_FREQ_KHZ_INT, khz)
+        self.write_masked(LPOSC_FREQ_KHZ_FRAC, frac)
+        return result
+    }
+
+    // Tick from an external clock of `clock_hz`, typically a 32.768 kHz
+    // oscillator, on the GPIO that EXT_TIME_REF source `source` selects
+    // (ext_time_source names them). It replaces the LPOSC everywhere,
+    // including the power manager's own clock while the switched core is
+    // off, and keeps running in every power state. The pin must be an input
+    // already. InvalidInput for a source above 3 or a clock outside
+    // LPOSC_MIN_HZ to LPOSC_MAX_HZ, Timeout if the switch never shows.
+    pub fn use_clock_input(&mut self, source: u32, clock_hz: u32) -> void!hal.Error {
+        if source > EXT_SOURCE || clock_hz < LPOSC_MIN_HZ || clock_hz > LPOSC_MAX_HZ {
+            return err(hal.Error.InvalidInput)
+        }
+        // DRIVE_LPCK changes only while the timer is stopped.
+        paused := self.pause()
+        self.write_masked(EXT_TIME_REF, source | DRIVE_LPCK)
+        paused = self.set_lposc_hz(clock_hz, paused)
+        return self.select(USE_LPOSC, USING_LPOSC, paused)
+    }
+
+    // Tick from an external 1 kHz tick, counted on its falling edges, on the
+    // GPIO that EXT_TIME_REF source `source` selects. Pulses and gaps must
+    // each last longer than the LPOSC's period, 31 us. It keeps running in
+    // every power state; the switch may advance the time by up to a
+    // millisecond. The pin must be an input already. InvalidInput for a
+    // source above 3, Timeout if the switch never shows.
+    pub fn use_tick_input(&mut self, source: u32) -> void!hal.Error {
+        if source > EXT_SOURCE {
+            return err(hal.Error.InvalidInput)
+        }
+        paused := self.internal_lpck()
+        if !paused {
+            paused = self.pause()
+        }
+        self.write_masked(EXT_TIME_REF, source)
+        return self.select(USE_GPIO_1KHZ, USING_GPIO_1KHZ, paused)
+    }
+
     // Disarm the alarm and stop its interrupt, and give back the registers.
     // The timer keeps counting.
     pub fn release(self) -> R from(self) {
@@ -485,4 +727,245 @@ pub struct AonTimer<R: hal.Registers>: hal.Rtc + hal.RtcAlarm {
         let AonTimer { registers } = self
         return registers
     }
+}
+
+// The EXT_TIME_REF source that selects GPIO `pin` as the always-on timer's
+// time reference: GPIO 12, 20, 14, and 22 are sources 0 to 3 (RP2350
+// datasheet 12.10.7). InvalidInput for another pin.
+pub fn ext_time_source(pin: u32) -> u32!hal.Error {
+    if pin == 12 {
+        return ok(0)
+    } else if pin == 20 {
+        return ok(1)
+    } else if pin == 14 {
+        return ok(2)
+    } else if pin == 22 {
+        return ok(3)
+    }
+    return err(hal.Error.InvalidInput)
+}
+
+// --- The clocks while the chip is dormant -------------------------------------
+
+// The divider for clk_rtc from a GPIO clock of `input_hz`, so that the RTC
+// counts from a whole number of hertz, CALENDAR_MIN_HZ to CALENDAR_MAX_HZ:
+// the smallest that divides the input exactly. InvalidInput if none does.
+pub fn calendar_divider(input_hz: u32) -> u32!hal.Error {
+    if input_hz < CALENDAR_MIN_HZ {
+        return err(hal.Error.InvalidInput)
+    }
+    first := (input_hz + CALENDAR_MAX_HZ - 1) / CALENDAR_MAX_HZ
+    for divider in first..RTC_DIVIDER_MAX + 1 {
+        clock := input_hz / divider
+        if clock < CALENDAR_MIN_HZ {
+            break
+        }
+        if input_hz % divider == 0 {
+            return ok(divider)
+        }
+    }
+    return err(hal.Error.InvalidInput)
+}
+
+// Poll `offset` of `block` until `mask` reads `set`.
+fn wait_bits<R: hal.Registers>(block: &mut R, offset: usize, mask: u32, set: bool) -> void!hal.Error {
+    for _ in 0..ATTEMPTS {
+        if ((block.read(offset) & mask) != 0) == set {
+            return ok()
+        }
+    }
+    return err(hal.Error.Timeout)
+}
+
+// What a timed dormant state borrows from the RP2040's RTC, to give back.
+pub struct CalendarAlarm {
+    setup_0: u32
+    setup_1: u32
+    inte: u32
+    intf: u32
+    // The second the borrowed alarm matches.
+    target: u64
+}
+
+// Borrow the RTC's alarm to end a dormant state at least `timeout_ms` from
+// now: it matches a whole second, later by up to a second, as the RTC's
+// time has no fractions. Its interrupt is enabled, as the oscillators wake
+// on it. Busy if the RTC is not running.
+//
+// SAFETY: `rtc` must be the RTC's registers, interrupts must be masked, and
+// nothing else may use them until calendar_return_alarm.
+pub unsafe fn calendar_borrow_alarm<R: hal.Registers>(rtc: &mut R, timeout_ms: u64) -> CalendarAlarm!hal.Error {
+    if (rtc.read(CTRL) & RTC_ACTIVE) == 0 {
+        return err(hal.Error.Busy)
+    }
+    clock := rtc.read(RTC_0)
+    date := rtc.read(RTC_1)
+    now := seconds_of(date, clock)?
+    target := now + 1 + (timeout_ms + 999) / 1000
+    let Fields { date: alarm_date, clock: alarm_clock, year: _ } = fields_of(target)?
+    saved := CalendarAlarm { setup_0: rtc.read(IRQ_SETUP_0), setup_1: rtc.read(IRQ_SETUP_1), inte: rtc.read(RTC_INTE), intf: rtc.read(RTC_INTF), target }
+    rtc.write(IRQ_SETUP_0 + CLEAR_ALIAS, MATCH_ENA)
+    wait_bits(rtc, IRQ_SETUP_0, MATCH_ACTIVE, false)?
+    rtc.write(RTC_INTF, 0)
+    rtc.write(IRQ_SETUP_0, alarm_date | YEAR_ENA | MONTH_ENA | DAY_ENA)
+    rtc.write(IRQ_SETUP_1, (alarm_clock & ~WEEKDAY) | HOUR_ENA | MINUTE_ENA | SECOND_ENA)
+    rtc.write(IRQ_SETUP_0 + SET_ALIAS, MATCH_ENA)
+    wait_bits(rtc, IRQ_SETUP_0, MATCH_ACTIVE, true)?
+    rtc.write(RTC_INTE, RTC_IRQ_BIT)
+    return ok(saved)
+}
+
+// Whether the RTC has reached the borrowed alarm's second.
+pub fn calendar_alarm_due<R: hal.Registers>(rtc: &mut R, saved: &CalendarAlarm) -> bool {
+    if (rtc.read(CTRL) & RTC_ACTIVE) == 0 {
+        return false
+    }
+    clock := rtc.read(RTC_0)
+    date := rtc.read(RTC_1)
+    return match seconds_of(date, clock) {
+        ok(now) => now >= saved.target,
+        err(_) => false,
+    }
+}
+
+// Put back the alarm calendar_borrow_alarm borrowed.
+//
+// SAFETY: as for calendar_borrow_alarm.
+pub unsafe fn calendar_return_alarm<R: hal.Registers>(rtc: &mut R, saved: CalendarAlarm) -> void!hal.Error {
+    let CalendarAlarm { setup_0, setup_1, inte, intf, target: _ } = saved
+    rtc.write(RTC_INTE, inte)
+    rtc.write(IRQ_SETUP_0 + CLEAR_ALIAS, MATCH_ENA)
+    wait_bits(rtc, IRQ_SETUP_0, MATCH_ACTIVE, false)?
+    rtc.write(IRQ_SETUP_0, setup_0 & ~(MATCH_ENA | MATCH_ACTIVE))
+    rtc.write(IRQ_SETUP_1, setup_1)
+    rtc.write(RTC_INTF, intf)
+    if (setup_0 & MATCH_ENA) != 0 {
+        rtc.write(IRQ_SETUP_0 + SET_ALIAS, MATCH_ENA)
+        wait_bits(rtc, IRQ_SETUP_0, MATCH_ACTIVE, true)?
+    }
+    return ok()
+}
+
+// Write the low half of `value` to a power manager register, with the
+// password.
+fn powman_write<R: hal.Registers>(powman: &mut R, offset: usize, value: u32) {
+    powman.write(offset, PASSWORD | (value & 0xFFFF))
+}
+
+// Whether the always-on timer runs.
+pub fn aon_running<R: hal.Registers>(powman: &mut R) -> bool {
+    return (powman.read(TIMER) & RUN) != 0
+}
+
+// The always-on timer's time, read as AonTimer.now_ms does.
+pub fn aon_now<R: hal.Registers>(powman: &mut R) -> u64 {
+    high := powman.read(READ_TIME_UPPER)
+    for {
+        low := powman.read(READ_TIME_LOWER)
+        next := powman.read(READ_TIME_UPPER)
+        if next == high {
+            return ((high as u64) << 32) | low as u64
+        }
+        high = next
+    }
+}
+
+// Arm the always-on timer's alarm for `time_ms`, replacing its alarm.
+pub fn aon_arm_alarm<R: hal.Registers>(powman: &mut R, time_ms: u64) {
+    powman_write(powman, TIMER + CLEAR_ALIAS, ALARM_ENAB)
+    powman_write(powman, ALARM_TIME_15TO0, (time_ms & 0xFFFF) as u32)
+    powman_write(powman, ALARM_TIME_31TO16, ((time_ms >> 16) & 0xFFFF) as u32)
+    powman_write(powman, ALARM_TIME_47TO32, ((time_ms >> 32) & 0xFFFF) as u32)
+    powman_write(powman, ALARM_TIME_63TO48, (time_ms >> 48) as u32)
+    powman_write(powman, TIMER + CLEAR_ALIAS, ALARM)
+    powman_write(powman, TIMER + SET_ALIAS, ALARM_ENAB)
+}
+
+// Move a running timer's tick from the crystal to the LPOSC, at
+// `lposc_hz` unless 0 (which keeps the frequency it has), as the power
+// sequencer does before the crystal stops. Timeout if the switch never
+// shows.
+pub fn aon_tick_from_lposc<R: hal.Registers>(powman: &mut R, lposc_hz: u32) -> void!hal.Error {
+    if lposc_hz >= LPOSC_MIN_HZ && lposc_hz <= LPOSC_MAX_HZ {
+        // Allowed while the crystal is the tick (12.10.5.1).
+        powman_write(powman, LPOSC_FREQ_KHZ_INT, lposc_hz / 1000)
+        powman_write(powman, LPOSC_FREQ_KHZ_FRAC, (lposc_hz % 1000) * 65_536 / 1000)
+    }
+    powman_write(powman, TIMER + SET_ALIAS, USE_LPOSC)
+    return wait_bits(powman, TIMER, USING_LPOSC, true)
+}
+
+// Move a running timer's tick back to the crystal.
+pub fn aon_tick_from_crystal<R: hal.Registers>(powman: &mut R) -> void!hal.Error {
+    powman_write(powman, TIMER + SET_ALIAS, USE_XOSC)
+    return wait_bits(powman, TIMER, USING_XOSC, true)
+}
+
+// What a timed dormant state borrows from the RP2350's always-on timer, to
+// give back.
+pub struct AonAlarm {
+    time: u64
+    enabled: bool
+    listening: bool
+    // The tick moved from the crystal to the LPOSC.
+    moved: bool
+}
+
+// Borrow the always-on timer's alarm to end a dormant state `timeout_ms`
+// from now. A tick from the crystal, which stops while dormant, moves to
+// the LPOSC at `lposc_hz` (as for aon_tick_from_lposc) until
+// aon_return_alarm. The alarm's interrupt stays off: the alarm itself
+// wakes the oscillators (RP2350 datasheet 6.5.3.1). Busy if the timer is
+// not running, Timeout if the tick does not move.
+//
+// SAFETY: `powman` must be the power manager's registers, interrupts must
+// be masked, and nothing else may use the timer until aon_return_alarm.
+pub unsafe fn aon_borrow_alarm<R: hal.Registers>(powman: &mut R, timeout_ms: u64, lposc_hz: u32) -> AonAlarm!hal.Error {
+    timer := powman.read(TIMER)
+    if (timer & RUN) == 0 {
+        return err(hal.Error.Busy)
+    }
+    time := (powman.read(ALARM_TIME_63TO48) as u64 & 0xFFFF) << 48
+    time |= (powman.read(ALARM_TIME_47TO32) as u64 & 0xFFFF) << 32
+    time |= (powman.read(ALARM_TIME_31TO16) as u64 & 0xFFFF) << 16
+    time |= powman.read(ALARM_TIME_15TO0) as u64 & 0xFFFF
+    saved := AonAlarm { time, enabled: (timer & ALARM_ENAB) != 0, listening: (powman.read(POWMAN_INTE) & INTE_TIMER) != 0, moved: false }
+    if (timer & USING_XOSC) != 0 {
+        aon_tick_from_lposc(powman, lposc_hz)?
+        saved.moved = true
+    }
+    powman_write(powman, POWMAN_INTE + CLEAR_ALIAS, INTE_TIMER)
+    now := aon_now(powman)
+    aon_arm_alarm(powman, now + timeout_ms)
+    return ok(saved)
+}
+
+// Whether the borrowed alarm has fired.
+pub fn aon_alarm_fired<R: hal.Registers>(powman: &mut R) -> bool {
+    return (powman.read(TIMER) & ALARM) != 0
+}
+
+// Put back the alarm, interrupt, and tick that aon_borrow_alarm borrowed.
+// An alarm whose time has passed meanwhile fires as soon as it is armed
+// again. Timeout if the tick does not move back.
+//
+// SAFETY: as for aon_borrow_alarm.
+pub unsafe fn aon_return_alarm<R: hal.Registers>(powman: &mut R, saved: AonAlarm) -> void!hal.Error {
+    let AonAlarm { time, enabled, listening, moved } = saved
+    powman_write(powman, TIMER + CLEAR_ALIAS, ALARM_ENAB)
+    powman_write(powman, ALARM_TIME_15TO0, (time & 0xFFFF) as u32)
+    powman_write(powman, ALARM_TIME_31TO16, ((time >> 16) & 0xFFFF) as u32)
+    powman_write(powman, ALARM_TIME_47TO32, ((time >> 32) & 0xFFFF) as u32)
+    powman_write(powman, ALARM_TIME_63TO48, (time >> 48) as u32)
+    powman_write(powman, TIMER + CLEAR_ALIAS, ALARM)
+    if enabled {
+        powman_write(powman, TIMER + SET_ALIAS, ALARM_ENAB)
+    }
+    if listening {
+        powman_write(powman, POWMAN_INTE + SET_ALIAS, INTE_TIMER)
+    }
+    if moved {
+        return aon_tick_from_crystal(powman)
+    }
+    return ok()
 }

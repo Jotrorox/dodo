@@ -25,6 +25,10 @@ import "std/embedded/sync"
 // - `Doorbells` hands out the RP2350's doorbells, which interrupt the other
 //   core without passing data. The RP2040 has none.
 //
+// And `lockout()` parks the other core in SRAM while this one needs it to
+// keep off the flash, as std/embedded/chip/rp_flash does to erase and write
+// it; see "The lockout" below.
+//
 // A task for core 1 is a value with a public `run(self)` method, like a
 // std/thread task. It moves to core 1, so it may hold peripherals and other
 // owned values but no references, which `start` checks:
@@ -64,6 +68,38 @@ import "std/embedded/sync"
 // other core through spinlock 31, with a `Spinlock` of the program's own,
 // or, on the RP2350, with std/sync/atomic. The RP2040's Cortex-M0+ has only
 // atomic loads and stores.
+//
+// The lockout. Both cores execute in place from the flash, which stops
+// answering reads while it erases or writes, so the core that changes it
+// must keep the other core off it, as pico-sdk's multicore_lockout does.
+// `lockout()` parks the other core, if it runs, in a loop in SRAM with its
+// interrupts masked, until the returned `Lockout` is dropped:
+//
+//   1. The calling core takes the lockout, held by one core at a time, and
+//      masks its own interrupts.
+//   2. It writes a request number into a mailbox in SRAM, then forces the
+//      other core's IO_IRQ_QSPI through IO_QSPI's PROCn_INTF register. Only
+//      that core sees the interrupt, the QSPI pins carry the flash and no
+//      GPIO events, and the vector is fetched from flash while it still
+//      reads.
+//   3. The chip runtime's handler, dodo_lockout_handler, runs from SRAM: it
+//      masks interrupts, clears the forced bit, copies the request number
+//      into the mailbox to acknowledge it, and spins on the mailbox.
+//   4. Once the acknowledgement arrives, the calling core may take the flash
+//      away. Dropping the Lockout clears the request, and the parked core
+//      returns to what it was doing.
+//
+// Core 1 listens at the most urgent priority from the start of its task,
+// and core 0 from `Core1.start`, so either core can lock the other out.
+// The parked core still finishes an interrupt handler of the same priority
+// first, and one with interrupts masked (hal.Critical, a sync.Mutex, a
+// Spinlock guard) cannot answer until it unmasks them: if no answer comes
+// within LOCKOUT_ATTEMPTS polls, the request is withdrawn and `lockout`
+// returns Timeout. Holding a sync section while asking for the lockout keeps
+// the other core out of its sections for as long, so it may time out the
+// same way. A program's own handler for IO_IRQ_QSPI replaces the runtime's
+// and breaks the lockout, and DMA transfers that read flash are not
+// stopped by it.
 
 // SIO, the single-cycle I/O block. Each core sees its own FIFO end and
 // CPUID at the same addresses.
@@ -115,6 +151,21 @@ pub const MIN_STACK_BYTES: usize = 256
 const ATTEMPTS: u32 = 1_000_000
 const MAX_RESTARTS: u32 = 8
 
+// Polls of the lockout's mailbox before a core that does not answer is
+// reported with Timeout: tens of milliseconds, far longer than a short
+// critical section or interrupt handler. And attempts to take the lockout
+// while the other core holds it before `lockout` reports Busy; between
+// them this core lets the other's request in, so it is parked meanwhile.
+pub const LOCKOUT_ATTEMPTS: u32 = 1_000_000
+const LOCKOUT_TAKES: u32 = 100_000
+// The lockout mailbox, in SRAM (the runtime's dodo_lockout_mailbox): the
+// request number the locking core writes, 0 for none, and the one the
+// parked core acknowledged.
+pub const LOCKOUT_REQUEST: usize = 0
+pub const LOCKOUT_ACKNOWLEDGE: usize = 4
+// PROC1_INTF follows PROC0_INTF by this many bytes in IO_QSPI on both chips.
+pub const LOCKOUT_FORCE_STRIDE: usize = 12
+
 // Per core, the signal raised when its FIFO end has a word, or NO_SIGNAL.
 const NO_SIGNAL: u32 = 0xFFFF_FFFF
 static mut WAKE: [2]u32 = [NO_SIGNAL, NO_SIGNAL]
@@ -125,9 +176,20 @@ static mut BELLS: [16]u32 = [NO_SIGNAL; 16]
 // True from a successful Core1.start until its Running handle stops core 1.
 static mut CORE1_RUNNING: bool = false
 
+// The lockout's lines, from take(), and NO_LOCKOUT in LOCKOUT_IRQ until
+// then; the core that holds the lockout, or NO_LOCKOUT; and the last
+// request number. The holder changes only inside a sync section.
+const NO_LOCKOUT: u32 = 0xFFFF_FFFF
+static mut LOCKOUT_QSPI: usize = 0
+static mut LOCKOUT_FORCE: usize = 0
+static mut LOCKOUT_BIT: u32 = 0
+static mut LOCKOUT_IRQ: u32 = 0xFFFF_FFFF
+static mut LOCKOUT_HOLDER: u32 = 0xFFFF_FFFF
+static mut LOCKOUT_SEQUENCE: u32 = 0
+
 // Whether core 1 runs a task from Core1.start, and so may be executing from
-// flash: rp_flash refuses to erase or write while it does. Core 1 waiting
-// in the boot ROM, before it is started or after it is stopped, does not
+// flash: `lockout` on core 0 parks it only while it does. Core 1 waiting in
+// the boot ROM, before it is started or after it is stopped, does not
 // count.
 pub fn core1_running() -> bool {
     // SAFETY: a word read; only core 0 writes it, in start and halt.
@@ -137,8 +199,10 @@ pub fn core1_running() -> bool {
 }
 
 // Provided by the compiler's RP2040 and RP2350 firmware runtimes: where core
-// 1 starts, with the Thumb bit set.
+// 1 starts, with the Thumb bit set; and the address of the lockout mailbox,
+// two words in SRAM that the runtime's dodo_lockout_handler reads.
 unsafe extern "C" fn dodo_core1_entry() -> u32
+unsafe extern "C" fn dodo_lockout_words() -> usize
 
 // What differs between the RP2040 and the RP2350, from their chip packages.
 pub struct Chip {
@@ -153,6 +217,19 @@ pub struct Chip {
     pub reserved_locks: u32
     // The doorbell interrupt, if the chip has doorbells.
     pub doorbell_irq: Option<u32>
+    // How one core interrupts the other for the lockout.
+    pub lockout: LockoutLine
+}
+
+// The lockout's interrupt (see "The lockout"): IO_QSPI's base address, the
+// offset of its PROC0_INTF register (PROC1_INTF follows by
+// LOCKOUT_FORCE_STRIDE), the bit to force there, which must be the one the
+// chip runtime's dodo_lockout_handler clears, and IO_IRQ_QSPI's number.
+pub struct LockoutLine {
+    pub qspi_base: usize
+    pub force: usize
+    pub bit: u32
+    pub irq: u32
 }
 
 // The parts the chip's take() hands out.
@@ -168,6 +245,11 @@ pub struct Cores {
 // one of its kind.
 pub unsafe fn take(chip: Chip) -> Cores {
     unsafe {
+        LOCKOUT_QSPI = chip.lockout.qspi_base
+        LOCKOUT_FORCE = chip.lockout.force
+        LOCKOUT_BIT = chip.lockout.bit
+        LOCKOUT_IRQ = chip.lockout.irq
+        LOCKOUT_HOLDER = NO_LOCKOUT
         return Cores {
             core1: Core1 { psm_base: chip.psm_base, core1_bit: chip.core1_bit, fifo_irq: chip.core0_fifo_irq },
             fifos: Fifos { irq0: chip.core0_fifo_irq, irq1: chip.core1_fifo_irq, claimed: 0 },
@@ -266,6 +348,8 @@ pub struct Core1 {
         unsafe {
             sync.set_core_lock(acquire_core_lock, release_core_lock)
         }
+        // Core 1 may lock core 0 out from the start of its task.
+        listen_for_lockout()
         // Core 0's FIFO interrupt stays off while core 1's boot ROM uses
         // the FIFO, so the program's handler does not see the handshake.
         irq := self.fifo_irq
@@ -297,7 +381,13 @@ unsafe fn boot(psm_base: usize, core1_bit: u32, stack_pointer: u32) -> void!hal.
     unsafe {
         sio := hal.RegisterBlock.at(SIO_BASE)
         psm := hal.RegisterBlock.at(psm_base)
-        hold(&mut psm, core1_bit)?
+        // A lockout the previous task held or asked for ends with it, with
+        // interrupts masked so that a request it left cannot park core 0.
+        section := hal.Critical.enter()
+        held := hold(&mut psm, core1_bit)
+        forget_lockout(1)
+        core.drop(section)
+        held?
         release(&mut sio, &mut psm, core1_bit)?
         return launch(&mut sio, cortex_m.vector_table() as u32, stack_pointer, dodo_core1_entry(), cortex_m.send_event)
     }
@@ -317,6 +407,8 @@ unsafe fn run_task<T>(argument: *mut u8) {
     mem.assert_send::<T>()
     unsafe {
         task := ptr.read(ptr.offset(argument, mem.offset_of::<Start<T>>("task") as isize) as *mut T)
+        // Before the task runs, so core 0 can lock core 1 out at any time.
+        listen_for_lockout()
         task.run()
         mem.atomic_store(ptr.offset(argument, mem.offset_of::<Start<T>>("finished") as isize) as *mut u32, 1u32, 2)
     }
@@ -357,11 +449,16 @@ pub struct Running {
         // for the write to take effect, so a timeout is ignored.
         unsafe {
             psm := hal.RegisterBlock.at(self.core1.psm_base)
+            section := hal.Critical.enter()
             match hold(&mut psm, self.core1.core1_bit) {
                 ok() => {}
                 err(_) => {}
             }
             CORE1_RUNNING = false
+            // A lockout core 1 held or asked for, which would park core 0
+            // forever.
+            forget_lockout(1)
+            core.drop(section)
             // A section core 1 held would keep core 0 out forever.
             sync.abandon_core(1)
         }
@@ -819,6 +916,197 @@ fn release_core_lock() {
     unsafe {
         lock := lock_register(CORE_LOCK)
         lock.write(1)
+    }
+}
+
+// --- The lockout ------------------------------------------------------------
+
+// The other core parked in SRAM, from `lockout`; see "The lockout" in the
+// package comment. Interrupts stay masked on this core until it is dropped,
+// which lets the other core go on.
+pub struct Lockout {
+    critical: hal.Critical
+    // Whether this Lockout parked the other core and ends that when dropped.
+    parked: bool
+
+    // True if this Lockout parked the other core; false if there was no
+    // need: on core 0 while core 1 runs no task, or inside another Lockout
+    // of this core, which keeps it parked.
+    pub fn is_parked(&self) -> bool {
+        return self.parked
+    }
+
+    fn drop(&mut self) {
+        if !self.parked {
+            return
+        }
+        self.parked = false
+        // SAFETY: this core holds the lockout, so it alone writes the
+        // mailbox's request word and the holder, which the other core only
+        // reads, here a word at a time.
+        unsafe {
+            mailbox := hal.RegisterBlock.at(dodo_lockout_words())
+            end_lockout(&mut mailbox)
+            LOCKOUT_HOLDER = NO_LOCKOUT
+        }
+        cpu.fence()
+    }
+}
+
+// Park the other core in SRAM, with its interrupts masked, until the
+// returned Lockout is dropped, so that this core can take the flash away
+// from execute-in-place; see "The lockout". On core 0 this parks core 1
+// only while it runs a task (core1_running); on core 1 it always parks core
+// 0. This core's interrupts are masked meanwhile too. Inside another
+// Lockout of this core it changes nothing.
+//
+// Timeout if the other core does not answer within LOCKOUT_ATTEMPTS polls,
+// for example while it keeps its interrupts masked, and Busy if it holds
+// the lockout itself and does not give it up in time. Either way nothing is
+// parked.
+pub fn lockout() -> Lockout!hal.Error {
+    here := cpu.core_id()
+    for _ in 0..LOCKOUT_TAKES {
+        critical := hal.Critical.enter()
+        if here == 0 && !core1_running() {
+            return ok(Lockout { critical, parked: false })
+        }
+        state := take_lockout(here)
+        if state == HELD_HERE {
+            return ok(Lockout { critical, parked: false })
+        }
+        if state == TAKEN {
+            match park_other(here) {
+                ok() => {
+                    return ok(Lockout { critical, parked: true })
+                }
+                err(error) => {
+                    // SAFETY: as in Lockout.drop.
+                    unsafe {
+                        LOCKOUT_HOLDER = NO_LOCKOUT
+                    }
+                    return err(error)
+                }
+            }
+        }
+        // The other core holds the lockout: let its request in, which parks
+        // this core until it is done, and try again.
+        core.drop(critical)
+    }
+    return err(hal.Error.Busy)
+}
+
+// take_lockout's answers.
+const TAKEN: u32 = 0
+const HELD_HERE: u32 = 1
+const HELD_THERE: u32 = 2
+
+// Take the lockout for core `here` if no core holds it.
+fn take_lockout(here: u32) -> u32 {
+    section := sync.enter()
+    state := HELD_THERE
+    // SAFETY: the holder changes only inside a sync section, or from this
+    // core's own value back to NO_LOCKOUT.
+    unsafe {
+        if LOCKOUT_HOLDER == NO_LOCKOUT {
+            LOCKOUT_HOLDER = here
+            state = TAKEN
+        } else if LOCKOUT_HOLDER == here {
+            state = HELD_HERE
+        }
+    }
+    core.drop(section)
+    return state
+}
+
+// Park the core that is not `here`, which holds the lockout.
+fn park_other(here: u32) -> void!hal.Error {
+    // SAFETY: the holder alone writes the sequence and the mailbox's request
+    // word; LOCKOUT_QSPI is IO_QSPI, set by take(), and the forced bit only
+    // interrupts the other core.
+    unsafe {
+        LOCKOUT_SEQUENCE += 1
+        if LOCKOUT_SEQUENCE == 0 {
+            LOCKOUT_SEQUENCE = 1
+        }
+        qspi := hal.RegisterBlock.at(LOCKOUT_QSPI)
+        mailbox := hal.RegisterBlock.at(dodo_lockout_words())
+        return request_lockout(&mut qspi, &mut mailbox, force_offset(1 - here), LOCKOUT_BIT, LOCKOUT_SEQUENCE)
+    }
+}
+
+// The offset in IO_QSPI of the PROCn_INTF register of core `victim`.
+fn force_offset(victim: u32) -> usize {
+    // SAFETY: set once by take(), before core 1 runs.
+    force := unsafe {
+        LOCKOUT_FORCE
+    }
+    return force + LOCKOUT_FORCE_STRIDE * victim as usize
+}
+
+// Ask the other core to park: write `request`, nonzero and different from
+// the last, into the mailbox registers `mailbox`, then set `bit` in its
+// PROCn_INTF register at `force` in the IO_QSPI registers `qspi`, through
+// the atomic set alias, and wait for the request to come back in the
+// mailbox's acknowledgement word. Timeout after LOCKOUT_ATTEMPTS polls,
+// once the request is withdrawn: its word cleared and the bit with it, so a
+// handler that still runs returns at once.
+pub fn request_lockout<Q: hal.Registers, M: hal.Registers>(qspi: &mut Q, mailbox: &mut M, force: usize, bit: u32, request: u32) -> void!hal.Error {
+    mailbox.write(LOCKOUT_REQUEST, request)
+    // The request is in SRAM before the interrupt that reads it is raised.
+    cpu.fence()
+    qspi.write(force + SET_ALIAS, bit)
+    for _ in 0..LOCKOUT_ATTEMPTS {
+        if mailbox.read(LOCKOUT_ACKNOWLEDGE) == request {
+            cpu.fence()
+            return ok()
+        }
+    }
+    mailbox.write(LOCKOUT_REQUEST, 0)
+    cpu.fence()
+    qspi.write(force + CLEAR_ALIAS, bit)
+    return err(hal.Error.Timeout)
+}
+
+// Let the parked core go on: clear the request in the mailbox registers
+// `mailbox`, after this core's accesses to the flash.
+pub fn end_lockout<M: hal.Registers>(mailbox: &mut M) {
+    cpu.fence()
+    mailbox.write(LOCKOUT_REQUEST, 0)
+}
+
+// Let the other core's lockout requests interrupt this core, at the most
+// urgent priority.
+fn listen_for_lockout() {
+    // SAFETY: set once by take(), before core 1 runs.
+    irq := unsafe {
+        LOCKOUT_IRQ
+    }
+    if irq == NO_LOCKOUT {
+        return
+    }
+    cortex_m.set_priority(irq, 0)
+    cortex_m.enable(irq)
+}
+
+// Forget a lockout that core `stopped` held or asked for: its request ends,
+// and the interrupt it forced on this core is withdrawn and unpended.
+// SAFETY: core `stopped` must be held in reset, and interrupts masked on
+// this core, the other one, so that a request left behind cannot park it.
+unsafe fn forget_lockout(stopped: u32) {
+    unsafe {
+        if LOCKOUT_IRQ == NO_LOCKOUT {
+            return
+        }
+        if LOCKOUT_HOLDER == stopped {
+            mailbox := hal.RegisterBlock.at(dodo_lockout_words())
+            end_lockout(&mut mailbox)
+            LOCKOUT_HOLDER = NO_LOCKOUT
+        }
+        qspi := hal.RegisterBlock.at(LOCKOUT_QSPI)
+        qspi.write(force_offset(1 - stopped) + CLEAR_ALIAS, LOCKOUT_BIT)
+        cpu.fence()
+        cortex_m.unpend(LOCKOUT_IRQ)
     }
 }
 

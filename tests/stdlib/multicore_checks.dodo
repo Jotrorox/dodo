@@ -6,9 +6,10 @@ import "std/embedded/hal"
 
 // std/embedded/chip/rp_multicore on the host: holding, releasing, and
 // launching core 1 against a simulated boot ROM behind simulated SIO and
-// power-on state machine registers, and the claims of FIFO ends and
-// spinlocks. Starting core 1 itself needs a chip; the board self-tests in
-// tests/hardware cover it.
+// power-on state machine registers, the claims of FIFO ends and spinlocks,
+// and the lockout's request and release against a simulated parked core
+// behind simulated IO_QSPI and mailbox registers. Starting core 1 itself
+// needs a chip; the board self-tests in tests/hardware cover it.
 
 const FIFO_ST: usize = 0x050
 const FIFO_WR: usize = 0x054
@@ -273,6 +274,7 @@ fn rp2040_has_no_doorbells() {
             core1_fifo_irq: 16,
             reserved_locks: 0,
             doorbell_irq: none,
+            lockout: rp_multicore.LockoutLine { qspi_base: 0x4001_8000, force: 0x38, bit: 1, irq: 14 },
         })
     }
     core.assert(!parts.doorbells.is_supported())
@@ -293,6 +295,7 @@ fn spinlocks_and_fifo_ends_are_claimed_once() {
             core1_fifo_irq: 25,
             reserved_locks: 0x0003_F31F,
             doorbell_irq: some(26),
+            lockout: rp_multicore.LockoutLine { qspi_base: 0x4003_0000, force: 0x220, bit: 0x100, irq: 23 },
         })
     }
     spinlocks := &mut parts.spinlocks
@@ -372,6 +375,154 @@ fn spinlocks_and_fifo_ends_are_claimed_once() {
     core.drop(fifo1)
 }
 
+// The lockout's other core, as the runtime's dodo_lockout_handler behaves:
+// once its forced interrupt is raised and it can take it (after
+// ANSWER_AFTER polls of the mailbox; never while MASKED), it clears the
+// forced bit, and if a request stands, acknowledges it and stays parked
+// until the request word changes.
+const QSPI_PROC0_INTF: usize = 0x220
+const FORCE_BIT: u32 = 0x100
+static mut FORCED: [2]u32 = [0u32; 2]
+static mut REQUEST_WORD: u32 = 0
+static mut ACKNOWLEDGED: u32 = 0
+static mut PARKED_ON: u32 = 0
+static mut PARKED: bool = false
+static mut MASKED: bool = false
+static mut ANSWER_AFTER: u32 = 0
+static mut POLLS: u32 = 0
+static mut HANDLED: u32 = 0
+
+fn reset_lockout() {
+    unsafe {
+        FORCED = [0u32; 2]
+        REQUEST_WORD = 0
+        ACKNOWLEDGED = 0
+        PARKED = false
+        MASKED = false
+        ANSWER_AFTER = 0
+        POLLS = 0
+        HANDLED = 0
+    }
+}
+
+// Core 1 takes its interrupt, if raised and not masked.
+fn run_victim() {
+    unsafe {
+        if MASKED || (FORCED[1] & FORCE_BIT) == 0 || POLLS < ANSWER_AFTER {
+            return
+        }
+        HANDLED += 1
+        FORCED[1] &= ~FORCE_BIT
+        if REQUEST_WORD != 0 {
+            ACKNOWLEDGED = REQUEST_WORD
+            PARKED_ON = REQUEST_WORD
+            PARKED = true
+        }
+    }
+}
+
+struct QspiView: hal.Registers {
+    pub fn read(&mut self, offset: usize) -> u32 {
+        core.assert(false)
+        return 0
+    }
+
+    pub fn write(&mut self, offset: usize, value: u32) {
+        unsafe {
+            for core_index in 0usize..2 {
+                force := QSPI_PROC0_INTF + rp_multicore.LOCKOUT_FORCE_STRIDE * core_index
+                if offset == force + SET_ALIAS {
+                    FORCED[core_index] |= value
+                } else if offset == force + CLEAR_ALIAS {
+                    FORCED[core_index] &= ~value
+                }
+            }
+            core.assert(FORCED[0] == 0)
+        }
+        run_victim()
+    }
+}
+
+struct MailboxView: hal.Registers {
+    pub fn read(&mut self, offset: usize) -> u32 {
+        core.assert(offset == rp_multicore.LOCKOUT_ACKNOWLEDGE)
+        unsafe {
+            POLLS += 1
+        }
+        run_victim()
+        unsafe {
+            return ACKNOWLEDGED
+        }
+    }
+
+    pub fn write(&mut self, offset: usize, value: u32) {
+        core.assert(offset == rp_multicore.LOCKOUT_REQUEST)
+        unsafe {
+            REQUEST_WORD = value
+            // The parked core leaves its loop once the request changes.
+            if PARKED && value != PARKED_ON {
+                PARKED = false
+            }
+        }
+    }
+}
+
+fn the_lockout_parks_and_releases_the_other_core() {
+    reset_lockout()
+    qspi := QspiView {}
+    mailbox := MailboxView {}
+    force := QSPI_PROC0_INTF + rp_multicore.LOCKOUT_FORCE_STRIDE
+    core.assert(succeeded(rp_multicore.request_lockout(&mut qspi, &mut mailbox, force, FORCE_BIT, 1)))
+    unsafe {
+        core.assert(PARKED && ACKNOWLEDGED == 1 && REQUEST_WORD == 1)
+        // The handler cleared the bit it was forced with.
+        core.assert(FORCED[1] == 0 && HANDLED == 1)
+    }
+    rp_multicore.end_lockout(&mut mailbox)
+    unsafe {
+        core.assert(!PARKED && REQUEST_WORD == 0)
+    }
+
+    // A core that takes a while still answers in time.
+    reset_lockout()
+    unsafe {
+        ANSWER_AFTER = 1000
+        ACKNOWLEDGED = 1
+    }
+    core.assert(succeeded(rp_multicore.request_lockout(&mut qspi, &mut mailbox, force, FORCE_BIT, 2)))
+    unsafe {
+        core.assert(PARKED && ACKNOWLEDGED == 2 && POLLS == 1000)
+    }
+    rp_multicore.end_lockout(&mut mailbox)
+}
+
+fn a_core_with_interrupts_masked_times_out() {
+    reset_lockout()
+    qspi := QspiView {}
+    mailbox := MailboxView {}
+    force := QSPI_PROC0_INTF + rp_multicore.LOCKOUT_FORCE_STRIDE
+    unsafe {
+        MASKED = true
+        // An earlier request's acknowledgement does not answer this one.
+        ACKNOWLEDGED = 6
+    }
+    core.assert(failed(rp_multicore.request_lockout(&mut qspi, &mut mailbox, force, FORCE_BIT, 7), hal.Error.Timeout))
+    unsafe {
+        core.assert(POLLS == rp_multicore.LOCKOUT_ATTEMPTS)
+        // Withdrawn: no request stands and the interrupt is no longer
+        // forced.
+        core.assert(REQUEST_WORD == 0 && FORCED[1] == 0 && !PARKED)
+        // Should the handler still run, latched in the interrupt controller,
+        // it finds no request and returns at once.
+        MASKED = false
+        FORCED[1] = FORCE_BIT
+    }
+    run_victim()
+    unsafe {
+        core.assert(HANDLED == 1 && !PARKED && ACKNOWLEDGED == 6)
+    }
+}
+
 fn main() {
     core.assert(rp_multicore.core_id() == 0 && cpu.core_id() == 0)
     restarts_core1_and_launches_it()
@@ -379,4 +530,6 @@ fn main() {
     a_silent_core1_times_out()
     spinlocks_and_fifo_ends_are_claimed_once()
     rp2040_has_no_doorbells()
+    the_lockout_parks_and_releases_the_other_core()
+    a_core_with_interrupts_masked_times_out()
 }

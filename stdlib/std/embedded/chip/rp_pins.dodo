@@ -3,6 +3,7 @@ package rp_pins
 import "core/ptr"
 import "std/embedded/hal"
 import "std/embedded/chip/rp_adc"
+import "std/embedded/chip/rp_capture"
 import "std/embedded/chip/rp_dma"
 import "std/embedded/chip/rp_pio"
 import "std/embedded/chip/rp_pwm"
@@ -12,13 +13,24 @@ import "std/embedded/peripheral/pl022"
 
 // The GPIO, I2C, SPI, UART, PWM, ADC, and PIO ownership the RP2040 and
 // RP2350 share. On both chips GPIO 0 to 29 select the same controller signals with
-// the same function numbers and pad bits, so the chip packages keep their
-// pins in a `Bank`, which checks bus pins, hands out each pin and controller
-// once, and takes them back. Serial ports claimed from a bank also report panics; see
+// the same function numbers and pad bits, and the RP2350B's GPIO 30 to 47
+// continue the same pattern (RP2350 datasheet 9.4), so the chip packages
+// keep their pins in a `Bank`, which checks bus pins, hands out each pin and
+// controller once, and takes them back. Pin sets are u64 masks, bit n for
+// GPIO n. Serial ports claimed from a bank also report panics; see
 // report_panic.
 
-// The GPIOs whose functions both chips share.
+// The GPIOs every chip has: GPIO 0 to 29, all of the RP2040 and the RP2350A
+// (QFN-60).
 pub const PIN_COUNT: u32 = 30
+// The GPIOs the function tables below reach: GPIO 0 to 47, all of the
+// RP2350B (QFN-80). A Bank refuses those its chip lacks.
+pub const MAX_PIN_COUNT: u32 = 48
+
+// GPIO `number`'s bit in a pin mask.
+pub fn pin_bit(number: u32) -> u64 {
+    return 1u64 << number as u64
+}
 
 // The bus controllers, as `Bank` numbers them for its chip.
 pub const I2C0: u32 = 0
@@ -31,6 +43,8 @@ const CONTROLLERS: usize = 6
 // The PWM block and the ADC, which serve several pins each.
 pub const PWM: u32 = 6
 pub const ADC: u32 = 7
+// The ADC's sampler, kept in Bank.analog_inputs above the inputs' bits.
+const SAMPLER: u32 = 1 << 31
 // The PIO blocks: PIO0 + n is block n, up to PIO1 on the RP2040 and PIO2 on
 // the RP2350.
 pub const PIO0: u32 = 8
@@ -59,10 +73,10 @@ const PAD_OUTPUT_DISABLE: u32 = 1 << 7
 
 // The I2C controller, 0 or 1, that pins `sda` and `scl` form a bus on. Even
 // pins carry SDA and odd pins SCL. GPIO 0 and 1, 4 and 5, and so on in steps
-// of four belong to I2C0; GPIO 2 and 3, 6 and 7, and so on to I2C1.
-// InvalidInput if the two pins cannot form a bus.
+// of four belong to I2C0; GPIO 2 and 3, 6 and 7, and so on to I2C1, up to
+// GPIO 47. InvalidInput if the two pins cannot form a bus.
 pub fn i2c_controller(sda: u32, scl: u32) -> u32!hal.Error {
-    if sda >= PIN_COUNT || scl >= PIN_COUNT || sda % 2 != 0 || scl % 2 != 1 || (sda / 2) % 2 != (scl / 2) % 2 {
+    if sda >= MAX_PIN_COUNT || scl >= MAX_PIN_COUNT || sda % 2 != 0 || scl % 2 != 1 || (sda / 2) % 2 != (scl / 2) % 2 {
         return err(hal.Error.InvalidInput)
     }
     return ok((sda / 2) % 2)
@@ -75,24 +89,24 @@ pub struct SpiPins {
     // The receive pin, if the bus has one.
     pub rx: Option<u32>
     // Every pin of the bus, one bit each.
-    pub mask: u32
+    pub mask: u64
 }
 
 // The SPI bus that pins `clock`, `tx`, and `rx` (if any) form. GPIO n
 // carries RX when n % 4 is 0, the clock when it is 2, and TX when it is 3.
-// GPIO 0 to 7 and 16 to 23 belong to SPI0, GPIO 8 to 15 and 24 to 29 to
-// SPI1. InvalidInput if the pins cannot form a bus.
+// GPIO 0 to 7, 16 to 23, and 32 to 39 belong to SPI0, GPIO 8 to 15, 24 to
+// 31, and 40 to 47 to SPI1. InvalidInput if the pins cannot form a bus.
 pub fn spi_pins(clock: u32, tx: u32, rx: Option<u32>) -> SpiPins!hal.Error {
-    if clock >= PIN_COUNT || tx >= PIN_COUNT || clock % 4 != 2 || tx % 4 != 3 || (clock / 8) % 2 != (tx / 8) % 2 {
+    if clock >= MAX_PIN_COUNT || tx >= MAX_PIN_COUNT || clock % 4 != 2 || tx % 4 != 3 || (clock / 8) % 2 != (tx / 8) % 2 {
         return err(hal.Error.InvalidInput)
     }
     controller := (clock / 8) % 2
-    mask := (1u32 << clock) | (1u32 << tx)
+    mask := pin_bit(clock) | pin_bit(tx)
     if let some(number) = rx {
-        if number >= PIN_COUNT || number % 4 != 0 || (number / 8) % 2 != controller {
+        if number >= MAX_PIN_COUNT || number % 4 != 0 || (number / 8) % 2 != controller {
             return err(hal.Error.InvalidInput)
         }
-        return ok(SpiPins { controller, rx: some(number), mask: mask | (1u32 << number) })
+        return ok(SpiPins { controller, rx: some(number), mask: mask | pin_bit(number) })
     }
     return ok(SpiPins { controller, rx: none, mask })
 }
@@ -100,11 +114,11 @@ pub fn spi_pins(clock: u32, tx: u32, rx: Option<u32>) -> SpiPins!hal.Error {
 // The chip select pin of SPI controller `controller` at GPIO `select`, as
 // a mask: GPIO n carries it when n % 4 is 1, in the same blocks of eight as
 // spi_pins. InvalidInput if the pin cannot.
-pub fn spi_select_pin(controller: u32, select: u32) -> u32!hal.Error {
-    if select >= PIN_COUNT || select % 4 != 1 || (select / 8) % 2 != controller {
+pub fn spi_select_pin(controller: u32, select: u32) -> u64!hal.Error {
+    if select >= MAX_PIN_COUNT || select % 4 != 1 || (select / 8) % 2 != controller {
         return err(hal.Error.InvalidInput)
     }
-    return ok(1u32 << select)
+    return ok(pin_bit(select))
 }
 
 // The pins of a serial port, from `uart_pins`.
@@ -112,26 +126,26 @@ pub struct UartPins {
     // The controller, 0 or 1.
     pub controller: u32
     // Every pin of the port, one bit each.
-    pub mask: u32
+    pub mask: u64
     // The pins among them on the RP2350's UART_AUX function.
-    pub aux: u32
+    pub aux: u64
 }
 
 // The serial port that pins `tx` and `rx` (if any) form. GPIO n carries TX
-// when n % 4 is 0 and RX when it is 1. GPIO 0 to 3, 12 to 19, 28, and 29
-// belong to UART0, GPIO 4 to 11 and 20 to 27 to UART1. InvalidInput if the
-// pins cannot form a port.
+// when n % 4 is 0 and RX when it is 1. GPIO 0 to 3, 12 to 19, 28 to 35, and
+// 44 to 47 belong to UART0, GPIO 4 to 11, 20 to 27, and 36 to 43 to UART1.
+// InvalidInput if the pins cannot form a port.
 pub fn uart_pins(tx: u32, rx: Option<u32>) -> UartPins!hal.Error {
-    if tx >= PIN_COUNT || tx % 4 != 0 {
+    if tx >= MAX_PIN_COUNT || tx % 4 != 0 {
         return err(hal.Error.InvalidInput)
     }
     controller := uart_of(tx)
-    mask := 1u32 << tx
+    mask := pin_bit(tx)
     if let some(number) = rx {
-        if number >= PIN_COUNT || number % 4 != 1 || uart_of(number) != controller {
+        if number >= MAX_PIN_COUNT || number % 4 != 1 || uart_of(number) != controller {
             return err(hal.Error.InvalidInput)
         }
-        mask |= 1u32 << number
+        mask |= pin_bit(number)
     }
     return ok(UartPins { controller, mask, aux: 0 })
 }
@@ -141,22 +155,22 @@ pub fn uart_pins(tx: u32, rx: Option<u32>) -> UartPins!hal.Error {
 // pins of its UART_AUX function; `aux` marks them. Pins of both kinds may
 // be mixed within a UART. InvalidInput if the pins cannot form a port.
 pub fn uart_aux_pins(tx: u32, rx: Option<u32>) -> UartPins!hal.Error {
-    if tx >= PIN_COUNT || (tx % 4 != 0 && tx % 4 != 2) {
+    if tx >= MAX_PIN_COUNT || (tx % 4 != 0 && tx % 4 != 2) {
         return err(hal.Error.InvalidInput)
     }
     controller := uart_of(tx)
-    mask := 1u32 << tx
-    aux := 0u32
+    mask := pin_bit(tx)
+    aux := 0u64
     if tx % 4 == 2 {
         aux = mask
     }
     if let some(number) = rx {
-        if number >= PIN_COUNT || (number % 4 != 1 && number % 4 != 3) || uart_of(number) != controller {
+        if number >= MAX_PIN_COUNT || (number % 4 != 1 && number % 4 != 3) || uart_of(number) != controller {
             return err(hal.Error.InvalidInput)
         }
-        mask |= 1u32 << number
+        mask |= pin_bit(number)
         if number % 4 == 3 {
-            aux |= 1u32 << number
+            aux |= pin_bit(number)
         }
     }
     return ok(UartPins { controller, mask, aux })
@@ -167,23 +181,26 @@ pub fn uart_aux_pins(tx: u32, rx: Option<u32>) -> UartPins!hal.Error {
 // four. InvalidInput if the pins cannot form the port.
 pub fn uart_flow_pins(tx: u32, rx: u32, cts: u32, rts: u32) -> UartPins!hal.Error {
     pins := uart_pins(tx, some(rx))?
-    if cts >= PIN_COUNT || rts >= PIN_COUNT || cts % 4 != 2 || rts % 4 != 3 || uart_of(cts) != pins.controller || uart_of(rts) != pins.controller {
+    if cts >= MAX_PIN_COUNT || rts >= MAX_PIN_COUNT || cts % 4 != 2 || rts % 4 != 3 || uart_of(cts) != pins.controller || uart_of(rts) != pins.controller {
         return err(hal.Error.InvalidInput)
     }
-    return ok(UartPins { controller: pins.controller, mask: pins.mask | (1u32 << cts) | (1u32 << rts), aux: 0 })
+    return ok(UartPins { controller: pins.controller, mask: pins.mask | pin_bit(cts) | pin_bit(rts), aux: 0 })
 }
 
-// The UART of GPIO `number`'s group of four pins: groups 0, 3, 4, and 7 are
-// UART0's, groups 1, 2, 5, and 6 UART1's.
+// The UART of GPIO `number`'s group of four pins: groups 0, 3, 4, 7, 8, and
+// 11 are UART0's, groups 1, 2, 5, 6, 9, and 10 UART1's.
 fn uart_of(number: u32) -> u32 {
     return ((number / 4 + 1) / 2) % 2
 }
 
-// GPIO 0 to 29, the bus controllers, and the PWM outputs and ADC inputs of
+// The GPIOs, the bus controllers, and the PWM outputs and ADC inputs of
 // one chip C, each handed out once and taken back by the release methods. C
 // does what differs between the chips, with these methods, `controller`
 // numbered as I2C0 to PIO2 above:
 //
+//    pin_count(&self) -> u32
+//        the GPIOs the chip has, 0 to pin_count() - 1: PIN_COUNT, or
+//        MAX_PIN_COUNT on the RP2350B
 //    route(&mut self, pin: u32, function: u32, clear: u32, set: u32)
 //        connect the pin to FUNCSEL `function`, then clear the `clear` and
 //        set the `set` bits of its pad
@@ -198,6 +215,9 @@ fn uart_of(number: u32) -> u32 {
 //        the frequency of the clock that feeds the controllers and PWM
 //    pwm_slices(&self) -> u32
 //        the PWM block's slices: 8 on the RP2040, 12 on the RP2350
+//    pwm_irq(&self) -> u32
+//        the PWM wrap interrupt: PWM_IRQ_WRAP on the RP2040,
+//        PWM_IRQ_WRAP_0 on the RP2350
 //    timer_base(&self) -> usize
 //        the running microsecond timer that times PWM input windows, with
 //        TIMERAWH and TIMERAWL at 0x24 and 0x28
@@ -217,36 +237,46 @@ fn uart_of(number: u32) -> u32 {
 pub struct Bank<C> {
     chip: C
     // Pins in use, one bit each.
-    taken: u32
+    taken: u64
     // The pins of each controller's bus, by controller number; 0 while the
     // controller is free.
-    buses: [6]u32
-    // Pins driven by PWM outputs or measured by PWM inputs, and ADC inputs
-    // in use, one bit each.
-    pwm_pins: u32
+    buses: [6]u64
+    // Pins driven by PWM outputs or measured by PWM inputs, one bit each,
+    // and ADC inputs in use, one bit per input.
+    pwm_pins: u64
     analog_inputs: u32
     // PIO blocks in use, one bit each, and the pins each one drives.
     pio_blocks: u32
-    pio_pins: [3]u32
+    pio_pins: [3]u64
 
     // SAFETY: C's methods must do what the protocol above says, `base` must
     // name the controller's DW_apb_i2c, PL022, or PL011, the PWM block, the
     // ADC, or the PIO block, `timer_base` a running microsecond timer that
     // nothing changes, and the bank must be the only bank, and the
-    // only user of GPIO 0 to 29's control and pad registers, of the
+    // only user of its GPIOs' control and pad registers, of the
     // controllers, the PWM block, the ADC, and the PIO blocks, and of their
     // resets and clocks.
     pub unsafe fn new(chip: C) -> Bank<C> {
-        return Bank<C> { chip, taken: 0, buses: [0u32; 6], pwm_pins: 0, analog_inputs: 0, pio_blocks: 0, pio_pins: [0u32; 3] }
+        return Bank<C> { chip, taken: 0, buses: [0u64; 6], pwm_pins: 0, analog_inputs: 0, pio_blocks: 0, pio_pins: [0u64; 3] }
     }
 
-    // Claim pin `number` for the single-cycle I/O block. Returns its bit, for
-    // the chip's GPIO registers. InvalidInput above GPIO 29, Busy if taken.
-    pub fn gpio(&mut self, number: u32) -> u32!hal.Error {
-        if number >= PIN_COUNT {
+    // The GPIOs the chip has: 0 to pin_count() - 1.
+    pub fn pin_count(&self) -> u32 {
+        return self.chip.pin_count()
+    }
+
+    // The pins in use, one bit each.
+    pub fn taken(&self) -> u64 {
+        return self.taken
+    }
+
+    // Claim pin `number` for the single-cycle I/O block. Returns its bit in
+    // a pin mask. InvalidInput for a GPIO the chip lacks, Busy if taken.
+    pub fn gpio(&mut self, number: u32) -> u64!hal.Error {
+        if number >= self.chip.pin_count() {
             return err(hal.Error.InvalidInput)
         }
-        mask := 1u32 << number
+        mask := pin_bit(number)
         self.reserve(mask)?
         self.chip.route(number, FUNCTION_SIO, PAD_OUTPUT_DISABLE, PAD_INPUT_ENABLE)
         return ok(mask)
@@ -254,7 +284,7 @@ pub struct Bank<C> {
 
     // Give back the GPIO with bit `mask`, from `gpio`, which the caller has
     // stopped driving. The pin is disconnected until it is claimed again.
-    pub fn release_gpio(&mut self, mask: u32) {
+    pub fn release_gpio(&mut self, mask: u64) {
         self.disconnect(mask)
     }
 
@@ -266,7 +296,7 @@ pub struct Bank<C> {
     pub fn i2c(&mut self, sda: u32, scl: u32, frequency_hz: u32) -> designware_i2c.Bus!hal.Error {
         controller := I2C0 + i2c_controller(sda, scl)?
         timing := designware_i2c.timing(self.chip.clock_hz(), frequency_hz)?
-        self.start(controller, (1u32 << sda) | (1u32 << scl))?
+        self.start(controller, pin_bit(sda) | pin_bit(scl))?
         // SAFETY: `start` made the controller and both pins exclusive to
         // this bus, and Bank.new vouches for the base address.
         unsafe {
@@ -300,7 +330,7 @@ pub struct Bank<C> {
         controller := I2C0 + i2c_controller(sda, scl)?
         designware_i2c.target_address(address, ten_bit)?
         timing := designware_i2c.timing(self.chip.clock_hz(), frequency_hz)?
-        self.start(controller, (1u32 << sda) | (1u32 << scl))?
+        self.start(controller, pin_bit(sda) | pin_bit(scl))?
         // SAFETY: as for `i2c`, with the address checked above.
         unsafe {
             target := designware_i2c.TargetBus.at(self.chip.base(controller), timing, address, ten_bit)
@@ -367,8 +397,8 @@ pub struct Bank<C> {
         // SDK's stdio does, so the receiver never starts on a low, unrouted
         // input and reads a byte that was never sent.
         self.connect(controller, FUNCTION_UART, PAD_OUTPUT_DISABLE | PAD_PULL_DOWN, PAD_INPUT_ENABLE | PAD_PULL_UP)
-        for number in 0..PIN_COUNT {
-            if (pins.aux & (1u32 << number)) != 0 {
+        for number in 0..MAX_PIN_COUNT {
+            if (pins.aux & pin_bit(number)) != 0 {
                 self.chip.route(number, FUNCTION_UART_AUX, 0, 0)
             }
         }
@@ -402,10 +432,11 @@ pub struct Bank<C> {
 
     // Claim pin `pin` as a PWM output at the frequency closest to
     // `frequency_hz`, low until a duty is set; see rp_pwm for the slices
-    // and the frequency range. InvalidInput above GPIO 29 or for a frequency
-    // out of range, Busy if the pin is taken, if its output is in use on
-    // another pin (GPIO n and n + 16 carry the same output), or if the
-    // other output of its slice runs at another frequency.
+    // and the frequency range. InvalidInput for a GPIO the chip lacks or a
+    // frequency out of range, Busy if the pin is taken, if its output is in
+    // use on another pin (GPIO n and n + 16 below GPIO 32, and n and n + 8
+    // above, carry the same output), or if the other output of its slice
+    // runs at another frequency.
     pub fn pwm(&mut self, pin: u32, frequency_hz: u32) -> rp_pwm.Pwm!hal.Error {
         timing := rp_pwm.timing(self.chip.clock_hz(), frequency_hz)?
         return self.open_pwm(pin, timing)
@@ -419,12 +450,12 @@ pub struct Bank<C> {
     }
 
     fn open_pwm(&mut self, pin: u32, timing: rp_pwm.Timing) -> rp_pwm.Pwm!hal.Error {
-        if pin >= PIN_COUNT {
+        if pin >= self.chip.pin_count() {
             return err(hal.Error.InvalidInput)
         }
-        mask := 1u32 << pin
+        mask := pin_bit(pin)
         self.reserve(mask)?
-        if self.pwm_pins == 0 {
+        if self.pwm_idle() {
             match self.chip.reset(PWM) {
                 ok() => {}
                 err(error) => {
@@ -436,8 +467,10 @@ pub struct Bank<C> {
         // SAFETY: Bank.new vouches for the base address, the reset above
         // started the block, and only Channels use it.
         base := self.chip.base(PWM)
+        slices := self.chip.pwm_slices()
+        irq := self.chip.pwm_irq()
         opened := unsafe {
-            rp_pwm.Pwm.at(base, pin, timing)
+            rp_pwm.Pwm.at(base, slices, irq, pin, timing)
         }
         match opened {
             ok(output) => {
@@ -447,7 +480,7 @@ pub struct Bank<C> {
             }
             err(error) => {
                 self.taken &= ~mask
-                if self.pwm_pins == 0 {
+                if self.pwm_idle() {
                     self.chip.hold(PWM)
                 }
                 return err(error)
@@ -459,16 +492,16 @@ pub struct Bank<C> {
     // disconnected, and the PWM block is held in reset once no output or
     // input is left.
     pub fn release_pwm(&mut self, output: rp_pwm.Pwm) {
-        mask := 1u32 << output.pin()
+        mask := pin_bit(output.pin())
         output.release()
         self.pwm_pins &= ~mask
         self.disconnect(mask)
-        if self.pwm_pins == 0 {
+        if self.pwm_idle() {
             self.chip.hold(PWM)
         }
     }
 
-    // Claim pin `pin`, an odd GPIO (output B of slice (pin / 2) % 8), as a
+    // Claim pin `pin`, an odd GPIO (output B of rp_pwm.slice_of(pin)), as a
     // PWM input measuring in windows of `window_us`; see rp_pwm.Capture for
     // the measurement and its range. The input uses the whole slice, so its
     // output A is not available while it runs. The pin's pad never drives
@@ -476,16 +509,17 @@ pub struct Bank<C> {
     // as a steady low line; an open-collector signal, such as a fan's
     // tachometer, needs a pull-up of 10 kOhm or less to 3.3 V, which
     // overrides the pull-down.
-    // InvalidInput for an even pin, above GPIO 29, or for a window out of
-    // range; Busy if the pin is taken or either output of its slice is in
-    // use (GPIO n and n + 16 share a slice).
+    // InvalidInput for an even pin, a GPIO the chip lacks, or a window out
+    // of range; Busy if the pin is taken or either output of its slice is
+    // in use (GPIO n and n + 16 share a slice, and above GPIO 31 n and
+    // n + 8).
     pub fn pwm_input(&mut self, pin: u32, window_us: u32) -> rp_pwm.PwmCapture!hal.Error {
-        if pin >= PIN_COUNT {
+        if pin >= self.chip.pin_count() {
             return err(hal.Error.InvalidInput)
         }
-        mask := 1u32 << pin
+        mask := pin_bit(pin)
         self.reserve(mask)?
-        if self.pwm_pins == 0 {
+        if self.pwm_idle() {
             match self.chip.reset(PWM) {
                 ok() => {}
                 err(error) => {
@@ -512,7 +546,7 @@ pub struct Bank<C> {
             }
             err(error) => {
                 self.taken &= ~mask
-                if self.pwm_pins == 0 {
+                if self.pwm_idle() {
                     self.chip.hold(PWM)
                 }
                 return err(error)
@@ -524,13 +558,62 @@ pub struct Bank<C> {
     // for outputs again, its pin is disconnected, and the PWM block is held
     // in reset once no output or input is left.
     pub fn release_pwm_input(&mut self, input: rp_pwm.PwmCapture) {
-        mask := 1u32 << input.pin()
+        mask := pin_bit(input.pin())
         input.release()
         self.pwm_pins &= ~mask
         self.disconnect(mask)
-        if self.pwm_pins == 0 {
+        if self.pwm_idle() {
             self.chip.hold(PWM)
         }
+    }
+
+    // Claim PWM slice `slice` as a periodic timer and counter at
+    // `tick_hz`, which drives no pins; see rp_pwm.SliceTimer. Slices 0 to
+    // 7 serve pins too, so a timer takes both outputs of its slice
+    // (GPIO 2n, 2n + 1, 2n + 16, and 2n + 17); the RP2350's slices 8 to 11
+    // serve none here. InvalidInput for another slice or a rate
+    // rp_pwm.timer_divider refuses, Busy if an output or input uses the
+    // slice.
+    pub fn pwm_timer(&mut self, slice: u32, tick_hz: u32) -> rp_pwm.PwmTimer!hal.Error {
+        if self.pwm_idle() {
+            self.chip.reset(PWM)?
+        }
+        // SAFETY: Bank.new vouches for the base addresses and the timer,
+        // the reset above started the block, and only Channels, Captures,
+        // and SliceTimers use it.
+        base := self.chip.base(PWM)
+        timer := self.chip.timer_base()
+        slices := self.chip.pwm_slices()
+        irq := self.chip.pwm_irq()
+        clock_hz := self.chip.clock_hz()
+        opened := unsafe {
+            rp_pwm.PwmTimer.at(base, timer, slices, irq, clock_hz, slice, tick_hz)
+        }
+        match opened {
+            ok(output) => {
+                return ok(output)
+            }
+            err(error) => {
+                if self.pwm_idle() {
+                    self.chip.hold(PWM)
+                }
+                return err(error)
+            }
+        }
+    }
+
+    // Give back a timer from `pwm_timer`: its slice stops and is free
+    // again, and the PWM block is held in reset once nothing uses it.
+    pub fn release_pwm_timer(&mut self, timer: rp_pwm.PwmTimer) {
+        timer.release()
+        if self.pwm_idle() {
+            self.chip.hold(PWM)
+        }
+    }
+
+    // Whether no output, input, or timer uses the PWM block.
+    fn pwm_idle(&self) -> bool {
+        return self.pwm_pins == 0 && rp_pwm.claimed() == 0
     }
 
     // Claim pin `pin`, GPIO 26 to 29, as an ADC input. Its digital input
@@ -539,7 +622,7 @@ pub struct Bank<C> {
     // the pin is taken, and Timeout if the ADC or its clock does not start.
     pub fn analog(&mut self, pin: u32) -> rp_adc.Analog!hal.Error {
         input := rp_adc.input_of(pin)?
-        mask := 1u32 << pin
+        mask := pin_bit(pin)
         self.reserve(mask)?
         match self.open_analog(input) {
             ok(analog) => {
@@ -564,6 +647,11 @@ pub struct Bank<C> {
     }
 
     fn open_analog(&mut self, input: u32) -> rp_adc.Analog!hal.Error {
+        // A sampler's round would lose its place if an input converted in
+        // between.
+        if (self.analog_inputs & SAMPLER) != 0 {
+            return err(hal.Error.Busy)
+        }
         if self.analog_inputs == 0 {
             self.chip.start_adc()?
         }
@@ -582,9 +670,57 @@ pub struct Bank<C> {
         input := analog.input()
         analog.release()
         if input < rp_adc.PIN_COUNT {
-            self.disconnect(1u32 << (rp_adc.FIRST_PIN + input))
+            self.disconnect(pin_bit(rp_adc.FIRST_PIN + input))
         }
         self.analog_inputs &= ~(1u32 << input)
+        if self.analog_inputs == 0 {
+            self.chip.stop_adc()
+        }
+    }
+
+    // Claim the ADC as a sampler of `inputs`, an rp_adc.Inputs set, that
+    // converts `rate_hz` times a second; `irq` is the chip's ADC_IRQ_FIFO.
+    // Its pins are claimed as by `analog`. InvalidInput for an empty set,
+    // one beyond rp_adc.ALL_INPUTS, or a rate out of range; Busy if a pin
+    // is taken or the ADC has inputs or a sampler already; Timeout if the
+    // ADC or its clock does not start.
+    pub fn sampler(&mut self, inputs: u32, rate_hz: u32, irq: u32) -> rp_adc.AdcSampler!hal.Error {
+        rp_adc.check_inputs(inputs)?
+        rp_adc.divider_for(rate_hz)?
+        if self.analog_inputs != 0 {
+            return err(hal.Error.Busy)
+        }
+        pins := rp_adc.pins_of(inputs) as u64
+        self.reserve(pins)?
+        match self.chip.start_adc() {
+            ok() => {}
+            err(error) => {
+                self.taken &= ~pins
+                return err(error)
+            }
+        }
+        self.analog_inputs = SAMPLER
+        for pin in 0..PIN_COUNT {
+            if (pins & pin_bit(pin)) != 0 {
+                self.chip.route(pin, FUNCTION_NULL, PAD_INPUT_ENABLE | PAD_PULL_UP | PAD_PULL_DOWN, PAD_OUTPUT_DISABLE)
+            }
+        }
+        // SAFETY: Bank.new vouches for the base address, start_adc started
+        // the ADC, and no input or other sampler uses it. The set and rate
+        // were checked above, so this cannot fail.
+        base := self.chip.base(ADC)
+        unsafe {
+            return rp_adc.AdcSampler.at(base, inputs, rate_hz, irq)
+        }
+    }
+
+    // Give back the ADC's sampler: it stops, its pins are disconnected,
+    // and the ADC stops with its clock.
+    pub fn release_sampler(&mut self, sampler: rp_adc.AdcSampler) {
+        pins := rp_adc.pins_of(sampler.inputs()) as u64
+        sampler.release()
+        self.disconnect(pins)
+        self.analog_inputs &= ~SAMPLER
         if self.analog_inputs == 0 {
             self.chip.stop_adc()
         }
@@ -618,21 +754,69 @@ pub struct Bank<C> {
     // Connect the `count` pins from GPIO `first` to PIO block `pio`, so its
     // state machines drive them, through the pin mappings of their
     // configs, and read them. State machines also read pins claimed in
-    // other ways, such as inputs. InvalidInput for pins above GPIO 29 or a
+    // other ways, such as inputs. The pins must lie in the block's window
+    // (rp_pio's Pio.gpio_base: GPIO 0 to 31, or 16 to 47 after
+    // `pio.set_gpio_base(16)`), together with the pins it has already.
+    // InvalidInput for a GPIO the chip lacks, pins outside the window, or a
     // count of 0, Busy if a pin is taken.
     pub fn pio_pins(&mut self, pio: &rp_pio.Pio, first: u32, count: u32) -> void!hal.Error {
-        if count == 0 || first >= PIN_COUNT || count > PIN_COUNT - first {
+        pin_count := self.chip.pin_count()
+        if count == 0 || first >= pin_count || count > pin_count - first {
             return err(hal.Error.InvalidInput)
         }
         block := pio.number()
         core.assert((self.pio_blocks & (1u32 << block)) != 0)
-        mask := (0xFFFF_FFFFu32 >> (32 - count)) << first
+        mask := (0xFFFF_FFFF_FFFF_FFFFu64 >> (64 - count) as u64) << first as u64
+        // The window's pins, bit n for GPIO n.
+        window := 0xFFFF_FFFFu64 << pio.gpio_base() as u64
+        if ((mask | self.pio_pins[block as usize]) & ~window) != 0 {
+            return err(hal.Error.InvalidInput)
+        }
         self.reserve(mask)?
         for number in first..first + count {
             self.chip.route(number, FUNCTION_PIO0 + block, PAD_OUTPUT_DISABLE, PAD_INPUT_ENABLE)
         }
         self.pio_pins[block as usize] |= mask
         return ok()
+    }
+
+    // Claim pin `pin` for PIO block `pio` and capture its `edges`
+    // (rp_capture.RISING, FALLING, or BOTH) with a free state machine of
+    // the block, in ticks of `tick_hz`; see rp_capture. Errors as for
+    // pio_pins and rp_capture.EdgeCapture.new.
+    pub fn edge_capture(&mut self, pio: &mut rp_pio.Pio, pin: u32, edges: u32, tick_hz: u32) -> rp_capture.EdgeCapture!hal.Error {
+        self.pio_pins(pio, pin, 1)?
+        timer := self.chip.timer_base()
+        clock_hz := self.chip.clock_hz()
+        // SAFETY: Bank.new vouches for the timer, and the PIO blocks run
+        // from the clock clock_hz reports.
+        opened := unsafe {
+            rp_capture.EdgeCapture.new(pio, pin, edges, clock_hz, tick_hz, timer)
+        }
+        match opened {
+            ok(capture) => {
+                return ok(capture)
+            }
+            err(error) => {
+                self.release_pio_pin(pio.number(), pin)
+                return err(error)
+            }
+        }
+    }
+
+    // Give back a capture from `edge_capture` to `pio`, the block it came
+    // from: its state machine and program, and its pin, which is
+    // disconnected.
+    pub fn release_edge_capture(&mut self, capture: rp_capture.EdgeCapture, pio: &mut rp_pio.Pio) {
+        pin := capture.pin()
+        capture.release(pio)
+        self.release_pio_pin(pio.number(), pin)
+    }
+
+    fn release_pio_pin(&mut self, block: u32, pin: u32) {
+        mask := pin_bit(pin)
+        self.pio_pins[block as usize] &= ~mask
+        self.disconnect(mask)
     }
 
     // Give back a PIO block from `pio` once its state machines have been
@@ -690,9 +874,12 @@ pub struct Bank<C> {
     // Take `controller` and the pins in `pins`, all or none, then pulse the
     // controller's reset. A reset that does not finish gives both back, so a
     // later attempt can try again.
-    fn start(&mut self, controller: u32, pins: u32) -> void!hal.Error {
+    fn start(&mut self, controller: u32, pins: u64) -> void!hal.Error {
         if self.buses[controller as usize] != 0 {
             return err(hal.Error.Busy)
+        }
+        if (pins >> self.chip.pin_count() as u64) != 0 {
+            return err(hal.Error.InvalidInput)
         }
         self.reserve(pins)?
         self.buses[controller as usize] = pins
@@ -721,7 +908,7 @@ pub struct Bank<C> {
         }
     }
 
-    fn reserve(&mut self, pins: u32) -> void!hal.Error {
+    fn reserve(&mut self, pins: u64) -> void!hal.Error {
         if (self.taken & pins) != 0 {
             return err(hal.Error.Busy)
         }
@@ -732,16 +919,16 @@ pub struct Bank<C> {
     // Route every pin of `controller`'s bus to `function`.
     fn connect(&mut self, controller: u32, function: u32, clear: u32, set: u32) {
         pins := self.buses[controller as usize]
-        for number in 0..PIN_COUNT {
-            if (pins & (1u32 << number)) != 0 {
+        for number in 0..MAX_PIN_COUNT {
+            if (pins & pin_bit(number)) != 0 {
                 self.chip.route(number, function, clear, set)
             }
         }
     }
 
-    fn disconnect(&mut self, pins: u32) {
-        for number in 0..PIN_COUNT {
-            if (pins & (1u32 << number)) != 0 {
+    fn disconnect(&mut self, pins: u64) {
+        for number in 0..MAX_PIN_COUNT {
+            if (pins & pin_bit(number)) != 0 {
                 self.chip.route(number, FUNCTION_NULL, 0, 0)
             }
         }

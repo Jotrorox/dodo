@@ -1056,6 +1056,59 @@
   cover 10-bit addressing, both targets, 12-bit and TI frames through the
   SPI loopback, breaks, and the flow control pins, and the desktop models
   gain a DW_apb_i2c target driven by a scripted master.
+- The RP2040's and RP2350's ADC samples by itself: `pins.sampler(inputs,
+  rate_hz)` returns an `rp_adc.AdcSampler` that converts a set of inputs
+  (GPIO 26 to 29 and the temperature sensor) round-robin at 733 to 500 000
+  samples a second into the ADC's FIFO. Polled reads return samples tagged
+  with their input and a conversion-error flag and report FIFO overruns;
+  `set_signal` wakes a task from the `ADC_IRQ_FIFO` interrupt, whose default
+  handler the chip runtimes now provide; and by DMA, paced by the ADC's
+  data request, `capture` fills a buffer of 12-bit or 8-bit samples, `dma`
+  does so in the background, and `stream` keeps filling a ring. Single
+  `pins.analog` inputs keep working and are `Busy` while a sampler holds
+  the converter, and the other way round. See `examples/adc.dodo`.
+- RP2040 and RP2350 flash regions erase and write from either core while
+  the other runs a task: `rp_multicore.lockout()` parks the other core in
+  SRAM with its interrupts masked, through a forced `IO_IRQ_QSPI` that the
+  runtimes' new SRAM handler answers, and reports `Timeout` if it cannot.
+  New `std/embedded/flash/spi_nor` drives JEDEC SPI NOR flash chips (W25Q,
+  GD25Q, MX25L, IS25LP, ...) as a `hal.Flash`, probing them by JEDEC ID and
+  SFDP, with 4-byte addressing above 16 MiB, protection, deep power-down,
+  and reset.
+- The RP2350B's GPIO 30 to 47: `rp2350.take()` reads the package from
+  SYSINFO, and `pins.pin_count()` (30 or 48) bounds every claim, so GPIO 30
+  to 47 work as inputs and outputs, with interrupts, dormant wake-up, and
+  their I2C, SPI, UART, and PWM functions (slices 8 to 11). Pin masks in
+  `rp_pins` are now `u64`. PIO blocks on the RP2350 reach GPIO 16 to 47
+  through `pio.set_gpio_base(rp_pio.HIGH_GPIO_BASE)`; pin mappings and
+  `wait gpio` (now up to GPIO 47) name absolute GPIOs and are translated
+  into the block's window. Pin interrupts work on either core: `listen`,
+  `ignore`, and `events` act for the calling core, and `listen_on`,
+  `ignore_on`, and `events_on` name one.
+- Deeper low power on the RP2040 and RP2350. A `power.Wake` takes a timeout
+  (`wake.after_ms(ms)`, `power.dormant_for`), and `dormant` reports it in
+  bit 63 (`power.BY_TIME`, `power.by_time`; `power.MAX_PINS` is now 63).
+  The RP2040 wakes by its RTC once `b.rtc.use_clock_input(&mut b.pins, 20,
+  32_768)` feeds clk_rtc from a GPIO clock; the RP2350 wakes by its
+  always-on timer, which `b.rtc` can also tick from the low-power
+  oscillator (OTP-calibrated), an external 32 kHz clock, or an external
+  1 kHz tick. `b.power.set_system_hz(hz)` runs clk_sys from the crystal or
+  PLL_SYS at a lower rate and back, refusing while a peripheral whose
+  divider follows clk_sys is claimed. The RP2350's `b.power.power_down(&wake,
+  retain)` switches off the switched core and unkept SRAM through POWMAN
+  until a pin event or a timeout restarts the chip, after which
+  `woke_from_power_down`, `power_down_wake`, `retained`, and `scratch`
+  report and keep state. `fake.Power` simulates timeouts.
+- Timers at other rates: `std/embedded/hal` gains `TickCounter`, `Compare`,
+  `PeriodicTimer`, and `InputCapture`, counting ticks at a rate of their
+  own, with conversion and wait helpers and a fake of each. On the RP2040
+  and RP2350 the timer alarms (now on the shared `rp_timer`) are compare
+  channels and drift-free periodic timers that count missed periods; the
+  RP2350's TIMER1 counts clk_sys or a divided crystal (`timer.timer1(hz)`);
+  PWM slices are periodic timers and 64-bit tick counters
+  (`pins.pwm_timer`), and PWM outputs expose the wrap interrupt; and
+  `rp_capture` timestamps edges on a PIO state machine
+  (`pins.edge_capture`).
 
 ## 0.1.5 — 2026-10-12
 

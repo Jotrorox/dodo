@@ -41,6 +41,8 @@ in `tests/hardware` (`scripts/test_pico.py`) cover the rest on real boards:
 - Nothing outside the chip: no I2C or SPI devices, USB host, or wireless chip.
   `pico2_w` is not emulated.
 - GPIO interrupts, and the RP2040's UART loopback.
+- Erasing and writing the flash through the boot ROM, so the lockout that
+  parks the other core is checked without a flash write.
 - Timing against the CPU: the RP2350 emulator counts the timer in `clk_sys`
   cycles rather than `clk_ref`, so its microseconds pass about 12 times too
   quickly for the code running between them.
@@ -59,6 +61,8 @@ candidates for upstream.
   through the FIFO when it leaves reset, as multicore launch code expects.
 - `SIO_IRQ_PROC0` and `SIO_IRQ_PROC1` follow each core's FIFO (VLD, WOF, ROE).
 - `ICSR.VECTACTIVE` reads the running exception's number.
+- `IO_IRQ_QSPI` is raised on the core whose IO_QSPI `PROCn_INTF` forces it,
+  as rp_multicore's lockout does.
 
 `rp2350-emu-0.2.6.patch`:
 
@@ -75,6 +79,8 @@ candidates for upstream.
 - The PSM resets core 1, which then restarts in the boot ROM.
 - `SIO_IRQ_FIFO` follows each core's FIFO (VLD, WOF, ROE).
 - `ICSR.VECTACTIVE` reads the running exception's number.
+- The secure `IO_IRQ_QSPI` is raised on the core whose IO_QSPI `PROCn_INTF`
+  forces it, as rp_multicore's lockout does.
 
 The runner also seeds the redundancy coprocessor salt that core 0's boot path
 would, since core 1 waits in the boot ROM until it has one.
