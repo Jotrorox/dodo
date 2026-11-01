@@ -1,0 +1,704 @@
+package selftest
+
+import "core/mem"
+import "core/mmio"
+import "core/ptr"
+import "std/embedded/board"
+import "std/embedded/chip"
+import "std/embedded/chip/rp_dma"
+import "std/embedded/chip/rp_multicore"
+import "std/embedded/chip/rp_pio"
+import "std/embedded/cortex_m"
+import "std/embedded/executor"
+import "std/embedded/hal"
+import "std/io"
+import "std/sync/atomic"
+
+// Emulator self-test for the RP2040 and RP2350 boards: the startup runtime,
+// the runtime's integer and floating-point helpers, interrupts, SysTick, the
+// timer and its alarms, the executor, DMA, PIO, a UART, and core 1 with the
+// FIFOs and spinlocks. CI runs it on emulated chips (scripts/test_emulator.py,
+// emulator/), so it only uses what the emulators model: nothing outside the
+// chip is connected, and timing is checked with the emulators' tolerances.
+// scripts/test_pico.py runs the fuller hardware self-tests in tests/hardware
+// on real boards.
+//
+// The emulator finds EMULATOR_RESULT by its symbol, which ends in
+// `.EMULATOR_RESULT`, and reads it between steps of the emulated chip:
+//
+//   [0] 0x5747_00ss  running step ss (a hang reports the step it hung in)
+//       0x600D_00ss  finished after ss steps
+//       0xDEAD_0000  a check failed or a runtime check panicked:
+//   [1] line  [2] column  [3] check kind, such as "assert", and [4] file
+//   name, as addresses of C strings
+
+const RUNNING: u32 = 0x5747_0000
+const FINISHED: u32 = 0x600D_0000
+const PANICKED: u32 = 0xDEAD_0000
+pub static mut EMULATOR_RESULT: [5]u32 = [0u32; 5]
+static mut STEP: u32 = 0
+// Initialized and zeroed statics: the reset handler copies .data from flash
+// and clears .bss.
+static mut DATA: [3]u32 = [0xDEAD_BEEFu32, 7, 0x1234_5678]
+static mut ZEROED: [3]u32 = [0u32; 3]
+
+// Store word `index` of the record with a volatile write, so that the
+// emulator sees each record in program order, optimized or not.
+fn record(index: usize, value: u32) {
+    unsafe {
+        base := ptr.as_mut_ptr(&mut EMULATOR_RESULT) as usize
+        mmio.write32(base + 4 * index, value)
+    }
+}
+
+fn step() {
+    unsafe {
+        STEP += 1
+        record(0, RUNNING | STEP)
+    }
+}
+
+// Replaces the board runtime's default panic hook. A failed assert lands
+// here too.
+extern "C" fn dodo_board_panic(check: *const u8, file: *const u8, line: u32, column: u32) {
+    unsafe {
+        record(1, line)
+        record(2, column)
+        record(3, check as usize as u32)
+        record(4, file as usize as u32)
+    }
+    record(0, PANICKED)
+    for {}
+}
+
+// A claim was refused with `expected`.
+fn refused<T>(result: T!hal.Error, expected: hal.Error) -> bool {
+    match result {
+        ok(_) => {
+            return false
+        }
+        err(error) => {
+            return error == expected
+        }
+    }
+}
+
+fn startup_checks() {
+    match board.take() {
+        ok(_) => {
+            assert(false, "a second board.take() succeeded")
+        }
+        err(error) => {
+            assert(error == hal.Error.Busy, "a second board.take() is not Busy")
+        }
+    }
+    unsafe {
+        assert(DATA[0] == 0xDEAD_BEEF && DATA[1] == 7 && DATA[2] == 0x1234_5678, ".data was not copied from flash")
+        assert(ZEROED[0] == 0 && ZEROED[1] == 0 && ZEROED[2] == 0, ".bss was not zeroed")
+    }
+}
+
+// The timer counts microseconds, and SysTick counts down while the timer
+// delays. The emulators tick the timer and SysTick at different rates from
+// real chips (the RP2350's counts its microseconds in clk_sys cycles), so
+// how many cycles a microsecond takes is only checked on real boards.
+fn clock_checks(timer: &mut chip.Timer) {
+    cortex_m.systick_start(cortex_m.SYSTICK_MAX_RELOAD, false)!
+    // The counter reads 0 until SysTick loads RELOAD on its first tick.
+    for cortex_m.systick_value() == 0 {}
+    start := cortex_m.systick_value()
+    before := timer.now_us()
+    timer.delay_us(1000)
+    after := timer.now_us()
+    cycles := start - cortex_m.systick_value()
+    cortex_m.systick_stop()
+    elapsed := after - before
+    assert(elapsed >= 1000 && elapsed < 1100, "a 1 ms delay is not 1 ms")
+    assert(cycles > 1000, "SysTick does not count while the timer delays")
+}
+
+// Integer, 64-bit, and single-precision helpers. `z` is zero at run time but
+// unknown to the optimizer, so the operations are not folded.
+fn arithmetic_checks(timer: &mut chip.Timer) {
+    z := timer.now_us() >> 63
+    z32 := z as u32
+    assert((1_000_000_007u32 ^ z32) / 13 == 76_923_077, "u32 division")
+    assert((1_000_000_007u32 ^ z32) % 13 == 6, "u32 remainder")
+    assert((0xFFFF_FFFFu32 ^ z32) / 0x8000_0001 == 1, "u32 division by a large divisor")
+    assert((0xFFFF_FFFFu32 ^ z32) % 0x8000_0001 == 0x7FFF_FFFE, "u32 remainder by a large divisor")
+    i := z32 as i32
+    assert((-1_000_000_007 + i) / 13 == -76_923_077, "i32 division")
+    assert((-1_000_000_007 + i) % 13 == -6, "i32 remainder")
+    assert((7 + i) / -2 == -3 && (7 + i) % -2 == 1, "i32 division by a negative divisor")
+    assert((-2_147_483_647 + i) / -3 == 715_827_882, "i32 division of a large dividend")
+    assert((0xFEDC_BA98_7654_3210u64 ^ z) / 0x12345 == 0xE000_4FA0_1C4D, "u64 division")
+    assert((0xFEDC_BA98_7654_3210u64 ^ z) % 0x12345 == 0x10A4F, "u64 remainder")
+    assert((0xFFFF_FFFF_FFFF_FFFFu64 ^ z) / 0x8000_0000_0000_0001 == 1, "u64 division by a large divisor")
+    assert((0x0123_4567_89AB_CDEFu64 ^ z) % 0xFFFF_FFFF == 0x8ACF_1356, "u64 remainder by a 32-bit divisor")
+    j := z as i64
+    assert((-81_985_529_216_486_895 + j) / 4660 == -17_593_461_205_254, "i64 division")
+    assert((-81_985_529_216_486_895 + j) % 4660 == -3255, "i64 remainder")
+    assert((9_223_372_036_854_775_807 - j) / -7 == -1_317_624_576_693_539_401, "i64 division by a negative divisor")
+    assert(core.wrapping_mul(0x1_2345_6789u64 ^ z, 0xA_BCDE_F012) == 0x379A_AAB7_F0BF_B7A2, "u64 multiplication")
+    x := 0x8000_0000_0000_0001u64 ^ z
+    s := -9_223_372_036_854_775_807 + j
+    assert((3u64 ^ z) << (31 + z) == 0x1_8000_0000 && (1u64 ^ z) << (63 + z) == 0x8000_0000_0000_0000, "u64 shift left")
+    assert(x >> (32 + z) == 0x8000_0000 && x >> (63 + z) == 1, "u64 shift right")
+    assert(s >> (32 + j) == -2_147_483_648 && s >> (63 + j) == -1, "i64 arithmetic shift right")
+
+    e := z as f32
+    assert((0.1f32 + e) + 0.2f32 == 0.3f32 && (1.1754944e-38f32 + e) / 8.0f32 == 1.469368e-39f32 && (10.5f32 + e) % 3.0f32 == 1.5f32, "f32 arithmetic")
+
+    // memcpy and memset through large copies.
+    big: [64]u32 = [0; 64]
+    for k in 0..64 {
+        big[k] = k as u32 + z32
+    }
+    copy := big
+    assert(copy[63] == 63 && copy[0] == 0, "a large copy")
+}
+
+// Binary64 helpers and conversions. The RP2040 runs them in software, the
+// RP2350 on its double-precision coprocessor.
+fn float64_checks(timer: &mut chip.Timer) {
+    z := timer.now_us() >> 63
+    j := z as i64
+    e := z as f32
+    d := z as f64
+    assert((0.1 + d) + 0.2 == 0.30000000000000004 && (1.0 + d) / 3.0 * 3.0 == 1.0, "f64 addition and division")
+    assert((2.2250738585072014e-308 + d) / 4.0 == 5.562684646268003e-309 && (1e308 + d) * 10.0 > 1.7976931348623157e308, "f64 subnormals and overflow")
+    assert((10.5 + d) % 3.0 == 1.5 && (-7.25 + d) % 2.0 == -1.25, "f64 remainder")
+    nan := d / d
+    assert(nan != nan && !(nan < 1.0) && !(nan >= 1.0) && -0.0 + d == 0.0, "f64 NaN comparisons")
+    assert((-3.75 + d) as i32 == -3 && (1e19 + d) as u64 == 10_000_000_000_000_000_000 && (-1e18 + d) as i64 == -1_000_000_000_000_000_000, "f64 to integer conversions")
+    assert((0x1F_FFFF_FFFF_FFFFu64 ^ z) as f64 == 9007199254740991.0 && (0xFFFF_FFFF_FFFF_FFFFu64 ^ z) as f64 == 18446744073709551616.0 && (-5 + j) as f64 == -5.0, "integer to f64 conversions")
+    assert(((1.0f32 + e) / 3.0f32) as f64 == 0.3333333432674408 && (0.1 + d) as f32 == 0.1f32 && (16_777_217u64 ^ z) as f32 == 16_777_216.0f32, "f32 conversions")
+}
+
+// Interrupts: `@interrupt` handlers, std/embedded/cortex_m, SysTick, a timer
+// alarm, and a function placed in SRAM. Nothing else raises I2C1_IRQ with
+// the I2C controller idle; the checks pend it from software.
+static mut ALARM: Option<chip.Alarm> = none
+// Counted with atomics, which the handlers and the checks share without a
+// critical section or `unsafe`, and which the optimizer cannot keep in a
+// register while a check waits for a handler.
+static ALARM_HITS: atomic.Atomic<u32> = atomic.Atomic.new(0u32)
+static PENDED_HITS: atomic.Atomic<u32> = atomic.Atomic.new(0u32)
+static TICKS: atomic.Atomic<u32> = atomic.Atomic.new(0u32)
+
+// The Cortex-M0+ has no atomic read-modify-write, but only one handler
+// writes each counter, and nothing preempts it.
+fn count(counter: &atomic.Atomic<u32>) {
+    hits := counter.load(atomic.Ordering.Relaxed)!
+    counter.store(hits + 1, atomic.Ordering.Release)!
+}
+
+fn hits(counter: &atomic.Atomic<u32>) -> u32 {
+    return counter.load(atomic.Ordering.Acquire)!
+}
+
+// Called by the entry file's handler for alarm 0, whose vector name differs
+// between the chips. The RP2040 emulator can run the handler again before
+// the cleared interrupt reaches the NVIC, so only a fired alarm counts.
+pub fn alarm_fired() {
+    unsafe {
+        match &mut ALARM {
+            some(alarm) => {
+                if alarm.fired() {
+                    count(&ALARM_HITS)
+                    alarm.clear()
+                }
+            }
+            none => {}
+        }
+    }
+}
+
+@interrupt(I2C1_IRQ)
+fn pended() {
+    count(&PENDED_HITS)
+    WAKE.raise()
+}
+
+@interrupt(SysTick_Handler)
+fn tick() {
+    count(&TICKS)
+}
+
+fn alarm_hits() -> u32 {
+    return hits(&ALARM_HITS)
+}
+
+fn pended_hits() -> u32 {
+    return hits(&PENDED_HITS)
+}
+
+fn ticks() -> u32 {
+    return hits(&TICKS)
+}
+
+@section(".ramfunc")
+fn from_sram(value: u32) -> u32 {
+    return core.wrapping_mul(value, 3) + 1
+}
+
+fn interrupt_checks(timer: &mut chip.Timer) {
+    // A pended interrupt waits until it is enabled, then runs once; masked,
+    // it waits for the critical section to end.
+    cortex_m.pend(chip.I2C1_IRQ)
+    waiting := cortex_m.is_pending(chip.I2C1_IRQ) && pended_hits() == 0
+    cortex_m.enable(chip.I2C1_IRQ)
+    cortex_m.instruction_barrier()
+    assert(waiting && pended_hits() == 1 && !cortex_m.is_pending(chip.I2C1_IRQ) && cortex_m.is_enabled(chip.I2C1_IRQ), "a pended interrupt does not run once when enabled")
+    section := hal.Critical.enter()
+    cortex_m.pend(chip.I2C1_IRQ)
+    cortex_m.instruction_barrier()
+    held := cortex_m.interrupts_masked() && pended_hits() == 1
+    core.drop(section)
+    cortex_m.instruction_barrier()
+    assert(held && pended_hits() == 2 && !cortex_m.interrupts_masked(), "a masked interrupt does not wait for the critical section")
+    cortex_m.disable(chip.I2C1_IRQ)
+    cortex_m.set_priority(chip.I2C1_IRQ, 0x80)
+    assert(!cortex_m.is_enabled(chip.I2C1_IRQ) && cortex_m.priority(chip.I2C1_IRQ) == 0x80 && cortex_m.active_exception() == 0, "NVIC enable and priority do not read back")
+    cortex_m.set_priority(chip.I2C1_IRQ, 0)
+
+    // SysTick interrupts: three more after the first, then none once
+    // SysTick stops.
+    cortex_m.systick_start(9999, true)!
+    start := timer.now_us()
+    for ticks() == 0 && timer.now_us() - start < 10_000 {}
+    first := ticks()
+    for ticks() < first + 3 && timer.now_us() - start < 10_000 {}
+    counted := ticks() - first
+    cortex_m.systick_stop()
+    stopped := ticks()
+    timer.delay_us(100)
+    assert(first >= 1 && counted == 3 && ticks() == stopped, "SysTick does not interrupt periodically")
+
+    // Alarm 0, 2 ms ahead, raises its interrupt once.
+    alarm := timer.alarm(0)!
+    assert(refused(timer.alarm(0), hal.Error.Busy) && refused(timer.alarm(chip.ALARM_COUNT), hal.Error.InvalidInput), "alarm claims are not checked")
+    irq := alarm.irq()
+    alarm.listen()
+    start = timer.now_us()
+    alarm.schedule_in(2000)
+    armed := alarm.is_armed() && alarm.is_listening()
+    unsafe {
+        ALARM = some(alarm)
+    }
+    cortex_m.enable(irq)
+    for alarm_hits() == 0 && timer.now_us() - start < 10_000 {}
+    elapsed := timer.now_us() - start
+    timer.delay_us(1000)
+    cortex_m.disable(irq)
+    back := unsafe {
+        mem.replace(&mut ALARM, none)
+    }
+    match back {
+        some(alarm) => {
+            assert(armed && alarm_hits() == 1 && !alarm.fired() && !alarm.is_armed(), "the alarm interrupt does not fire once")
+            assert(elapsed >= 1900 && elapsed < 2200, "the alarm interrupt does not fire after 2 ms")
+            timer.release_alarm(alarm)
+        }
+        none => {
+            assert(false, "the alarm went missing")
+        }
+    }
+    assert(from_sram(5) == 16, "a function placed in SRAM")
+}
+
+// The executor: a timer alarm as its clock, and tasks woken by time and by
+// an interrupt. The emulators do not model GPIO events, so the interrupt is
+// I2C1_IRQ, pended from software, whose handler raises WAKE.
+const WAKE: executor.Signal = executor.Signal { id: 0 }
+
+// Finishes after five 1 ms ticks.
+struct Ticks {
+    ticker: executor.Ticker
+    count: u32
+
+    pub fn poll(&mut self, cx: &mut executor.Context) -> executor.Poll {
+        if self.ticker.ready(cx) {
+            self.count += 1
+            if self.count == 5 {
+                return executor.Poll.Ready
+            }
+        }
+        return executor.Poll.Pending
+    }
+}
+
+// Pends the interrupt 2 ms after its first poll.
+struct Driver {
+    timer: executor.Timer
+    started: bool
+    pended_at: u64
+
+    pub fn poll(&mut self, cx: &mut executor.Context) -> executor.Poll {
+        if !self.started {
+            self.started = true
+            self.timer.start(cx, 2000)
+        }
+        if self.timer.expired(cx) {
+            self.pended_at = cx.now_us()
+            cortex_m.pend(chip.I2C1_IRQ)
+            return executor.Poll.Ready
+        }
+        return executor.Poll.Pending
+    }
+}
+
+// Finishes once the interrupt's handler has raised WAKE.
+struct Listener {
+    polls: u32
+    woke_at: u64
+
+    pub fn poll(&mut self, cx: &mut executor.Context) -> executor.Poll {
+        self.polls += 1
+        if WAKE.take(cx) {
+            self.woke_at = cx.now_us()
+            return executor.Poll.Ready
+        }
+        return executor.Poll.Pending
+    }
+}
+
+fn executor_checks(timer: &mut chip.Timer) {
+    // An alarm sleeps until its deadline; its interrupt is never taken.
+    alarm := timer.alarm(1)!
+    irq := alarm.irq()
+    start := alarm.now_us()
+    alarm.sleep_until(some(start + 2000))
+    slept := alarm.now_us() - start
+    assert(slept >= 2000 && slept < 2200 && !alarm.fired() && !alarm.is_armed() && !cortex_m.is_pending(irq) && !cortex_m.is_enabled(irq), "an alarm does not sleep until its deadline")
+
+    // A time already past returns at once, and so does a pending interrupt,
+    // whose handler runs when the critical section ends.
+    start = alarm.now_us()
+    alarm.sleep_until(some(start))
+    past := alarm.now_us() - start
+    cortex_m.enable(chip.I2C1_IRQ)
+    hits := pended_hits()
+    section := hal.Critical.enter()
+    cortex_m.pend(chip.I2C1_IRQ)
+    start = alarm.now_us()
+    alarm.sleep_until(some(start + 5000))
+    woke := alarm.now_us() - start
+    held := pended_hits() == hits
+    core.drop(section)
+    cortex_m.instruction_barrier()
+    assert(past < 100 && woke < 1000 && held && pended_hits() == hits + 1, "a pending interrupt does not end an alarm's sleep")
+
+    // Three tasks: one on a 1 ms ticker, one that pends the interrupt after
+    // 2 ms, and one woken only by the interrupt's handler.
+    WAKE.reset()
+    ticks := Ticks { ticker: executor.Ticker.every(1000), count: 0 }
+    driver := Driver { timer: executor.Timer.new(), started: false, pended_at: 0 }
+    listener := Listener { polls: 0, woke_at: 0 }
+    runner := executor.Executor.new()
+    start = alarm.now_us()
+    end := start + 20_000
+    finished := false
+    {
+        tasks: [3]&mut dyn executor.Task = [&mut listener, &mut ticks, &mut driver]
+        finished = runner.run_until(&mut tasks, &mut alarm, end)
+    }
+    elapsed := alarm.now_us() - start
+    cortex_m.disable(chip.I2C1_IRQ)
+    assert(finished && ticks.count == 5 && elapsed >= 5000 && elapsed < 5500, "the executor's ticker task does not finish in 5 ms")
+    assert(listener.polls == 2 && listener.woke_at >= driver.pended_at && listener.woke_at - driver.pended_at < 500, "the interrupt does not wake its task")
+    assert(runner.sleeps() >= 5, "the executor does not sleep between tasks")
+    timer.release_alarm(alarm)
+}
+
+// DMA: the claim API and copies, by words and by bytes at odd addresses.
+fn dma_checks(dma: &mut rp_dma.Dma) {
+    last := dma.channels() - 1
+    first := dma.channel()!
+    second := dma.claim(last)!
+    assert(first.number() == 0 && second.number() == last && dma.is_claimed(0) && refused(dma.claim(0), hal.Error.Busy) && refused(dma.claim(last + 1), hal.Error.InvalidInput), "DMA channel claims")
+    source: [256]u8 = [0; 256]
+    target: [256]u8 = [0; 256]
+    for index in 0..256usize {
+        source[index] = (index * 7 % 251) as u8
+    }
+    first.copy(&mut target, &source)!
+    same := true
+    for index in 0..256usize {
+        same = same && target[index] == source[index]
+    }
+    assert(same, "a DMA copy by words")
+    first.copy(&mut target[1..100], &source[3..102])!
+    assert(target[1] == source[3] && target[99] == source[101] && target[0] == source[0] && target[100] == source[100], "a DMA copy of bytes at odd addresses")
+    dma.release(first)
+    dma.release(second)
+}
+
+// A UART sends 16 bytes at 1 Mbaud and drains its transmit FIFO. (The
+// RP2040 emulator has no internal loopback to read them back.)
+fn uart_checks(pins: &mut chip.Pins) {
+    serial := pins.uart(board.UART_TX_PIN, some(board.UART_RX_PIN), 1_000_000)!
+    assert(serial.baud() == 1_000_000 && refused(pins.output(board.UART_TX_PIN), hal.Error.Busy), "UART claims and baud rate")
+    serial.set_poll_limit(1_000_000)
+    sent: [16]u8 = [0; 16]
+    for index in 0..16usize {
+        sent[index] = (0x3C + 13 * index) as u8
+    }
+    io.write_all(&mut serial, &sent)!
+    serial.flush()!
+    pins.release_uart(serial)
+}
+
+// PIO: a program that echoes each word inverted, through the FIFOs.
+const ECHO: rp_pio.Program = rp_pio.assemble(
+    ".wrap_target",
+    "    pull block",
+    "    mov isr, ~osr",
+    "    push block",
+    ".wrap",
+)
+
+fn pio_checks(pins: &mut chip.Pins, timer: &mut chip.Timer) {
+    pio := pins.pio(0)!
+    echo := pio.load(&ECHO)!
+    machine := pio.state_machine(0)!
+    assert(refused(pins.pio(0), hal.Error.Busy) && refused(pio.state_machine(0), hal.Error.Busy), "PIO claims")
+    config := echo.config()
+    machine.init(&config)
+    machine.set_enabled(true)
+    echoed := true
+    for word in 0..8u32 {
+        machine.put(0x1234_5670 + word)
+        start := timer.now_us()
+        received := false
+        for !received && timer.now_us() - start < 1000 {
+            if let some(value) = machine.try_get() {
+                received = true
+                echoed = echoed && value == ~(0x1234_5670 + word)
+            }
+        }
+        echoed = echoed && received
+    }
+    assert(echoed && machine.is_rx_empty() && machine.is_tx_empty(), "a PIO program echoes words through the FIFOs")
+    pio.release_state_machine(machine)
+    pio.unload(echo)
+    pins.release_pio(pio)
+}
+
+// Core 1: started with a task of its own, sharing the FIFOs and a spinlock
+// with core 0, and running an executor of its own.
+static mut CORE1_STACK: [512]u64 = [0u64; 512]
+static mut SHARED_COUNT: u32 = 0
+static CORE1_FLAG: atomic.Atomic<u32> = atomic.Atomic.new(0u32)
+// Core 1's executor numbers its signals on its own: the same id as EDGE.
+const WORDS: executor.Signal = executor.Signal { id: 0 }
+const STOP_WORD: u32 = 0xFFFF_FFFF
+const ADDS: u32 = 1000
+
+// On core 1, in three phases that core 0 drives: report the core number and
+// answer words until STOP_WORD; count to ADDS under the lock while core 0
+// does too; then double three words in a task of core 1's executor, woken
+// by the FIFO interrupt, and report how often that executor slept.
+struct Core1Test {
+    fifo: rp_multicore.Fifo
+    lock: rp_multicore.Spinlock
+    alarm: chip.Alarm
+
+    pub fn run(self) {
+        let Core1Test { fifo, lock, alarm } = self
+        link := fifo
+        clock := alarm
+        link.write(rp_multicore.core_id())
+        for {
+            word := link.read()
+            if word == STOP_WORD {
+                break
+            }
+            link.write(word * 3 + 1)
+        }
+        for _ in 0..ADDS {
+            guard := lock.lock()
+            unsafe {
+                SHARED_COUNT += 1
+            }
+            core.drop(guard)
+        }
+        link.write(ADDS)
+        link.set_signal(&WORDS)
+        doubler := Doubler { fifo: link, left: 3 }
+        runner := executor.Executor.new()
+        {
+            tasks: [1]&mut dyn executor.Task = [&mut doubler]
+            runner.run(&mut tasks, &mut clock)
+        }
+        doubler.fifo.clear_signal()
+        doubler.fifo.write(runner.sleeps() as u32)
+    }
+}
+
+// Doubles the words core 0 writes, polled when they arrive.
+struct Doubler {
+    fifo: rp_multicore.Fifo
+    left: u32
+
+    pub fn poll(&mut self, cx: &mut executor.Context) -> executor.Poll {
+        WORDS.take(cx)
+        for {
+            match self.fifo.try_read() {
+                some(word) => {
+                    self.fifo.write(word * 2)
+                    self.left -= 1
+                    if self.left == 0 {
+                        return executor.Poll.Ready
+                    }
+                }
+                none => {
+                    break
+                }
+            }
+        }
+        return executor.Poll.Pending
+    }
+}
+
+// On core 1, after a restart: show that it ran, and where.
+struct Flag {
+    pub fn run(self) {
+        match CORE1_FLAG.store(rp_multicore.core_id() + 1, atomic.Ordering.Release) {
+            ok() => {}
+            err(_) => {}
+        }
+    }
+}
+
+fn flag() -> u32 {
+    match CORE1_FLAG.load(atomic.Ordering.Acquire) {
+        ok(value) => {
+            return value
+        }
+        err(_) => {
+            return 0
+        }
+    }
+}
+
+// The next word from core 1, or STOP_WORD if none comes within 10 ms.
+fn receive(fifo: &mut rp_multicore.Fifo, timer: &mut chip.Timer) -> u32 {
+    start := timer.now_us()
+    for timer.now_us() - start < 10_000 {
+        if let some(word) = fifo.try_read() {
+            return word
+        }
+    }
+    return STOP_WORD
+}
+
+fn core1_checks(core1: &mut rp_multicore.Core1, fifos: &mut rp_multicore.Fifos, spinlocks: &mut rp_multicore.Spinlocks, timer: &mut chip.Timer) {
+    fifo := fifos.claim()!
+    lock := spinlocks.claim(20)!
+    claims := refused(spinlocks.claim(20), hal.Error.Busy) && refused(spinlocks.claim(32), hal.Error.InvalidInput)
+    guard := lock.lock()
+    held := lock.is_locked() && cortex_m.interrupts_masked()
+    excluded := false
+    match lock.try_lock() {
+        some(_) => {}
+        none => {
+            excluded = true
+        }
+    }
+    core.drop(guard)
+    released := !lock.is_locked() && !cortex_m.interrupts_masked()
+    assert(claims && held && excluded && released, "spinlock claims and locking")
+
+    unsafe {
+        SHARED_COUNT = 0
+    }
+    task := Core1Test { fifo: fifos.claim()!, lock: lock.clone(), alarm: timer.alarm(3)! }
+    assert(refused(fifos.claim(), hal.Error.Busy), "a third FIFO end is not refused")
+    running := unsafe {
+        core1.start(&mut CORE1_STACK, task)!
+    }
+    id := receive(&mut fifo, timer)
+    echoes := true
+    for word in 0..5u32 {
+        fifo.write(word * 1000)
+        echoes = echoes && receive(&mut fifo, timer) == word * 3000 + 1
+    }
+    assert(id == 1 && echoes, "core 1 does not start and answer over the FIFO")
+
+    fifo.write(STOP_WORD)
+    for _ in 0..ADDS {
+        guard = lock.lock()
+        unsafe {
+            SHARED_COUNT += 1
+        }
+        core.drop(guard)
+    }
+    counted := receive(&mut fifo, timer) == ADDS
+    total := unsafe {
+        SHARED_COUNT
+    }
+    assert(counted && total == 2 * ADDS, "the cores do not exclude each other under a spinlock")
+
+    doubled := true
+    for word in 10..13u32 {
+        timer.delay_ms(2)
+        fifo.write(word)
+        doubled = doubled && receive(&mut fifo, timer) == 2 * word
+    }
+    sleeps := receive(&mut fifo, timer)
+    start := timer.now_us()
+    for !running.is_finished() && timer.now_us() - start < 10_000 {}
+    finished := running.is_finished()
+    running.stop()
+    assert(doubled && sleeps >= 3 && sleeps < 100 && finished, "core 1's executor does not wake on the FIFO interrupt")
+
+    match CORE1_FLAG.store(0, atomic.Ordering.Release) {
+        ok() => {}
+        err(_) => {}
+    }
+    second := unsafe {
+        core1.start(&mut CORE1_STACK, Flag {})!
+    }
+    start = timer.now_us()
+    for flag() == 0 && timer.now_us() - start < 10_000 {}
+    flagged := flag() == 2
+    for !second.is_finished() && timer.now_us() - start < 10_000 {}
+    assert(flagged && second.is_finished(), "core 1 does not start again")
+    second.stop()
+    fifos.release(fifo)
+    spinlocks.release(lock)
+}
+
+// Run the checks and record the outcome. `float64` runs the binary64
+// checks, which an emulator without a faithful double-precision unit skips.
+pub fn run(float64: bool) {
+    step()
+    b := board.take()!
+    b.led.set_high()
+    startup_checks()
+    step()
+    clock_checks(&mut b.timer)
+    step()
+    arithmetic_checks(&mut b.timer)
+    if float64 {
+        float64_checks(&mut b.timer)
+    }
+    step()
+    interrupt_checks(&mut b.timer)
+    step()
+    executor_checks(&mut b.timer)
+    step()
+    dma_checks(&mut b.dma)
+    step()
+    uart_checks(&mut b.pins)
+    step()
+    pio_checks(&mut b.pins, &mut b.timer)
+    step()
+    core1_checks(&mut b.core1, &mut b.fifos, &mut b.spinlocks, &mut b.timer)
+    b.led.set_low()
+    unsafe {
+        record(0, FINISHED | STEP)
+    }
+    for {}
+}
