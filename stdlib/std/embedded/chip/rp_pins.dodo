@@ -31,6 +31,8 @@ const CONTROLLERS: usize = 6
 // The PWM block and the ADC, which serve several pins each.
 pub const PWM: u32 = 6
 pub const ADC: u32 = 7
+// The ADC's sampler, kept in Bank.analog_inputs above the inputs' bits.
+const SAMPLER: u32 = 1 << 31
 // The PIO blocks: PIO0 + n is block n, up to PIO1 on the RP2040 and PIO2 on
 // the RP2350.
 pub const PIO0: u32 = 8
@@ -564,6 +566,11 @@ pub struct Bank<C> {
     }
 
     fn open_analog(&mut self, input: u32) -> rp_adc.Analog!hal.Error {
+        // A sampler's round would lose its place if an input converted in
+        // between.
+        if (self.analog_inputs & SAMPLER) != 0 {
+            return err(hal.Error.Busy)
+        }
         if self.analog_inputs == 0 {
             self.chip.start_adc()?
         }
@@ -585,6 +592,54 @@ pub struct Bank<C> {
             self.disconnect(1u32 << (rp_adc.FIRST_PIN + input))
         }
         self.analog_inputs &= ~(1u32 << input)
+        if self.analog_inputs == 0 {
+            self.chip.stop_adc()
+        }
+    }
+
+    // Claim the ADC as a sampler of `inputs`, an rp_adc.Inputs set, that
+    // converts `rate_hz` times a second; `irq` is the chip's ADC_IRQ_FIFO.
+    // Its pins are claimed as by `analog`. InvalidInput for an empty set,
+    // one beyond rp_adc.ALL_INPUTS, or a rate out of range; Busy if a pin
+    // is taken or the ADC has inputs or a sampler already; Timeout if the
+    // ADC or its clock does not start.
+    pub fn sampler(&mut self, inputs: u32, rate_hz: u32, irq: u32) -> rp_adc.AdcSampler!hal.Error {
+        rp_adc.check_inputs(inputs)?
+        rp_adc.divider_for(rate_hz)?
+        if self.analog_inputs != 0 {
+            return err(hal.Error.Busy)
+        }
+        pins := rp_adc.pins_of(inputs)
+        self.reserve(pins)?
+        match self.chip.start_adc() {
+            ok() => {}
+            err(error) => {
+                self.taken &= ~pins
+                return err(error)
+            }
+        }
+        self.analog_inputs = SAMPLER
+        for pin in 0..PIN_COUNT {
+            if (pins & (1u32 << pin)) != 0 {
+                self.chip.route(pin, FUNCTION_NULL, PAD_INPUT_ENABLE | PAD_PULL_UP | PAD_PULL_DOWN, PAD_OUTPUT_DISABLE)
+            }
+        }
+        // SAFETY: Bank.new vouches for the base address, start_adc started
+        // the ADC, and no input or other sampler uses it. The set and rate
+        // were checked above, so this cannot fail.
+        base := self.chip.base(ADC)
+        unsafe {
+            return rp_adc.AdcSampler.at(base, inputs, rate_hz, irq)
+        }
+    }
+
+    // Give back the ADC's sampler: it stops, its pins are disconnected,
+    // and the ADC stops with its clock.
+    pub fn release_sampler(&mut self, sampler: rp_adc.AdcSampler) {
+        pins := rp_adc.pins_of(sampler.inputs())
+        sampler.release()
+        self.disconnect(pins)
+        self.analog_inputs &= ~SAMPLER
         if self.analog_inputs == 0 {
             self.chip.stop_adc()
         }
