@@ -26,13 +26,13 @@ need to run a separate server in a terminal while editing.
 The [Dodo VS Code extension](https://github.com/Jotrorox/dodo/tree/main/editor-support/dodo-vscode)
 connects to `dodo lsp` automatically and adds syntax highlighting, bracket and
 comment support, and snippets for programs, functions, types, loops, matches,
-and tests. It requires VS Code 1.137 or newer and Dodo 0.1.5 or newer.
+and tests. It requires VS Code 1.137 or newer and Dodo 0.1.6 or newer.
 
-Download `dodo-vscode-0.1.5.vsix` from
-[GitHub Releases](https://github.com/Jotrorox/dodo/releases/tag/v0.1.5), then install it:
+Download `dodo-vscode-0.1.6.vsix` from
+[GitHub Releases](https://github.com/Jotrorox/dodo/releases/tag/v0.1.6), then install it:
 
 ```sh
-code --install-extension dodo-vscode-0.1.5.vsix
+code --install-extension dodo-vscode-0.1.6.vsix
 ```
 
 To build the extension from a checkout with Node.js 22 or newer:
@@ -41,7 +41,7 @@ To build the extension from a checkout with Node.js 22 or newer:
 cd editor-support/dodo-vscode
 npm ci
 npm run package
-code --install-extension dodo-vscode-0.1.5.vsix
+code --install-extension dodo-vscode-0.1.6.vsix
 ```
 
 Alternatively, select the VSIX with **Extensions: Install from VSIX...**.
@@ -81,10 +81,10 @@ The [Dodo JetBrains plugin](https://github.com/Jotrorox/dodo/tree/main/editor-su
 works in RustRover, CLion, and other JetBrains IDEs from 2026.2 that include
 JetBrains' language server support. It connects to `dodo lsp` automatically and
 adds syntax highlighting, brace and comment support, folding, and live templates
-with the same abbreviations as the VS Code snippets. It requires Dodo 0.1.5 or newer.
+with the same abbreviations as the VS Code snippets. It requires Dodo 0.1.6 or newer.
 
-Download `dodo-jetbrains-0.1.5.zip` from
-[GitHub Releases](https://github.com/Jotrorox/dodo/releases/tag/v0.1.5). In
+Download `dodo-jetbrains-0.1.6.zip` from
+[GitHub Releases](https://github.com/Jotrorox/dodo/releases/tag/v0.1.6). In
 **Settings | Plugins**, click the gear icon, choose **Install Plugin from Disk...**,
 and select the ZIP file. To build the plugin from a checkout with JDK 25 or newer:
 

@@ -68,7 +68,7 @@ def check(root: Path, tag: str) -> tuple[str, str]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("tag", help="release tag, for example v0.1.5")
+    parser.add_argument("tag", help="release tag, for example v0.1.6")
     parser.add_argument("--notes", type=Path, help="write the changelog entry to this file")
     args = parser.parse_args()
     try:

@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.1.6 — 2026-11-01
+
+First release.
 
 - Add the Dodo plugin for RustRover, CLion, and other JetBrains IDEs from 2026.2,
   with the features of the VS Code extension: highlighting with a color settings

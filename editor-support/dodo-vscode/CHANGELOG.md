@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.6 — 2026-11-01
+
+- Highlight `interface`, `type`, `dyn`, `async`, `await`, and `asm`, the
+  names declared by `interface` and `type`, and tuple fields such as `.0`.
+- Add snippets for interfaces, type aliases, interrupt handlers, and inline
+  assembly.
+
 ## 0.1.5 — 2026-10-12
 
 - Follow the `dodo.toml` target's firmware board or chip, so diagnostics,
