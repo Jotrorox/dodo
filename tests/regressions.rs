@@ -304,3 +304,55 @@ fn main() -> i32 {
         assert_eq!(workspace.run(&executable).status.code(), Some(42));
     }
 }
+#[test]
+fn struct_fields_named_len_are_ordinary_fields() {
+    // `len` used to be lowered as the built-in collection length for every
+    // base type, so a struct field with that name failed code generation.
+    let workspace = Workspace::new();
+    let source = workspace.file(
+        "main.dodo",
+        r#"package regression
+import "core/ptr"
+struct Buf {
+    data: i64
+    len: i64
+}
+fn through_pointer(p: *mut Buf) -> i64 {
+    unsafe {
+        (*p).len = 9
+        return (*p).len + (*p).data
+    }
+}
+fn nested(s: & &[u8], a: & &[3]u8, t: & &str) -> usize {
+    return s.len + a.len + t.len + s[1] as usize
+}
+fn main() -> i32 {
+    b := Buf { data: 1, len: 5 }
+    x := b.len
+    r := &mut b
+    y := r.len
+    rr := &r
+    z := rr.len
+    p := ptr.from_mut(&mut b)
+    bytes := [1u8, 2, 3, 4]
+    arr := [7u8, 8, 9]
+    s := &bytes[..]
+    ar := &arr
+    text := "hello"
+    if nested(&s, &ar, &text) != 14 {
+        return 1
+    }
+    return (x + y + z + through_pointer(p)) as i32 - 25
+}
+"#,
+    );
+    for optimization in [0, 3] {
+        let executable = workspace.build(&source, optimization, None);
+        let output = workspace.run(&executable);
+        assert!(
+            output.status.success(),
+            "`len` field program failed at O{optimization}: {}",
+            output.status
+        );
+    }
+}

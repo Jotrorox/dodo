@@ -130,6 +130,14 @@ fn mentions_dyn_self(ty: &Type) -> bool {
     matches!(ty, Type::Named(name) if name == "Self")
 }
 
+/// Whether `ty`, seen through any references, has the built-in `len` of an
+/// array, slice or string.
+fn is_collection(mut ty: &Type) -> bool {
+    while let Type::Ref(_, inner) = ty {
+        ty = inner;
+    }
+    matches!(ty, Type::Array(..) | Type::Slice(..) | Type::Str)
+}
 fn error(s: impl std::fmt::Display) -> CodegenError {
     CodegenError(s.to_string())
 }
@@ -2088,7 +2096,9 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                         None,
                     );
                 }
-                if n == "len" {
+                // `len` is only the built-in length of arrays, slices and
+                // strings; on a struct it is an ordinary field.
+                if n == "len" && is_collection(&x.ty) {
                     self.collection(x)?.1
                 } else {
                     let p = self.place(e)?;
@@ -2264,33 +2274,43 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                 self.usize_type().const_int(*n as u64, false),
                 *t.clone(),
             )),
-            Type::Ref(_, t) => {
-                let p = self.expr(e)?;
-                match &**t {
-                    Type::Array(n, t) => {
-                        Ok((p, self.usize_type().const_int(*n as u64, false), *t.clone()))
+            Type::Ref(..) => {
+                // Follow references (`&[N]T`, `&&[T]`, ...) down to the
+                // collection value itself.
+                let mut ty = e.ty.clone();
+                let mut v = self.expr(e)?;
+                while let Type::Ref(_, inner) = ty {
+                    if let Type::Array(n, t) = inner.as_ref() {
+                        return Ok((v, self.usize_type().const_int(*n as u64, false), *t.clone()));
                     }
-                    _ => Err(error("reference is not a collection")),
+                    v = self.load(v, &inner)?;
+                    ty = *inner;
                 }
+                self.fat_collection(v, &ty)
             }
-            Type::Slice(_, t) => {
+            Type::Slice(..) | Type::Str => {
                 let v = self.expr(e)?;
-                Ok((
-                    self.builder.build_extract_value(v, 0, "data")?,
-                    self.builder.build_extract_value(v, 1, "len")?,
-                    *t.clone(),
-                ))
-            }
-            Type::Str => {
-                let v = self.expr(e)?;
-                Ok((
-                    self.builder.build_extract_value(v, 0, "data")?,
-                    self.builder.build_extract_value(v, 1, "len")?,
-                    Type::u8(),
-                ))
+                self.fat_collection(v, &e.ty)
             }
             _ => Err(error(format!("{} is not an array or slice", e.ty))),
         }
+    }
+    /// Splits a slice or string value into its data pointer and length.
+    fn fat_collection(
+        &mut self,
+        v: Value<'ctx>,
+        ty: &Type,
+    ) -> Result<(Value<'ctx>, Value<'ctx>, Type)> {
+        let element = match ty {
+            Type::Slice(_, t) => *t.clone(),
+            Type::Str => Type::u8(),
+            _ => return Err(error(format!("{ty} is not an array or slice"))),
+        };
+        Ok((
+            self.builder.build_extract_value(v, 0, "data")?,
+            self.builder.build_extract_value(v, 1, "len")?,
+            element,
+        ))
     }
     fn array_gep(&self, p: Value<'ctx>, t: &Type, i: Value<'ctx>) -> Result<Value<'ctx>> {
         // Callers use a statically in-range index into an array of this exact type.

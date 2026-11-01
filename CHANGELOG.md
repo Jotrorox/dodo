@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Fixed: a struct field named `len` failed code generation ("is not an
+  array or slice") because every `.len` was compiled as a collection length.
+  `len` is now the built-in length only on arrays, slices and strings, also
+  behind several references (`& &[u8]`).
 - `std/graphics` strokes paths: `canvas.stroke_path(&path, &style, color)`
   paints a band of the stroke's width along a path, as borders, chart lines
   and icons need. A `graphics.Stroke` sets the width (in subpixels), miter,
