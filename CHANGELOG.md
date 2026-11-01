@@ -30,6 +30,31 @@
 - `.len` and indexing through a reference to a slice or string (such as the
   `&&[u8]` a `match &value` binds) no longer fail in code generation.
 
+- GPUs draw straight into `std/window` windows:
+  - `win.native_handle()` returns a `window.NativeHandle` (defined in the
+    new, dependency-free `std/window/handle`): `Xcb(connection, window,
+    screen, visual)` on Linux, `AppKit(window, view)` on macOS and
+    `Win32(hwnd, instance)` on Windows. On Linux the first call loads
+    `libxcb.so.1` at run time and opens a second connection to the X
+    server, since Vulkan and EGL cannot use std/window's own socket;
+    programs that never ask still need nothing beyond libc. Every window of
+    the `App` shares that connection, which closes with the `App`.
+  - `window.Options.gpu(title, width, height)` opens a window without a
+    pixel buffer, and `Options` gains the `pixel_buffer` field (struct
+    literals must now set it). Its
+    `canvas()` is empty and `update()` fails with `Unsupported`.
+    `win.has_pixel_buffer()` tells the two kinds apart.
+  - `win.metal_layer()` gives a GPU window's view a `CAMetalLayer` on macOS,
+    for Metal and Vulkan's `VK_EXT_metal_surface`. std/window keeps its
+    drawable size and contents scale in step with the window.
+  - `opengl.Context.create_for_window(&native, options)` draws into a
+    window's framebuffer 0 through EGL's XCB platform (or Xlib and EGL's X11
+    platform), an `NSOpenGLContext` or WGL, with `swap_buffers()`,
+    `set_swap_interval()` and `update_surface()`.
+  - `examples/opengl_window.dodo` now presents its frames directly instead of
+    reading them back through the CPU, and `examples/vulkan_window.dodo` and
+    `examples/metal_window.dodo` draw a spinning triangle with Vulkan (XCB,
+    Win32 and Metal surfaces, rebuilding the swapchain on resize) and Metal.
 - `std/graphics` strokes paths: `canvas.stroke_path(&path, &style, color)`
   paints a band of the stroke's width along a path, as borders, chart lines
   and icons need. A `graphics.Stroke` sets the width (in subpixels), miter,

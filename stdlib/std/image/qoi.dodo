@@ -1,0 +1,370 @@
+package qoi
+
+import "std/image/color"
+import "std/image/meta"
+import "std/image/pixels"
+import "std/image/shared/binary"
+import "std/image/sink"
+
+// QOI, the "Quite OK Image" format (https://qoiformat.org/qoi-specification.pdf).
+//
+// Files store 8-bit RGB or RGBA; the decoder reports Rgb8 or Rgba8 by the
+// header's channel byte and emits runs of up to 64 pixels per rect. A
+// colorspace byte of 1 marks linear-light samples (ColorInfo.linear()). The
+// encoder writes 4 channels when the source has alpha, else 3.
+
+const HEADER: usize = 14
+const END: usize = 8
+const OP_INDEX: u8 = 0x00
+const OP_DIFF: u8 = 0x40
+const OP_LUMA: u8 = 0x80
+const OP_RUN: u8 = 0xc0
+const OP_RGB: u8 = 0xfe
+const OP_RGBA: u8 = 0xff
+// Pixels converted per batch.
+const CHUNK: usize = 64
+// Opaque black, the encoder's and decoder's starting pixel.
+const START: u32 = 0xff000000
+
+struct Fields {
+    width: u32
+    height: u32
+    channels: u32
+    linear: bool
+}
+
+pub fn matches(data: &[u8]) -> bool {
+    return data.len >= 4 && data[0] == b'q' && data[1] == b'o' && data[2] == b'i' && data[3] == b'f'
+}
+
+fn fields(data: &[u8]) -> Fields!pixels.Error {
+    if data.len < HEADER {
+        return err(pixels.Error.Truncated)
+    }
+    if !matches(data) {
+        return err(pixels.Error.Malformed)
+    }
+    width := binary.be32(data, 4)?
+    height := binary.be32(data, 8)?
+    channels := data[12] as u32
+    if (channels != 3 && channels != 4) || data[13] > 1 {
+        return err(pixels.Error.Malformed)
+    }
+    binary.check_dimensions(width, height)?
+    return ok(Fields { width: width, height: height, channels: channels, linear: data[13] == 1 })
+}
+
+pub fn info(data: &[u8]) -> pixels.Header!pixels.Error {
+    f := fields(data)?
+    layout := pixels.Layout.rgb8()
+    if f.channels == 4 {
+        layout = pixels.Layout.rgba8()
+    }
+    header := pixels.Header.new(pixels.Format.Qoi, f.width, f.height, layout, 8)
+    if f.linear {
+        header.color = color.ColorInfo.linear()
+    }
+    return ok(header)
+}
+
+// QOI carries no metadata.
+pub fn metadata(data: &[u8]) -> meta.Metadata!pixels.Error {
+    fields(data)?
+    return ok(meta.Metadata.empty())
+}
+
+// The decoder needs no scratch.
+pub fn scratch_size(data: &[u8]) -> usize!pixels.Error {
+    fields(data)?
+    return ok(0)
+}
+
+fn pack(r: u8, g: u8, b: u8, a: u8) -> u32 {
+    return ((a as u32) << 24) | ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
+}
+
+fn hash(color: u32) -> usize {
+    r := (color >> 16) & 255
+    g := (color >> 8) & 255
+    b := color & 255
+    a := color >> 24
+    return ((r * 3 + g * 5 + b * 7 + a * 11) % 64) as usize
+}
+
+pub fn decode<S: sink.Sink>(data: &[u8], output: &mut S, scratch: &mut[u8]) -> void!pixels.Error {
+    header := info(data)?
+    channels := header.native.channel_count()
+    width := header.width
+    height := header.height
+    output.begin(&header)?
+    index := [0u32; 64]
+    r := 0u8
+    g := 0u8
+    b := 0u8
+    a := 255u8
+    run := 0u32
+    position := HEADER
+    buffer := [0u8; CHUNK * 4]
+    for row in 0u32..height {
+        start := 0u32
+        fill := 0usize
+        for column in 0u32..width {
+            if run > 0 {
+                run -= 1
+            } else {
+                if position >= data.len {
+                    return cut(output, &buffer, fill, start, row, &header.native)
+                }
+                tag := data[position]
+                position += 1
+                if tag == OP_RGB {
+                    if data.len - position < 3 {
+                        return cut(output, &buffer, fill, start, row, &header.native)
+                    }
+                    r = data[position]
+                    g = data[position + 1]
+                    b = data[position + 2]
+                    position += 3
+                } else if tag == OP_RGBA {
+                    if data.len - position < 4 {
+                        return cut(output, &buffer, fill, start, row, &header.native)
+                    }
+                    r = data[position]
+                    g = data[position + 1]
+                    b = data[position + 2]
+                    a = data[position + 3]
+                    position += 4
+                } else if (tag & 0xc0) == OP_INDEX {
+                    c := index[(tag & 63) as usize]
+                    r = ((c >> 16) & 255) as u8
+                    g = ((c >> 8) & 255) as u8
+                    b = (c & 255) as u8
+                    a = (c >> 24) as u8
+                } else if (tag & 0xc0) == OP_DIFF {
+                    r = core.wrapping_sub(core.wrapping_add(r, (tag >> 4) & 3), 2)
+                    g = core.wrapping_sub(core.wrapping_add(g, (tag >> 2) & 3), 2)
+                    b = core.wrapping_sub(core.wrapping_add(b, tag & 3), 2)
+                } else if (tag & 0xc0) == OP_LUMA {
+                    if position >= data.len {
+                        return cut(output, &buffer, fill, start, row, &header.native)
+                    }
+                    second := data[position]
+                    position += 1
+                    // dg in -32..31; dr and db relative to it in -8..7.
+                    dg := core.wrapping_sub(tag & 63, 32)
+                    r = core.wrapping_add(r, core.wrapping_sub(core.wrapping_add(dg, second >> 4), 8))
+                    g = core.wrapping_add(g, dg)
+                    b = core.wrapping_add(b, core.wrapping_sub(core.wrapping_add(dg, second & 15), 8))
+                } else {
+                    run = (tag & 63) as u32
+                }
+                c := pack(r, g, b, a)
+                index[hash(c)] = c
+            }
+            o := fill * channels
+            buffer[o] = r
+            buffer[o + 1] = g
+            buffer[o + 2] = b
+            if channels == 4 {
+                buffer[o + 3] = a
+            }
+            fill += 1
+            if fill == CHUNK || column + 1 == width {
+                view := pixels.View.new(&buffer[..fill * channels], fill as u32, 1, header.native.clone())?
+                output.rect(start, row, &view)?
+                start += fill as u32
+                fill = 0
+            }
+        }
+    }
+    return ok()
+}
+
+// The stream ended: emit the pixels decoded so far, as drawing decoders
+// do, and fail with Truncated.
+fn cut<S: sink.Sink>(output: &mut S, buffer: &[u8], fill: usize, x: u32, y: u32, layout: &pixels.Layout) -> void!pixels.Error {
+    if fill > 0 {
+        size := layout.bytes_per_pixel()
+        view := pixels.View.new(&buffer[..fill * size], fill as u32, 1, layout.clone())?
+        output.rect(x, y, &view)?
+    }
+    return err(pixels.Error.Truncated)
+}
+
+// ---------------------------------------------------------------------------
+// Encoder
+
+pub struct EncodeOptions {
+    // 0 picks 4 channels when the source has alpha, else 3; 3 or 4 forces
+    // the count (3 drops alpha).
+    pub channels: u32
+    // Write colorspace 1, linear light, instead of 0, sRGB.
+    pub linear: bool
+
+    pub fn new() -> EncodeOptions {
+        return EncodeOptions { channels: 0, linear: false }
+    }
+}
+
+fn channel_count(layout: &pixels.Layout, options: &EncodeOptions) -> usize!pixels.Error {
+    if options.channels == 3 || options.channels == 4 {
+        return ok(options.channels as usize)
+    }
+    if options.channels != 0 {
+        return err(pixels.Error.Unsupported)
+    }
+    if layout.has_alpha() {
+        return ok(4)
+    }
+    return ok(3)
+}
+
+// The largest file encode can produce: every pixel as a full RGB or RGBA
+// chunk, plus the header and end marker.
+pub fn max_encoded_size(width: u32, height: u32, layout: &pixels.Layout, options: &EncodeOptions) -> usize!pixels.Error {
+    binary.check_dimensions(width, height)?
+    channels := channel_count(layout, options)?
+    count := binary.pixel_count(width, height)?
+    return pixels.checked(count, channels + 1, HEADER + END)
+}
+
+pub fn encode_scratch_size(width: u32, height: u32, layout: &pixels.Layout, options: &EncodeOptions) -> usize!pixels.Error {
+    binary.check_dimensions(width, height)?
+    channel_count(layout, options)?
+    return ok(0)
+}
+
+// Write `source` as QOI and return the file's length. The output needs at
+// most max_encoded_size bytes; a smaller buffer works when the image
+// compresses well, else fails with BufferTooSmall.
+pub fn encode(source: &pixels.View, options: &EncodeOptions, output: &mut[u8], scratch: &mut[u8]) -> usize!pixels.Error {
+    view_source := sink.ViewSource.new(source)
+    return encode_from(&view_source, options, output, scratch)
+}
+
+pub fn encode_from<S: sink.Source>(source: &S, options: &EncodeOptions, output: &mut[u8], scratch: &mut[u8]) -> usize!pixels.Error {
+    width := source.width()
+    height := source.height()
+    binary.check_dimensions(width, height)?
+    layout := source.layout()
+    channels := channel_count(&layout, options)?
+    if output.len < HEADER + END {
+        return err(pixels.Error.BufferTooSmall)
+    }
+    output[0] = b'q'
+    output[1] = b'o'
+    output[2] = b'i'
+    output[3] = b'f'
+    binary.put_be32(output, 4, width)
+    binary.put_be32(output, 8, height)
+    output[12] = channels as u8
+    output[13] = 0
+    if options.linear {
+        output[13] = 1
+    }
+    index := [0u32; 64]
+    previous := START
+    run := 0u32
+    position := HEADER
+    count := binary.pixel_count(width, height)?
+    seen := 0usize
+    buffer := [0u8; CHUNK * 4]
+    for row in 0u32..height {
+        column := 0u32
+        for column < width {
+            batch := width - column
+            if batch > CHUNK as u32 {
+                batch = CHUNK as u32
+            }
+            source.load_rgba8(column, row, batch as usize, &mut buffer)
+            for i in 0usize..batch as usize {
+                alpha := buffer[i * 4 + 3]
+                if channels == 3 {
+                    alpha = 255
+                }
+                c := pack(buffer[i * 4], buffer[i * 4 + 1], buffer[i * 4 + 2], alpha)
+                seen += 1
+                if c == previous {
+                    run += 1
+                    if run == 62 || seen == count {
+                        if position + 1 > output.len {
+                            return err(pixels.Error.BufferTooSmall)
+                        }
+                        output[position] = OP_RUN | (run - 1) as u8
+                        position += 1
+                        run = 0
+                    }
+                } else {
+                    if run > 0 {
+                        if position + 1 > output.len {
+                            return err(pixels.Error.BufferTooSmall)
+                        }
+                        output[position] = OP_RUN | (run - 1) as u8
+                        position += 1
+                        run = 0
+                    }
+                    // Room for the largest chunk keeps the checks below simple.
+                    if position + 5 > output.len {
+                        return err(pixels.Error.BufferTooSmall)
+                    }
+                    slot := hash(c)
+                    if index[slot] == c {
+                        output[position] = OP_INDEX | slot as u8
+                        position += 1
+                    } else {
+                        index[slot] = c
+                        if (c >> 24) == (previous >> 24) {
+                            dr := wrap_difference((((c >> 16) & 255) as i32) - (((previous >> 16) & 255) as i32))
+                            dg := wrap_difference((((c >> 8) & 255) as i32) - (((previous >> 8) & 255) as i32))
+                            db := wrap_difference(((c & 255) as i32) - ((previous & 255) as i32))
+                            dr_dg := dr - dg
+                            db_dg := db - dg
+                            if dr >= -2 && dr <= 1 && dg >= -2 && dg <= 1 && db >= -2 && db <= 1 {
+                                output[position] = OP_DIFF | (((dr + 2) << 4) | ((dg + 2) << 2) | (db + 2)) as u8
+                                position += 1
+                            } else if dg >= -32 && dg <= 31 && dr_dg >= -8 && dr_dg <= 7 && db_dg >= -8 && db_dg <= 7 {
+                                output[position] = OP_LUMA | (dg + 32) as u8
+                                output[position + 1] = (((dr_dg + 8) << 4) | (db_dg + 8)) as u8
+                                position += 2
+                            } else {
+                                output[position] = OP_RGB
+                                output[position + 1] = ((c >> 16) & 255) as u8
+                                output[position + 2] = ((c >> 8) & 255) as u8
+                                output[position + 3] = (c & 255) as u8
+                                position += 4
+                            }
+                        } else {
+                            output[position] = OP_RGBA
+                            output[position + 1] = ((c >> 16) & 255) as u8
+                            output[position + 2] = ((c >> 8) & 255) as u8
+                            output[position + 3] = (c & 255) as u8
+                            output[position + 4] = (c >> 24) as u8
+                            position += 5
+                        }
+                    }
+                }
+                previous = c
+            }
+            column += batch
+        }
+    }
+    if position + END > output.len {
+        return err(pixels.Error.BufferTooSmall)
+    }
+    for i in 0usize..7 {
+        output[position + i] = 0
+    }
+    output[position + 7] = 1
+    return ok(position + END)
+}
+
+// A channel difference taken modulo 256 into -128..127.
+fn wrap_difference(value: i32) -> i32 {
+    if value > 127 {
+        return value - 256
+    }
+    if value < -128 {
+        return value + 256
+    }
+    return value
+}

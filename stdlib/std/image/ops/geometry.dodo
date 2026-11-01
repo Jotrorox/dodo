@@ -1,0 +1,269 @@
+package ops
+
+import "std/image/color"
+import "std/image/convert"
+import "std/image/pixels"
+
+// Geometry: crops, copies, flips, quarter turns and EXIF orientation.
+//
+// Every transform reads a View and writes a separate ViewMut of the
+// transformed size (width and height swap for the quarter turns, transpose
+// and transverse). The target may use any layout; when it differs from the
+// source's, pixels are converted with convert.row, so a transform can also
+// change format in the same pass. A wrongly sized target is Malformed.
+//
+// Coordinates map as follows for a W x H source pixel (x, y):
+//
+//     flip_horizontal  (W-1-x, y)        rotate90 (clockwise)   (H-1-y, x)
+//     flip_vertical    (x, H-1-y)        rotate270              (y, W-1-x)
+//     rotate180        (W-1-x, H-1-y)    transpose              (y, x)
+//                                        transverse             (H-1-y, W-1-x)
+//
+// The in-place variants work on one ViewMut when the size does not change.
+
+// A width and height.
+pub struct Size {
+    pub width: u32
+    pub height: u32
+}
+
+// Transform codes are EXIF orientation values.
+const IDENTITY: u32 = 1
+const FLIP_HORIZONTAL: u32 = 2
+const ROTATE_180: u32 = 3
+const FLIP_VERTICAL: u32 = 4
+const TRANSPOSE: u32 = 5
+const ROTATE_90: u32 = 6
+const TRANSVERSE: u32 = 7
+const ROTATE_270: u32 = 8
+
+// The width x height rectangle of `source` at (x, y), sharing its pixels.
+// Malformed when it does not fit.
+pub fn crop(source: &pixels.View, x: u32, y: u32, width: u32, height: u32) -> pixels.View!pixels.Error from(source) {
+    return source.sub(x, y, width, height)
+}
+
+// The writable width x height rectangle of `target` at (x, y).
+pub fn crop_mut(target: &mut pixels.ViewMut, x: u32, y: u32, width: u32, height: u32) -> pixels.ViewMut!pixels.Error from(target) {
+    return target.sub_mut(x, y, width, height)
+}
+
+// Copy `source` into a target of the same size, converting the layout.
+pub fn copy(source: &pixels.View, target: &mut pixels.ViewMut) -> void!pixels.Error {
+    return convert.copy(source, target)
+}
+
+pub fn flip_horizontal(source: &pixels.View, target: &mut pixels.ViewMut) -> void!pixels.Error {
+    return transform(source, target, FLIP_HORIZONTAL)
+}
+
+pub fn flip_vertical(source: &pixels.View, target: &mut pixels.ViewMut) -> void!pixels.Error {
+    return transform(source, target, FLIP_VERTICAL)
+}
+
+pub fn rotate180(source: &pixels.View, target: &mut pixels.ViewMut) -> void!pixels.Error {
+    return transform(source, target, ROTATE_180)
+}
+
+// Rotate 90 degrees clockwise; the target is source.height() wide.
+pub fn rotate90(source: &pixels.View, target: &mut pixels.ViewMut) -> void!pixels.Error {
+    return transform(source, target, ROTATE_90)
+}
+
+// Rotate 270 degrees clockwise (90 counter-clockwise).
+pub fn rotate270(source: &pixels.View, target: &mut pixels.ViewMut) -> void!pixels.Error {
+    return transform(source, target, ROTATE_270)
+}
+
+// Mirror along the top-left to bottom-right diagonal.
+pub fn transpose(source: &pixels.View, target: &mut pixels.ViewMut) -> void!pixels.Error {
+    return transform(source, target, TRANSPOSE)
+}
+
+// Mirror along the top-right to bottom-left diagonal.
+pub fn transverse(source: &pixels.View, target: &mut pixels.ViewMut) -> void!pixels.Error {
+    return transform(source, target, TRANSVERSE)
+}
+
+// Apply an orientation (as stored in a file's header) so that `target` holds
+// the image as it is meant to be displayed. The target has
+// oriented_size(source.width(), source.height(), orientation).
+pub fn orient(source: &pixels.View, target: &mut pixels.ViewMut, orientation: &color.Orientation) -> void!pixels.Error {
+    return transform(source, target, color.exif_value(orientation))
+}
+
+// The size of a width x height image once `orientation` is applied.
+pub fn oriented_size(width: u32, height: u32, orientation: &color.Orientation) -> Size {
+    if color.swaps_axes(orientation) {
+        return Size { width: height, height: width }
+    }
+    return Size { width: width, height: height }
+}
+
+// The orientation that undoes `orientation`: applying one after the other
+// gives the original image. Only the quarter turns differ from themselves.
+pub fn inverse_orientation(orientation: &color.Orientation) -> color.Orientation {
+    code := color.exif_value(orientation)
+    if code == ROTATE_90 {
+        return color.Orientation.Rotate270
+    }
+    if code == ROTATE_270 {
+        return color.Orientation.Rotate90
+    }
+    return color.orientation_from_exif(code)
+}
+
+struct Point {
+    x: u32
+    y: u32
+}
+
+// Target position of source pixel (x, y) of a width x height image.
+fn place(code: u32, x: u32, y: u32, width: u32, height: u32) -> Point {
+    if code == FLIP_HORIZONTAL {
+        return Point { x: width - 1 - x, y: y }
+    }
+    if code == ROTATE_180 {
+        return Point { x: width - 1 - x, y: height - 1 - y }
+    }
+    if code == FLIP_VERTICAL {
+        return Point { x: x, y: height - 1 - y }
+    }
+    if code == TRANSPOSE {
+        return Point { x: y, y: x }
+    }
+    if code == ROTATE_90 {
+        return Point { x: height - 1 - y, y: x }
+    }
+    if code == TRANSVERSE {
+        return Point { x: height - 1 - y, y: width - 1 - x }
+    }
+    if code == ROTATE_270 {
+        return Point { x: y, y: width - 1 - x }
+    }
+    return Point { x: x, y: y }
+}
+
+fn transform(source: &pixels.View, target: &mut pixels.ViewMut, code: u32) -> void!pixels.Error {
+    width := source.width()
+    height := source.height()
+    swap := code >= TRANSPOSE
+    if swap {
+        if target.width() != height || target.height() != width {
+            return err(pixels.Error.Malformed)
+        }
+    } else if target.width() != width || target.height() != height {
+        return err(pixels.Error.Malformed)
+    }
+    if code == IDENTITY {
+        convert.copy_rect(source, target, 0, 0)
+        return ok()
+    }
+    source_layout := source.layout().clone()
+    target_layout := target.layout().clone()
+    size := target_layout.bytes_per_pixel()
+    // Convert up to BATCH pixels of a source row, then scatter them.
+    buffer := [0u8; 1024]
+    for y in 0u32..height {
+        line := source.row(y)
+        x := 0u32
+        for x < width {
+            count := width - x
+            if count > BATCH as u32 {
+                count = BATCH as u32
+            }
+            convert.row(line, &source_layout, x as usize, &mut buffer, &target_layout, 0, count as usize)
+            for i in 0u32..count {
+                at := place(code, x + i, y, width, height)
+                pixel := target.pixel_mut(at.x, at.y)
+                o := i as usize * size
+                for k in 0usize..size {
+                    pixel[k] = buffer[o + k]
+                }
+            }
+            x += count
+        }
+    }
+    return ok()
+}
+
+// ---------------------------------------------------------------------------
+// In place
+
+// Mirror left-right in place.
+pub fn flip_horizontal_in_place(view: &mut pixels.ViewMut) {
+    width := view.width() as usize
+    size := view.bytes_per_pixel()
+    for y in 0u32..view.height() {
+        line := view.row_mut(y)
+        for x in 0usize..width / 2 {
+            swap_pixels(line, x * size, (width - 1 - x) * size, size)
+        }
+    }
+}
+
+// Mirror top-bottom in place.
+pub fn flip_vertical_in_place(view: &mut pixels.ViewMut) {
+    height := view.height() as usize
+    stride := view.stride()
+    row := view.width() as usize * view.bytes_per_pixel()
+    data := view.bytes_mut()
+    for y in 0usize..height / 2 {
+        swap_pixels(data, y * stride, (height - 1 - y) * stride, row)
+    }
+}
+
+// Rotate by 180 degrees in place.
+pub fn rotate180_in_place(view: &mut pixels.ViewMut) {
+    flip_vertical_in_place(view)
+    flip_horizontal_in_place(view)
+}
+
+// Apply an orientation in place. Orientations that swap the axes need a
+// square view; others are Malformed then.
+pub fn orient_in_place(view: &mut pixels.ViewMut, orientation: &color.Orientation) -> void!pixels.Error {
+    code := color.exif_value(orientation)
+    if code == FLIP_HORIZONTAL {
+        flip_horizontal_in_place(view)
+    } else if code == ROTATE_180 {
+        rotate180_in_place(view)
+    } else if code == FLIP_VERTICAL {
+        flip_vertical_in_place(view)
+    } else if code >= TRANSPOSE {
+        if view.width() != view.height() {
+            return err(pixels.Error.Malformed)
+        }
+        // Every square orientation is a transpose followed by flips:
+        // rotate90 = transpose + flip_horizontal, rotate270 = transpose +
+        // flip_vertical, transverse = transpose + rotate180.
+        transpose_square(view)
+        if code == ROTATE_90 {
+            flip_horizontal_in_place(view)
+        } else if code == ROTATE_270 {
+            flip_vertical_in_place(view)
+        } else if code == TRANSVERSE {
+            rotate180_in_place(view)
+        }
+    }
+    return ok()
+}
+
+fn transpose_square(view: &mut pixels.ViewMut) {
+    n := view.width() as usize
+    stride := view.stride()
+    size := view.bytes_per_pixel()
+    data := view.bytes_mut()
+    for y in 0usize..n {
+        for x in y + 1..n {
+            swap_pixels(data, y * stride + x * size, x * stride + y * size, size)
+        }
+    }
+}
+
+fn swap_pixels(data: &mut[u8], a: usize, b: usize, size: usize) {
+    for k in 0usize..size {
+        t := data[a + k]
+        data[a + k] = data[b + k]
+        data[b + k] = t
+    }
+}

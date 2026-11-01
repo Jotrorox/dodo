@@ -1,0 +1,876 @@
+package png
+
+import "core/slice"
+import "std/checksum"
+import "std/compress/deflate"
+import "std/compress/zlib"
+import "std/image/pixels"
+import "std/image/shared/binary"
+import "std/image/shared/scratch" as storage
+import "std/image/sink"
+
+// The encoder writes gray, gray+alpha, RGB or RGBA following the source
+// layout: 8-bit for U8 sources, 16-bit for U16, F16 and F32 (floats clamp to
+// 0.0..1.0). With `palette`, an 8-bit source with at most 256 distinct RGBA
+// colors becomes an indexed PNG of 1, 2, 4 or 8 bits with a tRNS chunk for
+// its translucent entries. Pixels are read from the source a few at a time,
+// so nothing but the deflate state needs storage.
+
+pub struct EncodeOptions {
+    // 0 writes stored (uncompressed) deflate blocks and needs no scratch;
+    // 1 to 9 compress at that deflate level.
+    pub level: u32
+    // FILTER_NONE through FILTER_PAETH for every row, or FILTER_ADAPTIVE
+    // (which uses FILTER_NONE for indexed and sub-byte rows).
+    pub filter: u32
+    // Write Adam7-interlaced rows.
+    pub interlace: bool
+    // Write an indexed PNG when the 8-bit source has <= 256 RGBA colors.
+    pub palette: bool
+    // Write an sRGB chunk (perceptual intent), unless an ICC profile is
+    // given.
+    pub srgb_chunk: bool
+
+    pub fn new() -> EncodeOptions {
+        return EncodeOptions { level: 6, filter: FILTER_ADAPTIVE, interlace: false, palette: false, srgb_chunk: false }
+    }
+}
+
+// What the encoder writes.
+struct Target {
+    width: u32
+    height: u32
+    // PNG color type and bit depth.
+    color: u32
+    depth: u32
+    // Stored samples per pixel and bits per pixel.
+    channels: usize
+    bits: u32
+    // Filter distance: bytes per complete pixel, at least one.
+    step: usize
+    // Pixels are loaded as 16-bit RGBA.
+    wide: bool
+    palette_count: usize
+    // Leading palette entries that are not opaque, written to tRNS.
+    alpha_count: usize
+    interlace: bool
+}
+
+// One Adam7 pass, or the whole image.
+struct Pass {
+    x0: u32
+    y0: u32
+    dx: u32
+    dy: u32
+    columns: u32
+    rows: u32
+}
+
+fn pass_of(width: u32, height: u32, interlace: bool, pass: usize) -> Pass {
+    g := Pass { x0: 0, y0: 0, dx: 1, dy: 1, columns: width, rows: height }
+    if interlace {
+        g.x0 = ADAM7_X[pass]
+        g.y0 = ADAM7_Y[pass]
+        g.dx = ADAM7_DX[pass]
+        g.dy = ADAM7_DY[pass]
+        g.columns = 0
+        g.rows = 0
+        if width > g.x0 && height > g.y0 {
+            g.columns = (width - g.x0 + g.dx - 1) / g.dx
+            g.rows = (height - g.y0 + g.dy - 1) / g.dy
+        }
+    }
+    return g
+}
+
+// Raw image data size: each row of each pass is a filter byte and its
+// pixels.
+fn raw_size(width: u32, height: u32, bits: u32, interlace: bool) -> usize!pixels.Error {
+    passes := 1usize
+    if interlace {
+        passes = 7
+    }
+    total := 0usize
+    for pass in 0usize..passes {
+        g := pass_of(width, height, interlace, pass)
+        if g.columns == 0 || g.rows == 0 {
+            continue
+        }
+        row := row_bytes(g.columns, bits)?
+        total = pixels.checked(row + 1, g.rows as usize, total)?
+    }
+    return ok(total)
+}
+
+// The PNG color type for a channel count.
+fn color_type(channels: usize) -> u32 {
+    if channels == 1 {
+        return 0
+    }
+    if channels == 2 {
+        return 4
+    }
+    if channels == 3 {
+        return 2
+    }
+    return 6
+}
+
+fn check_options(width: u32, height: u32, options: &EncodeOptions) -> void!pixels.Error {
+    // PNG cannot store an empty image.
+    if width == 0 || height == 0 {
+        return err(pixels.Error.Unsupported)
+    }
+    binary.check_dimensions(width, height)?
+    if options.level > deflate.MAX_LEVEL as u32 || options.filter > FILTER_ADAPTIVE {
+        return err(pixels.Error.Unsupported)
+    }
+    return ok()
+}
+
+// Truecolor output for `layout`.
+fn truecolor(width: u32, height: u32, layout: &pixels.Layout, interlace: bool) -> Target {
+    channels := layout.channel_count()
+    wide := layout.sample_code() != pixels.SAMPLE_U8
+    depth := 8u32
+    if wide {
+        depth = 16
+    }
+    bits := depth * channels as u32
+    return Target { width: width, height: height, color: color_type(channels), depth: depth, channels: channels, bits: bits, step: bits as usize / 8, wide: wide, palette_count: 0, alpha_count: 0, interlace: interlace }
+}
+
+// ---------------------------------------------------------------------------
+// Palette
+
+const NO_ENTRY: usize = 256
+
+fn pack_color(rgba: &[u8], o: usize) -> u32 {
+    return ((rgba[o] as u32) << 24) | ((rgba[o + 1] as u32) << 16) | ((rgba[o + 2] as u32) << 8) | (rgba[o + 3] as u32)
+}
+
+fn slot_of(key: u32) -> usize {
+    return (core.wrapping_mul(key, 2654435761u32) >> 22) as usize
+}
+
+// The palette index of `key`, or NO_ENTRY. `slots` holds index + 1 in an
+// open-addressed table of 1024 entries.
+fn lookup(colors: &[u32], slots: &[u16], key: u32) -> usize {
+    s := slot_of(key)
+    for {
+        entry := slots[s] as usize
+        if entry == 0 {
+            return NO_ENTRY
+        }
+        if colors[entry - 1] == key {
+            return entry - 1
+        }
+        s = (s + 1) & 1023
+    }
+}
+
+fn insert(slots: &mut[u16], key: u32, index: usize) {
+    s := slot_of(key)
+    for slots[s] != 0 {
+        s = (s + 1) & 1023
+    }
+    slots[s] = (index + 1) as u16
+}
+
+// Collect the source's distinct colors; the count, or NO_ENTRY + 1 when
+// there are more than 256. Translucent entries are moved to the front.
+fn scan_palette<S: sink.Source>(source: &S, colors: &mut[u32], slots: &mut[u16]) -> usize {
+    count := 0usize
+    narrow := [0u8; CHUNK * 4]
+    width := source.width()
+    for y in 0u32..source.height() {
+        x := 0u32
+        for x < width {
+            n := width - x
+            if n > CHUNK as u32 {
+                n = CHUNK as u32
+            }
+            source.load_rgba8(x, y, n as usize, &mut narrow)
+            for k in 0usize..n as usize {
+                key := pack_color(&narrow, k * 4)
+                if lookup(colors, slots, key) == NO_ENTRY {
+                    if count == 256 {
+                        return NO_ENTRY + 1
+                    }
+                    colors[count] = key
+                    insert(slots, key, count)
+                    count += 1
+                }
+            }
+            x += n
+        }
+    }
+    // Translucent colors first, so tRNS stays short.
+    order := [0u32; 256]
+    placed := 0usize
+    for i in 0usize..count {
+        if (colors[i] & 255) != 255 {
+            order[placed] = colors[i]
+            placed += 1
+        }
+    }
+    for i in 0usize..count {
+        if (colors[i] & 255) == 255 {
+            order[placed] = colors[i]
+            placed += 1
+        }
+    }
+    for i in 0usize..1024 {
+        slots[i] = 0
+    }
+    for i in 0usize..count {
+        colors[i] = order[i]
+        insert(slots, colors[i], i)
+    }
+    return count
+}
+
+// The target for `source`: truecolor, or indexed when asked for and
+// possible.
+fn prepare<S: sink.Source>(source: &S, options: &EncodeOptions, colors: &mut[u32], slots: &mut[u16]) -> Target!pixels.Error {
+    width := source.width()
+    height := source.height()
+    check_options(width, height, options)?
+    layout := source.layout()
+    t := truecolor(width, height, &layout, options.interlace)
+    if !options.palette || t.wide {
+        return ok(t)
+    }
+    count := scan_palette(source, colors, slots)
+    if count > 256 {
+        return ok(t)
+    }
+    depth := 8u32
+    if count <= 2 {
+        depth = 1
+    } else if count <= 4 {
+        depth = 2
+    } else if count <= 16 {
+        depth = 4
+    }
+    alpha := 0usize
+    for i in 0usize..count {
+        if (colors[i] & 255) != 255 {
+            alpha = i + 1
+        }
+    }
+    return ok(Target { width: width, height: height, color: 3, depth: depth, channels: 1, bits: depth, step: 1, wide: false, palette_count: count, alpha_count: alpha, interlace: options.interlace })
+}
+
+// ---------------------------------------------------------------------------
+// Rows
+
+// Raw bytes of `count` pixels of row y, pass columns first.. (x = x0 +
+// column * dx), into out; returns the byte count. `first` is a multiple of
+// CHUNK, so sub-byte pixels start on a byte boundary.
+fn raw_pixels<S: sink.Source>(source: &S, t: &Target, colors: &[u32], slots: &[u16], y: u32, g: &Pass, first: u32, count: usize, out: &mut[u8]) -> usize {
+    if t.wide {
+        wide := [0u16; CHUNK * 4]
+        if g.dx == 1 {
+            source.load_rgba16(g.x0 + first, y, count, &mut wide)
+        } else {
+            for k in 0usize..count {
+                source.load_rgba16(g.x0 + (first + k as u32) * g.dx, y, 1, &mut wide[k * 4..])
+            }
+        }
+        o := 0usize
+        for k in 0usize..count {
+            p := k * 4
+            if t.channels <= 2 {
+                o = put_wide(out, o, wide[p])
+                if t.channels == 2 {
+                    o = put_wide(out, o, wide[p + 3])
+                }
+            } else {
+                o = put_wide(out, o, wide[p])
+                o = put_wide(out, o, wide[p + 1])
+                o = put_wide(out, o, wide[p + 2])
+                if t.channels == 4 {
+                    o = put_wide(out, o, wide[p + 3])
+                }
+            }
+        }
+        return o
+    }
+    narrow := [0u8; CHUNK * 4]
+    if g.dx == 1 {
+        source.load_rgba8(g.x0 + first, y, count, &mut narrow)
+    } else {
+        for k in 0usize..count {
+            source.load_rgba8(g.x0 + (first + k as u32) * g.dx, y, 1, &mut narrow[k * 4..])
+        }
+    }
+    if t.color == 3 {
+        length := (count * t.depth as usize + 7) / 8
+        for i in 0usize..length {
+            out[i] = 0
+        }
+        for k in 0usize..count {
+            index := lookup(colors, slots, pack_color(&narrow, k * 4))
+            if index == NO_ENTRY {
+                // The source changed since the palette was collected.
+                index = 0
+            }
+            bit := k * t.depth as usize
+            shift := 8 - t.depth - (bit % 8) as u32
+            out[bit / 8] = out[bit / 8] | ((index as u32) << shift) as u8
+        }
+        return length
+    }
+    o := 0usize
+    for k in 0usize..count {
+        p := k * 4
+        if t.channels <= 2 {
+            out[o] = narrow[p]
+            o += 1
+            if t.channels == 2 {
+                out[o] = narrow[p + 3]
+                o += 1
+            }
+        } else {
+            out[o] = narrow[p]
+            out[o + 1] = narrow[p + 1]
+            out[o + 2] = narrow[p + 2]
+            o += 3
+            if t.channels == 4 {
+                out[o] = narrow[p + 3]
+                o += 1
+            }
+        }
+    }
+    return o
+}
+
+fn put_wide(out: &mut[u8], o: usize, value: u16) -> usize {
+    out[o] = (value >> 8) as u8
+    out[o + 1] = (value & 255) as u8
+    return o + 2
+}
+
+// Where filtered bytes go: stored blocks or the deflate encoder.
+interface Writer {
+    fn write(&mut self, bytes: &[u8], output: &mut[u8]) -> void!pixels.Error
+}
+
+// Filter row r of pass `g`. With `emit` the filtered bytes go to `writer`;
+// otherwise the signed-magnitude sums of all five filters are added to
+// sums[..5].
+fn filter_row<S: sink.Source, W: Writer>(source: &S, t: &Target, colors: &[u32], slots: &[u16], g: &Pass, r: u32, filter: u32, emit: bool, sums: &mut[u64], writer: &mut W, output: &mut[u8]) -> void!pixels.Error {
+    y := g.y0 + r * g.dy
+    // Eight bytes of history before each chunk: the left neighbours.
+    current := [0u8; 8 + CHUNK * 8]
+    above := [0u8; 8 + CHUNK * 8]
+    filtered_bytes := [0u8; CHUNK * 8]
+    step := t.step
+    first := 0u32
+    for first < g.columns {
+        count := g.columns - first
+        if count > CHUNK as u32 {
+            count = CHUNK as u32
+        }
+        length := raw_pixels(source, t, colors, slots, y, g, first, count as usize, &mut current[8..])
+        if r > 0 {
+            raw_pixels(source, t, colors, slots, y - g.dy, g, first, count as usize, &mut above[8..])
+        }
+        for i in 0usize..length {
+            x := current[8 + i]
+            a := current[8 + i - step]
+            b := above[8 + i]
+            c := above[8 + i - step]
+            if emit {
+                filtered_bytes[i] = filtered(filter, x, a, b, c)
+            } else {
+                for f in 0u32..5 {
+                    value := filtered(f, x, a, b, c) as u64
+                    if value > 128 {
+                        value = 256 - value
+                    }
+                    sums[f as usize] += value
+                }
+            }
+        }
+        if emit {
+            writer.write(&filtered_bytes[..length], output)?
+        }
+        for k in 0usize..step {
+            current[8 - step + k] = current[8 + length - step + k]
+            above[8 - step + k] = above[8 + length - step + k]
+        }
+        first += count
+    }
+    return ok()
+}
+
+// Every row of every pass, each with its filter byte.
+fn write_image<S: sink.Source, W: Writer>(source: &S, t: &Target, options: &EncodeOptions, colors: &[u32], slots: &[u16], writer: &mut W, output: &mut[u8]) -> void!pixels.Error {
+    passes := 1usize
+    if t.interlace {
+        passes = 7
+    }
+    adaptive := options.filter == FILTER_ADAPTIVE && t.depth >= 8 && t.color != 3
+    fixed := options.filter
+    if options.filter == FILTER_ADAPTIVE {
+        fixed = FILTER_NONE
+    }
+    sums := [0u64; 5]
+    byte := [0u8; 1]
+    for pass in 0usize..passes {
+        g := pass_of(t.width, t.height, t.interlace, pass)
+        if g.columns == 0 || g.rows == 0 {
+            continue
+        }
+        for r in 0u32..g.rows {
+            filter := fixed
+            if adaptive {
+                for f in 0usize..5 {
+                    sums[f] = 0
+                }
+                filter_row(source, t, colors, slots, &g, r, 0, false, &mut sums, writer, output)?
+                filter = 0
+                for f in 1u32..5 {
+                    if sums[f as usize] < sums[filter as usize] {
+                        filter = f
+                    }
+                }
+            }
+            byte[0] = filter as u8
+            writer.write(&byte, output)?
+            filter_row(source, t, colors, slots, &g, r, filter, true, &mut sums, writer, output)?
+        }
+    }
+    return ok()
+}
+
+// ---------------------------------------------------------------------------
+// Chunks
+
+// Write the CRC of the chunk at `offset` with `length` data bytes.
+fn seal(output: &mut[u8], offset: usize, length: usize) {
+    crc := checksum.Crc32.new()
+    crc.update(&output[offset + 4..offset + 8 + length])
+    binary.put_be32(output, offset + 8 + length, crc.finish())
+}
+
+// Write the signature and IHDR, START bytes.
+fn write_start(output: &mut[u8], t: &Target) {
+    signature := [137u8, 80, 78, 71, 13, 10, 26, 10]
+    for i in 0usize..8 {
+        output[i] = signature[i]
+    }
+    binary.put_be32(output, 8, 13)
+    binary.put_be32(output, 12, IHDR)
+    binary.put_be32(output, 16, t.width)
+    binary.put_be32(output, 20, t.height)
+    output[24] = t.depth as u8
+    output[25] = t.color as u8
+    output[26] = 0
+    output[27] = 0
+    output[28] = 0
+    if t.interlace {
+        output[28] = 1
+    }
+    seal(output, 8, 13)
+}
+
+// Write a chunk with `data` at `offset`; returns the end.
+fn write_chunk(output: &mut[u8], offset: usize, kind: u32, data: &[u8]) -> usize {
+    binary.put_be32(output, offset, data.len as u32)
+    binary.put_be32(output, offset + 4, kind)
+    for i in 0usize..data.len {
+        output[offset + 8 + i] = data[i]
+    }
+    seal(output, offset, data.len)
+    return offset + 12 + data.len
+}
+
+// Write the IEND chunk at `offset` and return the end of the file.
+fn close(output: &mut[u8], offset: usize) -> usize {
+    binary.put_be32(output, offset, 0)
+    binary.put_be32(output, offset + 4, IEND)
+    seal(output, offset, 0)
+    return offset + END
+}
+
+// Bytes of a zlib stream of stored blocks holding `length` bytes.
+fn stored_zlib_size(length: usize) -> usize!pixels.Error {
+    blocks := length / STORED_BLOCK + 1
+    return pixels.checked(blocks, 5, length + 6)
+}
+
+// Write `input` as a zlib stream of stored blocks at output[offset..];
+// returns the end.
+fn write_stored_zlib(output: &mut[u8], offset: usize, input: &[u8]) -> usize {
+    output[offset] = 0x78
+    output[offset + 1] = 0x01
+    position := offset + 2
+    done := 0usize
+    for {
+        size := input.len - done
+        if size > STORED_BLOCK {
+            size = STORED_BLOCK
+        }
+        output[position] = 0
+        if done + size == input.len {
+            output[position] = 1
+        }
+        binary.put_le16(output, position + 1, size as u32)
+        binary.put_le16(output, position + 3, (size ^ 0xffff) as u32)
+        position += 5
+        for i in 0usize..size {
+            output[position + i] = input[done + i]
+        }
+        position += size
+        done += size
+        if done == input.len {
+            break
+        }
+    }
+    adler := checksum.Adler32.new()
+    adler.update(input)
+    binary.put_be32(output, position, adler.finish())
+    return position + 4
+}
+
+// The iCCP profile name.
+const PROFILE_NAME: usize = 11
+
+// Bytes the optional eXIf and iCCP chunks add for payloads of these sizes;
+// add it to max_encoded_size() when passing metadata.
+pub fn metadata_size(exif_len: usize, icc_len: usize) -> usize!pixels.Error {
+    total := 0usize
+    if exif_len > 0 {
+        total = pixels.checked(exif_len, 1, 12)?
+    }
+    if icc_len > 0 {
+        stream := stored_zlib_size(icc_len)?
+        total = pixels.checked(stream, 1, total + 12 + PROFILE_NAME + 2)?
+    }
+    return ok(total)
+}
+
+// Bytes of the chunks between IHDR and the image data.
+fn extras_size(t: &Target, options: &EncodeOptions, exif_len: usize, icc_len: usize) -> usize!pixels.Error {
+    total := metadata_size(exif_len, icc_len)?
+    if options.srgb_chunk && icc_len == 0 {
+        total += 13
+    }
+    if t.color == 3 {
+        total += 12 + 3 * t.palette_count
+        if t.alpha_count > 0 {
+            total += 12 + t.alpha_count
+        }
+    }
+    return ok(total)
+}
+
+// Write the chunks between IHDR and the image data; returns the end.
+fn write_extras(output: &mut[u8], offset: usize, t: &Target, options: &EncodeOptions, colors: &[u32], exif: &[u8], icc: &[u8]) -> usize {
+    position := offset
+    if icc.len > 0 {
+        start := position
+        binary.put_be32(output, start + 4, ICCP)
+        name := b"ICC profile"
+        for i in 0usize..PROFILE_NAME {
+            output[start + 8 + i] = name[i]
+        }
+        output[start + 8 + PROFILE_NAME] = 0
+        output[start + 9 + PROFILE_NAME] = 0
+        end := write_stored_zlib(output, start + 10 + PROFILE_NAME, icc)
+        length := end - start - 8
+        binary.put_be32(output, start, length as u32)
+        seal(output, start, length)
+        position = end + 4
+    } else if options.srgb_chunk {
+        intent := [0u8; 1]
+        position = write_chunk(output, position, SRGB, &intent)
+    }
+    if exif.len > 0 {
+        position = write_chunk(output, position, EXIF, exif)
+    }
+    if t.color == 3 {
+        entries := [0u8; 768]
+        alphas := [0u8; 256]
+        for i in 0usize..t.palette_count {
+            c := colors[i]
+            entries[i * 3] = (c >> 24) as u8
+            entries[i * 3 + 1] = ((c >> 16) & 255) as u8
+            entries[i * 3 + 2] = ((c >> 8) & 255) as u8
+            alphas[i] = (c & 255) as u8
+        }
+        position = write_chunk(output, position, PLTE, &entries[..3 * t.palette_count])
+        if t.alpha_count > 0 {
+            position = write_chunk(output, position, TRNS, &alphas[..t.alpha_count])
+        }
+    }
+    return position
+}
+
+// ---------------------------------------------------------------------------
+// Stored blocks
+
+// Splits the raw image data into stored deflate blocks, each in its own IDAT
+// chunk, so the size is known in advance.
+struct StoredWriter {
+    position: usize
+    // The current IDAT chunk and its stored block's first data byte.
+    chunk: usize
+    block: usize
+    // Bytes left in the current block and in the whole image.
+    block_left: usize
+    raw_left: usize
+    first: bool
+    adler: checksum.Adler32
+
+    fn open(&mut self, output: &mut[u8]) {
+        self.chunk = self.position
+        binary.put_be32(output, self.chunk + 4, IDAT)
+        position := self.chunk + 8
+        if self.first {
+            // Deflate with a 32 KiB window and no dictionary, fastest level.
+            output[position] = 0x78
+            output[position + 1] = 0x01
+            position += 2
+            self.first = false
+        }
+        size := self.raw_left
+        if size > STORED_BLOCK {
+            size = STORED_BLOCK
+        }
+        output[position] = 0
+        if size == self.raw_left {
+            output[position] = 1
+        }
+        binary.put_le16(output, position + 1, size as u32)
+        binary.put_le16(output, position + 3, (size ^ 0xffff) as u32)
+        self.block = position + 5
+        self.position = position + 5
+        self.block_left = size
+    }
+    fn close(&mut self, output: &mut[u8]) {
+        self.adler.update(&output[self.block..self.position])
+        if self.raw_left == 0 {
+            binary.put_be32(output, self.position, self.adler.finish())
+            self.position += 4
+        }
+        length := self.position - self.chunk - 8
+        binary.put_be32(output, self.chunk, length as u32)
+        seal(output, self.chunk, length)
+        self.position += 4
+    }
+    pub fn write(&mut self, bytes: &[u8], output: &mut[u8]) -> void!pixels.Error {
+        i := 0usize
+        for i < bytes.len {
+            if self.raw_left == 0 {
+                // More bytes than the size computed up front.
+                return err(pixels.Error.Malformed)
+            }
+            if self.block_left == 0 {
+                self.open(output)
+            }
+            n := bytes.len - i
+            if n > self.block_left {
+                n = self.block_left
+            }
+            for k in 0usize..n {
+                output[self.position + k] = bytes[i + k]
+            }
+            self.position += n
+            self.block_left -= n
+            self.raw_left -= n
+            i += n
+            if self.block_left == 0 {
+                self.close(output)
+            }
+        }
+        return ok()
+    }
+}
+
+// The size of a stored PNG with `raw` bytes of image data and `extras`
+// bytes of other chunks: each stored block sits in its own IDAT chunk with
+// 12 bytes of framing and a 5-byte block header; zlib adds 6.
+fn stored_size(raw: usize, extras: usize) -> usize!pixels.Error {
+    blocks := raw / STORED_BLOCK
+    if raw % STORED_BLOCK != 0 {
+        blocks += 1
+    }
+    fixed := pixels.checked(raw, 1, START + END + 6)?
+    fixed = pixels.checked(fixed, 1, extras)?
+    return pixels.checked(blocks, 17, fixed)
+}
+
+// An upper bound for deflate output of `raw` bytes in one IDAT chunk: the
+// streaming compressor ends a block at most once per 8 KiB of input on
+// average, and no block is larger than its stored form plus 6 bytes; zlib
+// adds 6.
+fn deflate_size(raw: usize, extras: usize) -> usize!pixels.Error {
+    blocks := raw / 8192 + 2
+    data := pixels.checked(blocks, 6, 6 + START + 12 + END)?
+    data = pixels.checked(data, 1, extras)?
+    return pixels.checked(raw, 1, data)
+}
+
+// ---------------------------------------------------------------------------
+// Deflate
+
+struct DeflateWriter {
+    encoder: zlib.Encoder
+    written: usize
+    limit: usize
+
+    pub fn write(&mut self, bytes: &[u8], output: &mut[u8]) -> void!pixels.Error {
+        return compress(&mut self.encoder, bytes, &mut output[..self.limit], &mut self.written, false)
+    }
+}
+
+// Compress `input` into output[*written..]; with `finish`, end the stream.
+fn compress(encoder: &mut zlib.Encoder, input: &[u8], output: &mut[u8], written: &mut usize, finish: bool) -> void!pixels.Error {
+    used := 0usize
+    for {
+        progress := encoder.process(&input[used..], &mut output[*written..], finish)
+        used += progress.input_consumed
+        *written += progress.output_written
+        if progress.status == deflate.Status.Done {
+            return ok()
+        }
+        if progress.status == deflate.Status.NeedOutput {
+            return err(pixels.Error.BufferTooSmall)
+        }
+        if !finish && used == input.len {
+            return ok()
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Entry points
+
+// An upper bound on the encoded size of a width x height image from a
+// source in `layout`, without metadata (see metadata_size). Level 0 gives
+// the exact size of a truecolor file.
+pub fn max_encoded_size(width: u32, height: u32, layout: &pixels.Layout, options: &EncodeOptions) -> usize!pixels.Error {
+    check_options(width, height, options)?
+    t := truecolor(width, height, layout, options.interlace)
+    raw := raw_size(width, height, t.bits, options.interlace)?
+    extras := extras_size(&t, options, 0, 0)?
+    if options.palette && !t.wide {
+        // PLTE and tRNS at their largest.
+        extras += 12 + 768 + 12 + 256
+    }
+    if options.level == 0 {
+        return stored_size(raw, extras)
+    }
+    return deflate_size(raw, extras)
+}
+
+// Bytes of scratch encode() needs: none for level 0, else the deflate
+// encoder's buffer and workspace.
+pub fn encode_scratch_size(width: u32, height: u32, layout: &pixels.Layout, options: &EncodeOptions) -> usize!pixels.Error {
+    check_options(width, height, options)?
+    if options.level == 0 {
+        return ok(0)
+    }
+    buffer := storage.size(deflate.ENCODER_BUFFER_LEN, 1)?
+    words := storage.size(deflate.WORKSPACE_LEN, 4)?
+    return storage.add(buffer, words)
+}
+
+// Encode `source` (any layout) and return the byte count.
+pub fn encode(source: &pixels.View, options: &EncodeOptions, output: &mut[u8], scratch: &mut[u8]) -> usize!pixels.Error {
+    reader := sink.ViewSource.new(source)
+    nothing := [0u8; 1]
+    return encode_with_metadata_from(&reader, options, &nothing[..0], &nothing[..0], output, scratch)
+}
+
+pub fn encode_from<S: sink.Source>(source: &S, options: &EncodeOptions, output: &mut[u8], scratch: &mut[u8]) -> usize!pixels.Error {
+    nothing := [0u8; 1]
+    return encode_with_metadata_from(source, options, &nothing[..0], &nothing[..0], output, scratch)
+}
+
+// Encode with an eXIf chunk holding `exif` (a TIFF-structured payload,
+// "II*\0" or "MM\0*") and an iCCP chunk holding the ICC profile `icc`, each
+// skipped when empty. The output needs max_encoded_size() +
+// metadata_size(exif.len, icc.len) bytes at most.
+pub fn encode_with_metadata(source: &pixels.View, options: &EncodeOptions, exif: &[u8], icc: &[u8], output: &mut[u8], scratch: &mut[u8]) -> usize!pixels.Error {
+    reader := sink.ViewSource.new(source)
+    return encode_with_metadata_from(&reader, options, exif, icc, output, scratch)
+}
+
+pub fn encode_with_metadata_from<S: sink.Source>(source: &S, options: &EncodeOptions, exif: &[u8], icc: &[u8], output: &mut[u8], work: &mut[u8]) -> usize!pixels.Error {
+    if options.level == 0 {
+        return encode_stored(source, options, exif, icc, output)
+    }
+    check_options(source.width(), source.height(), options)?
+    let slice.SplitMut { left: buffer, right: rest } = storage.split(work, deflate.ENCODER_BUFFER_LEN)?
+    words := storage.u32s(rest)
+    if words.len < deflate.WORKSPACE_LEN {
+        return err(pixels.Error.BufferTooSmall)
+    }
+    return encode_with_buffers(source, options, exif, icc, output, buffer, &mut words[..deflate.WORKSPACE_LEN])
+}
+
+fn encode_stored<S: sink.Source>(source: &S, options: &EncodeOptions, exif: &[u8], icc: &[u8], output: &mut[u8]) -> usize!pixels.Error {
+    colors := [0u32; 256]
+    slots := [0u16; 1024]
+    t := prepare(source, options, &mut colors, &mut slots)?
+    raw := raw_size(t.width, t.height, t.bits, t.interlace)?
+    extras := extras_size(&t, options, exif.len, icc.len)?
+    total := stored_size(raw, extras)?
+    if output.len < total {
+        return err(pixels.Error.BufferTooSmall)
+    }
+    write_start(output, &t)
+    position := write_extras(output, START, &t, options, &colors, exif, icc)
+    writer := StoredWriter { position: position, chunk: 0, block: 0, block_left: 0, raw_left: raw, first: true, adler: checksum.Adler32.new() }
+    write_image(source, &t, options, &colors, &slots, &mut writer, output)?
+    if writer.raw_left != 0 {
+        return err(pixels.Error.Malformed)
+    }
+    return ok(close(output, writer.position))
+}
+
+// Encode with the deflate encoder at options.level (0 through 9; 0 writes
+// deflate's own stored blocks) using caller storage of at least
+// deflate.ENCODER_BUFFER_LEN bytes and deflate.WORKSPACE_LEN words. All
+// compressed data goes into one IDAT chunk.
+pub fn encode_with_buffers<S: sink.Source>(source: &S, options: &EncodeOptions, exif: &[u8], icc: &[u8], output: &mut[u8], buffer: &mut[u8], words: &mut[u32]) -> usize!pixels.Error {
+    check_options(source.width(), source.height(), options)?
+    if buffer.len < deflate.ENCODER_BUFFER_LEN || words.len < deflate.WORKSPACE_LEN {
+        return err(pixels.Error.BufferTooSmall)
+    }
+    colors := [0u32; 256]
+    slots := [0u16; 1024]
+    t := prepare(source, options, &mut colors, &mut slots)?
+    extras := extras_size(&t, options, exif.len, icc.len)?
+    if output.len < START + 12 + END + extras {
+        return err(pixels.Error.BufferTooSmall)
+    }
+    encoder := match zlib.Encoder.new(options.level as usize, buffer, words) {
+        ok(value) => value,
+        err(_) => {
+            return err(pixels.Error.BufferTooSmall)
+        }
+    }
+    write_start(output, &t)
+    chunk := write_extras(output, START, &t, options, &colors, exif, icc)
+    binary.put_be32(output, chunk + 4, IDAT)
+    start := chunk + 8
+    // Room for the chunk's CRC and IEND stays reserved.
+    writer := DeflateWriter { encoder: encoder, written: start, limit: output.len - 4 - END }
+    write_image(source, &t, options, &colors, &slots, &mut writer, output)?
+    nothing := [0u8; 1]
+    limit := writer.limit
+    compress(&mut writer.encoder, &nothing[..0], &mut output[..limit], &mut writer.written, true)?
+    length := writer.written - start
+    if length > CHUNK_LIMIT as usize {
+        return err(pixels.Error.TooLarge)
+    }
+    binary.put_be32(output, chunk, length as u32)
+    seal(output, chunk, length)
+    return ok(close(output, writer.written + 4))
+}

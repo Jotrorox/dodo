@@ -1,0 +1,1070 @@
+package jxl
+
+import "std/image/pixels"
+
+// Entropy decoding (18181-1 annex C): a set of distributions ("Code") is
+// read from the bitstream as an optional LZ77 configuration, a context map
+// assigning each context to a cluster (simple, or itself entropy coded with
+// optional move-to-front), and per cluster a hybrid-integer configuration
+// plus either a Brotli-style prefix code or an ANS distribution with its
+// alias table. A Stream then decodes integers with a context, managing the
+// single ANS state and the LZ77 window of the stream.
+//
+// All tables live in caller-carved scratch: a Code owns a cluster map, a
+// small per-cluster info array and a u32 pool for decoding tables. Reading
+// a context map that is itself entropy coded needs a nested Code (and one
+// more level for the nested map's own map), passed in as `n1` and `n2`.
+
+const MAX_CLUSTERS: usize = 256
+// Words of `info` per cluster: hybrid config, table offset, fast/max length.
+const INFO_STRIDE: usize = 4
+const ANS_STATE_FINAL: u32 = 0x130000
+const LZ77_WINDOW_MAX: usize = 1048576
+const FAST_BITS: u32 = 10
+
+static ZIGZAG_L1: [18]u8 = [1, 2, 3, 4, 0, 5, 17, 6, 16, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+// The fixed code of the code-length code lengths: symbol << 16 | length,
+// indexed by 4 bits.
+static L0_TABLE: [16]u32 = [0x00002, 0x40002, 0x30002, 0x20003, 0x00002, 0x40002, 0x30002, 0x10004, 0x00002, 0x40002, 0x30002, 0x20003, 0x00002, 0x40002, 0x30002, 0x50004]
+static REV5: [32]u32 = [0, 16, 8, 24, 4, 20, 12, 28, 2, 18, 10, 26, 6, 22, 14, 30, 1, 17, 9, 25, 5, 21, 13, 29, 3, 19, 11, 27, 7, 23, 15, 31]
+// LZ77 special distances for a nonzero distance multiplier: (dx + 7) << 4 | dy.
+static SPECIAL_DISTANCES: [120]u8 = [
+    0x71, 0x80, 0x81, 0x61, 0x72, 0x90, 0x82, 0x62, 0x91, 0x51, 0x92, 0x52,
+    0x73, 0xa0, 0x83, 0x63, 0xa1, 0x41, 0x93, 0x53, 0xa2, 0x42, 0x74, 0xb0,
+    0x84, 0x64, 0xb1, 0x31, 0xa3, 0x43, 0x94, 0x54, 0xb2, 0x32, 0x75, 0xa4,
+    0x44, 0xb3, 0x33, 0xc0, 0x85, 0x65, 0xc1, 0x21, 0x95, 0x55, 0xc2, 0x22,
+    0xb4, 0x34, 0xa5, 0x45, 0xc3, 0x23, 0x76, 0xd0, 0x86, 0x66, 0xd1, 0x11,
+    0x96, 0x56, 0xd2, 0x12, 0xb5, 0x35, 0xc4, 0x24, 0xa6, 0x46, 0xd3, 0x13,
+    0x77, 0xe0, 0x87, 0x67, 0xc5, 0x25, 0xe1, 0x01, 0xb6, 0x36, 0xd4, 0x14,
+    0x97, 0x57, 0xe2, 0x02, 0xa7, 0x47, 0xe3, 0x03, 0xc6, 0x26, 0xd5, 0x15,
+    0xf0, 0xb7, 0x37, 0xe4, 0x04, 0xf1, 0xf2, 0xd6, 0x16, 0xf3, 0xc7, 0x27,
+    0xe5, 0x05, 0xf4, 0xd7, 0x17, 0xe6, 0x06, 0xf5, 0xe7, 0x07, 0xf6, 0xf7
+]
+
+// Bytes a Code needs for `num_dist` contexts and `pool` table words.
+fn code_bytes(num_dist: usize, pool: usize) -> usize {
+    return (num_dist + 2 + 8) + MAX_CLUSTERS * INFO_STRIDE * 4 + 8 + pool * 4 + 8
+}
+
+struct Code {
+    map: &mut[u8]
+    info: &mut[u32]
+    pool: &mut[u32]
+    num_dist: u32
+    num_clusters: u32
+    lz77: bool
+    min_symbol: u32
+    min_length: u32
+    lz_config: u32
+    prefix: bool
+    log_alpha: u32
+    used: usize
+
+    fn new(map: &mut[u8], info: &mut[u32], pool: &mut[u32]) -> Code from(map, info, pool) {
+        return Code { map: map, info: info, pool: pool, num_dist: 0, num_clusters: 0, lz77: false, min_symbol: 0xffffffff, min_length: 0, lz_config: 0, prefix: false, log_alpha: 0, used: 0 }
+    }
+
+    fn reset(&mut self) {
+        self.num_dist = 0
+        self.num_clusters = 0
+        self.lz77 = false
+        self.min_symbol = 0xffffffff
+        self.min_length = 0
+        self.lz_config = 0
+        self.prefix = false
+        self.log_alpha = 0
+        self.used = 0
+    }
+
+    // The cluster of context `ctx`.
+    fn cluster(&self, ctx: u32) -> u32 {
+        return self.map[ctx as usize] as u32
+    }
+
+    // One token of cluster `c`.
+    fn symbol(&self, st: &mut Stream, r: &mut Reader, c: u32) -> u32 {
+        base := c as usize * INFO_STRIDE
+        offset := self.info[base + 1] as usize
+        if self.prefix {
+            lengths := self.info[base + 2]
+            fast := lengths & 255
+            max := (lengths >> 8) & 255
+            if max == 0 {
+                return self.pool[offset] >> 16
+            }
+            v := r.peek(max)
+            entry := self.pool[offset + (v & ((1u32 << fast) - 1)) as usize]
+            if (entry & 0x80000000) == 0 {
+                r.consume(entry & 15)
+                return entry >> 16
+            }
+            // Overflow: scan the entries for codes longer than `fast`.
+            rest := v >> fast
+            index := offset + (entry & 0xffff) as usize
+            limit := offset + (lengths >> 16) as usize
+            for index < limit {
+                e := self.pool[index]
+                length := e & 15
+                if ((e >> 4) & 0xfff) == (rest & ((1u32 << length) - 1)) {
+                    r.consume(fast + length)
+                    return e >> 16
+                }
+                index += 1
+            }
+            r.broken = true
+            return 0
+        }
+        state := st.state
+        index := state & 0xfff
+        shift := 12 - self.log_alpha
+        bucket := (index >> shift) as usize
+        pos := index & ((1u32 << shift) - 1)
+        w0 := self.pool[offset + bucket * 2]
+        w1 := self.pool[offset + bucket * 2 + 1]
+        cutoff := w0 >> 16
+        symbol := bucket as u32
+        extra := 0u32
+        if pos >= cutoff {
+            symbol = w1 >> 16
+            extra = w1 & 0xffff
+        }
+        frequency := self.pool[offset + symbol as usize * 2] & 0xffff
+        state = frequency * (state >> 12) + extra + pos
+        if state < 65536 {
+            state = (state << 16) | r.bits(16)
+        }
+        st.state = state
+        return symbol
+    }
+
+    // An integer from context `ctx` (DecodeHybridVarLenUint).
+    fn read(&self, st: &mut Stream, r: &mut Reader, ctx: u32, dist_mult: u32) -> u32 {
+        if st.num_to_copy > 0 {
+            st.num_to_copy -= 1
+            value := st.copied()
+            st.push(value)
+            return value
+        }
+        c := self.map[ctx as usize] as u32
+        return self.read_cluster(st, r, c, dist_mult)
+    }
+
+    // An integer from cluster `c`.
+    fn read_cluster(&self, st: &mut Stream, r: &mut Reader, c: u32, dist_mult: u32) -> u32 {
+        if st.num_to_copy > 0 {
+            st.num_to_copy -= 1
+            value := st.copied()
+            st.push(value)
+            return value
+        }
+        token := self.symbol(st, r, c)
+        if token >= self.min_symbol {
+            length := hybrid(r, token - self.min_symbol, self.lz_config) as u64 + self.min_length as u64
+            if length > 0xffffffff || length == 0 {
+                r.broken = true
+                return 0
+            }
+            dc := self.map[(self.num_dist - 1) as usize] as u32
+            dtoken := self.symbol(st, r, dc)
+            distance := hybrid(r, dtoken, self.info[dc as usize * INFO_STRIDE]) as u64
+            if dist_mult == 0 {
+                distance += 1
+            } else if distance >= 120 {
+                distance -= 119
+            } else {
+                special := SPECIAL_DISTANCES[distance as usize] as i64
+                d := ((special >> 4) - 7) + dist_mult as i64 * (special & 7)
+                if d < 1 {
+                    d = 1
+                }
+                distance = d as u64
+            }
+            if distance > LZ77_WINDOW_MAX as u64 {
+                distance = LZ77_WINDOW_MAX as u64
+            }
+            if distance > st.num_decoded as u64 {
+                distance = st.num_decoded as u64
+            }
+            if distance > st.mask as u64 + 1 {
+                // The window is smaller than the stream needs.
+                st.too_far = true
+                distance = st.mask as u64 + 1
+            }
+            st.copy_pos = st.num_decoded - distance as u32
+            st.num_to_copy = (length - 1) as u32
+            value := st.copied()
+            st.push(value)
+            return value
+        }
+        value := hybrid(r, token, self.info[c as usize * INFO_STRIDE])
+        if self.lz77 {
+            st.push(value)
+        }
+        return value
+    }
+}
+
+// The value of `token` under a hybrid integer configuration packed as
+// split_exponent | msb_in_token << 8 | lsb_in_token << 16.
+fn hybrid(r: &mut Reader, token: u32, config: u32) -> u32 {
+    split_exponent := config & 255
+    split := 1u32 << split_exponent
+    if token < split {
+        return token
+    }
+    msb := (config >> 8) & 255
+    lsb := (config >> 16) & 255
+    in_token := msb + lsb
+    n64 := (split_exponent - in_token) as u64 + ((token - split) >> in_token) as u64
+    if n64 > 32 {
+        r.broken = true
+        return 0
+    }
+    n := n64 as u32
+    low := token & ((1u32 << lsb) - 1)
+    high := (token >> lsb) & ((1u32 << msb) - 1)
+    high = high | (1u32 << msb)
+    rest := r.bits(n) as u64
+    result := ((((high as u64) << (n as u64)) | rest) << (lsb as u64)) | low as u64
+    if result > 0xffffffff {
+        r.broken = true
+        return 0
+    }
+    return result as u32
+}
+
+// The decoding state of one entropy-coded stream.
+struct Stream {
+    window: &mut[u32]
+    mask: u32
+    state: u32
+    num_to_copy: u32
+    copy_pos: u32
+    num_decoded: u32
+    // A distance exceeded the window.
+    too_far: bool
+
+    fn new(window: &mut[u32]) -> Stream from(window) {
+        size := 1usize
+        for size * 2 <= window.len && size < LZ77_WINDOW_MAX {
+            size *= 2
+        }
+        return Stream { window: window, mask: (size - 1) as u32, state: 0, num_to_copy: 0, copy_pos: 0, num_decoded: 0, too_far: false }
+    }
+
+    // Start decoding with `code`: reads the initial ANS state.
+    fn begin(&mut self, code: &Code, r: &mut Reader) {
+        self.num_to_copy = 0
+        self.copy_pos = 0
+        self.num_decoded = 0
+        self.too_far = false
+        self.state = 0
+        if !code.prefix {
+            low := r.bits(16)
+            self.state = low | (r.bits(16) << 16)
+        }
+    }
+
+    // Check the final ANS state.
+    fn finish(&self, code: &Code) -> void!pixels.Error {
+        if self.too_far {
+            return err(pixels.Error.TooLarge)
+        }
+        if !code.prefix && self.state != ANS_STATE_FINAL {
+            return err(pixels.Error.Malformed)
+        }
+        return ok()
+    }
+
+    fn copied(&mut self) -> u32 {
+        // A copy with distance 0 (only possible before any symbol was
+        // decoded) yields zeros, as in libjxl.
+        value := 0u32
+        if self.copy_pos != self.num_decoded {
+            value = self.window[(self.copy_pos & self.mask) as usize]
+        }
+        self.copy_pos = core.wrapping_add(self.copy_pos, 1)
+        return value
+    }
+
+    fn push(&mut self, value: u32) {
+        self.window[(self.num_decoded & self.mask) as usize] = value
+        self.num_decoded = core.wrapping_add(self.num_decoded, 1)
+    }
+}
+
+// Read a Code for `num_dist` contexts into `code`, using `n1` and `n2` for
+// nested context maps and `window` for any LZ77-coded context map.
+fn read_code(r: &mut Reader, num_dist: u32, code: &mut Code, n1: &mut Code, n2: &mut Code, window: &mut[u32]) -> void!pixels.Error {
+    code.reset()
+    read_lz77(r, code, true)?
+    dists := num_dist
+    if code.lz77 {
+        dists += 1
+    }
+    if dists as usize > code.map.len {
+        return err(pixels.Error.TooLarge)
+    }
+    code.num_dist = dists
+    code.num_clusters = read_cluster_map(r, dists, code.map, n1, n2, window)?
+    read_tables(r, code)?
+    if r.broken {
+        return err(pixels.Error.Malformed)
+    }
+    if r.overrun {
+        return err(pixels.Error.Truncated)
+    }
+    return ok()
+}
+
+// A context map of `num` entries into map[..num] (simple, or entropy
+// coded with the nested Codes n1, n2 and an optional move-to-front);
+// returns the number of clusters, which must be numbered without holes.
+fn read_cluster_map(r: &mut Reader, num: u32, map: &mut[u8], n1: &mut Code, n2: &mut Code, window: &mut[u32]) -> u32!pixels.Error {
+    if num as usize > map.len {
+        return err(pixels.Error.TooLarge)
+    }
+    if num == 1 {
+        map[0] = 0
+        return ok(1)
+    }
+    if r.bit() {
+        nbits := r.bits(2)
+        for i in 0usize..num as usize {
+            map[i] = r.bits(nbits) as u8
+        }
+    } else {
+        use_mtf := r.bit()
+        read_code_nested(r, num > 2, n1, n2)?
+        stream := Stream.new(window)
+        stream.begin(n1, r)
+        for i in 0usize..num as usize {
+            value := n1.read(&mut stream, r, 0, 0)
+            if value >= 256 {
+                return err(pixels.Error.Malformed)
+            }
+            map[i] = value as u8
+        }
+        stream.finish(n1)?
+        if use_mtf {
+            inverse_mtf(map, num as usize)
+        }
+    }
+    seen := [false; 256]
+    highest := 0usize
+    for i in 0usize..num as usize {
+        value := map[i] as usize
+        seen[value] = true
+        if value > highest {
+            highest = value
+        }
+    }
+    for i in 0usize..highest + 1 {
+        if !seen[i] {
+            return err(pixels.Error.Malformed)
+        }
+    }
+    return ok((highest + 1) as u32)
+}
+
+// A Code for one context (two with LZ77), as used for entropy-coded
+// context maps.
+fn read_code_nested(r: &mut Reader, allow_lz77: bool, code: &mut Code, sub: &mut Code) -> void!pixels.Error {
+    code.reset()
+    read_lz77(r, code, allow_lz77)?
+    dists := 1u32
+    if code.lz77 {
+        dists = 2
+    }
+    code.num_dist = dists
+    if dists == 1 {
+        code.map[0] = 0
+        code.num_clusters = 1
+    } else if r.bit() {
+        read_simple_map(r, code)
+    } else {
+        use_mtf := r.bit()
+        sub.reset()
+        read_lz77(r, sub, false)?
+        sub.num_dist = 1
+        sub.map[0] = 0
+        sub.num_clusters = 1
+        read_tables(r, sub)?
+        // A two-symbol stream never needs its LZ77 window.
+        empty := [0u32; 2]
+        stream := Stream.new(&mut empty)
+        stream.begin(sub, r)
+        for i in 0usize..2 {
+            value := sub.read(&mut stream, r, 0, 0)
+            if value >= 256 {
+                return err(pixels.Error.Malformed)
+            }
+            code.map[i] = value as u8
+        }
+        stream.finish(sub)?
+        if use_mtf {
+            inverse_mtf(code.map, 2)
+        }
+    }
+    count_clusters(code)?
+    read_tables(r, code)?
+    if r.broken {
+        return err(pixels.Error.Malformed)
+    }
+    return ok()
+}
+
+fn read_lz77(r: &mut Reader, code: &mut Code, allowed: bool) -> void!pixels.Error {
+    code.lz77 = r.bit()
+    if code.lz77 {
+        if !allowed {
+            return err(pixels.Error.Malformed)
+        }
+        code.min_symbol = r.u32c(dist(224, 0), dist(512, 0), dist(4096, 0), dist(8, 15))
+        code.min_length = r.u32c(dist(3, 0), dist(4, 0), dist(5, 2), dist(9, 8))
+        code.lz_config = read_config(r, 8)?
+    } else {
+        code.min_symbol = 0xffffffff
+    }
+    return ok()
+}
+
+fn read_simple_map(r: &mut Reader, code: &mut Code) {
+    nbits := r.bits(2)
+    for i in 0usize..code.num_dist as usize {
+        code.map[i] = r.bits(nbits) as u8
+    }
+}
+
+fn inverse_mtf(map: &mut[u8], count: usize) {
+    mtf := [0u8; 256]
+    for i in 0usize..256 {
+        mtf[i] = i as u8
+    }
+    for i in 0usize..count {
+        index := map[i] as usize
+        value := mtf[index]
+        map[i] = value
+        j := index
+        for j > 0 {
+            mtf[j] = mtf[j - 1]
+            j -= 1
+        }
+        mtf[0] = value
+    }
+}
+
+// Clusters must be numbered 0..n without holes.
+fn count_clusters(code: &mut Code) -> void!pixels.Error {
+    seen := [false; 256]
+    highest := 0usize
+    for i in 0usize..code.num_dist as usize {
+        value := code.map[i] as usize
+        seen[value] = true
+        if value > highest {
+            highest = value
+        }
+    }
+    for i in 0usize..highest + 1 {
+        if !seen[i] {
+            return err(pixels.Error.Malformed)
+        }
+    }
+    code.num_clusters = (highest + 1) as u32
+    return ok()
+}
+
+fn read_config(r: &mut Reader, log_alpha: u32) -> u32!pixels.Error {
+    split := r.bits(bits_for(log_alpha))
+    if split > log_alpha {
+        return err(pixels.Error.Malformed)
+    }
+    msb := 0u32
+    lsb := 0u32
+    if split != log_alpha {
+        msb = r.bits(bits_for(split))
+        if msb > split {
+            return err(pixels.Error.Malformed)
+        }
+        lsb = r.bits(bits_for(split - msb))
+        if msb + lsb > split {
+            return err(pixels.Error.Malformed)
+        }
+    }
+    return ok(split | (msb << 8) | (lsb << 16))
+}
+
+fn read_tables(r: &mut Reader, code: &mut Code) -> void!pixels.Error {
+    code.prefix = r.bit()
+    clusters := code.num_clusters as usize
+    if clusters * INFO_STRIDE > code.info.len {
+        return err(pixels.Error.TooLarge)
+    }
+    code.used = 0
+    if code.prefix {
+        code.log_alpha = 15
+        for c in 0usize..clusters {
+            code.info[c * INFO_STRIDE] = read_config(r, 15)?
+        }
+        for c in 0usize..clusters {
+            count := 1u32
+            if r.bit() {
+                n := r.bits(4)
+                count = 1 + (1u32 << n) + r.bits(n)
+            }
+            if count > 32768 {
+                return err(pixels.Error.Malformed)
+            }
+            // Kept in the table-offset slot until the tables are read.
+            code.info[c * INFO_STRIDE + 1] = count
+        }
+        for c in 0usize..clusters {
+            count := code.info[c * INFO_STRIDE + 1]
+            read_prefix_code(r, code, c, count)?
+        }
+    } else {
+        code.log_alpha = 5 + r.bits(2)
+        for c in 0usize..clusters {
+            code.info[c * INFO_STRIDE] = read_config(r, code.log_alpha)?
+        }
+        for c in 0usize..clusters {
+            read_ans_table(r, code, c)?
+        }
+    }
+    return ok()
+}
+
+// The ANS distribution of cluster c with its alias table, stored as two
+// words per entry: frequency | cutoff << 16 and offset | symbol << 16.
+fn read_ans_table(r: &mut Reader, code: &mut Code, c: usize) -> void!pixels.Error {
+    log_alpha := code.log_alpha
+    table_size := 1usize << (log_alpha as usize)
+    base := code.used
+    if base + table_size * 2 > code.pool.len {
+        return err(pixels.Error.TooLarge)
+    }
+    code.used = base + table_size * 2
+    code.info[c * INFO_STRIDE + 1] = base as u32
+    code.info[c * INFO_STRIDE + 2] = 0
+    code.info[c * INFO_STRIDE + 3] = 0
+    pool := &mut code.pool[base..base + table_size * 2]
+    // Frequencies go to the even words first.
+    for i in 0usize..table_size {
+        pool[i * 2] = 0
+        pool[i * 2 + 1] = 0
+    }
+    if r.bit() {
+        if r.bit() {
+            v0 := read_ans_u8(r) as usize
+            v1 := read_ans_u8(r) as usize
+            if v0 == v1 || v0 >= table_size || v1 >= table_size {
+                return err(pixels.Error.Malformed)
+            }
+            p := r.bits(12)
+            pool[v0 * 2] = p
+            pool[v1 * 2] = 4096 - p
+        } else {
+            v := read_ans_u8(r) as usize
+            if v >= table_size {
+                return err(pixels.Error.Malformed)
+            }
+            pool[v * 2] = 4096
+        }
+    } else if r.bit() {
+        alphabet := read_ans_u8(r) as usize + 1
+        if alphabet > table_size {
+            return err(pixels.Error.Malformed)
+        }
+        each := 4096 / alphabet as u32
+        leftover := 4096 % alphabet
+        for i in 0usize..alphabet {
+            pool[i * 2] = each
+            if i < leftover {
+                pool[i * 2] = each + 1
+            }
+        }
+    } else {
+        len := 0u32
+        for len < 3 && r.bit() {
+            len += 1
+        }
+        shift := r.bits(len) as i32 + (1i32 << (len as i32)) - 1
+        if shift > 13 {
+            return err(pixels.Error.Malformed)
+        }
+        alphabet := read_ans_u8(r) as usize + 3
+        if alphabet > table_size {
+            return err(pixels.Error.Malformed)
+        }
+        // First pass: log-count codes into the odd words (13 = repeat with
+        // the count in the high half), tracking the first maximal code.
+        omit_log := 0u32
+        omit_pos := 0xffffffffusize
+        i := 0usize
+        for i < alphabet {
+            logc := read_log_count(r)
+            if logc == 13 {
+                repeat := read_ans_u8(r) as usize + 4
+                if i + repeat > alphabet {
+                    return err(pixels.Error.Malformed)
+                }
+                for k in 0usize..repeat {
+                    pool[(i + k) * 2 + 1] = 0x100
+                }
+                i += repeat
+                continue
+            }
+            if omit_pos == 0xffffffffusize || logc > omit_log {
+                omit_log = logc
+                omit_pos = i
+            }
+            pool[i * 2 + 1] = logc
+            i += 1
+        }
+        if omit_pos == 0xffffffffusize {
+            return err(pixels.Error.Malformed)
+        }
+        if omit_pos + 1 < alphabet && pool[(omit_pos + 1) * 2 + 1] == 0x100 {
+            return err(pixels.Error.Malformed)
+        }
+        total := 0u32
+        previous := 0u32
+        for k in 0usize..alphabet {
+            code_value := pool[k * 2 + 1]
+            if code_value == 0x100 {
+                pool[k * 2] = previous
+                total += previous
+                if total > 4096 {
+                    return err(pixels.Error.Malformed)
+                }
+                continue
+            }
+            if code_value == 0 || k == omit_pos {
+                previous = 0
+                continue
+            }
+            frequency := 1u32
+            if code_value > 1 {
+                zeros := code_value as i32 - 1
+                bitcount := shift - ((12 - zeros) >> 1)
+                if bitcount < 0 {
+                    bitcount = 0
+                }
+                if bitcount > zeros {
+                    bitcount = zeros
+                }
+                frequency = (1u32 << (zeros as u32)) + (r.bits(bitcount as u32) << ((zeros - bitcount) as u32))
+            }
+            pool[k * 2] = frequency
+            previous = frequency
+            total += frequency
+            if total > 4096 {
+                return err(pixels.Error.Malformed)
+            }
+        }
+        pool[omit_pos * 2] = 4096 - total
+        for k in 0usize..alphabet {
+            pool[k * 2 + 1] = 0
+        }
+    }
+    build_alias(pool, log_alpha)
+    single := 0xffffffffusize
+    for k in 0usize..table_size {
+        if (pool[k * 2] & 0xffff) == 4096 {
+            single = k
+        }
+    }
+    if single != 0xffffffffusize {
+        code.info[c * INFO_STRIDE + 3] = single as u32 + 1
+    }
+    return ok()
+}
+
+fn read_ans_u8(r: &mut Reader) -> u32 {
+    if r.bit() {
+        n := r.bits(3)
+        return (1u32 << n) + r.bits(n)
+    }
+    return 0
+}
+
+fn read_log_count(r: &mut Reader) -> u32 {
+    v := r.bits(3)
+    if v == 0 {
+        return 10
+    }
+    if v == 1 {
+        if r.bit() {
+            return 4
+        }
+        if r.bit() {
+            return 0
+        }
+        if r.bit() {
+            return 11
+        }
+        if r.bit() {
+            return 13
+        }
+        return 12
+    }
+    if v == 2 {
+        return 7
+    }
+    if v == 3 {
+        if r.bit() {
+            return 1
+        }
+        return 3
+    }
+    if v == 4 {
+        return 6
+    }
+    if v == 5 {
+        return 8
+    }
+    if v == 6 {
+        return 9
+    }
+    if r.bit() {
+        return 2
+    }
+    return 5
+}
+
+// Build the alias table in place: even words get frequency | cutoff << 16,
+// odd words offset | symbol << 16. Underfull and overfull buckets are kept on
+// two stacks threaded through the odd words.
+fn build_alias(pool: &mut[u32], log_alpha: u32) {
+    table_size := 1usize << (log_alpha as usize)
+    log_bucket := 12 - log_alpha
+    bucket_size := 1u32 << log_bucket
+    single := 0xffffffffusize
+    nonzero := 0usize
+    for i in 0usize..table_size {
+        if (pool[i * 2] & 0xffff) != 0 {
+            nonzero += 1
+            single = i
+        }
+    }
+    if nonzero == 1 {
+        for j in 0usize..table_size {
+            pool[j * 2] = pool[j * 2] & 0xffff
+            pool[j * 2 + 1] = ((single as u32) << 16) | ((j as u32) << log_bucket)
+        }
+        return
+    }
+    // cutoff[i] lives in a separate scratch array while the stacks use the
+    // odd words as `next` links.
+    cutoff := [0u32; 256]
+    empty := 0xffffu32
+    under := empty
+    over := empty
+    for i in 0usize..table_size {
+        d := pool[i * 2] & 0xffff
+        cutoff[i] = d
+        if d > bucket_size {
+            pool[i * 2 + 1] = over
+            over = i as u32
+        } else if d < bucket_size {
+            pool[i * 2 + 1] = under
+            under = i as u32
+        } else {
+            pool[i * 2 + 1] = (i as u32) << 16
+        }
+    }
+    for over != empty {
+        if under == empty {
+            break
+        }
+        o := over as usize
+        u := under as usize
+        by := bucket_size - cutoff[u]
+        next_under := pool[u * 2 + 1]
+        cutoff[o] -= by
+        pool[u * 2 + 1] = ((o as u32) << 16) | ((cutoff[o] - cutoff[u]) & 0xffff)
+        under = next_under
+        if cutoff[o] < bucket_size {
+            next_over := pool[o * 2 + 1]
+            pool[o * 2 + 1] = under
+            under = o as u32
+            over = next_over
+        } else if cutoff[o] == bucket_size {
+            next_over := pool[o * 2 + 1]
+            pool[o * 2 + 1] = (o as u32) << 16
+            over = next_over
+        }
+    }
+    for i in 0usize..table_size {
+        pool[i * 2] = (pool[i * 2] & 0xffff) | (cutoff[i] << 16)
+    }
+}
+
+// A Brotli prefix code (RFC 7932 section 3) for an alphabet of `count`
+// symbols. The table has 1 << fast entries indexed by the next `fast` bits:
+// symbol << 16 | length, or 0x80000000 | index of the first overflow entry
+// (symbol << 16 | remaining code << 4 | remaining length) for longer codes.
+fn read_prefix_code(r: &mut Reader, code: &mut Code, c: usize, count: u32) -> void!pixels.Error {
+    base := code.used
+    info := c * INFO_STRIDE
+    code.info[info + 3] = 0
+    if count == 1 {
+        if base + 1 > code.pool.len {
+            return err(pixels.Error.TooLarge)
+        }
+        code.pool[base] = 0
+        code.used = base + 1
+        code.info[info + 1] = base as u32
+        code.info[info + 2] = 0
+        code.info[info + 3] = 1
+        return ok()
+    }
+    hskip := r.bits(2)
+    if hskip == 1 {
+        return read_simple_prefix(r, code, c, count)
+    }
+    // Layer 1: code lengths of the 18 code-length symbols.
+    l1 := [0u32; 18]
+    l1_counts := [0u32; 6]
+    total := 0u32
+    i := hskip as usize
+    nonzero := 0u32
+    for i < 18 && total < 32 {
+        v := r.peek(4)
+        entry := L0_TABLE[v as usize]
+        r.consume(entry & 15)
+        length := entry >> 16
+        l1[ZIGZAG_L1[i] as usize] = length
+        l1_counts[length as usize] += 1
+        if length != 0 {
+            total += 32u32 >> length
+            nonzero += 1
+        }
+        i += 1
+    }
+    if nonzero == 0 || (total != 32 && nonzero != 1) {
+        return err(pixels.Error.Malformed)
+    }
+    l1_table := [0u32; 32]
+    if nonzero == 1 {
+        only := 0u32
+        for k in 0usize..18 {
+            if l1[k] != 0 {
+                only = k as u32
+            }
+        }
+        for k in 0usize..32 {
+            l1_table[k] = only << 16
+        }
+    } else {
+        starts := [0u32; 6]
+        for k in 2usize..6 {
+            starts[k] = starts[k - 1] + (l1_counts[k - 1] << (5 - (k - 1) as u32))
+        }
+        for k in 0usize..18 {
+            n := l1[k]
+            if n == 0 {
+                continue
+            }
+            slot := REV5[starts[n as usize] as usize]
+            for slot < 32 {
+                l1_table[slot as usize] = ((k as u32) << 16) | n
+                slot += 1u32 << n
+            }
+            starts[n as usize] += 32u32 >> n
+        }
+    }
+    // Layer 2: the symbol code lengths, stored temporarily past the table.
+    need := (1usize << (FAST_BITS as usize)) + count as usize * 2
+    if base + need > code.pool.len {
+        return err(pixels.Error.TooLarge)
+    }
+    lengths_at := base + (1usize << (FAST_BITS as usize)) + count as usize
+    for k in 0usize..count as usize {
+        code.pool[lengths_at + k] = 0
+    }
+    counts := [0u32; 16]
+    previous := 8u32
+    repeat := 0i64
+    total2 := 0u64
+    k := 0usize
+    for k < count as usize && total2 < 32768 {
+        v := r.peek(5)
+        entry := l1_table[v as usize]
+        r.consume(entry & 15)
+        symbol := entry >> 16
+        if symbol < 16 {
+            code.pool[lengths_at + k] = symbol
+            k += 1
+            counts[symbol as usize] += 1
+            if symbol != 0 {
+                total2 += 32768u64 >> (symbol as u64)
+                previous = symbol
+            }
+            repeat = 0
+        } else if symbol == 16 {
+            if repeat < 0 {
+                repeat = 0
+            }
+            next := 3i64
+            if repeat > 0 {
+                next = 4 * repeat - 5
+            }
+            next += r.bits(2) as i64
+            add := next - repeat
+            if k as i64 + add > count as i64 {
+                return err(pixels.Error.Malformed)
+            }
+            total2 += ((32768 * add) as u64) >> (previous as u64)
+            counts[previous as usize] += add as u32
+            for j in 0i64..add {
+                code.pool[lengths_at + k] = previous
+                k += 1
+            }
+            repeat = next
+        } else {
+            if repeat > 0 {
+                repeat = 0
+            }
+            next := -3i64
+            if repeat < 0 {
+                next = 8 * repeat + 13
+            }
+            next -= r.bits(3) as i64
+            add := repeat - next
+            if k as i64 + add > count as i64 {
+                return err(pixels.Error.Malformed)
+            }
+            k += add as usize
+            repeat = next
+        }
+        if r.overrun {
+            return err(pixels.Error.Truncated)
+        }
+    }
+    if total2 != 32768 {
+        return err(pixels.Error.Malformed)
+    }
+    return build_prefix_table(code, c, count, base, lengths_at)
+}
+
+// The decoding table of cluster c from the code lengths at
+// pool[lengths_at..lengths_at + count], built at pool[base..].
+fn build_prefix_table(code: &mut Code, c: usize, count: u32, base: usize, lengths_at: usize) -> void!pixels.Error {
+    info := c * INFO_STRIDE
+    counts := [0u32; 16]
+    total2 := 0u64
+    for s in 0usize..count as usize {
+        n := code.pool[lengths_at + s]
+        counts[n as usize] += 1
+        if n != 0 {
+            total2 += 32768u64 >> (n as u64)
+        }
+    }
+    if total2 != 32768 {
+        return err(pixels.Error.Malformed)
+    }
+    max_len := 1u32
+    for n in 1u32..16 {
+        if counts[n as usize] != 0 {
+            max_len = n
+        }
+    }
+    fast := max_len
+    if fast > FAST_BITS {
+        fast = FAST_BITS
+    }
+    starts := [0u32; 16]
+    for n in 2usize..16 {
+        starts[n] = starts[n - 1] + (counts[n - 1] << (15 - (n - 1) as u32))
+    }
+    // Overflow entries, grouped by length, follow the fast table.
+    overflow := [0u32; 16]
+    overflow_count := 0u32
+    if max_len > fast {
+        overflow[fast as usize + 1] = 1u32 << fast
+        for n in (fast as usize + 2)..16 {
+            overflow[n] = overflow[n - 1] + counts[n - 1]
+        }
+        for n in (fast as usize + 1)..16 {
+            overflow_count += counts[n]
+        }
+    }
+    table_len := (1usize << (fast as usize)) + overflow_count as usize
+    for t in 0usize..(1usize << (fast as usize)) {
+        code.pool[base + t] = 0
+    }
+    for s in 0usize..count as usize {
+        n := code.pool[lengths_at + s]
+        if n == 0 {
+            continue
+        }
+        start := starts[n as usize]
+        slot := (REV5[(start & 31) as usize] << 10) | (REV5[((start >> 5) & 31) as usize] << 5) | REV5[(start >> 10) as usize]
+        if n <= fast {
+            for slot < (1u32 << fast) {
+                code.pool[base + slot as usize] = ((s as u32) << 16) | n
+                slot += 1u32 << n
+            }
+        } else {
+            if (slot >> fast) == 0 {
+                code.pool[base + slot as usize] = 0x80000000 | overflow[n as usize]
+            }
+            code.pool[base + overflow[n as usize] as usize] = ((s as u32) << 16) | ((slot >> fast) << 4) | (n - fast)
+            overflow[n as usize] += 1
+        }
+        starts[n as usize] += 32768u32 >> n
+    }
+    code.used = base + table_len
+    code.info[info + 1] = base as u32
+    code.info[info + 2] = fast | (max_len << 8) | ((table_len as u32) << 16)
+    return ok()
+}
+
+fn read_simple_prefix(r: &mut Reader, code: &mut Code, c: usize, count: u32) -> void!pixels.Error {
+    nsym := r.bits(2) + 1
+    symbols := [0u32; 4]
+    width := bits_for(count - 1)
+    for i in 0usize..nsym as usize {
+        symbols[i] = r.bits(width)
+        if symbols[i] >= count {
+            return err(pixels.Error.Malformed)
+        }
+    }
+    base := code.used
+    info := c * INFO_STRIDE
+    code.info[info + 3] = 0
+    if nsym == 1 {
+        if base + 1 > code.pool.len {
+            return err(pixels.Error.TooLarge)
+        }
+        code.pool[base] = symbols[0] << 16
+        code.used = base + 1
+        code.info[info + 1] = base as u32
+        code.info[info + 2] = 0
+        code.info[info + 3] = symbols[0] + 1
+        return ok()
+    }
+    lengths := [0u32; 4]
+    if nsym == 2 {
+        lengths = [1u32, 1, 0, 0]
+    } else if nsym == 3 {
+        lengths = [1u32, 2, 2, 0]
+    } else if r.bit() {
+        lengths = [1u32, 2, 3, 3]
+    } else {
+        lengths = [2u32, 2, 2, 2]
+    }
+    need := (1usize << (FAST_BITS as usize)) + count as usize * 2
+    if base + need > code.pool.len {
+        return err(pixels.Error.TooLarge)
+    }
+    lengths_at := base + (1usize << (FAST_BITS as usize)) + count as usize
+    for k in 0usize..count as usize {
+        code.pool[lengths_at + k] = 0
+    }
+    for i in 0usize..nsym as usize {
+        code.pool[lengths_at + symbols[i] as usize] = lengths[i]
+    }
+    return build_prefix_table(code, c, count, base, lengths_at)
+}

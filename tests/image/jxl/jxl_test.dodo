@@ -1,0 +1,531 @@
+package jxl_test
+
+import "std/fs"
+import "std/graphics"
+import "std/graphics/image"
+import "std/image/color"
+import "std/image/jxl"
+import "std/image/meta"
+import "std/image/pixels"
+import "std/image/shared/isobmff"
+import "std/image/sink"
+import "std/platform"
+import "std/platform/error"
+import "std/text"
+
+// JPEG XL decoder tests against the fixtures in this directory, written by
+// tests/image/jxl/generate.py (cjxl encodes, djxl decodes for references):
+// lossless cases must reproduce djxl's samples exactly (compared by hash),
+// lossy, composited and VarDCT cases must match djxl's 8-bit decode within
+// two levels (one is observed).
+// Then animation timing, metadata boxes, the ICC profile, scratch sizing and
+// robustness against truncated and corrupted files.
+//
+// Run from the repository root: dodo test tests/image/jxl
+
+const FILE_LIMIT: usize = 65536
+const PIXEL_LIMIT: usize = 1048576
+const SCRATCH_LIMIT: usize = 67108864
+
+static mut SCRATCH: [SCRATCH_LIMIT]u8 = [0u8; SCRATCH_LIMIT]
+static mut PIXELS: [PIXEL_LIMIT]u8 = [0u8; PIXEL_LIMIT]
+static mut REFERENCE: [PIXEL_LIMIT]u8 = [0u8; PIXEL_LIMIT]
+
+fn read_fixture(name: &str, extension: &str, output: &mut[u8]) -> usize {
+    path_storage := [0u8; 256]
+    builder := text.Builder.new(&mut path_storage)
+    directory := text.Text.from_str("tests/image/jxl/")
+    builder.append(&directory)!
+    base := text.Text.from_str(name)
+    builder.append(&base)!
+    suffix := text.Text.from_str(extension)
+    builder.append(&suffix)!
+    built := builder.as_text()
+    workspace := platform.workspace()
+    match fs.read_file(built.as_str(), output, &mut workspace) {
+        ok(report) => {
+            assert(report.eof, "fixture larger than the test's buffer")
+            return report.read
+        }
+        err(reason) => {
+            assert(reason.cause.kind != error.Kind.NotFound, "fixture missing: run from the repository root, or run tests/image/jxl/generate.py")
+            assert(false, "fixture unreadable")
+            return 0
+        }
+    }
+}
+
+fn fnv(data: &[u8]) -> u64 {
+    h := 0xcbf29ce484222325u64
+    for i in 0usize..data.len {
+        h = core.wrapping_mul(h ^ data[i] as u64, 0x100000001b3u64)
+    }
+    return h
+}
+
+// Decode displayed frame `index` of `data` into PIXELS in `layout`;
+// returns the byte count.
+fn decode_into(data: &[u8], index: u32, layout: &pixels.Layout) -> usize!pixels.Error {
+    header := jxl.info(data)?
+    need := jxl.scratch_size(data)?
+    assert(need <= SCRATCH_LIMIT, "scratch limit")
+    size := pixels.bytes_needed(header.width, header.height, layout)?
+    assert(size <= PIXEL_LIMIT, "pixel limit")
+    unsafe {
+        target := pixels.ViewMut.new(&mut PIXELS[..size], header.width, header.height, layout.clone())?
+        view_sink := sink.ViewSink.new(&mut target)
+        buffer := &mut SCRATCH[..need]
+        jxl.decode_frame(data, index, &mut view_sink, buffer)?
+    }
+    return ok(size)
+}
+
+fn shape(k: usize, field: usize) -> u32 {
+    return CASE_SHAPES[k * 6 + field]
+}
+
+fn check_case(k: usize) {
+    name := CASE_FILES[k]
+    file := [0u8; FILE_LIMIT]
+    length := read_fixture(name, ".jxl", &mut file)
+    data := &file[..length]
+    assert(jxl.matches(data), name)
+    header := jxl.info(data)!
+    assert(header.format == pixels.Format.Jxl, name)
+    assert_eq(header.width, shape(k, 0), name)
+    assert_eq(header.height, shape(k, 1), name)
+    assert_eq(header.native.channel_count() as u32, shape(k, 2), name)
+    assert_eq(header.native.sample_code(), shape(k, 3), name)
+    index := shape(k, 5)
+    if shape(k, 4) == 0 {
+        size := decode_into(data, index, &header.native)!
+        assert_eq(pixels_hash(size), CASE_HASHES[k], name)
+        return
+    }
+    // Compare with djxl's 8-bit decode: a PNG, or (kind 2) a lossless JPEG
+    // XL file decoded first (the lossless cases check that path exactly).
+    reference := [0u8; FILE_LIMIT]
+    rgba := pixels.Layout.rgba8()
+    if shape(k, 4) == 2 {
+        ref_length := read_fixture(CASE_REFS[k], ".jxl", &mut reference)
+        ref_size := decode_into(&reference[..ref_length], 0, &rgba)!
+        keep_reference(ref_size)
+        size := decode_into(data, index, &rgba)!
+        assert_eq(size, ref_size, name)
+        assert(compare_reference(size) <= 2, name)
+        return
+    }
+    ref_length := read_fixture(CASE_REFS[k], ".png", &mut reference)
+    size := decode_into(data, index, &rgba)!
+    worst := compare_png(&reference[..ref_length], size, header.width, header.height)
+    assert(worst <= 2, name)
+}
+
+// Copy the decoded reference samples from PIXELS to REFERENCE.
+fn keep_reference(size: usize) {
+    unsafe {
+        for i in 0usize..size {
+            REFERENCE[i] = PIXELS[i]
+        }
+    }
+}
+
+// The largest sample difference between PIXELS and REFERENCE.
+fn compare_reference(size: usize) -> u32 {
+    worst := 0u32
+    unsafe {
+        for i in 0usize..size {
+            a := PIXELS[i] as u32
+            b := REFERENCE[i] as u32
+            d := 0u32
+            if a > b {
+                d = a - b
+            } else {
+                d = b - a
+            }
+            if d > worst {
+                worst = d
+            }
+        }
+    }
+    return worst
+}
+
+// Decode into a NullSink with `need` bytes of scratch; returns the rects.
+fn null_decode(data: &[u8], need: usize) -> u64!pixels.Error {
+    null := sink.NullSink.new()
+    unsafe {
+        buffer := &mut SCRATCH[..need]
+        jxl.decode(data, &mut null, buffer)?
+    }
+    return ok(null.rects)
+}
+
+fn icc_into(data: &[u8], profile: &mut[u8]) -> usize!pixels.Error {
+    need := jxl.scratch_size(data)?
+    unsafe {
+        buffer := &mut SCRATCH[..need]
+        return jxl.icc(data, profile, buffer)
+    }
+}
+
+fn pixels_hash(size: usize) -> u64 {
+    unsafe {
+        return fnv(&PIXELS[..size])
+    }
+}
+
+// The largest sample difference between PIXELS (RGBA8) and a PNG.
+fn compare_png(png: &[u8], size: usize, width: u32, height: u32) -> u32 {
+    worst := 0u32
+    unsafe {
+        expected := image.decode(png, &mut REFERENCE, graphics.PixelFormat.Rgba8888)!
+        assert_eq(expected.width(), width)
+        assert_eq(expected.height(), height)
+        want := expected.pixels()
+        for i in 0usize..size {
+            a := PIXELS[i] as u32
+            b := want[i] as u32
+            d := 0u32
+            if a > b {
+                d = a - b
+            } else {
+                d = b - a
+            }
+            if d > worst {
+                worst = d
+            }
+        }
+    }
+    return worst
+}
+
+@test
+fn lossless_fixtures() {
+    for k in 0usize..CASE_COUNT {
+        if shape(k, 4) == 0 {
+            check_case(k)
+        }
+    }
+}
+
+@test
+fn lossy_and_composited_fixtures() {
+    for k in 0usize..CASE_COUNT {
+        if shape(k, 4) == 1 {
+            check_case(k)
+        }
+    }
+}
+
+// VarDCT, LF frames, JPEG recompression, noise and splines against djxl.
+@test
+fn vardct_fixtures() {
+    for k in 0usize..CASE_COUNT {
+        if shape(k, 4) == 2 {
+            check_case(k)
+        }
+    }
+}
+
+@test
+fn scratch_size_is_exact_and_checked() {
+    names := ["rgb_e7", "squeeze_big", "anim_blend", "lossy_d1", "patches_text"]
+    for n in 0usize..names.len {
+        file := [0u8; FILE_LIMIT]
+        length := read_fixture(names[n], ".jxl", &mut file)
+        data := &file[..length]
+        header := jxl.info(data)!
+        need := jxl.scratch_size(data)!
+        rects := null_decode(data, need)!
+        assert(rects > 0, names[n])
+        match null_decode(data, need - 1) {
+            ok(_) => {
+                assert(false, names[n])
+            }
+            err(e) => {
+                assert(e == pixels.Error.BufferTooSmall, names[n])
+            }
+        }
+    }
+}
+
+@test
+fn animation_timing() {
+    file := [0u8; FILE_LIMIT]
+    length := read_fixture("anim", ".jxl", &mut file)
+    data := &file[..length]
+    header := jxl.info(data)!
+    assert(header.animated)
+    assert_eq(header.frames, 3u32)
+    assert_eq(header.loops, 0u32)
+    expected := [100u32, 200, 300]
+    for i in 0u32..3 {
+        frame := jxl.frame_info(data, i)!
+        assert_eq(frame.milliseconds(), expected[i as usize])
+    }
+    match jxl.frame_info(data, 3) {
+        ok(_) => {
+            assert(false, "frame 3 does not exist")
+        }
+        err(_) => {}
+    }
+    still := [0u8; FILE_LIMIT]
+    still_length := read_fixture("rgb_e7", ".jxl", &mut still)
+    still_header := jxl.info(&still[..still_length])!
+    assert(!still_header.animated)
+    assert_eq(still_header.frames, 1u32)
+    still_frame := jxl.frame_info(&still[..still_length], 0)!
+    assert_eq(still_frame.denominator, 1u32)
+}
+
+@test
+fn metadata_boxes() {
+    file := [0u8; FILE_LIMIT]
+    length := read_fixture("meta_raw", ".jxl", &mut file)
+    data := &file[..length]
+    m := jxl.metadata(data)!
+    assert(m.exif.present())
+    assert_eq(m.exif.encoding, meta.ENCODING_RAW)
+    exif := m.exif.bytes(data)!
+    assert(exif[0] == b'M' && exif[1] == b'M' && exif[2] == 0 && exif[3] == 42)
+    assert_eq(meta.exif_orientation(exif)!, 1u32)
+    assert(m.xmp.present())
+    xmp := m.xmp.bytes(data)!
+    assert(xmp[0] == b'<' && xmp[1] == b'x' && xmp[2] == b':')
+    assert(!m.icc.present())
+    compressed := [0u8; FILE_LIMIT]
+    compressed_length := read_fixture("meta_brob", ".jxl", &mut compressed)
+    cm := jxl.metadata(&compressed[..compressed_length])!
+    assert_eq(cm.exif.encoding, meta.ENCODING_BROTLI)
+    assert_eq(cm.xmp.encoding, meta.ENCODING_BROTLI)
+    bare := [0u8; FILE_LIMIT]
+    bare_length := read_fixture("rgb_e1", ".jxl", &mut bare)
+    bm := jxl.metadata(&bare[..bare_length])!
+    assert(!bm.exif.present() && !bm.xmp.present())
+}
+
+@test
+fn icc_profile() {
+    file := [0u8; FILE_LIMIT]
+    length := read_fixture("icc_lossless", ".jxl", &mut file)
+    data := &file[..length]
+    header := jxl.info(data)!
+    assert_eq(header.color.icc_encoding, color.ICC_JXL)
+    assert(header.color.has_icc())
+    m := jxl.metadata(data)!
+    assert_eq(m.icc.encoding, meta.ENCODING_JXL)
+    expected := [0u8; 4096]
+    expected_length := read_fixture("profile", ".icc", &mut expected)
+    profile := [0u8; 4096]
+    decoded := icc_into(data, &mut profile)!
+    assert_eq(decoded, expected_length)
+    for i in 0usize..expected_length {
+        assert_eq(profile[i], expected[i])
+    }
+    // XYB with an ICC profile is rendered to sRGB.
+    lossy := [0u8; FILE_LIMIT]
+    lossy_length := read_fixture("icc_lossy", ".jxl", &mut lossy)
+    lossy_header := jxl.info(&lossy[..lossy_length])!
+    assert(lossy_header.lossy)
+    assert(lossy_header.color.is_srgb())
+    // Files without a profile.
+    plain := [0u8; FILE_LIMIT]
+    plain_length := read_fixture("rgb_e7", ".jxl", &mut plain)
+    plain_header := jxl.info(&plain[..plain_length])!
+    assert(plain_header.color.is_srgb())
+    assert(plain_header.color.tagged)
+    match icc_into(&plain[..plain_length], &mut profile) {
+        ok(_) => {
+            assert(false, "no profile")
+        }
+        err(e) => {
+            assert(e == pixels.Error.Malformed)
+        }
+    }
+}
+
+@test
+fn signatures_and_headers() {
+    file := [0u8; FILE_LIMIT]
+    length := read_fixture("container_rgb", ".jxl", &mut file)
+    assert(jxl.matches(&file[..length]))
+    header := jxl.info(&file[..length])!
+    assert_eq(header.width, 61u32)
+    assert(!header.lossy)
+    assert(color.exif_value(&header.orientation) == 1)
+    png := [0x89u8, b'P', b'N', b'G', 13, 10, 26, 10]
+    assert(!jxl.matches(&png))
+    match jxl.info(&png) {
+        ok(_) => {
+            assert(false, "not a JPEG XL file")
+        }
+        err(e) => {
+            assert(e == pixels.Error.Malformed)
+        }
+    }
+    empty := [0u8; 0]
+    match jxl.info(&empty) {
+        ok(_) => {
+            assert(false, "empty")
+        }
+        err(e) => {
+            assert(e == pixels.Error.Truncated)
+        }
+    }
+    lossy := [0u8; FILE_LIMIT]
+    lossy_length := read_fixture("lossy_d1", ".jxl", &mut lossy)
+    lossy_header := jxl.info(&lossy[..lossy_length])!
+    assert(lossy_header.lossy)
+    sixteen := [0u8; FILE_LIMIT]
+    sixteen_length := read_fixture("rgb16_e7", ".jxl", &mut sixteen)
+    sixteen_header := jxl.info(&sixteen[..sixteen_length])!
+    assert_eq(sixteen_header.bit_depth, 16u32)
+    alpha := [0u8; FILE_LIMIT]
+    alpha_length := read_fixture("rgba_e7", ".jxl", &mut alpha)
+    alpha_header := jxl.info(&alpha[..alpha_length])!
+    assert(alpha_header.has_alpha())
+}
+
+@test
+fn isobmff_boxes() {
+    file := [0u8; FILE_LIMIT]
+    length := read_fixture("meta_raw", ".jxl", &mut file)
+    data := &file[..length]
+    boxes := isobmff.Boxes.new(data)
+    kinds := [0u32; 16]
+    count := 0usize
+    for {
+        match boxes.next() {
+            ok(some(b)) => {
+                assert(b.end() <= length)
+                kinds[count] = b.kind
+                count += 1
+            }
+            ok(none) => {
+                break
+            }
+            err(_) => {
+                assert(false, "valid container")
+            }
+        }
+    }
+    assert_eq(count, 6usize)
+    assert_eq(kinds[0], isobmff.fourcc(b'J', b'X', b'L', b' '))
+    assert_eq(kinds[1], isobmff.fourcc(b'f', b't', b'y', b'p'))
+    assert_eq(kinds[2], isobmff.fourcc(b'j', b'x', b'l', b'p'))
+    assert_eq(kinds[3], isobmff.fourcc(b'E', b'x', b'i', b'f'))
+    assert_eq(kinds[4], isobmff.fourcc(b'x', b'm', b'l', b' '))
+    assert_eq(kinds[5], isobmff.fourcc(b'j', b'x', b'l', b'p'))
+    // A box running past the data.
+    truncated := isobmff.Boxes.new(&file[..40])
+    truncated.next()!
+    truncated.next()!
+    match truncated.next() {
+        ok(_) => {
+            assert(false, "truncated box")
+        }
+        err(e) => {
+            assert(e == pixels.Error.Truncated)
+        }
+    }
+    // Children of a payload range, and an out-of-range one.
+    inner := isobmff.Boxes.within(data, 12, 20)
+    first := inner.next()!
+    match first {
+        some(b) => {
+            assert_eq(b.kind, isobmff.fourcc(b'f', b't', b'y', b'p'))
+        }
+        none => {
+            assert(false, "ftyp")
+        }
+    }
+    bad := isobmff.Boxes.within(data, length, 8)
+    match bad.next() {
+        ok(_) => {
+            assert(false, "range outside the data")
+        }
+        err(_) => {}
+    }
+}
+
+// Every prefix and a set of bit flips of `name` must decode or fail with an
+// error, never trap or hang.
+fn mangle(name: &str) {
+    file := [0u8; FILE_LIMIT]
+    length := read_fixture(name, ".jxl", &mut file)
+    work := [0u8; FILE_LIMIT]
+    steps := 40usize
+    for s in 0usize..steps {
+        cut := length * s / steps
+        for i in 0usize..cut {
+            work[i] = file[i]
+        }
+        attempt(&work[..cut])
+    }
+    for s in 0usize..steps {
+        for i in 0usize..length {
+            work[i] = file[i]
+        }
+        position := (length * 8 * (2 * s + 1)) / (2 * steps)
+        work[position / 8] = work[position / 8] ^ (1u8 << ((position % 8) as u8))
+        attempt(&work[..length])
+    }
+}
+
+fn attempt(data: &[u8]) {
+    match jxl.scratch_size(data) {
+        ok(need) => {
+            if need > SCRATCH_LIMIT {
+                return
+            }
+            null := sink.NullSink.new()
+            unsafe {
+                buffer := &mut SCRATCH[..need]
+                match jxl.decode(data, &mut null, buffer) {
+                    ok() => {}
+                    err(_) => {}
+                }
+            }
+        }
+        err(_) => {}
+    }
+}
+
+@test
+fn robustness_lossless() {
+    mangle("rgb_e7")
+    mangle("rgb_e1")
+}
+
+@test
+fn robustness_transforms() {
+    mangle("squeeze_rgb")
+    mangle("palette_delta")
+}
+
+@test
+fn robustness_float_pipeline() {
+    mangle("anim_blend")
+    mangle("lossy_d1")
+}
+
+@test
+fn robustness_vardct() {
+    mangle("vd_d1")
+    mangle("vd_progressive_dc1")
+    mangle("vd_progressive")
+}
+
+@test
+fn robustness_jpeg_noise_splines() {
+    mangle("jpeg420")
+    mangle("vd_noise")
+    mangle("splines")
+}
+
+@test
+fn robustness_container() {
+    mangle("meta_brob")
+    mangle("icc_lossless")
+}

@@ -1,0 +1,1087 @@
+package jxl
+
+import "core/ptr"
+import "std/image/convert"
+import "std/image/pixels"
+
+// VarDCT frame decoding (18181-1 sections C.6 to C.9 and I): LfGlobal
+// (quantizer, HF block context, LF channel correlation), per LF group the
+// quantized LF image, the extra-channel modular stream and the HF metadata
+// (chroma-from-luma tiles, varblock types and multipliers, EPF sharpness),
+// HfGlobal (dequantization matrices, HF presets, per pass coefficient
+// orders and histograms), and per pass and group the HF coefficients. The
+// coefficients of all passes accumulate in three planes that are then
+// dequantized, corrected by chroma-from-luma, completed with the LF image
+// (low-frequency coefficients of large varblocks come from a forward DCT of
+// the LF samples) and inverse transformed in place into XYB samples.
+
+const K_INV_SIGMA_NUM: f32 = -1.1715728752538099
+
+static COEFF_FREQ_CONTEXT: [63]u32 = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 15, 16, 16, 17, 17, 18, 18, 19, 19, 20, 20, 21, 21, 22, 22, 23, 23, 23, 23, 24, 24, 24, 24, 25, 25, 25, 25, 26, 26, 26, 26, 27, 27, 27, 27, 28, 28, 28, 28, 29, 29, 29, 29, 30, 30, 30, 30]
+static COEFF_NUM_NONZERO_CONTEXT: [63]u32 = [0, 31, 62, 62, 93, 93, 93, 93, 123, 123, 123, 123, 152, 152, 152, 152, 152, 152, 152, 152, 180, 180, 180, 180, 180, 180, 180, 180, 180, 180, 180, 180, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206]
+static DEFAULT_BLOCK_CTX: [39]u8 = [0, 1, 2, 2, 3, 3, 4, 5, 6, 6, 6, 6, 6, 7, 8, 9, 9, 10, 11, 12, 13, 14, 14, 14, 14, 14, 7, 8, 9, 9, 10, 11, 12, 13, 14, 14, 14, 14, 14]
+
+// binfo bits: first block of a varblock, its DctSelect, occupied, EPF
+// sharpness and the LF threshold index.
+const BI_FIRST: u32 = 0x80000000
+const BI_OCCUPIED: u32 = 0x8000
+const BI_DS_SHIFT: u32 = 24
+
+// Buffers and per-frame values of VarDCT decoding. The coefficient / sample
+// planes (3 x rw x rh) and the transform scratch are passed separately.
+struct VBufs {
+    lf: &mut[f32]
+    binfo: &mut[u32]
+    bmul: &mut[i32]
+    cfl: &mut[i32]
+    dqm: &mut[f32]
+    natural: &mut[u32]
+    orders: &mut[u32]
+    fen: &mut[u32]
+    bctx: &mut[u8]
+    sigma: &mut[f32]
+    nz: &mut[u32]
+    // LF frame outputs (XYB, 3 planes) per lf_level 1 to 3.
+    lfslot: &mut[f32]
+    lfslot_off: [3]usize
+    lfslot_cap: [3]usize
+    lfslot_w: [3]usize
+    lfslot_h: [3]usize
+    lfslot_valid: [3]bool
+    // Chroma subsampling shifts per channel (X/Cb, Y, B/Cr).
+    hs: [3]usize
+    vs: [3]usize
+    subsampled: bool
+    // Geometry: blocks, rounded sample size, 64x64 tiles.
+    bw: usize
+    bh: usize
+    rw: usize
+    rh: usize
+    tw: usize
+    th: usize
+    global_scale: u32
+    quant_lf: u32
+    nb_lf_thr: [3]u32
+    lf_thr: [48]i32
+    nb_qf_thr: u32
+    qf_thr: [16]u32
+    bctx_size: u32
+    nb_block_ctx: u32
+    colour_factor: u32
+    base_x: f32
+    base_b: f32
+    x_factor_lf: i32
+    b_factor_lf: i32
+    num_hf_presets: u32
+    hf_bit: u64
+    used_params: u32
+    custom_orders: u32
+    tables_ready: bool
+}
+
+fn as_i32(floats: &mut[f32]) -> &mut[i32] from(floats) {
+    unsafe {
+        return ptr.borrow_slice_mut(ptr.as_mut_ptr(floats) as *mut i32, floats.len, floats)
+    }
+}
+
+// The float whose bits are stored in v.
+fn i32_float(v: i32) -> f32 {
+    return convert.f32_from_bits((v as i64 & 0xffffffff) as u32)
+}
+
+fn ceil_log2(n: u32) -> u32 {
+    if n <= 1 {
+        return 0
+    }
+    return bits_for(n - 1)
+}
+
+// LfGlobal fields specific to VarDCT, read after LfChannelDequantization.
+fn read_vardct_globals(r: &mut Reader, vb: &mut VBufs, n1: &mut Code, n2: &mut Code, window: &mut[u32]) -> void!pixels.Error {
+    vb.global_scale = r.u32c(dist(1, 11), dist(2049, 11), dist(4097, 12), dist(8193, 16))
+    vb.quant_lf = r.u32c(dist(16, 0), dist(1, 5), dist(1, 8), dist(1, 16))
+    if r.bit() {
+        vb.nb_lf_thr = [0u32; 3]
+        vb.nb_qf_thr = 0
+        vb.bctx_size = 39
+        vb.nb_block_ctx = 15
+        for i in 0usize..39 {
+            vb.bctx[i] = DEFAULT_BLOCK_CTX[i]
+        }
+    } else {
+        size := 39u32
+        for c in 0usize..3 {
+            vb.nb_lf_thr[c] = r.bits(4)
+            for j in 0usize..vb.nb_lf_thr[c] as usize {
+                vb.lf_thr[c * 16 + j] = unpack_signed(r.u32c(dist(0, 4), dist(16, 8), dist(272, 16), dist(65808, 32)))
+            }
+            size *= vb.nb_lf_thr[c] + 1
+        }
+        vb.nb_qf_thr = r.bits(4)
+        for j in 0usize..vb.nb_qf_thr as usize {
+            vb.qf_thr[j] = r.u32c(dist(0, 2), dist(4, 3), dist(12, 5), dist(44, 8)) + 1
+        }
+        size *= vb.nb_qf_thr + 1
+        if size as usize > vb.bctx.len {
+            return err(pixels.Error.TooLarge)
+        }
+        vb.bctx_size = size
+        vb.nb_block_ctx = read_cluster_map(r, size, vb.bctx, n1, n2, window)?
+    }
+    vb.colour_factor = 84
+    vb.base_x = 0.0
+    vb.base_b = 1.0
+    vb.x_factor_lf = 0
+    vb.b_factor_lf = 0
+    if !r.bit() {
+        vb.colour_factor = r.u32c(dist(84, 0), dist(256, 0), dist(2, 8), dist(258, 16))
+        vb.base_x = r.f16()
+        vb.base_b = r.f16()
+        vb.x_factor_lf = r.bits(8) as i32 - 128
+        vb.b_factor_lf = r.bits(8) as i32 - 128
+    }
+    if r.broken {
+        return err(pixels.Error.Malformed)
+    }
+    return ok()
+}
+
+// Allocate a w x h channel at the arena top and append it to `ch`.
+fn push_temp_channel(work: &mut ModularWork, ch: &mut ChanList, w: usize, h: usize) -> void!pixels.Error {
+    off := work.alloc(w as u64 * h as u64)?
+    at := ch.count
+    ch.insert(at)?
+    ch.set(at, off, w, w, h, 0, 0)
+    return ok()
+}
+
+// One LF group of a VarDCT frame: the quantized LF image (unless an LF
+// frame supplies it), the modular LF group stream of the extra channels,
+// and the HF metadata.
+fn vardct_lf_group(r: &mut Reader, h: &ImageHeader, f: &FrameHeader, work: &mut ModularWork, gcode: &Code, lcode: &mut Code, tcode: &mut Code, n1: &mut Code, n2: &mut Code, window: &mut[u32], gch: &ChanList, gend: usize, lch: &mut ChanList, ltr: &mut TrList, lstash: &mut ChanList, wp: &mut[i32], m_lf: &[f32], vb: &mut VBufs, g: usize, lf_from_frame: bool) -> void!pixels.Error {
+    num_lf := f.num_lf_groups() as usize
+    gd := f.group_dim as usize
+    gx := g % f.lf_groups_x as usize
+    gy := g / f.lf_groups_x as usize
+    bx0 := gx * gd
+    by0 := gy * gd
+    lbw := vb.bw - bx0
+    if lbw > gd {
+        lbw = gd
+    }
+    lbh := vb.bh - by0
+    if lbh > gd {
+        lbh = gd
+    }
+    // Pixel size of the LF group.
+    px := f.sample_width as usize - bx0 * 8
+    if px > gd * 8 {
+        px = gd * 8
+    }
+    py := f.sample_height as usize - by0 * 8
+    if py > gd * 8 {
+        py = gd * 8
+    }
+    mark := work.arena_used
+    if !lf_from_frame {
+        extra := r.bits(2)
+        lch.reset()
+        ltr.count = 0
+        lstash.reset()
+        for k in 0usize..3 {
+            c := 2usize
+            if k < 2 {
+                c = 1 - k
+            }
+            push_temp_channel(work, lch, lbw >> vb.hs[c], lbh >> vb.vs[c])?
+        }
+        decode_stream(r, work, gcode, lcode, tcode, n1, n2, window, lch, ltr, lstash, wp, false, gd, (1 + g) as u32)?
+        inverse_transforms(work, lch, ltr, lstash, wp, h.bits)?
+        if lch.count != 3 {
+            return err(pixels.Error.Malformed)
+        }
+        // Channels are Y, X, B.
+        scale := 65536.0f64 / ((1u32 << extra) as f64 * vb.global_scale as f64 * vb.quant_lf as f64)
+        plane := vb.bw * vb.bh
+        for c in 0usize..3 {
+            src := 1usize
+            if c == 1 {
+                src = 0
+            } else if c == 2 {
+                src = 2
+            }
+            mult := narrow64(m_lf[c] as f64 * scale)
+            hs := vb.hs[c]
+            vs := vb.vs[c]
+            for y in 0usize..lch.height(src) {
+                row := lch.offset(src) + y * lch.stride(src)
+                at := c * plane + ((by0 >> vs) + y) * vb.bw + (bx0 >> hs)
+                for x in 0usize..lch.width(src) {
+                    vb.lf[at + x] = work.arena[row + x] as f32 * mult
+                }
+            }
+        }
+        // LF threshold index per block, from X, B then Y.
+        for y in 0usize..lbh {
+            for x in 0usize..lbw {
+                idx := 0u32
+                for k in 0usize..3 {
+                    c := 0usize
+                    src := 1usize
+                    if k == 1 {
+                        c = 2
+                        src = 2
+                    } else if k == 2 {
+                        c = 1
+                        src = 0
+                    }
+                    v := work.arena[lch.offset(src) + (y >> vb.vs[c]) * lch.stride(src) + (x >> vb.hs[c])]
+                    count := 0u32
+                    for j in 0usize..vb.nb_lf_thr[c] as usize {
+                        if v > vb.lf_thr[c * 16 + j] {
+                            count += 1
+                        }
+                    }
+                    idx = idx * (vb.nb_lf_thr[c] + 1) + count
+                }
+                b := (by0 + y) * vb.bw + bx0 + x
+                vb.binfo[b] = idx
+            }
+        }
+        work.arena_used = mark
+    } else {
+        for y in 0usize..lbh {
+            for x in 0usize..lbw {
+                vb.binfo[(by0 + y) * vb.bw + bx0 + x] = 0
+            }
+        }
+    }
+    // Extra channels with shifts of 3 or more.
+    pm := [0i32; MAX_PASSES]
+    pmx := [0i32; MAX_PASSES]
+    group_channels(f, gch, gend, lch, ltr, lstash, true, 0, gx, gy, &pm, &pmx)?
+    if lch.count > 0 {
+        decode_stream(r, work, gcode, lcode, tcode, n1, n2, window, lch, ltr, lstash, wp, false, gd, (1 + num_lf + g) as u32)?
+        inverse_transforms(work, lch, ltr, lstash, wp, h.bits)?
+        work.arena_used = mark
+    }
+    // HF metadata.
+    nb_blocks := r.bits(ceil_log2((lbw * lbh) as u32)) as usize + 1
+    tiles_x := (px + 63) / 64
+    tiles_y := (py + 63) / 64
+    lch.reset()
+    ltr.count = 0
+    lstash.reset()
+    push_temp_channel(work, lch, tiles_x, tiles_y)?
+    push_temp_channel(work, lch, tiles_x, tiles_y)?
+    push_temp_channel(work, lch, nb_blocks, 2)?
+    push_temp_channel(work, lch, lbw, lbh)?
+    decode_stream(r, work, gcode, lcode, tcode, n1, n2, window, lch, ltr, lstash, wp, false, gd, (1 + 2 * num_lf + g) as u32)?
+    inverse_transforms(work, lch, ltr, lstash, wp, h.bits)?
+    if lch.count != 4 {
+        return err(pixels.Error.Malformed)
+    }
+    tx0 := bx0 / 8
+    ty0 := by0 / 8
+    tiles := vb.tw * vb.th
+    for y in 0usize..tiles_y {
+        for x in 0usize..tiles_x {
+            t := (ty0 + y) * vb.tw + tx0 + x
+            vb.cfl[t] = work.arena[lch.offset(0) + y * lch.stride(0) + x]
+            vb.cfl[tiles + t] = work.arena[lch.offset(1) + y * lch.stride(1) + x]
+        }
+    }
+    gd8 := gd / 8
+    quant_scale := vb.global_scale as f32 / 65536.0
+    data := 0usize
+    info_off := lch.offset(2)
+    info_stride := lch.stride(2)
+    sharp_off := lch.offset(3)
+    sharp_stride := lch.stride(3)
+    for y in 0usize..lbh {
+        for x in 0usize..lbw {
+            b := (by0 + y) * vb.bw + bx0 + x
+            if (vb.binfo[b] & BI_OCCUPIED) != 0 {
+                continue
+            }
+            if data >= nb_blocks {
+                return err(pixels.Error.Malformed)
+            }
+            ds_raw := work.arena[info_off + data]
+            hf_mul := work.arena[info_off + info_stride + data] as i64 + 1
+            data += 1
+            if ds_raw < 0 || ds_raw >= NUM_DCT_SELECT as i32 || hf_mul <= 0 || hf_mul > 2147483647 {
+                return err(pixels.Error.Malformed)
+            }
+            ds := ds_raw as u32
+            w8 := DS_W8[ds as usize] as usize
+            h8 := DS_H8[ds as usize] as usize
+            if vb.subsampled && w8 * h8 > 1 {
+                return err(pixels.Error.Unsupported)
+            }
+            if x + w8 > lbw || y + h8 > lbh || (x % gd8) + w8 > gd8 || (y % gd8) + h8 > gd8 {
+                return err(pixels.Error.Malformed)
+            }
+            sigma_quant := 0.0f32
+            if f.epf_iters > 0 {
+                sigma_quant = f.epf_quant_mul / (quant_scale * hf_mul as f32 * K_INV_SIGMA_NUM)
+            }
+            for dy in 0usize..h8 {
+                for dx in 0usize..w8 {
+                    bb := (by0 + y + dy) * vb.bw + bx0 + x + dx
+                    if (vb.binfo[bb] & BI_OCCUPIED) != 0 {
+                        return err(pixels.Error.Malformed)
+                    }
+                    sharp := work.arena[sharp_off + (y + dy) * sharp_stride + x + dx]
+                    if sharp < 0 || sharp > 7 {
+                        return err(pixels.Error.Malformed)
+                    }
+                    vb.binfo[bb] = (vb.binfo[bb] & 0xfff) | BI_OCCUPIED | ((sharp as u32) << 12)
+                    if f.epf_iters > 0 {
+                        s := sigma_quant * f.epf_sharp[sharp as usize]
+                        if s > -0.0001 {
+                            s = -0.0001
+                        }
+                        vb.sigma[bb] = 1.0 / s
+                    }
+                }
+            }
+            vb.binfo[b] = vb.binfo[b] | BI_FIRST | (ds << BI_DS_SHIFT)
+            vb.bmul[b] = hf_mul as i32
+            vb.used_params = vb.used_params | (1u32 << DS_PARAM[ds as usize])
+        }
+    }
+    work.arena_used = mark
+    return ok()
+}
+
+// Fixed parameters per dequantization encoding mode (1 to 6).
+static DQ_FIXED: [7]u32 = [0, 3, 6, 2, 1, 9, 0]
+
+// One set of DCT band parameters for each channel at prm[c * 48 + at..]
+// (the first scaled by 64); returns the band count.
+fn read_dct_params(r: &mut Reader, prm: &mut[f32], at: usize) -> usize {
+    n := r.bits(4) as usize + 1
+    for c in 0usize..3 {
+        for i in 0usize..n {
+            prm[c * 48 + at + i] = r.f16()
+        }
+        prm[c * 48 + at] *= 64.0
+    }
+    return n
+}
+
+// The dequantization matrices of HfGlobal. Every encoding is parsed; the
+// multipliers of the parameter sets the frame uses are computed into
+// vb.dqm (raw tables come as a modular stream).
+fn read_dequant_matrices(r: &mut Reader, h: &ImageHeader, f: &FrameHeader, work: &mut ModularWork, gcode: &Code, lcode: &mut Code, tcode: &mut Code, n1: &mut Code, n2: &mut Code, window: &mut[u32], lch: &mut ChanList, ltr: &mut TrList, lstash: &mut ChanList, wp: &mut[i32], vb: &mut VBufs, t: &mut[f32]) -> void!pixels.Error {
+    all_default := r.bit()
+    num_lf := f.num_lf_groups() as usize
+    prm := [0.0f32; 144]
+    for p in 0usize..NUM_PARAMS {
+        mode := DQ_MODE[p]
+        n := DQ_N[p] as usize
+        m := DQ_M[p] as usize
+        enc := 0u32
+        if !all_default {
+            enc = r.bits(3)
+        }
+        used := (vb.used_params & (1u32 << (p as u32))) != 0
+        if enc == 7 {
+            den := r.f16()
+            width := PARAM_W[p] as usize
+            height := PARAM_H[p] as usize
+            mark := work.arena_used
+            lch.reset()
+            ltr.count = 0
+            lstash.reset()
+            for c in 0usize..3 {
+                push_temp_channel(work, lch, width, height)?
+            }
+            decode_stream(r, work, gcode, lcode, tcode, n1, n2, window, lch, ltr, lstash, wp, false, f.group_dim as usize, (1 + 3 * num_lf + p) as u32)?
+            inverse_transforms(work, lch, ltr, lstash, wp, h.bits)?
+            if lch.count != 3 {
+                return err(pixels.Error.Malformed)
+            }
+            if used {
+                base := param_offset(p)
+                size := param_size(p)
+                for c in 0usize..3 {
+                    for y in 0usize..height {
+                        row := lch.offset(c) + y * lch.stride(c)
+                        for x in 0usize..width {
+                            w := 1.0f32 / (den * work.arena[row + x] as f32)
+                            if !(w >= 0.00000001) || w >= 100000000.0 {
+                                return err(pixels.Error.Malformed)
+                            }
+                            vb.dqm[base + c * size + y * width + x] = 1.0 / w
+                        }
+                    }
+                }
+            }
+            work.arena_used = mark
+            continue
+        }
+        if enc == 0 {
+            for i in 0usize..144 {
+                prm[i] = DQ_DEFAULT[p * 144 + i]
+            }
+        } else {
+            if enc <= 5 && !(p <= 3 || p == 9 || p == 10) {
+                return err(pixels.Error.Malformed)
+            }
+            mode = enc
+            fixed := DQ_FIXED[enc as usize] as usize
+            for c in 0usize..3 {
+                for i in 0usize..fixed {
+                    prm[c * 48 + i] = r.f16()
+                }
+            }
+            if enc == 5 {
+                for c in 0usize..3 {
+                    for i in 0usize..6 {
+                        prm[c * 48 + i] *= 64.0
+                    }
+                }
+            }
+            if enc >= 3 {
+                n = read_dct_params(r, &mut prm, fixed)
+                if enc == 5 {
+                    m = read_dct_params(r, &mut prm, fixed + n)
+                }
+            }
+        }
+        if r.overrun {
+            return err(pixels.Error.Truncated)
+        }
+        if used {
+            base := param_offset(p)
+            size := param_size(p)
+            for c in 0usize..3 {
+                compute_matrix(p, mode, n, m, &prm, c, vb.dqm, base + c * size, t)?
+            }
+        }
+    }
+    return ok()
+}
+
+// The (value + 1)-th remaining entry of a Fenwick tree of `n` ones and
+// zeros (removed); removes it.
+fn fenwick_take(fen: &mut[u32], n: usize, value: u32) -> usize {
+    target := value + 1
+    position := 0usize
+    step := 1usize
+    for step * 2 <= n {
+        step *= 2
+    }
+    for step > 0 {
+        next := position + step
+        if next <= n && fen[next - 1] < target {
+            position = next
+            target -= fen[next - 1]
+        }
+        step /= 2
+    }
+    j := position + 1
+    for j <= n {
+        fen[j - 1] -= 1
+        j += lowbit(j)
+    }
+    return position
+}
+
+// A Lehmer-coded coefficient order of `size` entries whose first `skip`
+// stay in place, into vb.orders[out..] as natural-order positions.
+fn read_order(r: &mut Reader, code: &Code, st: &mut Stream, size: usize, skip: usize, vb: &mut VBufs, out: usize, nat: usize) -> void!pixels.Error {
+    end := code.read(st, r, permutation_context(size as u32), 0) as usize
+    n := size - skip
+    if end > n {
+        return err(pixels.Error.Malformed)
+    }
+    for i in 0usize..skip {
+        vb.orders[out + i] = vb.natural[nat + i]
+    }
+    for j in 1usize..n + 1 {
+        vb.fen[j - 1] = lowbit(j) as u32
+    }
+    previous := 0u32
+    for k in 0usize..end {
+        value := code.read(st, r, permutation_context(previous), 0)
+        if value as usize >= n - k {
+            return err(pixels.Error.Malformed)
+        }
+        previous = value
+        position := fenwick_take(vb.fen, n, value)
+        vb.orders[out + skip + k] = vb.natural[nat + skip + position]
+        if r.overrun {
+            return err(pixels.Error.Truncated)
+        }
+    }
+    // The remaining entries in increasing order.
+    k := skip + end
+    for i in 0usize..n {
+        if fenwick_prefix(vb.fen, 0, i + 1) - fenwick_prefix(vb.fen, 0, i) == 1 {
+            vb.orders[out + k] = vb.natural[nat + skip + i]
+            k += 1
+        }
+    }
+    return ok()
+}
+
+// One HfPass: the custom coefficient orders and the HF coefficient code.
+fn read_hf_pass(r: &mut Reader, vb: &mut VBufs, hcode: &mut Code, tcode: &mut Code, n1: &mut Code, n2: &mut Code, window: &mut[u32]) -> void!pixels.Error {
+    used := r.u32c(dist(0x5f, 0), dist(0x13, 0), dist(0, 0), dist(0, 13))
+    vb.custom_orders = used
+    if used != 0 {
+        read_code(r, 8, tcode, n1, n2, window)?
+        st := Stream.new(window)
+        st.begin(tcode, r)
+        for o in 0usize..NUM_ORDERS {
+            if (used & (1u32 << (o as u32))) == 0 {
+                continue
+            }
+            size := (ORDER_W[o] * ORDER_H[o]) as usize
+            base := order_offset(o)
+            for c in 0usize..3 {
+                read_order(r, tcode, &mut st, size, size / 64, vb, c * ORDER_TOTAL + base, base)?
+            }
+        }
+        st.finish(tcode)?
+    }
+    num_dist := 495u64 * vb.num_hf_presets as u64 * vb.nb_block_ctx as u64
+    if num_dist + 1 > hcode.map.len as u64 {
+        return err(pixels.Error.TooLarge)
+    }
+    read_code(r, num_dist as u32, hcode, n1, n2, window)?
+    return ok()
+}
+
+// The HF coefficients of pass group (gx, gy), added (shifted by `shift`)
+// to the coefficient planes.
+fn decode_hf_group(r: &mut Reader, f: &FrameHeader, vb: &mut VBufs, coeffs: &mut[i32], hcode: &Code, window: &mut[u32], gx: usize, gy: usize, shift: u32) -> void!pixels.Error {
+    gd8 := f.group_dim as usize / 8
+    bx0 := gx * gd8
+    by0 := gy * gd8
+    gbw := vb.bw - bx0
+    if gbw > gd8 {
+        gbw = gd8
+    }
+    gbh := vb.bh - by0
+    if gbh > gd8 {
+        gbh = gd8
+    }
+    hfp := r.bits(ceil_log2(vb.num_hf_presets))
+    if hfp >= vb.num_hf_presets {
+        return err(pixels.Error.Malformed)
+    }
+    nbc := vb.nb_block_ctx
+    ctx_off := 495 * nbc * hfp
+    lf_mul := (vb.nb_lf_thr[0] + 1) * (vb.nb_lf_thr[1] + 1) * (vb.nb_lf_thr[2] + 1)
+    qf_mul := vb.nb_qf_thr + 1
+    rw := vb.rw
+    plane := vb.rw * vb.rh
+    for i in 0usize..3 * gd8 {
+        vb.nz[i] = 0
+    }
+    st := Stream.new(window)
+    st.begin(hcode, r)
+    for by in 0usize..gbh {
+        for bx in 0usize..gbw {
+            b := (by0 + by) * vb.bw + bx0 + bx
+            info := vb.binfo[b]
+            if (info & BI_FIRST) == 0 {
+                continue
+            }
+            ds := (info >> BI_DS_SHIFT) & 31
+            w8 := DS_W8[ds as usize] as usize
+            nb := (DS_W8[ds as usize] * DS_H8[ds as usize]) as u32
+            lognb := floor_log2(nb as u64)
+            order := DS_ORDER[ds as usize] as usize
+            ow := ORDER_W[order] as usize
+            osz := ow * ORDER_H[order] as usize
+            obase := order_offset(order)
+            custom := ((vb.custom_orders >> (order as u32)) & 1) != 0
+            tr := ds_transposed(ds)
+            lf_idx := info & 0xfff
+            qf := vb.bmul[b]
+            hf_idx := 0u32
+            for j in 0usize..vb.nb_qf_thr as usize {
+                if qf > vb.qf_thr[j] as i32 {
+                    hf_idx += 1
+                }
+            }
+            for k in 0usize..3 {
+                c := 1usize
+                if k == 1 {
+                    c = 0
+                } else if k == 2 {
+                    c = 2
+                }
+                hs := vb.hs[c]
+                vs := vb.vs[c]
+                sx := bx >> hs
+                sy := by >> vs
+                if (sx << hs) != bx || (sy << vs) != by {
+                    continue
+                }
+                bctx := vb.bctx[(((k * 13 + order) as u32 * qf_mul + hf_idx) * lf_mul + lf_idx) as usize] as u32
+                row := c * gd8
+                predicted := 32u32
+                if sy == 0 {
+                    if sx > 0 {
+                        predicted = vb.nz[row + sx - 1]
+                    }
+                } else if sx == 0 {
+                    predicted = vb.nz[row]
+                } else {
+                    predicted = (vb.nz[row + sx] + vb.nz[row + sx - 1] + 1) >> 1
+                }
+                pidx := predicted
+                if predicted >= 8 {
+                    pidx = 4 + predicted / 2
+                }
+                nonzeros := hcode.read(&mut st, r, ctx_off + bctx + pidx * nbc, 0)
+                if nonzeros > (63u32 << lognb) {
+                    return err(pixels.Error.Malformed)
+                }
+                fill := (nonzeros + nb - 1) >> lognb
+                for dx in 0usize..w8 {
+                    if sx + dx < gd8 {
+                        vb.nz[row + sx + dx] = fill
+                    }
+                }
+                if nonzeros == 0 {
+                    continue
+                }
+                prev := 0u32
+                if nonzeros <= nb * 4 {
+                    prev = 1
+                }
+                cbase := ctx_off + bctx * 458 + 37 * nbc
+                pbase := c * plane + ((by0 >> vs) + sy) * 8 * rw + ((bx0 >> hs) + sx) * 8
+                remaining := nonzeros
+                for kk in nb as usize..osz {
+                    cctx := (COEFF_NUM_NONZERO_CONTEXT[((remaining - 1) >> lognb) as usize] + COEFF_FREQ_CONTEXT[(kk - nb as usize) >> (lognb as usize)]) * 2 + prev
+                    if cctx >= 458 {
+                        return err(pixels.Error.Malformed)
+                    }
+                    u := hcode.read(&mut st, r, cbase + cctx, 0)
+                    if u == 0 {
+                        prev = 0
+                        continue
+                    }
+                    pos := 0usize
+                    if custom {
+                        pos = vb.orders[c * ORDER_TOTAL + obase + kk] as usize
+                    } else {
+                        pos = vb.natural[obase + kk] as usize
+                    }
+                    px := pos % ow
+                    py := pos / ow
+                    if tr {
+                        tmp := px
+                        px = py
+                        py = tmp
+                    }
+                    at := pbase + py * rw + px
+                    coeffs[at] = wrap_i32(coeffs[at] as i64 + ((unpack_signed(u) as i64) << (shift as i64)))
+                    prev = 1
+                    remaining -= 1
+                    if remaining == 0 {
+                        break
+                    }
+                }
+                if remaining != 0 {
+                    return err(pixels.Error.Malformed)
+                }
+            }
+            if r.overrun {
+                return err(pixels.Error.Truncated)
+            }
+            if r.broken {
+                return err(pixels.Error.Malformed)
+            }
+        }
+    }
+    st.finish(hcode)?
+    return ok()
+}
+
+// Chroma-from-luma on the LF image, then adaptive LF smoothing (with the
+// planes as scratch).
+fn finish_lf(f: &FrameHeader, vb: &mut VBufs, vals: &FrameVals, scratch: &mut[f32]) {
+    plane := vb.bw * vb.bh
+    scale := 1.0f32 / vb.colour_factor as f32
+    kx := vb.base_x + vb.x_factor_lf as f32 * scale
+    kb := vb.base_b + vb.b_factor_lf as f32 * scale
+    for i in 0usize..plane {
+        y := vb.lf[plane + i]
+        vb.lf[i] += kx * y
+        vb.lf[2 * plane + i] += kb * y
+    }
+    if (f.flags & FLAG_SKIP_LF_SMOOTHING) != 0 || vb.bw <= 2 || vb.bh <= 2 {
+        return
+    }
+    for i in 0usize..3 * plane {
+        scratch[i] = vb.lf[i]
+    }
+    inv := 65536.0f64 / (vb.global_scale as f64 * vb.quant_lf as f64)
+    lfm := [0.0f32; 3]
+    for c in 0usize..3 {
+        lfm[c] = narrow64(vals.m_lf[c] as f64 * inv)
+    }
+    w := vb.bw
+    for y in 1usize..vb.bh - 1 {
+        for x in 1usize..w - 1 {
+            gap := 0.5f32
+            wa := [0.0f32; 3]
+            for c in 0usize..3 {
+                o := c * plane + y * w + x
+                me := scratch[o]
+                ud := scratch[o - w] + scratch[o + w]
+                side := scratch[o - 1] + scratch[o + 1] + ud
+                diag := (scratch[o - w - 1] + scratch[o + w - 1]) + (scratch[o - w + 1] + scratch[o + w + 1])
+                v := me * 0.052262735 + side * 0.2034514 + diag * 0.03348292
+                wa[c] = v
+                g := v - me
+                if g < 0.0 {
+                    g = -g
+                }
+                g = g / lfm[c]
+                if g > gap {
+                    gap = g
+                }
+            }
+            s := 3.0f32 - 4.0 * gap
+            if s < 0.0 {
+                s = 0.0
+            }
+            for c in 0usize..3 {
+                o := c * plane + y * w + x
+                me := scratch[o]
+                vb.lf[o] = (wa[c] - me) * s + me
+            }
+        }
+    }
+}
+
+// Dequantize channel c of the varblock at block b (type ds) whose
+// coefficients start at q[off] (in place, int to float bits).
+fn dequant_channel(q: &mut[i32], h: &ImageHeader, f: &FrameHeader, vb: &VBufs, b: usize, ds: u32, c: usize, off: usize) {
+    p := DS_PARAM[ds as usize] as usize
+    mw := PARAM_W[p] as usize
+    mbase := param_offset(p) + c * param_size(p)
+    tr := ds_transposed(ds)
+    bw8 := DS_W8[ds as usize] as usize * 8
+    bh8 := DS_H8[ds as usize] as usize * 8
+    rw := vb.rw
+    inv_gs := (65536.0f64 / vb.global_scale as f64) as f32
+    mul := inv_gs / vb.bmul[b] as f32
+    if c == 0 {
+        mul = mul * pow64(0.800000011920929, f.x_qm_scale as f64 - 2.0) as f32
+    } else if c == 2 {
+        mul = mul * pow64(0.800000011920929, f.b_qm_scale as f64 - 2.0) as f32
+    }
+    numer := h.quant_bias_numerator
+    bias := h.quant_bias[c]
+    for y in 0usize..bh8 {
+        row := off + y * rw
+        for x in 0usize..bw8 {
+            mi := y * mw + x
+            if tr {
+                mi = x * mw + y
+            }
+            m := vb.dqm[mbase + mi] * mul
+            qi := q[row + x]
+            v := 0.0f32
+            if qi == 1 {
+                v = bias
+            } else if qi == -1 {
+                v = -bias
+            } else if qi != 0 {
+                qf := qi as f32
+                v = qf - numer / qf
+            }
+            q[row + x] = float_bits_i32(v * m)
+        }
+    }
+}
+
+// Chroma from luma on the dequantized varblock at block (bx, by), per
+// 64x64 tile.
+fn cfl_block(q: &mut[i32], vb: &VBufs, bx: usize, by: usize, ds: u32) {
+    bw8 := DS_W8[ds as usize] as usize * 8
+    bh8 := DS_H8[ds as usize] as usize * 8
+    rw := vb.rw
+    plane := vb.rw * vb.rh
+    scale := 1.0f32 / vb.colour_factor as f32
+    tiles := vb.tw * vb.th
+    for y in 0usize..bh8 {
+        py := by * 8 + y
+        trow := (py / 64) * vb.tw
+        for x in 0usize..bw8 {
+            px := bx * 8 + x
+            t := trow + px / 64
+            kx := vb.base_x + vb.cfl[t] as f32 * scale
+            kb := vb.base_b + vb.cfl[tiles + t] as f32 * scale
+            o := py * rw + px
+            yv := i32_float(q[plane + o])
+            q[o] = float_bits_i32(kx * yv + i32_float(q[o]))
+            q[2 * plane + o] = float_bits_i32(kb * yv + i32_float(q[2 * plane + o]))
+        }
+    }
+}
+
+// Every varblock: dequantization, chroma from luma, the lowest frequencies
+// from the LF image, and the inverse transform to samples in place.
+// Subsampled channels hold their blocks at (bx >> hs, by >> vs).
+fn reconstruct(h: &ImageHeader, f: &FrameHeader, vb: &VBufs, planes: &mut[f32], t: &mut[f32]) {
+    rw := vb.rw
+    plane := vb.rw * vb.rh
+    lfplane := vb.bw * vb.bh
+    for by in 0usize..vb.bh {
+        for bx in 0usize..vb.bw {
+            b := by * vb.bw + bx
+            info := vb.binfo[b]
+            if (info & BI_FIRST) == 0 {
+                continue
+            }
+            ds := (info >> BI_DS_SHIFT) & 31
+            w8 := DS_W8[ds as usize] as usize
+            h8 := DS_H8[ds as usize] as usize
+            for c in 0usize..3 {
+                sx := bx >> vb.hs[c]
+                sy := by >> vb.vs[c]
+                if (sx << vb.hs[c]) != bx || (sy << vb.vs[c]) != by {
+                    continue
+                }
+                dequant_channel(as_i32(planes), h, f, vb, b, ds, c, c * plane + sy * 8 * rw + sx * 8)
+            }
+            if !vb.subsampled {
+                cfl_block(as_i32(planes), vb, bx, by, ds)
+            }
+            special := DS_SPECIAL[ds as usize]
+            lw := 5 - floor_log2(w8 as u64)
+            lh := 5 - floor_log2(h8 as u64)
+            for c in 0usize..3 {
+                sx := bx >> vb.hs[c]
+                sy := by >> vb.vs[c]
+                if (sx << vb.hs[c]) != bx || (sy << vb.vs[c]) != by {
+                    continue
+                }
+                off := c * plane + sy * 8 * rw + sx * 8
+                lfo := c * lfplane + sy * vb.bw + sx
+                if w8 * h8 == 1 {
+                    planes[off] = vb.lf[lfo]
+                } else {
+                    for y in 0usize..h8 {
+                        for x in 0usize..w8 {
+                            t[T_LLF + y * w8 + x] = vb.lf[lfo + y * vb.bw + x]
+                        }
+                    }
+                    dct2d_in(t, T_LLF, w8, w8, h8, false)
+                    for y in 0usize..h8 {
+                        scale_y := SCALE_F[y << (lh as usize)]
+                        for x in 0usize..w8 {
+                            planes[off + y * rw + x] = t[T_LLF + y * w8 + x] / (scale_y * SCALE_F[x << (lw as usize)])
+                        }
+                    }
+                }
+                if special {
+                    special_transform(ds, planes, off, rw, t)
+                } else {
+                    dct2d(planes, off, rw, w8 * 8, h8 * 8, true, t)
+                }
+            }
+        }
+    }
+}
+
+// Upsample the subsampled channels of `planes` to full resolution in place
+// (libjxl's chroma upsampling: 3/4 and 1/4 of the nearest samples, edges
+// mirrored), horizontally then vertically.
+fn upsample_chroma(f: &FrameHeader, vb: &VBufs, planes: &mut[f32]) {
+    rw := vb.rw
+    plane := vb.rw * vb.rh
+    for c in 0usize..3 {
+        base := c * plane
+        if vb.hs[c] == 1 {
+            n := (f.sample_width as usize + 1) / 2
+            rows := (f.sample_height as usize + (1usize << vb.vs[c]) - 1) >> vb.vs[c]
+            for y in 0usize..rows {
+                row := base + y * rw
+                x := n
+                for x > 0 {
+                    x -= 1
+                    cur := planes[row + x] * 0.75
+                    prev := planes[row + mirror(x as i64 - 1, n)]
+                    next := planes[row + mirror(x as i64 + 1, n)]
+                    planes[row + 2 * x] = 0.25 * prev + cur
+                    planes[row + 2 * x + 1] = 0.25 * next + cur
+                }
+            }
+        }
+        if vb.vs[c] == 1 {
+            n := (f.sample_height as usize + 1) / 2
+            w := f.sample_width as usize
+            y := n
+            for y > 0 {
+                y -= 1
+                up := base + mirror(y as i64 - 1, n) * rw
+                mid := base + y * rw
+                down := base + mirror(y as i64 + 1, n) * rw
+                out0 := base + 2 * y * rw
+                out1 := out0 + rw
+                for x in 0usize..w {
+                    cur := planes[mid + x] * 0.75
+                    a := 0.25 * planes[up + x] + cur
+                    bb := 0.25 * planes[down + x] + cur
+                    planes[out0 + x] = a
+                    planes[out1 + x] = bb
+                }
+            }
+        }
+    }
+}
+
+// Decode a VarDCT frame: XYB (or YCbCr) samples into `planes` (3 planes of
+// vb.rw x vb.rh), extra channels into the arena as the modular path does.
+fn decode_vardct_frame(r: &mut Reader, h: &ImageHeader, f: &FrameHeader, work: &mut ModularWork, gcode: &mut Code, lcode: &mut Code, tcode: &mut Code, n1: &mut Code, n2: &mut Code, window: &mut[u32], gch: &mut ChanList, lch: &mut ChanList, gstash: &mut ChanList, lstash: &mut ChanList, gtr: &mut TrList, ltr: &mut TrList, toc: &[u32], vals: &mut FrameVals, vb: &mut VBufs, planes: &mut[f32], t: &mut[f32], hcode: &mut Code) -> void!pixels.Error {
+    setup_channels(h, f, work, gch, gtr, gstash)?
+    vb.subsampled = chroma_subsampled(f)
+    for c in 0usize..3 {
+        vb.hs[c] = chroma_shift(f, c, false) as usize
+        vb.vs[c] = chroma_shift(f, c, true) as usize
+    }
+    vb.bw = vardct_blocks(f, false)
+    vb.bh = vardct_blocks(f, true)
+    vb.rw = vb.bw * 8
+    vb.rh = vb.bh * 8
+    vb.tw = (vb.bw + 7) / 8
+    vb.th = (vb.bh + 7) / 8
+    blocks := vb.bw * vb.bh
+    if 3 * vb.rw * vb.rh > planes.len || 3 * blocks > vb.lf.len || blocks > vb.binfo.len || blocks > vb.bmul.len || blocks > vb.sigma.len || 2 * vb.tw * vb.th > vb.cfl.len || f.group_dim != 256 {
+        return err(pixels.Error.TooLarge)
+    }
+    if !vb.tables_ready {
+        natural_orders(vb.natural)
+        init_dct_tables(t)
+        vb.tables_ready = true
+    }
+    // LfGlobal.
+    enter_section(r, f, toc, 0)?
+    vals.patches_bit = r.position()
+    if (f.flags & FLAG_PATCHES) != 0 {
+        skip_patches(r, h, f, tcode, n1, n2, window)?
+    }
+    skip_splines(r, f, tcode, n1, n2, window, vals)?
+    read_noise(r, f, vals)
+    vals.m_lf = [1.0f32 / 4096.0, 1.0 / 512.0, 1.0 / 256.0]
+    if !r.bit() {
+        for c in 0usize..3 {
+            vals.m_lf[c] = r.f16() / 128.0
+            if vals.m_lf[c] < 0.00000001 {
+                return err(pixels.Error.Malformed)
+            }
+        }
+    }
+    read_vardct_globals(r, vb, n1, n2, window)?
+    work.gtree_nodes = 0
+    if r.bit() {
+        nch := f.color_channels as u64 + h.num_extra as u64
+        limit := 1024 + f.width as u64 * f.height as u64 * nch / 16
+        if limit > 4194304 {
+            limit = 4194304
+        }
+        work.gtree_nodes = read_tree(r, limit, work.gtree, tcode, n1, n2, window, gcode)?
+    }
+    vals.gend = 0
+    if gch.count > 0 {
+        vals.gend = decode_stream(r, work, gcode, lcode, tcode, n1, n2, window, gch, gtr, gstash, &mut vals.wp, true, f.group_dim as usize, 0)?
+    }
+    leave_section(r, f)?
+    num_lf := f.num_lf_groups() as usize
+    num_groups := f.num_groups() as usize
+    gend := vals.gend
+    use_lf := (f.flags & FLAG_USE_LF_FRAME) != 0
+    if use_lf {
+        level := f.lf_level as usize
+        if level >= 3 || !vb.lfslot_valid[level] || vb.lfslot_w[level] != vb.bw || vb.lfslot_h[level] != vb.bh {
+            return err(pixels.Error.Malformed)
+        }
+        base := vb.lfslot_off[level]
+        for i in 0usize..3 * blocks {
+            vb.lf[i] = vb.lfslot[base + i]
+        }
+    }
+    // LF groups.
+    vb.used_params = 0
+    m_lf := [vals.m_lf[0], vals.m_lf[1], vals.m_lf[2]]
+    for g in 0usize..num_lf {
+        enter_section(r, f, toc, 1 + g)?
+        vardct_lf_group(r, h, f, work, gcode, lcode, tcode, n1, n2, window, gch, gend, lch, ltr, lstash, &mut vals.wp, &m_lf, vb, g, use_lf)?
+        leave_section(r, f)?
+    }
+    if !use_lf {
+        if vb.subsampled {
+            if (f.flags & FLAG_SKIP_LF_SMOOTHING) == 0 {
+                return err(pixels.Error.Unsupported)
+            }
+        } else {
+            finish_lf(f, vb, vals, planes)
+        }
+    }
+    // HfGlobal: dequantization matrices and HF presets; each pass reads
+    // its HfPass right before its groups.
+    enter_section(r, f, toc, 1 + num_lf)?
+    read_dequant_matrices(r, h, f, work, gcode, lcode, tcode, n1, n2, window, lch, ltr, lstash, &mut vals.wp, vb, t)?
+    vb.num_hf_presets = r.bits(ceil_log2(num_groups as u32)) + 1
+    hf_bit := r.position()
+    for i in 0usize..3 * vb.rw * vb.rh {
+        planes[i] = 0.0
+    }
+    pass_min := [0i32; MAX_PASSES]
+    pass_max := [0i32; MAX_PASSES]
+    pass_ranges(f, &mut pass_min, &mut pass_max)
+    for p in 0usize..f.num_passes as usize {
+        if f.toc_entries != 1 {
+            enter_section(r, f, toc, 1 + num_lf)?
+            r.seek_bit(hf_bit)
+        }
+        read_hf_pass(r, vb, hcode, tcode, n1, n2, window)?
+        hf_bit = r.position()
+        leave_section(r, f)?
+        for g in 0usize..num_groups {
+            enter_section(r, f, toc, 2 + num_lf + p * num_groups + g)?
+            gx := g % f.groups_x as usize
+            gy := g / f.groups_x as usize
+            decode_hf_group(r, f, vb, as_i32(planes), hcode, window, gx, gy, f.pass_shift[p])?
+            group_channels(f, gch, gend, lch, ltr, lstash, false, p, gx, gy, &pass_min, &pass_max)?
+            decode_group_stream(r, h, f, work, gcode, lcode, tcode, n1, n2, window, lch, ltr, lstash, &mut vals.wp, (1 + 3 * num_lf + 17 + p * num_groups + g) as u32)?
+            leave_section(r, f)?
+        }
+    }
+    r.clear_limit()
+    reconstruct(h, f, vb, planes, t)
+    inverse_transforms(work, gch, gtr, gstash, &vals.wp, h.bits)?
+    if gch.count != h.num_extra as usize {
+        return err(pixels.Error.Malformed)
+    }
+    return ok()
+}
+
+// Keep an LF frame's XYB planes (frame planes 0 to 2) for later frames.
+fn store_lf_slot(vb: &mut VBufs, level: usize, frame: &[f32], w: usize, h: usize) -> void!pixels.Error {
+    if level >= 3 || 3 * w * h > vb.lfslot_cap[level] {
+        return err(pixels.Error.TooLarge)
+    }
+    base := vb.lfslot_off[level]
+    for i in 0usize..3 * w * h {
+        vb.lfslot[base + i] = frame[i]
+    }
+    vb.lfslot_w[level] = w
+    vb.lfslot_h[level] = h
+    vb.lfslot_valid[level] = true
+    return ok()
+}

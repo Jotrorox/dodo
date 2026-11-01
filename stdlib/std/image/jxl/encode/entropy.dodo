@@ -1,0 +1,413 @@
+package encode
+
+// Entropy coding: hybrid integers, histograms, histogram clustering, the
+// context map and the prefix-coded "code spec" that precedes every entropy
+// coded stream, plus the Coder that either counts or writes symbols.
+
+// LZ77 length symbols start here; literal tokens stay below it.
+const LZ77_MIN_SYMBOL: u32 = 224
+// Hybrid integer configuration of every literal histogram (split exponent,
+// mantissa bits kept in the token, low bits kept in the token).
+const LIT_SPLIT: u32 = 4
+const LIT_MSB: u32 = 2
+const LIT_LSB: u32 = 0
+// Hybrid integer configuration for LZ77 lengths: 4, 0, 0.
+const LZ77_LEN_SPLIT: u32 = 4
+// At most this many histograms after clustering.
+const MAX_CLUSTERS: usize = 32
+// Contexts a stream may use, including the LZ77 distance context.
+const MAX_CONTEXTS: usize = 256
+
+// log2(1 + i / 256) in 16.16 fixed point.
+const LOG2_TABLE: [257]u64 = [
+    0, 369, 736, 1102, 1466, 1829, 2190, 2551, 2909, 3267, 3623, 3978, 4331, 4683, 5034, 5384,
+    5732, 6079, 6425, 6769, 7112, 7454, 7795, 8134, 8473, 8810, 9146, 9480, 9814, 10146, 10477, 10807,
+    11136, 11464, 11791, 12116, 12440, 12764, 13086, 13407, 13727, 14046, 14363, 14680, 14996, 15310, 15624, 15937,
+    16248, 16559, 16868, 17177, 17484, 17791, 18096, 18401, 18704, 19007, 19308, 19609, 19909, 20207, 20505, 20802,
+    21098, 21393, 21687, 21980, 22272, 22564, 22854, 23144, 23433, 23720, 24007, 24293, 24579, 24863, 25146, 25429,
+    25711, 25992, 26272, 26551, 26830, 27108, 27384, 27660, 27936, 28210, 28484, 28757, 29029, 29300, 29571, 29840,
+    30109, 30378, 30645, 30912, 31178, 31443, 31707, 31971, 32234, 32496, 32758, 33019, 33279, 33538, 33797, 34055,
+    34312, 34569, 34825, 35080, 35334, 35588, 35841, 36094, 36346, 36597, 36847, 37097, 37346, 37595, 37842, 38090,
+    38336, 38582, 38827, 39072, 39316, 39559, 39802, 40044, 40286, 40527, 40767, 41006, 41246, 41484, 41722, 41959,
+    42196, 42432, 42667, 42902, 43137, 43370, 43603, 43836, 44068, 44300, 44530, 44761, 44990, 45220, 45448, 45676,
+    45904, 46131, 46357, 46583, 46809, 47034, 47258, 47482, 47705, 47928, 48150, 48372, 48593, 48813, 49034, 49253,
+    49472, 49691, 49909, 50127, 50344, 50560, 50776, 50992, 51207, 51422, 51636, 51850, 52063, 52276, 52488, 52700,
+    52911, 53122, 53332, 53542, 53751, 53960, 54169, 54377, 54584, 54791, 54998, 55204, 55410, 55615, 55820, 56025,
+    56229, 56432, 56635, 56838, 57040, 57242, 57443, 57644, 57845, 58045, 58245, 58444, 58643, 58841, 59039, 59237,
+    59434, 59631, 59827, 60023, 60219, 60414, 60609, 60803, 60997, 61190, 61384, 61576, 61769, 61961, 62152, 62343,
+    62534, 62725, 62915, 63104, 63294, 63483, 63671, 63859, 64047, 64234, 64421, 64608, 64794, 64980, 65166, 65351,
+    65536
+]
+
+// Hybrid integer encoding of v: token | nbits << 16 | bits << 24.
+fn hybrid(v: u64, split: u32, msb: u32, lsb: u32) -> u64 {
+    if v < (1u64 << (split as u64)) {
+        return v
+    }
+    n := floor_log2(v)
+    token := (1u64 << (split as u64)) + (((n - split) as u64) << ((msb + lsb) as u64))
+    token += ((v >> ((n - msb) as u64)) & ((1u64 << (msb as u64)) - 1)) << (lsb as u64)
+    token += v & ((1u64 << (lsb as u64)) - 1)
+    nbits := n - msb - lsb
+    bits := (v >> (lsb as u64)) & ((1u64 << (nbits as u64)) - 1)
+    return token | ((nbits as u64) << 16) | (bits << 24)
+}
+
+// Raw bits following token t.
+fn extra_bits(t: u32, split: u32, msb: u32, lsb: u32) -> u32 {
+    if t < (1u32 << split) {
+        return 0
+    }
+    return split - msb - lsb + ((t - (1u32 << split)) >> (msb + lsb))
+}
+
+// log2(x) in 16.16 fixed point, x >= 1; integer-only so clustering is the
+// same on every target.
+fn log2_fixed(x: u64) -> u64 {
+    n := floor_log2(x)
+    frac := 0u64
+    if n >= 8 {
+        frac = (x >> ((n - 8) as u64)) & 255
+    } else {
+        frac = (x << ((8 - n) as u64)) & 255
+    }
+    return ((n as u64) << 16) + LOG2_TABLE[frac as usize]
+}
+
+// Estimated bits (16.16) to code a histogram over the symbols `syms`: its
+// entropy plus a rough prefix code header cost.
+fn histogram_cost(h: &[u32], base: usize, syms: &[u16]) -> u64 {
+    total := 0u64
+    nonzero := 0u64
+    sum := 0u64
+    for k in 0usize..syms.len {
+        c := h[base + syms[k] as usize] as u64
+        if c != 0 {
+            total += c
+            nonzero += 1
+            sum += c * log2_fixed(c)
+        }
+    }
+    if total == 0 {
+        return 0
+    }
+    return total * log2_fixed(total) - sum + ((16 + 5 * nonzero) << 16)
+}
+
+// Cost (16.16) of the union of two histograms.
+fn merged_cost(a: &[u32], abase: usize, b: &[u32], bbase: usize, syms: &[u16]) -> u64 {
+    total := 0u64
+    nonzero := 0u64
+    sum := 0u64
+    for k in 0usize..syms.len {
+        s := syms[k] as usize
+        c := a[abase + s] as u64 + b[bbase + s] as u64
+        if c != 0 {
+            total += c
+            nonzero += 1
+            sum += c * log2_fixed(c)
+        }
+    }
+    if total == 0 {
+        return 0
+    }
+    return total * log2_fixed(total) - sum + ((16 + 5 * nonzero) << 16)
+}
+
+// The symbols with a nonzero count in any of `count` histograms.
+fn used_symbols(hist: &[u32], count: usize, syms: &mut[u16]) -> usize {
+    n := 0usize
+    for s in 0usize..MAX_ALPHA {
+        for i in 0usize..count {
+            if hist[i * MAX_ALPHA + s] != 0 {
+                syms[n] = s as u16
+                n += 1
+                break
+            }
+        }
+    }
+    return n
+}
+
+// Group the histograms of `count` contexts (hist[ctx * MAX_ALPHA..]) into at
+// most `limit` clusters: farthest-first seeding, then each context joins
+// the cluster that codes it most cheaply. Writes the context map, the summed
+// cluster histograms (sums[cluster * MAX_ALPHA..]) and returns the cluster
+// count. Clusters are numbered in order of first use, so the map is dense.
+fn cluster_histograms(hist: &[u32], count: usize, limit: usize, map: &mut[u8], sums: &mut[u32], choice: &mut[u32]) -> usize {
+    symbol_storage := [0u16; 272]
+    used := used_symbols(hist, count, &mut symbol_storage)
+    syms := &symbol_storage[..used]
+    for i in 0usize..MAX_ALPHA * limit {
+        sums[i] = 0
+    }
+    // Costs of each context alone, and its cheapest merge so far.
+    alone := [0u64; 256]
+    nearest := [0u64; 256]
+    first := count
+    best_total := 0u64
+    for i in 0usize..count {
+        alone[i] = histogram_cost(hist, i * MAX_ALPHA, syms)
+        total := 0u64
+        for k in 0usize..used {
+            total += hist[i * MAX_ALPHA + syms[k] as usize] as u64
+        }
+        if total > best_total {
+            best_total = total
+            first = i
+        }
+    }
+    if first == count {
+        // Nothing coded at all: one empty cluster.
+        for i in 0usize..count {
+            map[i] = 0
+        }
+        return 1
+    }
+    seeds := [0usize; 32]
+    seed_cost := [0u64; 32]
+    seed_count := 0usize
+    next := first
+    for {
+        seeds[seed_count] = next
+        for k in 0usize..used {
+            s := syms[k] as usize
+            sums[seed_count * MAX_ALPHA + s] = hist[next * MAX_ALPHA + s]
+        }
+        seed_cost[seed_count] = alone[next]
+        // Update every context's cheapest merge with the new seed, then
+        // pick the context that is most expensive to merge anywhere.
+        worst := count
+        worst_delta := 0u64
+        for i in 0usize..count {
+            if alone[i] == 0 {
+                continue
+            }
+            delta := 0u64
+            if i != next {
+                both := merged_cost(sums, seed_count * MAX_ALPHA, hist, i * MAX_ALPHA, syms)
+                if both > seed_cost[seed_count] + alone[i] {
+                    delta = both - seed_cost[seed_count] - alone[i]
+                }
+            }
+            if seed_count == 0 || delta < nearest[i] {
+                nearest[i] = delta
+            }
+            if nearest[i] > worst_delta {
+                worst_delta = nearest[i]
+                worst = i
+            }
+        }
+        seed_count += 1
+        if worst == count || seed_count >= limit {
+            break
+        }
+        next = worst
+    }
+    // Assign every context to its cheapest seed, measured against the seed
+    // histograms alone so the result does not depend on visiting order.
+    for i in 0usize..count {
+        pick := 0usize
+        if alone[i] != 0 {
+            best := 0xFFFFFFFFFFFFFFFFu64
+            for k in 0usize..seed_count {
+                if seeds[k] == i {
+                    pick = k
+                    break
+                }
+                both := merged_cost(sums, k * MAX_ALPHA, hist, i * MAX_ALPHA, syms)
+                delta := 0u64
+                if both > seed_cost[k] {
+                    delta = both - seed_cost[k]
+                }
+                if delta < best {
+                    best = delta
+                    pick = k
+                }
+            }
+        }
+        choice[i] = pick as u32
+    }
+    // Renumber clusters by first use and sum their histograms.
+    rename := [255u8; 32]
+    clusters := 0usize
+    for i in 0usize..count {
+        k := choice[i] as usize
+        if rename[k] == 255 {
+            rename[k] = clusters as u8
+            clusters += 1
+        }
+        map[i] = rename[k]
+    }
+    for i in 0usize..MAX_ALPHA * limit {
+        sums[i] = 0
+    }
+    for i in 0usize..count {
+        k := map[i] as usize
+        for j in 0usize..used {
+            s := syms[j] as usize
+            sums[k * MAX_ALPHA + s] = saturating_add(sums[k * MAX_ALPHA + s], hist[i * MAX_ALPHA + s])
+        }
+    }
+    return clusters
+}
+
+fn saturating_add(a: u32, b: u32) -> u32 {
+    if a > 0xFFFFFFFF - b {
+        return 0xFFFFFFFF
+    }
+    return a + b
+}
+
+// Prefix codes for a set of clustered histograms.
+struct CodeSet {
+    // Context to cluster.
+    map: &mut[u8]
+    // Per cluster: lengths and codes at cluster * MAX_ALPHA.
+    lengths: &mut[u8]
+    codes: &mut[u16]
+    contexts: usize
+    clusters: usize
+    // Alphabet size per cluster.
+    alphabets: [32]u16
+    // Clusters whose code has one symbol, written with zero bits.
+    singles: [32]bool
+    split: u32
+    msb: u32
+    lsb: u32
+    lz77: bool
+    min_length: u32
+
+    // Build codes from cluster histograms sums[cluster * MAX_ALPHA..].
+    fn build(&mut self, sums: &[u32]) {
+        freq := [0u64; 272]
+        for k in 0usize..self.clusters {
+            alphabet := 1usize
+            for s in 0usize..MAX_ALPHA {
+                freq[s] = sums[k * MAX_ALPHA + s] as u64
+                if freq[s] != 0 {
+                    alphabet = s + 1
+                }
+            }
+            self.alphabets[k] = alphabet as u16
+            base := k * MAX_ALPHA
+            used := huffman_lengths(&freq, alphabet, &mut self.lengths[base..base + MAX_ALPHA], MAX_CODE_LENGTH, false)
+            self.singles[k] = used <= 1
+            if used <= 1 {
+                // A single symbol costs zero bits.
+                for s in 0usize..alphabet {
+                    self.lengths[base + s] = 0
+                }
+                for s in 0usize..alphabet {
+                    if freq[s] != 0 {
+                        self.lengths[base + s] = 1
+                    }
+                }
+                for s in 0usize..MAX_ALPHA {
+                    self.codes[base + s] = 0
+                }
+            } else {
+                canonical_codes(&self.lengths[base..base + MAX_ALPHA], alphabet, &mut self.codes[base..base + MAX_ALPHA])
+            }
+            for s in alphabet..MAX_ALPHA {
+                self.lengths[base + s] = 0
+            }
+        }
+    }
+    // Write symbol s of the cluster that context ctx maps to.
+    fn put(&self, w: &mut BitWriter, ctx: usize, s: usize) {
+        k := self.map[ctx] as usize
+        if !self.singles[k] {
+            w.write(self.lengths[k * MAX_ALPHA + s] as u32, self.codes[k * MAX_ALPHA + s] as u64)
+        }
+    }
+    // The LZ77 parameters, context map, hybrid integer configurations and
+    // prefix codes, in codestream order.
+    fn write(&self, w: &mut BitWriter) {
+        w.bit(self.lz77)
+        if self.lz77 {
+            // min_symbol 224, min_length, length config 4, 0, 0.
+            w.u32(LZ77_MIN_SYMBOL, 224, 0, 512, 0, 4096, 0, 8, 15)
+            w.u32(self.min_length, 3, 0, 4, 0, 5, 2, 9, 8)
+            write_config(w, 8, LZ77_LEN_SPLIT, 0, 0)
+        }
+        if self.contexts > 1 {
+            write_context_map(w, self.map, self.contexts, self.clusters)
+        }
+        w.write(1, 1)
+        for k in 0usize..self.clusters {
+            write_config(w, 15, self.split, self.msb, self.lsb)
+        }
+        for k in 0usize..self.clusters {
+            alphabet := self.alphabets[k] as u32
+            if alphabet <= 1 {
+                w.write(1, 0)
+            } else {
+                n := floor_log2((alphabet - 1) as u64)
+                w.write(1, 1)
+                w.write(4, n as u64)
+                w.write(n, (alphabet - 1 - (1u32 << n)) as u64)
+            }
+        }
+        for k in 0usize..self.clusters {
+            base := k * MAX_ALPHA
+            write_prefix_code(w, &self.lengths[base..base + MAX_ALPHA], self.alphabets[k] as usize)
+        }
+    }
+}
+
+// HybridUintConfig for an alphabet of 2^log_alpha symbols.
+fn write_config(w: &mut BitWriter, log_alpha: u32, split: u32, msb: u32, lsb: u32) {
+    w.write(bits_for(log_alpha), split as u64)
+    if split != log_alpha {
+        w.write(bits_for(split), msb as u64)
+        w.write(bits_for(split - msb), lsb as u64)
+    }
+}
+
+// The context map: a simple fixed-width map for up to 8 clusters, else a
+// prefix-coded one (no MTF, no LZ77).
+fn write_context_map(w: &mut BitWriter, map: &[u8], contexts: usize, clusters: usize) {
+    if clusters <= 8 {
+        nbits := bits_for((clusters - 1) as u32)
+        w.write(1, 1)
+        w.write(2, nbits as u64)
+        for i in 0usize..contexts {
+            w.write(nbits, map[i] as u64)
+        }
+        return
+    }
+    w.write(1, 0)
+    w.write(1, 0)
+    // Nested code spec: no LZ77, one context, prefix code, values as
+    // tokens (split exponent 15).
+    freq := [0u64; 272]
+    alphabet := 1usize
+    for i in 0usize..contexts {
+        freq[map[i] as usize] += 1
+        if map[i] as usize + 1 > alphabet {
+            alphabet = map[i] as usize + 1
+        }
+    }
+    lengths := [0u8; 272]
+    codes := [0u16; 272]
+    used := huffman_lengths(&freq, alphabet, &mut lengths, MAX_CODE_LENGTH, false)
+    single := used <= 1
+    if !single {
+        canonical_codes(&lengths, alphabet, &mut codes)
+    }
+    w.write(1, 0)
+    w.write(1, 1)
+    write_config(w, 15, 15, 0, 0)
+    n := floor_log2((alphabet - 1) as u64)
+    w.write(1, 1)
+    w.write(4, n as u64)
+    w.write(n, (alphabet as u32 - 1 - (1u32 << n)) as u64)
+    write_prefix_code(w, &lengths, alphabet)
+    if !single {
+        for i in 0usize..contexts {
+            s := map[i] as usize
+            w.write(lengths[s] as u32, codes[s] as u64)
+        }
+    }
+}

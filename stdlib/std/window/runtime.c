@@ -8,8 +8,11 @@
  * 1 and are never reused, so a stale id simply finds nothing. Each window's
  * pixel buffer is 32-bit BGRA, top-down, and owned by std/window, which
  * attaches it here whenever it replaces it; the window system repaints from
- * it. Events of every window are queued in one ring and handed out one at a
- * time in the std/window/raw Event layout, which names the window.
+ * it. A window opened for the GPU has no buffer: the program draws into it
+ * through its native handle (dodo_window_native) or, on macOS, a CAMetalLayer
+ * (dodo_window_metal_layer), and present refuses it. Events of every window
+ * are queued in one ring and handed out one at a time in the std/window/raw
+ * Event layout, which names the window.
  *
  * Error codes match std/window/raw from_code: 0 success, 1 NoDisplay,
  * 2 AlreadyOpen, 3 Closed, 4 InvalidInput, 5 OutOfMemory, 6 Protocol,
@@ -38,6 +41,9 @@ enum {
 };
 enum { F_PRESSED = 1, F_REPEAT = 2 };
 enum { M_SHIFT = 1, M_CONTROL = 2, M_ALT = 4, M_META = 8, M_CAPS = 16 };
+/* dodo_window_open flags, and the kinds dodo_window_native reports. */
+enum { O_RESIZABLE = 1, O_PIXEL_BUFFER = 2 };
+enum { NATIVE_APPKIT = 1, NATIVE_WIN32 = 2 };
 #define FOREVER 0xffffffffu
 
 struct dodo_window_event {
@@ -129,8 +135,12 @@ struct dodo_window {
     uint8_t *pixels;
     uint32_t pixel_width, pixel_height;
     int cursor_hidden, mouse_inside;
+    /* Opened without a pixel buffer, for drawing with the GPU. */
+    int gpu;
 #if defined(__APPLE__)
-    id window, view, layer;
+    /* layer shows the pixel buffer; a GPU window has none, and metal_layer
+     * is the CAMetalLayer dodo_window_metal_layer made, retained here. */
+    id window, view, layer, metal_layer;
     /* A CADisplayLink, paused except between request_frame and the refresh
      * it reports, and the refresh period it measured. */
     id display_link;
@@ -209,6 +219,7 @@ typedef long (*send_long)(id, SEL);
 typedef CGPoint (*send_point)(id, SEL);
 typedef CGPoint (*send_point_point)(id, SEL, CGPoint);
 typedef CGPoint (*send_point_point_id)(id, SEL, CGPoint, id);
+typedef void (*send_void_size)(id, SEL, CGSize);
 typedef const char *(*send_cstring)(id, SEL);
 
 static id cls(const char *name) { return (id)objc_getClass(name); }
@@ -288,7 +299,15 @@ static unsigned long modifier_bit(unsigned short code) {
 static void update_scale(struct dodo_window *w) {
     double scale = SEND(send_double)(w->window, sel("backingScaleFactor"));
     w->backing_scale = scale > 0 ? scale : 1;
-    SEND(send_void_double)(w->layer, sel("setContentsScale:"), w->backing_scale);
+    if (w->layer) SEND(send_void_double)(w->layer, sel("setContentsScale:"), w->backing_scale);
+    if (w->metal_layer) SEND(send_void_double)(w->metal_layer, sel("setContentsScale:"), w->backing_scale);
+}
+
+/* Keep the Metal layer's drawables at the drawing area's size in pixels. */
+static void size_metal_layer(struct dodo_window *w) {
+    if (!w->metal_layer) return;
+    CGSize size = CGSizeMake(w->width ? w->width : 1, w->height ? w->height : 1);
+    SEND(send_void_size)(w->metal_layer, sel("setDrawableSize:"), size);
 }
 
 /* Record the content view's size in pixels, reporting a change. */
@@ -300,6 +319,7 @@ static void sync_size(struct dodo_window *w, int report) {
     uint32_t pw = width > 0 ? (uint32_t)width : 0, ph = height > 0 ? (uint32_t)height : 0;
     if (pw == w->width && ph == w->height) return;
     w->width = pw; w->height = ph;
+    size_metal_layer(w);
     if (report) push(w->id, EV_RESIZE, 0, 0, 0, (int32_t)pw, (int32_t)ph);
 }
 
@@ -436,6 +456,7 @@ static void destroy_window(struct dodo_window *w) {
         msg_void(w->window, "close");
         msg_void(w->window, "release");
     }
+    if (w->metal_layer) msg_void(w->metal_layer, "release");
     purge(w->id, 0);
     free(w);
     apply_cursor();
@@ -478,10 +499,12 @@ void dodo_window_disconnect(void) {
     objc_autoreleasePoolPop(pool);
 }
 
-int32_t dodo_window_open(const uint8_t *title, size_t title_length, uint32_t width, uint32_t height, uint32_t resizable, uint32_t *handle) {
+int32_t dodo_window_open(const uint8_t *title, size_t title_length, uint32_t width, uint32_t height, uint32_t flags, uint32_t *handle) {
     if (!connected) return E_CLOSED;
     struct dodo_window *w = new_window();
     if (!w) return E_MEMORY;
+    int resizable = (flags & O_RESIZABLE) != 0;
+    w->gpu = (flags & O_PIXEL_BUFFER) == 0;
     void *pool = objc_autoreleasePoolPush();
     unsigned long style = 1 | 2 | 4 | (resizable ? 8 : 0); /* titled, closable, miniaturizable, resizable */
     CGRect frame = CGRectMake(0, 0, width, height);
@@ -494,10 +517,14 @@ int32_t dodo_window_open(const uint8_t *title, size_t title_length, uint32_t wid
     msg_void_id(w->window, "setTitle:", text);
     msg_void(text, "release");
     w->view = msg(w->window, "contentView");
-    msg_void_bool(w->view, "setWantsLayer:", YES);
-    w->layer = msg(w->view, "layer");
-    msg_void_id(w->layer, "setContentsGravity:", kCAGravityTopLeft);
-    msg_void_id(w->layer, "setMagnificationFilter:", kCAFilterNearest);
+    /* The pixel buffer is shown as the contents of the view's layer. A GPU
+     * window leaves the view alone for NSOpenGLContext or a Metal layer. */
+    if (!w->gpu) {
+        msg_void_bool(w->view, "setWantsLayer:", YES);
+        w->layer = msg(w->view, "layer");
+        msg_void_id(w->layer, "setContentsGravity:", kCAGravityTopLeft);
+        msg_void_id(w->layer, "setMagnificationFilter:", kCAFilterNearest);
+    }
     create_display_link(w);
     /* Moves and exits over the drawing area, focused or not. */
     id area = SEND(id (*)(id, SEL, CGRect, unsigned long, id, id))(msg(cls("NSTrackingArea"), "alloc"),
@@ -647,6 +674,7 @@ int32_t dodo_window_present(uint32_t window, int32_t x, int32_t y, uint32_t widt
     (void)x; (void)y; (void)width; (void)height;
     struct dodo_window *w = find(window);
     if (!w) return E_CLOSED;
+    if (w->gpu) return E_UNSUPPORTED;
     if (!w->pixels || !w->pixel_width || !w->pixel_height) return 0;
     void *pool = objc_autoreleasePoolPush();
     /* The image takes a copy, so the program can keep drawing at once. */
@@ -694,6 +722,38 @@ uint32_t dodo_window_scale_percent(uint32_t window) {
     struct dodo_window *w = find(window);
     if (!w) return 100;
     return (uint32_t)lround(w->backing_scale * 100);
+}
+
+/* The NSWindow and its content view; negative error codes. */
+int32_t dodo_window_native(uint32_t window, uintptr_t *first, uintptr_t *second) {
+    struct dodo_window *w = find(window);
+    if (!w) return -E_CLOSED;
+    *first = (uintptr_t)w->window; *second = (uintptr_t)w->view;
+    return NATIVE_APPKIT;
+}
+
+/* Make a CAMetalLayer the GPU window's backing layer, once: a layer-hosting
+ * view, so the layer is set before wantsLayer. */
+int32_t dodo_window_metal_layer(uint32_t window, uintptr_t *out) {
+    *out = 0;
+    struct dodo_window *w = find(window);
+    if (!w) return E_CLOSED;
+    if (!w->gpu) return E_UNSUPPORTED;
+    if (!w->metal_layer) {
+        id type = cls("CAMetalLayer");
+        if (!type) return E_UNSUPPORTED;
+        void *pool = objc_autoreleasePoolPush();
+        id created = msg(msg(type, "alloc"), "init");
+        if (!created) { objc_autoreleasePoolPop(pool); return E_SYSTEM; }
+        w->metal_layer = created;
+        msg_void_id(w->view, "setLayer:", w->metal_layer);
+        msg_void_bool(w->view, "setWantsLayer:", YES);
+        update_scale(w);
+        size_metal_layer(w);
+        objc_autoreleasePoolPop(pool);
+    }
+    *out = (uintptr_t)w->metal_layer;
+    return 0;
 }
 
 /* mach_absolute_time in nanoseconds, the clock CADisplayLink uses. */
@@ -1041,8 +1101,10 @@ static void blit(struct dodo_window *w, HDC dc, int32_t x, int32_t y, uint32_t w
 }
 
 /* Repaint from the buffer; until the program draws at a new size, the part
- * of the window beyond the buffer is black. */
+ * of the window beyond the buffer is black. A GPU window is left to its
+ * program, which draws over GDI. */
 static void paint(struct dodo_window *w, HDC dc) {
+    if (w->gpu) return;
     RECT client;
     GetClientRect(w->hwnd, &client);
     LONG covered_width = w->pixels ? (LONG)w->pixel_width : 0;
@@ -1224,12 +1286,14 @@ void dodo_window_disconnect(void) {
     connected = 0;
 }
 
-int32_t dodo_window_open(const uint8_t *title, size_t title_length, uint32_t width, uint32_t height, uint32_t resizable, uint32_t *handle) {
+int32_t dodo_window_open(const uint8_t *title, size_t title_length, uint32_t width, uint32_t height, uint32_t flags, uint32_t *handle) {
     if (!connected) return E_CLOSED;
+    int resizable = (flags & O_RESIZABLE) != 0;
     WCHAR *text = wide_from(title, title_length);
     if (!text) return E_MEMORY;
     struct dodo_window *w = new_window();
     if (!w) { free(text); return E_MEMORY; }
+    w->gpu = (flags & O_PIXEL_BUFFER) == 0;
     DWORD style = WS_OVERLAPPEDWINDOW;
     if (!resizable) style &= ~(DWORD)(WS_THICKFRAME | WS_MAXIMIZEBOX);
     HWND hwnd = CreateWindowExW(0, L"DodoWindow", text, style, CW_USEDEFAULT, CW_USEDEFAULT,
@@ -1373,6 +1437,7 @@ int32_t dodo_window_next_event(uint32_t milliseconds, struct dodo_window_event *
 int32_t dodo_window_present(uint32_t window, int32_t x, int32_t y, uint32_t width, uint32_t height) {
     struct dodo_window *w = find(window);
     if (!w) return E_CLOSED;
+    if (w->gpu) return E_UNSUPPORTED;
     if (!w->pixels || !w->pixel_width || !w->pixel_height) return 0;
     HDC dc = GetDC(w->hwnd);
     if (!dc) return E_SYSTEM;
@@ -1406,5 +1471,19 @@ uint32_t dodo_window_scale_percent(uint32_t window) {
     struct dodo_window *w = find(window);
     if (!w) return 100;
     return (uint32_t)MulDiv((int)w->dpi, 100, 96);
+}
+
+/* The HWND and the module that registered its class; negative error codes. */
+int32_t dodo_window_native(uint32_t window, uintptr_t *first, uintptr_t *second) {
+    struct dodo_window *w = find(window);
+    if (!w) return -E_CLOSED;
+    *first = (uintptr_t)w->hwnd; *second = (uintptr_t)GetModuleHandleW(NULL);
+    return NATIVE_WIN32;
+}
+
+/* Metal layers are macOS only. */
+int32_t dodo_window_metal_layer(uint32_t window, uintptr_t *out) {
+    *out = 0;
+    return find(window) ? E_UNSUPPORTED : E_CLOSED;
 }
 #endif

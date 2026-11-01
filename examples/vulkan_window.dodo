@@ -1,0 +1,945 @@
+package main
+
+import "core/mem"
+import "core/ptr"
+import "std/console"
+import "std/env"
+import "std/gpu/vulkan" as vk
+import "std/platform"
+import "std/text"
+import "std/window"
+import "std/window/handle"
+
+// Draw a spinning triangle with Vulkan straight into a std/window window.
+//
+// The window has no pixel buffer. Its native handle becomes a Vulkan
+// surface: VK_KHR_xcb_surface on Linux, VK_KHR_win32_surface on Windows and
+// VK_EXT_metal_surface on macOS (MoltenVK), where win.metal_layer() gives the
+// window's view the CAMetalLayer to present to. Frames go through a FIFO
+// swapchain that is rebuilt when the window is resized. Press Escape or close
+// the window to quit; a number argument stops after that many frames:
+//
+//     dodo run examples/vulkan_window.dodo
+//     dodo run examples/vulkan_window.dodo -- 120
+//
+// The shaders (GLSL below, compiled to SPIR-V with glslangValidator -V) place
+// the corners themselves, so there is no vertex buffer:
+//
+//     #version 450
+//     layout(push_constant) uniform Spin { float angle; vec2 aspect; } spin;
+//     layout(location = 0) out vec3 shade;
+//     const vec2 corners[3] = vec2[](vec2(-0.6, 0.5), vec2(0.6, 0.5), vec2(0.0, -0.7));
+//     const vec3 colors[3] = vec3[](vec3(1.0, 0.3, 0.2), vec3(0.2, 0.9, 0.4), vec3(0.3, 0.4, 1.0));
+//     void main() {
+//         float c = cos(spin.angle);
+//         float s = sin(spin.angle);
+//         gl_Position = vec4(mat2(c, s, -s, c) * corners[gl_VertexIndex] * spin.aspect, 0.0, 1.0);
+//         shade = colors[gl_VertexIndex];
+//     }
+//
+//     #version 450
+//     layout(location = 0) in vec3 shade;
+//     layout(location = 0) out vec4 result;
+//     void main() {
+//         result = vec4(shade, 1.0);
+//     }
+//
+// Every Vulkan call is unsafe, as in C. Without a Vulkan driver the program
+// says so and exits with status 2.
+
+// The most swapchain images this program handles.
+const IMAGES: usize = 8
+
+const VERTEX_SHADER: [549]u32 = [
+    0x07230203, 0x00010000, 0x0008000b, 0x00000058, 0x00000000, 0x00020011,
+    0x00000001, 0x0006000b, 0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e,
+    0x00000000, 0x0003000e, 0x00000000, 0x00000001, 0x0008000f, 0x00000000,
+    0x00000004, 0x6e69616d, 0x00000000, 0x0000001d, 0x00000034, 0x00000048,
+    0x00030003, 0x00000002, 0x000001c2, 0x00040005, 0x00000004, 0x6e69616d,
+    0x00000000, 0x00030005, 0x00000008, 0x00000063, 0x00040005, 0x0000000a,
+    0x6e697053, 0x00000000, 0x00050006, 0x0000000a, 0x00000000, 0x6c676e61,
+    0x00000065, 0x00050006, 0x0000000a, 0x00000001, 0x65707361, 0x00007463,
+    0x00040005, 0x0000000c, 0x6e697073, 0x00000000, 0x00030005, 0x00000013,
+    0x00000073, 0x00060005, 0x0000001b, 0x505f6c67, 0x65567265, 0x78657472,
+    0x00000000, 0x00060006, 0x0000001b, 0x00000000, 0x505f6c67, 0x7469736f,
+    0x006e6f69, 0x00070006, 0x0000001b, 0x00000001, 0x505f6c67, 0x746e696f,
+    0x657a6953, 0x00000000, 0x00070006, 0x0000001b, 0x00000002, 0x435f6c67,
+    0x4470696c, 0x61747369, 0x0065636e, 0x00070006, 0x0000001b, 0x00000003,
+    0x435f6c67, 0x446c6c75, 0x61747369, 0x0065636e, 0x00030005, 0x0000001d,
+    0x00000000, 0x00060005, 0x00000034, 0x565f6c67, 0x65747265, 0x646e4978,
+    0x00007865, 0x00050005, 0x00000037, 0x65646e69, 0x6c626178, 0x00000065,
+    0x00040005, 0x00000048, 0x64616873, 0x00000065, 0x00050005, 0x00000054,
+    0x65646e69, 0x6c626178, 0x00000065, 0x00030047, 0x0000000a, 0x00000002,
+    0x00050048, 0x0000000a, 0x00000000, 0x00000023, 0x00000000, 0x00050048,
+    0x0000000a, 0x00000001, 0x00000023, 0x00000008, 0x00030047, 0x0000001b,
+    0x00000002, 0x00050048, 0x0000001b, 0x00000000, 0x0000000b, 0x00000000,
+    0x00050048, 0x0000001b, 0x00000001, 0x0000000b, 0x00000001, 0x00050048,
+    0x0000001b, 0x00000002, 0x0000000b, 0x00000003, 0x00050048, 0x0000001b,
+    0x00000003, 0x0000000b, 0x00000004, 0x00040047, 0x00000034, 0x0000000b,
+    0x0000002a, 0x00040047, 0x00000048, 0x0000001e, 0x00000000, 0x00020013,
+    0x00000002, 0x00030021, 0x00000003, 0x00000002, 0x00030016, 0x00000006,
+    0x00000020, 0x00040020, 0x00000007, 0x00000007, 0x00000006, 0x00040017,
+    0x00000009, 0x00000006, 0x00000002, 0x0004001e, 0x0000000a, 0x00000006,
+    0x00000009, 0x00040020, 0x0000000b, 0x00000009, 0x0000000a, 0x0004003b,
+    0x0000000b, 0x0000000c, 0x00000009, 0x00040015, 0x0000000d, 0x00000020,
+    0x00000001, 0x0004002b, 0x0000000d, 0x0000000e, 0x00000000, 0x00040020,
+    0x0000000f, 0x00000009, 0x00000006, 0x00040017, 0x00000017, 0x00000006,
+    0x00000004, 0x00040015, 0x00000018, 0x00000020, 0x00000000, 0x0004002b,
+    0x00000018, 0x00000019, 0x00000001, 0x0004001c, 0x0000001a, 0x00000006,
+    0x00000019, 0x0006001e, 0x0000001b, 0x00000017, 0x00000006, 0x0000001a,
+    0x0000001a, 0x00040020, 0x0000001c, 0x00000003, 0x0000001b, 0x0004003b,
+    0x0000001c, 0x0000001d, 0x00000003, 0x00040018, 0x00000023, 0x00000009,
+    0x00000002, 0x0004002b, 0x00000006, 0x00000024, 0x3f800000, 0x0004002b,
+    0x00000006, 0x00000025, 0x00000000, 0x0004002b, 0x00000018, 0x00000029,
+    0x00000003, 0x0004001c, 0x0000002a, 0x00000009, 0x00000029, 0x0004002b,
+    0x00000006, 0x0000002b, 0xbf19999a, 0x0004002b, 0x00000006, 0x0000002c,
+    0x3f000000, 0x0005002c, 0x00000009, 0x0000002d, 0x0000002b, 0x0000002c,
+    0x0004002b, 0x00000006, 0x0000002e, 0x3f19999a, 0x0005002c, 0x00000009,
+    0x0000002f, 0x0000002e, 0x0000002c, 0x0004002b, 0x00000006, 0x00000030,
+    0xbf333333, 0x0005002c, 0x00000009, 0x00000031, 0x00000025, 0x00000030,
+    0x0006002c, 0x0000002a, 0x00000032, 0x0000002d, 0x0000002f, 0x00000031,
+    0x00040020, 0x00000033, 0x00000001, 0x0000000d, 0x0004003b, 0x00000033,
+    0x00000034, 0x00000001, 0x00040020, 0x00000036, 0x00000007, 0x0000002a,
+    0x00040020, 0x00000038, 0x00000007, 0x00000009, 0x0004002b, 0x0000000d,
+    0x0000003c, 0x00000001, 0x00040020, 0x0000003d, 0x00000009, 0x00000009,
+    0x00040020, 0x00000044, 0x00000003, 0x00000017, 0x00040017, 0x00000046,
+    0x00000006, 0x00000003, 0x00040020, 0x00000047, 0x00000003, 0x00000046,
+    0x0004003b, 0x00000047, 0x00000048, 0x00000003, 0x0004001c, 0x00000049,
+    0x00000046, 0x00000029, 0x0004002b, 0x00000006, 0x0000004a, 0x3e99999a,
+    0x0004002b, 0x00000006, 0x0000004b, 0x3e4ccccd, 0x0006002c, 0x00000046,
+    0x0000004c, 0x00000024, 0x0000004a, 0x0000004b, 0x0004002b, 0x00000006,
+    0x0000004d, 0x3f666666, 0x0004002b, 0x00000006, 0x0000004e, 0x3ecccccd,
+    0x0006002c, 0x00000046, 0x0000004f, 0x0000004b, 0x0000004d, 0x0000004e,
+    0x0006002c, 0x00000046, 0x00000050, 0x0000004a, 0x0000004e, 0x00000024,
+    0x0006002c, 0x00000049, 0x00000051, 0x0000004c, 0x0000004f, 0x00000050,
+    0x00040020, 0x00000053, 0x00000007, 0x00000049, 0x00040020, 0x00000055,
+    0x00000007, 0x00000046, 0x00050036, 0x00000002, 0x00000004, 0x00000000,
+    0x00000003, 0x000200f8, 0x00000005, 0x0004003b, 0x00000007, 0x00000008,
+    0x00000007, 0x0004003b, 0x00000007, 0x00000013, 0x00000007, 0x0004003b,
+    0x00000036, 0x00000037, 0x00000007, 0x0004003b, 0x00000053, 0x00000054,
+    0x00000007, 0x00050041, 0x0000000f, 0x00000010, 0x0000000c, 0x0000000e,
+    0x0004003d, 0x00000006, 0x00000011, 0x00000010, 0x0006000c, 0x00000006,
+    0x00000012, 0x00000001, 0x0000000e, 0x00000011, 0x0003003e, 0x00000008,
+    0x00000012, 0x00050041, 0x0000000f, 0x00000014, 0x0000000c, 0x0000000e,
+    0x0004003d, 0x00000006, 0x00000015, 0x00000014, 0x0006000c, 0x00000006,
+    0x00000016, 0x00000001, 0x0000000d, 0x00000015, 0x0003003e, 0x00000013,
+    0x00000016, 0x0004003d, 0x00000006, 0x0000001e, 0x00000008, 0x0004003d,
+    0x00000006, 0x0000001f, 0x00000013, 0x0004003d, 0x00000006, 0x00000020,
+    0x00000013, 0x0004007f, 0x00000006, 0x00000021, 0x00000020, 0x0004003d,
+    0x00000006, 0x00000022, 0x00000008, 0x00050050, 0x00000009, 0x00000026,
+    0x0000001e, 0x0000001f, 0x00050050, 0x00000009, 0x00000027, 0x00000021,
+    0x00000022, 0x00050050, 0x00000023, 0x00000028, 0x00000026, 0x00000027,
+    0x0004003d, 0x0000000d, 0x00000035, 0x00000034, 0x0003003e, 0x00000037,
+    0x00000032, 0x00050041, 0x00000038, 0x00000039, 0x00000037, 0x00000035,
+    0x0004003d, 0x00000009, 0x0000003a, 0x00000039, 0x00050091, 0x00000009,
+    0x0000003b, 0x00000028, 0x0000003a, 0x00050041, 0x0000003d, 0x0000003e,
+    0x0000000c, 0x0000003c, 0x0004003d, 0x00000009, 0x0000003f, 0x0000003e,
+    0x00050085, 0x00000009, 0x00000040, 0x0000003b, 0x0000003f, 0x00050051,
+    0x00000006, 0x00000041, 0x00000040, 0x00000000, 0x00050051, 0x00000006,
+    0x00000042, 0x00000040, 0x00000001, 0x00070050, 0x00000017, 0x00000043,
+    0x00000041, 0x00000042, 0x00000025, 0x00000024, 0x00050041, 0x00000044,
+    0x00000045, 0x0000001d, 0x0000000e, 0x0003003e, 0x00000045, 0x00000043,
+    0x0004003d, 0x0000000d, 0x00000052, 0x00000034, 0x0003003e, 0x00000054,
+    0x00000051, 0x00050041, 0x00000055, 0x00000056, 0x00000054, 0x00000052,
+    0x0004003d, 0x00000046, 0x00000057, 0x00000056, 0x0003003e, 0x00000048,
+    0x00000057, 0x000100fd, 0x00010038,
+]
+
+const FRAGMENT_SHADER: [123]u32 = [
+    0x07230203, 0x00010000, 0x0008000b, 0x00000013, 0x00000000, 0x00020011,
+    0x00000001, 0x0006000b, 0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e,
+    0x00000000, 0x0003000e, 0x00000000, 0x00000001, 0x0007000f, 0x00000004,
+    0x00000004, 0x6e69616d, 0x00000000, 0x00000009, 0x0000000c, 0x00030010,
+    0x00000004, 0x00000007, 0x00030003, 0x00000002, 0x000001c2, 0x00040005,
+    0x00000004, 0x6e69616d, 0x00000000, 0x00040005, 0x00000009, 0x75736572,
+    0x0000746c, 0x00040005, 0x0000000c, 0x64616873, 0x00000065, 0x00040047,
+    0x00000009, 0x0000001e, 0x00000000, 0x00040047, 0x0000000c, 0x0000001e,
+    0x00000000, 0x00020013, 0x00000002, 0x00030021, 0x00000003, 0x00000002,
+    0x00030016, 0x00000006, 0x00000020, 0x00040017, 0x00000007, 0x00000006,
+    0x00000004, 0x00040020, 0x00000008, 0x00000003, 0x00000007, 0x0004003b,
+    0x00000008, 0x00000009, 0x00000003, 0x00040017, 0x0000000a, 0x00000006,
+    0x00000003, 0x00040020, 0x0000000b, 0x00000001, 0x0000000a, 0x0004003b,
+    0x0000000b, 0x0000000c, 0x00000001, 0x0004002b, 0x00000006, 0x0000000e,
+    0x3f800000, 0x00050036, 0x00000002, 0x00000004, 0x00000000, 0x00000003,
+    0x000200f8, 0x00000005, 0x0004003d, 0x0000000a, 0x0000000d, 0x0000000c,
+    0x00050051, 0x00000006, 0x0000000f, 0x0000000d, 0x00000000, 0x00050051,
+    0x00000006, 0x00000010, 0x0000000d, 0x00000001, 0x00050051, 0x00000006,
+    0x00000011, 0x0000000d, 0x00000002, 0x00070050, 0x00000007, 0x00000012,
+    0x0000000f, 0x00000010, 0x00000011, 0x0000000e, 0x0003003e, 0x00000009,
+    0x00000012, 0x000100fd, 0x00010038,
+]
+
+// Everything that lives as long as the device.
+struct Gpu {
+    instance: vk.Instance
+    surface: vk.SurfaceKHR
+    physical: vk.PhysicalDevice
+    device: vk.Device
+    queue: vk.Queue
+    family: u32
+    format: vk.Format
+    color_space: vk.ColorSpaceKHR
+    render_pass: vk.RenderPass
+    layout: vk.PipelineLayout
+    pipeline: vk.Pipeline
+    command_pool: vk.CommandPool
+    commands: vk.CommandBuffer
+    // Signalled when the acquired image is free, and when the frame's
+    // commands have run.
+    acquired: vk.Semaphore
+    fence: vk.Fence
+}
+
+// The swapchain and one view, framebuffer and "rendered" semaphore per
+// image; a semaphore per image keeps presentation from reusing one that a
+// pending present still waits on.
+struct Swapchain {
+    handle: vk.SwapchainKHR
+    count: u32
+    width: u32
+    height: u32
+    images: [IMAGES]vk.Image
+    views: [IMAGES]vk.ImageView
+    framebuffers: [IMAGES]vk.Framebuffer
+    rendered: [IMAGES]vk.Semaphore
+}
+
+fn failure(code: vk.Result) -> vk.Error {
+    return vk.Error { code: code }
+}
+
+fn f32_bits(value: f32) -> u32 {
+    copy := value
+    return unsafe {
+        ptr.read(ptr.from_ref(&copy) as *const u32)
+    }
+}
+
+// The surface extension for this window system, and the surface itself.
+fn surface_extension(native: &handle.NativeHandle) -> &[u8] from(static) {
+    match native {
+        handle.NativeHandle.Xcb(_, _, _, _) => {
+            return vk.KHR_XCB_SURFACE_EXTENSION_NAME
+        }
+        handle.NativeHandle.AppKit(_, _) => {
+            return vk.EXT_METAL_SURFACE_EXTENSION_NAME
+        }
+        handle.NativeHandle.Win32(_, _) => {
+            return vk.KHR_WIN32_SURFACE_EXTENSION_NAME
+        }
+    }
+}
+
+fn create_surface(fns: &vk.InstanceFns, instance: vk.Instance, native: &handle.NativeHandle, layer: usize) -> vk.SurfaceKHR!vk.Error {
+    alloc := vk.no_allocator()
+    surface := vk.NULL_HANDLE
+    match native {
+        handle.NativeHandle.Xcb(connection, window_id, _, _) => {
+            info := vk.XcbSurfaceCreateInfoKHR.default()
+            info.connection = unsafe {
+                *connection as *mut u8
+            }
+            info.window = *window_id
+            unsafe {
+                vk.check(fns.create_xcb_surface_khr(instance, ptr.from_ref(&info), alloc, ptr.from_mut(&mut surface)))?
+            }
+        }
+        handle.NativeHandle.AppKit(_, _) => {
+            info := vk.MetalSurfaceCreateInfoEXT.default()
+            info.p_layer = unsafe {
+                layer as *const u8
+            }
+            unsafe {
+                vk.check(fns.create_metal_surface_ext(instance, ptr.from_ref(&info), alloc, ptr.from_mut(&mut surface)))?
+            }
+        }
+        handle.NativeHandle.Win32(hwnd, module) => {
+            info := vk.Win32SurfaceCreateInfoKHR.default()
+            info.hinstance = unsafe {
+                *module as *mut u8
+            }
+            info.hwnd = unsafe {
+                *hwnd as *mut u8
+            }
+            unsafe {
+                vk.check(fns.create_win32_surface_khr(instance, ptr.from_ref(&info), alloc, ptr.from_mut(&mut surface)))?
+            }
+        }
+    }
+    return ok(surface)
+}
+
+// Whether the instance or device extension list holds `name`.
+fn listed(extensions: &[vk.ExtensionProperties], count: u32, name: &[u8]) -> bool {
+    for i in 0usize..count as usize {
+        if vk.name_eq(&extensions[i].extension_name, name) {
+            return true
+        }
+    }
+    return false
+}
+
+// The first device with a queue family that draws and presents to the
+// surface: its family index, or none.
+fn find_family(fns: &vk.InstanceFns, physical: vk.PhysicalDevice, surface: vk.SurfaceKHR) -> Option<u32> {
+    families := unsafe {
+        vk.zeroed::<[16]vk.QueueFamilyProperties>()
+    }
+    count := 16u32
+    unsafe {
+        fns.get_physical_device_queue_family_properties(physical, ptr.from_mut(&mut count), ptr.as_mut_ptr(&mut families))
+    }
+    for i in 0u32..count {
+        supported := vk.FALSE
+        unsafe {
+            fns.get_physical_device_surface_support_khr(physical, i, surface, ptr.from_mut(&mut supported))
+        }
+        if (families[i as usize].queue_flags & vk.QUEUE_GRAPHICS_BIT) != 0 && supported == vk.TRUE {
+            return some(i)
+        }
+    }
+    return none
+}
+
+fn shader(d: &vk.DeviceFns, device: vk.Device, code: &[u32]) -> vk.ShaderModule!vk.Error {
+    info := vk.ShaderModuleCreateInfo.default()
+    info.code_size = code.len * 4
+    info.p_code = ptr.as_ptr(code)
+    module := vk.NULL_HANDLE
+    unsafe {
+        vk.check(d.create_shader_module(device, ptr.from_ref(&info), vk.no_allocator(), ptr.from_mut(&mut module)))?
+    }
+    return ok(module)
+}
+
+// The render pass, clearing the image and leaving it ready to present, and
+// the pipeline drawing into it with a dynamic viewport.
+fn create_pipeline(d: &vk.DeviceFns, gpu: &mut Gpu) -> void!vk.Error {
+    alloc := vk.no_allocator()
+    attachment := vk.AttachmentDescription.default()
+    attachment.format = gpu.format
+    attachment.samples = vk.SAMPLE_COUNT_1_BIT
+    attachment.load_op = vk.ATTACHMENT_LOAD_OP_CLEAR
+    attachment.store_op = vk.ATTACHMENT_STORE_OP_STORE
+    attachment.stencil_load_op = vk.ATTACHMENT_LOAD_OP_DONT_CARE
+    attachment.stencil_store_op = vk.ATTACHMENT_STORE_OP_DONT_CARE
+    attachment.initial_layout = vk.IMAGE_LAYOUT_UNDEFINED
+    attachment.final_layout = vk.IMAGE_LAYOUT_PRESENT_SRC_KHR
+    reference := vk.AttachmentReference.default()
+    reference.attachment = 0
+    reference.layout = vk.IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+    subpass := vk.SubpassDescription.default()
+    subpass.pipeline_bind_point = vk.PIPELINE_BIND_POINT_GRAPHICS
+    subpass.color_attachment_count = 1
+    subpass.p_color_attachments = ptr.from_ref(&reference)
+    // The clear waits until the presentation engine has let go of the image.
+    dependency := vk.SubpassDependency.default()
+    dependency.src_subpass = vk.SUBPASS_EXTERNAL
+    dependency.dst_subpass = 0
+    dependency.src_stage_mask = vk.PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
+    dependency.dst_stage_mask = vk.PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
+    dependency.dst_access_mask = vk.ACCESS_COLOR_ATTACHMENT_WRITE_BIT
+    pass_info := vk.RenderPassCreateInfo.default()
+    pass_info.attachment_count = 1
+    pass_info.p_attachments = ptr.from_ref(&attachment)
+    pass_info.subpass_count = 1
+    pass_info.p_subpasses = ptr.from_ref(&subpass)
+    pass_info.dependency_count = 1
+    pass_info.p_dependencies = ptr.from_ref(&dependency)
+    unsafe {
+        vk.check(d.create_render_pass(gpu.device, ptr.from_ref(&pass_info), alloc, ptr.from_mut(&mut gpu.render_pass)))?
+    }
+
+    push_range := vk.PushConstantRange.default()
+    push_range.stage_flags = vk.SHADER_STAGE_VERTEX_BIT
+    push_range.size = 16
+    layout_info := vk.PipelineLayoutCreateInfo.default()
+    layout_info.push_constant_range_count = 1
+    layout_info.p_push_constant_ranges = ptr.from_ref(&push_range)
+    unsafe {
+        vk.check(d.create_pipeline_layout(gpu.device, ptr.from_ref(&layout_info), alloc, ptr.from_mut(&mut gpu.layout)))?
+    }
+
+    vertex := shader(d, gpu.device, &VERTEX_SHADER)?
+    fragment := shader(d, gpu.device, &FRAGMENT_SHADER)?
+    stages := unsafe {
+        vk.zeroed::<[2]vk.PipelineShaderStageCreateInfo>()
+    }
+    stages[0] = vk.PipelineShaderStageCreateInfo.default()
+    stages[0].stage = vk.SHADER_STAGE_VERTEX_BIT
+    stages[0].module = vertex
+    stages[0].p_name = ptr.as_ptr(b"main\0")
+    stages[1] = vk.PipelineShaderStageCreateInfo.default()
+    stages[1].stage = vk.SHADER_STAGE_FRAGMENT_BIT
+    stages[1].module = fragment
+    stages[1].p_name = ptr.as_ptr(b"main\0")
+    vertex_input := vk.PipelineVertexInputStateCreateInfo.default()
+    assembly := vk.PipelineInputAssemblyStateCreateInfo.default()
+    assembly.topology = vk.PRIMITIVE_TOPOLOGY_TRIANGLE_LIST
+    viewport := vk.PipelineViewportStateCreateInfo.default()
+    viewport.viewport_count = 1
+    viewport.scissor_count = 1
+    raster := vk.PipelineRasterizationStateCreateInfo.default()
+    raster.polygon_mode = vk.POLYGON_MODE_FILL
+    raster.cull_mode = vk.CULL_MODE_NONE
+    raster.front_face = vk.FRONT_FACE_COUNTER_CLOCKWISE
+    raster.line_width = 1.0
+    multisample := vk.PipelineMultisampleStateCreateInfo.default()
+    multisample.rasterization_samples = vk.SAMPLE_COUNT_1_BIT
+    blend_attachment := vk.PipelineColorBlendAttachmentState.default()
+    blend_attachment.color_write_mask = vk.COLOR_COMPONENT_R_BIT | vk.COLOR_COMPONENT_G_BIT | vk.COLOR_COMPONENT_B_BIT | vk.COLOR_COMPONENT_A_BIT
+    blend := vk.PipelineColorBlendStateCreateInfo.default()
+    blend.attachment_count = 1
+    blend.p_attachments = ptr.from_ref(&blend_attachment)
+    dynamic_states := [vk.DYNAMIC_STATE_VIEWPORT, vk.DYNAMIC_STATE_SCISSOR]
+    dynamic := vk.PipelineDynamicStateCreateInfo.default()
+    dynamic.dynamic_state_count = 2
+    dynamic.p_dynamic_states = ptr.as_ptr(&dynamic_states)
+    pipeline_info := vk.GraphicsPipelineCreateInfo.default()
+    pipeline_info.stage_count = 2
+    pipeline_info.p_stages = ptr.as_ptr(&stages)
+    pipeline_info.p_vertex_input_state = ptr.from_ref(&vertex_input)
+    pipeline_info.p_input_assembly_state = ptr.from_ref(&assembly)
+    pipeline_info.p_viewport_state = ptr.from_ref(&viewport)
+    pipeline_info.p_rasterization_state = ptr.from_ref(&raster)
+    pipeline_info.p_multisample_state = ptr.from_ref(&multisample)
+    pipeline_info.p_color_blend_state = ptr.from_ref(&blend)
+    pipeline_info.p_dynamic_state = ptr.from_ref(&dynamic)
+    pipeline_info.layout = gpu.layout
+    pipeline_info.render_pass = gpu.render_pass
+    created := unsafe {
+        d.create_graphics_pipelines(gpu.device, vk.NULL_HANDLE, 1, ptr.from_ref(&pipeline_info), alloc, ptr.from_mut(&mut gpu.pipeline))
+    }
+    unsafe {
+        d.destroy_shader_module(gpu.device, vertex, alloc)
+        d.destroy_shader_module(gpu.device, fragment, alloc)
+    }
+    vk.check(created)?
+    return ok()
+}
+
+fn clamp(value: u32, low: u32, high: u32) -> u32 {
+    if value < low {
+        return low
+    }
+    if value > high {
+        return high
+    }
+    return value
+}
+
+fn destroy_images(d: &vk.DeviceFns, gpu: &Gpu, chain: &mut Swapchain) {
+    alloc := vk.no_allocator()
+    for i in 0usize..chain.count as usize {
+        unsafe {
+            d.destroy_framebuffer(gpu.device, chain.framebuffers[i], alloc)
+            d.destroy_image_view(gpu.device, chain.views[i], alloc)
+            d.destroy_semaphore(gpu.device, chain.rendered[i], alloc)
+        }
+    }
+    chain.count = 0
+}
+
+// (Re)build the swapchain for a drawing area of `width` by `height` pixels,
+// replacing any previous one. Leaves count 0 while the window has no area,
+// as when it is minimized.
+fn build_swapchain(fns: &vk.InstanceFns, d: &vk.DeviceFns, gpu: &Gpu, chain: &mut Swapchain, width: u32, height: u32) -> void!vk.Error {
+    alloc := vk.no_allocator()
+    unsafe {
+        vk.check(d.device_wait_idle(gpu.device))?
+    }
+    destroy_images(d, gpu, chain)
+    capabilities := vk.SurfaceCapabilitiesKHR.default()
+    unsafe {
+        vk.check(fns.get_physical_device_surface_capabilities_khr(gpu.physical, gpu.surface, ptr.from_mut(&mut capabilities)))?
+    }
+    // A current extent of 0xffffffff lets the swapchain pick the size.
+    extent_width := capabilities.current_extent.width
+    extent_height := capabilities.current_extent.height
+    if extent_width == 0xffffffff {
+        extent_width = clamp(width, capabilities.min_image_extent.width, capabilities.max_image_extent.width)
+        extent_height = clamp(height, capabilities.min_image_extent.height, capabilities.max_image_extent.height)
+    }
+    old := chain.handle
+    if extent_width == 0 || extent_height == 0 {
+        if old != vk.NULL_HANDLE {
+            unsafe {
+                d.destroy_swapchain_khr(gpu.device, old, alloc)
+            }
+            chain.handle = vk.NULL_HANDLE
+        }
+        return ok()
+    }
+    count := capabilities.min_image_count + 1
+    if capabilities.max_image_count != 0 && count > capabilities.max_image_count {
+        count = capabilities.max_image_count
+    }
+    if count as usize > IMAGES {
+        count = IMAGES as u32
+    }
+    composite := vk.COMPOSITE_ALPHA_OPAQUE_BIT_KHR
+    if (capabilities.supported_composite_alpha & composite) == 0 {
+        // The lowest supported mode, such as inherit on some compositors.
+        composite = capabilities.supported_composite_alpha & (0u32 - capabilities.supported_composite_alpha)
+    }
+    info := vk.SwapchainCreateInfoKHR.default()
+    info.surface = gpu.surface
+    info.min_image_count = count
+    info.image_format = gpu.format
+    info.image_color_space = gpu.color_space
+    info.image_extent.width = extent_width
+    info.image_extent.height = extent_height
+    info.image_array_layers = 1
+    info.image_usage = vk.IMAGE_USAGE_COLOR_ATTACHMENT_BIT
+    info.image_sharing_mode = vk.SHARING_MODE_EXCLUSIVE
+    info.pre_transform = capabilities.current_transform
+    info.composite_alpha = composite
+    info.present_mode = vk.PRESENT_MODE_FIFO_KHR
+    info.clipped = vk.TRUE
+    info.old_swapchain = old
+    swapchain := vk.NULL_HANDLE
+    created := unsafe {
+        d.create_swapchain_khr(gpu.device, ptr.from_ref(&info), alloc, ptr.from_mut(&mut swapchain))
+    }
+    if old != vk.NULL_HANDLE {
+        unsafe {
+            d.destroy_swapchain_khr(gpu.device, old, alloc)
+        }
+        chain.handle = vk.NULL_HANDLE
+    }
+    vk.check(created)?
+    chain.handle = swapchain
+    chain.width = extent_width
+    chain.height = extent_height
+    images := IMAGES as u32
+    unsafe {
+        vk.check(d.get_swapchain_images_khr(gpu.device, swapchain, ptr.from_mut(&mut images), ptr.as_mut_ptr(&mut chain.images)))?
+    }
+    for i in 0usize..images as usize {
+        view_info := vk.ImageViewCreateInfo.default()
+        view_info.image = chain.images[i]
+        view_info.view_type = vk.IMAGE_VIEW_TYPE_2D
+        view_info.format = gpu.format
+        view_info.subresource_range.aspect_mask = vk.IMAGE_ASPECT_COLOR_BIT
+        view_info.subresource_range.level_count = 1
+        view_info.subresource_range.layer_count = 1
+        semaphore_info := vk.SemaphoreCreateInfo.default()
+        unsafe {
+            vk.check(d.create_image_view(gpu.device, ptr.from_ref(&view_info), alloc, ptr.from_mut(&mut chain.views[i])))?
+            vk.check(d.create_semaphore(gpu.device, ptr.from_ref(&semaphore_info), alloc, ptr.from_mut(&mut chain.rendered[i])))?
+        }
+        framebuffer_info := vk.FramebufferCreateInfo.default()
+        framebuffer_info.render_pass = gpu.render_pass
+        framebuffer_info.attachment_count = 1
+        framebuffer_info.p_attachments = ptr.from_ref(&chain.views[i])
+        framebuffer_info.width = extent_width
+        framebuffer_info.height = extent_height
+        framebuffer_info.layers = 1
+        unsafe {
+            vk.check(d.create_framebuffer(gpu.device, ptr.from_ref(&framebuffer_info), alloc, ptr.from_mut(&mut chain.framebuffers[i])))?
+        }
+        chain.count = i as u32 + 1
+    }
+    return ok()
+}
+
+// Draw and present one frame with the triangle turned by `angle` radians.
+// Returns true when the swapchain no longer fits the window and must be
+// rebuilt.
+fn draw(d: &vk.DeviceFns, gpu: &Gpu, chain: &Swapchain, angle: f32) -> bool!vk.Error {
+    unsafe {
+        vk.check(d.wait_for_fences(gpu.device, 1, ptr.from_ref(&gpu.fence), vk.TRUE, 0xffffffffffffffff))?
+    }
+    index := 0u32
+    acquired := unsafe {
+        d.acquire_next_image_khr(gpu.device, chain.handle, 0xffffffffffffffff, gpu.acquired, vk.NULL_HANDLE, ptr.from_mut(&mut index))
+    }
+    if acquired == vk.ERROR_OUT_OF_DATE_KHR {
+        return ok(true)
+    }
+    vk.check(acquired)?
+    unsafe {
+        vk.check(d.reset_fences(gpu.device, 1, ptr.from_ref(&gpu.fence)))?
+    }
+    // Keep the triangle's shape whatever the window's proportions.
+    sx := 1.0f32
+    sy := 1.0f32
+    if chain.width > chain.height {
+        sx = chain.height as f32 / chain.width as f32
+    } else {
+        sy = chain.width as f32 / chain.height as f32
+    }
+    push := [f32_bits(angle), 0, f32_bits(sx), f32_bits(sy)]
+    clear := vk.clear_value_color(vk.clear_color_float(0.11, 0.13, 0.19, 1.0))
+    begin := vk.CommandBufferBeginInfo.default()
+    begin.flags = vk.COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
+    pass := vk.RenderPassBeginInfo.default()
+    pass.render_pass = gpu.render_pass
+    pass.framebuffer = chain.framebuffers[index as usize]
+    pass.render_area.extent.width = chain.width
+    pass.render_area.extent.height = chain.height
+    pass.clear_value_count = 1
+    pass.p_clear_values = ptr.from_ref(&clear)
+    viewport := vk.Viewport.default()
+    viewport.width = chain.width as f32
+    viewport.height = chain.height as f32
+    viewport.max_depth = 1.0
+    scissor := vk.Rect2D.default()
+    scissor.extent.width = chain.width
+    scissor.extent.height = chain.height
+    commands := gpu.commands
+    unsafe {
+        vk.check(d.reset_command_buffer(commands, 0))?
+        vk.check(d.begin_command_buffer(commands, ptr.from_ref(&begin)))?
+        d.cmd_begin_render_pass(commands, ptr.from_ref(&pass), vk.SUBPASS_CONTENTS_INLINE)
+        d.cmd_bind_pipeline(commands, vk.PIPELINE_BIND_POINT_GRAPHICS, gpu.pipeline)
+        d.cmd_set_viewport(commands, 0, 1, ptr.from_ref(&viewport))
+        d.cmd_set_scissor(commands, 0, 1, ptr.from_ref(&scissor))
+        d.cmd_push_constants(commands, gpu.layout, vk.SHADER_STAGE_VERTEX_BIT, 0, 16, ptr.as_ptr(&push) as *const u8)
+        d.cmd_draw(commands, 3, 1, 0, 0)
+        d.cmd_end_render_pass(commands)
+        vk.check(d.end_command_buffer(commands))?
+    }
+    rendered := chain.rendered[index as usize]
+    stage := vk.PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
+    submit := vk.SubmitInfo.default()
+    submit.wait_semaphore_count = 1
+    submit.p_wait_semaphores = ptr.from_ref(&gpu.acquired)
+    submit.p_wait_dst_stage_mask = ptr.from_ref(&stage)
+    submit.command_buffer_count = 1
+    submit.p_command_buffers = ptr.from_ref(&commands)
+    submit.signal_semaphore_count = 1
+    submit.p_signal_semaphores = ptr.from_ref(&rendered)
+    unsafe {
+        vk.check(d.queue_submit(gpu.queue, 1, ptr.from_ref(&submit), gpu.fence))?
+    }
+    present := vk.PresentInfoKHR.default()
+    present.wait_semaphore_count = 1
+    present.p_wait_semaphores = ptr.from_ref(&rendered)
+    present.swapchain_count = 1
+    present.p_swapchains = ptr.from_ref(&chain.handle)
+    present.p_image_indices = ptr.from_ref(&index)
+    presented := unsafe {
+        d.queue_present_khr(gpu.queue, ptr.from_ref(&present))
+    }
+    if presented == vk.ERROR_OUT_OF_DATE_KHR || presented == vk.SUBOPTIMAL_KHR || acquired == vk.SUBOPTIMAL_KHR {
+        return ok(true)
+    }
+    vk.check(presented)?
+    return ok(false)
+}
+
+// The frame limit from the command line, or 0 for none.
+fn frame_limit() -> u32 {
+    storage := platform.list_workspace()
+    arguments := match env.Arguments.capture(&mut storage, platform.TextPolicy.Strict) {
+        ok(value) => value,
+        err(_) => {
+            return 0
+        }
+    }
+    buffer := [0u8; 32]
+    match arguments.get(1, &mut buffer) {
+        ok(some(value)) => {
+            limit := 0u32
+            text_bytes := mem.str_bytes(value)
+            for i in 0usize..text_bytes.len {
+                digit := text_bytes[i]
+                if digit < 48 || digit > 57 || limit > 100000000 {
+                    return 0
+                }
+                limit = limit * 10 + (digit - 48) as u32
+            }
+            return limit
+        }
+        ok(none) => {
+            return 0
+        }
+        err(_) => {
+            return 0
+        }
+    }
+}
+
+fn run(library: &vk.Library, app: &mut window.App, win: &mut window.Window) -> void!vk.Error {
+    native := match win.native_handle() {
+        ok(native) => native,
+        err(_) => {
+            return err(failure(vk.ERROR_SURFACE_LOST_KHR))
+        }
+    }
+    // macOS presents through a CAMetalLayer on the window's view.
+    layer := 0usize
+    if let handle.NativeHandle.AppKit(_, _) = &native {
+        layer = match win.metal_layer() {
+            ok(address) => address,
+            err(_) => {
+                return err(failure(vk.ERROR_SURFACE_LOST_KHR))
+            }
+        }
+    }
+    entry := library.entry()
+    alloc := vk.no_allocator()
+
+    // VK_KHR_surface and this window system's surface, plus portability
+    // enumeration where MoltenVK needs it.
+    extensions := unsafe {
+        vk.zeroed::<[64]vk.ExtensionProperties>()
+    }
+    extension_count := 64u32
+    unsafe {
+        vk.check(entry.enumerate_instance_extension_properties(0usize as *const u8, ptr.from_mut(&mut extension_count), ptr.as_mut_ptr(&mut extensions)))?
+    }
+    platform_surface := surface_extension(&native)
+    if !listed(&extensions, extension_count, vk.KHR_SURFACE_EXTENSION_NAME) || !listed(&extensions, extension_count, platform_surface) {
+        return err(failure(vk.ERROR_EXTENSION_NOT_PRESENT))
+    }
+    enabled := [ptr.as_ptr(vk.KHR_SURFACE_EXTENSION_NAME), ptr.as_ptr(platform_surface), ptr.as_ptr(vk.KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME)]
+    application := vk.ApplicationInfo.default()
+    application.p_application_name = ptr.as_ptr(b"dodo vulkan window\0")
+    application.api_version = vk.API_VERSION_1_0
+    instance_info := vk.InstanceCreateInfo.default()
+    instance_info.p_application_info = ptr.from_ref(&application)
+    instance_info.enabled_extension_count = 2
+    instance_info.pp_enabled_extension_names = ptr.as_ptr(&enabled)
+    if listed(&extensions, extension_count, vk.KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME) {
+        instance_info.flags = vk.INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR
+        instance_info.enabled_extension_count = 3
+    }
+    gpu := unsafe {
+        vk.zeroed::<Gpu>()
+    }
+    unsafe {
+        vk.check(entry.create_instance(ptr.from_ref(&instance_info), alloc, ptr.from_mut(&mut gpu.instance)))?
+    }
+    fns := unsafe {
+        library.instance(gpu.instance)
+    }
+    gpu.surface = create_surface(&fns, gpu.instance, &native, layer)?
+
+    // The first device that can draw into the surface.
+    devices := [vk.null_handle::<vk.PhysicalDeviceT>(); 8]
+    device_count := 8u32
+    unsafe {
+        vk.check(fns.enumerate_physical_devices(gpu.instance, ptr.from_mut(&mut device_count), ptr.as_mut_ptr(&mut devices)))?
+    }
+    found := false
+    for i in 0usize..device_count as usize {
+        if !found {
+            if let some(family) = find_family(&fns, devices[i], gpu.surface) {
+                gpu.physical = devices[i]
+                gpu.family = family
+                found = true
+            }
+        }
+    }
+    if !found {
+        return err(failure(vk.ERROR_INCOMPATIBLE_DRIVER))
+    }
+    properties := vk.PhysicalDeviceProperties.default()
+    unsafe {
+        fns.get_physical_device_properties(gpu.physical, ptr.from_mut(&mut properties))
+    }
+    match text.Text.new(vk.c_name(&properties.device_name)) {
+        ok(name) => {
+            console.printf("device: {}\n", name.as_str())!
+            match win.set_title(name.as_str()) {
+                ok() => {}
+                err(_) => {}
+            }
+        }
+        err(_) => {}
+    }
+
+    // B8G8R8A8 UNORM in sRGB space where offered, like a std/window canvas.
+    formats := unsafe {
+        vk.zeroed::<[32]vk.SurfaceFormatKHR>()
+    }
+    format_count := 32u32
+    unsafe {
+        vk.check(fns.get_physical_device_surface_formats_khr(gpu.physical, gpu.surface, ptr.from_mut(&mut format_count), ptr.as_mut_ptr(&mut formats)))?
+    }
+    if format_count == 0 {
+        return err(failure(vk.ERROR_FORMAT_NOT_SUPPORTED))
+    }
+    gpu.format = formats[0].format
+    gpu.color_space = formats[0].color_space
+    for i in 0usize..format_count as usize {
+        if formats[i].format == vk.FORMAT_B8G8R8A8_UNORM && formats[i].color_space == vk.COLOR_SPACE_SRGB_NONLINEAR_KHR {
+            gpu.format = formats[i].format
+            gpu.color_space = formats[i].color_space
+        }
+    }
+
+    // The device with VK_KHR_swapchain, and VK_KHR_portability_subset when
+    // the device has it, as the specification requires.
+    device_extensions := unsafe {
+        vk.zeroed::<[256]vk.ExtensionProperties>()
+    }
+    device_extension_count := 256u32
+    unsafe {
+        vk.check(fns.enumerate_device_extension_properties(gpu.physical, 0usize as *const u8, ptr.from_mut(&mut device_extension_count), ptr.as_mut_ptr(&mut device_extensions)))?
+    }
+    if !listed(&device_extensions, device_extension_count, vk.KHR_SWAPCHAIN_EXTENSION_NAME) {
+        return err(failure(vk.ERROR_EXTENSION_NOT_PRESENT))
+    }
+    device_enabled := [ptr.as_ptr(vk.KHR_SWAPCHAIN_EXTENSION_NAME), ptr.as_ptr(vk.KHR_PORTABILITY_SUBSET_EXTENSION_NAME)]
+    priority := [1.0f32]
+    queue_info := vk.DeviceQueueCreateInfo.default()
+    queue_info.queue_family_index = gpu.family
+    queue_info.queue_count = 1
+    queue_info.p_queue_priorities = ptr.as_ptr(&priority)
+    device_info := vk.DeviceCreateInfo.default()
+    device_info.queue_create_info_count = 1
+    device_info.p_queue_create_infos = ptr.from_ref(&queue_info)
+    device_info.enabled_extension_count = 1
+    device_info.pp_enabled_extension_names = ptr.as_ptr(&device_enabled)
+    if listed(&device_extensions, device_extension_count, vk.KHR_PORTABILITY_SUBSET_EXTENSION_NAME) {
+        device_info.enabled_extension_count = 2
+    }
+    unsafe {
+        vk.check(fns.create_device(gpu.physical, ptr.from_ref(&device_info), alloc, ptr.from_mut(&mut gpu.device)))?
+    }
+    d := unsafe {
+        vk.device_fns(&fns, gpu.device)
+    }
+    unsafe {
+        d.get_device_queue(gpu.device, gpu.family, 0, ptr.from_mut(&mut gpu.queue))
+    }
+    create_pipeline(&d, &mut gpu)?
+
+    pool_info := vk.CommandPoolCreateInfo.default()
+    pool_info.flags = vk.COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT
+    pool_info.queue_family_index = gpu.family
+    command_info := vk.CommandBufferAllocateInfo.default()
+    command_info.level = vk.COMMAND_BUFFER_LEVEL_PRIMARY
+    command_info.command_buffer_count = 1
+    semaphore_info := vk.SemaphoreCreateInfo.default()
+    fence_info := vk.FenceCreateInfo.default()
+    fence_info.flags = vk.FENCE_CREATE_SIGNALED_BIT
+    unsafe {
+        vk.check(d.create_command_pool(gpu.device, ptr.from_ref(&pool_info), alloc, ptr.from_mut(&mut gpu.command_pool)))?
+        command_info.command_pool = gpu.command_pool
+        vk.check(d.allocate_command_buffers(gpu.device, ptr.from_ref(&command_info), ptr.from_mut(&mut gpu.commands)))?
+        vk.check(d.create_semaphore(gpu.device, ptr.from_ref(&semaphore_info), alloc, ptr.from_mut(&mut gpu.acquired)))?
+        vk.check(d.create_fence(gpu.device, ptr.from_ref(&fence_info), alloc, ptr.from_mut(&mut gpu.fence)))?
+    }
+    chain := unsafe {
+        vk.zeroed::<Swapchain>()
+    }
+    build_swapchain(&fns, &d, &gpu, &mut chain, win.width(), win.height())?
+
+    limit := frame_limit()
+    frames := 0u32
+    period := win.frame_interval()
+    step := 1.2f32 * (period.seconds() as f32 + period.subsec_nanos() as f32 / 1000000000.0)
+    angle := 0.0f32
+    stale := false
+    running := true
+    match win.request_frame() {
+        ok() => {}
+        err(_) => {
+            running = false
+        }
+    }
+    for running {
+        event := match app.wait_event() {
+            ok(event) => event,
+            err(_) => {
+                break
+            }
+        }
+        match event {
+            window.Event.Close(_) | window.Event.Quit => {
+                running = false
+            }
+            window.Event.Key(_, key) => {
+                if key.key == window.Key.Escape {
+                    running = false
+                }
+            }
+            window.Event.Resize(_, _, _) => {
+                stale = true
+            }
+            window.Event.Frame(_) => {
+                if stale {
+                    build_swapchain(&fns, &d, &gpu, &mut chain, win.width(), win.height())?
+                    stale = false
+                }
+                if chain.count != 0 {
+                    stale = draw(&d, &gpu, &chain, angle)?
+                    frames += 1
+                    if frames == 1 {
+                        console.println("presented")!
+                    }
+                    if limit != 0 && frames >= limit {
+                        running = false
+                    }
+                }
+                angle += step
+                match win.request_frame() {
+                    ok() => {}
+                    err(_) => {
+                        running = false
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    console.printf("{} frames\n", frames)!
+
+    // Destroy everything made from the window before the window closes.
+    unsafe {
+        d.device_wait_idle(gpu.device)
+    }
+    destroy_images(&d, &gpu, &mut chain)
+    unsafe {
+        if chain.handle != vk.NULL_HANDLE {
+            d.destroy_swapchain_khr(gpu.device, chain.handle, alloc)
+        }
+        d.destroy_fence(gpu.device, gpu.fence, alloc)
+        d.destroy_semaphore(gpu.device, gpu.acquired, alloc)
+        d.destroy_command_pool(gpu.device, gpu.command_pool, alloc)
+        d.destroy_pipeline(gpu.device, gpu.pipeline, alloc)
+        d.destroy_pipeline_layout(gpu.device, gpu.layout, alloc)
+        d.destroy_render_pass(gpu.device, gpu.render_pass, alloc)
+        d.destroy_device(gpu.device, alloc)
+        fns.destroy_surface_khr(gpu.instance, gpu.surface, alloc)
+        fns.destroy_instance(gpu.instance, alloc)
+    }
+    return ok()
+}
+
+fn main() -> i32 {
+    library := match vk.open() {
+        ok(library) => library,
+        err(error) => {
+            console.printf("no Vulkan: {}\n", vk.load_error_name(error))!
+            return 2
+        }
+    }
+    app := match window.App.new() {
+        ok(app) => app,
+        err(error) => {
+            console.printf("no window: {}\n", window.error_name(error))!
+            return 1
+        }
+    }
+    win := match app.open(window.Options.gpu("Vulkan", 480, 320)) {
+        ok(win) => win,
+        err(error) => {
+            console.printf("no window: {}\n", window.error_name(error))!
+            return 1
+        }
+    }
+    match run(&library, &mut app, &mut win) {
+        ok() => {
+            return 0
+        }
+        err(error) => {
+            console.println(error.name())!
+            return 1
+        }
+    }
+}

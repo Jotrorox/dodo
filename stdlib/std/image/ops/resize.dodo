@@ -1,0 +1,847 @@
+package ops
+
+import "core/slice"
+import "std/image/color"
+import "std/image/convert"
+import "std/image/pixels"
+import "std/image/shared/scratch" as carve
+
+// Resampling to another size with a choice of filters.
+//
+// resize() is separable: each source row is filtered horizontally into a
+// small ring of rows, and each target row is filtered vertically from that
+// ring as soon as all the source rows it needs have arrived. Only as many
+// horizontally filtered rows as the vertical filter has taps are kept, so
+// working memory grows with the target width, not with the image. The same
+// machinery drives ResizeSink, which resizes rows streaming out of a decoder
+// without a full-size intermediate.
+//
+// Weights are computed entirely in integers. Target pixel i of an axis
+// scaled from `in` to `out` pixels is centred at source coordinate
+// (i + 0.5) * in / out; when downscaling the filter is stretched by in / out
+// so that it averages instead of skipping pixels. Distances are exact
+// rationals turned into 16.16 fixed point, kernels are evaluated in fixed
+// point (Lanczos through a 1/256-step table), and each output's weights are
+// rounded cumulatively so that they sum to exactly WEIGHT_ONE (16 fractional
+// bits). Taps outside the image are clamped to the edge pixel. Identical
+// sizes on an axis copy that axis unfiltered.
+//
+// Pixels are filtered as premultiplied RGBA, so transparent pixels carry no
+// color into their neighbours, then divided by alpha again. With
+// ResizeOptions.linear, color is converted from sRGB to linear light before
+// filtering and back afterwards, which keeps bright and dark detail in
+// balance. Integer targets work on 16-bit samples with 64-bit accumulators
+// and clamp each pass to 0..65535 (ringing filters overshoot); results are
+// identical on every target. Float targets (F16, F32) use an f32 pipeline
+// with the same weights and keep values outside 0.0..1.0.
+//
+// Filters (support radius in source pixels before stretching):
+//
+//     Nearest     0.5  the pixel under the target pixel's centre, unfiltered
+//     Box         0.5  exact area average: the share of each source pixel
+//                      covered by the target pixel; best for downscaling
+//     Bilinear    1    triangle filter
+//     CatmullRom  2    cubic, B = 0, C = 0.5: sharp, slight ringing
+//     Mitchell    2    cubic, B = C = 1/3: soft, little ringing
+//     Lanczos3    3    windowed sinc: sharpest, most ringing
+//
+// Scratch layout, every part from carve.size(): horizontal bounds (2 u32
+// per target column) and weights (taps i32 per column), vertical bounds and
+// weights likewise per target row, one source row and one target row of
+// working RGBA, and the ring of vertical-taps target rows. Working samples
+// are u16 for integer targets and f32 for float targets. Nearest only needs
+// the bounds.
+
+pub enum Filter {
+    Nearest,
+    Box,
+    Bilinear,
+    CatmullRom,
+    Mitchell,
+    Lanczos3
+}
+
+pub struct ResizeOptions {
+    pub filter: Filter
+    // Filter in linear light instead of on sRGB-encoded values.
+    pub linear: bool
+
+    pub fn new(filter: Filter) -> ResizeOptions {
+        return ResizeOptions { filter: filter, linear: false }
+    }
+    pub fn linear_light(filter: Filter) -> ResizeOptions {
+        return ResizeOptions { filter: filter, linear: true }
+    }
+}
+
+const NEAREST: u32 = 0
+const BOX: u32 = 1
+const BILINEAR: u32 = 2
+const CATMULL_ROM: u32 = 3
+const MITCHELL: u32 = 4
+const LANCZOS3: u32 = 5
+
+const WEIGHT_BITS: i64 = 16
+const WEIGHT_ONE: i64 = 65536
+const FIXED_ONE: i64 = 65536
+
+fn filter_code(filter: &Filter) -> u32 {
+    match filter {
+        Filter.Nearest => {
+            return NEAREST
+        }
+        Filter.Box => {
+            return BOX
+        }
+        Filter.Bilinear => {
+            return BILINEAR
+        }
+        Filter.CatmullRom => {
+            return CATMULL_ROM
+        }
+        Filter.Mitchell => {
+            return MITCHELL
+        }
+        Filter.Lanczos3 => {
+            return LANCZOS3
+        }
+    }
+}
+
+// Twice the support radius.
+fn support2(code: u32) -> i64 {
+    if code == BILINEAR {
+        return 2
+    }
+    if code == CATMULL_ROM || code == MITCHELL {
+        return 4
+    }
+    if code == LANCZOS3 {
+        return 6
+    }
+    return 1
+}
+
+// ---------------------------------------------------------------------------
+// Weights
+
+fn floor_div(n: i64, d: i64) -> i64 {
+    q := n / d
+    if n % d != 0 && n < 0 {
+        return q - 1
+    }
+    return q
+}
+
+fn ceil_div(n: i64, d: i64) -> i64 {
+    return -floor_div(-n, d)
+}
+
+fn clamp_index(j: i64, length: u32) -> i64 {
+    if j < 0 {
+        return 0
+    }
+    if j >= length as i64 {
+        return length as i64 - 1
+    }
+    return j
+}
+
+// The kernel at distance x >= 0 (16.16 fixed point), in 16.16.
+fn kernel(code: u32, x: i64) -> i64 {
+    if code == BILINEAR {
+        if x >= FIXED_ONE {
+            return 0
+        }
+        return FIXED_ONE - x
+    }
+    if code == LANCZOS3 {
+        if x >= 3 * FIXED_ONE {
+            return 0
+        }
+        index := (x >> 8) as usize
+        fraction := x & 255
+        low := LANCZOS3_TABLE[index] as i64
+        high := LANCZOS3_TABLE[index + 1] as i64
+        return low + floor_div((high - low) * fraction + 128, 256)
+    }
+    x2 := (x * x) >> 16
+    x3 := (x2 * x) >> 16
+    if code == CATMULL_ROM {
+        if x < FIXED_ONE {
+            return floor_div(3 * x3 - 5 * x2 + 2 * FIXED_ONE, 2)
+        }
+        if x < 2 * FIXED_ONE {
+            return floor_div(-x3 + 5 * x2 - 8 * x + 4 * FIXED_ONE, 2)
+        }
+        return 0
+    }
+    // Mitchell-Netravali, B = C = 1/3.
+    if x < FIXED_ONE {
+        return floor_div(21 * x3 - 36 * x2 + 16 * FIXED_ONE, 18)
+    }
+    if x < 2 * FIXED_ONE {
+        return floor_div(-7 * x3 + 36 * x2 - 60 * x + 32 * FIXED_ONE, 18)
+    }
+    return 0
+}
+
+// The source pixel under target pixel i's centre.
+fn nearest_source(i: u32, input: u32, output: u32) -> u32 {
+    j := ((2 * i as u64 + 1) * input as u64) / (2 * output as u64)
+    if j >= input as u64 {
+        return input - 1
+    }
+    return j as u32
+}
+
+// Taps per output for one axis: an upper bound on the source pixels any
+// output reads. 1 when the axis is copied.
+fn axis_taps(input: u32, output: u32, code: u32) -> usize {
+    if code == NEAREST || input == output {
+        return 1
+    }
+    larger := input as i64
+    if output as i64 > larger {
+        larger = output as i64
+    }
+    taps := ceil_div(support2(code) * larger, output as i64) + 2
+    if taps > input as i64 {
+        taps = input as i64
+    }
+    return taps as usize
+}
+
+// The unnormalized weight of source pixel j for output i, and the window of
+// j values with nonzero weight, in the units described in plan_axis.
+struct Window {
+    first: i64
+    last: i64
+}
+
+fn window(code: u32, i: u32, input: u32, output: u32) -> Window {
+    larger := input as i64
+    if output as i64 > larger {
+        larger = output as i64
+    }
+    centre := (2 * i as i64 + 1) * input as i64
+    step := 2 * output as i64
+    if code == BOX {
+        low := centre - larger
+        high := centre + larger
+        return Window { first: floor_div(low, step), last: ceil_div(high, step) - 1 }
+    }
+    reach := support2(code) * larger
+    return Window { first: floor_div(centre - reach - output as i64, step) + 1, last: ceil_div(centre + reach - output as i64, step) - 1 }
+}
+
+// In units of 1 / (2 * output) source pixels the target centre lies at
+// (2i + 1) * input and source pixel j spans [2j * output, (2j + 2) * output)
+// with its centre at (2j + 1) * output. Distances are divided by
+// 2 * max(input, output), which also stretches the filter when downscaling.
+fn raw_weight(code: u32, i: u32, j: i64, input: u32, output: u32) -> i64 {
+    larger := input as i64
+    if output as i64 > larger {
+        larger = output as i64
+    }
+    centre := (2 * i as i64 + 1) * input as i64
+    if code == BOX {
+        low := centre - larger
+        high := centre + larger
+        left := 2 * j * output as i64
+        right := left + 2 * output as i64
+        if left > low {
+            low = left
+        }
+        if right < high {
+            high = right
+        }
+        if high <= low {
+            return 0
+        }
+        return high - low
+    }
+    distance := centre - (2 * j + 1) * output as i64
+    if distance < 0 {
+        distance = -distance
+    }
+    return kernel(code, distance * FIXED_ONE / (2 * larger))
+}
+
+fn round_div(n: i64, d: i64) -> i64 {
+    return floor_div(2 * n + d, 2 * d)
+}
+
+// Fill bounds (first source pixel, tap count) and weights (taps per output,
+// summing to WEIGHT_ONE) for one axis.
+fn plan_axis(input: u32, output: u32, code: u32, taps: usize, bounds: &mut[u32], weights: &mut[i32]) {
+    for i in 0u32..output {
+        b := 2 * i as usize
+        w := i as usize * taps
+        for k in 0usize..taps {
+            weights[w + k] = 0
+        }
+        if code == NEAREST || input == output {
+            bounds[b] = nearest_source(i, input, output)
+            bounds[b + 1] = 1
+            weights[w] = WEIGHT_ONE as i32
+            continue
+        }
+        span := window(code, i, input, output)
+        start := clamp_index(span.first, input)
+        end := clamp_index(span.last, input)
+        total := 0i64
+        for j := span.first; j <= span.last; j += 1 {
+            total += raw_weight(code, i, j, input, output)
+        }
+        if total <= 0 || end - start + 1 > taps as i64 {
+            // Cannot happen for these kernels; fall back to the nearest pixel.
+            bounds[b] = nearest_source(i, input, output)
+            bounds[b + 1] = 1
+            weights[w] = WEIGHT_ONE as i32
+            continue
+        }
+        bounds[b] = start as u32
+        bounds[b + 1] = (end - start + 1) as u32
+        // Cumulative rounding keeps every weight within one unit of exact
+        // and makes the sum exactly WEIGHT_ONE.
+        running := 0i64
+        given := 0i64
+        for j := span.first; j <= span.last; j += 1 {
+            running += raw_weight(code, i, j, input, output)
+            next := round_div(running * WEIGHT_ONE, total)
+            slot := (clamp_index(j, input) - start) as usize
+            weights[w + slot] = weights[w + slot] + (next - given) as i32
+            given = next
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The resampler shared by resize() and ResizeSink
+
+struct Resampler {
+    source_width: u32
+    source_height: u32
+    target_width: u32
+    target_height: u32
+    htaps: usize
+    vtaps: usize
+    // Nearest or same size: pixels are copied, not filtered.
+    direct: bool
+    float: bool
+    linear: bool
+    hbounds: &mut[u32]
+    hweights: &mut[i32]
+    vbounds: &mut[u32]
+    vweights: &mut[i32]
+    line: &mut[u8]
+    ring: &mut[u8]
+    output: &mut[u8]
+    // Target rows written so far.
+    next_target: u32
+}
+
+struct Sizes {
+    hbounds: usize
+    hweights: usize
+    vbounds: usize
+    vweights: usize
+    line: usize
+    ring: usize
+    output: usize
+}
+
+fn is_direct(source_width: u32, source_height: u32, target_width: u32, target_height: u32, code: u32) -> bool {
+    return code == NEAREST || (source_width == target_width && source_height == target_height)
+}
+
+fn sizes(source_width: u32, source_height: u32, target_width: u32, target_height: u32, float: bool, code: u32) -> Sizes!pixels.Error {
+    if source_width > pixels.MAX_DIMENSION || source_height > pixels.MAX_DIMENSION || target_width > pixels.MAX_DIMENSION || target_height > pixels.MAX_DIMENSION {
+        return err(pixels.Error.TooLarge)
+    }
+    hbounds := carve.size(2 * target_width as usize, 4)?
+    vbounds := carve.size(2 * target_height as usize, 4)?
+    if is_direct(source_width, source_height, target_width, target_height, code) {
+        return ok(Sizes { hbounds: hbounds, hweights: 0, vbounds: vbounds, vweights: 0, line: 0, ring: 0, output: 0 })
+    }
+    htaps := axis_taps(source_width, target_width, code)
+    vtaps := axis_taps(source_height, target_height, code)
+    element := 2usize
+    if float {
+        element = 4
+    }
+    hweights := carve.size(pixels.checked(target_width as usize, htaps, 0)?, 4)?
+    vweights := carve.size(pixels.checked(target_height as usize, vtaps, 0)?, 4)?
+    line := carve.size(4 * source_width as usize, element)?
+    row := 4 * target_width as usize
+    ring := carve.size(pixels.checked(row, vtaps, 0)?, element)?
+    output := carve.size(row, element)?
+    return ok(Sizes { hbounds: hbounds, hweights: hweights, vbounds: vbounds, vweights: vweights, line: line, ring: ring, output: output })
+}
+
+fn total_size(parts: &Sizes) -> usize!pixels.Error {
+    total := carve.add(parts.hbounds, parts.hweights)?
+    total = carve.add(total, parts.vbounds)?
+    total = carve.add(total, parts.vweights)?
+    total = carve.add(total, parts.line)?
+    total = carve.add(total, parts.ring)?
+    return carve.add(total, parts.output)
+}
+
+// Scratch bytes resize() and ResizeSink need for these sizes and a target
+// in `target_layout`.
+pub fn resize_scratch_size(source_width: u32, source_height: u32, target_width: u32, target_height: u32, target_layout: &pixels.Layout, options: &ResizeOptions) -> usize!pixels.Error {
+    parts := sizes(source_width, source_height, target_width, target_height, target_layout.is_float(), filter_code(&options.filter))?
+    return total_size(&parts)
+}
+
+fn new_resampler(source_width: u32, source_height: u32, target_width: u32, target_height: u32, float: bool, options: &ResizeOptions, bytes: &mut[u8]) -> Resampler!pixels.Error from(bytes) {
+    if target_width == 0 || target_height == 0 || source_width == 0 || source_height == 0 {
+        return err(pixels.Error.Malformed)
+    }
+    code := filter_code(&options.filter)
+    parts := sizes(source_width, source_height, target_width, target_height, float, code)?
+    total := total_size(&parts)?
+    if bytes.len < total {
+        return err(pixels.Error.BufferTooSmall)
+    }
+    direct := is_direct(source_width, source_height, target_width, target_height, code)
+    htaps := 1usize
+    vtaps := 1usize
+    if !direct {
+        htaps = axis_taps(source_width, target_width, code)
+        vtaps = axis_taps(source_height, target_height, code)
+    }
+    let slice.SplitMut { left: a, right: rest1 } = carve.split(bytes, parts.hbounds)?
+    let slice.SplitMut { left: b, right: rest2 } = carve.split(rest1, parts.hweights)?
+    let slice.SplitMut { left: c, right: rest3 } = carve.split(rest2, parts.vbounds)?
+    let slice.SplitMut { left: d, right: rest4 } = carve.split(rest3, parts.vweights)?
+    let slice.SplitMut { left: e, right: rest5 } = carve.split(rest4, parts.line)?
+    let slice.SplitMut { left: f, right: rest6 } = carve.split(rest5, parts.ring)?
+    let slice.SplitMut { left: g, right: _ } = carve.split(rest6, parts.output)?
+    hbounds := carve.u32s(a)
+    hweights := carve.i32s(b)
+    vbounds := carve.u32s(c)
+    vweights := carve.i32s(d)
+    if direct {
+        for i in 0u32..target_width {
+            hbounds[2 * i as usize] = nearest_source(i, source_width, target_width)
+        }
+        for i in 0u32..target_height {
+            vbounds[2 * i as usize] = nearest_source(i, source_height, target_height)
+        }
+    } else {
+        plan_axis(source_width, target_width, code, htaps, hbounds, hweights)
+        plan_axis(source_height, target_height, code, vtaps, vbounds, vweights)
+    }
+    return ok(Resampler { source_width: source_width, source_height: source_height, target_width: target_width, target_height: target_height, htaps: htaps, vtaps: vtaps, direct: direct, float: float, linear: options.linear, hbounds: hbounds, hweights: hweights, vbounds: vbounds, vweights: vweights, line: e, ring: f, output: g, next_target: 0 })
+}
+
+// True once every target row is written.
+fn finished(r: &Resampler) -> bool {
+    return r.next_target >= r.target_height
+}
+
+// Whether source row y is still needed; rows below the next target row's
+// window never are.
+fn wants(r: &Resampler, y: u32) -> bool {
+    if r.next_target >= r.target_height {
+        return false
+    }
+    first := r.vbounds[2 * r.next_target as usize]
+    if r.direct {
+        return y == first
+    }
+    return y >= first
+}
+
+// Feed source row y (rows arrive in increasing order) and write every
+// target row that becomes complete.
+fn push(r: &mut Resampler, y: u32, row: &[u8], layout: &pixels.Layout, target: &mut pixels.ViewMut) {
+    if !wants(r, y) {
+        return
+    }
+    target_layout := target.layout().clone()
+    if r.direct {
+        for r.next_target < r.target_height && r.vbounds[2 * r.next_target as usize] == y {
+            line := target.row_mut(r.next_target)
+            for i in 0u32..r.target_width {
+                convert.row(row, layout, r.hbounds[2 * i as usize] as usize, line, &target_layout, i as usize, 1)
+            }
+            r.next_target += 1
+        }
+        return
+    }
+    if r.float {
+        filter_row_f32(r, y, row, layout)
+    } else {
+        filter_row16(r, y, row, layout)
+    }
+    for r.next_target < r.target_height {
+        j := r.next_target as usize
+        if r.vbounds[2 * j] as u64 + r.vbounds[2 * j + 1] as u64 - 1 > y as u64 {
+            break
+        }
+        if r.float {
+            emit_row_f32(r, j)
+            store_f32(carve.f32s(r.output), target.row_mut(r.next_target), &target_layout, 0, r.target_width as usize)
+        } else {
+            emit_row16(r, j)
+            convert.store_rgba16(carve.u16s(r.output), target.row_mut(r.next_target), &target_layout, 0, r.target_width as usize)
+        }
+        r.next_target += 1
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The 16-bit path
+
+fn premultiply16(c: u32, a: u32) -> u32 {
+    return (c * a + 32767) / 65535
+}
+
+fn clamp16(value: i64) -> u16 {
+    if value <= 0 {
+        return 0
+    }
+    if value >= 65535 {
+        return 65535
+    }
+    return value as u16
+}
+
+// Source row y as premultiplied (linear) RGBA16, filtered horizontally into
+// ring slot y % vtaps.
+fn filter_row16(r: &mut Resampler, y: u32, row: &[u8], layout: &pixels.Layout) {
+    width := r.source_width as usize
+    linear := r.linear
+    line := carve.u16s(r.line)
+    convert.load_rgba16(row, layout, 0, width, line)
+    for p in 0usize..width {
+        o := p * 4
+        a := line[o + 3] as u32
+        for c in 0usize..3 {
+            v := line[o + c] as u32
+            if linear {
+                v = color.srgb_to_linear16(v as u16) as u32
+            }
+            if a < 65535 {
+                v = premultiply16(v, a)
+            }
+            line[o + c] = v as u16
+        }
+    }
+    taps := r.htaps
+    base := (y as usize % r.vtaps) * r.target_width as usize * 4
+    ring := carve.u16s(r.ring)
+    for i in 0usize..r.target_width as usize {
+        start := r.hbounds[2 * i] as usize
+        count := r.hbounds[2 * i + 1] as usize
+        w := i * taps
+        acc0 := 0i64
+        acc1 := 0i64
+        acc2 := 0i64
+        acc3 := 0i64
+        for k in 0usize..count {
+            weight := r.hweights[w + k] as i64
+            s := (start + k) * 4
+            acc0 += weight * line[s] as i64
+            acc1 += weight * line[s + 1] as i64
+            acc2 += weight * line[s + 2] as i64
+            acc3 += weight * line[s + 3] as i64
+        }
+        o := base + i * 4
+        half := WEIGHT_ONE / 2
+        ring[o] = clamp16((acc0 + half) >> WEIGHT_BITS)
+        ring[o + 1] = clamp16((acc1 + half) >> WEIGHT_BITS)
+        ring[o + 2] = clamp16((acc2 + half) >> WEIGHT_BITS)
+        ring[o + 3] = clamp16((acc3 + half) >> WEIGHT_BITS)
+    }
+}
+
+// Target row j filtered vertically from the ring into r.output as straight
+// sRGB-encoded RGBA16.
+fn emit_row16(r: &mut Resampler, j: usize) {
+    width := r.target_width as usize
+    stride := width * 4
+    first := r.vbounds[2 * j] as usize
+    count := r.vbounds[2 * j + 1] as usize
+    w := j * r.vtaps
+    vtaps := r.vtaps
+    linear := r.linear
+    ring := carve.u16s(r.ring)
+    output := carve.u16s(r.output)
+    half := WEIGHT_ONE / 2
+    for i in 0usize..width {
+        acc0 := 0i64
+        acc1 := 0i64
+        acc2 := 0i64
+        acc3 := 0i64
+        slot := first % vtaps
+        for k in 0usize..count {
+            weight := r.vweights[w + k] as i64
+            s := slot * stride + i * 4
+            acc0 += weight * ring[s] as i64
+            acc1 += weight * ring[s + 1] as i64
+            acc2 += weight * ring[s + 2] as i64
+            acc3 += weight * ring[s + 3] as i64
+            slot += 1
+            if slot == vtaps {
+                slot = 0
+            }
+        }
+        a := clamp16((acc3 + half) >> WEIGHT_BITS) as u32
+        values := [clamp16((acc0 + half) >> WEIGHT_BITS) as u32, clamp16((acc1 + half) >> WEIGHT_BITS) as u32, clamp16((acc2 + half) >> WEIGHT_BITS) as u32]
+        o := i * 4
+        for c in 0usize..3 {
+            v := values[c]
+            if a < 65535 {
+                if a == 0 {
+                    v = 0
+                } else {
+                    if v > a {
+                        v = a
+                    }
+                    v = (v * 65535 + a / 2) / a
+                }
+            }
+            if linear {
+                v = color.linear_to_srgb16(v as u16) as u32
+            }
+            output[o + c] = v as u16
+        }
+        output[o + 3] = a as u16
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The f32 path
+
+fn filter_row_f32(r: &mut Resampler, y: u32, row: &[u8], layout: &pixels.Layout) {
+    width := r.source_width as usize
+    linear := r.linear
+    line := carve.f32s(r.line)
+    load_f32(row, layout, 0, width, line)
+    for p in 0usize..width {
+        o := p * 4
+        a := line[o + 3]
+        for c in 0usize..3 {
+            v := line[o + c]
+            if linear {
+                v = transfer_f32(v, true)
+            }
+            line[o + c] = v * a
+        }
+    }
+    taps := r.htaps
+    base := (y as usize % r.vtaps) * r.target_width as usize * 4
+    ring := carve.f32s(r.ring)
+    for i in 0usize..r.target_width as usize {
+        start := r.hbounds[2 * i] as usize
+        count := r.hbounds[2 * i + 1] as usize
+        w := i * taps
+        acc0 := 0.0f32
+        acc1 := 0.0f32
+        acc2 := 0.0f32
+        acc3 := 0.0f32
+        for k in 0usize..count {
+            weight := r.hweights[w + k] as f32 / 65536.0f32
+            s := (start + k) * 4
+            acc0 += weight * line[s]
+            acc1 += weight * line[s + 1]
+            acc2 += weight * line[s + 2]
+            acc3 += weight * line[s + 3]
+        }
+        o := base + i * 4
+        ring[o] = acc0
+        ring[o + 1] = acc1
+        ring[o + 2] = acc2
+        ring[o + 3] = acc3
+    }
+}
+
+fn emit_row_f32(r: &mut Resampler, j: usize) {
+    width := r.target_width as usize
+    stride := width * 4
+    first := r.vbounds[2 * j] as usize
+    count := r.vbounds[2 * j + 1] as usize
+    w := j * r.vtaps
+    vtaps := r.vtaps
+    linear := r.linear
+    ring := carve.f32s(r.ring)
+    output := carve.f32s(r.output)
+    for i in 0usize..width {
+        acc0 := 0.0f32
+        acc1 := 0.0f32
+        acc2 := 0.0f32
+        acc3 := 0.0f32
+        slot := first % vtaps
+        for k in 0usize..count {
+            weight := r.vweights[w + k] as f32 / 65536.0f32
+            s := slot * stride + i * 4
+            acc0 += weight * ring[s]
+            acc1 += weight * ring[s + 1]
+            acc2 += weight * ring[s + 2]
+            acc3 += weight * ring[s + 3]
+            slot += 1
+            if slot == vtaps {
+                slot = 0
+            }
+        }
+        a := acc3
+        if !(a > 0.0f32) {
+            a = 0.0f32
+        } else if a > 1.0f32 {
+            a = 1.0f32
+        }
+        values := [acc0, acc1, acc2]
+        o := i * 4
+        for c in 0usize..3 {
+            v := values[c]
+            if a == 0.0f32 {
+                v = 0.0f32
+            } else if a != 1.0f32 {
+                v = v / a
+            }
+            if linear {
+                v = transfer_f32(v, false)
+            }
+            output[o + c] = v
+        }
+        output[o + 3] = a
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Entry points
+
+// Resize `source` into `target` (any sizes and layouts). Identical sizes
+// copy. Malformed when the source is empty but the target is not;
+// BufferTooSmall when scratch is shorter than resize_scratch_size().
+pub fn resize(source: &pixels.View, target: &mut pixels.ViewMut, options: &ResizeOptions, scratch: &mut[u8]) -> void!pixels.Error {
+    source_width := source.width()
+    source_height := source.height()
+    target_width := target.width()
+    target_height := target.height()
+    if target_width == 0 || target_height == 0 {
+        return ok()
+    }
+    if source_width == 0 || source_height == 0 {
+        return err(pixels.Error.Malformed)
+    }
+    if source_width == target_width && source_height == target_height {
+        return convert.copy(source, target)
+    }
+    float := target.layout().is_float()
+    r := new_resampler(source_width, source_height, target_width, target_height, float, options, scratch)?
+    layout := source.layout().clone()
+    for y in 0u32..source_height {
+        if finished(&r) {
+            break
+        }
+        push(&mut r, y, source.row(y), &layout, target)
+    }
+    return ok()
+}
+
+// A sink that resizes a decoder's output into `target` while it streams, so
+// a large image can be decoded straight to a thumbnail. The decoder must
+// deliver full-width rects top to bottom with no gaps or repeats (PNG, BMP,
+// QOI, PPM and other row-order decoders do); anything else, such as tiles
+// or interlaced passes, fails with Unsupported, and the image should then be
+// decoded to a full-size view and passed to resize(). Scratch is
+// resize_scratch_size() for the header's size and the target's layout.
+pub struct ResizeSink {
+    target: &mut pixels.ViewMut
+    resampler: Resampler
+    // The next source row expected.
+    row: u32
+
+    pub fn new(target: &mut pixels.ViewMut, source_width: u32, source_height: u32, options: &ResizeOptions, scratch: &mut[u8]) -> ResizeSink!pixels.Error from(target, scratch) {
+        width := target.width()
+        height := target.height()
+        float := target.layout().is_float()
+        resampler := new_resampler(source_width, source_height, width, height, float, options, scratch)?
+        return ok(ResizeSink { target: target, resampler: resampler, row: 0 })
+    }
+    pub fn begin(&mut self, header: &pixels.Header) -> void!pixels.Error {
+        if header.width != self.resampler.source_width || header.height != self.resampler.source_height {
+            return err(pixels.Error.Malformed)
+        }
+        return ok()
+    }
+    pub fn rect(&mut self, x: u32, y: u32, source: &pixels.View) -> void!pixels.Error {
+        if x != 0 || source.width() != self.resampler.source_width || y != self.row {
+            return err(pixels.Error.Unsupported)
+        }
+        if y as u64 + source.height() as u64 > self.resampler.source_height as u64 {
+            return err(pixels.Error.Malformed)
+        }
+        layout := source.layout().clone()
+        for k in 0u32..source.height() {
+            push(&mut self.resampler, y + k, source.row(k), &layout, self.target)
+        }
+        self.row = y + source.height()
+        return ok()
+    }
+    // True once every target row has been written.
+    pub fn complete(&self) -> bool {
+        return finished(&self.resampler)
+    }
+}
+
+// BEGIN GENERATED LANCZOS TABLE
+// sinc(x) * sinc(x / 3) for x = k / 256, k = 0..768, in 16.16 fixed point.
+static LANCZOS3_TABLE: [769]i32 = [
+    65536, 65534, 65529, 65520, 65507, 65490, 65470, 65446, 65419, 65388, 65353, 65315, 65273, 65228, 65178, 65126,
+    65069, 65009, 64946, 64878, 64808, 64733, 64655, 64574, 64489, 64400, 64308, 64213, 64114, 64011, 63905, 63795,
+    63682, 63566, 63446, 63323, 63196, 63066, 62932, 62795, 62655, 62512, 62365, 62215, 62061, 61904, 61744, 61581,
+    61415, 61245, 61072, 60897, 60717, 60535, 60350, 60162, 59970, 59776, 59578, 59378, 59174, 58968, 58759, 58547,
+    58331, 58113, 57893, 57669, 57443, 57214, 56982, 56747, 56510, 56270, 56028, 55783, 55535, 55285, 55032, 54777,
+    54519, 54259, 53996, 53731, 53464, 53194, 52922, 52648, 52372, 52093, 51812, 51529, 51244, 50957, 50668, 50377,
+    50083, 49788, 49491, 49192, 48891, 48588, 48284, 47978, 47670, 47360, 47048, 46735, 46421, 46104, 45787, 45467,
+    45147, 44824, 44501, 44176, 43849, 43522, 43193, 42863, 42531, 42199, 41865, 41530, 41195, 40858, 40520, 40181,
+    39841, 39500, 39159, 38817, 38473, 38129, 37785, 37439, 37093, 36747, 36400, 36052, 35704, 35355, 35006, 34656,
+    34306, 33956, 33605, 33254, 32903, 32551, 32200, 31848, 31496, 31144, 30792, 30440, 30088, 29737, 29385, 29033,
+    28682, 28330, 27979, 27628, 27278, 26928, 26578, 26228, 25879, 25531, 25182, 24835, 24488, 24141, 23795, 23450,
+    23106, 22762, 22418, 22076, 21734, 21394, 21054, 20715, 20376, 20039, 19703, 19368, 19033, 18700, 18368, 18037,
+    17707, 17378, 17051, 16725, 16399, 16076, 15753, 15432, 15112, 14793, 14476, 14161, 13846, 13534, 13222, 12913,
+    12604, 12298, 11993, 11689, 11387, 11087, 10788, 10492, 10196, 9903, 9611, 9321, 9033, 8747, 8463, 8180,
+    7899, 7621, 7344, 7069, 6796, 6525, 6255, 5988, 5723, 5460, 5199, 4940, 4683, 4428, 4176, 3925,
+    3677, 3430, 3186, 2944, 2704, 2467, 2231, 1998, 1767, 1538, 1312, 1087, 865, 645, 428, 213,
+    0, -211, -419, -625, -828, -1030, -1228, -1425, -1619, -1811, -2001, -2188, -2372, -2555, -2735, -2912,
+    -3088, -3260, -3431, -3599, -3764, -3928, -4088, -4247, -4403, -4557, -4708, -4857, -5003, -5147, -5289, -5428,
+    -5565, -5699, -5831, -5961, -6088, -6213, -6336, -6456, -6574, -6689, -6802, -6913, -7021, -7128, -7231, -7333,
+    -7432, -7529, -7623, -7715, -7805, -7893, -7978, -8061, -8142, -8220, -8297, -8371, -8442, -8512, -8580, -8645,
+    -8708, -8769, -8827, -8884, -8939, -8991, -9041, -9089, -9135, -9179, -9221, -9261, -9299, -9335, -9369, -9400,
+    -9430, -9458, -9484, -9508, -9530, -9550, -9569, -9585, -9600, -9612, -9623, -9632, -9640, -9645, -9649, -9651,
+    -9651, -9650, -9647, -9642, -9635, -9627, -9618, -9606, -9593, -9579, -9563, -9545, -9526, -9505, -9483, -9460,
+    -9435, -9408, -9380, -9351, -9321, -9289, -9255, -9221, -9185, -9148, -9109, -9070, -9029, -8987, -8944, -8899,
+    -8854, -8807, -8759, -8710, -8660, -8609, -8557, -8504, -8450, -8396, -8340, -8283, -8225, -8166, -8107, -8047,
+    -7986, -7924, -7861, -7797, -7733, -7668, -7602, -7536, -7469, -7401, -7333, -7264, -7194, -7124, -7053, -6982,
+    -6910, -6838, -6765, -6692, -6618, -6544, -6469, -6394, -6319, -6243, -6167, -6091, -6014, -5937, -5860, -5782,
+    -5705, -5627, -5549, -5470, -5392, -5313, -5234, -5156, -5077, -4997, -4918, -4839, -4760, -4681, -4601, -4522,
+    -4443, -4364, -4284, -4205, -4126, -4047, -3969, -3890, -3811, -3733, -3655, -3577, -3499, -3422, -3344, -3267,
+    -3190, -3113, -3037, -2961, -2885, -2810, -2735, -2660, -2585, -2511, -2437, -2364, -2291, -2219, -2146, -2075,
+    -2003, -1932, -1862, -1792, -1723, -1654, -1585, -1517, -1450, -1382, -1316, -1250, -1185, -1120, -1055, -992,
+    -929, -866, -804, -742, -682, -621, -562, -503, -444, -386, -329, -273, -217, -162, -107, -53,
+    0, 53, 105, 156, 206, 256, 305, 354, 402, 449, 495, 541, 586, 631, 674, 717,
+    760, 801, 842, 882, 922, 960, 998, 1036, 1072, 1108, 1143, 1178, 1211, 1244, 1277, 1308,
+    1339, 1370, 1399, 1428, 1456, 1483, 1510, 1536, 1561, 1586, 1610, 1633, 1656, 1677, 1699, 1719,
+    1739, 1758, 1777, 1794, 1812, 1828, 1844, 1859, 1874, 1888, 1901, 1913, 1926, 1937, 1948, 1958,
+    1967, 1976, 1985, 1993, 2000, 2006, 2012, 2018, 2023, 2027, 2031, 2034, 2037, 2039, 2041, 2042,
+    2042, 2042, 2042, 2041, 2039, 2038, 2035, 2032, 2029, 2025, 2021, 2016, 2011, 2005, 1999, 1993,
+    1986, 1979, 1971, 1963, 1955, 1946, 1937, 1928, 1918, 1908, 1897, 1886, 1875, 1863, 1852, 1839,
+    1827, 1814, 1801, 1788, 1774, 1761, 1747, 1732, 1718, 1703, 1688, 1673, 1657, 1642, 1626, 1610,
+    1594, 1577, 1561, 1544, 1527, 1510, 1493, 1476, 1459, 1441, 1423, 1406, 1388, 1370, 1352, 1334,
+    1316, 1298, 1280, 1261, 1243, 1225, 1206, 1188, 1169, 1151, 1133, 1114, 1096, 1077, 1059, 1040,
+    1022, 1004, 986, 967, 949, 931, 913, 895, 877, 859, 842, 824, 806, 789, 772, 754,
+    737, 720, 703, 686, 670, 653, 637, 621, 605, 589, 573, 557, 542, 527, 512, 497,
+    482, 468, 453, 439, 425, 411, 398, 384, 371, 358, 345, 333, 320, 308, 296, 284,
+    273, 262, 251, 240, 229, 219, 209, 199, 189, 180, 171, 162, 153, 144, 136, 128,
+    120, 113, 106, 99, 92, 85, 79, 73, 67, 62, 56, 51, 46, 42, 37, 33,
+    29, 26, 22, 19, 16, 14, 11, 9, 7, 6, 4, 3, 2, 1, 0, 0,
+    0
+]
+// END GENERATED LANCZOS TABLE

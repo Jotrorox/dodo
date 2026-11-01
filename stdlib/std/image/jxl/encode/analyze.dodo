@@ -1,0 +1,359 @@
+package encode
+
+import "std/image/pixels"
+
+// Effort 2+ analysis: candidate color transforms, predictors and the
+// palette are compared by the estimated size of a sample of the image,
+// coded with the real tree and entropy model (minus clustering).
+
+// Estimated bits per context of `plan` on its sample regions.
+fn estimate(source: &pixels.View, plan: &Plan, planes: &mut[i32], hist: &mut[u32], words: &[u32], costs: &mut[u64]) -> u64 {
+    tree := Tree.new()
+    build_tree(plan, &mut tree)
+    ctxs := [0u8; 2560]
+    values := [0u32; 2560]
+    tokens := tree.serialize(&mut ctxs, &mut values)
+    contexts := tree.contexts
+    if plan.lz77 {
+        contexts += 1
+    }
+    // The tree itself is part of the cost: small images cannot afford many
+    // contexts.
+    tree_freq := [0u32; 272]
+    tree_extra := 0u64
+    for i in 0usize..tokens {
+        t := hybrid(values[i] as u64, 4, 2, 0)
+        tree_freq[(t & 0xFFFF) as usize] += 1
+        tree_extra += (t >> 16) & 255
+    }
+    tree_bits := (histogram_cost(&tree_freq, 0, &ALL_SYMBOLS) >> 16) + tree_extra
+    map := [0u8; 1]
+    lengths := [0u8; 1]
+    codes := [0u16; 1]
+    set := CodeSet { map: &mut map, lengths: &mut lengths, codes: &mut codes, contexts: contexts, clusters: 1, alphabets: [0u16; 32], singles: [false; 32], split: LIT_SPLIT, msb: LIT_MSB, lsb: LIT_LSB, lz77: plan.lz77, min_length: plan.min_length as u32 }
+    empty := [0u8; 1]
+    dummy := BitWriter.new(&mut empty, 1)
+    for i in 0usize..contexts * MAX_ALPHA {
+        hist[i] = 0
+    }
+    for k in 0usize..contexts {
+        costs[k] = 0
+    }
+    {
+        e := Emitter { counting: true, hist: &mut hist[..], split: LIT_SPLIT, msb: LIT_MSB, lsb: LIT_LSB, lz77: plan.lz77, min_length: plan.min_length, dist_ctx: tree.contexts, run_value: 0, run_count: 0, run_ctx: [0u16; 16] }
+        code_global(source, plan, &tree, planes, words, &mut e, &set, &mut dummy)
+    }
+    total := add_costs(hist, contexts, 1, 1, costs) + tree_bits
+    if single_group(plan) {
+        return total
+    }
+    for i in 0usize..contexts * MAX_ALPHA {
+        hist[i] = 0
+    }
+    // Sample bands spread over the image: 8 (effort 2) or 32 (effort 3)
+    // rectangles of up to 256 x 32 pixels.
+    area := 0u64
+    regions := 8usize
+    if plan.effort >= 3 {
+        regions = 32
+    }
+    gw := plan.width
+    if gw > 256 {
+        gw = 256
+    }
+    gh := plan.height
+    if gh > 32 {
+        gh = 32
+    }
+    // No more bands than fit in the image without overlap.
+    fit := (plan.width / gw) * (plan.height / gh)
+    if regions > fit {
+        regions = fit
+    }
+    if regions < 2 {
+        regions = 2
+    }
+    for r in 0usize..regions {
+        x0 := ((r % 4) * (plan.width - gw)) / 3
+        y0 := (r * (plan.height - gh)) / (regions - 1)
+        e := Emitter { counting: true, hist: &mut hist[..], split: LIT_SPLIT, msb: LIT_MSB, lsb: LIT_LSB, lz77: plan.lz77, min_length: plan.min_length, dist_ctx: tree.contexts, run_value: 0, run_count: 0, run_ctx: [0u16; 16] }
+        code_rect(source, plan, &tree, planes, words, x0, y0, gw, gh, group_stream_id(plan, 0), &mut e, &set, &mut dummy)
+        area += (gw * gh) as u64
+    }
+    pixels_total := plan.width as u64 * plan.height as u64
+    return total + add_costs(hist, contexts, pixels_total, area, costs)
+}
+
+// Add each context's estimated bits, scaled by num / den, to costs[]; returns
+// the sum.
+fn add_costs(hist: &[u32], contexts: usize, num: u64, den: u64, costs: &mut[u64]) -> u64 {
+    total := 0u64
+    for k in 0usize..contexts {
+        base := k * MAX_ALPHA
+        bits := histogram_cost(hist, base, &ALL_SYMBOLS) >> 16
+        for s in 0usize..MAX_ALPHA {
+            c := hist[base + s] as u64
+            if c == 0 {
+                continue
+            }
+            if s < LZ77_MIN_SYMBOL as usize {
+                bits += c * extra_bits(s as u32, LIT_SPLIT, LIT_MSB, LIT_LSB) as u64
+            } else if s >= LZ77_MIN_SYMBOL as usize + 16 {
+                bits += c * (s as u64 - LZ77_MIN_SYMBOL as u64 - 12)
+            }
+        }
+        scaled := scale(bits, num, den)
+        costs[k] += scaled
+        total += scaled
+    }
+    return total
+}
+
+// bits * num / den, saturating (only relative sizes matter).
+fn scale(bits: u64, num: u64, den: u64) -> u64 {
+    factor := num / den
+    rest := num % den
+    if factor != 0 && bits > 0xFFFFFFFFFFFF / factor {
+        return 0xFFFFFFFFFFFF
+    }
+    part := 0u64
+    if bits <= 0xFFFFFFFFFFFF / (rest + 1) {
+        part = bits * rest / den
+    }
+    return bits * factor + part
+}
+
+// Mark the contexts of the leaves below `node`.
+fn mark_leaves(tree: &Tree, node: usize, marks: &mut[u8], channel: u8) {
+    if tree.prop[node] == LEAF {
+        marks[tree.ctx[node] as usize] = channel
+        return
+    }
+    mark_leaves(tree, tree.left[node] as usize, marks, channel)
+    mark_leaves(tree, tree.right[node] as usize, marks, channel)
+}
+
+// Estimated bits per image channel (group-stream numbering) from per-context
+// costs.
+fn channel_costs(plan: &Plan, costs: &[u64], out: &mut[u64]) {
+    tree := Tree.new()
+    build_tree(plan, &mut tree)
+    ctxs := [0u8; 2560]
+    values := [0u32; 2560]
+    tree.serialize(&mut ctxs, &mut values)
+    marks := [255u8; 512]
+    image_channels := plan.channels
+    first := 0u32
+    stream := 0u32
+    if plan.palette > 0 {
+        image_channels = 1
+        if single_group(plan) {
+            first = 1
+        } else {
+            stream = 1
+        }
+    }
+    for c in 0usize..image_channels {
+        out[c] = 0
+        mark_leaves(&tree, tree.resolve(first + c as u32, stream), &mut marks, c as u8)
+    }
+    for k in 0usize..tree.contexts {
+        if marks[k] != 255 {
+            out[marks[k] as usize] += costs[k]
+        }
+    }
+}
+
+const RCT_CANDIDATES_2: [3]i32 = [6, -1, 10]
+const RCT_CANDIDATES_3: [9]i32 = [6, -1, 10, 3, 17, 11, 12, 4, 5]
+const INDEX_PREDICTORS: [4]u32 = [PRED_ZERO, PRED_GRADIENT, PRED_W, PRED_N]
+const PREDICTOR_CANDIDATES_2: [3]u32 = [PRED_GRADIENT, PRED_W, PRED_N]
+const PREDICTOR_CANDIDATES: [5]u32 = [PRED_GRADIENT, PRED_WEIGHTED, PRED_W, PRED_N, PRED_SELECT]
+
+fn analyze(source: &pixels.View, plan: &mut Plan, planes: &mut[i32], hist: &mut[u32], words: &mut[u32]) {
+    if !plan.float {
+        find_factors(source, plan)
+    }
+    if plan.sample == pixels.SAMPLE_F32 {
+        lock_mixed_signs(source, plan)
+    }
+    if plan.effort < 2 {
+        return
+    }
+    costs := [0u64; 256]
+    best := 0xFFFFFFFFFFFFFFFFu64
+    if plan.color_channels == 3 && plan.sample != pixels.SAMPLE_F32 {
+        choice := plan.rct
+        count := 3usize
+        if plan.effort >= 3 {
+            count = 9
+        }
+        for i in 0usize..count {
+            candidate := RCT_CANDIDATES_3[i]
+            if plan.effort < 3 {
+                candidate = RCT_CANDIDATES_2[i]
+            }
+            plan.rct = candidate
+            cost := estimate(source, plan, planes, hist, words, &mut costs)
+            if cost < best {
+                best = cost
+                choice = candidate
+            }
+        }
+        plan.rct = choice
+    }
+    choose_predictors(source, plan, planes, hist, words)
+    best = estimate(source, plan, planes, hist, words, &mut costs)
+    // Palette: only integer samples; colors limited so indices stay within
+    // the sample range of single-channel images.
+    if plan.float {
+        return
+    }
+    limit := MAX_PALETTE
+    if plan.channels == 1 && plan.bits == 8 {
+        limit = 256
+    }
+    found := find_palette(source, plan.channels, plan.sample != pixels.SAMPLE_U8, limit, words)
+    if found == 0 {
+        try_without_contexts(source, plan, planes, hist, words, best)
+        return
+    }
+    saved_rct := plan.rct
+    saved := [0u32; 5]
+    for c in 0usize..5 {
+        saved[c] = plan.predictors[c]
+    }
+    plan.palette = found
+    plan.rct = -1
+    // Zero prediction suits unordered indices; the neighbors suit ordered
+    // ones.
+    cost := 0xFFFFFFFFFFFFFFFFu64
+    choice := PRED_ZERO
+    for i in 0usize..4 {
+        plan.predictors[0] = INDEX_PREDICTORS[i]
+        trial := estimate(source, plan, planes, hist, words, &mut costs)
+        if trial < cost {
+            cost = trial
+            choice = INDEX_PREDICTORS[i]
+        }
+    }
+    plan.predictors[0] = choice
+    if cost < best {
+        try_without_contexts(source, plan, planes, hist, words, cost)
+        return
+    }
+    plan.palette = 0
+    plan.rct = saved_rct
+    for c in 0usize..5 {
+        plan.predictors[c] = saved[c]
+    }
+    try_without_contexts(source, plan, planes, hist, words, best)
+}
+
+// Small images may code smaller with one context per channel.
+fn try_without_contexts(source: &pixels.View, plan: &mut Plan, planes: &mut[i32], hist: &mut[u32], words: &[u32], cost: u64) {
+    if !plan.contexts {
+        return
+    }
+    costs := [0u64; 256]
+    plan.contexts = false
+    plain := estimate(source, plan, planes, hist, words, &mut costs)
+    if plain >= cost {
+        plan.contexts = true
+    }
+}
+
+// Per channel, the predictor with the smallest estimate.
+fn choose_predictors(source: &pixels.View, plan: &mut Plan, planes: &mut[i32], hist: &mut[u32], words: &[u32]) {
+    costs := [0u64; 256]
+    per := [0u64; 5]
+    best := [0xFFFFFFFFFFFFFFFFu64; 5]
+    choice := [PRED_GRADIENT; 5]
+    candidates := 5usize
+    if plan.effort < 3 {
+        candidates = 3
+    }
+    for i in 0usize..candidates {
+        p := PREDICTOR_CANDIDATES[i]
+        if plan.effort < 3 {
+            p = PREDICTOR_CANDIDATES_2[i]
+        }
+        if p == PRED_WEIGHTED && plan.bits > 16 {
+            // 32-bit float patterns would overflow its error arithmetic.
+            continue
+        }
+        for c in 0usize..5 {
+            if !plan.locked[c] {
+                plan.predictors[c] = p
+            }
+        }
+        estimate(source, plan, planes, hist, words, &mut costs)
+        channel_costs(plan, &costs, &mut per)
+        for c in 0usize..plan.channels {
+            if per[c] < best[c] && !plan.locked[c] {
+                best[c] = per[c]
+                choice[c] = p
+            }
+        }
+    }
+    for c in 0usize..5 {
+        if !plan.locked[c] {
+            plan.predictors[c] = choice[c]
+        }
+    }
+}
+
+// 32-bit float patterns of both signs span the whole i32 range, where a
+// residual against a neighbor could need 33 bits; such channels code their
+// samples directly (predictor Zero), which always fits.
+fn lock_mixed_signs(source: &pixels.View, plan: &mut Plan) {
+    negative := [false; 4]
+    positive := [false; 4]
+    for y in 0u32..source.height() {
+        row := source.row(y)
+        for x in 0usize..plan.width {
+            for c in 0usize..plan.channels {
+                if sample_value(row, x * plan.channels + c, plan.sample) < 0 {
+                    negative[c] = true
+                } else {
+                    positive[c] = true
+                }
+            }
+        }
+    }
+    for c in 0usize..plan.channels {
+        if negative[c] && positive[c] {
+            plan.predictors[c] = PRED_ZERO
+            plan.locked[c] = true
+        }
+    }
+}
+// Every symbol, for costs over the whole alphabet.
+const ALL_SYMBOLS: [272]u16 = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139, 140, 141, 142, 143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 154, 155, 156, 157, 158, 159, 160, 161, 162, 163, 164, 165, 166, 167, 168, 169, 170, 171, 172, 173, 174, 175, 176, 177, 178, 179, 180, 181, 182, 183, 184, 185, 186, 187, 188, 189, 190, 191, 192, 193, 194, 195, 196, 197, 198, 199, 200, 201, 202, 203, 204, 205, 206, 207, 208, 209, 210, 211, 212, 213, 214, 215, 216, 217, 218, 219, 220, 221, 222, 223, 224, 225, 226, 227, 228, 229, 230, 231, 232, 233, 234, 235, 236, 237, 238, 239, 240, 241, 242, 243, 244, 245, 246, 247, 248, 249, 250, 251, 252, 253, 254, 255, 256, 257, 258, 259, 260, 261, 262, 263, 264, 265, 266, 267, 268, 269, 270, 271]
+
+// Per source channel, the greatest common divisor of all samples (1 for a
+// channel of zeros). Stops early once every channel is down to 1.
+fn find_factors(source: &pixels.View, plan: &mut Plan) {
+    factors := [0u32; 4]
+    width := plan.width
+    for y in 0u32..source.height() {
+        row := source.row(y)
+        for x in 0usize..width {
+            done := true
+            for c in 0usize..plan.channels {
+                if factors[c] != 1 {
+                    factors[c] = gcd(factors[c], sample_value(row, x * plan.channels + c, plan.sample) as u32)
+                    done = false
+                }
+            }
+            if done {
+                return
+            }
+        }
+    }
+    for c in 0usize..plan.channels {
+        if factors[c] > 1 {
+            plan.source_factors[c] = factors[c]
+        }
+    }
+}
