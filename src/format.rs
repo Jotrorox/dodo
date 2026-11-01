@@ -481,7 +481,8 @@ impl<'a> Plan<'a> {
             | ExprKind::Constant(value, _)
             | ExprKind::Field(value, _)
             | ExprKind::Cast(value, _)
-            | ExprKind::Try(value) => self.expression(value),
+            | ExprKind::Try(value)
+            | ExprKind::Await { value, .. } => self.expression(value),
             ExprKind::Slice {
                 base, start, end, ..
             } => {

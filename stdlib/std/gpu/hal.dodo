@@ -1,0 +1,679 @@
+package hal
+
+// The interface between std/gpu and its backends.
+//
+// std/gpu validates every call, tracks which objects the GPU may still be
+// using and keeps the state of a pass; a backend only translates. Each
+// backend is a `Device` struct implementing the Backend interface below:
+// std/gpu/hal/vulkan, std/gpu/hal/opengl, and std/gpu/hal/native, the
+// operating system's own API (Metal on macOS). Backends trust their caller:
+// a descriptor reaching them has already been checked against the rules
+// documented in std/gpu, so they do not check again.
+//
+// Objects cross the interface as plain Handles, four words whose meaning
+// each backend defines (a VkBuffer and its memory, a retained MTLBuffer, an
+// OpenGL buffer name). std/gpu never looks inside them.
+
+pub enum Error {
+    // No GPU API could be used: its library or driver is missing, or it
+    // offers no suitable GPU.
+    NoBackend,
+    // The backend or GPU lacks a version, feature or format the call needs.
+    Unsupported,
+    // An argument breaks one of std/gpu's documented rules.
+    InvalidInput,
+    // The shader source has no code for the backend in use.
+    MissingShader,
+    // The shader code failed to compile or link, or lacks the entry point.
+    InvalidShader,
+    // The GPU or the driver ran out of memory.
+    OutOfMemory,
+    // The GPU stopped responding or was removed; the device is unusable.
+    DeviceLost,
+    // Another backend call failed.
+    System
+}
+
+// Which GPU API a device uses.
+pub enum Api {
+    Vulkan,
+    Metal,
+    OpenGl
+}
+
+// A backend object: four words whose meaning the backend defines.
+pub struct Handle {
+    pub a: u64
+    pub b: u64
+    pub c: u64
+    pub d: u64
+
+    pub fn null() -> Handle {
+        return Handle { a: 0, b: 0, c: 0, d: 0 }
+    }
+    pub fn copy(&self) -> Handle {
+        return Handle { a: self.a, b: self.b, c: self.c, d: self.d }
+    }
+}
+
+// What std/gpu destroys through Backend.destroy.
+pub const OBJECT_BUFFER: u32 = 1
+pub const OBJECT_TEXTURE: u32 = 2
+pub const OBJECT_SAMPLER: u32 = 3
+pub const OBJECT_COMPUTE_PIPELINE: u32 = 4
+pub const OBJECT_RENDER_PIPELINE: u32 = 5
+// A submitted or abandoned command encoder.
+pub const OBJECT_ENCODER: u32 = 6
+
+// Binding slots per pipeline, vertex buffers and attributes per render
+// pipeline. Slot N is binding N of descriptor set 0 in SPIR-V,
+// [[buffer(N)]], [[texture(N)]] and [[sampler(N)]] in Metal, and
+// layout(binding = N) in GLSL.
+pub const MAX_SLOTS: u32 = 16
+pub const MAX_VERTEX_BUFFERS: u32 = 8
+pub const MAX_VERTEX_ATTRIBUTES: u32 = 16
+// Metal shares buffer indices between bindings and vertex buffers:
+// vertex buffer N is [[buffer(METAL_VERTEX_BUFFER_BASE + N)]].
+pub const METAL_VERTEX_BUFFER_BASE: u32 = 16
+
+// Buffer usages, combined with `|`.
+pub const BUFFER_COPY_SRC: u32 = 1
+pub const BUFFER_COPY_DST: u32 = 2
+pub const BUFFER_INDEX: u32 = 4
+pub const BUFFER_VERTEX: u32 = 8
+pub const BUFFER_UNIFORM: u32 = 16
+pub const BUFFER_STORAGE: u32 = 32
+pub const BUFFER_USAGES: u32 = 63
+
+// Texture usages, combined with `|`.
+pub const TEXTURE_COPY_SRC: u32 = 1
+pub const TEXTURE_COPY_DST: u32 = 2
+pub const TEXTURE_SAMPLED: u32 = 4
+pub const TEXTURE_STORAGE: u32 = 8
+pub const TEXTURE_RENDER: u32 = 16
+pub const TEXTURE_USAGES: u32 = 31
+
+// Texture formats. FORMAT_NONE marks a missing depth attachment.
+pub const FORMAT_NONE: u32 = 0
+pub const FORMAT_R8_UNORM: u32 = 1
+pub const FORMAT_RG8_UNORM: u32 = 2
+pub const FORMAT_RGBA8_UNORM: u32 = 3
+pub const FORMAT_RGBA8_UNORM_SRGB: u32 = 4
+pub const FORMAT_BGRA8_UNORM: u32 = 5
+pub const FORMAT_BGRA8_UNORM_SRGB: u32 = 6
+pub const FORMAT_R16_FLOAT: u32 = 7
+pub const FORMAT_RG16_FLOAT: u32 = 8
+pub const FORMAT_RGBA16_FLOAT: u32 = 9
+pub const FORMAT_R32_FLOAT: u32 = 10
+pub const FORMAT_RG32_FLOAT: u32 = 11
+pub const FORMAT_RGBA32_FLOAT: u32 = 12
+pub const FORMAT_R32_UINT: u32 = 13
+pub const FORMAT_R32_SINT: u32 = 14
+pub const FORMAT_RGBA32_UINT: u32 = 15
+pub const FORMAT_DEPTH32_FLOAT: u32 = 16
+pub const FORMAT_COUNT: u32 = 17
+
+// The size of one texel in bytes, or 0 for an unknown format.
+pub fn texel_size(format: u32) -> u32 {
+    if format == FORMAT_R8_UNORM {
+        return 1
+    }
+    if format == FORMAT_RG8_UNORM || format == FORMAT_R16_FLOAT {
+        return 2
+    }
+    if format == FORMAT_RGBA8_UNORM || format == FORMAT_RGBA8_UNORM_SRGB || format == FORMAT_BGRA8_UNORM || format == FORMAT_BGRA8_UNORM_SRGB || format == FORMAT_RG16_FLOAT || format == FORMAT_R32_FLOAT || format == FORMAT_R32_UINT || format == FORMAT_R32_SINT || format == FORMAT_DEPTH32_FLOAT {
+        return 4
+    }
+    if format == FORMAT_RGBA16_FLOAT || format == FORMAT_RG32_FLOAT {
+        return 8
+    }
+    if format == FORMAT_RGBA32_FLOAT || format == FORMAT_RGBA32_UINT {
+        return 16
+    }
+    return 0
+}
+
+pub fn is_depth(format: u32) -> bool {
+    return format == FORMAT_DEPTH32_FLOAT
+}
+
+// Whether shaders read the format as integers, which cannot be filtered
+// or blended.
+pub fn is_integer(format: u32) -> bool {
+    return format == FORMAT_R32_UINT || format == FORMAT_R32_SINT || format == FORMAT_RGBA32_UINT
+}
+
+// Whether every backend can use the format as a storage texture.
+pub fn is_storage(format: u32) -> bool {
+    return format == FORMAT_RGBA8_UNORM || format == FORMAT_RGBA16_FLOAT || format == FORMAT_R32_FLOAT || format == FORMAT_RG32_FLOAT || format == FORMAT_RGBA32_FLOAT || format == FORMAT_R32_UINT || format == FORMAT_R32_SINT || format == FORMAT_RGBA32_UINT
+}
+
+// Whether blending applies to a color format.
+pub fn is_blendable(format: u32) -> bool {
+    return !is_integer(format) && !is_depth(format) && format != FORMAT_R32_FLOAT && format != FORMAT_RG32_FLOAT && format != FORMAT_RGBA32_FLOAT
+}
+
+// Binding kinds in a pipeline's layout.
+pub const BINDING_NONE: u32 = 0
+pub const BINDING_UNIFORM_BUFFER: u32 = 1
+pub const BINDING_STORAGE_BUFFER: u32 = 2
+pub const BINDING_READ_ONLY_STORAGE_BUFFER: u32 = 3
+// A texture sampled through a sampler bound with it.
+pub const BINDING_SAMPLED_TEXTURE: u32 = 4
+// A texture read and written texel by texel, of the layout's format.
+pub const BINDING_STORAGE_TEXTURE: u32 = 5
+
+// Shader stages, combined with `|`.
+pub const STAGE_VERTEX: u32 = 1
+pub const STAGE_FRAGMENT: u32 = 2
+pub const STAGE_COMPUTE: u32 = 4
+
+// Vertex attribute formats.
+pub const VERTEX_FLOAT32: u32 = 1
+pub const VERTEX_FLOAT32X2: u32 = 2
+pub const VERTEX_FLOAT32X3: u32 = 3
+pub const VERTEX_FLOAT32X4: u32 = 4
+pub const VERTEX_UINT32: u32 = 5
+pub const VERTEX_UINT32X2: u32 = 6
+pub const VERTEX_UINT32X3: u32 = 7
+pub const VERTEX_UINT32X4: u32 = 8
+pub const VERTEX_SINT32: u32 = 9
+pub const VERTEX_SINT32X2: u32 = 10
+pub const VERTEX_SINT32X3: u32 = 11
+pub const VERTEX_SINT32X4: u32 = 12
+// Four bytes read as floats from 0.0 to 1.0, such as an RGBA color.
+pub const VERTEX_UNORM8X4: u32 = 13
+
+// The size of a vertex attribute in bytes, or 0 for an unknown format.
+pub fn vertex_size(format: u32) -> u32 {
+    if format == VERTEX_UNORM8X4 {
+        return 4
+    }
+    if format >= VERTEX_FLOAT32 && format <= VERTEX_SINT32X4 {
+        return ((format - 1) % 4 + 1) * 4
+    }
+    return 0
+}
+
+// How many components a vertex attribute has.
+pub fn vertex_components(format: u32) -> u32 {
+    if format == VERTEX_UNORM8X4 {
+        return 4
+    }
+    return (format - 1) % 4 + 1
+}
+
+// How a vertex buffer advances.
+pub const STEP_VERTEX: u32 = 0
+pub const STEP_INSTANCE: u32 = 1
+
+pub const TOPOLOGY_TRIANGLE_LIST: u32 = 0
+pub const TOPOLOGY_TRIANGLE_STRIP: u32 = 1
+pub const TOPOLOGY_LINE_LIST: u32 = 2
+pub const TOPOLOGY_LINE_STRIP: u32 = 3
+pub const TOPOLOGY_POINT_LIST: u32 = 4
+
+pub const CULL_NONE: u32 = 0
+pub const CULL_FRONT: u32 = 1
+pub const CULL_BACK: u32 = 2
+
+// Which winding faces the viewer, seen with y pointing up in clip space.
+pub const FRONT_CCW: u32 = 0
+pub const FRONT_CW: u32 = 1
+
+pub const INDEX_UINT16: u32 = 1
+pub const INDEX_UINT32: u32 = 2
+
+// Color blending: none, straight alpha, premultiplied alpha, additive.
+pub const BLEND_REPLACE: u32 = 0
+pub const BLEND_ALPHA: u32 = 1
+pub const BLEND_PREMULTIPLIED: u32 = 2
+pub const BLEND_ADDITIVE: u32 = 3
+
+pub const COMPARE_NEVER: u32 = 1
+pub const COMPARE_LESS: u32 = 2
+pub const COMPARE_EQUAL: u32 = 3
+pub const COMPARE_LESS_EQUAL: u32 = 4
+pub const COMPARE_GREATER: u32 = 5
+pub const COMPARE_NOT_EQUAL: u32 = 6
+pub const COMPARE_GREATER_EQUAL: u32 = 7
+pub const COMPARE_ALWAYS: u32 = 8
+
+pub const FILTER_NEAREST: u32 = 0
+pub const FILTER_LINEAR: u32 = 1
+
+pub const ADDRESS_CLAMP: u32 = 0
+pub const ADDRESS_REPEAT: u32 = 1
+pub const ADDRESS_MIRROR: u32 = 2
+
+// What a render pass does with an attachment's previous contents.
+pub const LOAD_CLEAR: u32 = 0
+pub const LOAD_KEEP: u32 = 1
+
+// What a device can do. Every backend offers at least the minimums listed
+// in std/gpu's documentation.
+pub struct Limits {
+    pub max_texture_size: u32
+    pub max_buffer_size: u64
+    pub max_uniform_binding_size: u64
+    pub max_storage_binding_size: u64
+    pub max_workgroups: u32
+    pub max_workgroup_size_x: u32
+    pub max_workgroup_size_y: u32
+    pub max_workgroup_size_z: u32
+    pub max_workgroup_invocations: u32
+
+    pub fn copy(&self) -> Limits {
+        return Limits {
+            max_texture_size: self.max_texture_size,
+            max_buffer_size: self.max_buffer_size,
+            max_uniform_binding_size: self.max_uniform_binding_size,
+            max_storage_binding_size: self.max_storage_binding_size,
+            max_workgroups: self.max_workgroups,
+            max_workgroup_size_x: self.max_workgroup_size_x,
+            max_workgroup_size_y: self.max_workgroup_size_y,
+            max_workgroup_size_z: self.max_workgroup_size_z,
+            max_workgroup_invocations: self.max_workgroup_invocations
+        }
+    }
+}
+
+// A two-dimensional texture: one mipmap level, one layer, one sample.
+pub struct TextureDescriptor {
+    pub width: u32
+    pub height: u32
+    pub format: u32
+    pub usage: u32
+
+    pub fn new(width: u32, height: u32, format: u32, usage: u32) -> TextureDescriptor {
+        return TextureDescriptor { width: width, height: height, format: format, usage: usage }
+    }
+    pub fn copy(&self) -> TextureDescriptor {
+        return TextureDescriptor { width: self.width, height: self.height, format: self.format, usage: self.usage }
+    }
+}
+
+// How a sampler filters and what it does outside 0.0 to 1.0.
+pub struct SamplerDescriptor {
+    pub mag_filter: u32
+    pub min_filter: u32
+    pub address_u: u32
+    pub address_v: u32
+
+    // Linear filtering, clamped to the edge.
+    pub fn linear() -> SamplerDescriptor {
+        return SamplerDescriptor { mag_filter: FILTER_LINEAR, min_filter: FILTER_LINEAR, address_u: ADDRESS_CLAMP, address_v: ADDRESS_CLAMP }
+    }
+    // Nearest-texel filtering, clamped to the edge.
+    pub fn nearest() -> SamplerDescriptor {
+        return SamplerDescriptor { mag_filter: FILTER_NEAREST, min_filter: FILTER_NEAREST, address_u: ADDRESS_CLAMP, address_v: ADDRESS_CLAMP }
+    }
+}
+
+// A rectangle of texels.
+pub struct Region {
+    pub x: u32
+    pub y: u32
+    pub width: u32
+    pub height: u32
+
+    pub fn new(x: u32, y: u32, width: u32, height: u32) -> Region {
+        return Region { x: x, y: y, width: width, height: height }
+    }
+    pub fn copy(&self) -> Region {
+        return Region { x: self.x, y: self.y, width: self.width, height: self.height }
+    }
+}
+
+// One shader in the languages of every backend. A backend uses its own:
+// Vulkan the SPIR-V words, Metal the Metal Shading Language source and
+// OpenGL the GLSL source. Leave out the ones you do not need.
+//
+// OpenGL compiles the GLSL source once per stage, with `#define VERTEX`,
+// `#define FRAGMENT` or `#define COMPUTE` inserted after its #version
+// line, so one source can hold every stage of a pipeline.
+pub struct ShaderSource {
+    pub spirv: &[u32]
+    pub msl: &str
+    pub glsl: &str
+
+    // A source with no code for any backend; add some with the with_
+    // methods.
+    pub fn new() -> ShaderSource from(static) {
+        return ShaderSource { spirv: &NO_WORDS, msl: "", glsl: "" }
+    }
+    pub fn with_spirv(self, words: &[u32]) -> ShaderSource from(self, words) {
+        return ShaderSource { spirv: words, msl: self.msl, glsl: self.glsl }
+    }
+    pub fn with_msl(self, source: &str) -> ShaderSource from(self, source) {
+        return ShaderSource { spirv: self.spirv, msl: source, glsl: self.glsl }
+    }
+    pub fn with_glsl(self, source: &str) -> ShaderSource from(self, source) {
+        return ShaderSource { spirv: self.spirv, msl: self.msl, glsl: source }
+    }
+}
+
+const NO_WORDS: [0]u32 = []
+const NO_BINDINGS: [0]BindingLayout = []
+const NO_VERTEX_BUFFERS: [0]VertexBufferLayout = []
+
+// One entry of a pipeline's binding layout: what the shader expects in
+// `slot`, and which stages use it.
+pub struct BindingLayout {
+    pub slot: u32
+    pub kind: u32
+    pub stages: u32
+    // The texel format of a BINDING_STORAGE_TEXTURE; otherwise ignored.
+    pub format: u32
+
+    pub fn uniform_buffer(slot: u32, stages: u32) -> BindingLayout {
+        return BindingLayout { slot: slot, kind: BINDING_UNIFORM_BUFFER, stages: stages, format: FORMAT_NONE }
+    }
+    pub fn storage_buffer(slot: u32, stages: u32) -> BindingLayout {
+        return BindingLayout { slot: slot, kind: BINDING_STORAGE_BUFFER, stages: stages, format: FORMAT_NONE }
+    }
+    pub fn read_only_storage_buffer(slot: u32, stages: u32) -> BindingLayout {
+        return BindingLayout { slot: slot, kind: BINDING_READ_ONLY_STORAGE_BUFFER, stages: stages, format: FORMAT_NONE }
+    }
+    pub fn sampled_texture(slot: u32, stages: u32) -> BindingLayout {
+        return BindingLayout { slot: slot, kind: BINDING_SAMPLED_TEXTURE, stages: stages, format: FORMAT_NONE }
+    }
+    pub fn storage_texture(slot: u32, stages: u32, format: u32) -> BindingLayout {
+        return BindingLayout { slot: slot, kind: BINDING_STORAGE_TEXTURE, stages: stages, format: format }
+    }
+}
+
+// One attribute read from a vertex buffer: shader input `location`, read
+// `offset` bytes into each vertex.
+pub struct VertexAttribute {
+    pub location: u32
+    pub format: u32
+    pub offset: u32
+
+    pub fn new(location: u32, format: u32, offset: u32) -> VertexAttribute {
+        return VertexAttribute { location: location, format: format, offset: offset }
+    }
+}
+
+// The layout of one vertex buffer: `stride` bytes per vertex (or instance,
+// for STEP_INSTANCE) holding `attributes`.
+pub struct VertexBufferLayout {
+    pub stride: u32
+    pub step: u32
+    pub attributes: &[VertexAttribute]
+
+    pub fn new(stride: u32, attributes: &[VertexAttribute]) -> VertexBufferLayout from(attributes) {
+        return VertexBufferLayout { stride: stride, step: STEP_VERTEX, attributes: attributes }
+    }
+    pub fn instanced(stride: u32, attributes: &[VertexAttribute]) -> VertexBufferLayout from(attributes) {
+        return VertexBufferLayout { stride: stride, step: STEP_INSTANCE, attributes: attributes }
+    }
+}
+
+// A compute pipeline. `workgroup_size_*` must equal the shader's own
+// workgroup size (local_size in GLSL); Metal, whose kernels do not declare
+// it, dispatches with it.
+pub struct ComputePipelineDescriptor {
+    pub source: &ShaderSource
+    pub entry: &str
+    pub bindings: &[BindingLayout]
+    pub workgroup_size_x: u32
+    pub workgroup_size_y: u32
+    pub workgroup_size_z: u32
+
+    pub fn new(source: &ShaderSource, entry: &str, workgroup_size_x: u32, workgroup_size_y: u32, workgroup_size_z: u32) -> ComputePipelineDescriptor from(source, entry) {
+        return ComputePipelineDescriptor { source: source, entry: entry, bindings: &NO_BINDINGS, workgroup_size_x: workgroup_size_x, workgroup_size_y: workgroup_size_y, workgroup_size_z: workgroup_size_z }
+    }
+}
+
+// A render pipeline drawing into one color attachment of `color_format`
+// and, unless `depth_format` is FORMAT_NONE, a depth attachment.
+pub struct RenderPipelineDescriptor {
+    pub vertex: &ShaderSource
+    pub vertex_entry: &str
+    pub fragment: &ShaderSource
+    pub fragment_entry: &str
+    pub bindings: &[BindingLayout]
+    pub vertex_buffers: &[VertexBufferLayout]
+    pub topology: u32
+    pub cull_mode: u32
+    pub front_face: u32
+    pub color_format: u32
+    pub blend: u32
+    pub depth_format: u32
+    pub depth_compare: u32
+    pub depth_write: bool
+
+    // Triangle lists without culling, blending or depth, and with no
+    // bindings or vertex buffers until you set them.
+    pub fn new(vertex: &ShaderSource, vertex_entry: &str, fragment: &ShaderSource, fragment_entry: &str, color_format: u32) -> RenderPipelineDescriptor from(vertex, vertex_entry, fragment, fragment_entry) {
+        return RenderPipelineDescriptor {
+            vertex: vertex,
+            vertex_entry: vertex_entry,
+            fragment: fragment,
+            fragment_entry: fragment_entry,
+            bindings: &NO_BINDINGS,
+            vertex_buffers: &NO_VERTEX_BUFFERS,
+            topology: TOPOLOGY_TRIANGLE_LIST,
+            cull_mode: CULL_NONE,
+            front_face: FRONT_CCW,
+            color_format: color_format,
+            blend: BLEND_REPLACE,
+            depth_format: FORMAT_NONE,
+            depth_compare: COMPARE_LESS,
+            depth_write: true
+        }
+    }
+}
+
+// A pipeline as std/gpu keeps it: the backend's handle and the layout the
+// pipeline was created with, which every draw or dispatch is checked
+// against.
+pub struct Pipeline {
+    pub handle: Handle
+    // The binding kind of each slot, BINDING_NONE when unused.
+    pub kinds: [16]u32
+    pub stages: [16]u32
+    // The format each storage texture slot expects.
+    pub formats: [16]u32
+    // Render pipelines only.
+    pub topology: u32
+    pub color_format: u32
+    pub depth_format: u32
+    pub vertex_buffer_count: u32
+    pub strides: [8]u32
+    pub steps: [8]u32
+    // How many bytes past the start of a vertex its last attribute ends.
+    pub extents: [8]u32
+    // Compute pipelines only.
+    pub workgroup_size_x: u32
+    pub workgroup_size_y: u32
+    pub workgroup_size_z: u32
+
+    pub fn empty() -> Pipeline {
+        return Pipeline {
+            handle: Handle.null(),
+            kinds: [0u32; 16],
+            stages: [0u32; 16],
+            formats: [0u32; 16],
+            topology: 0,
+            color_format: 0,
+            depth_format: 0,
+            vertex_buffer_count: 0,
+            strides: [0u32; 8],
+            steps: [0u32; 8],
+            extents: [0u32; 8],
+            workgroup_size_x: 0,
+            workgroup_size_y: 0,
+            workgroup_size_z: 0
+        }
+    }
+    pub fn copy(&self) -> Pipeline {
+        return Pipeline {
+            handle: self.handle.copy(),
+            kinds: copy16(&self.kinds),
+            stages: copy16(&self.stages),
+            formats: copy16(&self.formats),
+            topology: self.topology,
+            color_format: self.color_format,
+            depth_format: self.depth_format,
+            vertex_buffer_count: self.vertex_buffer_count,
+            strides: copy8(&self.strides),
+            steps: copy8(&self.steps),
+            extents: copy8(&self.extents),
+            workgroup_size_x: self.workgroup_size_x,
+            workgroup_size_y: self.workgroup_size_y,
+            workgroup_size_z: self.workgroup_size_z
+        }
+    }
+}
+
+fn copy16(values: &[16]u32) -> [16]u32 {
+    out := [0u32; 16]
+    for i in 0usize..16 {
+        out[i] = values[i]
+    }
+    return out
+}
+
+fn copy8(values: &[8]u32) -> [8]u32 {
+    out := [0u32; 8]
+    for i in 0usize..8 {
+        out[i] = values[i]
+    }
+    return out
+}
+
+// What is bound to the slots of a pass.
+pub const BOUND_NONE: u32 = 0
+pub const BOUND_BUFFER: u32 = 1
+// A texture together with a sampler.
+pub const BOUND_SAMPLED_TEXTURE: u32 = 2
+pub const BOUND_STORAGE_TEXTURE: u32 = 3
+
+// The state of a compute or render pass. std/gpu fills it as commands are
+// recorded and hands it to the backend at each draw or dispatch, which
+// applies whatever the dirty masks say changed and clears them.
+pub struct PassState {
+    pub pipeline: Pipeline
+    pub has_pipeline: bool
+    pub pipeline_dirty: bool
+
+    pub bound: [16]u32
+    // The buffer or texture handle's first two words, and the sampler's.
+    pub object_a: [16]u64
+    pub object_b: [16]u64
+    pub object_c: [16]u64
+    pub sampler: [16]u64
+    pub offset: [16]u64
+    pub size: [16]u64
+    // Bit N: slot N changed since the backend last applied it.
+    pub dirty: u32
+
+    pub vertex_a: [8]u64
+    pub vertex_offset: [8]u64
+    pub vertex_set: u32
+    pub vertex_dirty: u32
+
+    pub index_a: u64
+    pub index_offset: u64
+    pub index_format: u32
+    pub index_set: bool
+    pub index_dirty: bool
+
+    pub fn new() -> PassState {
+        return PassState {
+            pipeline: Pipeline.empty(),
+            has_pipeline: false,
+            pipeline_dirty: false,
+            bound: [0u32; 16],
+            object_a: [0u64; 16],
+            object_b: [0u64; 16],
+            object_c: [0u64; 16],
+            sampler: [0u64; 16],
+            offset: [0u64; 16],
+            size: [0u64; 16],
+            dirty: 0,
+            vertex_a: [0u64; 8],
+            vertex_offset: [0u64; 8],
+            vertex_set: 0,
+            vertex_dirty: 0,
+            index_a: 0,
+            index_offset: 0,
+            index_format: 0,
+            index_set: false,
+            index_dirty: false
+        }
+    }
+}
+
+// The attachments of a render pass.
+pub struct RenderPassInfo {
+    pub color: Handle
+    pub color_format: u32
+    pub width: u32
+    pub height: u32
+    pub load: u32
+    pub clear_red: f64
+    pub clear_green: f64
+    pub clear_blue: f64
+    pub clear_alpha: f64
+    pub has_depth: bool
+    pub depth: Handle
+    pub depth_load: u32
+    pub clear_depth: f32
+}
+
+// What std/gpu needs from a backend. Every method except the
+// constructor works on objects this device created; std/gpu destroys an
+// object only once the GPU has finished every submission that used it.
+pub interface Backend {
+    // Open the backend's preferred GPU. `debug` asks for the API's
+    // validation where it exists.
+    fn open(debug: bool) -> Self!Error
+    fn api(&self) -> Api
+    fn limits(&self) -> Limits
+    // Copy the GPU's name into `out`, cut at a character boundary, and
+    // return its length.
+    fn name(&self, out: &mut[u8]) -> usize
+
+    fn create_buffer(&self, size: u64, usage: u32) -> Handle!Error
+    // Copy into or out of a buffer. std/gpu has already waited for every
+    // submission that may use it.
+    fn write_buffer(&self, buffer: &Handle, offset: u64, data: &[u8]) -> void!Error
+    fn read_buffer(&self, buffer: &Handle, offset: u64, out: &mut[u8]) -> void!Error
+    fn create_texture(&self, descriptor: &TextureDescriptor) -> Handle!Error
+    // Copy texels in or out, `bytes_per_row` apart in `data`. Writes are
+    // ordered after earlier submissions; reads wait for them.
+    fn write_texture(&self, texture: &Handle, descriptor: &TextureDescriptor, region: &Region, data: &[u8], bytes_per_row: u32) -> void!Error
+    fn read_texture(&self, texture: &Handle, descriptor: &TextureDescriptor, region: &Region, out: &mut[u8], bytes_per_row: u32) -> void!Error
+    fn create_sampler(&self, descriptor: &SamplerDescriptor) -> Handle!Error
+    fn create_compute_pipeline(&self, descriptor: &ComputePipelineDescriptor) -> Handle!Error
+    fn create_render_pipeline(&self, descriptor: &RenderPipelineDescriptor) -> Handle!Error
+    // Destroy an OBJECT_* that the GPU no longer uses.
+    fn destroy(&self, object: u32, handle: &Handle)
+
+    // The number of the last submission the GPU has finished; submissions
+    // are numbered from 1 in order.
+    fn completed(&self) -> u64
+    // Wait until the GPU has finished submission `index` and those before.
+    fn wait(&self, index: u64) -> void!Error
+
+    fn begin_encoder(&self) -> Handle!Error
+    // Submit an encoder's commands and return the submission's number.
+    // The encoder is destroyed later, once that submission has finished.
+    fn submit(&self, encoder: &mut Handle) -> u64!Error
+    fn begin_compute_pass(&self, encoder: &mut Handle)
+    fn end_compute_pass(&self, encoder: &mut Handle)
+    fn begin_render_pass(&self, encoder: &mut Handle, pass: &RenderPassInfo)
+    fn end_render_pass(&self, encoder: &mut Handle)
+    // Viewports and scissors are in pixels from the top-left corner.
+    fn set_viewport(&self, encoder: &mut Handle, x: f32, y: f32, width: f32, height: f32, min_depth: f32, max_depth: f32)
+    fn set_scissor(&self, encoder: &mut Handle, x: u32, y: u32, width: u32, height: u32)
+    fn dispatch(&self, encoder: &mut Handle, state: &mut PassState, x: u32, y: u32, z: u32)
+    fn draw(&self, encoder: &mut Handle, state: &mut PassState, vertex_count: u32, instance_count: u32, first_vertex: u32, first_instance: u32)
+    fn draw_indexed(&self, encoder: &mut Handle, state: &mut PassState, index_count: u32, instance_count: u32, first_index: u32, base_vertex: i32, first_instance: u32)
+    fn copy_buffer(&self, encoder: &mut Handle, source: &Handle, source_offset: u64, destination: &Handle, destination_offset: u64, size: u64)
+    fn copy_buffer_to_texture(&self, encoder: &mut Handle, source: &Handle, offset: u64, bytes_per_row: u32, destination: &Handle, descriptor: &TextureDescriptor, region: &Region)
+    fn copy_texture_to_buffer(&self, encoder: &mut Handle, source: &Handle, descriptor: &TextureDescriptor, region: &Region, destination: &Handle, offset: u64, bytes_per_row: u32)
+}

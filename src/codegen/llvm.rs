@@ -820,8 +820,10 @@ impl<'ctx> Module<'ctx> {
     /// into one operation per element, costing minutes and gigabytes of
     /// compiler memory, and megabytes of stack at -O0. Constant stores become
     /// memset or field stores. A loaded value's store becomes a memmove when
-    /// nothing in between can write its source, a field extraction becomes a
-    /// field load, and a load left without uses is erased. Other loads stay.
+    /// nothing in between can write its source; otherwise the load becomes a
+    /// memcpy into a stack copy that the stores read. A field extraction
+    /// becomes a field load, and a load left without uses is erased. Loads
+    /// with other uses stay.
     pub(super) fn lower_large_aggregates(&self, data: &TargetData, limit: u64) {
         unsafe {
             let context = LLVMGetModuleContext(self.0);
@@ -870,7 +872,7 @@ impl<'ctx> Module<'ctx> {
                     users.push(LLVMGetUser(use_));
                     use_ = LLVMGetNextUse(use_);
                 }
-                let rewritable = users.iter().all(|&user| {
+                let movable = |user: LLVMValueRef| {
                     if !LLVMIsAExtractValueInst(user).is_null() {
                         return LLVMGetOperand(user, 0) == load;
                     }
@@ -878,9 +880,8 @@ impl<'ctx> Module<'ctx> {
                         && LLVMGetVolatile(user) == 0
                         && LLVMGetOperand(user, 0) == load
                         && LLVMGetOperand(user, 1) != load
-                        && no_writes_between(load, user, source)
-                });
-                if !rewritable {
+                };
+                if !users.iter().all(|&user| movable(user)) {
                     continue;
                 }
                 let ty = LLVMTypeOf(load);
@@ -889,6 +890,31 @@ impl<'ctx> Module<'ctx> {
                     LLVMABISizeOfType(data.0, ty),
                     0,
                 );
+                // When something between the load and a store may write the
+                // source, such as the drops after a Result is built, copy the
+                // value aside where it was loaded and read the copy instead.
+                // Left as a load, scalar replacement would split it into one
+                // operation per byte.
+                let direct = users.iter().all(|&user| {
+                    !LLVMIsAExtractValueInst(user).is_null()
+                        || no_writes_between(load, user, source)
+                });
+                let source = if direct {
+                    source
+                } else {
+                    let function = LLVMGetBasicBlockParent(LLVMGetInstructionParent(load));
+                    let entry = LLVMGetEntryBasicBlock(function);
+                    let first = LLVMGetFirstInstruction(entry);
+                    if first.is_null() {
+                        LLVMPositionBuilderAtEnd(builder, entry);
+                    } else {
+                        LLVMPositionBuilderBefore(builder, first);
+                    }
+                    let snapshot = LLVMBuildAlloca(builder, ty, c"snapshot".as_ptr());
+                    LLVMPositionBuilderBefore(builder, load);
+                    LLVMBuildMemCpy(builder, snapshot, 1, source, 1, size);
+                    snapshot
+                };
                 for user in users {
                     if LLVMIsAStoreInst(user).is_null() {
                         // Read the field where the whole value was read.
@@ -1382,7 +1408,17 @@ impl<'ctx> Builder<'ctx> {
     ) -> Result<Value<'ctx>> {
         self.positioned()?;
         if ty.get_field_type_at_index(index).is_none() {
-            return Err(error("LLVM struct field index is out of bounds"));
+            let name = unsafe { LLVMGetStructName(ty.0) };
+            let name = if name.is_null() {
+                String::new()
+            } else {
+                unsafe { CStr::from_ptr(name) }
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            return Err(error(format!(
+                "LLVM struct field index {index} is out of bounds for `{name}`"
+            )));
         }
         Ok(Value(
             unsafe { LLVMBuildStructGEP2(self.0, ty.0, ptr.0, index, cstring(name).as_ptr()) },
@@ -1705,5 +1741,431 @@ impl<'ctx> Builder<'ctx> {
             unsafe { LLVMBuildMemSet(self.0, dst.0, value.0, size.0, align) },
             PhantomData,
         ))
+    }
+}
+
+/// Rewriting a generated function into a resumable state machine: its entry
+/// block gains edges to the resume points, and its stack slots move into the
+/// suspended frame. See `Codegen::async_frames`.
+impl<'ctx> Value<'ctx> {
+    pub(super) fn basic_blocks(self) -> Vec<BasicBlock<'ctx>> {
+        let mut blocks = Vec::new();
+        let mut block = unsafe { LLVMGetFirstBasicBlock(self.0) };
+        while !block.is_null() {
+            blocks.push(BasicBlock(block, PhantomData));
+            block = unsafe { LLVMGetNextBasicBlock(block) };
+        }
+        blocks
+    }
+    pub(super) fn is_alloca(self) -> bool {
+        unsafe { !LLVMIsAAllocaInst(self.0).is_null() }
+    }
+    pub(super) fn allocated_type(self) -> LlvmType<'ctx> {
+        LlvmType(unsafe { LLVMGetAllocatedType(self.0) }, PhantomData)
+    }
+    pub(super) fn replace_all_uses_with(self, other: Self) {
+        unsafe { LLVMReplaceAllUsesWith(self.0, other.0) }
+    }
+    pub(super) fn erase_instruction(self) {
+        unsafe { LLVMInstructionEraseFromParent(self.0) }
+    }
+    /// Demote every instruction result that is used where its definition no
+    /// longer dominates the use: through memory from `slot(type)`, stored
+    /// right after the definition and loaded before each such use. In a
+    /// state machine such a use is reached through a resume point, so the
+    /// value comes from an earlier call; its slot must persist between them.
+    pub(super) fn repair_dominance(
+        self,
+        builder: &Builder<'ctx>,
+        mut slot: impl FnMut(LlvmType<'ctx>) -> Result<Value<'ctx>>,
+    ) -> Result<()> {
+        let blocks = self.basic_blocks();
+        let index: std::collections::HashMap<LLVMBasicBlockRef, usize> =
+            blocks.iter().enumerate().map(|(i, b)| (b.0, i)).collect();
+        let successors: Vec<Vec<usize>> = blocks
+            .iter()
+            .map(|block| unsafe {
+                let terminator = LLVMGetBasicBlockTerminator(block.0);
+                if terminator.is_null() {
+                    return vec![];
+                }
+                (0..LLVMGetNumSuccessors(terminator))
+                    .map(|i| index[&LLVMGetSuccessor(terminator, i)])
+                    .collect()
+            })
+            .collect();
+        // Reverse postorder from the entry; unreachable blocks keep None.
+        let mut order = Vec::new();
+        let mut visited = vec![false; blocks.len()];
+        let mut stack = vec![(0usize, 0usize)];
+        visited[0] = true;
+        while let Some((block, next)) = stack.pop() {
+            if next < successors[block].len() {
+                stack.push((block, next + 1));
+                let successor = successors[block][next];
+                if !visited[successor] {
+                    visited[successor] = true;
+                    stack.push((successor, 0));
+                }
+            } else {
+                order.push(block);
+            }
+        }
+        order.reverse();
+        let mut rank = vec![usize::MAX; blocks.len()];
+        for (position, block) in order.iter().enumerate() {
+            rank[*block] = position;
+        }
+        let mut predecessors = vec![vec![]; blocks.len()];
+        for (block, targets) in successors.iter().enumerate() {
+            if rank[block] != usize::MAX {
+                for target in targets {
+                    predecessors[*target].push(block);
+                }
+            }
+        }
+        // Cooper, Harvey, and Kennedy's iterative dominator computation.
+        let mut idom = vec![usize::MAX; blocks.len()];
+        idom[0] = 0;
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for &block in order.iter().skip(1) {
+                let mut new = usize::MAX;
+                for &p in &predecessors[block] {
+                    if idom[p] == usize::MAX {
+                        continue;
+                    }
+                    new = if new == usize::MAX {
+                        p
+                    } else {
+                        let (mut a, mut b) = (p, new);
+                        while a != b {
+                            while rank[a] > rank[b] {
+                                a = idom[a];
+                            }
+                            while rank[b] > rank[a] {
+                                b = idom[b];
+                            }
+                        }
+                        a
+                    };
+                }
+                if new != idom[block] {
+                    idom[block] = new;
+                    changed = true;
+                }
+            }
+        }
+        let dominates = |a: usize, mut b: usize| loop {
+            if a == b {
+                return true;
+            }
+            if b == 0 || idom[b] == usize::MAX {
+                return false;
+            }
+            b = idom[b];
+        };
+        let reachable = |block: usize| rank[block] != usize::MAX;
+        // Collect first: demotion inserts instructions.
+        let mut definitions = Vec::new();
+        for (number, block) in blocks.iter().enumerate() {
+            if !reachable(number) {
+                continue;
+            }
+            let mut instruction = unsafe { LLVMGetFirstInstruction(block.0) };
+            while !instruction.is_null() {
+                definitions.push((instruction, number));
+                instruction = unsafe { LLVMGetNextInstruction(instruction) };
+            }
+        }
+        for (definition, home) in definitions {
+            let ty = unsafe { LLVMTypeOf(definition) };
+            if unsafe { LLVMGetTypeKind(ty) } == LLVMTypeKind::LLVMVoidTypeKind {
+                continue;
+            }
+            // Operands (user, operand index, block of the use) not dominated.
+            let mut stale = Vec::new();
+            let mut user_use = unsafe { LLVMGetFirstUse(definition) };
+            let mut users = Vec::new();
+            while !user_use.is_null() {
+                let user = unsafe { LLVMGetUser(user_use) };
+                if !users.contains(&user) {
+                    users.push(user);
+                }
+                user_use = unsafe { LLVMGetNextUse(user_use) };
+            }
+            for user in users {
+                if unsafe { LLVMIsAInstruction(user) }.is_null() {
+                    continue;
+                }
+                let phi = unsafe { !LLVMIsAPHINode(user).is_null() };
+                let parent = unsafe { LLVMGetInstructionParent(user) };
+                for operand in 0..unsafe { LLVMGetNumOperands(user) } as u32 {
+                    if unsafe { LLVMGetOperand(user, operand) } != definition {
+                        continue;
+                    }
+                    let place = if phi {
+                        unsafe { LLVMGetIncomingBlock(user, operand) }
+                    } else {
+                        parent
+                    };
+                    let Some(&block) = index.get(&place) else {
+                        continue;
+                    };
+                    if reachable(block) && !dominates(home, block) {
+                        stale.push((user, operand, phi, place));
+                    }
+                }
+            }
+            if stale.is_empty() {
+                continue;
+            }
+            let memory = slot(LlvmType(ty, PhantomData))?;
+            unsafe {
+                // After the definition, and after every phi of its block.
+                let mut after = LLVMGetNextInstruction(definition);
+                while !after.is_null() && !LLVMIsAPHINode(after).is_null() {
+                    after = LLVMGetNextInstruction(after);
+                }
+                if after.is_null() {
+                    LLVMPositionBuilderAtEnd(builder.0, blocks[home].0);
+                } else {
+                    LLVMPositionBuilderBefore(builder.0, after);
+                }
+                LLVMBuildStore(builder.0, definition, memory.0);
+                for (user, operand, phi, place) in stale {
+                    if phi {
+                        LLVMPositionBuilderBefore(builder.0, LLVMGetBasicBlockTerminator(place));
+                    } else {
+                        LLVMPositionBuilderBefore(builder.0, user);
+                    }
+                    let reloaded =
+                        LLVMBuildLoad2(builder.0, ty, memory.0, cstring("resumed").as_ptr());
+                    LLVMSetOperand(user, operand, reloaded);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+impl<'ctx> BasicBlock<'ctx> {
+    pub(super) fn instructions(self) -> Vec<Value<'ctx>> {
+        let mut instructions = Vec::new();
+        let mut instruction = unsafe { LLVMGetFirstInstruction(self.0) };
+        while !instruction.is_null() {
+            instructions.push(Value(instruction, PhantomData));
+            instruction = unsafe { LLVMGetNextInstruction(instruction) };
+        }
+        instructions
+    }
+}
+impl<'ctx> Value<'ctx> {
+    /// Which of `slots`, stack slots of this function, carry a value from
+    /// one call to the next: those live where a `resume` block starts, that
+    /// is, read on some path from it before being overwritten. `ignored`
+    /// stores (first-call initialization) do not count. A slot whose address
+    /// escapes counts as carried, unless it goes only to LLVM intrinsics or,
+    /// as indirect call storage, to calls: `call_storage` tells whether a
+    /// slot is a call's result storage, which the callee overwrites, or its
+    /// argument storage, which the callee reads, and neither retains.
+    pub(super) fn carried_slots(
+        self,
+        slots: &[Value<'ctx>],
+        resumes: &[BasicBlock<'ctx>],
+        ignored: &[Value<'ctx>],
+        call_storage: impl Fn(Value<'ctx>) -> Option<bool>,
+    ) -> Vec<bool> {
+        let blocks = self.basic_blocks();
+        let index: std::collections::HashMap<LLVMBasicBlockRef, usize> =
+            blocks.iter().enumerate().map(|(i, b)| (b.0, i)).collect();
+        let mut successors = vec![vec![]; blocks.len()];
+        for (number, block) in blocks.iter().enumerate() {
+            let terminator = unsafe { LLVMGetBasicBlockTerminator(block.0) };
+            if terminator.is_null() {
+                continue;
+            }
+            for i in 0..unsafe { LLVMGetNumSuccessors(terminator) } {
+                successors[number].push(index[&unsafe { LLVMGetSuccessor(terminator, i) }]);
+            }
+        }
+        // Instruction positions, to order the events within a block.
+        let mut position = std::collections::HashMap::new();
+        for block in &blocks {
+            for (offset, instruction) in block.instructions().into_iter().enumerate() {
+                position.insert(instruction.0, offset);
+            }
+        }
+        let ignored: Vec<LLVMValueRef> = ignored.iter().map(|v| v.0).collect();
+        #[derive(Clone, Copy, PartialEq)]
+        enum Event {
+            Read,
+            Overwrite,
+        }
+        slots
+            .iter()
+            .map(|slot| {
+                let storage = call_storage(*slot);
+                let allocated = unsafe { LLVMGetAllocatedType(slot.0) };
+                // The first event in each block that touches the slot.
+                let mut first: Vec<Option<(usize, Event)>> = vec![None; blocks.len()];
+                let mut note = |user: LLVMValueRef, event: Event| {
+                    let block = index[&unsafe { LLVMGetInstructionParent(user) }];
+                    let at = position[&user];
+                    if first[block].is_none_or(|(earlier, _)| at < earlier) {
+                        first[block] = Some((at, event));
+                    }
+                };
+                let mut pending = vec![slot.0];
+                while let Some(pointer) = pending.pop() {
+                    let mut user_use = unsafe { LLVMGetFirstUse(pointer) };
+                    while !user_use.is_null() {
+                        let user = unsafe { LLVMGetUser(user_use) };
+                        user_use = unsafe { LLVMGetNextUse(user_use) };
+                        if unsafe { LLVMIsAInstruction(user) }.is_null() || ignored.contains(&user)
+                        {
+                            continue;
+                        }
+                        match unsafe { LLVMGetInstructionOpcode(user) } {
+                            LLVMOpcode::LLVMLoad | LLVMOpcode::LLVMICmp => note(user, Event::Read),
+                            LLVMOpcode::LLVMStore => {
+                                if unsafe { LLVMGetOperand(user, 0) } == pointer {
+                                    return true;
+                                }
+                                // Only a store of the whole slot replaces it.
+                                let whole = pointer == slot.0
+                                    && unsafe { LLVMTypeOf(LLVMGetOperand(user, 0)) } == allocated;
+                                if whole {
+                                    note(user, Event::Overwrite);
+                                }
+                            }
+                            LLVMOpcode::LLVMGetElementPtr => {
+                                note(user, Event::Read);
+                                pending.push(user);
+                            }
+                            LLVMOpcode::LLVMCall => {
+                                let callee = unsafe { LLVMGetCalledValue(user) };
+                                let intrinsic = !callee.is_null()
+                                    && unsafe { !LLVMIsAFunction(callee).is_null() }
+                                    && unsafe { LLVMGetIntrinsicID(callee) } != 0;
+                                match (intrinsic, storage) {
+                                    (true, _) | (false, Some(false)) => note(user, Event::Read),
+                                    (false, Some(true)) => note(user, Event::Overwrite),
+                                    (false, None) => return true,
+                                }
+                            }
+                            _ => return true,
+                        }
+                    }
+                }
+                // Backward liveness of the slot's contents to a fixed point.
+                let mut live_in = vec![false; blocks.len()];
+                let mut changed = true;
+                while changed {
+                    changed = false;
+                    for block in (0..blocks.len()).rev() {
+                        let live_out = successors[block].iter().any(|&s| live_in[s]);
+                        let live = match first[block] {
+                            Some((_, Event::Read)) => true,
+                            Some((_, Event::Overwrite)) => false,
+                            None => live_out,
+                        };
+                        if live != live_in[block] {
+                            live_in[block] = live;
+                            changed = true;
+                        }
+                    }
+                }
+                resumes.iter().any(|resume| live_in[index[&resume.0]])
+            })
+            .collect()
+    }
+}
+impl<'ctx> Value<'ctx> {
+    /// For each drop flag in `flags`, whether it may be set where the
+    /// function suspends: at a `pending` block of `points`, on some path from
+    /// `start` along which the last store to it was not `false`. A
+    /// suspension continues at its `resume` block in the next call, so
+    /// values flow along those edges too. Such a flag, and what it guards,
+    /// must survive the suspension for a drop of the suspended state.
+    pub(super) fn flags_set_at_suspension(
+        self,
+        flags: &[Value<'ctx>],
+        start: BasicBlock<'ctx>,
+        points: &[(BasicBlock<'ctx>, BasicBlock<'ctx>)],
+    ) -> Vec<bool> {
+        let blocks = self.basic_blocks();
+        let index: std::collections::HashMap<LLVMBasicBlockRef, usize> =
+            blocks.iter().enumerate().map(|(i, b)| (b.0, i)).collect();
+        let entry = blocks[0].0;
+        let mut successors = vec![vec![]; blocks.len()];
+        for (number, block) in blocks.iter().enumerate() {
+            // Later calls enter at the resume points, from their suspension.
+            if block.0 == entry {
+                continue;
+            }
+            let terminator = unsafe { LLVMGetBasicBlockTerminator(block.0) };
+            if terminator.is_null() {
+                continue;
+            }
+            for i in 0..unsafe { LLVMGetNumSuccessors(terminator) } {
+                successors[number].push(index[&unsafe { LLVMGetSuccessor(terminator, i) }]);
+            }
+        }
+        for (resume, pending) in points {
+            successors[index[&pending.0]].push(index[&resume.0]);
+        }
+        flags
+            .iter()
+            .map(|flag| {
+                // The last store to the flag in each block: Some(set).
+                let mut last: Vec<Option<(usize, bool)>> = vec![None; blocks.len()];
+                let mut user_use = unsafe { LLVMGetFirstUse(flag.0) };
+                while !user_use.is_null() {
+                    let user = unsafe { LLVMGetUser(user_use) };
+                    user_use = unsafe { LLVMGetNextUse(user_use) };
+                    if unsafe { LLVMIsAStoreInst(user) }.is_null()
+                        || unsafe { LLVMGetOperand(user, 1) } != flag.0
+                    {
+                        continue;
+                    }
+                    let value = unsafe { LLVMGetOperand(user, 0) };
+                    let clear = unsafe { !LLVMIsAConstantInt(value).is_null() }
+                        && unsafe { LLVMConstIntGetZExtValue(value) } == 0;
+                    let parent = unsafe { LLVMGetInstructionParent(user) };
+                    let block = index[&parent];
+                    let mut at = 0usize;
+                    let mut cursor = unsafe { LLVMGetFirstInstruction(parent) };
+                    while !cursor.is_null() && cursor != user {
+                        at += 1;
+                        cursor = unsafe { LLVMGetNextInstruction(cursor) };
+                    }
+                    if last[block].is_none_or(|(earlier, _)| at > earlier) {
+                        last[block] = Some((at, !clear));
+                    }
+                }
+                let mut set_in = vec![false; blocks.len()];
+                let mut reached = vec![false; blocks.len()];
+                reached[index[&start.0]] = true;
+                let mut changed = true;
+                while changed {
+                    changed = false;
+                    for block in 0..blocks.len() {
+                        if !reached[block] {
+                            continue;
+                        }
+                        let set_out = last[block].map_or(set_in[block], |(_, set)| set);
+                        for &next in &successors[block] {
+                            if !reached[next] || (set_out && !set_in[next]) {
+                                reached[next] = true;
+                                set_in[next] |= set_out;
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+                points.iter().any(|(_, pending)| set_in[index[&pending.0]])
+            })
+            .collect()
     }
 }

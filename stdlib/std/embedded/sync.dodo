@@ -1,0 +1,278 @@
+package sync
+
+import "core/cpu"
+import "core/ptr"
+import "std/embedded/hal"
+
+// State shared between interrupt handlers, executor tasks, and the cores of
+// a multicore chip, without `static mut` or `unsafe`.
+//
+// A `Mutex<T>` holds a value in a plain (not `mut`) static. Locking it masks
+// interrupts on the calling core, so no handler there can interleave, and,
+// once a chip runs a second core, also holds off the other core; the guard
+// gives exclusive access until it is dropped:
+//
+//     static SERIAL: sync.Mutex<Option<pl011.Port>> = sync.Mutex.new(none)
+//
+//     @interrupt(UART0_IRQ)
+//     fn serial_received() {
+//         guard := SERIAL.lock()
+//         if let some(port) = guard.get_mut() {
+//             // ... read the port
+//         }
+//     }
+//
+//     fn main() {
+//         ...
+//         SERIAL.set(some(port))
+//     }
+//
+// `with` runs a closure on the value instead, and `replace` and `set` move
+// whole values in and out: `SERIAL.replace(none)` takes the port back. Locking a mutex that the same core
+// holds already traps: it would hand out a second exclusive reference.
+//
+// Sections. Every mutex locks through one system-wide critical section,
+// `sync.enter()`: interrupts are masked on this core, and a chip with several
+// cores adds a hardware lock that the other cores wait for. Sections nest,
+// so code holding one mutex may lock another. Keep them short: interrupts
+// on this core wait, and so does the other core when it locks any mutex.
+// A single word that both sides only load and store, or change with one
+// atomic operation, needs no section: use std/sync/atomic for it.
+//
+// Multicore chips. std/embedded/chip/rp_multicore installs the RP2040's and
+// RP2350's lock, hardware spinlock 31, before it starts core 1, so a
+// single-core program pays only for masking interrupts. Another chip's
+// support installs its own with `set_core_lock`.
+//
+// Like hal.Critical, a section excludes nothing on a hosted target, where
+// programs see no interrupts: use these mutexes from one thread there, as
+// in a desktop test, and std/sync's for threads.
+
+// The core that holds the cross-core lock, NO_CORE for none, and how many
+// sections it has entered.
+const NO_CORE: u32 = 0xFFFF_FFFF
+static mut OWNER: u32 = 0xFFFF_FFFF
+static mut DEPTH: u32 = 0
+// The cross-core lock: acquire spins until this core holds it.
+static mut ACQUIRE: Option<fn()> = none
+static mut RELEASE: Option<fn()> = none
+
+// Install the lock that keeps the other cores out of every section: a chip's
+// multicore support calls this before it starts a second core. `acquire` is
+// called with interrupts masked and waits until the calling core holds the
+// lock; `release` frees it.
+// SAFETY: call while only one core runs, outside any section.
+pub unsafe fn set_core_lock(acquire: fn(), release: fn()) {
+    unsafe {
+        ACQUIRE = some(acquire)
+        RELEASE = some(release)
+        OWNER = NO_CORE
+        DEPTH = 0
+    }
+}
+
+// True once a cross-core lock is installed.
+pub fn has_core_lock() -> bool {
+    section := hal.Critical.enter()
+    // SAFETY: installed once, while one core runs.
+    installed := unsafe {
+        match &ACQUIRE {
+            some(_) => true,
+            none => false,
+        }
+    }
+    core.drop(section)
+    return installed
+}
+
+// Forget the sections that a stopped core held, releasing the cross-core
+// lock if it held that: a chip calls this after holding a core in reset.
+// SAFETY: core `stopped` must be stopped, and its sections never resumed.
+pub unsafe fn abandon_core(stopped: u32) {
+    section := hal.Critical.enter()
+    unsafe {
+        if OWNER == stopped {
+            OWNER = NO_CORE
+            DEPTH = 0
+            if let some(release) = &RELEASE {
+                release()
+            }
+        }
+    }
+    core.drop(section)
+}
+
+// The system-wide critical section that mutexes lock through; see the
+// package comment. It ends when dropped, and sections nest.
+pub struct Section {
+    critical: hal.Critical
+    shared: bool
+
+    fn drop(&mut self) {
+        if !self.shared {
+            return
+        }
+        // SAFETY: this core holds the cross-core lock while OWNER is this
+        // core, and only it changes OWNER and DEPTH then; interrupts are
+        // still masked.
+        unsafe {
+            DEPTH -= 1
+            if DEPTH == 0 {
+                OWNER = NO_CORE
+                cpu.fence()
+                if let some(release) = &RELEASE {
+                    release()
+                }
+            }
+        }
+    }
+}
+
+// Enter the system-wide critical section: mask interrupts on this core and,
+// with a cross-core lock installed, wait until no other core is in a
+// section.
+pub fn enter() -> Section {
+    critical := hal.Critical.enter()
+    here := cpu.core_id()
+    shared := false
+    // SAFETY: interrupts are masked. OWNER equals this core only while this
+    // core holds the lock, which only this core can change; another core
+    // writes only its own number or NO_CORE.
+    unsafe {
+        if let some(acquire) = &ACQUIRE {
+            shared = true
+            if OWNER == here {
+                DEPTH += 1
+            } else {
+                acquire()
+                cpu.fence()
+                OWNER = here
+                DEPTH = 1
+            }
+        }
+    }
+    return Section { critical, shared }
+}
+
+// A value that interrupt handlers, tasks, and cores share; see the package
+// comment. Declare it in a plain static, initialized with `Mutex.new`.
+pub struct Mutex<T> {
+    value: T
+    locked: bool
+
+    pub fn new(value: T) -> Mutex<T> {
+        return Mutex<T> { value, locked: false }
+    }
+
+    // Exclusive access to the value until the guard is dropped, inside a
+    // section. Traps if this core holds the mutex already.
+    pub fn lock(&self) -> Guard<T> from(self) {
+        section := enter()
+        // SAFETY: inside the section no other code changes `locked`.
+        unsafe {
+            flag := ptr.from_ref(&self.locked) as *mut bool
+            core.assert(!ptr.read(flag))
+            ptr.write(flag, true)
+            return Guard<T> { owner: self, pointer: ptr.from_ref(&self.value) as *mut T, section }
+        }
+    }
+
+    // Exclusive access to the value if this core does not hold the mutex
+    // already, for code that may run while it does: none instead of
+    // trapping.
+    pub fn try_lock(&self) -> Option<Guard<T>> from(self) {
+        section := enter()
+        // SAFETY: as in lock.
+        unsafe {
+            flag := ptr.from_ref(&self.locked) as *mut bool
+            if ptr.read(flag) {
+                core.drop(section)
+                return none
+            }
+            ptr.write(flag, true)
+            return some(Guard<T> { owner: self, pointer: ptr.from_ref(&self.value) as *mut T, section })
+        }
+    }
+
+    // Run `action` on the value while holding the mutex. A result leaves
+    // through a local the closure changes.
+    pub fn with(&self, action: &mut dyn fn(&mut T)) {
+        guard := self.lock()
+        action(guard.get_mut())
+        core.drop(guard)
+    }
+
+    // Store `value` and return the one it replaces.
+    pub fn replace(&self, value: T) -> T {
+        guard := self.lock()
+        // SAFETY: the guard gives exclusive access; the old value moves out
+        // as the new one moves in.
+        previous := unsafe {
+            ptr.read(guard.pointer)
+        }
+        unsafe {
+            ptr.write(guard.pointer, value)
+        }
+        core.drop(guard)
+        return previous
+    }
+
+    // Store `value`, dropping the one it replaces outside the section.
+    pub fn set(&self, value: T) {
+        previous := self.replace(value)
+        core.drop(previous)
+    }
+
+    // True while some code holds the mutex.
+    pub fn is_locked(&self) -> bool {
+        section := enter()
+        // SAFETY: as in lock.
+        locked := unsafe {
+            ptr.read(ptr.from_ref(&self.locked))
+        }
+        core.drop(section)
+        return locked
+    }
+}
+
+// A held mutex, from Mutex.lock or try_lock. Dropping it unlocks the mutex,
+// then ends the section, unmasking interrupts if they were enabled before.
+pub struct Guard<T> {
+    owner: &Mutex<T>
+    pointer: *mut T
+    section: Section
+
+    pub fn get(&self) -> &T from(self) {
+        // SAFETY: the guard holds the mutex, so nothing else accesses the
+        // value; the reference cannot outlive the guard.
+        unsafe {
+            return ptr.borrow(self.pointer, self)
+        }
+    }
+
+    pub fn get_mut(&mut self) -> &mut T from(self) {
+        // SAFETY: as in get.
+        unsafe {
+            return ptr.borrow_mut(self.pointer, self)
+        }
+    }
+
+    // Store `value` in the held mutex, dropping the old one.
+    pub fn set(&mut self, value: T) {
+        // SAFETY: as in get; the old value is dropped once replaced.
+        previous := unsafe {
+            ptr.read(self.pointer)
+        }
+        unsafe {
+            ptr.write(self.pointer, value)
+        }
+        core.drop(previous)
+    }
+
+    fn drop(&mut self) {
+        // SAFETY: the section is still held; fields drop after this.
+        unsafe {
+            ptr.write(ptr.from_ref(&self.owner.locked) as *mut bool, false)
+        }
+    }
+}

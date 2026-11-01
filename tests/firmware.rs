@@ -1,7 +1,8 @@
 //! Firmware platforms: board and chip settings, `std/embedded/board` and `std/embedded/chip`
 //! resolution, the embedded chip runtimes, and (when ld.lld is installed)
 //! linking flashable images. Running on a real board is scripts/test_pico.py
-//! (`--board pico`, `--board pico2`, or `--board pico2_w`).
+//! (`--board pico`, `--board pico2`, or `--board pico2_w`); running on
+//! emulated chips is scripts/test_emulator.py.
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -1290,6 +1291,50 @@ fn dma_signals_are_raised_from_the_default_dma_interrupt() {
             0,
             "{chip}"
         );
+    }
+}
+
+#[test]
+fn random_number_generators_compile_for_every_board() {
+    let scratch = Scratch::new("rng-compile");
+    let source = scratch.write(
+        "rng.dodo",
+        r#"package main
+import "std/embedded/board"
+import "std/embedded/hal"
+fn roll<R: hal.Rng>(rng: &mut R) -> u32!hal.Error {
+    return ok(hal.random_below(rng, 6)? + 1)
+}
+fn main() {
+    b := board.take()!
+    key := [0u8; 32]
+    b.rng.fill(&mut key)!
+    soft := hal.SoftRng.from_rng(&mut b.rng)!
+    b.timer.delay_us(soft.next_u32() % 1000)
+    generator: &mut dyn hal.Rng = &mut b.rng
+    generator.fill(&mut key)!
+    if roll(&mut b.rng)! == 6 && hal.random_u64(&mut soft)! != 0 {
+        b.led.toggle()
+    }
+}
+"#,
+    );
+    for board in ["pico", "pico2", "pico2_w"] {
+        for level in ["0", "2"] {
+            let object = scratch.path(&format!("rng-{board}-O{level}.o"));
+            stdout(&dodo(&[
+                "build",
+                source.to_str().unwrap(),
+                "--board",
+                board,
+                "-O",
+                level,
+                "--emit",
+                "obj",
+                "-o",
+                &object,
+            ]));
+        }
     }
 }
 

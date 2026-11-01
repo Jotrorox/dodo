@@ -62,6 +62,7 @@ impl Parser {
             discarded_tails: HashSet::new(),
             json_derives: Vec::new(),
             in_interface: false,
+            await_operand: false,
         }
     }
 }
@@ -84,6 +85,9 @@ struct Parser {
     json_derives: Vec<crate::json_derive::Derive>,
     // Interface methods are signatures without bodies.
     in_interface: bool,
+    // Parsing the operand of `await`: a trailing `?` or `!` applies to the
+    // awaited result, not to the future.
+    await_operand: bool,
 }
 
 #[derive(Default)]
@@ -107,6 +111,8 @@ struct Modifiers {
     link_name: Option<String>,
     placement: Placement,
     inlining: Inlining,
+    // `async fn`: a function whose body may `await`; see std/embedded/executor.
+    async_: bool,
 }
 
 impl Modifiers {
@@ -294,6 +300,27 @@ impl Parser {
                 self.diagnostics.push(error);
             }
         }
+        if program
+            .functions
+            .iter()
+            .chain(program.interfaces.iter().flat_map(|i| &i.methods))
+            .any(|f| f.async_part.is_some())
+        {
+            let identifiers = self
+                .tokens
+                .iter()
+                .filter_map(|token| match &token.kind {
+                    TokenKind::Ident(name) => Some(name.as_str()),
+                    _ => None,
+                })
+                .collect();
+            if let Err(error) = crate::async_desugar::expand(&mut program, &identifiers) {
+                if !self.recover {
+                    return Err(error);
+                }
+                self.diagnostics.push(error);
+            }
+        }
         Ok(program)
     }
     fn declaration(&mut self, program: &mut Program) -> ParseResult<()> {
@@ -326,6 +353,9 @@ impl Parser {
         let mods = self.modifiers()?;
         if mods.interrupt.is_some() && !self.at("fn") {
             return Err(self.error("@interrupt applies only to functions"));
+        }
+        if mods.async_ && !self.at("fn") {
+            return Err(self.error("`async` applies only to functions"));
         }
         if mods.link_name.is_some() && !self.at("fn") {
             return Err(self.error("@link_name applies only to extern \"C\" functions"));
@@ -480,6 +510,11 @@ impl Parser {
                     return Err(self.error("duplicate `unsafe` modifier"));
                 }
                 mods.unsafe_ = true;
+            } else if self.eat("async") {
+                if mods.async_ {
+                    return Err(self.error("duplicate `async` modifier"));
+                }
+                mods.async_ = true;
             } else if self.eat("extern") {
                 if mods.extern_ {
                     return Err(self.error("duplicate `extern` modifier"));
@@ -1217,6 +1252,9 @@ impl Parser {
             if field_mods.inlining != Inlining::Auto && !self.at("fn") {
                 return Err(self.error("@inline and @cold apply only to functions"));
             }
+            if field_mods.async_ && !self.at("fn") {
+                return Err(self.error("`async` applies only to functions"));
+            }
             if !field_mods.placement.is_empty() && !self.at("fn") {
                 return Err(self.error("@section and @align apply only to functions and statics"));
             }
@@ -1292,6 +1330,7 @@ impl Parser {
             unsafe_send: mods.unsafe_send,
             unsafe_sync: mods.unsafe_sync,
             interior_mutable: false,
+            async_future: false,
         });
         Ok(())
     }
@@ -1582,6 +1621,7 @@ impl Parser {
             link_name: mods.link_name,
             placement: mods.placement,
             inlining: mods.inlining,
+            async_part: mods.async_.then_some(AsyncPart::Body),
         })
     }
     fn constant(
@@ -2345,6 +2385,8 @@ impl Parser {
             self.newlines();
         }
         let start = self.span().start;
+        // Only the operand chain directly after `await` stops at `?` and `!`.
+        let await_operand = std::mem::take(&mut self.await_operand);
         let unary = if self.eat("-") {
             Some(UnaryOp::Neg)
         } else if self.eat("!") {
@@ -2362,7 +2404,20 @@ impl Parser {
         } else {
             None
         };
-        let mut lhs = if let Some(op) = unary {
+        let mut lhs = if unary.is_none() && self.eat("await") {
+            self.newlines();
+            self.await_operand = true;
+            let operand = self.expr_bp(25, allow_struct);
+            self.await_operand = false;
+            Expr::new(
+                ExprKind::Await {
+                    value: Box::new(operand?),
+                    poll: String::new(),
+                    output: None,
+                },
+                self.since(start),
+            )
+        } else if let Some(op) = unary {
             self.newlines();
             let mut rhs = self.expr_bp(23, allow_struct)?;
             if matches!(op, UnaryOp::Borrow | UnaryOp::BorrowMut)
@@ -2382,6 +2437,9 @@ impl Parser {
                 self.newlines();
             } else if 25 >= minimum {
                 self.chain_newlines();
+            }
+            if await_operand && (self.at("?") || self.at("!")) {
+                break;
             }
             if 25 >= minimum {
                 if self.eat("?") {
@@ -3085,6 +3143,8 @@ pub(crate) fn reserved(name: &str) -> bool {
             | "true"
             | "false"
             | "asm"
+            | "async"
+            | "await"
     )
 }
 

@@ -183,6 +183,7 @@ fn check_program(
             checker.namespace = context.function_namespace(&function.name);
             checker.function_name = function.name.clone();
             checker.imported = function.imported;
+            checker.async_body = function.async_part == Some(AsyncPart::Body);
             for parameter in &function.params {
                 checker.bind_parameter(&parameter.name, &parameter.ty, parameter.span)?;
             }
@@ -300,6 +301,9 @@ struct Context {
     imports: HashSet<String>,
     /// Types with a `drop` method, known before signatures are collected.
     destructors: HashSet<String>,
+    /// `std/embedded/executor`'s `Context` and `Poll`, the types of a
+    /// future's `poll` method, when the executor is loaded.
+    executor: Option<(String, String)>,
 }
 impl Context {
     fn new(program: &Program, pointer_bits: u32) -> Check<Self> {
@@ -317,6 +321,9 @@ impl Context {
                 .iter()
                 .filter_map(|f| f.name.strip_suffix(".drop").map(str::to_owned))
                 .collect(),
+            executor: program
+                .executor_item("Context")
+                .zip(program.executor_item("Poll")),
         };
         let mut names = HashSet::new();
         for declaration in &program.structs {
@@ -504,6 +511,21 @@ impl Context {
     /// `from(...)`, or the receiver or single borrowed parameter it implies.
     fn borrow_sources(&self, function: &Function) -> Check<Vec<String>> {
         let mut from = function.from.clone();
+        // An async fn's future keeps every borrow its arguments carry.
+        if function.async_part == Some(AsyncPart::Constructor)
+            && from.is_empty()
+            && self.carries_borrow(&function.ret)
+        {
+            from = function
+                .params
+                .iter()
+                .filter(|p| self.carries_borrow(&p.ty) || function.generic_instance)
+                .map(|p| p.name.clone())
+                .collect();
+            if from.is_empty() {
+                from.push("static".to_owned());
+            }
+        }
         for source in &from {
             if let Some(owner) = source.strip_suffix(".stored") {
                 self.validate_stored_source(function, owner)?;
@@ -968,6 +990,8 @@ struct Checker<'a> {
     inlined_constant: usize,
     captures: HashSet<String>,
     mutated_captures: std::cell::RefCell<HashSet<String>>,
+    /// Checking the body of an `async fn`, where `await` may appear.
+    async_body: bool,
 }
 impl<'a> Checker<'a> {
     fn new(context: &'a Context, return_ty: Type) -> Self {
@@ -990,6 +1014,7 @@ impl<'a> Checker<'a> {
             inlined_constant: 0,
             captures: HashSet::new(),
             mutated_captures: std::cell::RefCell::new(HashSet::new()),
+            async_body: false,
         }
     }
     fn lookup(&self, name: &str) -> Option<&Variable> {
@@ -2340,6 +2365,16 @@ impl<'a> Checker<'a> {
                     ty: success.clone(),
                 }
             }
+            ExprKind::Await {
+                value,
+                poll,
+                output,
+            } => {
+                let (ty, poll_name, output_name) = self.await_future(value, span)?;
+                *poll = poll_name;
+                *output = output_name;
+                Value { ty }
+            }
             ExprKind::MethodCall { .. } => unreachable!(),
         };
         // Reborrows may weaken exclusive access to shared access; numeric
@@ -2486,11 +2521,85 @@ impl<'a> Checker<'a> {
             _ => self.peek_type(expression),
         }
     }
+    /// Check `await value`: the value must be a future, a value with a
+    /// `poll(&mut self, cx: &mut executor.Context) -> executor.Poll` method,
+    /// and the await yields its `output(&mut self)` result, or void without
+    /// one. Returns that type and the two methods' names.
+    fn await_future(
+        &mut self,
+        value: &mut Expr,
+        span: Span,
+    ) -> Check<(Type, String, Option<String>)> {
+        if !self.async_body {
+            return Err(Diagnostic::new(
+                span,
+                "`await` is only allowed in the body of an `async fn`",
+            )
+            .note("declare the function `async fn`, or poll the future as an executor task"));
+        }
+        let future = self.expr(value, None, true)?;
+        let not_future = |detail: String| {
+            Diagnostic::new(value.span, format!("cannot await a value of type `{}`: {detail}", future.ty))
+                .note("a future has `pub fn poll(&mut self, cx: &mut executor.Context) -> executor.Poll`, and optionally `pub fn output(&mut self) -> T` for its result; async fns and executor helpers such as `executor.sleep_ms` return one")
+        };
+        let Type::Named(owner) = &future.ty else {
+            return Err(not_future("only a struct value can be a future".into()));
+        };
+        let poll = format!("{owner}.poll");
+        let Some(signature) = self.context.functions.get(&poll) else {
+            return Err(not_future("it has no `poll` method".into()));
+        };
+        let receiver = Type::Ref(true, Box::new(future.ty.clone()));
+        let shape = match (&self.context.executor, signature.params.as_slice()) {
+            (Some((context, result)), [this, cx]) => {
+                this.name == "self"
+                    && this.ty == receiver
+                    && cx.ty == Type::Ref(true, Box::new(Type::Named(context.clone())))
+                    && signature.ret == Type::Named(result.clone())
+            }
+            _ => false,
+        };
+        if !shape {
+            return Err(not_future(
+                "its `poll` method does not take `(&mut self, cx: &mut executor.Context)` and return `executor.Poll`"
+                    .into(),
+            ));
+        }
+        if !signature.public && type_namespace(owner) != self.namespace {
+            return Err(not_future("its `poll` method is private".into()));
+        }
+        let output = format!("{owner}.output");
+        let (ty, output) = match self.context.functions.get(&output) {
+            Some(signature) => {
+                if !matches!(signature.params.as_slice(), [this] if this.name == "self" && this.ty == receiver)
+                {
+                    return Err(not_future(
+                        "its `output` method must take only `&mut self`".into(),
+                    ));
+                }
+                if !signature.public && type_namespace(owner) != self.namespace {
+                    return Err(not_future("its `output` method is private".into()));
+                }
+                (signature.ret.clone(), Some(output))
+            }
+            None => (Type::Void, None),
+        };
+        Ok((ty, poll, output))
+    }
     fn peek_type(&self, expression: &Expr) -> Option<Type> {
         if expression.ty != Type::Unknown {
             return Some(expression.ty.clone());
         }
         match &expression.kind {
+            ExprKind::Await { value, .. } => match self.peek_type(value)? {
+                Type::Named(owner) => Some(
+                    self.context
+                        .functions
+                        .get(&format!("{owner}.output"))
+                        .map_or(Type::Void, |output| output.ret.clone()),
+                ),
+                _ => None,
+            },
             ExprKind::Int(_, suffix) | ExprKind::Float(_, suffix) => suffix.clone(),
             ExprKind::Bool(_) => Some(Type::Bool),
             ExprKind::String(_, bytes) => Some(if *bytes {
@@ -4717,6 +4826,19 @@ fn validate_public_interfaces(program: &Program) -> Check<()> {
         visit(&alias.ty, alias.span, &alias.generics, &private)?;
     }
     for function in program.functions.iter().filter(|f| f.public) {
+        // A private async fn's future methods are public so that the
+        // executor's Task interface accepts them; they expose no more than
+        // the async fn itself, which is checked as the constructor.
+        if matches!(
+            function.async_part,
+            Some(AsyncPart::Poll | AsyncPart::Output)
+        ) && function
+            .name
+            .rsplit_once('.')
+            .is_some_and(|(owner, _)| private.contains(owner))
+        {
+            continue;
+        }
         bounds(&function.bounds)?;
         let mut allowed = function.generics.clone();
         if let Some((owner, _)) = function.name.rsplit_once('.')

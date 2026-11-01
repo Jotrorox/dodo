@@ -152,7 +152,7 @@ fn main() {
 
 The converted pointer must address code with exactly the written signature.
 Dodo does not check for null: a table that stores address zero for an absent
-entry, as [`std/gpu/vulkan`](gpu.md) does for commands a driver lacks, must
+entry, as [`std/gpu/vulkan`](vulkan.md) does for commands a driver lacks, must
 test `entry as usize != 0` before calling it. [`std/dylib`](dylib.md) looks
 symbols up portably.
 Struct fields of C function pointer type describe C method tables, and a

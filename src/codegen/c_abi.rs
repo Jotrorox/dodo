@@ -451,7 +451,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         let direct = Pass::Direct;
         let pass = |index: usize| lowering.map_or(&direct, |l| &l.params[index]);
         let storage = match lowering.map(|l| &l.ret) {
-            Some(Pass::Indirect { .. }) => Some(self.alloca(self.ty(ret)?, "call.result")?),
+            Some(Pass::Indirect { .. }) => Some(self.alloca(self.ty(ret)?, CALL_RESULT)?),
             _ => None,
         };
         let mut pending = Vec::new();
