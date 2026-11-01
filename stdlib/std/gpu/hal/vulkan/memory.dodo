@@ -1,0 +1,697 @@
+package memory
+
+import "core/ptr"
+import "std/gpu/hal"
+import "std/gpu/vulkan" as vk
+
+// GPU memory for std/gpu's Vulkan backend.
+//
+// Drivers limit how many VkDeviceMemory allocations exist at once (often
+// 4096) and each vkAllocateMemory is slow, so buffers and images are carved
+// out of a few large blocks instead: up to 64 MiB each, an eighth of the heap
+// on small heaps. Resources of more than a quarter of a block get a block of
+// their own. Buffers and images never share a block, which keeps them
+// bufferImageGranularity apart without further care.
+//
+// Each block keeps its free space as a sorted list of ranges, allocated
+// first fit in steps of 256 bytes, and merged again when freed. A block whose
+// last allocation is freed is returned to the driver unless it is the only
+// one of its memory type and kind left, which stays for the next allocation.
+//
+// Host-visible blocks stay mapped for their whole life. The memory type of
+// each kind of allocation is chosen as follows:
+//
+// - KIND_BUFFER: device-local memory, mapped as well when the CPU can map
+//   the whole device-local heap (unified memory, or resizable BAR), so that
+//   std/gpu reads such buffers without a copy.
+// - KIND_IMAGE: device-local memory.
+// - KIND_UPLOAD: host-visible, coherent memory that the GPU reads, for
+//   staging writes.
+// - KIND_READBACK: host-visible memory the CPU caches, for reading results
+//   back; coherent if possible, otherwise invalidated before each read.
+
+pub const KIND_BUFFER: u32 = 0
+pub const KIND_IMAGE: u32 = 1
+pub const KIND_UPLOAD: u32 = 2
+pub const KIND_READBACK: u32 = 3
+
+const MAX_BLOCKS: usize = 512
+// Free ranges per block, each an offset and a size.
+const MAX_RANGES: usize = 1024
+const GRANULE: u64 = 256
+const LARGEST_BLOCK: u64 = 64 * 1024 * 1024
+const SMALLEST_BLOCK: u64 = 1024 * 1024
+
+const FLAG_USED: u32 = 1
+const FLAG_LINEAR: u32 = 2
+const FLAG_DEDICATED: u32 = 4
+const FLAG_COHERENT: u32 = 8
+
+unsafe extern "C" fn malloc(size: usize) -> *mut u8
+unsafe extern "C" fn free(block: *mut u8)
+
+// One allocation: `size` bytes of `memory` from `offset`, mapped at `mapped`
+// when the CPU can see it (0 otherwise). Free it with Allocator.free(id).
+pub struct Allocation {
+    pub memory: u64
+    pub offset: u64
+    pub mapped: usize
+    pub id: u64
+    // The memory type's VkMemoryPropertyFlags.
+    pub flags: u32
+}
+
+struct Blocks {
+    memory: [512]u64
+    size: [512]u64
+    type_index: [512]u32
+    flags: [512]u32
+    mapped: [512]u64
+    live: [512]u32
+    free_count: [512]u32
+    // The address of each block's free ranges: MAX_RANGES offset and size
+    // pairs.
+    ranges: [512]u64
+    // Blocks in use are below this index.
+    count: usize
+}
+
+pub struct Allocator {
+    // A malloc'ed Blocks.
+    blocks: usize
+    properties: vk.PhysicalDeviceMemoryProperties
+    atom: u64
+
+    pub fn new(properties: &vk.PhysicalDeviceMemoryProperties, non_coherent_atom_size: u64) -> Allocator!hal.Error {
+        size := mem_size()
+        address := unsafe {
+            malloc(size) as usize
+        }
+        if address == 0 {
+            return err(hal.Error.OutOfMemory)
+        }
+        unsafe {
+            ptr.write_bytes(address as *mut u8, 0u8, size)
+        }
+        atom := non_coherent_atom_size
+        if atom == 0 {
+            atom = 1
+        }
+        return ok(Allocator { blocks: address, properties: copy_properties(properties), atom: atom })
+    }
+
+    // Memory for a resource with `requirements`, of KIND_*. Host-visible
+    // memory comes back mapped.
+    pub fn allocate(&self, fns: &vk.DeviceFns, device: vk.Device, requirements: &vk.MemoryRequirements, kind: u32) -> Allocation!hal.Error {
+        size := align_up(requirements.size, GRANULE)
+        alignment := requirements.alignment
+        if alignment < GRANULE {
+            alignment = GRANULE
+        }
+        linear := kind != KIND_IMAGE
+        // Try memory types from the most to the least suitable.
+        tried := 0u32
+        for _ in 0usize..32 {
+            index := self.best_type(requirements.memory_type_bits & ~tried, kind)
+            if index < 0 {
+                break
+            }
+            type_index := index as u32
+            tried = tried | (1u32 << type_index)
+            match self.allocate_in(fns, device, type_index, size, alignment, linear) {
+                ok(allocation) => {
+                    return ok(allocation)
+                }
+                err(hal.Error.OutOfMemory) => {}
+                err(error) => {
+                    return err(error)
+                }
+            }
+        }
+        return err(hal.Error.OutOfMemory)
+    }
+
+    // Return an allocation's memory.
+    pub fn free(&self, fns: &vk.DeviceFns, device: vk.Device, id: u64) {
+        block := (id >> 48) as usize
+        b := self.table()
+        unsafe {
+            if block >= (*b).count || ((*b).flags[block] & FLAG_USED) == 0 {
+                return
+            }
+            if ((*b).flags[block] & FLAG_DEDICATED) != 0 {
+                self.release(fns, device, block)
+                return
+            }
+        }
+        offset := ((id >> 24) & 0xffffff) * GRANULE
+        size := (id & 0xffffff) * GRANULE
+        insert_range(b, block, offset, size)
+        last := unsafe {
+            (*b).live[block] -= 1
+            (*b).live[block] == 0
+        }
+        if last {
+            if self.has_other(block) {
+                self.release(fns, device, block)
+            } else {
+                unsafe {
+                    ranges := (*b).ranges[block] as usize
+                    (*b).free_count[block] = 1
+                    store(ranges, 0, 0)
+                    store(ranges, 1, (*b).size[block])
+                }
+            }
+        }
+    }
+
+    // Make the GPU's writes to `size` bytes of allocation `id` from `offset`
+    // visible to the CPU, for memory that is not coherent.
+    pub fn invalidate(&self, fns: &vk.DeviceFns, device: vk.Device, id: u64, offset: u64, size: u64) {
+        block := (id >> 48) as usize
+        b := self.table()
+        flags := unsafe {
+            (*b).flags[block]
+        }
+        if (flags & FLAG_COHERENT) != 0 || size == 0 {
+            return
+        }
+        start := ((id >> 24) & 0xffffff) * GRANULE + offset
+        block_size := unsafe {
+            (*b).size[block]
+        }
+        // Ranges are whole atoms within the block.
+        first := start / self.atom * self.atom
+        end := align_up(start + size, self.atom)
+        if end > block_size {
+            end = block_size
+        }
+        range := vk.MappedMemoryRange.default()
+        range.memory = unsafe {
+            (*b).memory[block]
+        }
+        range.offset = first
+        range.size = end - first
+        unsafe {
+            fns.invalidate_mapped_memory_ranges(device, 1, ptr.from_ref(&range))
+        }
+    }
+
+    // Return every block to the driver; the allocator must not be used
+    // afterwards.
+    pub fn destroy(&mut self, fns: &vk.DeviceFns, device: vk.Device) {
+        if self.blocks == 0 {
+            return
+        }
+        b := self.table()
+        count := unsafe {
+            (*b).count
+        }
+        for i in 0usize..count {
+            if unsafe {
+                ((*b).flags[i] & FLAG_USED) != 0
+            }
+            {
+                self.release(fns, device, i)
+            }
+        }
+        unsafe {
+            free(self.blocks as *mut u8)
+        }
+        self.blocks = 0
+    }
+
+    fn table(&self) -> *mut Blocks {
+        return unsafe {
+            self.blocks as *mut Blocks
+        }
+    }
+
+    // The memory type for KIND_* among `bits` that suits it best, or -1.
+    fn best_type(&self, bits: u32, kind: u32) -> i32 {
+        best := -1i32
+        best_score := 0u32
+        largest := self.largest_device_heap()
+        for i in 0u32..self.properties.memory_type_count {
+            if (bits >> i & 1) != 0 {
+                memory_type := &self.properties.memory_types[i as usize]
+                heap := self.properties.memory_heaps[memory_type.heap_index as usize].size
+                score := type_score(memory_type.property_flags, kind, heap >= largest / 2)
+                if score > best_score {
+                    best = i as i32
+                    best_score = score
+                }
+            }
+        }
+        return best
+    }
+
+    fn largest_device_heap(&self) -> u64 {
+        largest := 0u64
+        for i in 0u32..self.properties.memory_heap_count {
+            heap := &self.properties.memory_heaps[i as usize]
+            if (heap.flags & vk.MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0 && heap.size > largest {
+                largest = heap.size
+            }
+        }
+        return largest
+    }
+
+    // The block size for memory type `type_index`.
+    fn block_size(&self, type_index: u32) -> u64 {
+        heap := self.properties.memory_heaps[self.properties.memory_types[type_index as usize].heap_index as usize].size
+        size := LARGEST_BLOCK
+        if heap / 8 < size {
+            size = align_up(heap / 8, GRANULE)
+        }
+        if size < SMALLEST_BLOCK {
+            size = SMALLEST_BLOCK
+        }
+        return size
+    }
+
+    fn allocate_in(&self, fns: &vk.DeviceFns, device: vk.Device, type_index: u32, size: u64, alignment: u64, linear: bool) -> Allocation!hal.Error {
+        block_size := self.block_size(type_index)
+        if size > block_size / 4 || alignment > block_size / 4 {
+            block := self.create_block(fns, device, type_index, size, linear, true)?
+            unsafe {
+                (*self.table()).live[block] = 1
+            }
+            return ok(self.allocation(block, 0, 0))
+        }
+        b := self.table()
+        count := unsafe {
+            (*b).count
+        }
+        wanted := FLAG_USED
+        if linear {
+            wanted = wanted | FLAG_LINEAR
+        }
+        for i in 0usize..count {
+            flags := unsafe {
+                (*b).flags[i]
+            }
+            matches := unsafe {
+                (*b).type_index[i] == type_index
+            }
+            if matches && (flags & (FLAG_USED | FLAG_LINEAR | FLAG_DEDICATED)) == wanted {
+                offset := take_range(b, i, size, alignment)
+                if offset != NO_ROOM {
+                    return ok(self.allocation(i, offset, size))
+                }
+            }
+        }
+        block := self.create_block(fns, device, type_index, block_size, linear, false)?
+        offset := take_range(b, block, size, alignment)
+        return ok(self.allocation(block, offset, size))
+    }
+
+    fn allocation(&self, block: usize, offset: u64, size: u64) -> Allocation {
+        b := self.table()
+        mapped := unsafe {
+            (*b).mapped[block]
+        }
+        address := 0usize
+        if mapped != 0 {
+            address = (mapped + offset) as usize
+        }
+        id := ((block as u64) << 48) | ((offset / GRANULE) << 24) | (size / GRANULE)
+        type_index := unsafe {
+            (*b).type_index[block]
+        }
+        return Allocation {
+            memory: unsafe {
+                (*b).memory[block]
+            },
+            offset: offset,
+            mapped: address,
+            id: id,
+            flags: self.properties.memory_types[type_index as usize].property_flags
+        }
+    }
+
+    // A new block of `size` bytes of memory type `type_index`, mapped when
+    // host-visible: its index.
+    fn create_block(&self, fns: &vk.DeviceFns, device: vk.Device, type_index: u32, size: u64, linear: bool, dedicated: bool) -> usize!hal.Error {
+        b := self.table()
+        slot := MAX_BLOCKS
+        count := unsafe {
+            (*b).count
+        }
+        for i in 0usize..count {
+            if slot == MAX_BLOCKS && unsafe {
+                ((*b).flags[i] & FLAG_USED) == 0
+            }
+            {
+                slot = i
+            }
+        }
+        if slot == MAX_BLOCKS {
+            if count == MAX_BLOCKS {
+                return err(hal.Error.OutOfMemory)
+            }
+            slot = count
+        }
+        ranges := 0usize
+        if !dedicated {
+            ranges = unsafe {
+                malloc(MAX_RANGES * 16) as usize
+            }
+            if ranges == 0 {
+                return err(hal.Error.OutOfMemory)
+            }
+        }
+        info := vk.MemoryAllocateInfo.default()
+        info.allocation_size = size
+        info.memory_type_index = type_index
+        memory := vk.NULL_HANDLE
+        result := unsafe {
+            fns.allocate_memory(device, ptr.from_ref(&info), vk.no_allocator(), ptr.from_mut(&mut memory))
+        }
+        if result != vk.SUCCESS {
+            unsafe {
+                if ranges != 0 {
+                    free(ranges as *mut u8)
+                }
+            }
+            if result == vk.ERROR_OUT_OF_HOST_MEMORY || result == vk.ERROR_OUT_OF_DEVICE_MEMORY {
+                return err(hal.Error.OutOfMemory)
+            }
+            if result == vk.ERROR_DEVICE_LOST {
+                return err(hal.Error.DeviceLost)
+            }
+            return err(hal.Error.System)
+        }
+        properties := self.properties.memory_types[type_index as usize].property_flags
+        mapped := 0u64
+        if (properties & vk.MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0 {
+            address := vk.null_handle::<u8>()
+            mapping := unsafe {
+                fns.map_memory(device, memory, 0, vk.WHOLE_SIZE, 0, ptr.from_mut(&mut address))
+            }
+            if mapping != vk.SUCCESS {
+                unsafe {
+                    fns.free_memory(device, memory, vk.no_allocator())
+                    if ranges != 0 {
+                        free(ranges as *mut u8)
+                    }
+                }
+                return err(hal.Error.OutOfMemory)
+            }
+            mapped = unsafe {
+                address as usize as u64
+            }
+        }
+        flags := FLAG_USED
+        if linear {
+            flags = flags | FLAG_LINEAR
+        }
+        if dedicated {
+            flags = flags | FLAG_DEDICATED
+        }
+        if (properties & vk.MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0 {
+            flags = flags | FLAG_COHERENT
+        }
+        unsafe {
+            (*b).memory[slot] = memory
+            (*b).size[slot] = size
+            (*b).type_index[slot] = type_index
+            (*b).flags[slot] = flags
+            (*b).mapped[slot] = mapped
+            (*b).live[slot] = 0
+            (*b).ranges[slot] = ranges as u64
+            (*b).free_count[slot] = 0
+            if ranges != 0 {
+                // One free range covering the whole block.
+                (*b).free_count[slot] = 1
+                store(ranges, 0, 0)
+                store(ranges, 1, size)
+            }
+            if slot == (*b).count {
+                (*b).count = slot + 1
+            }
+        }
+        return ok(slot)
+    }
+
+    // Whether another block of the same memory type and kind as `block`
+    // still holds allocations, so that `block` need not stay.
+    fn has_other(&self, block: usize) -> bool {
+        b := self.table()
+        count := unsafe {
+            (*b).count
+        }
+        mask := FLAG_USED | FLAG_LINEAR | FLAG_DEDICATED
+        for i in 0usize..count {
+            if i != block {
+                same := unsafe {
+                    (*b).type_index[i] == (*b).type_index[block] && ((*b).flags[i] & mask) == ((*b).flags[block] & mask)
+                }
+                if same {
+                    return true
+                }
+            }
+        }
+        return false
+    }
+
+    fn release(&self, fns: &vk.DeviceFns, device: vk.Device, block: usize) {
+        b := self.table()
+        unsafe {
+            if (*b).mapped[block] != 0 {
+                fns.unmap_memory(device, (*b).memory[block])
+            }
+            fns.free_memory(device, (*b).memory[block], vk.no_allocator())
+            if (*b).ranges[block] != 0 {
+                free((*b).ranges[block] as usize as *mut u8)
+            }
+            (*b).flags[block] = 0
+            (*b).memory[block] = 0
+            (*b).mapped[block] = 0
+            (*b).ranges[block] = 0
+            (*b).live[block] = 0
+            (*b).free_count[block] = 0
+            // Keep the table short.
+            for (*b).count > 0 && ((*b).flags[(*b).count - 1] & FLAG_USED) == 0 {
+                (*b).count -= 1
+            }
+        }
+    }
+}
+
+const NO_ROOM: u64 = 0xffffffffffffffff
+
+// How well memory with `flags` suits KIND_*, 0 for not at all. `whole_heap`
+// says whether the type's heap is (about) the largest device-local one.
+fn type_score(flags: u32, kind: u32, whole_heap: bool) -> u32 {
+    local := (flags & vk.MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0
+    visible := (flags & vk.MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0
+    coherent := (flags & vk.MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0
+    cached := (flags & vk.MEMORY_PROPERTY_HOST_CACHED_BIT) != 0
+    // Protected and lazily allocated memory is never what std/gpu wants.
+    if (flags & (vk.MEMORY_PROPERTY_PROTECTED_BIT | vk.MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT)) != 0 {
+        return 0
+    }
+    if kind == KIND_UPLOAD {
+        if !visible || !coherent {
+            return 0
+        }
+        // Uncached (write-combined) host memory streams best; small BAR
+        // windows of device-local memory are better left to buffers.
+        score := 4u32
+        if !cached {
+            score += 2
+        }
+        if local && !whole_heap {
+            score -= 3
+        }
+        return score
+    }
+    if kind == KIND_READBACK {
+        if !visible {
+            return 0
+        }
+        score := 2u32
+        if cached {
+            score += 4
+        }
+        if coherent {
+            score += 1
+        }
+        return score
+    }
+    if kind == KIND_IMAGE {
+        if local {
+            // Plain device memory before a host-visible window of it.
+            if visible && !whole_heap {
+                return 5
+            }
+            return 6
+        }
+        return 1
+    }
+    // Buffers: device-local, mapped too when that costs nothing.
+    if local {
+        if visible && coherent && whole_heap {
+            return 7
+        }
+        if visible && !whole_heap {
+            return 5
+        }
+        return 6
+    }
+    return 1
+}
+
+fn align_up(value: u64, alignment: u64) -> u64 {
+    return (value + alignment - 1) / alignment * alignment
+}
+
+fn mem_size() -> usize {
+    // Blocks: eight parallel arrays of MAX_BLOCKS entries and a count.
+    return MAX_BLOCKS * (8 + 8 + 4 + 4 + 8 + 4 + 4 + 8) + 64
+}
+
+fn copy_properties(properties: &vk.PhysicalDeviceMemoryProperties) -> vk.PhysicalDeviceMemoryProperties {
+    out := vk.PhysicalDeviceMemoryProperties.default()
+    out.memory_type_count = properties.memory_type_count
+    out.memory_heap_count = properties.memory_heap_count
+    for i in 0usize..32 {
+        out.memory_types[i].property_flags = properties.memory_types[i].property_flags
+        out.memory_types[i].heap_index = properties.memory_types[i].heap_index
+    }
+    for i in 0usize..16 {
+        out.memory_heaps[i].size = properties.memory_heaps[i].size
+        out.memory_heaps[i].flags = properties.memory_heaps[i].flags
+    }
+    return out
+}
+
+// Word `index` of a block's free ranges: offsets at even, sizes at odd
+// indices.
+fn load(ranges: usize, index: usize) -> u64 {
+    return unsafe {
+        *((ranges + index * 8) as *const u64)
+    }
+}
+
+fn store(ranges: usize, index: usize, value: u64) {
+    unsafe {
+        *((ranges + index * 8) as *mut u64) = value
+    }
+}
+
+// Take `size` bytes aligned to `alignment` from a block's free ranges, first
+// fit: the offset, or NO_ROOM.
+fn take_range(b: *mut Blocks, block: usize, size: u64, alignment: u64) -> u64 {
+    ranges := unsafe {
+        (*b).ranges[block] as usize
+    }
+    count := unsafe {
+        (*b).free_count[block] as usize
+    }
+    for i in 0usize..count {
+        start := load(ranges, i * 2)
+        length := load(ranges, i * 2 + 1)
+        aligned := align_up(start, alignment)
+        if aligned + size <= start + length {
+            before := aligned - start
+            after := start + length - aligned - size
+            if before != 0 && after != 0 {
+                // The range splits in two: that needs a free entry.
+                if count == MAX_RANGES {
+                    return NO_ROOM
+                }
+                j := count
+                for j > i + 1 {
+                    store(ranges, j * 2, load(ranges, (j - 1) * 2))
+                    store(ranges, j * 2 + 1, load(ranges, (j - 1) * 2 + 1))
+                    j -= 1
+                }
+                store(ranges, i * 2 + 1, before)
+                store(ranges, (i + 1) * 2, aligned + size)
+                store(ranges, (i + 1) * 2 + 1, after)
+                unsafe {
+                    (*b).free_count[block] += 1
+                }
+            } else if before != 0 {
+                store(ranges, i * 2 + 1, before)
+            } else if after != 0 {
+                store(ranges, i * 2, aligned + size)
+                store(ranges, i * 2 + 1, after)
+            } else {
+                remove_range(b, block, i)
+            }
+            unsafe {
+                (*b).live[block] += 1
+            }
+            return aligned
+        }
+    }
+    return NO_ROOM
+}
+
+fn remove_range(b: *mut Blocks, block: usize, index: usize) {
+    ranges := unsafe {
+        (*b).ranges[block] as usize
+    }
+    count := unsafe {
+        (*b).free_count[block] as usize
+    }
+    for j in index..count - 1 {
+        store(ranges, j * 2, load(ranges, (j + 1) * 2))
+        store(ranges, j * 2 + 1, load(ranges, (j + 1) * 2 + 1))
+    }
+    unsafe {
+        (*b).free_count[block] -= 1
+    }
+}
+
+// Give a range back to a block's free list, merging it with its neighbors.
+fn insert_range(b: *mut Blocks, block: usize, offset: u64, size: u64) {
+    ranges := unsafe {
+        (*b).ranges[block] as usize
+    }
+    count := unsafe {
+        (*b).free_count[block] as usize
+    }
+    // The first free range after the freed one.
+    at := count
+    for i in 0usize..count {
+        if at == count && load(ranges, i * 2) > offset {
+            at = i
+        }
+    }
+    joins_before := at > 0 && load(ranges, (at - 1) * 2) + load(ranges, (at - 1) * 2 + 1) == offset
+    joins_after := at < count && offset + size == load(ranges, at * 2)
+    if joins_before && joins_after {
+        store(ranges, (at - 1) * 2 + 1, load(ranges, (at - 1) * 2 + 1) + size + load(ranges, at * 2 + 1))
+        remove_range(b, block, at)
+        return
+    }
+    if joins_before {
+        store(ranges, (at - 1) * 2 + 1, load(ranges, (at - 1) * 2 + 1) + size)
+        return
+    }
+    if joins_after {
+        store(ranges, at * 2, offset)
+        store(ranges, at * 2 + 1, size + load(ranges, at * 2 + 1))
+        return
+    }
+    // A full list loses the range until the block empties, when the whole
+    // block becomes one free range again.
+    if count == MAX_RANGES {
+        return
+    }
+    j := count
+    for j > at {
+        store(ranges, j * 2, load(ranges, (j - 1) * 2))
+        store(ranges, j * 2 + 1, load(ranges, (j - 1) * 2 + 1))
+        j -= 1
+    }
+    store(ranges, at * 2, offset)
+    store(ranges, at * 2 + 1, size)
+    unsafe {
+        (*b).free_count[block] += 1
+    }
+}

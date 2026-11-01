@@ -481,6 +481,7 @@ impl Checker<'_> {
             extern_: false,
             printing: None,
             pio: false,
+            wgsl: false,
             generics: vec![],
             bounds: vec![],
             generic_instance: false,

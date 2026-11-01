@@ -3,20 +3,32 @@ package vulkan
 import "core/mem"
 import "core/ptr"
 import "std/gpu/hal"
+import "std/gpu/hal/vulkan/memory"
 import "std/gpu/vulkan" as vk
+import "std/window/handle"
 
 // std/gpu's Vulkan backend, through std/gpu/vulkan.
 //
 // It needs Vulkan 1.2 with dynamic rendering (core in 1.3) and push
 // descriptors (core in 1.4), which current drivers for every desktop GPU,
-// Mesa's lavapipe and MoltenVK offer. The design favors simplicity:
+// Mesa's lavapipe and MoltenVK offer.
 //
-// - Buffers live in host-visible, coherent memory (device-local too where
-//   the GPU has such memory), so write_buffer and read_buffer are plain
-//   copies once earlier submissions have finished.
-// - Images stay in VK_IMAGE_LAYOUT_GENERAL for their whole life, and every
-//   pass, copy and dispatch starts with one full memory barrier, so no
-//   layouts or hazards need tracking.
+// - Memory comes from std/gpu/hal/vulkan/memory, which carves buffers and
+//   images out of a few large blocks per memory type. Buffers live in
+//   device-local memory, mapped as well on GPUs with unified memory where
+//   it is coherent and cached; std/gpu stages writes and reads of the
+//   others through BUFFER_UPLOAD (host-coherent) and BUFFER_READBACK
+//   (host-cached) buffers.
+// - Images stay in VK_IMAGE_LAYOUT_GENERAL for their whole life, except
+//   swapchain images, which move to PRESENT_SRC_KHR to be shown.
+// - Every command buffer begins with one memory barrier that orders it
+//   after everything submitted before it. Within a command buffer, std/gpu
+//   calls barrier() with the uses that depend on each other, and this
+//   backend turns them into stage and access masks. A render pass is
+//   recorded into a secondary command buffer and run by the primary one at
+//   end_render_pass, after the barrier its draws need, since Vulkan allows
+//   no barriers inside dynamic rendering.
+// - Command pools are reset and reused once their submission finishes.
 // - Bindings are pushed with vkCmdPushDescriptorSet at each draw or
 //   dispatch that changed them: no descriptor pools exist.
 // - The viewport is flipped (negative height), so clip space has y up as
@@ -24,17 +36,102 @@ import "std/gpu/vulkan" as vk
 // - A timeline semaphore numbers submissions; completed() reads it.
 //
 // Handles:
-//   buffer            a = VkBuffer, b = VkDeviceMemory, c = mapped address
+//   buffer            a = VkBuffer, b = allocation id, c = mapped address
+//                     or 0
 //   texture           a = VkImage, b = VkImageView (0 for textures that
-//                     are only copied), c = VkDeviceMemory, d = VkFormat
+//                     are only copied), c = allocation id (0 for swapchain
+//                     images), d = VkFormat
 //   sampler           a = VkSampler
 //   compute/render    a = VkPipeline, b = VkPipelineLayout,
 //   pipeline          c = VkDescriptorSetLayout or 0
-//   encoder           a = VkCommandPool, b = VkCommandBuffer, c = 1 while
-//                     rendering
+//   encoder           a = its Recording, b = primary VkCommandBuffer,
+//                     c = 1 while a render pass is open
+//   surface           a = its Swap
+
+unsafe extern "C" fn malloc(size: usize) -> *mut u8
+unsafe extern "C" fn free(block: *mut u8)
+unsafe extern "C" fn getenv(name: *const u8) -> *const u8
+
+// Encoders kept for reuse once their submissions finish.
+const SPARE_RECORDINGS: usize = 16
+// Render passes per encoder whose secondary command buffers are kept for
+// reuse with the encoder's pool. An encoder with more frees its pool.
+const SECONDARIES: usize = 64
 
 struct State {
     submitted: u64
+    // Recordings ready for reuse, their pools reset.
+    spare: [16]u64
+    spare_count: usize
+}
+
+// What an encoder records with: a command pool and its command buffers,
+// and the render pass that is open. Allocated with malloc and reused.
+struct Recording {
+    pool: u64
+    primary: u64
+    // Secondary command buffers for render passes: `secondary_count` exist,
+    // `secondary_used` of them by this encoder so far.
+    secondaries: [64]u64
+    secondary_count: u32
+    secondary_used: u32
+    // More render passes than SECONDARIES: the pool is freed, not reused.
+    overflow: bool
+    // The open render pass: its secondary command buffer and attachments.
+    secondary: u64
+    color_view: u64
+    color_format: u32
+    load: u32
+    clear_red: f64
+    clear_green: f64
+    clear_blue: f64
+    clear_alpha: f64
+    has_depth: bool
+    depth_view: u64
+    depth_load: u32
+    clear_depth: f32
+    width: u32
+    height: u32
+    // The barrier the pass's draws need, run before the pass.
+    before: u32
+    after: u32
+}
+
+// Frames in flight per surface, at most.
+const FRAMES: usize = 3
+// Swapchain images per surface, at most.
+const IMAGES: usize = 8
+
+// A surface: its VkSurfaceKHR, the swapchain and what presenting needs.
+struct Swap {
+    surface: u64
+    swapchain: u64
+    format: i32
+    color_space: i32
+    hal_format: u32
+    width: u32
+    height: u32
+    count: u32
+    images: [8]u64
+    views: [8]u64
+    // Signaled when image N has been rendered, for presenting it.
+    rendered: [8]u64
+    // Per frame slot: signaled when its image was acquired, the submission
+    // number of its present, and a pool for the two small command buffers
+    // that move its image into and out of the general layout.
+    acquired: [3]u64
+    done: [3]u64
+    pools: [3]u64
+    begin_commands: [3]u64
+    end_commands: [3]u64
+    frames: u32
+    slot: u32
+    image: u32
+    // The swapchain no longer matches the window.
+    outdated: bool
+    vsync: bool
+    requested_width: u32
+    requested_height: u32
 }
 
 pub struct Device: hal.Backend {
@@ -51,116 +148,24 @@ pub struct Device: hal.Backend {
     begin_rendering: vk.PfnCmdBeginRendering
     end_rendering: vk.PfnCmdEndRendering
     properties: vk.PhysicalDeviceProperties
-    memory: vk.PhysicalDeviceMemoryProperties
+    allocator: memory.Allocator
     max_allocation: u64
+    // Which window systems the instance can make surfaces for, and whether
+    // the device can make swapchains.
+    surfaces: u32
+    swapchains: bool
+    // DODO_GPU_UNMAPPED is set: ordinary buffers count as unmapped, as on a
+    // GPU with memory of its own, even where the CPU could map them. It
+    // lets tests run std/gpu's staging and readback copies on any GPU.
+    unmapped: bool
     state: State
 
     pub fn open(debug: bool) -> Device!hal.Error {
-        library := match vk.open() {
-            ok(library) => library,
-            err(_) => {
-                return err(hal.Error.NoBackend)
-            }
-        }
-        entry := library.entry()
-        version := vk.make_api_version(0, 1, 0, 0)
-        unsafe {
-            if entry.enumerate_instance_version as usize != 0 {
-                entry.enumerate_instance_version(ptr.from_mut(&mut version))
-            }
-        }
-        if version < vk.API_VERSION_1_2 {
-            return err(hal.Error.Unsupported)
-        }
-        instance := create_instance(&entry, debug)?
-        instance_fns := unsafe {
-            library.instance(instance)
-        }
-        choice := match choose_device(&instance_fns, instance) {
-            ok(choice) => choice,
-            err(error) => {
-                unsafe {
-                    instance_fns.destroy_instance(instance, vk.no_allocator())
-                }
-                return err(error)
-            }
-        }
-        device := match create_device(&instance_fns, &choice) {
-            ok(device) => device,
-            err(error) => {
-                unsafe {
-                    instance_fns.destroy_instance(instance, vk.no_allocator())
-                }
-                return err(error)
-            }
-        }
-        fns := unsafe {
-            vk.device_fns(&instance_fns, device)
-        }
-        queue := vk.null_handle::<vk.QueueT>()
-        unsafe {
-            fns.get_device_queue(device, choice.family, 0, ptr.from_mut(&mut queue))
-        }
-        // Each submission signals the timeline with its number.
-        timeline_type := vk.SemaphoreTypeCreateInfo.default()
-        timeline_type.semaphore_type = vk.SEMAPHORE_TYPE_TIMELINE
-        semaphore_info := vk.SemaphoreCreateInfo.default()
-        semaphore_info.p_next = unsafe {
-            ptr.from_ref(&timeline_type) as *const u8
-        }
-        timeline := vk.NULL_HANDLE
-        created := unsafe {
-            fns.create_semaphore(device, ptr.from_ref(&semaphore_info), vk.no_allocator(), ptr.from_mut(&mut timeline))
-        }
-        push := unsafe {
-            device_command(&instance_fns, device, b"vkCmdPushDescriptorSetKHR\0", b"vkCmdPushDescriptorSet\0")
-        }
-        begin := unsafe {
-            device_command(&instance_fns, device, b"vkCmdBeginRenderingKHR\0", b"vkCmdBeginRendering\0")
-        }
-        end := unsafe {
-            device_command(&instance_fns, device, b"vkCmdEndRenderingKHR\0", b"vkCmdEndRendering\0")
-        }
-        if created != vk.SUCCESS || push == 0 || begin == 0 || end == 0 {
-            unsafe {
-                if created == vk.SUCCESS {
-                    fns.destroy_semaphore(device, timeline, vk.no_allocator())
-                }
-                fns.destroy_device(device, vk.no_allocator())
-                instance_fns.destroy_instance(instance, vk.no_allocator())
-            }
-            return err(hal.Error.Unsupported)
-        }
-        memory := vk.PhysicalDeviceMemoryProperties.default()
-        properties := vk.PhysicalDeviceProperties.default()
-        unsafe {
-            instance_fns.get_physical_device_memory_properties(choice.physical, ptr.from_mut(&mut memory))
-            instance_fns.get_physical_device_properties(choice.physical, ptr.from_mut(&mut properties))
-        }
-        return ok(Device {
-            library: library,
-            instance: instance,
-            instance_fns: instance_fns,
-            physical: choice.physical,
-            device: device,
-            fns: fns,
-            queue: queue,
-            family: choice.family,
-            timeline: timeline,
-            push_descriptor_set: unsafe {
-                push as vk.PfnCmdPushDescriptorSet
-            },
-            begin_rendering: unsafe {
-                begin as vk.PfnCmdBeginRendering
-            },
-            end_rendering: unsafe {
-                end as vk.PfnCmdEndRendering
-            },
-            properties: properties,
-            memory: memory,
-            max_allocation: choice.max_allocation,
-            state: State { submitted: 0 }
-        })
+        return open_device(none, debug)
+    }
+
+    pub fn open_for_window(native: &handle.NativeHandle, debug: bool) -> Device!hal.Error {
+        return open_device(some(native), debug)
     }
 
     pub fn api(&self) -> hal.Api {
@@ -201,6 +206,18 @@ pub struct Device: hal.Backend {
         return length
     }
 
+    pub fn staged(&self) -> bool {
+        return true
+    }
+
+    pub fn mapped(&self, buffer: &hal.Handle) -> usize {
+        return buffer.c as usize
+    }
+
+    pub fn invalidate(&self, buffer: &hal.Handle, offset: u64, size: u64) {
+        self.allocator.invalidate(&self.fns, self.device, buffer.b, offset, size)
+    }
+
     pub fn create_buffer(&self, size: u64, usage: u32) -> hal.Handle!hal.Error {
         info := vk.BufferCreateInfo.default()
         info.size = size
@@ -214,65 +231,62 @@ pub struct Device: hal.Backend {
         unsafe {
             self.fns.get_buffer_memory_requirements(self.device, buffer, ptr.from_mut(&mut requirements))
         }
-        host := vk.MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk.MEMORY_PROPERTY_HOST_COHERENT_BIT
-        // Device-local memory the CPU can map is fastest for the GPU, but
-        // often small; plain host memory always works.
-        memory := self.allocate(&requirements, host | vk.MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
-        if memory == vk.NULL_HANDLE {
-            memory = self.allocate(&requirements, host)
+        kind := memory.KIND_BUFFER
+        if (usage & hal.BUFFER_UPLOAD) != 0 {
+            kind = memory.KIND_UPLOAD
+        } else if (usage & hal.BUFFER_READBACK) != 0 {
+            kind = memory.KIND_READBACK
         }
-        if memory == vk.NULL_HANDLE {
-            unsafe {
-                self.fns.destroy_buffer(self.device, buffer, vk.no_allocator())
+        allocation := match self.allocator.allocate(&self.fns, self.device, &requirements, kind) {
+            ok(allocation) => allocation,
+            err(error) => {
+                unsafe {
+                    self.fns.destroy_buffer(self.device, buffer, vk.no_allocator())
+                }
+                return err(error)
             }
-            return err(hal.Error.OutOfMemory)
         }
-        mapped := vk.null_handle::<u8>()
         result := unsafe {
-            code := self.fns.bind_buffer_memory(self.device, buffer, memory, 0)
-            if code == vk.SUCCESS {
-                code = self.fns.map_memory(self.device, memory, 0, vk.WHOLE_SIZE, 0, ptr.from_mut(&mut mapped))
-            }
-            code
+            self.fns.bind_buffer_memory(self.device, buffer, allocation.memory, allocation.offset)
         }
         if result != vk.SUCCESS {
             unsafe {
                 self.fns.destroy_buffer(self.device, buffer, vk.no_allocator())
-                self.fns.free_memory(self.device, memory, vk.no_allocator())
             }
+            self.allocator.free(&self.fns, self.device, allocation.id)
             return err(error_for(result))
         }
-        // New buffers read as zero, as on every backend.
-        unsafe {
-            ptr.write_bytes(mapped, 0u8, size as usize)
+        // New buffers read as zero, as on every backend: mapped ones are
+        // cleared here, std/gpu clears the others with clear_buffer.
+        mapped := allocation.mapped
+        // std/gpu reads mapped buffers directly and writes new ones
+        // directly: only worth it, and only correct without flushes, in
+        // coherent memory the CPU caches. Others go through copies.
+        cached := vk.MEMORY_PROPERTY_HOST_COHERENT_BIT | vk.MEMORY_PROPERTY_HOST_CACHED_BIT
+        if kind == memory.KIND_BUFFER && (self.unmapped || (allocation.flags & cached) != cached) {
+            mapped = 0
         }
-        return ok(hal.Handle { a: buffer, b: memory, c: unsafe {
-            mapped as usize as u64
-        }, d: 0 })
+        if mapped != 0 {
+            unsafe {
+                ptr.write_bytes(mapped as *mut u8, 0u8, size as usize)
+            }
+        }
+        return ok(hal.Handle { a: buffer, b: allocation.id, c: mapped as u64, d: 0 })
     }
 
+    // std/gpu stages every transfer on Vulkan (staged() is true).
     pub fn write_buffer(&self, buffer: &hal.Handle, offset: u64, data: &[u8]) -> void!hal.Error {
-        self.wait_all()?
-        unsafe {
-            start := buffer.c as usize as *mut u8
-            ptr.copy_nonoverlapping(ptr.as_ptr(data), ptr.offset(start, offset as isize), data.len)
-        }
-        return ok()
+        return err(hal.Error.Unsupported)
     }
 
     pub fn read_buffer(&self, buffer: &hal.Handle, offset: u64, out: &mut[u8]) -> void!hal.Error {
-        self.wait_all()?
-        unsafe {
-            start := buffer.c as usize as *const u8
-            ptr.copy_nonoverlapping(ptr.offset(start, offset as isize), ptr.as_mut_ptr(out), out.len)
-        }
-        return ok()
+        return err(hal.Error.Unsupported)
     }
 
     pub fn create_texture(&self, descriptor: &hal.TextureDescriptor) -> hal.Handle!hal.Error {
         format := image_format(descriptor.format)
         depth := hal.is_depth(descriptor.format)
-        // Cleared once at creation, so always a transfer destination.
+        // Cleared by initialize_texture, so always a transfer destination.
         usage := vk.IMAGE_USAGE_TRANSFER_DST_BIT
         if (descriptor.usage & hal.TEXTURE_COPY_SRC) != 0 {
             usage = usage | vk.IMAGE_USAGE_TRANSFER_SRC_BIT
@@ -316,95 +330,40 @@ pub struct Device: hal.Backend {
         unsafe {
             self.fns.get_image_memory_requirements(self.device, image, ptr.from_mut(&mut requirements))
         }
-        memory := self.allocate(&requirements, vk.MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
-        if memory == vk.NULL_HANDLE {
-            memory = self.allocate(&requirements, 0)
-        }
-        if memory == vk.NULL_HANDLE {
-            unsafe {
-                self.fns.destroy_image(self.device, image, vk.no_allocator())
+        allocation := match self.allocator.allocate(&self.fns, self.device, &requirements, memory.KIND_IMAGE) {
+            ok(allocation) => allocation,
+            err(error) => {
+                unsafe {
+                    self.fns.destroy_image(self.device, image, vk.no_allocator())
+                }
+                return err(error)
             }
-            return err(hal.Error.OutOfMemory)
         }
         view := vk.NULL_HANDLE
         result := unsafe {
-            self.fns.bind_image_memory(self.device, image, memory, 0)
+            self.fns.bind_image_memory(self.device, image, allocation.memory, allocation.offset)
         }
         // Views are for binding and rendering; copies use the image itself.
         viewed := (descriptor.usage & (hal.TEXTURE_SAMPLED | hal.TEXTURE_STORAGE | hal.TEXTURE_RENDER)) != 0
         if result == vk.SUCCESS && viewed {
-            view_info := vk.ImageViewCreateInfo.default()
-            view_info.image = image
-            view_info.view_type = vk.IMAGE_VIEW_TYPE_2D
-            view_info.format = format
-            view_info.subresource_range = whole_image(depth)
-            result = unsafe {
-                self.fns.create_image_view(self.device, ptr.from_ref(&view_info), vk.no_allocator(), ptr.from_mut(&mut view))
-            }
+            view = self.create_view(image, format, depth)?
         }
         if result != vk.SUCCESS {
             unsafe {
                 self.fns.destroy_image(self.device, image, vk.no_allocator())
-                self.fns.free_memory(self.device, memory, vk.no_allocator())
             }
+            self.allocator.free(&self.fns, self.device, allocation.id)
             return err(error_for(result))
         }
-        handle := hal.Handle { a: image, b: view, c: memory, d: format as u64 }
-        // Move the image to the general layout it keeps from now on, and
-        // clear it to zero.
-        match self.initialize(&handle, depth) {
-            ok() => {}
-            err(error) => {
-                self.destroy(hal.OBJECT_TEXTURE, &handle)
-                return err(error)
-            }
-        }
-        return ok(handle)
+        return ok(hal.Handle { a: image, b: view, c: allocation.id, d: format as u64 })
     }
 
     pub fn write_texture(&self, texture: &hal.Handle, descriptor: &hal.TextureDescriptor, region: &hal.Region, data: &[u8], bytes_per_row: u32) -> void!hal.Error {
-        size := copy_size(descriptor, region, bytes_per_row)
-        staging := self.create_buffer(size, hal.BUFFER_COPY_SRC)?
-        unsafe {
-            ptr.copy_nonoverlapping(ptr.as_ptr(data), staging.c as usize as *mut u8, size as usize)
-        }
-        encoder := match self.begin_encoder() {
-            ok(encoder) => encoder,
-            err(error) => {
-                self.destroy(hal.OBJECT_BUFFER, &staging)
-                return err(error)
-            }
-        }
-        self.copy_buffer_to_texture(&mut encoder, &staging, 0, bytes_per_row, texture, descriptor, region)
-        result := self.run(&mut encoder)
-        self.destroy(hal.OBJECT_BUFFER, &staging)
-        return result
+        return err(hal.Error.Unsupported)
     }
 
     pub fn read_texture(&self, texture: &hal.Handle, descriptor: &hal.TextureDescriptor, region: &hal.Region, out: &mut[u8], bytes_per_row: u32) -> void!hal.Error {
-        size := copy_size(descriptor, region, bytes_per_row)
-        staging := self.create_buffer(size, hal.BUFFER_COPY_DST)?
-        encoder := match self.begin_encoder() {
-            ok(encoder) => encoder,
-            err(error) => {
-                self.destroy(hal.OBJECT_BUFFER, &staging)
-                return err(error)
-            }
-        }
-        self.copy_texture_to_buffer(&mut encoder, texture, descriptor, region, &staging, 0, bytes_per_row)
-        match self.run(&mut encoder) {
-            ok() => {
-                unsafe {
-                    ptr.copy_nonoverlapping(staging.c as usize as *const u8, ptr.as_mut_ptr(out), size as usize)
-                }
-                self.destroy(hal.OBJECT_BUFFER, &staging)
-                return ok()
-            }
-            err(error) => {
-                self.destroy(hal.OBJECT_BUFFER, &staging)
-                return err(error)
-            }
-        }
+        return err(hal.Error.Unsupported)
     }
 
     pub fn create_sampler(&self, descriptor: &hal.SamplerDescriptor) -> hal.Handle!hal.Error {
@@ -629,21 +588,20 @@ pub struct Device: hal.Backend {
         unsafe {
             if object == hal.OBJECT_BUFFER {
                 self.fns.destroy_buffer(self.device, handle.a, alloc)
-                self.fns.free_memory(self.device, handle.b, alloc)
+                self.allocator.free(&self.fns, self.device, handle.b)
             } else if object == hal.OBJECT_TEXTURE {
                 if handle.b != vk.NULL_HANDLE {
                     self.fns.destroy_image_view(self.device, handle.b, alloc)
                 }
                 self.fns.destroy_image(self.device, handle.a, alloc)
-                self.fns.free_memory(self.device, handle.c, alloc)
+                self.allocator.free(&self.fns, self.device, handle.c)
             } else if object == hal.OBJECT_SAMPLER {
                 self.fns.destroy_sampler(self.device, handle.a, alloc)
             } else if object == hal.OBJECT_COMPUTE_PIPELINE || object == hal.OBJECT_RENDER_PIPELINE {
                 self.fns.destroy_pipeline(self.device, handle.a, alloc)
                 self.destroy_layout(handle)
             } else if object == hal.OBJECT_ENCODER {
-                // Freeing the pool frees its command buffer.
-                self.fns.destroy_command_pool(self.device, handle.a, alloc)
+                self.recycle(handle.a as usize)
             }
         }
     }
@@ -668,68 +626,40 @@ pub struct Device: hal.Backend {
     }
 
     pub fn begin_encoder(&self) -> hal.Handle!hal.Error {
-        pool_info := vk.CommandPoolCreateInfo.default()
-        pool_info.flags = vk.COMMAND_POOL_CREATE_TRANSIENT_BIT
-        pool_info.queue_family_index = self.family
-        pool := vk.NULL_HANDLE
-        unsafe {
-            check(self.fns.create_command_pool(self.device, ptr.from_ref(&pool_info), vk.no_allocator(), ptr.from_mut(&mut pool)))?
+        record := self.recording()?
+        primary := unsafe {
+            (*record).primary
         }
-        allocate := vk.CommandBufferAllocateInfo.default()
-        allocate.command_pool = pool
-        allocate.level = vk.COMMAND_BUFFER_LEVEL_PRIMARY
-        allocate.command_buffer_count = 1
-        commands := vk.null_handle::<vk.CommandBufferT>()
+        commands := unsafe {
+            primary as usize as vk.CommandBuffer
+        }
         begin := vk.CommandBufferBeginInfo.default()
         begin.flags = vk.COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
         result := unsafe {
-            code := self.fns.allocate_command_buffers(self.device, ptr.from_ref(&allocate), ptr.from_mut(&mut commands))
-            if code == vk.SUCCESS {
-                code = self.fns.begin_command_buffer(commands, ptr.from_ref(&begin))
-            }
-            code
+            self.fns.begin_command_buffer(commands, ptr.from_ref(&begin))
         }
         if result != vk.SUCCESS {
-            unsafe {
-                self.fns.destroy_command_pool(self.device, pool, vk.no_allocator())
-            }
+            self.recycle(unsafe {
+                record as usize
+            })
             return err(error_for(result))
         }
-        return ok(hal.Handle { a: pool, b: unsafe {
-            commands as usize as u64
-        }, c: 0, d: 0 })
+        // Everything submitted before this command buffer finishes, and its
+        // writes become visible, before this one's commands start.
+        self.memory_barrier(commands, vk.PIPELINE_STAGE_ALL_COMMANDS_BIT, vk.ACCESS_MEMORY_WRITE_BIT, vk.PIPELINE_STAGE_ALL_COMMANDS_BIT, vk.ACCESS_MEMORY_READ_BIT | vk.ACCESS_MEMORY_WRITE_BIT)
+        return ok(hal.Handle { a: unsafe {
+            record as usize as u64
+        }, b: primary, c: 0, d: 0 })
     }
 
     pub fn submit(&self, encoder: &mut hal.Handle) -> u64!hal.Error {
-        commands := command_buffer(encoder)
+        commands := primary(encoder)
         // Make the GPU's writes visible to the CPU once the work is done.
-        barrier := vk.MemoryBarrier.default()
-        barrier.src_access_mask = vk.ACCESS_MEMORY_WRITE_BIT
-        barrier.dst_access_mask = vk.ACCESS_HOST_READ_BIT
+        self.memory_barrier(commands, vk.PIPELINE_STAGE_ALL_COMMANDS_BIT, vk.ACCESS_MEMORY_WRITE_BIT, vk.PIPELINE_STAGE_HOST_BIT, vk.ACCESS_HOST_READ_BIT)
         unsafe {
-            self.fns.cmd_pipeline_barrier(commands, vk.PIPELINE_STAGE_ALL_COMMANDS_BIT, vk.PIPELINE_STAGE_HOST_BIT, 0, 1, ptr.from_ref(&barrier), 0, 0usize as *const vk.BufferMemoryBarrier, 0, 0usize as *const vk.ImageMemoryBarrier)
             check(self.fns.end_command_buffer(commands))?
         }
-        state := self.state()
-        index := unsafe {
-            (*state).submitted + 1
-        }
-        timeline_info := vk.TimelineSemaphoreSubmitInfo.default()
-        timeline_info.signal_semaphore_value_count = 1
-        timeline_info.p_signal_semaphore_values = ptr.from_ref(&index)
-        submit := vk.SubmitInfo.default()
-        submit.p_next = unsafe {
-            ptr.from_ref(&timeline_info) as *const u8
-        }
-        submit.command_buffer_count = 1
-        submit.p_command_buffers = ptr.from_ref(&commands)
-        submit.signal_semaphore_count = 1
-        submit.p_signal_semaphores = ptr.from_ref(&self.timeline)
-        unsafe {
-            check(self.fns.queue_submit(self.queue, 1, ptr.from_ref(&submit), vk.NULL_HANDLE))?
-            (*state).submitted = index
-        }
-        return ok(index)
+        return self.queue_submit(commands, vk.NULL_HANDLE, vk.NULL_HANDLE)
     }
 
     pub fn begin_compute_pass(&self, encoder: &mut hal.Handle) {}
@@ -737,30 +667,47 @@ pub struct Device: hal.Backend {
     pub fn end_compute_pass(&self, encoder: &mut hal.Handle) {}
 
     pub fn begin_render_pass(&self, encoder: &mut hal.Handle, pass: &hal.RenderPassInfo) {
-        commands := command_buffer(encoder)
-        self.barrier(commands)
-        color := vk.RenderingAttachmentInfo.default()
-        color.image_view = pass.color.b
-        color.image_layout = vk.IMAGE_LAYOUT_GENERAL
-        color.load_op = load_op(pass.load)
-        color.store_op = vk.ATTACHMENT_STORE_OP_STORE
-        color.clear_value = vk.clear_value_color(clear_color(pass))
-        depth := vk.RenderingAttachmentInfo.default()
-        info := vk.RenderingInfo.default()
-        info.render_area = vk.Rect2D { offset: vk.Offset2D { x: 0, y: 0 }, extent: vk.Extent2D { width: pass.width, height: pass.height } }
-        info.layer_count = 1
-        info.color_attachment_count = 1
-        info.p_color_attachments = ptr.from_ref(&color)
-        if pass.has_depth {
-            depth.image_view = pass.depth.b
-            depth.image_layout = vk.IMAGE_LAYOUT_GENERAL
-            depth.load_op = load_op(pass.depth_load)
-            depth.store_op = vk.ATTACHMENT_STORE_OP_STORE
-            depth.clear_value = vk.clear_value_depth_stencil(pass.clear_depth, 0)
-            info.p_depth_attachment = ptr.from_ref(&depth)
+        record := recording_of(encoder)
+        secondary := match self.secondary(record) {
+            ok(secondary) => secondary,
+            err(_) => {
+                assert(false, "Vulkan could not allocate a command buffer for a render pass")
+                return
+            }
         }
+        color_formats := [image_format(pass.color_format)]
+        inheritance_rendering := vk.CommandBufferInheritanceRenderingInfo.default()
+        inheritance_rendering.color_attachment_count = 1
+        inheritance_rendering.p_color_attachment_formats = ptr.as_ptr(&color_formats)
+        if pass.has_depth {
+            inheritance_rendering.depth_attachment_format = vk.FORMAT_D32_SFLOAT
+        }
+        inheritance_rendering.rasterization_samples = vk.SAMPLE_COUNT_1_BIT
+        inheritance := vk.CommandBufferInheritanceInfo.default()
+        inheritance.p_next = unsafe {
+            ptr.from_ref(&inheritance_rendering) as *const u8
+        }
+        begin := vk.CommandBufferBeginInfo.default()
+        begin.flags = vk.COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT | vk.COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT
+        begin.p_inheritance_info = ptr.from_ref(&inheritance)
         unsafe {
-            self.begin_rendering(commands, ptr.from_ref(&info))
+            self.fns.begin_command_buffer(secondary as usize as vk.CommandBuffer, ptr.from_ref(&begin))
+            (*record).secondary = secondary
+            (*record).color_view = pass.color.b
+            (*record).color_format = pass.color_format
+            (*record).load = pass.load
+            (*record).clear_red = pass.clear_red
+            (*record).clear_green = pass.clear_green
+            (*record).clear_blue = pass.clear_blue
+            (*record).clear_alpha = pass.clear_alpha
+            (*record).has_depth = pass.has_depth
+            (*record).depth_view = pass.depth.b
+            (*record).depth_load = pass.depth_load
+            (*record).clear_depth = pass.clear_depth
+            (*record).width = pass.width
+            (*record).height = pass.height
+            (*record).before = 0
+            (*record).after = 0
         }
         encoder.c = 1
         self.set_viewport(encoder, 0.0, 0.0, pass.width as f32, pass.height as f32, 0.0, 1.0)
@@ -768,8 +715,41 @@ pub struct Device: hal.Backend {
     }
 
     pub fn end_render_pass(&self, encoder: &mut hal.Handle) {
+        record := recording_of(encoder)
+        commands := primary(encoder)
         unsafe {
-            self.end_rendering(command_buffer(encoder))
+            secondary := (*record).secondary as usize as vk.CommandBuffer
+            self.fns.end_command_buffer(secondary)
+            before := (*record).before
+            after := (*record).after
+            if before != 0 {
+                self.memory_barrier(commands, stages(before), write_accesses(before), stages(after), accesses(after))
+            }
+            color := vk.RenderingAttachmentInfo.default()
+            color.image_view = (*record).color_view
+            color.image_layout = vk.IMAGE_LAYOUT_GENERAL
+            color.load_op = load_op((*record).load)
+            color.store_op = vk.ATTACHMENT_STORE_OP_STORE
+            color.clear_value = vk.clear_value_color(clear_color((*record).color_format, (*record).clear_red, (*record).clear_green, (*record).clear_blue, (*record).clear_alpha))
+            depth := vk.RenderingAttachmentInfo.default()
+            info := vk.RenderingInfo.default()
+            info.flags = vk.RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT
+            info.render_area = vk.Rect2D { offset: vk.Offset2D { x: 0, y: 0 }, extent: vk.Extent2D { width: (*record).width, height: (*record).height } }
+            info.layer_count = 1
+            info.color_attachment_count = 1
+            info.p_color_attachments = ptr.from_ref(&color)
+            if (*record).has_depth {
+                depth.image_view = (*record).depth_view
+                depth.image_layout = vk.IMAGE_LAYOUT_GENERAL
+                depth.load_op = load_op((*record).depth_load)
+                depth.store_op = vk.ATTACHMENT_STORE_OP_STORE
+                depth.clear_value = vk.clear_value_depth_stencil((*record).clear_depth, 0)
+                info.p_depth_attachment = ptr.from_ref(&depth)
+            }
+            self.begin_rendering(commands, ptr.from_ref(&info))
+            self.fns.cmd_execute_commands(commands, 1, ptr.from_ref(&secondary))
+            self.end_rendering(commands)
+            (*record).secondary = 0
         }
         encoder.c = 0
     }
@@ -778,21 +758,19 @@ pub struct Device: hal.Backend {
         // Negative height flips y, so that clip space has y up.
         viewport := vk.Viewport { x: x, y: y + height, width: width, height: 0.0 - height, min_depth: min_depth, max_depth: max_depth }
         unsafe {
-            self.fns.cmd_set_viewport(command_buffer(encoder), 0, 1, ptr.from_ref(&viewport))
+            self.fns.cmd_set_viewport(current(encoder), 0, 1, ptr.from_ref(&viewport))
         }
     }
 
     pub fn set_scissor(&self, encoder: &mut hal.Handle, x: u32, y: u32, width: u32, height: u32) {
         rect := vk.Rect2D { offset: vk.Offset2D { x: x as i32, y: y as i32 }, extent: vk.Extent2D { width: width, height: height } }
         unsafe {
-            self.fns.cmd_set_scissor(command_buffer(encoder), 0, 1, ptr.from_ref(&rect))
+            self.fns.cmd_set_scissor(current(encoder), 0, 1, ptr.from_ref(&rect))
         }
     }
 
     pub fn dispatch(&self, encoder: &mut hal.Handle, state: &mut hal.PassState, x: u32, y: u32, z: u32) {
-        commands := command_buffer(encoder)
-        // Each dispatch sees the writes of everything before it.
-        self.barrier(commands)
+        commands := primary(encoder)
         if state.pipeline_dirty {
             unsafe {
                 self.fns.cmd_bind_pipeline(commands, vk.PIPELINE_BIND_POINT_COMPUTE, state.pipeline.handle.a)
@@ -806,7 +784,7 @@ pub struct Device: hal.Backend {
     }
 
     pub fn draw(&self, encoder: &mut hal.Handle, state: &mut hal.PassState, vertex_count: u32, instance_count: u32, first_vertex: u32, first_instance: u32) {
-        commands := command_buffer(encoder)
+        commands := current(encoder)
         self.apply(commands, state, false)
         unsafe {
             self.fns.cmd_draw(commands, vertex_count, instance_count, first_vertex, first_instance)
@@ -814,7 +792,7 @@ pub struct Device: hal.Backend {
     }
 
     pub fn draw_indexed(&self, encoder: &mut hal.Handle, state: &mut hal.PassState, index_count: u32, instance_count: u32, first_index: u32, base_vertex: i32, first_instance: u32) {
-        commands := command_buffer(encoder)
+        commands := current(encoder)
         self.apply(commands, state, true)
         unsafe {
             self.fns.cmd_draw_indexed(commands, index_count, instance_count, first_index, base_vertex, first_instance)
@@ -822,29 +800,259 @@ pub struct Device: hal.Backend {
     }
 
     pub fn copy_buffer(&self, encoder: &mut hal.Handle, source: &hal.Handle, source_offset: u64, destination: &hal.Handle, destination_offset: u64, size: u64) {
-        commands := command_buffer(encoder)
-        self.barrier(commands)
         region := vk.BufferCopy { src_offset: source_offset, dst_offset: destination_offset, size: size }
         unsafe {
-            self.fns.cmd_copy_buffer(commands, source.a, destination.a, 1, ptr.from_ref(&region))
+            self.fns.cmd_copy_buffer(primary(encoder), source.a, destination.a, 1, ptr.from_ref(&region))
         }
     }
 
     pub fn copy_buffer_to_texture(&self, encoder: &mut hal.Handle, source: &hal.Handle, offset: u64, bytes_per_row: u32, destination: &hal.Handle, descriptor: &hal.TextureDescriptor, region: &hal.Region) {
-        commands := command_buffer(encoder)
-        self.barrier(commands)
         copy := image_copy(descriptor, region, offset, bytes_per_row)
         unsafe {
-            self.fns.cmd_copy_buffer_to_image(commands, source.a, destination.a, vk.IMAGE_LAYOUT_GENERAL, 1, ptr.from_ref(&copy))
+            self.fns.cmd_copy_buffer_to_image(primary(encoder), source.a, destination.a, vk.IMAGE_LAYOUT_GENERAL, 1, ptr.from_ref(&copy))
         }
     }
 
     pub fn copy_texture_to_buffer(&self, encoder: &mut hal.Handle, source: &hal.Handle, descriptor: &hal.TextureDescriptor, region: &hal.Region, destination: &hal.Handle, offset: u64, bytes_per_row: u32) {
-        commands := command_buffer(encoder)
-        self.barrier(commands)
         copy := image_copy(descriptor, region, offset, bytes_per_row)
         unsafe {
-            self.fns.cmd_copy_image_to_buffer(commands, source.a, vk.IMAGE_LAYOUT_GENERAL, destination.a, 1, ptr.from_ref(&copy))
+            self.fns.cmd_copy_image_to_buffer(primary(encoder), source.a, vk.IMAGE_LAYOUT_GENERAL, destination.a, 1, ptr.from_ref(&copy))
+        }
+    }
+
+    pub fn clear_buffer(&self, encoder: &mut hal.Handle, buffer: &hal.Handle, offset: u64, size: u64) {
+        unsafe {
+            self.fns.cmd_fill_buffer(primary(encoder), buffer.a, offset, size, 0)
+        }
+    }
+
+    // Move a new image to the general layout and clear it.
+    pub fn initialize_texture(&self, encoder: &mut hal.Handle, texture: &hal.Handle, descriptor: &hal.TextureDescriptor) {
+        commands := primary(encoder)
+        depth := hal.is_depth(descriptor.format)
+        self.transition(commands, texture.a, depth, vk.IMAGE_LAYOUT_UNDEFINED, vk.IMAGE_LAYOUT_GENERAL, vk.PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0, vk.PIPELINE_STAGE_TRANSFER_BIT, vk.ACCESS_TRANSFER_WRITE_BIT)
+        range := whole_image(depth)
+        unsafe {
+            if depth {
+                value := vk.ClearDepthStencilValue { depth: 0.0, stencil: 0 }
+                self.fns.cmd_clear_depth_stencil_image(commands, texture.a, vk.IMAGE_LAYOUT_GENERAL, ptr.from_ref(&value), 1, ptr.from_ref(&range))
+            } else {
+                value := vk.ClearColorValue.default()
+                self.fns.cmd_clear_color_image(commands, texture.a, vk.IMAGE_LAYOUT_GENERAL, ptr.from_ref(&value), 1, ptr.from_ref(&range))
+            }
+        }
+    }
+
+    pub fn barrier(&self, encoder: &mut hal.Handle, before: u32, after: u32) {
+        if encoder.c == 1 {
+            record := recording_of(encoder)
+            unsafe {
+                (*record).before = (*record).before | before
+                (*record).after = (*record).after | after
+            }
+            return
+        }
+        self.memory_barrier(primary(encoder), stages(before), write_accesses(before), stages(after), accesses(after))
+    }
+
+    pub fn create_surface(&self, native: &handle.NativeHandle) -> hal.Handle!hal.Error {
+        kind := surface_kind(native)
+        if (self.surfaces & kind) == 0 || !self.swapchains {
+            return err(hal.Error.Unsupported)
+        }
+        surface := create_vk_surface(&self.instance_fns, self.instance, native)?
+        supported := vk.FALSE
+        unsafe {
+            self.instance_fns.get_physical_device_surface_support_khr(self.physical, self.family, surface, ptr.from_mut(&mut supported))
+        }
+        if supported != vk.TRUE {
+            unsafe {
+                self.instance_fns.destroy_surface_khr(self.instance, surface, vk.no_allocator())
+            }
+            return err(hal.Error.Unsupported)
+        }
+        size := mem.size_of::<Swap>()
+        swap := unsafe {
+            malloc(size) as *mut Swap
+        }
+        if unsafe {
+            swap as usize
+        } == 0 {
+            unsafe {
+                self.instance_fns.destroy_surface_khr(self.instance, surface, vk.no_allocator())
+            }
+            return err(hal.Error.OutOfMemory)
+        }
+        unsafe {
+            ptr.write_bytes(swap as *mut u8, 0u8, size)
+            (*swap).surface = surface
+        }
+        return ok(hal.Handle { a: unsafe {
+            swap as usize as u64
+        }, b: 0, c: 0, d: 0 })
+    }
+
+    pub fn configure_surface(&self, surface: &mut hal.Handle, config: &mut hal.SurfaceConfig) -> void!hal.Error {
+        swap := swap_of(surface)
+        unsafe {
+            check(self.fns.device_wait_idle(self.device))?
+            (*swap).requested_width = config.width
+            (*swap).requested_height = config.height
+            (*swap).vsync = config.vsync
+        }
+        self.set_frames(swap, config.frames)?
+        self.build_swapchain(swap)?
+        unsafe {
+            config.format = (*swap).hal_format
+            config.width = (*swap).width
+            config.height = (*swap).height
+        }
+        return ok()
+    }
+
+    pub fn acquire(&self, surface: &mut hal.Handle, texture: &mut hal.Handle) -> u64!hal.Error {
+        swap := swap_of(surface)
+        slot := unsafe {
+            (*swap).slot as usize
+        }
+        outdated := unsafe {
+            (*swap).swapchain == vk.NULL_HANDLE || (*swap).outdated
+        }
+        if outdated {
+            return err(hal.Error.Outdated)
+        }
+        // At most `frames` frames in flight: this slot's last frame must
+        // have finished, which also frees its semaphore and command buffers.
+        done := unsafe {
+            (*swap).done[slot]
+        }
+        if done != 0 {
+            self.wait(done)?
+        }
+        index := 0u32
+        acquired := unsafe {
+            self.fns.acquire_next_image_khr(self.device, (*swap).swapchain, 0xffffffffffffffff, (*swap).acquired[slot], vk.NULL_HANDLE, ptr.from_mut(&mut index))
+        }
+        if acquired == vk.ERROR_OUT_OF_DATE_KHR {
+            unsafe {
+                (*swap).outdated = true
+            }
+            return err(hal.Error.Outdated)
+        }
+        check(acquired)?
+        // Use the image this time, and remake the swapchain afterwards.
+        if acquired == vk.SUBOPTIMAL_KHR {
+            unsafe {
+                (*swap).outdated = true
+            }
+        }
+        // A command buffer that waits for the image and moves it into the
+        // general layout, before every later submission.
+        commands := unsafe {
+            check(self.fns.reset_command_pool(self.device, (*swap).pools[slot], 0))?
+            (*swap).image = index
+            (*swap).begin_commands[slot] as usize as vk.CommandBuffer
+        }
+        begin := vk.CommandBufferBeginInfo.default()
+        begin.flags = vk.COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
+        image := unsafe {
+            (*swap).images[index as usize]
+        }
+        unsafe {
+            check(self.fns.begin_command_buffer(commands, ptr.from_ref(&begin)))?
+        }
+        self.transition(commands, image, false, vk.IMAGE_LAYOUT_UNDEFINED, vk.IMAGE_LAYOUT_GENERAL, vk.PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, vk.PIPELINE_STAGE_ALL_COMMANDS_BIT, vk.ACCESS_MEMORY_READ_BIT | vk.ACCESS_MEMORY_WRITE_BIT)
+        unsafe {
+            check(self.fns.end_command_buffer(commands))?
+        }
+        submission := unsafe {
+            self.queue_submit(commands, (*swap).acquired[slot], vk.NULL_HANDLE)?
+        }
+        texture.a = image
+        texture.b = unsafe {
+            (*swap).views[index as usize]
+        }
+        texture.c = 0
+        texture.d = unsafe {
+            (*swap).format as u64
+        }
+        return ok(submission)
+    }
+
+    pub fn present(&self, surface: &mut hal.Handle) -> u64!hal.Error {
+        swap := swap_of(surface)
+        slot := unsafe {
+            (*swap).slot as usize
+        }
+        index := unsafe {
+            (*swap).image
+        }
+        commands := unsafe {
+            (*swap).end_commands[slot] as usize as vk.CommandBuffer
+        }
+        begin := vk.CommandBufferBeginInfo.default()
+        begin.flags = vk.COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
+        image := unsafe {
+            (*swap).images[index as usize]
+        }
+        unsafe {
+            check(self.fns.begin_command_buffer(commands, ptr.from_ref(&begin)))?
+        }
+        self.transition(commands, image, false, vk.IMAGE_LAYOUT_GENERAL, vk.IMAGE_LAYOUT_PRESENT_SRC_KHR, vk.PIPELINE_STAGE_ALL_COMMANDS_BIT, vk.ACCESS_MEMORY_WRITE_BIT, vk.PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0)
+        unsafe {
+            check(self.fns.end_command_buffer(commands))?
+        }
+        rendered := unsafe {
+            (*swap).rendered[index as usize]
+        }
+        submission := self.queue_submit(commands, vk.NULL_HANDLE, rendered)?
+        unsafe {
+            (*swap).done[slot] = submission
+            (*swap).slot = ((slot + 1) % (*swap).frames as usize) as u32
+        }
+        swapchain := unsafe {
+            (*swap).swapchain
+        }
+        present := vk.PresentInfoKHR.default()
+        present.wait_semaphore_count = 1
+        present.p_wait_semaphores = ptr.from_ref(&rendered)
+        present.swapchain_count = 1
+        present.p_swapchains = ptr.from_ref(&swapchain)
+        present.p_image_indices = ptr.from_ref(&index)
+        presented := unsafe {
+            self.fns.queue_present_khr(self.queue, ptr.from_ref(&present))
+        }
+        if presented == vk.ERROR_OUT_OF_DATE_KHR || presented == vk.SUBOPTIMAL_KHR {
+            unsafe {
+                (*swap).outdated = true
+            }
+        } else {
+            check(presented)?
+        }
+        return ok(submission)
+    }
+
+    pub fn destroy_surface(&self, surface: &hal.Handle) {
+        swap := unsafe {
+            surface.a as usize as *mut Swap
+        }
+        unsafe {
+            self.fns.device_wait_idle(self.device)
+        }
+        self.destroy_images(swap)
+        alloc := vk.no_allocator()
+        unsafe {
+            if (*swap).swapchain != vk.NULL_HANDLE {
+                self.fns.destroy_swapchain_khr(self.device, (*swap).swapchain, alloc)
+            }
+        }
+        match self.set_frames(swap, 0) {
+            ok() => {}
+            err(_) => {}
+        }
+        unsafe {
+            self.instance_fns.destroy_surface_khr(self.instance, (*swap).surface, alloc)
+            free(swap as *mut u8)
         }
     }
 
@@ -854,82 +1062,429 @@ pub struct Device: hal.Backend {
         }
     }
 
-    fn wait_all(&self) -> void!hal.Error {
-        submitted := unsafe {
-            (*self.state()).submitted
+    // Submit one command buffer as the next submission, waiting for
+    // `wait` (a binary semaphore or null) first and signaling `signal` (a
+    // binary semaphore or null) besides the timeline: its number.
+    fn queue_submit(&self, commands: vk.CommandBuffer, wait: vk.Semaphore, signal: vk.Semaphore) -> u64!hal.Error {
+        state := self.state()
+        index := unsafe {
+            (*state).submitted + 1
         }
-        if submitted == 0 || self.completed() >= submitted {
-            return ok()
+        signals := [self.timeline, signal]
+        values := [index, 0u64]
+        signal_count := 1u32
+        if signal != vk.NULL_HANDLE {
+            signal_count = 2
         }
-        return self.wait(submitted)
-    }
-
-    // Submit a one-off encoder, wait for it and destroy it.
-    fn run(&self, encoder: &mut hal.Handle) -> void!hal.Error {
-        result := match self.submit(encoder) {
-            ok(index) => self.wait(index),
-            err(error) => err(error),
+        timeline_info := vk.TimelineSemaphoreSubmitInfo.default()
+        timeline_info.signal_semaphore_value_count = signal_count
+        timeline_info.p_signal_semaphore_values = ptr.as_ptr(&values)
+        stage := vk.PIPELINE_STAGE_ALL_COMMANDS_BIT
+        submit := vk.SubmitInfo.default()
+        submit.p_next = unsafe {
+            ptr.from_ref(&timeline_info) as *const u8
         }
-        self.destroy(hal.OBJECT_ENCODER, encoder)
-        return result
-    }
-
-    // A full memory barrier: every earlier command's writes become visible
-    // to every later command.
-    fn barrier(&self, commands: vk.CommandBuffer) {
-        barrier := vk.MemoryBarrier.default()
-        barrier.src_access_mask = vk.ACCESS_MEMORY_WRITE_BIT
-        barrier.dst_access_mask = vk.ACCESS_MEMORY_READ_BIT | vk.ACCESS_MEMORY_WRITE_BIT
+        if wait != vk.NULL_HANDLE {
+            submit.wait_semaphore_count = 1
+            submit.p_wait_semaphores = ptr.from_ref(&wait)
+            submit.p_wait_dst_stage_mask = ptr.from_ref(&stage)
+        }
+        submit.command_buffer_count = 1
+        submit.p_command_buffers = ptr.from_ref(&commands)
+        submit.signal_semaphore_count = signal_count
+        submit.p_signal_semaphores = ptr.as_ptr(&signals)
         unsafe {
-            self.fns.cmd_pipeline_barrier(commands, vk.PIPELINE_STAGE_ALL_COMMANDS_BIT, vk.PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, ptr.from_ref(&barrier), 0, 0usize as *const vk.BufferMemoryBarrier, 0, 0usize as *const vk.ImageMemoryBarrier)
+            check(self.fns.queue_submit(self.queue, 1, ptr.from_ref(&submit), vk.NULL_HANDLE))?
+            (*state).submitted = index
+        }
+        return ok(index)
+    }
+
+    // A global memory barrier.
+    fn memory_barrier(&self, commands: vk.CommandBuffer, source_stages: u32, source_access: u32, destination_stages: u32, destination_access: u32) {
+        barrier := vk.MemoryBarrier.default()
+        barrier.src_access_mask = source_access
+        barrier.dst_access_mask = destination_access
+        unsafe {
+            self.fns.cmd_pipeline_barrier(commands, source_stages, destination_stages, 0, 1, ptr.from_ref(&barrier), 0, 0usize as *const vk.BufferMemoryBarrier, 0, 0usize as *const vk.ImageMemoryBarrier)
         }
     }
 
-    // A memory type with all of `wanted` that `requirements` allow,
-    // allocated; NULL_HANDLE when there is none or allocation fails.
-    fn allocate(&self, requirements: &vk.MemoryRequirements, wanted: u32) -> vk.DeviceMemory {
-        for i in 0u32..self.memory.memory_type_count {
-            flags := self.memory.memory_types[i as usize].property_flags
-            if (requirements.memory_type_bits >> i & 1) != 0 && (flags & wanted) == wanted {
-                info := vk.MemoryAllocateInfo.default()
-                info.allocation_size = requirements.size
-                info.memory_type_index = i
-                memory := vk.NULL_HANDLE
-                result := unsafe {
-                    self.fns.allocate_memory(self.device, ptr.from_ref(&info), vk.no_allocator(), ptr.from_mut(&mut memory))
-                }
-                if result == vk.SUCCESS {
-                    return memory
-                }
-            }
-        }
-        return vk.NULL_HANDLE
-    }
-
-    // Move a new image to the general layout and clear it.
-    fn initialize(&self, texture: &hal.Handle, depth: bool) -> void!hal.Error {
-        encoder := self.begin_encoder()?
-        commands := command_buffer(&encoder)
+    // An image layout transition, which also orders the stages and makes
+    // the accesses visible.
+    fn transition(&self, commands: vk.CommandBuffer, image: u64, depth: bool, old_layout: i32, new_layout: i32, source_stages: u32, source_access: u32, destination_stages: u32, destination_access: u32) {
         transition := vk.ImageMemoryBarrier.default()
-        transition.dst_access_mask = vk.ACCESS_MEMORY_READ_BIT | vk.ACCESS_MEMORY_WRITE_BIT
-        transition.old_layout = vk.IMAGE_LAYOUT_UNDEFINED
-        transition.new_layout = vk.IMAGE_LAYOUT_GENERAL
+        transition.src_access_mask = source_access
+        transition.dst_access_mask = destination_access
+        transition.old_layout = old_layout
+        transition.new_layout = new_layout
         transition.src_queue_family_index = vk.QUEUE_FAMILY_IGNORED
         transition.dst_queue_family_index = vk.QUEUE_FAMILY_IGNORED
-        transition.image = texture.a
+        transition.image = image
         transition.subresource_range = whole_image(depth)
-        range := whole_image(depth)
         unsafe {
-            self.fns.cmd_pipeline_barrier(commands, vk.PIPELINE_STAGE_TOP_OF_PIPE_BIT, vk.PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, 0usize as *const vk.MemoryBarrier, 0, 0usize as *const vk.BufferMemoryBarrier, 1, ptr.from_ref(&transition))
-            if depth {
-                value := vk.ClearDepthStencilValue { depth: 0.0, stencil: 0 }
-                self.fns.cmd_clear_depth_stencil_image(commands, texture.a, vk.IMAGE_LAYOUT_GENERAL, ptr.from_ref(&value), 1, ptr.from_ref(&range))
-            } else {
-                value := vk.ClearColorValue.default()
-                self.fns.cmd_clear_color_image(commands, texture.a, vk.IMAGE_LAYOUT_GENERAL, ptr.from_ref(&value), 1, ptr.from_ref(&range))
+            self.fns.cmd_pipeline_barrier(commands, source_stages, destination_stages, 0, 0, 0usize as *const vk.MemoryBarrier, 0, 0usize as *const vk.BufferMemoryBarrier, 1, ptr.from_ref(&transition))
+        }
+    }
+
+    fn create_view(&self, image: u64, format: vk.Format, depth: bool) -> u64!hal.Error {
+        view_info := vk.ImageViewCreateInfo.default()
+        view_info.image = image
+        view_info.view_type = vk.IMAGE_VIEW_TYPE_2D
+        view_info.format = format
+        view_info.subresource_range = whole_image(depth)
+        view := vk.NULL_HANDLE
+        unsafe {
+            check(self.fns.create_image_view(self.device, ptr.from_ref(&view_info), vk.no_allocator(), ptr.from_mut(&mut view)))?
+        }
+        return ok(view)
+    }
+
+    // A Recording with its pool reset: a spare one, or a new one.
+    fn recording(&self) -> *mut Recording!hal.Error {
+        state := self.state()
+        unsafe {
+            if (*state).spare_count != 0 {
+                (*state).spare_count -= 1
+                return ok((*state).spare[(*state).spare_count] as usize as *mut Recording)
             }
         }
-        return self.run(&mut encoder)
+        size := mem.size_of::<Recording>()
+        record := unsafe {
+            malloc(size) as *mut Recording
+        }
+        if unsafe {
+            record as usize
+        } == 0 {
+            return err(hal.Error.OutOfMemory)
+        }
+        unsafe {
+            ptr.write_bytes(record as *mut u8, 0u8, size)
+        }
+        pool_info := vk.CommandPoolCreateInfo.default()
+        pool_info.flags = vk.COMMAND_POOL_CREATE_TRANSIENT_BIT
+        pool_info.queue_family_index = self.family
+        pool := vk.NULL_HANDLE
+        result := unsafe {
+            self.fns.create_command_pool(self.device, ptr.from_ref(&pool_info), vk.no_allocator(), ptr.from_mut(&mut pool))
+        }
+        if result != vk.SUCCESS {
+            unsafe {
+                free(record as *mut u8)
+            }
+            return err(error_for(result))
+        }
+        commands := self.allocate_commands(pool, vk.COMMAND_BUFFER_LEVEL_PRIMARY)
+        if commands == 0 {
+            unsafe {
+                self.fns.destroy_command_pool(self.device, pool, vk.no_allocator())
+                free(record as *mut u8)
+            }
+            return err(hal.Error.OutOfMemory)
+        }
+        unsafe {
+            (*record).pool = pool
+            (*record).primary = commands
+        }
+        return ok(record)
+    }
+
+    // A command buffer of `level` from `pool`, or 0.
+    fn allocate_commands(&self, pool: u64, level: i32) -> u64 {
+        allocate := vk.CommandBufferAllocateInfo.default()
+        allocate.command_pool = pool
+        allocate.level = level
+        allocate.command_buffer_count = 1
+        commands := vk.null_handle::<vk.CommandBufferT>()
+        result := unsafe {
+            self.fns.allocate_command_buffers(self.device, ptr.from_ref(&allocate), ptr.from_mut(&mut commands))
+        }
+        if result != vk.SUCCESS {
+            return 0
+        }
+        return unsafe {
+            commands as usize as u64
+        }
+    }
+
+    // The next secondary command buffer of an encoder.
+    fn secondary(&self, record: *mut Recording) -> u64!hal.Error {
+        unsafe {
+            used := (*record).secondary_used as usize
+            if used < (*record).secondary_count as usize {
+                (*record).secondary_used += 1
+                return ok((*record).secondaries[used])
+            }
+            commands := self.allocate_commands((*record).pool, vk.COMMAND_BUFFER_LEVEL_SECONDARY)
+            if commands == 0 {
+                return err(hal.Error.OutOfMemory)
+            }
+            if used < SECONDARIES {
+                (*record).secondaries[used] = commands
+                (*record).secondary_count += 1
+                (*record).secondary_used += 1
+            } else {
+                (*record).overflow = true
+            }
+            return ok(commands)
+        }
+    }
+
+    // An encoder's submission finished, or it was abandoned: reset its
+    // pool for reuse.
+    fn recycle(&self, address: usize) {
+        record := unsafe {
+            address as *mut Recording
+        }
+        state := self.state()
+        unsafe {
+            if !(*record).overflow && (*state).spare_count < SPARE_RECORDINGS && self.fns.reset_command_pool(self.device, (*record).pool, 0) == vk.SUCCESS {
+                (*record).secondary_used = 0
+                (*record).secondary = 0
+                (*state).spare[(*state).spare_count] = address as u64
+                (*state).spare_count += 1
+                return
+            }
+            // Freeing the pool frees its command buffers.
+            self.fns.destroy_command_pool(self.device, (*record).pool, vk.no_allocator())
+            free(record as *mut u8)
+        }
+    }
+
+    // Make or remake a surface's per-frame semaphores and command buffers
+    // for `frames` frames in flight; 0 destroys them.
+    fn set_frames(&self, swap: *mut Swap, frames: u32) -> void!hal.Error {
+        existing := unsafe {
+            (*swap).frames
+        }
+        if existing == frames {
+            return ok()
+        }
+        alloc := vk.no_allocator()
+        for i in 0usize..existing as usize {
+            unsafe {
+                self.fns.destroy_semaphore(self.device, (*swap).acquired[i], alloc)
+                self.fns.destroy_command_pool(self.device, (*swap).pools[i], alloc)
+                (*swap).acquired[i] = 0
+                (*swap).pools[i] = 0
+                (*swap).done[i] = 0
+            }
+        }
+        unsafe {
+            (*swap).frames = 0
+            (*swap).slot = 0
+        }
+        for i in 0usize..frames as usize {
+            semaphore_info := vk.SemaphoreCreateInfo.default()
+            pool_info := vk.CommandPoolCreateInfo.default()
+            pool_info.flags = vk.COMMAND_POOL_CREATE_TRANSIENT_BIT
+            pool_info.queue_family_index = self.family
+            semaphore := vk.NULL_HANDLE
+            pool := vk.NULL_HANDLE
+            unsafe {
+                check(self.fns.create_semaphore(self.device, ptr.from_ref(&semaphore_info), alloc, ptr.from_mut(&mut semaphore)))?
+                created := self.fns.create_command_pool(self.device, ptr.from_ref(&pool_info), alloc, ptr.from_mut(&mut pool))
+                if created != vk.SUCCESS {
+                    self.fns.destroy_semaphore(self.device, semaphore, alloc)
+                    return err(error_for(created))
+                }
+                (*swap).acquired[i] = semaphore
+                (*swap).pools[i] = pool
+                (*swap).begin_commands[i] = self.allocate_commands(pool, vk.COMMAND_BUFFER_LEVEL_PRIMARY)
+                (*swap).end_commands[i] = self.allocate_commands(pool, vk.COMMAND_BUFFER_LEVEL_PRIMARY)
+                (*swap).frames = i as u32 + 1
+                if (*swap).begin_commands[i] == 0 || (*swap).end_commands[i] == 0 {
+                    return err(hal.Error.OutOfMemory)
+                }
+            }
+        }
+        return ok()
+    }
+
+    fn destroy_images(&self, swap: *mut Swap) {
+        alloc := vk.no_allocator()
+        unsafe {
+            for i in 0usize..(*swap).count as usize {
+                self.fns.destroy_image_view(self.device, (*swap).views[i], alloc)
+                self.fns.destroy_semaphore(self.device, (*swap).rendered[i], alloc)
+            }
+            (*swap).count = 0
+        }
+    }
+
+    // (Re)build a surface's swapchain for its requested size, or the
+    // window's own where the window system decides. Leaves no swapchain
+    // while the window has no area, as when it is minimized.
+    fn build_swapchain(&self, swap: *mut Swap) -> void!hal.Error {
+        alloc := vk.no_allocator()
+        self.destroy_images(swap)
+        surface := unsafe {
+            (*swap).surface
+        }
+        capabilities := vk.SurfaceCapabilitiesKHR.default()
+        unsafe {
+            check(self.instance_fns.get_physical_device_surface_capabilities_khr(self.physical, surface, ptr.from_mut(&mut capabilities)))?
+        }
+        if unsafe {
+            (*swap).hal_format
+        } == hal.FORMAT_NONE {
+            self.choose_format(swap)?
+        }
+        // A current extent of 0xffffffff lets the swapchain pick the size;
+        // a requested size of 0 means the window shows nothing.
+        width := capabilities.current_extent.width
+        height := capabilities.current_extent.height
+        requested := unsafe {
+            (*swap).requested_width == 0 || (*swap).requested_height == 0
+        }
+        if requested {
+            width = 0
+            height = 0
+        } else if width == 0xffffffff {
+            width = clamp(unsafe {
+                (*swap).requested_width
+            }, capabilities.min_image_extent.width, capabilities.max_image_extent.width)
+            height = clamp(unsafe {
+                (*swap).requested_height
+            }, capabilities.min_image_extent.height, capabilities.max_image_extent.height)
+        }
+        old := unsafe {
+            (*swap).swapchain
+        }
+        unsafe {
+            (*swap).swapchain = vk.NULL_HANDLE
+            (*swap).outdated = false
+            (*swap).width = width
+            (*swap).height = height
+        }
+        if width == 0 || height == 0 {
+            if old != vk.NULL_HANDLE {
+                unsafe {
+                    self.fns.destroy_swapchain_khr(self.device, old, alloc)
+                }
+            }
+            return ok()
+        }
+        count := capabilities.min_image_count + 1
+        if capabilities.max_image_count != 0 && count > capabilities.max_image_count {
+            count = capabilities.max_image_count
+        }
+        if count as usize > IMAGES {
+            count = IMAGES as u32
+        }
+        composite := vk.COMPOSITE_ALPHA_OPAQUE_BIT_KHR
+        if (capabilities.supported_composite_alpha & composite) == 0 {
+            // The lowest supported mode, such as inherit on some compositors.
+            composite = capabilities.supported_composite_alpha & (0u32 - capabilities.supported_composite_alpha)
+        }
+        usage := vk.IMAGE_USAGE_COLOR_ATTACHMENT_BIT | (capabilities.supported_usage_flags & (vk.IMAGE_USAGE_TRANSFER_SRC_BIT | vk.IMAGE_USAGE_TRANSFER_DST_BIT))
+        info := vk.SwapchainCreateInfoKHR.default()
+        info.surface = surface
+        info.min_image_count = count
+        info.image_format = unsafe {
+            (*swap).format
+        }
+        info.image_color_space = unsafe {
+            (*swap).color_space
+        }
+        info.image_extent.width = width
+        info.image_extent.height = height
+        info.image_array_layers = 1
+        info.image_usage = usage
+        info.image_sharing_mode = vk.SHARING_MODE_EXCLUSIVE
+        info.pre_transform = capabilities.current_transform
+        info.composite_alpha = composite
+        info.present_mode = self.present_mode(surface, unsafe {
+            (*swap).vsync
+        })
+        info.clipped = vk.TRUE
+        info.old_swapchain = old
+        swapchain := vk.NULL_HANDLE
+        created := unsafe {
+            self.fns.create_swapchain_khr(self.device, ptr.from_ref(&info), alloc, ptr.from_mut(&mut swapchain))
+        }
+        if old != vk.NULL_HANDLE {
+            unsafe {
+                self.fns.destroy_swapchain_khr(self.device, old, alloc)
+            }
+        }
+        check(created)?
+        unsafe {
+            (*swap).swapchain = swapchain
+        }
+        images := IMAGES as u32
+        list := [0u64; 8]
+        unsafe {
+            check(self.fns.get_swapchain_images_khr(self.device, swapchain, ptr.from_mut(&mut images), ptr.as_mut_ptr(&mut list)))?
+        }
+        format := unsafe {
+            (*swap).format
+        }
+        for i in 0usize..images as usize {
+            semaphore_info := vk.SemaphoreCreateInfo.default()
+            view := self.create_view(list[i], format, false)?
+            semaphore := vk.NULL_HANDLE
+            unsafe {
+                created_semaphore := self.fns.create_semaphore(self.device, ptr.from_ref(&semaphore_info), alloc, ptr.from_mut(&mut semaphore))
+                if created_semaphore != vk.SUCCESS {
+                    self.fns.destroy_image_view(self.device, view, alloc)
+                    return err(error_for(created_semaphore))
+                }
+                (*swap).images[i] = list[i]
+                (*swap).views[i] = view
+                (*swap).rendered[i] = semaphore
+                (*swap).count = i as u32 + 1
+            }
+        }
+        return ok()
+    }
+
+    // The surface's format: 8-bit sRGB BGRA or RGBA where possible.
+    fn choose_format(&self, swap: *mut Swap) -> void!hal.Error {
+        formats := unsafe {
+            vk.zeroed::<[64]vk.SurfaceFormatKHR>()
+        }
+        count := 64u32
+        unsafe {
+            check(self.instance_fns.get_physical_device_surface_formats_khr(self.physical, (*swap).surface, ptr.from_mut(&mut count), ptr.as_mut_ptr(&mut formats)))?
+        }
+        wanted := [vk.FORMAT_B8G8R8A8_SRGB, vk.FORMAT_R8G8B8A8_SRGB, vk.FORMAT_B8G8R8A8_UNORM, vk.FORMAT_R8G8B8A8_UNORM]
+        hal_formats := [hal.FORMAT_BGRA8_UNORM_SRGB, hal.FORMAT_RGBA8_UNORM_SRGB, hal.FORMAT_BGRA8_UNORM, hal.FORMAT_RGBA8_UNORM]
+        for w in 0usize..4 {
+            for i in 0usize..count as usize {
+                if formats[i].format == wanted[w] && formats[i].color_space == vk.COLOR_SPACE_SRGB_NONLINEAR_KHR {
+                    unsafe {
+                        (*swap).format = wanted[w]
+                        (*swap).color_space = formats[i].color_space
+                        (*swap).hal_format = hal_formats[w]
+                    }
+                    return ok()
+                }
+            }
+        }
+        return err(hal.Error.Unsupported)
+    }
+
+    // FIFO waits for the display; otherwise mailbox, or immediate.
+    fn present_mode(&self, surface: u64, vsync: bool) -> vk.PresentModeKHR {
+        if vsync {
+            return vk.PRESENT_MODE_FIFO_KHR
+        }
+        modes := [0i32; 16]
+        count := 16u32
+        unsafe {
+            self.instance_fns.get_physical_device_surface_present_modes_khr(self.physical, surface, ptr.from_mut(&mut count), ptr.as_mut_ptr(&mut modes))
+        }
+        chosen := vk.PRESENT_MODE_FIFO_KHR
+        for i in 0usize..count as usize {
+            if modes[i] == vk.PRESENT_MODE_MAILBOX_KHR {
+                return vk.PRESENT_MODE_MAILBOX_KHR
+            }
+            if modes[i] == vk.PRESENT_MODE_IMMEDIATE_KHR {
+                chosen = vk.PRESENT_MODE_IMMEDIATE_KHR
+            }
+        }
+        return chosen
     }
 
     // A pipeline layout with one push-descriptor set holding `bindings`:
@@ -1074,11 +1629,349 @@ pub struct Device: hal.Backend {
         alloc := vk.no_allocator()
         unsafe {
             self.fns.device_wait_idle(self.device)
+            for i in 0usize..self.state.spare_count {
+                record := self.state.spare[i] as usize as *mut Recording
+                self.fns.destroy_command_pool(self.device, (*record).pool, alloc)
+                free(record as *mut u8)
+            }
+            self.state.spare_count = 0
+        }
+        self.allocator.destroy(&self.fns, self.device)
+        unsafe {
             self.fns.destroy_semaphore(self.device, self.timeline, alloc)
             self.fns.destroy_device(self.device, alloc)
             self.instance_fns.destroy_instance(self.instance, alloc)
         }
     }
+}
+
+// Open a device, one that can present to `window` when given.
+fn open_device(window: Option<&handle.NativeHandle>, debug: bool) -> Device!hal.Error {
+    library := match vk.open() {
+        ok(library) => library,
+        err(_) => {
+            return err(hal.Error.NoBackend)
+        }
+    }
+    entry := library.entry()
+    version := vk.make_api_version(0, 1, 0, 0)
+    unsafe {
+        if entry.enumerate_instance_version as usize != 0 {
+            entry.enumerate_instance_version(ptr.from_mut(&mut version))
+        }
+    }
+    if version < vk.API_VERSION_1_2 {
+        return err(hal.Error.Unsupported)
+    }
+    surfaces := 0u32
+    instance := create_instance(&entry, debug, &mut surfaces)?
+    instance_fns := unsafe {
+        library.instance(instance)
+    }
+    // A surface for the window, only to pick a device that can show it.
+    probe := vk.NULL_HANDLE
+    match window {
+        some(native) => {
+            if (surfaces & surface_kind(native)) == 0 {
+                unsafe {
+                    instance_fns.destroy_instance(instance, vk.no_allocator())
+                }
+                return err(hal.Error.Unsupported)
+            }
+            probe = match create_vk_surface(&instance_fns, instance, native) {
+                ok(surface) => surface,
+                err(error) => {
+                    unsafe {
+                        instance_fns.destroy_instance(instance, vk.no_allocator())
+                    }
+                    return err(error)
+                }
+            }
+        }
+        none => {}
+    }
+    chosen := choose_device(&instance_fns, instance, probe)
+    if probe != vk.NULL_HANDLE {
+        unsafe {
+            instance_fns.destroy_surface_khr(instance, probe, vk.no_allocator())
+        }
+    }
+    choice := match chosen {
+        ok(choice) => choice,
+        err(error) => {
+            unsafe {
+                instance_fns.destroy_instance(instance, vk.no_allocator())
+            }
+            return err(error)
+        }
+    }
+    device := match create_device(&instance_fns, &choice) {
+        ok(device) => device,
+        err(error) => {
+            unsafe {
+                instance_fns.destroy_instance(instance, vk.no_allocator())
+            }
+            return err(error)
+        }
+    }
+    fns := unsafe {
+        vk.device_fns(&instance_fns, device)
+    }
+    queue := vk.null_handle::<vk.QueueT>()
+    unsafe {
+        fns.get_device_queue(device, choice.family, 0, ptr.from_mut(&mut queue))
+    }
+    // Each submission signals the timeline with its number.
+    timeline_type := vk.SemaphoreTypeCreateInfo.default()
+    timeline_type.semaphore_type = vk.SEMAPHORE_TYPE_TIMELINE
+    semaphore_info := vk.SemaphoreCreateInfo.default()
+    semaphore_info.p_next = unsafe {
+        ptr.from_ref(&timeline_type) as *const u8
+    }
+    timeline := vk.NULL_HANDLE
+    created := unsafe {
+        fns.create_semaphore(device, ptr.from_ref(&semaphore_info), vk.no_allocator(), ptr.from_mut(&mut timeline))
+    }
+    push := unsafe {
+        device_command(&instance_fns, device, b"vkCmdPushDescriptorSetKHR\0", b"vkCmdPushDescriptorSet\0")
+    }
+    begin := unsafe {
+        device_command(&instance_fns, device, b"vkCmdBeginRenderingKHR\0", b"vkCmdBeginRendering\0")
+    }
+    end := unsafe {
+        device_command(&instance_fns, device, b"vkCmdEndRenderingKHR\0", b"vkCmdEndRendering\0")
+    }
+    memory_properties := vk.PhysicalDeviceMemoryProperties.default()
+    properties := vk.PhysicalDeviceProperties.default()
+    unsafe {
+        instance_fns.get_physical_device_memory_properties(choice.physical, ptr.from_mut(&mut memory_properties))
+        instance_fns.get_physical_device_properties(choice.physical, ptr.from_mut(&mut properties))
+    }
+    allocator := match memory.Allocator.new(&memory_properties, properties.limits.non_coherent_atom_size) {
+        ok(allocator) => allocator,
+        err(error) => {
+            unsafe {
+                if created == vk.SUCCESS {
+                    fns.destroy_semaphore(device, timeline, vk.no_allocator())
+                }
+                fns.destroy_device(device, vk.no_allocator())
+                instance_fns.destroy_instance(instance, vk.no_allocator())
+            }
+            return err(error)
+        }
+    }
+    if created != vk.SUCCESS || push == 0 || begin == 0 || end == 0 {
+        unsafe {
+            if created == vk.SUCCESS {
+                fns.destroy_semaphore(device, timeline, vk.no_allocator())
+            }
+            fns.destroy_device(device, vk.no_allocator())
+            instance_fns.destroy_instance(instance, vk.no_allocator())
+        }
+        allocator.destroy(&fns, device)
+        return err(hal.Error.Unsupported)
+    }
+    return ok(Device {
+        library: library,
+        instance: instance,
+        instance_fns: instance_fns,
+        physical: choice.physical,
+        device: device,
+        fns: fns,
+        queue: queue,
+        family: choice.family,
+        timeline: timeline,
+        push_descriptor_set: unsafe {
+            push as vk.PfnCmdPushDescriptorSet
+        },
+        begin_rendering: unsafe {
+            begin as vk.PfnCmdBeginRendering
+        },
+        end_rendering: unsafe {
+            end as vk.PfnCmdEndRendering
+        },
+        properties: properties,
+        allocator: allocator,
+        max_allocation: choice.max_allocation,
+        surfaces: surfaces,
+        swapchains: choice.swapchain,
+        unmapped: unsafe {
+            getenv(ptr.as_ptr(b"DODO_GPU_UNMAPPED\0")) as usize != 0
+        },
+        state: State { submitted: 0, spare: [0u64; 16], spare_count: 0 }
+    })
+}
+
+// The command buffer an encoder records into outside render passes.
+fn primary(encoder: &hal.Handle) -> vk.CommandBuffer {
+    unsafe {
+        return encoder.b as usize as vk.CommandBuffer
+    }
+}
+
+// The command buffer draws record into: the open render pass's secondary
+// one, or the primary one.
+fn current(encoder: &hal.Handle) -> vk.CommandBuffer {
+    if encoder.c == 1 {
+        unsafe {
+            return (*recording_of(encoder)).secondary as usize as vk.CommandBuffer
+        }
+    }
+    return primary(encoder)
+}
+
+fn recording_of(encoder: &hal.Handle) -> *mut Recording {
+    return unsafe {
+        encoder.a as usize as *mut Recording
+    }
+}
+
+fn swap_of(surface: &hal.Handle) -> *mut Swap {
+    return unsafe {
+        surface.a as usize as *mut Swap
+    }
+}
+
+// The pipeline stages of USE_* bits.
+fn stages(usage: u32) -> u32 {
+    flags := 0u32
+    if (usage & (hal.USE_VERTEX_INPUT | hal.USE_INDEX)) != 0 {
+        flags = flags | vk.PIPELINE_STAGE_VERTEX_INPUT_BIT
+    }
+    if (usage & hal.USE_VERTEX_READ) != 0 {
+        flags = flags | vk.PIPELINE_STAGE_VERTEX_SHADER_BIT
+    }
+    if (usage & (hal.USE_FRAGMENT_READ | hal.USE_FRAGMENT_WRITE)) != 0 {
+        flags = flags | vk.PIPELINE_STAGE_FRAGMENT_SHADER_BIT
+    }
+    if (usage & (hal.USE_COMPUTE_READ | hal.USE_COMPUTE_WRITE)) != 0 {
+        flags = flags | vk.PIPELINE_STAGE_COMPUTE_SHADER_BIT
+    }
+    if (usage & hal.USE_COLOR) != 0 {
+        flags = flags | vk.PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
+    }
+    if (usage & hal.USE_DEPTH) != 0 {
+        flags = flags | vk.PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | vk.PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT
+    }
+    if (usage & (hal.USE_COPY_SRC | hal.USE_COPY_DST)) != 0 {
+        flags = flags | vk.PIPELINE_STAGE_TRANSFER_BIT
+    }
+    if flags == 0 {
+        return vk.PIPELINE_STAGE_TOP_OF_PIPE_BIT
+    }
+    return flags
+}
+
+// The memory accesses of USE_* bits.
+fn accesses(usage: u32) -> u32 {
+    flags := 0u32
+    if (usage & hal.USE_VERTEX_INPUT) != 0 {
+        flags = flags | vk.ACCESS_VERTEX_ATTRIBUTE_READ_BIT
+    }
+    if (usage & hal.USE_INDEX) != 0 {
+        flags = flags | vk.ACCESS_INDEX_READ_BIT
+    }
+    if (usage & (hal.USE_VERTEX_READ | hal.USE_FRAGMENT_READ | hal.USE_COMPUTE_READ)) != 0 {
+        flags = flags | vk.ACCESS_SHADER_READ_BIT | vk.ACCESS_UNIFORM_READ_BIT
+    }
+    if (usage & (hal.USE_FRAGMENT_WRITE | hal.USE_COMPUTE_WRITE)) != 0 {
+        flags = flags | vk.ACCESS_SHADER_READ_BIT | vk.ACCESS_SHADER_WRITE_BIT
+    }
+    if (usage & hal.USE_COLOR) != 0 {
+        flags = flags | vk.ACCESS_COLOR_ATTACHMENT_READ_BIT | vk.ACCESS_COLOR_ATTACHMENT_WRITE_BIT
+    }
+    if (usage & hal.USE_DEPTH) != 0 {
+        flags = flags | vk.ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | vk.ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT
+    }
+    if (usage & hal.USE_COPY_SRC) != 0 {
+        flags = flags | vk.ACCESS_TRANSFER_READ_BIT
+    }
+    if (usage & hal.USE_COPY_DST) != 0 {
+        flags = flags | vk.ACCESS_TRANSFER_WRITE_BIT
+    }
+    return flags
+}
+
+// The writes among the accesses of USE_* bits: what a barrier's first half
+// makes available. Reads need only the execution dependency.
+fn write_accesses(usage: u32) -> u32 {
+    flags := 0u32
+    if (usage & (hal.USE_FRAGMENT_WRITE | hal.USE_COMPUTE_WRITE)) != 0 {
+        flags = flags | vk.ACCESS_SHADER_WRITE_BIT
+    }
+    if (usage & hal.USE_COLOR) != 0 {
+        flags = flags | vk.ACCESS_COLOR_ATTACHMENT_WRITE_BIT
+    }
+    if (usage & hal.USE_DEPTH) != 0 {
+        flags = flags | vk.ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT
+    }
+    if (usage & hal.USE_COPY_DST) != 0 {
+        flags = flags | vk.ACCESS_TRANSFER_WRITE_BIT
+    }
+    return flags
+}
+
+// Window systems, as bits of Device.surfaces.
+const SURFACE_XCB: u32 = 1
+const SURFACE_WIN32: u32 = 2
+
+fn surface_kind(native: &handle.NativeHandle) -> u32 {
+    match native {
+        handle.NativeHandle.Xcb(_, _, _, _) => {
+            return SURFACE_XCB
+        }
+        handle.NativeHandle.Win32(_, _) => {
+            return SURFACE_WIN32
+        }
+        handle.NativeHandle.AppKit(_, _) => {
+            // MoltenVK draws into a CAMetalLayer, which std/gpu sets up
+            // only for its Metal backend.
+            return 0
+        }
+    }
+}
+
+fn create_vk_surface(fns: &vk.InstanceFns, instance: vk.Instance, native: &handle.NativeHandle) -> vk.SurfaceKHR!hal.Error {
+    alloc := vk.no_allocator()
+    surface := vk.NULL_HANDLE
+    match native {
+        handle.NativeHandle.Xcb(connection, window_id, _, _) => {
+            info := vk.XcbSurfaceCreateInfoKHR.default()
+            info.connection = unsafe {
+                *connection as *mut u8
+            }
+            info.window = *window_id
+            unsafe {
+                check(fns.create_xcb_surface_khr(instance, ptr.from_ref(&info), alloc, ptr.from_mut(&mut surface)))?
+            }
+        }
+        handle.NativeHandle.Win32(hwnd, module) => {
+            info := vk.Win32SurfaceCreateInfoKHR.default()
+            info.hinstance = unsafe {
+                *module as *mut u8
+            }
+            info.hwnd = unsafe {
+                *hwnd as *mut u8
+            }
+            unsafe {
+                check(fns.create_win32_surface_khr(instance, ptr.from_ref(&info), alloc, ptr.from_mut(&mut surface)))?
+            }
+        }
+        handle.NativeHandle.AppKit(_, _) => {
+            return err(hal.Error.Unsupported)
+        }
+    }
+    return ok(surface)
+}
+
+fn clamp(value: u32, low: u32, high: u32) -> u32 {
+    if value < low {
+        return low
+    }
+    if value > high {
+        return high
+    }
+    return value
 }
 
 // The physical device open() picked, and what it needs enabled.
@@ -1092,6 +1985,7 @@ struct Choice {
     portability_subset: bool
     robust: bool
     fragment_stores: bool
+    swapchain: bool
 }
 
 const KHR_PUSH_DESCRIPTOR: &[u8] = b"VK_KHR_push_descriptor\0"
@@ -1100,7 +1994,9 @@ const KHR_DEPTH_STENCIL_RESOLVE: &[u8] = b"VK_KHR_depth_stencil_resolve\0"
 const KHR_CREATE_RENDERPASS2: &[u8] = b"VK_KHR_create_renderpass2\0"
 const VALIDATION_LAYER: &[u8] = b"VK_LAYER_KHRONOS_validation\0"
 
-fn create_instance(entry: &vk.EntryFns, debug: bool) -> vk.Instance!hal.Error {
+// The instance, with every window system surface extension the loader
+// offers; `surfaces` gets their SURFACE_* bits.
+fn create_instance(entry: &vk.EntryFns, debug: bool, surfaces: &mut u32) -> vk.Instance!hal.Error {
     // MoltenVK is a portability driver: the loader lists it only for
     // instances that enable VK_KHR_portability_enumeration.
     extensions := unsafe {
@@ -1111,9 +2007,22 @@ fn create_instance(entry: &vk.EntryFns, debug: bool) -> vk.Instance!hal.Error {
         entry.enumerate_instance_extension_properties(0usize as *const u8, ptr.from_mut(&mut extension_count), ptr.as_mut_ptr(&mut extensions))
     }
     portability := false
+    surface := false
+    xcb := false
+    win32 := false
     for i in 0usize..extension_count as usize {
-        if vk.name_eq(&extensions[i].extension_name, vk.KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME) {
+        let name: &[u8] = &extensions[i].extension_name
+        if vk.name_eq(name, vk.KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME) {
             portability = true
+        }
+        if vk.name_eq(name, vk.KHR_SURFACE_EXTENSION_NAME) {
+            surface = true
+        }
+        if vk.name_eq(name, vk.KHR_XCB_SURFACE_EXTENSION_NAME) {
+            xcb = true
+        }
+        if vk.name_eq(name, vk.KHR_WIN32_SURFACE_EXTENSION_NAME) {
+            win32 = true
         }
     }
     validation := false
@@ -1131,7 +2040,25 @@ fn create_instance(entry: &vk.EntryFns, debug: bool) -> vk.Instance!hal.Error {
             }
         }
     }
-    enabled_extensions := [ptr.as_ptr(vk.KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME)]
+    enabled_extensions := [ptr.as_ptr(vk.KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME); 4]
+    enabled_count := 0usize
+    if portability {
+        enabled_count = 1
+    }
+    if surface {
+        enabled_extensions[enabled_count] = ptr.as_ptr(vk.KHR_SURFACE_EXTENSION_NAME)
+        enabled_count += 1
+        if xcb {
+            enabled_extensions[enabled_count] = ptr.as_ptr(vk.KHR_XCB_SURFACE_EXTENSION_NAME)
+            enabled_count += 1
+            *surfaces = *surfaces | SURFACE_XCB
+        }
+        if win32 {
+            enabled_extensions[enabled_count] = ptr.as_ptr(vk.KHR_WIN32_SURFACE_EXTENSION_NAME)
+            enabled_count += 1
+            *surfaces = *surfaces | SURFACE_WIN32
+        }
+    }
     enabled_layers := [ptr.as_ptr(VALIDATION_LAYER)]
     app := vk.ApplicationInfo.default()
     app.p_application_name = ptr.as_ptr(b"dodo std/gpu\0")
@@ -1142,9 +2069,9 @@ fn create_instance(entry: &vk.EntryFns, debug: bool) -> vk.Instance!hal.Error {
     info.p_application_info = ptr.from_ref(&app)
     if portability {
         info.flags = vk.INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR
-        info.enabled_extension_count = 1
-        info.pp_enabled_extension_names = ptr.as_ptr(&enabled_extensions)
     }
+    info.enabled_extension_count = enabled_count as u32
+    info.pp_enabled_extension_names = ptr.as_ptr(&enabled_extensions)
     if validation {
         info.enabled_layer_count = 1
         info.pp_enabled_layer_names = ptr.as_ptr(&enabled_layers)
@@ -1163,8 +2090,9 @@ fn create_instance(entry: &vk.EntryFns, debug: bool) -> vk.Instance!hal.Error {
 }
 
 // The best GPU with what std/gpu needs: a discrete GPU before an
-// integrated one, before anything else.
-fn choose_device(fns: &vk.InstanceFns, instance: vk.Instance) -> Choice!hal.Error {
+// integrated one, before anything else. With a `surface`, only GPUs whose
+// queue presents to it count.
+fn choose_device(fns: &vk.InstanceFns, instance: vk.Instance, surface: vk.SurfaceKHR) -> Choice!hal.Error {
     devices := [vk.null_handle::<vk.PhysicalDeviceT>(); 16]
     count := 16u32
     unsafe {
@@ -1174,9 +2102,9 @@ fn choose_device(fns: &vk.InstanceFns, instance: vk.Instance) -> Choice!hal.Erro
         return err(hal.Error.NoBackend)
     }
     best := -1i32
-    chosen := Choice { physical: devices[0], properties: vk.PhysicalDeviceProperties.default(), family: 0, max_allocation: 0, push_extension: false, rendering_extension: false, portability_subset: false, robust: false, fragment_stores: false }
+    chosen := Choice { physical: devices[0], properties: vk.PhysicalDeviceProperties.default(), family: 0, max_allocation: 0, push_extension: false, rendering_extension: false, portability_subset: false, robust: false, fragment_stores: false, swapchain: false }
     for i in 0usize..count as usize {
-        match inspect(fns, devices[i]) {
+        match inspect(fns, devices[i], surface) {
             some(choice) => {
                 score := 0i32
                 kind := choice.properties.device_type
@@ -1201,8 +2129,9 @@ fn choose_device(fns: &vk.InstanceFns, instance: vk.Instance) -> Choice!hal.Erro
     return ok(chosen)
 }
 
-// What `physical` offers, or none when it lacks something std/gpu needs.
-fn inspect(fns: &vk.InstanceFns, physical: vk.PhysicalDevice) -> Option<Choice> {
+// What `physical` offers, or none when it lacks something std/gpu needs
+// or cannot present to `surface` (when not null).
+fn inspect(fns: &vk.InstanceFns, physical: vk.PhysicalDevice, surface: vk.SurfaceKHR) -> Option<Choice> {
     properties := vk.PhysicalDeviceProperties.default()
     unsafe {
         fns.get_physical_device_properties(physical, ptr.from_mut(&mut properties))
@@ -1228,6 +2157,16 @@ fn inspect(fns: &vk.InstanceFns, physical: vk.PhysicalDevice) -> Option<Choice> 
     if family == family_count {
         return none
     }
+    if surface != vk.NULL_HANDLE {
+        supported := vk.FALSE
+        unsafe {
+            fns.get_physical_device_surface_support_khr(physical, family, surface, ptr.from_mut(&mut supported))
+        }
+        if supported != vk.TRUE {
+            return none
+        }
+    }
+    swapchain := false
     push_extension := false
     rendering_extension := false
     portability_subset := false
@@ -1253,6 +2192,12 @@ fn inspect(fns: &vk.InstanceFns, physical: vk.PhysicalDevice) -> Option<Choice> 
         if vk.name_eq(name, vk.KHR_PORTABILITY_SUBSET_EXTENSION_NAME) {
             portability_subset = true
         }
+        if vk.name_eq(name, vk.KHR_SWAPCHAIN_EXTENSION_NAME) {
+            swapchain = true
+        }
+    }
+    if surface != vk.NULL_HANDLE && !swapchain {
+        return none
     }
     if !has_push || !has_rendering {
         return none
@@ -1289,7 +2234,8 @@ fn inspect(fns: &vk.InstanceFns, physical: vk.PhysicalDevice) -> Option<Choice> 
         rendering_extension: rendering_extension,
         portability_subset: portability_subset,
         robust: features.features.robust_buffer_access != 0,
-        fragment_stores: features.features.fragment_stores_and_atomics != 0
+        fragment_stores: features.features.fragment_stores_and_atomics != 0,
+        swapchain: swapchain
     })
 }
 
@@ -1315,6 +2261,10 @@ fn create_device(fns: &vk.InstanceFns, choice: &Choice) -> vk.Device!hal.Error {
     }
     if choice.portability_subset {
         names[count] = ptr.as_ptr(vk.KHR_PORTABILITY_SUBSET_EXTENSION_NAME)
+        count += 1
+    }
+    if choice.swapchain {
+        names[count] = ptr.as_ptr(vk.KHR_SWAPCHAIN_EXTENSION_NAME)
         count += 1
     }
     rendering := vk.PhysicalDeviceDynamicRenderingFeatures.default()
@@ -1366,12 +2316,6 @@ unsafe fn device_command(fns: &vk.InstanceFns, device: vk.Device, extension: &[u
             address = fns.get_device_proc_addr(device, ptr.as_ptr(core_name)) as usize
         }
         return address
-    }
-}
-
-fn command_buffer(encoder: &hal.Handle) -> vk.CommandBuffer {
-    unsafe {
-        return encoder.b as usize as vk.CommandBuffer
     }
 }
 
@@ -1464,11 +2408,6 @@ fn literal_equals(words: &[u32], text: &[u8]) -> bool {
     return true
 }
 
-fn copy_size(descriptor: &hal.TextureDescriptor, region: &hal.Region, bytes_per_row: u32) -> u64 {
-    row := region.width as u64 * hal.texel_size(descriptor.format) as u64
-    return (region.height as u64 - 1) * bytes_per_row as u64 + row
-}
-
 fn image_copy(descriptor: &hal.TextureDescriptor, region: &hal.Region, offset: u64, bytes_per_row: u32) -> vk.BufferImageCopy {
     aspect := vk.IMAGE_ASPECT_COLOR_BIT
     if hal.is_depth(descriptor.format) {
@@ -1492,15 +2431,14 @@ fn whole_image(depth: bool) -> vk.ImageSubresourceRange {
     return vk.ImageSubresourceRange { aspect_mask: aspect, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 }
 }
 
-fn clear_color(pass: &hal.RenderPassInfo) -> vk.ClearColorValue {
-    format := pass.color_format
+fn clear_color(format: u32, red: f64, green: f64, blue: f64, alpha: f64) -> vk.ClearColorValue {
     if format == hal.FORMAT_R32_SINT {
-        return vk.clear_color_int(pass.clear_red as i32, pass.clear_green as i32, pass.clear_blue as i32, pass.clear_alpha as i32)
+        return vk.clear_color_int(red as i32, green as i32, blue as i32, alpha as i32)
     }
     if hal.is_integer(format) {
-        return vk.clear_color_uint(unsigned(pass.clear_red), unsigned(pass.clear_green), unsigned(pass.clear_blue), unsigned(pass.clear_alpha))
+        return vk.clear_color_uint(unsigned(red), unsigned(green), unsigned(blue), unsigned(alpha))
     }
-    return vk.clear_color_float(pass.clear_red as f32, pass.clear_green as f32, pass.clear_blue as f32, pass.clear_alpha as f32)
+    return vk.clear_color_float(red as f32, green as f32, blue as f32, alpha as f32)
 }
 
 fn unsigned(value: f64) -> u32 {
@@ -1514,7 +2452,9 @@ fn unsigned(value: f64) -> u32 {
 }
 
 fn buffer_usage(usage: u32) -> vk.BufferUsageFlags {
-    flags := 0u32
+    // std/gpu copies staged writes into every buffer, clears unmapped
+    // ones, and copies out of them to read them.
+    flags := vk.BUFFER_USAGE_TRANSFER_SRC_BIT | vk.BUFFER_USAGE_TRANSFER_DST_BIT
     if (usage & hal.BUFFER_COPY_SRC) != 0 {
         flags = flags | vk.BUFFER_USAGE_TRANSFER_SRC_BIT
     }

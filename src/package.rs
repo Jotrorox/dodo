@@ -425,6 +425,9 @@ fn load_internal(
                     .to_owned()
                     .into());
             }
+            if function.wgsl && !matches!(&key, ModuleId::Bundled(path) if path == "std/gpu") {
+                return Err("@compiler(wgsl) is reserved for std/gpu".to_owned().into());
+            }
         }
         if key == root {
             program.package = module.program.package.clone();

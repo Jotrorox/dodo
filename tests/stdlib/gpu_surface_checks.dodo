@@ -1,0 +1,182 @@
+package main
+
+import "std/console"
+import "std/gpu"
+import "std/window"
+
+// gpu.Surface on every backend this machine has, each in a window of its
+// own. Every frame is cleared to a color of its own and copied into a
+// buffer before it is presented, so the pixels can be checked; more frames
+// than can be in flight are drawn without waiting. Prints "passed" when at
+// least one backend ran every check and exits 2 when none could present.
+
+fn main() -> i32 {
+    app := match window.App.new() {
+        ok(app) => app,
+        err(error) => {
+            console.printf("no window: {}\n", window.error_name(error))!
+            return 2
+        }
+    }
+    ran := 0
+    if run(&mut app, gpu.Preference.Vulkan, "Vulkan", 200) {
+        ran += 1
+    }
+    if run(&mut app, gpu.Preference.Metal, "Metal", 220) {
+        ran += 1
+    }
+    if run(&mut app, gpu.Preference.OpenGl, "OpenGL", 240) {
+        ran += 1
+    }
+    if ran == 0 {
+        console.println("no backend")!
+        return 2
+    }
+    console.println("passed")!
+    return 0
+}
+
+fn run(app: &mut window.App, preference: gpu.Preference, label: &str, width: u32) -> bool {
+    win := match app.open(window.Options.gpu(label, width, 150)) {
+        ok(win) => win,
+        err(error) => {
+            console.printf("skip {}: no window: {}\n", label, window.error_name(error))!
+            return false
+        }
+    }
+    native := match win.native_handle() {
+        ok(native) => native,
+        err(_) => {
+            console.printf("skip {}: no native handle\n", label)!
+            return false
+        }
+    }
+    device := match gpu.Device.open_for_window(&native, gpu.Options.with_backend(preference)) {
+        ok(device) => device,
+        err(error) => {
+            console.printf("skip {}: {}\n", label, gpu.error_name(error))!
+            return false
+        }
+    }
+    console.printf("{}: {}\n", label, device.name())!
+    match checks(&device, &mut win) {
+        ok() => {}
+        err(error) => {
+            console.printf("{} failed: {}\n", label, gpu.error_name(error))!
+            assert(false, "a check returned an error")
+        }
+    }
+    console.printf("{} ok\n", label)!
+    return true
+}
+
+const COLORS: [6]u32 = [0xff0000ff, 0xff00ff00, 0xffff0000, 0xffffffff, 0xff00ffff, 0xffff00ff]
+
+fn checks(device: &gpu.Device, win: &mut window.Window) -> void!gpu.Error {
+    native := match win.native_handle() {
+        ok(native) => native,
+        err(_) => {
+            return err(gpu.Error.System)
+        }
+    }
+    options := gpu.SurfaceOptions.default()
+    options.vsync = false
+    options.frames_in_flight = 3
+    surface := gpu.Surface.create_with(device, &native, win.width(), win.height(), options)?
+    format := surface.format()
+    assert(format == gpu.FORMAT_BGRA8_UNORM_SRGB || format == gpu.FORMAT_RGBA8_UNORM_SRGB, "an 8-bit sRGB surface format")
+    assert(surface.width() == win.width() && surface.height() == win.height(), "the surface has the window's size")
+    console.println("  format")!
+
+    // Twelve frames, each copied into its own part of one buffer.
+    row := surface.width() * 4
+    size := row as u64 * surface.height() as u64
+    readback := device.create_buffer(size * 12, gpu.BUFFER_COPY_DST | gpu.BUFFER_COPY_SRC)?
+    for i in 0u32..12 {
+        draw_frame(device, &mut surface, &readback, size * i as u64, COLORS[(i % 6) as usize])?
+    }
+    device.wait()?
+    for i in 0u32..12 {
+        expect_frame(device, &readback, size * i as u64, row, surface.height(), format, COLORS[(i % 6) as usize])?
+    }
+    console.println("  frames")!
+
+    // A surface of no size has nothing to acquire until it is resized.
+    surface.resize(0, 0)?
+    match surface.acquire() {
+        ok(_) => {
+            assert(false, "acquired an image of no size")
+        }
+        err(gpu.Error.Outdated) => {}
+        err(error) => {
+            return err(error)
+        }
+    }
+    surface.resize(win.width(), win.height())?
+    draw_frame(device, &mut surface, &readback, 0, COLORS[3])?
+    device.wait()?
+    expect_frame(device, &readback, 0, row, surface.height(), format, COLORS[3])?
+    console.println("  resize")!
+
+    // Writes made for a frame, without waiting, reach the frame: a CPU
+    // image copied straight into the window.
+    {
+        frame := surface.acquire()?
+        pixels := [0u32; 64]
+        for i in 0usize..64 {
+            pixels[i] = surface_pixel(COLORS[4], format)
+        }
+        texture := frame.texture()
+        device.write_texture(texture, gpu.Region.new(0, 0, 8, 8), gpu.u32_bytes(&pixels), 32)?
+        encoder := device.encoder()?
+        encoder.copy_texture_to_buffer(texture, gpu.Region.new(0, 0, 8, 8), &readback, 0, row)
+        encoder.submit()?
+        frame.present()?
+    }
+    device.wait()?
+    texel := [0u32; 1]
+    device.read_buffer(&readback, 0, gpu.u32_bytes_mut(&mut texel))?
+    assert(texel[0] == surface_pixel(COLORS[4], format), "a written texel")
+    console.println("  writes")!
+    return ok()
+}
+
+// Clear the next image to `color` (RGBA bytes), copy it into `readback`
+// at `offset` and present it.
+fn draw_frame(device: &gpu.Device, surface: &mut gpu.Surface, readback: &gpu.Buffer, offset: u64, color: u32) -> void!gpu.Error {
+    frame := surface.acquire()?
+    texture := frame.texture()
+    encoder := device.encoder()?
+    {
+        red := (color & 255) as f64 / 255.0
+        green := (color >> 8 & 255) as f64 / 255.0
+        blue := (color >> 16 & 255) as f64 / 255.0
+        attachment := gpu.ColorAttachment.clear(texture, red, green, blue, 1.0)
+        pass := encoder.render_pass(attachment)
+        pass.end()
+    }
+    encoder.copy_texture_to_buffer(texture, texture.region(), readback, offset, texture.bytes_per_row())
+    encoder.submit()?
+    return frame.present()
+}
+
+fn expect_frame(device: &gpu.Device, readback: &gpu.Buffer, offset: u64, row: u32, height: u32, format: u32, color: u32) -> void!gpu.Error {
+    wanted := surface_pixel(color, format)
+    corners := [0u32; 1]
+    device.read_buffer(readback, offset, gpu.u32_bytes_mut(&mut corners))?
+    first := corners[0]
+    device.read_buffer(readback, offset + (height as u64 - 1) * row as u64 + row as u64 - 4, gpu.u32_bytes_mut(&mut corners))?
+    if first != wanted || corners[0] != wanted {
+        console.printf("frame pixels {} and {}, expected {}\n", first, corners[0], wanted)!
+        assert(false, "wrong frame color")
+    }
+    return ok()
+}
+
+// An RGBA color as the surface's format stores it.
+fn surface_pixel(color: u32, format: u32) -> u32 {
+    if format == gpu.FORMAT_BGRA8_UNORM_SRGB {
+        return (color & 0xff00ff00) | (color >> 16 & 255) | ((color & 255) << 16)
+    }
+    return color
+}

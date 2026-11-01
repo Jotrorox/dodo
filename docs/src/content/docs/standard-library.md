@@ -289,6 +289,7 @@ select providers; they are not additional recommended starting paths.
 | `std/script/posix` | Lua host boundary on Linux and macOS (C library streams, processes, time, locale); use [Lua](script.md#platforms). |
 | `std/script/windows` | Lua host boundary on Windows; use [Lua](script.md#platforms). |
 | `std/gpu/hal/vulkan` | `std/gpu`'s Vulkan backend; use [GPU programming](gpu.md). |
+| `std/gpu/hal/vulkan/memory` | The Vulkan backend's memory sub-allocator; use [GPU programming](gpu.md). |
 | `std/gpu/hal/opengl` | `std/gpu`'s OpenGL backend; use [GPU programming](gpu.md). |
 | `std/gpu/hal/macos` | `std/gpu`'s Metal backend, its native one on macOS; use [GPU programming](gpu.md). |
 | `std/gpu/hal/linux` | `std/gpu`'s native backend on Linux, which has none; use [GPU programming](gpu.md). |
