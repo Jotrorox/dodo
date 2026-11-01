@@ -8,7 +8,7 @@
 //! DODO_LUA_PATTERN_CASES=DIR to check that directory with this test).
 //!
 //! The engine's functions are package-internal, so the driver
-//! (tests/stdlib/lua_pattern_driver.dodo) is appended to pattern.dodo to form one
+//! (tests/lua_pattern/driver.dodo) is appended to pattern.dodo to form one
 //! source file of package `lua`.
 use std::fs;
 use std::io::Write;
@@ -65,7 +65,7 @@ fn lua_patterns_match_reference_interpreter() {
     let scratch = std::env::temp_dir().join(format!("dodo-lua-pattern-{}", std::process::id()));
     fs::create_dir_all(&scratch).unwrap();
     let engine = fs::read_to_string(root.join("stdlib/std/script/lua/pattern.dodo")).unwrap();
-    let driver = fs::read_to_string(root.join("tests/stdlib/lua_pattern_driver.dodo")).unwrap();
+    let driver = fs::read_to_string(root.join("tests/lua_pattern/driver.dodo")).unwrap();
     let source = scratch.join("main.dodo");
     fs::write(&source, combine(&engine, &driver)).unwrap();
     let executable = scratch.join(format!("lua_pattern{}", std::env::consts::EXE_SUFFIX));

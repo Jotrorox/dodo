@@ -1,6 +1,6 @@
 -- Prints the expected results for tests/lua_pattern cases using a reference
 -- Lua 5.4 interpreter. Usage: lua reference.lua cases.txt > expected.txt
--- Output format: see tests/stdlib/lua_pattern_driver.dodo.
+-- Output format: see tests/lua_pattern/driver.dodo.
 local function unhex(h)
   return (h:gsub("%x%x", function(d) return string.char(tonumber(d, 16)) end))
 end
