@@ -1,0 +1,155 @@
+package arduino_uno
+
+import "std/embedded/hal"
+import "std/embedded/chip/atmega328p"
+
+// Arduino Uno (revision 3 and compatible boards): an ATmega328P at 16 MHz,
+// 32 KiB of flash of which the Optiboot bootloader keeps the top 512 bytes,
+// 2 KiB of SRAM, 1 KiB of EEPROM, and an orange user LED ("L") on D13. Build
+// with `board = "arduino_uno"` and import this package as
+// `std/embedded/board`, so the program also builds for other boards:
+//
+//     import "std/embedded/board"
+//
+//     fn main() {
+//         b := board.take()!
+//         for {
+//             b.led.toggle()
+//             b.timer.delay_ms(500)
+//         }
+//     }
+//
+// It follows the board contract described in std/embedded/hal. Pins have the
+// numbers printed on the board: D0 to D13 are 0 to 13 and A0 to A5 are 14 to
+// 19 (the constants D0 to A5). `dodo run` flashes the board through its
+// bootloader over the USB cable, which a second microcontroller on the board
+// turns into the chip's serial port on D0 and D1: `b.usb.serial()` opens
+// that port, for printing to the computer, at 115200 baud. Opening the port
+// on the computer resets the board.
+//
+// What the contract names and the Uno lacks: a random number generator, a
+// real-time clock, DMA, and a second core. The bootloader starts the program
+// again after a watchdog reset, so `restart` takes the place of
+// reboot_to_bootloader; `dodo run` resets the board into the bootloader
+// itself.
+
+pub const NAME: &str = "Arduino Uno"
+pub const LED_PIN: u32 = 13
+pub const CPU_HZ: u32 = 16_000_000
+// The serial port's speed through the USB cable.
+pub const USB_BAUD: u32 = 115_200
+
+pub const D0: u32 = 0
+pub const D1: u32 = 1
+pub const D2: u32 = 2
+pub const D3: u32 = 3
+pub const D4: u32 = 4
+pub const D5: u32 = 5
+pub const D6: u32 = 6
+pub const D7: u32 = 7
+pub const D8: u32 = 8
+pub const D9: u32 = 9
+pub const D10: u32 = 10
+pub const D11: u32 = 11
+pub const D12: u32 = 12
+pub const D13: u32 = 13
+pub const A0: u32 = 14
+pub const A1: u32 = 15
+pub const A2: u32 = 16
+pub const A3: u32 = 17
+pub const A4: u32 = 18
+pub const A5: u32 = 19
+
+// The usual bus pins, fixed by the chip: I2C on A4 (SDA) and A5 (SCL), also
+// on the header next to AREF; SPI on D13 (clock), D11 (data out), D12 (data
+// in), with D10 as chip select; and the serial port on D1 (TX) and D0 (RX),
+// which the USB cable shares:
+//
+//     i2c := b.pins.i2c(I2C_SDA_PIN, I2C_SCL_PIN, hal.I2C_FAST_HZ)!
+//
+// The LED shares D13 with the SPI clock: release it first,
+// `b.pins.release(b.led)`, by taking the board apart with `let`.
+pub const I2C_SDA_PIN: u32 = 18
+pub const I2C_SCL_PIN: u32 = 19
+pub const SPI_RX_PIN: u32 = 12
+pub const SPI_SELECT_PIN: u32 = 10
+pub const SPI_CLOCK_PIN: u32 = 13
+pub const SPI_TX_PIN: u32 = 11
+pub const UART_TX_PIN: u32 = 1
+pub const UART_RX_PIN: u32 = 0
+
+pub struct Board {
+    // The user LED, an output pin that is on when high.
+    pub led: atmega328p.Pin
+    // The remaining pins, and the serial port, I2C, SPI, PWM and analog
+    // inputs on them; D13 is already taken by `led`.
+    pub pins: atmega328p.Pins
+    // Microseconds since take(), and delays: delay_us, delay_ms, now_us.
+    pub timer: atmega328p.Timer
+    // The watchdog, stopped until `start(timeout_ms)`.
+    pub watchdog: atmega328p.Watchdog
+    // The 1 KiB EEPROM, for data that survives power cycles and flashing:
+    // read(offset, buffer) and update(offset, bytes).
+    pub eeprom: atmega328p.Eeprom
+    // The USB connector's serial port.
+    pub usb: Usb
+}
+
+// Start the chip's time base and claim the LED. A second call returns
+// hal.Error.Busy.
+pub fn take() -> Board!hal.Error {
+    chip := atmega328p.take(atmega328p.Config { cpu_hz: CPU_HZ })?
+    led := chip.pins.output(LED_PIN)?
+    let atmega328p.Peripherals { pins: pins, timer: timer, watchdog: watchdog, eeprom: eeprom } = chip
+    return ok(Board { led, pins, timer, watchdog, eeprom, usb: Usb {} })
+}
+
+// The USB connector, as `b.usb`.
+pub struct Usb {
+    // The serial port to the computer, at USB_BAUD: the chip's serial port
+    // on D0 and D1, which the board's USB interface carries. "\n" goes out
+    // as "\r\n", as terminals expect. Busy if the port, or D0 or D1, is
+    // taken.
+    pub fn serial(&mut self) -> atmega328p.Serial!hal.Error {
+        return self.serial_at(USB_BAUD)
+    }
+
+    // `serial` at another baud rate, such as 9600 or 57600.
+    pub fn serial_at(&mut self, baud: u32) -> atmega328p.Serial!hal.Error {
+        pins := atmega328p.Pins {}
+        port := pins.uart(UART_TX_PIN, some(UART_RX_PIN), baud)?
+        port.set_crlf(true)
+        return ok(port)
+    }
+
+    // Give back the port.
+    pub fn release_serial(&mut self, port: atmega328p.Serial) {
+        pins := atmega328p.Pins {}
+        pins.release_uart(port)
+    }
+}
+
+// Write a failed check's message to the serial port, if it is open, as the
+// default panic hook does before it halts. For a panic hook of your own:
+//
+//     extern "C" fn dodo_board_panic(check: *const u8, file: *const u8, line: u32, column: u32) {
+//         unsafe {
+//             board.report_panic(check, file, line, column)
+//         }
+//         board.restart()
+//     }
+//
+// SAFETY: `check` and `file` must be the hook's strings, which are in
+// program memory, and the caller must halt or reset afterwards, as this
+// takes over the serial port.
+pub unsafe fn report_panic(check: *const u8, file: *const u8, line: u32, column: u32) {
+    unsafe {
+        atmega328p.report_panic(check, file, line, column)
+    }
+}
+
+// Restart the board through the watchdog; the bootloader starts the program
+// again at once. Does not return.
+pub fn restart() {
+    atmega328p.restart()
+}

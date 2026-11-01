@@ -1,0 +1,217 @@
+package main
+
+import "checks"
+import "core/mmio"
+import "std/embedded/board"
+import "std/embedded/chip"
+import "std/embedded/hal"
+import "std/fmt"
+import "std/io"
+import "std/sync/atomic"
+
+// Arduino Uno self-test, part one: the ATmega328P startup runtime and its
+// 8- to 32-bit integer, binary32 and atomic helpers, and the code generator's AVR
+// specifics: function values in program memory, interrupt handlers,
+// critical sections, and panic messages in flash. wide.dodo tests the 64-bit
+// integer and binary64 helpers, and peripherals.dodo
+// std/embedded/chip/atmega328p's peripherals; together they do not fit the
+// flash. Nothing needs to be wired to the board.
+//
+// Results go to the USB serial port at 115200 baud, one line per check
+// (`ok 3 timer counts ...` or `FAIL 7 64-bit division (got 12)`), then
+// `done PASSED/TOTAL`, a formatting line, an echo exchange, and a check
+// that fails on purpose so the default panic hook reports it. Run both
+// parts with scripts/test_arduino_uno.py, which flashes them with `dodo
+// run` and reads the port.
+
+// Initialized data and zeroed statics: the reset code copies and clears them.
+static mut DATA: [3]u16 = [0xBEEFu16, 7, 0x1234]
+static mut ZEROED: [4]u8 = [0u8; 4]
+// Counted by the TIMER2_COMPA handler.
+static TICKS: atomic.Atomic<u16> = atomic.Atomic.new(0u16)
+static COUNTER: atomic.Atomic<u16> = atomic.Atomic.new(0u16)
+
+fn triple(value: u32) -> u32 {
+    return value * 3
+}
+
+fn square(value: u32) -> u32 {
+    return value * value
+}
+
+fn apply(function: fn(u32) -> u32, value: u32) -> u32 {
+    return function(value)
+}
+
+fn apply_closure(function: &dyn fn(u32) -> u32, value: u32) -> u32 {
+    return function(value)
+}
+
+@interrupt(TIMER2_COMPA)
+fn tick() {
+    TICKS.fetch_add(1u16, atomic.Ordering.SeqCst)!
+}
+
+fn main() {
+    b := board.take()!
+    serial := b.usb.serial()!
+    fmt.printf(&mut serial, "\nselftest {} core\n", board.NAME)!
+    startup_checks(&mut serial, &mut b)
+    time_checks(&mut serial, &mut b)
+    integer_checks(&mut serial)
+    float_checks(&mut serial)
+    function_checks(&mut serial)
+    atomic_checks(&mut serial)
+    interrupt_checks(&mut serial, &mut b)
+    fmt.printf(&mut serial, "fmt {} {} {}\n", -12345i32, 4_294_967_295u32, true)!
+    checks.finish(&mut serial)
+    echo(&mut serial)
+
+    // A failing check: the panic hook reports it from flash and halts.
+    limit := checks.opaque32(4_000_000_000)
+    overflow := limit + limit
+    fmt.printf(&mut serial, "unreachable {}\n", overflow)!
+}
+
+@inline(never)
+fn startup_checks(out: &mut chip.Serial, b: &mut board.Board) {
+    checks.check(out, match board.take() {
+        ok(_) => false,
+        err(error) => error == hal.Error.Busy,
+    }, "second take() is refused", 0)
+    data := unsafe {
+        DATA[0] as u32 + DATA[1] as u32 + DATA[2] as u32
+    }
+    checks.check(out, data == 0xBEEF + 7 + 0x1234, ".data initialized from flash", data)
+    zeroed := unsafe {
+        ZEROED[0] as u32 + ZEROED[3] as u32
+    }
+    checks.check(out, zeroed == 0, ".bss zeroed", zeroed)
+    checks.check(out, match b.pins.output(board.LED_PIN) {
+        ok(_) => false,
+        err(error) => error == hal.Error.Busy,
+    }, "LED pin is owned by led", 0)
+    checks.check(out, match b.pins.output(20) {
+        ok(_) => false,
+        err(error) => error == hal.Error.InvalidInput,
+    }, "pin 20 does not exist", 0)
+}
+
+@inline(never)
+fn time_checks(out: &mut chip.Serial, b: &mut board.Board) {
+    start := b.timer.now_us()
+    b.timer.delay_ms(100)
+    elapsed := (b.timer.now_us() - start) as u32
+    checks.check(out, elapsed >= 99_000 && elapsed <= 104_000, "timer counts 100 ms during a 100 ms delay", elapsed)
+    start = b.timer.now_us()
+    b.timer.delay_us(2000)
+    elapsed = (b.timer.now_us() - start) as u32
+    checks.check(out, elapsed >= 1960 && elapsed <= 2120, "2 ms delay lasts 2 ms", elapsed)
+}
+
+@inline(never)
+fn integer_checks(out: &mut chip.Serial) {
+    q := checks.opaque32(1_000_000_007) / checks.opaque32(97)
+    r := checks.opaque32(1_000_000_007) % checks.opaque32(97)
+    checks.check(out, q == 10_309_278 && r == 41, "32-bit division and remainder", q)
+    sq := checks.opaque_i32(-1_000_000_007) / checks.opaque_i32(97)
+    sr := checks.opaque_i32(-1_000_000_007) % checks.opaque_i32(97)
+    checks.check(out, sq == -10_309_278 && sr == -41, "signed 32-bit division", 0)
+    product := checks.opaque32(65_521) * checks.opaque32(65_519)
+    checks.check(out, product == 4_292_870_399, "32-bit multiplication", product)
+    signed := checks.opaque_i32(-46_341) * checks.opaque_i32(46_340)
+    checks.check(out, signed == -2_147_441_940, "signed 32-bit multiplication near the limit", 0)
+    small := checks.opaque32(200) as u8 / (checks.opaque32(7) as u8)
+    small16 := (checks.opaque32(60_000) as u16) % (checks.opaque32(7) as u16)
+    checks.check(out, small == 28 && small16 == 3, "8- and 16-bit division", small as u32)
+}
+
+@inline(never)
+fn float_checks(out: &mut chip.Serial) {
+    third := checks.opaque_f32(1.0) / checks.opaque_f32(3.0)
+    checks.check(out, third > 0.33333 && third < 0.33334, "f32 division", (third * 100000.0) as u32)
+    sum := checks.opaque_f32(1.5) + checks.opaque_f32(2.25) * checks.opaque_f32(4.0)
+    checks.check(out, sum == 10.5, "f32 multiply and add", sum as u32)
+    converted := checks.opaque_f32(-1234.75) as i32
+    widened := checks.opaque_i32(-7) as f32
+    checks.check(out, converted == -1234 && widened == -7.0, "f32 and integer conversions", 0)
+    zero := checks.opaque_f32(0.0)
+    nan := zero / zero
+    checks.check(out, !(nan == nan) && !(nan < 1.0) && !(nan > 1.0) && checks.opaque_f32(-1.0) < checks.opaque_f32(1.0), "f32 comparisons and NaN", 0)
+}
+
+// Function values, closures and dynamic dispatch, whose code addresses are
+// word addresses in program memory.
+@inline(never)
+fn function_checks(out: &mut chip.Serial) {
+    functions: [2]fn(u32) -> u32 = [triple, square]
+    picked := functions[(checks.opaque32(1) & 1) as usize]
+    checks.check(out, apply(triple, 14) == 42 && apply(picked, 9) == 81, "function pointers", apply(picked, 9))
+    offset := checks.opaque32(5)
+    checks.check(out, apply_closure(fn(x) {
+        x * 2 + offset
+    }, 10) == 25, "closures", 0)
+    checks.check(out, apply_closure(triple, 7) == 21, "function as closure", 0)
+}
+
+@inline(never)
+fn atomic_checks(out: &mut chip.Serial) {
+    COUNTER.store(65_534u16, atomic.Ordering.SeqCst)!
+    previous := COUNTER.fetch_add(3u16, atomic.Ordering.SeqCst)!
+    swapped := COUNTER.exchange(100u16, atomic.Ordering.SeqCst)!
+    exchanged := COUNTER.compare_exchange(100u16, 7u16, atomic.Ordering.SeqCst, atomic.Ordering.SeqCst)!
+    value := COUNTER.load(atomic.Ordering.SeqCst)!
+    checks.check(out, previous == 65_534 && swapped == 1 && exchanged.exchanged && value == 7, "16-bit atomics", value as u32)
+    section := hal.Critical.enter()
+    masked := (unsafe {
+        mmio.read8(0x5F)
+    } & 0x80) == 0
+    core.drop(section)
+    unmasked := (unsafe {
+        mmio.read8(0x5F)
+    } & 0x80) != 0
+    checks.check(out, masked && unmasked, "critical section masks and restores interrupts", 0)
+}
+
+// An interrupt handler: Timer 2 compare match A at 1 kHz.
+@inline(never)
+fn interrupt_checks(out: &mut chip.Serial, b: &mut board.Board) {
+    unsafe {
+        mmio.write8(0x64, mmio.read8(0x64) & 0xBF)
+        mmio.write8(0xB0, 0x02)
+        mmio.write8(0xB3, 249)
+        mmio.write8(0x70, 0x02)
+        mmio.write8(0xB1, 0x04)
+    }
+    b.timer.delay_ms(50)
+    unsafe {
+        mmio.write8(0x70, 0)
+        mmio.write8(0xB1, 0)
+        mmio.write8(0xB0, 0)
+    }
+    ticks := TICKS.load(atomic.Ordering.SeqCst)!
+    checks.check(out, ticks >= 49 && ticks <= 52, "@interrupt(TIMER2_COMPA) runs 50 times in 50 ms", ticks as u32)
+}
+
+// Answer one line from the host in upper case.
+@inline(never)
+fn echo(serial: &mut chip.Serial) {
+    fmt.printf(serial, "echo ready\n")!
+    line: [16]u8 = [0u8; 16]
+    count := 0usize
+    byte: [1]u8 = [0]
+    for count < 16 {
+        serial.read(&mut byte)!
+        if byte[0] == 10 {
+            break
+        }
+        if byte[0] >= 97 && byte[0] <= 122 {
+            byte[0] -= 32
+        }
+        line[count] = byte[0]
+        count += 1
+    }
+    io.write_all(serial, b"echo ")!
+    io.write_all(serial, &line[..count])!
+    io.write_all(serial, b"\n")!
+}
