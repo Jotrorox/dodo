@@ -218,6 +218,12 @@ pub struct Lua {
         return open_all_libs(&mut cx)
     }
 
+    // Register a native module for `require` (see Cx.preload_module).
+    pub fn preload_module(&mut self, name: &str, open: NativeFn) -> void!Throw {
+        cx := Cx { L: self.L }
+        return cx.preload_module(name, open)
+    }
+
     // Bytes currently allocated by the state.
     pub fn memory_in_use(&self) -> usize {
         unsafe {
@@ -2044,6 +2050,23 @@ pub struct Cx {
             self.set_global(modname)?
         }
         return ok()
+    }
+    // Register a native module for `require`: stores `open` as
+    // package.preload[name] (the registry table "_PRELOAD", so this works
+    // before or after the standard libraries are opened). `require(name)`
+    // then calls open with the arguments (name, ":preload:"), stores its
+    // first result in package.loaded[name] (true when it returns nothing or
+    // nil) and returns it, like any Lua module. Example:
+    //
+    //     fn open_greet(cx: &mut lua.Cx) -> i32!lua.Throw {
+    //         let funcs = [("hello", greet_hello)]
+    //         cx.new_lib(&funcs)?
+    //         return ok(1)
+    //     }
+    //     ...
+    //     cx.preload_module("greet", open_greet)?   // Lua: require "greet"
+    pub fn preload_module(&mut self, name: &str, open: NativeFn) -> void!Throw {
+        return pkg_preload_module(self, mem.str_bytes(name), open)
     }
     // Push a traceback of thread L1 (luaL_traceback), starting at `level`,
     // preceded by msg (if any).

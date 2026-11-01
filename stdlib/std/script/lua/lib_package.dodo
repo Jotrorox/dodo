@@ -21,7 +21,10 @@ import "std/platform/native" as platform_native
 // their first upvalue, so replacing the global `package` (or its fields
 // `path`, `cpath`, `searchers`) affects them the way the manual describes.
 
-unsafe extern "C" fn getenv(name: *const u8) -> *const u8
+// Private names for C functions (other library files may declare the same
+// symbols under their usual names).
+@link_name("getenv")
+unsafe extern "C" fn pkg_getenv(name: *const u8) -> *const u8
 
 const PKG_DLL_MSG: &str = "dynamic libraries not enabled; check your Lua installation"
 
@@ -382,9 +385,9 @@ fn pkg_set_path(cx: &mut Cx, field: &str, envname: &str, dft: &str) -> void!Thro
     let noenv = cx.to_boolean(-1)
     cx.pop(1)
     unsafe {
-        p := getenv(ptr.as_ptr(vname.bytes()))
+        p := pkg_getenv(ptr.as_ptr(vname.bytes()))
         if ptr.is_null(p) {
-            p = getenv(ptr.as_ptr(nm.bytes()))
+            p = pkg_getenv(ptr.as_ptr(nm.bytes()))
         }
         if ptr.is_null(p) || noenv {
             cx.push_str(dft)?
