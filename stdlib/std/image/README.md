@@ -13,12 +13,12 @@ top.
 | `std/image/color` | `ColorInfo` (CICP code points + gamma, chromaticities, ICC location), `Orientation`, integer sRGB curves. |
 | `std/image/convert` | Layout conversion (integer-only for integer targets), premultiply, sRGB/linear. |
 | `std/image/sink` | `Sink` interface (`ViewSink`, `CanvasSink`, `NullSink`) and `Source` interface (`ViewSource`, `CanvasSource`) for encoders. |
-| `std/image/meta` | `Metadata` of zero-copy `Item` ranges (EXIF, XMP, ICC), EXIF orientation, zlib payloads. |
+| `std/image/meta` | `Metadata` of zero-copy `Item` ranges (EXIF, XMP, ICC), EXIF orientation, zlib and Brotli payloads (`decode`, or `decode_with_scratch` with `scratch_size` bytes for any Brotli stream). |
 | `std/image/shared/binary` | Bounds-checked big/little-endian fields. |
 | `std/image/shared/scratch` | Typed views (`u32s`, `f32s`, ...) of one byte scratch buffer. |
 | `std/image/shared/isobmff` | ISO base media file format box iteration (JPEG XL container, AVIF). |
 | `std/image/ppm`, `qoi`, `bmp`, `png`, `jxl` | Codec layer, one package per format. |
-| `std/image/jxl/encode` | JPEG XL lossless encoder (modular, prefix codes, efforts 1 to 3). |
+| `std/image/jxl/encode` | JPEG XL encoder: lossless modular (efforts 1 to 3) or lossy VarDCT in XYB at a Butteraugli distance (efforts 1 to 9); prefix codes at effort 1, tuned hybrid integers and ANS from effort 2; embedded ICC profiles (lossy: the samples converted to XYB through the profile). |
 | `std/image/ops` | Crop, flip/rotate/orient, resize, quantize/dither, compare, histogram. |
 | `std/graphics/image` | The original Canvas-based API, forwarding to the codec packages. |
 | `std/image_alloc` | Owned `Image<A>` and `Bytes<A>` in an explicit allocator, `load`/`save` through std/fs, in-place convert/orient/resize/crop/quantize, metadata copies. |

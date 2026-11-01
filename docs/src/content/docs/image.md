@@ -40,10 +40,10 @@ buffers suit `static mut` storage on small stacks.
 | `std/image/color` | `ColorInfo` (CICP code points, gamma, chromaticities, ICC location), `Orientation`, integer sRGB curves. |
 | `std/image/convert` | Layout conversion, premultiplication, sRGB and linear light. |
 | `std/image/sink` | Where decoders put pixels (`Sink`: `ViewSink`, `CanvasSink`, `NullSink`) and where encoders read them (`Source`: `ViewSource`, `CanvasSource`). |
-| `std/image/meta` | `Metadata` of EXIF, XMP and ICC byte ranges, the EXIF orientation, zlib payloads. |
+| `std/image/meta` | `Metadata` of EXIF, XMP and ICC byte ranges, the EXIF orientation, zlib and Brotli payloads. |
 | `std/image/shared/binary`, `std/image/shared/scratch` | Bounds-checked fields of file data; typed views of one byte scratch buffer. |
 | `std/image/ppm`, `std/image/qoi`, `std/image/bmp`, `std/image/png`, `std/image/jxl` | The codecs, one package per format, with the same shape. |
-| `std/image/jxl/encode` | The JPEG XL lossless encoder. |
+| `std/image/jxl/encode` | The JPEG XL encoder (lossless modular, or lossy VarDCT). |
 | `std/image/ops` | Crop, flip, rotate and orient; resize; palettes and dithering; PSNR/SSIM comparison; histograms; fill and compositing (see [below](#pixel-operations)). |
 | `std/image/shared/isobmff` | ISO base media file format boxes (the JPEG XL container). |
 | `std/image_alloc` | Owned images and image files: `load`, `save`, `convert`, `orient`, `resize`, `crop` with an explicit allocator (see [below](#owned-images-and-files)). |
@@ -59,7 +59,7 @@ codec packages (see [below](#stdgraphicsimage)).
 | QOI | RGB and RGBA, sRGB or linear | RGB, or RGBA when the source has alpha |
 | BMP | 1, 4 and 8-bit palettes, RLE8 and RLE4; 16, 24 and 32-bit with or without bit-field masks; bottom-up or top-down; OS/2 core, V4 and V5 headers with sRGB or an embedded ICC profile | 24-bit, or 32-bit with a V5 header and alpha mask when the source has alpha |
 | PNG | Every color type and bit depth, `PLTE`, `tRNS`, Adam7, `cICP`, `iCCP`, `sRGB`, `gAMA`, `cHRM`, `cLLi`, `eXIf`, XMP in `iTXt`; APNG animation | Gray, gray+alpha, RGB or RGBA at 8 or 16 bits, or indexed; stored or deflate levels 1 to 9; any filter; Adam7; `sRGB`, `eXIf`, `iCCP` |
-| JPEG XL (`Format.Jxl`) | Bare codestreams and the ISOBMFF container (`jxlc`, split `jxlp`, `Exif`, `xml `, Brotli `brob` boxes reported as such); lossless and lossy modular, VarDCT with every block type, progressive passes and LF frames, recompressed JPEG (4:4:4, 4:2:2, 4:2:0, gray), patches, splines, noise, Gaborish and EPF, upsampling, animation with blending and reference frames, up to 64 extra channels; output U8, U16 or F32 by bit depth, XYB converted to the file's color encoding; embedded ICC profiles via `image.icc` | Lossless modular at efforts 1 to 3: 8 and 16-bit integer or exact 16/32-bit float samples, gray, RGB, alpha; bare codestream or container with `Exif`/`xml ` boxes |
+| JPEG XL (`Format.Jxl`) | Bare codestreams and the ISOBMFF container (`jxlc`, split `jxlp`, `Exif`, `xml `, Brotli-compressed `brob` boxes decoded by `meta.decode`); lossless and lossy modular, VarDCT with every block type, progressive passes and LF frames, recompressed JPEG (4:4:4, 4:2:2, 4:2:0, gray), patches, splines, noise, Gaborish and EPF, upsampling, animation with blending and reference frames, up to 4096 extra channels (each decodable on its own, spot colors rendered); output U8, U16 or F32 by bit depth, XYB converted to the file's color encoding; embedded ICC profiles via `image.icc` (lossy files with a profile decode to sRGB) | Lossless modular at efforts 1 to 3: 8 and 16-bit integer or exact 16/32-bit float samples, gray, RGB, alpha; or lossy VarDCT in XYB at a Butteraugli distance (efforts 1 to 9: adaptive quantization, Gaborish, varblocks up to 64x64, chroma from luma; alpha kept lossless); prefix codes (effort 1) or tuned hybrid integers and ANS when smaller (effort 2 and up); embedded RGB and gray ICC profiles (lossy: samples converted to XYB through the profile); bare codestream or container with `Exif`/`xml ` boxes |
 
 ASCII Netpbm (P1 to P3), P4 bitmaps, and BMP JPEG/PNG compression fail with
 `Unsupported`.
@@ -110,7 +110,8 @@ a display, or feed an encoder.
 
 `image.scratch_size(&data, &layout)` is the scratch a decode needs, computed
 from the header before any pixel work: PNG needs two rows of raw image data,
-the other formats none. The zlib decoder adds about 40 KiB of stack.
+the other formats none. The zlib decoder adds about 40 KiB of stack, the
+JPEG XL header walks (also `info` and `scratch_size`) at most about 32 KiB.
 
 Every length and index in a file is checked, so untrusted files never trap.
 Errors are `Truncated`, `Malformed`, `Unsupported`, `TooLarge` (a dimension
@@ -133,11 +134,31 @@ embedded profile is recorded with `ICC_RAW`. A QOI colorspace byte of 1 and
 every PFM file are linear.
 
 `image.metadata(&data)` returns a `meta.Metadata` whose `exif`, `xmp` and `icc`
-items are byte ranges of `data` with an encoding (`ENCODING_RAW` or
-`ENCODING_ZLIB`); nothing is copied. `item.bytes(&data)` borrows a raw item
-and `meta.decode(&data, &item, &mut output)` inflates or copies one.
+items are byte ranges of `data` with an encoding (`ENCODING_RAW`,
+`ENCODING_ZLIB`, or `ENCODING_BROTLI` for JPEG XL `brob` boxes, whose item
+covers the 4-byte inner box type and the Brotli stream); nothing is copied.
+`item.bytes(&data)` borrows a raw item and `meta.decode(&data, &item, &mut
+output)` copies, inflates or decompresses one with
+[`std/compress/brotli`](compression.md#brotli). A decoded EXIF payload
+starts at the TIFF header whatever its encoding; for a `brob` box `output`
+must also hold the 4-byte offset field that precedes it. `meta.decode`
+decodes Brotli with a 16 KiB stack workspace (about 30 KiB of stack in all
+unoptimized, 23 KiB optimized), enough for streams the reference encoder
+writes for payloads of up to 128 KiB; a stream whose prefix code tables
+need more fails with `TooLarge`. `meta.decode_with_scratch(&data, &item,
+&mut output, &mut scratch)` takes the workspace from caller scratch of
+`meta.scratch_size(&data, &item)` bytes instead (14 KiB of stack
+unoptimized, 7 KiB optimized) and decodes every valid stream: the size,
+read from the stream's headers, is exact for almost every stream (a few
+KiB for typical metadata) and at most about 1.3 MiB; it is zero for the
+other encodings. Inflating a zlib item takes about 20 KiB of stack
+unoptimized, 8 KiB optimized.
 `image.icc(&data, &mut output, &mut scratch)` returns the decoded ICC profile
-directly; only JPEG XL needs scratch (`image.icc_scratch_size(&data)`). PNG
+directly; only JPEG XL needs scratch (`image.icc_scratch_size(&data)`). It
+is the profile of the decoded pixels: lossy (XYB) JPEG XL files with an
+embedded profile decode to sRGB, so `header.color` is sRGB and `image.icc`
+returns 0 for them, while `image.metadata` lists the profile and `jxl.icc`
+extracts it. PNG
 finds `eXIf`, `iTXt` with the keyword `XML:com.adobe.xmp`, and `iCCP` before or
 after the image data. `header.orientation` comes from the EXIF orientation tag;
 `header.display_width()` and `display_height()` account for it.
@@ -160,9 +181,14 @@ indices follow the animation's own frames.
 ## Encoding
 
 `image.EncodeOptions` is format-independent: `effort` (1 to 9, the PNG deflate
-level, 0 writing stored PNG blocks; JPEG XL effort 1 for 1-2, 2 for 3-6 and 3
-for 7-9), `quality` and `lossless` (for lossy
-formats; everything written today is lossless) and `keep_metadata`. Encoders
+level, 0 writing stored PNG blocks; lossless JPEG XL effort 1 for 1-2, 2 for
+3-6 and 3 for 7-9, lossy JPEG XL the same effort), `lossless` (default true),
+`quality` (0 to 100, default 90) and `distance` for lossy encoding, and
+`keep_metadata`. JPEG XL is the one format with both: `lossless = false`
+writes lossy JPEG XL at `distance` when it is above zero, else at the
+Butteraugli distance cjxl derives from `quality` (90 is distance 1, the
+visually lossless default; quality 100 stays lossless). The other formats
+ignore `quality`, `distance` and `lossless`. Encoders
 read a `View` in any layout and pick the closest form the format stores, as
 the table above lists; float sources are clamped to 0.0 to 1.0 except in PFM.
 
@@ -170,11 +196,15 @@ the table above lists; float sources are clamped to 0.0 to 1.0 except in PFM.
   PPM, BMP and stored PNG it is exact.
 - `image.encode_scratch_size(format, &source, &options)` is the scratch
   `encode` needs: the deflate encoder's buffer and workspace for compressed
-  PNG (about 350 KiB), nothing otherwise.
+  PNG (about 350 KiB), JPEG XL's group planes and histograms plus, at effort
+  2 and up, ANS tables and a token buffer (about 0.4 to 4 MiB lossless, 3 to
+  9 MiB lossy), nothing otherwise.
 - `image.encode_with_metadata(format, &source, &options, &exif, &icc, ...)`
   also writes a TIFF-structured EXIF payload and an ICC profile where the
-  format stores them (PNG `eXIf` and `iCCP`); add `image.metadata_size(format,
-  exif.len, icc.len)` to the output size.
+  format stores them (PNG `eXIf` and `iCCP`; JPEG XL an `Exif` box and the
+  embedded profile, left out when it is not an RGB or gray profile matching
+  the image, or when lossy encoding cannot convert from it, see below); add
+  `image.metadata_size(format, exif.len, icc.len)` to the output size.
 - `image.encode_canvas` encodes a graphics canvas, read as 8-bit RGBA.
 
 `image.format_from_extension("photo.png")` and `image.extension(&format)` map
@@ -208,8 +238,54 @@ The codec options:
 | `std/image/ppm` | `kind`: `KIND_AUTO`, `KIND_PGM` (P5), `KIND_PPM` (P6), `KIND_PAM` (P7), `KIND_PFM`. |
 | `std/image/qoi` | `channels` (0 for automatic, 3 or 4), `linear` (the colorspace byte). |
 | `std/image/bmp` | `alpha`: write 32-bit with alpha when the source has it (default), or always 24-bit. |
-| `std/image/jxl/encode` | `effort` (1 to 3; higher values behave like 3), `container` (ISOBMFF boxes instead of a bare codestream), `color` (a `ColorInfo` written as the JPEG XL color encoding), `orientation`. `encode_with_metadata` adds `Exif` and `xml ` boxes. |
+| `std/image/jxl/encode` | `lossless` (default true) and `distance` (Butteraugli distance of lossy encoding, default 1.0, 0.05 to 25; `EncodeOptions.lossy(d)`, `distance_from_quality(q)` maps cjxl's 0 to 100 quality), `effort` (lossless 1 to 3, higher values behave like 3: 1 uses prefix codes, 2 and 3 tune the hybrid integer coding per cluster and switch to ANS when that is smaller; lossy 1 to 9: 1 DCT8 with uniform quantization, 2 adds adaptive quantization, inverse Gaborish and chroma from luma, 3 to 6 the varblock search up to 32x32 and per-block quant adjustment, 7 to 9 also 64x64; lossy entropy coding follows the lossless levels, prefix codes at 1, tuned hybrid integers and ANS when smaller from 2), `container` (ISOBMFF boxes instead of a bare codestream), `color` (a `ColorInfo` written as the JPEG XL color encoding), `orientation`. `encode_with_metadata` adds `Exif` and `xml ` boxes and embeds `Metadata.with_icc(exif, xmp, icc)`'s ICC profile (predictively coded as in libjxl; it then replaces `color`; an RGB profile for RGB(A), gray for gray, else `Unsupported`; `icc_fits` checks). Lossy encoding converts the samples to XYB through the profile as a color management system reads it (the AToB lookup table of its rendering intent, else its matrix/TRC model or gray curve; relative colorimetric) and embeds it as libjxl does, so decoders with color management render into it; profiles it cannot convert from give `Unsupported` (`icc_usable(icc, layout, options)` checks both). Size with `max_encoded_size_with_metadata`. |
 | `std/image/png` | `level` (0 stored, 1 to 9 deflate), `filter` (`FILTER_NONE` to `FILTER_PAETH`, or `FILTER_ADAPTIVE`), `interlace` (Adam7), `palette` (an indexed PNG of 1 to 8 bits with `tRNS` when an 8-bit source has at most 256 RGBA colors), `srgb_chunk`. |
+
+`std/image/jxl` adds `frame_info` and `decode_frame` for animations, `icc`
+for the embedded profile, and the extra channel API below.
+
+### JPEG XL extra channels
+
+A JPEG XL image can carry up to 4096 extra channels: alpha, depth maps,
+spot colors, selection masks, CMYK black, CFA, thermal or optional data.
+`decode` and `decode_frame` output the color channels and the first alpha
+channel; the others are read one at a time:
+
+```dodo
+pub fn extra_channel_count(data: &[u8]) -> u32!pixels.Error
+pub fn extra_channel_info(data: &[u8], channel: u32) -> ExtraChannelInfo!pixels.Error
+pub fn extra_channel_name(data: &[u8], channel: u32, output: &mut[u8]) -> usize!pixels.Error
+pub fn decode_extra_channel<S: sink.Sink>(data: &[u8], index: u32, channel: u32, output: &mut S, scratch: &mut[u8]) -> void!pixels.Error
+```
+
+The first three read only the image header (no scratch, a few KiB of
+stack).
+
+`ExtraChannelInfo` has the `kind` (`ExtraChannelType.Alpha`, `Depth`,
+`SpotColor`, `SelectionMask`, `Black`, `Cfa`, `Thermal` or `Optional`),
+`bit_depth` and `exponent_bits` (float samples), `dim_shift` (the channel is
+coded at 1/2^dim_shift of the image size), `alpha_associated`, `spot_color`
+(RGB and solidity), `cfa_channel`, `name_length` and the `layout`
+`decode_extra_channel` emits: gray, U8 for depths up to 8 bits, U16 up to
+16, F32 for float or deeper samples. `decode_extra_channel` takes the same
+scratch as `decode_frame` (`scratch_size`) and delivers displayed frame
+`index` of the channel at full image size, upsampled from its `dim_shift`
+and composited across animation frames like the color channels, as libjxl
+does. Spot colors are also rendered into the color output, as `djxl` does
+by default. CMYK images are not converted: the color channels hold C, M
+and Y as stored (with the CMYK profile from `icc`) and K is the `Black`
+extra channel, as libjxl's decoder returns them without a color management
+system.
+
+```dodo
+count := jxl.extra_channel_count(&data)?
+for channel in 0u32..count {
+    info := jxl.extra_channel_info(&data, channel)?
+    if info.kind == jxl.ExtraChannelType.Depth {
+        jxl.decode_extra_channel(&data, 0, channel, &mut depth_sink, scratch)?
+    }
+}
+```
 
 `std/image/png` adds `frame_info`, `frame_scratch_size` and `decode_frame` for
 APNG, `encode_with_metadata` for `eXIf` and `iCCP` chunks, and
@@ -315,15 +391,17 @@ one from the image's own allocator:
 &options)` and `save_auto(path)` (format from the extension, default options)
 write a file. With `options.keep_metadata` (the default) the EXIF payload and
 ICC profile are written where the format stores them: PNG `eXIf` and `iCCP`,
-JPEG XL EXIF. `EncodeOptions.palette` writes an indexed PNG when the image has
+JPEG XL `Exif` box and embedded ICC profile. `EncodeOptions.palette` writes an indexed PNG when the image has
 at most 256 colors, as after `quantize`.
 
 Errors are `image_alloc.Error`: `Image(pixels.Error)`,
 `Allocation(error.AllocError)` or `File(fs.FileError)`, so `?` wraps each in
 a function returning `image_alloc.Error`; `image_alloc.error_name(&error)`
-is a short fixed description. EXIF and ICC payloads that cannot be read (an
-unsupported encoding such as Brotli, a damaged chunk) are skipped rather
-than failing the decode; ICC profiles above 64 MiB and files above
+is a short fixed description. EXIF from Brotli-compressed JPEG XL `brob`
+boxes is decompressed with a workspace allocated at the size
+`meta.scratch_size` reports and released afterwards, so every valid
+stream decodes. EXIF and ICC payloads that cannot be read (a damaged
+chunk or compressed stream) are skipped rather than failing the decode; ICC profiles above 64 MiB and files above
 `MAX_FILE_SIZE` (1 GiB) are not loaded.
 
 ## The imgtool example
@@ -335,14 +413,15 @@ all images in one shared arena over a 512 MiB static buffer:
 dodo build examples/imgtool -o imgtool
 ./imgtool info photo.png
 ./imgtool convert photo.png photo.jxl --effort 7
+./imgtool convert photo.png small.jxl --quality 80
 ./imgtool resize photo.jxl thumb.png 320x0 --filter lanczos --linear
 ./imgtool compare photo.png thumb-back.png
 ```
 
 | Command | Effect |
 | --- | --- |
-| `info FILE` | Format, size, native layout, bit depth, color (CICP, gamma, ICC), orientation, frames and metadata items. |
-| `convert IN OUT [--effort N] [--layout L] [--strip]` | Re-encodes as OUT's format; `L` is `gray8`, `graya8`, `rgb8`, `rgba8` or the same with `16`, `f16`, `f32`. |
+| `info FILE` | Format, size, native layout, bit depth, color (CICP, gamma, ICC), orientation, frames and metadata items (with the decoded size of zlib and Brotli payloads). |
+| `convert IN OUT [--effort N] [--layout L] [--strip] [--quality Q \| --distance D \| --lossy]` | Re-encodes as OUT's format; `L` is `gray8`, `graya8`, `rgb8`, `rgba8` or the same with `16`, `f16`, `f32`. JPEG XL is lossless unless given a quality (0 to 100), a Butteraugli distance (such as `1.0`) or `--lossy` (quality 90). |
 | `resize IN OUT WxH [--filter F] [--linear]` | `F` is `nearest`, `box`, `bilinear`, `catmull-rom`, `mitchell` or `lanczos`; a zero side keeps the aspect ratio. |
 | `strip IN OUT` | Re-encodes without EXIF and ICC metadata. |
 | `orient IN OUT` | Applies the EXIF orientation. |
@@ -359,15 +438,29 @@ a usage error, and 3 when `compare` finds the images differ.
 ## Limits
 
 Decoders deliver the default image of an animation through `decode`; APNG
-and JPEG XL have frames (`decode_frame`). The JPEG XL decoder rejects with
-`Unsupported` patches or splines in upsampled frames, subsampled (YCbCr)
-frames combined with upsampling, filters, adaptive LF smoothing or blocks
-larger than 8x8, and more than 64 extra channels; extra channels other than
-the first alpha are decoded but not output. Lossy JPEG XL matches libjxl's
-`djxl` within one 8-bit level. The JPEG XL encoder is lossless only and
-uses prefix codes (no ANS); it does not embed ICC profiles. JPEG XL scratch
-is sized from frame headers, which can describe frames larger than the
-image, so check `scratch_size` against your budget before allocating. PNG text chunks other
-than XMP are skipped, as are `sBIT`, `pHYs` and timestamps. The PNG encoder
+and JPEG XL have frames (`decode_frame`). Lossy JPEG XL matches libjxl's
+`djxl` within one 8-bit level. Chroma-subsampled VarDCT frames with
+adaptive LF smoothing follow current libjxl, which smooths each channel at
+its own size (`djxl` 0.12 cannot decode them); subsampled frames with
+varblocks larger than 8x8 are invalid and fail `Malformed`, as in libjxl.
+The JPEG XL encoder embeds only RGB and gray ICC profiles (no CMYK). Lossy
+encoding with a profile needs one it can convert from: an AToB lookup table
+of type lutAtoB, lut16 or lut8 (XYZ or Lab connection space), a matrix/TRC
+RGB profile, or a gray profile's curve; profiles with float DToB tables,
+gray profiles with lookup tables and anything else fail `Unsupported`
+(`std/image` leaves them out). The conversion is relative colorimetric,
+ignoring white points. Lossy encoding keeps alpha lossless, uses the
+default dequantization matrices, natural coefficient orders and the 8x8 DCT
+only among the 8x8 transforms (no DCT4, AFV or identity blocks), and
+analyzes every group twice (once only in images up to 2048x2048 pixels). JPEG XL scratch follows the image header, not
+the frame sizes a file claims: each frame is decoded over the part that
+can reach the output, so with W' = width + 1100, H' = height + 1100 and
+C = 3 + extra channels (all of them, up to 4096), `scratch_size` stays
+within 64 W' H' C + 5 MiB C + 128 MiB. Not covered by that bound: frames
+that start left of or above the image (decoded from their origin),
+reference frames as far as later patches read them, and frames whose
+global squeeze or above-right delta palette needs the whole frame; check
+`scratch_size` against your budget for untrusted files. PNG text chunks
+other than XMP are skipped, as are `sBIT`, `pHYs` and timestamps. The PNG encoder
 writes palettes only for 8-bit sources, and float samples outside 0.0 to 1.0
 survive only in PFM.

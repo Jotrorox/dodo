@@ -273,6 +273,14 @@ fn encode_transfer(t: &ColorTransform, v: f32) -> f32 {
 
 // XYB pixel to the target color space, in place.
 fn xyb_pixel(t: &ColorTransform, px: &mut f32, py: &mut f32, pb: &mut f32) {
+    xyb_linear(t, px, py, pb)
+    *px = encode_transfer(t, *px)
+    *py = encode_transfer(t, *py)
+    *pb = encode_transfer(t, *pb)
+}
+
+// XYB pixel to linear light of the target primaries, in place.
+fn xyb_linear(t: &ColorTransform, px: &mut f32, py: &mut f32, pb: &mut f32) {
     gr := *py + *px - t.bias_cbrt[0]
     gg := *py - *px - t.bias_cbrt[1]
     gb := *pb - t.bias_cbrt[2]
@@ -295,7 +303,7 @@ fn xyb_pixel(t: &ColorTransform, px: &mut f32, py: &mut f32, pb: &mut f32) {
         g = narrow64(g as f64 * ratio)
         b = narrow64(b as f64 * ratio)
     }
-    *px = encode_transfer(t, r)
-    *py = encode_transfer(t, g)
-    *pb = encode_transfer(t, b)
+    *px = r
+    *py = g
+    *pb = b
 }

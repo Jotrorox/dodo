@@ -6,83 +6,218 @@ import "std/image/pixels"
 import "std/image/shared/binary"
 import "std/image/shared/scratch"
 
-// JPEG XL lossless encoder: pure Dodo, no allocation, integer-only, with
-// byte-identical output on every target.
+// JPEG XL encoder: pure Dodo, no allocation. Lossless (the default) is
+// integer-only with byte-identical output on every target; lossy
+// (EncodeOptions.lossless = false) writes a VarDCT frame at a Butteraugli
+// distance.
 //
-// Design
+// Design (lossless)
 //
 // Output is one lossless modular frame (not XYB) as a bare codestream, or in
 // the ISOBMFF container (signature, ftyp, optional jxll/Exif/xml boxes, then
-// jxlc) when asked for or when metadata is attached. Samples keep their
-// precision: U8 and U16 become 8 and 16-bit integer samples; F16 and F32
-// become 16 and 32-bit float samples whose bit patterns are coded exactly.
+// jxlc) when asked for or when EXIF or XMP is attached; an ICC profile goes
+// into the codestream. Samples keep their precision: U8 and U16 become 8 and
+// 16-bit integer samples; F16 and F32 become 16 and 32-bit float samples
+// whose bit patterns are coded exactly.
 // Alpha is an extra channel; premultiplied input is stored unchanged and
 // flagged alpha_associated.
 //
 // Bitstream: 256x256 groups. A single-group image is one section. Larger
-// images get a TOC with LfGlobal (MA tree, prefix codes, palette and the
+// images get a TOC with LfGlobal (MA tree, entropy codes, palette and the
 // global transform header), empty LF group and HfGlobal sections, and one
 // section per group with its rectangle of every channel. One global tree
-// and one set of clustered prefix codes (hybrid integers 4/2/0) serve all
-// groups; they come from a first pass that counts symbols over the whole
-// image, and a second pass writes each group independently. Runs of equal
-// residuals become LZ77 copies at distance 1 (RLE). Channels whose samples
-// share a factor (8-bit data * 257, 12-bit data * 16) code residuals
-// divided by it through the tree leaf multiplier.
+// and one set of clustered entropy codes serve all groups; they come from a
+// first pass that counts symbols over the whole image, and a second pass
+// writes each group independently. Runs of equal residuals become LZ77
+// copies at distance 1 (RLE). Channels whose samples share a factor (8-bit
+// data * 257, 12-bit data * 16) code residuals divided by it through the
+// tree leaf multiplier.
+//
+// Entropy coding (entropy.dodo, ans.dodo, prefix.dodo): effort 1 counts
+// hybrid integer tokens 4/2/0 and writes prefix codes. Effort 2+ counts
+// finer tokens (5/2/2, which keep enough of every residual of 8 and
+// 16-bit samples), clusters the contexts on their 4/2/0 projection, picks
+// each cluster's hybrid integer configuration from 26 candidates by
+// estimated size, and then codes the set with ANS (12-bit distributions
+// stored with the flat, small or general method at the cheapest precision
+// shift, alias tables, a 32-bit rANS state per stream with 16-bit flushes)
+// when that is estimated smaller than prefix codes, likewise for the tree.
+// ANS streams are written in reverse: each stream's tokens are buffered
+// (two words each) and coded when the stream ends.
+//
+// ICC profiles (icc.dodo) are embedded after the image header with
+// libjxl's predictive ICC encoding (header prediction, tag table commands,
+// type and XYZ shortcuts, shuffled mluc text, numeric prediction of curves
+// and CLUTs), LZ77 and per-cluster prefix codes over 41 byte contexts. The
+// encoded profile is regenerated on every pass rather than stored, so its
+// working memory is fixed and carved from the histogram scratch before the
+// image passes start.
 //
 // Effort:
 //   1: fjxl-like: YCoCg for RGB, the clamped gradient predictor, one context
-//      per channel, at most 8 prefix codes.
+//      per channel, at most 8 prefix codes (4/2/0 hybrid integers).
 //   2: palette (up to 1024 colors), the best of three color transforms, the
 //      best of gradient/W/N per channel, contexts from the local gradients
 //      W-NW and NW-N (and the previous channel's residual), up to 32
-//      clustered codes. Choices are estimated by coding sample bands of the
-//      image with the real model.
+//      clustered codes with tuned hybrid integers, ANS when smaller (some
+//      precision shifts). Choices are estimated by coding sample bands of
+//      the image with the real model.
 //   3+: nine color transforms, more predictors including the weighted
-//      (self-correcting) predictor with contexts on its error, and four
-//      times the sample.
+//      (self-correcting) predictor with contexts on its error, four times
+//      the sample, and every ANS precision shift.
 //
 // Memory: encode_scratch_size() bytes of scratch, carved into the i32
 // planes of one group (all channels; 256x256 at most), the context
-// histograms (256 contexts x 272 symbols), cluster sums, prefix code
-// tables, the palette hash and the TOC sizes (4 bytes per group). Planes are
-// bounded by the group size, so scratch stays between about 0.5 and 1.5 MiB
-// for any image. max_encoded_size() bounds the output.
+// histograms (256 contexts x 288 symbols), cluster sums, prefix code
+// tables, the palette hash and the TOC sizes (4 bytes per group); effort 2+
+// adds ANS tables (32 clusters x 9 KiB) and a token buffer of 8 bytes per
+// sample of one group. Planes and tokens are bounded by the group size, so
+// scratch stays between about 0.4 and 1.5 MiB at effort 1 and 0.7 and 4
+// MiB at effort 2+, for any image. max_encoded_size() bounds the output
+// (max_encoded_size_with_metadata() with metadata and ICC profile).
+//
+// Design (lossy, vd_*.dodo)
+//
+// One VarDCT frame in XYB (image metadata xyb_encoded; the color encoding
+// names the source's space, which the decoder converts back to). Samples
+// are linearized with the header's transfer curve (sRGB, linear, BT.709,
+// PQ, HLG, power laws), moved to sRGB primaries when needed, and turned into
+// XYB by libjxl's opsin matrix, bias and cube root; float and 16-bit
+// sources keep their precision up to that point. With an ICC profile
+// (vd_icc.dodo) the samples reach linear sRGB through the profile instead,
+// as a color management system reads it (its AToB lookup table, else its
+// matrix/TRC or gray curve; relative colorimetric via the D50 connection
+// space), and the header embeds the profile as libjxl does: decoders with
+// color management render XYB into it, std/image/jxl into sRGB. Per frame: a global quant
+// scale and LF quant from the distance (libjxl's formulas), default
+// dequantization matrices, x_qm_scale from the distance, Gaborish (effort 2+,
+// distance above 0.5) and EPF iterations (0 to 3 by distance) signalled as
+// applied. Per 256x256 group, analyzed with an 8-pixel border so results do
+// not depend on group order: the adaptive quant field (libjxl's masking
+// model) from the original XYB, inverse Gaborish (libjxl's 5x5 kernel),
+// then per 64x64 tile the varblock search (effort 3+: libjxl's entropy plus
+// information-loss estimate, merging DCT8 into 16x8, 16x16, 32x16, 32x32
+// and, at effort 7+, 64x32 and 64x64), the quant field per varblock,
+// chroma-from-luma factors fitted per tile (least squares, libjxl's
+// weighting), and quantization with libjxl's dead zones and per-block quant
+// adjustment (effort 3+). The LF image (one value per 8x8 block, the
+// lowest frequencies of each varblock folded back) is quantized with LF
+// chroma-from-luma, and with the HF metadata (chroma-from-luma tiles,
+// varblock types and quants, EPF sharpness) coded per LF group in modular
+// streams with their own trees. HF coefficients use the default block
+// context map, the decoder's nonzero-count prediction and contexts and the
+// natural coefficient orders; their tokens (counted as hybrid integers
+// 4/1/0) are clustered into at most 32 histograms with an MTF + LZ77 coded
+// context map. Alpha stays lossless in the modular stream (global tree and
+// codes, one stream per group). Entropy coding follows the lossless
+// effort levels: effort 1 writes prefix codes (with runs of more than 4
+// equal HF tokens as LZ77 copies); effort 2+ tunes each cluster's hybrid
+// integer configuration and codes with ANS when that is estimated smaller,
+// for the HF code and every modular stream (LF image, HF metadata, alpha),
+// with HF copies only for runs of more than 96 tokens.
+//
+// Two passes, group by group: the first analyzes each LF group's groups,
+// writes the LF group and counts the HF tokens; after the HF code is built
+// the second analyzes every group again (reusing the first pass's
+// decisions when the image is one LF group, up to 2048x2048) and writes
+// its tokens. Every HF token goes through VdHfCoder.token in vd_hf.dodo,
+// the single seam to the entropy coder.
+//
+// Lossy memory: encode_scratch_size() is about
+//   2.7 MiB fixed (HF histograms 7426 contexts x 64 symbols x 4 bytes,
+//     dequantization weights, orders, the modular coder)
+//   + 18 g^2 bytes for the group (XYB planes with an 8-pixel border,
+//     quantized coefficients), plus 8 g^2 more at effort 3+ (masking
+//     field), g = min(256, image side rounded up to 8)
+//   + 28 b^2 bytes for the LF group (LF image, metadata, block info),
+//     b = min(256, image side in blocks)
+//   + 1 KiB (8-bit) or 256 KiB (16-bit and half-float) linearization table
+//   + 4 bytes per alpha sample of one group
+//   + at effort 2+: 288 KiB of ANS tables (32 clusters x 4608 u16; shared
+//     by the LF group streams and the HF code), 288 KiB more for alpha's
+//     code, and 24 b^2 + b^2 / 8 bytes of ANS tokens for the larger LF
+//     group stream (HF and alpha group streams buffer theirs in the HF
+//     histograms, idle by then),
+// at most about 9 MiB whatever the image size (5 MiB for 1366x768 at
+// effort 2). max_encoded_size() is a true bound (31 bits per HF
+// coefficient, 40 per LF and metadata symbol, the alpha samples' lossless
+// bound, and the coding overhead).
 
 // Default effort for EncodeOptions.new().
 pub const DEFAULT_EFFORT: u32 = 2
 
+// Default Butteraugli distance of lossy encoding (cjxl's default, about
+// quality 90).
+pub const DEFAULT_DISTANCE: f32 = 1.0
+
 // Encoder settings.
 pub struct EncodeOptions {
-    // 1 (fastest) to 9; values above 3 currently behave like 3, 0 like 1.
+    // 1 (fastest) to 9. Lossless: values above 3 currently behave like 3,
+    // 0 like 1. Lossy: 1 DCT8 with uniform quantization; 2 adds adaptive
+    // quantization, inverse Gaborish and chroma-from-luma; 3-6 add the
+    // varblock search (DCT8 to DCT32 and rectangles) and per-block quant
+    // adjustment; 7-9 also try 64x64 varblocks.
     pub effort: u32
+    // Lossless modular coding (the default). When false, a lossy VarDCT
+    // frame in XYB is written at `distance`; alpha stays lossless.
+    pub lossless: bool
+    // Target Butteraugli distance of lossy coding: 1.0 is visually
+    // lossless, 0.5 very high quality, 3 to 8 small files. Clamped to
+    // 0.05..25; zero or less means lossless. distance_from_quality() maps
+    // a 0..100 quality the way cjxl does.
+    pub distance: f32
     // Wrap the codestream in the ISOBMFF container. Implied when metadata
     // is attached (encode_with_metadata).
     pub container: bool
     // Color description written as the JPEG XL color encoding: CICP
     // primaries and transfer (sRGB, linear, BT.709/601/2020 curves, PQ, HLG,
     // DCI, power-law gamma; BT.709, BT.2020, Display P3, DCI-P3 or custom
-    // chromaticities). Unrepresentable values fall back to sRGB; ICC
-    // profiles are not embedded.
+    // chromaticities). Unrepresentable values fall back to sRGB. Ignored
+    // when an ICC profile is embedded (Metadata.icc).
     pub color: color.ColorInfo
     pub orientation: color.Orientation
 
     pub fn new() -> EncodeOptions {
-        return EncodeOptions { effort: DEFAULT_EFFORT, container: false, color: color.ColorInfo.srgb(), orientation: color.Orientation.Identity }
+        return EncodeOptions { effort: DEFAULT_EFFORT, lossless: true, distance: DEFAULT_DISTANCE, container: false, color: color.ColorInfo.srgb(), orientation: color.Orientation.Identity }
+    }
+    // Lossy settings at Butteraugli distance `distance`.
+    pub fn lossy(distance: f32) -> EncodeOptions {
+        options := EncodeOptions.new()
+        options.lossless = false
+        options.distance = distance
+        return options
+    }
+    fn is_lossy(&self) -> bool {
+        return !self.lossless && (self.distance > 0.0 || !(self.distance == self.distance))
     }
 }
 
-// Metadata stored in container boxes. Kept apart from EncodeOptions so the
-// options hold no borrows.
+// Metadata stored with the image: EXIF and XMP in container boxes, the ICC
+// profile in the codestream. Kept apart from EncodeOptions so the options
+// hold no borrows.
 pub struct Metadata {
     // EXIF payload starting at the TIFF header ("II*\0" or "MM\0*"), or
     // with a leading "Exif\0\0"; stored in an "Exif" box. Empty for none.
     pub exif: &[u8]
     // XMP packet, stored in an "xml " box. Empty for none.
     pub xmp: &[u8]
+    // ICC profile embedded in the image header (entropy coded, see
+    // icc.dodo); it then describes the colors instead of
+    // EncodeOptions.color. Must be an RGB profile for RGB(A) images and a
+    // gray one for gray(+alpha) images (else Unsupported). Lossy encoding
+    // converts the samples to XYB through the profile, which must then be
+    // a matrix/TRC profile (colorants and rTRC/gTRC/bTRC) or a gray kTRC
+    // profile with the XYZ connection space (else Unsupported; profiles
+    // that only have lookup tables are not supported); see vd_icc.dodo.
+    // icc_usable() checks both. Empty for none; it does not need the
+    // container.
+    pub icc: &[u8]
 
     pub fn new(exif: &[u8], xmp: &[u8]) -> Metadata from(exif, xmp) {
-        return Metadata { exif: exif, xmp: xmp }
+        return Metadata { exif: exif, xmp: xmp, icc: &exif[..0] }
+    }
+    pub fn with_icc(exif: &[u8], xmp: &[u8], icc: &[u8]) -> Metadata from(exif, xmp, icc) {
+        return Metadata { exif: exif, xmp: xmp, icc: icc }
     }
 }
 
@@ -203,19 +338,20 @@ fn needs_level10(width: u32, height: u32, layout: &pixels.Layout) -> bool {
     return width > 262144 || height > 262144 || width as u64 * height as u64 > 268435456
 }
 
-// Worst-case bits per sample: a 15-bit prefix code plus the hybrid integer
-// extra bits of the largest residual (8 or 16-bit samples after a color
-// transform give residuals below 2^(bits + 2), with margin for the weighted
-// predictor), or 30 bits for 32-bit float patterns.
+// Worst-case bits per sample: a 15-bit prefix code (or ANS with its 16-bit
+// flushes, which never cost more than 16 bits per token) plus the hybrid
+// integer extra bits of the largest residual (8 or 16-bit samples after a
+// color transform give residuals below 2^(bits + 2), with margin for the
+// weighted predictor), or 30 bits for 32-bit float patterns.
 fn sample_bound_bits(layout: &pixels.Layout) -> usize {
     code := layout.sample_code()
     if code == pixels.SAMPLE_U8 {
-        return 15 + 8 + 2
+        return 16 + 8 + 2
     }
     if code == pixels.SAMPLE_F32 {
-        return 15 + 30
+        return 16 + 30
     }
-    return 15 + 16 + 2
+    return 16 + 16 + 2
 }
 
 fn codestream_bound(width: u32, height: u32, layout: &pixels.Layout) -> usize!pixels.Error {
@@ -224,9 +360,20 @@ fn codestream_bound(width: u32, height: u32, layout: &pixels.Layout) -> usize!pi
     h := height as usize
     samples := pixels.checked(binary.pixel_count(width, height)?, layout.channel_count(), MAX_PALETTE * 4)?
     data := pixels.checked(samples, sample_bound_bits(layout), 7)? / 8
-    // Headers, tree, prefix codes and per-section padding.
+    // Headers, tree, codes and per-section padding (and ANS states).
     overhead := pixels.checked(toc_entries(w, h), 8, 65536)?
     return pixels.checked(1, data, overhead)
+}
+
+// An upper bound on the bytes an embedded ICC profile of `length` bytes
+// adds to the output: the predicted stream has at most 2 * length + 64
+// bytes, each coded in at most 22 bits (LZ77 copies cost less per byte),
+// plus the code spec.
+pub fn icc_bound(length: usize) -> usize!pixels.Error {
+    if length == 0 {
+        return ok(0)
+    }
+    return pixels.checked(length, 6, 16384 + 192)
 }
 
 // An upper bound on the bytes encode() writes for this image and options.
@@ -234,16 +381,57 @@ fn codestream_bound(width: u32, height: u32, layout: &pixels.Layout) -> usize!pi
 // far smaller, and encode() reports BufferTooSmall rather than overrunning a
 // smaller buffer.
 pub fn max_encoded_size(width: u32, height: u32, layout: &pixels.Layout, options: &EncodeOptions) -> usize!pixels.Error {
+    if options.is_lossy() {
+        md := Metadata.new(b"", b"")
+        return vd_max_encoded_size(width, height, layout, options, &md)
+    }
     bound := codestream_bound(width, height, layout)?
     prefix := container_prefix(options, b"", b"", bound, needs_level10(width, height, layout))?
     return pixels.checked(1, bound, prefix)
 }
 
-// max_encoded_size() including the metadata boxes.
+// max_encoded_size() including the metadata boxes and the ICC profile.
 pub fn max_encoded_size_with_metadata(width: u32, height: u32, layout: &pixels.Layout, options: &EncodeOptions, metadata: &Metadata) -> usize!pixels.Error {
-    bound := codestream_bound(width, height, layout)?
+    if options.is_lossy() {
+        return vd_max_encoded_size(width, height, layout, options, metadata)
+    }
+    bound := pixels.checked(1, codestream_bound(width, height, layout)?, icc_bound(metadata.icc.len)?)?
     prefix := container_prefix(options, metadata.exif, metadata.xmp, bound, needs_level10(width, height, layout))?
     return pixels.checked(1, bound, prefix)
+}
+
+// Whether `icc` can be embedded for an image in `layout`: an RGB profile for
+// RGB(A), a gray one for gray(+alpha) (see Metadata.icc).
+pub fn icc_fits(icc: &[u8], layout: &pixels.Layout) -> bool {
+    color_channels := 1usize
+    if layout.channel_count() >= 3 {
+        color_channels = 3
+    }
+    match check_icc(icc, color_channels) {
+        ok() => {
+            return true
+        }
+        err(_) => {
+            return false
+        }
+    }
+}
+
+// Whether encode_with_metadata() accepts `icc` for an image in `layout`
+// with these options: icc_fits(), and for lossy encoding a matrix/TRC or
+// gray TRC profile (see Metadata.icc).
+pub fn icc_usable(icc: &[u8], layout: &pixels.Layout, options: &EncodeOptions) -> bool {
+    if !icc_fits(icc, layout) {
+        return false
+    }
+    if !options.is_lossy() {
+        return true
+    }
+    color_channels := 1usize
+    if layout.channel_count() >= 3 {
+        color_channels = 3
+    }
+    return vd_icc_usable(icc, color_channels)
 }
 
 // Scratch sizes in elements.
@@ -261,9 +449,19 @@ fn plane_words(width: u32, height: u32, layout: &pixels.Layout) -> usize {
 
 const HIST_WORDS: usize = MAX_CONTEXTS * MAX_ALPHA
 const SUM_WORDS: usize = MAX_CLUSTERS * MAX_ALPHA
+const ANS_WORDS: usize = MAX_CLUSTERS * ANS_STRIDE
+
+// Effort 2 and up may code with ANS: they need ANS tables and a token
+// buffer for the largest stream.
+fn uses_ans(options: &EncodeOptions) -> bool {
+    return options.effort >= 2
+}
 
 // Bytes of scratch encode() needs for this image and options.
 pub fn encode_scratch_size(width: u32, height: u32, layout: &pixels.Layout, options: &EncodeOptions) -> usize!pixels.Error {
+    if options.is_lossy() {
+        return vd_scratch_size(width, height, layout, options)
+    }
     check_size(width, height)?
     total := scratch.size(plane_words(width, height, layout), 4)?
     total = scratch.add(total, scratch.size(HIST_WORDS, 4)?)?
@@ -273,6 +471,10 @@ pub fn encode_scratch_size(width: u32, height: u32, layout: &pixels.Layout, opti
     total = scratch.add(total, scratch.size(SUM_WORDS + MAX_CONTEXTS, 1)?)?
     total = scratch.add(total, scratch.size(PALETTE_WORDS, 4)?)?
     total = scratch.add(total, scratch.size(toc_entries(width as usize, height as usize), 4)?)?
+    if uses_ans(options) {
+        total = scratch.add(total, scratch.size(ANS_WORDS, 2)?)?
+        total = scratch.add(total, scratch.size(2 * plane_words(width, height, layout), 4)?)?
+    }
     return ok(total)
 }
 
@@ -281,16 +483,26 @@ pub fn encode_scratch_size(width: u32, height: u32, layout: &pixels.Layout, opti
 // encode_scratch_size() or the output does not fit, and Malformed for an
 // empty image.
 pub fn encode(source: &pixels.View, options: &EncodeOptions, output: &mut[u8], scratch_bytes: &mut[u8]) -> usize!pixels.Error {
-    return encode_boxes(source, options, b"", b"", output, scratch_bytes)
+    md := Metadata.new(b"", b"")
+    return encode_boxes(source, options, &md, output, scratch_bytes)
 }
 
-// encode() with EXIF and/or XMP boxes; the output uses the container when
-// either is present. Size the output with max_encoded_size_with_metadata().
+// encode() with EXIF and/or XMP boxes and/or an ICC profile; the output
+// uses the container when EXIF or XMP is present. Size the output with
+// max_encoded_size_with_metadata(). An ICC profile that does not match the
+// image's color channels (RGB or gray), or that lossy encoding cannot
+// convert from, gives Unsupported (see icc_usable()).
 pub fn encode_with_metadata(source: &pixels.View, options: &EncodeOptions, metadata: &Metadata, output: &mut[u8], scratch_bytes: &mut[u8]) -> usize!pixels.Error {
-    return encode_boxes(source, options, metadata.exif, metadata.xmp, output, scratch_bytes)
+    return encode_boxes(source, options, metadata, output, scratch_bytes)
 }
 
-fn encode_boxes(source: &pixels.View, options: &EncodeOptions, exif: &[u8], xmp: &[u8], output: &mut[u8], scratch_bytes: &mut[u8]) -> usize!pixels.Error {
+fn encode_boxes(source: &pixels.View, options: &EncodeOptions, metadata: &Metadata, output: &mut[u8], scratch_bytes: &mut[u8]) -> usize!pixels.Error {
+    exif := metadata.exif
+    xmp := metadata.xmp
+    icc := metadata.icc
+    if options.is_lossy() {
+        return vd_encode(source, options, metadata, output, scratch_bytes)
+    }
     width := source.width()
     height := source.height()
     layout := source.layout()
@@ -305,17 +517,61 @@ fn encode_boxes(source: &pixels.View, options: &EncodeOptions, exif: &[u8], xmp:
     let slice.SplitMut { left: choice_bytes, right: rest4 } = scratch.split(rest3, scratch.size(MAX_CONTEXTS, 4)?)?
     let slice.SplitMut { left: code_bytes, right: rest5 } = scratch.split(rest4, scratch.size(SUM_WORDS, 2)?)?
     let slice.SplitMut { left: small_bytes, right: rest6 } = scratch.split(rest5, scratch.size(SUM_WORDS + MAX_CONTEXTS, 1)?)?
-    let slice.SplitMut { left: palette_bytes, right: toc_bytes } = scratch.split(rest6, scratch.size(PALETTE_WORDS, 4)?)?
+    let slice.SplitMut { left: palette_bytes, right: rest7 } = scratch.split(rest6, scratch.size(PALETTE_WORDS, 4)?)?
+    let slice.SplitMut { left: toc_bytes, right: rest8 } = scratch.split(rest7, scratch.size(toc_entries(width as usize, height as usize), 4)?)?
+    ans_size := 0usize
+    if uses_ans(options) {
+        ans_size = scratch.size(ANS_WORDS, 2)?
+    }
+    let slice.SplitMut { left: ans_bytes, right: token_bytes } = scratch.split(rest8, ans_size)?
     let slice.SplitMut { left: lengths, right: map } = scratch.split(small_bytes, SUM_WORDS)?
     planes := scratch.i32s(plane_bytes)
-    hist := scratch.u32s(hist_bytes)
     sums := scratch.u32s(sum_bytes)
     choice := scratch.u32s(choice_bytes)
     codes := scratch.u16s(code_bytes)
     words := scratch.u32s(palette_bytes)
     sizes := scratch.u32s(toc_bytes)
+    ans := scratch.u16s(ans_bytes)
+    tokens := scratch.u32s(token_bytes)
 
     plan := new_plan(width, height, layout, options.effort)
+    if icc.len > 0 {
+        check_icc(icc, plan.color_channels)?
+    }
+    level10 := needs_level10(width, height, layout)
+    bound := pixels.checked(1, codestream_bound(width, height, layout)?, icc_bound(icc.len)?)?
+    base := container_prefix(options, exif, xmp, bound, level10)?
+    if output.len < base {
+        return err(pixels.Error.BufferTooSmall)
+    }
+    shape := Shape { width: width, height: height, color_channels: plan.color_channels, alpha: plan.alpha, bits: plan.bits, float: plan.float, alpha_associated: plan.premultiplied, orientation: color.exif_value(&options.orientation), xyb: false }
+
+    // The image header and ICC profile go first, while all scratch is free
+    // for the ICC coder; the writer state is kept for the frame.
+    header_pos := 0usize
+    header_acc := 0u64
+    header_count := 0u32
+    header_overflow := false
+    {
+        w := BitWriter.new(output, base)
+        write_image_header(&mut w, &shape, &options.color, icc.len > 0)
+        if icc.len > 0 {
+            let slice.SplitMut { left: icc_hist_bytes, right: icc_work_bytes } = scratch.split(hist_bytes, scratch.size((ICC_CONTEXTS + 1) * MAX_ALPHA, 4)?)?
+            let slice.SplitMut { left: ring_bytes, right: rest9 } = scratch.split(icc_work_bytes, scratch.size(ICC_RING_WORDS, 4)?)?
+            let slice.SplitMut { left: head_bytes, right: chain_bytes } = scratch.split(rest9, scratch.size(ICC_HEAD_WORDS, 4)?)?
+            no_ans := [0u16; 1]
+            icc_set := CodeSet.new(map, lengths, codes, &mut no_ans[..0], ICC_CONTEXTS + 1, true, ICC_MIN_MATCH as u32)
+            if !write_icc(&mut w, icc, &mut icc_set, scratch.u32s(icc_hist_bytes), sums, choice, scratch.u32s(ring_bytes), scratch.u32s(head_bytes), scratch.u32s(chain_bytes)) {
+                return err(pixels.Error.Unsupported)
+            }
+        }
+        header_pos = w.pos
+        header_acc = w.acc
+        header_count = w.count
+        header_overflow = w.overflow
+    }
+
+    hist := scratch.u32s(hist_bytes)
     analyze(source, &mut plan, planes, hist, words)
     tree := Tree.new()
     build_tree(&plan, &mut tree)
@@ -326,34 +582,68 @@ fn encode_boxes(source: &pixels.View, options: &EncodeOptions, exif: &[u8], xmp:
     if plan.lz77 {
         contexts += 1
     }
-
-    // Pass 1: count symbols over the whole image.
-    for i in 0usize..contexts * MAX_ALPHA {
-        hist[i] = 0
+    // Effort 2 and up tune the hybrid integer configuration per cluster
+    // from finely counted histograms and may code with ANS.
+    tune := plan.effort >= 2
+    ans_level := 0u32
+    if tune {
+        ans_level = 1
+        if plan.effort >= 3 {
+            ans_level = 2
+        }
     }
-    set := CodeSet { map: map, lengths: lengths, codes: codes, contexts: contexts, clusters: 1, alphabets: [0u16; 32], singles: [false; 32], split: LIT_SPLIT, msb: LIT_MSB, lsb: LIT_LSB, lz77: plan.lz77, min_length: plan.min_length as u32 }
-    {
+    count := CONFIG_DEFAULT
+    lz_base := LZ77_MIN_SYMBOL
+    if tune && plan.bits <= 16 {
+        count = CONFIG_FINE
+        lz_base = LZ77_FINE_BASE
+    }
+
+    // Pass 1: count symbols over the whole image (again with the default
+    // configuration if a residual is too large for fine counting).
+    no_set_ans := [0u16; 1]
+    set := CodeSet.new(map, lengths, codes, &mut no_set_ans[..0], contexts, plan.lz77, plan.min_length as u32)
+    for attempt in 0usize..2 {
+        for i in 0usize..contexts * MAX_ALPHA {
+            hist[i] = 0
+        }
         empty := [0u8; 1]
         dummy := BitWriter.new(&mut empty, 1)
-        e := Emitter { counting: true, hist: &mut hist[..], split: LIT_SPLIT, msb: LIT_MSB, lsb: LIT_LSB, lz77: plan.lz77, min_length: plan.min_length, dist_ctx: tree.contexts, run_value: 0, run_count: 0, run_ctx: [0u16; 16] }
-        code_image(source, &plan, &tree, planes, words, &mut e, &set, &mut dummy, false)
+        broken := false
+        {
+            e := Emitter.new(true, &mut hist[..], &mut tokens[..0], count, lz_base, plan.lz77, plan.min_length, tree.contexts)
+            code_image(source, &plan, &tree, planes, words, &mut e, &set, &mut dummy, false)
+            broken = e.broken
+        }
+        if !broken {
+            break
+        }
+        if count == CONFIG_DEFAULT {
+            return err(pixels.Error.Unsupported)
+        }
+        count = CONFIG_DEFAULT
+        lz_base = LZ77_MIN_SYMBOL
     }
-    // Cluster the context histograms and build prefix codes.
+    // Cluster the context histograms and build the codes.
     limit := MAX_CLUSTERS
     if plan.effort == 1 {
         limit = 8
     }
-    set.clusters = cluster_histograms(hist, contexts, limit, set.map, sums, choice)
-    set.build(sums)
+    proj := [0u16; 288]
+    projection(count, lz_base, &mut proj)
+    set.ans = ans
+    set.clusters = cluster_histograms(hist, contexts, limit, set.map, sums, choice, &proj)
+    streams := 1usize
+    if !single_group(&plan) {
+        streams += plan.groups_x * plan.groups_y
+    }
+    if tune {
+        set.build_tuned(sums, count, lz_base, true, ans_level, streams)
+    } else {
+        set.build(sums)
+    }
 
     // Pass 2: write.
-    level10 := needs_level10(width, height, layout)
-    bound := codestream_bound(width, height, layout)?
-    base := container_prefix(options, exif, xmp, bound, level10)?
-    if output.len < base {
-        return err(pixels.Error.BufferTooSmall)
-    }
-    shape := Shape { width: width, height: height, color_channels: plan.color_channels, alpha: plan.alpha, bits: plan.bits, float: plan.float, alpha_associated: plan.premultiplied, orientation: color.exif_value(&options.orientation) }
     entries := toc_entries(plan.width, plan.height)
     // First attempt: leave room for the largest TOC, write the sections,
     // then move them down behind the real TOC.
@@ -362,12 +652,13 @@ fn encode_boxes(source: &pixels.View, options: &EncodeOptions, exif: &[u8], xmp:
     end := 0usize
     overflow := false
     {
-        w := BitWriter.new(output, base)
-        write_image_header(&mut w, &shape, &options.color)
+        w := BitWriter.resume(output, header_pos, header_acc, header_count, header_overflow)
         write_frame_header(&mut w, plan.alpha)
         toc_start = w.pos
         w.pos = toc_start + reserve
-        write_sections(source, &plan, &tree, planes, words, &tree_ctxs, &tree_values, tree_tokens, &set, &mut hist[..], sizes, &mut w)
+        if !write_sections(source, &plan, &tree, planes, words, &tree_ctxs, &tree_values, tree_tokens, &set, &mut hist[..], tokens, sizes, tune, ans_level, &mut w) {
+            return err(pixels.Error.Unsupported)
+        }
         end = w.pos
         overflow = w.overflow
     }
@@ -383,14 +674,15 @@ fn encode_boxes(source: &pixels.View, options: &EncodeOptions, exif: &[u8], xmp:
     if overflow {
         // The output fits only without the TOC slack: write again with the
         // TOC (sizes now known) in place.
-        w := BitWriter.new(output, base)
-        write_image_header(&mut w, &shape, &options.color)
+        w := BitWriter.resume(output, header_pos, header_acc, header_count, header_overflow)
         write_frame_header(&mut w, plan.alpha)
         for i in 0usize..entries {
             write_toc_entry(&mut w, sizes[i])
         }
         w.pad()
-        write_sections(source, &plan, &tree, planes, words, &tree_ctxs, &tree_values, tree_tokens, &set, &mut hist[..], sizes, &mut w)
+        if !write_sections(source, &plan, &tree, planes, words, &tree_ctxs, &tree_values, tree_tokens, &set, &mut hist[..], tokens, sizes, tune, ans_level, &mut w) {
+            return err(pixels.Error.Unsupported)
+        }
         if w.overflow || w.pos != final_end {
             return err(pixels.Error.BufferTooSmall)
         }
@@ -415,19 +707,22 @@ fn encode_boxes(source: &pixels.View, options: &EncodeOptions, exif: &[u8], xmp:
 
 // LfGlobal (default LF dequantization, then GlobalModular: tree, codes and
 // the global stream), the empty LF group and HfGlobal sections, and the
-// groups, recording every section's byte size.
-fn write_sections(source: &pixels.View, plan: &Plan, tree: &Tree, planes: &mut[i32], words: &[u32], tree_ctxs: &[u8], tree_values: &[u32], tree_tokens: usize, set: &CodeSet, hist: &mut[u32], sizes: &mut[u32], w: &mut BitWriter) {
+// groups, recording every section's byte size. Returns false when a value
+// could not be coded with the counted statistics (never expected).
+fn write_sections(source: &pixels.View, plan: &Plan, tree: &Tree, planes: &mut[i32], words: &[u32], tree_ctxs: &[u8], tree_values: &[u32], tree_tokens: usize, set: &CodeSet, hist: &mut[u32], tokens: &mut[u32], sizes: &mut[u32], tune: bool, ans_level: u32, w: &mut BitWriter) -> bool {
     section := w.pos
     w.write(1, 1)
     w.write(1, 1)
-    write_tree(w, tree_ctxs, tree_values, tree_tokens)
+    if !write_tree(w, tree_ctxs, tree_values, tree_tokens, tune, ans_level) {
+        return false
+    }
     set.write(w)
-    e := Emitter { counting: false, hist: hist, split: LIT_SPLIT, msb: LIT_MSB, lsb: LIT_LSB, lz77: plan.lz77, min_length: plan.min_length, dist_ctx: tree.contexts, run_value: 0, run_count: 0, run_ctx: [0u16; 16] }
+    e := Emitter.new(false, hist, tokens, CONFIG_DEFAULT, LZ77_MIN_SYMBOL, plan.lz77, plan.min_length, tree.contexts)
     code_global(source, plan, tree, planes, words, &mut e, set, w)
     w.pad()
     sizes[0] = (w.pos - section) as u32
     if single_group(plan) {
-        return
+        return !e.broken
     }
     at := 1usize
     for i in 0usize..plan.lf_groups + 1 {
@@ -441,6 +736,7 @@ fn write_sections(source: &pixels.View, plan: &Plan, tree: &Tree, planes: &mut[i
         sizes[at] = (w.pos - section) as u32
         at += 1
     }
+    return !e.broken
 }
 fn write_container(exif: &[u8], xmp: &[u8], output: &mut[u8], base: usize, codestream: usize, level10: bool) {
     at := 0usize
@@ -484,23 +780,53 @@ fn write_container(exif: &[u8], xmp: &[u8], output: &mut[u8], base: usize, codes
     }
 }
 
-// The MA tree: its code spec (six contexts sharing one prefix code) and
-// tokens.
-fn write_tree(w: &mut BitWriter, ctxs: &[u8], values: &[u32], tokens: usize) {
-    freq := [0u32; 272]
+// The MA tree: its code spec (six contexts sharing one distribution) and
+// tokens. With `tune` the hybrid integer configuration is chosen from
+// finely counted tokens and ANS is used when smaller (ans_level as in
+// CodeSet.build_tuned).
+fn write_tree(w: &mut BitWriter, ctxs: &[u8], values: &[u32], tokens: usize, tune: bool, ans_level: u32) -> bool {
+    count := CONFIG_DEFAULT
+    lz_base := LZ77_MIN_SYMBOL
+    if tune {
+        count = CONFIG_FINE
+        lz_base = LZ77_FINE_BASE
+        for i in 0usize..tokens {
+            if values[i] as u64 >= FINE_LIMIT {
+                count = CONFIG_DEFAULT
+                lz_base = LZ77_MIN_SYMBOL
+            }
+        }
+    }
+    freq := [0u32; 288]
     for i in 0usize..tokens {
-        t := hybrid(values[i] as u64, 4, 2, 0)
+        t := hybrid_config(values[i] as u64, count)
         freq[(t & 0xFFFF) as usize] += 1
     }
     map := [0u8; 6]
-    lengths := [0u8; 272]
-    codes := [0u16; 272]
-    set := CodeSet { map: &mut map, lengths: &mut lengths, codes: &mut codes, contexts: 6, clusters: 1, alphabets: [0u16; 32], singles: [false; 32], split: 4, msb: 2, lsb: 0, lz77: false, min_length: 0 }
-    set.build(&freq)
+    lengths := [0u8; 288]
+    codes := [0u16; 288]
+    ans := [0u16; 4608]
+    set := CodeSet.new(&mut map, &mut lengths, &mut codes, &mut ans, 6, false, 0)
+    if tune {
+        set.build_tuned(&freq, count, lz_base, true, ans_level, 1)
+    } else {
+        set.build(&freq)
+    }
     set.write(w)
+    config := set.configs[0]
+    if set.use_ans {
+        records := [0u32; 5120]
+        for i in 0usize..tokens {
+            t := hybrid_config(values[i] as u64, config)
+            records[2 * i] = (t >> 24) as u32
+            records[2 * i + 1] = ((t >> 16) & 255) as u32 | (((t & 0xFFFF) as u32) << 6)
+        }
+        return write_ans_stream(&set, w, &mut records, tokens)
+    }
     for i in 0usize..tokens {
-        t := hybrid(values[i] as u64, 4, 2, 0)
+        t := hybrid_config(values[i] as u64, config)
         set.put(w, ctxs[i] as usize, (t & 0xFFFF) as usize)
         w.write(((t >> 16) & 255) as u32, t >> 24)
     }
+    return true
 }

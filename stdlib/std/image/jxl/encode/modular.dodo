@@ -28,51 +28,101 @@ struct Stream {
     }
 }
 
-// Counts or writes symbols, turning runs of equal values into LZ77 copies.
+// Counts or writes symbols, turning runs of equal values into LZ77 copies
+// at distance 1 (one modular stream; flush() ends the stream).
+//
+// Counting adds tokens of the counting configuration (split, msb, lsb;
+// LZ77 lengths from lz_base) to hist[ctx * MAX_ALPHA..]. Writing codes each
+// value with the configuration of its context's cluster: prefix codes go to
+// the writer at once, ANS tokens are buffered in `tokens` (two words each)
+// and written in reverse at flush(). `broken` reports a value the counted
+// statistics cannot represent (a counted token beyond the alphabet, a
+// symbol without code, or a full token buffer).
 struct Emitter {
     counting: bool
     hist: &mut[u32]
     split: u32
     msb: u32
     lsb: u32
+    lz_base: u32
     lz77: bool
     min_length: usize
     dist_ctx: usize
     run_value: u64
     run_count: usize
     run_ctx: [16]u16
+    tokens: &mut[u32]
+    count: usize
+    broken: bool
 
-    fn literal(&mut self, codes: &CodeSet, w: &mut BitWriter, ctx: usize, value: u64) {
-        t := hybrid(value, self.split, self.msb, self.lsb)
-        token := (t & 0xFFFF) as usize
-        if self.counting {
-            at := ctx * MAX_ALPHA + token
-            if self.hist[at] != 0xFFFFFFFF {
-                self.hist[at] += 1
-            }
+    // An emitter that counts with configuration `config` (packed) and LZ77
+    // lengths from lz_base, or (counting false) writes with a CodeSet,
+    // buffering ANS tokens in `tokens`.
+    fn new(counting: bool, hist: &mut[u32], tokens: &mut[u32], config: u32, lz_base: u32, lz77: bool, min_length: usize, dist_ctx: usize) -> Emitter from(hist, tokens) {
+        return Emitter { counting: counting, hist: hist, split: config & 255, msb: (config >> 8) & 255, lsb: (config >> 16) & 255, lz_base: lz_base, lz77: lz77, min_length: min_length, dist_ctx: dist_ctx, run_value: 0, run_count: 0, run_ctx: [0u16; 16], tokens: tokens, count: 0, broken: false }
+    }
+    fn count_symbol(&mut self, ctx: usize, symbol: usize) {
+        at := ctx * MAX_ALPHA + symbol
+        if self.hist[at] != 0xFFFFFFFF {
+            self.hist[at] += 1
+        }
+    }
+    // Code token `symbol` of cluster k with its extra bits.
+    fn code(&mut self, codes: &CodeSet, w: &mut BitWriter, k: usize, symbol: usize, nbits: u32, bits: u32) {
+        if symbol >= codes.alphabets[k] as usize {
+            self.broken = true
             return
         }
-        codes.put(w, ctx, token)
-        w.write(((t >> 16) & 255) as u32, t >> 24)
+        if codes.use_ans {
+            if 2 * self.count + 2 > self.tokens.len {
+                self.broken = true
+                return
+            }
+            self.tokens[2 * self.count] = bits
+            self.tokens[2 * self.count + 1] = nbits | ((symbol as u32) << 6) | ((k as u32) << 14)
+            self.count += 1
+            return
+        }
+        if !codes.singles[k] {
+            length := codes.lengths[k * MAX_ALPHA + symbol] as u32
+            if length == 0 {
+                self.broken = true
+                return
+            }
+            w.write(length, codes.codes[k * MAX_ALPHA + symbol] as u64)
+        }
+        w.write(nbits, bits as u64)
+    }
+    fn literal(&mut self, codes: &CodeSet, w: &mut BitWriter, ctx: usize, value: u64) {
+        if self.counting {
+            t := hybrid(value, self.split, self.msb, self.lsb)
+            token := (t & 0xFFFF) as u32
+            if token >= self.lz_base {
+                self.broken = true
+                return
+            }
+            self.count_symbol(ctx, token as usize)
+            return
+        }
+        k := codes.map[ctx] as usize
+        t := hybrid_config(value, codes.configs[k])
+        self.code(codes, w, k, (t & 0xFFFF) as usize, ((t >> 16) & 255) as u32, (t >> 24) as u32)
     }
     fn copy(&mut self, codes: &CodeSet, w: &mut BitWriter, ctx: usize, length: usize) {
         t := hybrid((length - self.min_length) as u64, LZ77_LEN_SPLIT, 0, 0)
-        symbol := LZ77_MIN_SYMBOL as usize + (t & 0xFFFF) as usize
         if self.counting {
-            at := ctx * MAX_ALPHA + symbol
-            if self.hist[at] != 0xFFFFFFFF {
-                self.hist[at] += 1
-            }
+            symbol := self.lz_base as usize + (t & 0xFFFF) as usize
+            self.count_symbol(ctx, symbol)
             // Distance 1 is special distance index 1, token 1.
-            at2 := self.dist_ctx * MAX_ALPHA + 1
-            if self.hist[at2] != 0xFFFFFFFF {
-                self.hist[at2] += 1
-            }
+            dist_ctx := self.dist_ctx
+            self.count_symbol(dist_ctx, 1)
             return
         }
-        codes.put(w, ctx, symbol)
-        w.write(((t >> 16) & 255) as u32, t >> 24)
-        codes.put(w, self.dist_ctx, 1)
+        k := codes.map[ctx] as usize
+        self.code(codes, w, k, LZ77_MIN_SYMBOL as usize + (t & 0xFFFF) as usize, ((t >> 16) & 255) as u32, (t >> 24) as u32)
+        dk := codes.map[self.dist_ctx] as usize
+        d := hybrid_config(1, codes.configs[dk])
+        self.code(codes, w, dk, (d & 0xFFFF) as usize, ((d >> 16) & 255) as u32, (d >> 24) as u32)
     }
     fn feed(&mut self, codes: &CodeSet, w: &mut BitWriter, ctx: usize, value: u64) {
         if !self.lz77 {
@@ -86,13 +136,12 @@ struct Emitter {
             self.run_count += 1
             return
         }
-        self.flush(codes, w)
+        self.end_run(codes, w)
         self.run_value = value
         self.run_ctx[0] = ctx as u16
         self.run_count = 1
     }
-    // End the pending run; called at the end of every stream.
-    fn flush(&mut self, codes: &CodeSet, w: &mut BitWriter) {
+    fn end_run(&mut self, codes: &CodeSet, w: &mut BitWriter) {
         n := self.run_count
         if n == 0 {
             return
@@ -110,6 +159,18 @@ struct Emitter {
             }
         }
         self.run_count = 0
+    }
+    // End the stream: the pending run, then (writing with ANS) the buffered
+    // tokens. Called at the end of every stream.
+    fn flush(&mut self, codes: &CodeSet, w: &mut BitWriter) {
+        self.end_run(codes, w)
+        if self.counting || !codes.use_ans {
+            return
+        }
+        if !write_ans_stream(codes, w, self.tokens, self.count) {
+            self.broken = true
+        }
+        self.count = 0
     }
 }
 

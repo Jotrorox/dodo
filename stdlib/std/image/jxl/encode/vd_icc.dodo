@@ -1,0 +1,759 @@
+package encode
+
+import "std/image/convert"
+import "std/image/pixels"
+
+// Lossy encoding with an embedded ICC profile: samples are rendered to
+// linear sRGB for XYB through the profile, the way a color management
+// system (lcms) reads it as an input profile, and the image header embeds
+// the profile with xyb_encoded set, as libjxl writes it. Decoders with
+// color management render XYB into the profile; others (std/image/jxl)
+// output sRGB.
+//
+// RGB profiles: the AToB lookup table of the profile's rendering intent
+// (A2B0 perceptual, A2B1 relative/absolute colorimetric, A2B2 saturation;
+// A2B0 when that one is missing) when present: lutAtoBType (A curves,
+// CLUT, M curves, matrix, B curves), lut16Type or lut8Type (input tables,
+// CLUT, output tables), with the XYZ or Lab connection space and
+// tetrahedral CLUT interpolation; otherwise the matrix/TRC model
+// (rXYZ/gXYZ/bXYZ colorants, rTRC/gTRC/bTRC curves; XYZ connection space).
+// The D50 connection space reaches linear sRGB through the sRGB colorants
+// adapted to D50 (Bradford), i.e. relative colorimetric; white points are
+// not used. Gray profiles: kTRC. Profiles with float DToB tables
+// (multiProcessElements), gray profiles with lookup tables and anything
+// else are not supported in lossy mode.
+//
+// Curves: curv (identity, gamma, or a table interpolated linearly), para
+// (function types 0 to 4) and the tables of lut16/lut8. Each goes through a
+// table of the scratch: 256 entries for the input curves of 8-bit samples,
+// otherwise 4097 entries over 0..1 interpolated linearly. Matrix/TRC
+// profiles extend parametric curves odd-symmetrically to float samples
+// outside 0..1 and clamp table curves; lookup tables clamp their inputs to
+// 0..1.
+
+// Curve kinds.
+const VD_CURVE_IDENTITY: u32 = 0
+const VD_CURVE_POWER: u32 = 1
+const VD_CURVE_PARA: u32 = 2
+const VD_CURVE_TABLE: u32 = 3
+// Curve slots: input (A or TRC) curves 0..2, M curves 3..5, B (or output)
+// curves 6..8.
+const VD_CURVES: usize = 9
+// Entries of a curve table for samples that are not 8-bit and for the M
+// and B curves.
+const VD_ICC_STEPS: usize = 4096
+// Connection space encodings of lookup tables.
+const VD_PCS_XYZ: u32 = 0
+const VD_PCS_LAB: u32 = 1
+const VD_PCS_LAB16: u32 = 2
+const VD_PCS_LAB8: u32 = 3
+
+fn vd_be32(icc: &[u8], at: u64) -> u64 {
+    if at + 4 > icc.len as u64 {
+        return 0
+    }
+    i := at as usize
+    return ((icc[i] as u64) << 24) | ((icc[i + 1] as u64) << 16) | ((icc[i + 2] as u64) << 8) | icc[i + 3] as u64
+}
+
+fn vd_be16(icc: &[u8], at: u64) -> u32 {
+    if at + 2 > icc.len as u64 {
+        return 0
+    }
+    i := at as usize
+    return ((icc[i] as u32) << 8) | icc[i + 1] as u32
+}
+
+fn vd_byte(icc: &[u8], at: u64) -> u32 {
+    if at >= icc.len as u64 {
+        return 0
+    }
+    return icc[at as usize] as u32
+}
+
+// s15Fixed16Number at `at`.
+fn vd_s15(icc: &[u8], at: u64) -> f64 {
+    v := vd_be32(icc, at)
+    if v >= 0x80000000 {
+        return -((0x100000000 - v) as f64) / 65536.0
+    }
+    return v as f64 / 65536.0
+}
+
+fn vd_sig(icc: &[u8], at: u64, a: u8, b: u8, c: u8, d: u8) -> bool {
+    if at + 4 > icc.len as u64 {
+        return false
+    }
+    i := at as usize
+    return icc[i] == a && icc[i + 1] == b && icc[i + 2] == c && icc[i + 3] == d
+}
+
+// Offset and size of tag `a b c d`, or (0, 0) when it is missing or does not
+// fit in the profile.
+fn vd_find_tag(icc: &[u8], a: u8, b: u8, c: u8, d: u8) -> (u64, u64) {
+    length := icc.len as u64
+    if length < 132 {
+        return (0, 0)
+    }
+    count := vd_be32(icc, 128)
+    if count > (length - 132) / 12 {
+        return (0, 0)
+    }
+    for i in 0u64..count {
+        at := 132 + 12 * i
+        if vd_sig(icc, at, a, b, c, d) {
+            offset := vd_be32(icc, at + 4)
+            size := vd_be32(icc, at + 8)
+            if offset < 128 || offset > length || size > length - offset {
+                return (0, 0)
+            }
+            return (offset, size)
+        }
+    }
+    return (0, 0)
+}
+
+fn vd_has_tag(icc: &[u8], a: u8, b: u8, c: u8, d: u8) -> bool {
+    let (offset, size) = vd_find_tag(icc, a, b, c, d)
+    return size > 0 && offset > 0
+}
+
+// An XYZType tag's first value into column `col` of m (rows X, Y, Z).
+fn vd_read_colorant(icc: &[u8], a: u8, b: u8, c: u8, d: u8, m: &mut[f64], col: usize) -> bool {
+    let (offset, size) = vd_find_tag(icc, a, b, c, d)
+    if size < 20 || !vd_sig(icc, offset, b'X', b'Y', b'Z', b' ') {
+        return false
+    }
+    for k in 0usize..3 {
+        m[k * 3 + col] = vd_s15(icc, offset + 8 + 4 * k as u64)
+    }
+    return true
+}
+
+fn vd_finite(v: f64) -> bool {
+    return v == v && v < 1.0e30 && v > -1.0e30
+}
+
+// A curv or para element at `offset` (at most `size` bytes) into slot s;
+// returns its byte length padded to 4, or 0 when invalid.
+fn vd_read_curve_at(icc: &[u8], offset: u64, size: u64, t: &mut VdColor, s: usize) -> u64 {
+    if size < 12 {
+        return 0
+    }
+    for k in 0usize..7 {
+        t.curve_par[s * 7 + k] = 0.0
+    }
+    t.curve_w[s] = 2
+    if vd_sig(icc, offset, b'c', b'u', b'r', b'v') {
+        n := vd_be32(icc, offset + 8)
+        if n > (size - 12) / 2 {
+            return 0
+        }
+        length := (12 + 2 * n + 3) / 4 * 4
+        if n == 0 {
+            t.curve_kind[s] = VD_CURVE_IDENTITY
+            return length
+        }
+        if n == 1 {
+            g := vd_be16(icc, offset + 12) as f64 / 256.0
+            if g <= 0.0 {
+                return 0
+            }
+            t.curve_kind[s] = VD_CURVE_POWER
+            t.curve_par[s * 7] = g
+            return length
+        }
+        t.curve_kind[s] = VD_CURVE_TABLE
+        t.curve_at[s] = (offset + 12) as usize
+        t.curve_n[s] = n as usize
+        return length
+    }
+    if vd_sig(icc, offset, b'p', b'a', b'r', b'a') {
+        ftype := vd_be16(icc, offset + 8)
+        counts := [1u64, 3, 4, 5, 7]
+        if ftype > 4 || size < 12 + 4 * counts[ftype as usize] {
+            return 0
+        }
+        n := counts[ftype as usize]
+        for k in 0usize..n as usize {
+            t.curve_par[s * 7 + k] = vd_s15(icc, offset + 12 + 4 * k as u64)
+        }
+        if t.curve_par[s * 7] <= 0.0 {
+            return 0
+        }
+        t.curve_kind[s] = VD_CURVE_PARA
+        t.curve_type[s] = ftype
+        return (12 + 4 * n + 3) / 4 * 4
+    }
+    return 0
+}
+
+// The curve of tag `a b c d` into slot s.
+fn vd_read_curve(icc: &[u8], a: u8, b: u8, c: u8, d: u8, t: &mut VdColor, s: usize) -> bool {
+    let (offset, size) = vd_find_tag(icc, a, b, c, d)
+    return vd_read_curve_at(icc, offset, size, t, s) > 0
+}
+
+// Three consecutive curves at `start` of a lutAtoB tag spanning
+// [tag, tag + size) into slots s..s + 2.
+fn vd_read_curves3(icc: &[u8], tag: u64, size: u64, start: u64, t: &mut VdColor, s: usize) -> bool {
+    at := start
+    for k in 0usize..3 {
+        if at < 32 || at >= size {
+            return false
+        }
+        length := vd_read_curve_at(icc, tag + at, size - at, t, s + k)
+        if length == 0 {
+            return false
+        }
+        at += length
+    }
+    return true
+}
+
+fn vd_identity_curves(t: &mut VdColor, s: usize) {
+    for k in s..s + 3 {
+        t.curve_kind[k] = VD_CURVE_IDENTITY
+    }
+}
+
+// A lutAtoBType (3 in, 3 out) at `tag` of `size` bytes.
+fn vd_read_mab(icc: &[u8], tag: u64, size: u64, t: &mut VdColor) -> bool {
+    if size < 32 || vd_byte(icc, tag + 8) != 3 || vd_byte(icc, tag + 9) != 3 {
+        return false
+    }
+    off_b := vd_be32(icc, tag + 12)
+    off_mat := vd_be32(icc, tag + 16)
+    off_m := vd_be32(icc, tag + 20)
+    off_clut := vd_be32(icc, tag + 24)
+    off_a := vd_be32(icc, tag + 28)
+    if off_b == 0 || !vd_read_curves3(icc, tag, size, off_b, t, 6) {
+        return false
+    }
+    vd_identity_curves(t, 0)
+    if off_a != 0 && !vd_read_curves3(icc, tag, size, off_a, t, 0) {
+        return false
+    }
+    vd_identity_curves(t, 3)
+    if off_m != 0 && !vd_read_curves3(icc, tag, size, off_m, t, 3) {
+        return false
+    }
+    t.lut_matrix = false
+    if off_mat != 0 {
+        if off_mat < 32 || off_mat > size || size - off_mat < 48 {
+            return false
+        }
+        for k in 0usize..12 {
+            v := vd_s15(icc, tag + off_mat + 4 * k as u64)
+            if !vd_finite(v) {
+                return false
+            }
+            t.mtx[k] = v
+        }
+        t.lut_matrix = true
+    }
+    t.has_clut = false
+    if off_clut != 0 {
+        if off_clut < 32 || off_clut > size || size - off_clut < 20 {
+            return false
+        }
+        prec := vd_byte(icc, tag + off_clut + 16)
+        if prec != 1 && prec != 2 {
+            return false
+        }
+        entries := 3u64
+        for k in 0usize..3 {
+            g := vd_byte(icc, tag + off_clut + k as u64)
+            if g < 2 {
+                return false
+            }
+            t.clut_grid[k] = g as usize
+            entries *= g as u64
+        }
+        if entries * prec as u64 > size - off_clut - 20 {
+            return false
+        }
+        t.has_clut = true
+        t.clut_at = (tag + off_clut + 20) as usize
+        t.clut_prec = prec as usize
+    }
+    return true
+}
+
+// A lut16Type (`wide`) or lut8Type with 3 inputs and outputs at `tag`.
+fn vd_read_mft(icc: &[u8], tag: u64, size: u64, wide: bool, t: &mut VdColor) -> bool {
+    if size < 52 || vd_byte(icc, tag + 8) != 3 || vd_byte(icc, tag + 9) != 3 {
+        return false
+    }
+    g := vd_byte(icc, tag + 10) as u64
+    if g < 2 {
+        return false
+    }
+    n_in := 256u64
+    n_out := 256u64
+    w := 1u64
+    at := tag + 48
+    if wide {
+        n_in = vd_be16(icc, tag + 48) as u64
+        n_out = vd_be16(icc, tag + 50) as u64
+        w = 2
+        at = tag + 52
+        if n_in < 2 || n_in > 4096 || n_out < 2 || n_out > 4096 {
+            return false
+        }
+    }
+    need := (at - tag) + w * (3 * n_in + g * g * g * 3 + 3 * n_out)
+    if need > size {
+        return false
+    }
+    for k in 0usize..3 {
+        t.curve_kind[k] = VD_CURVE_TABLE
+        t.curve_at[k] = (at + w * n_in * k as u64) as usize
+        t.curve_n[k] = n_in as usize
+        t.curve_w[k] = w as u32
+    }
+    clut := at + w * 3 * n_in
+    out := clut + w * g * g * g * 3
+    for k in 0usize..3 {
+        t.curve_kind[6 + k] = VD_CURVE_TABLE
+        t.curve_at[6 + k] = (out + w * n_out * k as u64) as usize
+        t.curve_n[6 + k] = n_out as usize
+        t.curve_w[6 + k] = w as u32
+    }
+    vd_identity_curves(t, 3)
+    t.lut_matrix = false
+    t.has_clut = true
+    t.clut_at = clut as usize
+    t.clut_prec = w as usize
+    for k in 0usize..3 {
+        t.clut_grid[k] = g as usize
+    }
+    return true
+}
+
+// Fill in t's ICC model (see the top of this file); false for a profile
+// lossy encoding cannot convert from.
+fn vd_icc_model(icc: &[u8], t: &mut VdColor) -> bool {
+    if icc.len < 132 {
+        return false
+    }
+    xyz := vd_sig(icc, 20, b'X', b'Y', b'Z', b' ')
+    lab := vd_sig(icc, 20, b'L', b'a', b'b', b' ')
+    if vd_has_tag(icc, b'D', b'2', b'B', b'0') || vd_has_tag(icc, b'D', b'2', b'B', b'1') || vd_has_tag(icc, b'D', b'2', b'B', b'2') || vd_has_tag(icc, b'D', b'2', b'B', b'3') {
+        return false
+    }
+    t.icc = true
+    t.hlg_exponent = 0.0
+    if t.gray {
+        t.identity = true
+        if !xyz || vd_has_tag(icc, b'A', b'2', b'B', b'0') {
+            return false
+        }
+        return vd_read_curve(icc, b'k', b'T', b'R', b'C', t, 0)
+    }
+    // Linear sRGB from the D50 connection space.
+    to_srgb := [0.0f64; 9]
+    if !vd_srgb_d50(&mut to_srgb) || !vd_inv3(&mut to_srgb) {
+        return false
+    }
+    intent := vd_be32(icc, 64) & 3
+    digit := b'0'
+    if intent == 1 || intent == 3 {
+        digit = b'1'
+    } else if intent == 2 {
+        digit = b'2'
+    }
+    let (wanted_offset, wanted_size) = vd_find_tag(icc, b'A', b'2', b'B', digit)
+    let (default_offset, default_size) = vd_find_tag(icc, b'A', b'2', b'B', b'0')
+    offset := wanted_offset
+    size := wanted_size
+    if size == 0 {
+        offset = default_offset
+        size = default_size
+    }
+    if size > 0 {
+        if !xyz && !lab {
+            return false
+        }
+        found := false
+        if vd_sig(icc, offset, b'm', b'A', b'B', b' ') {
+            found = vd_read_mab(icc, offset, size, t)
+            t.pcs = VD_PCS_XYZ
+            if lab {
+                t.pcs = VD_PCS_LAB
+            }
+        } else if vd_sig(icc, offset, b'm', b'f', b't', b'2') {
+            found = vd_read_mft(icc, offset, size, true, t)
+            t.pcs = VD_PCS_XYZ
+            if lab {
+                t.pcs = VD_PCS_LAB16
+            }
+        } else if vd_sig(icc, offset, b'm', b'f', b't', b'1') {
+            found = vd_read_mft(icc, offset, size, false, t)
+            t.pcs = VD_PCS_XYZ
+            if lab {
+                t.pcs = VD_PCS_LAB8
+            }
+        }
+        if !found {
+            return false
+        }
+        t.lut_profile = true
+        for k in 0usize..9 {
+            t.m[k] = to_srgb[k] as f32
+        }
+        t.identity = false
+        return true
+    }
+    if !xyz {
+        return false
+    }
+    colorants := [0.0f64; 9]
+    if !vd_read_colorant(icc, b'r', b'X', b'Y', b'Z', &mut colorants, 0) || !vd_read_colorant(icc, b'g', b'X', b'Y', b'Z', &mut colorants, 1) || !vd_read_colorant(icc, b'b', b'X', b'Y', b'Z', &mut colorants, 2) {
+        return false
+    }
+    if !vd_read_curve(icc, b'r', b'T', b'R', b'C', t, 0) || !vd_read_curve(icc, b'g', b'T', b'R', b'C', t, 1) || !vd_read_curve(icc, b'b', b'T', b'R', b'C', t, 2) {
+        return false
+    }
+    product := [0.0f64; 9]
+    vd_mul3(&to_srgb, &colorants, &mut product)
+    for k in 0usize..9 {
+        if !vd_finite(product[k]) || product[k] > 1000.0 || product[k] < -1000.0 {
+            return false
+        }
+        t.m[k] = product[k] as f32
+    }
+    t.identity = false
+    return true
+}
+
+// Whether a lossy encoding can use `icc` for an image with `color_channels`
+// color channels.
+fn vd_icc_usable(icc: &[u8], color_channels: usize) -> bool {
+    match check_icc(icc, color_channels) {
+        ok() => {}
+        err(_) => {
+            return false
+        }
+    }
+    t := VdColor.empty(color_channels == 1)
+    return vd_icc_model(icc, &mut t)
+}
+
+// The parametric or power curve of slot s at x >= 0.
+fn vd_icc_formula(t: &VdColor, s: usize, x: f64) -> f64 {
+    p := s * 7
+    g := t.curve_par[p]
+    if t.curve_kind[s] == VD_CURVE_POWER {
+        return vd_pow(x, g)
+    }
+    a := t.curve_par[p + 1]
+    b := t.curve_par[p + 2]
+    c := t.curve_par[p + 3]
+    d := t.curve_par[p + 4]
+    e := t.curve_par[p + 5]
+    f := t.curve_par[p + 6]
+    ftype := t.curve_type[s]
+    if ftype == 0 {
+        return vd_pow(x, g)
+    }
+    if ftype == 1 || ftype == 2 {
+        base := a * x + b
+        offset := 0.0f64
+        if ftype == 2 {
+            offset = c
+        }
+        if base < 0.0 {
+            return offset
+        }
+        return vd_pow(base, g) + offset
+    }
+    if x < d {
+        if ftype == 4 {
+            return c * x + f
+        }
+        return c * x
+    }
+    base := a * x + b
+    if base < 0.0 {
+        base = 0.0
+    }
+    if ftype == 4 {
+        return vd_pow(base, g) + e
+    }
+    return vd_pow(base, g)
+}
+
+// Table entry i of slot s, 0..1.
+fn vd_curve_entry(t: &VdColor, icc: &[u8], s: usize, i: usize) -> f64 {
+    at := t.curve_at[s] as u64
+    if t.curve_w[s] == 1 {
+        return vd_byte(icc, at + i as u64) as f64 / 255.0
+    }
+    return vd_be16(icc, at + 2 * i as u64) as f64 / 65535.0
+}
+
+// Curve s at x in 0..1 (tables read from the profile).
+fn vd_icc_curve(t: &VdColor, icc: &[u8], s: usize, x: f64) -> f64 {
+    kind := t.curve_kind[s]
+    if kind == VD_CURVE_IDENTITY {
+        return x
+    }
+    if kind == VD_CURVE_TABLE {
+        n := t.curve_n[s]
+        p := x * (n - 1) as f64
+        if p <= 0.0 {
+            return vd_curve_entry(t, icc, s, 0)
+        }
+        i := p as usize
+        if i >= n - 1 {
+            return vd_curve_entry(t, icc, s, n - 1)
+        }
+        frac := p - i as f64
+        lo := vd_curve_entry(t, icc, s, i)
+        hi := vd_curve_entry(t, icc, s, i + 1)
+        return lo + frac * (hi - lo)
+    }
+    return vd_icc_formula(t, s, x)
+}
+
+fn vd_clamp_linear(v: f64) -> f32 {
+    if !(v == v) {
+        return 0.0
+    }
+    if v > VD_LINEAR_LIMIT as f64 {
+        return VD_LINEAR_LIMIT
+    }
+    if v < -(VD_LINEAR_LIMIT as f64) {
+        return -VD_LINEAR_LIMIT
+    }
+    return v as f32
+}
+
+// Start of slot s in the curve tables: the input curves take 256 entries
+// per channel for 8-bit samples and 4097 otherwise, the M and B curves 4097
+// each after them.
+fn vd_slot_base(t: &VdColor, s: usize) -> usize {
+    first := VD_ICC_STEPS + 1
+    if t.sample == pixels.SAMPLE_U8 {
+        first = 256
+    }
+    if s < 3 {
+        return s * first
+    }
+    return 3 * first + (s - 3) * (VD_ICC_STEPS + 1)
+}
+
+// The curve tables (see vd_lut_size).
+fn vd_fill_icc_lut(t: &VdColor, icc: &[u8], lut: &mut[f32]) {
+    slots := t.color_channels
+    if t.lut_profile {
+        slots = VD_CURVES
+    }
+    for s in 0usize..slots {
+        base := vd_slot_base(t, s)
+        if s < 3 && t.sample == pixels.SAMPLE_U8 {
+            for i in 0usize..256 {
+                lut[base + i] = vd_clamp_linear(vd_icc_curve(t, icc, s, i as f64 / 255.0))
+            }
+        } else {
+            for i in 0usize..VD_ICC_STEPS + 1 {
+                lut[base + i] = vd_clamp_linear(vd_icc_curve(t, icc, s, i as f64 / VD_ICC_STEPS as f64))
+            }
+        }
+    }
+}
+
+// Table lookup of slot s at x in 0..1 (clamped).
+@inline
+fn vd_curve_lookup(lut: &[f32], base: usize, x: f32) -> f32 {
+    if !(x > 0.0) {
+        return lut[base]
+    }
+    p := x * VD_ICC_STEPS as f32
+    i := p as usize
+    if i >= VD_ICC_STEPS {
+        return lut[base + VD_ICC_STEPS]
+    }
+    f := p - i as f32
+    return lut[base + i] + f * (lut[base + i + 1] - lut[base + i])
+}
+
+// Sample `index` as encoded 0..1 (8-bit samples are handled by the caller).
+fn vd_icc_encoded(t: &VdColor, row: &[u8], index: usize) -> f32 {
+    if t.sample == pixels.SAMPLE_U16 {
+        return pixels.get16(row, index * 2) as f32 / 65535.0
+    }
+    if t.sample == pixels.SAMPLE_F16 {
+        return vd_sanitize(convert.f32_from_bits(convert.half_to_f32_bits(pixels.get16(row, index * 2))))
+    }
+    return vd_sanitize(convert.f32_from_bits(pixels.get32(row, index * 4)))
+}
+
+// Linear value of channel ch of sample `index` through a matrix/TRC or gray
+// profile's curve.
+fn vd_icc_sample(t: &VdColor, lut: &[f32], row: &[u8], index: usize, ch: usize) -> f32 {
+    if t.sample == pixels.SAMPLE_U8 {
+        return lut[ch * 256 + row[index] as usize]
+    }
+    v := vd_icc_encoded(t, row, index)
+    base := ch * (VD_ICC_STEPS + 1)
+    if v >= 0.0 && v <= 1.0 {
+        return vd_curve_lookup(lut, base, v)
+    }
+    kind := t.curve_kind[ch]
+    if kind == VD_CURVE_TABLE {
+        if v < 0.0 {
+            return lut[base]
+        }
+        return lut[base + VD_ICC_STEPS]
+    }
+    if kind == VD_CURVE_IDENTITY {
+        return v
+    }
+    // Odd-symmetric extension of the formula.
+    if v < 0.0 {
+        return -vd_clamp_linear(vd_icc_formula(t, ch, -v as f64))
+    }
+    return vd_clamp_linear(vd_icc_formula(t, ch, v as f64))
+}
+
+fn vd_unit(v: f32) -> f32 {
+    if !(v > 0.0) {
+        return 0.0
+    }
+    if v > 1.0 {
+        return 1.0
+    }
+    return v
+}
+
+// CLUT entry (i, j, k), output o, 0..1.
+@inline
+fn vd_clut(t: &VdColor, icc: &[u8], i: usize, j: usize, k: usize, o: usize) -> f32 {
+    index := ((i * t.clut_grid[1] + j) * t.clut_grid[2] + k) * 3 + o
+    if t.clut_prec == 1 {
+        return vd_byte(icc, (t.clut_at + index) as u64) as f32 / 255.0
+    }
+    return vd_be16(icc, (t.clut_at + 2 * index) as u64) as f32 / 65535.0
+}
+
+// Tetrahedral interpolation of the CLUT at v (0..1 each) into out.
+fn vd_clut_eval(t: &VdColor, icc: &[u8], v: &[f32], out: &mut[f32]) {
+    idx := [0usize; 3]
+    fr := [0.0f32; 3]
+    for c in 0usize..3 {
+        g := t.clut_grid[c]
+        p := v[c] * (g - 1) as f32
+        i := p as usize
+        if i >= g - 1 {
+            i = g - 2
+        }
+        idx[c] = i
+        fr[c] = p - i as f32
+    }
+    x0 := idx[0]
+    y0 := idx[1]
+    z0 := idx[2]
+    fx := fr[0]
+    fy := fr[1]
+    fz := fr[2]
+    for o in 0usize..3 {
+        c000 := vd_clut(t, icc, x0, y0, z0, o)
+        c111 := vd_clut(t, icc, x0 + 1, y0 + 1, z0 + 1, o)
+        r := c000
+        if fx >= fy {
+            if fy >= fz {
+                c100 := vd_clut(t, icc, x0 + 1, y0, z0, o)
+                c110 := vd_clut(t, icc, x0 + 1, y0 + 1, z0, o)
+                r = c000 + fx * (c100 - c000) + fy * (c110 - c100) + fz * (c111 - c110)
+            } else if fx >= fz {
+                c100 := vd_clut(t, icc, x0 + 1, y0, z0, o)
+                c101 := vd_clut(t, icc, x0 + 1, y0, z0 + 1, o)
+                r = c000 + fx * (c100 - c000) + fz * (c101 - c100) + fy * (c111 - c101)
+            } else {
+                c001 := vd_clut(t, icc, x0, y0, z0 + 1, o)
+                c101 := vd_clut(t, icc, x0 + 1, y0, z0 + 1, o)
+                r = c000 + fz * (c001 - c000) + fx * (c101 - c001) + fy * (c111 - c101)
+            }
+        } else {
+            if fx >= fz {
+                c010 := vd_clut(t, icc, x0, y0 + 1, z0, o)
+                c110 := vd_clut(t, icc, x0 + 1, y0 + 1, z0, o)
+                r = c000 + fy * (c010 - c000) + fx * (c110 - c010) + fz * (c111 - c110)
+            } else if fy >= fz {
+                c010 := vd_clut(t, icc, x0, y0 + 1, z0, o)
+                c011 := vd_clut(t, icc, x0, y0 + 1, z0 + 1, o)
+                r = c000 + fy * (c010 - c000) + fz * (c011 - c010) + fx * (c111 - c011)
+            } else {
+                c001 := vd_clut(t, icc, x0, y0, z0 + 1, o)
+                c011 := vd_clut(t, icc, x0, y0 + 1, z0 + 1, o)
+                r = c000 + fz * (c001 - c000) + fy * (c011 - c001) + fx * (c111 - c011)
+            }
+        }
+        out[o] = r
+    }
+}
+
+fn vd_lab_inverse(f: f32) -> f32 {
+    if f > 0.20689655 {
+        return f * f * f
+    }
+    return 0.12841855 * (f - 0.13793103)
+}
+
+// XYZ D50 of pixel `x` through a lookup-table profile into out (t.m then
+// gives linear sRGB).
+fn vd_icc_lut_pixel(t: &VdColor, icc: &[u8], lut: &[f32], row: &[u8], x: usize, out: &mut[f32]) {
+    v := [0.0f32; 3]
+    for c in 0usize..3 {
+        index := x * t.channels + c
+        if t.sample == pixels.SAMPLE_U8 {
+            v[c] = lut[c * 256 + row[index] as usize]
+        } else {
+            v[c] = vd_curve_lookup(lut, c * (VD_ICC_STEPS + 1), vd_unit(vd_icc_encoded(t, row, index)))
+        }
+        v[c] = vd_unit(v[c])
+    }
+    if t.has_clut {
+        w := [0.0f32; 3]
+        vd_clut_eval(t, icc, &v, &mut w)
+        for c in 0usize..3 {
+            v[c] = vd_unit(w[c])
+        }
+    }
+    if t.lut_matrix {
+        m := [0.0f32; 3]
+        for c in 0usize..3 {
+            m[c] = vd_unit(vd_curve_lookup(lut, vd_slot_base(t, 3 + c), v[c]))
+        }
+        for c in 0usize..3 {
+            v[c] = vd_unit((t.mtx[c * 3] * m[0] as f64 + t.mtx[c * 3 + 1] * m[1] as f64 + t.mtx[c * 3 + 2] * m[2] as f64 + t.mtx[9 + c]) as f32)
+        }
+    }
+    for c in 0usize..3 {
+        v[c] = vd_unit(vd_curve_lookup(lut, vd_slot_base(t, 6 + c), v[c]))
+    }
+    // Connection space values to XYZ D50.
+    xyz := [0.0f32; 3]
+    if t.pcs == VD_PCS_XYZ {
+        for c in 0usize..3 {
+            xyz[c] = v[c] * (65535.0 / 32768.0)
+        }
+    } else {
+        scale := 1.0f32
+        if t.pcs == VD_PCS_LAB16 {
+            scale = 65535.0 / 65280.0
+        }
+        l := v[0] * scale * 100.0
+        a := v[1] * scale * 255.0 - 128.0
+        b := v[2] * scale * 255.0 - 128.0
+        fy := (l + 16.0) / 116.0
+        xyz[0] = 0.9642 * vd_lab_inverse(fy + a / 500.0)
+        xyz[1] = vd_lab_inverse(fy)
+        xyz[2] = 0.8249 * vd_lab_inverse(fy - b / 200.0)
+    }
+    for c in 0usize..3 {
+        out[c] = xyz[c]
+    }
+}

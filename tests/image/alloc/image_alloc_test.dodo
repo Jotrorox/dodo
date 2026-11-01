@@ -380,6 +380,28 @@ fn decodes_jpeg_xl_files() {
     for i in 0usize..expected.len() {
         assert(profiled.icc()[i] == expected.as_slice()[i])
     }
+    // EXIF from a Brotli-compressed brob box equals the plain Exif box.
+    compressed := image_alloc.load(jxl_fixture("meta_brob.jxl", &mut path), arena.handle())!
+    plain := image_alloc.load(jxl_fixture("meta_raw.jxl", &mut path), arena.handle())!
+    assert(plain.exif().len > 0)
+    assert_eq(compressed.exif().len, plain.exif().len)
+    for i in 0usize..plain.exif().len {
+        assert(compressed.exif()[i] == plain.exif()[i])
+    }
+    // A brob stream whose prefix code tables need about 246,000 workspace
+    // words (480 KiB) decodes with a workspace from the arena of exactly
+    // the size the stream asks for.
+    wide_file := image_alloc.read_file(jxl_fixture("meta_wide_brob.jxl", &mut path), arena.handle())!
+    found := image.metadata(wide_file.as_slice())!
+    need := meta.scratch_size(wide_file.as_slice(), &found.exif)!
+    assert(need > 2 * 131072)
+    before := arena.used()
+    wide := image_alloc.load(jxl_fixture("meta_wide_brob.jxl", &mut path), arena.handle())!
+    assert(arena.used() - before >= need)
+    assert_eq(wide.exif().len, plain.exif().len)
+    for i in 0usize..plain.exif().len {
+        assert(wide.exif()[i] == plain.exif()[i])
+    }
     // Animation frames.
     anim := image_alloc.read_file(jxl_fixture("anim.jxl", &mut path), arena.handle())!
     count := image.frame_count(anim.as_slice())!

@@ -30,7 +30,9 @@ fn estimate(source: &pixels.View, plan: &Plan, planes: &mut[i32], hist: &mut[u32
     map := [0u8; 1]
     lengths := [0u8; 1]
     codes := [0u16; 1]
-    set := CodeSet { map: &mut map, lengths: &mut lengths, codes: &mut codes, contexts: contexts, clusters: 1, alphabets: [0u16; 32], singles: [false; 32], split: LIT_SPLIT, msb: LIT_MSB, lsb: LIT_LSB, lz77: plan.lz77, min_length: plan.min_length as u32 }
+    no_ans := [0u16; 1]
+    set := CodeSet.new(&mut map, &mut lengths, &mut codes, &mut no_ans[..0], contexts, plan.lz77, plan.min_length as u32)
+    no_tokens := [0u32; 1]
     empty := [0u8; 1]
     dummy := BitWriter.new(&mut empty, 1)
     for i in 0usize..contexts * MAX_ALPHA {
@@ -40,7 +42,7 @@ fn estimate(source: &pixels.View, plan: &Plan, planes: &mut[i32], hist: &mut[u32
         costs[k] = 0
     }
     {
-        e := Emitter { counting: true, hist: &mut hist[..], split: LIT_SPLIT, msb: LIT_MSB, lsb: LIT_LSB, lz77: plan.lz77, min_length: plan.min_length, dist_ctx: tree.contexts, run_value: 0, run_count: 0, run_ctx: [0u16; 16] }
+        e := Emitter.new(true, &mut hist[..], &mut no_tokens[..0], CONFIG_DEFAULT, LZ77_MIN_SYMBOL, plan.lz77, plan.min_length, tree.contexts)
         code_global(source, plan, &tree, planes, words, &mut e, &set, &mut dummy)
     }
     total := add_costs(hist, contexts, 1, 1, costs) + tree_bits
@@ -76,7 +78,7 @@ fn estimate(source: &pixels.View, plan: &Plan, planes: &mut[i32], hist: &mut[u32
     for r in 0usize..regions {
         x0 := ((r % 4) * (plan.width - gw)) / 3
         y0 := (r * (plan.height - gh)) / (regions - 1)
-        e := Emitter { counting: true, hist: &mut hist[..], split: LIT_SPLIT, msb: LIT_MSB, lsb: LIT_LSB, lz77: plan.lz77, min_length: plan.min_length, dist_ctx: tree.contexts, run_value: 0, run_count: 0, run_ctx: [0u16; 16] }
+        e := Emitter.new(true, &mut hist[..], &mut no_tokens[..0], CONFIG_DEFAULT, LZ77_MIN_SYMBOL, plan.lz77, plan.min_length, tree.contexts)
         code_rect(source, plan, &tree, planes, words, x0, y0, gw, gh, group_stream_id(plan, 0), &mut e, &set, &mut dummy)
         area += (gw * gh) as u64
     }

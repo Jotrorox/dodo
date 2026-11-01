@@ -99,7 +99,9 @@ pub fn metadata(data: &[u8]) -> meta.Metadata!pixels.Error {
 // The embedded ICC profile, decoded into `output` (PNG iCCP is inflated,
 // BMP profiles are copied, JPEG XL profiles are entropy-decoded); returns
 // its length, 0 when there is none. `scratch` needs icc_scratch_size(data)
-// bytes (zero except for JPEG XL).
+// bytes (zero except for JPEG XL). The profile is the one describing the
+// decoded pixels (info().color): lossy (XYB) JPEG XL files decode to sRGB,
+// so this returns 0 for them; jxl.icc() extracts their embedded profile.
 pub fn icc(data: &[u8], output: &mut[u8], scratch: &mut[u8]) -> usize!pixels.Error {
     header := info(data)?
     found := header.color.clone()
@@ -260,13 +262,18 @@ pub fn decode_frame_into<S: sink.Sink>(data: &[u8], index: u32, output: &mut S, 
 // Encoding
 
 // Format-independent encoder settings, mapped onto each codec's options.
-// Every format written today is lossless, so quality and lossless only
-// matter for lossy formats.
+// JPEG XL is the one format with both: lossless (the default) or, with
+// lossless = false, lossy at `quality`. The other formats are lossless and
+// ignore quality and lossless.
 pub struct EncodeOptions {
-    // 0 to 100 for lossy formats; higher is better.
+    // 0 to 100 for lossy encoding; higher is better (JPEG XL maps it to a
+    // Butteraugli distance like cjxl: 90 is distance 1).
     pub quality: u32
     // Prefer a lossless encoding where the format offers both.
     pub lossless: bool
+    // JPEG XL lossy: the Butteraugli distance itself, overriding quality
+    // when above zero.
+    pub distance: f32
     // 1 (fastest) to 9 (smallest); PNG uses it as the deflate level, and 0
     // writes stored PNG blocks.
     pub effort: u32
@@ -277,13 +284,34 @@ pub struct EncodeOptions {
     pub palette: bool
 
     pub fn new() -> EncodeOptions {
-        return EncodeOptions { quality: 90, lossless: true, effort: 6, keep_metadata: true, palette: false }
+        return EncodeOptions { quality: 90, lossless: true, distance: 0.0, effort: 6, keep_metadata: true, palette: false }
     }
 }
 
-// Generic effort 1-2 is JPEG XL effort 1, 3-6 effort 2, 7-9 effort 3.
+// Lossless: generic effort 1-2 is JPEG XL effort 1, 3-6 effort 2, 7-9
+// effort 3. Lossy (lossless false): the effort carries over, and the
+// distance comes from `distance` or else from `quality`.
 fn jxl_options(options: &EncodeOptions) -> jxl_encode.EncodeOptions {
     result := jxl_encode.EncodeOptions.new()
+    if !options.lossless {
+        quality := options.quality
+        if quality > 100 {
+            quality = 100
+        }
+        distance := options.distance
+        if !(distance > 0.0) {
+            distance = jxl_encode.distance_from_quality(quality as f32)
+        }
+        if distance > 0.0 {
+            result.lossless = false
+            result.distance = distance
+            result.effort = options.effort
+            if result.effort == 0 {
+                result.effort = 1
+            }
+            return result
+        }
+    }
     if options.effort <= 2 {
         result.effort = 1
     } else if options.effort <= 6 {
@@ -361,11 +389,13 @@ pub fn metadata_size(format: pixels.Format, exif_len: usize, icc_len: usize) -> 
             return png.metadata_size(exif_len, icc_len)
         }
         pixels.Format.Jxl => {
-            if exif_len == 0 {
-                return ok(0)
+            // Container signature, ftyp, Exif and codestream box headers,
+            // and the entropy-coded ICC stream.
+            total := 0usize
+            if exif_len > 0 {
+                total = pixels.checked(1, exif_len, 128)?
             }
-            // Container signature, ftyp, Exif and codestream box headers.
-            return pixels.checked(1, exif_len, 128)
+            return pixels.checked(1, total, jxl_encode.icc_bound(icc_len)?)
         }
         _ => {
             return ok(0)
@@ -412,7 +442,9 @@ pub fn encode(format: pixels.Format, source: &pixels.View, options: &EncodeOptio
 
 // encode() with an EXIF payload (TIFF-structured) and an ICC profile, each
 // written when not empty, options.keep_metadata is set and the format can
-// store it (PNG: eXIf and iCCP). The output may need metadata_size() more
+// store it (PNG: eXIf and iCCP; JPEG XL: an Exif box and the embedded,
+// entropy-coded profile, which must be an RGB or gray profile matching the
+// image, else it is left out). The output may need metadata_size() more
 // bytes than max_encoded_size().
 pub fn encode_with_metadata(format: pixels.Format, source: &pixels.View, options: &EncodeOptions, exif: &[u8], icc: &[u8], output: &mut[u8], scratch: &mut[u8]) -> usize!pixels.Error {
     match format {
@@ -437,9 +469,17 @@ pub fn encode_with_metadata(format: pixels.Format, source: &pixels.View, options
         }
         pixels.Format.Jxl => {
             codec := jxl_options(options)
-            if options.keep_metadata && exif.len > 0 {
+            if options.keep_metadata && (exif.len > 0 || icc.len > 0) {
                 nothing := [0u8; 1]
-                boxes := jxl_encode.Metadata.new(exif, &nothing[..0])
+                profile := icc
+                if !jxl_encode.icc_usable(icc, source.layout(), &codec) {
+                    // A profile JPEG XL cannot carry for this image (CMYK,
+                    // Lab, or the wrong channel count), or that lossy
+                    // encoding cannot convert from (lookup tables only), is
+                    // left out.
+                    profile = &icc[..0]
+                }
+                boxes := jxl_encode.Metadata.with_icc(exif, &nothing[..0], profile)
                 return jxl_encode.encode_with_metadata(source, &codec, &boxes, output, scratch)
             }
             return jxl_encode.encode(source, &codec, output, scratch)

@@ -153,6 +153,10 @@ fn meta_squeeze(ch: &mut ChanList, begin: usize, num_c: usize, horizontal: bool,
         if w == 0 || h == 0 || hs > 30 || vs > 30 {
             return err(pixels.Error.Malformed)
         }
+        if ch.windowed(c) {
+            // Windowed frames never squeeze globally (window.dodo).
+            return err(pixels.Error.Malformed)
+        }
         off := ch.offset(c)
         stride := ch.stride(c)
         if horizontal {
@@ -229,6 +233,28 @@ fn decode_stream(r: &mut Reader, work: &mut ModularWork, gcode: &Code, lcode: &m
         use_wp = tree_uses_wp(work.ltree, work.ltree_nodes)
         refs = tree_refs(work.ltree, work.ltree_nodes)
     }
+    // Channels of a windowed frame that this stream codes whole but that
+    // are only partly stored decode into temporary buffers (kept until the
+    // stream ends, as later channels may reference them); tmap[i] holds
+    // the temporary offset of channel i, or -1.
+    mark := work.arena_used
+    tmap := 0usize
+    redirect := false
+    for i in 0usize..end {
+        if ch.width(i) > 0 && ch.height(i) > 0 && ch.windowed(i) {
+            redirect = true
+        }
+    }
+    if redirect {
+        tmap = work.alloc(end as u64)?
+        for i in 0usize..end {
+            work.arena[tmap + i] = -1
+            if ch.width(i) > 0 && ch.height(i) > 0 && ch.windowed(i) {
+                t := work.alloc(ch.width(i) as u64 * ch.height(i) as u64)?
+                work.arena[tmap + i] = t as i32
+            }
+        }
+    }
     stream := Stream.new(window)
     if use_global {
         stream.begin(gcode, r)
@@ -242,6 +268,10 @@ fn decode_stream(r: &mut Reader, work: &mut ModularWork, gcode: &Code, lcode: &m
             continue
         }
         job := ChannelJob { off: ch.offset(i), stride: ch.stride(i), width: w, height: h, channel_index: i as i64, stream_index: stream_index as i64, dist_mult: dist_mult as u32, use_wp: use_wp, num_refs: 0, ref_off: [0usize; MAX_REFS], ref_stride: [0usize; MAX_REFS] }
+        if redirect && work.arena[tmap + i] >= 0 {
+            job.off = work.arena[tmap + i] as usize
+            job.stride = w
+        }
         if refs > 0 {
             j := i
             for j > 0 && job.num_refs < refs {
@@ -249,6 +279,10 @@ fn decode_stream(r: &mut Reader, work: &mut ModularWork, gcode: &Code, lcode: &m
                 if ch.same_shape(i, j) {
                     job.ref_off[job.num_refs] = ch.offset(j)
                     job.ref_stride[job.num_refs] = ch.stride(j)
+                    if redirect && work.arena[tmap + j] >= 0 {
+                        job.ref_off[job.num_refs] = work.arena[tmap + j] as usize
+                        job.ref_stride[job.num_refs] = ch.width(j)
+                    }
                     job.num_refs += 1
                 }
             }
@@ -263,6 +297,24 @@ fn decode_stream(r: &mut Reader, work: &mut ModularWork, gcode: &Code, lcode: &m
         stream.finish(gcode)?
     } else {
         stream.finish(lcode)?
+    }
+    if redirect {
+        for i in 0usize..end {
+            t := work.arena[tmap + i]
+            if t < 0 {
+                continue
+            }
+            src := t as usize
+            w := ch.width(i)
+            dst := ch.offset(i)
+            stride := ch.stride(i)
+            for y in 0usize..ch.sheight(i) {
+                for x in 0usize..ch.swidth(i) {
+                    work.arena[dst + y * stride + x] = work.arena[src + y * w + x]
+                }
+            }
+        }
+        work.arena_used = mark
     }
     return ok(end)
 }
@@ -296,8 +348,8 @@ fn inverse_rct(a: &mut[i32], ch: &ChanList, begin: usize, rct_type: i32) {
     o0 := begin + permutation % 3
     o1 := begin + (permutation + 1 + permutation / 3) % 3
     o2 := begin + (permutation + 2 - permutation / 3) % 3
-    w := ch.width(begin)
-    h := ch.height(begin)
+    w := ch.swidth(begin)
+    h := ch.sheight(begin)
     second := custom >> 1
     third := custom & 1
     for y in 0usize..h {
@@ -412,8 +464,10 @@ fn inverse_palette(work: &mut ModularWork, ch: &mut ChanList, stash: &mut ChanLi
     if bit_depth > 24 {
         bit_depth = 24
     }
-    w := ch.width(begin)
-    h := ch.height(begin)
+    // Only the stored part of a windowed frame (window.dodo keeps such
+    // frames free of palettes whose predictions look right or below).
+    w := ch.swidth(begin)
+    h := ch.sheight(begin)
     if w == 0 || h == 0 {
         return ok()
     }
@@ -440,6 +494,9 @@ fn inverse_palette(work: &mut ModularWork, ch: &mut ChanList, stash: &mut ChanLi
         return ok()
     }
     use_wp := d_pred == 6
+    if ch.windowed(begin) && nb_deltas > 0 && !palette_windowable(d_pred) {
+        return err(pixels.Error.Malformed)
+    }
     if use_wp && (w > work.wp_err.len || w * 4 > work.wp_sub.len) {
         return err(pixels.Error.TooLarge)
     }
@@ -509,6 +566,12 @@ fn inverse_palette(work: &mut ModularWork, ch: &mut ChanList, stash: &mut ChanLi
     return ok()
 }
 
+// Whether delta palette predictor `p` only looks left and up, so a
+// top-left part of the channel decodes the same alone.
+fn palette_windowable(p: i32) -> bool {
+    return p != 6 && p != 7 && p != 12 && p != 13
+}
+
 fn tendency(a: i64, b: i64, c: i64) -> i64 {
     if a >= b && b >= c {
         x := (4 * a - 3 * c - b + 6) / 12
@@ -552,6 +615,9 @@ fn inverse_squeeze(work: &mut ModularWork, ch: &mut ChanList, begin: usize, num_
         stride := ch.stride(c)
         w1 := ch.width(c)
         h1 := ch.height(c)
+        if ch.windowed(c) || ch.windowed(rc) {
+            return err(pixels.Error.Malformed)
+        }
         if horizontal {
             w2 := ch.width(rc)
             if ch.offset(rc) != off + w1 || ch.height(rc) != h1 || w2 > w1 || w1 > w2 + 1 {

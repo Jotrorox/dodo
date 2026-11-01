@@ -17,6 +17,11 @@ struct BitWriter {
     fn new(out: &mut[u8], start: usize) -> BitWriter from(out) {
         return BitWriter { out: out, pos: start, acc: 0, count: 0, overflow: false }
     }
+    // Continue a writer whose state was saved as (pos, acc, count,
+    // overflow).
+    fn resume(out: &mut[u8], pos: usize, acc: u64, count: u32, overflow: bool) -> BitWriter from(out) {
+        return BitWriter { out: out, pos: pos, acc: acc, count: count, overflow: overflow }
+    }
     // Append the low n bits of value (n <= 32; value < 2^n).
     fn write(&mut self, n: u32, value: u64) {
         if n == 0 {

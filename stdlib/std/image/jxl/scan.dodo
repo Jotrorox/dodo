@@ -1,15 +1,12 @@
 package jxl
 
-import "core/slice"
 import "std/image/pixels"
-import "std/image/shared/scratch"
 
 // Walking the frames of a file from their headers and TOCs only, to count
-// them and to size every buffer decode() needs before any pixel work.
+// them and (with `sizing`) to size every buffer decode() needs before any
+// pixel work. Sizes follow each frame's decode window (window.dodo), not
+// its header size.
 
-// Bytes of stack working storage for skipping an ICC stream or a permuted
-// TOC while scanning.
-const SCAN_BYTES: usize = 200704
 const MAX_FRAMES: u32 = 1048576
 
 struct Scan {
@@ -17,6 +14,8 @@ struct Scan {
     displayed: u32
     // Largest per-frame needs.
     max_samples: u64
+    // Temporary tiles of clipped frames (see window.dodo).
+    max_temp: u64
     max_frame_pixels: u64
     max_sample_width: u32
     max_sample_height: u32
@@ -44,27 +43,27 @@ struct Scan {
     lf_slot: [3]u64
     any_noise: bool
     any_splines: bool
-    // Gray modular frames with restoration filters: samples of their color
-    // channel (two more copies are needed).
+    // Upsampled frames with patches or splines: coded color samples.
+    low_pixels: u64
+    // Gray modular frames with restoration filters and subsampled modular
+    // YCbCr frames: samples of one color channel (two full-size copies are
+    // needed).
     gray_filtered: u64
 }
 
 fn new_scan() -> Scan {
-    return Scan { frames: 0, displayed: 0, max_samples: 0, max_frame_pixels: 0, max_sample_width: 0, max_sample_height: 0, max_frame_width: 0, max_frame_height: 0, max_toc: 1, max_group_dim: 128, max_tree_global: 0, slots: 0, slot_pixels: [0u64; 4], float_path: false, any_vardct: false, needs_canvas: false, progressive: false, max_channels: 1, vd_planes: 0, vd_blocks: 0, vd_tiles: 0, vd_groups: 0, lf_slot: [0u64; 3], any_noise: false, any_splines: false, gray_filtered: 0 }
+    return Scan { frames: 0, displayed: 0, max_samples: 0, max_temp: 0, max_frame_pixels: 0, max_sample_width: 0, max_sample_height: 0, max_frame_width: 0, max_frame_height: 0, max_toc: 1, max_group_dim: 128, max_tree_global: 0, slots: 0, slot_pixels: [0u64; 4], float_path: false, any_vardct: false, needs_canvas: false, progressive: false, max_channels: 1, vd_planes: 0, vd_blocks: 0, vd_tiles: 0, vd_groups: 0, lf_slot: [0u64; 3], any_noise: false, any_splines: false, low_pixels: 0, gray_filtered: 0 }
 }
 
-// Samples of one frame's modular channels (color and extra channels at
-// their coded sizes).
-fn frame_samples(h: &ImageHeader, f: &FrameHeader) -> u64 {
-    w := f.sample_width as u64
-    hh := f.sample_height as u64
+// Samples of one frame's stored modular channels (color and extra
+// channels) under a sample window of w x hh.
+fn frame_samples(h: &ImageHeader, f: &FrameHeader, w: u64, hh: u64) -> u64 {
     total := 0u64
     if f.modular {
         total = f.color_channels as u64 * w * hh
     }
-    for i in 0usize..h.num_extra as usize {
-        shift := ec_shift(f, i)
-        total += ceil_shift(w, shift) * ceil_shift(hh, shift)
+    for shift in 0u32..4 {
+        total += f.ec_shift_count[shift as usize] as u64 * ceil_shift(w, shift) * ceil_shift(hh, shift)
     }
     return total
 }
@@ -82,9 +81,9 @@ fn log2_exact(v: u32) -> u32 {
 }
 
 // The shift of extra channel i relative to the color samples.
-fn ec_shift(f: &FrameHeader, i: usize) -> u32 {
+fn ec_shift(f: &FrameHeader, ex: &Extras, i: usize) -> u32 {
     up := log2_exact(f.upsampling)
-    ec := log2_exact(f.ec_upsampling[i])
+    ec := log2_exact(ex.get(i, EX_UP))
     if ec < up {
         return 0
     }
@@ -106,44 +105,82 @@ fn direct_frame(h: &ImageHeader, f: &FrameHeader) -> bool {
     if !f.replaces_all(h.num_extra) || f.width != h.width || f.height != h.height {
         return false
     }
-    for i in 0usize..h.num_extra as usize {
-        if f.ec_upsampling[i] != 1 {
-            return false
-        }
-    }
-    return true
+    // With upsampling 1, every extra channel must have shift 0 too.
+    return f.ec_same_size(h.num_extra)
 }
 
-fn scan_toc(r: &mut Reader, f: &mut FrameHeader, work: &mut[u8]) -> void!pixels.Error {
-    let slice.SplitMut { left: code_bytes_0, right: rest } = scratch.split(work, code_bytes(9, 8 * 512))?
-    let slice.SplitMut { left: n1_bytes, right: rest2 } = scratch.split(rest, code_bytes(2, NESTED_POOL))?
-    let slice.SplitMut { left: n2_bytes, right: window_bytes } = scratch.split(rest2, code_bytes(2, NESTED_POOL))?
-    code := carve_code(code_bytes_0, 9)?
-    n1 := carve_code(n1_bytes, 2)?
-    n2 := carve_code(n2_bytes, 2)?
-    window := scratch.u32s(window_bytes)
-    empty := [0u32; 1]
-    read_toc(r, f, &mut empty, &mut code, &mut n1, &mut n2, window)?
+// Skip the TOC at the reader (like read_toc without storing it), a
+// permutation decoded with the skimmer.
+fn scan_toc(r: &mut Reader, f: &mut FrameHeader, sk: &mut Skim, win: &mut[u8]) -> void!pixels.Error {
+    entries := f.toc_entries as usize
+    f.toc_permuted = r.bit()
+    if f.toc_permuted {
+        skip_permutation(r, entries, sk, win)?
+    }
+    r.pad()
+    total := 0u64
+    for i in 0usize..entries {
+        total += r.u32c(dist(0, 10), dist(1024, 14), dist(17408, 22), dist(4211712, 30)) as u64
+    }
+    r.pad()
+    if r.overrun {
+        return err(pixels.Error.Truncated)
+    }
+    if r.broken {
+        return err(pixels.Error.Malformed)
+    }
+    f.data_start = r.byte_position()
+    f.data_size = total
+    if total > 0xffffffff {
+        return err(pixels.Error.TooLarge)
+    }
     return ok()
 }
 
-// Parse the headers and walk every frame.
-fn scan_file(data: &[u8], work: &mut[u8]) -> Scan!pixels.Error {
-    r := open(data)?
-    h := read_headers(&mut r, work)?
-    s := new_scan()
-    walk_frames(&mut r, &h, &mut s, work)?
-    return ok(s)
+// Skip a Lehmer-coded TOC permutation of `size` entries. The window keeps
+// the context class of each entry; entries that LZ77 copies are not
+// range-checked here (decode() checks them when it reads the TOC).
+@inline(never)
+fn skip_permutation(r: &mut Reader, size: usize, sk: &mut Skim, win: &mut[u8]) -> void!pixels.Error {
+    code := new_sk_code()
+    sk_read_code(r, 8, &mut code, sk)?
+    st := new_sk_stream(SK_TOC, SK_WINDOW)
+    sk_begin(&mut st, &code, r)
+    end := sk_read(&mut code, sk, &mut st, win, r, permutation_context(size as u32), 0) as usize
+    if st.copied {
+        // A copy before any value repeats zeros.
+        end = 0
+    }
+    if end > size {
+        return err(pixels.Error.Malformed)
+    }
+    previous := 0u32
+    for k in 0usize..end {
+        value := sk_read(&mut code, sk, &mut st, win, r, previous, 0)
+        if st.copied {
+            previous = value
+        } else {
+            if value as usize >= size - k {
+                return err(pixels.Error.Malformed)
+            }
+            previous = permutation_context(value)
+        }
+        if (k & 1023) == 1023 && sk_failed(&st, r) {
+            break
+        }
+    }
+    sk_finish(&st, &code, r)?
+    return ok()
 }
 
-fn walk_frames(r: &mut Reader, h: &ImageHeader, s: &mut Scan, work: &mut[u8]) -> void!pixels.Error {
+fn walk_frames(data: &[u8], r: &mut Reader, h: &ImageHeader, s: &mut Scan, sk: &mut Skim, win: &mut[u8], sizing: bool) -> void!pixels.Error {
     r.seek_byte(h.frames_byte)
     if h.have_preview {
         preview := h.clone_header()
         preview.width = h.preview_width
         preview.height = h.preview_height
         f := read_frame_header(r, &preview)?
-        scan_toc(r, &mut f, work)?
+        scan_toc(r, &mut f, sk, win)?
         r.seek_byte64(f.end())
     }
     for {
@@ -151,15 +188,29 @@ fn walk_frames(r: &mut Reader, h: &ImageHeader, s: &mut Scan, work: &mut[u8]) ->
             return err(pixels.Error.TooLarge)
         }
         f := read_frame_header(r, h)?
-        scan_toc(r, &mut f, work)?
+        scan_toc(r, &mut f, sk, win)?
         s.frames += 1
         if f.is_keyframe() {
             s.displayed += 1
         }
+        w := full_window(&f)
+        if sizing {
+            w = frame_window(data, h, &f, sk, win)
+        }
+        sw := w.sw as u64
+        sh := w.sh as u64
+        pw := w.pw as u64
+        ph := w.ph as u64
         if !f.modular {
             s.any_vardct = true
             bw := vardct_blocks(&f, false) as u64
             bh := vardct_blocks(&f, true) as u64
+            if w.sw < f.sample_width {
+                bw = sw / 8
+            }
+            if w.sh < f.sample_height {
+                bh = sh / 8
+            }
             if bw * bh > s.vd_blocks {
                 s.vd_blocks = bw * bh
                 s.vd_planes = 192 * bw * bh
@@ -178,37 +229,61 @@ fn walk_frames(r: &mut Reader, h: &ImageHeader, s: &mut Scan, work: &mut[u8]) ->
         if (f.flags & FLAG_SPLINES) != 0 {
             s.any_splines = true
         }
-        if f.color_channels == 1 && (f.gab || f.epf_iters > 0) {
-            gray := f.sample_width as u64 * f.sample_height as u64
+        if f.upsampling > 1 && (f.flags & (FLAG_PATCHES | FLAG_SPLINES)) != 0 {
+            // Coded-size planes over the sample window.
+            low := sw * sh
+            if low > s.low_pixels {
+                s.low_pixels = low
+            }
+        }
+        if (f.color_channels == 1 && (f.gab || f.epf_iters > 0)) || (f.modular && f.ycbcr && chroma_subsampled(&f)) {
+            gray := sw * sh
             if gray > s.gray_filtered {
                 s.gray_filtered = gray
             }
         }
         if f.frame_type == FT_LF && f.lf_level >= 1 && f.lf_level <= 3 {
-            size := 3 * f.sample_width as u64 * f.sample_height as u64
+            shift := 3 * f.lf_level
+            size := 3 * ceil_shift(f.width as u64, shift) * ceil_shift(f.height as u64, shift)
             if size > s.lf_slot[(f.lf_level - 1) as usize] {
                 s.lf_slot[(f.lf_level - 1) as usize] = size
             }
         }
-        samples := frame_samples(h, &f)
+        nch := f.color_channels as u64 + h.num_extra as u64
+        samples := frame_samples(h, &f, sw, sh)
         if samples > s.max_samples {
             s.max_samples = samples
         }
-        pixels_count := f.width as u64 * f.height as u64
-        if pixels_count > s.max_frame_pixels {
-            s.max_frame_pixels = pixels_count
+        if w.clipped {
+            // Temporary tiles of a group straddling the window (one group
+            // of every channel), or the block occupancy of a VarDCT LF
+            // group.
+            temp := f.group_dim as u64 * f.group_dim as u64 * nch + 65536
+            if temp > s.max_temp {
+                s.max_temp = temp
+            }
         }
-        if f.sample_width > s.max_sample_width {
-            s.max_sample_width = f.sample_width
+        pixels_count := pw * ph
+        // The edge-preserving filter also borrows the frame planes for a
+        // copy of the color samples.
+        frame_pixels := pixels_count
+        if f.epf_iters > 0 && sw * sh > frame_pixels {
+            frame_pixels = sw * sh
         }
-        if f.sample_height > s.max_sample_height {
-            s.max_sample_height = f.sample_height
+        if frame_pixels > s.max_frame_pixels {
+            s.max_frame_pixels = frame_pixels
         }
-        if f.width > s.max_frame_width {
-            s.max_frame_width = f.width
+        if w.sw > s.max_sample_width {
+            s.max_sample_width = w.sw
         }
-        if f.height > s.max_frame_height {
-            s.max_frame_height = f.height
+        if w.sh > s.max_sample_height {
+            s.max_sample_height = w.sh
+        }
+        if w.pw > s.max_frame_width {
+            s.max_frame_width = w.pw
+        }
+        if w.ph > s.max_frame_height {
+            s.max_frame_height = w.ph
         }
         if f.toc_entries > s.max_toc {
             s.max_toc = f.toc_entries
@@ -216,19 +291,25 @@ fn walk_frames(r: &mut Reader, h: &ImageHeader, s: &mut Scan, work: &mut[u8]) ->
         if f.group_dim > s.max_group_dim {
             s.max_group_dim = f.group_dim
         }
-        nch := f.color_channels as u64 + h.num_extra as u64
+        // The global MA tree: its actual size when LfGlobal was read (for
+        // clipped frames), otherwise the limit for the frame's size.
         tree := 1024 + f.width as u64 * f.height as u64 * nch / 16
         if tree > 4194304 {
             tree = 4194304
+        }
+        if w.clipped && w.tree_nodes < tree {
+            tree = w.tree_nodes
         }
         if tree > s.max_tree_global {
             s.max_tree_global = tree
         }
         if f.can_reference() {
+            // Frames saved before the color transform keep their pixel
+            // window, the others at most the image area.
             slot := f.save_as_reference as usize
             s.slots = s.slots | (1u32 << (slot as u32))
             size := h.width as u64 * h.height as u64
-            if pixels_count > size {
+            if f.save_before_ct {
                 size = pixels_count
             }
             if size > s.slot_pixels[slot] {

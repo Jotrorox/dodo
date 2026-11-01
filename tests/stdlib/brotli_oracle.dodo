@@ -1,0 +1,196 @@
+package brotli_oracle
+
+import "std/compress/brotli"
+import "std/console"
+
+// Differential test driver for std/compress/brotli. stdin holds a mode byte,
+// a 4-byte little-endian window length and the compressed stream; the
+// decompressed data goes to stdout. Modes: 0 decompress_with_workspace
+// (WORKSPACE_LEN words), 1 decompress (stack workspace), 2 Decoder with a
+// ring of the given length (0 means window_len(input)) read in 777-byte
+// pieces, 3 decompressed_size (prints the size as 8 little-endian bytes),
+// 4 decompress_with_workspace with a workspace of the given length, 5
+// decompress_with_workspace with exactly workspace_size(input) words.
+// Errors exit with 10 plus the error's position in brotli.Error.
+
+static mut INPUT: [33554432]u8 = [0u8; 33554432]
+static mut OUTPUT: [67108864]u8 = [0u8; 67108864]
+static mut WINDOW: [16777216]u8 = [0u8; 16777216]
+static mut WORDS: [brotli.WORKSPACE_LEN]u16 = [0u16; brotli.WORKSPACE_LEN]
+
+fn code(e: brotli.Error) -> i32 {
+    match e {
+        brotli.Error.Truncated => {
+            return 10
+        }
+        brotli.Error.InvalidData => {
+            return 11
+        }
+        brotli.Error.OutputFull => {
+            return 12
+        }
+        brotli.Error.WindowTooSmall => {
+            return 13
+        }
+        brotli.Error.WorkspaceTooSmall => {
+            return 14
+        }
+        brotli.Error.Unsupported => {
+            return 15
+        }
+    }
+}
+
+fn emit(data: &[u8]) -> i32 {
+    sink := console.stdout()
+    done := 0usize
+    for done < data.len {
+        n := match sink.write(&data[done..]) {
+            ok(n) => {
+                n
+            }
+            err(_) => {
+                return 1
+            }
+        }
+        done += n
+    }
+    return 0
+}
+
+fn run(input: &mut[u8], output: &mut[u8], window: &mut[u8], words: &mut[u16]) -> i32 {
+    source := console.stdin()
+    used := 0usize
+    for used < input.len {
+        n := match source.read(&mut input[used..]) {
+            ok(n) => {
+                n
+            }
+            err(_) => {
+                return 1
+            }
+        }
+        if n == 0 {
+            break
+        }
+        used += n
+    }
+    if used < 5 {
+        return 2
+    }
+    mode := input[0]
+    ring := (input[1] as usize) | ((input[2] as usize) << 8) | ((input[3] as usize) << 16) | ((input[4] as usize) << 24)
+    stream := &input[5..used]
+    if mode == 0 {
+        match brotli.decompress_with_workspace(stream, output, words) {
+            ok(n) => {
+                return emit(&output[..n])
+            }
+            err(e) => {
+                return code(e)
+            }
+        }
+    }
+    if mode == 4 {
+        if ring > words.len {
+            return 3
+        }
+        match brotli.decompress_with_workspace(stream, output, &mut words[..ring]) {
+            ok(n) => {
+                return emit(&output[..n])
+            }
+            err(e) => {
+                return code(e)
+            }
+        }
+    }
+    if mode == 5 {
+        need := match brotli.workspace_size(stream) {
+            ok(n) => {
+                n
+            }
+            err(e) => {
+                return code(e)
+            }
+        }
+        match brotli.decompress_with_workspace(stream, output, &mut words[..need]) {
+            ok(n) => {
+                return emit(&output[..n])
+            }
+            err(e) => {
+                return code(e)
+            }
+        }
+    }
+    if mode == 1 {
+        match brotli.decompress(stream, output) {
+            ok(n) => {
+                return emit(&output[..n])
+            }
+            err(e) => {
+                return code(e)
+            }
+        }
+    }
+    if ring == 0 {
+        ring = match brotli.window_len(stream) {
+            ok(n) => {
+                n
+            }
+            err(e) => {
+                return code(e)
+            }
+        }
+    }
+    if ring > window.len {
+        return 3
+    }
+    if mode == 3 {
+        match brotli.decompressed_size(stream, &mut window[..ring], words) {
+            ok(n) => {
+                size := [0u8; 8]
+                for i in 0usize..8 {
+                    size[i] = ((n >> (8 * i)) & 255) as u8
+                }
+                return emit(&size)
+            }
+            err(e) => {
+                return code(e)
+            }
+        }
+    }
+    decoder := match brotli.Decoder.new(stream, &mut window[..ring], words) {
+        ok(d) => {
+            d
+        }
+        err(e) => {
+            return code(e)
+        }
+    }
+    total := 0usize
+    for {
+        end := total + 777
+        if end > output.len {
+            end = output.len
+        }
+        n := match decoder.read(&mut output[total..end]) {
+            ok(n) => {
+                n
+            }
+            err(e) => {
+                return code(e)
+            }
+        }
+        if n == 0 {
+            break
+        }
+        total += n
+    }
+    return emit(&output[..total])
+}
+
+fn main() -> i32 {
+    unsafe {
+        return run(&mut INPUT, &mut OUTPUT, &mut WINDOW, &mut WORDS)
+    }
+}

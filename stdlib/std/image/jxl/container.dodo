@@ -71,8 +71,10 @@ fn scan_metadata(data: &[u8]) -> meta.Metadata!pixels.Error {
                 } else if b.kind == XML_BOX && !result.xmp.present() && b.length > 0 {
                     result.xmp = meta.Item.raw(b.offset, b.length)
                 } else if b.kind == BROB_BOX && b.length > 4 {
+                    // The item keeps the inner box type, so meta.decode
+                    // knows to drop an Exif payload's offset field.
                     inner := (((data[b.offset] as u32) << 24) | ((data[b.offset + 1] as u32) << 16) | ((data[b.offset + 2] as u32) << 8) | (data[b.offset + 3] as u32))
-                    item := meta.Item { offset: b.offset + 4, length: b.length - 4, encoding: meta.ENCODING_BROTLI }
+                    item := meta.Item { offset: b.offset, length: b.length, encoding: meta.ENCODING_BROTLI }
                     if inner == EXIF_BOX && !result.exif.present() {
                         result.exif = item
                     } else if inner == XML_BOX && !result.xmp.present() {

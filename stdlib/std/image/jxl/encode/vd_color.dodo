@@ -1,0 +1,547 @@
+package encode
+
+import "std/image/color"
+import "std/image/convert"
+import "std/image/pixels"
+import "std/math"
+
+// Lossy encoding, color stage: source samples to the XYB planes VarDCT
+// codes. The decoder turns XYB back into the color space the image header
+// names (the same choice write_color_encoding makes from the ColorInfo), so
+// the forward path here is the exact inverse of std/image/jxl's xyb.dodo:
+// the header's transfer curve is undone (PQ and HLG with the header's
+// intensity target of 255 nits, HLG including its OOTF), non-sRGB
+// primaries go to linear sRGB through XYZ D50 with Bradford adaptation,
+// then the opsin absorbance matrix, bias and cube root give X, Y and B.
+
+const VD_OPSIN_BIAS: f32 = 0.0037930732552754493
+const VD_M20: f32 = 0.24342268924547819
+const VD_M21: f32 = 0.20476744424496821
+// Largest magnitude of a linear sample; keeps XYB finite for any float
+// input (NaN reads as 0).
+const VD_LINEAR_LIMIT: f32 = 1024.0
+
+// How samples become linear sRGB.
+struct VdColor {
+    // Header transfer: TF_SRGB, TF_LINEAR, TF_709, TF_PQ, TF_HLG, or 0 for
+    // a power law with encoding exponent `gamma`.
+    transfer: u32
+    gamma: f64
+    gray: bool
+    // Linear source RGB to linear sRGB (rows), unless `identity`.
+    m: [9]f32
+    identity: bool
+    // HLG OOTF exponent (0 when the decoder skips it) and luma weights of
+    // the source primaries.
+    hlg_exponent: f64
+    luma: [3]f64
+    // Source sample kind and the per-channel value count it reads.
+    sample: u32
+    channels: usize
+    color_channels: usize
+    cbrt_bias: f32
+    // An embedded ICC profile (vd_icc.dodo) instead of the transfer and
+    // primaries. Curves per slot: kind, para function type, parameters
+    // g a b c d e f, and the profile offset, entry count and entry bytes of
+    // table curves. Lookup-table profiles: the matrix (with offsets) after
+    // the M curves, the CLUT (offset, grid, bytes per entry) and the
+    // connection space encoding; m then maps XYZ D50 to linear sRGB.
+    icc: bool
+    curve_kind: [9]u32
+    curve_type: [9]u32
+    curve_par: [63]f64
+    curve_at: [9]usize
+    curve_n: [9]usize
+    curve_w: [9]u32
+    lut_profile: bool
+    lut_matrix: bool
+    mtx: [12]f64
+    has_clut: bool
+    clut_at: usize
+    clut_grid: [3]usize
+    clut_prec: usize
+    pcs: u32
+
+    // sRGB 8-bit (the starting point of vd_color).
+    fn empty(gray: bool) -> VdColor {
+        cc := 3usize
+        if gray {
+            cc = 1
+        }
+        return VdColor { transfer: TF_SRGB, gamma: 1.0, gray: gray, m: [1.0f32, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0], identity: true, hlg_exponent: 0.0, luma: [0.2126f64, 0.7152, 0.0722], sample: pixels.SAMPLE_U8, channels: cc, color_channels: cc, cbrt_bias: vd_cbrt(VD_OPSIN_BIAS), icc: false, curve_kind: [0u32; 9], curve_type: [0u32; 9], curve_par: [0.0f64; 63], curve_at: [0usize; 9], curve_n: [0usize; 9], curve_w: [2u32; 9], lut_profile: false, lut_matrix: false, mtx: [0.0f64; 12], has_clut: false, clut_at: 0, clut_grid: [2usize; 3], clut_prec: 2, pcs: 0 }
+    }
+}
+
+fn vd_pow(base: f64, exponent: f64) -> f64 {
+    match math.pow(base, exponent) {
+        ok(v) => {
+            return v
+        }
+        err(_) => {
+            return 0.0
+        }
+    }
+}
+
+fn vd_mul3(a: &[f64], b: &[f64], out: &mut[f64]) {
+    for i in 0usize..3 {
+        for j in 0usize..3 {
+            out[i * 3 + j] = a[i * 3] * b[j] + a[i * 3 + 1] * b[3 + j] + a[i * 3 + 2] * b[6 + j]
+        }
+    }
+}
+
+fn vd_inv3(m: &mut[f64]) -> bool {
+    a := m[0]
+    b := m[1]
+    c := m[2]
+    d := m[3]
+    e := m[4]
+    f := m[5]
+    g := m[6]
+    h := m[7]
+    i := m[8]
+    det := a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g)
+    if math.abs(det) < 0.000000000001 {
+        return false
+    }
+    m[0] = (e * i - f * h) / det
+    m[1] = (c * h - b * i) / det
+    m[2] = (b * f - c * e) / det
+    m[3] = (f * g - d * i) / det
+    m[4] = (a * i - c * g) / det
+    m[5] = (c * d - a * f) / det
+    m[6] = (d * h - e * g) / det
+    m[7] = (b * g - a * h) / det
+    m[8] = (a * e - b * d) / det
+    return true
+}
+
+fn vd_primaries_to_xyz(p: &[f64], wx: f64, wy: f64, out: &mut[f64]) -> bool {
+    if wx < 0.0 || wx > 1.0 || wy <= 0.0 || wy > 1.0 {
+        return false
+    }
+    rx := p[0]
+    ry := p[1]
+    gx := p[2]
+    gy := p[3]
+    bx := p[4]
+    by := p[5]
+    m := [rx, gx, bx, ry, gy, by, 1.0 - rx - ry, 1.0 - gx - gy, 1.0 - bx - by]
+    inv := [rx, gx, bx, ry, gy, by, 1.0 - rx - ry, 1.0 - gx - gy, 1.0 - bx - by]
+    if !vd_inv3(&mut inv) {
+        return false
+    }
+    w := [wx / wy, 1.0, (1.0 - wx - wy) / wy]
+    xyz := [0.0f64; 3]
+    for k in 0usize..3 {
+        xyz[k] = inv[k * 3] * w[0] + inv[k * 3 + 1] * w[1] + inv[k * 3 + 2] * w[2]
+    }
+    a := [xyz[0], 0.0, 0.0, 0.0, xyz[1], 0.0, 0.0, 0.0, xyz[2]]
+    vd_mul3(&m, &a, out)
+    return true
+}
+
+static VD_BRADFORD: [9]f64 = [0.8951, 0.2664, -0.1614, -0.7502, 1.7135, 0.0367, 0.0389, -0.0685, 1.0296]
+static VD_BRADFORD_INV: [9]f64 = [0.9869929, -0.1470543, 0.1599627, 0.4323053, 0.5183603, 0.0492912, -0.0085287, 0.0400428, 0.9684867]
+
+fn vd_adapt_to_d50(wx: f64, wy: f64, out: &mut[f64]) -> bool {
+    if wx < 0.0 || wx > 1.0 || wy <= 0.0 || wy > 1.0 {
+        return false
+    }
+    w := [wx / wy, 1.0, (1.0 - wx - wy) / wy]
+    w50 := [0.96422f64, 1.0, 0.82521]
+    lms := [0.0f64; 3]
+    lms50 := [0.0f64; 3]
+    for k in 0usize..3 {
+        lms[k] = VD_BRADFORD[k * 3] * w[0] + VD_BRADFORD[k * 3 + 1] * w[1] + VD_BRADFORD[k * 3 + 2] * w[2]
+        lms50[k] = VD_BRADFORD[k * 3] * w50[0] + VD_BRADFORD[k * 3 + 1] * w50[1] + VD_BRADFORD[k * 3 + 2] * w50[2]
+    }
+    if lms[0] == 0.0 || lms[1] == 0.0 || lms[2] == 0.0 {
+        return false
+    }
+    a := [lms50[0] / lms[0], 0.0, 0.0, 0.0, lms50[1] / lms[1], 0.0, 0.0, 0.0, lms50[2] / lms[2]]
+    b := [0.0f64; 9]
+    vd_mul3(&a, &VD_BRADFORD, &mut b)
+    vd_mul3(&VD_BRADFORD_INV, &b, out)
+    return true
+}
+
+// Linear sRGB to XYZ adapted to D50 (Bradford), the sRGB colorants of the
+// D50 connection space.
+fn vd_srgb_d50(out: &mut[f64]) -> bool {
+    srgb_xyz := [0.0f64; 9]
+    srgb_adapt := [0.0f64; 9]
+    srgb_prim := [0.639998686f64, 0.330010138, 0.300003784, 0.600003357, 0.150002046, 0.059997204]
+    if !vd_primaries_to_xyz(&srgb_prim, 0.3127, 0.329, &mut srgb_xyz) || !vd_adapt_to_d50(0.3127, 0.329, &mut srgb_adapt) {
+        return false
+    }
+    vd_mul3(&srgb_adapt, &srgb_xyz, out)
+    return true
+}
+
+// The color handling for `info` as the image header will describe it
+// (mirrors write_color_encoding: named CICP primaries and curves, custom
+// chromaticities, power laws, sRGB otherwise).
+fn vd_color(info: &color.ColorInfo, layout: &pixels.Layout) -> VdColor {
+    channels := layout.channel_count()
+    cc := 1usize
+    if channels >= 3 {
+        cc = 3
+    }
+    t := VdColor.empty(cc == 1)
+    t.sample = layout.sample_code()
+    t.channels = channels
+    tr := info.transfer
+    if tr == color.TRANSFER_SRGB {
+        t.transfer = TF_SRGB
+    } else if tr == color.TRANSFER_LINEAR {
+        t.transfer = TF_LINEAR
+    } else if tr == color.TRANSFER_BT709 || tr == color.TRANSFER_BT601 || tr == color.TRANSFER_BT2020_10 || tr == color.TRANSFER_BT2020_12 {
+        t.transfer = TF_709
+    } else if tr == color.TRANSFER_PQ {
+        t.transfer = TF_PQ
+    } else if tr == color.TRANSFER_HLG {
+        t.transfer = TF_HLG
+    } else if tr == color.TRANSFER_SMPTE428 {
+        t.transfer = 0
+        t.gamma = 1.0 / 2.6
+    } else if info.gamma > 0 && info.gamma <= 100000 {
+        t.transfer = 0
+        t.gamma = (info.gamma * 100) as f64 / 10000000.0
+    } else if tr == color.TRANSFER_GAMMA22 {
+        t.transfer = 0
+        t.gamma = 4545455.0 / 10000000.0
+    } else if tr == color.TRANSFER_GAMMA28 {
+        t.transfer = 0
+        t.gamma = 3571429.0 / 10000000.0
+    }
+    // Primaries and white point as written to the header.
+    wx := 0.3127f64
+    wy := 0.329f64
+    prim := [0.64f64, 0.33, 0.3, 0.6, 0.15, 0.06]
+    srgb := true
+    custom := info.custom_primaries && info.primaries == color.PRIMARIES_UNSPECIFIED && info.white_x != 0 && info.white_y != 0
+    if custom {
+        // Stored in millionths after rounding to hundred-thousandths.
+        wx = info.white_x as f64 / 100000.0
+        wy = info.white_y as f64 / 100000.0
+        prim = [info.red_x as f64 / 100000.0, info.red_y as f64 / 100000.0, info.green_x as f64 / 100000.0, info.green_y as f64 / 100000.0, info.blue_x as f64 / 100000.0, info.blue_y as f64 / 100000.0]
+        srgb = false
+    } else if info.primaries == color.PRIMARIES_BT2020 {
+        prim = [0.708f64, 0.292, 0.17, 0.797, 0.131, 0.046]
+        srgb = false
+    } else if info.primaries == color.PRIMARIES_DISPLAY_P3 {
+        prim = [0.68f64, 0.32, 0.265, 0.69, 0.15, 0.06]
+        srgb = false
+    } else if info.primaries == color.PRIMARIES_DCI_P3 {
+        prim = [0.68f64, 0.32, 0.265, 0.69, 0.15, 0.06]
+        wx = 0.314
+        wy = 0.351
+        srgb = false
+    }
+    if !srgb && !t.gray {
+        to_xyz := [0.0f64; 9]
+        adapt := [0.0f64; 9]
+        srgb_d50 := [0.0f64; 9]
+        ok1 := vd_primaries_to_xyz(&prim, wx, wy, &mut to_xyz)
+        ok2 := vd_srgb_d50(&mut srgb_d50)
+        ok3 := vd_adapt_to_d50(wx, wy, &mut adapt)
+        if ok1 && ok2 && ok3 {
+            for k in 0usize..3 {
+                t.luma[k] = to_xyz[3 + k]
+            }
+            original := [0.0f64; 9]
+            vd_mul3(&adapt, &to_xyz, &mut original)
+            if vd_inv3(&mut srgb_d50) {
+                // original -> sRGB = inverse(srgb_d50) * original.
+                product := [0.0f64; 9]
+                vd_mul3(&srgb_d50, &original, &mut product)
+                for k in 0usize..9 {
+                    t.m[k] = product[k] as f32
+                }
+                t.identity = false
+            }
+        }
+    }
+    if t.transfer == TF_HLG {
+        // The decoder's OOTF for its 255-nit intensity target.
+        g := (1.0 / 1.2) * vd_pow(1.111, -vd_log2(255.0 / 1000.0))
+        e := g - 1.0
+        if e > 0.01 || e < -0.01 {
+            t.hlg_exponent = e
+        }
+    }
+    return t
+}
+
+fn vd_log2(v: f64) -> f64 {
+    match math.log2(v) {
+        ok(r) => {
+            return r
+        }
+        err(_) => {
+            return 0.0
+        }
+    }
+}
+
+// Encoded value to linear light (the inverse of the decoder's
+// encode_transfer); odd-symmetric like the decoder.
+fn vd_to_linear(t: &VdColor, v: f64) -> f64 {
+    x := v
+    negative := x < 0.0
+    if negative {
+        x = -x
+    }
+    y := x
+    if t.transfer == TF_SRGB {
+        if x <= 0.04045 {
+            y = x / 12.92
+        } else {
+            y = vd_pow((x + 0.055) / 1.055, 2.4)
+        }
+    } else if t.transfer == TF_709 {
+        if x < 0.081 {
+            y = x / 4.5
+        } else {
+            y = vd_pow((x + 0.099) / 1.099, 1.0 / 0.45)
+        }
+    } else if t.transfer == TF_PQ {
+        m1 := 2610.0 / 16384.0
+        m2 := 2523.0 / 4096.0 * 128.0
+        c1 := 3424.0 / 4096.0
+        c2 := 2413.0 / 4096.0 * 32.0
+        c3 := 2392.0 / 4096.0 * 32.0
+        e := vd_pow(x, 1.0 / m2)
+        num := e - c1
+        if num < 0.0 {
+            num = 0.0
+        }
+        den := c2 - c3 * e
+        if den <= 0.000001 {
+            den = 0.000001
+        }
+        y = vd_pow(num / den, 1.0 / m1) * 10000.0 / 255.0
+    } else if t.transfer == TF_HLG {
+        if x <= 0.5 {
+            y = x * x / 3.0
+        } else {
+            match math.exp((x - 0.55991073) / 0.17883277) {
+                ok(ev) => {
+                    y = (ev + 0.28466892) / 12.0
+                }
+                err(_) => {
+                    y = 0.0
+                }
+            }
+        }
+    } else if t.transfer == 0 {
+        if x <= 0.0 {
+            y = 0.0
+        } else {
+            y = vd_pow(x, 1.0 / t.gamma)
+        }
+    }
+    if y > VD_LINEAR_LIMIT as f64 {
+        y = VD_LINEAR_LIMIT as f64
+    }
+    if negative {
+        y = -y
+    }
+    return y
+}
+
+// Entries of the linearization table: 256 for 8-bit samples, 65536 for
+// 16-bit integers and binary16 floats (indexed by the bit pattern), none
+// for binary32 (converted per sample). With an ICC profile (vd_icc.dodo)
+// it holds the curve tables: three input curves of 256 entries (8-bit
+// samples) or 4097, and six more curves of 4097 entries for lookup-table
+// profiles, which every size below accommodates.
+fn vd_lut_size(sample: u32) -> usize {
+    if sample == pixels.SAMPLE_U8 {
+        return 3 * 256 + 6 * (VD_ICC_STEPS + 1)
+    }
+    if sample == pixels.SAMPLE_F32 {
+        return VD_CURVES * (VD_ICC_STEPS + 1)
+    }
+    return 65536
+}
+
+fn vd_sanitize(v: f32) -> f32 {
+    if !(v == v) {
+        return 0.0
+    }
+    if v > VD_LINEAR_LIMIT {
+        return VD_LINEAR_LIMIT
+    }
+    if v < -VD_LINEAR_LIMIT {
+        return -VD_LINEAR_LIMIT
+    }
+    return v
+}
+
+fn vd_fill_lut(t: &VdColor, lut: &mut[f32]) {
+    n := vd_lut_size(t.sample)
+    if t.sample == pixels.SAMPLE_U8 {
+        n = 256
+    } else if t.sample == pixels.SAMPLE_F32 {
+        n = 0
+    }
+    for i in 0usize..n {
+        v := 0.0f64
+        if t.sample == pixels.SAMPLE_U8 {
+            v = i as f64 / 255.0
+        } else if t.sample == pixels.SAMPLE_U16 {
+            v = i as f64 / 65535.0
+        } else {
+            v = vd_sanitize(convert.f32_from_bits(convert.half_to_f32_bits(i as u16))) as f64
+        }
+        lut[i] = vd_to_linear(t, v) as f32
+    }
+}
+
+// Cube root of x >= 0 (three Newton steps from a bit-level estimate).
+@inline
+fn vd_cbrt(x: f32) -> f32 {
+    if x <= 0.0 {
+        return 0.0
+    }
+    bits := convert.f32_bits(x)
+    y := convert.f32_from_bits(bits / 3 + 709921077)
+    y = y - (y * y * y - x) / (3.0 * y * y)
+    y = y - (y * y * y - x) / (3.0 * y * y)
+    y = y - (y * y * y - x) / (3.0 * y * y)
+    return y
+}
+
+// Linear value of channel c of pixel `x` in `row`.
+@inline
+fn vd_linear_sample(t: &VdColor, lut: &[f32], row: &[u8], x: usize, c: usize) -> f32 {
+    index := x * t.channels + c
+    if t.icc {
+        return vd_icc_sample(t, lut, row, index, c)
+    }
+    if t.sample == pixels.SAMPLE_U8 {
+        return lut[row[index] as usize]
+    }
+    if t.sample == pixels.SAMPLE_F32 {
+        v := vd_sanitize(convert.f32_from_bits(pixels.get32(row, index * 4)))
+        return vd_to_linear(t, v as f64) as f32
+    }
+    return lut[pixels.get16(row, index * 2) as usize]
+}
+
+// XYB of one source pixel into xyb[at], xyb[at + plane], xyb[at + 2 * plane]
+// (X, Y, B). `icc` is the embedded profile (lookup-table profiles read their
+// CLUT from it).
+fn vd_pixel_xyb(t: &VdColor, icc: &[u8], lut: &[f32], row: &[u8], x: usize, xyb: &mut[f32], at: usize, plane: usize) {
+    if t.gray {
+        v := vd_linear_sample(t, lut, row, x, 0)
+        if t.hlg_exponent != 0.0 && v > 0.0 {
+            v = (v as f64 * vd_pow(v as f64, -t.hlg_exponent / (1.0 + t.hlg_exponent))) as f32
+        }
+        mixed := v + VD_OPSIN_BIAS
+        if mixed < 0.0 {
+            mixed = 0.0
+        }
+        yv := vd_cbrt(mixed) - t.cbrt_bias
+        xyb[at] = 0.0
+        xyb[at + plane] = yv
+        xyb[at + 2 * plane] = yv
+        return
+    }
+    r := 0.0f32
+    g := 0.0f32
+    b := 0.0f32
+    if t.lut_profile {
+        rgb := [0.0f32; 3]
+        vd_icc_lut_pixel(t, icc, lut, row, x, &mut rgb)
+        r = rgb[0]
+        g = rgb[1]
+        b = rgb[2]
+    } else {
+        r = vd_linear_sample(t, lut, row, x, 0)
+        g = vd_linear_sample(t, lut, row, x, 1)
+        b = vd_linear_sample(t, lut, row, x, 2)
+    }
+    if t.hlg_exponent != 0.0 {
+        lum := t.luma[0] * r as f64 + t.luma[1] * g as f64 + t.luma[2] * b as f64
+        if lum > 0.0 {
+            f := vd_pow(lum, -t.hlg_exponent / (1.0 + t.hlg_exponent))
+            r = (r as f64 * f) as f32
+            g = (g as f64 * f) as f32
+            b = (b as f64 * f) as f32
+        }
+    }
+    if !t.identity {
+        r2 := t.m[0] * r + t.m[1] * g + t.m[2] * b
+        g2 := t.m[3] * r + t.m[4] * g + t.m[5] * b
+        b2 := t.m[6] * r + t.m[7] * g + t.m[8] * b
+        r = r2
+        g = g2
+        b = b2
+    }
+    m0 := 0.3f32 * r + 0.622 * g + 0.078 * b + VD_OPSIN_BIAS
+    m1 := 0.23f32 * r + 0.692 * g + 0.078 * b + VD_OPSIN_BIAS
+    m2 := VD_M20 * r + VD_M21 * g + (1.0 - VD_M20 - VD_M21) * b + VD_OPSIN_BIAS
+    if m0 < 0.0 {
+        m0 = 0.0
+    }
+    if m1 < 0.0 {
+        m1 = 0.0
+    }
+    if m2 < 0.0 {
+        m2 = 0.0
+    }
+    l := vd_cbrt(m0) - t.cbrt_bias
+    m := vd_cbrt(m1) - t.cbrt_bias
+    s := vd_cbrt(m2) - t.cbrt_bias
+    xyb[at] = 0.5 * (l - m)
+    xyb[at + plane] = 0.5 * (l + m)
+    xyb[at + 2 * plane] = s
+}
+
+// The XYB planes of the rectangle (x0 - border, y0 - border) of size
+// (w + 2 border) x (h + 2 border), coordinates clamped to the image (edge
+// replication, which is how the padding to whole blocks is filled too).
+// Planes have row stride `stride` and size `plane`.
+fn vd_load_xyb(source: &pixels.View, t: &VdColor, icc: &[u8], lut: &[f32], x0: usize, y0: usize, w: usize, h: usize, border: usize, xyb: &mut[f32], stride: usize, plane: usize) {
+    width := source.width() as usize
+    height := source.height() as usize
+    for yy in 0usize..h + 2 * border {
+        sy := y0 + yy
+        if sy < border {
+            sy = 0
+        } else {
+            sy -= border
+        }
+        if sy >= height {
+            sy = height - 1
+        }
+        row := source.row(sy as u32)
+        base := yy * stride
+        // Pixels inside the image once, then replicate the edges.
+        lo := 0usize
+        if x0 < border {
+            lo = border - x0
+        }
+        hi := w + 2 * border
+        if x0 + hi > width + border {
+            hi = width + border - x0
+        }
+        for xx in lo..hi {
+            vd_pixel_xyb(t, icc, lut, row, x0 + xx - border, xyb, base + xx, plane)
+        }
+        for xx in 0usize..lo {
+            for c in 0usize..3 {
+                xyb[c * plane + base + xx] = xyb[c * plane + base + lo]
+            }
+        }
+        for xx in hi..w + 2 * border {
+            for c in 0usize..3 {
+                xyb[c * plane + base + xx] = xyb[c * plane + base + hi - 1]
+            }
+        }
+    }
+}

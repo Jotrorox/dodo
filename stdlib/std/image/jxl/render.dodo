@@ -8,9 +8,10 @@ import "std/image/sink"
 // The float pipeline (see decode.dodo): decoded modular channels (XYB
 // dequantized, bit depths normalized) or the VarDCT color planes go through
 // chroma upsampling, Gaborish and the edge-preserving filter, become the
-// frame's f32 planes (upsampled), get patches, splines and noise, then the
-// color transform and blending onto the canvas over reference slots,
-// following libjxl's render pipeline order.
+// frame's f32 planes (upsampled; patches and splines of upsampled frames
+// apply to coded-size planes first), get noise, then the color transform,
+// blending onto the canvas over reference slots and spot colors, following
+// libjxl's render pipeline order.
 
 const PATCH_NONE: u32 = 0
 const PATCH_REPLACE: u32 = 1
@@ -30,14 +31,26 @@ struct FloatBufs {
     ftemp: &mut[f32]
     // Three frame-sized planes for noise synthesis (empty without noise).
     noise: &mut[f32]
+    // Coded-size planes of upsampled frames with patches or splines (lw x
+    // lh; empty when no frame needs them).
+    low: &mut[f32]
     planes: usize
     fw: usize
     fh: usize
+    lw: usize
+    lh: usize
     slot_off: [4]usize
     slot_cap: [4]usize
+    // Stored size of each slot (the saved frame's window), the frame size
+    // patches are checked against, and whether it holds a frame saved
+    // before the color transform (only those feed patches, only the
+    // others backgrounds, as in libjxl).
     slot_w: [4]usize
     slot_h: [4]usize
+    slot_fw: [4]usize
+    slot_fh: [4]usize
     slot_valid: [4]bool
+    slot_before: [4]bool
     // False for a single frame covering the image: it is emitted from the
     // frame planes directly.
     use_canvas: bool
@@ -56,11 +69,11 @@ fn float_bits_i32(v: f32) -> i32 {
 
 // Convert the decoded channels to float in place: XYB dequantization for
 // XYB images, bit depth normalization otherwise.
-fn channels_to_float(h: &ImageHeader, f: &FrameHeader, work: &mut ModularWork, gch: &ChanList, vals: &FrameVals) {
+fn channels_to_float(h: &ImageHeader, f: &FrameHeader, work: &mut ModularWork, gch: &ChanList, vals: &FrameVals, ex: &Extras) {
     if !f.modular {
         // VarDCT: the color planes are separate, gch holds extra channels.
         for e in 0usize..h.num_extra as usize {
-            convert_channel(work, gch, e, h.ec_bits[e], h.ec_exp_bits[e])
+            convert_channel(work, gch, e, ex.get(e, EX_BITS), ex.get(e, EX_EXP))
         }
         return
     }
@@ -93,7 +106,7 @@ fn channels_to_float(h: &ImageHeader, f: &FrameHeader, work: &mut ModularWork, g
         }
     }
     for e in 0usize..h.num_extra as usize {
-        convert_channel(work, gch, color + e, h.ec_bits[e], h.ec_exp_bits[e])
+        convert_channel(work, gch, color + e, ex.get(e, EX_BITS), ex.get(e, EX_EXP))
     }
 }
 
@@ -352,10 +365,9 @@ fn upsampling_kernel(r: &mut Reader, h: &ImageHeader, n: usize, kernel: &mut[f32
     }
 }
 
-// Copy or upsample a float channel of the arena into frame plane `plane`.
-fn fill_plane(r: &mut Reader, h: &ImageHeader, a: &[f32], gch: &ChanList, c: usize, factor: usize, fb: &mut FloatBufs, plane: usize) {
-    fw := fb.fw
-    fh := fb.fh
+// Copy or upsample float channel c of `a` (described by gch) into plane
+// `plane` of `out` (planes of fw x fh).
+fn fill_plane(r: &mut Reader, h: &ImageHeader, a: &[f32], gch: &ChanList, c: usize, factor: usize, out: &mut[f32], fw: usize, fh: usize, plane: usize) {
     dst := plane * fw * fh
     off := gch.offset(c)
     stride := gch.stride(c)
@@ -372,7 +384,7 @@ fn fill_plane(r: &mut Reader, h: &ImageHeader, a: &[f32], gch: &ChanList, c: usi
                 if sx >= w {
                     sx = w - 1
                 }
-                fb.frame[dst + y * fw + x] = a[off + sy * stride + sx]
+                out[dst + y * fw + x] = a[off + sy * stride + sx]
             }
         }
         return
@@ -410,7 +422,7 @@ fn fill_plane(r: &mut Reader, h: &ImageHeader, a: &[f32], gch: &ChanList, c: usi
             if sum > hi {
                 sum = hi
             }
-            fb.frame[dst + y * fw + x] = sum
+            out[dst + y * fw + x] = sum
         }
     }
 }
@@ -431,16 +443,13 @@ fn chroma_h(a: &[f32], gch: &ChanList, c: usize, row: usize, x: usize) -> f32 {
     return 0.25 * a[base + mirror(sx as i64 + 1, n)] + cur
 }
 
-// Copy a (possibly subsampled) YCbCr channel into frame plane `plane`,
-// upsampling as libjxl does: 3/4 nearest + 1/4 next sample, horizontally
-// then vertically, edges mirrored.
-fn fill_chroma(a: &[f32], gch: &ChanList, c: usize, fb: &mut FloatBufs, plane: usize) {
-    fw := fb.fw
-    fh := fb.fh
-    dst := plane * fw * fh
+// Upsample a subsampled YCbCr channel c of `gch` to the full w x h sample
+// size at a[out..] (stride w) as libjxl does: 3/4 nearest + 1/4 next
+// sample, horizontally then vertically, edges mirrored.
+fn chroma_to_full(a: &mut[f32], gch: &ChanList, c: usize, out: usize, w: usize, h: usize) {
     m := gch.height(c)
-    for y in 0usize..fh {
-        for x in 0usize..fw {
+    for y in 0usize..h {
+        for x in 0usize..w {
             v := 0.0f32
             if gch.vshift(c) == 0 {
                 v = chroma_h(a, gch, c, y, x)
@@ -453,7 +462,7 @@ fn fill_chroma(a: &[f32], gch: &ChanList, c: usize, fb: &mut FloatBufs, plane: u
                 }
                 v = chroma_h(a, gch, c, other, x) * 0.25 + mid
             }
-            fb.frame[dst + y * fw + x] = v
+            a[out + y * w + x] = v
         }
     }
 }
@@ -488,36 +497,41 @@ fn uses_alpha(mode: u32) -> bool {
     return mode == PATCH_BLEND_ABOVE || mode == PATCH_BLEND_BELOW || mode == PATCH_MULADD_ABOVE || mode == PATCH_MULADD_BELOW
 }
 
-// libjxl's PerformBlending for one pixel: bg and fg hold 3 + num_ec values,
-// modes/alphas/clamps hold the color blending (index 0) and one per extra
-// channel; the result goes to out.
-fn blend_pixel(h: &ImageHeader, bg: &[f32], fg: &[f32], out: &mut[f32], modes: &[u32], alphas: &[u32], clamps: &[bool], has_alpha: bool) {
+// libjxl's PerformBlending for one pixel: ex.v holds the background, the
+// foreground and the result (3 + num_ec values each); the color blending is
+// (mode0, alpha0, clamp0), each extra channel's is in its EX_PMODE,
+// EX_PALPHA and EX_PCLAMP words (patch blending modes).
+fn blend_pixel(h: &ImageHeader, ex: &mut Extras, mode0: u32, alpha0: u32, clamp0: bool, has_alpha: bool) {
     nec := h.num_extra as usize
+    np := 3 + nec
+    fo := np
+    oo := 2 * np
     for i in 0usize..nec {
-        mode := modes[1 + i]
-        b := bg[3 + i]
-        fv := fg[3 + i]
-        alpha := alphas[1 + i] as usize
+        mode := ex.get(i, EX_PMODE)
+        b := ex.v[3 + i]
+        fv := ex.v[fo + 3 + i]
+        alpha := ex.get(i, EX_PALPHA) as usize
         if alpha >= nec {
             alpha = 0
         }
-        premultiplied := h.ec_associated[alpha]
+        clamp := ex.get(i, EX_PCLAMP) != 0
+        premultiplied := ex.get(alpha, EX_ASSOC) != 0
         v := b
         if mode == PATCH_ADD {
             v = b + fv
         } else if mode == PATCH_BLEND_ABOVE || mode == PATCH_BLEND_BELOW {
             lower := b
-            lower_a := bg[3 + alpha]
+            lower_a := ex.v[3 + alpha]
             upper := fv
-            upper_a := fg[3 + alpha]
+            upper_a := ex.v[fo + 3 + alpha]
             if mode == PATCH_BLEND_BELOW {
                 lower = fv
-                lower_a = fg[3 + alpha]
+                lower_a = ex.v[fo + 3 + alpha]
                 upper = b
-                upper_a = bg[3 + alpha]
+                upper_a = ex.v[3 + alpha]
             }
             fa := upper_a
-            if clamps[1 + i] {
+            if clamp {
                 fa = clamp01(fa)
             }
             if alpha == i {
@@ -535,71 +549,71 @@ fn blend_pixel(h: &ImageHeader, bg: &[f32], fg: &[f32], out: &mut[f32], modes: &
         } else if mode == PATCH_MULADD_ABOVE || mode == PATCH_MULADD_BELOW {
             lower := b
             upper := fv
-            upper_a := fg[3 + alpha]
+            upper_a := ex.v[fo + 3 + alpha]
             if mode == PATCH_MULADD_BELOW {
                 lower = fv
                 upper = b
-                upper_a = bg[3 + alpha]
+                upper_a = ex.v[3 + alpha]
             }
             if alpha == i {
                 v = lower
             } else {
                 fa := upper_a
-                if clamps[1 + i] {
+                if clamp {
                     fa = clamp01(fa)
                 }
                 v = lower + upper * fa
             }
         } else if mode == PATCH_MUL {
             m := fv
-            if clamps[1 + i] {
+            if clamp {
                 m = clamp01(m)
             }
             v = b * m
         } else if mode == PATCH_REPLACE {
             v = fv
         }
-        out[3 + i] = v
+        ex.v[oo + 3 + i] = v
     }
-    mode := modes[0]
-    alpha := alphas[0] as usize
+    mode := mode0
+    alpha := alpha0 as usize
     if alpha >= nec {
         alpha = 0
     }
     if mode == PATCH_ADD || ((mode == PATCH_MULADD_ABOVE || mode == PATCH_MULADD_BELOW) && !has_alpha) {
         for c in 0usize..3 {
-            out[c] = bg[c] + fg[c]
+            ex.v[oo + c] = ex.v[c] + ex.v[fo + c]
         }
     } else if mode == PATCH_MULADD_ABOVE || mode == PATCH_MULADD_BELOW {
-        fa := fg[3 + alpha]
+        fa := ex.v[fo + 3 + alpha]
         if mode == PATCH_MULADD_BELOW {
-            fa = bg[3 + alpha]
+            fa = ex.v[3 + alpha]
         }
-        if clamps[0] {
+        if clamp0 {
             fa = clamp01(fa)
         }
         for c in 0usize..3 {
             if mode == PATCH_MULADD_ABOVE {
-                out[c] = bg[c] + fg[c] * fa
+                ex.v[oo + c] = ex.v[c] + ex.v[fo + c] * fa
             } else {
-                out[c] = fg[c] + bg[c] * fa
+                ex.v[oo + c] = ex.v[fo + c] + ex.v[c] * fa
             }
         }
     } else if mode == PATCH_BLEND_ABOVE || mode == PATCH_BLEND_BELOW {
         if !has_alpha {
             for c in 0usize..3 {
-                out[c] = fg[c]
+                ex.v[oo + c] = ex.v[fo + c]
             }
         } else {
-            premultiplied := h.ec_associated[alpha]
+            premultiplied := ex.get(alpha, EX_ASSOC) != 0
             above := mode == PATCH_BLEND_ABOVE
-            lower_a := bg[3 + alpha]
-            fa := fg[3 + alpha]
+            lower_a := ex.v[3 + alpha]
+            fa := ex.v[fo + 3 + alpha]
             if !above {
-                lower_a = fg[3 + alpha]
-                fa = bg[3 + alpha]
+                lower_a = ex.v[fo + 3 + alpha]
+                fa = ex.v[3 + alpha]
             }
-            if clamps[0] {
+            if clamp0 {
                 fa = clamp01(fa)
             }
             new_a := 1.0 - (1.0 - fa) * (1.0 - lower_a)
@@ -608,35 +622,35 @@ fn blend_pixel(h: &ImageHeader, bg: &[f32], fg: &[f32], out: &mut[f32], modes: &
                 inv = 1.0 / new_a
             }
             for c in 0usize..3 {
-                upper := fg[c]
-                lower := bg[c]
+                upper := ex.v[fo + c]
+                lower := ex.v[c]
                 if !above {
-                    upper = bg[c]
-                    lower = fg[c]
+                    upper = ex.v[c]
+                    lower = ex.v[fo + c]
                 }
                 if premultiplied {
-                    out[c] = upper + lower * (1.0 - fa)
+                    ex.v[oo + c] = upper + lower * (1.0 - fa)
                 } else {
-                    out[c] = (upper * fa + lower * lower_a * (1.0 - fa)) * inv
+                    ex.v[oo + c] = (upper * fa + lower * lower_a * (1.0 - fa)) * inv
                 }
             }
-            out[3 + alpha] = new_a
+            ex.v[oo + 3 + alpha] = new_a
         }
     } else if mode == PATCH_MUL {
         for c in 0usize..3 {
-            m := fg[c]
-            if clamps[0] {
+            m := ex.v[fo + c]
+            if clamp0 {
                 m = clamp01(m)
             }
-            out[c] = bg[c] * m
+            ex.v[oo + c] = ex.v[c] * m
         }
     } else if mode == PATCH_REPLACE {
         for c in 0usize..3 {
-            out[c] = fg[c]
+            ex.v[oo + c] = ex.v[fo + c]
         }
     } else {
         for c in 0usize..3 {
-            out[c] = bg[c]
+            ex.v[oo + c] = ex.v[c]
         }
     }
 }
@@ -658,30 +672,59 @@ fn patch_mode(mode: u32) -> u32 {
     return PATCH_REPLACE
 }
 
+// The size patches are positioned in: the coded (not upsampled) frame
+// size, padded to whole blocks for VarDCT frames (as libjxl checks them).
+fn patch_area(f: &FrameHeader, vertical: bool) -> u64 {
+    if !f.modular {
+        return vardct_blocks(f, vertical) as u64 * 8
+    }
+    if vertical {
+        return f.sample_height as u64
+    }
+    return f.sample_width as u64
+}
+
 // Parse the patches at the reader; with `apply`, blend each patch from its
 // reference slot into the frame planes as it is read (in decoding order,
-// which is libjxl's order for overlapping patches).
-fn patches(r: &mut Reader, h: &ImageHeader, f: &FrameHeader, tcode: &mut Code, n1: &mut Code, n2: &mut Code, window: &mut[u32], apply: bool, fb: &mut FloatBufs) -> void!pixels.Error {
+// which is libjxl's order for overlapping patches). Patches apply before
+// upsampling: into the frame planes (upsampling 1) or, with `low`, into the
+// coded-size planes fb.low (lw x lh). Parts outside the planes are clipped.
+fn patches(r: &mut Reader, h: &ImageHeader, f: &FrameHeader, tcode: &mut Code, n1: &mut Code, n2: &mut Code, window: &mut[u32], apply: bool, fb: &mut FloatBufs, ex: &mut Extras, low: bool) -> void!pixels.Error {
     read_code(r, 10, tcode, n1, n2, window)?
     stream := Stream.new(window)
     stream.begin(tcode, r)
     nec := h.num_extra as usize
-    fw := f.width as u64
-    fh := f.height as u64
+    fw := patch_area(f, false)
+    fh := patch_area(f, true)
     max_refs := 1024 + fw * fh / 4
+    // Patches land only in the part of the frame that matters (see
+    // window.dodo, in the frame's patch coordinates); the slots hold what
+    // that part reads.
+    apply_w := f.patch_w as usize
+    apply_h := f.patch_h as usize
     max_patches := max_refs * 4
     num_refs := tcode.read(&mut stream, r, 0, 0) as u64
     if num_refs > max_refs {
         return err(pixels.Error.Malformed)
     }
+    if apply && ex.n < nec {
+        return err(pixels.Error.TooLarge)
+    }
     total := 0u64
-    has_alpha := h.alpha_channel() < MAX_EXTRA
-    modes := [0u32; MAX_EXTRA + 1]
-    alphas := [0u32; MAX_EXTRA + 1]
-    clamps := [false; MAX_EXTRA + 1]
-    bg := [0.0f32; MAX_EXTRA + 3]
-    fg := [0.0f32; MAX_EXTRA + 3]
-    out := [0.0f32; MAX_EXTRA + 3]
+    has_alpha := h.has_alpha()
+    planes := 3 + nec
+    tw := fb.fw
+    th := fb.fh
+    if low {
+        tw = fb.lw
+        th = fb.lh
+    }
+    if apply_w > tw {
+        apply_w = tw
+    }
+    if apply_h > th {
+        apply_h = th
+    }
     for i in 0u64..num_refs {
         slot := tcode.read(&mut stream, r, 1, 0) as usize
         if slot >= 4 {
@@ -692,7 +735,7 @@ fn patches(r: &mut Reader, h: &ImageHeader, f: &FrameHeader, tcode: &mut Code, n
         pw := tcode.read(&mut stream, r, 2, 0) as usize + 1
         ph := tcode.read(&mut stream, r, 2, 0) as usize + 1
         if apply {
-            if !fb.slot_valid[slot] || rx + pw > fb.slot_w[slot] || ry + ph > fb.slot_h[slot] {
+            if !fb.slot_valid[slot] || !fb.slot_before[slot] || rx + pw > fb.slot_fw[slot] || ry + ph > fb.slot_fh[slot] {
                 return err(pixels.Error.Malformed)
             }
         }
@@ -721,22 +764,37 @@ fn patches(r: &mut Reader, h: &ImageHeader, f: &FrameHeader, tcode: &mut Code, n
             if px as u64 + pw as u64 > fw || py as u64 + ph as u64 > fh {
                 return err(pixels.Error.Malformed)
             }
+            mode0 := 0u32
+            alpha0 := 0u32
+            clamp0 := false
             for j in 0usize..nec + 1 {
                 mode := tcode.read(&mut stream, r, 5, 0)
                 if mode >= 8 {
                     return err(pixels.Error.Malformed)
                 }
-                modes[j] = mode
-                alphas[j] = 0
+                alpha := 0u32
                 if uses_alpha(mode) && nec > 1 {
-                    alphas[j] = tcode.read(&mut stream, r, 8, 0)
-                    if alphas[j] as usize >= nec {
+                    alpha = tcode.read(&mut stream, r, 8, 0)
+                    if alpha as usize >= nec {
                         return err(pixels.Error.Malformed)
                     }
                 }
-                clamps[j] = false
+                clamp := false
                 if uses_alpha(mode) || mode == PATCH_MUL {
-                    clamps[j] = tcode.read(&mut stream, r, 9, 0) != 0
+                    clamp = tcode.read(&mut stream, r, 9, 0) != 0
+                }
+                if j == 0 {
+                    mode0 = mode
+                    alpha0 = alpha
+                    clamp0 = clamp
+                } else if apply {
+                    ex.put(j - 1, EX_PMODE, mode)
+                    ex.put(j - 1, EX_PALPHA, alpha)
+                    clamped := 0u32
+                    if clamp {
+                        clamped = 1
+                    }
+                    ex.put(j - 1, EX_PCLAMP, clamped)
                 }
             }
             if r.overrun {
@@ -745,22 +803,39 @@ fn patches(r: &mut Reader, h: &ImageHeader, f: &FrameHeader, tcode: &mut Code, n
             if !apply {
                 continue
             }
-            planes := 3 + nec
-            frame_plane := fb.fw * fb.fh
+            target_plane := tw * th
             sw := fb.slot_w[slot]
             slot_plane := sw * fb.slot_h[slot]
             base := fb.slot_off[slot]
+            fo := planes
+            oo := 2 * planes
             for dy in 0usize..ph {
+                ty := py as usize + dy
+                if ty >= apply_h || ry + dy >= fb.slot_h[slot] {
+                    break
+                }
                 for dx in 0usize..pw {
                     tx := px as usize + dx
-                    ty := py as usize + dy
-                    for c in 0usize..planes {
-                        bg[c] = fb.frame[c * frame_plane + ty * fb.fw + tx]
-                        fg[c] = fb.slots[base + c * slot_plane + (ry + dy) * sw + rx + dx]
+                    if tx >= apply_w || rx + dx >= sw {
+                        break
                     }
-                    blend_pixel(h, &bg, &fg, &mut out, &modes, &alphas, &clamps, has_alpha)
                     for c in 0usize..planes {
-                        fb.frame[c * frame_plane + ty * fb.fw + tx] = out[c]
+                        at := c * target_plane + ty * tw + tx
+                        if low {
+                            ex.v[c] = fb.low[at]
+                        } else {
+                            ex.v[c] = fb.frame[at]
+                        }
+                        ex.v[fo + c] = fb.slots[base + c * slot_plane + (ry + dy) * sw + rx + dx]
+                    }
+                    blend_pixel(h, ex, mode0, alpha0, clamp0, has_alpha)
+                    for c in 0usize..planes {
+                        at := c * target_plane + ty * tw + tx
+                        if low {
+                            fb.low[at] = ex.v[oo + c]
+                        } else {
+                            fb.frame[at] = ex.v[oo + c]
+                        }
                     }
                 }
             }
@@ -776,32 +851,43 @@ fn skip_patches(r: &mut Reader, h: &ImageHeader, f: &FrameHeader, tcode: &mut Co
     e3 := [0.0f32; 1]
     e4 := [0.0f32; 1]
     e5 := [0.0f32; 1]
-    fb := FloatBufs { frame: &mut e1, canvas: &mut e2, slots: &mut e3, ftemp: &mut e4, noise: &mut e5, planes: 0, fw: 0, fh: 0, slot_off: [0usize; 4], slot_cap: [0usize; 4], slot_w: [0usize; 4], slot_h: [0usize; 4], slot_valid: [false; 4], use_canvas: false }
-    return patches(r, h, f, tcode, n1, n2, window, false, &mut fb)
+    e6 := [0.0f32; 1]
+    w := [0u32; 1]
+    v := [0.0f32; 1]
+    fb := FloatBufs { frame: &mut e1, canvas: &mut e2, slots: &mut e3, ftemp: &mut e4, noise: &mut e5, low: &mut e6, planes: 0, fw: 0, fh: 0, lw: 0, lh: 0, slot_off: [0usize; 4], slot_cap: [0usize; 4], slot_w: [0usize; 4], slot_h: [0usize; 4], slot_fw: [0usize; 4], slot_fh: [0usize; 4], slot_valid: [false; 4], slot_before: [false; 4], use_canvas: false }
+    ex := Extras { w: &mut w, v: &mut v, n: 0 }
+    return patches(r, h, f, tcode, n1, n2, window, false, &mut fb, &mut ex, false)
 }
 
-// Copy planes into reference slot k: from the frame (pre color transform)
-// or from the canvas.
-fn save_slot(fb: &mut FloatBufs, k: usize, from_frame: bool, width: usize, height: usize) -> void!pixels.Error {
+// Copy planes into reference slot k: the top-left width x height of the
+// frame planes, or the canvas (image size). `before` marks a frame saved
+// before the color transform, whose full size is fw x fh.
+fn save_slot(fb: &mut FloatBufs, k: usize, from_frame: bool, width: usize, height: usize, before: bool, fw: usize, fh: usize) -> void!pixels.Error {
     pixels_count := width * height
-    if pixels_count > fb.slot_cap[k] {
+    if pixels_count > fb.slot_cap[k] || (from_frame && (width > fb.fw || height > fb.fh)) {
         return err(pixels.Error.TooLarge)
     }
     base := fb.slot_off[k]
+    frame_plane := fb.fw * fb.fh
     for c in 0usize..fb.planes {
-        for i in 0usize..pixels_count {
-            v := 0.0f32
-            if from_frame {
-                v = fb.frame[c * pixels_count + i]
-            } else {
-                v = fb.canvas[c * pixels_count + i]
+        for y in 0usize..height {
+            for x in 0usize..width {
+                v := 0.0f32
+                if from_frame {
+                    v = fb.frame[c * frame_plane + y * fb.fw + x]
+                } else {
+                    v = fb.canvas[c * pixels_count + y * width + x]
+                }
+                fb.slots[base + c * pixels_count + y * width + x] = v
             }
-            fb.slots[base + c * pixels_count + i] = v
         }
     }
     fb.slot_w[k] = width
     fb.slot_h[k] = height
+    fb.slot_fw[k] = fw
+    fb.slot_fh[k] = fh
     fb.slot_valid[k] = true
+    fb.slot_before[k] = before
     return ok()
 }
 
@@ -816,7 +902,7 @@ fn slot_sample(fb: &FloatBufs, k: usize, c: usize, x: usize, y: usize) -> f32 {
 
 // Compose the frame onto the canvas: over the reference slots for blended
 // or cropped frames, as a copy otherwise.
-fn compose(h: &ImageHeader, f: &FrameHeader, fb: &mut FloatBufs) {
+fn compose(h: &ImageHeader, f: &FrameHeader, fb: &mut FloatBufs, ex: &mut Extras) -> void!pixels.Error {
     width := h.width as usize
     height := h.height as usize
     canvas_plane := width * height
@@ -835,177 +921,224 @@ fn compose(h: &ImageHeader, f: &FrameHeader, fb: &mut FloatBufs) {
                 }
             }
         }
-        return
+        return ok()
     }
-    modes := [0u32; MAX_EXTRA + 1]
-    alphas := [0u32; MAX_EXTRA + 1]
-    clamps := [false; MAX_EXTRA + 1]
-    sources := [0usize; MAX_EXTRA + 1]
-    modes[0] = patch_mode(f.blend_mode)
-    alphas[0] = f.blend_alpha
-    clamps[0] = f.blend_clamp
-    sources[0] = f.blend_source as usize
+    if ex.n < nec {
+        return err(pixels.Error.TooLarge)
+    }
+    // The frame's extra channel blending as patch blending modes.
     for i in 0usize..nec {
-        modes[1 + i] = patch_mode(f.ec_blend_mode[i])
-        alphas[1 + i] = f.ec_blend_alpha[i]
-        clamps[1 + i] = f.ec_blend_clamp[i]
-        sources[1 + i] = f.ec_blend_source[i] as usize
+        mode := patch_mode(ex.get(i, EX_MODE))
+        ex.put(i, EX_PMODE, mode)
+        alpha := ex.get(i, EX_ALPHA)
+        ex.put(i, EX_PALPHA, alpha)
+        clamp := ex.get(i, EX_CLAMP)
+        ex.put(i, EX_PCLAMP, clamp)
     }
-    has_alpha := h.alpha_channel() < MAX_EXTRA
-    bg := [0.0f32; MAX_EXTRA + 3]
-    fg := [0.0f32; MAX_EXTRA + 3]
-    out := [0.0f32; MAX_EXTRA + 3]
+    mode0 := patch_mode(f.blend_mode)
+    has_alpha := h.has_alpha()
+    fo := planes
+    oo := 2 * planes
     for y in 0usize..height {
         for x in 0usize..width {
             for c in 0usize..planes {
-                s := sources[0]
+                src := f.blend_source as usize
                 if c >= 3 {
-                    s = sources[c - 2]
+                    src = ex.get(c - 3, EX_SOURCE) as usize
                 }
-                bg[c] = slot_sample(fb, s, c, x, y)
+                ex.v[c] = slot_sample(fb, src, c, x, y)
             }
             fx := x as i64 - f.x0 as i64
             fy := y as i64 - f.y0 as i64
             if fx >= 0 && fy >= 0 && fx < fb.fw as i64 && fy < fb.fh as i64 {
                 for c in 0usize..planes {
-                    fg[c] = fb.frame[c * frame_plane + fy as usize * fb.fw + fx as usize]
+                    ex.v[fo + c] = fb.frame[c * frame_plane + fy as usize * fb.fw + fx as usize]
                 }
-                blend_pixel(h, &bg, &fg, &mut out, &modes, &alphas, &clamps, has_alpha)
+                blend_pixel(h, ex, mode0, f.blend_alpha, f.blend_clamp, has_alpha)
                 for c in 0usize..planes {
-                    fb.canvas[c * canvas_plane + y * width + x] = out[c]
+                    fb.canvas[c * canvas_plane + y * width + x] = ex.v[oo + c]
                 }
             } else {
                 for c in 0usize..planes {
-                    fb.canvas[c * canvas_plane + y * width + x] = bg[c]
+                    fb.canvas[c * canvas_plane + y * width + x] = ex.v[c]
                 }
             }
         }
     }
+    return ok()
+}
+
+// Restoration filters on the color channels `cch` of `a` (floats), then
+// the channels into the frame planes (upsampled) or, with `low`, copied at
+// their coded size into fb.low. EPF uses vb.sigma per 8x8 block for VarDCT
+// frames (`per_block`), `inv_sigma` otherwise.
+fn filter_color(r: &mut Reader, h: &ImageHeader, f: &FrameHeader, a: &mut[f32], cch: &ChanList, fb: &mut FloatBufs, vb: &VBufs, per_block: bool, low: bool) -> void!pixels.Error {
+    if f.gab {
+        gaborish(f, a, cch, fb.ftemp)?
+    }
+    if f.epf_iters > 0 {
+        if per_block {
+            epf(f, a, cch, fb.frame, 0.0, vb.sigma, vb.bw)?
+        } else {
+            // kInvSigmaNum / sigma; the frame planes are free scratch here.
+            empty := [0.0f32; 1]
+            epf(f, a, cch, fb.frame, -1.1715728752538099 / f.epf_sigma_modular, &empty, 0)?
+        }
+    }
+    for c in 0usize..3 {
+        if low {
+            fill_plane(r, h, a, cch, c, 1, fb.low, fb.lw, fb.lh, c)
+        } else {
+            fill_plane(r, h, a, cch, c, f.upsampling as usize, fb.frame, fb.fw, fb.fh, c)
+        }
+    }
+    return ok()
 }
 
 // Render one decoded frame through the float pipeline. VarDCT frames
 // bring their color samples in `planes` (3 planes of vb.rw x vb.rh).
-fn render_frame(r: &mut Reader, h: &ImageHeader, f: &FrameHeader, work: &mut ModularWork, gch: &ChanList, vals: &FrameVals, fb: &mut FloatBufs, vb: &mut VBufs, planes: &mut[f32], sbuf: &mut[i32], cpf: &mut[f32], tcode: &mut Code, n1: &mut Code, n2: &mut Code, window: &mut[u32], ct: &ColorTransform) -> void!pixels.Error {
-    fw := f.width as usize
-    fh := f.height as usize
+// Stage order as in libjxl: chroma upsampling, Gaborish, EPF, extra
+// channel upsampling (unless every extra channel shares the color
+// upsampling), patches, splines, upsampling, noise.
+fn render_frame(r: &mut Reader, h: &ImageHeader, f: &FrameHeader, work: &mut ModularWork, gch: &ChanList, vals: &FrameVals, fb: &mut FloatBufs, vb: &mut VBufs, planes: &mut[f32], sbuf: &mut[i32], cpf: &mut[f32], tcode: &mut Code, n1: &mut Code, n2: &mut Code, window: &mut[u32], ct: &ColorTransform, ex: &mut Extras) -> void!pixels.Error {
+    // The frame's pixel window (see window.dodo).
+    fw := f.win_pw as usize
+    fh := f.win_ph as usize
     if f.frame_type == FT_LF {
-        // LF frames hold the 1:8 image.
-        if f.upsampling != 1 {
-            return err(pixels.Error.Unsupported)
-        }
-        fw = f.sample_width as usize
-        fh = f.sample_height as usize
+        // LF frames hold the 1:8^lf_level image (upsampled from their coded
+        // size like other frames).
+        shift := (3 * f.lf_level) as u64
+        fw = ceil_shift(f.width as u64, shift as u32) as usize
+        fh = ceil_shift(f.height as u64, shift as u32) as usize
     }
     if fb.planes * fw * fh > fb.frame.len {
         return err(pixels.Error.TooLarge)
     }
     fb.fw = fw
     fb.fh = fh
-    channels_to_float(h, f, work, gch, vals)
+    nec := h.num_extra as usize
+    if ex.n < nec {
+        return err(pixels.Error.TooLarge)
+    }
+    channels_to_float(h, f, work, gch, vals, ex)
     color := f.color_channels as usize
+    up := f.upsampling as usize
+    has_patches := (f.flags & FLAG_PATCHES) != 0
+    has_splines := (f.flags & FLAG_SPLINES) != 0
+    // Extra channels with the color channels' sample size are upsampled
+    // with them, after patches and splines; others first. Patches in
+    // upsampled frames need the former (libjxl rejects the rest).
+    late_ec := up > 1 && f.ec_same_size(h.num_extra)
+    if has_patches && up > 1 && !late_ec {
+        return err(pixels.Error.Malformed)
+    }
+    // Patches and splines of upsampled frames apply to the coded-size
+    // planes in fb.low.
+    low := up > 1 && (has_patches || has_splines)
+    if low {
+        // Over the sample window (see window.dodo).
+        sw := f.win_sw as usize
+        sh := f.win_sh as usize
+        count := 3usize
+        if late_ec {
+            count = fb.planes
+        }
+        if count * sw * sh > fb.low.len {
+            return err(pixels.Error.TooLarge)
+        }
+        fb.lw = sw
+        fb.lh = sh
+    }
+    // The color channels as three float channel views.
+    cd := [0i32; 3 * CH_STRIDE]
+    cch := ChanList { d: &mut cd, count: 3, nb_meta: 0 }
+    mark := work.arena_used
     if !f.modular {
-        // The VarDCT color planes as a channel list.
-        cd := [0i32; 3 * CH_STRIDE]
-        cch := ChanList { d: &mut cd, count: 3, nb_meta: 0 }
         for c in 0usize..3 {
-            cch.set(c, c * vb.rw * vb.rh, vb.rw, f.sample_width as usize, f.sample_height as usize, 0, 0)
+            cch.set(c, c * vb.rw * vb.rh, vb.rw, f.win_sw as usize, f.win_sh as usize, 0, 0)
         }
         if vb.subsampled {
             upsample_chroma(f, vb, planes)
         }
-        if f.gab {
-            gaborish(f, planes, &cch, fb.ftemp)?
-        }
-        if f.epf_iters > 0 {
-            epf(f, planes, &cch, fb.frame, 0.0, vb.sigma, vb.bw)?
-        }
-        for c in 0usize..3 {
-            fill_plane(r, h, planes, &cch, c, f.upsampling as usize, fb, c)
-        }
-        for e in 0usize..h.num_extra as usize {
-            fill_plane(r, h, as_f32(work.arena), gch, e, f.ec_upsampling[e] as usize, fb, 3 + e)
-        }
-    } else if color == 1 && (f.gab || f.epf_iters > 0) {
-        // Gray: the filters see three copies of the channel (as libjxl
-        // does); the copies live at the arena top meanwhile.
-        mark := work.arena_used
-        w := gch.width(0)
-        hh := gch.height(0)
-        cd := [0i32; 3 * CH_STRIDE]
-        cch := ChanList { d: &mut cd, count: 3, nb_meta: 0 }
-        cch.set(0, gch.offset(0), gch.stride(0), w, hh, 0, 0)
-        for c in 1usize..3 {
-            off := work.alloc(w as u64 * hh as u64)?
-            for y in 0usize..hh {
-                for x in 0usize..w {
-                    work.arena[off + y * w + x] = work.arena[gch.offset(0) + y * gch.stride(0) + x]
-                }
-            }
-            cch.set(c, off, w, w, hh, 0, 0)
-        }
-        if f.gab {
-            gaborish(f, as_f32(work.arena), &cch, fb.ftemp)?
-        }
-        if f.epf_iters > 0 {
-            empty := [0.0f32; 1]
-            epf(f, as_f32(work.arena), &cch, fb.frame, -1.1715728752538099 / f.epf_sigma_modular, &empty, 0)?
-        }
-        for c in 0usize..3 {
-            fill_plane(r, h, as_f32(work.arena), &cch, c, f.upsampling as usize, fb, c)
-        }
-        for e in 0usize..h.num_extra as usize {
-            fill_plane(r, h, as_f32(work.arena), gch, color + e, f.ec_upsampling[e] as usize, fb, 3 + e)
-        }
-        work.arena_used = mark
+        filter_color(r, h, f, planes, &cch, fb, vb, true, low)?
     } else {
-        if f.gab {
-            gaborish(f, as_f32(work.arena), gch, fb.ftemp)?
-        }
-        if f.epf_iters > 0 {
-            // kInvSigmaNum / sigma; the frame planes are free scratch here.
-            empty := [0.0f32; 1]
-            epf(f, as_f32(work.arena), gch, fb.frame, -1.1715728752538099 / f.epf_sigma_modular, &empty, 0)?
-        }
+        // Full-size copies cover the sample window (see window.dodo).
+        w := f.win_sw as usize
+        hh := f.win_sh as usize
         subsampled := f.ycbcr && chroma_subsampled(f)
-        if subsampled && (f.upsampling != 1 || f.gab || f.epf_iters > 0) {
-            return err(pixels.Error.Unsupported)
-        }
+        filters := f.gab || f.epf_iters > 0
         for c in 0usize..3 {
             source := c
             if color == 1 {
                 source = 0
             }
-            if subsampled {
-                fill_chroma(as_f32(work.arena), gch, c, fb, c)
-            } else {
-                fill_plane(r, h, as_f32(work.arena), gch, source, f.upsampling as usize, fb, c)
+            cch.set(c, gch.offset(source), gch.stride(source), gch.width(source), gch.height(source), 0, 0)
+            // Gray frames are filtered as three copies of the channel (as
+            // libjxl does); subsampled chroma is upsampled to full size
+            // first. The copies live at the arena top meanwhile.
+            copy := (color == 1 && c > 0 && filters) || (subsampled && (gch.hshift(c) != 0 || gch.vshift(c) != 0))
+            if copy {
+                off := work.alloc(w as u64 * hh as u64)?
+                if color == 1 {
+                    for y in 0usize..hh {
+                        for x in 0usize..w {
+                            work.arena[off + y * w + x] = work.arena[gch.offset(0) + y * gch.stride(0) + x]
+                        }
+                    }
+                } else {
+                    chroma_to_full(as_f32(work.arena), gch, c, off, w, hh)
+                }
+                cch.set(c, off, w, w, hh, 0, 0)
             }
         }
-        for e in 0usize..h.num_extra as usize {
-            fill_plane(r, h, as_f32(work.arena), gch, color + e, f.ec_upsampling[e] as usize, fb, 3 + e)
+        filter_color(r, h, f, as_f32(work.arena), &cch, fb, vb, false, low)?
+    }
+    // Extra channels.
+    ec_first := 0usize
+    if f.modular {
+        ec_first = color
+    }
+    for e in 0usize..nec {
+        if low && late_ec {
+            fill_plane(r, h, as_f32(work.arena), gch, ec_first + e, 1, fb.low, fb.lw, fb.lh, 3 + e)
+        } else {
+            fill_plane(r, h, as_f32(work.arena), gch, ec_first + e, ex.get(e, EX_UP) as usize, fb.frame, fb.fw, fb.fh, 3 + e)
         }
     }
-    if (f.flags & FLAG_PATCHES) != 0 {
-        if f.upsampling != 1 {
-            return err(pixels.Error.Unsupported)
-        }
-        r.clear_limit()
-        r.seek_bit(vals.patches_bit)
-        patches(r, h, f, tcode, n1, n2, window, true, fb)?
-    }
+    work.arena_used = mark
     ytox := 0.0f32
     ytob := 1.0f32
     if !f.modular {
         ytox = vb.base_x
         ytob = vb.base_b
     }
-    if (f.flags & FLAG_SPLINES) != 0 {
-        if f.upsampling != 1 {
-            return err(pixels.Error.Unsupported)
-        }
+    if has_patches {
+        r.clear_limit()
+        r.seek_bit(vals.patches_bit)
+        patches(r, h, f, tcode, n1, n2, window, true, fb, ex, low)?
+    }
+    if has_splines {
         r.clear_limit()
         r.seek_bit(vals.splines_bit)
-        splines(r, f, tcode, n1, n2, window, true, fb.frame, fw, fh, sbuf, cpf, ytox, ytob)?
+        if low {
+            splines(r, f, tcode, n1, n2, window, true, fb.low, fb.lw, fb.lh, sbuf, cpf, ytox, ytob)?
+        } else {
+            splines(r, f, tcode, n1, n2, window, true, fb.frame, fw, fh, sbuf, cpf, ytox, ytob)?
+        }
+    }
+    if low {
+        // Upsample the coded-size planes into the frame planes.
+        count := 3usize
+        if late_ec {
+            count = fb.planes
+        }
+        lplane := fb.lw * fb.lh
+        for k in 0usize..count {
+            one := [0i32; CH_STRIDE]
+            lch := ChanList { d: &mut one, count: 1, nb_meta: 0 }
+            lch.set(0, k * lplane, fb.lw, fb.lw, fb.lh, 0, 0)
+            fill_plane(r, h, fb.low, &lch, 0, up, fb.frame, fb.fw, fb.fh, k)
+        }
     }
     if (f.flags & FLAG_NOISE) != 0 {
         render_noise(f, fb, &vals.noise_lut, vals.visible, vals.nonvisible, ytox, ytob)?
@@ -1014,16 +1147,32 @@ fn render_frame(r: &mut Reader, h: &ImageHeader, f: &FrameHeader, work: &mut Mod
         store_lf_slot(vb, (f.lf_level - 1) as usize, fb.frame, fw, fh)?
     }
     if f.can_reference() && f.save_before_ct {
-        save_slot(fb, f.save_as_reference as usize, true, fw, fh)?
+        save_slot(fb, f.save_as_reference as usize, true, fw, fh, true, f.width as usize, f.height as usize)?
     }
-    // Color transform.
+    // Color transform. libjxl renders spot colors after blending and saving
+    // the frame, on linear samples for XYB frames that are neither blended
+    // nor saved after the color transform (its conversion from linear comes
+    // last then), on output samples otherwise.
     plane := fw * fh
+    spots := h.any_spot && f.is_normal()
+    linear_spots := spots && h.xyb && !f.needs_blending(h.num_extra) && !(f.can_reference() && !f.save_before_ct)
     if h.xyb {
         for i in 0usize..plane {
             x := fb.frame[i]
             y := fb.frame[plane + i]
             b := fb.frame[2 * plane + i]
-            xyb_pixel(ct, &mut x, &mut y, &mut b)
+            if linear_spots {
+                xyb_linear(ct, &mut x, &mut y, &mut b)
+                fb.frame[i] = x
+                fb.frame[plane + i] = y
+                fb.frame[2 * plane + i] = b
+                spot_pixel(h, ex, fb.frame, plane, i)
+                x = encode_transfer(ct, fb.frame[i])
+                y = encode_transfer(ct, fb.frame[plane + i])
+                b = encode_transfer(ct, fb.frame[2 * plane + i])
+            } else {
+                xyb_pixel(ct, &mut x, &mut y, &mut b)
+            }
             fb.frame[i] = x
             fb.frame[plane + i] = y
             fb.frame[2 * plane + i] = b
@@ -1040,22 +1189,69 @@ fn render_frame(r: &mut Reader, h: &ImageHeader, f: &FrameHeader, work: &mut Mod
     }
     if !f.is_normal() {
         if f.can_reference() && !f.save_before_ct {
-            save_slot(fb, f.save_as_reference as usize, true, fw, fh)?
+            // Only backgrounds read it, over the image area.
+            sw := fw
+            if sw > h.width as usize {
+                sw = h.width as usize
+            }
+            sh := fh
+            if sh > h.height as usize {
+                sh = h.height as usize
+            }
+            save_slot(fb, f.save_as_reference as usize, true, sw, sh, false, sw, sh)?
         }
         return ok()
     }
     if !fb.use_canvas {
+        if spots && !linear_spots {
+            for i in 0usize..plane {
+                spot_pixel(h, ex, fb.frame, plane, i)
+            }
+        }
         return ok()
     }
-    compose(h, f, fb)
+    if f.needs_blending(h.num_extra) {
+        // libjxl refuses backgrounds saved before the color transform.
+        if fb.slot_valid[f.blend_source as usize] && fb.slot_before[f.blend_source as usize] {
+            return err(pixels.Error.Malformed)
+        }
+        for e in 0usize..h.num_extra as usize {
+            s := ex.get(e, EX_SOURCE) as usize
+            if fb.slot_valid[s] && fb.slot_before[s] {
+                return err(pixels.Error.Malformed)
+            }
+        }
+    }
+    compose(h, f, fb, ex)?
     if f.can_reference() && !f.save_before_ct {
-        save_slot(fb, f.save_as_reference as usize, false, h.width as usize, h.height as usize)?
+        save_slot(fb, f.save_as_reference as usize, false, h.width as usize, h.height as usize, false, h.width as usize, h.height as usize)?
+    }
+    if spots && !linear_spots {
+        canvas_plane := h.width as usize * h.height as usize
+        for i in 0usize..canvas_plane {
+            spot_pixel(h, ex, fb.canvas, canvas_plane, i)
+        }
     }
     return ok()
 }
 
-// Emit the canvas in the native layout.
-fn emit_canvas<S: sink.Sink>(output: &mut S, h: &ImageHeader, fb: &FloatBufs, layout: &pixels.Layout, tile: &mut[u8]) -> void!pixels.Error {
+// Render the spot color channels into pixel i of the color planes of `p`
+// (planes of `plane` samples), in channel order like libjxl's spot stages.
+fn spot_pixel(h: &ImageHeader, ex: &Extras, p: &mut[f32], plane: usize, i: usize) {
+    for e in 0usize..h.num_extra as usize {
+        if ex.get(e, EX_KIND) != EC_SPOT {
+            continue
+        }
+        mix := ex.spot(e, 3) * p[(3 + e) * plane + i]
+        for c in 0usize..3 {
+            p[c * plane + i] = mix * ex.spot(e, c) + (1.0 - mix) * p[c * plane + i]
+        }
+    }
+}
+
+// Emit the canvas in the native layout: the color channels (and alpha),
+// or with `select` < NO_EXTRA that extra channel alone.
+fn emit_canvas<S: sink.Sink>(output: &mut S, h: &ImageHeader, fb: &FloatBufs, layout: &pixels.Layout, tile: &mut[u8], ex: &Extras, select: usize) -> void!pixels.Error {
     channels := layout.channel_count()
     sample := layout.sample_code()
     size := layout.sample_bytes()
@@ -1065,7 +1261,9 @@ fn emit_canvas<S: sink.Sink>(output: &mut S, h: &ImageHeader, fb: &FloatBufs, la
     plane := width * height
     alpha := h.alpha_channel()
     src := [0usize, 1, 2, 3]
-    if channels <= 2 {
+    if select != NO_EXTRA {
+        src[0] = 3 + select
+    } else if channels <= 2 {
         src[0] = 0
         src[1] = 3 + alpha
     } else if channels == 4 {

@@ -1,0 +1,461 @@
+package encode
+
+import "std/image/pixels"
+
+// Lossy encoding, per-group analysis: XYB conversion, quant field, inverse
+// Gaborish, then per 64x64 tile the varblock search, quant field, DCTs, LF
+// values, chroma-from-luma and quantization. The result for group g is a
+// pure function of the source and the plan, so the two passes over the
+// image (statistics, then writing) see identical data.
+
+// Encoder decisions for one lossy encode.
+struct VdPlan {
+    width: usize
+    height: usize
+    // 8x8 blocks of the frame, groups and LF groups.
+    bw: usize
+    bh: usize
+    groups_x: usize
+    groups_y: usize
+    lf_x: usize
+    lf_y: usize
+    channels: usize
+    color_channels: usize
+    alpha: bool
+    sample: u32
+    bits: u32
+    float: bool
+    premultiplied: bool
+    effort: u32
+    distance: f32
+    // Tools: adaptive quant field, Gaborish, varblock search (with 64x64
+    // merges), per-block quant adjustment, chroma-from-luma.
+    aq: bool
+    gab: bool
+    acs: bool
+    big: bool
+    adjust: bool
+    cfl: bool
+    epf: u32
+    x_qm_scale: u32
+    b_qm_scale: u32
+    qm_mult: [3]f32
+    global_scale: u32
+    quant_lf: u32
+    // global_scale / 65536 and its inverse.
+    scale: f32
+    inv_scale: f32
+    // Constant quant field without adaptive quantization.
+    q_uniform: f32
+    // Distance and scale of the adaptive quant field.
+    iqf_distance: f32
+    iqf_scale: f32
+    lf_step: [3]f32
+    // Largest group (padded pixels) and LF group (blocks).
+    gpw: usize
+    gph: usize
+    lfbw: usize
+    lfbh: usize
+}
+
+// cjxl's mapping from a 0..100 quality to a Butteraugli distance.
+pub fn distance_from_quality(quality: f32) -> f32 {
+    q := quality
+    if !(q == q) {
+        return 1.0
+    }
+    if q >= 100.0 {
+        return 0.0
+    }
+    if q >= 30.0 {
+        return 0.1 + (100.0 - q) * 0.09
+    }
+    if q < 0.0 {
+        q = 0.0
+    }
+    return 53.0 / 3000.0 * q * q - 23.0 / 20.0 * q + 25.0
+}
+
+// Distance actually used: at least 0.05 (libjxl's minimum), at most 25.
+fn vd_distance(d: f32) -> f32 {
+    if !(d == d) {
+        return 1.0
+    }
+    if d < 0.05 {
+        return 0.05
+    }
+    if d > 25.0 {
+        return 25.0
+    }
+    return d
+}
+
+fn vd_min_usize(a: usize, b: usize) -> usize {
+    if a < b {
+        return a
+    }
+    return b
+}
+
+fn vd_plan(width: u32, height: u32, layout: &pixels.Layout, options: &EncodeOptions) -> VdPlan {
+    w := width as usize
+    h := height as usize
+    channels := layout.channel_count()
+    sample := layout.sample_code()
+    bits := 8u32
+    if sample == pixels.SAMPLE_U16 || sample == pixels.SAMPLE_F16 {
+        bits = 16
+    } else if sample == pixels.SAMPLE_F32 {
+        bits = 32
+    }
+    cc := 1usize
+    if channels >= 3 {
+        cc = 3
+    }
+    d := vd_distance(options.distance)
+    e := options.effort
+    if e == 0 {
+        e = 1
+    }
+    if e > 9 {
+        e = 9
+    }
+    bw := (w + 7) / 8
+    bh := (h + 7) / 8
+    aq := e >= 2
+    gab := e >= 2 && d > 0.5
+    acs := e >= 3
+    adjust := e >= 3
+    epf := 0u32
+    if d >= 0.7 {
+        epf += 1
+    }
+    if d >= 1.5 {
+        epf += 1
+    }
+    if d >= 4.0 {
+        epf += 1
+    }
+    xs := 3u32
+    if d > 2.5 {
+        xs += 1
+    }
+    if d > 5.5 {
+        xs += 1
+    }
+    if d > 9.5 {
+        xs += 1
+    }
+    // Quantizer (libjxl's InitialQuantDC and ComputeGlobalScaleAndQuant).
+    d_dc := vd_pow((d / 0.3) as f64, 0.83) as f32 * 0.3
+    if d_dc > d {
+        d_dc = d
+    }
+    if d_dc < 0.5 * d {
+        d_dc = 0.5 * d
+    }
+    quant_dc := 1.095924047623553f32 / d_dc
+    if quant_dc > 50.0 {
+        quant_dc = 50.0
+    }
+    q := 0.79f32 / d
+    if aq {
+        q = 0.39 / d
+    }
+    gsf := 65536.0f32 * q / 5.0
+    if gsf < 1.0 {
+        gsf = 1.0
+    }
+    if gsf > 32768.0 {
+        gsf = 32768.0
+    }
+    gs := gsf as u32
+    sq := (quant_dc * 4096.0 * 1.6) as u32
+    if gs > sq {
+        gs = sq
+        if gs == 0 {
+            gs = 1
+        }
+    }
+    qlf := quant_dc * 65536.0 / gs as f32 + 0.5
+    if qlf > 65536.0 {
+        qlf = 65536.0
+    }
+    quant_lf := qlf as u32
+    if quant_lf == 0 {
+        quant_lf = 1
+    }
+    lf_unit := 65536.0f32 / (gs as f32 * quant_lf as f32)
+    iqf_d := d
+    if !gab {
+        iqf_d = d * 0.62
+    }
+    xm := vd_pow(1.25, (xs as f64) - 2.0) as f32
+    return VdPlan { width: w, height: h, bw: bw, bh: bh, groups_x: (w + 255) / 256, groups_y: (h + 255) / 256, lf_x: (w + 2047) / 2048, lf_y: (h + 2047) / 2048, channels: channels, color_channels: cc, alpha: channels == 2 || channels == 4, sample: sample, bits: bits, float: sample >= pixels.SAMPLE_F16, premultiplied: layout.premultiplied && (channels == 2 || channels == 4), effort: e, distance: d, aq: aq, gab: gab, acs: acs, big: e >= 7, adjust: adjust, cfl: e >= 2 && cc == 3, epf: epf, x_qm_scale: xs, b_qm_scale: 2, qm_mult: [xm, 1.0, 1.0], global_scale: gs, quant_lf: quant_lf, scale: gs as f32 / 65536.0, inv_scale: 65536.0 / gs as f32, q_uniform: q, iqf_distance: iqf_d, iqf_scale: 0.765 / iqf_d, lf_step: [lf_unit / 4096.0, lf_unit / 512.0, lf_unit / 256.0], gpw: vd_min_usize(bw, 32) * 8, gph: vd_min_usize(bh, 32) * 8, lfbw: vd_min_usize(bw, 256), lfbh: vd_min_usize(bh, 256) }
+}
+
+// Buffers of the lossy encoder, all carved from the caller's scratch.
+struct VdWork {
+    // Quantization / dequantization weights, natural orders, DCT scratch,
+    // the linearization table.
+    wq: &mut[f32]
+    wd: &mut[f32]
+    nat: &mut[u32]
+    t: &mut[f32]
+    lut: &mut[f32]
+    // The embedded ICC profile (empty for none).
+    icc: &[u8]
+    // Group: bordered XYB planes, quant field scratch, masking field and
+    // its scratch, Gaborish ring rows.
+    xyb: &mut[f32]
+    cells: &mut[f32]
+    mask: &mut[f32]
+    mtmp: &mut[f32]
+    ring: &mut[f32]
+    // Per block of the group: quant field, block info, quant (final, and
+    // before the per-block adjustment).
+    qf: &mut[f32]
+    acs: &mut[u8]
+    qraw: &mut[i32]
+    qorig: &mut[i32]
+    // Quantized coefficients (3 planes, natural layout, group padded
+    // size) and LF values (3 planes of blocks).
+    coef: &mut[i16]
+    glf: &mut[f32]
+    // Coefficients of one tile, and the varblock search scratch.
+    tile: &mut[f32]
+    cand: &mut[f32]
+    // Chroma-from-luma factors of the group's tiles (X then B, 16 each).
+    cfl: [32]i32
+}
+
+// Geometry of group gi.
+fn vd_group(plan: &VdPlan, gi: usize) -> VdGroup {
+    gx := gi % plan.groups_x
+    gy := gi / plan.groups_x
+    gbw := vd_min_usize(plan.bw - gx * 32, 32)
+    gbh := vd_min_usize(plan.bh - gy * 32, 32)
+    stride := gbw * 8 + 2 * VD_BORDER
+    return VdGroup { x0: gx * 256, y0: gy * 256, bw: gbw, bh: gbh, stride: stride, plane: stride * (gbh * 8 + 2 * VD_BORDER), left: gx == 0, top: gy == 0, right: gx + 1 == plan.groups_x, bottom: gy + 1 == plan.groups_y }
+}
+
+// Analyze group gi into the work buffers: block info, quant, quantized
+// coefficients, LF values and chroma-from-luma factors. With `cached`, the
+// decisions (block info, quants, chroma-from-luma factors) come from the
+// image's single LF group buffers of the first pass instead of being
+// searched again.
+fn vd_analyze_group(source: &pixels.View, plan: &VdPlan, col: &VdColor, wk: &mut VdWork, gi: usize, lf: &VdLf, cached: bool) {
+    g := vd_group(plan, gi)
+    vd_load_xyb(source, col, wk.icc, wk.lut, g.x0, g.y0, g.bw * 8, g.bh * 8, VD_BORDER, wk.xyb, g.stride, g.plane)
+    blocks := g.bw * g.bh
+    tiles_x := (g.bw + 7) / 8
+    tiles_y := (g.bh + 7) / 8
+    if cached {
+        lbw := plan.lfbw
+        ltx := (lbw + 7) / 8
+        tiles := ltx * ((plan.lfbh + 7) / 8)
+        gx := gi % plan.groups_x
+        gy := gi / plan.groups_x
+        for by in 0usize..g.bh {
+            for bx in 0usize..g.bw {
+                v := lf.lbi[(gy * 32 + by) * lbw + gx * 32 + bx]
+                wk.acs[by * g.bw + bx] = (v & 255) as u8
+                wk.qorig[by * g.bw + bx] = (v >> 17) & 511
+            }
+        }
+        for ty in 0usize..tiles_y {
+            for tx in 0usize..tiles_x {
+                lt := (gy * 4 + ty) * ltx + gx * 4 + tx
+                wk.cfl[ty * 4 + tx] = lf.meta[lt]
+                wk.cfl[16 + ty * 4 + tx] = lf.meta[tiles + lt]
+            }
+        }
+        if plan.gab {
+            vd_gaborish_inverse(&g, wk.xyb, wk.ring)
+        }
+        for ty in 0usize..tiles_y {
+            for tx in 0usize..tiles_x {
+                bx0 := tx * 8
+                by0 := ty * 8
+                vd_code_tile(plan, &g, wk, tx, ty, bx0, by0, vd_min_usize(g.bw - bx0, 8), vd_min_usize(g.bh - by0, 8), true)
+            }
+        }
+        return
+    }
+    if plan.aq {
+        vd_quant_field(&g, wk.xyb, plan.iqf_distance, plan.iqf_scale, wk.cells, wk.qf)
+    } else {
+        for i in 0usize..blocks {
+            wk.qf[i] = plan.q_uniform
+        }
+    }
+    if plan.acs {
+        vd_mask1x1(&g, wk.xyb, wk.mtmp, wk.mask)
+    }
+    if plan.gab {
+        vd_gaborish_inverse(&g, wk.xyb, wk.ring)
+    }
+    cfg := vd_acs_config(plan.distance, plan.big)
+    for i in 0usize..32 {
+        wk.cfl[i] = 0
+    }
+    for ty in 0usize..tiles_y {
+        for tx in 0usize..tiles_x {
+            bx0 := tx * 8
+            by0 := ty * 8
+            trw := vd_min_usize(g.bw - bx0, 8)
+            trh := vd_min_usize(g.bh - by0, 8)
+            if plan.acs {
+                vd_search_tile(&cfg, &g, wk.xyb, wk.qf, wk.mask, wk.wq, wk.wd, wk.acs, bx0, by0, trw, trh, wk.cand, wk.t)
+                vd_adjust_field(wk.qf, wk.acs, g.bw, bx0, by0, trw, trh, plan.distance)
+            } else {
+                for y in by0..by0 + trh {
+                    for x in bx0..bx0 + trw {
+                        wk.acs[y * g.bw + x] = VD_FIRST
+                    }
+                }
+            }
+            vd_code_tile(plan, &g, wk, tx, ty, bx0, by0, trw, trh, false)
+        }
+    }
+}
+
+// DCTs, LF values, chroma-from-luma and quantization of one tile.
+fn vd_code_tile(plan: &VdPlan, g: &VdGroup, wk: &mut VdWork, tx: usize, ty: usize, bx0: usize, by0: usize, trw: usize, trh: usize, cached: bool) {
+    bw := g.bw
+    pw := g.bw * 8
+    gplane := pw * g.bh * 8
+    lfplane := g.bw * g.bh
+    // Quant per varblock, transforms and LF values.
+    ca_x := 0.0f32
+    cb_x := 0.0f32
+    ca_b := 0.0f32
+    cb_b := 0.0f32
+    num := 0usize
+    for y in by0..by0 + trh {
+        for x in bx0..bx0 + trw {
+            info := wk.acs[y * bw + x]
+            if (info & VD_FIRST) == 0 {
+                continue
+            }
+            ds := (info & 127) as u32
+            s := vd_shape(ds)
+            raw := wk.qorig[y * bw + x]
+            if !cached {
+                q := wk.qf[y * bw + x] * plan.inv_scale + 0.5
+                raw = 1
+                if q >= 256.0 {
+                    raw = 256
+                } else if q > 1.0 {
+                    raw = q as i32
+                }
+                wk.qorig[y * bw + x] = raw
+            }
+            wk.qraw[y * bw + x] = raw
+            toff := (y - by0) * 8 * 64 + (x - bx0) * 8
+            for c in 0usize..3 {
+                vd_fdct(g, wk.xyb, c, x, y, s.w8 * 8, s.h8 * 8, wk.tile, c * 4096 + toff, 64, wk.t)
+                vd_lf_from_llf(wk.tile, c * 4096 + toff, 64, s.w8, s.h8, wk.glf, c * lfplane + y * bw + x, bw, wk.t)
+            }
+            if plan.cfl && !cached {
+                // libjxl's CfL inputs: AC coefficients weighted by the
+                // quantization multipliers (times its constant 128).
+                qq := plan.scale * 128.0 * raw as f32
+                mw := s.xs * 8
+                for yl in 0usize..s.ys * 8 {
+                    for xl in 0usize..mw {
+                        num += 1
+                        if xl < s.xs && yl < s.ys {
+                            continue
+                        }
+                        i := toff + vd_pos(&s, xl, yl, 64)
+                        mi := yl * mw + xl
+                        qx := qq * wk.wq[s.woff + mi]
+                        qb := qq * wk.wq[s.woff + 2 * s.psize + mi]
+                        yv := wk.tile[4096 + i]
+                        ax := yv * qx / 84.0
+                        bxv := -wk.tile[i] * qx
+                        ca_x += ax * ax
+                        cb_x += ax * bxv
+                        ab := yv * qb / 84.0
+                        bbv := yv * qb - wk.tile[8192 + i] * qb
+                        ca_b += ab * ab
+                        cb_b += ab * bbv
+                    }
+                }
+            }
+        }
+    }
+    fx := wk.cfl[ty * 4 + tx]
+    fb := wk.cfl[16 + ty * 4 + tx]
+    if !cached {
+        fx = 0
+        fb = 0
+        if plan.cfl {
+            fx = vd_cfl_factor(ca_x, cb_x, num)
+            fb = vd_cfl_factor(ca_b, cb_b, num)
+        }
+        wk.cfl[ty * 4 + tx] = fx
+        wk.cfl[16 + ty * 4 + tx] = fb
+    }
+    kx := fx as f32 / 84.0
+    kb := 1.0f32 + fb as f32 / 84.0
+    // Quantize.
+    for y in by0..by0 + trh {
+        for x in bx0..bx0 + trw {
+            info := wk.acs[y * bw + x]
+            if (info & VD_FIRST) == 0 {
+                continue
+            }
+            ds := (info & 127) as u32
+            s := vd_shape(ds)
+            toff := (y - by0) * 8 * 64 + (x - bx0) * 8
+            goff := y * 8 * pw + x * 8
+            quant := wk.qraw[y * bw + x]
+            thres_y := [0.56f32, 0.62, 0.62, 0.62]
+            if plan.adjust {
+                orig := quant
+                best := 0i32
+                order := [1usize, 0, 2]
+                for k in 0usize..3 {
+                    c := order[k]
+                    thres := [0.58f32, 0.64, 0.64, 0.64]
+                    adjusted := vd_adjust_quant(wk.tile, c * 4096 + toff, 64, &s, ds, wk.wq, c, plan.scale, orig, plan.qm_mult[c], &mut thres)
+                    if c == 1 {
+                        for i in 0usize..4 {
+                            thres_y[i] = thres[i]
+                        }
+                    }
+                    if adjusted > best {
+                        best = adjusted
+                    }
+                }
+                quant = best
+                if quant < 1 {
+                    quant = 1
+                }
+                if quant > 256 {
+                    quant = 256
+                }
+                wk.qraw[y * bw + x] = quant
+            }
+            qac := plan.scale * quant as f32
+            vd_quantize(wk.tile, 4096 + toff, 64, &s, wk.wq, 1, qac, &thres_y, wk.coef, gplane + goff, pw)
+            // Remove the dequantized luma from the chroma channels.
+            inv_qac := 1.0f32 / qac
+            mw := s.xs * 8
+            for yl in 0usize..s.ys * 8 {
+                for xl in 0usize..mw {
+                    i := toff + vd_pos(&s, xl, yl, 64)
+                    qi := wk.coef[gplane + goff + vd_pos(&s, xl, yl, pw)] as i32
+                    ydq := vd_recon(qi, 1) * wk.wd[s.woff + s.psize + yl * mw + xl] * inv_qac
+                    wk.tile[i] -= kx * ydq
+                    wk.tile[8192 + i] -= kb * ydq
+                }
+            }
+            thres_c := [0.58f32, 0.62, 0.62, 0.62]
+            vd_quantize(wk.tile, toff, 64, &s, wk.wq, 0, qac * plan.qm_mult[0], &thres_c, wk.coef, goff, pw)
+            vd_quantize(wk.tile, 8192 + toff, 64, &s, wk.wq, 2, qac * plan.qm_mult[2], &thres_c, wk.coef, 2 * gplane + goff, pw)
+        }
+    }
+}

@@ -19,12 +19,17 @@ struct Shape {
     alpha_associated: bool
     // EXIF orientation 1..8.
     orientation: u32
+    // Samples are XYB (lossy VarDCT); the color encoding then names the
+    // space the decoder converts back to.
+    xyb: bool
 }
 
-fn write_image_header(w: &mut BitWriter, shape: &Shape, info: &color.ColorInfo) {
+// The signature, SizeHeader and ImageMetadata; with `icc` the color
+// encoding announces an ICC profile (written next by write_icc).
+fn write_image_header(w: &mut BitWriter, shape: &Shape, info: &color.ColorInfo, icc: bool) {
     w.write(16, 0x0AFF)
     write_size(w, shape.width, shape.height)
-    // ImageMetadata: never all-default since samples are not XYB.
+    // ImageMetadata: never all-default (the encoder keeps it simple).
     w.write(1, 0)
     extra := shape.orientation != 1
     w.bit(extra)
@@ -53,9 +58,19 @@ fn write_image_header(w: &mut BitWriter, shape: &Shape, info: &color.ColorInfo) 
     } else {
         w.u32(0, 0, 0, 1, 0, 2, 4, 1, 12)
     }
-    // Not XYB encoded.
-    w.write(1, 0)
-    write_color_encoding(w, info, shape.color_channels == 1)
+    w.bit(shape.xyb)
+    if icc {
+        // Not all-default, want_icc, RGB or gray.
+        w.write(1, 0)
+        w.write(1, 1)
+        if shape.color_channels == 1 {
+            w.enumeration(1)
+        } else {
+            w.enumeration(0)
+        }
+    } else {
+        write_color_encoding(w, info, shape.color_channels == 1)
+    }
     if extra {
         // Default tone mapping.
         w.write(1, 1)
@@ -147,8 +162,8 @@ const TF_HLG: u32 = 18
 
 // ColorEncoding from CICP code points. Named CICP primaries and transfer
 // curves map to their JPEG XL enums, custom chromaticities and power-law
-// gammas are written explicitly, and anything else falls back to sRGB. An
-// ICC profile cannot be embedded; its CICP fields are used instead.
+// gammas are written explicitly, and anything else falls back to sRGB.
+// (An embedded ICC profile replaces all of this; see write_image_header.)
 fn write_color_encoding(w: &mut BitWriter, info: &color.ColorInfo, gray: bool) {
     white := WHITE_D65
     primaries := PRIM_SRGB

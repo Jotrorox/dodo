@@ -1,0 +1,852 @@
+package encode
+
+import "std/image/pixels"
+
+// Lossy encoding, block stage: per 64x64 tile of a group, the varblock
+// search (libjxl's entropy-plus-information-loss estimate, merging 8x8
+// blocks into 16x8 .. 64x64 DCTs bottom-up), the per-varblock quant field,
+// forward DCTs, the LF image (the lowest frequencies of every varblock
+// brought back to 8x8 resolution, as the decoder expects them), the
+// chroma-from-luma factors of the tile, and quantization (libjxl's dead
+// zones and per-block quant adjustment).
+//
+// Coefficients are kept in natural layout: a varblock w pixels wide and h
+// tall has its frequency (fy, fx) at row fy, column fx. Dequantization
+// matrices and coefficient orders are defined on the transposed layout for
+// varblocks taller than wide ("libjxl layout": the long side along x), so
+// positions are mapped through VdShape.
+
+// DctSelect values used by the encoder.
+const DS_DCT8: u32 = 0
+const DS_DCT16: u32 = 4
+const DS_DCT32: u32 = 5
+const DS_16X8: u32 = 6
+const DS_8X16: u32 = 7
+const DS_32X16: u32 = 10
+const DS_16X32: u32 = 11
+const DS_DCT64: u32 = 18
+const DS_64X32: u32 = 19
+const DS_32X64: u32 = 20
+
+// Block info flag: the first (top-left) block of its varblock.
+const VD_FIRST: u8 = 128
+
+// Offset of each DCT parameter set's three weight matrices in the weight
+// tables (only the sets of the DctSelect values above are stored).
+static VD_WOFF: [17]usize = [0, 0, 0, 0, 192, 960, 4032, 4416, 5184, 0, 0, 6720, 19008, 0, 0, 0, 0]
+const VD_WTOTAL: usize = 25152
+static VD_USED_PARAMS: [8]usize = [0, 4, 5, 6, 7, 8, 11, 12]
+// Natural orders 0..8 (all the stored DctSelect values use).
+const VD_ORDERS: usize = 9
+const VD_ORDER_WORDS: usize = 8448
+
+// Floats of the candidate scratch of the varblock search.
+const VD_CAND: usize = 4 * 4096
+// Floats of a tile's coefficient buffer (three 64x64 planes).
+const VD_TILE: usize = 3 * 4096
+
+// Square roots of 0..63.
+static VD_SQRT_SMALL: [64]f32 = [0.0000000, 1.0000000, 1.4142136, 1.7320508, 2.0000000, 2.2360680, 2.4494897, 2.6457513, 2.8284271, 3.0000000, 3.1622777, 3.3166248, 3.4641016, 3.6055513, 3.7416574, 3.8729833, 4.0000000, 4.1231056, 4.2426407, 4.3588989, 4.4721360, 4.5825757, 4.6904158, 4.7958315, 4.8989795, 5.0000000, 5.0990195, 5.1961524, 5.2915026, 5.3851648, 5.4772256, 5.5677644, 5.6568542, 5.7445626, 5.8309519, 5.9160798, 6.0000000, 6.0827625, 6.1644140, 6.2449980, 6.3245553, 6.4031242, 6.4807407, 6.5574385, 6.6332496, 6.7082039, 6.7823300, 6.8556546, 6.9282032, 7.0000000, 7.0710678, 7.1414284, 7.2111026, 7.2801099, 7.3484692, 7.4161985, 7.4833148, 7.5498344, 7.6157731, 7.6811457, 7.7459667, 7.8102497, 7.8740079, 7.9372539]
+
+// Reconstruction biases of the decoder for |q| == 1, and the numerator for
+// larger values (ImageMetadata defaults).
+static VD_QUANT_BIAS: [3]f32 = [0.94534993, 0.92994550, 0.95006490]
+const VD_QUANT_BIAS_NUM: f32 = 0.145
+
+// The decoder's default quantization weights for every stored parameter
+// set: wq (quantization multipliers) and wd = 1 / wq (dequantization).
+fn vd_init_weights(wq: &mut[f32], wd: &mut[f32]) -> void!pixels.Error {
+    prm := [0.0f32; 144]
+    for k in 0usize..8 {
+        p := VD_USED_PARAMS[k]
+        for i in 0usize..144 {
+            prm[i] = VD_DQ_DEFAULT[p * 144 + i]
+        }
+        width := VD_PARAM_W[p] as usize
+        height := VD_PARAM_H[p] as usize
+        size := width * height
+        n := VD_DQ_N[p] as usize
+        for c in 0usize..3 {
+            vd_dct_weights(&prm, c * 48, n, width, height, wq, VD_WOFF[p] + c * size)?
+        }
+        for i in 0usize..3 * size {
+            wd[VD_WOFF[p] + i] = 1.0f32 / wq[VD_WOFF[p] + i]
+        }
+    }
+    return ok()
+}
+
+// Geometry of a varblock type.
+struct VdShape {
+    w8: usize
+    h8: usize
+    // Block counts in libjxl layout (xs >= ys).
+    xs: usize
+    ys: usize
+    tall: bool
+    // Parameter set, its weights offset and the size of one matrix.
+    woff: usize
+    psize: usize
+}
+
+fn vd_shape(ds: u32) -> VdShape {
+    w8 := VD_DS_W8[ds as usize] as usize
+    h8 := VD_DS_H8[ds as usize] as usize
+    p := VD_DS_PARAM[ds as usize] as usize
+    tall := h8 > w8
+    xs := w8
+    ys := h8
+    if tall {
+        xs = h8
+        ys = w8
+    }
+    return VdShape { w8: w8, h8: h8, xs: xs, ys: ys, tall: tall, woff: VD_WOFF[p], psize: VD_PARAM_W[p] as usize * VD_PARAM_H[p] as usize }
+}
+
+// Offset in a natural-layout block (row stride `stride`) of the libjxl
+// layout position (xl, yl).
+@inline
+fn vd_pos(s: &VdShape, xl: usize, yl: usize, stride: usize) -> usize {
+    if s.tall {
+        return xl * stride + yl
+    }
+    return yl * stride + xl
+}
+
+fn vd_ceil_log2(x: u32) -> u32 {
+    if x <= 1 {
+        return 0
+    }
+    return floor_log2((x - 1) as u64) + 1
+}
+
+// Nearest integer, clamped to the 16-bit range the encoder codes.
+@inline
+fn vd_qround(v: f32) -> i32 {
+    if !(v == v) {
+        return 0
+    }
+    if v > 32767.0 {
+        return 32767
+    }
+    if v < -32767.0 {
+        return -32767
+    }
+    if v >= 0.0 {
+        return (v + 0.5) as i32
+    }
+    return -((0.5 - v) as i32)
+}
+
+// Copy the w x h pixels of channel c at group block (bx, by) from the
+// bordered XYB planes into out[off..] (row stride ostride) and forward
+// transform them.
+fn vd_fdct(g: &VdGroup, xyb: &[f32], c: usize, bx: usize, by: usize, w: usize, h: usize, out: &mut[f32], off: usize, ostride: usize, t: &mut[f32]) {
+    src := c * g.plane + (VD_BORDER + by * 8) * g.stride + VD_BORDER + bx * 8
+    for y in 0usize..h {
+        for x in 0usize..w {
+            out[off + y * ostride + x] = xyb[src + y * g.stride + x]
+        }
+    }
+    vd_dct2d(out, off, ostride, w, h, false, t)
+}
+
+// The LF values (one per 8x8 block) of a w8 x h8 varblock whose
+// coefficients start at coef[off] (row stride `stride`): the inverse of the
+// decoder's reinterpreting DCT of the LF samples. Into lf[lf_off..] with
+// row stride lf_stride.
+fn vd_lf_from_llf(coef: &[f32], off: usize, stride: usize, w8: usize, h8: usize, lf: &mut[f32], lf_off: usize, lf_stride: usize, t: &mut[f32]) {
+    if w8 * h8 == 1 {
+        lf[lf_off] = coef[off]
+        return
+    }
+    lw := 5 - floor_log2(w8 as u64) as usize
+    lh := 5 - floor_log2(h8 as u64) as usize
+    base := 512usize
+    for y in 0usize..h8 {
+        for x in 0usize..w8 {
+            t[base + y * w8 + x] = coef[off + y * stride + x] * VD_SCALE_F[y << lh] * VD_SCALE_F[x << lw]
+        }
+    }
+    for y in 0usize..h8 {
+        for x in 0usize..w8 {
+            t[x] = t[base + y * w8 + x]
+        }
+        vd_dct1d(t, 0, 256, w8, true)
+        for x in 0usize..w8 {
+            t[base + y * w8 + x] = t[x]
+        }
+    }
+    for x in 0usize..w8 {
+        for y in 0usize..h8 {
+            t[y] = t[base + y * w8 + x]
+        }
+        vd_dct1d(t, 0, 256, h8, true)
+        for y in 0usize..h8 {
+            t[base + y * w8 + x] = t[y]
+        }
+    }
+    for y in 0usize..h8 {
+        for x in 0usize..w8 {
+            lf[lf_off + y * lf_stride + x] = t[base + y * w8 + x]
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Quantization
+
+// libjxl's QuantizeBlockAC: dead-zone rounding of channel c of a varblock
+// (coefficients at src[soff..], row stride sstride) into dst[doff..] (row
+// stride dstride). `qac` is the quantization scale (global scale / 65536
+// times the varblock's quant times the channel multiplier).
+fn vd_quantize(src: &[f32], soff: usize, sstride: usize, s: &VdShape, wq: &[f32], c: usize, qac: f32, thresholds: &[f32], dst: &mut[i16], doff: usize, dstride: usize) {
+    thres := [thresholds[0], thresholds[1], thresholds[2], thresholds[3]]
+    if c != 1 && s.xs * s.ys >= 4 {
+        for i in 0usize..4 {
+            thres[i] -= 0.00744 * (s.xs * s.ys) as f32
+            if thres[i] < 0.5 {
+                thres[i] = 0.5
+            }
+        }
+    }
+    mw := s.xs * 8
+    woff := s.woff + c * s.psize
+    for yl in 0usize..s.ys * 8 {
+        yfix := 0usize
+        if yl >= s.ys * 4 {
+            yfix = 2
+        }
+        for xl in 0usize..mw {
+            thr := thres[yfix]
+            if xl >= s.xs * 4 {
+                thr = thres[yfix + 1]
+            }
+            val := src[soff + vd_pos(s, xl, yl, sstride)] * wq[woff + yl * mw + xl] * qac
+            a := val
+            if a < 0.0 {
+                a = -a
+            }
+            q := 0i32
+            if a >= thr {
+                q = vd_qround(val)
+            }
+            dst[doff + vd_pos(s, xl, yl, dstride)] = q as i16
+        }
+    }
+}
+
+// What the decoder reconstructs for quantized value q of channel c, in
+// quantization steps.
+@inline
+fn vd_recon(q: i32, c: usize) -> f32 {
+    if q == 0 {
+        return 0.0
+    }
+    if q == 1 {
+        return VD_QUANT_BIAS[c]
+    }
+    if q == -1 {
+        return -VD_QUANT_BIAS[c]
+    }
+    qf := q as f32
+    return qf - VD_QUANT_BIAS_NUM / qf
+}
+
+fn vd_min(a: f32, b: f32) -> f32 {
+    if a < b {
+        return a
+    }
+    return b
+}
+
+fn vd_max(a: f32, b: f32) -> f32 {
+    if a > b {
+        return a
+    }
+    return b
+}
+
+// libjxl's AdjustQuantBlockAC: raise or lower the varblock's quant from
+// the quantization error pattern of channel c, and adapt the dead zones.
+// Returns the new quant.
+fn vd_adjust_quant(src: &[f32], soff: usize, sstride: usize, s: &VdShape, ds: u32, wq: &[f32], c: usize, scale: f32, quant_in: i32, qm_mult: f32, thres: &mut[f32]) -> i32 {
+    quant := quant_in
+    xs := s.xs
+    ys := s.ys
+    if xs > 1 || ys > 1 {
+        d := 0.003f32 * (xs * ys) as f32
+        if d > 0.08 {
+            d = 0.08
+        }
+        for i in 0usize..4 {
+            thres[i] -= d
+            if thres[i] < 0.54 {
+                thres[i] = 0.54
+            }
+        }
+    }
+    qac := scale * quant as f32
+    mw := xs * 8
+    woff := s.woff + c * s.psize
+    sum_hf_corner := 0.0f32
+    sum_error := 0.0f32
+    sum_vals := 0.0f32
+    hf_nonzeros := [0.0f32; 4]
+    hf_max_error := [0.0f32; 4]
+    for yl in 0usize..ys * 8 {
+        for xl in 0usize..mw {
+            if xl < xs && yl < ys {
+                continue
+            }
+            hfix := 0usize
+            if yl >= ys * 4 {
+                hfix = 2
+            }
+            if xl >= xs * 4 {
+                hfix += 1
+            }
+            val := src[soff + vd_pos(s, xl, yl, sstride)] * (wq[woff + yl * mw + xl] * qac * qm_mult)
+            a := val
+            if a < 0.0 {
+                a = -a
+            }
+            v := 0.0f32
+            if a >= thres[hfix] {
+                v = vd_qround(val) as f32
+            }
+            e := val - v
+            if e < 0.0 {
+                e = -e
+            }
+            av := v
+            if av < 0.0 {
+                av = -av
+            }
+            sum_error += e
+            sum_vals += av
+            if c == 1 && v == 0.0 {
+                if hf_max_error[hfix] < e {
+                    hf_max_error[hfix] = e
+                }
+            }
+            if v != 0.0 {
+                hf_nonzeros[hfix] += av
+                in_corner := yl >= 7 * ys && xl >= 7 * xs
+                on_border := yl == ys * 8 - 1 || xl == xs * 8 - 1
+                in_larger_corner := xl >= 4 * xs && yl >= 4 * ys
+                if in_corner || (on_border && in_larger_corner) {
+                    sum_hf_corner += a
+                }
+            }
+        }
+    }
+    if c == 1 && sum_vals * 8.0 < (xs * ys) as f32 {
+        limit := 0.46f32
+        mul := 0.9999f32
+        orig := quant
+        new_quant := quant
+        for i in 1usize..4 {
+            if hf_nonzeros[i] == 0.0 && hf_max_error[i] > limit {
+                new_quant = orig + 1
+                break
+            }
+        }
+        quant = new_quant
+        ratio := new_quant as f32 / orig as f32
+        if hf_nonzeros[3] == 0.0 && hf_max_error[3] > limit {
+            thres[3] = mul * hf_max_error[3] * ratio
+        } else if (hf_nonzeros[1] == 0.0 && hf_max_error[1] > limit) || (hf_nonzeros[2] == 0.0 && hf_max_error[2] > limit) {
+            thres[1] = mul * vd_max(hf_max_error[1], hf_max_error[2]) * ratio
+            thres[2] = thres[1]
+        } else if hf_nonzeros[0] == 0.0 && hf_max_error[0] > limit {
+            thres[0] = mul * hf_max_error[0] * ratio
+        }
+    }
+    {
+        all := hf_nonzeros[0] + hf_nonzeros[1] + hf_nonzeros[2] + hf_nonzeros[3] + 1.0
+        muls := [70.0f32, 30.0, 60.0]
+        if muls[c] * sum_hf_corner >= all {
+            quant += (muls[c] * sum_hf_corner / all) as i32
+            if quant >= 256 {
+                quant = 255
+            }
+        }
+    }
+    if ds == DS_DCT8 {
+        if hf_nonzeros[0] + hf_nonzeros[1] + hf_nonzeros[2] + hf_nonzeros[3] < 11.0 {
+            quant += 1
+            if quant >= 256 {
+                quant = 255
+            }
+        }
+    }
+    if ds == DS_DCT16 || ds == DS_DCT32 || ds == DS_32X16 || ds == DS_16X32 || ds >= DS_DCT64 {
+        mul1 := [0.22080615753848404f32, 0.45797479824262011, 0.29859235095977965, 0.70109486510286834, 0.16185281305512639, 0.14387691730035473, 0.114985964456218638, 0.44656840441027695, 0.10587658215149048, 0.46849665264409396, 0.41239077937781954, 0.088667407767185444]
+        mul2 := [0.27450281941822197f32, 1.1255766549984996, 0.98950459134128388, 0.4652168675598285, 0.40945807983455818, 0.36581899811751367, 0.28034972424715715, 0.9182653201929738, 1.5581531543057416, 0.26873118114033728, 0.68863712390392484, 1.2082185408666786]
+        normalizer := 2.2942708343284721f32
+        se := sum_error * normalizer
+        sv := sum_vals * normalizer
+        ix := 3usize
+        if ds == DS_32X16 || ds == DS_16X32 {
+            ix = 1
+        } else if ds == DS_DCT16 {
+            ix = 0
+        } else if ds == DS_DCT32 {
+            ix = 2
+        }
+        bound := mul1[ix * 3 + c] * (xs * ys * 64) as f32 + mul2[ix * 3 + c] * sv
+        if se > bound {
+            step := 0i32
+            ratio := se / bound
+            if ratio >= 2.0 {
+                step = 2
+            } else if ratio >= 1.0 {
+                step = 1
+            }
+            quant += step
+            if quant >= 256 {
+                quant = 255
+            }
+        }
+    }
+    {
+        div := (xs * ys) as i32
+        min_nz := hf_nonzeros[0]
+        for i in 1usize..4 {
+            if hf_nonzeros[i] < min_nz {
+                min_nz = hf_nonzeros[i]
+            }
+        }
+        activity := 15i32
+        if min_nz < 15.0 * div as f32 {
+            activity = (min_nz as i32 + div / 2) / div
+        }
+        qp := quant - activity
+        if c == 1 {
+            for i in 1usize..4 {
+                thres[i] += 0.01 * activity as f32
+            }
+        }
+        limit := quant / 2
+        if limit < 4 {
+            limit = 4
+        }
+        if qp < limit {
+            qp = limit
+        }
+        quant = qp
+    }
+    return quant
+}
+
+// ---------------------------------------------------------------------------
+// Varblock search
+
+// Distance-dependent constants of the search.
+struct VdAcsConfig {
+    info_loss: f32
+    zeros_mul: f32
+    cost_delta: f32
+    mul8x8: f32
+    // Merge 64x64 regions too.
+    big: bool
+}
+
+fn vd_acs_config(distance: f32, big: bool) -> VdAcsConfig {
+    ratio := ((distance + 0.13731742964354549) / 1.13731742964354549) as f64
+    return VdAcsConfig { info_loss: 1.2f32 * vd_pow(ratio, 0.33677806662454718) as f32, zeros_mul: 9.3089059022677905f32 * vd_pow(ratio, 0.50990926717963703) as f32, cost_delta: 10.833273317067883f32 * vd_pow(ratio, 0.36702940662370243) as f32, mul8x8: 1.0 + -0.4 / (distance + 1.4), big: big }
+}
+
+// libjxl's EstimateEntropy: estimated bits plus weighted information loss
+// of coding varblock type ds at group block (bx, by).
+fn vd_estimate(cfg: &VdAcsConfig, g: &VdGroup, xyb: &[f32], qf: &[f32], mask: &[f32], wq: &[f32], wd: &[f32], ds: u32, bx: usize, by: usize, entropy_mul: f32, cand: &mut[f32], t: &mut[f32]) -> f32 {
+    s := vd_shape(ds)
+    w := s.w8 * 8
+    h := s.h8 * 8
+    nb := s.w8 * s.h8
+    size := w * h
+    for c in 0usize..3 {
+        vd_fdct(g, xyb, c, bx, by, w, h, cand, c * 4096, w, t)
+    }
+    quant := 0.0f32
+    if nb == 1 {
+        quant = qf[by * g.bw + bx]
+    } else if nb == 2 {
+        quant = qf[by * g.bw + bx]
+        other := 0.0f32
+        if s.h8 == 2 {
+            other = qf[(by + 1) * g.bw + bx]
+        } else {
+            other = qf[by * g.bw + bx + 1]
+        }
+        if other > quant {
+            quant = other
+        }
+    } else {
+        for iy in 0usize..s.h8 {
+            for ix in 0usize..s.w8 {
+                q := qf[(by + iy) * g.bw + bx + ix]
+                q = q * q
+                q = q * q
+                q = q * q
+                quant += q * q
+            }
+        }
+        quant = quant / nb as f32
+        quant = vd_sqrt(vd_sqrt(vd_sqrt(vd_sqrt(quant))))
+    }
+    if !(quant > 0.0000001) {
+        quant = 0.0000001
+    }
+    mem := 3usize * 4096
+    pw := g.bw * 8
+    masku := [12.0f32, 0.0, 4.0]
+    chan_mul := [20441190.0f32, 1.0, 1.2667701]
+    cmap := [0.0f32, 0.0, 1.0]
+    entropy := 0.0f32
+    loss := 0.0f32
+    for c in 0usize..3 {
+        woff := s.woff + c * s.psize
+        mw := s.xs * 8
+        ent := 0.0f32
+        nnz := 0u32
+        for yl in 0usize..s.ys * 8 {
+            for xl in 0usize..mw {
+                i := vd_pos(&s, xl, yl, w)
+                v := cand[c * 4096 + i] - cmap[c] * cand[4096 + i]
+                val := v * wq[woff + yl * mw + xl] * quant
+                rval := vd_qround(val) as f32
+                cand[mem + i] = wd[woff + yl * mw + xl] * (val - rval)
+                if rval != 0.0 {
+                    if rval < 0.0 {
+                        rval = -rval
+                    }
+                    if rval < 64.0 {
+                        ent += VD_SQRT_SMALL[rval as usize]
+                    } else {
+                        ent += vd_sqrt(rval)
+                    }
+                    nnz += 1
+                }
+            }
+        }
+        vd_dct2d(cand, mem, w, w, h, true, t)
+        lossc := 0.0f32
+        for y in 0usize..h {
+            mrow := (by * 8 + y) * pw + bx * 8
+            for x in 0usize..w {
+                v := (mask[mrow + x] + masku[c]) * cand[mem + y * w + x]
+                v = v * v
+                v = v * v
+                v = v * v
+                lossc += v
+            }
+        }
+        loss += lossc * chan_mul[c]
+        entropy += cfg.cost_delta * ent
+        nbits := vd_ceil_log2(nnz + 1) + 1
+        entropy += cfg.zeros_mul * (vd_ceil_log2(nbits + 17) + nbits) as f32
+        if c == 0 && nb >= 2 {
+            wgt := 1.0f32 + vd_min(3.0, nb as f32 / 8.0)
+            entropy = entropy * wgt
+            loss = loss * wgt
+        }
+    }
+    loss_scalar := vd_sqrt(vd_sqrt(vd_sqrt(loss / size as f32))) * size as f32 / quant
+    return entropy * entropy_mul + cfg.info_loss * loss_scalar
+}
+
+// Block info of the varblock ds with first block (bx, by) (group coords).
+fn vd_set_acs(acs: &mut[u8], bw: usize, bx: usize, by: usize, ds: u32) {
+    w8 := VD_DS_W8[ds as usize] as usize
+    h8 := VD_DS_H8[ds as usize] as usize
+    for y in 0usize..h8 {
+        for x in 0usize..w8 {
+            acs[(by + y) * bw + bx + x] = ds as u8
+        }
+    }
+    acs[by * bw + bx] = (ds as u8) | VD_FIRST
+}
+
+@inline
+fn vd_acs_type(acs: &[u8], i: usize) -> u32 {
+    return (acs[i] & 127) as u32
+}
+
+// The search's working state for one tile.
+struct VdTileSearch {
+    // Tile origin in group blocks and tile size in blocks.
+    bx0: usize
+    by0: usize
+    entropy: [64]f32
+}
+
+fn vd_set_entropy(st: &mut VdTileSearch, cx: usize, cy: usize, ds: u32, e: f32) {
+    w8 := VD_DS_W8[ds as usize] as usize
+    h8 := VD_DS_H8[ds as usize] as usize
+    for y in 0usize..h8 {
+        for x in 0usize..w8 {
+            st.entropy[(cy + y) * 8 + cx + x] = 0.0
+        }
+    }
+    st.entropy[cy * 8 + cx] = e
+}
+
+// Replace the varblocks under ds at tile block (cx, cy) by ds when cheaper.
+fn vd_try_merge(cfg: &VdAcsConfig, g: &VdGroup, xyb: &[f32], qf: &[f32], mask: &[f32], wq: &[f32], wd: &[f32], acs: &mut[u8], st: &mut VdTileSearch, ds: u32, cx: usize, cy: usize, mul: f32, cand: &mut[f32], t: &mut[f32]) {
+    w8 := VD_DS_W8[ds as usize] as usize
+    h8 := VD_DS_H8[ds as usize] as usize
+    current := 0.0f32
+    for y in 0usize..h8 {
+        for x in 0usize..w8 {
+            current += st.entropy[(cy + y) * 8 + cx + x]
+        }
+    }
+    e := vd_estimate(cfg, g, xyb, qf, mask, wq, wd, ds, st.bx0 + cx, st.by0 + cy, mul, cand, t)
+    if e < current {
+        vd_set_acs(acs, g.bw, st.bx0 + cx, st.by0 + cy, ds)
+        vd_set_entropy(st, cx, cy, ds, e)
+    }
+}
+
+// libjxl's FindBestFirstLevelDivisionForSquare: the square of `blocks` x
+// `blocks` at tile block (cx, cy) becomes one square DCT, two halves split
+// vertically or horizontally, or keeps its current content.
+fn vd_find_best(cfg: &VdAcsConfig, g: &VdGroup, xyb: &[f32], qf: &[f32], mask: &[f32], wq: &[f32], wd: &[f32], acs: &mut[u8], st: &mut VdTileSearch, blocks: usize, cx: usize, cy: usize, mul_half: f32, mul_square: f32, cand: &mut[f32], t: &mut[f32]) {
+    half := blocks / 2
+    ds_tall := DS_16X8
+    ds_wide := DS_8X16
+    ds_square := DS_DCT16
+    if blocks == 4 {
+        ds_tall = DS_32X16
+        ds_wide = DS_16X32
+        ds_square = DS_DCT32
+    } else if blocks == 8 {
+        ds_tall = DS_64X32
+        ds_wide = DS_32X64
+        ds_square = DS_DCT64
+    }
+    e := [0.0f32; 4]
+    for dy in 0usize..blocks {
+        for dx in 0usize..blocks {
+            e[(dy / half) * 2 + dx / half] += st.entropy[(cy + dy) * 8 + cx + dx]
+        }
+    }
+    big := 3.0e38f32
+    left := big
+    right := big
+    top := big
+    bottom := big
+    square := big
+    gx := st.bx0 + cx
+    gy := st.by0 + cy
+    // Halves are only possible when no current varblock straddles the
+    // dividing line.
+    allow_tall := true
+    allow_wide := true
+    for dy in 0usize..blocks {
+        for dx in 0usize..blocks {
+            info := acs[(gy + dy) * g.bw + gx + dx]
+            if (info & VD_FIRST) == 0 {
+                continue
+            }
+            ds := (info & 127) as u32
+            if dx < half && dx + VD_DS_W8[ds as usize] as usize > half {
+                allow_tall = false
+            }
+            if dy < half && dy + VD_DS_H8[ds as usize] as usize > half {
+                allow_wide = false
+            }
+        }
+    }
+    if allow_tall {
+        if vd_acs_type(acs, gy * g.bw + gx) != ds_tall {
+            left = vd_estimate(cfg, g, xyb, qf, mask, wq, wd, ds_tall, gx, gy, mul_half, cand, t)
+        }
+        if vd_acs_type(acs, gy * g.bw + gx + half) != ds_tall {
+            right = vd_estimate(cfg, g, xyb, qf, mask, wq, wd, ds_tall, gx + half, gy, mul_half, cand, t)
+        }
+    }
+    if allow_wide {
+        if vd_acs_type(acs, gy * g.bw + gx) != ds_wide {
+            top = vd_estimate(cfg, g, xyb, qf, mask, wq, wd, ds_wide, gx, gy, mul_half, cand, t)
+        }
+        if vd_acs_type(acs, (gy + half) * g.bw + gx) != ds_wide {
+            bottom = vd_estimate(cfg, g, xyb, qf, mask, wq, wd, ds_wide, gx, gy + half, mul_half, cand, t)
+        }
+    }
+    square = vd_estimate(cfg, g, xyb, qf, mask, wq, wd, ds_square, gx, gy, mul_square, cand, t)
+    cost_v := vd_min(left, e[0] + e[2]) + vd_min(right, e[1] + e[3])
+    cost_h := vd_min(top, e[0] + e[1]) + vd_min(bottom, e[2] + e[3])
+    if square < cost_v && square < cost_h {
+        vd_set_acs(acs, g.bw, gx, gy, ds_square)
+        vd_set_entropy(st, cx, cy, ds_square, square)
+    } else if cost_v < cost_h {
+        if left < e[0] + e[2] {
+            vd_set_acs(acs, g.bw, gx, gy, ds_tall)
+            vd_set_entropy(st, cx, cy, ds_tall, left)
+        }
+        if right < e[1] + e[3] {
+            vd_set_acs(acs, g.bw, gx + half, gy, ds_tall)
+            vd_set_entropy(st, cx + half, cy, ds_tall, right)
+        }
+    } else {
+        if top < e[0] + e[1] {
+            vd_set_acs(acs, g.bw, gx, gy, ds_wide)
+            vd_set_entropy(st, cx, cy, ds_wide, top)
+        }
+        if bottom < e[2] + e[3] {
+            vd_set_acs(acs, g.bw, gx, gy + half, ds_wide)
+            vd_set_entropy(st, cx, cy + half, ds_wide, bottom)
+        }
+    }
+}
+
+// Varblock types of the tile (bx0, by0) of trw x trh blocks.
+fn vd_search_tile(cfg: &VdAcsConfig, g: &VdGroup, xyb: &[f32], qf: &[f32], mask: &[f32], wq: &[f32], wd: &[f32], acs: &mut[u8], bx0: usize, by0: usize, trw: usize, trh: usize, cand: &mut[f32], t: &mut[f32]) {
+    st := VdTileSearch { bx0: bx0, by0: by0, entropy: [0.0f32; 64] }
+    for iy in 0usize..trh {
+        for ix in 0usize..trw {
+            e := vd_estimate(cfg, g, xyb, qf, mask, wq, wd, DS_DCT8, bx0 + ix, by0 + iy, 1.0, cand, t)
+            st.entropy[iy * 8 + ix] = e * cfg.mul8x8
+            vd_set_acs(acs, g.bw, bx0 + ix, by0 + iy, DS_DCT8)
+        }
+    }
+    mul16x8 := 1.21f32
+    mul16x16 := 1.34f32
+    mul16x32 := 1.49f32
+    mul32x32 := 1.48f32
+    mul64x32 := 2.25f32
+    mul64x64 := 2.25f32
+    // Lone 16x8 pairs in an odd last column, then 16x16 squares, then lone
+    // 8x16 pairs in an odd last row.
+    if trw % 2 == 1 {
+        cx := trw - 1
+        cy := 0usize
+        for cy + 1 < trh {
+            vd_try_merge(cfg, g, xyb, qf, mask, wq, wd, acs, &mut st, DS_16X8, cx, cy, mul16x8, cand, t)
+            cy += 2
+        }
+    }
+    cy2 := 0usize
+    for cy2 + 1 < trh {
+        cx := 0usize
+        for cx + 1 < trw {
+            vd_find_best(cfg, g, xyb, qf, mask, wq, wd, acs, &mut st, 2, cx, cy2, mul16x8, mul16x16, cand, t)
+            cx += 2
+        }
+        cy2 += 2
+    }
+    if trh % 2 == 1 {
+        cy := trh - 1
+        cx := 0usize
+        for cx + 1 < trw {
+            vd_try_merge(cfg, g, xyb, qf, mask, wq, wd, acs, &mut st, DS_8X16, cx, cy, mul16x8, cand, t)
+            cx += 2
+        }
+    }
+    // 32x32 squares; 16x32 / 32x16 where only part of a square fits.
+    cy4 := 0usize
+    for cy4 + 1 < trh {
+        cx := 0usize
+        for cx + 3 < trw {
+            if cy4 + 3 < trh {
+                vd_find_best(cfg, g, xyb, qf, mask, wq, wd, acs, &mut st, 4, cx, cy4, mul16x32, mul32x32, cand, t)
+            } else {
+                vd_try_merge(cfg, g, xyb, qf, mask, wq, wd, acs, &mut st, DS_16X32, cx, cy4, mul16x32, cand, t)
+            }
+            cx += 4
+        }
+        cy4 += 4
+    }
+    if trw % 4 >= 2 {
+        cx := trw - trw % 4
+        cy := 0usize
+        for cy + 3 < trh {
+            vd_try_merge(cfg, g, xyb, qf, mask, wq, wd, acs, &mut st, DS_32X16, cx, cy, mul16x32, cand, t)
+            cy += 4
+        }
+    }
+    if cfg.big && trw == 8 && trh == 8 {
+        vd_try_merge(cfg, g, xyb, qf, mask, wq, wd, acs, &mut st, DS_64X32, 0, 0, mul64x32, cand, t)
+        vd_try_merge(cfg, g, xyb, qf, mask, wq, wd, acs, &mut st, DS_64X32, 4, 0, mul64x32, cand, t)
+        vd_find_best(cfg, g, xyb, qf, mask, wq, wd, acs, &mut st, 8, 0, 0, mul64x32, mul64x64, cand, t)
+    }
+}
+
+// libjxl's AdjustQuantField: every block of a multi-block varblock takes
+// the maximum (mixed with the mean at larger distances) of the varblock's
+// quant field.
+fn vd_adjust_field(qf: &mut[f32], acs: &[u8], bw: usize, bx0: usize, by0: usize, trw: usize, trh: usize, distance: f32) {
+    mixer := 1.0f32
+    if distance > 1.54138 {
+        mixer -= (distance - 1.54138) * 0.56391
+        if mixer < 0.0 {
+            mixer = 0.0
+        }
+    }
+    for y in by0..by0 + trh {
+        for x in bx0..bx0 + trw {
+            info := acs[y * bw + x]
+            if (info & VD_FIRST) == 0 {
+                continue
+            }
+            ds := (info & 127) as u32
+            w8 := VD_DS_W8[ds as usize] as usize
+            h8 := VD_DS_H8[ds as usize] as usize
+            if w8 * h8 == 1 {
+                continue
+            }
+            mx := qf[y * bw + x]
+            mean := 0.0f32
+            for iy in 0usize..h8 {
+                for ix in 0usize..w8 {
+                    v := qf[(y + iy) * bw + x + ix]
+                    mean += v
+                    if v > mx {
+                        mx = v
+                    }
+                }
+            }
+            mean = mean / (w8 * h8) as f32
+            if w8 * h8 >= 4 {
+                mx = mx * mixer + (1.0 - mixer) * mean
+            }
+            for iy in 0usize..h8 {
+                for ix in 0usize..w8 {
+                    qf[(y + iy) * bw + x + ix] = mx
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Chroma from luma
+
+// libjxl's fast FindBestMultiplier over sums ca = sum(a^2), cb = sum(a b)
+// of `num` coefficients.
+fn vd_cfl_factor(ca: f32, cb: f32, num: usize) -> i32 {
+    if num == 0 {
+        return 0
+    }
+    x := -cb / (ca + num as f32 * 0.000000001 * 0.5)
+    if !(x == x) {
+        return 0
+    }
+    if x >= 2.6 {
+        x -= 2.6
+    } else if x <= -2.6 {
+        x += 2.6
+    } else {
+        x = 0.0
+    }
+    if x > 127.0 {
+        return 127
+    }
+    if x < -128.0 {
+        return -128
+    }
+    return vd_qround(x)
+}

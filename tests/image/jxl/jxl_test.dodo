@@ -17,7 +17,8 @@ import "std/text"
 // tests/image/jxl/generate.py (cjxl encodes, djxl decodes for references):
 // lossless cases must reproduce djxl's samples exactly (compared by hash),
 // lossy, composited and VarDCT cases must match djxl's 8-bit decode within
-// two levels (one is observed).
+// two levels (one is observed); extra channels must match djxl's float
+// decode within two 8-bit levels (U8 channels) or 4/65535 (deeper ones).
 // Then animation timing, metadata boxes, the ICC profile, scratch sizing and
 // robustness against truncated and corrupted files.
 //
@@ -81,7 +82,69 @@ fn decode_into(data: &[u8], index: u32, layout: &pixels.Layout) -> usize!pixels.
 }
 
 fn shape(k: usize, field: usize) -> u32 {
-    return CASE_SHAPES[k * 6 + field]
+    return CASE_SHAPES[k * 7 + field]
+}
+
+// Decode extra channel `channel` of displayed frame `index` into PIXELS as
+// 16-bit gray; returns the byte count.
+fn decode_extra_into(data: &[u8], index: u32, channel: u32) -> usize!pixels.Error {
+    header := jxl.info(data)?
+    need := jxl.scratch_size(data)?
+    assert(need <= SCRATCH_LIMIT, "scratch limit")
+    layout := pixels.Layout.from_codes(1, pixels.SAMPLE_U16, false)
+    size := pixels.bytes_needed(header.width, header.height, &layout)?
+    assert(size <= PIXEL_LIMIT, "pixel limit")
+    unsafe {
+        target := pixels.ViewMut.new(&mut PIXELS[..size], header.width, header.height, layout.clone())?
+        view_sink := sink.ViewSink.new(&mut target)
+        buffer := &mut SCRATCH[..need]
+        jxl.decode_extra_channel(data, index, channel, &mut view_sink, buffer)?
+    }
+    return ok(size)
+}
+
+// The largest difference between the 16-bit samples of PIXELS and
+// REFERENCE.
+fn compare_reference16(size: usize) -> u32 {
+    worst := 0u32
+    unsafe {
+        for i in 0usize..size / 2 {
+            a := PIXELS[2 * i] as u32 | ((PIXELS[2 * i + 1] as u32) << 8)
+            b := REFERENCE[2 * i] as u32 | ((REFERENCE[2 * i + 1] as u32) << 8)
+            d := 0u32
+            if a > b {
+                d = a - b
+            } else {
+                d = b - a
+            }
+            if d > worst {
+                worst = d
+            }
+        }
+    }
+    return worst
+}
+
+// Extra channel case k: the channel's info, then its decode against the
+// 16-bit reference.
+fn check_extra_case(k: usize, data: &[u8]) {
+    name := CASE_FILES[k]
+    channel := shape(k, 6)
+    info := jxl.extra_channel_info(data, channel)!
+    assert_eq(info.layout.channel_count() as u32, 1u32, name)
+    assert_eq(info.layout.sample_code(), shape(k, 3), name)
+    reference := [0u8; FILE_LIMIT]
+    ref_length := read_fixture(CASE_REFS[k], ".jxl", &mut reference)
+    gray16 := pixels.Layout.from_codes(1, pixels.SAMPLE_U16, false)
+    ref_size := decode_into(&reference[..ref_length], 0, &gray16)!
+    keep_reference(ref_size)
+    size := decode_extra_into(data, shape(k, 5), channel)!
+    assert_eq(size, ref_size, name)
+    limit := 4u32
+    if shape(k, 3) == pixels.SAMPLE_U8 {
+        limit = 514
+    }
+    assert(compare_reference16(size) <= limit, name)
 }
 
 fn check_case(k: usize) {
@@ -90,6 +153,10 @@ fn check_case(k: usize) {
     length := read_fixture(name, ".jxl", &mut file)
     data := &file[..length]
     assert(jxl.matches(data), name)
+    if shape(k, 4) == 3 {
+        check_extra_case(k, data)
+        return
+    }
     header := jxl.info(data)!
     assert(header.format == pixels.Format.Jxl, name)
     assert_eq(header.width, shape(k, 0), name)
@@ -228,9 +295,91 @@ fn vardct_fixtures() {
     }
 }
 
+// Extra channels against djxl, and the extra channel descriptions.
+@test
+fn extra_channel_fixtures() {
+    for k in 0usize..CASE_COUNT {
+        if shape(k, 4) == 3 {
+            check_case(k)
+        }
+    }
+}
+
+@test
+fn extra_channel_info() {
+    file := [0u8; FILE_LIMIT]
+    length := read_fixture("extra_channels", ".jxl", &mut file)
+    data := &file[..length]
+    assert_eq(jxl.extra_channel_count(data)!, 8u32)
+    alpha := jxl.extra_channel_info(data, 0)!
+    assert(alpha.kind == jxl.ExtraChannelType.Alpha)
+    assert_eq(alpha.bit_depth, 8u32)
+    assert(!alpha.alpha_associated)
+    assert_eq(alpha.name_length, 0u32)
+    depth := jxl.extra_channel_info(data, 1)!
+    assert(depth.kind == jxl.ExtraChannelType.Depth)
+    assert_eq(depth.bit_depth, 16u32)
+    assert_eq(depth.dim_shift, 1u32)
+    assert_eq(depth.layout.sample_code(), pixels.SAMPLE_U16)
+    name := [0u8; 16]
+    length_name := jxl.extra_channel_name(data, 1, &mut name)!
+    assert_eq(length_name, 5usize)
+    assert(name[0] == b'd' && name[1] == b'e' && name[4] == b'h')
+    short := [0u8; 2]
+    match jxl.extra_channel_name(data, 1, &mut short) {
+        ok(_) => {
+            assert(false, "name longer than the buffer")
+        }
+        err(e) => {
+            assert(e == pixels.Error.BufferTooSmall)
+        }
+    }
+    spot := jxl.extra_channel_info(data, 2)!
+    assert(spot.kind == jxl.ExtraChannelType.SpotColor)
+    assert(spot.spot_color[0] > 0.89 && spot.spot_color[0] < 0.91)
+    assert(spot.spot_color[3] > 0.79 && spot.spot_color[3] < 0.81)
+    mask := jxl.extra_channel_info(data, 3)!
+    assert(mask.kind == jxl.ExtraChannelType.SelectionMask)
+    assert_eq(mask.bit_depth, 1u32)
+    thermal := jxl.extra_channel_info(data, 4)!
+    assert(thermal.kind == jxl.ExtraChannelType.Thermal)
+    black := jxl.extra_channel_info(data, 5)!
+    assert(black.kind == jxl.ExtraChannelType.Black)
+    cfa := jxl.extra_channel_info(data, 6)!
+    assert(cfa.kind == jxl.ExtraChannelType.Cfa)
+    assert_eq(cfa.cfa_channel, 2u32)
+    half := jxl.extra_channel_info(data, 7)!
+    assert(half.kind == jxl.ExtraChannelType.Optional)
+    assert_eq(half.exponent_bits, 5u32)
+    assert_eq(half.layout.sample_code(), pixels.SAMPLE_F32)
+    match jxl.extra_channel_info(data, 8) {
+        ok(_) => {
+            assert(false, "only 8 extra channels")
+        }
+        err(e) => {
+            assert(e == pixels.Error.Malformed)
+        }
+    }
+    match decode_extra_into(data, 0, 8) {
+        ok(_) => {
+            assert(false, "only 8 extra channels")
+        }
+        err(e) => {
+            assert(e == pixels.Error.Malformed)
+        }
+    }
+    // The maximum count, and a file without extra channels.
+    many := [0u8; FILE_LIMIT]
+    many_length := read_fixture("max_ec", ".jxl", &mut many)
+    assert_eq(jxl.extra_channel_count(&many[..many_length])!, 4096u32)
+    plain := [0u8; FILE_LIMIT]
+    plain_length := read_fixture("rgb_e7", ".jxl", &mut plain)
+    assert_eq(jxl.extra_channel_count(&plain[..plain_length])!, 0u32)
+}
+
 @test
 fn scratch_size_is_exact_and_checked() {
-    names := ["rgb_e7", "squeeze_big", "anim_blend", "lossy_d1", "patches_text"]
+    names := ["rgb_e7", "squeeze_big", "anim_blend", "lossy_d1", "patches_text", "patches_up", "max_ec", "vd_ycbcr420", "patches_up_window", "ec_window", "ref_patches", "vd_window"]
     for n in 0usize..names.len {
         file := [0u8; FILE_LIMIT]
         length := read_fixture(names[n], ".jxl", &mut file)
@@ -247,6 +396,41 @@ fn scratch_size_is_exact_and_checked() {
                 assert(e == pixels.Error.BufferTooSmall, names[n])
             }
         }
+    }
+}
+
+// The scratch bound documented in image.md: with W' = width + 1100,
+// H' = height + 1100 and C = 3 + extra channels,
+// 64 W' H' C + 5 MiB C + 128 MiB, whatever size the frames claim.
+fn scratch_bound(width: u32, height: u32, channels: u64) -> u64 {
+    w := width as u64 + 1100
+    h := height as u64 + 1100
+    return 64 * w * h * channels + 5 * 1048576 * channels + 128 * 1048576
+}
+
+// scratch_size follows the image header, not the frame headers: frames
+// larger than the image or starting outside it, and reference frames, are
+// decoded over the part that can show (std/image/jxl/window.dodo). Every
+// fixture stays within the documented bound; the frame window fixtures
+// (frames of up to 6e8 pixels over a 64x48 image) need little.
+@test
+fn scratch_size_is_bounded() {
+    for k in 0usize..CASE_COUNT {
+        name := CASE_FILES[k]
+        file := [0u8; FILE_LIMIT]
+        length := read_fixture(name, ".jxl", &mut file)
+        data := &file[..length]
+        header := jxl.info(data)!
+        need := jxl.scratch_size(data)! as u64
+        channels := 3u64 + jxl.extra_channel_count(data)! as u64
+        assert(need <= scratch_bound(header.width, header.height, channels), name)
+    }
+    names := ["frame_big", "frame_huge", "frame_negative", "ref_patches", "ref_huge", "vd_window", "patches_up_window", "ec_window"]
+    for n in 0usize..names.len {
+        file := [0u8; FILE_LIMIT]
+        length := read_fixture(names[n], ".jxl", &mut file)
+        need := jxl.scratch_size(&file[..length])!
+        assert(need <= 48 * 1048576, names[n])
     }
 }
 
@@ -279,6 +463,86 @@ fn animation_timing() {
     assert_eq(still_frame.denominator, 1u32)
 }
 
+// Brotli metadata with caller scratch: meta_wide_brob's Exif brob box holds
+// a stream whose tables need about 246,000 workspace words, more than
+// meta.decode's stack workspace. decode_with_scratch() with
+// scratch_size() bytes decodes it to the plain Exif box of meta_raw.
+fn brotli_scratch(work: &mut[u8]) {
+    file := [0u8; FILE_LIMIT]
+    length := read_fixture("meta_raw", ".jxl", &mut file)
+    data := &file[..length]
+    m := jxl.metadata(data)!
+    exif := m.exif.bytes(data)!
+    assert_eq(meta.scratch_size(data, &m.exif)!, 0usize)
+    assert_eq(meta.scratch_size(data, &m.xmp)!, 0usize)
+    wide := [0u8; FILE_LIMIT]
+    wide_length := read_fixture("meta_wide_brob", ".jxl", &mut wide)
+    wdata := &wide[..wide_length]
+    wm := jxl.metadata(wdata)!
+    assert_eq(wm.exif.encoding, meta.ENCODING_BROTLI)
+    need := meta.scratch_size(wdata, &wm.exif)!
+    assert(need > 2 * 131072 && need < 2 * 696108 && need <= work.len)
+    decoded := [0u8; 4096]
+    match meta.decode(wdata, &wm.exif, &mut decoded) {
+        ok(_) => {
+            assert(false, "wide stream decoded with the stack workspace")
+        }
+        err(e) => {
+            assert(e == pixels.Error.TooLarge)
+        }
+    }
+    n := meta.decode_with_scratch(wdata, &wm.exif, &mut decoded, &mut work[..need])!
+    assert_eq(n, exif.len)
+    for i in 0usize..n {
+        assert(decoded[i] == exif[i])
+    }
+    assert_eq(meta.exif_orientation(&decoded[..n])!, 1u32)
+    // Much less scratch fails cleanly.
+    match meta.decode_with_scratch(wdata, &wm.exif, &mut decoded, &mut work[..need / 2]) {
+        ok(_) => {
+            assert(false, "wide stream decoded in half its workspace")
+        }
+        err(e) => {
+            assert(e == pixels.Error.TooLarge)
+        }
+    }
+    // The small streams of meta_brob need little scratch.
+    compressed := [0u8; FILE_LIMIT]
+    compressed_length := read_fixture("meta_brob", ".jxl", &mut compressed)
+    cdata := &compressed[..compressed_length]
+    cm := jxl.metadata(cdata)!
+    small := meta.scratch_size(cdata, &cm.xmp)!
+    assert(small > 0 && small < 8192)
+    xmp_length := meta.decode_with_scratch(cdata, &cm.xmp, &mut decoded, &mut work[..small])!
+    assert_eq(xmp_length, m.xmp.length)
+    // Truncated brob payloads fail in both functions.
+    cut := meta.Item { offset: wm.exif.offset, length: 3, encoding: meta.ENCODING_BROTLI }
+    match meta.scratch_size(wdata, &cut) {
+        ok(_) => {
+            assert(false, "short brob payload accepted")
+        }
+        err(e) => {
+            assert(e == pixels.Error.Truncated)
+        }
+    }
+    half := meta.Item { offset: wm.exif.offset, length: wm.exif.length / 2, encoding: meta.ENCODING_BROTLI }
+    match meta.scratch_size(wdata, &half) {
+        ok(_) => {
+            assert(false, "truncated brob stream accepted")
+        }
+        err(e) => {
+            assert(e == pixels.Error.Truncated)
+        }
+    }
+}
+
+@test
+fn metadata_brotli_scratch() {
+    unsafe {
+        brotli_scratch(&mut SCRATCH)
+    }
+}
+
 @test
 fn metadata_boxes() {
     file := [0u8; FILE_LIMIT]
@@ -296,9 +560,32 @@ fn metadata_boxes() {
     assert(!m.icc.present())
     compressed := [0u8; FILE_LIMIT]
     compressed_length := read_fixture("meta_brob", ".jxl", &mut compressed)
-    cm := jxl.metadata(&compressed[..compressed_length])!
+    cdata := &compressed[..compressed_length]
+    cm := jxl.metadata(cdata)!
     assert_eq(cm.exif.encoding, meta.ENCODING_BROTLI)
     assert_eq(cm.xmp.encoding, meta.ENCODING_BROTLI)
+    // Decompressed brob payloads equal the uncompressed boxes; EXIF starts
+    // at the TIFF header either way.
+    decoded := [0u8; 4096]
+    exif_length := meta.decode(cdata, &cm.exif, &mut decoded)!
+    assert_eq(exif_length, exif.len)
+    for i in 0usize..exif.len {
+        assert(decoded[i] == exif[i])
+    }
+    assert_eq(meta.exif_orientation(&decoded[..exif_length])!, 1u32)
+    xmp_length := meta.decode(cdata, &cm.xmp, &mut decoded)!
+    assert_eq(xmp_length, xmp.len)
+    for i in 0usize..xmp.len {
+        assert(decoded[i] == xmp[i])
+    }
+    match meta.decode(cdata, &cm.xmp, &mut decoded[..xmp.len - 1]) {
+        ok(_) => {
+            assert(false, "short output accepted")
+        }
+        err(e) => {
+            assert(e == pixels.Error.BufferTooSmall)
+        }
+    }
     bare := [0u8; FILE_LIMIT]
     bare_length := read_fixture("rgb_e1", ".jxl", &mut bare)
     bm := jxl.metadata(&bare[..bare_length])!
@@ -322,6 +609,20 @@ fn icc_profile() {
     assert_eq(decoded, expected_length)
     for i in 0usize..expected_length {
         assert_eq(profile[i], expected[i])
+    }
+    // A 45 KB profile (many prefix-coded clusters, long LZ77 matches),
+    // skipped by info() in a few KiB of stack and decoded by icc().
+    big := [0u8; FILE_LIMIT]
+    big_length := read_fixture("icc_big", ".jxl", &mut big)
+    big_header := jxl.info(&big[..big_length])!
+    assert(big_header.color.has_icc())
+    unsafe {
+        big_expected := read_fixture("profile_big", ".icc", &mut REFERENCE)
+        big_decoded := icc_into(&big[..big_length], &mut PIXELS)!
+        assert_eq(big_decoded, big_expected)
+        for i in 0usize..big_expected {
+            assert_eq(PIXELS[i], REFERENCE[i])
+        }
     }
     // XYB with an ICC profile is rendered to sRGB.
     lossy := [0u8; FILE_LIMIT]
@@ -486,6 +787,18 @@ fn attempt(data: &[u8]) {
                     ok() => {}
                     err(_) => {}
                 }
+                // The last extra channel too, when there is one.
+                match jxl.extra_channel_count(data) {
+                    ok(count) => {
+                        if count > 0 {
+                            match jxl.decode_extra_channel(data, 0, count - 1, &mut null, buffer) {
+                                ok() => {}
+                                err(_) => {}
+                            }
+                        }
+                    }
+                    err(_) => {}
+                }
             }
         }
         err(_) => {}
@@ -522,6 +835,38 @@ fn robustness_jpeg_noise_splines() {
     mangle("jpeg420")
     mangle("vd_noise")
     mangle("splines")
+}
+
+// Frame windows: frames larger than the image, reference frames read by
+// patches (also from an upsampled frame), extra channels of a windowed
+// frame, a VarDCT frame cropped to the window.
+@test
+fn robustness_frame_windows() {
+    mangle("frame_huge")
+    mangle("ref_patches")
+    mangle("patches_text")
+    mangle("patches_up_window")
+    mangle("ec_window")
+}
+
+@test
+fn robustness_vardct_window() {
+    mangle("vd_window")
+}
+
+// Header walks: permuted TOCs and a large ICC profile.
+@test
+fn robustness_header_walks() {
+    mangle("vd_group_order")
+    mangle("icc_big")
+}
+
+@test
+fn robustness_new_features() {
+    mangle("patches_up")
+    mangle("vd_ycbcr420")
+    mangle("lf_upsampled")
+    mangle("extra_channels")
 }
 
 @test

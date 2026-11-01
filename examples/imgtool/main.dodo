@@ -28,9 +28,11 @@ fn usage() -> void!io.Error {
     errors := console.stderr()
     errors.printf("usage: imgtool COMMAND ARGUMENTS\n\n")?
     errors.printf("  info FILE                       format, size, layout, color, orientation, frames, metadata\n")?
-    errors.printf("  convert IN OUT [--effort N] [--layout L] [--strip]\n")?
+    errors.printf("  convert IN OUT [--effort N] [--layout L] [--strip] [--quality Q | --distance D | --lossy]\n")?
     errors.printf("                                  re-encode as OUT's format (L: gray8 graya8 rgb8 rgba8,\n")?
-    errors.printf("                                  gray16 ... rgba16, rgbf32 rgbaf32 ...)\n")?
+    errors.printf("                                  gray16 ... rgba16, rgbf32 rgbaf32 ...); JPEG XL is\n")?
+    errors.printf("                                  lossless unless given a quality (0-100), a\n")?
+    errors.printf("                                  Butteraugli distance (e.g. 1.0) or --lossy (quality 90)\n")?
     errors.printf("  resize IN OUT WxH [--filter F] [--linear]\n")?
     errors.printf("                                  F: nearest box bilinear catmull-rom mitchell lanczos;\n")?
     errors.printf("                                  a 0 side keeps the aspect ratio\n")?
@@ -159,6 +161,41 @@ fn number(text: &str) -> Option<u32> {
         value = value * 10 + (*d - b'0') as u32
     }
     return some(value)
+}
+
+// A decimal such as "1.5" (digits with at most one point).
+fn decimal(text: &str) -> Option<f32> {
+    digits := mem.str_bytes(text)
+    if digits.len == 0 || digits.len > 12 {
+        return none
+    }
+    value := 0.0f64
+    scale := 0.0f64
+    seen := false
+    for d in digits {
+        if *d == b'.' {
+            if scale != 0.0 {
+                return none
+            }
+            scale = 1.0
+            continue
+        }
+        if *d < b'0' || *d > b'9' {
+            return none
+        }
+        seen = true
+        value = value * 10.0 + (*d - b'0') as f64
+        if scale != 0.0 {
+            scale = scale * 10.0
+        }
+    }
+    if !seen {
+        return none
+    }
+    if scale != 0.0 {
+        value = value / scale
+    }
+    return some(value as f32)
 }
 
 // ---------------------------------------------------------------------------
@@ -360,6 +397,40 @@ fn invalid(what: &str, value: &str) -> i32!Failure {
     return ok(EXIT_ERROR)
 }
 
+// Scratch for decoding Brotli metadata: brotli.WORKSPACE_LEN u16 words
+// cover any stream.
+const META_SCRATCH_SIZE: usize = 1392216
+
+static mut META_SCRATCH: [META_SCRATCH_SIZE]u8 = [0u8; META_SCRATCH_SIZE]
+
+// Decode a metadata item with the static Brotli scratch.
+fn decode_item(data: &[u8], item: &meta.Item, output: &mut[u8]) -> usize!pixels.Error {
+    need := meta.scratch_size(data, item)?
+    if need > META_SCRATCH_SIZE {
+        return err(pixels.Error.TooLarge)
+    }
+    unsafe {
+        return meta.decode_with_scratch(data, item, output, &mut META_SCRATCH[..need])
+    }
+}
+
+// One metadata line: the stored size and encoding, plus the decoded size
+// of a zlib or Brotli payload up to 64 KiB.
+fn print_item(kind: &str, data: &[u8], item: &meta.Item) -> void!Failure {
+    if item.encoding == meta.ENCODING_ZLIB || item.encoding == meta.ENCODING_BROTLI {
+        decoded := [0u8; 65536]
+        match decode_item(data, item, &mut decoded) {
+            ok(length) => {
+                console.printf("metadata: {}, {} bytes ({}, {} decoded)\n", kind, item.length, encoding_name(item.encoding), length)?
+                return ok()
+            }
+            err(_) => {}
+        }
+    }
+    console.printf("metadata: {}, {} bytes ({})\n", kind, item.length, encoding_name(item.encoding))?
+    return ok()
+}
+
 fn info(file: &str) -> i32!Failure {
     storage := arena()
     contents := image_alloc.read_file(file, storage.handle())?
@@ -406,15 +477,15 @@ fn info(file: &str) -> i32!Failure {
     console.printf("lossy: {}\nprogressive: {}\n", yes(header.lossy), yes(header.progressive))?
     count := 0u32
     if found.exif.present() {
-        console.printf("metadata: exif, {} bytes ({})\n", found.exif.length, encoding_name(found.exif.encoding))?
+        print_item("exif", data, &found.exif)?
         count += 1
     }
     if found.xmp.present() {
-        console.printf("metadata: xmp, {} bytes ({})\n", found.xmp.length, encoding_name(found.xmp.encoding))?
+        print_item("xmp", data, &found.xmp)?
         count += 1
     }
     if found.icc.present() {
-        console.printf("metadata: icc, {} bytes ({})\n", found.icc.length, encoding_name(found.icc.encoding))?
+        print_item("icc", data, &found.icc)?
         count += 1
     }
     if count == 0 {
@@ -441,6 +512,39 @@ fn encode_options(arguments: &Arguments) -> Option<image.EncodeOptions> {
         }
     }
     options.keep_metadata = !arguments.flag("--strip")
+    if arguments.flag("--lossy") {
+        options.lossless = false
+    }
+    quality := arguments.option("--quality", "")
+    if mem.str_bytes(quality).len > 0 {
+        match number(quality) {
+            some(value) => {
+                if value > 100 {
+                    return none
+                }
+                options.quality = value
+                options.lossless = false
+            }
+            none => {
+                return none
+            }
+        }
+    }
+    distance := arguments.option("--distance", "")
+    if mem.str_bytes(distance).len > 0 {
+        match decimal(distance) {
+            some(value) => {
+                if !(value > 0.0) || value > 25.0 {
+                    return none
+                }
+                options.distance = value
+                options.lossless = false
+            }
+            none => {
+                return none
+            }
+        }
+    }
     return some(options)
 }
 
@@ -458,7 +562,7 @@ fn convert(arguments: &Arguments, input: &str, output: &str) -> i32!Failure {
             value
         }
         none => {
-            return invalid("effort (0 to 9)", arguments.option("--effort", ""))
+            return invalid("encoder option (--effort 0 to 9, --quality 0 to 100, --distance up to 25)", "")
         }
     }
     storage := arena()

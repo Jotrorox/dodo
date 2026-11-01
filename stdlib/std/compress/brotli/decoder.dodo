@@ -1,0 +1,1473 @@
+package brotli
+
+// The decoder state machine. The whole compressed stream is in memory, so
+// bits are read through a 64-bit accumulator that is padded with zero bytes
+// past the end of the input; `pad` counts those bytes and the decoder checks
+// after every header, command and literal run that none of them was
+// consumed (Truncated otherwise). Output goes to `window` at `wpos`; `pos`
+// counts all bytes produced. In linear mode (decompress) the window is the
+// output and never wraps. Otherwise it is a ring: bytes between `delivered`
+// and `pos` are pending, and decoding pauses when the ring is full of them.
+//
+// Workspace layout per meta-block, bump-allocated from `top`: block type and
+// block count codes, literal context modes, the literal and distance
+// context maps (one word per entry), the tree directories (two words per
+// tree: table offset low half, then high half with the root bit count in
+// the top four bits) and the prefix code tables. Table entries are
+// (bits << 12) | value; a root entry with more bits than the root links to
+// a second-level table at `value` words from the tree start.
+
+const PHASE_HEADER: u32 = 0
+const PHASE_COMMAND: u32 = 1
+const PHASE_INSERT: u32 = 2
+const PHASE_COPY: u32 = 3
+const PHASE_WORD: u32 = 4
+const PHASE_RAW: u32 = 5
+const PHASE_DONE: u32 = 6
+const PHASE_FAILED: u32 = 7
+
+const ROOT_BITS: u32 = 8
+const MAX_ALPHABET: usize = 704
+// Distances above this are invalid (libbrotli's BROTLI_MAX_ALLOWED_DISTANCE).
+const MAX_DISTANCE: usize = 0x7ffffffc
+
+static CODE_LENGTH_ORDER: [18]u8 = [1, 2, 3, 4, 0, 5, 17, 6, 16, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+// The fixed code for code length code lengths, indexed by the next 4 bits.
+static CL_PREFIX_LEN: [16]u8 = [2, 2, 2, 3, 2, 2, 2, 4, 2, 2, 2, 3, 2, 2, 2, 4]
+static CL_PREFIX_VALUE: [16]u8 = [0, 4, 3, 2, 0, 4, 3, 1, 0, 4, 3, 2, 0, 4, 3, 5]
+static BLOCK_LEN_OFFSET: [26]u32 = [1, 5, 9, 13, 17, 25, 33, 41, 49, 65, 81, 97, 113, 145, 177, 209, 241, 305, 369, 497, 753, 1265, 2289, 4337, 8433, 16625]
+static BLOCK_LEN_BITS: [26]u8 = [2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 6, 6, 7, 8, 9, 10, 11, 12, 13, 24]
+static INSERT_OFFSET: [24]u32 = [0, 1, 2, 3, 4, 5, 6, 8, 10, 14, 18, 26, 34, 50, 66, 98, 130, 194, 322, 578, 1090, 2114, 6210, 22594]
+static INSERT_BITS: [24]u8 = [0, 0, 0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 7, 8, 9, 10, 12, 14, 24]
+static COPY_OFFSET: [24]u32 = [2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 14, 18, 22, 30, 38, 54, 70, 102, 134, 198, 326, 582, 1094, 2118]
+static COPY_BITS: [24]u8 = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 7, 8, 9, 10, 24]
+// Insert and copy length code bases per 64-symbol cell of the
+// insert-and-copy alphabet (cells 0 and 1 reuse the last distance).
+static CELL_INSERT: [11]u32 = [0, 0, 0, 0, 8, 8, 0, 16, 8, 16, 16]
+static CELL_COPY: [11]u32 = [0, 8, 0, 8, 0, 8, 16, 0, 16, 8, 16]
+// Static dictionary words per length: 1 << NDBITS words of that length
+// start at DOFFSET.
+static NDBITS: [25]u8 = [0, 0, 0, 0, 10, 10, 11, 11, 10, 10, 10, 10, 10, 9, 9, 8, 7, 7, 8, 7, 7, 6, 6, 5, 5]
+static DOFFSET: [25]u32 = [0, 0, 0, 0, 0, 4096, 9216, 21504, 35840, 44032, 53248, 63488, 74752, 87040, 93696, 100864, 104704, 106752, 108928, 113536, 115968, 118528, 119872, 121280, 122016]
+
+fn error_code(e: Error) -> u32 {
+    match e {
+        Error.Truncated => {
+            return 0
+        }
+        Error.InvalidData => {
+            return 1
+        }
+        Error.OutputFull => {
+            return 2
+        }
+        Error.WindowTooSmall => {
+            return 3
+        }
+        Error.WorkspaceTooSmall => {
+            return 4
+        }
+        Error.Unsupported => {
+            return 5
+        }
+    }
+}
+
+fn error_from(code: u32) -> Error {
+    if code == 0 {
+        return Error.Truncated
+    }
+    if code == 2 {
+        return Error.OutputFull
+    }
+    if code == 3 {
+        return Error.WindowTooSmall
+    }
+    if code == 4 {
+        return Error.WorkspaceTooSmall
+    }
+    if code == 5 {
+        return Error.Unsupported
+    }
+    return Error.InvalidData
+}
+
+fn min(a: usize, b: usize) -> usize {
+    if a < b {
+        return a
+    }
+    return b
+}
+
+// The low n bits of x in reverse order.
+fn reverse(x: u32, n: u32) -> u32 {
+    r := 0u32
+    v := x
+    for i in 0u32..n {
+        r = (r << 1) | (v & 1)
+        v = v >> 1
+    }
+    return r
+}
+
+// Bits needed to write any value below `alphabet`.
+fn alphabet_bits(alphabet: usize) -> u32 {
+    n := 0u32
+    v := alphabet - 1
+    for v != 0 {
+        n += 1
+        v = v >> 1
+    }
+    return n
+}
+
+// Builds the lookup table of the canonical prefix code with `lengths` (one
+// per symbol of `alphabet`) at ws[at..], returning the packed tree and
+// setting `end` past the table. Codes must be complete, or have exactly one
+// symbol, which then reads zero bits.
+fn build_table(ws: &mut[u16], at: usize, lengths: &[u8], alphabet: usize, end: &mut usize) -> u32!Error {
+    limit := min(ws.len, 1usize << 28)
+    counts := [0u32; 16]
+    last := 0usize
+    for s in 0usize..alphabet {
+        l := lengths[s] as usize
+        counts[l] += 1
+        if l != 0 {
+            last = s
+        }
+    }
+    used := alphabet - counts[0] as usize
+    if used == 0 {
+        return err(Error.InvalidData)
+    }
+    if used == 1 {
+        if at >= limit {
+            return err(Error.WorkspaceTooSmall)
+        }
+        ws[at] = last as u16
+        *end = at + 1
+        return ok(at as u32)
+    }
+    maxlen := 15u32
+    for counts[maxlen as usize] == 0 {
+        maxlen -= 1
+    }
+    root := maxlen
+    if root > ROOT_BITS {
+        root = ROOT_BITS
+    }
+    rsize := 1usize << (root as usize)
+    if rsize > limit || at > limit - rsize {
+        return err(Error.WorkspaceTooSmall)
+    }
+    offsets := [0u32; 16]
+    for l in 1usize..15 {
+        offsets[l + 1] = offsets[l] + counts[l]
+    }
+    sorted := [0u16; 704]
+    for s in 0usize..alphabet {
+        l := lengths[s] as usize
+        if l != 0 {
+            sorted[offsets[l] as usize] = s as u16
+            offsets[l] += 1
+        }
+    }
+    left := [0u32; 16]
+    for l in 0usize..16 {
+        left[l] = counts[l]
+    }
+    code := 0u32
+    index := 0usize
+    next := at + rsize
+    current := 0xffffffffu32
+    sub_at := 0usize
+    sub_size := 0usize
+    for len in 1u32..maxlen + 1 {
+        for k in 0u32..counts[len as usize] {
+            symbol := sorted[index] as u32
+            index += 1
+            if len <= root {
+                j := reverse(code, len) as usize
+                step := 1usize << (len as usize)
+                entry := ((len << 12) | symbol) as u16
+                for j < rsize {
+                    ws[at + j] = entry
+                    j += step
+                }
+            } else {
+                key := reverse(code >> (len - root), root)
+                if key != current {
+                    // A new second-level table, as large as the remaining
+                    // codes with this root prefix need (zlib's method).
+                    bits := len - root
+                    room := 1i64 << (bits as i64)
+                    for bits + root < maxlen {
+                        room -= left[(bits + root) as usize] as i64
+                        if room <= 0 {
+                            break
+                        }
+                        bits += 1
+                        room = room << 1
+                    }
+                    size := 1usize << (bits as usize)
+                    if size > limit || next > limit - size {
+                        return err(Error.WorkspaceTooSmall)
+                    }
+                    if next - at > 4095 {
+                        return err(Error.InvalidData)
+                    }
+                    ws[at + key as usize] = ((((root + bits) << 12) as usize) | (next - at)) as u16
+                    sub_at = next
+                    sub_size = size
+                    next += size
+                    current = key
+                }
+                j := (reverse(code, len) >> root) as usize
+                step := 1usize << ((len - root) as usize)
+                entry := (((len - root) << 12) | symbol) as u16
+                for j < sub_size {
+                    ws[sub_at + j] = entry
+                    j += step
+                }
+            }
+            left[len as usize] -= 1
+            code += 1
+        }
+        code = code << 1
+    }
+    *end = next
+    return ok((at as u32) | (root << 28))
+}
+
+// RFC 7932 section 8: change the case of the byte (sequence) at i, within
+// the word ending at `end`; returns the bytes stepped over.
+fn ferment(w: &mut[u8], i: usize, end: usize) -> usize {
+    c := w[i]
+    if c < 192 {
+        if c >= 97 && c <= 122 {
+            w[i] = c ^ 32
+        }
+        return 1
+    }
+    if c < 224 {
+        if i + 1 < end {
+            w[i + 1] = w[i + 1] ^ 32
+        }
+        return 2
+    }
+    if i + 2 < end {
+        w[i + 2] = w[i + 2] ^ 5
+    }
+    return 3
+}
+
+// Writes transform t of `word` to dst (at least 38 bytes) and returns its
+// length.
+fn transform(dst: &mut[u8], word: &[u8], t: usize) -> usize {
+    prefix := TRANSFORMS[3 * t] as usize
+    kind := TRANSFORMS[3 * t + 1] as usize
+    suffix := TRANSFORMS[3 * t + 2] as usize
+    n := 0usize
+    plen := AFFIXES[prefix] as usize
+    for i in 0usize..plen {
+        dst[n] = AFFIXES[prefix + 1 + i]
+        n += 1
+    }
+    first := 0usize
+    stop := word.len
+    if kind >= 3 && kind <= 11 {
+        first = min(kind - 2, word.len)
+    } else if kind >= 12 {
+        stop = word.len - min(kind - 11, word.len)
+    }
+    body := n
+    for i in first..stop {
+        dst[n] = word[i]
+        n += 1
+    }
+    if kind == 1 && n > body {
+        ferment(dst, body, n)
+    } else if kind == 2 {
+        i := body
+        for i < n {
+            i += ferment(dst, i, n)
+        }
+    }
+    slen := AFFIXES[suffix] as usize
+    for i in 0usize..slen {
+        dst[n] = AFFIXES[suffix + 1 + i]
+        n += 1
+    }
+    return n
+}
+
+@inline
+fn literal_context(mode: u32, p1: u32, p2: u32) -> usize {
+    if mode == 2 {
+        return (LUT0[p1 as usize] | LUT1[p2 as usize]) as usize
+    }
+    if mode == 0 {
+        return (p1 & 63) as usize
+    }
+    if mode == 1 {
+        return (p1 >> 2) as usize
+    }
+    return ((LUT2[p1 as usize] << 3) | LUT2[p2 as usize]) as usize
+}
+
+// Streaming Brotli decoder over a complete input. The caller's window is a
+// ring buffer of at least window_len(input) bytes (any length works when the
+// decompressed data fits); read() fills output buffers of any size. The
+// workspace holds the per-meta-block tables (see WORKSPACE_LEN). Errors are
+// final.
+pub struct Decoder {
+    input: &[u8]
+    window: &mut[u8]
+    ws: &mut[u16]
+    linear: bool
+    next: usize
+    acc: u64
+    nbits: u32
+    pad: usize
+    wbits: u32
+    max_backward: usize
+    pos: usize
+    wpos: usize
+    delivered: usize
+    p1: u32
+    p2: u32
+    rb: [4]usize
+    rb_idx: usize
+    phase: u32
+    failure: u32
+    last: bool
+    remaining: usize
+    top: usize
+    ntypes: [3]u32
+    btype: [3]u32
+    bprev: [3]u32
+    bcount: [3]u32
+    type_tree: [3]u32
+    count_tree: [3]u32
+    npostfix: u32
+    ndirect: u32
+    modes_at: usize
+    lit_map_at: usize
+    dist_map_at: usize
+    lit_trees_at: usize
+    cmd_trees_at: usize
+    dist_trees_at: usize
+    lit_slice: usize
+    mode: u32
+    cmd_tree: u32
+    dist_slice: usize
+    insert_left: usize
+    copy_len: usize
+    copy_left: usize
+    distance: usize
+    implicit: bool
+    word: [40]u8
+    word_at: usize
+    word_end: usize
+    // Measuring: tables are sized but not kept (see measure_stream).
+    measure: bool
+    // The most workspace words any meta-block header has used so far.
+    needed: usize
+
+    // Reads the stream header; fails with Unsupported for large-window
+    // streams.
+    pub fn new(input: &[u8], window: &mut[u8], workspace: &mut[u16]) -> Decoder!Error from(input, window, workspace) {
+        return Decoder.start(input, window, workspace, false)
+    }
+    fn start(input: &[u8], window: &mut[u8], workspace: &mut[u16], linear: bool) -> Decoder!Error from(input, window, workspace) {
+        d := Decoder { input: input, window: window, ws: workspace, linear: linear, next: 0, acc: 0, nbits: 0, pad: 0, wbits: 16, max_backward: 0, pos: 0, wpos: 0, delivered: 0, p1: 0, p2: 0, rb: [16usize, 15, 11, 4], rb_idx: 4, phase: PHASE_HEADER, failure: 0, last: false, remaining: 0, top: 0, ntypes: [1u32, 1, 1], btype: [0u32, 0, 0], bprev: [1u32, 1, 1], bcount: [0u32, 0, 0], type_tree: [0u32, 0, 0], count_tree: [0u32, 0, 0], npostfix: 0, ndirect: 0, modes_at: 0, lit_map_at: 0, dist_map_at: 0, lit_trees_at: 0, cmd_trees_at: 0, dist_trees_at: 0, lit_slice: 0, mode: 0, cmd_tree: 0, dist_slice: 0, insert_left: 0, copy_len: 0, copy_left: 0, distance: 0, implicit: false, word: [0u8; 40], word_at: 0, word_end: 0, measure: false, needed: 0 }
+        d.read_window_bits()?
+        return ok(d)
+    }
+
+    // True once the whole stream has been decoded and read.
+    pub fn is_done(&self) -> bool {
+        return self.phase == PHASE_DONE && self.delivered == self.pos
+    }
+    // Compressed bytes the stream occupies; meaningful once decoding has
+    // finished.
+    pub fn input_consumed(&self) -> usize {
+        held := (self.nbits / 8) as usize
+        if self.pad >= held {
+            return self.next
+        }
+        return self.next - (held - self.pad)
+    }
+    // Decompressed bytes produced so far.
+    pub fn produced(&self) -> usize {
+        return self.pos
+    }
+    // Workspace words the meta-blocks read so far need: the largest of
+    // their table sets, so a workspace of this length decodes them all.
+    // After a WorkspaceTooSmall error it includes the meta-block that did
+    // not fit (exact when the workspace has MEASURE_LEN words or more).
+    pub fn workspace_needed(&self) -> usize {
+        return self.needed
+    }
+
+    // Copies the next decompressed bytes to output and returns their count;
+    // 0 for a non-empty output means the stream has ended.
+    pub fn read(&mut self, output: &mut[u8]) -> usize!Error {
+        if self.phase == PHASE_FAILED {
+            return err(error_from(self.failure))
+        }
+        written := 0usize
+        for written < output.len {
+            pending := self.pos - self.delivered
+            if pending > 0 {
+                n := min(pending, output.len - written)
+                at := 0usize
+                if self.wpos >= pending {
+                    at = self.wpos - pending
+                } else {
+                    at = self.wpos + self.window.len - pending
+                }
+                for k in 0usize..n {
+                    output[written + k] = self.window[at]
+                    at += 1
+                    if at == self.window.len {
+                        at = 0
+                    }
+                }
+                self.delivered += n
+                written += n
+                continue
+            }
+            if self.phase == PHASE_DONE {
+                break
+            }
+            self.step()?
+        }
+        return ok(written)
+    }
+
+    fn skip_to_end(&mut self) -> usize!Error {
+        for {
+            self.delivered = self.pos
+            if self.phase == PHASE_DONE {
+                return ok(self.pos)
+            }
+            self.step()?
+        }
+    }
+
+    // Runs the state machine until the stream ends or the ring is full.
+    fn step(&mut self) -> void!Error {
+        if self.phase == PHASE_FAILED {
+            return err(error_from(self.failure))
+        }
+        match self.advance() {
+            ok() => {
+                return ok()
+            }
+            err(e) => {
+                self.phase = PHASE_FAILED
+                self.failure = error_code(e)
+                return err(error_from(self.failure))
+            }
+        }
+    }
+
+    fn advance(&mut self) -> void!Error {
+        for {
+            phase := self.phase
+            if phase == PHASE_COMMAND {
+                if self.remaining == 0 {
+                    self.end_meta_block()?
+                } else {
+                    self.read_command()?
+                }
+            } else if phase == PHASE_INSERT {
+                self.literals()?
+                if self.insert_left > 0 {
+                    return ok()
+                }
+                if self.remaining == 0 {
+                    self.end_meta_block()?
+                } else {
+                    self.read_distance()?
+                }
+            } else if phase == PHASE_COPY {
+                self.copy()?
+                if self.copy_left > 0 {
+                    return ok()
+                }
+                self.phase = PHASE_COMMAND
+            } else if phase == PHASE_WORD {
+                self.emit_word()?
+                if self.word_at < self.word_end {
+                    return ok()
+                }
+                self.phase = PHASE_COMMAND
+            } else if phase == PHASE_HEADER {
+                self.read_header()?
+            } else if phase == PHASE_RAW {
+                self.raw()?
+                if self.remaining > 0 {
+                    return ok()
+                }
+                self.end_meta_block()?
+            } else {
+                return ok()
+            }
+        }
+    }
+
+    // ---- Bits
+
+    fn refill(&mut self) {
+        for self.nbits <= 56 {
+            if self.next < self.input.len {
+                self.acc = self.acc | ((self.input[self.next] as u64) << (self.nbits as u64))
+                self.next += 1
+            } else {
+                self.pad += 1
+            }
+            self.nbits += 8
+        }
+    }
+    @inline
+    fn bits(&mut self, n: u32) -> u32 {
+        if self.nbits < n {
+            self.refill()
+        }
+        v := (self.acc & ((1u64 << (n as u64)) - 1)) as u32
+        self.acc = self.acc >> (n as u64)
+        self.nbits -= n
+        return v
+    }
+    // True when bits past the end of the input have been consumed.
+    fn overrun(&self) -> bool {
+        return self.pad * 8 > self.nbits as usize
+    }
+    fn check_input(&self) -> void!Error {
+        if self.pad * 8 > self.nbits as usize {
+            return err(Error.Truncated)
+        }
+        return ok()
+    }
+    // Skips to the next byte boundary; the skipped bits must be zero.
+    fn align(&mut self) -> void!Error {
+        self.check_input()?
+        k := self.nbits & 7
+        if self.bits(k) != 0 {
+            return err(Error.InvalidData)
+        }
+        return ok()
+    }
+    // Returns whole buffered bytes to the input, after align().
+    fn unload(&mut self) {
+        held := (self.nbits / 8) as usize
+        self.next -= held - self.pad
+        self.acc = 0
+        self.nbits = 0
+        self.pad = 0
+    }
+    @inline
+    fn symbol(&mut self, tree: u32) -> u32 {
+        if self.nbits < 15 {
+            self.refill()
+        }
+        root := tree >> 28
+        base := (tree & 0x0fffffff) as usize
+        low := (self.acc & ((1u64 << (root as u64)) - 1)) as usize
+        e := self.ws[base + low] as u32
+        n := e >> 12
+        if n <= root {
+            self.acc = self.acc >> (n as u64)
+            self.nbits -= n
+            return e & 0xfff
+        }
+        sub := ((self.acc >> (root as u64)) & ((1u64 << ((n - root) as u64)) - 1)) as usize
+        e2 := self.ws[base + (e & 0xfff) as usize + sub] as u32
+        used := root + (e2 >> 12)
+        self.acc = self.acc >> (used as u64)
+        self.nbits -= used
+        return e2 & 0xfff
+    }
+    fn tree_at(&self, directory: usize, index: usize) -> u32 {
+        return (self.ws[directory + 2 * index] as u32) | ((self.ws[directory + 2 * index + 1] as u32) << 16)
+    }
+    fn set_tree(&mut self, directory: usize, index: usize, tree: u32) {
+        if self.measure {
+            return
+        }
+        self.ws[directory + 2 * index] = (tree & 0xffff) as u16
+        self.ws[directory + 2 * index + 1] = (tree >> 16) as u16
+    }
+
+    // ---- Headers
+
+    fn read_window_bits(&mut self) -> void!Error {
+        if self.bits(1) == 0 {
+            self.wbits = 16
+        } else {
+            n := self.bits(3)
+            if n != 0 {
+                self.wbits = 17 + n
+            } else {
+                m := self.bits(3)
+                if m == 1 {
+                    self.check_input()?
+                    return err(Error.Unsupported)
+                }
+                if m != 0 {
+                    self.wbits = 8 + m
+                } else {
+                    self.wbits = 17
+                }
+            }
+        }
+        self.check_input()?
+        self.max_backward = (1usize << (self.wbits as usize)) - 16
+        return ok()
+    }
+
+    // window_len(): the first meta-block's length when it is the last one.
+    fn first_window(&mut self) -> usize!Error {
+        full := 1usize << (self.wbits as usize)
+        last := self.bits(1) == 1
+        if last && self.bits(1) == 1 {
+            self.check_input()?
+            return ok(0)
+        }
+        nibbles := self.bits(2)
+        if nibbles == 3 || !last {
+            self.check_input()?
+            return ok(full)
+        }
+        length := 0usize
+        for i in 0u32..nibbles + 4 {
+            length = length | ((self.bits(4) as usize) << (4 * i as usize))
+        }
+        self.check_input()?
+        return ok(min(length + 1, full))
+    }
+
+    fn read_var_u8(&mut self) -> u32 {
+        if self.bits(1) == 0 {
+            return 0
+        }
+        n := self.bits(3)
+        if n == 0 {
+            return 1
+        }
+        extra := self.bits(n)
+        return (1u32 << n) + extra
+    }
+
+    fn read_header(&mut self) -> void!Error {
+        is_last := self.bits(1) == 1
+        self.last = is_last
+        if self.last && self.bits(1) == 1 {
+            return self.finish()
+        }
+        nibbles := self.bits(2)
+        if nibbles == 3 {
+            if self.bits(1) != 0 {
+                return err(Error.InvalidData)
+            }
+            count := self.bits(2)
+            skip := 0usize
+            for i in 0u32..count {
+                b := self.bits(8)
+                if i + 1 == count && count > 1 && b == 0 {
+                    return err(Error.InvalidData)
+                }
+                skip = skip | ((b as usize) << (8 * i as usize))
+            }
+            if count > 0 {
+                skip += 1
+            }
+            self.align()?
+            self.unload()
+            if self.input.len - self.next < skip {
+                return err(Error.Truncated)
+            }
+            self.next += skip
+            return self.end_meta_block()
+        }
+        length := 0usize
+        n := nibbles + 4
+        for i in 0u32..n {
+            v := self.bits(4)
+            if i + 1 == n && n > 4 && v == 0 {
+                return err(Error.InvalidData)
+            }
+            length = length | ((v as usize) << (4 * i as usize))
+        }
+        self.remaining = length + 1
+        uncompressed := false
+        if !self.last {
+            uncompressed = self.bits(1) == 1
+        }
+        if uncompressed {
+            self.align()?
+            self.unload()
+            self.phase = PHASE_RAW
+            return ok()
+        }
+        self.check_input()?
+        next := self.next
+        acc := self.acc
+        nbits := self.nbits
+        pad := self.pad
+        match self.read_compressed_header() {
+            ok() => {}
+            err(e) => {
+                if e != Error.WorkspaceTooSmall || self.measure {
+                    return err(e)
+                }
+                // Size the tables that did not fit by reading the header
+                // again without keeping them.
+                self.next = next
+                self.acc = acc
+                self.nbits = nbits
+                self.pad = pad
+                self.measure = true
+                sized := self.read_compressed_header()
+                self.measure = false
+                sized?
+                return err(Error.WorkspaceTooSmall)
+            }
+        }
+        self.phase = PHASE_COMMAND
+        return ok()
+    }
+
+    // workspace_size(): runs through the stream without producing output,
+    // building each meta-block's tables in the (stack) workspace and noting
+    // their size. Metadata and uncompressed meta-blocks are skipped; the
+    // commands of a compressed meta-block that is not the last are read
+    // only when its literal trees do not depend on earlier bytes (which
+    // would need the window), its tables fit, and the symbol budget (eight
+    // per input byte plus 65536) lasts. Otherwise WORKSPACE_LEN, which is
+    // always enough.
+    fn measure_stream(&mut self) -> usize!Error {
+        budget := 8 * self.input.len + 65536
+        for {
+            phase := self.phase
+            if phase == PHASE_DONE {
+                return ok(self.needed)
+            }
+            if phase == PHASE_RAW {
+                if self.input.len - self.next < self.remaining {
+                    return err(Error.Truncated)
+                }
+                self.next += self.remaining
+                self.pos += self.remaining
+                self.remaining = 0
+                self.end_meta_block()?
+            } else if phase == PHASE_COMMAND {
+                if self.last {
+                    return ok(self.needed)
+                }
+                skipped := self.skip_commands(&mut budget)?
+                if !skipped {
+                    return ok(WORKSPACE_LEN)
+                }
+                self.end_meta_block()?
+            } else {
+                match self.read_header() {
+                    ok() => {}
+                    err(e) => {
+                        if e != Error.WorkspaceTooSmall {
+                            return err(e)
+                        }
+                        if self.last {
+                            return ok(self.needed)
+                        }
+                        return ok(WORKSPACE_LEN)
+                    }
+                }
+            }
+        }
+    }
+
+    // Reads a compressed meta-block's commands, counting the bytes they
+    // produce, for measure_stream(). False when a block type's literal
+    // context map row names more than one tree or the budget runs out.
+    fn skip_commands(&mut self, budget: &mut usize) -> bool!Error {
+        literal_types := self.ntypes[0] as usize
+        for t in 0usize..literal_types {
+            row := self.lit_map_at + 64 * t
+            first := self.ws[row]
+            for j in 1usize..64 {
+                if self.ws[row + j] != first {
+                    return ok(false)
+                }
+            }
+        }
+        for self.remaining > 0 {
+            if *budget == 0 {
+                return ok(false)
+            }
+            *budget -= 1
+            self.read_command()?
+            for self.insert_left > 0 {
+                if self.bcount[0] == 0 {
+                    self.block_switch(0)?
+                }
+                index := self.ws[self.lit_slice] as usize
+                tree := self.tree_at(self.lit_trees_at, index)
+                n := min(self.insert_left, self.bcount[0] as usize)
+                // A one-symbol tree reads no bits.
+                if (tree >> 28) != 0 {
+                    if *budget < n {
+                        return ok(false)
+                    }
+                    *budget -= n
+                    for k in 0usize..n {
+                        self.symbol(tree)
+                    }
+                }
+                self.bcount[0] -= n as u32
+                self.pos += n
+                self.insert_left -= n
+                self.check_input()?
+            }
+            if self.remaining == 0 {
+                break
+            }
+            self.read_distance()?
+            if self.phase == PHASE_COPY {
+                self.pos += self.copy_len
+            } else {
+                self.pos += self.word_end
+            }
+        }
+        return ok(true)
+    }
+
+    fn end_meta_block(&mut self) -> void!Error {
+        if self.last {
+            return self.finish()
+        }
+        self.phase = PHASE_HEADER
+        return ok()
+    }
+
+    fn finish(&mut self) -> void!Error {
+        self.align()?
+        self.phase = PHASE_DONE
+        return ok()
+    }
+
+    // Reserves n words at the top of the workspace. When measuring only the
+    // count is kept and nothing may be written there.
+    fn alloc(&mut self, n: usize) -> usize!Error {
+        if !self.measure && (n > self.ws.len || self.top > self.ws.len - n) {
+            return err(Error.WorkspaceTooSmall)
+        }
+        at := self.top
+        self.top += n
+        self.note_top()
+        return ok(at)
+    }
+    fn note_top(&mut self) {
+        if self.top > self.needed {
+            self.needed = self.top
+        }
+    }
+
+    fn read_compressed_header(&mut self) -> void!Error {
+        self.top = 0
+        for c in 0usize..3 {
+            types := self.read_var_u8() + 1
+            self.ntypes[c] = types
+            self.btype[c] = 0
+            self.bprev[c] = 1
+            self.bcount[c] = 1u32 << 24
+            if types >= 2 {
+                t := self.read_prefix_code((types + 2) as usize)?
+                self.type_tree[c] = t
+                l := self.read_prefix_code(26)?
+                self.count_tree[c] = l
+                first := self.read_block_count(c)
+                self.bcount[c] = first
+            }
+            self.check_input()?
+        }
+        v := self.bits(6)
+        self.npostfix = v & 3
+        self.ndirect = (v >> 2) << self.npostfix
+        literal_types := self.ntypes[0] as usize
+        modes_at := self.alloc(literal_types)?
+        self.modes_at = modes_at
+        for i in 0usize..literal_types {
+            m := self.bits(2)
+            if !self.measure {
+                self.ws[modes_at + i] = m as u16
+            }
+        }
+        literal_trees := (self.read_var_u8() + 1) as usize
+        lit_map_at := self.alloc(64 * literal_types)?
+        self.lit_map_at = lit_map_at
+        self.read_context_map(lit_map_at, 64 * literal_types, literal_trees)?
+        distance_types := self.ntypes[2] as usize
+        distance_trees := (self.read_var_u8() + 1) as usize
+        dist_map_at := self.alloc(4 * distance_types)?
+        self.dist_map_at = dist_map_at
+        self.read_context_map(dist_map_at, 4 * distance_types, distance_trees)?
+        command_trees := self.ntypes[1] as usize
+        lit_trees_at := self.alloc(2 * literal_trees)?
+        cmd_trees_at := self.alloc(2 * command_trees)?
+        dist_trees_at := self.alloc(2 * distance_trees)?
+        self.lit_trees_at = lit_trees_at
+        self.cmd_trees_at = cmd_trees_at
+        self.dist_trees_at = dist_trees_at
+        for i in 0usize..literal_trees {
+            t := self.read_prefix_code(256)?
+            self.set_tree(lit_trees_at, i, t)
+        }
+        for i in 0usize..command_trees {
+            t := self.read_prefix_code(MAX_ALPHABET)?
+            self.set_tree(cmd_trees_at, i, t)
+        }
+        alphabet := 16 + self.ndirect as usize + (48usize << (self.npostfix as usize))
+        for i in 0usize..distance_trees {
+            t := self.read_prefix_code(alphabet)?
+            self.set_tree(dist_trees_at, i, t)
+        }
+        self.check_input()?
+        if self.measure {
+            return ok()
+        }
+        self.prepare_literal()
+        command_tree := self.tree_at(cmd_trees_at, 0)
+        self.cmd_tree = command_tree
+        self.dist_slice = dist_map_at
+        return ok()
+    }
+
+    fn read_block_count(&mut self, c: usize) -> u32 {
+        tree := self.count_tree[c]
+        code := self.symbol(tree) as usize
+        extra := self.bits(BLOCK_LEN_BITS[code] as u32)
+        return BLOCK_LEN_OFFSET[code] + extra
+    }
+
+    // Reads a prefix code over `alphabet` symbols and builds its table at
+    // the top of the workspace.
+    fn read_prefix_code(&mut self, alphabet: usize) -> u32!Error {
+        lengths := [0u8; 704]
+        kind := self.bits(2)
+        if kind == 1 {
+            count := (self.bits(2) + 1) as usize
+            width := alphabet_bits(alphabet)
+            symbols := [0usize; 4]
+            for i in 0usize..count {
+                s := self.bits(width) as usize
+                if s >= alphabet {
+                    return err(Error.InvalidData)
+                }
+                for j in 0usize..i {
+                    if symbols[j] == s {
+                        return err(Error.InvalidData)
+                    }
+                }
+                symbols[i] = s
+            }
+            if count == 1 {
+                lengths[symbols[0]] = 1
+            } else if count == 2 {
+                lengths[symbols[0]] = 1
+                lengths[symbols[1]] = 1
+            } else if count == 3 {
+                lengths[symbols[0]] = 1
+                lengths[symbols[1]] = 2
+                lengths[symbols[2]] = 2
+            } else if self.bits(1) == 0 {
+                for i in 0usize..4 {
+                    lengths[symbols[i]] = 2
+                }
+            } else {
+                lengths[symbols[0]] = 1
+                lengths[symbols[1]] = 2
+                lengths[symbols[2]] = 3
+                lengths[symbols[3]] = 3
+            }
+            self.check_input()?
+            return self.build(&lengths, alphabet)
+        }
+        // Complex code: first the code length code lengths.
+        code_lengths := [0u8; 18]
+        space := 32i32
+        codes := 0usize
+        for i in (kind as usize)..18 {
+            if self.nbits < 4 {
+                self.refill()
+            }
+            p := (self.acc & 15) as usize
+            v := CL_PREFIX_VALUE[p]
+            drop := CL_PREFIX_LEN[p] as u32
+            self.acc = self.acc >> (drop as u64)
+            self.nbits -= drop
+            code_lengths[CODE_LENGTH_ORDER[i] as usize] = v
+            if v != 0 {
+                space -= 32i32 >> (v as i32)
+                codes += 1
+                if space <= 0 {
+                    break
+                }
+            }
+        }
+        if codes != 1 && space != 0 {
+            return err(Error.InvalidData)
+        }
+        self.check_input()?
+        saved := self.top
+        length_tree := self.build(&code_lengths, 18)?
+        symbol := 0usize
+        previous := 8u32
+        repeat := 0usize
+        repeat_length := 0u32
+        space = 32768
+        for symbol < alphabet && space > 0 {
+            if self.overrun() {
+                return err(Error.Truncated)
+            }
+            len := self.symbol(length_tree)
+            if len < 16 {
+                repeat = 0
+                if len != 0 {
+                    lengths[symbol] = len as u8
+                    previous = len
+                    space -= 32768i32 >> (len as i32)
+                }
+                symbol += 1
+            } else {
+                extra := 3u32
+                fresh := 0u32
+                if len == 16 {
+                    extra = 2
+                    fresh = previous
+                }
+                delta := self.bits(extra) as usize
+                if repeat_length != fresh {
+                    repeat = 0
+                    repeat_length = fresh
+                }
+                old := repeat
+                if repeat > 0 {
+                    repeat = (repeat - 2) << (extra as usize)
+                }
+                repeat += delta + 3
+                count := repeat - old
+                if count > alphabet - symbol {
+                    return err(Error.InvalidData)
+                }
+                if fresh != 0 {
+                    for k in 0usize..count {
+                        lengths[symbol + k] = fresh as u8
+                    }
+                    space -= (count << (15 - fresh as usize)) as i32
+                }
+                symbol += count
+            }
+        }
+        if space != 0 {
+            return err(Error.InvalidData)
+        }
+        self.check_input()?
+        self.top = saved
+        return self.build(&lengths, alphabet)
+    }
+
+    // Builds a table at the top of the workspace. When measuring, every
+    // table is built at the start of the workspace instead (the header
+    // reads count, code length and context map codes, and needs nothing
+    // else) while `top` advances by its size.
+    fn build(&mut self, lengths: &[u8], alphabet: usize) -> u32!Error {
+        end := 0usize
+        if self.measure {
+            tree := build_table(self.ws, 0, lengths, alphabet, &mut end)?
+            self.top += end
+            self.note_top()
+            return ok(tree)
+        }
+        at := self.top
+        tree := build_table(self.ws, at, lengths, alphabet, &mut end)?
+        self.top = end
+        self.note_top()
+        return ok(tree)
+    }
+
+    fn read_context_map(&mut self, at: usize, size: usize, trees: usize) -> void!Error {
+        if trees < 2 {
+            if self.measure {
+                return ok()
+            }
+            for i in 0usize..size {
+                self.ws[at + i] = 0
+            }
+            return ok()
+        }
+        rle := 0u32
+        if self.bits(1) == 1 {
+            rle = self.bits(4) + 1
+        }
+        saved := self.top
+        tree := self.read_prefix_code(trees + rle as usize)?
+        i := 0usize
+        for i < size {
+            if self.overrun() {
+                return err(Error.Truncated)
+            }
+            code := self.symbol(tree)
+            if code == 0 {
+                if !self.measure {
+                    self.ws[at + i] = 0
+                }
+                i += 1
+            } else if code > rle {
+                if !self.measure {
+                    self.ws[at + i] = (code - rle) as u16
+                }
+                i += 1
+            } else {
+                extra := self.bits(code)
+                reps := ((1u32 << code) + extra) as usize
+                if reps > size - i {
+                    return err(Error.InvalidData)
+                }
+                if !self.measure {
+                    for k in 0usize..reps {
+                        self.ws[at + i + k] = 0
+                    }
+                }
+                i += reps
+            }
+        }
+        if self.bits(1) == 1 && !self.measure {
+            mtf := [0u8; 256]
+            for k in 0usize..256 {
+                mtf[k] = k as u8
+            }
+            for k in 0usize..size {
+                index := self.ws[at + k] as usize
+                value := mtf[index]
+                self.ws[at + k] = value as u16
+                j := index
+                for j > 0 {
+                    mtf[j] = mtf[j - 1]
+                    j -= 1
+                }
+                mtf[0] = value
+            }
+        }
+        self.check_input()?
+        self.top = saved
+        return ok()
+    }
+
+    // ---- Commands
+
+    fn prepare_literal(&mut self) {
+        t := self.btype[0] as usize
+        self.lit_slice = self.lit_map_at + 64 * t
+        self.mode = self.ws[self.modes_at + t] as u32
+    }
+
+    fn block_switch(&mut self, c: usize) -> void!Error {
+        types := self.ntypes[c]
+        if types < 2 {
+            return err(Error.InvalidData)
+        }
+        tree := self.type_tree[c]
+        code := self.symbol(tree)
+        t := 0u32
+        if code == 0 {
+            t = self.bprev[c]
+        } else if code == 1 {
+            t = self.btype[c] + 1
+        } else {
+            t = code - 2
+        }
+        if t >= types {
+            t -= types
+        }
+        self.bprev[c] = self.btype[c]
+        self.btype[c] = t
+        count := self.read_block_count(c)
+        self.bcount[c] = count
+        if c == 0 {
+            self.prepare_literal()
+        } else if c == 1 {
+            command_tree := self.tree_at(self.cmd_trees_at, t as usize)
+            self.cmd_tree = command_tree
+        } else {
+            self.dist_slice = self.dist_map_at + 4 * t as usize
+        }
+        return ok()
+    }
+
+    fn read_command(&mut self) -> void!Error {
+        if self.bcount[1] == 0 {
+            self.block_switch(1)?
+        }
+        self.bcount[1] -= 1
+        tree := self.cmd_tree
+        code := self.symbol(tree)
+        cell := (code >> 6) as usize
+        ic := (CELL_INSERT[cell] + ((code >> 3) & 7)) as usize
+        cc := (CELL_COPY[cell] + (code & 7)) as usize
+        insert_extra := self.bits(INSERT_BITS[ic] as u32)
+        copy_extra := self.bits(COPY_BITS[cc] as u32)
+        self.check_input()?
+        insert := (INSERT_OFFSET[ic] + insert_extra) as usize
+        self.implicit = cell < 2
+        self.copy_len = (COPY_OFFSET[cc] + copy_extra) as usize
+        if insert > self.remaining {
+            return err(Error.InvalidData)
+        }
+        self.remaining -= insert
+        self.insert_left = insert
+        self.phase = PHASE_INSERT
+        return ok()
+    }
+
+    // Contiguous window space for new output. In ring mode 0 means the
+    // ring is full of bytes not read yet.
+    fn room(&mut self) -> usize!Error {
+        if self.wpos == self.window.len {
+            if self.linear {
+                return err(Error.OutputFull)
+            }
+            if self.window.len < self.max_backward {
+                return err(Error.WindowTooSmall)
+            }
+            if self.pos - self.delivered == self.window.len {
+                return ok(0)
+            }
+            self.wpos = 0
+        }
+        contiguous := self.window.len - self.wpos
+        if self.linear {
+            return ok(contiguous)
+        }
+        return ok(min(contiguous, self.window.len - (self.pos - self.delivered)))
+    }
+
+    fn back(&self, k: usize) -> u32 {
+        if self.wpos >= k {
+            return self.window[self.wpos - k] as u32
+        }
+        return self.window[self.wpos + self.window.len - k] as u32
+    }
+
+    // Reloads the last two bytes after a copy.
+    fn refresh_context(&mut self) {
+        if self.pos >= 1 {
+            last := self.back(1)
+            self.p1 = last
+        }
+        if self.pos >= 2 {
+            second := self.back(2)
+            self.p2 = second
+        }
+    }
+
+    fn literals(&mut self) -> void!Error {
+        for self.insert_left > 0 {
+            room := self.room()?
+            if room == 0 {
+                return ok()
+            }
+            n := min(self.insert_left, room)
+            for k in 0usize..n {
+                if self.bcount[0] == 0 {
+                    self.block_switch(0)?
+                }
+                self.bcount[0] -= 1
+                context := literal_context(self.mode, self.p1, self.p2)
+                index := self.ws[self.lit_slice + context] as usize
+                tree := (self.ws[self.lit_trees_at + 2 * index] as u32) | ((self.ws[self.lit_trees_at + 2 * index + 1] as u32) << 16)
+                b := self.symbol(tree)
+                self.window[self.wpos] = b as u8
+                self.wpos += 1
+                self.p2 = self.p1
+                self.p1 = b
+            }
+            self.pos += n
+            self.insert_left -= n
+            self.check_input()?
+        }
+        return ok()
+    }
+
+    fn read_distance(&mut self) -> void!Error {
+        d := 0usize
+        push := true
+        if self.implicit {
+            d = self.rb[(self.rb_idx - 1) & 3]
+            push = false
+        } else {
+            if self.bcount[2] == 0 {
+                self.block_switch(2)?
+            }
+            self.bcount[2] -= 1
+            context := 3usize
+            if self.copy_len < 5 {
+                context = self.copy_len - 2
+            }
+            index := self.ws[self.dist_slice + context] as usize
+            tree := self.tree_at(self.dist_trees_at, index)
+            code := self.symbol(tree) as usize
+            ndirect := self.ndirect as usize
+            if code < 4 {
+                d = self.rb[(self.rb_idx - 1 - code) & 3]
+                push = code != 0
+            } else if code < 16 {
+                base := 0usize
+                delta := 0usize
+                if code < 10 {
+                    base = self.rb[(self.rb_idx - 1) & 3]
+                    delta = code - 4
+                } else {
+                    base = self.rb[(self.rb_idx - 2) & 3]
+                    delta = code - 10
+                }
+                // Deltas -1, +1, -2, +2, -3, +3.
+                step := (delta >> 1) + 1
+                if (delta & 1) == 0 {
+                    if base <= step {
+                        return err(Error.InvalidData)
+                    }
+                    d = base - step
+                } else {
+                    d = base + step
+                }
+            } else if code < 16 + ndirect {
+                d = code - 15
+            } else {
+                postfix := self.npostfix as usize
+                x := code - ndirect - 16
+                ndistbits := 1 + (x >> (postfix + 1))
+                hcode := x >> postfix
+                lcode := x & ((1usize << postfix) - 1)
+                offset := ((2 + (hcode & 1)) << ndistbits) - 4
+                extra := self.bits(ndistbits as u32) as usize
+                d = ((offset + extra) << postfix) + lcode + ndirect + 1
+            }
+            self.check_input()?
+        }
+        max_distance := min(self.pos, self.max_backward)
+        if d > max_distance {
+            return self.dictionary_word(d, max_distance)
+        }
+        if push {
+            self.rb[self.rb_idx & 3] = d
+            self.rb_idx += 1
+        }
+        if self.copy_len > self.remaining {
+            return err(Error.InvalidData)
+        }
+        self.remaining -= self.copy_len
+        self.copy_left = self.copy_len
+        self.distance = d
+        self.phase = PHASE_COPY
+        return ok()
+    }
+
+    fn dictionary_word(&mut self, d: usize, max_distance: usize) -> void!Error {
+        len := self.copy_len
+        if d > MAX_DISTANCE || len < 4 || len > 24 {
+            return err(Error.InvalidData)
+        }
+        address := d - max_distance - 1
+        nbits := NDBITS[len] as usize
+        index := address & ((1usize << nbits) - 1)
+        t := address >> nbits
+        if t > 120 {
+            return err(Error.InvalidData)
+        }
+        start := DOFFSET[len] as usize + index * len
+        n := transform(&mut self.word, &DICTIONARY[start..start + len], t)
+        if n == 0 || n > self.remaining {
+            return err(Error.InvalidData)
+        }
+        self.remaining -= n
+        self.word_at = 0
+        self.word_end = n
+        self.phase = PHASE_WORD
+        return ok()
+    }
+
+    fn copy(&mut self) -> void!Error {
+        for self.copy_left > 0 {
+            room := self.room()?
+            if room == 0 {
+                return ok()
+            }
+            n := min(self.copy_left, room)
+            src := 0usize
+            if self.wpos >= self.distance {
+                src = self.wpos - self.distance
+            } else {
+                src = self.wpos + self.window.len - self.distance
+            }
+            for k in 0usize..n {
+                b := self.window[src]
+                self.window[self.wpos] = b
+                self.wpos += 1
+                src += 1
+                if src == self.window.len {
+                    src = 0
+                }
+            }
+            self.pos += n
+            self.copy_left -= n
+        }
+        self.refresh_context()
+        return ok()
+    }
+
+    fn emit_word(&mut self) -> void!Error {
+        for self.word_at < self.word_end {
+            room := self.room()?
+            if room == 0 {
+                return ok()
+            }
+            n := min(self.word_end - self.word_at, room)
+            for k in 0usize..n {
+                b := self.word[self.word_at + k]
+                self.window[self.wpos] = b
+                self.wpos += 1
+            }
+            self.word_at += n
+            self.pos += n
+        }
+        self.refresh_context()
+        return ok()
+    }
+
+    fn raw(&mut self) -> void!Error {
+        for self.remaining > 0 {
+            room := self.room()?
+            if room == 0 {
+                return ok()
+            }
+            available := self.input.len - self.next
+            if available == 0 {
+                return err(Error.Truncated)
+            }
+            n := min(min(self.remaining, room), available)
+            for k in 0usize..n {
+                b := self.input[self.next + k]
+                self.window[self.wpos] = b
+                self.wpos += 1
+            }
+            self.next += n
+            self.pos += n
+            self.remaining -= n
+        }
+        self.refresh_context()
+        return ok()
+    }
+}
