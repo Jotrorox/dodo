@@ -2386,6 +2386,159 @@ pub fn run(op: u32) -> i32 {
 }
 
 #[test]
+fn dispatch_loops_thread_their_match() {
+    // `threaded` is an unconditional loop ending in a match on a byte: each
+    // arm repeats the loop's statements and dispatches by itself. `plain`
+    // has a loop condition and keeps one switch; both must agree, including
+    // `continue`, `break`, guards and arms after the table.
+    let source = r#"package dispatch_loop
+fn threaded(code: &[u8], start: i32) -> i32 {
+    pc := 0usize
+    acc := start
+    steps := 0i32
+    for {
+        let op = code[pc]
+        pc += 1
+        steps += 1
+        let doubled = acc * 2
+        match op {
+            0 => { return acc * 100 + steps },
+            1 => { acc += 1 },
+            2 => { acc = doubled },
+            3 => { acc -= 1 },
+            4 => {
+                let skip = code[pc] as usize
+                pc += skip
+            },
+            5 => {
+                if acc > 10 {
+                    continue
+                }
+                acc += 10
+            },
+            6 => { break },
+            7 | 8 => { acc += 7 },
+            9..=15 => { acc += op as i32 },
+            x if x == 16 => { acc += 1000 },
+            17 => { acc += 17 },
+            _ => { acc = -1 },
+        }
+    }
+    return acc * 1000 + steps
+}
+fn plain(code: &[u8], start: i32) -> i32 {
+    pc := 0usize
+    acc := start
+    steps := 0i32
+    for true {
+        let op = code[pc]
+        pc += 1
+        steps += 1
+        let doubled = acc * 2
+        match op {
+            0 => { return acc * 100 + steps },
+            1 => { acc += 1 },
+            2 => { acc = doubled },
+            3 => { acc -= 1 },
+            4 => {
+                let skip = code[pc] as usize
+                pc += skip
+            },
+            5 => {
+                if acc > 10 {
+                    continue
+                }
+                acc += 10
+            },
+            6 => { break },
+            7 | 8 => { acc += 7 },
+            9..=15 => { acc += op as i32 },
+            x if x == 16 => { acc += 1000 },
+            17 => { acc += 17 },
+            _ => { acc = -1 },
+        }
+    }
+    return acc * 1000 + steps
+}
+fn check(code: &[u8], start: i32, expected: i32) -> bool {
+    return threaded(code, start) == expected && plain(code, start) == expected
+}
+fn main() -> i32 {
+    let a = [1u8, 1, 2, 0]
+    if !check(&a, 0, 404) { return 1 }
+    let b = [5u8, 5, 3, 0]
+    if !check(&b, 0, 1904) { return 2 }
+    let c = [4u8, 2, 1, 1, 9, 15, 0]
+    if !check(&c, 0, 2505) { return 3 }
+    let d = [16u8, 17, 7, 8, 6]
+    if !check(&d, 0, 1031005) { return 4 }
+    let e = [200u8, 1, 0]
+    if !check(&e, 5, 3) { return 5 }
+    let f = [2u8, 2, 2, 3, 0]
+    if !check(&f, 1, 705) { return 6 }
+    let g = [2u8, 2, 2, 2, 5, 1, 0]
+    if !check(&g, 1, 1707) { return 7 }
+    return 42
+}
+"#;
+    native_at_all_levels(source, 42, "");
+    let ir = emit_ir(source, 0);
+    let function = |name: &str| {
+        ir.split("\ndefine ")
+            .find(|f| f.contains(&format!("@dodo.dispatch_loop.{name}(")))
+            .unwrap_or_else(|| panic!("{name} is defined"))
+            .split("\n}\n")
+            .next()
+            .unwrap()
+            .to_string()
+    };
+    // The first dispatch, plus one per arm that falls through.
+    assert_eq!(function("threaded").matches("indirectbr").count(), 8);
+    assert!(!function("plain").contains("indirectbr"));
+}
+
+#[test]
+fn dispatch_loops_keep_a_switch_when_names_would_change_meaning() {
+    // Running `let acc = ...` again inside the arms would read the inner
+    // binding instead of the outer `acc`, so the loop keeps one switch.
+    let ir = emit_ir(
+        r#"package shadowing
+pub fn run(code: &[u8]) -> i32 {
+    acc := 0i32
+    pc := 0usize
+    for {
+        let acc = acc + 1
+        let op = code[pc]
+        pc += 1
+        match op {
+            0 => { return acc },
+            1 => { pc += 1 },
+            2 => { pc += 2 },
+            3 => { pc += 3 },
+            4 => { pc += 4 },
+            5 => { pc += 5 },
+            6 => { pc += 6 },
+            7 => { pc += 7 },
+            8 => { pc += 8 },
+            9 => { pc += 9 },
+            10 => { pc += 10 },
+            11 => { pc += 11 },
+            12 => { pc += 12 },
+            13 => { pc += 13 },
+            14 => { pc += 14 },
+            15 => { pc += 15 },
+            _ => { pc += 16 },
+        }
+    }
+}
+"#,
+        0,
+    );
+    assert!(!ir.contains("indirectbr"), "{ir}");
+    assert!(ir.contains("switch i8"), "{ir}");
+}
+
+#[test]
 fn inlining_attributes_reach_llvm() {
     let source = r#"package inlining
 @inline

@@ -19,6 +19,9 @@ const MIN_SWITCH_CASES: usize = 3;
 /// Integer range patterns spanning fewer values than this are expanded into
 /// switch cases; a wider range ends the switched prefix of a match.
 const MAX_SWITCH_RANGE: i128 = 256;
+/// An interpreter-style dispatch loop needs this many cases for its match to
+/// branch through a table of block addresses (see `threaded_dispatch`).
+const MIN_DISPATCH_CASES: usize = 16;
 
 mod c_abi;
 mod closures;
@@ -242,6 +245,8 @@ pub fn generate<'ctx>(
         globals: HashMap::new(),
         scopes: vec![],
         loops: vec![],
+        dispatch_loop: None,
+        rebind: None,
         yields: vec![],
         function: None,
         return_type: Type::Void,
@@ -347,6 +352,21 @@ struct Binding<'ctx> {
     ptr: Value<'ctx>,
     live: Option<Value<'ctx>>,
 }
+/// An unconditional `for` loop whose body ends with `match value { ... }`.
+struct DispatchLoop {
+    // Identifies the match; never dereferenced.
+    value: *const Expr,
+    // The statements of the body before the match.
+    prefix: Vec<Stmt>,
+    // Index in `scopes` of the loop body's scope.
+    body_scope: usize,
+}
+/// A dispatch loop's match whose arms each end with the next iteration's
+/// statements and their own dispatch (see `threaded_dispatch`).
+struct ThreadedDispatch<'ctx> {
+    prefix: Vec<Stmt>,
+    rebind: HashMap<String, Binding<'ctx>>,
+}
 #[derive(Clone, Copy)]
 struct Loop<'ctx> {
     end: BasicBlock<'ctx>,
@@ -371,6 +391,12 @@ struct Codegen<'a, 'ctx> {
     globals: HashMap<String, (Value<'ctx>, Type)>,
     scopes: Vec<Vec<Binding<'ctx>>>,
     loops: Vec<Loop<'ctx>>,
+    // The innermost unconditional loop whose body ends with a match.
+    dispatch_loop: Option<DispatchLoop>,
+    // While a dispatch loop's statements run again at the end of a match arm:
+    // the scope depth of their top-level `let`s and the loop-body bindings
+    // those store into.
+    rebind: Option<(usize, HashMap<String, Binding<'ctx>>)>,
     yields: Vec<YieldTarget<'ctx>>,
     function: Option<Value<'ctx>>,
     return_type: Type,
@@ -1299,6 +1325,18 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         b.build_alloca(t, name)
     }
     fn bind(&mut self, name: &str, ty: &Type, value: Option<Value<'ctx>>) -> Result<Binding<'ctx>> {
+        if let Some((depth, bindings)) = &self.rebind
+            && *depth == self.scopes.len()
+            && let Some(binding) = bindings.get(name)
+            && binding.ty == *ty
+        {
+            // A dispatch loop's `let` running again for the next iteration.
+            let binding = binding.clone();
+            if let Some(v) = value {
+                self.store_value(binding.ptr, v)?;
+            }
+            return Ok(binding);
+        }
         let ptr = self.alloca(self.ty(ty)?, name)?;
         if let Some(v) = value {
             self.store_value(ptr, v)?;
@@ -1697,7 +1735,23 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                     depth: self.scopes.len(),
                 });
                 self.builder.position_at_end(body_bb);
-                self.block(body)?;
+                let dispatch = match body.last() {
+                    Some(Stmt {
+                        kind: StmtKind::Match { value, .. },
+                        ..
+                    }) if init.is_none() && condition.is_none() && step.is_none() => {
+                        Some(DispatchLoop {
+                            value: &raw const *value,
+                            prefix: body[..body.len() - 1].to_vec(),
+                            body_scope: self.scopes.len(),
+                        })
+                    }
+                    _ => None,
+                };
+                let outer = std::mem::replace(&mut self.dispatch_loop, dispatch);
+                let result = self.block(body);
+                self.dispatch_loop = outer;
+                result?;
                 if !self.terminated() {
                     self.builder.build_unconditional_branch(step_bb)?;
                 }
@@ -4260,6 +4314,89 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         }
         Some(values)
     }
+    /// Whether a match dispatches as an interpreter loop: it is the last
+    /// statement of an unconditional `for` loop, has many cases on an 8-bit
+    /// value (so a 256-entry table needs no range check), and the statements
+    /// before it can run again at the end of each arm. Their `let` bindings
+    /// are then stored into the bindings of the loop body, which must hold
+    /// nothing to drop and shadow no outer name.
+    fn threaded_dispatch(
+        &self,
+        value: &Expr,
+        actual: &Type,
+        bits: u32,
+        cases: usize,
+    ) -> Option<ThreadedDispatch<'ctx>> {
+        let dispatch = self.dispatch_loop.as_ref()?;
+        if !std::ptr::eq(dispatch.value, value)
+            || bits > 8
+            || cases < MIN_DISPATCH_CASES
+            || matches!(actual, Type::Ref(..))
+        {
+            return None;
+        }
+        let scopes = self.scopes.get(dispatch.body_scope..)?;
+        if scopes
+            .iter()
+            .flatten()
+            .any(|binding| binding.live.is_some())
+        {
+            return None;
+        }
+        let body = &scopes[0];
+        let mut rebind = HashMap::new();
+        for statement in &dispatch.prefix {
+            match &statement.kind {
+                StmtKind::LetPattern { .. } => return None,
+                StmtKind::Let { name, value, .. } => {
+                    let shadows = self.scopes[..dispatch.body_scope]
+                        .iter()
+                        .flatten()
+                        .any(|binding| binding.name == *name)
+                        || self.globals.contains_key(name);
+                    let simple = value
+                        .as_ref()
+                        .is_some_and(|value| !matches!(value.kind, ExprKind::Repeat(..)));
+                    let binding = body.iter().rev().find(|binding| binding.name == *name)?;
+                    if shadows || !simple || rebind.insert(name.clone(), binding.clone()).is_some()
+                    {
+                        return None;
+                    }
+                }
+                _ => {}
+            }
+        }
+        Some(ThreadedDispatch {
+            prefix: dispatch.prefix.clone(),
+            rebind,
+        })
+    }
+    /// Branch through a dispatch table of block addresses.
+    fn indirect_dispatch(
+        &self,
+        table: Value<'ctx>,
+        size: usize,
+        value: Value<'ctx>,
+        destinations: &[BasicBlock<'ctx>],
+    ) -> Result<()> {
+        let i64_type = self.context.i64_type();
+        let index = self
+            .builder
+            .build_int_z_extend(value, i64_type, "dispatch.index")?;
+        let pointer = self.context.ptr_type(0);
+        // SAFETY: the table has an entry for every value of the 8-bit index.
+        let slot = unsafe {
+            self.builder.build_gep(
+                pointer.array_type(size as u32),
+                table,
+                &[i64_type.const_zero(), index],
+                "dispatch.slot",
+            )?
+        };
+        let target = self.builder.build_load(pointer, slot, "dispatch.target")?;
+        self.builder.build_indirect_br(target, destinations)?;
+        Ok(())
+    }
     /// Dispatch the leading run of integer-literal arms of a match with one
     /// `switch` (the first arm listing a value wins, as in the test chain).
     /// Returns how many arms it emitted; the caller continues with the test
@@ -4269,6 +4406,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
     #[allow(clippy::too_many_arguments)]
     fn match_switch_prefix(
         &mut self,
+        value: &Expr,
         arms: &[MatchArm],
         ptr: Value<'ctx>,
         actual: &Type,
@@ -4300,17 +4438,43 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         let default = self.bb("match.next");
         let mut seen = HashSet::new();
         let mut cases = vec![];
+        let mut raw_cases = vec![];
         let mut targets = vec![];
         for values in &arm_values {
             let yes = self.bb("match.pattern");
             for value in values {
                 if seen.insert(value & mask) {
                     cases.push((int_type.const_int(*value, false), yes));
+                    raw_cases.push((value & mask, yes));
                 }
             }
             targets.push(yes);
         }
-        self.builder.build_switch(value_ir, default, &cases)?;
+        let threaded = self.threaded_dispatch(value, actual, bits, cases.len());
+        let mut destinations = targets.clone();
+        destinations.push(default);
+        let table = if threaded.is_some() {
+            let function = self.function.unwrap();
+            let mut entries = vec![default.address(function); 1usize << bits];
+            for (value, block) in &raw_cases {
+                entries[*value as usize] = block.address(function);
+            }
+            let pointer = self.context.ptr_type(0);
+            let global = self.module.add_global(
+                pointer.array_type(entries.len() as u32),
+                None,
+                "match.dispatch",
+            );
+            global.set_initializer(&pointer.const_array(&entries));
+            global.set_constant(true);
+            global.set_linkage(LLVMPrivateLinkage);
+            global.set_unnamed_addr(true);
+            self.indirect_dispatch(global, entries.len(), value_ir, &destinations)?;
+            Some((global, entries.len()))
+        } else {
+            self.builder.build_switch(value_ir, default, &cases)?;
+            None
+        };
         for (arm, yes) in arms.iter().zip(targets) {
             self.builder.position_at_end(yes);
             self.push_scope();
@@ -4319,8 +4483,31 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             self.block(&arm.body)?;
             if !self.terminated() {
                 self.cleanup_to(self.scopes.len() - 1)?;
-                self.builder.build_unconditional_branch(end)?;
-                *reaches_end = true;
+                if let (Some(plan), Some((global, size))) = (&threaded, table) {
+                    // Run the loop's next iteration up to its dispatch here,
+                    // so every arm ends in its own indirect branch.
+                    self.pop_scope();
+                    self.push_scope();
+                    let outer = self
+                        .rebind
+                        .replace((self.scopes.len(), plan.rebind.clone()));
+                    for statement in &plan.prefix {
+                        if self.terminated() {
+                            break;
+                        }
+                        self.stmt(statement)?;
+                    }
+                    self.rebind = outer;
+                    if !self.terminated() {
+                        let next = self.expr(value)?;
+                        self.builder.build_store(place, next)?;
+                        self.cleanup_to(self.scopes.len() - 1)?;
+                        self.indirect_dispatch(global, size, next, &destinations)?;
+                    }
+                } else {
+                    self.builder.build_unconditional_branch(end)?;
+                    *reaches_end = true;
+                }
             }
             self.pop_scope();
         }
@@ -4332,8 +4519,16 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         let (ptr, actual, borrowed, owner) = self.pattern_value(value)?;
         let end = self.bb("match.end");
         let mut reaches_end = false;
-        let switched =
-            self.match_switch_prefix(arms, ptr, &actual, borrowed, &owner, end, &mut reaches_end)?;
+        let switched = self.match_switch_prefix(
+            value,
+            arms,
+            ptr,
+            &actual,
+            borrowed,
+            &owner,
+            end,
+            &mut reaches_end,
+        )?;
         for arm in &arms[switched..] {
             let binding_order = arm.pattern.bindings();
             for pattern in Self::pattern_alternatives(&arm.pattern) {
