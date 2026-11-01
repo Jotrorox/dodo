@@ -1,0 +1,903 @@
+package encode
+
+import "std/image/pixels"
+
+// ICC profile embedding (18181-1 annex B), following libjxl's
+// enc_icc_codec.cc: the profile becomes a byte stream of
+//
+//     varint(profile size) varint(command bytes) commands data
+//
+// where the data starts with the 128 header bytes minus their prediction,
+// the commands encode the tag table (common tag names, offsets and sizes
+// predicted from the previous tag, rTRC/gTRC/bTRC and rXYZ/gXYZ/bXYZ
+// groups), and the tagged elements become type shortcuts, XYZ shortcuts,
+// 2-byte shuffles (mluc text), order-1 numeric prediction of 16-bit curves
+// and CLUTs, order-0 prediction of gbd data, and raw inserts for anything
+// else. That stream is entropy coded with 41 contexts from the two previous
+// bytes plus an LZ77 distance context.
+//
+// The byte stream is never stored: icc_generate() produces it in order
+// (commands, then data) from the profile on every pass, and an IccStream
+// consumes it through a 64 KiB window with greedy hash-chain LZ77 matching
+// (distances up to 32768, the decoder's ICC window). One pass counts
+// statistics, a second writes with prefix codes chosen per cluster
+// (hybrid integer configuration tuned from exact byte histograms); a
+// prefix-coded stream is written forward, so no token buffer is needed and
+// the working memory is fixed (the LZ77 window, about 224 KiB with the
+// histograms, carved from the encoder's histogram scratch).
+
+const ICC_CONTEXTS: usize = 41
+const ICC_HEADER_SIZE: usize = 128
+// libjxl's limit on tag sizes worth predicting (2^32 / 4 - 1).
+const ICC_SIZE_LIMIT: u64 = 0x3FFFFFFF
+// Largest profile accepted (the decoder's limit).
+const ICC_MAX_BYTES: usize = 268435456
+const ICC_WINDOW: usize = 65536
+const ICC_MAX_DISTANCE: usize = 32768
+const ICC_MIN_MATCH: usize = 4
+const ICC_MAX_MATCH: usize = 1024
+const ICC_HASH_BITS: u32 = 13
+const ICC_MAX_CHAIN: usize = 32
+// Tag table entries used to recognize tagged elements.
+const ICC_MAX_TAGS: usize = 512
+// Histograms count bytes and distances exactly (CONFIG_EXACT: distance
+// tokens reach 262), so LZ77 lengths are counted from here.
+const ICC_LZ77_BASE: u32 = 264
+// Clusters of the ICC stream: enough for its 41 byte contexts, and few
+// enough prefix tables for small decoders (std/image/jxl's ICC table pool).
+const ICC_MAX_CLUSTERS: usize = 8
+// u32 words of LZ77 working memory: window bytes (as u32 words / 4),
+// hash heads and the chain.
+const ICC_RING_WORDS: usize = 16384
+const ICC_HEAD_WORDS: usize = 8192
+const ICC_CHAIN_WORDS: usize = 32768
+
+static ICC_TAG_NAMES: [68]u8 = [
+    b'c', b'p', b'r', b't', b'w', b't', b'p', b't', b'b', b'k', b'p', b't', b'r', b'X', b'Y', b'Z',
+    b'g', b'X', b'Y', b'Z', b'b', b'X', b'Y', b'Z', b'k', b'X', b'Y', b'Z', b'r', b'T', b'R', b'C',
+    b'g', b'T', b'R', b'C', b'b', b'T', b'R', b'C', b'k', b'T', b'R', b'C', b'c', b'h', b'a', b'd',
+    b'd', b'e', b's', b'c', b'c', b'h', b'r', b'm', b'd', b'm', b'n', b'd', b'd', b'm', b'd', b'd',
+    b'l', b'u', b'm', b'i'
+]
+
+static ICC_TYPE_NAMES: [32]u8 = [
+    b'X', b'Y', b'Z', b' ', b'd', b'e', b's', b'c', b't', b'e', b'x', b't', b'm', b'l', b'u', b'c',
+    b'p', b'a', b'r', b'a', b'c', b'u', b'r', b'v', b's', b'f', b'3', b'2', b'g', b'b', b'd', b' '
+]
+
+// A profile the encoder can embed for an image with `color_channels` color
+// channels: at least the header and tag count, the "acsp" signature, and
+// data color space "RGB " (3 channels) or "GRAY" (1 channel).
+fn check_icc(icc: &[u8], color_channels: usize) -> void!pixels.Error {
+    if icc.len < 132 || icc.len > ICC_MAX_BYTES {
+        return err(pixels.Error.Unsupported)
+    }
+    if icc[36] != b'a' || icc[37] != b'c' || icc[38] != b's' || icc[39] != b'p' {
+        return err(pixels.Error.Unsupported)
+    }
+    rgb := icc[16] == b'R' && icc[17] == b'G' && icc[18] == b'B' && icc[19] == b' '
+    gray := icc[16] == b'G' && icc[17] == b'R' && icc[18] == b'A' && icc[19] == b'Y'
+    if (color_channels == 3 && !rgb) || (color_channels == 1 && !gray) {
+        return err(pixels.Error.Unsupported)
+    }
+    return ok()
+}
+
+fn icc_be32(icc: &[u8], at: u64) -> u64 {
+    if at + 4 > icc.len as u64 {
+        return 0
+    }
+    i := at as usize
+    return ((icc[i] as u64) << 24) | ((icc[i + 1] as u64) << 16) | ((icc[i + 2] as u64) << 8) | icc[i + 3] as u64
+}
+
+// Whether the four bytes at `at` equal table[index * 4..].
+fn icc_is(icc: &[u8], at: u64, table: &[u8], index: usize) -> bool {
+    if at + 4 > icc.len as u64 {
+        return false
+    }
+    i := at as usize
+    for k in 0usize..4 {
+        if icc[i + k] != table[index * 4 + k] {
+            return false
+        }
+    }
+    return true
+}
+
+// Whether the four bytes at `at` are `a b c d`.
+fn icc_name(icc: &[u8], at: u64, a: u8, b: u8, c: u8, d: u8) -> bool {
+    if at + 4 > icc.len as u64 {
+        return false
+    }
+    i := at as usize
+    return icc[i] == a && icc[i + 1] == b && icc[i + 2] == c && icc[i + 3] == d
+}
+
+fn icc_varint_size(v: u64) -> usize {
+    n := 1usize
+    rest := v >> 7
+    for rest != 0 {
+        n += 1
+        rest = rest >> 7
+    }
+    return n
+}
+
+// The header byte predicted at position i (the decoder's predict_header,
+// on the profile's own bytes).
+fn icc_header_prediction(icc: &[u8], i: usize) -> u8 {
+    size := icc.len as u64
+    if i < 4 {
+        return ((size >> ((3 - i) * 8) as u64) & 255) as u8
+    }
+    if i == 8 {
+        return 4
+    }
+    if i >= 12 && i < 24 {
+        text := [b'm', b'n', b't', b'r', b'R', b'G', b'B', b' ', b'X', b'Y', b'Z', b' ']
+        return text[i - 12]
+    }
+    if i >= 36 && i < 40 {
+        text := [b'a', b'c', b's', b'p']
+        return text[i - 36]
+    }
+    if i >= 41 && i < 44 {
+        if icc[40] == b'A' {
+            if i == 43 {
+                return b'L'
+            }
+            return b'P'
+        }
+        if icc[40] == b'M' {
+            if i == 41 {
+                return b'S'
+            }
+            if i == 42 {
+                return b'F'
+            }
+            return b'T'
+        }
+        if icc[40] == b'S' && i >= 42 {
+            if icc[41] == b'G' {
+                if i == 42 {
+                    return b'I'
+                }
+                return b' '
+            }
+            if icc[41] == b'U' {
+                if i == 42 {
+                    return b'N'
+                }
+                return b'W'
+            }
+        }
+        return 0
+    }
+    if i == 70 {
+        return 246
+    }
+    if i == 71 {
+        return 214
+    }
+    if i == 73 {
+        return 1
+    }
+    if i == 78 {
+        return 211
+    }
+    if i == 79 {
+        return 45
+    }
+    if i >= 80 && i < 84 {
+        return icc[4 + i - 80]
+    }
+    return 0
+}
+
+// Byte i of a run predicted with (stride, width, order) starting at
+// `start`, from the profile bytes before it (libjxl LinearPredictICCValue).
+fn icc_linear_prediction(icc: &[u8], start: usize, i: usize, stride: usize, width: usize, order: u32) -> u8 {
+    if width == 1 {
+        at := start + i
+        p1 := icc[at - stride] as u32
+        p2 := icc[at - 2 * stride] as u32
+        p3 := icc[at - 3 * stride] as u32
+        return (icc_predict(p1, p2, p3, order) & 255) as u8
+    }
+    if width == 2 {
+        at := start + (i & 0xFFFFFFFFFFFFFFFE)
+        p1 := ((icc[at - stride] as u32) << 8) | icc[at - stride + 1] as u32
+        p2 := ((icc[at - 2 * stride] as u32) << 8) | icc[at - 2 * stride + 1] as u32
+        p3 := ((icc[at - 3 * stride] as u32) << 8) | icc[at - 3 * stride + 1] as u32
+        pred := icc_predict(p1, p2, p3, order) & 0xFFFF
+        if (i & 1) != 0 {
+            return (pred & 255) as u8
+        }
+        return ((pred >> 8) & 255) as u8
+    }
+    at := start + (i & 0xFFFFFFFFFFFFFFFC)
+    p1 := icc_be32(icc, (at - stride) as u64) as u32
+    p2 := icc_be32(icc, (at - 2 * stride) as u64) as u32
+    p3 := icc_be32(icc, (at - 3 * stride) as u64) as u32
+    pred := icc_predict(p1, p2, p3, order)
+    shift := (8 * (3 - (i & 3))) as u32
+    return ((pred >> shift) & 255) as u8
+}
+
+fn icc_predict(p1: u32, p2: u32, p3: u32, order: u32) -> u32 {
+    if order == 0 {
+        return p1
+    }
+    if order == 1 {
+        return core.wrapping_sub(core.wrapping_mul(2u32, p1), p2)
+    }
+    return core.wrapping_add(core.wrapping_mul(3u32, core.wrapping_sub(p1, p2)), p3)
+}
+
+// The input index stored at output index j when `num` bytes are
+// de-interleaved into `width` columns (libjxl Unshuffle).
+fn icc_unshuffle_index(j: usize, num: usize, width: usize) -> usize {
+    height := (num + width - 1) / width
+    s := j % height
+    t := j / height
+    q := num / height
+    r := num % height
+    m := s
+    if r < m {
+        m = r
+    }
+    return s * q + m + t
+}
+
+// Consumes the ICC byte stream: counts the phase sizes, or (phase 1 and 2)
+// LZ77-parses the bytes and counts or writes their tokens.
+struct IccStream {
+    // 0: count command and data bytes; 1: forward commands; 2: forward data.
+    phase: u32
+    commands: u64
+    data: u64
+    // Window of the last ICC_WINDOW bytes (as u32 words holding 4 bytes),
+    // hash heads (position + 1) and chain links (position + 1).
+    ring: &mut[u32]
+    head: &mut[u32]
+    chain: &mut[u32]
+    // Bytes received, and bytes already turned into tokens.
+    total: usize
+    done: usize
+    lz77: bool
+    copies: usize
+    counting: bool
+    hist: &mut[u32]
+    broken: bool
+
+    fn new(ring: &mut[u32], head: &mut[u32], chain: &mut[u32], hist: &mut[u32]) -> IccStream from(ring, head, chain, hist) {
+        return IccStream { phase: 0, commands: 0, data: 0, ring: ring, head: head, chain: chain, total: 0, done: 0, lz77: true, copies: 0, counting: true, hist: hist, broken: false }
+    }
+    fn reset(&mut self, counting: bool, lz77: bool) {
+        self.total = 0
+        self.done = 0
+        self.counting = counting
+        self.lz77 = lz77
+        self.copies = 0
+        for i in 0usize..ICC_HEAD_WORDS {
+            self.head[i] = 0
+        }
+    }
+    fn byte_at(&self, p: usize) -> u32 {
+        q := p & (ICC_WINDOW - 1)
+        return (self.ring[q >> 2] >> ((q & 3) * 8) as u32) & 255
+    }
+    fn cmd(&mut self, b: u32, set: &CodeSet, w: &mut BitWriter) {
+        if self.phase == 0 {
+            self.commands += 1
+        } else if self.phase == 1 {
+            self.push(b, set, w)
+        }
+    }
+    fn dat(&mut self, b: u32, set: &CodeSet, w: &mut BitWriter) {
+        if self.phase == 0 {
+            self.data += 1
+        } else if self.phase == 2 {
+            self.push(b, set, w)
+        }
+    }
+    fn cmd_varint(&mut self, v: u64, set: &CodeSet, w: &mut BitWriter) {
+        rest := v
+        for rest > 127 {
+            self.cmd(((rest & 127) | 128) as u32, set, w)
+            rest = rest >> 7
+        }
+        self.cmd(rest as u32, set, w)
+    }
+    // Append one byte of the stream and tokenize what has enough lookahead.
+    fn push(&mut self, b: u32, set: &CodeSet, w: &mut BitWriter) {
+        q := self.total & (ICC_WINDOW - 1)
+        shift := ((q & 3) * 8) as u32
+        word := q >> 2
+        self.ring[word] = (self.ring[word] & ~(255u32 << shift)) | ((b & 255) << shift)
+        self.total += 1
+        for self.total - self.done > ICC_MAX_MATCH + 2 {
+            self.step(set, w)
+        }
+    }
+    // Tokenize the rest of the stream.
+    fn finish(&mut self, set: &CodeSet, w: &mut BitWriter) {
+        for self.done < self.total {
+            self.step(set, w)
+        }
+    }
+    fn hash(&self, p: usize) -> usize {
+        v := (self.byte_at(p) << 16) | (self.byte_at(p + 1) << 8) | self.byte_at(p + 2)
+        return (core.wrapping_mul(v, 2654435761u32) >> (32 - ICC_HASH_BITS)) as usize
+    }
+    fn insert(&mut self, p: usize) {
+        if p + 2 >= self.total {
+            return
+        }
+        h := self.hash(p)
+        self.chain[p & (ICC_CHAIN_WORDS - 1)] = self.head[h]
+        self.head[h] = (p + 1) as u32
+    }
+    fn context(&self, p: usize) -> usize {
+        b1 := 0u32
+        b2 := 0u32
+        if p > 0 {
+            b1 = self.byte_at(p - 1)
+        }
+        if p > 1 {
+            b2 = self.byte_at(p - 2)
+        }
+        return icc_context(p, b1, b2)
+    }
+    // Code the token at position `done`: the longest earlier match of at
+    // least ICC_MIN_MATCH bytes, else a literal.
+    fn step(&mut self, set: &CodeSet, w: &mut BitWriter) {
+        p := self.done
+        ctx := self.context(p)
+        best_length := 0usize
+        best_distance := 0usize
+        if self.lz77 && p + ICC_MIN_MATCH <= self.total {
+            limit := self.total - p
+            if limit > ICC_MAX_MATCH {
+                limit = ICC_MAX_MATCH
+            }
+            candidate := self.head[self.hash(p)] as usize
+            steps := 0usize
+            for candidate != 0 && steps < ICC_MAX_CHAIN {
+                q := candidate - 1
+                if q >= p || p - q > ICC_MAX_DISTANCE {
+                    break
+                }
+                length := 0usize
+                for length < limit && self.byte_at(q + length) == self.byte_at(p + length) {
+                    length += 1
+                }
+                if length > best_length {
+                    best_length = length
+                    best_distance = p - q
+                    if length == limit {
+                        break
+                    }
+                }
+                candidate = self.chain[q & (ICC_CHAIN_WORDS - 1)] as usize
+                steps += 1
+            }
+        }
+        if best_length >= ICC_MIN_MATCH {
+            self.copies += 1
+            self.emit_copy(set, w, ctx, best_length, best_distance)
+            for k in 0usize..best_length {
+                self.insert(p + k)
+            }
+            self.done = p + best_length
+            return
+        }
+        value := self.byte_at(p)
+        self.emit_literal(set, w, ctx, value)
+        self.insert(p)
+        self.done = p + 1
+    }
+    fn count_symbol(&mut self, ctx: usize, symbol: usize) {
+        at := ctx * MAX_ALPHA + symbol
+        if self.hist[at] != 0xFFFFFFFF {
+            self.hist[at] += 1
+        }
+    }
+    fn code(&mut self, set: &CodeSet, w: &mut BitWriter, ctx: usize, symbol: usize, t: u64) {
+        k := set.map[ctx] as usize
+        if symbol >= set.alphabets[k] as usize {
+            self.broken = true
+            return
+        }
+        if !set.singles[k] {
+            length := set.lengths[k * MAX_ALPHA + symbol] as u32
+            if length == 0 {
+                self.broken = true
+                return
+            }
+            w.write(length, set.codes[k * MAX_ALPHA + symbol] as u64)
+        }
+        w.write(((t >> 16) & 255) as u32, t >> 24)
+    }
+    fn emit_literal(&mut self, set: &CodeSet, w: &mut BitWriter, ctx: usize, value: u32) {
+        if self.counting {
+            self.count_symbol(ctx, value as usize)
+            return
+        }
+        t := hybrid_config(value as u64, set.configs[set.map[ctx] as usize])
+        self.code(set, w, ctx, (t & 0xFFFF) as usize, t)
+    }
+    fn emit_copy(&mut self, set: &CodeSet, w: &mut BitWriter, ctx: usize, length: usize, distance: usize) {
+        t := hybrid((length - ICC_MIN_MATCH) as u64, LZ77_LEN_SPLIT, 0, 0)
+        if self.counting {
+            self.count_symbol(ctx, ICC_LZ77_BASE as usize + (t & 0xFFFF) as usize)
+            d := hybrid_config((distance - 1) as u64, CONFIG_EXACT)
+            self.count_symbol(ICC_CONTEXTS, (d & 0xFFFF) as usize)
+            return
+        }
+        self.code(set, w, ctx, LZ77_MIN_SYMBOL as usize + (t & 0xFFFF) as usize, t)
+        d := hybrid_config((distance - 1) as u64, set.configs[set.map[ICC_CONTEXTS] as usize])
+        self.code(set, w, ICC_CONTEXTS, (d & 0xFFFF) as usize, d)
+    }
+}
+
+fn icc_context(index: usize, b1: u32, b2: u32) -> usize {
+    if index <= 128 {
+        return 0
+    }
+    p1 := 7u32
+    if icc_letter(b1) {
+        p1 = 0
+    } else if icc_number(b1) {
+        p1 = 1
+    } else if b1 <= 1 {
+        p1 = 2 + b1
+    } else if b1 <= 15 {
+        p1 = 4
+    } else if b1 >= 241 && b1 <= 254 {
+        p1 = 5
+    } else if b1 == 255 {
+        p1 = 6
+    }
+    p2 := 4u32
+    if icc_letter(b2) {
+        p2 = 0
+    } else if icc_number(b2) {
+        p2 = 1
+    } else if b2 <= 15 {
+        p2 = 2
+    } else if b2 >= 241 {
+        p2 = 3
+    }
+    return (1 + p1 + 8 * p2) as usize
+}
+
+fn icc_letter(b: u32) -> bool {
+    return (b >= 97 && b <= 122) || (b >= 65 && b <= 90)
+}
+
+fn icc_number(b: u32) -> bool {
+    return (b >= 48 && b <= 57) || b == 46 || b == 44
+}
+
+// The tag table entries the main content is matched against.
+struct IccTags {
+    start: [512]u64
+    size: [512]u64
+    count: usize
+    // Smallest entry start >= the position last asked for, or u64 max.
+    next: u64
+    asked: u64
+
+    // The entry (latest with that start) whose element starts at `pos`, as
+    // its index, or ICC_MAX_TAGS.
+    fn at(&mut self, pos: u64) -> usize {
+        if pos < self.asked || pos > self.next || self.asked == 0xFFFFFFFFFFFFFFFF {
+            self.next = 0xFFFFFFFFFFFFFFFF
+            for i in 0usize..self.count {
+                if self.start[i] >= pos && self.start[i] < self.next {
+                    self.next = self.start[i]
+                }
+            }
+        }
+        self.asked = pos
+        if pos != self.next {
+            return ICC_MAX_TAGS
+        }
+        i := self.count
+        for i > 0 {
+            i -= 1
+            if self.start[i] == pos {
+                return i
+            }
+        }
+        return ICC_MAX_TAGS
+    }
+}
+
+// Emit a predicted run of `num` profile bytes at `start` as data, in the
+// de-interleaved order the decoder expects.
+fn icc_emit_predicted(icc: &[u8], start: usize, num: usize, stride: usize, width: usize, order: u32, s: &mut IccStream, set: &CodeSet, w: &mut BitWriter) {
+    for j in 0usize..num {
+        i := j
+        if width > 1 {
+            i = icc_unshuffle_index(j, num, width)
+        }
+        p := icc_linear_prediction(icc, start, i, stride, width, order) as u32
+        s.dat((icc[start + i] as u32 + 256 - p) & 255, set, w)
+    }
+}
+
+// A Predict command: flags, optional stride, count, then the data.
+fn icc_predict_command(icc: &[u8], start: usize, num: usize, stride: usize, width: usize, order: u32, s: &mut IccStream, set: &CodeSet, w: &mut BitWriter) {
+    s.cmd(4, set, w)
+    flags := (order << 2) | (width - 1) as u32
+    if stride != width {
+        flags = flags | 16
+    }
+    s.cmd(flags, set, w)
+    if stride != width {
+        s.cmd_varint(stride as u64, set, w)
+    }
+    s.cmd_varint(num as u64, set, w)
+    icc_emit_predicted(icc, start, num, stride, width, order, s, set, w)
+}
+
+// Raw bytes [first, end) as an Insert command.
+fn icc_insert(icc: &[u8], first: usize, end: usize, s: &mut IccStream, set: &CodeSet, w: &mut BitWriter) {
+    if first >= end {
+        return
+    }
+    s.cmd(1, set, w)
+    s.cmd_varint((end - first) as u64, set, w)
+    for i in first..end {
+        s.dat(icc[i] as u32, set, w)
+    }
+}
+
+// Produce the commands (phase 1) or data (phase 2) of the encoded profile,
+// or count both (phase 0).
+fn icc_generate(icc: &[u8], s: &mut IccStream, set: &CodeSet, w: &mut BitWriter) {
+    size := icc.len
+    header := size
+    if header > ICC_HEADER_SIZE {
+        header = ICC_HEADER_SIZE
+    }
+    for i in 0usize..header {
+        s.dat((icc[i] as u32 + 256 - icc_header_prediction(icc, i) as u32) & 255, set, w)
+    }
+    if size <= ICC_HEADER_SIZE {
+        return
+    }
+    tags := IccTags { start: [0u64; 512], size: [0u64; 512], count: 0, next: 0, asked: 0xFFFFFFFFFFFFFFFF }
+    pos := ICC_HEADER_SIZE
+    if pos + 4 <= size {
+        numtags := icc_be32(icc, pos as u64)
+        pos += 4
+        s.cmd_varint(numtags + 1, set, w)
+        previous_start := ICC_HEADER_SIZE as u64 + numtags * 12
+        previous_size := 0u64
+        i := 0u64
+        for i < numtags {
+            if pos + 12 > size {
+                break
+            }
+            p := pos as u64
+            tagstart := icc_be32(icc, p + 4)
+            tagsize := icc_be32(icc, p + 8)
+            pos += 12
+            if tags.count < ICC_MAX_TAGS {
+                tags.start[tags.count] = tagstart
+                tags.size[tags.count] = tagsize
+                tags.count += 1
+            }
+            tagcode := 1u32
+            for j in 0usize..17 {
+                if icc_is(icc, p, &ICC_TAG_NAMES, j) {
+                    tagcode = 4 + j as u32
+                    break
+                }
+            }
+            q := pos as u64
+            if icc_name(icc, p, b'r', b'T', b'R', b'C') && pos + 24 < size {
+                same := icc_name(icc, q, b'g', b'T', b'R', b'C') && icc_name(icc, q + 12, b'b', b'T', b'R', b'C')
+                if same {
+                    for k in 0usize..8 {
+                        if icc[pos - 8 + k] != icc[pos + 4 + k] || icc[pos - 8 + k] != icc[pos + 16 + k] {
+                            same = false
+                        }
+                    }
+                }
+                if same {
+                    tagcode = 2
+                    pos += 24
+                    i += 2
+                }
+            }
+            if icc_name(icc, p, b'r', b'X', b'Y', b'Z') && pos + 24 < size {
+                same := icc_name(icc, q, b'g', b'X', b'Y', b'Z') && icc_name(icc, q + 12, b'b', b'X', b'Y', b'Z')
+                same = same && tagsize == 20 && icc_be32(icc, q + 8) == 20 && icc_be32(icc, q + 20) == 20
+                same = same && icc_be32(icc, q + 4) == tagstart + 20 && icc_be32(icc, q + 16) == tagstart + 40
+                if same {
+                    tagcode = 3
+                    pos += 24
+                    i += 2
+                }
+            }
+            command := tagcode
+            if previous_start + previous_size != tagstart {
+                command = command | 64
+            }
+            predicted_size := previous_size
+            xyz := icc_name(icc, p, b'r', b'X', b'Y', b'Z') || icc_name(icc, p, b'g', b'X', b'Y', b'Z') || icc_name(icc, p, b'b', b'X', b'Y', b'Z') || icc_name(icc, p, b'k', b'X', b'Y', b'Z')
+            if xyz || icc_name(icc, p, b'w', b't', b'p', b't') || icc_name(icc, p, b'b', b'k', b'p', b't') || icc_name(icc, p, b'l', b'u', b'm', b'i') {
+                predicted_size = 20
+            }
+            if predicted_size != tagsize {
+                command = command | 128
+            }
+            s.cmd(command, set, w)
+            if tagcode == 1 {
+                for k in 0usize..4 {
+                    s.dat(icc[p as usize + k] as u32, set, w)
+                }
+            }
+            if (command & 64) != 0 {
+                s.cmd_varint(tagstart, set, w)
+            }
+            if (command & 128) != 0 {
+                s.cmd_varint(tagsize, set, w)
+            }
+            previous_start = tagstart
+            previous_size = tagsize
+            i += 1
+        }
+    }
+    // End of the tag list (or no tag list).
+    s.cmd(0, set, w)
+
+    // Main content: walk the profile, recognizing tagged elements.
+    tag := [0u8; 4]
+    tagstart := 0u64
+    tagsize := 0u64
+    clutstart := 0u64
+    last0 := pos
+    for pos <= size {
+        last1 := pos
+        emitted := false
+        p := pos as u64
+        if p > tagstart + tagsize && tagsize < ICC_SIZE_LIMIT {
+            tag = [0u8; 4]
+        }
+        index := tags.at(p)
+        if index < ICC_MAX_TAGS && pos + 4 <= size {
+            for k in 0usize..4 {
+                tag[k] = icc[pos + k]
+            }
+            tagstart = tags.start[index]
+            tagsize = tags.size[index]
+            sane := tagsize > 8 && tagsize < ICC_SIZE_LIMIT
+            fits := sane && p + tagsize <= size as u64
+            reserved_zero := pos + 8 <= size && icc_be32(icc, p + 4) == 0
+            if tag_is(&tag, b'm', b'l', b'u', b'c') && fits && reserved_zero {
+                num := (tagsize - 8) as usize
+                icc_insert(icc, last0, last1, s, set, w)
+                emitted = true
+                s.cmd(16 + 3, set, w)
+                pos += 8
+                s.cmd(2, set, w)
+                s.cmd_varint(num as u64, set, w)
+                for j in 0usize..num {
+                    s.dat(icc[pos + icc_unshuffle_index(j, num, 2)] as u32, set, w)
+                }
+                pos += num
+            }
+            if !emitted && tag_is(&tag, b'c', b'u', b'r', b'v') && fits && reserved_zero {
+                num := (tagsize - 8) as usize
+                if num > 16 && num < 268435456 && pos + num <= size && pos > 0 {
+                    icc_insert(icc, last0, last1, s, set, w)
+                    emitted = true
+                    s.cmd(16 + 5, set, w)
+                    pos += 8
+                    icc_predict_command(icc, pos, num, 2, 2, 1, s, set, w)
+                    pos += num
+                }
+            }
+        }
+        if tag_is(&tag, b'm', b'A', b'B', b' ') || tag_is(&tag, b'm', b'B', b'A', b' ') {
+            q := pos as u64
+            curve := icc_name(icc, q, b'c', b'u', b'r', b'v') || icc_name(icc, q, b'v', b'c', b'g', b't')
+            if pos + 12 < size && curve && icc_be32(icc, q + 4) == 0 {
+                num := ((icc_be32(icc, q + 8) * 2) & 0xFFFFFFFF) as usize
+                if num > 16 && num < 268435456 && pos + 12 + num <= size {
+                    pos += 12
+                    last1 = pos
+                    if !emitted {
+                        icc_insert(icc, last0, last1, s, set, w)
+                        emitted = true
+                    }
+                    icc_predict_command(icc, pos, num, 2, 2, 1, s, set, w)
+                    pos += num
+                }
+            }
+            if pos as u64 == tagstart + 24 && pos + 4 < size {
+                clutstart = tagstart + icc_be32(icc, pos as u64)
+            }
+            if pos as u64 == clutstart && clutstart + 16 < size as u64 && tagstart + 9 < size as u64 {
+                numi := icc[(tagstart + 8) as usize] as usize
+                numo := icc[(tagstart + 9) as usize] as usize
+                width := icc[(clutstart + 16) as usize] as usize
+                stride := width * numo
+                num := width * numo
+                c := clutstart as usize
+                for k in 0usize..numi {
+                    if c + k >= size || num >= 268435456 {
+                        break
+                    }
+                    num = num * icc[c + k] as usize
+                }
+                if (width == 1 || width == 2) && num > 64 && num < 268435456 && pos + num <= size && pos > stride * 4 {
+                    if !emitted {
+                        icc_insert(icc, last0, last1, s, set, w)
+                        emitted = true
+                    }
+                    icc_predict_command(icc, pos, num, stride, width, 1, s, set, w)
+                    pos += num
+                }
+            }
+        }
+        if !emitted && tag_is(&tag, b'g', b'b', b'd', b' ') && tagsize > 8 && tagsize < ICC_SIZE_LIMIT && pos as u64 == tagstart + 8 && pos as u64 + tagsize - 8 <= size as u64 && pos > 16 {
+            num := (tagsize - 8) as usize
+            icc_insert(icc, last0, last1, s, set, w)
+            emitted = true
+            icc_predict_command(icc, pos, num, 4, 4, 0, s, set, w)
+            pos += num
+        }
+        if !emitted && pos + 20 <= size {
+            q := pos as u64
+            if icc_name(icc, q, b'X', b'Y', b'Z', b' ') && icc_be32(icc, q + 4) == 0 {
+                icc_insert(icc, last0, last1, s, set, w)
+                emitted = true
+                s.cmd(10, set, w)
+                pos += 8
+                for k in 0usize..12 {
+                    s.dat(icc[pos + k] as u32, set, w)
+                }
+                pos += 12
+            }
+        }
+        if !emitted && pos + 8 <= size {
+            q := pos as u64
+            if icc_be32(icc, q + 4) == 0 {
+                for k in 0usize..8 {
+                    if icc_is(icc, q, &ICC_TYPE_NAMES, k) {
+                        icc_insert(icc, last0, last1, s, set, w)
+                        emitted = true
+                        s.cmd((16 + k) as u32, set, w)
+                        pos += 8
+                        break
+                    }
+                }
+            }
+        }
+        if emitted {
+            last0 = pos
+        } else {
+            if pos == size {
+                icc_insert(icc, last0, last1, s, set, w)
+                last0 = pos
+            }
+            pos += 1
+        }
+    }
+}
+
+fn tag_is(tag: &[u8], a: u8, b: u8, c: u8, d: u8) -> bool {
+    return tag[0] == a && tag[1] == b && tag[2] == c && tag[3] == d
+}
+
+// Bytes of the encoded (predicted) profile stream.
+fn icc_stream_size(icc: &[u8], set: &CodeSet, s: &mut IccStream) -> u64 {
+    empty := [0u8; 1]
+    w := BitWriter.new(&mut empty[..0], 0)
+    s.phase = 0
+    s.commands = 0
+    s.data = 0
+    icc_generate(icc, s, set, &mut w)
+    return icc_varint_size(icc.len as u64) as u64 + icc_varint_size(s.commands) as u64 + s.commands + s.data
+}
+
+// One full pass over the stream (header varints, commands, data).
+fn icc_pass(icc: &[u8], commands: u64, s: &mut IccStream, set: &CodeSet, w: &mut BitWriter) {
+    // The two leading varints travel as commands-phase bytes.
+    s.phase = 1
+    rest := icc.len as u64
+    for rest > 127 {
+        s.push(((rest & 127) | 128) as u32, set, w)
+        rest = rest >> 7
+    }
+    s.push(rest as u32, set, w)
+    rest = commands
+    for rest > 127 {
+        s.push(((rest & 127) | 128) as u32, set, w)
+        rest = rest >> 7
+    }
+    s.push(rest as u32, set, w)
+    icc_generate(icc, s, set, w)
+    s.phase = 2
+    icc_generate(icc, s, set, w)
+    s.finish(set, w)
+}
+
+// U64 field.
+fn write_u64(w: &mut BitWriter, value: u64) {
+    if value == 0 {
+        w.write(2, 0)
+        return
+    }
+    if value <= 16 {
+        w.write(2, 1)
+        w.write(4, value - 1)
+        return
+    }
+    if value <= 272 {
+        w.write(2, 2)
+        w.write(8, value - 17)
+        return
+    }
+    w.write(2, 3)
+    w.write(12, value & 4095)
+    rest := value >> 12
+    shift := 12u32
+    for rest != 0 {
+        w.write(1, 1)
+        if shift == 60 {
+            w.write(4, rest & 15)
+            return
+        }
+        w.write(8, rest & 255)
+        rest = rest >> 8
+        shift += 8
+    }
+    w.write(1, 0)
+}
+
+// Write the ICC stream of `icc` (checked by check_icc): its size, code spec
+// and tokens. `set` provides the context map and code storage (contexts
+// and LZ77 are set here), `hist` and `sums` histograms, `choice` the
+// clustering choices, and ring/head/chain (ICC_RING_WORDS, ICC_HEAD_WORDS,
+// ICC_CHAIN_WORDS words) the LZ77 window. Returns false if the coder found
+// an inconsistency (never expected).
+fn write_icc(w: &mut BitWriter, icc: &[u8], set: &mut CodeSet, hist: &mut[u32], sums: &mut[u32], choice: &mut[u32], ring: &mut[u32], head: &mut[u32], chain: &mut[u32]) -> bool {
+    contexts := ICC_CONTEXTS + 1
+    for i in 0usize..contexts * MAX_ALPHA {
+        hist[i] = 0
+    }
+    s := IccStream.new(ring, head, chain, hist)
+    enc_size := icc_stream_size(icc, set, &mut s)
+    commands := s.commands
+    // Count with LZ77 matching; drop LZ77 when it never matched.
+    empty := [0u8; 1]
+    {
+        dummy := BitWriter.new(&mut empty[..0], 0)
+        s.reset(true, true)
+        icc_pass(icc, commands, &mut s, set, &mut dummy)
+    }
+    lz77 := s.copies > 0
+    if !lz77 {
+        contexts = ICC_CONTEXTS
+    }
+    set.contexts = contexts
+    set.lz77 = lz77
+    set.min_length = ICC_MIN_MATCH as u32
+    proj := [0u16; 288]
+    projection(CONFIG_EXACT, ICC_LZ77_BASE, &mut proj)
+    set.clusters = cluster_histograms(s.hist, contexts, ICC_MAX_CLUSTERS, set.map, sums, choice, &proj)
+    set.build_tuned(sums, CONFIG_EXACT, ICC_LZ77_BASE, true, 0, 1)
+    write_u64(w, enc_size)
+    set.write(w)
+    s.reset(false, lz77)
+    icc_pass(icc, commands, &mut s, set, w)
+    return !s.broken
+}

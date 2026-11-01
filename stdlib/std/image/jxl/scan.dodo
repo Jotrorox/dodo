@@ -8,8 +8,9 @@ import "std/image/shared/scratch"
 // them and to size every buffer decode() needs before any pixel work.
 
 // Bytes of stack working storage for skipping an ICC stream or a permuted
-// TOC while scanning.
-const SCAN_BYTES: usize = 200704
+// TOC while scanning. Must cover icc_work_bytes() (about 256 KiB), or the
+// ICC stream's LZ77 window shrinks below its 32768 entries.
+const SCAN_BYTES: usize = 266240
 const MAX_FRAMES: u32 = 1048576
 
 struct Scan {

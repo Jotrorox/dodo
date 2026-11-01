@@ -361,11 +361,13 @@ pub fn metadata_size(format: pixels.Format, exif_len: usize, icc_len: usize) -> 
             return png.metadata_size(exif_len, icc_len)
         }
         pixels.Format.Jxl => {
-            if exif_len == 0 {
-                return ok(0)
+            // Container signature, ftyp, Exif and codestream box headers,
+            // and the entropy-coded ICC stream.
+            total := 0usize
+            if exif_len > 0 {
+                total = pixels.checked(1, exif_len, 128)?
             }
-            // Container signature, ftyp, Exif and codestream box headers.
-            return pixels.checked(1, exif_len, 128)
+            return pixels.checked(1, total, jxl_encode.icc_bound(icc_len)?)
         }
         _ => {
             return ok(0)
@@ -412,7 +414,9 @@ pub fn encode(format: pixels.Format, source: &pixels.View, options: &EncodeOptio
 
 // encode() with an EXIF payload (TIFF-structured) and an ICC profile, each
 // written when not empty, options.keep_metadata is set and the format can
-// store it (PNG: eXIf and iCCP). The output may need metadata_size() more
+// store it (PNG: eXIf and iCCP; JPEG XL: an Exif box and the embedded,
+// entropy-coded profile, which must be an RGB or gray profile matching the
+// image, else it is left out). The output may need metadata_size() more
 // bytes than max_encoded_size().
 pub fn encode_with_metadata(format: pixels.Format, source: &pixels.View, options: &EncodeOptions, exif: &[u8], icc: &[u8], output: &mut[u8], scratch: &mut[u8]) -> usize!pixels.Error {
     match format {
@@ -437,9 +441,15 @@ pub fn encode_with_metadata(format: pixels.Format, source: &pixels.View, options
         }
         pixels.Format.Jxl => {
             codec := jxl_options(options)
-            if options.keep_metadata && exif.len > 0 {
+            if options.keep_metadata && (exif.len > 0 || icc.len > 0) {
                 nothing := [0u8; 1]
-                boxes := jxl_encode.Metadata.new(exif, &nothing[..0])
+                profile := icc
+                if !jxl_encode.icc_fits(icc, source.layout()) {
+                    // A profile JPEG XL cannot carry for this image (CMYK,
+                    // Lab, or the wrong channel count) is left out.
+                    profile = &icc[..0]
+                }
+                boxes := jxl_encode.Metadata.with_icc(exif, &nothing[..0], profile)
                 return jxl_encode.encode_with_metadata(source, &codec, &boxes, output, scratch)
             }
             return jxl_encode.encode(source, &codec, output, scratch)

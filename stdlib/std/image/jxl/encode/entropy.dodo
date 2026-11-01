@@ -1,13 +1,33 @@
 package encode
 
-// Entropy coding: hybrid integers, histograms, histogram clustering, the
-// context map and the prefix-coded "code spec" that precedes every entropy
-// coded stream, plus the Coder that either counts or writes symbols.
+// Entropy coding shared by every encoder stream: hybrid integers and their
+// configurations, histograms and histogram clustering, the context map, and
+// the CodeSet that turns clustered histograms into either prefix codes or
+// ANS distributions (ans.dodo) and writes the "code spec" preceding every
+// entropy-coded stream.
+//
+// Use (see encode.dodo and modular.dodo for the modular encoder):
+//   1. Count: an Emitter in counting mode adds each (context, value) to
+//      per-context histograms hist[ctx * MAX_ALPHA..], tokenized with a
+//      counting configuration: CONFIG_DEFAULT (4, 2, 0), or CONFIG_FINE
+//      (5, 2, 2) / CONFIG_EXACT (8, 0, 0) when the hybrid integer
+//      configuration is tuned per cluster later. LZ77 length symbols are
+//      counted from lz_base (LZ77_MIN_SYMBOL or LZ77_FINE_BASE).
+//   2. Cluster: cluster_histograms() maps contexts to at most `limit`
+//      clusters (context map) and sums their histograms.
+//   3. Build: CodeSet.build() makes prefix codes with the set's single
+//      configuration; CodeSet.build_tuned() also picks a configuration per
+//      cluster and, when the set has ANS storage, codes the set with ANS if
+//      that is estimated smaller.
+//   4. Write: CodeSet.write() emits the code spec; an Emitter in writing
+//      mode then codes the values of each stream (prefix codes directly,
+//      ANS tokens buffered and written in reverse when the stream ends at
+//      Emitter.flush()).
 
 // LZ77 length symbols start here; literal tokens stay below it.
 const LZ77_MIN_SYMBOL: u32 = 224
-// Hybrid integer configuration of every literal histogram (split exponent,
-// mantissa bits kept in the token, low bits kept in the token).
+// Default hybrid integer configuration of literal histograms (split
+// exponent, mantissa bits kept in the token, low bits kept in the token).
 const LIT_SPLIT: u32 = 4
 const LIT_MSB: u32 = 2
 const LIT_LSB: u32 = 0
@@ -17,6 +37,28 @@ const LZ77_LEN_SPLIT: u32 = 4
 const MAX_CLUSTERS: usize = 32
 // Contexts a stream may use, including the LZ77 distance context.
 const MAX_CONTEXTS: usize = 256
+
+// Hybrid integer configurations packed as split | msb << 8 | lsb << 16.
+const CONFIG_DEFAULT: u32 = 0x204
+// Counting configuration that keeps enough of every value for any
+// candidate configuration with split <= 5, msb <= 2 and lsb <= 2. Values
+// below FINE_LIMIT give tokens below LZ77_FINE_BASE.
+const CONFIG_FINE: u32 = 0x20205
+const FINE_LIMIT: u64 = 524288
+// Counting configuration for byte values: the token is the value.
+const CONFIG_EXACT: u32 = 8
+// LZ77 length symbols of histograms counted with CONFIG_FINE or
+// CONFIG_EXACT start here.
+const LZ77_FINE_BASE: u32 = 256
+
+// Configurations tried per cluster by CodeSet.build_tuned().
+const CONFIG_CANDIDATES: [26]u32 = [
+    0x204, 0x104, 0x10204, 0x20204, 0x20104, 0x4,
+    0x205, 0x105, 0x10205, 0x20205, 0x20105, 0x5,
+    0x203, 0x103, 0x10203, 0x20103, 0x3,
+    0x10002, 0x2, 0x1, 0x0,
+    0x6, 0x206, 0x20106, 0x20206, 0x7
+]
 
 // log2(1 + i / 256) in 16.16 fixed point.
 const LOG2_TABLE: [257]u64 = [
@@ -53,12 +95,69 @@ fn hybrid(v: u64, split: u32, msb: u32, lsb: u32) -> u64 {
     return token | ((nbits as u64) << 16) | (bits << 24)
 }
 
+// hybrid() with a packed configuration.
+fn hybrid_config(v: u64, config: u32) -> u64 {
+    return hybrid(v, config & 255, (config >> 8) & 255, (config >> 16) & 255)
+}
+
 // Raw bits following token t.
 fn extra_bits(t: u32, split: u32, msb: u32, lsb: u32) -> u32 {
     if t < (1u32 << split) {
         return 0
     }
     return split - msb - lsb + ((t - (1u32 << split)) >> (msb + lsb))
+}
+
+// The token and extra-bit count (token | nbits << 16) under configuration
+// `dst` of a value that was counted as token t under `src`. Exact when t <
+// 2^split(src) or when `dst` keeps no more bits than `src` (see
+// derivable()).
+fn reproject(t: u32, src: u32, dst: u32) -> u32 {
+    fs := src & 255
+    if t < (1u32 << fs) {
+        h := hybrid_config(t as u64, dst)
+        return ((h & 0xFFFF) | (((h >> 16) & 255) << 16)) as u32
+    }
+    fm := (src >> 8) & 255
+    fl := (src >> 16) & 255
+    n := fs + ((t - (1u32 << fs)) >> (fm + fl))
+    top := (t >> fl) & ((1u32 << fm) - 1)
+    low := t & ((1u32 << fl) - 1)
+    ts := dst & 255
+    tm := (dst >> 8) & 255
+    tl := (dst >> 16) & 255
+    token := (1u32 << ts) + ((n - ts) << (tm + tl)) + ((top >> (fm - tm)) << tl) + (low & ((1u32 << tl) - 1))
+    return token | ((n - tm - tl) << 16)
+}
+
+// Whether tokens counted under `src` (the largest being max_token) can be
+// re-tokenized exactly under `dst`.
+fn derivable(src: u32, dst: u32, max_token: u32) -> bool {
+    fs := src & 255
+    if max_token < (1u32 << fs) {
+        return true
+    }
+    return (dst & 255) <= fs && ((dst >> 8) & 255) <= ((src >> 8) & 255) && ((dst >> 16) & 255) <= ((src >> 16) & 255)
+}
+
+// proj[s]: the default-configuration symbol of counted symbol s, which
+// clustering uses to compare histograms counted with a finer configuration.
+fn projection(count: u32, lz_base: u32, proj: &mut[u16]) {
+    for s in 0usize..MAX_ALPHA {
+        if s as u32 >= lz_base {
+            v := LZ77_MIN_SYMBOL + (s as u32 - lz_base)
+            if v >= MAX_ALPHA as u32 {
+                v = MAX_ALPHA as u32 - 1
+            }
+            proj[s] = v as u16
+        } else if derivable(count, CONFIG_DEFAULT, s as u32) {
+            proj[s] = (reproject(s as u32, count, CONFIG_DEFAULT) & 0xFFFF) as u16
+        } else {
+            // Not derivable (an LZ77 distance counted exactly): keep the
+            // exponent.
+            proj[s] = (LZ77_MIN_SYMBOL - 32 + (s as u32 & 31)) as u16
+        }
+    }
 }
 
 // log2(x) in 16.16 fixed point, x >= 1; integer-only so clustering is the
@@ -94,15 +193,26 @@ fn histogram_cost(h: &[u32], base: usize, syms: &[u16]) -> u64 {
     return total * log2_fixed(total) - sum + ((16 + 5 * nonzero) << 16)
 }
 
-// Cost (16.16) of the union of two histograms.
-fn merged_cost(a: &[u32], abase: usize, b: &[u32], bbase: usize, syms: &[u16]) -> u64 {
+// The cost of histogram `a` (plus histogram `b` when `both`) with counted
+// symbols merged into their projected symbols proj[s].
+fn projected_cost(a: &[u32], abase: usize, b: &[u32], bbase: usize, both: bool, syms: &[u16], proj: &[u16]) -> u64 {
+    bins := [0u64; 288]
+    for k in 0usize..syms.len {
+        s := syms[k] as usize
+        c := a[abase + s] as u64
+        if both {
+            c += b[bbase + s] as u64
+        }
+        bins[proj[s] as usize] += c
+    }
     total := 0u64
     nonzero := 0u64
     sum := 0u64
     for k in 0usize..syms.len {
-        s := syms[k] as usize
-        c := a[abase + s] as u64 + b[bbase + s] as u64
+        p := proj[syms[k] as usize] as usize
+        c := bins[p]
         if c != 0 {
+            bins[p] = 0
             total += c
             nonzero += 1
             sum += c * log2_fixed(c)
@@ -131,11 +241,12 @@ fn used_symbols(hist: &[u32], count: usize, syms: &mut[u16]) -> usize {
 
 // Group the histograms of `count` contexts (hist[ctx * MAX_ALPHA..]) into at
 // most `limit` clusters: farthest-first seeding, then each context joins
-// the cluster that codes it most cheaply. Writes the context map, the summed
+// the cluster that codes it most cheaply, costs measured on the projected
+// symbols proj[] (see projection()). Writes the context map, the summed
 // cluster histograms (sums[cluster * MAX_ALPHA..]) and returns the cluster
 // count. Clusters are numbered in order of first use, so the map is dense.
-fn cluster_histograms(hist: &[u32], count: usize, limit: usize, map: &mut[u8], sums: &mut[u32], choice: &mut[u32]) -> usize {
-    symbol_storage := [0u16; 272]
+fn cluster_histograms(hist: &[u32], count: usize, limit: usize, map: &mut[u8], sums: &mut[u32], choice: &mut[u32], proj: &[u16]) -> usize {
+    symbol_storage := [0u16; 288]
     used := used_symbols(hist, count, &mut symbol_storage)
     syms := &symbol_storage[..used]
     for i in 0usize..MAX_ALPHA * limit {
@@ -147,7 +258,7 @@ fn cluster_histograms(hist: &[u32], count: usize, limit: usize, map: &mut[u8], s
     first := count
     best_total := 0u64
     for i in 0usize..count {
-        alone[i] = histogram_cost(hist, i * MAX_ALPHA, syms)
+        alone[i] = projected_cost(hist, i * MAX_ALPHA, hist, 0, false, syms, proj)
         total := 0u64
         for k in 0usize..used {
             total += hist[i * MAX_ALPHA + syms[k] as usize] as u64
@@ -185,7 +296,7 @@ fn cluster_histograms(hist: &[u32], count: usize, limit: usize, map: &mut[u8], s
             }
             delta := 0u64
             if i != next {
-                both := merged_cost(sums, seed_count * MAX_ALPHA, hist, i * MAX_ALPHA, syms)
+                both := projected_cost(sums, seed_count * MAX_ALPHA, hist, i * MAX_ALPHA, true, syms, proj)
                 if both > seed_cost[seed_count] + alone[i] {
                     delta = both - seed_cost[seed_count] - alone[i]
                 }
@@ -215,7 +326,7 @@ fn cluster_histograms(hist: &[u32], count: usize, limit: usize, map: &mut[u8], s
                     pick = k
                     break
                 }
-                both := merged_cost(sums, k * MAX_ALPHA, hist, i * MAX_ALPHA, syms)
+                both := projected_cost(sums, k * MAX_ALPHA, hist, i * MAX_ALPHA, true, syms, proj)
                 delta := 0u64
                 if both > seed_cost[k] {
                     delta = both - seed_cost[k]
@@ -259,37 +370,190 @@ fn saturating_add(a: u32, b: u32) -> u32 {
     return a + b
 }
 
-// Prefix codes for a set of clustered histograms.
+// The cheapest configuration for the counted cluster histogram
+// h[base..base + MAX_ALPHA] (counted under `count`, LZ77 lengths from
+// lz_base) among CONFIG_CANDIDATES whose literal tokens stay below
+// LZ77_MIN_SYMBOL, by entropy plus extra bits plus a header estimate.
+fn choose_config(h: &[u32], base: usize, count: u32, lz_base: u32) -> u32 {
+    max_token := 0u32
+    lz_total := 0u64
+    lz_sum := 0u64
+    lz_nonzero := 0u64
+    for s in 0usize..MAX_ALPHA {
+        c := h[base + s] as u64
+        if c == 0 {
+            continue
+        }
+        if (s as u32) < lz_base {
+            max_token = s as u32
+        } else {
+            lz_total += c
+            lz_sum += c * log2_fixed(c)
+            lz_nonzero += 1
+        }
+    }
+    best := count
+    best_cost := 0xFFFFFFFFFFFFFFFFu64
+    for i in 0usize..CONFIG_CANDIDATES.len + 1 {
+        cand := count
+        if i > 0 {
+            cand = CONFIG_CANDIDATES[i - 1]
+        }
+        if !derivable(count, cand, max_token) {
+            continue
+        }
+        bins := [0u64; 224]
+        extra := 0u64
+        valid := true
+        for s in 0usize..(max_token + 1) as usize {
+            c := h[base + s] as u64
+            if c == 0 {
+                continue
+            }
+            r := reproject(s as u32, count, cand)
+            token := (r & 0xFFFF) as usize
+            if token >= LZ77_MIN_SYMBOL as usize {
+                valid = false
+                break
+            }
+            bins[token] += c
+            extra += c * (r >> 16) as u64
+        }
+        if !valid {
+            continue
+        }
+        total := lz_total
+        sum := lz_sum
+        nonzero := lz_nonzero
+        for t in 0usize..224 {
+            c := bins[t]
+            if c != 0 {
+                total += c
+                sum += c * log2_fixed(c)
+                nonzero += 1
+            }
+        }
+        cost := (extra << 16) + ((16 + 5 * nonzero) << 16)
+        if total > 0 {
+            cost += total * log2_fixed(total) - sum
+        }
+        if cost < best_cost {
+            best_cost = cost
+            best = cand
+        }
+    }
+    return best
+}
+
+// The final histogram of cluster histogram h[base..] (counted under `count`
+// with LZ77 lengths from lz_base) under configuration `config`, LZ77
+// lengths from LZ77_MIN_SYMBOL, into freq[0..MAX_ALPHA]; returns the
+// alphabet size (at least 1).
+fn project_histogram(h: &[u32], base: usize, count: u32, lz_base: u32, config: u32, freq: &mut[u64]) -> usize {
+    for s in 0usize..MAX_ALPHA {
+        freq[s] = 0
+    }
+    alphabet := 1usize
+    for s in 0usize..MAX_ALPHA {
+        c := h[base + s] as u64
+        if c == 0 {
+            continue
+        }
+        token := 0usize
+        if s as u32 >= lz_base {
+            token = (LZ77_MIN_SYMBOL + (s as u32 - lz_base)) as usize
+        } else {
+            token = (reproject(s as u32, count, config) & 0xFFFF) as usize
+        }
+        if token >= MAX_ALPHA {
+            token = MAX_ALPHA - 1
+        }
+        freq[token] += c
+        if token + 1 > alphabet {
+            alphabet = token + 1
+        }
+    }
+    return alphabet
+}
+
+// Prefix codes or ANS distributions for a set of clustered histograms.
 struct CodeSet {
     // Context to cluster.
     map: &mut[u8]
-    // Per cluster: lengths and codes at cluster * MAX_ALPHA.
+    // Per cluster: prefix code lengths and codes at cluster * MAX_ALPHA.
     lengths: &mut[u8]
     codes: &mut[u16]
+    // Per cluster: ANS tables, ANS_STRIDE words each (see ans.dodo). Empty
+    // when the set may only use prefix codes.
+    ans: &mut[u16]
     contexts: usize
     clusters: usize
     // Alphabet size per cluster.
     alphabets: [32]u16
-    // Clusters whose code has one symbol, written with zero bits.
+    // Clusters whose prefix code has one symbol, written with zero bits.
     singles: [32]bool
+    // Hybrid integer configuration per cluster (packed).
+    configs: [32]u32
+    // ANS histogram method per cluster (ANS_FLAT, 1 + shift, ANS_SMALL)
+    // and the symbol whose count is implied.
+    methods: [32]u8
+    omits: [32]u16
+    // Configuration of every cluster for build().
     split: u32
     msb: u32
     lsb: u32
     lz77: bool
     min_length: u32
+    // Code with ANS (after build_tuned) instead of prefix codes.
+    use_ans: bool
+    log_alpha: u32
 
-    // Build codes from cluster histograms sums[cluster * MAX_ALPHA..].
+    // A set over `contexts` contexts with the default configuration; `ans`
+    // may be empty.
+    fn new(map: &mut[u8], lengths: &mut[u8], codes: &mut[u16], ans: &mut[u16], contexts: usize, lz77: bool, min_length: u32) -> CodeSet from(map, lengths, codes, ans) {
+        return CodeSet { map: map, lengths: lengths, codes: codes, ans: ans, contexts: contexts, clusters: 1, alphabets: [0u16; 32], singles: [false; 32], configs: [CONFIG_DEFAULT; 32], methods: [0u8; 32], omits: [0u16; 32], split: LIT_SPLIT, msb: LIT_MSB, lsb: LIT_LSB, lz77: lz77, min_length: min_length, use_ans: false, log_alpha: 15 }
+    }
+    // Prefix codes from cluster histograms sums[cluster * MAX_ALPHA..],
+    // counted with the set's configuration (LZ77 lengths from
+    // LZ77_MIN_SYMBOL).
     fn build(&mut self, sums: &[u32]) {
-        freq := [0u64; 272]
+        config := self.split | (self.msb << 8) | (self.lsb << 16)
+        self.build_tuned(sums, config, LZ77_MIN_SYMBOL, false, 0, 1)
+    }
+    // Codes from cluster histograms counted under configuration `count`
+    // with LZ77 lengths from lz_base. With `tune`, each cluster gets the
+    // cheapest of CONFIG_CANDIDATES (otherwise `count`, which must then be
+    // the final configuration with lz_base == LZ77_MIN_SYMBOL). With
+    // ans_level 1 (some shifts) or 2 (every shift) and ANS storage, the set
+    // uses ANS when its estimated size, including a 32-bit state for each of
+    // `streams` streams, is below that of the prefix codes.
+    fn build_tuned(&mut self, sums: &[u32], count: u32, lz_base: u32, tune: bool, ans_level: u32, streams: usize) {
+        freq := [0u64; 288]
+        consider_ans := ans_level > 0 && self.ans.len >= self.clusters * ANS_STRIDE
+        lg := [0u32; 4097]
+        if consider_ans {
+            ans_log_table(&mut lg)
+        }
+        self.use_ans = false
+        self.log_alpha = 15
+        prefix_bits := 0u64
+        ans_cost := 0u64
+        max_alphabet := 1usize
+        max_split := 0u32
         for k in 0usize..self.clusters {
-            alphabet := 1usize
-            for s in 0usize..MAX_ALPHA {
-                freq[s] = sums[k * MAX_ALPHA + s] as u64
-                if freq[s] != 0 {
-                    alphabet = s + 1
-                }
+            config := count
+            if tune {
+                config = choose_config(sums, k * MAX_ALPHA, count, lz_base)
             }
+            self.configs[k] = config
+            if (config & 255) > max_split {
+                max_split = config & 255
+            }
+            alphabet := project_histogram(sums, k * MAX_ALPHA, count, lz_base, config, &mut freq)
             self.alphabets[k] = alphabet as u16
+            if alphabet > max_alphabet {
+                max_alphabet = alphabet
+            }
             base := k * MAX_ALPHA
             used := huffman_lengths(&freq, alphabet, &mut self.lengths[base..base + MAX_ALPHA], MAX_CODE_LENGTH, false)
             self.singles[k] = used <= 1
@@ -308,13 +572,58 @@ struct CodeSet {
                 }
             } else {
                 canonical_codes(&self.lengths[base..base + MAX_ALPHA], alphabet, &mut self.codes[base..base + MAX_ALPHA])
+                for s in 0usize..alphabet {
+                    prefix_bits += freq[s] * self.lengths[base + s] as u64
+                }
             }
             for s in alphabet..MAX_ALPHA {
                 self.lengths[base + s] = 0
             }
+            if consider_ans {
+                if alphabet > 256 {
+                    consider_ans = false
+                } else {
+                    abase := k * ANS_STRIDE
+                    result := ans_choose(&freq, alphabet, ans_level, &lg, &mut self.ans[abase + ANS_FREQ..abase + ANS_FREQ + 256])
+                    self.methods[k] = (result & 255) as u8
+                    self.omits[k] = ((result >> 8) & 0xFFFF) as u16
+                    ans_cost += ans_data_cost(&freq, alphabet, &self.ans[abase + ANS_FREQ..abase + ANS_FREQ + 256], &lg)
+                }
+            }
+        }
+        if !consider_ans {
+            return
+        }
+        log_alpha := 5u32
+        for (1usize << (log_alpha as usize)) < max_alphabet {
+            log_alpha += 1
+        }
+        if max_split > log_alpha {
+            log_alpha = max_split
+        }
+        if log_alpha > 8 {
+            return
+        }
+        empty := [0u8; 1]
+        pw := BitWriter.new(&mut empty[..0], 0)
+        self.write_tables(&mut pw, false, 15)
+        prefix_header := pw.bits_since(0)
+        aw := BitWriter.new(&mut empty[..0], 0)
+        self.write_tables(&mut aw, true, log_alpha)
+        ans_header := aw.bits_since(0)
+        prefix_total := (prefix_bits + prefix_header) << 16
+        ans_total := ans_cost + ((ans_header + 32 * streams as u64) << 16)
+        if ans_total >= prefix_total {
+            return
+        }
+        self.use_ans = true
+        self.log_alpha = log_alpha
+        for k in 0usize..self.clusters {
+            abase := k * ANS_STRIDE
+            ans_tables(&mut self.ans[abase..abase + ANS_STRIDE], log_alpha)
         }
     }
-    // Write symbol s of the cluster that context ctx maps to.
+    // Write symbol s of the cluster that context ctx maps to (prefix codes).
     fn put(&self, w: &mut BitWriter, ctx: usize, s: usize) {
         k := self.map[ctx] as usize
         if !self.singles[k] {
@@ -322,7 +631,7 @@ struct CodeSet {
         }
     }
     // The LZ77 parameters, context map, hybrid integer configurations and
-    // prefix codes, in codestream order.
+    // codes, in codestream order.
     fn write(&self, w: &mut BitWriter) {
         w.bit(self.lz77)
         if self.lz77 {
@@ -334,9 +643,35 @@ struct CodeSet {
         if self.contexts > 1 {
             write_context_map(w, self.map, self.contexts, self.clusters)
         }
-        w.write(1, 1)
+        log_alpha := 15u32
+        if self.use_ans {
+            log_alpha = self.log_alpha
+        }
+        self.write_tables(w, self.use_ans, log_alpha)
+    }
+    // use_prefix_code, the configurations and the prefix codes or ANS
+    // distributions.
+    fn write_tables(&self, w: &mut BitWriter, ans: bool, log_alpha: u32) {
+        w.bit(!ans)
+        if ans {
+            w.write(2, (log_alpha - 5) as u64)
+        }
         for k in 0usize..self.clusters {
-            write_config(w, 15, self.split, self.msb, self.lsb)
+            c := self.configs[k]
+            split := c & 255
+            if split >= log_alpha {
+                // Only values below 2^split occur: msb and lsb are implied.
+                write_config(w, log_alpha, log_alpha, 0, 0)
+            } else {
+                write_config(w, log_alpha, split, (c >> 8) & 255, (c >> 16) & 255)
+            }
+        }
+        if ans {
+            for k in 0usize..self.clusters {
+                abase := k * ANS_STRIDE
+                write_ans_histogram(w, &self.ans[abase + ANS_FREQ..abase + ANS_FREQ + 256], self.alphabets[k] as usize, self.methods[k] as u32, self.omits[k] as usize)
+            }
+            return
         }
         for k in 0usize..self.clusters {
             alphabet := self.alphabets[k] as u32
