@@ -394,6 +394,8 @@ fn exec_drop(e: &mut Engine, s: usize) -> void!db.Error {
         OT_TABLE
     } else if nop(e, s) == 3 {
         OT_VIEW
+    } else if nop(e, s) == 4 {
+        OT_TRIGGER
     } else {
         OT_INDEX
     }
@@ -407,6 +409,8 @@ fn exec_drop(e: &mut Engine, s: usize) -> void!db.Error {
             "no such table: "
         } else if kind == OT_VIEW {
             "no such view: "
+        } else if kind == OT_TRIGGER {
+            "no such trigger: "
         } else {
             "no such index: "
         })
@@ -445,8 +449,17 @@ fn exec_drop(e: &mut Engine, s: usize) -> void!db.Error {
             }
         }
     } else if kind == OT_VIEW {
+        for j in 0usize..e.schema_objs {
+            if obj_type(e, j) == OT_TRIGGER && obj_u(e, j, O_TABLE) == i {
+                let trow = obj_u(e, j, O_ROWNO) as i64
+                schema_delete(e, trow)?
+            }
+        }
         let rowno = obj_u(e, i, O_ROWNO) as i64
         schema_delete(e, rowno)?
+    } else if kind == OT_TRIGGER {
+        let trow2 = obj_u(e, i, O_ROWNO) as i64
+        schema_delete(e, trow2)?
     } else {
         if (obj_flags(e, i) & OF_AUTO) != 0 || obj_u(e, i, O_SQLL) == 0 {
             return err(fail(e, SQLITE_ERROR, "index associated with UNIQUE or PRIMARY KEY constraint cannot be dropped"))

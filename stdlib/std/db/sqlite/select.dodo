@@ -215,6 +215,38 @@ fn resolve_expr(e: &mut Engine, n: usize, sel: usize, allow_agg: bool) -> void!d
         return ok()
     }
     k := nkind(e, n)
+    if k == N_ID && e.trig_t != NO_COL && nc(e, n) != 0 {
+        // Trigger programs: NEW.col and OLD.col are row registers.
+        let q = nc(e, n)
+        let ql = ndd(e, n)
+        is_new := name_is(e, q, ql, "new")
+        if is_new || name_is(e, q, ql, "old") {
+            base := if is_new {
+                e.trig_new
+            } else {
+                e.trig_old
+            }
+            t := e.trig_t
+            let n_a0 = na(e, n)
+            let n_b0 = nb(e, n)
+            c := find_column(e, t, n_a0, n_b0)
+            if base == NO_COL || c == NO_COL && !is_rowid_name(e, n_a0, n_b0) {
+                return err(no_such_column(e, n))
+            }
+            set_kind(e, n, N_REG)
+            let reg = base + if c == NO_COL {
+                obj_ncol(e, t)
+            } else {
+                c
+            }
+            set_nf(e, n, 0, reg)
+            return ok()
+        }
+    }
+    if k == N_RAISE {
+        let msg = na(e, n)
+        return resolve_expr(e, msg, sel, allow_agg)
+    }
     if k == N_ID {
         // CHECK constraints: names refer to the new row's registers.
         let n_c = nc(e, n)
@@ -599,7 +631,7 @@ fn max_level(e: &Engine, n: usize, info: usize, nlev: usize) -> usize {
         }
         return NO_COL
     }
-    if k == N_SUBQ || k == N_EXISTS || k == N_INSEL || k == N_AGG || k == N_ALIAS {
+    if k == N_SUBQ || k == N_EXISTS || k == N_INSEL || k == N_AGG || k == N_ALIAS || k == N_RAISE {
         return 1000
     }
     if k == N_FUNC {

@@ -116,6 +116,10 @@ fn compile_slot(e: &mut Engine, slot: usize) -> void!db.Error {
     e.cte_n = 0
     e.min_ctx = NO_COL
     e.regctx_t = NO_COL
+    e.trig_t = NO_COL
+    e.trig_parse = false
+    e.tstack_off = 0
+    e.tstack_n = 0
     next_token(e)
     root := 0usize
     if e.tk == TK_EOF || e.tk == TK_SEMI {
@@ -276,6 +280,7 @@ fn stmt_start(e: &mut Engine, slot: usize, params: &[db.Value]) -> void!db.Error
         stmt_finish(e, slot, true)?
     }
     e.error_offset = -1
+    e.raise_kind = 0
     activate(e, slot)
     kind := sh(e, slot, SH_KIND) as u8
     root := sh(e, slot, SH_ROOT)
@@ -290,7 +295,7 @@ fn stmt_start(e: &mut Engine, slot: usize, params: &[db.Value]) -> void!db.Error
     if kind == S_PRAGMA {
         write = pragma_writes(e, nodes_root)
     } else {
-        write = kind == S_INSERT || kind == S_UPDATE || kind == S_DELETE || kind == S_CREATE_TABLE || kind == S_CREATE_INDEX || kind == S_DROP || kind == S_ALTER || kind == S_CREATE_VIEW
+        write = kind == S_INSERT || kind == S_UPDATE || kind == S_DELETE || kind == S_CREATE_TABLE || kind == S_CREATE_INDEX || kind == S_DROP || kind == S_ALTER || kind == S_CREATE_VIEW || kind == S_CREATE_TRIGGER
     }
     if write {
         begin_write(e)?
@@ -419,6 +424,30 @@ fn stmt_step(e: &mut Engine, slot: usize) -> bool!db.Error {
             ok(row)
         },
         err(reason) => {
+            kind := e.raise_kind
+            e.raise_kind = 0
+            if kind == RAISE_FAIL {
+                // FAIL keeps the changes made before the failure.
+                saved := e.msg_len
+                match stmt_finish(e, slot, true) {
+                    ok() => {},
+                    err(_) => {},
+                }
+                e.msg_len = saved
+                return err(reason)
+            }
+            if kind == RAISE_ROLLBACK && e.explicit_txn {
+                saved2 := e.msg_len
+                stmt_fail(e, slot)
+                match rollback(e) {
+                    ok() => {},
+                    err(_) => {},
+                }
+                e.explicit_txn = false
+                unlock_to(e, false)
+                e.msg_len = saved2
+                return err(reason)
+            }
             stmt_fail(e, slot)
             err(reason)
         },
@@ -487,6 +516,8 @@ fn step_inner(e: &mut Engine, slot: usize) -> bool!db.Error {
         exec_create_index(e, root)?
     } else if kind == S_CREATE_VIEW {
         exec_create_view(e, root)?
+    } else if kind == S_CREATE_TRIGGER {
+        exec_create_trigger(e, root)?
     } else if kind == S_DROP {
         exec_drop(e, root)?
     } else if kind == S_ALTER {
@@ -569,6 +600,7 @@ fn stmt_finish(e: &mut Engine, slot: usize, success: bool) -> void!db.Error {
     kind := sh(e, slot, SH_KIND) as u8
     if kind == S_INSERT || kind == S_UPDATE || kind == S_DELETE {
         e.total_changes += e.changes
+        e.last_changes = e.changes
     }
     stmt_end(e)
     if !success {
@@ -627,6 +659,10 @@ fn stmt_fail(e: &mut Engine, slot: usize) {
     }
     stmt_end(e)
     e.changes = 0
+    kind := sh(e, slot, SH_KIND) as u8
+    if kind == S_INSERT || kind == S_UPDATE || kind == S_DELETE {
+        e.last_changes = 0
+    }
     e.msg_len = saved_len
 }
 

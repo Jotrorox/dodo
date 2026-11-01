@@ -108,7 +108,7 @@ pub struct Connection {
     }
 
     pub fn changes(&self) -> u64 {
-        self.e.changes
+        self.e.last_changes
     }
 
     pub fn total_changes(&self) -> u64 {
@@ -177,9 +177,22 @@ pub struct Connection {
         if e.tk == TK_EOF {
             return ok(0)
         }
-        // A CREATE TRIGGER body could contain semicolons; triggers are not
-        // supported, so the first top-level semicolon ends the statement.
-        for e.tk != TK_EOF && e.tk != TK_SEMI {
+        // Like sqlite3_complete: inside CREATE [TEMP] TRIGGER, only a
+        // semicolon after END ends the statement.
+        trigger := false
+        if is_kw(e, "CREATE") {
+            next_token(e)
+            if is_kw(e, "TEMP") || is_kw(e, "TEMPORARY") {
+                next_token(e)
+            }
+            trigger = is_kw(e, "TRIGGER")
+        }
+        after_end := false
+        for e.tk != TK_EOF {
+            if e.tk == TK_SEMI && (!trigger || after_end) {
+                break
+            }
+            after_end = e.tk == TK_ID && is_kw(e, "END")
             next_token(e)
         }
         if e.tk != TK_SEMI && bytes.len < all.len {

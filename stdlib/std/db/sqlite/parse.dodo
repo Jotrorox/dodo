@@ -1362,7 +1362,11 @@ fn parse_primary(e: &mut Engine) -> usize!db.Error {
             return ok(n)
         }
         if is_kw(e, "RAISE") {
-            return err(fail(e, SQLITE_ERROR, "RAISE is only valid in triggers"))
+            if !e.trig_parse {
+                return err(fail(e, SQLITE_ERROR, "RAISE() may only be used within a trigger-program"))
+            }
+            next_token(e)
+            return parse_raise(e)
         }
         if is_reserved(e) && !((is_kw(e, "REPLACE") || is_kw(e, "LIKE") || is_kw(e, "GLOB")) && next_is_lparen(e)) {
             return err(syntax_error(e))
@@ -2373,8 +2377,11 @@ fn parse_create(e: &mut Engine, sql_start: usize) -> usize!db.Error {
         next_token(e)
         return parse_create_view(e)
     }
-    if is_kw(e, "TRIGGER") || is_kw(e, "VIRTUAL") {
-        return err(fail(e, SQLITE_ERROR, "triggers and virtual tables are not supported"))
+    if accept_kw(e, "TRIGGER") {
+        return parse_create_trigger(e)
+    }
+    if is_kw(e, "VIRTUAL") {
+        return err(fail(e, SQLITE_ERROR, "virtual tables are not supported"))
     }
     expect_kw(e, "TABLE")?
     s := new_node(e, S_CREATE_TABLE)?
@@ -2763,7 +2770,7 @@ fn parse_drop(e: &mut Engine) -> usize!db.Error {
     } else if accept_kw(e, "VIEW") {
         set_op(e, s, 3)
     } else if accept_kw(e, "TRIGGER") {
-        return err(fail(e, SQLITE_ERROR, "triggers are not supported"))
+        set_op(e, s, 4)
     } else {
         return err(syntax_error(e))
     }

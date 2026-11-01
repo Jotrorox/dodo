@@ -142,11 +142,14 @@ fn new_obj(e: &mut Engine) -> usize!db.Error {
     ok(i)
 }
 
+// Kind 0 finds tables, indexes and views; triggers have their own name
+// space.
 fn find_obj(e: &Engine, kind: u8, name: usize, len: usize) -> usize {
     for i in 0usize..e.schema_objs {
         let name2 = obj_u(e, i, O_NAME)
         let name_len = obj_u(e, i, O_NAMEL)
-        if (kind == 0 || obj_type(e, i) == kind) && names_eq(e, name2, name_len, name, len) {
+        let ty = obj_type(e, i)
+        if (kind == 0 && ty != OT_TRIGGER || ty == kind) && names_eq(e, name2, name_len, name, len) {
             return i
         }
     }
@@ -309,14 +312,28 @@ fn load_schema(e: &mut Engine) -> void!db.Error {
             let tbl = obj_u(e, i, O_TBL)
             let tbl_len = obj_u(e, i, O_TBLL)
             t := find_obj(e, OT_TABLE, tbl, tbl_len)
+            if t == NO_COL && k == OT_TRIGGER {
+                t = find_obj(e, OT_VIEW, tbl, tbl_len)
+            }
             o := obj(e, i)
             stu(e.ws, o + O_TABLE, t)
             if t == NO_COL {
                 continue
             }
             if k == OT_TRIGGER {
-                ot := obj(e, t)
-                e.ws[ot + O_FLAGS] = e.ws[ot + O_FLAGS] | OF_HAS_TRIGGER
+                match load_trigger(e, i) {
+                    ok() => {},
+                    err(_) => {
+                        // Writes must not silently skip a trigger.
+                        ot := obj(e, t)
+                        e.ws[ot + O_FLAGS] = e.ws[ot + O_FLAGS] | OF_HAS_TRIGGER
+                        o3 := obj(e, i)
+                        e.ws[o3 + O_TABLE] = 255
+                        e.ws[o3 + O_TABLE + 1] = 255
+                        e.ws[o3 + O_TABLE + 2] = 255
+                        e.ws[o3 + O_TABLE + 3] = 255
+                    },
+                }
                 continue
             }
             match load_index(e, i, t) {

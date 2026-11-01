@@ -27,7 +27,12 @@ const W_UPSERT: usize = 72
 const W_RET: usize = 76
 const W_RETREG: usize = 80
 const W_NRET: usize = 84
-const W_BYTES: usize = 88
+const W_TRIG: usize = 88
+const W_NTRIG: usize = 92
+const W_TNEW: usize = 96
+const W_VIEW: usize = 100
+const W_TOLD: usize = 104
+const W_BYTES: usize = 112
 
 const ROWID_TARGET: usize = 4294967294
 
@@ -89,7 +94,7 @@ fn table_for_write(e: &mut Engine, o: usize, l: usize) -> usize!db.Error {
         return err(fail(e, SQLITE_ERROR, "table uses unsupported features"))
     }
     if (flags & OF_HAS_TRIGGER) != 0 {
-        return err(fail(e, SQLITE_ERROR, "tables with triggers cannot be modified by this driver"))
+        return err(fail(e, SQLITE_ERROR, "table has a trigger this driver cannot read"))
     }
     if (flags & OF_UNSUPPORTED_INDEX) != 0 {
         return err(fail(e, SQLITE_ERROR, "table has an index this driver cannot read"))
@@ -221,10 +226,40 @@ fn open_write_cursors(e: &mut Engine, w: usize) {
 // INSERT
 
 fn resolve_insert(e: &mut Engine, s: usize) -> void!db.Error {
+    let s_a0 = na(e, s)
+    let s_b0 = nb(e, s)
+    view := view_target(e, s_a0, s_b0, TE_INSERT)
+    resolve_insert_rows(e, s, view)?
+    w := sget_w(e, s)
+    t := wget(e, w, W_TABLE)
+    compile_triggers(e, s, w, t, TE_INSERT)?
+    view_needs_trigger(e, w)
+}
+
+// Marks a constraint failure under OR FAIL / OR ROLLBACK, which keep the
+// statement's earlier changes or abandon the whole transaction.
+fn conf_mark(e: &mut Engine, conf: u8) {
+    if conf == OE_FAIL {
+        e.raise_kind = RAISE_FAIL
+    } else if conf == OE_ROLLBACK {
+        e.raise_kind = RAISE_ROLLBACK
+    }
+}
+
+fn resolve_insert_rows(e: &mut Engine, s: usize, view: usize) -> void!db.Error {
     let s_a = na(e, s)
     let s_b = nb(e, s)
-    t := table_for_write(e, s_a, s_b)?
+    t := 0usize
+    if view != 0 {
+        if nff(e, s) != 0 {
+            return err(fail(e, SQLITE_ERROR, "cannot UPSERT a view"))
+        }
+        t = view_columns(e, view - 1)?
+    } else {
+        t = table_for_write(e, s_a, s_b)?
+    }
     w := write_info(e, s, t)?
+    stu(e.ws, w + W_VIEW, view)
     ncol := obj_ncol(e, t)
     ipk := rowid_col(e, t)
     // Target list.
@@ -652,9 +687,26 @@ fn do_upsert(e: &mut Engine, w: usize, r: i64) -> void!db.Error {
         reg_own(e, base + i)?
     }
     e.rtop = save
+    if has_triggers(e, w, trig_mask(TE_UPDATE, TT_BEFORE)) {
+        load_trigger_old(e, w, old)?
+        for i in 0usize..ncol {
+            if i != ipk {
+                let aff = col_aff(e, t, i)
+                apply_affinity(e, base + i, aff)?
+            }
+        }
+        if !fire_triggers(e, w, trig_mask(TE_UPDATE, TT_BEFORE))? {
+            return ok()
+        }
+    } else {
+        load_trigger_old(e, w, old)?
+    }
     last := e.last_rowid
-    write_row(e, w, OE_ABORT, true, r)?
+    written := write_row(e, w, OE_ABORT, true, r)?
     e.last_rowid = last
+    if written && has_triggers(e, w, trig_mask(TE_UPDATE, TT_AFTER)) {
+        fire_triggers(e, w, trig_mask(TE_UPDATE, TT_AFTER))?
+    }
     ok()
 }
 
@@ -704,7 +756,7 @@ fn exec_insert(e: &mut Engine, s: usize) -> void!db.Error {
         mark := e.arena_top
         clear_row(e, w)
         fill_defaults(e, w, 0)?
-        write_row(e, w, conf, false, 0)?
+        insert_row(e, w, conf)?
         arena_reset(e, mark)
         return ok()
     }
@@ -726,7 +778,7 @@ fn exec_insert(e: &mut Engine, s: usize) -> void!db.Error {
                 x = nnext(e, x)
             }
             e.rtop = save
-            write_row(e, w, conf, false, 0)?
+            insert_row(e, w, conf)?
             arena_reset(e, mark)
             row = nnext(e, row)
         }
@@ -759,10 +811,19 @@ fn exec_insert(e: &mut Engine, s: usize) -> void!db.Error {
             record_column(e, p + 4, len, k, R_TMP)?
             set_target(e, w, k, R_TMP)
         }
-        write_row(e, w, conf, false, 0)?
+        insert_row(e, w, conf)?
         arena_reset(e, mark)
     }
     e.sort_hi = hi
+    ok()
+}
+
+fn insert_row(e: &mut Engine, w: usize, conf: u8) -> void!db.Error {
+    if wget(e, w, W_VIEW) != 0 {
+        fire_triggers(e, w, trig_mask(TE_INSERT, TT_INSTEAD))?
+        return ok()
+    }
+    write_row(e, w, conf, false, 0)?
     ok()
 }
 
@@ -938,6 +999,36 @@ fn write_row(e: &mut Engine, w: usize, conf: u8, update: bool, old_rowid: i64) -
     seq_obj := wget(e, w, W_SEQ)
     seq_value := 0i64
     seq_rowid := 0i64
+    if !update && has_triggers(e, w, trig_mask(TE_INSERT, TT_BEFORE)) {
+        // NEW for BEFORE INSERT: values with affinity applied; an automatic
+        // rowid reads as -1.
+        tnew := wget(e, w, W_TNEW)
+        for i in 0usize..ncol {
+            copy_reg(e, tnew + i, base + i)
+            if i != ipk {
+                let aff0 = col_aff(e, t, i)
+                apply_affinity(e, tnew + i, aff0)?
+            }
+        }
+        copy_reg(e, tnew + ncol, rid)
+        if rtype(e, tnew + ncol) == T_NULL {
+            set_int(e, tnew + ncol, -1)
+        } else {
+            compare_affinity(e, tnew + ncol, AFF_NUMERIC)?
+            if rtype(e, tnew + ncol) == T_REAL {
+                let (exact0, iv0) = real_as_int(rreal(e, tnew + ncol))
+                if exact0 {
+                    set_int(e, tnew + ncol, iv0)
+                }
+            }
+        }
+        if ipk != NO_COL {
+            copy_reg(e, tnew + ipk, tnew + ncol)
+        }
+        if !fire_triggers(e, w, trig_mask(TE_INSERT, TT_BEFORE))? {
+            return ok(false)
+        }
+    }
     // Rowid.
     if rtype(e, rid) != T_NULL {
         compare_affinity(e, rid, AFF_NUMERIC)?
@@ -1033,6 +1124,7 @@ fn write_row(e: &mut Engine, w: usize, conf: u8, update: bool, old_rowid: i64) -
                 continue
             }
         }
+        conf_mark(e, conf)
         return err(constraint_fail(e, SQLITE_CONSTRAINT_NOTNULL, "NOT NULL", t, i, 0, NO_COL))
     }
     // CHECK.
@@ -1047,6 +1139,7 @@ fn write_row(e: &mut Engine, w: usize, conf: u8, update: bool, old_rowid: i64) -
             let name = obj_u(e, t, O_NAME)
             let name_len = obj_u(e, t, O_NAMEL)
             msg_add_ws(e, name, name_len)
+            conf_mark(e, conf)
             return err(make_error(e, SQLITE_CONSTRAINT_CHECK))
         }
     }
@@ -1063,6 +1156,7 @@ fn write_row(e: &mut Engine, w: usize, conf: u8, update: bool, old_rowid: i64) -
             if conf == OE_REPLACE {
                 delete_row(e, w, rowid)?
             } else {
+                conf_mark(e, conf)
                 return err(constraint_fail(e, SQLITE_CONSTRAINT_PRIMARYKEY, "UNIQUE", t, ipk, 0, NO_COL))
             }
         }
@@ -1112,6 +1206,7 @@ fn write_row(e: &mut Engine, w: usize, conf: u8, update: bool, old_rowid: i64) -
             } else {
                 SQLITE_CONSTRAINT_UNIQUE
             }
+            conf_mark(e, conf)
             return err(constraint_fail(e, code, "UNIQUE", t, 0, n, x))
         }
     }
@@ -1119,7 +1214,24 @@ fn write_row(e: &mut Engine, w: usize, conf: u8, update: bool, old_rowid: i64) -
         delete_row(e, w, old_rowid)?
     }
     store_row(e, w, rowid)?
+    if !update && has_triggers(e, w, trig_mask(TE_INSERT, TT_AFTER)) {
+        fire_triggers(e, w, trig_mask(TE_INSERT, TT_AFTER))?
+    }
     ok(true)
+}
+
+// Trigger OLD registers: a copy of the row as it was before the change.
+fn load_trigger_old(e: &mut Engine, w: usize, src: usize) -> void!db.Error {
+    told := wget(e, w, W_TOLD)
+    if told == 0 {
+        return ok()
+    }
+    ncol := wget(e, w, W_NCOL)
+    for k in 0usize..(ncol + 1) {
+        copy_reg(e, told + k, src + k)
+        reg_own(e, told + k)?
+    }
+    ok()
 }
 
 fn store_row(e: &mut Engine, w: usize, rowid: i64) -> void!db.Error {
@@ -1296,6 +1408,58 @@ fn synth_select(e: &mut Engine, s: usize, t: usize) -> usize!db.Error {
 }
 
 fn resolve_update(e: &mut Engine, s: usize) -> void!db.Error {
+    let s_a0 = na(e, s)
+    let s_b0 = nb(e, s)
+    view := view_target(e, s_a0, s_b0, TE_UPDATE)
+    if view != 0 {
+        resolve_view_update(e, s, view)?
+    } else {
+        resolve_update_table(e, s)?
+    }
+    w := sget_w(e, s)
+    t := wget(e, w, W_TABLE)
+    compile_triggers(e, s, w, t, TE_UPDATE)?
+    view_needs_trigger(e, w)
+}
+
+fn resolve_view_update(e: &mut Engine, s: usize, view: usize) -> void!db.Error {
+    t := view_columns(e, view - 1)?
+    w := write_info(e, s, t)?
+    stu(e.ws, w + W_VIEW, view)
+    ncol := obj_ncol(e, t)
+    told := alloc_regs(e, ncol + 1)?
+    stu(e.ws, w + W_TOLD, told)
+    sel := view_rows_select(e, s)?
+    stu(e.ws, w + W_SEL, sel)
+    let s_c = nc(e, s)
+    nset := list_len(e, s_c)
+    sets := pool_alloc(e, nset * 8 + 4)?
+    st := nc(e, s)
+    k := 0usize
+    for st != 0 {
+        let st_a = na(e, st)
+        let st_b = nb(e, st)
+        col := find_column(e, t, st_a, st_b)
+        if col == NO_COL {
+            return err(fail2(e, SQLITE_ERROR, "no such column: ", st_a, st_b))
+        }
+        let x = nc(e, st)
+        e.regctx_t = t
+        e.regctx_base = told
+        res := resolve_expr(e, x, 0, false)
+        e.regctx_t = NO_COL
+        res?
+        stu(e.ws, sets + k * 8, col)
+        stu(e.ws, sets + k * 8 + 4, x)
+        k += 1
+        st = nnext(e, st)
+    }
+    stu(e.ws, w + W_SETS, sets)
+    stu(e.ws, w + W_NSET, nset)
+    ok()
+}
+
+fn resolve_update_table(e: &mut Engine, s: usize) -> void!db.Error {
     let s_a = na(e, s)
     let s_b = nb(e, s)
     t := table_for_write(e, s_a, s_b)?
@@ -1374,6 +1538,11 @@ fn collect_rowids(e: &mut Engine, sel: usize) -> (usize, usize)!db.Error {
 
 fn exec_update(e: &mut Engine, s: usize) -> void!db.Error {
     w := sget_w(e, s)
+    if wget(e, w, W_VIEW) != 0 {
+        return exec_view_update(e, w)
+    }
+    has_before := has_triggers(e, w, trig_mask(TE_UPDATE, TT_BEFORE))
+    has_after := has_triggers(e, w, trig_mask(TE_UPDATE, TT_AFTER))
     sel := wget(e, w, W_SEL)
     let (start, n) = collect_rowids(e, sel)?
     e.ret_start = e.sort_top
@@ -1406,6 +1575,9 @@ fn exec_update(e: &mut Engine, s: usize) -> void!db.Error {
             }
         }
         set_int(e, base + ncol, rowid)
+        if has_before || has_after {
+            load_trigger_old(e, w, base)?
+        }
         // Evaluate every SET expression against the old row first.
         save := e.rtop
         first := e.rtop
@@ -1432,7 +1604,46 @@ fn exec_update(e: &mut Engine, s: usize) -> void!db.Error {
         if rtype(e, base + ncol) == T_NULL {
             return err(fail(e, SQLITE_MISMATCH, "datatype mismatch"))
         }
-        write_row(e, w, conf, true, rowid)?
+        if has_before {
+            for k in 0usize..ncol {
+                if k != ipk {
+                    let aff = col_aff(e, t, k)
+                    apply_affinity(e, base + k, aff)?
+                }
+            }
+            if !fire_triggers(e, w, trig_mask(TE_UPDATE, TT_BEFORE))? {
+                arena_reset(e, mark)
+                continue
+            }
+            // The trigger may have deleted the row or changed the columns
+            // this UPDATE does not assign.
+            let root2 = obj_root(e, t)
+            cur_open(e, scan, root2, false)
+            if !seek_rowid(e, scan, rowid)? {
+                arena_reset(e, mark)
+                continue
+            }
+            let (p2, len2) = cur_payload(e, scan)?
+            for k in 0usize..ncol {
+                assigned := false
+                for j in 0usize..nset {
+                    if ldu(e.ws, sets + j * 8) == k {
+                        assigned = true
+                    }
+                }
+                if assigned || k == ipk {
+                    continue
+                }
+                if !record_column(e, p2, len2, k, base + k)? {
+                    column_default(e, t, k, base + k)?
+                }
+                reg_own(e, base + k)?
+            }
+        }
+        written := write_row(e, w, conf, true, rowid)?
+        if written && has_after {
+            fire_triggers(e, w, trig_mask(TE_UPDATE, TT_AFTER))?
+        }
         arena_reset(e, mark)
     }
     ok()
@@ -1441,17 +1652,35 @@ fn exec_update(e: &mut Engine, s: usize) -> void!db.Error {
 fn resolve_delete(e: &mut Engine, s: usize) -> void!db.Error {
     let s_a = na(e, s)
     let s_b = nb(e, s)
+    view := view_target(e, s_a, s_b, TE_DELETE)
+    if view != 0 {
+        t := view_columns(e, view - 1)?
+        w := write_info(e, s, t)?
+        stu(e.ws, w + W_VIEW, view)
+        let ncol = obj_ncol(e, t)
+        told := alloc_regs(e, ncol + 1)?
+        stu(e.ws, w + W_TOLD, told)
+        sel := view_rows_select(e, s)?
+        stu(e.ws, w + W_SEL, sel)
+        compile_triggers(e, s, w, t, TE_DELETE)?
+        return view_needs_trigger(e, w)
+    }
     t := table_for_write(e, s_a, s_b)?
     w := write_info(e, s, t)?
     sel := synth_select(e, s, t)?
     stu(e.ws, w + W_SEL, sel)
-    ok()
+    compile_triggers(e, s, w, t, TE_DELETE)
 }
 
 fn exec_delete(e: &mut Engine, s: usize) -> void!db.Error {
     w := sget_w(e, s)
+    if wget(e, w, W_VIEW) != 0 {
+        return exec_view_delete(e, w)
+    }
     t := wget(e, w, W_TABLE)
-    if ndd(e, s) == 0 && wget(e, w, W_RET) == 0 {
+    has_before := has_triggers(e, w, trig_mask(TE_DELETE, TT_BEFORE))
+    has_after := has_triggers(e, w, trig_mask(TE_DELETE, TT_AFTER))
+    if ndd(e, s) == 0 && wget(e, w, W_RET) == 0 && !has_before && !has_after {
         // DELETE without WHERE: clear the table and its indexes.
         let root = obj_root(e, t)
         count := btree_count(e, root, MAX_DEPTH)?
@@ -1470,13 +1699,58 @@ fn exec_delete(e: &mut Engine, s: usize) -> void!db.Error {
     let (start, n) = collect_rowids(e, sel)?
     e.ret_start = e.sort_top
     open_write_cursors(e, w)
+    c := wget(e, w, W_CUR)
     for i in 0usize..n {
         rowid := u2i(ld64(e.ws, start + i * 8))
         mark := e.arena_top
+        if has_before || has_after {
+            if !load_old_row(e, w, rowid)? {
+                arena_reset(e, mark)
+                continue
+            }
+            let old0 = wget(e, w, W_OLD)
+            load_trigger_old(e, w, old0)?
+        }
+        if has_before {
+            if !fire_triggers(e, w, trig_mask(TE_DELETE, TT_BEFORE))? {
+                arena_reset(e, mark)
+                continue
+            }
+            if !seek_rowid(e, c, rowid)? {
+                arena_reset(e, mark)
+                continue
+            }
+        }
         delete_row(e, w, rowid)?
         e.changes += 1
         push_returning(e, w)?
+        if has_after {
+            fire_triggers(e, w, trig_mask(TE_DELETE, TT_AFTER))?
+        }
         arena_reset(e, mark)
     }
     ok()
+}
+
+// Decodes row `rowid` into the W_OLD registers; false when it is gone.
+fn load_old_row(e: &mut Engine, w: usize, rowid: i64) -> bool!db.Error {
+    t := wget(e, w, W_TABLE)
+    c := wget(e, w, W_CUR)
+    old := wget(e, w, W_OLD)
+    ncol := wget(e, w, W_NCOL)
+    if !seek_rowid(e, c, rowid)? {
+        return ok(false)
+    }
+    ipk := rowid_col(e, t)
+    let (p, len) = cur_payload(e, c)?
+    for i in 0usize..ncol {
+        if i == ipk {
+            set_int(e, old + i, rowid)
+        } else if !record_column(e, p, len, i, old + i)? {
+            column_default(e, t, i, old + i)?
+        }
+        reg_own(e, old + i)?
+    }
+    set_int(e, old + ncol, rowid)
+    ok(true)
 }
