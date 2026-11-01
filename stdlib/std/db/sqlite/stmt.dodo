@@ -221,7 +221,7 @@ fn compile_slot(e: &mut Engine, slot: usize) -> void!db.Error {
         let root_a = na(e, root)
         let root_b = nb(e, root)
         pragma = pragma_id(e, root_a, root_b)
-        if nflags(e, root) == 1 && pragma != P_BUSY_TIMEOUT {
+        if nflags(e, root) == 1 && !pragma_set_returns_row(pragma) {
             ncol = 0
         } else {
             ncol = pragma_columns(pragma)
@@ -537,6 +537,7 @@ fn stmt_finish(e: &mut Engine, slot: usize, success: bool) -> void!db.Error {
     if kind == S_INSERT || kind == S_UPDATE || kind == S_DELETE {
         e.total_changes += e.changes
     }
+    e.w.read_fresh = false
     stmt_end(e)
     if !success {
         return ok()
@@ -572,6 +573,7 @@ fn stmt_fail(e: &mut Engine, slot: usize) {
     sh_set(e, slot, SH_PN, 0)
     sh_set(e, slot, SH_PPOS, 0)
     sh_set(e, slot, SH_PIDX, 0)
+    e.w.read_fresh = false
     if e.explicit_txn && e.write_txn {
         undone := match stmt_rollback(e) {
             ok(v) => v,

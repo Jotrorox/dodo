@@ -26,6 +26,8 @@ const P_AUTO_VACUUM: usize = 17
 const P_DATABASE_LIST: usize = 18
 const P_TABLE_LIST: usize = 19
 const P_IGNORED: usize = 20
+const P_WAL_CHECKPOINT: usize = 40
+const P_WAL_AUTOCHECKPOINT: usize = 41
 
 fn pragma_id(e: &Engine, o: usize, l: usize) -> usize {
     if name_is(e, o, l, "user_version") {
@@ -85,6 +87,12 @@ fn pragma_id(e: &Engine, o: usize, l: usize) -> usize {
     if name_is(e, o, l, "table_list") {
         return P_TABLE_LIST
     }
+    if name_is(e, o, l, "wal_checkpoint") {
+        return P_WAL_CHECKPOINT
+    }
+    if name_is(e, o, l, "wal_autocheckpoint") {
+        return P_WAL_AUTOCHECKPOINT
+    }
     P_IGNORED
 }
 
@@ -95,7 +103,7 @@ fn pragma_columns(id: usize) -> usize {
     if id == P_INDEX_LIST {
         return 5
     }
-    if id == P_INDEX_INFO || id == P_DATABASE_LIST {
+    if id == P_INDEX_INFO || id == P_DATABASE_LIST || id == P_WAL_CHECKPOINT {
         return 3
     }
     if id == P_TABLE_LIST {
@@ -127,6 +135,13 @@ fn pragma_column_name(id: usize, i: usize) -> &str from(static) {
     if id == P_TABLE_LIST {
         names := ["schema", "name", "type", "ncol", "wr", "strict"]
         return names[i]
+    }
+    if id == P_WAL_CHECKPOINT {
+        names := ["busy", "log", "checkpointed"]
+        return names[i]
+    }
+    if id == P_WAL_AUTOCHECKPOINT {
+        return "wal_autocheckpoint"
     }
     if id == P_USER_VERSION {
         return "user_version"
@@ -171,6 +186,30 @@ fn pragma_column_name(id: usize, i: usize) -> &str from(static) {
         return "auto_vacuum"
     }
     ""
+}
+
+// True when the set form (PRAGMA x = v) still returns a row.
+fn pragma_set_returns_row(id: usize) -> bool {
+    id == P_BUSY_TIMEOUT || id == P_JOURNAL_MODE || id == P_WAL_CHECKPOINT || id == P_WAL_AUTOCHECKPOINT
+}
+
+// The pragma argument as text (workspace offset, length); (0, 0) if absent
+// or not text.
+fn pragma_text_arg(e: &mut Engine, s: usize) -> (usize, usize)!db.Error {
+    if nflags(e, s) == 0 {
+        return ok((0usize, 0usize))
+    }
+    v := nc(e, s)
+    save := e.rtop
+    r := reg_push(e)?
+    eval(e, v, r)?
+    res := if rtype(e, r) == T_TEXT {
+        (roff(e, r), rlen(e, r))
+    } else {
+        (0usize, 0usize)
+    }
+    e.rtop = save
+    ok(res)
 }
 
 // True when the pragma modifies the database (needs a write transaction).
@@ -269,12 +308,59 @@ fn exec_pragma(e: &mut Engine, s: usize, resreg: usize) -> void!db.Error {
         return prow(e, r, 1)
     }
     if id == P_JOURNAL_MODE {
-        let value3 = if e.memory {
-            "memory"
+        mode := journal_mode_pragma(e, s)?
+        set_text_str(e, r, mode)?
+        return prow(e, r, 1)
+    }
+    if id == P_WAL_CHECKPOINT {
+        let (to, tl) = pragma_text_arg(e, s)?
+        mode := if name_is(e, to, tl, "full") {
+            CKPT_FULL
+        } else if name_is(e, to, tl, "restart") {
+            CKPT_RESTART
+        } else if name_is(e, to, tl, "truncate") {
+            CKPT_TRUNCATE
         } else {
-            "delete"
+            CKPT_PASSIVE
         }
-        set_text_str(e, r, value3)?
+        // Like SQLite, a checkpoint cannot run inside a transaction that
+        // has already read or written.
+        if e.write_txn || (e.explicit_txn && !e.w.read_fresh) {
+            return err(fail(e, SQLITE_LOCKED, "database table is locked"))
+        }
+        busy_flag := false
+        log := -1i64
+        done := -1i64
+        if e.w.open {
+            // The checkpoint runs outside this statement's read transaction.
+            wal_end_read(e)
+            let (b, l, d) = wal_checkpoint(e, mode)?
+            busy_flag = b
+            log = l
+            done = d
+        }
+        set_int(e, r, if busy_flag {
+            1i64
+        } else {
+            0i64
+        })
+        set_int(e, r + 1, log)
+        set_int(e, r + 2, done)
+        return prow(e, r, 3)
+    }
+    if id == P_WAL_AUTOCHECKPOINT {
+        if set {
+            v := pragma_int_arg(e, s)?
+            e.w.autockpt = if v <= 0 {
+                0u32
+            } else if v > 2147483647 {
+                2147483647u32
+            } else {
+                v as u32
+            }
+        }
+        let value7 = e.w.autockpt as i64
+        set_int(e, r, value7)
         return prow(e, r, 1)
     }
     if id == P_FOREIGN_KEYS || id == P_AUTO_VACUUM {
@@ -687,4 +773,82 @@ fn integrity_check(e: &mut Engine, r: usize) -> void!db.Error {
         prow(e, r, 1)?
     }
     ok()
+}
+
+// PRAGMA journal_mode [= mode]. Supported modes are DELETE (rollback
+// journal) and WAL; converting runs a write transaction that sets the file
+// format version bytes (2 = WAL), as SQLite does. Other modes are accepted
+// as DELETE. In-memory databases always report "memory".
+fn journal_mode_pragma(e: &mut Engine, s: usize) -> &str!db.Error from(static) {
+    if e.memory {
+        return ok("memory")
+    }
+    let (to, tl) = pragma_text_arg(e, s)?
+    want_wal := name_is(e, to, tl, "wal")
+    want_rollback := name_is(e, to, tl, "delete") || name_is(e, to, tl, "persist") || name_is(e, to, tl, "truncate") || name_is(e, to, tl, "off") || name_is(e, to, tl, "memory")
+    if want_wal && !e.w.open {
+        if e.explicit_txn {
+            return err(fail(e, SQLITE_ERROR, "cannot change into wal mode from within a transaction"))
+        }
+        begin_write(e)?
+        if !e.w.open {
+            d := pg_write(e, 1)?
+            e.ws[d + 18] = 2
+            e.ws[d + 19] = 2
+        }
+        commit(e)?
+        return ok("wal")
+    }
+    if want_rollback && e.w.open {
+        if e.explicit_txn {
+            return err(fail(e, SQLITE_ERROR, "cannot change out of wal mode from within a transaction"))
+        }
+        wal_leave(e)?
+        return ok("delete")
+    }
+    if e.w.open {
+        return ok("wal")
+    }
+    ok("delete")
+}
+
+// Converts a WAL database back to rollback-journal mode: needs an EXCLUSIVE
+// lock on the database file (no other connection), checkpoints everything,
+// deletes the -wal and -shm files and resets the version bytes to 1.
+fn wal_leave(e: &mut Engine) -> void!db.Error {
+    wal_end_read(e)
+    saved := e.busy_retries
+    e.busy_retries = 0
+    locked := lock_exclusive(e)
+    e.busy_retries = saved
+    locked?
+    let (b, log, done) = match wal_checkpoint(e, CKPT_PASSIVE) {
+        ok(res) => res,
+        err(reason) => {
+            wal_db_lock_shared(e)
+            return err(reason)
+        },
+    }
+    if b || log != done {
+        wal_db_lock_shared(e)
+        return err(busy(e))
+    }
+    if !wal_close(e) {
+        // Another connection of this process still uses the log.
+        return err(busy(e))
+    }
+    // wal_close leaves the database file locked; convert while it is.
+    cache_clear(e)
+    e.w.no_wal = true
+    r := leave_set_version(e)
+    e.w.no_wal = false
+    r
+}
+
+fn leave_set_version(e: &mut Engine) -> void!db.Error {
+    begin_write(e)?
+    d := pg_write(e, 1)?
+    e.ws[d + 18] = 1
+    e.ws[d + 19] = 1
+    commit(e)
 }

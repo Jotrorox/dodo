@@ -30,6 +30,7 @@ fn engine_new(ws: &mut[u8]) -> Engine from(ws) {
         subq_list: 0, subq_n: 0, min_ctx: 4294967295, regctx_t: 4294967295, regctx_base: 0, excluded_base: 0, group_list: 0, view_depth: 0, cte_off: 0, cte_n: 0, queue_rec: 0, ret_start: 0, bal_append: false,
         rtop: 16, param_reg: 16, arena_base: 0, slot_rec: 0, slot_len: 0, slot_first: 0, slot_first_len: 0,
         agg_top: 0, agg_end: 0, agg_hit: 0, active: 4294967295,
+        w: wal_state_new(),
     }
 }
 
@@ -95,6 +96,7 @@ fn engine_close(e: &mut Engine) -> void!db.Error {
         rollback(e)?
     }
     e.explicit_txn = false
+    wal_close(e)
     unlock_to(e, false)
     journal_close(e)
     failed := false

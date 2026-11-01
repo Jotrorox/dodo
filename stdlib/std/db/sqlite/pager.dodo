@@ -7,7 +7,8 @@ import "std/platform"
 import "std/platform/error"
 import "std/thread"
 
-// Pager: page cache, rollback journal, file locking, freelist.
+// Pager: page cache, rollback journal, file locking, freelist. WAL mode
+// (the -wal log and -shm index) is in wal.dodo.
 //
 // The rollback journal and the lock bytes follow SQLite's documented file
 // format, so SQLite and this engine can share a database file and recover
@@ -644,6 +645,15 @@ fn unlock_to(e: &mut Engine, keep_shared: bool) {
         }
         return
     }
+    if e.w.open {
+        // WAL mode: the SHARED lock on the database file is kept while the
+        // log is open; transactions end by releasing WAL locks.
+        wal_end_write(e)
+        if !keep_shared {
+            wal_end_read(e)
+        }
+        return
+    }
     if e.lock >= LOCK_EXCLUSIVE {
         unlock(e, SHARED_FIRST, SHARED_SIZE)
         if keep_shared {
@@ -669,10 +679,20 @@ fn unlock_to(e: &mut Engine, keep_shared: bool) {
 // ---------------------------------------------------------------------------
 // Opening and the read transaction
 
+// True while a read transaction is open.
+fn read_active(e: &Engine) -> bool {
+    if e.w.open {
+        e.w.read_lock >= 0
+    } else {
+        e.lock >= LOCK_SHARED
+    }
+}
+
 // Reads the header and starts a read transaction. Detects changes made by
-// other connections and rolls back hot journals.
+// other connections and rolls back hot journals. A database whose header
+// says WAL (read version 2) is read through its write-ahead log.
 fn begin_read(e: &mut Engine) -> void!db.Error {
-    if e.write_txn || (e.lock >= LOCK_SHARED && e.explicit_txn) {
+    if e.write_txn || (e.explicit_txn && read_active(e)) {
         return ok()
     }
     if e.memory {
@@ -683,6 +703,10 @@ fn begin_read(e: &mut Engine) -> void!db.Error {
         return ok()
     }
     lock_shared(e)?
+    e.w.read_fresh = true
+    if e.w.open {
+        return begin_read_wal(e)
+    }
     if !e.readonly && journal_exists(e) {
         recover_hot_journal(e)?
     }
@@ -701,6 +725,46 @@ fn begin_read(e: &mut Engine) -> void!db.Error {
     if got < 100 {
         return err(fail(e, SQLITE_NOTADB, "file is not a database"))
     }
+    if e.ws[hdr + 19] == 2 && !e.w.no_wal {
+        ps := rd16(e.ws, hdr + 16)
+        if ps == 1 {
+            ps = 65536
+        }
+        if ps >= 512 && ps <= 65536 && (ps & (ps - 1)) == 0 && ps != e.page_size {
+            e.page_size = ps
+            layout(e)?
+            cache_clear(e)
+        }
+        wal_open(e)?
+        return begin_read_wal(e)
+    }
+    apply_header(e, hdr, 0, size)
+}
+
+// Starts a WAL read transaction and reads the header of page 1 as of its
+// snapshot.
+fn begin_read_wal(e: &mut Engine) -> void!db.Error {
+    changed := wal_begin_read(e)?
+    if changed {
+        cache_clear(e)
+    }
+    wps := wal_page_size(e)
+    if wal_mx(e) > 0 && wps != e.page_size {
+        e.page_size = wps
+        layout(e)?
+        cache_clear(e)
+    }
+    size := file_size(e)?
+    hdr := PATH_CAP
+    wal_read_page(e, 1, hdr, 100)?
+    let npage = wal_npage(e)
+    apply_header(e, hdr, npage, size)
+}
+
+// Validates the database header at workspace offset `hdr` and adopts its
+// state. The page count comes from the header when it is valid, else from
+// `pages` (a WAL snapshot's size) or the file size.
+fn apply_header(e: &mut Engine, hdr: usize, pages: u32, size: u64) -> void!db.Error {
     magic := "SQLite format 3"
     mb := mem.str_bytes(magic)
     for i in 0usize..15 {
@@ -718,13 +782,9 @@ fn begin_read(e: &mut Engine) -> void!db.Error {
     if ps < 512 || ps > 65536 || (ps & (ps - 1)) != 0 {
         return err(fail(e, SQLITE_NOTADB, "file is not a database"))
     }
-    write_version := e.ws[hdr + 18]
     read_version := e.ws[hdr + 19]
     if read_version > 2 {
         return err(fail(e, SQLITE_CANTOPEN, "unsupported file format"))
-    }
-    if read_version == 2 || write_version == 2 {
-        return err(fail(e, SQLITE_CANTOPEN, "WAL-mode databases are not supported; run PRAGMA journal_mode=DELETE first"))
     }
     if e.ws[hdr + 21] != 64 || e.ws[hdr + 22] != 32 || e.ws[hdr + 23] != 32 {
         return err(fail(e, SQLITE_NOTADB, "file is not a database"))
@@ -737,25 +797,22 @@ fn begin_read(e: &mut Engine) -> void!db.Error {
     cookie := rd32(e.ws, hdr + 40)
     npages := rd32(e.ws, hdr + 28)
     if npages == 0 || rd32(e.ws, hdr + 92) != counter {
-        npages = (size / (ps as u64)) as u32
+        npages = if pages != 0 {
+            pages
+        } else {
+            (size / (ps as u64)) as u32
+        }
     }
     if ps != e.page_size {
-        if e.initialized && e.page_size != 0 && ps != e.page_size {
-            // The cache layout depends on the page size.
-            e.page_size = ps
-            layout(e)?
-        } else {
-            e.page_size = ps
-            layout(e)?
-        }
+        // The cache layout depends on the page size.
+        e.page_size = ps
+        layout(e)?
         cache_clear(e)
     } else if !e.initialized || counter != e.change_counter {
         cache_clear(e)
     }
-    if !e.initialized || cookie != e.schema_cookie || counter != e.change_counter {
-        if cookie != e.schema_cookie || !e.initialized {
-            e.schema_loaded = false
-        }
+    if cookie != e.schema_cookie || !e.initialized {
+        e.schema_loaded = false
     }
     e.reserved = reserved
     e.usable = ps - reserved
@@ -786,6 +843,9 @@ fn end_read(e: &mut Engine) {
         return
     }
     unlock_to(e, false)
+    if e.w.open {
+        wal_auto_checkpoint(e)
+    }
 }
 
 fn recover_hot_journal(e: &mut Engine) -> void!db.Error {
@@ -953,6 +1013,16 @@ fn pick_victim(e: &mut Engine) -> usize!db.Error {
 
 // Writes a dirty page to the database file before the transaction commits.
 fn spill(e: &mut Engine, s: usize) -> void!db.Error {
+    if e.w.open {
+        // WAL mode: the page goes to the log as a non-commit frame.
+        wal_restart_log(e)?
+        m0 := slot_meta(e, s)
+        let pgno0 = ld32(e.ws, m0)
+        let data0 = slot_data(e, s)
+        wal_append(e, pgno0, data0, 0)?
+        e.ws[m0 + 4] = 0
+        return ok()
+    }
     journal_sync_header(e)?
     lock_exclusive(e)?
     m := slot_meta(e, s)
@@ -987,7 +1057,20 @@ fn pg_fetch(e: &mut Engine, pgno: u32) -> usize!db.Error {
     d := slot_data(e, s)
     // Pages of the file: those that existed when the transaction began and
     // new ones that were spilled to the file under cache pressure.
-    if !e.memory && (pgno <= e.file_pages || pgno <= e.disk_pages) {
+    frame := if e.w.open {
+        wal_lookup(e, pgno)?
+    } else {
+        0u32
+    }
+    if frame != 0 {
+        let pos = frame_offset(e, frame) + WAL_FRAME_HDR
+        let page_size5 = e.page_size
+        got := walf_read_ws(e, pos, d, page_size5)?
+        if got < e.page_size {
+            let page_size6 = e.page_size - got
+            zero_bytes(e.ws, d + got, page_size6)
+        }
+    } else if !e.memory && (pgno <= e.file_pages || pgno <= e.disk_pages) {
         let value = ((pgno - 1) as u64) * (e.page_size as u64)
         let page_size2 = e.page_size
         got := file_read(e, value, d, page_size2)?
@@ -1025,7 +1108,7 @@ fn pg_write(e: &mut Engine, pgno: u32) -> usize!db.Error {
     d := pg_fetch(e, pgno)?
     v := hash_find(e, pgno)
     m := slot_meta(e, v - 1)
-    if pgno <= e.file_pages {
+    if pgno <= e.file_pages && !e.w.open {
         if (pgno as usize) / 8 >= e.bitmap_bytes {
             return err(full(e, "journal bitmap (database too large for this workspace)"))
         }
@@ -1217,8 +1300,13 @@ fn begin_write(e: &mut Engine) -> void!db.Error {
     if e.readonly {
         return err(fail(e, SQLITE_READONLY, "attempt to write a readonly database"))
     }
+    fresh := !read_active(e)
     begin_read(e)?
-    lock_reserved(e)?
+    if e.w.open {
+        wal_begin_write(e, fresh)?
+    } else {
+        lock_reserved(e)?
+    }
     e.write_txn = true
     e.db_written = false
     e.journal_open = false
@@ -1294,6 +1382,9 @@ fn commit(e: &mut Engine) -> void!db.Error {
     if !e.write_txn {
         return ok()
     }
+    if e.w.open {
+        return commit_wal(e)
+    }
     changed := e.db_written || e.db_pages != e.file_pages || any_dirty(e)
     if changed {
         d := pg_write(e, 1)?
@@ -1350,12 +1441,47 @@ fn commit(e: &mut Engine) -> void!db.Error {
     ok()
 }
 
+// WAL-mode commit. Page 1 is only rewritten when it changed, the database
+// size changed, or the transaction spilled frames and needs a commit frame
+// (SQLite does the same, so frame counts match).
+fn commit_wal(e: &mut Engine) -> void!db.Error {
+    spilled := e.w.appended
+    v1 := hash_find(e, 1)
+    p1_dirty := v1 != 0 && e.ws[slot_meta(e, v1 - 1) + 4] != 0
+    if spilled || p1_dirty || e.db_pages != e.file_pages {
+        d := pg_write(e, 1)?
+        counter := core.wrapping_add(rd32(e.ws, d + 24), 1u32)
+        wr32(e.ws, d + 24, counter)
+        let db_pages3 = e.db_pages
+        wr32(e.ws, d + 28, db_pages3)
+        wr32(e.ws, d + 92, counter)
+        wr32(e.ws, d + 96, WRITER_VERSION)
+        e.change_counter = counter
+        e.schema_cookie = rd32(e.ws, d + 40)
+    }
+    wal_commit(e)?
+    e.write_txn = false
+    e.file_pages = e.db_pages
+    let explicit_txn4 = e.explicit_txn
+    unlock_to(e, explicit_txn4)
+    ok()
+}
+
 fn rollback(e: &mut Engine) -> void!db.Error {
     if !e.write_txn {
         return ok()
     }
     e.write_txn = false
     e.sj_active = false
+    if e.w.open {
+        cache_clear(e)
+        undo := wal_undo(e)
+        e.db_pages = e.file_pages
+        e.schema_loaded = false
+        let explicit_txn3 = e.explicit_txn
+        unlock_to(e, explicit_txn3)
+        return undo
+    }
     if e.memory {
         // Restore saved images, newest first so the oldest image wins.
         rec := e.page_size + 4
