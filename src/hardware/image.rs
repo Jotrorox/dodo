@@ -1,5 +1,5 @@
 //! Chip-independent firmware image handling: reading the loadable segments of
-//! a linked ELF file, UF2 packing, and UF2 bootloader drives.
+//! a linked ELF file, UF2 packing, flat images, and UF2 bootloader drives.
 use std::path::{Path, PathBuf};
 
 /// One file-backed PT_LOAD segment, by load (physical) address.
@@ -95,6 +95,24 @@ pub fn uf2(elf: &[u8], segments: &[Segment], family: u32) -> Vec<u8> {
         out.extend_from_slice(data);
         out.resize(out.len() + 476 - PAGE as usize, 0);
         out.extend_from_slice(&u32::to_le_bytes(0x0AB1_6F30));
+    }
+    out
+}
+
+/// The bytes of flash from `origin` to the end of the last segment, as the
+/// segments fill them; gaps between segments are erased flash, 0xFF.
+/// Segments must lie at or above `origin`.
+pub fn flat(elf: &[u8], segments: &[Segment], origin: u32) -> Vec<u8> {
+    let end = segments
+        .iter()
+        .map(Segment::end)
+        .max()
+        .unwrap_or(origin as u64);
+    let mut out = vec![0xFF; (end - origin as u64) as usize];
+    for segment in segments {
+        let at = (segment.address - origin) as usize;
+        out[at..at + segment.size]
+            .copy_from_slice(&elf[segment.offset..segment.offset + segment.size]);
     }
     out
 }

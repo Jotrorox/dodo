@@ -49,8 +49,9 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         code: Value<'ctx>,
         environment: Value<'ctx>,
     ) -> Result<Value<'ctx>> {
-        let pointer = self.context.ptr_type(0);
-        let pair = self.context.struct_type(&[pointer, pointer], false);
+        let pair = self
+            .context
+            .struct_type(&[self.code_ptr_type(), self.context.ptr_type(0)], false);
         let value = self
             .builder
             .build_insert_value(pair.get_undef(), code, 0, "closure.code")?;
@@ -183,7 +184,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         if indirect_return {
             args.push(incoming.next().unwrap());
         }
-        let target = incoming.next().unwrap();
+        let target = self.data_as_code(&builder, incoming.next().unwrap())?;
         args.extend(incoming);
         let call = builder.build_indirect_call(
             self.value_fn_type(params, ret, false)?,

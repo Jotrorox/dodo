@@ -6,7 +6,9 @@
 //! special values, boundary cases and random operands. Rust's `as`
 //! conversions saturate and map NaN to zero, which is the helpers' contract
 //! too. The RP2350's coprocessor helpers, which must give the same bits, are
-//! checked on a board by scripts/test_rp2350_float.py.
+//! checked on a board by scripts/test_rp2350_float.py. The AVR chips' native
+//! binary32 helpers (src/hardware/avr_float32.ll) build on arm_float.ll's and
+//! are checked here the same way, on the binary32 cases.
 #![cfg(unix)]
 use std::fmt::Write as _;
 use std::fs;
@@ -16,8 +18,25 @@ use std::process::{Command, Stdio};
 
 const RUNTIME: &str = concat!(
     include_str!("../src/hardware/arm_float.ll"),
-    include_str!("../src/hardware/arm_float_soft.ll")
+    include_str!("../src/hardware/arm_float_soft.ll"),
+    include_str!("../src/hardware/avr_float32.ll")
 );
+
+/// Each AVR binary32 helper and the Arm EABI helper whose cases it shares.
+const AVR_TWINS: &[(&str, &str)] = &[
+    ("__aeabi_fadd", "dodo_f32_add"),
+    ("__aeabi_fsub", "dodo_f32_sub"),
+    ("__aeabi_fmul", "dodo_f32_mul"),
+    ("__aeabi_fdiv", "dodo_f32_div"),
+    ("__aeabi_f2iz", "dodo_f32_to_i32"),
+    ("__aeabi_f2uiz", "dodo_f32_to_u32"),
+    ("__aeabi_f2lz", "dodo_f32_to_i64"),
+    ("__aeabi_f2ulz", "dodo_f32_to_u64"),
+    ("__aeabi_i2f", "dodo_f32_from_i32"),
+    ("__aeabi_ui2f", "dodo_f32_from_u32"),
+    ("__aeabi_l2f", "dodo_f32_from_i64"),
+    ("__aeabi_ul2f", "dodo_f32_from_u64"),
+];
 
 // Reads `name a b` lines in hex and prints each result in hex.
 const DRIVER: &str = r#"
@@ -38,7 +57,9 @@ typedef uint64_t u64;
     X(__ledf2, u32, u64) X(__ltdf2, u32, u64) X(__eqdf2, u32, u64) X(__nedf2, u32, u64) \
     X(__gedf2, u32, u64) X(__gtdf2, u32, u64) \
     X(__lesf2, u32, u32) X(__ltsf2, u32, u32) X(__eqsf2, u32, u32) X(__nesf2, u32, u32) \
-    X(__gesf2, u32, u32) X(__gtsf2, u32, u32)
+    X(__gesf2, u32, u32) X(__gtsf2, u32, u32) \
+    X(dodo_f32_add, u32, u32) X(dodo_f32_sub, u32, u32) X(dodo_f32_mul, u32, u32) \
+    X(dodo_f32_div, u32, u32)
 #define UNARY(X) \
     X(__aeabi_d2iz, u32, u64) X(__aeabi_d2uiz, u32, u64) X(__aeabi_d2lz, u64, u64) \
     X(__aeabi_d2ulz, u64, u64) X(__aeabi_f2iz, u32, u32) X(__aeabi_f2uiz, u32, u32) \
@@ -46,7 +67,10 @@ typedef uint64_t u64;
     X(__aeabi_i2d, u64, u32) X(__aeabi_ui2d, u64, u32) X(__aeabi_l2d, u64, u64) \
     X(__aeabi_ul2d, u64, u64) X(__aeabi_i2f, u32, u32) X(__aeabi_ui2f, u32, u32) \
     X(__aeabi_l2f, u32, u64) X(__aeabi_ul2f, u32, u64) \
-    X(__aeabi_f2d, u64, u32) X(__aeabi_d2f, u32, u64)
+    X(__aeabi_f2d, u64, u32) X(__aeabi_d2f, u32, u64) \
+    X(dodo_f32_to_i32, u32, u32) X(dodo_f32_to_u32, u32, u32) X(dodo_f32_to_i64, u64, u32) \
+    X(dodo_f32_to_u64, u64, u32) X(dodo_f32_from_i32, u32, u32) X(dodo_f32_from_u32, u32, u32) \
+    X(dodo_f32_from_i64, u32, u64) X(dodo_f32_from_u64, u32, u64)
 #define DECLARE2(name, R, A) R name(A, A);
 #define DECLARE1(name, R, A) R name(A);
 BINARY(DECLARE2)
@@ -336,6 +360,19 @@ fn cases() -> Vec<Case> {
         );
         push(&mut cases, "__aeabi_ul2f", n, 0, Result::F32(n as f32));
     }
+    let twins: Vec<Case> = cases
+        .iter()
+        .filter_map(|case| {
+            let (_, avr) = AVR_TWINS.iter().find(|(arm, _)| *arm == case.op)?;
+            Some(Case {
+                op: avr,
+                a: case.a,
+                b: case.b,
+                expected: case.expected,
+            })
+        })
+        .collect();
+    cases.extend(twins);
     cases
 }
 

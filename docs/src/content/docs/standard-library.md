@@ -138,7 +138,7 @@ OS/C-library calls may allocate internally even when Dodo storage is fixed.
 HTTP/1.1 clients, servers, streaming framing, web routing, and QUIC connections
 and streams **are implemented**.
 HTTP/2, HTTP/3, WebSockets, TOML serialization and chip support beyond
-the RP2040 and RP2350 are remaining work. [`std/embedded/hal`](hardware.md) supplies typed
+the RP2040, RP2350 and ATmega328P are remaining work. [`std/embedded/hal`](hardware.md) supplies typed
 registers and portable device protocols, blocking and polling, including I2C
 and SPI targets, pulse capture, CAN, I2S, and DMA buffer transfers, with
 in-memory fakes in `std/embedded/hal/fake` and the serial port protocols in
@@ -177,6 +177,10 @@ cores through `Mutex<T>` statics. `std/embedded/power` is the low-power layer ev
 sleep and deep sleep modes, clock gating, and a dormant state that pins
 end. `std/embedded/wireless/cyw43` drives the Pico 2 W's CYW43439 wireless chip
 far enough for its LED; Wi-Fi and Bluetooth are not supported yet.
+`std/embedded/chip/atmega328p` and `std/embedded/board/arduino_uno` support
+the ATmega328P and Arduino Uno: pins, the serial port, I2C, SPI, PWM, the
+ADC, the watchdog, and the EEPROM, flashed by `dodo run` through the board's
+bootloader.
 `std/embedded/rtc/ds3231` drives a DS3231 battery-backed clock chip on I2C
 through the same real-time clock protocols as the chips' own clocks.
 [Compiler limits](implementation.md) and [container element restrictions](container-elements.md)
