@@ -4,8 +4,9 @@
 Generates test images (gradients, noise, few colors, text-like edges; gray,
 gray+alpha, RGB, RGBA; 8 and 16-bit, F16 and F32; odd sizes), encodes each
 at every effort and container setting with a small Dodo program, decodes the
-result with djxl and compares every sample exactly. Also reports sizes
-against `cjxl -d 0 -e 1/2/3`.
+result with djxl and compares every sample exactly (and, for the ICC
+fixtures in icc/, the profile djxl returns). Also reports sizes against
+`cjxl -d 0 -e 1/2/3`.
 
 Usage: python3 tests/image/jxl_encode/verify.py [--quick] [--sizes-only]
        [--image FILE.ppm|.pgm|.pam ...]
@@ -39,6 +40,7 @@ static mut JOBS: [1048576]u8 = [0u8; 1048576]
 static mut PIX: [67108864]u8 = [0u8; 67108864]
 static mut OUT: [201326592]u8 = [0u8; 201326592]
 static mut SCRATCH: [16777216]u8 = [0u8; 16777216]
+static mut ICCBUF: [4194304]u8 = [0u8; 4194304]
 
 const EXIF: [26]u8 = [0x4D, 0x4D, 0, 0x2A, 0, 0, 0, 8, 0, 1, 0x01, 0x12, 0, 3, 0, 0, 0, 1, 0, 6, 0, 0, 0, 0, 0, 0]
 const XMP: [44]u8 = [0x3C, 0x78, 0x3A, 0x78, 0x6D, 0x70, 0x6D, 0x65, 0x74, 0x61, 0x20, 0x78, 0x6D, 0x6C, 0x6E, 0x73, 0x3A, 0x78, 0x3D, 0x22, 0x61, 0x64, 0x6F, 0x62, 0x65, 0x3A, 0x6E, 0x73, 0x3A, 0x6D, 0x65, 0x74, 0x61, 0x2F, 0x22, 0x3E, 0x3C, 0x2F, 0x78, 0x3A, 0x78, 0x6D, 0x70, 0x3E]
@@ -64,7 +66,7 @@ fn number(field: &[u8]) -> usize {
 }
 
 fn run_job(line: &[u8]) -> i32 {
-    // in out width height channels sample premultiplied effort container meta
+    // in out width height channels sample premultiplied effort container meta [icc]
     starts := [0usize; 12]
     ends := [0usize; 12]
     count := 0usize
@@ -124,6 +126,20 @@ fn run_job(line: &[u8]) -> i32 {
         }
     }
     md := encode.Metadata.new(&EXIF, &XMP)
+    iccbuf := unsafe { &mut ICCBUF }
+    if count >= 11 {
+        icc_path := unsafe { mem.str_from_utf8(&line[starts[10]..ends[10]]) }
+        icc_len := match fs.read_file(icc_path, &mut iccbuf[..], &mut workspace) {
+            ok(report) => {
+                report.read
+            }, err(_) => {
+                say("err ReadIccFailed")
+                return 1
+            }
+        }
+        md = encode.Metadata.with_icc(b"", b"", &iccbuf[..icc_len])
+        meta = 1
+    }
     bound := 0usize
     if meta == 1 {
         bound = match encode.max_encoded_size_with_metadata(width, height, &layout, &options, &md) {
@@ -577,9 +593,30 @@ def main():
                     meta = 2
                 out = os.path.join(work, "%s-e%d-c%d.jxl" % (name, effort, container))
                 jobs.append(dict(name=name, pix=pix, w=w, h=h, channels=channels, sample=sample, premul=premul, effort=effort, container=container, meta=meta, raw=raw, out=out))
+    # ICC profiles (tests/image/jxl_encode/icc, see make_icc.py): embedded
+    # with every effort, with and without alpha and container; djxl must
+    # return the identical profile.
+    icc_folder = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icc")
+    if not args.no_builtin and os.path.isdir(icc_folder):
+        for icc_name in sorted(os.listdir(icc_folder)):
+            if not icc_name.endswith(".icc"):
+                continue
+            icc_path = os.path.join(icc_folder, icc_name)
+            gray = open(icc_path, "rb").read()[16:20] == b"GRAY"
+            for channels in ((1, 2) if gray else (3, 4)):
+                name = "icc-%s-c%d" % (icc_name[:-4], channels)
+                w, h = 61, 37
+                pix = gen("smooth", w, h, channels, 255, seed)
+                seed += 1
+                raw = os.path.join(work, name + ".raw")
+                open(raw, "wb").write(raw_bytes(pix, 0))
+                for effort in efforts:
+                    for container in (0, 1):
+                        out = os.path.join(work, "%s-e%d-c%d.jxl" % (name, effort, container))
+                        jobs.append(dict(name=name, pix=pix, w=w, h=h, channels=channels, sample=0, premul=False, effort=effort, container=container, meta=1, raw=raw, out=out, icc=icc_path))
     with open(os.path.join(work, "jobs.txt"), "w") as f:
         for j in jobs:
-            f.write("%s %s %d %d %d %d %d %d %d %d\n" % (j["raw"], j["out"], j["w"], j["h"], j["channels"], j["sample"], 1 if j["premul"] else 0, j["effort"], j["container"], j["meta"]))
+            f.write("%s %s %d %d %d %d %d %d %d %d%s\n" % (j["raw"], j["out"], j["w"], j["h"], j["channels"], j["sample"], 1 if j["premul"] else 0, j["effort"], j["container"], j["meta"], (" " + j["icc"]) if j.get("icc") else ""))
     t0 = time.time()
     r = subprocess.run([exe], cwd=work, capture_output=True, text=True)
     elapsed = time.time() - t0
@@ -590,6 +627,7 @@ def main():
         return 1
     failures = 0
     sizes = {}
+    icc_sizes = {}
     for j, line in zip(jobs, lines):
         if not line.startswith("ok "):
             print("FAIL encode %s e%d c%d: %s" % (j["name"], j["effort"], j["container"], line))
@@ -601,7 +639,10 @@ def main():
             failures += 1
         ext = ".npy" if j["sample"] >= 2 else ".pam"
         dec = j["out"] + ext
-        d = subprocess.run(["djxl", j["out"], dec, "--quiet"], capture_output=True, text=True)
+        command = ["djxl", j["out"], dec, "--quiet"]
+        if j.get("icc"):
+            command.append("--icc_out=" + j["out"] + ".icc")
+        d = subprocess.run(command, capture_output=True, text=True)
         if d.returncode != 0:
             print("FAIL djxl %s e%d c%d: %s" % (j["name"], j["effort"], j["container"], d.stderr.strip()[-500:]))
             failures += 1
@@ -611,9 +652,20 @@ def main():
             print("FAIL pixels %s e%d c%d: %s" % (j["name"], j["effort"], j["container"], problem))
             failures += 1
             continue
+        if j.get("icc"):
+            want = open(j["icc"], "rb").read()
+            got = open(j["out"] + ".icc", "rb").read() if os.path.exists(j["out"] + ".icc") else b""
+            if got != want:
+                print("FAIL icc %s e%d c%d: %d bytes back for %d" % (j["name"], j["effort"], j["container"], len(got), len(want)))
+                failures += 1
+                continue
+            icc_sizes[(j["name"], j["effort"], j["container"])] = n
+            continue
         if j["container"] == 0:
             sizes[(j["name"], j["effort"])] = n
     print("%d jobs, %d failures, encoder program %.1f s at -O%s" % (len(jobs), failures, elapsed, args.opt))
+    if icc_sizes:
+        print("ICC jobs: %d (sizes with container 0: %s)" % (len(icc_sizes), ", ".join("%s e%d %d" % (k[0], k[1], v) for k, v in sorted(icc_sizes.items()) if k[2] == 0)))
     # Compression against cjxl for the larger 8/16-bit images.
     report = []
     for (name, pix, w, h, channels, sample, premul) in images:

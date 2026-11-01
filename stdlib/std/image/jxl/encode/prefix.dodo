@@ -4,8 +4,9 @@ package encode
 // and complex codes, with code lengths of at most 15 bits.
 
 // Symbols per histogram: literal tokens stay below LZ77_MIN_SYMBOL (224) and
-// LZ77 length symbols follow it.
-const MAX_ALPHA: usize = 272
+// LZ77 length symbols follow it; histograms counted with a finer
+// configuration put LZ77 lengths from LZ77_FINE_BASE (256).
+const MAX_ALPHA: usize = 288
 const MAX_CODE_LENGTH: usize = 15
 const CODE_LENGTH_CODES: usize = 18
 // Transmission order of the code-length code lengths.
@@ -21,10 +22,10 @@ const CODE_LENGTH_LENGTH_CODES: [6]u64 = [0, 7, 3, 2, 1, 15]
 // code when two or more symbols have codes. Returns the number of coded
 // symbols.
 fn huffman_lengths(freq: &[u64], n: usize, lengths: &mut[u8], limit: usize, min_two: bool) -> usize {
-    leaves := [0usize; 272]
-    weight := [0u64; 543]
-    parent := [0usize; 543]
-    depth := [0usize; 543]
+    leaves := [0usize; 288]
+    weight := [0u64; 575]
+    parent := [0usize; 575]
+    depth := [0usize; 575]
     used := 0usize
     for i in 0usize..n {
         lengths[i] = 0
@@ -214,8 +215,8 @@ fn write_prefix_code(w: &mut BitWriter, lengths: &[u8], alphabet: usize) {
     }
     // Complex code: run-length coded code lengths (zero runs with symbol 17),
     // themselves prefix coded.
-    items := [0u8; 272]
-    extras := [0u8; 272]
+    items := [0u8; 288]
+    extras := [0u8; 288]
     count := 0usize
     last := alphabet - 1
     for lengths[last] == 0 {
