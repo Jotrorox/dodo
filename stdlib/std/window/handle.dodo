@@ -1,0 +1,41 @@
+package handle
+
+// The window-system objects behind a std/window window, in the form GPU APIs
+// take them: Vulkan's surface extensions, EGL, WGL, NSOpenGL and Metal.
+// Window.native_handle() returns one.
+//
+// This package only defines the type and links nothing, so GPU packages such
+// as std/gpu/opengl can accept a handle without pulling in the window
+// runtime. Every value is a plain address or id that stays valid only while
+// the window is open: destroy GPU surfaces made from it before closing or
+// dropping the window.
+
+pub enum NativeHandle {
+    // Linux: an X11 window and a libxcb connection to the same X server,
+    // opened for GPU APIs on the first native_handle() call and closed with
+    // the window. Pass `connection` and `window` to vkCreateXcbSurfaceKHR, or
+    // to EGL's XCB platform with `screen`. `visual` is the window's visual
+    // id, for choosing a matching EGL or GLX configuration.
+    Xcb(connection: usize, window: u32, screen: u32, visual: u32),
+    // macOS: the NSWindow and its content NSView. Use them on the main
+    // thread only. Window.metal_layer() attaches a CAMetalLayer to the view
+    // for Metal and for Vulkan's VK_EXT_metal_surface.
+    AppKit(window: usize, view: usize),
+    // Windows: the window's HWND and the HINSTANCE of the program that
+    // created it, as vkCreateWin32SurfaceKHR takes them.
+    Win32(hwnd: usize, instance: usize)
+}
+
+pub fn kind_name(handle: &NativeHandle) -> &str from(static) {
+    match handle {
+        NativeHandle.Xcb(_, _, _, _) => {
+            return "Xcb"
+        }
+        NativeHandle.AppKit(_, _) => {
+            return "AppKit"
+        }
+        NativeHandle.Win32(_, _) => {
+            return "Win32"
+        }
+    }
+}

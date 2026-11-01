@@ -1,0 +1,132 @@
+package jxl
+
+import "std/image/color"
+
+// Mapping of the JPEG XL ColourEncoding onto color.ColorInfo: white point
+// and primaries (named sets become CICP primaries, custom ones
+// chromaticities), the transfer function (CICP or a plain gamma), the
+// rendering intent, and want_icc as an entropy-coded profile to be decoded
+// with jxl.icc().
+
+// The ColorInfo of the samples decode() produces. Integer and float
+// samples are in the encoded color space; for XYB images (which decode to
+// the ColourEncoding when it names one, else to linear sRGB) see
+// output_color_info().
+fn color_info(h: &ImageHeader, data_len: usize) -> color.ColorInfo {
+    info := color.ColorInfo.srgb()
+    info.tagged = true
+    info.matrix = color.MATRIX_IDENTITY
+    info.full_range = true
+    if h.intensity_target > 0.0 {
+        info.intensity_target = h.intensity_target as u32
+    }
+    info.intent = intent_code(h.intent)
+    if h.want_icc {
+        info.primaries = color.PRIMARIES_UNSPECIFIED
+        info.transfer = color.TRANSFER_UNSPECIFIED
+        info.icc_encoding = color.ICC_JXL
+        info.icc_offset = 0
+        info.icc_length = data_len
+        return info
+    }
+    if h.color_space == CS_XYB || h.color_space == CS_UNKNOWN {
+        info.primaries = color.PRIMARIES_UNSPECIFIED
+    }
+    // Primaries and white point.
+    if h.color_space == CS_RGB {
+        if h.white_point == WP_D65 && h.primaries == PR_SRGB {
+            info.primaries = color.PRIMARIES_BT709
+        } else if h.white_point == WP_D65 && h.primaries == PR_2100 {
+            info.primaries = color.PRIMARIES_BT2020
+        } else if h.white_point == WP_D65 && h.primaries == PR_P3 {
+            info.primaries = color.PRIMARIES_DISPLAY_P3
+        } else if h.white_point == WP_DCI && h.primaries == PR_P3 {
+            info.primaries = color.PRIMARIES_DCI_P3
+        } else {
+            info.set_chromaticities(to_cicp_xy(h.white_x), to_cicp_xy(h.white_y), to_cicp_xy(h.red_x), to_cicp_xy(h.red_y), to_cicp_xy(h.green_x), to_cicp_xy(h.green_y), to_cicp_xy(h.blue_x), to_cicp_xy(h.blue_y))
+        }
+    } else if h.color_space == CS_GREY {
+        info.primaries = color.PRIMARIES_BT709
+        if h.white_point != WP_D65 {
+            info.primaries = color.PRIMARIES_UNSPECIFIED
+        }
+    }
+    // Transfer function.
+    if h.have_gamma {
+        // gamma is the encoding exponent times 10^7.
+        info.set_gamma((h.gamma + 50) / 100)
+    } else {
+        info.gamma = 0
+        if h.transfer == TF_SRGB {
+            info.transfer = color.TRANSFER_SRGB
+        } else if h.transfer == TF_LINEAR {
+            info.transfer = color.TRANSFER_LINEAR
+        } else if h.transfer == TF_709 {
+            info.transfer = color.TRANSFER_BT709
+        } else if h.transfer == TF_PQ {
+            info.transfer = color.TRANSFER_PQ
+        } else if h.transfer == TF_HLG {
+            info.transfer = color.TRANSFER_HLG
+        } else if h.transfer == TF_DCI {
+            // DCI is a 2.6 power law, which CICP does not name.
+            info.set_gamma(38462)
+        } else {
+            info.transfer = color.TRANSFER_UNSPECIFIED
+        }
+    }
+    return info
+}
+
+// Chromaticities are coded times 10^6; ColorInfo uses 10^5.
+fn to_cicp_xy(v: i32) -> u32 {
+    if v <= 0 {
+        return 0
+    }
+    return ((v + 5) / 10) as u32
+}
+
+fn intent_code(intent: u32) -> u8 {
+    if intent == 0 {
+        return color.INTENT_PERCEPTUAL
+    }
+    if intent == 2 {
+        return color.INTENT_SATURATION
+    }
+    if intent == 3 {
+        return color.INTENT_ABSOLUTE
+    }
+    return color.INTENT_RELATIVE
+}
+
+// The ColorInfo of decoded samples. XYB images are converted to the
+// encoded ColourEncoding when it names an RGB or gray space with a
+// supported transfer function; with an ICC profile (or an unsupported
+// description) they are converted to sRGB instead, and the result is
+// reported as untagged sRGB.
+fn output_color_info(h: &ImageHeader, data_len: usize) -> color.ColorInfo {
+    if !h.xyb {
+        return color_info(h, data_len)
+    }
+    if xyb_target_supported(h) {
+        return color_info(h, data_len)
+    }
+    info := color.ColorInfo.srgb()
+    if h.intensity_target > 0.0 {
+        info.intensity_target = h.intensity_target as u32
+    }
+    return info
+}
+
+// XYB can be rendered directly to the ColourEncoding.
+fn xyb_target_supported(h: &ImageHeader) -> bool {
+    if h.want_icc || h.color_space == CS_XYB || h.color_space == CS_UNKNOWN {
+        return false
+    }
+    if !h.have_gamma && h.transfer == TF_UNKNOWN {
+        return false
+    }
+    if h.color_space == CS_GREY && h.white_point != WP_D65 {
+        return false
+    }
+    return true
+}

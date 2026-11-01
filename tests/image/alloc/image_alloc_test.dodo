@@ -1,0 +1,536 @@
+package image_alloc_test
+
+import "core/mem"
+import "alloc/error"
+import "alloc/shared_arena"
+import "std/env"
+import "std/fs"
+import "std/image"
+import "std/image/color"
+import "std/image/meta"
+import "std/image/ops"
+import "std/image/pixels"
+import "std/image_alloc"
+import "std/platform"
+import "std/platform/error" as platform_error
+
+// std/image_alloc with a real allocator: owned images in a shared arena,
+// decoding fixtures of every format, metadata copies, transforms, encoding
+// and load/save round trips through files. Files are written to the
+// directory named by IMAGE_ALLOC_TEST_DIR (tests/image_alloc_library.rs
+// passes a fresh temporary directory), else target/image-alloc-test.
+
+const ARENA_SIZE: usize = 67108864
+
+static mut ARENA: [ARENA_SIZE]u8 = [0u8; ARENA_SIZE]
+
+// One arena per test over the static storage.
+fn fresh_arena() -> shared_arena.SharedArena from(static) {
+    unsafe {
+        return shared_arena.SharedArena.new(&mut ARENA)!
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Paths
+
+// `first` followed by `second` in `storage`.
+fn join(first: &str, second: &str, storage: &mut[u8]) -> &str from(storage) {
+    a := mem.str_bytes(first)
+    b := mem.str_bytes(second)
+    assert(a.len + b.len <= storage.len, "path too long")
+    for i in 0usize..a.len {
+        storage[i] = a[i]
+    }
+    for i in 0usize..b.len {
+        storage[a.len + i] = b[i]
+    }
+    unsafe {
+        return mem.str_from_utf8(&storage[..a.len + b.len])
+    }
+}
+
+// The scratch directory with a trailing slash, created when missing.
+fn scratch_dir(storage: &mut[u8]) -> &str from(storage) {
+    workspace := env.Workspace.new()
+    found := [0u8; 1024]
+    directory := "target/image-alloc-test"
+    match env.get("IMAGE_ALLOC_TEST_DIR", &mut found, &mut workspace, platform.TextPolicy.Strict)! {
+        some(value) => {
+            directory = value
+        }
+        none => {}
+    }
+    names := platform.workspace()
+    names.set(directory)!
+    name := names.get()!
+    match fs.create_directory(&name) {
+        ok() => {}
+        err(reason) => {
+            assert(reason.kind == platform_error.Kind.AlreadyExists, "cannot create the scratch directory")
+        }
+    }
+    return join(directory, "/", storage)
+}
+
+fn scratch_path(name: &str, storage: &mut[u8]) -> &str from(storage) {
+    directory_storage := [0u8; 1100]
+    directory := scratch_dir(&mut directory_storage)
+    return join(directory, name, storage)
+}
+
+fn fixture(directory: &str, name: &str, storage: &mut[u8]) -> &str from(storage) {
+    return join(directory, name, storage)
+}
+
+fn codec_fixture(name: &str, storage: &mut[u8]) -> &str from(storage) {
+    return fixture("tests/image/codecs/fixtures/", name, storage)
+}
+
+fn jxl_fixture(name: &str, storage: &mut[u8]) -> &str from(storage) {
+    return fixture("tests/image/jxl/", name, storage)
+}
+
+// ---------------------------------------------------------------------------
+// Pixels
+
+// A width x height RGBA8 test pattern with varied alpha.
+fn pattern(allocator: shared_arena.Handle, width: u32, height: u32) -> image_alloc.Image<shared_arena.Handle> from(allocator) {
+    result := image_alloc.new(width, height, pixels.Layout.rgba8(), allocator)!
+    data := result.bytes_mut()
+    for y in 0u32..height {
+        for x in 0u32..width {
+            i := (y * width + x) as usize * 4
+            data[i] = (x * 11 % 256) as u8
+            data[i + 1] = (y * 13 % 256) as u8
+            data[i + 2] = ((x + y) * 7 % 256) as u8
+            data[i + 3] = (255 - (x * y) % 200) as u8
+        }
+    }
+    return result
+}
+
+// The format an image was decoded from; fails for new images.
+fn format_of(picture: &image_alloc.Image<shared_arena.Handle>) -> pixels.Format {
+    match picture.format() {
+        some(found) => {
+            return found
+        }
+        none => {
+            assert(false, "the image was not decoded")
+            return pixels.Format.Png
+        }
+    }
+}
+
+fn is_layout(found: &pixels.Layout, expected: pixels.Layout) -> bool {
+    return found.equals(&expected)
+}
+
+// Channel `c` of pixel (x, y).
+fn sample(picture: &image_alloc.Image<shared_arena.Handle>, x: u32, y: u32, c: usize) -> u8 {
+    view := picture.view()
+    return view.pixel(x, y)[c]
+}
+
+fn same_pixels(a: &pixels.View, b: &pixels.View) -> bool {
+    return ops.equal(a, b)
+}
+
+fn assert_error_image(outcome: void!image_alloc.Error, expected: pixels.Error) {
+    match outcome {
+        ok() => {
+            assert(false, "expected an image error")
+        }
+        err(reason) => {
+            match reason {
+                image_alloc.Error.Image(found) => {
+                    assert(found == expected)
+                }
+                _ => {
+                    assert(false, "expected an image error")
+                }
+            }
+        }
+    }
+}
+
+fn format_at(k: usize) -> pixels.Format {
+    if k == 0 {
+        return pixels.Format.Png
+    }
+    if k == 1 {
+        return pixels.Format.Qoi
+    }
+    if k == 2 {
+        return pixels.Format.Bmp
+    }
+    if k == 3 {
+        return pixels.Format.Ppm
+    }
+    return pixels.Format.Jxl
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+
+@test
+fn new_images_views_and_conversion() {
+    arena := fresh_arena()
+    picture := pattern(arena.handle(), 7, 5)
+    assert_eq(picture.width(), 7u32)
+    assert_eq(picture.height(), 5u32)
+    assert_eq(picture.stride(), 28usize)
+    assert(is_layout(picture.layout(), pixels.Layout.rgba8()))
+    assert(!picture.decoded())
+    match picture.format() {
+        some(_) => {
+            assert(false)
+        }
+        none => {}
+    }
+    assert_eq(picture.bytes().len, 140usize)
+    assert_eq(picture.exif().len, 0usize)
+    assert_eq(picture.icc().len, 0usize)
+
+    // A converted copy in its own allocation, then back in place.
+    wide := picture.converted(pixels.Layout.rgba16(), arena.handle())!
+    assert(is_layout(wide.layout(), pixels.Layout.rgba16()))
+    assert_eq(wide.bytes().len, 280usize)
+    first := picture.view()
+    second := wide.view()
+    assert(same_pixels(&first, &second))
+    assert_eq(pixels.get16(wide.bytes(), 0), 0u16)
+    assert_eq(pixels.get16(wide.bytes(), 8), 11u16 * 257)
+
+    copied := wide.copy(arena.handle())!
+    copied.convert(pixels.Layout.rgba8())!
+    third := copied.view()
+    assert(same_pixels(&first, &third))
+    assert(is_layout(copied.layout(), pixels.Layout.rgba8()))
+
+    gray := picture.converted(pixels.Layout.gray8(), arena.handle())!
+    assert_eq(gray.bytes().len, 35usize)
+
+    // view_mut writes through to the image.
+    {
+        target := copied.view_mut()
+        ops.fill8(&mut target, 1, 2, 3, 4)
+    }
+    assert_eq(copied.bytes()[4], 1u8)
+    assert_eq(copied.bytes()[139], 4u8)
+}
+
+@test
+fn allocation_failures_and_exact_sizes() {
+    small := [0u8; 256]
+    tiny := shared_arena.SharedArena.new(&mut small)!
+    match image_alloc.new(100, 100, pixels.Layout.rgba8(), tiny.handle()) {
+        ok(_) => {
+            assert(false, "a 40000-byte image cannot fit in 256 bytes")
+        }
+        err(reason) => {
+            match reason {
+                image_alloc.Error.Allocation(found) => {
+                    assert(found == error.AllocError.Exhausted)
+                }
+                _ => {
+                    assert(false)
+                }
+            }
+        }
+    }
+    // A failed allocation leaves the arena usable.
+    fits := image_alloc.new(4, 4, pixels.Layout.rgba8(), tiny.handle())!
+    assert_eq(fits.bytes().len, 64usize)
+
+    // Decoding takes the pixels plus exactly the codec's scratch.
+    arena := fresh_arena()
+    picture := pattern(arena.handle(), 16, 9)
+    options := image.EncodeOptions.new()
+    encoded := picture.encode(pixels.Format.Qoi, &options, arena.handle())!
+    before := arena.used()
+    back := image_alloc.decode(encoded.as_slice(), arena.handle())!
+    used := arena.used() - before
+    need := pixels.bytes_needed(16, 9, back.layout())!
+    scratch := image.scratch_size(encoded.as_slice(), back.layout())!
+    assert(used >= need + scratch)
+    assert(used <= need + scratch + 64, "decode allocated more than the codec asked for")
+}
+
+@test
+fn encode_and_decode_every_format() {
+    arena := fresh_arena()
+    picture := pattern(arena.handle(), 23, 17)
+    original := picture.view()
+    options := image.EncodeOptions.new()
+    for k in 0usize..5 {
+        format := format_at(k)
+        encoded := picture.encode(pixels.clone_format(&format), &options, arena.handle())!
+        assert(encoded.len() > 0)
+        assert(encoded.len() <= picture.max_encoded_size(pixels.clone_format(&format), &options)!)
+        assert(image.detect(encoded.as_slice())! == format)
+        back := image_alloc.decode_as(encoded.as_slice(), pixels.Layout.rgba8(), arena.handle())!
+        assert(back.decoded())
+        assert(format_of(&back) == format)
+        assert_eq(back.width(), 23u32)
+        assert_eq(back.height(), 17u32)
+        decoded := back.view()
+        assert(same_pixels(&original, &decoded), image.extension(&format))
+        // Native layout keeps what the file stores: RGBA everywhere here.
+        native := image_alloc.decode(encoded.as_slice(), arena.handle())!
+        assert(native.layout().has_alpha())
+        assert(native.layout().equals(&native.header().native))
+    }
+    // 16-bit samples survive PNG and PAM.
+    wide := picture.converted(pixels.Layout.rgb16(), arena.handle())!
+    {
+        data := wide.bytes_mut()
+        data[0] = 0x34
+        data[1] = 0x12
+    }
+    for k in 0usize..2 {
+        format := pixels.Format.Png
+        if k == 1 {
+            format = pixels.Format.Ppm
+        }
+        encoded := wide.encode(format, &options, arena.handle())!
+        back := image_alloc.decode(encoded.as_slice(), arena.handle())!
+        assert(is_layout(back.layout(), pixels.Layout.rgb16()))
+        assert_eq(back.bit_depth(), 16u32)
+        assert_eq(pixels.get16(back.bytes(), 0), 0x1234u16)
+        first := wide.view()
+        second := back.view()
+        assert(same_pixels(&first, &second))
+    }
+}
+
+@test
+fn decodes_fixtures_with_metadata() {
+    arena := fresh_arena()
+    path := [0u8; 256]
+    // PNG with an EXIF orientation of 3 (rotate 180).
+    turned := image_alloc.load(codec_fixture("png_exif_before.png", &mut path), arena.handle())!
+    assert(format_of(&turned) == pixels.Format.Png)
+    assert(*turned.orientation() == color.Orientation.Rotate180)
+    assert_eq(turned.exif().len, 26usize)
+    assert(turned.exif()[0] == b'I' && turned.exif()[2] == 42)
+    stored := turned.copy(arena.handle())!
+    turned.orient()!
+    assert(*turned.orientation() == color.Orientation.Identity)
+    // The EXIF payload stays, with its orientation tag reset to 1.
+    assert_eq(turned.exif().len, 26usize)
+    assert_eq(meta.exif_orientation(turned.exif())!, 1u32)
+    assert_eq(meta.exif_orientation(stored.exif())!, 3u32)
+    expected := stored.copy(arena.handle())!
+    expected.rotate(180)!
+    a := turned.view()
+    b := expected.view()
+    assert(same_pixels(&a, &b))
+    options := image.EncodeOptions.new()
+    encoded := turned.encode(pixels.Format.Png, &options, arena.handle())!
+    reread := image_alloc.decode(encoded.as_slice(), arena.handle())!
+    assert(*reread.orientation() == color.Orientation.Identity)
+    assert_eq(reread.exif().len, 26usize)
+
+    // A zlib-compressed PNG profile is inflated into the image.
+    profiled := image_alloc.load(codec_fixture("png_color_iccp.png", &mut path), arena.handle())!
+    assert(profiled.color().has_icc())
+    assert_eq(profiled.icc().len, 300usize)
+    for i in 0usize..300 {
+        assert(profiled.icc()[i] as usize == ((i * 7 + 3) & 255))
+    }
+    // ... and written back to a PNG, unless stripped.
+    with_profile := profiled.encode(pixels.Format.Png, &options, arena.handle())!
+    again := image_alloc.decode(with_profile.as_slice(), arena.handle())!
+    assert_eq(again.icc().len, 300usize)
+    options.keep_metadata = false
+    stripped := profiled.encode(pixels.Format.Png, &options, arena.handle())!
+    plain := image_alloc.decode(stripped.as_slice(), arena.handle())!
+    assert_eq(plain.icc().len, 0usize)
+    assert(!plain.color().has_icc())
+
+    // A raw BMP profile.
+    bmp := image_alloc.load(codec_fixture("v5_icc.bmp", &mut path), arena.handle())!
+    assert(format_of(&bmp) == pixels.Format.Bmp)
+    assert(bmp.icc().len > 0)
+    assert_eq(bmp.icc().len, bmp.color().icc_length)
+
+    // Netpbm, QOI, PFM in their native layouts.
+    pam := image_alloc.load(codec_fixture("pam_rgba16.pam", &mut path), arena.handle())!
+    assert(is_layout(pam.layout(), pixels.Layout.rgba16()))
+    qoi := image_alloc.load(codec_fixture("qoi_linear.qoi", &mut path), arena.handle())!
+    assert(qoi.color().is_linear())
+    pfm := image_alloc.load_as(codec_fixture("pfm_rgb.pfm", &mut path), pixels.Layout.rgb8(), arena.handle())!
+    assert(is_layout(pfm.layout(), pixels.Layout.rgb8()))
+    assert(pfm.header().native.is_float())
+}
+
+@test
+fn decodes_jpeg_xl_files() {
+    arena := fresh_arena()
+    path := [0u8; 256]
+    lossless := image_alloc.load(jxl_fixture("rgb_e7.jxl", &mut path), arena.handle())!
+    assert(format_of(&lossless) == pixels.Format.Jxl)
+    assert(lossless.width() > 0 && lossless.height() > 0)
+    // The JPEG XL ICC profile is entropy-decoded into the image.
+    profiled := image_alloc.load(jxl_fixture("icc_lossless.jxl", &mut path), arena.handle())!
+    expected := image_alloc.read_file(jxl_fixture("profile.icc", &mut path), arena.handle())!
+    assert_eq(profiled.icc().len, expected.len())
+    for i in 0usize..expected.len() {
+        assert(profiled.icc()[i] == expected.as_slice()[i])
+    }
+    // Animation frames.
+    anim := image_alloc.read_file(jxl_fixture("anim.jxl", &mut path), arena.handle())!
+    count := image.frame_count(anim.as_slice())!
+    assert(count > 1)
+    reference := image_alloc.load(jxl_fixture("anim-1.png", &mut path), arena.handle())!
+    frame := image_alloc.decode_frame(anim.as_slice(), 1, reference.layout().clone(), false, arena.handle())!
+    assert_eq(frame.width(), reference.width())
+    a := frame.view()
+    b := reference.view()
+    assert(ops.max_difference(&a, &b)! <= 1)
+    // Reusing one image for every frame.
+    reused := image_alloc.new(1, 1, pixels.Layout.rgba8(), arena.handle())!
+    for index in 0u32..count {
+        reused.decode_frame_from(anim.as_slice(), index, pixels.Layout.rgba8(), false)!
+        assert_eq(reused.width(), reference.width())
+    }
+}
+
+@test
+fn transforms_replace_the_pixels() {
+    arena := fresh_arena()
+    picture := pattern(arena.handle(), 6, 4)
+    source := picture.copy(arena.handle())!
+
+    original := source.view()
+    picture.rotate(90)!
+    assert_eq(picture.width(), 4u32)
+    assert_eq(picture.height(), 6u32)
+    // Clockwise: source (x, y) lands at (H-1-y, x).
+    assert(sample(&picture, 3, 2, 0) == original.pixel(2, 0)[0])
+    picture.rotate(270)!
+    first := picture.view()
+    assert(same_pixels(&first, &original))
+    assert_error_image(picture.rotate(45), pixels.Error.Malformed)
+
+    picture.flip_horizontal()
+    assert(sample(&picture, 0, 0, 0) == original.pixel(5, 0)[0])
+    picture.flip_horizontal()
+    picture.flip_vertical()
+    assert(sample(&picture, 0, 0, 1) == original.pixel(0, 3)[1])
+    picture.flip_vertical()
+
+    transposed := color.Orientation.Transpose
+    picture.transform(&transposed)!
+    assert_eq(picture.width(), 4u32)
+    assert(sample(&picture, 1, 4, 0) == original.pixel(4, 1)[0])
+    picture.transform(&transposed)!
+
+    picture.crop(1, 1, 3, 2)!
+    assert_eq(picture.width(), 3u32)
+    assert_eq(picture.height(), 2u32)
+    assert(sample(&picture, 0, 0, 0) == original.pixel(1, 1)[0])
+    assert_error_image(picture.crop(2, 0, 2, 1), pixels.Error.Malformed)
+
+    big := pattern(arena.handle(), 40, 30)
+    options := ops.ResizeOptions.new(ops.Filter.Lanczos3)
+    big.resize(20, 15, &options)!
+    assert_eq(big.width(), 20u32)
+    assert_eq(big.height(), 15u32)
+    assert_eq(big.bytes().len, 1200usize)
+    linear := ops.ResizeOptions.linear_light(ops.Filter.Box)
+    big.resize(41, 7, &linear)!
+    assert_eq(big.width(), 41u32)
+    assert_error_image(big.resize(0, 7, &linear), pixels.Error.Malformed)
+
+    // Quantizing leaves at most N colors; PNG then writes a palette.
+    many := pattern(arena.handle(), 32, 32)
+    entries := many.quantize(16, ops.Dither.FloydSteinberg)!
+    assert(entries > 0 && entries <= 16)
+    table := [0u8; 1024]
+    work := [0u8; 65536]
+    view := many.view()
+    assert(ops.palette(&view, 256, &mut table, &mut work)! <= 16)
+    encode := image.EncodeOptions.new()
+    encode.palette = true
+    indexed := many.encode(pixels.Format.Png, &encode, arena.handle())!
+    // IHDR color type 3: indexed.
+    assert_eq(indexed.as_slice()[25], 3u8)
+    back := image_alloc.decode_as(indexed.as_slice(), pixels.Layout.rgba8(), arena.handle())!
+    restored := back.view()
+    assert(same_pixels(&view, &restored))
+    ordered := pattern(arena.handle(), 9, 9)
+    assert(ordered.quantize(4, ops.Dither.Ordered)! <= 4)
+}
+
+@test
+fn load_and_save_round_trips() {
+    arena := fresh_arena()
+    picture := pattern(arena.handle(), 19, 11)
+    original := picture.view()
+    names := ["round.png", "round.qoi", "round.bmp", "round.pam", "round.jxl"]
+    for k in 0usize..5 {
+        path := [0u8; 1200]
+        file := scratch_path(names[k], &mut path)
+        picture.save_auto(file)!
+        back := image_alloc.load_as(file, pixels.Layout.rgba8(), arena.handle())!
+        assert(format_of(&back) == format_at(k), file)
+        decoded := back.view()
+        assert(same_pixels(&original, &decoded), file)
+        contents := image_alloc.read_file(file, arena.handle())!
+        assert(image.detect(contents.as_slice())! == format_at(k))
+    }
+    // An explicit format and options, regardless of the name.
+    path := [0u8; 1200]
+    file := scratch_path("explicit.bin", &mut path)
+    options := image.EncodeOptions.new()
+    options.effort = 1
+    picture.save(file, pixels.Format.Jxl, &options)!
+    back := image_alloc.load(file, arena.handle())!
+    assert(format_of(&back) == pixels.Format.Jxl)
+    // Unknown extensions fail before writing.
+    assert_error_image(picture.save_auto(file), pixels.Error.Unsupported)
+    image_alloc.write_file(file, b"not an image")!
+    match image_alloc.load(file, arena.handle()) {
+        ok(_) => {
+            assert(false)
+        }
+        err(reason) => {
+            match reason {
+                image_alloc.Error.Image(found) => {
+                    assert(found == pixels.Error.Unsupported)
+                }
+                _ => {
+                    assert(false)
+                }
+            }
+        }
+    }
+}
+
+@test
+fn missing_files_report_file_errors() {
+    arena := fresh_arena()
+    path := [0u8; 1200]
+    file := scratch_path("does-not-exist.png", &mut path)
+    match image_alloc.load(file, arena.handle()) {
+        ok(_) => {
+            assert(false)
+        }
+        err(reason) => {
+            assert(mem.str_bytes(image_alloc.error_name(&reason))[0] == b'f')
+            match reason {
+                image_alloc.Error.File(found) => {
+                    assert(found.cause.kind == platform_error.Kind.NotFound)
+                }
+                _ => {
+                    assert(false)
+                }
+            }
+        }
+    }
+    // Nothing was left allocated by the failed load beyond the empty image.
+    assert(arena.used() < 256)
+}

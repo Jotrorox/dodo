@@ -2,6 +2,7 @@ package macos
 
 import "core/ptr"
 import "std/gpu/opengl/common"
+import "std/window/handle"
 
 // OpenGL contexts on macOS through CGL, the Core OpenGL API.
 //
@@ -10,6 +11,11 @@ import "std/gpu/opengl/common"
 // contexts need no window: drawing goes to framebuffer objects. macOS offers
 // OpenGL up to 4.1 core and 2.1 legacy, and Apple has deprecated it in favour
 // of Metal.
+//
+// A context for a std/window window is an NSOpenGLContext attached to the
+// window's view, reached through the Objective-C runtime, which is also
+// opened at run time; its CGL context is used like any other. The window
+// already loaded AppKit, which provides NSOpenGLContext.
 
 unsafe extern "C" fn dlopen(path: *const u8, mode: i32) -> *mut u8
 // Declared with the pointer result std/dylib and std/gpu/metal use, as one
@@ -20,13 +26,20 @@ unsafe extern "C" fn dlclose(handle: *mut u8) -> i32
 const RTLD_NOW: i32 = 2
 const RTLD_LOCAL: i32 = 4
 
-// CGLPixelFormatAttribute values.
+// CGLPixelFormatAttribute values, which NSOpenGLPixelFormat shares.
+const PFA_DOUBLE_BUFFER: i32 = 5
+const PFA_COLOR_SIZE: i32 = 8
+const PFA_ALPHA_SIZE: i32 = 11
+const PFA_DEPTH_SIZE: i32 = 12
+const PFA_STENCIL_SIZE: i32 = 13
 const PFA_ALLOW_OFFLINE_RENDERERS: i32 = 96
 const PFA_ACCELERATED: i32 = 73
 const PFA_OPENGL_PROFILE: i32 = 99
 const PROFILE_LEGACY: i32 = 0x1000
 const PROFILE_3_2_CORE: i32 = 0x3200
 const PROFILE_4_1_CORE: i32 = 0x4100
+// kCGLCPSwapInterval.
+const CP_SWAP_INTERVAL: i32 = 222
 
 type ChoosePixelFormat = extern "C" fn(*const i32, *mut *mut u8, *mut i32) -> i32
 type DestroyPixelFormat = extern "C" fn(*mut u8) -> i32
@@ -34,6 +47,19 @@ type CreateContext = extern "C" fn(*mut u8, *mut u8, *mut *mut u8) -> i32
 type DestroyContext = extern "C" fn(*mut u8) -> i32
 type SetCurrentContext = extern "C" fn(*mut u8) -> i32
 type GetCurrentContext = extern "C" fn() -> *mut u8
+type FlushDrawable = extern "C" fn(*mut u8) -> i32
+type SetParameter = extern "C" fn(*mut u8, i32, *const i32) -> i32
+type GetClass = extern "C" fn(*const u8) -> *mut u8
+type RegisterSelector = extern "C" fn(*const u8) -> *mut u8
+type PoolPush = extern "C" fn() -> *mut u8
+type PoolPop = extern "C" fn(*mut u8)
+// objc_msgSend, typed for each message sent.
+type SendId = extern "C" fn(*mut u8, *mut u8) -> *mut u8
+type SendVoid = extern "C" fn(*mut u8, *mut u8)
+type SendIdPointer = extern "C" fn(*mut u8, *mut u8, *const i32) -> *mut u8
+type SendIdIdId = extern "C" fn(*mut u8, *mut u8, *mut u8, *mut u8) -> *mut u8
+type SendVoidId = extern "C" fn(*mut u8, *mut u8, *mut u8)
+type SendVoidBool = extern "C" fn(*mut u8, *mut u8, bool)
 
 fn null() -> *mut u8 {
     unsafe {
@@ -47,24 +73,131 @@ unsafe fn symbol(library: *mut u8, name: &[u8]) -> usize {
     }
 }
 
+// The Objective-C runtime, for the NSOpenGLContext of a window.
+struct Objc {
+    get_class: GetClass
+    register: RegisterSelector
+    send: usize
+    pool_push: PoolPush
+    pool_pop: PoolPop
+
+    fn open() -> Objc!common.Error {
+        library := unsafe {
+            dlopen(common.c_string(b"/usr/lib/libobjc.A.dylib\0"), RTLD_NOW | RTLD_LOCAL)
+        }
+        if ptr.is_null(library) {
+            return err(common.Error.NoLibrary)
+        }
+        get_class := unsafe {
+            symbol(library, b"objc_getClass\0")
+        }
+        register := unsafe {
+            symbol(library, b"sel_registerName\0")
+        }
+        send := unsafe {
+            symbol(library, b"objc_msgSend\0")
+        }
+        pool_push := unsafe {
+            symbol(library, b"objc_autoreleasePoolPush\0")
+        }
+        pool_pop := unsafe {
+            symbol(library, b"objc_autoreleasePoolPop\0")
+        }
+        if get_class == 0 || register == 0 || send == 0 || pool_push == 0 || pool_pop == 0 {
+            return err(common.Error.NoLibrary)
+        }
+        return ok(unsafe {
+            Objc {
+                get_class: get_class as GetClass,
+                register: register as RegisterSelector,
+                send: send,
+                pool_push: pool_push as PoolPush,
+                pool_pop: pool_pop as PoolPop
+            }
+        })
+    }
+    fn class(&self, name: &[u8]) -> *mut u8 {
+        get := self.get_class
+        return unsafe {
+            get(common.c_string(name))
+        }
+    }
+    fn selector(&self, name: &[u8]) -> *mut u8 {
+        register := self.register
+        return unsafe {
+            register(common.c_string(name))
+        }
+    }
+    fn send_id(&self, receiver: *mut u8, name: &[u8]) -> *mut u8 {
+        selector := self.selector(name)
+        return unsafe {
+            send := self.send as SendId
+            send(receiver, selector)
+        }
+    }
+    fn send_void(&self, receiver: *mut u8, name: &[u8]) {
+        selector := self.selector(name)
+        unsafe {
+            send := self.send as SendVoid
+            send(receiver, selector)
+        }
+    }
+    fn send_void_id(&self, receiver: *mut u8, name: &[u8], value: *mut u8) {
+        selector := self.selector(name)
+        unsafe {
+            send := self.send as SendVoidId
+            send(receiver, selector, value)
+        }
+    }
+    fn send_void_bool(&self, receiver: *mut u8, name: &[u8], value: bool) {
+        selector := self.selector(name)
+        unsafe {
+            send := self.send as SendVoidBool
+            send(receiver, selector, value)
+        }
+    }
+    fn push(&self) -> *mut u8 {
+        push := self.pool_push
+        return unsafe {
+            push()
+        }
+    }
+    fn pop(&self, pool: *mut u8) {
+        pop := self.pool_pop
+        unsafe {
+            pop(pool)
+        }
+    }
+}
+
+// The CGL profile for OpenGL `major`.`minor`, or 0 when macOS has none.
+fn profile_for(major: u32, minor: u32) -> i32 {
+    if major == 3 && minor <= 2 {
+        return PROFILE_3_2_CORE
+    }
+    if major == 3 || (major == 4 && minor <= 1) {
+        return PROFILE_4_1_CORE
+    }
+    if major > 2 {
+        return 0
+    }
+    return PROFILE_LEGACY
+}
+
 pub struct Backend {
     library: *mut u8
     context: *mut u8
     set_current: SetCurrentContext
     get_current: GetCurrentContext
     destroy: DestroyContext
+    flush: FlushDrawable
+    set_parameter: SetParameter
+    // A window's NSOpenGLContext, which owns context, or null.
+    window_context: *mut u8
+    objc: Option<Objc>
 
-    // Create a context for OpenGL `major`.`minor` and make it current on the
-    // calling thread. CGL has no debug contexts, so `debug` is ignored.
-    pub fn create(major: u32, minor: u32, debug: bool) -> Backend!common.Error {
-        profile := PROFILE_LEGACY
-        if major == 3 && minor <= 2 {
-            profile = PROFILE_3_2_CORE
-        } else if major == 3 || (major == 4 && minor <= 1) {
-            profile = PROFILE_4_1_CORE
-        } else if major > 2 {
-            return err(common.Error.Unsupported)
-        }
+    // OpenGL.framework and its CGL entry points, with no context yet.
+    fn load() -> Backend!common.Error {
         library := unsafe {
             dlopen(common.c_string(b"/System/Library/Frameworks/OpenGL.framework/OpenGL\0"), RTLD_NOW | RTLD_LOCAL)
         }
@@ -89,20 +222,49 @@ pub struct Backend {
         get_current := unsafe {
             symbol(library, b"CGLGetCurrentContext\0")
         }
-        if choose == 0 || destroy_format == 0 || create == 0 || destroy == 0 || set_current == 0 || get_current == 0 {
+        flush := unsafe {
+            symbol(library, b"CGLFlushDrawable\0")
+        }
+        set_parameter := unsafe {
+            symbol(library, b"CGLSetParameter\0")
+        }
+        if choose == 0 || destroy_format == 0 || create == 0 || destroy == 0 || set_current == 0 || get_current == 0 || flush == 0 || set_parameter == 0 {
             unsafe {
                 dlclose(library)
             }
             return err(common.Error.NoLibrary)
         }
-        backend := unsafe {
+        return ok(unsafe {
             Backend {
                 library: library,
                 context: null(),
                 set_current: set_current as SetCurrentContext,
                 get_current: get_current as GetCurrentContext,
-                destroy: destroy as DestroyContext
+                destroy: destroy as DestroyContext,
+                flush: flush as FlushDrawable,
+                set_parameter: set_parameter as SetParameter,
+                window_context: null(),
+                objc: none
             }
+        })
+    }
+
+    // Create a context for OpenGL `major`.`minor` and make it current on the
+    // calling thread. CGL has no debug contexts, so `debug` is ignored.
+    pub fn create(major: u32, minor: u32, debug: bool) -> Backend!common.Error {
+        profile := profile_for(major, minor)
+        if profile == 0 {
+            return err(common.Error.Unsupported)
+        }
+        backend := Backend.load()?
+        choose := unsafe {
+            symbol(backend.library, b"CGLChoosePixelFormat\0")
+        }
+        destroy_format := unsafe {
+            symbol(backend.library, b"CGLDestroyPixelFormat\0")
+        }
+        create := unsafe {
+            symbol(backend.library, b"CGLCreateContext\0")
         }
         // Prefer a GPU; fall back to any renderer, such as Apple's software one.
         accelerated := [PFA_OPENGL_PROFILE, profile, PFA_ALLOW_OFFLINE_RENDERERS, PFA_ACCELERATED, 0]
@@ -132,6 +294,125 @@ pub struct Backend {
         backend.context = context
         backend.make_current()?
         return ok(backend)
+    }
+
+    // Create an NSOpenGLContext drawing into the view of `native`, a handle
+    // from std/window, and make it current on the calling thread, which
+    // must be the main thread.
+    pub fn create_for_window(native: &handle.NativeHandle, major: u32, minor: u32, debug: bool) -> Backend!common.Error {
+        view := 0usize
+        match native {
+            handle.NativeHandle.AppKit(_, v) => {
+                view = *v
+            }
+            _ => {
+                return err(common.Error.InvalidInput)
+            }
+        }
+        if view == 0 {
+            return err(common.Error.InvalidInput)
+        }
+        profile := profile_for(major, minor)
+        if profile == 0 {
+            return err(common.Error.Unsupported)
+        }
+        backend := Backend.load()?
+        objc := Objc.open()?
+        format_class := objc.class(b"NSOpenGLPixelFormat\0")
+        context_class := objc.class(b"NSOpenGLContext\0")
+        if ptr.is_null(format_class) || ptr.is_null(context_class) {
+            return err(common.Error.NoLibrary)
+        }
+        target := unsafe {
+            view as *mut u8
+        }
+        pool := objc.push()
+        // Prefer a GPU; fall back to any renderer, such as Apple's software one.
+        accelerated := [
+            PFA_OPENGL_PROFILE, profile, PFA_DOUBLE_BUFFER, PFA_COLOR_SIZE, 24, PFA_ALPHA_SIZE, 8,
+            PFA_DEPTH_SIZE, 24, PFA_STENCIL_SIZE, 8, PFA_ALLOW_OFFLINE_RENDERERS, PFA_ACCELERATED, 0
+        ]
+        initialize_format := objc.selector(b"initWithAttributes:\0")
+        format := unsafe {
+            send := objc.send as SendIdPointer
+            send(objc.send_id(format_class, b"alloc\0"), initialize_format, ptr.as_ptr(&accelerated))
+        }
+        if ptr.is_null(format) {
+            accelerated[12] = 0
+            format = unsafe {
+                send := objc.send as SendIdPointer
+                send(objc.send_id(format_class, b"alloc\0"), initialize_format, ptr.as_ptr(&accelerated))
+            }
+        }
+        if ptr.is_null(format) {
+            objc.pop(pool)
+            return err(common.Error.NoConfig)
+        }
+        initialize_context := objc.selector(b"initWithFormat:shareContext:\0")
+        window_context := unsafe {
+            send := objc.send as SendIdIdId
+            send(objc.send_id(context_class, b"alloc\0"), initialize_context, format, null())
+        }
+        objc.send_void(format, b"release\0")
+        if ptr.is_null(window_context) {
+            objc.pop(pool)
+            return err(common.Error.Unsupported)
+        }
+        backend.window_context = window_context
+        // Pixels rather than points on Retina displays, like the window.
+        objc.send_void_bool(target, b"setWantsBestResolutionOpenGLSurface:\0", true)
+        objc.send_void_id(window_context, b"setView:\0", target)
+        backend.context = objc.send_id(window_context, b"CGLContextObj\0")
+        objc.pop(pool)
+        backend.objc = some(objc)
+        if ptr.is_null(backend.context) {
+            return err(common.Error.System)
+        }
+        backend.make_current()?
+        return ok(backend)
+    }
+
+    // Show the window's back buffer. Unsupported without a window.
+    pub fn swap_buffers(&self) -> void!common.Error {
+        if ptr.is_null(self.window_context) {
+            return err(common.Error.Unsupported)
+        }
+        flush := self.flush
+        if unsafe {
+            flush(self.context)
+        } != 0 {
+            return err(common.Error.System)
+        }
+        return ok()
+    }
+
+    pub fn set_swap_interval(&self, interval: i32) -> void!common.Error {
+        if ptr.is_null(self.window_context) {
+            return err(common.Error.Unsupported)
+        }
+        value := interval
+        set := self.set_parameter
+        if unsafe {
+            set(self.context, CP_SWAP_INTERVAL, ptr.from_ref(&value))
+        } != 0 {
+            return err(common.Error.Unsupported)
+        }
+        return ok()
+    }
+
+    // NSOpenGLContext resizes its drawable only when told to.
+    pub fn update_surface(&self) {
+        if ptr.is_null(self.window_context) {
+            return
+        }
+        match &self.objc {
+            some(objc) => {
+                pool := objc.push()
+                objc.send_void(self.window_context, b"update\0")
+                objc.pop(pool)
+            }
+            none => {}
+        }
     }
 
     pub fn make_current(&self) -> void!common.Error {
@@ -168,7 +449,21 @@ pub struct Backend {
     }
 
     fn drop(&mut self) {
-        if !ptr.is_null(self.context) {
+        if !ptr.is_null(self.window_context) {
+            if self.is_current() {
+                self.release_current()
+            }
+            // The NSOpenGLContext owns its CGL context.
+            match &self.objc {
+                some(objc) => {
+                    pool := objc.push()
+                    objc.send_void(self.window_context, b"clearDrawable\0")
+                    objc.send_void(self.window_context, b"release\0")
+                    objc.pop(pool)
+                }
+                none => {}
+            }
+        } else if !ptr.is_null(self.context) {
             if self.is_current() {
                 self.release_current()
             }

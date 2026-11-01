@@ -1,0 +1,179 @@
+package encode
+
+// Meta-adaptive (MA) context trees: construction, the BFS serialization the
+// decoder expects, and per-channel resolution of the static properties.
+
+const MAX_NODES: usize = 512
+const LEAF: i32 = -1
+
+// MA tree property numbers.
+const PROP_CHANNEL: i32 = 0
+const PROP_STREAM: i32 = 1
+const PROP_Y: i32 = 2
+const PROP_X: i32 = 3
+const PROP_ABS_N: i32 = 4
+const PROP_ABS_W: i32 = 5
+const PROP_N: i32 = 6
+const PROP_W: i32 = 7
+const PROP_GRADIENT: i32 = 9
+const PROP_W_NW: i32 = 10
+const PROP_NW_N: i32 = 11
+const PROP_N_NE: i32 = 12
+const PROP_N_NN: i32 = 13
+const PROP_W_WW: i32 = 14
+// Maximum error of the weighted predictor.
+const PROP_WP_ERROR: i32 = 15
+// |residual| of the previous channel of the same size (first reference
+// channel property 16 + 2).
+const PROP_PREV_ABS_RESIDUAL: i32 = 18
+
+// Predictors.
+const PRED_ZERO: u32 = 0
+const PRED_W: u32 = 1
+const PRED_N: u32 = 2
+const PRED_SELECT: u32 = 4
+const PRED_GRADIENT: u32 = 5
+const PRED_WEIGHTED: u32 = 6
+const PRED_NW: u32 = 8
+
+struct Tree {
+    count: usize
+    root: usize
+    // LEAF or the property tested.
+    prop: [512]i32
+    split: [512]i32
+    // Child taken when the property is greater than split, and otherwise.
+    left: [512]i32
+    right: [512]i32
+    predictor: [512]i32
+    // Context of each leaf, assigned in serialization (BFS) order.
+    ctx: [512]i32
+    // Multiplier of each leaf: residuals are coded divided by it.
+    mul: [512]i32
+    // Multiplier given to leaves created from now on (predictors that keep
+    // common factors only).
+    leaf_mul: i32
+    contexts: usize
+    // Pixel properties beyond channel and stream are used.
+    uses_pixels: bool
+    // Reference channel properties (16+) are used.
+    uses_refs: bool
+
+    fn new() -> Tree {
+        return Tree { count: 0, root: 0, prop: [0i32; 512], split: [0i32; 512], left: [0i32; 512], right: [0i32; 512], predictor: [0i32; 512], ctx: [0i32; 512], mul: [0i32; 512], leaf_mul: 1, contexts: 0, uses_pixels: false, uses_refs: false }
+    }
+    fn leaf(&mut self, predictor: u32) -> usize {
+        n := self.count
+        self.prop[n] = LEAF
+        self.predictor[n] = predictor as i32
+        self.mul[n] = 1
+        if predictor != PRED_WEIGHTED {
+            self.mul[n] = self.leaf_mul
+        }
+        self.count += 1
+        self.root = n
+        return n
+    }
+    // A node testing `property > value`.
+    fn node(&mut self, property: i32, value: i32, greater: usize, other: usize) -> usize {
+        n := self.count
+        self.prop[n] = property
+        self.split[n] = value
+        self.left[n] = greater as i32
+        self.right[n] = other as i32
+        self.count += 1
+        self.root = n
+        if property >= 16 {
+            self.uses_refs = true
+        }
+        if property >= 2 {
+            self.uses_pixels = true
+        }
+        return n
+    }
+    // Number contexts in BFS order and append the tree's tokens: per node
+    // (context, value) pairs for the six tree contexts.
+    fn serialize(&mut self, ctxs: &mut[u8], values: &mut[u32]) -> usize {
+        queue := [0usize; 512]
+        head := 0usize
+        tail := 1usize
+        queue[0] = self.root
+        tokens := 0usize
+        leaves := 0usize
+        for head < tail {
+            n := queue[head]
+            head += 1
+            if self.prop[n] == LEAF {
+                self.ctx[n] = leaves as i32
+                leaves += 1
+                ctxs[tokens] = 1
+                values[tokens] = 0
+                ctxs[tokens + 1] = 2
+                values[tokens + 1] = self.predictor[n] as u32
+                // Offset 0; multiplier (bits + 1) << log.
+                m := self.mul[n] as u32
+                log := 0u32
+                for ((m >> log) & 1) == 0 {
+                    log += 1
+                }
+                ctxs[tokens + 2] = 3
+                values[tokens + 2] = 0
+                ctxs[tokens + 3] = 4
+                values[tokens + 3] = log
+                ctxs[tokens + 4] = 5
+                values[tokens + 4] = (m >> log) - 1
+                tokens += 5
+            } else {
+                ctxs[tokens] = 1
+                values[tokens] = (self.prop[n] + 1) as u32
+                ctxs[tokens + 1] = 0
+                values[tokens + 1] = pack_signed(self.split[n] as i64) as u32
+                tokens += 2
+                queue[tail] = self.left[n] as usize
+                queue[tail + 1] = self.right[n] as usize
+                tail += 2
+            }
+        }
+        self.contexts = leaves
+        return tokens
+    }
+    // Whether the weighted predictor or its property is used below `n`.
+    fn uses_wp(&self, n: usize) -> bool {
+        if self.prop[n] == LEAF {
+            return self.predictor[n] == PRED_WEIGHTED as i32
+        }
+        if self.prop[n] == PROP_WP_ERROR {
+            return true
+        }
+        return self.uses_wp(self.left[n] as usize) || self.uses_wp(self.right[n] as usize)
+    }
+    // The node reached from the root once channel and stream index are
+    // known: the start of the per-pixel walk for that channel.
+    fn resolve(&self, channel: u32, stream: u32) -> usize {
+        n := self.root
+        for self.prop[n] == PROP_CHANNEL || self.prop[n] == PROP_STREAM {
+            value := channel as i64
+            if self.prop[n] == PROP_STREAM {
+                value = stream as i64
+            }
+            if value > self.split[n] as i64 {
+                n = self.left[n] as usize
+            } else {
+                n = self.right[n] as usize
+            }
+        }
+        return n
+    }
+}
+
+// A tree giving each of `channels` channels its own leaf with `predictor`;
+// returns the root.
+fn channel_leaves(tree: &mut Tree, first: u32, channels: u32, predictors: &[u32]) -> usize {
+    if channels == 1 {
+        return tree.leaf(predictors[first as usize])
+    }
+    half := channels / 2
+    low := channel_leaves(tree, first, half, predictors)
+    high := channel_leaves(tree, first + half, channels - half, predictors)
+    return tree.node(PROP_CHANNEL, (first + half - 1) as i32, high, low)
+}

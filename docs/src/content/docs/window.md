@@ -1,6 +1,6 @@
 ---
 title: "Windows"
-description: "Open desktop windows on Linux, macOS or Windows, draw into them with std/graphics, and handle keyboard and mouse events of all of them in one plain loop."
+description: "Open desktop windows on Linux, macOS or Windows, draw into them with std/graphics or the GPU, and handle keyboard and mouse events of all of them in one plain loop."
 section: "Standard library"
 order: 160.6
 ---
@@ -19,8 +19,10 @@ install and no build flag to set:
 | Windows (x64) | Win32 | user32, gdi32 |
 
 Drawing happens on the CPU, as everywhere in `std/graphics`, and the window
-system only shows the result. Wayland desktops run these programs through
-XWayland, which they provide by default.
+system only shows the result. A GPU can draw into a window too: Vulkan,
+OpenGL and Metal present straight into it through its
+[native handle](#drawing-with-the-gpu). Wayland desktops run these programs
+through XWayland, which they provide by default.
 
 ## Quickstart
 
@@ -136,7 +138,7 @@ be mistaken for one of a newer window.
 ```dodo
 app := window.App.new()?
 main := app.open(window.Options.new("Main", 640, 480))?
-tools := app.open(window.Options { title: "Tools", width: 160, height: 320, resizable: false })?
+tools := app.open(window.Options { title: "Tools", width: 160, height: 320, resizable: false, pixel_buffer: true })?
 for {
     event := app.wait_event()?
     from_tools := window.event_window(&event) == tools.id()
@@ -292,6 +294,88 @@ there both units are pixels and the scale is always 100.
 Pass `resizable: false` in the options to keep the size fixed; otherwise
 handle `Resize`.
 
+## Drawing with the GPU
+
+A window can be the target of a GPU API instead of, or as well as, a canvas.
+`win.native_handle()` returns the window system's own objects, which is what
+Vulkan, EGL, WGL, NSOpenGL and Metal take to create a surface:
+
+| System | `window.NativeHandle` | Use it with |
+| --- | --- | --- |
+| Linux | `Xcb(connection, window, screen, visual)`: a libxcb connection and the X11 window id | `vkCreateXcbSurfaceKHR`, EGL's XCB platform |
+| macOS | `AppKit(window, view)`: the `NSWindow` and its content `NSView` | `NSOpenGLContext`; `win.metal_layer()` for Metal and `VK_EXT_metal_surface` |
+| Windows | `Win32(hwnd, instance)`: the `HWND` and the program's `HINSTANCE` | `vkCreateWin32SurfaceKHR`, WGL |
+
+Open the window with `window.Options.gpu(title, width, height)` when only the
+GPU draws into it. That window has no pixel buffer: `canvas()` lends out an
+empty 0x0 canvas, `update()` fails with `Unsupported`, and nothing is copied
+on resize. `win.has_pixel_buffer()` tells the two kinds apart. Events, frame
+pacing with `request_frame()`, `size()` and `scale()` work the same in both,
+and one App can have windows of both kinds.
+
+[std/gpu/opengl](opengl.md#drawing-into-a-window) takes the handle directly:
+
+```dodo
+app := window.App.new()?
+win := app.open(window.Options.gpu("Triangle", 480, 320))?
+native := win.native_handle()?
+context := opengl.Context.create_for_window(&native, opengl.Options.default())?
+win.request_frame()?
+for {
+    match app.wait_event()? {
+        window.Event.Resize(_, _, _) => {
+            context.update_surface()
+        }
+        window.Event.Frame(_) => {
+            // ... draw into framebuffer 0, win.width() by win.height() ...
+            context.swap_buffers()?
+            win.request_frame()?
+        }
+        _ => {}
+    }
+}
+```
+
+Three examples in the repository draw a spinning triangle this way:
+[`opengl_window.dodo`](https://github.com/Jotrorox/dodo/blob/main/examples/opengl_window.dodo),
+[`vulkan_window.dodo`](https://github.com/Jotrorox/dodo/blob/main/examples/vulkan_window.dodo),
+which makes a surface for each system and rebuilds its swapchain on resize
+(see [Vulkan](vulkan.md#drawing-into-a-window)),
+and [`metal_window.dodo`](https://github.com/Jotrorox/dodo/blob/main/examples/metal_window.dodo)
+for macOS.
+
+The GPU's drawing area is the window's size in pixels, `win.size()`, which on
+a Retina display is twice the size the window was opened with. After a
+`Resize` event, resize the swapchain or drawable to match.
+
+### Each system's catch
+
+**Linux.** `std/window` speaks X11 over its own socket, but Vulkan and EGL
+need a libxcb connection. The first `native_handle()` call therefore loads
+`libxcb.so.1`, which every X11 installation has, and opens a second
+connection to the same X server. X11 window ids are valid on every
+connection, so the GPU presents into the window through it. Programs that
+never ask for a handle still need nothing beyond libc. Every window of the App
+shares that connection, which closes with the App; without libxcb the call
+fails with `NoDisplay`.
+
+**macOS.** `win.metal_layer()` makes a `CAMetalLayer` the backing layer of
+the window's view and returns its address. Wrap it with
+`metal.MetalLayer.from_object` for [Metal](metal.md#presenting-to-a-window),
+or pass it to `vkCreateMetalSurfaceEXT` for Vulkan through MoltenVK.
+`std/window` keeps the layer's `contentsScale` and `drawableSize` at the
+window's scale and size in pixels, also across resizes. Only windows opened
+with `Options.gpu()` have one, since a pixel-buffer window's layer shows the
+buffer. Everything here, like the window itself, belongs to the main thread.
+
+**Windows.** The window class has its own device context (`CS_OWNDC`), as
+WGL wants, and a window keeps the first pixel format it is given.
+
+The handle is plain addresses and ids that stay valid until the window
+closes. Destroy every surface, context or swapchain made from it first; local
+variables are dropped in reverse order, so declaring the window before the
+GPU objects does that.
+
 ## Platform notes
 
 | | Linux (X11) | macOS | Windows |
@@ -308,13 +392,13 @@ handle `Resize`.
 
 | Error | When |
 | --- | --- |
-| `NoDisplay` | No window system to connect to: no `DISPLAY` on Linux, no desktop session. |
+| `NoDisplay` | No window system to connect to: no `DISPLAY` on Linux, no desktop session. Also `native_handle()` on Linux without libxcb. |
 | `AlreadyOpen` | Another App exists; a process has one at a time. |
 | `Closed` | The window or its App was closed, or the connection to the window system ended. |
 | `InvalidInput` | A zero size, a size above `window.MAX_SIZE` (16384), or an oversized title. |
 | `OutOfMemory` | The pixel buffer could not be allocated. |
 | `Protocol` | The X server refused the connection (usually a missing or wrong cookie) or sent something malformed. |
-| `Unsupported` | The X server's default visual is not 24-bit true color, or macOS was used off the main thread. |
+| `Unsupported` | The X server's default visual is not 24-bit true color, or macOS was used off the main thread. Also `update()` on a window without a pixel buffer, and `metal_layer()` on other systems or on a window with one. |
 | `System` | Another operating-system call failed. |
 
 ## Limits
@@ -322,7 +406,8 @@ handle `Resize`.
 Windows have no owner relationships yet: a dialog is an ordinary window,
 not kept above the window it belongs to or modal to it, and there are no
 borderless popups or ways to place a window. There is no clipboard, no
-cursor shapes other than hiding the pointer (`set_cursor_visible`), no input
-methods for Chinese, Japanese or Korean text, and no GPU path: frames are
-copied to the window system on every `update`. Native Wayland and drawing
-straight to the screen without a desktop (DRM/KMS) are not implemented yet.
+cursor shapes other than hiding the pointer (`set_cursor_visible`), and no
+input methods for Chinese, Japanese or Korean text. A canvas is copied to
+the window system on every `update`; for drawing without that copy, use the
+GPU. Native Wayland and drawing straight to the screen without a desktop
+(DRM/KMS) are not implemented yet.

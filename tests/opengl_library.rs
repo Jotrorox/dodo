@@ -1,7 +1,8 @@
 //! OpenGL contexts: code generation for every hosted target, adapter
 //! selection, the generated binding's shape, and a triangle rendered and
 //! read back wherever the machine has OpenGL 3.3 (Mesa's llvmpipe in Linux
-//! CI, CGL on macOS).
+//! CI, CGL on macOS). Window contexts run under Xvfb in window_library.rs,
+//! and on the macOS desktop here when DODO_DESKTOP_TESTS is set.
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -47,6 +48,7 @@ fn opengl_builds_for_every_hosted_target() {
     let scratch = Scratch::new("targets");
     for source in [
         "tests/gpu/opengl_checks.dodo",
+        "tests/gpu/opengl_window_checks.dodo",
         "examples/opengl_window.dodo",
     ] {
         let source = root().join(source);
@@ -224,4 +226,29 @@ fn triangle_renders_and_reads_back() {
         }
         assert!(stdout.ends_with("passed\n"), "{stdout}");
     }
+}
+
+/// An NSOpenGLContext drawing into a window on the macOS desktop, read back
+/// before it is shown. Opt-in, because it shows a window.
+#[cfg(target_os = "macos")]
+#[test]
+fn window_context_draws_on_the_macos_desktop() {
+    if std::env::var_os("DODO_DESKTOP_TESTS").is_none() {
+        eprintln!("skipping: set DODO_DESKTOP_TESTS to open desktop windows");
+        return;
+    }
+    let scratch = Scratch::new("window");
+    let executable = scratch.0.join("window");
+    let source = root().join("tests/gpu/opengl_window_checks.dodo");
+    success(
+        &dodo(
+            &["build", source.to_str().unwrap(), "-O", "0", "-o"],
+            &executable,
+        ),
+        "compile the OpenGL window checks",
+    );
+    let output = Command::new(&executable).output().unwrap();
+    success(&output, "execute the OpenGL window checks");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.ends_with("shown\npassed\n"), "{stdout}");
 }

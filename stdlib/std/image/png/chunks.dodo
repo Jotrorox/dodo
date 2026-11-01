@@ -1,0 +1,496 @@
+package png
+
+import "std/checksum"
+import "std/image/color"
+import "std/image/meta"
+import "std/image/pixels"
+import "std/image/shared/binary"
+
+// PNG and APNG (https://www.w3.org/TR/png-3/).
+//
+// The decoder reads every color type and bit depth, PLTE, tRNS, Adam7
+// interlacing and APNG animation, and reports the file's samples without
+// loss: 16-bit files decode to 16-bit layouts, palettes to Rgb8 or Rgba8,
+// gray below 8 bits to Gray8 (scaled), and a tRNS color key adds an alpha
+// channel at the file's depth. cICP, iCCP, sRGB, gAMA, cHRM and cLLi fill
+// the header's ColorInfo; eXIf, XMP (iTXt) and iCCP are reported by
+// metadata(), and the EXIF orientation by the header. Every chunk's CRC is
+// checked, unknown ancillary chunks are skipped and unknown critical chunks
+// are rejected.
+//
+// decode() needs scratch_size(data) bytes: two rows of raw image data, each
+// with its filter byte. Rows are converted to the native layout in small
+// stack buffers and emitted as rects (single pixels for Adam7 passes other
+// than the last), so the scratch never holds converted pixels.
+
+const IHDR: u32 = 0x49484452
+const PLTE: u32 = 0x504c5445
+const IDAT: u32 = 0x49444154
+const IEND: u32 = 0x49454e44
+const TRNS: u32 = 0x74524e53
+const SRGB: u32 = 0x73524742
+const GAMA: u32 = 0x67414d41
+const CHRM: u32 = 0x6348524d
+const ICCP: u32 = 0x69434350
+const CICP: u32 = 0x63494350
+const CLLI: u32 = 0x634c4c69
+const EXIF: u32 = 0x65584966
+const ITXT: u32 = 0x69545874
+const ACTL: u32 = 0x6163544c
+const FCTL: u32 = 0x6663544c
+const FDAT: u32 = 0x66644154
+
+const CHUNK_LIMIT: u32 = 0x7fffffff
+// Signature and IHDR chunk; the empty IEND chunk.
+const START: usize = 33
+const END: usize = 12
+// The largest stored deflate block.
+const STORED_BLOCK: usize = 65535
+
+static ADAM7_X: [7]u32 = [0, 4, 0, 2, 0, 1, 0]
+static ADAM7_Y: [7]u32 = [0, 0, 4, 0, 2, 0, 1]
+static ADAM7_DX: [7]u32 = [8, 8, 4, 4, 2, 2, 1]
+static ADAM7_DY: [7]u32 = [8, 8, 8, 4, 4, 2, 2]
+
+// True when `data` starts with the PNG signature.
+pub fn matches(data: &[u8]) -> bool {
+    return data.len >= 8 && data[0] == 137 && data[1] == 80 && data[2] == 78 && data[3] == 71 && data[4] == 13 && data[5] == 10 && data[6] == 26 && data[7] == 10
+}
+
+struct Chunk {
+    kind: u32
+    // Offset and length of the chunk's data, and the offset of the next chunk.
+    data: usize
+    length: usize
+    next: usize
+}
+
+// The chunk at `offset` without checking its CRC.
+fn peek_chunk(data: &[u8], offset: usize) -> Chunk!pixels.Error {
+    length := binary.be32(data, offset)?
+    kind := binary.be32(data, offset + 4)?
+    if length > CHUNK_LIMIT {
+        return err(pixels.Error.Malformed)
+    }
+    for i in 0usize..4 {
+        byte := data[offset + 4 + i]
+        if !((byte >= b'A' && byte <= b'Z') || (byte >= b'a' && byte <= b'z')) {
+            return err(pixels.Error.Malformed)
+        }
+    }
+    start := offset + 8
+    size := length as usize
+    if size > data.len - start || data.len - start - size < 4 {
+        return err(pixels.Error.Truncated)
+    }
+    return ok(Chunk { kind: kind, data: start, length: size, next: start + size + 4 })
+}
+
+// The chunk at `offset`, its CRC checked.
+fn read_chunk(data: &[u8], offset: usize) -> Chunk!pixels.Error {
+    chunk := peek_chunk(data, offset)?
+    crc := checksum.Crc32.new()
+    crc.update(&data[offset + 4..chunk.data + chunk.length])
+    if crc.finish() != binary.be32(data, chunk.data + chunk.length)? {
+        return err(pixels.Error.Malformed)
+    }
+    return ok(chunk)
+}
+
+// Everything the decoder needs from the chunks before the image data.
+// Offsets point at chunk data and are zero when the chunk is absent.
+struct Png {
+    width: u32
+    height: u32
+    depth: u32
+    color: u32
+    channels: u32
+    interlaced: bool
+    palette: usize
+    palette_count: usize
+    transparency: usize
+    transparency_len: usize
+    // Offset of the first IDAT chunk.
+    idat: usize
+    srgb: usize
+    gama: usize
+    chrm: usize
+    cicp: usize
+    clli: usize
+    // The compressed profile of iCCP, after its name and method byte.
+    iccp: usize
+    iccp_len: usize
+    exif: usize
+    exif_len: usize
+    // acTL: an animation with `frames` frames playing `plays` times.
+    animated: bool
+    frames: u32
+    plays: u32
+    // The fcTL before IDAT, which makes the default image frame 0.
+    first_control: usize
+}
+
+// Read IHDR and the chunks before the image data.
+fn parse(data: &[u8]) -> Png!pixels.Error {
+    if data.len < 8 {
+        return err(pixels.Error.Truncated)
+    }
+    if !matches(data) {
+        return err(pixels.Error.Malformed)
+    }
+    ihdr := read_chunk(data, 8)?
+    if ihdr.kind != IHDR || ihdr.length != 13 {
+        return err(pixels.Error.Malformed)
+    }
+    p := ihdr.data
+    width := binary.be32(data, p)?
+    height := binary.be32(data, p + 4)?
+    depth := data[p + 8] as u32
+    kind := data[p + 9] as u32
+    if width == 0 || height == 0 || width > 0x7fffffff || height > 0x7fffffff {
+        return err(pixels.Error.Malformed)
+    }
+    if data[p + 10] != 0 || data[p + 11] != 0 || data[p + 12] > 1 {
+        return err(pixels.Error.Malformed)
+    }
+    channels := 0u32
+    wide := depth == 8 || depth == 16
+    narrow := depth == 1 || depth == 2 || depth == 4 || depth == 8
+    if kind == 0 && (narrow || wide) {
+        channels = 1
+    } else if kind == 2 && wide {
+        channels = 3
+    } else if kind == 3 && narrow {
+        channels = 1
+    } else if kind == 4 && wide {
+        channels = 2
+    } else if kind == 6 && wide {
+        channels = 4
+    } else {
+        return err(pixels.Error.Malformed)
+    }
+    binary.check_dimensions(width, height)?
+    png := Png { width: width, height: height, depth: depth, color: kind, channels: channels, interlaced: data[p + 12] == 1, palette: 0, palette_count: 0, transparency: 0, transparency_len: 0, idat: 0, srgb: 0, gama: 0, chrm: 0, cicp: 0, clli: 0, iccp: 0, iccp_len: 0, exif: 0, exif_len: 0, animated: false, frames: 1, plays: 0, first_control: 0 }
+    seen_transparency := false
+    offset := ihdr.next
+    for {
+        chunk := read_chunk(data, offset)?
+        c := chunk.kind
+        if c == IDAT {
+            break
+        }
+        if c == PLTE {
+            if png.palette != 0 || seen_transparency || kind == 0 || kind == 4 || chunk.length == 0 || chunk.length % 3 != 0 || chunk.length > 768 {
+                return err(pixels.Error.Malformed)
+            }
+            png.palette = chunk.data
+            png.palette_count = chunk.length / 3
+        } else if c == TRNS {
+            if seen_transparency {
+                return err(pixels.Error.Malformed)
+            }
+            seen_transparency = true
+            if (kind == 0 && chunk.length != 2) || (kind == 2 && chunk.length != 6) || (kind == 3 && png.palette == 0) {
+                return err(pixels.Error.Malformed)
+            }
+            // Types with an alpha channel must not carry tRNS; it is ignored.
+            if kind != 4 && kind != 6 {
+                png.transparency = chunk.data
+                png.transparency_len = chunk.length
+                // Extra alpha values beyond the palette are ignored.
+                if kind == 3 && chunk.length > png.palette_count {
+                    png.transparency_len = png.palette_count
+                }
+            }
+        } else if c == IHDR || c == IEND {
+            return err(pixels.Error.Malformed)
+        } else if c == SRGB {
+            if chunk.length == 1 {
+                png.srgb = chunk.data
+            }
+        } else if c == GAMA {
+            if chunk.length == 4 {
+                png.gama = chunk.data
+            }
+        } else if c == CHRM {
+            if chunk.length == 32 {
+                png.chrm = chunk.data
+            }
+        } else if c == CICP {
+            if chunk.length == 4 {
+                png.cicp = chunk.data
+            }
+        } else if c == CLLI {
+            if chunk.length == 8 {
+                png.clli = chunk.data
+            }
+        } else if c == ICCP {
+            locate_profile(data, &chunk, &mut png)
+        } else if c == EXIF {
+            if png.exif == 0 && chunk.length > 0 {
+                png.exif = chunk.data
+                png.exif_len = chunk.length
+            }
+        } else if c == ACTL {
+            if chunk.length == 8 {
+                frames := binary.be32(data, chunk.data)?
+                if frames > 0 {
+                    png.animated = true
+                    png.frames = frames
+                    png.plays = binary.be32(data, chunk.data + 4)?
+                }
+            }
+        } else if c == FCTL {
+            if png.first_control == 0 {
+                png.first_control = offset
+            }
+        } else if (data[offset + 4] & 32) == 0 {
+            // An unknown critical chunk changes how the image must be read.
+            return err(pixels.Error.Unsupported)
+        }
+        offset = chunk.next
+    }
+    if kind == 3 && png.palette == 0 {
+        return err(pixels.Error.Malformed)
+    }
+    if !png.animated {
+        png.first_control = 0
+    }
+    png.idat = offset
+    return ok(png)
+}
+
+// The compressed profile of an iCCP chunk: a 1 to 79 byte name, a zero
+// byte, compression method 0, then the zlib stream.
+fn locate_profile(data: &[u8], chunk: &Chunk, png: &mut Png) {
+    if png.iccp != 0 {
+        return
+    }
+    limit := chunk.length
+    if limit > 81 {
+        limit = 81
+    }
+    for i in 0usize..limit {
+        if data[chunk.data + i] == 0 {
+            if i == 0 || i + 2 > chunk.length || data[chunk.data + i + 1] != 0 {
+                return
+            }
+            png.iccp = chunk.data + i + 2
+            png.iccp_len = chunk.length - i - 2
+            return
+        }
+    }
+}
+
+// The eXIf payload after the image data, when none came before it. Chunks
+// are walked without checking CRCs and the search stops quietly at the
+// first damaged one, so a file that decodes is never rejected for its tail.
+fn find_late_exif(data: &[u8], png: &mut Png) {
+    if png.exif != 0 {
+        return
+    }
+    offset := png.idat
+    for {
+        match peek_chunk(data, offset) {
+            ok(chunk) => {
+                if chunk.kind == IEND {
+                    return
+                }
+                if chunk.kind == EXIF && chunk.length > 0 {
+                    match read_chunk(data, offset) {
+                        ok(_) => {
+                            png.exif = chunk.data
+                            png.exif_len = chunk.length
+                        }
+                        err(_) => {}
+                    }
+                    return
+                }
+                offset = chunk.next
+            }
+            err(_) => {
+                return
+            }
+        }
+    }
+}
+
+// The layout holding the file's samples without loss.
+fn native_layout(png: &Png) -> pixels.Layout {
+    keyed := png.transparency_len > 0
+    sample := pixels.SAMPLE_U8
+    if png.depth == 16 {
+        sample = pixels.SAMPLE_U16
+    }
+    count := png.channels as usize
+    if png.color == 3 {
+        count = 3
+    }
+    if keyed && (count == 1 || count == 3) {
+        count += 1
+    }
+    return pixels.Layout.from_codes(count, sample, false)
+}
+
+fn color_info(data: &[u8], png: &Png) -> color.ColorInfo {
+    info := color.ColorInfo.srgb()
+    if png.gama != 0 || png.chrm != 0 || png.srgb != 0 || png.cicp != 0 || png.iccp != 0 || png.clli != 0 {
+        info.tagged = true
+    }
+    // sRGB and cICP override gAMA and cHRM; cICP overrides sRGB.
+    if png.cicp == 0 && png.srgb == 0 {
+        if png.gama != 0 {
+            gamma := word(data, png.gama)
+            if gamma > 0 {
+                info.set_gamma(gamma)
+            }
+        }
+        if png.chrm != 0 {
+            c := png.chrm
+            info.set_chromaticities(word(data, c), word(data, c + 4), word(data, c + 8), word(data, c + 12), word(data, c + 16), word(data, c + 20), word(data, c + 24), word(data, c + 28))
+        }
+    }
+    if png.srgb != 0 && png.cicp == 0 {
+        info.primaries = color.PRIMARIES_BT709
+        info.transfer = color.TRANSFER_SRGB
+        info.gamma = 0
+        intent := data[png.srgb]
+        if intent <= 3 {
+            info.intent = intent
+        }
+    }
+    if png.cicp != 0 {
+        c := png.cicp
+        info.primaries = data[c]
+        info.transfer = data[c + 1]
+        info.matrix = data[c + 2]
+        info.full_range = data[c + 3] != 0
+        info.gamma = 0
+    }
+    if png.iccp != 0 {
+        info.icc_encoding = color.ICC_ZLIB
+        info.icc_offset = png.iccp
+        info.icc_length = png.iccp_len
+    }
+    if png.clli != 0 {
+        // Maximum content light level in units of 0.0001 cd/m2.
+        info.intensity_target = word(data, png.clli) / 10000
+    }
+    return info
+}
+
+// A big-endian word the parser already bounds-checked.
+fn word(data: &[u8], offset: usize) -> u32 {
+    return ((data[offset] as u32) << 24) | ((data[offset + 1] as u32) << 16) | ((data[offset + 2] as u32) << 8) | (data[offset + 3] as u32)
+}
+
+fn header_of(data: &[u8], png: &Png) -> pixels.Header {
+    header := pixels.Header.new(pixels.Format.Png, png.width, png.height, native_layout(png), png.depth)
+    header.color = color_info(data, png)
+    header.progressive = png.interlaced
+    if png.animated {
+        header.animated = true
+        header.frames = png.frames
+        header.loops = png.plays
+    }
+    if png.exif != 0 {
+        match meta.exif_orientation(&data[png.exif..png.exif + png.exif_len]) {
+            ok(value) => {
+                header.orientation = color.orientation_from_exif(value)
+            }
+            err(_) => {}
+        }
+    }
+    return header
+}
+
+// Read the header without decoding: size, native layout, color, EXIF
+// orientation and animation.
+pub fn info(data: &[u8]) -> pixels.Header!pixels.Error {
+    png := parse(data)?
+    find_late_exif(data, &mut png)
+    return ok(header_of(data, &png))
+}
+
+// The file's EXIF (eXIf, raw), XMP (iTXt "XML:com.adobe.xmp", zlib when
+// compressed) and ICC profile (iCCP, zlib), before or after the image data.
+pub fn metadata(data: &[u8]) -> meta.Metadata!pixels.Error {
+    png := parse(data)?
+    find_late_exif(data, &mut png)
+    result := meta.Metadata.empty()
+    if png.exif != 0 {
+        result.exif = meta.Item.raw(png.exif, png.exif_len)
+    }
+    if png.iccp != 0 {
+        result.icc = meta.Item { offset: png.iccp, length: png.iccp_len, encoding: meta.ENCODING_ZLIB }
+    }
+    offset := 8usize
+    for {
+        match read_chunk(data, offset) {
+            ok(chunk) => {
+                if chunk.kind == IEND {
+                    break
+                }
+                if chunk.kind == ITXT && !result.xmp.present() {
+                    result.xmp = xmp_item(data, &chunk)
+                }
+                offset = chunk.next
+            }
+            err(_) => {
+                break
+            }
+        }
+    }
+    return ok(result)
+}
+
+// The text of an iTXt chunk with keyword "XML:com.adobe.xmp", or none.
+fn xmp_item(data: &[u8], chunk: &Chunk) -> meta.Item {
+    name := b"XML:com.adobe.xmp"
+    if chunk.length < name.len + 3 {
+        return meta.Item.none()
+    }
+    for i in 0usize..name.len {
+        if data[chunk.data + i] != name[i] {
+            return meta.Item.none()
+        }
+    }
+    p := chunk.data + name.len
+    end := chunk.data + chunk.length
+    if data[p] != 0 {
+        return meta.Item.none()
+    }
+    compressed := data[p + 1] == 1
+    p += 3
+    // The language tag and the translated keyword end with zero bytes.
+    for _ in 0usize..2 {
+        for p < end && data[p] != 0 {
+            p += 1
+        }
+        if p >= end {
+            return meta.Item.none()
+        }
+        p += 1
+    }
+    if p >= end {
+        return meta.Item.none()
+    }
+    encoding := meta.ENCODING_RAW
+    if compressed {
+        encoding = meta.ENCODING_ZLIB
+    }
+    return meta.Item { offset: p, length: end - p, encoding: encoding }
+}
+
+// Bytes in one row of `width` pixels of `bits` bits, without the filter byte.
+fn row_bytes(width: u32, bits: u32) -> usize!pixels.Error {
+    return ok(pixels.checked(width as usize, bits as usize, 7)? / 8)
+}
+
+// Bytes of scratch decode() needs for `data`: two rows of raw image data,
+// each with its filter byte.
+pub fn scratch_size(data: &[u8]) -> usize!pixels.Error {
+    png := parse(data)?
+    row := row_bytes(png.width, png.depth * png.channels)?
+    return pixels.checked(row + 1, 2, 0)
+}

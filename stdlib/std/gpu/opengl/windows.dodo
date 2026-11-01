@@ -3,6 +3,7 @@ package windows
 import "core/mem"
 import "core/ptr"
 import "std/gpu/opengl/common"
+import "std/window/handle"
 
 // OpenGL contexts on Windows through WGL.
 //
@@ -12,6 +13,10 @@ import "std/gpu/opengl/common"
 // window; drawing goes to framebuffer objects. A legacy context is created
 // first, because wglCreateContextAttribsARB, which creates versioned core
 // contexts, is itself only reachable through a current context.
+//
+// A context for a std/window window uses the window's own device context
+// instead, sets its pixel format (a window keeps the first one it gets) and
+// shows frames with SwapBuffers.
 
 unsafe extern "C" fn LoadLibraryA(name: *const u8) -> *mut u8
 // Declared with the pointer result std/dylib uses, as one program may load
@@ -45,6 +50,10 @@ type WglMakeCurrent = extern "C" fn(*mut u8, *mut u8) -> i32
 type WglGetProcAddress = extern "C" fn(*const u8) -> usize
 type WglGetCurrentContext = extern "C" fn() -> *mut u8
 type WglCreateContextAttribsArb = extern "C" fn(*mut u8, *mut u8, *const i32) -> *mut u8
+type GetPixelFormat = extern "C" fn(*mut u8) -> i32
+type DescribePixelFormat = extern "C" fn(*mut u8, i32, u32, *mut PixelFormatDescriptor) -> i32
+type GdiSwapBuffers = extern "C" fn(*mut u8) -> i32
+type WglSwapIntervalExt = extern "C" fn(i32) -> i32
 
 // WNDCLASSEXA.
 @repr(C)
@@ -110,13 +119,53 @@ unsafe fn symbol(module: *mut u8, name: &[u8]) -> usize {
 
 // Every entry point the backend uses.
 struct Wgl {
+    register_class: RegisterClassExA
+    create_window: CreateWindowExA
     destroy_window: DestroyWindow
+    get_dc: GetDC
     release_dc: ReleaseDC
+    default_procedure: usize
+    choose_pixel_format: ChoosePixelFormat
+    set_pixel_format: SetPixelFormat
+    get_pixel_format: GetPixelFormat
+    describe_pixel_format: DescribePixelFormat
+    swap_buffers: GdiSwapBuffers
     create_context: WglCreateContext
     delete_context: WglDeleteContext
     make_current: WglMakeCurrent
     get_proc_address: WglGetProcAddress
     get_current_context: WglGetCurrentContext
+}
+
+fn descriptor() -> PixelFormatDescriptor {
+    return PixelFormatDescriptor {
+        size: mem.size_of::<PixelFormatDescriptor>() as u16,
+        version: 1,
+        flags: PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL | PFD_DOUBLEBUFFER,
+        pixel_type: 0,
+        color_bits: 32,
+        red_bits: 0,
+        red_shift: 0,
+        green_bits: 0,
+        green_shift: 0,
+        blue_bits: 0,
+        blue_shift: 0,
+        alpha_bits: 8,
+        alpha_shift: 0,
+        accum_bits: 0,
+        accum_red_bits: 0,
+        accum_green_bits: 0,
+        accum_blue_bits: 0,
+        accum_alpha_bits: 0,
+        depth_bits: 24,
+        stencil_bits: 8,
+        aux_buffers: 0,
+        layer_type: 0,
+        reserved: 0,
+        layer_mask: 0,
+        visible_mask: 0,
+        damage_mask: 0
+    }
 }
 
 pub struct Backend {
@@ -125,10 +174,12 @@ pub struct Backend {
     window: *mut u8
     device: *mut u8
     context: *mut u8
+    // Whether window is std/window's, shown with swap_buffers, rather than
+    // the hidden one this backend created and destroys.
+    shown: bool
 
-    // Create a context for OpenGL `major`.`minor`, core profile from 3.2, and
-    // make it current on the calling thread.
-    pub fn create(major: u32, minor: u32, debug: bool) -> Backend!common.Error {
+    // opengl32, user32 and gdi32 and their entry points, with no window yet.
+    fn load() -> Backend!common.Error {
         opengl := unsafe {
             LoadLibraryA(common.c_string(b"opengl32.dll\0"))
         }
@@ -141,7 +192,7 @@ pub struct Backend {
         if ptr.is_null(opengl) || ptr.is_null(user32) || ptr.is_null(gdi32) {
             return err(common.Error.NoLibrary)
         }
-        addresses := [0usize; 12]
+        addresses := [0usize; 16]
         names := [
             b"RegisterClassExA\0", b"CreateWindowExA\0", b"DestroyWindow\0", b"GetDC\0",
             b"ReleaseDC\0", b"DefWindowProcA\0"
@@ -151,46 +202,56 @@ pub struct Backend {
                 symbol(user32, names[i])
             }
         }
-        addresses[6] = unsafe {
-            symbol(gdi32, b"ChoosePixelFormat\0")
+        gdi_names := [b"ChoosePixelFormat\0", b"SetPixelFormat\0", b"GetPixelFormat\0", b"DescribePixelFormat\0", b"SwapBuffers\0"]
+        for i in 0usize..5 {
+            addresses[6 + i] = unsafe {
+                symbol(gdi32, gdi_names[i])
+            }
         }
-        addresses[7] = unsafe {
-            symbol(gdi32, b"SetPixelFormat\0")
-        }
-        wgl_names := [b"wglCreateContext\0", b"wglDeleteContext\0", b"wglMakeCurrent\0", b"wglGetProcAddress\0"]
-        for i in 0usize..4 {
-            addresses[8 + i] = unsafe {
+        wgl_names := [b"wglCreateContext\0", b"wglDeleteContext\0", b"wglMakeCurrent\0", b"wglGetProcAddress\0", b"wglGetCurrentContext\0"]
+        for i in 0usize..5 {
+            addresses[11 + i] = unsafe {
                 symbol(opengl, wgl_names[i])
             }
         }
-        current := unsafe {
-            symbol(opengl, b"wglGetCurrentContext\0")
-        }
-        for i in 0usize..12 {
+        for i in 0usize..16 {
             if addresses[i] == 0 {
                 return err(common.Error.NoLibrary)
             }
         }
-        if current == 0 {
-            return err(common.Error.NoLibrary)
-        }
-        backend := unsafe {
+        return ok(unsafe {
             Backend {
                 opengl: opengl,
                 wgl: Wgl {
+                    register_class: addresses[0] as RegisterClassExA,
+                    create_window: addresses[1] as CreateWindowExA,
                     destroy_window: addresses[2] as DestroyWindow,
+                    get_dc: addresses[3] as GetDC,
                     release_dc: addresses[4] as ReleaseDC,
-                    create_context: addresses[8] as WglCreateContext,
-                    delete_context: addresses[9] as WglDeleteContext,
-                    make_current: addresses[10] as WglMakeCurrent,
-                    get_proc_address: addresses[11] as WglGetProcAddress,
-                    get_current_context: current as WglGetCurrentContext
+                    default_procedure: addresses[5],
+                    choose_pixel_format: addresses[6] as ChoosePixelFormat,
+                    set_pixel_format: addresses[7] as SetPixelFormat,
+                    get_pixel_format: addresses[8] as GetPixelFormat,
+                    describe_pixel_format: addresses[9] as DescribePixelFormat,
+                    swap_buffers: addresses[10] as GdiSwapBuffers,
+                    create_context: addresses[11] as WglCreateContext,
+                    delete_context: addresses[12] as WglDeleteContext,
+                    make_current: addresses[13] as WglMakeCurrent,
+                    get_proc_address: addresses[14] as WglGetProcAddress,
+                    get_current_context: addresses[15] as WglGetCurrentContext
                 },
                 window: null(),
                 device: null(),
-                context: null()
+                context: null(),
+                shown: false
             }
-        }
+        })
+    }
+
+    // Create a context for OpenGL `major`.`minor`, core profile from 3.2, and
+    // make it current on the calling thread.
+    pub fn create(major: u32, minor: u32, debug: bool) -> Backend!common.Error {
+        backend := Backend.load()?
         instance := unsafe {
             GetModuleHandleA(0usize as *const u8)
         }
@@ -198,7 +259,7 @@ pub struct Backend {
             WindowClass {
                 size: mem.size_of::<WindowClass>() as u32,
                 style: CS_OWNDC,
-                procedure: addresses[5] as WindowProcedure,
+                procedure: backend.wgl.default_procedure as WindowProcedure,
                 class_extra: 0,
                 window_extra: 0,
                 instance: instance,
@@ -210,80 +271,99 @@ pub struct Backend {
                 small_icon: null()
             }
         }
+        register := backend.wgl.register_class
+        create_window := backend.wgl.create_window
         unsafe {
             // Fails harmlessly once the class exists from an earlier context.
-            register := addresses[0] as RegisterClassExA
             register(ptr.from_ref(&class))
-            create_window := addresses[1] as CreateWindowExA
             backend.window = create_window(0, common.c_string(CLASS_NAME), common.c_string(b"\0"), WS_POPUP, 0, 0, 1, 1, null(), null(), instance, null())
         }
         // Without a desktop, such as in a service, there is no window.
         if ptr.is_null(backend.window) {
             return err(common.Error.NoDisplay)
         }
-        backend.device = unsafe {
-            get_dc := addresses[3] as GetDC
-            get_dc(backend.window)
+        backend.initialize(major, minor, debug)?
+        return ok(backend)
+    }
+
+    // Create a context that draws into the window of `native`, a handle from
+    // std/window, and make it current on the calling thread.
+    pub fn create_for_window(native: &handle.NativeHandle, major: u32, minor: u32, debug: bool) -> Backend!common.Error {
+        window := 0usize
+        match native {
+            handle.NativeHandle.Win32(hwnd, _) => {
+                window = *hwnd
+            }
+            _ => {
+                return err(common.Error.InvalidInput)
+            }
         }
-        if ptr.is_null(backend.device) {
+        if window == 0 {
+            return err(common.Error.InvalidInput)
+        }
+        backend := Backend.load()?
+        backend.window = unsafe {
+            window as *mut u8
+        }
+        backend.shown = true
+        backend.initialize(major, minor, debug)?
+        return ok(backend)
+    }
+
+    // Give the window's device context a pixel format and create the
+    // context on it.
+    fn initialize(&mut self, major: u32, minor: u32, debug: bool) -> void!common.Error {
+        get_dc := self.wgl.get_dc
+        self.device = unsafe {
+            get_dc(self.window)
+        }
+        if ptr.is_null(self.device) {
             return err(common.Error.NoDisplay)
         }
-        descriptor := PixelFormatDescriptor {
-            size: mem.size_of::<PixelFormatDescriptor>() as u16,
-            version: 1,
-            flags: PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL | PFD_DOUBLEBUFFER,
-            pixel_type: 0,
-            color_bits: 32,
-            red_bits: 0,
-            red_shift: 0,
-            green_bits: 0,
-            green_shift: 0,
-            blue_bits: 0,
-            blue_shift: 0,
-            alpha_bits: 8,
-            alpha_shift: 0,
-            accum_bits: 0,
-            accum_red_bits: 0,
-            accum_green_bits: 0,
-            accum_blue_bits: 0,
-            accum_alpha_bits: 0,
-            depth_bits: 24,
-            stencil_bits: 8,
-            aux_buffers: 0,
-            layer_type: 0,
-            reserved: 0,
-            layer_mask: 0,
-            visible_mask: 0,
-            damage_mask: 0
+        wanted := descriptor()
+        get_format := self.wgl.get_pixel_format
+        existing := unsafe {
+            get_format(self.device)
         }
-        format := unsafe {
-            choose := addresses[6] as ChoosePixelFormat
-            choose(backend.device, ptr.from_ref(&descriptor))
+        if existing == 0 {
+            choose := self.wgl.choose_pixel_format
+            format := unsafe {
+                choose(self.device, ptr.from_ref(&wanted))
+            }
+            if format == 0 {
+                return err(common.Error.NoConfig)
+            }
+            set_format := self.wgl.set_pixel_format
+            if unsafe {
+                set_format(self.device, format, ptr.from_ref(&wanted))
+            } == 0 {
+                return err(common.Error.NoConfig)
+            }
+        } else {
+            // A window keeps its first pixel format; it must suit OpenGL.
+            found := descriptor()
+            describe := self.wgl.describe_pixel_format
+            unsafe {
+                describe(self.device, existing, mem.size_of::<PixelFormatDescriptor>() as u32, ptr.from_mut(&mut found))
+            }
+            if (found.flags & PFD_SUPPORT_OPENGL) == 0 {
+                return err(common.Error.NoConfig)
+            }
         }
-        if format == 0 {
-            return err(common.Error.NoConfig)
-        }
-        set := unsafe {
-            set_format := addresses[7] as SetPixelFormat
-            set_format(backend.device, format, ptr.from_ref(&descriptor))
-        }
-        if set == 0 {
-            return err(common.Error.NoConfig)
-        }
-        create := backend.wgl.create_context
+        create := self.wgl.create_context
         legacy := unsafe {
-            create(backend.device)
+            create(self.device)
         }
         if ptr.is_null(legacy) {
             return err(common.Error.Unsupported)
         }
-        backend.context = legacy
-        backend.make_current()?
+        self.context = legacy
+        self.make_current()?
         if (major < 3 || (major == 3 && minor < 2)) && !debug {
             // A legacy context already provides every version up to 3.1.
-            return ok(backend)
+            return ok()
         }
-        resolve := backend.wgl.get_proc_address
+        resolve := self.wgl.get_proc_address
         address := unsafe {
             resolve(common.c_string(b"wglCreateContextAttribsARB\0"))
         }
@@ -310,21 +390,20 @@ pub struct Backend {
         }
         context := unsafe {
             create_attributes := address as WglCreateContextAttribsArb
-            create_attributes(backend.device, null(), ptr.as_ptr(&attributes))
+            create_attributes(self.device, null(), ptr.as_ptr(&attributes))
         }
         if ptr.is_null(context) {
             return err(common.Error.Unsupported)
         }
         // Replace the legacy context; drop() then deletes the new one.
-        delete := backend.wgl.delete_context
-        make := backend.wgl.make_current
+        delete := self.wgl.delete_context
+        make := self.wgl.make_current
         unsafe {
             make(null(), null())
             delete(legacy)
         }
-        backend.context = context
-        backend.make_current()?
-        return ok(backend)
+        self.context = context
+        return self.make_current()
     }
 
     pub fn make_current(&self) -> void!common.Error {
@@ -351,6 +430,41 @@ pub struct Backend {
             get() as usize == self.context as usize
         }
     }
+
+    // Show the window's back buffer. Unsupported without a window.
+    pub fn swap_buffers(&self) -> void!common.Error {
+        if !self.shown {
+            return err(common.Error.Unsupported)
+        }
+        swap := self.wgl.swap_buffers
+        if unsafe {
+            swap(self.device)
+        } == 0 {
+            return err(common.Error.System)
+        }
+        return ok()
+    }
+
+    // WGL_EXT_swap_control, which every current driver offers.
+    pub fn set_swap_interval(&self, interval: i32) -> void!common.Error {
+        if !self.shown {
+            return err(common.Error.Unsupported)
+        }
+        resolve := self.wgl.get_proc_address
+        address := unsafe {
+            resolve(common.c_string(b"wglSwapIntervalEXT\0"))
+        }
+        if !valid(address) || unsafe {
+            set := address as WglSwapIntervalExt
+            set(interval)
+        } == 0 {
+            return err(common.Error.Unsupported)
+        }
+        return ok()
+    }
+
+    // A window's framebuffer follows its size by itself.
+    pub fn update_surface(&self) {}
 
     // The address of an OpenGL command, or 0. wglGetProcAddress serves
     // commands after OpenGL 1.1; opengl32.dll exports the 1.1 ones itself.
@@ -383,7 +497,8 @@ pub struct Backend {
                 release(self.window, self.device)
             }
         }
-        if !ptr.is_null(self.window) {
+        // std/window owns a shown window.
+        if !ptr.is_null(self.window) && !self.shown {
             destroy := self.wgl.destroy_window
             unsafe {
                 destroy(self.window)

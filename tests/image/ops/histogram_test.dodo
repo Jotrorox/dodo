@@ -1,0 +1,89 @@
+package ops_test
+
+import "std/image/ops"
+import "std/image/pixels"
+
+// Histograms, ranges and means.
+
+@test
+fn histograms_count_every_pixel() {
+    data := [0u8; 10 * 6 * 4]
+    for i in 0usize..data.len {
+        data[i] = (i * 31 % 256) as u8
+    }
+    source := pixels.View.new(&data, 10, 6, pixels.Layout.rgba8())!
+    bins := [0u32; 256]
+    for k in 0usize..5 {
+        channel := ops.Channel.Red
+        if k == 1 {
+            channel = ops.Channel.Green
+        } else if k == 2 {
+            channel = ops.Channel.Blue
+        } else if k == 3 {
+            channel = ops.Channel.Alpha
+        } else if k == 4 {
+            channel = ops.Channel.Luma
+        }
+        ops.histogram(&source, channel, &mut bins)!
+        total := 0u32
+        for i in 0usize..256 {
+            total += bins[i]
+        }
+        assert_eq(total, 60u32)
+    }
+    // 256 bins count 8-bit values exactly.
+    ops.histogram(&source, ops.Channel.Red, &mut bins)!
+    for v in 0usize..256 {
+        expected := 0u32
+        for p in 0usize..60 {
+            if data[p * 4] as usize == v {
+                expected += 1
+            }
+        }
+        assert_eq(bins[v], expected)
+    }
+    // Four bins split at 64, 128, 192.
+    gray := [0u8, 63, 64, 127, 128, 191, 192, 255, 255]
+    g := pixels.View.new(&gray, 9, 1, pixels.Layout.gray8())!
+    four := [9u32; 4]
+    ops.luma_histogram(&g, &mut four)!
+    assert_eq(four[0], 2u32)
+    assert_eq(four[1], 2u32)
+    assert_eq(four[2], 2u32)
+    assert_eq(four[3], 3u32)
+    one := [0u32; 1]
+    ops.histogram(&g, ops.Channel.Alpha, &mut one)!
+    assert_eq(one[0], 9u32)
+    empty := [0u32; 0]
+    match ops.histogram(&g, ops.Channel.Red, &mut empty) {
+        ok() => {
+            assert(false, "no bins")
+        }
+        err(e) => {
+            assert_eq(pixels.error_name(e), "Malformed")
+        }
+    }
+}
+
+@test
+fn ranges_and_means() {
+    gray := [10u8, 20, 30, 40, 50, 250]
+    g := pixels.View.new(&gray, 3, 2, pixels.Layout.gray8())!
+    range := ops.channel_range(&g, ops.Channel.Luma)!
+    assert_eq(range.min, 10u32 * 257)
+    assert_eq(range.max, 250u32 * 257)
+    alpha := ops.channel_range(&g, ops.Channel.Alpha)!
+    assert_eq(alpha.min, 65535u32)
+    m := ops.mean(&g, ops.Channel.Green)!
+    // (10 + 20 + 30 + 40 + 50 + 250) / 6 / 255
+    assert(m > 0.2614 && m < 0.2615, "mean")
+    nothing := pixels.View.new(&gray, 0, 2, pixels.Layout.gray8())!
+    match ops.mean(&nothing, ops.Channel.Red) {
+        ok(_) => {
+            assert(false, "empty image")
+        }
+        err(e) => {
+            assert_eq(pixels.error_name(e), "Malformed")
+        }
+    }
+}

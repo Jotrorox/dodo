@@ -1,0 +1,707 @@
+package jxl
+
+import "core/num"
+import "core/slice"
+import "std/image/color"
+import "std/image/meta"
+import "std/image/pixels"
+import "std/image/shared/scratch"
+import "std/image/sink"
+
+// JPEG XL decoder (ISO/IEC 18181-1), pure Dodo, no allocation.
+//
+// Design
+// ------
+// container.dodo / bitreader.dodo
+//     The codestream is a bare FF 0A stream or the jxlc/jxlp payloads of an
+//     ISOBMFF container; Reader reads it LSB-first across jxlp segments in
+//     place. Reads past the data or a section limit yield zeros and set a
+//     flag that section boundaries turn into Truncated/Malformed.
+// headers.dodo, colorinfo.dodo, icc.dodo
+//     SizeHeader, ImageMetadata, CustomTransformData; ColourEncoding to
+//     color.ColorInfo; the entropy-coded ICC profile (skipped while
+//     scanning, decoded by icc()).
+// entropy.dodo
+//     Codes (context map + per-cluster prefix or ANS tables + hybrid uint
+//     configs + LZ77) and Streams (ANS state, LZ77 window).
+// scan.dodo
+//     Walks all frame headers and TOCs (no pixel work) to count frames and
+//     size every buffer: scratch_size() is computed from this up front.
+// frame.dodo
+//     FrameHeader, TOC (with Lehmer-coded permutation).
+// framedec.dodo, modular.dodo, transforms.dodo
+//     Per frame: LfGlobal (patches, splines, noise, LF dequant,
+//     GlobalModular with the global MA tree), LF groups, HfGlobal, pass
+//     groups. All modular samples live in one i32 arena; transforms work on
+//     channel views (see the note at the top of modular.dodo). Groups decode
+//     straight into the frame's channel buffers; the global transforms are
+//     undone at the end. YCbCr channels may be chroma subsampled.
+// vardct.dodo, vardct_tables.dodo
+//     VarDCT frames (decode_vardct_frame): LfGlobal quantizer, block
+//     context map and chroma-from-luma factors; per LF group the quantized
+//     LF image (or the output of an LF frame), the modular LF stream of the
+//     extra channels and the HF metadata (varblock types and multipliers,
+//     CfL tiles, EPF sharpness, giving a per-block EPF sigma); HfGlobal
+//     dequantization matrices (defaults, parametrized, raw modular) computed
+//     with libjxl's float formulas for the varblock types in use; per pass
+//     the HfPass (Lehmer-coded coefficient orders, HF code) then each pass
+//     group's coefficients with their nonzero contexts, accumulated as i32
+//     in three frame planes (shifted by the pass shift). Then, per varblock:
+//     dequantization with the quant bias, chroma from luma, the lowest
+//     frequencies from a forward DCT of the LF image, and the inverse
+//     transform (all 27 types: separable recursive f32 DCTs up to 256x256,
+//     DCT2/DCT4/Hornuss/DCT4x8/AFV) in place, giving XYB (or YCbCr, for
+//     recompressed JPEGs, including 4:2:0/4:2:2/4:4:0 subsampling) samples.
+//     The LF image gets chroma from luma and adaptive smoothing first.
+// features.dodo
+//     Noise (8-lane XorShift128+ per group seeded like libjxl, 5x5
+//     high-pass, LUT-scaled, added before the color transform) and splines
+//     (centripetal Catmull-Rom curves sampled every pixel of arc length,
+//     Gaussian segments with DCT-coded color and width).
+// render.dodo, xyb.dodo, output.dodo
+//     Lossless-style frames (one frame, modular, no XYB/upsampling/
+//     patches/blending) go straight from the arena to the sink, in tiles of
+//     at most 256x256 aligned with the groups. Everything else takes the
+//     float pipeline: color planes (modular channels converted in place, or
+//     the VarDCT planes) -> chroma upsampling -> Gaborish -> edge-preserving
+//     filter (constant sigma for modular frames, per 8x8 block for VarDCT;
+//     gray frames are filtered as three copies like libjxl) -> f32 frame
+//     planes with 2x/4x/8x upsampling -> patches -> splines -> noise -> LF
+//     frame output kept for later frames -> save before color transform ->
+//     XYB/YCbCr to the output color space -> blending onto the canvas over
+//     a reference slot -> save after color transform -> emit the displayed
+//     frame (8-bit output uses libjxl's ordered dither, so results match
+//     djxl). A single frame covering the image is emitted from its frame
+//     planes without a canvas.
+//
+// Frames
+// ------
+// decode_frame(index) walks the frames in file order. Frames before the
+// last one that replaces the whole canvas without patches are skipped when
+// nothing after that frame reads a reference slot written before it
+// (first_needed_frame; a frame built on LF frames starts at its LF
+// frames); every other frame up to the requested displayed frame is
+// decoded and composited. decode_frame_data() in framedec.dodo dispatches
+// on the frame encoding. LF frames (progressive DC, lf_level 1 to 3) keep
+// their XYB output, which later VarDCT frames with use_lf_frame take as
+// their LF image. The noise generator is seeded with the counts of
+// displayed and other frames, as libjxl does.
+//
+// Scratch
+// -------
+// One caller buffer, carved by plan() into: the scan work area (ICC/TOC
+// skipping), the LZ77 window, five Codes (global tree, local tree,
+// transient, two nested), two MA trees, channel and transform lists, the
+// weighted predictor rows, a squeeze row, the TOC, the i32 arena (frame
+// channels plus allowances for palettes, LF group streams, raw
+// quantization tables and gray filtering), the VarDCT buffers (coefficient
+// planes, LF image, block info, CfL tiles, dequantization matrices,
+// coefficient orders, the HF Code, LF frame outputs), and for the float
+// pipeline the frame planes, the canvas, the reference slots in use, noise
+// planes, spline storage, filter rows and one output tile. Sizes follow
+// from the headers (also on 32-bit targets: sizes are computed in u64 and
+// fail TooLarge when they do not fit usize).
+//
+// Output samples are in the native layout reported by info(): U8 for
+// integer depths up to 8, U16 up to 16, F32 for float or deeper samples
+// (float samples are converted through their bit patterns, so Inf/NaN and
+// subnormals survive). XYB images are converted to the encoded
+// ColourEncoding (sRGB when it is an ICC profile). The codestream
+// orientation is reported, not applied.
+//
+// Not supported (Unsupported): patches or splines in upsampled frames
+// (libjxl applies them before upsampling; cjxl never writes such files),
+// chroma-subsampled frames combined with upsampling or restoration filters
+// or with varblocks larger than 8x8 or adaptive LF smoothing, more than 64
+// extra channels, LF frames with upsampling. Extra channels other than the
+// first alpha are decoded but not output; spot colors are not rendered and
+// CMYK black is not applied.
+
+const TRANSIENT_DIST: usize = 16
+const CODE_POOL: usize = 196608
+
+// Signature check only: a bare codestream or the container signature box.
+pub fn matches(data: &[u8]) -> bool {
+    return is_bare(data) || is_container(data)
+}
+
+// Image size, native layout, bit depth, color description, orientation and
+// frame count (displayed frames of an animation). Walks every frame header.
+pub fn info(data: &[u8]) -> pixels.Header!pixels.Error {
+    work := [0u8; SCAN_BYTES]
+    r := open(data)?
+    h := read_headers(&mut r, &mut work)?
+    s := new_scan()
+    walk_frames(&mut r, &h, &mut s, &mut work)?
+    return ok(make_header(&h, &s, data.len))
+}
+
+fn make_header(h: &ImageHeader, s: &Scan, data_len: usize) -> pixels.Header {
+    header := pixels.Header.new(pixels.Format.Jxl, h.width, h.height, native_layout(h), h.bits)
+    header.color = output_color_info(h, data_len)
+    header.orientation = color.orientation_from_exif(h.orientation)
+    header.frames = s.displayed
+    if header.frames == 0 {
+        header.frames = 1
+    }
+    header.animated = h.animated
+    header.loops = h.loops
+    header.lossy = h.xyb || s.any_vardct
+    header.progressive = s.progressive
+    return header
+}
+
+// EXIF and XMP boxes of a container file, and the ICC profile (entropy
+// coded in the codestream: decode it with icc()).
+pub fn metadata(data: &[u8]) -> meta.Metadata!pixels.Error {
+    result := scan_metadata(data)?
+    work := [0u8; SCAN_BYTES]
+    r := open(data)?
+    h := read_headers(&mut r, &mut work)?
+    if h.want_icc {
+        result.icc = meta.Item { offset: 0, length: data.len, encoding: meta.ENCODING_JXL }
+    }
+    return ok(result)
+}
+
+// Display time of displayed frame `index`: duration ticks over the
+// animation's ticks per second. Still images report 0/1.
+pub fn frame_info(data: &[u8], index: u32) -> pixels.FrameInfo!pixels.Error {
+    work := [0u8; SCAN_BYTES]
+    r := open(data)?
+    h := read_headers(&mut r, &mut work)?
+    r.seek_byte(h.frames_byte)
+    skip_preview(&mut r, &h, &mut work)?
+    shown := 0u32
+    count := 0u32
+    for {
+        if count >= MAX_FRAMES {
+            return err(pixels.Error.TooLarge)
+        }
+        f := read_frame_header(&mut r, &h)?
+        scan_toc(&mut r, &mut f, &mut work)?
+        count += 1
+        if f.is_keyframe() {
+            if shown == index {
+                if !h.animated || h.tps_numerator == 0 {
+                    return ok(pixels.FrameInfo { numerator: 0, denominator: 1 })
+                }
+                // duration / (num / den) seconds = duration * den / num.
+                numerator := f.duration as u64 * h.tps_denominator as u64
+                denominator := h.tps_numerator as u64
+                for numerator > 0xffffffff || denominator > 0xffffffff {
+                    numerator = numerator / 2
+                    denominator = denominator / 2
+                }
+                if denominator == 0 {
+                    denominator = 1
+                }
+                return ok(pixels.FrameInfo { numerator: numerator as u32, denominator: denominator as u32 })
+            }
+            shown += 1
+        }
+        if f.is_last {
+            break
+        }
+        r.seek_byte64(f.end())
+    }
+    return err(pixels.Error.Malformed)
+}
+
+fn skip_preview(r: &mut Reader, h: &ImageHeader, work: &mut[u8]) -> void!pixels.Error {
+    if h.have_preview {
+        preview := h.clone_header()
+        preview.width = h.preview_width
+        preview.height = h.preview_height
+        f := read_frame_header(r, &preview)?
+        scan_toc(r, &mut f, work)?
+        r.seek_byte64(f.end())
+    }
+    return ok()
+}
+
+// Buffer sizes for one decode.
+struct Plan {
+    window: usize
+    gdist: usize
+    ldist: usize
+    gtree: usize
+    ltree: usize
+    wp_width: usize
+    temp: usize
+    toc: usize
+    arena: usize
+    planes: usize
+    frame_pixels: usize
+    canvas_pixels: usize
+    slot_pixels: [4]usize
+    ftemp: usize
+    noise: usize
+    splines: bool
+    tile: usize
+    float_path: bool
+    // VarDCT buffers (zero without VarDCT frames).
+    vd_planes: usize
+    vd_blocks: usize
+    vd_tiles: usize
+    hdist: usize
+    lf_slot: [3]usize
+    total: usize
+}
+
+// Most HF presets the HF coefficient Code is sized for.
+const MAX_HF_PRESETS: u64 = 16
+// Block context map entries (39 times at most 64 LF / quant contexts).
+const BCTX_SIZE: usize = 2496
+
+// Largest byte count handled (also bounded by the address space).
+const MAX_BYTES: u64 = 0xffffffffffff
+
+fn checked_add(a: usize, b: u64) -> usize!pixels.Error {
+    if b > MAX_BYTES || a as u64 + b > MAX_BYTES || a as u64 + b > num.MAX as u64 {
+        return err(pixels.Error.TooLarge)
+    }
+    return ok(a + b as usize)
+}
+
+// A size as usize, failing TooLarge when it does not fit (32-bit targets).
+fn fit(v: u64) -> usize!pixels.Error {
+    if v > num.MAX as u64 / 16 {
+        return err(pixels.Error.TooLarge)
+    }
+    return ok(v as usize)
+}
+
+fn pow2_at_least(v: u64, cap: u64) -> u64 {
+    p := 1u64
+    for p < v && p < cap {
+        p *= 2
+    }
+    return p
+}
+
+fn plan(h: &ImageHeader, s: &Scan) -> Plan!pixels.Error {
+    nec := h.num_extra as u64
+    samples := s.max_samples
+    arena := samples + samples / 2 + 65536
+    if s.any_vardct {
+        // LF group images, HF metadata and raw quantization tables.
+        arena += 7 * 65536
+    }
+    arena += 2 * s.gray_filtered
+    if arena > 0x7fffffff {
+        return err(pixels.Error.TooLarge)
+    }
+    gtree := s.max_tree_global
+    if gtree < 1024 {
+        gtree = 1024
+    }
+    // A local tree is bounded by the samples of its stream: one group of
+    // every channel, or the small channels of the global stream, plus
+    // palette storage.
+    group := s.max_group_dim as u64 * s.max_group_dim as u64 * s.max_channels as u64
+    if group > samples {
+        group = samples
+    }
+    ltree := 1024 + group + 65536
+    if s.any_vardct && ltree < 1024 + 4 * 65536 {
+        ltree = 1024 + 4 * 65536
+    }
+    if ltree > 1048576 {
+        ltree = 1048576
+    }
+    window := pow2_at_least(arena, 1048576)
+    if window < 6 * gtree {
+        window = pow2_at_least(6 * gtree, 1048576)
+    }
+    wp_width := s.max_sample_width as u64
+    if (s.max_sample_height as u64) > wp_width {
+        wp_width = s.max_sample_height as u64
+    }
+    if wp_width < 4096 {
+        wp_width = 4096
+    }
+    if s.any_vardct && wp_width < 65536 {
+        // The varblock list of an LF group is one row per block.
+        wp_width = 65536
+    }
+    temp := wp_width + 16
+    p := Plan { window: fit(window)?, gdist: fit(gtree / 2 + 2)?, ldist: fit(ltree / 2 + 2)?, gtree: fit(gtree)?, ltree: fit(ltree)?, wp_width: fit(wp_width)?, temp: fit(temp)?, toc: fit(s.max_toc as u64)?, arena: fit(arena)?, planes: (3 + nec) as usize, frame_pixels: 0, canvas_pixels: 0, slot_pixels: [0usize; 4], ftemp: 0, noise: 0, splines: s.any_splines, tile: 0, float_path: s.float_path, vd_planes: 0, vd_blocks: 0, vd_tiles: 0, hdist: 0, lf_slot: [0usize; 3], total: 0 }
+    layout := native_layout(h)
+    p.tile = TILE * TILE * layout.bytes_per_pixel()
+    total := SCAN_BYTES + 64
+    total = checked_add(total, p.window as u64 * 4 + 8)?
+    total = checked_add(total, code_bytes(p.gdist, CODE_POOL) as u64)?
+    total = checked_add(total, code_bytes(p.ldist, CODE_POOL) as u64)?
+    total = checked_add(total, code_bytes(TRANSIENT_DIST, CODE_POOL) as u64)?
+    total = checked_add(total, 2 * code_bytes(2, NESTED_POOL) as u64)?
+    total = checked_add(total, (p.gtree + p.ltree) as u64 * 16 + 16)?
+    total = checked_add(total, 4 * (MAX_CHANNELS * CH_STRIDE * 4 + 8) as u64)?
+    total = checked_add(total, 2 * (MAX_TRANSFORMS * TR_STRIDE * 4 + 8) as u64)?
+    total = checked_add(total, p.wp_width as u64 * 20 + 16)?
+    total = checked_add(total, p.temp as u64 * 4 + 8)?
+    total = checked_add(total, p.toc as u64 * 16 + 8)?
+    total = checked_add(total, p.arena as u64 * 4 + 8)?
+    total = checked_add(total, p.tile as u64 + 8)?
+    if p.float_path {
+        planes := p.planes as u64
+        p.frame_pixels = fit(s.max_frame_pixels)?
+        if s.needs_canvas {
+            p.canvas_pixels = fit(h.width as u64 * h.height as u64)?
+        }
+        for k in 0usize..4 {
+            if (s.slots & (1u32 << (k as u32))) != 0 {
+                p.slot_pixels[k] = fit(s.slot_pixels[k])?
+            }
+        }
+        widest := s.max_frame_width as u64
+        if (s.max_sample_width as u64) > widest {
+            widest = s.max_sample_width as u64
+        }
+        p.ftemp = fit(8 * widest + 64)?
+        floats := planes * (p.frame_pixels as u64 + p.canvas_pixels as u64)
+        for k in 0usize..4 {
+            floats += planes * p.slot_pixels[k] as u64
+        }
+        floats += p.ftemp as u64
+        if s.any_noise {
+            p.noise = fit(3 * p.frame_pixels as u64)?
+            floats += p.noise as u64 + 16
+        }
+        if s.any_splines {
+            floats += (SPLINE_WORDS + 2 * MAX_SPLINE_POINTS) as u64 + 16
+        }
+        if floats > 0x3fffffffffff {
+            return err(pixels.Error.TooLarge)
+        }
+        total = checked_add(total, floats * 4 + 64)?
+    }
+    if s.any_vardct {
+        p.vd_planes = fit(s.vd_planes)?
+        p.vd_blocks = fit(s.vd_blocks)?
+        p.vd_tiles = fit(s.vd_tiles)?
+        presets := 2 * s.vd_groups
+        if presets > MAX_HF_PRESETS {
+            presets = MAX_HF_PRESETS
+        }
+        p.hdist = (495 * 16 * presets) as usize
+        for k in 0usize..3 {
+            p.lf_slot[k] = fit(s.lf_slot[k])?
+        }
+    }
+    total = checked_add(total, vardct_bytes(&p))?
+    // icc() needs the scan area and the encoded profile.
+    icc_total := checked_add(SCAN_BYTES + 64, h.icc_enc_size)?
+    if icc_total > total {
+        total = icc_total
+    }
+    p.total = total
+    return ok(p)
+}
+
+// Bytes of one VarDCT buffer of `bytes` (with alignment slack); nothing
+// without VarDCT frames.
+fn vd_size(p: &Plan, bytes: usize) -> usize {
+    if p.vd_blocks == 0 {
+        return 0
+    }
+    return bytes + 8
+}
+
+fn hcode_pool(p: &Plan) -> usize {
+    if p.vd_blocks == 0 {
+        return 0
+    }
+    return CODE_POOL
+}
+
+// Bytes of the VarDCT buffers carved by run().
+fn vardct_bytes(p: &Plan) -> u64 {
+    if p.vd_blocks == 0 {
+        return code_bytes(p.hdist, 0) as u64
+    }
+    blocks := p.vd_blocks as u64
+    slots := p.lf_slot[0] as u64 + p.lf_slot[1] as u64 + p.lf_slot[2] as u64
+    total := 4 * p.vd_planes as u64 + 4 * DCT_TEMP as u64 + 12 * blocks + 4 * blocks + 4 * PARAM_TOTAL as u64
+    total += 4 * slots + 8 * blocks + 8 * p.vd_tiles as u64
+    total += 16 * ORDER_TOTAL as u64 + 4 * 65537 + 4 * 3 * 64 + BCTX_SIZE as u64 + 15 * 8
+    return total + code_bytes(p.hdist, CODE_POOL) as u64
+}
+
+// Bytes of scratch decode() and decode_frame() need for this file
+// (also enough for icc()).
+pub fn scratch_size(data: &[u8]) -> usize!pixels.Error {
+    work := [0u8; SCAN_BYTES]
+    r := open(data)?
+    h := read_headers(&mut r, &mut work)?
+    s := new_scan()
+    walk_frames(&mut r, &h, &mut s, &mut work)?
+    p := plan(&h, &s)?
+    return ok(p.total)
+}
+
+// Decode the first displayed frame into `output`, which receives the
+// header (as info() reports it) and then tile rects in the native layout.
+// `scratch` needs scratch_size(data) bytes.
+pub fn decode<S: sink.Sink>(data: &[u8], output: &mut S, buffer: &mut[u8]) -> void!pixels.Error {
+    return decode_frame(data, 0, output, buffer)
+}
+
+// Decode displayed frame `index` (0-based, counting the frames an
+// animation shows), composited over earlier frames as the format
+// specifies.
+pub fn decode_frame<S: sink.Sink>(data: &[u8], index: u32, output: &mut S, buffer: &mut[u8]) -> void!pixels.Error {
+    if buffer.len < SCAN_BYTES + 64 {
+        return err(pixels.Error.BufferTooSmall)
+    }
+    let slice.SplitMut { left: work, right: rest } = scratch.split(buffer, SCAN_BYTES)?
+    r := open(data)?
+    h := read_headers(&mut r, work)?
+    s := new_scan()
+    walk_frames(&mut r, &h, &mut s, work)?
+    if index >= s.displayed {
+        return err(pixels.Error.Malformed)
+    }
+    p := plan(&h, &s)?
+    if p.total > rest.len + SCAN_BYTES {
+        return err(pixels.Error.BufferTooSmall)
+    }
+    first := first_needed_frame(data, &h, index, work)?
+    header := make_header(&h, &s, data.len)
+    layout := header.native.clone()
+    output.begin(&header)?
+    return run(data, &h, &p, index, first, output, rest, &layout)
+}
+
+// Carve the scratch and decode frames up to displayed frame `index`.
+fn run<S: sink.Sink>(data: &[u8], h: &ImageHeader, p: &Plan, index: u32, first: u32, output: &mut S, bytes: &mut[u8], layout: &pixels.Layout) -> void!pixels.Error {
+    let slice.SplitMut { left: b_window, right: r1 } = scratch.split(bytes, p.window * 4 + 8)?
+    let slice.SplitMut { left: b_gcode, right: r2 } = scratch.split(r1, code_bytes(p.gdist, CODE_POOL))?
+    let slice.SplitMut { left: b_lcode, right: r3 } = scratch.split(r2, code_bytes(p.ldist, CODE_POOL))?
+    let slice.SplitMut { left: b_tcode, right: r4 } = scratch.split(r3, code_bytes(TRANSIENT_DIST, CODE_POOL))?
+    let slice.SplitMut { left: b_n1, right: r5 } = scratch.split(r4, code_bytes(2, NESTED_POOL))?
+    let slice.SplitMut { left: b_n2, right: r6 } = scratch.split(r5, code_bytes(2, NESTED_POOL))?
+    let slice.SplitMut { left: b_gtree, right: r7 } = scratch.split(r6, p.gtree * 16 + 8)?
+    let slice.SplitMut { left: b_ltree, right: r8 } = scratch.split(r7, p.ltree * 16 + 8)?
+    let slice.SplitMut { left: b_gch, right: r9 } = scratch.split(r8, MAX_CHANNELS * CH_STRIDE * 4 + 8)?
+    let slice.SplitMut { left: b_lch, right: r10 } = scratch.split(r9, MAX_CHANNELS * CH_STRIDE * 4 + 8)?
+    let slice.SplitMut { left: b_gstash, right: r11 } = scratch.split(r10, MAX_CHANNELS * CH_STRIDE * 4 + 8)?
+    let slice.SplitMut { left: b_lstash, right: r12 } = scratch.split(r11, MAX_CHANNELS * CH_STRIDE * 4 + 8)?
+    let slice.SplitMut { left: b_gtr, right: r13 } = scratch.split(r12, MAX_TRANSFORMS * TR_STRIDE * 4 + 8)?
+    let slice.SplitMut { left: b_ltr, right: r14 } = scratch.split(r13, MAX_TRANSFORMS * TR_STRIDE * 4 + 8)?
+    let slice.SplitMut { left: b_wperr, right: r15 } = scratch.split(r14, p.wp_width * 4 + 8)?
+    let slice.SplitMut { left: b_wpsub, right: r16 } = scratch.split(r15, p.wp_width * 16 + 8)?
+    let slice.SplitMut { left: b_temp, right: r17 } = scratch.split(r16, p.temp * 4 + 8)?
+    let slice.SplitMut { left: b_toc, right: r18 } = scratch.split(r17, p.toc * 16 + 8)?
+    let slice.SplitMut { left: b_arena, right: r19 } = scratch.split(r18, p.arena * 4 + 8)?
+    let slice.SplitMut { left: b_tile, right: r20 } = scratch.split(r19, p.tile + 8)?
+    let slice.SplitMut { left: b_vd, right: b_float } = scratch.split(r20, vardct_bytes(p) as usize)?
+    let slice.SplitMut { left: b_planes, right: v1 } = scratch.split(b_vd, vd_size(p, 4 * p.vd_planes))?
+    let slice.SplitMut { left: b_dct, right: v2 } = scratch.split(v1, vd_size(p, 4 * DCT_TEMP))?
+    let slice.SplitMut { left: b_lf, right: v3 } = scratch.split(v2, vd_size(p, 12 * p.vd_blocks))?
+    let slice.SplitMut { left: b_sigma, right: v4 } = scratch.split(v3, vd_size(p, 4 * p.vd_blocks))?
+    let slice.SplitMut { left: b_dqm, right: v5 } = scratch.split(v4, vd_size(p, 4 * PARAM_TOTAL))?
+    let slice.SplitMut { left: b_lfslot, right: v6 } = scratch.split(v5, vd_size(p, 4 * (p.lf_slot[0] + p.lf_slot[1] + p.lf_slot[2])))?
+    let slice.SplitMut { left: b_binfo, right: v7 } = scratch.split(v6, vd_size(p, 4 * p.vd_blocks))?
+    let slice.SplitMut { left: b_bmul, right: v8 } = scratch.split(v7, vd_size(p, 4 * p.vd_blocks))?
+    let slice.SplitMut { left: b_cfl, right: v9 } = scratch.split(v8, vd_size(p, 8 * p.vd_tiles))?
+    let slice.SplitMut { left: b_natural, right: v10 } = scratch.split(v9, vd_size(p, 4 * ORDER_TOTAL))?
+    let slice.SplitMut { left: b_orders, right: v11 } = scratch.split(v10, vd_size(p, 12 * ORDER_TOTAL))?
+    let slice.SplitMut { left: b_fen, right: v12 } = scratch.split(v11, vd_size(p, 4 * 65537))?
+    let slice.SplitMut { left: b_nz, right: v13 } = scratch.split(v12, vd_size(p, 4 * 3 * 64))?
+    let slice.SplitMut { left: b_bctx, right: b_hcode } = scratch.split(v13, vd_size(p, BCTX_SIZE))?
+    hcode := carve_code(b_hcode, p.hdist)?
+    vplanes := scratch.f32s(b_planes)
+    dct := scratch.f32s(b_dct)
+    lfslot_off := [0usize, p.lf_slot[0], p.lf_slot[0] + p.lf_slot[1]]
+    vb := VBufs { lf: scratch.f32s(b_lf), binfo: scratch.u32s(b_binfo), bmul: scratch.i32s(b_bmul), cfl: scratch.i32s(b_cfl), dqm: scratch.f32s(b_dqm), natural: scratch.u32s(b_natural), orders: scratch.u32s(b_orders), fen: scratch.u32s(b_fen), bctx: b_bctx, sigma: scratch.f32s(b_sigma), nz: scratch.u32s(b_nz), lfslot: scratch.f32s(b_lfslot), lfslot_off: lfslot_off, lfslot_cap: [p.lf_slot[0], p.lf_slot[1], p.lf_slot[2]], lfslot_w: [0usize; 3], lfslot_h: [0usize; 3], lfslot_valid: [false; 3], hs: [0usize; 3], vs: [0usize; 3], subsampled: false, bw: 0, bh: 0, rw: 0, rh: 0, tw: 0, th: 0, global_scale: 1, quant_lf: 1, nb_lf_thr: [0u32; 3], lf_thr: [0i32; 48], nb_qf_thr: 0, qf_thr: [0u32; 16], bctx_size: 0, nb_block_ctx: 1, colour_factor: 84, base_x: 0.0, base_b: 1.0, x_factor_lf: 0, b_factor_lf: 0, num_hf_presets: 1, hf_bit: 0, used_params: 0, custom_orders: 0, tables_ready: false }
+    gcode := carve_code(b_gcode, p.gdist)?
+    lcode := carve_code(b_lcode, p.ldist)?
+    tcode := carve_code(b_tcode, TRANSIENT_DIST)?
+    n1 := carve_code(b_n1, 2)?
+    n2 := carve_code(b_n2, 2)?
+    window := scratch.u32s(b_window)
+    work := ModularWork { arena: scratch.i32s(b_arena), arena_used: 0, wp_err: scratch.i32s(b_wperr), wp_sub: scratch.u32s(b_wpsub), temp: scratch.i32s(b_temp), gtree: scratch.i32s(b_gtree), gtree_nodes: 0, ltree: scratch.i32s(b_ltree), ltree_nodes: 0 }
+    gch := ChanList { d: scratch.i32s(b_gch), count: 0, nb_meta: 0 }
+    lch := ChanList { d: scratch.i32s(b_lch), count: 0, nb_meta: 0 }
+    gstash := ChanList { d: scratch.i32s(b_gstash), count: 0, nb_meta: 0 }
+    lstash := ChanList { d: scratch.i32s(b_lstash), count: 0, nb_meta: 0 }
+    gtr := TrList { t: scratch.i32s(b_gtr), count: 0 }
+    ltr := TrList { t: scratch.i32s(b_ltr), count: 0 }
+    toc := scratch.u32s(b_toc)
+    vals := FrameVals { m_lf: [0.0f32; 3], gend: 0, patches_bit: 0, splines_bit: 0, noise_lut: [0.0f32; 8], visible: 0, nonvisible: 0, wp: [0i32; 11] }
+    r := open(data)?
+    r.seek_byte(h.frames_byte)
+    if h.have_preview {
+        preview := h.clone_header()
+        preview.width = h.preview_width
+        preview.height = h.preview_height
+        f := read_frame_header(&mut r, &preview)?
+        empty := [0u32; 1]
+        read_toc(&mut r, &mut f, &mut empty, &mut tcode, &mut n1, &mut n2, window)?
+        r.seek_byte64(f.end())
+    }
+    if !p.float_path {
+        f := read_frame_header(&mut r, h)?
+        read_toc(&mut r, &mut f, toc, &mut tcode, &mut n1, &mut n2, window)?
+        decode_frame_data(&mut r, h, &f, &mut work, &mut gcode, &mut lcode, &mut tcode, &mut n1, &mut n2, window, &mut gch, &mut lch, &mut gstash, &mut lstash, &mut gtr, &mut ltr, toc, &mut vals, &mut vb, vplanes, dct, &mut hcode)?
+        return emit_direct(output, h, &f, &work, &gch, layout, b_tile)
+    }
+    // The float pipeline: frame planes, canvas, reference slots, rows.
+    planes := p.planes
+    slot_total := 0usize
+    slot_off := [0usize; 4]
+    slot_cap := [0usize; 4]
+    for k in 0usize..4 {
+        slot_off[k] = slot_total
+        slot_cap[k] = p.slot_pixels[k]
+        slot_total += planes * p.slot_pixels[k]
+    }
+    let slice.SplitMut { left: b_frame, right: f1 } = scratch.split(b_float, planes * p.frame_pixels * 4 + 8)?
+    let slice.SplitMut { left: b_canvas, right: f2 } = scratch.split(f1, planes * p.canvas_pixels * 4 + 8)?
+    let slice.SplitMut { left: b_slots, right: f3 } = scratch.split(f2, slot_total * 4 + 8)?
+    let slice.SplitMut { left: b_noise, right: f4 } = scratch.split(f3, p.noise * 4 + 8)?
+    sp_words := 0usize
+    if p.splines {
+        sp_words = SPLINE_WORDS
+    }
+    let slice.SplitMut { left: b_sbuf, right: f5 } = scratch.split(f4, sp_words * 4 + 8)?
+    let slice.SplitMut { left: b_cpf, right: b_ftemp } = scratch.split(f5, sp_words / 2 * 4 + 8)?
+    sbuf := scratch.i32s(b_sbuf)
+    cpf := scratch.f32s(b_cpf)
+    fb := FloatBufs { frame: scratch.f32s(b_frame), canvas: scratch.f32s(b_canvas), slots: scratch.f32s(b_slots), ftemp: scratch.f32s(b_ftemp), noise: scratch.f32s(b_noise), planes: planes, fw: 0, fh: 0, slot_off: slot_off, slot_cap: slot_cap, slot_w: [0usize; 4], slot_h: [0usize; 4], slot_valid: [false; 4], use_canvas: p.canvas_pixels > 0 }
+    ct := xyb_transform(h)
+    shown := 0u32
+    frame := 0u32
+    for {
+        f := read_frame_header(&mut r, h)?
+        read_toc(&mut r, &mut f, toc, &mut tcode, &mut n1, &mut n2, window)?
+        frame += 1
+        if f.is_keyframe() {
+            vals.visible += 1
+            vals.nonvisible = 0
+        } else {
+            vals.nonvisible += 1
+        }
+        if frame <= first {
+            // Cannot affect the requested frame: skip it.
+            if f.is_keyframe() {
+                shown += 1
+            }
+            if f.is_last {
+                break
+            }
+            r.clear_limit()
+            r.seek_byte64(f.end())
+            continue
+        }
+        decode_frame_data(&mut r, h, &f, &mut work, &mut gcode, &mut lcode, &mut tcode, &mut n1, &mut n2, window, &mut gch, &mut lch, &mut gstash, &mut lstash, &mut gtr, &mut ltr, toc, &mut vals, &mut vb, vplanes, dct, &mut hcode)?
+        render_frame(&mut r, h, &f, &mut work, &gch, &vals, &mut fb, &mut vb, vplanes, sbuf, cpf, &mut tcode, &mut n1, &mut n2, window, &ct)?
+        if f.is_keyframe() {
+            if shown == index {
+                return emit_canvas(output, h, &fb, layout, b_tile)
+            }
+            shown += 1
+        }
+        if f.is_last {
+            break
+        }
+        r.clear_limit()
+        r.seek_byte64(f.end())
+    }
+    return err(pixels.Error.Malformed)
+}
+
+// The first frame (0-based, in file order) whose result can affect
+// displayed frame `index`: the last earlier frame that replaces the whole
+// canvas without patches, provided no frame after it reads a reference slot
+// written before it; otherwise 0.
+fn first_needed_frame(data: &[u8], h: &ImageHeader, index: u32, work: &mut[u8]) -> u32!pixels.Error {
+    r := open(data)?
+    r.seek_byte(h.frames_byte)
+    skip_preview(&mut r, h, work)?
+    candidate := 0u32
+    usable := true
+    written := [false; 4]
+    writer := [0u32; 4]
+    shown := 0u32
+    frame := 0u32
+    // The LF frames right before the current frame start at lf_start.
+    lf_run := false
+    lf_start := 0u32
+    for {
+        if frame >= MAX_FRAMES {
+            return err(pixels.Error.TooLarge)
+        }
+        f := read_frame_header(&mut r, h)?
+        scan_toc(&mut r, &mut f, work)?
+        patches := (f.flags & FLAG_PATCHES) != 0
+        if f.is_normal() && !f.needs_blending(h.num_extra) && !patches {
+            candidate = frame
+            if (f.flags & FLAG_USE_LF_FRAME) != 0 && lf_run {
+                candidate = lf_start
+            }
+            usable = true
+        } else {
+            if patches {
+                usable = false
+            }
+            if f.needs_blending(h.num_extra) {
+                sources := 1u32 << f.blend_source
+                for e in 0usize..h.num_extra as usize {
+                    sources = sources | (1u32 << f.ec_blend_source[e])
+                }
+                for k in 0usize..4 {
+                    if (sources & (1u32 << (k as u32))) != 0 && (!written[k] || writer[k] < candidate) {
+                        usable = false
+                    }
+                }
+            }
+        }
+        if f.can_reference() {
+            written[f.save_as_reference as usize] = true
+            writer[f.save_as_reference as usize] = frame
+        }
+        if f.frame_type == FT_LF {
+            if !lf_run {
+                lf_start = frame
+            }
+            lf_run = true
+        } else {
+            lf_run = false
+        }
+        if f.is_keyframe() {
+            if shown == index {
+                if usable {
+                    return ok(candidate)
+                }
+                return ok(0)
+            }
+            shown += 1
+        }
+        if f.is_last {
+            break
+        }
+        r.seek_byte64(f.end())
+        frame += 1
+    }
+    return ok(0)
+}
+
+// The decoded ICC profile into `output`; returns its length. Fails
+// Malformed for files without one. `scratch` needs scratch_size(data)
+// bytes.
+pub fn icc(data: &[u8], output: &mut[u8], buffer: &mut[u8]) -> usize!pixels.Error {
+    if buffer.len < SCAN_BYTES + 64 {
+        return err(pixels.Error.BufferTooSmall)
+    }
+    let slice.SplitMut { left: work, right: encoded } = scratch.split(buffer, SCAN_BYTES)?
+    r := open(data)?
+    h := read_headers(&mut r, work)?
+    if !h.want_icc {
+        return err(pixels.Error.Malformed)
+    }
+    r.seek_bit(h.icc_bit)
+    length := read_icc_stream(&mut r, work, encoded, true)?
+    return decode_icc(&encoded[..length as usize], output)
+}

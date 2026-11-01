@@ -1,0 +1,1021 @@
+package image_alloc
+
+import "core/mem"
+import "core/ptr"
+import "alloc/block"
+import "alloc/error"
+import "alloc/layout"
+import "alloc/shared_arena"
+import "std/fs"
+import "std/image"
+import "std/image/color"
+import "std/image/convert"
+import "std/image/meta"
+import "std/image/ops"
+import "std/image/pixels"
+import "std/platform"
+import "std/platform/error" as platform_error
+
+// Owned images and image files on top of std/image. An Image owns its pixel
+// buffer, the decoded file's header and copies of its EXIF and ICC payloads,
+// all in storage from an explicit allocator; load and save read and write
+// files with std/fs. Every buffer a codec or operation needs is allocated at
+// exactly the size it asks for and released straight after.
+//
+//     storage := [0u8; 4194304]                   // or a static buffer
+//     arena := shared_arena.SharedArena.new(&mut storage)?
+//     photo := image_alloc.load(path, arena.handle())?
+//     photo.orient()?                              // apply EXIF orientation
+//     options := ops.ResizeOptions.new(ops.Filter.Lanczos3)
+//     photo.resize(640, 480, &options)?
+//     photo.save_auto(output)?                     // format from the extension
+//
+// A is an owned allocator capability, as for std/collections/vector:
+// allocate(&self, &Layout) -> Block!AllocError and unsafe deallocate(&self,
+// Block). The safe functions take a shared_arena.Handle, so several images
+// can share one arena (each from its own arena.handle()); the generic `_in`
+// functions accept any allocator meeting that contract and are unsafe.
+// Operations that change the pixels (convert, orient, resize, crop, ...)
+// replace the image's buffer with a new one from its own allocator and
+// release the old one; an arena reclaims released space only on reset.
+
+pub enum Error {
+    Image(pixels.Error), Allocation(error.AllocError), File(fs.FileError)
+}
+
+// A short fixed description of `failure` for messages.
+pub fn error_name(failure: &Error) -> &str from(static) {
+    match failure {
+        Error.Image(reason) => {
+            return image_error_name(reason)
+        }
+        Error.Allocation(reason) => {
+            match reason {
+                error.AllocError.InvalidAlignment => {
+                    return "allocation: invalid alignment"
+                }
+                error.AllocError.SizeOverflow => {
+                    return "allocation: size overflow"
+                }
+                error.AllocError.Exhausted => {
+                    return "allocation: out of memory"
+                }
+                error.AllocError.UnsupportedLayout => {
+                    return "allocation: unsupported layout"
+                }
+            }
+        }
+        Error.File(reason) => {
+            match &reason.cause.kind {
+                platform_error.Kind.NotFound => {
+                    return "file: not found"
+                }
+                platform_error.Kind.PermissionDenied => {
+                    return "file: permission denied"
+                }
+                platform_error.Kind.IsDirectory => {
+                    return "file: is a directory"
+                }
+                platform_error.Kind.NotDirectory => {
+                    return "file: not a directory"
+                }
+                platform_error.Kind.BufferTooSmall => {
+                    return "file: path too long"
+                }
+                platform_error.Kind.InvalidInput => {
+                    return "file: invalid path"
+                }
+                _ => {
+                    return "file: input/output error"
+                }
+            }
+        }
+    }
+}
+
+fn image_error_name(reason: &pixels.Error) -> &str from(static) {
+    match reason {
+        pixels.Error.Truncated => {
+            return "image: truncated file"
+        }
+        pixels.Error.Malformed => {
+            return "image: malformed file or arguments"
+        }
+        pixels.Error.Unsupported => {
+            return "image: unsupported format or feature"
+        }
+        pixels.Error.TooLarge => {
+            return "image: too large"
+        }
+        pixels.Error.BufferTooSmall => {
+            return "image: buffer too small"
+        }
+    }
+}
+
+// The largest file load() and read_file() accept: 1 GiB.
+pub const MAX_FILE_SIZE: u64 = 1073741824
+
+// The largest ICC profile copied from a file: 64 MiB.
+const MAX_ICC_SIZE: usize = 67108864
+
+// Codec scratch may be viewed as u32 or f32 words.
+const ALIGNMENT: usize = 16
+
+// ---------------------------------------------------------------------------
+// Raw allocations. A Region holds no allocator; its owner (an Image, Bytes,
+// or a function using it as scratch) releases it through the allocator it
+// came from.
+
+struct Region {
+    allocation: block.Block
+    length: usize
+
+    fn slice(&self) -> &[u8] from(self) {
+        unsafe {
+            return ptr.borrow_slice(self.allocation.as_ptr() as *const u8, self.length, self)
+        }
+    }
+    fn slice_mut(&mut self) -> &mut[u8] from(self) {
+        pointer := self.allocation.as_ptr()
+        length := self.length
+        unsafe {
+            return ptr.borrow_slice_mut(pointer, length, self)
+        }
+    }
+}
+
+// `size` zeroed bytes from `allocator`.
+fn allocate<A>(allocator: &A, size: usize) -> Region!error.AllocError {
+    requested := layout.Layout.new(size, ALIGNMENT)?
+    allocated := allocator.allocate(&requested)?
+    if size != 0 {
+        unsafe {
+            ptr.write_bytes(allocated.as_ptr(), 0u8, size)
+        }
+    }
+    return ok(Region { allocation: allocated, length: size })
+}
+
+fn release<A>(allocator: &A, area: Region) {
+    unsafe {
+        allocation := block.Block.from_raw_parts(area.allocation.as_ptr(), area.allocation.layout().clone())
+        allocator.deallocate(allocation)
+    }
+}
+
+// Release the storage behind a Region still held in a struct field.
+fn release_field<A>(allocator: &A, area: &Region) {
+    unsafe {
+        allocation := block.Block.from_raw_parts(area.allocation.as_ptr(), area.allocation.layout().clone())
+        allocator.deallocate(allocation)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Owned bytes
+
+// An owned byte buffer: file contents or an encoded image.
+pub struct Bytes<A> {
+    allocator: A
+    region: Region
+
+    pub fn len(&self) -> usize {
+        return self.region.length
+    }
+    pub fn is_empty(&self) -> bool {
+        return self.region.length == 0
+    }
+    pub fn as_slice(&self) -> &[u8] from(self) {
+        return self.region.slice()
+    }
+    pub fn as_mut_slice(&mut self) -> &mut[u8] from(self) {
+        return self.region.slice_mut()
+    }
+    // Shorten to `length` bytes; the storage is kept until the buffer drops.
+    pub fn truncate(&mut self, length: usize) {
+        if length < self.region.length {
+            self.region.length = length
+        }
+    }
+    fn drop(&mut self) {
+        release_field(&self.allocator, &self.region)
+    }
+}
+
+// SAFETY: A meets the allocator contract described at the top of this file.
+pub unsafe fn bytes_in<A>(size: usize, allocator: A) -> Bytes<A>!Error from(allocator) {
+    area := allocate(&allocator, size)?
+    return ok(Bytes<A> { allocator: allocator, region: area })
+}
+
+// `size` zeroed bytes from a shared arena.
+pub fn bytes(size: usize, allocator: shared_arena.Handle) -> Bytes<shared_arena.Handle>!Error from(allocator) {
+    unsafe {
+        return bytes_in(size, allocator)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Files
+
+fn file_error(cause: platform_error.Error) -> Error {
+    return Error.File(fs.FileError { cause: cause, transferred: 0 })
+}
+
+// The size of the file at `path`, at most MAX_FILE_SIZE.
+fn file_size(path: &str) -> usize!Error {
+    workspace := platform.workspace()
+    options := fs.OpenOptions.read_only()
+    file := match fs.File.open_utf8(path, &options, &mut workspace) {
+        ok(value) => {
+            value
+        }
+        err(cause) => {
+            return err(file_error(cause))
+        }
+    }
+    found := match file.metadata() {
+        ok(value) => {
+            value
+        }
+        err(cause) => {
+            return err(file_error(cause))
+        }
+    }
+    match file.close() {
+        ok() => {}
+        err(cause) => {
+            return err(file_error(cause))
+        }
+    }
+    if found.size > MAX_FILE_SIZE {
+        return err(Error.Image(pixels.Error.TooLarge))
+    }
+    return ok(found.size as usize)
+}
+
+// Read the whole file into a new Region from `allocator`.
+fn read_region<A>(allocator: &A, path: &str) -> Region!Error {
+    size := file_size(path)?
+    contents := allocate(allocator, size)?
+    workspace := platform.workspace()
+    outcome := fs.read_file(path, contents.slice_mut(), &mut workspace)
+    match outcome {
+        ok(report) => {
+            if !report.eof || report.read != size {
+                // The file changed size while it was read.
+                release(allocator, contents)
+                cause := platform_error.failure(platform_error.Kind.Other)
+                return err(Error.File(fs.FileError { cause: cause, transferred: report.read }))
+            }
+            return ok(contents)
+        }
+        err(reason) => {
+            release(allocator, contents)
+            return err(Error.File(reason))
+        }
+    }
+}
+
+// SAFETY: A meets the allocator contract described at the top of this file.
+pub unsafe fn read_file_in<A>(path: &str, allocator: A) -> Bytes<A>!Error from(allocator) {
+    contents := read_region(&allocator, path)?
+    return ok(Bytes<A> { allocator: allocator, region: contents })
+}
+
+// The whole file at `path` (UTF-8), at most MAX_FILE_SIZE bytes.
+pub fn read_file(path: &str, allocator: shared_arena.Handle) -> Bytes<shared_arena.Handle>!Error from(allocator) {
+    unsafe {
+        return read_file_in(path, allocator)
+    }
+}
+
+// Create or truncate the file at `path` and write `data` to it.
+pub fn write_file(path: &str, data: &[u8]) -> void!Error {
+    workspace := platform.workspace()
+    fs.write_file(path, data, &mut workspace)?
+    return ok()
+}
+
+// ---------------------------------------------------------------------------
+// Images
+
+// Owned pixels: width x height tightly packed rows in `layout`, plus what
+// the file they were decoded from said about them.
+pub struct Image<A> {
+    allocator: A
+    pixels: Region
+    exif_data: Region
+    icc_data: Region
+    width: u32
+    height: u32
+    layout: pixels.Layout
+    source: pixels.Header
+    decoded: bool
+
+    pub fn width(&self) -> u32 {
+        return self.width
+    }
+    pub fn height(&self) -> u32 {
+        return self.height
+    }
+    pub fn layout(&self) -> &pixels.Layout {
+        return &self.layout
+    }
+    // Bytes between rows: rows are tightly packed.
+    pub fn stride(&self) -> usize {
+        return self.width as usize * self.layout.bytes_per_pixel()
+    }
+    // Every pixel, row after row.
+    pub fn bytes(&self) -> &[u8] from(self) {
+        return self.pixels.slice()
+    }
+    pub fn bytes_mut(&mut self) -> &mut[u8] from(self) {
+        return self.pixels.slice_mut()
+    }
+    pub fn view(&self) -> pixels.View from(self) {
+        // The buffer always holds width x height pixels in layout.
+        return pixels.View.new(self.pixels.slice(), self.width, self.height, self.layout.clone())!
+    }
+    pub fn view_mut(&mut self) -> pixels.ViewMut from(self) {
+        width := self.width
+        height := self.height
+        shape := self.layout.clone()
+        return pixels.ViewMut.new(self.pixels.slice_mut(), width, height, shape)!
+    }
+
+    // The header of the file this image was decoded from: its format, size
+    // and native layout as stored, bit depth, color description and
+    // animation. Images made with new() have a placeholder header and
+    // decoded() is false. Transforms do not change it, except that orient()
+    // resets the orientation.
+    pub fn header(&self) -> &pixels.Header {
+        return &self.source
+    }
+    pub fn decoded(&self) -> bool {
+        return self.decoded
+    }
+    // The format of the file this image came from, if any.
+    pub fn format(&self) -> Option<pixels.Format> {
+        if !self.decoded {
+            return none
+        }
+        return some(pixels.clone_format(&self.source.format))
+    }
+    pub fn color(&self) -> &color.ColorInfo {
+        return &self.source.color
+    }
+    // How the pixels must be transformed for display; Identity once
+    // orient() has applied it.
+    pub fn orientation(&self) -> &color.Orientation {
+        return &self.source.orientation
+    }
+    pub fn bit_depth(&self) -> u32 {
+        return self.source.bit_depth
+    }
+    // The EXIF payload (TIFF structure) copied from the file, or empty.
+    pub fn exif(&self) -> &[u8] from(self) {
+        return self.exif_data.slice()
+    }
+    // The decoded ICC profile copied from the file, or empty.
+    pub fn icc(&self) -> &[u8] from(self) {
+        return self.icc_data.slice()
+    }
+    pub fn set_exif(&mut self, payload: &[u8]) -> void!Error {
+        fresh := allocate(&self.allocator, payload.len)?
+        copy_bytes(payload, fresh.slice_mut())
+        previous := mem.replace(&mut self.exif_data, fresh)
+        release(&self.allocator, previous)
+        return ok()
+    }
+    pub fn set_icc(&mut self, profile: &[u8]) -> void!Error {
+        fresh := allocate(&self.allocator, profile.len)?
+        copy_bytes(profile, fresh.slice_mut())
+        previous := mem.replace(&mut self.icc_data, fresh)
+        release(&self.allocator, previous)
+        return ok()
+    }
+    // Drop the EXIF and ICC payloads, so nothing is written with the pixels.
+    pub fn clear_metadata(&mut self) -> void!Error {
+        nothing := [0u8; 1]
+        self.set_exif(&nothing[..0])?
+        self.set_icc(&nothing[..0])?
+        return ok()
+    }
+
+    // ---- Copies
+
+    // A copy of this image (pixels, header and metadata) in `allocator`.
+    pub fn copy(&self, allocator: A) -> Image<A>!Error from(allocator) {
+        return self.converted(self.layout.clone(), allocator)
+    }
+    // A copy converted to `target`, in `allocator`.
+    pub fn converted(&self, target: pixels.Layout, allocator: A) -> Image<A>!Error from(allocator) {
+        result := blank(self.width, self.height, target, allocator)?
+        {
+            source := self.view()
+            output := result.view_mut()
+            convert.copy(&source, &mut output)?
+        }
+        result.source = self.source.clone()
+        result.decoded = self.decoded
+        result.set_exif(self.exif())?
+        result.set_icc(self.icc())?
+        return ok(result)
+    }
+
+    // ---- Operations replacing the pixels
+
+    // Convert the pixels to `target` (see std/image/convert: 8 to 16 bits
+    // multiplies by 257, 16 to 8 rounds, color to gray uses BT.709 luma, a
+    // missing alpha is opaque).
+    pub fn convert(&mut self, target: pixels.Layout) -> void!Error {
+        if target.equals(&self.layout) {
+            return ok()
+        }
+        size := pixels.bytes_needed(self.width, self.height, &target)?
+        fresh := allocate(&self.allocator, size)?
+        outcome := self.write_converted(&mut fresh, &target)
+        width := self.width
+        height := self.height
+        return self.finish(outcome, fresh, width, height, target)
+    }
+    // Apply the header's orientation, so the pixels are as displayed; the
+    // orientation becomes Identity and an EXIF orientation tag is reset to 1.
+    pub fn orient(&mut self) -> void!Error {
+        found := color.clone_orientation(&self.source.orientation)
+        self.transform(&found)?
+        self.source.orientation = color.Orientation.Identity
+        reset_exif_orientation(self.exif_data.slice_mut())
+        return ok()
+    }
+    // Transform the pixels by `orientation` (flips, quarter turns,
+    // transposes); the header is unchanged.
+    pub fn transform(&mut self, orientation: &color.Orientation) -> void!Error {
+        if color.exif_value(orientation) == 1 {
+            return ok()
+        }
+        size := ops.oriented_size(self.width, self.height, orientation)
+        shape := self.layout.clone()
+        fresh := allocate(&self.allocator, pixels.bytes_needed(size.width, size.height, &shape)?)?
+        outcome := self.write_transformed(&mut fresh, size.width, size.height, orientation)
+        return self.finish(outcome, fresh, size.width, size.height, shape)
+    }
+    // Rotate clockwise by 90, 180 or 270 degrees (0 does nothing); other
+    // angles fail with Malformed.
+    pub fn rotate(&mut self, degrees: u32) -> void!Error {
+        if degrees == 0 || degrees == 360 {
+            return ok()
+        }
+        if degrees == 90 {
+            turn := color.Orientation.Rotate90
+            return self.transform(&turn)
+        }
+        if degrees == 180 {
+            turn := color.Orientation.Rotate180
+            return self.transform(&turn)
+        }
+        if degrees == 270 {
+            turn := color.Orientation.Rotate270
+            return self.transform(&turn)
+        }
+        return err(Error.Image(pixels.Error.Malformed))
+    }
+    // Mirror left-right.
+    pub fn flip_horizontal(&mut self) {
+        target := self.view_mut()
+        ops.flip_horizontal_in_place(&mut target)
+    }
+    // Mirror top-bottom.
+    pub fn flip_vertical(&mut self) {
+        target := self.view_mut()
+        ops.flip_vertical_in_place(&mut target)
+    }
+    // Keep the width x height rectangle at (x, y); Malformed when it does
+    // not fit.
+    pub fn crop(&mut self, x: u32, y: u32, width: u32, height: u32) -> void!Error {
+        if x as u64 + width as u64 > self.width as u64 || y as u64 + height as u64 > self.height as u64 {
+            return err(Error.Image(pixels.Error.Malformed))
+        }
+        shape := self.layout.clone()
+        fresh := allocate(&self.allocator, pixels.bytes_needed(width, height, &shape)?)?
+        outcome := self.write_cropped(&mut fresh, x, y, width, height)
+        return self.finish(outcome, fresh, width, height, shape)
+    }
+    // Resample to width x height with std/image/ops resize (any filter, in
+    // linear light with options.linear); the layout is kept.
+    pub fn resize(&mut self, width: u32, height: u32, options: &ops.ResizeOptions) -> void!Error {
+        if width == 0 || height == 0 {
+            return err(Error.Image(pixels.Error.Malformed))
+        }
+        shape := self.layout.clone()
+        need := ops.resize_scratch_size(self.width, self.height, width, height, &shape, options)?
+        fresh := allocate(&self.allocator, pixels.bytes_needed(width, height, &shape)?)?
+        work := match allocate(&self.allocator, need) {
+            ok(value) => {
+                value
+            }
+            err(reason) => {
+                release(&self.allocator, fresh)
+                return err(Error.Allocation(reason))
+            }
+        }
+        outcome := self.write_resized(&mut fresh, width, height, options, work.slice_mut())
+        release(&self.allocator, work)
+        return self.finish(outcome, fresh, width, height, shape)
+    }
+    // Reduce the image to at most `colors` (1 to 256) colors with a median
+    // cut palette and the given dithering; the pixels become 8-bit RGBA
+    // using only palette colors, so a PNG written with
+    // EncodeOptions.palette is indexed. Returns the palette size.
+    pub fn quantize(&mut self, colors: usize, dither: ops.Dither) -> usize!Error {
+        if colors == 0 || colors > ops.MAX_PALETTE {
+            return err(Error.Image(pixels.Error.Malformed))
+        }
+        count := pixels.checked(self.width as usize, self.height as usize, 0)?
+        shape := pixels.Layout.rgba8()
+        work_size := ops.palette_scratch_size(self.width, self.height)?
+        remap_size := ops.remap_scratch_size(self.width)?
+        if remap_size > work_size {
+            work_size = remap_size
+        }
+        fresh := allocate(&self.allocator, pixels.bytes_needed(self.width, self.height, &shape)?)?
+        indices := match allocate(&self.allocator, count) {
+            ok(value) => {
+                value
+            }
+            err(reason) => {
+                release(&self.allocator, fresh)
+                return err(Error.Allocation(reason))
+            }
+        }
+        work := match allocate(&self.allocator, work_size) {
+            ok(value) => {
+                value
+            }
+            err(reason) => {
+                release(&self.allocator, indices)
+                release(&self.allocator, fresh)
+                return err(Error.Allocation(reason))
+            }
+        }
+        table := [0u8; 1024]
+        entries := 0usize
+        outcome := self.write_quantized(&mut fresh, colors, dither, &mut table, indices.slice_mut(), work.slice_mut(), &mut entries)
+        release(&self.allocator, work)
+        release(&self.allocator, indices)
+        width := self.width
+        height := self.height
+        self.finish(outcome, fresh, width, height, shape)?
+        return ok(entries)
+    }
+
+    // ---- Encoding
+
+    // An upper bound on the bytes encode() and save() write.
+    pub fn max_encoded_size(&self, format: pixels.Format, options: &image.EncodeOptions) -> usize!Error {
+        extra := 0usize
+        if options.keep_metadata {
+            extra = image.metadata_size(pixels.clone_format(&format), self.exif_data.length, self.icc_data.length)?
+        }
+        source := self.view()
+        base := image.max_encoded_size(format, &source, options)?
+        return ok(pixels.checked(base, 1, extra)?)
+    }
+    // Encode into `output` (at least max_encoded_size() bytes) and return
+    // the byte count. With options.keep_metadata the EXIF and ICC payloads
+    // are written where the format stores them.
+    pub fn encode_into(&self, format: pixels.Format, options: &image.EncodeOptions, output: &mut[u8]) -> usize!Error {
+        source := self.view()
+        need := image.encode_scratch_size(pixels.clone_format(&format), &source, options)?
+        work := allocate(&self.allocator, need)?
+        outcome := image.encode_with_metadata(format, &source, options, self.exif_data.slice(), self.icc_data.slice(), output, work.slice_mut())
+        release(&self.allocator, work)
+        return ok(outcome?)
+    }
+    // The encoded file in a new buffer from `allocator`.
+    pub fn encode(&self, format: pixels.Format, options: &image.EncodeOptions, allocator: A) -> Bytes<A>!Error from(allocator) {
+        size := self.max_encoded_size(pixels.clone_format(&format), options)?
+        area := allocate(&allocator, size)?
+        output := Bytes<A> { allocator: allocator, region: area }
+        length := self.encode_into(format, options, output.as_mut_slice())?
+        output.truncate(length)
+        return ok(output)
+    }
+    // Encode as `format` and write the file at `path`.
+    pub fn save(&self, path: &str, format: pixels.Format, options: &image.EncodeOptions) -> void!Error {
+        size := self.max_encoded_size(pixels.clone_format(&format), options)?
+        output := allocate(&self.allocator, size)?
+        outcome := self.save_region(path, format, options, &mut output)
+        release(&self.allocator, output)
+        return outcome
+    }
+    // save() with the format named by the path's extension (see
+    // image.format_from_extension) and default options.
+    pub fn save_auto(&self, path: &str) -> void!Error {
+        format := image.format_from_extension(path)?
+        options := image.EncodeOptions.new()
+        return self.save(path, format, &options)
+    }
+
+    // ---- Decoding into an existing image
+
+    // Decode the default image of `data` into this image, replacing its
+    // pixels, header and metadata. With `native` the file's native layout
+    // is used, otherwise `target`. After a failure the pixels are
+    // unspecified (the size may already be the file's) and the header and
+    // metadata are the previous ones.
+    pub fn decode_from(&mut self, data: &[u8], target: pixels.Layout, native: bool) -> void!Error {
+        return self.fill(data, target, native, 0, true)
+    }
+    // Render animation frame `index` of `data` into this image (see
+    // image.decode_frame), reusing the pixel buffer when its size matches.
+    pub fn decode_frame_from(&mut self, data: &[u8], index: u32, target: pixels.Layout, native: bool) -> void!Error {
+        return self.fill(data, target, native, index, false)
+    }
+
+    // ---- Internals
+
+    fn fill(&mut self, data: &[u8], target: pixels.Layout, native: bool, index: u32, whole: bool) -> void!Error {
+        header := image.info(data)?
+        shape := target
+        if native {
+            shape = header.native.clone()
+        }
+        size := pixels.bytes_needed(header.width, header.height, &shape)?
+        if size != self.pixels.length {
+            fresh := allocate(&self.allocator, size)?
+            previous := mem.replace(&mut self.pixels, fresh)
+            release(&self.allocator, previous)
+        }
+        self.width = header.width
+        self.height = header.height
+        self.layout = shape
+        need := 0usize
+        if whole {
+            need = image.scratch_size(data, &self.layout)?
+        } else {
+            need = image.frame_scratch_size(data)?
+        }
+        work := allocate(&self.allocator, need)?
+        outcome := self.decode_pixels(data, index, whole, work.slice_mut())
+        release(&self.allocator, work)
+        outcome?
+        self.source = header
+        self.decoded = true
+        return self.adopt_metadata(data)
+    }
+    fn decode_pixels(&mut self, data: &[u8], index: u32, whole: bool, work: &mut[u8]) -> void!pixels.Error {
+        target := self.view_mut()
+        if whole {
+            return image.decode(data, &mut target, work)
+        }
+        return image.decode_frame(data, index, &mut target, work)
+    }
+    // Copy the EXIF payload and the decoded ICC profile. A payload that
+    // cannot be read (an unsupported encoding, a damaged chunk) is skipped;
+    // only allocation failures are errors.
+    fn adopt_metadata(&mut self, data: &[u8]) -> void!Error {
+        self.clear_metadata()?
+        found := match image.metadata(data) {
+            ok(value) => {
+                value
+            }
+            err(_) => {
+                return ok()
+            }
+        }
+        if found.exif.present() && found.exif.encoding == meta.ENCODING_RAW {
+            match found.exif.bytes(data) {
+                ok(stored) => {
+                    self.set_exif(stored)?
+                }
+                err(_) => {}
+            }
+        }
+        return self.adopt_icc(data)
+    }
+    fn adopt_icc(&mut self, data: &[u8]) -> void!Error {
+        encoding := self.source.color.icc_encoding
+        if encoding == color.ICC_NONE {
+            return ok()
+        }
+        need := match image.icc_scratch_size(data) {
+            ok(value) => {
+                value
+            }
+            err(_) => {
+                return ok()
+            }
+        }
+        // A raw profile has a known size. A compressed one is decoded into
+        // a buffer of four times its stored size (at least 4 KiB), doubled
+        // while that is too small, up to MAX_ICC_SIZE.
+        size := self.source.color.icc_length
+        if size > MAX_ICC_SIZE {
+            return ok()
+        }
+        if encoding != color.ICC_RAW {
+            size = 4 * size
+            if size < 4096 {
+                size = 4096
+            }
+        }
+        work := allocate(&self.allocator, need)?
+        for size <= MAX_ICC_SIZE {
+            profile := match allocate(&self.allocator, size) {
+                ok(value) => {
+                    value
+                }
+                err(reason) => {
+                    release(&self.allocator, work)
+                    return err(Error.Allocation(reason))
+                }
+            }
+            outcome := image.icc(data, profile.slice_mut(), work.slice_mut())
+            match outcome {
+                ok(length) => {
+                    release(&self.allocator, work)
+                    profile.length = length
+                    previous := mem.replace(&mut self.icc_data, profile)
+                    release(&self.allocator, previous)
+                    return ok()
+                }
+                err(reason) => {
+                    release(&self.allocator, profile)
+                    if reason != pixels.Error.BufferTooSmall || encoding == color.ICC_RAW {
+                        break
+                    }
+                }
+            }
+            size = 2 * size
+        }
+        release(&self.allocator, work)
+        return ok()
+    }
+    // Install `fresh` as the pixels when `outcome` succeeded, else release
+    // it and report the failure.
+    fn finish(&mut self, outcome: void!pixels.Error, fresh: Region, width: u32, height: u32, shape: pixels.Layout) -> void!Error {
+        match outcome {
+            ok() => {
+                previous := mem.replace(&mut self.pixels, fresh)
+                release(&self.allocator, previous)
+                self.width = width
+                self.height = height
+                self.layout = shape
+                return ok()
+            }
+            err(reason) => {
+                release(&self.allocator, fresh)
+                return err(Error.Image(reason))
+            }
+        }
+    }
+    fn write_converted(&self, fresh: &mut Region, target: &pixels.Layout) -> void!pixels.Error {
+        source := self.view()
+        output := pixels.ViewMut.new(fresh.slice_mut(), self.width, self.height, target.clone())?
+        return convert.copy(&source, &mut output)
+    }
+    fn write_transformed(&self, fresh: &mut Region, width: u32, height: u32, orientation: &color.Orientation) -> void!pixels.Error {
+        source := self.view()
+        output := pixels.ViewMut.new(fresh.slice_mut(), width, height, self.layout.clone())?
+        return ops.orient(&source, &mut output, orientation)
+    }
+    fn write_cropped(&self, fresh: &mut Region, x: u32, y: u32, width: u32, height: u32) -> void!pixels.Error {
+        whole := self.view()
+        source := whole.sub(x, y, width, height)?
+        output := pixels.ViewMut.new(fresh.slice_mut(), width, height, self.layout.clone())?
+        return convert.copy(&source, &mut output)
+    }
+    fn write_resized(&self, fresh: &mut Region, width: u32, height: u32, options: &ops.ResizeOptions, work: &mut[u8]) -> void!pixels.Error {
+        source := self.view()
+        output := pixels.ViewMut.new(fresh.slice_mut(), width, height, self.layout.clone())?
+        return ops.resize(&source, &mut output, options, work)
+    }
+    fn write_quantized(&self, fresh: &mut Region, colors: usize, dither: ops.Dither, table: &mut[u8], indices: &mut[u8], work: &mut[u8], entries: &mut usize) -> void!pixels.Error {
+        source := self.view()
+        count := ops.palette(&source, colors, table, work)?
+        *entries = count
+        if count == 0 {
+            return ok()
+        }
+        ops.remap(&source, &table[..4 * count], indices, dither, work)?
+        output := fresh.slice_mut()
+        for i in 0usize..indices.len {
+            entry := indices[i] as usize * 4
+            for c in 0usize..4 {
+                output[i * 4 + c] = table[entry + c]
+            }
+        }
+        return ok()
+    }
+    fn save_region(&self, path: &str, format: pixels.Format, options: &image.EncodeOptions, output: &mut Region) -> void!Error {
+        length := self.encode_into(format, options, output.slice_mut())?
+        whole := output.slice()
+        return write_file(path, &whole[..length])
+    }
+
+    fn drop(&mut self) {
+        release_field(&self.allocator, &self.pixels)
+        release_field(&self.allocator, &self.exif_data)
+        release_field(&self.allocator, &self.icc_data)
+    }
+}
+
+fn copy_bytes(source: &[u8], target: &mut[u8]) {
+    for i in 0usize..source.len {
+        target[i] = source[i]
+    }
+}
+
+// Set the orientation tag (0x0112) of a TIFF-structured EXIF payload to 1
+// in place; anything unexpected leaves the payload unchanged.
+fn reset_exif_orientation(exif: &mut[u8]) {
+    if exif.len < 8 {
+        return
+    }
+    little := exif[0] == b'I' && exif[1] == b'I'
+    if !little && !(exif[0] == b'M' && exif[1] == b'M') {
+        return
+    }
+    ifd := tiff32(exif, 4, little)
+    if ifd + 2 > exif.len {
+        return
+    }
+    count := tiff16(exif, ifd, little)
+    for i in 0usize..count {
+        entry := ifd + 2 + i * 12
+        if entry + 12 > exif.len {
+            return
+        }
+        if tiff16(exif, entry, little) == 0x0112 {
+            kind := tiff16(exif, entry + 2, little)
+            if kind == 3 {
+                set_tiff(exif, entry + 8, 2, little)
+            } else if kind == 4 {
+                set_tiff(exif, entry + 8, 4, little)
+            }
+            return
+        }
+    }
+}
+
+fn tiff16(data: &[u8], offset: usize, little: bool) -> usize {
+    if little {
+        return data[offset] as usize | (data[offset + 1] as usize << 8)
+    }
+    return (data[offset] as usize << 8) | data[offset + 1] as usize
+}
+
+fn tiff32(data: &[u8], offset: usize, little: bool) -> usize {
+    if little {
+        return tiff16(data, offset, true) | (tiff16(data, offset + 2, true) << 16)
+    }
+    return (tiff16(data, offset, false) << 16) | tiff16(data, offset + 2, false)
+}
+
+// Write the value 1 as a `width`-byte TIFF integer.
+fn set_tiff(data: &mut[u8], offset: usize, width: usize, little: bool) {
+    for i in 0usize..width {
+        data[offset + i] = 0
+    }
+    if little {
+        data[offset] = 1
+    } else {
+        data[offset + width - 1] = 1
+    }
+}
+
+// An image with no pixels yet: the decoders replace its buffer.
+fn empty<A>(allocator: A) -> Image<A>!Error from(allocator) {
+    return blank(0, 0, pixels.Layout.rgba8(), allocator)
+}
+
+// A width x height image of zeroed pixels (transparent black, or black).
+fn blank<A>(width: u32, height: u32, shape: pixels.Layout, allocator: A) -> Image<A>!Error from(allocator) {
+    size := pixels.bytes_needed(width, height, &shape)?
+    store := allocate(&allocator, size)?
+    // Zero-size allocations cannot fail for a working allocator, but a
+    // failure here must still release what is held.
+    exif_area := match allocate(&allocator, 0) {
+        ok(value) => {
+            value
+        }
+        err(reason) => {
+            release(&allocator, store)
+            return err(Error.Allocation(reason))
+        }
+    }
+    icc_area := match allocate(&allocator, 0) {
+        ok(value) => {
+            value
+        }
+        err(reason) => {
+            release(&allocator, exif_area)
+            release(&allocator, store)
+            return err(Error.Allocation(reason))
+        }
+    }
+    placeholder := pixels.Header.new(pixels.Format.Png, width, height, shape.clone(), 8)
+    if shape.sample_code() == pixels.SAMPLE_U16 || shape.sample_code() == pixels.SAMPLE_F16 {
+        placeholder.bit_depth = 16
+    } else if shape.sample_code() == pixels.SAMPLE_F32 {
+        placeholder.bit_depth = 32
+    }
+    return ok(Image<A> { allocator: allocator, pixels: store, exif_data: exif_area, icc_data: icc_area, width: width, height: height, layout: shape, source: placeholder, decoded: false })
+}
+
+// ---------------------------------------------------------------------------
+// Constructors for any allocator meeting the contract at the top of this
+// file. SAFETY: A.allocate returns exclusive, writable storage of the
+// requested layout, valid until A.deallocate, which accepts exactly the
+// originating live descriptor and cannot fail.
+
+pub unsafe fn new_in<A>(width: u32, height: u32, shape: pixels.Layout, allocator: A) -> Image<A>!Error from(allocator) {
+    return blank(width, height, shape, allocator)
+}
+
+pub unsafe fn decode_in<A>(data: &[u8], allocator: A) -> Image<A>!Error from(allocator) {
+    result := empty(allocator)?
+    result.fill(data, pixels.Layout.rgba8(), true, 0, true)?
+    return ok(result)
+}
+
+pub unsafe fn decode_as_in<A>(data: &[u8], target: pixels.Layout, allocator: A) -> Image<A>!Error from(allocator) {
+    result := empty(allocator)?
+    result.fill(data, target, false, 0, true)?
+    return ok(result)
+}
+
+pub unsafe fn decode_frame_in<A>(data: &[u8], index: u32, target: pixels.Layout, native: bool, allocator: A) -> Image<A>!Error from(allocator) {
+    result := empty(allocator)?
+    result.fill(data, target, native, index, false)?
+    return ok(result)
+}
+
+pub unsafe fn load_in<A>(path: &str, allocator: A) -> Image<A>!Error from(allocator) {
+    return load_file(path, pixels.Layout.rgba8(), true, allocator)
+}
+
+pub unsafe fn load_as_in<A>(path: &str, target: pixels.Layout, allocator: A) -> Image<A>!Error from(allocator) {
+    return load_file(path, target, false, allocator)
+}
+
+// The file is read into a buffer from the image's allocator and released
+// once decoded, also on failure.
+fn load_file<A>(path: &str, target: pixels.Layout, native: bool, allocator: A) -> Image<A>!Error from(allocator) {
+    result := empty(allocator)?
+    contents := read_region(&result.allocator, path)?
+    outcome := result.fill(contents.slice(), target, native, 0, true)
+    release(&result.allocator, contents)
+    outcome?
+    return ok(result)
+}
+
+// ---------------------------------------------------------------------------
+// Safe constructors over a shared arena: take a fresh arena.handle() per
+// image.
+
+// A width x height image of zeroed pixels in `shape`.
+pub fn new(width: u32, height: u32, shape: pixels.Layout, allocator: shared_arena.Handle) -> Image<shared_arena.Handle>!Error from(allocator) {
+    unsafe {
+        return new_in(width, height, shape, allocator)
+    }
+}
+
+// Decode the default image of `data` in the file's native layout.
+pub fn decode(data: &[u8], allocator: shared_arena.Handle) -> Image<shared_arena.Handle>!Error from(allocator) {
+    unsafe {
+        return decode_in(data, allocator)
+    }
+}
+
+// Decode the default image of `data` converted to `target`.
+pub fn decode_as(data: &[u8], target: pixels.Layout, allocator: shared_arena.Handle) -> Image<shared_arena.Handle>!Error from(allocator) {
+    unsafe {
+        return decode_as_in(data, target, allocator)
+    }
+}
+
+// Render animation frame `index` of `data` (see image.decode_frame), in the
+// native layout when `native` is set, otherwise in `target`.
+pub fn decode_frame(data: &[u8], index: u32, target: pixels.Layout, native: bool, allocator: shared_arena.Handle) -> Image<shared_arena.Handle>!Error from(allocator) {
+    unsafe {
+        return decode_frame_in(data, index, target, native, allocator)
+    }
+}
+
+// Read and decode the file at `path` in its native layout.
+pub fn load(path: &str, allocator: shared_arena.Handle) -> Image<shared_arena.Handle>!Error from(allocator) {
+    unsafe {
+        return load_in(path, allocator)
+    }
+}
+
+// Read and decode the file at `path`, converted to `target`.
+pub fn load_as(path: &str, target: pixels.Layout, allocator: shared_arena.Handle) -> Image<shared_arena.Handle>!Error from(allocator) {
+    unsafe {
+        return load_as_in(path, target, allocator)
+    }
+}

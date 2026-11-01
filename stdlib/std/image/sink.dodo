@@ -1,0 +1,209 @@
+package sink
+
+import "std/graphics"
+import "std/image/convert"
+import "std/image/pixels"
+
+// Where decoders put pixels. A decoder calls begin() once with the header,
+// then rect() with pieces of the image in the header's native layout, in
+// whatever order the format produces them: rows for PNG and BMP, groups or
+// tiles for JPEG XL, single pixels for interlaced passes. A row is a rect of
+// height 1. Every pixel of the image arrives at least once; for progressive
+// formats a later rect replaces an earlier one.
+//
+// ViewSink converts into caller storage in any layout, CanvasSink draws onto
+// a graphics.Canvas, and NullSink discards (for validation). Implement Sink
+// for anything else, such as a streaming encoder or resizer.
+pub interface Sink {
+    fn begin(&mut self, header: &pixels.Header) -> void!pixels.Error
+    fn rect(&mut self, x: u32, y: u32, source: &pixels.View) -> void!pixels.Error
+}
+
+// Converts rects into a ViewMut at least as large as the image. The image's
+// top-left pixel lands at the view's top-left pixel.
+pub struct ViewSink {
+    target: &mut pixels.ViewMut
+
+    pub fn new(target: &mut pixels.ViewMut) -> ViewSink from(target) {
+        return ViewSink { target: target }
+    }
+    pub fn begin(&mut self, header: &pixels.Header) -> void!pixels.Error {
+        if header.width > self.target.width() || header.height > self.target.height() {
+            return err(pixels.Error.BufferTooSmall)
+        }
+        return ok()
+    }
+    pub fn rect(&mut self, x: u32, y: u32, source: &pixels.View) -> void!pixels.Error {
+        convert.copy_rect(source, self.target, x, y)
+        return ok()
+    }
+}
+
+// Draws rects onto a canvas with the image's top-left corner at (x, y).
+// Pixels outside the canvas or its clip are skipped; colors are stored, not
+// blended, after conversion to straight 8-bit RGBA.
+pub struct CanvasSink {
+    canvas: &mut graphics.Canvas
+    x: i32
+    y: i32
+
+    pub fn new(canvas: &mut graphics.Canvas, x: i32, y: i32) -> CanvasSink from(canvas) {
+        return CanvasSink { canvas: canvas, x: x, y: y }
+    }
+    pub fn begin(&mut self, header: &pixels.Header) -> void!pixels.Error {
+        return ok()
+    }
+    pub fn rect(&mut self, x: u32, y: u32, source: &pixels.View) -> void!pixels.Error {
+        clip := self.canvas.clip()
+        left := self.x as i64 + x as i64
+        top := self.y as i64 + y as i64
+        // The source columns inside the clip: first..last.
+        first := 0i64
+        last := source.width() as i64
+        if clip.x as i64 > left {
+            first = clip.x as i64 - left
+        }
+        if clip.right() - left < last {
+            last = clip.right() - left
+        }
+        if first >= last {
+            return ok()
+        }
+        layout := source.layout().clone()
+        buffer := [0u8; 256]
+        for r in 0u32..source.height() {
+            py := top + r as i64
+            if py < clip.y as i64 || py >= clip.bottom() {
+                continue
+            }
+            line := source.row(r)
+            column := first
+            for column < last {
+                count := last - column
+                if count > 64 {
+                    count = 64
+                }
+                convert.load_rgba8(line, &layout, column as usize, count as usize, &mut buffer)
+                for i in 0usize..count as usize {
+                    o := i * 4
+                    color := graphics.rgba(buffer[o], buffer[o + 1], buffer[o + 2], buffer[o + 3])
+                    self.canvas.pixel((left + column + i as i64) as i32, py as i32, color)
+                }
+                column += count
+            }
+        }
+        return ok()
+    }
+}
+
+// Accepts and discards everything: decoding into it validates a file.
+pub struct NullSink {
+    pub width: u32
+    pub height: u32
+    pub rects: u64
+
+    pub fn new() -> NullSink {
+        return NullSink { width: 0, height: 0, rects: 0 }
+    }
+    pub fn begin(&mut self, header: &pixels.Header) -> void!pixels.Error {
+        self.width = header.width
+        self.height = header.height
+        return ok()
+    }
+    pub fn rect(&mut self, x: u32, y: u32, source: &pixels.View) -> void!pixels.Error {
+        if x as u64 + source.width() as u64 > self.width as u64 || y as u64 + source.height() as u64 > self.height as u64 {
+            return err(pixels.Error.Malformed)
+        }
+        self.rects += 1
+        return ok()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Sources
+
+// Where encoders read pixels. An encoder asks for the source's layout to pick
+// its output format (channel count, 8 or 16-bit), then loads runs of pixels
+// as straight RGBA. ViewSource reads a pixels.View in any layout and
+// CanvasSource a graphics.Canvas in any pixel format; both are integer-only.
+pub interface Source {
+    fn width(&self) -> u32
+    fn height(&self) -> u32
+    // The layout that holds the source's samples without loss.
+    fn layout(&self) -> pixels.Layout
+    // `count` pixels of row y from column x as straight 8-bit RGBA in
+    // out[..4 * count]. The caller keeps x + count <= width and y < height.
+    fn load_rgba8(&self, x: u32, y: u32, count: usize, out: &mut[u8])
+    // The same as straight 16-bit RGBA.
+    fn load_rgba16(&self, x: u32, y: u32, count: usize, out: &mut[u16])
+}
+
+// Reads a View, converting with convert.load_rgba8 and load_rgba16.
+pub struct ViewSource {
+    view: &pixels.View
+
+    pub fn new(view: &pixels.View) -> ViewSource from(view) {
+        return ViewSource { view: view }
+    }
+    pub fn width(&self) -> u32 {
+        return self.view.width()
+    }
+    pub fn height(&self) -> u32 {
+        return self.view.height()
+    }
+    pub fn layout(&self) -> pixels.Layout {
+        return self.view.layout().clone()
+    }
+    pub fn load_rgba8(&self, x: u32, y: u32, count: usize, out: &mut[u8]) {
+        convert.load_rgba8(self.view.row(y), self.view.layout(), x as usize, count, out)
+    }
+    pub fn load_rgba16(&self, x: u32, y: u32, count: usize, out: &mut[u16]) {
+        convert.load_rgba16(self.view.row(y), self.view.layout(), x as usize, count, out)
+    }
+}
+
+// Reads a canvas from its top-left pixel, wherever its origin is, as 8-bit
+// RGBA (formats without alpha read as opaque).
+pub struct CanvasSource {
+    canvas: &graphics.Canvas
+
+    pub fn new(canvas: &graphics.Canvas) -> CanvasSource from(canvas) {
+        return CanvasSource { canvas: canvas }
+    }
+    pub fn width(&self) -> u32 {
+        return self.canvas.width()
+    }
+    pub fn height(&self) -> u32 {
+        return self.canvas.height()
+    }
+    pub fn layout(&self) -> pixels.Layout {
+        return pixels.Layout.rgba8()
+    }
+    pub fn load_rgba8(&self, x: u32, y: u32, count: usize, out: &mut[u8]) {
+        bounds := self.canvas.bounds()
+        py := (bounds.y as i64 + y as i64) as i32
+        for i in 0usize..count {
+            px := (bounds.x as i64 + x as i64 + i as i64) as i32
+            color := graphics.TRANSPARENT
+            match self.canvas.color_at(px, py) {
+                some(value) => {
+                    color = value
+                }
+                none => {}
+            }
+            out[i * 4] = graphics.red(color)
+            out[i * 4 + 1] = graphics.green(color)
+            out[i * 4 + 2] = graphics.blue(color)
+            out[i * 4 + 3] = graphics.alpha(color)
+        }
+    }
+    pub fn load_rgba16(&self, x: u32, y: u32, count: usize, out: &mut[u16]) {
+        narrow := [0u8; 4]
+        for i in 0usize..count {
+            self.load_rgba8(x + i as u32, y, 1, &mut narrow)
+            for k in 0usize..4 {
+                out[i * 4 + k] = narrow[k] as u16 * 257
+            }
+        }
+    }
+}

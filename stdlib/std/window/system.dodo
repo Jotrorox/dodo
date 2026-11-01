@@ -2,6 +2,7 @@ package system
 
 import "core/ptr"
 import "core/mem"
+import "std/window/handle"
 import "std/window/raw"
 
 // The window adapter shared by macOS and Windows, whose window systems are
@@ -11,7 +12,7 @@ import "std/window/raw"
 
 unsafe extern "C" fn dodo_window_connect() -> i32
 unsafe extern "C" fn dodo_window_disconnect()
-unsafe extern "C" fn dodo_window_open(title: *const u8, title_length: usize, width: u32, height: u32, resizable: u32, id: *mut u32) -> i32
+unsafe extern "C" fn dodo_window_open(title: *const u8, title_length: usize, width: u32, height: u32, flags: u32, id: *mut u32) -> i32
 unsafe extern "C" fn dodo_window_close(id: u32)
 unsafe extern "C" fn dodo_window_size(id: u32, width: *mut u32, height: *mut u32) -> i32
 unsafe extern "C" fn dodo_window_attach(id: u32, pixels: *mut u8, width: u32, height: u32)
@@ -25,6 +26,15 @@ unsafe extern "C" fn dodo_window_frame_period(id: u32) -> u64
 unsafe extern "C" fn dodo_window_next_vblank(id: u32, now: u64) -> u64
 unsafe extern "C" fn dodo_window_request_frame(id: u32) -> i32
 unsafe extern "C" fn dodo_window_set_animating(animating: u32)
+unsafe extern "C" fn dodo_window_native(id: u32, first: *mut usize, second: *mut usize) -> i32
+unsafe extern "C" fn dodo_window_metal_layer(id: u32, layer: *mut usize) -> i32
+
+// dodo_window_open flags.
+const RESIZABLE: u32 = 1
+const PIXEL_BUFFER: u32 = 2
+// What dodo_window_native reports.
+const NATIVE_APPKIT: i32 = 1
+const NATIVE_WIN32: i32 = 2
 
 fn flag(value: bool) -> u32 {
     if value {
@@ -52,12 +62,20 @@ pub struct Backend {
             dodo_window_disconnect()
         }
     }
-    // Open a window and return its id.
-    pub fn open(title: &str, width: u32, height: u32, resizable: bool) -> u32!raw.Error {
+    // Open a window and return its id. Without a pixel buffer the window
+    // system never repaints it; a GPU program draws into it instead.
+    pub fn open(title: &str, width: u32, height: u32, resizable: bool, pixel_buffer: bool) -> u32!raw.Error {
         id := 0u32
         text := mem.str_bytes(title)
+        flags := 0u32
+        if resizable {
+            flags = flags | RESIZABLE
+        }
+        if pixel_buffer {
+            flags = flags | PIXEL_BUFFER
+        }
         status(unsafe {
-            dodo_window_open(ptr.as_ptr(text), text.len, width, height, flag(resizable), ptr.from_mut(&mut id))
+            dodo_window_open(ptr.as_ptr(text), text.len, width, height, flags, ptr.from_mut(&mut id))
         })?
         return ok(id)
     }
@@ -148,5 +166,33 @@ pub struct Backend {
         return status(unsafe {
             dodo_window_set_cursor_visible(id, flag(visible))
         })
+    }
+    // The window system's objects behind the window: its NSWindow and
+    // content view on macOS, its HWND and HINSTANCE on Windows.
+    pub fn native_handle(id: u32) -> handle.NativeHandle!raw.Error {
+        first := 0usize
+        second := 0usize
+        kind := unsafe {
+            dodo_window_native(id, ptr.from_mut(&mut first), ptr.from_mut(&mut second))
+        }
+        if kind == NATIVE_APPKIT {
+            return ok(handle.NativeHandle.AppKit(first, second))
+        }
+        if kind == NATIVE_WIN32 {
+            return ok(handle.NativeHandle.Win32(first, second))
+        }
+        if kind < 0 {
+            return err(raw.from_code(-kind))
+        }
+        return err(raw.Error.Unsupported)
+    }
+    // The CAMetalLayer backing a window without a pixel buffer, made on the
+    // first call; macOS only.
+    pub fn metal_layer(id: u32) -> usize!raw.Error {
+        layer := 0usize
+        status(unsafe {
+            dodo_window_metal_layer(id, ptr.from_mut(&mut layer))
+        })?
+        return ok(layer)
     }
 }

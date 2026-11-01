@@ -1,0 +1,194 @@
+package codecs
+
+import "std/graphics"
+import "std/image"
+import "std/image/pixels"
+
+// The unified layer: detection, dispatch, and round trips through every
+// format via std/image.
+
+static mut IMAGE_SCRATCH: [400000]u8 = [0u8; 400000]
+
+fn image_format(k: usize) -> pixels.Format {
+    if k == 0 {
+        return pixels.Format.Ppm
+    }
+    if k == 1 {
+        return pixels.Format.Qoi
+    }
+    if k == 2 {
+        return pixels.Format.Bmp
+    }
+    return pixels.Format.Png
+}
+
+fn image_encode(format: pixels.Format, source: &pixels.View, options: &image.EncodeOptions, output: &mut[u8]) -> usize {
+    unsafe {
+        return image.encode(format, source, options, output, &mut IMAGE_SCRATCH)!
+    }
+}
+
+@test
+fn image_detects_and_names_formats() {
+    png := [137u8, 80, 78, 71, 13, 10, 26, 10]
+    assert(image.detect(&png)! == pixels.Format.Png)
+    qoi := [b'q', b'o', b'i', b'f']
+    assert(image.detect(&qoi)! == pixels.Format.Qoi)
+    bmp := [b'B', b'M', 0, 0]
+    assert(image.detect(&bmp)! == pixels.Format.Bmp)
+    pam := [b'P', b'7', 10]
+    assert(image.detect(&pam)! == pixels.Format.Ppm)
+    codestream := [0xffu8, 0x0a, 0, 0]
+    assert(image.detect(&codestream)! == pixels.Format.Jxl)
+    container := [0u8, 0, 0, 12, b'J', b'X', b'L', b' ', 13, 10, 0x87, 10]
+    assert(image.detect(&container)! == pixels.Format.Jxl)
+    // A signature box alone has no codestream to read.
+    match image.info(&container) {
+        ok(_) => {
+            assert(false)
+        }
+        err(reason) => {
+            assert(reason == pixels.Error.Truncated || reason == pixels.Error.Malformed)
+        }
+    }
+    garbage := [1u8, 2, 3]
+    match image.detect(&garbage) {
+        ok(_) => {
+            assert(false)
+        }
+        err(reason) => {
+            assert(reason == pixels.Error.Unsupported)
+        }
+    }
+    assert(image.format_from_extension("photo.PNG")! == pixels.Format.Png)
+    assert(image.format_from_extension("a.b.apng")! == pixels.Format.Png)
+    assert(image.format_from_extension("x.qoi")! == pixels.Format.Qoi)
+    assert(image.format_from_extension("x.Dib")! == pixels.Format.Bmp)
+    assert(image.format_from_extension("x.pgm")! == pixels.Format.Ppm)
+    assert(image.format_from_extension("x.pfm")! == pixels.Format.Ppm)
+    assert(image.format_from_extension("x.jxl")! == pixels.Format.Jxl)
+    match image.format_from_extension("README") {
+        ok(_) => {
+            assert(false)
+        }
+        err(reason) => {
+            assert(reason == pixels.Error.Unsupported)
+        }
+    }
+    match image.format_from_extension("x.gif") {
+        ok(_) => {
+            assert(false)
+        }
+        err(reason) => {
+            assert(reason == pixels.Error.Unsupported)
+        }
+    }
+    for k in 0usize..4 {
+        format := image_format(k)
+        name := image.extension(&format)
+        assert(image.format_from_extension(name)! == format)
+    }
+}
+
+@test
+fn image_round_trips_every_format_and_layout() {
+    source_storage := [0u8; RASTER_PIXEL_LIMIT]
+    output := [0u8; RASTER_FILE_LIMIT]
+    decoded := [0u8; RASTER_PIXEL_LIMIT]
+    options := image.EncodeOptions.new()
+    for f in 0usize..4 {
+        for k in 0usize..RASTER_LAYOUTS {
+            layout := raster_layouts(k)
+            width := 11u32
+            height := 6u32
+            size := pixels.bytes_needed(width, height, &layout)!
+            raster_pattern(&mut source_storage, width, height, &layout, (f * 16 + k) as u32)
+            source := pixels.View.new(&source_storage[..size], width, height, layout.clone())!
+            bound := image.max_encoded_size(image_format(f), &source, &options)!
+            assert(bound <= output.len)
+            unsafe {
+                assert(image.encode_scratch_size(image_format(f), &source, &options)! <= IMAGE_SCRATCH.len)
+            }
+            length := image_encode(image_format(f), &source, &options, &mut output)
+            assert(length <= bound)
+            data := &output[..length]
+            assert(image.detect(data)! == image_format(f))
+            header := image.info(data)!
+            assert(header.width == width && header.height == height)
+            assert_eq(image.frame_count(data)!, 1u32)
+            // Decode in the native layout, then compare with the source
+            // converted to it: the formats store what they can exactly.
+            target := pixels.ViewMut.new(&mut decoded, width, height, header.native.clone())!
+            scratch := [0u8; 1024]
+            need := image.scratch_size(data, &header.native)!
+            image.decode(data, &mut target, &mut scratch[..need])!
+            raster_expect(&source, &decoded, &header.native, "image round trip")
+            assert(image.frame_scratch_size(data)! == need)
+            frame := image.frame_info(data, 0)!
+            assert(frame.numerator == 0)
+            match image.frame_info(data, 1) {
+                ok(_) => {
+                    assert(false)
+                }
+                err(reason) => {
+                    assert(reason == pixels.Error.Malformed)
+                }
+            }
+        }
+    }
+}
+
+@test
+fn image_draws_and_encodes_canvases() {
+    canvas_pixels := [0u8; 9 * 7 * 4]
+    canvas := graphics.canvas(&mut canvas_pixels, 9, 7, graphics.PixelFormat.Rgba8888)!
+    canvas.clear(graphics.rgba(10, 20, 30, 255))
+    canvas.fill_rect(2, 1, 4, 3, graphics.rgba(200, 100, 50, 128))
+    options := image.EncodeOptions.new()
+    output := [0u8; 2048]
+    for f in 0usize..4 {
+        format := image_format(f)
+        layout := pixels.Layout.rgba8()
+        bound := image.max_encoded_size_for(image_format(f), 9, 7, &layout, &options)!
+        length := 0usize
+        unsafe {
+            length = image.encode_canvas(format, &canvas, &options, &mut output, &mut IMAGE_SCRATCH)!
+        }
+        assert(length <= bound)
+        target_pixels := [0u8; 9 * 7 * 4]
+        target := graphics.canvas(&mut target_pixels, 9, 7, graphics.PixelFormat.Rgba8888)!
+        scratch := [0u8; 256]
+        image.draw(&output[..length], &mut target, 0, 0, &mut scratch)!
+        // BMP and PPM keep alpha too when the source has it (V5 and PAM).
+        assert(target.equals(&canvas))
+    }
+    // Metadata goes into PNG only when asked for.
+    exif := [b'I', b'I', 42, 0, 8, 0, 0, 0, 1, 0, 0x12, 1, 3, 0, 1, 0, 0, 0, 6, 0, 0, 0, 0, 0, 0, 0]
+    nothing := [0u8; 1]
+    data := [1u8, 2, 3, 4, 5, 6]
+    source := pixels.View.new(&data, 2, 1, pixels.Layout.rgb8())!
+    with := 0usize
+    unsafe {
+        with = image.encode_with_metadata(pixels.Format.Png, &source, &options, &exif, &nothing[..0], &mut output, &mut IMAGE_SCRATCH)!
+    }
+    turned := image.info(&output[..with])!
+    assert(turned.orientation == color.Orientation.Rotate90)
+    options.keep_metadata = false
+    without := 0usize
+    unsafe {
+        without = image.encode_with_metadata(pixels.Format.Png, &source, &options, &exif, &nothing[..0], &mut output, &mut IMAGE_SCRATCH)!
+    }
+    plain := image.info(&output[..without])!
+    assert(plain.orientation == color.Orientation.Identity)
+    assert(without + 38 == with)
+    assert_eq(image.metadata_size(pixels.Format.Png, exif.len, 0)!, 38usize)
+    assert_eq(image.metadata_size(pixels.Format.Qoi, exif.len, 0)!, 0usize)
+    // Effort 0 stores PNG blocks.
+    options.effort = 0
+    stored := 0usize
+    unsafe {
+        stored = image.encode(pixels.Format.Png, &source, &options, &mut output, &mut IMAGE_SCRATCH)!
+    }
+    rgb8 := pixels.Layout.rgb8()
+    assert(stored == image.max_encoded_size_for(pixels.Format.Png, 2, 1, &rgb8, &options)!)
+}

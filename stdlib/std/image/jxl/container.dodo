@@ -1,0 +1,96 @@
+package jxl
+
+import "std/image/meta"
+import "std/image/pixels"
+import "std/image/shared/isobmff"
+
+// File level: a bare codestream starts with FF 0A; the ISOBMFF container
+// starts with the 12-byte JPEG XL signature box, followed by ftyp, optional
+// jxll (level), metadata boxes (Exif, xml, jumb, brob-compressed variants),
+// jbrd (JPEG reconstruction, ignored) and the codestream in one jxlc box or
+// in jxlp boxes that are concatenated in order.
+
+const EXIF_BOX: u32 = 0x45786966
+const XML_BOX: u32 = 0x786d6c20
+const BROB_BOX: u32 = 0x62726f62
+const FTYP_BOX: u32 = 0x66747970
+
+fn is_bare(data: &[u8]) -> bool {
+    return data.len >= 2 && data[0] == 0xff && data[1] == 0x0a
+}
+
+fn is_container(data: &[u8]) -> bool {
+    signature := [0u8, 0, 0, 12, b'J', b'X', b'L', b' ', 0x0d, 0x0a, 0x87, 0x0a]
+    if data.len < 12 {
+        return false
+    }
+    for i in 0usize..12 {
+        if data[i] != signature[i] {
+            return false
+        }
+    }
+    return true
+}
+
+// The codestream reader for `data`, positioned at the codestream signature.
+fn open(data: &[u8]) -> Reader!pixels.Error from(data) {
+    if is_bare(data) {
+        return ok(Reader.new(data, false))
+    }
+    if !is_container(data) {
+        if data.len < 2 {
+            return err(pixels.Error.Truncated)
+        }
+        return err(pixels.Error.Malformed)
+    }
+    reader := Reader.new(data, true)
+    return ok(reader)
+}
+
+// Metadata boxes of a container file; a bare codestream has none.
+fn scan_metadata(data: &[u8]) -> meta.Metadata!pixels.Error {
+    result := meta.Metadata.empty()
+    if !is_container(data) {
+        if is_bare(data) {
+            return ok(result)
+        }
+        return err(pixels.Error.Malformed)
+    }
+    boxes := isobmff.Boxes.new(data)
+    for {
+        match boxes.next() {
+            ok(some(b)) => {
+                if b.kind == EXIF_BOX && b.length >= 4 && !result.exif.present() {
+                    // A 4-byte offset from the payload's end of that field to
+                    // the TIFF header.
+                    skip := (((data[b.offset] as u64) << 24) | ((data[b.offset + 1] as u64) << 16) | ((data[b.offset + 2] as u64) << 8) | (data[b.offset + 3] as u64))
+                    if skip + 4 <= b.length as u64 {
+                        start := b.offset + 4 + skip as usize
+                        result.exif = meta.Item.raw(start, b.end() - start)
+                    }
+                } else if b.kind == XML_BOX && !result.xmp.present() && b.length > 0 {
+                    result.xmp = meta.Item.raw(b.offset, b.length)
+                } else if b.kind == BROB_BOX && b.length > 4 {
+                    inner := (((data[b.offset] as u32) << 24) | ((data[b.offset + 1] as u32) << 16) | ((data[b.offset + 2] as u32) << 8) | (data[b.offset + 3] as u32))
+                    item := meta.Item { offset: b.offset + 4, length: b.length - 4, encoding: meta.ENCODING_BROTLI }
+                    if inner == EXIF_BOX && !result.exif.present() {
+                        result.exif = item
+                    } else if inner == XML_BOX && !result.xmp.present() {
+                        result.xmp = item
+                    }
+                }
+            }
+            ok(none) => {
+                break
+            }
+            err(e) => {
+                // Metadata found before a truncated tail is still reported.
+                if e == pixels.Error.Truncated {
+                    break
+                }
+                return err(e)
+            }
+        }
+    }
+    return ok(result)
+}

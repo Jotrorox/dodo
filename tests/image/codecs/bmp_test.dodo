@@ -1,0 +1,236 @@
+package codecs
+
+import "std/image/bmp"
+
+// BMP decoding of fixtures (RLE8, RLE4, OS/2 core headers, V4 bit fields,
+// V5 with an embedded ICC profile or sRGB and alpha) to native layouts,
+// encoder round trips and malformed input.
+
+fn bmp_native(name: &str, raw: &str, channels: usize) -> pixels.Header {
+    file_storage := [0u8; RASTER_FILE_LIMIT]
+    raw_storage := [0u8; RASTER_FILE_LIMIT]
+    pixel_storage := [0u8; RASTER_PIXEL_LIMIT]
+    length := raster_read(name, &mut file_storage)
+    raw_length := raster_read(raw, &mut raw_storage)
+    file := &file_storage[..length]
+    assert(bmp.matches(file), name)
+    header := bmp.info(file)!
+    assert(header.format == pixels.Format.Bmp, name)
+    assert(header.native.channel_count() == channels && header.native.sample_code() == pixels.SAMPLE_U8, name)
+    assert_eq(bmp.scratch_size(file)!, 0usize)
+    capture := RasterCapture.new(&mut pixel_storage)
+    empty := [0u8; 0]
+    bmp.decode(file, &mut capture, &mut empty)!
+    assert(capture.pixels >= header.width as u64 * header.height as u64, name)
+    raster_same(&pixel_storage[..raster_size(&header)], &raw_storage[..raw_length], name)
+    return header
+}
+
+@test
+fn bmp_fixtures_decode_to_native_layouts() {
+    bmp_native("rle8.bmp", "rle8.raw", 3)
+    bmp_native("rle4.bmp", "rle4.raw", 3)
+    bmp_native("os2_core8.bmp", "os2_core8.raw", 3)
+    bmp_native("os2_core24.bmp", "os2_core24.raw", 3)
+    bmp_native("v4_565.bmp", "v4_565.raw", 3)
+    srgb := bmp_native("v5_srgb_alpha.bmp", "v5_srgb_alpha.raw", 4)
+    assert(srgb.color.tagged && srgb.color.is_srgb() && !srgb.color.has_icc())
+    icc := bmp_native("v5_icc.bmp", "v5_icc.raw", 3)
+    assert(icc.color.tagged && icc.color.icc_encoding == color.ICC_RAW)
+    // 14 + 124 header bytes and 2 rows of 12 bytes precede the profile.
+    assert_eq(icc.color.icc_offset, 162usize)
+    assert_eq(icc.color.icc_length, 64usize)
+
+    file_storage := [0u8; RASTER_FILE_LIMIT]
+    length := raster_read("v5_icc.bmp", &mut file_storage)
+    file := &file_storage[..length]
+    found := bmp.metadata(file)!
+    assert(found.icc.present() && found.icc.encoding == meta.ENCODING_RAW)
+    assert_eq(found.icc.offset, 162usize)
+    assert_eq(found.icc.length, 64usize)
+    profile := [0u8; 64]
+    assert_eq(meta.decode(file, &found.icc, &mut profile)!, 64usize)
+    assert(profile[0] == b'F' && profile[4] == b'I' && profile[13] == b'E' && profile[63] == 49)
+    assert(!found.exif.present() && !found.xmp.present())
+    length = raster_read("rle8.bmp", &mut file_storage)
+    plain := bmp.metadata(&file_storage[..length])!
+    assert(!plain.icc.present())
+}
+
+fn bmp_round_trip(layout: &pixels.Layout, alpha: bool, width: u32, height: u32) {
+    source_storage := [0u8; RASTER_PIXEL_LIMIT]
+    encoded := [0u8; RASTER_FILE_LIMIT]
+    decoded := [0u8; RASTER_PIXEL_LIMIT]
+    size := pixels.bytes_needed(width, height, layout)!
+    raster_pattern(&mut source_storage, width, height, layout, width * 3 + height)
+    source := pixels.View.new(&source_storage[..size], width, height, layout.clone())!
+    options := bmp.EncodeOptions.new()
+    options.alpha = alpha
+    total := bmp.max_encoded_size(width, height, layout, &options)!
+    assert_eq(bmp.encode_scratch_size(width, height, layout, &options)!, 0usize)
+    empty := [0u8; 0]
+    length := bmp.encode(&source, &options, &mut encoded, &mut empty)!
+    assert_eq(length, total)
+    match bmp.encode(&source, &options, &mut encoded[..total - 1], &mut empty) {
+        ok(_) => {
+            assert(false, "a short output must be rejected")
+        }
+        err(reason) => {
+            assert(reason == pixels.Error.BufferTooSmall)
+        }
+    }
+    header := bmp.info(&encoded[..length])!
+    assert(header.native.has_alpha() == (alpha && layout.has_alpha()))
+    if header.native.has_alpha() {
+        assert(header.color.tagged && header.color.is_srgb())
+    }
+    capture := RasterCapture.new(&mut decoded)
+    bmp.decode(&encoded[..length], &mut capture, &mut empty)!
+    raster_expect(&source, &decoded, &header.native, "bmp round trip")
+}
+
+@test
+fn bmp_encoders_round_trip() {
+    for k in 0usize..RASTER_LAYOUTS {
+        layout := raster_layouts(k)
+        bmp_round_trip(&layout, true, 70, 5)
+        bmp_round_trip(&layout, false, 9, 4)
+        bmp_round_trip(&layout, true, 1, 1)
+    }
+    // 24-bit sizes are the old bmp_size: rows padded to 4 bytes.
+    options := bmp.EncodeOptions.new()
+    rgb := pixels.Layout.rgb8()
+    assert_eq(bmp.max_encoded_size(12, 10, &rgb, &options)!, 54usize + 36 * 10)
+    rgba := pixels.Layout.rgba8()
+    assert_eq(bmp.max_encoded_size(3, 2, &rgba, &options)!, 138usize + 24)
+    options.alpha = false
+    assert_eq(bmp.max_encoded_size(3, 2, &rgba, &options)!, 54usize + 24)
+}
+
+fn bmp_expect_error(data: &[u8], expected: pixels.Error) {
+    null_sink := sink.NullSink.new()
+    empty := [0u8; 0]
+    match bmp.decode(data, &mut null_sink, &mut empty) {
+        ok() => {
+            assert(false, "bad file accepted")
+        }
+        err(reason) => {
+            assert(reason == expected, pixels.error_name(reason))
+        }
+    }
+}
+
+// A 4x2 RLE8 BMP with a two-color palette and the given stream.
+fn bmp_rle8(stream: &[u8], output: &mut[u8]) -> usize {
+    header := [
+        b'B', b'M', 0, 0, 0, 0, 0, 0, 0, 0, 62, 0, 0, 0,
+        40, 0, 0, 0, 4, 0, 0, 0, 2, 0, 0, 0, 1, 0, 8, 0, 1, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 255, 0, 255, 255, 255, 0
+    ]
+    for i in 0usize..header.len {
+        output[i] = header[i]
+    }
+    for i in 0usize..stream.len {
+        output[header.len + i] = stream[i]
+    }
+    return header.len + stream.len
+}
+
+@test
+fn bmp_rejects_malformed_files() {
+    storage := [0u8; 256]
+    // A run of an index past the palette.
+    length := bmp_rle8(b"\x02\x05\x00\x01", &mut storage)
+    bmp_expect_error(&storage[..length], pixels.Error.Malformed)
+    // A stream that ends before the image does.
+    length = bmp_rle8(b"\x04\x01\x00\x00\x02", &mut storage)
+    bmp_expect_error(&storage[..length], pixels.Error.Truncated)
+    // Absolute mode running past the data.
+    length = bmp_rle8(b"\x00\x06\x01\x01", &mut storage)
+    bmp_expect_error(&storage[..length], pixels.Error.Truncated)
+    // A good stream: red run, end of bitmap; the rest is black.
+    length = bmp_rle8(b"\x03\x00\x00\x01", &mut storage)
+    pixel_storage := [0u8; 64]
+    capture := RasterCapture.new(&mut pixel_storage)
+    empty := [0u8; 0]
+    bmp.decode(&storage[..length], &mut capture, &mut empty)!
+    // Bottom row (y = 1): red, red, red, black.
+    assert(pixel_storage[12] == 255 && pixel_storage[13] == 0 && pixel_storage[18] == 255 && pixel_storage[20] == 0)
+    assert(pixel_storage[21] == 0 && pixel_storage[22] == 0 && pixel_storage[23] == 0)
+    assert(pixel_storage[0] == 0 && pixel_storage[11] == 0)
+    // RLE with the wrong bit count, compressions this package lacks, short
+    // headers.
+    storage[28] = 24
+    bmp_expect_error(&storage[..length], pixels.Error.Malformed)
+    storage[28] = 8
+    storage[30] = 4
+    bmp_expect_error(&storage[..length], pixels.Error.Unsupported)
+    storage[30] = 1
+    storage[14] = 20
+    bmp_expect_error(&storage[..length], pixels.Error.Unsupported)
+    storage[14] = 40
+    bmp_expect_error(&storage[..20], pixels.Error.Truncated)
+    // Top-down RLE is invalid.
+    storage[25] = 0xff
+    storage[24] = 0xff
+    storage[23] = 0xff
+    storage[22] = 0xfe
+    bmp_expect_error(&storage[..length], pixels.Error.Malformed)
+
+    // Every prefix of a file fails cleanly or decodes; none traps.
+    file_storage := [0u8; RASTER_FILE_LIMIT]
+    names := ["rle8.bmp", "rle4.bmp", "os2_core8.bmp", "v5_icc.bmp", "v5_srgb_alpha.bmp", "v4_565.bmp"]
+    for n in 0usize..names.len {
+        total := raster_read(names[n], &mut file_storage)
+        for cut in 0usize..total + 1 {
+            data := &file_storage[..cut]
+            null_sink := sink.NullSink.new()
+            match bmp.decode(data, &mut null_sink, &mut empty) {
+                ok() => {}
+                err(reason) => {
+                    assert(cut < total, names[n])
+                    assert(reason == pixels.Error.Truncated || reason == pixels.Error.Malformed, names[n])
+                }
+            }
+            match bmp.metadata(data) {
+                ok(_) => {}
+                err(_) => {}
+            }
+        }
+    }
+}
+
+// Mutated files never trap.
+@test
+fn bmp_mutations_never_trap() {
+    file_storage := [0u8; RASTER_FILE_LIMIT]
+    mutated := [0u8; RASTER_FILE_LIMIT]
+    names := ["rle8.bmp", "rle4.bmp", "os2_core8.bmp", "v5_icc.bmp", "v4_565.bmp"]
+    state := 0x2545f491u32
+    empty := [0u8; 0]
+    for n in 0usize..names.len {
+        total := raster_read(names[n], &mut file_storage)
+        for _ in 0u32..200 {
+            for i in 0usize..total {
+                mutated[i] = file_storage[i]
+            }
+            for _ in 0u32..3 {
+                state = state ^ core.wrapping_mul(state, 8192)
+                state = state ^ (state >> 17)
+                state = state ^ core.wrapping_mul(state, 32)
+                position := (state as usize) % total
+                mutated[position] = ((state >> 8) & 255) as u8
+            }
+            null_sink := sink.NullSink.new()
+            match bmp.decode(&mutated[..total], &mut null_sink, &mut empty) {
+                ok() => {}
+                err(_) => {}
+            }
+            match bmp.info(&mutated[..total]) {
+                ok(_) => {}
+                err(_) => {}
+            }
+        }
+    }
+}

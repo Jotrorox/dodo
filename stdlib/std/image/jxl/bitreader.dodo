@@ -1,0 +1,369 @@
+package jxl
+
+import "core/num"
+import "std/image/convert"
+import "std/image/shared/isobmff"
+
+// The codestream bit reader. JPEG XL packs fields least significant bit
+// first. The codestream is either the whole file (bare, starting FF 0A) or
+// the payloads of a jxlc box or of jxlp boxes in an ISOBMFF container; the
+// reader walks those boxes lazily, so a codestream split across segments is
+// read in place without copying. Positions are logical: bytes counted from
+// the start of the codestream.
+//
+// Reads never fail: past the end of the data, or past a section limit set
+// with set_limit(), they return zero bits and set `overrun`, which callers
+// check at section boundaries. This keeps the hot paths free of Result
+// plumbing; every loop driven by decoded values is bounded separately.
+
+const SIGNATURE_BOX: u32 = 0x4a584c20
+const JXLC: u32 = 0x6a786c63
+const JXLP: u32 = 0x6a786c70
+
+pub struct Reader {
+    data: &[u8]
+    container: bool
+    // The current segment: file bytes [seg_start, seg_end) hold logical bytes
+    // from seg_logical on; pos is the next file byte to load.
+    seg_start: usize
+    seg_end: usize
+    seg_logical: usize
+    pos: usize
+    // Where the scan for the next codestream box continues.
+    next_box: usize
+    // Logical byte limit for the current section.
+    limit: usize
+    buf: u64
+    count: u32
+    // A read went past the data or the limit.
+    pub overrun: bool
+    // The container structure is invalid.
+    pub broken: bool
+
+    fn new(data: &[u8], container: bool) -> Reader from(data) {
+        reader := Reader { data: data, container: container, seg_start: 0, seg_end: 0, seg_logical: 0, pos: 0, next_box: 0, limit: num.MAX, buf: 0, count: 0, overrun: false, broken: false }
+        reader.restart()
+        return reader
+    }
+
+    // Back to logical byte 0.
+    fn restart(&mut self) {
+        self.buf = 0
+        self.count = 0
+        if !self.container {
+            self.seg_start = 0
+            self.seg_end = self.data.len
+            self.seg_logical = 0
+            self.pos = 0
+            return
+        }
+        self.seg_start = 0
+        self.seg_end = 0
+        self.seg_logical = 0
+        self.pos = 0
+        self.next_box = 0
+        self.advance()
+    }
+
+    // Move to the next codestream segment; false when there is none.
+    fn advance(&mut self) -> bool {
+        if !self.container {
+            return false
+        }
+        for {
+            match isobmff.read_box(self.data, self.next_box, self.data.len) {
+                ok(some(b)) => {
+                    self.next_box = b.end()
+                    if b.kind == JXLC || b.kind == JXLP {
+                        start := b.offset
+                        if b.kind == JXLP {
+                            if b.length < 4 {
+                                self.broken = true
+                                return false
+                            }
+                            start += 4
+                        }
+                        self.seg_logical += self.seg_end - self.seg_start
+                        self.seg_start = start
+                        self.seg_end = b.end()
+                        self.pos = start
+                        if self.seg_end > self.seg_start {
+                            return true
+                        }
+                    }
+                }
+                ok(none) => {
+                    return false
+                }
+                err(_) => {
+                    // A truncated final box still contributes its bytes.
+                    self.broken = true
+                    return false
+                }
+            }
+        }
+    }
+
+    // Logical offset of the next byte to load.
+    fn loaded(&self) -> usize {
+        return self.seg_logical + (self.pos - self.seg_start)
+    }
+
+    fn refill(&mut self) {
+        for self.count <= 56 {
+            if self.pos >= self.seg_end {
+                if !self.advance() {
+                    return
+                }
+                continue
+            }
+            if self.loaded() >= self.limit {
+                return
+            }
+            self.buf = self.buf | ((self.data[self.pos] as u64) << (self.count as u64))
+            self.pos += 1
+            self.count += 8
+        }
+    }
+
+    // The next n bits (0 to 32) as an integer.
+    fn bits(&mut self, n: u32) -> u32 {
+        if n == 0 {
+            return 0
+        }
+        if self.count < n {
+            self.refill()
+            if self.count < n {
+                self.overrun = true
+                value := self.buf as u32
+                self.buf = 0
+                self.count = 0
+                if n < 32 {
+                    return value & ((1u32 << n) - 1)
+                }
+                return value
+            }
+        }
+        value := (self.buf & ((1u64 << (n as u64)) - 1)) as u32
+        self.buf = self.buf >> (n as u64)
+        self.count -= n
+        return value
+    }
+
+    // The next n bits without consuming them (n <= 32); missing bits read
+    // as zero.
+    fn peek(&mut self, n: u32) -> u32 {
+        if self.count < n {
+            self.refill()
+        }
+        return (self.buf & ((1u64 << (n as u64)) - 1)) as u32
+    }
+
+    // Drop n bits that peek() returned.
+    fn consume(&mut self, n: u32) {
+        if self.count < n {
+            self.overrun = true
+            self.buf = 0
+            self.count = 0
+            return
+        }
+        self.buf = self.buf >> (n as u64)
+        self.count -= n
+    }
+
+    fn bit(&mut self) -> bool {
+        return self.bits(1) == 1
+    }
+
+    // U32(d0, d1, d2, d3): a 2-bit selector picks distribution i, which is
+    // offset[i] + u(bits[i]). Distributions are packed as offset << 6 | bits;
+    // see dist().
+    fn u32c(&mut self, d0: u64, d1: u64, d2: u64, d3: u64) -> u32 {
+        selector := self.bits(2)
+        d := d0
+        if selector == 1 {
+            d = d1
+        } else if selector == 2 {
+            d = d2
+        } else if selector == 3 {
+            d = d3
+        }
+        n := (d & 63) as u32
+        offset := d >> 6
+        return ((offset + self.bits(n) as u64) & 0xffffffff) as u32
+    }
+
+    // U64 field encoding.
+    fn u64c(&mut self) -> u64 {
+        selector := self.bits(2)
+        if selector == 0 {
+            return 0
+        }
+        if selector == 1 {
+            return 1 + self.bits(4) as u64
+        }
+        if selector == 2 {
+            return 17 + self.bits(8) as u64
+        }
+        value := self.bits(12) as u64
+        shift := 12u64
+        for self.bit() {
+            if shift == 60 {
+                value = value | ((self.bits(4) as u64) << 60)
+                break
+            }
+            value = value | ((self.bits(8) as u64) << shift)
+            shift += 8
+        }
+        return value
+    }
+
+    // An IEEE binary16 value as f32; infinities and NaNs set `broken`.
+    fn f16(&mut self) -> f32 {
+        bits := self.bits(16)
+        exponent := (bits >> 10) & 31
+        if exponent == 31 {
+            self.broken = true
+            return 0.0
+        }
+        return convert.f32_from_bits(convert.half_to_f32_bits(bits as u16))
+    }
+
+    // Enum field encoding: U32(0, 1, 2 + u(4), 18 + u(6)); values of 64 or
+    // more set `broken`.
+    fn enumv(&mut self) -> u32 {
+        value := self.u32c(dist(0, 0), dist(1, 0), dist(2, 4), dist(18, 6))
+        if value >= 64 {
+            self.broken = true
+        }
+        return value
+    }
+
+    // Skip n bits.
+    fn skip(&mut self, n: u64) {
+        if n <= self.count as u64 {
+            self.consume(n as u32)
+            return
+        }
+        bits := n - self.count as u64
+        self.buf = 0
+        self.count = 0
+        target := self.loaded() as u64 + bits / 8
+        if target > self.limit as u64 || target > 0xffffffffffff {
+            self.overrun = true
+            return
+        }
+        self.seek_byte(target as usize)
+        rest := (bits % 8) as u32
+        if rest > 0 {
+            self.bits(rest)
+        }
+    }
+
+    // Skip to the next byte boundary.
+    fn pad(&mut self) {
+        rest := self.count % 8
+        self.consume(rest)
+    }
+
+    // Logical bit position of the next unread bit.
+    fn position(&self) -> u64 {
+        return self.loaded() as u64 * 8 - self.count as u64
+    }
+
+    // Logical byte position; only meaningful at a byte boundary.
+    fn byte_position(&self) -> usize {
+        return self.loaded() - (self.count / 8) as usize
+    }
+
+    // Continue reading at logical byte `target`.
+    fn seek_byte(&mut self, target: usize) {
+        self.buf = 0
+        self.count = 0
+        if target < self.seg_logical {
+            self.restart()
+        }
+        for {
+            length := self.seg_end - self.seg_start
+            if target < self.seg_logical + length || (!self.container && target <= length) {
+                self.pos = self.seg_start + (target - self.seg_logical)
+                return
+            }
+            if !self.advance() {
+                // Past the end: further reads see no data.
+                self.pos = self.seg_end
+                return
+            }
+        }
+    }
+
+    // seek_byte for a 64-bit offset; offsets beyond the address space read
+    // as past the end.
+    fn seek_byte64(&mut self, target: u64) {
+        if target > num.MAX as u64 {
+            self.seek_byte(num.MAX)
+            return
+        }
+        self.seek_byte(target as usize)
+    }
+
+    // Continue reading at logical bit `target`.
+    fn seek_bit(&mut self, target: u64) {
+        self.seek_byte64(target / 8)
+        rest := (target % 8) as u32
+        if rest > 0 {
+            self.bits(rest)
+        }
+    }
+
+    // Bits past logical byte `end` read as zero and set `overrun`.
+    fn set_limit(&mut self, end: usize) {
+        self.limit = end
+        // Bits already buffered beyond the limit must not be used.
+        if self.loaded() > end {
+            over := (self.loaded() - end) as u32 * 8
+            if over >= self.count {
+                self.buf = 0
+                self.count = 0
+            } else {
+                self.count -= over
+                self.buf = self.buf & ((1u64 << (self.count as u64)) - 1)
+            }
+        }
+    }
+
+    fn clear_limit(&mut self) {
+        self.limit = num.MAX
+    }
+}
+
+// A U32 distribution: `offset + u(bits)`.
+fn dist(offset: u64, bits: u64) -> u64 {
+    return (offset << 6) | bits
+}
+
+// The signed value of a zigzag-packed integer.
+fn unpack_signed(value: u32) -> i32 {
+    if (value & 1) == 0 {
+        return (value >> 1) as i32
+    }
+    return -(((value >> 1) as i32)) - 1
+}
+
+// ceil(log2(x + 1)): the bits needed for values 0..=x.
+fn bits_for(x: u32) -> u32 {
+    n := 0u32
+    for n < 32 && (x >> n) != 0 {
+        n += 1
+    }
+    return n
+}
+
+// floor(log2(x)) for x > 0.
+fn floor_log2(x: u64) -> u32 {
+    n := 0u32
+    for n < 63 && (x >> (n as u64 + 1)) != 0 {
+        n += 1
+    }
+    return n
+}
