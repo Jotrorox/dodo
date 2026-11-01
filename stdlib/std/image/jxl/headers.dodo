@@ -6,8 +6,9 @@ import "std/image/pixels"
 // color encoding, tone mapping, orientation, animation, preview) and
 // CustomTransformData (opsin inverse matrix, upsampling weights).
 
-// Extra channels supported per image; files with more fail Unsupported.
-const MAX_EXTRA: usize = 64
+// No extra channel (alpha_channel() of an image without alpha). Images
+// have at most 4096 extra channels (U32 1 + u(12)).
+const NO_EXTRA: usize = 0xffffffff
 
 // Extra channel types.
 const EC_ALPHA: u32 = 0
@@ -61,12 +62,16 @@ struct ImageHeader {
     bits: u32
     exp_bits: u32
     modular16: bool
+    // Extra channels: their ExtraChannelInfo fields stay in the codestream
+    // from ec_bit on (see extra.dodo: Extras holds them per decode); the
+    // header keeps the first alpha channel (NO_EXTRA if none) and its depth.
     num_extra: u32
-    ec_type: [MAX_EXTRA]u32
-    ec_bits: [MAX_EXTRA]u32
-    ec_exp_bits: [MAX_EXTRA]u32
-    ec_dim_shift: [MAX_EXTRA]u32
-    ec_associated: [MAX_EXTRA]bool
+    ec_bit: u64
+    alpha: usize
+    alpha_bits: u32
+    alpha_exp_bits: u32
+    alpha_associated: bool
+    any_spot: bool
     xyb: bool
     // ColourEncoding.
     want_icc: bool
@@ -123,6 +128,12 @@ struct ImageHeader {
         c.exp_bits = self.exp_bits
         c.modular16 = self.modular16
         c.num_extra = self.num_extra
+        c.ec_bit = self.ec_bit
+        c.alpha = self.alpha
+        c.alpha_bits = self.alpha_bits
+        c.alpha_exp_bits = self.alpha_exp_bits
+        c.alpha_associated = self.alpha_associated
+        c.any_spot = self.any_spot
         c.xyb = self.xyb
         c.want_icc = self.want_icc
         c.color_space = self.color_space
@@ -150,13 +161,6 @@ struct ImageHeader {
         c.icc_bit = self.icc_bit
         c.icc_enc_size = self.icc_enc_size
         c.frames_byte = self.frames_byte
-        for i in 0usize..MAX_EXTRA {
-            c.ec_type[i] = self.ec_type[i]
-            c.ec_bits[i] = self.ec_bits[i]
-            c.ec_exp_bits[i] = self.ec_exp_bits[i]
-            c.ec_dim_shift[i] = self.ec_dim_shift[i]
-            c.ec_associated[i] = self.ec_associated[i]
-        }
         for i in 0usize..9 {
             c.opsin[i] = self.opsin[i]
         }
@@ -171,19 +175,17 @@ struct ImageHeader {
         return self.color_space == CS_GREY
     }
 
-    // The first alpha extra channel, or MAX_EXTRA when there is none.
+    // The first alpha extra channel, or NO_EXTRA when there is none.
     fn alpha_channel(&self) -> usize {
-        for i in 0usize..self.num_extra as usize {
-            if self.ec_type[i] == EC_ALPHA {
-                return i
-            }
-        }
-        return MAX_EXTRA
+        return self.alpha
+    }
+    fn has_alpha(&self) -> bool {
+        return self.alpha != NO_EXTRA
     }
 }
 
 fn default_header() -> ImageHeader {
-    return ImageHeader { width: 0, height: 0, orientation: 1, have_preview: false, preview_width: 0, preview_height: 0, animated: false, tps_numerator: 0, tps_denominator: 0, loops: 0, have_timecodes: false, bits: 8, exp_bits: 0, modular16: true, num_extra: 0, ec_type: [0u32; MAX_EXTRA], ec_bits: [8u32; MAX_EXTRA], ec_exp_bits: [0u32; MAX_EXTRA], ec_dim_shift: [0u32; MAX_EXTRA], ec_associated: [false; MAX_EXTRA], xyb: true, want_icc: false, color_space: CS_RGB, white_point: WP_D65, white_x: 312700, white_y: 329000, primaries: PR_SRGB, red_x: 640000, red_y: 330000, green_x: 300000, green_y: 600000, blue_x: 150000, blue_y: 60000, have_gamma: false, gamma: 0, transfer: TF_SRGB, intent: 1, intensity_target: 255.0, min_nits: 0.0, relative_to_max_display: false, linear_below: 0.0, opsin: [11.031566901960783f32, -9.866943921568629, -0.16462299647058826, -3.254147380392157, 4.418770392156863, -0.16462299647058826, -3.6588512862745097, 2.7129230470588235, 1.9459282392156863], opsin_bias: [-0.0037930732552754493f32; 3], quant_bias: [0.94534993f32, 0.92994550, 0.95006490], quant_bias_numerator: 0.145, custom_weights: 0, weights_bit: 0, icc_bit: 0, icc_enc_size: 0, frames_byte: 0 }
+    return ImageHeader { width: 0, height: 0, orientation: 1, have_preview: false, preview_width: 0, preview_height: 0, animated: false, tps_numerator: 0, tps_denominator: 0, loops: 0, have_timecodes: false, bits: 8, exp_bits: 0, modular16: true, num_extra: 0, ec_bit: 0, alpha: NO_EXTRA, alpha_bits: 8, alpha_exp_bits: 0, alpha_associated: false, any_spot: false, xyb: true, want_icc: false, color_space: CS_RGB, white_point: WP_D65, white_x: 312700, white_y: 329000, primaries: PR_SRGB, red_x: 640000, red_y: 330000, green_x: 300000, green_y: 600000, blue_x: 150000, blue_y: 60000, have_gamma: false, gamma: 0, transfer: TF_SRGB, intent: 1, intensity_target: 255.0, min_nits: 0.0, relative_to_max_display: false, linear_below: 0.0, opsin: [11.031566901960783f32, -9.866943921568629, -0.16462299647058826, -3.254147380392157, 4.418770392156863, -0.16462299647058826, -3.6588512862745097, 2.7129230470588235, 1.9459282392156863], opsin_bias: [-0.0037930732552754493f32; 3], quant_bias: [0.94534993f32, 0.92994550, 0.95006490], quant_bias_numerator: 0.145, custom_weights: 0, weights_bit: 0, icc_bit: 0, icc_enc_size: 0, frames_byte: 0 }
 }
 
 // SizeHeader: (width, height).
@@ -249,9 +251,11 @@ fn read_bit_depth(r: &mut Reader) -> u32!pixels.Error {
     return ok(bits << 8)
 }
 
-fn skip_name(r: &mut Reader) {
+// Skip a name; returns its byte length.
+fn skip_name(r: &mut Reader) -> u32 {
     length := r.u32c(dist(0, 0), dist(0, 4), dist(16, 5), dist(48, 10))
     r.skip(length as u64 * 8)
+    return length
 }
 
 fn read_extensions(r: &mut Reader) {
@@ -351,10 +355,33 @@ fn read_color_encoding(r: &mut Reader, h: &mut ImageHeader) -> void!pixels.Error
 // Parse the headers up to the first frame. The ICC stream, when present, is
 // skipped with `sk` and `win` (see skip_icc), so the frame offset is known.
 fn read_headers(r: &mut Reader, sk: &mut Skim, win: &mut[u8]) -> ImageHeader!pixels.Error {
+    h := default_header()
+    read_header_fields(r, &mut h, false)?
+    h.icc_bit = r.position()
+    if h.want_icc {
+        h.icc_enc_size = skip_icc(r, sk, win)?
+    }
+    r.pad()
+    if r.overrun {
+        return err(pixels.Error.Truncated)
+    }
+    h.frames_byte = r.byte_position()
+    return ok(h)
+}
+
+// Parse the headers up to the end of the extra channel descriptions only.
+fn read_extra_headers(r: &mut Reader) -> ImageHeader!pixels.Error {
+    h := default_header()
+    read_header_fields(r, &mut h, true)?
+    return ok(h)
+}
+
+// The header fields before the ICC stream into `h` (up to the extra channel
+// descriptions only when `extra_only`).
+fn read_header_fields(r: &mut Reader, h: &mut ImageHeader, extra_only: bool) -> void!pixels.Error {
     if r.bits(16) != 0x0aff {
         return err(pixels.Error.Malformed)
     }
-    h := default_header()
     size := read_size(r)
     h.width = (size >> 32) as u32
     h.height = (size & 0xffffffff) as u32
@@ -409,37 +436,30 @@ fn read_headers(r: &mut Reader, sk: &mut Skim, win: &mut[u8]) -> ImageHeader!pix
         h.exp_bits = depth & 255
         h.modular16 = r.bit()
         h.num_extra = r.u32c(dist(0, 0), dist(1, 0), dist(2, 4), dist(1, 12))
-        if h.num_extra as usize > MAX_EXTRA {
-            return err(pixels.Error.Unsupported)
-        }
+        h.ec_bit = r.position()
         for i in 0usize..h.num_extra as usize {
-            if r.bit() {
-                // Default: 8-bit unassociated alpha.
-                continue
+            e := read_ec_info(r)?
+            if e.kind == EC_ALPHA && h.alpha == NO_EXTRA {
+                h.alpha = i
+                h.alpha_bits = e.bits
+                h.alpha_exp_bits = e.exp_bits
+                h.alpha_associated = e.associated
             }
-            kind := r.enumv()
-            if kind > 6 && kind != EC_NON_OPTIONAL && kind != EC_OPTIONAL {
+            if e.kind == EC_SPOT {
+                h.any_spot = true
+            }
+        }
+        if extra_only {
+            if r.broken {
                 return err(pixels.Error.Malformed)
             }
-            h.ec_type[i] = kind
-            ec_depth := read_bit_depth(r)?
-            h.ec_bits[i] = ec_depth >> 8
-            h.ec_exp_bits[i] = ec_depth & 255
-            h.ec_dim_shift[i] = r.u32c(dist(0, 0), dist(3, 0), dist(4, 0), dist(1, 3))
-            skip_name(r)
-            if kind == EC_ALPHA {
-                h.ec_associated[i] = r.bit()
-            } else if kind == EC_SPOT {
-                r.f16()
-                r.f16()
-                r.f16()
-                r.f16()
-            } else if kind == EC_CFA {
-                r.u32c(dist(1, 0), dist(0, 2), dist(3, 4), dist(19, 8))
+            if r.overrun {
+                return err(pixels.Error.Truncated)
             }
+            return ok()
         }
         h.xyb = r.bit()
-        read_color_encoding(r, &mut h)?
+        read_color_encoding(r, h)?
         if extra_fields {
             if !r.bit() {
                 h.intensity_target = r.f16()
@@ -489,14 +509,5 @@ fn read_headers(r: &mut Reader, sk: &mut Skim, win: &mut[u8]) -> ImageHeader!pix
     if h.color_space == CS_XYB && !h.want_icc && h.have_gamma && h.gamma != 3333333 {
         return err(pixels.Error.Malformed)
     }
-    h.icc_bit = r.position()
-    if h.want_icc {
-        h.icc_enc_size = skip_icc(r, sk, win)?
-    }
-    r.pad()
-    if r.overrun {
-        return err(pixels.Error.Truncated)
-    }
-    h.frames_byte = r.byte_position()
-    return ok(h)
+    return ok()
 }

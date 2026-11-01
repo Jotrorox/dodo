@@ -52,6 +52,9 @@ const WIN_MARGIN_PX: u64 = 8
 const WIN_MARGIN_S: u64 = 32
 // Most patch positions and spline points the lookahead reads per frame.
 const WIN_SKIM_LIMIT: u64 = 16777216
+// Coded samples beyond a pixel extent that upsampling reads (the 5x5
+// kernel reaches 2; one more for rounding).
+const WIN_PATCH_UP: u64 = 3
 
 struct FrameWin {
     sw: u32
@@ -151,6 +154,8 @@ fn frame_window(data: &[u8], h: &ImageHeader, f: &FrameHeader, sk: &mut Skim, wi
         patch_w = pw
         patch_h = ph
     }
+    patch_w = patch_space(f, patch_w, false)
+    patch_h = patch_space(f, patch_h, true)
     w := FrameWin { sw: f.sample_width, sh: f.sample_height, pw: pw as u32, ph: ph as u32, patch_w: patch_w as u32, patch_h: patch_h as u32, clipped: false, tree_nodes: 0 }
     up := f.upsampling as u64
     sx := (pw + up - 1) / up + WIN_MARGIN_S
@@ -422,8 +427,8 @@ fn skim_patches(r: &mut Reader, h: &ImageHeader, f: &FrameHeader, sk: &mut Skim,
     st := new_sk_stream(SK_FULL, SK_WINDOW)
     sk_begin(&mut st, &code, r)
     nec := h.num_extra as u64
-    fw := f.width as u64
-    fh := f.height as u64
+    fw := patch_area(f, false)
+    fh := patch_area(f, true)
     max_refs := 1024 + fw * fh / 4
     max_patches := max_refs * 4
     num_refs := sk_read(&mut code, sk, &mut st, win, r, 0, 0) as u64
@@ -493,21 +498,35 @@ fn skim_patches(r: &mut Reader, h: &ImageHeader, f: &FrameHeader, sk: &mut Skim,
     }
 }
 
-// The part of frame `g` that its patches are applied to (see frame_window).
+// A pixel extent `v` of frame `f` in the coordinates its patches use:
+// pixels, or for upsampled frames (whose patches apply to the coded-size
+// planes) the coded samples that reach those pixels through the 5x5
+// upsampling kernel.
+fn patch_space(f: &FrameHeader, v: u64, vertical: bool) -> u64 {
+    up := f.upsampling as u64
+    if up <= 1 {
+        return v
+    }
+    return min64(patch_area(f, vertical), (v + up - 1) / up + WIN_PATCH_UP)
+}
+
+// The part of frame `g` that its patches are applied to, in its patch
+// coordinates (see frame_window).
 fn patch_region(h: &ImageHeader, g: &FrameHeader, cx: &mut u64, cy: &mut u64) {
-    if g.frame_type == FT_LF {
-        *cx = g.sample_width as u64
-        *cy = g.sample_height as u64
-    } else if g.can_reference() && g.save_before_ct {
-        *cx = g.width as u64
-        *cy = g.height as u64
-    } else if g.is_normal() {
+    if g.frame_type == FT_LF || (g.can_reference() && g.save_before_ct) {
+        *cx = patch_area(g, false)
+        *cy = patch_area(g, true)
+        return
+    }
+    if g.is_normal() {
         *cx = visible_extent(g.x0, g.width, h.width)
         *cy = visible_extent(g.y0, g.height, h.height)
     } else {
         *cx = min64(g.width as u64, h.width as u64)
         *cy = min64(g.height as u64, h.height as u64)
     }
+    *cx = patch_space(g, *cx, false)
+    *cy = patch_space(g, *cy, true)
 }
 
 // The extent later patches read from the slot frame `f` saves to, up to

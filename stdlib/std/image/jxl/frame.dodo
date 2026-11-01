@@ -31,8 +31,10 @@ struct FrameHeader {
     ycbcr: bool
     jpeg_upsampling: [3]u32
     upsampling: u32
-    // Total upsampling of each extra channel, dim_shift included.
-    ec_upsampling: [MAX_EXTRA]u32
+    // Extra channels by their sample shift relative to the color samples
+    // (0 to 3: total upsampling, dim_shift included, over upsampling); the
+    // per-channel values go to an Extras table when one is given.
+    ec_shift_count: [4]u32
     group_shift: u32
     x_qm_scale: u32
     b_qm_scale: u32
@@ -52,10 +54,10 @@ struct FrameHeader {
     blend_alpha: u32
     blend_clamp: bool
     blend_source: u32
-    ec_blend_mode: [MAX_EXTRA]u32
-    ec_blend_alpha: [MAX_EXTRA]u32
-    ec_blend_clamp: [MAX_EXTRA]bool
-    ec_blend_source: [MAX_EXTRA]u32
+    // Every extra channel blends with mode replace; the reference slots
+    // extra channel blending reads (bit per slot).
+    ec_all_replace: bool
+    ec_sources: u32
     duration: u32
     timecode: u32
     is_last: bool
@@ -118,15 +120,11 @@ struct FrameHeader {
     // Every channel is replaced over the whole canvas: earlier frames do not
     // show through.
     fn replaces_all(&self, num_extra: u32) -> bool {
-        if self.blend_mode != BLEND_REPLACE || self.partial {
-            return false
-        }
-        for i in 0usize..num_extra as usize {
-            if self.ec_blend_mode[i] != BLEND_REPLACE {
-                return false
-            }
-        }
-        return true
+        return self.blend_mode == BLEND_REPLACE && !self.partial && self.ec_all_replace
+    }
+    // Every extra channel has the color channels' sample size.
+    fn ec_same_size(&self, num_extra: u32) -> bool {
+        return self.ec_shift_count[0] == num_extra
     }
     fn needs_blending(&self, num_extra: u32) -> bool {
         if !self.is_normal() {
@@ -211,15 +209,49 @@ fn read_blending(r: &mut Reader, num_extra: u32, partial: bool, mode: &mut u32, 
     return ok()
 }
 
-// Parse a frame header at the reader (byte aligned), then its TOC: offsets
-// go to `toc` when it is long enough (two words per entry: offset relative
-// to data_start, size), using `work` for a permuted TOC.
+// Parse a frame header at the reader (byte aligned); per extra channel
+// fields are only summarized.
 fn read_frame_header(r: &mut Reader, h: &ImageHeader) -> FrameHeader!pixels.Error {
-    f := FrameHeader { frame_type: FT_REGULAR, modular: false, flags: 0, ycbcr: false, jpeg_upsampling: [0u32; 3], upsampling: 1, ec_upsampling: [1u32; MAX_EXTRA], group_shift: 1, x_qm_scale: 2, b_qm_scale: 2, num_passes: 1, num_ds: 0, pass_shift: [0u32; MAX_PASSES], downsample: [1u32; 4], last_pass: [0u32; 4], lf_level: 0, have_crop: false, x0: 0, y0: 0, width: h.width, height: h.height, partial: false, blend_mode: BLEND_REPLACE, blend_alpha: 0, blend_clamp: false, blend_source: 0, ec_blend_mode: [0u32; MAX_EXTRA], ec_blend_alpha: [0u32; MAX_EXTRA], ec_blend_clamp: [false; MAX_EXTRA], ec_blend_source: [0u32; MAX_EXTRA], duration: 0, timecode: 0, is_last: true, save_as_reference: 0, save_before_ct: false, gab: true, gab_weights: [0.115169525f32, 0.061248592, 0.115169525, 0.061248592, 0.115169525, 0.061248592], epf_iters: 2, epf_sharp: [0.0f32, 0.14285715, 0.2857143, 0.42857143, 0.5714286, 0.71428573, 0.85714287, 1.0], epf_channel_scale: [40.0f32, 5.0, 3.5], epf_quant_mul: 0.46, epf_pass0_sigma: 0.9, epf_pass2_sigma: 6.5, epf_border_sad: 0.6666667, epf_sigma_modular: 1.0, color_channels: 3, sample_width: 0, sample_height: 0, group_dim: 256, groups_x: 0, groups_y: 0, lf_groups_x: 0, lf_groups_y: 0, toc_entries: 0, toc_permuted: false, data_start: 0, data_size: 0, start: r.byte_position(), win_sw: 0, win_sh: 0, win_pw: 0, win_ph: 0, patch_w: 0, patch_h: 0 }
-    num_extra := h.num_extra
-    for i in 0usize..num_extra as usize {
-        f.ec_upsampling[i] = 1u32 << h.ec_dim_shift[i]
+    w := [0u32; 1]
+    v := [0.0f32; 1]
+    ex := Extras { w: &mut w, v: &mut v, n: 0 }
+    return read_frame_header_ex(r, h, &mut ex)
+}
+
+// The ExtraChannelInfo at logical bit *at (advanced past it); the reader
+// continues where it was.
+fn read_ec_at(r: &mut Reader, at: &mut u64) -> EcInfo!pixels.Error {
+    back := r.position()
+    r.seek_bit(*at)
+    e := read_ec_info(r)
+    *at = r.position()
+    r.seek_bit(back)
+    return e
+}
+
+// The log2 of an upsampling factor (1, 2, 4 or 8).
+fn up_log2(v: u32) -> u32 {
+    if v >= 8 {
+        return 3
     }
+    if v >= 4 {
+        return 2
+    }
+    if v >= 2 {
+        return 1
+    }
+    return 0
+}
+
+// Parse a frame header at the reader (byte aligned); the upsampling and
+// blending of each extra channel also go to `ex` when it has room.
+fn read_frame_header_ex(r: &mut Reader, h: &ImageHeader, ex: &mut Extras) -> FrameHeader!pixels.Error {
+    f := FrameHeader { frame_type: FT_REGULAR, modular: false, flags: 0, ycbcr: false, jpeg_upsampling: [0u32; 3], upsampling: 1, ec_shift_count: [0u32; 4], group_shift: 1, x_qm_scale: 2, b_qm_scale: 2, num_passes: 1, num_ds: 0, pass_shift: [0u32; MAX_PASSES], downsample: [1u32; 4], last_pass: [0u32; 4], lf_level: 0, have_crop: false, x0: 0, y0: 0, width: h.width, height: h.height, partial: false, blend_mode: BLEND_REPLACE, blend_alpha: 0, blend_clamp: false, blend_source: 0, ec_all_replace: true, ec_sources: 0, duration: 0, timecode: 0, is_last: true, save_as_reference: 0, save_before_ct: false, gab: true, gab_weights: [0.115169525f32, 0.061248592, 0.115169525, 0.061248592, 0.115169525, 0.061248592], epf_iters: 2, epf_sharp: [0.0f32, 0.14285715, 0.2857143, 0.42857143, 0.5714286, 0.71428573, 0.85714287, 1.0], epf_channel_scale: [40.0f32, 5.0, 3.5], epf_quant_mul: 0.46, epf_pass0_sigma: 0.9, epf_pass2_sigma: 6.5, epf_border_sad: 0.6666667, epf_sigma_modular: 1.0, color_channels: 3, sample_width: 0, sample_height: 0, group_dim: 256, groups_x: 0, groups_y: 0, lf_groups_x: 0, lf_groups_y: 0, toc_entries: 0, toc_permuted: false, data_start: 0, data_size: 0, start: r.byte_position(), win_sw: 0, win_sh: 0, win_pw: 0, win_ph: 0, patch_w: 0, patch_h: 0 }
+    num_extra := h.num_extra
+    store := ex.n >= num_extra as usize
+    // The extra channel descriptions are read alongside for their dim_shift.
+    ec_at := h.ec_bit
+    read_ups := false
     if h.xyb {
         f.x_qm_scale = 3
     }
@@ -239,15 +271,34 @@ fn read_frame_header(r: &mut Reader, h: &ImageHeader) -> FrameHeader!pixels.Erro
         }
         if !use_lf_frame {
             f.upsampling = r.u32c(dist(1, 0), dist(2, 0), dist(4, 0), dist(8, 0))
-            for i in 0usize..num_extra as usize {
-                coded := r.u32c(dist(1, 0), dist(2, 0), dist(4, 0), dist(8, 0))
-                total := coded << h.ec_dim_shift[i]
-                if total < f.upsampling || total > 8 {
-                    return err(pixels.Error.Malformed)
-                }
-                f.ec_upsampling[i] = total
-            }
+            read_ups = true
         }
+    }
+    // Extra channel upsampling: coded (times 2^dim_shift) or 2^dim_shift.
+    for i in 0usize..num_extra as usize {
+        e := read_ec_at(r, &mut ec_at)?
+        total := 1u32 << e.dim_shift
+        if read_ups {
+            coded := r.u32c(dist(1, 0), dist(2, 0), dist(4, 0), dist(8, 0))
+            total = coded << e.dim_shift
+        }
+        if total < f.upsampling || total > 8 {
+            return err(pixels.Error.Malformed)
+        }
+        shift := 0u32
+        if up_log2(total) > up_log2(f.upsampling) {
+            shift = up_log2(total) - up_log2(f.upsampling)
+        }
+        f.ec_shift_count[shift as usize] += 1
+        if store {
+            ex.put(i, EX_UP, total)
+            ex.put(i, EX_MODE, BLEND_REPLACE)
+            ex.put(i, EX_ALPHA, 0)
+            ex.put(i, EX_CLAMP, 0)
+            ex.put(i, EX_SOURCE, 0)
+        }
+    }
+    if !all_default {
         if f.modular {
             f.group_shift = r.bits(2)
         }
@@ -315,10 +366,20 @@ fn read_frame_header(r: &mut Reader, h: &ImageHeader) -> FrameHeader!pixels.Erro
                 clamp := false
                 source := 0u32
                 read_blending(r, num_extra, f.partial, &mut mode, &mut alpha, &mut clamp, &mut source)?
-                f.ec_blend_mode[i] = mode
-                f.ec_blend_alpha[i] = alpha
-                f.ec_blend_clamp[i] = clamp
-                f.ec_blend_source[i] = source
+                if mode != BLEND_REPLACE {
+                    f.ec_all_replace = false
+                }
+                f.ec_sources = f.ec_sources | (1u32 << source)
+                if store {
+                    ex.put(i, EX_MODE, mode)
+                    ex.put(i, EX_ALPHA, alpha)
+                    clamped := 0u32
+                    if clamp {
+                        clamped = 1
+                    }
+                    ex.put(i, EX_CLAMP, clamped)
+                    ex.put(i, EX_SOURCE, source)
+                }
             }
             if h.animated {
                 f.duration = r.u32c(dist(0, 0), dist(1, 0), dist(0, 8), dist(0, 32))

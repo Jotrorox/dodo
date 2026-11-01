@@ -1,0 +1,286 @@
+package jxl
+
+import "core/slice"
+import "std/image/convert"
+import "std/image/pixels"
+import "std/image/shared/scratch"
+import "std/image/sink"
+
+// Extra channels (alpha, depth, spot colors, selection masks, CMYK black,
+// CFA, thermal, ...). An image may have up to 4096 of them. Their
+// descriptions (ExtraChannelInfo) stay in the codestream: ImageHeader keeps
+// only their count, where they start and a summary of the first alpha
+// channel, and frame headers keep summaries of their upsampling and
+// blending (see FrameHeader). Decoding loads the per-channel fields into an
+// Extras table carved from the caller's scratch, so no fixed-size array
+// bounds the channel count.
+
+// Extra channel types.
+pub enum ExtraChannelType {
+    Alpha
+    Depth
+    SpotColor
+    SelectionMask
+    Black
+    Cfa
+    Thermal
+    // Type 16: may be ignored. (Type 15, an extra channel that must not be
+    // ignored but is unknown, fails Unsupported as in libjxl.)
+    Optional
+}
+
+// One extra channel as described by the image header.
+pub struct ExtraChannelInfo {
+    pub kind: ExtraChannelType
+    // Bits per sample; exponent_bits > 0 for floating-point samples.
+    pub bit_depth: u32
+    pub exponent_bits: u32
+    // The channel is coded at 1 / 2^dim_shift of the image size (and
+    // decoded to full size).
+    pub dim_shift: u32
+    // Alpha channels: color is premultiplied by this channel.
+    pub alpha_associated: bool
+    // Spot colors: linear RGB of the ink and its solidity.
+    pub spot_color: [4]f32
+    // CFA channels: the channel index of the color filter array.
+    pub cfa_channel: u32
+    // Byte length of the channel name (UTF-8, see extra_channel_name()).
+    pub name_length: u32
+    // The layout decode_extra_channel() emits: gray, U8 for integer depths
+    // up to 8, U16 up to 16, F32 for float or deeper samples.
+    pub layout: pixels.Layout
+}
+
+// One ExtraChannelInfo as parsed.
+struct EcInfo {
+    kind: u32
+    bits: u32
+    exp_bits: u32
+    dim_shift: u32
+    associated: bool
+    spot: [4]f32
+    cfa: u32
+    name_bit: u64
+    name_length: u32
+}
+
+fn read_ec_info(r: &mut Reader) -> EcInfo!pixels.Error {
+    e := EcInfo { kind: EC_ALPHA, bits: 8, exp_bits: 0, dim_shift: 0, associated: false, spot: [0.0f32; 4], cfa: 1, name_bit: 0, name_length: 0 }
+    if r.bit() {
+        // Default: 8-bit unassociated alpha.
+        return ok(e)
+    }
+    kind := r.enumv()
+    if kind > 6 && kind != EC_NON_OPTIONAL && kind != EC_OPTIONAL {
+        return err(pixels.Error.Malformed)
+    }
+    e.kind = kind
+    depth := read_bit_depth(r)?
+    e.bits = depth >> 8
+    e.exp_bits = depth & 255
+    e.dim_shift = r.u32c(dist(0, 0), dist(3, 0), dist(4, 0), dist(1, 3))
+    // Channels are at most 8 times smaller than the image.
+    if e.dim_shift > 3 {
+        return err(pixels.Error.Malformed)
+    }
+    length := r.u32c(dist(0, 0), dist(0, 4), dist(16, 5), dist(48, 10))
+    e.name_bit = r.position()
+    e.name_length = length
+    r.skip(length as u64 * 8)
+    if kind == EC_ALPHA {
+        e.associated = r.bit()
+    } else if kind == EC_SPOT {
+        for k in 0usize..4 {
+            e.spot[k] = r.f16()
+        }
+    } else if kind == EC_CFA {
+        e.cfa = r.u32c(dist(1, 0), dist(0, 2), dist(3, 4), dist(19, 8))
+    }
+    if kind == EC_NON_OPTIONAL {
+        return err(pixels.Error.Unsupported)
+    }
+    return ok(e)
+}
+
+// Per extra channel words of an Extras table.
+const EX_KIND: usize = 0
+const EX_BITS: usize = 1
+const EX_EXP: usize = 2
+const EX_SHIFT: usize = 3
+const EX_ASSOC: usize = 4
+// The frame's total upsampling of the channel (dim_shift included).
+const EX_UP: usize = 5
+// The frame's blending, then the blending of the patch being applied.
+const EX_MODE: usize = 6
+const EX_ALPHA: usize = 7
+const EX_CLAMP: usize = 8
+const EX_SOURCE: usize = 9
+const EX_PMODE: usize = 10
+const EX_PALPHA: usize = 11
+const EX_PCLAMP: usize = 12
+// Spot color (four f32 bit patterns).
+const EX_SPOT: usize = 13
+const EX_STRIDE: usize = 17
+
+// The extra channel table of one decode: EX_STRIDE words per channel in w,
+// and three per-pixel vectors of 3 + n floats (background, foreground,
+// result) for blending in v. With n == 0 nothing is stored (header walks
+// that only need the frame header summaries).
+struct Extras {
+    w: &mut[u32]
+    v: &mut[f32]
+    n: usize
+
+    fn get(&self, i: usize, field: usize) -> u32 {
+        return self.w[i * EX_STRIDE + field]
+    }
+    fn put(&mut self, i: usize, field: usize, value: u32) {
+        self.w[i * EX_STRIDE + field] = value
+    }
+    fn spot(&self, i: usize, k: usize) -> f32 {
+        return convert.f32_from_bits(self.w[i * EX_STRIDE + EX_SPOT + k])
+    }
+}
+
+// Scratch bytes of the Extras table for `count` channels.
+fn extras_bytes(count: u32) -> usize {
+    n := count as usize
+    return (n * EX_STRIDE + 8) * 4 + 8 + (3 * (3 + n) + 8) * 4 + 8
+}
+
+fn carve_extras(bytes: &mut[u8], count: u32) -> Extras!pixels.Error from(bytes) {
+    n := count as usize
+    let slice.SplitMut { left: words, right: floats } = scratch.split(bytes, (n * EX_STRIDE + 8) * 4 + 8)?
+    ex := Extras { w: scratch.u32s(words), v: scratch.f32s(floats), n: n }
+    if ex.w.len < n * EX_STRIDE || ex.v.len < 3 * (3 + n) {
+        return err(pixels.Error.BufferTooSmall)
+    }
+    return ok(ex)
+}
+
+// Fill the header fields of every extra channel from the codestream.
+fn load_extras(data: &[u8], h: &ImageHeader, ex: &mut Extras) -> void!pixels.Error {
+    r := open(data)?
+    r.seek_bit(h.ec_bit)
+    for i in 0usize..h.num_extra as usize {
+        e := read_ec_info(&mut r)?
+        if i < ex.n {
+            ex.put(i, EX_KIND, e.kind)
+            ex.put(i, EX_BITS, e.bits)
+            ex.put(i, EX_EXP, e.exp_bits)
+            ex.put(i, EX_SHIFT, e.dim_shift)
+            assoc := 0u32
+            if e.associated {
+                assoc = 1
+            }
+            ex.put(i, EX_ASSOC, assoc)
+            ex.put(i, EX_UP, 1u32 << e.dim_shift)
+            for k in 0usize..4 {
+                ex.put(i, EX_SPOT + k, convert.f32_bits(e.spot[k]))
+            }
+        }
+    }
+    if r.overrun {
+        return err(pixels.Error.Truncated)
+    }
+    return ok()
+}
+
+// The native gray layout of an extra channel of `bits` / `exp_bits`.
+fn extra_layout(bits: u32, exp_bits: u32) -> pixels.Layout {
+    sample := pixels.SAMPLE_U8
+    if exp_bits > 0 || bits > 16 {
+        sample = pixels.SAMPLE_F32
+    } else if bits > 8 {
+        sample = pixels.SAMPLE_U16
+    }
+    return pixels.Layout.from_codes(1, sample, false)
+}
+
+fn extra_type(kind: u32) -> ExtraChannelType {
+    if kind == EC_ALPHA {
+        return ExtraChannelType.Alpha
+    }
+    if kind == EC_DEPTH {
+        return ExtraChannelType.Depth
+    }
+    if kind == EC_SPOT {
+        return ExtraChannelType.SpotColor
+    }
+    if kind == EC_SELECTION {
+        return ExtraChannelType.SelectionMask
+    }
+    if kind == EC_BLACK {
+        return ExtraChannelType.Black
+    }
+    if kind == EC_CFA {
+        return ExtraChannelType.Cfa
+    }
+    if kind == EC_THERMAL {
+        return ExtraChannelType.Thermal
+    }
+    return ExtraChannelType.Optional
+}
+
+// Description of extra channel `channel`, parsed at the reader.
+fn find_extra(r: &mut Reader, channel: u32) -> EcInfo!pixels.Error {
+    h := read_extra_headers(r)?
+    if channel >= h.num_extra {
+        return err(pixels.Error.Malformed)
+    }
+    r.seek_bit(h.ec_bit)
+    for i in 0u32..channel {
+        read_ec_info(r)?
+    }
+    e := read_ec_info(r)?
+    if r.overrun {
+        return err(pixels.Error.Truncated)
+    }
+    return ok(e)
+}
+
+// Number of extra channels (alpha included).
+pub fn extra_channel_count(data: &[u8]) -> u32!pixels.Error {
+    r := open(data)?
+    h := read_extra_headers(&mut r)?
+    return ok(h.num_extra)
+}
+
+// Description of extra channel `channel` (0-based, < extra_channel_count).
+pub fn extra_channel_info(data: &[u8], channel: u32) -> ExtraChannelInfo!pixels.Error {
+    r := open(data)?
+    e := find_extra(&mut r, channel)?
+    return ok(ExtraChannelInfo { kind: extra_type(e.kind), bit_depth: e.bits, exponent_bits: e.exp_bits, dim_shift: e.dim_shift, alpha_associated: e.associated, spot_color: [e.spot[0], e.spot[1], e.spot[2], e.spot[3]], cfa_channel: e.cfa, name_length: e.name_length, layout: extra_layout(e.bits, e.exp_bits) })
+}
+
+// The UTF-8 name of extra channel `channel` into `output`; returns its
+// byte length (BufferTooSmall when output is shorter).
+pub fn extra_channel_name(data: &[u8], channel: u32, output: &mut[u8]) -> usize!pixels.Error {
+    r := open(data)?
+    e := find_extra(&mut r, channel)?
+    length := e.name_length as usize
+    if length > output.len {
+        return err(pixels.Error.BufferTooSmall)
+    }
+    r.seek_bit(e.name_bit)
+    for i in 0usize..length {
+        output[i] = (r.bits(8) & 255) as u8
+    }
+    if r.overrun {
+        return err(pixels.Error.Truncated)
+    }
+    return ok(length)
+}
+
+// Decode extra channel `channel` of displayed frame `index` into `output`:
+// a header (info()'s, with the channel's gray layout and depth) then tile
+// rects of the full-size channel (upsampled from its dim_shift as libjxl
+// does), composited across animation frames like the color channels.
+// `buffer` needs scratch_size(data) bytes.
+pub fn decode_extra_channel<S: sink.Sink>(data: &[u8], index: u32, channel: u32, output: &mut S, buffer: &mut[u8]) -> void!pixels.Error {
+    count := extra_channel_count(data)?
+    if channel >= count {
+        return err(pixels.Error.Malformed)
+    }
+    return decode_selected(data, index, channel as usize, output, buffer)
+}

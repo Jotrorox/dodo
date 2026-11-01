@@ -11,16 +11,29 @@ cjxl (libjxl 0.12) in many configurations, decodes each with djxl, and writes:
                     a 64-bit FNV-1a hash of the decoded samples in the
                     decoder's native layout (lossless cases)
 
+  NAME[-K]-ecE_ref.jxl  extra channel E of (displayed frame K of) NAME as
+                    djxl decodes it (float output, stored as lossless 16-bit
+                    gray)
+
 Run from anywhere:  python3 tests/image/jxl/generate.py [OUTDIR]
 Needs cjxl, djxl and ffmpeg (JPEG sources) on PATH; the tests themselves do
-not. The splines, YCbCr and frame window fixtures are written by this
-script (cjxl never emits them) and decoded by djxl like the others (the
-frame_huge and ref_huge cases, too large for djxl, decode like frame_big
-and ref_patches).
+not. Bitstreams cjxl never emits (splines, patches or splines in upsampled
+frames, upsampled LF frames, chroma-subsampled modular and VarDCT frames
+with filters, many and non-alpha extra channels, frames larger than the
+image or starting outside it) are written by this script (see
+codestream.py) and decoded by djxl like the others (the frame_huge and
+ref_huge cases, too large for djxl, decode like frame_big and
+ref_patches). libjxl 0.12 cannot decode chroma-subsampled VarDCT frames
+with adaptive LF smoothing (only libjxl main smooths each channel at its
+size); the reference of that case comes from the djxl named by
+$DJXL_MAIN (a libjxl main build), and the committed reference is kept
+when it is not set.
 """
-import math, os, struct, subprocess, sys, zlib, random, tempfile
+import math, os, shutil, struct, subprocess, sys, zlib, random, tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+import codestream as cs
 OUT = sys.argv[1] if len(sys.argv) > 1 else HERE
 TMP = tempfile.mkdtemp(prefix='jxlgen')
 
@@ -772,9 +785,17 @@ def encode(name, source, args):
         print('warning: %s is %d bytes' % (name, size))
     return jxl
 
-def add(name, source, args, sample, pfm=False):
+def add(name, source, args, sample, pfm=False, float_alpha=False):
     """A lossless case: the decoded native samples must hash to djxl's."""
-    jxl = encode(name, source, args)
+    if source is None:
+        jxl = os.path.join(OUT, name + '.jxl')
+    else:
+        jxl = encode(name, source, args)
+    if float_alpha is not False:
+        # 8-bit samples from djxl's float decode (exact for 8-bit files).
+        w, h, depth, vals = float_frames(jxl, 1, float_alpha)[0]
+        CASES.append((name, '', w, h, depth, sample, 0, 0, fnv(native_bytes(vals, 255, sample))))
+        return
     ref = os.path.join(TMP, name)
     if pfm:
         run(['djxl', jxl, ref + '.pfm', '--quiet'])
@@ -786,7 +807,33 @@ def add(name, source, args, sample, pfm=False):
     w, h, depth, maxval, vals = read_pam(ref + '.pam')
     CASES.append((name, '', w, h, depth, sample, 0, 0, fnv(native_bytes(vals, maxval, sample))))
 
-def add_png(name, source, args, sample, frames=1, srgb=False, jxlref=False):
+def ec_file(base, ec):
+    """djxl's file for extra channel ec (1-based, zero-padded to the digits
+    of the channel count)."""
+    for digits in range(1, 6):
+        path = '%s-ec%0*d.pfm' % (base, digits, ec + 1)
+        if os.path.exists(path):
+            return path
+    raise SystemExit('missing extra channel output %s-ec%d' % (base, ec + 1))
+
+def float_frames(jxl, frames, alpha):
+    """djxl's float decode of each frame as 8-bit samples (rounded), with
+    the alpha extra channel `alpha` (or none): (w, h, depth, values)."""
+    tmp = os.path.join(TMP, os.path.basename(jxl) + '.pfm')
+    run(['djxl', jxl, tmp, '--quiet', '--output_extra_channels'] + (['--output_frames'] if frames > 1 else []))
+    out = []
+    for k in range(frames):
+        base = tmp if frames == 1 else '%s-%d' % (tmp, k)
+        w, h, ch, color = read_pfm(base if frames == 1 else base + '.pfm')
+        planes = [color[c::ch] for c in range(ch)]
+        if alpha is not None:
+            planes.append(read_pfm(ec_file(base, alpha))[3])
+        depth = len(planes)
+        vals = [int(round(min(1.0, max(0.0, planes[c][i])) * 255)) for i in range(w * h) for c in range(depth)]
+        out.append((w, h, depth, vals))
+    return out
+
+def add_png(name, source, args, sample, frames=1, srgb=False, jxlref=False, decoder='djxl', float_alpha=False):
     """A lossy or blended case: each displayed frame is compared with djxl's
     8-bit decode, NAME.png (or NAME-K.png per animation frame). With jxlref
     the reference is stored losslessly as NAME_ref.jxl (NAME-K_ref.jxl),
@@ -797,12 +844,21 @@ def add_png(name, source, args, sample, frames=1, srgb=False, jxlref=False):
         jxl = encode(name, source, args)
     tmp = os.path.join(TMP, name + '.pam')
     extra = ['--color_space=RGB_D65_SRG_Rel_SRG'] if srgb else []
-    run(['djxl', jxl, tmp, '--quiet', '--bits_per_sample=8', '--output_frames'] + extra)
+    if float_alpha is False:
+        run([decoder, jxl, tmp, '--quiet', '--bits_per_sample=8', '--output_frames'] + extra)
+    else:
+        # djxl cannot write PAM with deeper extra channels: its float decode
+        # (alpha from extra channel float_alpha, or None) rounded instead.
+        decoded = float_frames(jxl, frames, float_alpha)
     for k in range(frames):
-        pam = tmp if frames == 1 else tmp + '-%d.pam' % k
-        if frames > 1 and not os.path.exists(pam):
-            raise SystemExit('missing frame %s' % pam)
-        w, h, depth, maxval, vals = read_pam(pam)
+        if float_alpha is False:
+            pam = tmp if frames == 1 else tmp + '-%d.pam' % k
+            if frames > 1 and not os.path.exists(pam):
+                raise SystemExit('missing frame %s' % pam)
+            w, h, depth, maxval, vals = read_pam(pam)
+        else:
+            w, h, depth, vals = decoded[k]
+            maxval = 255
         if depth > 4:
             # Color and the first (alpha) extra channel are output.
             vals = [vals[i * depth + c] for i in range(w * h) for c in range(4)]
@@ -834,6 +890,192 @@ def add_alias(name, other):
     """A case decoding like `other` (too large for djxl to decode)."""
     c = [c for c in CASES if c[0] == other][0]
     CASES.append((name,) + c[1:])
+
+def add_ec(name, ec, sample, frames=1):
+    """Extra channel `ec` of each displayed frame of NAME.jxl against djxl's
+    float decode, stored as a lossless 16-bit gray NAME[-K]-ecE_ref.jxl."""
+    jxl = os.path.join(OUT, name + '.jxl')
+    tmp = os.path.join(TMP, name + '-ec.pfm')
+    run(['djxl', jxl, tmp, '--quiet', '--output_extra_channels'] + (['--output_frames'] if frames > 1 else []))
+    for k in range(frames):
+        base = tmp if frames == 1 else '%s-%d' % (tmp, k)
+        w, h, ch, vals = read_pfm(ec_file(base, ec))
+        ref = '%s-ec%d' % (name, ec) if frames == 1 else '%s-%d-ec%d' % (name, k, ec)
+        levels = [int(round(min(1.0, max(0.0, v)) * 65535)) for v in vals]
+        png = os.path.join(TMP, ref + '_ref.png')
+        open(png, 'wb').write(png_bytes(w, h, 1, 16, lambda x, y, c: levels[y * w + x]))
+        run(['cjxl', png, os.path.join(OUT, ref + '_ref.jxl'), '--quiet', '-d', '0', '-e', '9'])
+        CASES.append((name, ref + '_ref', w, h, 1, sample, 3, k, 0, ec))
+
+def grid(w, h, f):
+    return [[f(x, y) for x in range(w)] for y in range(h)]
+
+def ycbcr_planes(w, h, modes):
+    """Cb, Y, Cr samples at their subsampled sizes (8-bit, centered)."""
+    hs_of, vs_of = [0, 1, 1, 0], [0, 1, 0, 1]
+    maxh = max(hs_of[m] for m in modes)
+    maxv = max(vs_of[m] for m in modes)
+    out = []
+    for c in range(3):
+        cw = cs.ceil_div(w, 1 << (maxh - hs_of[modes[c]]))
+        ch = cs.ceil_div(h, 1 << (maxv - vs_of[modes[c]]))
+        if c == 1:
+            out.append(grid(cw, ch, lambda x, y: int(90 * math.sin(x * 0.4) * math.cos(y * 0.3)) + (x * 3 - y * 2) % 30))
+        else:
+            out.append(grid(cw, ch, lambda x, y, c=c: int(60 * math.sin(x * 0.7 + c + y * 0.5))))
+    return out
+
+def hand_written():
+    """Codestreams cjxl never writes, decoded by djxl for references."""
+    path = lambda name: os.path.join(OUT, name + '.jxl')
+    # Patches and splines in an upsampled frame; the alpha channel shares
+    # the color upsampling, so patches blend it too (before upsampling).
+    w, h = 32, 24
+    ref = [grid(w, h, lambda x, y, c=c: 40 + c * 50 + x * 4 + y * 2) for c in range(3)] + [grid(w, h, lambda x, y: 255 - x * 6)]
+    low = [grid(16, 12, lambda x, y, c=c: 60 + c * 40 + int(30 * math.sin(x * 0.5 + y * 0.3 + c))) for c in range(3)] + [grid(16, 12, lambda x, y: 200)]
+    refs = [(1, 3, 2, 8, 6, [(1, 1, [(1, 0, False), (1, 0, False)]), (8, 6, [(2, 0, False), (2, 0, False)])]),
+            (1, 20, 10, 9, 7, [(4, 2, [(4, 0, True), (4, 0, False)]), (6, 5, [(6, 0, False), (1, 0, False)])])]
+    spl = ([((4, 5), [(8, 3), (2, 6)], [[3, 1], [6, 4, -2], [4, 0, 1], [5, 2]])], 0)
+    cs.write_modular(path('patches_up'), w, h, [
+        dict(channels=ref, ftype=2, save_as=1, save_before_ct=True),
+        dict(channels=low, up=2, ec_up=[2], patches=refs, splines=spl)], ecs=[cs.EC(default=True)])
+    add_png('patches_up', None, [], 0)
+    # Splines in an upsampled XYB frame.
+    spline_set = [((5, 6), [(8, 3), (-2, 4), (1, -5)], [[3, 1], [8, 4, -2], [5, 0, 1], [6, 2]]),
+                  ((25, 4), [(-10, 10), (5, 0)], [[-2], [6, 0, 3], [-4, 2], [4, -1, 1]])]
+    zeros = [grid(32, 32, lambda x, y: 0) for _ in range(3)]
+    cs.write_modular(path('splines_up'), 64, 64, [dict(channels=zeros, up=2, splines=(spline_set, 0))], xyb=True)
+    add_png('splines_up', None, [], 0, jxlref=True)
+    # Modular YCbCr: 4:2:0 with Gaborish, EPF and upsampling; 4:2:2 with
+    # custom Gaborish weights and three EPF steps.
+    cs.write_modular(path('ycbcr420_filters'), 37, 29, [dict(channels=ycbcr_planes(19, 15, [0, 1, 0]), ycbcr=True, jup=(0, 1, 0), up=2, gab=True, epf=2, epf_sigma=0.7)], predictor=0)
+    add_png('ycbcr420_filters', None, [], 0)
+    cs.write_modular(path('ycbcr422_epf'), 33, 21, [dict(channels=ycbcr_planes(33, 21, [0, 2, 0]), ycbcr=True, jup=(0, 2, 0), gab=True, gab_weights=[0.1, 0.05, 0.12, 0.04, 0.08, 0.06], epf=3, epf_sigma=1.3)], predictor=0)
+    add_png('ycbcr422_epf', None, [], 0)
+    # VarDCT YCbCr 4:2:0 with adaptive LF smoothing, chroma from luma,
+    # Gaborish and EPF (libjxl main reference); 4:2:2 upsampled without LF
+    # smoothing. 8x8-sized varblocks only (larger ones are invalid there).
+    small = [0, 0, 0, 1, 2, 3, 12, 13, 14, 15, 16, 17]
+    rng = random.Random(5)
+    wr = cs.Writer()
+    cs.image_header(wr, 64, 48, xyb=False)
+    cs.vardct_frame(wr, [], False, 64, 48, {(x, y): rng.choice(small) for y in range(6) for x in range(8)}, rng,
+                    lf_values=lambda c, x, y: int(40 * math.sin(x * 0.9 + y * 0.7 + c)) + (20 if c == 1 else 0),
+                    cfl=(84, 0.05, 0.2, 10, -20, [[30]], [[-40]]), ycbcr=True, jup=(0, 1, 0), gab=True, epf=1, coeff_range=4, density=0.12)
+    open(path('vd_ycbcr420'), 'wb').write(wr.data())
+    main = os.environ.get('DJXL_MAIN')
+    if main:
+        add_png('vd_ycbcr420', None, [], 0, jxlref=True, decoder=main)
+    else:
+        print('note: DJXL_MAIN not set, keeping the vd_ycbcr420 reference')
+        if os.path.abspath(OUT) != HERE:
+            shutil.copy(os.path.join(HERE, 'vd_ycbcr420_ref.jxl'), OUT)
+        CASES.append(('vd_ycbcr420', 'vd_ycbcr420_ref', 64, 48, 3, 0, 2, 0, 0))
+    wr = cs.Writer()
+    cs.image_header(wr, 70, 50, xyb=False)
+    cs.vardct_frame(wr, [], False, 70, 50, {(x, y): rng.choice(small) for y in range(4) for x in range(6)}, rng,
+                    lf_values=lambda c, x, y: int(30 * math.cos(x * 0.8 + y + c)), ycbcr=True, jup=(0, 2, 0), up=2, epf=2, flags=128, coeff_range=4, density=0.12)
+    open(path('vd_ycbcr422_up'), 'wb').write(wr.data())
+    add_png('vd_ycbcr422_up', None, [], 0, jxlref=True)
+    # An LF frame with 2x upsampling as the LF image of a VarDCT frame.
+    w, h = 64, 48
+    lw, lh = cs.ceil_div(cs.ceil_div(w, 8), 2), cs.ceil_div(cs.ceil_div(h, 8), 2)
+    lf = [grid(lw, lh, lambda x, y: 256 + int(60 * math.sin(x * 0.9 + y * 0.6))),
+          grid(lw, lh, lambda x, y: int(15 * math.cos(x * 0.7 - y * 0.8))),
+          grid(lw, lh, lambda x, y: -150 + int(20 * math.sin(y * 1.1)))]
+    wr = cs.Writer()
+    cs.image_header(wr, w, h, xyb=True)
+    cs.frame_header(wr, [], xyb=True, ftype=1, modular=True, lf_level=1, up=2)
+    sec = cs.Writer()
+    sec.u(1, 1)
+    cs.global_tree(sec)
+    cs.modular_stream(sec, lf)
+    data = sec.data()
+    cs.toc(wr, [len(data)])
+    wr.bits.extend(cs.bits_of(data))
+    rng = random.Random(9)
+    layout = {}
+    for y in range(0, 6, 2):
+        for x in range(0, 8, 2):
+            if (x // 2 + y // 2) % 3 == 0:
+                layout[(x, y)] = 4
+            else:
+                for dy in range(2):
+                    for dx in range(2):
+                        layout[(x + dx, y + dy)] = rng.choice([0, 3, 12])
+    cs.vardct_frame(wr, [], True, w, h, layout, rng, use_lf=True, coeff_range=2, density=0.05)
+    open(path('lf_upsampled'), 'wb').write(wr.data())
+    add_png('lf_upsampled', None, [], 0, jxlref=True)
+    # A modular frame flagged to use an LF frame (which it ignores) after
+    # a modular LF frame, in a file without VarDCT frames.
+    rgb = [grid(16, 12, lambda x, y, c=c: x * 10 + y * 3 + c * 40) for c in range(3)]
+    wr = cs.Writer()
+    cs.image_header(wr, 16, 12, xyb=False)
+    for header, channels in [(dict(ftype=1, lf_level=1), [grid(2, 2, lambda x, y: 50) for _ in range(3)]), (dict(flags=32), rgb)]:
+        cs.frame_header(wr, [], xyb=False, **header)
+        sec = cs.Writer()
+        sec.u(1, 1)
+        cs.global_tree(sec, 5)
+        cs.modular_stream(sec, channels, 5)
+        data = sec.data()
+        cs.toc(wr, [len(data)])
+        wr.bits.extend(cs.bits_of(data))
+    open(path('modular_lf_flag'), 'wb').write(wr.data())
+    add('modular_lf_flag', None, None, 0)
+    # Extra channels of every kind: alpha, a 16-bit depth map at half size,
+    # a spot color (rendered into the color image), a selection mask,
+    # 12-bit thermal, CMYK black, a CFA channel and an optional half-float
+    # channel (F32 output).
+    w, h = 24, 20
+    ecs = [cs.EC(default=True), cs.EC(kind=1, bits=16, dim_shift=1, name=b'depth'),
+           cs.EC(kind=2, name=b'spot', spot=(0.9, 0.1, 0.2, 0.8)), cs.EC(kind=3, bits=1, name=b'selection'),
+           cs.EC(kind=6, bits=12, name=b'thermal'), cs.EC(kind=4, name=b'black'), cs.EC(kind=5, cfa=2),
+           cs.EC(kind=16, bits=16, exp_bits=5, name=b'half')]
+    def half(v):
+        return struct.unpack('<H', struct.pack('<e', v))[0]
+    chans = [grid(w, h, lambda x, y, c=c: (x * 9 + y * 5 + c * 70) % 256) for c in range(3)]
+    chans += [grid(w, h, lambda x, y: x * 11), grid(12, 10, lambda x, y: x * 5000 + y * 1000),
+              grid(w, h, lambda x, y: 255 if (x // 6 + y // 5) % 2 else 40), grid(w, h, lambda x, y: 1 if x > y else 0),
+              grid(w, h, lambda x, y: x * 150 + y * 20), grid(w, h, lambda x, y: x * 10 + y * 2),
+              grid(w, h, lambda x, y: x * 7 + y * 3), grid(w, h, lambda x, y: half(x / 23.0 * (y / 19.0)))]
+    cs.write_modular(path('extra_channels'), w, h, [dict(channels=chans)], ecs=ecs)
+    add_png('extra_channels', None, [], 0, float_alpha=0)
+    for ec, sample in [(0, 0), (1, 1), (2, 0), (3, 0), (4, 1), (5, 0), (6, 0), (7, 3)]:
+        add_ec('extra_channels', ec, sample)
+    # Extra channels composited across animation frames (a cropped frame
+    # blends alpha over and adds depth).
+    w, h = 20, 16
+    ecs = [cs.EC(default=True), cs.EC(kind=1, bits=16, name=b'z')]
+    f1 = [grid(w, h, lambda x, y, c=c: (x * 9 + c * 60) % 256) for c in range(3)] + [grid(w, h, lambda x, y: 255), grid(w, h, lambda x, y: x * 3000)]
+    f2 = [grid(8, 6, lambda x, y, c=c: (y * 30 + c * 50) % 256) for c in range(3)] + [grid(8, 6, lambda x, y: 128 + x * 10), grid(8, 6, lambda x, y: 4000 + y * 1000)]
+    cs.write_modular(path('ec_anim'), w, h, [
+        dict(channels=f1, duration=1, is_last=False),
+        dict(channels=f2, crop=(5, 4, 8, 6), image_size=(w, h), blend=(2, 0, False, 0), ec_blend=[(2, 0, False, 0), (1, 0, False, 0)], duration=1)],
+        ecs=ecs, animated=True)
+    add_png('ec_anim', None, [], 0, frames=2, float_alpha=0)
+    add_ec('ec_anim', 1, 1, frames=2)
+    # Many extra channels: 100 of mixed kinds and depths, some at half size.
+    w, h = 5, 4
+    ecs = []
+    chans = [grid(w, h, lambda x, y, c=c: (x * 40 + y * 20 + c * 80) % 256) for c in range(3)]
+    for i in range(100):
+        kind = [1, 6, 3, 16][i % 4]
+        bits = [8, 10, 16, 1][i % 4]
+        shift = 1 if i % 7 == 3 else 0
+        ecs.append(cs.EC(kind=kind, bits=bits, dim_shift=shift))
+        cw, ch = cs.ceil_div(w, 1 << shift), cs.ceil_div(h, 1 << shift)
+        chans.append(grid(cw, ch, lambda x, y, i=i, bits=bits: ((x * 3 + y + i) * ((1 << bits) - 1)) // (4 * 3 + 4 + 100)))
+    cs.write_modular(path('many_ec'), w, h, [dict(channels=chans)], ecs=ecs)
+    add_png('many_ec', None, [], 0, float_alpha=None)
+    for ec, sample in [(2, 1), (3, 0), (98, 1), (99, 0)]:
+        add_ec('many_ec', ec, sample)
+    # The format's maximum of 4096 extra channels (all 8-bit alpha).
+    w, h = 1, 1
+    chans = [grid(w, h, lambda x, y, c=c: 100 + c * 20) for c in range(3)]
+    chans += [grid(w, h, lambda x, y, i=i: (i * 5) % 7) for i in range(4096)]
+    cs.write_modular(path('max_ec'), w, h, [dict(channels=chans)], ecs=[cs.EC(default=True)] * 4096)
+    add('max_ec', None, None, 0, float_alpha=0)
+    add_ec('max_ec', 4095, 0)
 
 def make_icc(big=False):
     """A small RGB matrix/TRC ICC v2 profile with unusual primaries and a
@@ -1024,6 +1266,7 @@ def main():
     add_alias('ref_huge', 'ref_patches')
     vardct_window_jxl(os.path.join(OUT, 'vd_window.jxl'), (160, 120), (1400, 1100), (40, 30), 2)
     add_png('vd_window', None, [], 0, jxlref=True)
+    hand_written()
 
     # Metadata and color.
     w, h = 23, 17
@@ -1052,7 +1295,8 @@ def main():
         f.write('// reference PNG name (compare cases), then width, height, channels, native\n')
         f.write('// sample code, kind (0: FNV-1a hash of the native samples, 1: compare with\n')
         f.write('// the PNG, 2: compare with the lossless reference NAME.jxl), displayed\n')
-        f.write('// frame index; and the hash for kind 0.\n\n')
+        f.write('// frame index, extra channel (kind 3: compare extra channel E with the\n')
+        f.write('// 16-bit reference NAME.jxl); and the hash for kind 0.\n\n')
         f.write('const CASE_COUNT: usize = %d\n\n' % len(CASES))
         f.write('static CASE_FILES: [CASE_COUNT]&str = [\n')
         for c in CASES:
@@ -1062,9 +1306,10 @@ def main():
         for c in CASES:
             f.write('    "%s",\n' % c[1])
         f.write(']\n\n')
-        f.write('static CASE_SHAPES: [%d]u32 = [\n' % (len(CASES) * 6))
+        f.write('static CASE_SHAPES: [%d]u32 = [\n' % (len(CASES) * 7))
         for c in CASES:
-            f.write('    %d, %d, %d, %d, %d, %d,\n' % (c[2], c[3], c[4], c[5], c[6], c[7]))
+            ec = c[9] if len(c) > 9 else 0
+            f.write('    %d, %d, %d, %d, %d, %d, %d,\n' % (c[2], c[3], c[4], c[5], c[6], c[7], ec))
         f.write(']\n\n')
         f.write('static CASE_HASHES: [CASE_COUNT]u64 = [\n')
         for c in CASES:

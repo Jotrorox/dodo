@@ -59,7 +59,7 @@ codec packages (see [below](#stdgraphicsimage)).
 | QOI | RGB and RGBA, sRGB or linear | RGB, or RGBA when the source has alpha |
 | BMP | 1, 4 and 8-bit palettes, RLE8 and RLE4; 16, 24 and 32-bit with or without bit-field masks; bottom-up or top-down; OS/2 core, V4 and V5 headers with sRGB or an embedded ICC profile | 24-bit, or 32-bit with a V5 header and alpha mask when the source has alpha |
 | PNG | Every color type and bit depth, `PLTE`, `tRNS`, Adam7, `cICP`, `iCCP`, `sRGB`, `gAMA`, `cHRM`, `cLLi`, `eXIf`, XMP in `iTXt`; APNG animation | Gray, gray+alpha, RGB or RGBA at 8 or 16 bits, or indexed; stored or deflate levels 1 to 9; any filter; Adam7; `sRGB`, `eXIf`, `iCCP` |
-| JPEG XL (`Format.Jxl`) | Bare codestreams and the ISOBMFF container (`jxlc`, split `jxlp`, `Exif`, `xml `, Brotli-compressed `brob` boxes decoded by `meta.decode`); lossless and lossy modular, VarDCT with every block type, progressive passes and LF frames, recompressed JPEG (4:4:4, 4:2:2, 4:2:0, gray), patches, splines, noise, Gaborish and EPF, upsampling, animation with blending and reference frames, up to 64 extra channels; output U8, U16 or F32 by bit depth, XYB converted to the file's color encoding; embedded ICC profiles via `image.icc` | Lossless modular at efforts 1 to 3: 8 and 16-bit integer or exact 16/32-bit float samples, gray, RGB, alpha; bare codestream or container with `Exif`/`xml ` boxes |
+| JPEG XL (`Format.Jxl`) | Bare codestreams and the ISOBMFF container (`jxlc`, split `jxlp`, `Exif`, `xml `, Brotli-compressed `brob` boxes decoded by `meta.decode`); lossless and lossy modular, VarDCT with every block type, progressive passes and LF frames, recompressed JPEG (4:4:4, 4:2:2, 4:2:0, gray), patches, splines, noise, Gaborish and EPF, upsampling, animation with blending and reference frames, up to 4096 extra channels (each decodable on its own, spot colors rendered); output U8, U16 or F32 by bit depth, XYB converted to the file's color encoding; embedded ICC profiles via `image.icc` | Lossless modular at efforts 1 to 3: 8 and 16-bit integer or exact 16/32-bit float samples, gray, RGB, alpha; bare codestream or container with `Exif`/`xml ` boxes |
 
 ASCII Netpbm (P1 to P3), P4 bitmaps, and BMP JPEG/PNG compression fail with
 `Unsupported`.
@@ -218,6 +218,49 @@ The codec options:
 | `std/image/jxl/encode` | `effort` (1 to 3; higher values behave like 3), `container` (ISOBMFF boxes instead of a bare codestream), `color` (a `ColorInfo` written as the JPEG XL color encoding), `orientation`. `encode_with_metadata` adds `Exif` and `xml ` boxes. |
 | `std/image/png` | `level` (0 stored, 1 to 9 deflate), `filter` (`FILTER_NONE` to `FILTER_PAETH`, or `FILTER_ADAPTIVE`), `interlace` (Adam7), `palette` (an indexed PNG of 1 to 8 bits with `tRNS` when an 8-bit source has at most 256 RGBA colors), `srgb_chunk`. |
 
+`std/image/jxl` adds `frame_info` and `decode_frame` for animations, `icc`
+for the embedded profile, and the extra channel API below.
+
+### JPEG XL extra channels
+
+A JPEG XL image can carry up to 4096 extra channels: alpha, depth maps,
+spot colors, selection masks, CMYK black, CFA, thermal or optional data.
+`decode` and `decode_frame` output the color channels and the first alpha
+channel; the others are read one at a time:
+
+```dodo
+pub fn extra_channel_count(data: &[u8]) -> u32!pixels.Error
+pub fn extra_channel_info(data: &[u8], channel: u32) -> ExtraChannelInfo!pixels.Error
+pub fn extra_channel_name(data: &[u8], channel: u32, output: &mut[u8]) -> usize!pixels.Error
+pub fn decode_extra_channel<S: sink.Sink>(data: &[u8], index: u32, channel: u32, output: &mut S, scratch: &mut[u8]) -> void!pixels.Error
+```
+
+`ExtraChannelInfo` has the `kind` (`ExtraChannelType.Alpha`, `Depth`,
+`SpotColor`, `SelectionMask`, `Black`, `Cfa`, `Thermal` or `Optional`),
+`bit_depth` and `exponent_bits` (float samples), `dim_shift` (the channel is
+coded at 1/2^dim_shift of the image size), `alpha_associated`, `spot_color`
+(RGB and solidity), `cfa_channel`, `name_length` and the `layout`
+`decode_extra_channel` emits: gray, U8 for depths up to 8 bits, U16 up to
+16, F32 for float or deeper samples. `decode_extra_channel` takes the same
+scratch as `decode_frame` (`scratch_size`) and delivers displayed frame
+`index` of the channel at full image size, upsampled from its `dim_shift`
+and composited across animation frames like the color channels, as libjxl
+does. Spot colors are also rendered into the color output, as `djxl` does
+by default. CMYK images are not converted: the color channels hold C, M
+and Y as stored (with the CMYK profile from `icc`) and K is the `Black`
+extra channel, as libjxl's decoder returns them without a color management
+system.
+
+```dodo
+count := jxl.extra_channel_count(&data)?
+for channel in 0u32..count {
+    info := jxl.extra_channel_info(&data, channel)?
+    if info.kind == jxl.ExtraChannelType.Depth {
+        jxl.decode_extra_channel(&data, 0, channel, &mut depth_sink, scratch)?
+    }
+}
+```
+
 `std/image/png` adds `frame_info`, `frame_scratch_size` and `decode_frame` for
 APNG, `encode_with_metadata` for `eXIf` and `iCCP` chunks, and
 `encode_with_buffers` to pass the deflate encoder's buffer and workspace
@@ -366,12 +409,11 @@ a usage error, and 3 when `compare` finds the images differ.
 ## Limits
 
 Decoders deliver the default image of an animation through `decode`; APNG
-and JPEG XL have frames (`decode_frame`). The JPEG XL decoder rejects with
-`Unsupported` patches or splines in upsampled frames, subsampled (YCbCr)
-frames combined with upsampling, filters, adaptive LF smoothing or blocks
-larger than 8x8, and more than 64 extra channels; extra channels other than
-the first alpha are decoded but not output. Lossy JPEG XL matches libjxl's
-`djxl` within one 8-bit level. The JPEG XL encoder is lossless only and
+and JPEG XL have frames (`decode_frame`). Lossy JPEG XL matches libjxl's
+`djxl` within one 8-bit level. Chroma-subsampled VarDCT frames with
+adaptive LF smoothing follow current libjxl, which smooths each channel at
+its own size (`djxl` 0.12 cannot decode them); subsampled frames with
+varblocks larger than 8x8 are invalid and fail `Malformed`, as in libjxl. The JPEG XL encoder is lossless only and
 uses prefix codes (no ANS); it does not embed ICC profiles. JPEG XL scratch
 follows the image header, not the frame sizes a file claims: each frame is
 decoded over the part that can reach the output, so with W' = width + 1100,

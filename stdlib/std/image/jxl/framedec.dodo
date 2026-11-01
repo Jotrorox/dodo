@@ -84,7 +84,7 @@ fn read_noise(r: &mut Reader, f: &FrameHeader, vals: &mut FrameVals) {
 // Allocate the frame's channels and describe them in gch. Only the part
 // inside the frame's sample window (f.win_sw x f.win_sh, see window.dodo)
 // is stored.
-fn setup_channels(h: &ImageHeader, f: &FrameHeader, work: &mut ModularWork, gch: &mut ChanList, gtr: &mut TrList, gstash: &mut ChanList) -> void!pixels.Error {
+fn setup_channels(h: &ImageHeader, f: &FrameHeader, work: &mut ModularWork, gch: &mut ChanList, gtr: &mut TrList, gstash: &mut ChanList, ex: &Extras) -> void!pixels.Error {
     work.arena_used = 0
     gch.reset()
     gtr.count = 0
@@ -114,7 +114,7 @@ fn setup_channels(h: &ImageHeader, f: &FrameHeader, work: &mut ModularWork, gch:
         }
     }
     for i in 0usize..h.num_extra as usize {
-        shift := ec_shift(f, i)
+        shift := ec_shift(f, ex, i)
         ew := ceil_shift(w as u64, shift)
         eh := ceil_shift(hh as u64, shift)
         sew := stored_extent(ew, sw, shift)
@@ -308,15 +308,19 @@ fn decode_group(r: &mut Reader, h: &ImageHeader, f: &FrameHeader, work: &mut Mod
 }
 
 // Decode all sections of a frame into the arena.
-fn decode_frame_data(r: &mut Reader, h: &ImageHeader, f: &FrameHeader, work: &mut ModularWork, gcode: &mut Code, lcode: &mut Code, tcode: &mut Code, n1: &mut Code, n2: &mut Code, window: &mut[u32], gch: &mut ChanList, lch: &mut ChanList, gstash: &mut ChanList, lstash: &mut ChanList, gtr: &mut TrList, ltr: &mut TrList, toc: &[u32], vals: &mut FrameVals, vb: &mut VBufs, planes: &mut[f32], t: &mut[f32], hcode: &mut Code) -> void!pixels.Error {
+fn decode_frame_data(r: &mut Reader, h: &ImageHeader, f: &FrameHeader, work: &mut ModularWork, gcode: &mut Code, lcode: &mut Code, tcode: &mut Code, n1: &mut Code, n2: &mut Code, window: &mut[u32], gch: &mut ChanList, lch: &mut ChanList, gstash: &mut ChanList, lstash: &mut ChanList, gtr: &mut TrList, ltr: &mut TrList, toc: &[u32], vals: &mut FrameVals, vb: &mut VBufs, planes: &mut[f32], t: &mut[f32], hcode: &mut Code, ex: &Extras) -> void!pixels.Error {
     if !f.modular {
-        return decode_vardct_frame(r, h, f, work, gcode, lcode, tcode, n1, n2, window, gch, lch, gstash, lstash, gtr, ltr, toc, vals, vb, planes, t, hcode)
+        return decode_vardct_frame(r, h, f, work, gcode, lcode, tcode, n1, n2, window, gch, lch, gstash, lstash, gtr, ltr, toc, vals, vb, planes, t, hcode, ex)
     }
-    // Only VarDCT frames take their LF from an LF frame.
+    // Only VarDCT frames take their LF from an LF frame; modular frames
+    // ignore it, but (as in libjxl) one must have been decoded.
     if (f.flags & FLAG_USE_LF_FRAME) != 0 {
-        return err(pixels.Error.Unsupported)
+        level := f.lf_level as usize
+        if level >= 3 || !vb.lfslot_valid[level] {
+            return err(pixels.Error.Malformed)
+        }
     }
-    setup_channels(h, f, work, gch, gtr, gstash)?
+    setup_channels(h, f, work, gch, gtr, gstash, ex)?
     // LfGlobal.
     enter_section(r, f, toc, 0)?
     vals.patches_bit = r.position()

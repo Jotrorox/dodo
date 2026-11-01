@@ -43,13 +43,16 @@ struct Scan {
     lf_slot: [3]u64
     any_noise: bool
     any_splines: bool
-    // Gray modular frames with restoration filters: samples of their color
-    // channel (two more copies are needed).
+    // Upsampled frames with patches or splines: coded color samples.
+    low_pixels: u64
+    // Gray modular frames with restoration filters and subsampled modular
+    // YCbCr frames: samples of one color channel (two full-size copies are
+    // needed).
     gray_filtered: u64
 }
 
 fn new_scan() -> Scan {
-    return Scan { frames: 0, displayed: 0, max_samples: 0, max_temp: 0, max_frame_pixels: 0, max_sample_width: 0, max_sample_height: 0, max_frame_width: 0, max_frame_height: 0, max_toc: 1, max_group_dim: 128, max_tree_global: 0, slots: 0, slot_pixels: [0u64; 4], float_path: false, any_vardct: false, needs_canvas: false, progressive: false, max_channels: 1, vd_planes: 0, vd_blocks: 0, vd_tiles: 0, vd_groups: 0, lf_slot: [0u64; 3], any_noise: false, any_splines: false, gray_filtered: 0 }
+    return Scan { frames: 0, displayed: 0, max_samples: 0, max_temp: 0, max_frame_pixels: 0, max_sample_width: 0, max_sample_height: 0, max_frame_width: 0, max_frame_height: 0, max_toc: 1, max_group_dim: 128, max_tree_global: 0, slots: 0, slot_pixels: [0u64; 4], float_path: false, any_vardct: false, needs_canvas: false, progressive: false, max_channels: 1, vd_planes: 0, vd_blocks: 0, vd_tiles: 0, vd_groups: 0, lf_slot: [0u64; 3], any_noise: false, any_splines: false, low_pixels: 0, gray_filtered: 0 }
 }
 
 // Samples of one frame's stored modular channels (color and extra
@@ -59,9 +62,8 @@ fn frame_samples(h: &ImageHeader, f: &FrameHeader, w: u64, hh: u64) -> u64 {
     if f.modular {
         total = f.color_channels as u64 * w * hh
     }
-    for i in 0usize..h.num_extra as usize {
-        shift := ec_shift(f, i)
-        total += ceil_shift(w, shift) * ceil_shift(hh, shift)
+    for shift in 0u32..4 {
+        total += f.ec_shift_count[shift as usize] as u64 * ceil_shift(w, shift) * ceil_shift(hh, shift)
     }
     return total
 }
@@ -79,9 +81,9 @@ fn log2_exact(v: u32) -> u32 {
 }
 
 // The shift of extra channel i relative to the color samples.
-fn ec_shift(f: &FrameHeader, i: usize) -> u32 {
+fn ec_shift(f: &FrameHeader, ex: &Extras, i: usize) -> u32 {
     up := log2_exact(f.upsampling)
-    ec := log2_exact(f.ec_upsampling[i])
+    ec := log2_exact(ex.get(i, EX_UP))
     if ec < up {
         return 0
     }
@@ -103,12 +105,8 @@ fn direct_frame(h: &ImageHeader, f: &FrameHeader) -> bool {
     if !f.replaces_all(h.num_extra) || f.width != h.width || f.height != h.height {
         return false
     }
-    for i in 0usize..h.num_extra as usize {
-        if f.ec_upsampling[i] != 1 {
-            return false
-        }
-    }
-    return true
+    // With upsampling 1, every extra channel must have shift 0 too.
+    return f.ec_same_size(h.num_extra)
 }
 
 // Skip the TOC at the reader (like read_toc without storing it), a
@@ -231,14 +229,22 @@ fn walk_frames(data: &[u8], r: &mut Reader, h: &ImageHeader, s: &mut Scan, sk: &
         if (f.flags & FLAG_SPLINES) != 0 {
             s.any_splines = true
         }
-        if f.color_channels == 1 && (f.gab || f.epf_iters > 0) {
+        if f.upsampling > 1 && (f.flags & (FLAG_PATCHES | FLAG_SPLINES)) != 0 {
+            // Coded-size planes over the sample window.
+            low := sw * sh
+            if low > s.low_pixels {
+                s.low_pixels = low
+            }
+        }
+        if (f.color_channels == 1 && (f.gab || f.epf_iters > 0)) || (f.modular && f.ycbcr && chroma_subsampled(&f)) {
             gray := sw * sh
             if gray > s.gray_filtered {
                 s.gray_filtered = gray
             }
         }
         if f.frame_type == FT_LF && f.lf_level >= 1 && f.lf_level <= 3 {
-            size := 3 * f.sample_width as u64 * f.sample_height as u64
+            shift := 3 * f.lf_level
+            size := 3 * ceil_shift(f.width as u64, shift) * ceil_shift(f.height as u64, shift)
             if size > s.lf_slot[(f.lf_level - 1) as usize] {
                 s.lf_slot[(f.lf_level - 1) as usize] = size
             }

@@ -151,6 +151,16 @@ fn read_vardct_globals(r: &mut Reader, vb: &mut VBufs, n1: &mut Code, n2: &mut C
     return ok()
 }
 
+fn clamp_i8(v: i32) -> i32 {
+    if v < -128 {
+        return -128
+    }
+    if v > 127 {
+        return 127
+    }
+    return v
+}
+
 // Allocate a w x h channel at the arena top and append it to `ch`.
 fn push_temp_channel(work: &mut ModularWork, ch: &mut ChanList, w: usize, h: usize) -> void!pixels.Error {
     off := work.alloc(w as u64 * h as u64)?
@@ -314,8 +324,9 @@ fn vardct_lf_group(r: &mut Reader, h: &ImageHeader, f: &FrameHeader, work: &mut 
                 break
             }
             t := (ty0 + y) * vb.tw + tx0 + x
-            vb.cfl[t] = work.arena[lch.offset(0) + y * lch.stride(0) + x]
-            vb.cfl[tiles + t] = work.arena[lch.offset(1) + y * lch.stride(1) + x]
+            // Chroma-from-luma factors are int8 (libjxl clamps them).
+            vb.cfl[t] = clamp_i8(work.arena[lch.offset(0) + y * lch.stride(0) + x])
+            vb.cfl[tiles + t] = clamp_i8(work.arena[lch.offset(1) + y * lch.stride(1) + x])
         }
     }
     gd8 := gd / 8
@@ -345,16 +356,25 @@ fn vardct_lf_group(r: &mut Reader, h: &ImageHeader, f: &FrameHeader, work: &mut 
                 return err(pixels.Error.Malformed)
             }
             ds_raw := work.arena[info_off + data]
+            // The quantization multiplier is clamped to 1..256 like libjxl.
             hf_mul := work.arena[info_off + info_stride + data] as i64 + 1
+            if hf_mul < 1 {
+                hf_mul = 1
+            }
+            if hf_mul > 256 {
+                hf_mul = 256
+            }
             data += 1
-            if ds_raw < 0 || ds_raw >= NUM_DCT_SELECT as i32 || hf_mul <= 0 || hf_mul > 2147483647 {
+            if ds_raw < 0 || ds_raw >= NUM_DCT_SELECT as i32 {
                 return err(pixels.Error.Malformed)
             }
             ds := ds_raw as u32
             w8 := DS_W8[ds as usize] as usize
             h8 := DS_H8[ds as usize] as usize
+            // Chroma-subsampled frames only allow 8x8 varblocks (libjxl
+            // rejects larger ones as incompatible with the subsampling).
             if vb.subsampled && w8 * h8 > 1 {
-                return err(pixels.Error.Unsupported)
+                return err(pixels.Error.Malformed)
             }
             if x + w8 > lbw || y + h8 > lbh || (x % gd8) + w8 > gd8 || (y % gd8) + h8 > gd8 {
                 return err(pixels.Error.Malformed)
@@ -751,17 +771,21 @@ fn decode_hf_group(r: &mut Reader, f: &FrameHeader, vb: &mut VBufs, coeffs: &mut
     return ok()
 }
 
-// Chroma-from-luma on the LF image, then adaptive LF smoothing (with the
-// planes as scratch).
+// Chroma-from-luma on the LF image (not for chroma-subsampled frames, as
+// libjxl), then adaptive LF smoothing (with the planes as scratch): over
+// the three channels together, or for subsampled frames each channel alone
+// at its own size.
 fn finish_lf(f: &FrameHeader, vb: &mut VBufs, vals: &FrameVals, scratch: &mut[f32]) {
     plane := vb.bw * vb.bh
-    scale := 1.0f32 / vb.colour_factor as f32
-    kx := vb.base_x + vb.x_factor_lf as f32 * scale
-    kb := vb.base_b + vb.b_factor_lf as f32 * scale
-    for i in 0usize..plane {
-        y := vb.lf[plane + i]
-        vb.lf[i] += kx * y
-        vb.lf[2 * plane + i] += kb * y
+    if !vb.subsampled {
+        scale := 1.0f32 / vb.colour_factor as f32
+        kx := vb.base_x + vb.x_factor_lf as f32 * scale
+        kb := vb.base_b + vb.b_factor_lf as f32 * scale
+        for i in 0usize..plane {
+            y := vb.lf[plane + i]
+            vb.lf[i] += kx * y
+            vb.lf[2 * plane + i] += kb * y
+        }
     }
     if (f.flags & FLAG_SKIP_LF_SMOOTHING) != 0 || vb.bw <= 2 || vb.bh <= 2 {
         return
@@ -775,6 +799,39 @@ fn finish_lf(f: &FrameHeader, vb: &mut VBufs, vals: &FrameVals, scratch: &mut[f3
         lfm[c] = narrow64(vals.m_lf[c] as f64 * inv)
     }
     w := vb.bw
+    if vb.subsampled {
+        for c in 0usize..3 {
+            cw := vb.bw >> vb.hs[c]
+            chh := vb.bh >> vb.vs[c]
+            if cw <= 2 || chh <= 2 {
+                continue
+            }
+            for y in 1usize..chh - 1 {
+                for x in 1usize..cw - 1 {
+                    o := c * plane + y * w + x
+                    me := scratch[o]
+                    ud := scratch[o - w] + scratch[o + w]
+                    side := scratch[o - 1] + scratch[o + 1] + ud
+                    diag := (scratch[o - w - 1] + scratch[o + w - 1]) + (scratch[o - w + 1] + scratch[o + w + 1])
+                    v := me * 0.052262735 + side * 0.2034514 + diag * 0.03348292
+                    g := v - me
+                    if g < 0.0 {
+                        g = -g
+                    }
+                    gap := g / lfm[c]
+                    if gap < 0.5 {
+                        gap = 0.5
+                    }
+                    s := 3.0f32 - 4.0 * gap
+                    if s < 0.0 {
+                        s = 0.0
+                    }
+                    vb.lf[o] = (v - me) * s + me
+                }
+            }
+        }
+        return
+    }
     for y in 1usize..vb.bh - 1 {
         for x in 1usize..w - 1 {
             gap := 0.5f32
@@ -851,8 +908,10 @@ fn dequant_channel(q: &mut[i32], h: &ImageHeader, f: &FrameHeader, vb: &VBufs, b
     }
 }
 
-// Chroma from luma on the dequantized varblock at block (bx, by), per
-// 64x64 tile.
+// Chroma from luma on the dequantized varblock at block (bx, by) with the
+// factors of the 64x64 tile holding its first block (as libjxl): X and B
+// coefficients gain a multiple of the Y coefficient at the same position.
+// Chroma-subsampled channels hold their (8x8) blocks at (bx >> hs, by >> vs).
 fn cfl_block(q: &mut[i32], vb: &VBufs, bx: usize, by: usize, ds: u32) {
     bw8 := DS_W8[ds as usize] as usize * 8
     bh8 := DS_H8[ds as usize] as usize * 8
@@ -860,18 +919,33 @@ fn cfl_block(q: &mut[i32], vb: &VBufs, bx: usize, by: usize, ds: u32) {
     plane := vb.rw * vb.rh
     scale := 1.0f32 / vb.colour_factor as f32
     tiles := vb.tw * vb.th
-    for y in 0usize..bh8 {
-        py := by * 8 + y
-        trow := (py / 64) * vb.tw
-        for x in 0usize..bw8 {
-            px := bx * 8 + x
-            t := trow + px / 64
-            kx := vb.base_x + vb.cfl[t] as f32 * scale
-            kb := vb.base_b + vb.cfl[tiles + t] as f32 * scale
-            o := py * rw + px
-            yv := i32_float(q[plane + o])
-            q[o] = float_bits_i32(kx * yv + i32_float(q[o]))
-            q[2 * plane + o] = float_bits_i32(kb * yv + i32_float(q[2 * plane + o]))
+    t := (by / 8) * vb.tw + bx / 8
+    kx := vb.base_x + vb.cfl[t] as f32 * scale
+    kb := vb.base_b + vb.cfl[tiles + t] as f32 * scale
+    k := [kx, 0.0, kb]
+    // Y coefficients of blocks where Y is not coded (subsampled) are zero.
+    ysx := bx >> vb.hs[1]
+    ysy := by >> vb.vs[1]
+    if (ysx << vb.hs[1]) != bx || (ysy << vb.vs[1]) != by {
+        return
+    }
+    yo := ysy * 8 * rw + ysx * 8
+    for c in 0usize..3 {
+        if c == 1 {
+            continue
+        }
+        sx := bx >> vb.hs[c]
+        sy := by >> vb.vs[c]
+        if (sx << vb.hs[c]) != bx || (sy << vb.vs[c]) != by {
+            continue
+        }
+        co := c * plane + sy * 8 * rw + sx * 8
+        for y in 0usize..bh8 {
+            for x in 0usize..bw8 {
+                yv := i32_float(q[plane + yo + y * rw + x])
+                at := co + y * rw + x
+                q[at] = float_bits_i32(k[c] * yv + i32_float(q[at]))
+            }
         }
     }
 }
@@ -901,9 +975,7 @@ fn reconstruct(h: &ImageHeader, f: &FrameHeader, vb: &VBufs, planes: &mut[f32], 
                 }
                 dequant_channel(as_i32(planes), h, f, vb, b, ds, c, c * plane + sy * 8 * rw + sx * 8)
             }
-            if !vb.subsampled {
-                cfl_block(as_i32(planes), vb, bx, by, ds)
-            }
+            cfl_block(as_i32(planes), vb, bx, by, ds)
             special := DS_SPECIAL[ds as usize]
             lw := 5 - floor_log2(w8 as u64)
             lh := 5 - floor_log2(h8 as u64)
@@ -990,8 +1062,8 @@ fn upsample_chroma(f: &FrameHeader, vb: &VBufs, planes: &mut[f32]) {
 
 // Decode a VarDCT frame: XYB (or YCbCr) samples into `planes` (3 planes of
 // vb.rw x vb.rh), extra channels into the arena as the modular path does.
-fn decode_vardct_frame(r: &mut Reader, h: &ImageHeader, f: &FrameHeader, work: &mut ModularWork, gcode: &mut Code, lcode: &mut Code, tcode: &mut Code, n1: &mut Code, n2: &mut Code, window: &mut[u32], gch: &mut ChanList, lch: &mut ChanList, gstash: &mut ChanList, lstash: &mut ChanList, gtr: &mut TrList, ltr: &mut TrList, toc: &[u32], vals: &mut FrameVals, vb: &mut VBufs, planes: &mut[f32], t: &mut[f32], hcode: &mut Code) -> void!pixels.Error {
-    setup_channels(h, f, work, gch, gtr, gstash)?
+fn decode_vardct_frame(r: &mut Reader, h: &ImageHeader, f: &FrameHeader, work: &mut ModularWork, gcode: &mut Code, lcode: &mut Code, tcode: &mut Code, n1: &mut Code, n2: &mut Code, window: &mut[u32], gch: &mut ChanList, lch: &mut ChanList, gstash: &mut ChanList, lstash: &mut ChanList, gtr: &mut TrList, ltr: &mut TrList, toc: &[u32], vals: &mut FrameVals, vb: &mut VBufs, planes: &mut[f32], t: &mut[f32], hcode: &mut Code, ex: &Extras) -> void!pixels.Error {
+    setup_channels(h, f, work, gch, gtr, gstash, ex)?
     vb.subsampled = chroma_subsampled(f)
     for c in 0usize..3 {
         vb.hs[c] = chroma_shift(f, c, false) as usize
@@ -1065,6 +1137,9 @@ fn decode_vardct_frame(r: &mut Reader, h: &ImageHeader, f: &FrameHeader, work: &
         if level >= 3 || !vb.lfslot_valid[level] || vb.lfslot_w[level] != vb.rbw || vb.lfslot_h[level] != vb.rbh {
             return err(pixels.Error.Malformed)
         }
+        if 3 * blocks > vb.lfslot_cap[level] {
+            return err(pixels.Error.TooLarge)
+        }
         base := vb.lfslot_off[level]
         rplane := vb.rbw * vb.rbh
         for c in 0usize..3 {
@@ -1088,13 +1163,7 @@ fn decode_vardct_frame(r: &mut Reader, h: &ImageHeader, f: &FrameHeader, work: &
         leave_section(r, f)?
     }
     if !use_lf {
-        if vb.subsampled {
-            if (f.flags & FLAG_SKIP_LF_SMOOTHING) == 0 {
-                return err(pixels.Error.Unsupported)
-            }
-        } else {
-            finish_lf(f, vb, vals, planes)
-        }
+        finish_lf(f, vb, vals, planes)
     }
     // HfGlobal: dequantization matrices and HF presets; each pass reads
     // its HfPass right before its groups.
@@ -1139,8 +1208,19 @@ fn decode_vardct_frame(r: &mut Reader, h: &ImageHeader, f: &FrameHeader, work: &
 }
 
 // Keep an LF frame's XYB planes (frame planes 0 to 2) for later frames.
+// Files without VarDCT frames have no storage for them (nothing reads the
+// samples then; the slot is only marked as decoded).
 fn store_lf_slot(vb: &mut VBufs, level: usize, frame: &[f32], w: usize, h: usize) -> void!pixels.Error {
-    if level >= 3 || 3 * w * h > vb.lfslot_cap[level] {
+    if level >= 3 {
+        return err(pixels.Error.TooLarge)
+    }
+    if vb.lfslot_cap[level] == 0 {
+        vb.lfslot_w[level] = w
+        vb.lfslot_h[level] = h
+        vb.lfslot_valid[level] = true
+        return ok()
+    }
+    if 3 * w * h > vb.lfslot_cap[level] {
         return err(pixels.Error.TooLarge)
     }
     base := vb.lfslot_off[level]

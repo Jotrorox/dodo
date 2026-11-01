@@ -26,7 +26,8 @@ const TR_STRIDE: usize = 8
 const TR_RCT: i32 = 0
 const TR_PALETTE: i32 = 1
 const TR_SQUEEZE: i32 = 2
-// Limits on header-driven counts.
+// Limits on header-driven counts (channel lists hold at least
+// MAX_CHANNELS entries; plan() sizes them from the headers).
 const MAX_CHANNELS: usize = 4096
 const MAX_TRANSFORMS: usize = 2048
 const MAX_REFS: usize = 32
@@ -122,7 +123,7 @@ struct ChanList {
     }
     // Open an empty slot at `at`.
     fn insert(&mut self, at: usize) -> void!pixels.Error {
-        if (self.count + 1) * CH_STRIDE > self.d.len || self.count + 1 > MAX_CHANNELS {
+        if (self.count + 1) * CH_STRIDE > self.d.len {
             return err(pixels.Error.TooLarge)
         }
         i := self.count
