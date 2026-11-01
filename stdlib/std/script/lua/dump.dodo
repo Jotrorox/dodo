@@ -1,0 +1,149 @@
+package lua
+
+import "core/mem"
+import "core/ptr"
+
+// Writing binary chunks (string.dump / Cx.dump), in the Lua 5.4 format so
+// the output loads in the reference implementation.
+
+fn dp_size(b: &mut SBuf, x0: u64) -> void!Throw {
+    unsafe {
+        buf := [0u8; 10]
+        n := 0usize
+        x := x0
+        for {
+            n += 1
+            buf[10 - n] = (x & 0x7f) as u8
+            x = x >> 7
+            if x == 0 {
+                break
+            }
+        }
+        buf[9] = buf[9] | 0x80
+        return b.add_raw(ptr.offset(ptr.as_ptr(&buf), (10 - n) as isize), n)
+    }
+}
+
+fn dp_int(b: &mut SBuf, x: i32) -> void!Throw {
+    unsafe {
+        return dp_size(b, x as u64)
+    }
+}
+
+fn dp_integer(b: &mut SBuf, x: i64) -> void!Throw {
+    unsafe {
+        v := x
+        return b.add_raw(ptr.from_mut(&mut v) as *const u8, 8)
+    }
+}
+
+fn dp_number(b: &mut SBuf, x: f64) -> void!Throw {
+    unsafe {
+        v := x
+        return b.add_raw(ptr.from_mut(&mut v) as *const u8, 8)
+    }
+}
+
+fn dp_string(b: &mut SBuf, s: *mut LString) -> void!Throw {
+    unsafe {
+        if ptr.is_null(s) {
+            return dp_size(b, 0)
+        }
+        dp_size(b, ((*s).length as u64) + 1)?
+        return b.add_raw(str_data(s) as *const u8, (*s).length)
+    }
+}
+
+fn dp_function(b: &mut SBuf, f: *mut Proto, psource: *mut LString, strip: bool) -> void!Throw {
+    unsafe {
+        if strip || (*f).source == psource {
+            dp_string(b, 0 as *mut LString)?
+        } else {
+            dp_string(b, (*f).source)?
+        }
+        dp_int(b, (*f).linedefined)?
+        dp_int(b, (*f).lastlinedefined)?
+        b.add_char((*f).numparams)?
+        b.add_char((*f).is_vararg)?
+        b.add_char((*f).maxstacksize)?
+        dp_int(b, (*f).sizecode)?
+        b.add_raw((*f).code as *const u8, ((*f).sizecode as usize) * 4)?
+        dp_int(b, (*f).sizek)?
+        for i in 0i32..(*f).sizek {
+            let o = ptr.offset((*f).k, i as isize)
+            let t = (*o).tag
+            if t == TAG_FLOAT {
+                b.add_char(0x13)?
+                dp_number(b, val_float(o))?
+            } else if t == TAG_INT {
+                b.add_char(0x03)?
+                dp_integer(b, val_int(o))?
+            } else if t == TAG_SHORTSTR {
+                b.add_char(0x04)?
+                dp_string(b, val_str(o))?
+            } else if t == TAG_LONGSTR {
+                b.add_char(0x14)?
+                dp_string(b, val_str(o))?
+            } else if t == TAG_TRUE {
+                b.add_char(0x11)?
+            } else if t == TAG_FALSE {
+                b.add_char(0x01)?
+            } else {
+                b.add_char(0x00)?
+            }
+        }
+        dp_int(b, (*f).sizeupvalues)?
+        for i in 0i32..(*f).sizeupvalues {
+            let u = ptr.offset((*f).upvalues, i as isize)
+            b.add_char((*u).instack)?
+            b.add_char((*u).index)?
+            b.add_char((*u).kind)?
+        }
+        dp_int(b, (*f).sizep)?
+        for i in 0i32..(*f).sizep {
+            dp_function(b, *ptr.offset((*f).p, i as isize), (*f).source, strip)?
+        }
+        // Debug information.
+        let nli = if strip { 0i32 } else { (*f).sizelineinfo }
+        dp_int(b, nli)?
+        b.add_raw((*f).lineinfo as *const u8, nli as usize)?
+        let nabs = if strip { 0i32 } else { (*f).sizeabslineinfo }
+        dp_int(b, nabs)?
+        for i in 0i32..nabs {
+            let a = ptr.offset((*f).abslineinfo, i as isize)
+            dp_int(b, (*a).pc)?
+            dp_int(b, (*a).line)?
+        }
+        let nloc = if strip { 0i32 } else { (*f).sizelocvars }
+        dp_int(b, nloc)?
+        for i in 0i32..nloc {
+            let v = ptr.offset((*f).locvars, i as isize)
+            dp_string(b, (*v).name)?
+            dp_int(b, (*v).startpc)?
+            dp_int(b, (*v).endpc)?
+        }
+        let nupn = if strip { 0i32 } else { (*f).sizeupvalues }
+        dp_int(b, nupn)?
+        for i in 0i32..nupn {
+            dp_string(b, (*ptr.offset((*f).upvalues, i as isize)).name)?
+        }
+        return ok()
+    }
+}
+
+// Append the binary chunk of prototype `f` to `b`.
+fn dump_function(L: *mut State, f: *mut Proto, strip: bool, b: &mut SBuf) -> void!Throw {
+    unsafe {
+        b.add_bytes(b"\x1bLua")?
+        b.add_char(0x54)?
+        b.add_char(0)?
+        b.add_bytes(b"\x19\x93\r\n\x1a\n")?
+        b.add_char(4)?
+        b.add_char(8)?
+        b.add_char(8)?
+        dp_integer(b, 0x5678)?
+        dp_number(b, 370.5)?
+        b.add_char((*f).sizeupvalues as u8)?
+        return dp_function(b, f, 0 as *mut LString, strip)
+    }
+}

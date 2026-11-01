@@ -3,15 +3,299 @@ package lua
 import "core/mem"
 import "core/ptr"
 
-// Prototypes, closures and upvalues. (Skeleton: the runtime agent owns this
-// file; proto_new keeps its signature.)
+// Prototypes, closures, upvalues and full userdata.
+
+// Upvalue: while open it points at a stack slot of its thread; when closed
+// it owns the value.
+struct UpVal {
+    next: *mut GCObject
+    tag: u8
+    marked: u8
+    v: *mut Value
+    value: Value
+    // Open upvalues: list of the thread, highest level first.
+    open_next: *mut UpVal
+    open_prev: *mut *mut UpVal
+}
+
+// Lua closure; `nupvalues` UpVal pointers follow the record.
+struct LClosure {
+    next: *mut GCObject
+    tag: u8
+    marked: u8
+    nupvalues: u8
+    gclist: *mut GCObject
+    p: *mut Proto
+}
+
+// Native closure; `nupvalues` Values follow the record.
+struct NClosure {
+    next: *mut GCObject
+    tag: u8
+    marked: u8
+    nupvalues: u8
+    gclist: *mut GCObject
+    f: NativeFn
+}
+
+// Full userdata: `nuvalue` user values follow the record, then the block of
+// `size` bytes (16-byte aligned).
+struct Udata {
+    next: *mut GCObject
+    tag: u8
+    marked: u8
+    nuvalue: u16
+    size: usize
+    metatable: *mut Table
+    gclist: *mut GCObject
+}
+
+fn upval_value(uv: *mut UpVal) -> *mut Value {
+    unsafe {
+        unsafe { return ptr.offset(uv as *mut u8, mem.offset_of::<UpVal>("value") as isize) as *mut Value }
+    }
+}
+fn upval_is_open(uv: *mut UpVal) -> bool {
+    unsafe {
+        unsafe { return (*uv).v != upval_value(uv) }
+    }
+}
+
+fn lcl_upvals(cl: *mut LClosure) -> *mut *mut UpVal {
+    unsafe {
+        unsafe { return ptr.offset(cl as *mut u8, mem.size_of::<LClosure>() as isize) as *mut *mut UpVal }
+    }
+}
+fn lcl_upval(cl: *mut LClosure, i: isize) -> *mut UpVal {
+    unsafe {
+        unsafe { return *ptr.offset(lcl_upvals(cl), i) }
+    }
+}
+fn ncl_upvalues(cl: *mut NClosure) -> *mut Value {
+    unsafe {
+        unsafe { return ptr.offset(cl as *mut u8, mem.size_of::<NClosure>() as isize) as *mut Value }
+    }
+}
+fn lcl_size(n: u8) -> usize {
+    unsafe {
+        return mem.size_of::<LClosure>() + (n as usize) * 8
+    }
+}
+fn ncl_size(n: u8) -> usize {
+    unsafe {
+        return mem.size_of::<NClosure>() + (n as usize) * 16
+    }
+}
+
+fn udata_header_size(nuv: u16) -> usize {
+    unsafe {
+        let raw = mem.size_of::<Udata>() + (nuv as usize) * 16
+        return (raw + 15) & ~15usize
+    }
+}
+fn udata_mem_size(nuv: u16, size: usize) -> usize {
+    unsafe {
+        return udata_header_size(nuv) + size
+    }
+}
+fn udata_uv(u: *mut Udata, i: isize) -> *mut Value {
+    unsafe {
+        unsafe { return ptr.offset(ptr.offset(u as *mut u8, mem.size_of::<Udata>() as isize) as *mut Value, i) }
+    }
+}
+fn udata_data(u: *mut Udata) -> *mut u8 {
+    unsafe {
+        unsafe { return ptr.offset(u as *mut u8, udata_header_size((*u).nuvalue) as isize) }
+    }
+}
 
 // A new prototype with every count zero and every array null.
 fn proto_new(L: *mut State) -> (*mut Proto)!Throw {
     unsafe {
-        let p = mem_alloc(L, mem.size_of::<Proto>())? as *mut Proto
+        let p = gc_new(L, mem.size_of::<Proto>(), TAG_PROTO)? as *mut Proto
+        let keep_next = (*p).next
+        let keep_marked = (*p).marked
         ptr.write_bytes(p as *mut u8, 0u8, mem.size_of::<Proto>())
+        (*p).next = keep_next
+        (*p).marked = keep_marked
         (*p).tag = TAG_PROTO
         return ok(p)
+    }
+}
+
+fn proto_free(L: *mut State, p: *mut Proto) {
+    unsafe {
+        mem_free(L, (*p).code as *mut u8, ((*p).sizecode as usize) * 4)
+        mem_free(L, (*p).p as *mut u8, ((*p).sizep as usize) * 8)
+        mem_free(L, (*p).k as *mut u8, ((*p).sizek as usize) * 16)
+        mem_free(L, (*p).lineinfo as *mut u8, (*p).sizelineinfo as usize)
+        mem_free(L, (*p).abslineinfo as *mut u8, ((*p).sizeabslineinfo as usize) * mem.size_of::<AbsLineInfo>())
+        mem_free(L, (*p).locvars as *mut u8, ((*p).sizelocvars as usize) * mem.size_of::<LocVar>())
+        mem_free(L, (*p).upvalues as *mut u8, ((*p).sizeupvalues as usize) * mem.size_of::<UpvalDesc>())
+        mem_free(L, p as *mut u8, mem.size_of::<Proto>())
+    }
+}
+
+fn proto_mem_size(p: *mut Proto) -> usize {
+    unsafe {
+        return mem.size_of::<Proto>() + ((*p).sizecode as usize) * 4 + ((*p).sizep as usize) * 8 + ((*p).sizek as usize) * 16 + ((*p).sizelineinfo as usize) + ((*p).sizeabslineinfo as usize) * mem.size_of::<AbsLineInfo>() + ((*p).sizelocvars as usize) * mem.size_of::<LocVar>() + ((*p).sizeupvalues as usize) * mem.size_of::<UpvalDesc>()
+    }
+}
+
+fn lclosure_new(L: *mut State, nup: u8) -> (*mut LClosure)!Throw {
+    unsafe {
+        let cl = gc_new(L, lcl_size(nup), TAG_LCLOSURE)? as *mut LClosure
+        (*cl).nupvalues = nup
+        (*cl).gclist = 0 as *mut GCObject
+        (*cl).p = 0 as *mut Proto
+        for i in 0isize..(nup as isize) {
+            *ptr.offset(lcl_upvals(cl), i) = 0 as *mut UpVal
+        }
+        return ok(cl)
+    }
+}
+
+fn nclosure_new(L: *mut State, f: NativeFn, nup: u8) -> (*mut NClosure)!Throw {
+    unsafe {
+        let cl = gc_new(L, ncl_size(nup), TAG_NCLOSURE)? as *mut NClosure
+        (*cl).nupvalues = nup
+        (*cl).gclist = 0 as *mut GCObject
+        (*cl).f = f
+        for i in 0isize..(nup as isize) {
+            (*ptr.offset(ncl_upvalues(cl), i)).tag = TAG_NIL
+        }
+        return ok(cl)
+    }
+}
+
+fn udata_new(L: *mut State, size: usize, nuv: u16) -> (*mut Udata)!Throw {
+    unsafe {
+        let u = gc_new(L, udata_mem_size(nuv, size), TAG_USERDATA)? as *mut Udata
+        (*u).nuvalue = nuv
+        (*u).size = size
+        (*u).metatable = 0 as *mut Table
+        (*u).gclist = 0 as *mut GCObject
+        for i in 0isize..(nuv as isize) {
+            (*udata_uv(u, i)).tag = TAG_NIL
+        }
+        return ok(u)
+    }
+}
+
+fn upval_new_closed(L: *mut State) -> (*mut UpVal)!Throw {
+    unsafe {
+        let uv = gc_new(L, mem.size_of::<UpVal>(), TAG_UPVAL)? as *mut UpVal
+        (*uv).v = upval_value(uv)
+        (*upval_value(uv)).tag = TAG_NIL
+        (*uv).open_next = 0 as *mut UpVal
+        (*uv).open_prev = 0 as *mut *mut UpVal
+        return ok(uv)
+    }
+}
+
+// Give every upvalue slot of a closure a fresh closed upvalue (nil).
+fn lclosure_init_upvals(L: *mut State, cl: *mut LClosure) -> void!Throw {
+    unsafe {
+        for i in 0isize..((*cl).nupvalues as isize) {
+            let uv = upval_new_closed(L)?
+            *ptr.offset(lcl_upvals(cl), i) = uv
+            gc_barrier_obj(L, cl as *mut GCObject, uv as *mut GCObject)
+        }
+        return ok()
+    }
+}
+
+// The open upvalue for stack slot `level`, created if needed.
+fn func_find_upval(L: *mut State, level: *mut Value) -> (*mut UpVal)!Throw {
+    unsafe {
+        pp := ptr.offset(L as *mut u8, mem.offset_of::<State>("openupval") as isize) as *mut *mut UpVal
+        for !ptr.is_null(*pp) && (*(*pp)).v as usize >= level as usize {
+            let p = *pp
+            if (*p).v == level {
+                return ok(p)
+            }
+            pp = ptr.offset(p as *mut u8, mem.offset_of::<UpVal>("open_next") as isize) as *mut *mut UpVal
+        }
+        let uv = gc_new(L, mem.size_of::<UpVal>(), TAG_UPVAL)? as *mut UpVal
+        (*uv).v = level
+        (*uv).open_next = *pp
+        (*uv).open_prev = pp
+        if !ptr.is_null(*pp) {
+            (*(*pp)).open_prev = ptr.offset(uv as *mut u8, mem.offset_of::<UpVal>("open_next") as isize) as *mut *mut UpVal
+        }
+        *pp = uv
+        // Register the thread in the list of threads with open upvalues.
+        if (*L).twups == L {
+            let g = G(L)
+            (*L).twups = (*g).twups
+            (*g).twups = L
+        }
+        return ok(uv)
+    }
+}
+
+fn upval_unlink(uv: *mut UpVal) {
+    unsafe {
+        *(*uv).open_prev = (*uv).open_next
+        if !ptr.is_null((*uv).open_next) {
+            (*(*uv).open_next).open_prev = (*uv).open_prev
+        }
+    }
+}
+
+// Close every open upvalue at or above `level`.
+fn func_close_upvals(L: *mut State, level: *mut Value) {
+    unsafe {
+        for !ptr.is_null((*L).openupval) && (*(*L).openupval).v as usize >= level as usize {
+            let uv = (*L).openupval
+            upval_unlink(uv)
+            let slot = upval_value(uv)
+            set_obj(slot, (*uv).v)
+            (*uv).v = slot
+            gc_barrier_upval_close(L, uv)
+        }
+    }
+}
+
+// Create the closure for prototype `p` in slot `ra`, capturing upvalues from
+// the enclosing closure `encl` and the frame whose registers start at `base`.
+fn func_push_closure(L: *mut State, p: *mut Proto, encl: *mut LClosure, base: *mut Value, ra: *mut Value) -> void!Throw {
+    unsafe {
+        let nup = (*p).sizeupvalues
+        let cl = lclosure_new(L, nup as u8)?
+        (*cl).p = p
+        set_gc(ra, cl as *mut GCObject, TAG_LCLOSURE)
+        for i in 0i32..nup {
+            let desc = ptr.offset((*p).upvalues, i as isize)
+            uv := 0 as *mut UpVal
+            if (*desc).instack != 0 {
+                uv = func_find_upval(L, ptr.offset(base, (*desc).index as isize))?
+            } else {
+                uv = lcl_upval(encl, (*desc).index as isize)
+            }
+            *ptr.offset(lcl_upvals(cl), i as isize) = uv
+            gc_barrier_obj(L, cl as *mut GCObject, uv as *mut GCObject)
+        }
+        return ok()
+    }
+}
+
+// Name of the n-th (1-based) active local variable at instruction `pc`.
+fn func_local_name(p: *mut Proto, n0: i32, pc: i32) -> *mut LString {
+    unsafe {
+        n := n0
+        for i in 0i32..(*p).sizelocvars {
+            let lv = ptr.offset((*p).locvars, i as isize)
+            if (*lv).startpc > pc {
+                break
+            }
+            if pc < (*lv).endpc {
+                n -= 1
+                if n == 0 {
+                    return (*lv).name
+                }
+            }
+        }
+        return 0 as *mut LString
     }
 }

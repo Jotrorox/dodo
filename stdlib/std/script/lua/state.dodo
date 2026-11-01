@@ -1,11 +1,158 @@
 package lua
 
-// Thread (coroutine) and global state. (Skeleton: the runtime agent owns this
-// file and extends these records freely.)
+import "core/mem"
+import "core/ptr"
 
+// Threads (coroutines), call frames and the global state shared by all the
+// threads of one Lua universe.
+//
+// Stack discipline: `State.stack` is one contiguous block of Values. Pointers
+// into it (`top`, `CallInfo.func`, `CallInfo.top`, open upvalues) are fixed up
+// whenever the block moves (see `stack_realloc`), so any code that holds a raw
+// `*mut Value` into the stack across an operation that can grow the stack (a
+// call, a metamethod, an allocation of stack space) must reload it from an
+// offset afterwards.
+
+// Thread status values (also the public status codes, see api.dodo).
+const ST_OK: u8 = 0
+const ST_YIELD: u8 = 1
+const ST_ERRRUN: u8 = 2
+const ST_ERRSYNTAX: u8 = 3
+const ST_ERRMEM: u8 = 4
+const ST_ERRERR: u8 = 5
+
+// Largest number of stack slots a thread may use.
+const MAX_STACK: isize = 1000000
+// Extra slots granted after a stack overflow so the error can be handled.
+const ERROR_STACK_SIZE: isize = 1000200
+// Slots kept free above `stack_last` for metamethod calls and the like.
+const EXTRA_STACK: isize = 5
+// Slots guaranteed to a native function on entry.
+const MIN_STACK: isize = 20
+const BASIC_STACK_SIZE: isize = 40
+// Nesting limit of native (Dodo-level) calls: metamethods, pcall, resume...
+const MAX_CCALLS: u32 = 200
+
+// CallInfo.callstatus bits.
+const CIST_NATIVE: u32 = 1
+// The frame is the entry frame of a vm_execute activation.
+const CIST_FRESH: u32 = 2
+// The frame is running a debug hook.
+const CIST_HOOKED: u32 = 4
+// A yieldable protected call (pcall_k) is active in this native frame.
+const CIST_YPCALL: u32 = 8
+// The frame was entered through a tail call.
+const CIST_TAIL: u32 = 16
+// The last hook call yielded.
+const CIST_HOOKYIELD: u32 = 32
+// The frame runs a finalizer.
+const CIST_FIN: u32 = 64
+// `ftransfer`/`ntransfer` are valid (call/return hooks).
+const CIST_TRAN: u32 = 128
+// The frame is closing to-be-closed variables while returning.
+const CIST_CLSRET: u32 = 256
+// The native frame has a continuation function.
+const CIST_HASK: u32 = 512
+// The frame is a native frame whose continuation must get `recover_status`.
+const CIST_RECST: u32 = 1024
+
+// Continuation of a native function that called or yielded with a
+// continuation (see Cx.call_k / Cx.pcall_k / Cx.yield_k).
+pub type ContinuationFn = fn(&mut Cx, i32, isize) -> i32!Throw
+
+// A call frame. Frames form a doubly linked list that is reused: `next`
+// frames past the current one are free records kept for later calls.
+struct CallInfo {
+    // Function slot; its arguments and locals follow.
+    func: *mut Value
+    // Highest slot this frame may use (exclusive).
+    top: *mut Value
+    previous: *mut CallInfo
+    next: *mut CallInfo
+    // Lua frames: next instruction to execute (saved when leaving the VM loop).
+    savedpc: *mut u32
+    // Native frames: continuation, its context and pcall bookkeeping.
+    k: ContinuationFn
+    ctx: isize
+    old_errfunc: isize
+    funcidx: isize
+    // Number of results the caller wants (-1: all).
+    nresults: i32
+    callstatus: u32
+    // Lua vararg frames: number of extra arguments below `func`.
+    nextraargs: i32
+    // Native frames: number of values yielded.
+    nyield: i32
+    // Values being returned while closing to-be-closed variables.
+    nres: i32
+    recover_status: i32
+    // Transfer information for call/return hooks.
+    ftransfer: i32
+    ntransfer: i32
+    old_allowhook: u8
+}
+
+// Debug hook installed with Cx.set_hook.
+pub type HookFn = fn(&mut Cx, &mut Debug) -> void!Throw
+
+// Warning function installed with Lua.set_warn_fn: receives one piece of a
+// (possibly multi-part) message and whether more pieces follow.
+pub type WarnFn = fn(&mut Cx, &[u8], bool)
+
+// Mutable state shared by every thread of a Lua universe.
 struct Global {
-    // Allocated bytes, for collectgarbage("count").
-    total_bytes: usize
+    // Bytes currently allocated through mem.dodo.
+    total_bytes: isize
+    // Allocation debt: the collector does work when it becomes positive.
+    gc_debt: isize
+    // Estimate of live bytes after the last cycle.
+    gc_estimate: isize
+    // Short-string intern table.
+    strt_hash: *mut *mut LString
+    strt_size: i32
+    strt_nuse: i32
+    seed: u32
+    registry: Value
+    // Set to a nil value once the state is completely built.
+    nilvalue: Value
+    // Collector state (see gc.dodo).
+    currentwhite: u8
+    gcstate: u8
+    gckind: u8
+    gcstp: u8
+    gcemergency: u8
+    gc_running_fin: u8
+    gcpause: i32
+    gcstepmul: i32
+    gcstepsize: i32
+    gen_minormul: i32
+    gen_majormul: i32
+    sweepgc: *mut *mut GCObject
+    allgc: *mut GCObject
+    finobj: *mut GCObject
+    gray: *mut GCObject
+    grayagain: *mut GCObject
+    weak: *mut GCObject
+    ephemeron: *mut GCObject
+    allweak: *mut GCObject
+    tobefnz: *mut GCObject
+    fixedgc: *mut GCObject
+    // Head of `allgc` at the last collector check point (see gc.dodo).
+    young_mark: *mut GCObject
+    // Threads with open upvalues.
+    twups: *mut State
+    mainthread: *mut State
+    memerrmsg: *mut LString
+    // Metamethod event names, TM_N entries.
+    tmname: *mut *mut LString
+    // Metatables of the basic types (indexed by TYPE_*), 9 entries.
+    mt: *mut *mut Table
+    // Warning system.
+    warn_mode: u8
+    has_warnf: bool
+    warnf: WarnFn
+    // Value returned for absent table keys.
+    absentkey: Value
 }
 
 // A Lua thread. `*mut State` is the `L` parameter of every internal function.
@@ -13,7 +160,674 @@ struct State {
     next: *mut GCObject
     tag: u8
     marked: u8
+    status: u8
+    allowhook: u8
+    hookmask: u8
+    // First free slot.
+    top: *mut Value
     global: *mut Global
+    // Current frame.
+    ci: *mut CallInfo
+    // End of the usable stack (EXTRA_STACK slots follow).
+    stack_last: *mut Value
+    stack: *mut Value
+    // Allocated stack size in slots (including EXTRA_STACK).
+    stack_size: isize
+    // Open upvalues, highest stack level first.
+    openupval: *mut UpVal
+    // To-be-closed variables: stack offsets, innermost last.
+    tbc: *mut isize
+    tbc_count: isize
+    tbc_cap: isize
+    gclist: *mut GCObject
+    // Next thread in the list of threads with open upvalues.
+    twups: *mut State
     // Error object of the error being propagated (see DESIGN.md "Errors").
     errobj: Value
+    // First frame (the thread's bottom pseudo-frame).
+    base_ci: CallInfo
+    // Number of allocated CallInfo records besides base_ci.
+    nci: isize
+    // Debug hook.
+    has_hook: bool
+    hook: HookFn
+    basehookcount: i32
+    hookcount: i32
+    // Last pc traced by the line hook.
+    oldpc: i32
+    // Stack offset of the current message handler (0: none).
+    errfunc: isize
+    // Nesting of native (Dodo-level) calls.
+    n_ccalls: u32
+    // Nesting of non-yieldable calls.
+    nny: u32
+}
+
+// Main thread and global state allocated together.
+struct MainBlock {
+    l: State
+    g: Global
+}
+
+// --- Field addresses --------------------------------------------------------
+
+fn G(L: *mut State) -> *mut Global {
+    unsafe {
+        unsafe { return (*L).global }
+    }
+}
+fn L_errobj(L: *mut State) -> *mut Value {
+    unsafe {
+        unsafe { return ptr.offset(L as *mut u8, mem.offset_of::<State>("errobj") as isize) as *mut Value }
+    }
+}
+fn L_base_ci(L: *mut State) -> *mut CallInfo {
+    unsafe {
+        unsafe { return ptr.offset(L as *mut u8, mem.offset_of::<State>("base_ci") as isize) as *mut CallInfo }
+    }
+}
+fn G_registry(g: *mut Global) -> *mut Value {
+    unsafe {
+        unsafe { return ptr.offset(g as *mut u8, mem.offset_of::<Global>("registry") as isize) as *mut Value }
+    }
+}
+fn G_nilvalue(g: *mut Global) -> *mut Value {
+    unsafe {
+        unsafe { return ptr.offset(g as *mut u8, mem.offset_of::<Global>("nilvalue") as isize) as *mut Value }
+    }
+}
+fn G_absent(g: *mut Global) -> *mut Value {
+    unsafe {
+        unsafe { return ptr.offset(g as *mut u8, mem.offset_of::<Global>("absentkey") as isize) as *mut Value }
+    }
+}
+fn G_tmname(g: *mut Global, event: u32) -> *mut LString {
+    unsafe {
+        unsafe { return *ptr.offset((*g).tmname, event as isize) }
+    }
+}
+fn G_mt(g: *mut Global, t: u8) -> *mut Table {
+    unsafe {
+        unsafe { return *ptr.offset((*g).mt, t as isize) }
+    }
+}
+fn G_set_mt(g: *mut Global, t: u8, mt: *mut Table) {
+    unsafe {
+        unsafe { *ptr.offset((*g).mt, t as isize) = mt }
+    }
+}
+// The state is completely built (registry and preallocated objects exist).
+fn G_complete(g: *mut Global) -> bool {
+    unsafe {
+        unsafe { return (*g).nilvalue.tag == TAG_NIL }
+    }
+}
+
+// --- Stack pointer arithmetic -----------------------------------------------
+
+// p + n Values.
+fn sv(p: *mut Value, n: isize) -> *mut Value {
+    unsafe {
+        unsafe { return ptr.offset(p, n) }
+    }
+}
+// a - b, in Values.
+fn sdiff(a: *mut Value, b: *mut Value) -> isize {
+    unsafe {
+        unsafe { return ((a as isize) - (b as isize)) >> 4 }
+    }
+}
+// Stack offset of a slot (stable across reallocation).
+fn save_stack(L: *mut State, p: *mut Value) -> isize {
+    unsafe {
+        unsafe { return sdiff(p, (*L).stack) }
+    }
+}
+fn restore_stack(L: *mut State, off: isize) -> *mut Value {
+    unsafe {
+        unsafe { return ptr.offset((*L).stack, off) }
+    }
+}
+fn L_push_value(L: *mut State, v: *mut Value) {
+    unsafe {
+        set_obj((*L).top, v)
+        (*L).top = ptr.offset((*L).top, 1)
+    }
+}
+fn L_push_nil(L: *mut State) {
+    unsafe {
+        (*(*L).top).tag = TAG_NIL
+        (*L).top = ptr.offset((*L).top, 1)
+    }
+}
+
+// --- Stack management -------------------------------------------------------
+
+fn stack_relocate(p: *mut Value, oldstack: *mut Value, newstack: *mut Value) -> *mut Value {
+    unsafe {
+        unsafe { return ptr.offset(newstack, sdiff(p, oldstack)) }
+    }
+}
+
+// Move the stack to a block of `newsize` slots (EXTRA_STACK included) and
+// fix every pointer into it.
+fn stack_realloc(L: *mut State, newsize: isize) -> void!Throw {
+    unsafe {
+        let oldsize = (*L).stack_size
+        let oldstack = (*L).stack
+        let newstack = mem_alloc(L, (newsize as usize) * 16)? as *mut Value
+        let keep = if oldsize < newsize { oldsize } else { newsize }
+        ptr.copy_nonoverlapping(oldstack, newstack, keep as usize)
+        for i in keep..newsize {
+            (*ptr.offset(newstack, i)).tag = TAG_NIL
+        }
+        (*L).top = stack_relocate((*L).top, oldstack, newstack)
+        ci := (*L).ci
+        for !ptr.is_null(ci) {
+            (*ci).top = stack_relocate((*ci).top, oldstack, newstack)
+            (*ci).func = stack_relocate((*ci).func, oldstack, newstack)
+            ci = (*ci).previous
+        }
+        uv := (*L).openupval
+        for !ptr.is_null(uv) {
+            (*uv).v = stack_relocate((*uv).v, oldstack, newstack)
+            uv = (*uv).open_next
+        }
+        (*L).stack = newstack
+        (*L).stack_size = newsize
+        (*L).stack_last = ptr.offset(newstack, newsize - EXTRA_STACK)
+        mem_free(L, oldstack as *mut u8, (oldsize as usize) * 16)
+        return ok()
+    }
+}
+
+fn stack_in_use_size(L: *mut State) -> isize {
+    unsafe {
+        unsafe { return (*L).stack_size - EXTRA_STACK }
+    }
+}
+
+// Grow the stack so that `n` more slots are available above top. Raises
+// "stack overflow" when the thread exceeds MAX_STACK.
+fn stack_grow(L: *mut State, n: isize) -> void!Throw {
+    unsafe {
+        let size = stack_in_use_size(L)
+        if size > MAX_STACK {
+            // Already using the error reserve: an error while handling a
+            // stack overflow.
+            return err(err_set_handler_error(L))
+        }
+        let needed = sdiff((*L).top, (*L).stack) + n
+        if n < MAX_STACK && needed <= MAX_STACK {
+            newsize := size * 2
+            if newsize > MAX_STACK {
+                newsize = MAX_STACK
+            }
+            if newsize < needed {
+                newsize = needed
+            }
+            stack_realloc(L, newsize + EXTRA_STACK)?
+            return ok()
+        }
+        stack_realloc(L, ERROR_STACK_SIZE + EXTRA_STACK)?
+        return err(err_runtime(L, "stack overflow"))
+    }
+}
+
+// Ensure `n` free slots above top.
+fn stack_check(L: *mut State, n: isize) -> void!Throw {
+    unsafe {
+        unsafe {
+            if sdiff((*L).stack_last, (*L).top) <= n {
+                return stack_grow(L, n)
+            }
+        }
+        return ok()
+    }
+}
+
+// Shrink an oversized stack (called by the collector and after errors).
+fn stack_shrink(L: *mut State) {
+    unsafe {
+        // Highest slot in use by any frame.
+        lim := (*L).top
+        ci := (*L).ci
+        for !ptr.is_null(ci) {
+            if (*ci).top as usize > lim as usize {
+                lim = (*ci).top
+            }
+            ci = (*ci).previous
+        }
+        let inuse = sdiff(lim, (*L).stack) + 1
+        nsize := inuse * 2
+        if nsize < MIN_STACK * 2 {
+            nsize = MIN_STACK * 2
+        }
+        if inuse <= MAX_STACK && stack_in_use_size(L) > nsize && stack_in_use_size(L) > BASIC_STACK_SIZE {
+            if nsize < BASIC_STACK_SIZE {
+                nsize = BASIC_STACK_SIZE
+            }
+            match stack_realloc(L, nsize + EXTRA_STACK) {
+                ok() => {},
+                err(_) => {},
+            }
+        } else if stack_in_use_size(L) > MAX_STACK && inuse <= MAX_STACK {
+            // Leave the error reserve.
+            match stack_realloc(L, MAX_STACK + EXTRA_STACK) {
+                ok() => {},
+                err(_) => {},
+            }
+        }
+        ci_shrink(L)
+    }
+}
+
+// --- CallInfo records -------------------------------------------------------
+
+// The next frame record after the current one (allocating if needed); it
+// becomes the current frame.
+fn ci_next(L: *mut State) -> (*mut CallInfo)!Throw {
+    unsafe {
+        let cur = (*L).ci
+        nxt := (*cur).next
+        if ptr.is_null(nxt) {
+            nxt = mem_alloc(L, mem.size_of::<CallInfo>())? as *mut CallInfo
+            (*nxt).previous = cur
+            (*nxt).next = 0 as *mut CallInfo
+            (*cur).next = nxt
+            (*L).nci = (*L).nci + 1
+        }
+        (*nxt).callstatus = 0
+        (*nxt).nextraargs = 0
+        (*nxt).nyield = 0
+        (*nxt).nres = 0
+        (*nxt).ctx = 0
+        (*nxt).ftransfer = 0
+        (*nxt).ntransfer = 0
+        (*L).ci = nxt
+        return ok(nxt)
+    }
+}
+
+// Free every unused frame record.
+fn ci_free_unused(L: *mut State) {
+    unsafe {
+        let ci = (*L).ci
+        nxt := (*ci).next
+        (*ci).next = 0 as *mut CallInfo
+        for !ptr.is_null(nxt) {
+            let after = (*nxt).next
+            mem_free(L, nxt as *mut u8, mem.size_of::<CallInfo>())
+            (*L).nci = (*L).nci - 1
+            nxt = after
+        }
+    }
+}
+
+// Free half of the unused frame records.
+fn ci_shrink(L: *mut State) {
+    unsafe {
+        ci := (*(*L).ci).next
+        if ptr.is_null(ci) {
+            return
+        }
+        // Keep every other record.
+        for !ptr.is_null(ci) {
+            let victim = (*ci).next
+            if ptr.is_null(victim) {
+                break
+            }
+            let after = (*victim).next
+            (*ci).next = after
+            if !ptr.is_null(after) {
+                (*after).previous = ci
+            }
+            mem_free(L, victim as *mut u8, mem.size_of::<CallInfo>())
+            (*L).nci = (*L).nci - 1
+            ci = after
+        }
+    }
+}
+
+fn ci_is_lua(ci: *mut CallInfo) -> bool {
+    unsafe {
+        unsafe { return ((*ci).callstatus & CIST_NATIVE) == 0 }
+    }
+}
+
+// --- To-be-closed variable list ----------------------------------------------
+
+fn tbc_push(L: *mut State, off: isize) -> void!Throw {
+    unsafe {
+        if (*L).tbc_count == (*L).tbc_cap {
+            let ncap = if (*L).tbc_cap == 0 { 8isize } else { (*L).tbc_cap * 2 }
+            let block = mem_realloc(L, (*L).tbc as *mut u8, ((*L).tbc_cap as usize) * 8, (ncap as usize) * 8)?
+            (*L).tbc = block as *mut isize
+            (*L).tbc_cap = ncap
+        }
+        *ptr.offset((*L).tbc, (*L).tbc_count) = off
+        (*L).tbc_count = (*L).tbc_count + 1
+        return ok()
+    }
+}
+
+// Offset of the innermost to-be-closed variable, or -1.
+fn tbc_top(L: *mut State) -> isize {
+    unsafe {
+        if (*L).tbc_count == 0 {
+            return -1
+        }
+        return *ptr.offset((*L).tbc, (*L).tbc_count - 1)
+    }
+}
+
+// --- Threads ----------------------------------------------------------------
+
+fn stack_init(L1: *mut State, L: *mut State) -> void!Throw {
+    unsafe {
+        let size = BASIC_STACK_SIZE + EXTRA_STACK
+        let stack = mem_alloc(L, (size as usize) * 16)? as *mut Value
+        for i in 0isize..size {
+            (*ptr.offset(stack, i)).tag = TAG_NIL
+        }
+        (*L1).stack = stack
+        (*L1).stack_size = size
+        (*L1).stack_last = ptr.offset(stack, BASIC_STACK_SIZE)
+        (*L1).top = stack
+        let ci = L_base_ci(L1)
+        (*ci).next = 0 as *mut CallInfo
+        (*ci).previous = 0 as *mut CallInfo
+        (*ci).callstatus = CIST_NATIVE
+        (*ci).func = stack
+        (*ci).nresults = 0
+        (*ci).nextraargs = 0
+        (*ci).nyield = 0
+        (*ci).nres = 0
+        (*ci).savedpc = 0 as *mut u32
+        // The bottom pseudo-frame owns one slot (a nil "function").
+        (*stack).tag = TAG_NIL
+        (*L1).top = ptr.offset(stack, 1)
+        (*ci).top = ptr.offset((*L1).top, MIN_STACK)
+        (*L1).ci = ci
+        return ok()
+    }
+}
+
+// Fields common to the main thread and coroutines.
+fn thread_preinit(L1: *mut State, g: *mut Global) {
+    unsafe {
+        (*L1).global = g
+        (*L1).stack = 0 as *mut Value
+        (*L1).stack_size = 0
+        (*L1).ci = 0 as *mut CallInfo
+        (*L1).nci = 0
+        (*L1).twups = L1
+        (*L1).errfunc = 0
+        (*L1).n_ccalls = 0
+        (*L1).nny = 0
+        (*L1).has_hook = false
+        (*L1).hookmask = 0
+        (*L1).basehookcount = 0
+        (*L1).allowhook = 1
+        (*L1).hookcount = 0
+        (*L1).openupval = 0 as *mut UpVal
+        (*L1).status = ST_OK
+        (*L1).oldpc = 0
+        (*L1).tbc = 0 as *mut isize
+        (*L1).tbc_count = 0
+        (*L1).tbc_cap = 0
+        (*L1).gclist = 0 as *mut GCObject
+        (*L_errobj(L1)).tag = TAG_NIL
+    }
+}
+
+// A new coroutine sharing L's global state; it is pushed onto L's stack.
+fn thread_new(L: *mut State) -> (*mut State)!Throw {
+    unsafe {
+        let g = G(L)
+        let L1 = mem_alloc(L, mem.size_of::<State>())? as *mut State
+        (*L1).tag = TAG_THREAD
+        thread_preinit(L1, g)
+        (*L1).hookmask = (*L).hookmask
+        (*L1).basehookcount = (*L).basehookcount
+        (*L1).has_hook = (*L).has_hook
+        if (*L).has_hook {
+            (*L1).hook = (*L).hook
+        }
+        (*L1).hookcount = (*L1).basehookcount
+        match stack_init(L1, L) {
+            ok() => {},
+            err(e) => {
+                mem_free(L, L1 as *mut u8, mem.size_of::<State>())
+                return err(e)
+            },
+        }
+        gc_link(L, L1 as *mut GCObject)
+        set_gc((*L).top, L1 as *mut GCObject, TAG_THREAD)
+        (*L).top = ptr.offset((*L).top, 1)
+        return ok(L1)
+    }
+}
+
+fn thread_free_stack(L: *mut State, L1: *mut State) {
+    unsafe {
+        if ptr.is_null((*L1).stack) {
+            return
+        }
+        (*L1).ci = L_base_ci(L1)
+        ci_free_unused(L1)
+        mem_free(L, (*L1).stack as *mut u8, ((*L1).stack_size as usize) * 16)
+        (*L1).stack = 0 as *mut Value
+        if (*L1).tbc_cap > 0 {
+            mem_free(L, (*L1).tbc as *mut u8, ((*L1).tbc_cap as usize) * 8)
+            (*L1).tbc = 0 as *mut isize
+            (*L1).tbc_cap = 0
+        }
+    }
+}
+
+// Release a coroutine (called by the collector).
+fn thread_free(L: *mut State, L1: *mut State) {
+    unsafe {
+        func_close_upvals(L1, (*L1).stack)
+        thread_free_stack(L, L1)
+        mem_free(L, L1 as *mut u8, mem.size_of::<State>())
+    }
+}
+
+// Reset a thread after an error or for coroutine.close: close its pending
+// to-be-closed variables (with the error object of `status`) and leave it
+// with an empty stack. Returns the final status.
+fn thread_reset(L: *mut State, status0: i32) -> i32 {
+    unsafe {
+        let ci = L_base_ci(L)
+        (*L).ci = ci
+        status := status0
+        if status == ST_YIELD as i32 {
+            status = ST_OK as i32
+        }
+        (*L).status = ST_OK
+        status = do_close_protected(L, 1, status)
+        if status != ST_OK as i32 {
+            set_error_obj(L, status, ptr.offset((*L).stack, 1))
+        } else {
+            (*L).top = ptr.offset((*L).stack, 1)
+        }
+        (*ci).top = ptr.offset((*L).top, MIN_STACK)
+        (*L).n_ccalls = 0
+        (*L).nny = 0
+        (*L).errfunc = 0
+        (*ci).callstatus = CIST_NATIVE
+        match stack_realloc(L, sdiff((*ci).top, (*L).stack) + EXTRA_STACK + 1) {
+            ok() => {},
+            err(_) => {},
+        }
+        return status
+    }
+}
+
+// Store the error object of `status` at `oldtop` and set top just above it.
+fn set_error_obj(L: *mut State, status: i32, oldtop: *mut Value) {
+    unsafe {
+        if status == ST_ERRMEM as i32 {
+            set_str(oldtop, (*G(L)).memerrmsg)
+        } else if status == ST_ERRERR as i32 {
+            match str_from(L, "error in error handling") {
+                ok(s) => { set_str(oldtop, s) },
+                err(_) => { set_str(oldtop, (*G(L)).memerrmsg) },
+            }
+        } else if status == ST_OK as i32 {
+            (*oldtop).tag = TAG_NIL
+        } else {
+            set_obj(oldtop, L_errobj(L))
+        }
+        (*L).top = ptr.offset(oldtop, 1)
+    }
+}
+
+fn throw_status(t: Throw) -> i32 {
+    unsafe {
+        match t {
+            Throw.Runtime => { return ST_ERRRUN as i32 },
+            Throw.Syntax => { return ST_ERRSYNTAX as i32 },
+            Throw.Memory => { return ST_ERRMEM as i32 },
+            Throw.Handler => { return ST_ERRERR as i32 },
+            Throw.Yield => { return ST_YIELD as i32 },
+        }
+    }
+}
+
+fn status_throw(status: i32) -> Throw {
+    unsafe {
+        if status == ST_ERRSYNTAX as i32 {
+            return Throw.Syntax
+        }
+        if status == ST_ERRMEM as i32 {
+            return Throw.Memory
+        }
+        if status == ST_ERRERR as i32 {
+            return Throw.Handler
+        }
+        if status == ST_YIELD as i32 {
+            return Throw.Yield
+        }
+        return Throw.Runtime
+    }
+}
+
+unsafe extern "C" fn time(t: *mut i64) -> i64
+
+// Create a new universe: the global state and its main thread. Returns null
+// when memory is exhausted.
+fn state_open() -> *mut State {
+    unsafe {
+        let block = malloc(mem.size_of::<MainBlock>()) as *mut MainBlock
+        if ptr.is_null(block) {
+            return 0 as *mut State
+        }
+        ptr.write_bytes(block as *mut u8, 0u8, mem.size_of::<MainBlock>())
+        let L = ptr.offset(block as *mut u8, mem.offset_of::<MainBlock>("l") as isize) as *mut State
+        let g = ptr.offset(block as *mut u8, mem.offset_of::<MainBlock>("g") as isize) as *mut Global
+        (*L).tag = TAG_THREAD
+        (*L).marked = 0
+        (*L).next = 0 as *mut GCObject
+        thread_preinit(L, g)
+        (*g).mainthread = L
+        (*g).seed = state_make_seed(L)
+        (*G_registry(g)).tag = TAG_NIL
+        // Not complete until the registry exists.
+        (*G_nilvalue(g)).tag = TAG_TRUE
+        (*G_absent(g)).tag = TAG_ABSENT
+        (*g).warn_mode = 0
+        (*g).has_warnf = false
+        gc_init_global(g)
+        // The main thread is the first (oldest) object of allgc.
+        (*L).marked = current_white(g)
+        (*g).allgc = L as *mut GCObject
+        match state_build(L) {
+            ok() => {},
+            err(_) => {
+                state_close(L)
+                return 0 as *mut State
+            },
+        }
+        return L
+    }
+}
+
+fn state_make_seed(L: *mut State) -> u32 {
+    unsafe {
+        let addr = L as usize
+        local := 0u64
+        let laddr = ptr.from_mut(&mut local) as usize
+        let t = time(0 as *mut i64)
+        let mixed = (addr as u64) ^ ((laddr as u64) << 7) ^ (t as u64)
+        let h = core.wrapping_mul(mixed ^ (mixed >> 29), 0x9E3779B97F4A7C15u64)
+        return ((h >> 32) ^ (h & 0xFFFFFFFF)) as u32
+    }
+}
+
+// Allocate everything a usable state needs.
+fn state_build(L: *mut State) -> void!Throw {
+    unsafe {
+        let g = G(L)
+        stack_init(L, L)?
+        str_table_init(L)?
+        (*g).tmname = mem_alloc(L, (TM_N as usize) * 8)? as *mut *mut LString
+        for i in 0u32..TM_N {
+            *ptr.offset((*g).tmname, i as isize) = 0 as *mut LString
+        }
+        (*g).mt = mem_alloc(L, 9 * 8)? as *mut *mut Table
+        for i in 0isize..9 {
+            *ptr.offset((*g).mt, i) = 0 as *mut Table
+        }
+        // Registry: [1] = main thread, [2] = globals.
+        let reg = tab_new(L)?
+        set_gc(G_registry(g), reg as *mut GCObject, TAG_TABLE)
+        tab_resize(L, reg, 2, 0)?
+        tmp: Value = Value { bits: 0, tag: 0 }
+        let tp = ptr.from_mut(&mut tmp)
+        set_gc(tp, L as *mut GCObject, TAG_THREAD)
+        tab_set_int(L, reg, 1, tp)?
+        let globals = tab_new(L)?
+        set_gc(tp, globals as *mut GCObject, TAG_TABLE)
+        tab_set_int(L, reg, 2, tp)?
+        let msg = str_from(L, "not enough memory")?
+        gc_fix(L, msg as *mut GCObject)
+        (*g).memerrmsg = msg
+        meta_init(L)?
+        (*G_nilvalue(g)).tag = TAG_NIL
+        (*g).gcstp = 0
+        return ok()
+    }
+}
+
+// Close a universe: run pending finalizers, free every object.
+fn state_close(L0: *mut State) {
+    unsafe {
+        let g = G(L0)
+        let L = (*g).mainthread
+        if G_complete(g) {
+            (*L).ci = L_base_ci(L)
+            (*L).errfunc = 0
+            (*L).n_ccalls = 0
+            (*L).nny = 0
+            (*L).status = ST_OK
+            // Close pending to-be-closed variables of the main thread.
+            if !ptr.is_null((*L).stack) {
+                do_close_protected(L, 1, ST_OK as i32)
+            }
+        }
+        gc_free_all(L)
+        thread_free_stack(L, L)
+        str_table_free(L)
+        if !ptr.is_null((*g).tmname) {
+            mem_free(L, (*g).tmname as *mut u8, (TM_N as usize) * 8)
+        }
+        if !ptr.is_null((*g).mt) {
+            mem_free(L, (*g).mt as *mut u8, 9 * 8)
+        }
+        let block = ptr.offset(L as *mut u8, -(mem.offset_of::<MainBlock>("l") as isize))
+        free(block)
+    }
 }

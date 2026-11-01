@@ -1,0 +1,402 @@
+package lua
+
+import "core/ptr"
+
+// TEMPORARY stand-ins for code owned by other agents (the compiler in
+// lex/parse/code.dodo and number formatting/parsing in number.dodo). This
+// file is deleted when those files are merged; the signatures here are the
+// agreed interfaces.
+
+unsafe extern "C" fn strtod(text: *const u8, end: *mut *mut u8) -> f64
+
+// Compile a text chunk (stand-in: always a syntax error).
+fn compile(L: *mut State, source: *mut u8, length: usize, chunkname: *mut LString) -> (*mut Proto)!Throw {
+    unsafe {
+        let msg = b"compiler not available"
+        return err(err_syntax(L, ptr.as_ptr(msg), msg.len))
+    }
+}
+
+fn sti_put(out: &mut [u8], at: usize, c: u8) -> usize {
+    unsafe {
+        if at < out.len {
+            out[at] = c
+        }
+        return at + 1
+    }
+}
+
+// Decimal form of an integer.
+fn num_int_to_string(out: &mut [u8], v: i64) -> usize {
+    unsafe {
+        digits := [0u8; 24]
+        nd := 0usize
+        neg := v < 0
+        // Work with negative values so the minimum integer needs no special case.
+        x := if neg { v } else { -v }
+        if x == 0 {
+            digits[0] = b'0'
+            nd = 1
+        }
+        for x != 0 {
+            let q = x / 10
+            let r = q * 10 - x
+            digits[nd] = b'0' + (r as u8)
+            nd += 1
+            x = q
+        }
+        at := 0usize
+        if neg {
+            at = sti_put(out, at, b'-')
+        }
+        for i in 0usize..nd {
+            at = sti_put(out, at, digits[nd - 1 - i])
+        }
+        return at
+    }
+}
+
+// Format a float with `prec` significant digits like C's "%.{prec}g".
+fn sti_format_g(out: &mut [u8], v0: f64, prec: i32) -> usize {
+    unsafe {
+        at := 0usize
+        v := v0
+        if v != v {
+            if v0 < 0.0 || (f2bits(v0) >> 63) != 0 {
+                at = sti_put(out, at, b'-')
+            }
+            at = sti_put(out, at, b'n')
+            at = sti_put(out, at, b'a')
+            return sti_put(out, at, b'n')
+        }
+        if (f2bits(v) >> 63) != 0 {
+            at = sti_put(out, at, b'-')
+            v = -v
+        }
+        if v > 1.7976931348623157e308 {
+            at = sti_put(out, at, b'i')
+            at = sti_put(out, at, b'n')
+            return sti_put(out, at, b'f')
+        }
+        if v == 0.0 {
+            return sti_put(out, at, b'0')
+        }
+        // Decimal exponent and `prec` significant digits.
+        e := 0i32
+        m := v
+        for m >= 10.0 {
+            m = m / 10.0
+            e += 1
+        }
+        for m < 1.0 {
+            m = m * 10.0
+            e -= 1
+        }
+        // Digits via scaling by a power of ten computed exactly where possible.
+        digits := [0u8; 40]
+        let p10 = sti_pow10(prec - 1 - e)
+        scaled := if prec - 1 - e >= 0 { v * p10 } else { v / sti_pow10(e - prec + 1) }
+        r := sti_round(scaled)
+        if r >= sti_pow10(prec) {
+            e += 1
+            scaled = if prec - 1 - e >= 0 { v * sti_pow10(prec - 1 - e) } else { v / sti_pow10(e - prec + 1) }
+            r = sti_round(scaled)
+        }
+        // r is an integer with `prec` digits.
+        nd := 0i32
+        ri := r as u64
+        for i in 0i32..prec {
+            digits[(prec - 1 - i) as usize] = b'0' + ((ri % 10) as u8)
+            ri = ri / 10
+            nd += 1
+        }
+        // Strip trailing zeros.
+        last := prec
+        for last > 1 && digits[(last - 1) as usize] == b'0' {
+            last -= 1
+        }
+        if e < -4 || e >= prec {
+            at = sti_put(out, at, digits[0])
+            if last > 1 {
+                at = sti_put(out, at, b'.')
+                for i in 1i32..last {
+                    at = sti_put(out, at, digits[i as usize])
+                }
+            }
+            at = sti_put(out, at, b'e')
+            ee := e
+            if ee < 0 {
+                at = sti_put(out, at, b'-')
+                ee = -ee
+            } else {
+                at = sti_put(out, at, b'+')
+            }
+            if ee < 10 {
+                at = sti_put(out, at, b'0')
+            }
+            tmp := [0u8; 8]
+            let n = num_int_to_string(&mut tmp, ee as i64)
+            for i in 0usize..n {
+                at = sti_put(out, at, tmp[i])
+            }
+            return at
+        }
+        if e < 0 {
+            at = sti_put(out, at, b'0')
+            at = sti_put(out, at, b'.')
+            for i in 0i32..(-e - 1) {
+                at = sti_put(out, at, b'0')
+            }
+            for i in 0i32..last {
+                at = sti_put(out, at, digits[i as usize])
+            }
+            return at
+        }
+        for i in 0i32..(e + 1) {
+            at = sti_put(out, at, digits[i as usize])
+        }
+        if last > e + 1 {
+            at = sti_put(out, at, b'.')
+            for i in (e + 1)..last {
+                at = sti_put(out, at, digits[i as usize])
+            }
+        }
+        return at
+    }
+}
+
+fn sti_pow10(n: i32) -> f64 {
+    unsafe {
+        r := 1.0
+        for i in 0i32..n {
+            r = r * 10.0
+        }
+        return r
+    }
+}
+
+fn sti_round(x: f64) -> f64 {
+    unsafe {
+        let f = sti_floor(x)
+        if x - f >= 0.5 {
+            return f + 1.0
+        }
+        return f
+    }
+}
+
+fn sti_floor(x: f64) -> f64 {
+    unsafe {
+        if x >= 9007199254740992.0 || x <= -9007199254740992.0 {
+            return x
+        }
+        let i = x as i64
+        let f = i as f64
+        if f > x {
+            return f - 1.0
+        }
+        return f
+    }
+}
+
+// Lua `tostring` of a float: "%.14g", plus ".0" when it looks like an integer.
+fn num_float_to_string(out: &mut [u8], v: f64) -> usize {
+    unsafe {
+        n := sti_format_g(out, v, 14)
+        looks_int := true
+        for i in 0usize..n {
+            let c = out[i]
+            if !((c >= b'0' && c <= b'9') || c == b'-') {
+                looks_int = false
+            }
+        }
+        if looks_int {
+            n = sti_put(out, n, b'.')
+            n = sti_put(out, n, b'0')
+        }
+        return n
+    }
+}
+
+fn sti_is_space(c: u8) -> bool {
+    unsafe {
+        return c == b' ' || c == b'\t' || c == b'\n' || c == b'\r' || c == 11 || c == 12
+    }
+}
+
+fn sti_hex(c: u8) -> i32 {
+    unsafe {
+        if c >= b'0' && c <= b'9' {
+            return (c - b'0') as i32
+        }
+        if c >= b'a' && c <= b'f' {
+            return (c - b'a') as i32 + 10
+        }
+        if c >= b'A' && c <= b'F' {
+            return (c - b'A') as i32 + 10
+        }
+        return -1
+    }
+}
+
+// Convert text to a number following Lua's rules: 0 none, 1 integer
+// (stored in ival), 2 float (stored in fval).
+fn num_string_to_number(text: &[u8], ival: &mut i64, fval: &mut f64) -> u32 {
+    unsafe {
+        let n = text.len
+        i := 0usize
+        for i < n && sti_is_space(text[i]) {
+            i += 1
+        }
+        j := n
+        for j > i && sti_is_space(text[j - 1]) {
+            j -= 1
+        }
+        if i >= j {
+            return 0
+        }
+        // Integer forms.
+        k := i
+        neg := false
+        if text[k] == b'-' {
+            neg = true
+            k += 1
+        } else if text[k] == b'+' {
+            k += 1
+        }
+        if k + 1 < j && text[k] == b'0' && (text[k + 1] == b'x' || text[k + 1] == b'X') {
+            k += 2
+            acc := 0u64
+            any := false
+            isint := true
+            p := k
+            for p < j && sti_hex(text[p]) >= 0 {
+                acc = core.wrapping_add(core.wrapping_mul(acc, 16), sti_hex(text[p]) as u64)
+                any = true
+                p += 1
+            }
+            if p == j && any {
+                let v = u2i(acc)
+                *ival = if neg { core.wrapping_sub(0i64, v) } else { v }
+                return 1
+            }
+            isint = false
+        } else {
+            acc := 0u64
+            any := false
+            overflow := false
+            p := k
+            for p < j && text[p] >= b'0' && text[p] <= b'9' {
+                let d = (text[p] - b'0') as u64
+                if acc > (18446744073709551615u64 - d) / 10 {
+                    overflow = true
+                } else {
+                    acc = acc * 10 + d
+                }
+                any = true
+                p += 1
+            }
+            if p == j && any && !overflow {
+                if neg && acc <= 9223372036854775808u64 {
+                    *ival = core.wrapping_sub(0i64, u2i(acc))
+                    return 1
+                }
+                if !neg && acc <= 9223372036854775807u64 {
+                    *ival = acc as i64
+                    return 1
+                }
+            }
+        }
+        // Float: reject "inf"/"nan" spellings that strtod accepts.
+        for p in i..j {
+            let c = text[p]
+            if c == b'n' || c == b'N' || c == b'i' || c == b'I' {
+                return 0
+            }
+        }
+        buf := [0u8; 256]
+        if j - i >= 255 {
+            return 0
+        }
+        for p in i..j {
+            buf[p - i] = text[p]
+        }
+        buf[j - i] = 0
+        unsafe {
+            endp := 0 as *mut u8
+            let base = ptr.as_mut_ptr(&mut buf)
+            let v = strtod(base as *const u8, ptr.from_mut(&mut endp))
+            if (endp as usize) - (base as usize) != j - i || endp == base {
+                return 0
+            }
+            *fval = v
+        }
+        return 2
+    }
+}
+
+// Parse an integer numeral in `base` (2..36), with optional sign and spaces.
+fn num_string_to_int_base(text: &[u8], base: i32, out: &mut i64) -> bool {
+    unsafe {
+        let n = text.len
+        i := 0usize
+        for i < n && sti_is_space(text[i]) {
+            i += 1
+        }
+        neg := false
+        if i < n && text[i] == b'-' {
+            neg = true
+            i += 1
+        } else if i < n && text[i] == b'+' {
+            i += 1
+        }
+        acc := 0i64
+        any := false
+        for i < n {
+            let c = text[i]
+            d := -1i32
+            if c >= b'0' && c <= b'9' {
+                d = (c - b'0') as i32
+            } else if c >= b'a' && c <= b'z' {
+                d = (c - b'a') as i32 + 10
+            } else if c >= b'A' && c <= b'Z' {
+                d = (c - b'A') as i32 + 10
+            }
+            if d < 0 || d >= base {
+                break
+            }
+            acc = core.wrapping_add(core.wrapping_mul(acc, base as i64), d as i64)
+            any = true
+            i += 1
+        }
+        for i < n && sti_is_space(text[i]) {
+            i += 1
+        }
+        if !any || i != n {
+            return false
+        }
+        *out = if neg { core.wrapping_sub(0i64, acc) } else { acc }
+        return true
+    }
+}
+
+// Printf-style formatting used by string.format (stand-in: %g/%d only).
+fn num_format_float(out: &mut [u8], v: f64, conv: u8, flags: u32, width: i32, precision: i32) -> usize {
+    unsafe {
+        return sti_format_g(out, v, if precision < 0 { 6 } else { precision })
+    }
+}
+
+fn num_format_int(out: &mut [u8], v: i64, conv: u8, flags: u32, width: i32, precision: i32) -> usize {
+    unsafe {
+        return num_int_to_string(out, v)
+    }
+}
+
+// Opens the standard libraries written by other agents (string, table,
+// math, utf8, io, os, package, debug). Stand-in: nothing yet.
+fn open_other_libs(cx: &mut Cx) -> void!Throw {
+    unsafe {
+        return ok()
+    }
+}

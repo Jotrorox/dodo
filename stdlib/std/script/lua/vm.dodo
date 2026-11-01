@@ -1,0 +1,1641 @@
+package lua
+
+import "core/mem"
+import "core/ptr"
+
+// The interpreter: executes Lua frames until the frame that started the
+// activation (marked CIST_FRESH) returns. Lua-to-Lua calls and returns
+// switch frames inside the loop.
+//
+// Register discipline: `base` (first register), `pc` (next instruction) and
+// `k` (constants) are cached in locals. Before any operation that can raise,
+// call a function or allocate, the loop saves `pc` into the frame and sets
+// L.top to the frame's top (so every register is visible to the collector
+// and to metamethod calls); afterwards it reloads `base`, because the stack
+// may have moved.
+
+unsafe extern "C" fn fmod(a: f64, b: f64) -> f64
+unsafe extern "C" fn pow(a: f64, b: f64) -> f64
+unsafe extern "C" fn floor(a: f64) -> f64
+unsafe extern "C" fn ceil(a: f64) -> f64
+
+// Float-to-integer conversion modes.
+const F2I_EQ: i32 = 0
+const F2I_FLOOR: i32 = 1
+const F2I_CEIL: i32 = 2
+
+// --- Number conversions -----------------------------------------------------
+
+// Float to integer according to `mode`; false if out of range or inexact
+// (for F2I_EQ).
+fn flt_to_int(f: f64, out: *mut i64, mode: i32) -> bool {
+    unsafe {
+        fl := floor(f)
+        if f != fl {
+            if mode == F2I_EQ {
+                return false
+            }
+            if mode == F2I_CEIL {
+                fl = fl + 1.0
+            }
+        }
+        if fl >= -9223372036854775808.0 && fl < 9223372036854775808.0 {
+            *out = fl as i64
+            return true
+        }
+        return false
+    }
+}
+
+// Number value of a string value (false if it does not convert).
+fn str_to_number_value(v: *mut Value, out: *mut Value) -> bool {
+    unsafe {
+        let s = val_str(v)
+        iv: i64 = 0
+        fv: f64 = 0.0
+        let r = num_string_to_number(ptr.borrow_slice(str_data(s) as *const u8, (*s).length, b""), &mut iv, &mut fv)
+        if r == 1 {
+            set_int(out, iv)
+            return true
+        }
+        if r == 2 {
+            set_float(out, fv)
+            return true
+        }
+        return false
+    }
+}
+
+// Value to float, converting strings (luaV_tonumber semantics).
+fn vm_to_number(v: *mut Value, out: *mut f64) -> bool {
+    unsafe {
+        let t = (*v).tag
+        if t == TAG_FLOAT {
+            *out = val_float(v)
+            return true
+        }
+        if t == TAG_INT {
+            *out = val_int(v) as f64
+            return true
+        }
+        if t == TAG_SHORTSTR || t == TAG_LONGSTR {
+            tmp := Value { bits: 0, tag: 0 }
+            let n = ptr.from_mut(&mut tmp)
+            if str_to_number_value(v, n) {
+                *out = if (*n).tag == TAG_INT { val_int(n) as f64 } else { val_float(n) }
+                return true
+            }
+        }
+        return false
+    }
+}
+
+// Value to integer, converting strings and floats per `mode`.
+fn vm_to_integer(v: *mut Value, out: *mut i64, mode: i32) -> bool {
+    unsafe {
+        let t = (*v).tag
+        if t == TAG_INT {
+            *out = val_int(v)
+            return true
+        }
+        if t == TAG_FLOAT {
+            return flt_to_int(val_float(v), out, mode)
+        }
+        if t == TAG_SHORTSTR || t == TAG_LONGSTR {
+            tmp := Value { bits: 0, tag: 0 }
+            let n = ptr.from_mut(&mut tmp)
+            if str_to_number_value(v, n) {
+                return vm_to_integer(n, out, mode)
+            }
+        }
+        return false
+    }
+}
+
+// Integer value of a number with an exact integer representation (no
+// string conversion).
+fn vm_to_integer_strict(v: *mut Value, out: *mut i64) -> bool {
+    unsafe {
+        let t = (*v).tag
+        if t == TAG_INT {
+            *out = val_int(v)
+            return true
+        }
+        if t == TAG_FLOAT {
+            return flt_to_int(val_float(v), out, F2I_EQ)
+        }
+        return false
+    }
+}
+
+// Float value of a number (no string conversion).
+fn to_float_ns(v: *mut Value, out: *mut f64) -> bool {
+    unsafe {
+        let t = (*v).tag
+        if t == TAG_FLOAT {
+            *out = val_float(v)
+            return true
+        }
+        if t == TAG_INT {
+            *out = val_int(v) as f64
+            return true
+        }
+        return false
+    }
+}
+
+// --- Arithmetic -------------------------------------------------------------
+
+// Integer floor modulo; raises on a zero divisor.
+fn vm_mod_int(L: *mut State, m: i64, n: i64) -> i64!Throw {
+    unsafe {
+        if n == 0 {
+            return err(err_runtime(L, "attempt to perform 'n%%0'"))
+        }
+        if n == -1 {
+            return ok(0)
+        }
+        r := m % n
+        if r != 0 && (r ^ n) < 0 {
+            r += n
+        }
+        return ok(r)
+    }
+}
+
+// Integer floor division; raises on a zero divisor.
+fn vm_idiv_int(L: *mut State, m: i64, n: i64) -> i64!Throw {
+    unsafe {
+        if n == 0 {
+            return err(err_runtime(L, "attempt to divide by zero"))
+        }
+        if n == -1 {
+            return ok(core.wrapping_sub(0i64, m))
+        }
+        q := m / n
+        if (m ^ n) < 0 && m % n != 0 {
+            q -= 1
+        }
+        return ok(q)
+    }
+}
+
+fn vm_mod_float(a: f64, b: f64) -> f64 {
+    unsafe {
+        m := fmod(a, b)
+        if (m > 0.0 && b < 0.0) || (m < 0.0 && b != m && b > 0.0) {
+            m = m + b
+        }
+        return m
+    }
+}
+
+fn vm_pow(a: f64, b: f64) -> f64 {
+    unsafe {
+        if b == 2.0 {
+            return a * a
+        }
+        return pow(a, b)
+    }
+}
+
+fn vm_idiv_float(a: f64, b: f64) -> f64 {
+    unsafe {
+        unsafe { return floor(a / b) }
+    }
+}
+
+// Shift left by y (negative: logical shift right); counts beyond 63 give 0.
+fn vm_shiftl(x: i64, y: i64) -> i64 {
+    unsafe {
+        if y < 0 {
+            if y <= -64 {
+                return 0
+            }
+            return u2i(i2u(x) >> ((-y) as u64))
+        }
+        if y >= 64 {
+            return 0
+        }
+        return u2i(i2u(x) << (y as u64))
+    }
+}
+
+// Arithmetic on two numbers (op is the TM_* event). Returns false if an
+// operand is not a number (or not convertible to an integer for bitwise
+// operations, in which case the metamethod path reports it).
+fn vm_arith_num(L: *mut State, op: u32, v1: *mut Value, v2: *mut Value, res: *mut Value) -> bool!Throw {
+    unsafe {
+        if op >= TM_BAND && op <= TM_SHR {
+            i1: i64 = 0
+            i2: i64 = 0
+            if !vm_to_integer_strict(v1, ptr.from_mut(&mut i1)) || !vm_to_integer_strict(v2, ptr.from_mut(&mut i2)) {
+                return ok(false)
+            }
+            set_int(res, int_bitop(op, i1, i2))
+            return ok(true)
+        }
+        if (*v1).tag == TAG_INT && (*v2).tag == TAG_INT && op != TM_POW && op != TM_DIV {
+            let a = val_int(v1)
+            let b = val_int(v2)
+            r := 0i64
+            if op == TM_ADD {
+                r = core.wrapping_add(a, b)
+            } else if op == TM_SUB {
+                r = core.wrapping_sub(a, b)
+            } else if op == TM_MUL {
+                r = core.wrapping_mul(a, b)
+            } else if op == TM_MOD {
+                r = vm_mod_int(L, a, b)?
+            } else if op == TM_IDIV {
+                r = vm_idiv_int(L, a, b)?
+            } else {
+                r = core.wrapping_sub(0i64, a)
+            }
+            set_int(res, r)
+            return ok(true)
+        }
+        f1: f64 = 0.0
+        f2: f64 = 0.0
+        if !to_float_ns(v1, ptr.from_mut(&mut f1)) || !to_float_ns(v2, ptr.from_mut(&mut f2)) {
+            return ok(false)
+        }
+        set_float(res, float_arith(op, f1, f2))
+        return ok(true)
+    }
+}
+
+fn int_bitop(op: u32, a: i64, b: i64) -> i64 {
+    unsafe {
+        if op == TM_BAND {
+            return a & b
+        }
+        if op == TM_BOR {
+            return a | b
+        }
+        if op == TM_BXOR {
+            return a ^ b
+        }
+        if op == TM_SHL {
+            return vm_shiftl(a, b)
+        }
+        if op == TM_SHR {
+            return vm_shiftl(a, core.wrapping_sub(0i64, b))
+        }
+        return ~a
+    }
+}
+
+fn float_arith(op: u32, a: f64, b: f64) -> f64 {
+    unsafe {
+        if op == TM_ADD {
+            return a + b
+        }
+        if op == TM_SUB {
+            return a - b
+        }
+        if op == TM_MUL {
+            return a * b
+        }
+        if op == TM_DIV {
+            return a / b
+        }
+        if op == TM_POW {
+            return vm_pow(a, b)
+        }
+        if op == TM_IDIV {
+            return vm_idiv_float(a, b)
+        }
+        if op == TM_MOD {
+            return vm_mod_float(a, b)
+        }
+        return -a
+    }
+}
+
+// Full arithmetic with metamethods (used by the API): R[res] := v1 op v2.
+fn vm_arith(L: *mut State, op: u32, v1: *mut Value, v2: *mut Value, res: isize) -> void!Throw {
+    unsafe {
+        tmp := Value { bits: 0, tag: 0 }
+        let r = ptr.from_mut(&mut tmp)
+        if vm_arith_num(L, op, v1, v2, r)? {
+            set_obj(restore_stack(L, res), r)
+            return ok()
+        }
+        return meta_trybin(L, v1, v2, res, op)
+    }
+}
+
+// --- Comparisons ------------------------------------------------------------
+
+fn lt_int_float(i: i64, f: f64) -> bool {
+    unsafe {
+        if i >= -9007199254740992 && i <= 9007199254740992 {
+            return (i as f64) < f
+        }
+        if f != f {
+            return false
+        }
+        if f >= 9223372036854775808.0 {
+            return true
+        }
+        if f > -9223372036854775808.0 {
+            return i < (ceil(f) as i64)
+        }
+        return false
+    }
+}
+fn le_int_float(i: i64, f: f64) -> bool {
+    unsafe {
+        if i >= -9007199254740992 && i <= 9007199254740992 {
+            return (i as f64) <= f
+        }
+        if f != f {
+            return false
+        }
+        if f >= 9223372036854775808.0 {
+            return true
+        }
+        if f >= -9223372036854775808.0 {
+            return i <= (floor(f) as i64)
+        }
+        return false
+    }
+}
+fn lt_float_int(f: f64, i: i64) -> bool {
+    unsafe {
+        if i >= -9007199254740992 && i <= 9007199254740992 {
+            return f < (i as f64)
+        }
+        if f != f {
+            return false
+        }
+        if f >= 9223372036854775808.0 {
+            return false
+        }
+        if f >= -9223372036854775808.0 {
+            return (floor(f) as i64) < i
+        }
+        return true
+    }
+}
+fn le_float_int(f: f64, i: i64) -> bool {
+    unsafe {
+        if i >= -9007199254740992 && i <= 9007199254740992 {
+            return f <= (i as f64)
+        }
+        if f != f {
+            return false
+        }
+        if f >= 9223372036854775808.0 {
+            return false
+        }
+        if f > -9223372036854775808.0 {
+            return (ceil(f) as i64) <= i
+        }
+        return true
+    }
+}
+
+// a < b for two numbers.
+fn num_lt(a: *mut Value, b: *mut Value) -> bool {
+    unsafe {
+        if (*a).tag == TAG_INT {
+            if (*b).tag == TAG_INT {
+                return val_int(a) < val_int(b)
+            }
+            return lt_int_float(val_int(a), val_float(b))
+        }
+        if (*b).tag == TAG_FLOAT {
+            return val_float(a) < val_float(b)
+        }
+        return lt_float_int(val_float(a), val_int(b))
+    }
+}
+fn num_le(a: *mut Value, b: *mut Value) -> bool {
+    unsafe {
+        if (*a).tag == TAG_INT {
+            if (*b).tag == TAG_INT {
+                return val_int(a) <= val_int(b)
+            }
+            return le_int_float(val_int(a), val_float(b))
+        }
+        if (*b).tag == TAG_FLOAT {
+            return val_float(a) <= val_float(b)
+        }
+        return le_float_int(val_float(a), val_int(b))
+    }
+}
+
+fn both_numbers(a: *mut Value, b: *mut Value) -> bool {
+    unsafe {
+        unsafe { return ((*a).tag & 15) == TYPE_NUMBER && ((*b).tag & 15) == TYPE_NUMBER }
+    }
+}
+fn both_strings(a: *mut Value, b: *mut Value) -> bool {
+    unsafe {
+        unsafe { return ((*a).tag & 15) == TYPE_STRING && ((*b).tag & 15) == TYPE_STRING }
+    }
+}
+
+fn vm_less_than(L: *mut State, a: *mut Value, b: *mut Value) -> bool!Throw {
+    unsafe {
+        if both_numbers(a, b) {
+            return ok(num_lt(a, b))
+        }
+        if both_strings(a, b) {
+            return ok(str_compare(val_str(a), val_str(b)) < 0)
+        }
+        return meta_call_order(L, a, b, TM_LT)
+    }
+}
+
+fn vm_less_equal(L: *mut State, a: *mut Value, b: *mut Value) -> bool!Throw {
+    unsafe {
+        if both_numbers(a, b) {
+            return ok(num_le(a, b))
+        }
+        if both_strings(a, b) {
+            return ok(str_compare(val_str(a), val_str(b)) <= 0)
+        }
+        return meta_call_order(L, a, b, TM_LE)
+    }
+}
+
+// --- Numeric for ------------------------------------------------------------
+
+fn for_error(L: *mut State, v: *mut Value, what: &str) -> Throw {
+    unsafe {
+        b := SBuf.new(L)
+        match for_error_build(L, &mut b, v, what) {
+            ok() => {},
+            err(e) => { return e },
+        }
+        return err_raise_buf(L, &mut b)
+    }
+}
+
+fn for_error_build(L: *mut State, b: &mut SBuf, v: *mut Value, what: &str) -> void!Throw {
+    unsafe {
+        b.add_str("bad 'for' ")?
+        b.add_str(what)?
+        b.add_str(" (number expected, got ")?
+        meta_add_objtypename(L, b, v)?
+        b.add_str(")")?
+        return ok()
+    }
+}
+
+// Integer limit of a loop with integer init and step; true if the loop must
+// not run at all.
+fn for_limit(L: *mut State, init: i64, lim: *mut Value, out: *mut i64, step: i64) -> bool!Throw {
+    unsafe {
+        if !vm_to_integer(lim, out, if step < 0 { F2I_CEIL } else { F2I_FLOOR }) {
+            flim: f64 = 0.0
+            if !vm_to_number(lim, ptr.from_mut(&mut flim)) {
+                return err(for_error(L, lim, "limit"))
+            }
+            // Out of the integer range (or NaN).
+            if flim > 0.0 {
+                if step < 0 {
+                    return ok(true)
+                }
+                *out = 9223372036854775807
+            } else {
+                if step > 0 {
+                    return ok(true)
+                }
+                *out = -9223372036854775807 - 1
+            }
+        }
+        if step > 0 {
+            return ok(init > *out)
+        }
+        return ok(init < *out)
+    }
+}
+
+// Prepare a numeric for loop at ra; true if the loop is skipped.
+fn vm_forprep(L: *mut State, ra: *mut Value) -> bool!Throw {
+    unsafe {
+        let pinit = ra
+        let plimit = ptr.offset(ra, 1)
+        let pstep = ptr.offset(ra, 2)
+        if (*pinit).tag == TAG_INT && (*pstep).tag == TAG_INT {
+            let init = val_int(pinit)
+            let step = val_int(pstep)
+            if step == 0 {
+                return err(err_runtime(L, "'for' step is zero"))
+            }
+            set_int(ptr.offset(ra, 3), init)
+            limit: i64 = 0
+            if for_limit(L, init, plimit, ptr.from_mut(&mut limit), step)? {
+                return ok(true)
+            }
+            count := 0u64
+            if step > 0 {
+                count = core.wrapping_sub(i2u(limit), i2u(init))
+                if step != 1 {
+                    count = count / i2u(step)
+                }
+            } else {
+                count = core.wrapping_sub(i2u(init), i2u(limit))
+                count = count / (i2u(core.wrapping_sub(0i64, step + 1)) + 1)
+            }
+            set_int(plimit, u2i(count))
+            return ok(false)
+        }
+        flimit: f64 = 0.0
+        fstep: f64 = 0.0
+        finit: f64 = 0.0
+        if !vm_to_number(plimit, ptr.from_mut(&mut flimit)) {
+            return err(for_error(L, plimit, "limit"))
+        }
+        if !vm_to_number(pstep, ptr.from_mut(&mut fstep)) {
+            return err(for_error(L, pstep, "step"))
+        }
+        if !vm_to_number(pinit, ptr.from_mut(&mut finit)) {
+            return err(for_error(L, pinit, "initial value"))
+        }
+        if fstep == 0.0 {
+            return err(err_runtime(L, "'for' step is zero"))
+        }
+        let skip = if fstep > 0.0 { flimit < finit } else { finit < flimit }
+        if skip {
+            return ok(true)
+        }
+        set_float(pinit, finit)
+        set_float(plimit, flimit)
+        set_float(pstep, fstep)
+        set_float(ptr.offset(ra, 3), finit)
+        return ok(false)
+    }
+}
+
+// --- Varargs ----------------------------------------------------------------
+
+// VARARGPREP: move the function and its fixed parameters above the extra
+// arguments.
+fn vm_adjust_varargs(L: *mut State, ci: *mut CallInfo, nfix: i32, p: *mut Proto) -> void!Throw {
+    unsafe {
+        let actual = sdiff((*L).top, (*ci).func) as i32 - 1
+        let nextra = actual - nfix
+        (*ci).nextraargs = nextra
+        stack_check(L, ((*p).maxstacksize as isize) + 1)?
+        let func = (*ci).func
+        set_obj((*L).top, func)
+        (*L).top = ptr.offset((*L).top, 1)
+        for i in 1isize..((nfix as isize) + 1) {
+            set_obj((*L).top, ptr.offset(func, i))
+            (*ptr.offset(func, i)).tag = TAG_NIL
+            (*L).top = ptr.offset((*L).top, 1)
+        }
+        (*ci).func = ptr.offset((*ci).func, (actual as isize) + 1)
+        (*ci).top = ptr.offset((*ci).top, (actual as isize) + 1)
+        return ok()
+    }
+}
+
+// VARARG: copy `wanted` extra arguments (-1: all, setting top) to ra.
+fn vm_get_varargs(L: *mut State, ci: *mut CallInfo, ra_off: isize, wanted0: i32) -> void!Throw {
+    unsafe {
+        let nextra = (*ci).nextraargs
+        wanted := wanted0
+        if wanted < 0 {
+            wanted = nextra
+            stack_check(L, nextra as isize)?
+            (*L).top = ptr.offset(restore_stack(L, ra_off), nextra as isize)
+        }
+        let ra = restore_stack(L, ra_off)
+        let src = ptr.offset((*ci).func, -(nextra as isize))
+        let n = if wanted < nextra { wanted } else { nextra }
+        for i in 0isize..(n as isize) {
+            set_obj(ptr.offset(ra, i), ptr.offset(src, i))
+        }
+        for i in (n as isize)..(wanted as isize) {
+            (*ptr.offset(ra, i)).tag = TAG_NIL
+        }
+        return ok()
+    }
+}
+
+// --- Finishing interrupted instructions --------------------------------------
+
+// Complete the instruction of Lua frame `ci` that was interrupted by a yield
+// inside a metamethod (or __close) it called.
+fn vm_finish_op(L: *mut State, ci: *mut CallInfo) -> void!Throw {
+    unsafe {
+        let base = ptr.offset((*ci).func, 1)
+        let inst = *ptr.offset((*ci).savedpc, -1)
+        let op = op_code(inst)
+        if op == OP_MMBIN || op == OP_MMBINI || op == OP_MMBINK {
+            let prev = *ptr.offset((*ci).savedpc, -2)
+            (*L).top = ptr.offset((*L).top, -1)
+            set_obj(ptr.offset(base, arg_a(prev) as isize), (*L).top)
+        } else if op == OP_UNM || op == OP_BNOT || op == OP_LEN || op == OP_GETTABUP || op == OP_GETTABLE || op == OP_GETI || op == OP_GETFIELD || op == OP_SELF {
+            (*L).top = ptr.offset((*L).top, -1)
+            set_obj(ptr.offset(base, arg_a(inst) as isize), (*L).top)
+        } else if op == OP_LT || op == OP_LE || op == OP_LTI || op == OP_LEI || op == OP_GTI || op == OP_GEI || op == OP_EQ {
+            let res = !val_is_falsy(ptr.offset((*L).top, -1))
+            (*L).top = ptr.offset((*L).top, -1)
+            if res != arg_k(inst) {
+                (*ci).savedpc = ptr.offset((*ci).savedpc, 1)
+            }
+        } else if op == OP_CONCAT {
+            let top = ptr.offset((*L).top, -1)
+            let a = arg_a(inst)
+            let total = sdiff(ptr.offset(top, -1), ptr.offset(base, a as isize)) as i32
+            set_obj(ptr.offset(top, -2), top)
+            (*L).top = ptr.offset(top, -1)
+            vm_concat(L, total)?
+        } else if op == OP_CLOSE {
+            (*ci).savedpc = ptr.offset((*ci).savedpc, -1)
+        } else if op == OP_RETURN {
+            let ra = ptr.offset(base, arg_a(inst) as isize)
+            (*L).top = ptr.offset(ra, (*ci).nres as isize)
+            (*ci).savedpc = ptr.offset((*ci).savedpc, -1)
+        }
+        return ok()
+    }
+}
+
+// Instructions whose operand count comes from top (set by the previous one).
+fn instr_uses_top(i: u32) -> bool {
+    unsafe {
+        let op = op_code(i)
+        if op == OP_CALL || op == OP_TAILCALL {
+            return arg_b(i) == 0
+        }
+        if op == OP_RETURN {
+            return arg_b(i) == 0
+        }
+        if op == OP_SETLIST {
+            return arg_b(i) == 0
+        }
+        return false
+    }
+}
+
+// --- The interpreter loop ---------------------------------------------------
+
+fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
+    unsafe {
+        ci := startci
+        for {
+            // (Re)enter frame `ci`.
+            let cl = val_gc((*ci).func) as *mut LClosure
+            let proto = (*cl).p
+            let k = (*proto).k
+            pc := (*ci).savedpc
+            base := ptr.offset((*ci).func, 1)
+            trap := (*L).hookmask != 0
+            if trap && pc == (*proto).code && (*proto).is_vararg == 0 {
+                hook_call_lua(L, ci)?
+                base = ptr.offset((*ci).func, 1)
+            }
+            for {
+                let i = *pc
+                pc = ptr.offset(pc, 1)
+                if trap {
+                    trap = vm_trace(L, ci, pc)?
+                    base = ptr.offset((*ci).func, 1)
+                }
+                let ra = ptr.offset(base, ((i >> 7) & 255) as isize)
+                match i & 127 {
+                    0 => {
+                        // MOVE
+                        set_obj(ra, ptr.offset(base, ((i >> 16) & 255) as isize))
+                    },
+                    1 => {
+                        // LOADI
+                        set_int(ra, (arg_sbx(i)) as i64)
+                    },
+                    2 => {
+                        // LOADF
+                        set_float(ra, (arg_sbx(i)) as f64)
+                    },
+                    3 => {
+                        // LOADK
+                        set_obj(ra, ptr.offset(k, (i >> 15) as isize))
+                    },
+                    4 => {
+                        // LOADKX
+                        set_obj(ra, ptr.offset(k, (*pc >> 7) as isize))
+                        pc = ptr.offset(pc, 1)
+                    },
+                    5 => {
+                        // LOADFALSE
+                        (*ra).tag = TAG_FALSE
+                    },
+                    6 => {
+                        // LFALSESKIP
+                        (*ra).tag = TAG_FALSE
+                        pc = ptr.offset(pc, 1)
+                    },
+                    7 => {
+                        // LOADTRUE
+                        (*ra).tag = TAG_TRUE
+                    },
+                    8 => {
+                        // LOADNIL
+                        let b = ((i >> 16) & 255) as isize
+                        for j in 0isize..(b + 1) {
+                            (*ptr.offset(ra, j)).tag = TAG_NIL
+                        }
+                    },
+                    9 => {
+                        // GETUPVAL
+                        let uv = lcl_upval(cl, ((i >> 16) & 255) as isize)
+                        set_obj(ra, (*uv).v)
+                    },
+                    10 => {
+                        // SETUPVAL
+                        let uv = lcl_upval(cl, ((i >> 16) & 255) as isize)
+                        set_obj((*uv).v, ra)
+                        if ((*ra).tag & COLLECTABLE) != 0 {
+                            gc_barrier(L, uv as *mut GCObject, ra)
+                        }
+                    },
+                    11 => {
+                        // GETTABUP
+                        let upv = (*lcl_upval(cl, ((i >> 16) & 255) as isize)).v
+                        let key = ptr.offset(k, (i >> 24) as isize)
+                        if (*upv).tag == TAG_TABLE {
+                            let slot = tab_get_shortstr(val_gc(upv) as *mut Table, val_str(key))
+                            if !val_is_empty(slot) {
+                                set_obj(ra, slot)
+                            } else {
+                                (*ci).savedpc = pc
+                                (*L).top = (*ci).top
+                                vm_finish_get(L, upv, key, sdiff(ra, (*L).stack), slot)?
+                                base = ptr.offset((*ci).func, 1)
+                                trap = (*L).hookmask != 0
+                            }
+                        } else {
+                            (*ci).savedpc = pc
+                            (*L).top = (*ci).top
+                            vm_finish_get(L, upv, key, sdiff(ra, (*L).stack), 0 as *mut Value)?
+                            base = ptr.offset((*ci).func, 1)
+                            trap = (*L).hookmask != 0
+                        }
+                    },
+                    12 => {
+                        // GETTABLE
+                        let rb = ptr.offset(base, ((i >> 16) & 255) as isize)
+                        let rc = ptr.offset(base, (i >> 24) as isize)
+                        slot := 0 as *mut Value
+                        if (*rb).tag == TAG_TABLE {
+                            let t = val_gc(rb) as *mut Table
+                            if (*rc).tag == TAG_INT {
+                                slot = tab_get_int(t, val_int(rc))
+                            } else {
+                                slot = tab_get(t, rc)
+                            }
+                        }
+                        if !ptr.is_null(slot) && !val_is_empty(slot) {
+                            set_obj(ra, slot)
+                        } else {
+                            (*ci).savedpc = pc
+                            (*L).top = (*ci).top
+                            vm_finish_get(L, rb, rc, sdiff(ra, (*L).stack), slot)?
+                            base = ptr.offset((*ci).func, 1)
+                            trap = (*L).hookmask != 0
+                        }
+                    },
+                    13 => {
+                        // GETI
+                        let rb = ptr.offset(base, ((i >> 16) & 255) as isize)
+                        let c = (i >> 24) as i64
+                        slot := 0 as *mut Value
+                        if (*rb).tag == TAG_TABLE {
+                            slot = tab_get_int(val_gc(rb) as *mut Table, c)
+                        }
+                        if !ptr.is_null(slot) && !val_is_empty(slot) {
+                            set_obj(ra, slot)
+                        } else {
+                            kv := Value { bits: 0, tag: 0 }
+                            let key = ptr.from_mut(&mut kv)
+                            set_int(key, c)
+                            (*ci).savedpc = pc
+                            (*L).top = (*ci).top
+                            vm_finish_get(L, rb, key, sdiff(ra, (*L).stack), slot)?
+                            base = ptr.offset((*ci).func, 1)
+                            trap = (*L).hookmask != 0
+                        }
+                    },
+                    14 => {
+                        // GETFIELD
+                        let rb = ptr.offset(base, ((i >> 16) & 255) as isize)
+                        let key = ptr.offset(k, (i >> 24) as isize)
+                        slot := 0 as *mut Value
+                        if (*rb).tag == TAG_TABLE {
+                            slot = tab_get_shortstr(val_gc(rb) as *mut Table, val_str(key))
+                        }
+                        if !ptr.is_null(slot) && !val_is_empty(slot) {
+                            set_obj(ra, slot)
+                        } else {
+                            (*ci).savedpc = pc
+                            (*L).top = (*ci).top
+                            vm_finish_get(L, rb, key, sdiff(ra, (*L).stack), slot)?
+                            base = ptr.offset((*ci).func, 1)
+                            trap = (*L).hookmask != 0
+                        }
+                    },
+                    15 => {
+                        // SETTABUP
+                        let upv = (*lcl_upval(cl, ((i >> 7) & 255) as isize)).v
+                        let key = ptr.offset(k, ((i >> 16) & 255) as isize)
+                        let rc = if ((i >> 15) & 1) != 0 { ptr.offset(k, (i >> 24) as isize) } else { ptr.offset(base, (i >> 24) as isize) }
+                        slot := 0 as *mut Value
+                        if (*upv).tag == TAG_TABLE {
+                            slot = tab_get_shortstr(val_gc(upv) as *mut Table, val_str(key))
+                        }
+                        if !ptr.is_null(slot) && !val_is_empty(slot) {
+                            set_obj(slot, rc)
+                            gc_barrier_back(L, val_gc(upv) as *mut Table, rc)
+                        } else {
+                            (*ci).savedpc = pc
+                            (*L).top = (*ci).top
+                            vm_finish_set(L, upv, key, rc, slot)?
+                            base = ptr.offset((*ci).func, 1)
+                            trap = (*L).hookmask != 0
+                        }
+                    },
+                    16 => {
+                        // SETTABLE
+                        let rb = ptr.offset(base, ((i >> 16) & 255) as isize)
+                        let rc = if ((i >> 15) & 1) != 0 { ptr.offset(k, (i >> 24) as isize) } else { ptr.offset(base, (i >> 24) as isize) }
+                        slot := 0 as *mut Value
+                        if (*ra).tag == TAG_TABLE {
+                            let t = val_gc(ra) as *mut Table
+                            if (*rb).tag == TAG_INT {
+                                slot = tab_get_int(t, val_int(rb))
+                            } else {
+                                slot = tab_get(t, rb)
+                            }
+                        }
+                        if !ptr.is_null(slot) && !val_is_empty(slot) {
+                            set_obj(slot, rc)
+                            gc_barrier_back(L, val_gc(ra) as *mut Table, rc)
+                        } else {
+                            (*ci).savedpc = pc
+                            (*L).top = (*ci).top
+                            vm_finish_set(L, ra, rb, rc, slot)?
+                            base = ptr.offset((*ci).func, 1)
+                            trap = (*L).hookmask != 0
+                        }
+                    },
+                    17 => {
+                        // SETI
+                        let b = ((i >> 16) & 255) as i64
+                        let rc = if ((i >> 15) & 1) != 0 { ptr.offset(k, (i >> 24) as isize) } else { ptr.offset(base, (i >> 24) as isize) }
+                        slot := 0 as *mut Value
+                        if (*ra).tag == TAG_TABLE {
+                            slot = tab_get_int(val_gc(ra) as *mut Table, b)
+                        }
+                        if !ptr.is_null(slot) && !val_is_empty(slot) {
+                            set_obj(slot, rc)
+                            gc_barrier_back(L, val_gc(ra) as *mut Table, rc)
+                        } else {
+                            kv := Value { bits: 0, tag: 0 }
+                            let key = ptr.from_mut(&mut kv)
+                            set_int(key, b)
+                            (*ci).savedpc = pc
+                            (*L).top = (*ci).top
+                            vm_finish_set(L, ra, key, rc, slot)?
+                            base = ptr.offset((*ci).func, 1)
+                            trap = (*L).hookmask != 0
+                        }
+                    },
+                    18 => {
+                        // SETFIELD
+                        let key = ptr.offset(k, ((i >> 16) & 255) as isize)
+                        let rc = if ((i >> 15) & 1) != 0 { ptr.offset(k, (i >> 24) as isize) } else { ptr.offset(base, (i >> 24) as isize) }
+                        slot := 0 as *mut Value
+                        if (*ra).tag == TAG_TABLE {
+                            slot = tab_get_shortstr(val_gc(ra) as *mut Table, val_str(key))
+                        }
+                        if !ptr.is_null(slot) && !val_is_empty(slot) {
+                            set_obj(slot, rc)
+                            gc_barrier_back(L, val_gc(ra) as *mut Table, rc)
+                        } else {
+                            (*ci).savedpc = pc
+                            (*L).top = (*ci).top
+                            vm_finish_set(L, ra, key, rc, slot)?
+                            base = ptr.offset((*ci).func, 1)
+                            trap = (*L).hookmask != 0
+                        }
+                    },
+                    19 => {
+                        // NEWTABLE
+                        b := ((i >> 16) & 255) as u32
+                        c := (i >> 24) as u32
+                        if b > 0 {
+                            b = 1u32 << (b - 1)
+                        }
+                        if ((i >> 15) & 1) != 0 {
+                            c = c + (*pc >> 7) * 256
+                        }
+                        pc = ptr.offset(pc, 1)
+                        (*ci).savedpc = pc
+                        (*L).top = (*ci).top
+                        let t = tab_new(L)?
+                        set_gc(ra, t as *mut GCObject, TAG_TABLE)
+                        if b != 0 || c != 0 {
+                            tab_resize(L, t, c, b)?
+                        }
+                        gc_check(L)
+                        (*L).top = (*ci).top
+                        base = ptr.offset((*ci).func, 1)
+                        trap = (*L).hookmask != 0
+                    },
+                    20 => {
+                        // SELF
+                        let rb = ptr.offset(base, ((i >> 16) & 255) as isize)
+                        let rc = if ((i >> 15) & 1) != 0 { ptr.offset(k, (i >> 24) as isize) } else { ptr.offset(base, (i >> 24) as isize) }
+                        set_obj(ptr.offset(ra, 1), rb)
+                        slot := 0 as *mut Value
+                        if (*rb).tag == TAG_TABLE {
+                            slot = tab_get_str(val_gc(rb) as *mut Table, val_str(rc))
+                        }
+                        if !ptr.is_null(slot) && !val_is_empty(slot) {
+                            set_obj(ra, slot)
+                        } else {
+                            (*ci).savedpc = pc
+                            (*L).top = (*ci).top
+                            vm_finish_get(L, rb, rc, sdiff(ra, (*L).stack), slot)?
+                            base = ptr.offset((*ci).func, 1)
+                            trap = (*L).hookmask != 0
+                        }
+                    },
+                    21 => {
+                        // ADDI
+                        let rb = ptr.offset(base, ((i >> 16) & 255) as isize)
+                        let imm = arg_sc(i)
+                        if (*rb).tag == TAG_INT {
+                            set_int(ra, core.wrapping_add(val_int(rb), imm as i64))
+                            pc = ptr.offset(pc, 1)
+                        } else if (*rb).tag == TAG_FLOAT {
+                            set_float(ra, val_float(rb) + (imm as f64))
+                            pc = ptr.offset(pc, 1)
+                        }
+                    },
+                    22 => {
+                        // ADDK
+                        let rb = ptr.offset(base, ((i >> 16) & 255) as isize)
+                        let kc = ptr.offset(k, (i >> 24) as isize)
+                        if (*rb).tag == TAG_INT && (*kc).tag == TAG_INT {
+                            set_int(ra, core.wrapping_add(val_int(rb), val_int(kc)))
+                            pc = ptr.offset(pc, 1)
+                        } else {
+                            f1: f64 = 0.0
+                            f2: f64 = 0.0
+                            if to_float_ns(rb, ptr.from_mut(&mut f1)) && to_float_ns(kc, ptr.from_mut(&mut f2)) {
+                                set_float(ra, f1 + f2)
+                                pc = ptr.offset(pc, 1)
+                            }
+                        }
+                    },
+                    23 => {
+                        // SUBK
+                        let rb = ptr.offset(base, ((i >> 16) & 255) as isize)
+                        let kc = ptr.offset(k, (i >> 24) as isize)
+                        if (*rb).tag == TAG_INT && (*kc).tag == TAG_INT {
+                            set_int(ra, core.wrapping_sub(val_int(rb), val_int(kc)))
+                            pc = ptr.offset(pc, 1)
+                        } else {
+                            f1: f64 = 0.0
+                            f2: f64 = 0.0
+                            if to_float_ns(rb, ptr.from_mut(&mut f1)) && to_float_ns(kc, ptr.from_mut(&mut f2)) {
+                                set_float(ra, f1 - f2)
+                                pc = ptr.offset(pc, 1)
+                            }
+                        }
+                    },
+                    24 => {
+                        // MULK
+                        let rb = ptr.offset(base, ((i >> 16) & 255) as isize)
+                        let kc = ptr.offset(k, (i >> 24) as isize)
+                        if (*rb).tag == TAG_INT && (*kc).tag == TAG_INT {
+                            set_int(ra, core.wrapping_mul(val_int(rb), val_int(kc)))
+                            pc = ptr.offset(pc, 1)
+                        } else {
+                            f1: f64 = 0.0
+                            f2: f64 = 0.0
+                            if to_float_ns(rb, ptr.from_mut(&mut f1)) && to_float_ns(kc, ptr.from_mut(&mut f2)) {
+                                set_float(ra, f1 * f2)
+                                pc = ptr.offset(pc, 1)
+                            }
+                        }
+                    },
+                    25..=31 => {
+                        // MODK, POWK, DIVK, IDIVK, BANDK, BORK, BXORK
+                        let rb = ptr.offset(base, ((i >> 16) & 255) as isize)
+                        let kc = ptr.offset(k, (i >> 24) as isize)
+                        let op = arith_op_event(i & 127)
+                        (*ci).savedpc = pc
+                        (*L).top = (*ci).top
+                        if vm_arith_num(L, op, rb, kc, ra)? {
+                            pc = ptr.offset(pc, 1)
+                        }
+                    },
+                    32 => {
+                        // SHRI
+                        let rb = ptr.offset(base, ((i >> 16) & 255) as isize)
+                        ib: i64 = 0
+                        if vm_to_integer_strict(rb, ptr.from_mut(&mut ib)) {
+                            set_int(ra, vm_shiftl(ib, -(arg_sc(i) as i64)))
+                            pc = ptr.offset(pc, 1)
+                        }
+                    },
+                    33 => {
+                        // SHLI
+                        let rb = ptr.offset(base, ((i >> 16) & 255) as isize)
+                        ib: i64 = 0
+                        if vm_to_integer_strict(rb, ptr.from_mut(&mut ib)) {
+                            set_int(ra, vm_shiftl(arg_sc(i) as i64, ib))
+                            pc = ptr.offset(pc, 1)
+                        }
+                    },
+                    34 => {
+                        // ADD
+                        let rb = ptr.offset(base, ((i >> 16) & 255) as isize)
+                        let rc = ptr.offset(base, (i >> 24) as isize)
+                        if (*rb).tag == TAG_INT && (*rc).tag == TAG_INT {
+                            set_int(ra, core.wrapping_add(val_int(rb), val_int(rc)))
+                            pc = ptr.offset(pc, 1)
+                        } else {
+                            f1: f64 = 0.0
+                            f2: f64 = 0.0
+                            if to_float_ns(rb, ptr.from_mut(&mut f1)) && to_float_ns(rc, ptr.from_mut(&mut f2)) {
+                                set_float(ra, f1 + f2)
+                                pc = ptr.offset(pc, 1)
+                            }
+                        }
+                    },
+                    35 => {
+                        // SUB
+                        let rb = ptr.offset(base, ((i >> 16) & 255) as isize)
+                        let rc = ptr.offset(base, (i >> 24) as isize)
+                        if (*rb).tag == TAG_INT && (*rc).tag == TAG_INT {
+                            set_int(ra, core.wrapping_sub(val_int(rb), val_int(rc)))
+                            pc = ptr.offset(pc, 1)
+                        } else {
+                            f1: f64 = 0.0
+                            f2: f64 = 0.0
+                            if to_float_ns(rb, ptr.from_mut(&mut f1)) && to_float_ns(rc, ptr.from_mut(&mut f2)) {
+                                set_float(ra, f1 - f2)
+                                pc = ptr.offset(pc, 1)
+                            }
+                        }
+                    },
+                    36 => {
+                        // MUL
+                        let rb = ptr.offset(base, ((i >> 16) & 255) as isize)
+                        let rc = ptr.offset(base, (i >> 24) as isize)
+                        if (*rb).tag == TAG_INT && (*rc).tag == TAG_INT {
+                            set_int(ra, core.wrapping_mul(val_int(rb), val_int(rc)))
+                            pc = ptr.offset(pc, 1)
+                        } else {
+                            f1: f64 = 0.0
+                            f2: f64 = 0.0
+                            if to_float_ns(rb, ptr.from_mut(&mut f1)) && to_float_ns(rc, ptr.from_mut(&mut f2)) {
+                                set_float(ra, f1 * f2)
+                                pc = ptr.offset(pc, 1)
+                            }
+                        }
+                    },
+                    37..=45 => {
+                        // MOD, POW, DIV, IDIV, BAND, BOR, BXOR, SHL, SHR
+                        let rb = ptr.offset(base, ((i >> 16) & 255) as isize)
+                        let rc = ptr.offset(base, (i >> 24) as isize)
+                        let op = arith_op_event(i & 127)
+                        (*ci).savedpc = pc
+                        (*L).top = (*ci).top
+                        if vm_arith_num(L, op, rb, rc, ra)? {
+                            pc = ptr.offset(pc, 1)
+                        }
+                    },
+                    46 => {
+                        // MMBIN
+                        let rb = ptr.offset(base, ((i >> 16) & 255) as isize)
+                        let prev = *ptr.offset(pc, -2)
+                        let res = ptr.offset(base, ((prev >> 7) & 255) as isize)
+                        (*ci).savedpc = pc
+                        (*L).top = (*ci).top
+                        meta_trybin(L, ra, rb, sdiff(res, (*L).stack), (i >> 24) as u32)?
+                        base = ptr.offset((*ci).func, 1)
+                        trap = (*L).hookmask != 0
+                    },
+                    47 => {
+                        // MMBINI
+                        let prev = *ptr.offset(pc, -2)
+                        let res = ptr.offset(base, ((prev >> 7) & 255) as isize)
+                        kv := Value { bits: 0, tag: 0 }
+                        let imm = ptr.from_mut(&mut kv)
+                        set_int(imm, arg_sb(i) as i64)
+                        (*ci).savedpc = pc
+                        (*L).top = (*ci).top
+                        meta_trybin_k(L, ra, imm, ((i >> 15) & 1) != 0, sdiff(res, (*L).stack), (i >> 24) as u32)?
+                        base = ptr.offset((*ci).func, 1)
+                        trap = (*L).hookmask != 0
+                    },
+                    48 => {
+                        // MMBINK
+                        let prev = *ptr.offset(pc, -2)
+                        let res = ptr.offset(base, ((prev >> 7) & 255) as isize)
+                        let imm = ptr.offset(k, ((i >> 16) & 255) as isize)
+                        (*ci).savedpc = pc
+                        (*L).top = (*ci).top
+                        meta_trybin_k(L, ra, imm, ((i >> 15) & 1) != 0, sdiff(res, (*L).stack), (i >> 24) as u32)?
+                        base = ptr.offset((*ci).func, 1)
+                        trap = (*L).hookmask != 0
+                    },
+                    49 => {
+                        // UNM
+                        let rb = ptr.offset(base, ((i >> 16) & 255) as isize)
+                        if (*rb).tag == TAG_INT {
+                            set_int(ra, core.wrapping_sub(0i64, val_int(rb)))
+                        } else if (*rb).tag == TAG_FLOAT {
+                            set_float(ra, -val_float(rb))
+                        } else {
+                            (*ci).savedpc = pc
+                            (*L).top = (*ci).top
+                            meta_trybin(L, rb, rb, sdiff(ra, (*L).stack), TM_UNM)?
+                            base = ptr.offset((*ci).func, 1)
+                            trap = (*L).hookmask != 0
+                        }
+                    },
+                    50 => {
+                        // BNOT
+                        let rb = ptr.offset(base, ((i >> 16) & 255) as isize)
+                        ib: i64 = 0
+                        if vm_to_integer_strict(rb, ptr.from_mut(&mut ib)) {
+                            set_int(ra, ~ib)
+                        } else {
+                            (*ci).savedpc = pc
+                            (*L).top = (*ci).top
+                            meta_trybin(L, rb, rb, sdiff(ra, (*L).stack), TM_BNOT)?
+                            base = ptr.offset((*ci).func, 1)
+                            trap = (*L).hookmask != 0
+                        }
+                    },
+                    51 => {
+                        // NOT
+                        let rb = ptr.offset(base, ((i >> 16) & 255) as isize)
+                        if val_is_falsy(rb) {
+                            (*ra).tag = TAG_TRUE
+                        } else {
+                            (*ra).tag = TAG_FALSE
+                        }
+                    },
+                    52 => {
+                        // LEN
+                        let rb = ptr.offset(base, ((i >> 16) & 255) as isize)
+                        if (*rb).tag == TAG_TABLE && ptr.is_null((*(val_gc(rb) as *mut Table)).metatable) {
+                            set_int(ra, u2i(tab_length(val_gc(rb) as *mut Table)))
+                        } else {
+                            (*ci).savedpc = pc
+                            (*L).top = (*ci).top
+                            vm_objlen(L, sdiff(ra, (*L).stack), rb)?
+                            base = ptr.offset((*ci).func, 1)
+                            trap = (*L).hookmask != 0
+                        }
+                    },
+                    53 => {
+                        // CONCAT
+                        let n = ((i >> 16) & 255) as i32
+                        (*L).top = ptr.offset(ra, n as isize)
+                        (*ci).savedpc = pc
+                        vm_concat(L, n)?
+                        (*L).top = (*ci).top
+                        gc_check(L)
+                        base = ptr.offset((*ci).func, 1)
+                        trap = (*L).hookmask != 0
+                    },
+                    54 => {
+                        // CLOSE
+                        (*ci).savedpc = pc
+                        (*L).top = (*ci).top
+                        do_close(L, sdiff(ra, (*L).stack), ST_OK as i32, true)?
+                        base = ptr.offset((*ci).func, 1)
+                        trap = (*L).hookmask != 0
+                    },
+                    55 => {
+                        // TBC
+                        (*ci).savedpc = pc
+                        (*L).top = (*ci).top
+                        tbc_mark(L, sdiff(ra, (*L).stack))?
+                    },
+                    56 => {
+                        // JMP
+                        pc = ptr.offset(pc, arg_sj(i) as isize)
+                        trap = (*L).hookmask != 0
+                    },
+                    57 => {
+                        // EQ
+                        let rb = ptr.offset(base, ((i >> 16) & 255) as isize)
+                        cond := false
+                        if (*ra).tag == (*rb).tag && (*ra).tag == TAG_INT {
+                            cond = val_int(ra) == val_int(rb)
+                        } else {
+                            (*ci).savedpc = pc
+                            (*L).top = (*ci).top
+                            cond = vm_equal(L, ra, rb)?
+                            base = ptr.offset((*ci).func, 1)
+                            trap = (*L).hookmask != 0
+                        }
+                        if cond != (((i >> 15) & 1) != 0) {
+                            pc = ptr.offset(pc, 1)
+                        } else {
+                            pc = ptr.offset(pc, (arg_sj(*pc) + 1) as isize)
+                            trap = (*L).hookmask != 0
+                        }
+                    },
+                    58 => {
+                        // LT
+                        let rb = ptr.offset(base, ((i >> 16) & 255) as isize)
+                        cond := false
+                        if (*ra).tag == TAG_INT && (*rb).tag == TAG_INT {
+                            cond = val_int(ra) < val_int(rb)
+                        } else if both_numbers(ra, rb) {
+                            cond = num_lt(ra, rb)
+                        } else {
+                            (*ci).savedpc = pc
+                            (*L).top = (*ci).top
+                            cond = vm_less_than(L, ra, rb)?
+                            base = ptr.offset((*ci).func, 1)
+                            trap = (*L).hookmask != 0
+                        }
+                        if cond != (((i >> 15) & 1) != 0) {
+                            pc = ptr.offset(pc, 1)
+                        } else {
+                            pc = ptr.offset(pc, (arg_sj(*pc) + 1) as isize)
+                            trap = (*L).hookmask != 0
+                        }
+                    },
+                    59 => {
+                        // LE
+                        let rb = ptr.offset(base, ((i >> 16) & 255) as isize)
+                        cond := false
+                        if (*ra).tag == TAG_INT && (*rb).tag == TAG_INT {
+                            cond = val_int(ra) <= val_int(rb)
+                        } else if both_numbers(ra, rb) {
+                            cond = num_le(ra, rb)
+                        } else {
+                            (*ci).savedpc = pc
+                            (*L).top = (*ci).top
+                            cond = vm_less_equal(L, ra, rb)?
+                            base = ptr.offset((*ci).func, 1)
+                            trap = (*L).hookmask != 0
+                        }
+                        if cond != (((i >> 15) & 1) != 0) {
+                            pc = ptr.offset(pc, 1)
+                        } else {
+                            pc = ptr.offset(pc, (arg_sj(*pc) + 1) as isize)
+                            trap = (*L).hookmask != 0
+                        }
+                    },
+                    60 => {
+                        // EQK
+                        let kb = ptr.offset(k, ((i >> 16) & 255) as isize)
+                        let cond = vm_raw_equal(ra, kb)
+                        if cond != (((i >> 15) & 1) != 0) {
+                            pc = ptr.offset(pc, 1)
+                        } else {
+                            pc = ptr.offset(pc, (arg_sj(*pc) + 1) as isize)
+                            trap = (*L).hookmask != 0
+                        }
+                    },
+                    61 => {
+                        // EQI
+                        let im = arg_sb(i)
+                        cond := false
+                        if (*ra).tag == TAG_INT {
+                            cond = val_int(ra) == (im as i64)
+                        } else if (*ra).tag == TAG_FLOAT {
+                            cond = val_float(ra) == (im as f64)
+                        }
+                        if cond != (((i >> 15) & 1) != 0) {
+                            pc = ptr.offset(pc, 1)
+                        } else {
+                            pc = ptr.offset(pc, (arg_sj(*pc) + 1) as isize)
+                            trap = (*L).hookmask != 0
+                        }
+                    },
+                    62..=65 => {
+                        // LTI, LEI, GTI, GEI
+                        let im = arg_sb(i)
+                        let op = i & 127
+                        cond := false
+                        if (*ra).tag == TAG_INT {
+                            let a = val_int(ra)
+                            let b = im as i64
+                            cond = if op == 62 { a < b } else if op == 63 { a <= b } else if op == 64 { a > b } else { a >= b }
+                        } else if (*ra).tag == TAG_FLOAT {
+                            let a = val_float(ra)
+                            let b = im as f64
+                            cond = if op == 62 { a < b } else if op == 63 { a <= b } else if op == 64 { a > b } else { a >= b }
+                        } else {
+                            let isf = (i >> 24) != 0
+                            (*ci).savedpc = pc
+                            (*L).top = (*ci).top
+                            if op == 62 {
+                                cond = meta_call_order_imm(L, ra, im, false, isf, TM_LT)?
+                            } else if op == 63 {
+                                cond = meta_call_order_imm(L, ra, im, false, isf, TM_LE)?
+                            } else if op == 64 {
+                                cond = meta_call_order_imm(L, ra, im, true, isf, TM_LT)?
+                            } else {
+                                cond = meta_call_order_imm(L, ra, im, true, isf, TM_LE)?
+                            }
+                            base = ptr.offset((*ci).func, 1)
+                            trap = (*L).hookmask != 0
+                        }
+                        if cond != (((i >> 15) & 1) != 0) {
+                            pc = ptr.offset(pc, 1)
+                        } else {
+                            pc = ptr.offset(pc, (arg_sj(*pc) + 1) as isize)
+                            trap = (*L).hookmask != 0
+                        }
+                    },
+                    66 => {
+                        // TEST
+                        let cond = !val_is_falsy(ra)
+                        if cond != (((i >> 15) & 1) != 0) {
+                            pc = ptr.offset(pc, 1)
+                        } else {
+                            pc = ptr.offset(pc, (arg_sj(*pc) + 1) as isize)
+                            trap = (*L).hookmask != 0
+                        }
+                    },
+                    67 => {
+                        // TESTSET
+                        let rb = ptr.offset(base, ((i >> 16) & 255) as isize)
+                        if val_is_falsy(rb) == (((i >> 15) & 1) != 0) {
+                            pc = ptr.offset(pc, 1)
+                        } else {
+                            set_obj(ra, rb)
+                            pc = ptr.offset(pc, (arg_sj(*pc) + 1) as isize)
+                            trap = (*L).hookmask != 0
+                        }
+                    },
+                    68 => {
+                        // CALL
+                        let b = ((i >> 16) & 255) as isize
+                        let nresults = ((i >> 24) as i32) - 1
+                        if b != 0 {
+                            (*L).top = ptr.offset(ra, b)
+                        }
+                        (*ci).savedpc = pc
+                        let newci = precall(L, ra, nresults)?
+                        if ptr.is_null(newci) {
+                            base = ptr.offset((*ci).func, 1)
+                            trap = (*L).hookmask != 0
+                        } else {
+                            ci = newci
+                            break
+                        }
+                    },
+                    69 => {
+                        // TAILCALL
+                        b := ((i >> 16) & 255) as i32
+                        let nparams1 = (i >> 24) as i32
+                        let delta = if nparams1 != 0 { (*ci).nextraargs + nparams1 } else { 0i32 }
+                        if b != 0 {
+                            (*L).top = ptr.offset(ra, b as isize)
+                        } else {
+                            b = sdiff((*L).top, ra) as i32
+                        }
+                        (*ci).savedpc = pc
+                        if ((i >> 15) & 1) != 0 {
+                            func_close_upvals(L, base)
+                        }
+                        let n = pretailcall(L, ci, ra, b, delta)?
+                        if n < 0 {
+                            break
+                        }
+                        (*ci).func = ptr.offset((*ci).func, -(delta as isize))
+                        poscall(L, ci, n)?
+                        if ((*ci).callstatus & CIST_FRESH) != 0 {
+                            return ok()
+                        }
+                        ci = (*ci).previous
+                        break
+                    },
+                    70 => {
+                        // RETURN
+                        n := ((i >> 16) & 255) as i32 - 1
+                        let nparams1 = (i >> 24) as i32
+                        if n < 0 {
+                            n = sdiff((*L).top, ra) as i32
+                        }
+                        (*ci).savedpc = pc
+                        ra_off := sdiff(ra, (*L).stack)
+                        if ((i >> 15) & 1) != 0 {
+                            (*ci).nres = n
+                            if ((*L).top as usize) < ((*ci).top as usize) {
+                                (*L).top = (*ci).top
+                            }
+                            do_close(L, sdiff(base, (*L).stack), CLOSE_KTOP, true)?
+                        }
+                        if nparams1 != 0 {
+                            (*ci).func = ptr.offset((*ci).func, -(((*ci).nextraargs + nparams1) as isize))
+                        }
+                        (*L).top = ptr.offset((*L).stack, ra_off + (n as isize))
+                        poscall(L, ci, n)?
+                        if ((*ci).callstatus & CIST_FRESH) != 0 {
+                            return ok()
+                        }
+                        ci = (*ci).previous
+                        break
+                    },
+                    71 => {
+                        // RETURN0
+                        if (*L).hookmask != 0 {
+                            (*ci).savedpc = pc
+                            (*L).top = ra
+                            poscall(L, ci, 0)?
+                        } else {
+                            nres := (*ci).nresults
+                            (*L).ci = (*ci).previous
+                            (*L).top = ptr.offset(base, -1)
+                            for nres > 0 {
+                                (*(*L).top).tag = TAG_NIL
+                                (*L).top = ptr.offset((*L).top, 1)
+                                nres -= 1
+                            }
+                        }
+                        if ((*ci).callstatus & CIST_FRESH) != 0 {
+                            return ok()
+                        }
+                        ci = (*ci).previous
+                        break
+                    },
+                    72 => {
+                        // RETURN1
+                        if (*L).hookmask != 0 {
+                            (*ci).savedpc = pc
+                            (*L).top = ptr.offset(ra, 1)
+                            poscall(L, ci, 1)?
+                        } else {
+                            nres := (*ci).nresults
+                            (*L).ci = (*ci).previous
+                            let res = ptr.offset(base, -1)
+                            if nres == 0 {
+                                (*L).top = res
+                            } else {
+                                set_obj(res, ra)
+                                (*L).top = base
+                                for nres > 1 {
+                                    (*(*L).top).tag = TAG_NIL
+                                    (*L).top = ptr.offset((*L).top, 1)
+                                    nres -= 1
+                                }
+                            }
+                        }
+                        if ((*ci).callstatus & CIST_FRESH) != 0 {
+                            return ok()
+                        }
+                        ci = (*ci).previous
+                        break
+                    },
+                    73 => {
+                        // FORLOOP
+                        if (*ptr.offset(ra, 2)).tag == TAG_INT {
+                            let count = i2u(val_int(ptr.offset(ra, 1)))
+                            if count > 0 {
+                                let step = val_int(ptr.offset(ra, 2))
+                                let idx = core.wrapping_add(val_int(ra), step)
+                                *(ptr.offset(ra, 1) as *mut i64) = u2i(count - 1)
+                                *(ra as *mut i64) = idx
+                                set_int(ptr.offset(ra, 3), idx)
+                                pc = ptr.offset(pc, -((i >> 15) as isize))
+                            }
+                        } else {
+                            let step = val_float(ptr.offset(ra, 2))
+                            let limit = val_float(ptr.offset(ra, 1))
+                            let idx = val_float(ra) + step
+                            let cont = if step > 0.0 { idx <= limit } else { limit <= idx }
+                            if cont {
+                                *(ra as *mut f64) = idx
+                                set_float(ptr.offset(ra, 3), idx)
+                                pc = ptr.offset(pc, -((i >> 15) as isize))
+                            }
+                        }
+                        trap = (*L).hookmask != 0
+                    },
+                    74 => {
+                        // FORPREP
+                        (*ci).savedpc = pc
+                        (*L).top = (*ci).top
+                        if vm_forprep(L, ra)? {
+                            pc = ptr.offset(pc, ((i >> 15) as isize) + 1)
+                        }
+                    },
+                    75 => {
+                        // TFORPREP
+                        (*ci).savedpc = pc
+                        (*L).top = (*ci).top
+                        tbc_mark(L, sdiff(ra, (*L).stack) + 3)?
+                        pc = ptr.offset(pc, (i >> 15) as isize)
+                    },
+                    76 => {
+                        // TFORCALL
+                        let cb = ptr.offset(ra, 4)
+                        set_obj(ptr.offset(cb, 2), ptr.offset(ra, 2))
+                        set_obj(ptr.offset(cb, 1), ptr.offset(ra, 1))
+                        set_obj(cb, ra)
+                        (*L).top = ptr.offset(cb, 3)
+                        (*ci).savedpc = pc
+                        call_value(L, cb, (i >> 24) as i32)?
+                        base = ptr.offset((*ci).func, 1)
+                        trap = (*L).hookmask != 0
+                    },
+                    77 => {
+                        // TFORLOOP
+                        if !val_is_nil(ptr.offset(ra, 4)) {
+                            set_obj(ptr.offset(ra, 2), ptr.offset(ra, 4))
+                            pc = ptr.offset(pc, -((i >> 15) as isize))
+                        }
+                    },
+                    78 => {
+                        // SETLIST
+                        n := ((i >> 16) & 255) as u32
+                        last := (i >> 24) as u32
+                        let h = val_gc(ra) as *mut Table
+                        if n == 0 {
+                            n = (sdiff((*L).top, ra) - 1) as u32
+                        } else {
+                            (*L).top = (*ci).top
+                        }
+                        last = last + n
+                        if ((i >> 15) & 1) != 0 {
+                            last = last + (*pc >> 7) * 256
+                            pc = ptr.offset(pc, 1)
+                        }
+                        if last > (*h).asize {
+                            (*ci).savedpc = pc
+                            tab_resize_array(L, h, last)?
+                        }
+                        let arr = (*h).array
+                        for n > 0 {
+                            let v = ptr.offset(ra, n as isize)
+                            set_obj(ptr.offset(arr, (last - 1) as isize), v)
+                            gc_barrier_back(L, h, v)
+                            last -= 1
+                            n -= 1
+                        }
+                        (*L).top = (*ci).top
+                    },
+                    79 => {
+                        // CLOSURE
+                        let p = *ptr.offset((*proto).p, (i >> 15) as isize)
+                        (*ci).savedpc = pc
+                        (*L).top = (*ci).top
+                        func_push_closure(L, p, cl, base, ra)?
+                        gc_check(L)
+                        base = ptr.offset((*ci).func, 1)
+                        trap = (*L).hookmask != 0
+                    },
+                    80 => {
+                        // VARARG
+                        let n = ((i >> 24) as i32) - 1
+                        (*ci).savedpc = pc
+                        vm_get_varargs(L, ci, sdiff(ra, (*L).stack), n)?
+                        base = ptr.offset((*ci).func, 1)
+                        trap = (*L).hookmask != 0
+                    },
+                    81 => {
+                        // VARARGPREP
+                        (*ci).savedpc = pc
+                        vm_adjust_varargs(L, ci, ((i >> 7) & 255) as i32, proto)?
+                        base = ptr.offset((*ci).func, 1)
+                        trap = (*L).hookmask != 0
+                        if trap {
+                            hook_call_lua(L, ci)?
+                            // The line hook must see the first real instruction as new.
+                            (*L).oldpc = 0
+                            base = ptr.offset((*ci).func, 1)
+                        }
+                    },
+                    _ => {
+                        // EXTRAARG (never executed) or an invalid opcode.
+                        (*ci).savedpc = pc
+                        return err(err_runtime(L, "invalid instruction"))
+                    },
+                }
+            }
+        }
+    }
+}
+
+// TM event of an arithmetic opcode (ADDK..BXORK, ADD..SHR).
+fn arith_op_event(op: u32) -> u32 {
+    unsafe {
+        if op >= OP_ADDK && op <= OP_BXORK {
+            return op - OP_ADDK + TM_ADD
+        }
+        return op - OP_ADD + TM_ADD
+    }
+}

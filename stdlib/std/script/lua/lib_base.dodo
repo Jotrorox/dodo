@@ -1,0 +1,510 @@
+package lua
+
+import "core/mem"
+import "core/ptr"
+
+// The basic library (_G): print, type, pcall, error, load, pairs, ...
+
+fn base_print(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        let n = cx.get_top()
+        for i in 1i32..(n + 1) {
+            let s = cx.to_lstring_meta(i)?
+            if i > 1 {
+                write_stdout(b"\t")
+            }
+            write_stdout(s.bytes())
+            cx.pop(1)
+        }
+        write_stdout(b"\n")
+        flush_stdout()
+        return ok(0)
+    }
+}
+
+fn base_tostring(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        cx.check_any(1)?
+        cx.to_lstring_meta(1)?
+        return ok(1)
+    }
+}
+
+fn base_type(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        let t = cx.type_of(1)
+        cx.arg_check(t != TNONE, 1, "value expected")?
+        let tn = type_name(t as u8)
+        cx.push_str(tn)?
+        return ok(1)
+    }
+}
+
+fn base_error(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        let level = cx.opt_integer(2, 1)?
+        cx.set_top(1)
+        if cx.type_of(1) == TSTRING && level > 0 {
+            cx.where_(level as i32)?
+            cx.push_value(1)
+            cx.concat(2)?
+        }
+        return err(cx.error())
+    }
+}
+
+fn base_assert(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        if cx.to_boolean(1) {
+            return ok(cx.get_top())
+        }
+        cx.check_any(1)?
+        cx.remove(1)
+        cx.push_str("assertion failed!")?
+        cx.set_top(1)
+        return base_error(cx)
+    }
+}
+
+fn base_finish_pcall(cx: &mut Cx, status: i32, extra: isize) -> i32!Throw {
+    unsafe {
+        if status != OK && status != YIELD {
+            cx.push_boolean(false)
+            cx.push_value(-2)
+            return ok(2)
+        }
+        return ok(cx.get_top() - (extra as i32))
+    }
+}
+
+fn base_pcall(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        cx.check_any(1)?
+        cx.push_boolean(true)
+        cx.insert(1)
+        let nargs = cx.get_top() - 2
+        let status = cx.pcall_k(nargs, MULTRET_ALL, 0, 0, base_finish_pcall)?
+        return base_finish_pcall(cx, status, 0)
+    }
+}
+
+fn base_xpcall(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        let n = cx.get_top()
+        cx.check_type(2, TFUNCTION)?
+        cx.push_boolean(true)
+        cx.push_value(1)
+        cx.rotate(3, 2)
+        let status = cx.pcall_k(n - 2, MULTRET_ALL, 2, 2, base_finish_pcall)?
+        return base_finish_pcall(cx, status, 2)
+    }
+}
+
+fn base_select(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        let n = cx.get_top() as i64
+        if cx.type_of(1) == TSTRING {
+            let s = cx.to_lstr(1)?
+            match s {
+                some(v) => {
+                    let b = v.bytes()
+                    if b.len > 0 && b[0] == b'#' {
+                        cx.push_integer(n - 1)
+                        return ok(1)
+                    }
+                },
+                none => {},
+            }
+        }
+        i := cx.check_integer(1)?
+        if i < 0 {
+            i = n + i
+        } else if i > n {
+            i = n
+        }
+        cx.arg_check(1 <= i, 1, "index out of range")?
+        return ok((n - i) as i32)
+    }
+}
+
+fn base_rawequal(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        cx.check_any(1)?
+        cx.check_any(2)?
+        let eq = cx.raw_equal(1, 2)
+        cx.push_boolean(eq)
+        return ok(1)
+    }
+}
+
+fn base_rawlen(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        let t = cx.type_of(1)
+        cx.arg_expected(t == TTABLE || t == TSTRING, 1, "table or string")?
+        let rl = cx.raw_len(1) as i64
+        cx.push_integer(rl)
+        return ok(1)
+    }
+}
+
+fn base_rawget(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        cx.check_type(1, TTABLE)?
+        cx.check_any(2)?
+        cx.set_top(2)
+        cx.raw_get(1)
+        return ok(1)
+    }
+}
+
+fn base_rawset(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        cx.check_type(1, TTABLE)?
+        cx.check_any(2)?
+        cx.check_any(3)?
+        cx.set_top(3)
+        cx.raw_set(1)?
+        return ok(1)
+    }
+}
+
+fn base_getmetatable(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        cx.check_any(1)?
+        if !cx.get_metatable(1) {
+            cx.push_nil()
+            return ok(1)
+        }
+        cx.get_metafield(1, "__metatable")?
+        return ok(1)
+    }
+}
+
+fn base_setmetatable(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        let t = cx.type_of(2)
+        cx.check_type(1, TTABLE)?
+        cx.arg_expected(t == TNIL || t == TTABLE, 2, "nil or table")?
+        if cx.get_metafield(1, "__metatable")? != TNIL {
+            return err(cx.error_msg("cannot change a protected metatable"))
+        }
+        cx.set_top(2)
+        cx.set_metatable(1)
+        return ok(1)
+    }
+}
+
+fn base_next(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        cx.check_type(1, TTABLE)?
+        cx.set_top(2)
+        if cx.next(1)? {
+            return ok(2)
+        }
+        cx.push_nil()
+        return ok(1)
+    }
+}
+
+fn base_pairs_cont(cx: &mut Cx, status: i32, ctx: isize) -> i32!Throw {
+    unsafe {
+        return ok(3)
+    }
+}
+
+fn base_pairs(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        cx.check_any(1)?
+        if cx.get_metafield(1, "__pairs")? == TNIL {
+            cx.push_native(base_next)?
+            cx.push_value(1)
+            cx.push_nil()
+        } else {
+            cx.push_value(1)
+            cx.call_k(1, 3, 0, base_pairs_cont)?
+        }
+        return ok(3)
+    }
+}
+
+fn base_ipairs_aux(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        let i = core.wrapping_add(cx.check_integer(2)?, 1)
+        cx.push_integer(i)
+        if cx.get_i(1, i)? == TNIL {
+            return ok(1)
+        }
+        return ok(2)
+    }
+}
+
+fn base_ipairs(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        cx.check_any(1)?
+        cx.push_native(base_ipairs_aux)?
+        cx.push_value(1)
+        cx.push_integer(0)
+        return ok(3)
+    }
+}
+
+fn base_tonumber(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        if cx.is_none_or_nil(2) {
+            if cx.type_of(1) == TNUMBER {
+                cx.set_top(1)
+                return ok(1)
+            }
+            if cx.type_of(1) == TSTRING {
+                let s = cx.to_lstr(1)?
+                match s {
+                    some(v) => {
+                        let b = v.bytes()
+                        if cx.string_to_number(b) == b.len + 1 {
+                            return ok(1)
+                        }
+                    },
+                    none => {},
+                }
+            }
+            cx.check_any(1)?
+        } else {
+            let base = cx.check_integer(2)?
+            cx.check_type(1, TSTRING)?
+            let s = cx.check_lstr(1)?
+            cx.arg_check(2 <= base && base <= 36, 2, "base out of range")?
+            n: i64 = 0
+            if num_string_to_int_base(s.bytes(), base as i32, &mut n) {
+                cx.push_integer(n)
+                return ok(1)
+            }
+        }
+        cx.push_fail()
+        return ok(1)
+    }
+}
+
+fn base_gc_result(cx: &mut Cx) -> bool {
+    unsafe {
+        unsafe { return ((*G(cx.L)).gcstp & GCSTP_GC) != 0 }
+    }
+}
+
+fn base_collectgarbage(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        let opts = ["stop", "restart", "collect", "count", "step", "setpause", "setstepmul", "isrunning", "generational", "incremental"]
+        let o = cx.check_option(1, "collect", &opts)?
+        if base_gc_result(cx) {
+            // Not allowed inside a finalizer.
+            cx.push_fail()
+            return ok(1)
+        }
+        if o == 0 {
+            cx.gc_stop()
+            cx.push_integer(0)
+        } else if o == 1 {
+            cx.gc_restart()
+            cx.push_integer(0)
+        } else if o == 2 {
+            cx.gc_collect()
+            cx.push_integer(0)
+        } else if o == 3 {
+            let kb = (cx.gc_count_bytes() as f64) / 1024.0
+            cx.push_number(kb)
+        } else if o == 4 {
+            let step = cx.opt_integer(2, 0)?
+            let r = cx.gc_step(step)
+            cx.push_boolean(r)
+        } else if o == 5 {
+            let p = cx.opt_integer(2, 0)?
+            let prev = cx.gc_set_pause(p as i32)
+            cx.push_integer(prev as i64)
+        } else if o == 6 {
+            let p = cx.opt_integer(2, 0)?
+            let prev = cx.gc_set_stepmul(p as i32)
+            cx.push_integer(prev as i64)
+        } else if o == 7 {
+            let running = cx.gc_is_running()
+            cx.push_boolean(running)
+        } else if o == 8 {
+            let minormul = cx.opt_integer(2, 0)?
+            let majormul = cx.opt_integer(3, 0)?
+            let prev = cx.gc_generational(minormul as i32, majormul as i32)
+            cx.push_str(prev)?
+        } else {
+            let pause = cx.opt_integer(2, 0)?
+            let stepmul = cx.opt_integer(3, 0)?
+            let stepsize = cx.opt_integer(4, 0)?
+            let prev = cx.gc_incremental(pause as i32, stepmul as i32, stepsize as i32)
+            cx.push_str(prev)?
+        }
+        return ok(1)
+    }
+}
+
+// Result of load/loadfile: the function (with `env` as first upvalue), or
+// fail plus the message.
+fn base_load_aux(cx: &mut Cx, status: i32, envidx: i32) -> i32!Throw {
+    unsafe {
+        if status == OK {
+            if envidx != 0 {
+                cx.push_value(envidx)
+                match cx.set_upvalue(-2, 1) {
+                    some(_) => {},
+                    none => { cx.pop(1) },
+                }
+            }
+            return ok(1)
+        }
+        cx.push_fail()
+        cx.insert(-2)
+        return ok(2)
+    }
+}
+
+fn base_load(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        let envidx = if !cx.is_none(4) { 4i32 } else { 0i32 }
+        let mode = cx.opt_lstr(3, b"bt")?
+        if cx.type_of(1) == TSTRING || cx.type_of(1) == TNUMBER {
+            let s = cx.check_lstr(1)?
+            let name = cx.opt_lstr(2, s.bytes())?
+            let st = cx.load_bytes(s.bytes(), name.bytes(), mode.bytes())
+            return base_load_aux(cx, st, envidx)
+        }
+        // Reader function: collect the pieces first.
+        let name = cx.opt_lstr(2, b"=(load)")?
+        cx.check_type(1, TFUNCTION)?
+        buf := Buffer.new(cx)
+        for {
+            cx.check_stack_msg(2, "too many nested functions")?
+            cx.push_value(1)
+            let st = cx.pcall(0, 1, 0)
+            if st != OK {
+                return base_load_aux(cx, st, envidx)
+            }
+            if cx.is_nil(-1) {
+                cx.pop(1)
+                break
+            }
+            if cx.type_of(-1) != TSTRING {
+                cx.pop(1)
+                let e = cx.error_msg("reader function must return a string")
+                if e == Throw.Runtime {
+                    unsafe { L_push_value(cx.L, L_errobj(cx.L)) }
+                    return base_load_aux(cx, ERRRUN, envidx)
+                }
+                return err(e)
+            }
+            let piece = cx.to_lstr(-1)?
+            match piece {
+                some(p) => {
+                    if p.size() == 0 {
+                        cx.pop(1)
+                        break
+                    }
+                    buf.add_raw(p.as_ptr(), p.size())?
+                },
+                none => {},
+            }
+            cx.pop(1)
+        }
+        let st = cx.load_bytes(buf.bytes(), name.bytes(), mode.bytes())
+        return base_load_aux(cx, st, envidx)
+    }
+}
+
+fn base_loadfile(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        let envidx = if !cx.is_none(3) { 3i32 } else { 0i32 }
+        let mode = cx.opt_lstr(2, b"bt")?
+        st := 0i32
+        if cx.is_none_or_nil(1) {
+            st = cx.load_file(none, mode.bytes())
+        } else {
+            let f = cx.check_lstr(1)?
+            st = cx.load_file(some(f.bytes()), mode.bytes())
+        }
+        return base_load_aux(cx, st, envidx)
+    }
+}
+
+fn base_dofile_cont(cx: &mut Cx, status: i32, ctx: isize) -> i32!Throw {
+    unsafe {
+        return ok(cx.get_top() - 1)
+    }
+}
+
+fn base_dofile(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        st := 0i32
+        if cx.is_none_or_nil(1) {
+            cx.set_top(1)
+            st = cx.load_file(none, b"bt")
+        } else {
+            let f = cx.check_lstr(1)?
+            cx.set_top(1)
+            st = cx.load_file(some(f.bytes()), b"bt")
+        }
+        if st != OK {
+            return err(cx.error())
+        }
+        cx.call_k(0, MULTRET_ALL, 0, base_dofile_cont)?
+        return base_dofile_cont(cx, OK, 0)
+    }
+}
+
+fn base_warn(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        let n = cx.get_top()
+        cx.check_lstr(1)?
+        for i in 2i32..(n + 1) {
+            cx.check_lstr(i)?
+        }
+        for i in 1i32..n {
+            let s = cx.check_lstr(i)?
+            cx.warning(s.bytes(), true)
+        }
+        let last = cx.check_lstr(n)?
+        cx.warning(last.bytes(), false)
+        return ok(0)
+    }
+}
+
+// Open the basic library into the globals table (pushes it).
+pub fn open_base(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        let funcs = [
+            ("assert", base_assert),
+            ("collectgarbage", base_collectgarbage),
+            ("dofile", base_dofile),
+            ("error", base_error),
+            ("getmetatable", base_getmetatable),
+            ("ipairs", base_ipairs),
+            ("loadfile", base_loadfile),
+            ("load", base_load),
+            ("next", base_next),
+            ("pairs", base_pairs),
+            ("pcall", base_pcall),
+            ("print", base_print),
+            ("warn", base_warn),
+            ("rawequal", base_rawequal),
+            ("rawlen", base_rawlen),
+            ("rawget", base_rawget),
+            ("rawset", base_rawset),
+            ("select", base_select),
+            ("setmetatable", base_setmetatable),
+            ("tonumber", base_tonumber),
+            ("tostring", base_tostring),
+            ("type", base_type),
+            ("xpcall", base_xpcall),
+        ]
+        cx.push_global_table()
+        cx.set_funcs(&funcs, 0)?
+        cx.push_value(-1)
+        cx.set_field(-2, "_G")?
+        cx.push_str("Lua 5.4")?
+        cx.set_field(-2, "_VERSION")?
+        return ok(1)
+    }
+}

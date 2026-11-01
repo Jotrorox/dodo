@@ -1,0 +1,307 @@
+package lua
+
+import "core/mem"
+import "core/ptr"
+
+// Loading binary chunks (the Lua 5.4 format described in DESIGN.md "Binary
+// chunks"). Runs with collection blocked (see load_chunk), so partially
+// built prototypes need no anchoring.
+
+struct LoadState {
+    L: *mut State
+    data: *const u8
+    size: usize
+    pos: usize
+    name: *mut LString
+}
+
+fn ud_error(S: &mut LoadState, why: &str) -> Throw {
+    unsafe {
+        b := SBuf.new(S.L)
+        let n = S.name
+        let d = str_data(n)
+        let len = (*n).length
+        r := ud_error_build(&mut b, d, len, why)
+        match r {
+            ok() => {},
+            err(e) => { return e },
+        }
+        match b.to_lstring() {
+            ok(s) => { err_set_msg(S.L, s) },
+            err(e) => { return e },
+        }
+        return Throw.Syntax
+    }
+}
+
+fn ud_error_build(b: &mut SBuf, d: *mut u8, len: usize, why: &str) -> void!Throw {
+    unsafe {
+        if len > 0 && (*d == b'@' || *d == b'=') {
+            b.add_raw(ptr.offset(d, 1) as *const u8, len - 1)?
+        } else if len > 0 && *d == 0x1b {
+            b.add_str("binary string")?
+        } else {
+            b.add_raw(d as *const u8, len)?
+        }
+        b.add_str(": bad binary format (")?
+        b.add_str(why)?
+        b.add_str(")")?
+        return ok()
+    }
+}
+
+fn ud_block(S: &mut LoadState, out: *mut u8, n: usize) -> void!Throw {
+    unsafe {
+        if S.size - S.pos < n {
+            return err(ud_error(S, "truncated chunk"))
+        }
+        unsafe { ptr.copy_nonoverlapping(ptr.offset(S.data, S.pos as isize), out, n) }
+        S.pos = S.pos + n
+        return ok()
+    }
+}
+
+fn ud_byte(S: &mut LoadState) -> u8!Throw {
+    unsafe {
+        if S.pos >= S.size {
+            return err(ud_error(S, "truncated chunk"))
+        }
+        unsafe {
+            let b = *ptr.offset(S.data, S.pos as isize)
+            S.pos = S.pos + 1
+            return ok(b)
+        }
+    }
+}
+
+fn ud_size(S: &mut LoadState, limit: u64) -> u64!Throw {
+    unsafe {
+        x := 0u64
+        let lim = limit >> 7
+        for {
+            let b = ud_byte(S)?
+            if x >= lim {
+                return err(ud_error(S, "integer overflow"))
+            }
+            x = (x << 7) | ((b & 0x7f) as u64)
+            if (b & 0x80) != 0 {
+                break
+            }
+        }
+        return ok(x)
+    }
+}
+
+fn ud_int(S: &mut LoadState) -> i32!Throw {
+    unsafe {
+        let v = ud_size(S, 2147483647)?
+        return ok(v as i32)
+    }
+}
+
+fn ud_integer(S: &mut LoadState) -> i64!Throw {
+    unsafe {
+        x: i64 = 0
+        ud_block(S, ptr.from_mut(&mut x) as *mut u8, 8)?
+        return ok(x)
+    }
+}
+
+fn ud_number(S: &mut LoadState) -> f64!Throw {
+    unsafe {
+        x: f64 = 0.0
+        ud_block(S, ptr.from_mut(&mut x) as *mut u8, 8)?
+        return ok(x)
+    }
+}
+
+// A string, or null for size 0.
+fn ud_string(S: &mut LoadState) -> (*mut LString)!Throw {
+    unsafe {
+        size := ud_size(S, 0xffffffffffffffffu64)?
+        if size == 0 {
+            return ok(0 as *mut LString)
+        }
+        size -= 1
+        if (S.size - S.pos) as u64 < size {
+            return err(ud_error(S, "truncated chunk"))
+        }
+        let s = str_new(S.L, ptr.offset(S.data, S.pos as isize), size as usize)?
+        S.pos = S.pos + (size as usize)
+        return ok(s)
+    }
+}
+
+fn ud_function(S: &mut LoadState, f: *mut Proto, psource: *mut LString) -> void!Throw {
+    unsafe {
+        let L = S.L
+        src := ud_string(S)?
+        if ptr.is_null(src) {
+            src = psource
+        }
+        (*f).source = src
+        (*f).linedefined = ud_int(S)?
+        (*f).lastlinedefined = ud_int(S)?
+        (*f).numparams = ud_byte(S)?
+        (*f).is_vararg = ud_byte(S)?
+        (*f).maxstacksize = ud_byte(S)?
+        // Code.
+        let ncode = ud_int(S)?
+        let code = mem_alloc(L, (ncode as usize) * 4)? as *mut u32
+        (*f).code = code
+        (*f).sizecode = ncode
+        ud_block(S, code as *mut u8, (ncode as usize) * 4)?
+        // Constants.
+        let nk = ud_int(S)?
+        let k = mem_alloc(L, (nk as usize) * 16)? as *mut Value
+        for i in 0i32..nk {
+            (*ptr.offset(k, i as isize)).tag = TAG_NIL
+        }
+        (*f).k = k
+        (*f).sizek = nk
+        for i in 0i32..nk {
+            let o = ptr.offset(k, i as isize)
+            let t = ud_byte(S)?
+            if t == 0x00 {
+                (*o).tag = TAG_NIL
+            } else if t == 0x01 {
+                (*o).tag = TAG_FALSE
+            } else if t == 0x11 {
+                (*o).tag = TAG_TRUE
+            } else if t == 0x13 {
+                set_float(o, ud_number(S)?)
+            } else if t == 0x03 {
+                set_int(o, ud_integer(S)?)
+            } else if t == 0x04 || t == 0x14 {
+                let s = ud_string(S)?
+                if ptr.is_null(s) {
+                    return err(ud_error(S, "bad format for constant string"))
+                }
+                set_str(o, s)
+            } else {
+                return err(ud_error(S, "bad constant"))
+            }
+        }
+        // Upvalues.
+        let nup = ud_int(S)?
+        let ups = mem_alloc(L, (nup as usize) * mem.size_of::<UpvalDesc>())? as *mut UpvalDesc
+        for i in 0i32..nup {
+            (*ptr.offset(ups, i as isize)).name = 0 as *mut LString
+        }
+        (*f).upvalues = ups
+        (*f).sizeupvalues = nup
+        for i in 0i32..nup {
+            let u = ptr.offset(ups, i as isize)
+            (*u).instack = ud_byte(S)?
+            (*u).index = ud_byte(S)?
+            (*u).kind = ud_byte(S)?
+        }
+        // Nested prototypes.
+        let np = ud_int(S)?
+        let ps = mem_alloc(L, (np as usize) * 8)? as *mut *mut Proto
+        for i in 0i32..np {
+            *ptr.offset(ps, i as isize) = 0 as *mut Proto
+        }
+        (*f).p = ps
+        (*f).sizep = np
+        for i in 0i32..np {
+            let child = proto_new(L)?
+            *ptr.offset(ps, i as isize) = child
+            ud_function(S, child, (*f).source)?
+        }
+        // Debug information.
+        let nli = ud_int(S)?
+        let li = mem_alloc(L, nli as usize)? as *mut i8
+        (*f).lineinfo = li
+        (*f).sizelineinfo = nli
+        ud_block(S, li as *mut u8, nli as usize)?
+        let nabs = ud_int(S)?
+        let abs = mem_alloc(L, (nabs as usize) * mem.size_of::<AbsLineInfo>())? as *mut AbsLineInfo
+        (*f).abslineinfo = abs
+        (*f).sizeabslineinfo = nabs
+        for i in 0i32..nabs {
+            let a = ptr.offset(abs, i as isize)
+            (*a).pc = ud_int(S)?
+            (*a).line = ud_int(S)?
+        }
+        let nloc = ud_int(S)?
+        let lv = mem_alloc(L, (nloc as usize) * mem.size_of::<LocVar>())? as *mut LocVar
+        for i in 0i32..nloc {
+            (*ptr.offset(lv, i as isize)).name = 0 as *mut LString
+        }
+        (*f).locvars = lv
+        (*f).sizelocvars = nloc
+        for i in 0i32..nloc {
+            let v = ptr.offset(lv, i as isize)
+            (*v).name = ud_string(S)?
+            (*v).startpc = ud_int(S)?
+            (*v).endpc = ud_int(S)?
+        }
+        let nupn = ud_int(S)?
+        if nupn != 0 && nupn != nup {
+            return err(ud_error(S, "bad upvalue names"))
+        }
+        for i in 0i32..nupn {
+            (*ptr.offset(ups, i as isize)).name = ud_string(S)?
+        }
+        return ok()
+    }
+}
+
+fn ud_check_literal(S: &mut LoadState, lit: &[u8], why: &str) -> void!Throw {
+    unsafe {
+        for i in 0usize..lit.len {
+            let b = ud_byte(S)?
+            if b != lit[i] {
+                return err(ud_error(S, why))
+            }
+        }
+        return ok()
+    }
+}
+
+fn ud_header(S: &mut LoadState) -> void!Throw {
+    unsafe {
+        // The first byte (ESC) was checked by the caller.
+        S.pos = 1
+        ud_check_literal(S, b"Lua", "not a binary chunk")?
+        if ud_byte(S)? != 0x54 {
+            return err(ud_error(S, "version mismatch"))
+        }
+        if ud_byte(S)? != 0 {
+            return err(ud_error(S, "format mismatch"))
+        }
+        ud_check_literal(S, b"\x19\x93\r\n\x1a\n", "corrupted chunk")?
+        if ud_byte(S)? != 4 {
+            return err(ud_error(S, "Instruction size mismatch"))
+        }
+        if ud_byte(S)? != 8 {
+            return err(ud_error(S, "lua_Integer size mismatch"))
+        }
+        if ud_byte(S)? != 8 {
+            return err(ud_error(S, "lua_Number size mismatch"))
+        }
+        if ud_integer(S)? != 0x5678 {
+            return err(ud_error(S, "integer format mismatch"))
+        }
+        if ud_number(S)? != 370.5 {
+            return err(ud_error(S, "float format mismatch"))
+        }
+        return ok()
+    }
+}
+
+// Load a binary chunk; returns its main prototype.
+fn undump(L: *mut State, data: *const u8, size: usize, name: *mut LString) -> (*mut Proto)!Throw {
+    unsafe {
+        S := LoadState { L: L, data: data, size: size, pos: 0, name: name }
+        ud_header(&mut S)?
+        let nup = ud_byte(&mut S)?
+        let p = proto_new(L)?
+        ud_function(&mut S, p, 0 as *mut LString)?
+        if (*p).sizeupvalues != nup as i32 {
+            return err(ud_error(&mut S, "bad upvalue count"))
+        }
+        return ok(p)
+    }
+}

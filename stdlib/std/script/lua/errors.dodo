@@ -3,8 +3,214 @@ package lua
 import "core/mem"
 import "core/ptr"
 
-// Raising errors from internal code. (Skeleton: the runtime agent owns this
-// file and keeps these signatures.)
+// Raising errors from internal code, and the growable byte buffer used to
+// build messages and strings.
+//
+// Every raiser stores the error object in `L.errobj` and returns the Throw
+// to propagate (`return err(err_runtime(L, "..."))`). Runtime errors raised
+// while a Lua function is running get the "chunkname:line:" prefix of that
+// function's current line.
+
+// Growable byte buffer owned by Dodo code; frees its block when dropped.
+struct SBuf {
+    L: *mut State
+    data: *mut u8
+    n: usize
+    cap: usize
+
+    fn new(L: *mut State) -> SBuf {
+        unsafe { return SBuf { L: L, data: 0 as *mut u8, n: 0, cap: 0 } }
+    }
+
+    fn drop(&mut self) {
+        if self.cap > 0 {
+            mem_free(self.L, self.data, self.cap)
+            self.cap = 0
+        }
+    }
+
+    // Make room for `extra` more bytes.
+    fn reserve(&mut self, extra: usize) -> void!Throw {
+        if self.n + extra <= self.cap {
+            return ok()
+        }
+        ncap := if self.cap == 0 { 64usize } else { self.cap * 2 }
+        for ncap < self.n + extra {
+            ncap = ncap * 2
+        }
+        let block = mem_realloc(self.L, self.data, self.cap, ncap)?
+        self.data = block
+        self.cap = ncap
+        return ok()
+    }
+
+    fn add_raw(&mut self, p: *const u8, count: usize) -> void!Throw {
+        if count == 0 {
+            return ok()
+        }
+        self.reserve(count)?
+        unsafe { ptr.copy(p as *mut u8, ptr.offset(self.data, self.n as isize), count) }
+        self.n = self.n + count
+        return ok()
+    }
+
+    fn add_str(&mut self, s: &str) -> void!Throw {
+        let b = mem.str_bytes(s)
+        return self.add_raw(ptr.as_ptr(b), b.len)
+    }
+
+    fn add_bytes(&mut self, b: &[u8]) -> void!Throw {
+        return self.add_raw(ptr.as_ptr(b), b.len)
+    }
+
+    fn add_lstr(&mut self, s: *mut LString) -> void!Throw {
+        unsafe { return self.add_raw(str_data(s) as *const u8, (*s).length) }
+    }
+
+    fn add_char(&mut self, c: u8) -> void!Throw {
+        self.reserve(1)?
+        unsafe { *ptr.offset(self.data, self.n as isize) = c }
+        self.n = self.n + 1
+        return ok()
+    }
+
+    fn add_int(&mut self, v: i64) -> void!Throw {
+        tmp := [0u8; 32]
+        let n = num_int_to_string(&mut tmp, v)
+        return self.add_raw(ptr.as_ptr(&tmp), n)
+    }
+
+    fn add_float(&mut self, v: f64) -> void!Throw {
+        tmp := [0u8; 64]
+        let n = num_float_to_string(&mut tmp, v)
+        return self.add_raw(ptr.as_ptr(&tmp), n)
+    }
+
+    // A number value formatted as `tostring` does.
+    fn add_number(&mut self, v: *mut Value) -> void!Throw {
+        unsafe {
+            if (*v).tag == TAG_INT {
+                return self.add_int(val_int(v))
+            }
+            return self.add_float(val_float(v))
+        }
+    }
+
+    // A pointer in "0x..." form.
+    fn add_pointer(&mut self, p: *mut u8) -> void!Throw {
+        tmp := [0u8; 24]
+        let n = fmt_pointer(&mut tmp, p)
+        return self.add_raw(ptr.as_ptr(&tmp), n)
+    }
+
+    fn to_lstring(&mut self) -> (*mut LString)!Throw {
+        unsafe { return str_new(self.L, self.data as *const u8, self.n) }
+    }
+}
+
+// "0x" followed by the lowercase hex digits of the address (like %p).
+fn fmt_pointer(out: &mut [u8], p: *mut u8) -> usize {
+    unsafe {
+        let v = unsafe { p as usize as u64 }
+        if v == 0 {
+            out[0] = b'('
+            out[1] = b'n'
+            out[2] = b'i'
+            out[3] = b'l'
+            out[4] = b')'
+            return 5
+        }
+        out[0] = b'0'
+        out[1] = b'x'
+        digits := [0u8; 16]
+        nd := 0usize
+        x := v
+        for x > 0 {
+            let d = (x & 15) as u8
+            digits[nd] = if d < 10 { b'0' + d } else { b'a' + d - 10 }
+            nd += 1
+            x = x >> 4
+        }
+        for i in 0usize..nd {
+            out[2 + i] = digits[nd - 1 - i]
+        }
+        return 2 + nd
+    }
+}
+
+// Store a message string as the error object.
+fn err_set_msg(L: *mut State, s: *mut LString) {
+    unsafe {
+        set_str(L_errobj(L), s)
+    }
+}
+
+// Prefix "chunkname:line: " of the current Lua function (nothing for natives).
+fn err_add_position(L: *mut State, b: &mut SBuf) -> void!Throw {
+    unsafe {
+        let ci = (*L).ci
+        if ci_is_lua(ci) {
+            dbg_add_where(L, ci, b)?
+        }
+        return ok()
+    }
+}
+
+// Raise the message held in `b` (prefixed with the current position).
+fn err_raise_buf(L: *mut State, b: &mut SBuf) -> Throw {
+    unsafe {
+        s := SBuf.new(L)
+        match err_add_position(L, &mut s) {
+            ok() => {},
+            err(e) => { return e },
+        }
+        match s.add_raw(unsafe { b.data as *const u8 }, b.n) {
+            ok() => {},
+            err(e) => { return e },
+        }
+        match s.to_lstring() {
+            ok(str) => {
+                err_set_msg(L, str)
+                return Throw.Runtime
+            },
+            err(e) => { return e },
+        }
+    }
+}
+
+// Runtime error with a fixed message (gets position information).
+fn err_runtime(L: *mut State, msg: &str) -> Throw {
+    unsafe {
+        b := SBuf.new(L)
+        match b.add_str(msg) {
+            ok() => {},
+            err(e) => { return e },
+        }
+        return err_raise_buf(L, &mut b)
+    }
+}
+
+// Runtime error built from up to three pieces (bytes of LStrings or &str).
+fn err_runtime3(L: *mut State, a: &str, s: *mut LString, c: &str) -> Throw {
+    unsafe {
+        b := SBuf.new(L)
+        match b.add_str(a) {
+            ok() => {},
+            err(e) => { return e },
+        }
+        if !ptr.is_null(s) {
+            match b.add_lstr(s) {
+                ok() => {},
+                err(e) => { return e },
+            }
+        }
+        match b.add_str(c) {
+            ok() => {},
+            err(e) => { return e },
+        }
+        return err_raise_buf(L, &mut b)
+    }
+}
 
 // Raise a syntax error whose complete message (already including the
 // "chunkname:line:" prefix and any "near 'token'" suffix) is `msg[0..len]`.
@@ -13,12 +219,196 @@ fn err_syntax(L: *mut State, msg: *const u8, len: usize) -> Throw {
     unsafe {
         match str_new(L, msg, len) {
             ok(s) => {
-                set_str(ptr.offset(L as *mut u8, mem.offset_of::<State>("errobj") as isize) as *mut Value, s)
+                err_set_msg(L, s)
             },
-            err(_) => {
-                return Throw.Memory
+            err(e) => {
+                return e
             },
         }
+        return Throw.Syntax
     }
-    return Throw.Syntax
+}
+
+// Error while handling an error (message handler failure, stack overflow
+// during error handling).
+fn err_set_handler_error(L: *mut State) -> Throw {
+    unsafe {
+        match str_from(L, "error in error handling") {
+            ok(s) => { err_set_msg(L, s) },
+            err(e) => { return e },
+        }
+        return Throw.Handler
+    }
+}
+
+// Raise the value on top of the stack as the error object (pops it).
+fn err_throw_top(L: *mut State) -> Throw {
+    unsafe {
+        unsafe {
+            (*L).top = ptr.offset((*L).top, -1)
+            set_obj(L_errobj(L), (*L).top)
+        }
+        return Throw.Runtime
+    }
+}
+
+// Raise an arbitrary value as the error object.
+fn err_throw_value(L: *mut State, v: *mut Value) -> Throw {
+    unsafe {
+        set_obj(L_errobj(L), v)
+        return Throw.Runtime
+    }
+}
+
+// "attempt to <op> a <type> value<varinfo>"
+fn err_type(L: *mut State, v: *mut Value, op: &str) -> Throw {
+    unsafe {
+        b := SBuf.new(L)
+        match err_type_build(L, &mut b, v, op) {
+            ok() => {},
+            err(e) => { return e },
+        }
+        return err_raise_buf(L, &mut b)
+    }
+}
+
+fn err_type_build(L: *mut State, b: &mut SBuf, v: *mut Value, op: &str) -> void!Throw {
+    unsafe {
+        b.add_str("attempt to ")?
+        b.add_str(op)?
+        b.add_str(" a ")?
+        meta_add_objtypename(L, b, v)?
+        b.add_str(" value")?
+        dbg_add_varinfo(L, b, v)?
+        return ok()
+    }
+}
+
+// Error for calling a non-callable value.
+fn err_call(L: *mut State, v: *mut Value) -> Throw {
+    unsafe {
+        b := SBuf.new(L)
+        match err_call_build(L, &mut b, v) {
+            ok() => {},
+            err(e) => { return e },
+        }
+        return err_raise_buf(L, &mut b)
+    }
+}
+
+fn err_call_build(L: *mut State, b: &mut SBuf, v: *mut Value) -> void!Throw {
+    unsafe {
+        b.add_str("attempt to call a ")?
+        meta_add_objtypename(L, b, v)?
+        b.add_str(" value")?
+        if !dbg_add_callee_info(L, b)? {
+            dbg_add_varinfo(L, b, v)?
+        }
+        return ok()
+    }
+}
+
+fn val_is_string(v: *mut Value) -> bool {
+    unsafe {
+        unsafe { return ((*v).tag & 15) == TYPE_STRING }
+    }
+}
+fn val_is_number(v: *mut Value) -> bool {
+    unsafe {
+        unsafe { return ((*v).tag & 15) == TYPE_NUMBER }
+    }
+}
+
+fn err_concat(L: *mut State, p1: *mut Value, p2: *mut Value) -> Throw {
+    unsafe {
+        if val_is_string(p1) || val_is_number(p1) {
+            return err_type(L, p2, "concatenate")
+        }
+        return err_type(L, p1, "concatenate")
+    }
+}
+
+// Error for an arithmetic/bitwise operation on non-numbers.
+fn err_op(L: *mut State, p1: *mut Value, p2: *mut Value, msg: &str) -> Throw {
+    unsafe {
+        if !val_is_number(p1) {
+            return err_type(L, p1, msg)
+        }
+        return err_type(L, p2, msg)
+    }
+}
+
+// "number has no integer representation" (with variable information).
+fn err_to_int(L: *mut State, p1: *mut Value, p2: *mut Value) -> Throw {
+    unsafe {
+        i: i64 = 0
+        culprit := p2
+        if !vm_to_integer_strict(p1, ptr.from_mut(&mut i)) {
+            culprit = p1
+        }
+        b := SBuf.new(L)
+        match err_to_int_build(L, &mut b, culprit) {
+            ok() => {},
+            err(e) => { return e },
+        }
+        return err_raise_buf(L, &mut b)
+    }
+}
+
+fn err_to_int_build(L: *mut State, b: &mut SBuf, v: *mut Value) -> void!Throw {
+    unsafe {
+        b.add_str("number")?
+        dbg_add_varinfo(L, b, v)?
+        b.add_str(" has no integer representation")?
+        return ok()
+    }
+}
+
+fn err_order(L: *mut State, p1: *mut Value, p2: *mut Value) -> Throw {
+    unsafe {
+        b := SBuf.new(L)
+        match err_order_build(L, &mut b, p1, p2) {
+            ok() => {},
+            err(e) => { return e },
+        }
+        return err_raise_buf(L, &mut b)
+    }
+}
+
+fn err_order_build(L: *mut State, b: &mut SBuf, p1: *mut Value, p2: *mut Value) -> void!Throw {
+    unsafe {
+        t1 := SBuf.new(L)
+        meta_add_objtypename(L, &mut t1, p1)?
+        t2 := SBuf.new(L)
+        meta_add_objtypename(L, &mut t2, p2)?
+        b.add_str("attempt to compare ")?
+        if t1.n == t2.n && mem_equal(t1.data, t2.data, t1.n) {
+            b.add_str("two ")?
+            unsafe { b.add_raw(t1.data as *const u8, t1.n)? }
+            b.add_str(" values")?
+        } else {
+            unsafe { b.add_raw(t1.data as *const u8, t1.n)? }
+            b.add_str(" with ")?
+            unsafe { b.add_raw(t2.data as *const u8, t2.n)? }
+        }
+        return ok()
+    }
+}
+
+// Emit a warning "error in <where> (<message>)" for the error object on top
+// of the stack (used for errors in finalizers and similar contexts).
+fn warn_error(L: *mut State, where_: &str) {
+    unsafe {
+        let eo = ptr.offset((*L).top, -1)
+        warn_emit(L, mem.str_bytes("error in "), true)
+        warn_emit(L, mem.str_bytes(where_), true)
+        warn_emit(L, mem.str_bytes(" ("), true)
+        if val_is_string(eo) {
+            let s = val_str(eo)
+            warn_emit(L, ptr.borrow_slice(str_data(s) as *const u8, (*s).length, mem.str_bytes(where_)), true)
+        } else {
+            warn_emit(L, mem.str_bytes("error object is not a string"), true)
+        }
+        warn_emit(L, mem.str_bytes(")"), false)
+    }
 }

@@ -1,0 +1,624 @@
+package lua
+
+import "core/mem"
+import "core/ptr"
+
+// Metatables and metamethods: event names, lookup (with the per-table
+// "absent event" cache), and the slow paths of the operations that consult
+// metamethods (indexing chains, arithmetic fallbacks, comparisons, concat,
+// length).
+
+const MAX_TAG_LOOP: i32 = 2000
+
+fn tm_event_name(e: u32) -> &str from(static) {
+    unsafe {
+        match e {
+            0 => { return "__index" },
+            1 => { return "__newindex" },
+            2 => { return "__gc" },
+            3 => { return "__mode" },
+            4 => { return "__len" },
+            5 => { return "__eq" },
+            6 => { return "__add" },
+            7 => { return "__sub" },
+            8 => { return "__mul" },
+            9 => { return "__mod" },
+            10 => { return "__pow" },
+            11 => { return "__div" },
+            12 => { return "__idiv" },
+            13 => { return "__band" },
+            14 => { return "__bor" },
+            15 => { return "__bxor" },
+            16 => { return "__shl" },
+            17 => { return "__shr" },
+            18 => { return "__unm" },
+            19 => { return "__bnot" },
+            20 => { return "__lt" },
+            21 => { return "__le" },
+            22 => { return "__concat" },
+            23 => { return "__call" },
+            _ => { return "__close" },
+        }
+    }
+}
+
+// Names of the basic types as `type()` returns them.
+fn type_name(t: u8) -> &str from(static) {
+    unsafe {
+        match t {
+            0 => { return "nil" },
+            1 => { return "boolean" },
+            2 => { return "userdata" },
+            3 => { return "number" },
+            4 => { return "string" },
+            5 => { return "table" },
+            6 => { return "function" },
+            7 => { return "userdata" },
+            8 => { return "thread" },
+            9 => { return "upvalue" },
+            10 => { return "proto" },
+            _ => { return "no value" },
+        }
+    }
+}
+
+fn meta_init(L: *mut State) -> void!Throw {
+    unsafe {
+        let g = G(L)
+        for e in 0u32..TM_N {
+            let s = str_from(L, tm_event_name(e))?
+            gc_fix(L, s as *mut GCObject)
+            *ptr.offset((*g).tmname, e as isize) = s
+        }
+        return ok()
+    }
+}
+
+// Metamethod `event` of metatable `mt`, or null. For the first six events a
+// miss is remembered in mt.flags until the table is modified.
+fn meta_fast_tm(g: *mut Global, mt: *mut Table, event: u32) -> *mut Value {
+    unsafe {
+        if ptr.is_null(mt) {
+            return 0 as *mut Value
+        }
+        if event < 6 && ((*mt).flags & (1u8 << (event as u8))) != 0 {
+            return 0 as *mut Value
+        }
+        let tm = tab_get_shortstr(mt, G_tmname(g, event))
+        if val_is_nil(tm) {
+            if event < 6 {
+                (*mt).flags = (*mt).flags | (1u8 << (event as u8))
+            }
+            return 0 as *mut Value
+        }
+        return tm
+    }
+}
+
+// Metatable of any value (null if none).
+fn meta_get_metatable(g: *mut Global, v: *mut Value) -> *mut Table {
+    unsafe {
+        let t = (*v).tag
+        if t == TAG_TABLE {
+            return (*(val_gc(v) as *mut Table)).metatable
+        }
+        if t == TAG_USERDATA {
+            return (*(val_gc(v) as *mut Udata)).metatable
+        }
+        return G_mt(g, t & 15)
+    }
+}
+
+// Metamethod of a value for `event` (a nil value when absent; never null).
+fn meta_get_tm_by_obj(L: *mut State, o: *mut Value, event: u32) -> *mut Value {
+    unsafe {
+        let g = G(L)
+        let mt = meta_get_metatable(g, o)
+        if ptr.is_null(mt) {
+            return G_nilvalue(g)
+        }
+        return tab_get_shortstr(mt, G_tmname(g, event))
+    }
+}
+
+// Append the type name of a value, honouring a string `__name` metafield.
+fn meta_add_objtypename(L: *mut State, b: &mut SBuf, v: *mut Value) -> void!Throw {
+    unsafe {
+        let g = G(L)
+        let t = (*v).tag
+        if t == TAG_TABLE || t == TAG_USERDATA {
+            let mt = meta_get_metatable(g, v)
+            if !ptr.is_null(mt) {
+                let name = meta_get_field_str(L, mt, "__name")?
+                if !ptr.is_null(name) && val_is_string(name) {
+                    return b.add_lstr(val_str(name))
+                }
+            }
+        }
+        return b.add_str(type_name(t & 15))
+    }
+}
+
+// Raw lookup of a string field in a table (null when absent).
+fn meta_get_field_str(L: *mut State, t: *mut Table, name: &str) -> (*mut Value)!Throw {
+    unsafe {
+        let s = str_from(L, name)?
+        let v = tab_get_str(t, s)
+        if val_is_nil(v) {
+            unsafe { return ok(0 as *mut Value) }
+        }
+        return ok(v)
+    }
+}
+
+// --- Calling metamethods ----------------------------------------------------
+
+// Call `f(p1, p2, p3)` discarding results (used for __newindex).
+fn meta_call_tm(L: *mut State, f: *mut Value, p1: *mut Value, p2: *mut Value, p3: *mut Value) -> void!Throw {
+    unsafe {
+        let top = (*L).top
+        set_obj(top, f)
+        set_obj(ptr.offset(top, 1), p1)
+        set_obj(ptr.offset(top, 2), p2)
+        set_obj(ptr.offset(top, 3), p3)
+        (*L).top = ptr.offset(top, 4)
+        if ci_is_lua((*L).ci) {
+            return call_value(L, top, 0)
+        }
+        return call_noyield(L, top, 0)
+    }
+}
+
+// Call `f(p1, p2)` and store its first result at stack offset `res`.
+fn meta_call_tm_res(L: *mut State, f: *mut Value, p1: *mut Value, p2: *mut Value, res: isize) -> void!Throw {
+    unsafe {
+        let top = (*L).top
+        set_obj(top, f)
+        set_obj(ptr.offset(top, 1), p1)
+        set_obj(ptr.offset(top, 2), p2)
+        (*L).top = ptr.offset(top, 3)
+        let fidx = save_stack(L, top)
+        if ci_is_lua((*L).ci) {
+            call_value(L, top, 1)?
+        } else {
+            call_noyield(L, top, 1)?
+        }
+        (*L).top = ptr.offset((*L).top, -1)
+        set_obj(restore_stack(L, res), (*L).top)
+        return ok()
+    }
+}
+
+// Call `f(p1, p2)` and return the truth value of its result.
+fn meta_call_tm_bool(L: *mut State, f: *mut Value, p1: *mut Value, p2: *mut Value) -> bool!Throw {
+    unsafe {
+        let top = (*L).top
+        set_obj(top, f)
+        set_obj(ptr.offset(top, 1), p1)
+        set_obj(ptr.offset(top, 2), p2)
+        (*L).top = ptr.offset(top, 3)
+        if ci_is_lua((*L).ci) {
+            call_value(L, top, 1)?
+        } else {
+            call_noyield(L, top, 1)?
+        }
+        (*L).top = ptr.offset((*L).top, -1)
+        return ok(!val_is_falsy((*L).top))
+    }
+}
+
+// --- Arithmetic fallback ----------------------------------------------------
+
+// Binary operation on operands that are not both numbers (or that failed a
+// conversion): try the metamethods, else raise the proper error.
+fn meta_trybin(L: *mut State, p1: *mut Value, p2: *mut Value, res: isize, event: u32) -> void!Throw {
+    unsafe {
+        tm := meta_get_tm_by_obj(L, p1, event)
+        if val_is_nil(tm) {
+            tm = meta_get_tm_by_obj(L, p2, event)
+        }
+        if val_is_nil(tm) {
+            if event >= TM_BAND && event <= TM_SHR || event == TM_BNOT {
+                if val_is_number(p1) && val_is_number(p2) {
+                    return err(err_to_int(L, p1, p2))
+                }
+                return err(err_op(L, p1, p2, "perform bitwise operation on"))
+            }
+            if event == TM_CONCAT {
+                return err(err_concat(L, p1, p2))
+            }
+            return err(err_op(L, p1, p2, "perform arithmetic on"))
+        }
+        return meta_call_tm_res(L, tm, p1, p2, res)
+    }
+}
+
+// Like meta_trybin with an immediate or constant second operand; `flip`
+// means the constant was the first operand in the source.
+fn meta_trybin_k(L: *mut State, p1: *mut Value, p2: *mut Value, flip: bool, res: isize, event: u32) -> void!Throw {
+    unsafe {
+        if flip {
+            return meta_trybin(L, p2, p1, res, event)
+        }
+        return meta_trybin(L, p1, p2, res, event)
+    }
+}
+
+// --- Comparison -------------------------------------------------------------
+
+fn meta_call_order(L: *mut State, p1: *mut Value, p2: *mut Value, event: u32) -> bool!Throw {
+    unsafe {
+        tm := meta_get_tm_by_obj(L, p1, event)
+        if val_is_nil(tm) {
+            tm = meta_get_tm_by_obj(L, p2, event)
+        }
+        if val_is_nil(tm) {
+            return err(err_order(L, p1, p2))
+        }
+        return meta_call_tm_bool(L, tm, p1, p2)
+    }
+}
+
+// Order metamethod with an immediate operand `v2` (an integer or float).
+fn meta_call_order_imm(L: *mut State, p1: *mut Value, v2: i32, flip: bool, isfloat: bool, event: u32) -> bool!Throw {
+    unsafe {
+        tmp := Value { bits: 0, tag: 0 }
+        let aux = ptr.from_mut(&mut tmp)
+        if isfloat {
+            set_float(aux, v2 as f64)
+        } else {
+            set_int(aux, v2 as i64)
+        }
+        if flip {
+            return meta_call_order(L, aux, p1, event)
+        }
+        return meta_call_order(L, p1, aux, event)
+    }
+}
+
+// Raw equality (no metamethods).
+fn vm_raw_equal(t1: *mut Value, t2: *mut Value) -> bool {
+    unsafe {
+        let a = (*t1).tag
+        let b = (*t2).tag
+        if a != b {
+            if (a & 15) != (b & 15) {
+                return false
+            }
+            if (a & 15) == TYPE_NUMBER {
+                return num_equal(t1, t2)
+            }
+            if (a & 15) == TYPE_STRING {
+                return str_equal(val_str(t1), val_str(t2))
+            }
+            // nil variants (empty slots, absent keys) are all nil.
+            return (a & 15) == TYPE_NIL
+        }
+        if a == TAG_INT {
+            return val_int(t1) == val_int(t2)
+        }
+        if a == TAG_FLOAT {
+            return val_float(t1) == val_float(t2)
+        }
+        if a == TAG_NIL || a == TAG_TRUE || a == TAG_FALSE || a == TAG_EMPTY || a == TAG_ABSENT {
+            return true
+        }
+        if a == TAG_LONGSTR {
+            return str_equal(val_str(t1), val_str(t2))
+        }
+        return (*t1).bits == (*t2).bits
+    }
+}
+
+// Mathematical equality of two numbers of different subtypes.
+fn num_equal(t1: *mut Value, t2: *mut Value) -> bool {
+    unsafe {
+        if (*t1).tag == TAG_INT {
+            if (*t2).tag == TAG_INT {
+                return val_int(t1) == val_int(t2)
+            }
+            return int_float_eq(val_int(t1), val_float(t2))
+        }
+        if (*t2).tag == TAG_FLOAT {
+            return val_float(t1) == val_float(t2)
+        }
+        return int_float_eq(val_int(t2), val_float(t1))
+    }
+}
+
+fn int_float_eq(i: i64, f: f64) -> bool {
+    unsafe {
+        k: i64 = 0
+        if float_to_int_exact(f, ptr.from_mut(&mut k)) {
+            return k == i
+        }
+        return false
+    }
+}
+
+// Equality with __eq for tables and full userdata.
+fn vm_equal(L: *mut State, t1: *mut Value, t2: *mut Value) -> bool!Throw {
+    unsafe {
+        let a = (*t1).tag
+        if a != (*t2).tag || (a != TAG_TABLE && a != TAG_USERDATA) {
+            return ok(vm_raw_equal(t1, t2))
+        }
+        if (*t1).bits == (*t2).bits {
+            return ok(true)
+        }
+        let g = G(L)
+        tm := meta_fast_tm(g, meta_get_metatable(g, t1), TM_EQ)
+        if ptr.is_null(tm) {
+            tm = meta_fast_tm(g, meta_get_metatable(g, t2), TM_EQ)
+        }
+        if ptr.is_null(tm) {
+            return ok(false)
+        }
+        return meta_call_tm_bool(L, tm, t1, t2)
+    }
+}
+
+// --- Index chains -----------------------------------------------------------
+
+// Finish `t[key]` after the fast path missed (`slot` is the raw lookup result
+// when t is a table, null otherwise); the result goes to stack offset `res`.
+fn vm_finish_get(L: *mut State, t0: *mut Value, key: *mut Value, res: isize, slot0: *mut Value) -> void!Throw {
+    unsafe {
+        let g = G(L)
+        t := t0
+        slot := slot0
+        tmp := Value { bits: 0, tag: 0 }
+        let cur = ptr.from_mut(&mut tmp)
+        for loop in 0i32..MAX_TAG_LOOP {
+            tm := 0 as *mut Value
+            if ptr.is_null(slot) {
+                // Not a table.
+                tm = meta_get_tm_by_obj(L, t, TM_INDEX)
+                if val_is_nil(tm) {
+                    return err(err_type(L, t, "index"))
+                }
+            } else {
+                tm = meta_fast_tm(g, (*(val_gc(t) as *mut Table)).metatable, TM_INDEX)
+                if ptr.is_null(tm) {
+                    (*restore_stack(L, res)).tag = TAG_NIL
+                    return ok()
+                }
+            }
+            if ((*tm).tag & 15) == TYPE_FUNCTION {
+                return meta_call_tm_res(L, tm, t, key, res)
+            }
+            set_obj(cur, tm)
+            t = cur
+            if (*t).tag == TAG_TABLE {
+                slot = tab_get(val_gc(t) as *mut Table, key)
+                if !val_is_empty(slot) {
+                    set_obj(restore_stack(L, res), slot)
+                    return ok()
+                }
+            } else {
+                slot = 0 as *mut Value
+            }
+        }
+        return err(err_runtime(L, "'__index' chain too long; possibly a loop"))
+    }
+}
+
+// Finish `t[key] = val` after the fast path missed.
+fn vm_finish_set(L: *mut State, t0: *mut Value, key: *mut Value, val: *mut Value, slot0: *mut Value) -> void!Throw {
+    unsafe {
+        let g = G(L)
+        t := t0
+        slot := slot0
+        tmp := Value { bits: 0, tag: 0 }
+        let cur = ptr.from_mut(&mut tmp)
+        for loop in 0i32..MAX_TAG_LOOP {
+            tm := 0 as *mut Value
+            if !ptr.is_null(slot) {
+                let h = val_gc(t) as *mut Table
+                tm = meta_fast_tm(g, (*h).metatable, TM_NEWINDEX)
+                if ptr.is_null(tm) {
+                    return tab_finish_set(L, h, key, slot, val)
+                }
+            } else {
+                tm = meta_get_tm_by_obj(L, t, TM_NEWINDEX)
+                if val_is_nil(tm) {
+                    return err(err_type(L, t, "index"))
+                }
+            }
+            if ((*tm).tag & 15) == TYPE_FUNCTION {
+                return meta_call_tm(L, tm, t, key, val)
+            }
+            set_obj(cur, tm)
+            t = cur
+            if (*t).tag == TAG_TABLE {
+                let h = val_gc(t) as *mut Table
+                slot = tab_get(h, key)
+                if !val_is_empty(slot) {
+                    set_obj(slot, val)
+                    gc_barrier_back(L, h, val)
+                    return ok()
+                }
+            } else {
+                slot = 0 as *mut Value
+            }
+        }
+        return err(err_runtime(L, "'__newindex' chain too long; possibly a loop"))
+    }
+}
+
+// Generic `t[key]` into stack offset `res`.
+fn vm_get(L: *mut State, t: *mut Value, key: *mut Value, res: isize) -> void!Throw {
+    unsafe {
+        if (*t).tag == TAG_TABLE {
+            let slot = tab_get(val_gc(t) as *mut Table, key)
+            if !val_is_empty(slot) {
+                set_obj(restore_stack(L, res), slot)
+                return ok()
+            }
+            return vm_finish_get(L, t, key, res, slot)
+        }
+        return vm_finish_get(L, t, key, res, 0 as *mut Value)
+    }
+}
+
+// Generic `t[key] = val`.
+fn vm_set(L: *mut State, t: *mut Value, key: *mut Value, val: *mut Value) -> void!Throw {
+    unsafe {
+        if (*t).tag == TAG_TABLE {
+            let h = val_gc(t) as *mut Table
+            let slot = tab_get(h, key)
+            if !val_is_empty(slot) {
+                set_obj(slot, val)
+                gc_barrier_back(L, h, val)
+                return ok()
+            }
+            return vm_finish_set(L, t, key, val, slot)
+        }
+        return vm_finish_set(L, t, key, val, 0 as *mut Value)
+    }
+}
+
+// --- Length -----------------------------------------------------------------
+
+// R[res] := #rb
+fn vm_objlen(L: *mut State, res: isize, rb: *mut Value) -> void!Throw {
+    unsafe {
+        let t = (*rb).tag
+        tm := 0 as *mut Value
+        if t == TAG_TABLE {
+            let h = val_gc(rb) as *mut Table
+            tm = meta_fast_tm(G(L), (*h).metatable, TM_LEN)
+            if ptr.is_null(tm) {
+                set_int(restore_stack(L, res), u2i(tab_length(h)))
+                return ok()
+            }
+        } else if t == TAG_SHORTSTR || t == TAG_LONGSTR {
+            set_int(restore_stack(L, res), (*val_str(rb)).length as i64)
+            return ok()
+        } else {
+            tm = meta_get_tm_by_obj(L, rb, TM_LEN)
+            if val_is_nil(tm) {
+                return err(err_type(L, rb, "get length of"))
+            }
+        }
+        return meta_call_tm_res(L, tm, rb, rb, res)
+    }
+}
+
+// --- Concatenation ----------------------------------------------------------
+
+// Convert a number value to its string form in place (false if `v` is
+// neither a string nor a number).
+fn vm_tostring_inplace(L: *mut State, v: *mut Value) -> bool!Throw {
+    unsafe {
+        let t = (*v).tag
+        if t == TAG_SHORTSTR || t == TAG_LONGSTR {
+            return ok(true)
+        }
+        if t == TAG_INT || t == TAG_FLOAT {
+            let s = num_to_lstring(L, v)?
+            set_str(v, s)
+            return ok(true)
+        }
+        return ok(false)
+    }
+}
+
+// String form of a number value.
+fn num_to_lstring(L: *mut State, v: *mut Value) -> (*mut LString)!Throw {
+    unsafe {
+        tmp := [0u8; 64]
+        n := 0usize
+        if (*v).tag == TAG_INT {
+            n = num_int_to_string(&mut tmp, val_int(v))
+        } else {
+            n = num_float_to_string(&mut tmp, val_float(v))
+        }
+        return str_new(L, ptr.as_ptr(&tmp), n)
+    }
+}
+
+fn is_str_or_num(v: *mut Value) -> bool {
+    unsafe {
+        let t = (*v).tag & 15
+        return t == TYPE_STRING || t == TYPE_NUMBER
+    }
+}
+
+fn is_empty_string(v: *mut Value) -> bool {
+    unsafe {
+        let t = (*v).tag
+        return (t == TAG_SHORTSTR || t == TAG_LONGSTR) && (*val_str(v)).length == 0
+    }
+}
+
+// Concatenate the `total` values on top of the stack; the result replaces
+// them (at top - total) and top drops accordingly. May call __concat.
+fn vm_concat(L: *mut State, total0: i32) -> void!Throw {
+    unsafe {
+        total := total0
+        if total == 1 {
+            return ok()
+        }
+        for total > 1 {
+            let top = (*L).top
+            n := 2i32
+            let a = ptr.offset(top, -2)
+            let b = ptr.offset(top, -1)
+            if !(is_str_or_num(a)) || !(is_str_or_num(b)) {
+                meta_trybin(L, a, b, save_stack(L, a), TM_CONCAT)?
+            } else if is_empty_string(b) {
+                // Result is the first operand (as a string).
+                vm_tostring_inplace(L, a)?
+            } else if is_empty_string(a) {
+                vm_tostring_inplace(L, b)?
+                set_obj(a, b)
+            } else {
+                // Gather as many string/number operands as possible.
+                tl := 0usize
+                let last = ptr.offset(top, -1)
+                vm_tostring_inplace(L, last)?
+                tl = (*val_str(last)).length
+                n = 1
+                for n < total && is_str_or_num(ptr.offset(top, -(n as isize) - 1)) {
+                    let v = ptr.offset((*L).top, -(n as isize) - 1)
+                    vm_tostring_inplace(L, v)?
+                    let l = (*val_str(v)).length
+                    if l >= 0x7fffffffffffffffusize - tl {
+                        (*L).top = ptr.offset((*L).top, -(total as isize))
+                        return err(err_runtime(L, "string length overflow"))
+                    }
+                    tl += l
+                    n += 1
+                }
+                let top2 = (*L).top
+                s := 0 as *mut LString
+                if tl <= SHORTSTR_MAX {
+                    buf := [0u8; 48]
+                    let bp = ptr.as_mut_ptr(&mut buf)
+                    concat_copy(top2, n, bp)
+                    s = str_new(L, bp as *const u8, tl)?
+                } else {
+                    s = str_new_long(L, tl)?
+                    concat_copy(top2, n, str_data(s))
+                }
+                set_str(ptr.offset(top2, -(n as isize)), s)
+            }
+            total -= n - 1
+            (*L).top = ptr.offset((*L).top, -((n - 1) as isize))
+        }
+        return ok()
+    }
+}
+
+fn concat_copy(top: *mut Value, n: i32, out: *mut u8) {
+    unsafe {
+        at := 0usize
+        for i in 0i32..n {
+            let s = val_str(ptr.offset(top, -((n - i) as isize)))
+            let l = (*s).length
+            ptr.copy(str_data(s), ptr.offset(out, at as isize), l)
+            at += l
+        }
+    }
+}

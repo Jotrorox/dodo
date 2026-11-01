@@ -3,16 +3,2110 @@ package lua
 import "core/mem"
 import "core/ptr"
 
-// Public embedding API. (Skeleton.)
+// Public embedding API.
+//
+// A `Lua` value owns a universe (global state plus main thread); dropping it
+// closes the state, running pending finalizers and freeing every object.
+// All stack operations go through `Cx`, a thin handle on one thread, which
+// is also what native functions receive:
+//
+//     fn add(cx: &mut lua.Cx) -> i32!lua.Throw {
+//         let a = cx.check_integer(1)?
+//         let b = cx.check_integer(2)?
+//         cx.push_integer(a + b)
+//         return ok(1)
+//     }
+//
+// Stack indices follow the C API: 1..n are absolute (1 = first argument),
+// -1..-n are relative to the top, and REGISTRY_INDEX / upvalue_index(i) are
+// pseudo-indices. Operations that can raise a Lua error (allocation,
+// metamethods, ...) return `T!Throw`; propagate the Throw with `?` from a
+// native function, or run the code through `pcall` from embedding code.
 
+// Lua 5.4 version strings.
 pub fn version() -> &str from(static) {
     return "Lua 5.4"
 }
+pub const VERSION_NUM: i32 = 504
+pub const RELEASE: &str = "Lua 5.4.9"
+pub const COPYRIGHT: &str = "Lua 5.4.9  Copyright (C) 1994-2025 Lua.org, PUC-Rio"
 
-// Temporary probe for the skeleton build; removed by the runtime agent.
-pub fn chunk_name_probe(text: &str, out: &mut [u8]) -> usize {
-    let bytes = mem.str_bytes(text)
-    unsafe {
-        return chunk_id(ptr.as_ptr(bytes) as *mut u8, bytes.len, ptr.as_mut_ptr(out))
+// Signature of native functions callable from Lua. The function receives
+// its arguments on the stack (1..get_top()) and returns the number of
+// results it pushed (taken from the top).
+pub type NativeFn = fn(&mut Cx) -> i32!Throw
+
+// Status codes.
+pub const OK: i32 = 0
+pub const YIELD: i32 = 1
+pub const ERRRUN: i32 = 2
+pub const ERRSYNTAX: i32 = 3
+pub const ERRMEM: i32 = 4
+pub const ERRERR: i32 = 5
+// Extra status of loadfile: the file could not be opened/read.
+pub const ERRFILE: i32 = 6
+
+// Basic types (type_of results).
+pub const TNONE: i32 = -1
+pub const TNIL: i32 = 0
+pub const TBOOLEAN: i32 = 1
+pub const TLIGHTUSERDATA: i32 = 2
+pub const TNUMBER: i32 = 3
+pub const TSTRING: i32 = 4
+pub const TTABLE: i32 = 5
+pub const TFUNCTION: i32 = 6
+pub const TUSERDATA: i32 = 7
+pub const TTHREAD: i32 = 8
+
+// "All results" for calls.
+pub const MULTRET_ALL: i32 = -1
+
+// Pseudo-index of the registry, and of the upvalues of the running native
+// closure (upvalue_index(1) is the first upvalue).
+pub const REGISTRY_INDEX: i32 = -1001000
+pub fn upvalue_index(i: i32) -> i32 {
+    return REGISTRY_INDEX - i
+}
+// Registry slots.
+pub const RIDX_MAINTHREAD: i64 = 1
+pub const RIDX_GLOBALS: i64 = 2
+
+// Arithmetic operators for Cx.arith.
+pub const OPADD: i32 = 0
+pub const OPSUB: i32 = 1
+pub const OPMUL: i32 = 2
+pub const OPMOD: i32 = 3
+pub const OPPOW: i32 = 4
+pub const OPDIV: i32 = 5
+pub const OPIDIV: i32 = 6
+pub const OPBAND: i32 = 7
+pub const OPBOR: i32 = 8
+pub const OPBXOR: i32 = 9
+pub const OPSHL: i32 = 10
+pub const OPSHR: i32 = 11
+pub const OPUNM: i32 = 12
+pub const OPBNOT: i32 = 13
+
+// Comparison operators for Cx.compare.
+pub const OPEQ: i32 = 0
+pub const OPLT: i32 = 1
+pub const OPLE: i32 = 2
+
+// Hook masks and events.
+pub const MASKCALL: i32 = 1
+pub const MASKRET: i32 = 2
+pub const MASKLINE: i32 = 4
+pub const MASKCOUNT: i32 = 8
+pub const HOOKCALL: i32 = 0
+pub const HOOKRET: i32 = 1
+pub const HOOKLINE: i32 = 2
+pub const HOOKCOUNT: i32 = 3
+pub const HOOKTAILCALL: i32 = 4
+
+// Reference values of Cx.reference.
+pub const NOREF: i32 = -2
+pub const REFNIL: i32 = -1
+
+static mut NONE_VALUE: Value = Value { bits: 0, tag: 0 }
+
+fn none_value() -> *mut Value {
+    unsafe { return ptr.from_mut(&mut NONE_VALUE) }
+}
+
+// A view of a Lua string's bytes. It stays valid while the string is
+// reachable (for strings obtained from a stack slot: while that slot keeps
+// the string), independently of later Cx operations.
+pub struct LuaStr {
+    p: *const u8
+    n: usize
+
+    // The bytes (without the terminating NUL the runtime keeps after them).
+    pub fn bytes(&self) -> &[u8] {
+        unsafe { return ptr.borrow_slice(self.p, self.n, self) }
     }
+    // Number of bytes.
+    pub fn size(&self) -> usize {
+        return self.n
+    }
+    // Pointer to the bytes, which are followed by a NUL byte.
+    pub fn as_ptr(&self) -> *const u8 {
+        return self.p
+    }
+}
+
+fn lstr_of(s: *mut LString) -> LuaStr {
+    unsafe { return LuaStr { p: str_data(s) as *const u8, n: (*s).length } }
+}
+
+// --- The universe -----------------------------------------------------------
+
+// A Lua universe: global state and main thread.
+pub struct Lua {
+    L: *mut State
+
+    // Create a new state with no libraries loaded (Throw.Memory if the
+    // allocation fails).
+    pub fn new() -> Lua!Throw {
+        let L = state_open()
+        if ptr.is_null(L) {
+            return err(Throw.Memory)
+        }
+        unsafe {
+            // The main thread is never yieldable.
+            (*L).nny = 1
+        }
+        return ok(Lua { L: L })
+    }
+
+    // Handle on the main thread.
+    pub fn cx(&mut self) -> Cx {
+        return Cx { L: self.L }
+    }
+
+    // Open every standard library available in this build into the globals.
+    pub fn open_libs(&mut self) -> void!Throw {
+        cx := Cx { L: self.L }
+        return open_all_libs(&mut cx)
+    }
+
+    // Bytes currently allocated by the state.
+    pub fn memory_in_use(&self) -> usize {
+        unsafe { return (*G(self.L)).total_bytes as usize }
+    }
+
+    // Install a warning function (replacing the default one, which writes
+    // "Lua warning: ..." to stderr when warnings are on).
+    pub fn set_warn_fn(&mut self, f: WarnFn) {
+        unsafe {
+            let g = G(self.L)
+            (*g).warnf = f
+            (*g).has_warnf = true
+        }
+    }
+
+    fn drop(&mut self) {
+        if !ptr.is_null(self.L) {
+            state_close(self.L)
+            unsafe { self.L = 0 as *mut State }
+        }
+    }
+}
+
+// --- Thread handle ----------------------------------------------------------
+
+// Handle on one Lua thread; native functions receive one for the calling
+// thread. A Cx is only valid while its thread is alive (the main thread:
+// while the Lua value lives).
+pub struct Cx {
+    L: *mut State
+
+    // --- Index helpers ---
+
+    fn idx2val(&self, idx: i32) -> *mut Value {
+        unsafe {
+            let L = self.L
+            let ci = (*L).ci
+            if idx > 0 {
+                let o = ptr.offset((*ci).func, idx as isize)
+                if (o as usize) >= ((*L).top as usize) {
+                    return none_value()
+                }
+                return o
+            }
+            if idx > REGISTRY_INDEX {
+                return ptr.offset((*L).top, idx as isize)
+            }
+            if idx == REGISTRY_INDEX {
+                return G_registry(G(L))
+            }
+            // Upvalue of the running native closure.
+            let n = REGISTRY_INDEX - idx
+            let f = (*ci).func
+            if (*f).tag == TAG_NCLOSURE {
+                let cl = val_gc(f) as *mut NClosure
+                if n <= (*cl).nupvalues as i32 {
+                    return ptr.offset(ncl_upvalues(cl), (n - 1) as isize)
+                }
+            }
+            return none_value()
+        }
+    }
+
+    fn push_raw(&mut self, v: *mut Value) {
+        L_push_value(self.L, v)
+    }
+
+    fn api_incr_top(&mut self) {
+        unsafe { (*self.L).top = ptr.offset((*self.L).top, 1) }
+    }
+
+    // --- Basic stack manipulation ---
+
+    // Index of the top element (= number of elements in the frame).
+    pub fn get_top(&self) -> i32 {
+        unsafe { return sdiff((*self.L).top, (*(*self.L).ci).func) as i32 - 1 }
+    }
+
+    // Set the top (non-negative: absolute; negative: relative). New slots
+    // are nil. Does not run __close (see close_slot).
+    pub fn set_top(&mut self, idx: i32) {
+        unsafe {
+            let L = self.L
+            let func = (*(*L).ci).func
+            if idx >= 0 {
+                let target = ptr.offset(func, (idx + 1) as isize)
+                for ((*L).top as usize) < (target as usize) {
+                    (*(*L).top).tag = TAG_NIL
+                    (*L).top = ptr.offset((*L).top, 1)
+                }
+                (*L).top = target
+            } else {
+                (*L).top = ptr.offset((*L).top, (idx + 1) as isize)
+            }
+        }
+    }
+
+    // Pop n elements.
+    pub fn pop(&mut self, n: i32) {
+        self.set_top(-n - 1)
+    }
+
+    // Absolute version of an index.
+    pub fn abs_index(&self, idx: i32) -> i32 {
+        if idx > 0 || idx <= REGISTRY_INDEX {
+            return idx
+        }
+        return self.get_top() + idx + 1
+    }
+
+    // Ensure room for n more elements; false if impossible.
+    pub fn check_stack(&mut self, n: i32) -> bool {
+        unsafe {
+            let L = self.L
+            let ci = (*L).ci
+            res := true
+            if sdiff((*L).stack_last, (*L).top) <= n as isize {
+                let inuse = sdiff((*L).top, (*L).stack) + EXTRA_STACK
+                if inuse > MAX_STACK - (n as isize) {
+                    res = false
+                } else {
+                    match stack_grow(L, n as isize) {
+                        ok() => {},
+                        err(_) => { res = false },
+                    }
+                }
+            }
+            let ci2 = (*L).ci
+            if res && ((*ci2).top as usize) < (ptr.offset((*L).top, n as isize) as usize) {
+                (*ci2).top = ptr.offset((*L).top, n as isize)
+            }
+            return res
+        }
+    }
+
+    // Push a copy of the element at idx.
+    pub fn push_value(&mut self, idx: i32) {
+        let v = self.idx2val(idx)
+        self.push_raw(v)
+    }
+
+    // Rotate the elements between idx and the top by n positions (towards
+    // the top for positive n).
+    pub fn rotate(&mut self, idx: i32, n: i32) {
+        unsafe {
+            let L = self.L
+            let t = ptr.offset((*L).top, -1)
+            let p = self.idx2val(idx)
+            let m = if n >= 0 { ptr.offset(t, -(n as isize)) } else { ptr.offset(p, -(n as isize) - 1) }
+            api_reverse(p, m)
+            api_reverse(ptr.offset(m, 1), t)
+            api_reverse(p, t)
+        }
+    }
+
+    // Copy the element at `from` into `to`.
+    pub fn copy(&mut self, fromidx: i32, toidx: i32) {
+        unsafe {
+            let fr = self.idx2val(fromidx)
+            let t = self.idx2val(toidx)
+            set_obj(t, fr)
+            if toidx < REGISTRY_INDEX {
+                // An upvalue of a native closure.
+                let f = (*(*self.L).ci).func
+                gc_barrier(self.L, val_gc(f), fr)
+            }
+        }
+    }
+
+    // Move the top element into position idx, shifting up.
+    pub fn insert(&mut self, idx: i32) {
+        self.rotate(idx, 1)
+    }
+
+    // Remove the element at idx, shifting down.
+    pub fn remove(&mut self, idx: i32) {
+        self.rotate(idx, -1)
+        self.pop(1)
+    }
+
+    // Pop the top element into position idx.
+    pub fn replace(&mut self, idx: i32) {
+        self.copy(-1, idx)
+        self.pop(1)
+    }
+
+    // Move n values from this thread to `to` (same universe).
+    pub fn xmove(&mut self, to: &mut Cx, n: i32) {
+        unsafe {
+            if self.L == to.L {
+                return
+            }
+            let src = self.L
+            (*src).top = ptr.offset((*src).top, -(n as isize))
+            for i in 0isize..(n as isize) {
+                set_obj((*to.L).top, ptr.offset((*src).top, i))
+                (*to.L).top = ptr.offset((*to.L).top, 1)
+            }
+        }
+    }
+
+    // --- Push ---
+
+    pub fn push_nil(&mut self) {
+        L_push_nil(self.L)
+    }
+    pub fn push_boolean(&mut self, b: bool) {
+        unsafe {
+            set_bool((*self.L).top, b)
+            self.api_incr_top()
+        }
+    }
+    pub fn push_integer(&mut self, n: i64) {
+        unsafe {
+            set_int((*self.L).top, n)
+            self.api_incr_top()
+        }
+    }
+    pub fn push_number(&mut self, n: f64) {
+        unsafe {
+            set_float((*self.L).top, n)
+            self.api_incr_top()
+        }
+    }
+    // Push a string with these bytes.
+    pub fn push_bytes(&mut self, b: &[u8]) -> void!Throw {
+        unsafe {
+            let s = str_new(self.L, ptr.as_ptr(b), b.len)?
+            set_str((*self.L).top, s)
+            self.api_incr_top()
+            gc_check(self.L)
+            return ok()
+        }
+    }
+    pub fn push_str(&mut self, s: &str) -> void!Throw {
+        return self.push_bytes(mem.str_bytes(s))
+    }
+    // Push a string from raw bytes (ptr, len).
+    pub fn push_raw_bytes(&mut self, p: *const u8, n: usize) -> void!Throw {
+        unsafe {
+            let s = str_new(self.L, p, n)?
+            set_str((*self.L).top, s)
+            self.api_incr_top()
+            gc_check(self.L)
+            return ok()
+        }
+    }
+    pub fn push_light_userdata(&mut self, p: *mut u8) {
+        unsafe {
+            set_lightud((*self.L).top, p)
+            self.api_incr_top()
+        }
+    }
+    // Push a native function (no upvalues).
+    pub fn push_native(&mut self, f: NativeFn) -> void!Throw {
+        return self.push_closure(f, 0)
+    }
+    // Push a native closure taking its n upvalues from the top of the stack.
+    pub fn push_closure(&mut self, f: NativeFn, n: i32) -> void!Throw {
+        unsafe {
+            let L = self.L
+            let cl = nclosure_new(L, f, n as u8)?
+            (*L).top = ptr.offset((*L).top, -(n as isize))
+            for i in 0isize..(n as isize) {
+                set_obj(ptr.offset(ncl_upvalues(cl), i), ptr.offset((*L).top, i))
+            }
+            set_gc((*L).top, cl as *mut GCObject, TAG_NCLOSURE)
+            self.api_incr_top()
+            gc_check(L)
+            return ok()
+        }
+    }
+    // Push this thread; true if it is the main thread.
+    pub fn push_thread(&mut self) -> bool {
+        unsafe {
+            set_gc((*self.L).top, self.L as *mut GCObject, TAG_THREAD)
+            self.api_incr_top()
+            return (*G(self.L)).mainthread == self.L
+        }
+    }
+    pub fn push_global_table(&mut self) {
+        unsafe {
+            let reg = val_gc(G_registry(G(self.L))) as *mut Table
+            let v = tab_get_int(reg, RIDX_GLOBALS)
+            self.push_raw(v)
+        }
+    }
+    // Push the "fail" value (nil).
+    pub fn push_fail(&mut self) {
+        self.push_nil()
+    }
+
+    // --- Type queries ---
+
+    pub fn type_of(&self, idx: i32) -> i32 {
+        unsafe {
+            let v = self.idx2val(idx)
+            if v == none_value() {
+                return TNONE
+            }
+            return ((*v).tag & 15) as i32
+        }
+    }
+    pub fn type_name(&self, t: i32) -> &str from(static) {
+        if t < 0 {
+            return "no value"
+        }
+        return type_name(t as u8)
+    }
+    pub fn is_none(&self, idx: i32) -> bool {
+        return self.type_of(idx) == TNONE
+    }
+    pub fn is_nil(&self, idx: i32) -> bool {
+        return self.type_of(idx) == TNIL
+    }
+    pub fn is_none_or_nil(&self, idx: i32) -> bool {
+        return self.type_of(idx) <= 0
+    }
+    pub fn is_boolean(&self, idx: i32) -> bool {
+        return self.type_of(idx) == TBOOLEAN
+    }
+    pub fn is_table(&self, idx: i32) -> bool {
+        return self.type_of(idx) == TTABLE
+    }
+    pub fn is_function(&self, idx: i32) -> bool {
+        return self.type_of(idx) == TFUNCTION
+    }
+    pub fn is_thread(&self, idx: i32) -> bool {
+        return self.type_of(idx) == TTHREAD
+    }
+    pub fn is_light_userdata(&self, idx: i32) -> bool {
+        return self.type_of(idx) == TLIGHTUSERDATA
+    }
+    // Full or light userdata.
+    pub fn is_userdata(&self, idx: i32) -> bool {
+        let t = self.type_of(idx)
+        return t == TUSERDATA || t == TLIGHTUSERDATA
+    }
+    pub fn is_native_function(&self, idx: i32) -> bool {
+        unsafe { return (*self.idx2val(idx)).tag == TAG_NCLOSURE }
+    }
+    // A number or a string convertible to a number.
+    pub fn is_number(&self, idx: i32) -> bool {
+        n: f64 = 0.0
+        return vm_to_number(self.idx2val(idx), ptr.from_mut(&mut n))
+    }
+    // A string or a number (numbers convert to strings).
+    pub fn is_string(&self, idx: i32) -> bool {
+        let t = self.type_of(idx)
+        return t == TSTRING || t == TNUMBER
+    }
+    // An integer value (not a float).
+    pub fn is_integer(&self, idx: i32) -> bool {
+        unsafe { return (*self.idx2val(idx)).tag == TAG_INT }
+    }
+    pub fn is_yieldable(&self) -> bool {
+        unsafe { return (*self.L).nny == 0 }
+    }
+
+    // --- Conversions ---
+
+    // Integer value (strings and integral floats convert), or none.
+    pub fn to_integer(&self, idx: i32) -> Option<i64> {
+        r: i64 = 0
+        if vm_to_integer(self.idx2val(idx), ptr.from_mut(&mut r), F2I_EQ) {
+            return some(r)
+        }
+        return none
+    }
+    // Float value (strings convert), or none.
+    pub fn to_number(&self, idx: i32) -> Option<f64> {
+        r: f64 = 0.0
+        if vm_to_number(self.idx2val(idx), ptr.from_mut(&mut r)) {
+            return some(r)
+        }
+        return none
+    }
+    pub fn to_boolean(&self, idx: i32) -> bool {
+        return !val_is_falsy(self.idx2val(idx))
+    }
+    // String value (numbers are converted in place, like lua_tolstring),
+    // or none for other types.
+    pub fn to_lstr(&mut self, idx: i32) -> Option<LuaStr>!Throw {
+        unsafe {
+            let v = self.idx2val(idx)
+            if !val_is_string(v) {
+                if !val_is_number(v) {
+                    return ok(none)
+                }
+                let s = num_to_lstring(self.L, v)?
+                let v2 = self.idx2val(idx)
+                set_str(v2, s)
+                gc_check(self.L)
+                return ok(some(lstr_of(val_str(self.idx2val(idx)))))
+            }
+            return ok(some(lstr_of(val_str(v))))
+        }
+    }
+    // Raw length: string length, table border without __len, userdata size.
+    pub fn raw_len(&self, idx: i32) -> u64 {
+        unsafe {
+            let v = self.idx2val(idx)
+            let t = (*v).tag
+            if t == TAG_SHORTSTR || t == TAG_LONGSTR {
+                return (*val_str(v)).length as u64
+            }
+            if t == TAG_TABLE {
+                return tab_length(val_gc(v) as *mut Table)
+            }
+            if t == TAG_USERDATA {
+                return (*(val_gc(v) as *mut Udata)).size as u64
+            }
+            return 0
+        }
+    }
+    // Address of a full userdata's block or a light userdata, else null.
+    pub fn to_userdata(&self, idx: i32) -> *mut u8 {
+        unsafe {
+            let v = self.idx2val(idx)
+            if (*v).tag == TAG_USERDATA {
+                return udata_data(val_gc(v) as *mut Udata)
+            }
+            if (*v).tag == TAG_LIGHTUD {
+                return val_ptr(v)
+            }
+            return 0 as *mut u8
+        }
+    }
+    // Generic pointer identifying the value (for "%p" style output).
+    pub fn to_pointer(&self, idx: i32) -> *const u8 {
+        unsafe {
+            let v = self.idx2val(idx)
+            let t = (*v).tag
+            if t == TAG_USERDATA || t == TAG_LIGHTUD {
+                return self.to_userdata(idx) as *const u8
+            }
+            if (t & COLLECTABLE) != 0 {
+                return val_ptr(v) as *const u8
+            }
+            return 0 as *const u8
+        }
+    }
+    // Handle on the thread at idx.
+    pub fn to_thread(&self, idx: i32) -> Option<Cx> {
+        unsafe {
+            let v = self.idx2val(idx)
+            if (*v).tag == TAG_THREAD {
+                return some(Cx { L: val_gc(v) as *mut State })
+            }
+            return none
+        }
+    }
+    // The native function at idx, if any.
+    pub fn to_native(&self, idx: i32) -> Option<NativeFn> {
+        unsafe {
+            let v = self.idx2val(idx)
+            if (*v).tag == TAG_NCLOSURE {
+                return some((*(val_gc(v) as *mut NClosure)).f)
+            }
+            return none
+        }
+    }
+
+    // --- Comparison and arithmetic ---
+
+    pub fn raw_equal(&self, i1: i32, i2: i32) -> bool {
+        let a = self.idx2val(i1)
+        let b = self.idx2val(i2)
+        if a == none_value() || b == none_value() {
+            return false
+        }
+        return vm_raw_equal(a, b)
+    }
+
+    // Compare two values with metamethods (OPEQ, OPLT, OPLE).
+    pub fn compare(&mut self, i1: i32, i2: i32, op: i32) -> bool!Throw {
+        let a = self.idx2val(i1)
+        let b = self.idx2val(i2)
+        if a == none_value() || b == none_value() {
+            return ok(false)
+        }
+        if op == OPEQ {
+            return vm_equal(self.L, a, b)
+        }
+        if op == OPLT {
+            return vm_less_than(self.L, a, b)
+        }
+        return vm_less_equal(self.L, a, b)
+    }
+
+    // Arithmetic over the top two values (one for OPUNM/OPBNOT), replaced by
+    // the result.
+    pub fn arith(&mut self, op: i32) -> void!Throw {
+        unsafe {
+            let L = self.L
+            if op == OPUNM || op == OPBNOT {
+                // Duplicate the operand as a fake second operand.
+                set_obj((*L).top, ptr.offset((*L).top, -1))
+                self.api_incr_top()
+            }
+            let ev = (op as u32) + TM_ADD
+            let p1 = ptr.offset((*L).top, -2)
+            let p2 = ptr.offset((*L).top, -1)
+            vm_arith(L, ev, p1, p2, save_stack(L, p1))?
+            (*L).top = ptr.offset((*L).top, -1)
+            return ok()
+        }
+    }
+
+    // Concatenate the top n values (n = 0 pushes "").
+    pub fn concat(&mut self, n: i32) -> void!Throw {
+        unsafe {
+            if n > 0 {
+                vm_concat(self.L, n)?
+            } else {
+                let s = str_new(self.L, 0 as *const u8, 0)?
+                set_str((*self.L).top, s)
+                self.api_incr_top()
+            }
+            gc_check(self.L)
+            return ok()
+        }
+    }
+
+    // Push the length of the value at idx (with __len).
+    pub fn len(&mut self, idx: i32) -> void!Throw {
+        unsafe {
+            let L = self.L
+            let v = self.idx2val(idx)
+            let off = save_stack(L, (*L).top)
+            self.api_incr_top()
+            vm_objlen(L, off, v)?
+            return ok()
+        }
+    }
+
+    // Convert a numeral string and push its value; returns the string size
+    // plus one on success, 0 otherwise.
+    pub fn string_to_number(&mut self, s: &[u8]) -> usize {
+        iv: i64 = 0
+        fv: f64 = 0.0
+        let r = num_string_to_number(s, &mut iv, &mut fv)
+        if r == 1 {
+            self.push_integer(iv)
+        } else if r == 2 {
+            self.push_number(fv)
+        } else {
+            return 0
+        }
+        return s.len + 1
+    }
+
+    // --- Tables ---
+
+    // Push a new empty table.
+    pub fn new_table(&mut self) -> void!Throw {
+        return self.create_table(0, 0)
+    }
+    // Push a new table with preallocated space.
+    pub fn create_table(&mut self, narr: i32, nrec: i32) -> void!Throw {
+        unsafe {
+            let L = self.L
+            let t = tab_new(L)?
+            set_gc((*L).top, t as *mut GCObject, TAG_TABLE)
+            self.api_incr_top()
+            if narr > 0 || nrec > 0 {
+                tab_resize(L, t, narr as u32, nrec as u32)?
+            }
+            gc_check(L)
+            return ok()
+        }
+    }
+
+    fn finish_get_type(&self) -> i32 {
+        unsafe { return ((*ptr.offset((*self.L).top, -1)).tag & 15) as i32 }
+    }
+
+    // Push t[k] (t at idx, k popped from the top), with metamethods.
+    pub fn get_table(&mut self, idx: i32) -> i32!Throw {
+        unsafe {
+            let L = self.L
+            let t = self.idx2val(idx)
+            let k = ptr.offset((*L).top, -1)
+            vm_get(L, t, k, save_stack(L, k))?
+            return ok(self.finish_get_type())
+        }
+    }
+    // Push t[name].
+    pub fn get_field(&mut self, idx: i32, name: &str) -> i32!Throw {
+        let a = self.abs_index(idx)
+        self.push_str(name)?
+        return self.get_table(a)
+    }
+    // Push t[n].
+    pub fn get_i(&mut self, idx: i32, n: i64) -> i32!Throw {
+        let a = self.abs_index(idx)
+        self.push_integer(n)
+        return self.get_table(a)
+    }
+    // Push the global `name`.
+    pub fn get_global(&mut self, name: &str) -> i32!Throw {
+        self.push_global_table()
+        self.push_str(name)?
+        let r = self.get_table(-2)?
+        self.remove(-2)
+        return ok(r)
+    }
+    // t[k] = v with t at idx, k and v on top (both popped).
+    pub fn set_table(&mut self, idx: i32) -> void!Throw {
+        unsafe {
+            let L = self.L
+            let t = self.idx2val(idx)
+            vm_set(L, t, ptr.offset((*L).top, -2), ptr.offset((*L).top, -1))?
+            (*L).top = ptr.offset((*L).top, -2)
+            return ok()
+        }
+    }
+    // t[name] = v (v popped).
+    pub fn set_field(&mut self, idx: i32, name: &str) -> void!Throw {
+        let a = self.abs_index(idx)
+        self.push_str(name)?
+        self.insert(-2)
+        return self.set_table(a)
+    }
+    // t[n] = v (v popped).
+    pub fn set_i(&mut self, idx: i32, n: i64) -> void!Throw {
+        let a = self.abs_index(idx)
+        self.push_integer(n)
+        self.insert(-2)
+        return self.set_table(a)
+    }
+    // Set global `name` to the popped value.
+    pub fn set_global(&mut self, name: &str) -> void!Throw {
+        self.push_global_table()
+        self.insert(-2)
+        self.set_field(-2, name)?
+        self.pop(1)
+        return ok()
+    }
+
+    fn table_at(&self, idx: i32) -> *mut Table {
+        unsafe { return val_gc(self.idx2val(idx)) as *mut Table }
+    }
+
+    // Raw t[k] (k popped, value pushed); t must be a table.
+    pub fn raw_get(&mut self, idx: i32) -> i32 {
+        unsafe {
+            let L = self.L
+            let t = self.table_at(idx)
+            let k = ptr.offset((*L).top, -1)
+            let v = tab_get(t, k)
+            if val_is_empty(v) {
+                (*k).tag = TAG_NIL
+            } else {
+                set_obj(k, v)
+            }
+            return self.finish_get_type()
+        }
+    }
+    // Push raw t[n].
+    pub fn raw_get_i(&mut self, idx: i32, n: i64) -> i32 {
+        unsafe {
+            let t = self.table_at(idx)
+            let v = tab_get_int(t, n)
+            if val_is_empty(v) {
+                self.push_nil()
+            } else {
+                self.push_raw(v)
+            }
+            return self.finish_get_type()
+        }
+    }
+    // Push raw t[p] for a light userdata key.
+    pub fn raw_get_p(&mut self, idx: i32, p: *mut u8) -> i32 {
+        unsafe {
+            let t = self.table_at(idx)
+            kv := Value { bits: 0, tag: 0 }
+            let k = ptr.from_mut(&mut kv)
+            set_lightud(k, p)
+            let v = tab_get(t, k)
+            if val_is_empty(v) {
+                self.push_nil()
+            } else {
+                self.push_raw(v)
+            }
+            return self.finish_get_type()
+        }
+    }
+    // Raw t[k] = v (k, v popped).
+    pub fn raw_set(&mut self, idx: i32) -> void!Throw {
+        unsafe {
+            let L = self.L
+            let t = self.table_at(idx)
+            tab_set(L, t, ptr.offset((*L).top, -2), ptr.offset((*L).top, -1))?
+            (*t).flags = 0
+            (*L).top = ptr.offset((*L).top, -2)
+            return ok()
+        }
+    }
+    // Raw t[n] = v (v popped).
+    pub fn raw_set_i(&mut self, idx: i32, n: i64) -> void!Throw {
+        unsafe {
+            let L = self.L
+            let t = self.table_at(idx)
+            tab_set_int(L, t, n, ptr.offset((*L).top, -1))?
+            (*L).top = ptr.offset((*L).top, -1)
+            return ok()
+        }
+    }
+    // Raw t[p] = v for a light userdata key (v popped).
+    pub fn raw_set_p(&mut self, idx: i32, p: *mut u8) -> void!Throw {
+        unsafe {
+            let L = self.L
+            let t = self.table_at(idx)
+            kv := Value { bits: 0, tag: 0 }
+            let k = ptr.from_mut(&mut kv)
+            set_lightud(k, p)
+            tab_set(L, t, k, ptr.offset((*L).top, -1))?
+            (*L).top = ptr.offset((*L).top, -1)
+            return ok()
+        }
+    }
+
+    // Push the metatable of the value at idx; false (nothing pushed) if none.
+    pub fn get_metatable(&mut self, idx: i32) -> bool {
+        unsafe {
+            let mt = meta_get_metatable(G(self.L), self.idx2val(idx))
+            if ptr.is_null(mt) {
+                return false
+            }
+            set_gc((*self.L).top, mt as *mut GCObject, TAG_TABLE)
+            self.api_incr_top()
+            return true
+        }
+    }
+
+    // Pop a table (or nil) and make it the metatable of the value at idx.
+    pub fn set_metatable(&mut self, idx: i32) {
+        unsafe {
+            let L = self.L
+            let obj = self.idx2val(idx)
+            let mtv = ptr.offset((*L).top, -1)
+            mt := 0 as *mut Table
+            if (*mtv).tag == TAG_TABLE {
+                mt = val_gc(mtv) as *mut Table
+            }
+            let t = (*obj).tag
+            if t == TAG_TABLE {
+                let h = val_gc(obj) as *mut Table
+                (*h).metatable = mt
+                if !ptr.is_null(mt) {
+                    gc_barrier_obj(L, h as *mut GCObject, mt as *mut GCObject)
+                    gc_check_finalizer(L, h as *mut GCObject, mt)
+                }
+            } else if t == TAG_USERDATA {
+                let u = val_gc(obj) as *mut Udata
+                (*u).metatable = mt
+                if !ptr.is_null(mt) {
+                    gc_barrier_obj(L, u as *mut GCObject, mt as *mut GCObject)
+                    gc_check_finalizer(L, u as *mut GCObject, mt)
+                }
+            } else {
+                G_set_mt(G(L), t & 15, mt)
+            }
+            (*L).top = ptr.offset((*L).top, -1)
+        }
+    }
+
+    // Table traversal: pops a key and pushes the next key and value
+    // (returns false, pushing nothing, at the end).
+    pub fn next(&mut self, idx: i32) -> bool!Throw {
+        unsafe {
+            let L = self.L
+            let t = self.table_at(idx)
+            let k = ptr.offset((*L).top, -1)
+            if tab_next(L, t, k)? {
+                self.api_incr_top()
+                return ok(true)
+            }
+            (*L).top = ptr.offset((*L).top, -1)
+            return ok(false)
+        }
+    }
+
+    // --- Userdata ---
+
+    // Push a new full userdata with `size` bytes and `nuv` user values;
+    // returns its block address (16-byte aligned).
+    pub fn new_userdata(&mut self, size: usize, nuv: i32) -> (*mut u8)!Throw {
+        unsafe {
+            let L = self.L
+            let u = udata_new(L, size, nuv as u16)?
+            set_gc((*L).top, u as *mut GCObject, TAG_USERDATA)
+            self.api_incr_top()
+            gc_check(L)
+            return ok(udata_data(u))
+        }
+    }
+    // Push user value n of the userdata at idx; returns its type (TNONE if
+    // there is no such value, pushing nil).
+    pub fn get_iuservalue(&mut self, idx: i32, n: i32) -> i32 {
+        unsafe {
+            let v = self.idx2val(idx)
+            if (*v).tag != TAG_USERDATA {
+                self.push_nil()
+                return TNONE
+            }
+            let u = val_gc(v) as *mut Udata
+            if n <= 0 || n > (*u).nuvalue as i32 {
+                self.push_nil()
+                return TNONE
+            }
+            self.push_raw(udata_uv(u, (n - 1) as isize))
+            return self.finish_get_type()
+        }
+    }
+    // Pop a value into user value n of the userdata at idx (false if none).
+    pub fn set_iuservalue(&mut self, idx: i32, n: i32) -> bool {
+        unsafe {
+            let L = self.L
+            let v = self.idx2val(idx)
+            res := false
+            if (*v).tag == TAG_USERDATA {
+                let u = val_gc(v) as *mut Udata
+                if n > 0 && n <= (*u).nuvalue as i32 {
+                    let src = ptr.offset((*L).top, -1)
+                    set_obj(udata_uv(u, (n - 1) as isize), src)
+                    gc_barrier(L, u as *mut GCObject, src)
+                    res = true
+                }
+            }
+            (*L).top = ptr.offset((*L).top, -1)
+            return res
+        }
+    }
+
+    // --- Calls ---
+
+    // Call the function below the top `nargs` arguments.
+    pub fn call(&mut self, nargs: i32, nresults: i32) -> void!Throw {
+        unsafe {
+            let L = self.L
+            let func = ptr.offset((*L).top, -((nargs + 1) as isize))
+            call_noyield(L, func, nresults)?
+            api_adjust_results(L, nresults)
+            return ok()
+        }
+    }
+
+    // Call with a continuation: if the callee yields, `k` is called (with
+    // status YIELD) when the coroutine resumes, instead of returning here.
+    pub fn call_k(&mut self, nargs: i32, nresults: i32, ctx: isize, k: ContinuationFn) -> void!Throw {
+        unsafe {
+            let L = self.L
+            let func = ptr.offset((*L).top, -((nargs + 1) as isize))
+            if (*L).nny > 0 {
+                call_noyield(L, func, nresults)?
+            } else {
+                let ci = (*L).ci
+                (*ci).k = k
+                (*ci).ctx = ctx
+                (*ci).callstatus = (*ci).callstatus | CIST_HASK
+                call_value(L, func, nresults)?
+            }
+            api_adjust_results(L, nresults)
+            return ok()
+        }
+    }
+
+    // Protected call; `msgh` is the stack index of a message handler (0:
+    // none). Returns the status; on error the error object is on top.
+    pub fn pcall(&mut self, nargs: i32, nresults: i32, msgh: i32) -> i32 {
+        unsafe {
+            let L = self.L
+            ef := 0isize
+            if msgh != 0 {
+                ef = save_stack(L, self.idx2val(msgh))
+            }
+            let func = save_stack(L, ptr.offset((*L).top, -((nargs + 1) as isize)))
+            let status = do_pcall_raw(L, func, nresults, ef)
+            api_adjust_results(L, nresults)
+            return status
+        }
+    }
+
+    // Protected call with continuation (see call_k). The Throw is only ever
+    // Yield, which the native function must propagate.
+    pub fn pcall_k(&mut self, nargs: i32, nresults: i32, msgh: i32, ctx: isize, k: ContinuationFn) -> i32!Throw {
+        unsafe {
+            let L = self.L
+            ef := 0isize
+            if msgh != 0 {
+                ef = save_stack(L, self.idx2val(msgh))
+            }
+            let func = save_stack(L, ptr.offset((*L).top, -((nargs + 1) as isize)))
+            status := 0i32
+            if (*L).nny > 0 {
+                status = do_pcall_raw(L, func, nresults, ef)
+            } else {
+                status = do_pcall_k(L, func, nresults, ef, ctx, k)?
+            }
+            api_adjust_results(L, nresults)
+            return ok(status)
+        }
+    }
+
+    // Raise the value on top of the stack as an error: `return err(cx.error())`.
+    pub fn error(&mut self) -> Throw {
+        return err_throw_top(self.L)
+    }
+
+    // Yield from a native function: `return err(cx.yield_(n))`.
+    pub fn yield_(&mut self, nresults: i32) -> Throw {
+        return do_yield(self.L, nresults, false, 0, yield_no_k)
+    }
+    // Yield with a continuation called on resume.
+    pub fn yield_k(&mut self, nresults: i32, ctx: isize, k: ContinuationFn) -> Throw {
+        return do_yield(self.L, nresults, true, ctx, k)
+    }
+
+    // Resume the coroutine `co` with its top `nargs` values; returns the
+    // status and stores the number of results (on co's stack) in nres.
+    pub fn resume(&mut self, co: &mut Cx, nargs: i32, nres: &mut i32) -> i32 {
+        n := 0i32
+        let st = do_resume(co.L, self.L, nargs, ptr.from_mut(&mut n))
+        *nres = n
+        return st
+    }
+
+    // Thread status (OK, YIELD or an error status).
+    pub fn status(&self) -> i32 {
+        unsafe { return (*self.L).status as i32 }
+    }
+
+    // Push a new coroutine; returns its handle.
+    pub fn new_thread(&mut self) -> Cx!Throw {
+        let L1 = thread_new(self.L)?
+        gc_check(self.L)
+        return ok(Cx { L: L1 })
+    }
+
+    // Reset a thread (coroutine.close): close pending to-be-closed
+    // variables and return the status (the error object is on top on error).
+    pub fn close_thread(&mut self, caller: &mut Cx) -> i32 {
+        unsafe {
+            let L = self.L
+            (*L).n_ccalls = (*caller.L).n_ccalls
+            let st = thread_reset(L, (*L).status as i32)
+            return st
+        }
+    }
+
+    // Same universe check: whether two handles are the same thread.
+    pub fn same_thread(&self, other: &Cx) -> bool {
+        return self.L == other.L
+    }
+
+    // Mark the slot at idx as to-be-closed (closed by close_slot or when the
+    // native function returns).
+    pub fn to_close(&mut self, idx: i32) -> void!Throw {
+        unsafe {
+            let v = self.idx2val(idx)
+            return tbc_mark(self.L, save_stack(self.L, v))
+        }
+    }
+    // Close the to-be-closed slot at idx (and set it to nil).
+    pub fn close_slot(&mut self, idx: i32) -> void!Throw {
+        unsafe {
+            let L = self.L
+            let v = self.idx2val(idx)
+            let off = save_stack(L, v)
+            do_close(L, off, ST_OK as i32, false)?
+            (*restore_stack(L, off)).tag = TAG_NIL
+            return ok()
+        }
+    }
+
+    // --- Garbage collector ---
+
+    // Full collection.
+    pub fn gc_collect(&mut self) {
+        gc_full(self.L, false)
+    }
+    pub fn gc_stop(&mut self) {
+        unsafe { (*G(self.L)).gcstp = GCSTP_USR }
+    }
+    pub fn gc_restart(&mut self) {
+        unsafe {
+            let g = G(self.L)
+            set_debt(g, 0)
+            (*g).gcstp = 0
+        }
+    }
+    pub fn gc_is_running(&self) -> bool {
+        unsafe { return (*G(self.L)).gcstp == 0 }
+    }
+    // Memory in use, in bytes.
+    pub fn gc_count_bytes(&self) -> usize {
+        unsafe { return (*G(self.L)).total_bytes as usize }
+    }
+    // One step (`kb`: extra kilobytes of debt, 0 for a basic step); true if
+    // a cycle finished.
+    pub fn gc_step(&mut self, kb: i64) -> bool {
+        return gc_user_step(self.L, kb)
+    }
+    // Switch to incremental mode (parameters <= 0 keep the current value);
+    // returns the previous mode name.
+    pub fn gc_incremental(&mut self, pause: i32, stepmul: i32, stepsize: i32) -> &str from(static) {
+        unsafe {
+            let g = G(self.L)
+            let prev = if (*g).gckind == GC_KIND_GEN { "generational" } else { "incremental" }
+            if pause != 0 {
+                (*g).gcpause = pause
+            }
+            if stepmul != 0 {
+                (*g).gcstepmul = stepmul
+            }
+            if stepsize != 0 {
+                (*g).gcstepsize = stepsize
+            }
+            (*g).gckind = GC_KIND_INC
+            return prev
+        }
+    }
+    // Switch to generational mode; returns the previous mode name.
+    pub fn gc_generational(&mut self, minormul: i32, majormul: i32) -> &str from(static) {
+        unsafe {
+            let g = G(self.L)
+            let prev = if (*g).gckind == GC_KIND_GEN { "generational" } else { "incremental" }
+            if minormul != 0 {
+                (*g).gen_minormul = minormul
+            }
+            if majormul != 0 {
+                (*g).gen_majormul = majormul
+            }
+            (*g).gckind = GC_KIND_GEN
+            return prev
+        }
+    }
+    // Set the pause (percent); returns the previous value.
+    pub fn gc_set_pause(&mut self, v: i32) -> i32 {
+        unsafe {
+            let g = G(self.L)
+            let prev = (*g).gcpause
+            (*g).gcpause = v
+            return prev
+        }
+    }
+    // Set the step multiplier; returns the previous value.
+    pub fn gc_set_stepmul(&mut self, v: i32) -> i32 {
+        unsafe {
+            let g = G(self.L)
+            let prev = (*g).gcstepmul
+            (*g).gcstepmul = v
+            return prev
+        }
+    }
+
+    // --- Warnings ---
+
+    // Emit a warning piece (`tocont`: more pieces follow).
+    pub fn warning(&mut self, msg: &[u8], tocont: bool) {
+        warn_emit(self.L, msg, tocont)
+    }
+
+    // --- Upvalues ---
+
+    // Push upvalue n of the function at funcindex; returns its name ("" for
+    // native closures) or none if there is no such upvalue.
+    pub fn get_upvalue(&mut self, funcindex: i32, n: i32) -> Option<LuaStr> {
+        unsafe {
+            let f = self.idx2val(funcindex)
+            let v = api_upvalue_slot(f, n)
+            if ptr.is_null(v) {
+                return none
+            }
+            let name = api_upvalue_name(f, n)
+            self.push_raw(v)
+            return some(name)
+        }
+    }
+    // Pop a value into upvalue n of the function at funcindex.
+    pub fn set_upvalue(&mut self, funcindex: i32, n: i32) -> Option<LuaStr> {
+        unsafe {
+            let L = self.L
+            let f = self.idx2val(funcindex)
+            let v = api_upvalue_slot(f, n)
+            if ptr.is_null(v) {
+                return none
+            }
+            let name = api_upvalue_name(f, n)
+            (*L).top = ptr.offset((*L).top, -1)
+            set_obj(v, (*L).top)
+            if (*f).tag == TAG_LCLOSURE {
+                gc_barrier(L, lcl_upval(val_gc(f) as *mut LClosure, (n - 1) as isize) as *mut GCObject, v)
+            } else {
+                gc_barrier(L, val_gc(f), v)
+            }
+            return some(name)
+        }
+    }
+    // Identity of upvalue n of the function at funcindex (null if none).
+    pub fn upvalue_id(&self, funcindex: i32, n: i32) -> *mut u8 {
+        unsafe {
+            let f = self.idx2val(funcindex)
+            if (*f).tag == TAG_LCLOSURE {
+                let cl = val_gc(f) as *mut LClosure
+                if n >= 1 && n <= (*cl).nupvalues as i32 {
+                    return lcl_upval(cl, (n - 1) as isize) as *mut u8
+                }
+            } else if (*f).tag == TAG_NCLOSURE {
+                let cl = val_gc(f) as *mut NClosure
+                if n >= 1 && n <= (*cl).nupvalues as i32 {
+                    return ptr.offset(ncl_upvalues(cl), (n - 1) as isize) as *mut u8
+                }
+            }
+            return 0 as *mut u8
+        }
+    }
+    // Make upvalue n1 of Lua closure f1 refer to upvalue n2 of closure f2.
+    pub fn upvalue_join(&mut self, f1: i32, n1: i32, f2: i32, n2: i32) {
+        unsafe {
+            let c1 = val_gc(self.idx2val(f1)) as *mut LClosure
+            let c2 = val_gc(self.idx2val(f2)) as *mut LClosure
+            let uv = lcl_upval(c2, (n2 - 1) as isize)
+            *ptr.offset(lcl_upvals(c1), (n1 - 1) as isize) = uv
+            gc_barrier_obj(self.L, c1 as *mut GCObject, uv as *mut GCObject)
+        }
+    }
+
+    // --- Debug interface ---
+
+    // Activation record of the function `level` levels up the stack (0 =
+    // current). False if the level is out of range.
+    pub fn get_stack(&mut self, level: i32, ar: &mut Debug) -> bool {
+        let ci = dbg_get_stack(self.L, level)
+        if ptr.is_null(ci) {
+            return false
+        }
+        ar.ci = ci
+        return true
+    }
+
+    // Fill `ar` with the fields selected by `what` ('n', 'S', 'l', 'u', 't',
+    // 'r'; 'f' pushes the function, 'L' pushes the table of active lines).
+    // A leading '>' takes the function from the top of the stack (popped)
+    // instead of the record's frame. Returns false for invalid options.
+    pub fn get_info(&mut self, what: &str, ar: &mut Debug) -> bool!Throw {
+        unsafe {
+            let L = self.L
+            let w = mem.str_bytes(what)
+            fv := Value { bits: 0, tag: 0 }
+            let f = ptr.from_mut(&mut fv)
+            ci := 0 as *mut CallInfo
+            start := 0usize
+            if w.len > 0 && w[0] == b'>' {
+                set_obj(f, ptr.offset((*L).top, -1))
+                (*L).top = ptr.offset((*L).top, -1)
+                start = 1
+            } else {
+                ci = ar.ci
+                set_obj(f, (*ci).func)
+            }
+            let opts = w[start..w.len]
+            let res = dbg_fill_info(L, opts, ar, f, ci)
+            for i in 0usize..opts.len {
+                if opts[i] == b'f' {
+                    self.push_raw(f)
+                }
+            }
+            for i in 0usize..opts.len {
+                if opts[i] == b'L' {
+                    api_collect_valid_lines(L, f)?
+                }
+            }
+            return ok(res)
+        }
+    }
+
+    // Push local variable n of the frame described by `ar` and return its
+    // name; none (nothing pushed) if there is no such local.
+    pub fn get_local(&mut self, ar: &Debug, n: i32) -> Option<LuaStr> {
+        unsafe {
+            ni := ni_new()
+            let slot = dbg_find_local(self.L, ar.ci, n, &mut ni)
+            if ptr.is_null(slot) {
+                return none
+            }
+            self.push_raw(slot)
+            return some(LuaStr { p: ni.name, n: ni.name_len })
+        }
+    }
+    // Name of parameter n of the Lua function on top of the stack (not
+    // popped), for get_local with a function instead of a frame.
+    pub fn get_param_name(&mut self, n: i32) -> Option<LuaStr> {
+        unsafe {
+            let f = ptr.offset((*self.L).top, -1)
+            if (*f).tag != TAG_LCLOSURE {
+                return none
+            }
+            let name = func_local_name((*(val_gc(f) as *mut LClosure)).p, n, 0)
+            if ptr.is_null(name) {
+                return none
+            }
+            return some(lstr_of(name))
+        }
+    }
+    // Pop a value into local n of the frame described by `ar`; returns the
+    // name or none (the value is popped either way).
+    pub fn set_local(&mut self, ar: &Debug, n: i32) -> Option<LuaStr> {
+        unsafe {
+            let L = self.L
+            ni := ni_new()
+            let slot = dbg_find_local(L, ar.ci, n, &mut ni)
+            (*L).top = ptr.offset((*L).top, -1)
+            if ptr.is_null(slot) {
+                return none
+            }
+            set_obj(slot, (*L).top)
+            return some(LuaStr { p: ni.name, n: ni.name_len })
+        }
+    }
+
+    // Install (or remove, with mask 0) the debug hook of this thread.
+    pub fn set_hook(&mut self, f: HookFn, mask: i32, count: i32) {
+        unsafe {
+            let L = self.L
+            m := mask
+            if m == 0 {
+                (*L).has_hook = false
+            } else {
+                (*L).has_hook = true
+                (*L).hook = f
+            }
+            (*L).basehookcount = count
+            (*L).hookcount = count
+            (*L).hookmask = (m & 15) as u8
+        }
+    }
+    // Remove the debug hook.
+    pub fn clear_hook(&mut self) {
+        unsafe {
+            (*self.L).has_hook = false
+            (*self.L).hookmask = 0
+            (*self.L).basehookcount = 0
+            (*self.L).hookcount = 0
+        }
+    }
+    pub fn get_hook_mask(&self) -> i32 {
+        unsafe { return (*self.L).hookmask as i32 }
+    }
+    pub fn get_hook_count(&self) -> i32 {
+        unsafe { return (*self.L).basehookcount }
+    }
+    pub fn has_hook(&self) -> bool {
+        unsafe { return (*self.L).has_hook }
+    }
+
+    // --- Loading ---
+
+    // Load a chunk (text or binary) and push it as a function; on error push
+    // the message. `mode` is "b", "t" or "bt".
+    pub fn load_buffer(&mut self, chunk: &[u8], chunkname: &str, mode: &str) -> i32 {
+        return api_load(self.L, ptr.as_ptr(chunk), chunk.len, mem.str_bytes(chunkname), mem.str_bytes(mode))
+    }
+    // Same with byte-string chunk name and mode.
+    pub fn load_bytes(&mut self, chunk: &[u8], chunkname: &[u8], mode: &[u8]) -> i32 {
+        return api_load(self.L, ptr.as_ptr(chunk), chunk.len, chunkname, mode)
+    }
+
+    // Push the binary chunk of the Lua function on top (stripping debug
+    // information if asked). False if the value is not a Lua function.
+    pub fn dump(&mut self, strip: bool) -> bool!Throw {
+        unsafe {
+            let L = self.L
+            let f = ptr.offset((*L).top, -1)
+            if (*f).tag != TAG_LCLOSURE {
+                return ok(false)
+            }
+            b := SBuf.new(L)
+            dump_function(L, (*(val_gc(f) as *mut LClosure)).p, strip, &mut b)?
+            let s = b.to_lstring()?
+            set_str((*L).top, s)
+            self.api_incr_top()
+            return ok(true)
+        }
+    }
+    // --- Auxiliary library (luaL_* analogues) ---
+
+    // Raise "bad argument #arg to 'fname' (msg)".
+    pub fn arg_error(&mut self, arg: i32, msg: &str) -> Throw {
+        return aux_arg_error(self, arg, mem.str_bytes(msg))
+    }
+    pub fn arg_error_bytes(&mut self, arg: i32, msg: &[u8]) -> Throw {
+        return aux_arg_error(self, arg, msg)
+    }
+    // Raise "bad argument ... (tname expected, got <type>)".
+    pub fn type_error(&mut self, arg: i32, tname: &str) -> Throw {
+        b := SBuf.new(self.L)
+        match b.add_str(tname) {
+            ok() => {},
+            err(e) => { return e },
+        }
+        match b.add_str(" expected, got ") {
+            ok() => {},
+            err(e) => { return e },
+        }
+        match aux_typename_for_error(self, arg, &mut b) {
+            ok() => {},
+            err(e) => { return e },
+        }
+        let n = b.n
+        unsafe { return aux_arg_error(self, arg, ptr.borrow_slice(b.data as *const u8, n, &b)) }
+    }
+    fn tag_error(&mut self, arg: i32, t: i32) -> Throw {
+        return self.type_error(arg, type_name(t as u8))
+    }
+    // Check a condition on an argument.
+    pub fn arg_check(&mut self, cond: bool, arg: i32, msg: &str) -> void!Throw {
+        if !cond {
+            return err(self.arg_error(arg, msg))
+        }
+        return ok()
+    }
+    // Check an argument's type condition (raising a type error with tname).
+    pub fn arg_expected(&mut self, cond: bool, arg: i32, tname: &str) -> void!Throw {
+        if !cond {
+            return err(self.type_error(arg, tname))
+        }
+        return ok()
+    }
+    pub fn check_integer(&mut self, arg: i32) -> i64!Throw {
+        match self.to_integer(arg) {
+            some(v) => { return ok(v) },
+            none => {
+                if self.is_number(arg) {
+                    return err(self.arg_error(arg, "number has no integer representation"))
+                }
+                return err(self.tag_error(arg, TNUMBER))
+            },
+        }
+    }
+    pub fn opt_integer(&mut self, arg: i32, def: i64) -> i64!Throw {
+        if self.is_none_or_nil(arg) {
+            return ok(def)
+        }
+        return self.check_integer(arg)
+    }
+    pub fn check_number(&mut self, arg: i32) -> f64!Throw {
+        match self.to_number(arg) {
+            some(v) => { return ok(v) },
+            none => { return err(self.tag_error(arg, TNUMBER)) },
+        }
+    }
+    pub fn opt_number(&mut self, arg: i32, def: f64) -> f64!Throw {
+        if self.is_none_or_nil(arg) {
+            return ok(def)
+        }
+        return self.check_number(arg)
+    }
+    // String argument (numbers are converted in place).
+    pub fn check_lstr(&mut self, arg: i32) -> LuaStr!Throw {
+        match self.to_lstr(arg)? {
+            some(s) => { return ok(s) },
+            none => { return err(self.tag_error(arg, TSTRING)) },
+        }
+    }
+    // Optional string argument with a static default.
+    pub fn opt_lstr(&mut self, arg: i32, def: &[u8]) -> LuaStr!Throw {
+        if self.is_none_or_nil(arg) {
+            return ok(LuaStr { p: ptr.as_ptr(def), n: def.len })
+        }
+        return self.check_lstr(arg)
+    }
+    pub fn check_any(&mut self, arg: i32) -> void!Throw {
+        if self.type_of(arg) == TNONE {
+            return err(self.arg_error(arg, "value expected"))
+        }
+        return ok()
+    }
+    pub fn check_type(&mut self, arg: i32, t: i32) -> void!Throw {
+        if self.type_of(arg) != t {
+            return err(self.tag_error(arg, t))
+        }
+        return ok()
+    }
+    // Index of the string argument in `list` (or of `def` when the argument
+    // is absent and def is non-empty); raises "invalid option 'x'".
+    pub fn check_option(&mut self, arg: i32, def: &str, list: &[&str]) -> i32!Throw {
+        name := LuaStr { p: ptr.as_ptr(mem.str_bytes(def)), n: def.len }
+        if def.len == 0 || !self.is_none_or_nil(arg) {
+            name = self.check_lstr(arg)?
+        }
+        let nb = name.bytes()
+        for i in 0usize..list.len {
+            let cand = mem.str_bytes(list[i])
+            if slice_eq(cand, nb) {
+                return ok(i as i32)
+            }
+        }
+        b := SBuf.new(self.L)
+        b.add_str("invalid option '")?
+        b.add_bytes(nb)?
+        b.add_str("'")?
+        let n = b.n
+        unsafe { return err(aux_arg_error(self, arg, ptr.borrow_slice(b.data as *const u8, n, &b))) }
+    }
+    // Grow the stack or raise "stack overflow (msg)".
+    pub fn check_stack_msg(&mut self, n: i32, msg: &str) -> void!Throw {
+        if !self.check_stack(n) {
+            if msg.len > 0 {
+                b := SBuf.new(self.L)
+                b.add_str("stack overflow (")?
+                b.add_str(msg)?
+                b.add_str(")")?
+                return err(aux_raise(self, &mut b))
+            }
+            return err(self.error_msg("stack overflow"))
+        }
+        return ok()
+    }
+    // Raise an error with position information of the caller (luaL_error):
+    // `return err(cx.error_msg("..."))`.
+    pub fn error_msg(&mut self, msg: &str) -> Throw {
+        b := SBuf.new(self.L)
+        match b.add_str(msg) {
+            ok() => {},
+            err(e) => { return e },
+        }
+        return aux_raise(self, &mut b)
+    }
+    pub fn error_bytes(&mut self, msg: &[u8]) -> Throw {
+        b := SBuf.new(self.L)
+        match b.add_bytes(msg) {
+            ok() => {},
+            err(e) => { return e },
+        }
+        return aux_raise(self, &mut b)
+    }
+    // Raise the contents of a Buffer as an error with position information.
+    pub fn error_buffer(&mut self, buf: &mut Buffer) -> Throw {
+        return aux_raise(self, &mut buf.b)
+    }
+    // Push "short_src:line: " of the function at `level` (or "").
+    pub fn where_(&mut self, level: i32) -> void!Throw {
+        b := SBuf.new(self.L)
+        aux_where(self, &mut b, level)?
+        unsafe { return self.push_raw_bytes(b.data as *const u8, b.n) }
+    }
+    // Push field `event` of the metatable of obj; returns its type (TNIL,
+    // pushing nothing, when absent).
+    pub fn get_metafield(&mut self, obj: i32, event: &str) -> i32!Throw {
+        if !self.get_metatable(obj) {
+            return ok(TNIL)
+        }
+        self.push_str(event)?
+        let t = self.raw_get(-2)
+        if t == TNIL {
+            self.pop(2)
+        } else {
+            self.remove(-2)
+        }
+        return ok(t)
+    }
+    // Call metamethod `event` of obj with obj as argument, pushing its
+    // result; false (nothing pushed) if there is no such metamethod.
+    pub fn call_meta(&mut self, obj0: i32, event: &str) -> bool!Throw {
+        let obj = self.abs_index(obj0)
+        if self.get_metafield(obj, event)? == TNIL {
+            return ok(false)
+        }
+        self.push_value(obj)
+        self.call(1, 1)?
+        return ok(true)
+    }
+    // Push the string form of any value (as `tostring` does: __tostring,
+    // __name, numbers, "type: 0x..."), returning a view of it.
+    pub fn to_lstring_meta(&mut self, idx0: i32) -> LuaStr!Throw {
+        let idx = self.abs_index(idx0)
+        if self.call_meta(idx, "__tostring")? {
+            if !self.is_string(-1) {
+                return err(self.error_msg("'__tostring' must return a string"))
+            }
+        } else {
+            let t = self.type_of(idx)
+            if t == TNUMBER || t == TSTRING {
+                self.push_value(idx)
+                self.to_lstr(-1)?
+            } else if t == TBOOLEAN {
+                if self.to_boolean(idx) {
+                    self.push_str("true")?
+                } else {
+                    self.push_str("false")?
+                }
+            } else if t == TNIL {
+                self.push_str("nil")?
+            } else {
+                b := SBuf.new(self.L)
+                let tt = self.get_metafield(idx, "__name")?
+                if tt == TSTRING {
+                    let s = self.to_lstr(-1)?
+                    match s {
+                        some(v) => { b.add_raw(v.as_ptr(), v.size())? },
+                        none => {},
+                    }
+                } else {
+                    b.add_str(self.type_name(t))?
+                }
+                if tt != TNIL {
+                    self.pop(1)
+                }
+                b.add_str(": ")?
+                unsafe { b.add_pointer(self.to_pointer(idx) as *mut u8)? }
+                unsafe { self.push_raw_bytes(b.data as *const u8, b.n)? }
+            }
+        }
+        match self.to_lstr(-1)? {
+            some(s) => { return ok(s) },
+            none => { return err(self.error_msg("'__tostring' must return a string")) },
+        }
+    }
+    // Length of the value at idx (with __len) as an integer.
+    pub fn len_of(&mut self, idx: i32) -> i64!Throw {
+        self.len(idx)?
+        match self.to_integer(-1) {
+            some(v) => {
+                self.pop(1)
+                return ok(v)
+            },
+            none => { return err(self.error_msg("object length is not an integer")) },
+        }
+    }
+    // Create (or find) registry[tname] as a metatable with __name = tname
+    // and push it; true if it was created.
+    pub fn new_metatable(&mut self, tname: &str) -> bool!Throw {
+        if self.get_metatable_by_name(tname)? != TNIL {
+            return ok(false)
+        }
+        self.pop(1)
+        self.create_table(0, 2)?
+        self.push_str(tname)?
+        self.set_field(-2, "__name")?
+        self.push_value(-1)
+        self.set_field(REGISTRY_INDEX, tname)?
+        return ok(true)
+    }
+    // Push registry[tname]; returns its type.
+    pub fn get_metatable_by_name(&mut self, tname: &str) -> i32!Throw {
+        return self.get_field(REGISTRY_INDEX, tname)
+    }
+    // Set registry[tname] as the metatable of the value on top.
+    pub fn set_metatable_by_name(&mut self, tname: &str) -> void!Throw {
+        self.get_metatable_by_name(tname)?
+        self.set_metatable(-2)
+        return ok()
+    }
+    // Block of the userdata at arg if its metatable is registry[tname],
+    // else null.
+    pub fn test_udata(&mut self, arg: i32, tname: &str) -> (*mut u8)!Throw {
+        let p = self.to_userdata(arg)
+        if !ptr.is_null(p) && self.type_of(arg) == TUSERDATA {
+            if self.get_metatable(arg) {
+                self.get_metatable_by_name(tname)?
+                let same = self.raw_equal(-1, -2)
+                self.pop(2)
+                if same {
+                    return ok(p)
+                }
+            }
+        }
+        unsafe { return ok(0 as *mut u8) }
+    }
+    // Like test_udata, raising a type error on mismatch.
+    pub fn check_udata(&mut self, arg: i32, tname: &str) -> (*mut u8)!Throw {
+        let p = self.test_udata(arg, tname)?
+        if ptr.is_null(p) {
+            return err(self.type_error(arg, tname))
+        }
+        return ok(p)
+    }
+    // Register functions into the table below the `nup` upvalues on top;
+    // each function gets copies of the upvalues (which are then popped).
+    pub fn set_funcs(&mut self, funcs: &[(&str, NativeFn)], nup: i32) -> void!Throw {
+        for i in 0usize..funcs.len {
+            for j in 0i32..nup {
+                self.push_value(-nup)
+            }
+            self.push_closure(funcs[i].1, nup)?
+            self.set_field(-(nup + 2), funcs[i].0)?
+        }
+        self.pop(nup)
+        return ok()
+    }
+    // Push a new table with the given functions.
+    pub fn new_lib(&mut self, funcs: &[(&str, NativeFn)]) -> void!Throw {
+        self.create_table(0, funcs.len as i32)?
+        return self.set_funcs(funcs, 0)
+    }
+    // Push t[fname] (t at idx), creating it as a table if needed; true if it
+    // already existed.
+    pub fn get_subtable(&mut self, idx0: i32, fname: &str) -> bool!Throw {
+        if self.get_field(idx0, fname)? == TTABLE {
+            return ok(true)
+        }
+        self.pop(1)
+        let idx = self.abs_index(idx0)
+        self.new_table()?
+        self.push_value(-1)
+        self.set_field(idx, fname)?
+        return ok(false)
+    }
+    // luaL_requiref: if package.loaded[modname] is not true, call
+    // openf(modname) and store its result there; push the module, and also
+    // set it as global `modname` when glb.
+    pub fn require_lib(&mut self, modname: &str, openf: NativeFn, glb: bool) -> void!Throw {
+        self.get_subtable(REGISTRY_INDEX, "_LOADED")?
+        self.get_field(-1, modname)?
+        if !self.to_boolean(-1) {
+            self.pop(1)
+            self.push_native(openf)?
+            self.push_str(modname)?
+            self.call(1, 1)?
+            self.push_value(-1)
+            self.set_field(-3, modname)?
+        }
+        self.remove(-2)
+        if glb {
+            self.push_value(-1)
+            self.set_global(modname)?
+        }
+        return ok()
+    }
+    // Push a traceback of thread L1 (luaL_traceback), starting at `level`,
+    // preceded by msg (if any).
+    pub fn traceback(&mut self, L1: &mut Cx, msg: Option<&[u8]>, level: i32) -> void!Throw {
+        return aux_traceback(self, L1, msg, level)
+    }
+    // Store the value on top in table t (popped) and return a fresh integer
+    // reference to it (REFNIL for nil).
+    pub fn reference(&mut self, t0: i32) -> i32!Throw {
+        if self.is_nil(-1) {
+            self.pop(1)
+            return ok(REFNIL)
+        }
+        let t = self.abs_index(t0)
+        self.raw_get_i(t, 0)
+        r := 0i32
+        match self.to_integer(-1) {
+            some(v) => { r = v as i32 },
+            none => {},
+        }
+        self.pop(1)
+        if r != 0 {
+            // Reuse a freed reference.
+            self.raw_get_i(t, r as i64)
+            self.raw_set_i(t, 0)?
+        } else {
+            r = (self.raw_len(t) as i32) + 1
+        }
+        self.raw_set_i(t, r as i64)?
+        return ok(r)
+    }
+    // Release reference r of table t.
+    pub fn unreference(&mut self, t0: i32, r: i32) -> void!Throw {
+        if r >= 0 {
+            let t = self.abs_index(t0)
+            self.raw_get_i(t, 0)
+            self.raw_set_i(t, r as i64)?
+            self.push_integer(r as i64)
+            self.raw_set_i(t, 0)?
+        }
+        return ok()
+    }
+    // Load a file (or standard input when filename is none) as a chunk:
+    // skips a first line starting with '#', accepts binary chunks. Pushes
+    // the function or an error message; returns the status (ERRFILE when
+    // the file cannot be read).
+    pub fn load_file(&mut self, filename: Option<&[u8]>, mode: &[u8]) -> i32 {
+        return aux_load_file(self, filename, mode)
+    }
+    // Load and run a string chunk; returns the status.
+    pub fn do_string(&mut self, s: &[u8]) -> i32 {
+        let st = self.load_bytes(s, s, b"bt")
+        if st != OK {
+            return st
+        }
+        return self.pcall(0, MULTRET_ALL, 0)
+    }
+    // Push a copy of s with every occurrence of pattern p (plain text)
+    // replaced by r.
+    pub fn gsub(&mut self, s: &[u8], p: &[u8], r: &[u8]) -> void!Throw {
+        b := SBuf.new(self.L)
+        i := 0usize
+        for i < s.len {
+            if p.len > 0 && i + p.len <= s.len && slice_eq(s[i..i + p.len], p) {
+                b.add_bytes(r)?
+                i += p.len
+            } else {
+                b.add_char(s[i])?
+                i += 1
+            }
+        }
+        unsafe { return self.push_raw_bytes(b.data as *const u8, b.n) }
+    }
+    // Results of a file operation (luaL_fileresult): true, or
+    // fail, "fname: message", errno.
+    pub fn file_result(&mut self, success: bool, fname: Option<&[u8]>) -> i32!Throw {
+        unsafe {
+            let code = dodo_platform_errno()
+            if success {
+                self.push_boolean(true)
+                return ok(1)
+            }
+            self.push_fail()
+            b := SBuf.new(self.L)
+            match fname {
+                some(f) => {
+                    b.add_bytes(f)?
+                    b.add_str(": ")?
+                },
+                none => {},
+            }
+            let m = strerror(code)
+            b.add_raw(m, strlen(m))?
+            self.push_raw_bytes(b.data as *const u8, b.n)?
+            self.push_integer(code as i64)
+            return ok(3)
+        }
+    }
+
+}
+
+fn yield_no_k(cx: &mut Cx, status: i32, ctx: isize) -> i32!Throw {
+    return ok(0)
+}
+
+fn api_reverse(lo0: *mut Value, hi0: *mut Value) {
+    unsafe {
+        lo := lo0
+        hi := hi0
+        tmp := Value { bits: 0, tag: 0 }
+        let t = ptr.from_mut(&mut tmp)
+        for (lo as usize) < (hi as usize) {
+            set_obj(t, lo)
+            set_obj(lo, hi)
+            set_obj(hi, t)
+            lo = ptr.offset(lo, 1)
+            hi = ptr.offset(hi, -1)
+        }
+    }
+}
+
+// After a call with MULTRET, make sure the frame's top covers the results.
+fn api_adjust_results(L: *mut State, nres: i32) {
+    unsafe {
+        let ci = (*L).ci
+        if nres <= MULTRET && ((*ci).top as usize) < ((*L).top as usize) {
+            (*ci).top = (*L).top
+        }
+    }
+}
+
+fn api_upvalue_slot(f: *mut Value, n: i32) -> *mut Value {
+    unsafe {
+        if (*f).tag == TAG_LCLOSURE {
+            let cl = val_gc(f) as *mut LClosure
+            if n >= 1 && n <= (*cl).nupvalues as i32 {
+                return (*lcl_upval(cl, (n - 1) as isize)).v
+            }
+        } else if (*f).tag == TAG_NCLOSURE {
+            let cl = val_gc(f) as *mut NClosure
+            if n >= 1 && n <= (*cl).nupvalues as i32 {
+                return ptr.offset(ncl_upvalues(cl), (n - 1) as isize)
+            }
+        }
+        return 0 as *mut Value
+    }
+}
+
+fn api_upvalue_name(f: *mut Value, n: i32) -> LuaStr {
+    unsafe {
+        if (*f).tag == TAG_LCLOSURE {
+            let p = (*(val_gc(f) as *mut LClosure)).p
+            let name = upval_name(p, n - 1)
+            if ptr.is_null(name) {
+                let q = b"(no name)"
+                return LuaStr { p: ptr.as_ptr(q), n: q.len }
+            }
+            return lstr_of(name)
+        }
+        let e = b""
+        return LuaStr { p: ptr.as_ptr(e), n: 0 }
+    }
+}
+
+// Push a table whose keys are the lines with code of Lua function f (for
+// debug.getinfo 'L'), or nil for native functions.
+fn api_collect_valid_lines(L: *mut State, f: *mut Value) -> void!Throw {
+    unsafe {
+        if (*f).tag != TAG_LCLOSURE {
+            L_push_nil(L)
+            return ok()
+        }
+        let p = (*(val_gc(f) as *mut LClosure)).p
+        let t = tab_new(L)?
+        set_gc((*L).top, t as *mut GCObject, TAG_TABLE)
+        (*L).top = ptr.offset((*L).top, 1)
+        if !ptr.is_null((*p).lineinfo) {
+            tv := Value { bits: 0, tag: TAG_TRUE }
+            let tp = ptr.from_mut(&mut tv)
+            line := (*p).linedefined
+            start := 0i32
+            if (*p).is_vararg == 0 {
+                start = 0
+            } else {
+                // Skip VARARGPREP (it has the line of the definition).
+                line = dbg_get_line(p, 0)
+                start = 1
+            }
+            for i in start..(*p).sizelineinfo {
+                line = dbg_get_line(p, i)
+                tab_set_int(L, t, line as i64, tp)?
+            }
+        }
+        return ok()
+    }
+}
+
+// Load a chunk; pushes the function (with _ENV set to the globals) or the
+// error message. Returns the status.
+fn api_load(L: *mut State, data: *const u8, size: usize, chunkname: &[u8], mode: &[u8]) -> i32 {
+    unsafe {
+        let top_off = save_stack(L, (*L).top)
+        let r = load_chunk(L, data, size, chunkname, mode)
+        match r {
+            ok() => { return ST_OK as i32 },
+            err(e) => {
+                let st = throw_status(e)
+                (*L).top = restore_stack(L, top_off)
+                set_error_obj(L, st, (*L).top)
+                return st
+            },
+        }
+    }
+}
+
+// Parse/undump a chunk with collection blocked, push the closure and set
+// its first upvalue to the globals table.
+fn load_chunk(L: *mut State, data: *const u8, size: usize, chunkname: &[u8], mode: &[u8]) -> void!Throw {
+    unsafe {
+        let g = G(L)
+        let name = str_new(L, ptr.as_ptr(chunkname), chunkname.len)?
+        // Anchor the name on the stack.
+        set_str((*L).top, name)
+        (*L).top = ptr.offset((*L).top, 1)
+        let isbinary = size > 0 && *data == 0x1b
+        if isbinary && !mode_allows(mode, b'b') {
+            return err(load_mode_error(L, "binary", mode))
+        }
+        if !isbinary && !mode_allows(mode, b't') {
+            return err(load_mode_error(L, "text", mode))
+        }
+        let oldstp = (*g).gcstp
+        (*g).gcstp = (*g).gcstp | GCSTP_GC
+        p := 0 as *mut Proto
+        if isbinary {
+            match undump(L, data, size, name) {
+                ok(x) => { p = x },
+                err(e) => {
+                    (*g).gcstp = oldstp
+                    return err(e)
+                },
+            }
+        } else {
+            match compile(L, data as *mut u8, size, name) {
+                ok(x) => { p = x },
+                err(e) => {
+                    (*g).gcstp = oldstp
+                    return err(e)
+                },
+            }
+        }
+        // Build the closure while still blocked, then anchor it.
+        let res = lclosure_new(L, (*p).sizeupvalues as u8)
+        match res {
+            ok(cl) => {
+                (*cl).p = p
+                (*L).top = ptr.offset((*L).top, -1)
+                set_gc((*L).top, cl as *mut GCObject, TAG_LCLOSURE)
+                (*L).top = ptr.offset((*L).top, 1)
+                let r2 = lclosure_init_upvals(L, cl)
+                (*g).gcstp = oldstp
+                r2?
+                if (*cl).nupvalues >= 1 {
+                    let reg = val_gc(G_registry(g)) as *mut Table
+                    let gt = tab_get_int(reg, RIDX_GLOBALS)
+                    let uv = lcl_upval(cl, 0)
+                    set_obj((*uv).v, gt)
+                    gc_barrier(L, uv as *mut GCObject, gt)
+                }
+            },
+            err(e) => {
+                (*g).gcstp = oldstp
+                return err(e)
+            },
+        }
+        gc_check(L)
+        return ok()
+    }
+}
+
+fn mode_allows(mode: &[u8], c: u8) -> bool {
+    for i in 0usize..mode.len {
+        if mode[i] == c {
+            return true
+        }
+    }
+    return false
+}
+
+fn load_mode_error(L: *mut State, kind: &str, mode: &[u8]) -> Throw {
+    b := SBuf.new(L)
+    match load_mode_error_build(&mut b, kind, mode) {
+        ok() => {},
+        err(e) => { return e },
+    }
+    match b.to_lstring() {
+        ok(s) => { err_set_msg(L, s) },
+        err(e) => { return e },
+    }
+    return Throw.Syntax
+}
+
+fn load_mode_error_build(b: &mut SBuf, kind: &str, mode: &[u8]) -> void!Throw {
+    b.add_str("attempt to load a ")?
+    b.add_str(kind)?
+    b.add_str(" chunk (mode is '")?
+    b.add_bytes(mode)?
+    b.add_str("')")?
+    return ok()
 }

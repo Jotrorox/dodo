@@ -1,24 +1,57 @@
 package lua
 
-import "core/mem"
 import "core/ptr"
 
 // Memory management. Every allocation of the runtime goes through these
-// functions so the collector can account for it. (Skeleton version: plain
-// libc; the runtime agent replaces the bodies, keeping the signatures.)
+// functions so the collector can account for it: `total_bytes` is the exact
+// number of bytes in use and `gc_debt` grows with every allocation (the
+// collector runs a step at the next check point once the debt is positive).
+//
+// When the system allocator fails, an emergency full collection is tried
+// once (unless collection is blocked) before raising "not enough memory".
 
 unsafe extern "C" fn malloc(size: usize) -> *mut u8
 unsafe extern "C" fn realloc(block: *mut u8, size: usize) -> *mut u8
 unsafe extern "C" fn free(block: *mut u8)
 
+fn mem_account(L: *mut State, delta: isize) {
+    unsafe {
+        let g = G(L)
+        (*g).total_bytes = (*g).total_bytes + delta
+        (*g).gc_debt = (*g).gc_debt + delta
+    }
+}
+
+// Raise the memory error: the error object is the preallocated message.
+fn mem_error(L: *mut State) -> Throw {
+    unsafe {
+        unsafe {
+            let g = G(L)
+            if !ptr.is_null((*g).memerrmsg) {
+                set_str(L_errobj(L), (*g).memerrmsg)
+            } else {
+                (*L_errobj(L)).tag = TAG_NIL
+            }
+        }
+        return Throw.Memory
+    }
+}
+
 // Allocate `size` bytes (size may be 0, which returns a non-null dummy or null
 // that mem_free accepts). Raises Throw.Memory on failure.
 fn mem_alloc(L: *mut State, size: usize) -> (*mut u8)!Throw {
     unsafe {
-        let block = malloc(if size == 0 { 1 } else { size })
+        let n = if size == 0 { 1usize } else { size }
+        block := malloc(n)
         if ptr.is_null(block) {
-            return err(Throw.Memory)
+            if gc_emergency(L) {
+                block = malloc(n)
+            }
+            if ptr.is_null(block) {
+                return err(mem_error(L))
+            }
         }
+        mem_account(L, size as isize)
         return ok(block)
     }
 }
@@ -27,10 +60,17 @@ fn mem_alloc(L: *mut State, size: usize) -> (*mut u8)!Throw {
 // old_size 0). Raises Throw.Memory on failure, leaving the old block intact.
 fn mem_realloc(L: *mut State, block: *mut u8, old_size: usize, new_size: usize) -> (*mut u8)!Throw {
     unsafe {
-        let grown = realloc(block, if new_size == 0 { 1 } else { new_size })
+        let n = if new_size == 0 { 1usize } else { new_size }
+        grown := if ptr.is_null(block) { malloc(n) } else { realloc(block, n) }
         if ptr.is_null(grown) {
-            return err(Throw.Memory)
+            if gc_emergency(L) {
+                grown = if ptr.is_null(block) { malloc(n) } else { realloc(block, n) }
+            }
+            if ptr.is_null(grown) {
+                return err(mem_error(L))
+            }
         }
+        mem_account(L, (new_size as isize) - (old_size as isize))
         return ok(grown)
     }
 }
@@ -40,6 +80,7 @@ fn mem_free(L: *mut State, block: *mut u8, size: usize) {
     unsafe {
         if !ptr.is_null(block) {
             free(block)
+            mem_account(L, -(size as isize))
         }
     }
 }
