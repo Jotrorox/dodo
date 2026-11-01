@@ -118,6 +118,7 @@ fn vm_to_integer(v: *mut Value, out: *mut i64, mode: i32) -> bool {
 
 // Integer value of a number with an exact integer representation (no
 // string conversion).
+@inline
 fn vm_to_integer_strict(v: *mut Value, out: *mut i64) -> bool {
     unsafe {
         let t = (*v).tag
@@ -133,6 +134,7 @@ fn vm_to_integer_strict(v: *mut Value, out: *mut i64) -> bool {
 }
 
 // Float value of a number (no string conversion).
+@inline
 fn to_float_ns(v: *mut Value, out: *mut f64) -> bool {
     unsafe {
         let t = (*v).tag
@@ -191,7 +193,7 @@ fn vm_mod_ii(m: i64, n: i64) -> i64 {
     }
     r := m % n
     if r != 0 && (r ^ n) < 0 {
-        r += n
+        r = core.wrapping_add(r, n)
     }
     return r
 }
@@ -203,7 +205,7 @@ fn vm_idiv_ii(m: i64, n: i64) -> i64 {
     }
     q := m / n
     if (m ^ n) < 0 && m % n != 0 {
-        q -= 1
+        q = core.wrapping_sub(q, 1)
     }
     return q
 }
@@ -254,6 +256,7 @@ fn vm_shiftl(x: i64, y: i64) -> i64 {
 // Arithmetic on two numbers (op is the TM_* event). Returns false if an
 // operand is not a number (or not convertible to an integer for bitwise
 // operations, in which case the metamethod path reports it).
+@cold
 fn vm_arith_num(L: *mut State, op: u32, v1: *mut Value, v2: *mut Value, res: *mut Value) -> bool!Throw {
     unsafe {
         if op >= TM_BAND && op <= TM_SHR {
@@ -358,6 +361,7 @@ fn vm_arith(L: *mut State, op: u32, v1: *mut Value, v2: *mut Value, res: isize) 
 
 // --- Comparisons ------------------------------------------------------------
 
+@inline(never)
 fn lt_int_float(i: i64, f: f64) -> bool {
     unsafe {
         if i >= -9007199254740992 && i <= 9007199254740992 {
@@ -375,6 +379,7 @@ fn lt_int_float(i: i64, f: f64) -> bool {
         return false
     }
 }
+@inline(never)
 fn le_int_float(i: i64, f: f64) -> bool {
     unsafe {
         if i >= -9007199254740992 && i <= 9007199254740992 {
@@ -392,6 +397,7 @@ fn le_int_float(i: i64, f: f64) -> bool {
         return false
     }
 }
+@inline(never)
 fn lt_float_int(f: f64, i: i64) -> bool {
     unsafe {
         if i >= -9007199254740992 && i <= 9007199254740992 {
@@ -409,6 +415,7 @@ fn lt_float_int(f: f64, i: i64) -> bool {
         return true
     }
 }
+@inline(never)
 fn le_float_int(f: f64, i: i64) -> bool {
     unsafe {
         if i >= -9007199254740992 && i <= 9007199254740992 {
@@ -428,6 +435,7 @@ fn le_float_int(f: f64, i: i64) -> bool {
 }
 
 // a < b for two numbers.
+@inline
 fn num_lt(a: *mut Value, b: *mut Value) -> bool {
     unsafe {
         if (*a).tag == TAG_INT {
@@ -442,6 +450,7 @@ fn num_lt(a: *mut Value, b: *mut Value) -> bool {
         return lt_float_int(val_float(a), val_int(b))
     }
 }
+@inline
 fn num_le(a: *mut Value, b: *mut Value) -> bool {
     unsafe {
         if (*a).tag == TAG_INT {
@@ -472,6 +481,7 @@ fn both_strings(a: *mut Value, b: *mut Value) -> bool {
     }
 }
 
+@inline(never)
 fn vm_less_than(L: *mut State, a: *mut Value, b: *mut Value) -> bool!Throw {
     unsafe {
         if both_numbers(a, b) {
@@ -484,6 +494,7 @@ fn vm_less_than(L: *mut State, a: *mut Value, b: *mut Value) -> bool!Throw {
     }
 }
 
+@inline(never)
 fn vm_less_equal(L: *mut State, a: *mut Value, b: *mut Value) -> bool!Throw {
     unsafe {
         if both_numbers(a, b) {
@@ -498,6 +509,7 @@ fn vm_less_equal(L: *mut State, a: *mut Value, b: *mut Value) -> bool!Throw {
 
 // --- Numeric for ------------------------------------------------------------
 
+@cold
 fn for_error(L: *mut State, v: *mut Value, what: &str) -> Throw {
     unsafe {
         b := SBuf.new(L)
@@ -556,6 +568,7 @@ fn for_limit(L: *mut State, init: i64, lim: *mut Value, out: *mut i64, step: i64
 }
 
 // Prepare a numeric for loop at ra; true if the loop is skipped.
+@inline(never)
 fn vm_forprep(L: *mut State, ra: *mut Value) -> bool!Throw {
     unsafe {
         let pinit = ra
@@ -620,10 +633,11 @@ fn vm_forprep(L: *mut State, ra: *mut Value) -> bool!Throw {
 
 // VARARGPREP: move the function and its fixed parameters above the extra
 // arguments.
+@inline(never)
 fn vm_adjust_varargs(L: *mut State, ci: *mut CallInfo, nfix: i32, p: *mut Proto) -> void!Throw {
     unsafe {
-        let actual = sdiff((*L).top, (*ci).func) as i32 - 1
-        let nextra = actual - nfix
+        let actual = small_i32(sdiff((*L).top, (*ci).func)) - 1
+        let nextra = core.wrapping_sub(actual, nfix)
         (*ci).nextraargs = nextra
         stack_check(L, ((*p).maxstacksize as isize) + 1)?
         let func = (*ci).func
@@ -641,6 +655,7 @@ fn vm_adjust_varargs(L: *mut State, ci: *mut CallInfo, nfix: i32, p: *mut Proto)
 }
 
 // VARARG: copy `wanted` extra arguments (-1: all, setting top) to ra.
+@inline(never)
 fn vm_get_varargs(L: *mut State, ci: *mut CallInfo, ra_off: isize, wanted0: i32) -> void!Throw {
     unsafe {
         let nextra = (*ci).nextraargs
@@ -1004,10 +1019,10 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                         b := ((i >> 16) & 255) as u32
                         c := (i >> 24) as u32
                         if b > 0 {
-                            b = 1u32 << (b - 1)
+                            b = 1u32 << ((b - 1) & 31)
                         }
                         if ((i >> 15) & 1) != 0 {
-                            c = c + (*pc >> 7) * 256
+                            c = core.wrapping_add(c, (*pc >> 7) << 8)
                         }
                         pc = ptr.offset(pc, 1)
                         (*ci).savedpc = pc
@@ -1928,14 +1943,14 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                         b := ((i >> 16) & 255) as i32
                         let nparams1 = (i >> 24) as i32
                         let delta = if nparams1 != 0 {
-                            (*ci).nextraargs + nparams1
+                            core.wrapping_add((*ci).nextraargs, nparams1)
                         } else {
                             0i32
                         }
                         if b != 0 {
                             (*L).top = ptr.offset(ra, b as isize)
                         } else {
-                            b = sdiff((*L).top, ra) as i32
+                            b = small_i32(sdiff((*L).top, ra))
                         }
                         (*ci).savedpc = pc
                         if ((i >> 15) & 1) != 0 {
@@ -1959,7 +1974,7 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                         n := ((i >> 16) & 255) as i32 - 1
                         let nparams1 = (i >> 24) as i32
                         if n < 0 {
-                            n = sdiff((*L).top, ra) as i32
+                            n = small_i32(sdiff((*L).top, ra))
                         }
                         (*ci).savedpc = pc
                         ra_off := sdiff(ra, (*L).stack)
@@ -1971,7 +1986,7 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                             do_close(L, sdiff(base, (*L).stack), CLOSE_KTOP, true)?
                         }
                         if nparams1 != 0 {
-                            (*ci).func = ptr.offset((*ci).func, -(((*ci).nextraargs + nparams1) as isize))
+                            (*ci).func = ptr.offset((*ci).func, -(core.wrapping_add((*ci).nextraargs, nparams1) as isize))
                         }
                         (*L).top = ptr.offset((*L).stack, ra_off + (n as isize))
                         poscall(L, ci, n)?
@@ -2100,13 +2115,13 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                         last := (i >> 24) as u32
                         let h = val_gc(ra) as *mut Table
                         if n == 0 {
-                            n = (sdiff((*L).top, ra) - 1) as u32
+                            n = (small_i32(sdiff((*L).top, ra) - 1)) as u32
                         } else {
                             (*L).top = (*ci).top
                         }
-                        last = last + n
+                        last = core.wrapping_add(last, n)
                         if ((i >> 15) & 1) != 0 {
-                            last = last + (*pc >> 7) * 256
+                            last = core.wrapping_add(last, (*pc >> 7) << 8)
                             pc = ptr.offset(pc, 1)
                         }
                         if last > (*h).asize {
@@ -2116,10 +2131,10 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                         let arr = (*h).array
                         for n > 0 {
                             let v = ptr.offset(ra, n as isize)
-                            set_obj(ptr.offset(arr, (last - 1) as isize), v)
+                            set_obj(ptr.offset(arr, core.wrapping_sub(last, 1) as isize), v)
                             gc_barrier_back(L, h, v)
-                            last -= 1
-                            n -= 1
+                            last = core.wrapping_sub(last, 1)
+                            n = core.wrapping_sub(n, 1)
                         }
                         (*L).top = (*ci).top
                     },
