@@ -4,20 +4,34 @@ import "std/embedded/hal"
 
 // The general-purpose SPI controller of Espressif's RISC-V chips (GP-SPI2,
 // the ESP32-C6's FSPI, and the same controller in the ESP32-C3, C5, H2, and
-// others), as a bus master. `Controller` implements the std/embedded/hal SPI
-// bus protocol over any hal.Registers: a `hal.RegisterBlock` on the chip, or
-// a simulated controller in a desktop test, so device drivers use it
-// unchanged.
+// others), as a bus master or as a target (slave) that a master clocks.
+// `Controller` implements the std/embedded/hal SPI bus protocol and its
+// polling form, hal.SpiPoll, over any hal.Registers: a `hal.RegisterBlock`
+// on the chip, or a simulated controller in a desktop test, so device
+// drivers use it unchanged. `Target` implements hal.SpiTarget.
 //
 // The controller shifts up to 64 bytes per run from its own data buffer
 // (W0 to W15), full duplex, most significant bit first; longer transfers
 // are split into runs of 64 bytes, between which the clock pauses briefly.
-// Chip selects are output pins of their own (see hal.SpiDevice); the
-// controller's chip select outputs stay off.
+// The polled methods start a run and return; each later poll that finds it
+// over collects what it read and starts the next, so the clock pauses
+// between polls, which SPI devices accept, as the master drives it. The
+// blocking methods poll until the transfer ends.
+//
+// Chip selects are usually output pins of their own (see hal.SpiDevice),
+// and the controller's chip select outputs stay off. `set_hardware_select`
+// turns on its first one, CS0 (FSPICS0), which then goes low around each
+// transfer, with the controller's CS setup and hold phases, and stays low
+// across all the runs of a longer transfer (CS_KEEP_ACTIVE until its last
+// run), polled or not. The controller moves CS0 only as a run starts and
+// ends, so a cancelled transfer ends with a run without data phases, which
+// raises it without a clock. For DMA, chip
+// packages call `prepare_dma`, start their DMA channel, then `start_dma`:
+// a whole transfer of up to 32 KiB is then one run.
 //
 // Chip packages enable the controller's clock, route its clock, data out,
-// and data in signals through the GPIO matrix, and pass the frequency of
-// its function clock.
+// data in, and chip select signals through the GPIO matrix, and pass the
+// frequency of its function clock.
 //
 // Register names follow the ESP32-C6 technical reference manual (SPI
 // Controller).
@@ -35,39 +49,72 @@ const CTRL_VALUE: u32 = 0x0020_0000
 // by (pre + 1) * (n + 1), high for h + 1 and low for the rest.
 const CLOCK: usize = 0x0C
 const CLOCK_EQUALS_SYSTEM: u32 = 1 << 31
-// USER: full duplex, chip select setup and hold, data out changes on the
-// other clock edge, a data out phase and a data in phase.
+// USER: full duplex, a target's transmit and receive clock edges, chip
+// select setup and hold, data out changes on the other clock edge, a data
+// out phase and a data in phase.
 const USER: usize = 0x10
 const FULL_DUPLEX: u32 = 1 << 0
+const TARGET_TX_EDGE: u32 = 1 << 5
 const CS_HOLD: u32 = 1 << 6
 const CS_SETUP: u32 = 1 << 7
+const TARGET_RX_EDGE: u32 = 1 << 8
 const CLOCK_OUT_EDGE: u32 = 1 << 9
 const DATA_OUT: u32 = 1 << 27
 const DATA_IN: u32 = 1 << 28
 const USER_VALUE: u32 = FULL_DUPLEX | CS_HOLD | CS_SETUP | DATA_OUT | DATA_IN
-// MS_DLEN: the run's length in bits, minus one.
+// MS_DLEN: the run's length in bits, minus one: 18 bits.
 const MS_DLEN: usize = 0x1C
-// MISC: chip select outputs 0 to 5 off, and SCK idles high.
+// MISC: chip select outputs 0 to 5 off (CS0 on with a hardware select),
+// SCK idles high, and the chip select stays low between runs.
 const MISC: usize = 0x20
 const CHIP_SELECTS_OFF: u32 = 0x3F
+const CS0_ON: u32 = 0x3E
 const CLOCK_IDLE_HIGH: u32 = 1 << 29
+const CS_KEEP_ACTIVE: u32 = 1 << 30
+// DMA_CONF: DMA moves received and sent data, and resets of the receive,
+// CPU transmit, and DMA transmit FIFOs between the controller and memory.
 const DMA_CONF: usize = 0x30
+const RX_EOF_BY_LENGTH: u32 = 1 << 21
+const DMA_RX_ENABLE: u32 = 1 << 27
+const DMA_TX_ENABLE: u32 = 1 << 28
 const FIFO_RESETS: u32 = 0b111 << 29
+const CPU_TX_FIFO_RESET: u32 = 1 << 30
 const DMA_INT_CLR: usize = 0x38
 const DMA_INT_RAW: usize = 0x3C
+// DMA_INT_RAW: DMA delivered received data too slowly, or data to send
+// too slowly; a run ended; a target received beyond its 64-byte buffer.
+const DMA_RX_LATE: u32 = 1 << 0
+const DMA_TX_LATE: u32 = 1 << 1
 const TRANS_DONE: u32 = 1 << 12
+const BUFFER_OVERRUN: u32 = 1 << 15
+const ALL_DMA_INTERRUPTS: u32 = 0x1F_FFFF
 const W0: usize = 0x98
-// SLAVE: master mode.
+// SLAVE: a target's clock mode for SPI modes 1 and 3, target mode, and a
+// reset of its state.
 const SLAVE: usize = 0xE0
+const TARGET_MODE_13: u32 = 1 << 2
+const TARGET_MODE: u32 = 1 << 26
+const TARGET_RESET: u32 = 1 << 27
+// SLAVE1: the bits a target exchanged in its last transaction.
+const SLAVE1: usize = 0xE4
+const TARGET_BITS: u32 = 0x3_FFFF
 // CLK_GATE: the controller's clocks on.
 const CLK_GATE: usize = 0xE8
 const CLOCKS_ON: u32 = 0b11
 
-// Bytes in the data buffer, the most one run moves.
+// Bytes in the data buffer, the most one run moves without DMA.
 pub const BUFFER_SIZE: usize = 64
-// Polls before a run that does not end is reported as Timeout: one byte at
-// the slowest clock takes about 10_000 function clock cycles.
+// The most bytes one DMA run moves: MS_DLEN counts 2^18 bits.
+pub const MAX_DMA_BYTES: usize = 32_768
+// Polls without progress before a run that does not end is reported as
+// Timeout: one byte at the slowest clock takes about 10_000 function clock
+// cycles.
 const POLLS: u32 = 10_000_000
+
+// What a polled transfer does, if one runs.
+const POLL_NONE: u32 = 0
+const POLL_EXCHANGE: u32 = 1
+const POLL_WRITE: u32 = 2
 
 // The clock divider for one SCK frequency, from `divider`.
 pub struct Divider {
@@ -117,15 +164,27 @@ pub fn divider(clock_hz: u32, frequency_hz: u32) -> Divider!hal.Error {
 }
 
 // An SPI bus master on one controller with registers R. Implements the
-// std/embedded/hal SPI bus protocol.
-pub struct Controller<R: hal.Registers>: hal.Spi {
+// std/embedded/hal SPI bus protocol and its polling form.
+pub struct Controller<R: hal.Registers>: hal.Spi + hal.SpiPoll {
     registers: R
     divider: Divider
+    // MISC and USER for the mode and the chip select, between transfers.
+    misc: u32
+    user: u32
+    // The polled transfer: POLL_NONE, POLL_EXCHANGE, or POLL_WRITE, its
+    // length, the bytes done, and the bytes of the run on the wire.
+    polled: u32
+    poll_length: usize
+    poll_done: usize
+    poll_run: usize
+    // A DMA run was prepared and not yet ended, and whether it receives.
+    dma: bool
+    dma_receive: bool
 
     // Configure a controller fresh out of reset as a master in `mode` at
     // the SCK frequency of `divider`.
     pub fn new(registers: R, divider: Divider, mode: hal.SpiMode) -> Controller<R> {
-        bus := Controller<R> { registers, divider }
+        bus := Controller<R> { registers, divider, misc: CHIP_SELECTS_OFF, user: USER_VALUE, polled: POLL_NONE, poll_length: 0, poll_done: 0, poll_run: 0, dma: false, dma_receive: false }
         bus.registers.write(CLK_GATE, CLOCKS_ON)
         bus.registers.write(SLAVE, 0)
         bus.registers.write(CTRL, CTRL_VALUE)
@@ -168,49 +227,222 @@ pub struct Controller<R: hal.Registers>: hal.Spi {
                 idle_high = true
             }
         }
-        misc := CHIP_SELECTS_OFF
+        self.misc = self.misc & CHIP_SELECTS_OFF
         if idle_high {
-            misc |= CLOCK_IDLE_HIGH
+            self.misc |= CLOCK_IDLE_HIGH
         }
-        self.registers.write(MISC, misc)
-        user := USER_VALUE
+        self.registers.write(MISC, self.misc)
+        self.user = USER_VALUE
         if out_edge {
-            user |= CLOCK_OUT_EDGE
+            self.user |= CLOCK_OUT_EDGE
         }
-        self.registers.write(USER, user)
+        self.registers.write(USER, self.user)
+    }
+
+    // Drive the controller's chip select output CS0 around each transfer,
+    // or leave it off (high). The chip package routes it to a pin.
+    pub fn set_hardware_select(&mut self, on: bool) {
+        self.misc = self.misc & ~CHIP_SELECTS_OFF
+        if on {
+            self.misc |= CS0_ON
+        } else {
+            self.misc |= CHIP_SELECTS_OFF
+        }
+        self.registers.write(MISC, self.misc)
+        self.update()
     }
 
     // Full-duplex exchange in place: each byte sent is replaced by the
-    // byte read.
+    // byte read. Busy while a polled transfer runs.
     pub fn transfer(&mut self, bytes: &mut[u8]) -> void!hal.Error {
-        done := 0usize
-        for done < bytes.len {
-            count := bytes.len - done
-            if count > BUFFER_SIZE {
-                count = BUFFER_SIZE
+        self.check_idle()?
+        polls := 0u32
+        done := self.poll_done
+        for !self.poll_transfer(bytes)? {
+            if self.poll_done != done {
+                done = self.poll_done
+                polls = 0
+            } else {
+                polls += 1
+                if polls >= POLLS {
+                    self.cancel()
+                    return err(hal.Error.Timeout)
+                }
             }
-            self.fill(&bytes[done..done + count])
-            self.run(count)?
-            for index in 0..count {
-                word := self.registers.read(W0 + 4 * (index / 4))
-                bytes[done + index] = ((word >> (8 * (index % 4) as u32)) & 0xFF) as u8
-            }
-            done += count
         }
         return ok()
     }
 
     // Send `bytes`, ignoring what comes back.
     pub fn write(&mut self, bytes: &[u8]) -> void!hal.Error {
-        done := 0usize
-        for done < bytes.len {
-            count := bytes.len - done
-            if count > BUFFER_SIZE {
-                count = BUFFER_SIZE
+        self.check_idle()?
+        polls := 0u32
+        done := self.poll_done
+        for !self.poll_write(bytes)? {
+            if self.poll_done != done {
+                done = self.poll_done
+                polls = 0
+            } else {
+                polls += 1
+                if polls >= POLLS {
+                    self.cancel()
+                    return err(hal.Error.Timeout)
+                }
             }
-            self.fill(&bytes[done..done + count])
-            self.run(count)?
-            done += count
+        }
+        return ok()
+    }
+
+    // Advance a full-duplex exchange of `bytes` in place without waiting:
+    // the first call starts a run of up to 64 bytes, and each later call
+    // that finds the run over stores what it read and starts the next;
+    // true once every byte has been exchanged. See hal.SpiPoll.
+    // InvalidInput for a slice of another length, or a write, while a
+    // polled transfer runs. An empty slice is done at once.
+    pub fn poll_transfer(&mut self, bytes: &mut[u8]) -> bool!hal.Error {
+        if !self.poll_start(POLL_EXCHANGE, bytes.len)? {
+            return ok(true)
+        }
+        if self.poll_run > 0 {
+            if (self.registers.read(CMD) & USR) != 0 {
+                return ok(false)
+            }
+            done := self.poll_done
+            for index in 0..self.poll_run {
+                word := self.registers.read(W0 + 4 * (index / 4))
+                bytes[done + index] = ((word >> (8 * (index % 4) as u32)) & 0xFF) as u8
+            }
+            self.poll_done += self.poll_run
+            self.poll_run = 0
+        }
+        if self.poll_done == self.poll_length {
+            self.poll_end()
+            return ok(true)
+        }
+        count := self.next_count()
+        done := self.poll_done
+        self.fill(&bytes[done..done + count])
+        self.run(count)
+        return ok(false)
+    }
+
+    // Advance a write of `bytes`, discarding what arrives, as for
+    // `poll_transfer`.
+    pub fn poll_write(&mut self, bytes: &[u8]) -> bool!hal.Error {
+        if !self.poll_start(POLL_WRITE, bytes.len)? {
+            return ok(true)
+        }
+        if self.poll_run > 0 {
+            if (self.registers.read(CMD) & USR) != 0 {
+                return ok(false)
+            }
+            self.poll_done += self.poll_run
+            self.poll_run = 0
+        }
+        if self.poll_done == self.poll_length {
+            self.poll_end()
+            return ok(true)
+        }
+        count := self.next_count()
+        done := self.poll_done
+        self.fill(&bytes[done..done + count])
+        self.run(count)
+        return ok(false)
+    }
+
+    // Abandon the running polled transfer, if any, once the run on the
+    // wire is complete (at most 64 bytes' time), and raise a hardware chip
+    // select.
+    pub fn cancel(&mut self) {
+        if self.polled != POLL_NONE {
+            for _ in 0..POLLS {
+                if (self.registers.read(CMD) & USR) == 0 {
+                    break
+                }
+            }
+            self.poll_end()
+        }
+    }
+
+    // True while a polled transfer runs.
+    pub fn is_busy(&self) -> bool {
+        return self.polled != POLL_NONE
+    }
+
+    // Set up a DMA run of `count` bytes, sending and, with `receive`,
+    // receiving at the same time, and switch the data phases to DMA. The
+    // chip package then starts its DMA channel's links to this controller
+    // and calls `start_dma`. Busy while a polled transfer or a DMA run
+    // runs; InvalidInput for 0 or more than MAX_DMA_BYTES.
+    pub fn prepare_dma(&mut self, count: usize, receive: bool) -> void!hal.Error {
+        if self.polled != POLL_NONE || self.dma {
+            return err(hal.Error.Busy)
+        }
+        if count == 0 || count > MAX_DMA_BYTES {
+            return err(hal.Error.InvalidInput)
+        }
+        self.registers.write(MS_DLEN, 8 * count as u32 - 1)
+        user := self.user
+        conf := self.registers.read(DMA_CONF) | DMA_TX_ENABLE
+        if receive {
+            // Mark the end of the received data for the DMA channel once
+            // all of it is there.
+            conf |= DMA_RX_ENABLE | RX_EOF_BY_LENGTH
+        } else {
+            user &= ~DATA_IN
+        }
+        self.registers.write(USER, user)
+        self.registers.write(DMA_CONF, conf)
+        self.dma = true
+        self.dma_receive = receive
+        return ok()
+    }
+
+    // Start the DMA run that `prepare_dma` set up, once the chip package
+    // has started its DMA channel: the FIFOs between the controller and
+    // memory start empty.
+    pub fn start_dma(&mut self) {
+        conf := self.registers.read(DMA_CONF)
+        self.registers.write(DMA_CONF, conf | FIFO_RESETS)
+        self.registers.write(DMA_CONF, conf & ~FIFO_RESETS)
+        self.registers.write(DMA_INT_CLR, ALL_DMA_INTERRUPTS)
+        self.update()
+        self.registers.write(CMD, USR)
+    }
+
+    // True once the DMA run has shifted its last bit. The data received
+    // may still be on its way to memory; the DMA channel says when it is
+    // there.
+    pub fn dma_done(&mut self) -> bool {
+        return (self.registers.read(CMD) & USR) == 0
+    }
+
+    // End a DMA run that is done, or abandon one, and switch the data
+    // phases back to the data buffer. An abandoned run stops after its
+    // current bit, waiting at most a byte's time. Overrun if the DMA
+    // channel took received data too slowly for the clock, so bytes were
+    // lost; data to send that comes late only pauses the clock.
+    pub fn end_dma(&mut self) -> void!hal.Error {
+        if (self.registers.read(CMD) & USR) != 0 {
+            // Cut the run short: a length of one bit ends it at once.
+            self.registers.write(MS_DLEN, 0)
+            self.update()
+            for _ in 0..POLLS {
+                if (self.registers.read(CMD) & USR) == 0 {
+                    break
+                }
+            }
+        }
+        // A late transmit channel only pauses the clock; a late receive
+        // channel loses bytes.
+        late := self.dma_receive && (self.registers.read(DMA_INT_RAW) & DMA_RX_LATE) != 0
+        conf := self.registers.read(DMA_CONF)
+        self.registers.write(DMA_CONF, conf & ~(DMA_RX_ENABLE | DMA_TX_ENABLE | RX_EOF_BY_LENGTH))
+        self.registers.write(USER, self.user)
+        self.registers.write(DMA_INT_CLR, ALL_DMA_INTERRUPTS)
+        self.dma = false
+        if late {
+            return err(hal.Error.Overrun)
         }
         return ok()
     }
@@ -218,8 +450,70 @@ pub struct Controller<R: hal.Registers>: hal.Spi {
     // Give back the registers, with the controller's clocks off.
     pub fn release(self) -> R {
         self.registers.write(CLK_GATE, 0)
-        let Controller { registers, divider } = self
+        let Controller { registers, divider, misc, user, polled, poll_length, poll_done, poll_run, dma, dma_receive } = self
         return registers
+    }
+
+    fn check_idle(&mut self) -> void!hal.Error {
+        if self.polled != POLL_NONE || self.dma {
+            return err(hal.Error.Busy)
+        }
+        return ok()
+    }
+
+    // Begin a polled transfer of `kind` and `length` if none runs, or check
+    // that the running one is the same. False for an empty transfer, which
+    // is done at once.
+    fn poll_start(&mut self, kind: u32, length: usize) -> bool!hal.Error {
+        if self.polled == POLL_NONE {
+            if self.dma {
+                return err(hal.Error.Busy)
+            }
+            if length == 0 {
+                return ok(false)
+            }
+            self.polled = kind
+            self.poll_length = length
+            self.poll_done = 0
+            self.poll_run = 0
+            if length > BUFFER_SIZE {
+                // Keep a hardware chip select low across the runs.
+                self.registers.write(MISC, self.misc | CS_KEEP_ACTIVE)
+            }
+        } else if self.polled != kind || length != self.poll_length {
+            return err(hal.Error.InvalidInput)
+        }
+        return ok(true)
+    }
+
+    // End the polled transfer. One cut short of its last run still holds
+    // a hardware chip select low, which only the state machine changes.
+    fn poll_end(&mut self) {
+        if self.poll_length > BUFFER_SIZE && self.poll_done < self.poll_length {
+            // A run without data phases: the chip select's hold, then its
+            // rise, and no clock.
+            self.registers.write(MISC, self.misc)
+            self.registers.write(USER, self.user & ~(DATA_OUT | DATA_IN))
+            self.update()
+            self.registers.write(CMD, USR)
+            for _ in 0..POLLS {
+                if (self.registers.read(CMD) & USR) == 0 {
+                    break
+                }
+            }
+            self.registers.write(USER, self.user)
+            self.update()
+        }
+        self.polled = POLL_NONE
+        self.poll_run = 0
+    }
+
+    fn next_count(&self) -> usize {
+        count := self.poll_length - self.poll_done
+        if count > BUFFER_SIZE {
+            count = BUFFER_SIZE
+        }
+        return count
     }
 
     // Put `bytes`, at most 64, into the data buffer, little-endian words.
@@ -237,22 +531,239 @@ pub struct Controller<R: hal.Registers>: hal.Spi {
         }
     }
 
-    // Shift `count` bytes and wait until the run ends.
-    fn run(&mut self, count: usize) -> void!hal.Error {
+    // Start shifting `count` bytes from the data buffer. The last run of a
+    // longer transfer lets a hardware chip select rise after it, which the
+    // controller does when the run ends.
+    fn run(&mut self, count: usize) {
+        if self.poll_length > BUFFER_SIZE && self.poll_done + count == self.poll_length {
+            self.registers.write(MISC, self.misc)
+        }
         self.registers.write(MS_DLEN, 8 * count as u32 - 1)
+        self.update()
+        self.registers.write(DMA_INT_CLR, TRANS_DONE)
+        self.registers.write(CMD, USR)
+        self.poll_run = count
+    }
+
+    // Latch the configuration into the controller's clock domain.
+    fn update(&mut self) {
         self.registers.write(CMD, UPDATE)
         for _ in 0..POLLS {
             if (self.registers.read(CMD) & UPDATE) == 0 {
-                break
+                return
             }
         }
-        self.registers.write(DMA_INT_CLR, TRANS_DONE)
+    }
+}
+
+// --- Target (slave) --------------------------------------------------------
+
+// An SPI target (slave) on one controller with registers R: a master drives
+// the clock and the chip select, and the target shifts out what it queued
+// while it shifts in what the master sends, most significant bit first, in
+// the SpiMode given. It implements hal.SpiTarget.
+//
+// The controller exchanges whole transactions, from the chip select going
+// low to its rising again, through its 64-byte data buffer: the bytes
+// queued before a transaction starts go out in it, the rest of what the
+// master clocks reads 0xFF, and the bytes the master sends arrive once
+// the chip select rises. A transaction beyond 64 bytes loses the excess,
+// which the next read reports as Overrun. After each transaction the
+// controller waits to be armed again, which `queue` and `read` do, so the
+// master must leave the program time to poll between transactions:
+// a transaction clocked meanwhile is not received, and the target cannot
+// tell. Up to 128 received bytes wait for `read`; while they would not
+// fit, the target is not armed again.
+pub struct Target<R: hal.Registers>: hal.SpiTarget {
+    registers: R
+    // Bytes queued to send, the first `loaded` of them in the armed data
+    // buffer.
+    tx: [64]u8
+    queued: usize
+    loaded: usize
+    // Bytes received and not yet read: rx[taken..received].
+    rx: [128]u8
+    received: usize
+    taken: usize
+    // The controller waits for a transaction.
+    armed: bool
+    // Bytes were lost since the last read.
+    lost: bool
+
+    // Configure a controller fresh out of reset as a target in `mode`, and
+    // arm it, with nothing queued.
+    pub fn new(registers: R, mode: hal.SpiMode) -> Target<R> {
+        target := Target<R> { registers, tx: [0; 64], queued: 0, loaded: 0, rx: [0; 128], received: 0, taken: 0, armed: false, lost: false }
+        target.registers.write(CLK_GATE, CLOCKS_ON)
+        target.registers.write(CLOCK, 0)
+        target.registers.write(CTRL, 0)
+        target.registers.write(MISC, 0)
+        edges := 0u32
+        mode_13 := 0u32
+        match mode {
+            hal.SpiMode.Mode0 => {}
+            hal.SpiMode.Mode1 => {
+                edges = TARGET_TX_EDGE | TARGET_RX_EDGE
+                mode_13 = TARGET_MODE_13
+            }
+            hal.SpiMode.Mode2 => {
+                edges = TARGET_TX_EDGE | TARGET_RX_EDGE
+            }
+            hal.SpiMode.Mode3 => {
+                mode_13 = TARGET_MODE_13
+            }
+        }
+        target.registers.write(SLAVE, TARGET_MODE | mode_13)
+        target.registers.write(USER, FULL_DUPLEX | DATA_OUT | DATA_IN | edges)
+        conf := target.registers.read(DMA_CONF) & ~(DMA_RX_ENABLE | DMA_TX_ENABLE)
+        target.registers.write(DMA_CONF, conf | FIFO_RESETS)
+        target.registers.write(DMA_CONF, conf)
+        target.arm()
+        return target
+    }
+
+    // Queue `bytes` to send in the master's next transactions, as many as
+    // there is room for (64 bytes at most wait), without waiting; returns
+    // how many. Bytes queued while the target waits for a transaction go
+    // out in it if the master has not begun clocking it yet, else in the
+    // one after. Never fails: the error is there for hal.SpiTarget.
+    pub fn queue(&mut self, bytes: &[u8]) -> usize!hal.Error {
+        self.service()
+        count := bytes.len
+        if count > BUFFER_SIZE - self.queued {
+            count = BUFFER_SIZE - self.queued
+        }
+        for index in 0..count {
+            self.tx[self.queued + index] = bytes[index]
+        }
+        self.queued += count
+        if self.armed && count > 0 && !self.started() {
+            // The controller took the data buffer's first bytes when it was
+            // armed: arm it again.
+            self.arm()
+        }
+        return ok(count)
+    }
+
+    // The bytes the master sent in finished transactions since the last
+    // call, up to `buffer.len`, without waiting; returns how many. Overrun
+    // if a transaction ran beyond the 64-byte buffer and lost bytes; the
+    // bytes received stay for the next read.
+    pub fn read(&mut self, buffer: &mut[u8]) -> usize!hal.Error {
+        self.service()
+        if self.lost {
+            self.lost = false
+            return err(hal.Error.Overrun)
+        }
+        count := self.received - self.taken
+        if count > buffer.len {
+            count = buffer.len
+        }
+        for index in 0..count {
+            buffer[index] = self.rx[self.taken + index]
+        }
+        self.taken += count
+        if self.taken == self.received {
+            self.taken = 0
+            self.received = 0
+        }
+        // Room for a transaction that waited for it.
+        self.service()
+        return ok(count)
+    }
+
+    // The bytes queued and not yet sent.
+    pub fn unsent(&self) -> usize {
+        return self.queued
+    }
+
+    // Stop, and give back the registers with the controller's clocks off.
+    pub fn release(self) -> R {
+        self.registers.write(SLAVE, TARGET_RESET)
+        self.registers.write(SLAVE, 0)
+        self.registers.write(CLK_GATE, 0)
+        let Target { registers, tx, queued, loaded, rx, received, taken, armed, lost } = self
+        return registers
+    }
+
+    // Take in a finished transaction, if there is one and room for it, and
+    // arm the controller again; or arm it if it is not.
+    fn service(&mut self) {
+        if self.armed {
+            if (self.registers.read(DMA_INT_RAW) & TRANS_DONE) == 0 {
+                return
+            }
+            bits := self.registers.read(SLAVE1) & TARGET_BITS
+            count := (bits / 8) as usize
+            if count > BUFFER_SIZE || (self.registers.read(DMA_INT_RAW) & BUFFER_OVERRUN) != 0 {
+                count = BUFFER_SIZE
+                self.lost = true
+            }
+            if self.taken > 0 {
+                // Move what waits to the front, for room behind it.
+                waiting := self.received - self.taken
+                for index in 0..waiting {
+                    self.rx[index] = self.rx[self.taken + index]
+                }
+                self.received = waiting
+                self.taken = 0
+            }
+            if self.received + count > self.rx.len {
+                return
+            }
+            for index in 0..count {
+                word := self.registers.read(W0 + 4 * (index / 4))
+                self.rx[self.received + index] = ((word >> (8 * (index % 4) as u32)) & 0xFF) as u8
+            }
+            self.received += count
+            // The bytes sent leave the queue.
+            sent := count
+            if sent > self.loaded {
+                sent = self.loaded
+            }
+            for index in sent..self.queued {
+                self.tx[index - sent] = self.tx[index]
+            }
+            self.queued -= sent
+            self.armed = false
+        }
+        self.arm()
+    }
+
+    // Whether the master has begun the armed transaction.
+    fn started(&mut self) -> bool {
+        return (self.registers.read(SLAVE1) & TARGET_BITS) != 0 || (self.registers.read(DMA_INT_RAW) & TRANS_DONE) != 0
+    }
+
+    // Wait for the next transaction, with the queued bytes to send.
+    fn arm(&mut self) {
+        slave := self.registers.read(SLAVE) & ~TARGET_RESET
+        self.registers.write(SLAVE, slave | TARGET_RESET)
+        self.registers.write(SLAVE, slave)
+        self.load()
+        conf := self.registers.read(DMA_CONF)
+        self.registers.write(DMA_CONF, conf | CPU_TX_FIFO_RESET)
+        self.registers.write(DMA_CONF, conf & ~CPU_TX_FIFO_RESET)
+        self.registers.write(MS_DLEN, 8 * BUFFER_SIZE as u32 - 1)
+        self.registers.write(DMA_INT_CLR, ALL_DMA_INTERRUPTS)
         self.registers.write(CMD, USR)
-        for _ in 0..POLLS {
-            if (self.registers.read(CMD) & USR) == 0 {
-                return ok()
+        self.armed = true
+    }
+
+    // Put the queued bytes into the data buffer, and 0xFF after them.
+    fn load(&mut self) {
+        for word in 0..BUFFER_SIZE / 4 {
+            value := 0u32
+            for lane in 0..4usize {
+                index := 4 * word + lane
+                byte := 0xFFu32
+                if index < self.queued {
+                    byte = self.tx[index] as u32
+                }
+                value |= byte << (8 * lane as u32)
             }
+            self.registers.write(W0 + 4 * word, value)
         }
-        return err(hal.Error.Timeout)
+        self.loaded = self.queued
     }
 }

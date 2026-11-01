@@ -755,3 +755,22 @@ fn espressif_system_drivers_execute_against_simulated_registers() {
         );
     }
 }
+
+#[test]
+fn espressif_bus_features_execute_against_simulated_controllers() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let scratch = Scratch::new("esp-bus");
+    let source = root.join("tests/stdlib/esp_bus_checks.dodo");
+    for optimization in ["0", "3"] {
+        let executable = scratch.0.join(format!(
+            "esp-bus-O{optimization}{}",
+            std::env::consts::EXE_SUFFIX
+        ));
+        let args = ["build", source.to_str().unwrap(), "-O", optimization, "-o"];
+        success(&dodo(&args, &executable), "compile Espressif bus fixture");
+        success(
+            &Command::new(&executable).output().unwrap(),
+            "execute Espressif bus fixture",
+        );
+    }
+}

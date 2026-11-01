@@ -1,6 +1,7 @@
 package esp_uart
 
 import "std/embedded/hal"
+import "std/embedded/hal/serial"
 import "std/io"
 
 // The UART of Espressif's RISC-V chips (UART0 and UART1 of the ESP32-C6,
@@ -21,7 +22,9 @@ import "std/io"
 // beyond the FIFO, so a program must read at least every 128 bytes' time
 // (11 ms at 115200 baud) while data arrives, or bytes are lost and a read
 // reports OVERRUN; with hardware flow control, see `set_flow_control`, the
-// controller asks the other end to pause instead.
+// controller asks the other end to pause instead. Ports implement
+// serial.Port and, with `poll_read`, `poll_write`, and `poll_flush`, which
+// never wait, serial.PollPort.
 //
 // Waits are counted in status polls, not time, as in std/embedded/
 // peripheral/pl011: a write, `flush`, and the settings that wait for output
@@ -185,9 +188,9 @@ fn line_format(data_bits: u32, parity: Parity, stop_bits: u32) -> u32!hal.Error 
 }
 
 // A serial port on one controller with registers R, any hal.Registers.
-// Implements the std/io Reader and Writer interfaces and their polling
-// forms.
-pub struct Controller<R: hal.Registers>: io.ReadWriter {
+// Implements the std/io Reader and Writer interfaces and the serial port
+// protocols of std/embedded/hal/serial.
+pub struct Controller<R: hal.Registers>: serial.Port + serial.PollPort {
     registers: R
     divisor: Divisor
     poll_limit: u32
@@ -397,6 +400,14 @@ pub struct Controller<R: hal.Registers>: io.ReadWriter {
         return ok()
     }
 
+    // `flush` without waiting: true once every byte written has left, stop
+    // bits included (the transmit FIFO is empty and the transmitter idle,
+    // TXFIFO_CNT and the FSM_STATUS transmit state both 0), false while
+    // some are still queued or being sent.
+    pub fn poll_flush(&mut self) -> bool!io.Error {
+        return ok(self.transmitter_idle())
+    }
+
     // Wait for the first byte, then return what has arrived, up to
     // `buffer.len`. A serial port has no end of input, so a read never
     // returns 0 bytes for a nonempty buffer. On a receive error, the bytes
@@ -496,20 +507,26 @@ pub struct Controller<R: hal.Registers>: io.ReadWriter {
         budget := self.poll_limit as u64 * (FIFO_DEPTH as u64 + 1)
         polls := 0u64
         for {
-            status := self.registers.read(STATUS)
-            state := self.registers.read(FSM_STATUS)
-            if hal.decode(TX_COUNT, status) == 0 && hal.decode(TX_STATE, state) == 0 {
-                // The state machine reads idle for a moment between the
-                // FIFO's last byte and its start bit: look again.
-                if hal.decode(TX_STATE, self.registers.read(FSM_STATUS)) == 0 && hal.decode(TX_COUNT, self.registers.read(STATUS)) == 0 {
-                    return true
-                }
+            if self.transmitter_idle() {
+                return true
             }
             polls += 1
             if self.poll_limit != NO_POLL_LIMIT && polls >= budget {
                 return false
             }
         }
+    }
+
+    // Whether the transmit FIFO is empty and the transmitter idle.
+    fn transmitter_idle(&mut self) -> bool {
+        status := self.registers.read(STATUS)
+        state := self.registers.read(FSM_STATUS)
+        if hal.decode(TX_COUNT, status) != 0 || hal.decode(TX_STATE, state) != 0 {
+            return false
+        }
+        // The state machine reads idle for a moment between the FIFO's last
+        // byte and its start bit: look again.
+        return hal.decode(TX_STATE, self.registers.read(FSM_STATUS)) == 0 && hal.decode(TX_COUNT, self.registers.read(STATUS)) == 0
     }
 
     fn settle(&mut self) -> void!hal.Error {
