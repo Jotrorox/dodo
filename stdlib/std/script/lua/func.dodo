@@ -1,0 +1,17 @@
+package lua
+
+import "core/mem"
+import "core/ptr"
+
+// Prototypes, closures and upvalues. (Skeleton: the runtime agent owns this
+// file; proto_new keeps its signature.)
+
+// A new prototype with every count zero and every array null.
+fn proto_new(L: *mut State) -> (*mut Proto)!Throw {
+    unsafe {
+        let p = mem_alloc(L, mem.size_of::<Proto>())? as *mut Proto
+        ptr.write_bytes(p as *mut u8, 0u8, mem.size_of::<Proto>())
+        (*p).tag = TAG_PROTO
+        return ok(p)
+    }
+}

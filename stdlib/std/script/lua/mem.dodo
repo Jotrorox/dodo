@@ -1,0 +1,45 @@
+package lua
+
+import "core/mem"
+import "core/ptr"
+
+// Memory management. Every allocation of the runtime goes through these
+// functions so the collector can account for it. (Skeleton version: plain
+// libc; the runtime agent replaces the bodies, keeping the signatures.)
+
+unsafe extern "C" fn malloc(size: usize) -> *mut u8
+unsafe extern "C" fn realloc(block: *mut u8, size: usize) -> *mut u8
+unsafe extern "C" fn free(block: *mut u8)
+
+// Allocate `size` bytes (size may be 0, which returns a non-null dummy or null
+// that mem_free accepts). Raises Throw.Memory on failure.
+fn mem_alloc(L: *mut State, size: usize) -> (*mut u8)!Throw {
+    unsafe {
+        let block = malloc(if size == 0 { 1 } else { size })
+        if ptr.is_null(block) {
+            return err(Throw.Memory)
+        }
+        return ok(block)
+    }
+}
+
+// Resize a block previously returned by mem_alloc/mem_realloc (or null with
+// old_size 0). Raises Throw.Memory on failure, leaving the old block intact.
+fn mem_realloc(L: *mut State, block: *mut u8, old_size: usize, new_size: usize) -> (*mut u8)!Throw {
+    unsafe {
+        let grown = realloc(block, if new_size == 0 { 1 } else { new_size })
+        if ptr.is_null(grown) {
+            return err(Throw.Memory)
+        }
+        return ok(grown)
+    }
+}
+
+// Release a block of `size` bytes (size must be the size it was allocated with).
+fn mem_free(L: *mut State, block: *mut u8, size: usize) {
+    unsafe {
+        if !ptr.is_null(block) {
+            free(block)
+        }
+    }
+}

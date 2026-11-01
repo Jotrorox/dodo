@@ -1,0 +1,53 @@
+package lua
+
+import "core/mem"
+import "core/ptr"
+
+// String objects. (Skeleton: no interning yet; the runtime agent replaces the
+// bodies, keeping the signatures, and interns strings up to SHORTSTR_MAX.)
+
+// Create (or find, for short strings) the string with these bytes.
+fn str_new(L: *mut State, bytes: *const u8, len: usize) -> (*mut LString)!Throw {
+    unsafe {
+        let size = mem.size_of::<LString>() + len + 1
+        let block = mem_alloc(L, size)?
+        let s = block as *mut LString
+        (*s).next = 0 as *mut GCObject
+        (*s).tag = if len <= SHORTSTR_MAX { TAG_SHORTSTR } else { TAG_LONGSTR }
+        (*s).marked = 0
+        (*s).extra = 0
+        (*s).hash = 0
+        (*s).length = len
+        (*s).hnext = 0 as *mut LString
+        let data = str_data(s)
+        ptr.copy_nonoverlapping(bytes, data, len)
+        *ptr.offset(data, len as isize) = 0
+        return ok(s)
+    }
+}
+
+fn str_from(L: *mut State, text: &str) -> (*mut LString)!Throw {
+    let bytes = mem.str_bytes(text)
+    return str_new(L, ptr.as_ptr(bytes), bytes.len)
+}
+
+// Byte-wise equality (works for both short and long strings).
+fn str_equal(a: *mut LString, b: *mut LString) -> bool {
+    unsafe {
+        if a == b {
+            return true
+        }
+        let n = (*a).length
+        if n != (*b).length {
+            return false
+        }
+        let pa = str_data(a)
+        let pb = str_data(b)
+        for i in 0usize..n {
+            if *ptr.offset(pa, i as isize) != *ptr.offset(pb, i as isize) {
+                return false
+            }
+        }
+        return true
+    }
+}

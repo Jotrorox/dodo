@@ -1,0 +1,19 @@
+package lua
+
+// Thread (coroutine) and global state. (Skeleton: the runtime agent owns this
+// file and extends these records freely.)
+
+struct Global {
+    // Allocated bytes, for collectgarbage("count").
+    total_bytes: usize
+}
+
+// A Lua thread. `*mut State` is the `L` parameter of every internal function.
+struct State {
+    next: *mut GCObject
+    tag: u8
+    marked: u8
+    global: *mut Global
+    // Error object of the error being propagated (see DESIGN.md "Errors").
+    errobj: Value
+}

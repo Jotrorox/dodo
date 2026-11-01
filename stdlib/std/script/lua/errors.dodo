@@ -1,0 +1,24 @@
+package lua
+
+import "core/mem"
+import "core/ptr"
+
+// Raising errors from internal code. (Skeleton: the runtime agent owns this
+// file and keeps these signatures.)
+
+// Raise a syntax error whose complete message (already including the
+// "chunkname:line:" prefix and any "near 'token'" suffix) is `msg[0..len]`.
+// Returns the Throw to propagate: `return err(err_syntax(L, p, n))`.
+fn err_syntax(L: *mut State, msg: *const u8, len: usize) -> Throw {
+    unsafe {
+        match str_new(L, msg, len) {
+            ok(s) => {
+                set_str(ptr.offset(L as *mut u8, mem.offset_of::<State>("errobj") as isize) as *mut Value, s)
+            },
+            err(_) => {
+                return Throw.Memory
+            },
+        }
+    }
+    return Throw.Syntax
+}
