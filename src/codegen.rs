@@ -13,6 +13,7 @@ use llvm_sys::{
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
+mod async_fn;
 mod c_abi;
 mod closures;
 mod debug;
@@ -107,6 +108,12 @@ pub enum PanicStrategy {
     /// The hook owns termination; returning is undefined behavior.
     Hook(String),
 }
+
+/// Names of the stack slots that pass a call's result and large arguments
+/// through memory. The callee writes the result, reads the arguments, and
+/// retains neither, which lets an async fn keep such slots out of its frame.
+const CALL_RESULT: &str = "call.result";
+const CALL_ARGUMENT: &str = "call.argument";
 
 #[derive(Debug)]
 pub struct CodegenError(pub String);
@@ -259,12 +266,16 @@ pub fn generate<'ctx>(
         c_definitions: HashSet::new(),
         trampolines: HashMap::new(),
         used: vec![],
+        frame: None,
+        frames: HashMap::new(),
+        future_holders: async_fn::future_holders(program),
     };
     cg.declare_types()?;
     cg.declare_functions()?;
     cg.declare_constants()?;
+    cg.async_frames()?;
     for f in &program.functions {
-        if f.body.is_some() && f.generics.is_empty() {
+        if f.body.is_some() && f.generics.is_empty() && f.async_part != Some(AsyncPart::Body) {
             cg.function(f)?;
         }
     }
@@ -398,6 +409,11 @@ struct Codegen<'a, 'ctx> {
     trampolines: HashMap<String, Value<'ctx>>,
     // Definitions with `@section`, kept through `llvm.used`.
     used: Vec<Value<'ctx>>,
+    // The async fn poll function being generated, and each future's frame type.
+    frame: Option<async_fn::Frame<'ctx>>,
+    frames: HashMap<String, LlvmType<'ctx>>,
+    // Types whose values hold a future, which pass through memory.
+    future_holders: HashSet<String>,
 }
 impl<'a, 'ctx> Codegen<'a, 'ctx> {
     fn ty(&self, t: &Type) -> Result<LlvmType<'ctx>> {
@@ -524,7 +540,11 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                     .map(|e| &e.name),
             )
         {
-            self.define_layout(&Type::Named(name.clone()))?;
+            // A future's size is its frame's: layouts holding one wait for
+            // `async_frames`.
+            if !self.holds_future(&Type::Named(name.clone())) {
+                self.define_layout(&Type::Named(name.clone()))?;
+            }
         }
         Ok(())
     }
@@ -533,6 +553,12 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
     fn define_layout(&self, ty: &Type) -> Result<()> {
         match ty {
             Type::Named(name) if self.structs[name].is_opaque() => {
+                if self.is_future(name) {
+                    return Err(error(format!(
+                        "the layout of future `{}` is needed before its state machine exists",
+                        crate::ast::source_names(name)
+                    )));
+                }
                 let fields = if let Some(s) = self.program.structs.iter().find(|s| s.name == *name)
                 {
                     for f in &s.fields {
@@ -589,7 +615,8 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
     }
     fn declare_functions(&mut self) -> Result<()> {
         for f in &self.program.functions {
-            if !f.generics.is_empty() {
+            // An async fn's body is compiled into its future's poll.
+            if !f.generics.is_empty() || f.async_part == Some(AsyncPart::Body) {
                 continue;
             }
             if let Some(captures) = f.environment {
@@ -617,9 +644,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             // value costs gigabytes of LLVM memory.
             let exported = f.extern_ || f.interrupt.is_some();
             let dodo_abi = !exported && f.name != "main";
-            let large = |ty: &Type| -> Result<bool> {
-                Ok(dodo_abi && *ty != Type::Void && self.data.get_abi_size(&self.ty(ty)?) > 1024)
-            };
+            let large = |ty: &Type| -> Result<bool> { Ok(dodo_abi && self.large_value(ty)?) };
             let indirect_return = large(&f.ret)?;
             let indirect_params = f
                 .params
@@ -1135,7 +1160,10 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         }
         Ok(())
     }
-    fn return_value(&self, value: Value<'ctx>) -> Result<()> {
+    fn return_value(&mut self, value: Value<'ctx>) -> Result<()> {
+        if self.frame.is_some() {
+            return self.frame_return(Some(value));
+        }
         if let Some(pieces) = &self.c_result {
             self.c_return(value, pieces)?;
         } else if let Some(storage) = self.return_storage {
@@ -1283,7 +1311,18 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         if let Some(v) = value {
             self.store_value(ptr, v)?;
         }
-        let live = if self.needs_drop(ty) {
+        let live = if self.needs_drop(ty) && self.frame.is_some() {
+            let flag = self.alloca(self.context.bool_type(), "initialized")?;
+            self.zero_on_start(flag)?;
+            self.builder.build_store(
+                flag,
+                self.context
+                    .bool_type()
+                    .const_int(value.is_some() as u64, false),
+            )?;
+            self.frame_owns(ptr, ty, flag);
+            Some(flag)
+        } else if self.needs_drop(ty) {
             let flag = self.alloca(self.context.bool_type(), "initialized")?;
             // A temporary may be created only in a short-circuit branch. Its
             // cleanup flag must still be defined along the skipped path.
@@ -1401,6 +1440,10 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                 if let Some(s) = self.program.structs.iter().find(|s| s.name == *n).cloned() {
                     if let Some(f) = self.functions.get(&format!("{n}.drop")).copied() {
                         self.builder.build_call(f, &[ptr], "")?;
+                    }
+                    // A future's drop knows which of its parts still own values.
+                    if s.async_future {
+                        return Ok(());
                     }
                     for (i, field) in s.fields.iter().enumerate().rev() {
                         let p = self.builder.build_struct_gep(
@@ -1597,7 +1640,9 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             StmtKind::Return(e) => {
                 let v = e.as_ref().map(|v| self.expr(v)).transpose()?;
                 self.cleanup_to(0)?;
-                if self.return_type == Type::Void {
+                if self.frame.is_some() && self.return_type == Type::Void {
+                    self.frame_return(None)?;
+                } else if self.return_type == Type::Void {
                     self.builder.build_return(None)?;
                 } else if let Some(v) = v {
                     self.return_value(v)?;
@@ -1939,6 +1984,18 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                 }
                 self.transfer(&pending)?;
                 if let Some(storage) = storage {
+                    // A future starts in its first state; the rest of its
+                    // frame is written by its first poll.
+                    if decl.async_future {
+                        let state = self.builder.build_struct_gep(
+                            st,
+                            storage,
+                            decl.fields.len() as u32,
+                            "async.state",
+                        )?;
+                        self.builder
+                            .build_store(state, self.context.i32_type().const_zero())?;
+                    }
                     self.builder.build_load(st, storage, "struct.value")?
                 } else {
                     v
@@ -2045,6 +2102,11 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             ExprKind::Closure(closure) => self.closure(closure, &e.ty)?,
             ExprKind::Invoke { callee, args } => self.invoke(callee, args, &e.ty)?,
             ExprKind::Asm(asm) => self.inline_asm(asm, &e.ty)?,
+            ExprKind::Await {
+                value,
+                poll,
+                output,
+            } => self.await_expr(value, poll, output.as_deref(), &e.ty)?,
             ExprKind::Cast(x, t) if t.closure_signature().is_some() => match &x.kind {
                 // A closure without captures needs no environment.
                 ExprKind::Closure(closure) if closure.captures.is_empty() => {
@@ -3589,7 +3651,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         }
         let (indirect_return, indirect_params) = self.indirect[name].clone();
         let storage = if indirect_return {
-            Some(self.alloca(self.ty(ret)?, "call.result")?)
+            Some(self.alloca(self.ty(ret)?, CALL_RESULT)?)
         } else {
             None
         };
@@ -3601,7 +3663,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         for (e, indirect) in args.iter().zip(&indirect_params) {
             let value = self.stage(e, &mut pending)?;
             if *indirect {
-                let argument = self.alloca(self.ty(&e.ty)?, "call.argument")?;
+                let argument = self.alloca(self.ty(&e.ty)?, CALL_ARGUMENT)?;
                 self.store_value(argument, value)?;
                 vs.push(argument);
             } else {
@@ -3639,9 +3701,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
     /// the value's address.
     fn dispatch_convention(&self, method: &Function) -> Result<(bool, Vec<bool>)> {
         let large = |ty: &Type| -> Result<bool> {
-            Ok(*ty != Type::Void
-                && !mentions_dyn_self(ty)
-                && self.data.get_abi_size(&self.ty(ty)?) > 1024)
+            Ok(*ty != Type::Void && !mentions_dyn_self(ty) && self.large_value(ty)?)
         };
         let params = method
             .params
@@ -3785,7 +3845,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         let declaration = methods[slot].clone();
         let (indirect_return, indirect_params) = self.dispatch_convention(&declaration)?;
         let storage = if indirect_return {
-            Some(self.alloca(self.ty(ret)?, "call.result")?)
+            Some(self.alloca(self.ty(ret)?, CALL_RESULT)?)
         } else {
             None
         };
@@ -3798,7 +3858,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                 values.push(self.builder.build_extract_value(value, 0, "dyn.data")?);
                 table = Some(self.builder.build_extract_value(value, 1, "dyn.table")?);
             } else if *indirect {
-                let argument = self.alloca(self.ty(&e.ty)?, "call.argument")?;
+                let argument = self.alloca(self.ty(&e.ty)?, CALL_ARGUMENT)?;
                 self.store_value(argument, value)?;
                 values.push(argument);
             } else {

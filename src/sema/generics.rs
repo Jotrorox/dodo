@@ -215,6 +215,7 @@ impl Expander {
             unsafe_send: false,
             unsafe_sync: false,
             interior_mutable: false,
+            async_future: false,
         };
         self.struct_templates
             .insert(name.to_owned(), template.clone());
@@ -1172,6 +1173,7 @@ impl Expander {
                     None
                 }
             }),
+            ExprKind::Await { value, .. } => self.guess(value).map(|t| self.awaited(&t)),
             _ => None,
         }
     }
@@ -1969,6 +1971,10 @@ impl Expander {
                     Type::Unknown
                 }
             }
+            ExprKind::Await { value, .. } => {
+                let future = self.expression(value, substitutions, None)?;
+                self.awaited(&future)
+            }
             ExprKind::ValueBlock(body) => {
                 let previous = std::mem::replace(&mut self.yield_type, expected.cloned());
                 self.block(body, substitutions)?;
@@ -1977,6 +1983,17 @@ impl Expander {
                 result
             }
         })
+    }
+    /// What `await` on a value of type `future` yields: its `output`
+    /// method's result, or void.
+    fn awaited(&self, future: &Type) -> Type {
+        match future {
+            Type::Named(name) => self
+                .signatures
+                .get(&format!("{name}.output"))
+                .map_or(Type::Void, |output| output.ret.clone()),
+            _ => Type::Unknown,
+        }
     }
     fn inferred_arguments(
         &self,
