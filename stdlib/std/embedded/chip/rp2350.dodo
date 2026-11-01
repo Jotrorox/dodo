@@ -10,6 +10,7 @@ import "std/embedded/chip/rp_multicore"
 import "std/embedded/chip/rp_pio"
 import "std/embedded/chip/rp_power"
 import "std/embedded/chip/rp_pwm"
+import "std/embedded/chip/rp_rtc"
 import "std/embedded/chip/rp_usb"
 import "std/embedded/chip/rp_watchdog"
 import "std/embedded/peripheral/designware_i2c"
@@ -18,16 +19,18 @@ import "std/embedded/peripheral/pl022"
 import "std/embedded/chip/rp_pins"
 
 // Raspberry Pi RP2350 chip support for the Arm cores: clocks, resets, GPIO,
-// I2C, SPI, UART, PWM, the ADC, PIO, the microsecond timer, the watchdog, a
-// USB serial port, the second core, the FIFOs and spinlocks the cores share,
-// low power, and the boot ROM. `take(config)` brings the chip from its boot state (ring
+// I2C, SPI, UART, PWM, the ADC, PIO, the microsecond timer, the always-on
+// timer as a real-time clock, the watchdog, a USB serial port, the second
+// core, the FIFOs and spinlocks the cores share, low power, and the boot
+// ROM. `take(config)` brings the chip from its boot state (ring
 // oscillator, peripherals held in reset) to a known configuration and hands
 // out the peripherals once. Pins implement the std/embedded/hal output and
 // input pin protocols, I2C and SPI buses claimed from `Pins` implement the
 // bus protocols, serial ports the std/io Reader and Writer protocols, PWM
 // outputs and ADC inputs the PWM output and analog input protocols, the
-// timer the delay protocol, and the watchdog the watchdog protocol, so
-// portable drivers use them unchanged.
+// timer the delay protocol, the real-time clock the clock and alarm
+// protocols, and the watchdog the watchdog protocol, so portable drivers use
+// them unchanged.
 //
 // Applications normally use a board package instead, which supplies the
 // board's Config and wiring: `import "std/embedded/board"` with
@@ -167,6 +170,9 @@ const TIMER_INTF: usize = TIMER0_BASE + 0x44
 // The longest an alarm sleeps at once: below 2^31 us, so its 32-bit
 // target time is still ahead when the write lands.
 const MAX_ALARM_SLEEP_US: u64 = 0x7FFF_FFFF
+// The power manager (6.4), whose always-on timer is the real-time clock.
+const POWMAN_BASE: usize = 0x4010_0000
+
 // Alarms 0 to 3, raising TIMER0_IRQ_0 + n.
 pub const ALARM_COUNT: u32 = 4
 
@@ -429,6 +435,9 @@ pub struct Config {
 pub struct Peripherals {
     pub pins: Pins
     pub timer: Timer
+    // The always-on timer as a real-time clock: the time of day, counted in
+    // milliseconds, which survives resets.
+    pub rtc: Rtc
     // The watchdog, stopped; rp_watchdog documents it.
     pub watchdog: rp_watchdog.Watchdog
     pub usb: Usb
@@ -473,6 +482,11 @@ pub fn take(config: Config) -> Peripherals!hal.Error {
         start_clocks(crystal)?
         reset_blocks(RESET_IO_BANK0 | RESET_PADS_BANK0 | RESET_TIMER0 | RESET_DMA)?
     }
+    // SAFETY: TAKEN guarantees one Rtc, the only user of the power
+    // manager's timer, alarm, and interrupt enable registers.
+    aon := unsafe {
+        rp_rtc.AonTimer.new(hal.RegisterBlock.at(POWMAN_BASE), crystal)?
+    }
     // SAFETY: the timer was just taken out of reset; Timer only reads its
     // free-running counter registers.
     timer := unsafe {
@@ -510,7 +524,7 @@ pub fn take(config: Config) -> Peripherals!hal.Error {
     }
     let rp_multicore.Cores { core1, fifos, spinlocks, doorbells } = cores
     power := Power { crystal_hz: crystal }
-    return ok(Peripherals { pins: Pins { bank }, timer, watchdog, usb, dma, core1, fifos, spinlocks, doorbells, power })
+    return ok(Peripherals { pins: Pins { bank }, timer, rtc: Rtc { aon }, watchdog, usb, dma, core1, fifos, spinlocks, doorbells, power })
 }
 
 // SAFETY: the caller owns `address`, a 32-bit RP2350 register.
@@ -1215,6 +1229,69 @@ pub struct Pin {
     // The interrupt pin events raise, IO_IRQ_BANK0, for cortex_m.enable.
     pub fn irq(&self) -> u32 {
         return IO_IRQ_BANK0
+    }
+}
+
+// The always-on timer of the power manager as a real-time clock: a
+// millisecond counter, ticking from the crystal, with an alarm. Implements
+// the std/embedded/hal Rtc and RtcAlarm protocols, so
+// `hal.rtc_now(&mut b.rtc)` reads it as a date and time. It sits in the
+// always-on power domain: once set, it keeps counting through the resets
+// that leave that domain running, such as the watchdog's, so a later take()
+// finds it still set; it stops when the chip loses power, and pauses while
+// the chip is dormant, which stops the crystal. The alarm raises
+// POWMAN_IRQ_TIMER while `listen`ing, and its handler calls `clear_alarm`.
+pub struct Rtc: hal.Rtc + hal.RtcAlarm {
+    aon: rp_rtc.AonTimer<hal.RegisterBlock>
+
+    pub fn is_set(&mut self) -> bool!hal.Error {
+        return self.aon.is_set()
+    }
+
+    pub fn now_ms(&mut self) -> u64!hal.Error {
+        return self.aon.now_ms()
+    }
+
+    pub fn set_ms(&mut self, time_ms: u64) -> void!hal.Error {
+        return self.aon.set_ms(time_ms)
+    }
+
+    // 1: the timer counts milliseconds.
+    pub fn resolution_ms(&self) -> u32 {
+        return self.aon.resolution_ms()
+    }
+
+    pub fn set_alarm_ms(&mut self, time_ms: u64) -> void!hal.Error {
+        return self.aon.set_alarm_ms(time_ms)
+    }
+
+    pub fn alarm_fired(&mut self) -> bool!hal.Error {
+        return self.aon.alarm_fired()
+    }
+
+    pub fn clear_alarm(&mut self) -> void!hal.Error {
+        return self.aon.clear_alarm()
+    }
+
+    // The alarm's interrupt: its number for cortex_m.enable, and its vector
+    // name, POWMAN_IRQ_TIMER, for `@interrupt`.
+    pub fn irq(&self) -> u32 {
+        return POWMAN_IRQ_TIMER
+    }
+
+    // Raise POWMAN_IRQ_TIMER when the alarm fires. Enable it in the NVIC
+    // too: `cortex_m.enable(rtc.irq())`.
+    pub fn listen(&mut self) {
+        self.aon.listen()
+    }
+
+    // Stop raising the interrupt; alarm_fired still reports.
+    pub fn ignore(&mut self) {
+        self.aon.ignore()
+    }
+
+    pub fn is_listening(&mut self) -> bool {
+        return self.aon.is_listening()
     }
 }
 

@@ -1,0 +1,822 @@
+package main
+
+import "std/embedded/chip/rp_rtc"
+import "std/embedded/hal"
+import "std/embedded/hal/fake"
+import "std/embedded/rtc/ds3231"
+import "std/time"
+
+// Simulated time for the register models: milliseconds since the test
+// started. Models moved into a driver still see it advance.
+static mut ELAPSED_MS: u64 = 0
+
+fn elapsed() -> u64 {
+    return unsafe {
+        ELAPSED_MS
+    }
+}
+
+fn advance(milliseconds: u64) {
+    unsafe {
+        ELAPSED_MS += milliseconds
+    }
+}
+
+fn expect_error(result: void!hal.Error, expected: hal.Error) {
+    match result {
+        ok() => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == expected)
+        }
+    }
+}
+
+fn expect_time_error(result: u64!hal.Error, expected: hal.Error) {
+    match result {
+        ok(_) => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == expected)
+        }
+    }
+}
+
+fn date_time(year: i32, month: u32, day: u32, hour: u32, minute: u32, second: u32) -> time.DateTime {
+    return time.DateTime.new(time.Date.new(year, month, day)!, time.TimeOfDay.new(hour, minute, second, 0)!)
+}
+
+// Unix milliseconds of a UTC date and time.
+fn unix_ms(year: i32, month: u32, day: u32, hour: u32, minute: u32, second: u32) -> u64 {
+    value := date_time(year, month, day, hour, minute, second)
+    return hal.ms_of_date_time(&value)!
+}
+
+// --- Portable code -----------------------------------------------------------
+
+// A timestamp for a log line from any clock, chosen at run time.
+fn stamp(clock: &mut dyn hal.Rtc) -> u64!hal.Error {
+    if !clock.is_set()? {
+        return ok(0)
+    }
+    return clock.now_ms()
+}
+
+// Set a clock that lost its time, then wait for an alarm `seconds` ahead,
+// letting `tick` pass the time, as firmware would sleep.
+fn wake_after<R: hal.Rtc + hal.RtcAlarm>(clock: &mut R, seconds: u32, tick: fn()) -> u32!hal.Error {
+    if !clock.is_set()? {
+        start := date_time(2026, 11, 1, 8, 0, 0)
+        hal.rtc_set(clock, &start)?
+    }
+    hal.rtc_alarm_in(clock, seconds as u64 * 1000)?
+    ticks := 0u32
+    for !clock.alarm_fired()? {
+        tick()
+        ticks += 1
+    }
+    clock.clear_alarm()?
+    return ok(ticks)
+}
+
+// The register models' time.
+fn tick() {
+    advance(100)
+}
+
+fn calendar_conversions() {
+    epoch := hal.date_time_of_ms(0)!
+    core.assert(epoch.date().year() == 1970 && epoch.date().month() == 1 && epoch.date().day() == 1)
+    core.assert_eq(epoch.time_of_day().seconds_since_midnight(), 0u32)
+
+    time_ms := unix_ms(2026, 11, 1, 12, 34, 56) + 789
+    core.assert_eq(time_ms, 1_793_536_496_789u64)
+    value := hal.date_time_of_ms(time_ms)!
+    core.assert(value.date().year() == 2026 && value.date().month() == 11 && value.date().day() == 1)
+    core.assert(value.time_of_day().hour() == 12 && value.time_of_day().minute() == 34 && value.time_of_day().second() == 56)
+    core.assert_eq(value.time_of_day().subsec_nanos(), 789_000_000u32)
+    core.assert_eq(hal.ms_of_date_time(&value)!, time_ms)
+
+    before := date_time(1969, 12, 31, 23, 59, 59)
+    expect_time_error(hal.ms_of_date_time(&before), hal.Error.InvalidInput)
+}
+
+fn fake_clocks() {
+    clock := fake.Rtc.new()
+    core.assert(!clock.is_set()! && clock.resolution_ms() == 1)
+    expect_time_error(clock.now_ms(), hal.Error.Busy)
+    expect_error(clock.set_alarm_ms(5), hal.Error.Busy)
+    core.assert_eq(stamp(&mut clock)!, 0u64)
+    // Time does not pass for a clock that is not set.
+    clock.advance(1000)
+    core.assert(!clock.is_set()!)
+
+    start := date_time(2026, 11, 1, 12, 0, 0)
+    hal.rtc_set(&mut clock, &start)!
+    clock.advance(1_500)
+    now := hal.rtc_now(&mut clock)!
+    core.assert(now.time_of_day().second() == 1 && now.time_of_day().subsec_nanos() == 500_000_000)
+    core.assert_eq(stamp(&mut clock)!, unix_ms(2026, 11, 1, 12, 0, 1) + 500)
+
+    // Alarms: not in the past, fire at their time, and stay fired.
+    noon := unix_ms(2026, 11, 1, 12, 0, 0)
+    // A time already reached fires at once, as for a counter's alarm.
+    clock.set_alarm_ms(noon + 1_500)!
+    core.assert(clock.alarm_fired()!)
+    hal.rtc_alarm_in(&mut clock, 0)!
+    core.assert(clock.alarm_fired()!)
+    clock.clear_alarm()!
+    hal.rtc_alarm_in(&mut clock, 250)!
+    core.assert(clock.is_armed() && clock.alarm_ms() == noon + 1_750)
+    clock.advance(249)
+    core.assert(!clock.alarm_fired()!)
+    clock.advance(1)
+    core.assert(clock.alarm_fired()!)
+    clock.advance(10_000)
+    core.assert(clock.alarm_fired()!)
+    clock.clear_alarm()!
+    core.assert(!clock.alarm_fired()! && !clock.is_armed())
+
+    at := date_time(2026, 11, 1, 13, 0, 0)
+    hal.rtc_alarm_at(&mut clock, &at)!
+    core.assert(clock.is_armed() && clock.alarm_ms() == unix_ms(2026, 11, 1, 13, 0, 0))
+
+    // Losing power loses the time and the alarm.
+    clock.lose_power()
+    core.assert(!clock.is_set()! && !clock.is_armed())
+    expect_time_error(clock.now_ms(), hal.Error.Busy)
+
+    // Errors from a clock on a bus pass through the helpers.
+    hal.rtc_set(&mut clock, &start)!
+    clock.fail_next(hal.Error.NoAcknowledge)
+    match hal.rtc_now(&mut clock) {
+        ok(_) => {
+            core.assert(false)
+        },
+        err(error) => {
+            core.assert(error == hal.Error.NoAcknowledge)
+        },
+    }
+    core.assert_eq(clock.now_ms()!, noon)
+
+    // A clock that counts seconds reports whole seconds, and an alarm a
+    // little ahead waits for the next whole second at least.
+    seconds := fake.Rtc.with_resolution(1000)
+    seconds.set_ms(noon + 999)!
+    core.assert_eq(seconds.now_ms()!, noon)
+    hal.rtc_alarm_in(&mut seconds, 10)!
+    core.assert(seconds.is_armed() && seconds.alarm_ms() == noon + 10)
+    core.assert(!seconds.alarm_fired()!)
+    seconds.advance(1000)
+    core.assert(seconds.alarm_fired()!)
+    seconds.clear_alarm()!
+
+}
+
+// --- The RP2040 RTC ----------------------------------------------------------
+
+// The RTC's registers, with the set and clear aliases. The counter runs from
+// ELAPSED_MS while enabled; a time loaded shows only after `stale` more
+// reads, as the RTC's slow clock domain catches up.
+struct CalendarModel: hal.Registers {
+    clock_divider: u32
+    setup_0: u32
+    setup_1: u32
+    irq_setup_0: u32
+    irq_setup_1: u32
+    inte: u32
+    intf: u32
+    enabled: bool
+    force_not_leap: bool
+    // FORCE_NOTLEAPYEAR as the last LOAD set it.
+    loaded_not_leap: bool
+    // The seconds since the epoch the counter held when it last started
+    // or stopped, and ELAPSED_MS then.
+    base: u64
+    since: u64
+    // The value reads show until the domain catches up, and how long.
+    shown: u64
+    stale: u32
+    delay: u32
+    // Before the first load, stale reads show zeros, as after the RTC's
+    // reset: month 0, which is no date.
+    loaded: bool
+    zeros: bool
+    // RTC_1 as RTC_0's read held it.
+    held_date: u32
+    holding: bool
+    // Failure injection: the RTC never starts.
+    stuck: bool
+
+    fn new() -> CalendarModel {
+        return CalendarModel {
+            clock_divider: 0, setup_0: 0, setup_1: 0, irq_setup_0: 0, irq_setup_1: 0, inte: 0, intf: 0,
+            enabled: false, force_not_leap: false, loaded_not_leap: false, base: 0, since: 0, shown: 0, stale: 0, delay: 3, loaded: false, zeros: false,
+            held_date: 0, holding: false, stuck: false,
+        }
+    }
+
+    fn seconds(&self) -> u64 {
+        if self.enabled {
+            return self.base + (elapsed() - self.since) / 1000
+        }
+        return self.base
+    }
+
+    // The RTC_1 and RTC_0 fields of `seconds`.
+    fn fields(seconds: u64) -> [2]u32 {
+        date := time.Date.from_days_since_epoch((seconds / 86_400) as i64)!
+        of_day := (seconds % 86_400) as u32
+        weekday := date.weekday() % 7
+        return [
+            ((date.year() as u32) << 12) | (date.month() << 8) | date.day(),
+            (weekday << 24) | ((of_day / 3600) << 16) | ((of_day / 60 % 60) << 8) | (of_day % 60),
+        ]
+    }
+
+    fn matching(&self) -> bool {
+        if (self.irq_setup_0 & (1u32 << 28)) == 0 {
+            return false
+        }
+        now := CalendarModel.fields(self.seconds())
+        // The driver compares the date and the time, not the weekday.
+        core.assert_eq(self.irq_setup_0 & (7u32 << 24), 7u32 << 24)
+        core.assert_eq(self.irq_setup_1 & (0xFu32 << 28), 7u32 << 28)
+        return (now[0] & 0xFFFF1F) == (self.irq_setup_0 & 0xFFFF1F) && (now[1] & 0x1F3F3F) == (self.irq_setup_1 & 0x1F3F3F)
+    }
+
+    pub fn read(&mut self, offset: usize) -> u32 {
+        if offset == 0x00 {
+            return self.clock_divider
+        }
+        if offset == 0x0C {
+            control := 0u32
+            if self.enabled {
+                control |= 1
+                if !self.stuck {
+                    control |= 2
+                }
+            }
+            if self.force_not_leap {
+                control |= 1 << 8
+            }
+            return control
+        }
+        if offset == 0x10 {
+            active := (self.irq_setup_0 & (1u32 << 28)) << 1
+            return self.irq_setup_0 | active
+        }
+        if offset == 0x14 {
+            return self.irq_setup_1
+        }
+        if offset == 0x1C {
+            seconds := self.seconds()
+            if self.stale > 0 {
+                self.stale -= 1
+                if self.zeros {
+                    self.held_date = 0
+                    self.holding = true
+                    return 0
+                }
+                seconds = self.shown
+            }
+            now := CalendarModel.fields(seconds)
+            self.held_date = now[0]
+            self.holding = true
+            return now[1]
+        }
+        if offset == 0x18 {
+            // RTC_0 has to be read first.
+            core.assert(self.holding)
+            self.holding = false
+            return self.held_date
+        }
+        if offset == 0x20 {
+            if self.matching() {
+                return 1
+            }
+            return 0
+        }
+        if offset == 0x24 {
+            return self.inte
+        }
+        core.assert_eq(offset, 0x28usize)
+        return self.intf
+    }
+
+    pub fn write(&mut self, offset: usize, value: u32) {
+        alias := offset & 0x3000
+        register := offset & 0xFFF
+        if alias != 0 {
+            // Only the alarm's global match enable is set and cleared.
+            core.assert(register == 0x10 && value == 1u32 << 28)
+            if alias == 0x2000 {
+                self.irq_setup_0 |= value
+            } else {
+                core.assert_eq(alias, 0x3000usize)
+                self.irq_setup_0 &= ~value
+            }
+            return
+        }
+        if register == 0x00 {
+            core.assert(!self.enabled)
+            self.clock_divider = value
+        } else if register == 0x04 {
+            core.assert(!self.enabled)
+            self.setup_0 = value
+        } else if register == 0x08 {
+            core.assert(!self.enabled)
+            self.setup_1 = value
+        } else if register == 0x0C {
+            self.control(value)
+        } else if register == 0x10 || register == 0x14 {
+            // Nothing else changes while the alarm compares.
+            core.assert((self.irq_setup_0 & (1u32 << 28)) == 0)
+            if register == 0x10 {
+                self.irq_setup_0 = value
+            } else {
+                self.irq_setup_1 = value
+            }
+        } else if register == 0x24 {
+            self.inte = value & 1
+        } else {
+            core.assert_eq(register, 0x28usize)
+            self.intf = value & 1
+        }
+    }
+
+    fn control(&mut self, value: u32) {
+        self.force_not_leap = (value & (1u32 << 8)) != 0
+        if (value & (1u32 << 4)) != 0 {
+            // LOAD: the setup registers into the stopped counter. The
+            // weekday has to match the date.
+            core.assert(!self.enabled)
+            date := time.Date.new(((self.setup_0 >> 12) & 0xFFF) as i32, (self.setup_0 >> 8) & 0xF, self.setup_0 & 0x1F)!
+            core.assert_eq((self.setup_1 >> 24) & 7, date.weekday() % 7)
+            hour := (self.setup_1 >> 16) & 0x1F
+            minute := (self.setup_1 >> 8) & 0x3F
+            second := self.setup_1 & 0x3F
+            self.loaded_not_leap = self.force_not_leap
+            self.shown = self.seconds()
+            self.stale = self.delay
+            self.zeros = !self.loaded
+            self.loaded = true
+            self.base = date.days_since_epoch() as u64 * 86_400 + (hour * 3600 + minute * 60 + second) as u64
+        }
+        enable := (value & 1) != 0
+        if enable != self.enabled {
+            self.base = self.seconds()
+            self.since = elapsed()
+            self.enabled = enable
+        }
+    }
+}
+
+fn calendar_rtc() {
+    expect_calendar_error(unsafe {
+        rp_rtc.Calendar.new(CalendarModel.new(), 0)
+    }, hal.Error.InvalidInput)
+    expect_calendar_error(unsafe {
+        rp_rtc.Calendar.new(CalendarModel.new(), 70_000)
+    }, hal.Error.InvalidInput)
+
+    rtc := unsafe {
+        rp_rtc.Calendar.new(CalendarModel.new(), 31_250)!
+    }
+    core.assert(!rtc.is_set()! && rtc.resolution_ms() == 1000)
+    expect_time_error(rtc.now_ms(), hal.Error.Busy)
+    expect_error(rtc.set_alarm_ms(1000), hal.Error.Busy)
+    core.assert(!rtc.alarm_fired()!)
+
+    // A Sunday: the weekday the model checks is 0. The RTC counts seconds,
+    // so the milliseconds round down, and the set waits for the slow
+    // domain to show the new time.
+    time_ms := unix_ms(2026, 11, 1, 12, 34, 56)
+    rtc.set_ms(time_ms + 789)!
+    core.assert(rtc.is_set()!)
+    core.assert_eq(rtc.now_ms()!, time_ms)
+    advance(61_000)
+    now := hal.rtc_now(&mut rtc)!
+    core.assert(now.time_of_day().hour() == 12 && now.time_of_day().minute() == 35 && now.time_of_day().second() == 57)
+    core.assert_eq(stamp(&mut rtc)!, time_ms + 61_000)
+
+    // Across a year's end.
+    rtc.set_ms(unix_ms(2026, 12, 31, 23, 59, 59))!
+    advance(1000)
+    core.assert_eq(rtc.now_ms()!, unix_ms(2027, 1, 1, 0, 0, 0))
+
+    // The alarm fires at the first whole second at or after its time, its
+    // interrupt is raised for that second, and it stays fired.
+    now_ms := rtc.now_ms()!
+    // A time already reached fires at once and forces the interrupt.
+    rtc.set_alarm_ms(now_ms)!
+    core.assert(rtc.alarm_fired()! && rtc.is_pending())
+    rtc.clear_alarm()!
+    core.assert(!rtc.alarm_fired()! && !rtc.is_pending())
+    rtc.listen()
+    core.assert(rtc.is_listening())
+    rtc.set_alarm_ms(now_ms + 1)!
+    core.assert(!rtc.alarm_fired()! && !rtc.is_pending())
+    advance(999)
+    core.assert(!rtc.alarm_fired()!)
+    advance(1)
+    core.assert(rtc.alarm_fired()! && rtc.is_pending())
+    advance(1000)
+    core.assert(rtc.alarm_fired()! && !rtc.is_pending())
+    rtc.clear_alarm()!
+    core.assert(!rtc.alarm_fired()!)
+    rtc.ignore()
+    core.assert(!rtc.is_listening())
+
+    // A time set past the alarm fires it and forces the interrupt.
+    hal.rtc_alarm_in(&mut rtc, 60_000)!
+    later := rtc.now_ms()! + 3_600_000
+    rtc.set_ms(later)!
+    core.assert(rtc.alarm_fired()! && rtc.is_pending())
+    rtc.clear_alarm()!
+    core.assert(!rtc.alarm_fired()! && !rtc.is_pending())
+
+    // Years the RTC's every-fourth-year rule gets wrong, and the last year.
+    rtc.set_ms(unix_ms(2100, 1, 1, 0, 0, 0))!
+    model := rtc.release()
+    core.assert(model.loaded_not_leap && !model.enabled && model.clock_divider == 31_249)
+    rtc = unsafe {
+        rp_rtc.Calendar.new(model, 31_250)!
+    }
+    rtc.set_ms(unix_ms(2104, 1, 1, 0, 0, 0))!
+    rtc.set_ms(unix_ms(4095, 12, 31, 23, 59, 59))!
+    expect_error(rtc.set_ms(unix_ms(4096, 1, 1, 0, 0, 0)), hal.Error.InvalidInput)
+    expect_error(rtc.set_alarm_ms(unix_ms(4096, 1, 1, 0, 0, 0)), hal.Error.InvalidInput)
+    rtc.set_ms(unix_ms(2026, 11, 1, 8, 0, 0))!
+    model = rtc.release()
+    core.assert(!model.loaded_not_leap)
+
+    // Portable code, then a counter that never starts.
+    rtc = unsafe {
+        rp_rtc.Calendar.new(model, 31_250)!
+    }
+    core.assert_eq(wake_after(&mut rtc, 3, tick)!, 30u32)
+    model = rtc.release()
+    model.stuck = true
+    rtc = unsafe {
+        rp_rtc.Calendar.new(model, 31_250)!
+    }
+    expect_error(rtc.set_ms(0), hal.Error.Timeout)
+}
+
+fn expect_calendar_error(result: rp_rtc.Calendar<CalendarModel>!hal.Error, expected: hal.Error) {
+    match result {
+        ok(_) => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == expected)
+        }
+    }
+}
+
+// --- The RP2350 always-on timer ---------------------------------------------
+
+// The power manager's timer registers, with the set and clear aliases. Every
+// write must carry the password. The counter runs from ELAPSED_MS while RUN
+// is set.
+struct AonModel: hal.Registers {
+    timer: u32
+    set_time: [4]u32
+    alarm_time: [4]u32
+    xosc_khz: u32
+    xosc_frac: u32
+    inte: u32
+    base: u64
+    since: u64
+    writes: u32
+    // Failure injection: starting the counter does not load SET_TIME.
+    frozen: bool
+
+    fn new() -> AonModel {
+        return AonModel { timer: 0, set_time: [0u32; 4], alarm_time: [0u32; 4], xosc_khz: 12_000, xosc_frac: 0, inte: 0, base: 0, since: 0, writes: 0, frozen: false }
+    }
+
+    fn running(&self) -> bool {
+        return (self.timer & (1u32 << 1)) != 0
+    }
+
+    fn now(&self) -> u64 {
+        if self.running() {
+            return self.base + elapsed() - self.since
+        }
+        return self.base
+    }
+
+    // Four 16-bit registers, most significant first.
+    fn join(parts: &[4]u32) -> u64 {
+        return ((parts[0] as u64) << 48) | ((parts[1] as u64) << 32) | ((parts[2] as u64) << 16) | parts[3] as u64
+    }
+
+    // The alarm latches once the time is at or past it while it is enabled.
+    fn update(&mut self) {
+        if (self.timer & (1u32 << 4)) != 0 && self.now() >= AonModel.join(&self.alarm_time) {
+            self.timer |= 1 << 6
+        }
+    }
+
+    pub fn read(&mut self, offset: usize) -> u32 {
+        self.update()
+        if offset == 0x58 {
+            return self.xosc_khz
+        }
+        if offset == 0x5C {
+            return self.xosc_frac
+        }
+        if offset == 0x70 {
+            return (self.now() >> 32) as u32
+        }
+        if offset == 0x74 {
+            return (self.now() & 0xFFFF_FFFF) as u32
+        }
+        if offset == 0x88 {
+            return self.timer
+        }
+        core.assert_eq(offset, 0xE4usize)
+        return self.inte
+    }
+
+    pub fn write(&mut self, offset: usize, value: u32) {
+        core.assert_eq(value >> 16, 0x5AFEu32)
+        self.writes += 1
+        bits := value & 0xFFFF
+        alias := offset & 0x3000
+        register := offset & 0xFFF
+        if register == 0x88 {
+            // The timer's control is only set and cleared.
+            core.assert(alias != 0)
+            self.update()
+            was_running := self.running()
+            if alias == 0x2000 {
+                if (bits & (1u32 << 9)) != 0 {
+                    // USE_XOSC switches the tick and clears itself.
+                    self.timer |= 1 << 16
+                }
+                self.timer |= bits & ((1u32 << 1) | (1u32 << 4))
+            } else {
+                core.assert_eq(alias, 0x3000usize)
+                self.timer &= ~(bits & ((1u32 << 1) | (1u32 << 4) | (1u32 << 6)))
+            }
+            if !was_running && self.running() && !self.frozen {
+                self.base = AonModel.join(&self.set_time)
+                self.since = elapsed()
+            } else if was_running && !self.running() {
+                self.base = self.now()
+            }
+            self.update()
+            return
+        }
+        if register == 0xE4 {
+            if alias == 0x2000 {
+                self.inte |= bits
+            } else {
+                core.assert_eq(alias, 0x3000usize)
+                self.inte &= ~bits
+            }
+            return
+        }
+        core.assert_eq(alias, 0usize)
+        if register == 0x58 || register == 0x5C {
+            core.assert(!self.running() || (self.timer & (1u32 << 16)) == 0)
+            if register == 0x58 {
+                self.xosc_khz = bits
+            } else {
+                self.xosc_frac = bits
+            }
+        } else if register >= 0x60 && register <= 0x6C {
+            core.assert(!self.running())
+            self.set_time[(register - 0x60) / 4] = bits
+        } else {
+            core.assert(register >= 0x78 && register <= 0x84)
+            core.assert((self.timer & (1u32 << 4)) == 0)
+            self.alarm_time[(register - 0x78) / 4] = bits
+        }
+    }
+}
+
+fn expect_aon_error(result: rp_rtc.AonTimer<AonModel>!hal.Error, expected: hal.Error) {
+    match result {
+        ok(_) => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == expected)
+        }
+    }
+}
+
+fn aon_timer() {
+    expect_aon_error(unsafe {
+        rp_rtc.AonTimer.new(AonModel.new(), 1500)
+    }, hal.Error.InvalidInput)
+
+    // A timer fresh from power-up is stopped; take it with a 12 MHz crystal.
+    model := AonModel.new()
+    model.xosc_khz = 1
+    timer := unsafe {
+        rp_rtc.AonTimer.new(model, 12_000_000)!
+    }
+    core.assert(!timer.is_set()! && timer.resolution_ms() == 1)
+    expect_time_error(timer.now_ms(), hal.Error.Busy)
+    expect_error(timer.set_alarm_ms(1), hal.Error.Busy)
+
+    time_ms := unix_ms(2026, 11, 1, 12, 34, 56) + 789
+    timer.set_ms(time_ms)!
+    core.assert(timer.is_set()!)
+    core.assert_eq(timer.now_ms()!, time_ms)
+    advance(1_234)
+    core.assert_eq(timer.now_ms()!, time_ms + 1_234)
+    now := hal.rtc_now(&mut timer)!
+    core.assert(now.time_of_day().second() == 58 && now.time_of_day().subsec_nanos() == 23_000_000)
+    core.assert_eq(stamp(&mut timer)!, time_ms + 1_234)
+
+    // The alarm fires at its millisecond and stays fired until cleared,
+    // which disarms it.
+    now_ms := timer.now_ms()!
+    // A time already reached fires at once.
+    timer.set_alarm_ms(now_ms)!
+    core.assert(timer.alarm_fired()!)
+    timer.clear_alarm()!
+    core.assert(!timer.alarm_fired()!)
+    timer.listen()
+    core.assert(timer.is_listening())
+    timer.set_alarm_ms(now_ms + 500)!
+    advance(499)
+    core.assert(!timer.alarm_fired()!)
+    advance(1)
+    core.assert(timer.alarm_fired()!)
+    advance(5_000)
+    core.assert(timer.alarm_fired()!)
+    timer.clear_alarm()!
+    core.assert(!timer.alarm_fired()!)
+    timer.ignore()
+    core.assert(!timer.is_listening())
+
+    // A time set past an armed alarm fires it.
+    hal.rtc_alarm_in(&mut timer, 60_000)!
+    later := timer.now_ms()! + 120_000
+    timer.set_ms(later)!
+    core.assert(timer.alarm_fired()!)
+    timer.clear_alarm()!
+
+    // A reset: the timer keeps counting and a new AonTimer finds it set,
+    // with its tick left alone and its alarm disarmed.
+    hal.rtc_alarm_in(&mut timer, 60_000)!
+    timer.listen()
+    model = timer.release()
+    core.assert((model.timer & (1u32 << 16)) != 0 && model.xosc_khz == 12_000 && model.inte == 0)
+    core.assert((model.timer & (1u32 << 4)) == 0)
+    model.timer |= 1 << 4
+    model.inte = 2
+    model.xosc_khz = 11_000
+    before := model.now()
+    advance(10)
+    timer = unsafe {
+        rp_rtc.AonTimer.new(model, 12_000_000)!
+    }
+    core.assert(timer.is_set()!)
+    core.assert_eq(timer.now_ms()!, before + 10)
+    core.assert(!timer.is_listening())
+    model = timer.release()
+    core.assert(model.xosc_khz == 11_000 && (model.timer & (1u32 << 4)) == 0)
+
+    // A crystal that is not a whole number of kilohertz.
+    fresh := AonModel.new()
+    timer = unsafe {
+        rp_rtc.AonTimer.new(fresh, 12_000_500)!
+    }
+    timer.set_ms(0)!
+    model = timer.release()
+    core.assert(model.xosc_khz == 12_000 && model.xosc_frac == 32_768)
+
+    // Portable code from an unset timer.
+    timer = unsafe {
+        rp_rtc.AonTimer.new(AonModel.new(), 12_000_000)!
+    }
+    core.assert_eq(wake_after(&mut timer, 1, tick)!, 10u32)
+
+    // A counter that does not take the time.
+    model = timer.release()
+    model.frozen = true
+    timer = unsafe {
+        rp_rtc.AonTimer.new(model, 12_000_000)!
+    }
+    expect_error(timer.set_ms(5_000_000), hal.Error.Timeout)
+}
+
+// --- A DS3231 on I2C ---------------------------------------------------------
+
+fn ds3231_clock() {
+    chip := fake.I2c.new(ds3231.ADDRESS)
+    // Fresh from its first power-up: the oscillator-stopped flag is up and
+    // the oscillator stops on battery power.
+    chip.set_register(0x0E, 0x9C)
+    chip.set_register(0x0F, 0x80)
+    clock := ds3231.Clock.new(chip)
+    core.assert(!clock.is_set()! && clock.resolution_ms() == 1000)
+    expect_time_error(clock.now_ms(), hal.Error.Busy)
+    expect_error(clock.set_alarm_ms(1000), hal.Error.Busy)
+    core.assert(!clock.alarm_fired()!)
+    core.assert_eq(stamp(&mut clock)!, 0u64)
+
+    time_ms := unix_ms(2026, 11, 1, 12, 34, 56)
+    clock.set_ms(time_ms + 789)!
+    core.assert(clock.is_set()!)
+    core.assert_eq(clock.now_ms()!, time_ms)
+    chip = clock.release()
+    expected: [7]u8 = [0x56, 0x34, 0x12, 7, 0x01, 0x11, 0x26]
+    for index in 0usize..7 {
+        core.assert_eq(chip.register(index as u8), expected[index])
+    }
+    core.assert(chip.register(0x0E) == 0x1C && chip.register(0x0F) == 0)
+
+    // A chip left in 12-hour mode: 1 PM.
+    chip.set_register(0x02, 0x61)
+    clock = ds3231.Clock.new(chip)
+    core.assert_eq(clock.now_ms()!, unix_ms(2026, 11, 1, 13, 34, 56))
+    // 12 AM is midnight.
+    chip = clock.release()
+    chip.set_register(0x02, 0x52)
+    clock = ds3231.Clock.new(chip)
+    core.assert_eq(clock.now_ms()!, unix_ms(2026, 11, 1, 0, 34, 56))
+    clock.set_ms(time_ms)!
+
+    // The alarm: alarm 1 matching the date and time, rounded up to a whole
+    // second, reaching 28 days ahead.
+    expect_error(clock.set_alarm_ms(time_ms + 28 * 86_400_000 + 1000), hal.Error.InvalidInput)
+    // A time already reached fires at once, without arming the chip's alarm,
+    // which would match next month.
+    clock.set_alarm_ms(time_ms)!
+    core.assert(clock.alarm_fired()!)
+    chip = clock.release()
+    core.assert(chip.register(0x0E) == 0x1C && chip.register(0x0F) == 0)
+    clock = ds3231.Clock.new(chip)
+    clock.set_alarm_ms(time_ms + 89_500)!
+    core.assert(!clock.alarm_fired()!)
+    chip = clock.release()
+    alarm: [4]u8 = [0x26, 0x36, 0x12, 0x01]
+    for index in 0usize..4 {
+        core.assert_eq(chip.register((7 + index) as u8), alarm[index])
+    }
+    core.assert_eq(chip.register(0x0E), 0x1Du8)
+    // The chip matches and raises its flag.
+    chip.set_register(0x0F, 0x01)
+    clock = ds3231.Clock.new(chip)
+    // A new driver does not know the alarm is armed.
+    core.assert(!clock.alarm_fired()!)
+    hal.rtc_alarm_in(&mut clock, 2000)!
+    chip = clock.release()
+    core.assert_eq(chip.register(0x0F), 0u8)
+    chip.set_register(0x0F, 0x01)
+    clock = ds3231.Clock.new(chip)
+    clock.set_alarm_ms(time_ms + 5000)!
+    core.assert(!clock.alarm_fired()!)
+    // The time set past the alarm fires it, without the flag.
+    clock.set_ms(time_ms + 10_000)!
+    core.assert(clock.alarm_fired()!)
+    clock.clear_alarm()!
+    core.assert(!clock.alarm_fired()!)
+    chip = clock.release()
+    core.assert(chip.register(0x0E) == 0x1C && chip.register(0x0F) == 0)
+
+    // Years outside 2000 to 2099.
+    clock = ds3231.Clock.new(chip)
+    expect_error(clock.set_ms(unix_ms(2100, 1, 1, 0, 0, 0)), hal.Error.InvalidInput)
+    expect_error(clock.set_ms(unix_ms(1999, 12, 31, 23, 59, 59)), hal.Error.InvalidInput)
+    clock.set_ms(unix_ms(2099, 12, 31, 23, 59, 59))!
+    now := hal.rtc_now(&mut clock)!
+    core.assert(now.date().year() == 2099 && now.date().month() == 12 && now.date().day() == 31)
+
+    // The temperature, in quarters of a degree: 25.25 C and -0.25 C.
+    chip = clock.release()
+    chip.set_register(0x11, 0x19)
+    chip.set_register(0x12, 0x40)
+    clock = ds3231.Clock.new(chip)
+    core.assert_eq(clock.temperature_quarters()!, 101)
+    chip = clock.release()
+    chip.set_register(0x11, 0xFF)
+    chip.set_register(0x12, 0xC0)
+    // A bus error passes through.
+    chip.fail_next(hal.Error.NoAcknowledge)
+    clock = ds3231.Clock.new(chip)
+    expect_time_error(clock.now_ms(), hal.Error.NoAcknowledge)
+    core.assert_eq(clock.temperature_quarters()!, -1)
+    // Nothing answers at another address.
+    other := ds3231.Clock.new(fake.I2c.new(0x57))
+    expect_time_error(other.now_ms(), hal.Error.NoAcknowledge)
+}
+
+fn main() {
+    calendar_conversions()
+    fake_clocks()
+    calendar_rtc()
+    aon_timer()
+    ds3231_clock()
+}
