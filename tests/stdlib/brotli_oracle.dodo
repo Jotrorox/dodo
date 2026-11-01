@@ -8,7 +8,8 @@ import "std/console"
 // decompressed data goes to stdout. Modes: 0 decompress_with_workspace
 // (WORKSPACE_LEN words), 1 decompress (stack workspace), 2 Decoder with a
 // ring of the given length (0 means window_len(input)) read in 777-byte
-// pieces, 3 decompressed_size (prints the size as 8 little-endian bytes).
+// pieces, 3 decompressed_size (prints the size as 8 little-endian bytes),
+// 4 decompress_with_workspace with a workspace of the given length.
 // Errors exit with 10 plus the error's position in brotli.Error.
 
 static mut INPUT: [33554432]u8 = [0u8; 33554432]
@@ -81,6 +82,19 @@ fn run(input: &mut[u8], output: &mut[u8], window: &mut[u8], words: &mut[u16]) ->
     stream := &input[5..used]
     if mode == 0 {
         match brotli.decompress_with_workspace(stream, output, words) {
+            ok(n) => {
+                return emit(&output[..n])
+            }
+            err(e) => {
+                return code(e)
+            }
+        }
+    }
+    if mode == 4 {
+        if ring > words.len {
+            return 3
+        }
+        match brotli.decompress_with_workspace(stream, output, &mut words[..ring]) {
             ok(n) => {
                 return emit(&output[..n])
             }

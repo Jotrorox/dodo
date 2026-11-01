@@ -1,0 +1,386 @@
+package brotli_test
+
+import "std/checksum"
+import "std/compress/brotli"
+import "std/fs"
+import "std/platform"
+import "std/platform/error"
+import "std/text"
+
+// std/compress/brotli against the fixtures in this directory, written by
+// tests/compress/brotli/generate.py with the brotli tool (qualities 0 to 11,
+// window sizes 10 to 24, text that uses the static dictionary, binary,
+// random and repetitive data, multi-meta-block streams) plus hand-written
+// streams. Every decoding path must reproduce the original's length and
+// CRC-32 or fail with the recorded error; truncated, corrupted and random
+// streams must fail cleanly.
+//
+// Run from the repository root: dodo test tests/compress/brotli
+
+const FILE_LIMIT: usize = 1048576
+const OUTPUT_LIMIT: usize = 18874368
+
+static mut INPUT: [FILE_LIMIT]u8 = [0u8; FILE_LIMIT]
+static mut OUTPUT: [OUTPUT_LIMIT]u8 = [0u8; OUTPUT_LIMIT]
+static mut WINDOW: [brotli.MAX_WINDOW_LEN]u8 = [0u8; brotli.MAX_WINDOW_LEN]
+static mut WORDS: [brotli.WORKSPACE_LEN]u16 = [0u16; brotli.WORKSPACE_LEN]
+
+fn read_fixture(name: &str, output: &mut[u8]) -> usize {
+    path_storage := [0u8; 256]
+    builder := text.Builder.new(&mut path_storage)
+    directory := text.Text.from_str("tests/compress/brotli/")
+    builder.append(&directory)!
+    base := text.Text.from_str(name)
+    builder.append(&base)!
+    suffix := text.Text.from_str(".br")
+    builder.append(&suffix)!
+    built := builder.as_text()
+    workspace := platform.workspace()
+    match fs.read_file(built.as_str(), output, &mut workspace) {
+        ok(report) => {
+            assert(report.eof, "fixture larger than the test's buffer")
+            return report.read
+        }
+        err(reason) => {
+            assert(reason.cause.kind != error.Kind.NotFound, "fixture missing: run from the repository root, or run tests/compress/brotli/generate.py")
+            assert(false, "fixture unreadable")
+            return 0
+        }
+    }
+}
+
+// 1 + the position of e in brotli.Error, as in cases.dodo.
+fn outcome(e: brotli.Error) -> u8 {
+    match e {
+        brotli.Error.Truncated => {
+            return 1
+        }
+        brotli.Error.InvalidData => {
+            return 2
+        }
+        brotli.Error.OutputFull => {
+            return 3
+        }
+        brotli.Error.WindowTooSmall => {
+            return 4
+        }
+        brotli.Error.WorkspaceTooSmall => {
+            return 5
+        }
+        brotli.Error.Unsupported => {
+            return 6
+        }
+    }
+}
+
+fn same(a: &str, b: &str) -> bool {
+    x := text.Text.from_str(a)
+    y := text.Text.from_str(b)
+    p := x.as_bytes()
+    q := y.as_bytes()
+    if p.len != q.len {
+        return false
+    }
+    for i in 0usize..p.len {
+        if p[i] != q[i] {
+            return false
+        }
+    }
+    return true
+}
+
+fn index_of(name: &str) -> usize {
+    for i in 0usize..CASE_COUNT {
+        if same(CASE_FILES[i], name) {
+            return i
+        }
+    }
+    assert(false, "unknown case")
+    return 0
+}
+
+fn one_shot(input: &mut[u8], output: &mut[u8], words: &mut[u16]) {
+    for i in 0usize..CASE_COUNT {
+        size := read_fixture(CASE_FILES[i], input)
+        data := &input[..size]
+        match brotli.decompress_with_workspace(data, output, words) {
+            ok(n) => {
+                assert(CASE_OUTCOME[i] == 0, CASE_FILES[i])
+                assert(n == CASE_LENGTH[i], CASE_FILES[i])
+                assert(checksum.crc32(&output[..n]) == CASE_CRC[i], CASE_FILES[i])
+            }
+            err(e) => {
+                assert(outcome(e) == CASE_OUTCOME[i], CASE_FILES[i])
+            }
+        }
+    }
+}
+
+@test
+fn fixtures_decompress() {
+    unsafe {
+        one_shot(&mut INPUT, &mut OUTPUT, &mut WORDS)
+    }
+}
+
+fn stack_one_shot(input: &mut[u8], output: &mut[u8]) {
+    for i in 0usize..CASE_COUNT {
+        if CASE_OUTCOME[i] != 0 {
+            continue
+        }
+        size := read_fixture(CASE_FILES[i], input)
+        n := brotli.decompress(&input[..size], output)!
+        assert(n == CASE_LENGTH[i] && checksum.crc32(&output[..n]) == CASE_CRC[i], CASE_FILES[i])
+    }
+}
+
+@test
+fn fixtures_decompress_stack_workspace() {
+    unsafe {
+        stack_one_shot(&mut INPUT, &mut OUTPUT)
+    }
+}
+
+// Decoder with a ring of window_len() bytes, read in pieces of varying
+// size; decompressed_size() through the same window.
+fn streamed(input: &mut[u8], window: &mut[u8], words: &mut[u16]) {
+    pieces := [1usize, 7, 777, 65536, 3, 100000]
+    for i in 0usize..CASE_COUNT {
+        if CASE_OUTCOME[i] != 0 {
+            continue
+        }
+        size := read_fixture(CASE_FILES[i], input)
+        data := &input[..size]
+        ring := brotli.window_len(data)!
+        assert(ring <= brotli.MAX_WINDOW_LEN, CASE_FILES[i])
+        decoder := brotli.Decoder.new(data, &mut window[..ring], words)!
+        crc := checksum.Crc32.new()
+        total := 0usize
+        piece := [0u8; 100000]
+        turn := 0usize
+        for {
+            want := pieces[turn % pieces.len]
+            turn += 1
+            n := decoder.read(&mut piece[..want])!
+            if n == 0 {
+                break
+            }
+            crc.update(&piece[..n])
+            total += n
+        }
+        assert(decoder.is_done(), CASE_FILES[i])
+        assert(decoder.input_consumed() == size, CASE_FILES[i])
+        assert(total == CASE_LENGTH[i] && crc.finish() == CASE_CRC[i], CASE_FILES[i])
+        counted := brotli.decompressed_size(data, &mut window[..ring], words)!
+        assert(counted == CASE_LENGTH[i], CASE_FILES[i])
+    }
+}
+
+@test
+fn fixtures_streamed() {
+    unsafe {
+        streamed(&mut INPUT, &mut WINDOW, &mut WORDS)
+    }
+}
+
+fn limits(input: &mut[u8], output: &mut[u8], window: &mut[u8], words: &mut[u16]) {
+    // A window-size-10 stream decodes through a ring of exactly 1 KiB, and
+    // a ring smaller than its sliding window fails once data wraps.
+    w10 := index_of("text_w10_q9")
+    size := read_fixture("text_w10_q9", input)
+    data := &input[..size]
+    assert(brotli.window_len(data)! == 1024)
+    small := brotli.decompressed_size(data, &mut window[..1024], words)!
+    assert(small == CASE_LENGTH[w10])
+    match brotli.decompressed_size(data, &mut window[..1000], words) {
+        ok(_) => {
+            assert(false, "ring below the sliding window accepted")
+        }
+        err(e) => {
+            assert(outcome(e) == 4)
+        }
+    }
+    // Output one byte short, and a workspace too small for the tables.
+    match brotli.decompress_with_workspace(data, &mut output[..CASE_LENGTH[w10] - 1], words) {
+        ok(_) => {
+            assert(false, "short output accepted")
+        }
+        err(e) => {
+            assert(outcome(e) == 3)
+        }
+    }
+    match brotli.decompress_with_workspace(data, output, &mut words[..300]) {
+        ok(_) => {
+            assert(false, "tiny workspace accepted")
+        }
+        err(e) => {
+            assert(outcome(e) == 5)
+        }
+    }
+    // A single-meta-block stream needs a window of its length only.
+    short := index_of("short_q11")
+    size = read_fixture("short_q11", input)
+    assert(brotli.window_len(&input[..size])! == CASE_LENGTH[short])
+    // Trailing bytes: one-shot calls reject them, Decoder stops before.
+    input[size] = 0x55
+    match brotli.decompress_with_workspace(&input[..size + 1], output, words) {
+        ok(_) => {
+            assert(false, "trailing byte accepted")
+        }
+        err(e) => {
+            assert(outcome(e) == 2)
+        }
+    }
+    decoder := brotli.Decoder.new(&input[..size + 1], &mut window[..65536], words)!
+    n := decoder.read(&mut output[..65536])!
+    assert(n == CASE_LENGTH[short])
+    assert(decoder.input_consumed() == size)
+    // Errors are final.
+    bad := read_fixture("crafted_padding", input)
+    broken := brotli.Decoder.new(&input[..bad], &mut window[..65536], words)!
+    first := broken.read(&mut output[..16])
+    second := broken.read(&mut output[..16])
+    match first {
+        ok(_) => {
+            assert(false, "nonzero padding accepted")
+        }
+        err(e) => {
+            assert(outcome(e) == 2)
+        }
+    }
+    match second {
+        ok(_) => {
+            assert(false, "decoder recovered from an error")
+        }
+        err(e) => {
+            assert(outcome(e) == 2)
+        }
+    }
+}
+
+@test
+fn limits_and_trailing_data() {
+    unsafe {
+        limits(&mut INPUT, &mut OUTPUT, &mut WINDOW, &mut WORDS)
+    }
+}
+
+fn truncated(input: &mut[u8], output: &mut[u8], window: &mut[u8], words: &mut[u16]) {
+    names := ["short_q5", "short_q11", "short_binary_q9", "crafted_meta", "byte_q11", "random_q11"]
+    for k in 0usize..names.len {
+        size := read_fixture(names[k], input)
+        for cut in 0usize..size {
+            prefix := &input[..cut]
+            match brotli.decompress_with_workspace(prefix, &mut output[..65536], words) {
+                ok(_) => {
+                    assert(false, "truncated stream accepted")
+                }
+                err(e) => {
+                    code := outcome(e)
+                    assert(code == 1 || code == 2, names[k])
+                }
+            }
+            match brotli.Decoder.new(prefix, &mut window[..65536], words) {
+                ok(decoder) => {
+                    for {
+                        match decoder.read(&mut output[..1000]) {
+                            ok(n) => {
+                                assert(n > 0, "truncated stream ended cleanly")
+                            }
+                            err(_) => {
+                                break
+                            }
+                        }
+                    }
+                }
+                err(_) => {}
+            }
+        }
+    }
+}
+
+@test
+fn every_prefix_fails() {
+    unsafe {
+        truncated(&mut INPUT, &mut OUTPUT, &mut WINDOW, &mut WORDS)
+    }
+}
+
+fn next_random(state: &mut u64) -> u64 {
+    x := *state
+    x = x ^ ((x & 0x0007ffffffffffff) << 13)
+    x = x ^ (x >> 7)
+    x = x ^ ((x & 0x00007fffffffffff) << 17)
+    *state = x
+    return x
+}
+
+// Random bit flips and random bytes must decode or fail, never trap or
+// hang; successful decodes stay within the output buffer.
+fn corrupted(input: &mut[u8], output: &mut[u8], window: &mut[u8], words: &mut[u16]) {
+    state := 0x9e3779b97f4a7c15u64
+    names := ["short_q5", "short_q11", "short_binary_q9", "text_q2", "random_q5"]
+    copy := [0u8; 65536]
+    for k in 0usize..names.len {
+        size := read_fixture(names[k], input)
+        for round in 0usize..400 {
+            for i in 0usize..size {
+                copy[i] = input[i]
+            }
+            flips := 1 + (next_random(&mut state) % 4) as usize
+            for f in 0usize..flips {
+                at := (next_random(&mut state) % size as u64) as usize
+                bit := (next_random(&mut state) % 8) as u8
+                copy[at] = copy[at] ^ (1u8 << bit)
+            }
+            if round % 2 == 0 {
+                match brotli.decompress_with_workspace(&copy[..size], &mut output[..131072], words) {
+                    ok(n) => {
+                        assert(n <= 131072)
+                    }
+                    err(_) => {}
+                }
+            } else {
+                match brotli.Decoder.new(&copy[..size], &mut window[..4096], words) {
+                    ok(decoder) => {
+                        total := 0usize
+                        for {
+                            match decoder.read(&mut output[..999]) {
+                                ok(n) => {
+                                    if n == 0 {
+                                        break
+                                    }
+                                    total += n
+                                    assert(total <= 16777216 * 2)
+                                }
+                                err(_) => {
+                                    break
+                                }
+                            }
+                        }
+                    }
+                    err(_) => {}
+                }
+            }
+        }
+    }
+    for round in 0usize..2000 {
+        length := 1 + (next_random(&mut state) % 300) as usize
+        for i in 0usize..length {
+            copy[i] = (next_random(&mut state) & 255) as u8
+        }
+        match brotli.decompress_with_workspace(&copy[..length], &mut output[..65536], words) {
+            ok(n) => {
+                assert(n <= 65536)
+            }
+            err(_) => {}
+        }
+    }
+}
+
+@test
+fn corrupted_streams_fail_cleanly() {
+    unsafe {
+        corrupted(&mut INPUT, &mut OUTPUT, &mut WINDOW, &mut WORDS)
+    }
+}

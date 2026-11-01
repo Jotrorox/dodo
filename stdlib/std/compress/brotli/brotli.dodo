@@ -15,7 +15,7 @@ package brotli
 // code tables, context maps and the other per-meta-block state live in a
 // `u16` workspace: a meta-block needs a few thousand words for typical
 // streams and at most WORKSPACE_LEN words for any valid one. decompress()
-// keeps STACK_WORKSPACE_LEN words (64 KiB) on the stack; streams that need
+// keeps STACK_WORKSPACE_LEN words (256 KiB) on the stack; streams that need
 // more fail with WorkspaceTooSmall, and decompress_with_workspace() or
 // Decoder take a caller workspace of any size instead.
 //
@@ -49,12 +49,12 @@ pub enum Error {
 // and the literal context modes.
 pub const WORKSPACE_LEN: usize = 690956
 // Workspace words decompress() keeps on the stack.
-pub const STACK_WORKSPACE_LEN: usize = 32768
+pub const STACK_WORKSPACE_LEN: usize = 131072
 // The largest sliding window, for window size 24.
 pub const MAX_WINDOW_LEN: usize = 16777216
 
 // Decompresses one stream into output and returns its length. The output
-// buffer is also the window, so no other memory is needed beyond 64 KiB of
+// buffer is also the window, so no other memory is needed beyond 256 KiB of
 // stack workspace (see STACK_WORKSPACE_LEN). Input after the end of the
 // stream is InvalidData. On error the output contents are unspecified.
 pub fn decompress(input: &[u8], output: &mut[u8]) -> usize!Error {
