@@ -30,6 +30,8 @@ const IO_BUFFER_SIZE: i64 = 1024
 const IO_MAX_LINE_FORMATS: i32 = 250
 const IO_MAX_NUMERAL: usize = 200
 const IO_EOF: i32 = -1
+// Byte counts from here on cannot be allocated (beyond 48-bit addresses).
+const IO_MAX_READ: u64 = 0x1000000000000
 
 // The userdata block of a file handle.
 struct IoStream {
@@ -307,6 +309,11 @@ fn io_read_all(cx: &mut Cx, f: *mut u8) -> void!Throw {
 // Read up to n bytes and push them; false if nothing could be read.
 fn io_read_chars(cx: &mut Cx, f: *mut u8, n: u64) -> bool!Throw {
     unsafe {
+        if n >= IO_MAX_READ {
+            // The reference reserves the whole count up front, which no
+            // system can allocate (negative counts land here too).
+            return err(mem_error(cx.L))
+        }
         b := Buffer.new(cx)
         remaining := n
         total := 0usize

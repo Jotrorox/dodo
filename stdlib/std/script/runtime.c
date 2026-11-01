@@ -2,7 +2,7 @@
  * library whose names, constants or layouts differ between C libraries.
  * Compiled against the target's own headers, so the Dodo side only sees
  * portable signatures. Functions with identical names and ABIs everywhere
- * (fopen, fread, getc, strftime, getenv, ...) are declared directly in Dodo. */
+ * (fopen, fread, getc, strftime, remove, ...) are declared directly in Dodo. */
 #if !defined(_WIN32)
 #ifndef _POSIX_C_SOURCE
 #define _POSIX_C_SOURCE 200809L
@@ -160,6 +160,9 @@ int64_t dodo_script_mktime(struct tm *tm, int32_t *ok) {
 size_t dodo_script_strftime(char *out, size_t size, const char *format, const struct tm *tm) {
     return strftime(out, size, format, tm);
 }
+
+/* getenv under a private name (several Lua libraries read the environment). */
+const char *dodo_script_getenv(const char *name) { return getenv(name); }
 
 /* category: 0 all, 1 collate, 2 ctype, 3 monetary, 4 numeric, 5 time. */
 const char *dodo_script_setlocale(int32_t category, const char *locale) {

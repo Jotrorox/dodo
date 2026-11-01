@@ -9,7 +9,6 @@ import "std/script/native" as script_host
 // boundary, which also hides the per-OS differences of processes, locales
 // and temporary names.
 
-unsafe extern "C" fn getenv(name: *const u8) -> *const u8
 unsafe extern "C" fn remove(path: *const u8) -> i32
 unsafe extern "C" fn rename(from_path: *const u8, to_path: *const u8) -> i32
 unsafe extern "C" fn exit(status: i32)
@@ -98,7 +97,7 @@ fn os_exit(cx: &mut Cx) -> i32!Throw {
 fn os_getenv(cx: &mut Cx) -> i32!Throw {
     unsafe {
         let name = cx.check_lstr(1)?
-        let v = getenv(name.as_ptr())
+        let v = script_host.dodo_script_getenv(name.as_ptr())
         if ptr.is_null(v) {
             cx.push_nil()
         } else {
