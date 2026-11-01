@@ -1,0 +1,340 @@
+package lua
+
+// Differential driver for stdlib/std/script/lua/pattern.dodo. The test harness
+// (tests/lua_pattern_library.rs) appends this file to pattern.dodo, because the
+// engine's names are package-internal. Each stdin line is
+//   x<hex subject> x<hex pattern> <init>
+// and each output line is
+//   F:<string.find>|M:<string.match>|G:<string.gmatch>|S:<string.gsub "<%0>">
+// using the encoding of tests/lua_pattern/reference.lua: integers in decimal,
+// strings as s<hex>, values separated by ',', gmatch steps by ';', errors E<msg>,
+// no result N. The string-library glue here mirrors Lua 5.4.
+
+import "core/mem"
+import "core/ptr"
+import "std/console"
+import "std/io"
+
+const DRV_OUT_SIZE: usize = 65536
+
+struct DrvOut {
+    buf: [65536]u8
+    used: usize
+}
+
+fn drv_flush(o: &mut DrvOut) {
+    sink := console.stdout()
+    match io.write_all(&mut sink, &o.buf[..o.used]) {
+        ok(_) => {}, err(_) => {}
+    }
+    o.used = 0
+}
+
+fn drv_byte(o: &mut DrvOut, b: u8) {
+    if o.used == DRV_OUT_SIZE {
+        drv_flush(o)
+    }
+    o.buf[o.used] = b
+    o.used += 1
+}
+
+fn drv_text(o: &mut DrvOut, text: &str) {
+    let bytes = mem.str_bytes(text)
+    for i in 0usize..bytes.len {
+        drv_byte(o, bytes[i])
+    }
+}
+
+fn drv_int(o: &mut DrvOut, value: isize) {
+    if value < 0 {
+        drv_byte(o, b'-')
+        drv_int(o, 0 - value)
+        return
+    }
+    if value >= 10 {
+        drv_int(o, value / 10)
+    }
+    drv_byte(o, (48 + value % 10) as u8)
+}
+
+fn drv_hex_digit(v: u8) -> u8 {
+    if v < 10 {
+        return 48 + v
+    }
+    return 87 + v
+}
+
+fn drv_hex(o: &mut DrvOut, base: *const u8, start: usize, len: usize) {
+    drv_byte(o, b's')
+    for i in 0usize..len {
+        let b = pat_load(base, start + i)
+        drv_byte(o, drv_hex_digit(b >> 4))
+        drv_byte(o, drv_hex_digit(b & 15))
+    }
+}
+
+fn drv_unhex(c: u8) -> u8 {
+    if c >= b'a' {
+        return c - 87
+    }
+    return c - 48
+}
+
+// Lua's posrelatI: 1-based start from a possibly negative init.
+fn drv_posrelat(init: isize, len: usize) -> usize {
+    if init > 0 {
+        return init as usize
+    }
+    if init == 0 {
+        return 1
+    }
+    if init < 0 - (len as isize) {
+        return 1
+    }
+    return (len as isize + init + 1) as usize
+}
+
+// Emits the captures of the last match (or the whole match); false if an
+// unfinished capture means the caller must report an error instead.
+fn drv_captures_ok(m: &PatMatcher, st: usize, e: usize) -> bool {
+    let count = pat_capture_count(m)
+    cs := 0usize
+    cl := 0usize
+    for i in 0usize..count {
+        if pat_capture(m, i, st, e, &mut cs, &mut cl) == PAT_KIND_UNFINISHED {
+            return false
+        }
+    }
+    return true
+}
+
+fn drv_captures(o: &mut DrvOut, m: &PatMatcher, src: *const u8, st: usize, e: usize, leading_comma: bool) {
+    count := pat_capture_count(m)
+    if count == 0 {
+        count = 1
+    }
+    cs := 0usize
+    cl := 0usize
+    for i in 0usize..count {
+        if i > 0 || leading_comma {
+            drv_byte(o, b',')
+        }
+        let kind = pat_capture(m, i, st, e, &mut cs, &mut cl)
+        if kind == PAT_KIND_POSITION {
+            drv_int(o, (cs + 1) as isize)
+        } else {
+            drv_hex(o, src, cs, cl)
+        }
+    }
+}
+
+fn drv_error(o: &mut DrvOut, message: &str) {
+    drv_byte(o, b'E')
+    drv_text(o, message)
+}
+
+fn drv_find(o: &mut DrvOut, src: *const u8, sl: usize, pat: *const u8, pl: usize, init: isize, is_find: bool) {
+    let start = drv_posrelat(init, sl) - 1
+    if start > sl {
+        drv_byte(o, b'N')
+        return
+    }
+    if is_find && pat_is_plain(pat, pl) {
+        let at = pat_find_plain(src, sl, pat, pl, start)
+        if at < 0 {
+            drv_byte(o, b'N')
+        } else {
+            drv_int(o, at + 1)
+            drv_byte(o, b',')
+            drv_int(o, at + pl as isize)
+        }
+        return
+    }
+    let anchor = pat_anchor_offset(pat, pl)
+    m := pat_new(src, sl, pat, pl)
+    st := 0usize
+    let e = pat_search(&mut m, start, anchor, anchor == 1, -1, &mut st)
+    if e == PAT_ERROR {
+        drv_error(o, pat_error_message(&m))
+        return
+    }
+    if e == PAT_NO_MATCH {
+        drv_byte(o, b'N')
+        return
+    }
+    let end = e as usize
+    if is_find {
+        if pat_capture_count(&m) > 0 && !drv_captures_ok(&m, st, end) {
+            drv_error(o, "unfinished capture")
+            return
+        }
+        drv_int(o, (st + 1) as isize)
+        drv_byte(o, b',')
+        drv_int(o, e)
+        if pat_capture_count(&m) > 0 {
+            drv_captures(o, &m, src, st, end, true)
+        }
+        return
+    }
+    if !drv_captures_ok(&m, st, end) {
+        drv_error(o, "unfinished capture")
+        return
+    }
+    drv_captures(o, &m, src, st, end, false)
+}
+
+fn drv_gmatch(o: &mut DrvOut, src: *const u8, sl: usize, pat: *const u8, pl: usize, init: isize) {
+    pos := drv_posrelat(init, sl) - 1
+    if pos > sl {
+        pos = sl + 1
+    }
+    m := pat_new(src, sl, pat, pl)
+    last := -1isize
+    first := true
+    for pos <= sl {
+        st := 0usize
+        let e = pat_search(&mut m, pos, 0, false, last, &mut st)
+        if e == PAT_NO_MATCH {
+            return
+        }
+        if !first {
+            drv_byte(o, b';')
+        }
+        first = false
+        if e == PAT_ERROR {
+            drv_error(o, pat_error_message(&m))
+            return
+        }
+        if !drv_captures_ok(&m, st, e as usize) {
+            drv_error(o, "unfinished capture")
+            return
+        }
+        drv_captures(o, &m, src, st, e as usize, false)
+        pos = e as usize
+        last = e
+    }
+}
+
+fn drv_gsub(o: &mut DrvOut, src: *const u8, sl: usize, pat: *const u8, pl: usize, result: &mut[u8]) {
+    let anchor = pat_anchor_offset(pat, pl)
+    m := pat_new(src, sl, pat, pl)
+    used := 0usize
+    pos := 0usize
+    last := -1isize
+    count := 0isize
+    for {
+        st := 0usize
+        let e = pat_search(&mut m, pos, anchor, anchor == 1, last, &mut st)
+        if e == PAT_ERROR {
+            drv_error(o, pat_error_message(&m))
+            return
+        }
+        if e == PAT_NO_MATCH {
+            break
+        }
+        let end = e as usize
+        for i in pos..st {
+            result[used] = pat_load(src, i)
+            used += 1
+        }
+        result[used] = b'<'
+        used += 1
+        for i in st..end {
+            result[used] = pat_load(src, i)
+            used += 1
+        }
+        result[used] = b'>'
+        used += 1
+        count += 1
+        pos = end
+        last = e
+        if anchor == 1 {
+            break
+        }
+    }
+    for i in pos..sl {
+        result[used] = pat_load(src, i)
+        used += 1
+    }
+    drv_hex(o, ptr.as_ptr(result), 0, used)
+    drv_byte(o, b',')
+    drv_int(o, count)
+}
+
+fn drv_case(o: &mut DrvOut, line: &[u8], subject: &mut[u8], pattern: &mut[u8], scratch: &mut[u8]) {
+    // Fields: x<hex> x<hex> <int>
+    i := 1usize
+    sl := 0usize
+    for line[i] != b' ' {
+        subject[sl] = drv_unhex(line[i]) * 16 + drv_unhex(line[i + 1])
+        sl += 1
+        i += 2
+    }
+    i += 2
+    pl := 0usize
+    for line[i] != b' ' {
+        pattern[pl] = drv_unhex(line[i]) * 16 + drv_unhex(line[i + 1])
+        pl += 1
+        i += 2
+    }
+    i += 1
+    negative := false
+    if line[i] == b'-' {
+        negative = true
+        i += 1
+    }
+    init := 0isize
+    for i < line.len {
+        init = init * 10 + (line[i] - 48) as isize
+        i += 1
+    }
+    if negative {
+        init = 0 - init
+    }
+    let src = ptr.as_ptr(subject)
+    let pat = ptr.as_ptr(pattern)
+    drv_text(o, "F:")
+    drv_find(o, src, sl, pat, pl, init, true)
+    drv_text(o, "|M:")
+    drv_find(o, src, sl, pat, pl, init, false)
+    drv_text(o, "|G:")
+    drv_gmatch(o, src, sl, pat, pl, init)
+    drv_text(o, "|S:")
+    drv_gsub(o, src, sl, pat, pl, scratch)
+    drv_byte(o, 10)
+}
+
+fn main() -> i32 {
+    out := DrvOut { buf: [0u8; 65536], used: 0 }
+    chunk := [0u8; 65536]
+    line := [0u8; 20000]
+    subject := [0u8; 8192]
+    pattern := [0u8; 8192]
+    scratch := [0u8; 65536]
+    line_len := 0usize
+    source := console.stdin()
+    for {
+        let n = match source.read(&mut chunk) {
+            ok(n) => {
+                n
+            }, err(_) => {
+                return 1
+            }
+        }
+        if n == 0 {
+            break
+        }
+        for k in 0usize..n {
+            let b = chunk[k]
+            if b == 10 {
+                drv_case(&mut out, &line[..line_len], &mut subject, &mut pattern, &mut scratch)
+                line_len = 0
+            } else {
+                line[line_len] = b
+                line_len += 1
+            }
+        }
+    }
+    drv_flush(&mut out)
+    return 0
+}
