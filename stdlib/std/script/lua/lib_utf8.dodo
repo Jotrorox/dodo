@@ -1,5 +1,6 @@
 package lua
 
+import "core/mem"
 import "core/ptr"
 
 // The utf8 library (reference manual section 6.5). Sequences of up to six
@@ -101,18 +102,22 @@ fn utf8_encode(out: *mut u8, x: u32) -> usize {
 
 fn utf8_char(cx: &mut Cx) -> i32!Throw {
     let n = cx.get_top()
-    b := Buffer.new(cx)
+    stk := mem.uninit::<[256]u8>()
+    b := SlBuf.new(cx.L, unsafe {
+        mem.uninit_as_mut_ptr(&mut stk) as *mut u8
+    }, 256)
     for i in 1i32..(n + 1) {
         c := 0i64
         sl_arg_int(cx, i, &mut c)?
         if num_i64_as_u64(c) > UTF8_MAXUTF as u64 {
             return err(cx.arg_error(i, "value out of range"))
         }
-        let dst = b.prepare(8)?
+        dst := sl_null_mut()
+        b.room(8, &mut dst)?
         let k = utf8_encode(dst, c as u32)
         b.add_size(k)
     }
-    b.push_result(cx)?
+    b.push(cx)?
     return ok(1)
 }
 
@@ -138,6 +143,11 @@ fn utf8_len(cx: &mut Cx) -> i32!Throw {
     n := 0i64
     code := 0u32
     for posi <= posj {
+        if sl_load(s, posi as usize) < 0x80 {
+            posi += 1
+            n += 1
+            continue
+        }
         let next = utf8_decode(s, posi as usize, !lax, &mut code)
         if next < 0 {
             cx.push_fail()

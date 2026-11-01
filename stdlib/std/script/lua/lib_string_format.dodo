@@ -1,5 +1,6 @@
 package lua
 
+import "core/mem"
 import "core/ptr"
 
 // string.format (reference manual section 6.4): C printf conversions over
@@ -140,7 +141,7 @@ fn sf_bad_spec(cx: &mut Cx, spec: *const u8, count: usize) -> Throw {
 }
 
 // Append text padded with spaces to `width` (left-justified with '-').
-fn sf_add_padded(b: &mut Buffer, p: *const u8, n: usize, flags: u32, width: i32) -> void!Throw {
+fn sf_add_padded(b: &mut SlBuf, p: *const u8, n: usize, flags: u32, width: i32) -> void!Throw {
     pad := 0usize
     if width > 0 && (width as usize) > n {
         pad = width as usize - n
@@ -160,7 +161,7 @@ fn sf_add_padded(b: &mut Buffer, p: *const u8, n: usize, flags: u32, width: i32)
 }
 
 // %q of a string: quoted so that Lua reads it back.
-fn sf_add_quoted(b: &mut Buffer, s: *const u8, n: usize) -> void!Throw {
+fn sf_add_quoted(b: &mut SlBuf, s: *const u8, n: usize) -> void!Throw {
     b.add_char(b'"')?
     run := 0usize
     i := 0usize
@@ -193,7 +194,7 @@ fn sf_add_quoted(b: &mut Buffer, s: *const u8, n: usize) -> void!Throw {
 }
 
 // %q: a literal for strings, numbers, nil and booleans.
-fn sf_add_literal(cx: &mut Cx, b: &mut Buffer, arg: i32, tmp: &mut[u8]) -> void!Throw {
+fn sf_add_literal(cx: &mut Cx, b: &mut SlBuf, arg: i32) -> void!Throw {
     unsafe {
         let v = cx.idx2val(arg)
         let t = (*v).tag
@@ -206,7 +207,7 @@ fn sf_add_literal(cx: &mut Cx, b: &mut Buffer, arg: i32, tmp: &mut[u8]) -> void!
             if n == -9223372036854775807 - 1 {
                 return b.add_str("0x8000000000000000")
             }
-            return b.add_integer(n)
+            return b.add_int(n)
         }
         if t == TAG_FLOAT {
             let f = val_float(v)
@@ -219,8 +220,7 @@ fn sf_add_literal(cx: &mut Cx, b: &mut Buffer, arg: i32, tmp: &mut[u8]) -> void!
             if f == -1.0 / 0.0 {
                 return b.add_str("-1e9999")
             }
-            let k = num_format_float(tmp, f, b'a', 0, -1, -1)
-            return b.add_raw(ptr.as_ptr(tmp), k)
+            return b.add_fmt_float(f, b'a', 0, -1, -1)
         }
         let ty = cx.type_of(arg)
         if ty == TNIL || ty == TBOOLEAN {
@@ -239,8 +239,17 @@ fn strlib_format(cx: &mut Cx) -> i32!Throw {
     fmt := sl_null()
     fl := 0usize
     sl_arg_str(cx, 1, &mut fmt, &mut fl)?
-    b := Buffer.new(cx)
-    tmp := [0u8; 512]
+    stk := mem.uninit::<[1024]u8>()
+    b := SlBuf.new(cx.L, unsafe {
+        mem.uninit_as_mut_ptr(&mut stk) as *mut u8
+    }, 1024)
+    let tskey = unsafe {
+        val_str(cx.idx2val(upvalue_index(1)))
+    }
+    nb := mem.uninit::<[64]u8>()
+    let numbuf = unsafe {
+        mem.uninit_as_mut_ptr(&mut nb) as *mut u8
+    }
     i := 0usize
     for i < fl {
         let q = sl_find_byte(fmt, i, fl, b'%')
@@ -289,19 +298,22 @@ fn strlib_format(cx: &mut Cx) -> i32!Throw {
             if !sf_check(spec, count, allowed, true, &mut flags, &mut width, &mut prec) {
                 return err(sf_bad_spec(cx, spec, count))
             }
-            let n = num_format_int(&mut tmp, v, conv, flags, width, prec)
-            b.add_raw(ptr.as_ptr(&tmp), n)?
+            b.add_fmt_int(v, conv, flags, width, prec)?
         } else if conv == b'f' || conv == b'e' || conv == b'E' || conv == b'g' || conv == b'G' {
             let v = cx.check_number(arg)?
             if !sf_check(spec, count, SF_FLAGS_FLOAT, true, &mut flags, &mut width, &mut prec) {
                 return err(sf_bad_spec(cx, spec, count))
             }
-            let n = num_format_float(&mut tmp, v, conv, flags, width, prec)
-            b.add_raw(ptr.as_ptr(&tmp), n)?
+            b.add_fmt_float(v, conv, flags, width, prec)?
         } else if conv == b's' {
-            let s = cx.to_lstring_meta(arg)?
-            let sp = s.as_ptr()
-            let sn = s.size()
+            sp := sl_null()
+            sn := 0usize
+            let fast = sf_plain_tostring(cx, arg, tskey, numbuf, &mut sp, &mut sn)
+            if !fast {
+                let s = cx.to_lstring_meta(arg)?
+                sp = s.as_ptr()
+                sn = s.size()
+            }
             if span == 0 {
                 b.add_raw(sp, sn)?
             } else {
@@ -311,40 +323,36 @@ fn strlib_format(cx: &mut Cx) -> i32!Throw {
                 if !sf_check(spec, count, SF_FLAGS_CHAR, true, &mut flags, &mut width, &mut prec) {
                     return err(sf_bad_spec(cx, spec, count))
                 }
-                if prec < 0 {
-                    // (Strings of 100 or more bytes are never padded: widths
-                    // have at most two digits.)
-                    sf_add_padded(&mut b, sp, sn, flags, width)?
+                // (Without a precision, strings of 100 or more bytes are kept
+                // whole; widths have at most two digits, so no padding applies.)
+                let keep = if prec >= 0 && (prec as usize) < sn {
+                    prec as usize
                 } else {
-                    let keep = if (prec as usize) < sn {
-                        prec as usize
-                    } else {
-                        sn
-                    }
-                    sf_add_padded(&mut b, sp, keep, flags, width)?
+                    sn
                 }
+                sf_add_padded(&mut b, sp, keep, flags, width)?
             }
-            cx.pop(1)
+            if !fast {
+                cx.pop(1)
+            }
         } else if conv == b'c' {
             if !sf_check(spec, count, SF_FLAGS_CHAR, false, &mut flags, &mut width, &mut prec) {
                 return err(sf_bad_spec(cx, spec, count))
             }
             v := 0i64
             sl_arg_int(cx, arg, &mut v)?
-            let n = num_format_int(&mut tmp, v, b'c', flags, width, -1)
-            b.add_raw(ptr.as_ptr(&tmp), n)?
+            b.add_fmt_int(v, b'c', flags, width, -1)?
         } else if conv == b'a' || conv == b'A' {
             if !sf_check(spec, count, SF_FLAGS_FLOAT, true, &mut flags, &mut width, &mut prec) {
                 return err(sf_bad_spec(cx, spec, count))
             }
             let v = cx.check_number(arg)?
-            let n = num_format_float(&mut tmp, v, conv, flags, width, prec)
-            b.add_raw(ptr.as_ptr(&tmp), n)?
+            b.add_fmt_float(v, conv, flags, width, prec)?
         } else if conv == b'q' {
             if span != 0 {
                 return err(cx.error_msg("specifier '%q' cannot have modifiers"))
             }
-            sf_add_literal(cx, &mut b, arg, &mut tmp)?
+            sf_add_literal(cx, &mut b, arg)?
         } else if conv == b'p' {
             let pv = cx.to_pointer(arg)
             if !sf_check(spec, count, SF_FLAGS_CHAR, false, &mut flags, &mut width, &mut prec) {
@@ -353,13 +361,46 @@ fn strlib_format(cx: &mut Cx) -> i32!Throw {
             if ptr.is_null(pv) {
                 sf_add_padded(&mut b, ptr.as_ptr(b"(null)"), 6, flags, width)?
             } else {
-                let n = fmt_pointer(&mut tmp, unsafe { pv as *mut u8 })
-                sf_add_padded(&mut b, ptr.as_ptr(&tmp), n, flags, width)?
+                let n = unsafe {
+                    fmt_pointer(ptr.borrow_slice_mut(numbuf, 64, &mut nb), pv as *mut u8)
+                }
+                sf_add_padded(&mut b, unsafe {
+                    numbuf as *const u8
+                }, n, flags, width)?
             }
         } else {
             return err(sf_spec_error(cx, "invalid conversion '", spec, count, "' to 'format'"))
         }
     }
-    b.push_result(cx)?
+    b.push(cx)?
     return ok(1)
+}
+
+// The `tostring` text of a string or number argument when no __tostring
+// metamethod applies (key is the interned "__tostring"); numbers are written
+// to numbuf (64 bytes). False for other values: use to_lstring_meta.
+fn sf_plain_tostring(cx: &mut Cx, arg: i32, key: *mut LString, numbuf: *mut u8, p: &mut *const u8, n: &mut usize) -> bool {
+    unsafe {
+        let v = cx.idx2val(arg)
+        let t = (*v).tag
+        if (t & 15) != TYPE_STRING && (t & 15) != TYPE_NUMBER {
+            return false
+        }
+        let mt = meta_get_metatable(G(cx.L), v)
+        if !ptr.is_null(mt) && ((*tab_get_shortstr(mt, key)).tag & 15) != TYPE_NIL {
+            return false
+        }
+        if t == TAG_INT {
+            *n = num_int_to_string(ptr.borrow_slice_mut(numbuf, 64, cx), val_int(v))
+            *p = numbuf as *const u8
+        } else if t == TAG_FLOAT {
+            *n = num_float_to_string(ptr.borrow_slice_mut(numbuf, 64, cx), val_float(v))
+            *p = numbuf as *const u8
+        } else {
+            let s = val_str(v)
+            *p = str_data(s) as *const u8
+            *n = (*s).length
+        }
+        return true
+    }
 }

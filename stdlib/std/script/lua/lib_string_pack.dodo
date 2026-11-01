@@ -1,5 +1,6 @@
 package lua
 
+import "core/mem"
 import "core/ptr"
 
 // string.pack, string.packsize and string.unpack (reference manual 6.4.2).
@@ -87,71 +88,107 @@ fn pk_option(cx: &mut Cx, st: &mut PkState, kind: &mut u32, size: &mut i32) -> v
     st.at += 1
     *size = 0
     *kind = PK_NOP
-    if opt == b'b' {
-        *size = 1
-        *kind = PK_INT
-    } else if opt == b'B' {
-        *size = 1
-        *kind = PK_UINT
-    } else if opt == b'h' {
-        *size = 2
-        *kind = PK_INT
-    } else if opt == b'H' {
-        *size = 2
-        *kind = PK_UINT
-    } else if opt == b'l' || opt == b'j' {
-        *size = 8
-        *kind = PK_INT
-    } else if opt == b'L' || opt == b'J' || opt == b'T' {
-        *size = 8
-        *kind = PK_UINT
-    } else if opt == b'f' {
-        *size = 4
-        *kind = PK_FLOAT
-    } else if opt == b'n' {
-        *size = 8
-        *kind = PK_NUMBER
-    } else if opt == b'd' {
-        *size = 8
-        *kind = PK_DOUBLE
-    } else if opt == b'i' {
-        pk_size_limit(cx, st, 4, size)?
-        *kind = PK_INT
-    } else if opt == b'I' {
-        pk_size_limit(cx, st, 4, size)?
-        *kind = PK_UINT
-    } else if opt == b's' {
-        pk_size_limit(cx, st, 8, size)?
-        *kind = PK_STRING
-    } else if opt == b'c' {
-        let n = pk_number(st, -1)
-        if n == -1 {
-            return err(cx.error_msg("missing size for format option 'c'"))
-        }
-        *size = n
-        *kind = PK_CHAR
-    } else if opt == b'z' {
-        *kind = PK_ZSTR
-    } else if opt == b'x' {
-        *size = 1
-        *kind = PK_PADDING
-    } else if opt == b'X' {
-        *kind = PK_PADDALIGN
-    } else if opt == b' ' {
-    } else if opt == b'<' || opt == b'=' {
-        st.little = true
-    } else if opt == b'>' {
-        st.little = false
-    } else if opt == b'!' {
-        ma := 0i32
-        pk_size_limit(cx, st, PK_NATIVE_ALIGN, &mut ma)?
-        st.maxalign = ma
-    } else {
-        b := Buffer.new(cx)
-        b.add_str("invalid format option '")?
-        b.add_char(opt)?
-        b.add_str("'")?
-        return err(cx.error_buffer(&mut b))
+    match opt {
+        b'b' => {
+            *size = 1
+            *kind = PK_INT
+        },
+        b'B' => {
+            *size = 1
+            *kind = PK_UINT
+        },
+        b'h' => {
+            *size = 2
+            *kind = PK_INT
+        },
+        b'H' => {
+            *size = 2
+            *kind = PK_UINT
+        },
+        b'l' => {
+            *size = 8
+            *kind = PK_INT
+        },
+        b'j' => {
+            *size = 8
+            *kind = PK_INT
+        },
+        b'L' => {
+            *size = 8
+            *kind = PK_UINT
+        },
+        b'J' => {
+            *size = 8
+            *kind = PK_UINT
+        },
+        b'T' => {
+            *size = 8
+            *kind = PK_UINT
+        },
+        b'f' => {
+            *size = 4
+            *kind = PK_FLOAT
+        },
+        b'n' => {
+            *size = 8
+            *kind = PK_NUMBER
+        },
+        b'd' => {
+            *size = 8
+            *kind = PK_DOUBLE
+        },
+        b'i' => {
+            pk_size_limit(cx, st, 4, size)?
+            *kind = PK_INT
+        },
+        b'I' => {
+            pk_size_limit(cx, st, 4, size)?
+            *kind = PK_UINT
+        },
+        b's' => {
+            pk_size_limit(cx, st, 8, size)?
+            *kind = PK_STRING
+        },
+        b'c' => {
+            let n = pk_number(st, -1)
+            if n == -1 {
+                return err(cx.error_msg("missing size for format option 'c'"))
+            }
+            *size = n
+            *kind = PK_CHAR
+        },
+        b'z' => {
+            *kind = PK_ZSTR
+        },
+        b'x' => {
+            *size = 1
+            *kind = PK_PADDING
+        },
+        b'X' => {
+            *kind = PK_PADDALIGN
+        },
+        b' ' => {},
+        b'<' => {
+            st.little = true
+        },
+        b'=' => {
+            st.little = true
+        },
+        b'>' => {
+            st.little = false
+        },
+        b'!' => {
+            ma := 0i32
+            pk_size_limit(cx, st, PK_NATIVE_ALIGN, &mut ma)?
+            st.maxalign = ma
+        },
+        _ => {
+            b := Buffer.new(cx)
+            b.add_str("invalid format option '")?
+            b.add_char(opt)?
+            b.add_str("'")?
+            return err(cx.error_buffer(&mut b))
+        },
     }
     return ok()
 }
@@ -187,8 +224,9 @@ fn pk_details(cx: &mut Cx, st: &mut PkState, total: usize, kind: &mut u32, size:
 
 // Append `size` bytes of the integer n (two's complement, sign-extended past
 // 8 bytes when neg).
-fn pk_add_int(b: &mut Buffer, n: u64, little: bool, size: usize, neg: bool) -> void!Throw {
-    let dst = b.prepare(size)?
+fn pk_add_int(b: &mut SlBuf, n: u64, little: bool, size: usize, neg: bool) -> void!Throw {
+    dst := sl_null_mut()
+    b.room(size, &mut dst)?
     v := n
     for i in 0usize..size {
         byte := 0u8
@@ -208,11 +246,12 @@ fn pk_add_int(b: &mut Buffer, n: u64, little: bool, size: usize, neg: bool) -> v
     return ok()
 }
 
-fn pk_add_zeros(b: &mut Buffer, n: usize) -> void!Throw {
+fn pk_add_zeros(b: &mut SlBuf, n: usize) -> void!Throw {
     if n == 0 {
         return ok()
     }
-    let dst = b.prepare(n)?
+    dst := sl_null_mut()
+    b.room(n, &mut dst)?
     unsafe {
         ptr.write_bytes(dst, 0u8, n)
     }
@@ -221,7 +260,7 @@ fn pk_add_zeros(b: &mut Buffer, n: usize) -> void!Throw {
 }
 
 // Append the low `size` bytes of bits (8 or 4 bytes of a float).
-fn pk_add_bits(b: &mut Buffer, bits: u64, little: bool, size: usize) -> void!Throw {
+fn pk_add_bits(b: &mut SlBuf, bits: u64, little: bool, size: usize) -> void!Throw {
     return pk_add_int(b, bits, little, size, false)
 }
 
@@ -275,7 +314,10 @@ fn strlib_pack(cx: &mut Cx) -> i32!Throw {
     st := pk_state(fp, fl)
     arg := 1i32
     total := 0usize
-    b := Buffer.new(cx)
+    stk := mem.uninit::<[256]u8>()
+    b := SlBuf.new(cx.L, unsafe {
+        mem.uninit_as_mut_ptr(&mut stk) as *mut u8
+    }, 256)
     for st.at < st.flen {
         kind := 0u32
         size := 0i32
@@ -304,10 +346,10 @@ fn strlib_pack(cx: &mut Cx) -> i32!Throw {
                 pk_add_int(&mut b, un, st.little, sz, false)?
             }
         } else if kind == PK_FLOAT {
-            let f = cx.check_number(arg)?
+            let f = sl_arg_num(cx, arg)?
             pk_add_bits(&mut b, pk_f32_bits(f), st.little, 4)?
         } else if kind == PK_NUMBER || kind == PK_DOUBLE {
-            let f = cx.check_number(arg)?
+            let f = sl_arg_num(cx, arg)?
             pk_add_bits(&mut b, num_f64_bits(f), st.little, 8)?
         } else if kind == PK_CHAR {
             sp := sl_null()
@@ -345,7 +387,7 @@ fn strlib_pack(cx: &mut Cx) -> i32!Throw {
             arg -= 1
         }
     }
-    b.push_result(cx)?
+    b.push(cx)?
     return ok(1)
 }
 
