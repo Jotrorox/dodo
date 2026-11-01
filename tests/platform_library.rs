@@ -236,7 +236,7 @@ fn script_runtimes_select_the_script_host_adapter() {
             loaded
                 .sources
                 .iter()
-                .any(|s| s.path.to_str() == Some(adapter_path.as_str())),
+                .any(|s| s.path.to_string_lossy().replace('\\', "/") == adapter_path),
             "{import} for {target}"
         );
         let native = package::native_sources(&loaded);
