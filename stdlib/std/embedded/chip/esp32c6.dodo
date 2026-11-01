@@ -239,6 +239,10 @@ const PCR_CPU_FREQ_CONF: usize = PCR_BASE + 0x118
 const SOC_CLK_SEL: u32 = 0b11 << 16
 const SOC_CLK_PLL: u32 = 1
 const CPU_HS_DIV: u32 = 0xFF << 8
+const SOC_HS_DIV: u32 = 0xFF << 8
+// PMU CLK_STATE0: the PLL is stable and powered.
+const PMU_CLK_STATE0: usize = 0x600B_0194
+const PMU_PLL_RUNS: u32 = (1u32 << 0) | (1u32 << 30)
 
 // The USB serial port.
 const USB_DEVICE_BASE: usize = 0x6000_F000
@@ -376,6 +380,9 @@ pub fn take() -> Peripherals!hal.Error {
         start_clocks()?
         start_timer()
         gate_cpu_in_wait()
+        open_modem_clock_gates()
+        pmu := hal.RegisterBlock.at(PMU_BASE)
+        esp_power.init_active_state(&mut pmu)
     }
     return ok(Peripherals {
         pins: Pins { taken: 0, buses: 0, pwm_channels: 0, pwm_timers: [0u32; 4], pwm_timer_users: [0u32; 4], analog_inputs: 0 },
@@ -394,8 +401,16 @@ unsafe fn start_clocks() -> void!hal.Error {
     unsafe {
         sysclk := mmio.read32(PCR_SYSCLK_CONF)
         if hal.decode(SOC_CLK_SEL, sysclk) != SOC_CLK_PLL {
-            // Not from the boot ROM's direct boot: leave the clocks alone.
-            return err(hal.Error.Unsupported)
+            // The PCR keeps its settings through the resets of `dodo run`,
+            // so whether the boot ROM leaves the root clock on the PLL or
+            // the crystal depends on what ran before. With the PLL powered
+            // and stable (PMU CLK_STATE0), run from it, divided by 3 as the
+            // reset value of SYSCLK_CONF.HS_DIV_NUM says; otherwise leave
+            // the clocks alone.
+            if (mmio.read32(PMU_CLK_STATE0) & PMU_PLL_RUNS) != PMU_PLL_RUNS || hal.decode(SOC_HS_DIV, sysclk) != 2 {
+                return err(hal.Error.Unsupported)
+            }
+            mmio.write32(PCR_SYSCLK_CONF, (sysclk & ~SOC_CLK_SEL) | hal.encode(SOC_CLK_SEL, SOC_CLK_PLL))
         }
         divider := mmio.read32(PCR_CPU_FREQ_CONF)
         mmio.write32(PCR_CPU_FREQ_CONF, divider & ~CPU_HS_DIV)
@@ -2175,6 +2190,11 @@ const MODEM_LPCON_CLK_CONF: usize = 0x600A_F018
 // bus's reads return 0 and its writes are lost.
 const MODEM_LPCON_CLK_CONF_FORCE_ON: usize = 0x600A_F01C
 const I2C_MASTER_FORCE_ON: u32 = 1 << 2
+// PMU RF_PWC: power the analog configuration bus's peripheral side
+// (XPD_PERIF_I2C) and release its reset (PERIF_I2C_RSTB), which power-up
+// leaves held; ESP-IDF and esp-hal do this at start-up.
+const PMU_RF_PWC: usize = 0x600B_0154
+const PERIF_I2C_ON: u32 = (1u32 << 26) | (1u32 << 27)
 const I2C_ANA_MST_I2C0_CTRL: usize = 0x600A_F800
 const I2C_ANA_MST_ANA_CONF1: usize = 0x600A_F81C
 const I2C_ANA_MST_ANA_CONF2: usize = 0x600A_F820
@@ -2196,6 +2216,8 @@ unsafe fn sar_write(register: u32, msb: u32, lsb: u32, value: u32) {
         mmio.write32(MODEM_LPCON_CLK_CONF, clock | (1u32 << 2))
         forced := mmio.read32(MODEM_LPCON_CLK_CONF_FORCE_ON)
         mmio.write32(MODEM_LPCON_CLK_CONF_FORCE_ON, forced | I2C_MASTER_FORCE_ON)
+        rf := mmio.read32(PMU_RF_PWC)
+        mmio.write32(PMU_RF_PWC, rf | PERIF_I2C_ON)
         source := mmio.read32(MODEM_LPCON_I2C_MST_CLK_CONF)
         mmio.write32(MODEM_LPCON_I2C_MST_CLK_CONF, source | 1)
         master := I2C_ANA_MST_I2C0_CTRL
@@ -3006,6 +3028,28 @@ const LP_TIMER_BASE: usize = 0x600B_0C00
 const LP_CLKRST_BASE: usize = 0x600B_0400
 const SOC_CLK_XTAL: u32 = 0
 
+// The radio (modem) domain's clock gating maps, MODEM_SYSCON and
+// MODEM_LPCON CLK_CONF_POWER_ST: per clock, the PMU ICG codes (HP_ACTIVE's
+// is HP_ACTIVE_ICG_MODEM) in which it runs. Their reset value 0 stops
+// every one of them, including the analog configuration bus behind the
+// ADC, once the PMU applies a code, as it does after any PMU sleep, and a
+// core reset does not undo that. Let every clock run in the MODEM (1) and
+// ACTIVE (2) codes and stop in the SLEEP code (0), as Espressif's start-up
+// code sets them, whatever an earlier program left.
+const MODEM_SYSCON_CLK_CONF_POWER_ST: usize = 0x600A_980C
+const MODEM_LPCON_CLK_CONF_POWER_ST: usize = 0x600A_F020
+const MODEM_SYSCON_ALL_CODES: u32 = 0x6666_6600
+const MODEM_LPCON_ALL_CODES: u32 = 0x6666_0000
+
+// SAFETY: the caller owns the clock configuration; nothing else uses the
+// radio.
+unsafe fn open_modem_clock_gates() {
+    unsafe {
+        mmio.write32(MODEM_SYSCON_CLK_CONF_POWER_ST, MODEM_SYSCON_ALL_CODES)
+        mmio.write32(MODEM_LPCON_CLK_CONF_POWER_ST, MODEM_LPCON_ALL_CODES)
+    }
+}
+
 // Stop the CPU's clock while it waits for an interrupt, so `wfi` saves
 // power; any interrupt still ends the wait at once.
 // SAFETY: the caller owns the clock configuration.
@@ -3275,6 +3319,9 @@ unsafe fn go_dormant(wake: &power.Wake, pins: u32, timeout: u64) -> u64!hal.Erro
             return ok(present as u64)
         }
         lp_clkrst := hal.RegisterBlock.at(LP_CLKRST_BASE)
+        pmu_state: [24]u32 = [0u32; 24]
+        esp_power.save_sleep_state(&mut pmu, &mut pmu_state)
+        alarm_state := esp_power.save_lp_alarm(&mut timer)
         esp_power.configure_sleep(&mut pmu)
         lp_clock := esp_power.use_rc_fast(&mut lp_clkrst)
         sources := esp_power.WAKE_GPIO
@@ -3313,12 +3360,39 @@ unsafe fn go_dormant(wake: &power.Wake, pins: u32, timeout: u64) -> u64!hal.Erro
         }
         if timeout != 0 {
             esp_power.disarm_lp_alarm(&mut timer)
+            esp_power.restore_lp_alarm(&mut timer, alarm_state)
         }
         esp_power.restore_lp_fast_clock(&mut lp_clkrst, lp_clock)
+        esp_power.restore_sleep_state(&mut pmu, &pmu_state)
+        // The modem domain powered down while the chip slept.
+        open_modem_clock_gates()
+        reattach_usb()
         if failure != 0 {
             return err(hal.Error.Timeout)
         }
         return ok(woken as u64)
+    }
+}
+
+// USB_SERIAL_JTAG CONF0: PAD_PULL_OVERRIDE takes the D+ and D- pulls from
+// the register's own bits instead of the controller, and DP_PULLUP is D+'s
+// pull-up, which tells the host a device is there.
+const USB_CONF0: usize = USB_DEVICE_BASE + 0x18
+const USB_PAD_PULL_OVERRIDE: u32 = 1 << 8
+const USB_DP_PULLUP: u32 = 1 << 9
+// How long D+ stays released, so the host sees the device leave.
+const USB_DETACH_US: u32 = 100_000
+// A dormant state stops the USB serial port's clock; a host sees the
+// device stop answering and gives up on it. Release D+ for a moment, as if
+// the cable were unplugged, so the host enumerates the port again. Without
+// a host this only costs the time.
+// SAFETY: nothing may use the USB serial port meanwhile.
+unsafe fn reattach_usb() {
+    unsafe {
+        conf := mmio.read32(USB_CONF0)
+        mmio.write32(USB_CONF0, (conf | USB_PAD_PULL_OVERRIDE) & ~USB_DP_PULLUP)
+        ets_delay_us(USB_DETACH_US)
+        mmio.write32(USB_CONF0, conf)
     }
 }
 

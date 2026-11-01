@@ -17,9 +17,10 @@ lock on the board (DODO_ESP32C6_LOCK, default /tmp/dodo-esp32c6.lock) from
 flashing until the result is read, so several runs, from several checkouts,
 take turns instead of flashing over each other. `--reconnect` is for a
 project that releases the USB serial port for a while, such as across a
-dormant state, which drops the connection: the script then reopens the port
-whenever it fails or disappears, and keeps sending a byte while the board
-is silent, until the project prints `selftest done`.
+dormant state, which drops the connection: it prints `selftest waiting`
+first and `selftest resumed` once back. The script then reopens the port
+whenever it fails or disappears, or stays silent in between, and keeps
+sending a byte while the board is silent, until `selftest done`.
 
 The self-test (tests/hardware/esp32c6_devkitc/main.dodo) waits for this
 script to send a byte, so no output is lost before the port is open, then
@@ -280,6 +281,17 @@ def recover(port):
         lock.close()
 
 
+def close_quietly(fd):
+    """Close the port without a reset request: the USB serial port resets
+    the chip when RTS is on while DTR is off, so RTS goes off first."""
+    try:
+        set_lines(fd, True, False)
+        set_lines(fd, False, False)
+    except OSError:
+        pass
+    os.close(fd)
+
+
 def reopen(port, deadline):
     """Open the board's port again once it is back, or None by `deadline`."""
     while time.time() < deadline:
@@ -319,6 +331,8 @@ def run_locked(dodo, optimization, port, project, reconnect=False):
         deadline = time.time() + (60 if reconnect else 30)
         last_poke = 0.0
         last_output = time.time()
+        opened = time.time()
+        waits = 0
         while b"selftest done" not in output and b"dodo: " not in output:
             if time.time() > deadline:
                 break
@@ -326,7 +340,17 @@ def run_locked(dodo, optimization, port, project, reconnect=False):
                 fd = reopen(port, deadline)
                 if fd is None:
                     break
+                opened = time.time()
             quiet = time.time() - last_output > 0.5
+            if reconnect and output.count(b"selftest waiting") > waits:
+                # The project releases its port and drops the connection:
+                # let go of the port meanwhile, so no stale descriptor is
+                # left, and open it again once the board is back.
+                waits += 1
+                close_quietly(fd)
+                fd = None
+                time.sleep(4)
+                continue
             if (b"selftest ready" not in output or (reconnect and quiet)) and time.time() - last_poke > 0.5:
                 try:
                     os.write(fd, b"s")
