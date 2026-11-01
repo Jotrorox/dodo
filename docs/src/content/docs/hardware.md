@@ -2004,6 +2004,27 @@ Wait until serial ports have sent their last bytes before calling it. A
 complete example that blinks, deep-sleeps, and goes dormant until a button
 press is `examples/low_power.dodo`.
 
+The ESP32-C6 has no hardware deep sleep that a system timer alarm can end:
+its PMU wakes only for pins, the low-power timer, a UART, or the low-power
+core. So in deep-sleep mode every wait, including the executor's and
+`cpu.wait_for_interrupt()`'s, masks interrupts, stops the clocks outside the
+sleep set (never `esp32c6.ESSENTIAL_CLOCKS`), waits, and starts them again
+before the interrupt runs; the compiler calls the chip's
+`dodo_wait_for_interrupt` for `wfi` on RISC-V so that this needs no change
+to the waiting code. `dormant` is the PMU's light sleep: the crystal, the
+PLL, and the fast RC oscillator stop, RAM and the CPU's state are kept, and
+the system timer pauses. The chip's GPIO wakeup sees levels, so `dormant`
+arms each pin for the level opposite to the one it has, and an edge may
+take two sleeps to see. Every pin but GPIO 12 and 13 can wake it. It
+returns `Busy` while a host has the USB serial port open, as the light sleep
+drops the USB connection; afterwards it detaches from USB for 100 ms so
+that the host finds the port again, and the host has to reopen it.
+`b.power.set_dormant_timeout_us(us)` also ends the dormant state after a
+time on the low-power timer, which `lp_ticks()` reads. The low-power
+timer's one comparator serves both that timeout and the real-time clock's
+alarm, so an RTC alarm that falls due during a dormant state does not raise
+its interrupt.
+
 ### Testing power-aware code
 
 `fake.Power.new(essential, managed)` starts with every clock running. It
@@ -3426,12 +3447,13 @@ what earlier firmware left:
 | `p.watchdog` | Timer group 0's watchdog (`esp_watchdog`), with `rp_watchdog`'s interface: `start(timeout_ms)` up to one hour in 10 µs steps, `feed`, `stop`, `remaining_us`, `restart`, `reset_reason()`, and two `scratch` words that survive its reset. It resets the whole chip, which boots the firmware again, and a panic while it runs ends in a `Timeout` reset. |
 | `p.rtc` | The low-power timer as a real-time clock (`esp_rtc`), with `hal.Rtc` and `hal.RtcAlarm`: milliseconds that keep counting through every reset but a power cycle, like the RP2350's always-on timer. Its slow clock, about 138 kHz, is calibrated against the crystal at `take()` (within a few hundred ppm; it drifts with temperature, and `rtc.calibrate()` measures again). The alarm raises `LP_RTC_TIMER`. |
 | `p.flash` | The program flash above the image (`esp_flash`), with `rp_flash`'s interface: `program_end()`, `region`, `last`, `free`, and `release`, as `hal.Flash` with 4096-byte erases and single-byte writes, for a [`std/embedded/storage`](#persistent-storage) store. Erasing and writing run from SRAM with interrupts masked, at most about 45 ms per sector, and reads through the flash mapping see the new data at once. |
+| `p.power` | Low power with the [`std/embedded/power`](#low-power) protocol (`esp32c6.Power`). Every `wfi` stops the CPU's clock and wakes within microseconds. The clock gates are `esp32c6.CLOCK_*`, one per enable in the clock controller (57 in all), with `ALARM_CLOCKS` (the system timer), `ESSENTIAL_CLOCKS`, and `ALL_CLOCKS`; claiming a peripheral starts its clocks again. Deep sleep stops the clocks outside the sleep set around each wait and restarts them before the interrupt runs; `dormant(&wake)` is the PMU's light sleep with the crystal, PLL, and fast RC oscillator off. |
 | `pins.ws2812(pin)` | Up to seven WS2812 addressable LEDs, sent by the remote control peripheral (RMT). |
 | `esp32c6.reboot_to_bootloader()`, `restart()` | Restart into the boot ROM's download mode, or into the firmware. `dodo run` clears the download request when it flashes. |
 
 The ESP32-C6-DevKitC-1's package, `std/embedded/board/esp32c6_devkitc`,
 hands out the board contract's `pins`, `timer`, `usb`, `dma`, `rng`,
-`watchdog`, `rtc`, and `flash`, and claims the RGB LED as `b.led`: `set_high` lights it in `LED_ON_COLOR`, a dim
+`watchdog`, `rtc`, `flash`, and `power`, and claims the RGB LED as `b.led`: `set_high` lights it in `LED_ON_COLOR`, a dim
 white, and `b.led.set_color(0x00_10_00)` shows any color. `BUTTON_PIN` is
 the BOOT button on GPIO 9, low while pressed. The usual bus pins are on the
 J1 header: I2C on GPIO 6 and 7, SPI on GPIO 2, 4, and 5 with GPIO 3 for a
@@ -3573,9 +3595,11 @@ dodo build firmware.dodo --emit obj --target thumbv7em-none-eabihf \
   transactions of up to 64 bytes, with time to poll between them. I2S runs
   as controller only, and one PWM input runs at a time. The real-time clock
   runs from the internal slow oscillator, which drifts with temperature; a
-  32 kHz crystal is not supported. An ADC input draws enough current while
-  it samples that sources above about 10 kOhm read low. Flashing works from
-  macOS and Linux.
+  32 kHz crystal is not supported. Deep sleep is clock gating around each
+  wait rather than a hardware state, and the dormant state sees pin levels,
+  not edges. An ADC input draws enough current while it samples that
+  sources above about 10 kOhm read low. Flashing works from macOS and
+  Linux.
 - PIO state machines move words through their FIFOs by polling or their
   interrupts. DMA can pace transfers by their FIFOs' data requests
   (`rp_dma.request` with `sm.tx_fifo_address()`), and `hal.DmaStream` runs

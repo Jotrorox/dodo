@@ -12,16 +12,38 @@
   chip. `dodo run` flashes through the boot ROM's serial protocol over the
   chip's own USB serial port or a USB serial adapter, with no button and no
   external tool, checks the result by MD5, and skips unchanged images.
-  `std/embedded/chip/esp32c6` covers clocks (160 MHz), GPIO on any pin
-  through the GPIO matrix, I2C, SPI, both UARTs, PWM, the ADC calibrated from
-  eFuse, the temperature sensor, the system timer's alarms as executor
-  clocks, the interrupt matrix, DMA copies, WS2812 LEDs, and the USB serial
-  port, with new drivers `std/embedded/peripheral/esp_i2c`, `esp_spi`,
-  `esp_uart`, and `esp_usb_serial`. `std/embedded/board/esp32c6_devkitc`
-  makes the RGB LED the board's `led`. The portable board examples build
-  unchanged, `examples/esp32c6_tasks` shows tasks woken by the board's
-  interrupts, and `scripts/test_esp32c6.py` runs a 50-check hardware
-  self-test, which passes at -O0 to -O3.
+  `std/embedded/chip/esp32c6` covers clocks (160 MHz from the PLL, set at
+  every start along with the PMU's active state, which survives resets),
+  GPIO on any pin through the GPIO matrix, the interrupt matrix, I2C and SPI
+  as master, polled (`hal.I2cPoll`, `hal.SpiPoll`), or target
+  (`i2c_target`, `spi_target`), SPI with the controller's own chip select
+  (`spi_with_select`) and by DMA (`hal.SpiDma`), both UARTs and the USB
+  serial port with `serial.Port` and `serial.PollPort`, CAN on both TWAI
+  controllers (`hal.Can`, new driver `std/embedded/peripheral/esp_twai`),
+  I2S audio output and input by DMA (`hal.I2sOutput`, `hal.I2sInput`,
+  `std/embedded/chip/esp_i2s`), PWM outputs and inputs (`hal.PwmInput` on
+  the MCPWM capture unit, `esp_capture`), the ADC calibrated from eFuse, the
+  temperature sensor, the system timer's alarms as executor clocks, DMA
+  copies, and WS2812 LEDs, with new drivers
+  `std/embedded/peripheral/esp_i2c`, `esp_spi`, `esp_uart`, and
+  `esp_usb_serial`. The board contract's `rng` (the hardware generator, fit
+  for keys while no analog input is claimed, `esp_rng`), `watchdog` (timer
+  group 0's, with `rp_watchdog`'s interface, reset reasons, and scratch
+  words, `esp_watchdog`), `rtc` (the low-power timer, which keeps counting
+  through resets, calibrated against the crystal, `esp_rtc`), `flash`
+  (`rp_flash`'s regions above the program, for `std/embedded/storage`,
+  `esp_flash`), and `power` (`std/embedded/power`: clock gating on the 57
+  gates of the clock controller, every `wfi` with the CPU clock stopped,
+  deep sleep as clock gating around each wait through a new weak
+  `dodo_wait_for_interrupt` hook that the compiler calls for `wfi` on
+  RISC-V, and a dormant state in the PMU's light sleep, `esp_power`) are all
+  there. `std/embedded/board/esp32c6_devkitc` makes the RGB LED the board's
+  `led`. The portable board examples build unchanged,
+  `examples/esp32c6_tasks` shows tasks woken by the board's interrupts, and
+  `scripts/test_esp32c6.py` runs a 51-check hardware self-test and, with
+  `--project`, 97 more checks of the buses, CAN, I2S, PWM input, system
+  services, and low power in `tests/hardware/esp32c6_*`, which pass at -O0
+  to -O3.
 - Functions placed with `@section`, such as `@section(".ramfunc")`, are no
   longer inlined into their callers, which would have run their code from the
   caller's section instead.

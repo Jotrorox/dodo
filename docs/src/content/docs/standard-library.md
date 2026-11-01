@@ -172,7 +172,7 @@ calibrated ADC and temperature sensor, the system timer's alarms, DMA
 copies, WS2812 LEDs such as the board's RGB LED, the random number
 generator, the watchdog, the low-power timer as a real-time clock, the
 flash above the program (`esp_rng`, `esp_watchdog`, `esp_rtc`,
-`esp_flash`), and the chip's own USB serial port through
+`esp_flash`), low power (`esp_power`), and the chip's own USB serial port through
 `std/embedded/peripheral/esp_usb_serial`, which `dodo run` also flashes
 through.
 `std/embedded/can/mcp2515` drives the MCP2515 CAN controller over any SPI bus.
