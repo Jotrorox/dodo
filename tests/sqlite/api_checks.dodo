@@ -387,6 +387,106 @@ fn file_database_persists_and_reopens() {
     remove(path)
 }
 
+fn text_of(conn: &mut sqlite.Connection, sql_text: &str, out: &mut[u8]) -> usize!db.Error {
+    none_: [0]db.Value = []
+    rows := conn.select(sql_text, &none_)!
+    let some(row) = rows.next()! else {
+        return ok(0)
+    }
+    match row.text_into(0, out) {
+        some(n) => ok(n),
+        none => ok(0),
+    }
+}
+
+// WAL mode: conversion, statement-level undo and rollback inside the log,
+// the last connection deleting -wal/-shm, read-only access, and in-memory
+// databases staying in "memory" mode.
+@test
+fn wal_mode_round_trip() {
+    path := "dodo_sqlite_wal_checks.db"
+    remove(path)
+    remove("dodo_sqlite_wal_checks.db-wal")
+    remove("dodo_sqlite_wal_checks.db-shm")
+    buf := [0u8; 64]
+    {
+        conn := sqlite.Connection.open(path, workspace())!
+        n := text_of(&mut conn, "pragma journal_mode = wal", &mut buf)!
+        assert(same(unsafe {
+            mem.str_from_utf8(&buf[..n])
+        }, "wal"))
+        conn.exec("create table w(id integer primary key, v text unique)")!
+        assert(exists("dodo_sqlite_wal_checks.db-wal"))
+        conn.exec("begin")!
+        stmt := conn.prepare("insert into w(v) values (?)")!
+        for i in 0i64..500 {
+            p := [db.Value.Int(i)]
+            conn.run(&stmt, &p)!
+        }
+        dup := [db.Value.Int(7)]
+        match conn.run(&stmt, &dup) {
+            ok(_) => {
+                assert(false)
+            },
+            err(e) => {
+                assert(e.constraint == db.Constraint.Unique)
+            },
+        }
+        conn.exec("commit")!
+        conn.exec("begin; delete from w; rollback")!
+        none_: [0]db.Value = []
+        count := sql.ScalarInt.new()
+        conn.query("select count(*) from w", &none_, &mut count)!
+        assert_eq(count.value, 500i64)
+        n2 := text_of(&mut conn, "pragma wal_checkpoint(truncate)", &mut buf)!
+        assert(same(unsafe {
+            mem.str_from_utf8(&buf[..n2])
+        }, "0"))
+        conn.close()!
+    }
+    assert(!exists("dodo_sqlite_wal_checks.db-wal"))
+    assert(!exists("dodo_sqlite_wal_checks.db-shm"))
+    {
+        options := sqlite.Options.new()
+        options.read_only = true
+        conn := sqlite.Connection.open_with(path, workspace(), &options)!
+        n := text_of(&mut conn, "pragma journal_mode", &mut buf)!
+        assert(same(unsafe {
+            mem.str_from_utf8(&buf[..n])
+        }, "wal"))
+        none_: [0]db.Value = []
+        count := sql.ScalarInt.new()
+        conn.query("select count(*) from w", &none_, &mut count)!
+        assert_eq(count.value, 500i64)
+        match conn.exec("insert into w(v) values ('no')") {
+            ok() => {
+                assert(false)
+            },
+            err(e) => {
+                assert(e.kind == db.ErrorKind.ReadOnly)
+            },
+        }
+        conn.close()!
+    }
+    {
+        conn := sqlite.Connection.open(path, workspace())!
+        n := text_of(&mut conn, "pragma journal_mode = delete", &mut buf)!
+        assert(same(unsafe {
+            mem.str_from_utf8(&buf[..n])
+        }, "delete"))
+        conn.close()!
+    }
+    assert(!exists("dodo_sqlite_wal_checks.db-wal"))
+    remove(path)
+    {
+        conn := sqlite.Connection.open_memory(workspace())!
+        n := text_of(&mut conn, "pragma journal_mode = wal", &mut buf)!
+        assert(same(unsafe {
+            mem.str_from_utf8(&buf[..n])
+        }, "memory"))
+    }
+}
+
 @test
 fn workspace_too_small_is_a_capacity_error() {
     small := [0u8; 4096]

@@ -105,7 +105,7 @@ def main():
                 continue
         a = os.path.join(workdir, name + ".sqlite.db")
         b = os.path.join(workdir, name + ".dodo.db")
-        for p in (a, b, b + "-journal"):
+        for p in (a, a + "-wal", a + "-shm", b, b + "-journal", b + "-wal", b + "-shm"):
             if os.path.exists(p):
                 os.remove(p)
         expected = "\n".join(oracle(a, script)).splitlines()
