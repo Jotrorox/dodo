@@ -363,6 +363,9 @@ fn resolve_expr(e: &mut Engine, n: usize, sel: usize, allow_agg: bool) -> void!d
             set_nf(e, n, 3, id)
             return ok()
         }
+        if is_window_call(e, n) && resolve_window_func(e, n, sel, allow_agg)? {
+            return ok()
+        }
         let (id, lo, hi) = func_lookup(e, name, len, nargs, (flags & 2) != 0)
         if id == 0 {
             e.msg_len = 0
@@ -392,6 +395,8 @@ fn resolve_expr(e: &mut Engine, n: usize, sel: usize, allow_agg: bool) -> void!d
                 resolve_expr(e, a, sel, false)?
                 a = nnext(e, a)
             }
+            let filter = nff(e, n)
+            resolve_expr(e, filter, sel, false)?
             regs := alloc_regs(e, 4)?
             set_nf(e, n, 4, regs)
             // Register with the select being resolved.
@@ -830,11 +835,13 @@ fn resolve_core(e: &mut Engine, s: usize, own_order: bool) -> void!db.Error {
     nres := list_len(e, s_a)
     iset(e, info, I_NRES, nres)
     rc := na(e, s)
+    e.ws[info + I_WINOK] = 1
     for rc != 0 {
         let rc_a = na(e, rc)
         resolve_expr(e, rc_a, s, true)?
         rc = nnext(e, rc)
     }
+    e.ws[info + I_WINOK] = 0
     resreg := alloc_regs(e, nres)?
     iset(e, info, I_RESREG, resreg)
     // ON, WHERE, GROUP BY, HAVING, ORDER BY.
@@ -859,10 +866,12 @@ fn resolve_core(e: &mut Engine, s: usize, own_order: bool) -> void!db.Error {
         resolve_expr(e, ext_b, s, true)?
         if own_order {
             o := nc(e, ext)
+            e.ws[info + I_WINOK] = 1
             for o != 0 {
                 resolve_order_item(e, s, o, true)?
                 o = nnext(e, o)
             }
+            e.ws[info + I_WINOK] = 0
             let ext_d = ndd(e, ext)
             resolve_expr(e, ext_d, 0, false)?
             let ext_e = ne_(e, ext)
@@ -1394,7 +1403,8 @@ fn plan_select(e: &mut Engine, s: usize, info: usize) -> void!db.Error {
         iset(e, info, I_NFINAL, nw)
         iset(e, info, I_WHERE, wterms)
     }
-    plan_output(e, s, info)
+    plan_output(e, s, info)?
+    window_plan(e, s, info)
 }
 
 // Picks the access path for level l from equality terms.
@@ -1823,7 +1833,11 @@ fn slotify(e: &mut Engine, n: usize, info: usize) -> void!db.Error {
             slotify(e, a, info)?
             a = nnext(e, a)
         }
-        return ok()
+        let filter = nff(e, n)
+        return slotify(e, filter, info)
+    }
+    if k == N_WIN {
+        return win_slotify(e, n, info)
     }
     if k == N_CASE {
         let n_a2 = na(e, n)

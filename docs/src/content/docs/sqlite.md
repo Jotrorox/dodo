@@ -299,7 +299,7 @@ and UPSERT), `UPDATE`, `DELETE`, each with `RETURNING`; `SELECT` with joins
 `char`, `zeroblob`, `concat`, `concat_ws`, `octet_length`, `changes`,
 `last_insert_rowid`, `total_changes`, `sqlite_version`, ...); the aggregates
 `count`, `sum`, `total`, `avg`, `min`, `max`, `group_concat`/`string_agg`
-(with `DISTINCT`); and the date and time functions `date`, `time`,
+(with `DISTINCT` and `FILTER (WHERE ...)`); and the date and time functions `date`, `time`,
 `datetime`, `julianday`, `unixepoch`, `strftime` with their modifiers. The
 `localtime` and `utc` modifiers use the operating system's time zone rules
 (`localtime_r`, or `_localtime64_s` on Windows), as SQLite does, including
@@ -328,6 +328,23 @@ database unchanged, while Dodo converts them, so an invalid UTF-16 sequence
 stored that way (an unpaired surrogate or an odd byte count) is normalized
 rather than kept byte for byte.
 
+**Window functions.** `fn(...) [FILTER (WHERE ...)] OVER (...)` and
+`OVER name` with `WINDOW name AS (...)` clauses (a definition may build on an
+earlier one); `PARTITION BY`, `ORDER BY` (with `NULLS FIRST/LAST` and
+collations), and `ROWS`, `RANGE` (numeric offsets on one `ORDER BY` term), or
+`GROUPS` frames with `UNBOUNDED PRECEDING`, `n PRECEDING`, `CURRENT ROW`,
+`n FOLLOWING`, `UNBOUNDED FOLLOWING` and `EXCLUDE NO OTHERS`/`CURRENT
+ROW`/`GROUP`/`TIES`. The functions are `row_number`, `rank`, `dense_rank`,
+`percent_rank`, `cume_dist`, `ntile`, `lag`, `lead`, `first_value`,
+`last_value`, `nth_value`, and every aggregate above (without `DISTINCT`).
+Windows run over the rows left after `WHERE`, `GROUP BY` and `HAVING`
+(aggregates may appear in window arguments), may be used in `ORDER BY`, and
+combine with `DISTINCT`, `LIMIT`, compound selects, subqueries, views, and
+CTEs. Default frames, error messages, row order, and the results of sliding
+frames (including SQLite's incremental `sum` and `group_concat` behaviour)
+follow SQLite. A window query materializes its rows in the sorter, so the
+workspace bounds its size.
+
 **Pragmas.** `user_version`, `application_id`, `schema_version`,
 `page_size`, `page_count`, `freelist_count`, `encoding`, `journal_mode`
 (`DELETE` and `WAL`; other rollback modes behave as `DELETE`),
@@ -336,8 +353,7 @@ rather than kept byte for byte.
 are accepted and
 ignored, as SQLite does for unknown pragmas.
 
-**Not supported.** Window functions, virtual tables, `ATTACH`, and
-temporary tables.
+**Not supported.** Virtual tables, `ATTACH`, and temporary tables.
 
 **Concurrency.** Locks follow SQLite's protocol, so Dodo and SQLite processes
 can use one file safely. As with SQLite's POSIX locking, two connections to

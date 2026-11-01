@@ -1441,10 +1441,8 @@ fn parse_function(e: &mut Engine, o: usize, l: usize) -> usize!db.Error {
         }
     }
     expect(e, TK_RP)?
-    if is_kw(e, "FILTER") || is_kw(e, "OVER") {
-        return err(fail(e, SQLITE_ERROR, "window functions and FILTER are not supported"))
-    }
     set_flags(e, n, flags)
+    parse_filter_over(e, n)?
     ok(n)
 }
 
@@ -1649,6 +1647,10 @@ fn parse_select(e: &mut Engine) -> usize!db.Error {
         }
         next := parse_select_core(e)?
         set_op(e, next, op)
+        // A VALUES list is already a chain of UNION ALL rows.
+        for nnext(e, last) != 0 {
+            last = nnext(e, last)
+        }
         set_next(e, last, next)
         last = next
     }
@@ -1849,8 +1851,8 @@ fn parse_select_core(e: &mut Engine) -> usize!db.Error {
         ext := nd_ext(e, s)?
         set_nf(e, ext, 1, hv)
     }
-    if is_kw(e, "WINDOW") {
-        return err(fail(e, SQLITE_ERROR, "window functions are not supported"))
+    if accept_kw(e, "WINDOW") {
+        parse_window_clause(e, s)?
     }
     ok(s)
 }

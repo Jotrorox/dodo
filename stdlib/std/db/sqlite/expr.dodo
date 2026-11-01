@@ -555,10 +555,19 @@ fn eval(e: &mut Engine, n: usize, dst: usize) -> void!db.Error {
         return eval_function(e, n, dst)
     }
     if k == N_AGG {
+        if ng(e, n) != 0 && win_readback(e, n) {
+            return win_extra_value(e, n, dst)
+        }
         return agg_value(e, n, dst)
     }
     if k == N_SUBQ || k == N_EXISTS || k == N_INSEL {
+        if ng(e, n) != 0 && win_readback(e, n) {
+            return win_extra_value(e, n, dst)
+        }
         return eval_subquery(e, n, dst)
+    }
+    if k == N_WIN {
+        return win_value(e, n, dst)
     }
     if k == N_ALIAS {
         let n_a7 = na(e, n)
