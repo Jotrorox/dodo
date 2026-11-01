@@ -4533,11 +4533,30 @@ pub struct Power: power.Power {
         }
     }
 
+    // A timeout in `wake` (power.Wake.after_ms) ends the dormant state on
+    // the low-power timer as set_dormant_timeout_us does, the shorter of
+    // the two applying; when it is the one that ran out, the result is
+    // power.BY_TIME.
     pub fn dormant(&mut self, wake: &power.Wake) -> u64!hal.Error {
         pins := dormant_pins(wake)?
+        timeout_us := self.timeout_us
+        by_wake := false
+        requested := wake.timeout_ms()
+        if requested != 0 {
+            if requested > MAX_DORMANT_TIMEOUT_US / 1000 {
+                requested = MAX_DORMANT_TIMEOUT_US / 1000
+            }
+            if timeout_us == 0 || requested * 1000 <= timeout_us {
+                timeout_us = requested * 1000
+                by_wake = true
+            }
+        }
+        if timeout_us > MAX_DORMANT_TIMEOUT_US {
+            timeout_us = MAX_DORMANT_TIMEOUT_US
+        }
         timeout := 0u64
-        if self.timeout_us != 0 {
-            timeout = self.timeout_us * self.lp_rate() / 10_000
+        if timeout_us != 0 {
+            timeout = timeout_us * self.lp_rate() / 10_000
             if timeout == 0 {
                 timeout = 1
             }
@@ -4558,7 +4577,12 @@ pub struct Power: power.Power {
             go_dormant(wake, pins, timeout)
         }
         core.drop(section)
-        return result
+        // go_dormant returns no pins only once the time has run out.
+        woken := result?
+        if woken == 0 && by_wake {
+            return ok(power.BY_TIME)
+        }
+        return ok(woken)
     }
 
     // Also end a dormant state after `microseconds` of the low-power
@@ -4596,11 +4620,16 @@ pub struct Power: power.Power {
     }
 }
 
-// The pins of `wake`, bit n for pin n; InvalidInput if it has none, or one
-// the chip cannot watch: GPIO 24 and up, and the USB pins.
+// The longest dormant timeout, in microseconds, so that its count of the
+// low-power timer cannot overflow: about 35 years.
+const MAX_DORMANT_TIMEOUT_US: u64 = 1u64 << 50
+
+// The pins of `wake`, bit n for pin n; InvalidInput if it has neither pins
+// nor a timeout, or a pin the chip cannot watch: GPIO 24 and up, and the
+// USB pins.
 fn dormant_pins(wake: &power.Wake) -> u32!hal.Error {
     all := wake.pins()
-    if all == 0 || (all >> PIN_COUNT as u64) != 0 {
+    if (all == 0 && wake.timeout_ms() == 0) || (all >> PIN_COUNT as u64) != 0 {
         return err(hal.Error.InvalidInput)
     }
     pins := all as u32

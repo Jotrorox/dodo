@@ -279,6 +279,181 @@ fn main() {
     }
 }
 
+// The timer protocols at other rates on a board: a timer alarm as a
+// compare channel and as a periodic timer, a PWM slice as a periodic timer
+// and tick counter, a PWM output's wrap interrupt, a PIO edge capture, and
+// on the RP2350 TIMER1, through generic drivers, with interrupt handlers
+// for the alarm and the PWM wrap in the vector table.
+#[test]
+fn timer_channels_link_for_every_board() {
+    if !ld_lld() {
+        return;
+    }
+    let scratch = Scratch::new("timer-channels");
+    let common = r#"package main
+import "std/embedded/board"
+import "std/embedded/chip"
+import "std/embedded/chip/rp_capture"
+import "std/embedded/chip/rp_pwm"
+import "std/embedded/cortex_m"
+import "std/embedded/hal"
+static mut ALARM: Option<chip.Alarm> = none
+static mut TIMER: Option<rp_pwm.PwmTimer> = none
+static mut PERIODS: u32 = 0
+@interrupt(ALARM_VECTOR)
+fn alarm_fired() {
+    unsafe {
+        match &mut ALARM {
+            some(alarm) => {
+                PERIODS += alarm.poll_periods()
+            }
+            none => {}
+        }
+    }
+}
+@interrupt(PWM_VECTOR)
+fn wrapped() {
+    unsafe {
+        match &mut TIMER {
+            some(timer) => {
+                PERIODS += timer.poll_periods()
+            }
+            none => {}
+        }
+    }
+}
+fn measure<C: hal.TickCounter>(counter: &C) -> u64 {
+    start := counter.now_ticks()
+    for hal.elapsed_ticks(counter, start) < 100 {}
+    return hal.ticks_to_ns(hal.elapsed_ticks(counter, start), counter.tick_hz())
+}
+fn pulse<C: hal.Compare>(channel: &mut C) -> void!hal.Error {
+    hal.schedule_in_ticks(channel, 1000)?
+    hal.wait_for_compare(channel)
+    return ok()
+}
+fn every<P: hal.PeriodicTimer>(timer: &mut P, period_us: u64) -> u32!hal.Error {
+    hal.start_periodic_us(timer, period_us)?
+    timer.listen()
+    return ok(hal.wait_periods(timer))
+}
+fn edges<C: hal.InputCapture>(input: &mut C) -> u64!hal.Error {
+    return hal.capture_ticks(input, 1_000_000)
+}
+fn main() {
+    b := board.take()!
+    alarm := b.timer.alarm(1)!
+    pulse(&mut alarm)!
+    core.assert(every(&mut alarm, 500)! >= 1)
+    core.assert(measure(&b.timer) >= 100_000)
+    irq := alarm.irq()
+    unsafe {
+        ALARM = some(alarm)
+    }
+    cortex_m.enable(irq)
+    timer := b.pins.pwm_timer(3, 1_000_000)!
+    core.assert(every(&mut timer, 100)! >= 1)
+    core.assert(measure(&timer) >= 100_000)
+    wrap := timer.irq()
+    unsafe {
+        TIMER = some(timer)
+    }
+    cortex_m.enable(wrap)
+    output := b.pins.pwm(0, 1000)!
+    output.listen_wrap()
+    for !output.wrapped() {}
+    output.clear_wrap()
+    output.ignore_wrap()
+    b.pins.release_pwm(output)
+    pio := b.pins.pio(0)!
+    capture := b.pins.edge_capture(&mut pio, 5, rp_capture.RISING, 1_000_000)!
+    match edges(&mut capture) {
+        ok(ticks) => core.assert(ticks > 0),
+        err(error) => core.assert(error == hal.Error.Timeout),
+    }
+    b.pins.release_edge_capture(capture, &mut pio)
+    b.pins.release_pio(pio)
+    extra(&mut b)
+}
+"#;
+    let rp2040 = "fn extra(b: &mut board.Board) {}\n";
+    let rp2350 = r#"fn extra(b: &mut board.Board) {
+    second := b.timer.timer1(chip.SYS_HZ)!
+    core.assert(measure(&second) >= 100_000)
+    channel := second.alarm(0)!
+    pulse(&mut channel)!
+    core.assert(every(&mut channel, 1000)! >= 1)
+    hal.schedule_in_us(&mut channel, 10)!
+    second.release_alarm(channel)
+    b.timer.release_timer1(second)
+    slow := b.timer.timer1(100_000)!
+    core.assert(slow.tick_hz() == 100_000)
+    b.timer.release_timer1(slow)
+}
+"#;
+    // The alarm's and the PWM wrap's vectors and interrupt numbers.
+    let boards = [
+        (
+            "pico",
+            0xE48B_FF56u32,
+            "TIMER_IRQ_1",
+            1usize,
+            "PWM_IRQ_WRAP",
+            4usize,
+            rp2040,
+        ),
+        (
+            "pico2",
+            0xE48B_FF59,
+            "TIMER0_IRQ_1",
+            1,
+            "PWM_IRQ_WRAP_0",
+            8,
+            rp2350,
+        ),
+        (
+            "pico2_w",
+            0xE48B_FF59,
+            "TIMER0_IRQ_1",
+            1,
+            "PWM_IRQ_WRAP_0",
+            8,
+            rp2350,
+        ),
+    ];
+    for (board, family, alarm, alarm_irq, wrap, wrap_irq, extra) in boards {
+        let text = common
+            .replace("ALARM_VECTOR", alarm)
+            .replace("PWM_VECTOR", wrap)
+            + extra;
+        let source = scratch.write(&format!("timers-{board}.dodo"), &text);
+        for level in ["0", "2"] {
+            let elf = scratch.path(&format!("timers-{board}-O{level}.elf"));
+            build(&[
+                "build",
+                source.to_str().unwrap(),
+                "--board",
+                board,
+                "-O",
+                level,
+                "-o",
+                &elf,
+            ]);
+            let path = Path::new(&elf);
+            let bytes = fs::read(path).unwrap();
+            let image = flash_image(&fs::read(path.with_extension("uf2")).unwrap(), family);
+            let vectors = elf_symbol(&bytes, "__vector_table").unwrap() as usize - 0x1000_0000;
+            for (name, irq) in [(alarm, alarm_irq), (wrap, wrap_irq)] {
+                assert_eq!(
+                    word(&image, vectors + 4 * (16 + irq)),
+                    elf_symbol(&bytes, name).unwrap() | 1,
+                    "{board} -O{level}: {name}"
+                );
+            }
+        }
+    }
+}
+
 // Low power on a board: the chip's Power through the portable protocol
 // and directly, and the example. Needs no linker.
 #[test]
@@ -338,6 +513,124 @@ fn main() {
                     "-o",
                     &object,
                 ]));
+            }
+        }
+    }
+}
+
+// Waking a dormant chip by time, a slower system clock, and the real-time
+// clocks' other tick sources on every board, and the RP2350's power-down
+// states, linked into firmware.
+#[test]
+fn low_power_states_link_for_every_board() {
+    if !ld_lld() {
+        return;
+    }
+    let scratch = Scratch::new("low-power");
+    let portable = scratch.write(
+        "timed.dodo",
+        r#"package main
+import "std/embedded/board"
+import "std/embedded/chip"
+import "std/embedded/hal"
+import "std/embedded/power"
+fn nap<P: power.Power>(chip_power: &mut P, milliseconds: u64) -> bool!hal.Error {
+    woken := power.dormant_for(chip_power, milliseconds)?
+    return ok(power.by_time(woken))
+}
+fn main() {
+    b := board.take()!
+    // A 32.768 kHz oscillator on GPIO 20 keeps the clock running.
+    b.rtc.use_clock_input(&mut b.pins, 20, 32_768)!
+    b.rtc.set_ms(1_800_000_000_000)!
+    crystal := b.power.crystal_hz()
+    b.power.set_system_hz(crystal)!
+    core.assert(b.power.system_hz() == crystal)
+    button := b.pins.input(15)!
+    wake := power.Wake.new()
+    wake.on(15, power.FALLING_EDGE)
+    wake.after_ms(60_000)
+    woken := b.power.dormant(&wake)!
+    core.assert(power.by_time(woken) || power.woken_pins(woken) <= 1u64 << 15)
+    core.assert(nap(&mut b.power, 1000)!)
+    b.power.set_system_hz(chip.SYS_HZ)!
+    serial := b.pins.uart(4, none, 9600)!
+    match b.power.set_system_hz(crystal / 2) {
+        ok() => core.assert(false),
+        err(error) => core.assert(error == hal.Error.Busy),
+    }
+    b.pins.release_uart(serial)
+    b.rtc.release_clock_input(&mut b.pins)!
+    b.pins.release(button)
+}
+"#,
+    );
+    let power_down = scratch.write(
+        "power_down.dodo",
+        r#"package main
+import "std/embedded/board"
+import "std/embedded/chip"
+import "std/embedded/chip/rp_rtc"
+import "std/embedded/hal"
+import "std/embedded/power"
+// Survives the power-down with SRAM0 kept.
+@section(".noinit")
+static mut WAKES: u32 = 0
+fn main() {
+    b := board.take()!
+    if b.power.woke_from_power_down() && (b.power.retained() & chip.RETAIN_SRAM0) != 0 {
+        unsafe {
+            WAKES += 1
+        }
+        core.assert(b.power.power_down_wake() != 0)
+    } else {
+        unsafe {
+            WAKES = 0
+        }
+    }
+    count := b.power.scratch(0)
+    b.power.set_scratch(chip.SCRATCH_WORDS - 1, count + 1)
+    b.rtc.use_low_power_oscillator()!
+    core.assert(b.rtc.tick_source() == rp_rtc.TICK_LPOSC)
+    b.rtc.use_crystal()!
+    if !b.rtc.is_set()! {
+        b.rtc.set_ms(1_800_000_000_000)!
+    }
+    button := b.pins.input(15)!
+    wake := power.Wake.new()
+    wake.on(15, power.FALLING_EDGE)
+    wake.after_ms(3_600_000)
+    match b.power.power_down(&wake, chip.RETAIN_SRAM0) {
+        ok() => {}
+        err(error) => core.assert(error != hal.Error.InvalidInput),
+    }
+    b.pins.release(button)
+}
+"#,
+    );
+    for board in ["pico", "pico2", "pico2_w"] {
+        let mut sources = vec![(portable.as_path(), "timed")];
+        if board != "pico" {
+            sources.push((power_down.as_path(), "power-down"));
+        }
+        for (input, name) in sources {
+            for level in ["0", "2"] {
+                let elf = scratch.path(&format!("{name}-{board}-O{level}.elf"));
+                build(&[
+                    "build",
+                    input.to_str().unwrap(),
+                    "--board",
+                    board,
+                    "-O",
+                    level,
+                    "-o",
+                    &elf,
+                ]);
+                if board == "pico" {
+                    check_rp2040_firmware(Path::new(&elf));
+                } else {
+                    check_rp2350_firmware(Path::new(&elf));
+                }
             }
         }
     }
@@ -507,6 +800,127 @@ fn pio_programs_assemble_only_for_rp_chips() {
 
 // The WS2812 example and the rest of the PIO driver on every board. Needs
 // no linker.
+// GPIOs up to the package's last, PIO windows, and pin interrupts on
+// either core: a core 1 task listens to a pin, and the one IO_IRQ_BANK0
+// handler serves it there. The Pico boards' chips have 30 GPIOs, so the
+// RP2350B's GPIO 30 to 47 are reached only through pin_count().
+#[test]
+fn gpio_banks_and_core1_pin_interrupts_link_for_every_board() {
+    if !ld_lld() {
+        return;
+    }
+    let scratch = Scratch::new("gpio-banks");
+    let source = scratch.write(
+        "gpio.dodo",
+        r#"package main
+import "std/embedded/board"
+import "std/embedded/chip"
+import "std/embedded/chip/rp_pio"
+import "std/embedded/cortex_m"
+import "std/embedded/executor"
+import "std/embedded/hal"
+import "std/embedded/power"
+const EDGE: executor.Signal = executor.Signal { id: 0 }
+const WAITS: rp_pio.Program = rp_pio.assemble(".side_set 1", "    wait 1 gpio 20 side 0", "    in pins, 1     side 1", "    push           side 0")
+@interrupt(IO_IRQ_BANK0)
+fn gpio_interrupt() {
+    // Runs on the core that listens: core 1 here.
+    cortex_m.disable(chip.IO_IRQ_BANK0)
+    EDGE.raise()
+}
+struct Watcher {
+    button: chip.Pin
+    pub fn run(self) {
+        self.button.listen(chip.FALLING_EDGE | chip.RISING_EDGE)
+        cortex_m.enable(self.button.irq())
+        for {
+            if self.button.events_on(1) != 0 {
+                self.button.clear_events(chip.FALLING_EDGE | chip.RISING_EDGE)
+                cortex_m.enable(chip.IO_IRQ_BANK0)
+            }
+        }
+    }
+}
+fn main() {
+    b := board.take()!
+    count := b.pins.pin_count()
+    core.assert(count == chip.pin_count() && (count == chip.PIN_COUNT || count == 48))
+    last := b.pins.input(count - 1)!
+    core.assert(last.number() == count - 1)
+    last.listen_on(0, chip.LEVEL_HIGH)
+    core.assert(last.events_on(0) <= chip.LEVEL_HIGH)
+    last.ignore_on(0, chip.LEVEL_HIGH)
+    b.pins.release(last)
+    match b.pins.output(count) {
+        ok(_) => core.assert(false),
+        err(error) => core.assert(error == hal.Error.InvalidInput),
+    }
+    pio := b.pins.pio(1)!
+    match pio.set_gpio_base(rp_pio.HIGH_GPIO_BASE) {
+        ok() => {}
+        err(error) => core.assert(error == hal.Error.Unsupported),
+    }
+    base := pio.gpio_base()
+    b.pins.pio_pins(&pio, base + 4, 2)!
+    loaded := pio.load(&WAITS)!
+    config := loaded.config()
+    config.set_in_pins(base + 4)!
+    config.set_sideset_pins(base + 5)!
+    config.set_jmp_pin(base + 31)!
+    sm := pio.free_state_machine()!
+    sm.init(&config)
+    sm.set_pindirs(base + 5, 1, 1)
+    pio.bypass_input_sync(base + 4, true)
+    sm.set_enabled(true)
+    pio.release_state_machine(sm)
+    pio.unload(loaded)
+    b.pins.release_pio(pio)
+    wake := power.Wake.new()
+    wake.on(count - 1, power.LEVEL_HIGH)
+    woken := b.power.dormant(&wake)!
+    core.assert(woken <= 1u64 << (count - 1) as u64)
+    button := b.pins.input(15)!
+    stack := [0u64; 256]
+    watching := b.core1.start(&mut stack, Watcher { button })!
+    b.timer.delay_ms(10)
+    watching.stop()
+}
+"#,
+    );
+    // IO_IRQ_BANK0 is IRQ 13 on the RP2040 and 21 on the RP2350; both
+    // cores take it through the one vector table.
+    let boards: [(&str, u32, usize); 3] = [
+        ("pico", 0xE48B_FF56, 13),
+        ("pico2", 0xE48B_FF59, 21),
+        ("pico2_w", 0xE48B_FF59, 21),
+    ];
+    for (board, family, irq) in boards {
+        for level in ["0", "2"] {
+            let elf = scratch.path(&format!("gpio-{board}-O{level}.elf"));
+            build(&[
+                "build",
+                source.to_str().unwrap(),
+                "--board",
+                board,
+                "-O",
+                level,
+                "-o",
+                &elf,
+            ]);
+            let path = Path::new(&elf);
+            let bytes = fs::read(path).unwrap();
+            let handler = elf_symbol(&bytes, "IO_IRQ_BANK0").expect("the handler is linked");
+            let image = flash_image(&fs::read(path.with_extension("uf2")).unwrap(), family);
+            let vectors = elf_symbol(&bytes, "__vector_table").unwrap() as usize - 0x1000_0000;
+            assert_eq!(
+                word(&image, vectors + 4 * (16 + irq)),
+                handler | 1,
+                "{board} -O{level}: IRQ {irq} is the program's IO_IRQ_BANK0 handler"
+            );
+        }
+    }
+}
+
 #[test]
 fn pio_drivers_compile_for_every_board() {
     let scratch = Scratch::new("pio-compile");
@@ -794,6 +1208,141 @@ fn flash_storage_links_for_every_board() {
                 // The RP2350's flash_op restores execute-in-place itself.
                 assert!(symbol("dodo_flash_erase") >= 0x1000_0000);
             }
+            // Regions erase and write under rp_multicore's lockout, whose
+            // handler parks the other core in SRAM.
+            assert!(in_sram(symbol("dodo_lockout_handler")), "{board}");
+            assert!(in_sram(symbol("dodo_lockout_mailbox")), "{board}");
+            assert!(symbol("dodo.main.rp_multicore.lockout") >= 0x1000_0000);
+        }
+    }
+}
+
+/// The lockout handler's code as loaded: the bytes `length` from the start
+/// of `dodo_lockout_handler`, taken from the flash image of `.data`.
+fn lockout_handler_code(elf: &Path, family: u32, length: usize) -> Vec<u8> {
+    let bytes = fs::read(elf).unwrap();
+    let image = flash_image(&fs::read(elf.with_extension("uf2")).unwrap(), family);
+    let symbol = |name: &str| elf_symbol(&bytes, name).unwrap_or_else(|| panic!("{name}"));
+    let handler = symbol("dodo_lockout_handler") & !1;
+    let at = (symbol("__data_load") + handler - symbol("__data_start") - 0x1000_0000) as usize;
+    image[at..at + length].to_vec()
+}
+
+// A flash region erased and written on each core while the other runs a
+// task from flash, and rp_multicore.lockout called directly, on every board:
+// the lockout handler is IO_IRQ_QSPI's vector and runs from SRAM, with its
+// literal pool, which holds IO_QSPI's PROC0_INTF clear alias of the chip.
+#[test]
+fn flash_writes_with_both_cores_running_link_for_every_board() {
+    if !ld_lld() {
+        return;
+    }
+    let scratch = Scratch::new("lockout");
+    let source = scratch.write(
+        "lockout.dodo",
+        r#"package main
+import "std/embedded/board"
+import "std/embedded/chip/rp_flash"
+import "std/embedded/chip/rp_multicore"
+import "std/embedded/hal"
+import "std/embedded/storage"
+
+static mut STACK: [1024]u64 = [0u64; 1024]
+
+struct Writer {
+    region: rp_flash.Region
+
+    pub fn run(self) {
+        let Writer { region } = self
+        match storage.Store.open(region) {
+            ok(store) => {
+                settings := store
+                match settings.set_u32("core", 1) {
+                    ok() => {}
+                    err(_) => {}
+                }
+            }
+            err(_) => {}
+        }
+        match rp_multicore.lockout() {
+            ok(pause) => {
+                core.assert(pause.is_parked())
+            }
+            err(error) => {
+                core.assert(error == hal.Error.Timeout || error == hal.Error.Busy)
+            }
+        }
+    }
+}
+
+fn main() {
+    b := board.take()!
+    capacity := b.flash.capacity()
+    theirs := b.flash.region(capacity - 32 * 1024, 16 * 1024)!
+    mine := b.flash.last(16 * 1024)!
+    running := unsafe {
+        b.core1.start(&mut STACK, Writer { region: theirs })!
+    }
+    store := storage.Store.open(mine)!
+    store.set_u32("core", 0)!
+    pause := rp_multicore.lockout()!
+    inner := rp_multicore.lockout()!
+    core.assert(pause.is_parked() && !inner.is_parked())
+    core.drop(inner)
+    core.drop(pause)
+    running.stop()
+}
+"#,
+    );
+    // IO_IRQ_QSPI, and IO_QSPI's PROC0_INTF clear alias.
+    let boards = [
+        ("pico", 0xE48B_FF56u32, 14usize, 0x4001_B038u32),
+        ("pico2", 0xE48B_FF59, 23, 0x4003_3220),
+        ("pico2_w", 0xE48B_FF59, 23, 0x4003_3220),
+    ];
+    for (board, family, irq, force) in boards {
+        for level in ["0", "2"] {
+            let elf = scratch.path(&format!("lockout-{board}-O{level}.elf"));
+            build(&[
+                "build",
+                source.to_str().unwrap(),
+                "--board",
+                board,
+                "-O",
+                level,
+                "-o",
+                &elf,
+            ]);
+            let path = Path::new(&elf);
+            let bytes = fs::read(path).unwrap();
+            let symbol = |name: &str| {
+                elf_symbol(&bytes, name).unwrap_or_else(|| panic!("{board} lacks {name}"))
+            };
+            let handler = symbol("dodo_lockout_handler");
+            let in_sram = |address: u32| (0x2000_0000..0x2008_2000).contains(&address);
+            assert!(
+                in_sram(handler),
+                "{board} -O{level}: the handler runs from SRAM"
+            );
+            assert!(in_sram(symbol("dodo_lockout_mailbox")));
+            let image = flash_image(&fs::read(path.with_extension("uf2")).unwrap(), family);
+            let vectors = symbol("__vector_table") as usize - 0x1000_0000;
+            assert_eq!(
+                word(&image, vectors + 4 * (16 + irq)),
+                handler | 1,
+                "{board} -O{level}: IO_IRQ_QSPI is the lockout handler"
+            );
+            // Its literals follow its code in SRAM, so it reads nothing from
+            // flash: among them the forced bit's clear alias and the
+            // mailbox.
+            let code = lockout_handler_code(path, family, 0x48);
+            let literals: Vec<u32> = (0..code.len() / 4).map(|at| word(&code, 4 * at)).collect();
+            assert!(
+                literals.contains(&force),
+                "{board} -O{level}: {literals:x?}"
+            );
+            assert!(literals.contains(&symbol("dodo_lockout_mailbox")));
+            assert!(symbol("dodo.main.rp_multicore.lockout") >= 0x1000_0000);
         }
     }
 }
@@ -1253,6 +1802,12 @@ fn two_core_programs_link_for_every_board() {
                 elf_symbol(&bytes, "dodo_core_id").is_some(),
                 "{board} -O{level}"
             );
+            // Core 1 and core 0 listen for the lockout through IO_IRQ_QSPI,
+            // whose handler runs from SRAM.
+            let qspi = if board == "pico" { 14 } else { 23 };
+            let lockout = elf_symbol(&bytes, "dodo_lockout_handler").expect("lockout");
+            assert!((0x2000_0000..0x2008_2000).contains(&lockout), "{board}");
+            assert_eq!(word(&image, vectors + 4 * (16 + qspi)), lockout | 1);
         }
     }
     // Without std/embedded/chip the FIFO stub falls through to DefaultHandler.
@@ -1373,6 +1928,159 @@ fn dma_signals_are_raised_from_the_default_dma_interrupt() {
         build(&["build", bare.to_str().unwrap(), "--chip", chip, "-o", &elf]);
         assert_eq!(
             stub_literal(Path::new(&elf), family, "DMA_IRQ_0", 10),
+            0,
+            "{chip}"
+        );
+    }
+}
+
+#[test]
+fn adc_samplers_compile_for_every_board() {
+    let scratch = Scratch::new("adc-sampler");
+    let source = scratch.write(
+        "sampler.dodo",
+        r#"package main
+import "std/embedded/board"
+import "std/embedded/chip/rp_adc"
+import "std/embedded/executor"
+import "std/embedded/hal"
+const READY: executor.Signal = executor.Signal { id: 0 }
+fn main() {
+    b := board.take()!
+    sampler := b.pins.sampler(rp_adc.GPIO26 | rp_adc.GPIO27 | rp_adc.TEMPERATURE, 30_000)!
+    match b.pins.analog(28) {
+        ok(input) => core.assert(false),
+        err(error) => core.assert(error == hal.Error.Busy),
+    }
+    sampler.set_threshold(4)!
+    sampler.set_signal(&READY)
+    sampler.start()
+    samples: [16]u16 = [0; 16]
+    got := sampler.poll_read(&mut samples)!
+    sampler.read(&mut samples)!
+    value := rp_adc.sample_value(samples[0])
+    input := rp_adc.sample_input(samples[0])
+    failed := rp_adc.sample_failed(samples[0])
+    sampler.stop()
+    sampler.clear_signal()
+    channel := b.dma.channel()!
+    capture: [256]u16 = [0; 256]
+    sampler.capture(&mut channel, &mut capture)!
+    bytes: [256]u8 = [0; 256]
+    sampler.capture_bytes(&mut channel, &mut bytes)!
+    {
+        session := sampler.dma(&mut channel, &mut capture)!
+        session.start(128)!
+        session.finish()!
+        first := session.buffer()![0]
+    }
+    ring: [1024]u16 = [0; 1024]
+    {
+        stream := sampler.stream(&mut channel, &mut ring)!
+        stream.read(&mut samples)!
+        size := stream.ring_size()
+    }
+    b.dma.release(channel)
+    b.pins.release_sampler(sampler)
+    knob := b.pins.analog(26)!
+    reading := knob.read()!
+    b.pins.release_analog(knob)
+}
+"#,
+    );
+    for board in ["pico", "pico2", "pico2_w"] {
+        for level in ["0", "2"] {
+            let object = scratch.path(&format!("sampler-{board}-O{level}.o"));
+            stdout(&dodo(&[
+                "build",
+                source.to_str().unwrap(),
+                "--board",
+                board,
+                "-O",
+                level,
+                "--emit",
+                "obj",
+                "-o",
+                &object,
+            ]));
+        }
+    }
+}
+
+#[test]
+fn adc_signals_are_raised_from_the_default_adc_interrupt() {
+    if !ld_lld() {
+        return;
+    }
+    let scratch = Scratch::new("adc");
+    let example = root().join("examples/adc.dodo");
+    // ADC_IRQ_FIFO's vector: IRQ 22 on the RP2040, 35 on the RP2350.
+    let boards = [
+        ("pico", 0xE48B_FF56, 22),
+        ("pico2", 0xE48B_FF59, 35),
+        ("pico2_w", 0xE48B_FF59, 35),
+    ];
+    for (board, family, irq) in boards {
+        for level in ["0", "2"] {
+            let elf = scratch.path(&format!("adc-{board}-O{level}.elf"));
+            build(&[
+                "build",
+                example.to_str().unwrap(),
+                "--board",
+                board,
+                "-O",
+                level,
+                "-o",
+                &elf,
+            ]);
+            let bytes = fs::read(&elf).unwrap();
+            let serve = elf_symbol(&bytes, "dodo_adc_interrupt").expect("the handler is linked");
+            assert_eq!(serve & 1, 1, "{board} -O{level}: a Thumb function");
+            assert_eq!(
+                stub_literal(Path::new(&elf), family, "AdcHandler", 10),
+                serve
+            );
+            let image = flash_image(
+                &fs::read(Path::new(&elf).with_extension("uf2")).unwrap(),
+                family,
+            );
+            let vectors = elf_symbol(&bytes, "__vector_table").unwrap() as usize - 0x1000_0000;
+            assert_eq!(
+                word(&image, vectors + 4 * (16 + irq)),
+                elf_symbol(&bytes, "AdcHandler").unwrap() | 1,
+                "{board} -O{level}: the vector is the runtime's handler"
+            );
+        }
+    }
+    // A program's own handler replaces the runtime's.
+    let own = scratch.write(
+        "own.dodo",
+        "package main\nimport \"std/embedded/board\"\nstatic mut COUNT: u32 = 0\n@interrupt(ADC_IRQ_FIFO)\nfn adc() {\n unsafe {\n  COUNT += 1\n }\n}\nfn main() {\n b := board.take()!\n b.led.toggle()\n}\n",
+    );
+    for (board, family, irq) in [("pico", 0xE48B_FF56, 22), ("pico2", 0xE48B_FF59, 35)] {
+        let elf = scratch.path(&format!("own-{board}.elf"));
+        build(&["build", own.to_str().unwrap(), "--board", board, "-o", &elf]);
+        let bytes = fs::read(&elf).unwrap();
+        let image = flash_image(
+            &fs::read(Path::new(&elf).with_extension("uf2")).unwrap(),
+            family,
+        );
+        let vectors = elf_symbol(&bytes, "__vector_table").unwrap() as usize - 0x1000_0000;
+        let handler = elf_symbol(&bytes, "ADC_IRQ_FIFO").expect("the program's handler");
+        assert_ne!(Some(handler), elf_symbol(&bytes, "AdcHandler"), "{board}");
+        assert_eq!(
+            word(&image, vectors + 4 * (16 + irq)),
+            handler | 1,
+            "{board}"
+        );
+    }
+    // Without std/embedded/chip the stub falls through to DefaultHandler.
+    let bare = scratch.write("bare.dodo", "package main\nfn main() {}\n");
+    for (chip, family) in [("rp2040", 0xE48B_FF56), ("rp2350", 0xE48B_FF59)] {
+        let elf = scratch.path(&format!("bare-{chip}.elf"));
+        build(&["build", bare.to_str().unwrap(), "--chip", chip, "-o", &elf]);
+        assert_eq!(
+            stub_literal(Path::new(&elf), family, "AdcHandler", 10),
             0,
             "{chip}"
         );

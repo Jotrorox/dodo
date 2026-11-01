@@ -1,5 +1,10 @@
 package rp_adc
 
+import "core/cpu"
+import "core/mmio"
+import "core/ptr"
+import "std/embedded/cortex_m"
+import "std/embedded/executor"
 import "std/embedded/hal"
 
 // The analog-to-digital converter the RP2040 and RP2350 share (RP2040
@@ -16,22 +21,73 @@ import "std/embedded/hal"
 // interrupt handler and by the main program then never mix up their
 // conversions. The reference voltage is the chip's ADC_AVDD supply,
 // 3.3 V on the Pico boards.
+//
+// `Sampler` runs the converter by itself instead (datasheet 4.9.2.1 to
+// 4.9.2.5, RP2350 12.4.3): it converts a set of inputs one after the other,
+// round and round (CS.RROBIN), at a steady rate set by the DIV register,
+// and pushes each result into the converter's 8-entry FIFO. A program
+// empties the FIFO by polling, from the ADC_IRQ_FIFO interrupt, or by DMA:
+// paced by the converter's data request (DREQ_ADC, 36 on the RP2040 and 48
+// on the RP2350, which rp_dma.request finds from the FIFO's address), a
+// channel captures a buffer of samples or streams them into a ring. The
+// FIFO does not record which input a result came from, so the sampler
+// counts: it always starts with the lowest input of its set, and every
+// sample is followed by one of the next input in the set. A sampler and
+// Inputs cannot share the converter, as an Input's conversion would break
+// the round; the chip packages hand out one or the other.
+//
+// Samples come out tagged (see `sample_value`): bits 0 to 11 hold the
+// value, 0 to MAX_VALUE, or 0 to 255 in eight-bit mode; bits 12 to 14 the
+// input; and bit 15 is set if the converter flagged the conversion as
+// failed.
 
 const CS: usize = 0x00
 const RESULT: usize = 0x04
+const FCS: usize = 0x08
+const FIFO: usize = 0x0C
+const DIV: usize = 0x10
+const INTE: usize = 0x18
+const INTS: usize = 0x20
 
 // Atomic register aliases (RP2040 datasheet 2.1.2).
 const SET_ALIAS: usize = 0x2000
 const CLEAR_ALIAS: usize = 0x3000
 
 // CS: the converter is on, the temperature sensor is powered, start one
-// conversion, ready (idle), the last conversion failed, and, from bit 12,
-// the selected input.
+// conversion, convert continuously, ready (idle), the last conversion
+// failed, some conversion failed (write one to clear), and, from bit 12,
+// the selected input (AINSEL, 3 bits on the RP2040 and 4 on the RP2350)
+// and, from bit 16, the round-robin set (RROBIN, one bit per input, 5 bits
+// on the RP2040 and 9 on the RP2350). Inputs 0 to 4 fit both.
 const ENABLE: u32 = 1 << 0
 const SENSOR_ENABLE: u32 = 1 << 1
 const START_ONCE: u32 = 1 << 2
+const START_MANY: u32 = 1 << 3
 const READY: u32 = 1 << 8
 const FAILED: u32 = 1 << 9
+const FAILED_STICKY: u32 = 1 << 10
+const SELECT_SHIFT: u32 = 12
+const ROUND_ROBIN_SHIFT: u32 = 16
+
+// FCS, the FIFO's control and status (4.9.6): push each result, shift it
+// to 8 bits, keep the error flag in bit 15 of each entry, raise DMA
+// requests; empty, full, underflowed and overflowed (both write one to
+// clear); the number of entries waiting; and the level from which the
+// FIFO raises its interrupt and data requests.
+const FIFO_ENABLE: u32 = 1 << 0
+const FIFO_SHIFT: u32 = 1 << 1
+const FIFO_ERRORS: u32 = 1 << 2
+const FIFO_DREQ: u32 = 1 << 3
+const UNDERFLOW: u32 = 1 << 10
+const OVERFLOW: u32 = 1 << 11
+const LEVEL: u32 = 0xF << 16
+const THRESHOLD: u32 = 0xF << 24
+
+// The FIFO interrupt's bit in INTR, INTE, INTF, and INTS.
+const FIFO_INTERRUPT: u32 = 1 << 0
+
+// A FIFO entry: the result, and bit 15, set for a failed conversion.
+const ENTRY: u32 = 0x8FFF
 
 // The converter's 12-bit range.
 pub const MAX_VALUE: u16 = 4095
@@ -41,9 +97,43 @@ pub const TEMPERATURE_INPUT: u32 = 4
 pub const FIRST_PIN: u32 = 26
 pub const PIN_COUNT: u32 = 4
 
+// A set of inputs for a Sampler, one bit per input number.
+pub type Inputs = u32
+pub const GPIO26: Inputs = 1 << 0
+pub const GPIO27: Inputs = 1 << 1
+pub const GPIO28: Inputs = 1 << 2
+pub const GPIO29: Inputs = 1 << 3
+pub const TEMPERATURE: Inputs = 1 << 4
+pub const ALL_INPUTS: Inputs = 0x1F
+const INPUT_COUNT: u32 = 5
+
+// The converter's clock, clk_adc, which the chip packages run at 48 MHz.
+pub const CLOCK_HZ: u32 = 48_000_000
+// A conversion takes 96 cycles, so the converter makes at most 500 000 a
+// second; DIV's 16-bit integer part stretches the period to at most 65 536
+// cycles and a fraction, 733 a second.
+pub const MAX_RATE_HZ: u32 = 500_000
+pub const MIN_RATE_HZ: u32 = 733
+const CONVERSION_CYCLES: u32 = 96
+// The largest DIV value: its integer and fractional parts, 16.8 bits.
+const MAX_DIVIDER: u32 = 0xFF_FFFF
+// The FIFO's depth, the highest threshold.
+pub const FIFO_DEPTH: u32 = 8
+
+// The parts of a tagged sample.
+pub const SAMPLE_VALUE: u16 = 0x0FFF
+pub const SAMPLE_INPUT: u16 = 0x7000
+pub const SAMPLE_FAILED: u16 = 0x8000
+
 // Status polls before a conversion that does not finish is reported as
 // Timeout. One takes 96 cycles of the 48 MHz clock, about 50 polls.
 const ATTEMPTS: u32 = 10_000
+
+// The smallest ring a Stream uses, the FIFO's 8 samples, and the largest,
+// 32 KiB, as DMA rings go; as powers of two, in bytes.
+pub const MIN_RING: usize = 8
+const MIN_RING_BITS: u32 = 4
+const MAX_RING_BITS: u32 = 15
 
 // The input of GPIO `pin`; InvalidInput for a pin without one.
 pub fn input_of(pin: u32) -> u32!hal.Error {
@@ -179,5 +269,1248 @@ pub struct Analog: hal.AnalogInput {
         let Analog { input } = self
         registers := input.release()
         return registers.base()
+    }
+}
+
+// The value of a tagged sample: 0 to MAX_VALUE, or 0 to 255 from a
+// sampler in eight-bit mode.
+pub fn sample_value(sample: u16) -> u16 {
+    return sample & SAMPLE_VALUE
+}
+
+// The input a tagged sample came from, 0 to 4.
+pub fn sample_input(sample: u16) -> u32 {
+    return ((sample & SAMPLE_INPUT) >> 12) as u32
+}
+
+// Whether the converter flagged a tagged sample's conversion as failed;
+// its value is then undefined or noisy.
+pub fn sample_failed(sample: u16) -> bool {
+    return (sample & SAMPLE_FAILED) != 0
+}
+
+// The bit of GPIO `pin`'s input in a set of Inputs; InvalidInput for a
+// pin without one.
+pub fn pin_input(pin: u32) -> Inputs!hal.Error {
+    input := input_of(pin)?
+    return ok(1u32 << input)
+}
+
+// The GPIOs of the inputs in `inputs`, one bit per GPIO number.
+pub fn pins_of(inputs: Inputs) -> u32 {
+    return (inputs & (GPIO26 | GPIO27 | GPIO28 | GPIO29)) << FIRST_PIN
+}
+
+// InvalidInput for an empty set of inputs or one with inputs beyond 4.
+pub fn check_inputs(inputs: Inputs) -> void!hal.Error {
+    if inputs == 0 || (inputs & ~ALL_INPUTS) != 0 {
+        return err(hal.Error.InvalidInput)
+    }
+    return ok()
+}
+
+// The number of inputs in `inputs`.
+pub fn input_count(inputs: Inputs) -> u32 {
+    count := 0u32
+    for input in 0..INPUT_COUNT {
+        if (inputs & (1u32 << input)) != 0 {
+            count += 1
+        }
+    }
+    return count
+}
+
+// The input that sample `index` of a round through `inputs` comes from,
+// counting from 0 at the lowest input: the inputs in ascending order,
+// round and round. A capture's sample `index` comes from this input.
+pub fn input_at(inputs: Inputs, index: usize) -> u32 {
+    count := input_count(inputs)
+    if count == 0 {
+        return 0
+    }
+    input := lowest(inputs)
+    for _ in 0..index % count as usize {
+        input = following(inputs, input)
+    }
+    return input
+}
+
+// The DIV value that starts `rate_hz` conversions a second: DIV holds a
+// period of 1 + INT + FRAC / 256 clk_adc cycles (4.9.2.2), rounded here to
+// the nearest 1/256 cycle, and the converter's delta-sigma divider keeps
+// that period on average. InvalidInput outside MIN_RATE_HZ to MAX_RATE_HZ.
+pub fn divider_for(rate_hz: u32) -> u32!hal.Error {
+    if rate_hz < MIN_RATE_HZ || rate_hz > MAX_RATE_HZ {
+        return err(hal.Error.InvalidInput)
+    }
+    period := (CLOCK_HZ as u64 * 256 + rate_hz as u64 / 2) / rate_hz as u64
+    return ok((period - 256) as u32)
+}
+
+// The conversions a second that DIV value `divider` starts, rounded. A
+// period below a conversion's 96 cycles, 0 included, runs conversions
+// back to back, MAX_RATE_HZ.
+pub fn rate_of(divider: u32) -> u32 {
+    period := divider as u64 + 256
+    if period < CONVERSION_CYCLES as u64 * 256 {
+        period = CONVERSION_CYCLES as u64 * 256
+    }
+    return ((CLOCK_HZ as u64 * 256 + period / 2) / period) as u32
+}
+
+// The lowest input in `inputs`, which a round starts with.
+fn lowest(inputs: u32) -> u32 {
+    for input in 0..INPUT_COUNT {
+        if (inputs & (1u32 << input)) != 0 {
+            return input
+        }
+    }
+    return 0
+}
+
+// The input after `input` in a round through `inputs`, as the converter
+// advances AINSEL after each conversion.
+fn following(inputs: u32, input: u32) -> u32 {
+    candidate := input
+    for _ in 0..INPUT_COUNT {
+        candidate += 1
+        if candidate == INPUT_COUNT {
+            candidate = 0
+        }
+        if (inputs & (1u32 << candidate)) != 0 {
+            return candidate
+        }
+    }
+    return input
+}
+
+// The round through `inputs` as a table: three bits per input, holding the
+// input after it, so that reads advance without searching (or dividing,
+// which the Cortex-M0+ does in software).
+fn round_of(inputs: u32) -> u32 {
+    table := 0u32
+    for input in 0..INPUT_COUNT {
+        table |= following(inputs, input) << (3 * input)
+    }
+    return table
+}
+
+// The input after `input` in round table `round`.
+fn after(round: u32, input: u32) -> u32 {
+    return (round >> (3 * input)) & 7
+}
+
+// A FIFO entry, tagged with the input it came from.
+fn tagged(entry: u32, input: u32) -> u16 {
+    return ((entry & ENTRY) | (input << 12)) as u16
+}
+
+// Tag samples[..count], raw FIFO entries of a round through `inputs` from
+// its lowest input.
+fn tag(samples: &mut[u16], count: usize, inputs: u32) {
+    round := round_of(inputs)
+    input := lowest(inputs)
+    for index in 0..count {
+        samples[index] = tagged(samples[index] as u32, input)
+        input = after(round, input)
+    }
+}
+
+// The address of a sample buffer, for a DMA transfer.
+fn address_of(samples: &[u16]) -> usize {
+    // SAFETY: the pointer becomes a number and is never dereferenced here.
+    unsafe {
+        return ptr.as_ptr(samples) as usize
+    }
+}
+
+// Stop free-running conversions, wait for the one under way, and empty
+// the FIFO, which is left off with its flags cleared; the converter and
+// the temperature sensor stay as they were. Results of the last
+// conversions are dropped.
+fn halt(registers: &mut dyn hal.Registers) {
+    // Writing CS without START_MANY stops after the conversion under way,
+    // and clears the round and the selected input.
+    power := registers.read(CS) & (ENABLE | SENSOR_ENABLE)
+    registers.write(CS, power)
+    for _ in 0..ATTEMPTS {
+        if (registers.read(CS) & READY) != 0 {
+            break
+        }
+    }
+    // No conversion pushes into the FIFO any more: turn it and its data
+    // requests off, empty it, and clear its flags, which empty reads
+    // would otherwise set.
+    registers.write(FCS, 0)
+    for _ in 0..2 * FIFO_DEPTH {
+        if hal.decode(LEVEL, registers.read(FCS)) == 0 {
+            break
+        }
+        entry := registers.read(FIFO)
+    }
+    registers.write(FCS, UNDERFLOW | OVERFLOW)
+}
+
+// Start converting `inputs` round-robin from the lowest one, a period of
+// DIV value `divider` apart, pushing each result into the FIFO with FCS
+// control bits `fifo` and threshold `threshold`. Halts first, so the
+// round and the FIFO start afresh.
+fn launch(registers: &mut dyn hal.Registers, inputs: u32, divider: u32, fifo: u32, threshold: u32) {
+    halt(registers)
+    // Writing DIV also restarts the divider's count.
+    registers.write(DIV, divider)
+    registers.write(FCS, fifo | hal.encode(THRESHOLD, threshold))
+    first := lowest(inputs)
+    control := (registers.read(CS) & (ENABLE | SENSOR_ENABLE)) | (first << SELECT_SHIFT)
+    // A round of one input is no round: RROBIN stays 0.
+    if inputs != 1u32 << first {
+        control |= inputs << ROUND_ROBIN_SHIFT
+    }
+    // Select the first input and clear the sticky error, then start.
+    registers.write(CS, control | FAILED_STICKY)
+    registers.write(CS, control | START_MANY)
+}
+
+// Whether the FIFO overflowed: a result came while it was full and was
+// dropped, so later samples no longer follow the round as counted.
+fn overflowed(registers: &mut dyn hal.Registers) -> bool {
+    return (registers.read(FCS) & OVERFLOW) != 0
+}
+
+// Start DMA transfer `transfer` out of the FIFO, and the conversions that
+// feed it: the FIFO raises a data request for each result. `shift` is
+// FIFO_SHIFT for eight-bit samples, 0 otherwise.
+fn begin(registers: &mut dyn hal.Registers, channel: &mut dyn hal.DmaChannel, transfer: hal.DmaTransfer, inputs: u32, divider: u32, shift: u32) -> void!hal.Error {
+    halt(registers)
+    // Makes the program's writes to the buffer land before the channel's.
+    cpu.fence()
+    // SAFETY: the callers keep the buffer borrowed until the channel is
+    // done or aborted.
+    unsafe {
+        channel.start(transfer)?
+    }
+    launch(registers, inputs, divider, FIFO_ENABLE | FIFO_DREQ | FIFO_ERRORS | shift, 1)
+    return ok()
+}
+
+// Run `transfer` as `begin` starts it, and wait until it is done: Overrun
+// if the FIFO overflows meanwhile, Timeout if the channel moves nothing
+// for `poll_limit` polls, Bus on a bus error. Halts the conversions in the
+// end.
+fn run_capture(registers: &mut dyn hal.Registers, channel: &mut dyn hal.DmaChannel, transfer: hal.DmaTransfer, inputs: u32, divider: u32, shift: u32, poll_limit: u32) -> void!hal.Error {
+    begin(registers, channel, transfer, inputs, divider, shift)?
+    polls := 0u32
+    last := channel.remaining()
+    for channel.is_busy() {
+        if overflowed(registers) {
+            channel.abort()
+            halt(registers)
+            return err(hal.Error.Overrun)
+        }
+        left := channel.remaining()
+        if left != last {
+            last = left
+            polls = 0
+        } else {
+            polls += 1
+            if poll_limit != hal.NO_POLL_LIMIT && polls >= poll_limit {
+                channel.abort()
+                halt(registers)
+                return err(hal.Error.Timeout)
+            }
+        }
+    }
+    halt(registers)
+    // Makes what the channel wrote visible to the program.
+    cpu.fence()
+    return channel.take_error()
+}
+
+// A transfer of `count` elements of `width` out of the FIFO at `fifo`
+// into memory at `destination`, paced by the FIFO's data request.
+fn from_fifo(fifo: usize, destination: usize, count: usize, width: hal.DmaWidth) -> hal.DmaTransfer {
+    return hal.DmaTransfer {
+        source: fifo,
+        destination,
+        count: count as u32,
+        width,
+        increment_source: false,
+        increment_destination: true,
+        pace: hal.DmaPace.Source,
+        ring: hal.DmaRing.None,
+    }
+}
+
+// The size, as a power of two, of the largest block aligned to its size
+// within `length` bytes at `address`, up to MAX_RING_BITS; 0 if none of
+// MIN_RING samples fits.
+fn ring_bits(address: usize, length: usize) -> u32 {
+    bits := MAX_RING_BITS
+    for bits >= MIN_RING_BITS {
+        size := 1usize << bits as usize
+        start := (size - address % size) % size
+        if start <= length && length - start >= size {
+            return bits
+        }
+        bits -= 1
+    }
+    return 0
+}
+
+// The converter running by itself over registers R, any hal.Registers:
+// a set of inputs converted round-robin at a steady rate into the FIFO,
+// read by polling, from the FIFO interrupt, or by DMA.
+//
+// A sampler starts stopped. `start` empties the FIFO and begins a round
+// at the lowest input; `poll_read` and `read` then return tagged samples
+// in the order they were converted. The FIFO holds 8 samples, 16 us at the
+// highest rate: a program that falls further behind loses samples, which
+// `poll_read` reports once as Overrun, starting over. DMA keeps up at any
+// rate: `capture_at` fills a buffer, `dma_at` does so in the background,
+// and `stream_at` keeps filling a ring. They take a stopped sampler and
+// leave it stopped.
+pub struct Sampler<R: hal.Registers> {
+    registers: R
+    inputs: u32
+    // The round through them; see round_of.
+    round: u32
+    divider: u32
+    threshold: u32
+    eight_bit: bool
+    running: bool
+    // The input of the next sample out of the FIFO.
+    next: u32
+    poll_limit: u32
+
+    // A sampler of `inputs`, a set such as GPIO26 | TEMPERATURE, that
+    // converts `rate_hz` times a second in all, so each of n inputs
+    // `rate_hz` / n times; stopped. A set with TEMPERATURE powers the
+    // temperature sensor until release. InvalidInput for an empty set, one
+    // beyond ALL_INPUTS, or a rate outside MIN_RATE_HZ to MAX_RATE_HZ.
+    // SAFETY: `registers` must be the converter's, started with `start`,
+    // and only this sampler may use it until it is released.
+    pub unsafe fn new(registers: R, inputs: Inputs, rate_hz: u32) -> Sampler<R>!hal.Error {
+        check_inputs(inputs)?
+        period := divider_for(rate_hz)?
+        if (inputs & TEMPERATURE) != 0 {
+            registers.write(CS + SET_ALIAS, SENSOR_ENABLE)
+        }
+        return ok(Sampler<R> { registers, inputs, round: round_of(inputs), divider: period, threshold: 1, eight_bit: false, running: false, next: lowest(inputs), poll_limit: hal.DEFAULT_POLL_LIMIT })
+    }
+
+    // The set of inputs, and how many it has.
+    pub fn inputs(&self) -> Inputs {
+        return self.inputs
+    }
+
+    pub fn input_count(&self) -> u32 {
+        return input_count(self.inputs)
+    }
+
+    // The input of sample `index` of a capture; see input_at.
+    pub fn input_at(&self, index: usize) -> u32 {
+        return input_at(self.inputs, index)
+    }
+
+    // The input the next sample `poll_read` returns comes from.
+    pub fn next_input(&self) -> u32 {
+        return self.next
+    }
+
+    // Convert `rate_hz` times a second, from now if running; see
+    // divider_for. The rate is rounded to 1/256 of a clk_adc cycle.
+    pub fn set_rate(&mut self, rate_hz: u32) -> void!hal.Error {
+        period := divider_for(rate_hz)?
+        self.apply_divider(period)
+        return ok()
+    }
+
+    // Set DIV directly: a period of 1 + divider / 256 clk_adc cycles,
+    // divider up to 0xFF_FFFF; below 95 * 256, conversions run back to
+    // back. InvalidInput above that.
+    pub fn set_divider(&mut self, divider: u32) -> void!hal.Error {
+        if divider > MAX_DIVIDER {
+            return err(hal.Error.InvalidInput)
+        }
+        self.apply_divider(divider)
+        return ok()
+    }
+
+    // The DIV value, and the conversions a second it gives.
+    pub fn divider(&self) -> u32 {
+        return self.divider
+    }
+
+    pub fn rate_hz(&self) -> u32 {
+        return rate_of(self.divider)
+    }
+
+    // Shift samples to 8 bits, 0 to 255, for polled reads (FCS.SHIFT).
+    // Busy while running.
+    pub fn set_eight_bit(&mut self, on: bool) -> void!hal.Error {
+        if self.running {
+            return err(hal.Error.Busy)
+        }
+        self.eight_bit = on
+        return ok()
+    }
+
+    pub fn is_eight_bit(&self) -> bool {
+        return self.eight_bit
+    }
+
+    // Raise the FIFO interrupt while at least `level` samples wait, 1 to
+    // FIFO_DEPTH (1 at first); InvalidInput otherwise.
+    pub fn set_threshold(&mut self, level: u32) -> void!hal.Error {
+        if level == 0 || level > FIFO_DEPTH {
+            return err(hal.Error.InvalidInput)
+        }
+        self.threshold = level
+        if self.running {
+            // Keep the control bits; the flags are write-one-to-clear.
+            control := self.registers.read(FCS) & (FIFO_ENABLE | FIFO_SHIFT | FIFO_ERRORS | FIFO_DREQ)
+            self.registers.write(FCS, control | hal.encode(THRESHOLD, level))
+        }
+        return ok()
+    }
+
+    pub fn threshold(&self) -> u32 {
+        return self.threshold
+    }
+
+    // Give up a `read` after `polls` polls without a sample;
+    // hal.NO_POLL_LIMIT never does. hal.DEFAULT_POLL_LIMIT at first.
+    pub fn set_poll_limit(&mut self, polls: u32) {
+        self.poll_limit = polls
+    }
+
+    // Start converting, or start over if running: the FIFO is emptied and
+    // a round begins at the lowest input.
+    pub fn start(&mut self) {
+        fifo := FIFO_ENABLE | FIFO_ERRORS
+        if self.eight_bit {
+            fifo |= FIFO_SHIFT
+        }
+        inputs := self.inputs
+        divider := self.divider
+        threshold := self.threshold
+        launch(&mut self.registers, inputs, divider, fifo, threshold)
+        self.next = lowest(inputs)
+        self.running = true
+    }
+
+    // Stop converting. Samples still in the FIFO are dropped.
+    pub fn stop(&mut self) {
+        halt(&mut self.registers)
+        self.running = false
+        self.next = lowest(self.inputs)
+    }
+
+    pub fn is_running(&self) -> bool {
+        return self.running
+    }
+
+    // The samples waiting in the FIFO, up to FIFO_DEPTH.
+    pub fn available(&mut self) -> u32 {
+        return hal.decode(LEVEL, self.registers.read(FCS))
+    }
+
+    // Move the samples waiting in the FIFO into `samples`, tagged with
+    // their inputs, up to its length, without waiting; returns how many.
+    // Overrun if the FIFO overflowed since the last read: samples were
+    // lost, those it held are dropped, and the sampler starts over at the
+    // lowest input.
+    pub fn poll_read(&mut self, samples: &mut[u16]) -> usize!hal.Error {
+        status := self.registers.read(FCS)
+        if (status & OVERFLOW) != 0 {
+            if self.running {
+                self.start()
+            } else {
+                halt(&mut self.registers)
+            }
+            return err(hal.Error.Overrun)
+        }
+        // The entries counted here came before any later overflow, so
+        // they follow the round.
+        count := hal.decode(LEVEL, status) as usize
+        if count > samples.len {
+            count = samples.len
+        }
+        for index in 0..count {
+            entry := self.registers.read(FIFO)
+            samples[index] = tagged(entry, self.next)
+            self.next = after(self.round, self.next)
+        }
+        return ok(count)
+    }
+
+    // Fill `samples`, waiting for them; Timeout after the poll limit
+    // passes without a sample, as when the sampler is stopped, and Overrun
+    // as for poll_read, either way with the samples read so far dropped.
+    pub fn read(&mut self, samples: &mut[u16]) -> void!hal.Error {
+        filled := 0usize
+        polls := 0u32
+        for filled < samples.len {
+            count := self.poll_read(&mut samples[filled..])?
+            if count == 0 {
+                polls += 1
+                if self.poll_limit != hal.NO_POLL_LIMIT && polls >= self.poll_limit {
+                    return err(hal.Error.Timeout)
+                }
+            } else {
+                filled += count
+                polls = 0
+            }
+        }
+        return ok()
+    }
+
+    // Raise the converter's interrupt, ADC_IRQ_FIFO, while the threshold's
+    // number of samples wait; reading them ends it.
+    pub fn listen(&mut self) {
+        self.registers.write(INTE, FIFO_INTERRUPT)
+    }
+
+    // Stop raising it.
+    pub fn ignore(&mut self) {
+        self.registers.write(INTE, 0)
+    }
+
+    pub fn is_listening(&mut self) -> bool {
+        return (self.registers.read(INTE) & FIFO_INTERRUPT) != 0
+    }
+
+    // True while the interrupt is raised.
+    pub fn is_pending(&mut self) -> bool {
+        return (self.registers.read(INTS) & FIFO_INTERRUPT) != 0
+    }
+
+    // Fill `samples` by DMA through `channel`, from a fresh round, and
+    // wait: sample i comes from input_at(i), tagged like poll_read's.
+    // `fifo` is the FIFO's address as the channel sees it, which the chip
+    // packages know. Busy if the sampler runs or the channel is busy;
+    // InvalidInput for more samples than the channel moves at once;
+    // Overrun if the channel fell eight samples behind; Timeout if it
+    // moves nothing for the poll limit; Bus on a bus error. The sampler is
+    // stopped afterwards.
+    pub fn capture_at(&mut self, fifo: usize, channel: &mut dyn hal.DmaChannel, samples: &mut[u16]) -> void!hal.Error {
+        if self.running || channel.is_busy() {
+            return err(hal.Error.Busy)
+        }
+        if samples.len == 0 {
+            return ok()
+        }
+        if samples.len as u64 > channel.max_count() as u64 {
+            return err(hal.Error.InvalidInput)
+        }
+        transfer := from_fifo(fifo, address_of(samples), samples.len, hal.DmaWidth.HalfWord)
+        inputs := self.inputs
+        divider := self.divider
+        limit := self.poll_limit
+        run_capture(&mut self.registers, channel, transfer, inputs, divider, 0, limit)?
+        tag(samples, samples.len, inputs)
+        return ok()
+    }
+
+    // capture_at with eight-bit samples, 0 to 255, untagged: half the
+    // memory, for twice the samples. Errors as for capture_at.
+    pub fn capture_bytes_at(&mut self, fifo: usize, channel: &mut dyn hal.DmaChannel, samples: &mut[u8]) -> void!hal.Error {
+        if self.running || channel.is_busy() {
+            return err(hal.Error.Busy)
+        }
+        if samples.len == 0 {
+            return ok()
+        }
+        if samples.len as u64 > channel.max_count() as u64 {
+            return err(hal.Error.InvalidInput)
+        }
+        transfer := from_fifo(fifo, hal.address_of(samples), samples.len, hal.DmaWidth.Byte)
+        inputs := self.inputs
+        divider := self.divider
+        limit := self.poll_limit
+        return run_capture(&mut self.registers, channel, transfer, inputs, divider, FIFO_SHIFT, limit)
+    }
+
+    // A session that captures into `samples` by DMA in the background,
+    // until it is dropped; see Capture. Busy if the sampler runs or the
+    // channel is busy.
+    pub fn dma_at(&mut self, fifo: usize, channel: &mut dyn hal.DmaChannel, samples: &mut[u16]) -> Capture!hal.Error from(self, channel, samples) {
+        if self.running || channel.is_busy() {
+            return err(hal.Error.Busy)
+        }
+        inputs := self.inputs
+        divider := self.divider
+        limit := self.poll_limit
+        return ok(Capture { registers: &mut self.registers, channel, samples, fifo, inputs, divider, poll_limit: limit, count: 0, running: false })
+    }
+
+    // A session that keeps converting into a ring within `ring` by DMA
+    // until it is dropped; see Stream. Busy if the sampler runs or the
+    // channel is busy; InvalidInput if `ring` holds no aligned block of
+    // MIN_RING samples.
+    pub fn stream_at(&mut self, fifo: usize, channel: &mut dyn hal.DmaChannel, ring: &mut[u16]) -> Stream!hal.Error from(self, channel, ring) {
+        if self.running || channel.is_busy() {
+            return err(hal.Error.Busy)
+        }
+        address := address_of(ring)
+        bits := ring_bits(address, ring.len * 2)
+        if bits == 0 {
+            return err(hal.Error.InvalidInput)
+        }
+        size := 1usize << bits as usize
+        start := (size - address % size) % size / 2
+        inputs := self.inputs
+        divider := self.divider
+        limit := self.poll_limit
+        stream := Stream {
+            registers: &mut self.registers,
+            channel,
+            ring,
+            fifo,
+            inputs,
+            round: round_of(inputs),
+            divider,
+            start,
+            bits,
+            run_count: 0,
+            run_offset: 0,
+            consumed: 0,
+            next: lowest(inputs),
+            poll_limit: limit,
+        }
+        stream.begin()?
+        return ok(stream)
+    }
+
+    // Stop, turn the interrupt off, power the temperature sensor down if
+    // the set has it, and give back the registers.
+    pub fn release(self) -> R {
+        halt(&mut self.registers)
+        self.registers.write(INTE, 0)
+        self.registers.write(DIV, 0)
+        if (self.inputs & TEMPERATURE) != 0 {
+            self.registers.write(CS + CLEAR_ALIAS, SENSOR_ENABLE)
+        }
+        let Sampler { registers, inputs, round, divider, threshold, eight_bit, running, next, poll_limit } = self
+        return registers
+    }
+
+    fn apply_divider(&mut self, divider: u32) {
+        self.divider = divider
+        if self.running {
+            self.registers.write(DIV, divider)
+        }
+    }
+}
+
+// A capture of samples by DMA that runs in the background, from
+// `Sampler.dma_at` or `AdcSampler.dma`. It holds the sampler, the channel,
+// and the buffer, and lends the buffer out only between captures:
+//
+//     capture.start(256)?
+//     // ... other work, or return Pending from a task ...
+//     if capture.poll_finish()? { ... read capture.buffer()? ... }
+//
+// Each capture is a fresh round from the lowest input: sample i comes from
+// input_at(i), and once it is done the buffer holds samples tagged as
+// poll_read's are. The channel's signal tells a task when a capture is
+// done. Dropping the session aborts a running capture and stops the
+// sampler.
+pub struct Capture {
+    registers: &mut dyn hal.Registers
+    channel: &mut dyn hal.DmaChannel
+    samples: &mut[u16]
+    fifo: usize
+    inputs: u32
+    divider: u32
+    poll_limit: u32
+    // The running capture's length.
+    count: usize
+    running: bool
+
+    // The buffer, between captures; Busy while one runs.
+    pub fn buffer(&mut self) -> &mut[u16]!hal.Error from(self) {
+        if self.running {
+            return err(hal.Error.Busy)
+        }
+        return ok(&mut self.samples[..])
+    }
+
+    // The buffer's length in samples, the most a capture takes.
+    pub fn capacity(&self) -> usize {
+        return self.samples.len
+    }
+
+    // Start capturing `count` samples into buffer[..count], and return at
+    // once. InvalidInput for 0, more than the capacity, or more than the
+    // channel moves at once; Busy while a capture runs.
+    pub fn start(&mut self, count: usize) -> void!hal.Error {
+        if self.running {
+            return err(hal.Error.Busy)
+        }
+        if count == 0 || count > self.samples.len || count as u64 > self.channel.max_count() as u64 {
+            return err(hal.Error.InvalidInput)
+        }
+        transfer := from_fifo(self.fifo, address_of(self.samples), count, hal.DmaWidth.HalfWord)
+        inputs := self.inputs
+        divider := self.divider
+        begin(self.registers, self.channel, transfer, inputs, divider, 0)?
+        self.count = count
+        self.running = true
+        return ok()
+    }
+
+    // True while a capture runs.
+    pub fn is_busy(&mut self) -> bool {
+        return self.running && self.channel.is_busy()
+    }
+
+    // The samples the running capture has yet to take: 0 once it is done.
+    pub fn remaining(&mut self) -> usize {
+        if !self.running {
+            return 0
+        }
+        return self.channel.remaining() as usize
+    }
+
+    // Without waiting: true once no capture runs, ending one that is done,
+    // false while one does. Overrun if the channel fell eight samples
+    // behind, Bus on a bus error; either way the capture is over.
+    pub fn poll_finish(&mut self) -> bool!hal.Error {
+        if !self.running {
+            return ok(true)
+        }
+        if self.channel.is_busy() {
+            if overflowed(self.registers) {
+                self.abort()
+                return err(hal.Error.Overrun)
+            }
+            return ok(false)
+        }
+        // The channel took every sample, so the results the converter
+        // pushed since then, and any overflow they caused, are extra.
+        halt(self.registers)
+        self.running = false
+        cpu.fence()
+        self.channel.take_error()?
+        count := self.count
+        inputs := self.inputs
+        tag(self.samples, count, inputs)
+        return ok(true)
+    }
+
+    // Wait for the running capture, if any, and end it; errors as for
+    // poll_finish, and Timeout if the channel moves nothing for the poll
+    // limit, which aborts it.
+    pub fn finish(&mut self) -> void!hal.Error {
+        polls := 0u32
+        last := self.remaining()
+        for !self.poll_finish()? {
+            left := self.remaining()
+            if left != last {
+                last = left
+                polls = 0
+            } else {
+                polls += 1
+                if self.poll_limit != hal.NO_POLL_LIMIT && polls >= self.poll_limit {
+                    self.abort()
+                    return err(hal.Error.Timeout)
+                }
+            }
+        }
+        return ok()
+    }
+
+    // Start a capture of `count` samples and finish it.
+    pub fn capture(&mut self, count: usize) -> void!hal.Error {
+        self.start(count)?
+        return self.finish()
+    }
+
+    // Stop the running capture, if any, and the sampler; the buffer holds
+    // part of it, untagged.
+    pub fn abort(&mut self) {
+        if self.running {
+            self.channel.abort()
+            self.running = false
+            cpu.fence()
+            // An aborted capture has nothing to report.
+            match self.channel.take_error() {
+                ok() => {}
+                err(_) => {}
+            }
+        }
+        halt(self.registers)
+    }
+
+    fn drop(&mut self) {
+        self.abort()
+    }
+}
+
+// A sampler that keeps converting into a ring buffer by DMA, from
+// `Sampler.stream_at` or `AdcSampler.stream`, until it is dropped: the
+// channel moves each sample into the ring as the converter makes it,
+// round and round, and the program reads them at its own pace, tagged
+// with their inputs, in the order they were converted. A 4096-sample ring
+// holds 8 ms at 500 000 samples a second.
+//
+// The ring is the largest block within `ring` whose size in bytes is a
+// power of two and whose address is a multiple of it, as the channel
+// needs: a static buffer of N samples with `@align(2 * N)` gives all N,
+// any other buffer at least a quarter of its length (`ring_size()`
+// tells). Samples the program has not read when the ring comes round
+// again are lost: the next read reports Overrun and continues with the
+// newest sample, still tagged with the right input, since the stream
+// counts every sample the channel moves.
+//
+// A transfer moves at most the channel's max_count samples, 2^28 - 1 on
+// the RP2350, 9 minutes at the highest rate; the next read after one ends
+// starts another, while the FIFO holds 8 samples. A read that comes later
+// than that finds the FIFO overflowed, reports Overrun, and starts the
+// stream over. A task polls the stream on a ticker, as the channel raises
+// its signal only when a transfer ends.
+pub struct Stream {
+    registers: &mut dyn hal.Registers
+    channel: &mut dyn hal.DmaChannel
+    ring: &mut[u16]
+    fifo: usize
+    inputs: u32
+    round: u32
+    divider: u32
+    // The ring within `ring`: its first sample, and its size in bytes as
+    // a power of two.
+    start: usize
+    bits: u32
+    // The running transfer: its count, the ring position it started at,
+    // and the samples of it read so far.
+    run_count: u32
+    run_offset: usize
+    consumed: u32
+    // The input of the next sample to read.
+    next: u32
+    poll_limit: u32
+
+    // The ring's size in samples.
+    pub fn ring_size(&self) -> usize {
+        return (1usize << self.bits as usize) / 2
+    }
+
+    // The samples converted and not yet read, up to the ring's size.
+    pub fn available(&mut self) -> usize {
+        waiting := core.wrapping_sub(self.received(), self.consumed) as usize
+        if waiting > self.ring_size() {
+            return self.ring_size()
+        }
+        return waiting
+    }
+
+    // The input the next sample read comes from.
+    pub fn next_input(&self) -> u32 {
+        return self.next
+    }
+
+    // Move the samples waiting in the ring into `samples`, tagged, up to
+    // its length, without waiting; returns how many. Overrun if the ring
+    // came round over unread samples, which are dropped (reading goes on
+    // with the newest), or the FIFO overflowed, which starts the stream
+    // over at the lowest input. Bus if a transfer hit a bus error; the
+    // stream goes on with a new one.
+    pub fn poll_read(&mut self, samples: &mut[u16]) -> usize!hal.Error {
+        if overflowed(self.registers) {
+            self.restart()
+            return err(hal.Error.Overrun)
+        }
+        written := self.received()
+        if core.wrapping_sub(written, self.consumed) as usize > self.ring_size() {
+            self.skip(written)
+            return err(hal.Error.Overrun)
+        }
+        first := self.consumed
+        count := 0usize
+        mask := self.ring_size() - 1
+        // Makes what the channel wrote visible to the program.
+        cpu.fence()
+        for count < samples.len && self.consumed != written {
+            position := self.start + (core.wrapping_add(self.run_offset, self.consumed as usize) & mask)
+            entry := self.ring[position] as u32
+            samples[count] = tagged(entry, self.next)
+            self.next = after(self.round, self.next)
+            self.consumed += 1
+            count += 1
+        }
+        // The channel may have come round over the first of them while
+        // they were copied.
+        now := self.received()
+        if core.wrapping_sub(now, first) as usize > self.ring_size() {
+            self.skip(now)
+            return err(hal.Error.Overrun)
+        }
+        // Once the channel has stopped and everything it wrote is read,
+        // the next transfer starts: after its count, or early after a bus
+        // error, which this reports.
+        if !self.channel.is_busy() && self.consumed == self.received() {
+            self.next_run()?
+        }
+        return ok(count)
+    }
+
+    // Fill `samples`, waiting for them; Timeout after the poll limit
+    // passes without a sample, Overrun as for poll_read, either way with
+    // the samples read so far dropped.
+    pub fn read(&mut self, samples: &mut[u16]) -> void!hal.Error {
+        filled := 0usize
+        polls := 0u32
+        for filled < samples.len {
+            count := self.poll_read(&mut samples[filled..])?
+            if count == 0 {
+                polls += 1
+                if self.poll_limit != hal.NO_POLL_LIMIT && polls >= self.poll_limit {
+                    return err(hal.Error.Timeout)
+                }
+            } else {
+                filled += count
+                polls = 0
+            }
+        }
+        return ok()
+    }
+
+    // Samples the channel has written in its running transfer.
+    fn received(&mut self) -> u32 {
+        return core.wrapping_sub(self.run_count, self.channel.remaining())
+    }
+
+    // Start a transfer into the ring where the last one ended, as long as
+    // a transfer may be, then the conversions.
+    fn begin(&mut self) -> void!hal.Error {
+        count := self.channel.max_count()
+        transfer := hal.DmaTransfer {
+            source: self.fifo,
+            destination: address_of(self.ring) + 2 * (self.start + self.run_offset),
+            count,
+            width: hal.DmaWidth.HalfWord,
+            increment_source: false,
+            increment_destination: true,
+            pace: hal.DmaPace.Source,
+            ring: hal.DmaRing.Destination(self.bits),
+        }
+        inputs := self.inputs
+        divider := self.divider
+        begin(self.registers, self.channel, transfer, inputs, divider, 0)?
+        self.run_count = count
+        self.consumed = 0
+        return ok()
+    }
+
+    // Start the next transfer once the running one has ended and been
+    // read, without stopping the conversions: the FIFO holds what comes
+    // meanwhile. Bus if the last one ended in a bus error.
+    fn next_run(&mut self) -> void!hal.Error {
+        self.run_offset = core.wrapping_add(self.run_offset, self.consumed as usize) & (self.ring_size() - 1)
+        failure := self.channel.take_error()
+        count := self.channel.max_count()
+        transfer := hal.DmaTransfer {
+            source: self.fifo,
+            destination: address_of(self.ring) + 2 * (self.start + self.run_offset),
+            count,
+            width: hal.DmaWidth.HalfWord,
+            increment_source: false,
+            increment_destination: true,
+            pace: hal.DmaPace.Source,
+            ring: hal.DmaRing.Destination(self.bits),
+        }
+        // SAFETY: the ring stays borrowed by this stream, which aborts the
+        // channel before it is dropped, and the stream only reads the
+        // samples the channel has written. The channel was just found idle
+        // and serves this stream, so starting cannot fail.
+        unsafe {
+            succeeded(self.channel.start(transfer))
+        }
+        self.run_count = count
+        self.consumed = 0
+        return failure
+    }
+
+    // Report lost samples once, going on with the newest, `written`.
+    fn skip(&mut self, written: u32) {
+        lost := core.wrapping_sub(written, self.consumed) % input_count(self.inputs)
+        for _ in 0..lost {
+            self.next = after(self.round, self.next)
+        }
+        self.consumed = written
+    }
+
+    // Start over after the FIFO overflowed: a new transfer at the ring's
+    // start and a new round.
+    fn restart(&mut self) {
+        self.channel.abort()
+        halt(self.registers)
+        succeeded(self.channel.take_error())
+        self.run_offset = 0
+        self.next = lowest(self.inputs)
+        succeeded(self.begin())
+    }
+
+    fn drop(&mut self) {
+        self.channel.abort()
+        halt(self.registers)
+    }
+}
+
+fn succeeded(result: void!hal.Error) -> bool {
+    match result {
+        ok() => {
+            return true
+        }
+        err(error) => {
+            return false
+        }
+    }
+}
+
+// The signal ADC_IRQ_FIFO raises, from AdcSampler.set_signal: its id plus
+// one, 0 for none. Set with interrupts masked.
+static mut SIGNAL: u32 = 0
+
+// The Cortex-M interrupt control and state register, whose VECTACTIVE
+// tells the running exception, and the NVIC's interrupt clear-enable
+// registers (Armv6-M and Armv8-M architecture reference manuals).
+const SCB_ICSR: usize = 0xE000_ED04
+const NVIC_ICER: usize = 0xE000_E180
+
+// The chip runtimes' default ADC_IRQ_FIFO handler calls this weak symbol;
+// every program that uses std/embedded/chip defines it through this
+// package. The interrupt stays raised while the FIFO holds the threshold's
+// number of samples, so the handler disables it in the NVIC, as
+// cortex_m.disable does but with plain register accesses (every program
+// links it, desktop tests too), and raises the signal of
+// AdcSampler.set_signal, if any; the sampler's next read enables it
+// again. A program's own `@interrupt(ADC_IRQ_FIFO)` replaces the default
+// handler, and with it the signal.
+extern "C" fn dodo_adc_interrupt() {
+    // SAFETY: reading ICSR has no side effects, and ICER is
+    // write-one-to-clear, so other interrupts stay enabled. SIGNAL changes
+    // only with interrupts masked.
+    unsafe {
+        irq := (mmio.read32(SCB_ICSR) & 0x1FF) - 16
+        mmio.write32(NVIC_ICER + 4 * (irq / 32) as usize, 1u32 << (irq % 32))
+        cpu.fence()
+        if SIGNAL != 0 {
+            signal := executor.Signal { id: SIGNAL - 1 }
+            signal.raise()
+        }
+    }
+}
+
+// A sampler on the chip: a Sampler over the converter's registers, which
+// the chip packages hand out with `pins.sampler(inputs, rate_hz)`.
+pub struct AdcSampler {
+    sampler: Sampler<hal.RegisterBlock>
+    // The FIFO's address, for DMA, and the converter's interrupt.
+    fifo: usize
+    irq: u32
+
+    // Sampler.new over the converter at `base`, whose interrupt is `irq`.
+    // SAFETY: as for Sampler.new, with `base` the converter's base address.
+    pub unsafe fn at(base: usize, inputs: Inputs, rate_hz: u32, irq: u32) -> AdcSampler!hal.Error {
+        unsafe {
+            sampler := Sampler.new(hal.RegisterBlock.at(base), inputs, rate_hz)?
+            return ok(AdcSampler { sampler, fifo: base + FIFO, irq })
+        }
+    }
+
+    pub fn inputs(&self) -> Inputs {
+        return self.sampler.inputs()
+    }
+
+    pub fn input_count(&self) -> u32 {
+        return self.sampler.input_count()
+    }
+
+    pub fn input_at(&self, index: usize) -> u32 {
+        return self.sampler.input_at(index)
+    }
+
+    pub fn next_input(&self) -> u32 {
+        return self.sampler.next_input()
+    }
+
+    pub fn set_rate(&mut self, rate_hz: u32) -> void!hal.Error {
+        return self.sampler.set_rate(rate_hz)
+    }
+
+    pub fn set_divider(&mut self, divider: u32) -> void!hal.Error {
+        return self.sampler.set_divider(divider)
+    }
+
+    pub fn divider(&self) -> u32 {
+        return self.sampler.divider()
+    }
+
+    pub fn rate_hz(&self) -> u32 {
+        return self.sampler.rate_hz()
+    }
+
+    pub fn set_eight_bit(&mut self, on: bool) -> void!hal.Error {
+        return self.sampler.set_eight_bit(on)
+    }
+
+    pub fn is_eight_bit(&self) -> bool {
+        return self.sampler.is_eight_bit()
+    }
+
+    pub fn set_threshold(&mut self, level: u32) -> void!hal.Error {
+        return self.sampler.set_threshold(level)
+    }
+
+    pub fn threshold(&self) -> u32 {
+        return self.sampler.threshold()
+    }
+
+    pub fn set_poll_limit(&mut self, polls: u32) {
+        self.sampler.set_poll_limit(polls)
+    }
+
+    pub fn start(&mut self) {
+        self.sampler.start()
+        self.relisten()
+    }
+
+    pub fn stop(&mut self) {
+        self.sampler.stop()
+    }
+
+    pub fn is_running(&self) -> bool {
+        return self.sampler.is_running()
+    }
+
+    pub fn available(&mut self) -> u32 {
+        return self.sampler.available()
+    }
+
+    pub fn poll_read(&mut self, samples: &mut[u16]) -> usize!hal.Error {
+        result := self.sampler.poll_read(samples)
+        self.relisten()
+        return result
+    }
+
+    pub fn read(&mut self, samples: &mut[u16]) -> void!hal.Error {
+        result := self.sampler.read(samples)
+        self.relisten()
+        return result
+    }
+
+    // The converter's interrupt, ADC_IRQ_FIFO: its number for
+    // cortex_m.enable, and its vector name for `@interrupt`.
+    pub fn irq(&self) -> u32 {
+        return self.irq
+    }
+
+    // Interrupts for handlers of your own: `listen` raises ADC_IRQ_FIFO
+    // while the threshold's number of samples wait. Enable it in the NVIC
+    // too: `cortex_m.enable(sampler.irq())`.
+    pub fn listen(&mut self) {
+        self.sampler.listen()
+    }
+
+    pub fn ignore(&mut self) {
+        self.sampler.ignore()
+    }
+
+    pub fn is_listening(&mut self) -> bool {
+        return self.sampler.is_listening()
+    }
+
+    pub fn is_pending(&mut self) -> bool {
+        return self.sampler.is_pending()
+    }
+
+    // Raise `signal` whenever the threshold's number of samples wait, from
+    // the chip runtime's default ADC_IRQ_FIFO handler, so a task waits for
+    // samples instead of polling: take the signal, then poll_read. The
+    // handler holds the interrupt back until the next read. Enables the
+    // interrupt and ADC_IRQ_FIFO in the NVIC.
+    pub fn set_signal(&mut self, signal: &executor.Signal) {
+        section := hal.Critical.enter()
+        // SAFETY: interrupts are masked, which excludes the handler, and
+        // there is one sampler.
+        unsafe {
+            SIGNAL = signal.id + 1
+        }
+        self.sampler.listen()
+        core.drop(section)
+        cortex_m.enable(self.irq)
+    }
+
+    // Stop raising the signal and the interrupt.
+    pub fn clear_signal(&mut self) {
+        section := hal.Critical.enter()
+        self.sampler.ignore()
+        // SAFETY: as in set_signal. ICER is write-one-to-clear; this is
+        // cortex_m.disable without its barriers, whose inline assembly
+        // would not build for a desktop test. Should the interrupt still
+        // run once, it finds no signal to raise.
+        unsafe {
+            mmio.write32(NVIC_ICER + 4 * (self.irq / 32) as usize, 1u32 << (self.irq % 32))
+            SIGNAL = 0
+        }
+        core.drop(section)
+    }
+
+    // Fill `samples` by DMA and wait; see Sampler.capture_at.
+    pub fn capture(&mut self, channel: &mut dyn hal.DmaChannel, samples: &mut[u16]) -> void!hal.Error {
+        fifo := self.fifo
+        return self.sampler.capture_at(fifo, channel, samples)
+    }
+
+    // Fill `samples` with eight-bit samples by DMA and wait; see
+    // Sampler.capture_bytes_at.
+    pub fn capture_bytes(&mut self, channel: &mut dyn hal.DmaChannel, samples: &mut[u8]) -> void!hal.Error {
+        fifo := self.fifo
+        return self.sampler.capture_bytes_at(fifo, channel, samples)
+    }
+
+    // Capture into `samples` in the background; see Capture.
+    pub fn dma(&mut self, channel: &mut dyn hal.DmaChannel, samples: &mut[u16]) -> Capture!hal.Error from(self, channel, samples) {
+        fifo := self.fifo
+        return self.sampler.dma_at(fifo, channel, samples)
+    }
+
+    // Keep converting into a ring within `ring`; see Stream.
+    pub fn stream(&mut self, channel: &mut dyn hal.DmaChannel, ring: &mut[u16]) -> Stream!hal.Error from(self, channel, ring) {
+        fifo := self.fifo
+        return self.sampler.stream_at(fifo, channel, ring)
+    }
+
+    // Stop the signal, if set, and Sampler.release; returns the
+    // converter's base address.
+    pub fn release(self) -> usize {
+        // SAFETY: as in set_signal; a word read is atomic.
+        signalled := unsafe {
+            SIGNAL != 0
+        }
+        if signalled {
+            self.clear_signal()
+        }
+        let AdcSampler { sampler, fifo, irq } = self
+        registers := sampler.release()
+        return registers.base()
+    }
+
+    // Let the interrupt through again after a read, if a signal is set; if
+    // the threshold's samples still wait, it raises the signal again. The
+    // NVIC kept the interrupt pending while it was disabled, even if the
+    // read has since ended it, so that is cleared first: the converter
+    // raises it again at once if it still holds the threshold's samples.
+    fn relisten(&mut self) {
+        // SAFETY: as in set_signal; a word read is atomic.
+        signalled := unsafe {
+            SIGNAL != 0
+        }
+        if signalled {
+            cortex_m.unpend(self.irq)
+            cortex_m.enable(self.irq)
+        }
     }
 }

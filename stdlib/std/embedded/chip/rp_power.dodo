@@ -4,6 +4,7 @@ import "core/cpu"
 import "std/embedded/cortex_m"
 import "std/embedded/hal"
 import "std/embedded/power"
+import "std/embedded/chip/rp_rtc"
 
 // The low-power parts the RP2040 and RP2350 share, for their chip packages'
 // std/embedded/power implementations (RP2040 datasheet 2.11 and 2.15.3,
@@ -25,6 +26,23 @@ import "std/embedded/power"
 // and RISING_EDGE. The ring oscillator (ROSC), which the chips boot from
 // and nothing uses afterwards, is stopped too so that no clock runs, and
 // started again afterwards.
+//
+// The system clock. clk_sys runs from PLL_SYS after take(), or slower for
+// less power: from PLL_SYS at a lower rate, or from clk_ref, the crystal,
+// divided by a whole number with PLL_SYS stopped. `plan_system_clock`
+// picks the settings for a rate (RP2040 datasheet 2.15 and 2.18, RP2350
+// 8.1 and 8.6).
+//
+// Power-down (RP2350 only, datasheet 6.2 and 6.4). The power manager
+// (POWMAN) can switch off the switched-core domain, which holds the
+// processors, the bus fabric, and every peripheral, and the SRAM domains
+// the program does not keep. Up to four GPIO events and the always-on
+// timer's alarm power the chip up again, and it restarts through reset:
+// `plan_power_down` turns a power.Wake into POWMAN's PWRUP sources,
+// `enter_power_down` arms them and requests the state, and after the
+// restart `take_power_down_wake` reports what happened. A word in the
+// power manager's SCRATCH7 register, which keeps its value while the
+// switched core is off, marks a power-down this code requested.
 //
 // The functions take the blocks as hal.Registers, so desktop tests run
 // them against simulated registers; the chip packages pass
@@ -119,10 +137,11 @@ pub fn sleep() {
     cpu.wait_for_interrupt()
 }
 
-// InvalidInput unless `wake` names at least one pin, all below `pin_count`.
+// InvalidInput unless `wake` names a pin or a timeout, and only pins below
+// `pin_count`.
 pub fn check_wake(wake: &power.Wake, pin_count: u32) -> void!hal.Error {
     pins := wake.pins()
-    if pins == 0 {
+    if wake.is_empty() {
         return err(hal.Error.InvalidInput)
     }
     if pin_count < 64 && (pins >> pin_count as u64) != 0 {
@@ -216,4 +235,342 @@ pub unsafe fn stop_oscillators<X: hal.Registers, O: hal.Registers>(xosc: &mut X,
 fn enable_field<O: hal.Registers>(oscillator: &mut O, value: u32) {
     control := oscillator.read(OSC_CTRL)
     oscillator.write(OSC_CTRL, (control & ~OSC_ENABLE) | (value << 12))
+}
+
+// --- The system clock ---------------------------------------------------------
+
+// PLL limits (RP2040 datasheet 2.18.2, RP2350 8.6.3): the VCO runs at 750
+// to 1600 MHz, at FBDIV times a reference of at least 5 MHz, FBDIV 16 to
+// 320, and each post divider divides by 1 to 7.
+const VCO_MIN_HZ: u64 = 750_000_000
+const VCO_MAX_HZ: u64 = 1_600_000_000
+const REFERENCE_MIN_HZ: u32 = 5_000_000
+const FEEDBACK_MIN: u32 = 16
+const FEEDBACK_MAX: u32 = 320
+
+// The largest whole-number divider of clk_sys this code uses when it runs
+// from the crystal.
+pub const MAX_SYSTEM_DIVIDER: u32 = 256
+
+// How clk_sys runs: from PLL_SYS with a VCO at `vco_hz` divided by `post1`
+// and `post2`, or from clk_ref, the crystal, divided by `divider` with
+// PLL_SYS stopped. `hz` is the result.
+pub struct SystemClock {
+    pub hz: u32
+    pub from_pll: bool
+    pub vco_hz: u32
+    pub post1: u32
+    pub post2: u32
+    pub divider: u32
+}
+
+// The settings for clk_sys at exactly `hz` from a `crystal_hz` crystal.
+// The default rate, a VCO of `default_vco_hz` divided by `default_post1`
+// and `default_post2`, keeps the settings take() uses. A rate the crystal
+// divides into by a whole number up to MAX_SYSTEM_DIVIDER runs from the
+// crystal with PLL_SYS stopped, which saves the most; another runs from
+// PLL_SYS with the slowest VCO that reaches it exactly. InvalidInput for 0,
+// above `max_hz`, or a rate neither reaches exactly.
+pub fn plan_system_clock(crystal_hz: u32, hz: u32, default_vco_hz: u32, default_post1: u32, default_post2: u32, max_hz: u32) -> SystemClock!hal.Error {
+    if hz == 0 || hz > max_hz || crystal_hz == 0 {
+        return err(hal.Error.InvalidInput)
+    }
+    if hz as u64 * (default_post1 * default_post2) as u64 == default_vco_hz as u64 {
+        return ok(SystemClock { hz, from_pll: true, vco_hz: default_vco_hz, post1: default_post1, post2: default_post2, divider: 1 })
+    }
+    if crystal_hz % hz == 0 && crystal_hz / hz <= MAX_SYSTEM_DIVIDER {
+        return ok(SystemClock { hz, from_pll: false, vco_hz: 0, post1: 1, post2: 1, divider: crystal_hz / hz })
+    }
+    if crystal_hz < REFERENCE_MIN_HZ {
+        return err(hal.Error.InvalidInput)
+    }
+    for feedback in FEEDBACK_MIN..FEEDBACK_MAX + 1 {
+        vco := crystal_hz as u64 * feedback as u64
+        if vco >= VCO_MIN_HZ && vco <= VCO_MAX_HZ {
+            // The larger post divider goes first (RP2040 datasheet 2.18.2).
+            for post1 in 1u32..8 {
+                for post2 in 1u32..post1 + 1 {
+                    if hz as u64 * (post1 * post2) as u64 == vco {
+                        return ok(SystemClock { hz, from_pll: true, vco_hz: vco as u32, post1, post2, divider: 1 })
+                    }
+                }
+            }
+        }
+    }
+    return err(hal.Error.InvalidInput)
+}
+
+// --- RP2350 power-down ---------------------------------------------------------
+
+// POWMAN registers (RP2350 datasheet 6.4). Writes to those up to BOOTDIS
+// carry the password in their upper half; SCRATCH and BOOT do not.
+const PASSWORD: u32 = 0x5AFE_0000
+const VREG_CTRL: usize = 0x04
+const CHIP_RESET: usize = 0x2C
+const SEQ_CFG: usize = 0x34
+const STATE: usize = 0x38
+const TIMER: usize = 0x88
+const PWRUP0: usize = 0x8C
+const LAST_SWCORE_PWRUP: usize = 0xA0
+const DBG_PWRCFG: usize = 0xA4
+const SCRATCH0: usize = 0xB0
+const BOOT0: usize = 0xD0
+const INTE: usize = 0xE4
+
+// VREG_CTRL.UNLOCK lets the power sequencer put the regulator in its
+// low-power mode while the switched core is off.
+const VREG_UNLOCK: u32 = 1 << 13
+// CHIP_RESET.HAD_SWCORE_PD: the last reset was a switched-core power-down.
+const HAD_SWCORE_PD: u32 = 1 << 25
+// SEQ_CFG.HW_PWRUP_SRAM0 and _SRAM1: leave the domain as it is at power-up
+// (set) rather than power it up (clear).
+const HW_PWRUP_SRAM0: u32 = 1 << 1
+const HW_PWRUP_SRAM1: u32 = 1 << 0
+// STATE: the requested domains to power down at bits 4 to 7, in the order
+// of the DOMAIN_ bits, and the request's progress.
+const STATE_REQ_IGNORED: u32 = 1 << 8
+const STATE_PWRUP_WHILE_WAITING: u32 = 1 << 9
+const STATE_BAD_SW_REQ: u32 = 1 << 10
+const STATE_WAITING: u32 = 1 << 12
+// TIMER: the alarm, powering up on it, and the tick source.
+const TIMER_RUN: u32 = 1 << 1
+const TIMER_ALARM_ENAB: u32 = 1 << 4
+const TIMER_PWRUP_ON_ALARM: u32 = 1 << 5
+const TIMER_ALARM: u32 = 1 << 6
+const TIMER_USE_LPOSC: u32 = 1 << 8
+const TIMER_USING_XOSC: u32 = 1 << 16
+const TIMER_USING_LPOSC: u32 = 1 << 17
+// PWRUPn: the GPIO, its level (0) or edge (1), high or rising (1), the
+// enable, and a latched edge (write one to clear).
+const PWRUP_SOURCE: u32 = 0x3F
+const PWRUP_ENABLE: u32 = 1 << 6
+const PWRUP_HIGH: u32 = 1 << 7
+const PWRUP_EDGE: u32 = 1 << 8
+const PWRUP_STATUS: u32 = 1 << 9
+// LAST_SWCORE_PWRUP: bit 1 + n for PWRUPn, bit 6 for the alarm.
+const POWERED_UP_BY_ALARM: u32 = 1 << 6
+// INTE.PWRUP_WHILE_WAITING: a power-up request cancelled the power-down.
+const INTE_PWRUP_WHILE_WAITING: u32 = 1 << 3
+
+// The power domains in POWMAN's STATE order: SRAM1 (SRAM4 to SRAM9, the
+// upper 264 KiB), SRAM0 (SRAM0 to SRAM3, the lower 256 KiB), the XIP cache
+// and boot RAM, and the switched core.
+pub const DOMAIN_SRAM1: u32 = 1 << 0
+pub const DOMAIN_SRAM0: u32 = 1 << 1
+pub const DOMAIN_XIP: u32 = 1 << 2
+pub const DOMAIN_SWCORE: u32 = 1 << 3
+
+// GPIO events that can power the chip up, PWRUP0 to PWRUP3.
+pub const POWER_UP_SOURCES: u32 = 4
+
+// SCRATCH0 to SCRATCH6 are the program's; SCRATCH7 holds the record of a
+// power-down: RECORD_MAGIC, the domains kept, and whether the always-on
+// timer ticked from the crystal before.
+pub const SCRATCH_WORDS: u32 = 7
+const RECORD: usize = SCRATCH0 + 4 * 7
+const RECORD_MAGIC: u32 = 0xD0D0_0000
+const RECORD_CRYSTAL: u32 = 1 << 8
+
+// Polls of STATE before a power-down that never waits for the processors
+// is reported: the power manager's clock is slow, but not this slow.
+const STATE_ATTEMPTS: u32 = 100_000
+
+// The PWRUP sources of a power-down and its timeout, from plan_power_down.
+pub struct PowerDown {
+    // The PWRUPn values, without ENABLE, for n below `count`.
+    pub sources: [4]u32
+    pub count: u32
+    // 0 for none.
+    pub timeout_ms: u64
+}
+
+// The PWRUP sources for `wake`: one per pin event, as a GPIO's level or
+// edge, low or falling, high or rising. InvalidInput if `wake` is empty,
+// names a pin from `pin_count` up, or more than POWER_UP_SOURCES events.
+pub fn plan_power_down(wake: &power.Wake, pin_count: u32) -> PowerDown!hal.Error {
+    check_wake(wake, pin_count)?
+    plan := PowerDown { sources: [0u32; 4], count: 0, timeout_ms: wake.timeout_ms() }
+    limit := pin_count
+    if limit > power.MAX_PINS {
+        limit = power.MAX_PINS
+    }
+    for pin in 0u32..limit {
+        events := wake.events(pin)
+        for bit in 0u32..4 {
+            event := 1u32 << bit
+            if (events & event) != 0 {
+                if plan.count == POWER_UP_SOURCES {
+                    return err(hal.Error.InvalidInput)
+                }
+                source := pin
+                if event == power.LEVEL_HIGH || event == power.RISING_EDGE {
+                    source |= PWRUP_HIGH
+                }
+                if event == power.FALLING_EDGE || event == power.RISING_EDGE {
+                    source |= PWRUP_EDGE
+                }
+                plan.sources[plan.count as usize] = source
+                plan.count += 1
+            }
+        }
+    }
+    return ok(plan)
+}
+
+// Write `bits` through a POWMAN register's set or clear alias, with the
+// password.
+fn powman_set<R: hal.Registers>(powman: &mut R, offset: usize, bits: u32) {
+    powman.write(offset + SET_ALIAS, PASSWORD | bits)
+}
+
+fn powman_clear<R: hal.Registers>(powman: &mut R, offset: usize, bits: u32) {
+    powman.write(offset + CLEAR_ALIAS, PASSWORD | bits)
+}
+
+// Stop every PWRUP source, and powering up on the alarm.
+fn disarm_power_up<R: hal.Registers>(powman: &mut R) {
+    for index in 0usize..4 {
+        powman_clear(powman, PWRUP0 + 4 * index, PWRUP_ENABLE)
+    }
+    powman_clear(powman, TIMER, TIMER_PWRUP_ON_ALARM)
+}
+
+// Arm `plan`'s sources, keep the SRAM domains in `retain` (DOMAIN_SRAM0
+// and DOMAIN_SRAM1) powered, and request a power state with the switched
+// core and the XIP domain off. A timeout fires at `alarm_ms` on the
+// always-on timer, which replaces its alarm. `lposc_hz`, unless 0, is the
+// low-power oscillator's frequency: a timer ticking from the crystal
+// changes to it now, as the power sequencer would, and the record says so
+// for take_power_down_wake. The switched core powers off once both
+// processors wait for an interrupt. Busy if the power manager ignores the
+// request, as for a power-up request already pending, InvalidInput if it
+// refuses the state, Timeout if it never waits for the processors; the
+// sources are disarmed then.
+//
+// SAFETY: `powman` must be the power manager's registers, interrupts must
+// be masked, and nothing else may use its timer, PWRUP, STATE, or SCRATCH7
+// registers meanwhile.
+pub unsafe fn enter_power_down<R: hal.Registers>(powman: &mut R, plan: &PowerDown, retain: u32, alarm_ms: u64, lposc_hz: u32) -> void!hal.Error {
+    if (retain & ~(DOMAIN_SRAM0 | DOMAIN_SRAM1)) != 0 {
+        return err(hal.Error.InvalidInput)
+    }
+    // An attached debugger would hold the switched core on otherwise.
+    powman.write(DBG_PWRCFG, PASSWORD | 1)
+    record := RECORD_MAGIC | retain
+    if (powman.read(TIMER) & TIMER_USING_XOSC) != 0 {
+        record |= RECORD_CRYSTAL
+        rp_rtc.aon_tick_from_lposc(powman, lposc_hz)?
+    }
+    powman_set(powman, VREG_CTRL, VREG_UNLOCK)
+    powman_clear(powman, SEQ_CFG, HW_PWRUP_SRAM0 | HW_PWRUP_SRAM1)
+    kept := 0u32
+    if (retain & DOMAIN_SRAM0) != 0 {
+        kept |= HW_PWRUP_SRAM0
+    }
+    if (retain & DOMAIN_SRAM1) != 0 {
+        kept |= HW_PWRUP_SRAM1
+    }
+    if kept != 0 {
+        powman_set(powman, SEQ_CFG, kept)
+    }
+    // The boot ROM boots normally, not through a POWMAN boot vector.
+    for index in 0usize..4 {
+        powman.write(BOOT0 + 4 * index, 0)
+    }
+    powman.write(RECORD, record)
+    disarm_power_up(powman)
+    for index in 0u32..plan.count {
+        offset := PWRUP0 + 4 * index as usize
+        powman.write(offset, PASSWORD | plan.sources[index as usize])
+        // Forget an edge latched before; enable it separately, so the
+        // source has settled (as the Pico SDK does).
+        powman_clear(powman, offset, PWRUP_STATUS)
+        powman_set(powman, offset, PWRUP_ENABLE)
+    }
+    if plan.timeout_ms != 0 {
+        rp_rtc.aon_arm_alarm(powman, alarm_ms)
+        powman_set(powman, TIMER, TIMER_PWRUP_ON_ALARM)
+    }
+    powman_clear(powman, STATE, STATE_REQ_IGNORED | STATE_PWRUP_WHILE_WAITING)
+    down := DOMAIN_SWCORE | DOMAIN_XIP | (~retain & (DOMAIN_SRAM0 | DOMAIN_SRAM1))
+    powman.write(STATE, PASSWORD | (down << 4))
+    state := powman.read(STATE)
+    failure := hal.Error.Timeout
+    if (state & STATE_REQ_IGNORED) != 0 {
+        failure = hal.Error.Busy
+    } else if (state & STATE_BAD_SW_REQ) != 0 {
+        failure = hal.Error.InvalidInput
+    } else {
+        for _ in 0..STATE_ATTEMPTS {
+            if (powman.read(STATE) & STATE_WAITING) != 0 {
+                // A power-up request while waiting cancels the request and
+                // raises POWMAN_IRQ_POW, which ends the processor's wait.
+                powman.write(INTE + SET_ALIAS, INTE_PWRUP_WHILE_WAITING)
+                return ok()
+            }
+        }
+        // Withdraw the request: every domain on.
+        powman.write(STATE, PASSWORD)
+    }
+    cancel_power_down(powman)
+    return err(failure)
+}
+
+// True once a power-up request has cancelled the power-down that
+// enter_power_down requested.
+pub fn power_down_cancelled<R: hal.Registers>(powman: &mut R) -> bool {
+    return (powman.read(STATE) & STATE_PWRUP_WHILE_WAITING) != 0
+}
+
+// Undo enter_power_down after it returned or failed: disarm the sources
+// and the alarm, and forget the record.
+pub fn cancel_power_down<R: hal.Registers>(powman: &mut R) {
+    disarm_power_up(powman)
+    powman_clear(powman, TIMER, TIMER_ALARM_ENAB)
+    powman_clear(powman, TIMER, TIMER_ALARM)
+    powman.write(INTE + CLEAR_ALIAS, INTE_PWRUP_WHILE_WAITING)
+    powman.write(RECORD, 0)
+}
+
+// What take_power_down_wake found.
+pub struct PowerDownWake {
+    // The reset was the restart after a power-down that enter_power_down
+    // requested.
+    pub happened: bool
+    // What powered the chip up, as a power.Power.dormant result: the pins
+    // of the PWRUP sources that did, and power.BY_TIME for the alarm.
+    pub woken: u64
+    // The SRAM domains kept powered, DOMAIN_SRAM0 and DOMAIN_SRAM1.
+    pub retained: u32
+    // The always-on timer ticked from the crystal before.
+    pub crystal_tick: bool
+}
+
+// After a reset, report a power-down that enter_power_down requested, and
+// forget its record and PWRUP sources whatever the reset was.
+//
+// SAFETY: as for enter_power_down.
+pub unsafe fn take_power_down_wake<R: hal.Registers>(powman: &mut R) -> PowerDownWake {
+    record := powman.read(RECORD)
+    result := PowerDownWake { happened: false, woken: 0, retained: 0, crystal_tick: false }
+    if (record & 0xFFFF_0000) == RECORD_MAGIC && (powman.read(CHIP_RESET) & HAD_SWCORE_PD) != 0 {
+        result.happened = true
+        result.retained = record & (DOMAIN_SRAM0 | DOMAIN_SRAM1)
+        result.crystal_tick = (record & RECORD_CRYSTAL) != 0
+        last := powman.read(LAST_SWCORE_PWRUP)
+        for index in 0u32..4 {
+            if (last & (1u32 << (index + 1))) != 0 {
+                pin := powman.read(PWRUP0 + 4 * index as usize) & PWRUP_SOURCE
+                if pin < power.MAX_PINS {
+                    result.woken |= 1u64 << pin as u64
+                }
+            }
+        }
+        if (last & POWERED_UP_BY_ALARM) != 0 {
+            result.woken |= power.BY_TIME
+        }
+    }
+    disarm_power_up(powman)
+    powman.write(RECORD, 0)
+    return result
 }

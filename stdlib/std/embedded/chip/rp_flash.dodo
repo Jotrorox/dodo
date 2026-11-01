@@ -1,6 +1,5 @@
 package rp_flash
 
-import "core/cpu"
 import "core/ptr"
 import "std/embedded/hal"
 import "std/embedded/chip/rp_multicore"
@@ -26,9 +25,12 @@ import "std/embedded/chip/rp_multicore"
 // the flash out of execute-in-place mode while it works, so no code or data
 // may be read from flash meanwhile. Regions therefore mask interrupts on
 // the calling core for the duration, run the RP2040's part from SRAM, and
-// refuse with Busy on core 1 and while core 1 runs a task
-// (rp_multicore.core1_running): stop core 1 first. DMA transfers must not
-// read from flash meanwhile either.
+// park the other core, if it runs, in SRAM with rp_multicore.lockout, one
+// sector erase or page write at a time. Either core may erase and write;
+// a region reports the lockout's Timeout if the other core does not answer,
+// for example while it keeps interrupts masked, and Busy if it holds the
+// lockout itself for too long. DMA transfers must not read from flash
+// meanwhile.
 //
 // An erase covers 4 KiB sectors and takes about 50 ms each, during which
 // interrupts wait; a USB serial port stays connected, as its controller
@@ -190,16 +192,18 @@ pub struct Region: hal.Flash {
         if offset % SECTOR_BYTES != 0 || length % SECTOR_BYTES != 0 {
             return err(hal.Error.InvalidInput)
         }
-        writable()?
-        // One sector at a time, so interrupts wait for one erase at most.
+        // One sector at a time, so interrupts and the other core wait for
+        // one erase at most.
         done := 0u32
         for done < length {
+            pause := rp_multicore.lockout()?
             // SAFETY: the region lies in the free flash above the program,
-            // claimed once from Flash, and writable() makes sure no other
-            // core runs from flash.
+            // claimed once from Flash, and the lockout keeps the other core
+            // off the flash.
             result := unsafe {
                 dodo_flash_erase(at + done, SECTOR_BYTES)
             }
+            core.drop(pause)
             if result != 0 {
                 return err(hal.Error.Bus)
             }
@@ -210,7 +214,6 @@ pub struct Region: hal.Flash {
 
     pub fn write(&mut self, offset: u32, bytes: &[u8]) -> void!hal.Error {
         start := self.place(offset, bytes.len as u32)?
-        writable()?
         page: [256]u8 = [hal.FLASH_ERASED; 256]
         done := 0u32
         total := bytes.len as u32
@@ -227,10 +230,12 @@ pub struct Region: hal.Flash {
             for index in 0..count as usize {
                 page[skip as usize + index] = bytes[done as usize + index]
             }
+            pause := rp_multicore.lockout()?
             // SAFETY: as in erase; the page is in SRAM, on this stack.
             result := unsafe {
                 dodo_flash_program(at - skip, ptr.as_ptr(&page), PAGE_BYTES)
             }
+            core.drop(pause)
             if result != 0 {
                 return err(hal.Error.Bus)
             }
@@ -249,20 +254,12 @@ pub struct Region: hal.Flash {
     }
 }
 
-// Busy on core 1 or while core 1 runs a task, which may run from flash.
-fn writable() -> void!hal.Error {
-    if cpu.core_id() != 0 || rp_multicore.core1_running() {
-        return err(hal.Error.Busy)
-    }
-    return ok()
-}
-
 // Copy flash from `offset` into `buffer`; the range lies inside the flash.
 fn copy_out(offset: u32, buffer: &mut[u8]) {
     // SAFETY: the bytes lie inside the flash's memory-mapped window, which
     // reads like memory between erases and writes; those run with
-    // interrupts masked on core 0 while core 1 runs no task, so none is in
-    // progress here.
+    // interrupts masked on their core and the other core parked by the
+    // lockout, so none is in progress here.
     unsafe {
         ptr.copy_nonoverlapping((XIP_BASE + offset as usize) as *const u8, ptr.as_mut_ptr(buffer), buffer.len)
     }

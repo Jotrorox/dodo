@@ -2,8 +2,10 @@ package main
 
 import "std/embedded/board"
 import "core/mem"
+import "core/option"
 import "std/embedded/chip"
 import "std/embedded/chip/rp_adc"
+import "std/embedded/chip/rp_capture"
 import "std/embedded/chip/rp_dma"
 import "std/embedded/chip/rp_flash"
 import "std/embedded/chip/rp_multicore"
@@ -872,6 +874,104 @@ fn usb_checks(usb: &mut board.Usb, pins: &mut chip.Pins, timer: &mut chip.Timer)
     check(owned && configured && quick && shared)
 }
 
+const ADC_SAMPLES: executor.Signal = executor.Signal { id: 29 }
+const ADC_ROUND: u32 = rp_adc.GPIO26 | rp_adc.GPIO27 | rp_adc.TEMPERATURE
+// Buffers for adc_sampler_checks, static to keep them off the stack: a
+// capture, and a stream's ring of 512 samples, aligned to its size.
+static mut ADC_CAPTURE: [1000]u16 = [0u16; 1000]
+@align(1024)
+static mut ADC_RING: [512]u16 = [0u16; 512]
+
+// Samples follow the round of ADC_ROUND from GPIO 26, none failed, and
+// those of the temperature sensor read 0 to 70 C.
+fn adc_round(samples: &[u16], count: usize) -> bool {
+    good := true
+    for index in 0..count {
+        sample := samples[index]
+        input := rp_adc.sample_input(sample)
+        good = good && input == rp_adc.input_at(ADC_ROUND, index) && !rp_adc.sample_failed(sample)
+        if input == rp_adc.TEMPERATURE_INPUT {
+            celsius := rp_adc.millicelsius(rp_adc.sample_value(sample), 3300)
+            good = good && celsius > 0 && celsius < 70_000
+        }
+    }
+    return good
+}
+
+// The ADC's sampler with nothing connected to GP26 and GP27 (3 checks):
+// ownership, polled reads at its rate, the FIFO interrupt's signal, and
+// DMA captures and a stream at 100 000 samples a second.
+fn adc_sampler_checks(dma: &mut rp_dma.Dma, pins: &mut chip.Pins, timer: &mut chip.Timer) {
+    sampler := pins.sampler(ADC_ROUND, 30_000)!
+    owned := refused(pins.analog(28), hal.Error.Busy) && refused(pins.temperature(), hal.Error.Busy) && refused(pins.output(26), hal.Error.Busy) && refused(pins.sampler(rp_adc.GPIO28, 30_000), hal.Error.Busy)
+    // 300 samples at 30 000 a second take 10 ms. They are checked once
+    // all are in: checking each batch between reads, at -O0, takes longer
+    // than the FIFO holds samples, which `read` rightly reports as Overrun.
+    samples: [300]u16 = [0; 300]
+    sampler.start()
+    start := timer.now_us()
+    sampler.read(&mut samples)!
+    elapsed := timer.now_us() - start
+    sampler.stop()
+    polled := adc_round(&samples, 300)
+    check(owned && polled && sampler.rate_hz() == 30_000 && elapsed >= 9_800 && elapsed < 10_300)
+
+    // The FIFO interrupt raises the signal once 4 samples wait, 133 us in.
+    sampler.set_threshold(4)!
+    sampler.set_signal(&ADC_SAMPLES)
+    cx := executor.Context.new(0)
+    stale := ADC_SAMPLES.take(&mut cx)
+    sampler.start()
+    start = timer.now_us()
+    raised := false
+    for !raised && timer.now_us() - start < 2000 {
+        raised = ADC_SAMPLES.take(&mut cx)
+    }
+    waited := timer.now_us() - start
+    got := sampler.poll_read(&mut samples)!
+    sampler.stop()
+    sampler.clear_signal()
+    sampler.set_threshold(1)!
+    check(raised && waited >= 100 && waited < 300 && got >= 4)
+
+    // 1000 samples at 100 000 a second by DMA take 10 ms; eight-bit
+    // samples too; and a stream keeps 2000 samples coming while they are
+    // polled.
+    sampler.set_rate(100_000)!
+    channel := dma.channel()!
+    captured := false
+    timed := false
+    streamed := false
+    unsafe {
+        start = timer.now_us()
+        sampler.capture(&mut channel, &mut ADC_CAPTURE)!
+        elapsed = timer.now_us() - start
+        captured = adc_round(&ADC_CAPTURE, 1000) && !sampler.is_running()
+        timed = elapsed >= 9_900 && elapsed < 10_300
+        bytes: [64]u8 = [0; 64]
+        sampler.capture_bytes(&mut channel, &mut bytes)!
+        stream := sampler.stream(&mut channel, &mut ADC_RING)!
+        total := 0usize
+        streamed = stream.ring_size() == 512
+        start = timer.now_us()
+        for total < 2000 && timer.now_us() - start < 100_000 {
+            got = stream.poll_read(&mut samples)!
+            for index in 0..got {
+                input := rp_adc.sample_input(samples[index])
+                streamed = streamed && input == rp_adc.input_at(ADC_ROUND, total)
+                total += 1
+            }
+        }
+        streamed = streamed && total >= 2000
+    }
+    dma.release(channel)
+    pins.release_sampler(sampler)
+    knob := pins.analog(26)!
+    single := knob.read()! <= 4095
+    pins.release_analog(knob)
+    check(captured && timed && streamed && single)
+}
+
 const DMA_DONE: executor.Signal = executor.Signal { id: 30 }
 
 // DMA: the claim API, copies, and SPI, UART, and I2C transfers that run
@@ -913,7 +1013,7 @@ fn dma_checks(dma: &mut rp_dma.Dma, pins: &mut chip.Pins, timer: &mut chip.Timer
         transfers := spi.dma(&mut first, &mut second, &mut buffer)!
         bytes := transfers.buffer()!
         for index in 0..64usize {
-            bytes[index] = (index * 5 + 1) as u8
+            bytes[index] = ((index * 5 + 1) & 255) as u8
         }
         transfers.start_transfer(64)!
         lent := refused(transfers.buffer(), hal.Error.Busy)
@@ -926,7 +1026,7 @@ fn dma_checks(dma: &mut rp_dma.Dma, pins: &mut chip.Pins, timer: &mut chip.Timer
         echoed := transfers.buffer()!
         looped := true
         for index in 0..64usize {
-            looped = looped && echoed[index] == (index * 5 + 1) as u8
+            looped = looped && echoed[index] == ((index * 5 + 1) & 255) as u8
         }
         check(lent && spins > 1000 && raised && looped)
     }
@@ -1210,6 +1310,59 @@ fn power_checks(chip_power: &mut chip.Power, usb: &mut board.Usb, pins: &mut chi
     }
 }
 
+// clk_sys from the crystal and from PLL_SYS at 48 MHz, by the frequency
+// counter, and back at full speed. The timer keeps its rate, as it counts
+// clk_ref; a UART claimed at the slow rate keeps its baud, and while
+// claimed refuses a change.
+fn system_clock_checks(chip_power: &mut chip.Power, pins: &mut chip.Pins, timer: &mut chip.Timer) {
+    feed_watchdog()
+    crystal := chip_power.crystal_hz()
+    slow := !failed_with(chip_power.set_system_hz(crystal), hal.Error.Busy) && chip_power.system_hz() == crystal
+    crystal_khz := clk_sys_khz()
+    before := timer.now_us()
+    timer.delay_us(10_000)
+    delay := timer.now_us() - before
+    serial_ok := false
+    match pins.uart(4, none, 115_200) {
+        ok(port) => {
+            baud := port.baud()
+            busy := failed_with(chip_power.set_system_hz(chip.SYS_HZ), hal.Error.Busy)
+            pins.release_uart(port)
+            serial_ok = busy && baud > 113_000 && baud < 117_000
+        }
+        err(_) => {}
+    }
+    pll := !failed_with(chip_power.set_system_hz(48_000_000), hal.Error.Timeout) && chip_power.system_hz() == 48_000_000
+    pll_khz := clk_sys_khz()
+    back := !failed_with(chip_power.set_system_hz(chip.SYS_HZ), hal.Error.Timeout) && chip_power.system_hz() == chip.SYS_HZ
+    full_khz := clk_sys_khz()
+    check(slow && crystal_khz > 11_900 && crystal_khz < 12_100 && delay >= 10_000 && delay < 10_200 && serial_ok && pll && pll_khz > 47_500 && pll_khz < 48_500 && back && full_khz > chip.SYS_HZ / 1000 - 1000 && full_khz < chip.SYS_HZ / 1000 + 1000)
+}
+
+// A timed dormant state needs clk_rtc from a clock input. The Pico has no
+// 32 kHz oscillator on GPIO 20, so with the RTC unset only the refusals and
+// the input's ownership are checked.
+fn timed_dormant_checks(chip_power: &mut chip.Power, rtc: &mut chip.Rtc, pins: &mut chip.Pins) {
+    wake := power.Wake.new()
+    wake.after_ms(100)
+    unsupported := dormant_refused(chip_power, &wake, hal.Error.Unsupported) && !rtc.runs_while_dormant()
+    wrong := failed_with(rtc.use_clock_input(pins, 21, 32_768), hal.Error.InvalidInput) && failed_with(rtc.use_clock_input(pins, 20, 500), hal.Error.InvalidInput)
+    claimed := !failed_with(rtc.use_clock_input(pins, 20, 32_768), hal.Error.Timeout)
+    owned := refused(pins.input(20), hal.Error.Busy) && rtc.runs_while_dormant() && rtc.clock_hz() == 32_768
+    again := failed_with(rtc.use_clock_input(pins, 22, 32_768), hal.Error.Busy)
+    unset := dormant_refused(chip_power, &wake, hal.Error.Busy)
+    released := !failed_with(rtc.release_clock_input(pins), hal.Error.Timeout) && rtc.clock_hz() == 31_250 && !rtc.runs_while_dormant()
+    free := false
+    match pins.input(20) {
+        ok(pin) => {
+            pins.release(pin)
+            free = true
+        }
+        err(_) => {}
+    }
+    check(unsupported && wrong && claimed && owned && again && unset && released && free)
+}
+
 fn core1_checks(core1: &mut rp_multicore.Core1, fifos: &mut rp_multicore.Fifos, spinlocks: &mut rp_multicore.Spinlocks, timer: &mut chip.Timer) {
     feed_watchdog()
     fifo := fifos.claim()!
@@ -1288,6 +1441,85 @@ fn core1_checks(core1: &mut rp_multicore.Core1, fifos: &mut rp_multicore.Fifos, 
     spinlocks.release(lock)
 }
 
+// A pin core 1 listens to raises IO_IRQ_BANK0 on core 1, where the one
+// gpio_event handler runs and raises core 1's EDGE; core 0's stays quiet.
+// The pin goes to core 1 and back through CORE1_PIN, and core 1 reports
+// in CORE1_REPORT (core 1 keeps the FIFO end core1_checks gave it).
+static mut CORE1_PIN: Option<chip.Pin> = none
+static CORE1_REPORT: atomic.Atomic<u32> = atomic.Atomic.new(0u32)
+
+struct Core1Pin {
+    pub fn run(self) {
+        report := 0u32
+        slot := unsafe {
+            option.take(&mut CORE1_PIN)
+        }
+        if let some(pin) = slot {
+            output := pin
+            EDGE.reset()
+            output.listen(chip.RISING_EDGE)
+            cortex_m.unpend(chip.IO_IRQ_BANK0)
+            cortex_m.enable(chip.IO_IRQ_BANK0)
+            output.set_high()
+            spins := 0u32
+            for !EDGE.is_raised() && spins < 100_000 {
+                spins += 1
+            }
+            if EDGE.is_raised() {
+                report |= 1
+            }
+            report |= output.events_on(1) << 4
+            report |= output.events_on(0) << 8
+            output.clear_events(chip.RISING_EDGE)
+            output.ignore(chip.RISING_EDGE)
+            output.set_low()
+            cortex_m.disable(chip.IO_IRQ_BANK0)
+            cortex_m.unpend(chip.IO_IRQ_BANK0)
+            unsafe {
+                CORE1_PIN = some(output)
+            }
+        }
+        match CORE1_REPORT.store(report | (rp_multicore.core_id() << 12), atomic.Ordering.Release) {
+            ok() => {}
+            err(_) => {}
+        }
+    }
+}
+
+fn core1_gpio_checks(core1: &mut rp_multicore.Core1, pins: &mut chip.Pins, timer: &mut chip.Timer) {
+    feed_watchdog()
+    // The Pico boards' chips have 30 GPIOs; on the RP2350 take() reads it
+    // from SYSINFO's PACKAGE_SEL.
+    counted := pins.pin_count() == chip.PIN_COUNT && refused(pins.input(chip.PIN_COUNT), hal.Error.InvalidInput)
+    pin := pins.output(EVENT_PIN)!
+    unsafe {
+        CORE1_PIN = some(pin)
+    }
+    running := unsafe {
+        core1.start(&mut CORE1_STACK, Core1Pin {})!
+    }
+    start := timer.now_us()
+    for !running.is_finished() && timer.now_us() - start < 10_000 {}
+    running.stop()
+    report := 0u32
+    match CORE1_REPORT.load(atomic.Ordering.Acquire) {
+        ok(value) => {
+            report = value
+        }
+        err(_) => {}
+    }
+    quiet := !cortex_m.is_pending(chip.IO_IRQ_BANK0)
+    slot := unsafe {
+        option.take(&mut CORE1_PIN)
+    }
+    returned := false
+    if let some(back) = slot {
+        returned = true
+        pins.release(back)
+    }
+    check(counted && report == ((1u32 << 12) | (chip.RISING_EDGE << 4) | 1) && quiet && returned)
+}
+
 // The program flash and std/embedded/storage on it. The regions sit below
 // the last sector, which the RP2350 self-tests keep their record in.
 fn flash_checks(flash: &mut rp_flash.Flash, core1: &mut rp_multicore.Core1, timer: &mut chip.Timer) {
@@ -1347,16 +1579,6 @@ fn flash_checks(flash: &mut rp_flash.Flash, core1: &mut rp_multicore.Core1, time
     }
     check(blank && same && mapped_byte == bytes[299] && edge && erased && clk_sys_khz() > 0)
 
-    // Core 1 may run from flash, so no erase or write while it runs.
-    feed_watchdog()
-    running := unsafe {
-        core1.start(&mut CORE1_STACK, Flag {})!
-    }
-    busy := refused_flash(area.erase(0, rp_flash.SECTOR_BYTES), hal.Error.Busy) && refused_flash(area.write(0, &tail), hal.Error.Busy)
-    running.stop()
-    area.write(0, &tail)!
-    check(busy)
-
     // A key-value store over the region: 300 updates of a 100-byte value
     // compact its four sectors twice over.
     feed_watchdog()
@@ -1412,17 +1634,137 @@ fn flash_checks(flash: &mut rp_flash.Flash, core1: &mut rp_multicore.Core1, time
     kept = kept && again.start() == end
     flash.release(again)
     check(kept)
+    flash_lockout_checks(flash, core1, timer)
 }
 
-fn refused_flash(result: void!hal.Error, expected: hal.Error) -> bool {
-    match result {
-        ok() => {
-            return false
+// Core 1 counts in SPINS while core 0 erases and writes; TURN hands over to
+// core 1's side of the lockout checks and brings back its report.
+static SPINS: atomic.Atomic<u32> = atomic.Atomic.new(0u32)
+static TURN: atomic.Atomic<u32> = atomic.Atomic.new(0u32)
+const PARKED_CORE0: u32 = 4
+const WROTE_FROM_CORE1: u32 = 8
+
+fn load_word(word: &atomic.Atomic<u32>) -> u32 {
+    match word.load(atomic.Ordering.Acquire) {
+        ok(value) => {
+            return value
         }
-        err(error) => {
-            return error == expected
+        err(_) => {
+            return 0
         }
     }
+}
+
+fn store_word(word: &atomic.Atomic<u32>, value: u32) {
+    match word.store(value, atomic.Ordering.Release) {
+        ok() => {}
+        err(_) => {}
+    }
+}
+
+// One more count, from code in flash: only one core counts at a time.
+fn spin() {
+    store_word(&SPINS, load_word(&SPINS) + 1)
+}
+
+// Erase the region's first sector and write and read back three bytes.
+fn rewrite(region: &mut rp_flash.Region) -> bool {
+    pattern: [3]u8 = [0x11, 0x22, 0x33]
+    back := [0u8; 3]
+    match rewrite_bytes(region, &pattern, &mut back) {
+        ok() => {
+            return back[0] == 0x11 && back[1] == 0x22 && back[2] == 0x33
+        }
+        err(_) => {
+            return false
+        }
+    }
+}
+
+fn rewrite_bytes(region: &mut rp_flash.Region, pattern: &[u8], back: &mut[u8]) -> void!hal.Error {
+    region.erase(0, rp_flash.SECTOR_BYTES)?
+    region.write(100, pattern)?
+    region.read(100, back)?
+    return ok()
+}
+
+// On core 1: count until core 0 hands over, then lock core 0 out and see its
+// count stand still, then erase and write a region of its own while core 0
+// counts from flash, and report both in TURN.
+struct FlashWorker {
+    region: rp_flash.Region
+
+    pub fn run(self) {
+        let FlashWorker { region } = self
+        own := region
+        for load_word(&TURN) == 0 {
+            spin()
+        }
+        report := 2u32
+        match rp_multicore.lockout() {
+            ok(pause) => {
+                before := load_word(&SPINS)
+                still := pause.is_parked()
+                for _ in 0..200_000 {
+                    still = still && load_word(&SPINS) == before
+                }
+                core.drop(pause)
+                if still {
+                    report |= PARKED_CORE0
+                }
+            }
+            err(_) => {}
+        }
+        if rewrite(&mut own) {
+            report |= WROTE_FROM_CORE1
+        }
+        store_word(&TURN, report)
+    }
+}
+
+// Either core erases and writes the flash while the other runs from it:
+// rp_multicore's lockout parks the other core in SRAM meanwhile, its count
+// standing still, and lets it go on afterwards. Core 1 keeps its region.
+fn flash_lockout_checks(flash: &mut rp_flash.Flash, core1: &mut rp_multicore.Core1, timer: &mut chip.Timer) {
+    feed_watchdog()
+    start := flash.capacity() - 5 * rp_flash.SECTOR_BYTES
+    area := flash.region(start, rp_flash.SECTOR_BYTES)!
+    other := flash.region(start - rp_flash.SECTOR_BYTES, rp_flash.SECTOR_BYTES)!
+    store_word(&SPINS, 0)
+    store_word(&TURN, 0)
+    running := unsafe {
+        core1.start(&mut CORE1_STACK, FlashWorker { region: other })!
+    }
+    timer.delay_ms(1)
+    counting := load_word(&SPINS) > 0
+    written := rewrite(&mut area)
+    moved := load_word(&SPINS)
+    timer.delay_ms(1)
+    resumed := load_word(&SPINS) != moved
+    parked := false
+    match rp_multicore.lockout() {
+        ok(pause) => {
+            before := load_word(&SPINS)
+            timer.delay_ms(2)
+            parked = pause.is_parked() && load_word(&SPINS) == before
+            core.drop(pause)
+        }
+        err(_) => {}
+    }
+    after := load_word(&SPINS)
+    timer.delay_ms(1)
+    parked = parked && load_word(&SPINS) != after
+    // Core 1's turn, while core 0 counts from flash.
+    store_word(&TURN, 1)
+    begin := timer.now_us()
+    for load_word(&TURN) < 2 && timer.now_us() - begin < 1_000_000 {
+        spin()
+    }
+    report := load_word(&TURN)
+    running.stop()
+    flash.release(area)
+    check(counting && written && resumed && (report & WROTE_FROM_CORE1) != 0)
+    check(parked && (report & PARKED_CORE0) != 0)
 }
 
 // Random numbers: the board's generator fills two 64-byte buffers that
@@ -1561,6 +1903,147 @@ fn rtc_checks(rtc: &mut chip.Rtc, watchdog: &mut rp_watchdog.Watchdog, timer: &m
     check(armed && fired && on_time && pending && cleared && !still && quiet)
 }
 
+// Timer channels: an alarm as a compare channel and a drift-free periodic
+// timer (and on the RP2350 TIMER1 at clk_sys and at 1 MHz); a PWM slice as
+// a periodic timer whose count the timer extends exactly; and a PIO edge
+// capture of a pin another state machine toggles every 32000 cycles, whose
+// edges are 8000 ticks of clk_sys / 4 apart, exactly, and whose full FIFO
+// reports Overrun.
+const TOGGLE: rp_pio.Program = rp_pio.assemble("set pins, 1 [31]", "set pins, 0 [31]")
+
+fn timer_channel_checks(pins: &mut chip.Pins, timer: &mut chip.Timer) {
+    alarm := timer.alarm(2)!
+    start := alarm.now_ticks()
+    alarm.schedule_at_ticks(start + 2000)!
+    for !alarm.fired() && alarm.now_ticks() - start < 10_000 {}
+    fired := alarm.now_ticks() - start
+    alarm.clear()
+    alarm.start(1000)!
+    begin := alarm.now_us()
+    for alarm.now_us() - begin < 3500 {}
+    missed := alarm.poll_periods()
+    for !alarm.fired() && alarm.now_us() - begin < 10_000 {}
+    next := alarm.poll_periods()
+    waited := alarm.now_us() - begin
+    timer.release_alarm(alarm)
+    timed := fired >= 2000 && fired < 2010 && missed == 3 && next == 1 && waited >= 3995 && waited < 4010
+    alarms := timed && second_timer_checks(timer)
+
+    // A PWM slice at clk_sys: its count against the timer's, and periods.
+    per_us := (chip.SYS_HZ / 1_000_000) as u64
+    period := chip.SYS_HZ as u64 / 4000
+    slice := pins.pwm_timer(3, chip.SYS_HZ)!
+    before := timer.now_us()
+    slice.start(period)!
+    monotonic := true
+    last := slice.now_ticks()
+    for timer.now_us() - before < 10_000 {
+        ticks := slice.now_ticks()
+        monotonic = monotonic && ticks >= last
+        last = ticks
+    }
+    periods := slice.poll_periods()
+    ticks := slice.now_ticks()
+    spent := timer.now_us() - before
+    counted := ticks + 3 * per_us >= spent * per_us && ticks <= spent * per_us + 3 * per_us
+    whole := periods as u64 == ticks / period || periods as u64 + 1 == ticks / period
+    wrapped := !slice.wrapped()
+    for !slice.wrapped() && timer.now_us() - before < 20_000 {}
+    wrapped = wrapped && slice.wrapped() && slice.poll_periods() == 1 && !slice.wrapped()
+    // Periods of 10 us, the shortest period allowed is 8.
+    slice.start(10 * per_us)!
+    mark := timer.now_us()
+    for timer.now_us() - mark < 1000 {}
+    short := slice.poll_periods()
+    pins.release_pwm_timer(slice)
+    micro := pins.pwm_timer(4, 1_000_000)!
+    micro.start(100)!
+    mark = timer.now_us()
+    for timer.now_us() - mark < 1050 {}
+    tens := micro.poll_periods()
+    pins.release_pwm_timer(micro)
+    slices := monotonic && counted && whole && wrapped && short >= 99 && short <= 101 && tens == 10
+
+    // A PIO edge capture.
+    pio := pins.pio(1)!
+    capture := pins.edge_capture(&mut pio, 6, rp_capture.BOTH, chip.SYS_HZ / 4)!
+    toggle := pio.load(&TOGGLE)!
+    machine := pio.free_state_machine()!
+    config := toggle.config()
+    config.set_set_pins(6, 1)!
+    config.set_divider(1000 * 256)!
+    machine.init(&config)
+    machine.set_pindirs(6, 1, 1)
+    machine.set_enabled(true)
+    exact := true
+    seen := 0u32
+    previous := 0u64
+    rising := false
+    mark = timer.now_us()
+    for seen < 6 && timer.now_us() - mark < 20_000 {
+        ticks := 0u64
+        match capture.poll_event(&mut ticks) {
+            ok(found) => {
+                if found {
+                    if seen > 0 {
+                        exact = exact && ticks - previous == 8000 && capture.rising() != rising
+                    }
+                    previous = ticks
+                    rising = capture.rising()
+                    seen += 1
+                }
+            }
+            err(_) => {
+                exact = false
+            }
+        }
+    }
+    // Twenty edges with nobody reading: eight wait, the rest are lost.
+    timer.delay_us(5200)
+    overrun := false
+    match capture.poll_event(&mut previous) {
+        ok(_) => {}
+        err(error) => {
+            overrun = error == hal.Error.Overrun
+        }
+    }
+    queued := 0u32
+    first := 0u64
+    gaps := true
+    stamp := 0u64
+    for queued < 8 {
+        match capture.poll_event(&mut stamp) {
+            ok(found) => {
+                if !found {
+                    break
+                }
+                if queued > 0 {
+                    gaps = gaps && stamp - first == 8000 * queued as u64
+                } else {
+                    first = stamp
+                }
+                queued += 1
+            }
+            err(_) => {
+                gaps = false
+                break
+            }
+        }
+    }
+    machine.set_enabled(false)
+    pio.release_state_machine(machine)
+    pio.unload(toggle)
+    pins.release_edge_capture(capture, &mut pio)
+    pins.release_pio(pio)
+    // One check for all three, as the record holds 128.
+    check(alarms && slices && exact && seen == 6 && overrun && queued == 8 && gaps)
+}
+
+// The RP2040 has no second timer.
+fn second_timer_checks(timer: &mut chip.Timer) -> bool {
+    return true
+}
+
 fn main() {
     // A previous run hung and the watchdog reset the chip: report it.
     unsafe {
@@ -1696,12 +2179,17 @@ fn main() {
     pio_checks(&mut b.pins, &mut b.timer)
     usb_checks(&mut b.usb, &mut b.pins, &mut b.timer)
     dma_checks(&mut b.dma, &mut b.pins, &mut b.timer)
+    adc_sampler_checks(&mut b.dma, &mut b.pins, &mut b.timer)
     core1_checks(&mut b.core1, &mut b.fifos, &mut b.spinlocks, &mut b.timer)
+    core1_gpio_checks(&mut b.core1, &mut b.pins, &mut b.timer)
     rng_checks(&mut b.rng)
     power_checks(&mut b.power, &mut b.usb, &mut b.pins, &mut b.timer)
+    system_clock_checks(&mut b.power, &mut b.pins, &mut b.timer)
+    timed_dormant_checks(&mut b.power, &mut b.rtc, &mut b.pins)
     watchdog_checks(&mut b.watchdog, &mut b.timer)
     rtc_checks(&mut b.rtc, &mut b.watchdog, &mut b.timer)
     flash_checks(&mut b.flash, &mut b.core1, &mut b.timer)
+    timer_channel_checks(&mut b.pins, &mut b.timer)
 
     // Configuration is validated before ownership: an unusable crystal is
     // InvalidInput, a valid one is Busy because the board already took it.
