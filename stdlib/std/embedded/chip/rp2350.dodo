@@ -1,6 +1,7 @@
 package rp2350
 
 import "core/cpu"
+import "core/option"
 import "std/embedded/cortex_m"
 import "std/embedded/hal"
 import "std/embedded/power"
@@ -43,8 +44,9 @@ import "std/embedded/chip/rp_pins"
 // clk_peri = clk_sys, and 1 MHz ticks for TIMER0 and the watchdog. clk_adc
 // and clk_usb run at 48 MHz from PLL_USB while an ADC input or the USB
 // serial port is claimed. The flash
-// keeps the boot ROM's execute-in-place setup. Section numbers below refer to
-// the RP2350 datasheet.
+// keeps the boot ROM's execute-in-place setup. `Power.set_system_hz` runs
+// clk_sys slower, and the `Rtc` chooses the always-on timer's tick.
+// Section numbers below refer to the RP2350 datasheet.
 //
 // GPIO 0 to 29 are supported, all the RP2350A (QFN-60) has; the RP2350B's
 // GPIO 30 to 47 are not yet.
@@ -135,6 +137,10 @@ const CLK_ADC_DIV: usize = CLOCKS_BASE + 0x70
 const CLK_SYS_RESUS_CTRL: usize = CLOCKS_BASE + 0x84
 const CLK_REF_SRC: u32 = 0b11
 const CLK_REF_SRC_XOSC: u32 = 2
+// clk_ref from the low-power oscillator, and clk_sys's auxiliary source the
+// crystal, for a dormant state that the always-on timer ends (8.1.6.1).
+const CLK_REF_SRC_LPOSC: u32 = 3
+const CLK_SYS_AUXSRC_XOSC: u32 = 3 << 5
 const CLK_SYS_SRC_AUX: u32 = 1
 const CLK_SYS_AUXSRC: u32 = 0b111 << 5
 const CLK_ENABLE: u32 = 1 << 11
@@ -174,6 +180,35 @@ const TIMER_INTF: usize = TIMER0_BASE + 0x44
 const MAX_ALARM_SLEEP_US: u64 = 0x7FFF_FFFF
 // The power manager (6.4), whose always-on timer is the real-time clock.
 const POWMAN_BASE: usize = 0x4010_0000
+
+// The SRAM domains `Power.power_down` can keep powered, so their contents
+// survive: SRAM0 is SRAM0 to SRAM3, the lower 256 KiB from 0x2000_0000,
+// which holds the program's statics, `.noinit` ones included, unless they
+// pass 256 KiB; SRAM1 is SRAM4 to SRAM9, the rest, with the stack at its
+// top (6.2.1).
+pub const RETAIN_SRAM0: u32 = rp_power.DOMAIN_SRAM0
+pub const RETAIN_SRAM1: u32 = rp_power.DOMAIN_SRAM1
+pub const RETAIN_NOTHING: u32 = 0
+// The power manager's scratch registers for the program, which keep their
+// values through power-down and every reset but a loss of power:
+// `Power.scratch(0)` to `scratch(SCRATCH_WORDS - 1)`.
+pub const SCRATCH_WORDS: u32 = rp_power.SCRATCH_WORDS
+const POWMAN_SCRATCH0: usize = POWMAN_BASE + 0xB0
+
+// OTP row LPOSC_CALIB: the low-power oscillator's frequency in hertz,
+// measured in manufacturing, read through the ECC data window (13.10); the
+// Pico SDK ignores values outside 26 to 40 kHz.
+const OTP_DATA_BASE: usize = 0x4013_0000
+const OTP_LPOSC_CALIB_ROW: usize = 0x11
+const LPOSC_CALIB_MIN_HZ: u32 = 26_000
+const LPOSC_CALIB_MAX_HZ: u32 = 40_000
+
+// The USB controller needs clk_sys above 48 MHz (12.7.3.1, erratum
+// RP2350-E12).
+const USB_MIN_SYSTEM_HZ: u32 = 48_000_001
+// The blocks whose rates follow clk_sys or clk_peri, set when claimed:
+// Power.set_system_hz refuses while one is out of reset.
+const SYSTEM_CLOCKED: u32 = RESET_HSTX | RESET_I2C0 | RESET_I2C1 | RESET_PIO0 | RESET_PIO1 | RESET_PIO2 | RESET_PWM | RESET_SPI0 | RESET_SPI1 | RESET_UART0 | RESET_UART1
 
 // Alarms 0 to 3, raising TIMER0_IRQ_0 + n.
 pub const ALARM_COUNT: u32 = 4
@@ -370,6 +405,9 @@ static mut PLL_USB_USERS: u32 = 0
 // The pin the USB bootloader lights while its drive is accessed, after the
 // USB serial port restarts the chip into it; PIN_COUNT for none.
 static mut USB_ACTIVITY_LED: u32 = PIN_COUNT
+// How clk_sys runs now; Power.set_system_hz changes it, with interrupts
+// masked.
+static mut SYSTEM_CLOCK: rp_power.SystemClock = rp_power.SystemClock { hz: SYS_HZ, from_pll: true, vco_hz: VCO_HZ, post1: 5, post2: 2, divider: 1 }
 
 // Provided by the compiler's RP2350 firmware runtime: call the boot ROM
 // function with lookup code `code` ('R' | 'B' << 8 for reboot), or return -1
@@ -491,11 +529,27 @@ pub fn take(config: Config) -> Peripherals!hal.Error {
     unsafe {
         start_clocks(crystal)?
         reset_blocks(RESET_IO_BANK0 | RESET_PADS_BANK0 | RESET_TIMER0 | RESET_DMA | RESET_TRNG)?
+        // The controllers whose rates follow clk_sys stay in reset until
+        // claimed, whatever ran before, so Power.set_system_hz sees only
+        // the claimed ones.
+        hold := reg(RESET + SET_ALIAS)
+        hold.write(SYSTEM_CLOCKED)
     }
     // SAFETY: TAKEN guarantees one Rtc, the only user of the power
-    // manager's timer, alarm, and interrupt enable registers.
+    // manager's timer, alarm, and interrupt enable registers apart from
+    // Power, which uses them only while interrupts are masked.
     aon := unsafe {
         rp_rtc.AonTimer.new(hal.RegisterBlock.at(POWMAN_BASE), crystal)?
+    }
+    // SAFETY: TAKEN guarantees one Power, the only user of the power
+    // manager's PWRUP, STATE, and SCRATCH7 registers.
+    down := unsafe {
+        powman := hal.RegisterBlock.at(POWMAN_BASE)
+        rp_power.take_power_down_wake(&mut powman)
+    }
+    if down.crystal_tick {
+        // The power sequencer moved the tick to the low-power oscillator.
+        aon.use_crystal(crystal)?
     }
     // SAFETY: the timer was just taken out of reset; Timer only reads its
     // free-running counter registers.
@@ -542,8 +596,9 @@ pub fn take(config: Config) -> Peripherals!hal.Error {
     flash := unsafe {
         rp_flash.Flash.take()
     }
-    power := Power { crystal_hz: crystal }
-    return ok(Peripherals { pins: Pins { bank }, timer, rtc: Rtc { aon }, watchdog, usb, dma, rng, core1, fifos, spinlocks, doorbells, power, flash })
+    power := Power { crystal_hz: crystal, powered_down: down.happened, woken: down.woken, retained: down.retained }
+    rtc := Rtc { aon, crystal_hz: crystal, external: false, clock_pin: none }
+    return ok(Peripherals { pins: Pins { bank }, timer, rtc, watchdog, usb, dma, rng, core1, fifos, spinlocks, doorbells, power, flash })
 }
 
 // SAFETY: the caller owns `address`, a 32-bit RP2350 register.
@@ -677,6 +732,76 @@ unsafe fn start_clocks(crystal_hz: u32) -> void!hal.Error {
         start_tick(TICK_WATCHDOG, crystal_hz / 1_000_000)
         return ok()
     }
+}
+
+// clk_sys now, as Power.set_system_hz left it.
+fn system_hz() -> u32 {
+    // SAFETY: a single aligned word, written only with interrupts masked.
+    unsafe {
+        return SYSTEM_CLOCK.hz
+    }
+}
+
+// Run clk_sys at `plan`'s rate: from clk_ref first, then from PLL_SYS
+// restarted at the new rate, or from clk_ref divided down with PLL_SYS
+// stopped. On an error clk_sys stays on the crystal, undivided.
+// SAFETY: interrupts must be masked, the caller owns the clock and PLL_SYS
+// registers, and nothing may depend on clk_sys's rate meanwhile.
+unsafe fn switch_system_clock(crystal_hz: u32, plan: &rp_power.SystemClock) -> void!hal.Error {
+    unsafe {
+        sys_ctrl := reg(CLK_SYS_CTRL)
+        sys_ctrl.clear_bits(CLK_SYS_SRC_AUX)
+        sys_selected := reg(CLK_SYS_SELECTED)
+        sys_selected.wait_set(1, ATTEMPTS)?
+        sys_div := reg(CLK_SYS_DIV)
+        sys_div.write(DIVIDE_BY_ONE)
+        hold := reg(RESET + SET_ALIAS)
+        hold.write(RESET_PLL_SYS)
+        SYSTEM_CLOCK = rp_power.SystemClock { hz: crystal_hz, from_pll: false, vco_hz: 0, post1: 1, post2: 1, divider: 1 }
+        if plan.from_pll {
+            start_pll(PLL_SYS_BASE, RESET_PLL_SYS, crystal_hz, plan.vco_hz, plan.post1, plan.post2)?
+            sys_ctrl.clear_bits(CLK_SYS_AUXSRC)
+            sys_ctrl.set_bits(CLK_SYS_SRC_AUX)
+            sys_selected.wait_set(1 << 1, ATTEMPTS)?
+        } else {
+            sys_div.write(plan.divider * DIVIDE_BY_ONE)
+        }
+        SYSTEM_CLOCK = rp_power.SystemClock { hz: plan.hz, from_pll: plan.from_pll, vco_hz: plan.vco_hz, post1: plan.post1, post2: plan.post2, divider: plan.divider }
+        return ok()
+    }
+}
+
+// Restart PLL_SYS as SYSTEM_CLOCK says, if clk_sys runs from it, and run
+// clk_sys from it again: after a dormant state, which ran clk_sys from
+// clk_ref with PLL_SYS stopped.
+// SAFETY: as for switch_system_clock, with clk_sys running from clk_ref.
+unsafe fn restore_system_clock(crystal_hz: u32) -> void!hal.Error {
+    unsafe {
+        if !SYSTEM_CLOCK.from_pll {
+            return ok()
+        }
+        start_pll(PLL_SYS_BASE, RESET_PLL_SYS, crystal_hz, SYSTEM_CLOCK.vco_hz, SYSTEM_CLOCK.post1, SYSTEM_CLOCK.post2)?
+        sys_ctrl := reg(CLK_SYS_CTRL)
+        sys_ctrl.clear_bits(CLK_SYS_AUXSRC)
+        sys_ctrl.set_bits(CLK_SYS_SRC_AUX)
+        sys_selected := reg(CLK_SYS_SELECTED)
+        return sys_selected.wait_set(1 << 1, ATTEMPTS)
+    }
+}
+
+// The low-power oscillator's frequency from OTP, or 0 if the row holds
+// none in the expected range.
+fn lposc_calibration() -> u32 {
+    // SAFETY: the OTP's ECC data window is readable by Secure code, and
+    // reading a row has no side effects.
+    hz := unsafe {
+        row: hal.Reg<u16> = hal.Reg.at(OTP_DATA_BASE + 2 * OTP_LPOSC_CALIB_ROW)
+        row.read() as u32
+    }
+    if hz < LPOSC_CALIB_MIN_HZ || hz > LPOSC_CALIB_MAX_HZ {
+        return 0
+    }
+    return hz
 }
 
 // The 30 user GPIOs, and the I2C, SPI, and UART controllers that use them.
@@ -965,7 +1090,7 @@ pub struct Usb {
     // pass the default identity with the board's name, and the board's
     // LED.
     pub fn serial_with(&mut self, identity: rp_usb.Identity, activity_led: u32) -> rp_usb.Serial!hal.Error {
-        if self.open {
+        if self.open || system_hz() < USB_MIN_SYSTEM_HZ {
             return err(hal.Error.Busy)
         }
         // SAFETY: `open` makes this the only user of the controller, its
@@ -1076,7 +1201,7 @@ struct Chip {
     }
 
     pub fn clock_hz(&self) -> u32 {
-        return SYS_HZ
+        return system_hz()
     }
 
     pub fn pwm_slices(&self) -> u32 {
@@ -1252,16 +1377,125 @@ pub struct Pin {
 }
 
 // The always-on timer of the power manager as a real-time clock: a
-// millisecond counter, ticking from the crystal, with an alarm. Implements
-// the std/embedded/hal Rtc and RtcAlarm protocols, so
-// `hal.rtc_now(&mut b.rtc)` reads it as a date and time. It sits in the
-// always-on power domain: once set, it keeps counting through the resets
-// that leave that domain running, such as the watchdog's, so a later take()
-// finds it still set; it stops when the chip loses power, and pauses while
-// the chip is dormant, which stops the crystal. The alarm raises
-// POWMAN_IRQ_TIMER while `listen`ing, and its handler calls `clear_alarm`.
+// millisecond counter with an alarm. Implements the std/embedded/hal Rtc
+// and RtcAlarm protocols, so `hal.rtc_now(&mut b.rtc)` reads it as a date
+// and time. It sits in the always-on power domain: once set, it keeps
+// counting through the resets that leave that domain running, such as the
+// watchdog's and the restart after `Power.power_down`, so a later take()
+// finds it still set; it stops when the chip loses power. It ticks from the
+// crystal, the most precise source, until told otherwise; the low-power
+// oscillator, an external 32 kHz clock, or an external 1 kHz tick keep it
+// counting while the crystal is stopped too, and Power moves a crystal tick
+// to the low-power oscillator by itself for a timed dormant state or a
+// power-down (12.10.5). The alarm raises POWMAN_IRQ_TIMER while
+// `listen`ing, and its handler calls `clear_alarm`.
 pub struct Rtc: hal.Rtc + hal.RtcAlarm {
     aon: rp_rtc.AonTimer<hal.RegisterBlock>
+    crystal_hz: u32
+    // A GPIO time reference from `use_clock_input` or `use_tick_input`.
+    external: bool
+    clock_pin: Option<Pin>
+
+    // Where the tick comes from: rp_rtc.TICK_CRYSTAL, TICK_LPOSC,
+    // TICK_CLOCK_INPUT, or TICK_INPUT.
+    pub fn tick_source(&mut self) -> u32 {
+        return self.aon.tick_source()
+    }
+
+    // Tick from the crystal, as take() sets up. Busy while a GPIO time
+    // reference is in use: `release_clock_input` returns to the crystal.
+    pub fn use_crystal(&mut self) -> void!hal.Error {
+        if self.external {
+            return err(hal.Error.Busy)
+        }
+        return self.aon.use_crystal(self.crystal_hz)
+    }
+
+    // Tick from the low-power oscillator, at the frequency this chip's OTP
+    // records from manufacturing, or else at its nominal 32.768 kHz. It
+    // keeps counting while the chip is dormant or powered down, less
+    // precisely than the crystal: the oscillator drifts by several percent
+    // with temperature and voltage. Busy while a GPIO time reference is in
+    // use.
+    pub fn use_low_power_oscillator(&mut self) -> void!hal.Error {
+        hz := lposc_calibration()
+        if hz == 0 {
+            hz = rp_rtc.LPOSC_HZ
+        }
+        return self.use_low_power_oscillator_at(hz)
+    }
+
+    // `use_low_power_oscillator`, with a frequency of `hz` measured by the
+    // program. InvalidInput outside rp_rtc.LPOSC_MIN_HZ to LPOSC_MAX_HZ.
+    pub fn use_low_power_oscillator_at(&mut self, hz: u32) -> void!hal.Error {
+        if self.external {
+            return err(hal.Error.Busy)
+        }
+        return self.aon.use_lposc(hz)
+    }
+
+    // Tick from an external clock of `clock_hz` on GPIO `pin`, 12, 14, 20,
+    // or 22, typically a 32.768 kHz oscillator: it replaces the low-power
+    // oscillator, so it also clocks the power manager while the switched
+    // core is off, and keeps the time precise in every power state. The
+    // pin is claimed as an input until `release_clock_input`. InvalidInput
+    // for another pin or a clock outside rp_rtc.LPOSC_MIN_HZ to
+    // LPOSC_MAX_HZ, Busy if the pin is taken or a reference is in use.
+    pub fn use_clock_input(&mut self, pins: &mut Pins, pin: u32, clock_hz: u32) -> void!hal.Error {
+        if clock_hz < rp_rtc.LPOSC_MIN_HZ || clock_hz > rp_rtc.LPOSC_MAX_HZ {
+            return err(hal.Error.InvalidInput)
+        }
+        return self.use_reference(pins, pin, clock_hz)
+    }
+
+    // Tick from an external 1 kHz tick on GPIO `pin`, 12, 14, 20, or 22,
+    // counted on its falling edges, which keeps counting in every power
+    // state. The pin is claimed as an input until `release_clock_input`;
+    // the switch may advance the time by up to a millisecond. InvalidInput
+    // for another pin, Busy if the pin is taken or a reference is in use.
+    pub fn use_tick_input(&mut self, pins: &mut Pins, pin: u32) -> void!hal.Error {
+        return self.use_reference(pins, pin, 0)
+    }
+
+    // A GPIO reference: a clock of `clock_hz`, or a 1 kHz tick for 0.
+    fn use_reference(&mut self, pins: &mut Pins, pin: u32, clock_hz: u32) -> void!hal.Error {
+        if self.external {
+            return err(hal.Error.Busy)
+        }
+        source := rp_rtc.ext_time_source(pin)?
+        input := pins.input(pin)?
+        result := if clock_hz == 0 {
+            self.aon.use_tick_input(source)
+        } else {
+            self.aon.use_clock_input(source, clock_hz)
+        }
+        match result {
+            ok() => {}
+            err(error) => {
+                match self.aon.use_crystal(self.crystal_hz) {
+                    ok() => {}
+                    err(_) => {}
+                }
+                pins.release(input)
+                return err(error)
+            }
+        }
+        self.external = true
+        self.clock_pin = some(input)
+        return ok()
+    }
+
+    // Tick from the crystal again and give back the pin of
+    // `use_clock_input` or `use_tick_input`; nothing happens without one.
+    pub fn release_clock_input(&mut self, pins: &mut Pins) -> void!hal.Error {
+        if let some(input) = option.take(&mut self.clock_pin) {
+            result := self.aon.use_crystal(self.crystal_hz)
+            self.external = false
+            pins.release(input)
+            return result
+        }
+        return ok()
+    }
 
     pub fn is_set(&mut self) -> bool!hal.Error {
         return self.aon.is_set()
@@ -1577,8 +1811,183 @@ pub struct Alarm {
 // USB serial port or an ADC input runs, since their 48 MHz clock would
 // stop. Wait until serial ports have sent their last bytes first, as
 // clk_peri slows down to the crystal's rate during the switch.
+//
+// A timeout in the power.Wake uses the always-on timer's alarm (6.5.3),
+// which needs the timer set (Busy otherwise) and a tick that runs while the
+// crystal is stopped: a tick from the crystal moves to the low-power
+// oscillator meanwhile, and clk_ref runs from that oscillator, so the power
+// manager stays clocked. The chip wakes up to a millisecond after the
+// timeout, counted at the oscillator's precision. An alarm set through the
+// Rtc is put back afterwards.
+//
+// `power_down` goes further: it switches off the switched-core power
+// domain, with the processors and every peripheral, and the SRAM it is not
+// told to keep, until a pin event or a timeout powers the chip up again
+// (6.2). The chip then restarts through reset; after take(),
+// `woke_from_power_down` and `power_down_wake` say why, the SRAM domains
+// kept still hold their contents, `.noinit` statics included, and the
+// `scratch` registers keep a few words in any case.
+//
+// `set_system_hz` runs clk_sys, and with it clk_peri, slower to save power:
+// from the crystal divided by a whole number, with PLL_SYS stopped, or from
+// PLL_SYS at a lower rate. The timers, the watchdog, and the always-on
+// timer keep their rates, as they count clk_ref or their own ticks, and the
+// ADC and USB keep their 48 MHz clock; flash reads slow down with clk_sys.
 pub struct Power: power.Power {
     crystal_hz: u32
+    // What take() found: a restart after power_down, what woke the chip,
+    // and the SRAM domains kept.
+    powered_down: bool
+    woken: u64
+    retained: u32
+
+    // clk_sys in hertz now: SYS_HZ until `set_system_hz`.
+    pub fn system_hz(&self) -> u32 {
+        return system_hz()
+    }
+
+    // The crystal's frequency, the fastest rate `set_system_hz` reaches
+    // with PLL_SYS stopped.
+    pub fn crystal_hz(&self) -> u32 {
+        return self.crystal_hz
+    }
+
+    // Run clk_sys at exactly `hz`: the crystal divided by a whole number up
+    // to 256, with PLL_SYS stopped, which saves the most, or else PLL_SYS at
+    // a rate it reaches exactly, or SYS_HZ, take()'s rate, again.
+    // Peripherals claimed later compute their dividers from the new rate,
+    // and a SysTick reload the program set counts it too. InvalidInput for
+    // 0, above SYS_HZ, or a rate neither reaches, Busy while a UART, SPI,
+    // I2C, PWM, PIO, or HSTX block runs (release them and claim them again
+    // afterwards) or while the USB serial port runs and `hz` is 48 MHz or
+    // less, Timeout if PLL_SYS does not lock, leaving clk_sys at the
+    // crystal's rate.
+    pub fn set_system_hz(&mut self, hz: u32) -> void!hal.Error {
+        plan := rp_power.plan_system_clock(self.crystal_hz, hz, VCO_HZ, 5, 2, SYS_HZ)?
+        section := hal.Critical.enter()
+        // SAFETY: reading RESET has no side effects.
+        held := unsafe {
+            reg(RESET)
+        }
+        running := ~held.read()
+        if (running & SYSTEM_CLOCKED) != 0 || ((running & RESET_USBCTRL) != 0 && hz < USB_MIN_SYSTEM_HZ) {
+            core.drop(section)
+            return err(hal.Error.Busy)
+        }
+        // SAFETY: interrupts are masked, Power owns clk_sys's generator and
+        // PLL_SYS, and nothing claimed depends on clk_sys's rate.
+        result := unsafe {
+            switch_system_clock(self.crystal_hz, &plan)
+        }
+        core.drop(section)
+        return result
+    }
+
+    // Whether this start is the restart after `power_down`.
+    pub fn woke_from_power_down(&self) -> bool {
+        return self.powered_down
+    }
+
+    // What powered the chip up after `power_down`, as a `dormant` result:
+    // the pins whose events did, bit n for pin n, and power.BY_TIME for
+    // the timeout. 0 after any other reset.
+    pub fn power_down_wake(&self) -> u64 {
+        return self.woken
+    }
+
+    // The SRAM domains that stayed powered during the `power_down` before
+    // this start, RETAIN_SRAM0 and RETAIN_SRAM1, whose contents survived;
+    // RETAIN_NOTHING after any other reset.
+    pub fn retained(&self) -> u32 {
+        return self.retained
+    }
+
+    // Scratch register `index`, below SCRATCH_WORDS: 0 after power-up, and
+    // what `set_scratch` left there through power-down and every reset
+    // since. Traps for another index.
+    pub fn scratch(&self, index: u32) -> u32 {
+        core.assert(index < SCRATCH_WORDS)
+        // SAFETY: the program's scratch registers belong to Power; reading
+        // one has no side effects.
+        word := unsafe {
+            reg(POWMAN_SCRATCH0 + 4 * index as usize)
+        }
+        return word.read()
+    }
+
+    pub fn set_scratch(&mut self, index: u32, value: u32) {
+        core.assert(index < SCRATCH_WORDS)
+        // SAFETY: as in `scratch`; these registers need no password.
+        word := unsafe {
+            reg(POWMAN_SCRATCH0 + 4 * index as usize)
+        }
+        word.write(value)
+    }
+
+    // Switch off the switched core and the XIP cache, and every SRAM domain
+    // not in `retain` (RETAIN_SRAM0, RETAIN_SRAM1, or RETAIN_NOTHING), until
+    // one of `wake`'s pin events or its timeout powers the chip up; it then
+    // restarts through reset into the program, and `woke_from_power_down`
+    // says so. Up to four pin events (one per pin and event kind) can wake
+    // it, each a level or an edge; claim their pins as inputs first, with
+    // the pulls they need: the pads keep their state while the core is off.
+    // A timeout uses the always-on timer's alarm, replacing one set through
+    // the Rtc, and moves a crystal tick to the low-power oscillator; take()
+    // moves it back. Both cores must wait for this: a core 1 that runs a
+    // task must be stopped first. Returns only on failure: InvalidInput for
+    // an empty `wake`, a pin from PIN_COUNT up, more than four events, or
+    // another `retain`; Busy if the always-on timer has no time for a
+    // timeout or a power-up request cancels the power-down, Timeout if the
+    // power manager does not take the request.
+    pub fn power_down(&mut self, wake: &power.Wake, retain: u32) -> void!hal.Error {
+        if (retain & ~(RETAIN_SRAM0 | RETAIN_SRAM1)) != 0 {
+            return err(hal.Error.InvalidInput)
+        }
+        plan := rp_power.plan_power_down(wake, PIN_COUNT)?
+        section := hal.Critical.enter()
+        // SAFETY: interrupts are masked, so the Rtc, the only other user of
+        // the power manager's timer, does not run; Power owns the rest.
+        powman := unsafe {
+            hal.RegisterBlock.at(POWMAN_BASE)
+        }
+        alarm := 0u64
+        if plan.timeout_ms != 0 {
+            if !rp_rtc.aon_running(&mut powman) {
+                core.drop(section)
+                return err(hal.Error.Busy)
+            }
+            // A millisecond more, so the alarm cannot fire before the power
+            // manager watches for it.
+            alarm = rp_rtc.aon_now(&mut powman) + plan.timeout_ms + 1
+        }
+        lposc_hz := lposc_calibration()
+        // SAFETY: as above.
+        entered := unsafe {
+            rp_power.enter_power_down(&mut powman, &plan, retain, alarm, lposc_hz)
+        }
+        match entered {
+            ok() => {}
+            err(error) => {
+                core.drop(section)
+                return err(error)
+            }
+        }
+        // The switched core powers off while this core waits here. A
+        // power-up request that cancels the power-down raises
+        // POWMAN_IRQ_POW, masked but enabled so it ends the wait.
+        cortex_m.unpend(POWMAN_IRQ_POW)
+        cortex_m.enable(POWMAN_IRQ_POW)
+        for {
+            rp_power.sleep()
+            if rp_power.power_down_cancelled(&mut powman) {
+                cortex_m.disable(POWMAN_IRQ_POW)
+                rp_power.cancel_power_down(&mut powman)
+                cortex_m.unpend(POWMAN_IRQ_POW)
+                core.drop(section)
+                return err(hal.Error.Busy)
+            }
+        }
+    }
 
     pub fn mode(&self) -> power.Mode {
         return rp_power.mode()
@@ -1655,6 +2064,10 @@ pub struct Power: power.Power {
     pub fn dormant(&mut self, wake: &power.Wake) -> u64!hal.Error {
         rp_power.check_wake(wake, PIN_COUNT)?
         layout := power_layout()
+        lposc_hz := 0u32
+        if wake.timeout_ms() != 0 {
+            lposc_hz = lposc_calibration()
+        }
         section := hal.Critical.enter()
         // SAFETY: interrupts are masked, so this core reads the count
         // atomically and no handler sees the clocks change.
@@ -1668,7 +2081,7 @@ pub struct Power: power.Power {
         // SAFETY: Power owns the dormant state; nothing runs from PLL_USB,
         // and interrupts stay masked throughout.
         result := unsafe {
-            go_dormant(self.crystal_hz, &layout, wake)
+            go_dormant(self.crystal_hz, &layout, wake, lposc_hz)
         }
         core.drop(section)
         return result
@@ -1687,12 +2100,56 @@ fn power_layout() -> rp_power.Layout {
     }
 }
 
-// Run from the crystal, stop until one of `wake`'s events, and restart
-// PLL_SYS and clk_sys from it; return the pins that woke the chip.
+// Go dormant until one of `wake`'s events or its timeout, which borrows
+// the always-on timer's alarm, moving a crystal tick to the low-power
+// oscillator at `lposc_hz` unless 0; return what woke the chip, as
+// Power.dormant does.
+// SAFETY: as for stop_clocks; with a timeout, the power manager's timer
+// registers are borrowed meanwhile, which the Rtc does not use while
+// interrupts are masked.
+unsafe fn go_dormant(crystal_hz: u32, layout: &rp_power.Layout, wake: &power.Wake, lposc_hz: u32) -> u64!hal.Error {
+    timeout := wake.timeout_ms()
+    unsafe {
+        if timeout == 0 {
+            return stop_clocks(crystal_hz, layout, wake, false)
+        }
+        powman := hal.RegisterBlock.at(POWMAN_BASE)
+        // A millisecond more, so the alarm cannot fire before the
+        // oscillator stops, which would leave the chip dormant.
+        saved := rp_rtc.aon_borrow_alarm(&mut powman, timeout + 1, lposc_hz)?
+        result := stop_clocks(crystal_hz, layout, wake, true)
+        fired := rp_rtc.aon_alarm_fired(&mut powman)
+        returned := rp_rtc.aon_return_alarm(&mut powman, saved)
+        match result {
+            ok(pins) => {
+                returned?
+                if fired {
+                    return ok(pins | power.BY_TIME)
+                }
+                return ok(pins)
+            }
+            err(error) => {
+                match returned {
+                    ok() => {}
+                    err(_) => {}
+                }
+                return err(error)
+            }
+        }
+    }
+}
+
+// Run from the crystal, stop until one of `wake`'s events or, if `timed`,
+// the always-on timer's alarm, and restart PLL_SYS and clk_sys as they
+// ran; return the pins that woke the chip. A timed dormant state runs
+// clk_sys from the crystal through the auxiliary mux and clk_ref from the
+// low-power oscillator, which keeps running, so the power manager that
+// raises the alarm stays clocked; the timer and watchdog ticks, which count
+// clk_ref, stop meanwhile.
 // SAFETY: interrupts must be masked and PLL_USB stopped, and the caller
-// must own the clock, reset, PLL_SYS, oscillator, and dormant wake
+// must own the clock, reset, PLL_SYS, oscillator, tick, and dormant wake
 // registers.
-unsafe fn go_dormant(crystal_hz: u32, layout: &rp_power.Layout, wake: &power.Wake) -> u64!hal.Error {
+unsafe fn stop_clocks(crystal_hz: u32, layout: &rp_power.Layout, wake: &power.Wake, timed: bool) -> u64!hal.Error {
     unsafe {
         io := hal.RegisterBlock.at(IO_BANK0_BASE)
         xosc := hal.RegisterBlock.at(XOSC_BASE)
@@ -1705,14 +2162,41 @@ unsafe fn go_dormant(crystal_hz: u32, layout: &rp_power.Layout, wake: &power.Wak
         sys_selected.wait_set(1, ATTEMPTS)?
         hold := reg(RESET + SET_ALIAS)
         hold.write(RESET_PLL_SYS)
+        ref_ctrl := reg(CLK_REF_CTRL)
+        ref_selected := reg(CLK_REF_SELECTED)
+        timer_tick := reg(TICK_TIMER0)
+        watchdog_tick := reg(TICK_WATCHDOG)
+        if timed {
+            sys_ctrl.modify(CLK_SYS_AUXSRC, CLK_SYS_AUXSRC_XOSC)
+            sys_ctrl.set_bits(CLK_SYS_SRC_AUX)
+            sys_selected.wait_set(1 << 1, ATTEMPTS)?
+            timer_tick.clear_bits(TICK_ENABLE)
+            watchdog_tick.clear_bits(TICK_ENABLE)
+            ref_ctrl.set(CLK_REF_SRC, CLK_REF_SRC_LPOSC)
+            ref_selected.wait_set(1 << CLK_REF_SRC_LPOSC, ATTEMPTS)?
+        }
         rp_power.arm_wake(&mut io, layout, wake)
-        stopped := rp_power.stop_oscillators(&mut xosc, &mut rosc, layout)
+        powman := hal.RegisterBlock.at(POWMAN_BASE)
+        // An alarm that has fired already would not end the dormant state.
+        stop := !timed || !rp_rtc.aon_alarm_fired(&mut powman)
+        stopped := if stop {
+            rp_power.stop_oscillators(&mut xosc, &mut rosc, layout)
+        } else {
+            ok()
+        }
         woken := rp_power.woken_pins(&mut io, layout, wake)
         rp_power.disarm_wake(&mut io, layout, wake)
         stopped?
-        start_pll(PLL_SYS_BASE, RESET_PLL_SYS, crystal_hz, VCO_HZ, 5, 2)?
-        sys_ctrl.set_bits(CLK_SYS_SRC_AUX)
-        sys_selected.wait_set(1 << 1, ATTEMPTS)?
+        if timed {
+            ref_ctrl.set(CLK_REF_SRC, CLK_REF_SRC_XOSC)
+            ref_selected.wait_set(1 << CLK_REF_SRC_XOSC, ATTEMPTS)?
+            timer_tick.set_bits(TICK_ENABLE)
+            watchdog_tick.set_bits(TICK_ENABLE)
+            sys_ctrl.clear_bits(CLK_SYS_SRC_AUX)
+            sys_selected.wait_set(1, ATTEMPTS)?
+            sys_ctrl.clear_bits(CLK_SYS_AUXSRC)
+        }
+        restore_system_clock(crystal_hz)?
         return ok(woken)
     }
 }

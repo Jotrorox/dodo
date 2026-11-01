@@ -16,8 +16,8 @@ import "std/sync/atomic"
 
 // Emulator self-test for the RP2040 and RP2350 boards: the startup runtime,
 // the runtime's integer and floating-point helpers, interrupts, SysTick, the
-// timer and its alarms, the executor, DMA, PIO, a UART, and core 1 with the
-// FIFOs and spinlocks. CI runs it on emulated chips (scripts/test_emulator.py,
+// timer and its alarms, changing the system clock, the executor, DMA, PIO, a
+// UART, and core 1 with the FIFOs and spinlocks. CI runs it on emulated chips (scripts/test_emulator.py,
 // emulator/), so it only uses what the emulators model: nothing outside the
 // chip is connected, and timing is checked with the emulators' tolerances.
 // scripts/test_pico.py runs the fuller hardware self-tests in tests/hardware
@@ -115,6 +115,41 @@ fn clock_checks(timer: &mut chip.Timer) {
     elapsed := after - before
     assert(elapsed >= 1000 && elapsed < 1100, "a 1 ms delay is not 1 ms")
     assert(cycles > 1000, "SysTick does not count while the timer delays")
+}
+
+// A change was refused with `expected`.
+fn change_refused(result: void!hal.Error, expected: hal.Error) -> bool {
+    match result {
+        ok() => {
+            return false
+        }
+        err(error) => {
+            return error == expected
+        }
+    }
+}
+
+// clk_sys from the crystal and from PLL_SYS at other rates, and back. The
+// timer keeps counting, as it counts clk_ref; a claimed UART, whose divider
+// follows clk_peri, refuses a change. The emulators do not slow down with
+// clk_sys, so the rates themselves are only checked on real boards.
+fn system_clock_checks(power: &mut chip.Power, pins: &mut chip.Pins, timer: &mut chip.Timer) {
+    crystal := power.crystal_hz()
+    assert(power.system_hz() == chip.SYS_HZ, "clk_sys does not start at SYS_HZ")
+    power.set_system_hz(crystal)!
+    assert(power.system_hz() == crystal, "clk_sys does not run from the crystal")
+    before := timer.now_us()
+    timer.delay_us(100)
+    assert(timer.now_us() > before, "the timer stops with clk_sys on the crystal")
+    power.set_system_hz(crystal / 4)!
+    serial := pins.uart(4, none, 9600)!
+    assert(change_refused(power.set_system_hz(chip.SYS_HZ), hal.Error.Busy), "a claimed UART does not keep clk_sys")
+    pins.release_uart(serial)
+    power.set_system_hz(48_000_000)!
+    assert(power.system_hz() == 48_000_000, "clk_sys does not run from PLL_SYS at 48 MHz")
+    assert(change_refused(power.set_system_hz(7_000_000), hal.Error.InvalidInput), "an unreachable clk_sys is accepted")
+    power.set_system_hz(chip.SYS_HZ)!
+    assert(power.system_hz() == chip.SYS_HZ, "clk_sys does not return to SYS_HZ")
 }
 
 // Integer, 64-bit, and single-precision helpers. `z` is zero at run time but
@@ -679,6 +714,8 @@ pub fn run(float64: bool) {
     startup_checks()
     step()
     clock_checks(&mut b.timer)
+    step()
+    system_clock_checks(&mut b.power, &mut b.pins, &mut b.timer)
     step()
     arithmetic_checks(&mut b.timer)
     if float64 {
