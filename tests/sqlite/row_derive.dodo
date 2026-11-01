@@ -1,0 +1,258 @@
+package row_derive_checks
+
+// @derive(Row) against std/db/sqlite: parameters from `params()`, decoding
+// by column name in any order, NULL as `none`, custom column types,
+// flattened joins, decoding through `&dyn sql.Row`, and the error classes.
+
+import "core/mem"
+import "std/db"
+import "std/db/sql"
+import "std/db/sqlite"
+
+static mut WORKSPACE: [2097152]u8 = [0u8; 2097152]
+
+fn workspace() -> &mut[u8] from(static) {
+    unsafe {
+        &mut WORKSPACE[..]
+    }
+}
+
+fn same(a: &str, b: &str) -> bool {
+    x := mem.str_bytes(a)
+    y := mem.str_bytes(b)
+    if x.len != y.len {
+        return false
+    }
+    for i in 0usize..x.len {
+        if x[i] != y[i] {
+            return false
+        }
+    }
+    true
+}
+
+// A custom column type: any struct with these two methods.
+pub struct Cents {
+    pub amount: i64
+
+    pub fn decode_value(value: db.Value) -> Self!db.Error {
+        amount := sql.int(value)?
+        if amount < 0 {
+            return err(db.Error.new(db.ErrorKind.Type, 0))
+        }
+        ok(Cents { amount })
+    }
+
+    pub fn encode_value(&self) -> db.Value {
+        db.Value.Int(self.amount)
+    }
+}
+
+@derive(Row)
+struct User {
+    id: i64
+    @db_name("display_name")
+    name: &str
+    email: Option<&str>
+    age: u8
+    score: f32
+    ratio: f64
+    active: bool
+    avatar: &[u8]
+    balance: Cents
+    tip: Option<Cents>
+    small: i16
+    big: isize
+}
+
+@derive(Row)
+struct Team {
+    team_name: &str
+}
+
+@derive(Row)
+struct Member {
+    @db_flatten
+    user: User
+    @db_flatten
+    team: Team
+    joined: i32
+}
+
+const CREATE: &str = "create table users (id integer primary key, display_name text, email text, age integer, score real, ratio real, active integer, avatar blob, balance integer, tip integer, small integer, big integer)"
+const INSERT: &str = "insert into users values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+
+fn seed(conn: &mut sqlite.Connection) {
+    conn.exec(CREATE)!
+    avatar := [1u8, 2, 3]
+    ada := User { id: 1, name: "Ada", email: some("ada@example.com"), age: 36, score: 1.5, ratio: 0.25, active: true, avatar: &avatar, balance: Cents { amount: 100 }, tip: none, small: -5, big: 7 }
+    p := ada.params()
+    assert_eq(conn.execute(INSERT, &p)!, 1u64)
+    grace := User { id: 2, name: "Grace", email: none, age: 85, score: 2.0, ratio: 3.0, active: false, avatar: &avatar[0..1], balance: Cents { amount: 5 }, tip: some(Cents { amount: 9 }), small: 300, big: -1 }
+    q := grace.params()
+    assert_eq(conn.execute(INSERT, &q)!, 1u64)
+}
+
+@test
+fn params_round_trip_through_decode_row() {
+    conn := sqlite.Connection.open_memory(workspace())!
+    seed(&mut conn)
+    none_: [0]db.Value = []
+    rows := conn.select("select * from users order by id", &none_)!
+    let some(first) = rows.next()! else {
+        assert(false)
+        return
+    }
+    ada := User.decode_row(&first)!
+    assert_eq(ada.id, 1i64)
+    assert(same(ada.name, "Ada"))
+    match &ada.email {
+        some(email) => assert(same(*email, "ada@example.com")),
+        none => assert(false),
+    }
+    assert_eq(ada.age, 36u8)
+    assert(ada.score == 1.5)
+    assert(ada.ratio == 0.25)
+    assert(ada.active)
+    assert_eq(ada.avatar.len, 3usize)
+    assert_eq(ada.avatar[2], 3u8)
+    assert_eq(ada.balance.amount, 100i64)
+    match &ada.tip {
+        some(_) => assert(false),
+        none => {},
+    }
+    assert_eq(ada.small, -5i16)
+    assert_eq(ada.big, 7isize)
+    let some(second) = rows.next()! else {
+        assert(false)
+        return
+    }
+    grace := User.decode_row(&second)!
+    assert(same(grace.name, "Grace"))
+    match &grace.email {
+        some(_) => assert(false),
+        none => {},
+    }
+    assert(!grace.active)
+    match &grace.tip {
+        some(tip) => assert_eq(tip.amount, 9i64),
+        none => assert(false),
+    }
+    assert_eq(grace.small, 300i16)
+    assert_eq(grace.big, -1isize)
+}
+
+@test
+fn columns_match_by_name_in_any_order() {
+    conn := sqlite.Connection.open_memory(workspace())!
+    seed(&mut conn)
+    none_: [0]db.Value = []
+    rows := conn.select("select big, small, tip, balance, avatar, active, ratio, score, age, email, display_name, id, 'extra' as unused from users where id = 2", &none_)!
+    let some(row) = rows.next()! else {
+        assert(false)
+        return
+    }
+    user := User.decode_row(&row)!
+    assert_eq(user.id, 2i64)
+    assert(same(user.name, "Grace"))
+    assert_eq(user.age, 85u8)
+    assert_eq(user.big, -1isize)
+}
+
+struct Totals {
+    ids: i64
+    balances: i64
+
+    pub fn row(&mut self, row: &dyn sql.Row) -> void!db.Error {
+        user := User.decode_row(row)?
+        self.ids += user.id
+        self.balances += user.balance.amount
+        ok()
+    }
+}
+
+@test
+fn row_sinks_decode_through_dyn_rows() {
+    conn := sqlite.Connection.open_memory(workspace())!
+    seed(&mut conn)
+    none_: [0]db.Value = []
+    totals := Totals { ids: 0, balances: 0 }
+    conn.query("select * from users", &none_, &mut totals)!
+    assert_eq(totals.ids, 3i64)
+    assert_eq(totals.balances, 105i64)
+}
+
+@test
+fn flattened_structs_decode_joins() {
+    conn := sqlite.Connection.open_memory(workspace())!
+    seed(&mut conn)
+    conn.exec("create table teams (team_name text, user_id integer, joined integer); insert into teams values ('core', 2, 2019)")!
+    none_: [0]db.Value = []
+    rows := conn.select("select users.*, teams.team_name, teams.joined from users join teams on teams.user_id = users.id", &none_)!
+    let some(row) = rows.next()! else {
+        assert(false)
+        return
+    }
+    member := Member.decode_row(&row)!
+    assert(same(member.user.name, "Grace"))
+    assert(same(member.team.team_name, "core"))
+    assert_eq(member.joined, 2019i32)
+}
+
+fn decode_error(conn: &mut sqlite.Connection, query: &str) -> db.ErrorKind {
+    none_: [0]db.Value = []
+    rows := conn.select(query, &none_)!
+    let some(row) = rows.next()! else {
+        return db.ErrorKind.Internal
+    }
+    match User.decode_row(&row) {
+        ok(_) => db.ErrorKind.Internal,
+        err(e) => {
+            let db.Error { kind: kind, constraint: _, code: _, position: _ } = e
+            kind
+        },
+    }
+}
+
+@test
+fn missing_columns_and_bad_values_are_errors() {
+    conn := sqlite.Connection.open_memory(workspace())!
+    seed(&mut conn)
+    // A required column absent from the result.
+    assert(decode_error(&mut conn, "select id, display_name from users") == db.ErrorKind.Schema)
+    // NULL in a non-optional field.
+    assert(decode_error(&mut conn, "select id, null as display_name, email, age, score, ratio, active, avatar, balance, tip, small, big from users") == db.ErrorKind.Type)
+    // Values out of range for narrow fields are errors, not traps.
+    assert(decode_error(&mut conn, "select id, display_name, email, 256 as age, score, ratio, active, avatar, balance, tip, small, big from users") == db.ErrorKind.Type)
+    assert(decode_error(&mut conn, "select id, display_name, email, age, score, ratio, active, avatar, balance, tip, 40000 as small, big from users") == db.ErrorKind.Type)
+    assert(decode_error(&mut conn, "select id, display_name, email, age, 1e300 as score, ratio, active, avatar, balance, tip, small, big from users") == db.ErrorKind.Type)
+    // A wrong storage class.
+    assert(decode_error(&mut conn, "select 'one' as id, display_name, email, age, score, ratio, active, avatar, balance, tip, small, big from users") == db.ErrorKind.Type)
+    // Custom column types report their own errors.
+    assert(decode_error(&mut conn, "select id, display_name, email, age, score, ratio, active, avatar, -1 as balance, tip, small, big from users") == db.ErrorKind.Type)
+}
+
+@test
+fn helpers_follow_the_documented_conversions() {
+    assert(sql.boolean(db.Value.Int(2))!)
+    assert(!sql.boolean(db.Value.Int(0))!)
+    assert(sql.real(db.Value.Int(3))! == 3.0)
+    assert(sql.real32(db.Value.Real(0.5))! == 0.5)
+    match sql.real32(db.Value.Real(0.0 / 0.0)) {
+        ok(_) => assert(false),
+        err(e) => assert(e.kind == db.ErrorKind.Type),
+    }
+    assert_eq(sql.int_in(db.Value.Int(255), 0, 255)!, 255i64)
+    match sql.int_in(db.Value.Int(-1), 0, 255) {
+        ok(_) => assert(false),
+        err(e) => assert(e.kind == db.ErrorKind.Type),
+    }
+    assert_eq(sql.bytes(db.Value.Text("hi"))!.len, 2usize)
+    assert(same(sql.text(db.Value.Text("hi"))!, "hi"))
+    match sql.text(db.Value.Bytes(mem.str_bytes("hi"))) {
+        ok(_) => assert(false),
+        err(e) => assert(e.kind == db.ErrorKind.Type),
+    }
+    null := db.Value.Null
+    assert(sql.is_null(&null))
+}

@@ -70,6 +70,11 @@ pub fn prepare(program: &mut Program, bits: u32) -> Check<()> {
             resolver.block(body, &mut locals, ns)?;
         }
     }
+    for global in &mut program.global_asm {
+        for value in global.asm.inputs_mut() {
+            resolver.expr(value, &Locals::new(), &global.namespace, true)?;
+        }
+    }
     Ok(())
 }
 fn namespace(name: &str) -> &str {
@@ -271,8 +276,15 @@ impl Resolver {
                 for (ty, span) in asm.output_types_mut() {
                     self.ty(ty, locals, ns, span)?;
                 }
-                for v in asm.inputs_mut() {
-                    self.expr(v, locals, ns, constant)?;
+                for operand in &mut asm.operands {
+                    match &mut operand.kind {
+                        AsmOperandKind::In(v) | AsmOperandKind::InOut(v) => {
+                            self.expr(v, locals, ns, constant)?
+                        }
+                        // Written into the template, so its names are constants.
+                        AsmOperandKind::Const(v) => self.expr(v, locals, ns, true)?,
+                        AsmOperandKind::Out(_) | AsmOperandKind::Sym(_) => {}
+                    }
                 }
             }
             ExprKind::Slice {

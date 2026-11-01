@@ -151,6 +151,14 @@ fn mentions_dyn_self(ty: &Type) -> bool {
     matches!(ty, Type::Named(name) if name == "Self")
 }
 
+/// Whether `ty`, seen through any references, has the built-in `len` of an
+/// array, slice or string.
+fn is_collection(mut ty: &Type) -> bool {
+    while let Type::Ref(_, inner) = ty {
+        ty = inner;
+    }
+    matches!(ty, Type::Array(..) | Type::Slice(..) | Type::Str)
+}
 fn error(s: impl std::fmt::Display) -> CodegenError {
     CodegenError(s.to_string())
 }
@@ -305,6 +313,7 @@ pub fn generate<'ctx>(
     if options.entry {
         cg.entry(&options.test_functions)?;
     }
+    cg.global_asm()?;
     cg.emit_used();
     cg.mark_nounwind();
     if let Some(debug) = &cg.debug {
@@ -528,9 +537,16 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         Ok(self.context.struct_type(&fields, false))
     }
     /// LLVM has no union type. A zero-length array supplies the strictest
-    /// alignment, while bytes preserve every alternative's representation when
-    /// the enclosing aggregate is copied or passed by value. Using a real
-    /// alternative as storage would lose bytes in its padding or narrow fields.
+    /// alignment, while an array of padding-free integers preserves every
+    /// alternative's representation when the enclosing aggregate is copied or
+    /// passed by value. Using a real alternative as storage would lose bytes in
+    /// its padding or narrow fields.
+    ///
+    /// The integers are as wide as the alignment allows, up to a pointer: LLVM
+    /// returns each array element of a first-class aggregate in its own
+    /// register, so byte elements made a `T!E` with an 8-byte payload need
+    /// eight registers, which demoted the return to a hidden memory slot that
+    /// the caller then reassembled byte by byte.
     fn union_storage(&self, alternatives: &[LlvmType<'ctx>]) -> Result<LlvmType<'ctx>> {
         let mut aligner: LlvmType<'ctx> = self.context.i8_type();
         let mut size = 0;
@@ -545,12 +561,19 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         }
         let alignment = u64::from(self.data.get_abi_alignment(&aligner));
         let size = size.div_ceil(alignment) * alignment;
-        let bytes = self.context.i8_type().array_type(
-            u32::try_from(size).map_err(|_| error("payload storage is too large for LLVM"))?,
-        );
+        // Alignments are powers of two, so the word divides the padded size.
+        let word = alignment.min(u64::from(self.bits / 8)).max(1);
+        let words = self
+            .context
+            .custom_width_int_type(std::num::NonZeroU32::new(word as u32 * 8).unwrap())
+            .unwrap()
+            .array_type(
+                u32::try_from(size / word)
+                    .map_err(|_| error("payload storage is too large for LLVM"))?,
+            );
         Ok(self
             .context
-            .struct_type(&[aligner.array_type(0), bytes], false))
+            .struct_type(&[aligner.array_type(0), words], false))
     }
     fn usize_type(&self) -> LlvmType<'ctx> {
         self.context
@@ -643,8 +666,8 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         // Only the tag and active payload are initialized. Inactive bytes are
         // unspecified, so clearing the whole union would add unnecessary stores.
         // Use undef, not poison: aggregate copies may combine inactive bytes with
-        // active ones. Keep union_storage's byte representation to preserve every
-        // initialized byte, including those in another alternative's padding.
+        // active ones. Keep union_storage's padding-free integer words to preserve
+        // every initialized byte, including those in another alternative's padding.
         let value = self
             .builder
             .build_insert_value(ty.get_undef(), tag, 0, "tag")?;
@@ -788,6 +811,8 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             }
             self.apply_placement(function, &f.placement, f.body.is_some(), 1)?;
             let inlining: &[&str] = match f.inlining {
+                // A naked function's assembly returns from its own frame.
+                Inlining::Auto if f.naked => &["naked", "noinline"],
                 Inlining::Auto => &[],
                 Inlining::Always => &["alwaysinline"],
                 Inlining::Never => &["noinline"],
@@ -1102,6 +1127,9 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
     }
 
     fn function(&mut self, f: &Function) -> Result<()> {
+        if let Some(asm) = f.naked_asm() {
+            return self.naked_function(f, asm);
+        }
         let function = self.functions[&f.name];
         self.function = Some(function);
         self.return_type = f.ret.clone();
@@ -2173,7 +2201,9 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                         None,
                     );
                 }
-                if n == "len" {
+                // `len` is only the built-in length of arrays, slices and
+                // strings; on a struct it is an ordinary field.
+                if n == "len" && is_collection(&x.ty) {
                     self.collection(x)?.1
                 } else {
                     let p = self.place(e)?;
@@ -2933,8 +2963,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
     /// cannot name separately. `out` operands are early-clobber: the template
     /// may write them before it has read every input.
     fn inline_asm(&mut self, asm: &InlineAsm, ty: &Type) -> Result<Value<'ctx>> {
-        let indices = crate::sema::asm::llvm_operand_indices(asm);
-        let template = crate::sema::asm::llvm_template(&asm.template, &indices).map_err(error)?;
+        let template = self.asm_template(asm, true)?;
         let register = |register: &AsmRegister| match register {
             AsmRegister::Any => "r".to_owned(),
             AsmRegister::Named(name) => format!("{{{}}}", name.to_ascii_lowercase()),
@@ -2944,7 +2973,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         for operand in &asm.operands {
             values.push(match &operand.kind {
                 AsmOperandKind::In(value) | AsmOperandKind::InOut(value) => Some(self.expr(value)?),
-                AsmOperandKind::Out(_) => None,
+                AsmOperandKind::Out(_) | AsmOperandKind::Sym(_) | AsmOperandKind::Const(_) => None,
             });
         }
         let mut constraints = vec![];
@@ -2959,7 +2988,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                     constraints.push(format!("={}", register(&operand.register)));
                     outputs.push(self.ty(&value.ty)?);
                 }
-                AsmOperandKind::In(_) => {}
+                AsmOperandKind::In(_) | AsmOperandKind::Sym(_) | AsmOperandKind::Const(_) => {}
             }
         }
         let mut args = vec![];
@@ -3034,6 +3063,91 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                 tuple
             }
         })
+    }
+    /// A checked template with its `sym` and `const` operands written in as
+    /// text, as an LLVM inline asm template (`inline`) or as module-level
+    /// assembly.
+    fn asm_template(&mut self, asm: &InlineAsm, inline: bool) -> Result<String> {
+        let operands = crate::sema::asm::template_operands(asm, |kind| match kind {
+            AsmOperandKind::Sym(path) => self.asm_symbol(path),
+            AsmOperandKind::Const(value) => {
+                crate::sema::asm::constant_operand(value, self.bits).map(|value| value.to_string())
+            }
+            _ => unreachable!("register operands have LLVM operand numbers"),
+        })
+        .map_err(error)?;
+        crate::sema::asm::render_template(&asm.template, &operands, inline).map_err(error)
+    }
+    /// The assembler name of the function or static a `sym` operand names.
+    /// The assembly's reference is invisible to LLVM, so a definition is
+    /// listed in `llvm.used`: it is kept, under this name, even when nothing
+    /// else refers to it.
+    fn asm_symbol(&mut self, path: &str) -> std::result::Result<String, String> {
+        let (value, defined) = if let Some(function) = self.functions.get(path) {
+            let defined = self
+                .program
+                .functions
+                .iter()
+                .any(|f| f.name == path && f.body.is_some());
+            (*function, defined)
+        } else if let Some((global, _)) = self.globals.get(path) {
+            (*global, true)
+        } else {
+            return Err(format!("`sym {path}` names no function or static"));
+        };
+        if defined && !self.used.contains(&value) {
+            self.used.push(value);
+        }
+        let name = value.get_name().to_string_lossy().into_owned();
+        // Mach-O, and COFF on 32-bit x86, prefix C symbols with an underscore.
+        let layout = self.module.get_data_layout();
+        let layout = layout.as_str().to_string_lossy();
+        let prefix = if layout.split('-').any(|part| part == "m:o" || part == "m:x") {
+            "_"
+        } else {
+            ""
+        };
+        let symbol = format!("{prefix}{name}");
+        let plain = symbol
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'$'))
+            && !symbol.starts_with(|c: char| c.is_ascii_digit());
+        Ok(if plain {
+            symbol
+        } else {
+            format!("\"{}\"", symbol.replace('\\', "\\\\").replace('"', "\\\""))
+        })
+    }
+    /// Emit top-level `unsafe asm(...)` blocks as module-level assembly, in
+    /// source order.
+    fn global_asm(&mut self) -> Result<()> {
+        for global in &self.program.global_asm {
+            let mut text = self.asm_template(&global.asm, false)?;
+            text.push('\n');
+            self.module.append_inline_asm(&text);
+        }
+        Ok(())
+    }
+    /// The body of a `@naked` function: its assembly alone, with no prologue
+    /// or epilogue, and nothing after it. The assembly returns by itself.
+    fn naked_function(&mut self, f: &Function, asm: &InlineAsm) -> Result<()> {
+        let function = self.functions[&f.name];
+        self.function = Some(function);
+        self.debug_function(f, function)?;
+        self.location(f.span);
+        self.builder
+            .position_at_end(self.context.append_basic_block(function, "entry"));
+        let template = self.asm_template(asm, true)?;
+        self.location(asm.span);
+        self.builder.build_inline_asm(
+            self.context.void_type().fn_type(&[], false),
+            &template,
+            "",
+            &[],
+            "",
+        )?;
+        self.builder.build_unreachable()?;
+        Ok(())
     }
     /// Lowers `core/cpu`. Bare-metal Cortex-M and RISC-V (machine mode) use the
     /// architectural interrupt mask; hosted OS targets expose no interrupt mask
