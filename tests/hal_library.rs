@@ -224,7 +224,7 @@ fn pio_i2s_programs_match_the_compiler_assembler() {
         &dodo(
             &[
                 "build",
-                root.join("tests/stdlib/i2s_programs.dodo")
+                root.join("tests/fixtures/rp_i2s_programs.dodo")
                     .to_str()
                     .unwrap(),
                 "--board",
