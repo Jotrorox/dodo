@@ -450,6 +450,10 @@ fn portable_package_dependencies_are_independent_and_reserved() {
             "std/embedded/display/ssd1306",
             vec!["alloc/", "std/io", "std/platform", "std/graphics/"],
         ),
+        (
+            "std/embedded/storage",
+            vec!["alloc/", "std/io", "std/platform", "std/fs", "std/checksum"],
+        ),
     ] {
         let source = workspace.write(
             "main.dodo",

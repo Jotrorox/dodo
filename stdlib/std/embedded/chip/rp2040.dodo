@@ -6,6 +6,7 @@ import "std/embedded/hal"
 import "std/embedded/power"
 import "std/embedded/chip/rp_adc"
 import "std/embedded/chip/rp_dma"
+import "std/embedded/chip/rp_flash"
 import "std/embedded/chip/rp_multicore"
 import "std/embedded/chip/rp_pio"
 import "std/embedded/chip/rp_power"
@@ -389,6 +390,9 @@ pub struct Peripherals {
     pub core1: rp_multicore.Core1
     pub fifos: rp_multicore.Fifos
     pub spinlocks: rp_multicore.Spinlocks
+    // The program flash, for storing data above the program; see
+    // std/embedded/chip/rp_flash.
+    pub flash: rp_flash.Flash
     // Sleep modes, clock gating, and the dormant state; see Power.
     pub power: Power
 }
@@ -470,8 +474,12 @@ pub fn take(config: Config) -> Peripherals!hal.Error {
     }
     // The RP2040 has no doorbells.
     let rp_multicore.Cores { core1, fifos, spinlocks, doorbells: _ } = cores
+    // SAFETY: TAKEN guarantees one Flash.
+    flash := unsafe {
+        rp_flash.Flash.take()
+    }
     power := Power { crystal_hz: crystal }
-    return ok(Peripherals { pins: Pins { bank }, timer, rtc: Rtc { calendar }, watchdog, usb, dma, rng, core1, fifos, spinlocks, power })
+    return ok(Peripherals { pins: Pins { bank }, timer, rtc: Rtc { calendar }, watchdog, usb, dma, rng, core1, fifos, spinlocks, power, flash })
 }
 
 // SAFETY: the caller owns `address`, a 32-bit RP2040 register.
