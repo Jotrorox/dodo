@@ -591,6 +591,22 @@ def hand_written():
     cs.vardct_frame(wr, [], True, w, h, layout, rng, use_lf=True, coeff_range=2, density=0.05)
     open(path('lf_upsampled'), 'wb').write(wr.data())
     add_png('lf_upsampled', None, [], 0, jxlref=True)
+    # A modular frame flagged to use an LF frame (which it ignores) after
+    # a modular LF frame, in a file without VarDCT frames.
+    rgb = [grid(16, 12, lambda x, y, c=c: x * 10 + y * 3 + c * 40) for c in range(3)]
+    wr = cs.Writer()
+    cs.image_header(wr, 16, 12, xyb=False)
+    for header, channels in [(dict(ftype=1, lf_level=1), [grid(2, 2, lambda x, y: 50) for _ in range(3)]), (dict(flags=32), rgb)]:
+        cs.frame_header(wr, [], xyb=False, **header)
+        sec = cs.Writer()
+        sec.u(1, 1)
+        cs.global_tree(sec, 5)
+        cs.modular_stream(sec, channels, 5)
+        data = sec.data()
+        cs.toc(wr, [len(data)])
+        wr.bits.extend(cs.bits_of(data))
+    open(path('modular_lf_flag'), 'wb').write(wr.data())
+    add('modular_lf_flag', None, None, 0)
     # Extra channels of every kind: alpha, a 16-bit depth map at half size,
     # a spot color (rendered into the color image), a selection mask,
     # 12-bit thermal, CMYK black, a CFA channel and an optional half-float

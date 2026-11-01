@@ -51,8 +51,14 @@ import "std/image/sink"
 //     frequencies from a forward DCT of the LF image, and the inverse
 //     transform (all 27 types: separable recursive f32 DCTs up to 256x256,
 //     DCT2/DCT4/Hornuss/DCT4x8/AFV) in place, giving XYB (or YCbCr, for
-//     recompressed JPEGs, including 4:2:0/4:2:2/4:4:0 subsampling) samples.
-//     The LF image gets chroma from luma and adaptive smoothing first.
+//     recompressed JPEGs, including 4:2:0/4:2:2/4:4:0 subsampling, where
+//     only 8x8-sized varblocks are valid) samples. The LF image gets chroma
+//     from luma and adaptive smoothing first (subsampled frames: no chroma
+//     from luma, each channel smoothed at its size, as current libjxl).
+// extra.dodo
+//     Extra channels (up to 4096): descriptions stay in the codestream, the
+//     per-channel fields of a decode live in an Extras table in scratch;
+//     the public extra channel API.
 // features.dodo
 //     Noise (8-lane XorShift128+ per group seeded like libjxl, 5x5
 //     high-pass, LUT-scaled, added before the color transform) and splines
@@ -69,10 +75,14 @@ import "std/image/sink"
 //     planes with 2x/4x/8x upsampling -> patches -> splines -> noise -> LF
 //     frame output kept for later frames -> save before color transform ->
 //     XYB/YCbCr to the output color space -> blending onto the canvas over
-//     a reference slot -> save after color transform -> emit the displayed
-//     frame (8-bit output uses libjxl's ordered dither, so results match
-//     djxl). A single frame covering the image is emitted from its frame
-//     planes without a canvas.
+//     a reference slot -> save after color transform -> spot colors ->
+//     emit the displayed frame (8-bit output uses libjxl's ordered dither,
+//     so results match djxl). In upsampled frames patches and splines come
+//     before upsampling (on coded-size planes), with the extra channels
+//     upsampled after them when they share the color upsampling, as in
+//     libjxl. A single frame covering the image is emitted from its frame
+//     planes without a canvas. Any extra channel can be emitted instead of
+//     the color channels (decode_extra_channel).
 //
 // Frames
 // ------
@@ -91,14 +101,17 @@ import "std/image/sink"
 // -------
 // One caller buffer, carved by plan() into: the scan work area (ICC/TOC
 // skipping), the LZ77 window, five Codes (global tree, local tree,
-// transient, two nested), two MA trees, channel and transform lists, the
-// weighted predictor rows, a squeeze row, the TOC, the i32 arena (frame
-// channels plus allowances for palettes, LF group streams, raw
-// quantization tables and gray filtering), the VarDCT buffers (coefficient
-// planes, LF image, block info, CfL tiles, dequantization matrices,
-// coefficient orders, the HF Code, LF frame outputs), and for the float
-// pipeline the frame planes, the canvas, the reference slots in use, noise
-// planes, spline storage, filter rows and one output tile. Sizes follow
+// transient, two nested), two MA trees, channel lists (sized for every
+// channel squeezed down to one sample) and transform lists, the weighted
+// predictor rows, a squeeze row, the TOC, the i32 arena (frame channels
+// plus allowances for palettes, LF group streams, raw quantization tables
+// and full-size copies for gray filtering and subsampled chroma), the
+// extra channel table, the VarDCT buffers (coefficient planes, LF image,
+// block info, CfL tiles, dequantization matrices, coefficient orders, the
+// HF Code, LF frame outputs), and for the float pipeline the frame planes,
+// the canvas, the reference slots in use, noise planes, coded-size planes
+// for patches and splines of upsampled frames, spline storage, filter rows
+// and one output tile. Sizes follow
 // from the headers (also on 32-bit targets: sizes are computed in u64 and
 // fail TooLarge when they do not fit usize).
 //
@@ -109,13 +122,10 @@ import "std/image/sink"
 // ColourEncoding (sRGB when it is an ICC profile). The codestream
 // orientation is reported, not applied.
 //
-// Not supported (Unsupported): patches or splines in upsampled frames
-// (libjxl applies them before upsampling; cjxl never writes such files),
-// chroma-subsampled frames combined with upsampling or restoration filters
-// or with varblocks larger than 8x8 or adaptive LF smoothing, more than 64
-// extra channels, LF frames with upsampling. Extra channels other than the
-// first alpha are decoded but not output; spot colors are not rendered and
-// CMYK black is not applied.
+// Like libjxl, chroma-subsampled frames with varblocks larger than 8x8 and
+// extra channels of type 15 (unknown, not to be ignored) are rejected.
+// CMYK is not converted: color holds C, M, Y as stored and K is the Black
+// extra channel (libjxl without a color management system does the same).
 
 const TRANSIENT_DIST: usize = 16
 const CODE_POOL: usize = 196608

@@ -1082,6 +1082,9 @@ fn decode_vardct_frame(r: &mut Reader, h: &ImageHeader, f: &FrameHeader, work: &
         if level >= 3 || !vb.lfslot_valid[level] || vb.lfslot_w[level] != vb.bw || vb.lfslot_h[level] != vb.bh {
             return err(pixels.Error.Malformed)
         }
+        if 3 * blocks > vb.lfslot_cap[level] {
+            return err(pixels.Error.TooLarge)
+        }
         base := vb.lfslot_off[level]
         for i in 0usize..3 * blocks {
             vb.lf[i] = vb.lfslot[base + i]
@@ -1138,8 +1141,19 @@ fn decode_vardct_frame(r: &mut Reader, h: &ImageHeader, f: &FrameHeader, work: &
 }
 
 // Keep an LF frame's XYB planes (frame planes 0 to 2) for later frames.
+// Files without VarDCT frames have no storage for them (nothing reads the
+// samples then; the slot is only marked as decoded).
 fn store_lf_slot(vb: &mut VBufs, level: usize, frame: &[f32], w: usize, h: usize) -> void!pixels.Error {
-    if level >= 3 || 3 * w * h > vb.lfslot_cap[level] {
+    if level >= 3 {
+        return err(pixels.Error.TooLarge)
+    }
+    if vb.lfslot_cap[level] == 0 {
+        vb.lfslot_w[level] = w
+        vb.lfslot_h[level] = h
+        vb.lfslot_valid[level] = true
+        return ok()
+    }
+    if 3 * w * h > vb.lfslot_cap[level] {
         return err(pixels.Error.TooLarge)
     }
     base := vb.lfslot_off[level]

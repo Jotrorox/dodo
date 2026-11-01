@@ -228,9 +228,13 @@ fn decode_frame_data(r: &mut Reader, h: &ImageHeader, f: &FrameHeader, work: &mu
     if !f.modular {
         return decode_vardct_frame(r, h, f, work, gcode, lcode, tcode, n1, n2, window, gch, lch, gstash, lstash, gtr, ltr, toc, vals, vb, planes, t, hcode, ex)
     }
-    // Only VarDCT frames take their LF from an LF frame.
+    // Only VarDCT frames take their LF from an LF frame; modular frames
+    // ignore it, but (as in libjxl) one must have been decoded.
     if (f.flags & FLAG_USE_LF_FRAME) != 0 {
-        return err(pixels.Error.Unsupported)
+        level := f.lf_level as usize
+        if level >= 3 || !vb.lfslot_valid[level] {
+            return err(pixels.Error.Malformed)
+        }
     }
     setup_channels(h, f, work, gch, gtr, gstash, ex)?
     // LfGlobal.
