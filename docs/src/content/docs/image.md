@@ -111,7 +111,7 @@ a display, or feed an encoder.
 `image.scratch_size(&data, &layout)` is the scratch a decode needs, computed
 from the header before any pixel work: PNG needs two rows of raw image data,
 the other formats none. The zlib decoder adds about 40 KiB of stack, the
-JPEG XL header walks (also `info` and `scratch_size`) at most about 36 KiB.
+JPEG XL header walks (also `info` and `scratch_size`) at most about 32 KiB.
 
 Every length and index in a file is checked, so untrusted files never trap.
 Errors are `Truncated`, `Malformed`, `Unsupported`, `TooLarge` (a dimension
@@ -234,6 +234,9 @@ pub fn extra_channel_info(data: &[u8], channel: u32) -> ExtraChannelInfo!pixels.
 pub fn extra_channel_name(data: &[u8], channel: u32, output: &mut[u8]) -> usize!pixels.Error
 pub fn decode_extra_channel<S: sink.Sink>(data: &[u8], index: u32, channel: u32, output: &mut S, scratch: &mut[u8]) -> void!pixels.Error
 ```
+
+The first three read only the image header (no scratch, a few KiB of
+stack).
 
 `ExtraChannelInfo` has the `kind` (`ExtraChannelType.Alpha`, `Depth`,
 `SpotColor`, `SelectionMask`, `Black`, `Cfa`, `Thermal` or `Optional`),
@@ -413,16 +416,17 @@ and JPEG XL have frames (`decode_frame`). Lossy JPEG XL matches libjxl's
 `djxl` within one 8-bit level. Chroma-subsampled VarDCT frames with
 adaptive LF smoothing follow current libjxl, which smooths each channel at
 its own size (`djxl` 0.12 cannot decode them); subsampled frames with
-varblocks larger than 8x8 are invalid and fail `Malformed`, as in libjxl. The JPEG XL encoder is lossless only and
-uses prefix codes (no ANS); it does not embed ICC profiles. JPEG XL scratch
-follows the image header, not the frame sizes a file claims: each frame is
-decoded over the part that can reach the output, so with W' = width + 1100,
-H' = height + 1100 and C = 3 + extra channels, `scratch_size` stays within
-64 W' H' C + 5 MiB C + 128 MiB. Not covered by that bound: frames that
-start left of or above the image (decoded from their origin), reference
-frames as far as later patches read them, and frames whose global squeeze
-or above-right delta palette needs the whole frame; check `scratch_size`
-against your budget for untrusted files. PNG text chunks other
-than XMP are skipped, as are `sBIT`, `pHYs` and timestamps. The PNG encoder
+varblocks larger than 8x8 are invalid and fail `Malformed`, as in libjxl.
+The JPEG XL encoder is lossless only and uses prefix codes (no ANS); it
+does not embed ICC profiles. JPEG XL scratch follows the image header, not
+the frame sizes a file claims: each frame is decoded over the part that
+can reach the output, so with W' = width + 1100, H' = height + 1100 and
+C = 3 + extra channels (all of them, up to 4096), `scratch_size` stays
+within 64 W' H' C + 5 MiB C + 128 MiB. Not covered by that bound: frames
+that start left of or above the image (decoded from their origin),
+reference frames as far as later patches read them, and frames whose
+global squeeze or above-right delta palette needs the whole frame; check
+`scratch_size` against your budget for untrusted files. PNG text chunks
+other than XMP are skipped, as are `sBIT`, `pHYs` and timestamps. The PNG encoder
 writes palettes only for 8-bit sources, and float samples outside 0.0 to 1.0
 survive only in PFM.

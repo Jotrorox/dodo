@@ -133,12 +133,13 @@ import "std/image/sink"
 // computed in u64 and fail TooLarge when they do not fit usize (also on
 // 32-bit targets).
 //
-// Stack: the scratch-free entry points (info, metadata, frame_info,
-// scratch_size, extra_channel_count, extra_channel_info,
-// extra_channel_name) keep the skimmer state (skim.dodo: a 4 KiB table
-// cache and a 12 KiB window) on the stack, at most about 36 KiB with their
-// callees when optimized; decode() and icc() do the same for their header
-// walks.
+// Stack: the scratch-free entry points info, metadata, frame_info and
+// scratch_size keep the skimmer state (skim.dodo: a 4 KiB table cache and
+// a 12 KiB window) on the stack, at most about 32 KiB with their callees
+// when optimized (about 31 KiB for scratch_size, arm64 -O2); decode() and
+// icc() do the same for their header walks. extra_channel_count,
+// extra_channel_info and extra_channel_name read only up to the extra
+// channel descriptions (under 4 KiB).
 //
 // Output samples are in the native layout reported by info(): U8 for
 // integer depths up to 8, U16 up to 16, F32 for float or deeper samples
