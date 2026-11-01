@@ -102,6 +102,34 @@ fn base_xpcall(cx: &mut Cx) -> i32!Throw {
 
 fn base_select(cx: &mut Cx) -> i32!Throw {
     unsafe {
+        // Fast path: an in-range integer index or a string selector.
+        let L = cx.L
+        let func = (*(*L).ci).func
+        let top = (*L).top
+        let nargs = sdiff(top, func) - 1
+        if nargs >= 1 {
+            let a = ptr.offset(func, 1)
+            if (*a).tag == TAG_INT {
+                let k = val_int(a)
+                let at = if k < 0 {
+                    core.wrapping_add(nargs as i64, k)
+                } else if k > (nargs as i64) {
+                    nargs as i64
+                } else {
+                    k
+                }
+                if at >= 1 {
+                    return ok(small_i32(nargs - (at as isize)))
+                }
+            } else if ((*a).tag & 15) == TYPE_STRING {
+                let s = val_str(a)
+                if (*s).length > 0 && *str_data(s) == b'#' {
+                    set_int(top, (nargs - 1) as i64)
+                    (*L).top = ptr.offset(top, 1)
+                    return ok(1)
+                }
+            }
+        }
         let n = cx.get_top() as i64
         if cx.type_of(1) == TSTRING {
             let s = cx.to_lstr(1)?
@@ -229,6 +257,27 @@ fn base_pairs(cx: &mut Cx) -> i32!Throw {
 
 fn base_ipairs_aux(cx: &mut Cx) -> i32!Throw {
     unsafe {
+        // Fast path: a table, an integer control value and a raw hit (or a
+        // miss in a table without metatable, where no __index can apply).
+        let L = cx.L
+        let func = (*(*L).ci).func
+        let top = (*L).top
+        if sdiff(top, func) >= 3 && (*ptr.offset(func, 1)).tag == TAG_TABLE && (*ptr.offset(func, 2)).tag == TAG_INT {
+            let t = val_gc(ptr.offset(func, 1)) as *mut Table
+            let i = core.wrapping_add(val_int(ptr.offset(func, 2)), 1)
+            let slot = tab_get_int(t, i)
+            if !val_is_empty(slot) || ptr.is_null((*t).metatable) {
+                set_int(top, i)
+                if val_is_empty(slot) {
+                    (*ptr.offset(top, 1)).tag = TAG_NIL
+                    (*L).top = ptr.offset(top, 2)
+                    return ok(1)
+                }
+                set_obj(ptr.offset(top, 1), slot)
+                (*L).top = ptr.offset(top, 2)
+                return ok(2)
+            }
+        }
         let i = core.wrapping_add(cx.check_integer(2)?, 1)
         cx.push_integer(i)
         if cx.get_i(1, i)? == TNIL {

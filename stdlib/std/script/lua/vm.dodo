@@ -1937,7 +1937,14 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                             base = ptr.offset(func, 1)
                             break
                         }
-                        precall(L, ra, nresults)?
+                        let ftag = (*ra).tag
+                        if ftag == TAG_LIGHTFN {
+                            precall_native(L, ra, nresults, val_lightfn(ra))?
+                        } else if ftag == TAG_NCLOSURE {
+                            precall_native(L, ra, nresults, (*(val_gc(ra) as *mut NClosure)).f)?
+                        } else {
+                            precall(L, ra, nresults)?
+                        }
                         let newci = (*L).ci
                         if newci == ci {
                             base = ptr.offset((*ci).func, 1)
@@ -2125,7 +2132,21 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                         set_obj(cb, ra)
                         (*L).top = ptr.offset(cb, 3)
                         (*ci).savedpc = pc
-                        call_value(L, cb, (i >> 24) as i32)?
+                        let ftag = (*cb).tag
+                        if (ftag == TAG_LIGHTFN || ftag == TAG_NCLOSURE) && (*L).n_ccalls + 1 < MAX_CCALLS {
+                            // A native iterator (next, ipairs): call it directly,
+                            // counted as a nested call like call_value does.
+                            let f = if ftag == TAG_LIGHTFN {
+                                val_lightfn(cb)
+                            } else {
+                                (*(val_gc(cb) as *mut NClosure)).f
+                            }
+                            (*L).n_ccalls = (*L).n_ccalls + 1
+                            precall_native(L, cb, (i >> 24) as i32, f)?
+                            (*L).n_ccalls = (*L).n_ccalls - 1
+                        } else {
+                            call_value(L, cb, (i >> 24) as i32)?
+                        }
                         base = ptr.offset((*ci).func, 1)
                         trap = (*L).hookmask != 0
                     },
