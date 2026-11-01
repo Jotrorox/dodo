@@ -97,7 +97,7 @@ methods implements it and can be passed where a driver expects it:
 | `hal.Spi` | `transfer(&mut self, bytes: &mut[u8]) -> void!hal.Error`<br>`write(&mut self, bytes: &[u8]) -> void!hal.Error` |
 | `hal.PwmOutput` | `max_duty(&self) -> u16`<br>`set_duty(&mut self, duty: u16) -> void!hal.Error` |
 | `hal.AnalogInput` | `max_value(&self) -> u16`<br>`read(&mut self) -> u16!hal.Error` |
-| Serial port | [`io.Reader` and `io.Writer`](io.md) from `std/io`; `hal.Serial` adds `flush(&mut self) -> void!io.Error`. |
+| Serial port | [`io.Reader` and `io.Writer`](io.md) from `std/io`; `serial.Port` adds `flush(&mut self) -> void!io.Error`. |
 | `hal.Registers` | `read(&mut self, offset: usize) -> u32`<br>`write(&mut self, offset: usize, value: u32)` |
 
 Write drivers against bounded parameters, `fn probe<B: hal.I2c>(bus: &mut B)`,
@@ -218,7 +218,7 @@ also come in polling forms that never wait:
 | --- | --- |
 | `hal.I2cPoll` | `poll_write(&mut self, address: u8, bytes: &[u8]) -> bool!hal.Error`<br>`poll_read(&mut self, address: u8, buffer: &mut[u8]) -> bool!hal.Error`<br>`poll_write_read(&mut self, address: u8, bytes: &[u8], buffer: &mut[u8]) -> bool!hal.Error`<br>`cancel(&mut self)` |
 | `hal.SpiPoll` | `poll_transfer(&mut self, bytes: &mut[u8]) -> bool!hal.Error`<br>`poll_write(&mut self, bytes: &[u8]) -> bool!hal.Error`<br>`cancel(&mut self)` |
-| `hal.SerialPoll` | `poll_read(&mut self, buffer: &mut[u8]) -> io.Poll!io.Error`<br>`poll_write(&mut self, bytes: &[u8]) -> io.Poll!io.Error`<br>`poll_flush(&mut self) -> bool!io.Error` |
+| `serial.PollPort` | `poll_read(&mut self, buffer: &mut[u8]) -> io.Poll!io.Error`<br>`poll_write(&mut self, bytes: &[u8]) -> io.Poll!io.Error`<br>`poll_flush(&mut self) -> bool!io.Error` |
 
 Every call does what the hardware allows right now, such as topping up a
 FIFO or collecting received bytes, and returns `false` while the operation
@@ -302,9 +302,11 @@ forever. `bus()` reaches the wrapped bus and `release()` gives it back.
 `poll_write_read` keep the device selected from the first poll until the
 transaction ends, and `cancel` deselects it.
 
-`hal.Serial` is a serial port with `std/io`'s `read` and `write` and a
-`flush` that waits until the last byte has left the transmitter, for drivers
-that must know a reply was sent before they listen or power down.
+Serial ports' protocols live in `std/embedded/hal/serial`, so that
+`std/embedded/hal` itself depends on no stream package: `serial.PollPort`
+above, and `serial.Port`, a serial port with `std/io`'s `read` and `write`
+and a `flush` that waits until the last byte has left the transmitter, for
+drivers that must know a reply was sent before they listen or power down.
 
 ### Being the device: targets
 
@@ -706,7 +708,7 @@ which pins can carry which bus.
 | `fake.Delay` | A delay that returns at once. | `elapsed_us()` |
 | `fake.I2c` | One device at an address with 256 numbered registers and an auto-incrementing register pointer. Other addresses report `NoAcknowledge`. Also `hal.I2cPoll`: a polled transaction takes `set_poll_steps(n)` polls. | `register(n)`, `set_register(n, v)`, `fail_next(error)`, `set_poll_steps(n)`, `cancels()` |
 | `fake.Spi` | A bus that records sent bytes and answers from a programmed reply. Also `hal.SpiPoll`, moving `set_poll_chunk(n)` bytes per poll. | `sent()`, `clear()`, `reply_with(bytes)`, `set_poll_chunk(n)`, `polls()` |
-| `fake.Serial` | A serial port, `hal.Serial` and `hal.SerialPoll`: it records what is written and reads back bytes given to `feed`, then reports end of input; `poll_read` reports Pending instead. | `sent()`, `clear()`, `feed(bytes)`, `set_write_room(n)`, `set_flush_polls(n)`, `flushes()` |
+| `fake.Serial` | A serial port, `serial.Port` and `serial.PollPort`: it records what is written and reads back bytes given to `feed`, then reports end of input; `poll_read` reports Pending instead. | `sent()`, `clear()`, `feed(bytes)`, `set_write_room(n)`, `set_flush_polls(n)`, `flushes()` |
 | `fake.Pwm` | A PWM output with a given `max_duty`, initially at duty 0. | `duty()`, `changes()`, `fail_next(error)` |
 | `fake.Analog` | An analog input with a given `max_value` that reads the value given to `set`, after any given to `queue`, one per read. | `set(value)`, `queue(values)`, `reads()`, `fail_next(error)` |
 | `fake.I2cTarget` | An I2C target and the master that talks to it, played by the test: the master's writes, reads, and STOPs come out of `poll` in order. | `master_write(bytes)`, `master_read(count)`, `master_stop()`, `master_received()`, `is_idle()`, `fail_next(error)` |
@@ -1784,7 +1786,7 @@ pulled up and nothing is sent, and `flush()` waits as long.
 | --- | --- |
 | Speed | From 120 baud (144 on the RP2350) up to a sixteenth of the system clock: 7.8 Mbaud on the RP2040, 9.4 Mbaud on the RP2350. `baud()` reports the rate the divider makes, within 0.1 % up to 921600 baud (`115_207` for `115_200`). |
 | Changing it | `set_baud(baud)`, and `set_format(data_bits, parity, stop_bits)` for 5 to 8 data bits, `pl011.Parity.None`, `Even`, or `Odd`, and 1 or 2 stop bits. Both wait until everything written is out. |
-| Writing | `write` waits while the 32-byte transmit FIFO is full and returns once the last byte is queued; `flush()` waits until it has left. `poll_write` queues what fits and `poll_flush()` tells whether the last byte has left, both without waiting; ports implement `hal.Serial` and `hal.SerialPoll`. A write or `flush()` that makes no progress for `pl011.DEFAULT_POLL_LIMIT` status polls (around a second), as when flow control holds the transmitter, fails with `TimedOut` and the bytes queued before it; `set_poll_limit(polls)` changes the limit, `pl011.NO_POLL_LIMIT` removes it. |
+| Writing | `write` waits while the 32-byte transmit FIFO is full and returns once the last byte is queued; `flush()` waits until it has left. `poll_write` queues what fits and `poll_flush()` tells whether the last byte has left, both without waiting; ports implement `serial.Port` and `serial.PollPort`. A write or `flush()` that makes no progress for `pl011.DEFAULT_POLL_LIMIT` status polls (around a second), as when flow control holds the transmitter, fails with `TimedOut` and the bytes queued before it; `set_poll_limit(polls)` changes the limit, `pl011.NO_POLL_LIMIT` removes it. |
 | Reading | `read` waits for the first byte, as long as it takes unless `set_read_poll_limit(polls)` bounds it (then `TimedOut`), then returns what has arrived; a serial port never reaches end of input. `poll_read` returns at once, `Pending` while nothing has arrived. Nothing buffers beyond the 32-byte receive FIFO, so read at least every 32 bytes' time (2.8 ms at 115200 baud) while data arrives. |
 | Errors | A read fails with an `io.Error` of kind `Other` whose `code` holds `pl011.FRAMING_ERROR`, `PARITY_ERROR`, `BREAK`, or `OVERRUN`, after the good bytes before it (`transferred`). Bytes with framing or parity errors, and breaks, are dropped; an overrun means bytes were lost because the receive FIFO was full. The next read continues. |
 | Terminals | `set_crlf(true)` writes `"\n"` as `"\r\n"` and reads the CR that Enter sends, alone or followed by LF, as one `"\n"`, so `io.read_line` ends at Enter. Off at first, so binary protocols get their bytes unchanged. Terminals do not show what is typed unless the program echoes it. |
@@ -1860,7 +1862,7 @@ is a small command line over USB.
 
 | | USB serial port |
 | --- | --- |
-| Writing | `write` queues its bytes and returns. While no terminal has the port open, the first 1024 bytes (`rp_usb.TX_CAPACITY`) wait for one and the rest are dropped, so the start of the output, such as a banner printed at startup, is shown when a terminal opens it. While one has it open, a full queue waits for the host, and output the host does not take within 100 ms is dropped. Printing never stops the program and never fails. `flush()` waits until the host has taken everything, within the same limit; `poll_write` queues what fits and `poll_flush()` tells whether the host has taken it all. The port implements `hal.Serial` and `hal.SerialPoll`. |
+| Writing | `write` queues its bytes and returns. While no terminal has the port open, the first 1024 bytes (`rp_usb.TX_CAPACITY`) wait for one and the rest are dropped, so the start of the output, such as a banner printed at startup, is shown when a terminal opens it. While one has it open, a full queue waits for the host, and output the host does not take within 100 ms is dropped. Printing never stops the program and never fails. `flush()` waits until the host has taken everything, within the same limit; `poll_write` queues what fits and `poll_flush()` tells whether the host has taken it all. The port implements `serial.Port` and `serial.PollPort`. |
 | Reading | `read` waits for the first byte, then returns what has arrived; `poll_read` returns at once, `Pending` while nothing has. Up to 256 bytes (`rp_usb.RX_CAPACITY`) are kept; beyond that the host waits until the program reads, so no input is lost. `available()` counts what is waiting. |
 | Terminals | Newline translation is on at first, unlike on a UART: `"\n"` goes out as `"\r\n"`, and the CR that Enter sends, alone or followed by LF, reads as `"\n"`. `set_crlf(false)` passes binary data unchanged. |
 | Connection | `is_connected()` is true while a program on the host has the port open (DTR set, as terminals do); `is_configured()` while the host has enumerated the board. `line_state()` returns `rp_usb.DTR` and `rp_usb.RTS`, and `baud()` the rate the host set, for a bridge to a UART. |
@@ -2310,7 +2312,7 @@ bus then works as before. Frames above 8 bits are `Unsupported`.
 
 `port.dma(&mut rx, &mut ring, &mut tx, &mut output)` returns a
 `pl011.DmaPort`, a serial port with the `std/io` Reader and Writer
-protocols, `hal.Serial`, and `hal.SerialPoll`, like `pl011.Port`, but with
+protocols, `serial.Port`, and `serial.PollPort`, like `pl011.Port`, but with
 two differences:
 
 - `rx` moves every byte that arrives into `ring`, round and round, so input

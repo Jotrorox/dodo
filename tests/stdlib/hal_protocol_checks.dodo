@@ -3,6 +3,7 @@ package main
 import "core/ptr"
 import "std/embedded/hal"
 import "std/embedded/hal/fake"
+import "std/embedded/hal/serial"
 import "std/io"
 
 // Host checks for the std/embedded/hal protocols beyond the basic blocking
@@ -212,9 +213,9 @@ fn polled_spi() {
 
 // --- Serial ----------------------------------------------------------------
 
-// A driver written against hal.SerialPoll: sends a whole message across
+// A driver written against serial.PollPort: sends a whole message across
 // polls.
-fn send_polled<S: hal.SerialPoll>(serial: &mut S, message: &[u8], sent: &mut usize) -> bool!io.Error {
+fn send_polled<S: serial.PollPort>(serial: &mut S, message: &[u8], sent: &mut usize) -> bool!io.Error {
     for *sent < message.len {
         progress := serial.poll_write(message[*sent..])?
         *sent += progress.transferred
@@ -225,7 +226,7 @@ fn send_polled<S: hal.SerialPoll>(serial: &mut S, message: &[u8], sent: &mut usi
     return serial.poll_flush()
 }
 
-fn flush_twice<S: hal.Serial>(serial: &mut S) -> void!io.Error {
+fn flush_twice<S: serial.Port>(serial: &mut S) -> void!io.Error {
     io.write_all(serial, b"bye")?
     serial.flush()?
     return serial.flush()
@@ -252,7 +253,7 @@ fn serial_protocols() {
     serial.clear()
     flush_twice(&mut serial)!
     core.assert(bytes_equal(serial.sent(), b"bye"))
-    dynamic: &mut dyn hal.Serial = &mut serial
+    dynamic: &mut dyn serial.Port = &mut serial
     dynamic.flush()!
 }
 

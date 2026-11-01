@@ -4,6 +4,7 @@ import "core/option"
 import "core/ptr"
 import "std/embedded/executor"
 import "std/embedded/hal"
+import "std/embedded/hal/serial"
 import "std/io"
 
 // In-memory devices implementing the `std/embedded/hal` protocols. They let
@@ -460,11 +461,11 @@ pub struct Analog {
 // Reader and Writer protocols like the chips' serial ports, so drivers for
 // devices on a UART, and std/fmt output, can be tested on a desktop.
 //
-// It also implements hal.Serial and hal.SerialPoll. `set_write_room`
+// It also implements serial.Port and serial.PollPort. `set_write_room`
 // limits how many bytes one poll_write takes, to test a driver against a
 // full transmitter, and `set_flush_polls` how many poll_flush calls report
 // output still going out after a write.
-pub struct Serial: hal.Serial + hal.SerialPoll {
+pub struct Serial: serial.Port + serial.PollPort {
     sent: [256]u8
     sent_length: usize
     input: [256]u8

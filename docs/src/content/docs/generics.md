@@ -310,10 +310,11 @@ one generic function serves many types.
 The standard library declares interfaces for its byte streams and devices:
 `io.Reader`, `io.Writer`, and `io.ReadWriter` in [`std/io`](io.md), and
 `hal.OutputPin`, `hal.InputPin`, `hal.Delay`, `hal.I2c`, `hal.Spi`,
-`hal.Serial`, `hal.PwmOutput`, `hal.PwmInput`, `hal.AnalogInput`, `hal.Can`,
+`hal.PwmOutput`, `hal.PwmInput`, `hal.AnalogInput`, `hal.Can`,
 `hal.I2sOutput`, `hal.I2sInput`, their polling and target forms, the DMA
 protocols, and `hal.Registers` in
-[`std/embedded/hal`](hardware.md#device-protocols). Its
+[`std/embedded/hal`](hardware.md#device-protocols), with the serial port
+protocols `serial.Port` and `serial.PollPort` in `std/embedded/hal/serial`. Its
 helpers are bounded by them, so `io.write_all(&mut stream, bytes)` reports a
 stream without the right `write` method at the call.
 

@@ -2,7 +2,6 @@ package hal
 
 import "core/cpu"
 import "core/ptr"
-import "std/io"
 
 // Portable hardware abstraction layer. Nothing here requires an OS, allocator,
 // or particular chip, and every package that imports it also compiles for
@@ -19,19 +18,20 @@ import "std/io"
 // 2. Interrupts. `Critical` masks interrupts on the current core until it is
 //    dropped. It never excludes other threads or cores.
 // 3. Device protocols. The interfaces below name what drivers need from a
-//    device: OutputPin, InputPin, Delay, I2c, Spi, Serial, PwmOutput,
-//    PwmInput, AnalogInput, Can, I2sOutput, I2sInput, Watchdog, and
-//    Registers; the polling forms I2cPoll, SpiPoll, and SerialPoll; the
-//    target (slave) sides I2cTarget and SpiTarget; and DmaChannel,
-//    DmaBuffer, and SpiDma for transfers that run while the program does
-//    other work. Any value
-//    with matching methods implements them. Drivers are usually generic over
+//    device: OutputPin, InputPin, Delay, I2c, Spi, PwmOutput, PwmInput,
+//    AnalogInput, Can, I2sOutput, I2sInput, Watchdog, and Registers; the
+//    polling forms I2cPoll and SpiPoll; the target (slave) sides I2cTarget
+//    and SpiTarget; and DmaChannel, DmaBuffer, and SpiDma for transfers that
+//    run while the program does other work. Any value with matching methods
+//    implements them. Drivers are usually generic over
 //    a bounded parameter, `fn probe<B: hal.I2c>(bus: &mut B)`, which is
 //    statically dispatched and reports a wrong argument where it is passed.
 //    `&mut dyn hal.I2c` instead dispatches at run time, for drivers chosen at
 //    run time or a list of different devices. Serial ports implement the
 //    `std/io` Reader and Writer interfaces, so ports work with `std/io`
-//    helpers and `std/fmt` formatting unchanged.
+//    helpers and `std/fmt` formatting unchanged, and the Port and PollPort
+//    protocols of `std/embedded/hal/serial`, which stay out of this package
+//    so that it depends on no stream package.
 //
 // Blocking and polling. The plain protocols wait until an operation is
 // done. Their polling forms never wait: each call does what the hardware
@@ -101,7 +101,8 @@ import "std/io"
 //                                  window_us) for a PwmInput,
 //                                  spi_with_select, and uart_flow. Buses
 //                                  implement the polling forms too, and
-//                                  serial ports Serial and SerialPoll
+//                                  serial ports serial.Port and
+//                                  serial.PollPort
 //    Board.timer                   delay_us, delay_ms, now_us(&self) -> u64;
 //                                  chips may hand out alarms that are
 //                                  std/embedded/executor clocks, as the
@@ -233,15 +234,6 @@ pub interface AnalogInput {
     fn read(&mut self) -> u16!Error
 }
 
-// A serial port: a byte stream with std/io's read and write, which waits
-// for room or for the first byte, and `flush`, which waits until every
-// byte written has left the transmitter. Chip serial ports, USB serial
-// ports, and fake.Serial implement it, so drivers for devices on a UART
-// name `S: hal.Serial` when they need flush and `io.ReadWriter` when not.
-pub interface Serial: io.ReadWriter {
-    fn flush(&mut self) -> void!io.Error
-}
-
 // --- Polling forms -------------------------------------------------------
 //
 // See "Blocking and polling" in the package comment for the contract they
@@ -289,18 +281,6 @@ pub interface SpiPoll {
     // Abandon the running transfer, if any, once the frame on the wire is
     // complete, and discard what was received.
     fn cancel(&mut self)
-}
-
-// A serial port that moves bytes without waiting, with the progress
-// contract of std/io: poll_read returns what has arrived, up to
-// `buffer.len`, and Pending with nothing while nothing has; poll_write
-// takes what there is room for and is Pending once it took less than all.
-pub interface SerialPoll {
-    fn poll_read(&mut self, buffer: &mut[u8]) -> io.Poll!io.Error
-    fn poll_write(&mut self, bytes: &[u8]) -> io.Poll!io.Error
-    // True once every byte written has left the transmitter, stop bits
-    // included; false while some are still going out.
-    fn poll_flush(&mut self) -> bool!io.Error
 }
 
 // --- Target (slave) sides ------------------------------------------------

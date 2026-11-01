@@ -4,13 +4,14 @@
 
 - `std/embedded/hal` settles its device protocols before a second chip
   vendor arrives, so drivers written now keep working:
-  - Polling forms of the buses, `hal.I2cPoll`, `hal.SpiPoll`, and
-    `hal.SerialPoll`, never wait: each call does what the hardware allows
+  - Polling forms of the buses, `hal.I2cPoll`, `hal.SpiPoll`, and, in the
+    new `std/embedded/hal/serial` (which keeps `hal` free of `std/io`),
+    `serial.PollPort`, never wait: each call does what the hardware allows
     and returns true once the operation has finished, keeping its state in
     the bus rather than in borrowed buffers, so transactions may be any
     length and run across an executor task's polls. `hal.BlockingI2c` and
     `hal.BlockingSpi` turn a polling-only controller into a blocking one, and
-    `hal.SpiDevice` keeps a device selected across polls. `hal.Serial` adds
+    `hal.SpiDevice` keeps a device selected across polls. `serial.Port` adds
     `flush` to std/io's streams.
   - Target sides: `hal.I2cTarget` with `hal.I2cTargetEvent`, and
     `hal.SpiTarget`.
@@ -37,8 +38,8 @@
   poll can make progress; I2C targets `hal.I2cTarget` (the driver's own
   `TargetEvent` is gone); PL022 SPI buses `hal.SpiPoll`, targets
   `hal.SpiTarget`, and `pl022.DmaBus` `hal.SpiDma` with `poll_finish` and
-  `abort`; serial ports and the USB serial port `hal.Serial` and
-  `hal.SerialPoll` with `poll_flush`.
+  `abort`; serial ports and the USB serial port `serial.Port` and
+  `serial.PollPort` with `poll_flush`.
 - `pins.pwm_input(pin, window_us)` measures pulses on an odd GPIO with a PWM
   slice's counting modes, as a `hal.PwmInput`: the frequency and duty of a
   PWM signal, a fan's tachometer, or a servo pulse, to within microseconds.

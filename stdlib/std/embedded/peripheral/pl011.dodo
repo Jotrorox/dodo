@@ -2,6 +2,7 @@ package pl011
 
 import "core/cpu"
 import "std/embedded/hal"
+import "std/embedded/hal/serial"
 import "std/io"
 
 // The Arm PrimeCell PL011 UART, an asynchronous serial port. Chip vendors
@@ -25,9 +26,9 @@ import "std/io"
 // are lost and a read reports OVERRUN; with hardware flow control, see
 // `set_flow_control`, the controller asks the other end to pause instead.
 // `Port.dma` lifts the limit: a `DmaPort` receives into a ring buffer by
-// DMA, and writes in the background. Ports implement hal.Serial and, with
+// DMA, and writes in the background. Ports implement serial.Port and, with
 // `poll_read`, `poll_write`, and `poll_flush`, which never wait,
-// hal.SerialPoll.
+// serial.PollPort.
 // `set_break` holds the line low, for protocols that signal with breaks.
 //
 // Waits are counted in status polls, not time. A write, `flush`, and the
@@ -209,7 +210,7 @@ fn line_format(data_bits: u32, parity: Parity, stop_bits: u32) -> u32!hal.Error 
 
 // A serial port on one PL011 with registers R, any hal.Registers. Implements
 // the std/io Reader and Writer interfaces and their polling forms.
-pub struct Controller<R: hal.Registers>: hal.Serial + hal.SerialPoll {
+pub struct Controller<R: hal.Registers>: serial.Port + serial.PollPort {
     registers: R
     divisors: Divisors
     // Status polls without progress before a wait for output, or for the
@@ -661,7 +662,7 @@ fn ring_bits(address: usize, length: usize) -> u32 {
 // RX_TIMEOUT_INTERRUPT and RX_INTERRUPT as with a polled port. Dropping
 // the DmaPort stops both channels and hands the port back; input still in
 // the ring is lost and output not yet sent is cut short.
-pub struct DmaPort: hal.Serial + hal.SerialPoll {
+pub struct DmaPort: serial.Port + serial.PollPort {
     registers: &mut dyn hal.Registers
     data: usize
     rx: &mut dyn hal.DmaChannel
@@ -1010,7 +1011,7 @@ pub fn send<R: hal.Registers>(registers: &mut R, bytes: &[u8]) {
 // implements the std/io Reader and Writer protocols like Controller but keeps
 // the register block: `RegisterBlock` trusts its owner with every offset,
 // which only the driver may be.
-pub struct Port: hal.Serial + hal.SerialPoll {
+pub struct Port: serial.Port + serial.PollPort {
     controller: Controller<hal.RegisterBlock>
 
     // SAFETY: as for hal.RegisterBlock.at, with `base` a PL011 whose reset
