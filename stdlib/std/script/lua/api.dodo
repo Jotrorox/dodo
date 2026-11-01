@@ -1,7 +1,18 @@
 package lua
 
+import "core/mem"
+import "core/ptr"
+
 // Public embedding API. (Skeleton.)
 
 pub fn version() -> &str from(static) {
     return "Lua 5.4"
+}
+
+// Temporary probe for the skeleton build; removed by the runtime agent.
+pub fn chunk_name_probe(text: &str, out: &mut [u8]) -> usize {
+    let bytes = mem.str_bytes(text)
+    unsafe {
+        return chunk_id(ptr.as_ptr(bytes) as *mut u8, bytes.len, ptr.as_mut_ptr(out))
+    }
 }

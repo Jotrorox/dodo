@@ -270,3 +270,58 @@ enum Throw {
     // A coroutine yield unwinding the native stack.
     Yield,
 }
+
+// Size of a printable chunk identifier, including room for a terminator.
+const CHUNKID_SIZE: usize = 60
+
+fn cid_put(out: *mut u8, at: usize, src: *mut u8, count: usize) -> usize {
+    unsafe { ptr.copy_nonoverlapping(src, ptr.offset(out, at as isize), count) }
+    return at + count
+}
+
+// Writes the printable name of a chunk (as used in error messages and
+// debug.getinfo().short_src) into `out` (at least CHUNKID_SIZE bytes) and
+// returns its length. "=name" prints name, "@file" prints the file name
+// (keeping its end when too long), anything else prints [string "..."]
+// with the first line of the source.
+fn chunk_id(source: *mut u8, length: usize, out: *mut u8) -> usize {
+    unsafe {
+        let first = if length > 0 { *source } else { 0u8 }
+        if first == b'=' {
+            let n = if length <= CHUNKID_SIZE { length - 1 } else { CHUNKID_SIZE - 1 }
+            return cid_put(out, 0, ptr.offset(source, 1), n)
+        }
+        if first == b'@' {
+            if length <= CHUNKID_SIZE {
+                return cid_put(out, 0, ptr.offset(source, 1), length - 1)
+            }
+            let dots = b"..."
+            at := cid_put(out, 0, ptr.as_ptr(dots) as *mut u8, 3)
+            let keep = CHUNKID_SIZE - 4
+            return cid_put(out, at, ptr.offset(source, (length - keep) as isize), keep)
+        }
+        let prefix = b"[string \""
+        let suffix = b"\"]"
+        let dots = b"..."
+        at := cid_put(out, 0, ptr.as_ptr(prefix) as *mut u8, prefix.len)
+        let room = CHUNKID_SIZE - prefix.len - dots.len - suffix.len - 1
+        newline := length
+        for i in 0usize..length {
+            if *ptr.offset(source, i as isize) == b'\n' {
+                newline = i
+                break
+            }
+        }
+        if length < room && newline == length {
+            at = cid_put(out, at, source, length)
+        } else {
+            n := newline
+            if n > room {
+                n = room
+            }
+            at = cid_put(out, at, source, n)
+            at = cid_put(out, at, ptr.as_ptr(dots) as *mut u8, dots.len)
+        }
+        return cid_put(out, at, ptr.as_ptr(suffix) as *mut u8, suffix.len)
+    }
+}
