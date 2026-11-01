@@ -913,6 +913,20 @@
   cover 10-bit addressing, both targets, 12-bit and TI frames through the
   SPI loopback, breaks, and the flow control pins, and the desktop models
   gain a DW_apb_i2c target driven by a scripted master.
+- Deeper low power on the RP2040 and RP2350. A `power.Wake` takes a timeout
+  (`wake.after_ms(ms)`, `power.dormant_for`), and `dormant` reports it in
+  bit 63 (`power.BY_TIME`, `power.by_time`; `power.MAX_PINS` is now 63).
+  The RP2040 wakes by its RTC once `b.rtc.use_clock_input(&mut b.pins, 20,
+  32_768)` feeds clk_rtc from a GPIO clock; the RP2350 wakes by its
+  always-on timer, which `b.rtc` can also tick from the low-power
+  oscillator (OTP-calibrated), an external 32 kHz clock, or an external
+  1 kHz tick. `b.power.set_system_hz(hz)` runs clk_sys from the crystal or
+  PLL_SYS at a lower rate and back, refusing while a peripheral whose
+  divider follows clk_sys is claimed. The RP2350's `b.power.power_down(&wake,
+  retain)` switches off the switched core and unkept SRAM through POWMAN
+  until a pin event or a timeout restarts the chip, after which
+  `woke_from_power_down`, `power_down_wake`, `retained`, and `scratch`
+  report and keep state. `fake.Power` simulates timeouts.
 
 ## 0.1.5 — 2026-10-12
 
