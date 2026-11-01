@@ -1,0 +1,488 @@
+package rp_rtc
+
+import "std/embedded/hal"
+import "std/time"
+
+// The real-time clocks of the RP2040 and RP2350, over any hal.Registers: a
+// `hal.RegisterBlock` at the block's base on the chip, or a simulated block
+// in a desktop test. Both implement the std/embedded/hal Rtc and RtcAlarm
+// protocols, so code that keeps the time moves between the chips unchanged.
+//
+// `Calendar` is the RP2040's RTC (RP2040 datasheet 4.8): a calendar of
+// year, month, day, hours, minutes, and seconds, counting whole seconds
+// from a clock of up to 65536 Hz. It counts years up to 4095 and keeps leap
+// years, but only every fourth year: 2100, which is not one, needs the
+// time set again after February 2100. Its alarm compares every field with
+// the time, so it matches for one second.
+//
+// `AonTimer` is the RP2350's always-on timer in the power manager (RP2350
+// datasheet 6.5): a 64-bit millisecond counter in the always-on power
+// domain, which keeps counting while the processors sleep and through
+// resets, until the chip loses power. Its 1 kHz tick comes from the
+// crystal. Its alarm fires once the counter is at or past the alarm time.
+//
+// The clocks count Unix time, milliseconds since 1970-01-01 00:00:00 UTC,
+// as the hal protocols do.
+
+// Status polls before a register change that does not take effect is
+// reported as Timeout. The RTC's clock domain needs a few of its own
+// cycles, about 100 us; the power manager's, a few milliseconds' worth.
+const ATTEMPTS: u32 = 1_000_000
+
+// Atomic register aliases (RP2040 datasheet 2.1.2, RP2350 2.1.3).
+const SET_ALIAS: usize = 0x2000
+const CLEAR_ALIAS: usize = 0x3000
+
+// RP2040 RTC registers.
+const CLKDIV_M1: usize = 0x00
+const SETUP_0: usize = 0x04
+const SETUP_1: usize = 0x08
+const CTRL: usize = 0x0C
+const IRQ_SETUP_0: usize = 0x10
+const IRQ_SETUP_1: usize = 0x14
+const RTC_1: usize = 0x18
+const RTC_0: usize = 0x1C
+const RTC_INTR: usize = 0x20
+const RTC_INTE: usize = 0x24
+const RTC_INTF: usize = 0x28
+
+// SETUP_0, IRQ_SETUP_0, and RTC_1: the date. SETUP_1, IRQ_SETUP_1, and
+// RTC_0: the day of the week (0 for Sunday) and the time.
+const YEAR: u32 = 0xFFF << 12
+const MONTH: u32 = 0xF << 8
+const DAY: u32 = 0x1F
+const WEEKDAY: u32 = 0x7 << 24
+const HOUR: u32 = 0x1F << 16
+const MINUTE: u32 = 0x3F << 8
+const SECOND: u32 = 0x3F
+
+// CTRL: run, running, load SETUP into the counter, and no leap year this
+// year.
+const RTC_ENABLE: u32 = 1 << 0
+const RTC_ACTIVE: u32 = 1 << 1
+const LOAD: u32 = 1 << 4
+const FORCE_NOT_LEAP_YEAR: u32 = 1 << 8
+
+// IRQ_SETUP_0 and IRQ_SETUP_1: the fields the alarm compares, and whether
+// it compares at all. MATCH_ENA may only change while the others hold.
+const DAY_ENA: u32 = 1 << 24
+const MONTH_ENA: u32 = 1 << 25
+const YEAR_ENA: u32 = 1 << 26
+const MATCH_ENA: u32 = 1 << 28
+const MATCH_ACTIVE: u32 = 1 << 29
+const SECOND_ENA: u32 = 1 << 28
+const MINUTE_ENA: u32 = 1 << 29
+const HOUR_ENA: u32 = 1 << 30
+
+const RTC_IRQ_BIT: u32 = 1 << 0
+
+// The RTC's largest year and clock.
+pub const CALENDAR_LAST_YEAR: i32 = 4095
+pub const CALENDAR_MAX_HZ: u32 = 65_536
+
+// RP2350 power manager registers. Every write carries the password in its
+// upper half, or the power manager ignores it.
+const PASSWORD: u32 = 0x5AFE_0000
+const XOSC_FREQ_KHZ_INT: usize = 0x58
+const XOSC_FREQ_KHZ_FRAC: usize = 0x5C
+const SET_TIME_63TO48: usize = 0x60
+const SET_TIME_47TO32: usize = 0x64
+const SET_TIME_31TO16: usize = 0x68
+const SET_TIME_15TO0: usize = 0x6C
+const READ_TIME_UPPER: usize = 0x70
+const READ_TIME_LOWER: usize = 0x74
+const ALARM_TIME_63TO48: usize = 0x78
+const ALARM_TIME_47TO32: usize = 0x7C
+const ALARM_TIME_31TO16: usize = 0x80
+const ALARM_TIME_15TO0: usize = 0x84
+const TIMER: usize = 0x88
+const POWMAN_INTE: usize = 0xE4
+
+// TIMER: counting, the alarm compares, the alarm fired (write one to
+// clear), switch the tick to the crystal (clears itself), and ticking from
+// the crystal. Setting RUN loads SET_TIME, which may only be written while
+// RUN is clear; ALARM_TIME only while ALARM_ENAB is clear.
+const RUN: u32 = 1 << 1
+const ALARM_ENAB: u32 = 1 << 4
+const ALARM: u32 = 1 << 6
+const USE_XOSC: u32 = 1 << 9
+const USING_XOSC: u32 = 1 << 16
+
+// INTE: the timer's alarm raises POWMAN_IRQ_TIMER.
+const INTE_TIMER: u32 = 1 << 1
+
+// The RP2040's RTC over `R`. Implements hal.Rtc and hal.RtcAlarm with a
+// resolution of one second.
+pub struct Calendar<R: hal.Registers>: hal.Rtc + hal.RtcAlarm {
+    registers: R
+    // The second the alarm is set for, while it is armed.
+    alarm: u64
+    armed: bool
+
+    // Take the RTC, fresh from its reset, counting from a `clock_hz` clock
+    // (clk_rtc): stopped, with no alarm. InvalidInput for a clock of 0 or
+    // above CALENDAR_MAX_HZ.
+    // SAFETY: `registers` must be the RTC's own, and nothing else may
+    // touch them while the Calendar exists.
+    pub unsafe fn new(registers: R, clock_hz: u32) -> Calendar<R>!hal.Error from(registers) {
+        if clock_hz == 0 || clock_hz > CALENDAR_MAX_HZ {
+            return err(hal.Error.InvalidInput)
+        }
+        calendar := Calendar<R> { registers, alarm: 0, armed: false }
+        calendar.registers.write(CTRL, 0)
+        calendar.wait_for(CTRL, RTC_ACTIVE, false)?
+        calendar.registers.write(CLKDIV_M1, clock_hz - 1)
+        calendar.registers.write(RTC_INTE, 0)
+        calendar.registers.write(RTC_INTF, 0)
+        calendar.stop_matching()?
+        return ok(calendar)
+    }
+
+    // Poll `offset` until `mask` reads `set`.
+    fn wait_for(&mut self, offset: usize, mask: u32, set: bool) -> void!hal.Error {
+        for _ in 0..ATTEMPTS {
+            if ((self.registers.read(offset) & mask) != 0) == set {
+                return ok()
+            }
+        }
+        return err(hal.Error.Timeout)
+    }
+
+    fn stop_matching(&mut self) -> void!hal.Error {
+        self.registers.write(IRQ_SETUP_0 + CLEAR_ALIAS, MATCH_ENA)
+        return self.wait_for(IRQ_SETUP_0, MATCH_ACTIVE, false)
+    }
+
+    pub fn is_set(&mut self) -> bool!hal.Error {
+        return ok((self.registers.read(CTRL) & RTC_ACTIVE) != 0)
+    }
+
+    pub fn resolution_ms(&self) -> u32 {
+        return 1000
+    }
+
+    // Seconds since the epoch.
+    fn now_seconds(&mut self) -> u64!hal.Error {
+        if (self.registers.read(CTRL) & RTC_ACTIVE) == 0 {
+            return err(hal.Error.Busy)
+        }
+        // RTC_0 first: reading it holds RTC_1 for the read that follows.
+        clock := self.registers.read(RTC_0)
+        date := self.registers.read(RTC_1)
+        return seconds_of(date, clock)
+    }
+
+    pub fn now_ms(&mut self) -> u64!hal.Error {
+        seconds := self.now_seconds()?
+        return ok(seconds * 1000)
+    }
+
+    // Stop the RTC, load the time, and start it again. The new time shows
+    // a few of the RTC's clock cycles later, which this waits for.
+    // InvalidInput past CALENDAR_LAST_YEAR.
+    pub fn set_ms(&mut self, time_ms: u64) -> void!hal.Error {
+        seconds := time_ms / 1000
+        let Fields { date, clock, year } = fields_of(seconds)?
+        control := RTC_ENABLE
+        if year % 100 == 0 && year % 400 != 0 {
+            control |= FORCE_NOT_LEAP_YEAR
+        }
+        self.registers.write(CTRL, 0)
+        self.wait_for(CTRL, RTC_ACTIVE, false)?
+        self.registers.write(SETUP_0, date)
+        self.registers.write(SETUP_1, clock)
+        self.registers.write(CTRL, LOAD | (control & FORCE_NOT_LEAP_YEAR))
+        self.registers.write(CTRL, control)
+        self.wait_for(CTRL, RTC_ACTIVE, true)?
+        for _ in 0..ATTEMPTS {
+            // Until then reads show the old time, or zeros, which are no
+            // date, after the RTC's reset.
+            shown := match self.now_seconds() {
+                ok(value) => value,
+                err(_) => 0,
+            }
+            if shown == seconds || shown == seconds + 1 {
+                // The alarm fires at or after its time, as the protocol
+                // says, though the RTC only matches its exact second: a
+                // time set past it forces the interrupt.
+                if self.armed && shown >= self.alarm {
+                    self.registers.write(RTC_INTF, RTC_IRQ_BIT)
+                }
+                return ok()
+            }
+        }
+        return err(hal.Error.Timeout)
+    }
+
+    // Fire at the first whole second at or after `time_ms`. The RTC only
+    // matches its exact second, so a time already reached forces the
+    // interrupt instead.
+    pub fn set_alarm_ms(&mut self, time_ms: u64) -> void!hal.Error {
+        now := self.now_seconds()?
+        target := time_ms / 1000
+        if time_ms % 1000 != 0 {
+            target += 1
+        }
+        let Fields { date, clock, year } = fields_of(target)?
+        self.stop_matching()?
+        self.registers.write(RTC_INTF, 0)
+        self.registers.write(IRQ_SETUP_0, date | YEAR_ENA | MONTH_ENA | DAY_ENA)
+        self.registers.write(IRQ_SETUP_1, (clock & ~WEEKDAY) | HOUR_ENA | MINUTE_ENA | SECOND_ENA)
+        self.registers.write(IRQ_SETUP_0 + SET_ALIAS, MATCH_ENA)
+        self.alarm = target
+        self.armed = true
+        self.wait_for(IRQ_SETUP_0, MATCH_ACTIVE, true)?
+        // Read again: the second may have passed while the alarm was set.
+        if self.now_seconds()? >= target || target <= now {
+            self.registers.write(RTC_INTF, RTC_IRQ_BIT)
+        }
+        return ok()
+    }
+
+    // True from the alarm's second until clear_alarm. The RTC raises its
+    // interrupt only during that second; the time decides afterwards.
+    pub fn alarm_fired(&mut self) -> bool!hal.Error {
+        if !self.armed || (self.registers.read(CTRL) & RTC_ACTIVE) == 0 {
+            return ok(false)
+        }
+        now := self.now_seconds()?
+        return ok(now >= self.alarm)
+    }
+
+    pub fn clear_alarm(&mut self) -> void!hal.Error {
+        self.armed = false
+        self.registers.write(RTC_INTF, 0)
+        return self.stop_matching()
+    }
+
+    // Raise the RTC's interrupt when the alarm fires.
+    pub fn listen(&mut self) {
+        self.registers.write(RTC_INTE, RTC_IRQ_BIT)
+    }
+
+    // Stop raising the interrupt; alarm_fired still reports.
+    pub fn ignore(&mut self) {
+        self.registers.write(RTC_INTE, 0)
+    }
+
+    pub fn is_listening(&mut self) -> bool {
+        return (self.registers.read(RTC_INTE) & RTC_IRQ_BIT) != 0
+    }
+
+    // True while the interrupt is raised: the alarm's second, or a time set
+    // past it.
+    pub fn is_pending(&mut self) -> bool {
+        return (self.registers.read(RTC_INTR) & RTC_IRQ_BIT) != 0 || (self.registers.read(RTC_INTF) & RTC_IRQ_BIT) != 0
+    }
+
+    // Stop the clock and the alarm, and give back the registers.
+    pub fn release(self) -> R from(self) {
+        self.ignore()
+        match self.clear_alarm() {
+            ok() => {},
+            err(_) => {},
+        }
+        self.registers.write(CTRL, 0)
+        let Calendar { registers, alarm, armed } = self
+        return registers
+    }
+}
+
+// The RP2040 RTC's register fields for one time.
+struct Fields {
+    // SETUP_0: year, month, and day.
+    date: u32
+    // SETUP_1: weekday, hours, minutes, and seconds.
+    clock: u32
+    year: i32
+}
+
+// The fields for `seconds` since the epoch; InvalidInput past
+// CALENDAR_LAST_YEAR.
+fn fields_of(seconds: u64) -> Fields!hal.Error {
+    days := seconds / 86_400
+    second_of_day := (seconds % 86_400) as u32
+    // Days to the end of CALENDAR_LAST_YEAR fit an i64 with room to spare.
+    if days > 2_000_000 {
+        return err(hal.Error.InvalidInput)
+    }
+    date := match time.Date.from_days_since_epoch(days as i64) {
+        ok(value) => value,
+        err(_) => {
+            return err(hal.Error.InvalidInput)
+        },
+    }
+    year := date.year()
+    if year > CALENDAR_LAST_YEAR {
+        return err(hal.Error.InvalidInput)
+    }
+    // ISO weekdays run from Monday, 1, to Sunday, 7; the RTC's from Sunday, 0.
+    weekday := date.weekday() % 7
+    hour := second_of_day / 3600
+    minute := second_of_day / 60 % 60
+    second := second_of_day % 60
+    return ok(Fields {
+        date: hal.encode(YEAR, year as u32) | hal.encode(MONTH, date.month()) | hal.encode(DAY, date.day()),
+        clock: hal.encode(WEEKDAY, weekday) | hal.encode(HOUR, hour) | hal.encode(MINUTE, minute) | hal.encode(SECOND, second),
+        year,
+    })
+}
+
+// Seconds since the epoch of the RTC_1 `date` and RTC_0 `clock` fields.
+fn seconds_of(date: u32, clock: u32) -> u64!hal.Error {
+    year := hal.decode(YEAR, date) as i32
+    day := match time.Date.new(year, hal.decode(MONTH, date), hal.decode(DAY, date)) {
+        ok(value) => value,
+        err(_) => {
+            return err(hal.Error.InvalidInput)
+        },
+    }
+    days := day.days_since_epoch()
+    hour := hal.decode(HOUR, clock)
+    minute := hal.decode(MINUTE, clock)
+    second := hal.decode(SECOND, clock)
+    if days < 0 || hour > 23 || minute > 59 || second > 59 {
+        return err(hal.Error.InvalidInput)
+    }
+    return ok(days as u64 * 86_400 + (hour * 3600 + minute * 60 + second) as u64)
+}
+
+// The RP2350's always-on timer over `R`. Implements hal.Rtc and
+// hal.RtcAlarm with a resolution of one millisecond.
+pub struct AonTimer<R: hal.Registers>: hal.Rtc + hal.RtcAlarm {
+    registers: R
+
+    // Take the power manager's timer, ticking from a `crystal_hz` crystal.
+    // A timer that is running already, set before a reset, keeps its time
+    // and tick; a stopped one is set up to tick from the crystal. Either way
+    // its alarm is disarmed. InvalidInput for a crystal below 1 kHz or above
+    // 65.5 MHz.
+    // SAFETY: `registers` must be the power manager's, and nothing else
+    // may write its timer, alarm, or interrupt registers while the
+    // AonTimer exists.
+    pub unsafe fn new(registers: R, crystal_hz: u32) -> AonTimer<R>!hal.Error from(registers) {
+        khz := crystal_hz / 1000
+        if khz < 2 || khz > 0xFFFF {
+            return err(hal.Error.InvalidInput)
+        }
+        timer := AonTimer<R> { registers }
+        timer.disarm()
+        timer.write_masked(POWMAN_INTE + CLEAR_ALIAS, INTE_TIMER)
+        if (timer.registers.read(TIMER) & RUN) == 0 {
+            timer.write_masked(XOSC_FREQ_KHZ_INT, khz)
+            timer.write_masked(XOSC_FREQ_KHZ_FRAC, (crystal_hz % 1000) * 65_536 / 1000)
+            timer.write_masked(TIMER + SET_ALIAS, USE_XOSC)
+        }
+        return ok(timer)
+    }
+
+    // Write the low half of `value` with the password.
+    fn write_masked(&mut self, offset: usize, value: u32) {
+        self.registers.write(offset, PASSWORD | (value & 0xFFFF))
+    }
+
+    fn disarm(&mut self) {
+        self.write_masked(TIMER + CLEAR_ALIAS, ALARM_ENAB)
+        self.write_masked(TIMER + CLEAR_ALIAS, ALARM)
+    }
+
+    pub fn is_set(&mut self) -> bool!hal.Error {
+        return ok((self.registers.read(TIMER) & RUN) != 0)
+    }
+
+    pub fn resolution_ms(&self) -> u32 {
+        return 1
+    }
+
+    fn read_time(&mut self) -> u64 {
+        high := self.registers.read(READ_TIME_UPPER)
+        for {
+            low := self.registers.read(READ_TIME_LOWER)
+            next := self.registers.read(READ_TIME_UPPER)
+            if next == high {
+                return ((high as u64) << 32) | low as u64
+            }
+            high = next
+        }
+    }
+
+    pub fn now_ms(&mut self) -> u64!hal.Error {
+        if (self.registers.read(TIMER) & RUN) == 0 {
+            return err(hal.Error.Busy)
+        }
+        return ok(self.read_time())
+    }
+
+    // Stop the timer, load the time, and start it from the crystal. The
+    // alarm stays armed; a time set past it fires it. Timeout if the
+    // counter never shows the new time.
+    pub fn set_ms(&mut self, time_ms: u64) -> void!hal.Error {
+        self.write_masked(TIMER + CLEAR_ALIAS, RUN)
+        self.write_masked(SET_TIME_15TO0, (time_ms & 0xFFFF) as u32)
+        self.write_masked(SET_TIME_31TO16, ((time_ms >> 16) & 0xFFFF) as u32)
+        self.write_masked(SET_TIME_47TO32, ((time_ms >> 32) & 0xFFFF) as u32)
+        self.write_masked(SET_TIME_63TO48, (time_ms >> 48) as u32)
+        if (self.registers.read(TIMER) & USING_XOSC) == 0 {
+            self.write_masked(TIMER + SET_ALIAS, USE_XOSC)
+        }
+        self.write_masked(TIMER + SET_ALIAS, RUN)
+        // The counter takes the time in its own clock domain; wait until
+        // reads show it, so now_ms() never reports the old time.
+        for _ in 0..ATTEMPTS {
+            shown := self.read_time()
+            if shown >= time_ms && shown - time_ms < 1000 {
+                return ok()
+            }
+        }
+        return err(hal.Error.Timeout)
+    }
+
+    // The timer's alarm fires once the time is at or past it, so a time
+    // already reached fires at once.
+    pub fn set_alarm_ms(&mut self, time_ms: u64) -> void!hal.Error {
+        if (self.registers.read(TIMER) & RUN) == 0 {
+            return err(hal.Error.Busy)
+        }
+        self.disarm()
+        self.write_masked(ALARM_TIME_15TO0, (time_ms & 0xFFFF) as u32)
+        self.write_masked(ALARM_TIME_31TO16, ((time_ms >> 16) & 0xFFFF) as u32)
+        self.write_masked(ALARM_TIME_47TO32, ((time_ms >> 32) & 0xFFFF) as u32)
+        self.write_masked(ALARM_TIME_63TO48, (time_ms >> 48) as u32)
+        self.write_masked(TIMER + SET_ALIAS, ALARM_ENAB)
+        return ok()
+    }
+
+    pub fn alarm_fired(&mut self) -> bool!hal.Error {
+        return ok((self.registers.read(TIMER) & ALARM) != 0)
+    }
+
+    // The alarm fires for as long as the time is past it while it is
+    // armed, so this disarms it before acknowledging it.
+    pub fn clear_alarm(&mut self) -> void!hal.Error {
+        self.disarm()
+        return ok()
+    }
+
+    // Raise POWMAN_IRQ_TIMER when the alarm fires.
+    pub fn listen(&mut self) {
+        self.write_masked(POWMAN_INTE + SET_ALIAS, INTE_TIMER)
+    }
+
+    // Stop raising the interrupt; alarm_fired still reports.
+    pub fn ignore(&mut self) {
+        self.write_masked(POWMAN_INTE + CLEAR_ALIAS, INTE_TIMER)
+    }
+
+    pub fn is_listening(&mut self) -> bool {
+        return (self.registers.read(POWMAN_INTE) & INTE_TIMER) != 0
+    }
+
+    // Disarm the alarm and stop its interrupt, and give back the registers.
+    // The timer keeps counting.
+    pub fn release(self) -> R from(self) {
+        self.ignore()
+        self.disarm()
+        let AonTimer { registers } = self
+        return registers
+    }
+}

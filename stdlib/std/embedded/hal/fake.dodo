@@ -1738,3 +1738,116 @@ pub struct Power {
         return ok(woken)
     }
 }
+
+// A real-time clock with an alarm, implementing hal.Rtc and hal.RtcAlarm.
+// It starts unset, as a clock that has just been powered, and keeps time
+// only as `advance` says. Its resolution is 1 ms unless made coarser, so
+// drivers are tested against clocks that count whole seconds too.
+pub struct Rtc: hal.Rtc + hal.RtcAlarm {
+    // Milliseconds since the epoch, exactly, while `set`.
+    time: u64
+    set: bool
+    resolution: u32
+    alarm: u64
+    armed: bool
+    failure: Option<hal.Error>
+
+    // An unset clock that counts milliseconds.
+    pub fn new() -> Rtc {
+        return Rtc.with_resolution(1)
+    }
+
+    // An unset clock whose steps are `resolution_ms` long, such as 1000
+    // for one that counts seconds; at least 1.
+    pub fn with_resolution(resolution_ms: u32) -> Rtc {
+        core.assert(resolution_ms > 0)
+        return Rtc { time: 0, set: false, resolution: resolution_ms, alarm: 0, armed: false, failure: none }
+    }
+
+    // Let `milliseconds` pass. An unset clock stays unset.
+    pub fn advance(&mut self, milliseconds: u64) {
+        if self.set {
+            self.time += milliseconds
+        }
+    }
+
+    // Lose power: the time is gone and the alarm disarmed, as when a
+    // backup battery runs out.
+    pub fn lose_power(&mut self) {
+        self.set = false
+        self.time = 0
+        self.armed = false
+    }
+
+    // True from set_alarm_ms until clear_alarm or a loss of power.
+    pub fn is_armed(&self) -> bool {
+        return self.armed
+    }
+
+    // The time the alarm was last set for.
+    pub fn alarm_ms(&self) -> u64 {
+        return self.alarm
+    }
+
+    // Make the next operation fail with `error`, as a clock chip on a bus
+    // may, for testing error paths.
+    pub fn fail_next(&mut self, error: hal.Error) {
+        self.failure = some(error)
+    }
+
+    fn begin(&mut self) -> void!hal.Error {
+        if let some(error) = option.take(&mut self.failure) {
+            return err(error)
+        }
+        return ok()
+    }
+
+    fn shown(&self) -> u64 {
+        return self.time - self.time % self.resolution as u64
+    }
+
+    pub fn is_set(&mut self) -> bool!hal.Error {
+        self.begin()?
+        return ok(self.set)
+    }
+
+    pub fn now_ms(&mut self) -> u64!hal.Error {
+        self.begin()?
+        if !self.set {
+            return err(hal.Error.Busy)
+        }
+        return ok(self.shown())
+    }
+
+    pub fn set_ms(&mut self, time_ms: u64) -> void!hal.Error {
+        self.begin()?
+        self.time = time_ms
+        self.set = true
+        return ok()
+    }
+
+    pub fn resolution_ms(&self) -> u32 {
+        return self.resolution
+    }
+
+    pub fn set_alarm_ms(&mut self, time_ms: u64) -> void!hal.Error {
+        self.begin()?
+        if !self.set {
+            return err(hal.Error.Busy)
+        }
+        self.alarm = time_ms
+        self.armed = true
+        return ok()
+    }
+
+    pub fn alarm_fired(&mut self) -> bool!hal.Error {
+        self.begin()?
+        return ok(self.armed && self.set && self.shown() >= self.alarm)
+    }
+
+    pub fn clear_alarm(&mut self) -> void!hal.Error {
+        self.begin()?
+        self.armed = false
+        return ok()
+    }
+}
