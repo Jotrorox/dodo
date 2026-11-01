@@ -49,6 +49,11 @@ SECTIONS
     } > RAM AT > FLASH
     __data_load = LOADADDR(.data);
 
+    /* Where the program image ends in flash, and where the board's flash
+       ends, for std/embedded/chip/rp_flash: storage goes in between. */
+    __flash_image_end = LOADADDR(.data) + SIZEOF(.data);
+    __flash_end = ORIGIN(FLASH) + LENGTH(FLASH);
+
     .bss (NOLOAD) : ALIGN(4)
     {
         __bss_start = .;
