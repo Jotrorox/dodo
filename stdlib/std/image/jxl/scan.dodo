@@ -3,7 +3,9 @@ package jxl
 import "std/image/pixels"
 
 // Walking the frames of a file from their headers and TOCs only, to count
-// them and to size every buffer decode() needs before any pixel work.
+// them and (with `sizing`) to size every buffer decode() needs before any
+// pixel work. Sizes follow each frame's decode window (window.dodo), not
+// its header size.
 
 const MAX_FRAMES: u32 = 1048576
 
@@ -12,6 +14,8 @@ struct Scan {
     displayed: u32
     // Largest per-frame needs.
     max_samples: u64
+    // Temporary tiles of clipped frames (see window.dodo).
+    max_temp: u64
     max_frame_pixels: u64
     max_sample_width: u32
     max_sample_height: u32
@@ -45,14 +49,12 @@ struct Scan {
 }
 
 fn new_scan() -> Scan {
-    return Scan { frames: 0, displayed: 0, max_samples: 0, max_frame_pixels: 0, max_sample_width: 0, max_sample_height: 0, max_frame_width: 0, max_frame_height: 0, max_toc: 1, max_group_dim: 128, max_tree_global: 0, slots: 0, slot_pixels: [0u64; 4], float_path: false, any_vardct: false, needs_canvas: false, progressive: false, max_channels: 1, vd_planes: 0, vd_blocks: 0, vd_tiles: 0, vd_groups: 0, lf_slot: [0u64; 3], any_noise: false, any_splines: false, gray_filtered: 0 }
+    return Scan { frames: 0, displayed: 0, max_samples: 0, max_temp: 0, max_frame_pixels: 0, max_sample_width: 0, max_sample_height: 0, max_frame_width: 0, max_frame_height: 0, max_toc: 1, max_group_dim: 128, max_tree_global: 0, slots: 0, slot_pixels: [0u64; 4], float_path: false, any_vardct: false, needs_canvas: false, progressive: false, max_channels: 1, vd_planes: 0, vd_blocks: 0, vd_tiles: 0, vd_groups: 0, lf_slot: [0u64; 3], any_noise: false, any_splines: false, gray_filtered: 0 }
 }
 
-// Samples of one frame's modular channels (color and extra channels at
-// their coded sizes).
-fn frame_samples(h: &ImageHeader, f: &FrameHeader) -> u64 {
-    w := f.sample_width as u64
-    hh := f.sample_height as u64
+// Samples of one frame's stored modular channels (color and extra
+// channels) under a sample window of w x hh.
+fn frame_samples(h: &ImageHeader, f: &FrameHeader, w: u64, hh: u64) -> u64 {
     total := 0u64
     if f.modular {
         total = f.color_channels as u64 * w * hh
@@ -172,7 +174,7 @@ fn skip_permutation(r: &mut Reader, size: usize, sk: &mut Skim, win: &mut[u8]) -
     return ok()
 }
 
-fn walk_frames(r: &mut Reader, h: &ImageHeader, s: &mut Scan, sk: &mut Skim, win: &mut[u8]) -> void!pixels.Error {
+fn walk_frames(data: &[u8], r: &mut Reader, h: &ImageHeader, s: &mut Scan, sk: &mut Skim, win: &mut[u8], sizing: bool) -> void!pixels.Error {
     r.seek_byte(h.frames_byte)
     if h.have_preview {
         preview := h.clone_header()
@@ -192,10 +194,24 @@ fn walk_frames(r: &mut Reader, h: &ImageHeader, s: &mut Scan, sk: &mut Skim, win
         if f.is_keyframe() {
             s.displayed += 1
         }
+        w := full_window(&f)
+        if sizing {
+            w = frame_window(data, h, &f, sk, win)
+        }
+        sw := w.sw as u64
+        sh := w.sh as u64
+        pw := w.pw as u64
+        ph := w.ph as u64
         if !f.modular {
             s.any_vardct = true
             bw := vardct_blocks(&f, false) as u64
             bh := vardct_blocks(&f, true) as u64
+            if w.sw < f.sample_width {
+                bw = sw / 8
+            }
+            if w.sh < f.sample_height {
+                bh = sh / 8
+            }
             if bw * bh > s.vd_blocks {
                 s.vd_blocks = bw * bh
                 s.vd_planes = 192 * bw * bh
@@ -215,7 +231,7 @@ fn walk_frames(r: &mut Reader, h: &ImageHeader, s: &mut Scan, sk: &mut Skim, win
             s.any_splines = true
         }
         if f.color_channels == 1 && (f.gab || f.epf_iters > 0) {
-            gray := f.sample_width as u64 * f.sample_height as u64
+            gray := sw * sh
             if gray > s.gray_filtered {
                 s.gray_filtered = gray
             }
@@ -226,25 +242,41 @@ fn walk_frames(r: &mut Reader, h: &ImageHeader, s: &mut Scan, sk: &mut Skim, win
                 s.lf_slot[(f.lf_level - 1) as usize] = size
             }
         }
-        samples := frame_samples(h, &f)
+        nch := f.color_channels as u64 + h.num_extra as u64
+        samples := frame_samples(h, &f, sw, sh)
         if samples > s.max_samples {
             s.max_samples = samples
         }
-        pixels_count := f.width as u64 * f.height as u64
-        if pixels_count > s.max_frame_pixels {
-            s.max_frame_pixels = pixels_count
+        if w.clipped {
+            // Temporary tiles of a group straddling the window (one group
+            // of every channel), or the block occupancy of a VarDCT LF
+            // group.
+            temp := f.group_dim as u64 * f.group_dim as u64 * nch + 65536
+            if temp > s.max_temp {
+                s.max_temp = temp
+            }
         }
-        if f.sample_width > s.max_sample_width {
-            s.max_sample_width = f.sample_width
+        pixels_count := pw * ph
+        // The edge-preserving filter also borrows the frame planes for a
+        // copy of the color samples.
+        frame_pixels := pixels_count
+        if f.epf_iters > 0 && sw * sh > frame_pixels {
+            frame_pixels = sw * sh
         }
-        if f.sample_height > s.max_sample_height {
-            s.max_sample_height = f.sample_height
+        if frame_pixels > s.max_frame_pixels {
+            s.max_frame_pixels = frame_pixels
         }
-        if f.width > s.max_frame_width {
-            s.max_frame_width = f.width
+        if w.sw > s.max_sample_width {
+            s.max_sample_width = w.sw
         }
-        if f.height > s.max_frame_height {
-            s.max_frame_height = f.height
+        if w.sh > s.max_sample_height {
+            s.max_sample_height = w.sh
+        }
+        if w.pw > s.max_frame_width {
+            s.max_frame_width = w.pw
+        }
+        if w.ph > s.max_frame_height {
+            s.max_frame_height = w.ph
         }
         if f.toc_entries > s.max_toc {
             s.max_toc = f.toc_entries
@@ -252,19 +284,25 @@ fn walk_frames(r: &mut Reader, h: &ImageHeader, s: &mut Scan, sk: &mut Skim, win
         if f.group_dim > s.max_group_dim {
             s.max_group_dim = f.group_dim
         }
-        nch := f.color_channels as u64 + h.num_extra as u64
+        // The global MA tree: its actual size when LfGlobal was read (for
+        // clipped frames), otherwise the limit for the frame's size.
         tree := 1024 + f.width as u64 * f.height as u64 * nch / 16
         if tree > 4194304 {
             tree = 4194304
+        }
+        if w.clipped && w.tree_nodes < tree {
+            tree = w.tree_nodes
         }
         if tree > s.max_tree_global {
             s.max_tree_global = tree
         }
         if f.can_reference() {
+            // Frames saved before the color transform keep their pixel
+            // window, the others at most the image area.
             slot := f.save_as_reference as usize
             s.slots = s.slots | (1u32 << (slot as u32))
             size := h.width as u64 * h.height as u64
-            if pixels_count > size {
+            if f.save_before_ct {
                 size = pixels_count
             }
             if size > s.slot_pixels[slot] {

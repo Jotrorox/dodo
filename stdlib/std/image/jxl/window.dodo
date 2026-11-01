@@ -1,0 +1,556 @@
+package jxl
+
+import "std/image/pixels"
+
+// Decode windows: the part of each frame that can affect the output.
+//
+// A frame may be larger than the image (a custom size or origin, or a
+// reference-only frame), so sizing buffers by frame headers would let a
+// tiny file demand gigabytes. Each frame is instead decoded over a window
+// anchored at its top-left corner:
+//
+// * Needed region (frame pixels [0, nx) x [0, ny)): for displayed frame
+//   types the part left of and above the image's right and bottom edges;
+//   for reference-only frames saved after the color transform (which only
+//   serve as blending backgrounds, read over the image area) the same
+//   area at origin 0; for frames saved before the color transform (only
+//   patches read those, as in libjxl) also the farthest extent that the
+//   patches of later frames read from their slot until it is overwritten
+//   (patch_reads: every later patch dictionary is read with the skimmer;
+//   reads are clipped to what the reading frame itself needs, or taken
+//   whole when the reader is itself saved before the color transform).
+// * Pixel window (win_pw x win_ph): the needed region plus WIN_MARGIN_PX,
+//   rounded to whole noise groups for frames with noise (the noise
+//   generator fills whole groups), clipped to the frame.
+// * Sample window (win_sw x win_sh): the pixel window in color samples
+//   plus WIN_MARGIN_S for the restoration filters, upsampling and chroma
+//   or extra channel upsampling; for VarDCT rounded up to whole groups
+//   plus one more (varblocks never cross a group, and adaptive LF
+//   smoothing and large varblocks reach a group into the window from its
+//   edge). Groups and LF groups outside it are skipped (no section is
+//   read); modular channels store only their part inside it, tiles that
+//   straddle it decode into temporary storage and are cropped, and so is
+//   VarDCT LF group data.
+//
+// The sample window stays the whole frame when the frame's global modular
+// transforms are not local to a top-left part: a squeeze (whose inverse
+// runs left to right through the whole channel) or a delta palette whose
+// predictor looks above-right. lf_global_info reads LfGlobal up to the
+// transforms to tell; anything it cannot read (a permuted TOC, LZ77
+// distances beyond the skimmer's window) also keeps the whole frame,
+// which is always correct. The same functions run when planning and when
+// decoding, so the buffers planned are the ones used.
+//
+// Bound: the pixel and sample windows of a frame are at most
+// (W - x0 + WIN_MARGIN_PX) x (H - y0 + WIN_MARGIN_PX) pixels plus the
+// rounding, so for frames that start inside the image everything scales
+// with the image size. Not bounded by the image: frames extending left of
+// or above it (decoded from their origin), the extent of patch reads from
+// reference frames, and frames whose transforms keep the whole frame.
+
+const WIN_MARGIN_PX: u64 = 8
+const WIN_MARGIN_S: u64 = 32
+// Most patch positions and spline points the lookahead reads per frame.
+const WIN_SKIM_LIMIT: u64 = 16777216
+
+struct FrameWin {
+    sw: u32
+    sh: u32
+    pw: u32
+    ph: u32
+    patch_w: u32
+    patch_h: u32
+    // The sample window is smaller than the frame.
+    clipped: bool
+    // Nodes of the global MA tree, read when `clipped`.
+    tree_nodes: u64
+}
+
+fn full_window(f: &FrameHeader) -> FrameWin {
+    return FrameWin { sw: f.sample_width, sh: f.sample_height, pw: f.width, ph: f.height, patch_w: f.width, patch_h: f.height, clipped: false, tree_nodes: 0 }
+}
+
+// Columns (or rows) of a frame of `size` at `origin` before the canvas
+// edge at `canvas`.
+fn visible_extent(origin: i32, size: u32, canvas: u32) -> u64 {
+    e := canvas as i64 - origin as i64
+    if e <= 0 {
+        return 0
+    }
+    if e > size as i64 {
+        return size as u64
+    }
+    return e as u64
+}
+
+fn align_up(v: u64, a: u64) -> u64 {
+    return (v + a - 1) / a * a
+}
+
+fn min64(a: u64, b: u64) -> u64 {
+    if a < b {
+        return a
+    }
+    return b
+}
+
+fn max64(a: u64, b: u64) -> u64 {
+    if a > b {
+        return a
+    }
+    return b
+}
+
+// Copy a window into the frame header's win_* fields.
+fn apply_window(f: &mut FrameHeader, w: &FrameWin) {
+    f.win_sw = w.sw
+    f.win_sh = w.sh
+    f.win_pw = w.pw
+    f.win_ph = w.ph
+    f.patch_w = w.patch_w
+    f.patch_h = w.patch_h
+}
+
+// The decode window of frame `f` (whose TOC has been read).
+fn frame_window(data: &[u8], h: &ImageHeader, f: &FrameHeader, sk: &mut Skim, win: &mut[u8]) -> FrameWin {
+    if f.frame_type == FT_LF {
+        return full_window(f)
+    }
+    fw := f.width as u64
+    fh := f.height as u64
+    nx := 0u64
+    ny := 0u64
+    if f.is_normal() {
+        nx = visible_extent(f.x0, f.width, h.width)
+        ny = visible_extent(f.y0, f.height, h.height)
+    } else if f.can_reference() && !f.save_before_ct {
+        nx = min64(fw, h.width as u64)
+        ny = min64(fh, h.height as u64)
+    }
+    patch_w := nx
+    patch_h := ny
+    before := f.can_reference() && f.save_before_ct
+    if before {
+        reads := patch_reads(data, h, f, sk, win)
+        if !reads.known {
+            return full_window(f)
+        }
+        nx = max64(nx, reads.x)
+        ny = max64(ny, reads.y)
+    }
+    nx = min64(max64(nx, 1), fw)
+    ny = min64(max64(ny, 1), fh)
+    pw := min64(fw, nx + WIN_MARGIN_PX)
+    ph := min64(fh, ny + WIN_MARGIN_PX)
+    if (f.flags & FLAG_NOISE) != 0 {
+        pw = min64(fw, align_up(pw, f.group_dim as u64))
+        ph = min64(fh, align_up(ph, f.group_dim as u64))
+    }
+    if before {
+        patch_w = pw
+        patch_h = ph
+    }
+    w := FrameWin { sw: f.sample_width, sh: f.sample_height, pw: pw as u32, ph: ph as u32, patch_w: patch_w as u32, patch_h: patch_h as u32, clipped: false, tree_nodes: 0 }
+    up := f.upsampling as u64
+    sx := (pw + up - 1) / up + WIN_MARGIN_S
+    sy := (ph + up - 1) / up + WIN_MARGIN_S
+    if !f.modular {
+        sx = align_up(sx, 256) + 256
+        sy = align_up(sy, 256) + 256
+    }
+    if sx >= f.sample_width as u64 && sy >= f.sample_height as u64 {
+        return w
+    }
+    info := lf_global_info(data, h, f, sk, win)
+    if !info.known || !info.windowable {
+        return w
+    }
+    w.sw = min64(sx, f.sample_width as u64) as u32
+    w.sh = min64(sy, f.sample_height as u64) as u32
+    w.clipped = true
+    w.tree_nodes = info.tree_nodes
+    return w
+}
+
+// What LfGlobal tells about windowing.
+struct LfInfo {
+    known: bool
+    windowable: bool
+    tree_nodes: u64
+}
+
+// Read LfGlobal up to the global modular transforms (patches, splines and
+// the global tree skipped with the skimmer).
+fn lf_global_info(data: &[u8], h: &ImageHeader, f: &FrameHeader, sk: &mut Skim, win: &mut[u8]) -> LfInfo {
+    unknown := LfInfo { known: false, windowable: false, tree_nodes: 0 }
+    if f.toc_permuted && f.toc_entries > 1 {
+        return unknown
+    }
+    r := Reader.new(data, is_container(data))
+    r.seek_byte(f.data_start)
+    if (f.flags & FLAG_PATCHES) != 0 {
+        acc := PatchNeed { x: 0, y: 0, known: true }
+        if !skim_patches(&mut r, h, f, sk, win, 4, 0, 0, &mut acc) {
+            return unknown
+        }
+    }
+    if (f.flags & FLAG_SPLINES) != 0 && !skim_splines(&mut r, f, sk, win) {
+        return unknown
+    }
+    if (f.flags & FLAG_NOISE) != 0 {
+        r.skip(80)
+    }
+    if !r.bit() {
+        r.skip(48)
+    }
+    if !f.modular {
+        r.u32c(dist(1, 11), dist(2049, 11), dist(4097, 12), dist(8193, 16))
+        r.u32c(dist(16, 0), dist(1, 5), dist(1, 8), dist(1, 16))
+        if !r.bit() {
+            size := 39u64
+            for c in 0usize..3 {
+                n := r.bits(4)
+                for j in 0u32..n {
+                    r.u32c(dist(0, 4), dist(16, 8), dist(272, 16), dist(65808, 32))
+                }
+                size *= n as u64 + 1
+            }
+            nq := r.bits(4)
+            for j in 0u32..nq {
+                r.u32c(dist(0, 2), dist(4, 3), dist(12, 5), dist(44, 8))
+            }
+            size *= nq as u64 + 1
+            if size > BCTX_SIZE as u64 {
+                return unknown
+            }
+            empty := [0u8; 1]
+            match sk_cluster_map(&mut r, size as u32, &mut empty, false, sk) {
+                ok(_) => {}
+                err(_) => {
+                    return unknown
+                }
+            }
+        }
+        if !r.bit() {
+            r.u32c(dist(84, 0), dist(256, 0), dist(2, 8), dist(258, 16))
+            r.skip(48)
+        }
+    }
+    nodes := 0u64
+    if r.bit() {
+        nch := f.color_channels as u64 + h.num_extra as u64
+        limit := 1024 + f.width as u64 * f.height as u64 * nch / 16
+        if limit > 4194304 {
+            limit = 4194304
+        }
+        t := skim_tree(&mut r, limit, sk, win)
+        if !t.known {
+            return unknown
+        }
+        nodes = t.nodes
+        match sk_skip_code(&mut r, t.leaves, sk) {
+            ok(_) => {}
+            err(_) => {
+                return unknown
+            }
+        }
+    }
+    windowable := true
+    if f.modular || h.num_extra > 0 {
+        // The global stream header: use_global_tree, WP header, transforms.
+        r.bit()
+        if !r.bit() {
+            r.skip(51)
+        }
+        count := r.u32c(dist(0, 0), dist(1, 0), dist(2, 4), dist(18, 8))
+        if count > 512 {
+            return unknown
+        }
+        for t in 0u32..count {
+            kind := r.bits(2)
+            if kind == 0 {
+                r.u32c(dist(0, 3), dist(8, 6), dist(72, 10), dist(1096, 13))
+                r.u32c(dist(6, 0), dist(0, 2), dist(2, 4), dist(10, 6))
+            } else if kind == 1 {
+                r.u32c(dist(0, 3), dist(8, 6), dist(72, 10), dist(1096, 13))
+                r.u32c(dist(1, 0), dist(3, 0), dist(4, 0), dist(1, 13))
+                r.u32c(dist(0, 8), dist(256, 10), dist(1280, 12), dist(5376, 16))
+                nb_deltas := r.u32c(dist(0, 0), dist(1, 8), dist(257, 10), dist(1281, 16))
+                d_pred := r.bits(4)
+                if nb_deltas > 0 && !palette_windowable(d_pred as i32) {
+                    windowable = false
+                }
+            } else if kind == 2 {
+                windowable = false
+                break
+            } else {
+                return unknown
+            }
+        }
+    }
+    if r.overrun || r.broken {
+        return unknown
+    }
+    return LfInfo { known: true, windowable: windowable, tree_nodes: nodes }
+}
+
+struct TreeCount {
+    known: bool
+    nodes: u64
+    leaves: u32
+}
+
+// Count the nodes and leaves of the MA tree at the reader (as read_tree).
+fn skim_tree(r: &mut Reader, limit: u64, sk: &mut Skim, win: &mut[u8]) -> TreeCount {
+    unknown := TreeCount { known: false, nodes: 0, leaves: 0 }
+    code := new_sk_code()
+    match sk_read_code(r, 6, &mut code, sk) {
+        ok() => {}
+        err(_) => {
+            return unknown
+        }
+    }
+    st := new_sk_stream(SK_FULL, SK_WINDOW)
+    sk_begin(&mut st, &code, r)
+    count := 0u64
+    pending := 1u64
+    leaves := 0u32
+    for pending > 0 {
+        if count >= limit {
+            return unknown
+        }
+        pending -= 1
+        property := sk_read(&mut code, sk, &mut st, win, r, 1, 0)
+        if property > 0 {
+            sk_read(&mut code, sk, &mut st, win, r, 0, 0)
+            pending += 2
+        } else {
+            for ctx in 2u32..6 {
+                sk_read(&mut code, sk, &mut st, win, r, ctx, 0)
+            }
+            leaves += 1
+        }
+        count += 1
+        if (count & 255) == 0 && sk_failed(&st, r) {
+            return unknown
+        }
+    }
+    match sk_finish(&st, &code, r) {
+        ok() => {}
+        err(_) => {
+            return unknown
+        }
+    }
+    return TreeCount { known: true, nodes: count, leaves: leaves }
+}
+
+// Skip the splines at the reader (as splines() without drawing).
+fn skim_splines(r: &mut Reader, f: &FrameHeader, sk: &mut Skim, win: &mut[u8]) -> bool {
+    code := new_sk_code()
+    match sk_read_code(r, 6, &mut code, sk) {
+        ok() => {}
+        err(_) => {
+            return false
+        }
+    }
+    st := new_sk_stream(SK_FULL, SK_WINDOW)
+    sk_begin(&mut st, &code, r)
+    count := sk_read(&mut code, sk, &mut st, win, r, 2, 0) as u64 + 1
+    if count > WIN_SKIM_LIMIT {
+        return false
+    }
+    for i in 0u64..count {
+        sk_read(&mut code, sk, &mut st, win, r, 1, 0)
+        sk_read(&mut code, sk, &mut st, win, r, 1, 0)
+        if sk_failed(&st, r) {
+            return false
+        }
+    }
+    sk_read(&mut code, sk, &mut st, win, r, 0, 0)
+    total := 0u64
+    for s in 0u64..count {
+        ncp := sk_read(&mut code, sk, &mut st, win, r, 3, 0) as u64
+        total += ncp + 128
+        if total > WIN_SKIM_LIMIT {
+            return false
+        }
+        for k in 0u64..ncp {
+            sk_read(&mut code, sk, &mut st, win, r, 4, 0)
+            sk_read(&mut code, sk, &mut st, win, r, 4, 0)
+        }
+        for i in 0usize..128 {
+            sk_read(&mut code, sk, &mut st, win, r, 5, 0)
+        }
+        if sk_failed(&st, r) {
+            return false
+        }
+    }
+    match sk_finish(&st, &code, r) {
+        ok() => {
+            return true
+        }
+        err(_) => {
+            return false
+        }
+    }
+}
+
+// The farthest extent read from a reference slot.
+struct PatchNeed {
+    x: u64
+    y: u64
+    known: bool
+}
+
+// Read the patch dictionary at the reader (as patches()). For patches
+// from `slot` that land in [0, cx) x [0, cy) of the frame, extend `acc` to
+// the farthest slot column and row they read. False when the dictionary
+// cannot be read.
+fn skim_patches(r: &mut Reader, h: &ImageHeader, f: &FrameHeader, sk: &mut Skim, win: &mut[u8], slot: u32, cx: u64, cy: u64, acc: &mut PatchNeed) -> bool {
+    code := new_sk_code()
+    match sk_read_code(r, 10, &mut code, sk) {
+        ok() => {}
+        err(_) => {
+            return false
+        }
+    }
+    st := new_sk_stream(SK_FULL, SK_WINDOW)
+    sk_begin(&mut st, &code, r)
+    nec := h.num_extra as u64
+    fw := f.width as u64
+    fh := f.height as u64
+    max_refs := 1024 + fw * fh / 4
+    max_patches := max_refs * 4
+    num_refs := sk_read(&mut code, sk, &mut st, win, r, 0, 0) as u64
+    if num_refs > max_refs || num_refs > WIN_SKIM_LIMIT {
+        return false
+    }
+    total := 0u64
+    for i in 0u64..num_refs {
+        ref_slot := sk_read(&mut code, sk, &mut st, win, r, 1, 0)
+        rx := sk_read(&mut code, sk, &mut st, win, r, 3, 0) as u64
+        ry := sk_read(&mut code, sk, &mut st, win, r, 3, 0) as u64
+        pw := sk_read(&mut code, sk, &mut st, win, r, 2, 0) as u64 + 1
+        ph := sk_read(&mut code, sk, &mut st, win, r, 2, 0) as u64 + 1
+        count := sk_read(&mut code, sk, &mut st, win, r, 7, 0) as u64
+        if ref_slot >= 4 || count > max_patches {
+            return false
+        }
+        count += 1
+        total += count
+        if total > max_patches || total > WIN_SKIM_LIMIT {
+            return false
+        }
+        px := 0i64
+        py := 0i64
+        for k in 0u64..count {
+            if k == 0 {
+                px = sk_read(&mut code, sk, &mut st, win, r, 4, 0) as i64
+                py = sk_read(&mut code, sk, &mut st, win, r, 4, 0) as i64
+            } else {
+                px += unpack_signed(sk_read(&mut code, sk, &mut st, win, r, 6, 0)) as i64
+                py += unpack_signed(sk_read(&mut code, sk, &mut st, win, r, 6, 0)) as i64
+                if px < 0 || py < 0 {
+                    return false
+                }
+            }
+            if px as u64 + pw > fw || py as u64 + ph > fh {
+                return false
+            }
+            for j in 0u64..nec + 1 {
+                mode := sk_read(&mut code, sk, &mut st, win, r, 5, 0)
+                if mode >= 8 {
+                    return false
+                }
+                if uses_alpha(mode) && nec > 1 {
+                    sk_read(&mut code, sk, &mut st, win, r, 8, 0)
+                }
+                if uses_alpha(mode) || mode == PATCH_MUL {
+                    sk_read(&mut code, sk, &mut st, win, r, 9, 0)
+                }
+            }
+            if ref_slot == slot && (px as u64) < cx && (py as u64) < cy {
+                acc.x = max64(acc.x, rx + min64(px as u64 + pw, cx) - px as u64)
+                acc.y = max64(acc.y, ry + min64(py as u64 + ph, cy) - py as u64)
+            }
+            if sk_failed(&st, r) {
+                return false
+            }
+        }
+    }
+    match sk_finish(&st, &code, r) {
+        ok() => {
+            return true
+        }
+        err(_) => {
+            return false
+        }
+    }
+}
+
+// The part of frame `g` that its patches are applied to (see frame_window).
+fn patch_region(h: &ImageHeader, g: &FrameHeader, cx: &mut u64, cy: &mut u64) {
+    if g.frame_type == FT_LF {
+        *cx = g.sample_width as u64
+        *cy = g.sample_height as u64
+    } else if g.can_reference() && g.save_before_ct {
+        *cx = g.width as u64
+        *cy = g.height as u64
+    } else if g.is_normal() {
+        *cx = visible_extent(g.x0, g.width, h.width)
+        *cy = visible_extent(g.y0, g.height, h.height)
+    } else {
+        *cx = min64(g.width as u64, h.width as u64)
+        *cy = min64(g.height as u64, h.height as u64)
+    }
+}
+
+// The extent later patches read from the slot frame `f` saves to, up to
+// the frame that overwrites it.
+fn patch_reads(data: &[u8], h: &ImageHeader, f: &FrameHeader, sk: &mut Skim, win: &mut[u8]) -> PatchNeed {
+    match patch_reads_walk(data, h, f, sk, win) {
+        ok(need) => {
+            return need
+        }
+        err(_) => {
+            return PatchNeed { x: 0, y: 0, known: false }
+        }
+    }
+}
+
+fn patch_reads_walk(data: &[u8], h: &ImageHeader, f: &FrameHeader, sk: &mut Skim, win: &mut[u8]) -> PatchNeed!pixels.Error {
+    acc := PatchNeed { x: 0, y: 0, known: true }
+    slot := f.save_as_reference
+    r := Reader.new(data, is_container(data))
+    r.seek_byte64(f.end())
+    count := 0u32
+    for {
+        if count >= MAX_FRAMES {
+            return err(pixels.Error.TooLarge)
+        }
+        g := read_frame_header(&mut r, h)?
+        scan_toc(&mut r, &mut g, sk, win)?
+        if (g.flags & FLAG_PATCHES) != 0 {
+            if g.toc_permuted && g.toc_entries > 1 {
+                return err(pixels.Error.Unsupported)
+            }
+            cx := 0u64
+            cy := 0u64
+            patch_region(h, &g, &mut cx, &mut cy)
+            r2 := Reader.new(data, is_container(data))
+            r2.seek_byte(g.data_start)
+            if !skim_patches(&mut r2, h, &g, sk, win, slot, cx, cy, &mut acc) {
+                return err(pixels.Error.Malformed)
+            }
+        }
+        if (g.can_reference() && g.save_as_reference == slot) || g.is_last {
+            break
+        }
+        if g.end() > 0xffffffffffff {
+            return err(pixels.Error.TooLarge)
+        }
+        r.seek_byte64(g.end())
+        count += 1
+    }
+    return ok(acc)
+}

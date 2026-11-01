@@ -35,9 +35,16 @@ struct FloatBufs {
     fh: usize
     slot_off: [4]usize
     slot_cap: [4]usize
+    // Stored size of each slot (the saved frame's window), the frame size
+    // patches are checked against, and whether it holds a frame saved
+    // before the color transform (only those feed patches, only the
+    // others backgrounds, as in libjxl).
     slot_w: [4]usize
     slot_h: [4]usize
+    slot_fw: [4]usize
+    slot_fh: [4]usize
     slot_valid: [4]bool
+    slot_before: [4]bool
     // False for a single frame covering the image: it is emitted from the
     // frame planes directly.
     use_canvas: bool
@@ -669,6 +676,16 @@ fn patches(r: &mut Reader, h: &ImageHeader, f: &FrameHeader, tcode: &mut Code, n
     fw := f.width as u64
     fh := f.height as u64
     max_refs := 1024 + fw * fh / 4
+    // Patches land only in the part of the frame that matters (see
+    // window.dodo); the slots hold what that part reads.
+    apply_w := f.patch_w as usize
+    if apply_w > fb.fw {
+        apply_w = fb.fw
+    }
+    apply_h := f.patch_h as usize
+    if apply_h > fb.fh {
+        apply_h = fb.fh
+    }
     max_patches := max_refs * 4
     num_refs := tcode.read(&mut stream, r, 0, 0) as u64
     if num_refs > max_refs {
@@ -692,7 +709,7 @@ fn patches(r: &mut Reader, h: &ImageHeader, f: &FrameHeader, tcode: &mut Code, n
         pw := tcode.read(&mut stream, r, 2, 0) as usize + 1
         ph := tcode.read(&mut stream, r, 2, 0) as usize + 1
         if apply {
-            if !fb.slot_valid[slot] || rx + pw > fb.slot_w[slot] || ry + ph > fb.slot_h[slot] {
+            if !fb.slot_valid[slot] || !fb.slot_before[slot] || rx + pw > fb.slot_fw[slot] || ry + ph > fb.slot_fh[slot] {
                 return err(pixels.Error.Malformed)
             }
         }
@@ -751,9 +768,15 @@ fn patches(r: &mut Reader, h: &ImageHeader, f: &FrameHeader, tcode: &mut Code, n
             slot_plane := sw * fb.slot_h[slot]
             base := fb.slot_off[slot]
             for dy in 0usize..ph {
+                ty := py as usize + dy
+                if ty >= apply_h || ry + dy >= fb.slot_h[slot] {
+                    break
+                }
                 for dx in 0usize..pw {
                     tx := px as usize + dx
-                    ty := py as usize + dy
+                    if tx >= apply_w || rx + dx >= sw {
+                        break
+                    }
                     for c in 0usize..planes {
                         bg[c] = fb.frame[c * frame_plane + ty * fb.fw + tx]
                         fg[c] = fb.slots[base + c * slot_plane + (ry + dy) * sw + rx + dx]
@@ -776,32 +799,39 @@ fn skip_patches(r: &mut Reader, h: &ImageHeader, f: &FrameHeader, tcode: &mut Co
     e3 := [0.0f32; 1]
     e4 := [0.0f32; 1]
     e5 := [0.0f32; 1]
-    fb := FloatBufs { frame: &mut e1, canvas: &mut e2, slots: &mut e3, ftemp: &mut e4, noise: &mut e5, planes: 0, fw: 0, fh: 0, slot_off: [0usize; 4], slot_cap: [0usize; 4], slot_w: [0usize; 4], slot_h: [0usize; 4], slot_valid: [false; 4], use_canvas: false }
+    fb := FloatBufs { frame: &mut e1, canvas: &mut e2, slots: &mut e3, ftemp: &mut e4, noise: &mut e5, planes: 0, fw: 0, fh: 0, slot_off: [0usize; 4], slot_cap: [0usize; 4], slot_w: [0usize; 4], slot_h: [0usize; 4], slot_fw: [0usize; 4], slot_fh: [0usize; 4], slot_valid: [false; 4], slot_before: [false; 4], use_canvas: false }
     return patches(r, h, f, tcode, n1, n2, window, false, &mut fb)
 }
 
-// Copy planes into reference slot k: from the frame (pre color transform)
-// or from the canvas.
-fn save_slot(fb: &mut FloatBufs, k: usize, from_frame: bool, width: usize, height: usize) -> void!pixels.Error {
+// Copy planes into reference slot k: the top-left width x height of the
+// frame planes, or the canvas (image size). `before` marks a frame saved
+// before the color transform, whose full size is fw x fh.
+fn save_slot(fb: &mut FloatBufs, k: usize, from_frame: bool, width: usize, height: usize, before: bool, fw: usize, fh: usize) -> void!pixels.Error {
     pixels_count := width * height
-    if pixels_count > fb.slot_cap[k] {
+    if pixels_count > fb.slot_cap[k] || (from_frame && (width > fb.fw || height > fb.fh)) {
         return err(pixels.Error.TooLarge)
     }
     base := fb.slot_off[k]
+    frame_plane := fb.fw * fb.fh
     for c in 0usize..fb.planes {
-        for i in 0usize..pixels_count {
-            v := 0.0f32
-            if from_frame {
-                v = fb.frame[c * pixels_count + i]
-            } else {
-                v = fb.canvas[c * pixels_count + i]
+        for y in 0usize..height {
+            for x in 0usize..width {
+                v := 0.0f32
+                if from_frame {
+                    v = fb.frame[c * frame_plane + y * fb.fw + x]
+                } else {
+                    v = fb.canvas[c * pixels_count + y * width + x]
+                }
+                fb.slots[base + c * pixels_count + y * width + x] = v
             }
-            fb.slots[base + c * pixels_count + i] = v
         }
     }
     fb.slot_w[k] = width
     fb.slot_h[k] = height
+    fb.slot_fw[k] = fw
+    fb.slot_fh[k] = fh
     fb.slot_valid[k] = true
+    fb.slot_before[k] = before
     return ok()
 }
 
@@ -886,8 +916,9 @@ fn compose(h: &ImageHeader, f: &FrameHeader, fb: &mut FloatBufs) {
 // Render one decoded frame through the float pipeline. VarDCT frames
 // bring their color samples in `planes` (3 planes of vb.rw x vb.rh).
 fn render_frame(r: &mut Reader, h: &ImageHeader, f: &FrameHeader, work: &mut ModularWork, gch: &ChanList, vals: &FrameVals, fb: &mut FloatBufs, vb: &mut VBufs, planes: &mut[f32], sbuf: &mut[i32], cpf: &mut[f32], tcode: &mut Code, n1: &mut Code, n2: &mut Code, window: &mut[u32], ct: &ColorTransform) -> void!pixels.Error {
-    fw := f.width as usize
-    fh := f.height as usize
+    // The frame's pixel window (see window.dodo).
+    fw := f.win_pw as usize
+    fh := f.win_ph as usize
     if f.frame_type == FT_LF {
         // LF frames hold the 1:8 image.
         if f.upsampling != 1 {
@@ -908,7 +939,7 @@ fn render_frame(r: &mut Reader, h: &ImageHeader, f: &FrameHeader, work: &mut Mod
         cd := [0i32; 3 * CH_STRIDE]
         cch := ChanList { d: &mut cd, count: 3, nb_meta: 0 }
         for c in 0usize..3 {
-            cch.set(c, c * vb.rw * vb.rh, vb.rw, f.sample_width as usize, f.sample_height as usize, 0, 0)
+            cch.set(c, c * vb.rw * vb.rh, vb.rw, f.win_sw as usize, f.win_sh as usize, 0, 0)
         }
         if vb.subsampled {
             upsample_chroma(f, vb, planes)
@@ -1014,7 +1045,7 @@ fn render_frame(r: &mut Reader, h: &ImageHeader, f: &FrameHeader, work: &mut Mod
         store_lf_slot(vb, (f.lf_level - 1) as usize, fb.frame, fw, fh)?
     }
     if f.can_reference() && f.save_before_ct {
-        save_slot(fb, f.save_as_reference as usize, true, fw, fh)?
+        save_slot(fb, f.save_as_reference as usize, true, fw, fh, true, f.width as usize, f.height as usize)?
     }
     // Color transform.
     plane := fw * fh
@@ -1040,16 +1071,37 @@ fn render_frame(r: &mut Reader, h: &ImageHeader, f: &FrameHeader, work: &mut Mod
     }
     if !f.is_normal() {
         if f.can_reference() && !f.save_before_ct {
-            save_slot(fb, f.save_as_reference as usize, true, fw, fh)?
+            // Only backgrounds read it, over the image area.
+            sw := fw
+            if sw > h.width as usize {
+                sw = h.width as usize
+            }
+            sh := fh
+            if sh > h.height as usize {
+                sh = h.height as usize
+            }
+            save_slot(fb, f.save_as_reference as usize, true, sw, sh, false, sw, sh)?
         }
         return ok()
     }
     if !fb.use_canvas {
         return ok()
     }
+    if f.needs_blending(h.num_extra) {
+        // libjxl refuses backgrounds saved before the color transform.
+        if fb.slot_valid[f.blend_source as usize] && fb.slot_before[f.blend_source as usize] {
+            return err(pixels.Error.Malformed)
+        }
+        for e in 0usize..h.num_extra as usize {
+            s := f.ec_blend_source[e] as usize
+            if fb.slot_valid[s] && fb.slot_before[s] {
+                return err(pixels.Error.Malformed)
+            }
+        }
+    }
     compose(h, f, fb)
     if f.can_reference() && !f.save_before_ct {
-        save_slot(fb, f.save_as_reference as usize, false, h.width as usize, h.height as usize)?
+        save_slot(fb, f.save_as_reference as usize, false, h.width as usize, h.height as usize, false, h.width as usize, h.height as usize)?
     }
     return ok()
 }

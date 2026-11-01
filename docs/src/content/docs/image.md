@@ -110,7 +110,8 @@ a display, or feed an encoder.
 
 `image.scratch_size(&data, &layout)` is the scratch a decode needs, computed
 from the header before any pixel work: PNG needs two rows of raw image data,
-the other formats none. The zlib decoder adds about 40 KiB of stack.
+the other formats none. The zlib decoder adds about 40 KiB of stack, the
+JPEG XL header walks (also `info` and `scratch_size`) about 20 KiB.
 
 Every length and index in a file is checked, so untrusted files never trap.
 Errors are `Truncated`, `Malformed`, `Unsupported`, `TooLarge` (a dimension
@@ -366,8 +367,14 @@ larger than 8x8, and more than 64 extra channels; extra channels other than
 the first alpha are decoded but not output. Lossy JPEG XL matches libjxl's
 `djxl` within one 8-bit level. The JPEG XL encoder is lossless only and
 uses prefix codes (no ANS); it does not embed ICC profiles. JPEG XL scratch
-is sized from frame headers, which can describe frames larger than the
-image, so check `scratch_size` against your budget before allocating. PNG text chunks other
+follows the image header, not the frame sizes a file claims: each frame is
+decoded over the part that can reach the output, so with W' = width + 1100,
+H' = height + 1100 and C = 3 + extra channels, `scratch_size` stays within
+64 W' H' C + 5 MiB C + 128 MiB. Not covered by that bound: frames that
+start left of or above the image (decoded from their origin), reference
+frames as far as later patches read them, and frames whose global squeeze
+or above-right delta palette needs the whole frame; check `scratch_size`
+against your budget for untrusted files. PNG text chunks other
 than XMP are skipped, as are `sBIT`, `pHYs` and timestamps. The PNG encoder
 writes palettes only for 8-bit sources, and float samples outside 0.0 to 1.0
 survive only in PFM.

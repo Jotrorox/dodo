@@ -52,9 +52,13 @@ struct VBufs {
     hs: [3]usize
     vs: [3]usize
     subsampled: bool
-    // Geometry: blocks, rounded sample size, 64x64 tiles.
+    // Geometry of the decoded window (the frame's sample window, see
+    // window.dodo): blocks, rounded sample size, 64x64 tiles; and the
+    // frame's whole block grid (rbw x rbh), which the LF groups follow.
     bw: usize
     bh: usize
+    rbw: usize
+    rbh: usize
     rw: usize
     rh: usize
     tw: usize
@@ -166,13 +170,26 @@ fn vardct_lf_group(r: &mut Reader, h: &ImageHeader, f: &FrameHeader, work: &mut 
     gy := g / f.lf_groups_x as usize
     bx0 := gx * gd
     by0 := gy * gd
-    lbw := vb.bw - bx0
+    if bx0 >= vb.bw || by0 >= vb.bh || bx0 >= vb.rbw || by0 >= vb.rbh {
+        return err(pixels.Error.Malformed)
+    }
+    // The LF group's blocks, and the part of them inside the window
+    // (whole groups, so no varblock straddles its edge).
+    lbw := vb.rbw - bx0
     if lbw > gd {
         lbw = gd
     }
-    lbh := vb.bh - by0
+    lbh := vb.rbh - by0
     if lbh > gd {
         lbh = gd
+    }
+    wbw := vb.bw - bx0
+    if wbw > lbw {
+        wbw = lbw
+    }
+    wbh := vb.bh - by0
+    if wbh > lbh {
+        wbh = lbh
     }
     // Pixel size of the LF group.
     px := f.sample_width as usize - bx0 * 8
@@ -214,17 +231,25 @@ fn vardct_lf_group(r: &mut Reader, h: &ImageHeader, f: &FrameHeader, work: &mut 
             mult := narrow64(m_lf[c] as f64 * scale)
             hs := vb.hs[c]
             vs := vb.vs[c]
-            for y in 0usize..lch.height(src) {
+            cols := lch.width(src)
+            if (bx0 >> hs) + cols > ceil_shift(vb.bw as u64, hs as u32) as usize {
+                cols = ceil_shift(vb.bw as u64, hs as u32) as usize - (bx0 >> hs)
+            }
+            rows := lch.height(src)
+            if (by0 >> vs) + rows > ceil_shift(vb.bh as u64, vs as u32) as usize {
+                rows = ceil_shift(vb.bh as u64, vs as u32) as usize - (by0 >> vs)
+            }
+            for y in 0usize..rows {
                 row := lch.offset(src) + y * lch.stride(src)
                 at := c * plane + ((by0 >> vs) + y) * vb.bw + (bx0 >> hs)
-                for x in 0usize..lch.width(src) {
+                for x in 0usize..cols {
                     vb.lf[at + x] = work.arena[row + x] as f32 * mult
                 }
             }
         }
         // LF threshold index per block, from X, B then Y.
-        for y in 0usize..lbh {
-            for x in 0usize..lbw {
+        for y in 0usize..wbh {
+            for x in 0usize..wbw {
                 idx := 0u32
                 for k in 0usize..3 {
                     c := 0usize
@@ -251,8 +276,8 @@ fn vardct_lf_group(r: &mut Reader, h: &ImageHeader, f: &FrameHeader, work: &mut 
         }
         work.arena_used = mark
     } else {
-        for y in 0usize..lbh {
-            for x in 0usize..lbw {
+        for y in 0usize..wbh {
+            for x in 0usize..wbw {
                 vb.binfo[(by0 + y) * vb.bw + bx0 + x] = 0
             }
         }
@@ -260,12 +285,7 @@ fn vardct_lf_group(r: &mut Reader, h: &ImageHeader, f: &FrameHeader, work: &mut 
     // Extra channels with shifts of 3 or more.
     pm := [0i32; MAX_PASSES]
     pmx := [0i32; MAX_PASSES]
-    group_channels(f, gch, gend, lch, ltr, lstash, true, 0, gx, gy, &pm, &pmx)?
-    if lch.count > 0 {
-        decode_stream(r, work, gcode, lcode, tcode, n1, n2, window, lch, ltr, lstash, wp, false, gd, (1 + num_lf + g) as u32)?
-        inverse_transforms(work, lch, ltr, lstash, wp, h.bits)?
-        work.arena_used = mark
-    }
+    decode_group(r, h, f, work, gcode, lcode, tcode, n1, n2, window, gch, gend, lch, ltr, lstash, wp, true, 0, gx, gy, &pm, &pmx, (1 + num_lf + g) as u32)?
     // HF metadata.
     nb_blocks := r.bits(ceil_log2((lbw * lbh) as u32)) as usize + 1
     tiles_x := (px + 63) / 64
@@ -286,7 +306,13 @@ fn vardct_lf_group(r: &mut Reader, h: &ImageHeader, f: &FrameHeader, work: &mut 
     ty0 := by0 / 8
     tiles := vb.tw * vb.th
     for y in 0usize..tiles_y {
+        if ty0 + y >= vb.th {
+            break
+        }
         for x in 0usize..tiles_x {
+            if tx0 + x >= vb.tw {
+                break
+            }
             t := (ty0 + y) * vb.tw + tx0 + x
             vb.cfl[t] = work.arena[lch.offset(0) + y * lch.stride(0) + x]
             vb.cfl[tiles + t] = work.arena[lch.offset(1) + y * lch.stride(1) + x]
@@ -299,11 +325,21 @@ fn vardct_lf_group(r: &mut Reader, h: &ImageHeader, f: &FrameHeader, work: &mut 
     info_stride := lch.stride(2)
     sharp_off := lch.offset(3)
     sharp_stride := lch.stride(3)
+    // Block occupancy of the whole LF group (blocks outside the window are
+    // parsed but not kept).
+    occ := work.alloc(lbw as u64 * lbh as u64)?
+    for i in 0usize..lbw * lbh {
+        work.arena[occ + i] = 0
+    }
     for y in 0usize..lbh {
         for x in 0usize..lbw {
-            b := (by0 + y) * vb.bw + bx0 + x
-            if (vb.binfo[b] & BI_OCCUPIED) != 0 {
+            if work.arena[occ + y * lbw + x] != 0 {
                 continue
+            }
+            inside := x < wbw && y < wbh
+            b := 0usize
+            if inside {
+                b = (by0 + y) * vb.bw + bx0 + x
             }
             if data >= nb_blocks {
                 return err(pixels.Error.Malformed)
@@ -329,14 +365,19 @@ fn vardct_lf_group(r: &mut Reader, h: &ImageHeader, f: &FrameHeader, work: &mut 
             }
             for dy in 0usize..h8 {
                 for dx in 0usize..w8 {
-                    bb := (by0 + y + dy) * vb.bw + bx0 + x + dx
-                    if (vb.binfo[bb] & BI_OCCUPIED) != 0 {
+                    o := occ + (y + dy) * lbw + x + dx
+                    if work.arena[o] != 0 {
                         return err(pixels.Error.Malformed)
                     }
+                    work.arena[o] = 1
                     sharp := work.arena[sharp_off + (y + dy) * sharp_stride + x + dx]
                     if sharp < 0 || sharp > 7 {
                         return err(pixels.Error.Malformed)
                     }
+                    if !inside {
+                        continue
+                    }
+                    bb := (by0 + y + dy) * vb.bw + bx0 + x + dx
                     vb.binfo[bb] = (vb.binfo[bb] & 0xfff) | BI_OCCUPIED | ((sharp as u32) << 12)
                     if f.epf_iters > 0 {
                         s := sigma_quant * f.epf_sharp[sharp as usize]
@@ -347,9 +388,11 @@ fn vardct_lf_group(r: &mut Reader, h: &ImageHeader, f: &FrameHeader, work: &mut 
                     }
                 }
             }
-            vb.binfo[b] = vb.binfo[b] | BI_FIRST | (ds << BI_DS_SHIFT)
-            vb.bmul[b] = hf_mul as i32
-            vb.used_params = vb.used_params | (1u32 << DS_PARAM[ds as usize])
+            if inside {
+                vb.binfo[b] = vb.binfo[b] | BI_FIRST | (ds << BI_DS_SHIFT)
+                vb.bmul[b] = hf_mul as i32
+                vb.used_params = vb.used_params | (1u32 << DS_PARAM[ds as usize])
+            }
         }
     }
     work.arena_used = mark
@@ -907,8 +950,8 @@ fn upsample_chroma(f: &FrameHeader, vb: &VBufs, planes: &mut[f32]) {
     for c in 0usize..3 {
         base := c * plane
         if vb.hs[c] == 1 {
-            n := (f.sample_width as usize + 1) / 2
-            rows := (f.sample_height as usize + (1usize << vb.vs[c]) - 1) >> vb.vs[c]
+            n := (f.win_sw as usize + 1) / 2
+            rows := (f.win_sh as usize + (1usize << vb.vs[c]) - 1) >> vb.vs[c]
             for y in 0usize..rows {
                 row := base + y * rw
                 x := n
@@ -923,8 +966,8 @@ fn upsample_chroma(f: &FrameHeader, vb: &VBufs, planes: &mut[f32]) {
             }
         }
         if vb.vs[c] == 1 {
-            n := (f.sample_height as usize + 1) / 2
-            w := f.sample_width as usize
+            n := (f.win_sh as usize + 1) / 2
+            w := f.win_sw as usize
             y := n
             for y > 0 {
                 y -= 1
@@ -954,8 +997,20 @@ fn decode_vardct_frame(r: &mut Reader, h: &ImageHeader, f: &FrameHeader, work: &
         vb.hs[c] = chroma_shift(f, c, false) as usize
         vb.vs[c] = chroma_shift(f, c, true) as usize
     }
-    vb.bw = vardct_blocks(f, false)
-    vb.bh = vardct_blocks(f, true)
+    vb.rbw = vardct_blocks(f, false)
+    vb.rbh = vardct_blocks(f, true)
+    vb.bw = vb.rbw
+    vb.bh = vb.rbh
+    // A clipped sample window is a whole number of groups.
+    if f.win_sw < f.sample_width {
+        vb.bw = f.win_sw as usize / 8
+    }
+    if f.win_sh < f.sample_height {
+        vb.bh = f.win_sh as usize / 8
+    }
+    if vb.bw == 0 || vb.bh == 0 || vb.bw > vb.rbw || vb.bh > vb.rbh {
+        return err(pixels.Error.Malformed)
+    }
     vb.rw = vb.bw * 8
     vb.rh = vb.bh * 8
     vb.tw = (vb.bw + 7) / 8
@@ -1007,18 +1062,27 @@ fn decode_vardct_frame(r: &mut Reader, h: &ImageHeader, f: &FrameHeader, work: &
     use_lf := (f.flags & FLAG_USE_LF_FRAME) != 0
     if use_lf {
         level := f.lf_level as usize
-        if level >= 3 || !vb.lfslot_valid[level] || vb.lfslot_w[level] != vb.bw || vb.lfslot_h[level] != vb.bh {
+        if level >= 3 || !vb.lfslot_valid[level] || vb.lfslot_w[level] != vb.rbw || vb.lfslot_h[level] != vb.rbh {
             return err(pixels.Error.Malformed)
         }
         base := vb.lfslot_off[level]
-        for i in 0usize..3 * blocks {
-            vb.lf[i] = vb.lfslot[base + i]
+        rplane := vb.rbw * vb.rbh
+        for c in 0usize..3 {
+            for y in 0usize..vb.bh {
+                for x in 0usize..vb.bw {
+                    vb.lf[c * blocks + y * vb.bw + x] = vb.lfslot[base + c * rplane + y * vb.rbw + x]
+                }
+            }
         }
     }
     // LF groups.
     vb.used_params = 0
     m_lf := [vals.m_lf[0], vals.m_lf[1], vals.m_lf[2]]
+    gd := f.group_dim as usize
     for g in 0usize..num_lf {
+        if (g % f.lf_groups_x as usize) * gd >= vb.bw || (g / f.lf_groups_x as usize) * gd >= vb.bh {
+            continue
+        }
         enter_section(r, f, toc, 1 + g)?
         vardct_lf_group(r, h, f, work, gcode, lcode, tcode, n1, n2, window, gch, gend, lch, ltr, lstash, &mut vals.wp, &m_lf, vb, g, use_lf)?
         leave_section(r, f)?
@@ -1053,12 +1117,14 @@ fn decode_vardct_frame(r: &mut Reader, h: &ImageHeader, f: &FrameHeader, work: &
         hf_bit = r.position()
         leave_section(r, f)?
         for g in 0usize..num_groups {
-            enter_section(r, f, toc, 2 + num_lf + p * num_groups + g)?
             gx := g % f.groups_x as usize
             gy := g / f.groups_x as usize
+            if gx * (gd / 8) >= vb.bw || gy * (gd / 8) >= vb.bh {
+                continue
+            }
+            enter_section(r, f, toc, 2 + num_lf + p * num_groups + g)?
             decode_hf_group(r, f, vb, as_i32(planes), hcode, window, gx, gy, f.pass_shift[p])?
-            group_channels(f, gch, gend, lch, ltr, lstash, false, p, gx, gy, &pass_min, &pass_max)?
-            decode_group_stream(r, h, f, work, gcode, lcode, tcode, n1, n2, window, lch, ltr, lstash, &mut vals.wp, (1 + 3 * num_lf + 17 + p * num_groups + g) as u32)?
+            decode_group(r, h, f, work, gcode, lcode, tcode, n1, n2, window, gch, gend, lch, ltr, lstash, &mut vals.wp, false, p, gx, gy, &pass_min, &pass_max, (1 + 3 * num_lf + 17 + p * num_groups + g) as u32)?
             leave_section(r, f)?
         }
     }
@@ -1068,6 +1134,7 @@ fn decode_vardct_frame(r: &mut Reader, h: &ImageHeader, f: &FrameHeader, work: &
     if gch.count != h.num_extra as usize {
         return err(pixels.Error.Malformed)
     }
+    gch.collapse()
     return ok()
 }
 

@@ -24,9 +24,18 @@ import "std/image/sink"
 // entropy.dodo
 //     Codes (context map + per-cluster prefix or ANS tables + hybrid uint
 //     configs + LZ77) and Streams (ANS state, LZ77 window).
-// scan.dodo
-//     Walks all frame headers and TOCs (no pixel work) to count frames and
-//     size every buffer: scratch_size() is computed from this up front.
+// skim.dodo
+//     The same entropy decoding in a few KiB of stack (lazily built
+//     compact tables, a window of what the walk needs of each value), for
+//     everything that runs before scratch exists: skipping the ICC profile
+//     and permuted TOCs, reading patch dictionaries, trees and splines
+//     while planning.
+// scan.dodo, window.dodo
+//     Walks all frame headers and TOCs (no pixel work) to count frames
+//     and, for scratch_size() and decode(), to size every buffer up front.
+//     Each frame is sized and decoded over its window: the part, anchored
+//     at its top-left corner, that can reach the output (the visible part,
+//     or for reference frames what later patches read), plus margins.
 // frame.dodo
 //     FrameHeader, TOC (with Lehmer-coded permutation).
 // framedec.dodo, modular.dodo, transforms.dodo
@@ -89,8 +98,8 @@ import "std/image/sink"
 //
 // Scratch
 // -------
-// One caller buffer, carved by plan() into: the scan work area (ICC/TOC
-// skipping), the LZ77 window, five Codes (global tree, local tree,
+// One caller buffer, carved by plan() into: the LZ77 window, five Codes
+// (global tree, local tree,
 // transient, two nested), two MA trees, channel and transform lists, the
 // weighted predictor rows, a squeeze row, the TOC, the i32 arena (frame
 // channels plus allowances for palettes, LF group streams, raw
@@ -99,8 +108,21 @@ import "std/image/sink"
 // coefficient orders, the HF Code, LF frame outputs), and for the float
 // pipeline the frame planes, the canvas, the reference slots in use, noise
 // planes, spline storage, filter rows and one output tile. Sizes follow
-// from the headers (also on 32-bit targets: sizes are computed in u64 and
-// fail TooLarge when they do not fit usize).
+// from the image header and each frame's window (window.dodo), not from
+// the sizes frame headers claim, so frames larger than the image cost what
+// their visible part costs: with W' = width + 1100, H' = height + 1100 and
+// C = 3 + extra channels, scratch_size() <= 64 W' H' C + 5 MiB C + 128 MiB
+// (the constant covers group-sized temporaries, the local MA tree libjxl
+// allows a group, up to 2^22 global tree nodes and the LZ77 window). The
+// exceptions are listed in window.dodo: frames starting left of or above
+// the image, the extent of patch reads from reference frames, and frames
+// whose global transforms (squeeze, above-right delta palettes) need the
+// whole frame. Sizes are computed in u64 and fail TooLarge when they do
+// not fit usize (also on 32-bit targets).
+//
+// Stack: the scratch-free entry points (info, metadata, frame_info,
+// scratch_size) keep a 20 KiB skimmer state (skim.dodo) on the stack;
+// decode() and icc() do the same for their header walks.
 //
 // Output samples are in the native layout reported by info(): U8 for
 // integer depths up to 8, U16 up to 16, F32 for float or deeper samples
@@ -133,7 +155,7 @@ pub fn info(data: &[u8]) -> pixels.Header!pixels.Error {
     r := open(data)?
     h := read_headers(&mut r, &mut sk, &mut win)?
     s := new_scan()
-    walk_frames(&mut r, &h, &mut s, &mut sk, &mut win)?
+    walk_frames(data, &mut r, &h, &mut s, &mut sk, &mut win, false)?
     return ok(make_header(&h, &s, data.len))
 }
 
@@ -286,7 +308,7 @@ fn pow2_at_least(v: u64, cap: u64) -> u64 {
 fn plan(h: &ImageHeader, s: &Scan) -> Plan!pixels.Error {
     nec := h.num_extra as u64
     samples := s.max_samples
-    arena := samples + samples / 2 + 65536
+    arena := samples + samples / 2 + s.max_temp + 65536
     if s.any_vardct {
         // LF group images, HF metadata and raw quantization tables.
         arena += 7 * 65536
@@ -303,8 +325,8 @@ fn plan(h: &ImageHeader, s: &Scan) -> Plan!pixels.Error {
     // every channel, or the small channels of the global stream, plus
     // palette storage.
     group := s.max_group_dim as u64 * s.max_group_dim as u64 * s.max_channels as u64
-    if group > samples {
-        group = samples
+    if group > samples + s.max_temp {
+        group = samples + s.max_temp
     }
     ltree := 1024 + group + 65536
     if s.any_vardct && ltree < 1024 + 4 * 65536 {
@@ -439,7 +461,7 @@ pub fn scratch_size(data: &[u8]) -> usize!pixels.Error {
     r := open(data)?
     h := read_headers(&mut r, &mut sk, &mut win)?
     s := new_scan()
-    walk_frames(&mut r, &h, &mut s, &mut sk, &mut win)?
+    walk_frames(data, &mut r, &h, &mut s, &mut sk, &mut win, true)?
     p := plan(&h, &s)?
     return ok(p.total)
 }
@@ -460,7 +482,7 @@ pub fn decode_frame<S: sink.Sink>(data: &[u8], index: u32, output: &mut S, buffe
     r := open(data)?
     h := read_headers(&mut r, &mut sk, &mut win)?
     s := new_scan()
-    walk_frames(&mut r, &h, &mut s, &mut sk, &mut win)?
+    walk_frames(data, &mut r, &h, &mut s, &mut sk, &mut win, true)?
     if index >= s.displayed {
         return err(pixels.Error.Malformed)
     }
@@ -472,11 +494,11 @@ pub fn decode_frame<S: sink.Sink>(data: &[u8], index: u32, output: &mut S, buffe
     header := make_header(&h, &s, data.len)
     layout := header.native.clone()
     output.begin(&header)?
-    return run(data, &h, &p, index, first, output, buffer, &layout)
+    return run(data, &h, &p, index, first, output, buffer, &layout, &mut sk, &mut win)
 }
 
 // Carve the scratch and decode frames up to displayed frame `index`.
-fn run<S: sink.Sink>(data: &[u8], h: &ImageHeader, p: &Plan, index: u32, first: u32, output: &mut S, bytes: &mut[u8], layout: &pixels.Layout) -> void!pixels.Error {
+fn run<S: sink.Sink>(data: &[u8], h: &ImageHeader, p: &Plan, index: u32, first: u32, output: &mut S, bytes: &mut[u8], layout: &pixels.Layout, sk: &mut Skim, win: &mut[u8]) -> void!pixels.Error {
     let slice.SplitMut { left: b_window, right: r1 } = scratch.split(bytes, p.window * 4 + 8)?
     let slice.SplitMut { left: b_gcode, right: r2 } = scratch.split(r1, code_bytes(p.gdist, CODE_POOL))?
     let slice.SplitMut { left: b_lcode, right: r3 } = scratch.split(r2, code_bytes(p.ldist, CODE_POOL))?
@@ -516,7 +538,7 @@ fn run<S: sink.Sink>(data: &[u8], h: &ImageHeader, p: &Plan, index: u32, first: 
     vplanes := scratch.f32s(b_planes)
     dct := scratch.f32s(b_dct)
     lfslot_off := [0usize, p.lf_slot[0], p.lf_slot[0] + p.lf_slot[1]]
-    vb := VBufs { lf: scratch.f32s(b_lf), binfo: scratch.u32s(b_binfo), bmul: scratch.i32s(b_bmul), cfl: scratch.i32s(b_cfl), dqm: scratch.f32s(b_dqm), natural: scratch.u32s(b_natural), orders: scratch.u32s(b_orders), fen: scratch.u32s(b_fen), bctx: b_bctx, sigma: scratch.f32s(b_sigma), nz: scratch.u32s(b_nz), lfslot: scratch.f32s(b_lfslot), lfslot_off: lfslot_off, lfslot_cap: [p.lf_slot[0], p.lf_slot[1], p.lf_slot[2]], lfslot_w: [0usize; 3], lfslot_h: [0usize; 3], lfslot_valid: [false; 3], hs: [0usize; 3], vs: [0usize; 3], subsampled: false, bw: 0, bh: 0, rw: 0, rh: 0, tw: 0, th: 0, global_scale: 1, quant_lf: 1, nb_lf_thr: [0u32; 3], lf_thr: [0i32; 48], nb_qf_thr: 0, qf_thr: [0u32; 16], bctx_size: 0, nb_block_ctx: 1, colour_factor: 84, base_x: 0.0, base_b: 1.0, x_factor_lf: 0, b_factor_lf: 0, num_hf_presets: 1, hf_bit: 0, used_params: 0, custom_orders: 0, tables_ready: false }
+    vb := VBufs { lf: scratch.f32s(b_lf), binfo: scratch.u32s(b_binfo), bmul: scratch.i32s(b_bmul), cfl: scratch.i32s(b_cfl), dqm: scratch.f32s(b_dqm), natural: scratch.u32s(b_natural), orders: scratch.u32s(b_orders), fen: scratch.u32s(b_fen), bctx: b_bctx, sigma: scratch.f32s(b_sigma), nz: scratch.u32s(b_nz), lfslot: scratch.f32s(b_lfslot), lfslot_off: lfslot_off, lfslot_cap: [p.lf_slot[0], p.lf_slot[1], p.lf_slot[2]], lfslot_w: [0usize; 3], lfslot_h: [0usize; 3], lfslot_valid: [false; 3], hs: [0usize; 3], vs: [0usize; 3], subsampled: false, bw: 0, bh: 0, rbw: 0, rbh: 0, rw: 0, rh: 0, tw: 0, th: 0, global_scale: 1, quant_lf: 1, nb_lf_thr: [0u32; 3], lf_thr: [0i32; 48], nb_qf_thr: 0, qf_thr: [0u32; 16], bctx_size: 0, nb_block_ctx: 1, colour_factor: 84, base_x: 0.0, base_b: 1.0, x_factor_lf: 0, b_factor_lf: 0, num_hf_presets: 1, hf_bit: 0, used_params: 0, custom_orders: 0, tables_ready: false }
     gcode := carve_code(b_gcode, p.gdist)?
     lcode := carve_code(b_lcode, p.ldist)?
     tcode := carve_code(b_tcode, TRANSIENT_DIST)?
@@ -571,7 +593,7 @@ fn run<S: sink.Sink>(data: &[u8], h: &ImageHeader, p: &Plan, index: u32, first: 
     let slice.SplitMut { left: b_cpf, right: b_ftemp } = scratch.split(f5, sp_words / 2 * 4 + 8)?
     sbuf := scratch.i32s(b_sbuf)
     cpf := scratch.f32s(b_cpf)
-    fb := FloatBufs { frame: scratch.f32s(b_frame), canvas: scratch.f32s(b_canvas), slots: scratch.f32s(b_slots), ftemp: scratch.f32s(b_ftemp), noise: scratch.f32s(b_noise), planes: planes, fw: 0, fh: 0, slot_off: slot_off, slot_cap: slot_cap, slot_w: [0usize; 4], slot_h: [0usize; 4], slot_valid: [false; 4], use_canvas: p.canvas_pixels > 0 }
+    fb := FloatBufs { frame: scratch.f32s(b_frame), canvas: scratch.f32s(b_canvas), slots: scratch.f32s(b_slots), ftemp: scratch.f32s(b_ftemp), noise: scratch.f32s(b_noise), planes: planes, fw: 0, fh: 0, slot_off: slot_off, slot_cap: slot_cap, slot_w: [0usize; 4], slot_h: [0usize; 4], slot_fw: [0usize; 4], slot_fh: [0usize; 4], slot_valid: [false; 4], slot_before: [false; 4], use_canvas: p.canvas_pixels > 0 }
     ct := xyb_transform(h)
     shown := 0u32
     frame := 0u32
@@ -597,6 +619,9 @@ fn run<S: sink.Sink>(data: &[u8], h: &ImageHeader, p: &Plan, index: u32, first: 
             r.seek_byte64(f.end())
             continue
         }
+        // Decode only the part of the frame that can matter (window.dodo).
+        w := frame_window(data, h, &f, sk, win)
+        apply_window(&mut f, &w)
         decode_frame_data(&mut r, h, &f, &mut work, &mut gcode, &mut lcode, &mut tcode, &mut n1, &mut n2, window, &mut gch, &mut lch, &mut gstash, &mut lstash, &mut gtr, &mut ltr, toc, &mut vals, &mut vb, vplanes, dct, &mut hcode)?
         render_frame(&mut r, h, &f, &mut work, &gch, &vals, &mut fb, &mut vb, vplanes, sbuf, cpf, &mut tcode, &mut n1, &mut n2, window, &ct)?
         if f.is_keyframe() {
