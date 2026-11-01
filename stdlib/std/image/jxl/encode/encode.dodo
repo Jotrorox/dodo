@@ -6,10 +6,12 @@ import "std/image/pixels"
 import "std/image/shared/binary"
 import "std/image/shared/scratch"
 
-// JPEG XL lossless encoder: pure Dodo, no allocation, integer-only, with
-// byte-identical output on every target.
+// JPEG XL encoder: pure Dodo, no allocation. Lossless (the default) is
+// integer-only with byte-identical output on every target; lossy
+// (EncodeOptions.lossless = false) writes a VarDCT frame at a Butteraugli
+// distance.
 //
-// Design
+// Design (lossless)
 //
 // Output is one lossless modular frame (not XYB) as a bare codestream, or in
 // the ISOBMFF container (signature, ftyp, optional jxll/Exif/xml boxes, then
@@ -48,6 +50,57 @@ import "std/image/shared/scratch"
 // tables, the palette hash and the TOC sizes (4 bytes per group). Planes are
 // bounded by the group size, so scratch stays between about 0.5 and 1.5 MiB
 // for any image. max_encoded_size() bounds the output.
+//
+// Design (lossy, vd_*.dodo)
+//
+// One VarDCT frame in XYB (image metadata xyb_encoded; the color encoding
+// names the source's space, which the decoder converts back to). Samples
+// are linearized with the header's transfer curve (sRGB, linear, BT.709,
+// PQ, HLG, power laws), moved to sRGB primaries when needed, and turned into
+// XYB by libjxl's opsin matrix, bias and cube root; float and 16-bit
+// sources keep their precision up to that point. Per frame: a global quant
+// scale and LF quant from the distance (libjxl's formulas), default
+// dequantization matrices, x_qm_scale from the distance, Gaborish (effort 2+,
+// distance above 0.5) and EPF iterations (0 to 3 by distance) signalled as
+// applied. Per 256x256 group, analyzed with an 8-pixel border so results do
+// not depend on group order: the adaptive quant field (libjxl's masking
+// model) from the original XYB, inverse Gaborish (libjxl's 5x5 kernel),
+// then per 64x64 tile the varblock search (effort 3+: libjxl's entropy plus
+// information-loss estimate, merging DCT8 into 16x8, 16x16, 32x16, 32x32
+// and, at effort 7+, 64x32 and 64x64), the quant field per varblock,
+// chroma-from-luma factors fitted per tile (least squares, libjxl's
+// weighting), and quantization with libjxl's dead zones and per-block quant
+// adjustment (effort 3+). The LF image (one value per 8x8 block, the
+// lowest frequencies of each varblock folded back) is quantized with LF
+// chroma-from-luma, and with the HF metadata (chroma-from-luma tiles,
+// varblock types and quants, EPF sharpness) coded per LF group in modular
+// streams with their own trees. HF coefficients use the default block
+// context map, the decoder's nonzero-count prediction and contexts and the
+// natural coefficient orders; their tokens (hybrid integers 4/1/0, runs of
+// equal tokens as LZ77 copies) are clustered into at most 32 prefix codes
+// with an MTF + LZ77 coded context map. Alpha stays lossless in the modular
+// stream (global tree and codes, one stream per group).
+//
+// Two passes, group by group: the first analyzes each LF group's groups,
+// writes the LF group and counts the HF tokens; after the HF code is built
+// the second analyzes every group again (reusing the first pass's
+// decisions when the image is one LF group, up to 2048x2048) and writes
+// its tokens. Every HF token goes through VdHfCoder.token in vd_hf.dodo,
+// the single seam to the entropy coder.
+//
+// Lossy memory: encode_scratch_size() is about
+//   2.7 MiB fixed (HF histograms 7426 contexts x 64 symbols x 4 bytes,
+//     dequantization weights, orders, the modular coder)
+//   + 18 g^2 bytes for the group (XYB planes with an 8-pixel border,
+//     quantized coefficients), plus 8 g^2 more at effort 3+ (masking
+//     field), g = min(256, image side rounded up to 8)
+//   + 28 b^2 bytes for the LF group (LF image, metadata, block info),
+//     b = min(256, image side in blocks)
+//   + 1 KiB (8-bit) or 256 KiB (16-bit and half-float) linearization table
+//   + 4 bytes per alpha sample of one group,
+// at most about 7 MiB whatever the image size. max_encoded_size() is a
+// true bound (29 bits per HF coefficient, 36 per LF and metadata symbol,
+// the alpha samples' lossless bound, and the coding overhead).
 
 // Default effort for EncodeOptions.new().
 pub const DEFAULT_EFFORT: u32 = 2

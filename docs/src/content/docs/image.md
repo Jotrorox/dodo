@@ -43,7 +43,7 @@ buffers suit `static mut` storage on small stacks.
 | `std/image/meta` | `Metadata` of EXIF, XMP and ICC byte ranges, the EXIF orientation, zlib payloads. |
 | `std/image/shared/binary`, `std/image/shared/scratch` | Bounds-checked fields of file data; typed views of one byte scratch buffer. |
 | `std/image/ppm`, `std/image/qoi`, `std/image/bmp`, `std/image/png`, `std/image/jxl` | The codecs, one package per format, with the same shape. |
-| `std/image/jxl/encode` | The JPEG XL lossless encoder. |
+| `std/image/jxl/encode` | The JPEG XL encoder (lossless modular, or lossy VarDCT). |
 | `std/image/ops` | Crop, flip, rotate and orient; resize; palettes and dithering; PSNR/SSIM comparison; histograms; fill and compositing (see [below](#pixel-operations)). |
 | `std/image/shared/isobmff` | ISO base media file format boxes (the JPEG XL container). |
 | `std/image_alloc` | Owned images and image files: `load`, `save`, `convert`, `orient`, `resize`, `crop` with an explicit allocator (see [below](#owned-images-and-files)). |
@@ -59,7 +59,7 @@ codec packages (see [below](#stdgraphicsimage)).
 | QOI | RGB and RGBA, sRGB or linear | RGB, or RGBA when the source has alpha |
 | BMP | 1, 4 and 8-bit palettes, RLE8 and RLE4; 16, 24 and 32-bit with or without bit-field masks; bottom-up or top-down; OS/2 core, V4 and V5 headers with sRGB or an embedded ICC profile | 24-bit, or 32-bit with a V5 header and alpha mask when the source has alpha |
 | PNG | Every color type and bit depth, `PLTE`, `tRNS`, Adam7, `cICP`, `iCCP`, `sRGB`, `gAMA`, `cHRM`, `cLLi`, `eXIf`, XMP in `iTXt`; APNG animation | Gray, gray+alpha, RGB or RGBA at 8 or 16 bits, or indexed; stored or deflate levels 1 to 9; any filter; Adam7; `sRGB`, `eXIf`, `iCCP` |
-| JPEG XL (`Format.Jxl`) | Bare codestreams and the ISOBMFF container (`jxlc`, split `jxlp`, `Exif`, `xml `, Brotli `brob` boxes reported as such); lossless and lossy modular, VarDCT with every block type, progressive passes and LF frames, recompressed JPEG (4:4:4, 4:2:2, 4:2:0, gray), patches, splines, noise, Gaborish and EPF, upsampling, animation with blending and reference frames, up to 64 extra channels; output U8, U16 or F32 by bit depth, XYB converted to the file's color encoding; embedded ICC profiles via `image.icc` | Lossless modular at efforts 1 to 3: 8 and 16-bit integer or exact 16/32-bit float samples, gray, RGB, alpha; bare codestream or container with `Exif`/`xml ` boxes |
+| JPEG XL (`Format.Jxl`) | Bare codestreams and the ISOBMFF container (`jxlc`, split `jxlp`, `Exif`, `xml `, Brotli `brob` boxes reported as such); lossless and lossy modular, VarDCT with every block type, progressive passes and LF frames, recompressed JPEG (4:4:4, 4:2:2, 4:2:0, gray), patches, splines, noise, Gaborish and EPF, upsampling, animation with blending and reference frames, up to 64 extra channels; output U8, U16 or F32 by bit depth, XYB converted to the file's color encoding; embedded ICC profiles via `image.icc` | Lossless modular at efforts 1 to 3: 8 and 16-bit integer or exact 16/32-bit float samples, gray, RGB, alpha; or lossy VarDCT in XYB at a Butteraugli distance (efforts 1 to 9: adaptive quantization, Gaborish, varblocks up to 64x64, chroma from luma; alpha kept lossless); bare codestream or container with `Exif`/`xml ` boxes |
 
 ASCII Netpbm (P1 to P3), P4 bitmaps, and BMP JPEG/PNG compression fail with
 `Unsupported`.
@@ -160,9 +160,14 @@ indices follow the animation's own frames.
 ## Encoding
 
 `image.EncodeOptions` is format-independent: `effort` (1 to 9, the PNG deflate
-level, 0 writing stored PNG blocks; JPEG XL effort 1 for 1-2, 2 for 3-6 and 3
-for 7-9), `quality` and `lossless` (for lossy
-formats; everything written today is lossless) and `keep_metadata`. Encoders
+level, 0 writing stored PNG blocks; lossless JPEG XL effort 1 for 1-2, 2 for
+3-6 and 3 for 7-9, lossy JPEG XL the same effort), `lossless` (default true),
+`quality` (0 to 100, default 90) and `distance` for lossy encoding, and
+`keep_metadata`. JPEG XL is the one format with both: `lossless = false`
+writes lossy JPEG XL at `distance` when it is above zero, else at the
+Butteraugli distance cjxl derives from `quality` (90 is distance 1, the
+visually lossless default; quality 100 stays lossless). The other formats
+ignore `quality`, `distance` and `lossless`. Encoders
 read a `View` in any layout and pick the closest form the format stores, as
 the table above lists; float sources are clamped to 0.0 to 1.0 except in PFM.
 
@@ -208,7 +213,7 @@ The codec options:
 | `std/image/ppm` | `kind`: `KIND_AUTO`, `KIND_PGM` (P5), `KIND_PPM` (P6), `KIND_PAM` (P7), `KIND_PFM`. |
 | `std/image/qoi` | `channels` (0 for automatic, 3 or 4), `linear` (the colorspace byte). |
 | `std/image/bmp` | `alpha`: write 32-bit with alpha when the source has it (default), or always 24-bit. |
-| `std/image/jxl/encode` | `effort` (1 to 3; higher values behave like 3), `container` (ISOBMFF boxes instead of a bare codestream), `color` (a `ColorInfo` written as the JPEG XL color encoding), `orientation`. `encode_with_metadata` adds `Exif` and `xml ` boxes. |
+| `std/image/jxl/encode` | `lossless` (default true) and `distance` (Butteraugli distance of lossy encoding, default 1.0, 0.05 to 25; `EncodeOptions.lossy(d)`, `distance_from_quality(q)` maps cjxl's 0 to 100 quality), `effort` (lossless 1 to 3, higher values behave like 3; lossy 1 to 9: 1 DCT8 with uniform quantization, 2 adds adaptive quantization, inverse Gaborish and chroma from luma, 3 to 6 the varblock search up to 32x32 and per-block quant adjustment, 7 to 9 also 64x64), `container` (ISOBMFF boxes instead of a bare codestream), `color` (a `ColorInfo` written as the JPEG XL color encoding), `orientation`. `encode_with_metadata` adds `Exif` and `xml ` boxes. |
 | `std/image/png` | `level` (0 stored, 1 to 9 deflate), `filter` (`FILTER_NONE` to `FILTER_PAETH`, or `FILTER_ADAPTIVE`), `interlace` (Adam7), `palette` (an indexed PNG of 1 to 8 bits with `tRNS` when an 8-bit source has at most 256 RGBA colors), `srgb_chunk`. |
 
 `std/image/png` adds `frame_info`, `frame_scratch_size` and `decode_frame` for
@@ -335,6 +340,7 @@ all images in one shared arena over a 512 MiB static buffer:
 dodo build examples/imgtool -o imgtool
 ./imgtool info photo.png
 ./imgtool convert photo.png photo.jxl --effort 7
+./imgtool convert photo.png small.jxl --quality 80
 ./imgtool resize photo.jxl thumb.png 320x0 --filter lanczos --linear
 ./imgtool compare photo.png thumb-back.png
 ```
@@ -342,7 +348,7 @@ dodo build examples/imgtool -o imgtool
 | Command | Effect |
 | --- | --- |
 | `info FILE` | Format, size, native layout, bit depth, color (CICP, gamma, ICC), orientation, frames and metadata items. |
-| `convert IN OUT [--effort N] [--layout L] [--strip]` | Re-encodes as OUT's format; `L` is `gray8`, `graya8`, `rgb8`, `rgba8` or the same with `16`, `f16`, `f32`. |
+| `convert IN OUT [--effort N] [--layout L] [--strip] [--quality Q \| --distance D \| --lossy]` | Re-encodes as OUT's format; `L` is `gray8`, `graya8`, `rgb8`, `rgba8` or the same with `16`, `f16`, `f32`. JPEG XL is lossless unless given a quality (0 to 100), a Butteraugli distance (such as `1.0`) or `--lossy` (quality 90). |
 | `resize IN OUT WxH [--filter F] [--linear]` | `F` is `nearest`, `box`, `bilinear`, `catmull-rom`, `mitchell` or `lanczos`; a zero side keeps the aspect ratio. |
 | `strip IN OUT` | Re-encodes without EXIF and ICC metadata. |
 | `orient IN OUT` | Applies the EXIF orientation. |
@@ -364,8 +370,13 @@ and JPEG XL have frames (`decode_frame`). The JPEG XL decoder rejects with
 frames combined with upsampling, filters, adaptive LF smoothing or blocks
 larger than 8x8, and more than 64 extra channels; extra channels other than
 the first alpha are decoded but not output. Lossy JPEG XL matches libjxl's
-`djxl` within one 8-bit level. The JPEG XL encoder is lossless only and
-uses prefix codes (no ANS); it does not embed ICC profiles. JPEG XL scratch
+`djxl` within one 8-bit level. The JPEG XL encoder uses prefix codes (no
+ANS), which costs lossy files roughly 5 to 10% against libjxl at the same
+quality; it does not embed ICC profiles, and lossy output converts from the
+CICP color description only. Lossy encoding keeps alpha lossless, uses the
+default dequantization matrices, natural coefficient orders and the 8x8
+DCT only among the 8x8 transforms (no DCT4, AFV or identity blocks), and
+analyzes every group twice (once only in images up to 2048x2048 pixels). JPEG XL scratch
 is sized from frame headers, which can describe frames larger than the
 image, so check `scratch_size` against your budget before allocating. PNG text chunks other
 than XMP are skipped, as are `sBIT`, `pHYs` and timestamps. The PNG encoder
