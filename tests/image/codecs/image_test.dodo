@@ -4,6 +4,8 @@ import "core/bytes"
 import "std/fs"
 import "std/graphics"
 import "std/image"
+import "std/image/color"
+import "std/image/jxl"
 import "std/image/pixels"
 import "std/platform"
 
@@ -211,14 +213,16 @@ fn image_writes_jxl_icc_profiles_that_fit() {
     data := [1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
     nothing := [0u8; 1]
     options := image.EncodeOptions.new()
-    for k in 0usize..2 {
-        // An RGB profile on an RGB image is embedded; on a gray image it is
-        // left out.
+    for k in 0usize..3 {
+        // An RGB profile on an RGB image is embedded, losslessly or lossy
+        // (converted to XYB through it); on a gray image it is left out.
         layout := pixels.Layout.rgb8()
         width := 2u32
         if k == 1 {
             layout = pixels.Layout.gray8()
             width = 6
+        } else if k == 2 {
+            options.lossless = false
         }
         source := pixels.View.new(&data, width, 1, layout)!
         bound := image.max_encoded_size(pixels.Format.Jxl, &source, &options)! + image.metadata_size(pixels.Format.Jxl, 0, icc.len)!
@@ -227,11 +231,20 @@ fn image_writes_jxl_icc_profiles_that_fit() {
             assert(bound <= JXL_OUTPUT.len && need <= JXL_SCRATCH.len)
             n := image.encode_with_metadata(pixels.Format.Jxl, &source, &options, &nothing[..0], icc, &mut JXL_OUTPUT[..bound], &mut JXL_SCRATCH[..need])!
             found := image.metadata(&JXL_OUTPUT[..n])!
-            assert_eq(found.icc.present(), k == 0)
-            if k == 0 {
+            assert_eq(found.icc.present(), k != 1)
+            if k != 1 {
                 decode_need := image.icc_scratch_size(&JXL_OUTPUT[..n])!
                 assert(decode_need <= JXL_SCRATCH.len)
                 m := image.icc(&JXL_OUTPUT[..n], &mut JXL_PROFILE_BACK, &mut JXL_SCRATCH[..decode_need])!
+                if k == 2 {
+                    // Lossy (XYB) files decode to sRGB, so the header and
+                    // image.icc() describe sRGB pixels; jxl.icc() still
+                    // extracts the embedded profile.
+                    assert(m == 0, "XYB pixels decode as sRGB")
+                    header := image.info(&JXL_OUTPUT[..n])!
+                    assert(header.lossy && header.color.icc_encoding == color.ICC_NONE)
+                    m = jxl.icc(&JXL_OUTPUT[..n], &mut JXL_PROFILE_BACK, &mut JXL_SCRATCH[..decode_need])!
+                }
                 assert(bytes.equal(&JXL_PROFILE_BACK[..m], icc))
             }
         }

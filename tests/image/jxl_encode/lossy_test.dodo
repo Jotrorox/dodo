@@ -601,3 +601,160 @@ fn color_encodings_round_trip() {
     bt709.transfer = color.TRANSFER_BT709
     assert(color_round_trip("bt709", pixels.Layout.rgba8(), bt709) > 34.0, "BT.709")
 }
+
+static mut LPROFILE: [65536]u8 = [0u8; 65536]
+static mut LCOMPARE: [131072]u8 = [0u8; 131072]
+
+// tests/image/jxl_encode/icc/NAME into LPROFILE; returns its length.
+fn read_profile(path: &str) -> usize {
+    workspace := platform.workspace()
+    profile := unsafe {
+        &mut LPROFILE
+    }
+    report := fs.read_file(path, &mut profile[..], &mut workspace)!
+    return report.read
+}
+
+// Lossy encoding of `view` with `icc` (empty for none) into LOUTPUT, within
+// max_encoded_size_with_metadata(), then decoded into LDECODED and dumped
+// as `name` (by lossy_psnr); returns the size.
+fn icc_encode(view: &pixels.View, icc: &[u8], name: &str) -> usize {
+    options := encode.EncodeOptions.lossy(1.0)
+    options.effort = 3
+    nothing := [0u8; 1]
+    md := encode.Metadata.with_icc(&nothing[..0], &nothing[..0], icc)
+    layout := view.layout()
+    assert(encode.icc_usable(icc, layout, &options) || icc.len == 0, "usable profile")
+    bound := encode.max_encoded_size_with_metadata(view.width(), view.height(), layout, &options, &md)!
+    need := encode.encode_scratch_size(view.width(), view.height(), layout, &options)!
+    output := unsafe {
+        &mut LOUTPUT
+    }
+    scratch := unsafe {
+        &mut LSCRATCH
+    }
+    assert(bound <= output.len && need <= scratch.len)
+    n := encode.encode_with_metadata(view, &options, &md, &mut output[..bound], &mut scratch[..need])!
+    assert(n <= bound, "output exceeds max_encoded_size_with_metadata")
+    lossy_psnr(&output[..n], view, name)
+    return n
+}
+
+@test
+fn icc_profiles_drive_the_lossy_color_conversion() {
+    data := unsafe {
+        &mut LPIXELS
+    }
+    srgb_len := read_profile("tests/image/jxl_encode/icc/srgb-v4.icc")
+    srgb := [0u8; 1024]
+    unsafe {
+        for i in 0usize..srgb_len {
+            srgb[i] = LPROFILE[i]
+        }
+    }
+    // An sRGB-like matrix/TRC profile gives the XYB of sRGB: decoded (to
+    // sRGB, as for every ICC file) it matches the encoding without it.
+    names := ["icc_srgb_rgb8", "icc_srgb_rgb16", "icc_srgb_f32"]
+    plain := ["no_icc_rgb8", "no_icc_rgb16", "no_icc_f32"]
+    for k in 0usize..3 {
+        layout := pixels.Layout.rgb8()
+        w := 64u32
+        h := 48u32
+        limit := 3.0 / 255.0
+        if k == 1 {
+            layout = pixels.Layout.rgb16()
+            w = 48
+            h = 40
+            limit = 3.0 / 255.0
+        } else if k == 2 {
+            layout = pixels.Layout.from_codes(3, pixels.SAMPLE_F32, false)
+            w = 40
+            h = 32
+            limit = 0.012
+        }
+        make_scene(&mut data[..], w, h, &layout)
+        view := pixels.View.new(&data[..], w, h, layout.clone())!
+        icc_encode(&view, &srgb[..0], plain[k])
+        bytes_used := (w * h) as usize * layout.bytes_per_pixel()
+        unsafe {
+            for i in 0usize..bytes_used {
+                LCOMPARE[i] = LDECODED[i]
+            }
+        }
+        n := icc_encode(&view, &srgb[..srgb_len], names[k])
+        worst := 0.0f64
+        total := 0.0f64
+        unsafe {
+            for i in 0usize..(w * h * 3) as usize {
+                d := sample_at(&LDECODED, &layout, i) - sample_at(&LCOMPARE, &layout, i)
+                if d < 0.0 {
+                    d = -d
+                }
+                total += d
+                if d > worst {
+                    worst = d
+                }
+            }
+            // The profile itself travels in the codestream.
+            found := jxl.metadata(&LOUTPUT[..n])!
+            assert(found.icc.present(), "ICC profile embedded")
+        }
+        // Tiny XYB differences (the profile's rounded colorants) may move a
+        // coefficient across a rounding boundary here and there.
+        assert(worst <= limit, "sRGB profile matches sRGB")
+        assert(total / (w * h * 3) as f64 <= limit / 20.0, "sRGB profile matches sRGB on average")
+    }
+    // Wide-gamut matrix/TRC, lookup-table (lutAtoB) and gray profiles.
+    {
+        layout := pixels.Layout.rgb8()
+        make_scene(&mut data[..], 64, 48, &layout)
+        view := pixels.View.new(&data[..], 64, 48, layout)!
+        p3_len := read_profile("tests/image/jxl_encode/icc/p3-v4.icc")
+        p3 := unsafe {
+            &LPROFILE[..p3_len]
+        }
+        assert(icc_encode(&view, p3, "icc_p3") > 0)
+        lut_len := read_profile("tests/image/jxl_encode/icc/lut-rgb.icc")
+        lut := unsafe {
+            &LPROFILE[..lut_len]
+        }
+        assert(icc_encode(&view, lut, "icc_lut") > 0)
+        gray_layout := pixels.Layout.gray8()
+        make_scene(&mut data[..], 40, 24, &gray_layout)
+        gview := pixels.View.new(&data[..], 40, 24, gray_layout)!
+        gray_len := read_profile("tests/image/jxl_encode/icc/gray.icc")
+        gray := unsafe {
+            &LPROFILE[..gray_len]
+        }
+        assert(icc_encode(&gview, gray, "icc_gray") > 0)
+    }
+    // A profile without colorants (nor lookup tables) cannot be converted
+    // from: Unsupported when lossy, still embedded when lossless.
+    srgb[132 + 12 * 4 + 3] = b'Q'
+    {
+        layout := pixels.Layout.rgb8()
+        view := pixels.View.new(&data[..], 64, 48, layout.clone())!
+        lossy := encode.EncodeOptions.lossy(1.0)
+        lossless := encode.EncodeOptions.new()
+        broken := &srgb[..srgb_len]
+        assert(!encode.icc_usable(broken, &layout, &lossy), "unusable for lossy")
+        assert(encode.icc_usable(broken, &layout, &lossless), "usable for lossless")
+        nothing := [0u8; 1]
+        md := encode.Metadata.with_icc(&nothing[..0], &nothing[..0], broken)
+        output := unsafe {
+            &mut LOUTPUT
+        }
+        scratch := unsafe {
+            &mut LSCRATCH
+        }
+        need := encode.encode_scratch_size(64, 48, &layout, &lossy)!
+        match encode.encode_with_metadata(&view, &lossy, &md, &mut output[..], &mut scratch[..need]) {
+            ok(_) => {
+                assert(false, "lossy encoding needs a usable profile")
+            }
+            err(e) => {
+                assert(e == pixels.Error.Unsupported)
+            }
+        }
+    }
+}

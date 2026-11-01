@@ -40,6 +40,36 @@ struct VdColor {
     channels: usize
     color_channels: usize
     cbrt_bias: f32
+    // An embedded ICC profile (vd_icc.dodo) instead of the transfer and
+    // primaries. Curves per slot: kind, para function type, parameters
+    // g a b c d e f, and the profile offset, entry count and entry bytes of
+    // table curves. Lookup-table profiles: the matrix (with offsets) after
+    // the M curves, the CLUT (offset, grid, bytes per entry) and the
+    // connection space encoding; m then maps XYZ D50 to linear sRGB.
+    icc: bool
+    curve_kind: [9]u32
+    curve_type: [9]u32
+    curve_par: [63]f64
+    curve_at: [9]usize
+    curve_n: [9]usize
+    curve_w: [9]u32
+    lut_profile: bool
+    lut_matrix: bool
+    mtx: [12]f64
+    has_clut: bool
+    clut_at: usize
+    clut_grid: [3]usize
+    clut_prec: usize
+    pcs: u32
+
+    // sRGB 8-bit (the starting point of vd_color).
+    fn empty(gray: bool) -> VdColor {
+        cc := 3usize
+        if gray {
+            cc = 1
+        }
+        return VdColor { transfer: TF_SRGB, gamma: 1.0, gray: gray, m: [1.0f32, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0], identity: true, hlg_exponent: 0.0, luma: [0.2126f64, 0.7152, 0.0722], sample: pixels.SAMPLE_U8, channels: cc, color_channels: cc, cbrt_bias: vd_cbrt(VD_OPSIN_BIAS), icc: false, curve_kind: [0u32; 9], curve_type: [0u32; 9], curve_par: [0.0f64; 63], curve_at: [0usize; 9], curve_n: [0usize; 9], curve_w: [2u32; 9], lut_profile: false, lut_matrix: false, mtx: [0.0f64; 12], has_clut: false, clut_at: 0, clut_grid: [2usize; 3], clut_prec: 2, pcs: 0 }
+    }
 }
 
 fn vd_pow(base: f64, exponent: f64) -> f64 {
@@ -137,6 +167,19 @@ fn vd_adapt_to_d50(wx: f64, wy: f64, out: &mut[f64]) -> bool {
     return true
 }
 
+// Linear sRGB to XYZ adapted to D50 (Bradford), the sRGB colorants of the
+// D50 connection space.
+fn vd_srgb_d50(out: &mut[f64]) -> bool {
+    srgb_xyz := [0.0f64; 9]
+    srgb_adapt := [0.0f64; 9]
+    srgb_prim := [0.639998686f64, 0.330010138, 0.300003784, 0.600003357, 0.150002046, 0.059997204]
+    if !vd_primaries_to_xyz(&srgb_prim, 0.3127, 0.329, &mut srgb_xyz) || !vd_adapt_to_d50(0.3127, 0.329, &mut srgb_adapt) {
+        return false
+    }
+    vd_mul3(&srgb_adapt, &srgb_xyz, out)
+    return true
+}
+
 // The color handling for `info` as the image header will describe it
 // (mirrors write_color_encoding: named CICP primaries and curves, custom
 // chromaticities, power laws, sRGB otherwise).
@@ -146,7 +189,9 @@ fn vd_color(info: &color.ColorInfo, layout: &pixels.Layout) -> VdColor {
     if channels >= 3 {
         cc = 3
     }
-    t := VdColor { transfer: TF_SRGB, gamma: 1.0, gray: cc == 1, m: [1.0f32, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0], identity: true, hlg_exponent: 0.0, luma: [0.2126f64, 0.7152, 0.0722], sample: layout.sample_code(), channels: channels, color_channels: cc, cbrt_bias: vd_cbrt(VD_OPSIN_BIAS) }
+    t := VdColor.empty(cc == 1)
+    t.sample = layout.sample_code()
+    t.channels = channels
     tr := info.transfer
     if tr == color.TRANSFER_SRGB {
         t.transfer = TF_SRGB
@@ -197,22 +242,17 @@ fn vd_color(info: &color.ColorInfo, layout: &pixels.Layout) -> VdColor {
     }
     if !srgb && !t.gray {
         to_xyz := [0.0f64; 9]
-        srgb_xyz := [0.0f64; 9]
         adapt := [0.0f64; 9]
-        srgb_adapt := [0.0f64; 9]
-        srgb_prim := [0.639998686f64, 0.330010138, 0.300003784, 0.600003357, 0.150002046, 0.059997204]
+        srgb_d50 := [0.0f64; 9]
         ok1 := vd_primaries_to_xyz(&prim, wx, wy, &mut to_xyz)
-        ok2 := vd_primaries_to_xyz(&srgb_prim, 0.3127, 0.329, &mut srgb_xyz)
+        ok2 := vd_srgb_d50(&mut srgb_d50)
         ok3 := vd_adapt_to_d50(wx, wy, &mut adapt)
-        ok4 := vd_adapt_to_d50(0.3127, 0.329, &mut srgb_adapt)
-        if ok1 && ok2 && ok3 && ok4 {
+        if ok1 && ok2 && ok3 {
             for k in 0usize..3 {
                 t.luma[k] = to_xyz[3 + k]
             }
             original := [0.0f64; 9]
             vd_mul3(&adapt, &to_xyz, &mut original)
-            srgb_d50 := [0.0f64; 9]
-            vd_mul3(&srgb_adapt, &srgb_xyz, &mut srgb_d50)
             if vd_inv3(&mut srgb_d50) {
                 // original -> sRGB = inverse(srgb_d50) * original.
                 product := [0.0f64; 9]
@@ -314,13 +354,16 @@ fn vd_to_linear(t: &VdColor, v: f64) -> f64 {
 
 // Entries of the linearization table: 256 for 8-bit samples, 65536 for
 // 16-bit integers and binary16 floats (indexed by the bit pattern), none
-// for binary32 (converted per sample).
+// for binary32 (converted per sample). With an ICC profile (vd_icc.dodo)
+// it holds the curve tables: three input curves of 256 entries (8-bit
+// samples) or 4097, and six more curves of 4097 entries for lookup-table
+// profiles, which every size below accommodates.
 fn vd_lut_size(sample: u32) -> usize {
     if sample == pixels.SAMPLE_U8 {
-        return 256
+        return 3 * 256 + 6 * (VD_ICC_STEPS + 1)
     }
     if sample == pixels.SAMPLE_F32 {
-        return 0
+        return VD_CURVES * (VD_ICC_STEPS + 1)
     }
     return 65536
 }
@@ -340,6 +383,11 @@ fn vd_sanitize(v: f32) -> f32 {
 
 fn vd_fill_lut(t: &VdColor, lut: &mut[f32]) {
     n := vd_lut_size(t.sample)
+    if t.sample == pixels.SAMPLE_U8 {
+        n = 256
+    } else if t.sample == pixels.SAMPLE_F32 {
+        n = 0
+    }
     for i in 0usize..n {
         v := 0.0f64
         if t.sample == pixels.SAMPLE_U8 {
@@ -371,6 +419,9 @@ fn vd_cbrt(x: f32) -> f32 {
 @inline
 fn vd_linear_sample(t: &VdColor, lut: &[f32], row: &[u8], x: usize, c: usize) -> f32 {
     index := x * t.channels + c
+    if t.icc {
+        return vd_icc_sample(t, lut, row, index, c)
+    }
     if t.sample == pixels.SAMPLE_U8 {
         return lut[row[index] as usize]
     }
@@ -382,8 +433,9 @@ fn vd_linear_sample(t: &VdColor, lut: &[f32], row: &[u8], x: usize, c: usize) ->
 }
 
 // XYB of one source pixel into xyb[at], xyb[at + plane], xyb[at + 2 * plane]
-// (X, Y, B).
-fn vd_pixel_xyb(t: &VdColor, lut: &[f32], row: &[u8], x: usize, xyb: &mut[f32], at: usize, plane: usize) {
+// (X, Y, B). `icc` is the embedded profile (lookup-table profiles read their
+// CLUT from it).
+fn vd_pixel_xyb(t: &VdColor, icc: &[u8], lut: &[f32], row: &[u8], x: usize, xyb: &mut[f32], at: usize, plane: usize) {
     if t.gray {
         v := vd_linear_sample(t, lut, row, x, 0)
         if t.hlg_exponent != 0.0 && v > 0.0 {
@@ -399,9 +451,20 @@ fn vd_pixel_xyb(t: &VdColor, lut: &[f32], row: &[u8], x: usize, xyb: &mut[f32], 
         xyb[at + 2 * plane] = yv
         return
     }
-    r := vd_linear_sample(t, lut, row, x, 0)
-    g := vd_linear_sample(t, lut, row, x, 1)
-    b := vd_linear_sample(t, lut, row, x, 2)
+    r := 0.0f32
+    g := 0.0f32
+    b := 0.0f32
+    if t.lut_profile {
+        rgb := [0.0f32; 3]
+        vd_icc_lut_pixel(t, icc, lut, row, x, &mut rgb)
+        r = rgb[0]
+        g = rgb[1]
+        b = rgb[2]
+    } else {
+        r = vd_linear_sample(t, lut, row, x, 0)
+        g = vd_linear_sample(t, lut, row, x, 1)
+        b = vd_linear_sample(t, lut, row, x, 2)
+    }
     if t.hlg_exponent != 0.0 {
         lum := t.luma[0] * r as f64 + t.luma[1] * g as f64 + t.luma[2] * b as f64
         if lum > 0.0 {
@@ -443,7 +506,7 @@ fn vd_pixel_xyb(t: &VdColor, lut: &[f32], row: &[u8], x: usize, xyb: &mut[f32], 
 // (w + 2 border) x (h + 2 border), coordinates clamped to the image (edge
 // replication, which is how the padding to whole blocks is filled too).
 // Planes have row stride `stride` and size `plane`.
-fn vd_load_xyb(source: &pixels.View, t: &VdColor, lut: &[f32], x0: usize, y0: usize, w: usize, h: usize, border: usize, xyb: &mut[f32], stride: usize, plane: usize) {
+fn vd_load_xyb(source: &pixels.View, t: &VdColor, icc: &[u8], lut: &[f32], x0: usize, y0: usize, w: usize, h: usize, border: usize, xyb: &mut[f32], stride: usize, plane: usize) {
     width := source.width() as usize
     height := source.height() as usize
     for yy in 0usize..h + 2 * border {
@@ -468,7 +531,7 @@ fn vd_load_xyb(source: &pixels.View, t: &VdColor, lut: &[f32], x0: usize, y0: us
             hi = width + border - x0
         }
         for xx in lo..hi {
-            vd_pixel_xyb(t, lut, row, x0 + xx - border, xyb, base + xx, plane)
+            vd_pixel_xyb(t, icc, lut, row, x0 + xx - border, xyb, base + xx, plane)
         }
         for xx in 0usize..lo {
             for c in 0usize..3 {

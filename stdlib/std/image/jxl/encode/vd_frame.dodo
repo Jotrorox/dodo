@@ -753,7 +753,7 @@ fn vd_max_encoded_size(width: u32, height: u32, layout: &pixels.Layout, options:
     exif := metadata.exif
     xmp := metadata.xmp
     plan := vd_plan(width, height, layout, options)
-    bound := vd_codestream_bound(&plan, layout)?
+    bound := pixels.checked(1, vd_codestream_bound(&plan, layout)?, icc_bound(metadata.icc.len)?)?
     prefix := container_prefix(options, exif, xmp, bound, needs_level10(width, height, layout))?
     return pixels.checked(1, bound, prefix)
 }
@@ -768,9 +768,7 @@ fn vd_scratch_size(width: u32, height: u32, layout: &pixels.Layout, options: &En
 fn vd_encode(source: &pixels.View, options: &EncodeOptions, metadata: &Metadata, output: &mut[u8], scratch_bytes: &mut[u8]) -> usize!pixels.Error {
     exif := metadata.exif
     xmp := metadata.xmp
-    if metadata.icc.len > 0 {
-        return err(pixels.Error.Unsupported)
-    }
+    icc := metadata.icc
     width := source.width()
     height := source.height()
     layout := source.layout()
@@ -833,8 +831,50 @@ fn vd_encode(source: &pixels.View, options: &EncodeOptions, metadata: &Metadata,
     vd_init_dct_tables(tdct)
     info := vd_header_color(&options.color, plan.color_channels == 1)
     col := vd_color(&info, layout)
-    vd_fill_lut(&col, lut)
-    wk := VdWork { wq: wq, wd: wd, nat: nat, t: tdct, lut: lut, xyb: scratch.f32s(b_xyb), cells: scratch.f32s(b_cells), mask: scratch.f32s(b_mask), mtmp: scratch.f32s(b_mtmp), ring: scratch.f32s(b_ring), qf: scratch.f32s(b_qf), acs: b_acs, qraw: scratch.i32s(b_qraw), qorig: scratch.i32s(b_qorig), coef: scratch.i16s(b_coef), glf: scratch.f32s(b_glf), tile: scratch.f32s(b_tile), cand: scratch.f32s(b_cand), cfl: [0i32; 32] }
+    if icc.len > 0 {
+        // The profile replaces the color encoding: its curves and colorants
+        // lead to XYB (matrix/TRC and gray profiles only).
+        check_icc(icc, plan.color_channels)?
+        if !vd_icc_model(icc, &mut col) {
+            return err(pixels.Error.Unsupported)
+        }
+        vd_fill_icc_lut(&col, icc, lut)
+    } else {
+        vd_fill_lut(&col, lut)
+    }
+
+    level10 := needs_level10(width, height, layout)
+    bound := pixels.checked(1, vd_codestream_bound(&plan, layout)?, icc_bound(icc.len)?)?
+    base := container_prefix(options, exif, xmp, bound, level10)?
+    if output.len < base {
+        return err(pixels.Error.BufferTooSmall)
+    }
+    shape := Shape { width: width, height: height, color_channels: plan.color_channels, alpha: plan.alpha, bits: plan.bits, float: plan.float, alpha_associated: plan.premultiplied, orientation: color.exif_value(&options.orientation), xyb: true }
+    // The image header and ICC profile first, while the HF histograms are
+    // free for the ICC coder; the writer state is kept for the frame.
+    header_pos := 0usize
+    header_acc := 0u64
+    header_count := 0u32
+    header_overflow := false
+    {
+        w := BitWriter.new(output, base)
+        write_image_header(&mut w, &shape, &info, icc.len > 0)
+        if icc.len > 0 {
+            let slice.SplitMut { left: icc_hist_bytes, right: icc_work_bytes } = scratch.split(b_hhist, scratch.size((ICC_CONTEXTS + 1) * MAX_ALPHA, 4)?)?
+            let slice.SplitMut { left: ring_bytes, right: icc_rest } = scratch.split(icc_work_bytes, scratch.size(ICC_RING_WORDS, 4)?)?
+            let slice.SplitMut { left: head_bytes, right: chain_bytes } = scratch.split(icc_rest, scratch.size(ICC_HEAD_WORDS, 4)?)?
+            no_ans := [0u16; 1]
+            icc_set := CodeSet.new(b_mmap, b_mlengths, scratch.u16s(b_mcodes), &mut no_ans[..0], ICC_CONTEXTS + 1, true, ICC_MIN_MATCH as u32)
+            if !write_icc(&mut w, icc, &mut icc_set, scratch.u32s(icc_hist_bytes), scratch.u32s(b_msums), scratch.u32s(b_mchoice), scratch.u32s(ring_bytes), scratch.u32s(head_bytes), scratch.u32s(chain_bytes)) {
+                return err(pixels.Error.Unsupported)
+            }
+        }
+        header_pos = w.pos
+        header_acc = w.acc
+        header_count = w.count
+        header_overflow = w.overflow
+    }
+    wk := VdWork { wq: wq, wd: wd, nat: nat, t: tdct, lut: lut, icc: icc, xyb: scratch.f32s(b_xyb), cells: scratch.f32s(b_cells), mask: scratch.f32s(b_mask), mtmp: scratch.f32s(b_mtmp), ring: scratch.f32s(b_ring), qf: scratch.f32s(b_qf), acs: b_acs, qraw: scratch.i32s(b_qraw), qorig: scratch.i32s(b_qorig), coef: scratch.i16s(b_coef), glf: scratch.f32s(b_glf), tile: scratch.f32s(b_tile), cand: scratch.f32s(b_cand), cfl: [0i32; 32] }
     lf := VdLf { lfp: scratch.i32s(b_lfp), meta: scratch.i32s(b_meta), lbi: scratch.i32s(b_lbi) }
     md := VdMod { hist: scratch.u32s(b_mhist), sums: scratch.u32s(b_msums), choice: scratch.u32s(b_mchoice), codes: scratch.u16s(b_mcodes), lengths: b_mlengths, map: b_mmap, ans: scratch.u16s(b_ans), tokens: scratch.u32s(b_tokens), tune: vd_tuned(&plan), ans_level: vd_ans_level(&plan), broken: false }
     hf := VdHf { hist: scratch.u32s(b_hhist), seeds: scratch.u32s(b_hseeds), sums: scratch.u32s(b_hsums), alone: scratch.f32s(b_halone), nearest: scratch.f32s(b_hnear), map: b_hmap, lengths: b_hlengths, codes: scratch.u16s(b_hcodes), mtf: b_mtf }
@@ -851,21 +891,13 @@ fn vd_encode(source: &pixels.View, options: &EncodeOptions, metadata: &Metadata,
     atree_values := [0u32; 2560]
     atree_tokens := atree.serialize(&mut atree_ctxs, &mut atree_values)
 
-    level10 := needs_level10(width, height, layout)
-    bound := vd_codestream_bound(&plan, layout)?
-    base := container_prefix(options, exif, xmp, bound, level10)?
-    if output.len < base {
-        return err(pixels.Error.BufferTooSmall)
-    }
-    shape := Shape { width: width, height: height, color_channels: plan.color_channels, alpha: plan.alpha, bits: plan.bits, float: plan.float, alpha_associated: plan.premultiplied, orientation: color.exif_value(&options.orientation), xyb: true }
     entries := vd_toc_entries(&plan)
     reserve := 4 * entries + 1
     toc_start := 0usize
     end := 0usize
     overflow := false
     {
-        w := BitWriter.new(output, base)
-        write_image_header(&mut w, &shape, &info, false)
+        w := BitWriter.resume(output, header_pos, header_acc, header_count, header_overflow)
         vd_write_frame_header(&mut w, &plan)
         toc_start = w.pos
         w.pos = toc_start + reserve
@@ -890,8 +922,7 @@ fn vd_encode(source: &pixels.View, options: &EncodeOptions, metadata: &Metadata,
     }
     if overflow {
         // Fits only without the TOC slack: write again with the TOC known.
-        w := BitWriter.new(output, base)
-        write_image_header(&mut w, &shape, &info, false)
+        w := BitWriter.resume(output, header_pos, header_acc, header_count, header_overflow)
         vd_write_frame_header(&mut w, &plan)
         for i in 0usize..entries {
             write_toc_entry(&mut w, sizes[i])

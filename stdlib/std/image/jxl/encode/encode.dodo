@@ -83,7 +83,12 @@ import "std/image/shared/scratch"
 // are linearized with the header's transfer curve (sRGB, linear, BT.709,
 // PQ, HLG, power laws), moved to sRGB primaries when needed, and turned into
 // XYB by libjxl's opsin matrix, bias and cube root; float and 16-bit
-// sources keep their precision up to that point. Per frame: a global quant
+// sources keep their precision up to that point. With an ICC profile
+// (vd_icc.dodo) the samples reach linear sRGB through the profile instead,
+// as a color management system reads it (its AToB lookup table, else its
+// matrix/TRC or gray curve; relative colorimetric via the D50 connection
+// space), and the header embeds the profile as libjxl does: decoders with
+// color management render XYB into it, std/image/jxl into sRGB. Per frame: a global quant
 // scale and LF quant from the distance (libjxl's formulas), default
 // dequantization matrices, x_qm_scale from the distance, Gaborish (effort 2+,
 // distance above 0.5) and EPF iterations (0 to 3 by distance) signalled as
@@ -199,8 +204,13 @@ pub struct Metadata {
     // ICC profile embedded in the image header (entropy coded, see
     // icc.dodo); it then describes the colors instead of
     // EncodeOptions.color. Must be an RGB profile for RGB(A) images and a
-    // gray one for gray(+alpha) images (else Unsupported). Empty for none;
-    // it does not need the container.
+    // gray one for gray(+alpha) images (else Unsupported). Lossy encoding
+    // converts the samples to XYB through the profile, which must then be
+    // a matrix/TRC profile (colorants and rTRC/gTRC/bTRC) or a gray kTRC
+    // profile with the XYZ connection space (else Unsupported; profiles
+    // that only have lookup tables are not supported); see vd_icc.dodo.
+    // icc_usable() checks both. Empty for none; it does not need the
+    // container.
     pub icc: &[u8]
 
     pub fn new(exif: &[u8], xmp: &[u8]) -> Metadata from(exif, xmp) {
@@ -407,6 +417,23 @@ pub fn icc_fits(icc: &[u8], layout: &pixels.Layout) -> bool {
     }
 }
 
+// Whether encode_with_metadata() accepts `icc` for an image in `layout`
+// with these options: icc_fits(), and for lossy encoding a matrix/TRC or
+// gray TRC profile (see Metadata.icc).
+pub fn icc_usable(icc: &[u8], layout: &pixels.Layout, options: &EncodeOptions) -> bool {
+    if !icc_fits(icc, layout) {
+        return false
+    }
+    if !options.is_lossy() {
+        return true
+    }
+    color_channels := 1usize
+    if layout.channel_count() >= 3 {
+        color_channels = 3
+    }
+    return vd_icc_usable(icc, color_channels)
+}
+
 // Scratch sizes in elements.
 fn plane_words(width: u32, height: u32, layout: &pixels.Layout) -> usize {
     gw := width as usize
@@ -463,7 +490,8 @@ pub fn encode(source: &pixels.View, options: &EncodeOptions, output: &mut[u8], s
 // encode() with EXIF and/or XMP boxes and/or an ICC profile; the output
 // uses the container when EXIF or XMP is present. Size the output with
 // max_encoded_size_with_metadata(). An ICC profile that does not match the
-// image's color channels (RGB or gray) gives Unsupported.
+// image's color channels (RGB or gray), or that lossy encoding cannot
+// convert from, gives Unsupported (see icc_usable()).
 pub fn encode_with_metadata(source: &pixels.View, options: &EncodeOptions, metadata: &Metadata, output: &mut[u8], scratch_bytes: &mut[u8]) -> usize!pixels.Error {
     return encode_boxes(source, options, metadata, output, scratch_bytes)
 }

@@ -6,7 +6,10 @@ DODO_LOSSY_DUMP pointing at a temporary directory, so every encoding is
 written as NAME.jxl next to our decoder's pixels (NAME.pam for integer
 samples, NAME.pfm for floats). Each file is then decoded with djxl and the
 two decoders must agree: within one 8-bit level for integer samples (257 in
-16-bit units), within 0.002 for floats, and exactly for alpha.
+16-bit units), within 0.002 for floats, and exactly for alpha. Files with
+an embedded ICC profile (names starting with "icc_") are XYB images whose
+color encoding is that profile: std/image/jxl outputs sRGB for them, so
+djxl is asked for sRGB too (its default would be linear sRGB).
 
 Usage: python3 tests/image/jxl_encode/verify_lossy.py [--keep DIR]
 Needs djxl (libjxl) on PATH; run `cargo build` first.
@@ -50,6 +53,12 @@ def read_pfm(path):
     return w, h, channels, list(values)
 
 
+def srgb_request(name, gray):
+    if not name.startswith("icc_"):
+        return []
+    return ["--color_space=" + ("Gra_D65_Rel_SRG" if gray else "RGB_D65_SRG_Rel_SRG")]
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--keep", help="dump directory to use and keep")
@@ -69,7 +78,7 @@ def main():
         if os.path.exists(ours_pam):
             reference = os.path.join(directory, name + ".djxl.pam")
             w, h, depth, maxval, ours = read_pam(ours_pam)
-            subprocess.run(["djxl", jxl, reference, "--quiet", "--bits_per_sample=%d" % (16 if maxval > 255 else 8)], check=True)
+            subprocess.run(["djxl", jxl, reference, "--quiet", "--bits_per_sample=%d" % (16 if maxval > 255 else 8)] + srgb_request(name, depth <= 2), check=True)
             rw, rh, rdepth, rmax, theirs = read_pam(reference)
             assert (w, h, depth) == (rw, rh, rdepth), (name, w, h, depth, rw, rh, rdepth)
             alpha = depth in (2, 4)
@@ -87,7 +96,7 @@ def main():
             ours_pfm = os.path.join(directory, name + ".pfm")
             reference = os.path.join(directory, name + ".djxl.pfm")
             w, h, channels, ours = read_pfm(ours_pfm)
-            subprocess.run(["djxl", jxl, reference, "--quiet"], check=True)
+            subprocess.run(["djxl", jxl, reference, "--quiet"] + srgb_request(name, channels == 1), check=True)
             rw, rh, rchannels, theirs = read_pfm(reference)
             assert (w, h, channels) == (rw, rh, rchannels), name
             worst = max(abs(a - b) for a, b in zip(ours, theirs))

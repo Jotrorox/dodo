@@ -203,6 +203,8 @@ struct VdWork {
     nat: &mut[u32]
     t: &mut[f32]
     lut: &mut[f32]
+    // The embedded ICC profile (empty for none).
+    icc: &[u8]
     // Group: bordered XYB planes, quant field scratch, masking field and
     // its scratch, Gaborish ring rows.
     xyb: &mut[f32]
@@ -244,7 +246,7 @@ fn vd_group(plan: &VdPlan, gi: usize) -> VdGroup {
 // searched again.
 fn vd_analyze_group(source: &pixels.View, plan: &VdPlan, col: &VdColor, wk: &mut VdWork, gi: usize, lf: &VdLf, cached: bool) {
     g := vd_group(plan, gi)
-    vd_load_xyb(source, col, wk.lut, g.x0, g.y0, g.bw * 8, g.bh * 8, VD_BORDER, wk.xyb, g.stride, g.plane)
+    vd_load_xyb(source, col, wk.icc, wk.lut, g.x0, g.y0, g.bw * 8, g.bh * 8, VD_BORDER, wk.xyb, g.stride, g.plane)
     blocks := g.bw * g.bh
     tiles_x := (g.bw + 7) / 8
     tiles_y := (g.bh + 7) / 8

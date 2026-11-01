@@ -99,7 +99,9 @@ pub fn metadata(data: &[u8]) -> meta.Metadata!pixels.Error {
 // The embedded ICC profile, decoded into `output` (PNG iCCP is inflated,
 // BMP profiles are copied, JPEG XL profiles are entropy-decoded); returns
 // its length, 0 when there is none. `scratch` needs icc_scratch_size(data)
-// bytes (zero except for JPEG XL).
+// bytes (zero except for JPEG XL). The profile is the one describing the
+// decoded pixels (info().color): lossy (XYB) JPEG XL files decode to sRGB,
+// so this returns 0 for them; jxl.icc() extracts their embedded profile.
 pub fn icc(data: &[u8], output: &mut[u8], scratch: &mut[u8]) -> usize!pixels.Error {
     header := info(data)?
     found := header.color.clone()
@@ -470,9 +472,11 @@ pub fn encode_with_metadata(format: pixels.Format, source: &pixels.View, options
             if options.keep_metadata && (exif.len > 0 || icc.len > 0) {
                 nothing := [0u8; 1]
                 profile := icc
-                if !jxl_encode.icc_fits(icc, source.layout()) {
+                if !jxl_encode.icc_usable(icc, source.layout(), &codec) {
                     // A profile JPEG XL cannot carry for this image (CMYK,
-                    // Lab, or the wrong channel count) is left out.
+                    // Lab, or the wrong channel count), or that lossy
+                    // encoding cannot convert from (lookup tables only), is
+                    // left out.
                     profile = &icc[..0]
                 }
                 boxes := jxl_encode.Metadata.with_icc(exif, &nothing[..0], profile)
