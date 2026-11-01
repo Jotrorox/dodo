@@ -13,7 +13,6 @@ import "std/embedded/chip/rp_watchdog"
 import "std/embedded/cortex_m"
 import "std/embedded/executor"
 import "std/embedded/hal"
-import "std/embedded/peripheral/designware_i2c"
 import "std/embedded/peripheral/pl011"
 import "std/embedded/peripheral/pl022"
 import "std/embedded/power"
@@ -395,8 +394,15 @@ fn protocol_checks<P, T>(pins: &mut P, timer: &mut T) {
     idle := true
     for _ in 0..100 {
         match target.poll(&mut buffer) {
-            designware_i2c.TargetEvent.Idle => {}
-            _ => {
+            ok(event) => {
+                match event {
+                    hal.I2cTargetEvent.Idle => {}
+                    _ => {
+                        idle = false
+                    }
+                }
+            }
+            err(_) => {
                 idle = false
             }
         }
@@ -1023,15 +1029,14 @@ fn dma_checks(dma: &mut rp_dma.Dma, pins: &mut chip.Pins, timer: &mut chip.Timer
     }
     pins.release_uart(port)
 
-    // A queued I2C read of an absent device: the program polls while the
+    // A polled I2C read of an absent device: the program polls while the
     // controller addresses it, about 100 us at 100 kHz.
     i2c := pins.i2c(board.I2C_SDA_PIN, board.I2C_SCL_PIN, hal.I2C_STANDARD_HZ)!
-    i2c.start_read(0x7C, 1)!
     byte: [1]u8 = [0]
     polls := 0u32
     absent := false
     for {
-        match i2c.poll_finish(&mut byte) {
+        match i2c.poll_read(0x7C, &mut byte) {
             ok(done) => {
                 if done {
                     break

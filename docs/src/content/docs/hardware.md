@@ -12,7 +12,7 @@ grouped under `std/embedded` in layers, on top of two small compiler packages:
 
 | Layer | Import | What it gives you |
 | --- | --- | --- |
-| Device protocols | `std/embedded/hal` | Pin, delay, I2C, SPI, and serial interfaces that drivers are written against. |
+| Device protocols | `std/embedded/hal` | Pin, delay, I2C, SPI, serial, PWM, analog, CAN, and I2S interfaces that drivers are written against, blocking and polling, with target (slave) sides, pulse capture, and DMA buffer transfers. |
 | Peripheral drivers | `std/embedded/peripheral/...` | I2C, SPI, and UART controller drivers, shared by every chip that contains the controller. |
 | Typed registers | `std/embedded/hal` | `hal.Reg<T>` and `hal.RegisterBlock` handles and mask constants for memory-mapped registers. |
 | Interrupts | `std/embedded/hal`, `std/embedded/cortex_m` | `@interrupt` handlers; `hal.Critical`, a section that masks interrupts until it is dropped; `hal.Handler`, a slot for a handler chosen at run time; the Cortex-M interrupt controller and SysTick. |
@@ -24,6 +24,7 @@ grouped under `std/embedded` in layers, on top of two small compiler packages:
 | Boards | `std/embedded/board` | The selected board: one `take()` and the same LED, pin, and timer fields on every board. |
 | Chip support | `std/embedded/chip` | The selected microcontroller's peripherals, for custom boards. |
 | Wireless chip | `std/embedded/wireless/cyw43` | The CYW43439 on the Pico 2 W: power-up, its gSPI bus, and its GPIO pins. |
+| CAN controllers | `std/embedded/can/mcp2515` | The MCP2515 CAN controller over SPI, as a `hal.Can`. |
 | Display panels | `std/embedded/display`, `.../display/st7789`, `.../display/ssd1306` | ST7789 colour and SSD1306 OLED panels as [graphics displays](graphics.md#display-panels), over SPI or I2C. |
 | Raw access | `core/mmio`, `core/cpu`, `asm(...)` | Volatile loads/stores, barriers, interrupt masking, `wfi`, inline assembly. |
 
@@ -100,7 +101,7 @@ methods implements it and can be passed where a driver expects it:
 | `hal.Spi` | `transfer(&mut self, bytes: &mut[u8]) -> void!hal.Error`<br>`write(&mut self, bytes: &[u8]) -> void!hal.Error` |
 | `hal.PwmOutput` | `max_duty(&self) -> u16`<br>`set_duty(&mut self, duty: u16) -> void!hal.Error` |
 | `hal.AnalogInput` | `max_value(&self) -> u16`<br>`read(&mut self) -> u16!hal.Error` |
-| Serial port | [`io.Reader` and `io.Writer`](io.md) from `std/io`. |
+| Serial port | [`io.Reader` and `io.Writer`](io.md) from `std/io`; `serial.Port` adds `flush(&mut self) -> void!io.Error`. |
 | `hal.Flash` | `capacity(&self) -> u32`, `erase_size(&self) -> u32`, `write_size(&self) -> u32`<br>`read(&mut self, offset: u32, buffer: &mut[u8]) -> void!hal.Error`<br>`erase(&mut self, offset: u32, length: u32) -> void!hal.Error`<br>`write(&mut self, offset: u32, bytes: &[u8]) -> void!hal.Error` |
 | `hal.Registers` | `read(&mut self, offset: usize) -> u32`<br>`write(&mut self, offset: usize, value: u32)` |
 
@@ -134,6 +135,12 @@ handler, and either calls `clear()`. Turning that interrupt on is
 chip-specific, as `listen` and `irq` are on the
 [RP2040 and RP2350](#an-interrupt-driven-driver); the protocol only sets
 times and reports them. An alarm has `now_us` too, so it is also a counter.
+
+More protocols follow below: [polling forms](#polling-instead-of-waiting)
+of the buses that never wait, [targets](#being-the-device-targets) for being
+the device on an I2C or SPI bus, [pulse measurement](#measuring-pulses),
+[CAN](#can), [I2S audio](#i2s-audio), and [DMA buffer
+transfers](#transfers-in-the-background-dma).
 
 Pins, delays, and counters cannot fail. Alarm, bus, PWM, and analog
 operations return
@@ -188,6 +195,12 @@ bus and a memory buffer.
 | `hal.set_pulse_us(&mut output, pulse_us, period_us)` | Set a PWM pulse length, as for a servo: `set_pulse_us(&mut servo, 1500, 20_000)` centres one on a 50 Hz output. |
 | `hal.read_millivolts(&mut input, reference_mv)` | Read an analog input as millivolts. |
 | `hal.SpiDevice<P>` | One SPI device and its chip-select pin; see below. |
+| `hal.BlockingI2c<B>`, `hal.BlockingSpi<B>` | The blocking protocol over a polling bus; see [polling](#polling-instead-of-waiting). |
+| `hal.capture(&mut input, polls)` | Wait for a pulse measurement. |
+| `hal.send_frame`, `hal.receive_frame` | Send or receive a CAN frame, waiting up to a number of polls. |
+| `hal.write_samples`, `hal.read_samples` | Move a whole slice of I2S samples, waiting for room or data. |
+| `hal.finish_transfer(&mut session)` | Wait for a DMA buffer transfer. |
+| `hal.dma_copy(&mut channel, &mut destination, &source)` | Copy memory with any DMA channel. |
 
 ### Timeouts and periodic work
 
@@ -271,6 +284,367 @@ fn main() {
     display.write(&mut bus, &pixels)!
 }
 ```
+
+### Polling instead of waiting
+
+The protocols above wait: `bus.write_read(...)` returns when the transaction
+is over. Firmware that runs several things at once, such as
+[executor tasks](#tasks-and-the-executor), cannot afford that, so the buses
+also come in polling forms that never wait:
+
+| Interface | Methods |
+| --- | --- |
+| `hal.I2cPoll` | `poll_write(&mut self, address: u8, bytes: &[u8]) -> bool!hal.Error`<br>`poll_read(&mut self, address: u8, buffer: &mut[u8]) -> bool!hal.Error`<br>`poll_write_read(&mut self, address: u8, bytes: &[u8], buffer: &mut[u8]) -> bool!hal.Error`<br>`cancel(&mut self)` |
+| `hal.SpiPoll` | `poll_transfer(&mut self, bytes: &mut[u8]) -> bool!hal.Error`<br>`poll_write(&mut self, bytes: &[u8]) -> bool!hal.Error`<br>`cancel(&mut self)` |
+| `serial.PollPort` | `poll_read(&mut self, buffer: &mut[u8]) -> io.Poll!io.Error`<br>`poll_write(&mut self, bytes: &[u8]) -> io.Poll!io.Error`<br>`poll_flush(&mut self) -> bool!io.Error` |
+
+Every call does what the hardware allows right now, such as topping up a
+FIFO or collecting received bytes, and returns `false` while the operation
+continues and `true` once it has finished. The first call starts the
+operation; later calls pass the same arguments until it finishes, fails, or
+is cancelled. The operation's state lives in the bus, not in borrowed
+buffers, so the buffers stay yours between polls and a transaction can be any
+length: an I2C controller holds the bus with SCL low between polls, which
+devices accept as clock stretching. A call with a different address or length
+while one runs is `InvalidInput` and leaves the running one alone. Errors are
+those of the blocking methods, and the operation is over after one. Serial
+ports follow the progress contract of [`std/io`](io.md): `poll_read` returns
+what has arrived and `poll_write` takes what fits, Pending otherwise.
+
+A task keeps its buffers in fields and returns Pending until the poll says
+`true`:
+
+```dodo test
+package sampler
+
+import "std/embedded/executor"
+import "std/embedded/hal"
+import "std/embedded/hal/fake"
+
+// Reads a 16-bit sensor register every 100 ms, never waiting for the bus.
+pub struct Sampler<B: hal.I2cPoll> {
+    bus: B
+    ticker: executor.Ticker
+    reading: bool
+    command: [1]u8
+    reply: [2]u8
+    last: u16
+
+    pub fn poll(&mut self, cx: &mut executor.Context) -> executor.Poll {
+        if self.ticker.ready(cx) {
+            self.reading = true
+        }
+        if self.reading {
+            match self.bus.poll_write_read(0x48, &self.command, &mut self.reply) {
+                ok(done) => {
+                    if done {
+                        self.reading = false
+                        self.last = ((self.reply[0] as u16) << 8) | self.reply[1] as u16
+                    } else {
+                        // Or wait for a signal from the bus's interrupt.
+                        cx.yield_now()
+                    }
+                }
+                err(_) => {
+                    self.reading = false
+                }
+            }
+        }
+        return executor.Poll.Pending
+    }
+}
+
+@test
+fn samples_across_polls() {
+    bus := fake.I2c.new(0x48)
+    bus.set_register(0x10, 0x01)
+    bus.set_register(0x11, 0x2C)
+    // Each transaction takes three polls.
+    bus.set_poll_steps(3)
+    sampler := Sampler { bus, ticker: executor.Ticker.every_ms(100), reading: false, command: [0x10], reply: [0, 0], last: 0 }
+    clock := fake.Clock.new()
+    tasks: [1]&mut dyn executor.Task = [&mut sampler]
+    runner := executor.Executor.new()
+    runner.run_until(&mut tasks, &mut clock, 150_000)
+    assert_eq(sampler.last, 300u16)
+}
+```
+
+A controller that implements only the polling form still serves blocking
+drivers: `hal.BlockingI2c.new(bus)` and `hal.BlockingSpi.new(bus)` implement
+`hal.I2c` and `hal.Spi` by polling until the transaction is over. They give up
+after `hal.DEFAULT_POLL_LIMIT` polls, cancelling the transaction and returning
+`Timeout`; `set_poll_limit(polls)` changes that and `hal.NO_POLL_LIMIT` waits
+forever. `bus()` reaches the wrapped bus and `release()` gives it back.
+`hal.SpiDevice` also polls: `poll_transfer`, `poll_write`, and
+`poll_write_read` keep the device selected from the first poll until the
+transaction ends, and `cancel` deselects it.
+
+Serial ports' protocols live in `std/embedded/hal/serial`, so that
+`std/embedded/hal` itself depends on no stream package: `serial.PollPort`
+above, and `serial.Port`, a serial port with `std/io`'s `read` and `write`
+and a `flush` that waits until the last byte has left the transmitter, for
+drivers that must know a reply was sent before they listen or power down.
+
+### Being the device: targets
+
+A microcontroller can also be the device that another master talks to. The
+address, mode, and frame size are set when the target is created; the
+protocols then move bytes:
+
+| Interface | Methods |
+| --- | --- |
+| `hal.I2cTarget` | `poll(&mut self, buffer: &mut[u8]) -> hal.I2cTargetEvent!hal.Error`<br>`respond(&mut self, bytes: &[u8]) -> usize!hal.Error` |
+| `hal.SpiTarget` | `queue(&mut self, bytes: &[u8]) -> usize!hal.Error`<br>`read(&mut self, buffer: &mut[u8]) -> usize!hal.Error` |
+
+`poll` reports what the master did, in order, without waiting:
+`hal.I2cTargetEvent.Write(count, start)` for bytes it wrote, now at the
+start of `buffer` (`start` marks the first byte after the address, such as a
+register number), `Stop` at the end of a transaction, `Read` when it reads,
+and `Idle` when nothing happened. A read holds the master, with SCL low,
+until `respond` answers it, so a slow program delays the master but loses
+nothing. An empty `respond` answers one `0xFF`, what the master would read
+from an idle bus. An SPI target `queue`s the bytes to shift out before the
+master clocks them, and `read` collects what the master sent; `Overrun` means
+bytes were lost.
+
+```dodo test
+package register_device
+
+import "std/embedded/hal"
+import "std/embedded/hal/fake"
+
+// A register device: the first byte of a write picks the register, later
+// bytes fill it, and reads continue from there.
+pub struct Registers {
+    memory: [16]u8
+    pointer: usize
+
+    pub fn serve<T: hal.I2cTarget>(&mut self, target: &mut T) -> void!hal.Error {
+        buffer: [16]u8 = [0; 16]
+        match target.poll(&mut buffer)? {
+            hal.I2cTargetEvent.Write(count, start) => {
+                first := 0usize
+                if start {
+                    self.pointer = buffer[0] as usize % 16
+                    first = 1
+                }
+                for index in first..count {
+                    self.memory[self.pointer] = buffer[index]
+                    self.pointer = (self.pointer + 1) % 16
+                }
+            }
+            hal.I2cTargetEvent.Read => {
+                answer: [1]u8 = [self.memory[self.pointer]]
+                target.respond(&answer)?
+                self.pointer = (self.pointer + 1) % 16
+            }
+            hal.I2cTargetEvent.Stop => {}
+            hal.I2cTargetEvent.Idle => {}
+        }
+        return ok()
+    }
+}
+
+@test
+fn answers_a_master() {
+    target := fake.I2cTarget.new()
+    write: [3]u8 = [4, 0xAB, 0xCD]
+    target.master_write(&write)
+    target.master_stop()
+    select: [1]u8 = [5]
+    target.master_write(&select)
+    target.master_read(1)
+    target.master_stop()
+    device := Registers { memory: [0; 16], pointer: 0 }
+    for !target.is_idle() {
+        device.serve(&mut target)!
+    }
+    assert_eq(target.master_received()[0], 0xCDu8)
+}
+```
+
+### Measuring pulses
+
+`hal.PwmInput` is the input side of PWM: it measures the pulses on a pin,
+such as a PWM signal's frequency and duty cycle, a fan's tachometer, or the
+pulse a servo or radio receiver channel sends. Like an output, it is
+configured when it is created, with how long one measurement may take, and
+measurements follow one another:
+
+| Interface | Methods |
+| --- | --- |
+| `hal.PwmInput` | `poll_capture(&mut self, capture: &mut hal.PulseCapture) -> bool!hal.Error` |
+
+A `hal.PulseCapture` holds `period_ns` and `high_ns`, averaged over `cycles`
+periods: hardware that timestamps edges measures single periods, hardware
+that counts edges over a window averages many. A line that did not change
+has `cycles` 0, with `high_ns` telling whether it stayed high. Its methods
+convert: `frequency_hz()`, `frequency_millihz()`, `duty(max)` (so
+`duty(100)` is a percentage, and `duty(output.max_duty() as u32)` copies the
+signal onto a PWM output), `high_us()`, and `period_us()`.
+`hal.capture(&mut input, polls)` waits for the next measurement.
+
+### CAN
+
+`hal.Can` sends and receives frames on a CAN bus. Bit rate, acceptance
+filters, and modes are set when a controller is created; both directions
+queue in the controller's buffers, so both methods return at once:
+
+| Interface | Methods |
+| --- | --- |
+| `hal.Can` | `poll_send(&mut self, frame: &hal.CanFrame) -> bool!hal.Error`<br>`poll_receive(&mut self, frame: &mut hal.CanFrame) -> bool!hal.Error`<br>`error_state(&mut self) -> hal.CanErrorState!hal.Error` |
+
+`poll_send` is false while every transmit buffer is full and `poll_receive`
+false while no frame waits. A controller that lost frames reports `Overrun`
+once, a bus-off controller refuses to send with `Bus`, and a classic
+controller refuses CAN FD frames with `Unsupported`. `error_state()` tells
+where the controller stands: `Active`, `Passive` after many errors, or
+`BusOff`. `hal.send_frame(&mut can, &frame, polls)` and
+`hal.receive_frame(&mut can, &mut frame, polls)` wait, up to a number of
+polls.
+
+A `hal.CanFrame` is a value a program keeps and reuses. Its fields are
+checked as they are set, so every frame is one a controller can send:
+`CanFrame.standard(id, bytes)` and `CanFrame.extended(id, bytes)` make
+classic data frames, and `set_data`, `set_remote` (a request for data), and
+`set_fd` (up to 64 bytes, optionally at the faster data bit rate) change one;
+an identifier too large for its kind or too many bytes is `InvalidInput`.
+`id()`, `is_extended()`, `is_remote()`, `is_fd()`, `len()`, `dlc()`, and
+`bytes()` read it. `hal.CanFilter` describes an acceptance filter (an
+identifier, a mask, and the kind), which controllers program into their
+hardware: `CanFilter.exact(id, extended)` passes one identifier and
+`CanFilter.all(extended)` everything of a kind.
+
+Controller drivers share the arithmetic of bit timing:
+`hal.can_timing(clock_hz, bitrate, sample_point_permille, &limits)` finds the
+prescaler and segments for a bit rate within a controller's
+`hal.CanTimingLimits`, preferring the exact rate, the sample point closest to
+the one asked for (875 per mille is CiA's recommendation), and the most time
+quanta, and returns a `hal.CanBitTiming` that each driver encodes into its
+own registers. `hal.can_dlc_length` and `hal.can_length_dlc` convert between
+data length codes and lengths.
+
+```dodo test
+package can_echo
+
+import "std/embedded/hal"
+import "std/embedded/hal/fake"
+
+// Answers every request on 0x100 with its first byte plus one, on 0x101.
+pub fn serve<C: hal.Can>(can: &mut C) -> void!hal.Error {
+    frame := hal.CanFrame.new()
+    for can.poll_receive(&mut frame)? {
+        if frame.id() == 0x100 && frame.len() >= 1 {
+            reply: [1]u8 = [frame.bytes()[0] + 1]
+            answer := hal.CanFrame.standard(0x101, &reply)?
+            hal.send_frame(can, &answer, hal.DEFAULT_POLL_LIMIT)?
+        }
+    }
+    return ok()
+}
+
+@test
+fn answers_requests() {
+    can := fake.Can.new()
+    request := hal.CanFrame.standard(0x100, b"\x07")!
+    can.inject(&request)
+    serve(&mut can)!
+    assert_eq(can.sent_count(), 1usize)
+    assert_eq(can.sent(0).bytes()[0], 8u8)
+}
+```
+
+#### CAN controllers on SPI
+
+`std/embedded/can/mcp2515` drives the Microchip MCP2515, the stand-alone
+CAN controller on most add-on CAN boards, over any SPI bus. Its `Controller`
+owns the bus and a chip-select pin and implements `hal.Can`, so CAN drivers
+run unchanged on boards such as the Pico, whose chip has no CAN controller:
+
+```dodo
+spi := b.pins.spi(board.SPI_CLOCK_PIN, board.SPI_TX_PIN, some(board.SPI_RX_PIN), hal.SpiMode.Mode0, 8_000_000)!
+select := b.pins.output(board.SPI_SELECT_PIN)!
+config := mcp2515.Config.new(16_000_000, 500_000)   // crystal, bit rate
+filters: [1]hal.CanFilter = [hal.CanFilter.all(false)]
+can := mcp2515.Controller.new(spi, select, &config, &filters)!
+```
+
+`Config` holds the board's crystal frequency (usually 8 or 16 MHz), the bit
+rate, the sample point (875 per mille unless changed), the mode (`Normal`,
+`Loopback`, or `ListenOnly`), and whether frames are sent once without
+retrying. Startup resets the chip, programs the bit timing and filters, and
+switches modes; a bit rate the crystal cannot reach is `InvalidInput`, and a
+missing chip `Timeout`. `mcp2515.timing(crystal, bitrate, sample_point)`
+shows the register values, and `release()` gives the bus and pin back.
+`Controller.new` drops them if startup fails; `attach` and `configure` keep
+them.
+
+The chip has two receive buffers, one with a mask and two filters, the other
+with a mask and four. The driver groups the given filters by their mask, so
+at most two masks fit, with at most two filters on one and four on the
+other; a standard and an extended filter share a mask when they cover the
+same identifier bits. No filters accept everything. The buffers roll over,
+so two frames wait in the chip before one is lost, and `poll_receive`
+returns them oldest first and reports a lost one as `Overrun`, once.
+`poll_send` queues a frame in one of three transmit buffers, and frames
+leave in the order they were queued. On a bus where no other node
+acknowledges, frames stay queued, so `hal.send_frame` times out;
+`abort_pending()` empties the queue. `tec()` and `rec()` read the error
+counters, and FD frames are `Unsupported`.
+
+Wire the chip's INT pin to a GPIO and call `can.listen(mcp2515.RECEIVE)`: a
+task then waits for the pin's falling edge and calls `poll_receive` until it
+returns false, which releases INT. `TRANSMIT` and `ERROR` interrupts stay
+raised until `acknowledge` clears them.
+
+### I2S audio
+
+`hal.I2sOutput` and `hal.I2sInput` stream audio samples to a DAC or
+amplifier and from a microphone or ADC. Sample rate, resolution, channels,
+and the framing (`hal.I2sFormat.Philips`, `LeftJustified`, or
+`RightJustified`) are set when a stream is created:
+
+| Interface | Methods |
+| --- | --- |
+| `hal.I2sOutput` | `sample_rate(&self) -> u32`, `channels(&self) -> u32`<br>`poll_write(&mut self, samples: &[i32]) -> usize!hal.Error` |
+| `hal.I2sInput` | `sample_rate(&self) -> u32`, `channels(&self) -> u32`<br>`poll_read(&mut self, samples: &mut[i32]) -> usize!hal.Error` |
+
+Samples are `i32` values with the audio in the most significant bits, so
+full scale is the same at every resolution: a 16-bit sample is `value << 16`
+(`hal.sample_from_i16` and `hal.sample_to_i16` convert). Stereo samples
+interleave, left first, and both methods move whole frames only, returning
+how many samples they took; a slice that is not whole frames is
+`InvalidInput`. An output plays silence when its queue runs dry, so a task
+keeps it topped up; an input reports `Overrun` once if samples were lost.
+`hal.write_samples` and `hal.read_samples` wait until a whole slice has
+moved.
+
+### Transfers in the background (DMA)
+
+`hal.DmaChannel` (see [DMA in drivers](#dma-in-drivers)) is what peripheral
+drivers start transfers on. Device drivers work one level up, with a session
+that holds a buffer and moves it while the program does other work:
+
+| Interface | Methods |
+| --- | --- |
+| `hal.DmaBuffer` | `buffer(&mut self) -> &mut[u8]!hal.Error`, `capacity(&self) -> usize`<br>`start(&mut self, count: usize) -> void!hal.Error`<br>`poll_finish(&mut self) -> bool!hal.Error`, `abort(&mut self)` |
+| `hal.SpiDma` | the same, with `start_transfer(count)` (exchange in place) and `start_write(count)` (send only) instead of `start` |
+
+The session lends its buffer out only between transfers (`buffer()` is
+`Busy` while one runs), so the program never touches memory a transfer is
+moving. Fill it, `start` a transfer, and poll `poll_finish` until it is
+true; `Bus` and `Overrun` report failed transfers. A display driver written
+against `hal.SpiDma` streams frames on any chip whose SPI bus has DMA, and
+on a desktop against a fake. `hal.finish_transfer(&mut session)` waits.
+
+`hal.DmaStream` is the session every DMA-backed peripheral driver needs,
+written once against `hal.DmaChannel`: `DmaStream.transmit(&mut channel,
+&mut buffer, register, width)` sends a buffer to a peripheral's data register
+whenever the peripheral asks for data, `DmaStream.receive(...)` fills one from
+it, and the stream implements `hal.DmaBuffer`. The peripheral's driver turns
+the peripheral's DMA requests on and off around it. `hal.dma_copy(&mut
+channel, &mut destination, &source)` copies memory with any channel.
 
 ## A complete driver
 
@@ -411,11 +785,18 @@ which pins can carry which bus.
 | `fake.Pin` | An input/output pin, initially low. | `is_high()`, `changes()` |
 | `fake.Delay` | A delay that returns at once, and a counter whose time is the delays so far. | `elapsed_us()`, `now_us()` |
 | `fake.Alarm` | An alarm on a counter that starts at 0 and moves only on `advance`. It reaches any time ahead. | `advance(us)`, `is_armed()`, `target_us()`, `schedules()`, `fail_next(error)` |
-| `fake.I2c` | One device at an address with 256 numbered registers and an auto-incrementing register pointer. Other addresses report `NoAcknowledge`. | `register(n)`, `set_register(n, v)`, `fail_next(error)` |
-| `fake.Spi` | A bus that records sent bytes and answers from a programmed reply. | `sent()`, `clear()`, `reply_with(bytes)` |
-| `fake.Serial` | A serial port, the `std/io` Reader and Writer: it records what is written and reads back bytes given to `feed`, then reports end of input; `poll_read` reports Pending instead. | `sent()`, `clear()`, `feed(bytes)` |
+| `fake.I2c` | One device at an address with 256 numbered registers and an auto-incrementing register pointer. Other addresses report `NoAcknowledge`. Also `hal.I2cPoll`: a polled transaction takes `set_poll_steps(n)` polls. | `register(n)`, `set_register(n, v)`, `fail_next(error)`, `set_poll_steps(n)`, `cancels()` |
+| `fake.Spi` | A bus that records sent bytes and answers from a programmed reply. Also `hal.SpiPoll`, moving `set_poll_chunk(n)` bytes per poll. | `sent()`, `clear()`, `reply_with(bytes)`, `set_poll_chunk(n)`, `polls()` |
+| `fake.Serial` | A serial port, `serial.Port` and `serial.PollPort`: it records what is written and reads back bytes given to `feed`, then reports end of input; `poll_read` reports Pending instead. | `sent()`, `clear()`, `feed(bytes)`, `set_write_room(n)`, `set_flush_polls(n)`, `flushes()` |
 | `fake.Pwm` | A PWM output with a given `max_duty`, initially at duty 0. | `duty()`, `changes()`, `fail_next(error)` |
 | `fake.Analog` | An analog input with a given `max_value` that reads the value given to `set`, after any given to `queue`, one per read. | `set(value)`, `queue(values)`, `reads()`, `fail_next(error)` |
+| `fake.I2cTarget` | An I2C target and the master that talks to it, played by the test: the master's writes, reads, and STOPs come out of `poll` in order. | `master_write(bytes)`, `master_read(count)`, `master_stop()`, `master_received()`, `is_idle()`, `fail_next(error)` |
+| `fake.SpiTarget` | An SPI target and the master that clocks it. | `master_exchange(bytes)`, `queued()` |
+| `fake.PwmInput` | A pulse input that reports queued measurements, one per poll. | `queue(period_ns, high_ns, cycles)`, `queue_signal(hz, percent)`, `fail_next(error)` |
+| `fake.Can` | A CAN controller on a simulated bus: it records frames sent and receives injected ones, optionally its own. | `inject(&frame)`, `sent_count()`, `sent(n)`, `waiting()`, `set_loopback(on)`, `set_transmit_room(n)`, `drain_transmit()`, `set_error_state(state)`, `fail_next(error)`; `new_fd()` for CAN FD |
+| `fake.I2sOutput`, `fake.I2sInput` | Audio streams that record what is played, or deliver what is fed, a limited number of samples per poll. | `played()`, `total()`, `feed(samples)`, `set_room(n)`, `drop_samples()` |
+| `fake.DmaBuffer` | A DMA buffer session, transmitting or receiving, whose transfers finish after a number of polls. | `sent()`, `feed(bytes)`, `set_poll_steps(n)`, `fail_next(error)` |
+| `fake.DmaChannel` | A DMA channel that runs transfers in host memory, for testing code written against `hal.DmaChannel`, such as `hal.DmaStream`. | `set_busy_polls(n)`, `set_max_count(n)`, `starts()`, `aborts()`, `fail_next()` |
 | `fake.Clock` | The [executor](#tasks-and-the-executor)'s clock, and a counter: time jumps ahead when the executor sleeps, and simulated interrupts raise signals. | `now_us()`, `interrupt_at(time, &signal)`, `advance(us)`, `sleeps()`, `idle_us()` |
 
 `fail_next` makes the next I2C transaction, duty change, analog read, or
@@ -1041,7 +1422,7 @@ runs a blinking LED, a debounced button, and such a serial console together.
 | Timer alarm | `alarm.listen()` | `alarm.clear()`. An alarm used as the executor's clock is busy. |
 | USB serial port | `serial.set_signal(&SIGNAL)`: the port's own interrupt handler raises it | Nothing to acknowledge: read with `poll_read` until it is Pending. |
 | DMA channel | `channel.set_signal(&SIGNAL)`: the runtime's `DMA_IRQ_0` handler raises it when a transfer ends | Nothing to acknowledge: check the transfer, for example with `is_busy()`. |
-| Queued I2C transaction | `bus.listen()`: the transaction's STOP or abort raises `I2C0_IRQ` or `I2C1_IRQ` | `bus.poll_finish(&mut buffer)` collects it, which ends the condition. |
+| Polled I2C transaction | `bus.listen()`: `I2C0_IRQ` or `I2C1_IRQ` whenever a poll can move bytes or the transaction has ended | The next `poll_*` call, which deals with the condition and sets the mask for the next one. |
 
 Several pins share `IO_IRQ_BANK0`, so give them one signal and let each
 task check its own pin's `events()`: raising wakes every waiting task.
@@ -1557,33 +1938,42 @@ bus again.
 
 #### Transactions that run in the background
 
-The blocking methods return when the transaction is over. A transaction that
-fits the controller's FIFO, 16 commands on both chips (`queue_depth()`, one
-per byte written and one per byte read), can instead be queued at once: the
-controller runs it while the program does other work, and `poll_finish`
-collects the outcome without waiting:
+The blocking methods return when the transaction is over. Both buses also
+implement the [polling forms](#polling-instead-of-waiting): an I2C bus
+`hal.I2cPoll` and an SPI bus `hal.SpiPoll`, which run the same transactions,
+of any length, while the program does other work. Each call moves the bytes
+received so far into the buffer and refills the controller's FIFO, and
+returns false while the transaction runs and true once it has ended:
 
 ```dodo
 register: [1]u8 = [0x0F]
-i2c.start_write_read(0x48, &register, 2)!
-reply: [2]u8 = [0, 0]
-for !i2c.poll_finish(&mut reply)! {
+reply: [32]u8 = [0; 32]
+for !i2c.poll_write_read(0x48, &register, &mut reply)! {
     // other work
 }
 ```
 
-`start_write(address, bytes)`, `start_read(address, count)`, and
-`start_write_read(address, bytes, count)` queue the three kinds of
-transaction. `poll_finish(&mut buffer)` returns false while the controller
-works, and true once the transaction has ended, with the bytes read in the
-buffer; its errors are those of the blocking methods. Until then the bus is
-`is_busy()`, and every other transaction on it is `Busy`. A task waits for
-the end with the controller's interrupt: `listen()` raises `I2C0_IRQ` or
-`I2C1_IRQ` at the STOP or an abort, and a handler masks it and raises a
-signal, as in [waking tasks from interrupts](#waking-tasks-from-interrupts).
-A transaction never ends while a device holds SCL low: bound the wait with
-an `executor.Timer` and `cancel()` it, which aborts it and disables the
-controller as a stuck blocking transfer does.
+Between polls an I2C controller holds SCL low, which every device accepts as
+clock stretching, so a slow program loses nothing, but a transaction that is
+never polled again keeps the bus. `is_busy()` is true while one runs, and
+blocking calls and `set_frequency` on the bus are `Busy` meanwhile. A
+transaction never ends while a device holds SCL low: bound the wait with an
+`executor.Timer` and call `cancel()`, which aborts it and disables the
+controller as a stuck blocking transfer does; `hal.BlockingI2c` does the
+same after a number of polls. Devices with 10-bit addresses have
+`poll_write_ten_bit`, `poll_read_ten_bit`, and `poll_write_read_ten_bit`. An
+SPI bus moves at most a FIFO's worth of frames per poll and the clock simply
+stops in between; its `cancel()` waits for the frames already queued.
+
+A task waits with the I2C controller's interrupt. After `listen()`,
+`I2C0_IRQ` or `I2C1_IRQ` is raised whenever the next poll can make progress:
+the transmit FIFO is half empty while bytes remain to send, the receive FIFO
+is half full, or the transaction ended with a STOP or an abort. Each poll
+sets the controller's mask for what it waits on next, and an idle bus raises
+nothing. The condition lasts until a poll deals with it, so a handler masks
+the interrupt in the NVIC and raises a signal, and the task, once woken,
+polls and enables it again, as in
+[waking tasks from interrupts](#waking-tasks-from-interrupts).
 
 #### Answering another master
 
@@ -1599,7 +1989,6 @@ package main
 
 import "std/embedded/board"
 import "std/embedded/hal"
-import "std/embedded/peripheral/designware_i2c"
 
 // A register device at 0x42: the first byte of a write picks the
 // register, later bytes fill it, and reads continue from there.
@@ -1610,8 +1999,8 @@ fn main() {
     pointer := 0usize
     buffer: [16]u8 = [0; 16]
     for {
-        match target.poll(&mut buffer) {
-            designware_i2c.TargetEvent.Write(count, start) => {
+        match target.poll(&mut buffer)! {
+            hal.I2cTargetEvent.Write(count, start) => {
                 first := 0usize
                 if start {
                     pointer = buffer[0] as usize % 16
@@ -1622,8 +2011,8 @@ fn main() {
                     pointer = (pointer + 1) % 16
                 }
             }
-            designware_i2c.TargetEvent.Read => {
-                target.respond(&memory[pointer..pointer + 1])
+            hal.I2cTargetEvent.Read => {
+                target.respond(&memory[pointer..pointer + 1])!
                 pointer = (pointer + 1) % 16
             }
             _ => {}
@@ -1632,8 +2021,13 @@ fn main() {
 }
 ```
 
-`respond` can queue several bytes at once; what the master does not read is
-dropped when it next reads. Addresses that the I2C specification reserves
+The targets implement [`hal.I2cTarget` and
+`hal.SpiTarget`](#being-the-device-targets), so a device emulation written
+against them runs on any chip and against fakes. The controller holds SCL
+low while its receive FIFO is full, so written bytes are never lost and
+`poll` does not fail in practice; it would report `Overrun` if bytes were
+dropped. `respond` can queue several bytes at once; what the master does not
+read is dropped when it next reads. Addresses that the I2C specification reserves
 (7-bit `0x00` to `0x07` and `0x78` to `0x7F`) are `InvalidInput`, and general
 calls are not acknowledged.
 
@@ -1714,7 +2108,7 @@ pulled up and nothing is sent, and `flush()` waits as long.
 | --- | --- |
 | Speed | From 120 baud (144 on the RP2350) up to a sixteenth of the system clock: 7.8 Mbaud on the RP2040, 9.4 Mbaud on the RP2350. `baud()` reports the rate the divider makes, within 0.1 % up to 921600 baud (`115_207` for `115_200`). |
 | Changing it | `set_baud(baud)`, and `set_format(data_bits, parity, stop_bits)` for 5 to 8 data bits, `pl011.Parity.None`, `Even`, or `Odd`, and 1 or 2 stop bits. Both wait until everything written is out. |
-| Writing | `write` waits while the 32-byte transmit FIFO is full and returns once the last byte is queued; `flush()` waits until it has left. `poll_write` queues what fits without waiting. A write or `flush()` that makes no progress for `pl011.DEFAULT_POLL_LIMIT` status polls (around a second), as when flow control holds the transmitter, fails with `TimedOut` and the bytes queued before it; `set_poll_limit(polls)` changes the limit, `pl011.NO_POLL_LIMIT` removes it. |
+| Writing | `write` waits while the 32-byte transmit FIFO is full and returns once the last byte is queued; `flush()` waits until it has left. `poll_write` queues what fits and `poll_flush()` tells whether the last byte has left, both without waiting; ports implement `serial.Port` and `serial.PollPort`. A write or `flush()` that makes no progress for `pl011.DEFAULT_POLL_LIMIT` status polls (around a second), as when flow control holds the transmitter, fails with `TimedOut` and the bytes queued before it; `set_poll_limit(polls)` changes the limit, `pl011.NO_POLL_LIMIT` removes it. |
 | Reading | `read` waits for the first byte, as long as it takes unless `set_read_poll_limit(polls)` bounds it (then `TimedOut`), then returns what has arrived; a serial port never reaches end of input. `poll_read` returns at once, `Pending` while nothing has arrived. Nothing buffers beyond the 32-byte receive FIFO, so read at least every 32 bytes' time (2.8 ms at 115200 baud) while data arrives. |
 | Errors | A read fails with an `io.Error` of kind `Other` whose `code` holds `pl011.FRAMING_ERROR`, `PARITY_ERROR`, `BREAK`, or `OVERRUN`, after the good bytes before it (`transferred`). Bytes with framing or parity errors, and breaks, are dropped; an overrun means bytes were lost because the receive FIFO was full. The next read continues. |
 | Terminals | `set_crlf(true)` writes `"\n"` as `"\r\n"` and reads the CR that Enter sends, alone or followed by LF, as one `"\n"`, so `io.read_line` ends at Enter. Off at first, so binary protocols get their bytes unchanged. Terminals do not show what is typed unless the program echoes it. |
@@ -1790,7 +2184,7 @@ is a small command line over USB.
 
 | | USB serial port |
 | --- | --- |
-| Writing | `write` queues its bytes and returns. While no terminal has the port open, the first 1024 bytes (`rp_usb.TX_CAPACITY`) wait for one and the rest are dropped, so the start of the output, such as a banner printed at startup, is shown when a terminal opens it. While one has it open, a full queue waits for the host, and output the host does not take within 100 ms is dropped. Printing never stops the program and never fails. `flush()` waits until the host has taken everything, within the same limit; `poll_write` queues what fits. |
+| Writing | `write` queues its bytes and returns. While no terminal has the port open, the first 1024 bytes (`rp_usb.TX_CAPACITY`) wait for one and the rest are dropped, so the start of the output, such as a banner printed at startup, is shown when a terminal opens it. While one has it open, a full queue waits for the host, and output the host does not take within 100 ms is dropped. Printing never stops the program and never fails. `flush()` waits until the host has taken everything, within the same limit; `poll_write` queues what fits and `poll_flush()` tells whether the host has taken it all. The port implements `serial.Port` and `serial.PollPort`. |
 | Reading | `read` waits for the first byte, then returns what has arrived; `poll_read` returns at once, `Pending` while nothing has. Up to 256 bytes (`rp_usb.RX_CAPACITY`) are kept; beyond that the host waits until the program reads, so no input is lost. `available()` counts what is waiting. |
 | Terminals | Newline translation is on at first, unlike on a UART: `"\n"` goes out as `"\r\n"`, and the CR that Enter sends, alone or followed by LF, reads as `"\n"`. `set_crlf(false)` passes binary data unchanged. |
 | Connection | `is_connected()` is true while a program on the host has the port open (DTR set, as terminals do); `is_configured()` while the host has enumerated the board. `line_state()` returns `rp_usb.DTR` and `rp_usb.RTS`, and `baud()` the rate the host set, for a bridge to a UART. |
@@ -1919,6 +2313,41 @@ clk_sys. For a divider and TOP of your own,
 slice once neither output is in use. The two outputs of a slice write only
 their own bits of the registers they share, so one can be kept by an
 interrupt handler and the other by the main program.
+
+`pins.pwm_input(pin, window_us)` measures the signal on an odd GPIO, input B
+of PWM slice (n / 2) % 8: its frequency, duty cycle, and pulse length, as for
+a servo or RC receiver signal, a fan's tachometer, or another board's PWM
+output. It returns an `rp_pwm.PwmCapture`, which implements
+[`hal.PwmInput`](#measuring-pulses). The input uses the slice's counter, so
+the slice's other pin cannot be a PWM output meanwhile: `pwm_input` is
+`Busy` if either output is in use, and outputs on that slice are `Busy` while
+the input exists. Even pins are `InvalidInput`. `release_pwm_input` gives the
+pin and slice back.
+
+```dodo
+input := b.pins.pwm_input(15, 100_000)!   // 100 ms windows
+servo := hal.capture(&mut input, hal.DEFAULT_POLL_LIMIT)!
+pulse := servo.high_us()                  // about 1000 to 2000
+```
+
+A slice cannot timestamp edges, so it counts over windows of `window_us`,
+two per measurement, one right after the other: first rising edges, then
+clk_sys cycles while the pin is high, over a whole number of the periods it
+just measured. Polls note when the edge count changes, so a program that
+polls often gets the period to within a few microseconds over the whole
+window; one that polls once per window gets it to within one period per
+window. Choose a window spanning at least a few periods of the slowest
+signal: 10 ms for 25 kHz fan PWM or 1 kHz, 50 ms for a 100 Hz tachometer,
+100 ms for a 50 Hz servo. Windows reach 134 ms on the RP2040 and 111 ms on
+the RP2350 (`rp_pwm.max_window_us`). Fewer than two rising edges in a
+window, or a line that does not change, reads as a steady line: `cycles` is
+0 and `duty` shows the share of time it was high. Fast signals are counted
+through a prescaler that adapts by itself, so a sudden jump in frequency
+costs a window or two; `poll_capture` returns `Overrun` for a count that
+wrapped beyond recovery, a signal near half of clk_sys or polls more than
+about three windows apart, and the next measurement then starts. The pin is
+pulled down, so an unconnected input reads as a steady low line; a fan's
+open-collector tachometer needs a pull-up of 10 kΩ or less to 3.3 V.
 
 `pins.analog(pin)` claims GPIO 26 to 29, ADC inputs 0 to 3, and returns an
 `rp_adc.Analog`, which implements `hal.AnalogInput`: each `read()` converts
@@ -2068,6 +2497,53 @@ interrupt handler and another by the main program.
 [`examples/ws2812.dodo`](https://github.com/Jotrorox/dodo/blob/main/examples/ws2812.dodo)
 drives a strip of WS2812 LEDs this way.
 
+### I2S audio on the RP2040 and RP2350
+
+Neither chip has an I2S peripheral, so `std/embedded/chip/rp_i2s` makes one
+from a [PIO](#pio-on-the-rp2040-and-rp2350) state machine. An
+`rp_i2s.Output` plays samples to a DAC or amplifier such as the PCM5102 or
+MAX98357A and implements [`hal.I2sOutput`](#i2s-audio); an `rp_i2s.Input`
+records an I2S microphone or ADC such as the INMP441 and implements
+`hal.I2sInput`. Both drive the bit clock (BCLK) and word select (LRCLK):
+BCLK is GPIO `clock` and LRCLK the GPIO after it, and DATA any other pin.
+Give all three to the block first:
+
+```dodo
+pio := b.pins.pio(0)!
+b.pins.pio_pins(&pio, 9, 3)!             // DATA 9, BCLK 10, LRCLK 11
+config := rp_i2s.Config.new(48_000, 16, 2, hal.I2sFormat.Philips)
+output := rp_i2s.Output.new(&mut pio, 9, 10, &config)!
+hal.write_samples(&mut output, &samples, hal.NO_POLL_LIMIT)!
+```
+
+A frame always has two slots on the wire, left then right: a mono output
+sends each sample in both, and a mono input keeps the slot `config.channel`
+names. Slots are 32 bit clocks, or 16 with `config.slot_bits = 16` for
+16-bit samples, so BCLK runs at `sample_rate × 2 × slot_bits`. The state
+machine spends four cycles per bit, divided down from clk_sys in 1/256
+steps; `output.timing()` reports the rate actually produced and its error in
+parts per million. At 125 MHz, 48 kHz comes out 64 ppm fast; a 150 MHz
+RP2350 makes 48 kHz exactly. Philips, left-justified, and right-justified
+framing are supported; a 24-bit sample sits in the top bits of its 32-bit
+slot, or the bottom bits when right-justified.
+
+The joined FIFO holds eight words: four frames in 32-bit slots, eight in
+16-bit slots. `poll_write` queues as many whole frames as fit, so a task
+tops it up, or a buffer plays without the processor: `output.pack(&samples,
+buffer)` fills a word-aligned buffer in the wire format and
+`output.dma(&mut channel, buffer)` returns a
+[`hal.DmaStream`](#transfers-in-the-background-dma) paced by the state
+machine. When the queue runs dry the output keeps its clocks running and
+sends silence a whole frame at a time, so left and right never swap. The
+input instead pauses its clocks when the program falls behind; the next
+`poll_read` reports `Overrun` once and drops what was queued, and some
+microphones need a few milliseconds to wake after their clock stops.
+
+An output takes 17 instruction slots (10 with 16-bit slots) and an input 8,
+so both fit in one block. `release(&mut pio)` stops the stream, gives back
+its state machine, and frees the program's slots; the pins stay with the
+block until `pins.release_pio`.
+
 ### DMA on the RP2040 and RP2350
 
 Both chips have a DMA controller, 12 channels on the RP2040 and 16 on the
@@ -2119,7 +2595,9 @@ every claimed channel before it writes to the serial ports.
 
 `bus.dma(&mut tx, &mut rx, &mut buffer)` returns a `pl022.DmaBus` that
 sends from and receives into `buffer`, `tx` feeding the transmit FIFO and
-`rx` emptying the receive FIFO:
+`rx` emptying the receive FIFO. It implements
+[`hal.SpiDma`](#transfers-in-the-background-dma), so device drivers written
+against that protocol use it unchanged:
 
 ```dodo
 spi := b.pins.spi(board.SPI_CLOCK_PIN, board.SPI_TX_PIN, some(board.SPI_RX_PIN), hal.SpiMode.Mode0, 8_000_000)!
@@ -2141,7 +2619,9 @@ data := flash.buffer()!
 | `start_transfer(count)` | Send `buffer[..count]` and replace each byte with the one received at the same time; returns at once. |
 | `start_write(count)` | Send `buffer[..count]` and discard what arrives; the buffer stays as it is. |
 | `is_busy()` | True until the last byte has been received, which is when `rx`'s signal is raised. |
+| `poll_finish()` | Without waiting: false while a transfer runs, true once none does, ending one that is done; errors as for `finish`. |
 | `finish()` | Wait for the running transfer, if any, and end it: `Overrun` if replies were lost, `Bus` on a bus error. |
+| `abort()` | Stop a running transfer; the device saw only part of it. |
 | `transfer(count)`, `write(count)` | Start and finish, for code that waits anyway but wants no gaps between frames. |
 | `capacity()` | The buffer's length, the most one transfer moves. |
 
@@ -2154,7 +2634,8 @@ bus then works as before. Frames above 8 bits are `Unsupported`.
 
 `port.dma(&mut rx, &mut ring, &mut tx, &mut output)` returns a
 `pl011.DmaPort`, a serial port with the `std/io` Reader and Writer
-protocols, like `pl011.Port`, but with two differences:
+protocols, `serial.Port`, and `serial.PollPort`, like `pl011.Port`, but with
+two differences:
 
 - `rx` moves every byte that arrives into `ring`, round and round, so input
   waits there and not just in the 32-byte FIFO: a 1 KiB ring holds 89 ms at
@@ -2206,6 +2687,10 @@ behind the borrow checker's back; `is_busy`, `remaining`, `max_count`,
 `abort`, and `take_error` are safe. A driver keeps its buffers borrowed until
 the transfer is done or aborted, and aborts it when dropped, as the DMA
 sessions above do. `hal.address_of(bytes)` gives a buffer's address.
+[`hal.DmaStream`](#transfers-in-the-background-dma) does all of that for a
+buffer moved to or from one peripheral data register, so a new DMA-backed
+driver only turns its peripheral's requests on and off around it, and
+`fake.DmaChannel` runs such code on a desktop.
 
 An `rp_dma.Channel` finds the data request (DREQ) from the peripheral
 register a transfer reads or writes: the UARTs' and SPI controllers' data
@@ -2551,19 +3036,22 @@ dodo build firmware.dodo --emit obj --target thumbv7em-none-eabihf \
   yet. Write them with `hal.Reg` as above.
 - PIO state machines move words through their FIFOs by polling or their
   interrupts. DMA can pace transfers by their FIFOs' data requests
-  (`rp_dma.request` with `sm.tx_fifo_address()`), but there is no DMA
-  session for them as for SPI buses and serial ports. Their pin mappings
+  (`rp_dma.request` with `sm.tx_fifo_address()`), and `hal.DmaStream` runs
+  a buffer through one, as `rp_i2s.Output.dma` does. Their pin mappings
   reach GPIO 0 to 31; the
   RP2350B's GPIO 32 to 47 and the RP2350's GPIOBASE register are not
   supported. `rp_pio.assemble` takes one program per call.
-- PWM outputs only generate; the slices' input modes, which count or time a
-  pin's pulses, and the PWM wrap interrupt are not exposed. ADC reads are
+- PWM inputs measure by counting over windows, as the slices cannot
+  timestamp edges; the PWM wrap interrupt is not exposed. ADC reads are
   polled one at a time, without the round-robin sampler, FIFO, or DMA.
 - A serial port keeps no more input than its 32-byte FIFO unless it
   receives [by DMA](#serial-ports-by-dma), a program serves its interrupts,
   as in [an interrupt-driven driver](#an-interrupt-driven-driver), or the
   other end honours RTS. An I2C master is the bus's only master, without high-speed
   mode, which the chips' controllers lack, and cannot send empty transfers.
+  Neither chip has a CAN controller: CAN goes through an external MCP2515
+  on SPI, and I2S through PIO, as master only (the program drives BCLK and
+  LRCLK).
   The Pico 2 W's wireless chip drives only its LED and senses USB power;
   Wi-Fi and Bluetooth need its firmware, which is not loaded yet.
 - The software floating-point helpers are written for correctness, not speed:
@@ -2597,10 +3085,8 @@ dodo build firmware.dodo --emit obj --target thumbv7em-none-eabihf \
   core 1 stopped; there is no lockout that pauses core 1 in SRAM meanwhile.
   External SPI flash chips have no bundled driver yet, but any driver with
   the `hal.Flash` methods holds a `storage.Store`.
-- SPI by DMA moves frames of up to 8 bits; wider frames use the word
-  methods, which are polled. A queued I2C transaction fits the controller's
-  FIFO, 16 commands on both chips; longer transfers use the blocking
-  methods. The ADC is not read by DMA yet, and channel signals come only
-  from `DMA_IRQ_0`.
+- SPI by DMA and polled SPI transfers move frames of up to 8 bits; wider
+  frames use the word methods, which wait. The ADC is not read by DMA yet,
+  and channel signals come only from `DMA_IRQ_0`.
 
 For raw register and pointer contracts, see [memory and foreign calls](memory-and-ffi.md).

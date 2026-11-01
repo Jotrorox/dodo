@@ -1,0 +1,660 @@
+package main
+
+import "core/ptr"
+import "std/embedded/chip/rp_i2s"
+import "std/embedded/chip/rp_pio"
+import "std/embedded/hal"
+import "std/embedded/hal/fake"
+
+// Host checks for std/embedded/chip/rp_i2s: the I2S programs' instruction
+// words, which tests/firmware builds compare with rp_pio.assemble's, the
+// clock dividers, and the Output and Input streams against memory standing
+// in for a PIO block, as tests/stdlib/peripheral_checks.dodo checks the
+// PIO driver. The driver only writes registers and reads FIFO levels, so
+// plain memory serves: a write to an atomic alias lands in the alias's own
+// word, the FIFO registers keep the last word written, and the checks set
+// FLEVEL, FSTAT, and FDEBUG to stand in for the state machine.
+
+const CLOCK_HZ: u32 = 125_000_000
+const RP2350_HZ: u32 = 150_000_000
+
+// Block registers.
+const CTRL: usize = 0x000
+const FSTAT: usize = 0x004
+const FDEBUG: usize = 0x008
+const FLEVEL: usize = 0x00C
+const TXF0: usize = 0x010
+const RXF0: usize = 0x020
+const INSTR_MEM: usize = 0x048
+// State machine 0's registers; each next one is 0x18 further.
+const SM0: usize = 0x0C8
+const SM_STRIDE: usize = 0x18
+const CLKDIV: usize = 0x00
+const EXECCTRL: usize = 0x04
+const SHIFTCTRL: usize = 0x08
+const INSTR: usize = 0x10
+const PINCTRL: usize = 0x14
+const SET: usize = 0x2000
+const CLEAR: usize = 0x3000
+
+// One PIO block, 4096 words.
+static mut PIO_MEMORY: [4096]u32 = [0u32; 4096]
+
+fn pio_base() -> usize {
+    unsafe {
+        return ptr.from_mut(&mut PIO_MEMORY) as usize
+    }
+}
+
+fn word(offset: usize) -> u32 {
+    unsafe {
+        return PIO_MEMORY[offset / 4]
+    }
+}
+
+fn set_word(offset: usize, value: u32) {
+    unsafe {
+        PIO_MEMORY[offset / 4] = value
+    }
+}
+
+fn sm(index: u32, register: usize) -> usize {
+    return SM0 + SM_STRIDE * index as usize + register
+}
+
+// A fresh block of PIO version `version`, every FIFO empty.
+fn block(version: u32, clock_hz: u32) -> rp_pio.Pio {
+    for index in 0usize..4096 {
+        set_word(4 * index, 0)
+    }
+    set_word(FSTAT, 0x0F00_0F00)
+    unsafe {
+        return rp_pio.Pio.at(pio_base(), 0, version, clock_hz, 7)
+    }
+}
+
+// The TX and RX FIFO levels of state machine `index`.
+fn set_levels(index: u32, tx: u32, rx: u32) {
+    set_word(FLEVEL, (tx | (rx << 4)) << (8 * index))
+}
+
+fn expect_failure(result: void!hal.Error, expected: hal.Error) {
+    match result {
+        ok() => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == expected)
+        }
+    }
+}
+
+fn expect_error<T>(result: T!hal.Error, expected: hal.Error) {
+    match result {
+        ok(_) => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == expected)
+        }
+    }
+}
+
+// Creating an output with `settings` fails with `expected`.
+fn try_output(pio: &mut rp_pio.Pio, data: u32, clock: u32, settings: rp_i2s.Config, expected: hal.Error) {
+    result := rp_i2s.Output.new(pio, data, clock, &settings)
+    match result {
+        ok(output) => {
+            output.release(pio)
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == expected)
+        }
+    }
+}
+
+fn expect_words(program: &rp_pio.Program, words: &[u16]) {
+    core.assert_eq(program.length as usize, words.len)
+    for index in 0usize..words.len {
+        core.assert_eq(program.instructions[index], words[index])
+    }
+    for index in words.len..32 {
+        core.assert_eq(program.instructions[index], 0u16)
+    }
+    core.assert(program.wrap_target == 0 && program.wrap == program.length - 1 && program.origin == rp_pio.ANYWHERE)
+    core.assert(program.side_set_count == 2 && !program.side_set_optional && !program.side_set_pindirs)
+    core.assert(program.version == 0 && program.clock_divider == 256 && program.set_count == 0)
+}
+
+fn output_program(format: hal.I2sFormat, slot_bits: u32) -> rp_pio.Program {
+    return rp_i2s.output_program(&format, slot_bits)!
+}
+
+fn input_program(format: hal.I2sFormat, slot_bits: u32) -> rp_pio.Program {
+    return rp_i2s.input_program(&format, slot_bits)!
+}
+
+// The programs, decoded by hand; tests/firmware builds the same source
+// with rp_pio.assemble and finds the same words. Side-set is bits 12 (LRCLK)
+// and 11 (BCLK), the delay bits 10 to 8.
+fn programs() {
+    // Philips, 32-bit slots: out pins, 1 side 0b00 [1]; set y, 29 side
+    // 0b01 [1]; out, jmp y-- 2; out side 0b10; jmp !x 7 side 0b10; jmp 8
+    // side 0b11 [1]; pull block side 0b11 [1]; then the right slot with
+    // mov x, status, and back to 0.
+    philips32 := [0x6101u16, 0xE95D, 0x6101, 0x0982, 0x7001, 0x1027, 0x1908, 0x99A0, 0x7101, 0xF85D, 0xB825, 0x7101, 0x198B, 0x6001, 0x0030, 0x0900, 0x89A0]
+    program := output_program(hal.I2sFormat.Philips, 32)
+    expect_words(&program, &philips32)
+    core.assert(program.fifo == rp_pio.FIFO_TX && program.status_select == rp_pio.STATUS_TX_LESS && program.status_n == 2)
+    core.assert(program.out_count == 1 && !program.out_right && !program.autopull && program.pull_threshold == 32)
+    core.assert(!program.autopush)
+    // Left justified: LRCLK high through the left slot, low through the
+    // right.
+    left32 := [0x7101u16, 0xF95D, 0x7101, 0x1982, 0x7001, 0x1027, 0x1908, 0x99A0, 0x6101, 0xE85D, 0xA825, 0x6101, 0x098B, 0x6001, 0x0030, 0x0900, 0x89A0]
+    program = output_program(hal.I2sFormat.LeftJustified, 32)
+    expect_words(&program, &left32)
+    // Right justified differs only in how samples fill the slots.
+    program = output_program(hal.I2sFormat.RightJustified, 32)
+    expect_words(&program, &left32)
+    // 16-bit slots: one word a frame, pull noblock at the end.
+    philips16 := [0x6101u16, 0xE94D, 0x6101, 0x0982, 0x7101, 0xF94E, 0x7101, 0x1986, 0x6101, 0x8980]
+    program = output_program(hal.I2sFormat.Philips, 16)
+    expect_words(&program, &philips16)
+    core.assert(program.fifo == rp_pio.FIFO_TX && program.status_select == 0 && program.status_n == 0 && program.out_count == 1 && !program.out_right)
+    left16 := [0x7101u16, 0xF94D, 0x7101, 0x1982, 0x7101, 0xF94E, 0x6101, 0x0986, 0x6101, 0x8980]
+    program = output_program(hal.I2sFormat.LeftJustified, 16)
+    expect_words(&program, &left16)
+
+    // Input: set y, 30 side 0b10 [1]; in pins, 1 side 0b11 [1]; jmp y-- 1
+    // side 0b10 [1]; in; then the same with LRCLK low.
+    in_left32 := [0xF15Eu16, 0x5901, 0x1181, 0x5901, 0xE15E, 0x4901, 0x0185, 0x4901]
+    program = input_program(hal.I2sFormat.LeftJustified, 32)
+    expect_words(&program, &in_left32)
+    core.assert(program.fifo == rp_pio.FIFO_RX && program.autopush && !program.in_right && program.push_threshold == 32 && program.in_count == 32)
+    core.assert(program.out_count == 0 && !program.autopull)
+    in_philips32 := [0xE15Eu16, 0x4901, 0x0181, 0x4901, 0xF15E, 0x5901, 0x1185, 0x5901]
+    program = input_program(hal.I2sFormat.Philips, 32)
+    expect_words(&program, &in_philips32)
+    in_philips16 := [0xE14Eu16, 0x4901, 0x0181, 0x4901, 0xF14E, 0x5901, 0x1185, 0x5901]
+    program = input_program(hal.I2sFormat.Philips, 16)
+    expect_words(&program, &in_philips16)
+
+    // Only 16- and 32-bit slots.
+    format := hal.I2sFormat.Philips
+    expect_error(rp_i2s.output_program(&format, 24), hal.Error.InvalidInput)
+    expect_error(rp_i2s.input_program(&format, 8), hal.Error.InvalidInput)
+}
+
+fn expect_timing(clock_hz: u32, rate: u32, slot_bits: u32, divider: u32, millihertz: u64, ppm: i32, bit_clock: u32) {
+    timing := rp_i2s.timing(clock_hz, rate, slot_bits)!
+    core.assert_eq(timing.divider, divider)
+    core.assert_eq(timing.actual_millihertz(), millihertz)
+    core.assert_eq(timing.actual_rate(), ((millihertz + 500) / 1000) as u32)
+    core.assert_eq(timing.error_ppm(), ppm)
+    core.assert_eq(timing.bit_clock_hz(), bit_clock)
+    core.assert(timing.clock_hz == clock_hz && timing.sample_rate == rate && timing.slot_bits == slot_bits)
+}
+
+// Four state machine cycles a bit clock: the divider is clk_sys * 256 /
+// (8 * slot_bits * rate), rounded.
+fn timings() {
+    expect_timing(CLOCK_HZ, 44_100, 32, 2834, 44_107_269, 165, 2_822_865)
+    expect_timing(CLOCK_HZ, 44_100, 16, 5669, 44_099_488, -12, 1_411_184)
+    expect_timing(CLOCK_HZ, 48_000, 32, 2604, 48_003_072, 64, 3_072_197)
+    expect_timing(CLOCK_HZ, 48_000, 16, 5208, 48_003_072, 64, 1_536_098)
+    expect_timing(CLOCK_HZ, 16_000, 32, 7813, 15_998_976, -64, 1_023_934)
+    expect_timing(CLOCK_HZ, 16_000, 16, 15625, 16_000_000, 0, 512_000)
+    expect_timing(RP2350_HZ, 44_100, 32, 3401, 44_104_675, 106, 2_822_699)
+    expect_timing(RP2350_HZ, 44_100, 16, 6803, 44_098_192, -41, 1_411_142)
+    expect_timing(RP2350_HZ, 48_000, 32, 3125, 48_000_000, 0, 3_072_000)
+    expect_timing(RP2350_HZ, 48_000, 16, 6250, 48_000_000, 0, 1_536_000)
+    expect_timing(RP2350_HZ, 16_000, 32, 9375, 16_000_000, 0, 1_024_000)
+    expect_timing(RP2350_HZ, 16_000, 16, 18750, 16_000_000, 0, 512_000)
+    // The fastest: a divider of one, clk_sys / 256 in 32-bit slots.
+    fastest := rp_i2s.timing(CLOCK_HZ, 488_281, 32)!
+    core.assert_eq(fastest.divider, 256u32)
+    expect_error(rp_i2s.timing(CLOCK_HZ, 490_000, 32), hal.Error.InvalidInput)
+    expect_error(rp_i2s.timing(CLOCK_HZ, 7, 32), hal.Error.InvalidInput)
+    slowest := rp_i2s.timing(CLOCK_HZ, 8, 32)!
+    core.assert(slowest.divider <= 0xFF_FFFF)
+    expect_error(rp_i2s.timing(CLOCK_HZ, 0, 32), hal.Error.InvalidInput)
+    expect_error(rp_i2s.timing(CLOCK_HZ, 48_000, 24), hal.Error.InvalidInput)
+}
+
+fn config(rate: u32, bits: u32, channels: u32, format: hal.I2sFormat) -> rp_i2s.Config {
+    return rp_i2s.Config.new(rate, bits, channels, format)
+}
+
+// The output's registers: the program at the highest free slots with its
+// jumps moved along, the pins mapped, the divider, and silence first.
+fn output_setup() {
+    pio := block(0, CLOCK_HZ)
+    settings := config(48_000, 24, 2, hal.I2sFormat.Philips)
+    output := rp_i2s.Output.new(&mut pio, 9, 10, &settings)!
+    core.assert(output.sample_rate() == 48_000 && output.channels() == 2 && output.bits() == 24 && output.slot_bits() == 32)
+    core.assert(output.machine_index() == 0 && pio.machines() == 1)
+    // 17 instructions from slot 15; `jmp y-- 2` becomes `jmp y-- 17`.
+    core.assert_eq(pio.memory(), 0xFFFF_8000u32)
+    core.assert_eq(word(INSTR_MEM + 4 * 15), 0x6101u32)
+    core.assert_eq(word(INSTR_MEM + 4 * 18), 0x0982u32 + 15)
+    core.assert_eq(word(INSTR_MEM + 4 * 30), 0x0900u32 + 15)
+    core.assert_eq(word(INSTR_MEM + 4 * 31), 0x89A0u32)
+    core.assert_eq(word(sm(0, CLKDIV)), 2604u32 << 8)
+    // EXECCTRL: wrap 31 to 15, status: TX FIFO below 2.
+    core.assert_eq(word(sm(0, EXECCTRL)), (31u32 << 12) | (15u32 << 7) | 2)
+    // SHIFTCTRL: TX join, left-shifting OSR without autopull, thresholds
+    // 32 (written as 0).
+    core.assert_eq(word(sm(0, SHIFTCTRL)), (1u32 << 30) | (1u32 << 18))
+    // PINCTRL: two side-set pins from GPIO 10, one OUT pin at GPIO 9.
+    core.assert_eq(word(sm(0, PINCTRL)), (2u32 << 29) | (1u32 << 20) | (10u32 << 10) | 9)
+    // The last instruction run before the start: `mov x, ~null`, so the
+    // first frame is silent; the state machine runs.
+    core.assert_eq(word(sm(0, INSTR)), 0xA02Bu32)
+    core.assert_eq(word(CTRL + SET), 1u32)
+    timing := output.timing()
+    core.assert(timing.divider == 2604 && timing.actual_rate() == 48_003)
+
+    // An input fits beside it, at slots 7 to 14, on the next state machine.
+    microphone := config(16_000, 24, 1, hal.I2sFormat.LeftJustified)
+    input := rp_i2s.Input.new(&mut pio, 2, 3, &microphone)!
+    core.assert(input.machine_index() == 1 && pio.memory() == 0xFFFF_FF80)
+    core.assert_eq(word(sm(1, CLKDIV)), 7813u32 << 8)
+    core.assert_eq(word(sm(1, EXECCTRL)), (14u32 << 12) | (7u32 << 7))
+    // SHIFTCTRL: RX join, autopush at 32, left-shifting ISR.
+    core.assert_eq(word(sm(1, SHIFTCTRL)), (1u32 << 31) | (1u32 << 19) | (1u32 << 16))
+    // PINCTRL: side-set from GPIO 3, IN from GPIO 2.
+    core.assert_eq(word(sm(1, PINCTRL)), (2u32 << 29) | (2u32 << 15) | (3u32 << 10))
+    // Left justified starts at the program's start; the last instruction
+    // run made LRCLK an output.
+    core.assert_eq(word(sm(1, INSTR)), 0xE081u32)
+    core.assert_eq(word(CTRL + SET), 2u32)
+
+    // Released, each stops, makes its pins inputs, and gives back its
+    // state machine and slots.
+    input.release(&mut pio)
+    core.assert(word(CTRL + CLEAR) == 2 && word(sm(1, INSTR)) == 0xE080)
+    core.assert(pio.machines() == 1 && pio.memory() == 0xFFFF_8000)
+    output.release(&mut pio)
+    core.assert(pio.machines() == 0 && pio.memory() == 0)
+    pio.release()
+}
+
+// 16-bit slots on an RP2350 at 150 MHz; Philips input starts inside the
+// first run of LRCLK low with Y preset.
+fn narrow_setup() {
+    pio := block(1, RP2350_HZ)
+    settings := config(44_100, 16, 2, hal.I2sFormat.Philips)
+    settings.slot_bits = 16
+    output := rp_i2s.Output.new(&mut pio, 20, 18, &settings)!
+    core.assert(output.slot_bits() == 16 && pio.memory() == 0xFFC0_0000)
+    core.assert_eq(word(sm(0, CLKDIV)), 6803u32 << 8)
+    // No status select in 16-bit slots.
+    core.assert_eq(word(sm(0, EXECCTRL)), (31u32 << 12) | (22u32 << 7))
+    core.assert_eq(word(sm(0, PINCTRL)), (2u32 << 29) | (1u32 << 20) | (18u32 << 10) | 20)
+    // `set x, 0`: `pull noblock` sends zeros while nothing is queued.
+    core.assert_eq(word(sm(0, INSTR)), 0xE020u32)
+
+    microphone := config(44_100, 16, 2, hal.I2sFormat.Philips)
+    microphone.slot_bits = 16
+    input := rp_i2s.Input.new(&mut pio, 21, 22, &microphone)!
+    // Loaded at 14 to 21: starts at 16 after `set y, 14`.
+    core.assert_eq(word(sm(1, INSTR)), 0xE04Eu32)
+    core.assert_eq(word(sm(1, EXECCTRL)), (21u32 << 12) | (14u32 << 7))
+    input.release(&mut pio)
+    output.release(&mut pio)
+    pio.release()
+}
+
+// 48 kHz Philips stereo of `bits` bits in slots of `slot_bits`.
+fn slotted(bits: u32, slot_bits: u32) -> rp_i2s.Config {
+    settings := config(48_000, bits, 2, hal.I2sFormat.Philips)
+    settings.slot_bits = slot_bits
+    return settings
+}
+
+// Settings out of range are InvalidInput, a full block Busy, and a failed
+// creation leaves nothing claimed.
+fn setup_failures() {
+    pio := block(0, CLOCK_HZ)
+    try_output(&mut pio, 9, 10, config(48_000, 20, 2, hal.I2sFormat.Philips), hal.Error.InvalidInput)
+    try_output(&mut pio, 9, 10, config(48_000, 16, 3, hal.I2sFormat.Philips), hal.Error.InvalidInput)
+    try_output(&mut pio, 9, 10, config(48_000, 16, 0, hal.I2sFormat.Philips), hal.Error.InvalidInput)
+    try_output(&mut pio, 11, 10, config(48_000, 16, 2, hal.I2sFormat.Philips), hal.Error.InvalidInput)
+    try_output(&mut pio, 10, 10, config(48_000, 16, 2, hal.I2sFormat.Philips), hal.Error.InvalidInput)
+    try_output(&mut pio, 0, 31, config(48_000, 16, 2, hal.I2sFormat.Philips), hal.Error.InvalidInput)
+    try_output(&mut pio, 32, 10, config(48_000, 16, 2, hal.I2sFormat.Philips), hal.Error.InvalidInput)
+    try_output(&mut pio, 9, 10, config(1_000_000, 16, 2, hal.I2sFormat.Philips), hal.Error.InvalidInput)
+    // 24-bit samples need 32-bit slots.
+    try_output(&mut pio, 9, 10, slotted(24, 16), hal.Error.InvalidInput)
+    try_output(&mut pio, 9, 10, slotted(16, 8), hal.Error.InvalidInput)
+    core.assert(pio.machines() == 0 && pio.memory() == 0)
+
+    // Every state machine claimed: Busy, and the program is unloaded.
+    first := pio.state_machine(0)!
+    second := pio.state_machine(1)!
+    third := pio.state_machine(2)!
+    fourth := pio.state_machine(3)!
+    try_output(&mut pio, 9, 10, config(48_000, 16, 2, hal.I2sFormat.Philips), hal.Error.Busy)
+    core.assert_eq(pio.memory(), 0u32)
+    pio.release_state_machine(fourth)
+    // No room for 17 instructions beside 16 others.
+    filler := [0xA042u16; 16]
+    instructions := [0u16; 32]
+    for index in 0usize..16 {
+        instructions[index] = filler[index]
+    }
+    program := rp_pio.Program { instructions, length: 16, origin: 0, wrap_target: 0, wrap: 15, side_set_count: 0, side_set_optional: false, side_set_pindirs: false, version: 0, clock_divider: 256, fifo: rp_pio.FIFO_TXRX, status_select: 0, status_n: 0, in_count: 32, in_right: true, autopush: false, push_threshold: 32, out_count: 0, out_right: true, autopull: false, pull_threshold: 32, set_count: 0 }
+    loaded := pio.load(&program)!
+    try_output(&mut pio, 9, 10, config(48_000, 16, 2, hal.I2sFormat.Philips), hal.Error.Busy)
+    core.assert(pio.memory() == 0xFFFF && pio.machines() == 7)
+    // A 16-bit output's 10 instructions fit.
+    narrow := config(48_000, 16, 2, hal.I2sFormat.Philips)
+    narrow.slot_bits = 16
+    output := rp_i2s.Output.new(&mut pio, 9, 10, &narrow)!
+    core.assert(output.machine_index() == 3 && pio.memory() == 0xFFC0_FFFF)
+    output.release(&mut pio)
+    pio.unload(loaded)
+    pio.release_state_machine(first)
+    pio.release_state_machine(second)
+    pio.release_state_machine(third)
+    pio.release()
+}
+
+// Packed words, little-endian in bytes.
+fn packed(bytes: &[u8], index: usize) -> u32 {
+    at := 4 * index
+    return bytes[at] as u32 | ((bytes[at + 1] as u32) << 8) | ((bytes[at + 2] as u32) << 16) | ((bytes[at + 3] as u32) << 24)
+}
+
+fn output_with(pio: &mut rp_pio.Pio, bits: u32, channels: u32, format: hal.I2sFormat, slot_bits: u32) -> rp_i2s.Output {
+    settings := config(48_000, bits, channels, format)
+    settings.slot_bits = slot_bits
+    return rp_i2s.Output.new(pio, 9, 10, &settings)!
+}
+
+// Samples on the wire: the top bits of each, right justified at the
+// bottom with the sign above, mono in both slots, and 16-bit slots two to
+// a word.
+fn sample_packing() {
+    pio := block(0, CLOCK_HZ)
+    bytes: [64]u8 = [0; 64]
+    samples := [0x1234_5678i32, -0x1234_5678, 0x7FFF_FFFF, -0x7FFF_FFFF - 1]
+
+    output := output_with(&mut pio, 32, 2, hal.I2sFormat.Philips, 32)
+    core.assert_eq(output.pack(&samples, &mut bytes)!, 16usize)
+    core.assert(packed(&bytes, 0) == 0x1234_5678 && packed(&bytes, 1) == 0xEDCB_A988 && packed(&bytes, 2) == 0x7FFF_FFFF && packed(&bytes, 3) == 0x8000_0000)
+    output.release(&mut pio)
+
+    output = output_with(&mut pio, 24, 2, hal.I2sFormat.LeftJustified, 32)
+    output.pack(&samples, &mut bytes)!
+    core.assert(packed(&bytes, 0) == 0x1234_5600 && packed(&bytes, 1) == 0xEDCB_A900 && packed(&bytes, 3) == 0x8000_0000)
+    output.release(&mut pio)
+
+    output = output_with(&mut pio, 16, 2, hal.I2sFormat.Philips, 32)
+    output.pack(&samples, &mut bytes)!
+    core.assert(packed(&bytes, 0) == 0x1234_0000 && packed(&bytes, 1) == 0xEDCB_0000 && packed(&bytes, 2) == 0x7FFF_0000)
+    output.release(&mut pio)
+
+    // Right justified: the sample's bits at the bottom, its sign above.
+    output = output_with(&mut pio, 24, 2, hal.I2sFormat.RightJustified, 32)
+    output.pack(&samples, &mut bytes)!
+    core.assert(packed(&bytes, 0) == 0x0012_3456 && packed(&bytes, 1) == 0xFFED_CBA9 && packed(&bytes, 2) == 0x007F_FFFF && packed(&bytes, 3) == 0xFF80_0000)
+    output.release(&mut pio)
+    output = output_with(&mut pio, 16, 2, hal.I2sFormat.RightJustified, 32)
+    output.pack(&samples, &mut bytes)!
+    core.assert(packed(&bytes, 0) == 0x0000_1234 && packed(&bytes, 1) == 0xFFFF_EDCB)
+    output.release(&mut pio)
+
+    // Mono: each sample in both slots.
+    output = output_with(&mut pio, 24, 1, hal.I2sFormat.Philips, 32)
+    core.assert_eq(output.pack(&samples, &mut bytes)!, 32usize)
+    core.assert(packed(&bytes, 0) == 0x1234_5600 && packed(&bytes, 1) == 0x1234_5600 && packed(&bytes, 2) == 0xEDCB_A900 && packed(&bytes, 7) == 0x8000_0000)
+    output.release(&mut pio)
+
+    // 16-bit slots: left in the upper half.
+    output = output_with(&mut pio, 16, 2, hal.I2sFormat.Philips, 16)
+    core.assert_eq(output.pack(&samples, &mut bytes)!, 8usize)
+    core.assert(packed(&bytes, 0) == 0x1234_EDCB && packed(&bytes, 1) == 0x7FFF_8000)
+    // A frame is whole samples only, and must fit.
+    expect_error(output.pack(&samples[..3], &mut bytes), hal.Error.InvalidInput)
+    expect_error(output.pack(&samples, &mut bytes[..7]), hal.Error.InvalidInput)
+    output.release(&mut pio)
+    output = output_with(&mut pio, 16, 1, hal.I2sFormat.LeftJustified, 16)
+    output.pack(&samples[..2], &mut bytes)!
+    core.assert(packed(&bytes, 0) == 0x1234_1234 && packed(&bytes, 1) == 0xEDCB_EDCB)
+    output.release(&mut pio)
+    pio.release()
+}
+
+// poll_write queues as many whole frames as the FIFO has room for.
+fn output_queue() {
+    pio := block(1, CLOCK_HZ)
+    output := output_with(&mut pio, 24, 2, hal.I2sFormat.Philips, 32)
+    samples := [0x0100_0000i32, 0x0200_0000, 0x0300_0000, 0x0400_0000, 0x0500_0000, 0x0600_0000, 0x0700_0000, 0x0800_0000, 0x0900_0000, 0x0A00_0000]
+    // Empty: four frames of two words fit; the last word written is the
+    // fourth frame's right sample.
+    set_levels(0, 0, 0)
+    core.assert_eq(output.poll_write(&samples)!, 8usize)
+    core.assert_eq(word(TXF0), 0x0800_0000u32)
+    core.assert_eq(output.queued(), 0u32)
+    // Three words free: one frame.
+    set_levels(0, 5, 0)
+    core.assert_eq(output.queued(), 2u32)
+    core.assert_eq(output.poll_write(&samples[4..])!, 2usize)
+    core.assert_eq(word(TXF0), 0x0600_0000u32)
+    // One word free: no room for a frame. Full: none either.
+    set_levels(0, 7, 0)
+    core.assert_eq(output.poll_write(&samples)!, 0usize)
+    set_levels(0, 8, 0)
+    core.assert_eq(output.poll_write(&samples)!, 0usize)
+    core.assert_eq(word(TXF0), 0x0600_0000u32)
+    // Half a frame is refused, even when nothing fits.
+    expect_error(output.poll_write(&samples[..3]), hal.Error.InvalidInput)
+    set_levels(0, 0, 0)
+    expect_error(output.poll_write(&samples[..1]), hal.Error.InvalidInput)
+    empty := &samples[..0]
+    core.assert_eq(output.poll_write(empty)!, 0usize)
+    output.release(&mut pio)
+
+    // Mono in 16-bit slots: one word a frame, eight frames.
+    output = output_with(&mut pio, 16, 1, hal.I2sFormat.Philips, 16)
+    set_levels(0, 0, 0)
+    core.assert_eq(output.poll_write(&samples)!, 8usize)
+    core.assert_eq(word(TXF0), 0x0800_0800u32)
+    set_levels(0, 7, 0)
+    core.assert_eq(output.queued(), 7u32)
+    core.assert_eq(output.poll_write(&samples[8..])!, 1usize)
+    core.assert_eq(word(TXF0), 0x0900_0900u32)
+    output.release(&mut pio)
+    pio.release()
+}
+
+fn play(output: &mut dyn hal.I2sOutput, samples: &[i32]) -> usize {
+    core.assert(output.sample_rate() == 48_000 && output.channels() == 2)
+    return output.poll_write(samples)!
+}
+
+// The output through hal's protocol: dynamically, and with write_samples.
+fn output_protocol() {
+    pio := block(0, CLOCK_HZ)
+    output := output_with(&mut pio, 16, 2, hal.I2sFormat.Philips, 32)
+    tone := [hal.sample_from_i16(1000), hal.sample_from_i16(-1000), hal.sample_from_i16(32767), hal.sample_from_i16(-32768)]
+    core.assert(tone[0] == 1000 * 65536 && tone[1] == -1000 * 65536 && hal.sample_to_i16(tone[3]) == -32768)
+    set_levels(0, 0, 0)
+    core.assert_eq(play(&mut output, &tone), 4usize)
+    core.assert_eq(word(TXF0), 0x8000_0000u32)
+    // The model's FIFO never fills while its level reads 0.
+    hal.write_samples(&mut output, &tone, 3)!
+    // A full FIFO: Timeout after three polls without progress.
+    set_levels(0, 8, 0)
+    expect_failure(hal.write_samples(&mut output, &tone, 3), hal.Error.Timeout)
+    output.release(&mut pio)
+    pio.release()
+}
+
+// A buffer played by DMA: packed words go to the TX FIFO's address.
+fn output_dma() {
+    pio := block(0, CLOCK_HZ)
+    output := output_with(&mut pio, 24, 2, hal.I2sFormat.Philips, 32)
+    core.assert_eq(output.tx_fifo_address(), pio_base() + TXF0)
+    channel := fake.DmaChannel.new()
+    storage: [68]u8 = [0; 68]
+    skip := (4 - hal.address_of(&storage) % 4) % 4
+    samples := [0x1111_1111i32, 0x2222_2222, 0x3333_3333, 0x4444_4444]
+    stream := output.dma(&mut channel, &mut storage[skip..skip + 64])!
+    bytes := stream.buffer()!
+    count := output_pack(&samples, bytes)
+    stream.start(count)!
+    hal.finish_transfer(&mut stream)!
+    core.drop(stream)
+    core.assert_eq(channel.starts(), 1u32)
+    // The last word moved: the second frame's right sample.
+    core.assert_eq(word(TXF0), 0x4444_4400u32)
+    // A misaligned buffer is refused.
+    expect_error(output.dma(&mut channel, &mut storage[skip + 1..skip + 9]), hal.Error.InvalidInput)
+    output.release(&mut pio)
+    pio.release()
+}
+
+// Packing for the DMA check, as Output.pack does for 24-bit stereo in
+// 32-bit slots, while the session holds the output.
+fn output_pack(samples: &[i32], bytes: &mut[u8]) -> usize {
+    for index in 0usize..samples.len {
+        value := samples[index] as u32 & 0xFFFF_FF00
+        bytes[4 * index] = (value & 0xFF) as u8
+        bytes[4 * index + 1] = ((value >> 8) & 0xFF) as u8
+        bytes[4 * index + 2] = ((value >> 16) & 0xFF) as u8
+        bytes[4 * index + 3] = (value >> 24) as u8
+    }
+    return 4 * samples.len
+}
+
+fn input_with(pio: &mut rp_pio.Pio, bits: u32, channels: u32, format: hal.I2sFormat, slot_bits: u32, right: bool) -> rp_i2s.Input {
+    settings := config(16_000, bits, channels, format)
+    settings.slot_bits = slot_bits
+    if right {
+        settings.channel = rp_i2s.Channel.Right
+    }
+    return rp_i2s.Input.new(pio, 2, 3, &settings)!
+}
+
+// A word waiting in state machine 0's RX FIFO, `level` deep, and no
+// stall flagged (the model keeps the bits init writes to clear them).
+fn receive(value: u32, level: u32) {
+    set_word(FDEBUG, 0)
+    set_word(RXF0, value)
+    set_levels(0, 0, level)
+    if level == 0 {
+        set_word(FSTAT, 0x0F00_0F00)
+    } else {
+        set_word(FSTAT, 0x0F00_0E00)
+    }
+}
+
+// poll_read turns words into samples, a frame at a time.
+fn input_unpacking() {
+    pio := block(1, CLOCK_HZ)
+    samples := [0i32; 8]
+    // 24 bits from 32-bit slots, as from an INMP441: the low byte drops.
+    input := input_with(&mut pio, 24, 2, hal.I2sFormat.Philips, 32, false)
+    core.assert(input.sample_rate() == 16_000 && input.channels() == 2 && input.bits() == 24 && input.slot_bits() == 32)
+    // Philips starts at instruction 2 of the program at 24, Y preset.
+    core.assert_eq(word(sm(0, INSTR)), 0xE05Eu32)
+    receive(0x89AB_CDEF, 5)
+    // Five words: two whole frames.
+    core.assert_eq(input.poll_read(&mut samples)!, 4usize)
+    core.assert(samples[0] == -0x7654_3300 && samples[3] == -0x7654_3300)
+    // Room for one frame only.
+    core.assert_eq(input.poll_read(&mut samples[..3])!, 2usize)
+    // Nothing waiting, or one word of a frame: nothing.
+    receive(0x89AB_CDEF, 1)
+    core.assert_eq(input.poll_read(&mut samples)!, 0usize)
+    receive(0, 0)
+    core.assert_eq(input.poll_read(&mut samples)!, 0usize)
+    input.release(&mut pio)
+
+    // 32 bits keep every bit; right justified 24 bits sit at the bottom.
+    input = input_with(&mut pio, 32, 2, hal.I2sFormat.LeftJustified, 32, false)
+    receive(0x0000_0001, 2)
+    core.assert_eq(input.poll_read(&mut samples)!, 2usize)
+    core.assert(samples[0] == 1 && samples[1] == 1)
+    input.release(&mut pio)
+    input = input_with(&mut pio, 24, 2, hal.I2sFormat.RightJustified, 32, false)
+    receive(0xFF80_0001, 2)
+    input.poll_read(&mut samples)!
+    core.assert_eq(samples[0], -0x7FFF_FF00)
+    input.release(&mut pio)
+
+    // 16-bit slots: a word holds a frame, left in the upper half.
+    input = input_with(&mut pio, 16, 2, hal.I2sFormat.Philips, 16, false)
+    receive(0x1234_ABCD, 3)
+    core.assert_eq(input.poll_read(&mut samples)!, 6usize)
+    core.assert(samples[0] == 0x1234_0000 && samples[1] == -0x5433_0000 && samples[5] == -0x5433_0000)
+    core.assert(hal.sample_to_i16(samples[1]) == -0x5433)
+    input.release(&mut pio)
+
+    // Mono keeps the slot asked for.
+    input = input_with(&mut pio, 16, 1, hal.I2sFormat.Philips, 16, true)
+    core.assert_eq(input.channels(), 1u32)
+    receive(0x1234_ABCD, 2)
+    core.assert_eq(input.poll_read(&mut samples[..1])!, 1usize)
+    core.assert_eq(samples[0], -0x5433_0000)
+    input.release(&mut pio)
+    input = input_with(&mut pio, 24, 1, hal.I2sFormat.LeftJustified, 32, false)
+    receive(0x7FFF_FFFF, 4)
+    core.assert_eq(input.poll_read(&mut samples)!, 2usize)
+    core.assert(samples[0] == 0x7FFF_FF00 && samples[1] == 0x7FFF_FF00)
+    input.release(&mut pio)
+    pio.release()
+}
+
+fn record(input: &mut dyn hal.I2sInput, samples: &mut[i32]) -> usize!hal.Error {
+    core.assert(input.sample_rate() == 16_000)
+    return input.poll_read(samples)
+}
+
+// Overrun once after the RX FIFO stalled, then samples again; the
+// protocol's helpers.
+fn input_overrun() {
+    pio := block(0, CLOCK_HZ)
+    input := input_with(&mut pio, 24, 2, hal.I2sFormat.Philips, 32, false)
+    samples := [0i32; 4]
+    receive(0x4000_0000, 8)
+    // RXSTALL for state machine 0: Overrun, and the flag is written back
+    // to clear it.
+    set_word(FDEBUG, 1)
+    expect_error(record(&mut input, &mut samples), hal.Error.Overrun)
+    core.assert_eq(word(FDEBUG), 1u32)
+    // The flag cleared, as the hardware's write-one-to-clear does: the
+    // samples that follow.
+    set_word(FDEBUG, 0)
+    core.assert_eq(record(&mut input, &mut samples)!, 4usize)
+    core.assert_eq(samples[2], 0x4000_0000)
+    // Another state machine's stall is not this input's.
+    set_word(FDEBUG, 2)
+    core.assert_eq(input.poll_read(&mut samples)!, 4usize)
+    set_word(FDEBUG, 0)
+    // read_samples fills the slice, or times out.
+    filled := [0i32; 6]
+    hal.read_samples(&mut input, &mut filled, 3)!
+    core.assert(filled[0] == 0x4000_0000 && filled[5] == 0x4000_0000)
+    receive(0, 0)
+    expect_failure(hal.read_samples(&mut input, &mut filled, 3), hal.Error.Timeout)
+    input.release(&mut pio)
+    pio.release()
+}
+
+fn main() {
+    programs()
+    timings()
+    output_setup()
+    narrow_setup()
+    setup_failures()
+    sample_packing()
+    output_queue()
+    output_protocol()
+    output_dma()
+    input_unpacking()
+    input_overrun()
+}
