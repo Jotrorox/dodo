@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- `std/window` has the basics desktop programs such as text editors need.
+  `app.set_clipboard_text(text)` and `app.clipboard_text()` copy and paste
+  text through the system clipboard (`NSPasteboard`, the Win32 clipboard,
+  and the X11 CLIPBOARD selection, which the App serves to other programs
+  from its event loop, with large texts in both directions and Latin-1
+  `STRING` from older programs). `win.set_cursor(window.Cursor.Text)` and ten
+  other standard shapes set the pointer over a window. `win.set_size`,
+  `win.set_min_size` and `win.set_max_size` resize a window from code and
+  limit the sizes the user can give it, and `win.set_fullscreen(on)` and
+  `win.is_fullscreen()` switch to fullscreen: a fullscreen space on macOS, a
+  borderless window covering the monitor on Windows, and `_NET_WM_STATE` on
+  X11, where a window without a window manager covers the screen itself. See
+  the [Windows guide](docs/src/content/docs/window.md#clipboard).
 - New database packages. `std/db` holds the shared vocabulary for drivers:
   `db.Error` with portable `db.ErrorKind`s and `db.Constraint`s plus the
   driver's native code, the borrowed `db.Value`, and `db.IsolationLevel`.
