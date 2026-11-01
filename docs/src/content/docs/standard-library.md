@@ -49,8 +49,9 @@ they are not prerequisites for using the safe entry APIs.
 | Draw smooth shapes, gradients, or TrueType text | `canvas.aa_fill_circle`, `graphics.Gradient`, `truetype.Font.new` | [Graphics](graphics.md#antialiased-drawing) |
 | Open a window | `window.open` and `win.canvas()` | [Windows](window.md) |
 | Render with the GPU through OpenGL | `opengl.Context.create`, `opengl.Target.new` and the `gl` commands | [OpenGL](opengl.md) |
+| Compute or render on any GPU | `gpu.Device.open`, `device.encoder()` and `encoder.submit()` | [GPU programming](gpu.md) |
 | Run a shader on the GPU (macOS) | `metal.Device.system_default` and `new_library_with_source` | [Metal](metal.md) |
-| Run a shader on the GPU | `vk.open()` and `library.entry()` from `std/gpu/vulkan` | [GPU programming with Vulkan](gpu.md) |
+| Call Vulkan directly | `vk.open()` and `library.entry()` from `std/gpu/vulkan` | [Vulkan](vulkan.md) |
 | Call a function in a shared library | `dylib.open` and `library.symbol` | [Shared libraries](dylib.md) |
 | Read the current time | `time/hosted.WallClock.new().wall_now()` | [Time and clocks](time.md) |
 | Fetch a URL | `http/hosted.Client.new` and `get` | [HTTP](http.md), [hosted HTTP/HTTPS](hosted-http.md) |
@@ -183,7 +184,8 @@ individual modules and links every public declaration back to its source.
 | [Windows](window.md) | `std/window`, `std/window/x11` | Hosted: X11 on Linux, AppKit on macOS, Win32 on Windows; the X11 protocol code is portable. |
 | [OpenGL](opengl.md) | `std/gpu/opengl`, `std/gpu/opengl/gl` | Hosted: EGL on Linux, CGL on macOS, WGL on Windows, loaded at run time; the generated binding is portable. |
 | [Metal](metal.md) | `std/gpu/metal`, `std/gpu/metal/objc` | macOS only (Apple silicon and Intel); links Metal, QuartzCore and Foundation. |
-| [GPU programming with Vulkan](gpu.md) | `std/gpu/vulkan` | Hosted; the Vulkan loader is opened at run time, nothing is linked. |
+| [GPU programming](gpu.md) | `std/gpu`, `std/gpu/hal` | Hosted: Metal on macOS, Vulkan on Linux and Windows, OpenGL 4.5 where Vulkan is missing; nothing beyond Metal is linked. |
+| [Vulkan](vulkan.md) | `std/gpu/vulkan` | Hosted; the Vulkan loader is opened at run time, nothing is linked. |
 | [Shared libraries](dylib.md) | `std/dylib` | Hosted: dlopen on Linux and macOS, LoadLibrary on Windows. |
 | [Time and clocks](time.md) | `std/time`, `std/time/clock`, `std/time/hosted`, `std/time/iso8601`, `std/time/timer` | Values/contracts portable; hosted clock explicit. |
 | [Native strings and errors](platform.md) | `std/platform`, `std/platform/error` | Hosted. |
@@ -251,12 +253,18 @@ select providers; they are not additional recommended starting paths.
 | `std/gpu/opengl/macos` | CGL context adapter; use [OpenGL](opengl.md). |
 | `std/gpu/opengl/windows` | WGL context adapter; use [OpenGL](opengl.md). |
 | `std/gpu/opengl/common` | Error type and helpers the adapters share; use [OpenGL](opengl.md). |
+| `std/gpu/hal/vulkan` | `std/gpu`'s Vulkan backend; use [GPU programming](gpu.md). |
+| `std/gpu/hal/opengl` | `std/gpu`'s OpenGL backend; use [GPU programming](gpu.md). |
+| `std/gpu/hal/macos` | `std/gpu`'s Metal backend, its native one on macOS; use [GPU programming](gpu.md). |
+| `std/gpu/hal/linux` | `std/gpu`'s native backend on Linux, which has none; use [GPU programming](gpu.md). |
+| `std/gpu/hal/windows` | `std/gpu`'s native backend on Windows, which has none yet; use [GPU programming](gpu.md). |
+| `std/gpu/hal/unavailable` | The backend that never opens, behind the Linux and Windows native imports; use [GPU programming](gpu.md). |
 
 Virtual imports `std/platform/native`, `std/fs/native`, `std/env/native`,
 `std/process/native`, `std/signal/native`, `std/thread/native`, `std/sync/native`, `std/net/native`,
 `std/time/native`, `std/tls/native`, `std/quic/native`, `std/crypto/native`,
-`std/crypto/openssl/native`, `std/web/native`, `std/window/native` and
-`std/gpu/opengl/native` select compatible providers. `std/platform/native` exposes advanced native values;
+`std/crypto/openssl/native`, `std/web/native`, `std/window/native`,
+`std/gpu/opengl/native` and `std/gpu/hal/native` select compatible providers. `std/platform/native` exposes advanced native values;
 `std/net/native` is also the public socket entry point. Explicit `linux`/`windows`
 imports are for matching-target integrations. `runtime.c` files are embedded
 implementation boundaries, not Dodo imports.
