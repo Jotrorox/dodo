@@ -1,5 +1,7 @@
 package main
 
+import "std/embedded/chip/rp_capture"
+import "std/embedded/chip/rp_pio"
 import "std/embedded/chip/rp_pwm"
 import "std/embedded/chip/rp_timer"
 import "std/embedded/hal"
@@ -11,7 +13,9 @@ import "std/embedded/hal/fake"
 // channels and periodic timers against a model of the timer block; and PWM
 // slices as periodic timers and counters (rp_pwm.SliceTimer) against a
 // model of the PWM block whose counters run from simulated time, paired
-// with the timer model's microsecond count.
+// with the timer model's microsecond count; and the words, timestamps, and
+// dividers of the PIO capture channel (rp_capture), whose program
+// tests/hal_library.rs checks against the compiler's assembler.
 
 fn expect_error(result: void!hal.Error, expected: hal.Error) {
     match result {
@@ -770,6 +774,54 @@ fn slice_timers(slices: u32) {
     core.assert_eq(rp_pwm.claimed(), 0u32)
 }
 
+// --- PIO capture ---------------------------------------------------------------
+
+fn pio_capture() {
+    // The program, as tests/hal_library.rs expects the assembler to make it.
+    expected := [0x0041u16, 0x00C3, 0x0100, 0x4041, 0x403F, 0x0046, 0x8000, 0x0108, 0x0049, 0x00C7, 0x4061, 0x403F, 0x004D, 0x8200]
+    program := rp_capture.program()
+    core.assert_eq(program.length, 14u32)
+    core.assert_eq(program.wrap_target, 0u32)
+    core.assert_eq(program.wrap, 13u32)
+    core.assert_eq(program.fifo, rp_pio.FIFO_RX)
+    core.assert(!program.in_right && !program.autopush)
+    for index in 0usize..14 {
+        core.assert_eq(program.instructions[index], expected[index])
+    }
+    for index in 14usize..32 {
+        core.assert_eq(program.instructions[index], 0u16)
+    }
+    // Words: the level in bit 31, and X, counting down from all ones,
+    // below it.
+    core.assert(rp_capture.word_rising(0x8000_0000))
+    core.assert(!rp_capture.word_rising(0x7FFF_FFFF))
+    core.assert_eq(rp_capture.word_count(0x7FFF_FFFF), 0u64)
+    core.assert_eq(rp_capture.word_count(0xFFFF_FFFE), 1u64)
+    core.assert_eq(rp_capture.word_count(0x7FFF_FF9B), 100u64)
+    core.assert_eq(rp_capture.word_count(0x0000_0000), 0x7FFF_FFFFu64)
+    core.assert_eq(rp_capture.word_count(0x8000_0001), 0x7FFF_FFFEu64)
+    // Extension: the largest count up to the latest possible one.
+    core.assert_eq(rp_capture.extend(100, 1100), 100u64)
+    core.assert_eq(rp_capture.extend(100, 0x8000_0000 + 1100), 0x8000_0064u64)
+    core.assert_eq(rp_capture.extend(0x7FFF_FFF0, 0x8000_0010), 0x7FFF_FFF0u64)
+    core.assert_eq(rp_capture.extend(5, 0x3_0000_0004), 0x2_8000_0005u64)
+    core.assert_eq(rp_capture.extend(5, 0x3_0000_0005), 0x3_0000_0005u64)
+    // A count beyond the estimate, as in the first ticks, is taken as is.
+    core.assert_eq(rp_capture.extend(2000, 1000), 2000u64)
+    // Dividers, in 256ths of four cycles per tick.
+    core.assert_eq(rp_capture.divider(125_000_000, 31_250_000)!, 256u32)
+    core.assert_eq(rp_capture.divider(125_000_000, 1_000_000)!, 8000u32)
+    core.assert_eq(rp_capture.divider(150_000_000, 37_500_000)!, 256u32)
+    core.assert_eq(rp_capture.divider(150_000_000, 10_000_000)!, 960u32)
+    rates := [62_500_000u32, 0, 3, 30_000_000]
+    for index in 0usize..4 {
+        match rp_capture.divider(125_000_000, rates[index]) {
+            ok(_) => core.assert(false),
+            err(error) => core.assert(error == hal.Error.InvalidInput),
+        }
+    }
+}
+
 fn main() {
     conversions()
     tick_counters()
@@ -782,4 +834,5 @@ fn main() {
     dividers()
     slice_timers(8)
     slice_timers(12)
+    pio_capture()
 }

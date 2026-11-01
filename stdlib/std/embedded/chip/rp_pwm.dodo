@@ -1117,6 +1117,10 @@ pub struct SliceTimer<B: rp_timer.Block>: hal.PeriodicTimer + hal.TickCounter {
     bit: u32
     claim: u32
     hz: u32
+    // Ticks per microsecond when that is a whole number, else 0: the
+    // counter extends with a multiplication then, rather than divisions,
+    // which the Cortex-M0+ does in software.
+    per_us: u64
     // The period in ticks, 0 before the first start.
     period: u64
     running: bool
@@ -1150,6 +1154,7 @@ pub struct SliceTimer<B: rp_timer.Block>: hal.PeriodicTimer + hal.TickCounter {
             bit: 1u32 << slice,
             claim: 3u32 << (2 * slice),
             hz: tick_hz,
+            per_us: 0,
             period: 0,
             running: false,
             start_us: 0,
@@ -1171,6 +1176,9 @@ pub struct SliceTimer<B: rp_timer.Block>: hal.PeriodicTimer + hal.TickCounter {
             CLAIMED = claimed | timer.claim
         }
         core.drop(section)
+        if tick_hz % 1_000_000 == 0 {
+            timer.per_us = (tick_hz / 1_000_000) as u64
+        }
         base := timer.base
         timer.pwm.write(base + CSR, 0)
         timer.pwm.write(base + DIV, divider)
@@ -1247,7 +1255,8 @@ pub struct SliceTimer<B: rp_timer.Block>: hal.PeriodicTimer + hal.TickCounter {
             return 0
         }
         self.clear_wrap()
-        ended := (self.now_ticks() - self.base_ticks) / self.period
+        position := 0u64
+        ended := self.split(&mut position)
         if ended <= self.polled {
             return 0
         }
@@ -1265,6 +1274,15 @@ pub struct SliceTimer<B: rp_timer.Block>: hal.PeriodicTimer + hal.TickCounter {
         if !self.running {
             return self.stopped_ticks
         }
+        position := 0u64
+        periods := self.split(&mut position)
+        return self.base_ticks + periods * self.period + position
+    }
+
+    // The whole periods since the start, and in `position` the ticks
+    // since the last of them: the counter and the microsecond timer read
+    // together, as extend_count combines them.
+    fn split(&self, position: &mut u64) -> u64 {
         section := hal.Critical.enter()
         now := rp_timer.read_count(&self.clock)
         count := self.pwm.read(self.base + CTR) & FULL_TOP
@@ -1273,7 +1291,12 @@ pub struct SliceTimer<B: rp_timer.Block>: hal.PeriodicTimer + hal.TickCounter {
         if now > self.start_us {
             elapsed = now - self.start_us
         }
-        return self.base_ticks + extend_count(elapsed, count, self.period, self.hz)
+        estimate := elapsed * self.per_us
+        if self.per_us == 0 {
+            estimate = hal.us_to_ticks(elapsed, self.hz)
+        }
+        *position = count as u64
+        return periods_since(estimate, count as u64, self.period)
     }
 
     // The counter's position in the period, 0 to period - 1.
@@ -1320,7 +1343,7 @@ pub struct SliceTimer<B: rp_timer.Block>: hal.PeriodicTimer + hal.TickCounter {
             CLAIMED &= ~self.claim
         }
         core.drop(section)
-        let SliceTimer { pwm, clock, base: _, interrupts, bit, claim, hz, period, running, start_us, base_ticks, polled, stopped_ticks } = self
+        let SliceTimer { pwm, clock, base: _, interrupts, bit, claim, hz, per_us, period, running, start_us, base_ticks, polled, stopped_ticks } = self
         return pwm
     }
 
@@ -1339,11 +1362,16 @@ pub struct SliceTimer<B: rp_timer.Block>: hal.PeriodicTimer + hal.TickCounter {
 pub fn extend_count(elapsed_us: u64, count: u32, period: u64, tick_hz: u32) -> u64 {
     estimate := hal.us_to_ticks(elapsed_us, tick_hz)
     position := count as u64 % period
+    return periods_since(estimate, position, period) * period + position
+}
+
+// The whole periods before a count at `position` in its period, closest to
+// `estimate` ticks.
+fn periods_since(estimate: u64, position: u64, period: u64) -> u64 {
     if estimate + period / 2 < position {
-        return position
+        return 0
     }
-    periods := (estimate + period / 2 - position) / period
-    return periods * period + position
+    return (estimate + period / 2 - position) / period
 }
 
 // A slice as a timer on the chip: a SliceTimer over the PWM block and the

@@ -5,6 +5,7 @@ import "std/embedded/cortex_m"
 import "std/embedded/hal"
 import "std/embedded/power"
 import "std/embedded/chip/rp_adc"
+import "std/embedded/chip/rp_capture"
 import "std/embedded/chip/rp_dma"
 import "std/embedded/chip/rp_flash"
 import "std/embedded/chip/rp_multicore"
@@ -782,6 +783,22 @@ pub struct Pins {
     // 29 or for a count of 0, Busy if a pin is taken.
     pub fn pio_pins(&mut self, pio: &rp_pio.Pio, first: u32, count: u32) -> void!hal.Error {
         return self.bank.pio_pins(pio, first, count)
+    }
+
+    // Claim pin `pin` for PIO block `pio` and capture its edges
+    // (rp_capture.RISING, FALLING, or BOTH) with one of the block's state
+    // machines: a hal.InputCapture whose edge times the state machine
+    // latches, in ticks of `tick_hz`, up to SYS_HZ / 4. rp_capture
+    // documents it. Errors as for pio_pins, and InvalidInput for a rate
+    // rp_capture.divider refuses; Busy without a free state machine or 14
+    // free instruction slots.
+    pub fn edge_capture(&mut self, pio: &mut rp_pio.Pio, pin: u32, edges: u32, tick_hz: u32) -> rp_capture.EdgeCapture!hal.Error {
+        return self.bank.edge_capture(pio, pin, edges, tick_hz)
+    }
+
+    // Give back a capture from `edge_capture` to the block it came from.
+    pub fn release_edge_capture(&mut self, capture: rp_capture.EdgeCapture, pio: &mut rp_pio.Pio) {
+        self.bank.release_edge_capture(capture, pio)
     }
 
     // Give back a PIO block, once its state machines have been given back

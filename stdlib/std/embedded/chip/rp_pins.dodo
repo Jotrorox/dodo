@@ -3,6 +3,7 @@ package rp_pins
 import "core/ptr"
 import "std/embedded/hal"
 import "std/embedded/chip/rp_adc"
+import "std/embedded/chip/rp_capture"
 import "std/embedded/chip/rp_dma"
 import "std/embedded/chip/rp_pio"
 import "std/embedded/chip/rp_pwm"
@@ -687,6 +688,45 @@ pub struct Bank<C> {
         }
         self.pio_pins[block as usize] |= mask
         return ok()
+    }
+
+    // Claim pin `pin` for PIO block `pio` and capture its `edges`
+    // (rp_capture.RISING, FALLING, or BOTH) with a free state machine of
+    // the block, in ticks of `tick_hz`; see rp_capture. Errors as for
+    // pio_pins and rp_capture.EdgeCapture.new.
+    pub fn edge_capture(&mut self, pio: &mut rp_pio.Pio, pin: u32, edges: u32, tick_hz: u32) -> rp_capture.EdgeCapture!hal.Error {
+        self.pio_pins(pio, pin, 1)?
+        timer := self.chip.timer_base()
+        clock_hz := self.chip.clock_hz()
+        // SAFETY: Bank.new vouches for the timer, and the PIO blocks run
+        // from the clock clock_hz reports.
+        opened := unsafe {
+            rp_capture.EdgeCapture.new(pio, pin, edges, clock_hz, tick_hz, timer)
+        }
+        match opened {
+            ok(capture) => {
+                return ok(capture)
+            }
+            err(error) => {
+                self.release_pio_pin(pio.number(), pin)
+                return err(error)
+            }
+        }
+    }
+
+    // Give back a capture from `edge_capture` to `pio`, the block it came
+    // from: its state machine and program, and its pin, which is
+    // disconnected.
+    pub fn release_edge_capture(&mut self, capture: rp_capture.EdgeCapture, pio: &mut rp_pio.Pio) {
+        pin := capture.pin()
+        capture.release(pio)
+        self.release_pio_pin(pio.number(), pin)
+    }
+
+    fn release_pio_pin(&mut self, block: u32, pin: u32) {
+        mask := 1u32 << pin
+        self.pio_pins[block as usize] &= ~mask
+        self.disconnect(mask)
     }
 
     // Give back a PIO block from `pio` once its state machines have been

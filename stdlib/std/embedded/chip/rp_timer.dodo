@@ -265,7 +265,12 @@ pub struct Alarm<B: Block>: hal.TickCounter + hal.Compare + hal.PeriodicTimer {
         if now < self.next {
             return 0
         }
-        periods := (now - self.next) / self.period + 1
+        // Usually the poll comes within a period, which needs no division,
+        // a slow one on the Cortex-M0+.
+        periods := 1u64
+        if now - self.next >= self.period {
+            periods = (now - self.next) / self.period + 1
+        }
         next := self.next + periods * self.period
         self.next = next
         self.arm_at(next)

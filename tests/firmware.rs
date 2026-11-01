@@ -278,6 +278,181 @@ fn main() {
     }
 }
 
+// The timer protocols at other rates on a board: a timer alarm as a
+// compare channel and as a periodic timer, a PWM slice as a periodic timer
+// and tick counter, a PWM output's wrap interrupt, a PIO edge capture, and
+// on the RP2350 TIMER1, through generic drivers, with interrupt handlers
+// for the alarm and the PWM wrap in the vector table.
+#[test]
+fn timer_channels_link_for_every_board() {
+    if !ld_lld() {
+        return;
+    }
+    let scratch = Scratch::new("timer-channels");
+    let common = r#"package main
+import "std/embedded/board"
+import "std/embedded/chip"
+import "std/embedded/chip/rp_capture"
+import "std/embedded/chip/rp_pwm"
+import "std/embedded/cortex_m"
+import "std/embedded/hal"
+static mut ALARM: Option<chip.Alarm> = none
+static mut TIMER: Option<rp_pwm.PwmTimer> = none
+static mut PERIODS: u32 = 0
+@interrupt(ALARM_VECTOR)
+fn alarm_fired() {
+    unsafe {
+        match &mut ALARM {
+            some(alarm) => {
+                PERIODS += alarm.poll_periods()
+            }
+            none => {}
+        }
+    }
+}
+@interrupt(PWM_VECTOR)
+fn wrapped() {
+    unsafe {
+        match &mut TIMER {
+            some(timer) => {
+                PERIODS += timer.poll_periods()
+            }
+            none => {}
+        }
+    }
+}
+fn measure<C: hal.TickCounter>(counter: &C) -> u64 {
+    start := counter.now_ticks()
+    for hal.elapsed_ticks(counter, start) < 100 {}
+    return hal.ticks_to_ns(hal.elapsed_ticks(counter, start), counter.tick_hz())
+}
+fn pulse<C: hal.Compare>(channel: &mut C) -> void!hal.Error {
+    hal.schedule_in_ticks(channel, 1000)?
+    hal.wait_for_compare(channel)
+    return ok()
+}
+fn every<P: hal.PeriodicTimer>(timer: &mut P, period_us: u64) -> u32!hal.Error {
+    hal.start_periodic_us(timer, period_us)?
+    timer.listen()
+    return ok(hal.wait_periods(timer))
+}
+fn edges<C: hal.InputCapture>(input: &mut C) -> u64!hal.Error {
+    return hal.capture_ticks(input, 1_000_000)
+}
+fn main() {
+    b := board.take()!
+    alarm := b.timer.alarm(1)!
+    pulse(&mut alarm)!
+    core.assert(every(&mut alarm, 500)! >= 1)
+    core.assert(measure(&b.timer) >= 100_000)
+    irq := alarm.irq()
+    unsafe {
+        ALARM = some(alarm)
+    }
+    cortex_m.enable(irq)
+    timer := b.pins.pwm_timer(3, 1_000_000)!
+    core.assert(every(&mut timer, 100)! >= 1)
+    core.assert(measure(&timer) >= 100_000)
+    wrap := timer.irq()
+    unsafe {
+        TIMER = some(timer)
+    }
+    cortex_m.enable(wrap)
+    output := b.pins.pwm(0, 1000)!
+    output.listen_wrap()
+    for !output.wrapped() {}
+    output.clear_wrap()
+    output.ignore_wrap()
+    b.pins.release_pwm(output)
+    pio := b.pins.pio(0)!
+    capture := b.pins.edge_capture(&mut pio, 5, rp_capture.RISING, 1_000_000)!
+    match edges(&mut capture) {
+        ok(ticks) => core.assert(ticks > 0),
+        err(error) => core.assert(error == hal.Error.Timeout),
+    }
+    b.pins.release_edge_capture(capture, &mut pio)
+    b.pins.release_pio(pio)
+    extra(&mut b)
+}
+"#;
+    let rp2040 = "fn extra(b: &mut board.Board) {}\n";
+    let rp2350 = r#"fn extra(b: &mut board.Board) {
+    second := b.timer.timer1(chip.SYS_HZ)!
+    core.assert(measure(&second) >= 100_000)
+    channel := second.alarm(0)!
+    pulse(&mut channel)!
+    core.assert(every(&mut channel, 1000)! >= 1)
+    hal.schedule_in_us(&mut channel, 10)!
+    second.release_alarm(channel)
+    b.timer.release_timer1(second)
+    slow := b.timer.timer1(100_000)!
+    core.assert(slow.tick_hz() == 100_000)
+    b.timer.release_timer1(slow)
+}
+"#;
+    // The alarm's and the PWM wrap's vectors and interrupt numbers.
+    let boards = [
+        (
+            "pico",
+            0xE48B_FF56u32,
+            "TIMER_IRQ_1",
+            1usize,
+            "PWM_IRQ_WRAP",
+            4usize,
+            rp2040,
+        ),
+        (
+            "pico2",
+            0xE48B_FF59,
+            "TIMER0_IRQ_1",
+            1,
+            "PWM_IRQ_WRAP_0",
+            8,
+            rp2350,
+        ),
+        (
+            "pico2_w",
+            0xE48B_FF59,
+            "TIMER0_IRQ_1",
+            1,
+            "PWM_IRQ_WRAP_0",
+            8,
+            rp2350,
+        ),
+    ];
+    for (board, family, alarm, alarm_irq, wrap, wrap_irq, extra) in boards {
+        let text = common
+            .replace("ALARM_VECTOR", alarm)
+            .replace("PWM_VECTOR", wrap)
+            + extra;
+        let source = scratch.write(&format!("timers-{board}.dodo"), &text);
+        for level in ["0", "2"] {
+            let elf = scratch.path(&format!("timers-{board}-O{level}.elf"));
+            build(&[
+                "build",
+                source.to_str().unwrap(),
+                "--board",
+                board,
+                "-O",
+                level,
+                "-o",
+                &elf,
+            ]);
+            let path = Path::new(&elf);
+            let bytes = fs::read(path).unwrap();
+            let image = flash_image(&fs::read(path.with_extension("uf2")).unwrap(), family);
+            let vectors = elf_symbol(&bytes, "__vector_table").unwrap() as usize - 0x1000_0000;
+            for (name, irq) in [(alarm, alarm_irq), (wrap, wrap_irq)] {
+                assert_eq!(
+                    word(&image, vectors + 4 * (16 + irq)),
+                    elf_symbol(&bytes, name).unwrap() | 1,
+                    "{board} -O{level}: {name}"
+                );
+            }
+        }
+    }
+}
+
 // Low power on a board: the chip's Power through the portable protocol
 // and directly, and the example. Needs no linker.
 #[test]

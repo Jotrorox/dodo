@@ -119,6 +119,49 @@ fn timer_protocols_alarms_and_pwm_timers_execute_against_fakes_and_models() {
 }
 
 #[test]
+fn pio_capture_program_matches_the_compiler_assembler() {
+    // rp_capture writes its program as words so that desktop tests can run
+    // it; these are what timer_checks.dodo expects of it. The compiler's
+    // own assembler must produce the same from the pioasm source.
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let scratch = Scratch::new("capture-program");
+    let ir = scratch.0.join("program.ll");
+    success(
+        &dodo(
+            &[
+                "build",
+                root.join("tests/fixtures/rp_capture_program.dodo")
+                    .to_str()
+                    .unwrap(),
+                "--board",
+                "pico",
+                "-O",
+                "0",
+                "--emit",
+                "llvm-ir",
+                "-o",
+            ],
+            &ir,
+        ),
+        "assemble the capture program",
+    );
+    let text = fs::read_to_string(&ir).unwrap();
+    let expected: [(&str, &[u16]); 2] = [
+        (
+            "EDGES",
+            &[
+                0x0041, 0x00C3, 0x0100, 0x4041, 0x403F, 0x0046, 0x8000, 0x0108, 0x0049, 0x00C7,
+                0x4061, 0x403F, 0x004D, 0x8200,
+            ],
+        ),
+        ("EXECS", &[0xE041, 0xA02B, 0x00C0]),
+    ];
+    for (name, words) in expected {
+        assert_eq!(program_words(&text, name), words, "{name}");
+    }
+}
+
+#[test]
 fn pwm_input_capture_measures_against_a_simulated_slice() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let scratch = Scratch::new("pwm-capture");
