@@ -30,19 +30,22 @@ fn step(ball: &mut Ball, micros: i64, width: i64, height: i64, radius: i64) {
 }
 
 fn run() -> void!window.Error {
-    win := window.open(window.Options.new("Bouncing ball", 480, 320))?
+    app := window.App.new()?
+    win := app.open(window.Options.new("Bouncing ball", 480, 320))?
     scale := win.scale()
     label := font.medium().scaled(scale)
     radius := 16 * scale as i32
     ball := Ball { x: 100000, y: 100000, dx: 180 * scale as i64, dy: 120 * scale as i64 }
     paused := false
+    // Ask for the first frame; each Frame event asks for the next.
+    win.request_frame()?
     for {
-        // Handle events as they come; none means the next frame is due.
-        match win.wait_event_until_frame()? {
-            some(window.Event.Close) => {
+        // Handle events as they come; Frame means the next frame is due.
+        match app.wait_event()? {
+            window.Event.Close(_) | window.Event.Quit => {
                 return ok()
             }
-            some(window.Event.Key(key)) => {
+            window.Event.Key(_, key) => {
                 if key.key == window.Key.Escape {
                     return ok()
                 }
@@ -51,17 +54,17 @@ fn run() -> void!window.Error {
                 }
                 continue
             }
-            some(window.Event.MouseButton(button)) => {
+            window.Event.MouseButton(_, button) => {
                 if button.pressed {
                     ball.x = button.x as i64 * 1000
                     ball.y = button.y as i64 * 1000
                 }
                 continue
             }
-            some(_) => {
+            window.Event.Frame(_) => {}
+            _ => {
                 continue
             }
-            none => {}
         }
         width := win.width() as i64 * 1000
         height := win.height() as i64 * 1000
@@ -80,6 +83,7 @@ fn run() -> void!window.Error {
         canvas.text(&label, 8 * scale as i32, 8 * scale as i32, hint, graphics.WHITE)
         dirty := canvas.take_dirty()
         win.update(dirty)?
+        win.request_frame()?
     }
 }
 

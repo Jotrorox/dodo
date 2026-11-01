@@ -1,7 +1,8 @@
 //! Firmware platforms: board and chip settings, `std/embedded/board` and `std/embedded/chip`
 //! resolution, the embedded chip runtimes, and (when ld.lld is installed)
 //! linking flashable images. Running on a real board is scripts/test_pico.py
-//! (`--board pico`, `--board pico2`, or `--board pico2_w`).
+//! (`--board pico`, `--board pico2`, or `--board pico2_w`); running on
+//! emulated chips is scripts/test_emulator.py.
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -96,6 +97,57 @@ fn main() {
     }
 }
 
+// The board watchdog: started, fed through the portable protocol, its reset
+// reason and scratch words read, and a deliberate restart. Needs no linker.
+#[test]
+fn watchdogs_compile_for_every_board() {
+    let scratch = Scratch::new("watchdog");
+    let source = scratch.write(
+        "watchdog.dodo",
+        r#"package main
+import "std/embedded/board"
+import "std/embedded/hal"
+fn keep_alive<W: hal.Watchdog>(dog: &mut W) {
+    dog.feed()
+}
+fn main() {
+    b := board.take()!
+    if b.watchdog.reset_reason() == hal.ResetReason.Timeout {
+        count := b.watchdog.scratch(0)
+        b.watchdog.set_scratch(0, count + 1)
+    }
+    longest := b.watchdog.max_timeout_ms()
+    b.watchdog.start(longest)!
+    for _ in 0..10u32 {
+        b.timer.delay_ms(100)
+        keep_alive(&mut b.watchdog)
+    }
+    if b.watchdog.remaining_us() < 1000 && b.watchdog.is_running() {
+        b.watchdog.stop()
+    }
+    b.watchdog.restart()
+}
+"#,
+    );
+    for board in ["pico", "pico2", "pico2_w"] {
+        for level in ["0", "2"] {
+            let object = scratch.path(&format!("watchdog-{board}-O{level}.o"));
+            stdout(&dodo(&[
+                "build",
+                source.to_str().unwrap(),
+                "--board",
+                board,
+                "-O",
+                level,
+                "--emit",
+                "obj",
+                "-o",
+                &object,
+            ]));
+        }
+    }
+}
+
 // The executor on a board: tasks woken by an alarm, a GPIO edge, and the
 // UART, with the alarm as the executor's clock. Needs no linker.
 #[test]
@@ -145,6 +197,132 @@ fn main() {
     );
     for board in ["pico", "pico2", "pico2_w"] {
         for (input, name) in [(tasks.as_path(), "tasks"), (source.as_path(), "clock")] {
+            for level in ["0", "2"] {
+                let object = scratch.path(&format!("{name}-{board}-O{level}.o"));
+                stdout(&dodo(&[
+                    "build",
+                    input.to_str().unwrap(),
+                    "--board",
+                    board,
+                    "-O",
+                    level,
+                    "--emit",
+                    "obj",
+                    "-o",
+                    &object,
+                ]));
+            }
+        }
+    }
+}
+
+// Every board's timer is a hal counter and delay, and its alarms are hal
+// alarms: drivers generic over the protocols take them unchanged.
+#[test]
+fn timer_protocols_compile_for_every_board() {
+    let scratch = Scratch::new("timer-protocols");
+    let source = scratch.write(
+        "timers.dodo",
+        r#"package main
+import "std/embedded/board"
+import "std/embedded/hal"
+fn settle<T: hal.Delay + hal.Counter>(timer: &mut T) -> u64 {
+    start := timer.now_us()
+    deadline := hal.Deadline.after(timer, 2000)
+    for !deadline.passed(timer) {
+        timer.delay_us(100)
+    }
+    return hal.elapsed_us(timer, start)
+}
+fn pulse<A: hal.Alarm>(alarm: &mut A) -> void!hal.Error {
+    hal.schedule_in_us(alarm, 500)?
+    hal.wait_for_alarm(alarm)
+    alarm.schedule_at_us(0)?
+    core.assert(alarm.fired())
+    alarm.clear()
+    alarm.cancel()
+    return ok()
+}
+fn main() {
+    b := board.take()!
+    core.assert(settle(&mut b.timer) >= 2000)
+    ticker := hal.Ticker.start(&b.timer, 1000)
+    ticker.wait(&b.timer)
+    alarm := b.timer.alarm(1)!
+    pulse(&mut alarm)!
+    far := alarm.now_us() + 0x8000_0000
+    match alarm.schedule_at_us(far) {
+        ok() => core.assert(false),
+        err(error) => core.assert(error == hal.Error.InvalidInput),
+    }
+    b.timer.release_alarm(alarm)
+}
+"#,
+    );
+    for board in ["pico", "pico2", "pico2_w"] {
+        for level in ["0", "2"] {
+            let object = scratch.path(&format!("timers-{board}-O{level}.o"));
+            stdout(&dodo(&[
+                "build",
+                source.to_str().unwrap(),
+                "--board",
+                board,
+                "-O",
+                level,
+                "--emit",
+                "obj",
+                "-o",
+                &object,
+            ]));
+        }
+    }
+}
+
+// Low power on a board: the chip's Power through the portable protocol
+// and directly, and the example. Needs no linker.
+#[test]
+fn power_controls_compile_for_every_board() {
+    let scratch = Scratch::new("power");
+    let example = root().join("examples/low_power.dodo");
+    let source = scratch.write(
+        "power.dodo",
+        r#"package main
+import "std/embedded/board"
+import "std/embedded/chip"
+import "std/embedded/hal"
+import "std/embedded/power"
+fn idle<P: power.Power>(chip_power: &mut P, keep: power.Clocks) -> power.Clocks {
+    stopped := chip_power.disable_unused_clocks()
+    chip_power.set_sleep_clocks(keep)
+    chip_power.set_mode(power.Mode.DeepSleep)
+    chip_power.sleep()
+    chip_power.set_mode(power.Mode.Sleep)
+    return stopped
+}
+fn main() {
+    b := board.take()!
+    stopped := idle(&mut b.power, chip.ALARM_CLOCKS | chip.CLOCK_GPIO)
+    core.assert((stopped & chip.ESSENTIAL_CLOCKS) == 0)
+    match b.power.disable_clocks(chip.ESSENTIAL_CLOCKS) {
+        ok() => core.assert(false),
+        err(error) => core.assert(error == hal.Error.InvalidInput),
+    }
+    b.power.disable_clocks(chip.CLOCK_UART1)!
+    serial := b.pins.uart(4, none, 9600)!
+    core.assert((b.power.enabled_clocks() & chip.CLOCK_UART1) == chip.CLOCK_UART1)
+    b.pins.release_uart(serial)
+    power.deep_sleep(&mut b.power, chip.ALARM_CLOCKS)
+    button := b.pins.input(15)!
+    wake := power.Wake.new()
+    wake.on(15, power.RISING_EDGE | power.LEVEL_HIGH)
+    woken := b.power.dormant(&wake)!
+    core.assert(woken <= 1u64 << 15)
+    b.pins.release(button)
+}
+"#,
+    );
+    for board in ["pico", "pico2", "pico2_w"] {
+        for (input, name) in [(source.as_path(), "power"), (example.as_path(), "example")] {
             for level in ["0", "2"] {
                 let object = scratch.path(&format!("{name}-{board}-O{level}.o"));
                 stdout(&dodo(&[
@@ -480,6 +658,10 @@ fn chip_runtimes_provide_startup_and_helper_symbols() {
             "dodo_panic_report",
             "dodo_usb_interrupt",
             "dodo_dma_interrupt",
+            "dodo_flash_erase",
+            "dodo_flash_program",
+            "dodo_flash_image_end",
+            "dodo_flash_end",
             "memcpy",
             "memset",
             "__udivdi3",
@@ -553,6 +735,61 @@ fn chip_runtimes_provide_startup_and_helper_symbols() {
         "fmod",
     ] {
         assert!(text.contains(name), "rp2350 runtime lacks {name}");
+    }
+}
+
+#[test]
+fn flash_storage_links_for_every_board() {
+    if !ld_lld() {
+        return;
+    }
+    let scratch = Scratch::new("storage");
+    let example = root().join("examples/boot_counter.dodo");
+    for (board, flash_size, family) in [
+        ("pico", 2u32 << 20, 0xE48B_FF56),
+        ("pico2", 4 << 20, 0xE48B_FF59),
+        ("pico2_w", 4 << 20, 0xE48B_FF59),
+    ] {
+        for level in ["0", "2"] {
+            let elf = scratch.path(&format!("boot-counter-{board}-O{level}.elf"));
+            build(&[
+                "build",
+                example.to_str().unwrap(),
+                "--board",
+                board,
+                "-O",
+                level,
+                "-o",
+                &elf,
+            ]);
+            let path = Path::new(&elf);
+            if board == "pico" {
+                check_rp2040_firmware(path);
+            } else {
+                check_rp2350_firmware(path);
+            }
+            let bytes = fs::read(path).unwrap();
+            let symbol = |name: &str| {
+                elf_symbol(&bytes, name).unwrap_or_else(|| panic!("{board} lacks {name}"))
+            };
+            // rp_flash sizes the flash from the board and keeps regions above
+            // the image, which ends where the UF2 payload does.
+            assert_eq!(symbol("__flash_end"), 0x1000_0000 + flash_size);
+            let image = flash_image(&fs::read(path.with_extension("uf2")).unwrap(), family);
+            let end = (symbol("__flash_image_end") - 0x1000_0000) as usize;
+            assert_eq!(end.div_ceil(256) * 256, image.len(), "{board}");
+            let in_sram = |address: u32| (0x2000_0000..0x2008_2000).contains(&address);
+            if board == "pico" {
+                // With execute-in-place off, the RP2040 routine and the copy
+                // of .boot2 it restores it with run from SRAM.
+                assert!(in_sram(symbol("dodo_flash_erase")));
+                assert!(in_sram(symbol("dodo_flash_program")));
+                assert!(in_sram(symbol("dodo_rp2040_boot2_copy")));
+            } else {
+                // The RP2350's flash_op restores execute-in-place itself.
+                assert!(symbol("dodo_flash_erase") >= 0x1000_0000);
+            }
+        }
     }
 }
 
@@ -1134,6 +1371,50 @@ fn dma_signals_are_raised_from_the_default_dma_interrupt() {
             0,
             "{chip}"
         );
+    }
+}
+
+#[test]
+fn random_number_generators_compile_for_every_board() {
+    let scratch = Scratch::new("rng-compile");
+    let source = scratch.write(
+        "rng.dodo",
+        r#"package main
+import "std/embedded/board"
+import "std/embedded/hal"
+fn roll<R: hal.Rng>(rng: &mut R) -> u32!hal.Error {
+    return ok(hal.random_below(rng, 6)? + 1)
+}
+fn main() {
+    b := board.take()!
+    key := [0u8; 32]
+    b.rng.fill(&mut key)!
+    soft := hal.SoftRng.from_rng(&mut b.rng)!
+    b.timer.delay_us(soft.next_u32() % 1000)
+    generator: &mut dyn hal.Rng = &mut b.rng
+    generator.fill(&mut key)!
+    if roll(&mut b.rng)! == 6 && hal.random_u64(&mut soft)! != 0 {
+        b.led.toggle()
+    }
+}
+"#,
+    );
+    for board in ["pico", "pico2", "pico2_w"] {
+        for level in ["0", "2"] {
+            let object = scratch.path(&format!("rng-{board}-O{level}.o"));
+            stdout(&dodo(&[
+                "build",
+                source.to_str().unwrap(),
+                "--board",
+                board,
+                "-O",
+                level,
+                "--emit",
+                "obj",
+                "-o",
+                &object,
+            ]));
+        }
     }
 }
 

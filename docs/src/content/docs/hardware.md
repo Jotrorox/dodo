@@ -12,16 +12,20 @@ grouped under `std/embedded` in layers, on top of two small compiler packages:
 
 | Layer | Import | What it gives you |
 | --- | --- | --- |
-| Device protocols | `std/embedded/hal` | Pin, delay, I2C, SPI, and serial interfaces that drivers are written against. |
-| Peripheral drivers | `std/embedded/peripheral/...` | I2C, SPI, and UART controller drivers, and Espressif's USB serial port, shared by every chip that contains the controller. |
+| Device protocols | `std/embedded/hal` | Pin, delay, I2C, SPI, serial, PWM, analog, CAN, and I2S interfaces that drivers are written against, blocking and polling, with target (slave) sides, pulse capture, and DMA buffer transfers. |
+| Peripheral drivers | `std/embedded/peripheral/...` | I2C, SPI, and UART controller drivers, shared by every chip that contains the controller. |
 | Typed registers | `std/embedded/hal` | `hal.Reg<T>` and `hal.RegisterBlock` handles and mask constants for memory-mapped registers. |
 | Interrupts | `std/embedded/hal`, `std/embedded/cortex_m` | `@interrupt` handlers; `hal.Critical`, a section that masks interrupts until it is dropped; `hal.Handler`, a slot for a handler chosen at run time; the Cortex-M interrupt controller and SysTick; the ESP32-C6's interrupt matrix in `std/embedded/chip/esp32c6`. |
 | Tasks | `std/embedded/executor` | Several activities on one core, each woken on time or by an interrupt, with the core asleep in between. |
-| DMA | `std/embedded/hal`, `std/embedded/chip/rp_dma`, `std/embedded/chip/esp32c6` | `hal.DmaChannel`, through which drivers move data while the program does other work; the RP2040's and RP2350's channels, and the ESP32-C6's for copies. |
-| Desktop testing | `std/embedded/hal/fake` | In-memory pins, delays, buses, serial ports, and a simulated clock that record what a driver did. |
-| Boards | `std/embedded/board` | The selected board: one `take()` and the same LED, pin, and timer fields on every board. |
+| Real-time clocks | `std/embedded/hal`, `std/embedded/chip/rp_rtc`, `std/embedded/rtc/ds3231` | `hal.Rtc` and `hal.RtcAlarm`: the time of day and an alarm, the same on the RP2040's RTC, the RP2350's always-on timer, and a DS3231 clock chip on I2C. |
+| Low power | `std/embedded/power` | Sleep and deep sleep, clock gating, and a dormant state woken by pins, through one `Power` protocol that every chip and the fakes implement. |
+| DMA | `std/embedded/hal`, `std/embedded/chip/rp_dma` | `hal.DmaChannel`, through which drivers move data while the program does other work; the RP2040's and RP2350's channels. |
+| Persistent storage | `std/embedded/hal`, `std/embedded/storage`, `std/embedded/chip/rp_flash` | `hal.Flash`, erasing and writing NOR flash; a power-cut-safe key-value store and flash regions on any such device; the RP2040's and RP2350's program flash. |
+| Desktop testing | `std/embedded/hal/fake` | In-memory pins, delays, buses, serial ports, flash, a real-time clock, a simulated clock, and simulated power controls that record what a driver did. |
+| Boards | `std/embedded/board` | The selected board: one `take()` and the same LED, pin, timer, and clock fields on every board. |
 | Chip support | `std/embedded/chip` | The selected microcontroller's peripherals, for custom boards. |
 | Wireless chip | `std/embedded/wireless/cyw43` | The CYW43439 on the Pico 2 W: power-up, its gSPI bus, and its GPIO pins. |
+| CAN controllers | `std/embedded/can/mcp2515` | The MCP2515 CAN controller over SPI, as a `hal.Can`. |
 | Display panels | `std/embedded/display`, `.../display/st7789`, `.../display/ssd1306` | ST7789 colour and SSD1306 OLED panels as [graphics displays](graphics.md#display-panels), over SPI or I2C. |
 | Raw access | `core/mmio`, `core/cpu`, `asm(...)` | Volatile loads/stores, barriers, interrupt masking, `wfi`, inline assembly. |
 
@@ -92,11 +96,17 @@ methods implements it and can be passed where a driver expects it:
 | `hal.OutputPin` | `set_high(&mut self)`, `set_low(&mut self)` |
 | `hal.InputPin` | `is_high(&self) -> bool` |
 | `hal.Delay` | `delay_us(&mut self, microseconds: u32)` |
+| `hal.Counter` | `now_us(&self) -> u64` |
+| `hal.Alarm` | `now_us(&self) -> u64`<br>`schedule_at_us(&mut self, time_us: u64) -> void!hal.Error`<br>`cancel(&mut self)`<br>`fired(&self) -> bool`<br>`clear(&mut self)` |
 | `hal.I2c` | `write(&mut self, address: u8, bytes: &[u8]) -> void!hal.Error`<br>`read(&mut self, address: u8, buffer: &mut[u8]) -> void!hal.Error`<br>`write_read(&mut self, address: u8, bytes: &[u8], buffer: &mut[u8]) -> void!hal.Error` |
 | `hal.Spi` | `transfer(&mut self, bytes: &mut[u8]) -> void!hal.Error`<br>`write(&mut self, bytes: &[u8]) -> void!hal.Error` |
 | `hal.PwmOutput` | `max_duty(&self) -> u16`<br>`set_duty(&mut self, duty: u16) -> void!hal.Error` |
 | `hal.AnalogInput` | `max_value(&self) -> u16`<br>`read(&mut self) -> u16!hal.Error` |
-| Serial port | [`io.Reader` and `io.Writer`](io.md) from `std/io`. |
+| `hal.Rng` | `fill(&mut self, bytes: &mut[u8]) -> void!hal.Error` |
+| `hal.Rtc` | `is_set(&mut self) -> bool!hal.Error`<br>`now_ms(&mut self) -> u64!hal.Error`<br>`set_ms(&mut self, time_ms: u64) -> void!hal.Error`<br>`resolution_ms(&self) -> u32` |
+| `hal.RtcAlarm` | `set_alarm_ms(&mut self, time_ms: u64) -> void!hal.Error`<br>`alarm_fired(&mut self) -> bool!hal.Error`<br>`clear_alarm(&mut self) -> void!hal.Error` |
+| Serial port | [`io.Reader` and `io.Writer`](io.md) from `std/io`; `serial.Port` adds `flush(&mut self) -> void!io.Error`. |
+| `hal.Flash` | `capacity(&self) -> u32`, `erase_size(&self) -> u32`, `write_size(&self) -> u32`<br>`read(&mut self, offset: u32, buffer: &mut[u8]) -> void!hal.Error`<br>`erase(&mut self, offset: u32, length: u32) -> void!hal.Error`<br>`write(&mut self, offset: u32, bytes: &[u8]) -> void!hal.Error` |
 | `hal.Registers` | `read(&mut self, offset: usize) -> u32`<br>`write(&mut self, offset: usize, value: u32)` |
 
 Write drivers against bounded parameters, `fn probe<B: hal.I2c>(bus: &mut B)`,
@@ -112,14 +122,36 @@ way, with its frequency, and the protocol then only sets its duty cycle: the
 output is high for `duty / max_duty()` of each period, so 0 holds it low and
 `max_duty()` holds it high. An analog input reads 0 at ground and
 `max_value()`, such as 4095 for a 12-bit converter, at the converter's
-reference voltage. `hal.I2C_STANDARD_HZ`,
+reference voltage. A [random number generator](#random-numbers) fills
+buffers with random bytes. A [real-time clock](#real-time-clocks) counts
+milliseconds since the Unix epoch. `hal.I2C_STANDARD_HZ`,
 `hal.I2C_FAST_HZ`, and `hal.I2C_FAST_PLUS_HZ` name the usual I2C speeds.
 The register block protocol is for [peripheral drivers](#register-blocks)
 rather than device drivers.
 
-Pins and delays cannot fail. Bus, PWM, and analog operations return
+A counter keeps time: `now_us()` is microseconds since a fixed start, such
+as the chip's, in a `u64` that never decreases and that no program outlives.
+Drivers measure intervals and give up on stuck devices with one; see
+[timeouts and periodic work](#timeouts-and-periodic-work). An alarm fires
+once when its counter reaches the time given to `schedule_at_us`, replacing
+any earlier time and clearing an earlier firing; a time already reached
+fires at once, and one further ahead than the alarm reaches is
+`InvalidInput`. Code polls `fired()`, or the alarm's interrupt runs a
+handler, and either calls `clear()`. Turning that interrupt on is
+chip-specific, as `listen` and `irq` are on the
+[RP2040 and RP2350](#an-interrupt-driven-driver); the protocol only sets
+times and reports them. An alarm has `now_us` too, so it is also a counter.
+
+More protocols follow below: [polling forms](#polling-instead-of-waiting)
+of the buses that never wait, [targets](#being-the-device-targets) for being
+the device on an I2C or SPI bus, [pulse measurement](#measuring-pulses),
+[CAN](#can), [I2S audio](#i2s-audio), and [DMA buffer
+transfers](#transfers-in-the-background-dma).
+
+Pins, delays, and counters cannot fail. Alarm, bus, PWM, analog, clock,
+and random operations return
 `hal.Error`, one shared enum, because such a device may itself sit on a bus,
-as a PWM controller chip on I2C does: `Timeout`, `NoAcknowledge`, `Bus`,
+as a PWM controller chip or a clock chip on I2C does: `Timeout`, `NoAcknowledge`, `Bus`,
 `Overrun`, `Busy`, `InvalidInput`, and `Unsupported`. Every driver and chip uses the same error type, so `?` passes
 errors through layers without conversions, and `==` compares them. Use
 `hal.error_name(error)` for a log message.
@@ -149,12 +181,63 @@ fn log_reading<B: hal.I2c, W: io.Writer>(bus: &mut B, output: &mut W) -> u8!LogE
 The repository's `examples/sensor_log.dodo` tests this function against a fake
 bus and a memory buffer.
 
+### Random numbers
+
+A random number generator implements `hal.Rng`: `fill(bytes)` fills a
+buffer with random bytes, and `hal.random_u32`, `hal.random_u64`, and
+`hal.random_below` build numbers from them. Every board has one as `b.rng`,
+the best its chip offers, so code written against the protocol runs on any
+board and, with a fake or `hal.SoftRng`, in desktop tests:
+
+```dodo
+package main
+
+import "std/embedded/board"
+import "std/embedded/hal"
+
+// Roll a die with any generator.
+fn roll<R: hal.Rng>(rng: &mut R) -> u32!hal.Error {
+    return ok(hal.random_below(rng, 6)? + 1)
+}
+
+fn main() {
+    b := board.take()!
+    key := [0u8; 16]
+    b.rng.fill(&mut key)!
+    if roll(&mut b.rng)! == 6 {
+        b.led.set_high()
+    }
+}
+```
+
+Hardware generators gather entropy from physical noise, such as an
+oscillator's jitter, and differ in quality and speed: the
+[RP2040's](#random-numbers-on-the-rp2040-and-rp2350) suits seeds and games
+but not cryptographic keys, and the RP2350's is fit for keys. A generator
+whose source stops reports `Timeout`, and one whose health checks fail
+reports `Bus`; the bytes of a failed fill must not be used.
+
+`hal.SoftRng` is a software generator, xoshiro128**, that implements the
+protocol too. Seed it once from a hardware generator with
+`hal.SoftRng.from_rng(&mut b.rng)` and it produces numbers at a few cycles
+each, with `next_u32()` or the helpers, and never fails. Its output is
+statistically uniform but predictable to anyone who learns its 128-bit
+state, so it is for simulations, games, random delays, and test order, not
+keys. `hal.SoftRng.new(seed)` repeats the same sequence for the same seed,
+for reproducible tests.
+
 ### Helpers
 
 | Helper | Purpose |
 | --- | --- |
 | `hal.write_pin(&mut pin, high)` | Drive a pin from a `bool`. |
 | `hal.delay_ms(&mut delay, ms)` | Millisecond delay from any `delay_us`. |
+| `hal.elapsed_us(&counter, since_us)` | Microseconds since an earlier `now_us()`; 0 for a time still ahead. |
+| `hal.wait_until(&counter, time_us)` | Busy-wait until a counter reaches a time. |
+| `hal.Deadline` | A time by which something must happen: `Deadline.after(&counter, us)` or `Deadline.at(time_us)`, then `passed(&counter)`, `remaining_us(&counter)`, and `wait(&counter)`. |
+| `hal.Ticker` | Ticks at a fixed period without drift: `Ticker.start(&counter, period_us)`, then `ready(&counter)` once per tick, or `wait(&counter)`. Ticks missed entirely are skipped. |
+| `hal.schedule_in_us(&mut alarm, us)` | Fire an alarm a number of microseconds from now. |
+| `hal.wait_for_alarm(&mut alarm)` | Busy-wait until an alarm fires, then clear it. |
 | `hal.read_register(&mut bus, address, register)` | Read one numbered 8-bit I2C register. |
 | `hal.read_registers(&mut bus, address, first, buffer)` | Read consecutive I2C registers. |
 | `hal.write_register(&mut bus, address, register, value)` | Write one I2C register. |
@@ -162,7 +245,72 @@ bus and a memory buffer.
 | `hal.set_duty_fraction(&mut output, numerator, denominator)` | Set a PWM duty cycle to a fraction, rounded to the nearest step. |
 | `hal.set_pulse_us(&mut output, pulse_us, period_us)` | Set a PWM pulse length, as for a servo: `set_pulse_us(&mut servo, 1500, 20_000)` centres one on a 50 Hz output. |
 | `hal.read_millivolts(&mut input, reference_mv)` | Read an analog input as millivolts. |
+| `hal.random_u32(&mut rng)`, `hal.random_u64(&mut rng)` | A uniformly distributed number from a [random number generator](#random-numbers). |
+| `hal.random_below(&mut rng, bound)` | A uniformly distributed number from 0 to `bound - 1`, without modulo bias: `random_below(&mut rng, 6)? + 1` rolls a die. |
+| `hal.SoftRng` | A fast [software generator](#random-numbers) seeded from a hardware one. |
+| `hal.rtc_now(&mut clock)`, `hal.rtc_set(&mut clock, &date_time)` | Read or set a real-time clock as a UTC `time.DateTime`. |
+| `hal.rtc_alarm_at(&mut clock, &date_time)`, `hal.rtc_alarm_in(&mut clock, ms)` | Set a clock's alarm for a date and time, or some milliseconds from now. |
+| `hal.date_time_of_ms(ms)`, `hal.ms_of_date_time(&date_time)` | Convert between Unix milliseconds and a `time.DateTime`. |
 | `hal.SpiDevice<P>` | One SPI device and its chip-select pin; see below. |
+| `hal.BlockingI2c<B>`, `hal.BlockingSpi<B>` | The blocking protocol over a polling bus; see [polling](#polling-instead-of-waiting). |
+| `hal.capture(&mut input, polls)` | Wait for a pulse measurement. |
+| `hal.send_frame`, `hal.receive_frame` | Send or receive a CAN frame, waiting up to a number of polls. |
+| `hal.write_samples`, `hal.read_samples` | Move a whole slice of I2S samples, waiting for room or data. |
+| `hal.finish_transfer(&mut session)` | Wait for a DMA buffer transfer. |
+| `hal.dma_copy(&mut channel, &mut destination, &source)` | Copy memory with any DMA channel. |
+
+### Timeouts and periodic work
+
+A driver that waits for a device names no chip when it takes a counter.
+Boards' timers are both a counter and a delay, so a driver bounded by
+`hal.Delay + hal.Counter` polls, delays between polls, and gives up at a
+deadline. A `hal.Deadline` holds only its time, so it never borrows the
+counter, and in a test `fake.Delay` reaches the deadline without waiting:
+its time is the sum of the delays asked of it.
+
+```dodo test
+package ready
+
+import "std/embedded/hal"
+import "std/embedded/hal/fake"
+
+const ADDRESS: u8 = 0x48
+const STATUS: u8 = 0x00
+
+// Poll the status register every millisecond until it is nonzero, for at
+// most `timeout_us`.
+pub fn wait_ready<B: hal.I2c, T: hal.Delay + hal.Counter>(bus: &mut B, timer: &mut T, timeout_us: u64) -> void!hal.Error {
+    deadline := hal.Deadline.after(timer, timeout_us)
+    for hal.read_register(bus, ADDRESS, STATUS)? == 0 {
+        if deadline.passed(timer) {
+            return err(hal.Error.Timeout)
+        }
+        timer.delay_us(1000)
+    }
+    return ok()
+}
+
+@test
+fn a_stuck_device_times_out() {
+    bus := fake.I2c.new(ADDRESS)
+    timer := fake.Delay.new()
+    match wait_ready(&mut bus, &mut timer, 5000) {
+        ok() => assert(false),
+        err(error) => assert(error == hal.Error.Timeout),
+    }
+    assert_eq(timer.now_us(), 5000u64)
+    bus.set_register(STATUS, 1)
+    wait_ready(&mut bus, &mut timer, 5000)!
+}
+```
+
+A `hal.Ticker` runs work at a fixed period, such as sampling every 10 ms:
+`ticker := hal.Ticker.start(&b.timer, 10_000)`, then `ticker.wait(&b.timer)`
+before each sample. Every tick falls a whole number of periods after the
+start, so the samples do not drift however long each one takes. Firmware
+that runs several such jobs side by side uses the
+[executor](#tasks-and-the-executor) instead, whose tasks sleep rather than
+busy-wait.
 
 ### Several devices on one SPI bus
 
@@ -193,6 +341,450 @@ fn main() {
     display.write(&mut bus, &pixels)!
 }
 ```
+
+### Polling instead of waiting
+
+The protocols above wait: `bus.write_read(...)` returns when the transaction
+is over. Firmware that runs several things at once, such as
+[executor tasks](#tasks-and-the-executor), cannot afford that, so the buses
+also come in polling forms that never wait:
+
+| Interface | Methods |
+| --- | --- |
+| `hal.I2cPoll` | `poll_write(&mut self, address: u8, bytes: &[u8]) -> bool!hal.Error`<br>`poll_read(&mut self, address: u8, buffer: &mut[u8]) -> bool!hal.Error`<br>`poll_write_read(&mut self, address: u8, bytes: &[u8], buffer: &mut[u8]) -> bool!hal.Error`<br>`cancel(&mut self)` |
+| `hal.SpiPoll` | `poll_transfer(&mut self, bytes: &mut[u8]) -> bool!hal.Error`<br>`poll_write(&mut self, bytes: &[u8]) -> bool!hal.Error`<br>`cancel(&mut self)` |
+| `serial.PollPort` | `poll_read(&mut self, buffer: &mut[u8]) -> io.Poll!io.Error`<br>`poll_write(&mut self, bytes: &[u8]) -> io.Poll!io.Error`<br>`poll_flush(&mut self) -> bool!io.Error` |
+
+Every call does what the hardware allows right now, such as topping up a
+FIFO or collecting received bytes, and returns `false` while the operation
+continues and `true` once it has finished. The first call starts the
+operation; later calls pass the same arguments until it finishes, fails, or
+is cancelled. The operation's state lives in the bus, not in borrowed
+buffers, so the buffers stay yours between polls and a transaction can be any
+length: an I2C controller holds the bus with SCL low between polls, which
+devices accept as clock stretching. A call with a different address or length
+while one runs is `InvalidInput` and leaves the running one alone. Errors are
+those of the blocking methods, and the operation is over after one. Serial
+ports follow the progress contract of [`std/io`](io.md): `poll_read` returns
+what has arrived and `poll_write` takes what fits, Pending otherwise.
+
+A task keeps its buffers in fields and returns Pending until the poll says
+`true`:
+
+```dodo test
+package sampler
+
+import "std/embedded/executor"
+import "std/embedded/hal"
+import "std/embedded/hal/fake"
+
+// Reads a 16-bit sensor register every 100 ms, never waiting for the bus.
+pub struct Sampler<B: hal.I2cPoll> {
+    bus: B
+    ticker: executor.Ticker
+    reading: bool
+    command: [1]u8
+    reply: [2]u8
+    last: u16
+
+    pub fn poll(&mut self, cx: &mut executor.Context) -> executor.Poll {
+        if self.ticker.ready(cx) {
+            self.reading = true
+        }
+        if self.reading {
+            match self.bus.poll_write_read(0x48, &self.command, &mut self.reply) {
+                ok(done) => {
+                    if done {
+                        self.reading = false
+                        self.last = ((self.reply[0] as u16) << 8) | self.reply[1] as u16
+                    } else {
+                        // Or wait for a signal from the bus's interrupt.
+                        cx.yield_now()
+                    }
+                }
+                err(_) => {
+                    self.reading = false
+                }
+            }
+        }
+        return executor.Poll.Pending
+    }
+}
+
+@test
+fn samples_across_polls() {
+    bus := fake.I2c.new(0x48)
+    bus.set_register(0x10, 0x01)
+    bus.set_register(0x11, 0x2C)
+    // Each transaction takes three polls.
+    bus.set_poll_steps(3)
+    sampler := Sampler { bus, ticker: executor.Ticker.every_ms(100), reading: false, command: [0x10], reply: [0, 0], last: 0 }
+    clock := fake.Clock.new()
+    tasks: [1]&mut dyn executor.Task = [&mut sampler]
+    runner := executor.Executor.new()
+    runner.run_until(&mut tasks, &mut clock, 150_000)
+    assert_eq(sampler.last, 300u16)
+}
+```
+
+A controller that implements only the polling form still serves blocking
+drivers: `hal.BlockingI2c.new(bus)` and `hal.BlockingSpi.new(bus)` implement
+`hal.I2c` and `hal.Spi` by polling until the transaction is over. They give up
+after `hal.DEFAULT_POLL_LIMIT` polls, cancelling the transaction and returning
+`Timeout`; `set_poll_limit(polls)` changes that and `hal.NO_POLL_LIMIT` waits
+forever. `bus()` reaches the wrapped bus and `release()` gives it back.
+`hal.SpiDevice` also polls: `poll_transfer`, `poll_write`, and
+`poll_write_read` keep the device selected from the first poll until the
+transaction ends, and `cancel` deselects it.
+
+Serial ports' protocols live in `std/embedded/hal/serial`, so that
+`std/embedded/hal` itself depends on no stream package: `serial.PollPort`
+above, and `serial.Port`, a serial port with `std/io`'s `read` and `write`
+and a `flush` that waits until the last byte has left the transmitter, for
+drivers that must know a reply was sent before they listen or power down.
+
+### Being the device: targets
+
+A microcontroller can also be the device that another master talks to. The
+address, mode, and frame size are set when the target is created; the
+protocols then move bytes:
+
+| Interface | Methods |
+| --- | --- |
+| `hal.I2cTarget` | `poll(&mut self, buffer: &mut[u8]) -> hal.I2cTargetEvent!hal.Error`<br>`respond(&mut self, bytes: &[u8]) -> usize!hal.Error` |
+| `hal.SpiTarget` | `queue(&mut self, bytes: &[u8]) -> usize!hal.Error`<br>`read(&mut self, buffer: &mut[u8]) -> usize!hal.Error` |
+
+`poll` reports what the master did, in order, without waiting:
+`hal.I2cTargetEvent.Write(count, start)` for bytes it wrote, now at the
+start of `buffer` (`start` marks the first byte after the address, such as a
+register number), `Stop` at the end of a transaction, `Read` when it reads,
+and `Idle` when nothing happened. A read holds the master, with SCL low,
+until `respond` answers it, so a slow program delays the master but loses
+nothing. An empty `respond` answers one `0xFF`, what the master would read
+from an idle bus. An SPI target `queue`s the bytes to shift out before the
+master clocks them, and `read` collects what the master sent; `Overrun` means
+bytes were lost.
+
+```dodo test
+package register_device
+
+import "std/embedded/hal"
+import "std/embedded/hal/fake"
+
+// A register device: the first byte of a write picks the register, later
+// bytes fill it, and reads continue from there.
+pub struct Registers {
+    memory: [16]u8
+    pointer: usize
+
+    pub fn serve<T: hal.I2cTarget>(&mut self, target: &mut T) -> void!hal.Error {
+        buffer: [16]u8 = [0; 16]
+        match target.poll(&mut buffer)? {
+            hal.I2cTargetEvent.Write(count, start) => {
+                first := 0usize
+                if start {
+                    self.pointer = buffer[0] as usize % 16
+                    first = 1
+                }
+                for index in first..count {
+                    self.memory[self.pointer] = buffer[index]
+                    self.pointer = (self.pointer + 1) % 16
+                }
+            }
+            hal.I2cTargetEvent.Read => {
+                answer: [1]u8 = [self.memory[self.pointer]]
+                target.respond(&answer)?
+                self.pointer = (self.pointer + 1) % 16
+            }
+            hal.I2cTargetEvent.Stop => {}
+            hal.I2cTargetEvent.Idle => {}
+        }
+        return ok()
+    }
+}
+
+@test
+fn answers_a_master() {
+    target := fake.I2cTarget.new()
+    write: [3]u8 = [4, 0xAB, 0xCD]
+    target.master_write(&write)
+    target.master_stop()
+    select: [1]u8 = [5]
+    target.master_write(&select)
+    target.master_read(1)
+    target.master_stop()
+    device := Registers { memory: [0; 16], pointer: 0 }
+    for !target.is_idle() {
+        device.serve(&mut target)!
+    }
+    assert_eq(target.master_received()[0], 0xCDu8)
+}
+```
+
+### Measuring pulses
+
+`hal.PwmInput` is the input side of PWM: it measures the pulses on a pin,
+such as a PWM signal's frequency and duty cycle, a fan's tachometer, or the
+pulse a servo or radio receiver channel sends. Like an output, it is
+configured when it is created, with how long one measurement may take, and
+measurements follow one another:
+
+| Interface | Methods |
+| --- | --- |
+| `hal.PwmInput` | `poll_capture(&mut self, capture: &mut hal.PulseCapture) -> bool!hal.Error` |
+
+A `hal.PulseCapture` holds `period_ns` and `high_ns`, averaged over `cycles`
+periods: hardware that timestamps edges measures single periods, hardware
+that counts edges over a window averages many. A line that did not change
+has `cycles` 0, with `high_ns` telling whether it stayed high. Its methods
+convert: `frequency_hz()`, `frequency_millihz()`, `duty(max)` (so
+`duty(100)` is a percentage, and `duty(output.max_duty() as u32)` copies the
+signal onto a PWM output), `high_us()`, and `period_us()`.
+`hal.capture(&mut input, polls)` waits for the next measurement.
+
+### CAN
+
+`hal.Can` sends and receives frames on a CAN bus. Bit rate, acceptance
+filters, and modes are set when a controller is created; both directions
+queue in the controller's buffers, so both methods return at once:
+
+| Interface | Methods |
+| --- | --- |
+| `hal.Can` | `poll_send(&mut self, frame: &hal.CanFrame) -> bool!hal.Error`<br>`poll_receive(&mut self, frame: &mut hal.CanFrame) -> bool!hal.Error`<br>`error_state(&mut self) -> hal.CanErrorState!hal.Error` |
+
+`poll_send` is false while every transmit buffer is full and `poll_receive`
+false while no frame waits. A controller that lost frames reports `Overrun`
+once, a bus-off controller refuses to send with `Bus`, and a classic
+controller refuses CAN FD frames with `Unsupported`. `error_state()` tells
+where the controller stands: `Active`, `Passive` after many errors, or
+`BusOff`. `hal.send_frame(&mut can, &frame, polls)` and
+`hal.receive_frame(&mut can, &mut frame, polls)` wait, up to a number of
+polls.
+
+A `hal.CanFrame` is a value a program keeps and reuses. Its fields are
+checked as they are set, so every frame is one a controller can send:
+`CanFrame.standard(id, bytes)` and `CanFrame.extended(id, bytes)` make
+classic data frames, and `set_data`, `set_remote` (a request for data), and
+`set_fd` (up to 64 bytes, optionally at the faster data bit rate) change one;
+an identifier too large for its kind or too many bytes is `InvalidInput`.
+`id()`, `is_extended()`, `is_remote()`, `is_fd()`, `len()`, `dlc()`, and
+`bytes()` read it. `hal.CanFilter` describes an acceptance filter (an
+identifier, a mask, and the kind), which controllers program into their
+hardware: `CanFilter.exact(id, extended)` passes one identifier and
+`CanFilter.all(extended)` everything of a kind.
+
+Controller drivers share the arithmetic of bit timing:
+`hal.can_timing(clock_hz, bitrate, sample_point_permille, &limits)` finds the
+prescaler and segments for a bit rate within a controller's
+`hal.CanTimingLimits`, preferring the exact rate, the sample point closest to
+the one asked for (875 per mille is CiA's recommendation), and the most time
+quanta, and returns a `hal.CanBitTiming` that each driver encodes into its
+own registers. `hal.can_dlc_length` and `hal.can_length_dlc` convert between
+data length codes and lengths.
+
+```dodo test
+package can_echo
+
+import "std/embedded/hal"
+import "std/embedded/hal/fake"
+
+// Answers every request on 0x100 with its first byte plus one, on 0x101.
+pub fn serve<C: hal.Can>(can: &mut C) -> void!hal.Error {
+    frame := hal.CanFrame.new()
+    for can.poll_receive(&mut frame)? {
+        if frame.id() == 0x100 && frame.len() >= 1 {
+            reply: [1]u8 = [frame.bytes()[0] + 1]
+            answer := hal.CanFrame.standard(0x101, &reply)?
+            hal.send_frame(can, &answer, hal.DEFAULT_POLL_LIMIT)?
+        }
+    }
+    return ok()
+}
+
+@test
+fn answers_requests() {
+    can := fake.Can.new()
+    request := hal.CanFrame.standard(0x100, b"\x07")!
+    can.inject(&request)
+    serve(&mut can)!
+    assert_eq(can.sent_count(), 1usize)
+    assert_eq(can.sent(0).bytes()[0], 8u8)
+}
+```
+
+#### CAN controllers on SPI
+
+`std/embedded/can/mcp2515` drives the Microchip MCP2515, the stand-alone
+CAN controller on most add-on CAN boards, over any SPI bus. Its `Controller`
+owns the bus and a chip-select pin and implements `hal.Can`, so CAN drivers
+run unchanged on boards such as the Pico, whose chip has no CAN controller:
+
+```dodo
+spi := b.pins.spi(board.SPI_CLOCK_PIN, board.SPI_TX_PIN, some(board.SPI_RX_PIN), hal.SpiMode.Mode0, 8_000_000)!
+select := b.pins.output(board.SPI_SELECT_PIN)!
+config := mcp2515.Config.new(16_000_000, 500_000)   // crystal, bit rate
+filters: [1]hal.CanFilter = [hal.CanFilter.all(false)]
+can := mcp2515.Controller.new(spi, select, &config, &filters)!
+```
+
+`Config` holds the board's crystal frequency (usually 8 or 16 MHz), the bit
+rate, the sample point (875 per mille unless changed), the mode (`Normal`,
+`Loopback`, or `ListenOnly`), and whether frames are sent once without
+retrying. Startup resets the chip, programs the bit timing and filters, and
+switches modes; a bit rate the crystal cannot reach is `InvalidInput`, and a
+missing chip `Timeout`. `mcp2515.timing(crystal, bitrate, sample_point)`
+shows the register values, and `release()` gives the bus and pin back.
+`Controller.new` drops them if startup fails; `attach` and `configure` keep
+them.
+
+The chip has two receive buffers, one with a mask and two filters, the other
+with a mask and four. The driver groups the given filters by their mask, so
+at most two masks fit, with at most two filters on one and four on the
+other; a standard and an extended filter share a mask when they cover the
+same identifier bits. No filters accept everything. The buffers roll over,
+so two frames wait in the chip before one is lost, and `poll_receive`
+returns them oldest first and reports a lost one as `Overrun`, once.
+`poll_send` queues a frame in one of three transmit buffers, and frames
+leave in the order they were queued. On a bus where no other node
+acknowledges, frames stay queued, so `hal.send_frame` times out;
+`abort_pending()` empties the queue. `tec()` and `rec()` read the error
+counters, and FD frames are `Unsupported`.
+
+Wire the chip's INT pin to a GPIO and call `can.listen(mcp2515.RECEIVE)`: a
+task then waits for the pin's falling edge and calls `poll_receive` until it
+returns false, which releases INT. `TRANSMIT` and `ERROR` interrupts stay
+raised until `acknowledge` clears them.
+
+### I2S audio
+
+`hal.I2sOutput` and `hal.I2sInput` stream audio samples to a DAC or
+amplifier and from a microphone or ADC. Sample rate, resolution, channels,
+and the framing (`hal.I2sFormat.Philips`, `LeftJustified`, or
+`RightJustified`) are set when a stream is created:
+
+| Interface | Methods |
+| --- | --- |
+| `hal.I2sOutput` | `sample_rate(&self) -> u32`, `channels(&self) -> u32`<br>`poll_write(&mut self, samples: &[i32]) -> usize!hal.Error` |
+| `hal.I2sInput` | `sample_rate(&self) -> u32`, `channels(&self) -> u32`<br>`poll_read(&mut self, samples: &mut[i32]) -> usize!hal.Error` |
+
+Samples are `i32` values with the audio in the most significant bits, so
+full scale is the same at every resolution: a 16-bit sample is `value << 16`
+(`hal.sample_from_i16` and `hal.sample_to_i16` convert). Stereo samples
+interleave, left first, and both methods move whole frames only, returning
+how many samples they took; a slice that is not whole frames is
+`InvalidInput`. An output plays silence when its queue runs dry, so a task
+keeps it topped up; an input reports `Overrun` once if samples were lost.
+`hal.write_samples` and `hal.read_samples` wait until a whole slice has
+moved.
+
+### Transfers in the background (DMA)
+
+`hal.DmaChannel` (see [DMA in drivers](#dma-in-drivers)) is what peripheral
+drivers start transfers on. Device drivers work one level up, with a session
+that holds a buffer and moves it while the program does other work:
+
+| Interface | Methods |
+| --- | --- |
+| `hal.DmaBuffer` | `buffer(&mut self) -> &mut[u8]!hal.Error`, `capacity(&self) -> usize`<br>`start(&mut self, count: usize) -> void!hal.Error`<br>`poll_finish(&mut self) -> bool!hal.Error`, `abort(&mut self)` |
+| `hal.SpiDma` | the same, with `start_transfer(count)` (exchange in place) and `start_write(count)` (send only) instead of `start` |
+
+The session lends its buffer out only between transfers (`buffer()` is
+`Busy` while one runs), so the program never touches memory a transfer is
+moving. Fill it, `start` a transfer, and poll `poll_finish` until it is
+true; `Bus` and `Overrun` report failed transfers. A display driver written
+against `hal.SpiDma` streams frames on any chip whose SPI bus has DMA, and
+on a desktop against a fake. `hal.finish_transfer(&mut session)` waits.
+
+`hal.DmaStream` is the session every DMA-backed peripheral driver needs,
+written once against `hal.DmaChannel`: `DmaStream.transmit(&mut channel,
+&mut buffer, register, width)` sends a buffer to a peripheral's data register
+whenever the peripheral asks for data, `DmaStream.receive(...)` fills one from
+it, and the stream implements `hal.DmaBuffer`. The peripheral's driver turns
+the peripheral's DMA requests on and off around it. `hal.dma_copy(&mut
+channel, &mut destination, &source)` copies memory with any channel.
+
+### Real-time clocks
+
+A real-time clock keeps the time of day in a counter that runs while the
+processor sleeps, and sometimes through resets or on a backup battery. The
+protocol is the same whatever counts: `hal.Rtc` reads and sets the time
+as milliseconds since the Unix epoch, 1970-01-01 00:00:00 UTC, the count a
+[`time.Timestamp`](time.md) holds, and `hal.RtcAlarm` fires once when the
+clock reaches a time. Every chip below implements both, so a program
+that keeps time moves between them unchanged:
+
+| Clock | Counts | Range | Keeps time |
+| --- | --- | --- | --- |
+| `rp2040.Rtc`, `b.rtc` on the Pico | Seconds | Years 1970 to 4095 | While the chip is powered; a reset stops it. |
+| `rp2350.Rtc`, `b.rtc` on the Pico 2 and Pico 2 W | Milliseconds | 64 bits | Through resets that leave the always-on power domain running, such as the watchdog's. |
+| `ds3231.Clock` on any `hal.I2c` | Seconds | Years 2000 to 2099 | On its backup battery while the board is off. |
+| `fake.Rtc` | Milliseconds, or coarser steps | 64 bits | As a test says. |
+
+A clock runs only once its time is set. Until then, and again after it lost
+power, `is_set()` is false and `now_ms()` reports `Busy`, so firmware sets the
+clock once, from the network, a GPS, or the user, and later boots keep the
+time where the clock allows it. A clock that counts whole seconds reports whole
+seconds; `resolution_ms()` says how long a step is, and `set_ms` rounds
+down to one.
+
+`hal.rtc_now` and `hal.rtc_set` convert to and from a UTC
+`time.DateTime`, so the calendar never has to be done by hand. Shift by a
+time zone's offset with the `DateTime` methods:
+
+```dodo test
+package clock_example
+
+import "std/embedded/hal"
+import "std/embedded/hal/fake"
+import "std/time"
+
+// Seconds since midnight, from any clock.
+fn seconds_today<R: hal.Rtc>(clock: &mut R) -> u32!hal.Error {
+    now := hal.rtc_now(clock)?
+    return ok(now.time_of_day().seconds_since_midnight())
+}
+
+fn main() {
+    clock := fake.Rtc.new()
+    assert(!clock.is_set()!)
+    start := time.DateTime.new(time.Date.new(2026, 11, 1)!, time.TimeOfDay.new(8, 30, 0, 0)!)
+    hal.rtc_set(&mut clock, &start)!
+    clock.advance(90_000)
+    assert_eq(seconds_today(&mut clock)!, 30_690u32)
+
+    hal.rtc_alarm_in(&mut clock, 60_000)!
+    clock.advance(59_999)
+    assert(!clock.alarm_fired()!)
+    clock.advance(1)
+    assert(clock.alarm_fired()!)
+    clock.clear_alarm()!
+}
+```
+
+An alarm fires when `now_ms()` reaches its time, also when the time is set
+past it, and stays fired until `clear_alarm`. As for a counter's alarm, a time
+the clock has already reached fires at once. On clocks that count seconds the
+alarm fires at the start of a second, so `hal.rtc_alarm_in` fires up to a
+second early. Chips raise an interrupt when it fires; their clock types add
+`listen`, `ignore`, and `irq()` for it, as the
+[RP2040 and RP2350](#real-time-clocks-on-the-rp2040-and-rp2350) do.
+
+`std/embedded/rtc/ds3231` drives a DS3231 clock chip on an I2C bus, the
+common battery-backed module, through the same protocols. It counts on its
+battery while the board is off, so a board without an always-on domain of its
+own can copy the time into its chip's clock at start-up:
+
+```dodo
+bus := b.pins.i2c(board.I2C_SDA_PIN, board.I2C_SCL_PIN, hal.I2C_FAST_HZ)!
+battery := ds3231.Clock.new(bus)
+if battery.is_set()! {
+    b.rtc.set_ms(battery.now_ms()!)!
+}
+```
+
+Its alarm, the chip's alarm 1, matches the day of the month and the time,
+so it reaches 28 days ahead; while armed, it pulls the chip's INT/SQW pin
+low when it fires, which a GPIO with a pull-up can wait on.
 
 ## A complete driver
 
@@ -331,15 +923,26 @@ which pins can carry which bus.
 | Fake | Behaves like | Inspect with |
 | --- | --- | --- |
 | `fake.Pin` | An input/output pin, initially low. | `is_high()`, `changes()` |
-| `fake.Delay` | A delay that returns at once. | `elapsed_us()` |
-| `fake.I2c` | One device at an address with 256 numbered registers and an auto-incrementing register pointer. Other addresses report `NoAcknowledge`. | `register(n)`, `set_register(n, v)`, `fail_next(error)` |
-| `fake.Spi` | A bus that records sent bytes and answers from a programmed reply. | `sent()`, `clear()`, `reply_with(bytes)` |
-| `fake.Serial` | A serial port, the `std/io` Reader and Writer: it records what is written and reads back bytes given to `feed`, then reports end of input; `poll_read` reports Pending instead. | `sent()`, `clear()`, `feed(bytes)` |
+| `fake.Delay` | A delay that returns at once, and a counter whose time is the delays so far. | `elapsed_us()`, `now_us()` |
+| `fake.Alarm` | An alarm on a counter that starts at 0 and moves only on `advance`. It reaches any time ahead. | `advance(us)`, `is_armed()`, `target_us()`, `schedules()`, `fail_next(error)` |
+| `fake.I2c` | One device at an address with 256 numbered registers and an auto-incrementing register pointer. Other addresses report `NoAcknowledge`. Also `hal.I2cPoll`: a polled transaction takes `set_poll_steps(n)` polls. | `register(n)`, `set_register(n, v)`, `fail_next(error)`, `set_poll_steps(n)`, `cancels()` |
+| `fake.Spi` | A bus that records sent bytes and answers from a programmed reply. Also `hal.SpiPoll`, moving `set_poll_chunk(n)` bytes per poll. | `sent()`, `clear()`, `reply_with(bytes)`, `set_poll_chunk(n)`, `polls()` |
+| `fake.Serial` | A serial port, `serial.Port` and `serial.PollPort`: it records what is written and reads back bytes given to `feed`, then reports end of input; `poll_read` reports Pending instead. | `sent()`, `clear()`, `feed(bytes)`, `set_write_room(n)`, `set_flush_polls(n)`, `flushes()` |
 | `fake.Pwm` | A PWM output with a given `max_duty`, initially at duty 0. | `duty()`, `changes()`, `fail_next(error)` |
 | `fake.Analog` | An analog input with a given `max_value` that reads the value given to `set`, after any given to `queue`, one per read. | `set(value)`, `queue(values)`, `reads()`, `fail_next(error)` |
-| `fake.Clock` | The [executor](#tasks-and-the-executor)'s clock: time jumps ahead when the executor sleeps, and simulated interrupts raise signals. | `now_us()`, `interrupt_at(time, &signal)`, `advance(us)`, `sleeps()`, `idle_us()` |
+| `fake.Rng` | A random number generator that fills with the bytes given to `queue`, then counts up 0, 1, 2, and so on, so tests know what a driver drew. | `queue(bytes)`, `drawn()`, `fail_next(error)` |
+| `fake.Rtc` | A [real-time clock](#real-time-clocks) with an alarm, unset until set, counting milliseconds (`new()`) or coarser steps (`with_resolution(ms)`). Time passes only by `advance`. | `advance(ms)`, `lose_power()`, `is_armed()`, `alarm_ms()`, `fail_next(error)` |
+| `fake.I2cTarget` | An I2C target and the master that talks to it, played by the test: the master's writes, reads, and STOPs come out of `poll` in order. | `master_write(bytes)`, `master_read(count)`, `master_stop()`, `master_received()`, `is_idle()`, `fail_next(error)` |
+| `fake.SpiTarget` | An SPI target and the master that clocks it. | `master_exchange(bytes)`, `queued()` |
+| `fake.PwmInput` | A pulse input that reports queued measurements, one per poll. | `queue(period_ns, high_ns, cycles)`, `queue_signal(hz, percent)`, `fail_next(error)` |
+| `fake.Can` | A CAN controller on a simulated bus: it records frames sent and receives injected ones, optionally its own. | `inject(&frame)`, `sent_count()`, `sent(n)`, `waiting()`, `set_loopback(on)`, `set_transmit_room(n)`, `drain_transmit()`, `set_error_state(state)`, `fail_next(error)`; `new_fd()` for CAN FD |
+| `fake.I2sOutput`, `fake.I2sInput` | Audio streams that record what is played, or deliver what is fed, a limited number of samples per poll. | `played()`, `total()`, `feed(samples)`, `set_room(n)`, `drop_samples()` |
+| `fake.DmaBuffer` | A DMA buffer session, transmitting or receiving, whose transfers finish after a number of polls. | `sent()`, `feed(bytes)`, `set_poll_steps(n)`, `fail_next(error)` |
+| `fake.DmaChannel` | A DMA channel that runs transfers in host memory, for testing code written against `hal.DmaChannel`, such as `hal.DmaStream`. | `set_busy_polls(n)`, `set_max_count(n)`, `starts()`, `aborts()`, `fail_next()` |
+| `fake.Clock` | The [executor](#tasks-and-the-executor)'s clock, and a counter: time jumps ahead when the executor sleeps, and simulated interrupts raise signals. | `now_us()`, `interrupt_at(time, &signal)`, `advance(us)`, `sleeps()`, `idle_us()` |
 
-`fail_next` makes the next I2C transaction, duty change, or analog read fail,
+`fail_next` makes the next I2C transaction, duty change, analog read,
+alarm schedule, clock operation, or random fill fail,
 so error paths are as easy to test as success. The repository's
 `examples/dimmer.dodo` tests an LED dimmer, a knob on an analog input setting
 a PWM output, this way, and `examples/dimmer_board.dodo` runs it unchanged on
@@ -559,12 +1162,13 @@ with `mret`.
 
 The handler and the code it interrupts share state through static storage: a
 single integer through an [atomic](#sharing-state-with-atomics), anything else
-through `static mut` storage. Reading or writing `static mut` storage is unsafe
-in Dodo, and keeping both sides consistent is the program's job: `hal.Critical.enter()` masks interrupts on the
-current core and remembers whether they were enabled; dropping it restores
-exactly that state, so sections nest. A handler cannot be interrupted by
-itself, so it needs no section for state only it and lower-priority code use.
-Keep sections short, and remember they never exclude other threads or cores.
+through a [mutex](#sharing-values-with-a-mutex) from `std/embedded/sync`.
+Both work in a plain `static` and need no `unsafe`. Underneath them,
+`hal.Critical.enter()` masks interrupts on the current core and remembers
+whether they were enabled; dropping it restores exactly that state, so
+sections nest. Raw `static mut` storage is still available, but reading or
+writing it is unsafe, and keeping both sides consistent is then the
+program's job.
 
 ### Sharing state with atomics
 
@@ -620,36 +1224,95 @@ handler `load`s the count, adds one, and `store`s it, which is safe as long
 as nothing else stores to it. A value that both sides change needs a critical
 section there.
 
+### Sharing values with a mutex
+
+Anything larger than a word, such as a driver or a buffer, goes into a
+`sync.Mutex<T>` from `std/embedded/sync`, in a plain static initialized
+with `sync.Mutex.new`. `lock()` masks interrupts on this core and returns a
+guard whose `get()` and `get_mut()` reach the value; dropping the guard
+unlocks it and restores the interrupt mask:
+
+```dodo test
+package main
+
+import "std/embedded/sync"
+
+struct Stats {
+    samples: u32
+    peak: u32
+}
+
+static STATS: sync.Mutex<Stats> = sync.Mutex.new(Stats { samples: 0, peak: 0 })
+
+// Called from an interrupt handler and from the main loop alike.
+fn record(value: u32) {
+    guard := STATS.lock()
+    stats := guard.get_mut()
+    stats.samples += 1
+    if value > stats.peak {
+        stats.peak = value
+    }
+}
+
+fn main() {
+    record(12)
+    record(40)
+    record(7)
+    peak := 0u32
+    STATS.with(fn(stats: &mut Stats) { peak = stats.peak })
+    assert_eq(peak, 40u32)
+}
+```
+
+`with(closure)` runs a closure on the value under the lock, `set(value)` replaces the value (dropping the old one outside the
+lock), and `replace(value)` returns the old one, so `SERIAL.replace(none)`
+takes a driver back. `try_lock()` returns none instead of locking a mutex
+this core holds already, which `lock()` reports with a trap, since a second
+guard would be a second exclusive reference. Mutexes nest: code holding one
+may lock another.
+
+| Share | With | Notes |
+| --- | --- | --- |
+| A counter or flag that one side changes | `atomic.Atomic<T>` | `load` and `store` everywhere; read-modify-write except on the Cortex-M0+. |
+| A word both sides change | `atomic.Atomic<T>`, or a mutex on the Cortex-M0+ | One indivisible step per call. |
+| A driver, buffer, or record | `sync.Mutex<T>` | Interrupts on this core wait while it is held; so does the other core of a [running RP2040 or RP2350 pair](#two-cores-on-the-rp2040-and-rp2350). |
+| An event that wakes a task | `executor.Signal` | See [waking tasks from interrupts](#waking-tasks-from-interrupts). |
+
+Every mutex locks through one system-wide section, `sync.enter()`, which
+other code can take too. Keep it short: interrupts on the core wait while a
+guard lives. On a desktop, where there are no interrupts, a mutex excludes
+nothing, so use these mutexes from one thread there, as in tests, and
+[`std/sync`](synchronization.md)'s for threads.
+
 ### An interrupt-driven driver
 
-A driver can live in a `static mut Option<...>` that the handler serves. The
-repository's
+A driver can live in a mutex that the handler serves. The repository's
 [`examples/interrupts`](https://github.com/Jotrorox/dodo/blob/main/examples/interrupts/main.dodo)
 echoes a serial port this way: the UART's receive interrupt moves bytes into a
 queue, SysTick counts milliseconds, and the main loop sleeps until either has
 news:
 
 ```dodo
-static mut SERIAL: Option<pl011.Port> = none
+static SERIAL: sync.Mutex<Option<pl011.Port>> = sync.Mutex.new(none)
+static QUEUE: sync.Mutex<Queue> = sync.Mutex.new(Queue { bytes: [0u8; 64], start: 0, queued: 0, dropped: 0 })
 
 @interrupt(UART0_IRQ)
 fn serial_received() {
-    unsafe {
-        match &mut SERIAL {
-            some(port) => {
-                buffer := [0u8; 32]
-                match port.poll_read(&mut buffer) {
-                    ok(progress) => {
-                        enqueue(&buffer[..progress.transferred])
-                    }
-                    err(failure) => {
-                        enqueue(&buffer[..failure.transferred])
-                        port.clear_interrupts(pl011.ERROR_INTERRUPTS)
-                    }
-                }
+    serial := SERIAL.lock()
+    if let some(port) = serial.get_mut() {
+        buffer := [0u8; 32]
+        received := 0usize
+        match port.poll_read(&mut buffer) {
+            ok(progress) => {
+                received = progress.transferred
             }
-            none => {}
+            err(failure) => {
+                received = failure.transferred
+                port.clear_interrupts(pl011.ERROR_INTERRUPTS)
+            }
         }
+        queue := QUEUE.lock()
+        queue.get_mut().push(&buffer[..received])
     }
 }
 
@@ -657,11 +1320,9 @@ fn main() {
     b := board.take()!
     port := b.pins.uart(board.UART_TX_PIN, some(board.UART_RX_PIN), 115_200)!
     port.listen(pl011.RX_INTERRUPT | pl011.RX_TIMEOUT_INTERRUPT | pl011.ERROR_INTERRUPTS)
-    unsafe {
-        SERIAL = some(port)
-    }
+    SERIAL.set(some(port))
     cortex_m.enable(chip.UART0_IRQ)
-    // ... sleep with cpu.wait_for_interrupt() and drain the queue
+    // ... drain QUEUE, sleeping with cpu.wait_for_interrupt() while it is empty
 }
 ```
 
@@ -673,7 +1334,7 @@ which is open at reset and closed only inside critical sections.
 | Driver | Interrupt sources |
 | --- | --- |
 | `pl011.Port` and `Controller` | `listen(sources)`, `ignore(sources)`, `pending_interrupts()`, and `clear_interrupts(sources)` with `RX_INTERRUPT` (FIFO 3/4 full), `RX_TIMEOUT_INTERRUPT` (bytes waiting for 32 bit times), `TX_INTERRUPT`, and `ERROR_INTERRUPTS`. The receive sources end when reads drain the FIFO. |
-| `Timer.alarm(n)` on the RP2040 and RP2350 | An `Alarm` that fires once at `schedule_at(time)` or `schedule_in(microseconds)`; `listen` raises `alarm.irq()`, and its handler calls `clear`. `release_alarm` gives it back. With `now_us()` and `sleep_until(deadline)` it is also the [executor](#tasks-and-the-executor)'s clock. |
+| `Timer.alarm(n)` on the RP2040 and RP2350 | An `Alarm` with the [alarm protocol](#device-protocols): it fires once at `schedule_at_us(time)`, a `now_us()` time up to 2^31 - 1 us (35 minutes) ahead, or at the low 32 bits of the counter with `schedule_at(time)` and `schedule_in(microseconds)`. `listen` raises `alarm.irq()`, and its handler calls `clear`; a time `schedule_at_us` finds already passed raises it at once. `release_alarm` gives it back. With `now_us()` and `sleep_until(deadline)` it is also the [executor](#tasks-and-the-executor)'s clock. |
 | `Pin` on the RP2040 and RP2350 | `listen(events)` raises `IO_IRQ_BANK0` for `chip.RISING_EDGE`, `FALLING_EDGE`, `LEVEL_HIGH`, or `LEVEL_LOW`; `events()` shows them, `clear_events(edges)` acknowledges edges, `ignore(events)` stops. |
 
 ### The Cortex-M core
@@ -803,7 +1464,8 @@ for the full rules.
 ### Sleeping and other targets
 
 `cpu.wait_for_interrupt()` sleeps until an interrupt is pending, which is the
-usual idle loop. `cpu.fence()` is a full hardware memory barrier, for example
+usual idle loop. How deeply it sleeps is set with
+[`std/embedded/power`](#low-power). `cpu.fence()` is a full hardware memory barrier, for example
 between filling a DMA buffer and starting the transfer.
 
 | Target | Critical section and `wait_for_interrupt` |
@@ -826,8 +1488,10 @@ link alive. `std/embedded/executor` lets each activity be a **task** of its own.
 The executor polls a task only when something it waits for has happened, a
 time arriving or an interrupt, and puts the core to sleep while none has work.
 
-A task is any value with a `poll` method, usually a struct that owns the
-peripherals it uses and remembers where it is in its work:
+A task is any value with a `poll` method. Most tasks are easiest to write as
+[async functions](#async-tasks), which the compiler turns into such values;
+underneath, a task is a struct that owns the peripherals it uses and
+remembers where it is in its work:
 
 ```dodo
 struct Blinker<L> {
@@ -898,6 +1562,70 @@ in steps. `polls()`, `sleeps()`, and `is_finished(index)` report what it did.
 `executor.Context.new(now_us)` makes a context for calling a task's `poll`
 directly, and `cx.wake_time()` shows what the task asked for.
 
+### Async tasks
+
+Written by hand, a task keeps where it is in its fields and returns to the
+executor at every step. An [`async fn`](async.md) writes the same task as
+straight-line code: each `await` returns to the executor until what it
+waits for has happened, and the next poll continues after it. Calling the
+function makes the task, a future, which goes into the task list like any
+other:
+
+```dodo
+const BUTTON: executor.Signal = executor.Signal { id: 1 }
+const PRESSES: executor.Signal = executor.Signal { id: 2 }
+
+async fn blink<L: hal.OutputPin>(led: &mut L, period_ms: u32) {
+    ticker := executor.Ticker.every_ms(period_ms)
+    for {
+        led.set_high()
+        await ticker.tick()
+        led.set_low()
+        await ticker.tick()
+    }
+}
+
+// Counts presses, ignoring the contacts' bounce.
+async fn count_presses(pin: &mut chip.Pin) {
+    presses := 0u32
+    for {
+        cortex_m.enable(chip.IO_IRQ_BANK0)
+        await BUTTON.wait()
+        if (pin.events() & chip.RISING_EDGE) != 0 {
+            pin.clear_events(chip.RISING_EDGE)
+            presses += 1
+            PRESSES.send(presses)
+            await executor.sleep_ms(50)
+            pin.clear_events(chip.RISING_EDGE)
+        }
+    }
+}
+
+fn main() {
+    b := board.take()!
+    clock := b.timer.alarm(0)!
+    pin := b.pins.input(15)!
+    pin.listen(chip.RISING_EDGE)
+    blinker := blink(&mut b.led, 250)
+    button := count_presses(&mut pin)
+    console := Console { port: b.pins.uart(board.UART_TX_PIN, some(board.UART_RX_PIN), 115_200)! }
+    tasks: [3]&mut dyn executor.Task = [&mut blinker, &mut button, &mut console]
+    executor.run(&mut tasks, &mut clock)
+}
+```
+
+Here `console` is a hand-written task; async and hand-written tasks mix
+freely, since a future has the task's `poll` method. The repository's
+[`examples/async_tasks`](https://github.com/Jotrorox/dodo/blob/main/examples/async_tasks/main.dodo)
+writes all three tasks of `examples/tasks` as async fns. A future keeps its
+locals between polls, and lives where its owner put it: on `main`'s stack
+above, or in a `static mut` for a large one. Once started, it must stay in
+place, as a reference into it may be held across an `await`. The
+[async functions](async.md) chapter describes `await` and what it accepts:
+`executor.sleep_ms`, `ticker.tick()`, `SIGNAL.wait()`, `SIGNAL.next_value()`,
+`executor.yield_now()`, `executor.now()`, other async fns, and `executor.select` and
+`executor.join` to wait for either or both of two futures.
+
 ### Waking tasks from interrupts
 
 A **signal** carries an event from an interrupt handler, or from another task,
@@ -960,7 +1688,7 @@ runs a blinking LED, a debounced button, and such a serial console together.
 | Timer alarm | `alarm.listen()` | `alarm.clear()`. An alarm used as the executor's clock is busy. |
 | USB serial port | `serial.set_signal(&SIGNAL)`: the port's own interrupt handler raises it | Nothing to acknowledge: read with `poll_read` until it is Pending. |
 | DMA channel | `channel.set_signal(&SIGNAL)`: the runtime's `DMA_IRQ_0` handler raises it when a transfer ends | Nothing to acknowledge: check the transfer, for example with `is_busy()`. |
-| Queued I2C transaction | `bus.listen()`: the transaction's STOP or abort raises `I2C0_IRQ` or `I2C1_IRQ` | `bus.poll_finish(&mut buffer)` collects it, which ends the condition. |
+| Polled I2C transaction | `bus.listen()`: `I2C0_IRQ` or `I2C1_IRQ` whenever a poll can move bytes or the transaction has ended | The next `poll_*` call, which deals with the condition and sets the mask for the next one. |
 
 Several pins share `IO_IRQ_BANK0`, so give them one signal and let each
 task check its own pin's `events()`: raising wakes every waiting task.
@@ -1038,9 +1766,9 @@ while nothing has been fed.
   signals take their numbers from the application. On the RP2040 and RP2350
   each core can run an executor of its own; see
   [two cores](#two-cores-on-the-rp2040-and-rp2350).
-- Tasks are state machines written by hand: Dodo has no `async` functions
-  that the compiler would turn into them. Keep the state in the task's
-  fields, and do each step without waiting.
+- A task does each step without waiting: an `async fn` returns to the
+  executor at each `await`, a hand-written task at the end of each `poll`.
+  Code between them runs to completion and delays every other task.
 - A task owns its peripherals. Tasks that share a bus are one task, or one
   task owns the bus and the others send it requests with signals.
 - The blocking bus methods (`write`, `read`, `transfer`) wait for the bus
@@ -1051,6 +1779,247 @@ while nothing has been fed.
   return at once and finish while the task waits.
 - On a desktop, where a critical section excludes nothing, use the executor
   and its signals from one thread.
+
+## Persistent storage
+
+Data that must outlive a restart, such as settings, calibration values,
+counters, or credentials, goes in flash. `hal.Flash` is the protocol for
+memory that behaves like NOR flash: erasing sets whole blocks of
+`erase_size()` bytes to `0xFF` (`hal.FLASH_ERASED`), and writing then
+programs bytes, in units of `write_size()`, only once until their block is
+erased again. Out-of-range or misaligned requests return
+`hal.Error.InvalidInput`. A board's program flash implements it through
+regions, and so can a driver for an external SPI flash chip.
+
+`std/embedded/storage` builds on any `hal.Flash`:
+
+- `storage.Store` is a key-value store. Keys are text of 1 to 64 bytes
+  (`storage.MAX_KEY_BYTES`); values are any bytes up to `max_value_len`,
+  about one erase block.
+- `storage.Region` is a window of a flash device, itself a `hal.Flash`, for
+  giving a store part of a device.
+
+```dodo
+import "std/embedded/board"
+import "std/embedded/storage"
+
+fn main() {
+    b := board.take()!
+    settings := storage.Store.open(b.flash.last(64 * 1024)!)!
+    boots := 0u32
+    match settings.get_u32("boots") {
+        ok(some(count)) => {
+            boots = count
+        }
+        ok(none) => {}
+        err(_) => {
+            settings.clear()!
+        }
+    }
+    settings.set_u32("boots", boots + 1)!
+}
+```
+
+`get(key, buffer)` copies a value into a buffer and returns its length, or
+`none` for a missing key; `len_of` and `contains` look without copying, and
+`set`, `remove`, and `clear` change the store. `get_u32` and `set_u32` store
+numbers as four little-endian bytes. `next_key` with a `storage.Cursor` lists
+the keys. Errors are `storage.Error`: `Flash` and `Busy` from the device,
+`Full`, `TooLarge` for an overlong key or value, `InvalidInput` for an empty
+key or an unusable device, and `BufferTooSmall`.
+
+The store is a log over the device's erase blocks, of which it needs 2 to 64
+(`storage.MAX_BLOCKS`), each of at least 256 bytes. Every `set` or `remove`
+appends a record to the newest block, and the latest record of a key wins; a
+`set` of the value a key already has writes nothing. When the newest block
+is full, the store moves on to the next one and compacts the oldest block in
+use into it, copying the records still current there, then erases it. Erases
+thus go round all blocks evenly, and one block always stays erased, so a
+store holds somewhat less than its size minus one block. Replacing a value
+needs room for the new record while the old one is still there; `remove`
+works even in a full store.
+
+Every record has a CRC-32 and is read back after it is written, and the store
+writes only to erased bytes, so it also works on flash that cannot write a
+byte twice. A power cut at any moment, even during a compaction, loses at most
+the `set` or `remove` in progress: `Store.open` finds the last intact record
+and finishes or undoes an interrupted compaction. After a failed write,
+the store reads the flash again before its next operation.
+
+Lookups scan the blocks in use, so the store suits small data, up to a few
+hundred kilobytes, that changes now and then, not logs or fast-changing
+values. A compaction holds the device busy for one erase and the copies.
+
+`fake.Flash` from `std/embedded/hal/fake` is flash in a buffer of your own for
+desktop tests. It checks the protocol strictly, refusing misaligned requests
+and writes over bytes that are not erased, counts erases and writes, fails an
+operation on request with `fail_next`, and cuts the power partway through an
+operation with `cut_power_after(bytes)` or just after one with
+`cut_power_after_operations(count)`, until `restore_power`:
+
+```dodo
+@test
+fn settings_survive_a_power_cut() {
+    memory := [0xFFu8; 4096]
+    flash := fake.Flash.new(&mut memory, 1024, 4)
+    store := storage.Store.open(flash)!
+    store.set_u32("volume", 7)!
+    store.flash().cut_power_after(10)
+    match store.set_u32("volume", 8) {
+        ok() => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == storage.Error.Flash)
+        }
+    }
+    store.flash().restore_power()
+    flash = store.release()
+    store = storage.Store.open(flash)!
+    match store.get_u32("volume")! {
+        some(volume) => {
+            core.assert(volume == 7)
+        }
+        none => {
+            core.assert(false)
+        }
+    }
+}
+```
+
+The repository's `tests/stdlib/storage_checks.dodo` cuts the power at every
+erase and write, and every few bytes in between, of a long run of updates,
+and checks that each key keeps its old or new value.
+
+## Low power
+
+Battery-powered firmware spends most of its time waiting.
+`std/embedded/power` decides how much of the chip keeps running meanwhile.
+Every chip package implements its `power.Power` protocol, every board hands it
+out as `b.power`, and `std/embedded/hal/fake.Power` implements it on a
+desktop. Power-aware code is therefore written and tested once, like a driver.
+
+There are three levels, from the lightest to the deepest:
+
+| Level | What stops | What wakes it | How |
+| --- | --- | --- | --- |
+| Sleep | The core | Any enabled interrupt | `power.Mode.Sleep`, the mode at reset |
+| Deep sleep | The core and every clock outside the sleep set | An interrupt from a peripheral whose clock still runs | `power.Mode.DeepSleep` with `set_sleep_clocks` |
+| Dormant | Every oscillator, and with them every clock | A pin event in a `power.Wake` | `dormant(&wake)` |
+
+### Sleep modes
+
+The mode says what every wait does from now on: `b.power.sleep()`,
+`cpu.wait_for_interrupt()`, a timer alarm's `sleep_until`, and the
+[executor](#tasks-and-the-executor) all honour it. An executor therefore
+deep-sleeps between its tasks without being changed:
+
+```dodo
+import "std/embedded/board"
+import "std/embedded/chip"
+import "std/embedded/executor"
+import "std/embedded/power"
+
+fn main() {
+    b := board.take()!
+    // Only the timer runs while the core sleeps, so its alarm can wake it.
+    b.power.set_sleep_clocks(chip.ALARM_CLOCKS)
+    b.power.set_mode(power.Mode.DeepSleep)
+    clock := b.timer.alarm(0)!
+    // ... tasks as before ...
+    executor.run(&mut tasks, &mut clock)
+}
+```
+
+The sleep set must keep the clocks of whatever should wake the core:
+`chip.ALARM_CLOCKS` for a timer alarm, `chip.CLOCK_GPIO` for a pin interrupt,
+and a peripheral's own constant, such as `chip.CLOCK_UART0`, for its
+interrupts. Add `chip.CLOCK_MEMORY` and `chip.CLOCK_DMA` for DMA that runs
+during the sleep. Every clock is in the sleep set at reset, so a deep sleep
+stops nothing more than a light one until the program says otherwise. When
+the core wakes, the stopped clocks start again before its handler runs.
+`power.deep_sleep(&mut b.power, keep)` deep-sleeps once and then restores the
+previous mode and sleep set.
+
+To wait for something an interrupt handler records, check it inside a
+`hal.Critical` section and sleep there. An interrupt that becomes pending
+between the check and the sleep still ends the sleep, and its handler runs
+once the section ends. The executor does this for you.
+
+### Clock gating
+
+Apart from sleeping, the chip stops the clocks of peripherals that nothing
+uses. Clocks are a `power.Clocks` set, a `u64` with one bit per clock gate.
+The chip package names the gates, such as `chip.CLOCK_UART1` or
+`chip.CLOCK_PIO0`, and they combine with `|`:
+
+```dodo
+stopped := b.power.disable_unused_clocks()   // every unclaimed peripheral
+b.power.disable_clocks(chip.CLOCK_JTAG)!    // one the chip does not claim
+serial := b.pins.uart(4, none, 115_200)!     // UART1's clocks start again
+```
+
+`disable_unused_clocks` stops the clocks of every peripheral the chip claims
+and releases that is not claimed now, and returns them. Claiming one of those
+peripherals starts its clocks again, so calling it once at start-up is safe.
+`disable_clocks` refuses with `InvalidInput` the clocks the program cannot run
+without (`chip.ESSENTIAL_CLOCKS`: memory, flash, the boot ROM, the bus fabric,
+GPIO, and the clock, reset, and oscillator controls), and refuses with `Busy`
+the clocks of a claimed peripheral. Peripherals that are not claimed through
+`Pins`, such as the timer (`chip.CLOCK_TIMER`) and DMA (`chip.CLOCK_DMA`),
+are the program's to stop: their registers stop answering until
+`enable_clocks` starts them again.
+
+### Dormant
+
+`dormant` stops every oscillator. The chip keeps its memory and pin levels
+and draws the least it can until one of the pin events in a `power.Wake`
+happens. The chip then restarts its clocks as they were, and `dormant`
+returns the pins that woke it, bit n for pin n:
+
+```dodo
+button := b.pins.input(15)!
+// Wait for a new press, not one latched earlier.
+button.clear_events(chip.RISING_EDGE)
+wake := power.Wake.new()
+wake.on(15, power.RISING_EDGE)
+woken := b.power.dormant(&wake)!
+```
+
+`power.dormant_until(&mut b.power, pin, events)` is the one-pin shorthand.
+The events are `power.LEVEL_LOW`, `LEVEL_HIGH`, `FALLING_EDGE`, and
+`RISING_EDGE`, numbered as for `Pin.listen`. Claim each wake pin as an input
+first, with the pull it needs, so its level is defined while nothing runs.
+An edge or level that is present already ends the dormant state at once.
+
+On the RP2040 and RP2350, `dormant` runs clk_sys from the crystal, stops
+PLL_SYS, the ring oscillator, and the crystal, and afterwards starts PLL_SYS
+again. Both cores stop. The microsecond timer pauses meanwhile, so `now_us`
+does not count the time spent dormant. `dormant` returns `Busy` while the USB
+serial port or an ADC input runs, because their 48 MHz clock would stop.
+Wait until serial ports have sent their last bytes before calling it. A
+complete example that blinks, deep-sleeps, and goes dormant until a button
+press is `examples/low_power.dodo`.
+
+### Testing power-aware code
+
+`fake.Power.new(essential, managed)` starts with every clock running. It
+refuses to disable `essential` clocks and treats `managed` clocks as
+peripherals that `disable_unused_clocks` stops. Tests can `claim` and
+`release` clocks as a chip does, and choose with `wake_next_dormant(pins)`
+which pins end the next dormant state. A dormant state that nothing could end
+traps instead of hanging the test. The fake counts `light_sleeps`,
+`deep_sleeps`, and `dormant_states`, and reports the `requested_events` of
+each pin.
+
+### Sleep controls of the Cortex-M core
+
+`std/embedded/cortex_m` also exposes the system control register directly.
+`set_deep_sleep(bool)` sets SLEEPDEEP, which the chips' `set_mode` uses.
+`set_sleep_on_exit(bool)` makes the core sleep again whenever its last
+handler returns, for firmware that works only in interrupt handlers.
+`set_event_on_pend(bool)` lets a pending but disabled interrupt end a
+`wait_for_event`. Each core has its own register.
 
 ## Building firmware
 
@@ -1131,7 +2100,10 @@ so changing the board in `dodo.toml` is the only change a program needs:
 | `board.I2C_SDA_PIN`, `board.I2C_SCL_PIN` | The board's usual I2C pins. |
 | `board.SPI_CLOCK_PIN`, `board.SPI_TX_PIN`, `board.SPI_RX_PIN`, `board.SPI_SELECT_PIN` | The board's usual SPI pins, and a free pin for one chip select. |
 | `board.UART_TX_PIN`, `board.UART_RX_PIN` | The board's usual serial port pins. |
-| `b.timer` | The delay protocol, plus `delay_ms(ms)` and `now_us() -> u64`; `alarm(n)` claims an alarm, which can also run the [executor](#tasks-and-the-executor). |
+| `b.timer` | The delay and counter protocols, plus `delay_ms(ms)`; `alarm(n)` claims an alarm with the alarm protocol, which can also run the [executor](#tasks-and-the-executor). |
+| `b.rtc` | The chip's [real-time clock](#real-time-clocks-on-the-rp2040-and-rp2350), implementing the clock and alarm protocols. |
+| `b.rng` | The chip's [random number generator](#random-numbers-on-the-rp2040-and-rp2350), implementing the random number generator protocol. |
+| `b.watchdog` | The [watchdog](#the-watchdog-on-the-rp2040-and-rp2350): `start(timeout_ms)`, then `feed()` in time or the board resets; `reset_reason()` tells whether it did. Implements `hal.Watchdog`. |
 | `b.dma` | The [DMA channels](#dma-on-the-rp2040-and-rp2350): `channel()` claims one, `release(channel)` gives it back. Buses and serial ports take them for transfers that run while the program does other work. |
 | `b.usb.serial()` | A [USB serial port](#usb-serial-on-the-rp2040-and-rp2350) on the board's USB connector, implementing the `std/io` Reader and Writer, for printing over the USB cable; `b.usb.serial_with(identity)` sets its [USB identity](#usb-identity), and `b.usb.release_serial(port)` gives it back. |
 | `board.reboot_to_bootloader()` | Restart into the board's flashing mode, for example to run `dodo run` again without pressing a button. |
@@ -1244,33 +2216,42 @@ bus again.
 
 #### Transactions that run in the background
 
-The blocking methods return when the transaction is over. A transaction that
-fits the controller's FIFO, 16 commands on both chips (`queue_depth()`, one
-per byte written and one per byte read), can instead be queued at once: the
-controller runs it while the program does other work, and `poll_finish`
-collects the outcome without waiting:
+The blocking methods return when the transaction is over. Both buses also
+implement the [polling forms](#polling-instead-of-waiting): an I2C bus
+`hal.I2cPoll` and an SPI bus `hal.SpiPoll`, which run the same transactions,
+of any length, while the program does other work. Each call moves the bytes
+received so far into the buffer and refills the controller's FIFO, and
+returns false while the transaction runs and true once it has ended:
 
 ```dodo
 register: [1]u8 = [0x0F]
-i2c.start_write_read(0x48, &register, 2)!
-reply: [2]u8 = [0, 0]
-for !i2c.poll_finish(&mut reply)! {
+reply: [32]u8 = [0; 32]
+for !i2c.poll_write_read(0x48, &register, &mut reply)! {
     // other work
 }
 ```
 
-`start_write(address, bytes)`, `start_read(address, count)`, and
-`start_write_read(address, bytes, count)` queue the three kinds of
-transaction. `poll_finish(&mut buffer)` returns false while the controller
-works, and true once the transaction has ended, with the bytes read in the
-buffer; its errors are those of the blocking methods. Until then the bus is
-`is_busy()`, and every other transaction on it is `Busy`. A task waits for
-the end with the controller's interrupt: `listen()` raises `I2C0_IRQ` or
-`I2C1_IRQ` at the STOP or an abort, and a handler masks it and raises a
-signal, as in [waking tasks from interrupts](#waking-tasks-from-interrupts).
-A transaction never ends while a device holds SCL low: bound the wait with
-an `executor.Timer` and `cancel()` it, which aborts it and disables the
-controller as a stuck blocking transfer does.
+Between polls an I2C controller holds SCL low, which every device accepts as
+clock stretching, so a slow program loses nothing, but a transaction that is
+never polled again keeps the bus. `is_busy()` is true while one runs, and
+blocking calls and `set_frequency` on the bus are `Busy` meanwhile. A
+transaction never ends while a device holds SCL low: bound the wait with an
+`executor.Timer` and call `cancel()`, which aborts it and disables the
+controller as a stuck blocking transfer does; `hal.BlockingI2c` does the
+same after a number of polls. Devices with 10-bit addresses have
+`poll_write_ten_bit`, `poll_read_ten_bit`, and `poll_write_read_ten_bit`. An
+SPI bus moves at most a FIFO's worth of frames per poll and the clock simply
+stops in between; its `cancel()` waits for the frames already queued.
+
+A task waits with the I2C controller's interrupt. After `listen()`,
+`I2C0_IRQ` or `I2C1_IRQ` is raised whenever the next poll can make progress:
+the transmit FIFO is half empty while bytes remain to send, the receive FIFO
+is half full, or the transaction ended with a STOP or an abort. Each poll
+sets the controller's mask for what it waits on next, and an idle bus raises
+nothing. The condition lasts until a poll deals with it, so a handler masks
+the interrupt in the NVIC and raises a signal, and the task, once woken,
+polls and enables it again, as in
+[waking tasks from interrupts](#waking-tasks-from-interrupts).
 
 #### Answering another master
 
@@ -1286,7 +2267,6 @@ package main
 
 import "std/embedded/board"
 import "std/embedded/hal"
-import "std/embedded/peripheral/designware_i2c"
 
 // A register device at 0x42: the first byte of a write picks the
 // register, later bytes fill it, and reads continue from there.
@@ -1297,8 +2277,8 @@ fn main() {
     pointer := 0usize
     buffer: [16]u8 = [0; 16]
     for {
-        match target.poll(&mut buffer) {
-            designware_i2c.TargetEvent.Write(count, start) => {
+        match target.poll(&mut buffer)! {
+            hal.I2cTargetEvent.Write(count, start) => {
                 first := 0usize
                 if start {
                     pointer = buffer[0] as usize % 16
@@ -1309,8 +2289,8 @@ fn main() {
                     pointer = (pointer + 1) % 16
                 }
             }
-            designware_i2c.TargetEvent.Read => {
-                target.respond(&memory[pointer..pointer + 1])
+            hal.I2cTargetEvent.Read => {
+                target.respond(&memory[pointer..pointer + 1])!
                 pointer = (pointer + 1) % 16
             }
             _ => {}
@@ -1319,8 +2299,13 @@ fn main() {
 }
 ```
 
-`respond` can queue several bytes at once; what the master does not read is
-dropped when it next reads. Addresses that the I2C specification reserves
+The targets implement [`hal.I2cTarget` and
+`hal.SpiTarget`](#being-the-device-targets), so a device emulation written
+against them runs on any chip and against fakes. The controller holds SCL
+low while its receive FIFO is full, so written bytes are never lost and
+`poll` does not fail in practice; it would report `Overrun` if bytes were
+dropped. `respond` can queue several bytes at once; what the master does not
+read is dropped when it next reads. Addresses that the I2C specification reserves
 (7-bit `0x00` to `0x07` and `0x78` to `0x7F`) are `InvalidInput`, and general
 calls are not acknowledged.
 
@@ -1401,7 +2386,7 @@ pulled up and nothing is sent, and `flush()` waits as long.
 | --- | --- |
 | Speed | From 120 baud (144 on the RP2350) up to a sixteenth of the system clock: 7.8 Mbaud on the RP2040, 9.4 Mbaud on the RP2350. `baud()` reports the rate the divider makes, within 0.1 % up to 921600 baud (`115_207` for `115_200`). |
 | Changing it | `set_baud(baud)`, and `set_format(data_bits, parity, stop_bits)` for 5 to 8 data bits, `pl011.Parity.None`, `Even`, or `Odd`, and 1 or 2 stop bits. Both wait until everything written is out. |
-| Writing | `write` waits while the 32-byte transmit FIFO is full and returns once the last byte is queued; `flush()` waits until it has left. `poll_write` queues what fits without waiting. A write or `flush()` that makes no progress for `pl011.DEFAULT_POLL_LIMIT` status polls (around a second), as when flow control holds the transmitter, fails with `TimedOut` and the bytes queued before it; `set_poll_limit(polls)` changes the limit, `pl011.NO_POLL_LIMIT` removes it. |
+| Writing | `write` waits while the 32-byte transmit FIFO is full and returns once the last byte is queued; `flush()` waits until it has left. `poll_write` queues what fits and `poll_flush()` tells whether the last byte has left, both without waiting; ports implement `serial.Port` and `serial.PollPort`. A write or `flush()` that makes no progress for `pl011.DEFAULT_POLL_LIMIT` status polls (around a second), as when flow control holds the transmitter, fails with `TimedOut` and the bytes queued before it; `set_poll_limit(polls)` changes the limit, `pl011.NO_POLL_LIMIT` removes it. |
 | Reading | `read` waits for the first byte, as long as it takes unless `set_read_poll_limit(polls)` bounds it (then `TimedOut`), then returns what has arrived; a serial port never reaches end of input. `poll_read` returns at once, `Pending` while nothing has arrived. Nothing buffers beyond the 32-byte receive FIFO, so read at least every 32 bytes' time (2.8 ms at 115200 baud) while data arrives. |
 | Errors | A read fails with an `io.Error` of kind `Other` whose `code` holds `pl011.FRAMING_ERROR`, `PARITY_ERROR`, `BREAK`, or `OVERRUN`, after the good bytes before it (`transferred`). Bytes with framing or parity errors, and breaks, are dropped; an overrun means bytes were lost because the receive FIFO was full. The next read continues. |
 | Terminals | `set_crlf(true)` writes `"\n"` as `"\r\n"` and reads the CR that Enter sends, alone or followed by LF, as one `"\n"`, so `io.read_line` ends at Enter. Off at first, so binary protocols get their bytes unchanged. Terminals do not show what is typed unless the program echoes it. |
@@ -1477,7 +2462,7 @@ is a small command line over USB.
 
 | | USB serial port |
 | --- | --- |
-| Writing | `write` queues its bytes and returns. While no terminal has the port open, the first 1024 bytes (`rp_usb.TX_CAPACITY`) wait for one and the rest are dropped, so the start of the output, such as a banner printed at startup, is shown when a terminal opens it. While one has it open, a full queue waits for the host, and output the host does not take within 100 ms is dropped. Printing never stops the program and never fails. `flush()` waits until the host has taken everything, within the same limit; `poll_write` queues what fits. |
+| Writing | `write` queues its bytes and returns. While no terminal has the port open, the first 1024 bytes (`rp_usb.TX_CAPACITY`) wait for one and the rest are dropped, so the start of the output, such as a banner printed at startup, is shown when a terminal opens it. While one has it open, a full queue waits for the host, and output the host does not take within 100 ms is dropped. Printing never stops the program and never fails. `flush()` waits until the host has taken everything, within the same limit; `poll_write` queues what fits and `poll_flush()` tells whether the host has taken it all. The port implements `serial.Port` and `serial.PollPort`. |
 | Reading | `read` waits for the first byte, then returns what has arrived; `poll_read` returns at once, `Pending` while nothing has. Up to 256 bytes (`rp_usb.RX_CAPACITY`) are kept; beyond that the host waits until the program reads, so no input is lost. `available()` counts what is waiting. |
 | Terminals | Newline translation is on at first, unlike on a UART: `"\n"` goes out as `"\r\n"`, and the CR that Enter sends, alone or followed by LF, reads as `"\n"`. `set_crlf(false)` passes binary data unchanged. |
 | Connection | `is_connected()` is true while a program on the host has the port open (DTR set, as terminals do); `is_configured()` while the host has enumerated the board. `line_state()` returns `rp_usb.DTR` and `rp_usb.RTS`, and `baud()` the rate the host set, for a bridge to a UART. |
@@ -1607,6 +2592,41 @@ slice once neither output is in use. The two outputs of a slice write only
 their own bits of the registers they share, so one can be kept by an
 interrupt handler and the other by the main program.
 
+`pins.pwm_input(pin, window_us)` measures the signal on an odd GPIO, input B
+of PWM slice (n / 2) % 8: its frequency, duty cycle, and pulse length, as for
+a servo or RC receiver signal, a fan's tachometer, or another board's PWM
+output. It returns an `rp_pwm.PwmCapture`, which implements
+[`hal.PwmInput`](#measuring-pulses). The input uses the slice's counter, so
+the slice's other pin cannot be a PWM output meanwhile: `pwm_input` is
+`Busy` if either output is in use, and outputs on that slice are `Busy` while
+the input exists. Even pins are `InvalidInput`. `release_pwm_input` gives the
+pin and slice back.
+
+```dodo
+input := b.pins.pwm_input(15, 100_000)!   // 100 ms windows
+servo := hal.capture(&mut input, hal.DEFAULT_POLL_LIMIT)!
+pulse := servo.high_us()                  // about 1000 to 2000
+```
+
+A slice cannot timestamp edges, so it counts over windows of `window_us`,
+two per measurement, one right after the other: first rising edges, then
+clk_sys cycles while the pin is high, over a whole number of the periods it
+just measured. Polls note when the edge count changes, so a program that
+polls often gets the period to within a few microseconds over the whole
+window; one that polls once per window gets it to within one period per
+window. Choose a window spanning at least a few periods of the slowest
+signal: 10 ms for 25 kHz fan PWM or 1 kHz, 50 ms for a 100 Hz tachometer,
+100 ms for a 50 Hz servo. Windows reach 134 ms on the RP2040 and 111 ms on
+the RP2350 (`rp_pwm.max_window_us`). Fewer than two rising edges in a
+window, or a line that does not change, reads as a steady line: `cycles` is
+0 and `duty` shows the share of time it was high. Fast signals are counted
+through a prescaler that adapts by itself, so a sudden jump in frequency
+costs a window or two; `poll_capture` returns `Overrun` for a count that
+wrapped beyond recovery, a signal near half of clk_sys or polls more than
+about three windows apart, and the next measurement then starts. The pin is
+pulled down, so an unconnected input reads as a steady low line; a fan's
+open-collector tachometer needs a pull-up of 10 kΩ or less to 3.3 V.
+
 `pins.analog(pin)` claims GPIO 26 to 29, ADC inputs 0 to 3, and returns an
 `rp_adc.Analog`, which implements `hal.AnalogInput`: each `read()` converts
 once, 0 to 4095 for 0 V to the ADC's reference, the 3.3 V supply on the Pico
@@ -1639,6 +2659,38 @@ that does not finish is `Timeout`, and one the converter flags as failed is
 releasing the last with `pins.release_analog(input)` stops both. The sensor
 is accurate to a few degrees and depends on the reference voltage; on the
 Pico and Pico 2, GP29 reads a third of the supply voltage VSYS.
+
+### Random numbers on the RP2040 and RP2350
+
+`b.rng`, or `Peripherals.rng` from the chip package, is each chip's best
+generator; both implement [`hal.Rng`](#random-numbers), and
+`std/embedded/chip/rp_rng` holds the drivers:
+
+| Chip | `b.rng` | Source | Speed | Fit for keys |
+| --- | --- | --- | --- | --- |
+| RP2040 | `rp_rng.Rosc` | The ring oscillator's RANDOMBIT, sampled every 128 reads (about 10 us) and debiased with von Neumann's method: of two samples that differ, the first is kept; pairs that agree are dropped. | About 3 KB a second | No |
+| RP2350 | `rp_rng.Trng` | The TRNG, with its hardware debiasing and all three health tests on, sampling its oscillator every 200 clk_sys cycles. | About 20 KB a second | Yes |
+
+The ring oscillator was not designed or tested as an entropy source, and
+the RP2040 has nothing better: use its bytes for seeds, random delays,
+identifiers, and games. `take()` moves the clocks to the crystal and the
+PLL but leaves the oscillator running, so its jitter against clk_sys is
+what the samples see. An
+oscillator that has stopped makes a fill `Timeout`, and 32 equal bits in a
+row, which a source locked to the system clock gives, make it `Bus`.
+
+The RP2350's TRNG collects 192 bits at a time in about 1 ms. A fill keeps
+the bytes it does not use for the next, so `hal.random_u32` mostly returns
+at once. Bits that fail the repetition tests are discarded, and four failed
+autocorrelation tests in a row, which stop the TRNG, restart it; after 100
+restarts for one block the fill reports `Bus`. The TRNG runs only during a
+fill. Its events are unmasked meanwhile and raise `TRNG_IRQ`; while that
+interrupt is disabled in the NVIC, as it is unless the program enables it,
+the fill clears the pend they leave.
+
+Both generators are generic over `hal.Registers`, as `rp_rng.RoscSource` and
+`rp_rng.TrngSource`, so they run against simulated registers in
+[desktop tests](#testing-with-fakes).
 
 ### PIO on the RP2040 and RP2350
 
@@ -1755,6 +2807,53 @@ interrupt handler and another by the main program.
 [`examples/ws2812.dodo`](https://github.com/Jotrorox/dodo/blob/main/examples/ws2812.dodo)
 drives a strip of WS2812 LEDs this way.
 
+### I2S audio on the RP2040 and RP2350
+
+Neither chip has an I2S peripheral, so `std/embedded/chip/rp_i2s` makes one
+from a [PIO](#pio-on-the-rp2040-and-rp2350) state machine. An
+`rp_i2s.Output` plays samples to a DAC or amplifier such as the PCM5102 or
+MAX98357A and implements [`hal.I2sOutput`](#i2s-audio); an `rp_i2s.Input`
+records an I2S microphone or ADC such as the INMP441 and implements
+`hal.I2sInput`. Both drive the bit clock (BCLK) and word select (LRCLK):
+BCLK is GPIO `clock` and LRCLK the GPIO after it, and DATA any other pin.
+Give all three to the block first:
+
+```dodo
+pio := b.pins.pio(0)!
+b.pins.pio_pins(&pio, 9, 3)!             // DATA 9, BCLK 10, LRCLK 11
+config := rp_i2s.Config.new(48_000, 16, 2, hal.I2sFormat.Philips)
+output := rp_i2s.Output.new(&mut pio, 9, 10, &config)!
+hal.write_samples(&mut output, &samples, hal.NO_POLL_LIMIT)!
+```
+
+A frame always has two slots on the wire, left then right: a mono output
+sends each sample in both, and a mono input keeps the slot `config.channel`
+names. Slots are 32 bit clocks, or 16 with `config.slot_bits = 16` for
+16-bit samples, so BCLK runs at `sample_rate × 2 × slot_bits`. The state
+machine spends four cycles per bit, divided down from clk_sys in 1/256
+steps; `output.timing()` reports the rate actually produced and its error in
+parts per million. At 125 MHz, 48 kHz comes out 64 ppm fast; a 150 MHz
+RP2350 makes 48 kHz exactly. Philips, left-justified, and right-justified
+framing are supported; a 24-bit sample sits in the top bits of its 32-bit
+slot, or the bottom bits when right-justified.
+
+The joined FIFO holds eight words: four frames in 32-bit slots, eight in
+16-bit slots. `poll_write` queues as many whole frames as fit, so a task
+tops it up, or a buffer plays without the processor: `output.pack(&samples,
+buffer)` fills a word-aligned buffer in the wire format and
+`output.dma(&mut channel, buffer)` returns a
+[`hal.DmaStream`](#transfers-in-the-background-dma) paced by the state
+machine. When the queue runs dry the output keeps its clocks running and
+sends silence a whole frame at a time, so left and right never swap. The
+input instead pauses its clocks when the program falls behind; the next
+`poll_read` reports `Overrun` once and drops what was queued, and some
+microphones need a few milliseconds to wake after their clock stops.
+
+An output takes 17 instruction slots (10 with 16-bit slots) and an input 8,
+so both fit in one block. `release(&mut pio)` stops the stream, gives back
+its state machine, and frees the program's slots; the pins stay with the
+block until `pins.release_pio`.
+
 ### DMA on the RP2040 and RP2350
 
 Both chips have a DMA controller, 12 channels on the RP2040 and 16 on the
@@ -1806,7 +2905,9 @@ every claimed channel before it writes to the serial ports.
 
 `bus.dma(&mut tx, &mut rx, &mut buffer)` returns a `pl022.DmaBus` that
 sends from and receives into `buffer`, `tx` feeding the transmit FIFO and
-`rx` emptying the receive FIFO:
+`rx` emptying the receive FIFO. It implements
+[`hal.SpiDma`](#transfers-in-the-background-dma), so device drivers written
+against that protocol use it unchanged:
 
 ```dodo
 spi := b.pins.spi(board.SPI_CLOCK_PIN, board.SPI_TX_PIN, some(board.SPI_RX_PIN), hal.SpiMode.Mode0, 8_000_000)!
@@ -1828,7 +2929,9 @@ data := flash.buffer()!
 | `start_transfer(count)` | Send `buffer[..count]` and replace each byte with the one received at the same time; returns at once. |
 | `start_write(count)` | Send `buffer[..count]` and discard what arrives; the buffer stays as it is. |
 | `is_busy()` | True until the last byte has been received, which is when `rx`'s signal is raised. |
+| `poll_finish()` | Without waiting: false while a transfer runs, true once none does, ending one that is done; errors as for `finish`. |
 | `finish()` | Wait for the running transfer, if any, and end it: `Overrun` if replies were lost, `Bus` on a bus error. |
+| `abort()` | Stop a running transfer; the device saw only part of it. |
 | `transfer(count)`, `write(count)` | Start and finish, for code that waits anyway but wants no gaps between frames. |
 | `capacity()` | The buffer's length, the most one transfer moves. |
 
@@ -1841,7 +2944,8 @@ bus then works as before. Frames above 8 bits are `Unsupported`.
 
 `port.dma(&mut rx, &mut ring, &mut tx, &mut output)` returns a
 `pl011.DmaPort`, a serial port with the `std/io` Reader and Writer
-protocols, like `pl011.Port`, but with two differences:
+protocols, `serial.Port`, and `serial.PollPort`, like `pl011.Port`, but with
+two differences:
 
 - `rx` moves every byte that arrives into `ring`, round and round, so input
   waits there and not just in the 32-byte FIFO: a 1 KiB ring holds 89 ms at
@@ -1893,6 +2997,10 @@ behind the borrow checker's back; `is_busy`, `remaining`, `max_count`,
 `abort`, and `take_error` are safe. A driver keeps its buffers borrowed until
 the transfer is done or aborted, and aborts it when dropped, as the DMA
 sessions above do. `hal.address_of(bytes)` gives a buffer's address.
+[`hal.DmaStream`](#transfers-in-the-background-dma) does all of that for a
+buffer moved to or from one peripheral data register, so a new DMA-backed
+driver only turns its peripheral's requests on and off around it, and
+`fake.DmaChannel` runs such code on a desktop.
 
 An `rp_dma.Channel` finds the data request (DREQ) from the peripheral
 register a transfer reads or writes: the UARTs' and SPI controllers' data
@@ -1902,6 +3010,90 @@ up. `start_request(transfer, dreq)` paces by any other request, or by
 `rp_dma.TIMER0` to `TIMER3`. The driver, `std/embedded/chip/rp_dma`, is a
 `Driver` over any `hal.Registers`, tested against a model of both chips'
 controllers.
+
+### Flash on the RP2040 and RP2350
+
+The board's flash chip holds the program from its start and is otherwise
+free: `b.flash`, a `rp_flash.Flash`, hands out regions of it above the
+program, each a `rp_flash.Region` with the `hal.Flash` protocol, for
+[persistent storage](#persistent-storage). `last(length)` takes the last
+`length` bytes, `region(start, length)` any sectors from `program_end()` on,
+and `free()` all of them; `release(region)` gives one back. A region below
+the program or past the board's flash size (2 MiB on the Pico, 4 MiB on the
+Pico 2) is `InvalidInput`, and one that overlaps a region still out is
+`Busy`. `b.flash.read(offset, buffer)` reads anywhere, the program included.
+
+Flashing a new program through the bootloader rewrites only the program's
+own sectors, so data in a region stays, as long as the program does not grow
+into it. Regions erase 4 KiB sectors, about 50 ms each, and write any bytes,
+filling the rest of each 256-byte page with `0xFF`, which leaves it as it
+was.
+
+Both go through the boot ROM, which takes the flash out of execute-in-place
+mode meanwhile, so nothing may run from or read flash: a region masks
+interrupts on the core that calls it while it works, and on the RP2040 runs
+that part from SRAM. Interrupt handlers wait for up to one sector erase. A
+USB serial port stays connected, as its controller answers the host by itself.
+Core 1 runs from flash too, so a region refuses to erase or write with
+`Busy` on core 1 and while core 1 runs a task: stop it first. DMA transfers
+must not read from flash while a region erases or writes.
+
+### Real-time clocks on the RP2040 and RP2350
+
+`b.rtc` is each chip's [real-time clock](#real-time-clocks), handed out by
+`take()` with `rp2040.Rtc` and `rp2350.Rtc` as its types. Both implement
+`hal.Rtc` and `hal.RtcAlarm`, and the register-level drivers behind them,
+generic over a register block for desktop tests, are in
+`std/embedded/chip/rp_rtc`:
+
+- The **RP2040's RTC** is a calendar of year, month, day, hours, minutes,
+  and seconds. `take()` clocks it at 31.25 kHz from the crystal and leaves it
+  unset; a reset stops it, so every boot starts unset. It counts leap years
+  every fourth year only, so a clock running from 2099 into 2100 needs its
+  time set again after February 2100; setting a time in such a year tells it.
+  Its alarm compares every field with the time.
+- The **RP2350's always-on timer** is the power manager's 64-bit millisecond
+  counter, ticking from the crystal. It sits in the always-on power domain:
+  once set, it keeps counting through the resets that leave that domain
+  running, such as the watchdog's, and a later `take()` finds it still set.
+  It stops when the chip loses power.
+
+The alarm raises the clock's interrupt while `listen`ing: `RTC_IRQ` on the
+RP2040, during the alarm's second, and `POWMAN_IRQ_TIMER` on the RP2350,
+until `clear_alarm`. `rtc.irq()` gives its number for
+[`std/embedded/cortex_m`](#the-cortex-m-core). To sleep until the alarm,
+enable the interrupt inside a critical section: its arrival ends `wfi` while
+interrupts are masked, so no handler runs and the same code works on both
+chips:
+
+```dodo
+b.rtc.listen()
+hal.rtc_alarm_in(&mut b.rtc, 60_000)!
+irq := b.rtc.irq()
+section := hal.Critical.enter()
+cortex_m.enable(irq)
+for !b.rtc.alarm_fired()! {
+    cpu.wait_for_interrupt()
+}
+b.rtc.clear_alarm()!
+cortex_m.disable(irq)
+cortex_m.unpend(irq)
+core.drop(section)
+```
+
+An `@interrupt(RTC_IRQ)` or `@interrupt(POWMAN_IRQ_TIMER)` handler instead
+has to call `clear_alarm`, or the interrupt stays raised; move the clock into
+a `static mut Option<rp2040.Rtc>` for it, as for a [timer
+alarm](#an-interrupt-driven-driver).
+
+With [low power](#low-power), the RP2040's RTC keeps counting in deep
+sleep only if its clock is in the sleep set, as in
+`b.power.set_sleep_clocks(rp2040.ALARM_CLOCKS | rp2040.CLOCK_RTC)`; its alarm
+then wakes the core like a timer alarm. The RP2350's always-on timer needs no
+gate and counts through deep sleep. Both tick from the crystal, which
+`b.power.dormant` stops, so neither counts while the chip is dormant, nor can
+its alarm end a dormant state; set the clock again from another source
+afterwards if the time matters.
 
 ### Two cores on the RP2040 and RP2350
 
@@ -1915,6 +3107,7 @@ hands out three parts from `std/embedded/chip/rp_multicore`:
 | `b.core1` | `start(&mut stack, task)` runs `task.run()` on core 1 and returns a `Running` handle. |
 | `b.fifos` | `claim()` hands out a core's end of the FIFOs between the cores, twice: one for core 0 and one to move into core 1's task. |
 | `b.spinlocks` | `claim(n)` and `claim_free()` hand out the hardware locks both cores see. |
+| `b.doorbells` | On the RP2350, `claim(n)` and `claim_free()` hand out the doorbells that interrupt the other core. The Pico's RP2040 has none. |
 
 A task for core 1 is a value with a public `run(self)` method, like a
 [`std/thread`](threads.md) task. It moves to core 1, so it may own
@@ -2019,8 +3212,30 @@ runtime's, and `set_signal` with it. GPIO events reach core 0 only: `Pin.listen`
 enables them for core 0's `IO_IRQ_BANK0`. The USB serial port's interrupt runs
 on the core that opened the port.
 
-Statics are shared by both cores, and a critical section does not keep the
-other core out. Guard state both cores change with a spinlock:
+Statics are shared by both cores, and `hal.Critical` does not keep the other
+core out. A [`sync.Mutex`](#sharing-values-with-a-mutex) does: `start`
+installs hardware spinlock 31 as the lock of `std/embedded/sync`'s sections,
+so from then on a mutex locked on one core makes the other core wait as
+well as masking interrupts, and the same static works across handlers,
+tasks, and cores:
+
+```dodo
+static PRIMES: sync.Mutex<Found> = sync.Mutex.new(Found { count: 0, largest: 0 })
+
+// On core 1:
+PRIMES.with(fn(found: &mut Found) {
+    found.count += 1
+    found.largest = candidate
+})
+
+// On core 0:
+guard := PRIMES.lock()
+report(guard.get().count)
+```
+
+While one core holds a mutex, the other spins when it locks any mutex, so
+keep sections short. Stopping core 1 releases a section it held. A program
+of its own can also guard state with a spinlock:
 
 ```dodo
 static mut TOTAL: u32 = 0
@@ -2035,19 +3250,98 @@ core.drop(guard)
 `lock()` masks interrupts on this core, then waits while the other core holds
 the lock; dropping the guard releases it and unmasks them again. `try_lock()`
 does not wait, and `is_locked()` reports either core's hold. Claim a lock once,
-then give the other core its own copy with `clone()`. The RP2040 has 32 locks.
-On the RP2350, writes to some other SIO registers unlock the locks just below
-them (erratum RP2350-E2), so locks 0 to 4, 8, 9, and 12 to 17 are never handed
-out; locks 18 to 31 work on both chips. On the RP2350 a single word can also be
+then give the other core its own copy with `clone()`. The RP2040 has 32 locks,
+of which lock 31 belongs to `std/embedded/sync`. On the RP2350, writes to some
+other SIO registers unlock the locks just below them (erratum RP2350-E2), so
+locks 0 to 4, 8, 9, and 12 to 17 are never handed out either; locks 18 to 30
+work on both chips. On the RP2350 a single word can also be
 shared with [atomics](#sharing-state-with-atomics), whose exclusive loads and
 stores work across cores; the RP2040's Cortex-M0+ only loads and stores
 atomically.
+
+The RP2350 also has eight **doorbells**, which interrupt the other core
+without passing data, so they wake the other core's executor without using
+the FIFO. Claim one, give core 1 a `clone()`, and let the core that waits
+raise a signal from it:
+
+```dodo
+const RUNG: executor.Signal = executor.Signal { id: 4 }
+
+// Core 0, before starting core 1 with `bell.clone()` in its task:
+bell := b.doorbells.claim(0)!
+bell.set_signal(&RUNG)
+
+// In an async task of core 0's executor:
+await RUNG.wait()
+
+// On core 1, when there is news:
+bell.ring()
+```
+
+| `rp_multicore.Doorbell` | Purpose |
+| --- | --- |
+| `ring()`, `withdraw()` | Ring the doorbell on the other core, or take back a ring it has not acknowledged. Rings before an acknowledgement are one. |
+| `is_ringing()`, `answer()` | Whether the other core rang it, and acknowledging that, true if it was ringing. |
+| `set_signal(&signal)`, `clear_signal()` | Raise a signal on this core when the other core rings: the RP2350 runtime's `SIO_IRQ_BELL` handler acknowledges the ring and raises it. |
+| `irq()`, `clone()` | `SIO_IRQ_BELL`, which each core has, and the same doorbell for the other core. |
+
+A program's own `@interrupt(SIO_IRQ_BELL)` handler replaces the runtime's.
 
 `examples/two_cores.dodo` searches for primes on core 1 and reports progress
 over USB serial from an executor on core 0, woken through the FIFO, with a
 spinlock around the results both cores read. The ADC and the USB serial port
 share the bookkeeping that starts and stops PLL_USB, so claim and release them
 from one core.
+
+### The watchdog on the RP2040 and RP2350
+
+A watchdog restarts firmware that hangs. Once started, it counts down, and
+unless the program calls `feed()` before the count runs out, it resets the
+chip. `b.watchdog` is stopped after `board.take()`:
+
+```dodo
+package main
+
+import "std/embedded/board"
+import "std/embedded/hal"
+
+fn main() {
+    b := board.take()!
+    if b.watchdog.reset_reason() == hal.ResetReason.Timeout {
+        // The last run hung: count it in a word that survived the reset.
+        hangs := b.watchdog.scratch(0)
+        b.watchdog.set_scratch(0, hangs + 1)
+    }
+    b.watchdog.start(500)!
+    for {
+        b.led.toggle()
+        b.timer.delay_ms(100)
+        b.watchdog.feed()
+    }
+}
+```
+
+| `rp_watchdog.Watchdog` | Purpose |
+| --- | --- |
+| `start(timeout_ms)` | Count down from the timeout, from 1 ms up to `max_timeout_ms()`: 8388 ms on the RP2040, which counts twice per tick (erratum RP2040-E1), and 16777 ms on the RP2350. `InvalidInput` outside that range. Starting a running watchdog changes its timeout. |
+| `feed()` | Count down from the timeout again; the `hal.Watchdog` protocol, so drivers and tasks can feed it without naming the chip. |
+| `stop()`, `is_running()` | Stop counting, so the chip is not reset, until `start` again. |
+| `timeout_ms()`, `remaining_us()` | The timeout last started, and the microseconds left before the reset. |
+| `reset_reason()` | Why the chip last started: `hal.ResetReason.Timeout` if the watchdog ran out, `Restart` after `restart()`, and `Other` after power-up, the RUN pin, a debugger, or the boot ROM. |
+| `scratch(n)`, `set_scratch(n, value)` | Two words, `n` 0 or 1, that survive a watchdog reset but not power-up, for a note to the next run. |
+| `restart()` | Reset the chip through the watchdog now. Does not return. |
+
+The reset restarts both cores, the peripherals, and RAM, but not the
+oscillators. The count pauses while a debugger halts a core. A panic halts
+the program, so with the watchdog running the default panic hook's report is
+followed by a restart, which `reset_reason()` reads as `Timeout`.
+
+The boot ROM resets through the same watchdog when it restarts into the
+bootloader and when it starts newly flashed firmware. As in the Pico SDK,
+`start` leaves a mark in a scratch register that the boot ROM overwrites, and
+only a reset with that mark counts as the watchdog's.
+`reboot_to_bootloader()` clears the mark, so the first run after `dodo run`
+reads `Other`. `board.take()` reads the reason once and clears the mark.
 
 ### The Raspberry Pi Pico 2 W
 
@@ -2215,10 +3509,11 @@ so each new board or chip is a small, self-contained addition:
 
 The compiler compiles the runtime itself with the selected target machine, so
 no assembler or C toolchain is involved. `scripts/test_pico.py` (with
-`--board pico`, `--board pico2`, or `--board pico2_w`) and
-`scripts/test_esp32c6.py` show how to check a chip on real hardware, and
-`scripts/test_rp2350_float.py` checks the RP2350's coprocessor `f64` helpers
-against the software ones on a board.
+`--board pico`, `--board pico2`, or `--board pico2_w`) shows how to check a chip
+on real hardware, and `scripts/test_rp2350_float.py` checks the RP2350's
+coprocessor `f64` helpers against the software ones on a board. Without a
+board, `scripts/test_emulator.py` runs the self-test in `tests/emulator` on
+emulated RP2040 and RP2350 chips, as CI does.
 
 ### Unsupported chips
 
@@ -2246,33 +3541,31 @@ dodo build firmware.dodo --emit obj --target thumbv7em-none-eabihf \
 
 ## Current limits
 
-- The boards are `pico`, `pico2`, `pico2_w`, and `esp32c6_devkitc`, on the
-  `rp2040`, `rp2350`, and `esp32c6` chips. On the ESP32-C6, the radios
-  (Wi-Fi, Bluetooth LE, IEEE 802.15.4), the low-power core, sleep modes, and
-  the I2C and SPI controllers' target (slave) modes are not supported; its
-  DMA copies between buffers but is not used by the buses yet, an ADC input
-  draws enough current while it samples that sources above about 10 kOhm
-  read low, and flashing works from macOS and Linux. The Raspberry Pi
-  chip packages cover clocks, GPIO, I2C, SPI, UART, PWM, the ADC,
-  PIO, the timer, DMA, a USB serial port, and the second core; other USB
-  devices (HID,
-  mass storage, several functions at once) or USB host mode are not bundled
+- The boards are `pico`, `pico2`, and `pico2_w`, on the `rp2040` and `rp2350`
+  chips. The chip packages cover clocks, GPIO, I2C, SPI, UART, PWM, the ADC,
+  PIO, the timer, the real-time clock, the watchdog, DMA, a USB serial port,
+  the random number generators, low power, and the second core; other USB
+  devices (HID, mass storage, several functions at once) or USB host mode
+  are not bundled
   yet. Write them with `hal.Reg` as above.
 - PIO state machines move words through their FIFOs by polling or their
   interrupts. DMA can pace transfers by their FIFOs' data requests
-  (`rp_dma.request` with `sm.tx_fifo_address()`), but there is no DMA
-  session for them as for SPI buses and serial ports. Their pin mappings
+  (`rp_dma.request` with `sm.tx_fifo_address()`), and `hal.DmaStream` runs
+  a buffer through one, as `rp_i2s.Output.dma` does. Their pin mappings
   reach GPIO 0 to 31; the
   RP2350B's GPIO 32 to 47 and the RP2350's GPIOBASE register are not
   supported. `rp_pio.assemble` takes one program per call.
-- PWM outputs only generate; the slices' input modes, which count or time a
-  pin's pulses, and the PWM wrap interrupt are not exposed. ADC reads are
+- PWM inputs measure by counting over windows, as the slices cannot
+  timestamp edges; the PWM wrap interrupt is not exposed. ADC reads are
   polled one at a time, without the round-robin sampler, FIFO, or DMA.
 - A serial port keeps no more input than its 32-byte FIFO unless it
   receives [by DMA](#serial-ports-by-dma), a program serves its interrupts,
   as in [an interrupt-driven driver](#an-interrupt-driven-driver), or the
   other end honours RTS. An I2C master is the bus's only master, without high-speed
   mode, which the chips' controllers lack, and cannot send empty transfers.
+  Neither chip has a CAN controller: CAN goes through an external MCP2515
+  on SPI, and I2S through PIO, as master only (the program drives BCLK and
+  LRCLK).
   The Pico 2 W's wireless chip drives only its LED and senses USB power;
   Wi-Fi and Bluetooth need its firmware, which is not loaded yet.
 - The software floating-point helpers are written for correctness, not speed:
@@ -2282,21 +3575,42 @@ dodo build firmware.dodo --emit obj --target thumbv7em-none-eabihf \
   floating-point exception flags and return the default quiet NaN for every
   NaN result.
 - Core 1 runs one task, started from core 0, and the cores share the
-  vector table. Executor tasks on either core are cooperative: there is no
-  preemptive scheduler. GPIO events interrupt core 0 only, the RP2350's
-  doorbells between the cores are not exposed, and its RISC-V cores are not
-  supported.
+  vector table. Executor tasks on either core, async or hand-written, are
+  cooperative: there is no preemptive scheduler. GPIO events interrupt
+  core 0 only, and the RP2350's RISC-V cores are not supported. A signal
+  belongs to one core; the FIFO or a doorbell carries a wake-up across.
+- An async fn's future must stay in place once started, cannot await
+  itself, and is as large as everything its body keeps across an `await`;
+  `await` begins its statement. See [async functions](async.md).
+- `sync.Mutex` masks interrupts while held, and with core 1 running also
+  holds off the other core; on a hosted target it excludes nothing, like
+  the executor's signals, so use both from one thread there.
 - On the Cortex-M0+ of the RP2040, atomics only load and store; see
   [sharing state with atomics](#sharing-state-with-atomics).
 - Inline assembly lives inside functions; there is no global or naked
   assembly, so startup code and vector tables come from the chip runtime or a
   `@section`-placed static.
-- Timers have no shared protocol yet. Expose them as methods on your chip's
-  types.
-- SPI by DMA moves frames of up to 8 bits; wider frames use the word
-  methods, which are polled. A queued I2C transaction fits the controller's
-  FIFO, 16 commands on both chips; longer transfers use the blocking
-  methods. The ADC is not read by DMA yet, and channel signals come only
-  from `DMA_IRQ_0`.
+- Low power covers sleep, deep sleep, clock gating, and the dormant state
+  woken by GPIO 0 to 29. The RP2350's power manager states, which switch
+  power domains off, its always-on timer, and waking a dormant chip by time
+  (the RP2040's RTC from an external clock, the RP2350's AON timer) are not
+  supported. Neither is lowering the system clock to save power. On a dual-core chip,
+  deep sleep stops the sleep set's other clocks only while both cores
+  deep-sleep.
+- The timer protocols count microseconds. Counters at other rates, a
+  timer's capture and compare channels, and periodic hardware timers have no
+  shared protocol; use the chip's own methods, as for the RP2040's and
+  RP2350's alarms, whose interrupts `listen` turns on.
+- Flash regions erase and write only from core 0, with interrupts masked and
+  core 1 stopped; there is no lockout that pauses core 1 in SRAM meanwhile.
+  External SPI flash chips have no bundled driver yet, but any driver with
+  the `hal.Flash` methods holds a `storage.Store`.
+- Real-time clocks tick from the crystal: the RP2040's RTC is not clocked
+  from a GPIO, nor the RP2350's always-on timer from its low-power
+  oscillator or a GPIO, so they stop while the chip is dormant and cannot
+  wake it, and the RP2350's power-down states are not supported.
+- SPI by DMA and polled SPI transfers move frames of up to 8 bits; wider
+  frames use the word methods, which wait. The ADC is not read by DMA yet,
+  and channel signals come only from `DMA_IRQ_0`.
 
 For raw register and pointer contracts, see [memory and foreign calls](memory-and-ffi.md).

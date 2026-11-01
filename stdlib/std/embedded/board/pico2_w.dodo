@@ -4,8 +4,11 @@ import "std/embedded/wireless/cyw43"
 import "std/embedded/hal"
 import "std/embedded/chip/rp2350"
 import "std/embedded/chip/rp_dma"
+import "std/embedded/chip/rp_flash"
 import "std/embedded/chip/rp_multicore"
+import "std/embedded/chip/rp_rng"
 import "std/embedded/chip/rp_usb"
+import "std/embedded/chip/rp_watchdog"
 
 // Raspberry Pi Pico 2 W: a Pico 2 (RP2350A, 12 MHz crystal, 4 MiB of flash)
 // with an Infineon CYW43439 wireless chip. The green user LED hangs off the
@@ -66,17 +69,36 @@ pub struct Board {
     pub pins: rp2350.Pins
     // The 1 MHz system timer: delay_us, delay_ms, and now_us.
     pub timer: rp2350.Timer
+    // The real-time clock, with the hal Rtc and RtcAlarm protocols: the
+    // time of day in milliseconds, which keeps counting through resets.
+    pub rtc: rp2350.Rtc
+    // The watchdog, stopped until `start(timeout_ms)`: it then resets the
+    // board unless `feed()` is called in time; see
+    // std/embedded/chip/rp_watchdog.
+    pub watchdog: rp_watchdog.Watchdog
     // The USB port: `serial()` makes the board a USB serial port, for
     // printing over the USB cable.
     pub usb: Usb
     // The DMA channels: `channel()` claims one, for transfers that run
     // while the program does other work.
     pub dma: rp_dma.Dma
-    // The second core, `start`ed with a task of its own, and the FIFOs and
-    // spinlocks the two cores share; see std/embedded/chip/rp_multicore.
+    // The random number generator, the RP2350's TRNG, fit for
+    // cryptographic keys; std/embedded/chip/rp_rng documents it.
+    pub rng: rp_rng.Trng
+    // The second core, `start`ed with a task of its own, and the FIFOs,
+    // spinlocks, and doorbells the two cores share; see
+    // std/embedded/chip/rp_multicore.
     pub core1: rp_multicore.Core1
     pub fifos: rp_multicore.Fifos
     pub spinlocks: rp_multicore.Spinlocks
+    pub doorbells: rp_multicore.Doorbells
+    // The program flash: the free flash above `flash.program_end()` keeps
+    // data across restarts and reflashing, for example a
+    // std/embedded/storage key-value store; see std/embedded/chip/rp_flash.
+    pub flash: rp_flash.Flash
+    // Sleep modes, clock gating, and the dormant state, with the
+    // std/embedded/power protocol; see rp2350.Power.
+    pub power: rp2350.Power
 }
 
 // Start the chip with the Pico 2 W's crystal, power up the wireless chip,
@@ -85,16 +107,16 @@ pub struct Board {
 // not answer returns hal.Error.Timeout.
 pub fn take() -> Board!hal.Error {
     chip := rp2350.take(rp2350.Config { crystal_hz: CRYSTAL_HZ })?
-    power := chip.pins.output(WL_POWER_PIN)?
+    wireless_power := chip.pins.output(WL_POWER_PIN)?
     data := chip.pins.output(WL_DATA_PIN)?
     select := chip.pins.output(WL_SELECT_PIN)?
     clock := chip.pins.output(WL_CLOCK_PIN)?
-    wireless := cyw43.Device.new(cyw43.Spi.new(select, clock, data), power)
+    wireless := cyw43.Device.new(cyw43.Spi.new(select, clock, data), wireless_power)
     wireless.init(&mut chip.timer)?
     led := Led { wireless, on: false }
     led.set_low()
-    let rp2350.Peripherals { pins, timer, usb, dma, core1, fifos, spinlocks } = chip
-    return ok(Board { led, pins, timer, usb: Usb { usb }, dma, core1, fifos, spinlocks })
+    let rp2350.Peripherals { pins, timer, rtc, watchdog, usb, dma, rng, core1, fifos, spinlocks, doorbells, power, flash } = chip
+    return ok(Board { led, pins, timer, rtc, watchdog, usb: Usb { usb }, dma, rng, core1, fifos, spinlocks, doorbells, power, flash })
 }
 
 // The LED on the wireless chip's GPIO 0. Implements the std/embedded/hal

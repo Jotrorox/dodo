@@ -73,7 +73,6 @@ fn protocol_and_key_checks_execute() {
 #[test]
 fn windows_build_for_every_hosted_target() {
     let scratch = Scratch::new("targets");
-    let source = root().join("tests/stdlib/window_events.dodo");
     for target in [
         "x86_64-unknown-linux-gnu",
         "aarch64-unknown-linux-gnu",
@@ -82,24 +81,27 @@ fn windows_build_for_every_hosted_target() {
         "x86_64-pc-windows-msvc",
         "x86_64-pc-windows-gnu",
     ] {
-        let object = scratch.0.join(format!("events-{target}.o"));
-        success(
-            &Command::new(env!("CARGO_BIN_EXE_dodo"))
-                .args([
-                    "build",
-                    source.to_str().unwrap(),
-                    "--emit",
-                    "obj",
-                    "--target",
-                    target,
-                    "-o",
-                ])
-                .arg(&object)
-                .output()
-                .unwrap(),
-            &format!("emit the window fixture for {target}"),
-        );
-        assert!(fs::metadata(object).unwrap().len() > 0);
+        for fixture in ["window_events", "window_multi"] {
+            let source = root().join(format!("tests/stdlib/{fixture}.dodo"));
+            let object = scratch.0.join(format!("{fixture}-{target}.o"));
+            success(
+                &Command::new(env!("CARGO_BIN_EXE_dodo"))
+                    .args([
+                        "build",
+                        source.to_str().unwrap(),
+                        "--emit",
+                        "obj",
+                        "--target",
+                        target,
+                        "-o",
+                    ])
+                    .arg(&object)
+                    .output()
+                    .unwrap(),
+                &format!("emit {fixture} for {target}"),
+            );
+            assert!(fs::metadata(object).unwrap().len() > 0);
+        }
     }
     // The protocol code needs no operating system.
     let portable = scratch.0.join("portable.dodo");
@@ -276,6 +278,10 @@ mod x11 {
                     "640x480x24",
                     "-nolisten",
                     "tcp",
+                    // Without it the server resets when its last client
+                    // disconnects, and a program reconnecting with a new
+                    // App can catch it mid-reset.
+                    "-noreset",
                 ])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
@@ -446,5 +452,117 @@ mod x11 {
             assert!(index >= previous, "{line:?} out of order in:\n{log}");
             previous = index;
         }
+    }
+
+    /// Several windows on one App: each draws its own pixels and gets its
+    /// own events, a window opened later works like the first, and closing
+    /// one leaves the others running.
+    #[test]
+    fn multiple_windows_under_xvfb() {
+        if !have_window_tools() {
+            return;
+        }
+        let scratch = Scratch::new("multi");
+        let executable = scratch.0.join("multi");
+        build(
+            &root().join("tests/stdlib/window_multi.dodo"),
+            &executable,
+            "0",
+        );
+        let (_server, display) = start_xvfb(2);
+        let log = scratch.0.join("multi.log");
+        let mut app = Command::new(&executable)
+            .env("DISPLAY", &display)
+            .env_remove("XAUTHORITY")
+            .stdout(fs::File::create(&log).unwrap())
+            .spawn()
+            .unwrap();
+        let started = Instant::now();
+        while !fs::read_to_string(&log).unwrap().contains("drawn") {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "the windows did not appear"
+            );
+            sleep(Duration::from_millis(50));
+        }
+        sleep(Duration::from_millis(300));
+        assert!(!xdotool(&display, &["search", "--name", "^Main$"]).is_empty());
+        assert!(!xdotool(&display, &["search", "--name", "^Tools$"]).is_empty());
+        // Without a window manager both sit at the root's origin, Tools on
+        // top of the larger Main.
+        assert_eq!(screen_pixel(&display, 20, 20), 0x00ff00);
+        assert_eq!(screen_pixel(&display, 200, 150), 0xff0000);
+
+        // The focus follows the pointer, so keys go to the window below it.
+        xdotool(&display, &["mousemove", "50", "40", "click", "1"]);
+        xdotool(&display, &["key", "a"]);
+        xdotool(&display, &["mousemove", "200", "150", "click", "1"]);
+        xdotool(&display, &["key", "b", "n"]);
+        sleep(Duration::from_millis(300));
+        assert!(!xdotool(&display, &["search", "--name", "^Dialog$"]).is_empty());
+        assert_eq!(screen_pixel(&display, 20, 20), 0x0000ff);
+        xdotool(&display, &["mousemove", "20", "20", "key", "w"]);
+        sleep(Duration::from_millis(200));
+        xdotool(&display, &["mousemove", "50", "70", "key", "w"]);
+        sleep(Duration::from_millis(300));
+        assert!(xdotool(&display, &["search", "--name", "^Tools$"]).is_empty());
+        assert_eq!(screen_pixel(&display, 20, 20), 0xff0000);
+        xdotool(&display, &["mousemove", "200", "150", "key", "Escape"]);
+
+        let started = Instant::now();
+        let status = loop {
+            if let Some(status) = app.try_wait().unwrap() {
+                break status;
+            }
+            if started.elapsed() > Duration::from_secs(10) {
+                let _ = app.kill();
+                panic!(
+                    "the windows program did not exit: {}",
+                    fs::read_to_string(&log).unwrap()
+                );
+            }
+            sleep(Duration::from_millis(50));
+        };
+        let log = fs::read_to_string(&log).unwrap();
+        assert!(status.success(), "{status}: {log}");
+        let lines: Vec<&str> = log.lines().collect();
+        let position = |line: &str| {
+            lines
+                .iter()
+                .position(|candidate| *candidate == line)
+                .unwrap_or_else(|| panic!("missing {line:?} in:\n{log}"))
+        };
+        let expected = [
+            "second app AlreadyOpen",
+            "zero size InvalidInput",
+            "huge size InvalidInput",
+            "open true 320 240 120 90",
+            "drawn",
+            "button tools true 50 40",
+            "key tools A true",
+            "text tools 97",
+            "button main true 200 150",
+            "key main B true",
+            "text main 98",
+            "key main N true",
+            "dialog true",
+            "key dialog W true",
+            "dialog closed",
+            "key tools W true",
+            "tools closed",
+            "key main Escape true",
+            "stale Closed",
+            "stale size 0 0",
+            "reopened true",
+        ];
+        let mut previous = 0;
+        for line in expected {
+            let index = position(line);
+            assert!(index >= previous, "{line:?} out of order in:\n{log}");
+            previous = index;
+        }
+        // Both windows got the frame they asked for.
+        position("frame main");
+        position("frame tools");
     }
 }

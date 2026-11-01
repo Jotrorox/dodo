@@ -49,8 +49,8 @@ object DodoTokenTypes {
 
     /** Keyword spellings, mirroring the VS Code grammar's keyword scopes. */
     val KEYWORDS = setOf(
-        "return", "if", "else", "for", "in", "break", "continue", "match",
-        "pub", "unsafe", "extern", "mut", "const", "static", "dyn",
+        "return", "if", "else", "for", "in", "break", "continue", "match", "await",
+        "pub", "unsafe", "async", "extern", "mut", "const", "static", "dyn",
         "fn", "struct", "enum", "interface", "type", "let",
         "package", "import", "from", "stores", "requires_plain",
         "as",

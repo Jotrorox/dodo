@@ -47,9 +47,11 @@ they are not prerequisites for using the safe entry APIs.
 | Store values | `fixed_vector.Vector.new` with `Option<T>` slots | [Collections](collections.md) |
 | Draw shapes, text, or images | `graphics.canvas` over a byte array | [Graphics](graphics.md) |
 | Draw smooth shapes, gradients, or TrueType text | `canvas.aa_fill_circle`, `graphics.Gradient`, `truetype.Font.new` | [Graphics](graphics.md#antialiased-drawing) |
-| Open a window | `window.open` and `win.canvas()` | [Windows](window.md) |
+| Open windows | `window.App.new`, `app.open` and `win.canvas()` | [Windows](window.md) |
+| Render with the GPU through OpenGL | `opengl.Context.create`, `opengl.Target.new` and the `gl` commands | [OpenGL](opengl.md) |
+| Compute or render on any GPU | `gpu.Device.open`, `device.encoder()` and `encoder.submit()` | [GPU programming](gpu.md) |
 | Run a shader on the GPU (macOS) | `metal.Device.system_default` and `new_library_with_source` | [Metal](metal.md) |
-| Run a shader on the GPU | `vk.open()` and `library.entry()` from `std/gpu/vulkan` | [GPU programming with Vulkan](gpu.md) |
+| Call Vulkan directly | `vk.open()` and `library.entry()` from `std/gpu/vulkan` | [Vulkan](vulkan.md) |
 | Call a function in a shared library | `dylib.open` and `library.symbol` | [Shared libraries](dylib.md) |
 | Read the current time | `time/hosted.WallClock.new().wall_now()` | [Time and clocks](time.md) |
 | Fetch a URL | `http/hosted.Client.new` and `get` | [HTTP](http.md), [hosted HTTP/HTTPS](hosted-http.md) |
@@ -131,35 +133,47 @@ OS/C-library calls may allocate internally even when Dodo storage is fixed.
 HTTP/1.1 clients, servers, streaming framing, web routing, and QUIC connections
 and streams **are implemented**.
 HTTP/2, HTTP/3, WebSockets, TOML serialization and chip support beyond
-the RP2040, RP2350, and ESP32-C6 are remaining work. [`std/embedded/hal`](hardware.md) supplies typed
-registers and portable device protocols; `std/embedded/chip/rp2040` and
+the RP2040 and RP2350 are remaining work. [`std/embedded/hal`](hardware.md) supplies typed
+registers and portable device protocols, blocking and polling, including I2C
+and SPI targets, pulse capture, CAN, I2S, and DMA buffer transfers, with
+in-memory fakes in `std/embedded/hal/fake` and the serial port protocols in
+`std/embedded/hal/serial`; `std/embedded/chip/rp2040` and
 `std/embedded/board/pico` support the Raspberry Pi RP2040 and Pico, and
 `std/embedded/chip/rp2350` with `std/embedded/board/pico2` and
 `std/embedded/board/pico2_w` the RP2350, Pico 2, and Pico 2 W, including
 their I2C and SPI buses, as master or target, and serial ports through the
 shared controller drivers in `std/embedded/peripheral` and the pin and
 controller ownership both chips share in `std/embedded/chip/rp_pins`, and
-their PWM outputs and ADC inputs through `std/embedded/chip/rp_pwm` and
-`std/embedded/chip/rp_adc`, their PIO state machines, with programs assembled
-at compile time, through `std/embedded/chip/rp_pio`, a USB serial port on
+their PWM outputs and inputs and ADC inputs through `std/embedded/chip/rp_pwm` and
+`std/embedded/chip/rp_adc`, their random number generators, the RP2040's
+ring oscillator and the RP2350's TRNG, through `std/embedded/chip/rp_rng`,
+their PIO state machines, with programs assembled
+at compile time, through `std/embedded/chip/rp_pio`, I2S audio on PIO
+through `std/embedded/chip/rp_i2s`, a USB serial port on
 the board's own USB connector through `std/embedded/chip/rp_usb`, their DMA
 channels through `std/embedded/chip/rp_dma`, which the SPI buses and serial
-ports use for transfers that run in the background, and their second core,
-with the FIFOs and spinlocks the cores share, through
-`std/embedded/chip/rp_multicore`.
-`std/embedded/chip/esp32c6` with `std/embedded/board/esp32c6_devkitc`
-supports the Espressif ESP32-C6 and ESP32-C6-DevKitC-1: GPIO through the
-GPIO matrix, its interrupt matrix, I2C, SPI, and serial ports through
-`std/embedded/peripheral/esp_i2c`, `esp_spi`, and `esp_uart`, PWM, the
-calibrated ADC and temperature sensor, the system timer's alarms, DMA copies,
-WS2812 LEDs such as the board's RGB LED, and the chip's own USB serial port
-through `std/embedded/peripheral/esp_usb_serial`, which `dodo run` also
-flashes through.
+ports use for transfers that run in the background, their real-time clocks,
+the RP2040's RTC and the RP2350's always-on timer, through
+`std/embedded/chip/rp_rtc`, and their second core,
+with the FIFOs, spinlocks, and RP2350 doorbells the cores share, through
+`std/embedded/chip/rp_multicore`, their watchdog through
+`std/embedded/chip/rp_watchdog`, and the free flash above the program
+through `std/embedded/chip/rp_flash`. The clock gating and dormant state both
+chips share are in `std/embedded/chip/rp_power`. `std/embedded/storage` keeps
+a power-cut-safe key-value store on that flash, or on any device with the
+`hal.Flash` protocol.
+`std/embedded/can/mcp2515` drives the MCP2515 CAN controller over any SPI bus.
 `std/embedded/cortex_m` enables, pends, and prioritizes interrupts and runs
 SysTick on any Cortex-M core. `std/embedded/executor` runs several firmware
 tasks on a core, waking each on time or on an interrupt and sleeping
-in between. `std/embedded/wireless/cyw43` drives the Pico 2 W's CYW43439 wireless chip
+in between; tasks are hand-written or [`async fn`s](async.md).
+`std/embedded/sync` shares values between interrupt handlers, tasks, and
+cores through `Mutex<T>` statics. `std/embedded/power` is the low-power layer every chip implements:
+sleep and deep sleep modes, clock gating, and a dormant state that pins
+end. `std/embedded/wireless/cyw43` drives the Pico 2 W's CYW43439 wireless chip
 far enough for its LED; Wi-Fi and Bluetooth are not supported yet.
+`std/embedded/rtc/ds3231` drives a DS3231 battery-backed clock chip on I2C
+through the same real-time clock protocols as the chips' own clocks.
 [Compiler limits](implementation.md) and [container element restrictions](container-elements.md)
 remain relevant: check them when using references or Results as stored elements.
 
@@ -187,8 +201,10 @@ individual modules and links every public declaration back to its source.
 | [Hashing and checksums](hash.md) | `std/checksum`, `std/hash` | Portable. |
 | [Graphics](graphics.md) | `std/graphics`, `std/graphics/fake`, `std/graphics/font`, `std/graphics/image`, `std/graphics/truetype`; panels in `std/embedded/display`, `std/embedded/display/st7789`, `std/embedded/display/ssd1306` | Portable; caller-supplied pixel and file buffers. |
 | [Windows](window.md) | `std/window`, `std/window/x11` | Hosted: X11 on Linux, AppKit on macOS, Win32 on Windows; the X11 protocol code is portable. |
+| [OpenGL](opengl.md) | `std/gpu/opengl`, `std/gpu/opengl/gl` | Hosted: EGL on Linux, CGL on macOS, WGL on Windows, loaded at run time; the generated binding is portable. |
 | [Metal](metal.md) | `std/gpu/metal`, `std/gpu/metal/objc` | macOS only (Apple silicon and Intel); links Metal, QuartzCore and Foundation. |
-| [GPU programming with Vulkan](gpu.md) | `std/gpu/vulkan` | Hosted; the Vulkan loader is opened at run time, nothing is linked. |
+| [GPU programming](gpu.md) | `std/gpu`, `std/gpu/hal` | Hosted: Metal on macOS, Vulkan on Linux and Windows, OpenGL 4.5 where Vulkan is missing; nothing beyond Metal is linked. |
+| [Vulkan](vulkan.md) | `std/gpu/vulkan` | Hosted; the Vulkan loader is opened at run time, nothing is linked. |
 | [Shared libraries](dylib.md) | `std/dylib` | Hosted: dlopen on Linux and macOS, LoadLibrary on Windows. |
 | [Time and clocks](time.md) | `std/time`, `std/time/clock`, `std/time/hosted`, `std/time/iso8601`, `std/time/timer` | Values/contracts portable; hosted clock explicit. |
 | [Native strings and errors](platform.md) | `std/platform`, `std/platform/error` | Hosted. |
@@ -205,7 +221,7 @@ individual modules and links every public declaration back to its source.
 | [HTTP](http.md), [hosted HTTP/HTTPS](hosted-http.md) | `std/http`, `std/http/client`, `std/http/connection`, `std/http/hosted`, `std/http/https`, `std/http/server` | Protocol/polling portable; hosted/HTTPS explicit. |
 | [MQTT](mqtt.md) | `std/mqtt`, `std/mqtt/app`, `std/mqtt/broker`, `std/mqtt/hosted` | Packets/topics/handlers/test deliveries portable; app, broker, and client hosted. |
 | [Web serving](web.md) | `std/web`, `std/web/application`, `std/web/app`, `std/web/hosted`, `std/web/https`, `std/web/reactor`, `std/web/response`, `std/web/server`, `std/web/static_files`, `std/web/stream`, `std/web/testing` | Routing/registration/composition portable; app/hosted/HTTPS/reactor/static files explicit. |
-| [Hardware and embedded](hardware.md) | `std/embedded/hal`, `std/embedded/hal/fake`, `std/embedded/executor`, `std/embedded/board`, `std/embedded/chip`, `std/embedded/peripheral/designware_i2c`, `std/embedded/peripheral/pl022`, `std/embedded/peripheral/pl011`, `std/embedded/peripheral/esp_i2c`, `std/embedded/peripheral/esp_spi`, `std/embedded/peripheral/esp_uart`, `std/embedded/peripheral/esp_usb_serial`, `std/embedded/wireless/cyw43`, `std/embedded/cortex_m` | `std/embedded/hal` and `std/embedded/executor` are portable, with interrupt masking on bare-metal Cortex-M and RISC-V. `std/embedded/cortex_m` (interrupt controller, SysTick, barriers) runs only on Cortex-M. `std/embedded/board` and `std/embedded/chip` resolve to the firmware build's board and chip packages, such as `std/embedded/board/pico2` and `std/embedded/chip/rp2350`, or `std/embedded/board/esp32c6_devkitc` and `std/embedded/chip/esp32c6`. |
+| [Hardware and embedded](hardware.md) | `std/embedded/hal`, `std/embedded/hal/serial`, `std/embedded/hal/fake`, `std/embedded/executor`, `std/embedded/sync`, `std/embedded/power`, `std/embedded/storage`, `std/embedded/board`, `std/embedded/chip`, `std/embedded/peripheral/designware_i2c`, `std/embedded/peripheral/pl022`, `std/embedded/peripheral/pl011`, `std/embedded/wireless/cyw43`, `std/embedded/can/mcp2515`, `std/embedded/rtc/ds3231`, `std/embedded/cortex_m` | `std/embedded/hal`, `std/embedded/executor`, `std/embedded/sync`, and `std/embedded/power` are portable, with interrupt masking on bare-metal Cortex-M and RISC-V. `std/embedded/cortex_m` (interrupt controller, SysTick, barriers) runs only on Cortex-M. `std/embedded/board` and `std/embedded/chip` resolve to the firmware build's board and chip packages, such as `std/embedded/board/pico2` and `std/embedded/chip/rp2350`. |
 
 ## Implementation and adapter packages
 
@@ -252,12 +268,23 @@ select providers; they are not additional recommended starting paths.
 | `std/window/windows` | Native Win32 window boundary; use [windows](window.md). |
 | `std/window/system` | The C-runtime adapter the macOS and Windows boundaries share; use [windows](window.md). |
 | `std/window/raw` | Error and event records exchanged with the adapters; use [windows](window.md). |
+| `std/window/heap` | C-heap pixel buffers and window tables shared by `std/window` and its adapters; use [windows](window.md). |
+| `std/gpu/opengl/linux` | EGL context adapter; use [OpenGL](opengl.md). |
+| `std/gpu/opengl/macos` | CGL context adapter; use [OpenGL](opengl.md). |
+| `std/gpu/opengl/windows` | WGL context adapter; use [OpenGL](opengl.md). |
+| `std/gpu/opengl/common` | Error type and helpers the adapters share; use [OpenGL](opengl.md). |
+| `std/gpu/hal/vulkan` | `std/gpu`'s Vulkan backend; use [GPU programming](gpu.md). |
+| `std/gpu/hal/opengl` | `std/gpu`'s OpenGL backend; use [GPU programming](gpu.md). |
+| `std/gpu/hal/macos` | `std/gpu`'s Metal backend, its native one on macOS; use [GPU programming](gpu.md). |
+| `std/gpu/hal/linux` | `std/gpu`'s native backend on Linux, which has none; use [GPU programming](gpu.md). |
+| `std/gpu/hal/windows` | `std/gpu`'s native backend on Windows, which has none yet; use [GPU programming](gpu.md). |
+| `std/gpu/hal/unavailable` | The backend that never opens, behind the Linux and Windows native imports; use [GPU programming](gpu.md). |
 
 Virtual imports `std/platform/native`, `std/fs/native`, `std/env/native`,
 `std/process/native`, `std/signal/native`, `std/thread/native`, `std/sync/native`, `std/net/native`,
 `std/time/native`, `std/tls/native`, `std/quic/native`, `std/crypto/native`,
-`std/crypto/openssl/native`, and `std/web/native` select compatible
-providers. `std/platform/native` exposes advanced native values;
+`std/crypto/openssl/native`, `std/web/native`, `std/window/native`,
+`std/gpu/opengl/native` and `std/gpu/hal/native` select compatible providers. `std/platform/native` exposes advanced native values;
 `std/net/native` is also the public socket entry point. Explicit `linux`/`windows`
 imports are for matching-target integrations. `runtime.c` files are embedded
 implementation boundaries, not Dodo imports.

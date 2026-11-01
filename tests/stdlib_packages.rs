@@ -426,6 +426,12 @@ fn portable_package_dependencies_are_independent_and_reserved() {
                 "std/graphics/image",
             ],
         ),
+        // The device protocols stay free of streams, so every driver can
+        // import them; serial ports' protocols live in hal/serial.
+        (
+            "std/embedded/hal",
+            vec!["alloc/", "std/io", "std/platform", "std/embedded/hal/"],
+        ),
         (
             "std/embedded/display",
             vec![
@@ -443,6 +449,10 @@ fn portable_package_dependencies_are_independent_and_reserved() {
         (
             "std/embedded/display/ssd1306",
             vec!["alloc/", "std/io", "std/platform", "std/graphics/"],
+        ),
+        (
+            "std/embedded/storage",
+            vec!["alloc/", "std/io", "std/platform", "std/fs", "std/checksum"],
         ),
     ] {
         let source = workspace.write(

@@ -1,0 +1,183 @@
+package macos
+
+import "core/ptr"
+import "std/gpu/opengl/common"
+
+// OpenGL contexts on macOS through CGL, the Core OpenGL API.
+//
+// OpenGL.framework is opened at run time with dlopen, so a program links no
+// framework and still starts if OpenGL is ever removed from the system. CGL
+// contexts need no window: drawing goes to framebuffer objects. macOS offers
+// OpenGL up to 4.1 core and 2.1 legacy, and Apple has deprecated it in favour
+// of Metal.
+
+unsafe extern "C" fn dlopen(path: *const u8, mode: i32) -> *mut u8
+// Declared with the pointer result std/dylib and std/gpu/metal use, as one
+// program may load all three: a symbol has a single C signature.
+unsafe extern "C" fn dlsym(handle: *mut u8, name: *const u8) -> *mut u8
+unsafe extern "C" fn dlclose(handle: *mut u8) -> i32
+
+const RTLD_NOW: i32 = 2
+const RTLD_LOCAL: i32 = 4
+
+// CGLPixelFormatAttribute values.
+const PFA_ALLOW_OFFLINE_RENDERERS: i32 = 96
+const PFA_ACCELERATED: i32 = 73
+const PFA_OPENGL_PROFILE: i32 = 99
+const PROFILE_LEGACY: i32 = 0x1000
+const PROFILE_3_2_CORE: i32 = 0x3200
+const PROFILE_4_1_CORE: i32 = 0x4100
+
+type ChoosePixelFormat = extern "C" fn(*const i32, *mut *mut u8, *mut i32) -> i32
+type DestroyPixelFormat = extern "C" fn(*mut u8) -> i32
+type CreateContext = extern "C" fn(*mut u8, *mut u8, *mut *mut u8) -> i32
+type DestroyContext = extern "C" fn(*mut u8) -> i32
+type SetCurrentContext = extern "C" fn(*mut u8) -> i32
+type GetCurrentContext = extern "C" fn() -> *mut u8
+
+fn null() -> *mut u8 {
+    unsafe {
+        return 0usize as *mut u8
+    }
+}
+
+unsafe fn symbol(library: *mut u8, name: &[u8]) -> usize {
+    unsafe {
+        return dlsym(library, common.c_string(name)) as usize
+    }
+}
+
+pub struct Backend {
+    library: *mut u8
+    context: *mut u8
+    set_current: SetCurrentContext
+    get_current: GetCurrentContext
+    destroy: DestroyContext
+
+    // Create a context for OpenGL `major`.`minor` and make it current on the
+    // calling thread. CGL has no debug contexts, so `debug` is ignored.
+    pub fn create(major: u32, minor: u32, debug: bool) -> Backend!common.Error {
+        profile := PROFILE_LEGACY
+        if major == 3 && minor <= 2 {
+            profile = PROFILE_3_2_CORE
+        } else if major == 3 || (major == 4 && minor <= 1) {
+            profile = PROFILE_4_1_CORE
+        } else if major > 2 {
+            return err(common.Error.Unsupported)
+        }
+        library := unsafe {
+            dlopen(common.c_string(b"/System/Library/Frameworks/OpenGL.framework/OpenGL\0"), RTLD_NOW | RTLD_LOCAL)
+        }
+        if ptr.is_null(library) {
+            return err(common.Error.NoLibrary)
+        }
+        choose := unsafe {
+            symbol(library, b"CGLChoosePixelFormat\0")
+        }
+        destroy_format := unsafe {
+            symbol(library, b"CGLDestroyPixelFormat\0")
+        }
+        create := unsafe {
+            symbol(library, b"CGLCreateContext\0")
+        }
+        destroy := unsafe {
+            symbol(library, b"CGLDestroyContext\0")
+        }
+        set_current := unsafe {
+            symbol(library, b"CGLSetCurrentContext\0")
+        }
+        get_current := unsafe {
+            symbol(library, b"CGLGetCurrentContext\0")
+        }
+        if choose == 0 || destroy_format == 0 || create == 0 || destroy == 0 || set_current == 0 || get_current == 0 {
+            unsafe {
+                dlclose(library)
+            }
+            return err(common.Error.NoLibrary)
+        }
+        backend := unsafe {
+            Backend {
+                library: library,
+                context: null(),
+                set_current: set_current as SetCurrentContext,
+                get_current: get_current as GetCurrentContext,
+                destroy: destroy as DestroyContext
+            }
+        }
+        // Prefer a GPU; fall back to any renderer, such as Apple's software one.
+        accelerated := [PFA_OPENGL_PROFILE, profile, PFA_ALLOW_OFFLINE_RENDERERS, PFA_ACCELERATED, 0]
+        any := [PFA_OPENGL_PROFILE, profile, PFA_ALLOW_OFFLINE_RENDERERS, 0]
+        format := null()
+        count := 0i32
+        unsafe {
+            choose_format := choose as ChoosePixelFormat
+            if choose_format(ptr.as_ptr(&accelerated), ptr.from_mut(&mut format), ptr.from_mut(&mut count)) != 0 || ptr.is_null(format) {
+                format = null()
+                if choose_format(ptr.as_ptr(&any), ptr.from_mut(&mut format), ptr.from_mut(&mut count)) != 0 || ptr.is_null(format) {
+                    return err(common.Error.NoConfig)
+                }
+            }
+        }
+        context := null()
+        code := unsafe {
+            create_context := create as CreateContext
+            created := create_context(format, null(), ptr.from_mut(&mut context))
+            release := destroy_format as DestroyPixelFormat
+            release(format)
+            created
+        }
+        if code != 0 || ptr.is_null(context) {
+            return err(common.Error.Unsupported)
+        }
+        backend.context = context
+        backend.make_current()?
+        return ok(backend)
+    }
+
+    pub fn make_current(&self) -> void!common.Error {
+        set := self.set_current
+        if unsafe {
+            set(self.context)
+        } != 0 {
+            return err(common.Error.System)
+        }
+        return ok()
+    }
+
+    // Leave the calling thread without a current context.
+    pub fn release_current(&self) {
+        set := self.set_current
+        unsafe {
+            set(null())
+        }
+    }
+
+    pub fn is_current(&self) -> bool {
+        get := self.get_current
+        return !ptr.is_null(self.context) && unsafe {
+            get() as usize == self.context as usize
+        }
+    }
+
+    // The address of an OpenGL command, or 0. OpenGL.framework exports every
+    // command it implements.
+    pub fn resolve(&self, name: *const u8) -> usize {
+        return unsafe {
+            dlsym(self.library, name) as usize
+        }
+    }
+
+    fn drop(&mut self) {
+        if !ptr.is_null(self.context) {
+            if self.is_current() {
+                self.release_current()
+            }
+            destroy := self.destroy
+            unsafe {
+                destroy(self.context)
+            }
+        }
+        // OpenGL.framework stays loaded: Apple frameworks are never unloaded,
+        // and another context may still be using it.
+    }
+}

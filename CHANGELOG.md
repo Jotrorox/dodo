@@ -27,6 +27,237 @@
   caller's section instead.
 - 64-bit integer division in firmware takes one 32-bit division when both
   operands fit in 32 bits, instead of 64 shift-and-subtract steps.
+- Persistent storage for firmware. `hal.Flash` is a device protocol for NOR
+  flash (erase blocks to `0xFF`, then write erased bytes once), and
+  `std/embedded/storage` builds on it: `storage.Store`, a key-value store
+  with text keys and byte values (`get`, `set`, `remove`, `contains`,
+  `len_of`, `get_u32`/`set_u32`, key listing, `clear`), and
+  `storage.Region`, a window of any flash device. The store is a log over
+  2 to 64 erase blocks with even wear and compaction; every record has a
+  CRC-32 and is verified, writes never touch written bytes, and a power cut
+  at any point loses at most the operation in progress. On the RP2040 and
+  RP2350, `b.flash` (`std/embedded/chip/rp_flash`) reads the flash and hands
+  out regions above the program, which reflashing keeps: the chip runtimes
+  erase and program through the boot ROM, from SRAM with execute-in-place
+  restored by a copy of `.boot2` on the RP2040 and through `flash_op` on the
+  RP2350, with interrupts masked, and refuse while core 1 runs a task.
+  `fake.Flash` checks the protocol strictly and can cut the power mid-write
+  for tests, which sweep power cuts over every erase and write of a long run.
+  `examples/boot_counter.dodo` counts restarts, and the Pico self-tests check
+  regions, writes, and a store on the flash.
+- `std/window` supports several windows per process, for dialogs, popups
+  and tool windows. This changes the API: a `window.App` connects to the
+  window system and runs the one event loop, `app.open(options)` opens any
+  number of windows, and `app.wait_event()`, `poll_event()` and
+  `wait_event_timeout()` return the events of all of them. Every `Event`
+  variant now starts with the `WindowId` of its window (`win.id()`,
+  `window.event_window(&event)`); ids are never reused within a process.
+  Animation asks per window: `win.request_frame()` delivers one
+  `Event.Frame(id)` at that window's next display refresh, with the same
+  pacing as before, replacing `wait_event_until_frame()`. Command-Q on macOS
+  now reports the app-level `Event.Quit` instead of closing the window.
+  Windows do not borrow their App, and each owns its pixel buffer, which is
+  only resized inside the window's own calls. `window.open` is gone; use
+  `window.App.new()?` and `app.open(...)`. `examples/window_palette.dodo`
+  paints with colors picked in a second window.
+- Fixed: X11 focus events took their mode from the wrong byte, so focus
+  changes caused by pointer and keyboard grabs were reported too.
+- `async fn` and `await`: an optional concurrency model for firmware on top of
+  `std/embedded/executor`. Calling an async fn returns a future, a struct
+  named after the function (`blink` → `BlinkFuture`) whose `poll` is the
+  executor's task method, so async and hand-written tasks run side by side;
+  `await` waits for another future and yields its `output`. The compiler
+  generates the state machine: the body's locals live in the future, so
+  references between them survive suspensions, and dropping an unfinished
+  future drops what it holds. Methods and generic functions can be async.
+  `await` begins its statement, possibly followed by `?`, `!`, or `as`; a
+  started future traps if polled after moving, and a future that would hold
+  itself is rejected. The executor gains the futures async code waits on:
+  `sleep_ms`, `sleep`, `sleep_until`, `yield_now`, `now`, `Ticker.tick`,
+  `Signal.wait`, `Signal.next_value`, and `select` and `join` for two
+  futures. `examples/async_tasks` is `examples/tasks` written with them.
+- `std/embedded/sync`: `Mutex<T>` shares values between interrupt handlers,
+  tasks, and cores from a plain static, without `static mut` or `unsafe`.
+  `lock()` masks interrupts on this core and returns a guard; `with`,
+  `set`, `replace`, and `try_lock` cover the rest, and locking a mutex this
+  core already holds traps. All mutexes lock through one nesting
+  system-wide section, `sync.enter()`. On the RP2040 and RP2350,
+  `Core1.start` installs hardware spinlock 31 as its cross-core lock, so
+  the same mutex also holds off the other core; spinlock 31 is no longer
+  handed out by `Spinlocks`. `examples/interrupts` uses mutexes now.
+- The RP2350's doorbells: `b.doorbells` on the Pico 2 and Pico 2 W hands out
+  the eight doorbells between the cores. `ring()` interrupts the other core,
+  and `set_signal` makes the runtime's new `SIO_IRQ_BELL` handler raise an
+  executor signal there, to wake a task on the other core without the FIFO.
+- Random numbers for firmware: `std/embedded/hal` gains the `Rng`
+  protocol (`fill(bytes)`), with `random_u32`, `random_u64`, and the unbiased
+  `random_below`, and `hal.SoftRng`, a xoshiro128** generator seeded from a
+  hardware one with `from_rng` or from a fixed seed with `new`.
+  `hal/fake` gains `fake.Rng`. Every board has `b.rng`, and the chip packages
+  `Peripherals.rng`, from the new `std/embedded/chip/rp_rng`: on the RP2040,
+  `rp_rng.Rosc` samples the ring oscillator's RANDOMBIT about every 10 us and
+  debiases it with von Neumann's method, about 3 KB a second and not for
+  keys; on the RP2350, `rp_rng.Trng` runs the TRNG with its hardware
+  debiasing and all health tests on, about 20 KB a second and fit for keys,
+  restarting it after failed autocorrelation tests and keeping a block's
+  unused bytes for the next fill. A stopped source reports `Timeout` and
+  failing health checks `Bus`. Both drivers are generic over
+  `hal.Registers` and tested against simulated registers on the desktop.
+- `std/gpu`: portable GPU compute and rendering on Metal, Vulkan and
+  OpenGL, written in Dodo on top of `std/gpu/metal`, `std/gpu/vulkan` and
+  `std/gpu/opengl`. It follows WebGPU's model: a `Device` creates buffers,
+  2D textures, samplers and compute and render pipelines; a
+  `CommandEncoder` records compute passes, render passes and copies;
+  `submit()` runs them in order, and `write_buffer`, `read_buffer`,
+  `write_texture` and `read_texture` move data in queue order.
+  `Device.open` picks Metal on macOS and Vulkan elsewhere, falling back to
+  OpenGL 4.5. Shaders come as SPIR-V, MSL and GLSL in one `ShaderSource`,
+  with numbered binding slots that mean the same in every language, and
+  clip space, depth range, winding and texture rows agree on every backend.
+  Every call is checked (usages, ranges, pipeline layouts and attachment
+  formats, workgroup limits, and SPIR-V entry points), and resources dropped
+  while the GPU may still use them are destroyed once it has finished.
+  Backends implement the `std/gpu/hal` interface; `std/gpu/hal/native`
+  selects the OS's own API. A fixture runs the same compute, rendering,
+  depth, sampling, blending, copy and lifetime checks on Metal, on Vulkan
+  with lavapipe and on OpenGL with llvmpipe, clean under the Vulkan
+  validation and synchronization layers and Metal's debug layer.
+  `examples/gpu_compute.dodo` and `examples/gpu_triangle.dodo` show compute
+  and a window. The Vulkan guide moved to its own page, and
+  `std/gpu/opengl` now declares `dlsym` and `GetProcAddress` with the
+  pointer results `std/dylib` uses, so one program can load both.
+- Large values loaded whole and stored after code that may write their
+  source, such as a big struct returned in a `Result` while locals with
+  drops are still alive, are now copied aside in memory instead of being
+  split by LLVM into one operation per byte. Such functions took minutes to
+  compile at -O1 and above.
+- Fixed: `Fifo.set_signal` and the FIFO interrupt hook of
+  `std/embedded/chip/rp_multicore` wrote 0 to `FIFO_ST` to clear its sticky
+  WOF and ROE flags, which only a 1 clears. A flag left set, such as the ROE
+  that core 1's boot ROM leaves while it waits to be launched, kept the FIFO
+  interrupt raised, so an executor waiting for FIFO words could spin instead
+  of sleeping.
+- CI runs firmware on emulated RP2040 and RP2350 chips: a self-test of the
+  startup runtime, the integer and floating-point helpers, interrupts,
+  SysTick, timer alarms, the executor, DMA, PIO, a UART, and the second core
+  with its FIFOs and spinlocks, at -O0 and -O2. `scripts/test_emulator.py`
+  builds `tests/emulator` and runs it in `emulator/`, a runner around the
+  picoem emulator crates with fixes in `emulator/patches`; it takes seconds.
+- Real-time clocks share one protocol in `std/embedded/hal`: `hal.Rtc` reads
+  and sets the time as Unix milliseconds and `hal.RtcAlarm` fires once at a
+  time, with `hal.rtc_now`, `rtc_set`, `rtc_alarm_at`, and `rtc_alarm_in`
+  converting to and from `std/time`'s `DateTime`. Every board has `b.rtc`:
+  the RP2040's RTC, clocked from the crystal and counting seconds, and the
+  RP2350's always-on timer, a millisecond counter that keeps counting through
+  resets. The register-level drivers are in `std/embedded/chip/rp_rtc`, with
+  RTC_IRQ and POWMAN_IRQ_TIMER raised by their alarms.
+  `std/embedded/rtc/ds3231` drives a battery-backed DS3231 clock chip on I2C
+  through the same protocols, and `fake.Rtc` tests clock code on a desktop.
+  The Pico self-tests check the clocks and their alarms on the boards.
+- `std/embedded/hal` settles its device protocols before a second chip
+  vendor arrives, so drivers written now keep working:
+  - Polling forms of the buses, `hal.I2cPoll`, `hal.SpiPoll`, and, in the
+    new `std/embedded/hal/serial` (which keeps `hal` free of `std/io`),
+    `serial.PollPort`, never wait: each call does what the hardware allows
+    and returns true once the operation has finished, keeping its state in
+    the bus rather than in borrowed buffers, so transactions may be any
+    length and run across an executor task's polls. `hal.BlockingI2c` and
+    `hal.BlockingSpi` turn a polling-only controller into a blocking one, and
+    `hal.SpiDevice` keeps a device selected across polls. `serial.Port` adds
+    `flush` to std/io's streams.
+  - Target sides: `hal.I2cTarget` with `hal.I2cTargetEvent`, and
+    `hal.SpiTarget`.
+  - Pulse measurement: `hal.PwmInput` and `hal.PulseCapture` (period, high
+    time, frequency, duty).
+  - CAN: `hal.Can`, `hal.CanFrame` (standard, extended, remote, and CAN FD
+    frames, checked as they are set), `hal.CanFilter`, `hal.CanErrorState`,
+    and `hal.can_timing`, which computes bit timing within any controller's
+    limits.
+  - I2S: `hal.I2sOutput` and `hal.I2sInput` with MSB-aligned `i32` samples
+    and `hal.I2sFormat`.
+  - Background transfers: `hal.DmaBuffer` and `hal.SpiDma` for sessions that
+    hold a buffer, `hal.DmaStream`, the DMA-backed session every peripheral
+    driver needs, written once against `hal.DmaChannel`, and `hal.dma_copy`.
+  - Helpers that wait with a poll limit: `hal.capture`, `hal.send_frame`,
+    `hal.receive_frame`, `hal.write_samples`, `hal.read_samples`, and
+    `hal.finish_transfer`.
+  - `std/embedded/hal/fake` gains a fake for every new protocol, polled
+    modes for `fake.I2c`, `fake.Spi`, and `fake.Serial`, and
+    `fake.DmaChannel`, which runs DMA transfers in host memory.
+- The RP2040 and RP2350 implement the new protocols: the DesignWare I2C
+  bus `hal.I2cPoll` for transactions of any length (replacing the
+  FIFO-sized `start_*`/`poll_finish` methods), with an interrupt whenever a
+  poll can make progress; I2C targets `hal.I2cTarget` (the driver's own
+  `TargetEvent` is gone); PL022 SPI buses `hal.SpiPoll`, targets
+  `hal.SpiTarget`, and `pl022.DmaBus` `hal.SpiDma` with `poll_finish` and
+  `abort`; serial ports and the USB serial port `serial.Port` and
+  `serial.PollPort` with `poll_flush`.
+- `pins.pwm_input(pin, window_us)` measures pulses on an odd GPIO with a PWM
+  slice's counting modes, as a `hal.PwmInput`: the frequency and duty of a
+  PWM signal, a fan's tachometer, or a servo pulse, to within microseconds.
+- `std/embedded/chip/rp_i2s` plays and records I2S audio on PIO, as
+  `hal.I2sOutput` and `hal.I2sInput`: Philips, left- and right-justified
+  framing, 16 to 32-bit samples, mono or stereo, a fractional clock reported
+  with its error in ppm, silence instead of swapped channels when the queue
+  runs dry, and playback by DMA through `hal.DmaStream`.
+- `std/embedded/can/mcp2515` drives the MCP2515 CAN controller over any SPI
+  bus as a `hal.Can`, so boards without a CAN controller, such as the Pico,
+  get CAN: bit timing from the crystal, filters mapped onto its masks,
+  frames sent and received in order, overrun and error states, and its
+  interrupt pin.
+- `std/embedded/power` is one low-power layer for every chip: sleep and deep
+  sleep modes that every wait honours, including timer alarms and the
+  executor; clock gating with `power.Clocks` sets; and a dormant state, with
+  every oscillator stopped, that pins in a `power.Wake` end. The RP2040 and
+  RP2350 implement its `Power` protocol as `Peripherals.power`, and every board
+  hands it out as `b.power`. The chips name each clock gate
+  (`CLOCK_UART0`, `ALARM_CLOCKS`, `ESSENTIAL_CLOCKS`, ...).
+  `disable_unused_clocks` stops the clocks of unclaimed peripherals, and
+  claiming a peripheral starts them again. `disable_clocks` refuses clocks
+  the program needs or a claimed peripheral uses. `dormant` runs from the
+  crystal, stops the PLL and both oscillators, and restores clk_sys on wake.
+  `fake.Power` tests power-aware code on a desktop.
+  `cortex_m.set_deep_sleep`, `set_sleep_on_exit`, and `set_event_on_pend`
+  expose the core's SCR. The self-tests gain on-board checks, and
+  `examples/low_power.dodo` shows all three levels.
+- `std/embedded/hal` gains a shared timer protocol: `Counter` (`now_us`), a
+  free-running microsecond count, and `Alarm` (`now_us`, `schedule_at_us`,
+  `cancel`, `fired`, `clear`), a one-shot compare that fires at once for a
+  time already reached. `hal.Deadline` and `hal.Ticker` give drivers
+  timeouts and drift-free periodic work on any counter, with
+  `elapsed_us`, `wait_until`, `schedule_in_us`, and `wait_for_alarm`
+  helpers. Board timers are counters, and the RP2040 and RP2350 alarms
+  implement the alarm protocol for times up to 35 minutes ahead, forcing
+  their interrupt when a time has passed before the alarm was armed.
+  `std/embedded/hal/fake` gains `Alarm`, and `fake.Delay` is a counter whose
+  time is the delays asked of it, so timeouts are tested without waiting.
+- Watchdog for the RP2040 and RP2350: `b.watchdog` on every board (and
+  `watchdog` in the chips' `Peripherals`) is a `std/embedded/chip/rp_watchdog`
+  `Watchdog`. It is stopped after `take()`. `start(timeout_ms)` makes it reset
+  the chip unless `feed()` is called in time, from 1 ms up to 8388 ms on the
+  RP2040 (whose count runs twice per tick, erratum RP2040-E1) or 16777 ms on
+  the RP2350. `stop()`, `remaining_us()`, and `restart()` for a deliberate
+  reset complete it. The reset restarts everything but the oscillators, and
+  the count pauses while a debugger halts a core. `reset_reason()` reads
+  `hal.ResetReason.Timeout`, `Restart`, or `Other`. A Pico SDK-style mark tells
+  the program's watchdog resets apart from the boot ROM's, so the first run
+  after flashing reads `Other`. Two `scratch` words survive the reset.
+  `std/embedded/hal` gains the `Watchdog` protocol (`feed`), so drivers and
+  tasks can feed any chip's watchdog. Desktop tests run the driver against a
+  model of both chips' watchdogs, and the board self-tests gain a watchdog
+  check.
+- `std/gpu/opengl` creates OpenGL contexts without a window, and
+  `std/gpu/opengl/gl` binds the complete OpenGL 4.6 core profile (656
+  commands, 1364 enums), generated from the Khronos registry by
+  `scripts/generate_opengl.py`. Both are pure Dodo with no C runtime: each
+  OS's interface is opened at run time (EGL on Linux, surfaceless and without
+  an X server; CGL on macOS; WGL with a hidden window on Windows), so programs
+  link no graphics library and start on machines without one.
+  `opengl.Target` is an offscreen framebuffer whose pixels read back in
+  `std/graphics` row order, as RGBA or as the BGRA a `std/window` canvas uses;
+  `examples/opengl_window.dodo` shows a shaded triangle in a window. A
+  fixture renders and reads back a triangle with Mesa's llvmpipe in Linux CI
+  and with CGL on macOS.
 - `std/gpu/metal` binds Apple's Metal API on macOS (Apple silicon and Intel)
   entirely in Dodo, with no C runtime: each method is an `objc_msgSend`
   declared with its own signature. It covers devices, command queues,
@@ -51,7 +282,7 @@
   `Canvas.fill_spans` and `gradient_spans`, all drawing exactly what
   `fill_outline` draws.
 - `std/gpu/vulkan`: the Vulkan API in pure Dodo, one to one like Rust's
-  `ash`, as the bottom layer for a future portable `std/gpu`. Constants,
+  `ash`, as the bottom layer for the portable `std/gpu`. Constants,
   handles, enums, bitmasks, structs and the command tables are generated from
   the Khronos registry by `scripts/generate_vulkan.py` and cover core Vulkan
   1.0 to 1.4, the Xlib, XCB, Wayland, Win32, Metal and headless surfaces,
@@ -351,11 +582,10 @@
   returns a `pl011.DmaPort`, a `std/io` Reader and Writer that receives into
   a ring buffer of up to 32 KiB, so input is no longer limited to the
   32-byte FIFO between reads, and writes in the background.
-- Queued I2C transactions: `start_write`, `start_read`, and
-  `start_write_read` put a transaction of up to 16 commands into the
-  controller's FIFO and return; `poll_finish` collects it without waiting,
-  `listen` raises the controller's interrupt when it ends, and `cancel`
-  aborts it.
+- Polled I2C transactions: the DesignWare controller implements
+  `hal.I2cPoll`, whose `poll_write`, `poll_read`, and `poll_write_read` run
+  transactions of any length across polls; `listen` raises the controller's
+  interrupt whenever a poll can make progress, and `cancel` aborts one.
 - `examples/dma.dodo` runs a DMA serial console that polls ten times a
   second next to a task streaming SPI frames by DMA. The board self-tests
   check DMA copies, SPI and UART loopback by DMA, and queued I2C reads, and

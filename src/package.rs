@@ -164,8 +164,8 @@ pub fn load_for_platform(
     .map_err(|error| error.to_string())
 }
 
-/// File stems of hosted adapters. `std/window` has one per OS; the other
-/// areas share `posix` between Linux and macOS.
+/// File stems of hosted adapters. `std/window` and `std/gpu/opengl` have one
+/// per OS; the other areas share `posix` between Linux and macOS.
 const ADAPTER_STEMS: &[&str] = &["posix", "windows", "linux", "macos"];
 
 /// C boundaries are embedded alongside the Dodo sources for relocated compilers.
@@ -435,6 +435,12 @@ fn load_internal(
                 item.interior_mutable = item.name == "Atomic";
             }
         }
+        // So do std/embedded/sync's mutexes, inside a critical section.
+        if matches!(&key, ModuleId::Bundled(path) if path == "std/embedded/sync") {
+            for item in &mut module.program.structs {
+                item.interior_mutable = item.name == "Mutex";
+            }
+        }
         let mut visible_packages: BTreeMap<String, String> = module
             .import_aliases
             .iter()
@@ -460,6 +466,9 @@ fn load_internal(
     program.pio_version = platform.and_then(|platform| platform.chip.pio_version);
     program.dispatched_interrupts = platform
         .is_some_and(|platform| platform.chip.interrupt_abi == hardware::InterruptAbi::Dispatched);
+    program.executor_prefix = prefixes
+        .get(&ModuleId::Bundled("std/embedded/executor".to_owned()))
+        .cloned();
     Ok(Loaded {
         program,
         sources: loader.sources,
@@ -542,8 +551,11 @@ impl Loader<'_> {
         {
             return Err(format!("`{import}` is unsupported for target `{}`; Metal requires a macOS target such as aarch64-apple-darwin or x86_64-apple-darwin", self.target).into());
         }
-        // An area is a stdlib directory with its own adapters and `runtime.c`;
-        // `crypto/openssl` keeps libcrypto out of programs that only need entropy.
+        // An area is a stdlib directory with its own adapters, usually with a
+        // `runtime.c`; `crypto/openssl` keeps libcrypto out of programs that
+        // only need entropy, `gpu/opengl` is pure Dodo that loads the
+        // system's OpenGL interface at run time, and `gpu/hal` selects the
+        // operating system's own GPU API for `std/gpu` (Metal on macOS).
         let Some((area, selector)) = import
             .strip_prefix("std/")
             .and_then(|rest| rest.rsplit_once('/'))
@@ -567,6 +579,8 @@ impl Loader<'_> {
                 | "web"
                 | "time"
                 | "window"
+                | "gpu/opengl"
+                | "gpu/hal"
                 | "dylib"
         ) || !matches!(selector, "native" | "posix" | "linux" | "macos" | "windows")
         {
@@ -576,8 +590,13 @@ impl Loader<'_> {
             return Err(format!("`{import}` is unsupported for target `{}`; hosted adapters require x86_64 or aarch64 Linux GNU, x86_64 or arm64 macOS, or x86_64 Windows (MSVC/GNU)", self.target).into());
         };
         // Window systems differ on every OS, so `window` has one adapter per OS
-        // (X11, Cocoa, Win32) instead of a shared POSIX one.
-        let adapter = if area == "window" { os } else { adapter };
+        // (X11, Cocoa, Win32) instead of a shared POSIX one, and so do
+        // `gpu/opengl` (EGL, CGL, WGL) and `gpu/hal` (Metal on macOS).
+        let adapter = if matches!(area, "window" | "gpu/opengl" | "gpu/hal") {
+            os
+        } else {
+            adapter
+        };
         // `std/AREA/linux` and `std/AREA/macos` name the shared POSIX adapter
         // on their own operating system only.
         if selector != "native" && selector != adapter && selector != os {

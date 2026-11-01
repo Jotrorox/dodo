@@ -1,0 +1,174 @@
+diff --git a/src/bus/mod.rs b/src/bus/mod.rs
+index a295cfd..6565d6b 100644
+--- a/src/bus/mod.rs
++++ b/src/bus/mod.rs
+@@ -67,6 +67,8 @@ pub const SYSCFG_BASE: u32 = 0x4000_4000;
+ pub const CLOCKS_BASE: u32 = 0x4000_8000;
+ pub const RESETS_BASE: u32 = 0x4000_C000;
+ pub const PSM_BASE: u32 = 0x4001_0000;
++/// PSM FRCE_OFF / FRCE_ON / DONE bit for core 1.
++pub const PSM_PROC1: u32 = 1 << 16;
+ pub const IO_BANK0_BASE: u32 = 0x4001_4000;
+ pub const IO_QSPI_BASE: u32 = 0x4001_8000;
+ pub const PADS_BANK0_BASE: u32 = 0x4001_C000;
+@@ -334,6 +336,10 @@ pub struct Bus {
+     /// UART / SPI / I2C / ADC / PWM / TIMER / WATCHDOG / RTC / VREG / TBMAN).
+     /// Keyed by canonical word address (alias bits stripped).
+     peripheral_regs: HashMap<u32, u32>,
++    /// Set when firmware forces core 1 into reset with PSM FRCE_OFF.PROC1
++    /// (`Some(true)`) or releases it (`Some(false)`); taken by the
++    /// emulator after each core 0 instruction.
++    pub(crate) proc1_reset: Option<bool>,
+     /// PIO0 / PIO1. Wired into the AHB decode at `0x5020_0000` /
+     /// `0x5030_0000` (see [`PIO0_BASE`] / [`PIO1_BASE`]); output pins are
+     /// merged into [`Self::gpio_in`] by [`crate::Emulator::update_gpio`].
+@@ -497,6 +503,7 @@ impl Bus {
+             xip_ctrl_regs: HashMap::new(),
+             ssi_regs: HashMap::new(),
+             peripheral_regs: HashMap::new(),
++            proc1_reset: None,
+             pio: [PioBlock::new(), PioBlock::new()],
+             watchdog_tick: WatchdogTickRegs::new(),
+             timer: TimerRegs::new(),
+@@ -981,6 +988,10 @@ impl Bus {
+                     3 => old & !val,
+                     _ => val,
+                 };
++                // PSM FRCE_OFF.PROC1 holds core 1 in reset while set.
++                if canonical == PSM_BASE + 0x4 && (old ^ new) & PSM_PROC1 != 0 {
++                    self.proc1_reset = Some(new & PSM_PROC1 != 0);
++                }
+                 self.peripheral_regs.insert(canonical, new);
+             }
+         }
+diff --git a/src/bus/ppb.rs b/src/bus/ppb.rs
+index f6be95b..89d3c16 100644
+--- a/src/bus/ppb.rs
++++ b/src/bus/ppb.rs
+@@ -51,6 +51,9 @@ pub struct Ppb {
+     /// executing (has been entered but not yet returned from). Used by
+     /// the nested-exception return path to clear the bit on `exit`.
+     pub active: u64,
++    /// ICSR.VECTACTIVE: the running exception's number, as in IPSR. Kept
++    /// in step by exception entry and return.
++    pub vectactive: u32,
+ }
+ 
+ impl Ppb {
+@@ -61,6 +64,7 @@ impl Ppb {
+             shpr: [0; SHPR_LEN],
+             icsr: 0,
+             active: 0,
++            vectactive: 0,
+         }
+     }
+ 
+@@ -132,7 +136,7 @@ impl Ppb {
+     pub fn read32(&self, addr: u32) -> u32 {
+         match addr & 0xFFFF {
+             0xED00 => 0x410C_C601, // CPUID: Cortex-M0+ r0p1
+-            0xED04 => self.icsr,
++            0xED04 => (self.icsr & !0x1FF) | self.vectactive,
+             0xED08 => self.vtor,
+             0xED0C => 0xFA05_0000, // AIRCR stub (VECTKEY echo)
+             0xED1C => {
+diff --git a/src/bus/sio.rs b/src/bus/sio.rs
+index 16b4d9b..a4eb9c1 100644
+--- a/src/bus/sio.rs
++++ b/src/bus/sio.rs
+@@ -456,6 +456,27 @@ impl Sio {
+         }
+     }
+ 
++    /// SIO_IRQ_PROC<core>: raised while the core's FIFO end holds a word
++    /// or its sticky WOF or ROE flag is set (RP2040 datasheet 2.3.1.4).
++    pub(crate) fn fifo_irq_level(&self, core: usize) -> bool {
++        let rx_fifo = if core == 0 {
++            &self.fifo_to_core0
++        } else {
++            &self.fifo_to_core1
++        };
++        !rx_fifo.is_empty() || self.fifo_wof[core] || self.fifo_roe[core]
++    }
++
++    /// Push `val` into core 0's FIFO end as core 1 would: what core 1's
++    /// boot ROM sends when it leaves reset.
++    pub(crate) fn push_from_core1(&mut self, val: u32) {
++        if self.fifo_to_core0.push(val) {
++            self.pending_fifo_event = Some(0);
++        } else {
++            self.fifo_wof[1] = true;
++        }
++    }
++
+     fn fifo_wr(&mut self, val: u32, core: usize) {
+         // Armed path: core 0 pushing while core 1 halted. The FSM
+         // consumes `val` — nothing lands in fifo_to_core1 — and the
+diff --git a/src/core/exceptions.rs b/src/core/exceptions.rs
+index a2a00e7..1dd5a8b 100644
+--- a/src/core/exceptions.rs
++++ b/src/core/exceptions.rs
+@@ -148,6 +148,7 @@ impl CortexM0Plus {
+ 
+         // Enter handler mode: IPSR = exc_num, CONTROL.SPSEL forced to 0.
+         self.regs.xpsr = (self.regs.xpsr & !0x1FF) | (exc_num as u32);
++        bus.ppb_mut(active_core).vectactive = exc_num as u32;
+         self.regs.control &= !0x2; // handler always uses MSP
+         self.regs.sync_sp_from_banked();
+ 
+@@ -247,6 +248,7 @@ impl CortexM0Plus {
+         let frame_size: u32 = if return_xpsr & (1 << 9) != 0 { 36 } else { 32 };
+         // Restore xPSR, clearing the alignment bit we borrowed.
+         self.regs.xpsr = return_xpsr & !(1 << 9);
++        bus.ppb_mut(active_core).vectactive = self.regs.xpsr & 0x1FF;
+ 
+         // Deallocate frame on the selected stack.
+         if return_to_psp {
+diff --git a/src/lib.rs b/src/lib.rs
+index 4fb2189..f24af7d 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -691,6 +691,7 @@ impl Emulator {
+                 // sees the eviction next quantum. Mirrors rp2350_emu
+                 // (commit 0c31479, lib.rs §lookup-and-drain).
+                 Self::drain_cache_invalidations(&mut self.bus, &mut self.cores);
++                self.apply_core1_reset();
+                 self.maybe_wake_core1(0);
+                 c
+             } else {
+@@ -823,6 +824,13 @@ impl Emulator {
+     /// `NVIC_IPR` / `NVIC_ISER` (modelled in
+     /// `bus/mod.rs::nvic_mmio_write32` + `nvic_mmio_read32`).
+     fn drain_pending_irqs_to_cores(&mut self) {
++        // SIO_IRQ_PROC0 (15) and SIO_IRQ_PROC1 (16) follow each core's
++        // FIFO end, level-sensitive.
++        for core in 0..2 {
++            if self.bus.sio.fifo_irq_level(core) {
++                self.bus.irq_pending |= 1u32 << (15 + core);
++            }
++        }
+         if self.bus.irq_pending != 0 {
+             let raised = std::mem::replace(&mut self.bus.irq_pending, 0);
+             for irq in 0..crate::irq::IRQ_COUNT {
+@@ -1204,6 +1212,21 @@ impl Emulator {
+         self.bus.sio.set_handshake_armed(true);
+     }
+ 
++    /// PSM FRCE_OFF.PROC1: core 1 stops while core 0 holds it in reset.
++    /// Released, it runs the boot ROM, which sends a 0 through the FIFO
++    /// and then waits for the launch handshake; the armed FSM stands in
++    /// for that wait.
++    fn apply_core1_reset(&mut self) {
++        match self.bus.proc1_reset.take() {
++            Some(true) => self.halt_core1(),
++            Some(false) => {
++                self.halt_core1();
++                self.bus.sio.push_from_core1(0);
++            }
++            None => {}
++        }
++    }
++
+     /// Wake core 1 and synchronously disarm the multicore-launch FSM.
+     ///
+     /// This is the ONLY sanctioned path for waking core 1 from
