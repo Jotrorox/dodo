@@ -3,7 +3,6 @@
 //! zero-copy row decoding cannot outlive the row it borrows.
 use dodoc::{format, package, parser, sema};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -279,10 +278,12 @@ fn derived_rows_work_across_packages_and_with_implicit_imports() {
     check(&directory.0.join("main.dodo")).unwrap_or_else(|error| panic!("{error}"));
 }
 
+// Builds and runs a program, which needs the LLVM backend.
+#[cfg(feature = "llvm")]
 #[test]
 fn derived_rows_run_against_sqlite() {
     let directory = Directory::new();
-    let output = Command::new(env!("CARGO_BIN_EXE_dodo"))
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_dodo"))
         .arg("test")
         .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/sqlite/row_derive.dodo"))
         .current_dir(&directory.0)
