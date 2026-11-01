@@ -14,9 +14,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         params: &[Type],
         ret: &Type,
     ) -> Result<(bool, Vec<bool>)> {
-        let large = |ty: &Type| -> Result<bool> {
-            Ok(*ty != Type::Void && self.data.get_abi_size(&self.ty(ty)?) > 1024)
-        };
+        let large = |ty: &Type| -> Result<bool> { self.large_value(ty) };
         Ok((
             large(ret)?,
             params.iter().map(large).collect::<Result<Vec<_>>>()?,
@@ -245,7 +243,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         let closure = callee.ty.closure_signature().is_some();
         let (indirect_return, indirect_params) = self.value_convention(&params, ret)?;
         let storage = if indirect_return {
-            Some(self.alloca(self.ty(ret)?, "call.result")?)
+            Some(self.alloca(self.ty(ret)?, CALL_RESULT)?)
         } else {
             None
         };
@@ -263,7 +261,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         for (e, indirect) in args.iter().zip(&indirect_params) {
             let value = self.stage(e, &mut pending)?;
             if *indirect {
-                let argument = self.alloca(self.ty(&e.ty)?, "call.argument")?;
+                let argument = self.alloca(self.ty(&e.ty)?, CALL_ARGUMENT)?;
                 self.store_value(argument, value)?;
                 values.push(argument);
             } else {

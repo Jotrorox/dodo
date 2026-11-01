@@ -89,7 +89,14 @@ fn near(actual: u32, expected: u32) -> bool {
 }
 
 fn main() -> i32 {
-    win := match window.open(window.Options.gpu("OpenGL window", 160, 120)) {
+    app := match window.App.new() {
+        ok(app) => app,
+        err(error) => {
+            console.printf("unavailable\nwindow {}\n", window.error_name(error))!
+            return 0
+        }
+    }
+    win := match app.open(window.Options.gpu("OpenGL window", 160, 120)) {
         ok(win) => win,
         err(error) => {
             console.printf("unavailable\nwindow {}\n", window.error_name(error))!
@@ -132,16 +139,16 @@ fn main() -> i32 {
     console.println("shown")!
     idle := 0u32
     for idle < 20 {
-        match win.wait_event_timeout(100)! {
-            some(window.Event.Key(key)) => {
+        match app.wait_event_timeout(100)! {
+            some(window.Event.Key(_, key)) => {
                 if key.key == window.Key.Escape {
                     break
                 }
             }
-            some(window.Event.Close) => {
+            some(window.Event.Close(_)) | some(window.Event.Quit) => {
                 break
             }
-            some(window.Event.Resize(_, _)) => {
+            some(window.Event.Resize(_, _, _)) => {
                 context.update_surface()
                 draw(shader, win.width(), win.height())
                 context.swap_buffers()!

@@ -27,7 +27,7 @@ def tool(names):
     raise SystemExit(f"Required tool not found: {' or '.join(names)}")
 
 
-def run(arguments, *, env=None, timeout=120, cwd=None):
+def run(arguments, *, env=None, timeout=120, cwd=None, allowed=(0,)):
     # Wine's background services can inherit stdout/stderr. A log file avoids
     # waiting for those services to close pipes after the tested process exits.
     # Fixtures may write binary data and read stdin; give them no input and
@@ -42,7 +42,7 @@ def run(arguments, *, env=None, timeout=120, cwd=None):
                                f"{log.read()}") from error
         log.seek(0)
         output = log.read()
-    if result.returncode:
+    if result.returncode not in allowed:
         raise RuntimeError(f"Command failed ({result.returncode}): {' '.join(map(str, arguments))}\n"
                            f"{output}")
     return result
@@ -195,10 +195,11 @@ def main():
     if kernel32 is None:
         raise SystemExit("MinGW libkernel32.a not found; provide --kernel32 or install the MinGW development files")
     fixtures = [path.resolve() for path in args.fixture] if args.fixture else (
-        # window_events and window_frames open real windows; tests/window_library.rs drives them.
-        # gpu_metal_checks needs Metal, which only macOS has.
+        # window_events, window_frames and window_multi open real windows; tests/window_library.rs
+        # drives them. gpu_metal_checks needs Metal, which only macOS has.
         sorted(path for path in (ROOT / "tests/stdlib").glob("*.dodo")
-               if path.name not in ("window_events.dodo", "window_frames.dodo", "gpu_metal_checks.dodo")) +
+               if path.name not in ("window_events.dodo", "window_frames.dodo", "window_multi.dodo",
+                                    "gpu_metal_checks.dodo")) +
         sorted(path for path in (ROOT / "tests/os").glob("*.dodo")
                if "_unix_" not in path.name and path.name not in (
                    "process_checks.dodo", "env_native_checks.dodo", "thread_failures.dodo")))
@@ -287,13 +288,19 @@ def main():
                         shutil.copyfile(scratch / "os child.exe", child_work / "os child.exe")
                         (child_work / "cwd-marker").write_bytes(b"fixture")
                     extra_args = ["space arg", "é", ""] if source.stem in ("env_checks", "hosted_env") else []
+                    exit_code = 0
                     if source.stem == "console_checks":
                         run_console([wine, str(exe)], env=env, cwd=work)
+                    elif source.stem == "gpu_checks":
+                        # Wine has no GPU std/gpu can use: the fixture must try
+                        # every backend, report each failure and exit 2.
+                        result = run([wine, str(exe)], env=env, cwd=work, allowed=(0, 2))
+                        exit_code = result.returncode
                     else:
                         run([wine, str(exe), *extra_args], env=env, cwd=work)
                     executions += 1
                     records.append({"fixture": source.name, "optimization": optimization,
-                                    "target": "x86_64-pc-windows-msvc", "exit_code": 0})
+                                    "target": "x86_64-pc-windows-msvc", "exit_code": exit_code})
                     print(f"PASS Windows x64 / Wine: {source.name} -O{optimization}", flush=True)
         finally:
             subprocess.run([wineserver, "-k"], env=env, capture_output=True, timeout=20)

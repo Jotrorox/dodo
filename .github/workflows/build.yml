@@ -319,6 +319,60 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+  # Firmware runs on emulated RP2040 and RP2350 chips: startup, interrupts,
+  # the executor, DMA, PIO, and the second core, at O0 and O2. The emulator
+  # runner is cached by its sources, so most runs only build the firmware.
+  firmware-emulator:
+    name: Firmware on emulated RP2040 and RP2350
+    needs: linux-debug-build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: debug-dodo-x86_64
+          path: target/debug
+      - run: chmod +x target/debug/dodo
+      - name: Install ld.lld for linking firmware
+        run: |
+          if ! command -v ld.lld > /dev/null; then
+            sudo apt-get install --no-install-recommends -y lld ||
+              { sudo apt-get update && sudo apt-get install --no-install-recommends -y lld; }
+          fi
+          ld.lld --version
+      - name: Restore the emulator runner and boot ROMs
+        id: emulator-cache
+        if: inputs.cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            emulator/target/release/dodo-emulator
+            emulator/target/release/dodo-emulator.key
+            emulator/target/cache
+          key: dodo-emulator-${{ hashFiles('emulator/Cargo.toml', 'emulator/Cargo.lock', 'emulator/src/**', 'emulator/patches/**', 'scripts/test_emulator.py') }}
+      # Only needed to build the runner when the cache misses.
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        if: steps.emulator-cache.outputs.cache-hit != 'true'
+        with:
+          toolchain: 1.98.1
+      - name: Run the firmware self-tests in the emulators
+        run: python3 scripts/test_emulator.py --dodo target/debug/dodo
+      # Like the other caches, only main saves; pull requests restore it.
+      - name: Save the emulator runner and boot ROMs
+        if: inputs.cache && steps.emulator-cache.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            emulator/target/release/dodo-emulator
+            emulator/target/release/dodo-emulator.key
+            emulator/target/cache
+          key: ${{ steps.emulator-cache.outputs.cache-primary-key }}
+
   # Windows cross-checks use x86-64 MinGW and Wine; run them once.
   linux-windows-cross:
     name: Windows cross-checks / Wine

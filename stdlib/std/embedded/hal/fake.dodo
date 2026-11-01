@@ -539,6 +539,65 @@ pub struct Analog {
     }
 }
 
+// A random number generator that fills buffers with the bytes given to
+// `queue`, in order, and after those with a counting pattern: 0, 1, 2, ...,
+// 255, 0, 1, ... continuing across calls. Tests then see exactly which bytes
+// a driver drew, and how many.
+pub struct Rng {
+    queued: [64]u8
+    queued_length: usize
+    queued_position: usize
+    next: u8
+    drawn: u32
+    failure: Option<hal.Error>
+
+    pub fn new() -> Rng {
+        return Rng { queued: [0u8; 64], queued_length: 0, queued_position: 0, next: 0, drawn: 0, failure: none }
+    }
+
+    // Bytes for the next fills to return in order, after any still unread,
+    // before the counting pattern resumes. At most 64 can wait at once.
+    pub fn queue(&mut self, bytes: &[u8]) {
+        unread := self.queued_length - self.queued_position
+        core.assert(unread + bytes.len <= 64)
+        for index in 0..unread {
+            self.queued[index] = self.queued[self.queued_position + index]
+        }
+        for index in 0..bytes.len {
+            self.queued[unread + index] = bytes[index]
+        }
+        self.queued_position = 0
+        self.queued_length = unread + bytes.len
+    }
+
+    pub fn fill(&mut self, bytes: &mut[u8]) -> void!hal.Error {
+        if let some(error) = option.take(&mut self.failure) {
+            return err(error)
+        }
+        for index in 0..bytes.len {
+            if self.queued_position < self.queued_length {
+                bytes[index] = self.queued[self.queued_position]
+                self.queued_position += 1
+            } else {
+                bytes[index] = self.next
+                self.next = core.wrapping_add(self.next, 1u8)
+            }
+        }
+        self.drawn += bytes.len as u32
+        return ok()
+    }
+
+    // The number of bytes filled so far.
+    pub fn drawn(&self) -> u32 {
+        return self.drawn
+    }
+
+    // Make the next fill fail with `error`, for testing error paths.
+    pub fn fail_next(&mut self, error: hal.Error) {
+        self.failure = some(error)
+    }
+}
+
 // A serial port that records the most recent 256 bytes written and reads
 // back bytes given to `feed`, as if they had arrived on its receive line;
 // once they are read, reads report end of input. Implements the std/io
@@ -1583,6 +1642,234 @@ pub struct DmaChannel: hal.DmaChannel {
     }
 }
 
+// NOR flash in caller-provided memory, with the hal Flash protocol, that
+// checks the protocol strictly: it refuses misaligned and out-of-range
+// requests and writes over bytes that are not erased with InvalidInput, so
+// code that passes its tests here also works on flash that cannot rewrite a
+// byte. It counts erases and written bytes, can fail its next operation,
+// and can cut the power partway through an operation or just after one, to
+// test recovery:
+//
+//     memory := [0u8; 16384]
+//     flash := fake.Flash.new(&mut memory, 4096, 4)
+//     flash.erase(0, 16384)!
+//
+// Fresh memory holds whatever the caller filled it with; erase it first to
+// start from blank flash.
+pub struct Flash {
+    memory: &mut[u8]
+    erase_size: u32
+    write_size: u32
+    erases: u32
+    written: u32
+    operations: u32
+    failure: Option<hal.Error>
+    // Bytes the device may still change before the power is cut, if a cut
+    // is pending, and whether the power is off.
+    budget: Option<u32>
+    // Erases and writes to complete before the power is cut, if a cut is
+    // pending.
+    countdown: Option<u32>
+    off: bool
+
+    // Flash over `memory`, whose length must be a nonzero multiple of
+    // `erase_size`; both sizes must be powers of two, `write_size` at most
+    // 256 and at most `erase_size`. Traps otherwise.
+    pub fn new(memory: &mut[u8], erase_size: u32, write_size: u32) -> Flash from(memory) {
+        core.assert(power_of_two(erase_size) && power_of_two(write_size))
+        core.assert(write_size <= 256 && write_size <= erase_size)
+        core.assert(memory.len > 0 && memory.len % erase_size as usize == 0)
+        return Flash {
+            memory,
+            erase_size,
+            write_size,
+            erases: 0,
+            written: 0,
+            operations: 0,
+            failure: none,
+            budget: none,
+            countdown: none,
+            off: false,
+        }
+    }
+
+    pub fn capacity(&self) -> u32 {
+        return self.memory.len as u32
+    }
+
+    pub fn erase_size(&self) -> u32 {
+        return self.erase_size
+    }
+
+    pub fn write_size(&self) -> u32 {
+        return self.write_size
+    }
+
+    pub fn read(&mut self, offset: u32, buffer: &mut[u8]) -> void!hal.Error {
+        self.begin()?
+        start := self.range(offset, buffer.len as u32, 1)?
+        for index in 0..buffer.len {
+            buffer[index] = self.memory[start + index]
+        }
+        return ok()
+    }
+
+    pub fn erase(&mut self, offset: u32, length: u32) -> void!hal.Error {
+        self.begin()?
+        start := self.range(offset, length, self.erase_size)?
+        self.erases += length / self.erase_size
+        for index in 0..length as usize {
+            if !self.spend() {
+                return err(hal.Error.Bus)
+            }
+            self.memory[start + index] = hal.FLASH_ERASED
+        }
+        self.complete()
+        return ok()
+    }
+
+    pub fn write(&mut self, offset: u32, bytes: &[u8]) -> void!hal.Error {
+        self.begin()?
+        start := self.range(offset, bytes.len as u32, self.write_size)?
+        for index in 0..bytes.len {
+            if self.memory[start + index] != hal.FLASH_ERASED {
+                return err(hal.Error.InvalidInput)
+            }
+        }
+        for index in 0..bytes.len {
+            if !self.spend() {
+                return err(hal.Error.Bus)
+            }
+            self.memory[start + index] = bytes[index]
+            self.written += 1
+        }
+        self.complete()
+        return ok()
+    }
+
+    // Blocks erased so far.
+    pub fn erases(&self) -> u32 {
+        return self.erases
+    }
+
+    // Bytes written so far.
+    pub fn written(&self) -> u32 {
+        return self.written
+    }
+
+    // Erases and writes completed so far.
+    pub fn operations(&self) -> u32 {
+        return self.operations
+    }
+
+    // Make the next operation fail with `error`, changing nothing.
+    pub fn fail_next(&mut self, error: hal.Error) {
+        self.failure = some(error)
+    }
+
+    // Cut the power once erases and writes have changed `bytes` more bytes:
+    // the operation in progress stops there, leaving the bytes it reached
+    // changed and the rest as they were, and fails with Bus, as does every
+    // operation after it until restore_power.
+    pub fn cut_power_after(&mut self, bytes: u32) {
+        self.budget = some(bytes)
+    }
+
+    // Cut the power just after `count` more erases and writes complete:
+    // they succeed, and every operation after them fails with Bus until
+    // restore_power. 0 cuts it now.
+    pub fn cut_power_after_operations(&mut self, count: u32) {
+        if count == 0 {
+            self.off = true
+            return
+        }
+        self.countdown = some(count)
+    }
+
+    // True once a cut has happened.
+    pub fn is_off(&self) -> bool {
+        return self.off
+    }
+
+    // Turn the power back on and cancel a pending cut.
+    pub fn restore_power(&mut self) {
+        self.off = false
+        self.budget = none
+        self.countdown = none
+    }
+
+    // The memory, for inspecting or corrupting it.
+    pub fn memory(&mut self) -> &mut[u8] from(self) {
+        return &mut self.memory[..]
+    }
+
+    fn begin(&mut self) -> void!hal.Error {
+        if let some(error) = option.take(&mut self.failure) {
+            return err(error)
+        }
+        if self.off {
+            return err(hal.Error.Bus)
+        }
+        return ok()
+    }
+
+    // The index of `offset` after checking that `length` bytes from it are
+    // inside the memory and both are multiples of `align`.
+    fn range(&self, offset: u32, length: u32, align: u32) -> usize!hal.Error {
+        end := offset as u64 + length as u64
+        if end > self.memory.len as u64 || offset % align != 0 || length % align != 0 {
+            return err(hal.Error.InvalidInput)
+        }
+        return ok(offset as usize)
+    }
+
+    // Count a completed erase or write, cutting the power if it was the
+    // last before a pending cut.
+    fn complete(&mut self) {
+        self.operations += 1
+        left := 0u32
+        match &self.countdown {
+            some(count) => {
+                left = *count
+            }
+            none => {
+                return
+            }
+        }
+        if left <= 1 {
+            self.off = true
+            self.countdown = none
+        } else {
+            self.countdown = some(left - 1)
+        }
+    }
+
+    // Use up one byte of a pending power cut's budget; false, cutting the
+    // power, when none is left.
+    fn spend(&mut self) -> bool {
+        left := 0u32
+        match &self.budget {
+            some(bytes) => {
+                left = *bytes
+            }
+            none => {
+                return true
+            }
+        }
+        if left == 0 {
+            self.off = true
+            self.budget = none
+            return false
+        }
+        self.budget = some(left - 1)
+        return true
+    }
+}
+
+fn power_of_two(value: u32) -> bool {
+    return value != 0 && (value & (value - 1)) == 0
+}
+
 // A chip's low-power controls in memory, implementing std/embedded/power's
 // protocol. Every clock starts running, awake and in deep sleep. The test
 // says which clocks the simulated program cannot run without, which ones
@@ -1736,5 +2023,118 @@ pub struct Power {
         self.wake_pins = 0
         self.dormant_states += 1
         return ok(woken)
+    }
+}
+
+// A real-time clock with an alarm, implementing hal.Rtc and hal.RtcAlarm.
+// It starts unset, as a clock that has just been powered, and keeps time
+// only as `advance` says. Its resolution is 1 ms unless made coarser, so
+// drivers are tested against clocks that count whole seconds too.
+pub struct Rtc: hal.Rtc + hal.RtcAlarm {
+    // Milliseconds since the epoch, exactly, while `set`.
+    time: u64
+    set: bool
+    resolution: u32
+    alarm: u64
+    armed: bool
+    failure: Option<hal.Error>
+
+    // An unset clock that counts milliseconds.
+    pub fn new() -> Rtc {
+        return Rtc.with_resolution(1)
+    }
+
+    // An unset clock whose steps are `resolution_ms` long, such as 1000
+    // for one that counts seconds; at least 1.
+    pub fn with_resolution(resolution_ms: u32) -> Rtc {
+        core.assert(resolution_ms > 0)
+        return Rtc { time: 0, set: false, resolution: resolution_ms, alarm: 0, armed: false, failure: none }
+    }
+
+    // Let `milliseconds` pass. An unset clock stays unset.
+    pub fn advance(&mut self, milliseconds: u64) {
+        if self.set {
+            self.time += milliseconds
+        }
+    }
+
+    // Lose power: the time is gone and the alarm disarmed, as when a
+    // backup battery runs out.
+    pub fn lose_power(&mut self) {
+        self.set = false
+        self.time = 0
+        self.armed = false
+    }
+
+    // True from set_alarm_ms until clear_alarm or a loss of power.
+    pub fn is_armed(&self) -> bool {
+        return self.armed
+    }
+
+    // The time the alarm was last set for.
+    pub fn alarm_ms(&self) -> u64 {
+        return self.alarm
+    }
+
+    // Make the next operation fail with `error`, as a clock chip on a bus
+    // may, for testing error paths.
+    pub fn fail_next(&mut self, error: hal.Error) {
+        self.failure = some(error)
+    }
+
+    fn begin(&mut self) -> void!hal.Error {
+        if let some(error) = option.take(&mut self.failure) {
+            return err(error)
+        }
+        return ok()
+    }
+
+    fn shown(&self) -> u64 {
+        return self.time - self.time % self.resolution as u64
+    }
+
+    pub fn is_set(&mut self) -> bool!hal.Error {
+        self.begin()?
+        return ok(self.set)
+    }
+
+    pub fn now_ms(&mut self) -> u64!hal.Error {
+        self.begin()?
+        if !self.set {
+            return err(hal.Error.Busy)
+        }
+        return ok(self.shown())
+    }
+
+    pub fn set_ms(&mut self, time_ms: u64) -> void!hal.Error {
+        self.begin()?
+        self.time = time_ms
+        self.set = true
+        return ok()
+    }
+
+    pub fn resolution_ms(&self) -> u32 {
+        return self.resolution
+    }
+
+    pub fn set_alarm_ms(&mut self, time_ms: u64) -> void!hal.Error {
+        self.begin()?
+        if !self.set {
+            return err(hal.Error.Busy)
+        }
+        self.alarm = time_ms
+        self.armed = true
+        return ok()
+    }
+
+    pub fn alarm_fired(&mut self) -> bool!hal.Error {
+        self.begin()?
+        return ok(self.armed && self.set && self.shown() >= self.alarm)
+    }
+
+    pub fn clear_alarm(&mut self) -> void!hal.Error {
+        self.begin()?
+        self.armed = false
+        return ok()
     }
 }

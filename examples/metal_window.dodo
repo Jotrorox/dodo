@@ -80,7 +80,19 @@ fn draw(layer: &metal.MetalLayer, queue: &metal.CommandQueue, state: &metal.Rend
     return ok()
 }
 
-fn run(device: &metal.Device, win: &mut window.Window) -> void!metal.Error {
+// Ask for the next Frame event; false once the window is gone.
+fn asked(win: &mut window.Window) -> bool {
+    match win.request_frame() {
+        ok() => {
+            return true
+        }
+        err(_) => {
+            return false
+        }
+    }
+}
+
+fn run(device: &metal.Device, app: &mut window.App, win: &mut window.Window) -> void!metal.Error {
     address := match win.metal_layer() {
         ok(address) => address,
         err(_) => {
@@ -107,27 +119,33 @@ fn run(device: &metal.Device, win: &mut window.Window) -> void!metal.Error {
     period := win.frame_interval()
     step := 1.2f32 * (period.seconds() as f32 + period.subsec_nanos() as f32 / 1000000000.0)
     angle := 0.0f32
+    if !asked(win) {
+        return ok()
+    }
     for {
-        event := match win.wait_event_until_frame() {
+        event := match app.wait_event() {
             ok(event) => event,
             err(_) => {
                 return ok()
             }
         }
         match event {
-            some(window.Event.Close) => {
+            window.Event.Close(_) | window.Event.Quit => {
                 return ok()
             }
-            some(window.Event.Key(key)) => {
+            window.Event.Key(_, key) => {
                 if key.key == window.Key.Escape {
                     return ok()
                 }
             }
-            some(_) => {}
-            none => {
+            window.Event.Frame(_) => {
                 draw(&layer, &queue, &state, win.width(), win.height(), angle)?
                 angle += step
+                if !asked(win) {
+                    return ok()
+                }
             }
+            _ => {}
         }
     }
 }
@@ -140,14 +158,21 @@ fn main() -> i32 {
             return 2
         }
     }
-    win := match window.open(window.Options.gpu("Metal", 480, 320)) {
+    app := match window.App.new() {
+        ok(app) => app,
+        err(error) => {
+            console.println(window.error_name(error))!
+            return 1
+        }
+    }
+    win := match app.open(window.Options.gpu("Metal", 480, 320)) {
         ok(win) => win,
         err(error) => {
             console.println(window.error_name(error))!
             return 1
         }
     }
-    match run(&device, &mut win) {
+    match run(&device, &mut app, &mut win) {
         ok() => {
             return 0
         }

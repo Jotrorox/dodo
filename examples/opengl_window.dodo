@@ -77,7 +77,13 @@ fn draw(program: u32, width: u32, height: u32, angle: f32) {
 }
 
 fn run() -> void!opengl.Error {
-    win := match window.open(window.Options.gpu("OpenGL", WIDTH, HEIGHT)) {
+    app := match window.App.new() {
+        ok(app) => app,
+        err(_) => {
+            return err(opengl.Error.NoDisplay)
+        }
+    }
+    win := match app.open(window.Options.gpu("OpenGL", WIDTH, HEIGHT)) {
         ok(win) => win,
         err(_) => {
             return err(opengl.Error.NoDisplay)
@@ -89,12 +95,13 @@ fn run() -> void!opengl.Error {
             return err(opengl.Error.NoDisplay)
         }
     }
+    // Declared after the window, so it is dropped before it.
     context := opengl.Context.create_for_window(&native, opengl.Options.default())?
     match win.set_title(context.renderer()) {
         ok() => {}
         err(_) => {}
     }
-    // Frames follow the display; wait_event_until_frame paces them too.
+    // Swaps wait for the display; Frame events pace the drawing too.
     match context.set_swap_interval(1) {
         ok() => {}
         err(_) => {}
@@ -104,31 +111,33 @@ fn run() -> void!opengl.Error {
     period := win.frame_interval()
     step := 1.2f32 * (period.seconds() as f32 + period.subsec_nanos() as f32 / 1000000000.0)
     angle := 0.0f32
+    win.request_frame()!
     for {
-        event := match win.wait_event_until_frame() {
+        event := match app.wait_event() {
             ok(event) => event,
             err(_) => {
                 return ok()
             }
         }
         match event {
-            some(window.Event.Close) => {
+            window.Event.Close(_) | window.Event.Quit => {
                 return ok()
             }
-            some(window.Event.Key(key)) => {
+            window.Event.Key(_, key) => {
                 if key.key == window.Key.Escape {
                     return ok()
                 }
             }
-            some(window.Event.Resize(_, _)) => {
+            window.Event.Resize(_, _, _) => {
                 context.update_surface()
             }
-            some(_) => {}
-            none => {
+            window.Event.Frame(_) => {
                 draw(program, win.width(), win.height(), angle)
                 context.swap_buffers()?
                 angle += step
+                win.request_frame()!
             }
+            _ => {}
         }
     }
 }

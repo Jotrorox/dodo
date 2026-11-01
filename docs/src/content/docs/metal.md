@@ -12,9 +12,8 @@ install. Building for a macOS target links Metal, QuartzCore, Foundation and
 libobjc automatically.
 
 The module follows Metal closely, one Dodo method per Metal method, so Apple's
-documentation applies directly. It is the bottom layer for a future portable
-`std/gpu`: higher layers can be built on it in Dodo, and programs can use it
-on its own.
+documentation applies directly. It is the bottom layer of the portable
+[std/gpu](gpu.md) on macOS, and programs can use it on its own.
 
 ## Quickstart
 
@@ -255,7 +254,8 @@ A [std/window](window.md#drawing-with-the-gpu) window opened with
 and render into its drawables:
 
 ```dodo
-win := window.open(window.Options.gpu("Metal", 480, 320))?
+app := window.App.new()?
+win := app.open(window.Options.gpu("Metal", 480, 320))?
 address := win.metal_layer()?
 // A second reference to the layer, released when `layer` is dropped.
 object := match unsafe {
@@ -276,8 +276,8 @@ layer.set_pixel_format(metal.PIXEL_FORMAT_BGRA8_UNORM)
 
 `std/window` keeps the layer's drawable size at the window's size in pixels
 and its contents scale at the display's, so a frame needs no sizing of its
-own: take `next_drawable()` once per `wait_event_until_frame()` frame, render
-into its texture and `present_drawable` it.
+own: take `next_drawable()` on each `Event.Frame` that `win.request_frame()`
+asked for, render into its texture and `present_drawable` it.
 [`examples/metal_window.dodo`](https://github.com/Jotrorox/dodo/blob/main/examples/metal_window.dodo)
 draws a spinning triangle this way.
 

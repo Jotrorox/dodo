@@ -19,7 +19,9 @@ import "std/window/handle"
 // shows frames with SwapBuffers.
 
 unsafe extern "C" fn LoadLibraryA(name: *const u8) -> *mut u8
-unsafe extern "C" fn GetProcAddress(module: *mut u8, name: *const u8) -> usize
+// Declared with the pointer result std/dylib uses, as one program may load
+// both: a symbol has a single C signature.
+unsafe extern "C" fn GetProcAddress(module: *mut u8, name: *const u8) -> *mut u8
 unsafe extern "C" fn GetModuleHandleA(name: *const u8) -> *mut u8
 
 const CS_OWNDC: u32 = 0x0020
@@ -111,7 +113,7 @@ fn null() -> *mut u8 {
 
 unsafe fn symbol(module: *mut u8, name: &[u8]) -> usize {
     unsafe {
-        return GetProcAddress(module, common.c_string(name))
+        return GetProcAddress(module, common.c_string(name)) as usize
     }
 }
 
@@ -475,7 +477,7 @@ pub struct Backend {
             return address
         }
         return unsafe {
-            GetProcAddress(self.opengl, name)
+            GetProcAddress(self.opengl, name) as usize
         }
     }
 

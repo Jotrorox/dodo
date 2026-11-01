@@ -3,19 +3,25 @@
  * gdi32 on Windows, and on Linux nothing beyond libc, because std/window/x11
  * speaks the X11 protocol itself over the socket opened here.
  *
- * macOS and Windows keep one window per process in static state. Its pixel
- * buffer is 32-bit BGRA, top-down, and replaced only inside
- * dodo_window_next_event when the drawing area changes size. A window opened
- * for the GPU has no buffer and only tracks its size. Events are queued in a
- * ring and handed out one at a time in the std/window/raw Event layout.
+ * macOS and Windows keep the process's one connection in static state, with
+ * a record per open window in a list, found by the window's id. Ids start at
+ * 1 and are never reused, so a stale id simply finds nothing. Each window's
+ * pixel buffer is 32-bit BGRA, top-down, and owned by std/window, which
+ * attaches it here whenever it replaces it; the window system repaints from
+ * it. A window opened for the GPU has no buffer: the program draws into it
+ * through its native handle (dodo_window_native) or, on macOS, a CAMetalLayer
+ * (dodo_window_metal_layer), and present refuses it. Events of every window
+ * are queued in one ring and handed out one at a time in the std/window/raw
+ * Event layout, which names the window.
  *
  * Error codes match std/window/raw from_code: 0 success, 1 NoDisplay,
  * 2 AlreadyOpen, 3 Closed, 4 InvalidInput, 5 OutOfMemory, 6 Protocol,
  * 7 Unsupported, 8 System. dodo_window_next_event returns them negated.
  *
  * Frame pacing: dodo_window_clock is a monotonic nanosecond clock on every
- * OS. macOS 14 and later report display refreshes with a CADisplayLink as
- * FRAME events; Windows reads the next refresh time from the compositor. */
+ * OS. macOS 14 and later report display refreshes with a CADisplayLink per
+ * window as FRAME events; Windows reads the next refresh time from the
+ * compositor. */
 #if defined(__linux__)
 #define _GNU_SOURCE
 #endif
@@ -30,11 +36,12 @@ enum {
 };
 enum {
     EV_CLOSE = 1, EV_RESIZE = 2, EV_FOCUS = 3, EV_KEY = 4, EV_TEXT = 5,
-    EV_MOVE = 6, EV_BUTTON = 7, EV_LEAVE = 8, EV_SCROLL = 9, EV_FRAME = 10
+    EV_MOVE = 6, EV_BUTTON = 7, EV_LEAVE = 8, EV_SCROLL = 9, EV_FRAME = 10,
+    EV_QUIT = 11
 };
 enum { F_PRESSED = 1, F_REPEAT = 2 };
 enum { M_SHIFT = 1, M_CONTROL = 2, M_ALT = 4, M_META = 8, M_CAPS = 16 };
-/* dodo_window_open flags, and what dodo_window_native reports. */
+/* dodo_window_open flags, and the kinds dodo_window_native reports. */
 enum { O_RESIZABLE = 1, O_PIXEL_BUFFER = 2 };
 enum { NATIVE_APPKIT = 1, NATIVE_WIN32 = 2 };
 #define FOREVER 0xffffffffu
@@ -42,26 +49,35 @@ enum { NATIVE_APPKIT = 1, NATIVE_WIN32 = 2 };
 struct dodo_window_event {
     uint32_t kind, code, modifiers, flags;
     int32_t x, y;
+    uint32_t window;
 };
 
 /* An empty buffer still needs a valid address for a Dodo slice. */
 static uint32_t empty_pixels[1];
+
+/* Pixel buffers and window tables of std/window and its adapters. */
+uint8_t *dodo_window_alloc(size_t bytes) { return calloc(bytes ? bytes : 4, 1); }
+void dodo_window_free(uint8_t *memory) { free(memory); }
+uint8_t *dodo_window_empty(void) { return (uint8_t *)empty_pixels; }
 
 #if defined(__APPLE__) || defined(_WIN32)
 #define QUEUE 256
 static struct dodo_window_event queue[QUEUE];
 static unsigned queue_head, queue_count;
 
-static void push(uint32_t kind, uint32_t code, uint32_t modifiers, uint32_t flags, int32_t x, int32_t y) {
+static void push(uint32_t window, uint32_t kind, uint32_t code, uint32_t modifiers, uint32_t flags, int32_t x, int32_t y) {
     /* Coalesce motion so a slow consumer sees the latest position. */
     if (kind == EV_MOVE && queue_count) {
         struct dodo_window_event *last = &queue[(queue_head + queue_count - 1) % QUEUE];
-        if (last->kind == EV_MOVE) { last->x = x; last->y = y; last->modifiers = modifiers; return; }
+        if (last->kind == EV_MOVE && last->window == window) {
+            last->x = x; last->y = y; last->modifiers = modifiers;
+            return;
+        }
     }
     if (queue_count == QUEUE) return;
     struct dodo_window_event *event = &queue[(queue_head + queue_count) % QUEUE];
     event->kind = kind; event->code = code; event->modifiers = modifiers;
-    event->flags = flags; event->x = x; event->y = y;
+    event->flags = flags; event->x = x; event->y = y; event->window = window;
     queue_count++;
 }
 static int pop(struct dodo_window_event *event) {
@@ -71,56 +87,25 @@ static int pop(struct dodo_window_event *event) {
     queue_count--;
     return 1;
 }
+/* Drop the queued events of `window`, only those of `kind` unless it is 0. */
+static void purge(uint32_t window, uint32_t kind) {
+    unsigned kept = 0;
+    for (unsigned i = 0; i < queue_count; ++i) {
+        struct dodo_window_event event = queue[(queue_head + i) % QUEUE];
+        if (event.window == window && (!kind || event.kind == kind)) continue;
+        queue[(queue_head + kept) % QUEUE] = event;
+        kept++;
+    }
+    queue_count = kept;
+}
 /* UTF-8 text from the keyboard layout becomes one TEXT event per scalar;
  * control characters and the private-use range macOS uses for function keys
  * are not text. */
-static void push_text(uint32_t code_point) {
+static void push_text(uint32_t window, uint32_t code_point) {
     if (code_point < 0x20 || code_point == 0x7f || (code_point >= 0x80 && code_point < 0xa0)) return;
     if (code_point >= 0xf700 && code_point <= 0xf8ff) return;
     if (code_point > 0x10ffff || (code_point >= 0xd800 && code_point <= 0xdfff)) return;
-    push(EV_TEXT, code_point, 0, 0, 0, 0);
-}
-
-/* The pixel buffer. Resizing keeps the old picture in the top-left corner.
- * Without one (has_pixels 0) pixels stays NULL and only the size is kept;
- * sized says whether the size is known yet. */
-static uint8_t *pixels;
-static uint32_t pixel_width, pixel_height;
-static int has_pixels, sized;
-
-static int resize_buffer(uint32_t width, uint32_t height) {
-    if (!has_pixels) {
-        pixel_width = width; pixel_height = height; sized = 1;
-        return 0;
-    }
-    size_t bytes = (size_t)width * height * 4;
-    uint8_t *next = calloc(bytes ? bytes : 4, 1);
-    if (!next) return E_MEMORY;
-    if (pixels) {
-        uint32_t rows = height < pixel_height ? height : pixel_height;
-        uint32_t columns = width < pixel_width ? width : pixel_width;
-        for (uint32_t y = 0; y < rows; ++y)
-            memcpy(next + (size_t)y * width * 4, pixels + (size_t)y * pixel_width * 4, (size_t)columns * 4);
-        free(pixels);
-    }
-    pixels = next; pixel_width = width; pixel_height = height; sized = 1;
-    return 0;
-}
-static void free_buffer(void) {
-    free(pixels); pixels = NULL; pixel_width = 0; pixel_height = 0; sized = 0;
-}
-
-/* A window without a buffer reports its size with an empty one. */
-void dodo_window_buffer(intptr_t handle, uint8_t **out, uint32_t *width, uint32_t *height, size_t *stride) {
-    if (!handle || !sized) {
-        *out = (uint8_t *)empty_pixels; *width = 0; *height = 0; *stride = 0;
-        return;
-    }
-    if (!pixels) {
-        *out = (uint8_t *)empty_pixels; *width = pixel_width; *height = pixel_height; *stride = 0;
-        return;
-    }
-    *out = pixels; *width = pixel_width; *height = pixel_height; *stride = (size_t)pixel_width * 4;
+    push(window, EV_TEXT, code_point, 0, 0, 0, 0);
 }
 #endif
 
@@ -132,7 +117,84 @@ void dodo_window_buffer(intptr_t handle, uint8_t **out, uint32_t *width, uint32_
 #include <math.h>
 #include <pthread.h>
 #include <time.h>
+#elif defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <dwmapi.h>
+#endif
 
+#if defined(__APPLE__) || defined(_WIN32)
+struct dodo_window {
+    struct dodo_window *next;
+    uint32_t id;
+    /* The drawing area in pixels, as last reported. */
+    uint32_t width, height;
+    /* The attached buffer, owned by std/window; NULL before the first. */
+    uint8_t *pixels;
+    uint32_t pixel_width, pixel_height;
+    int cursor_hidden, mouse_inside;
+    /* Opened without a pixel buffer, for drawing with the GPU. */
+    int gpu;
+#if defined(__APPLE__)
+    /* layer shows the pixel buffer; a GPU window has none, and metal_layer
+     * is the CAMetalLayer dodo_window_metal_layer made, retained here. */
+    id window, view, layer, metal_layer;
+    /* A CADisplayLink, paused except between request_frame and the refresh
+     * it reports, and the refresh period it measured. */
+    id display_link;
+    uint64_t link_period;
+    double backing_scale;
+#else
+    HWND hwnd;
+    UINT dpi;
+    int mouse_tracking, buttons_down;
+    WCHAR high_surrogate;
+#endif
+};
+
+static struct dodo_window *windows;
+static uint32_t next_window_id = 1;
+static int connected;
+
+static struct dodo_window *find(uint32_t window) {
+    for (struct dodo_window *w = windows; w; w = w->next)
+        if (w->id == window) return w;
+    return NULL;
+}
+static struct dodo_window *new_window(void) {
+    struct dodo_window *w = calloc(1, sizeof(*w));
+    if (w) w->id = next_window_id++;
+    return w;
+}
+static void link_window(struct dodo_window *w) {
+    struct dodo_window **end = &windows;
+    while (*end) end = &(*end)->next;
+    w->next = NULL;
+    *end = w;
+}
+static void unlink_window(struct dodo_window *w) {
+    for (struct dodo_window **at = &windows; *at; at = &(*at)->next)
+        if (*at == w) { *at = w->next; return; }
+}
+
+int32_t dodo_window_size(uint32_t window, uint32_t *width, uint32_t *height) {
+    struct dodo_window *w = find(window);
+    if (!w) { *width = 0; *height = 0; return E_CLOSED; }
+    *width = w->width; *height = w->height;
+    return 0;
+}
+
+void dodo_window_attach(uint32_t window, uint8_t *pixels, uint32_t width, uint32_t height) {
+    struct dodo_window *w = find(window);
+    if (!w) return;
+    w->pixels = pixels; w->pixel_width = width; w->pixel_height = height;
+}
+#endif
+
+/* ------------------------------------------------------------------------ */
+#if defined(__APPLE__)
 extern void *objc_autoreleasePoolPush(void);
 extern void objc_autoreleasePoolPop(void *pool);
 extern id const kCAGravityTopLeft;
@@ -155,8 +217,8 @@ typedef unsigned short (*send_ushort)(id, SEL);
 typedef unsigned long (*send_ulong)(id, SEL);
 typedef long (*send_long)(id, SEL);
 typedef CGPoint (*send_point)(id, SEL);
+typedef CGPoint (*send_point_point)(id, SEL, CGPoint);
 typedef CGPoint (*send_point_point_id)(id, SEL, CGPoint, id);
-typedef CGSize (*send_size_size)(id, SEL, CGSize);
 typedef void (*send_void_size)(id, SEL, CGSize);
 typedef const char *(*send_cstring)(id, SEL);
 
@@ -178,19 +240,23 @@ static CGRect msg_rect(id target, const char *name) {
 #endif
 }
 
-static id app, window, view, delegate;
-/* The CAMetalLayer dodo_window_metal_layer made the view's backing layer,
- * retained here until the window closes. */
-static id metal_layer;
+/* One delegate serves every window, the Quit item and the display links;
+ * it finds the window record from the NSWindow or link it is given. */
+static id app, delegate;
 static CGColorSpaceRef color_space;
-static double backing_scale = 1;
-static int cursor_hidden, mouse_inside;
-static int launched;
-/* A CADisplayLink, paused except between request_frame and the refresh it
- * reports, the refresh period it measured, and the App Nap opt-out held
- * while animating. */
-static id display_link, activity;
-static uint64_t link_period;
+static int launched, cursor_hidden;
+/* The App Nap opt-out held while animating. */
+static id activity;
+/* Where the next window's top-left corner goes; the first is centered. */
+static CGPoint cascade;
+static int cascading;
+
+static struct dodo_window *by_window(id window) {
+    if (!window) return NULL;
+    for (struct dodo_window *w = windows; w; w = w->next)
+        if (w->window == window) return w;
+    return NULL;
+}
 
 static uint32_t modifiers_of(unsigned long flags) {
     uint32_t bits = 0;
@@ -202,6 +268,8 @@ static uint32_t modifiers_of(unsigned long flags) {
     return bits;
 }
 
+/* Generated from the Key order in std/window.dodo: macOS virtual key codes,
+ * which name physical positions, to Key ordinals. */
 /* Generated from the Key order in std/window.dodo: macOS virtual key codes,
  * which name physical positions, to Key ordinals. */
 static const uint8_t mac_keys[128] = {
@@ -228,70 +296,82 @@ static unsigned long modifier_bit(unsigned short code) {
     }
 }
 
-/* The view's layer is fetched when needed rather than kept: a GPU program
- * may replace it. */
-static void update_scale(void) {
-    double scale = SEND(send_double)(window, sel("backingScaleFactor"));
-    backing_scale = scale > 0 ? scale : 1;
-    if (has_pixels) SEND(send_void_double)(msg(view, "layer"), sel("setContentsScale:"), backing_scale);
-    if (metal_layer) SEND(send_void_double)(metal_layer, sel("setContentsScale:"), backing_scale);
+static void update_scale(struct dodo_window *w) {
+    double scale = SEND(send_double)(w->window, sel("backingScaleFactor"));
+    w->backing_scale = scale > 0 ? scale : 1;
+    if (w->layer) SEND(send_void_double)(w->layer, sel("setContentsScale:"), w->backing_scale);
+    if (w->metal_layer) SEND(send_void_double)(w->metal_layer, sel("setContentsScale:"), w->backing_scale);
 }
 
 /* Keep the Metal layer's drawables at the drawing area's size in pixels. */
-static void size_metal_layer(void) {
-    if (!metal_layer) return;
-    CGSize size = CGSizeMake(pixel_width ? pixel_width : 1, pixel_height ? pixel_height : 1);
-    SEND(send_void_size)(metal_layer, sel("setDrawableSize:"), size);
+static void size_metal_layer(struct dodo_window *w) {
+    if (!w->metal_layer) return;
+    CGSize size = CGSizeMake(w->width ? w->width : 1, w->height ? w->height : 1);
+    SEND(send_void_size)(w->metal_layer, sel("setDrawableSize:"), size);
 }
 
-/* Bring the buffer to the content view's size in pixels. */
-static int sync_size(int report) {
-    CGRect bounds = msg_rect(view, "bounds");
-    update_scale();
-    double width = floor(bounds.size.width * backing_scale + 0.5);
-    double height = floor(bounds.size.height * backing_scale + 0.5);
-    uint32_t w = width > 0 ? (uint32_t)width : 0, h = height > 0 ? (uint32_t)height : 0;
-    if (sized && w == pixel_width && h == pixel_height) return 0;
-    int code = resize_buffer(w, h);
-    if (code) return code;
-    size_metal_layer();
-    if (report) push(EV_RESIZE, 0, 0, 0, (int32_t)w, (int32_t)h);
-    return 0;
+/* Record the content view's size in pixels, reporting a change. */
+static void sync_size(struct dodo_window *w, int report) {
+    CGRect bounds = msg_rect(w->view, "bounds");
+    update_scale(w);
+    double width = floor(bounds.size.width * w->backing_scale + 0.5);
+    double height = floor(bounds.size.height * w->backing_scale + 0.5);
+    uint32_t pw = width > 0 ? (uint32_t)width : 0, ph = height > 0 ? (uint32_t)height : 0;
+    if (pw == w->width && ph == w->height) return;
+    w->width = pw; w->height = ph;
+    size_metal_layer(w);
+    if (report) push(w->id, EV_RESIZE, 0, 0, 0, (int32_t)pw, (int32_t)ph);
+}
+
+/* NSCursor hiding is global, so the pointer hides while any window asks. */
+static void apply_cursor(void) {
+    int wanted = 0;
+    for (struct dodo_window *w = windows; w; w = w->next) wanted |= w->cursor_hidden;
+    if (wanted && !cursor_hidden) { msg_void(cls("NSCursor"), "hide"); cursor_hidden = 1; }
+    if (!wanted && cursor_hidden) { msg_void(cls("NSCursor"), "unhide"); cursor_hidden = 0; }
 }
 
 /* Closing is the program's decision, so the close button only reports. */
 static BOOL should_close(id self, SEL command, id sender) {
-    (void)self; (void)command; (void)sender;
-    push(EV_CLOSE, 0, 0, 0, 0, 0);
+    (void)self; (void)command;
+    struct dodo_window *w = by_window(sender);
+    if (w) push(w->id, EV_CLOSE, 0, 0, 0, 0, 0);
     return NO;
 }
 static void quit_requested(id self, SEL command, id sender) {
     (void)self; (void)command; (void)sender;
-    push(EV_CLOSE, 0, 0, 0, 0, 0);
+    push(0, EV_QUIT, 0, 0, 0, 0, 0);
 }
 static void became_key(id self, SEL command, id note) {
-    (void)self; (void)command; (void)note;
-    push(EV_FOCUS, 0, 0, F_PRESSED, 0, 0);
+    (void)self; (void)command;
+    struct dodo_window *w = by_window(msg(note, "object"));
+    if (w) push(w->id, EV_FOCUS, 0, 0, F_PRESSED, 0, 0);
 }
 static void resigned_key(id self, SEL command, id note) {
-    (void)self; (void)command; (void)note;
-    push(EV_FOCUS, 0, 0, 0, 0, 0);
+    (void)self; (void)command;
+    struct dodo_window *w = by_window(msg(note, "object"));
+    if (w) push(w->id, EV_FOCUS, 0, 0, 0, 0, 0);
 }
 static void did_resize(id self, SEL command, id note) {
-    (void)self; (void)command; (void)note;
-    if (window) sync_size(1);
+    (void)self; (void)command;
+    struct dodo_window *w = by_window(msg(note, "object"));
+    if (w) sync_size(w, 1);
 }
 /* Marks frame_ready's application-defined wake-up event in data1. */
 #define FRAME_WAKE 0x646f646fl
 
-/* The display refreshed: report one FRAME and pause until the next request. */
+/* A window's display refreshed: report one FRAME and pause until the next
+ * request. */
 static void frame_ready(id self, SEL command, id link) {
     (void)self; (void)command;
+    struct dodo_window *w = windows;
+    while (w && w->display_link != link) w = w->next;
+    msg_void_bool(link, "setPaused:", YES);
+    if (!w) return;
     double last = SEND(send_double)(link, sel("timestamp"));
     double next = SEND(send_double)(link, sel("targetTimestamp"));
-    if (next > last && next - last < 0.1) link_period = (uint64_t)((next - last) * 1e9 + 0.5);
-    msg_void_bool(link, "setPaused:", YES);
-    push(EV_FRAME, 0, 0, 0, 0, 0);
+    if (next > last && next - last < 0.1) w->link_period = (uint64_t)((next - last) * 1e9 + 0.5);
+    push(w->id, EV_FRAME, 0, 0, 0, 0, 0);
     /* nextEventMatchingMask: returns only for events, so post an
      * application-defined one to end its wait. */
     id wake = SEND(id (*)(id, SEL, unsigned long, CGPoint, unsigned long, double, long, id, short, long, long))(
@@ -321,7 +401,7 @@ static id string_from(const uint8_t *bytes, size_t length) {
     return text ? text : SEND(id (*)(id, SEL, const char *))(msg(cls("NSString"), "alloc"), sel("initWithUTF8String:"), "");
 }
 
-/* An application menu whose Quit item (Command-Q) reports Close. */
+/* An application menu whose Quit item (Command-Q) reports Quit. */
 static void install_menu(void) {
     id bar = msg(msg(cls("NSMenu"), "alloc"), "init");
     id app_item = msg(msg(cls("NSMenuItem"), "alloc"), "init");
@@ -346,13 +426,13 @@ static BOOL responds(id target, const char *name) {
 }
 
 /* NSView display links exist from macOS 14; older systems pace by timer. */
-static void create_display_link(void) {
-    if (!responds(view, "displayLinkWithTarget:selector:")) return;
-    id link = SEND(id (*)(id, SEL, id, SEL))(view, sel("displayLinkWithTarget:selector:"), delegate, sel("dodoFrame:"));
+static void create_display_link(struct dodo_window *w) {
+    if (!responds(w->view, "displayLinkWithTarget:selector:")) return;
+    id link = SEND(id (*)(id, SEL, id, SEL))(w->view, sel("displayLinkWithTarget:selector:"), delegate, sel("dodoFrame:"));
     if (!link) return;
-    display_link = msg(link, "retain");
-    msg_void_bool(display_link, "setPaused:", YES);
-    SEND(void (*)(id, SEL, id, id))(display_link, sel("addToRunLoop:forMode:"),
+    w->display_link = msg(link, "retain");
+    msg_void_bool(w->display_link, "setPaused:", YES);
+    SEND(void (*)(id, SEL, id, id))(w->display_link, sel("addToRunLoop:forMode:"),
         msg(cls("NSRunLoop"), "mainRunLoop"), NSDefaultRunLoopMode);
 }
 
@@ -363,37 +443,28 @@ static void end_activity(void) {
     activity = nil;
 }
 
-static void release_all(void) {
-    if (display_link) {
-        msg_void(display_link, "invalidate");
-        msg_void(display_link, "release");
-        display_link = nil;
+/* Remove a window from the screen and the list, with its queued events. */
+static void destroy_window(struct dodo_window *w) {
+    unlink_window(w);
+    if (w->display_link) {
+        msg_void(w->display_link, "invalidate");
+        msg_void(w->display_link, "release");
     }
-    link_period = 0;
-    end_activity();
-    if (window) {
-        msg_void_id(window, "setDelegate:", nil);
-        msg_void_id(window, "orderOut:", nil);
-        msg_void(window, "close");
-        msg_void(window, "release");
+    if (w->window) {
+        msg_void_id(w->window, "setDelegate:", nil);
+        msg_void_id(w->window, "orderOut:", nil);
+        msg_void(w->window, "close");
+        msg_void(w->window, "release");
     }
-    if (metal_layer) msg_void(metal_layer, "release");
-    /* The menu's Quit item targets the delegate released below. */
-    if (app && delegate) msg_void_id(app, "setMainMenu:", nil);
-    if (delegate) msg_void(delegate, "release");
-    if (color_space) CGColorSpaceRelease(color_space);
-    if (cursor_hidden) msg_void(cls("NSCursor"), "unhide");
-    window = view = delegate = metal_layer = nil;
-    color_space = NULL; cursor_hidden = 0; mouse_inside = 0; has_pixels = 0;
-    queue_head = queue_count = 0;
-    free_buffer();
+    if (w->metal_layer) msg_void(w->metal_layer, "release");
+    purge(w->id, 0);
+    free(w);
+    apply_cursor();
 }
 
-int32_t dodo_window_open(const uint8_t *title, size_t title_length, uint32_t width, uint32_t height, uint32_t flags, intptr_t *handle) {
-    if (window) return E_ALREADY_OPEN;
+int32_t dodo_window_connect(void) {
+    if (connected) return E_ALREADY_OPEN;
     if (!pthread_main_np()) return E_UNSUPPORTED;
-    int resizable = (flags & O_RESIZABLE) != 0;
-    has_pixels = (flags & O_PIXEL_BUFFER) != 0;
     void *pool = objc_autoreleasePoolPush();
     app = msg(cls("NSApplication"), "sharedApplication");
     if (!app) { objc_autoreleasePoolPop(pool); return E_NO_DISPLAY; }
@@ -402,79 +473,117 @@ int32_t dodo_window_open(const uint8_t *title, size_t title_length, uint32_t wid
         msg_void(app, "finishLaunching");
         launched = 1;
     }
+    color_space = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+    if (!color_space) { objc_autoreleasePoolPop(pool); return E_SYSTEM; }
     delegate = msg(msg((id)delegate_class(), "alloc"), "init");
     install_menu();
-    unsigned long style = 1 | 2 | 4 | (resizable ? 8 : 0); /* titled, closable, miniaturizable, resizable */
-    CGRect frame = CGRectMake(0, 0, width, height);
-    window = SEND(id (*)(id, SEL, CGRect, unsigned long, unsigned long, BOOL))(msg(cls("NSWindow"), "alloc"),
-        sel("initWithContentRect:styleMask:backing:defer:"), frame, style, 2ul, NO);
-    if (!window) { release_all(); objc_autoreleasePoolPop(pool); return E_SYSTEM; }
-    msg_void_bool(window, "setReleasedWhenClosed:", NO);
-    msg_void_bool(window, "setAcceptsMouseMovedEvents:", YES);
-    msg_void_id(window, "setDelegate:", delegate);
-    id text = string_from(title, title_length);
-    msg_void_id(window, "setTitle:", text);
-    msg_void(text, "release");
-    view = msg(window, "contentView");
-    /* The pixel buffer is shown as the contents of the view's layer. A GPU
-     * window leaves the view alone for NSOpenGLContext or a Metal layer. */
-    if (has_pixels) {
-        msg_void_bool(view, "setWantsLayer:", YES);
-        id layer = msg(view, "layer");
-        msg_void_id(layer, "setContentsGravity:", kCAGravityTopLeft);
-        msg_void_id(layer, "setMagnificationFilter:", kCAFilterNearest);
-    }
-    create_display_link();
-    /* Moves and exits over the drawing area, focused or not. */
-    id area = SEND(id (*)(id, SEL, CGRect, unsigned long, id, id))(msg(cls("NSTrackingArea"), "alloc"),
-        sel("initWithRect:options:owner:userInfo:"), CGRectZero, 0x01ul | 0x02ul | 0x80ul | 0x200ul, view, nil);
-    msg_void_id(view, "addTrackingArea:", area);
-    msg_void(area, "release");
-    color_space = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
-    msg_void(window, "center");
-    msg_void_id(window, "makeKeyAndOrderFront:", nil);
-    msg_void_bool(app, "activateIgnoringOtherApps:", YES);
-    int code = color_space ? sync_size(0) : E_SYSTEM;
-    if (code) { release_all(); objc_autoreleasePoolPop(pool); return code; }
+    connected = 1;
+    cascading = 0;
+    queue_head = queue_count = 0;
     objc_autoreleasePoolPop(pool);
-    *handle = 1;
     return 0;
 }
 
-void dodo_window_close(intptr_t handle) {
-    if (!handle || !window) return;
+void dodo_window_disconnect(void) {
+    if (!connected) return;
     void *pool = objc_autoreleasePoolPush();
-    release_all();
+    while (windows) destroy_window(windows);
+    end_activity();
+    /* The menu's Quit item targets the delegate released below. */
+    msg_void_id(app, "setMainMenu:", nil);
+    msg_void(delegate, "release");
+    CGColorSpaceRelease(color_space);
+    delegate = nil; color_space = NULL;
+    queue_head = queue_count = 0;
+    connected = 0;
     objc_autoreleasePoolPop(pool);
 }
 
-static void decode_utf8(const char *text) {
+int32_t dodo_window_open(const uint8_t *title, size_t title_length, uint32_t width, uint32_t height, uint32_t flags, uint32_t *handle) {
+    if (!connected) return E_CLOSED;
+    struct dodo_window *w = new_window();
+    if (!w) return E_MEMORY;
+    int resizable = (flags & O_RESIZABLE) != 0;
+    w->gpu = (flags & O_PIXEL_BUFFER) == 0;
+    void *pool = objc_autoreleasePoolPush();
+    unsigned long style = 1 | 2 | 4 | (resizable ? 8 : 0); /* titled, closable, miniaturizable, resizable */
+    CGRect frame = CGRectMake(0, 0, width, height);
+    w->window = SEND(id (*)(id, SEL, CGRect, unsigned long, unsigned long, BOOL))(msg(cls("NSWindow"), "alloc"),
+        sel("initWithContentRect:styleMask:backing:defer:"), frame, style, 2ul, NO);
+    if (!w->window) { free(w); objc_autoreleasePoolPop(pool); return E_SYSTEM; }
+    msg_void_bool(w->window, "setReleasedWhenClosed:", NO);
+    msg_void_bool(w->window, "setAcceptsMouseMovedEvents:", YES);
+    id text = string_from(title, title_length);
+    msg_void_id(w->window, "setTitle:", text);
+    msg_void(text, "release");
+    w->view = msg(w->window, "contentView");
+    /* The pixel buffer is shown as the contents of the view's layer. A GPU
+     * window leaves the view alone for NSOpenGLContext or a Metal layer. */
+    if (!w->gpu) {
+        msg_void_bool(w->view, "setWantsLayer:", YES);
+        w->layer = msg(w->view, "layer");
+        msg_void_id(w->layer, "setContentsGravity:", kCAGravityTopLeft);
+        msg_void_id(w->layer, "setMagnificationFilter:", kCAFilterNearest);
+    }
+    create_display_link(w);
+    /* Moves and exits over the drawing area, focused or not. */
+    id area = SEND(id (*)(id, SEL, CGRect, unsigned long, id, id))(msg(cls("NSTrackingArea"), "alloc"),
+        sel("initWithRect:options:owner:userInfo:"), CGRectZero, 0x01ul | 0x02ul | 0x80ul | 0x200ul, w->view, nil);
+    msg_void_id(w->view, "addTrackingArea:", area);
+    msg_void(area, "release");
+    /* The first window is centered, later ones cascade from it. */
+    if (!cascading) {
+        msg_void(w->window, "center");
+        cascade = SEND(send_point_point)(w->window, sel("cascadeTopLeftFromPoint:"), CGPointZero);
+        cascading = 1;
+    } else {
+        cascade = SEND(send_point_point)(w->window, sel("cascadeTopLeftFromPoint:"), cascade);
+    }
+    link_window(w);
+    msg_void_id(w->window, "setDelegate:", delegate);
+    msg_void_id(w->window, "makeKeyAndOrderFront:", nil);
+    msg_void_bool(app, "activateIgnoringOtherApps:", YES);
+    sync_size(w, 0);
+    objc_autoreleasePoolPop(pool);
+    *handle = w->id;
+    return 0;
+}
+
+void dodo_window_close(uint32_t window) {
+    struct dodo_window *w = find(window);
+    if (!w) return;
+    void *pool = objc_autoreleasePoolPush();
+    destroy_window(w);
+    objc_autoreleasePoolPop(pool);
+}
+
+static void decode_utf8(uint32_t window, const char *text) {
     const unsigned char *s = (const unsigned char *)text;
     while (s && *s) {
         uint32_t c = *s++;
         int extra = c >= 0xf0 ? 3 : c >= 0xe0 ? 2 : c >= 0xc0 ? 1 : 0;
         if (extra) c &= 0x3f >> extra;
         for (; extra && (*s & 0xc0) == 0x80; --extra) c = (c << 6) | (*s++ & 0x3f);
-        if (!extra) push_text(c);
+        if (!extra) push_text(window, c);
     }
 }
 
-static void mouse_position(id event, int32_t *x, int32_t *y) {
+static void mouse_position(struct dodo_window *w, id event, int32_t *x, int32_t *y) {
     CGPoint location = SEND(send_point)(event, sel("locationInWindow"));
-    CGPoint local = SEND(send_point_point_id)(view, sel("convertPoint:fromView:"), location, nil);
-    CGRect bounds = msg_rect(view, "bounds");
-    *x = (int32_t)floor(local.x * backing_scale);
-    *y = (int32_t)floor((bounds.size.height - local.y) * backing_scale);
+    CGPoint local = SEND(send_point_point_id)(w->view, sel("convertPoint:fromView:"), location, nil);
+    CGRect bounds = msg_rect(w->view, "bounds");
+    *x = (int32_t)floor(local.x * w->backing_scale);
+    *y = (int32_t)floor((bounds.size.height - local.y) * w->backing_scale);
 }
 
 /* Translates an event into the queue. Returns whether AppKit should also
- * see it: keys go only to menu shortcuts, which avoids the beep AppKit plays
- * for keys no responder handles. */
+ * see it: keys of our windows go only to menu shortcuts, which avoids the
+ * beep AppKit plays for keys no responder handles. */
 static int translate(id event) {
     long type = SEND(send_long)(event, sel("type"));
     unsigned long flags = SEND(send_ulong)(event, sel("modifierFlags"));
     uint32_t modifiers = modifiers_of(flags);
-    int ours = msg(event, "window") == window;
+    struct dodo_window *w = by_window(msg(event, "window"));
     int32_t x = 0, y = 0;
     switch (type) {
     case 15: /* application-defined, such as frame_ready's wake-up */
@@ -486,52 +595,53 @@ static int translate(id event) {
             id menu = msg(app, "mainMenu");
             if (menu && SEND(send_bool_id)(menu, sel("performKeyEquivalent:"), event)) return 0;
         }
+        if (!w) return 1;
         uint32_t state = type == 10 ? F_PRESSED : 0;
         if (type == 10 && SEND(send_bool)(event, sel("isARepeat"))) state |= F_REPEAT;
-        push(EV_KEY, key, modifiers, state, 0, 0);
+        push(w->id, EV_KEY, key, modifiers, state, 0, 0);
         if (type == 10 && !(modifiers & (M_META | M_CONTROL)))
-            decode_utf8(SEND(send_cstring)(msg(event, "characters"), sel("UTF8String")));
+            decode_utf8(w->id, SEND(send_cstring)(msg(event, "characters"), sel("UTF8String")));
         return 0;
     }
     case 12: { /* modifier flags changed */
         unsigned short code = SEND(send_ushort)(event, sel("keyCode"));
         unsigned long bit = modifier_bit(code);
-        if (bit && code < 128) push(EV_KEY, mac_keys[code], modifiers, (flags & bit) ? F_PRESSED : 0, 0, 0);
+        if (w && bit && code < 128) push(w->id, EV_KEY, mac_keys[code], modifiers, (flags & bit) ? F_PRESSED : 0, 0, 0);
         return 1;
     }
     case 1: case 2: case 3: case 4: case 25: case 26: { /* mouse buttons */
-        if (!ours) return 1;
-        mouse_position(event, &x, &y);
+        if (!w) return 1;
+        mouse_position(w, event, &x, &y);
         long number = SEND(send_long)(event, sel("buttonNumber"));
         uint32_t button = number == 0 ? 0 : number == 1 ? 2 : number == 2 ? 1 : number == 3 ? 3 : number == 4 ? 4 : 99;
         int down = type == 1 || type == 3 || type == 25;
         /* Clicks on the title bar move the window; only the drawing area counts. */
-        CGRect bounds = msg_rect(view, "bounds");
-        if (down && (y < 0 || x < 0 || x >= (int32_t)(bounds.size.width * backing_scale))) return 1;
-        if (button != 99) push(EV_BUTTON, button, modifiers, down ? F_PRESSED : 0, x, y);
+        CGRect bounds = msg_rect(w->view, "bounds");
+        if (down && (y < 0 || x < 0 || x >= (int32_t)(bounds.size.width * w->backing_scale))) return 1;
+        if (button != 99) push(w->id, EV_BUTTON, button, modifiers, down ? F_PRESSED : 0, x, y);
         return 1;
     }
     case 5: case 6: case 7: case 27: { /* moved, dragged */
-        if (!ours) return 1;
-        mouse_position(event, &x, &y);
-        CGRect bounds = msg_rect(view, "bounds");
-        int inside = x >= 0 && y >= 0 && x < (int32_t)(bounds.size.width * backing_scale)
-            && y < (int32_t)(bounds.size.height * backing_scale);
-        if (inside || type != 5) { mouse_inside = 1; push(EV_MOVE, 0, modifiers, 0, x, y); }
-        else if (mouse_inside) { mouse_inside = 0; push(EV_LEAVE, 0, 0, 0, 0, 0); }
+        if (!w) return 1;
+        mouse_position(w, event, &x, &y);
+        CGRect bounds = msg_rect(w->view, "bounds");
+        int inside = x >= 0 && y >= 0 && x < (int32_t)(bounds.size.width * w->backing_scale)
+            && y < (int32_t)(bounds.size.height * w->backing_scale);
+        if (inside || type != 5) { w->mouse_inside = 1; push(w->id, EV_MOVE, 0, modifiers, 0, x, y); }
+        else if (w->mouse_inside) { w->mouse_inside = 0; push(w->id, EV_LEAVE, 0, 0, 0, 0, 0); }
         return 1;
     }
     case 9: /* exited */
-        if (mouse_inside) { mouse_inside = 0; push(EV_LEAVE, 0, 0, 0, 0, 0); }
+        if (w && w->mouse_inside) { w->mouse_inside = 0; push(w->id, EV_LEAVE, 0, 0, 0, 0, 0); }
         return 1;
     case 22: { /* scroll wheel */
-        if (!ours) return 1;
+        if (!w) return 1;
         double dx = SEND(send_double)(event, sel("scrollingDeltaX"));
         double dy = SEND(send_double)(event, sel("scrollingDeltaY"));
         /* Precise deltas are points; about ten make one notch. */
         double unit = SEND(send_bool)(event, sel("hasPreciseScrollingDeltas")) ? 12 : 120;
         int32_t sx = (int32_t)lround(-dx * unit), sy = (int32_t)lround(-dy * unit);
-        if (sx || sy) push(EV_SCROLL, 0, modifiers, 0, sx, sy);
+        if (sx || sy) push(w->id, EV_SCROLL, 0, modifiers, 0, sx, sy);
         return 1;
     }
     default:
@@ -539,46 +649,46 @@ static int translate(id event) {
     }
 }
 
-int32_t dodo_window_next_event(intptr_t handle, uint32_t milliseconds, struct dodo_window_event *event) {
-    if (!handle || !window) return -E_CLOSED;
+int32_t dodo_window_next_event(uint32_t milliseconds, struct dodo_window_event *event) {
+    if (!connected) return -E_CLOSED;
     if (pop(event)) return 1;
     void *pool = objc_autoreleasePoolPush();
     id until = milliseconds == 0 ? msg(cls("NSDate"), "distantPast")
         : milliseconds == FOREVER ? msg(cls("NSDate"), "distantFuture")
         : SEND(id (*)(id, SEL, double))(cls("NSDate"), sel("dateWithTimeIntervalSinceNow:"), milliseconds / 1000.0);
-    int found = 0;
     for (;;) {
         id next = SEND(id (*)(id, SEL, unsigned long long, id, id, BOOL))(app,
             sel("nextEventMatchingMask:untilDate:inMode:dequeue:"), ~0ull, until, NSDefaultRunLoopMode, YES);
         if (!next) break;
         if (translate(next)) msg_void_id(app, "sendEvent:", next);
-        if (window) sync_size(1);
+        for (struct dodo_window *w = windows; w; w = w->next) sync_size(w, 1);
         if (queue_count) break;
     }
-    if (window) msg_void(app, "updateWindows");
-    found = pop(event);
+    msg_void(app, "updateWindows");
+    int found = pop(event);
     objc_autoreleasePoolPop(pool);
     return found;
 }
 
-int32_t dodo_window_present(intptr_t handle, int32_t x, int32_t y, uint32_t width, uint32_t height) {
+int32_t dodo_window_present(uint32_t window, int32_t x, int32_t y, uint32_t width, uint32_t height) {
     (void)x; (void)y; (void)width; (void)height;
-    if (!handle || !window) return E_CLOSED;
-    if (!pixels) return E_UNSUPPORTED;
-    if (!pixel_width || !pixel_height) return 0;
+    struct dodo_window *w = find(window);
+    if (!w) return E_CLOSED;
+    if (w->gpu) return E_UNSUPPORTED;
+    if (!w->pixels || !w->pixel_width || !w->pixel_height) return 0;
     void *pool = objc_autoreleasePoolPush();
     /* The image takes a copy, so the program can keep drawing at once. */
-    size_t stride = (size_t)pixel_width * 4;
-    CFDataRef data = CFDataCreate(NULL, pixels, (CFIndex)(stride * pixel_height));
+    size_t stride = (size_t)w->pixel_width * 4;
+    CFDataRef data = CFDataCreate(NULL, w->pixels, (CFIndex)(stride * w->pixel_height));
     CGDataProviderRef provider = data ? CGDataProviderCreateWithCFData(data) : NULL;
-    CGImageRef image = provider ? CGImageCreate(pixel_width, pixel_height, 8, 32, stride, color_space,
+    CGImageRef image = provider ? CGImageCreate(w->pixel_width, w->pixel_height, 8, 32, stride, color_space,
         kCGBitmapByteOrder32Little | kCGImageAlphaNoneSkipFirst, provider, NULL, false, kCGRenderingIntentDefault) : NULL;
     int code = image ? 0 : E_MEMORY;
     if (image) {
         id transaction = cls("CATransaction");
         msg_void(transaction, "begin");
         msg_void_bool(transaction, "setDisableActions:", YES);
-        msg_void_id(msg(view, "layer"), "setContents:", (id)image);
+        msg_void_id(w->layer, "setContents:", (id)image);
         msg_void(transaction, "commit");
         msg_void(transaction, "flush");
         CGImageRelease(image);
@@ -589,26 +699,61 @@ int32_t dodo_window_present(intptr_t handle, int32_t x, int32_t y, uint32_t widt
     return code;
 }
 
-int32_t dodo_window_set_title(intptr_t handle, const uint8_t *title, size_t title_length) {
-    if (!handle || !window) return E_CLOSED;
+int32_t dodo_window_set_title(uint32_t window, const uint8_t *title, size_t title_length) {
+    struct dodo_window *w = find(window);
+    if (!w) return E_CLOSED;
     void *pool = objc_autoreleasePoolPush();
     id text = string_from(title, title_length);
-    msg_void_id(window, "setTitle:", text);
+    msg_void_id(w->window, "setTitle:", text);
     msg_void(text, "release");
     objc_autoreleasePoolPop(pool);
     return 0;
 }
 
-int32_t dodo_window_set_cursor_visible(intptr_t handle, uint32_t visible) {
-    if (!handle || !window) return E_CLOSED;
-    if (visible && cursor_hidden) { msg_void(cls("NSCursor"), "unhide"); cursor_hidden = 0; }
-    if (!visible && !cursor_hidden) { msg_void(cls("NSCursor"), "hide"); cursor_hidden = 1; }
+int32_t dodo_window_set_cursor_visible(uint32_t window, uint32_t visible) {
+    struct dodo_window *w = find(window);
+    if (!w) return E_CLOSED;
+    w->cursor_hidden = !visible;
+    apply_cursor();
     return 0;
 }
 
-uint32_t dodo_window_scale_percent(intptr_t handle) {
-    if (!handle || !window) return 100;
-    return (uint32_t)lround(backing_scale * 100);
+uint32_t dodo_window_scale_percent(uint32_t window) {
+    struct dodo_window *w = find(window);
+    if (!w) return 100;
+    return (uint32_t)lround(w->backing_scale * 100);
+}
+
+/* The NSWindow and its content view; negative error codes. */
+int32_t dodo_window_native(uint32_t window, uintptr_t *first, uintptr_t *second) {
+    struct dodo_window *w = find(window);
+    if (!w) return -E_CLOSED;
+    *first = (uintptr_t)w->window; *second = (uintptr_t)w->view;
+    return NATIVE_APPKIT;
+}
+
+/* Make a CAMetalLayer the GPU window's backing layer, once: a layer-hosting
+ * view, so the layer is set before wantsLayer. */
+int32_t dodo_window_metal_layer(uint32_t window, uintptr_t *out) {
+    *out = 0;
+    struct dodo_window *w = find(window);
+    if (!w) return E_CLOSED;
+    if (!w->gpu) return E_UNSUPPORTED;
+    if (!w->metal_layer) {
+        id type = cls("CAMetalLayer");
+        if (!type) return E_UNSUPPORTED;
+        void *pool = objc_autoreleasePoolPush();
+        id created = msg(msg(type, "alloc"), "init");
+        if (!created) { objc_autoreleasePoolPop(pool); return E_SYSTEM; }
+        w->metal_layer = created;
+        msg_void_id(w->view, "setLayer:", w->metal_layer);
+        msg_void_bool(w->view, "setWantsLayer:", YES);
+        update_scale(w);
+        size_metal_layer(w);
+        objc_autoreleasePoolPop(pool);
+    }
+    *out = (uintptr_t)w->metal_layer;
+    return 0;
 }
 
 /* mach_absolute_time in nanoseconds, the clock CADisplayLink uses. */
@@ -616,10 +761,11 @@ uint64_t dodo_window_clock(void) {
     return clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
 }
 
-uint64_t dodo_window_frame_period(intptr_t handle) {
-    if (!handle || !window) return 0;
-    if (link_period) return link_period;
-    id screen = msg(window, "screen");
+uint64_t dodo_window_frame_period(uint32_t window) {
+    struct dodo_window *w = find(window);
+    if (!w) return 0;
+    if (w->link_period) return w->link_period;
+    id screen = msg(w->window, "screen");
     if (screen && responds(screen, "maximumFramesPerSecond")) {
         long rate = SEND(send_long)(screen, sel("maximumFramesPerSecond"));
         if (rate > 0) return (UINT64_C(1000000000) + (uint64_t)rate / 2) / (uint64_t)rate;
@@ -627,48 +773,22 @@ uint64_t dodo_window_frame_period(intptr_t handle) {
     return 0;
 }
 
-/* The display link reports refreshes as they happen instead. */
-uint64_t dodo_window_next_vblank(intptr_t handle, uint64_t now) {
-    (void)handle; (void)now;
+/* The display links report refreshes as they happen instead. */
+uint64_t dodo_window_next_vblank(uint32_t window, uint64_t now) {
+    (void)window; (void)now;
     return 0;
 }
 
-int32_t dodo_window_request_frame(intptr_t handle) {
-    if (!handle || !window) return -E_CLOSED;
-    if (!display_link) return 0;
-    msg_void_bool(display_link, "setPaused:", NO);
+int32_t dodo_window_request_frame(uint32_t window) {
+    struct dodo_window *w = find(window);
+    if (!w) return -E_CLOSED;
+    if (!w->display_link) return 0;
+    msg_void_bool(w->display_link, "setPaused:", NO);
     return 1;
 }
 
-int32_t dodo_window_native(intptr_t handle, uintptr_t *first, uintptr_t *second) {
-    if (!handle || !window) return -E_CLOSED;
-    *first = (uintptr_t)window; *second = (uintptr_t)view;
-    return NATIVE_APPKIT;
-}
-
-/* A layer-hosting view: the CAMetalLayer is set before wantsLayer. */
-int32_t dodo_window_metal_layer(intptr_t handle, uintptr_t *out) {
-    if (!handle || !window) return E_CLOSED;
-    if (has_pixels) return E_UNSUPPORTED;
-    if (!metal_layer) {
-        id type = cls("CAMetalLayer");
-        if (!type) return E_UNSUPPORTED;
-        void *pool = objc_autoreleasePoolPush();
-        id created = msg(msg(type, "alloc"), "init");
-        if (!created) { objc_autoreleasePoolPop(pool); return E_SYSTEM; }
-        metal_layer = created;
-        msg_void_id(view, "setLayer:", metal_layer);
-        msg_void_bool(view, "setWantsLayer:", YES);
-        update_scale();
-        size_metal_layer();
-        objc_autoreleasePoolPop(pool);
-    }
-    *out = (uintptr_t)metal_layer;
-    return 0;
-}
-
-void dodo_window_set_animating(intptr_t handle, uint32_t animating) {
-    if (!handle || !window) return;
+void dodo_window_set_animating(uint32_t animating) {
+    if (!connected) return;
     if (!animating) { end_activity(); return; }
     if (activity) return;
     void *pool = objc_autoreleasePoolPush();
@@ -701,6 +821,7 @@ void dodo_window_set_animating(intptr_t handle, uint32_t animating) {
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 
+/* The one App of the process: std/window/linux keeps the connection. */
 static atomic_int claimed;
 
 int32_t dodo_window_claim(void) {
@@ -708,10 +829,6 @@ int32_t dodo_window_claim(void) {
     return atomic_compare_exchange_strong(&claimed, &expected, 1) ? 0 : E_ALREADY_OPEN;
 }
 void dodo_window_release(void) { atomic_store(&claimed, 0); }
-
-uint8_t *dodo_window_alloc(size_t bytes) { return calloc(bytes ? bytes : 4, 1); }
-void dodo_window_free(uint8_t *memory) { free(memory); }
-uint8_t *dodo_window_empty(void) { return (uint8_t *)empty_pixels; }
 
 static int connect_unix(const char *path, int abstract) {
     struct sockaddr_un address;
@@ -894,23 +1011,15 @@ uint64_t dodo_window_clock(void) {
 
 /* ------------------------------------------------------------------------ */
 #if defined(_WIN32)
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#include <windows.h>
-#include <dwmapi.h>
-
 #ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x2
 #endif
 
-static HWND hwnd;
 /* Waits shorter than the 15.6 ms system tick, for frame pacing. */
 static HANDLE wait_timer;
-static int cursor_hidden, mouse_tracking, buttons_down;
-static UINT dpi = 96;
-static WCHAR high_surrogate;
 
+/* Generated from the Key order in std/window.dodo: set-1 scan codes, with
+ * 0x80 added for extended (E0) keys, to Key ordinals. */
 /* Generated from the Key order in std/window.dodo: set-1 scan codes, with
  * 0x80 added for extended (E0) keys, to Key ordinals. */
 static const uint8_t scan_keys[256] = {
@@ -945,7 +1054,7 @@ static uint32_t current_modifiers(void) {
 
 /* Optional user32 functions of Windows 10, looked up so older systems and
  * older import libraries still work. */
-static UINT window_dpi(void) {
+static UINT window_dpi(HWND hwnd) {
     typedef UINT (WINAPI *dpi_for_window)(HWND);
     static dpi_for_window lookup;
     static int resolved;
@@ -972,22 +1081,47 @@ static WCHAR *wide_from(const uint8_t *text, size_t length) {
     return wide;
 }
 
-static void blit(HDC dc, int32_t x, int32_t y, uint32_t width, uint32_t height) {
+/* Copy part of the attached buffer to the window, clipped to the buffer. */
+static void blit(struct dodo_window *w, HDC dc, int32_t x, int32_t y, uint32_t width, uint32_t height) {
+    if (!w->pixels || x < 0 || y < 0 || (uint32_t)x >= w->pixel_width || (uint32_t)y >= w->pixel_height) return;
+    if (width > w->pixel_width - (uint32_t)x) width = w->pixel_width - (uint32_t)x;
+    if (height > w->pixel_height - (uint32_t)y) height = w->pixel_height - (uint32_t)y;
     /* A top-down DIB starting at row y avoids the ambiguous source origin
      * of partial top-down transfers. */
     BITMAPINFO info;
     memset(&info, 0, sizeof(info));
     info.bmiHeader.biSize = sizeof(info.bmiHeader);
-    info.bmiHeader.biWidth = (LONG)pixel_width;
+    info.bmiHeader.biWidth = (LONG)w->pixel_width;
     info.bmiHeader.biHeight = -(LONG)height;
     info.bmiHeader.biPlanes = 1;
     info.bmiHeader.biBitCount = 32;
     info.bmiHeader.biCompression = BI_RGB;
     StretchDIBits(dc, x, y, (int)width, (int)height, x, 0, (int)width, (int)height,
-        pixels + (size_t)y * pixel_width * 4, &info, DIB_RGB_COLORS, SRCCOPY);
+        w->pixels + (size_t)y * w->pixel_width * 4, &info, DIB_RGB_COLORS, SRCCOPY);
 }
 
-static void button(UINT message, WPARAM wparam, LPARAM lparam) {
+/* Repaint from the buffer; until the program draws at a new size, the part
+ * of the window beyond the buffer is black. A GPU window is left to its
+ * program, which draws over GDI. */
+static void paint(struct dodo_window *w, HDC dc) {
+    if (w->gpu) return;
+    RECT client;
+    GetClientRect(w->hwnd, &client);
+    LONG covered_width = w->pixels ? (LONG)w->pixel_width : 0;
+    LONG covered_height = w->pixels ? (LONG)w->pixel_height : 0;
+    if (covered_width && covered_height) blit(w, dc, 0, 0, w->pixel_width, w->pixel_height);
+    HBRUSH black = (HBRUSH)GetStockObject(BLACK_BRUSH);
+    if (client.right > covered_width) {
+        RECT right = { covered_width, 0, client.right, client.bottom };
+        FillRect(dc, &right, black);
+    }
+    if (client.bottom > covered_height) {
+        RECT bottom = { 0, covered_height, covered_width < client.right ? covered_width : client.right, client.bottom };
+        FillRect(dc, &bottom, black);
+    }
+}
+
+static void button(struct dodo_window *w, UINT message, WPARAM wparam, LPARAM lparam) {
     uint32_t code, down;
     switch (message) {
     case WM_LBUTTONDOWN: code = 0; down = 1; break;
@@ -1000,39 +1134,48 @@ static void button(UINT message, WPARAM wparam, LPARAM lparam) {
     default: code = HIWORD(wparam) == XBUTTON1 ? 3 : 4; down = 0; break;
     }
     /* Keep receiving the release when it happens outside the window. */
-    if (down) { if (!buttons_down++) SetCapture(hwnd); }
-    else if (buttons_down && !--buttons_down) ReleaseCapture();
-    push(EV_BUTTON, code, current_modifiers(), down ? F_PRESSED : 0,
+    if (down) { if (!w->buttons_down++) SetCapture(w->hwnd); }
+    else if (w->buttons_down && !--w->buttons_down) ReleaseCapture();
+    push(w->id, EV_BUTTON, code, current_modifiers(), down ? F_PRESSED : 0,
         (int32_t)(short)LOWORD(lparam), (int32_t)(short)HIWORD(lparam));
 }
 
-static LRESULT CALLBACK procedure(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
+static LRESULT CALLBACK procedure(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
+    if (message == WM_NCCREATE) {
+        /* The record arrives with the creation parameters. */
+        struct dodo_window *created = (struct dodo_window *)((CREATESTRUCTW *)lparam)->lpCreateParams;
+        if (created) created->hwnd = hwnd;
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)created);
+    }
+    struct dodo_window *w = (struct dodo_window *)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+    if (!w) return DefWindowProcW(hwnd, message, wparam, lparam);
     switch (message) {
     case WM_CLOSE:
-        push(EV_CLOSE, 0, 0, 0, 0, 0);
+        push(w->id, EV_CLOSE, 0, 0, 0, 0, 0);
         return 0;
     case WM_SIZE:
         if (wparam != SIZE_MINIMIZED) {
             uint32_t width = LOWORD(lparam), height = HIWORD(lparam);
-            if (width != pixel_width || height != pixel_height) {
-                if (resize_buffer(width, height) == 0) push(EV_RESIZE, 0, 0, 0, (int32_t)width, (int32_t)height);
+            if (width != w->width || height != w->height) {
+                w->width = width; w->height = height;
+                push(w->id, EV_RESIZE, 0, 0, 0, (int32_t)width, (int32_t)height);
             }
         }
         return 0;
     case WM_ERASEBKGND:
         return 1;
     case WM_PAINT: {
-        PAINTSTRUCT paint;
-        HDC dc = BeginPaint(window, &paint);
-        if (pixels && pixel_width && pixel_height) blit(dc, 0, 0, pixel_width, pixel_height);
-        EndPaint(window, &paint);
+        PAINTSTRUCT paint_info;
+        HDC dc = BeginPaint(hwnd, &paint_info);
+        paint(w, dc);
+        EndPaint(hwnd, &paint_info);
         return 0;
     }
     case WM_SETFOCUS:
-        push(EV_FOCUS, 0, 0, F_PRESSED, 0, 0);
+        push(w->id, EV_FOCUS, 0, 0, F_PRESSED, 0, 0);
         return 0;
     case WM_KILLFOCUS:
-        push(EV_FOCUS, 0, 0, 0, 0, 0);
+        push(w->id, EV_FOCUS, 0, 0, 0, 0, 0);
         return 0;
     case WM_KEYDOWN: case WM_SYSKEYDOWN: case WM_KEYUP: case WM_SYSKEYUP: {
         int down = message == WM_KEYDOWN || message == WM_SYSKEYDOWN;
@@ -1042,7 +1185,7 @@ static LRESULT CALLBACK procedure(HWND window, UINT message, WPARAM wparam, LPAR
         if (wparam == VK_NUMLOCK) key = KEY_NUM_LOCK;
         uint32_t state = down ? F_PRESSED : 0;
         if (down && (lparam & (1 << 30))) state |= F_REPEAT;
-        push(EV_KEY, key, current_modifiers(), state, 0, 0);
+        push(w->id, EV_KEY, key, current_modifiers(), state, 0, 0);
         /* Alt-F4 still closes through the default handling; other system
          * keys would enter the menu loop. */
         if (message == WM_SYSKEYDOWN && wparam == VK_F4) break;
@@ -1050,73 +1193,61 @@ static LRESULT CALLBACK procedure(HWND window, UINT message, WPARAM wparam, LPAR
     }
     case WM_CHAR: {
         WCHAR unit = (WCHAR)wparam;
-        if (unit >= 0xd800 && unit <= 0xdbff) { high_surrogate = unit; return 0; }
+        if (unit >= 0xd800 && unit <= 0xdbff) { w->high_surrogate = unit; return 0; }
         if (unit >= 0xdc00 && unit <= 0xdfff) {
-            if (high_surrogate) push_text(0x10000 + (((uint32_t)high_surrogate - 0xd800) << 10) + (unit - 0xdc00));
-            high_surrogate = 0;
+            if (w->high_surrogate) push_text(w->id, 0x10000 + (((uint32_t)w->high_surrogate - 0xd800) << 10) + (unit - 0xdc00));
+            w->high_surrogate = 0;
             return 0;
         }
-        high_surrogate = 0;
-        push_text(unit);
+        w->high_surrogate = 0;
+        push_text(w->id, unit);
         return 0;
     }
     case WM_SYSCHAR:
         return 0;
     case WM_MOUSEMOVE:
-        if (!mouse_tracking) {
-            TRACKMOUSEEVENT track = { sizeof(track), TME_LEAVE, window, 0 };
-            mouse_tracking = TrackMouseEvent(&track) ? 1 : 0;
+        if (!w->mouse_tracking) {
+            TRACKMOUSEEVENT track = { sizeof(track), TME_LEAVE, hwnd, 0 };
+            w->mouse_tracking = TrackMouseEvent(&track) ? 1 : 0;
         }
-        push(EV_MOVE, 0, current_modifiers(), 0, (int32_t)(short)LOWORD(lparam), (int32_t)(short)HIWORD(lparam));
+        push(w->id, EV_MOVE, 0, current_modifiers(), 0, (int32_t)(short)LOWORD(lparam), (int32_t)(short)HIWORD(lparam));
         return 0;
     case WM_MOUSELEAVE:
-        mouse_tracking = 0;
-        push(EV_LEAVE, 0, 0, 0, 0, 0);
+        w->mouse_tracking = 0;
+        push(w->id, EV_LEAVE, 0, 0, 0, 0, 0);
         return 0;
     case WM_LBUTTONDOWN: case WM_LBUTTONUP: case WM_MBUTTONDOWN: case WM_MBUTTONUP:
     case WM_RBUTTONDOWN: case WM_RBUTTONUP:
-        button(message, wparam, lparam);
+        button(w, message, wparam, lparam);
         return 0;
     case WM_XBUTTONDOWN: case WM_XBUTTONUP:
-        button(message, wparam, lparam);
+        button(w, message, wparam, lparam);
         return TRUE;
     case WM_MOUSEWHEEL:
-        push(EV_SCROLL, 0, current_modifiers(), 0, 0, -(int32_t)GET_WHEEL_DELTA_WPARAM(wparam));
+        push(w->id, EV_SCROLL, 0, current_modifiers(), 0, 0, -(int32_t)GET_WHEEL_DELTA_WPARAM(wparam));
         return 0;
     case WM_MOUSEHWHEEL:
-        push(EV_SCROLL, 0, current_modifiers(), 0, (int32_t)GET_WHEEL_DELTA_WPARAM(wparam), 0);
+        push(w->id, EV_SCROLL, 0, current_modifiers(), 0, (int32_t)GET_WHEEL_DELTA_WPARAM(wparam), 0);
         return 0;
     case 0x02E0: { /* WM_DPICHANGED: take the size Windows suggests. */
         const RECT *suggested = (const RECT *)lparam;
-        dpi = HIWORD(wparam);
-        SetWindowPos(window, NULL, suggested->left, suggested->top, suggested->right - suggested->left,
+        w->dpi = HIWORD(wparam);
+        SetWindowPos(hwnd, NULL, suggested->left, suggested->top, suggested->right - suggested->left,
             suggested->bottom - suggested->top, SWP_NOZORDER | SWP_NOACTIVATE);
         return 0;
     }
     case WM_SETCURSOR:
-        if (cursor_hidden && LOWORD(lparam) == HTCLIENT) { SetCursor(NULL); return TRUE; }
+        if (w->cursor_hidden && LOWORD(lparam) == HTCLIENT) { SetCursor(NULL); return TRUE; }
         break;
     default:
         break;
     }
-    return DefWindowProcW(window, message, wparam, lparam);
+    return DefWindowProcW(hwnd, message, wparam, lparam);
 }
 
-/* Sizes at open are only the initial layout, not a resize. */
-static void drop_resizes(void) {
-    struct dodo_window_event kept[QUEUE];
-    unsigned count = 0;
-    struct dodo_window_event event;
-    while (pop(&event)) if (event.kind != EV_RESIZE) kept[count++] = event;
-    for (unsigned i = 0; i < count; ++i) push(kept[i].kind, kept[i].code, kept[i].modifiers, kept[i].flags, kept[i].x, kept[i].y);
-}
-
-int32_t dodo_window_open(const uint8_t *title, size_t title_length, uint32_t width, uint32_t height, uint32_t flags, intptr_t *handle) {
+int32_t dodo_window_connect(void) {
     static ATOM registered;
-    if (hwnd) return E_ALREADY_OPEN;
-    int resizable = (flags & O_RESIZABLE) != 0;
-    has_pixels = (flags & O_PIXEL_BUFFER) != 0;
-    HINSTANCE instance = GetModuleHandleW(NULL);
+    if (connected) return E_ALREADY_OPEN;
     if (!registered) {
         become_dpi_aware();
         WNDCLASSEXW type;
@@ -1124,39 +1255,80 @@ int32_t dodo_window_open(const uint8_t *title, size_t title_length, uint32_t wid
         type.cbSize = sizeof(type);
         type.style = CS_OWNDC;
         type.lpfnWndProc = procedure;
-        type.hInstance = instance;
+        type.hInstance = GetModuleHandleW(NULL);
         type.hCursor = LoadCursorW(NULL, (LPCWSTR)IDC_ARROW);
         type.hIcon = LoadIconW(NULL, (LPCWSTR)IDI_APPLICATION);
         type.lpszClassName = L"DodoWindow";
         registered = RegisterClassExW(&type);
         if (!registered) return E_SYSTEM;
     }
+    connected = 1;
+    queue_head = queue_count = 0;
+    return 0;
+}
+
+/* Remove a window from the screen and the list, with its queued events. */
+static void destroy_window(struct dodo_window *w) {
+    unlink_window(w);
+    if (w->buttons_down) ReleaseCapture();
+    /* Messages sent while it is destroyed no longer find the record. */
+    SetWindowLongPtrW(w->hwnd, GWLP_USERDATA, 0);
+    DestroyWindow(w->hwnd);
+    purge(w->id, 0);
+    free(w);
+}
+
+void dodo_window_disconnect(void) {
+    if (!connected) return;
+    while (windows) destroy_window(windows);
+    if (wait_timer) { CloseHandle(wait_timer); wait_timer = NULL; }
+    queue_head = queue_count = 0;
+    connected = 0;
+}
+
+int32_t dodo_window_open(const uint8_t *title, size_t title_length, uint32_t width, uint32_t height, uint32_t flags, uint32_t *handle) {
+    if (!connected) return E_CLOSED;
+    int resizable = (flags & O_RESIZABLE) != 0;
     WCHAR *text = wide_from(title, title_length);
     if (!text) return E_MEMORY;
+    struct dodo_window *w = new_window();
+    if (!w) { free(text); return E_MEMORY; }
+    w->gpu = (flags & O_PIXEL_BUFFER) == 0;
     DWORD style = WS_OVERLAPPEDWINDOW;
     if (!resizable) style &= ~(DWORD)(WS_THICKFRAME | WS_MAXIMIZEBOX);
-    hwnd = CreateWindowExW(0, L"DodoWindow", text, style, CW_USEDEFAULT, CW_USEDEFAULT,
-        (int)width, (int)height, NULL, NULL, instance, NULL);
+    HWND hwnd = CreateWindowExW(0, L"DodoWindow", text, style, CW_USEDEFAULT, CW_USEDEFAULT,
+        (int)width, (int)height, NULL, NULL, GetModuleHandleW(NULL), w);
     free(text);
     if (!hwnd) {
+        DWORD error = GetLastError();
+        purge(w->id, 0);
+        free(w);
         /* Services and other sessions without a desktop cannot create windows. */
-        return GetLastError() == ERROR_ACCESS_DENIED ? E_NO_DISPLAY : E_SYSTEM;
+        return error == ERROR_ACCESS_DENIED ? E_NO_DISPLAY : E_SYSTEM;
     }
+    w->hwnd = hwnd;
     /* Options are in units of the system scale; the drawing area is in pixels. */
-    dpi = window_dpi();
-    RECT frame = { 0, 0, (LONG)MulDiv((int)width, (int)dpi, 96), (LONG)MulDiv((int)height, (int)dpi, 96) };
+    w->dpi = window_dpi(hwnd);
+    RECT frame = { 0, 0, (LONG)MulDiv((int)width, (int)w->dpi, 96), (LONG)MulDiv((int)height, (int)w->dpi, 96) };
     AdjustWindowRectEx(&frame, style, FALSE, 0);
     SetWindowPos(hwnd, NULL, 0, 0, frame.right - frame.left, frame.bottom - frame.top, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
     RECT client;
     GetClientRect(hwnd, &client);
-    int code = resize_buffer((uint32_t)(client.right - client.left), (uint32_t)(client.bottom - client.top));
-    if (code) { DestroyWindow(hwnd); hwnd = NULL; return code; }
+    w->width = (uint32_t)(client.right - client.left);
+    w->height = (uint32_t)(client.bottom - client.top);
+    link_window(w);
     ShowWindow(hwnd, SW_SHOWDEFAULT);
     UpdateWindow(hwnd);
     SetForegroundWindow(hwnd);
-    drop_resizes();
-    *handle = 1;
+    /* Sizes at open are only the initial layout, not a resize. */
+    purge(w->id, EV_RESIZE);
+    *handle = w->id;
     return 0;
+}
+
+void dodo_window_close(uint32_t window) {
+    struct dodo_window *w = find(window);
+    if (w) destroy_window(w);
 }
 
 /* The performance counter in nanoseconds, the compositor's clock. */
@@ -1210,8 +1382,8 @@ static int composition_timing(uint64_t *period, uint64_t *vblank) {
     return *period != 0;
 }
 
-uint64_t dodo_window_frame_period(intptr_t handle) {
-    if (!handle || !hwnd) return 0;
+uint64_t dodo_window_frame_period(uint32_t window) {
+    if (!find(window)) return 0;
     uint64_t period, vblank;
     if (composition_timing(&period, &vblank)) return period;
     DEVMODEW mode;
@@ -1223,8 +1395,8 @@ uint64_t dodo_window_frame_period(intptr_t handle) {
     return 0;
 }
 
-uint64_t dodo_window_next_vblank(intptr_t handle, uint64_t now) {
-    if (!handle || !hwnd) return 0;
+uint64_t dodo_window_next_vblank(uint32_t window, uint64_t now) {
+    if (!find(window)) return 0;
     uint64_t period, vblank;
     if (!composition_timing(&period, &vblank)) return 0;
     if (vblank > now) return vblank;
@@ -1233,31 +1405,16 @@ uint64_t dodo_window_next_vblank(intptr_t handle, uint64_t now) {
 
 /* DwmFlush would block input until the compositor's next frame, so Windows
  * paces by the refresh times of next_vblank instead of FRAME events. */
-int32_t dodo_window_request_frame(intptr_t handle) {
-    return !handle || !hwnd ? -E_CLOSED : 0;
+int32_t dodo_window_request_frame(uint32_t window) {
+    return find(window) ? 0 : -E_CLOSED;
 }
 
-void dodo_window_set_animating(intptr_t handle, uint32_t animating) {
-    (void)handle; (void)animating;
+void dodo_window_set_animating(uint32_t animating) {
+    (void)animating;
 }
 
-void dodo_window_close(intptr_t handle) {
-    if (!handle || !hwnd) return;
-    if (buttons_down) ReleaseCapture();
-    if (wait_timer) { CloseHandle(wait_timer); wait_timer = NULL; }
-    DestroyWindow(hwnd);
-    hwnd = NULL;
-    MSG message;
-    while (PeekMessageW(&message, NULL, 0, 0, PM_REMOVE)) DispatchMessageW(&message);
-    cursor_hidden = mouse_tracking = buttons_down = 0;
-    high_surrogate = 0;
-    queue_head = queue_count = 0;
-    free_buffer();
-    has_pixels = 0;
-}
-
-int32_t dodo_window_next_event(intptr_t handle, uint32_t milliseconds, struct dodo_window_event *event) {
-    if (!handle || !hwnd) return -E_CLOSED;
+int32_t dodo_window_next_event(uint32_t milliseconds, struct dodo_window_event *event) {
+    if (!connected) return -E_CLOSED;
     uint64_t start = dodo_window_clock();
     for (;;) {
         if (pop(event)) return 1;
@@ -1277,50 +1434,56 @@ int32_t dodo_window_next_event(intptr_t handle, uint32_t milliseconds, struct do
     }
 }
 
-int32_t dodo_window_present(intptr_t handle, int32_t x, int32_t y, uint32_t width, uint32_t height) {
-    if (!handle || !hwnd) return E_CLOSED;
-    if (!pixels) return E_UNSUPPORTED;
-    if (!pixel_width || !pixel_height) return 0;
-    HDC dc = GetDC(hwnd);
+int32_t dodo_window_present(uint32_t window, int32_t x, int32_t y, uint32_t width, uint32_t height) {
+    struct dodo_window *w = find(window);
+    if (!w) return E_CLOSED;
+    if (w->gpu) return E_UNSUPPORTED;
+    if (!w->pixels || !w->pixel_width || !w->pixel_height) return 0;
+    HDC dc = GetDC(w->hwnd);
     if (!dc) return E_SYSTEM;
-    blit(dc, x, y, width, height);
-    ReleaseDC(hwnd, dc);
+    blit(w, dc, x, y, width, height);
+    ReleaseDC(w->hwnd, dc);
     return 0;
 }
 
-int32_t dodo_window_set_title(intptr_t handle, const uint8_t *title, size_t title_length) {
-    if (!handle || !hwnd) return E_CLOSED;
+int32_t dodo_window_set_title(uint32_t window, const uint8_t *title, size_t title_length) {
+    struct dodo_window *w = find(window);
+    if (!w) return E_CLOSED;
     WCHAR *text = wide_from(title, title_length);
     if (!text) return E_MEMORY;
-    BOOL done = SetWindowTextW(hwnd, text);
+    BOOL done = SetWindowTextW(w->hwnd, text);
     free(text);
     return done ? 0 : E_SYSTEM;
 }
 
-int32_t dodo_window_set_cursor_visible(intptr_t handle, uint32_t visible) {
-    if (!handle || !hwnd) return E_CLOSED;
-    cursor_hidden = !visible;
+int32_t dodo_window_set_cursor_visible(uint32_t window, uint32_t visible) {
+    struct dodo_window *w = find(window);
+    if (!w) return E_CLOSED;
+    w->cursor_hidden = !visible;
     POINT point;
     RECT client;
-    if (GetCursorPos(&point) && ScreenToClient(hwnd, &point) && GetClientRect(hwnd, &client) && PtInRect(&client, point))
+    if (GetCursorPos(&point) && ScreenToClient(w->hwnd, &point) && GetClientRect(w->hwnd, &client) && PtInRect(&client, point))
         SetCursor(visible ? LoadCursorW(NULL, (LPCWSTR)IDC_ARROW) : NULL);
     return 0;
 }
 
-uint32_t dodo_window_scale_percent(intptr_t handle) {
-    if (!handle || !hwnd) return 100;
-    return (uint32_t)MulDiv((int)dpi, 100, 96);
+uint32_t dodo_window_scale_percent(uint32_t window) {
+    struct dodo_window *w = find(window);
+    if (!w) return 100;
+    return (uint32_t)MulDiv((int)w->dpi, 100, 96);
 }
 
-int32_t dodo_window_native(intptr_t handle, uintptr_t *first, uintptr_t *second) {
-    if (!handle || !hwnd) return -E_CLOSED;
-    *first = (uintptr_t)hwnd; *second = (uintptr_t)GetModuleHandleW(NULL);
+/* The HWND and the module that registered its class; negative error codes. */
+int32_t dodo_window_native(uint32_t window, uintptr_t *first, uintptr_t *second) {
+    struct dodo_window *w = find(window);
+    if (!w) return -E_CLOSED;
+    *first = (uintptr_t)w->hwnd; *second = (uintptr_t)GetModuleHandleW(NULL);
     return NATIVE_WIN32;
 }
 
 /* Metal layers are macOS only. */
-int32_t dodo_window_metal_layer(intptr_t handle, uintptr_t *out) {
+int32_t dodo_window_metal_layer(uint32_t window, uintptr_t *out) {
     *out = 0;
-    return !handle || !hwnd ? E_CLOSED : E_UNSUPPORTED;
+    return find(window) ? E_UNSUPPORTED : E_CLOSED;
 }
 #endif

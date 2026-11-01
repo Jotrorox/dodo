@@ -18,16 +18,9 @@ import "std/window/handle"
 // already loaded AppKit, which provides NSOpenGLContext.
 
 unsafe extern "C" fn dlopen(path: *const u8, mode: i32) -> *mut u8
-// Declared as std/dylib and std/gpu/metal declare it, so programs using
-// them together link one symbol.
-@link_name("dlsym")
-unsafe extern "C" fn dlsym_pointer(handle: *mut u8, name: *const u8) -> *mut u8
-
-unsafe fn dlsym(handle: *mut u8, name: *const u8) -> usize {
-    unsafe {
-        return dlsym_pointer(handle, name) as usize
-    }
-}
+// Declared with the pointer result std/dylib and std/gpu/metal use, as one
+// program may load all three: a symbol has a single C signature.
+unsafe extern "C" fn dlsym(handle: *mut u8, name: *const u8) -> *mut u8
 unsafe extern "C" fn dlclose(handle: *mut u8) -> i32
 
 const RTLD_NOW: i32 = 2
@@ -76,7 +69,7 @@ fn null() -> *mut u8 {
 
 unsafe fn symbol(library: *mut u8, name: &[u8]) -> usize {
     unsafe {
-        return dlsym(library, common.c_string(name))
+        return dlsym(library, common.c_string(name)) as usize
     }
 }
 
@@ -451,7 +444,7 @@ pub struct Backend {
     // command it implements.
     pub fn resolve(&self, name: *const u8) -> usize {
         return unsafe {
-            dlsym(self.library, name)
+            dlsym(self.library, name) as usize
         }
     }
 

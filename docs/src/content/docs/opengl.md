@@ -10,7 +10,8 @@ window or without one, and offscreen render targets.
 `std/gpu/opengl/gl` is the raw OpenGL binding: every enum and command of the
 OpenGL 4.6 core profile, generated from the Khronos registry. Both are written
 in Dodo. Nothing is linked at build time: each operating system's own OpenGL
-interface is opened when a context is created.
+interface is opened when a context is created. The portable
+[std/gpu](gpu.md) uses OpenGL 4.5 where Vulkan is missing.
 
 | System | Interface | Loaded at run time | Highest version |
 | --- | --- | --- | --- |
@@ -86,19 +87,20 @@ draws into a window. `native` is the window's
 `window.Options.gpu()` has no pixel buffer to keep alongside:
 
 ```dodo
-win := window.open(window.Options.gpu("OpenGL", 480, 320))?
+app := window.App.new()?
+win := app.open(window.Options.gpu("OpenGL", 480, 320))?
 native := win.native_handle()?
 context := opengl.Context.create_for_window(&native, opengl.Options.default())?
+win.request_frame()?
 for {
-    match win.wait_event_until_frame()? {
-        some(window.Event.Close) => {
+    match app.wait_event()? {
+        window.Event.Close(_) | window.Event.Quit => {
             return ok()
         }
-        some(window.Event.Resize(_, _)) => {
+        window.Event.Resize(_, _, _) => {
             context.update_surface()
         }
-        some(_) => {}
-        none => {
+        window.Event.Frame(_) => {
             unsafe {
                 gl.bind_framebuffer(gl.FRAMEBUFFER, 0)
                 gl.viewport(0, 0, win.width() as i32, win.height() as i32)
@@ -107,7 +109,9 @@ for {
                 // ... draw ...
             }
             context.swap_buffers()?
+            win.request_frame()?
         }
+        _ => {}
     }
 }
 ```

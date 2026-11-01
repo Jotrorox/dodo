@@ -1,0 +1,449 @@
+diff --git a/src/bus/ppb.rs b/src/bus/ppb.rs
+index b3dc7c8..e594116 100644
+--- a/src/bus/ppb.rs
++++ b/src/bus/ppb.rs
+@@ -708,7 +708,11 @@ impl Ppb {
+     pub fn any_pending_enabled(&self, pending: u64) -> bool {
+         let iser = self.nvic_iser[0].load(Ordering::Acquire) as u64
+             | (self.nvic_iser[1].load(Ordering::Acquire) as u64) << 32;
+-        (pending & iser) != 0
++        // Interrupts pended through NVIC_ISPR (by software, or merged from
++        // the peripherals already) wake WFI too, even with PRIMASK set.
++        let ispr = self.nvic_ispr[0].load(Ordering::Acquire) as u64
++            | (self.nvic_ispr[1].load(Ordering::Acquire) as u64) << 32;
++        ((pending | ispr) & iser) != 0
+     }
+ 
+     /// Set an external IRQ's active bit. Called by exception entry.
+diff --git a/src/core/decode.rs b/src/core/decode.rs
+index 42a5356..a8233e0 100644
+--- a/src/core/decode.rs
++++ b/src/core/decode.rs
+@@ -298,6 +298,9 @@ impl CortexM33 {
+             0xE // AL (always)
+         };
+         let cond_passed = self.regs.condition_passed(cond);
++        // The running exception: an instruction that returns from it (or
++        // enters another) changes IPSR.
++        let ipsr = self.regs.ipsr();
+ 
+         if is_pure {
+             // Fast path: neither the fetch (handled by the cache) nor
+@@ -313,7 +316,9 @@ impl CortexM33 {
+                 } else {
+                     1
+                 };
+-                if in_it {
++                // An exception return (or entry) restored or reset the IT
++                // state; it is not this block's to advance.
++                if in_it && self.regs.ipsr() == ipsr {
+                     self.advance_it_state();
+                 }
+                 c
+@@ -331,10 +336,13 @@ impl CortexM33 {
+                 };
+                 // Flag-only suppression in IT blocks — same logic as the
+                 // slow path, but using the pre-computed `flag_only` bit.
+-                if in_it && cond_passed && !flag_only {
++                // A BX that returned from an exception restored the flags
++                // and IT state from the stacked xPSR: keep them.
++                let same_context = self.regs.ipsr() == ipsr;
++                if in_it && cond_passed && !flag_only && same_context {
+                     self.regs.xpsr = (self.regs.xpsr & !0xF800_0000) | saved_flags;
+                 }
+-                if in_it {
++                if in_it && same_context {
+                     self.advance_it_state();
+                 }
+                 c
+@@ -375,7 +383,7 @@ impl CortexM33 {
+                 } else {
+                     1
+                 };
+-                if in_it {
++                if in_it && self.regs.ipsr() == ipsr {
+                     self.advance_it_state();
+                 }
+                 cycles + bus.extra_wait_states()
+@@ -391,10 +399,11 @@ impl CortexM33 {
+                 } else {
+                     1
+                 };
+-                if in_it && cond_passed && !flag_only {
++                let same_context = self.regs.ipsr() == ipsr;
++                if in_it && cond_passed && !flag_only && same_context {
+                     self.regs.xpsr = (self.regs.xpsr & !0xF800_0000) | saved_flags;
+                 }
+-                if in_it {
++                if in_it && same_context {
+                     self.advance_it_state();
+                 }
+                 cycles + bus.extra_wait_states()
+diff --git a/src/core/execute.rs b/src/core/execute.rs
+index 85dc6ea..84098c8 100644
+--- a/src/core/execute.rs
++++ b/src/core/execute.rs
+@@ -785,8 +785,9 @@ impl CortexM33 {
+             0b0110 => {
+                 // CPS: CPSIE/CPSID — affects PRIMASK/FAULTMASK
+                 let im = ((opcode >> 4) & 1) as u32;
+-                let affect_i = opcode & (1 << 0) != 0; // bit 0 = I (PRIMASK)
+-                let affect_f = opcode & (1 << 1) != 0; // bit 1 = F (FAULTMASK)
++                // T1 encoding: 1011 0110 011 im 0 0 I F (cpsid i is 0xB672).
++                let affect_i = opcode & (1 << 1) != 0; // bit 1 = I (PRIMASK)
++                let affect_f = opcode & (1 << 0) != 0; // bit 0 = F (FAULTMASK)
+                 if affect_i {
+                     self.regs.primask = im;
+                 }
+diff --git a/src/core/execute_thumb32.rs b/src/core/execute_thumb32.rs
+index b7d691a..3f6f2e6 100644
+--- a/src/core/execute_thumb32.rs
++++ b/src/core/execute_thumb32.rs
+@@ -775,6 +775,52 @@ impl CortexM33 {
+             return 4;
+         }
+ 
++        // Load-acquire / store-release (ARMv8-M), with their exclusive
++        // forms: hw0 = 0xE8Dx (load) or 0xE8Cx (store), hw1 = Rt 1111 op Rd.
++        //   op 1000 / 1001 / 1010: LDAB LDAH LDA, STLB STLH STL (Rd = 1111)
++        //   op 1100 / 1101 / 1110: LDAEXB LDAEXH LDAEX, STLEXB STLEXH STLEX
++        // The emulator's accesses are already ordered, so the barrier
++        // semantics need nothing more.
++        if hw0 & 0xFFE0 == 0xE8C0 && (hw1 >> 8) & 0xF == 0xF && (hw1 >> 7) & 1 == 1 {
++            let load = hw0 & 0x10 != 0;
++            let rn = (hw0 & 0xF) as usize;
++            let rt = ((hw1 >> 12) & 0xF) as usize;
++            let rd = (hw1 & 0xF) as usize;
++            let op = (hw1 >> 4) & 0xF;
++            let exclusive = op & 0x4 != 0;
++            let size = op & 0x3;
++            if size == 3 {
++                return self.thumb32_undefined(hw0, hw1, bus);
++            }
++            let addr = self.regs.r[rn];
++            if load {
++                self.regs.r[rt] = match size {
++                    0 => self.bus_read8(addr, bus) as u32,
++                    1 => self.bus_read16(addr, bus) as u32,
++                    _ => self.bus_read32(addr, bus),
++                };
++                if exclusive {
++                    self.exclusive_address = Some(addr & !3);
++                }
++                return 2;
++            }
++            if exclusive && self.exclusive_address != Some(addr & !3) {
++                self.regs.r[rd] = 1;
++                self.exclusive_address = None;
++                return 2;
++            }
++            match size {
++                0 => self.bus_write8(addr, self.regs.r[rt] as u8, bus),
++                1 => self.bus_write16(addr, self.regs.r[rt] as u16, bus),
++                _ => self.bus_write32(addr, self.regs.r[rt], bus),
++            }
++            if exclusive {
++                self.regs.r[rd] = 0;
++                self.exclusive_address = None;
++            }
++            return 2;
++        }
++
+         // LDREX: hw0 = 1110_1000_0101_Rn (0xE85x)
+         // STREX: hw0 = 1110_1000_0100_Rn (0xE84x)
+         // Phase 0b.2: address-based exclusive monitor per ARMv8-M §A3.4.
+diff --git a/src/core/mod.rs b/src/core/mod.rs
+index d7861a3..09be371 100644
+--- a/src/core/mod.rs
++++ b/src/core/mod.rs
+@@ -797,7 +797,11 @@ impl CortexM33 {
+     pub(crate) fn bus_read32<B: CoreBus>(&mut self, addr: u32, bus: &mut B) -> u32 {
+         self.counters.classify_access(addr, false);
+         if addr >> 28 == 0xE && !Bus::is_boot_ram(addr) {
+-            let val = self.ppb.read32(addr);
++            let mut val = self.ppb.read32(addr);
++            if addr & 0xFFFF == 0xED04 {
++                // ICSR.VECTACTIVE: the active exception number, as in IPSR.
++                val = (val & !0x1FF) | self.regs.ipsr();
++            }
+             if bus.mmio_trace_enabled() {
+                 bus.emit_mmio_trace('R', 4, addr, val, self.core_id);
+             }
+diff --git a/src/lib.rs b/src/lib.rs
+index 5c10c34..bd1abb2 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -749,6 +749,33 @@ impl Emulator {
+             Cores::RiscV(cs) => step_pair_riscv(cs, &mut self.bus, target),
+         }
+ 
++        // PSM FRCE_OFF.PROC1: core 1 stops while firmware holds it in
++        // reset, and restarts from the boot ROM's reset vector when
++        // released, as multicore launch code expects.
++        if let Some(held) = self.bus.psm.take_proc1_reset()
++            && let Cores::Arm(arm) = &mut self.cores
++        {
++            if held {
++                self.bus.atomics.set_halted(1);
++            } else {
++                let (hook_s, hook_ns) =
++                    (arm[0].bootrom_reboot_hook_pc_s, arm[0].bootrom_reboot_hook_pc_ns);
++                let initial_sp = self.bus.memory.rom_read32(0);
++                let reset_vector = self.bus.memory.rom_read32(4);
++                let cycles = arm[0].cycles;
++                arm[1] = CortexM33::new(1, Arc::clone(&self.bus.atomics));
++                arm[1].regs.msp = initial_sp;
++                arm[1].regs.r[13] = initial_sp;
++                arm[1].regs.set_pc(reset_vector & !1);
++                arm[1].regs.xpsr = 1 << 24;
++                arm[1].bootrom_reboot_hook_pc_s = hook_s;
++                arm[1].bootrom_reboot_hook_pc_ns = hook_ns;
++                arm[1].cycles = cycles;
++                self.bus.atomics.clear_wfe_waiting(1);
++                self.bus.atomics.clear_halted(1);
++            }
++        }
++
+         // Drain bootrom-hook latches into `shutdown_requested` (HLD V5
+         // §"Component 3"). The hook check inside
+         // `CortexM33::step{,_no_atomics}` halts the core and sets
+@@ -773,6 +800,12 @@ impl Emulator {
+         // the ARMv8-M dual-core contention model is disabled here
+         // (CLAUDE.md "Bank contention model").
+         self.tick_peripherals(self.step_quantum);
++        // Each core's SIO_IRQ_FIFO follows its FIFO end, level-sensitive.
++        for core in 0..2 {
++            if self.bus.sio.fifo_irq_level(core) {
++                self.bus.assert_irq_core(core, crate::irq::IRQ_SIO_IRQ_FIFO);
++            }
++        }
+         // RISC-V has no SysTick — the SysTick block lives on the M33 PPB.
+         if self.cores.is_arm() {
+             self.tick_systick();
+@@ -1155,7 +1188,7 @@ impl Emulator {
+                     // merge via `take_irq_pending`.
+                     if self.bus.atomics.is_halted(i) {
+                         let pending = self.bus.atomics.irq_pending_load(i);
+-                        if pending != 0 && arm[i].ppb.any_pending_enabled(pending) {
++                        if arm[i].ppb.any_pending_enabled(pending) {
+                             self.bus.atomics.clear_halted(i);
+                         }
+                     }
+diff --git a/src/peripherals/psm.rs b/src/peripherals/psm.rs
+index 34bcf57..a3fb496 100644
+--- a/src/peripherals/psm.rs
++++ b/src/peripherals/psm.rs
+@@ -36,11 +36,18 @@ const FRCE_OFF_OFFSET: u32 = 0x04;
+ const WDSEL_OFFSET: u32 = 0x08;
+ const DONE_OFFSET: u32 = 0x0C;
+ 
++/// FRCE_OFF bit holding core 1 in reset.
++pub const PROC1: u32 = 1 << 24;
++
+ /// PSM register block.
+ pub struct Psm {
+     frce_on: u32,
+     frce_off: u32,
+     wdsel: u32,
++    /// Set when firmware releases core 1 from a reset it forced with
++    /// FRCE_OFF.PROC1 (`Some(false)`), or forces one (`Some(true)`);
++    /// taken by the emulator at the end of the quantum.
++    proc1_reset: Option<bool>,
+ }
+ 
+ impl Psm {
+@@ -49,9 +56,16 @@ impl Psm {
+             frce_on: 0,
+             frce_off: 0,
+             wdsel: 0,
++            proc1_reset: None,
+         }
+     }
+ 
++    /// Take the latest change of core 1's forced reset: `Some(true)` if
++    /// FRCE_OFF.PROC1 was set, `Some(false)` if it was cleared.
++    pub fn take_proc1_reset(&mut self) -> Option<bool> {
++        self.proc1_reset.take()
++    }
++
+     /// Read a word. `DONE` mirrors `FRCE_ON` (instant handshake).
+     pub fn read32(&self, offset: u32) -> u32 {
+         match offset {
+@@ -67,7 +81,14 @@ impl Psm {
+     pub fn write32(&mut self, offset: u32, value: u32, alias: u32) {
+         match offset {
+             FRCE_ON_OFFSET => apply_alias_rmw(&mut self.frce_on, value, alias),
+-            FRCE_OFF_OFFSET => apply_alias_rmw(&mut self.frce_off, value, alias),
++            FRCE_OFF_OFFSET => {
++                let before = self.frce_off & PROC1;
++                apply_alias_rmw(&mut self.frce_off, value, alias);
++                let after = self.frce_off & PROC1;
++                if before != after {
++                    self.proc1_reset = Some(after != 0);
++                }
++            }
+             WDSEL_OFFSET => apply_alias_rmw(&mut self.wdsel, value, alias),
+             DONE_OFFSET => { /* RO — ignore */ }
+             _ => { /* unmodelled — drop */ }
+diff --git a/src/sio/mod.rs b/src/sio/mod.rs
+index 80494c0..08f1be8 100644
+--- a/src/sio/mod.rs
++++ b/src/sio/mod.rs
+@@ -386,6 +386,17 @@ impl Sio {
+     // --- FIFO helpers ---
+ 
+     /// Read FIFO_ST: status register from the calling core's perspective.
++    /// SIO_IRQ_FIFO for `core`: raised while its FIFO end holds a word or
++    /// its sticky WOF or ROE flag is set (RP2350 datasheet 3.1.5).
++    pub fn fifo_irq_level(&self, core: usize) -> bool {
++        let rx_fifo = if core == 0 {
++            &self.fifo_to_core0
++        } else {
++            &self.fifo_to_core1
++        };
++        !rx_fifo.is_empty() || self.fifo_wof[core] || self.fifo_roe[core]
++    }
++
+     fn fifo_st_read(&self, core: usize) -> u32 {
+         // Bit 0: VLD -- this core's RX queue has data
+         let rx_fifo = if core == 0 {
+diff --git a/src/tests.rs b/src/tests.rs
+index ef7de49..02127ca 100644
+--- a/src/tests.rs
++++ b/src/tests.rs
+@@ -11447,9 +11447,9 @@ mod stage1_execute_coverage {
+     fn cpsie_i_clears_primask() {
+         let mut c = CortexM33::for_test(0);
+         c.regs.primask = 1;
+-        // CPSIE I: bit 4 = 0 (enable → im=0), bit 0 = 1.
+-        // Base 0xB660 | 0x01 = 0xB661
+-        c.execute_one(0xB661);
++        // CPSIE I: bit 4 = 0 (enable → im=0), bit 1 = 1.
++        // Base 0xB660 | 0x02 = 0xB662
++        c.execute_one(0xB662);
+         assert_eq!(c.regs.primask, 0, "CPSIE clears PRIMASK");
+     }
+ 
+@@ -11457,19 +11457,19 @@ mod stage1_execute_coverage {
+     fn cpsid_i_sets_primask() {
+         let mut c = CortexM33::for_test(0);
+         c.regs.primask = 0;
+-        // CPSID I: bit 4 = 1 (im=1), bit 0 = 1.
+-        // Base 0xB660 | 0x10 | 0x01 = 0xB671
+-        c.execute_one(0xB671);
++        // CPSID I: bit 4 = 1 (im=1), bit 1 = 1.
++        // Base 0xB660 | 0x10 | 0x02 = 0xB672
++        c.execute_one(0xB672);
+         assert_eq!(c.regs.primask, 1);
+     }
+ 
+-    // line 665: CPS affect_f branch (bit 1 set). CPSIE F / CPSID F.
++    // line 665: CPS affect_f branch (bit 0 set). CPSIE F / CPSID F.
+     #[test]
+     fn cpsie_f_clears_faultmask() {
+         let mut c = CortexM33::for_test(0);
+         c.regs.faultmask = 1;
+-        // CPSIE F: bit 4 = 0, bit 1 = 1. 0xB660 | 0x02 = 0xB662
+-        c.execute_one(0xB662);
++        // CPSIE F: bit 4 = 0, bit 0 = 1. 0xB660 | 0x01 = 0xB661
++        c.execute_one(0xB661);
+         assert_eq!(c.regs.faultmask, 0);
+     }
+ 
+@@ -11477,8 +11477,8 @@ mod stage1_execute_coverage {
+     fn cpsid_f_sets_faultmask() {
+         let mut c = CortexM33::for_test(0);
+         c.regs.faultmask = 0;
+-        // CPSID F: bit 4 = 1, bit 1 = 1. 0xB660 | 0x10 | 0x02 = 0xB672
+-        c.execute_one(0xB672);
++        // CPSID F: bit 4 = 1, bit 0 = 1. 0xB660 | 0x10 | 0x01 = 0xB671
++        c.execute_one(0xB671);
+         assert_eq!(c.regs.faultmask, 1);
+     }
+ 
+@@ -18958,6 +18958,21 @@ mod stage7_sio_coverage {
+         assert!(!sio.fifo_roe(1));
+     }
+ 
++    #[test]
++    fn fifo_irq_follows_fifo_and_sticky_flags() {
++        let mut sio = Sio::new();
++        assert!(!sio.fifo_irq_level(1));
++        sio.write32(0x054, 7, 0);
++        assert!(sio.fifo_irq_level(1));
++        let _ = sio.read32(0x058, 1);
++        let _ = sio.read32(0x058, 1); // empty → ROE latches
++        assert!(sio.fifo_roe(1) && sio.fifo_irq_level(1));
++        sio.write32(0x050, 0, 1); // W1C: writing 0 keeps ROE
++        assert!(sio.fifo_roe(1) && sio.fifo_irq_level(1));
++        sio.write32(0x050, 0x8, 1);
++        assert!(!sio.fifo_roe(1) && !sio.fifo_irq_level(1));
++    }
++
+     #[test]
+     fn fifo_wof_w1c() {
+         let mut sio = Sio::new();
+@@ -22468,20 +22483,16 @@ mod stage8_workerbus_smoke {
+ 
+     #[test]
+     fn wide_misc_cpsie_cpsid() {
+-        // Note: the emulator's CPS dispatch treats bit 0 of the opcode as
+-        // the "I" (PRIMASK) select (see `execute.rs:660`). The ARMv7-M
+-        // architectural encoding uses bit 1 for I; we follow the emulator
+-        // convention here so the test exercises the dispatch path.
++        // The architectural encoding uses bit 1 for I (PRIMASK).
+         let (mut c, mut bus) = core_and_worker_bus();
+-        // CPSID with bit 0 set (emulator's "I" bit) and im=1:
+-        // 0xB671 = 1011_0110_0111_0001
+-        narrow_at(&mut bus, 0x2000_3400, 0xB671);
++        // CPSID I, im=1: 0xB672 = 1011_0110_0111_0010
++        narrow_at(&mut bus, 0x2000_3400, 0xB672);
+         c.regs.set_pc(0x2000_3400);
+         c.step_no_atomics(&mut bus);
+         assert_eq!(c.regs.primask, 1);
+ 
+-        // CPSIE: im=0, bit 0 set → clear PRIMASK. 0xB661.
+-        narrow_at(&mut bus, 0x2000_3410, 0xB661);
++        // CPSIE I: im=0, bit 1 set → clear PRIMASK. 0xB662.
++        narrow_at(&mut bus, 0x2000_3410, 0xB662);
+         c.regs.set_pc(0x2000_3410);
+         c.step_no_atomics(&mut bus);
+         assert_eq!(c.regs.primask, 0);
+@@ -35426,3 +35437,37 @@ fn resets_narrow_writes_widen_to_32_bit() {
+     bus.write16(0x4002_2002, 0xABCD, 0);
+     assert_eq!(bus.read32(0x4002_0000, 0), 0xABCD_0000);
+ }
++
++#[cfg(test)]
++mod acquire_release_tests {
++    use super::*;
++
++    // STL r1, [r0] then LDA r2, [r0]: E8C0 1FAF, E8D0 2FAF.
++    #[test]
++    fn stl_and_lda_store_and_load_words() {
++        let mut bus = crate::bus::Bus::default();
++        let mut c = CortexM33::for_test(0);
++        c.regs.r[0] = 0x2000_1000;
++        c.regs.r[1] = 0xCAFE_F00D;
++        c.execute_one_wide_with_bus(0xE8C0, 0x1FAF, &mut bus);
++        c.execute_one_wide_with_bus(0xE8D0, 0x2FAF, &mut bus);
++        assert_eq!(c.regs.r[2], 0xCAFE_F00D);
++        assert!(c.pending_fault.is_none());
++    }
++
++    // LDAEX r2, [r0] then STLEX r3, r1, [r0]: E8D0 2FEF, E8C0 1FE3.
++    #[test]
++    fn ldaex_and_stlex_pair_succeeds() {
++        let mut bus = crate::bus::Bus::default();
++        let mut c = CortexM33::for_test(0);
++        c.regs.r[0] = 0x2000_1000;
++        c.regs.r[1] = 7;
++        c.execute_one_wide_with_bus(0xE8D0, 0x2FEF, &mut bus);
++        c.execute_one_wide_with_bus(0xE8C0, 0x1FE3, &mut bus);
++        assert_eq!(c.regs.r[3], 0, "STLEX succeeds after LDAEX");
++        c.execute_one_wide_with_bus(0xE8C0, 0x1FE3, &mut bus);
++        assert_eq!(c.regs.r[3], 1, "STLEX fails without a monitor");
++        c.execute_one_wide_with_bus(0xE8D0, 0x2FAF, &mut bus);
++        assert_eq!(c.regs.r[2], 7);
++    }
++}

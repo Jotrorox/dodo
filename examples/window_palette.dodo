@@ -1,0 +1,138 @@
+package main
+
+import "std/console"
+import "std/graphics"
+import "std/graphics/font"
+import "std/window"
+
+// Two windows on one App: a canvas to paint on and a palette tool window.
+// Pick a color in the palette, drag in the canvas to paint, press P in the
+// canvas to close or reopen the palette, and close the canvas or press
+// Escape to quit. Run with `dodo run examples/window_palette.dodo`.
+
+const SWATCH: u32 = 64
+
+fn swatch(index: u32) -> u32 {
+    if index == 0 {
+        return graphics.hex(0xe06c75)
+    }
+    if index == 1 {
+        return graphics.hex(0xe5c07b)
+    }
+    if index == 2 {
+        return graphics.hex(0x98c379)
+    }
+    if index == 3 {
+        return graphics.hex(0x61afef)
+    }
+    return graphics.hex(0xc678dd)
+}
+
+fn open_palette(app: &mut window.App) -> window.Window!window.Error {
+    palette := app.open(window.Options { title: "Palette", width: SWATCH, height: SWATCH * 5, resizable: false, pixel_buffer: true })?
+    draw_palette(&mut palette, 0)?
+    return ok(palette)
+}
+
+// The swatches in a column, the selected one outlined.
+fn draw_palette(palette: &mut window.Window, selected: u32) -> void!window.Error {
+    side := SWATCH * palette.scale()
+    canvas := palette.canvas()
+    for i in 0u32..5 {
+        canvas.fill_rect(0, (i * side) as i32, side, side, swatch(i))
+    }
+    canvas.rect(2, (selected * side + 2) as i32, side - 4, side - 4, graphics.WHITE)
+    dirty := canvas.take_dirty()
+    return palette.update(dirty)
+}
+
+fn clear_canvas(paper: &mut window.Window) -> void!window.Error {
+    scale := paper.scale()
+    label := font.medium().scaled(scale)
+    canvas := paper.canvas()
+    canvas.clear(graphics.hex(0x1d2330))
+    canvas.text(&label, 8 * scale as i32, 8 * scale as i32, "Drag to paint, P toggles the palette", graphics.WHITE)
+    dirty := canvas.take_dirty()
+    return paper.update(dirty)
+}
+
+fn run() -> void!window.Error {
+    app := window.App.new()?
+    paper := app.open(window.Options.new("Paint", 480, 320))?
+    clear_canvas(&mut paper)?
+    palette := open_palette(&mut app)?
+    palette_open := true
+    selected := 0u32
+    painting := false
+    for {
+        event := app.wait_event()?
+        // Which window it happened in decides what an event means.
+        on_paper := window.event_window(&event) == paper.id()
+        match event {
+            window.Event.Close(_) | window.Event.Quit => {
+                if on_paper || !palette_open {
+                    return ok()
+                }
+                // Closing the palette only hides the tool.
+                palette.close()
+                palette_open = false
+            }
+            window.Event.Key(_, key) => {
+                if !key.pressed {
+                    continue
+                }
+                if key.key == window.Key.Escape {
+                    return ok()
+                }
+                if key.key == window.Key.P && on_paper {
+                    if palette_open {
+                        palette.close()
+                    } else {
+                        palette = open_palette(&mut app)?
+                        draw_palette(&mut palette, selected)?
+                    }
+                    palette_open = !palette_open
+                }
+            }
+            window.Event.MouseButton(_, button) => {
+                if on_paper {
+                    painting = button.pressed
+                } else if button.pressed && button.y >= 0 {
+                    side := SWATCH * palette.scale()
+                    index := button.y as u32 / side
+                    if index < 5 {
+                        selected = index
+                        draw_palette(&mut palette, selected)?
+                    }
+                }
+            }
+            window.Event.MouseMove(_, x, y) => {
+                if on_paper && painting {
+                    radius := 6 * paper.scale()
+                    canvas := paper.canvas()
+                    canvas.fill_circle(x, y, radius, swatch(selected))
+                    dirty := canvas.take_dirty()
+                    paper.update(dirty)?
+                }
+            }
+            window.Event.Resize(_, _, _) => {
+                if on_paper {
+                    clear_canvas(&mut paper)?
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn main() -> i32 {
+    match run() {
+        ok() => {
+            return 0
+        }
+        err(error) => {
+            console.printf("cannot show the windows: {}\n", window.error_name(error))!
+            return 1
+        }
+    }
+}

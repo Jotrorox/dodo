@@ -20,16 +20,9 @@ import "std/window/handle"
 // time, and EGL's X11 platform.
 
 unsafe extern "C" fn dlopen(path: *const u8, mode: i32) -> *mut u8
-// Declared as std/dylib and std/gpu/metal declare it, so programs using
-// them together link one symbol.
-@link_name("dlsym")
-unsafe extern "C" fn dlsym_pointer(handle: *mut u8, name: *const u8) -> *mut u8
-
-unsafe fn dlsym(handle: *mut u8, name: *const u8) -> usize {
-    unsafe {
-        return dlsym_pointer(handle, name) as usize
-    }
-}
+// Declared with the pointer result std/dylib and std/gpu/metal use, as one
+// program may load all three: a symbol has a single C signature.
+unsafe extern "C" fn dlsym(handle: *mut u8, name: *const u8) -> *mut u8
 unsafe extern "C" fn dlclose(handle: *mut u8) -> i32
 
 const RTLD_NOW: i32 = 2
@@ -128,7 +121,7 @@ unsafe fn load_egl(library: *mut u8) -> Option<Egl> {
     addresses := [0usize; 16]
     for i in 0usize..16 {
         address := unsafe {
-            dlsym(library, common.c_string(names[i]))
+            dlsym(library, common.c_string(names[i])) as usize
         }
         if address == 0 {
             return none
@@ -377,10 +370,10 @@ pub struct Backend {
             return err(common.Error.NoLibrary)
         }
         open_display := unsafe {
-            dlsym(xlib, common.c_string(b"XOpenDisplay\0"))
+            dlsym(xlib, common.c_string(b"XOpenDisplay\0")) as usize
         }
         close_display := unsafe {
-            dlsym(xlib, common.c_string(b"XCloseDisplay\0"))
+            dlsym(xlib, common.c_string(b"XCloseDisplay\0")) as usize
         }
         if open_display == 0 || close_display == 0 {
             return err(common.Error.NoLibrary)
@@ -592,7 +585,7 @@ pub struct Backend {
         }
         if address == 0 && !ptr.is_null(self.gl_library) {
             address = unsafe {
-                dlsym(self.gl_library, name)
+                dlsym(self.gl_library, name) as usize
             }
         }
         return address

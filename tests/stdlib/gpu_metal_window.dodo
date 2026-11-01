@@ -109,7 +109,14 @@ fn main() -> i32 {
             return 0
         }
     }
-    win := match window.open(window.Options.gpu("Metal window", 160, 120)) {
+    app := match window.App.new() {
+        ok(app) => app,
+        err(error) => {
+            console.printf("unavailable\nwindow {}\n", window.error_name(error))!
+            return 0
+        }
+    }
+    win := match app.open(window.Options.gpu("Metal window", 160, 120)) {
         ok(win) => win,
         err(error) => {
             console.printf("unavailable\nwindow {}\n", window.error_name(error))!

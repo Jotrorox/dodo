@@ -8,7 +8,7 @@ order: 160.8
 `std/dylib` loads a shared library while the program runs and looks up its
 symbols. A program that uses an optional system library this way still
 starts when the library is missing, and can say so instead of failing to
-launch; [std/gpu/vulkan](gpu.md) opens the Vulkan loader like this.
+launch; [std/gpu/vulkan](vulkan.md) opens the Vulkan loader like this.
 
 | System | Calls | Linked |
 | --- | --- | --- |

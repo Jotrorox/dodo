@@ -5,6 +5,7 @@ import "core/mem"
 import "std/embedded/chip"
 import "std/embedded/chip/rp_adc"
 import "std/embedded/chip/rp_dma"
+import "std/embedded/chip/rp_flash"
 import "std/embedded/chip/rp_multicore"
 import "std/embedded/chip/rp_pio"
 import "std/embedded/chip/rp_watchdog"
@@ -14,6 +15,7 @@ import "std/embedded/hal"
 import "std/embedded/peripheral/pl011"
 import "std/embedded/peripheral/pl022"
 import "std/embedded/power"
+import "std/embedded/storage"
 import "std/io"
 import "std/sync/atomic"
 
@@ -1328,6 +1330,178 @@ fn core1_checks(core1: &mut rp_multicore.Core1, fifos: &mut rp_multicore.Fifos, 
     spinlocks.release(lock)
 }
 
+// The program flash and std/embedded/storage on it. The regions sit below
+// the last sector, which the RP2350 self-tests keep their record in.
+fn flash_checks(flash: &mut rp_flash.Flash, core1: &mut rp_multicore.Core1, timer: &mut chip.Timer) {
+    feed_watchdog()
+    capacity := flash.capacity()
+    end := flash.program_end()
+    start := capacity - 5 * rp_flash.SECTOR_BYTES
+    first: [4]u8 = [0, 0, 0, 0]
+    flash.read(0, &mut first)!
+    mapped := unsafe {
+        word: hal.Reg<u32> = hal.Reg.at(rp_flash.XIP_BASE)
+        word.read()
+    }
+    layout := capacity >= 2 * 1024 * 1024 && end > 0 && end % rp_flash.SECTOR_BYTES == 0 && end < start
+    layout = layout && (first[0] as u32 | first[1] as u32 << 8 | first[2] as u32 << 16 | first[3] as u32 << 24) == mapped
+    layout = layout && refused(flash.region(end - rp_flash.SECTOR_BYTES, rp_flash.SECTOR_BYTES), hal.Error.InvalidInput)
+    layout = layout && refused(flash.region(start + 1, rp_flash.SECTOR_BYTES), hal.Error.InvalidInput)
+    layout = layout && refused(flash.region(start, 100), hal.Error.InvalidInput)
+    layout = layout && refused(flash.region(capacity, rp_flash.SECTOR_BYTES), hal.Error.InvalidInput)
+    area := flash.region(start, 4 * rp_flash.SECTOR_BYTES)!
+    layout = layout && refused(flash.region(start + rp_flash.SECTOR_BYTES, rp_flash.SECTOR_BYTES), hal.Error.Busy)
+    layout = layout && area.capacity() == 4 * rp_flash.SECTOR_BYTES && area.start() == start && area.write_size() == 1
+    check(layout)
+
+    // Erase two sectors, write across page boundaries, read back; code and
+    // data keep coming from flash in between.
+    area.erase(0, 2 * rp_flash.SECTOR_BYTES)!
+    bytes := [0u8; 300]
+    area.read(100, &mut bytes)!
+    blank := true
+    for &byte in bytes {
+        blank = blank && byte == 0xFF
+    }
+    for index in 0usize..300 {
+        bytes[index] = ((index * 7 + 3) & 0xFF) as u8
+    }
+    area.write(200, &bytes)!
+    back := [0u8; 302]
+    area.read(199, &mut back)!
+    same := back[0] == 0xFF && back[301] == 0xFF
+    for index in 0usize..300 {
+        same = same && back[index + 1] == bytes[index]
+    }
+    mapped_byte := unsafe {
+        byte: hal.Reg<u8> = hal.Reg.at(rp_flash.XIP_BASE + (start + 200 + 299) as usize)
+        byte.read()
+    }
+    tail: [1]u8 = [0x5A]
+    area.write(rp_flash.SECTOR_BYTES + 4095, &tail)!
+    area.read(rp_flash.SECTOR_BYTES + 4094, &mut back[..2])!
+    edge := back[0] == 0xFF && back[1] == 0x5A
+    area.erase(0, rp_flash.SECTOR_BYTES)!
+    area.read(200, &mut back[..300])!
+    erased := true
+    for &byte in back[..300] {
+        erased = erased && byte == 0xFF
+    }
+    check(blank && same && mapped_byte == bytes[299] && edge && erased && clk_sys_khz() > 0)
+
+    // Core 1 may run from flash, so no erase or write while it runs.
+    feed_watchdog()
+    running := unsafe {
+        core1.start(&mut CORE1_STACK, Flag {})!
+    }
+    busy := refused_flash(area.erase(0, rp_flash.SECTOR_BYTES), hal.Error.Busy) && refused_flash(area.write(0, &tail), hal.Error.Busy)
+    running.stop()
+    area.write(0, &tail)!
+    check(busy)
+
+    // A key-value store over the region: 300 updates of a 100-byte value
+    // compact its four sectors twice over.
+    feed_watchdog()
+    area.erase(0, 4 * rp_flash.SECTOR_BYTES)!
+    store := storage.Store.open(area)!
+    value := [0u8; 100]
+    for round in 0u32..300 {
+        if round % 50 == 0 {
+            feed_watchdog()
+        }
+        for index in 0usize..100 {
+            value[index] = ((round + index as u32) & 0xFF) as u8
+        }
+        store.set("value", &value)!
+        store.set_u32("round", round)!
+    }
+    store.set("name", b"pico")!
+    store.remove("name")!
+    feed_watchdog()
+    area = store.release()
+    store = storage.Store.open(area)!
+    kept := false
+    match store.get_u32("round") {
+        ok(some(round)) => {
+            kept = round == 299
+        }
+        ok(none) => {}
+        err(_) => {}
+    }
+    match store.get("value", &mut value) {
+        ok(some(length)) => {
+            kept = kept && length == 100 && value[0] == 43 && value[99] == 142
+        }
+        ok(none) => {
+            kept = false
+        }
+        err(_) => {
+            kept = false
+        }
+    }
+    match store.contains("name") {
+        ok(present) => {
+            kept = kept && !present
+        }
+        err(_) => {
+            kept = false
+        }
+    }
+    area = store.release()
+    area.erase(0, 4 * rp_flash.SECTOR_BYTES)!
+    flash.release(area)
+    again := flash.free()!
+    kept = kept && again.start() == end
+    flash.release(again)
+    check(kept)
+}
+
+fn refused_flash(result: void!hal.Error, expected: hal.Error) -> bool {
+    match result {
+        ok() => {
+            return false
+        }
+        err(error) => {
+            return error == expected
+        }
+    }
+}
+
+// Random numbers: the board's generator fills two 64-byte buffers that
+// differ almost everywhere, with about half their bits set, and seeds a
+// SoftRng.
+fn filled<R: hal.Rng>(rng: &mut R, bytes: &mut[u8]) -> bool {
+    match rng.fill(bytes) {
+        ok() => {
+            return true
+        }
+        err(_) => {
+            return false
+        }
+    }
+}
+
+fn rng_checks<R: hal.Rng>(rng: &mut R) {
+    first := [0u8; 64]
+    second := [0u8; 64]
+    both := filled(rng, &mut first) && filled(rng, &mut second)
+    differing := 0u32
+    ones := 0u32
+    for index in 0usize..64 {
+        if first[index] != second[index] {
+            differing += 1
+        }
+        for bit in 0u32..8 {
+            ones += ((first[index] as u32 >> bit) & 1) + ((second[index] as u32 >> bit) & 1)
+        }
+    }
+    seeded := match hal.SoftRng.from_rng(rng) {
+        ok(_) => true,
+        err(_) => false,
+    }
+    check(both && seeded && differing >= 48 && ones > 400 && ones < 624)
+}
+
 // The watchdog through its API, taking over the self-test's raw 3 s
 // watchdog: timeouts it cannot count are refused, it counts down once per
 // microsecond (the RP2040's double count included), reloads when fed, holds
@@ -1351,6 +1525,82 @@ fn watchdog_checks(watchdog: &mut rp_watchdog.Watchdog, timer: &mut chip.Timer) 
     mapped := (watchdog.scratch(0) & 0xFFFF_0000) == RUNNING
     watchdog.start(3000)!
     check(zero && too_long && started && counted && fed && paused && mapped && watchdog.is_running())
+}
+
+// The time a clock read reports, or 0 if it failed.
+fn time_or_zero(result: u64!hal.Error) -> u64 {
+    match result {
+        ok(value) => {
+            return value
+        }
+        err(_) => {
+            return 0
+        }
+    }
+}
+
+// The real-time clock: set, keeping pace with the timer, and its alarm,
+// whose interrupt stays disabled at the NVIC, so it only pends.
+// The self-test's 3 s watchdog is fed before each wait.
+fn rtc_checks(rtc: &mut chip.Rtc, watchdog: &mut rp_watchdog.Watchdog, timer: &mut chip.Timer) {
+    watchdog.feed()
+    step := rtc.resolution_ms() as u64
+    // 2026-11-01 12:34:56.789 UTC.
+    start := 1_793_536_496_789u64
+    given := match rtc.set_ms(start) {
+        ok() => true,
+        err(_) => false,
+    }
+    set := match rtc.is_set() {
+        ok(value) => value,
+        err(_) => false,
+    }
+    first := time_or_zero(rtc.now_ms())
+    rounded := start - start % step
+    check(given && set && first >= rounded && first <= rounded + step)
+
+    watchdog.feed()
+    before := time_or_zero(rtc.now_ms())
+    timer.delay_ms(1500)
+    after := time_or_zero(rtc.now_ms())
+    check(after >= before && after - before + step >= 1500 && after - before <= 1500 + step)
+
+    irq := rtc.irq()
+    cortex_m.disable(irq)
+    rtc.listen()
+    cortex_m.unpend(irq)
+    armed := match hal.rtc_alarm_in(rtc, 1500) {
+        ok() => true,
+        err(_) => false,
+    }
+    watchdog.feed()
+    begin := timer.now_us()
+    fired := false
+    for !fired && timer.now_us() - begin < 2_500_000 {
+        fired = match rtc.alarm_fired() {
+            ok(value) => value,
+            err(_) => false,
+        }
+    }
+    took := timer.now_us() - begin
+    pending := cortex_m.is_pending(irq)
+    cleared := match rtc.clear_alarm() {
+        ok() => true,
+        err(_) => false,
+    }
+    cortex_m.unpend(irq)
+    still := cortex_m.is_pending(irq)
+    rtc.ignore()
+    quiet := match rtc.alarm_fired() {
+        ok(value) => !value,
+        err(_) => false,
+    }
+    // A clock that counts seconds fires at the second after next.
+    on_time := took >= 1_490_000 && took < 1_520_000
+    if step == 1000 {
+        on_time = took >= 990_000 && took < 2_100_000
+    }
+    check(armed && fired && on_time && pending && cleared && !still && quiet)
 }
 
 fn main() {
@@ -1492,8 +1742,11 @@ fn main() {
     usb_checks(&mut b.usb, &mut b.pins, &mut b.timer)
     dma_checks(&mut b.dma, &mut b.pins, &mut b.timer)
     core1_checks(&mut b.core1, &mut b.fifos, &mut b.spinlocks, &mut b.timer)
+    rng_checks(&mut b.rng)
     power_checks(&mut b.power, &mut b.usb, &mut b.pins, &mut b.timer)
     watchdog_checks(&mut b.watchdog, &mut b.timer)
+    rtc_checks(&mut b.rtc, &mut b.watchdog, &mut b.timer)
+    flash_checks(&mut b.flash, &mut b.core1, &mut b.timer)
 
     // Configuration is validated before ownership: an unusable crystal is
     // InvalidInput, a valid one is Busy because the board already took it.

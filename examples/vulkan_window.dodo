@@ -661,7 +661,7 @@ fn frame_limit() -> u32 {
     }
 }
 
-fn run(library: &vk.Library, win: &mut window.Window) -> void!vk.Error {
+fn run(library: &vk.Library, app: &mut window.App, win: &mut window.Window) -> void!vk.Error {
     native := match win.native_handle() {
         ok(native) => native,
         err(_) => {
@@ -695,11 +695,11 @@ fn run(library: &vk.Library, win: &mut window.Window) -> void!vk.Error {
         return err(failure(vk.ERROR_EXTENSION_NOT_PRESENT))
     }
     enabled := [ptr.as_ptr(vk.KHR_SURFACE_EXTENSION_NAME), ptr.as_ptr(platform_surface), ptr.as_ptr(vk.KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME)]
-    app := vk.ApplicationInfo.default()
-    app.p_application_name = ptr.as_ptr(b"dodo vulkan window\0")
-    app.api_version = vk.API_VERSION_1_0
+    application := vk.ApplicationInfo.default()
+    application.p_application_name = ptr.as_ptr(b"dodo vulkan window\0")
+    application.api_version = vk.API_VERSION_1_0
     instance_info := vk.InstanceCreateInfo.default()
-    instance_info.p_application_info = ptr.from_ref(&app)
+    instance_info.p_application_info = ptr.from_ref(&application)
     instance_info.enabled_extension_count = 2
     instance_info.pp_enabled_extension_names = ptr.as_ptr(&enabled)
     if listed(&extensions, extension_count, vk.KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME) {
@@ -836,27 +836,32 @@ fn run(library: &vk.Library, win: &mut window.Window) -> void!vk.Error {
     angle := 0.0f32
     stale := false
     running := true
+    match win.request_frame() {
+        ok() => {}
+        err(_) => {
+            running = false
+        }
+    }
     for running {
-        event := match win.wait_event_until_frame() {
+        event := match app.wait_event() {
             ok(event) => event,
             err(_) => {
                 break
             }
         }
         match event {
-            some(window.Event.Close) => {
+            window.Event.Close(_) | window.Event.Quit => {
                 running = false
             }
-            some(window.Event.Key(key)) => {
+            window.Event.Key(_, key) => {
                 if key.key == window.Key.Escape {
                     running = false
                 }
             }
-            some(window.Event.Resize(_, _)) => {
+            window.Event.Resize(_, _, _) => {
                 stale = true
             }
-            some(_) => {}
-            none => {
+            window.Event.Frame(_) => {
                 if stale {
                     build_swapchain(&fns, &d, &gpu, &mut chain, win.width(), win.height())?
                     stale = false
@@ -872,7 +877,14 @@ fn run(library: &vk.Library, win: &mut window.Window) -> void!vk.Error {
                     }
                 }
                 angle += step
+                match win.request_frame() {
+                    ok() => {}
+                    err(_) => {
+                        running = false
+                    }
+                }
             }
+            _ => {}
         }
     }
     console.printf("{} frames\n", frames)!
@@ -907,14 +919,21 @@ fn main() -> i32 {
             return 2
         }
     }
-    win := match window.open(window.Options.gpu("Vulkan", 480, 320)) {
+    app := match window.App.new() {
+        ok(app) => app,
+        err(error) => {
+            console.printf("no window: {}\n", window.error_name(error))!
+            return 1
+        }
+    }
+    win := match app.open(window.Options.gpu("Vulkan", 480, 320)) {
         ok(win) => win,
         err(error) => {
             console.printf("no window: {}\n", window.error_name(error))!
             return 1
         }
     }
-    match run(&library, &mut win) {
+    match run(&library, &mut app, &mut win) {
         ok() => {
             return 0
         }

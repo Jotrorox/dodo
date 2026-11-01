@@ -318,6 +318,7 @@ impl Scan<'_> {
             | ExprKind::Cast(e, _)
             | ExprKind::Try(e)
             | ExprKind::Unwrap(e)
+            | ExprKind::Await { value: e, .. }
             | ExprKind::Constant(e, _)
             | ExprKind::Repeat(e, _) => self.expr(e),
             ExprKind::Binary(_, a, b) | ExprKind::Index(a, b) | ExprKind::Range(a, b) => {
@@ -504,6 +505,7 @@ impl Checker<'_> {
             interrupt: None,
             link_name: None,
             placement: Placement::default(),
+            async_part: None,
         };
         let mut checker = Checker::new(self.context, closure.ret.clone());
         checker.recover = self.recover;

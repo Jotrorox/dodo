@@ -63,6 +63,24 @@ fn registers_protocols_and_fakes_execute_on_the_host() {
 }
 
 #[test]
+fn storage_runs_against_the_fake_flash_and_survives_power_cuts() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let scratch = Scratch::new("storage");
+    let source = root.join("tests/stdlib/storage_checks.dodo");
+    // Unoptimized only: the power-cut sweep runs in seconds either way, and
+    // an optimized build of the fixture takes about a minute.
+    let executable = scratch
+        .0
+        .join(format!("storage{}", std::env::consts::EXE_SUFFIX));
+    let args = ["build", source.to_str().unwrap(), "-O", "0", "-o"];
+    success(&dodo(&args, &executable), "compile storage fixture");
+    success(
+        &Command::new(&executable).output().unwrap(),
+        "execute storage fixture",
+    );
+}
+
+#[test]
 fn polling_target_capture_can_i2s_and_dma_protocols_execute_with_fakes() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let scratch = Scratch::new("protocols");
@@ -383,6 +401,25 @@ fn peripheral_drivers_execute_against_simulated_controllers() {
         success(
             &Command::new(&executable).output().unwrap(),
             "execute peripheral fixture",
+        );
+    }
+}
+
+#[test]
+fn real_time_clocks_execute_against_fakes_and_simulated_registers() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let scratch = Scratch::new("rtc");
+    let source = root.join("tests/stdlib/rtc_checks.dodo");
+    for optimization in ["0", "3"] {
+        let executable = scratch.0.join(format!(
+            "rtc-O{optimization}{}",
+            std::env::consts::EXE_SUFFIX
+        ));
+        let args = ["build", source.to_str().unwrap(), "-O", optimization, "-o"];
+        success(&dodo(&args, &executable), "compile rtc fixture");
+        success(
+            &Command::new(&executable).output().unwrap(),
+            "execute rtc fixture",
         );
     }
 }

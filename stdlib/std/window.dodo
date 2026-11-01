@@ -3,23 +3,28 @@ package window
 import "std/graphics"
 import "std/time"
 import "std/window/handle"
+import "std/window/heap"
 import "std/window/native" as backend
 import "std/window/raw"
 
-// Open a desktop window and draw into it with std/graphics.
+// Open desktop windows and draw into them with std/graphics.
+//
+// An App is the program's connection to the window system and its event
+// loop; app.open() opens any number of windows on it. Every event names the
+// window it belongs to, and all of them arrive through the App: wait_event()
+// blocks for the next one, poll_event() returns none when nothing is pending,
+// so a program's main loop is an ordinary loop with no callbacks.
 //
 // A window owns a pixel buffer the size of its drawing area. canvas() lends
-// it out as a graphics.Canvas; update() shows the parts that changed. Events
-// are polled: wait_event() blocks for the next one, poll_event() returns
-// none when nothing is pending, so a program's main loop is an ordinary loop
-// with no callbacks. An animation's loop uses wait_event_until_frame()
-// instead, which also says when to draw the next frame.
+// it out as a graphics.Canvas; update() shows the parts that changed. An
+// animation asks for a Frame event with request_frame() and draws when it
+// arrives, once per display refresh.
 //
 // Each operating system's own window system is used directly, with nothing
 // to install: the X11 protocol over a socket on Linux, AppKit on macOS and
-// user32/gdi32 on Windows. A process has at most one window open at a time,
-// and must use it from the thread that opened it; on macOS that has to be
-// the main thread.
+// user32/gdi32 on Windows. A process has at most one App at a time, and must
+// use it and its windows from the thread that created it; on macOS that has
+// to be the main thread.
 //
 // A GPU draws into a window through native_handle(), which hands Vulkan,
 // OpenGL or Metal the window system's own objects. A window opened with
@@ -65,6 +70,11 @@ pub fn error_name(error: Error) -> &str from(static) {
 // The largest accepted width or height, in pixels.
 pub const MAX_SIZE: u32 = 16384
 
+// Names one window of the App. Ids start at 1 and are never reused within a
+// process, so an event can be told apart from those of a window closed
+// earlier; 0 is no window.
+pub type WindowId = u32
+
 // How to open a window. The size is the drawing area's, excluding the title
 // bar and borders, in the window system's own units: points on macOS and
 // pixels at the system scale on Windows, so a window looks the same size on
@@ -92,43 +102,79 @@ pub struct Options {
     }
 }
 
-// Open a window and show it. Fails with InvalidInput for a zero size or one
-// above MAX_SIZE, NoDisplay without a window system, and AlreadyOpen while
-// another window is open.
-pub fn open(options: Options) -> Window!Error {
-    if options.width == 0 || options.height == 0 || options.width > MAX_SIZE || options.height > MAX_SIZE {
-        return err(Error.InvalidInput)
-    }
-    system := backend.Backend.open(options.title, options.width, options.height, options.resizable, options.pixel_buffer)?
-    return ok(Window { backend: system, pending: raw.Event.empty(), frame_deadline: 0, frame_previous: 0, frame_requested: false, frame_signalled: false, animating: false })
-}
-
-// Something that happened to the window.
+// Something that happened to one of the App's windows, named by the
+// WindowId each variant starts with; event_window() reads it from any event.
 pub enum Event {
     // The user asked to close the window, for example with its close button.
     // The window stays open until close() or the end of its lifetime, so a
     // program may still ask "save changes?".
-    Close,
-    // The drawing area changed size. The pixel buffer now has the new size and
-    // keeps the old picture in its top-left corner; redraw and update().
-    Resize(width: u32, height: u32),
+    Close(window: WindowId),
+    // The drawing area changed size. The window's canvas() has the new size
+    // from now on and keeps the old picture in its top-left corner; redraw
+    // and update().
+    Resize(window: WindowId, width: u32, height: u32),
     // The window gained (true) or lost (false) keyboard focus.
-    Focus(focused: bool),
-    // A key went down, repeated, or came up.
-    Key(KeyEvent),
+    Focus(window: WindowId, focused: bool),
+    // A key went down, repeated, or came up in the focused window.
+    Key(window: WindowId, key: KeyEvent),
     // Text typed through the keyboard layout, one Unicode scalar value per
     // event, after any Key event for the same keystroke. Control characters
     // are not reported; use Key events for Enter, Tab and Backspace.
-    Text(code_point: u32),
+    Text(window: WindowId, code_point: u32),
     // The pointer moved to (x, y) inside the drawing area.
-    MouseMove(x: i32, y: i32),
+    MouseMove(window: WindowId, x: i32, y: i32),
     // A mouse button went down or came up.
-    MouseButton(ButtonEvent),
+    MouseButton(window: WindowId, button: ButtonEvent),
     // The pointer left the drawing area.
-    MouseLeave,
+    MouseLeave(window: WindowId),
     // A wheel or trackpad scrolled. 120 units are one wheel notch; trackpads
     // report finer amounts. Positive dx scrolls right, positive dy down.
-    Scroll(dx: i32, dy: i32)
+    Scroll(window: WindowId, dx: i32, dy: i32),
+    // Time to draw the window's next frame, which request_frame() asked for.
+    Frame(window: WindowId),
+    // The user asked the whole application to quit: Command-Q or the Quit
+    // menu item on macOS. Other systems close windows one at a time and
+    // never send it.
+    Quit
+}
+
+// The window an event belongs to; 0 for Quit, which belongs to none.
+pub fn event_window(event: &Event) -> WindowId {
+    match event {
+        Event.Close(id) => {
+            return *id
+        }
+        Event.Resize(id, _, _) => {
+            return *id
+        }
+        Event.Focus(id, _) => {
+            return *id
+        }
+        Event.Key(id, _) => {
+            return *id
+        }
+        Event.Text(id, _) => {
+            return *id
+        }
+        Event.MouseMove(id, _, _) => {
+            return *id
+        }
+        Event.MouseButton(id, _) => {
+            return *id
+        }
+        Event.MouseLeave(id) => {
+            return *id
+        }
+        Event.Scroll(id, _, _) => {
+            return *id
+        }
+        Event.Frame(id) => {
+            return *id
+        }
+        Event.Quit => {
+            return 0
+        }
+    }
 }
 
 // A physical key press or release. `key` names the key's position on a US
@@ -211,71 +257,380 @@ fn button_from_code(code: u32) -> Button {
 
 fn convert(event: &raw.Event) -> Option<Event> {
     kind := event.kind
+    id := event.window
     if kind == raw.CLOSE {
-        return some(Event.Close)
+        return some(Event.Close(id))
     }
     if kind == raw.RESIZE {
-        return some(Event.Resize(event.x as u32, event.y as u32))
+        return some(Event.Resize(id, event.x as u32, event.y as u32))
     }
     if kind == raw.FOCUS {
-        return some(Event.Focus((event.flags & raw.PRESSED) != 0))
+        return some(Event.Focus(id, (event.flags & raw.PRESSED) != 0))
     }
     if kind == raw.KEY {
-        return some(Event.Key(KeyEvent { key: key_from_code(event.code), pressed: (event.flags & raw.PRESSED) != 0, repeat: (event.flags & raw.REPEAT) != 0, modifiers: Modifiers { bits: event.modifiers } }))
+        return some(Event.Key(id, KeyEvent { key: key_from_code(event.code), pressed: (event.flags & raw.PRESSED) != 0, repeat: (event.flags & raw.REPEAT) != 0, modifiers: Modifiers { bits: event.modifiers } }))
     }
     if kind == raw.TEXT {
-        return some(Event.Text(event.code))
+        return some(Event.Text(id, event.code))
     }
     if kind == raw.MOUSE_MOVE {
-        return some(Event.MouseMove(event.x, event.y))
+        return some(Event.MouseMove(id, event.x, event.y))
     }
     if kind == raw.MOUSE_BUTTON {
-        return some(Event.MouseButton(ButtonEvent { button: button_from_code(event.code), pressed: (event.flags & raw.PRESSED) != 0, x: event.x, y: event.y, modifiers: Modifiers { bits: event.modifiers } }))
+        return some(Event.MouseButton(id, ButtonEvent { button: button_from_code(event.code), pressed: (event.flags & raw.PRESSED) != 0, x: event.x, y: event.y, modifiers: Modifiers { bits: event.modifiers } }))
     }
     if kind == raw.MOUSE_LEAVE {
-        return some(Event.MouseLeave)
+        return some(Event.MouseLeave(id))
     }
     if kind == raw.SCROLL {
-        return some(Event.Scroll(event.x, event.y))
+        return some(Event.Scroll(id, event.x, event.y))
+    }
+    if kind == raw.QUIT {
+        return some(Event.Quit)
     }
     return none
 }
 
-// An open window. Closing happens with close() or when the value is dropped.
-pub struct Window {
-    backend: backend.Backend
-    pending: raw.Event
-    // Frame pacing, in backend.clock() nanoseconds: when the awaited frame
-    // is due (0 before it is scheduled) and when the last one was.
-    frame_deadline: u64
-    frame_previous: u64
-    // A FRAME event was requested and has not arrived yet.
-    frame_requested: bool
+// -- Frame pacing -------------------------------------------------------------
+
+// The frame state of one open window, in backend clock() nanoseconds.
+struct Pacer {
+    window: u32
+    // When the requested frame is due; 0 while none is requested.
+    deadline: u64
+    // When the last frame was.
+    previous: u64
+    // A FRAME event was requested from the window system and has not
+    // arrived yet.
+    native: bool
     // A FRAME event arrived: the display refreshed since the request.
-    frame_signalled: bool
-    // Frames were asked for since the last wait_event().
+    signalled: bool
+}
+
+// One Pacer per open window. Windows are handles that do not borrow their
+// App, so the App finds the frames they asked for here.
+static mut PACERS: heap.Table<Pacer> = heap.Table<Pacer> { address: 0, count: 0, capacity: 0 }
+
+fn pacer_add(id: u32) -> bool {
+    unsafe {
+        return PACERS.push(Pacer { window: id, deadline: 0, previous: 0, native: false, signalled: false })
+    }
+}
+
+fn pacer_remove(id: u32) {
+    unsafe {
+        count := PACERS.len()
+        for i in 0usize..count {
+            found := false
+            {
+                records := PACERS.records()
+                found = records[i].window == id
+            }
+            if found {
+                PACERS.remove(i)
+                return
+            }
+        }
+    }
+}
+
+fn frame_period(id: u32) -> u64 {
+    period := backend.Backend.frame_period(id)
+    if period == 0 {
+        return 16666667
+    }
+    return period
+}
+
+// Set the deadline of window `id`'s next frame unless one is pending.
+fn pacer_request(id: u32) -> void!Error {
+    unsafe {
+        records := PACERS.records()
+        for i in 0usize..records.len {
+            if records[i].window != id {
+                continue
+            }
+            if records[i].deadline != 0 {
+                return ok()
+            }
+            period := frame_period(id)
+            if !records[i].native && !records[i].signalled {
+                requested := backend.Backend.request_frame(id)?
+                records[i].native = requested
+            }
+            now := backend.Backend.clock()
+            if records[i].native || records[i].signalled {
+                // The FRAME event ends the wait; this deadline only matters
+                // when the display stops reporting refreshes.
+                records[i].deadline = now + 2 * period
+                return ok()
+            }
+            vblank := backend.Backend.next_vblank(id, now)
+            if vblank > now {
+                records[i].deadline = vblank
+                return ok()
+            }
+            // A timer at the refresh rate that keeps its phase, skipping the
+            // frames that were missed.
+            deadline := records[i].previous + period
+            if deadline <= now {
+                deadline += ((now - deadline) / period + 1) * period
+            }
+            records[i].deadline = deadline
+            return ok()
+        }
+    }
+    return err(Error.Closed)
+}
+
+// The display of window `id` refreshed after a request_frame().
+fn pacer_signal(id: u32) {
+    unsafe {
+        records := PACERS.records()
+        for i in 0usize..records.len {
+            if records[i].window == id {
+                records[i].native = false
+                records[i].signalled = true
+                return
+            }
+        }
+    }
+}
+
+// A window whose requested frame is due at `now`, marked as delivered, or 0.
+fn pacer_due(now: u64) -> u32 {
+    unsafe {
+        records := PACERS.records()
+        for i in 0usize..records.len {
+            deadline := records[i].deadline
+            if deadline == 0 || (!records[i].signalled && now < deadline) {
+                continue
+            }
+            if records[i].signalled {
+                records[i].previous = now
+            } else {
+                records[i].previous = deadline
+            }
+            records[i].signalled = false
+            records[i].deadline = 0
+            return records[i].window
+        }
+    }
+    return 0
+}
+
+// The earliest pending frame deadline, or 0 when no frame is requested.
+fn pacer_earliest() -> u64 {
+    earliest := 0u64
+    unsafe {
+        records := PACERS.view()
+        for i in 0usize..records.len {
+            deadline := records[i].deadline
+            if deadline != 0 && (earliest == 0 || deadline < earliest) {
+                earliest = deadline
+            }
+        }
+    }
+    return earliest
+}
+
+fn pacer_clear() {
+    unsafe {
+        PACERS.clear()
+    }
+}
+
+// -- App ----------------------------------------------------------------------
+
+// The connection to the window system and the event loop of every window
+// opened on it. Dropping the App, or close(), closes all its windows.
+pub struct App {
+    active: bool
+    pending: raw.Event
+    // A frame is requested, which keeps macOS from napping.
     animating: bool
 
-    // Size of the drawing area in pixels; also the size of canvas().
+    // Connect to the window system. Fails with NoDisplay without one,
+    // AlreadyOpen while another App exists, and Unsupported off the main
+    // thread on macOS.
+    pub fn new() -> App!Error {
+        backend.Backend.connect()?
+        return ok(App { active: true, pending: raw.Event.empty(), animating: false })
+    }
+
+    // Open a window and show it. Fails with InvalidInput for a zero size or
+    // one above MAX_SIZE.
+    pub fn open(&mut self, options: Options) -> Window!Error {
+        if !self.active {
+            return err(Error.Closed)
+        }
+        if options.width == 0 || options.height == 0 || options.width > MAX_SIZE || options.height > MAX_SIZE {
+            return err(Error.InvalidInput)
+        }
+        id := backend.Backend.open(options.title, options.width, options.height, options.resizable, options.pixel_buffer)?
+        if !pacer_add(id) {
+            backend.Backend.close(id)
+            return err(Error.OutOfMemory)
+        }
+        win := Window { id: id, pixel_buffer: options.pixel_buffer, pixels: heap.Bytes.empty(), width: 0, height: 0 }
+        if !win.sync() {
+            return err(Error.OutOfMemory)
+        }
+        return ok(win)
+    }
+
+    // The next event of any window, waiting as long as it takes.
+    pub fn wait_event(&mut self) -> Event!Error {
+        for {
+            if let some(event) = self.next(raw.FOREVER)? {
+                return ok(event)
+            }
+        }
+    }
+    // The next event if one is pending, without waiting.
+    pub fn poll_event(&mut self) -> Option<Event>!Error {
+        return self.next(0)
+    }
+    // The next event, waiting at most `milliseconds` for one; none when the
+    // time passes first.
+    pub fn wait_event_timeout(&mut self, milliseconds: u32) -> Option<Event>!Error {
+        limit := milliseconds
+        if limit == raw.FOREVER {
+            limit = raw.FOREVER - 1
+        }
+        return self.next(limit)
+    }
+
+    // Close every window and the connection. Later calls fail with Closed;
+    // closing twice does nothing. The windows' handles stay valid but report
+    // Closed, and their canvases are empty.
+    pub fn close(&mut self) {
+        if !self.active {
+            return
+        }
+        self.active = false
+        pacer_clear()
+        if self.animating {
+            self.animating = false
+            backend.Backend.set_animating(false)
+        }
+        backend.Backend.disconnect()
+    }
+    fn drop(&mut self) {
+        self.close()
+    }
+
+    // Frames that are due come first, so a stream of input does not hold
+    // them back; waits for input end at the earliest frame deadline.
+    fn next(&mut self, milliseconds: u32) -> Option<Event>!Error {
+        if !self.active {
+            return err(Error.Closed)
+        }
+        start := backend.Backend.clock()
+        for {
+            now := backend.Backend.clock()
+            due := pacer_due(now)
+            if due != 0 {
+                return ok(some(Event.Frame(due)))
+            }
+            earliest := pacer_earliest()
+            self.set_animating(earliest != 0)
+            wait := milliseconds
+            if milliseconds != raw.FOREVER {
+                elapsed := (now - start) / 1000000
+                if elapsed >= milliseconds as u64 {
+                    wait = 0
+                } else {
+                    wait = milliseconds - elapsed as u32
+                }
+            }
+            if earliest != 0 {
+                // Round up so the wait never ends early and spins.
+                until := (earliest - now + 999999) / 1000000
+                if until > 1000 {
+                    until = 1000
+                }
+                if wait == raw.FOREVER || until < wait as u64 {
+                    wait = until as u32
+                }
+            }
+            if backend.Backend.next_event(wait, &mut self.pending)? {
+                if self.pending.kind == raw.FRAME {
+                    pacer_signal(self.pending.window)
+                } else if let some(event) = convert(&self.pending) {
+                    return ok(some(event))
+                }
+                continue
+            }
+            if milliseconds != raw.FOREVER {
+                after := backend.Backend.clock()
+                if (after - start) / 1000000 >= milliseconds as u64 {
+                    late := pacer_due(after)
+                    if late != 0 {
+                        return ok(some(Event.Frame(late)))
+                    }
+                    return ok(none)
+                }
+            }
+        }
+    }
+    // macOS must not throttle the program with App Nap while it animates.
+    fn set_animating(&mut self, animating: bool) {
+        if animating != self.animating {
+            self.animating = animating
+            backend.Backend.set_animating(animating)
+        }
+    }
+}
+
+// -- Window -------------------------------------------------------------------
+
+// An open window. Closing happens with close() or when the value is dropped.
+// A window does not borrow its App; once the App is gone it reports Closed.
+pub struct Window {
+    id: u32
+    // False for a window opened with Options.gpu(), which never has pixels.
+    pixel_buffer: bool
+    // The pixel buffer, owned here so that only this window's own methods
+    // replace it, and its size. The window system repaints from it.
+    pixels: heap.Bytes
+    width: u32
+    height: u32
+
+    // The id its events carry.
+    pub fn id(&self) -> WindowId {
+        return self.id
+    }
+    // Size of the drawing area in pixels; also the size of canvas(). After a
+    // Resize event it is the new size. 0 by 0 once the window is closed.
     pub fn size(&self) -> graphics.Size {
-        return graphics.Size { width: self.backend.width(), height: self.backend.height() }
+        width := 0u32
+        height := 0u32
+        backend.Backend.size(self.id, &mut width, &mut height)
+        return graphics.Size { width: width, height: height }
     }
     pub fn width(&self) -> u32 {
-        return self.backend.width()
+        width := 0u32
+        height := 0u32
+        backend.Backend.size(self.id, &mut width, &mut height)
+        return width
     }
     pub fn height(&self) -> u32 {
-        return self.backend.height()
+        width := 0u32
+        height := 0u32
+        backend.Backend.size(self.id, &mut width, &mut height)
+        return height
     }
     // How much the window system enlarges content, in percent: 100 on a
     // classic display, 200 on a Retina or other high-density one. Canvases
     // are always in physical pixels; multiply sizes by this to keep them
     // readable, for example with font.medium().scaled(window.scale()).
     pub fn scale_percent(&self) -> u32 {
-        return self.backend.scale_percent()
+        return backend.Backend.scale_percent(self.id)
     }
     // scale_percent() rounded to a whole factor, at least 1.
     pub fn scale(&self) -> u32 {
-        factor := (self.backend.scale_percent() + 50) / 100
+        factor := (backend.Backend.scale_percent(self.id) + 50) / 100
         if factor == 0 {
             return 1
         }
@@ -285,202 +640,91 @@ pub struct Window {
     // Whether the window has a pixel buffer: false when it was opened with
     // Options.gpu().
     pub fn has_pixel_buffer(&self) -> bool {
-        return self.backend.has_pixel_buffer()
+        return self.pixel_buffer
     }
 
     // The window's pixel buffer as a canvas, in graphics.PixelFormat.Bgra8888.
-    // It keeps what was drawn into it until the window is resized. Drawing
-    // shows nothing until update(); the borrow must end before the next
-    // event call, since a resize replaces the buffer. A window without a
-    // pixel buffer lends out an empty 0x0 canvas.
+    // It keeps what was drawn into it until the window is resized, when it
+    // takes the new size here, keeping the old picture in its top-left
+    // corner. Drawing shows nothing until update(). A window without a pixel
+    // buffer lends out an empty 0x0 canvas.
     pub fn canvas(&mut self) -> graphics.Canvas from(self) {
-        width := self.backend.width()
-        height := self.backend.height()
-        stride := self.backend.stride()
-        if !self.backend.has_pixel_buffer() {
-            width = 0
-            height = 0
-            stride = 0
-        }
-        return graphics.Canvas.with_stride(self.backend.pixels(), width, height, stride, graphics.PixelFormat.Bgra8888)!
+        self.sync()
+        width := self.width
+        height := self.height
+        return graphics.Canvas.with_stride(self.pixels.bytes(), width, height, width as usize * 4, graphics.PixelFormat.Bgra8888)!
     }
     // Show the `dirty` part of the pixel buffer, typically the rectangle
     // canvas.take_dirty() returned. An empty rectangle shows nothing. Fails
-    // with Unsupported for a window without a pixel buffer, whose frames
-    // the GPU presents.
+    // with Unsupported for a window without a pixel buffer, whose frames the
+    // GPU presents.
     pub fn update(&mut self, dirty: graphics.Rect) -> void!Error {
-        if !self.backend.has_pixel_buffer() {
+        if !self.pixel_buffer {
+            self.check()?
             return err(Error.Unsupported)
         }
-        bounds := graphics.Rect { x: 0, y: 0, width: self.backend.width(), height: self.backend.height() }
+        bounds := graphics.Rect { x: 0, y: 0, width: self.width, height: self.height }
         area := dirty.intersect(&bounds)
         if area.is_empty() {
-            return ok()
+            return self.check()
         }
-        return self.backend.present(area.x, area.y, area.width, area.height)
+        return backend.Backend.present(self.id, area.x, area.y, area.width, area.height)
     }
     // Show the whole pixel buffer. Fails with Unsupported for a window
     // without one.
     pub fn update_all(&mut self) -> void!Error {
-        if !self.backend.has_pixel_buffer() {
+        if !self.pixel_buffer {
+            self.check()?
             return err(Error.Unsupported)
         }
-        width := self.backend.width()
-        height := self.backend.height()
-        if width == 0 || height == 0 {
-            return ok()
+        if self.width == 0 || self.height == 0 {
+            return self.check()
         }
-        return self.backend.present(0, 0, width, height)
+        return backend.Backend.present(self.id, 0, 0, self.width, self.height)
     }
 
-    // The next event, waiting as long as it takes. A program that stops
-    // animating calls this, which lets macOS throttle it again.
-    pub fn wait_event(&mut self) -> Event!Error {
-        if self.animating {
-            self.animating = false
-            self.backend.set_animating(false)
-        }
-        for {
-            if let some(event) = self.next(raw.FOREVER)? {
-                return ok(event)
-            }
-        }
-    }
-    // The next event, or none once it is time to draw the next frame. An
-    // animation handles events until none, draws, calls update() and asks
-    // again:
+    // Ask for one Frame event of this window when it is time to draw the
+    // next frame. An animation draws on each Frame and asks again:
     //
+    //     win.request_frame()?
     //     for {
-    //         match win.wait_event_until_frame()? {
-    //             some(event) => { ...handle it... }
-    //             none => { ...draw, then win.update(dirty)?... }
+    //         match app.wait_event()? {
+    //             window.Event.Frame(_) => {
+    //                 ...draw, then win.update(dirty)?...
+    //                 win.request_frame()?
+    //             }
+    //             ...other events...
     //         }
     //     }
     //
-    // A frame is due once per display refresh, frame_interval() apart,
-    // however many events arrive. Where the window system reports refreshes
-    // frames follow them: a display link on macOS 14 and later, the
-    // compositor's timing on Windows and the Present extension on X11;
-    // elsewhere a timer keeps the pace. A program slower than the display
-    // skips refreshes rather than falling behind, and a hidden window, whose
-    // display reports no refreshes, still gets a frame every two intervals.
-    // macOS does not put an animating program to sleep with App Nap until
-    // it calls wait_event() again.
-    pub fn wait_event_until_frame(&mut self) -> Option<Event>!Error {
-        if self.frame_deadline == 0 {
-            self.schedule_frame()?
-        }
-        for {
-            now := self.backend.clock()
-            if self.frame_signalled || now >= self.frame_deadline {
-                if self.frame_signalled {
-                    self.frame_previous = now
-                } else {
-                    self.frame_previous = self.frame_deadline
-                }
-                self.frame_signalled = false
-                self.frame_deadline = 0
-                return ok(none)
-            }
-            // Round up so the wait never ends early and spins.
-            wait := (self.frame_deadline - now + 999999) / 1000000
-            if wait > 1000 {
-                wait = 1000
-            }
-            if self.backend.next_event(wait as u32, &mut self.pending)? {
-                if self.pending.kind == raw.FRAME {
-                    self.note_frame()
-                } else if let some(event) = convert(&self.pending) {
-                    return ok(some(event))
-                }
-            }
-        }
+    // Frames come once per display refresh, frame_interval() apart, however
+    // many events arrive. Where the window system reports refreshes frames
+    // follow them: a display link on macOS 14 and later, the compositor's
+    // timing on Windows and the Present extension on X11; elsewhere a timer
+    // keeps the pace. A program slower than the display skips refreshes
+    // rather than falling behind, and a hidden window, whose display reports
+    // no refreshes, still gets a frame every two intervals. Asking again
+    // before the Frame arrives changes nothing. While any window waits for a
+    // frame macOS does not put the program to sleep with App Nap.
+    pub fn request_frame(&mut self) -> void!Error {
+        return pacer_request(self.id)
     }
     // How long one display refresh lasts, such as about 16.7 ms at 60 Hz:
-    // the time between frames of wait_event_until_frame(), for advancing an
-    // animation by one frame. 60 Hz when the window system does not say; on
-    // X11 the real period is known after about half a second of frames.
+    // the time between Frame events, for advancing an animation by one
+    // frame. 60 Hz when the window system does not say; on X11 the real
+    // period is known after about half a second of frames.
     pub fn frame_interval(&self) -> time.Duration {
-        return time.Duration.from_nanos(self.frame_period())
-    }
-    fn frame_period(&self) -> u64 {
-        period := self.backend.frame_period()
-        if period == 0 {
-            return 16666667
-        }
-        return period
-    }
-    // Set frame_deadline for the next frame.
-    fn schedule_frame(&mut self) -> void!Error {
-        if !self.animating {
-            self.animating = true
-            self.backend.set_animating(true)
-        }
-        period := self.frame_period()
-        if !self.frame_requested && !self.frame_signalled {
-            requested := self.backend.request_frame()?
-            self.frame_requested = requested
-        }
-        now := self.backend.clock()
-        if self.frame_requested {
-            // The FRAME event ends the wait; this deadline only matters
-            // when the display stops reporting refreshes.
-            self.frame_deadline = now + 2 * period
-            return ok()
-        }
-        vblank := self.backend.next_vblank(now)
-        if vblank > now {
-            self.frame_deadline = vblank
-            return ok()
-        }
-        // A timer at the refresh rate that keeps its phase, skipping the
-        // frames that were missed.
-        deadline := self.frame_previous + period
-        if deadline <= now {
-            deadline += ((now - deadline) / period + 1) * period
-        }
-        self.frame_deadline = deadline
-        return ok()
-    }
-    fn note_frame(&mut self) {
-        self.frame_requested = false
-        self.frame_signalled = true
-    }
-    // The next event if one is pending, without waiting.
-    pub fn poll_event(&mut self) -> Option<Event>!Error {
-        return self.next(0)
-    }
-    // The next event, waiting at most `milliseconds` for one; none when the
-    // time passes first. Use it to pace animation without a timer thread.
-    pub fn wait_event_timeout(&mut self, milliseconds: u32) -> Option<Event>!Error {
-        limit := milliseconds
-        if limit == raw.FOREVER {
-            limit = raw.FOREVER - 1
-        }
-        return self.next(limit)
-    }
-    fn next(&mut self, milliseconds: u32) -> Option<Event>!Error {
-        for {
-            if !self.backend.next_event(milliseconds, &mut self.pending)? {
-                return ok(none)
-            }
-            // A refresh that arrives here is kept for the next
-            // wait_event_until_frame(), not reported.
-            if self.pending.kind != raw.FRAME {
-                return ok(convert(&self.pending))
-            }
-            self.note_frame()
-        }
+        return time.Duration.from_nanos(frame_period(self.id))
     }
 
     pub fn set_title(&mut self, title: &str) -> void!Error {
-        return self.backend.set_title(title)
+        return backend.Backend.set_title(self.id, title)
     }
     // Show or hide the mouse pointer while it is over the window.
     pub fn set_cursor_visible(&mut self, visible: bool) -> void!Error {
-        return self.backend.set_cursor_visible(visible)
+        return backend.Backend.set_cursor_visible(self.id, visible)
     }
-    // -- GPU access ---------------------------------------------------------
+    // -- GPU access -------------------------------------------------------
 
     // The window system's objects behind this window, for creating a Vulkan,
     // OpenGL or Metal surface that draws straight into it: the X11 window
@@ -492,15 +736,16 @@ pub struct Window {
     // On Linux the first call loads libxcb (libxcb.so.1, part of every X11
     // installation) and opens a second connection to the X server, since
     // Vulkan and EGL need a library connection rather than std/window's own
-    // socket; programs that never ask need nothing beyond libc. The
-    // connection closes with the window. Fails with NoDisplay when libxcb is
-    // missing or cannot connect, and Closed after close().
+    // socket; programs that never ask need nothing beyond libc. That
+    // connection is shared by every window and closes with the App. Fails
+    // with NoDisplay when libxcb is missing or cannot connect, and Closed
+    // once the window or its App is closed.
     //
     // The addresses stay valid until the window closes: destroy every
     // surface made from them first. A window without a pixel buffer
     // (Options.gpu()) avoids keeping an unused one, but any window works.
     pub fn native_handle(&mut self) -> NativeHandle!Error {
-        return self.backend.native_handle()
+        return backend.Backend.native_handle(self.id)
     }
     // macOS: make a CAMetalLayer the backing layer of the window's view and
     // return its address, a CAMetalLayer * that the view keeps alive until
@@ -511,13 +756,76 @@ pub struct Window {
     // also across resizes. Fails with Unsupported on other systems and for a
     // window with a pixel buffer, whose own layer shows the buffer.
     pub fn metal_layer(&mut self) -> usize!Error {
-        return self.backend.metal_layer()
+        return backend.Backend.metal_layer(self.id)
     }
 
     // Close the window. Later calls fail with Closed; closing twice does
     // nothing. Dropping the window closes it too.
     pub fn close(&mut self) {
-        self.backend.close()
+        backend.Backend.close(self.id)
+        pacer_remove(self.id)
+        self.pixels = heap.Bytes.empty()
+        self.width = 0
+        self.height = 0
+    }
+    fn drop(&mut self) {
+        self.close()
+    }
+
+    // Closed when the window or its App has been closed.
+    fn check(&self) -> void!Error {
+        width := 0u32
+        height := 0u32
+        if !backend.Backend.size(self.id, &mut width, &mut height) {
+            return err(Error.Closed)
+        }
+        return ok()
+    }
+    // Bring the pixel buffer to the drawing area's current size, keeping the
+    // old picture in the top-left corner. False when memory runs out, which
+    // keeps the old buffer.
+    fn sync(&mut self) -> bool {
+        if !self.pixel_buffer {
+            return true
+        }
+        width := 0u32
+        height := 0u32
+        if !backend.Backend.size(self.id, &mut width, &mut height) {
+            if self.pixels.len() != 0 {
+                self.pixels = heap.Bytes.empty()
+            }
+            self.width = 0
+            self.height = 0
+            return true
+        }
+        if width == self.width && height == self.height && self.pixels.len() != 0 {
+            return true
+        }
+        match heap.Bytes.new(width as usize * height as usize * 4) {
+            some(next) => {
+                rows := smaller(height, self.height) as usize
+                row := smaller(width, self.width) as usize * 4
+                old_stride := self.width as usize * 4
+                new_stride := width as usize * 4
+                {
+                    source := self.pixels.view()
+                    target := next.bytes()
+                    for y in 0usize..rows {
+                        for i in 0usize..row {
+                            target[y * new_stride + i] = source[y * old_stride + i]
+                        }
+                    }
+                }
+                self.pixels = next
+                self.width = width
+                self.height = height
+                backend.Backend.attach(self.id, self.pixels.pointer(), width, height)
+                return true
+            }
+            none => {
+                return false
+            }
+        }
     }
 
     // -- graphics.Display -------------------------------------------------
@@ -535,11 +843,12 @@ pub struct Window {
     // updates just the part it covers. Fails with Device when the window
     // system fails or the window has no pixel buffer.
     pub fn present(&mut self, canvas: &graphics.Canvas, dirty: graphics.Rect) -> void!graphics.Error {
-        if !self.backend.has_pixel_buffer() {
+        if !self.pixel_buffer {
             return err(graphics.Error.Device)
         }
+        self.sync()
         bounds := canvas.bounds()
-        screen := graphics.Rect { x: 0, y: 0, width: self.backend.width(), height: self.backend.height() }
+        screen := graphics.Rect { x: 0, y: 0, width: self.width, height: self.height }
         inside := dirty.intersect(&bounds)
         area := inside.intersect(&screen)
         if area.is_empty() {
@@ -549,7 +858,7 @@ pub struct Window {
             pixels := self.canvas()
             pixels.blit_region(canvas, area.clone(), area.x, area.y)
         }
-        match self.backend.present(area.x, area.y, area.width, area.height) {
+        match backend.Backend.present(self.id, area.x, area.y, area.width, area.height) {
             ok() => {
                 return ok()
             }
@@ -558,6 +867,13 @@ pub struct Window {
             }
         }
     }
+}
+
+fn smaller(a: u32, b: u32) -> u32 {
+    if a < b {
+        return a
+    }
+    return b
 }
 
 // Physical keys, named after their position on a US keyboard.

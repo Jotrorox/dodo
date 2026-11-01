@@ -1,0 +1,419 @@
+package main
+
+import "std/embedded/executor"
+import "std/embedded/hal"
+import "std/embedded/hal/fake"
+
+// async fns on the host: futures run by the executor beside hand-written
+// tasks, awaiting times, ticks, signals, other async fns, and select/join,
+// against hal/fake's simulated clock.
+
+const BUTTON: executor.Signal = executor.Signal { id: 0 }
+const READING: executor.Signal = executor.Signal { id: 1 }
+const DONE: executor.Signal = executor.Signal { id: 2 }
+
+enum Fault {
+    Timeout,
+    Odd(u32)
+}
+
+// Counts drops, to check that cancelled futures drop what they hold.
+static mut DROPS: u32 = 0
+
+struct Guard {
+    id: u32
+
+    fn drop(&mut self) {
+        unsafe {
+            DROPS += self.id
+        }
+    }
+}
+
+async fn double_later(value: u32, ms: u32) -> u32 {
+    await executor.sleep_ms(ms)
+    return value * 2
+}
+
+async fn checked_half(value: u32) -> u32!Fault {
+    await executor.yield_now()
+    if value % 2 != 0 {
+        return err(Fault.Odd(value))
+    }
+    return ok(value / 2)
+}
+
+// `?` inside an async fn returns the error from the future.
+async fn quarter(value: u32) -> u32!Fault {
+    half := (await checked_half(value))?
+    return await checked_half(half)
+}
+
+// A generic async fn over a HAL pin.
+async fn blink<P: hal.OutputPin>(led: &mut P, times: u32, period_ms: u32) -> u32 {
+    ticker := executor.Ticker.every_ms(period_ms)
+    count := 0u32
+    for i in 0u32..times {
+        led.set_high()
+        await ticker.tick()
+        led.set_low()
+        await ticker.tick()
+        count += 1
+    }
+    return count
+}
+
+// A local buffer borrowed across awaits: it lives in the future's frame.
+async fn fill(out: &mut[4]u32) -> u32 {
+    buffer := [0u32; 4]
+    view := &mut buffer
+    for i in 0usize..4 {
+        value := await double_later(i as u32 + 1, 1)
+        view[i] = value
+    }
+    sum := 0u32
+    for i in 0usize..4 {
+        out[i] = buffer[i]
+        sum += buffer[i]
+    }
+    return sum
+}
+
+// A borrowed result keeps the borrow of the argument it comes from.
+async fn largest(items: &[u32]) -> &u32 {
+    best := 0usize
+    for i in 0usize..items.len {
+        await executor.yield_now()
+        if items[i] > items[best] {
+            best = i
+        }
+    }
+    return &items[best]
+}
+
+async fn copy_largest(items: &[u32], out: &mut u32) {
+    top := await largest(items)
+    *out = *top
+}
+
+// Matches and if-lets around awaits.
+async fn classify(values: &[u32], results: &mut[4]u32) {
+    for i in 0usize..values.len {
+        match await quarter(values[i]) {
+            ok(q) => {
+                results[i] = q
+            }
+            err(Fault.Odd(v)) => {
+                results[i] = 1000 + v
+            }
+            err(Fault.Timeout) => {
+                results[i] = 9999
+            }
+        }
+    }
+}
+
+struct Counter {
+    total: u32
+
+    // An async method borrowing its receiver.
+    async fn add_presses(&mut self, wanted: u32) -> u32 {
+        seen := 0u32
+        for seen < wanted {
+            seen += await BUTTON.wait()
+        }
+        self.total += seen
+        return seen
+    }
+}
+
+// Waits for a reading or times out.
+async fn reading_or_timeout(ms: u32) -> u32!Fault {
+    match await executor.select(READING.next_value(), executor.sleep_ms(ms)) {
+        executor.Which.First => {
+            return ok(77)
+        }
+        executor.Which.Second => {
+            return err(Fault.Timeout)
+        }
+    }
+}
+
+// Holds guards across awaits; dropping the suspended future drops them.
+async fn hold_guards() {
+    first := Guard { id: 1 }
+    await executor.sleep_ms(5)
+    second := Guard { id: 10 }
+    await executor.sleep_ms(1000)
+    core.drop(first)
+    core.drop(second)
+}
+
+async fn conditional_guard(make: bool) {
+    if make {
+        held := Guard { id: 1000 }
+        await executor.sleep_ms(1000)
+        core.drop(held)
+    }
+    await executor.sleep_ms(1000)
+}
+
+fn consume(guard: Guard) {
+    core.drop(guard)
+}
+
+async fn moved_guard() {
+    held := Guard { id: 5 }
+    consume(held)
+    await executor.sleep_ms(1000)
+}
+
+async fn loop_guards() {
+    for i in 0u32..3 {
+        held := Guard { id: 100 }
+        await executor.sleep_ms(10)
+    }
+    await executor.sleep_ms(1000)
+}
+
+// Polls `future` until the clock reaches `end_us`, then drops it, and
+// returns the drops that counted.
+fn cancel_at<F: executor.Task>(future: F, end_us: u64) -> u32 {
+    unsafe {
+        DROPS = 0
+    }
+    clock := fake.Clock.new()
+    {
+        task := future
+        runner := executor.Executor.new()
+        tasks: [1]&mut dyn executor.Task = [&mut task]
+        core.assert(!runner.run_until(&mut tasks, &mut clock, end_us))
+    }
+    unsafe {
+        return DROPS
+    }
+}
+
+async fn guarded(guard: Guard) -> u32 {
+    await executor.sleep_ms(1)
+    return guard.id
+}
+
+// A hand-written task beside async ones.
+struct Raiser {
+    timer: executor.Timer
+    started: bool
+
+    pub fn poll(&mut self, cx: &mut executor.Context) -> executor.Poll {
+        if !self.started {
+            self.started = true
+            self.timer.start_ms(cx, 3)
+        }
+        if self.timer.expired(cx) {
+            DONE.raise()
+            return executor.Poll.Ready
+        }
+        return executor.Poll.Pending
+    }
+}
+
+async fn wait_done() -> u64 {
+    await DONE.wait()
+    return 3
+}
+
+async fn both(a: &mut u32, b: &mut u32) {
+    await executor.join(set_after(a, 5, 2), set_after(b, 7, 4))
+}
+
+async fn set_after(target: &mut u32, value: u32, ms: u32) {
+    await executor.sleep_ms(ms)
+    *target = value
+}
+
+fn run_one<F: executor.Task>(future: &mut F, clock: &mut fake.Clock) {
+    tasks: [1]&mut dyn executor.Task = [future]
+    executor.run(&mut tasks, clock)
+}
+
+fn sequencing() {
+    clock := fake.Clock.new()
+    future := double_later(21, 5)
+    run_one(&mut future, &mut clock)
+    core.assert_eq(future.output(), 42u32)
+    core.assert_eq(clock.now_us(), 5000u64)
+}
+
+fn results() {
+    clock := fake.Clock.new()
+    good := quarter(40)
+    run_one(&mut good, &mut clock)
+    match good.output() {
+        ok(value) => core.assert_eq(value, 10u32),
+        err(_) => core.assert(false),
+    }
+    bad := quarter(6)
+    run_one(&mut bad, &mut clock)
+    match bad.output() {
+        ok(_) => core.assert(false),
+        err(Fault.Odd(value)) => core.assert_eq(value, 3u32),
+        err(Fault.Timeout) => core.assert(false),
+    }
+}
+
+fn generic_pins() {
+    clock := fake.Clock.new()
+    led := fake.Pin.new()
+    {
+        future := blink(&mut led, 3, 10)
+        run_one(&mut future, &mut clock)
+        core.assert_eq(future.output(), 3u32)
+    }
+    core.assert_eq(led.changes(), 6u32)
+    core.assert(!led.is_high())
+    core.assert_eq(clock.now_us(), 60_000u64)
+}
+
+fn frames() {
+    clock := fake.Clock.new()
+    out := [0u32; 4]
+    {
+        future := fill(&mut out)
+        run_one(&mut future, &mut clock)
+        core.assert_eq(future.output(), 20u32)
+    }
+    core.assert_eq(out[3], 8u32)
+    values := [40u32, 6, 8, 0]
+    results := [0u32; 4]
+    {
+        future := classify(&values, &mut results)
+        run_one(&mut future, &mut clock)
+    }
+    top := 0u32
+    {
+        future := copy_largest(&values, &mut top)
+        run_one(&mut future, &mut clock)
+    }
+    core.assert_eq(top, 40u32)
+    core.assert_eq(results[0], 10u32)
+    core.assert_eq(results[1], 1003u32)
+    core.assert_eq(results[2], 2u32)
+    core.assert_eq(results[3], 0u32)
+}
+
+fn methods_and_signals() {
+    BUTTON.reset()
+    clock := fake.Clock.new()
+    clock.interrupt_at(1_000, &BUTTON)
+    clock.interrupt_at(2_000, &BUTTON)
+    clock.interrupt_at(3_000, &BUTTON)
+    counter := Counter { total: 5 }
+    {
+        future := counter.add_presses(3)
+        run_one(&mut future, &mut clock)
+        core.assert_eq(future.output(), 3u32)
+    }
+    core.assert_eq(counter.total, 8u32)
+    core.assert_eq(clock.now_us(), 3_000u64)
+}
+
+fn select_and_join() {
+    READING.reset()
+    clock := fake.Clock.new()
+    {
+        timed_out := reading_or_timeout(4)
+        run_one(&mut timed_out, &mut clock)
+        match timed_out.output() {
+            ok(_) => core.assert(false),
+            err(Fault.Timeout) => {}
+            err(Fault.Odd(_)) => core.assert(false),
+        }
+    }
+    clock.interrupt_at(6_000, &READING)
+    {
+        answered := reading_or_timeout(100)
+        run_one(&mut answered, &mut clock)
+        match answered.output() {
+            ok(value) => core.assert_eq(value, 77u32),
+            err(_) => core.assert(false),
+        }
+    }
+    a := 0u32
+    b := 0u32
+    start := clock.now_us()
+    {
+        future := both(&mut a, &mut b)
+        run_one(&mut future, &mut clock)
+    }
+    core.assert_eq(a + b, 12u32)
+    core.assert_eq(clock.now_us() - start, 4_000u64)
+}
+
+fn mixed_tasks() {
+    DONE.reset()
+    clock := fake.Clock.new()
+    raiser := Raiser { timer: executor.Timer.new(), started: false }
+    waiter := wait_done()
+    {
+        tasks: [2]&mut dyn executor.Task = [&mut raiser, &mut waiter]
+        executor.run(&mut tasks, &mut clock)
+    }
+    core.assert_eq(waiter.output(), 3u64)
+    core.assert_eq(clock.now_us(), 3_000u64)
+}
+
+fn cancellation() {
+    unsafe {
+        DROPS = 0
+    }
+    clock := fake.Clock.new()
+    {
+        future := hold_guards()
+        runner := executor.Executor.new()
+        {
+            tasks: [1]&mut dyn executor.Task = [&mut future]
+            core.assert(!runner.run_until(&mut tasks, &mut clock, 10_000))
+        }
+        // Suspended at the second sleep: both guards are alive.
+        unsafe {
+            core.assert_eq(DROPS, 0u32)
+        }
+    }
+    unsafe {
+        core.assert_eq(DROPS, 11u32)
+        DROPS = 0
+    }
+    {
+        // Never polled: its argument is dropped with it.
+        unused := guarded(Guard { id: 100 })
+    }
+    unsafe {
+        core.assert_eq(DROPS, 100u32)
+        DROPS = 0
+    }
+    {
+        finished := guarded(Guard { id: 7 })
+        run_one(&mut finished, &mut clock)
+        core.assert_eq(finished.output(), 7u32)
+    }
+    unsafe {
+        core.assert_eq(DROPS, 7u32)
+    }
+    core.assert_eq(cancel_at(conditional_guard(true), 500), 1000u32)
+    core.assert_eq(cancel_at(conditional_guard(true), 1500_000), 1000u32)
+    core.assert_eq(cancel_at(conditional_guard(false), 500), 0u32)
+    core.assert_eq(cancel_at(moved_guard(), 500), 5u32)
+    core.assert_eq(cancel_at(loop_guards(), 25_000), 300u32)
+    core.assert_eq(cancel_at(loop_guards(), 40_000), 300u32)
+}
+
+fn main() {
+    sequencing()
+    results()
+    generic_pins()
+    frames()
+    methods_and_signals()
+    select_and_join()
+    mixed_tasks()
+    cancellation()
+}

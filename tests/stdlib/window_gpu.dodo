@@ -37,7 +37,8 @@ fn is_appkit(native: &handle.NativeHandle) -> bool {
 }
 
 fn run() -> void!window.Error {
-    win := window.open(window.Options.gpu("GPU", 200, 120))?
+    app := window.App.new()?
+    win := app.open(window.Options.gpu("GPU", 200, 120))?
     assert(!win.has_pixel_buffer())
     assert(win.width() > 0 && win.height() > 0)
     {
@@ -89,13 +90,13 @@ fn run() -> void!window.Error {
     // Events still flow; the window stays up briefly for the test to see.
     idle := 0u32
     for idle < 5 {
-        match win.wait_event_timeout(100)? {
-            some(window.Event.Key(key)) => {
+        match app.wait_event_timeout(100)? {
+            some(window.Event.Key(_, key)) => {
                 if key.key == window.Key.Escape {
                     break
                 }
             }
-            some(window.Event.Close) => {
+            some(window.Event.Close(_)) | some(window.Event.Quit) => {
                 break
             }
             some(_) => {}
@@ -115,7 +116,7 @@ fn run() -> void!window.Error {
         }
     }
     // A pixel-buffer window has no Metal layer to give.
-    plain := window.open(window.Options.new("Plain", 64, 64))?
+    plain := app.open(window.Options.new("Plain", 64, 64))?
     assert(plain.has_pixel_buffer())
     assert(rejected(match plain.metal_layer() {
         ok(_) => ok(),
