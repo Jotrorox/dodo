@@ -30,10 +30,10 @@ those changes with the CLI.
 ```sh
 git clone https://github.com/Jotrorox/dodo.git
 cd dodo
-git checkout v0.1.5
+git checkout v0.1.6
 ```
 
-The tag selects compiler release 0.1.5. For compiler development, use `main`
+The tag selects compiler release 0.1.6. For compiler development, use `main`
 instead. Run the commands on this page from the repository root.
 
 ## Install build prerequisites
@@ -183,7 +183,7 @@ python scripts/build-windows-llvm-support.py
 cargo build --locked --features llvm-sys/force-static --release --bin dodo --target x86_64-pc-windows-msvc
 python scripts/test_windows_native.py --linker clang
 python scripts/package-release.py --target x86_64-pc-windows-msvc
-python scripts/test_windows_release.py build/release-assets/dodo-0.1.5-x86_64-pc-windows-msvc.zip --linker clang
+python scripts/test_windows_release.py build/release-assets/dodo-0.1.6-x86_64-pc-windows-msvc.zip --linker clang
 ```
 
 The support script requires CMake and Visual Studio 2022. It builds the libxml2,
@@ -316,7 +316,7 @@ to contain a dated `## <version> — YYYY-MM-DD` entry. Run it locally before
 tagging:
 
 ```sh
-python3 scripts/check_release.py v0.1.5
+python3 scripts/check_release.py v0.1.6
 ```
 
 The workflow then runs the same build, test, and packaging jobs as CI and

@@ -470,7 +470,7 @@ fn commit_all(e: &mut Engine) -> void!db.Error {
     ok()
 }
 
-fn test_abort(e: &Engine, point: u32) {
+fn crash_point(e: &Engine, point: u32) {
     if e.test_crash == point {
         // Test hook: die like a crashed process (files stay as they are).
         core.assert(false)
@@ -536,7 +536,7 @@ fn commit_super(e: &mut Engine) -> void!db.Error {
         remove_path(&buf[..n])
         return err(io_fail(e, "disk I/O error (super-journal)"))
     }
-    test_abort(e, 1)
+    crash_point(e, 1)
     // Journals point at the super-journal; database files are written.
     first := true
     failure := false
@@ -556,7 +556,7 @@ fn commit_super(e: &mut Engine) -> void!db.Error {
             },
         }
         if first {
-            test_abort(e, 2)
+            crash_point(e, 2)
         }
         first = false
     }
@@ -587,11 +587,11 @@ fn commit_super(e: &mut Engine) -> void!db.Error {
             commit_db(e)?
         }
     }
-    test_abort(e, 3)
+    crash_point(e, 3)
     if !remove_path(&buf[..n]) {
         return err(io_fail(e, "disk I/O error (super-journal delete)"))
     }
-    test_abort(e, 4)
+    crash_point(e, 4)
     // Committed: the journals are deleted.
     result := true
     for k in 0usize..e.ndb {

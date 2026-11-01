@@ -182,15 +182,19 @@ a power-cut-safe key-value store on that flash, or on any device with the
 supports the Espressif ESP32-C6 and ESP32-C6-DevKitC-1: GPIO through the
 GPIO matrix, its interrupt matrix, I2C and SPI as master, polled, or target
 and serial ports through `std/embedded/peripheral/esp_i2c`, `esp_spi`, and
-`esp_uart`, SPI by DMA, CAN through `std/embedded/peripheral/esp_twai`,
-I2S audio through `std/embedded/chip/esp_i2s`, PWM outputs and inputs, the
-calibrated ADC and temperature sensor, the system timer's alarms, DMA
-copies, pulse trains through the remote control peripheral
+`esp_uart`, SPI by DMA, serial ports by DMA through
+`std/embedded/peripheral/esp_uhci`, CAN through `std/embedded/peripheral/esp_twai`,
+I2S audio through `std/embedded/chip/esp_i2s`, PWM outputs and inputs
+(`std/embedded/chip/esp_capture`), the calibrated ADC and temperature sensor
+with continuous sampling (`std/embedded/chip/esp_adc`), the system timer's
+alarms, DMA copies through `std/embedded/chip/esp_gdma`, pulse trains through the remote control peripheral
 (`std/embedded/peripheral/esp_rmt`) and WS2812 LEDs on it, such as the
 board's RGB LED, the random number
 generator, the watchdog, the low-power timer as a real-time clock, the
-flash above the program (`esp_rng`, `esp_watchdog`, `esp_rtc`,
-`esp_flash`), low power and hibernation (`esp_power`), the chip's own USB
+flash above the program (`std/embedded/chip/esp_rng`,
+`std/embedded/chip/esp_watchdog`, `std/embedded/chip/esp_rtc`,
+`std/embedded/chip/esp_flash`), low power and hibernation
+(`std/embedded/chip/esp_power`), the chip's own USB
 serial port through `std/embedded/peripheral/esp_usb_serial`, which `dodo
 run` also flashes through, and its low-power core, whose programs use
 `std/embedded/chip/esp32c6_lp` and share LP SRAM through
@@ -228,7 +232,7 @@ individual modules and links every public declaration back to its source.
 | [Allocation and boxes](allocation.md) | `alloc/arena`, `alloc/arena_box`, `alloc/block`, `alloc/boxed`, `alloc/error`, `alloc/layout`, `alloc/pool`, `alloc/pool_box`, `alloc/shared_arena`, `alloc/shared_box` | Portable. |
 | [Binary bytes](bytes.md) | `std/arena_bytes`, `std/bytes`, `std/bytes_alloc`, `std/pool_bytes` | Portable. |
 | [Byte I/O](io.md) | `std/io`, `std/io_alloc` | Portable. |
-| [Compression](compression.md) | `std/compress/deflate`, `std/compress/zlib`, `std/compress/gzip`, `std/compress/io` | Portable; caller-supplied buffers. |
+| [Compression](compression.md) | `std/compress/deflate`, `std/compress/zlib`, `std/compress/gzip`, `std/compress/brotli`, `std/compress/io` | Portable; caller-supplied buffers. `std/compress/brotli` decompresses only. |
 | [Console I/O](console.md) | `std/console` | Hosted. |
 | [Formatting](formatting.md) | `std/fmt`, `std/fmt/errors`, `std/fmt_alloc` | Portable. |
 | [UTF-8 text](text.md) | `std/text`, `std/text_alloc`, `std/text_shared` | Portable. |

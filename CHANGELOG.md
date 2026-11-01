@@ -1,6 +1,18 @@
 # Changelog
 
-## Unreleased
+## 0.1.6 — 2026-11-02
+
+Dodo 0.1.6 grows the language with interfaces and `dyn` references, function
+values and closures, tuples, type aliases, `async fn` and `await`, inline and
+global assembly, interrupt handlers, and placement and inlining attributes.
+Firmware reaches the Espressif ESP32-C6 and the Arduino Uno, and the RP2040
+and RP2350 gain DMA, PIO, PWM, the ADC, their second core, USB serial ports,
+flash storage, and deep sleep. The standard library adds desktop windows, 2D
+graphics, and portable GPU compute and rendering on Metal, Vulkan, and OpenGL;
+PNG and JPEG XL images; DEFLATE and Brotli compression; cryptography and QUIC;
+MQTT; an SQLite-compatible database engine and a PostgreSQL client; and a Lua
+5.4 implementation, all written in Dodo. A JetBrains plugin joins the VS Code
+extension. The language specification remains version 0.1.
 
 - JPEG XL in `std/image` loses its documented limitations.
   The decoder now handles patches and splines in upsampled frames, upsampled
@@ -1160,8 +1172,6 @@
   pause from 24 received bytes on. `set_break` holds the line low. On the
   RP2350, `pins.uart` also takes TX and RX on the UART_AUX pins (GPIO n
   with n % 4 of 2 and 3).
-- Fix `set_break(false)` waiting for the UART to go idle, which a break
-  prevents: ending a break now returns at once.
 - `std/embedded/hal/fake` gains `fake.Serial`, an in-memory serial port for
   testing drivers of devices on a serial line. The board self-tests check
   the serial port's pins, ownership, timing at 115200 baud and 1 Mbaud,
@@ -1223,6 +1233,10 @@
   (`pins.pwm_timer`), and PWM outputs expose the wrap interrupt; and
   `rp_capture` timestamps edges on a PIO state machine
   (`pins.edge_capture`).
+
+The compiler still implements a subset of the language design. See the
+[implementation status and limits](https://jotrorox.github.io/dodo/implementation/)
+for supported behavior and remaining work.
 
 ## 0.1.5 — 2026-10-12
 

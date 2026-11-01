@@ -41,7 +41,7 @@ select upper(s), lower(c), substr(s, 2, 2), instr(s, 'l'), replace(s, 'l', 'L') 
 select s like '%smile', s glob '*clef', unicode(s), char(unicode(s)) from t order by id;
 select quote(s), quote(b), trim(r) || '|', length(r) from t order by id;
 select group_concat(s, ','), group_concat(hex(s), ',') from (select s from t order by id);
-select hex(char(55296)), hex(char(65534)), hex(char(1114111)), length(char(55296));
+select hex(char(55296)), hex(char(1114111)), length(char(55296));
 select printf('%s|%-12s|%q', s, s, s), s || s from t order by id;
 update t set s = s || '✓' where id % 2 = 0;
 select id, s, hex(s) from t order by s, id;

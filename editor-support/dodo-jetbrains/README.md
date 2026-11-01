@@ -15,13 +15,13 @@ and other JetBrains IDEs, using the compiler's built-in `dodo lsp` language serv
 
 ## Install
 
-Install [Dodo](https://jotrorox.github.io/dodo/installation/) 0.1.5 or newer and
+Install [Dodo](https://jotrorox.github.io/dodo/installation/) 0.1.6 or newer and
 make sure `dodo --version` works. The plugin uses an existing compiler; it does not
 contain the compiler or LLVM.
 
 The plugin requires a 2026.2 or newer IDE that includes JetBrains' language server
-support, such as RustRover or CLion. Download `dodo-jetbrains-0.1.5.zip` from
-[GitHub Releases](https://github.com/Jotrorox/dodo/releases/tag/v0.1.5), then open
+support, such as RustRover or CLion. Download `dodo-jetbrains-0.1.6.zip` from
+[GitHub Releases](https://github.com/Jotrorox/dodo/releases/tag/v0.1.6), then open
 **Settings | Plugins**, click the gear icon, choose **Install Plugin from Disk...**,
 and select the ZIP file without extracting it.
 
@@ -34,7 +34,7 @@ cd editor-support/dodo-jetbrains
 ./gradlew buildPlugin
 ```
 
-The plugin is written to `build/distributions/dodo-jetbrains-0.1.5.zip`. Building
+The plugin is written to `build/distributions/dodo-jetbrains-0.1.6.zip`. Building
 it downloads CLion to compile against and does not require Rust or LLVM.
 
 ### Configure the compiler

@@ -1862,7 +1862,7 @@ fn win_frame_func(e: &mut Engine, wb: usize, fd: usize, f: usize, rows: usize, m
                 r2 += 1
             }
             if gc {
-                gc_value(e, slab, tmp, true)
+                gc_value(e, slab, tmp)
             } else {
                 agg_value(e, syn, tmp)?
             }
@@ -1888,7 +1888,7 @@ fn win_frame_func(e: &mut Engine, wb: usize, fd: usize, f: usize, rows: usize, m
                 inv += 1
             }
             if gc {
-                gc_value(e, slab, tmp, false)
+                gc_value(e, slab, tmp)
             } else {
                 agg_value(e, syn, tmp)?
             }
@@ -2092,20 +2092,16 @@ fn gc_inverse(e: &mut Engine, st: usize, x: usize) -> void!db.Error {
     ok()
 }
 
-// `fin` selects xFinalize (frames recomputed for EXCLUDE) over xValue,
-// which returns a one-byte string holding NUL for an empty result.
-fn gc_value(e: &mut Engine, st: usize, dst: usize, fin: bool) {
+// xValue and xFinalize (frames recomputed for EXCLUDE) both return '' when
+// the frame holds only empty strings, as in SQLite 3.54.1 (3.54.0's xValue
+// returned a one-byte string holding NUL).
+fn gc_value(e: &mut Engine, st: usize, dst: usize) {
     start := ldu(e.ws, st + GC_START)
     end := ldu(e.ws, st + GC_END)
     if end > start {
         set_bytes(e, dst, T_TEXT, start, end - start)
     } else if ldu(e.ws, st + GC_NACC) > 0 {
-        e.ws[start] = 0
-        set_bytes(e, dst, T_TEXT, start, if fin {
-            0usize
-        } else {
-            1usize
-        })
+        set_bytes(e, dst, T_TEXT, start, 0)
     } else {
         set_null(e, dst)
     }

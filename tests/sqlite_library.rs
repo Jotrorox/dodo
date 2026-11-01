@@ -144,6 +144,7 @@ fn localtime_matches_sqlite_in_several_time_zones() {
                 .arg(&workspace.0)
                 .arg(root().join("tests/sqlite/localtime.sql"))
                 .arg(root().join("tests/sqlite/localtime_zero_offset.sql"))
+                .arg(root().join("tests/sqlite/localtime_346.sql"))
                 .env("TZ", zone)
                 .output()
                 .unwrap(),

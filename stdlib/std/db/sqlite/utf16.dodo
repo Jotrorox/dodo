@@ -8,8 +8,9 @@ import "std/db"
 // invalid input maps the same way:
 //
 //   UTF-8 -> UTF-16: a lead byte >= 0xC0 absorbs every continuation byte
-//   that follows; code points below 0x80 decoded that way, surrogates and
-//   U+FFFE/U+FFFF become U+FFFD; any other byte stands for itself.
+//   that follows; code points below 0x80 decoded that way and surrogates
+//   become U+FFFD (SQLite before 3.54.1 also replaced U+FFFE and U+FFFF);
+//   any other byte stands for itself.
 //   UTF-16 -> UTF-8: a surrogate followed by another unit combines with it
 //   whatever it is; a trailing odd byte is dropped.
 //
@@ -42,7 +43,7 @@ fn u8_read(b: &[u8], p: usize, end: usize) -> (u32, usize) {
             c = ((c & 67108863) << 6) | ((b[q] & 63) as u32)
             q += 1
         }
-        if c < 128 || (c & 4294965248) == 55296 || (c & 4294967294) == 65534 {
+        if c < 128 || (c & 4294965248) == 55296 {
             c = 65533
         }
     }

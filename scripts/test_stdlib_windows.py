@@ -195,13 +195,13 @@ def main():
     if kernel32 is None:
         raise SystemExit("MinGW libkernel32.a not found; provide --kernel32 or install the MinGW development files")
     fixtures = [path.resolve() for path in args.fixture] if args.fixture else (
-        # window_events, window_frames, window_multi and window_desktop open real windows;
-        # tests/window_library.rs drives them. window_desktop also resizes its window and goes
-        # fullscreen, which needs a display. The gpu_metal_* fixtures need Metal, which only
-        # macOS has.
+        # window_events, window_frames, window_multi, window_desktop and window_gpu open real
+        # windows, which Wine cannot without a display; tests/window_library.rs drives them.
+        # window_desktop also resizes its window and goes fullscreen. The gpu_metal_* fixtures
+        # need Metal, which only macOS has.
         sorted(path for path in (ROOT / "tests/stdlib").glob("*.dodo")
                if path.name not in ("window_events.dodo", "window_frames.dodo", "window_multi.dodo",
-                                    "window_desktop.dodo")
+                                    "window_desktop.dodo", "window_gpu.dodo")
                and not path.name.startswith("gpu_metal")) +
         sorted(path for path in (ROOT / "tests/os").glob("*.dodo")
                if "_unix_" not in path.name and path.name not in (
@@ -210,6 +210,7 @@ def main():
         raise SystemExit("No standard-library fixtures found")
     executions = 0
     records = []
+    failures: list[str] = []
     with tempfile.TemporaryDirectory(prefix="dodo-windows-stdlib-") as directory:
         scratch = Path(directory)
         (scratch / "wine").mkdir()
@@ -268,49 +269,57 @@ def main():
                 run([clang, "--target=x86_64-pc-windows-msvc", "-ffreestanding", "-fno-builtin", "-fno-stack-protector",
                      "-O2", "-c", str(startup), "-o", str(runtime_object)])
                 for optimization in (0, 3):
-                    obj = scratch / f"{source.stem}-O{optimization}.obj"
-                    exe = obj.with_suffix(".exe")
-                    run([str(compiler), "build", str(source), "--emit", "obj", "--target", "x86_64-pc-windows-msvc",
-                         "--panic", panic, "-O", str(optimization), "-o", str(obj)])
-                    run([linker, "/nologo", "/nodefaultlib", "/entry:mainCRTStartup", "/subsystem:console", "/machine:x64",
-                         "/stack:8388608", f"/out:{exe}", str(runtime_object), str(stack_probe), str(alias_object), str(obj), str(kernel32),
-                         *[str(native_objects[path, optimization]) for path in boundaries],
-                         *([str(kernel32.parent / "libmsvcrt.a")] if boundaries else []),
-                         *([str(kernel32.parent / "libws2_32.a")]
-                           if any(path.parent.name == "net" for path in boundaries) else []),
-                         *([str(kernel32.parent / "libuser32.a"), str(kernel32.parent / "libgdi32.a")]
-                           if any(path.parent.name == "window" for path in boundaries) else [])])
-                    if exe.read_bytes()[:2] != b"MZ":
-                        raise RuntimeError(f"Linker did not produce a Windows executable: {exe}")
-                    work = scratch / f"work-{source.stem}-{optimization}"
-                    work.mkdir()
-                    if "process" in source.stem:
-                        shutil.copyfile(scratch / "os child.exe", work / "os child.exe")
-                        child_work = work / "child cwd é"
-                        child_work.mkdir()
-                        shutil.copyfile(scratch / "os child.exe", child_work / "os child.exe")
-                        (child_work / "cwd-marker").write_bytes(b"fixture")
-                    extra_args = ["space arg", "é", ""] if source.stem in ("env_checks", "hosted_env") else []
-                    exit_code = 0
-                    if source.stem == "console_checks":
-                        run_console([wine, str(exe)], env=env, cwd=work)
-                    elif source.stem in ("gpu_checks", "gpu_surface_checks"):
-                        # Wine has no GPU std/gpu can use: the fixtures must try
-                        # every backend, report each failure and exit 2.
-                        result = run([wine, str(exe)], env=env, cwd=work, allowed=(0, 2))
-                        exit_code = result.returncode
-                    else:
-                        run([wine, str(exe), *extra_args], env=env, cwd=work)
-                    executions += 1
-                    records.append({"fixture": source.name, "optimization": optimization,
-                                    "target": "x86_64-pc-windows-msvc", "exit_code": exit_code})
-                    print(f"PASS Windows x64 / Wine: {source.name} -O{optimization}", flush=True)
+                    # Run every fixture and report all failures at the end, so one
+                    # broken fixture does not hide the ones after it.
+                    try:
+                        obj = scratch / f"{source.stem}-O{optimization}.obj"
+                        exe = obj.with_suffix(".exe")
+                        run([str(compiler), "build", str(source), "--emit", "obj", "--target", "x86_64-pc-windows-msvc",
+                             "--panic", panic, "-O", str(optimization), "-o", str(obj)])
+                        run([linker, "/nologo", "/nodefaultlib", "/entry:mainCRTStartup", "/subsystem:console", "/machine:x64",
+                             "/stack:8388608", f"/out:{exe}", str(runtime_object), str(stack_probe), str(alias_object), str(obj), str(kernel32),
+                             *[str(native_objects[path, optimization]) for path in boundaries],
+                             *([str(kernel32.parent / "libmsvcrt.a")] if boundaries else []),
+                             *([str(kernel32.parent / "libws2_32.a")]
+                               if any(path.parent.name == "net" for path in boundaries) else []),
+                             *([str(kernel32.parent / "libuser32.a"), str(kernel32.parent / "libgdi32.a")]
+                               if any(path.parent.name == "window" for path in boundaries) else [])])
+                        if exe.read_bytes()[:2] != b"MZ":
+                            raise RuntimeError(f"Linker did not produce a Windows executable: {exe}")
+                        work = scratch / f"work-{source.stem}-{optimization}"
+                        work.mkdir()
+                        if "process" in source.stem:
+                            shutil.copyfile(scratch / "os child.exe", work / "os child.exe")
+                            child_work = work / "child cwd é"
+                            child_work.mkdir()
+                            shutil.copyfile(scratch / "os child.exe", child_work / "os child.exe")
+                            (child_work / "cwd-marker").write_bytes(b"fixture")
+                        extra_args = ["space arg", "é", ""] if source.stem in ("env_checks", "hosted_env") else []
+                        exit_code = 0
+                        if source.stem == "console_checks":
+                            run_console([wine, str(exe)], env=env, cwd=work)
+                        elif source.stem in ("gpu_checks", "gpu_feature_checks", "gpu_surface_checks", "gpu_wgsl_checks"):
+                            # Wine has no GPU std/gpu can use: the fixtures must try
+                            # every backend, report each failure and exit 2.
+                            result = run([wine, str(exe)], env=env, cwd=work, allowed=(0, 2))
+                            exit_code = result.returncode
+                        else:
+                            run([wine, str(exe), *extra_args], env=env, cwd=work)
+                        executions += 1
+                        records.append({"fixture": source.name, "optimization": optimization,
+                                        "target": "x86_64-pc-windows-msvc", "exit_code": exit_code})
+                        print(f"PASS Windows x64 / Wine: {source.name} -O{optimization}", flush=True)
+                    except RuntimeError as error:
+                        failures.append(f"{source.name} -O{optimization}")
+                        print(f"FAIL Windows x64 / Wine: {source.name} -O{optimization}\n{error}", flush=True)
         finally:
             subprocess.run([wineserver, "-k"], env=env, capture_output=True, timeout=20)
             subprocess.run([wineserver, "-w"], env=env, capture_output=True, timeout=20)
     if args.report:
         args.report.write_text(json.dumps({"executions": executions, "fixtures": records}, indent=2) + "\n")
     print(f"Passed {executions} Windows executions across {len(fixtures)} fixtures.")
+    if failures:
+        raise SystemExit(f"{len(failures)} Windows executions failed: {', '.join(failures)}")
 
 
 if __name__ == "__main__":

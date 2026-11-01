@@ -11,7 +11,11 @@ import "std/console"
 // pieces, 3 decompressed_size (prints the size as 8 little-endian bytes),
 // 4 decompress_with_workspace with a workspace of the given length, 5
 // decompress_with_workspace with exactly workspace_size(input) words.
-// Errors exit with 10 plus the error's position in brotli.Error.
+// Errors exit with 10 plus the error's position in brotli.Error. Empty
+// stdin decodes SAMPLE in mode 0, so the fixture also runs on its own.
+
+// "hello, brotli\n" as written by the brotli tool, after mode 0 and ring 0.
+const SAMPLE: [23]u8 = [0u8, 0u8, 0u8, 0u8, 0u8, 0x8fu8, 0x06u8, 0x80u8, 0x68u8, 0x65u8, 0x6cu8, 0x6cu8, 0x6fu8, 0x2cu8, 0x20u8, 0x62u8, 0x72u8, 0x6fu8, 0x74u8, 0x6cu8, 0x69u8, 0x0au8, 0x03u8]
 
 static mut INPUT: [33554432]u8 = [0u8; 33554432]
 static mut OUTPUT: [67108864]u8 = [0u8; 67108864]
@@ -74,6 +78,12 @@ fn run(input: &mut[u8], output: &mut[u8], window: &mut[u8], words: &mut[u16]) ->
             break
         }
         used += n
+    }
+    if used == 0 {
+        for i in 0usize..SAMPLE.len {
+            input[i] = SAMPLE[i]
+        }
+        used = SAMPLE.len
     }
     if used < 5 {
         return 2
