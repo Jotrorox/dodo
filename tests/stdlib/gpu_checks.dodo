@@ -1,0 +1,860 @@
+package main
+
+import "core/bytes"
+import "core/mem"
+import "std/console"
+import "std/gpu"
+
+// std/gpu on every backend this machine has. Each check prints its name;
+// a failed expectation panics with the reason. Exits 0 when at least one
+// backend ran every check, 2 when none could be opened.
+//
+// The shaders exist in each backend's language: MSL for Metal, GLSL for
+// OpenGL, and SPIR-V compiled from the same GLSL for Vulkan. Their readable
+// sources are in tests/gpu/shaders; scripts/generate_gpu_test_shaders.py
+// writes the constants at the end of this file.
+
+fn main() -> i32 {
+    ran := 0
+    if run(gpu.Preference.Vulkan, "Vulkan") {
+        ran += 1
+    }
+    if run(gpu.Preference.Metal, "Metal") {
+        ran += 1
+    }
+    if run(gpu.Preference.OpenGl, "OpenGL") {
+        ran += 1
+    }
+    if ran == 0 {
+        console.println("no backend")!
+        return 2
+    }
+    console.println("gpu ok")!
+    return 0
+}
+
+fn run(preference: gpu.Preference, label: &str) -> bool {
+    device := match gpu.Device.open(gpu.Options.with_backend(preference)) {
+        ok(device) => device,
+        err(error) => {
+            console.printf("skip {}: {}\n", label, gpu.error_name(error))!
+            return false
+        }
+    }
+    console.printf("{}: {}\n", label, device.name())!
+    match checks(&device) {
+        ok() => {}
+        err(error) => {
+            console.printf("{} failed: {}\n", label, gpu.error_name(error))!
+            assert(false, "a check returned an error")
+        }
+    }
+    console.printf("{} ok\n", label)!
+    return true
+}
+
+fn checks(device: &gpu.Device) -> void!gpu.Error {
+    check_errors(device)?
+    console.println("  errors")!
+    check_compute(device)?
+    console.println("  compute")!
+    check_ordering(device)?
+    console.println("  ordering")!
+    check_storage_texture(device)?
+    console.println("  storage texture")!
+    check_triangles(device)?
+    console.println("  triangles")!
+    check_depth(device)?
+    console.println("  depth")!
+    check_sampling(device)?
+    console.println("  sampling")!
+    check_blending(device)?
+    console.println("  blending")!
+    check_copies(device)?
+    console.println("  copies")!
+    check_lifetimes(device)?
+    console.println("  lifetimes")!
+    return ok()
+}
+
+fn expect_error(result: void!gpu.Error, wanted: &str) {
+    match result {
+        ok() => {
+            assert(false, "expected an error")
+        }
+        err(error) => {
+            name := gpu.error_name(error)
+            if !same(name, wanted) {
+                console.printf("expected {}, got {}\n", wanted, name)!
+                assert(false, "unexpected error")
+            }
+        }
+    }
+}
+
+fn drop_buffer(result: gpu.Buffer!gpu.Error) -> void!gpu.Error {
+    core.drop(result?)
+    return ok()
+}
+
+fn drop_texture(result: gpu.Texture!gpu.Error) -> void!gpu.Error {
+    core.drop(result?)
+    return ok()
+}
+
+fn drop_compute(result: gpu.ComputePipeline!gpu.Error) -> void!gpu.Error {
+    core.drop(result?)
+    return ok()
+}
+
+fn check_errors(device: &gpu.Device) -> void!gpu.Error {
+    expect_error(drop_buffer(device.create_buffer(0, gpu.BUFFER_STORAGE)), "InvalidInput")
+    expect_error(drop_buffer(device.create_buffer(16, 0)), "InvalidInput")
+    expect_error(drop_buffer(device.create_buffer(16, 1024)), "InvalidInput")
+    buffer := device.create_buffer(16, gpu.BUFFER_COPY_DST)?
+    bytes := [1u8, 2, 3, 4]
+    expect_error(device.write_buffer(&buffer, 13, &bytes), "InvalidInput")
+    device.write_buffer(&buffer, 12, &bytes)?
+    out := [0u8; 4]
+    expect_error(device.read_buffer(&buffer, 0, &mut out), "InvalidInput")
+    expect_error(drop_texture(device.create_texture(gpu.TextureDescriptor.new(0, 4, gpu.FORMAT_RGBA8_UNORM, gpu.TEXTURE_SAMPLED))), "InvalidInput")
+    expect_error(drop_texture(device.create_texture(gpu.TextureDescriptor.new(4, 4, gpu.FORMAT_DEPTH32_FLOAT, gpu.TEXTURE_STORAGE))), "InvalidInput")
+    expect_error(drop_texture(device.create_texture(gpu.TextureDescriptor.new(4, 4, gpu.FORMAT_BGRA8_UNORM, gpu.TEXTURE_STORAGE))), "InvalidInput")
+    texture := device.create_texture(gpu.TextureDescriptor.new(4, 4, gpu.FORMAT_RGBA8_UNORM, gpu.TEXTURE_COPY_DST))?
+    pixels := [0u8; 64]
+    expect_error(device.write_texture(&texture, gpu.Region.new(2, 0, 4, 4), &pixels, 16), "InvalidInput")
+    expect_error(device.write_texture(&texture, gpu.Region.new(0, 0, 4, 4), &pixels, 15), "InvalidInput")
+    expect_error(device.write_texture(&texture, gpu.Region.new(0, 0, 4, 4), &pixels[..60], 16), "InvalidInput")
+    device.write_texture(&texture, gpu.Region.new(0, 0, 4, 4), &pixels, 16)?
+
+    empty := gpu.ShaderSource.new()
+    expect_error(drop_compute(device.create_compute_pipeline(gpu.ComputePipelineDescriptor.new(&empty, "update", 64, 1, 1))), "MissingShader")
+    source := gpu.ShaderSource { spirv: &UPDATE_SPIRV, msl: MSL, glsl: UPDATE_GLSL }
+    expect_error(drop_compute(device.create_compute_pipeline(gpu.ComputePipelineDescriptor.new(&source, "update", 0, 1, 1))), "InvalidInput")
+    expect_error(drop_compute(device.create_compute_pipeline(gpu.ComputePipelineDescriptor.new(&source, "update", 4096, 1, 1))), "InvalidInput")
+    // The entry point must exist (OpenGL's is always main).
+    if !same(api_label(device), "OpenGL") {
+        expect_error(drop_compute(device.create_compute_pipeline(gpu.ComputePipelineDescriptor.new(&source, "missing", 64, 1, 1))), "InvalidShader")
+    }
+    broken := gpu.ShaderSource { spirv: &BROKEN_SPIRV, msl: "kernel void update( {", glsl: "#version 450\nlayout(local_size_x = 64) in;\nvoid main() { nonsense }\n" }
+    expect_error(drop_compute(device.create_compute_pipeline(gpu.ComputePipelineDescriptor.new(&broken, "update", 64, 1, 1))), "InvalidShader")
+    return ok()
+}
+
+fn same(a: &str, b: &str) -> bool {
+    return bytes.equal(mem.str_bytes(a), mem.str_bytes(b))
+}
+
+const BROKEN_SPIRV: [5]u32 = [0x07230203, 0x00010000, 0, 1, 0]
+
+fn api_label(device: &gpu.Device) -> &str from(static) {
+    api := device.api()
+    return gpu.api_name(&api)
+}
+
+fn check_compute(device: &gpu.Device) -> void!gpu.Error {
+    values := [0u32; 1000]
+    for i in 0usize..1000 {
+        values[i] = i as u32 + 1
+    }
+    buffer := device.create_buffer_with_data(gpu.u32_bytes(&values), gpu.BUFFER_STORAGE | gpu.BUFFER_COPY_SRC)?
+    params := [1000u32, 3]
+    uniform := device.create_buffer_with_data(gpu.u32_bytes(&params), gpu.BUFFER_UNIFORM)?
+    source := gpu.ShaderSource { spirv: &UPDATE_SPIRV, msl: MSL, glsl: UPDATE_GLSL }
+    bindings := [gpu.BindingLayout.storage_buffer(0, gpu.STAGE_COMPUTE), gpu.BindingLayout.uniform_buffer(1, gpu.STAGE_COMPUTE)]
+    descriptor := gpu.ComputePipelineDescriptor.new(&source, "update", 64, 1, 1)
+    descriptor.bindings = &bindings
+    pipeline := device.create_compute_pipeline(descriptor)?
+    encoder := device.encoder()?
+    {
+        pass := encoder.compute_pass()
+        pass.set_pipeline(&pipeline)
+        pass.set_buffer(0, &buffer)
+        pass.set_buffer(1, &uniform)
+        // The second dispatch sees the first one's writes.
+        pass.dispatch(16, 1, 1)
+        pass.dispatch(16, 1, 1)
+    }
+    encoder.submit()?
+    result := [0u32; 1000]
+    device.read_buffer(&buffer, 0, gpu.u32_bytes_mut(&mut result))?
+    for i in 0u32..1000 {
+        once := (i + 1) * 3 + i
+        assert(result[i as usize] == once * 3 + i, "compute result")
+    }
+    return ok()
+}
+
+fn double_pipeline(device: &gpu.Device) -> gpu.ComputePipeline!gpu.Error from(device) {
+    source := gpu.ShaderSource { spirv: &DOUBLE_SPIRV, msl: MSL, glsl: DOUBLE_GLSL }
+    bindings := [gpu.BindingLayout.read_only_storage_buffer(0, gpu.STAGE_COMPUTE), gpu.BindingLayout.storage_buffer(1, gpu.STAGE_COMPUTE)]
+    descriptor := gpu.ComputePipelineDescriptor.new(&source, "double_values", 64, 1, 1)
+    descriptor.bindings = &bindings
+    return device.create_compute_pipeline(descriptor)
+}
+
+fn run_double(device: &gpu.Device, pipeline: &gpu.ComputePipeline, source: &gpu.Buffer, target: &gpu.Buffer, groups: u32) -> void!gpu.Error {
+    encoder := device.encoder()?
+    {
+        pass := encoder.compute_pass()
+        pass.set_pipeline(pipeline)
+        pass.set_buffer(0, source)
+        pass.set_buffer(1, target)
+        pass.dispatch(groups, 1, 1)
+    }
+    return encoder.submit()
+}
+
+// Queue writes happen between the submissions around them.
+fn check_ordering(device: &gpu.Device) -> void!gpu.Error {
+    values := [0u32; 256]
+    for i in 0usize..256 {
+        values[i] = i as u32
+    }
+    source := device.create_buffer_with_data(gpu.u32_bytes(&values), gpu.BUFFER_STORAGE | gpu.BUFFER_COPY_DST)?
+    target := device.create_buffer(1024, gpu.BUFFER_STORAGE | gpu.BUFFER_COPY_SRC)?
+    pipeline := double_pipeline(device)?
+    run_double(device, &pipeline, &source, &target, 4)?
+    later := [0u32; 256]
+    for i in 0usize..256 {
+        later[i] = i as u32 + 1000
+    }
+    device.write_buffer(&source, 0, gpu.u32_bytes(&later))?
+    result := [0u32; 256]
+    device.read_buffer(&target, 0, gpu.u32_bytes_mut(&mut result))?
+    for i in 0usize..256 {
+        assert(result[i] == i as u32 * 2, "the write overtook an earlier submission")
+    }
+    run_double(device, &pipeline, &source, &target, 4)?
+    device.read_buffer(&target, 0, gpu.u32_bytes_mut(&mut result))?
+    for i in 0usize..256 {
+        assert(result[i] == (i as u32 + 1000) * 2, "a later submission missed the write")
+    }
+    return ok()
+}
+
+fn check_storage_texture(device: &gpu.Device) -> void!gpu.Error {
+    image := device.create_texture(gpu.TextureDescriptor.new(16, 16, gpu.FORMAT_R32_UINT, gpu.TEXTURE_STORAGE | gpu.TEXTURE_COPY_SRC))?
+    source := gpu.ShaderSource { spirv: &FILL_SPIRV, msl: MSL, glsl: FILL_GLSL }
+    bindings := [gpu.BindingLayout.storage_texture(0, gpu.STAGE_COMPUTE, gpu.FORMAT_R32_UINT)]
+    descriptor := gpu.ComputePipelineDescriptor.new(&source, "fill", 8, 8, 1)
+    descriptor.bindings = &bindings
+    pipeline := device.create_compute_pipeline(descriptor)?
+    encoder := device.encoder()?
+    {
+        pass := encoder.compute_pass()
+        pass.set_pipeline(&pipeline)
+        pass.set_storage_texture(0, &image)
+        pass.dispatch(2, 2, 1)
+    }
+    encoder.submit()?
+    texels := [0u32; 256]
+    device.read_texture(&image, image.region(), gpu.u32_bytes_mut(&mut texels), 64)?
+    for y in 0u32..16 {
+        for x in 0u32..16 {
+            assert(texels[(y * 16 + x) as usize] == x + y * 100, "storage texture texel")
+        }
+    }
+    return ok()
+}
+
+fn pixel(pixels: &[u8], width: u32, x: u32, y: u32) -> u32 {
+    i := ((y * width + x) * 4) as usize
+    return pixels[i] as u32 | (pixels[i + 1] as u32 << 8) | (pixels[i + 2] as u32 << 16) | (pixels[i + 3] as u32 << 24)
+}
+
+fn expect_pixel(pixels: &[u8], width: u32, x: u32, y: u32, wanted: u32) {
+    got := pixel(pixels, width, x, y)
+    if got != wanted {
+        console.printf("pixel ({}, {}) is {}, expected {}\n", x, y, got, wanted)!
+        assert(false, "wrong pixel")
+    }
+}
+
+const RED: u32 = 0xff0000ff
+const GREEN: u32 = 0xff00ff00
+const BLUE: u32 = 0xffff0000
+const WHITE: u32 = 0xffffffff
+const BLACK: u32 = 0xff000000
+
+fn color_pipeline(device: &gpu.Device, depth: bool, cull: u32) -> gpu.RenderPipeline!gpu.Error from(device) {
+    vertex := gpu.ShaderSource { spirv: &COLOR_VERTEX_SPIRV, msl: MSL, glsl: COLOR_GLSL }
+    fragment := gpu.ShaderSource { spirv: &COLOR_FRAGMENT_SPIRV, msl: MSL, glsl: COLOR_GLSL }
+    positions := [gpu.VertexAttribute.new(0, gpu.VERTEX_FLOAT32X3, 0)]
+    colors := [gpu.VertexAttribute.new(1, gpu.VERTEX_UNORM8X4, 0)]
+    layouts := [gpu.VertexBufferLayout.new(12, &positions), gpu.VertexBufferLayout.new(4, &colors)]
+    descriptor := gpu.RenderPipelineDescriptor.new(&vertex, "color_vertex", &fragment, "color_fragment", gpu.FORMAT_RGBA8_UNORM)
+    descriptor.vertex_buffers = &layouts
+    descriptor.cull_mode = cull
+    if depth {
+        descriptor.depth_format = gpu.FORMAT_DEPTH32_FLOAT
+    }
+    return device.create_render_pipeline(descriptor)
+}
+
+// Clip space has y up; front faces wind counterclockwise there.
+fn check_triangles(device: &gpu.Device) -> void!gpu.Error {
+    target := device.create_texture(gpu.TextureDescriptor.new(64, 64, gpu.FORMAT_RGBA8_UNORM, gpu.TEXTURE_RENDER | gpu.TEXTURE_COPY_SRC))?
+    pipeline := color_pipeline(device, false, gpu.CULL_BACK)?
+    positions := [
+        // Top left, counterclockwise: drawn.
+        -1.0f32, 1.0, 0.5, -1.0, 0.0, 0.5, 0.0, 1.0, 0.5,
+        // Bottom left, counterclockwise: drawn.
+        -1.0, 0.0, 0.5, -1.0, -1.0, 0.5, 0.0, -1.0, 0.5,
+        // Bottom right, clockwise: culled.
+        0.0, -1.0, 0.5, 1.0, 0.0, 0.5, 1.0, -1.0, 0.5,
+    ]
+    colors := [RED, RED, RED, BLUE, BLUE, BLUE, GREEN, GREEN, GREEN]
+    position_buffer := device.create_buffer_with_data(gpu.f32_bytes(&positions), gpu.BUFFER_VERTEX)?
+    color_buffer := device.create_buffer_with_data(gpu.u32_bytes(&colors), gpu.BUFFER_VERTEX)?
+    encoder := device.encoder()?
+    {
+        color := gpu.ColorAttachment.clear(&target, 0.0, 0.0, 0.0, 1.0)
+        pass := encoder.render_pass(color)
+        pass.set_pipeline(&pipeline)
+        pass.set_vertex_buffer(0, &position_buffer, 0)
+        pass.set_vertex_buffer(1, &color_buffer, 0)
+        pass.draw(9, 1, 0, 0)
+    }
+    encoder.submit()?
+    pixels := [0u8; 16384]
+    device.read_texture(&target, target.region(), &mut pixels, 256)?
+    expect_pixel(&pixels, 64, 8, 8, RED)
+    expect_pixel(&pixels, 64, 8, 56, BLUE)
+    expect_pixel(&pixels, 64, 56, 56, BLACK)
+    expect_pixel(&pixels, 64, 56, 8, BLACK)
+    return ok()
+}
+
+fn check_depth(device: &gpu.Device) -> void!gpu.Error {
+    target := device.create_texture(gpu.TextureDescriptor.new(32, 32, gpu.FORMAT_RGBA8_UNORM, gpu.TEXTURE_RENDER | gpu.TEXTURE_COPY_SRC))?
+    depth := device.create_texture(gpu.TextureDescriptor.new(32, 32, gpu.FORMAT_DEPTH32_FLOAT, gpu.TEXTURE_RENDER | gpu.TEXTURE_COPY_SRC))?
+    pipeline := color_pipeline(device, true, gpu.CULL_NONE)?
+    positions := [
+        -1.0f32, 1.0, 0.25, -1.0, -1.0, 0.25, 1.0, 1.0, 0.25, 1.0, -1.0, 0.25,
+        -1.0, 1.0, 0.75, -1.0, -1.0, 0.75, 1.0, 1.0, 0.75, 1.0, -1.0, 0.75,
+    ]
+    colors := [BLUE, BLUE, BLUE, BLUE, RED, RED, RED, RED]
+    indices := [0u16, 1, 2, 2, 1, 3]
+    position_buffer := device.create_buffer_with_data(gpu.f32_bytes(&positions), gpu.BUFFER_VERTEX)?
+    color_buffer := device.create_buffer_with_data(gpu.u32_bytes(&colors), gpu.BUFFER_VERTEX)?
+    index_buffer := device.create_buffer_with_data(gpu.u16_bytes(&indices), gpu.BUFFER_INDEX)?
+    readback := device.create_buffer(4096, gpu.BUFFER_COPY_DST | gpu.BUFFER_COPY_SRC)?
+    encoder := device.encoder()?
+    {
+        color := gpu.ColorAttachment.clear(&target, 0.0, 0.0, 0.0, 1.0)
+        depth_attachment := gpu.DepthAttachment.clear(&depth, 1.0)
+        pass := encoder.render_pass_with_depth(color, depth_attachment)
+        pass.set_pipeline(&pipeline)
+        pass.set_vertex_buffer(0, &position_buffer, 0)
+        pass.set_vertex_buffer(1, &color_buffer, 0)
+        pass.set_index_buffer(&index_buffer, gpu.INDEX_UINT16, 0)
+        // The near blue quad first; the far red one fails the depth test.
+        pass.draw_indexed(6, 1, 0, 0, 0)
+        pass.draw_indexed(6, 1, 0, 4, 0)
+    }
+    encoder.copy_texture_to_buffer(&depth, depth.region(), &readback, 0, 128)
+    encoder.submit()?
+    pixels := [0u8; 4096]
+    device.read_texture(&target, target.region(), &mut pixels, 128)?
+    expect_pixel(&pixels, 32, 16, 16, BLUE)
+    expect_pixel(&pixels, 32, 2, 30, BLUE)
+    depths := [0.0f32; 1024]
+    device.read_buffer(&readback, 0, gpu.f32_bytes_mut(&mut depths))?
+    assert(depths[16 * 32 + 16] > 0.249 && depths[16 * 32 + 16] < 0.251, "depth value")
+    return ok()
+}
+
+fn screen_pipeline(device: &gpu.Device, fragment: &gpu.ShaderSource, entry: &str, bindings: &[gpu.BindingLayout], blend: u32) -> gpu.RenderPipeline!gpu.Error from(device) {
+    vertex := gpu.ShaderSource { spirv: &SCREEN_VERTEX_SPIRV, msl: MSL, glsl: fragment.glsl }
+    descriptor := gpu.RenderPipelineDescriptor.new(&vertex, "screen_vertex", fragment, entry, gpu.FORMAT_RGBA8_UNORM)
+    descriptor.bindings = bindings
+    descriptor.blend = blend
+    return device.create_render_pipeline(descriptor)
+}
+
+// Texture rows run top to bottom in memory, on screen and in uv space.
+fn check_sampling(device: &gpu.Device) -> void!gpu.Error {
+    image := device.create_texture(gpu.TextureDescriptor.new(2, 2, gpu.FORMAT_RGBA8_UNORM, gpu.TEXTURE_SAMPLED | gpu.TEXTURE_COPY_DST))?
+    texels := [RED, GREEN, BLUE, WHITE]
+    device.write_texture(&image, image.region(), gpu.u32_bytes(&texels), 8)?
+    sampler := device.create_sampler(gpu.SamplerDescriptor.nearest())?
+    target := device.create_texture(gpu.TextureDescriptor.new(64, 64, gpu.FORMAT_RGBA8_UNORM, gpu.TEXTURE_RENDER | gpu.TEXTURE_COPY_SRC))?
+    fragment := gpu.ShaderSource { spirv: &TEXTURE_FRAGMENT_SPIRV, msl: MSL, glsl: TEXTURE_GLSL }
+    bindings := [gpu.BindingLayout.sampled_texture(0, gpu.STAGE_FRAGMENT)]
+    pipeline := screen_pipeline(device, &fragment, "texture_fragment", &bindings, gpu.BLEND_REPLACE)?
+    encoder := device.encoder()?
+    {
+        color := gpu.ColorAttachment.clear(&target, 0.0, 0.0, 0.0, 1.0)
+        pass := encoder.render_pass(color)
+        pass.set_pipeline(&pipeline)
+        pass.set_texture(0, &image, &sampler)
+        pass.draw(3, 1, 0, 0)
+    }
+    encoder.submit()?
+    pixels := [0u8; 16384]
+    device.read_texture(&target, target.region(), &mut pixels, 256)?
+    expect_pixel(&pixels, 64, 16, 16, RED)
+    expect_pixel(&pixels, 64, 48, 16, GREEN)
+    expect_pixel(&pixels, 64, 16, 48, BLUE)
+    expect_pixel(&pixels, 64, 48, 48, WHITE)
+    return ok()
+}
+
+fn check_blending(device: &gpu.Device) -> void!gpu.Error {
+    target := device.create_texture(gpu.TextureDescriptor.new(16, 16, gpu.FORMAT_RGBA8_UNORM, gpu.TEXTURE_RENDER | gpu.TEXTURE_COPY_SRC))?
+    shade := [1.0f32, 0.0, 0.0, 0.5]
+    uniform := device.create_buffer_with_data(gpu.f32_bytes(&shade), gpu.BUFFER_UNIFORM)?
+    fragment := gpu.ShaderSource { spirv: &CONSTANT_FRAGMENT_SPIRV, msl: MSL, glsl: CONSTANT_GLSL }
+    bindings := [gpu.BindingLayout.uniform_buffer(0, gpu.STAGE_FRAGMENT)]
+    pipeline := screen_pipeline(device, &fragment, "constant_fragment", &bindings, gpu.BLEND_ALPHA)?
+    encoder := device.encoder()?
+    {
+        color := gpu.ColorAttachment.clear(&target, 1.0, 1.0, 1.0, 1.0)
+        pass := encoder.render_pass(color)
+        pass.set_pipeline(&pipeline)
+        pass.set_buffer(0, &uniform)
+        pass.draw(3, 1, 0, 0)
+    }
+    encoder.submit()?
+    pixels := [0u8; 1024]
+    device.read_texture(&target, target.region(), &mut pixels, 64)?
+    i := ((8 * 16 + 8) * 4) as usize
+    assert(pixels[i] == 255 && pixels[i + 1] >= 126 && pixels[i + 1] <= 129 && pixels[i + 2] >= 126 && pixels[i + 2] <= 129 && pixels[i + 3] == 255, "blended color")
+    return ok()
+}
+
+fn check_copies(device: &gpu.Device) -> void!gpu.Error {
+    values := [0u32; 64]
+    for i in 0usize..64 {
+        values[i] = i as u32 * 7
+    }
+    source := device.create_buffer_with_data(gpu.u32_bytes(&values), gpu.BUFFER_COPY_SRC)?
+    target := device.create_buffer(256, gpu.BUFFER_COPY_DST | gpu.BUFFER_COPY_SRC)?
+    // Texels travel through a texture with padded rows both ways.
+    texels := [0u32; 256]
+    for i in 0usize..256 {
+        texels[i] = i as u32 * 0x01010101
+    }
+    padded := device.create_buffer_with_data(gpu.u32_bytes(&texels), gpu.BUFFER_COPY_SRC)?
+    image := device.create_texture(gpu.TextureDescriptor.new(8, 4, gpu.FORMAT_RGBA8_UNORM, gpu.TEXTURE_COPY_DST | gpu.TEXTURE_COPY_SRC))?
+    back := device.create_buffer(1024, gpu.BUFFER_COPY_DST | gpu.BUFFER_COPY_SRC)?
+    encoder := device.encoder()?
+    encoder.copy_buffer(&source, 64, &target, 0, 128)
+    encoder.copy_buffer_to_texture(&padded, 0, 256, &image, image.region())
+    encoder.copy_texture_to_buffer(&image, gpu.Region.new(2, 1, 4, 2), &back, 256, 512)
+    encoder.submit()?
+    result := [0u32; 32]
+    device.read_buffer(&target, 0, gpu.u32_bytes_mut(&mut result))?
+    for i in 0usize..32 {
+        assert(result[i] == (i as u32 + 16) * 7, "buffer copy")
+    }
+    rows := [0u32; 256]
+    device.read_buffer(&back, 0, gpu.u32_bytes_mut(&mut rows))?
+    // Texel (x, y) came from word y * 64 + x of the padded buffer.
+    for y in 0u32..2 {
+        for x in 0u32..4 {
+            wanted := texels[((y + 1) * 64 + x + 2) as usize]
+            assert(rows[(64 + y * 128 + x) as usize] == wanted, "texture copy")
+        }
+    }
+    image_texels := [0u32; 32]
+    device.read_texture(&image, image.region(), gpu.u32_bytes_mut(&mut image_texels), 32)?
+    assert(image_texels[3 * 8 + 5] == texels[3 * 64 + 5], "texture contents")
+    return ok()
+}
+
+// Objects dropped while the GPU may still use them stay alive until it
+// is done, including ones dropped before their encoder was submitted.
+fn check_lifetimes(device: &gpu.Device) -> void!gpu.Error {
+    pipeline := double_pipeline(device)?
+    values := [0u32; 64]
+    for i in 0usize..64 {
+        values[i] = i as u32
+    }
+    keep := device.create_buffer(256, gpu.BUFFER_STORAGE | gpu.BUFFER_COPY_SRC)?
+    for round in 0u32..100 {
+        source := device.create_buffer_with_data(gpu.u32_bytes(&values), gpu.BUFFER_STORAGE)?
+        scratch := device.create_buffer(256, gpu.BUFFER_STORAGE)?
+        encoder := device.encoder()?
+        {
+            pass := encoder.compute_pass()
+            pass.set_pipeline(&pipeline)
+            pass.set_buffer(0, &source)
+            pass.set_buffer(1, &scratch)
+            pass.dispatch(1, 1, 1)
+            pass.set_buffer(0, &scratch)
+            pass.set_buffer(1, &keep)
+            pass.dispatch(1, 1, 1)
+        }
+        core.drop(source)
+        core.drop(scratch)
+        encoder.submit()?
+        values[round as usize % 64] += 1
+    }
+    result := [0u32; 64]
+    device.read_buffer(&keep, 0, gpu.u32_bytes_mut(&mut result))?
+    // The last round doubled twice what values held before its increment.
+    for i in 0usize..64 {
+        before := values[i]
+        if i == 99 % 64 {
+            before -= 1
+        }
+        assert(result[i] == before * 4, "lifetime round result")
+    }
+    // An encoder dropped without submitting discards its work.
+    {
+        encoder := device.encoder()?
+        pass := encoder.compute_pass()
+        pass.set_pipeline(&pipeline)
+        pass.end()
+    }
+    device.wait()?
+    return ok()
+}
+
+// Shaders, generated by scripts/generate_gpu_test_shaders.py from tests/gpu/shaders.
+
+const MSL: &str = "#include <metal_stdlib>\nusing namespace metal;\n\nstruct Params {\n    uint count;\n    uint factor;\n};\n\nkernel void update(device uint *values [[buffer(0)]], constant Params &params [[buffer(1)]], uint i [[thread_position_in_grid]]) {\n    if (i < params.count) {\n        values[i] = values[i] * params.factor + i;\n    }\n}\n\nkernel void double_values(device const uint *source [[buffer(0)]], device uint *target [[buffer(1)]], uint i [[thread_position_in_grid]]) {\n    target[i] = source[i] * 2u;\n}\n\nkernel void fill(texture2d<uint, access::write> image [[texture(0)]], uint2 id [[thread_position_in_grid]]) {\n    image.write(uint4(id.x + id.y * 100u, 0u, 0u, 0u), id);\n}\n\nstruct ColorIn {\n    float3 position [[attribute(0)]];\n    float4 color [[attribute(1)]];\n};\n\nstruct ColorOut {\n    float4 position [[position]];\n    float4 color;\n};\n\nvertex ColorOut color_vertex(ColorIn in [[stage_in]]) {\n    ColorOut out;\n    out.position = float4(in.position, 1.0);\n    out.color = in.color;\n    return out;\n}\n\nfragment float4 color_fragment(ColorOut in [[stage_in]]) {\n    return in.color;\n}\n\nstruct ScreenOut {\n    float4 position [[position]];\n    float2 uv;\n};\n\nvertex ScreenOut screen_vertex(uint id [[vertex_id]]) {\n    float2 corner = float2((id << 1) & 2, id & 2);\n    ScreenOut out;\n    out.position = float4(corner * 2.0 - 1.0, 0.0, 1.0);\n    out.uv = float2(corner.x, 1.0 - corner.y);\n    return out;\n}\n\nfragment float4 texture_fragment(ScreenOut in [[stage_in]], texture2d<float> image [[texture(0)]], sampler nearest [[sampler(0)]]) {\n    return image.sample(nearest, in.uv);\n}\n\nfragment float4 constant_fragment(ScreenOut in [[stage_in]], constant float4 &color [[buffer(0)]]) {\n    return color;\n}\n"
+
+const UPDATE_GLSL: &str = "#version 450\nlayout(local_size_x = 64) in;\nlayout(std430, binding = 0) buffer Data { uint values[]; };\nlayout(std140, binding = 1) uniform Params { uint count; uint factor; };\nvoid main() {\n    uint i = gl_GlobalInvocationID.x;\n    if (i < count) {\n        values[i] = values[i] * factor + i;\n    }\n}\n"
+
+const DOUBLE_GLSL: &str = "#version 450\nlayout(local_size_x = 64) in;\nlayout(std430, binding = 0) readonly buffer Source { uint source[]; };\nlayout(std430, binding = 1) buffer Target { uint target[]; };\nvoid main() {\n    uint i = gl_GlobalInvocationID.x;\n    target[i] = source[i] * 2u;\n}\n"
+
+const FILL_GLSL: &str = "#version 450\nlayout(local_size_x = 8, local_size_y = 8) in;\nlayout(r32ui, binding = 0) uniform writeonly uimage2D image;\nvoid main() {\n    uvec2 id = gl_GlobalInvocationID.xy;\n    imageStore(image, ivec2(id), uvec4(id.x + id.y * 100u));\n}\n"
+
+const COLOR_GLSL: &str = "#version 450\n#ifdef VERTEX\nlayout(location = 0) in vec3 position;\nlayout(location = 1) in vec4 color;\nlayout(location = 0) out vec4 shade;\nvoid main() {\n    gl_Position = vec4(position, 1.0);\n    shade = color;\n}\n#endif\n#ifdef FRAGMENT\nlayout(location = 0) in vec4 shade;\nlayout(location = 0) out vec4 result;\nvoid main() {\n    result = shade;\n}\n#endif\n"
+
+const TEXTURE_GLSL: &str = "#version 450\n#ifdef VULKAN\n#define VERTEX_ID gl_VertexIndex\n#else\n#define VERTEX_ID gl_VertexID\n#endif\n#ifdef VERTEX\nlayout(location = 0) out vec2 uv;\nvoid main() {\n    vec2 corner = vec2((VERTEX_ID << 1) & 2, VERTEX_ID & 2);\n    gl_Position = vec4(corner * 2.0 - 1.0, 0.0, 1.0);\n    uv = vec2(corner.x, 1.0 - corner.y);\n}\n#endif\n#ifdef FRAGMENT\nlayout(location = 0) in vec2 uv;\nlayout(binding = 0) uniform sampler2D image;\nlayout(location = 0) out vec4 result;\nvoid main() {\n    result = texture(image, uv);\n}\n#endif\n"
+
+const CONSTANT_GLSL: &str = "#version 450\n#ifdef VULKAN\n#define VERTEX_ID gl_VertexIndex\n#else\n#define VERTEX_ID gl_VertexID\n#endif\n#ifdef VERTEX\nlayout(location = 0) out vec2 uv;\nvoid main() {\n    vec2 corner = vec2((VERTEX_ID << 1) & 2, VERTEX_ID & 2);\n    gl_Position = vec4(corner * 2.0 - 1.0, 0.0, 1.0);\n    uv = vec2(corner.x, 1.0 - corner.y);\n}\n#endif\n#ifdef FRAGMENT\nlayout(std140, binding = 0) uniform Color { vec4 color; };\nlayout(location = 0) out vec4 result;\nvoid main() {\n    result = color;\n}\n#endif\n"
+
+const UPDATE_SPIRV: [327]u32 = [
+    0x07230203, 0x00010500, 0x0008000b, 0x00000030, 0x00000000, 0x00020011,
+    0x00000001, 0x0006000b, 0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e,
+    0x00000000, 0x0003000e, 0x00000000, 0x00000001, 0x0008000f, 0x00000005,
+    0x00000004, 0x61647075, 0x00006574, 0x0000000b, 0x00000013, 0x00000020,
+    0x00060010, 0x00000004, 0x00000011, 0x00000040, 0x00000001, 0x00000001,
+    0x00030003, 0x00000002, 0x000001c2, 0x00040005, 0x00000004, 0x61647075,
+    0x00006574, 0x00030005, 0x00000008, 0x00000069, 0x00080005, 0x0000000b,
+    0x475f6c67, 0x61626f6c, 0x766e496c, 0x7461636f, 0x496e6f69, 0x00000044,
+    0x00040005, 0x00000011, 0x61726150, 0x0000736d, 0x00050006, 0x00000011,
+    0x00000000, 0x6e756f63, 0x00000074, 0x00050006, 0x00000011, 0x00000001,
+    0x74636166, 0x0000726f, 0x00030005, 0x00000013, 0x00000000, 0x00040005,
+    0x0000001e, 0x61746144, 0x00000000, 0x00050006, 0x0000001e, 0x00000000,
+    0x756c6176, 0x00007365, 0x00030005, 0x00000020, 0x00000000, 0x00040047,
+    0x0000000b, 0x0000000b, 0x0000001c, 0x00030047, 0x00000011, 0x00000002,
+    0x00050048, 0x00000011, 0x00000000, 0x00000023, 0x00000000, 0x00050048,
+    0x00000011, 0x00000001, 0x00000023, 0x00000004, 0x00040047, 0x00000013,
+    0x00000021, 0x00000001, 0x00040047, 0x00000013, 0x00000022, 0x00000000,
+    0x00040047, 0x0000001d, 0x00000006, 0x00000004, 0x00030047, 0x0000001e,
+    0x00000002, 0x00050048, 0x0000001e, 0x00000000, 0x00000023, 0x00000000,
+    0x00040047, 0x00000020, 0x00000021, 0x00000000, 0x00040047, 0x00000020,
+    0x00000022, 0x00000000, 0x00040047, 0x0000002f, 0x0000000b, 0x00000019,
+    0x00020013, 0x00000002, 0x00030021, 0x00000003, 0x00000002, 0x00040015,
+    0x00000006, 0x00000020, 0x00000000, 0x00040020, 0x00000007, 0x00000007,
+    0x00000006, 0x00040017, 0x00000009, 0x00000006, 0x00000003, 0x00040020,
+    0x0000000a, 0x00000001, 0x00000009, 0x0004003b, 0x0000000a, 0x0000000b,
+    0x00000001, 0x0004002b, 0x00000006, 0x0000000c, 0x00000000, 0x00040020,
+    0x0000000d, 0x00000001, 0x00000006, 0x0004001e, 0x00000011, 0x00000006,
+    0x00000006, 0x00040020, 0x00000012, 0x00000002, 0x00000011, 0x0004003b,
+    0x00000012, 0x00000013, 0x00000002, 0x00040015, 0x00000014, 0x00000020,
+    0x00000001, 0x0004002b, 0x00000014, 0x00000015, 0x00000000, 0x00040020,
+    0x00000016, 0x00000002, 0x00000006, 0x00020014, 0x00000019, 0x0003001d,
+    0x0000001d, 0x00000006, 0x0003001e, 0x0000001e, 0x0000001d, 0x00040020,
+    0x0000001f, 0x0000000c, 0x0000001e, 0x0004003b, 0x0000001f, 0x00000020,
+    0x0000000c, 0x00040020, 0x00000023, 0x0000000c, 0x00000006, 0x0004002b,
+    0x00000014, 0x00000026, 0x00000001, 0x0004002b, 0x00000006, 0x0000002d,
+    0x00000040, 0x0004002b, 0x00000006, 0x0000002e, 0x00000001, 0x0006002c,
+    0x00000009, 0x0000002f, 0x0000002d, 0x0000002e, 0x0000002e, 0x00050036,
+    0x00000002, 0x00000004, 0x00000000, 0x00000003, 0x000200f8, 0x00000005,
+    0x0004003b, 0x00000007, 0x00000008, 0x00000007, 0x00050041, 0x0000000d,
+    0x0000000e, 0x0000000b, 0x0000000c, 0x0004003d, 0x00000006, 0x0000000f,
+    0x0000000e, 0x0003003e, 0x00000008, 0x0000000f, 0x0004003d, 0x00000006,
+    0x00000010, 0x00000008, 0x00050041, 0x00000016, 0x00000017, 0x00000013,
+    0x00000015, 0x0004003d, 0x00000006, 0x00000018, 0x00000017, 0x000500b0,
+    0x00000019, 0x0000001a, 0x00000010, 0x00000018, 0x000300f7, 0x0000001c,
+    0x00000000, 0x000400fa, 0x0000001a, 0x0000001b, 0x0000001c, 0x000200f8,
+    0x0000001b, 0x0004003d, 0x00000006, 0x00000021, 0x00000008, 0x0004003d,
+    0x00000006, 0x00000022, 0x00000008, 0x00060041, 0x00000023, 0x00000024,
+    0x00000020, 0x00000015, 0x00000022, 0x0004003d, 0x00000006, 0x00000025,
+    0x00000024, 0x00050041, 0x00000016, 0x00000027, 0x00000013, 0x00000026,
+    0x0004003d, 0x00000006, 0x00000028, 0x00000027, 0x00050084, 0x00000006,
+    0x00000029, 0x00000025, 0x00000028, 0x0004003d, 0x00000006, 0x0000002a,
+    0x00000008, 0x00050080, 0x00000006, 0x0000002b, 0x00000029, 0x0000002a,
+    0x00060041, 0x00000023, 0x0000002c, 0x00000020, 0x00000015, 0x00000021,
+    0x0003003e, 0x0000002c, 0x0000002b, 0x000200f9, 0x0000001c, 0x000200f8,
+    0x0000001c, 0x000100fd, 0x00010038,
+]
+
+const DOUBLE_SPIRV: [279]u32 = [
+    0x07230203, 0x00010500, 0x0008000b, 0x00000025, 0x00000000, 0x00020011,
+    0x00000001, 0x0006000b, 0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e,
+    0x00000000, 0x0003000e, 0x00000000, 0x00000001, 0x000a000f, 0x00000005,
+    0x00000004, 0x62756f64, 0x765f656c, 0x65756c61, 0x00000073, 0x0000000b,
+    0x00000013, 0x0000001a, 0x00060010, 0x00000004, 0x00000011, 0x00000040,
+    0x00000001, 0x00000001, 0x00030003, 0x00000002, 0x000001c2, 0x00060005,
+    0x00000004, 0x62756f64, 0x765f656c, 0x65756c61, 0x00000073, 0x00030005,
+    0x00000008, 0x00000069, 0x00080005, 0x0000000b, 0x475f6c67, 0x61626f6c,
+    0x766e496c, 0x7461636f, 0x496e6f69, 0x00000044, 0x00040005, 0x00000011,
+    0x67726154, 0x00007465, 0x00050006, 0x00000011, 0x00000000, 0x67726174,
+    0x00007465, 0x00030005, 0x00000013, 0x00000000, 0x00040005, 0x00000018,
+    0x72756f53, 0x00006563, 0x00050006, 0x00000018, 0x00000000, 0x72756f73,
+    0x00006563, 0x00030005, 0x0000001a, 0x00000000, 0x00040047, 0x0000000b,
+    0x0000000b, 0x0000001c, 0x00040047, 0x00000010, 0x00000006, 0x00000004,
+    0x00030047, 0x00000011, 0x00000002, 0x00050048, 0x00000011, 0x00000000,
+    0x00000023, 0x00000000, 0x00040047, 0x00000013, 0x00000021, 0x00000001,
+    0x00040047, 0x00000013, 0x00000022, 0x00000000, 0x00040047, 0x00000017,
+    0x00000006, 0x00000004, 0x00030047, 0x00000018, 0x00000002, 0x00040048,
+    0x00000018, 0x00000000, 0x00000018, 0x00050048, 0x00000018, 0x00000000,
+    0x00000023, 0x00000000, 0x00030047, 0x0000001a, 0x00000018, 0x00040047,
+    0x0000001a, 0x00000021, 0x00000000, 0x00040047, 0x0000001a, 0x00000022,
+    0x00000000, 0x00040047, 0x00000024, 0x0000000b, 0x00000019, 0x00020013,
+    0x00000002, 0x00030021, 0x00000003, 0x00000002, 0x00040015, 0x00000006,
+    0x00000020, 0x00000000, 0x00040020, 0x00000007, 0x00000007, 0x00000006,
+    0x00040017, 0x00000009, 0x00000006, 0x00000003, 0x00040020, 0x0000000a,
+    0x00000001, 0x00000009, 0x0004003b, 0x0000000a, 0x0000000b, 0x00000001,
+    0x0004002b, 0x00000006, 0x0000000c, 0x00000000, 0x00040020, 0x0000000d,
+    0x00000001, 0x00000006, 0x0003001d, 0x00000010, 0x00000006, 0x0003001e,
+    0x00000011, 0x00000010, 0x00040020, 0x00000012, 0x0000000c, 0x00000011,
+    0x0004003b, 0x00000012, 0x00000013, 0x0000000c, 0x00040015, 0x00000014,
+    0x00000020, 0x00000001, 0x0004002b, 0x00000014, 0x00000015, 0x00000000,
+    0x0003001d, 0x00000017, 0x00000006, 0x0003001e, 0x00000018, 0x00000017,
+    0x00040020, 0x00000019, 0x0000000c, 0x00000018, 0x0004003b, 0x00000019,
+    0x0000001a, 0x0000000c, 0x00040020, 0x0000001c, 0x0000000c, 0x00000006,
+    0x0004002b, 0x00000006, 0x0000001f, 0x00000002, 0x0004002b, 0x00000006,
+    0x00000022, 0x00000040, 0x0004002b, 0x00000006, 0x00000023, 0x00000001,
+    0x0006002c, 0x00000009, 0x00000024, 0x00000022, 0x00000023, 0x00000023,
+    0x00050036, 0x00000002, 0x00000004, 0x00000000, 0x00000003, 0x000200f8,
+    0x00000005, 0x0004003b, 0x00000007, 0x00000008, 0x00000007, 0x00050041,
+    0x0000000d, 0x0000000e, 0x0000000b, 0x0000000c, 0x0004003d, 0x00000006,
+    0x0000000f, 0x0000000e, 0x0003003e, 0x00000008, 0x0000000f, 0x0004003d,
+    0x00000006, 0x00000016, 0x00000008, 0x0004003d, 0x00000006, 0x0000001b,
+    0x00000008, 0x00060041, 0x0000001c, 0x0000001d, 0x0000001a, 0x00000015,
+    0x0000001b, 0x0004003d, 0x00000006, 0x0000001e, 0x0000001d, 0x00050084,
+    0x00000006, 0x00000020, 0x0000001e, 0x0000001f, 0x00060041, 0x0000001c,
+    0x00000021, 0x00000013, 0x00000015, 0x00000016, 0x0003003e, 0x00000021,
+    0x00000020, 0x000100fd, 0x00010038,
+]
+
+const FILL_SPIRV: [233]u32 = [
+    0x07230203, 0x00010500, 0x0008000b, 0x00000025, 0x00000000, 0x00020011,
+    0x00000001, 0x0006000b, 0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e,
+    0x00000000, 0x0003000e, 0x00000000, 0x00000001, 0x0007000f, 0x00000005,
+    0x00000004, 0x6c6c6966, 0x00000000, 0x0000000c, 0x00000011, 0x00060010,
+    0x00000004, 0x00000011, 0x00000008, 0x00000008, 0x00000001, 0x00030003,
+    0x00000002, 0x000001c2, 0x00040005, 0x00000004, 0x6c6c6966, 0x00000000,
+    0x00030005, 0x00000009, 0x00006469, 0x00080005, 0x0000000c, 0x475f6c67,
+    0x61626f6c, 0x766e496c, 0x7461636f, 0x496e6f69, 0x00000044, 0x00040005,
+    0x00000011, 0x67616d69, 0x00000065, 0x00040047, 0x0000000c, 0x0000000b,
+    0x0000001c, 0x00030047, 0x00000011, 0x00000019, 0x00040047, 0x00000011,
+    0x00000021, 0x00000000, 0x00040047, 0x00000011, 0x00000022, 0x00000000,
+    0x00040047, 0x00000024, 0x0000000b, 0x00000019, 0x00020013, 0x00000002,
+    0x00030021, 0x00000003, 0x00000002, 0x00040015, 0x00000006, 0x00000020,
+    0x00000000, 0x00040017, 0x00000007, 0x00000006, 0x00000002, 0x00040020,
+    0x00000008, 0x00000007, 0x00000007, 0x00040017, 0x0000000a, 0x00000006,
+    0x00000003, 0x00040020, 0x0000000b, 0x00000001, 0x0000000a, 0x0004003b,
+    0x0000000b, 0x0000000c, 0x00000001, 0x00090019, 0x0000000f, 0x00000006,
+    0x00000001, 0x00000000, 0x00000000, 0x00000000, 0x00000002, 0x00000021,
+    0x00040020, 0x00000010, 0x00000000, 0x0000000f, 0x0004003b, 0x00000010,
+    0x00000011, 0x00000000, 0x00040015, 0x00000014, 0x00000020, 0x00000001,
+    0x00040017, 0x00000015, 0x00000014, 0x00000002, 0x0004002b, 0x00000006,
+    0x00000017, 0x00000000, 0x00040020, 0x00000018, 0x00000007, 0x00000006,
+    0x0004002b, 0x00000006, 0x0000001b, 0x00000001, 0x0004002b, 0x00000006,
+    0x0000001e, 0x00000064, 0x00040017, 0x00000021, 0x00000006, 0x00000004,
+    0x0004002b, 0x00000006, 0x00000023, 0x00000008, 0x0006002c, 0x0000000a,
+    0x00000024, 0x00000023, 0x00000023, 0x0000001b, 0x00050036, 0x00000002,
+    0x00000004, 0x00000000, 0x00000003, 0x000200f8, 0x00000005, 0x0004003b,
+    0x00000008, 0x00000009, 0x00000007, 0x0004003d, 0x0000000a, 0x0000000d,
+    0x0000000c, 0x0007004f, 0x00000007, 0x0000000e, 0x0000000d, 0x0000000d,
+    0x00000000, 0x00000001, 0x0003003e, 0x00000009, 0x0000000e, 0x0004003d,
+    0x0000000f, 0x00000012, 0x00000011, 0x0004003d, 0x00000007, 0x00000013,
+    0x00000009, 0x0004007c, 0x00000015, 0x00000016, 0x00000013, 0x00050041,
+    0x00000018, 0x00000019, 0x00000009, 0x00000017, 0x0004003d, 0x00000006,
+    0x0000001a, 0x00000019, 0x00050041, 0x00000018, 0x0000001c, 0x00000009,
+    0x0000001b, 0x0004003d, 0x00000006, 0x0000001d, 0x0000001c, 0x00050084,
+    0x00000006, 0x0000001f, 0x0000001d, 0x0000001e, 0x00050080, 0x00000006,
+    0x00000020, 0x0000001a, 0x0000001f, 0x00070050, 0x00000021, 0x00000022,
+    0x00000020, 0x00000020, 0x00000020, 0x00000020, 0x00050063, 0x00000012,
+    0x00000016, 0x00000022, 0x00002000, 0x000100fd, 0x00010038,
+]
+
+const COLOR_VERTEX_SPIRV: [248]u32 = [
+    0x07230203, 0x00010500, 0x0008000b, 0x0000001f, 0x00000000, 0x00020011,
+    0x00000001, 0x0006000b, 0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e,
+    0x00000000, 0x0003000e, 0x00000000, 0x00000001, 0x000b000f, 0x00000000,
+    0x00000004, 0x6f6c6f63, 0x65765f72, 0x78657472, 0x00000000, 0x0000000d,
+    0x00000012, 0x0000001b, 0x0000001d, 0x00030003, 0x00000002, 0x000001c2,
+    0x00060005, 0x00000004, 0x6f6c6f63, 0x65765f72, 0x78657472, 0x00000000,
+    0x00060005, 0x0000000b, 0x505f6c67, 0x65567265, 0x78657472, 0x00000000,
+    0x00060006, 0x0000000b, 0x00000000, 0x505f6c67, 0x7469736f, 0x006e6f69,
+    0x00070006, 0x0000000b, 0x00000001, 0x505f6c67, 0x746e696f, 0x657a6953,
+    0x00000000, 0x00070006, 0x0000000b, 0x00000002, 0x435f6c67, 0x4470696c,
+    0x61747369, 0x0065636e, 0x00070006, 0x0000000b, 0x00000003, 0x435f6c67,
+    0x446c6c75, 0x61747369, 0x0065636e, 0x00030005, 0x0000000d, 0x00000000,
+    0x00050005, 0x00000012, 0x69736f70, 0x6e6f6974, 0x00000000, 0x00040005,
+    0x0000001b, 0x64616873, 0x00000065, 0x00040005, 0x0000001d, 0x6f6c6f63,
+    0x00000072, 0x00030047, 0x0000000b, 0x00000002, 0x00050048, 0x0000000b,
+    0x00000000, 0x0000000b, 0x00000000, 0x00050048, 0x0000000b, 0x00000001,
+    0x0000000b, 0x00000001, 0x00050048, 0x0000000b, 0x00000002, 0x0000000b,
+    0x00000003, 0x00050048, 0x0000000b, 0x00000003, 0x0000000b, 0x00000004,
+    0x00040047, 0x00000012, 0x0000001e, 0x00000000, 0x00040047, 0x0000001b,
+    0x0000001e, 0x00000000, 0x00040047, 0x0000001d, 0x0000001e, 0x00000001,
+    0x00020013, 0x00000002, 0x00030021, 0x00000003, 0x00000002, 0x00030016,
+    0x00000006, 0x00000020, 0x00040017, 0x00000007, 0x00000006, 0x00000004,
+    0x00040015, 0x00000008, 0x00000020, 0x00000000, 0x0004002b, 0x00000008,
+    0x00000009, 0x00000001, 0x0004001c, 0x0000000a, 0x00000006, 0x00000009,
+    0x0006001e, 0x0000000b, 0x00000007, 0x00000006, 0x0000000a, 0x0000000a,
+    0x00040020, 0x0000000c, 0x00000003, 0x0000000b, 0x0004003b, 0x0000000c,
+    0x0000000d, 0x00000003, 0x00040015, 0x0000000e, 0x00000020, 0x00000001,
+    0x0004002b, 0x0000000e, 0x0000000f, 0x00000000, 0x00040017, 0x00000010,
+    0x00000006, 0x00000003, 0x00040020, 0x00000011, 0x00000001, 0x00000010,
+    0x0004003b, 0x00000011, 0x00000012, 0x00000001, 0x0004002b, 0x00000006,
+    0x00000014, 0x3f800000, 0x00040020, 0x00000019, 0x00000003, 0x00000007,
+    0x0004003b, 0x00000019, 0x0000001b, 0x00000003, 0x00040020, 0x0000001c,
+    0x00000001, 0x00000007, 0x0004003b, 0x0000001c, 0x0000001d, 0x00000001,
+    0x00050036, 0x00000002, 0x00000004, 0x00000000, 0x00000003, 0x000200f8,
+    0x00000005, 0x0004003d, 0x00000010, 0x00000013, 0x00000012, 0x00050051,
+    0x00000006, 0x00000015, 0x00000013, 0x00000000, 0x00050051, 0x00000006,
+    0x00000016, 0x00000013, 0x00000001, 0x00050051, 0x00000006, 0x00000017,
+    0x00000013, 0x00000002, 0x00070050, 0x00000007, 0x00000018, 0x00000015,
+    0x00000016, 0x00000017, 0x00000014, 0x00050041, 0x00000019, 0x0000001a,
+    0x0000000d, 0x0000000f, 0x0003003e, 0x0000001a, 0x00000018, 0x0004003d,
+    0x00000007, 0x0000001e, 0x0000001d, 0x0003003e, 0x0000001b, 0x0000001e,
+    0x000100fd, 0x00010038,
+]
+
+const COLOR_FRAGMENT_SPIRV: [97]u32 = [
+    0x07230203, 0x00010500, 0x0008000b, 0x0000000d, 0x00000000, 0x00020011,
+    0x00000001, 0x0006000b, 0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e,
+    0x00000000, 0x0003000e, 0x00000000, 0x00000001, 0x0009000f, 0x00000004,
+    0x00000004, 0x6f6c6f63, 0x72665f72, 0x656d6761, 0x0000746e, 0x00000009,
+    0x0000000b, 0x00030010, 0x00000004, 0x00000007, 0x00030003, 0x00000002,
+    0x000001c2, 0x00060005, 0x00000004, 0x6f6c6f63, 0x72665f72, 0x656d6761,
+    0x0000746e, 0x00040005, 0x00000009, 0x75736572, 0x0000746c, 0x00040005,
+    0x0000000b, 0x64616873, 0x00000065, 0x00040047, 0x00000009, 0x0000001e,
+    0x00000000, 0x00040047, 0x0000000b, 0x0000001e, 0x00000000, 0x00020013,
+    0x00000002, 0x00030021, 0x00000003, 0x00000002, 0x00030016, 0x00000006,
+    0x00000020, 0x00040017, 0x00000007, 0x00000006, 0x00000004, 0x00040020,
+    0x00000008, 0x00000003, 0x00000007, 0x0004003b, 0x00000008, 0x00000009,
+    0x00000003, 0x00040020, 0x0000000a, 0x00000001, 0x00000007, 0x0004003b,
+    0x0000000a, 0x0000000b, 0x00000001, 0x00050036, 0x00000002, 0x00000004,
+    0x00000000, 0x00000003, 0x000200f8, 0x00000005, 0x0004003d, 0x00000007,
+    0x0000000c, 0x0000000b, 0x0003003e, 0x00000009, 0x0000000c, 0x000100fd,
+    0x00010038,
+]
+
+const SCREEN_VERTEX_SPIRV: [344]u32 = [
+    0x07230203, 0x00010500, 0x0008000b, 0x00000035, 0x00000000, 0x00020011,
+    0x00000001, 0x0006000b, 0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e,
+    0x00000000, 0x0003000e, 0x00000000, 0x00000001, 0x000a000f, 0x00000000,
+    0x00000004, 0x65726373, 0x765f6e65, 0x65747265, 0x00000078, 0x0000000c,
+    0x0000001d, 0x0000002c, 0x00030003, 0x00000002, 0x000001c2, 0x00060005,
+    0x00000004, 0x65726373, 0x765f6e65, 0x65747265, 0x00000078, 0x00040005,
+    0x00000009, 0x6e726f63, 0x00007265, 0x00060005, 0x0000000c, 0x565f6c67,
+    0x65747265, 0x646e4978, 0x00007865, 0x00060005, 0x0000001b, 0x505f6c67,
+    0x65567265, 0x78657472, 0x00000000, 0x00060006, 0x0000001b, 0x00000000,
+    0x505f6c67, 0x7469736f, 0x006e6f69, 0x00070006, 0x0000001b, 0x00000001,
+    0x505f6c67, 0x746e696f, 0x657a6953, 0x00000000, 0x00070006, 0x0000001b,
+    0x00000002, 0x435f6c67, 0x4470696c, 0x61747369, 0x0065636e, 0x00070006,
+    0x0000001b, 0x00000003, 0x435f6c67, 0x446c6c75, 0x61747369, 0x0065636e,
+    0x00030005, 0x0000001d, 0x00000000, 0x00030005, 0x0000002c, 0x00007675,
+    0x00040047, 0x0000000c, 0x0000000b, 0x0000002a, 0x00030047, 0x0000001b,
+    0x00000002, 0x00050048, 0x0000001b, 0x00000000, 0x0000000b, 0x00000000,
+    0x00050048, 0x0000001b, 0x00000001, 0x0000000b, 0x00000001, 0x00050048,
+    0x0000001b, 0x00000002, 0x0000000b, 0x00000003, 0x00050048, 0x0000001b,
+    0x00000003, 0x0000000b, 0x00000004, 0x00040047, 0x0000002c, 0x0000001e,
+    0x00000000, 0x00020013, 0x00000002, 0x00030021, 0x00000003, 0x00000002,
+    0x00030016, 0x00000006, 0x00000020, 0x00040017, 0x00000007, 0x00000006,
+    0x00000002, 0x00040020, 0x00000008, 0x00000007, 0x00000007, 0x00040015,
+    0x0000000a, 0x00000020, 0x00000001, 0x00040020, 0x0000000b, 0x00000001,
+    0x0000000a, 0x0004003b, 0x0000000b, 0x0000000c, 0x00000001, 0x0004002b,
+    0x0000000a, 0x0000000e, 0x00000001, 0x0004002b, 0x0000000a, 0x00000010,
+    0x00000002, 0x00040017, 0x00000017, 0x00000006, 0x00000004, 0x00040015,
+    0x00000018, 0x00000020, 0x00000000, 0x0004002b, 0x00000018, 0x00000019,
+    0x00000001, 0x0004001c, 0x0000001a, 0x00000006, 0x00000019, 0x0006001e,
+    0x0000001b, 0x00000017, 0x00000006, 0x0000001a, 0x0000001a, 0x00040020,
+    0x0000001c, 0x00000003, 0x0000001b, 0x0004003b, 0x0000001c, 0x0000001d,
+    0x00000003, 0x0004002b, 0x0000000a, 0x0000001e, 0x00000000, 0x0004002b,
+    0x00000006, 0x00000020, 0x40000000, 0x0004002b, 0x00000006, 0x00000022,
+    0x3f800000, 0x0004002b, 0x00000006, 0x00000025, 0x00000000, 0x00040020,
+    0x00000029, 0x00000003, 0x00000017, 0x00040020, 0x0000002b, 0x00000003,
+    0x00000007, 0x0004003b, 0x0000002b, 0x0000002c, 0x00000003, 0x0004002b,
+    0x00000018, 0x0000002d, 0x00000000, 0x00040020, 0x0000002e, 0x00000007,
+    0x00000006, 0x00050036, 0x00000002, 0x00000004, 0x00000000, 0x00000003,
+    0x000200f8, 0x00000005, 0x0004003b, 0x00000008, 0x00000009, 0x00000007,
+    0x0004003d, 0x0000000a, 0x0000000d, 0x0000000c, 0x000500c4, 0x0000000a,
+    0x0000000f, 0x0000000d, 0x0000000e, 0x000500c7, 0x0000000a, 0x00000011,
+    0x0000000f, 0x00000010, 0x0004006f, 0x00000006, 0x00000012, 0x00000011,
+    0x0004003d, 0x0000000a, 0x00000013, 0x0000000c, 0x000500c7, 0x0000000a,
+    0x00000014, 0x00000013, 0x00000010, 0x0004006f, 0x00000006, 0x00000015,
+    0x00000014, 0x00050050, 0x00000007, 0x00000016, 0x00000012, 0x00000015,
+    0x0003003e, 0x00000009, 0x00000016, 0x0004003d, 0x00000007, 0x0000001f,
+    0x00000009, 0x0005008e, 0x00000007, 0x00000021, 0x0000001f, 0x00000020,
+    0x00050050, 0x00000007, 0x00000023, 0x00000022, 0x00000022, 0x00050083,
+    0x00000007, 0x00000024, 0x00000021, 0x00000023, 0x00050051, 0x00000006,
+    0x00000026, 0x00000024, 0x00000000, 0x00050051, 0x00000006, 0x00000027,
+    0x00000024, 0x00000001, 0x00070050, 0x00000017, 0x00000028, 0x00000026,
+    0x00000027, 0x00000025, 0x00000022, 0x00050041, 0x00000029, 0x0000002a,
+    0x0000001d, 0x0000001e, 0x0003003e, 0x0000002a, 0x00000028, 0x00050041,
+    0x0000002e, 0x0000002f, 0x00000009, 0x0000002d, 0x0004003d, 0x00000006,
+    0x00000030, 0x0000002f, 0x00050041, 0x0000002e, 0x00000031, 0x00000009,
+    0x00000019, 0x0004003d, 0x00000006, 0x00000032, 0x00000031, 0x00050083,
+    0x00000006, 0x00000033, 0x00000022, 0x00000032, 0x00050050, 0x00000007,
+    0x00000034, 0x00000030, 0x00000033, 0x0003003e, 0x0000002c, 0x00000034,
+    0x000100fd, 0x00010038,
+]
+
+const TEXTURE_FRAGMENT_SPIRV: [144]u32 = [
+    0x07230203, 0x00010500, 0x0008000b, 0x00000014, 0x00000000, 0x00020011,
+    0x00000001, 0x0006000b, 0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e,
+    0x00000000, 0x0003000e, 0x00000000, 0x00000001, 0x000b000f, 0x00000004,
+    0x00000004, 0x74786574, 0x5f657275, 0x67617266, 0x746e656d, 0x00000000,
+    0x00000009, 0x0000000d, 0x00000011, 0x00030010, 0x00000004, 0x00000007,
+    0x00030003, 0x00000002, 0x000001c2, 0x00070005, 0x00000004, 0x74786574,
+    0x5f657275, 0x67617266, 0x746e656d, 0x00000000, 0x00040005, 0x00000009,
+    0x75736572, 0x0000746c, 0x00040005, 0x0000000d, 0x67616d69, 0x00000065,
+    0x00030005, 0x00000011, 0x00007675, 0x00040047, 0x00000009, 0x0000001e,
+    0x00000000, 0x00040047, 0x0000000d, 0x00000021, 0x00000000, 0x00040047,
+    0x0000000d, 0x00000022, 0x00000000, 0x00040047, 0x00000011, 0x0000001e,
+    0x00000000, 0x00020013, 0x00000002, 0x00030021, 0x00000003, 0x00000002,
+    0x00030016, 0x00000006, 0x00000020, 0x00040017, 0x00000007, 0x00000006,
+    0x00000004, 0x00040020, 0x00000008, 0x00000003, 0x00000007, 0x0004003b,
+    0x00000008, 0x00000009, 0x00000003, 0x00090019, 0x0000000a, 0x00000006,
+    0x00000001, 0x00000000, 0x00000000, 0x00000000, 0x00000001, 0x00000000,
+    0x0003001b, 0x0000000b, 0x0000000a, 0x00040020, 0x0000000c, 0x00000000,
+    0x0000000b, 0x0004003b, 0x0000000c, 0x0000000d, 0x00000000, 0x00040017,
+    0x0000000f, 0x00000006, 0x00000002, 0x00040020, 0x00000010, 0x00000001,
+    0x0000000f, 0x0004003b, 0x00000010, 0x00000011, 0x00000001, 0x00050036,
+    0x00000002, 0x00000004, 0x00000000, 0x00000003, 0x000200f8, 0x00000005,
+    0x0004003d, 0x0000000b, 0x0000000e, 0x0000000d, 0x0004003d, 0x0000000f,
+    0x00000012, 0x00000011, 0x00050057, 0x00000007, 0x00000013, 0x0000000e,
+    0x00000012, 0x0003003e, 0x00000009, 0x00000013, 0x000100fd, 0x00010038,
+]
+
+const CONSTANT_FRAGMENT_SPIRV: [139]u32 = [
+    0x07230203, 0x00010500, 0x0008000b, 0x00000012, 0x00000000, 0x00020011,
+    0x00000001, 0x0006000b, 0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e,
+    0x00000000, 0x0003000e, 0x00000000, 0x00000001, 0x000a000f, 0x00000004,
+    0x00000004, 0x736e6f63, 0x746e6174, 0x6172665f, 0x6e656d67, 0x00000074,
+    0x00000009, 0x0000000c, 0x00030010, 0x00000004, 0x00000007, 0x00030003,
+    0x00000002, 0x000001c2, 0x00070005, 0x00000004, 0x736e6f63, 0x746e6174,
+    0x6172665f, 0x6e656d67, 0x00000074, 0x00040005, 0x00000009, 0x75736572,
+    0x0000746c, 0x00040005, 0x0000000a, 0x6f6c6f43, 0x00000072, 0x00050006,
+    0x0000000a, 0x00000000, 0x6f6c6f63, 0x00000072, 0x00030005, 0x0000000c,
+    0x00000000, 0x00040047, 0x00000009, 0x0000001e, 0x00000000, 0x00030047,
+    0x0000000a, 0x00000002, 0x00050048, 0x0000000a, 0x00000000, 0x00000023,
+    0x00000000, 0x00040047, 0x0000000c, 0x00000021, 0x00000000, 0x00040047,
+    0x0000000c, 0x00000022, 0x00000000, 0x00020013, 0x00000002, 0x00030021,
+    0x00000003, 0x00000002, 0x00030016, 0x00000006, 0x00000020, 0x00040017,
+    0x00000007, 0x00000006, 0x00000004, 0x00040020, 0x00000008, 0x00000003,
+    0x00000007, 0x0004003b, 0x00000008, 0x00000009, 0x00000003, 0x0003001e,
+    0x0000000a, 0x00000007, 0x00040020, 0x0000000b, 0x00000002, 0x0000000a,
+    0x0004003b, 0x0000000b, 0x0000000c, 0x00000002, 0x00040015, 0x0000000d,
+    0x00000020, 0x00000001, 0x0004002b, 0x0000000d, 0x0000000e, 0x00000000,
+    0x00040020, 0x0000000f, 0x00000002, 0x00000007, 0x00050036, 0x00000002,
+    0x00000004, 0x00000000, 0x00000003, 0x000200f8, 0x00000005, 0x00050041,
+    0x0000000f, 0x00000010, 0x0000000c, 0x0000000e, 0x0004003d, 0x00000007,
+    0x00000011, 0x00000010, 0x0003003e, 0x00000009, 0x00000011, 0x000100fd,
+    0x00010038,
+]

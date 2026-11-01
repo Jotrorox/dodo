@@ -433,7 +433,8 @@ impl HoverIndex<'_> {
             | ExprKind::Field(value, _)
             | ExprKind::Cast(value, _)
             | ExprKind::Try(value)
-            | ExprKind::Unwrap(value) => self.expression(value),
+            | ExprKind::Unwrap(value)
+            | ExprKind::Await { value, .. } => self.expression(value),
             ExprKind::Binary(_, left, right)
             | ExprKind::Index(left, right)
             | ExprKind::Range(left, right) => {

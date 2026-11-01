@@ -117,8 +117,9 @@ and scheduling belong in libraries, rather than mandatory runtime services.
 ### 1.3. Deliberate omissions
 
 Version 0.1 has no operator or function overloading, inheritance, implicit
-constructors, exceptions, macros, reflection, `async`/`await`, or
-language-level threads. Closures capture local bindings only by reference
+constructors, exceptions, macros, reflection, or language-level threads.
+`async fn` and `await` (section 11.5) compile to state machines that a library
+executor polls; the language has no scheduler of its own. Closures capture local bindings only by reference
 (section 6.7); there are no owning or heap-allocated closures. It has no user-defined implicit conversions, iterator
 protocol, specialization, or metaprogramming facilities.
 
@@ -259,7 +260,7 @@ reserved and must not be used as identifiers:
 ```text
 package import pub fn struct enum interface type dyn const let return if
 else for in break continue match unsafe extern as from static void mut
-true false asm
+true false asm async await
 ```
 
 `Self`, `self`, primitive type names, and constructor names such as `some` have
@@ -1171,6 +1172,56 @@ cannot discard an unhandled Result in a wildcard, omitted field, or payload.
 A statement arm that produces a new Result must still forward, propagate, or
 handle it.
 
+### 11.5. Async functions and await
+
+```dodo
+async fn twice(value: u32) -> u32 {
+    await executor.sleep_ms(10)
+    return value * 2
+}
+```
+
+An `async fn`, which may be a method or generic, declares a future type and
+a constructor. For a function `name` (a method `Owner.name`), the future type
+is the struct `NameFuture` (`OwnerNameFuture`), CamelCase with `Future`
+appended, generic over the function's type parameters and public exactly when
+the function is; declaring another item of that name is an error. Calling the
+function evaluates the arguments and stores them in a new future without
+running the body. The future's result keeps every borrow its arguments carry,
+as if the constructor declared all its borrow-carrying parameters in
+`from(...)`.
+
+A future has the methods `pub fn poll(&mut self, cx: &mut executor.Context) ->
+executor.Poll`, with `executor` naming `std/embedded/executor`, and, when the
+function's result type `T` is not `void`, `pub fn output(&mut self) -> T`.
+Each `poll` runs the body from where it last stopped until it returns, which
+yields `Poll.Ready`, or until an awaited future is pending, which yields
+`Poll.Pending`. Polling a future that returned yields `Poll.Ready` again.
+`output` moves the result out once after `Poll.Ready`; calling it earlier or
+twice traps. Destroying a future destroys its arguments if it never ran, its
+result if that was not taken, and otherwise the bindings live at the `await`
+where it stopped, in reverse declaration order.
+
+`await e` may appear only in the body of an `async fn`, not in a nested
+closure. `e` must have a struct type with a `poll` method of the signature
+above, accessible where the `await` is written; the expression's type is the
+result type of that type's accessible `output(&mut self)` method, or `void`
+without one. `await e` moves `e` into the suspended body, polls it until it
+returns `Poll.Ready`, takes its output, and destroys it. A `?`, `!`, or `as`
+written directly after the operand applies to the awaited result.
+
+An `await` must be the first evaluation of its statement: the whole
+expression of an expression statement, initializer, assigned value, returned
+value, or `if`, `for`, or `match` condition, possibly followed by `?`, `!`,
+and `as`, or a statement of a value-producing block in such a position. Its
+operand contains no `await`.
+
+Between polls, a future holds its body's bindings, which may refer to each
+other. A future must therefore not move after its first poll until it has
+returned; polling a moved suspended future traps. A future that holds itself
+by value, as a directly or indirectly self-awaiting function would, is
+rejected.
+
 ## 12. Results and error propagation
 
 ### 12.1. Result values
@@ -1912,7 +1963,7 @@ alias-decl    = "type", identifier, [ type-params ], "=", type, newline ;
 const-decl    = ( "const" | "static", [ "mut" ] ), identifier, ":", type, "=",
                 expression, newline ;
 
-function-decl = [ "unsafe" ], [ "extern", string-literal ],
+function-decl = [ "unsafe" ], [ "async" ], [ "extern", string-literal ],
                 "fn", identifier, [ type-params ], "(", [ parameters ], ")",
                 [ "->", type ], [ borrow-source ], ( block | newline ) ;
 parameters    = parameter, { ",", parameter } ;

@@ -254,6 +254,21 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         Ok(dtype)
     }
     fn debug_type_inner(&mut self, ty: &Type) -> Result<Metadata<'ctx>> {
+        // A future's poll is described before its frame is laid out, while
+        // the future's size is still unknown: debuggers see an opaque value.
+        if let Type::Named(name) = ty
+            && self.is_future(name)
+            && self.frames.get(name).is_none_or(|frame| frame.is_opaque())
+        {
+            let name = crate::ast::source_names(name);
+            return self
+                .debug
+                .as_ref()
+                .unwrap()
+                .builder
+                .create_basic_type(&name, 8, 0x08, LLVMDIFlagZero)
+                .map_err(error);
+        }
         let llvm = self.storage_ty(ty)?;
         let size = self.data.get_abi_size(&llvm) * 8;
         let align = self.data.get_abi_alignment(&llvm) * 8;

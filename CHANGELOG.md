@@ -2,6 +2,98 @@
 
 ## Unreleased
 
+- `async fn` and `await`: an optional concurrency model for firmware on top of
+  `std/embedded/executor`. Calling an async fn returns a future, a struct
+  named after the function (`blink` → `BlinkFuture`) whose `poll` is the
+  executor's task method, so async and hand-written tasks run side by side;
+  `await` waits for another future and yields its `output`. The compiler
+  generates the state machine: the body's locals live in the future, so
+  references between them survive suspensions, and dropping an unfinished
+  future drops what it holds. Methods and generic functions can be async.
+  `await` begins its statement, possibly followed by `?`, `!`, or `as`; a
+  started future traps if polled after moving, and a future that would hold
+  itself is rejected. The executor gains the futures async code waits on:
+  `sleep_ms`, `sleep`, `sleep_until`, `yield_now`, `now`, `Ticker.tick`,
+  `Signal.wait`, `Signal.next_value`, and `select` and `join` for two
+  futures. `examples/async_tasks` is `examples/tasks` written with them.
+- `std/embedded/sync`: `Mutex<T>` shares values between interrupt handlers,
+  tasks, and cores from a plain static, without `static mut` or `unsafe`.
+  `lock()` masks interrupts on this core and returns a guard; `with`,
+  `set`, `replace`, and `try_lock` cover the rest, and locking a mutex this
+  core already holds traps. All mutexes lock through one nesting
+  system-wide section, `sync.enter()`. On the RP2040 and RP2350,
+  `Core1.start` installs hardware spinlock 31 as its cross-core lock, so
+  the same mutex also holds off the other core; spinlock 31 is no longer
+  handed out by `Spinlocks`. `examples/interrupts` uses mutexes now.
+- The RP2350's doorbells: `b.doorbells` on the Pico 2 and Pico 2 W hands out
+  the eight doorbells between the cores. `ring()` interrupts the other core,
+  and `set_signal` makes the runtime's new `SIO_IRQ_BELL` handler raise an
+  executor signal there, to wake a task on the other core without the FIFO.
+- Random numbers for firmware: `std/embedded/hal` gains the `Rng`
+  protocol (`fill(bytes)`), with `random_u32`, `random_u64`, and the unbiased
+  `random_below`, and `hal.SoftRng`, a xoshiro128** generator seeded from a
+  hardware one with `from_rng` or from a fixed seed with `new`.
+  `hal/fake` gains `fake.Rng`. Every board has `b.rng`, and the chip packages
+  `Peripherals.rng`, from the new `std/embedded/chip/rp_rng`: on the RP2040,
+  `rp_rng.Rosc` samples the ring oscillator's RANDOMBIT about every 10 us and
+  debiases it with von Neumann's method, about 3 KB a second and not for
+  keys; on the RP2350, `rp_rng.Trng` runs the TRNG with its hardware
+  debiasing and all health tests on, about 20 KB a second and fit for keys,
+  restarting it after failed autocorrelation tests and keeping a block's
+  unused bytes for the next fill. A stopped source reports `Timeout` and
+  failing health checks `Bus`. Both drivers are generic over
+  `hal.Registers` and tested against simulated registers on the desktop.
+- `std/gpu`: portable GPU compute and rendering on Metal, Vulkan and
+  OpenGL, written in Dodo on top of `std/gpu/metal`, `std/gpu/vulkan` and
+  `std/gpu/opengl`. It follows WebGPU's model: a `Device` creates buffers,
+  2D textures, samplers and compute and render pipelines; a
+  `CommandEncoder` records compute passes, render passes and copies;
+  `submit()` runs them in order, and `write_buffer`, `read_buffer`,
+  `write_texture` and `read_texture` move data in queue order.
+  `Device.open` picks Metal on macOS and Vulkan elsewhere, falling back to
+  OpenGL 4.5. Shaders come as SPIR-V, MSL and GLSL in one `ShaderSource`,
+  with numbered binding slots that mean the same in every language, and
+  clip space, depth range, winding and texture rows agree on every backend.
+  Every call is checked (usages, ranges, pipeline layouts and attachment
+  formats, workgroup limits, and SPIR-V entry points), and resources dropped
+  while the GPU may still use them are destroyed once it has finished.
+  Backends implement the `std/gpu/hal` interface; `std/gpu/hal/native`
+  selects the OS's own API. A fixture runs the same compute, rendering,
+  depth, sampling, blending, copy and lifetime checks on Metal, on Vulkan
+  with lavapipe and on OpenGL with llvmpipe, clean under the Vulkan
+  validation and synchronization layers and Metal's debug layer.
+  `examples/gpu_compute.dodo` and `examples/gpu_triangle.dodo` show compute
+  and a window. The Vulkan guide moved to its own page, and
+  `std/gpu/opengl` now declares `dlsym` and `GetProcAddress` with the
+  pointer results `std/dylib` uses, so one program can load both.
+- Large values loaded whole and stored after code that may write their
+  source, such as a big struct returned in a `Result` while locals with
+  drops are still alive, are now copied aside in memory instead of being
+  split by LLVM into one operation per byte. Such functions took minutes to
+  compile at -O1 and above.
+- Fixed: `Fifo.set_signal` and the FIFO interrupt hook of
+  `std/embedded/chip/rp_multicore` wrote 0 to `FIFO_ST` to clear its sticky
+  WOF and ROE flags, which only a 1 clears. A flag left set, such as the ROE
+  that core 1's boot ROM leaves while it waits to be launched, kept the FIFO
+  interrupt raised, so an executor waiting for FIFO words could spin instead
+  of sleeping.
+- CI runs firmware on emulated RP2040 and RP2350 chips: a self-test of the
+  startup runtime, the integer and floating-point helpers, interrupts,
+  SysTick, timer alarms, the executor, DMA, PIO, a UART, and the second core
+  with its FIFOs and spinlocks, at -O0 and -O2. `scripts/test_emulator.py`
+  builds `tests/emulator` and runs it in `emulator/`, a runner around the
+  picoem emulator crates with fixes in `emulator/patches`; it takes seconds.
+- Real-time clocks share one protocol in `std/embedded/hal`: `hal.Rtc` reads
+  and sets the time as Unix milliseconds and `hal.RtcAlarm` fires once at a
+  time, with `hal.rtc_now`, `rtc_set`, `rtc_alarm_at`, and `rtc_alarm_in`
+  converting to and from `std/time`'s `DateTime`. Every board has `b.rtc`:
+  the RP2040's RTC, clocked from the crystal and counting seconds, and the
+  RP2350's always-on timer, a millisecond counter that keeps counting through
+  resets. The register-level drivers are in `std/embedded/chip/rp_rtc`, with
+  RTC_IRQ and POWMAN_IRQ_TIMER raised by their alarms.
+  `std/embedded/rtc/ds3231` drives a battery-backed DS3231 clock chip on I2C
+  through the same protocols, and `fake.Rtc` tests clock code on a desktop.
+  The Pico self-tests check the clocks and their alarms on the boards.
 - `std/embedded/hal` settles its device protocols before a second chip
   vendor arrives, so drivers written now keep working:
   - Polling forms of the buses, `hal.I2cPoll`, `hal.SpiPoll`, and, in the
@@ -130,7 +222,7 @@
   `Canvas.fill_spans` and `gradient_spans`, all drawing exactly what
   `fill_outline` draws.
 - `std/gpu/vulkan`: the Vulkan API in pure Dodo, one to one like Rust's
-  `ash`, as the bottom layer for a future portable `std/gpu`. Constants,
+  `ash`, as the bottom layer for the portable `std/gpu`. Constants,
   handles, enums, bitmasks, structs and the command tables are generated from
   the Khronos registry by `scripts/generate_vulkan.py` and cover core Vulkan
   1.0 to 1.4, the Xlib, XCB, Wayland, Win32, Metal and headless surfaces,
