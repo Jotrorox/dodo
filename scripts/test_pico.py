@@ -99,6 +99,7 @@ LAST_CHECKS = [
     "spinlocks are claimed once and exclude; both cores count 10000 each under one",
     "core 1's executor wakes on the FIFO interrupt; core 1 finishes, stops, and starts again",
     "random number generator fills differing, balanced bytes and seeds a SoftRng",
+    "watchdog refuses bad timeouts, counts 1 us per us, reloads when fed, holds when stopped; scratch 0 is the record's",
     "invalid crystal is rejected",
     "chip take() after board take() is refused",
     "delay_ms(10) lasts 10 ms",
