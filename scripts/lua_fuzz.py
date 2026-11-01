@@ -730,6 +730,52 @@ class Gen:
                         "error(42)", "coroutine.wrap(function() error('in coro') end)()", "assert(false)", "assert(nil, 'amsg')",
                         "local function deep(n) if n == 0 then error('deep') end return (deep(n - 1)) end deep(30)"])]
 
+    def b_proxy(self):
+        # library functions on proxy tables: the order of __index/__newindex/
+        # __len calls is observable
+        n = self.r.randint(0, 8)
+        vals = ", ".join(self.c(["1", "2", "3", '"a"', '"b"', "2.5"]) for _ in range(n))
+        lines = ["do local store = {%s}" % vals,
+                 "  local acc = {}",
+                 "  local p = setmetatable({}, {__index = function(_, k) acc[#acc + 1] = 'r' .. tostring(k) return store[k] end,",
+                 "    __newindex = function(_, k, v) acc[#acc + 1] = 'w' .. tostring(k) .. '=' .. tostring(v) store[k] = v end,",
+                 "    __len = function() acc[#acc + 1] = 'len' return #store end})"]
+        for _ in range(self.r.randint(1, 4)):
+            op = self.c([
+                "table.insert(p, 'x')", "table.insert(p, 1, 'y')", "table.insert(p, %s, 'z')" % self.smallint(-1, 9),
+                "table.remove(p)", "table.remove(p, 1)", "table.remove(p, %s)" % self.smallint(-1, 9),
+                "return table.concat(p, ',')", "return table.unpack(p)", "return table.unpack(p, %s, %s)" % (self.smallint(-1, 4), self.smallint(0, 9)),
+                "table.move(p, %s, %s, %s)" % (self.smallint(1, 4), self.smallint(0, 8), self.smallint(1, 8)),
+                "table.move(p, 1, 3, 2, {})", "table.move({7, 8, 9}, 1, 3, %s, p)" % self.smallint(1, 5),
+                "table.sort(p)", "table.sort(p, function(a, b) return tostring(a) > tostring(b) end)",
+                "for i, v in ipairs(p) do end", "return #p", "return next(p)", "return rawlen(p)"])
+            lines.append("  try(function() %s end) show(table.concat(acc, ' '), seq(store, 10)) acc = {}" % op)
+        lines.append("end")
+        return lines
+
+    def b_undump(self):
+        # load (but never run) randomly corrupted binary chunks
+        src = self.c(["return 1", "local a, b = ... return a + b, 'str', 2.5, nil, true",
+                      "local t = {} for i = 1, 3 do t[i] = function() return i end end return t",
+                      "local x <const> = 'k' return function(...) return x, ... end"])
+        seed = self.r.randint(0, 1 << 30)
+        return ["do local f = load(%s) local d = string.dump(f, %s)" % (lua_str(src), self.c(["true", "false"])),
+                "  math.randomseed(%d)" % seed,
+                "  for trial = 1, %d do" % self.r.randint(3, 12),
+                "    local bytes = {d:byte(1, -1)}",
+                "    for _ = 1, math.random(1, 4) do",
+                "      local k = math.random(1, #bytes)",
+                "      local mode = math.random(1, 3)",
+                "      if mode == 1 then bytes[k] = math.random(0, 255)",
+                "      elseif mode == 2 then bytes[k] = (bytes[k] + 1) % 256",
+                "      else for j = #bytes, k, -1 do bytes[j] = nil end end",
+                "    end",
+                "    local m = string.char(table.unpack(bytes))",
+                "    local g, e = load(m, 'mut', 'b')",
+                "    show(trial, #m, type(g), e)",
+                "  end",
+                "end"]
+
     def program(self, nblocks: int) -> str:
         blocks = [self.b_arith, self.b_mathlib, self.b_compare, self.b_concat,
                   self.b_strlib, self.b_strlib, self.b_pack, self.b_utf8,
@@ -738,7 +784,8 @@ class Gen:
                   self.b_coroutine, self.b_coroutine, self.b_goto, self.b_tbc,
                   self.b_for, self.b_stringconv, self.b_misc, self.b_varnames,
                   self.b_quote, self.b_gc, self.b_iter, self.b_debug, self.b_dump,
-                  self.b_io, self.b_strcmp, self.b_varnames]
+                  self.b_io, self.b_strcmp, self.b_varnames, self.b_proxy,
+                  self.b_proxy, self.b_undump]
         out = [HEADER,
                "MT1 = setmetatable({}, {__add = function(a, b) return 'MTadd' end, __concat = function(a, b) return 'MTcat' end, __lt = function() return true end, __le = function() return false end, __eq = function() return true end, __index = function(t, k) return k end, __len = function() return 3 end, __unm = function() return 'neg' end, __tostring = function() return 'MT1' end})",
                "MT2 = setmetatable({}, {__name = 'Obj'})"]

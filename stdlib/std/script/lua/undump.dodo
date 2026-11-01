@@ -132,6 +132,13 @@ fn ud_string(S: &mut LoadState) -> (*mut LString)!Throw {
         }
         size -= 1
         if (S.size - S.pos) as u64 < size {
+            // The reference allocates a long string before reading its
+            // bytes, so an impossible size reports the failed allocation.
+            if size > 40 {
+                let total = core.wrapping_add(size as usize, str_object_size(0))
+                let probe = mem_alloc(S.L, total)?
+                mem_free(S.L, probe, total)
+            }
             return err(ud_error(S, "truncated chunk"))
         }
         let s = str_new(S.L, ptr.offset(S.data, S.pos as isize), size as usize)?
@@ -186,11 +193,12 @@ fn ud_function(S: &mut LoadState, f: *mut Proto, psource: *mut LString) -> void!
                     return err(ud_error(S, "bad format for constant string"))
                 }
                 set_str(o, s)
-            } else {
-                return err(ud_error(S, "bad constant"))
             }
+            // Any other tag leaves the constant nil, like the reference.
         }
-        // Upvalues.
+        // Upvalues. Instructions address at most 255 of them; more can only
+        // come from a forged chunk (the reference would truncate the
+        // closure's count), so such chunks are refused once read.
         let nup = ud_int(S)?
         let ups = mem_alloc(L, (nup as usize) * mem.size_of::<UpvalDesc>())? as *mut UpvalDesc
         for i in 0i32..nup {
@@ -203,6 +211,9 @@ fn ud_function(S: &mut LoadState, f: *mut Proto, psource: *mut LString) -> void!
             (*u).instack = ud_byte(S)?
             (*u).index = ud_byte(S)?
             (*u).kind = ud_byte(S)?
+        }
+        if nup > 255 {
+            return err(ud_error(S, "too many upvalues"))
         }
         // Nested prototypes.
         let np = ud_int(S)?
@@ -245,9 +256,11 @@ fn ud_function(S: &mut LoadState, f: *mut Proto, psource: *mut LString) -> void!
             (*v).startpc = ud_int(S)?
             (*v).endpc = ud_int(S)?
         }
-        let nupn = ud_int(S)?
-        if nupn != 0 && nupn != nup {
-            return err(ud_error(S, "bad upvalue names"))
+        // A non-zero count means "debug names present": one per upvalue,
+        // whatever the count says (as in the reference).
+        nupn := ud_int(S)?
+        if nupn != 0 {
+            nupn = nup
         }
         for i in 0i32..nupn {
             (*ptr.offset(ups, i as isize)).name = ud_string(S)?
@@ -256,14 +269,19 @@ fn ud_function(S: &mut LoadState, f: *mut Proto, psource: *mut LString) -> void!
     }
 }
 
+// The whole literal is read before it is compared, so a chunk cut short
+// inside it reports "truncated chunk".
 fn ud_check_literal(S: &mut LoadState, lit: &[u8], why: &str) -> void!Throw {
     unsafe {
+        if S.size - S.pos < lit.len {
+            return err(ud_error(S, "truncated chunk"))
+        }
         for i in 0usize..lit.len {
-            let b = ud_byte(S)?
-            if b != lit[i] {
+            if *ptr.offset(S.data, (S.pos + i) as isize) != lit[i] {
                 return err(ud_error(S, why))
             }
         }
+        S.pos = S.pos + lit.len
         return ok()
     }
 }
@@ -304,12 +322,11 @@ fn undump(L: *mut State, data: *const u8, size: usize, name: *mut LString) -> (*
     unsafe {
         S := LoadState { L: L, data: data, size: size, pos: 0, name: name }
         ud_header(&mut S)?
-        let nup = ud_byte(&mut S)?
+        // The main function's upvalue count; the reference does not check
+        // it against the prototype (closures get the prototype's count).
+        ud_byte(&mut S)?
         let p = proto_new(L)?
         ud_function(&mut S, p, 0 as *mut LString)?
-        if (*p).sizeupvalues != nup as i32 {
-            return err(ud_error(&mut S, "bad upvalue count"))
-        }
         return ok(p)
     }
 }
