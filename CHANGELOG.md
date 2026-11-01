@@ -41,7 +41,7 @@
   `led`. The portable board examples build unchanged,
   `examples/esp32c6_tasks` shows tasks woken by the board's interrupts, and
   `scripts/test_esp32c6.py` runs a 51-check hardware self-test and, with
-  `--project`, 97 more checks of the buses, CAN, I2S, PWM input, system
+  `--project`, 98 more checks of the buses, CAN, I2S, PWM input, system
   services, and low power in `tests/hardware/esp32c6_*`, which pass at -O0
   to -O3.
 - Functions placed with `@section`, such as `@section(".ramfunc")`, are no

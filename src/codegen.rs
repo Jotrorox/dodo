@@ -3168,7 +3168,8 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         let plain = self.bb("wfi.plain");
         let done = self.bb("wfi.done");
         let missing = self.builder.build_is_null(hook, "wfi.missing")?;
-        self.builder.build_conditional_branch(missing, plain, call)?;
+        self.builder
+            .build_conditional_branch(missing, plain, call)?;
         self.builder.position_at_end(call);
         self.builder.build_call(hook, &[], "")?;
         self.builder.build_unconditional_branch(done)?;

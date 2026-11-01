@@ -642,9 +642,7 @@ fn interrupt_control_lowers_to_each_architecture_mask() {
     );
     let text = fs::read_to_string(&assembly).unwrap();
     assert!(
-        text.contains("wfi")
-            && text.contains("dodo_wait_for_interrupt")
-            && text.contains(".weak"),
+        text.contains("wfi") && text.contains("dodo_wait_for_interrupt") && text.contains(".weak"),
         "{text}"
     );
 
