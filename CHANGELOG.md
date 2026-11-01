@@ -956,6 +956,16 @@
   until a pin event or a timeout restarts the chip, after which
   `woke_from_power_down`, `power_down_wake`, `retained`, and `scratch`
   report and keep state. `fake.Power` simulates timeouts.
+- Timers at other rates: `std/embedded/hal` gains `TickCounter`, `Compare`,
+  `PeriodicTimer`, and `InputCapture`, counting ticks at a rate of their
+  own, with conversion and wait helpers and a fake of each. On the RP2040
+  and RP2350 the timer alarms (now on the shared `rp_timer`) are compare
+  channels and drift-free periodic timers that count missed periods; the
+  RP2350's TIMER1 counts clk_sys or a divided crystal (`timer.timer1(hz)`);
+  PWM slices are periodic timers and 64-bit tick counters
+  (`pins.pwm_timer`), and PWM outputs expose the wrap interrupt; and
+  `rp_capture` timestamps edges on a PIO state machine
+  (`pins.edge_capture`).
 
 ## 0.1.5 — 2026-10-12
 

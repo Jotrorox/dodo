@@ -3,6 +3,7 @@ package rp_pins
 import "core/ptr"
 import "std/embedded/hal"
 import "std/embedded/chip/rp_adc"
+import "std/embedded/chip/rp_capture"
 import "std/embedded/chip/rp_dma"
 import "std/embedded/chip/rp_pio"
 import "std/embedded/chip/rp_pwm"
@@ -214,6 +215,9 @@ fn uart_of(number: u32) -> u32 {
 //        the frequency of the clock that feeds the controllers and PWM
 //    pwm_slices(&self) -> u32
 //        the PWM block's slices: 8 on the RP2040, 12 on the RP2350
+//    pwm_irq(&self) -> u32
+//        the PWM wrap interrupt: PWM_IRQ_WRAP on the RP2040,
+//        PWM_IRQ_WRAP_0 on the RP2350
 //    timer_base(&self) -> usize
 //        the running microsecond timer that times PWM input windows, with
 //        TIMERAWH and TIMERAWL at 0x24 and 0x28
@@ -451,7 +455,7 @@ pub struct Bank<C> {
         }
         mask := pin_bit(pin)
         self.reserve(mask)?
-        if self.pwm_pins == 0 {
+        if self.pwm_idle() {
             match self.chip.reset(PWM) {
                 ok() => {}
                 err(error) => {
@@ -463,8 +467,10 @@ pub struct Bank<C> {
         // SAFETY: Bank.new vouches for the base address, the reset above
         // started the block, and only Channels use it.
         base := self.chip.base(PWM)
+        slices := self.chip.pwm_slices()
+        irq := self.chip.pwm_irq()
         opened := unsafe {
-            rp_pwm.Pwm.at(base, pin, timing)
+            rp_pwm.Pwm.at(base, slices, irq, pin, timing)
         }
         match opened {
             ok(output) => {
@@ -474,7 +480,7 @@ pub struct Bank<C> {
             }
             err(error) => {
                 self.taken &= ~mask
-                if self.pwm_pins == 0 {
+                if self.pwm_idle() {
                     self.chip.hold(PWM)
                 }
                 return err(error)
@@ -490,7 +496,7 @@ pub struct Bank<C> {
         output.release()
         self.pwm_pins &= ~mask
         self.disconnect(mask)
-        if self.pwm_pins == 0 {
+        if self.pwm_idle() {
             self.chip.hold(PWM)
         }
     }
@@ -513,7 +519,7 @@ pub struct Bank<C> {
         }
         mask := pin_bit(pin)
         self.reserve(mask)?
-        if self.pwm_pins == 0 {
+        if self.pwm_idle() {
             match self.chip.reset(PWM) {
                 ok() => {}
                 err(error) => {
@@ -540,7 +546,7 @@ pub struct Bank<C> {
             }
             err(error) => {
                 self.taken &= ~mask
-                if self.pwm_pins == 0 {
+                if self.pwm_idle() {
                     self.chip.hold(PWM)
                 }
                 return err(error)
@@ -556,9 +562,58 @@ pub struct Bank<C> {
         input.release()
         self.pwm_pins &= ~mask
         self.disconnect(mask)
-        if self.pwm_pins == 0 {
+        if self.pwm_idle() {
             self.chip.hold(PWM)
         }
+    }
+
+    // Claim PWM slice `slice` as a periodic timer and counter at
+    // `tick_hz`, which drives no pins; see rp_pwm.SliceTimer. Slices 0 to
+    // 7 serve pins too, so a timer takes both outputs of its slice
+    // (GPIO 2n, 2n + 1, 2n + 16, and 2n + 17); the RP2350's slices 8 to 11
+    // serve none here. InvalidInput for another slice or a rate
+    // rp_pwm.timer_divider refuses, Busy if an output or input uses the
+    // slice.
+    pub fn pwm_timer(&mut self, slice: u32, tick_hz: u32) -> rp_pwm.PwmTimer!hal.Error {
+        if self.pwm_idle() {
+            self.chip.reset(PWM)?
+        }
+        // SAFETY: Bank.new vouches for the base addresses and the timer,
+        // the reset above started the block, and only Channels, Captures,
+        // and SliceTimers use it.
+        base := self.chip.base(PWM)
+        timer := self.chip.timer_base()
+        slices := self.chip.pwm_slices()
+        irq := self.chip.pwm_irq()
+        clock_hz := self.chip.clock_hz()
+        opened := unsafe {
+            rp_pwm.PwmTimer.at(base, timer, slices, irq, clock_hz, slice, tick_hz)
+        }
+        match opened {
+            ok(output) => {
+                return ok(output)
+            }
+            err(error) => {
+                if self.pwm_idle() {
+                    self.chip.hold(PWM)
+                }
+                return err(error)
+            }
+        }
+    }
+
+    // Give back a timer from `pwm_timer`: its slice stops and is free
+    // again, and the PWM block is held in reset once nothing uses it.
+    pub fn release_pwm_timer(&mut self, timer: rp_pwm.PwmTimer) {
+        timer.release()
+        if self.pwm_idle() {
+            self.chip.hold(PWM)
+        }
+    }
+
+    // Whether no output, input, or timer uses the PWM block.
+    fn pwm_idle(&self) -> bool {
+        return self.pwm_pins == 0 && rp_pwm.claimed() == 0
     }
 
     // Claim pin `pin`, GPIO 26 to 29, as an ADC input. Its digital input
@@ -723,6 +778,45 @@ pub struct Bank<C> {
         }
         self.pio_pins[block as usize] |= mask
         return ok()
+    }
+
+    // Claim pin `pin` for PIO block `pio` and capture its `edges`
+    // (rp_capture.RISING, FALLING, or BOTH) with a free state machine of
+    // the block, in ticks of `tick_hz`; see rp_capture. Errors as for
+    // pio_pins and rp_capture.EdgeCapture.new.
+    pub fn edge_capture(&mut self, pio: &mut rp_pio.Pio, pin: u32, edges: u32, tick_hz: u32) -> rp_capture.EdgeCapture!hal.Error {
+        self.pio_pins(pio, pin, 1)?
+        timer := self.chip.timer_base()
+        clock_hz := self.chip.clock_hz()
+        // SAFETY: Bank.new vouches for the timer, and the PIO blocks run
+        // from the clock clock_hz reports.
+        opened := unsafe {
+            rp_capture.EdgeCapture.new(pio, pin, edges, clock_hz, tick_hz, timer)
+        }
+        match opened {
+            ok(capture) => {
+                return ok(capture)
+            }
+            err(error) => {
+                self.release_pio_pin(pio.number(), pin)
+                return err(error)
+            }
+        }
+    }
+
+    // Give back a capture from `edge_capture` to `pio`, the block it came
+    // from: its state machine and program, and its pin, which is
+    // disconnected.
+    pub fn release_edge_capture(&mut self, capture: rp_capture.EdgeCapture, pio: &mut rp_pio.Pio) {
+        pin := capture.pin()
+        capture.release(pio)
+        self.release_pio_pin(pio.number(), pin)
+    }
+
+    fn release_pio_pin(&mut self, block: u32, pin: u32) {
+        mask := pin_bit(pin)
+        self.pio_pins[block as usize] &= ~mask
+        self.disconnect(mask)
     }
 
     // Give back a PIO block from `pio` once its state machines have been

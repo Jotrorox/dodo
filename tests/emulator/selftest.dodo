@@ -6,9 +6,11 @@ import "core/ptr"
 import "std/embedded/board"
 import "std/embedded/chip"
 import "std/embedded/chip/rp_adc"
+import "std/embedded/chip/rp_capture"
 import "std/embedded/chip/rp_dma"
 import "std/embedded/chip/rp_multicore"
 import "std/embedded/chip/rp_pio"
+import "std/embedded/chip/rp_pwm"
 import "std/embedded/cortex_m"
 import "std/embedded/executor"
 import "std/embedded/hal"
@@ -19,9 +21,11 @@ import "std/sync/atomic"
 // the runtime's integer and floating-point helpers, interrupts, SysTick, the
 // timer and its alarms, changing the system clock, the executor, DMA, the ADC
 // sampler, PIO (and the RP2350's PIO GPIO window), GPIO interrupt enables per
-// core, a UART, and core 1 with the FIFOs, spinlocks, and the lockout. CI runs
-// it on emulated chips (scripts/test_emulator.py, emulator/), so it only uses
-// what the emulators model: nothing outside the
+// core, a UART, timer channels (alarms as compare channels and periodic
+// timers, PWM slice timers, PIO edge capture), and core 1 with the FIFOs,
+// spinlocks, and the lockout. CI runs it on emulated chips
+// (scripts/test_emulator.py, emulator/), so it only uses what the emulators
+// model: nothing outside the
 // chip is connected, and timing is checked with the emulators' tolerances.
 // scripts/test_pico.py runs the fuller hardware self-tests in tests/hardware
 // on real boards.
@@ -738,6 +742,149 @@ fn pio_checks(pins: &mut chip.Pins, timer: &mut chip.Timer) {
     pins.release_pio(pio)
 }
 
+// Timer channels: an alarm as a compare channel and as a periodic timer, a
+// PWM slice as a periodic timer whose wrap interrupt fires, and a PIO edge
+// capture of a pin another state machine toggles. The emulators' PWM
+// counters do not keep pace with their timers (the RP2040's lags, and
+// counts at clk_sys whatever the divider; the RP2350's timer runs at clk_sys
+// rate), so the PWM timer's count, which the timer extends, is checked on
+// real boards only (tests/hardware). The RP2350 emulator keeps the PWM
+// block's EN register apart from the slices' CSR.EN bits, which it aliases
+// on the chip, so its slices never count: the PWM timer is checked on the
+// RP2040 only.
+static mut PWM_TIMER: Option<rp_pwm.PwmTimer> = none
+static WRAPS: atomic.Atomic<u32> = atomic.Atomic.new(0u32)
+static mut WRAP_PERIODS: u32 = 0
+// High for 32 cycles, low for 32.
+const TOGGLE: rp_pio.Program = rp_pio.assemble("set pins, 1 [31]", "set pins, 0 [31]")
+const TOGGLE_PIN: u32 = 6
+
+// Called by the entry file's handler for the PWM wrap interrupt, whose
+// vector name differs between the chips.
+pub fn pwm_wrapped() {
+    unsafe {
+        match &mut PWM_TIMER {
+            some(timer) => {
+                WRAP_PERIODS += timer.poll_periods()
+                count(&WRAPS)
+            }
+            none => {}
+        }
+    }
+}
+
+fn timer_channel_checks(pins: &mut chip.Pins, timer: &mut chip.Timer) {
+    // An alarm as a compare channel, in ticks of 1 MHz.
+    alarm := timer.alarm(2)!
+    start := alarm.now_ticks()
+    alarm.schedule_at_ticks(start + 2000)!
+    for !alarm.fired() && alarm.now_ticks() - start < 10_000 {}
+    elapsed := alarm.now_ticks() - start
+    alarm.clear()
+    assert(elapsed >= 2000 && elapsed < 2200 && alarm.tick_hz() == 1_000_000, "an alarm does not fire as a compare channel")
+    // As a periodic timer: three periods end while nothing polls, then one
+    // more, in phase with the start. The periods are long next to a poll,
+    // which the RP2350 emulator's fast timer makes long too.
+    alarm.start(5000)!
+    begin := alarm.now_us()
+    for alarm.now_us() - begin < 17_500 {}
+    missed := alarm.poll_periods()
+    for !alarm.fired() && alarm.now_us() - begin < 50_000 {}
+    next := alarm.poll_periods()
+    waited := alarm.now_us() - begin
+    assert(missed == 3 && next == 1 && waited >= 19_990 && waited < 21_000 && alarm.is_periodic(), "an alarm does not run as a periodic timer")
+    timer.release_alarm(alarm)
+    step()
+    // A PWM slice: its wrap interrupt ends each period.
+    if chip.SYS_HZ == 125_000_000 {
+        pwm_timer_checks(pins, timer)
+    }
+    step()
+    pio_capture_checks(pins, timer)
+}
+
+fn pwm_timer_checks(pins: &mut chip.Pins, timer: &mut chip.Timer) {
+    slice := pins.pwm_timer(3, chip.SYS_HZ)!
+    period := chip.SYS_HZ as u64 / 4000
+    slice.start(period)!
+    slice.listen()
+    irq := slice.irq()
+    unsafe {
+        WRAP_PERIODS = 0
+        PWM_TIMER = some(slice)
+    }
+    cortex_m.enable(irq)
+    begin := timer.now_us()
+    for hits(&WRAPS) < 4 && timer.now_us() - begin < 20_000 {}
+    cortex_m.disable(irq)
+    wraps := hits(&WRAPS)
+    taken := unsafe {
+        mem.replace(&mut PWM_TIMER, none)
+    }
+    match taken {
+        some(back) => {
+            periods := unsafe {
+                WRAP_PERIODS
+            }
+            assert(wraps >= 4 && periods >= 1 && back.is_running() && back.is_listening(), "the PWM wrap interrupt does not fire")
+            back.ignore()
+            pins.release_pwm_timer(back)
+        }
+        none => {
+            assert(false, "the PWM timer went missing")
+        }
+    }
+
+}
+
+fn pio_capture_checks(pins: &mut chip.Pins, timer: &mut chip.Timer) {
+    // A PIO edge capture of a pin that another state machine of the block
+    // toggles every 32000 cycles: 8000 ticks of clk_sys / 4 apart, exactly
+    // on a real board (tests/hardware); the emulators' PIO timing is only
+    // close, so the gaps may be 5% off here.
+    pio := pins.pio(1)!
+    capture := pins.edge_capture(&mut pio, TOGGLE_PIN, rp_capture.BOTH, chip.SYS_HZ / 4)!
+    toggle := pio.load(&TOGGLE)!
+    machine := pio.free_state_machine()!
+    config := toggle.config()
+    config.set_set_pins(TOGGLE_PIN, 1)!
+    config.set_divider(1000 * 256)!
+    machine.init(&config)
+    machine.set_pindirs(TOGGLE_PIN, 1, 1)
+    machine.set_enabled(true)
+    times := [0u64; 6]
+    rising := [false; 6]
+    seen := 0usize
+    overrun := false
+    begin := timer.now_us()
+    for seen < 6 && timer.now_us() - begin < 50_000 {
+        ticks := 0u64
+        match capture.poll_event(&mut ticks) {
+            ok(found) => {
+                if found {
+                    times[seen] = ticks
+                    rising[seen] = capture.rising()
+                    seen += 1
+                }
+            }
+            err(_) => {
+                overrun = true
+            }
+        }
+    }
+    machine.set_enabled(false)
+    timed := seen == 6 && !overrun
+    for index in 1usize..6 {
+        gap := times[index] - times[index - 1]
+        timed = timed && rising[index] != rising[index - 1] && gap >= 7600 && gap <= 8400
+    }
+    assert(timed, "a PIO edge capture does not time a toggling pin")
+    pio.release_state_machine(machine)
+    pio.unload(toggle)
+    pins.release_edge_capture(capture, &mut pio)
+    pins.release_pio(pio)
+}
+
 // Core 1: started with a task of its own, sharing the FIFOs and a spinlock
 // with core 0, and running an executor of its own.
 static mut CORE1_STACK: [512]u64 = [0u64; 512]
@@ -1045,6 +1192,8 @@ pub fn run(float64: bool) {
     gpio_checks(&mut b.pins)
     step()
     pio_window_checks(&mut b.pins, &mut b.timer)
+    step()
+    timer_channel_checks(&mut b.pins, &mut b.timer)
     step()
     core1_checks(&mut b.core1, &mut b.fifos, &mut b.spinlocks, &mut b.timer)
     step()

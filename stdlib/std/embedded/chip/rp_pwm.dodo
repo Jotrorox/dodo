@@ -1,5 +1,6 @@
 package rp_pwm
 
+import "std/embedded/chip/rp_timer"
 import "std/embedded/hal"
 
 // The PWM block the RP2040 and RP2350 share (RP2040 datasheet 4.5, RP2350
@@ -20,7 +21,9 @@ import "std/embedded/hal"
 // `Channel` is one output over any hal.Registers: a `hal.RegisterBlock` at
 // the block's base on the chip, or a simulated block in a desktop test. It
 // implements hal.PwmOutput. `Capture` instead measures the signal on a B
-// pin with the slice's counter; see "Input capture" below. The outputs of a slice write their own bits of
+// pin with the slice's counter; see "Input capture" below. `SliceTimer`
+// uses a slice without pins, as a periodic timer and a counter; see
+// "Slices as timers" below. The outputs of a slice write their own bits of
 // shared registers through the block's atomic XOR, set, and clear aliases,
 // at 0x1000, 0x2000, and 0x3000 above each register, so neither disturbs
 // the other, nor an interrupt handler that owns one of them.
@@ -32,6 +35,13 @@ const CTR: usize = 0x08
 const CC: usize = 0x0C
 const TOP: usize = 0x10
 const SLICE_STRIDE: usize = 0x14
+
+// The wrap interrupt registers, from INTR (interrupt_offset): the raw
+// flags, one bit per slice, set when its counter wraps and cleared by
+// writing one; and the enables of the interrupt PWM_IRQ_WRAP (RP2040) or
+// PWM_IRQ_WRAP_0 (RP2350, IRQ0_INTE). The RP2350's second line,
+// PWM_IRQ_WRAP_1, has its own enables at INTR + 0x10, which are not used.
+const INTE: usize = 4
 
 // Atomic register aliases (RP2040 datasheet 2.1.2).
 const XOR_ALIAS: usize = 0x1000
@@ -142,15 +152,28 @@ pub struct Channel<R: hal.Registers>: hal.PwmOutput {
     sibling: u32
     timing: Timing
     duty: u16
+    // INTR's offset in the block.
+    interrupts: usize
 
     // Start output `output_of(pin)` of slice `slice_of(pin)` at `timing`,
     // low. If the slice's other output is already in use, the slice keeps
     // running and `timing` must be what it runs at: Busy otherwise, and Busy
-    // if this output is in use too. InvalidInput above GPIO 47.
+    // if this output is in use too. InvalidInput above GPIO 47 or for a GPIO
+    // whose slice the block lacks. The block has the RP2040's 8 slices,
+    // which places its wrap flags; new_in names another count.
     // SAFETY: `registers` must be the PWM block's, out of reset and clocked
     // at timing.clock_hz, and only Channels may use it.
     pub unsafe fn new(registers: R, pin: u32, timing: Timing) -> Channel<R>!hal.Error {
-        if pin >= PIN_COUNT {
+        unsafe {
+            return Channel.new_in(registers, SLICE_COUNT, pin, timing)
+        }
+    }
+
+    // `new` in a block of `slices` slices: 8 on the RP2040, 12 on the
+    // RP2350.
+    // SAFETY: as for `new`.
+    pub unsafe fn new_in(registers: R, slices: u32, pin: u32, timing: Timing) -> Channel<R>!hal.Error {
+        if pin >= PIN_COUNT || slice_of(pin) >= slices {
             return err(hal.Error.InvalidInput)
         }
         slice := slice_of(pin)
@@ -167,6 +190,7 @@ pub struct Channel<R: hal.Registers>: hal.PwmOutput {
             sibling,
             timing,
             duty: 0,
+            interrupts: interrupt_offset(slices),
         }
         section := hal.Critical.enter()
         // SAFETY: interrupts are masked, so CLAIMED is read and changed
@@ -290,8 +314,43 @@ pub struct Channel<R: hal.Registers>: hal.PwmOutput {
         return self.registers.read(self.base + CTR) & 0xFFFF
     }
 
+    // Whether the slice's counter wrapped, ending a period, since the flag
+    // was last cleared. The flag and the wrap interrupt belong to the
+    // slice, so both outputs of a slice see them; with both in use, let
+    // one of them handle the interrupt. Compare values set in a period take
+    // effect at its wrap, so a handler that sets the next duty has a whole
+    // period to do it.
+    pub fn wrapped(&mut self) -> bool {
+        return (self.registers.read(self.interrupts) & self.slice_bit()) != 0
+    }
+
+    // Clear the wrap flag. A wrap interrupt handler has to, or the
+    // interrupt stays raised.
+    pub fn clear_wrap(&mut self) {
+        bit := self.slice_bit()
+        self.registers.write(self.interrupts, bit)
+    }
+
+    // Raise the wrap interrupt, PWM_IRQ_WRAP on the RP2040 and
+    // PWM_IRQ_WRAP_0 on the RP2350, while the wrap flag is set.
+    pub fn listen_wrap(&mut self) {
+        bit := self.slice_bit()
+        self.registers.write(self.interrupts + INTE + SET_ALIAS, bit)
+    }
+
+    // Stop raising the wrap interrupt; `wrapped` still reports.
+    pub fn ignore_wrap(&mut self) {
+        bit := self.slice_bit()
+        self.registers.write(self.interrupts + INTE + CLEAR_ALIAS, bit)
+    }
+
+    pub fn is_listening_wrap(&mut self) -> bool {
+        return (self.registers.read(self.interrupts + INTE) & self.slice_bit()) != 0
+    }
+
     // Hold the output low and give it up, and stop the slice if its other
-    // output is not in use either. Returns the registers.
+    // output is not in use either, with its wrap interrupt off and its
+    // flag clear. Returns the registers.
     pub fn release(self) -> R {
         self.write_compare(0)
         self.set_inverted(false)
@@ -301,11 +360,18 @@ pub struct Channel<R: hal.Registers>: hal.PwmOutput {
             CLAIMED &= ~self.bit
             if (CLAIMED & self.sibling) == 0 {
                 self.registers.write(self.base + CSR + CLEAR_ALIAS, ENABLE)
+                self.ignore_wrap()
+                self.clear_wrap()
             }
         }
         core.drop(section)
-        let Channel { registers, pin, base, shift, invert, bit, sibling, timing, duty } = self
+        let Channel { registers, pin, base, shift, invert, bit, sibling, timing, duty, interrupts } = self
         return registers
+    }
+
+    // The slice's bit in the wrap interrupt registers.
+    fn slice_bit(&self) -> u32 {
+        return 1u32 << (self.base / SLICE_STRIDE) as u32
     }
 
     // Whether the slice runs with `divider` and `top` now.
@@ -326,14 +392,45 @@ pub struct Channel<R: hal.Registers>: hal.PwmOutput {
 // the chip packages hand out. Implements hal.PwmOutput.
 pub struct Pwm: hal.PwmOutput {
     channel: Channel<hal.RegisterBlock>
+    // The wrap interrupt's number.
+    irq: u32
 
-    // Channel.new over the block at `base`.
+    // Channel.new_in over the block at `base`, of `slices` slices, whose
+    // wrap interrupt is `irq`.
     // SAFETY: as for Channel.new, with `base` the PWM block's base address.
-    pub unsafe fn at(base: usize, pin: u32, timing: Timing) -> Pwm!hal.Error {
+    pub unsafe fn at(base: usize, slices: u32, irq: u32, pin: u32, timing: Timing) -> Pwm!hal.Error {
         unsafe {
-            channel := Channel.new(hal.RegisterBlock.at(base), pin, timing)?
-            return ok(Pwm { channel })
+            channel := Channel.new_in(hal.RegisterBlock.at(base), slices, pin, timing)?
+            return ok(Pwm { channel, irq })
         }
+    }
+
+    // The wrap interrupt, for cortex_m.enable and `@interrupt`:
+    // PWM_IRQ_WRAP on the RP2040, PWM_IRQ_WRAP_0 on the RP2350. Every
+    // slice raises it, so its handler checks `wrapped` on each output or
+    // timer it listens for.
+    pub fn irq(&self) -> u32 {
+        return self.irq
+    }
+
+    pub fn wrapped(&mut self) -> bool {
+        return self.channel.wrapped()
+    }
+
+    pub fn clear_wrap(&mut self) {
+        self.channel.clear_wrap()
+    }
+
+    pub fn listen_wrap(&mut self) {
+        self.channel.listen_wrap()
+    }
+
+    pub fn ignore_wrap(&mut self) {
+        self.channel.ignore_wrap()
+    }
+
+    pub fn is_listening_wrap(&mut self) -> bool {
+        return self.channel.is_listening_wrap()
     }
 
     pub fn max_duty(&self) -> u16 {
@@ -386,7 +483,7 @@ pub struct Pwm: hal.PwmOutput {
 
     // Channel.release; returns the block's base address.
     pub fn release(self) -> usize {
-        let Pwm { channel } = self
+        let Pwm { channel, irq } = self
         registers := channel.release()
         return registers.base()
     }
@@ -949,5 +1046,422 @@ fn read_timer(high: &hal.Reg<u32>, low: &hal.Reg<u32>) -> u64 {
         if high.read() == upper {
             return ((upper as u64) << 32) | lower as u64
         }
+    }
+}
+
+// The bits of CLAIMED in use: outputs, inputs, and timers, two bits per
+// slice. The chip packages hold the block in reset while none is.
+pub fn claimed() -> u32 {
+    section := hal.Critical.enter()
+    // SAFETY: interrupts are masked, so the read is not torn by a claim on
+    // this core; only core 0 claims.
+    value := unsafe {
+        CLAIMED
+    }
+    core.drop(section)
+    return value
+}
+
+// --- Slices as timers --------------------------------------------------------
+//
+// A slice needs no pins: its counter counts clk_sys / divider from 0 to TOP
+// and wraps, setting the slice's flag in INTR and, while its INTE bit is
+// set, raising the wrap interrupt (RP2040 datasheet 4.5.2.7, RP2350
+// datasheet 12.5.2.7). `SliceTimer` uses that as a hal.PeriodicTimer
+// whose period is TOP + 1 ticks of clk_sys / divider: the hardware wraps
+// exactly every period, so periods never drift, and they are timed to a
+// tick, down to a clk_sys cycle.
+//
+// The flag only says that a wrap happened, not how many. To count them, and
+// to extend the 16-bit counter into the 64-bit hal.TickCounter, the timer
+// pairs the counter with the chip's microsecond timer, which runs from the
+// same crystal as clk_sys, so the two never drift apart: the microseconds
+// since the start give the ticks to within a microsecond or two, and the
+// counter gives the ticks within the period exactly, which settles the
+// whole periods. That takes a period of at least MIN_PERIOD_US, so the
+// microsecond timer's resolution stays well below half a period, and it
+// takes clk_sys to stay at the rate the timer was opened with. Nothing
+// needs to poll in between: a poll after any delay counts every period.
+
+// The shortest period, in microseconds.
+pub const MIN_PERIOD_US: u64 = 8
+// The longest period, in ticks: the counter's 16 bits.
+pub const MAX_PERIOD_TICKS: u64 = 0x1_0000
+// The timer's TIMERAWH and TIMERAWL on both chips.
+const TIMER_RAW_HIGH: usize = 0x24
+const TIMER_RAW_LOW: usize = 0x28
+
+// The divider, in sixteenths, that makes a slice count at `tick_hz` from
+// `clock_hz`: clock_hz / tick_hz, which must be a whole number of
+// sixteenths from 1 to 255 15/16. At a clk_sys of 125 MHz, for example, 125
+// MHz, 10 MHz, 1 MHz, or 500 kHz; 488.3 kHz is the slowest rate. InvalidInput
+// otherwise.
+pub fn timer_divider(clock_hz: u32, tick_hz: u32) -> u32!hal.Error {
+    scaled := clock_hz as u64 * 16
+    if tick_hz == 0 || scaled % tick_hz as u64 != 0 {
+        return err(hal.Error.InvalidInput)
+    }
+    divider := scaled / tick_hz as u64
+    if divider < MIN_DIVIDER as u64 || divider > MAX_DIVIDER as u64 {
+        return err(hal.Error.InvalidInput)
+    }
+    return ok(divider as u32)
+}
+
+// A slice as a periodic timer and a counter, over a PWM block and the
+// chip's microsecond timer, each any rp_timer.Block: rp_timer.Mmio on the
+// chip, or a simulated block in a desktop test. It claims both outputs of
+// its slice and drives no pins. `PwmTimer` is the chip's, which the chip
+// packages hand out. Implements hal.PeriodicTimer and hal.TickCounter.
+pub struct SliceTimer<B: rp_timer.Block>: hal.PeriodicTimer + hal.TickCounter {
+    pwm: B
+    clock: B
+    // The slice's registers, from the block's base; INTR's offset and the
+    // slice's bit in it; and the slice's two bits in CLAIMED.
+    base: usize
+    interrupts: usize
+    bit: u32
+    claim: u32
+    hz: u32
+    // Ticks per microsecond when that is a whole number, else 0: the
+    // counter extends with a multiplication then, rather than divisions,
+    // which the Cortex-M0+ does in software.
+    per_us: u64
+    // The period in ticks, 0 before the first start.
+    period: u64
+    running: bool
+    // While running: the microsecond time the counter started from 0, the
+    // ticks counted before that, and the periods polled since.
+    start_us: u64
+    base_ticks: u64
+    polled: u64
+    // While stopped: the ticks counted.
+    stopped_ticks: u64
+
+    // Slice `slice` of a block of `slices` slices (8 on the RP2040, 12 on
+    // the RP2350, whose slices 8 to 11 reach no pins but count as timers),
+    // counting at `tick_hz` from `clock_hz`; see timer_divider for the
+    // rates. It starts stopped. InvalidInput for another slice or rate;
+    // Busy if either output of the slice is in use.
+    // SAFETY: `pwm` must be the PWM block's, out of reset and clocked at
+    // `clock_hz`, used only by Channels, Captures, and SliceTimers, and
+    // `clock` a running microsecond timer from the same crystal; nothing
+    // else may clear the slice's INTR flag or change its INTE bit.
+    pub unsafe fn new(pwm: B, clock: B, slices: u32, clock_hz: u32, slice: u32, tick_hz: u32) -> SliceTimer<B>!hal.Error {
+        if slice >= slices {
+            return err(hal.Error.InvalidInput)
+        }
+        divider := timer_divider(clock_hz, tick_hz)?
+        timer := SliceTimer<B> {
+            pwm,
+            clock,
+            base: SLICE_STRIDE * slice as usize,
+            interrupts: interrupt_offset(slices),
+            bit: 1u32 << slice,
+            claim: 3u32 << (2 * slice),
+            hz: tick_hz,
+            per_us: 0,
+            period: 0,
+            running: false,
+            start_us: 0,
+            base_ticks: 0,
+            polled: 0,
+            stopped_ticks: 0,
+        }
+        section := hal.Critical.enter()
+        // SAFETY: interrupts are masked, so CLAIMED is read and changed
+        // atomically on this core; only core 0 runs.
+        claimed := unsafe {
+            CLAIMED
+        }
+        if (claimed & timer.claim) != 0 {
+            core.drop(section)
+            return err(hal.Error.Busy)
+        }
+        unsafe {
+            CLAIMED = claimed | timer.claim
+        }
+        core.drop(section)
+        if tick_hz % 1_000_000 == 0 {
+            timer.per_us = (tick_hz / 1_000_000) as u64
+        }
+        base := timer.base
+        timer.pwm.write(base + CSR, 0)
+        timer.pwm.write(base + DIV, divider)
+        timer.pwm.write(base + TOP, FULL_TOP)
+        timer.pwm.write(base + CTR, 0)
+        timer.pwm.write(base + CC, 0)
+        timer.clear_wrap()
+        return ok(timer)
+    }
+
+    pub fn tick_hz(&self) -> u32 {
+        return self.hz
+    }
+
+    // The slice, 0 to 11.
+    pub fn slice(&self) -> u32 {
+        return (self.base / SLICE_STRIDE) as u32
+    }
+
+    // The period `start` set, in ticks; 0 before the first start.
+    pub fn period_ticks(&self) -> u64 {
+        return self.period
+    }
+
+    pub fn is_running(&self) -> bool {
+        return self.running
+    }
+
+    // Wrap every `period_ticks` ticks, 1 to MAX_PERIOD_TICKS and at least
+    // MIN_PERIOD_US long, the first time one period from now. The counter
+    // starts the period from 0; now_ticks carries on from where it was.
+    // InvalidInput for a period out of range.
+    pub fn start(&mut self, period_ticks: u64) -> void!hal.Error {
+        if period_ticks == 0 || period_ticks > MAX_PERIOD_TICKS || period_ticks * 1_000_000 < MIN_PERIOD_US * self.hz as u64 {
+            return err(hal.Error.InvalidInput)
+        }
+        ticks := self.now_ticks()
+        base := self.base
+        self.pwm.write(base + CSR, 0)
+        self.pwm.write(base + TOP, (period_ticks - 1) as u32)
+        self.pwm.write(base + CTR, 0)
+        self.clear_wrap()
+        section := hal.Critical.enter()
+        self.pwm.write(base + CSR, ENABLE)
+        start := rp_timer.read_count(&self.clock)
+        core.drop(section)
+        self.start_us = start
+        self.base_ticks = ticks
+        self.period = period_ticks
+        self.polled = 0
+        self.running = true
+        return ok()
+    }
+
+    // Stop the counter; now_ticks holds still until the next start.
+    pub fn cancel(&mut self) {
+        if !self.running {
+            return
+        }
+        ticks := self.now_ticks()
+        base := self.base
+        self.pwm.write(base + CSR, 0)
+        self.clear_wrap()
+        self.stopped_ticks = ticks
+        self.running = false
+    }
+
+    // How many periods ended since `start` or the last call. Clears the
+    // wrap flag first, so a wrap interrupt handler calls it; a wrap that
+    // lands right after the clear sets the flag again but is counted now,
+    // so the next call may return 0.
+    pub fn poll_periods(&mut self) -> u32 {
+        if !self.running {
+            return 0
+        }
+        self.clear_wrap()
+        position := 0u64
+        ended := self.split(&mut position)
+        if ended <= self.polled {
+            return 0
+        }
+        periods := ended - self.polled
+        self.polled = ended
+        if periods > 0xFFFF_FFFFu64 {
+            return 0xFFFF_FFFF
+        }
+        return periods as u32
+    }
+
+    // Ticks since the timer was opened, counted while it ran: the 16-bit
+    // counter extended by the microsecond timer.
+    pub fn now_ticks(&self) -> u64 {
+        if !self.running {
+            return self.stopped_ticks
+        }
+        position := 0u64
+        periods := self.split(&mut position)
+        return self.base_ticks + periods * self.period + position
+    }
+
+    // The whole periods since the start, and in `position` the ticks
+    // since the last of them: the counter and the microsecond timer read
+    // together, as extend_count combines them.
+    fn split(&self, position: &mut u64) -> u64 {
+        section := hal.Critical.enter()
+        now := rp_timer.read_count(&self.clock)
+        count := self.pwm.read(self.base + CTR) & FULL_TOP
+        core.drop(section)
+        elapsed := 0u64
+        if now > self.start_us {
+            elapsed = now - self.start_us
+        }
+        estimate := elapsed * self.per_us
+        if self.per_us == 0 {
+            estimate = hal.us_to_ticks(elapsed, self.hz)
+        }
+        *position = count as u64
+        return periods_since(estimate, count as u64, self.period)
+    }
+
+    // The counter's position in the period, 0 to period - 1.
+    pub fn count(&self) -> u32 {
+        return self.pwm.read(self.base + CTR) & FULL_TOP
+    }
+
+    // Whether the counter wrapped since the flag was last cleared.
+    pub fn wrapped(&self) -> bool {
+        return (self.pwm.read(self.interrupts) & self.bit) != 0
+    }
+
+    // Raise the wrap interrupt, PWM_IRQ_WRAP on the RP2040 and
+    // PWM_IRQ_WRAP_0 on the RP2350, when a period ends.
+    pub fn listen(&mut self) {
+        offset := self.interrupts + INTE + SET_ALIAS
+        bit := self.bit
+        self.pwm.write(offset, bit)
+    }
+
+    pub fn ignore(&mut self) {
+        offset := self.interrupts + INTE + CLEAR_ALIAS
+        bit := self.bit
+        self.pwm.write(offset, bit)
+    }
+
+    pub fn is_listening(&self) -> bool {
+        return (self.pwm.read(self.interrupts + INTE) & self.bit) != 0
+    }
+
+    // Stop the slice and give it up, with its interrupt off, its flag
+    // clear, and its registers as Capture.release leaves them. Returns the
+    // PWM block.
+    pub fn release(self) -> B {
+        self.cancel()
+        self.ignore()
+        base := self.base
+        self.pwm.write(base + DIV, MIN_DIVIDER)
+        self.pwm.write(base + TOP, FULL_TOP)
+        self.pwm.write(base + CTR, 0)
+        section := hal.Critical.enter()
+        // SAFETY: as in `new`.
+        unsafe {
+            CLAIMED &= ~self.claim
+        }
+        core.drop(section)
+        let SliceTimer { pwm, clock, base: _, interrupts, bit, claim, hz, per_us, period, running, start_us, base_ticks, polled, stopped_ticks } = self
+        return pwm
+    }
+
+    fn clear_wrap(&mut self) {
+        offset := self.interrupts
+        bit := self.bit
+        self.pwm.write(offset, bit)
+    }
+}
+
+// The ticks a counter of `period` ticks at `tick_hz` has counted since it
+// started from 0 `elapsed_us` microseconds ago, now showing `count`: of the
+// values that show `count`, a whole number of periods plus `count`, the
+// one closest to what the elapsed time says. Exact while the elapsed time
+// is right to within half a period, as it is from MIN_PERIOD_US on.
+pub fn extend_count(elapsed_us: u64, count: u32, period: u64, tick_hz: u32) -> u64 {
+    estimate := hal.us_to_ticks(elapsed_us, tick_hz)
+    position := count as u64 % period
+    return periods_since(estimate, position, period) * period + position
+}
+
+// The whole periods before a count at `position` in its period, closest to
+// `estimate` ticks.
+fn periods_since(estimate: u64, position: u64, period: u64) -> u64 {
+    if estimate + period / 2 < position {
+        return 0
+    }
+    return (estimate + period / 2 - position) / period
+}
+
+// A slice as a timer on the chip: a SliceTimer over the PWM block and the
+// microsecond timer's registers, which the chip packages hand out.
+// Implements hal.PeriodicTimer and hal.TickCounter.
+pub struct PwmTimer: hal.PeriodicTimer + hal.TickCounter {
+    timer: SliceTimer<rp_timer.Mmio>
+    irq: u32
+
+    // SliceTimer.new over the PWM block at `base` and the microsecond timer
+    // at `timer`, raising wrap interrupt `irq`. Errors as for
+    // SliceTimer.new.
+    // SAFETY: as for SliceTimer.new, with `base` the PWM block's base
+    // address and `timer` a running microsecond timer's.
+    pub unsafe fn at(base: usize, timer: usize, slices: u32, irq: u32, clock_hz: u32, slice: u32, tick_hz: u32) -> PwmTimer!hal.Error {
+        unsafe {
+            opened := SliceTimer.new(rp_timer.Mmio.at(base), rp_timer.Mmio.at(timer), slices, clock_hz, slice, tick_hz)?
+            return ok(PwmTimer { timer: opened, irq })
+        }
+    }
+
+    // The wrap interrupt, for cortex_m.enable and `@interrupt`:
+    // PWM_IRQ_WRAP on the RP2040, PWM_IRQ_WRAP_0 on the RP2350. Every
+    // slice raises it, so its handler polls each timer it listens for.
+    pub fn irq(&self) -> u32 {
+        return self.irq
+    }
+
+    pub fn tick_hz(&self) -> u32 {
+        return self.timer.tick_hz()
+    }
+
+    pub fn slice(&self) -> u32 {
+        return self.timer.slice()
+    }
+
+    pub fn period_ticks(&self) -> u64 {
+        return self.timer.period_ticks()
+    }
+
+    pub fn is_running(&self) -> bool {
+        return self.timer.is_running()
+    }
+
+    pub fn start(&mut self, period_ticks: u64) -> void!hal.Error {
+        return self.timer.start(period_ticks)
+    }
+
+    pub fn cancel(&mut self) {
+        self.timer.cancel()
+    }
+
+    pub fn poll_periods(&mut self) -> u32 {
+        return self.timer.poll_periods()
+    }
+
+    pub fn now_ticks(&self) -> u64 {
+        return self.timer.now_ticks()
+    }
+
+    pub fn count(&self) -> u32 {
+        return self.timer.count()
+    }
+
+    pub fn wrapped(&self) -> bool {
+        return self.timer.wrapped()
+    }
+
+    pub fn listen(&mut self) {
+        self.timer.listen()
+    }
+
+    pub fn ignore(&mut self) {
+        self.timer.ignore()
+    }
+
+    pub fn is_listening(&self) -> bool {
+        return self.timer.is_listening()
+    }
+
+    // SliceTimer.release; returns the PWM block's base address.
+    pub fn release(self) -> usize {
+        let PwmTimer { timer, irq } = self
+        block := timer.release()
+        return block.base()
     }
 }

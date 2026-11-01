@@ -214,7 +214,8 @@ struct PwmView: hal.Registers {
     pub fn read(&mut self, offset: usize) -> u32 {
         core.assert(offset < 0x1000 && offset % 4 == 0)
         word := offset / 4
-        core.assert(word <= interrupt_word())
+        // INTE, the wrap interrupt enables, follows INTR.
+        core.assert(word <= interrupt_word() + 1)
         catch_up()
         unsafe {
             return REGISTERS[word]
@@ -224,9 +225,20 @@ struct PwmView: hal.Registers {
     pub fn write(&mut self, offset: usize, value: u32) {
         alias := offset & 0x3000
         word := (offset & 0xFFF) / 4
-        core.assert(word <= interrupt_word())
+        core.assert(word <= interrupt_word() + 1)
         catch_up()
         unsafe {
+            if word == interrupt_word() + 1 {
+                // INTE: plain storage, through the set and clear aliases.
+                if alias == 0x2000 {
+                    REGISTERS[word] |= value
+                } else if alias == 0x3000 {
+                    REGISTERS[word] &= ~value
+                } else {
+                    REGISTERS[word] = value
+                }
+                return
+            }
             if word == interrupt_word() {
                 // INTR: write 1 to clear, only through the plain address.
                 core.assert(alias == 0)
@@ -851,6 +863,10 @@ struct BankChip {
 
     pub fn pwm_slices(&self) -> u32 {
         return 8
+    }
+
+    pub fn pwm_irq(&self) -> u32 {
+        return 4
     }
 
     pub fn timer_base(&self) -> usize {

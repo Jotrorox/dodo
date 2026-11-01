@@ -136,6 +136,7 @@ LAST_CHECKS = [
     "key-value store on flash compacts, reopens, and keeps its values",
     "either core erases and writes flash while the other runs from it",
     "a lockout parks the other core in SRAM until it is dropped, from either core",
+    "timer channels: an alarm fires as a compare channel and runs periodically in phase, counting missed periods (and TIMER1 keeps pace on the RP2350); a PWM slice timer counts clk_sys against the timer and counts its periods; a PIO edge capture times a toggling pin exactly and reports a full FIFO as Overrun",
     "invalid crystal is rejected",
     "chip take() after board take() is refused",
     "delay_ms(10) lasts 10 ms",

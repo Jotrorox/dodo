@@ -19,7 +19,8 @@ import "std/time"
 // 2. Interrupts. `Critical` masks interrupts on the current core until it is
 //    dropped. It never excludes other threads or cores.
 // 3. Device protocols. The interfaces below name what drivers need from a
-//    device: OutputPin, InputPin, Delay, Counter, Alarm, I2c, Spi,
+//    device: OutputPin, InputPin, Delay, Counter, Alarm, TickCounter,
+//    Compare, PeriodicTimer, InputCapture, I2c, Spi,
 //    PwmOutput, PwmInput, AnalogInput, Rtc, RtcAlarm, Can, I2sOutput,
 //    I2sInput, Rng, Watchdog, Flash, and Registers; the polling forms
 //    I2cPoll and SpiPoll; the target (slave) sides I2cTarget and SpiTarget; and
@@ -117,7 +118,9 @@ import "std/time"
 //                                  chips may hand out alarms with the Alarm
 //                                  protocol that are also
 //                                  std/embedded/executor clocks, as the
-//                                  RP2040 and RP2350 do with alarm(n)
+//                                  RP2040 and RP2350 do with alarm(n),
+//                                  whose alarms are also Compare channels
+//                                  and PeriodicTimers
 //    Board.rtc                     the chip's real-time clock, with the Rtc
 //                                  and RtcAlarm protocols: the RP2040's
 //                                  RTC, the RP2350's always-on timer
@@ -256,6 +259,98 @@ pub interface Alarm {
     // Acknowledge a firing. An interrupt handler has to, or the interrupt
     // stays raised.
     fn clear(&mut self)
+}
+
+// Timers at other rates. Counter and Alarm count microseconds; hardware
+// timers often count something else: the system clock, a divided clock, or
+// a crystal. The four protocols below count ticks at a rate each
+// implementation reports with `tick_hz`, in a u64 that starts at 0 at some
+// fixed time and never decreases, and ticks_to_us and us_to_ticks convert.
+// A tick rate stays fixed while a timer runs.
+//
+// Interrupts. Compare channels, periodic timers, and capture channels each
+// raise an interrupt with `listen` until `ignore`: a compare channel while
+// it has fired, until `clear`; a periodic timer once per period, until
+// `poll_periods` acknowledges it; a capture channel while an event waits
+// to be read. Which vector that is stays chip-specific (on the RP2040 and
+// RP2350 each implementation's `irq` names it), so a driver generic over
+// these protocols polls, or leaves the handler to the program.
+
+// A free-running counter at a rate of its own, such as a timer that counts
+// the system clock.
+pub interface TickCounter {
+    // Ticks per second.
+    fn tick_hz(&self) -> u32
+    // Ticks since some fixed start; never decreases.
+    fn now_ticks(&self) -> u64
+}
+
+// A compare channel on a TickCounter: it fires once when the counter
+// reaches the tick count it was given, as an Alarm does with microseconds,
+// and is a TickCounter itself. Code polls `fired`, or with `listen` the
+// channel raises its interrupt, whose handler calls `clear`.
+pub interface Compare {
+    fn tick_hz(&self) -> u32
+    fn now_ticks(&self) -> u64
+    // Fire once when now_ticks() reaches `ticks`, replacing any earlier
+    // count and clearing an earlier firing. A count already reached fires
+    // at once. InvalidInput if the count lies further ahead than the
+    // channel reaches, which each implementation states.
+    fn schedule_at_ticks(&mut self, ticks: u64) -> void!Error
+    // Disarm: a scheduled count no longer fires. An earlier firing stays
+    // reported until `clear`.
+    fn cancel(&mut self)
+    // True once the scheduled count was reached, until `clear` or the next
+    // schedule.
+    fn fired(&self) -> bool
+    // Acknowledge a firing. An interrupt handler has to, or the interrupt
+    // stays raised.
+    fn clear(&mut self)
+    // Raise the channel's interrupt while it has fired.
+    fn listen(&mut self)
+    // Stop raising it; `fired` still reports.
+    fn ignore(&mut self)
+}
+
+// A timer that elapses again and again at a fixed period: a hardware
+// counter that wraps, or an alarm that re-arms itself. Each period ends a
+// whole number of periods after the start, so periods do not drift however
+// late a program looks at them, and a program that looks late learns how
+// many ended meanwhile instead of losing them.
+pub interface PeriodicTimer {
+    fn tick_hz(&self) -> u32
+    // Elapse every `period_ticks` ticks, the first time one period from
+    // now, replacing a running period and forgetting periods not yet
+    // polled. InvalidInput for 0 or a period the timer cannot make, which
+    // each implementation states.
+    fn start(&mut self, period_ticks: u64) -> void!Error
+    // Stop: no more periods end, and those not yet polled are forgotten.
+    fn cancel(&mut self)
+    // Without waiting: how many periods ended since `start` or the last
+    // call, 0 while none has. More than 1 means the program missed
+    // periods: they ended while it was busy. Acknowledges the interrupt,
+    // so a handler calls it; a handler may then see 0 for a period an
+    // earlier call already counted.
+    fn poll_periods(&mut self) -> u32
+    // Raise the timer's interrupt when a period ends.
+    fn listen(&mut self)
+    fn ignore(&mut self)
+}
+
+// A capture channel: on each event at its input, such as an edge on a pin,
+// the hardware latches the time on a counter, so the time is exact however
+// late the program reads it.
+pub interface InputCapture {
+    fn tick_hz(&self) -> u32
+    // Without waiting: true with `ticks` set to the time of the earliest
+    // event not yet reported, a tick count at tick_hz, and false while
+    // none waits. Overrun if events came faster than the channel holds
+    // them, so some were lost; events that still wait are reported by the
+    // next calls.
+    fn poll_event(&mut self, ticks: &mut u64) -> bool!Error
+    // Raise the channel's interrupt while an event waits.
+    fn listen(&mut self)
+    fn ignore(&mut self)
 }
 
 // An I2C bus controller. Addresses are 7-bit device addresses.
@@ -1856,6 +1951,111 @@ pub struct Ticker {
     pub fn wait<C: Counter>(&mut self, counter: &C) {
         for !self.ready(counter) {}
     }
+}
+
+// `value * multiplier / divisor`, rounded down (or up with `round_up`),
+// without overflowing in between; the largest u64 if the result does not
+// fit. `divisor` and `multiplier` are at most 2^32.
+fn scale(value: u64, multiplier: u64, divisor: u64, round_up: bool) -> u64 {
+    whole := value / divisor
+    part := (value % divisor) * multiplier
+    if whole != 0 && multiplier > 0xFFFF_FFFF_FFFF_FFFFu64 / whole {
+        return 0xFFFF_FFFF_FFFF_FFFFu64
+    }
+    result := whole * multiplier
+    rest := part / divisor
+    if round_up && part % divisor != 0 {
+        rest += 1
+    }
+    if rest > 0xFFFF_FFFF_FFFF_FFFFu64 - result {
+        return 0xFFFF_FFFF_FFFF_FFFFu64
+    }
+    return result + rest
+}
+
+// The microseconds `ticks` at `tick_hz` last, rounded down. A rate of 0
+// gives 0.
+pub fn ticks_to_us(ticks: u64, tick_hz: u32) -> u64 {
+    if tick_hz == 0 {
+        return 0
+    }
+    return scale(ticks, 1_000_000, tick_hz as u64, false)
+}
+
+// The nanoseconds `ticks` at `tick_hz` last, rounded down, saturating at
+// the largest u64 (584 years).
+pub fn ticks_to_ns(ticks: u64, tick_hz: u32) -> u64 {
+    if tick_hz == 0 {
+        return 0
+    }
+    return scale(ticks, 1_000_000_000, tick_hz as u64, false)
+}
+
+// The ticks at `tick_hz` in `microseconds`, rounded up, so that waiting
+// that many ticks lasts at least that long.
+pub fn us_to_ticks(microseconds: u64, tick_hz: u32) -> u64 {
+    return scale(microseconds, tick_hz as u64, 1_000_000, true)
+}
+
+// The ticks a tick counter has run since `since`, one of its own
+// now_ticks counts; 0 for a count still ahead.
+pub fn elapsed_ticks<C: TickCounter>(counter: &C, since: u64) -> u64 {
+    now := counter.now_ticks()
+    if now <= since {
+        return 0
+    }
+    return now - since
+}
+
+// Fire a compare channel `ticks` from now. InvalidInput if that lies beyond
+// the channel's reach.
+pub fn schedule_in_ticks<C: Compare>(channel: &mut C, ticks: u64) -> void!Error {
+    time := later(channel.now_ticks(), ticks)
+    return channel.schedule_at_ticks(time)
+}
+
+// Busy-wait until a compare channel fires, then clear it.
+pub fn wait_for_compare<C: Compare>(channel: &mut C) {
+    for !channel.fired() {}
+    channel.clear()
+}
+
+// Start a periodic timer with a period of `period_us`. InvalidInput unless
+// the period is a whole number of the timer's ticks, since a rounded period
+// would drift, or if the timer cannot make it.
+pub fn start_periodic_us<P: PeriodicTimer>(timer: &mut P, period_us: u64) -> void!Error {
+    hz := timer.tick_hz() as u64
+    ticks := scale(period_us, hz, 1_000_000, false)
+    if ticks == 0 || scale(period_us, hz, 1_000_000, true) != ticks {
+        return err(Error.InvalidInput)
+    }
+    return timer.start(ticks)
+}
+
+// Busy-wait until at least one period of a running periodic timer ends,
+// and return how many did, as poll_periods counts them. Waits forever on a
+// timer that is not running.
+pub fn wait_periods<P: PeriodicTimer>(timer: &mut P) -> u32 {
+    for {
+        periods := timer.poll_periods()
+        if periods > 0 {
+            return periods
+        }
+    }
+}
+
+// Wait for the next event on a capture channel, polling at most `polls`
+// times (NO_POLL_LIMIT for no limit), and return its tick count; Timeout
+// after that, and errors as for poll_event.
+pub fn capture_ticks<C: InputCapture>(input: &mut C, polls: u32) -> u64!Error {
+    ticks := 0u64
+    count := 0u32
+    for !input.poll_event(&mut ticks)? {
+        if out_of_polls(&mut count, polls) {
+            return err(Error.Timeout)
+        }
+    }
+    return ok(ticks)
 }
 
 // Set a PWM output high for `numerator / denominator` of each period,

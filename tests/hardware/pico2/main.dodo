@@ -5,6 +5,7 @@ import "core/mem"
 import "core/option"
 import "std/embedded/chip"
 import "std/embedded/chip/rp_adc"
+import "std/embedded/chip/rp_capture"
 import "std/embedded/chip/rp_dma"
 import "std/embedded/chip/rp_flash"
 import "std/embedded/chip/rp_multicore"
@@ -2041,6 +2042,174 @@ fn rtc_checks(rtc: &mut chip.Rtc, watchdog: &mut rp_watchdog.Watchdog, timer: &m
     check(armed && fired && on_time && pending && cleared && !still && quiet)
 }
 
+// Timer channels: an alarm as a compare channel and a drift-free periodic
+// timer (and on the RP2350 TIMER1 at clk_sys and at 1 MHz); a PWM slice as
+// a periodic timer whose count the timer extends exactly; and a PIO edge
+// capture of a pin another state machine toggles every 32000 cycles, whose
+// edges are 8000 ticks of clk_sys / 4 apart, exactly, and whose full FIFO
+// reports Overrun.
+const TOGGLE: rp_pio.Program = rp_pio.assemble("set pins, 1 [31]", "set pins, 0 [31]")
+
+fn timer_channel_checks(pins: &mut chip.Pins, timer: &mut chip.Timer) {
+    alarm := timer.alarm(2)!
+    start := alarm.now_ticks()
+    alarm.schedule_at_ticks(start + 2000)!
+    for !alarm.fired() && alarm.now_ticks() - start < 10_000 {}
+    fired := alarm.now_ticks() - start
+    alarm.clear()
+    alarm.start(1000)!
+    begin := alarm.now_us()
+    for alarm.now_us() - begin < 3500 {}
+    missed := alarm.poll_periods()
+    for !alarm.fired() && alarm.now_us() - begin < 10_000 {}
+    next := alarm.poll_periods()
+    waited := alarm.now_us() - begin
+    timer.release_alarm(alarm)
+    timed := fired >= 2000 && fired < 2010 && missed == 3 && next == 1 && waited >= 3995 && waited < 4010
+    alarms := timed && second_timer_checks(timer)
+
+    // A PWM slice at clk_sys: its count against the timer's, and periods.
+    per_us := (chip.SYS_HZ / 1_000_000) as u64
+    period := chip.SYS_HZ as u64 / 4000
+    slice := pins.pwm_timer(3, chip.SYS_HZ)!
+    before := timer.now_us()
+    slice.start(period)!
+    monotonic := true
+    last := slice.now_ticks()
+    for timer.now_us() - before < 10_000 {
+        ticks := slice.now_ticks()
+        monotonic = monotonic && ticks >= last
+        last = ticks
+    }
+    periods := slice.poll_periods()
+    ticks := slice.now_ticks()
+    spent := timer.now_us() - before
+    counted := ticks + 3 * per_us >= spent * per_us && ticks <= spent * per_us + 3 * per_us
+    whole := periods as u64 == ticks / period || periods as u64 + 1 == ticks / period
+    wrapped := !slice.wrapped()
+    for !slice.wrapped() && timer.now_us() - before < 20_000 {}
+    wrapped = wrapped && slice.wrapped() && slice.poll_periods() == 1 && !slice.wrapped()
+    // Periods of 10 us, the shortest period allowed is 8.
+    slice.start(10 * per_us)!
+    mark := timer.now_us()
+    for timer.now_us() - mark < 1000 {}
+    short := slice.poll_periods()
+    pins.release_pwm_timer(slice)
+    micro := pins.pwm_timer(4, 1_000_000)!
+    micro.start(100)!
+    mark = timer.now_us()
+    for timer.now_us() - mark < 1050 {}
+    tens := micro.poll_periods()
+    pins.release_pwm_timer(micro)
+    slices := monotonic && counted && whole && wrapped && short >= 99 && short <= 101 && tens == 10
+
+    // A PIO edge capture.
+    pio := pins.pio(1)!
+    capture := pins.edge_capture(&mut pio, 6, rp_capture.BOTH, chip.SYS_HZ / 4)!
+    toggle := pio.load(&TOGGLE)!
+    machine := pio.free_state_machine()!
+    config := toggle.config()
+    config.set_set_pins(6, 1)!
+    config.set_divider(1000 * 256)!
+    machine.init(&config)
+    machine.set_pindirs(6, 1, 1)
+    machine.set_enabled(true)
+    exact := true
+    seen := 0u32
+    previous := 0u64
+    rising := false
+    mark = timer.now_us()
+    for seen < 6 && timer.now_us() - mark < 20_000 {
+        ticks := 0u64
+        match capture.poll_event(&mut ticks) {
+            ok(found) => {
+                if found {
+                    if seen > 0 {
+                        exact = exact && ticks - previous == 8000 && capture.rising() != rising
+                    }
+                    previous = ticks
+                    rising = capture.rising()
+                    seen += 1
+                }
+            }
+            err(_) => {
+                exact = false
+            }
+        }
+    }
+    // Twenty edges with nobody reading: eight wait, the rest are lost.
+    timer.delay_us(5200)
+    overrun := false
+    match capture.poll_event(&mut previous) {
+        ok(_) => {}
+        err(error) => {
+            overrun = error == hal.Error.Overrun
+        }
+    }
+    queued := 0u32
+    first := 0u64
+    gaps := true
+    stamp := 0u64
+    for queued < 8 {
+        match capture.poll_event(&mut stamp) {
+            ok(found) => {
+                if !found {
+                    break
+                }
+                if queued > 0 {
+                    gaps = gaps && stamp - first == 8000 * queued as u64
+                } else {
+                    first = stamp
+                }
+                queued += 1
+            }
+            err(_) => {
+                gaps = false
+                break
+            }
+        }
+    }
+    machine.set_enabled(false)
+    pio.release_state_machine(machine)
+    pio.unload(toggle)
+    pins.release_edge_capture(capture, &mut pio)
+    pins.release_pio(pio)
+    // One check for all three, as the record holds 128.
+    check(alarms && slices && exact && seen == 6 && overrun && queued == 8 && gaps)
+}
+
+// TIMER1 at clk_sys and at 1 MHz from the crystal, against TIMER0, and an
+// alarm of its own as a compare channel and a periodic timer.
+fn second_timer_checks(timer: &mut chip.Timer) -> bool {
+    fast := timer.timer1(chip.SYS_HZ)!
+    begin := timer.now_us()
+    first := fast.now_ticks()
+    for timer.now_us() - begin < 10_000 {}
+    counted := fast.now_ticks() - first
+    timer.release_timer1(fast)
+    paced := counted >= 1_499_000 && counted <= 1_501_000
+    micro := timer.timer1(1_000_000)!
+    refused := false
+    match timer.timer1(1_000_000) {
+        ok(_) => {}
+        err(error) => {
+            refused = error == hal.Error.Busy
+        }
+    }
+    alarm := micro.alarm(1)!
+    start := alarm.now_ticks()
+    alarm.schedule_at_ticks(start + 2000)!
+    for !alarm.fired() && alarm.now_ticks() - start < 10_000 {}
+    fired := alarm.now_ticks() - start
+    alarm.start(1000)!
+    begin = timer.now_us()
+    for timer.now_us() - begin < 3500 {}
+    missed := alarm.poll_periods()
+    micro.release_alarm(alarm)
+    timer.release_timer1(micro)
+    return paced && refused && fired >= 2000 && fired < 2010 && missed == 3
+}
+
 fn main() {
     // A previous run hung and the watchdog reset the chip: report it.
     unsafe {
@@ -2192,6 +2361,7 @@ fn main() {
     watchdog_checks(&mut b.watchdog, &mut b.timer)
     rtc_checks(&mut b.rtc, &mut b.watchdog, &mut b.timer)
     flash_checks(&mut b.flash, &mut b.core1, &mut b.timer)
+    timer_channel_checks(&mut b.pins, &mut b.timer)
 
     // Configuration is validated before ownership: an unusable crystal is
     // InvalidInput, a valid one is Busy because the board already took it.
