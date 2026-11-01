@@ -27,6 +27,8 @@ package hal
 // ordered after everything submitted before it, so hazards between
 // submissions never need a barrier call.
 
+import "core/mem"
+import "core/ptr"
 import "std/window/handle"
 
 pub enum Error {
@@ -90,6 +92,11 @@ pub const OBJECT_ENCODER: u32 = 6
 pub const MAX_SLOTS: u32 = 16
 pub const MAX_VERTEX_BUFFERS: u32 = 8
 pub const MAX_VERTEX_ATTRIBUTES: u32 = 16
+// Color attachments per render pass and pipeline, at most; a device may
+// allow fewer (Limits.max_color_attachments, at least 4).
+pub const MAX_COLOR_ATTACHMENTS: u32 = 8
+// Samples per texel of a multisampled texture: every backend offers 4.
+pub const MULTISAMPLE_COUNT: u32 = 4
 // Metal shares buffer indices between bindings and vertex buffers:
 // vertex buffer N is [[buffer(METAL_VERTEX_BUFFER_BASE + N)]].
 pub const METAL_VERTEX_BUFFER_BASE: u32 = 16
@@ -176,6 +183,72 @@ pub fn is_blendable(format: u32) -> bool {
     return !is_integer(format) && !is_depth(format) && format != FORMAT_R32_FLOAT && format != FORMAT_RG32_FLOAT && format != FORMAT_RGBA32_FLOAT
 }
 
+// Whether every backend filters the format linearly, which generating
+// mipmaps and multisample resolves need: the blendable formats.
+pub fn is_filterable(format: u32) -> bool {
+    return is_blendable(format)
+}
+
+// The size of mipmap `level` of a texture `size` texels wide (or high).
+pub fn level_size(size: u32, level: u32) -> u32 {
+    if level >= 32 {
+        return 1
+    }
+    scaled := size >> level
+    if scaled == 0 {
+        return 1
+    }
+    return scaled
+}
+
+// How many mipmap levels a `width` by `height` texture has at most: down
+// to one texel.
+pub fn mip_level_count(width: u32, height: u32) -> u32 {
+    largest := width
+    if height > largest {
+        largest = height
+    }
+    count := 1u32
+    for largest > 1 {
+        largest = largest >> 1
+        count += 1
+    }
+    return count
+}
+
+// Bit patterns of numbers, for packing them into handles.
+pub fn f32_bits(value: f32) -> u32 {
+    bits := 0u32
+    unsafe {
+        *(ptr.from_mut(&mut bits) as *mut f32) = value
+    }
+    return bits
+}
+
+pub fn f32_from_bits(bits: u32) -> f32 {
+    value := 0.0f32
+    unsafe {
+        *(ptr.from_mut(&mut value) as *mut u32) = bits
+    }
+    return value
+}
+
+pub fn i32_bits(value: i32) -> u32 {
+    bits := 0u32
+    unsafe {
+        *(ptr.from_mut(&mut bits) as *mut i32) = value
+    }
+    return bits
+}
+
+pub fn i32_from_bits(bits: u32) -> i32 {
+    value := 0i32
+    unsafe {
+        *(ptr.from_mut(&mut value) as *mut u32) = bits
+    }
+    return value
+}
+
 // Binding kinds in a pipeline's layout.
 pub const BINDING_NONE: u32 = 0
 pub const BINDING_UNIFORM_BUFFER: u32 = 1
@@ -185,6 +258,9 @@ pub const BINDING_READ_ONLY_STORAGE_BUFFER: u32 = 3
 pub const BINDING_SAMPLED_TEXTURE: u32 = 4
 // A texture read and written texel by texel, of the layout's format.
 pub const BINDING_STORAGE_TEXTURE: u32 = 5
+// A depth texture sampled through a comparison sampler bound with it
+// (texture_depth_2d with sampler_comparison in WGSL).
+pub const BINDING_COMPARISON_TEXTURE: u32 = 6
 
 // Shader stages, combined with `|`.
 pub const STAGE_VERTEX: u32 = 1
@@ -247,12 +323,118 @@ pub const FRONT_CW: u32 = 1
 pub const INDEX_UINT16: u32 = 1
 pub const INDEX_UINT32: u32 = 2
 
-// Color blending: none, straight alpha, premultiplied alpha, additive.
+// Color blending presets: none, straight alpha, premultiplied alpha,
+// additive. Blend.preset() spells each out.
 pub const BLEND_REPLACE: u32 = 0
 pub const BLEND_ALPHA: u32 = 1
 pub const BLEND_PREMULTIPLIED: u32 = 2
 pub const BLEND_ADDITIVE: u32 = 3
 
+// Blend factors: what the shader's output (source) and the attachment's
+// current value (destination) are multiplied by. CONSTANT is the pass's
+// blend constant (RenderPass.set_blend_constant).
+pub const BLEND_FACTOR_ZERO: u32 = 0
+pub const BLEND_FACTOR_ONE: u32 = 1
+pub const BLEND_FACTOR_SRC: u32 = 2
+pub const BLEND_FACTOR_ONE_MINUS_SRC: u32 = 3
+pub const BLEND_FACTOR_SRC_ALPHA: u32 = 4
+pub const BLEND_FACTOR_ONE_MINUS_SRC_ALPHA: u32 = 5
+pub const BLEND_FACTOR_DST: u32 = 6
+pub const BLEND_FACTOR_ONE_MINUS_DST: u32 = 7
+pub const BLEND_FACTOR_DST_ALPHA: u32 = 8
+pub const BLEND_FACTOR_ONE_MINUS_DST_ALPHA: u32 = 9
+pub const BLEND_FACTOR_SRC_ALPHA_SATURATED: u32 = 10
+pub const BLEND_FACTOR_CONSTANT: u32 = 11
+pub const BLEND_FACTOR_ONE_MINUS_CONSTANT: u32 = 12
+
+// How the two products combine. MIN and MAX ignore the factors.
+pub const BLEND_OP_ADD: u32 = 0
+pub const BLEND_OP_SUBTRACT: u32 = 1
+pub const BLEND_OP_REVERSE_SUBTRACT: u32 = 2
+pub const BLEND_OP_MIN: u32 = 3
+pub const BLEND_OP_MAX: u32 = 4
+
+// Which channels of a color attachment a pipeline writes, combined with
+// `|`.
+pub const COLOR_WRITE_RED: u32 = 1
+pub const COLOR_WRITE_GREEN: u32 = 2
+pub const COLOR_WRITE_BLUE: u32 = 4
+pub const COLOR_WRITE_ALPHA: u32 = 8
+pub const COLOR_WRITE_ALL: u32 = 15
+
+// How a color target blends: result = source * source factor (op)
+// destination * destination factor, for the color channels and for alpha.
+pub struct Blend {
+    pub color_source: u32
+    pub color_destination: u32
+    pub color_operation: u32
+    pub alpha_source: u32
+    pub alpha_destination: u32
+    pub alpha_operation: u32
+
+    // No blending: the shader's output replaces the attachment's value.
+    pub fn replace() -> Blend {
+        return Blend.new(BLEND_FACTOR_ONE, BLEND_FACTOR_ZERO, BLEND_OP_ADD)
+    }
+    // The same factors and operation for color and alpha.
+    pub fn new(source: u32, destination: u32, operation: u32) -> Blend {
+        return Blend { color_source: source, color_destination: destination, color_operation: operation, alpha_source: source, alpha_destination: destination, alpha_operation: operation }
+    }
+    pub fn separate(color_source: u32, color_destination: u32, color_operation: u32, alpha_source: u32, alpha_destination: u32, alpha_operation: u32) -> Blend {
+        return Blend { color_source: color_source, color_destination: color_destination, color_operation: color_operation, alpha_source: alpha_source, alpha_destination: alpha_destination, alpha_operation: alpha_operation }
+    }
+    // One of the BLEND_* presets.
+    pub fn preset(preset: u32) -> Blend {
+        if preset == BLEND_ALPHA {
+            return Blend.separate(BLEND_FACTOR_SRC_ALPHA, BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, BLEND_OP_ADD, BLEND_FACTOR_ONE, BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, BLEND_OP_ADD)
+        }
+        if preset == BLEND_PREMULTIPLIED {
+            return Blend.new(BLEND_FACTOR_ONE, BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, BLEND_OP_ADD)
+        }
+        if preset == BLEND_ADDITIVE {
+            return Blend.new(BLEND_FACTOR_ONE, BLEND_FACTOR_ONE, BLEND_OP_ADD)
+        }
+        return Blend.replace()
+    }
+    // Whether this blends at all, rather than replacing.
+    pub fn enabled(&self) -> bool {
+        return !(self.color_source == BLEND_FACTOR_ONE && self.color_destination == BLEND_FACTOR_ZERO && self.color_operation == BLEND_OP_ADD && self.alpha_source == BLEND_FACTOR_ONE && self.alpha_destination == BLEND_FACTOR_ZERO && self.alpha_operation == BLEND_OP_ADD)
+    }
+    // Whether a factor reads the blend constant.
+    pub fn uses_constant(&self) -> bool {
+        return is_constant_factor(self.color_source) || is_constant_factor(self.color_destination) || is_constant_factor(self.alpha_source) || is_constant_factor(self.alpha_destination)
+    }
+    pub fn copy(&self) -> Blend {
+        return Blend { color_source: self.color_source, color_destination: self.color_destination, color_operation: self.color_operation, alpha_source: self.alpha_source, alpha_destination: self.alpha_destination, alpha_operation: self.alpha_operation }
+    }
+    pub fn same(&self, other: &Blend) -> bool {
+        return self.color_source == other.color_source && self.color_destination == other.color_destination && self.color_operation == other.color_operation && self.alpha_source == other.alpha_source && self.alpha_destination == other.alpha_destination && self.alpha_operation == other.alpha_operation
+    }
+}
+
+fn is_constant_factor(factor: u32) -> bool {
+    return factor == BLEND_FACTOR_CONSTANT || factor == BLEND_FACTOR_ONE_MINUS_CONSTANT
+}
+
+// One color attachment a render pipeline draws into: its format, how the
+// shader's output at the same @location blends into it, and which
+// channels are written.
+pub struct ColorTarget {
+    pub format: u32
+    pub blend: Blend
+    pub write_mask: u32
+
+    // Replacing every channel.
+    pub fn new(format: u32) -> ColorTarget {
+        return ColorTarget { format: format, blend: Blend.replace(), write_mask: COLOR_WRITE_ALL }
+    }
+    pub fn blended(format: u32, blend: Blend) -> ColorTarget {
+        return ColorTarget { format: format, blend: blend, write_mask: COLOR_WRITE_ALL }
+    }
+}
+
+// COMPARE_NONE: a sampler that does not compare.
+pub const COMPARE_NONE: u32 = 0
 pub const COMPARE_NEVER: u32 = 1
 pub const COMPARE_LESS: u32 = 2
 pub const COMPARE_EQUAL: u32 = 3
@@ -268,6 +450,13 @@ pub const FILTER_LINEAR: u32 = 1
 pub const ADDRESS_CLAMP: u32 = 0
 pub const ADDRESS_REPEAT: u32 = 1
 pub const ADDRESS_MIRROR: u32 = 2
+// Outside 0.0 to 1.0 read the sampler's border color.
+pub const ADDRESS_BORDER: u32 = 3
+
+// Border colors, for ADDRESS_BORDER.
+pub const BORDER_TRANSPARENT_BLACK: u32 = 0
+pub const BORDER_OPAQUE_BLACK: u32 = 1
+pub const BORDER_OPAQUE_WHITE: u32 = 2
 
 // What a render pass does with an attachment's previous contents.
 pub const LOAD_CLEAR: u32 = 0
@@ -304,6 +493,8 @@ pub struct Limits {
     pub max_workgroup_size_y: u32
     pub max_workgroup_size_z: u32
     pub max_workgroup_invocations: u32
+    // Color attachments of a render pass, from 4 to MAX_COLOR_ATTACHMENTS.
+    pub max_color_attachments: u32
 
     pub fn copy(&self) -> Limits {
         return Limits {
@@ -315,55 +506,108 @@ pub struct Limits {
             max_workgroup_size_x: self.max_workgroup_size_x,
             max_workgroup_size_y: self.max_workgroup_size_y,
             max_workgroup_size_z: self.max_workgroup_size_z,
-            max_workgroup_invocations: self.max_workgroup_invocations
+            max_workgroup_invocations: self.max_workgroup_invocations,
+            max_color_attachments: self.max_color_attachments
         }
     }
 }
 
-// A two-dimensional texture: one mipmap level, one layer, one sample.
+// A two-dimensional texture with `mip_levels` mipmap levels, each half
+// the size of the one before, and `samples` samples per texel (1, or
+// MULTISAMPLE_COUNT for a multisampled render target).
 pub struct TextureDescriptor {
     pub width: u32
     pub height: u32
     pub format: u32
     pub usage: u32
+    pub mip_levels: u32
+    pub samples: u32
 
+    // One mipmap level, one sample.
     pub fn new(width: u32, height: u32, format: u32, usage: u32) -> TextureDescriptor {
-        return TextureDescriptor { width: width, height: height, format: format, usage: usage }
+        return TextureDescriptor { width: width, height: height, format: format, usage: usage, mip_levels: 1, samples: 1 }
+    }
+    // Every mipmap level down to one texel.
+    pub fn mipmapped(width: u32, height: u32, format: u32, usage: u32) -> TextureDescriptor {
+        return TextureDescriptor { width: width, height: height, format: format, usage: usage, mip_levels: mip_level_count(width, height), samples: 1 }
+    }
+    // A multisampled render target, resolved into an ordinary texture by
+    // render passes (ColorAttachment.with_resolve).
+    pub fn multisampled(width: u32, height: u32, format: u32) -> TextureDescriptor {
+        return TextureDescriptor { width: width, height: height, format: format, usage: TEXTURE_RENDER, mip_levels: 1, samples: MULTISAMPLE_COUNT }
     }
     pub fn copy(&self) -> TextureDescriptor {
-        return TextureDescriptor { width: self.width, height: self.height, format: self.format, usage: self.usage }
+        return TextureDescriptor { width: self.width, height: self.height, format: self.format, usage: self.usage, mip_levels: self.mip_levels, samples: self.samples }
     }
 }
 
-// How a sampler filters and what it does outside 0.0 to 1.0.
+// How a sampler filters, picks mipmap levels and compares, and what it
+// does outside 0.0 to 1.0.
 pub struct SamplerDescriptor {
     pub mag_filter: u32
     pub min_filter: u32
+    // How levels blend: FILTER_NEAREST takes the nearest level,
+    // FILTER_LINEAR blends the two nearest (trilinear filtering).
+    pub mipmap_filter: u32
     pub address_u: u32
     pub address_v: u32
+    // The color ADDRESS_BORDER reads: BORDER_*.
+    pub border: u32
+    // The range of mipmap levels sampled, as level numbers.
+    pub lod_min: f32
+    pub lod_max: f32
+    // COMPARE_NONE, or the comparison a comparison sampler makes between a
+    // reference and each depth texel (passing gives 1.0, failing 0.0).
+    pub compare: u32
+    // Anisotropic filtering of up to this many samples (1 to 16), where the
+    // GPU offers it; above 1 needs every filter linear.
+    pub max_anisotropy: u32
 
-    // Linear filtering, clamped to the edge.
+    // Linear filtering, clamped to the edge, the nearest mipmap level.
     pub fn linear() -> SamplerDescriptor {
-        return SamplerDescriptor { mag_filter: FILTER_LINEAR, min_filter: FILTER_LINEAR, address_u: ADDRESS_CLAMP, address_v: ADDRESS_CLAMP }
+        return SamplerDescriptor.new(FILTER_LINEAR, FILTER_NEAREST, ADDRESS_CLAMP)
     }
     // Nearest-texel filtering, clamped to the edge.
     pub fn nearest() -> SamplerDescriptor {
-        return SamplerDescriptor { mag_filter: FILTER_NEAREST, min_filter: FILTER_NEAREST, address_u: ADDRESS_CLAMP, address_v: ADDRESS_CLAMP }
+        return SamplerDescriptor.new(FILTER_NEAREST, FILTER_NEAREST, ADDRESS_CLAMP)
+    }
+    // Linear filtering between texels and mipmap levels, repeating.
+    pub fn trilinear() -> SamplerDescriptor {
+        return SamplerDescriptor.new(FILTER_LINEAR, FILTER_LINEAR, ADDRESS_REPEAT)
+    }
+    // A comparison sampler for shadow maps: linear filtering of the
+    // comparison results (percentage-closer filtering), and outside the
+    // texture the comparison passes against an opaque white border.
+    pub fn comparison(compare: u32) -> SamplerDescriptor {
+        descriptor := SamplerDescriptor.new(FILTER_LINEAR, FILTER_NEAREST, ADDRESS_BORDER)
+        descriptor.border = BORDER_OPAQUE_WHITE
+        descriptor.compare = compare
+        return descriptor
+    }
+    // `filter` between texels, `mipmap_filter` between levels, `address`
+    // in both directions.
+    pub fn new(filter: u32, mipmap_filter: u32, address: u32) -> SamplerDescriptor {
+        return SamplerDescriptor { mag_filter: filter, min_filter: filter, mipmap_filter: mipmap_filter, address_u: address, address_v: address, border: BORDER_TRANSPARENT_BLACK, lod_min: 0.0, lod_max: 32.0, compare: COMPARE_NONE, max_anisotropy: 1 }
     }
 }
 
-// A rectangle of texels.
+// A rectangle of texels of mipmap level `level`.
 pub struct Region {
     pub x: u32
     pub y: u32
     pub width: u32
     pub height: u32
+    pub level: u32
 
+    // A rectangle of the first level.
     pub fn new(x: u32, y: u32, width: u32, height: u32) -> Region {
-        return Region { x: x, y: y, width: width, height: height }
+        return Region { x: x, y: y, width: width, height: height, level: 0 }
+    }
+    pub fn at_level(level: u32, x: u32, y: u32, width: u32, height: u32) -> Region {
+        return Region { x: x, y: y, width: width, height: height, level: level }
     }
     pub fn copy(&self) -> Region {
-        return Region { x: self.x, y: self.y, width: self.width, height: self.height }
+        return Region { x: self.x, y: self.y, width: self.width, height: self.height, level: self.level }
     }
 }
 
@@ -398,6 +642,7 @@ pub struct ShaderSource {
 const NO_WORDS: [0]u32 = []
 const NO_BINDINGS: [0]BindingLayout = []
 const NO_VERTEX_BUFFERS: [0]VertexBufferLayout = []
+const NO_TARGETS: [0]ColorTarget = []
 
 // One entry of a pipeline's binding layout: what the shader expects in
 // `slot`, and which stages use it.
@@ -419,6 +664,9 @@ pub struct BindingLayout {
     }
     pub fn sampled_texture(slot: u32, stages: u32) -> BindingLayout {
         return BindingLayout { slot: slot, kind: BINDING_SAMPLED_TEXTURE, stages: stages, format: FORMAT_NONE }
+    }
+    pub fn comparison_texture(slot: u32, stages: u32) -> BindingLayout {
+        return BindingLayout { slot: slot, kind: BINDING_COMPARISON_TEXTURE, stages: stages, format: FORMAT_NONE }
     }
     pub fn storage_texture(slot: u32, stages: u32, format: u32) -> BindingLayout {
         return BindingLayout { slot: slot, kind: BINDING_STORAGE_TEXTURE, stages: stages, format: format }
@@ -468,8 +716,15 @@ pub struct ComputePipelineDescriptor {
     }
 }
 
-// A render pipeline drawing into one color attachment of `color_format`
-// and, unless `depth_format` is FORMAT_NONE, a depth attachment.
+// A render pipeline drawing into color attachments and, unless
+// `depth_format` is FORMAT_NONE, a depth attachment.
+//
+// The color attachments are either the one of `color_format`, blended by
+// the `blend` preset, or, for several attachments or custom blending,
+// `targets` (with `color_format` FORMAT_NONE): target N takes the
+// fragment shader's output at @location(N). An empty `fragment_entry`
+// leaves out the fragment stage, for a pipeline that only writes depth,
+// such as one drawing a shadow map; it then has no color attachments.
 pub struct RenderPipelineDescriptor {
     pub vertex: &ShaderSource
     pub vertex_entry: &str
@@ -482,12 +737,26 @@ pub struct RenderPipelineDescriptor {
     pub front_face: u32
     pub color_format: u32
     pub blend: u32
+    pub targets: &[ColorTarget]
     pub depth_format: u32
     pub depth_compare: u32
     pub depth_write: bool
+    // Added to each fragment's depth before the depth test: `depth_bias`
+    // units of the smallest depth step, plus `depth_bias_slope_scale` times
+    // the triangle's depth slope, limited to `depth_bias_clamp` in size
+    // unless that is 0. Triangles only; it keeps shadow maps from shadowing
+    // the surfaces they were drawn from.
+    pub depth_bias: i32
+    pub depth_bias_slope_scale: f32
+    pub depth_bias_clamp: f32
+    // Samples per pixel of every attachment: 1 or MULTISAMPLE_COUNT.
+    pub samples: u32
+    // Multisampled pipelines only: cover each pixel's samples in proportion
+    // to the alpha the shader writes to @location(0).
+    pub alpha_to_coverage: bool
 
-    // Triangle lists without culling, blending or depth, and with no
-    // bindings or vertex buffers until you set them.
+    // Triangle lists without culling, blending, depth or multisampling,
+    // and with no bindings or vertex buffers until you set them.
     pub fn new(vertex: &ShaderSource, vertex_entry: &str, fragment: &ShaderSource, fragment_entry: &str, color_format: u32) -> RenderPipelineDescriptor from(vertex, vertex_entry, fragment, fragment_entry) {
         return RenderPipelineDescriptor {
             vertex: vertex,
@@ -501,10 +770,29 @@ pub struct RenderPipelineDescriptor {
             front_face: FRONT_CCW,
             color_format: color_format,
             blend: BLEND_REPLACE,
+            targets: &NO_TARGETS,
             depth_format: FORMAT_NONE,
             depth_compare: COMPARE_LESS,
-            depth_write: true
+            depth_write: true,
+            depth_bias: 0,
+            depth_bias_slope_scale: 0.0,
+            depth_bias_clamp: 0.0,
+            samples: 1,
+            alpha_to_coverage: false
         }
+    }
+
+    // A pipeline without a fragment stage that only writes depth to an
+    // attachment of `depth_format`.
+    pub fn depth_only(vertex: &ShaderSource, vertex_entry: &str, depth_format: u32) -> RenderPipelineDescriptor from(vertex, vertex_entry) {
+        descriptor := RenderPipelineDescriptor.new(vertex, vertex_entry, vertex, "", FORMAT_NONE)
+        descriptor.depth_format = depth_format
+        return descriptor
+    }
+
+    // Whether the pipeline has a fragment stage.
+    pub fn has_fragment(&self) -> bool {
+        return mem.str_bytes(self.fragment_entry).len != 0
     }
 }
 
@@ -518,10 +806,13 @@ pub struct Pipeline {
     pub stages: [16]u32
     // The format each storage texture slot expects.
     pub formats: [16]u32
-    // Render pipelines only.
+    // Render pipelines only: the color attachments' formats, the depth
+    // attachment's and the samples of each.
     pub topology: u32
-    pub color_format: u32
+    pub color_count: u32
+    pub color_formats: [8]u32
     pub depth_format: u32
+    pub samples: u32
     pub vertex_buffer_count: u32
     pub strides: [8]u32
     pub steps: [8]u32
@@ -539,8 +830,10 @@ pub struct Pipeline {
             stages: [0u32; 16],
             formats: [0u32; 16],
             topology: 0,
-            color_format: 0,
+            color_count: 0,
+            color_formats: [0u32; 8],
             depth_format: 0,
+            samples: 1,
             vertex_buffer_count: 0,
             strides: [0u32; 8],
             steps: [0u32; 8],
@@ -557,8 +850,10 @@ pub struct Pipeline {
             stages: copy16(&self.stages),
             formats: copy16(&self.formats),
             topology: self.topology,
-            color_format: self.color_format,
+            color_count: self.color_count,
+            color_formats: copy8(&self.color_formats),
             depth_format: self.depth_format,
+            samples: self.samples,
             vertex_buffer_count: self.vertex_buffer_count,
             strides: copy8(&self.strides),
             steps: copy8(&self.steps),
@@ -602,10 +897,11 @@ pub struct PassState {
     pub pipeline_dirty: bool
 
     pub bound: [16]u32
-    // The buffer or texture handle's first two words, and the sampler's.
+    // The words of the buffer or texture handle, and the sampler's first.
     pub object_a: [16]u64
     pub object_b: [16]u64
     pub object_c: [16]u64
+    pub object_d: [16]u64
     pub sampler: [16]u64
     pub offset: [16]u64
     pub size: [16]u64
@@ -632,6 +928,7 @@ pub struct PassState {
             object_a: [0u64; 16],
             object_b: [0u64; 16],
             object_c: [0u64; 16],
+            object_d: [0u64; 16],
             sampler: [0u64; 16],
             offset: [0u64; 16],
             size: [0u64; 16],
@@ -649,21 +946,64 @@ pub struct PassState {
     }
 }
 
-// The attachments of a render pass.
-pub struct RenderPassInfo {
-    pub color: Handle
-    pub color_format: u32
-    pub width: u32
-    pub height: u32
+// One attachment of a render pass: what happens to its contents before
+// (`load`) and after (`store`; false leaves them undefined) the pass, and
+// for a multisampled color attachment with `has_resolve`, the texture its
+// samples are averaged into at the end.
+pub struct Attachment {
+    pub texture: Handle
+    pub format: u32
     pub load: u32
+    pub store: bool
     pub clear_red: f64
     pub clear_green: f64
     pub clear_blue: f64
     pub clear_alpha: f64
-    pub has_depth: bool
-    pub depth: Handle
-    pub depth_load: u32
     pub clear_depth: f32
+    pub has_resolve: bool
+    pub resolve: Handle
+
+    pub fn empty() -> Attachment {
+        return Attachment { texture: Handle.null(), format: FORMAT_NONE, load: LOAD_KEEP, store: true, clear_red: 0.0, clear_green: 0.0, clear_blue: 0.0, clear_alpha: 0.0, clear_depth: 0.0, has_resolve: false, resolve: Handle.null() }
+    }
+    pub fn copy(&self) -> Attachment {
+        return Attachment { texture: self.texture.copy(), format: self.format, load: self.load, store: self.store, clear_red: self.clear_red, clear_green: self.clear_green, clear_blue: self.clear_blue, clear_alpha: self.clear_alpha, clear_depth: self.clear_depth, has_resolve: self.has_resolve, resolve: self.resolve.copy() }
+    }
+}
+
+// The attachments of a render pass: `color_count` color attachments (none
+// for a depth-only pass), and a depth attachment when `has_depth`, all
+// `width` by `height` with `samples` samples per pixel.
+pub struct RenderPassInfo {
+    pub colors: [8]Attachment
+    pub color_count: u32
+    pub has_depth: bool
+    pub depth: Attachment
+    pub width: u32
+    pub height: u32
+    pub samples: u32
+
+    pub fn new(width: u32, height: u32, samples: u32) -> RenderPassInfo {
+        return RenderPassInfo {
+            colors: [Attachment.empty(), Attachment.empty(), Attachment.empty(), Attachment.empty(), Attachment.empty(), Attachment.empty(), Attachment.empty(), Attachment.empty()],
+            color_count: 0,
+            has_depth: false,
+            depth: Attachment.empty(),
+            width: width,
+            height: height,
+            samples: samples
+        }
+    }
+    pub fn copy(&self) -> RenderPassInfo {
+        info := RenderPassInfo.new(self.width, self.height, self.samples)
+        for i in 0usize..8 {
+            info.colors[i] = self.colors[i].copy()
+        }
+        info.color_count = self.color_count
+        info.has_depth = self.has_depth
+        info.depth = self.depth.copy()
+        return info
+    }
 }
 
 // How a surface presents: the size of its images in pixels, whether
@@ -720,6 +1060,8 @@ pub interface Backend {
     fn read_texture(&self, texture: &Handle, descriptor: &TextureDescriptor, region: &Region, out: &mut[u8], bytes_per_row: u32) -> void!Error
     fn create_sampler(&self, descriptor: &SamplerDescriptor) -> Handle!Error
     fn create_compute_pipeline(&self, descriptor: &ComputePipelineDescriptor) -> Handle!Error
+    // std/gpu hands render pipelines over with every color attachment in
+    // `targets`; their `color_format` and `blend` are then unused.
     fn create_render_pipeline(&self, descriptor: &RenderPipelineDescriptor) -> Handle!Error
     // Destroy an OBJECT_* that the GPU no longer uses.
     fn destroy(&self, object: u32, handle: &Handle)
@@ -741,12 +1083,18 @@ pub interface Backend {
     // Viewports and scissors are in pixels from the top-left corner.
     fn set_viewport(&self, encoder: &mut Handle, x: f32, y: f32, width: f32, height: f32, min_depth: f32, max_depth: f32)
     fn set_scissor(&self, encoder: &mut Handle, x: u32, y: u32, width: u32, height: u32)
+    // The color BLEND_FACTOR_CONSTANT reads; render passes start with 0.
+    fn set_blend_constant(&self, encoder: &mut Handle, red: f64, green: f64, blue: f64, alpha: f64)
     fn dispatch(&self, encoder: &mut Handle, state: &mut PassState, x: u32, y: u32, z: u32)
     fn draw(&self, encoder: &mut Handle, state: &mut PassState, vertex_count: u32, instance_count: u32, first_vertex: u32, first_instance: u32)
     fn draw_indexed(&self, encoder: &mut Handle, state: &mut PassState, index_count: u32, instance_count: u32, first_index: u32, base_vertex: i32, first_instance: u32)
     fn copy_buffer(&self, encoder: &mut Handle, source: &Handle, source_offset: u64, destination: &Handle, destination_offset: u64, size: u64)
     fn copy_buffer_to_texture(&self, encoder: &mut Handle, source: &Handle, offset: u64, bytes_per_row: u32, destination: &Handle, descriptor: &TextureDescriptor, region: &Region)
     fn copy_texture_to_buffer(&self, encoder: &mut Handle, source: &Handle, descriptor: &TextureDescriptor, region: &Region, destination: &Handle, offset: u64, bytes_per_row: u32)
+    // Fill every mipmap level after the first from the one before it,
+    // filtering linearly. The format is filterable and has more than one
+    // level.
+    fn generate_mipmaps(&self, encoder: &mut Handle, texture: &Handle, descriptor: &TextureDescriptor)
     // Fill `size` bytes of a buffer from `offset` with zeros; both are
     // multiples of 4.
     fn clear_buffer(&self, encoder: &mut Handle, buffer: &Handle, offset: u64, size: u64)

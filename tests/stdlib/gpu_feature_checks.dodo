@@ -1,0 +1,611 @@
+package main
+
+import "std/console"
+import "std/gpu"
+
+// std/gpu's rendering features beyond a single blended color target, on
+// every backend this machine has: mipmaps, depth-only passes read through
+// comparison samplers, depth bias, multisampling with resolves and
+// alpha-to-coverage, several color targets with write masks, and custom
+// blending. Shaders are WGSL. Each check prints its name; a failed
+// expectation panics with the reason. Exits 0 when at least one backend
+// ran every check, 2 when none could be opened.
+
+fn main() -> i32 {
+    ran := 0
+    if run(gpu.Preference.Vulkan, "Vulkan") {
+        ran += 1
+    }
+    if run(gpu.Preference.Metal, "Metal") {
+        ran += 1
+    }
+    if run(gpu.Preference.OpenGl, "OpenGL") {
+        ran += 1
+    }
+    if ran == 0 {
+        console.println("no backend")!
+        return 2
+    }
+    console.println("features ok")!
+    return 0
+}
+
+fn run(preference: gpu.Preference, label: &str) -> bool {
+    device := match gpu.Device.open(gpu.Options.with_backend(preference)) {
+        ok(device) => device,
+        err(error) => {
+            console.printf("skip {}: {}\n", label, gpu.error_name(error))!
+            return false
+        }
+    }
+    console.printf("{}: {}\n", label, device.name())!
+    match checks(&device) {
+        ok() => {}
+        err(error) => {
+            console.printf("{} failed: {}\n", label, gpu.error_name(error))!
+            assert(false, "a check returned an error")
+        }
+    }
+    console.printf("{} ok\n", label)!
+    return true
+}
+
+fn checks(device: &gpu.Device) -> void!gpu.Error {
+    limits := device.limits()
+    assert(limits.max_color_attachments >= 4, "at least 4 color attachments")
+    check_validation(device)?
+    console.println("  validation")!
+    check_mip_levels(device)?
+    console.println("  mip levels")!
+    check_generated_mipmaps(device)?
+    console.println("  generated mipmaps")!
+    check_shadow(device)?
+    console.println("  shadow map")!
+    check_depth_bias(device)?
+    console.println("  depth bias")!
+    check_multisampling(device)?
+    console.println("  multisampling")!
+    check_alpha_to_coverage(device)?
+    console.println("  alpha to coverage")!
+    check_targets(device)?
+    console.println("  color targets")!
+    check_blending(device)?
+    console.println("  custom blending")!
+    return ok()
+}
+
+fn shaders() -> gpu.ShaderSource from(static) {
+    return gpu.wgsl(
+        "struct ScreenOut {",
+        "    @builtin(position) position: vec4<f32>,",
+        "    @location(0) uv: vec2<f32>,",
+        "}",
+        "",
+        "@vertex",
+        "fn screen_vertex(@builtin(vertex_index) id: u32) -> ScreenOut {",
+        "    let corner = vec2<f32>(f32((id << 1u) & 2u), f32(id & 2u));",
+        "    var out: ScreenOut;",
+        "    out.position = vec4<f32>(corner * 2.0 - 1.0, 0.0, 1.0);",
+        "    out.uv = vec2<f32>(corner.x, 1.0 - corner.y);",
+        "    return out;",
+        "}",
+        "",
+        "@vertex",
+        "fn position_vertex(@location(0) position: vec3<f32>) -> @builtin(position) vec4<f32> {",
+        "    return vec4<f32>(position, 1.0);",
+        "}",
+        "",
+        "@group(0) @binding(0) var levels: texture_2d<f32>;",
+        "@group(1) @binding(0) var level_sampler: sampler;",
+        "@group(0) @binding(1) var<uniform> lod: vec4<f32>;",
+        "",
+        "@fragment",
+        "fn level_fragment(in: ScreenOut) -> @location(0) vec4<f32> {",
+        "    return textureSampleLevel(levels, level_sampler, in.uv, lod.x);",
+        "}",
+        "",
+        "@group(0) @binding(2) var shadow: texture_depth_2d;",
+        "@group(1) @binding(2) var shadow_sampler: sampler_comparison;",
+        "",
+        "@fragment",
+        "fn shadow_fragment(in: ScreenOut) -> @location(0) vec4<f32> {",
+        "    let lit = textureSampleCompare(shadow, shadow_sampler, in.uv, 0.5);",
+        "    return vec4<f32>(lit, lit, lit, 1.0);",
+        "}",
+        "",
+        "@group(0) @binding(3) var<uniform> paint: vec4<f32>;",
+        "",
+        "@fragment",
+        "fn paint_fragment() -> @location(0) vec4<f32> {",
+        "    return paint;",
+        "}",
+        "",
+        "struct Targets {",
+        "    @location(0) color: vec4<f32>,",
+        "    @location(1) id: u32,",
+        "}",
+        "",
+        "@fragment",
+        "fn targets_fragment(in: ScreenOut) -> Targets {",
+        "    var out: Targets;",
+        "    out.color = vec4<f32>(0.25, 1.0, 0.5, 1.0);",
+        "    out.id = u32(in.position.x) + 1000u * u32(in.position.y);",
+        "    return out;",
+        "}"
+    )
+}
+
+fn pixel(pixels: &[u8], width: u32, x: u32, y: u32) -> u32 {
+    i := ((y * width + x) * 4) as usize
+    return pixels[i] as u32 | (pixels[i + 1] as u32 << 8) | (pixels[i + 2] as u32 << 16) | (pixels[i + 3] as u32 << 24)
+}
+
+fn expect_pixel(pixels: &[u8], width: u32, x: u32, y: u32, wanted: u32) {
+    got := pixel(pixels, width, x, y)
+    if got != wanted {
+        console.printf("pixel ({}, {}) is {}, expected {}\n", x, y, got, wanted)!
+        assert(false, "wrong pixel")
+    }
+}
+
+// Each channel of pixel (x, y) within 2 of `wanted`'s.
+fn expect_near(pixels: &[u8], width: u32, x: u32, y: u32, wanted: u32) {
+    got := pixel(pixels, width, x, y)
+    for channel in 0u32..4 {
+        a := (got >> (channel * 8)) & 255
+        b := (wanted >> (channel * 8)) & 255
+        if a + 2 < b || b + 2 < a {
+            console.printf("pixel ({}, {}) is {}, expected about {}\n", x, y, got, wanted)!
+            assert(false, "wrong pixel")
+        }
+    }
+}
+
+fn rgba(red: u32, green: u32, blue: u32, alpha: u32) -> u32 {
+    return red | (green << 8) | (blue << 16) | (alpha << 24)
+}
+
+const RED: u32 = 0xff0000ff
+const GREEN: u32 = 0xff00ff00
+const BLUE: u32 = 0xffff0000
+const WHITE: u32 = 0xffffffff
+const BLACK: u32 = 0xff000000
+
+fn invalid<T>(result: T!gpu.Error) -> bool {
+    match result {
+        ok(_) => {
+            return false
+        }
+        err(gpu.Error.InvalidInput) => {
+            return true
+        }
+        err(_) => {
+            return false
+        }
+    }
+}
+
+fn check_validation(device: &gpu.Device) -> void!gpu.Error {
+    assert(gpu.mip_level_count(8, 8) == 4 && gpu.mip_level_count(1, 1) == 1 && gpu.mip_level_count(640, 480) == 10, "mip level counts")
+    too_deep := gpu.TextureDescriptor.new(8, 8, gpu.FORMAT_RGBA8_UNORM, gpu.TEXTURE_SAMPLED)
+    too_deep.mip_levels = 5
+    assert(invalid(device.create_texture(too_deep)), "more levels than the size allows")
+    sampled := gpu.TextureDescriptor.multisampled(8, 8, gpu.FORMAT_RGBA8_UNORM)
+    sampled.usage = gpu.TEXTURE_RENDER | gpu.TEXTURE_SAMPLED
+    assert(invalid(device.create_texture(sampled)), "a sampled multisampled texture")
+    odd := gpu.TextureDescriptor.multisampled(8, 8, gpu.FORMAT_RGBA8_UNORM)
+    odd.samples = 2
+    assert(invalid(device.create_texture(odd)), "two samples")
+    integer := gpu.TextureDescriptor.multisampled(8, 8, gpu.FORMAT_R32_UINT)
+    assert(invalid(device.create_texture(integer)), "a multisampled integer texture")
+    nearest := gpu.SamplerDescriptor.nearest()
+    nearest.max_anisotropy = 4
+    assert(invalid(device.create_sampler(nearest)), "anisotropy without linear filtering")
+    backwards := gpu.SamplerDescriptor.linear()
+    backwards.lod_min = 2.0
+    backwards.lod_max = 1.0
+    assert(invalid(device.create_sampler(backwards)), "a level range running backwards")
+    trilinear := gpu.SamplerDescriptor.trilinear()
+    trilinear.max_anisotropy = 8
+    sampler := device.create_sampler(trilinear)?
+    assert(!sampler.compares(), "a sampler without comparison")
+    source := shaders()
+    targets := [gpu.ColorTarget.new(gpu.FORMAT_RGBA8_UNORM)]
+    both := gpu.RenderPipelineDescriptor.new(&source, "screen_vertex", &source, "paint_fragment", gpu.FORMAT_RGBA8_UNORM)
+    both.targets = &targets
+    assert(invalid(device.create_render_pipeline(both)), "a color format and targets")
+    colorless := gpu.RenderPipelineDescriptor.new(&source, "screen_vertex", &source, "", gpu.FORMAT_RGBA8_UNORM)
+    assert(invalid(device.create_render_pipeline(colorless)), "color without a fragment stage")
+    nothing := gpu.RenderPipelineDescriptor.new(&source, "screen_vertex", &source, "paint_fragment", gpu.FORMAT_NONE)
+    assert(invalid(device.create_render_pipeline(nothing)), "no attachments at all")
+    blend := gpu.RenderPipelineDescriptor.new(&source, "screen_vertex", &source, "paint_fragment", gpu.FORMAT_NONE)
+    bad_blend := [gpu.ColorTarget.blended(gpu.FORMAT_RGBA8_UNORM, gpu.Blend.new(13, gpu.BLEND_FACTOR_ONE, gpu.BLEND_OP_ADD))]
+    blend.targets = &bad_blend
+    assert(invalid(device.create_render_pipeline(blend)), "an unknown blend factor")
+    coverage := gpu.RenderPipelineDescriptor.new(&source, "screen_vertex", &source, "paint_fragment", gpu.FORMAT_RGBA8_UNORM)
+    coverage.alpha_to_coverage = true
+    assert(invalid(device.create_render_pipeline(coverage)), "alpha to coverage with one sample")
+    lines := gpu.RenderPipelineDescriptor.depth_only(&source, "screen_vertex", gpu.FORMAT_DEPTH32_FLOAT)
+    lines.topology = gpu.TOPOLOGY_LINE_LIST
+    lines.depth_bias = 4
+    assert(invalid(device.create_render_pipeline(lines)), "depth bias on lines")
+    return ok()
+}
+
+// Each level written on its own and sampled at an explicit level of
+// detail, also through a sampler whose level range stops short.
+fn check_mip_levels(device: &gpu.Device) -> void!gpu.Error {
+    levels := device.create_texture(gpu.TextureDescriptor.mipmapped(8, 8, gpu.FORMAT_RGBA8_UNORM, gpu.TEXTURE_SAMPLED | gpu.TEXTURE_COPY_DST | gpu.TEXTURE_COPY_SRC))?
+    region := levels.level_region(2)
+    assert(levels.mip_levels() == 4 && region.width == 2 && region.level == 2 && levels.level_bytes_per_row(1) == 16, "the texture's levels")
+    colors := [RED, GREEN, BLUE, WHITE]
+    texels := [0u32; 64]
+    for level in 0u32..4 {
+        for i in 0usize..64 {
+            texels[i] = colors[level as usize]
+        }
+        device.write_texture(&levels, levels.level_region(level), gpu.u32_bytes(&texels), levels.level_bytes_per_row(level))?
+    }
+    // A copy into one level, and a read of another.
+    staging := device.create_buffer(16, gpu.BUFFER_COPY_SRC | gpu.BUFFER_COPY_DST)?
+    corner := [BLACK]
+    device.write_buffer(&staging, 0, gpu.u32_bytes(&corner))?
+    copies := device.encoder()?
+    copies.copy_buffer_to_texture(&staging, 0, 4, &levels, gpu.Region.at_level(2, 1, 1, 1, 1))
+    copies.copy_texture_to_buffer(&levels, gpu.Region.at_level(1, 3, 0, 1, 1), &staging, 4, 4)
+    copies.submit()?
+    words := [0u32; 4]
+    device.read_buffer(&staging, 0, gpu.u32_bytes_mut(&mut words))?
+    assert(words[1] == GREEN, "a texel copied out of level 1")
+    level_two := [0u32; 4]
+    device.read_texture(&levels, levels.level_region(2), gpu.u32_bytes_mut(&mut level_two), 8)?
+    assert(level_two[0] == BLUE && level_two[3] == BLACK, "level 2 after a copy into it")
+    // Restore level 2 for sampling.
+    for i in 0usize..4 {
+        texels[i] = BLUE
+    }
+    device.write_texture(&levels, levels.level_region(2), gpu.u32_bytes(&texels), 8)?
+
+    lods := [0.0f32; 256]
+    for i in 0usize..4 {
+        lods[i * 64] = i as f32
+    }
+    uniform := device.create_buffer_with_data(gpu.f32_bytes(&lods), gpu.BUFFER_UNIFORM)?
+    nearest := device.create_sampler(gpu.SamplerDescriptor.nearest())?
+    capped_descriptor := gpu.SamplerDescriptor.nearest()
+    capped_descriptor.lod_max = 1.0
+    capped := device.create_sampler(capped_descriptor)?
+    source := shaders()
+    bindings := [gpu.BindingLayout.sampled_texture(0, gpu.STAGE_FRAGMENT), gpu.BindingLayout.uniform_buffer(1, gpu.STAGE_FRAGMENT)]
+    descriptor := gpu.RenderPipelineDescriptor.new(&source, "screen_vertex", &source, "level_fragment", gpu.FORMAT_RGBA8_UNORM)
+    descriptor.bindings = &bindings
+    pipeline := device.create_render_pipeline(descriptor)?
+    target := device.create_texture(gpu.TextureDescriptor.new(16, 24, gpu.FORMAT_RGBA8_UNORM, gpu.TEXTURE_RENDER | gpu.TEXTURE_COPY_SRC))?
+    encoder := device.encoder()?
+    {
+        pass := encoder.render_pass(gpu.ColorAttachment.clear(&target, 0.0, 0.0, 0.0, 1.0))
+        pass.set_pipeline(&pipeline)
+        pass.set_texture(0, &levels, &nearest)
+        for i in 0u32..4 {
+            pass.set_viewport((i % 2 * 8) as f32, (i / 2 * 8) as f32, 8.0, 8.0, 0.0, 1.0)
+            pass.set_buffer_range(1, &uniform, i as u64 * 256, 16)
+            pass.draw(3, 1, 0, 0)
+        }
+        // Level 3 asked for, level 1 the most the sampler allows.
+        pass.set_texture(0, &levels, &capped)
+        pass.set_viewport(0.0, 16.0, 8.0, 8.0, 0.0, 1.0)
+        pass.set_buffer_range(1, &uniform, 768, 16)
+        pass.draw(3, 1, 0, 0)
+    }
+    encoder.submit()?
+    pixels := [0u8; 1536]
+    device.read_texture(&target, target.region(), &mut pixels, 64)?
+    expect_pixel(&pixels, 16, 4, 4, RED)
+    expect_pixel(&pixels, 16, 12, 4, GREEN)
+    expect_pixel(&pixels, 16, 4, 12, BLUE)
+    expect_pixel(&pixels, 16, 12, 12, WHITE)
+    expect_pixel(&pixels, 16, 4, 20, GREEN)
+    return ok()
+}
+
+// Level 0 holds stripes; every smaller level averages them.
+fn check_generated_mipmaps(device: &gpu.Device) -> void!gpu.Error {
+    texture := device.create_texture(gpu.TextureDescriptor.mipmapped(8, 8, gpu.FORMAT_RGBA8_UNORM, gpu.TEXTURE_COPY_DST | gpu.TEXTURE_COPY_SRC))?
+    texels := [0u32; 64]
+    for y in 0u32..8 {
+        for x in 0u32..8 {
+            red := 0u32
+            if x % 2 == 1 {
+                red = 200
+            }
+            blue := 0u32
+            if y % 2 == 1 {
+                blue = 100
+            }
+            texels[(y * 8 + x) as usize] = rgba(red, 50, blue, 255)
+        }
+    }
+    device.write_texture(&texture, texture.region(), gpu.u32_bytes(&texels), 32)?
+    encoder := device.encoder()?
+    encoder.generate_mipmaps(&texture)
+    encoder.submit()?
+    wanted := rgba(100, 50, 50, 255)
+    level_one := [0u8; 64]
+    device.read_texture(&texture, texture.level_region(1), &mut level_one, 16)?
+    for y in 0u32..4 {
+        for x in 0u32..4 {
+            expect_near(&level_one, 4, x, y, wanted)
+        }
+    }
+    last := [0u8; 4]
+    device.read_texture(&texture, texture.level_region(3), &mut last, 4)?
+    expect_near(&last, 1, 0, 0, wanted)
+    // The first level is left alone.
+    first := [0u8; 256]
+    device.read_texture(&texture, texture.region(), &mut first, 32)?
+    expect_pixel(&first, 8, 1, 1, rgba(200, 50, 100, 255))
+    return ok()
+}
+
+fn depth_pipeline(device: &gpu.Device, source: &gpu.ShaderSource, bias: i32) -> gpu.RenderPipeline!gpu.Error from(device) {
+    attributes := [gpu.VertexAttribute.new(0, gpu.VERTEX_FLOAT32X3, 0)]
+    layouts := [gpu.VertexBufferLayout.new(12, &attributes)]
+    descriptor := gpu.RenderPipelineDescriptor.depth_only(source, "position_vertex", gpu.FORMAT_DEPTH32_FLOAT)
+    descriptor.vertex_buffers = &layouts
+    descriptor.depth_bias = bias
+    return device.create_render_pipeline(descriptor)
+}
+
+// A quad over the left half at depth 0.25, as a triangle strip.
+fn left_quad(device: &gpu.Device) -> gpu.Buffer!gpu.Error from(device) {
+    positions := [-1.0f32, 1.0, 0.25, -1.0, -1.0, 0.25, 0.0, 1.0, 0.25, 0.0, -1.0, 0.25]
+    return device.create_buffer_with_data(gpu.f32_bytes(&positions), gpu.BUFFER_VERTEX)
+}
+
+// A shadow map drawn by a depth-only pass, then read through a comparison
+// sampler: where the map is nearer than the reference 0.5, the comparison
+// fails.
+fn check_shadow(device: &gpu.Device) -> void!gpu.Error {
+    source := shaders()
+    depth_only := gpu.RenderPipelineDescriptor.depth_only(&source, "position_vertex", gpu.FORMAT_DEPTH32_FLOAT)
+    attributes := [gpu.VertexAttribute.new(0, gpu.VERTEX_FLOAT32X3, 0)]
+    layouts := [gpu.VertexBufferLayout.new(12, &attributes)]
+    depth_only.vertex_buffers = &layouts
+    depth_only.topology = gpu.TOPOLOGY_TRIANGLE_STRIP
+    writer := device.create_render_pipeline(depth_only)?
+    quad := left_quad(device)?
+    map := device.create_texture(gpu.TextureDescriptor.new(16, 16, gpu.FORMAT_DEPTH32_FLOAT, gpu.TEXTURE_RENDER | gpu.TEXTURE_SAMPLED))?
+    comparison := device.create_sampler(gpu.SamplerDescriptor.comparison(gpu.COMPARE_LESS_EQUAL))?
+    assert(comparison.compares(), "a comparison sampler")
+    bindings := [gpu.BindingLayout.comparison_texture(2, gpu.STAGE_FRAGMENT)]
+    descriptor := gpu.RenderPipelineDescriptor.new(&source, "screen_vertex", &source, "shadow_fragment", gpu.FORMAT_RGBA8_UNORM)
+    descriptor.bindings = &bindings
+    reader := device.create_render_pipeline(descriptor)?
+    target := device.create_texture(gpu.TextureDescriptor.new(16, 16, gpu.FORMAT_RGBA8_UNORM, gpu.TEXTURE_RENDER | gpu.TEXTURE_COPY_SRC))?
+    encoder := device.encoder()?
+    {
+        pass := encoder.depth_pass(gpu.DepthAttachment.clear(&map, 1.0))
+        pass.set_pipeline(&writer)
+        pass.set_vertex_buffer(0, &quad, 0)
+        pass.draw(4, 1, 0, 0)
+    }
+    {
+        pass := encoder.render_pass(gpu.ColorAttachment.clear(&target, 1.0, 0.0, 0.0, 1.0))
+        pass.set_pipeline(&reader)
+        pass.set_texture(2, &map, &comparison)
+        pass.draw(3, 1, 0, 0)
+    }
+    encoder.submit()?
+    pixels := [0u8; 1024]
+    device.read_texture(&target, target.region(), &mut pixels, 64)?
+    expect_pixel(&pixels, 16, 3, 8, BLACK)
+    expect_pixel(&pixels, 16, 12, 8, WHITE)
+    expect_pixel(&pixels, 16, 12, 1, WHITE)
+    return ok()
+}
+
+// The same quad with and without depth bias: the biased depths lie
+// further away, by a little.
+fn check_depth_bias(device: &gpu.Device) -> void!gpu.Error {
+    source := shaders()
+    plain := depth_pipeline(device, &source, 0)?
+    biased := depth_pipeline(device, &source, 10000)?
+    quad := left_quad(device)?
+    usage := gpu.TEXTURE_RENDER | gpu.TEXTURE_COPY_SRC
+    plain_depth := device.create_texture(gpu.TextureDescriptor.new(16, 16, gpu.FORMAT_DEPTH32_FLOAT, usage))?
+    biased_depth := device.create_texture(gpu.TextureDescriptor.new(16, 16, gpu.FORMAT_DEPTH32_FLOAT, usage))?
+    readback := device.create_buffer(2048, gpu.BUFFER_COPY_DST | gpu.BUFFER_COPY_SRC)?
+    encoder := device.encoder()?
+    {
+        pass := encoder.depth_pass(gpu.DepthAttachment.clear(&plain_depth, 1.0))
+        pass.set_pipeline(&plain)
+        pass.set_vertex_buffer(0, &quad, 0)
+        pass.draw(3, 1, 0, 0)
+    }
+    {
+        pass := encoder.depth_pass(gpu.DepthAttachment.clear(&biased_depth, 1.0))
+        pass.set_pipeline(&biased)
+        pass.set_vertex_buffer(0, &quad, 0)
+        pass.draw(3, 1, 0, 0)
+    }
+    encoder.copy_texture_to_buffer(&plain_depth, plain_depth.region(), &readback, 0, 64)
+    encoder.copy_texture_to_buffer(&biased_depth, biased_depth.region(), &readback, 1024, 64)
+    encoder.submit()?
+    depths := [0.0f32; 512]
+    device.read_buffer(&readback, 0, gpu.f32_bytes_mut(&mut depths))?
+    unbiased := depths[2 * 16 + 2]
+    pushed := depths[256 + 2 * 16 + 2]
+    if !(unbiased > 0.2499 && unbiased < 0.2501 && pushed > unbiased + 0.00001 && pushed < 0.27) {
+        console.printf("depth {} biased to {}\n", unbiased as f64, pushed as f64)!
+        assert(false, "depth bias")
+    }
+    return ok()
+}
+
+fn color_attributes() -> [1]gpu.VertexAttribute {
+    return [gpu.VertexAttribute.new(0, gpu.VERTEX_FLOAT32X3, 0)]
+}
+
+// A triangle over the upper left half, multisampled with depth and
+// resolved: pixels the diagonal crosses come out between the triangle's
+// color and the background.
+fn check_multisampling(device: &gpu.Device) -> void!gpu.Error {
+    source := shaders()
+    attributes := color_attributes()
+    layouts := [gpu.VertexBufferLayout.new(12, &attributes)]
+    bindings := [gpu.BindingLayout.uniform_buffer(3, gpu.STAGE_FRAGMENT)]
+    descriptor := gpu.RenderPipelineDescriptor.new(&source, "position_vertex", &source, "paint_fragment", gpu.FORMAT_RGBA8_UNORM)
+    descriptor.vertex_buffers = &layouts
+    descriptor.bindings = &bindings
+    descriptor.samples = gpu.MULTISAMPLE_COUNT
+    descriptor.depth_format = gpu.FORMAT_DEPTH32_FLOAT
+    pipeline := device.create_render_pipeline(descriptor)?
+    positions := [-1.0f32, 1.0, 0.5, 1.0, 1.0, 0.5, -1.0, -1.0, 0.5]
+    triangle := device.create_buffer_with_data(gpu.f32_bytes(&positions), gpu.BUFFER_VERTEX)?
+    red := [1.0f32, 0.0, 0.0, 1.0]
+    paint := device.create_buffer_with_data(gpu.f32_bytes(&red), gpu.BUFFER_UNIFORM)?
+    samples := device.create_texture(gpu.TextureDescriptor.multisampled(16, 16, gpu.FORMAT_RGBA8_UNORM))?
+    assert(samples.samples() == 4, "a multisampled texture")
+    depth := device.create_texture(gpu.TextureDescriptor.multisampled(16, 16, gpu.FORMAT_DEPTH32_FLOAT))?
+    resolved := device.create_texture(gpu.TextureDescriptor.new(16, 16, gpu.FORMAT_RGBA8_UNORM, gpu.TEXTURE_RENDER | gpu.TEXTURE_COPY_SRC))?
+    encoder := device.encoder()?
+    {
+        color := gpu.ColorAttachment.clear(&samples, 0.0, 0.0, 0.0, 1.0).with_resolve(&resolved).discard()
+        pass := encoder.render_pass_with_depth(color, gpu.DepthAttachment.clear(&depth, 1.0).discard())
+        pass.set_pipeline(&pipeline)
+        pass.set_buffer(3, &paint)
+        pass.set_vertex_buffer(0, &triangle, 0)
+        pass.draw(3, 1, 0, 0)
+    }
+    encoder.submit()?
+    pixels := [0u8; 1024]
+    device.read_texture(&resolved, resolved.region(), &mut pixels, 64)?
+    expect_pixel(&pixels, 16, 2, 2, RED)
+    expect_pixel(&pixels, 16, 13, 13, BLACK)
+    partial := 0
+    for y in 0u32..16 {
+        for x in 0u32..16 {
+            value := pixel(&pixels, 16, x, y) & 255
+            if value > 20 && value < 235 {
+                partial += 1
+            }
+        }
+    }
+    if partial < 8 {
+        console.printf("{} partly covered pixels\n", partial)!
+        assert(false, "edges were not antialiased")
+    }
+    return ok()
+}
+
+// Half the samples of each pixel covered by an alpha of 0.5.
+fn check_alpha_to_coverage(device: &gpu.Device) -> void!gpu.Error {
+    source := shaders()
+    bindings := [gpu.BindingLayout.uniform_buffer(3, gpu.STAGE_FRAGMENT)]
+    descriptor := gpu.RenderPipelineDescriptor.new(&source, "screen_vertex", &source, "paint_fragment", gpu.FORMAT_RGBA8_UNORM)
+    descriptor.bindings = &bindings
+    descriptor.samples = gpu.MULTISAMPLE_COUNT
+    descriptor.alpha_to_coverage = true
+    pipeline := device.create_render_pipeline(descriptor)?
+    half := [1.0f32, 0.0, 0.0, 0.5]
+    paint := device.create_buffer_with_data(gpu.f32_bytes(&half), gpu.BUFFER_UNIFORM)?
+    samples := device.create_texture(gpu.TextureDescriptor.multisampled(16, 16, gpu.FORMAT_RGBA8_UNORM))?
+    resolved := device.create_texture(gpu.TextureDescriptor.new(16, 16, gpu.FORMAT_RGBA8_UNORM, gpu.TEXTURE_RENDER | gpu.TEXTURE_COPY_SRC))?
+    encoder := device.encoder()?
+    {
+        pass := encoder.render_pass(gpu.ColorAttachment.clear(&samples, 0.0, 0.0, 0.0, 1.0).with_resolve(&resolved))
+        pass.set_pipeline(&pipeline)
+        pass.set_buffer(3, &paint)
+        pass.draw(3, 1, 0, 0)
+    }
+    encoder.submit()?
+    pixels := [0u8; 1024]
+    device.read_texture(&resolved, resolved.region(), &mut pixels, 64)?
+    total := 0u32
+    for i in 0usize..256 {
+        total += pixels[i * 4] as u32
+    }
+    average := total / 256
+    if average < 64 || average > 192 {
+        console.printf("average red {}\n", average)!
+        assert(false, "alpha to coverage")
+    }
+    return ok()
+}
+
+// Two color targets of one pass: an additive one writing red, green and
+// alpha only, and an integer one.
+fn check_targets(device: &gpu.Device) -> void!gpu.Error {
+    source := shaders()
+    targets := [gpu.ColorTarget.blended(gpu.FORMAT_RGBA8_UNORM, gpu.Blend.preset(gpu.BLEND_ADDITIVE)), gpu.ColorTarget.new(gpu.FORMAT_R32_UINT)]
+    targets[0].write_mask = gpu.COLOR_WRITE_RED | gpu.COLOR_WRITE_GREEN | gpu.COLOR_WRITE_ALPHA
+    descriptor := gpu.RenderPipelineDescriptor.new(&source, "screen_vertex", &source, "targets_fragment", gpu.FORMAT_NONE)
+    descriptor.targets = &targets
+    pipeline := device.create_render_pipeline(descriptor)?
+    usage := gpu.TEXTURE_RENDER | gpu.TEXTURE_COPY_SRC
+    color := device.create_texture(gpu.TextureDescriptor.new(8, 8, gpu.FORMAT_RGBA8_UNORM, usage))?
+    ids := device.create_texture(gpu.TextureDescriptor.new(8, 8, gpu.FORMAT_R32_UINT, usage))?
+    encoder := device.encoder()?
+    {
+        attachments := [gpu.ColorAttachment.clear(&color, 0.5, 0.0, 0.25, 1.0), gpu.ColorAttachment.clear(&ids, 7.0, 0.0, 0.0, 0.0)]
+        pass := encoder.render_pass_targets(&attachments)
+        pass.set_pipeline(&pipeline)
+        pass.draw(3, 1, 0, 0)
+    }
+    encoder.submit()?
+    pixels := [0u8; 256]
+    device.read_texture(&color, color.region(), &mut pixels, 32)?
+    // Red 0.5 + 0.25 and green 0 + 1 added; blue kept at 0.25.
+    expect_near(&pixels, 8, 3, 2, rgba(191, 255, 64, 255))
+    values := [0u32; 64]
+    device.read_texture(&ids, ids.region(), gpu.u32_bytes_mut(&mut values), 32)?
+    assert(values[2 * 8 + 3] == 2003 && values[7 * 8 + 6] == 7006, "integer target values")
+    return ok()
+}
+
+fn paint_pipeline(device: &gpu.Device, source: &gpu.ShaderSource, blend: gpu.Blend) -> gpu.RenderPipeline!gpu.Error from(device) {
+    bindings := [gpu.BindingLayout.uniform_buffer(3, gpu.STAGE_FRAGMENT)]
+    targets := [gpu.ColorTarget.blended(gpu.FORMAT_RGBA8_UNORM, blend)]
+    descriptor := gpu.RenderPipelineDescriptor.new(source, "screen_vertex", source, "paint_fragment", gpu.FORMAT_NONE)
+    descriptor.bindings = &bindings
+    descriptor.targets = &targets
+    return device.create_render_pipeline(descriptor)
+}
+
+// A blend constant mixing a quarter of the shader's color into the
+// background, and a maximum per channel.
+fn check_blending(device: &gpu.Device) -> void!gpu.Error {
+    source := shaders()
+    mix := paint_pipeline(device, &source, gpu.Blend.new(gpu.BLEND_FACTOR_CONSTANT, gpu.BLEND_FACTOR_ONE_MINUS_CONSTANT, gpu.BLEND_OP_ADD))?
+    maximum := paint_pipeline(device, &source, gpu.Blend.new(gpu.BLEND_FACTOR_ONE, gpu.BLEND_FACTOR_ONE, gpu.BLEND_OP_MAX))?
+    paints := [0.0f32; 128]
+    paints[0] = 1.0
+    paints[3] = 1.0
+    paints[64] = 0.4
+    paints[65] = 0.8
+    uniform := device.create_buffer_with_data(gpu.f32_bytes(&paints), gpu.BUFFER_UNIFORM)?
+    usage := gpu.TEXTURE_RENDER | gpu.TEXTURE_COPY_SRC
+    mixed := device.create_texture(gpu.TextureDescriptor.new(4, 4, gpu.FORMAT_RGBA8_UNORM, usage))?
+    largest := device.create_texture(gpu.TextureDescriptor.new(4, 4, gpu.FORMAT_RGBA8_UNORM, usage))?
+    encoder := device.encoder()?
+    {
+        pass := encoder.render_pass(gpu.ColorAttachment.clear(&mixed, 0.0, 0.0, 1.0, 1.0))
+        pass.set_pipeline(&mix)
+        pass.set_blend_constant(0.25, 0.25, 0.25, 0.25)
+        pass.set_buffer_range(3, &uniform, 0, 16)
+        pass.draw(3, 1, 0, 0)
+    }
+    {
+        pass := encoder.render_pass(gpu.ColorAttachment.clear(&largest, 0.6, 0.2, 0.0, 1.0))
+        pass.set_pipeline(&maximum)
+        pass.set_buffer_range(3, &uniform, 256, 16)
+        pass.draw(3, 1, 0, 0)
+    }
+    encoder.submit()?
+    pixels := [0u8; 64]
+    device.read_texture(&mixed, mixed.region(), &mut pixels, 16)?
+    expect_near(&pixels, 4, 1, 1, rgba(64, 0, 191, 255))
+    device.read_texture(&largest, largest.region(), &mut pixels, 16)?
+    expect_near(&pixels, 4, 2, 2, rgba(153, 204, 0, 255))
+    return ok()
+}

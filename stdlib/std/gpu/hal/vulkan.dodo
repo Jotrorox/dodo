@@ -20,7 +20,9 @@ import "std/window/handle"
 //   others through BUFFER_UPLOAD (host-coherent) and BUFFER_READBACK
 //   (host-cached) buffers.
 // - Images stay in VK_IMAGE_LAYOUT_GENERAL for their whole life, except
-//   swapchain images, which move to PRESENT_SRC_KHR to be shown.
+//   swapchain images, which move to PRESENT_SRC_KHR to be shown. Mipmaps
+//   are generated with vkCmdBlitImage, and multisampled attachments
+//   resolve at the end of dynamic rendering.
 // - Every command buffer begins with one memory barrier that orders it
 //   after everything submitted before it. Within a command buffer, std/gpu
 //   calls barrier() with the uses that depend on each other, and this
@@ -38,9 +40,11 @@ import "std/window/handle"
 // Handles:
 //   buffer            a = VkBuffer, b = allocation id, c = mapped address
 //                     or 0
-//   texture           a = VkImage, b = VkImageView (0 for textures that
-//                     are only copied), c = allocation id (0 for swapchain
-//                     images), d = VkFormat
+//   texture           a = VkImage, b = VkImageView of every level (0 for
+//                     textures that are only copied), c = allocation id (0
+//                     for swapchain images), d = VkImageView of the first
+//                     level alone, for attachments and storage (b itself
+//                     with one level)
 //   sampler           a = VkSampler
 //   compute/render    a = VkPipeline, b = VkPipelineLayout,
 //   pipeline          c = VkDescriptorSetLayout or 0
@@ -79,19 +83,7 @@ struct Recording {
     overflow: bool
     // The open render pass: its secondary command buffer and attachments.
     secondary: u64
-    color_view: u64
-    color_format: u32
-    load: u32
-    clear_red: f64
-    clear_green: f64
-    clear_blue: f64
-    clear_alpha: f64
-    has_depth: bool
-    depth_view: u64
-    depth_load: u32
-    clear_depth: f32
-    width: u32
-    height: u32
+    pass: hal.RenderPassInfo
     // The barrier the pass's draws need, run before the pass.
     before: u32
     after: u32
@@ -154,6 +146,11 @@ pub struct Device: hal.Backend {
     // the device can make swapchains.
     surfaces: u32
     swapchains: bool
+    // Optional features the device has enabled: anisotropic filtering,
+    // different blending per color attachment, depth bias clamping.
+    anisotropy: bool
+    independent_blend: bool
+    bias_clamp: bool
     // DODO_GPU_UNMAPPED is set: ordinary buffers count as unmapped, as on a
     // GPU with memory of its own, even where the CPU could map them. It
     // lets tests run std/gpu's staging and readback copies on any GPU.
@@ -190,7 +187,8 @@ pub struct Device: hal.Backend {
             max_workgroup_size_x: limits.max_compute_work_group_size[0],
             max_workgroup_size_y: limits.max_compute_work_group_size[1],
             max_workgroup_size_z: limits.max_compute_work_group_size[2],
-            max_workgroup_invocations: limits.max_compute_work_group_invocations
+            max_workgroup_invocations: limits.max_compute_work_group_invocations,
+            max_color_attachments: clamp(limits.max_color_attachments, 1, hal.MAX_COLOR_ATTACHMENTS)
         }
     }
 
@@ -288,7 +286,8 @@ pub struct Device: hal.Backend {
         depth := hal.is_depth(descriptor.format)
         // Cleared by initialize_texture, so always a transfer destination.
         usage := vk.IMAGE_USAGE_TRANSFER_DST_BIT
-        if (descriptor.usage & hal.TEXTURE_COPY_SRC) != 0 {
+        // generate_mipmaps blits from level to level.
+        if (descriptor.usage & hal.TEXTURE_COPY_SRC) != 0 || descriptor.mip_levels > 1 {
             usage = usage | vk.IMAGE_USAGE_TRANSFER_SRC_BIT
         }
         if (descriptor.usage & hal.TEXTURE_SAMPLED) != 0 {
@@ -308,16 +307,17 @@ pub struct Device: hal.Backend {
         supported := unsafe {
             self.instance_fns.get_physical_device_image_format_properties(self.physical, format, vk.IMAGE_TYPE_2D, vk.IMAGE_TILING_OPTIMAL, usage, 0, ptr.from_mut(&mut support))
         }
-        if supported != vk.SUCCESS {
+        if supported != vk.SUCCESS || (support.sample_counts & descriptor.samples) == 0 || support.max_mip_levels < descriptor.mip_levels {
             return err(hal.Error.Unsupported)
         }
         info := vk.ImageCreateInfo.default()
         info.image_type = vk.IMAGE_TYPE_2D
         info.format = format
         info.extent = vk.Extent3D { width: descriptor.width, height: descriptor.height, depth: 1 }
-        info.mip_levels = 1
+        info.mip_levels = descriptor.mip_levels
         info.array_layers = 1
-        info.samples = vk.SAMPLE_COUNT_1_BIT
+        // SAMPLE_COUNT_N_BIT is N.
+        info.samples = descriptor.samples
         info.tiling = vk.IMAGE_TILING_OPTIMAL
         info.usage = usage
         info.sharing_mode = vk.SHARING_MODE_EXCLUSIVE
@@ -339,14 +339,8 @@ pub struct Device: hal.Backend {
                 return err(error)
             }
         }
-        view := vk.NULL_HANDLE
         result := unsafe {
             self.fns.bind_image_memory(self.device, image, allocation.memory, allocation.offset)
-        }
-        // Views are for binding and rendering; copies use the image itself.
-        viewed := (descriptor.usage & (hal.TEXTURE_SAMPLED | hal.TEXTURE_STORAGE | hal.TEXTURE_RENDER)) != 0
-        if result == vk.SUCCESS && viewed {
-            view = self.create_view(image, format, depth)?
         }
         if result != vk.SUCCESS {
             unsafe {
@@ -355,7 +349,30 @@ pub struct Device: hal.Backend {
             self.allocator.free(&self.fns, self.device, allocation.id)
             return err(error_for(result))
         }
-        return ok(hal.Handle { a: image, b: view, c: allocation.id, d: format as u64 })
+        // Views are for binding and rendering; copies use the image itself.
+        // Attachments and storage bindings see the first level alone.
+        view := vk.NULL_HANDLE
+        single := vk.NULL_HANDLE
+        if (descriptor.usage & (hal.TEXTURE_SAMPLED | hal.TEXTURE_STORAGE | hal.TEXTURE_RENDER)) != 0 {
+            view = match self.create_view(image, format, depth, descriptor.mip_levels) {
+                ok(made) => made,
+                err(error) => {
+                    self.discard_image(image, allocation.id, vk.NULL_HANDLE)
+                    return err(error)
+                }
+            }
+            single = view
+            if descriptor.mip_levels > 1 && (descriptor.usage & (hal.TEXTURE_STORAGE | hal.TEXTURE_RENDER)) != 0 {
+                single = match self.create_view(image, format, depth, 1) {
+                    ok(made) => made,
+                    err(error) => {
+                        self.discard_image(image, allocation.id, view)
+                        return err(error)
+                    }
+                }
+            }
+        }
+        return ok(hal.Handle { a: image, b: view, c: allocation.id, d: single })
     }
 
     pub fn write_texture(&self, texture: &hal.Handle, descriptor: &hal.TextureDescriptor, region: &hal.Region, data: &[u8], bytes_per_row: u32) -> void!hal.Error {
@@ -371,10 +388,27 @@ pub struct Device: hal.Backend {
         info.mag_filter = filter(descriptor.mag_filter)
         info.min_filter = filter(descriptor.min_filter)
         info.mipmap_mode = vk.SAMPLER_MIPMAP_MODE_NEAREST
+        if descriptor.mipmap_filter == hal.FILTER_LINEAR {
+            info.mipmap_mode = vk.SAMPLER_MIPMAP_MODE_LINEAR
+        }
         info.address_mode_u = address(descriptor.address_u)
         info.address_mode_v = address(descriptor.address_v)
         info.address_mode_w = address(descriptor.address_v)
-        info.max_lod = 0.25
+        info.border_color = border_color(descriptor.border)
+        info.min_lod = descriptor.lod_min
+        info.max_lod = descriptor.lod_max
+        // Anisotropy is a hint: GPUs without it filter as usual.
+        if descriptor.max_anisotropy > 1 && self.anisotropy {
+            info.anisotropy_enable = vk.TRUE
+            info.max_anisotropy = descriptor.max_anisotropy as f32
+            if info.max_anisotropy > self.properties.limits.max_sampler_anisotropy {
+                info.max_anisotropy = self.properties.limits.max_sampler_anisotropy
+            }
+        }
+        if descriptor.compare != hal.COMPARE_NONE {
+            info.compare_enable = vk.TRUE
+            info.compare_op = compare(descriptor.compare)
+        }
         sampler := vk.NULL_HANDLE
         unsafe {
             check(self.fns.create_sampler(self.device, ptr.from_ref(&info), vk.no_allocator(), ptr.from_mut(&mut sampler)))?
@@ -417,9 +451,25 @@ pub struct Device: hal.Backend {
     }
 
     pub fn create_render_pipeline(&self, descriptor: &hal.RenderPipelineDescriptor) -> hal.Handle!hal.Error {
+        targets := descriptor.targets
+        // Without independentBlend, every attachment blends alike.
+        if !self.independent_blend {
+            for i in 1usize..targets.len {
+                if !targets[i].blend.same(&targets[0].blend) || targets[i].write_mask != targets[0].write_mask {
+                    return err(hal.Error.Unsupported)
+                }
+            }
+        }
+        if descriptor.depth_bias_clamp != 0.0 && !self.bias_clamp {
+            return err(hal.Error.Unsupported)
+        }
+        has_fragment := descriptor.has_fragment()
         vertex_entry := c_string(descriptor.vertex_entry)?
-        fragment_entry := c_string(descriptor.fragment_entry)?
-        if !has_entry_point(descriptor.vertex.spirv, descriptor.vertex_entry, MODEL_VERTEX) || !has_entry_point(descriptor.fragment.spirv, descriptor.fragment_entry, MODEL_FRAGMENT) {
+        fragment_entry := [0u8; 256]
+        if has_fragment {
+            fragment_entry = c_string(descriptor.fragment_entry)?
+        }
+        if !has_entry_point(descriptor.vertex.spirv, descriptor.vertex_entry, MODEL_VERTEX) || (has_fragment && !has_entry_point(descriptor.fragment.spirv, descriptor.fragment_entry, MODEL_FRAGMENT)) {
             return err(hal.Error.InvalidShader)
         }
         layout := self.create_layout(descriptor.bindings)?
@@ -431,7 +481,7 @@ pub struct Device: hal.Backend {
             }
         }
         fragment_module := vertex_module
-        separate := ptr.as_ptr(descriptor.vertex.spirv) != ptr.as_ptr(descriptor.fragment.spirv)
+        separate := has_fragment && ptr.as_ptr(descriptor.vertex.spirv) != ptr.as_ptr(descriptor.fragment.spirv)
         if separate {
             fragment_module = match self.create_module(descriptor.fragment.spirv) {
                 ok(module) => module,
@@ -505,8 +555,18 @@ pub struct Device: hal.Backend {
             raster.front_face = vk.FRONT_FACE_CLOCKWISE
         }
         raster.line_width = 1.0
+        if descriptor.depth_bias != 0 || descriptor.depth_bias_slope_scale != 0.0 || descriptor.depth_bias_clamp != 0.0 {
+            raster.depth_bias_enable = vk.TRUE
+            raster.depth_bias_constant_factor = descriptor.depth_bias as f32
+            raster.depth_bias_slope_factor = descriptor.depth_bias_slope_scale
+            raster.depth_bias_clamp = descriptor.depth_bias_clamp
+        }
         multisample := vk.PipelineMultisampleStateCreateInfo.default()
-        multisample.rasterization_samples = vk.SAMPLE_COUNT_1_BIT
+        // SAMPLE_COUNT_N_BIT is N.
+        multisample.rasterization_samples = descriptor.samples
+        if descriptor.alpha_to_coverage {
+            multisample.alpha_to_coverage_enable = vk.TRUE
+        }
         depth_state := vk.PipelineDepthStencilStateCreateInfo.default()
         has_depth := descriptor.depth_format != hal.FORMAT_NONE
         if has_depth {
@@ -516,37 +576,36 @@ pub struct Device: hal.Backend {
             }
             depth_state.depth_compare_op = compare(descriptor.depth_compare)
         }
-        attachment := vk.PipelineColorBlendAttachmentState.default()
-        attachment.color_write_mask = vk.COLOR_COMPONENT_R_BIT | vk.COLOR_COMPONENT_G_BIT | vk.COLOR_COMPONENT_B_BIT | vk.COLOR_COMPONENT_A_BIT
-        if descriptor.blend != hal.BLEND_REPLACE {
-            source := vk.BLEND_FACTOR_ONE
-            destination := vk.BLEND_FACTOR_ONE_MINUS_SRC_ALPHA
-            if descriptor.blend == hal.BLEND_ALPHA {
-                source = vk.BLEND_FACTOR_SRC_ALPHA
-            } else if descriptor.blend == hal.BLEND_ADDITIVE {
-                destination = vk.BLEND_FACTOR_ONE
-            }
-            attachment.blend_enable = vk.TRUE
-            attachment.src_color_blend_factor = source
-            attachment.dst_color_blend_factor = destination
-            attachment.color_blend_op = vk.BLEND_OP_ADD
-            attachment.src_alpha_blend_factor = source
-            if descriptor.blend == hal.BLEND_ALPHA {
-                attachment.src_alpha_blend_factor = vk.BLEND_FACTOR_ONE
-            }
-            attachment.dst_alpha_blend_factor = destination
-            attachment.alpha_blend_op = vk.BLEND_OP_ADD
+        attachments := unsafe {
+            vk.zeroed::<[8]vk.PipelineColorBlendAttachmentState>()
         }
-        blend := vk.PipelineColorBlendStateCreateInfo.default()
-        blend.attachment_count = 1
-        blend.p_attachments = ptr.from_ref(&attachment)
-        dynamic_states := [vk.DYNAMIC_STATE_VIEWPORT, vk.DYNAMIC_STATE_SCISSOR]
+        color_formats := [vk.FORMAT_UNDEFINED; 8]
+        for i in 0usize..targets.len {
+            target := &targets[i]
+            blend := &target.blend
+            color_formats[i] = image_format(target.format)
+            // COLOR_WRITE_* and VK_COLOR_COMPONENT_*_BIT agree.
+            attachments[i].color_write_mask = target.write_mask
+            if blend.enabled() {
+                attachments[i].blend_enable = vk.TRUE
+                attachments[i].src_color_blend_factor = blend_factor(blend.color_source)
+                attachments[i].dst_color_blend_factor = blend_factor(blend.color_destination)
+                // BLEND_OP_* and VkBlendOp agree.
+                attachments[i].color_blend_op = blend.color_operation as i32
+                attachments[i].src_alpha_blend_factor = blend_factor(blend.alpha_source)
+                attachments[i].dst_alpha_blend_factor = blend_factor(blend.alpha_destination)
+                attachments[i].alpha_blend_op = blend.alpha_operation as i32
+            }
+        }
+        blend_state := vk.PipelineColorBlendStateCreateInfo.default()
+        blend_state.attachment_count = targets.len as u32
+        blend_state.p_attachments = ptr.as_ptr(&attachments)
+        dynamic_states := [vk.DYNAMIC_STATE_VIEWPORT, vk.DYNAMIC_STATE_SCISSOR, vk.DYNAMIC_STATE_BLEND_CONSTANTS]
         dynamic := vk.PipelineDynamicStateCreateInfo.default()
-        dynamic.dynamic_state_count = 2
+        dynamic.dynamic_state_count = 3
         dynamic.p_dynamic_states = ptr.as_ptr(&dynamic_states)
-        color_formats := [image_format(descriptor.color_format)]
         rendering := vk.PipelineRenderingCreateInfo.default()
-        rendering.color_attachment_count = 1
+        rendering.color_attachment_count = targets.len as u32
         rendering.p_color_attachment_formats = ptr.as_ptr(&color_formats)
         if has_depth {
             rendering.depth_attachment_format = image_format(descriptor.depth_format)
@@ -555,7 +614,10 @@ pub struct Device: hal.Backend {
         info.p_next = unsafe {
             ptr.from_ref(&rendering) as *const u8
         }
-        info.stage_count = 2
+        info.stage_count = 1
+        if has_fragment {
+            info.stage_count = 2
+        }
         info.p_stages = ptr.as_ptr(&stages)
         info.p_vertex_input_state = ptr.from_ref(&vertex_input)
         info.p_input_assembly_state = ptr.from_ref(&assembly)
@@ -563,7 +625,7 @@ pub struct Device: hal.Backend {
         info.p_rasterization_state = ptr.from_ref(&raster)
         info.p_multisample_state = ptr.from_ref(&multisample)
         info.p_depth_stencil_state = ptr.from_ref(&depth_state)
-        info.p_color_blend_state = ptr.from_ref(&blend)
+        info.p_color_blend_state = ptr.from_ref(&blend_state)
         info.p_dynamic_state = ptr.from_ref(&dynamic)
         info.layout = layout.b
         pipeline := vk.NULL_HANDLE
@@ -590,6 +652,9 @@ pub struct Device: hal.Backend {
                 self.fns.destroy_buffer(self.device, handle.a, alloc)
                 self.allocator.free(&self.fns, self.device, handle.b)
             } else if object == hal.OBJECT_TEXTURE {
+                if handle.d != vk.NULL_HANDLE && handle.d != handle.b {
+                    self.fns.destroy_image_view(self.device, handle.d, alloc)
+                }
                 if handle.b != vk.NULL_HANDLE {
                     self.fns.destroy_image_view(self.device, handle.b, alloc)
                 }
@@ -675,14 +740,17 @@ pub struct Device: hal.Backend {
                 return
             }
         }
-        color_formats := [image_format(pass.color_format)]
+        color_formats := [vk.FORMAT_UNDEFINED; 8]
+        for i in 0usize..pass.color_count as usize {
+            color_formats[i] = image_format(pass.colors[i].format)
+        }
         inheritance_rendering := vk.CommandBufferInheritanceRenderingInfo.default()
-        inheritance_rendering.color_attachment_count = 1
+        inheritance_rendering.color_attachment_count = pass.color_count
         inheritance_rendering.p_color_attachment_formats = ptr.as_ptr(&color_formats)
         if pass.has_depth {
-            inheritance_rendering.depth_attachment_format = vk.FORMAT_D32_SFLOAT
+            inheritance_rendering.depth_attachment_format = image_format(pass.depth.format)
         }
-        inheritance_rendering.rasterization_samples = vk.SAMPLE_COUNT_1_BIT
+        inheritance_rendering.rasterization_samples = pass.samples
         inheritance := vk.CommandBufferInheritanceInfo.default()
         inheritance.p_next = unsafe {
             ptr.from_ref(&inheritance_rendering) as *const u8
@@ -693,30 +761,24 @@ pub struct Device: hal.Backend {
         unsafe {
             self.fns.begin_command_buffer(secondary as usize as vk.CommandBuffer, ptr.from_ref(&begin))
             (*record).secondary = secondary
-            (*record).color_view = pass.color.b
-            (*record).color_format = pass.color_format
-            (*record).load = pass.load
-            (*record).clear_red = pass.clear_red
-            (*record).clear_green = pass.clear_green
-            (*record).clear_blue = pass.clear_blue
-            (*record).clear_alpha = pass.clear_alpha
-            (*record).has_depth = pass.has_depth
-            (*record).depth_view = pass.depth.b
-            (*record).depth_load = pass.depth_load
-            (*record).clear_depth = pass.clear_depth
-            (*record).width = pass.width
-            (*record).height = pass.height
+            (*record).pass = pass.copy()
             (*record).before = 0
             (*record).after = 0
         }
         encoder.c = 1
         self.set_viewport(encoder, 0.0, 0.0, pass.width as f32, pass.height as f32, 0.0, 1.0)
         self.set_scissor(encoder, 0, 0, pass.width, pass.height)
+        self.set_blend_constant(encoder, 0.0, 0.0, 0.0, 0.0)
     }
 
     pub fn end_render_pass(&self, encoder: &mut hal.Handle) {
         record := recording_of(encoder)
         commands := primary(encoder)
+        colors := unsafe {
+            vk.zeroed::<[8]vk.RenderingAttachmentInfo>()
+        }
+        depth := vk.RenderingAttachmentInfo.default()
+        info := vk.RenderingInfo.default()
         unsafe {
             secondary := (*record).secondary as usize as vk.CommandBuffer
             self.fns.end_command_buffer(secondary)
@@ -725,25 +787,31 @@ pub struct Device: hal.Backend {
             if before != 0 {
                 self.memory_barrier(commands, stages(before), write_accesses(before), stages(after), accesses(after))
             }
-            color := vk.RenderingAttachmentInfo.default()
-            color.image_view = (*record).color_view
-            color.image_layout = vk.IMAGE_LAYOUT_GENERAL
-            color.load_op = load_op((*record).load)
-            color.store_op = vk.ATTACHMENT_STORE_OP_STORE
-            color.clear_value = vk.clear_value_color(clear_color((*record).color_format, (*record).clear_red, (*record).clear_green, (*record).clear_blue, (*record).clear_alpha))
-            depth := vk.RenderingAttachmentInfo.default()
-            info := vk.RenderingInfo.default()
+            count := (*record).pass.color_count as usize
+            for i in 0usize..count {
+                colors[i] = vk.RenderingAttachmentInfo.default()
+                colors[i].image_view = (*record).pass.colors[i].texture.d
+                colors[i].image_layout = vk.IMAGE_LAYOUT_GENERAL
+                colors[i].load_op = load_op((*record).pass.colors[i].load)
+                colors[i].store_op = store_op((*record).pass.colors[i].store)
+                colors[i].clear_value = vk.clear_value_color(clear_color((*record).pass.colors[i].format, (*record).pass.colors[i].clear_red, (*record).pass.colors[i].clear_green, (*record).pass.colors[i].clear_blue, (*record).pass.colors[i].clear_alpha))
+                if (*record).pass.colors[i].has_resolve {
+                    colors[i].resolve_mode = vk.RESOLVE_MODE_AVERAGE_BIT
+                    colors[i].resolve_image_view = (*record).pass.colors[i].resolve.d
+                    colors[i].resolve_image_layout = vk.IMAGE_LAYOUT_GENERAL
+                }
+            }
             info.flags = vk.RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT
-            info.render_area = vk.Rect2D { offset: vk.Offset2D { x: 0, y: 0 }, extent: vk.Extent2D { width: (*record).width, height: (*record).height } }
+            info.render_area = vk.Rect2D { offset: vk.Offset2D { x: 0, y: 0 }, extent: vk.Extent2D { width: (*record).pass.width, height: (*record).pass.height } }
             info.layer_count = 1
-            info.color_attachment_count = 1
-            info.p_color_attachments = ptr.from_ref(&color)
-            if (*record).has_depth {
-                depth.image_view = (*record).depth_view
+            info.color_attachment_count = count as u32
+            info.p_color_attachments = ptr.as_ptr(&colors)
+            if (*record).pass.has_depth {
+                depth.image_view = (*record).pass.depth.texture.d
                 depth.image_layout = vk.IMAGE_LAYOUT_GENERAL
-                depth.load_op = load_op((*record).depth_load)
-                depth.store_op = vk.ATTACHMENT_STORE_OP_STORE
-                depth.clear_value = vk.clear_value_depth_stencil((*record).clear_depth, 0)
+                depth.load_op = load_op((*record).pass.depth.load)
+                depth.store_op = store_op((*record).pass.depth.store)
+                depth.clear_value = vk.clear_value_depth_stencil((*record).pass.depth.clear_depth, 0)
                 info.p_depth_attachment = ptr.from_ref(&depth)
             }
             self.begin_rendering(commands, ptr.from_ref(&info))
@@ -766,6 +834,13 @@ pub struct Device: hal.Backend {
         rect := vk.Rect2D { offset: vk.Offset2D { x: x as i32, y: y as i32 }, extent: vk.Extent2D { width: width, height: height } }
         unsafe {
             self.fns.cmd_set_scissor(current(encoder), 0, 1, ptr.from_ref(&rect))
+        }
+    }
+
+    pub fn set_blend_constant(&self, encoder: &mut hal.Handle, red: f64, green: f64, blue: f64, alpha: f64) {
+        constants := [red as f32, green as f32, blue as f32, alpha as f32]
+        unsafe {
+            self.fns.cmd_set_blend_constants(current(encoder), ptr.as_ptr(&constants))
         }
     }
 
@@ -817,6 +892,25 @@ pub struct Device: hal.Backend {
         copy := image_copy(descriptor, region, offset, bytes_per_row)
         unsafe {
             self.fns.cmd_copy_image_to_buffer(primary(encoder), source.a, vk.IMAGE_LAYOUT_GENERAL, destination.a, 1, ptr.from_ref(&copy))
+        }
+    }
+
+    // Blit each level from the one before it, in the general layout.
+    pub fn generate_mipmaps(&self, encoder: &mut hal.Handle, texture: &hal.Handle, descriptor: &hal.TextureDescriptor) {
+        commands := primary(encoder)
+        for level in 1u32..descriptor.mip_levels {
+            if level > 1 {
+                // The previous blit wrote the level this one reads.
+                self.memory_barrier(commands, vk.PIPELINE_STAGE_TRANSFER_BIT, vk.ACCESS_TRANSFER_WRITE_BIT, vk.PIPELINE_STAGE_TRANSFER_BIT, vk.ACCESS_TRANSFER_READ_BIT)
+            }
+            blit := vk.ImageBlit.default()
+            blit.src_subresource = vk.ImageSubresourceLayers { aspect_mask: vk.IMAGE_ASPECT_COLOR_BIT, mip_level: level - 1, base_array_layer: 0, layer_count: 1 }
+            blit.src_offsets[1] = vk.Offset3D { x: hal.level_size(descriptor.width, level - 1) as i32, y: hal.level_size(descriptor.height, level - 1) as i32, z: 1 }
+            blit.dst_subresource = vk.ImageSubresourceLayers { aspect_mask: vk.IMAGE_ASPECT_COLOR_BIT, mip_level: level, base_array_layer: 0, layer_count: 1 }
+            blit.dst_offsets[1] = vk.Offset3D { x: hal.level_size(descriptor.width, level) as i32, y: hal.level_size(descriptor.height, level) as i32, z: 1 }
+            unsafe {
+                self.fns.cmd_blit_image(commands, texture.a, vk.IMAGE_LAYOUT_GENERAL, texture.a, vk.IMAGE_LAYOUT_GENERAL, 1, ptr.from_ref(&blit), vk.FILTER_LINEAR)
+            }
         }
     }
 
@@ -973,9 +1067,7 @@ pub struct Device: hal.Backend {
             (*swap).views[index as usize]
         }
         texture.c = 0
-        texture.d = unsafe {
-            (*swap).format as u64
-        }
+        texture.d = texture.b
         return ok(submission)
     }
 
@@ -1127,12 +1219,26 @@ pub struct Device: hal.Backend {
         }
     }
 
-    fn create_view(&self, image: u64, format: vk.Format, depth: bool) -> u64!hal.Error {
+    // Destroy a texture that failed halfway: its image, its memory and
+    // its view, unless that is null.
+    fn discard_image(&self, image: u64, allocation: u64, view: u64) {
+        unsafe {
+            if view != vk.NULL_HANDLE {
+                self.fns.destroy_image_view(self.device, view, vk.no_allocator())
+            }
+            self.fns.destroy_image(self.device, image, vk.no_allocator())
+        }
+        self.allocator.free(&self.fns, self.device, allocation)
+    }
+
+    // A view of the first `levels` mipmap levels.
+    fn create_view(&self, image: u64, format: vk.Format, depth: bool, levels: u32) -> u64!hal.Error {
         view_info := vk.ImageViewCreateInfo.default()
         view_info.image = image
         view_info.view_type = vk.IMAGE_VIEW_TYPE_2D
         view_info.format = format
         view_info.subresource_range = whole_image(depth)
+        view_info.subresource_range.level_count = levels
         view := vk.NULL_HANDLE
         unsafe {
             check(self.fns.create_image_view(self.device, ptr.from_ref(&view_info), vk.no_allocator(), ptr.from_mut(&mut view)))?
@@ -1422,7 +1528,7 @@ pub struct Device: hal.Backend {
         }
         for i in 0usize..images as usize {
             semaphore_info := vk.SemaphoreCreateInfo.default()
-            view := self.create_view(list[i], format, false)?
+            view := self.create_view(list[i], format, false, 1)?
             semaphore := vk.NULL_HANDLE
             unsafe {
                 created_semaphore := self.fns.create_semaphore(self.device, ptr.from_ref(&semaphore_info), alloc, ptr.from_mut(&mut semaphore))
@@ -1611,8 +1717,13 @@ pub struct Device: hal.Backend {
                     buffers[slot].range = state.size[slot]
                     writes[count].p_buffer_info = ptr.from_ref(&buffers[slot])
                 } else {
+                    // Sampled textures see every level, storage ones the
+                    // first.
                     images[slot].sampler = state.sampler[slot]
                     images[slot].image_view = state.object_b[slot]
+                    if state.bound[slot] == hal.BOUND_STORAGE_TEXTURE {
+                        images[slot].image_view = state.object_d[slot]
+                    }
                     images[slot].image_layout = vk.IMAGE_LAYOUT_GENERAL
                     writes[count].p_image_info = ptr.from_ref(&images[slot])
                 }
@@ -1795,6 +1906,9 @@ fn open_device(window: Option<&handle.NativeHandle>, debug: bool) -> Device!hal.
         max_allocation: choice.max_allocation,
         surfaces: surfaces,
         swapchains: choice.swapchain,
+        anisotropy: choice.anisotropy,
+        independent_blend: choice.independent_blend,
+        bias_clamp: choice.bias_clamp,
         unmapped: unsafe {
             getenv(ptr.as_ptr(b"DODO_GPU_UNMAPPED\0")) as usize != 0
         },
@@ -1986,6 +2100,9 @@ struct Choice {
     robust: bool
     fragment_stores: bool
     swapchain: bool
+    anisotropy: bool
+    independent_blend: bool
+    bias_clamp: bool
 }
 
 const KHR_PUSH_DESCRIPTOR: &[u8] = b"VK_KHR_push_descriptor\0"
@@ -2102,7 +2219,7 @@ fn choose_device(fns: &vk.InstanceFns, instance: vk.Instance, surface: vk.Surfac
         return err(hal.Error.NoBackend)
     }
     best := -1i32
-    chosen := Choice { physical: devices[0], properties: vk.PhysicalDeviceProperties.default(), family: 0, max_allocation: 0, push_extension: false, rendering_extension: false, portability_subset: false, robust: false, fragment_stores: false, swapchain: false }
+    chosen := Choice { physical: devices[0], properties: vk.PhysicalDeviceProperties.default(), family: 0, max_allocation: 0, push_extension: false, rendering_extension: false, portability_subset: false, robust: false, fragment_stores: false, swapchain: false, anisotropy: false, independent_blend: false, bias_clamp: false }
     for i in 0usize..count as usize {
         match inspect(fns, devices[i], surface) {
             some(choice) => {
@@ -2235,7 +2352,10 @@ fn inspect(fns: &vk.InstanceFns, physical: vk.PhysicalDevice, surface: vk.Surfac
         portability_subset: portability_subset,
         robust: features.features.robust_buffer_access != 0,
         fragment_stores: features.features.fragment_stores_and_atomics != 0,
-        swapchain: swapchain
+        swapchain: swapchain,
+        anisotropy: features.features.sampler_anisotropy != 0,
+        independent_blend: features.features.independent_blend != 0,
+        bias_clamp: features.features.depth_bias_clamp != 0
     })
 }
 
@@ -2285,6 +2405,15 @@ fn create_device(fns: &vk.InstanceFns, choice: &Choice) -> vk.Device!hal.Error {
     }
     if choice.fragment_stores {
         features.features.fragment_stores_and_atomics = vk.TRUE
+    }
+    if choice.anisotropy {
+        features.features.sampler_anisotropy = vk.TRUE
+    }
+    if choice.independent_blend {
+        features.features.independent_blend = vk.TRUE
+    }
+    if choice.bias_clamp {
+        features.features.depth_bias_clamp = vk.TRUE
     }
     info := vk.DeviceCreateInfo.default()
     info.p_next = unsafe {
@@ -2417,7 +2546,7 @@ fn image_copy(descriptor: &hal.TextureDescriptor, region: &hal.Region, offset: u
         buffer_offset: offset,
         buffer_row_length: bytes_per_row / hal.texel_size(descriptor.format),
         buffer_image_height: 0,
-        image_subresource: vk.ImageSubresourceLayers { aspect_mask: aspect, mip_level: 0, base_array_layer: 0, layer_count: 1 },
+        image_subresource: vk.ImageSubresourceLayers { aspect_mask: aspect, mip_level: region.level, base_array_layer: 0, layer_count: 1 },
         image_offset: vk.Offset3D { x: region.x as i32, y: region.y as i32, z: 0 },
         image_extent: vk.Extent3D { width: region.width, height: region.height, depth: 1 }
     }
@@ -2428,7 +2557,7 @@ fn whole_image(depth: bool) -> vk.ImageSubresourceRange {
     if depth {
         aspect = vk.IMAGE_ASPECT_DEPTH_BIT
     }
-    return vk.ImageSubresourceRange { aspect_mask: aspect, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 }
+    return vk.ImageSubresourceRange { aspect_mask: aspect, base_mip_level: 0, level_count: vk.REMAINING_MIP_LEVELS, base_array_layer: 0, layer_count: 1 }
 }
 
 fn clear_color(format: u32, red: f64, green: f64, blue: f64, alpha: f64) -> vk.ClearColorValue {
@@ -2570,7 +2699,7 @@ fn descriptor_type(kind: u32) -> vk.DescriptorType {
     if kind == hal.BINDING_UNIFORM_BUFFER {
         return vk.DESCRIPTOR_TYPE_UNIFORM_BUFFER
     }
-    if kind == hal.BINDING_SAMPLED_TEXTURE {
+    if kind == hal.BINDING_SAMPLED_TEXTURE || kind == hal.BINDING_COMPARISON_TEXTURE {
         return vk.DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
     }
     if kind == hal.BINDING_STORAGE_TEXTURE {
@@ -2636,4 +2765,62 @@ fn load_op(load: u32) -> vk.AttachmentLoadOp {
         return vk.ATTACHMENT_LOAD_OP_CLEAR
     }
     return vk.ATTACHMENT_LOAD_OP_LOAD
+}
+
+fn store_op(store: bool) -> vk.AttachmentStoreOp {
+    if store {
+        return vk.ATTACHMENT_STORE_OP_STORE
+    }
+    return vk.ATTACHMENT_STORE_OP_DONT_CARE
+}
+
+fn border_color(border: u32) -> vk.BorderColor {
+    if border == hal.BORDER_OPAQUE_BLACK {
+        return vk.BORDER_COLOR_FLOAT_OPAQUE_BLACK
+    }
+    if border == hal.BORDER_OPAQUE_WHITE {
+        return vk.BORDER_COLOR_FLOAT_OPAQUE_WHITE
+    }
+    return vk.BORDER_COLOR_FLOAT_TRANSPARENT_BLACK
+}
+
+// hal's BLEND_FACTOR_* (numbered as Metal's) as VkBlendFactor.
+fn blend_factor(factor: u32) -> vk.BlendFactor {
+    if factor == hal.BLEND_FACTOR_ZERO {
+        return vk.BLEND_FACTOR_ZERO
+    }
+    if factor == hal.BLEND_FACTOR_ONE {
+        return vk.BLEND_FACTOR_ONE
+    }
+    if factor == hal.BLEND_FACTOR_SRC {
+        return vk.BLEND_FACTOR_SRC_COLOR
+    }
+    if factor == hal.BLEND_FACTOR_ONE_MINUS_SRC {
+        return vk.BLEND_FACTOR_ONE_MINUS_SRC_COLOR
+    }
+    if factor == hal.BLEND_FACTOR_SRC_ALPHA {
+        return vk.BLEND_FACTOR_SRC_ALPHA
+    }
+    if factor == hal.BLEND_FACTOR_ONE_MINUS_SRC_ALPHA {
+        return vk.BLEND_FACTOR_ONE_MINUS_SRC_ALPHA
+    }
+    if factor == hal.BLEND_FACTOR_DST {
+        return vk.BLEND_FACTOR_DST_COLOR
+    }
+    if factor == hal.BLEND_FACTOR_ONE_MINUS_DST {
+        return vk.BLEND_FACTOR_ONE_MINUS_DST_COLOR
+    }
+    if factor == hal.BLEND_FACTOR_DST_ALPHA {
+        return vk.BLEND_FACTOR_DST_ALPHA
+    }
+    if factor == hal.BLEND_FACTOR_ONE_MINUS_DST_ALPHA {
+        return vk.BLEND_FACTOR_ONE_MINUS_DST_ALPHA
+    }
+    if factor == hal.BLEND_FACTOR_SRC_ALPHA_SATURATED {
+        return vk.BLEND_FACTOR_SRC_ALPHA_SATURATE
+    }
+    if factor == hal.BLEND_FACTOR_CONSTANT {
+        return vk.BLEND_FACTOR_CONSTANT_COLOR
+    }
+    return vk.BLEND_FACTOR_ONE_MINUS_CONSTANT_COLOR
 }

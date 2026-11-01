@@ -251,6 +251,40 @@ fn recording_mistakes_panic() {
             "a render pass attachment needs TEXTURE_RENDER",
         ),
         (
+            "the same texture attached twice",
+            r#"    texture := device.create_texture(gpu.TextureDescriptor.new(4, 4, gpu.FORMAT_RGBA8_UNORM, gpu.TEXTURE_RENDER))?
+    encoder := device.encoder()?
+    colors := [gpu.ColorAttachment.clear(&texture, 0.0, 0.0, 0.0, 1.0), gpu.ColorAttachment.keep(&texture)]
+    pass := encoder.render_pass_targets(&colors)
+    pass.end()"#,
+            "a texture is attached to the pass twice",
+        ),
+        (
+            "resolve a single-sampled attachment",
+            r#"    texture := device.create_texture(gpu.TextureDescriptor.new(4, 4, gpu.FORMAT_RGBA8_UNORM, gpu.TEXTURE_RENDER))?
+    target := device.create_texture(gpu.TextureDescriptor.new(4, 4, gpu.FORMAT_RGBA8_UNORM, gpu.TEXTURE_RENDER))?
+    encoder := device.encoder()?
+    pass := encoder.render_pass(gpu.ColorAttachment.clear(&texture, 0.0, 0.0, 0.0, 1.0).with_resolve(&target))
+    pass.end()"#,
+            "only multisampled attachments resolve",
+        ),
+        (
+            "attachments with different sample counts",
+            r#"    color := device.create_texture(gpu.TextureDescriptor.multisampled(4, 4, gpu.FORMAT_RGBA8_UNORM))?
+    depth := device.create_texture(gpu.TextureDescriptor.new(4, 4, gpu.FORMAT_DEPTH32_FLOAT, gpu.TEXTURE_RENDER))?
+    encoder := device.encoder()?
+    pass := encoder.render_pass_with_depth(gpu.ColorAttachment.clear(&color, 0.0, 0.0, 0.0, 1.0), gpu.DepthAttachment.clear(&depth, 1.0))
+    pass.end()"#,
+            "the attachments differ in their sample counts",
+        ),
+        (
+            "mipmaps of an integer texture",
+            r#"    texture := device.create_texture(gpu.TextureDescriptor.mipmapped(4, 4, gpu.FORMAT_R32_UINT, gpu.TEXTURE_COPY_DST))?
+    encoder := device.encoder()?
+    encoder.generate_mipmaps(&texture)"#,
+            "generating mipmaps needs a filterable color format",
+        ),
+        (
             "unaligned binding offset",
             r#"    buffer := device.create_buffer(1024, gpu.BUFFER_STORAGE)?
     encoder := device.encoder()?

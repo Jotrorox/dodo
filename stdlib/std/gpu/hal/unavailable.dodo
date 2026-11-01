@@ -28,7 +28,7 @@ pub struct Device: hal.Backend {
         return hal.Api.Metal
     }
     pub fn limits(&self) -> hal.Limits {
-        return hal.Limits { max_texture_size: 0, max_buffer_size: 0, max_uniform_binding_size: 0, max_storage_binding_size: 0, max_workgroups: 0, max_workgroup_size_x: 0, max_workgroup_size_y: 0, max_workgroup_size_z: 0, max_workgroup_invocations: 0 }
+        return hal.Limits { max_texture_size: 0, max_buffer_size: 0, max_uniform_binding_size: 0, max_storage_binding_size: 0, max_workgroups: 0, max_workgroup_size_x: 0, max_workgroup_size_y: 0, max_workgroup_size_z: 0, max_workgroup_invocations: 0, max_color_attachments: 0 }
     }
     pub fn name(&self, out: &mut[u8]) -> usize {
         return 0
@@ -79,12 +79,14 @@ pub struct Device: hal.Backend {
     pub fn end_render_pass(&self, encoder: &mut hal.Handle) {}
     pub fn set_viewport(&self, encoder: &mut hal.Handle, x: f32, y: f32, width: f32, height: f32, min_depth: f32, max_depth: f32) {}
     pub fn set_scissor(&self, encoder: &mut hal.Handle, x: u32, y: u32, width: u32, height: u32) {}
+    pub fn set_blend_constant(&self, encoder: &mut hal.Handle, red: f64, green: f64, blue: f64, alpha: f64) {}
     pub fn dispatch(&self, encoder: &mut hal.Handle, state: &mut hal.PassState, x: u32, y: u32, z: u32) {}
     pub fn draw(&self, encoder: &mut hal.Handle, state: &mut hal.PassState, vertex_count: u32, instance_count: u32, first_vertex: u32, first_instance: u32) {}
     pub fn draw_indexed(&self, encoder: &mut hal.Handle, state: &mut hal.PassState, index_count: u32, instance_count: u32, first_index: u32, base_vertex: i32, first_instance: u32) {}
     pub fn copy_buffer(&self, encoder: &mut hal.Handle, source: &hal.Handle, source_offset: u64, destination: &hal.Handle, destination_offset: u64, size: u64) {}
     pub fn copy_buffer_to_texture(&self, encoder: &mut hal.Handle, source: &hal.Handle, offset: u64, bytes_per_row: u32, destination: &hal.Handle, descriptor: &hal.TextureDescriptor, region: &hal.Region) {}
     pub fn copy_texture_to_buffer(&self, encoder: &mut hal.Handle, source: &hal.Handle, descriptor: &hal.TextureDescriptor, region: &hal.Region, destination: &hal.Handle, offset: u64, bytes_per_row: u32) {}
+    pub fn generate_mipmaps(&self, encoder: &mut hal.Handle, texture: &hal.Handle, descriptor: &hal.TextureDescriptor) {}
     pub fn clear_buffer(&self, encoder: &mut hal.Handle, buffer: &hal.Handle, offset: u64, size: u64) {}
     pub fn initialize_texture(&self, encoder: &mut hal.Handle, texture: &hal.Handle, descriptor: &hal.TextureDescriptor) {}
     pub fn barrier(&self, encoder: &mut hal.Handle, before: u32, after: u32) {}

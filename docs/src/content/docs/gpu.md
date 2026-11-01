@@ -111,7 +111,7 @@ context for OpenGL. For Metal, run with `MTL_DEBUG_LAYER=1` instead.
 | --- | --- |
 | `device.api()` | `gpu.Api.Vulkan`, `Metal` or `OpenGl`; `gpu.api_name(&api)` names it |
 | `device.name()` | The GPU's name, such as `"Apple M2"` |
-| `device.limits()` | `gpu.Limits`: the largest texture, buffer, binding and workgroup |
+| `device.limits()` | `gpu.Limits`: the largest texture, buffer, binding and workgroup, and how many color attachments a pass takes (at least 4) |
 | `device.wait()` | Waits until the GPU has finished everything submitted, and every write |
 | `device.poll()` | Starts pending writes and destroys dropped objects the GPU is done with |
 
@@ -153,11 +153,29 @@ flight](#staging-and-frames-in-flight)). `device.read_buffer(&buffer, offset,
 
 ## Textures and samplers
 
-Textures are two-dimensional, with one mipmap level and one layer:
+Textures are two-dimensional, with one layer and one or more mipmap levels:
 
 ```dodo
 texture := device.create_texture(gpu.TextureDescriptor.new(256, 256, gpu.FORMAT_RGBA8_UNORM, gpu.TEXTURE_RENDER | gpu.TEXTURE_COPY_SRC))?
+image := device.create_texture(gpu.TextureDescriptor.mipmapped(256, 256, gpu.FORMAT_RGBA8_UNORM, gpu.TEXTURE_SAMPLED | gpu.TEXTURE_COPY_DST))?
+samples := device.create_texture(gpu.TextureDescriptor.multisampled(256, 256, gpu.FORMAT_RGBA8_UNORM))?
 ```
+
+`TextureDescriptor.mipmapped` gives a texture every level down to one texel
+(`gpu.mip_level_count(width, height)` of them); set `mip_levels` for fewer.
+Each level is half the size of the one before, rounded down to at least 1
+(`gpu.level_size`). Write the first level and fill the others with
+`encoder.generate_mipmaps(&texture)`, which filters each level down from the
+one before for 8-bit and 16-bit float color formats, or write each level
+yourself. Render passes draw into the first level, and storage bindings
+reach only that level too.
+
+`TextureDescriptor.multisampled` makes a render target with
+`gpu.MULTISAMPLE_COUNT` (4) samples per pixel, which a render pass resolves
+into an ordinary texture of the same size and format (see
+[Commands](#commands)). Multisampled textures have one level, no integer
+format and only the usage `TEXTURE_RENDER`: nothing copies, samples or
+stores them.
 
 | Format | Bytes per texel | Notes |
 | --- | --- | --- |
@@ -175,13 +193,33 @@ Usages are `TEXTURE_COPY_SRC`, `TEXTURE_COPY_DST`, `TEXTURE_SAMPLED`,
 `device.read_texture(&texture, region, &mut out, bytes_per_row)` copy a
 `gpu.Region` of texels, ordered and staged like the buffer calls. Rows are
 `bytes_per_row` apart, a multiple of the texel size and at least the width of
-the region; `texture.region()` covers the whole texture and
-`texture.bytes_per_row()` is its tight row size. Rows run top to bottom:
-row 0 is the top row in memory, on screen and at texture coordinate v = 0.
+the region; `texture.region()` covers the whole first level and
+`texture.bytes_per_row()` is its tight row size, while
+`texture.level_region(level)` and `texture.level_bytes_per_row(level)` do the
+same for any level, and `gpu.Region.at_level(level, x, y, width, height)`
+picks part of one. Rows run top to bottom: row 0 is the top row in memory,
+on screen and at texture coordinate v = 0.
 
 `device.create_sampler(gpu.SamplerDescriptor.linear())` and `nearest()`
-filter and clamp; set `address_u` and `address_v` to `ADDRESS_REPEAT` or
-`ADDRESS_MIRROR` to tile.
+filter and clamp, and `trilinear()` filters between texels and mipmap levels
+and repeats. A `gpu.SamplerDescriptor` has these fields:
+
+| Field | Sets |
+| --- | --- |
+| `mag_filter`, `min_filter` | `FILTER_NEAREST` or `FILTER_LINEAR` between texels |
+| `mipmap_filter` | `FILTER_NEAREST` takes the nearest level, `FILTER_LINEAR` blends the two nearest |
+| `address_u`, `address_v` | `ADDRESS_CLAMP`, `ADDRESS_REPEAT`, `ADDRESS_MIRROR`, or `ADDRESS_BORDER`, which reads `border` outside the texture |
+| `border` | `BORDER_TRANSPARENT_BLACK`, `BORDER_OPAQUE_BLACK` or `BORDER_OPAQUE_WHITE` |
+| `lod_min`, `lod_max` | The range of levels sampled, 0 to 32 by default |
+| `max_anisotropy` | Up to 16 samples along the direction a texture is stretched in; a hint, and above 1 it needs every filter linear |
+| `compare` | `COMPARE_NONE`, or a `COMPARE_*` that makes a comparison sampler |
+
+A comparison sampler compares a reference depth with the texels of a depth
+texture, giving 1.0 where the comparison passes and 0.0 where it fails,
+filtered when the filters are linear. `SamplerDescriptor.comparison(gpu.COMPARE_LESS_EQUAL)`
+is the usual one for shadow maps: linear, and passing outside the map, where
+it reads an opaque white border. Comparison samplers only work in
+`comparison_texture` slots, which only take them.
 
 ## Shaders and bindings
 
@@ -199,6 +237,7 @@ in every language:
 | `BindingLayout.uniform_buffer(n, stages)` | `layout(binding = n) uniform` | `constant T &x [[buffer(n)]]` | `layout(std140, binding = n) uniform` |
 | `storage_buffer`, `read_only_storage_buffer` | `layout(binding = n) buffer` | `device T *x [[buffer(n)]]` | `layout(std430, binding = n) buffer` |
 | `sampled_texture` | `layout(binding = n) uniform sampler2D` | `texture2d<float> [[texture(n)]]` and `sampler [[sampler(n)]]` | `layout(binding = n) uniform sampler2D` |
+| `comparison_texture` | `layout(binding = n) uniform sampler2DShadow` | `depth2d<float> [[texture(n)]]` and `sampler [[sampler(n)]]` | `layout(binding = n) uniform sampler2DShadow` |
 | `storage_texture(n, stages, format)` | `layout(binding = n, r32ui) uniform uimage2D` | `texture2d<uint, access::write> [[texture(n)]]` | the same as SPIR-V |
 | Vertex attribute at `location` | `layout(location = l) in` | `[[attribute(l)]]` with `[[stage_in]]` | `layout(location = l) in` |
 
@@ -268,8 +307,10 @@ Bindings use std/gpu's slots:
 | `@group(0) @binding(n) var<uniform>` | `BindingLayout.uniform_buffer(n, stages)` |
 | `@group(0) @binding(n) var<storage, read_write>` or `var<storage, read>` | `storage_buffer` or `read_only_storage_buffer` |
 | `@group(0) @binding(n) var t: texture_2d<f32>` and `@group(1) @binding(n) var s: sampler` | `sampled_texture(n, stages)`, bound with `set_texture(n, texture, sampler)` |
+| `@group(0) @binding(n) var t: texture_depth_2d` and `@group(1) @binding(n) var s: sampler_comparison` | `comparison_texture(n, stages)`, bound with a depth texture and a comparison sampler |
 | `@group(0) @binding(n) var t: texture_storage_2d<r32uint, write>` | `storage_texture(n, stages, gpu.FORMAT_R32_UINT)` |
 | `@location(l)` input of a `@vertex` function | `VertexAttribute.new(l, format, offset)` |
+| `@location(n)` output of a `@fragment` function | Color target *n* of the pipeline |
 
 So samplers sit in `@group(1)`, at the binding of the texture they are read
 with in `@group(0)`; every other resource is in `@group(0)`, at slots 0 to
@@ -313,10 +354,55 @@ pipeline := device.create_render_pipeline(descriptor)?
 
 The other fields default to triangle lists (`topology`), counterclockwise
 front faces (`front_face`), no blending (`blend`: `BLEND_ALPHA`,
-`BLEND_PREMULTIPLIED` or `BLEND_ADDITIVE`) and no depth buffer
-(`depth_format`, with `depth_compare` and `depth_write`).
-`VertexBufferLayout.instanced` steps a buffer per instance. Point lists draw
-points as large as the vertex shader's `gl_PointSize` or `[[point_size]]`.
+`BLEND_PREMULTIPLIED` or `BLEND_ADDITIVE`), no depth buffer (`depth_format`,
+with `depth_compare` and `depth_write`), no depth bias and one sample per
+pixel. `VertexBufferLayout.instanced` steps a buffer per instance. Point
+lists draw points as large as the vertex shader's `gl_PointSize` or
+`[[point_size]]`.
+
+For several color attachments, or blending beyond the presets, pass
+`gpu.FORMAT_NONE` as the color format and list `targets` instead; target
+*n* takes the fragment shader's output at location *n*:
+
+```dodo
+targets := [
+    gpu.ColorTarget.new(gpu.FORMAT_RGBA16_FLOAT),
+    gpu.ColorTarget.blended(gpu.FORMAT_RGBA8_UNORM, gpu.Blend.new(gpu.BLEND_FACTOR_CONSTANT, gpu.BLEND_FACTOR_ONE_MINUS_CONSTANT, gpu.BLEND_OP_ADD)),
+]
+targets[1].write_mask = gpu.COLOR_WRITE_RED | gpu.COLOR_WRITE_GREEN | gpu.COLOR_WRITE_BLUE
+descriptor := gpu.RenderPipelineDescriptor.new(&source, "scene_vertex", &source, "scene_fragment", gpu.FORMAT_NONE)
+descriptor.targets = &targets
+```
+
+A `gpu.Blend` computes `source * source factor (op) destination * destination factor`,
+separately for color and alpha with `Blend.separate`. The factors are
+`BLEND_FACTOR_ZERO`, `ONE`, `SRC`, `ONE_MINUS_SRC`, `SRC_ALPHA`,
+`ONE_MINUS_SRC_ALPHA`, `DST`, `ONE_MINUS_DST`, `DST_ALPHA`,
+`ONE_MINUS_DST_ALPHA`, `SRC_ALPHA_SATURATED`, `CONSTANT` and
+`ONE_MINUS_CONSTANT` (the pass's `set_blend_constant`), and the operations
+`BLEND_OP_ADD`, `SUBTRACT`, `REVERSE_SUBTRACT`, `MIN` and `MAX`;
+`Blend.preset(gpu.BLEND_ALPHA)` spells out a preset. A pass may have up to
+`limits().max_color_attachments` targets. Vulkan GPUs without the
+`independentBlend` feature, which are rare, need every target blended and
+masked alike.
+
+A pipeline that only writes depth, such as one drawing a shadow map, leaves
+out the fragment stage and draws in a `depth_pass`:
+
+```dodo
+descriptor := gpu.RenderPipelineDescriptor.depth_only(&source, "shadow_vertex", gpu.FORMAT_DEPTH32_FLOAT)
+descriptor.depth_bias = 2
+descriptor.depth_bias_slope_scale = 1.5
+```
+
+`depth_bias` adds that many of the depth buffer's smallest steps to each
+fragment's depth, `depth_bias_slope_scale` scales the triangle's depth
+slope, and `depth_bias_clamp`, unless 0, limits the sum; it applies to
+triangles only. Later passes read the map through a `comparison_texture`
+slot. For multisampling, set `samples` to `gpu.MULTISAMPLE_COUNT` on a
+pipeline drawing into multisampled attachments; `alpha_to_coverage` then
+covers each pixel's samples in proportion to the alpha written to location
+0, for antialiased cutouts such as foliage.
 
 Clip space is the same on every backend: x right and y up from -1 to 1,
 depth from 0 to 1, and the top of the image at y = 1. Front faces wind
@@ -332,14 +418,28 @@ end, when dropped or with `pass.end()`:
 | `encoder.compute_pass()` | `set_pipeline`, `set_buffer`, `set_buffer_range`, `set_texture`, `set_storage_texture`, `dispatch(x, y, z)` |
 | `encoder.render_pass(color)` | The same bindings, plus `set_vertex_buffer`, `set_index_buffer`, `set_viewport`, `set_scissor`, `draw`, `draw_indexed` |
 | `encoder.render_pass_with_depth(color, depth)` | A render pass with a depth buffer |
+| `encoder.render_pass_targets(&colors)`, `render_pass_targets_with_depth(&colors, depth)` | A render pass with several color attachments, one per pipeline target |
+| `encoder.depth_pass(depth)` | A render pass with only a depth buffer, for depth-only pipelines |
+| `pass.set_blend_constant(r, g, b, a)` | The color `BLEND_FACTOR_CONSTANT` reads, until the pass ends (0 to begin with) |
+| `encoder.generate_mipmaps(&texture)` | Fills every level after the first from the one before |
 | `encoder.copy_buffer`, `copy_buffer_to_texture`, `copy_texture_to_buffer` | Copies between objects with the copy usages |
 | `encoder.submit()` | Runs everything recorded, after all earlier submissions |
 
 `gpu.ColorAttachment.clear(&texture, r, g, b, a)` clears the attachment first
 and `ColorAttachment.keep(&texture)` draws over it; `gpu.DepthAttachment` does
-the same for depth. Every command sees the results of the commands before it,
-including dispatches within one pass. Buffer offsets bound to a slot are
-multiples of `gpu.BINDING_ALIGNMENT` (256).
+the same for depth. All attachments of a pass have one size and one sample
+count. A multisampled color attachment resolves into a texture with one
+sample when the pass ends, and `discard()` drops what the GPU need not keep
+afterwards, leaving it undefined:
+
+```dodo
+color := gpu.ColorAttachment.clear(&samples, 0.0, 0.0, 0.0, 1.0).with_resolve(frame.texture()).discard()
+pass := encoder.render_pass_with_depth(color, gpu.DepthAttachment.clear(&depth, 1.0).discard())
+```
+
+Every command sees the results of the commands before it, including
+dispatches within one pass. Buffer offsets bound to a slot are multiples of
+`gpu.BINDING_ALIGNMENT` (256).
 
 Dropping an encoder without submitting discards its commands, except on
 OpenGL, which has no command buffers: there commands run as they are
@@ -463,8 +563,12 @@ as an index out of bounds does, and the report names the line of
 - ranges: copies, bound ranges, texture regions, row sizes and the vertices
   and indices a draw reads all lie inside their buffers and textures
 - pipelines: a draw or dispatch has a pipeline, every slot it lists holds the
-  right kind of object, storage textures have the layout's format, and the
-  attachments match the pipeline's formats and do not appear as bindings
+  right kind of object (comparison samplers and depth textures only in
+  comparison slots), storage textures have the layout's format, and the
+  attachments match the pipeline's formats and sample count and do not
+  appear as bindings
+- passes: attachments share a size and sample count, no texture is attached
+  twice, and resolve targets have one sample and their attachment's format
 - limits: workgroup counts and sizes, texture sizes and binding sizes
 - SPIR-V: Vulkan modules are well formed and contain the named entry point
   of the right stage
@@ -482,7 +586,7 @@ developing.
 | Error | When |
 | --- | --- |
 | `NoBackend` | No backend could be used: no Metal GPU, Vulkan loader or OpenGL library, or no GPU behind it |
-| `Unsupported` | The backend is too old (Vulkan before 1.2 or without dynamic rendering and push descriptors, OpenGL before 4.5) or lacks a format |
+| `Unsupported` | The backend is too old (Vulkan before 1.2 or without dynamic rendering and push descriptors, OpenGL before 4.5), lacks a format or sample count, or lacks an optional feature a pipeline uses (independent blending or depth bias clamping on Vulkan, depth bias clamping before OpenGL 4.6) |
 | `InvalidInput` | An argument breaks one of the rules above |
 | `MissingShader` | The shader source has no code for this device's API |
 | `InvalidShader` | The shader does not compile or link, or lacks the entry point |
@@ -498,7 +602,7 @@ developing.
 | Version | 1.2 with dynamic rendering and push descriptors (core in 1.3 and 1.4) | Any Mac GPU | 4.5 core, without a window |
 | Memory | Large blocks per memory type, carved into buffers and images | Metal's own | The driver's |
 | Buffers | Device-local, mapped too on unified memory; staged writes, reads through host-cached memory | Shared storage; staged writes | Buffer objects |
-| Textures | Optimal tiling, always in the general layout | Private storage, copied through buffers | Immutable storage |
+| Textures | Optimal tiling, always in the general layout; mipmaps by blits, resolves at the end of rendering | Private storage, copied through buffers | Immutable storage; resolves by framebuffer blits |
 | Synchronization | Barriers from tracked usage, one per submission besides; a timeline semaphore numbers submissions | Metal's own tracking; a shared event numbers submissions | `glMemoryBarrier` after shader storage writes |
 | Surfaces | Swapchains (Linux, Windows) | `CAMetalLayer` | The window's context |
 
@@ -508,9 +612,10 @@ macOS stops at OpenGL 4.1, so there `Preference.OpenGl` fails with
 
 ## Limits
 
-A render pass has one color attachment; textures have no mipmaps,
-layers or multisampling; there are no push constants, indirect draws, stencil
-buffers or queries. The raw bindings, [std/gpu/vulkan](vulkan.md),
+Textures have one layer (no arrays, cube maps or 3D textures), render passes
+draw into the first mipmap level, multisampling has 4 samples, and depth
+attachments do not resolve; there are no push constants, indirect draws,
+stencil buffers or queries. The raw bindings, [std/gpu/vulkan](vulkan.md),
 [std/gpu/metal](metal.md) and [std/gpu/opengl](opengl.md), cover all of that.
 
 ## Writing a backend
