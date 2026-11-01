@@ -9,17 +9,24 @@ import "std/embedded/power"
 import "std/fmt"
 
 // Hardware checks of the ESP32-C6's low power, std/embedded/chip/esp32c6's
-// Power as `Board.power`: clock gating, light and deep sleep under an
-// alarm, an executor, and a GPIO interrupt, and the dormant state. Nothing
-// needs to be wired to the board.
+// Power as `Board.power`: clock gating (a stopped peripheral stops,
+// essential and claimed clocks are refused, claiming starts clocks again),
+// light sleep (the CPU's clock stops in `wfi`, alarms wake it on time),
+// deep sleep under an alarm, an executor, and a GPIO interrupt (clocks
+// outside the sleep set stop), and the dormant state (a level already
+// present, a timeout, and a pin that changes while the chip sleeps).
+// Nothing needs to be wired to the board: the pin wake comes from a pad's
+// sleep configuration (IO MUX SLP_SEL), a pull-down that takes over once
+// the chip sleeps.
 //
 // Results go to the chip's USB serial port, which
 // `scripts/test_esp32c6.py --project tests/hardware/esp32c6_power
 // --reconnect` reads: after the host sends a byte, `selftest ready`, then
 // `check N ok` or `check N FAILED` per check, and `selftest done N`. The
-// dormant checks run with the port released, as the USB connection does
-// not survive a dormant state; their results follow once the host has
-// sent another byte.
+// dormant checks drop the USB connection, so the program prints `selftest
+// waiting`, the host lets go of the port, the checks run, the port comes
+// back, and after another byte from the host `selftest resumed` and their
+// results follow.
 
 static mut CHECKS: u32 = 0
 static mut SERIAL: Option<chip.UsbSerial> = none
@@ -207,28 +214,16 @@ fn gpio_edge() {
     write(0x6009_104C, 1u32 << PIN_C)
 }
 
-// Progress marks in LP SRAM, which a reset keeps: the next run prints
-// where a hung run stopped.
-const BREADCRUMB: usize = 0x5000_3F00
+// Progress through the dormant checks, in LP SRAM, which a reset keeps:
+// should one hang (the LP watchdog below then resets the chip), the next
+// run prints where it stopped.
+const PROGRESS: usize = 0x5000_3F40
 
-fn crumb(value: u32) {
-    write(BREADCRUMB, 0xC0DE_0000 | value)
-}
-
-// Progress through the dormant checks, which the next boot keeps.
 fn dormant_crumb(value: u32) {
-    write(BREADCRUMB + 0x40, 0xD0D0_0000 | value)
+    write(PROGRESS, 0xD0D0_0000 | value)
 }
-
-// The clocks that ran when the program started, restored at its end: the
-// PCR keeps its gates through the flasher's reset, so stopped clocks would
-// otherwise stay stopped for the next program.
-static mut INITIAL_CLOCKS: u64 = 0
 
 fn clock_checks(b: &mut board.Board) {
-    unsafe {
-        INITIAL_CLOCKS = b.power.enabled_clocks()
-    }
     // Defaults, and validation.
     p := &mut b.power
     enabled := p.enabled_clocks()
@@ -596,26 +591,12 @@ fn woken_bits(result: u64!hal.Error) -> u32 {
     }
 }
 
-fn is_ok(result: u64!hal.Error) -> bool {
-    match result {
-        ok(_) => {
-            return true
-        }
-        err(_) => {
-            return false
-        }
-    }
-}
-
 fn open_serial(b: &mut board.Board) {
-    crumb(0x11)
     serial := b.usb.serial()!
-    crumb(0x12)
     // Wait for the host's byte, so no output is lost before the port is
     // open.
     poke: [1]u8 = [0]
     serial.read(&mut poke)!
-    crumb(0x13)
     for _ in 0..5000 {
         if serial.is_connected() {
             break
@@ -640,45 +621,12 @@ fn close_serial(b: &mut board.Board) {
     }
 }
 
-// board.take(), recording a failure's reason in the breadcrumb.
-fn take_board() -> board.Board {
-    result := board.take()
-    match &result {
-        ok(_) => {}
-        err(error) => {
-            code := 0x1FFu32
-            if *error == hal.Error.Unsupported {
-                code = 0x107
-            } else if *error == hal.Error.Busy {
-                code = 0x105
-            } else if *error == hal.Error.Timeout {
-                code = 0x101
-            }
-            crumb(code)
-        }
-    }
-    return result!
-}
-
 fn main() {
-    // Boot state, for diagnosis: PCR SYSCLK_CONF, CPU_FREQ_CONF, PMU
-    // CLK_STATE0, LP_CLKRST reset cause, LP_AON STORE registers.
-    write(BREADCRUMB + 4, read(0x6009_6110))
-    write(BREADCRUMB + 8, read(0x6009_6118))
-    write(BREADCRUMB + 12, read(0x600B_0194))
-    write(BREADCRUMB + 16, read(0x600B_0410))
-    write(BREADCRUMB + 20, read(0x600B_1010))
-    write(BREADCRUMB + 24, read(0x600B_1014))
-    write(BREADCRUMB + 28, read(0x600B_1000))
-    write(BREADCRUMB + 32, read(0x600B_1004))
-    crumb(0x0F)
-    b := take_board()
-    crumb(0x10)
+    b := board.take()!
     open_serial(&mut b)
     say("selftest ready\n")
-    say_number("previous dormant progress ", read(BREADCRUMB + 0x40))
-    write(BREADCRUMB + 0x40, 0)
-    crumb(1)
+    say_number("previous dormant progress ", read(PROGRESS))
+    write(PROGRESS, 0)
     clock_checks(&mut b)
     sleep_checks(&mut b)
     dormant_validation(&mut b.power)

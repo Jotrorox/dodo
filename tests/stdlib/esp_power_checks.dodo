@@ -1,0 +1,306 @@
+package main
+
+import "std/embedded/chip/esp_power"
+import "std/embedded/hal"
+import "std/embedded/power"
+
+// Host checks for std/embedded/chip/esp_power, the ESP32-C6's low-power
+// parts, against simulated register blocks: the PCR clock gates, the PMU's
+// sleep configuration, request, and its save and restore, GPIO wakeup, the
+// low-power timer, and the planning of a dormant state's pin events.
+
+// A register block of plain memory, 4-byte words at byte offsets.
+struct Memory: hal.Registers {
+    words: [256]u32
+
+    fn new() -> Memory {
+        return Memory { words: [0u32; 256] }
+    }
+
+    pub fn read(&mut self, offset: usize) -> u32 {
+        return self.words[offset / 4]
+    }
+
+    pub fn write(&mut self, offset: usize, value: u32) {
+        self.words[offset / 4] = value
+    }
+
+    fn get(&self, offset: usize) -> u32 {
+        return self.words[offset / 4]
+    }
+}
+
+// The PMU: a sleep request (SLP_WAKEUP_CNTL0 bit 31) raises INT_RAW's
+// woken bit (31), or its rejected bit (30) when a source enabled for
+// rejection (SLP_WAKEUP_CNTL1) is active; INT_CLR clears them. `silent`
+// never answers.
+struct Pmu: hal.Registers {
+    memory: Memory
+    active_sources: u32
+    silent: bool
+    requests: u32
+
+    fn new() -> Pmu {
+        return Pmu { memory: Memory.new(), active_sources: 0, silent: false, requests: 0 }
+    }
+
+    pub fn read(&mut self, offset: usize) -> u32 {
+        return self.memory.read(offset)
+    }
+
+    pub fn write(&mut self, offset: usize, value: u32) {
+        if offset == 0x120 && (value & (1u32 << 31)) != 0 {
+            self.requests += 1
+            if !self.silent {
+                rejecting := self.memory.read(0x124) & 0x7FFF_FFFF & self.active_sources
+                raw := self.memory.read(0x15C)
+                if rejecting != 0 {
+                    self.memory.write(0x15C, raw | (1u32 << 30))
+                } else {
+                    self.memory.write(0x15C, raw | (1u32 << 31))
+                }
+            }
+            return
+        }
+        if offset == 0x168 {
+            raw := self.memory.read(0x15C)
+            self.memory.write(0x15C, raw & ~value)
+            return
+        }
+        self.memory.write(offset, value)
+    }
+}
+
+fn gate_checks() {
+    pcr := Memory.new()
+    // Every gate: bus enables at bit 0, function enables at bit 22, and
+    // the odd ones.
+    esp_power.start_clocks(&mut pcr, 0x1FF_FFFF_FFFF_FFFF)
+    // UART0's bus and function gates.
+    core.assert(pcr.get(0x000) == 1 && pcr.get(0x004) == (1u32 << 22))
+    // MSPI's two enables are one gate.
+    core.assert(pcr.get(0x018) == 0x5)
+    // SARADC's bus enable is bit 2.
+    core.assert(pcr.get(0x080) == (1u32 << 2) && pcr.get(0x084) == (1u32 << 22))
+    // PARLIO's receiver and transmitter.
+    core.assert(pcr.get(0x0A8) == (1u32 << 18) && pcr.get(0x0AC) == (1u32 << 18))
+    // The PVT monitors.
+    core.assert(pcr.get(0x0B4) == 0x1D)
+    // The last gate, and registers that are none.
+    core.assert(pcr.get(0x108) == 1 && pcr.get(0x074) == 0 && pcr.get(0x0F4) == 0)
+    // 57 gates, all running.
+    core.assert(esp_power.enabled_clocks(&mut pcr, 0xFFFF_FFFF_FFFF_FFFF) == 0x1FF_FFFF_FFFF_FFFF)
+
+    // Stopping keeps the other fields; a gate runs only with all its bits.
+    pcr.write(0x004, (1u32 << 22) | (3u32 << 20) | 0x5000)
+    esp_power.stop_clocks(&mut pcr, (1u64 << 1) | (1u64 << 4))
+    // Stopping clears only the gate's bits.
+    core.assert(pcr.get(0x004) == ((3u32 << 20) | 0x5000) && pcr.get(0x018) == 0)
+    pcr.write(0x018, 0x1)
+    running := esp_power.enabled_clocks(&mut pcr, 0x1F)
+    // A gate with part of its bits counts as stopped.
+    core.assert(running == ((1u64 << 0) | (1u64 << 2) | (1u64 << 3)))
+    esp_power.start_clocks(&mut pcr, 1u64 << 1)
+    // Starting sets only the gate's bits.
+    core.assert(pcr.get(0x004) == ((1u32 << 22) | (3u32 << 20) | 0x5000))
+    // Only the asked gates are reported.
+    core.assert(esp_power.enabled_clocks(&mut pcr, 1u64 << 18) == (1u64 << 18))
+}
+
+fn wake_checks() {
+    wake := power.Wake.new()
+    wake.on(3, power.LEVEL_LOW)
+    wake.on(5, power.FALLING_EDGE)
+    wake.on(7, power.RISING_EDGE | power.FALLING_EDGE)
+    wake.on(9, power.LEVEL_HIGH)
+    // Pin 3 low and pin 9 high are present at once; edges never are.
+    levels := (1u32 << 5) | (1u32 << 7)
+    // A low level present now.
+    core.assert(esp_power.levels_present(&wake, levels) == (1u32 << 3))
+    // A high level present now.
+    core.assert(esp_power.levels_present(&wake, levels | (1u32 << 3) | (1u32 << 9)) == (1u32 << 9))
+    // Pin 5 fell, pin 7 fell: both events; pin 9 rose: its level.
+    before := (1u32 << 3) | (1u32 << 5) | (1u32 << 7)
+    changed := (1u32 << 5) | (1u32 << 7) | (1u32 << 9)
+    // Edges and levels after a change.
+    core.assert(esp_power.events_seen(&wake, before, changed, 0) == changed)
+    // Pin 5 rose instead (it was low): only the first half of its edge.
+    // A falling edge's rise is not the event.
+    core.assert(esp_power.events_seen(&wake, 0, 1u32 << 5, 0) == 0)
+    // A pulse, back where it started, crossed both edges.
+    // A pulse crosses the falling edge.
+    core.assert(esp_power.events_seen(&wake, 0, 0, 1u32 << 5) == (1u32 << 5))
+    // A pulse to low shows the low level.
+    core.assert(esp_power.events_seen(&wake, 1u32 << 3, 0, 1u32 << 3) == (1u32 << 3))
+    // A pulse to high shows the high level.
+    core.assert(esp_power.events_seen(&wake, 0, 0, 1u32 << 9) == (1u32 << 9))
+
+    // Arming: each pin waits for the opposite of its level, with its
+    // wakeup and interrupt enables; disarming restores the registers.
+    gpio := Memory.new()
+    gpio.write(0x74 + 4 * 5, 0x4)
+    gpio.write(0x74 + 4 * 3, 0x0)
+    gpio.write(0x44, 0xFFFF_FFFF)
+    saved: [31]u32 = [0u32; 31]
+    pins := (1u32 << 3) | (1u32 << 5)
+    esp_power.arm_pins(&mut gpio, pins, 1u32 << 5, &mut saved)
+    // A high pin waits for low.
+    core.assert(gpio.get(0x74 + 4 * 5) == (0x4 | (4u32 << 7) | (1u32 << 10) | (1u32 << 13)))
+    // A low pin waits for high.
+    core.assert(gpio.get(0x74 + 4 * 3) == ((5u32 << 7) | (1u32 << 10) | (1u32 << 13)))
+    // Arming clears the pins' latched conditions.
+    core.assert(gpio.get(0x4C) == pins)
+    gpio.write(0x44, (1u32 << 5) | (1u32 << 20))
+    // Latched conditions of the armed pins.
+    core.assert(esp_power.latched_pins(&mut gpio, pins) == (1u32 << 5))
+    esp_power.disarm_pins(&mut gpio, pins, &saved)
+    // Disarming restores PINn.
+    core.assert(gpio.get(0x74 + 4 * 5) == 0x4 && gpio.get(0x74 + 4 * 3) == 0)
+}
+
+fn sleep_checks() {
+    pmu := Pmu.new()
+    // HP_SLEEP_DIG_POWER's reset value: flash and radio domain powered down.
+    pmu.write(0x068, 0x0820_0000)
+    pmu.write(0x134, 0x0100_0080)
+    pmu.write(0x194, 1)
+    saved: [24]u32 = [0u32; 24]
+    esp_power.save_sleep_state(&mut pmu, &mut saved)
+    esp_power.configure_sleep(&mut pmu)
+    // The flash stays powered while asleep.
+    core.assert(pmu.read(0x068) == 0x0800_0000)
+    // Crystal and RC_FAST stop.
+    core.assert(pmu.read(0x098) == 0 && pmu.read(0x0BC) == 0 && pmu.read(0x0C4) == 0)
+    // The PLL stops.
+    core.assert((pmu.read(0x07C) & (1u32 << 30)) == 0)
+    // Every HP clock is gated.
+    core.assert(pmu.read(0x06C) == 0 && pmu.read(0x070) == 0)
+    // The active state runs the PLL, crystal, and system clock.
+    core.assert((pmu.read(0x014) & (1u32 << 30)) != 0 && (pmu.read(0x024) & (1u32 << 27)) != 0 && (pmu.read(0x030) & (1u32 << 31)) != 0)
+    // The LP analog wait keeps the modem field.
+    core.assert(pmu.read(0x134) == 0x2000_0080)
+
+    // A request that the chip takes; one that a source rejects; a PMU that
+    // never answers.
+    slept := unsafe {
+        esp_power.sleep(&mut pmu, esp_power.WAKE_GPIO, esp_power.WAKE_GPIO)
+    }
+    // A sleep with its wake and reject sources.
+    core.assert(is_true(slept) && pmu.read(0x128) == esp_power.WAKE_GPIO && pmu.read(0x124) == ((1u32 << 31) | esp_power.WAKE_GPIO))
+    // The result is cleared.
+    core.assert(pmu.read(0x15C) == 0)
+    pmu.active_sources = esp_power.WAKE_GPIO
+    rejected := unsafe {
+        esp_power.sleep(&mut pmu, esp_power.WAKE_GPIO | esp_power.WAKE_LP_TIMER, esp_power.WAKE_GPIO)
+    }
+    // An active source rejects the sleep.
+    core.assert(is_false(rejected))
+    // The PLL is stable.
+    core.assert(is_ok_void(esp_power.wait_for_pll(&mut pmu)))
+
+    esp_power.restore_sleep_state(&mut pmu, &saved)
+    // Restoring leaves the PMU as it was.
+    core.assert(pmu.read(0x068) == 0x0820_0000 && pmu.read(0x134) == 0x0100_0080 && pmu.read(0x014) == 0 && pmu.read(0x124) == 0 && pmu.read(0x128) == 0)
+
+    pmu.silent = true
+    unanswered := unsafe {
+        esp_power.sleep(&mut pmu, esp_power.WAKE_GPIO, 0)
+    }
+    // A PMU that never answers times out.
+    core.assert(is_timeout(unanswered))
+    pmu.write(0x194, 0)
+    // A PLL that never settles times out.
+    core.assert(!is_ok_void(esp_power.wait_for_pll(&mut pmu)))
+
+    // The active state as start-up code leaves it.
+    fresh := Pmu.new()
+    fresh.write(0x154, 0x0800_0000)
+    esp_power.init_active_state(&mut fresh)
+    // HP clocks ungated, radio domain code ACTIVE.
+    core.assert(fresh.read(0x004) == 0xFFFF_FFFF && fresh.read(0x008) == 0xFFFF_FFFF && fresh.read(0x00C) == (2u32 << 30))
+    // The analog bus out of reset, gating applied.
+    core.assert(fresh.read(0x154) == 0x0C00_0000 && fresh.read(0x0DC) == (1u32 << 31) && fresh.read(0x0D0) == (1u32 << 28))
+
+    // The LP fast clock moves to RC_FAST and back.
+    clocks := Memory.new()
+    clocks.write(0, 0x7)
+    previous := esp_power.use_rc_fast(&mut clocks)
+    // RC_FAST for the LP fast clock.
+    core.assert(clocks.get(0) == 0x3 && previous == 0x7)
+    esp_power.restore_lp_fast_clock(&mut clocks, previous)
+    // The LP fast clock restored.
+    core.assert(clocks.get(0) == 0x7)
+}
+
+fn timer_checks() {
+    timer := Memory.new()
+    timer.write(0x14, 0x1234_5678)
+    timer.write(0x18, 0xFFFF_0042)
+    // 48 bits of count.
+    core.assert(esp_power.lp_ticks(&mut timer) == 0x42_1234_5678)
+    // The count is latched first.
+    core.assert(timer.get(0x10) == (1u32 << 28))
+    timer.write(0x00, 0x1111)
+    timer.write(0x04, (1u32 << 31) | 0x22)
+    saved := esp_power.save_lp_alarm(&mut timer)
+    esp_power.arm_lp_alarm(&mut timer, 0x9_8765_4321)
+    // Target 0 armed.
+    core.assert(timer.get(0x00) == 0x8765_4321 && timer.get(0x04) == ((1u32 << 31) | 0x9) && timer.get(0x34) == (1u32 << 31))
+    esp_power.disarm_lp_alarm(&mut timer)
+    // Target 0 disarmed.
+    core.assert(timer.get(0x04) == 0)
+    esp_power.restore_lp_alarm(&mut timer, saved)
+    // Another user's target restored.
+    core.assert(timer.get(0x00) == 0x1111 && timer.get(0x04) == ((1u32 << 31) | 0x22))
+}
+
+fn is_true(result: bool!hal.Error) -> bool {
+    match result {
+        ok(value) => {
+            return value
+        }
+        err(_) => {
+            return false
+        }
+    }
+}
+
+fn is_false(result: bool!hal.Error) -> bool {
+    match result {
+        ok(value) => {
+            return !value
+        }
+        err(_) => {
+            return false
+        }
+    }
+}
+
+fn is_timeout(result: bool!hal.Error) -> bool {
+    match result {
+        ok(_) => {
+            return false
+        }
+        err(error) => {
+            return error == hal.Error.Timeout
+        }
+    }
+}
+
+fn is_ok_void(result: void!hal.Error) -> bool {
+    match result {
+        ok() => {
+            return true
+        }
+        err(_) => {
+            return false
+        }
+    }
+}
+
+fn main() {
+    gate_checks()
+    wake_checks()
+    sleep_checks()
+    timer_checks()
+}

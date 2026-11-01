@@ -278,7 +278,7 @@ pub fn configure_sleep<R: hal.Registers>(pmu: &mut R) {
 // not reset outlives the program.
 const SAVED: [24]usize = [HP_ACTIVE_HP_CK_POWER, HP_ACTIVE_BIAS, HP_ACTIVE_SYSCLK, HP_ACTIVE_XTAL, HP_SLEEP_DIG_POWER, HP_SLEEP_ICG_HP_FUNC, HP_SLEEP_ICG_HP_APB, HP_SLEEP_HP_SYS_CNTL, HP_SLEEP_HP_CK_POWER, HP_SLEEP_BIAS, HP_SLEEP_SYSCLK, HP_SLEEP_HP_REGULATOR0, HP_SLEEP_HP_REGULATOR1, HP_SLEEP_XTAL, LP_SLEEP_LP_REGULATOR0, LP_SLEEP_XTAL, LP_SLEEP_LP_DIG_POWER, LP_SLEEP_LP_CK_POWER, LP_SLEEP_BIAS, SLP_WAKEUP_CNTL1, SLP_WAKEUP_CNTL2, SLP_WAKEUP_CNTL3, SLP_WAKEUP_CNTL5, SLP_WAKEUP_CNTL7]
 
-pub fn save_sleep_state<R: hal.Registers>(pmu: &mut R, saved: &mut [24]u32) {
+pub fn save_sleep_state<R: hal.Registers>(pmu: &mut R, saved: &mut[24]u32) {
     for index in 0usize..24 {
         saved[index] = pmu.read(SAVED[index])
     }
@@ -419,7 +419,7 @@ pub fn events_seen(wake: &power.Wake, before: u32, changed: u32, pulsed: u32) ->
 // Let each of `pins` wake a light sleep when it leaves its level in
 // `levels`: every event a dormant state waits for begins with that change.
 // Saves the pins' PINn registers in `saved` for `disarm_pins`.
-pub fn arm_pins<R: hal.Registers>(gpio: &mut R, pins: u32, levels: u32, saved: &mut [31]u32) {
+pub fn arm_pins<R: hal.Registers>(gpio: &mut R, pins: u32, levels: u32, saved: &mut[31]u32) {
     for pin in 0u32..PIN_LIMIT {
         bit := 1u32 << pin
         if (pins & bit) != 0 {

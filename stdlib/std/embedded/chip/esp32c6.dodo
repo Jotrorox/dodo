@@ -3092,7 +3092,7 @@ extern "C" fn dodo_wait_for_interrupt() {
 //
 // Sleep. Every wait (`wfi`) stops the CPU's clock until an interrupt is
 // pending (PCR CPU_WAITI_CONF), so a light sleep saves power and still
-// wakes within a microsecond.
+// wakes within a few microseconds.
 //
 // Deep sleep. The ESP32-C6 has no per-peripheral sleep enables and its
 // core no deep-sleep state, and the PMU's own sleep, which does gate
@@ -3112,8 +3112,11 @@ extern "C" fn dodo_wait_for_interrupt() {
 // `disable_unused_clocks` is safe at any time; it stops the peripherals
 // listed in MANAGED_CLOCKS that nothing has claimed, including those the
 // package has no driver for. A timer alarm's claim keeps CLOCK_SYSTIMER
-// running; without one, stopping it also stops Timer.now_us and its
-// delays.
+// running; without one it can be stopped, and Timer.now_us, delays, and
+// alarms then wait for it until it starts again. The PCR keeps its gates
+// through the resets of `dodo run`: the package's own claims start every
+// clock they need, but a program that drives a peripheral directly should
+// call `enable_clocks` first.
 //
 // Dormant. `dormant` asks the PMU for a light sleep: the CPU stalls with
 // its state, SRAM, and every register kept, every HP clock stops, and the
@@ -3124,11 +3127,23 @@ extern "C" fn dodo_wait_for_interrupt() {
 // (an edge takes two sleeps when the pin starts at the edge's end level).
 // GPIO 0 to 23 apart from the USB pins can wake it. The system timer
 // pauses meanwhile, so `now_us` does not count the time spent dormant; the
-// low-power timer keeps counting its 136 kHz RC oscillator. It returns
-// Busy while the USB serial port is open and a host has it open, as the
-// USB connection does not survive the stopped PLL (the host sees the
-// device stop answering); release the port first. Serial ports must have
-// sent their last bytes, and peripherals' clocks from the PLL stop too.
+// low-power timer keeps counting its 136 kHz RC oscillator. The USB
+// connection does not survive the stopped PLL: the host sees the device
+// stop answering and gives up on it. So `dormant` returns Busy while the
+// USB serial port is open and a host has it open; release the port first.
+// After a sleep it detaches the USB device for 100 ms (D+ released) so the
+// host enumerates it again: a program on the host has to open the port
+// anew. Serial ports must have sent their last bytes, and peripherals'
+// clocks from the PLL stop too. Wakes take about 2 ms (the crystal
+// restarts) plus the 100 ms detach.
+//
+// The PMU's registers are in the always-on domain, which the resets of
+// `dodo run` keep, so what one program leaves there, the next finds.
+// `dormant` restores every PMU, LP clock, and LP timer register it
+// changes, and take() puts the PMU's HP_ACTIVE state, the analog bus's
+// power (RF_PWC), and the radio domain's clock gating where ESP-IDF's
+// start-up code puts them (see esp_power.init_active_state), so whatever
+// ran before, the ADC and a dormant state work.
 pub struct Power: power.Power {
     // The dormant timeout, 0 for none, and the low-power timer's measured
     // rate.
@@ -3262,7 +3277,10 @@ pub struct Power: power.Power {
     // that woke the chip, none if the time ran out first. The timer counts
     // the RC_SLOW oscillator, whose rate the first timed dormant state
     // measures against the system timer for 10 ms; the time is then
-    // accurate to about 1 %.
+    // accurate to about 1 %. It uses the timer's target 0 (LP_TIMER TAR0),
+    // the only one the PMU wakes on, and puts back what another user, such
+    // as an RTC alarm, had there; an alarm that falls due during the
+    // dormant state does not end it.
     pub fn set_dormant_timeout_us(&mut self, microseconds: u64) {
         self.timeout_us = microseconds
     }
