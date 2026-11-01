@@ -13,7 +13,7 @@ top.
 | `std/image/color` | `ColorInfo` (CICP code points + gamma, chromaticities, ICC location), `Orientation`, integer sRGB curves. |
 | `std/image/convert` | Layout conversion (integer-only for integer targets), premultiply, sRGB/linear. |
 | `std/image/sink` | `Sink` interface (`ViewSink`, `CanvasSink`, `NullSink`) and `Source` interface (`ViewSource`, `CanvasSource`) for encoders. |
-| `std/image/meta` | `Metadata` of zero-copy `Item` ranges (EXIF, XMP, ICC), EXIF orientation, zlib and Brotli payloads. |
+| `std/image/meta` | `Metadata` of zero-copy `Item` ranges (EXIF, XMP, ICC), EXIF orientation, zlib and Brotli payloads (`decode`, or `decode_with_scratch` with `scratch_size` bytes for any Brotli stream). |
 | `std/image/shared/binary` | Bounds-checked big/little-endian fields. |
 | `std/image/shared/scratch` | Typed views (`u32s`, `f32s`, ...) of one byte scratch buffer. |
 | `std/image/shared/isobmff` | ISO base media file format box iteration (JPEG XL container, AVIF). |

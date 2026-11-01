@@ -4,7 +4,7 @@ package brotli_test
 // name, the expected outcome (0: decodes, else 1 + the position of the
 // brotli.Error it fails with), the decompressed length and its CRC-32.
 
-const CASE_COUNT: usize = 50
+const CASE_COUNT: usize = 52
 
 static CASE_FILES: [CASE_COUNT]&str = [
     "empty_q0",
@@ -56,8 +56,10 @@ static CASE_FILES: [CASE_COUNT]&str = [
     "crafted_padding",
     "crafted_raw_padding",
     "crafted_nibble",
-    "crafted_truncated"
+    "crafted_truncated",
+    "crafted_wide",
+    "crafted_wide_split"
 ]
-static CASE_OUTCOME: [CASE_COUNT]u8 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 6, 2, 2, 2, 1]
-static CASE_LENGTH: [CASE_COUNT]usize = [0, 0, 0, 1, 2000, 2000, 2000, 23969, 23969, 23969, 23969, 23969, 23969, 23969, 23969, 23969, 23969, 23969, 23969, 47911, 47911, 47911, 47911, 47911, 47911, 47911, 47911, 32000, 32000, 32000, 32000, 32000, 32000, 32000, 32000, 8000, 8000, 8000, 120000, 120000, 120000, 1048576, 2097152, 17825792, 17, 0, 0, 0, 0, 0]
-static CASE_CRC: [CASE_COUNT]u32 = [0x00000000, 0x00000000, 0x00000000, 0xe8b7be43, 0x63d10f4a, 0x63d10f4a, 0x81ec45a1, 0x39ab8004, 0x39ab8004, 0x39ab8004, 0x39ab8004, 0x39ab8004, 0x39ab8004, 0x39ab8004, 0x39ab8004, 0x39ab8004, 0x39ab8004, 0x39ab8004, 0x39ab8004, 0xc742d403, 0xc742d403, 0xc742d403, 0xc742d403, 0xc742d403, 0xc742d403, 0xc742d403, 0xc742d403, 0xeff4b736, 0xeff4b736, 0xeff4b736, 0xeff4b736, 0xeff4b736, 0xeff4b736, 0xeff4b736, 0xeff4b736, 0x3a109337, 0x3a109337, 0x3a109337, 0xbf161f94, 0xbf161f94, 0xbf161f94, 0xa738ea1c, 0x9fa429fa, 0xf9f6dafc, 0x0c611827, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000]
+static CASE_OUTCOME: [CASE_COUNT]u8 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 6, 2, 2, 2, 1, 0, 0]
+static CASE_LENGTH: [CASE_COUNT]usize = [0, 0, 0, 1, 2000, 2000, 2000, 23969, 23969, 23969, 23969, 23969, 23969, 23969, 23969, 23969, 23969, 23969, 23969, 47911, 47911, 47911, 47911, 47911, 47911, 47911, 47911, 32000, 32000, 32000, 32000, 32000, 32000, 32000, 32000, 8000, 8000, 8000, 120000, 120000, 120000, 1048576, 2097152, 17825792, 17, 0, 0, 0, 0, 0, 300, 300]
+static CASE_CRC: [CASE_COUNT]u32 = [0x00000000, 0x00000000, 0x00000000, 0xe8b7be43, 0x63d10f4a, 0x63d10f4a, 0x81ec45a1, 0x39ab8004, 0x39ab8004, 0x39ab8004, 0x39ab8004, 0x39ab8004, 0x39ab8004, 0x39ab8004, 0x39ab8004, 0x39ab8004, 0x39ab8004, 0x39ab8004, 0x39ab8004, 0xc742d403, 0xc742d403, 0xc742d403, 0xc742d403, 0xc742d403, 0xc742d403, 0xc742d403, 0xc742d403, 0xeff4b736, 0xeff4b736, 0xeff4b736, 0xeff4b736, 0xeff4b736, 0xeff4b736, 0xeff4b736, 0xeff4b736, 0x3a109337, 0x3a109337, 0x3a109337, 0xbf161f94, 0xbf161f94, 0xbf161f94, 0xa738ea1c, 0x9fa429fa, 0xf9f6dafc, 0x0c611827, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x42b3b242, 0x42b3b242]

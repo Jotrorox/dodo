@@ -13,11 +13,18 @@ package brotli
 // the output buffer and uses it as the window; Decoder keeps a ring buffer of
 // at least window_len(input) bytes and hands out the data in pieces. Prefix
 // code tables, context maps and the other per-meta-block state live in a
-// `u16` workspace: a meta-block needs a few thousand words for typical
-// streams and at most WORKSPACE_LEN words for any valid one. decompress()
-// keeps STACK_WORKSPACE_LEN words (256 KiB) on the stack; streams that need
-// more fail with WorkspaceTooSmall, and decompress_with_workspace() or
-// Decoder take a caller workspace of any size instead.
+// `u16` workspace that each meta-block reuses. Its need depends on the
+// prefix codes a meta-block declares: for the reference encoder's streams
+// up to about 5,500 words for inputs of 64 KiB, 8,000 for 128 KiB, 12,000
+// for 300 KiB and 80,000 for several MiB; at most WORKSPACE_LEN words for
+// any valid stream (256 codes of each of the three kinds at their largest
+// table sizes; a table-driven decoder needs at least one word per symbol,
+// over 380,000, for such a stream). workspace_size(input) reads the
+// headers and returns the exact need of almost every stream, so callers can
+// supply just that much; Decoder.workspace_needed() reports it after
+// decoding. decompress() keeps STACK_WORKSPACE_LEN words (16 KiB) on the
+// stack and fails with WorkspaceTooSmall for streams that need more;
+// decompress_with_workspace() and Decoder take a caller workspace.
 //
 // Untrusted input never traps: every length and index is checked. A stream
 // whose transformed dictionary word is empty is rejected (libbrotli rejects
@@ -45,25 +52,39 @@ pub enum Error {
 
 // Workspace words that hold the tables of any valid meta-block: 256
 // literal, 256 insert-and-copy and 256 distance prefix codes at their
-// largest two-level table sizes, the block-switch codes, both context maps
-// and the literal context modes.
-pub const WORKSPACE_LEN: usize = 690956
-// Workspace words decompress() keeps on the stack.
-pub const STACK_WORKSPACE_LEN: usize = 131072
+// largest two-level table sizes (632, 1080 and 920 words for 8-bit roots,
+// the bounds libbrotli derives with zlib's `enough`), three block type and
+// three block count codes (632 and 396 words), both context maps, the
+// literal context modes, two directory words per code and 32 words for the
+// temporary code length table.
+pub const WORKSPACE_LEN: usize = 696108
+// Workspace words decompress() and workspace_size() keep on the stack (16
+// KiB): enough for the streams the reference encoder writes for inputs of
+// up to 128 KiB at any quality.
+pub const STACK_WORKSPACE_LEN: usize = 8192
 // The largest sliding window, for window size 24.
 pub const MAX_WINDOW_LEN: usize = 16777216
+// The largest single prefix code table (a 704-symbol insert-and-copy
+// code); Decoder.workspace_needed() is exact for workspaces of at least
+// this many words.
+pub const MEASURE_LEN: usize = 1080
 
 // Decompresses one stream into output and returns its length. The output
-// buffer is also the window, so no other memory is needed beyond 256 KiB of
-// stack workspace (see STACK_WORKSPACE_LEN). Input after the end of the
-// stream is InvalidData. On error the output contents are unspecified.
+// buffer is also the window, so no other memory is needed beyond 16 KiB of
+// stack workspace (STACK_WORKSPACE_LEN words); a stream whose tables need
+// more fails with WorkspaceTooSmall (see workspace_size and
+// decompress_with_workspace). Input after the end of the stream is
+// InvalidData. On error the output contents are unspecified.
+// Not inlined, so callers do not carry its stack workspace.
+@inline(never)
 pub fn decompress(input: &[u8], output: &mut[u8]) -> usize!Error {
     words := [0u16; STACK_WORKSPACE_LEN]
     return decompress_with_workspace(input, output, &mut words)
 }
 
 // decompress() with a caller-owned workspace, which may live in static
-// storage; WORKSPACE_LEN words decode every valid stream.
+// storage: workspace_size(input) words decode the stream, WORKSPACE_LEN
+// words every valid stream.
 pub fn decompress_with_workspace(input: &[u8], output: &mut[u8], workspace: &mut[u16]) -> usize!Error {
     decoder := Decoder.start(input, output, workspace, true)?
     decoder.step()?
@@ -71,6 +92,22 @@ pub fn decompress_with_workspace(input: &[u8], output: &mut[u8], workspace: &mut
         return err(Error.InvalidData)
     }
     return ok(decoder.produced())
+}
+
+// The workspace words needed to decode this stream, without decoding it:
+// the headers are read and the tables built in STACK_WORKSPACE_LEN words of
+// stack. Exact when the last compressed meta-block is the only one, or the
+// earlier ones each fit in that stack workspace and choose literal trees
+// without context modeling (such as the meta-blocks quality 0 and 1 write);
+// otherwise WORKSPACE_LEN, which always suffices. Errors in the parts read
+// are reported as decoding would.
+// Not inlined, so callers do not carry its stack workspace.
+@inline(never)
+pub fn workspace_size(input: &[u8]) -> usize!Error {
+    window := [0u8; 1]
+    words := [0u16; STACK_WORKSPACE_LEN]
+    decoder := Decoder.start(input, &mut window, &mut words, true)?
+    return decoder.measure_stream()
 }
 
 // The window length a Decoder needs for this stream: the stream's sliding

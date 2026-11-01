@@ -369,6 +369,10 @@ pub struct Decoder {
     word: [40]u8
     word_at: usize
     word_end: usize
+    // Measuring: tables are sized but not kept (see measure_stream).
+    measure: bool
+    // The most workspace words any meta-block header has used so far.
+    needed: usize
 
     // Reads the stream header; fails with Unsupported for large-window
     // streams.
@@ -376,7 +380,7 @@ pub struct Decoder {
         return Decoder.start(input, window, workspace, false)
     }
     fn start(input: &[u8], window: &mut[u8], workspace: &mut[u16], linear: bool) -> Decoder!Error from(input, window, workspace) {
-        d := Decoder { input: input, window: window, ws: workspace, linear: linear, next: 0, acc: 0, nbits: 0, pad: 0, wbits: 16, max_backward: 0, pos: 0, wpos: 0, delivered: 0, p1: 0, p2: 0, rb: [16usize, 15, 11, 4], rb_idx: 4, phase: PHASE_HEADER, failure: 0, last: false, remaining: 0, top: 0, ntypes: [1u32, 1, 1], btype: [0u32, 0, 0], bprev: [1u32, 1, 1], bcount: [0u32, 0, 0], type_tree: [0u32, 0, 0], count_tree: [0u32, 0, 0], npostfix: 0, ndirect: 0, modes_at: 0, lit_map_at: 0, dist_map_at: 0, lit_trees_at: 0, cmd_trees_at: 0, dist_trees_at: 0, lit_slice: 0, mode: 0, cmd_tree: 0, dist_slice: 0, insert_left: 0, copy_len: 0, copy_left: 0, distance: 0, implicit: false, word: [0u8; 40], word_at: 0, word_end: 0 }
+        d := Decoder { input: input, window: window, ws: workspace, linear: linear, next: 0, acc: 0, nbits: 0, pad: 0, wbits: 16, max_backward: 0, pos: 0, wpos: 0, delivered: 0, p1: 0, p2: 0, rb: [16usize, 15, 11, 4], rb_idx: 4, phase: PHASE_HEADER, failure: 0, last: false, remaining: 0, top: 0, ntypes: [1u32, 1, 1], btype: [0u32, 0, 0], bprev: [1u32, 1, 1], bcount: [0u32, 0, 0], type_tree: [0u32, 0, 0], count_tree: [0u32, 0, 0], npostfix: 0, ndirect: 0, modes_at: 0, lit_map_at: 0, dist_map_at: 0, lit_trees_at: 0, cmd_trees_at: 0, dist_trees_at: 0, lit_slice: 0, mode: 0, cmd_tree: 0, dist_slice: 0, insert_left: 0, copy_len: 0, copy_left: 0, distance: 0, implicit: false, word: [0u8; 40], word_at: 0, word_end: 0, measure: false, needed: 0 }
         d.read_window_bits()?
         return ok(d)
     }
@@ -397,6 +401,13 @@ pub struct Decoder {
     // Decompressed bytes produced so far.
     pub fn produced(&self) -> usize {
         return self.pos
+    }
+    // Workspace words the meta-blocks read so far need: the largest of
+    // their table sets, so a workspace of this length decodes them all.
+    // After a WorkspaceTooSmall error it includes the meta-block that did
+    // not fit (exact when the workspace has MEASURE_LEN words or more).
+    pub fn workspace_needed(&self) -> usize {
+        return self.needed
     }
 
     // Copies the next decompressed bytes to output and returns their count;
@@ -583,6 +594,9 @@ pub struct Decoder {
         return (self.ws[directory + 2 * index] as u32) | ((self.ws[directory + 2 * index + 1] as u32) << 16)
     }
     fn set_tree(&mut self, directory: usize, index: usize, tree: u32) {
+        if self.measure {
+            return
+        }
         self.ws[directory + 2 * index] = (tree & 0xffff) as u16
         self.ws[directory + 2 * index + 1] = (tree >> 16) as u16
     }
@@ -699,9 +713,135 @@ pub struct Decoder {
             return ok()
         }
         self.check_input()?
-        self.read_compressed_header()?
+        next := self.next
+        acc := self.acc
+        nbits := self.nbits
+        pad := self.pad
+        match self.read_compressed_header() {
+            ok() => {}
+            err(e) => {
+                if e != Error.WorkspaceTooSmall || self.measure {
+                    return err(e)
+                }
+                // Size the tables that did not fit by reading the header
+                // again without keeping them.
+                self.next = next
+                self.acc = acc
+                self.nbits = nbits
+                self.pad = pad
+                self.measure = true
+                sized := self.read_compressed_header()
+                self.measure = false
+                sized?
+                return err(Error.WorkspaceTooSmall)
+            }
+        }
         self.phase = PHASE_COMMAND
         return ok()
+    }
+
+    // workspace_size(): runs through the stream without producing output,
+    // building each meta-block's tables in the (stack) workspace and noting
+    // their size. Metadata and uncompressed meta-blocks are skipped; the
+    // commands of a compressed meta-block that is not the last are read
+    // only when its literal trees do not depend on earlier bytes (which
+    // would need the window), its tables fit, and the symbol budget (eight
+    // per input byte plus 65536) lasts. Otherwise WORKSPACE_LEN, which is
+    // always enough.
+    fn measure_stream(&mut self) -> usize!Error {
+        budget := 8 * self.input.len + 65536
+        for {
+            phase := self.phase
+            if phase == PHASE_DONE {
+                return ok(self.needed)
+            }
+            if phase == PHASE_RAW {
+                if self.input.len - self.next < self.remaining {
+                    return err(Error.Truncated)
+                }
+                self.next += self.remaining
+                self.pos += self.remaining
+                self.remaining = 0
+                self.end_meta_block()?
+            } else if phase == PHASE_COMMAND {
+                if self.last {
+                    return ok(self.needed)
+                }
+                skipped := self.skip_commands(&mut budget)?
+                if !skipped {
+                    return ok(WORKSPACE_LEN)
+                }
+                self.end_meta_block()?
+            } else {
+                match self.read_header() {
+                    ok() => {}
+                    err(e) => {
+                        if e != Error.WorkspaceTooSmall {
+                            return err(e)
+                        }
+                        if self.last {
+                            return ok(self.needed)
+                        }
+                        return ok(WORKSPACE_LEN)
+                    }
+                }
+            }
+        }
+    }
+
+    // Reads a compressed meta-block's commands, counting the bytes they
+    // produce, for measure_stream(). False when a block type's literal
+    // context map row names more than one tree or the budget runs out.
+    fn skip_commands(&mut self, budget: &mut usize) -> bool!Error {
+        literal_types := self.ntypes[0] as usize
+        for t in 0usize..literal_types {
+            row := self.lit_map_at + 64 * t
+            first := self.ws[row]
+            for j in 1usize..64 {
+                if self.ws[row + j] != first {
+                    return ok(false)
+                }
+            }
+        }
+        for self.remaining > 0 {
+            if *budget == 0 {
+                return ok(false)
+            }
+            *budget -= 1
+            self.read_command()?
+            for self.insert_left > 0 {
+                if self.bcount[0] == 0 {
+                    self.block_switch(0)?
+                }
+                index := self.ws[self.lit_slice] as usize
+                tree := self.tree_at(self.lit_trees_at, index)
+                n := min(self.insert_left, self.bcount[0] as usize)
+                // A one-symbol tree reads no bits.
+                if (tree >> 28) != 0 {
+                    if *budget < n {
+                        return ok(false)
+                    }
+                    *budget -= n
+                    for k in 0usize..n {
+                        self.symbol(tree)
+                    }
+                }
+                self.bcount[0] -= n as u32
+                self.pos += n
+                self.insert_left -= n
+                self.check_input()?
+            }
+            if self.remaining == 0 {
+                break
+            }
+            self.read_distance()?
+            if self.phase == PHASE_COPY {
+                self.pos += self.copy_len
+            } else {
+                self.pos += self.word_end
+            }
+        }
+        return ok(true)
     }
 
     fn end_meta_block(&mut self) -> void!Error {
@@ -718,13 +858,21 @@ pub struct Decoder {
         return ok()
     }
 
+    // Reserves n words at the top of the workspace. When measuring only the
+    // count is kept and nothing may be written there.
     fn alloc(&mut self, n: usize) -> usize!Error {
-        if n > self.ws.len || self.top > self.ws.len - n {
+        if !self.measure && (n > self.ws.len || self.top > self.ws.len - n) {
             return err(Error.WorkspaceTooSmall)
         }
         at := self.top
         self.top += n
+        self.note_top()
         return ok(at)
+    }
+    fn note_top(&mut self) {
+        if self.top > self.needed {
+            self.needed = self.top
+        }
     }
 
     fn read_compressed_header(&mut self) -> void!Error {
@@ -753,7 +901,9 @@ pub struct Decoder {
         self.modes_at = modes_at
         for i in 0usize..literal_types {
             m := self.bits(2)
-            self.ws[modes_at + i] = m as u16
+            if !self.measure {
+                self.ws[modes_at + i] = m as u16
+            }
         }
         literal_trees := (self.read_var_u8() + 1) as usize
         lit_map_at := self.alloc(64 * literal_types)?
@@ -785,6 +935,9 @@ pub struct Decoder {
             self.set_tree(dist_trees_at, i, t)
         }
         self.check_input()?
+        if self.measure {
+            return ok()
+        }
         self.prepare_literal()
         command_tree := self.tree_at(cmd_trees_at, 0)
         self.cmd_tree = command_tree
@@ -926,16 +1079,30 @@ pub struct Decoder {
         return self.build(&lengths, alphabet)
     }
 
+    // Builds a table at the top of the workspace. When measuring, every
+    // table is built at the start of the workspace instead (the header
+    // reads count, code length and context map codes, and needs nothing
+    // else) while `top` advances by its size.
     fn build(&mut self, lengths: &[u8], alphabet: usize) -> u32!Error {
-        at := self.top
         end := 0usize
+        if self.measure {
+            tree := build_table(self.ws, 0, lengths, alphabet, &mut end)?
+            self.top += end
+            self.note_top()
+            return ok(tree)
+        }
+        at := self.top
         tree := build_table(self.ws, at, lengths, alphabet, &mut end)?
         self.top = end
+        self.note_top()
         return ok(tree)
     }
 
     fn read_context_map(&mut self, at: usize, size: usize, trees: usize) -> void!Error {
         if trees < 2 {
+            if self.measure {
+                return ok()
+            }
             for i in 0usize..size {
                 self.ws[at + i] = 0
             }
@@ -954,10 +1121,14 @@ pub struct Decoder {
             }
             code := self.symbol(tree)
             if code == 0 {
-                self.ws[at + i] = 0
+                if !self.measure {
+                    self.ws[at + i] = 0
+                }
                 i += 1
             } else if code > rle {
-                self.ws[at + i] = (code - rle) as u16
+                if !self.measure {
+                    self.ws[at + i] = (code - rle) as u16
+                }
                 i += 1
             } else {
                 extra := self.bits(code)
@@ -965,13 +1136,15 @@ pub struct Decoder {
                 if reps > size - i {
                     return err(Error.InvalidData)
                 }
-                for k in 0usize..reps {
-                    self.ws[at + i + k] = 0
+                if !self.measure {
+                    for k in 0usize..reps {
+                        self.ws[at + i + k] = 0
+                    }
                 }
                 i += reps
             }
         }
-        if self.bits(1) == 1 {
+        if self.bits(1) == 1 && !self.measure {
             mtf := [0u8; 256]
             for k in 0usize..256 {
                 mtf[k] = k as u8

@@ -123,15 +123,28 @@ fn fixtures_decompress() {
     }
 }
 
+// decompress() with its stack workspace decodes every fixture whose tables
+// fit in STACK_WORKSPACE_LEN words and fails cleanly for the others.
 fn stack_one_shot(input: &mut[u8], output: &mut[u8]) {
     for i in 0usize..CASE_COUNT {
         if CASE_OUTCOME[i] != 0 {
             continue
         }
         size := read_fixture(CASE_FILES[i], input)
-        n := brotli.decompress(&input[..size], output)!
-        assert(n == CASE_LENGTH[i] && checksum.crc32(&output[..n]) == CASE_CRC[i], CASE_FILES[i])
+        data := &input[..size]
+        fits := brotli.workspace_size(data)! <= brotli.STACK_WORKSPACE_LEN
+        match brotli.decompress(data, output) {
+            ok(n) => {
+                assert(fits, CASE_FILES[i])
+                assert(n == CASE_LENGTH[i] && checksum.crc32(&output[..n]) == CASE_CRC[i], CASE_FILES[i])
+            }
+            err(e) => {
+                assert(!fits && outcome(e) == 5, CASE_FILES[i])
+            }
+        }
     }
+    size := read_fixture("crafted_wide", input)
+    assert(brotli.workspace_size(&input[..size])! > brotli.STACK_WORKSPACE_LEN)
 }
 
 @test
@@ -266,11 +279,26 @@ fn limits_and_trailing_data() {
 }
 
 fn truncated(input: &mut[u8], output: &mut[u8], window: &mut[u8], words: &mut[u16]) {
-    names := ["short_q5", "short_q11", "short_binary_q9", "crafted_meta", "byte_q11", "random_q11"]
+    names := ["short_q5", "short_q11", "short_binary_q9", "crafted_meta", "byte_q11", "random_q11", "text_q0"]
     for k in 0usize..names.len {
         size := read_fixture(names[k], input)
-        for cut in 0usize..size {
+        // Every prefix of the short streams; text_q0 (several meta-blocks
+        // that workspace_size() reads through) at a stride.
+        stride := 1 + size / 2048
+        next := 0usize
+        for next < size {
+            cut := next
+            next += stride
             prefix := &input[..cut]
+            match brotli.workspace_size(prefix) {
+                ok(need) => {
+                    assert(need <= brotli.WORKSPACE_LEN)
+                }
+                err(e) => {
+                    code := outcome(e)
+                    assert(code == 1 || code == 2, names[k])
+                }
+            }
             match brotli.decompress_with_workspace(prefix, &mut output[..65536], words) {
                 ok(_) => {
                     assert(false, "truncated stream accepted")
@@ -338,8 +366,20 @@ fn corrupted(input: &mut[u8], output: &mut[u8], window: &mut[u8], words: &mut[u1
                 match brotli.decompress_with_workspace(&copy[..size], &mut output[..131072], words) {
                     ok(n) => {
                         assert(n <= 131072)
+                        // A stream that decodes does so in exactly the
+                        // workspace workspace_size() names.
+                        need := brotli.workspace_size(&copy[..size])!
+                        again := brotli.decompress_with_workspace(&copy[..size], &mut output[..131072], &mut words[..need])!
+                        assert(again == n)
                     }
-                    err(_) => {}
+                    err(_) => {
+                        match brotli.workspace_size(&copy[..size]) {
+                            ok(need) => {
+                                assert(need <= brotli.WORKSPACE_LEN)
+                            }
+                            err(_) => {}
+                        }
+                    }
                 }
             } else {
                 match brotli.Decoder.new(&copy[..size], &mut window[..4096], words) {
@@ -376,6 +416,12 @@ fn corrupted(input: &mut[u8], output: &mut[u8], window: &mut[u8], words: &mut[u1
             }
             err(_) => {}
         }
+        match brotli.workspace_size(&copy[..length]) {
+            ok(need) => {
+                assert(need <= brotli.WORKSPACE_LEN)
+            }
+            err(_) => {}
+        }
     }
 }
 
@@ -383,5 +429,103 @@ fn corrupted(input: &mut[u8], output: &mut[u8], window: &mut[u8], words: &mut[u1
 fn corrupted_streams_fail_cleanly() {
     unsafe {
         corrupted(&mut INPUT, &mut OUTPUT, &mut WINDOW, &mut WORDS)
+    }
+}
+
+// workspace_size() is exact for streams with a single compressed
+// meta-block, and Decoder.workspace_needed() after decoding is the exact
+// workspace length: one word less fails with WorkspaceTooSmall.
+fn workspace_sizes(input: &mut[u8], output: &mut[u8], window: &mut[u8], words: &mut[u16]) {
+    for i in 0usize..CASE_COUNT {
+        if CASE_OUTCOME[i] != 0 {
+            continue
+        }
+        size := read_fixture(CASE_FILES[i], input)
+        data := &input[..size]
+        estimate := brotli.workspace_size(data)!
+        ring := brotli.window_len(data)!
+        decoder := brotli.Decoder.new(data, &mut window[..ring], words)!
+        decoder.read(&mut output[..CASE_LENGTH[i] + 1])!
+        assert(decoder.is_done(), CASE_FILES[i])
+        needed := decoder.workspace_needed()
+        assert(estimate >= needed, CASE_FILES[i])
+        if estimate < brotli.WORKSPACE_LEN {
+            assert(estimate == needed, CASE_FILES[i])
+        }
+        n := brotli.decompress_with_workspace(data, output, &mut words[..needed])!
+        assert(n == CASE_LENGTH[i], CASE_FILES[i])
+        if needed > 0 {
+            match brotli.decompress_with_workspace(data, output, &mut words[..needed - 1]) {
+                ok(_) => {
+                    assert(false, "workspace one word short accepted")
+                }
+                err(e) => {
+                    assert(outcome(e) == 5, CASE_FILES[i])
+                }
+            }
+        }
+    }
+}
+
+// The hand-written wide streams need more than the 128K words (256 KiB)
+// decompress() once kept on the stack. A Decoder whose workspace is too
+// small reports the exact need of the meta-block that did not fit.
+fn wide_streams(input: &mut[u8], output: &mut[u8], window: &mut[u8], words: &mut[u16]) {
+    size := read_fixture("crafted_wide", input)
+    data := &input[..size]
+    needed := brotli.workspace_size(data)!
+    assert(needed > 131072 && needed < brotli.WORKSPACE_LEN)
+    small := brotli.Decoder.new(data, &mut window[..65536], &mut words[..brotli.MEASURE_LEN])!
+    match small.read(&mut output[..65536]) {
+        ok(_) => {
+            assert(false, "wide stream decoded in a small workspace")
+        }
+        err(e) => {
+            assert(outcome(e) == 5)
+        }
+    }
+    assert_eq(small.workspace_needed(), needed)
+    n := brotli.decompress_with_workspace(data, output, &mut words[..needed])!
+    assert_eq(n, CASE_LENGTH[index_of("crafted_wide")])
+    // Headers are checked as decoding checks them.
+    match brotli.workspace_size(&data[..size / 2]) {
+        ok(_) => {
+            assert(false, "truncated header accepted")
+        }
+        err(e) => {
+            assert(outcome(e) == 1)
+        }
+    }
+    // Followed by an empty last meta-block, the wide one cannot be read
+    // without its tables: workspace_size() gives the general bound, and
+    // Decoder still finds the exact need.
+    size = read_fixture("crafted_wide_split", input)
+    split := &input[..size]
+    assert_eq(brotli.workspace_size(split)!, brotli.WORKSPACE_LEN)
+    probe := brotli.Decoder.new(split, &mut window[..65536], &mut words[..5000])!
+    match probe.read(&mut output[..65536]) {
+        ok(_) => {
+            assert(false, "wide stream decoded in a small workspace")
+        }
+        err(e) => {
+            assert(outcome(e) == 5)
+        }
+    }
+    assert_eq(probe.workspace_needed(), needed)
+    n = brotli.decompress_with_workspace(split, output, &mut words[..needed])!
+    assert_eq(n, CASE_LENGTH[index_of("crafted_wide_split")])
+}
+
+@test
+fn wide_meta_blocks() {
+    unsafe {
+        wide_streams(&mut INPUT, &mut OUTPUT, &mut WINDOW, &mut WORDS)
+    }
+}
+
+@test
+fn workspace_size_is_exact() {
+    unsafe {
+        workspace_sizes(&mut INPUT, &mut OUTPUT, &mut WINDOW, &mut WORDS)
     }
 }

@@ -7,7 +7,8 @@ repetitive data, a 17 MiB input that spans several meta-blocks) and
 compressed with the brotli command-line tool at qualities 0..11 and window
 sizes 10..24. A few streams are written bit by bit here: metadata and
 uncompressed meta-blocks, which the reference encoder only emits in special
-cases, and invalid streams with their expected errors. cases.dodo records
+cases, meta-blocks with the most prefix codes (brotli_wide.py), and invalid
+streams with their expected errors. cases.dodo records
 each fixture's decompressed length and CRC-32 (the originals are not
 committed) or the error it must produce.
 
@@ -18,6 +19,8 @@ import os
 import random
 import subprocess
 import zlib
+
+import brotli_wide
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -199,6 +202,15 @@ def crafted():
     w.put(1, 1)
     w.raw(b"short")
     cases.append(("crafted_truncated", w.bytes(), TRUNCATED, None))
+    # One meta-block with 256 insert-and-copy prefix codes of 704 symbols:
+    # about 246,000 workspace words (brotli_wide.py), as the last
+    # meta-block and followed by an empty last one.
+    wide = english(random.Random(4), 300)
+    for name, split in (("crafted_wide", False), ("crafted_wide_split", True)):
+        stream = brotli_wide.wide_stream(wide, split)
+        decoded = subprocess.run(["brotli", "-d", "-c"], input=stream, capture_output=True, check=True).stdout
+        assert decoded == wide, name
+        cases.append((name, stream, OK, wide))
     return cases
 
 

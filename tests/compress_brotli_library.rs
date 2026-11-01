@@ -116,8 +116,8 @@ fn brotli(args: &[&str], input: &[u8]) -> Option<(bool, Vec<u8>)> {
     Some((output.status.success(), output.stdout))
 }
 
-/// Runs the oracle in one-shot (0) or streaming (2) mode; returns its exit
-/// code and output.
+/// Runs the oracle in one-shot (0), streaming (2) or exact-workspace (5)
+/// mode; returns its exit code and output.
 fn oracle(executable: &PathBuf, mode: u8, stream: &[u8]) -> (i32, Vec<u8>) {
     let mut input = vec![mode, 0, 0, 0, 0];
     input.extend_from_slice(stream);
@@ -189,7 +189,7 @@ fn brotli_decoder_matches_brotli_tool() {
         let window = (10 + rng.below(15)).to_string();
         let (ok, stream) = brotli(&["-c", "-q", &quality, "-w", &window], &data).unwrap();
         assert!(ok);
-        for mode in [0u8, 2] {
+        for mode in [0u8, 2, 5] {
             let (code, output) = oracle(&executable, mode, &stream);
             assert_eq!(code, 0, "case {case} q{quality} w{window} mode {mode}");
             assert!(output == data, "case {case} q{quality} w{window} mode {mode}: output differs");
@@ -212,6 +212,10 @@ fn brotli_decoder_matches_brotli_tool() {
             assert_eq!(code == 0, accepted, "case {case}: verdict differs at byte {at}");
             if accepted {
                 assert!(output == expected, "case {case}: output differs at byte {at}");
+                // Accepted streams decode in the workspace they report.
+                let (exact, again) = oracle(&executable, 5, &broken);
+                assert_eq!(exact, 0, "case {case}: exact workspace fails at byte {at}");
+                assert!(again == expected, "case {case}: exact workspace output differs at byte {at}");
             }
         }
     }

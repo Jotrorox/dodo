@@ -463,6 +463,86 @@ fn animation_timing() {
     assert_eq(still_frame.denominator, 1u32)
 }
 
+// Brotli metadata with caller scratch: meta_wide_brob's Exif brob box holds
+// a stream whose tables need about 246,000 workspace words, more than
+// meta.decode's stack workspace. decode_with_scratch() with
+// scratch_size() bytes decodes it to the plain Exif box of meta_raw.
+fn brotli_scratch(work: &mut[u8]) {
+    file := [0u8; FILE_LIMIT]
+    length := read_fixture("meta_raw", ".jxl", &mut file)
+    data := &file[..length]
+    m := jxl.metadata(data)!
+    exif := m.exif.bytes(data)!
+    assert_eq(meta.scratch_size(data, &m.exif)!, 0usize)
+    assert_eq(meta.scratch_size(data, &m.xmp)!, 0usize)
+    wide := [0u8; FILE_LIMIT]
+    wide_length := read_fixture("meta_wide_brob", ".jxl", &mut wide)
+    wdata := &wide[..wide_length]
+    wm := jxl.metadata(wdata)!
+    assert_eq(wm.exif.encoding, meta.ENCODING_BROTLI)
+    need := meta.scratch_size(wdata, &wm.exif)!
+    assert(need > 2 * 131072 && need < 2 * 696108 && need <= work.len)
+    decoded := [0u8; 4096]
+    match meta.decode(wdata, &wm.exif, &mut decoded) {
+        ok(_) => {
+            assert(false, "wide stream decoded with the stack workspace")
+        }
+        err(e) => {
+            assert(e == pixels.Error.TooLarge)
+        }
+    }
+    n := meta.decode_with_scratch(wdata, &wm.exif, &mut decoded, &mut work[..need])!
+    assert_eq(n, exif.len)
+    for i in 0usize..n {
+        assert(decoded[i] == exif[i])
+    }
+    assert_eq(meta.exif_orientation(&decoded[..n])!, 1u32)
+    // Much less scratch fails cleanly.
+    match meta.decode_with_scratch(wdata, &wm.exif, &mut decoded, &mut work[..need / 2]) {
+        ok(_) => {
+            assert(false, "wide stream decoded in half its workspace")
+        }
+        err(e) => {
+            assert(e == pixels.Error.TooLarge)
+        }
+    }
+    // The small streams of meta_brob need little scratch.
+    compressed := [0u8; FILE_LIMIT]
+    compressed_length := read_fixture("meta_brob", ".jxl", &mut compressed)
+    cdata := &compressed[..compressed_length]
+    cm := jxl.metadata(cdata)!
+    small := meta.scratch_size(cdata, &cm.xmp)!
+    assert(small > 0 && small < 8192)
+    xmp_length := meta.decode_with_scratch(cdata, &cm.xmp, &mut decoded, &mut work[..small])!
+    assert_eq(xmp_length, m.xmp.length)
+    // Truncated brob payloads fail in both functions.
+    cut := meta.Item { offset: wm.exif.offset, length: 3, encoding: meta.ENCODING_BROTLI }
+    match meta.scratch_size(wdata, &cut) {
+        ok(_) => {
+            assert(false, "short brob payload accepted")
+        }
+        err(e) => {
+            assert(e == pixels.Error.Truncated)
+        }
+    }
+    half := meta.Item { offset: wm.exif.offset, length: wm.exif.length / 2, encoding: meta.ENCODING_BROTLI }
+    match meta.scratch_size(wdata, &half) {
+        ok(_) => {
+            assert(false, "truncated brob stream accepted")
+        }
+        err(e) => {
+            assert(e == pixels.Error.Truncated)
+        }
+    }
+}
+
+@test
+fn metadata_brotli_scratch() {
+    unsafe {
+        brotli_scratch(&mut SCRATCH)
+    }
+}
+
 @test
 fn metadata_boxes() {
     file := [0u8; FILE_LIMIT]
