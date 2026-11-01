@@ -2669,15 +2669,19 @@ fn parse_create_index(e: &mut Engine, unique: bool, sql_start: usize) -> usize!d
     head := 0usize
     tail := 0usize
     for {
+        xstart := e.ts
         x := parse_expr(e)?
         item := new_node(e, N_ORDER)?
         // COLLATE on an index column is parsed as an expression postfix.
+        xlen := e.last_end - xstart
         if nkind(e, x) == N_COLLATE {
             let nb2 = nb(e, x) + 1
             set_nf(e, item, 1, nb2)
             x = na(e, x)
         }
         set_nf(e, item, 0, x)
+        set_nf(e, item, 2, xstart)
+        set_nf(e, item, 3, xlen)
         if accept_kw(e, "DESC") {
             set_flags(e, item, 1)
         } else {
@@ -2693,7 +2697,10 @@ fn parse_create_index(e: &mut Engine, unique: bool, sql_start: usize) -> usize!d
     expect(e, TK_RP)?
     set_nf(e, s, 4, head)
     if accept_kw(e, "WHERE") {
-        return err(fail(e, SQLITE_ERROR, "partial indexes are not supported"))
+        wstart := e.ts
+        parse_expr(e)?
+        let span = ((wstart as u64) << 32) | ((e.last_end - wstart) as u64)
+        set_x(e, s, span)
     }
     let last_end2 = e.last_end
     set_nf(e, s, 6, last_end2)

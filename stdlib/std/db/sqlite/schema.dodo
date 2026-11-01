@@ -24,6 +24,9 @@ const O_ROWID: usize = 40
 const O_ROWNO: usize = 44
 const O_ONCONF: usize = 48
 const O_NPK: usize = 49
+// Partial indexes: the WHERE clause text.
+const O_WHERE: usize = 52
+const O_WHEREL: usize = 56
 
 const OT_TABLE: u8 = 1
 const OT_INDEX: u8 = 2
@@ -54,6 +57,8 @@ const K_COL: usize = 0
 const K_DESC: usize = 8
 
 const NO_COL: usize = 4294967295
+// Index column that is an expression; its text is at K_DFLT/K_DFLTL.
+const EXPR_COL: usize = 4294967293
 
 // Statement-local objects (FROM subqueries, views) are records in the
 // statement pool, encoded as LOCAL_OBJ + workspace offset.
@@ -508,7 +513,29 @@ fn index_from_ast(e: &mut Engine, x: usize, t: usize, s: usize) -> void!db.Error
     for item != 0 {
         ex := na(e, item)
         if nkind(e, ex) != N_ID || nc(e, ex) != 0 {
-            return err(fail(e, SQLITE_ERROR, "indexes on expressions are not supported"))
+            // Expression column: keep its text; it is resolved where used.
+            r := cols + k * COL_BYTES
+            stu(e.ws, r + K_COL, EXPR_COL)
+            let span_o = nc(e, item)
+            let span_l = ndd(e, item)
+            d := schema_copy(e, span_o, span_l)?
+            stu(e.ws, r + K_DFLT, d)
+            stu(e.ws, r + K_DFLTL, span_l)
+            if (nflags(e, item) & 1) != 0 {
+                e.ws[r + K_DESC] = 1
+            }
+            coll := nb(e, item)
+            let (xc, strength) = expr_collation(e, ex)
+            e.ws[r + K_COLL] = if coll > 0 {
+                (coll - 1) as u8
+            } else if strength == 2 {
+                xc
+            } else {
+                COLL_BINARY
+            }
+            k += 1
+            item = nnext(e, item)
+            continue
         }
         let ex_a = na(e, ex)
         let ex_b = nb(e, ex)
@@ -544,6 +571,15 @@ fn index_from_ast(e: &mut Engine, x: usize, t: usize, s: usize) -> void!db.Error
         }
         k += 1
         item = nnext(e, item)
+    }
+    span := nx(e, s)
+    if span != 0 {
+        let wo = (span >> 32) as usize
+        let wl = (span & 0xffffffffu64) as usize
+        d := schema_copy(e, wo, wl)?
+        o2 := obj(e, x)
+        stu(e.ws, o2 + O_WHERE, d)
+        stu(e.ws, o2 + O_WHEREL, wl)
     }
     ok()
 }

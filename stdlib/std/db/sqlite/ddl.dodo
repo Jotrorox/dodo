@@ -288,10 +288,28 @@ fn exec_create_index(e: &mut Engine, s: usize) -> void!db.Error {
     open_index_cursor(e, ic, x)
     n := obj_ncol(e, x)
     ipk := rowid_col(e, t)
+    ncol := obj_ncol(e, t)
     save := e.rtop
     keys := e.rtop
     for _ in 0usize..(n + 1) {
         reg_push(e)?
+    }
+    // Expression and partial indexes evaluate against the whole row.
+    base := e.rtop
+    for _ in 0usize..(ncol + 1) {
+        reg_push(e)?
+    }
+    e.reg_alloc = e.rtop
+    exprs := match index_exprs(e, x, t, base) {
+        ok(v) => v,
+        err(reason) => {
+            e.rtop = save
+            e.schema_objs -= 1
+            return err(reason)
+        },
+    }
+    if e.reg_alloc > e.rtop {
+        e.rtop = e.reg_alloc
     }
     more := cur_first(e, tc)?
     for more {
@@ -299,12 +317,40 @@ fn exec_create_index(e: &mut Engine, s: usize) -> void!db.Error {
         rowid := cur_rowid(e, tc)
         let (p, len) = cur_payload(e, tc)?
         any_null := false
+        skip := false
+        if exprs != 0 {
+            for c2 in 0usize..ncol {
+                if c2 == ipk {
+                    set_int(e, base + c2, rowid)
+                } else if !record_column(e, p, len, c2, base + c2)? {
+                    column_default(e, t, c2, base + c2)?
+                }
+                reg_own(e, base + c2)?
+            }
+            set_int(e, base + ncol, rowid)
+            cond := ldu(e.ws, exprs + n * 4)
+            if cond != 0 && eval_truth(e, cond)? != 1 {
+                skip = true
+            }
+        }
         for k in 0usize..n {
             c := idx_col(e, x, k)
-            if c == NO_COL || c == ipk {
+            if skip {
+                break
+            }
+            if c == EXPR_COL {
+                let node = ldu(e.ws, exprs + k * 4)
+                eval(e, node, keys + k)?
+                reg_own(e, keys + k)?
+                if rtype(e, keys + k) == T_NULL {
+                    any_null = true
+                }
+            } else if c == NO_COL || c == ipk {
                 set_int(e, keys + k, rowid)
             } else {
-                if !record_column(e, p, len, c, keys + k)? {
+                if exprs != 0 {
+                    copy_reg(e, keys + k, base + c)
+                } else if !record_column(e, p, len, c, keys + k)? {
                     column_default(e, t, c, keys + k)?
                 }
                 if rtype(e, keys + k) == T_NULL {
@@ -313,6 +359,11 @@ fn exec_create_index(e: &mut Engine, s: usize) -> void!db.Error {
             }
         }
         set_int(e, keys + n, rowid)
+        if skip {
+            arena_reset(e, mark)
+            more = cur_next(e, tc)?
+            continue
+        }
         if unique && !any_null {
             if seek_index(e, ic, keys, n)? == 0 {
                 e.rtop = save

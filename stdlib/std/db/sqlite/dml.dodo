@@ -31,6 +31,13 @@ const W_BYTES: usize = 88
 
 const ROWID_TARGET: usize = 4294967294
 
+// Index array entry of a write: [0] index object, [4] cursor, [8] key
+// expressions bound to the new row (W_BASE), [12] bound to the old row
+// (W_OLD). Expression arrays hold one node per index column (0 for plain
+// columns) followed by the partial-index WHERE (0 for none); 0 when the
+// index has neither.
+const IDX_ENTRY: usize = 16
+
 fn wget(e: &Engine, w: usize, f: usize) -> usize {
     ldu(e.ws, w + f)
 }
@@ -85,7 +92,7 @@ fn table_for_write(e: &mut Engine, o: usize, l: usize) -> usize!db.Error {
         return err(fail(e, SQLITE_ERROR, "tables with triggers cannot be modified by this driver"))
     }
     if (flags & OF_UNSUPPORTED_INDEX) != 0 {
-        return err(fail(e, SQLITE_ERROR, "table has an index this driver cannot maintain (expression or partial index)"))
+        return err(fail(e, SQLITE_ERROR, "table has an index this driver cannot read"))
     }
     ok(t)
 }
@@ -113,18 +120,25 @@ fn write_info(e: &mut Engine, s: usize, t: usize) -> usize!db.Error {
         nidx += 1
         x = next_index_of(e, t, x)
     }
-    arr := pool_alloc(e, nidx * 8 + 4)?
+    arr := pool_alloc(e, nidx * IDX_ENTRY + 4)?
     x = next_index_of(e, t, NO_COL)
     k := 0usize
     for x != NO_COL {
         ic := alloc_cursor(e)?
-        stu(e.ws, arr + k * 8, x)
-        stu(e.ws, arr + k * 8 + 4, ic)
+        stu(e.ws, arr + k * IDX_ENTRY, x)
+        stu(e.ws, arr + k * IDX_ENTRY + 4, ic)
         k += 1
         x = next_index_of(e, t, x)
     }
     stu(e.ws, w + W_IDX, arr)
     stu(e.ws, w + W_NIDX, nidx)
+    for k2 in 0usize..nidx {
+        x2 := ldu(e.ws, arr + k2 * IDX_ENTRY)
+        let eb = index_exprs(e, x2, t, base)?
+        stu(e.ws, arr + k2 * IDX_ENTRY + 8, eb)
+        let eo = index_exprs(e, x2, t, old)?
+        stu(e.ws, arr + k2 * IDX_ENTRY + 12, eo)
+    }
     let nop2 = nop(e, s) as usize
     stu(e.ws, w + W_CONF, nop2)
     // CHECK constraints: re-parse the table definition here and resolve
@@ -197,8 +211,8 @@ fn open_write_cursors(e: &mut Engine, w: usize) {
     cur_open(e, c, root, false)
     arr := wget(e, w, W_IDX)
     for k in 0usize..wget(e, w, W_NIDX) {
-        x := ldu(e.ws, arr + k * 8)
-        ic := ldu(e.ws, arr + k * 8 + 4)
+        x := ldu(e.ws, arr + k * IDX_ENTRY)
+        ic := ldu(e.ws, arr + k * IDX_ENTRY + 4)
         open_index_cursor(e, ic, x)
     }
 }
@@ -777,6 +791,12 @@ fn constraint_fail(e: &mut Engine, code: i32, kind: &str, t: usize, cols: usize,
             let name_len = ldu(e.ws, r + K_NAMEL)
             msg_add_ws(e, name, name_len)
         }
+    } else if index_has_expr(e, x) {
+        msg_add(e, "index '")
+        let xn = obj_u(e, x, O_NAME)
+        let xl = obj_u(e, x, O_NAMEL)
+        msg_add_ws(e, xn, xl)
+        msg_add(e, "'")
     } else {
         for k in 0usize..ncols {
             if k > 0 {
@@ -798,17 +818,101 @@ fn constraint_fail(e: &mut Engine, code: i32, kind: &str, t: usize, cols: usize,
     make_error(e, code)
 }
 
-// Builds the key registers of index x from the row registers; returns
-// false if any key column is NULL.
-fn index_key(e: &mut Engine, w: usize, x: usize, row: usize, rowid: i64) -> bool {
+// Parses and resolves the key expressions and WHERE clause of index x
+// against the row registers at `regs`; returns the expression array (or 0
+// for a plain index).
+fn index_exprs(e: &mut Engine, x: usize, t: usize, regs: usize) -> usize!db.Error {
+    n := obj_ncol(e, x)
+    partial := obj_u(e, x, O_WHEREL) != 0
+    plain := !partial
+    for k in 0usize..n {
+        if idx_col(e, x, k) == EXPR_COL {
+            plain = false
+        }
+    }
+    if plain {
+        return ok(0)
+    }
+    arr := pool_alloc(e, (n + 1) * 4)?
+    zero_bytes(e.ws, arr, (n + 1) * 4)
+    for k in 0usize..(n + 1) {
+        if k < n && idx_col(e, x, k) != EXPR_COL {
+            continue
+        }
+        let (so, sl) = if k == n {
+            (obj_u(e, x, O_WHERE), obj_u(e, x, O_WHEREL))
+        } else {
+            let r = col_rec(e, x, k)
+            (ldu(e.ws, r + K_DFLT), ldu(e.ws, r + K_DFLTL))
+        }
+        if sl == 0 {
+            continue
+        }
+        node := parse_fragment_expr(e, so, sl)?
+        e.regctx_t = t
+        e.regctx_base = regs
+        res := resolve_expr(e, node, 0, false)
+        e.regctx_t = NO_COL
+        res?
+        stu(e.ws, arr + k * 4, node)
+    }
+    ok(arr)
+}
+
+// True when the row in the registers bound to entry k's expressions
+// belongs in that (possibly partial) index.
+fn index_applies(e: &mut Engine, w: usize, k: usize, old: bool) -> bool!db.Error {
+    arr := wget(e, w, W_IDX)
+    ex := ldu(e.ws, arr + k * IDX_ENTRY + if old {
+        12usize
+    } else {
+        8usize
+    })
+    if ex == 0 {
+        return ok(true)
+    }
+    x := ldu(e.ws, arr + k * IDX_ENTRY)
+    n := obj_ncol(e, x)
+    cond := ldu(e.ws, ex + n * 4)
+    if cond == 0 {
+        return ok(true)
+    }
+    ok(eval_truth(e, cond)? == 1)
+}
+
+fn index_has_expr(e: &Engine, x: usize) -> bool {
+    for k in 0usize..obj_ncol(e, x) {
+        if idx_col(e, x, k) == EXPR_COL {
+            return true
+        }
+    }
+    false
+}
+
+// Builds the key registers of index entry k from the row registers;
+// returns false if any key column is NULL.
+fn index_key(e: &mut Engine, w: usize, k0: usize, row: usize, rowid: i64, old: bool) -> bool!db.Error {
     keys := wget(e, w, W_KEYREG)
-    ncol := wget(e, w, W_NCOL)
     t := wget(e, w, W_TABLE)
+    arr := wget(e, w, W_IDX)
+    x := ldu(e.ws, arr + k0 * IDX_ENTRY)
+    ex := ldu(e.ws, arr + k0 * IDX_ENTRY + if old {
+        12usize
+    } else {
+        8usize
+    })
     n := obj_ncol(e, x)
     any_null := false
     for k in 0usize..n {
         c := idx_col(e, x, k)
-        if c == NO_COL || c == rowid_col(e, t) {
+        if c == EXPR_COL {
+            let node = ldu(e.ws, ex + k * 4)
+            eval(e, node, keys + k)?
+            reg_own(e, keys + k)?
+            if rtype(e, keys + k) == T_NULL {
+                any_null = true
+            }
+        } else if c == NO_COL || c == rowid_col(e, t) {
             set_int(e, keys + k, rowid)
         } else {
             copy_reg(e, keys + k, row + c)
@@ -818,10 +922,7 @@ fn index_key(e: &mut Engine, w: usize, x: usize, row: usize, rowid: i64) -> bool
         }
     }
     set_int(e, keys + n, rowid)
-    if ncol == 0 {
-        return !any_null
-    }
-    !any_null
+    ok(!any_null)
 }
 
 // Inserts the row in the W_BASE registers. Returns false when skipped by
@@ -971,13 +1072,16 @@ fn write_row(e: &mut Engine, w: usize, conf: u8, update: bool, old_rowid: i64) -
     nidx := wget(e, w, W_NIDX)
     keys := wget(e, w, W_KEYREG)
     for k in 0usize..nidx {
-        x := ldu(e.ws, arr + k * 8)
+        x := ldu(e.ws, arr + k * IDX_ENTRY)
         if (obj_flags(e, x) & OF_UNIQUE) == 0 {
             continue
         }
-        ic := ldu(e.ws, arr + k * 8 + 4)
+        ic := ldu(e.ws, arr + k * IDX_ENTRY + 4)
         n := obj_ncol(e, x)
-        if !index_key(e, w, x, base, rowid) {
+        if !index_applies(e, w, k, false)? {
+            continue
+        }
+        if !index_key(e, w, k, base, rowid, false)? {
             continue
         }
         for {
@@ -1000,7 +1104,7 @@ fn write_row(e: &mut Engine, w: usize, conf: u8, update: bool, old_rowid: i64) -
             }
             if conf == OE_REPLACE {
                 delete_row(e, w, other)?
-                index_key(e, w, x, base, rowid)
+                index_key(e, w, k, base, rowid, false)?
                 continue
             }
             code := if (obj_flags(e, x) & OF_PK) != 0 {
@@ -1038,13 +1142,16 @@ fn store_row(e: &mut Engine, w: usize, rowid: i64) -> void!db.Error {
     arr := wget(e, w, W_IDX)
     keys := wget(e, w, W_KEYREG)
     for k in 0usize..wget(e, w, W_NIDX) {
-        x := ldu(e.ws, arr + k * 8)
-        ic := ldu(e.ws, arr + k * 8 + 4)
+        x := ldu(e.ws, arr + k * IDX_ENTRY)
+        ic := ldu(e.ws, arr + k * IDX_ENTRY + 4)
         n := obj_ncol(e, x)
-        index_key(e, w, x, base, rowid)
+        if !index_applies(e, w, k, false)? {
+            continue
+        }
+        index_key(e, w, k, base, rowid, false)?
         for i in 0usize..n {
             c2 := idx_col(e, x, i)
-            if c2 != NO_COL && c2 != ipk {
+            if c2 != NO_COL && c2 != ipk && c2 != EXPR_COL {
                 let affinity = col_aff(e, t, c2)
                 apply_affinity(e, keys + i, affinity)?
             }
@@ -1078,13 +1185,24 @@ fn delete_row(e: &mut Engine, w: usize, rowid: i64) -> void!db.Error {
         }
         reg_own(e, old + i)?
     }
+    set_int(e, old + ncol, rowid)
     arr := wget(e, w, W_IDX)
     keys := wget(e, w, W_KEYREG)
     for k in 0usize..wget(e, w, W_NIDX) {
-        x := ldu(e.ws, arr + k * 8)
-        ic := ldu(e.ws, arr + k * 8 + 4)
+        x := ldu(e.ws, arr + k * IDX_ENTRY)
+        ic := ldu(e.ws, arr + k * IDX_ENTRY + 4)
         n := obj_ncol(e, x)
-        index_key(e, w, x, old, rowid)
+        if !index_applies(e, w, k, true)? {
+            continue
+        }
+        index_key(e, w, k, old, rowid, true)?
+        for i in 0usize..n {
+            c2 := idx_col(e, x, i)
+            if c2 != NO_COL && c2 != ipk && c2 != EXPR_COL {
+                let affinity = col_aff(e, t, c2)
+                apply_affinity(e, keys + i, affinity)?
+            }
+        }
         if seek_index(e, ic, keys, n + 1)? == 0 {
             cur_delete(e, ic)?
         }
@@ -1341,7 +1459,7 @@ fn exec_delete(e: &mut Engine, s: usize) -> void!db.Error {
         btree_clear(e, root2)?
         arr := wget(e, w, W_IDX)
         for k in 0usize..wget(e, w, W_NIDX) {
-            x := ldu(e.ws, arr + k * 8)
+            x := ldu(e.ws, arr + k * IDX_ENTRY)
             let root3 = obj_root(e, x)
             btree_clear(e, root3)?
         }

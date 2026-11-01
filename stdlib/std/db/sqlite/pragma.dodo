@@ -341,7 +341,10 @@ fn exec_pragma(e: &mut Engine, s: usize, resreg: usize) -> void!db.Error {
             for k in 0usize..obj_ncol(e, x) {
                 c := idx_col(e, x, k)
                 set_int(e, r, k as i64)
-                if c == NO_COL {
+                if c == EXPR_COL {
+                    set_int(e, r + 1, -2)
+                    set_null(e, r + 2)
+                } else if c == NO_COL {
                     set_int(e, r + 1, -1)
                     set_null(e, r + 2)
                 } else {
@@ -434,7 +437,12 @@ fn exec_pragma(e: &mut Engine, s: usize, resreg: usize) -> void!db.Error {
                 "c"
             }
             set_text_str(e, r + 3, origin)?
-            set_int(e, r + 4, 0)
+            let partial = if obj_u(e, j, O_WHEREL) != 0 {
+                1i64
+            } else {
+                0i64
+            }
+            set_int(e, r + 4, partial)
             prow(e, r, 5)?
             k += 1
         }
@@ -663,7 +671,7 @@ fn integrity_check(e: &mut Engine, r: usize) -> void!db.Error {
             continue
         }
         let (n, _) = ic_tree(e, map, root, r, &mut count, 0)?
-        if k == OT_INDEX {
+        if k == OT_INDEX && obj_u(e, i, O_WHEREL) == 0 {
             t := obj_u(e, i, O_TABLE)
             if t != NO_COL {
                 let root2 = obj_root(e, t)

@@ -1399,6 +1399,11 @@ fn choose_plan(e: &mut Engine, info: usize, l: usize, a: usize, na_: usize, b: u
     best_keys := 0usize
     x := next_index_of(e, t, NO_COL)
     for x != NO_COL {
+        if obj_u(e, x, O_WHEREL) != 0 {
+            // Partial indexes do not hold every row.
+            x = next_index_of(e, t, x)
+            continue
+        }
         keys := pool_alloc(e, 4 * 33)?
         nk := 0usize
         ncols := obj_ncol(e, x)
