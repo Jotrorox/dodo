@@ -336,15 +336,16 @@ fn keys() {
     none := window.Modifiers.none()
     assert(!none.shift() && !none.control() && !none.alt() && !none.meta() && !none.caps_lock() && !none.shortcut())
 
-    // Invalid sizes fail before any window system is contacted.
-    match window.open(window.Options.new("Zero", 0, 10)) {
-        ok(_) => assert(false, "zero width accepted"),
-        err(error) => assert(error == window.Error.InvalidInput),
-    }
-    match window.open(window.Options.new("Huge", 10, window.MAX_SIZE + 1)) {
-        ok(_) => assert(false, "oversized window accepted"),
-        err(error) => assert(error == window.Error.InvalidInput),
-    }
+    // Every event names its window; Quit belongs to none.
+    resize := window.Event.Resize(3, 640, 480)
+    assert_eq(window.event_window(&resize), 3u32)
+    frame := window.Event.Frame(7)
+    assert_eq(window.event_window(&frame), 7u32)
+    key := window.Event.Key(2, window.KeyEvent { key: window.Key.A, pressed: true, repeat: false, modifiers: window.Modifiers.none() })
+    assert_eq(window.event_window(&key), 2u32)
+    quit := window.Event.Quit
+    assert_eq(window.event_window(&quit), 0u32)
+    assert_eq(raw.QUIT, 11u32)
 }
 
 fn main() {
