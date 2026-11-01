@@ -9,13 +9,15 @@ import "std/embedded/hal"
 //
 // How it measures. Two peripherals watch the pin through the GPIO matrix.
 // The MCPWM's capture unit timestamps edges with its 32-bit capture timer,
-// which counts the 40 MHz APB clock (25 ns, wrapping after 107 s): channel
+// which counts the MCPWM's 160 MHz function clock (6.25 ns, wrapping after
+// 26.8 s; the reference manual's "APB clock" is not what the ESP32-C6
+// counts): channel
 // 0 latches the time of each rising edge, channel 1 of each falling edge,
 // and channel 2 takes a software capture (CAP2_SW) whenever the driver
 // needs the time now. A PCNT unit counts the rising edges. A poll reads the
-// count, the two edge times, and the time now, and repeats the reads until
-// the count and the rising edge time did not change in between, so the
-// latest rising edge is known to be rising edge number `count`. Two such
+// count, the two edge times, and the count again, repeating the four reads
+// until the count did not change in between, so the latest rising edge is
+// known to be rising edge number `count`; then it reads the time now. Two such
 // readings a window apart give the period as an exact average over the
 // rising edges between them, `cycles` of them; the high time comes from the
 // latest falling edge: the time from the last rising edge to it, or the
@@ -23,15 +25,16 @@ import "std/embedded/hal"
 // at the first poll at least `window_us` after its first rising edge, or
 // once 16384 rising edges have passed, whichever is first.
 //
-// Range and resolution. Edges are timed to 25 ns, so one period of a slow
-// signal is exact to 25 ns, and averaging over many cycles makes a fast
-// signal's period finer still (25 ns / cycles): a 1 MHz signal measured
-// over a 10 ms window averages 10000 periods, to 2.5 ps. The high time is
-// the last period's, to 25 ns. Signals up to about 10 MHz count (the PCNT
+// Range and resolution. Edges are timed to 6.25 ns, so one period of a
+// slow signal is exact to 6.25 ns, and averaging over many cycles makes a
+// fast signal's period finer still (6.25 ns / cycles): a 1 MHz signal
+// measured over a 10 ms window averages 10000 periods, to under a
+// picosecond. The high time is the last period's, to 6.25 ns. Signals up
+// to about 10 MHz count (the PCNT
 // needs a high and low phase of a few APB cycles each, and its glitch
 // filter is off); at the fastest, a poll may need several tries to read
 // a consistent snapshot. A period up to the window can be measured, and
-// windows run from 1 us to 100 s (WINDOW_MAX_US), within the capture
+// windows run from 1 us to 25 s (WINDOW_MAX_US), within the capture
 // timer's wrap; a signal slower than the window gives measurements with
 // cycles 0 in between (see hal.PulseCapture). Polls must come at least
 // every 32767 rising edges (32 ms at 1 MHz), or the counter wraps and the
@@ -42,11 +45,12 @@ import "std/embedded/hal"
 // (Motor Control PWM, Pulse Count Controller).
 
 const MCPWM_BASE: usize = 0x6001_4000
+const MCPWM_CLK_CFG: usize = MCPWM_BASE + 0x00
 const CAP_TIMER_CFG: usize = MCPWM_BASE + 0xE8
 const CAP_CH_CFG: usize = MCPWM_BASE + 0xF0
 const CAP_CH: usize = MCPWM_BASE + 0xFC
 const MCPWM_CLK: usize = MCPWM_BASE + 0x128
-// CAP_TIMER_CFG: count the APB clock. CAP_CHn_CFG: enabled, capture on the
+// CAP_TIMER_CFG: count. CAP_CHn_CFG: enabled, capture on the
 // falling or the rising edge, and a software capture.
 const CAP_TIMER_ENABLE: u32 = 1 << 0
 const CAP_ENABLE: u32 = 1 << 0
@@ -74,15 +78,16 @@ const PCNT_CLOCK: u32 = 1 << 16
 
 const GPIO_IN: usize = 0x6009_103C
 
-// The capture timer's clock, the APB clock after esp32c6.take().
-pub const CLOCK_HZ: u32 = 40_000_000
-// The longest window, within the capture timer's 107-second wrap.
-pub const WINDOW_MAX_US: u32 = 100_000_000
+// The capture timer's clock: the MCPWM function clock, the 160 MHz PLL
+// output undivided (PCR PWM_CLK_CONF, MCPWM CLK_CFG).
+pub const CLOCK_HZ: u32 = 160_000_000
+// The longest window, within the capture timer's 26.8-second wrap.
+pub const WINDOW_MAX_US: u32 = 25_000_000
 // Rising edges after which a measurement ends whatever the window.
 pub const MAX_CYCLES: u32 = 16384
-// Tries a poll makes at a consistent reading before giving up until the
-// next poll.
-pub const READ_TRIES: u32 = 16
+// Tries a poll makes at a consistent reading before it takes an
+// inconsistent one.
+pub const READ_TRIES: u32 = 64
 
 // The window in capture timer ticks.
 pub fn window_ticks(clock_hz: u32, window_us: u32) -> u32 {
@@ -150,13 +155,21 @@ pub struct Tracker {
             span := ticks_between(rise, self.reference_rise)
             if span >= self.window_ticks || edges >= MAX_CYCLES {
                 period := (span as u64 * 1_000_000_000 + (self.clock_hz as u64 * edges as u64) / 2) / (self.clock_hz as u64 * edges as u64)
+                // Falling edges come `high` after rising ones, so the time
+                // from the latest rise to the latest fall, modulo the
+                // period, is the high time, however many periods lie
+                // between the two edges read.
                 since_rise := ticks_between(now, rise)
                 since_fall := ticks_between(now, fall)
                 high := 0u64
+                // In ticks times `edges`, so the period is `span`.
+                cycles_hz := self.clock_hz as u64 * edges as u64
                 if since_fall < since_rise {
-                    high = ticks_ns(self.clock_hz, (since_rise - since_fall) as u64)
+                    offset := (since_rise - since_fall) as u64 * edges as u64 % span as u64
+                    high = (offset * 1_000_000_000 + cycles_hz / 2) / cycles_hz
                 } else {
-                    low := ticks_ns(self.clock_hz, (since_fall - since_rise) as u64)
+                    offset := (since_fall - since_rise) as u64 * edges as u64 % span as u64
+                    low := (offset * 1_000_000_000 + cycles_hz / 2) / cycles_hz
                     if low < period {
                         high = period - low
                     }
@@ -244,6 +257,7 @@ pub struct PwmCapture: hal.PwmInput {
         window_ticks_checked(CLOCK_HZ, window_us)?
         unsafe {
             mmio.write32(MCPWM_CLK, 1)
+            mmio.write32(MCPWM_CLK_CFG, 0)
             mmio.write32(CAP_TIMER_CFG, CAP_TIMER_ENABLE)
             mmio.write32(CAP_CH_CFG, CAP_ENABLE | CAP_RISING)
             mmio.write32(CAP_CH_CFG + 4, CAP_ENABLE | CAP_FALLING)
@@ -268,9 +282,7 @@ pub struct PwmCapture: hal.PwmInput {
     // 32767 rising edges apart; the next measurement has then begun.
     pub fn poll_capture(&mut self, capture: &mut hal.PulseCapture) -> bool!hal.Error {
         reading := Reading { count: 0, rise: 0, fall: 0, now: 0, level: false, wrapped: false }
-        if !self.read(&mut reading) {
-            return ok(false)
-        }
+        self.read(&mut reading)
         result := self.tracker.update(reading.count, reading.rise, reading.fall, reading.now, reading.level, reading.wrapped, capture)
         if self.tracker.needs_restart() {
             self.restart()
@@ -288,7 +300,7 @@ pub struct PwmCapture: hal.PwmInput {
         return self.window_us
     }
 
-    // The time one capture timer tick stands for, in picoseconds: 25000.
+    // The time one capture timer tick stands for, in picoseconds: 6250.
     pub fn resolution_ps(&self) -> u32 {
         return 1_000_000_000 / (CLOCK_HZ / 1000)
     }
@@ -317,46 +329,41 @@ pub struct PwmCapture: hal.PwmInput {
             mmio.write32(PCNT_CTRL, control & ~U0_RESET)
         }
         reading := Reading { count: 0, rise: 0, fall: 0, now: 0, level: false, wrapped: false }
-        for _ in 0u32..READ_TRIES {
-            if self.read(&mut reading) {
-                self.tracker.restart(reading.count, reading.rise, reading.now, reading.level)
-                return
-            }
-        }
-        // A signal too fast to read consistently: start from an estimate.
-        self.tracker.restart(0, reading.rise, reading.now, reading.level)
+        self.read(&mut reading)
+        self.tracker.restart(reading.count, reading.rise, reading.now, reading.level)
     }
 
-    // Read the hardware until the count and the rising edge time hold
-    // still across the reads; false if they never did in READ_TRIES tries.
-    fn read(&mut self, reading: &mut Reading) -> bool {
+    // Read the hardware until the count held still across the reads of the
+    // two edge times, so no rising edge came in between. A signal whose
+    // edges come faster than the four reads never holds still: the last
+    // try's reading is then used, its count off by the few edges that came
+    // during the reads. The time now and the level come after: they only
+    // need to be no earlier than the edges.
+    fn read(&mut self, reading: &mut Reading) {
         // SAFETY: reads of the input's units and GPIO_IN, a software
         // capture on channel 2, and unit 0's event flag.
         unsafe {
-            for _ in 0u32..READ_TRIES {
-                count := mmio.read32(PCNT_U0_CNT) & 0xFFFF
+            for attempt in 0u32..READ_TRIES {
+                last_try := attempt + 1 == READ_TRIES
+                count := mmio.read32(PCNT_U0_CNT)
                 rise := mmio.read32(CAP_CH)
                 fall := mmio.read32(CAP_CH + 4)
-                mmio.write32(CAP_CH_CFG + 8, CAP_ENABLE | CAP_SOFTWARE)
-                now := mmio.read32(CAP_CH + 8)
-                level := (mmio.read32(GPIO_IN) & (1u32 << self.pin)) != 0
-                again := mmio.read32(CAP_CH)
-                later := mmio.read32(PCNT_U0_CNT) & 0xFFFF
-                if count == later && rise == again {
+                later := mmio.read32(PCNT_U0_CNT)
+                if count == later || last_try {
+                    mmio.write32(CAP_CH_CFG + 8, CAP_ENABLE | CAP_SOFTWARE)
+                    reading.now = mmio.read32(CAP_CH + 8)
+                    reading.level = (mmio.read32(GPIO_IN) & (1u32 << self.pin)) != 0
                     raw := mmio.read32(PCNT_INT_RAW)
                     reading.wrapped = (raw & 1) != 0
                     if reading.wrapped {
                         mmio.write32(PCNT_INT_CLR, 1)
                     }
-                    reading.count = count
+                    reading.count = later & 0xFFFF
                     reading.rise = rise
                     reading.fall = fall
-                    reading.now = now
-                    reading.level = level
-                    return true
+                    return
                 }
             }
-            return false
         }
     }
 }

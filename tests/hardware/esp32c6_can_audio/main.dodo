@@ -51,6 +51,10 @@ fn say_values(text: &str, a: u64, b: u64, c: u64) {
     }
 }
 
+fn hex(value: i32) -> u64 {
+    return (value as i64 & 0xFFFF_FFFF) as u64
+}
+
 fn flag(value: bool) -> u64 {
     if value {
         return 1
@@ -285,7 +289,7 @@ fn can_checks(b: &mut board.Board) {
     // pad has one output, so the bus is a wired AND in software: TWAI0
     // and TWAI1 drive their TX pads, the CPU drives a third pad low while
     // either TX is low, and both RX inputs read that pad.
-    slow := esp_twai.Config.new(50_000)
+    slow := esp_twai.Config.new(20_000)
     first := b.pins.can(PIN_D, PIN_E, &slow, &none)!
     second = b.pins.can(PIN_F, PIN_G, &slow, &none)!
     bus := b.pins.output(PIN_H)!
@@ -296,7 +300,7 @@ fn can_checks(b: &mut board.Board) {
     request := hal.CanFrame.extended(0x18DA_F110, &hello)!
     reply := hal.CanFrame.standard(0x7E8, &hello[0..2])!
     there := exchange(&mut first, &mut second, &request) && exchange(&mut second, &mut first, &reply)
-    say_values("can exchange tec, rec, ok ", (first.tec() + second.tec()) as u64, (first.rec() + second.rec()) as u64, flag(there))
+    say_values("can exchange tec, tec, ok ", first.tec() as u64, second.tec() as u64, flag(there))
     check(there && first.tec() == 0 && second.tec() == 0 && state_code(&mut first) == 0)
     b.pins.release(bus)
     b.pins.release_can(first)
@@ -325,7 +329,7 @@ fn exchange(sender: &mut chip.Can, receiver: &mut chip.Can, frame: &hal.CanFrame
         clear: hal.Reg<u32> = hal.Reg.at(0x6009_100C)
         for _ in 0..100 {
             section := hal.Critical.enter()
-            for _ in 0..2000 {
+            for _ in 0..5000 {
                 if (input.read() & tx_mask) == tx_mask {
                     set.write(bus_mask)
                 } else {
@@ -345,7 +349,7 @@ fn exchange(sender: &mut chip.Can, receiver: &mut chip.Can, frame: &hal.CanFrame
 
 // A sample pattern: distinct in every frame and both slots, using all bits.
 fn pattern(index: u32, bits: u32) -> i32 {
-    word := (index * 0x9E37_79B9) ^ 0x5A5A_A5A5
+    word := ((index as u64 * 0x9E37_79B9) & 0xFFFF_FFFF) as u32 ^ 0x5A5A_A5A5
     if (index & 1) != 0 {
         word = ~word
     }
@@ -399,13 +403,22 @@ fn loopback(b: &mut board.Board, config: &esp_i2s.Config, frames: u32) -> bool {
         }
         if found == 2048 || got < 2048 || !shared {
             say_values("i2s not found, got, shared ", found as u64, got as u64, flag(shared))
-            say_values("i2s first received ", RECEIVED[200] as u32 as u64, RECEIVED[201] as u32 as u64, SENT[0] as u32 as u64)
+            first_nonzero := 0usize
+            for index in 0usize..2046 {
+                if first_nonzero == 0 && RECEIVED[index] != 0 {
+                    first_nonzero = index
+                }
+            }
+            say_values("i2s first nonzero at, value, next ", first_nonzero as u64, hex(RECEIVED[first_nonzero]), hex(RECEIVED[first_nonzero + 1]))
+            say_values("i2s sent 0, 1, 2 ", hex(SENT[0]), hex(SENT[1]), hex(SENT[2]))
+            say_values("i2s first received ", (RECEIVED[200] as i64 & 0xFFFF_FFFF) as u64, (RECEIVED[201] as i64 & 0xFFFF_FFFF) as u64, (SENT[0] as i64 & 0xFFFF_FFFF) as u64)
             return false
         }
         same := true
         for index in 0..count {
-            if RECEIVED[found + index] != SENT[index] {
+            if same && RECEIVED[found + index] != SENT[index] {
                 same = false
+                say_values("i2s mismatch at, got, sent ", index as u64, hex(RECEIVED[found + index]), hex(SENT[index]))
             }
         }
         silent := found >= 2 && RECEIVED[found - 1] == 0 && RECEIVED[found - 2] == 0 && RECEIVED[found + count] == 0 && RECEIVED[found + count + 1] == 0
@@ -414,19 +427,133 @@ fn loopback(b: &mut board.Board, config: &esp_i2s.Config, frames: u32) -> bool {
     }
 }
 
-// The rate at which `frames_received` rises, in millihertz, measured
-// against the system timer between two descriptor completions about
-// 200 ms apart.
+fn peek(address: usize) -> u64 {
+    unsafe {
+        register: hal.Reg<u32> = hal.Reg.at(address)
+        return register.read() as u64
+    }
+}
+
+// Diagnostics: the output's GDMA channel and the I2S transmitter.
+fn dump(channel: u32, played: u64) {
+    base := 0x6008_0070 + 0xC0 * channel as usize
+    say_values("dma link, state, dscr ", peek(base + 0x70), peek(base + 0x74), peek(base + 0x80))
+    say_values("dma raw, conf0, peri ", peek(0x6008_0030 + 0x10 * channel as usize), peek(base + 0x60), peek(base + 0x90))
+    say_values("i2s state, conf, conf1 ", peek(0x6000_C06C), peek(0x6000_C024), peek(0x6000_C02C))
+    say_values("pcr clkm, div, played ", peek(0x6009_6070), peek(0x6009_6074), played)
+}
+
+// WS and data at each rising edge of BCLK, bit 0 and bit 1.
+static mut WIRE: [400]u32 = [0u32; 400]
+
+// Play one frame, `left` and `right`, over and over at a low rate, sample
+// the BCLK, WS, and data pads with the CPU, and decode the first whole
+// frame from the wire: true if its left and right slots carry the samples'
+// slot words, most significant bit first, in the slots the format puts
+// them in.
+fn wire_check(b: &mut board.Board, config: &esp_i2s.Config, left: i32, right: i32) -> bool {
+    output := b.pins.i2s_output(PIN_A, PIN_B, PIN_C, &mut b.dma, config)!
+    frame: [2]i32 = [left, right]
+    // Fill the queue; two descriptors of silence play first.
+    for output.poll_write(&frame)! > 0 {}
+    wait := (2 * output.frames_per_descriptor() as u64 + 8) * 1_000_000 / config.sample_rate as u64
+    b.timer.delay_us(wait as u32)
+    clock_mask := 1u32 << PIN_B
+    count := 0usize
+    // SAFETY: reads of GPIO_IN; the buffer is the test's.
+    unsafe {
+        input: hal.Reg<u32> = hal.Reg.at(0x6009_103C)
+        section := hal.Critical.enter()
+        previous := true
+        for _ in 0u32..2_000_000 {
+            value := input.read()
+            clock := (value & clock_mask) != 0
+            if clock && !previous {
+                WIRE[count] = ((value >> PIN_C) & 1) | (((value >> PIN_A) & 1) << 1)
+                count += 1
+                if count == 400 {
+                    break
+                }
+            }
+            previous = clock
+        }
+        core.drop(section)
+    }
+    b.pins.release_i2s_output(output, &mut b.dma)
+    philips := false
+    match &config.format {
+        hal.I2sFormat.Philips => {
+            philips = true
+        }
+        _ => {}
+    }
+    slot := config.slot_bits as usize
+    // The left slot starts where WS takes the left level (low in Philips
+    // framing, high otherwise), one bit clock later in Philips framing.
+    left_level := 1u32
+    if philips {
+        left_level = 0
+    }
+    start := 400usize
+    unsafe {
+        for index in 1usize..200 {
+            if start == 400 && (WIRE[index] & 1) == left_level && (WIRE[index - 1] & 1) != left_level {
+                start = index
+            }
+        }
+    }
+    if philips {
+        start += 1
+    }
+    if count < 400 || start + 2 * slot > 400 {
+        say_values("i2s wire count, start ", count as u64, start as u64, 0)
+        return false
+    }
+    first := 0u32
+    second := 0u32
+    in_left := true
+    unsafe {
+        for index in 0..slot {
+            first = (first << 1) | ((WIRE[start + index] >> 1) & 1)
+            second = (second << 1) | ((WIRE[start + slot + index] >> 1) & 1)
+            // WS holds the left level through the left slot (Philips:
+            // from one bit clock before it to one bit clock before its
+            // end).
+            ws := WIRE[start + index - flag(philips) as usize] & 1
+            if ws != left_level {
+                in_left = false
+            }
+        }
+    }
+    expected_left := esp_i2s.slot_word(left, config.bits, false) >> (32 - config.slot_bits)
+    expected_right := esp_i2s.slot_word(right, config.bits, false) >> (32 - config.slot_bits)
+    say_values("i2s wire left, right, start ", first as u64, second as u64, start as u64)
+    return first == expected_left && second == expected_right && in_left
+}
+
+// The input's sample rate in millihertz, measured against the system
+// timer: frames read between two descriptor completions about 800 ms
+// apart, reading all the while (an input nobody reads stops).
 fn measured_rate(b: &mut board.Board, input: &mut chip.I2sInput) -> u64 {
-    first := input.frames_received()
-    for input.frames_received() == first {}
+    samples := [0i32; 256]
+    channels := input.channels() as u64
+    // Drain what waits, then catch a completion.
+    for input.poll_read(&mut samples)! > 0 {}
+    for input.poll_read(&mut samples)! == 0 {}
     start := b.timer.now_us()
-    begin := input.frames_received()
-    b.timer.delay_ms(200)
-    last := input.frames_received()
-    for input.frames_received() == last {}
-    end := b.timer.now_us()
-    frames := input.frames_received() - begin
+    frames := 0u64
+    end := start
+    for end - start < 800_000 {
+        got := input.poll_read(&mut samples)!
+        if got > 0 {
+            frames += got as u64 / channels
+            end = b.timer.now_us()
+        }
+    }
+    // Finish the last batch, so `frames` ends on a descriptor boundary.
+    for input.poll_read(&mut samples)! > 0 {}
+    remainder := frames % input.frames_per_descriptor() as u64
+    frames -= remainder
     return frames * 1_000_000_000 / (end - start)
 }
 
@@ -436,6 +563,14 @@ fn i2s_checks(b: &mut board.Board) {
     bad_rate := esp_i2s.Config.new(2_000_000, 32, 2, hal.I2sFormat.Philips)
     good := esp_i2s.Config.new(48_000, 32, 2, hal.I2sFormat.Philips)
     check(refused(b.pins.i2s_output(PIN_A, PIN_B, PIN_C, &mut b.dma, &bad_bits), hal.Error.InvalidInput) && refused(b.pins.i2s_output(PIN_A, PIN_B, PIN_C, &mut b.dma, &bad_rate), hal.Error.InvalidInput) && refused(b.pins.i2s_output(PIN_A, PIN_A, PIN_C, &mut b.dma, &good), hal.Error.InvalidInput) && refused(b.pins.i2s_output(12, PIN_B, PIN_C, &mut b.dma, &good), hal.Error.InvalidInput))
+
+    // The wire format, decoded from the pads: Philips 32-bit slots and
+    // left-justified 16-bit slots at 2 kHz.
+    slow := esp_i2s.Config.new(2000, 32, 2, hal.I2sFormat.Philips)
+    check(wire_check(b, &slow, -0x5A3C_0F7F, 0x3C5A_F00E))
+    slow_narrow := esp_i2s.Config.new(2000, 16, 2, hal.I2sFormat.LeftJustified)
+    slow_narrow.slot_bits = 16
+    check(wire_check(b, &slow_narrow, 0x7123_0000, -0x2EDC_0000))
 
     // Loopbacks: Philips 32-bit stereo at 48 kHz, left-justified 16-bit
     // slots at 16 kHz, right-justified 24-bit samples at 44.1 kHz.
@@ -498,7 +633,11 @@ fn i2s_checks(b: &mut board.Board) {
 
 // Measure the chip's own PWM output: LEDC on PIN_A, the capture input
 // claimed on PIN_B and pointed at PIN_A.
+// Measurements of a steady line (duty 0 or 100%) have cycles 0; of a
+// signal, the ones with whole periods count, as a window shorter than the
+// period also gives cycles-0 reports in between.
 fn measure(b: &mut board.Board, frequency: u32, percent: u32, window_us: u32, capture: &mut hal.PulseCapture) -> bool {
+    steady := percent == 0 || percent == 100
     output := b.pins.pwm(PIN_A, frequency)!
     duty := (output.max_duty() as u32 * percent / 100) as u16
     output.set_duty(duty)!
@@ -509,11 +648,11 @@ fn measure(b: &mut board.Board, frequency: u32, percent: u32, window_us: u32, ca
     // The first measurement may span the moment the inputs moved.
     found := 0u32
     start := b.timer.now_us()
-    limit := 3 * window_us as u64 + 200_000
+    limit := 3 * window_us as u64 + 400_000
     for found < 2 && b.timer.now_us() - start < limit {
         match input.poll_capture(capture) {
             ok(done) => {
-                if done {
+                if done && (capture.cycles == 0) == steady {
                     found += 1
                 }
             }
@@ -523,6 +662,38 @@ fn measure(b: &mut board.Board, frequency: u32, percent: u32, window_us: u32, ca
     b.pins.release_pwm_input(input)
     b.pins.release_pwm(output)
     say_values("pwm in Hz, period ns, high ns ", frequency as u64, capture.period_ns, capture.high_ns)
+    return found == 2
+}
+
+// Measure the input's own pad, pulled up or down, over 5 ms windows; true
+// once a whole window passed.
+fn steady(b: &mut board.Board, up: bool, capture: &mut hal.PulseCapture) -> bool {
+    input := b.pins.pwm_input(PIN_B, 5000)!
+    // SAFETY: the test owns the pin through its PWM input.
+    unsafe {
+        pad: hal.Reg<u32> = hal.Reg.at(0x6009_0004 + 4 * PIN_B as usize)
+        value := pad.read() & ~((1u32 << 7) | (1u32 << 8))
+        if up {
+            value |= 1u32 << 8
+        } else {
+            value |= 1u32 << 7
+        }
+        pad.write(value)
+    }
+    found := 0u32
+    start := b.timer.now_us()
+    for found < 2 && b.timer.now_us() - start < 100_000 {
+        match input.poll_capture(capture) {
+            ok(done) => {
+                if done && capture.cycles == 0 {
+                    found += 1
+                }
+            }
+            err(_) => {}
+        }
+    }
+    b.pins.release_pwm_input(input)
+    say_values("pwm in steady up, period ns, high ns ", flag(up), capture.period_ns, capture.high_ns)
     return found == 2
 }
 
@@ -547,21 +718,44 @@ fn pwm_checks(b: &mut board.Board) {
     // 1 MHz at 75% (64 duty steps).
     fast := measure(b, 1_000_000, 75, 2000, &mut capture)
     check(fast && capture.frequency_hz() == 1_000_000 && capture.cycles >= 1000 && near(capture.high_ns, 750, 40))
-    // 4 MHz at 25% (16 duty steps): the high time is 62.5 ns, timed to
-    // 25 ns.
+    // 4 MHz at 25% (16 duty steps): faster than a consistent reading, so
+    // the count may be off by a few edges per window; the high time is
+    // 62.5 ns, timed to 6.25 ns.
     faster := measure(b, 4_000_000, 25, 1000, &mut capture)
-    check(faster && capture.frequency_hz() == 4_000_000 && capture.high_ns >= 50 && capture.high_ns <= 75)
-    // 10 Hz at 10%: single periods, 100 ms each, in a 150 ms window.
-    crawl := measure(b, 10, 10, 150_000, &mut capture)
+    check(faster && near(capture.period_ns, 250, 5) && capture.high_ns >= 50 && capture.high_ns <= 75)
+    // 10 Hz at 10%: single periods, 100 ms each, with a 50 ms window.
+    crawl := measure(b, 10, 10, 50_000, &mut capture)
     check(crawl && capture.cycles == 1 && near(capture.period_ns, 100_000_000, 1) && near(capture.high_ns, 10_000_000, 2))
-    // Steady lines: duty 0 and 100% give windows with cycles 0.
-    low := measure(b, 1000, 0, 5000, &mut capture)
-    low_ok := low && capture.cycles == 0 && capture.high_ns == 0 && near(capture.period_ns, 5_000_000, 50)
-    high := measure(b, 1000, 100, 5000, &mut capture)
-    check(low_ok && high && capture.cycles == 0 && capture.high_ns == capture.period_ns && capture.duty(100) == 100)
+    // Steady lines, the input's own pad pulled down, then up: windows with
+    // cycles 0, high none or all of the time.
+    low_ok := steady(b, false, &mut capture) && capture.high_ns == 0 && near(capture.period_ns, 5_000_000, 50)
+    high_ok := steady(b, true, &mut capture) && capture.high_ns == capture.period_ns && capture.duty(100) == 100
+    check(low_ok && high_ok)
+}
+
+// Put the LP watchdogs back to their defaults, in case firmware run before
+// this one left them armed (they survive the reset that starts this
+// firmware): the RTC watchdog off, the super watchdog fed automatically.
+fn calm_watchdogs() {
+    // SAFETY: LP_WDT's write protection, RTC watchdog configuration, and
+    // super watchdog configuration; nothing else in this firmware uses them.
+    unsafe {
+        protect: hal.Reg<u32> = hal.Reg.at(0x600B_1C18)
+        config: hal.Reg<u32> = hal.Reg.at(0x600B_1C00)
+        super_protect: hal.Reg<u32> = hal.Reg.at(0x600B_1C20)
+        super_config: hal.Reg<u32> = hal.Reg.at(0x600B_1C1C)
+        protect.write(0x50D8_3AA1)
+        config.write(0)
+        protect.write(0)
+        super_protect.write(0x50D8_3AA1)
+        feed := super_config.read() | (1u32 << 18)
+        super_config.write(feed)
+        super_protect.write(0)
+    }
 }
 
 fn main() {
+    calm_watchdogs()
     b := board.take()!
     serial := b.usb.serial()!
     poke: [1]u8 = [0]

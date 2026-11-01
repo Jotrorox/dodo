@@ -994,7 +994,6 @@ pub struct Pins {
         }
         match started {
             ok(stream) => {
-                enable(DMA_IN_CH0 + channel.number)
                 return ok(I2sInput { stream, dma: channel, data, bclk, ws, pins })
             }
             err(error) => {
@@ -1010,7 +1009,6 @@ pub struct Pins {
     // channel goes back to `dma`, and the pins it claimed are disconnected.
     pub fn release_i2s_input(&mut self, input: I2sInput, dma: &mut Dma) {
         let I2sInput { stream, dma: channel, data, bclk, ws, pins } = input
-        disable(DMA_IN_CH0 + channel.number)
         stream.stop()
         dma_memory_mode(&channel)
         dma.release(channel)
@@ -1022,8 +1020,8 @@ pub struct Pins {
     }
 
     // Claim `pin` as a PWM input that measures the frequency and duty
-    // cycle of the signal on it in windows of `window_us`, 1 us to 100 s:
-    // the MCPWM capture unit timestamps its edges to 25 ns and a PCNT unit
+    // cycle of the signal on it in windows of `window_us`, 1 us to 25 s:
+    // the MCPWM capture unit timestamps its edges to 6.25 ns and a PCNT unit
     // counts its rising edges, from 1 Hz (or slower, with a longer window)
     // to about 10 MHz; std/embedded/chip/esp_capture documents the
     // measurement and its precision. The pad never drives and has its
@@ -2036,8 +2034,8 @@ unsafe fn stop_i2s() {
 }
 
 // The PWM input's units: the MCPWM's bus clock and reset and its function
-// clock (the 160 MHz PLL output; the capture timer counts the APB clock),
-// and the PCNT's.
+// clock, the 160 MHz PLL output, which its capture timer counts; and the
+// PCNT's.
 // SAFETY: the caller owns both.
 unsafe fn start_capture() {
     unsafe {
@@ -3385,12 +3383,12 @@ pub struct I2sInput: hal.I2sInput {
     }
 
     // The frames received and not yet read.
-    pub fn available(&self) -> u32 {
+    pub fn available(&mut self) -> u32 {
         return self.stream.available()
     }
 
     // The frames received since the input started, a descriptor at a time.
-    pub fn frames_received(&self) -> u64 {
+    pub fn frames_received(&mut self) -> u64 {
         return self.stream.frames_received()
     }
 

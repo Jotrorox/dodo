@@ -48,24 +48,28 @@ import "std/embedded/hal"
 // Queues. Each direction streams through a GDMA channel taken from
 // esp32c6.Dma, over a ring of RING_DESCRIPTORS descriptors of
 // DESCRIPTOR_BYTES each that the channel follows round and round
-// (OUT_LINK, IN_LINK, owner checks off), so samples move in the background.
+// (OUT_LINK, IN_LINK), so samples move in the background.
 // A 32-bit slot takes 4 bytes and a frame of two 16-bit slots 4 bytes, so a
 // descriptor holds 64 frames, or 128 in 16-bit slots: 1.33 ms or 2.67 ms at
 // 48 kHz. The output queues at most RING_DESCRIPTORS - 2 descriptors ahead
-// of the one playing, 8 ms in 32-bit slots at 48 kHz; the input keeps
-// RING_DESCRIPTORS - 1 complete descriptors for poll_read, and returns
+// of the one playing, 8 ms in 32-bit slots at 48 kHz; the input keeps up to
+// RING_DESCRIPTORS complete descriptors for poll_read, 10.7 ms, and returns
 // samples a descriptor at a time, as each one completes.
 //
 // Running dry and overrunning. The channel's interrupt (a DMA_OUT_CHn
 // handler in the runtime, `dma_interrupt` here) zeroes each output
 // descriptor once the channel has read it, so an output whose queue runs
 // dry plays silence, a whole descriptor at a time, and the clocks never
-// stop; samples queued afterwards follow the silence. An input whose ring
-// fills before poll_read takes the samples drops the oldest descriptors:
-// poll_read reports hal.Error.Overrun once and then returns the samples
-// that follow. Each I2S DMA channel's interrupt must be enabled for this,
-// which the chip package does, and both depend on interrupts being taken
-// within a descriptor's time.
+// stop; samples queued afterwards follow the silence. The output channel
+// does not check descriptor owners, so it never stops; the output depends
+// on its interrupt (enabled by the chip package) being taken within a
+// descriptor's time. The input channel does check them: the channel hands
+// each descriptor back as it fills it (clearing its owner bit), poll_read
+// returns it to the channel once read, and a ring the program did not read
+// in time stops the channel at the first unread descriptor
+// (IN_DSCR_ERR). poll_read then reports hal.Error.Overrun once, drops what
+// the ring held, and restarts the receiver, so the samples that follow
+// begin with a left slot.
 //
 // Register names follow the ESP32-C6 technical reference manual (I2S
 // Controller, GDMA Controller).
@@ -121,7 +125,6 @@ const GDMA_STRIDE: usize = 0xC0
 const IN_CONF0: usize = 0x00
 const IN_CONF1: usize = 0x04
 const IN_LINK: usize = 0x10
-const IN_SUC_EOF_DES_ADDR: usize = 0x18
 const IN_PERI_SEL: usize = 0x30
 const OUT_CONF0: usize = 0x60
 const OUT_CONF1: usize = 0x64
@@ -139,9 +142,11 @@ const IN_LINK_STOP: u32 = 1 << 21
 const IN_LINK_START: u32 = 1 << 22
 const OUT_LINK_STOP: u32 = 1 << 20
 const OUT_LINK_START: u32 = 1 << 21
-// Interrupt bits: an input descriptor completed with EOF (IN_SUC_EOF), an
-// output descriptor with EOF was read (OUT_EOF).
-const IN_SUC_EOF: u32 = 1 << 1
+// Interrupt bits: the input channel met a descriptor it does not own or
+// ran out of them (IN_DSCR_ERR, IN_DSCR_EMPTY), an output descriptor with
+// EOF was read (OUT_EOF).
+const IN_STALLED: u32 = (1u32 << 3) | (1u32 << 4)
+const CHECK_OWNER: u32 = 1 << 12
 const OUT_EOF: u32 = 1 << 1
 const ALL_DMA_INTERRUPTS: u32 = 0x7F
 // I2S0 in GDMA's peripheral selection.
@@ -161,15 +166,15 @@ const DESCRIPTOR_WORDS: usize = 128
 // No channel.
 const NONE: u32 = 0xFF
 
-// The rings, their descriptors, and per direction the GDMA channel, or
-// NONE. COUNTERS: descriptors the output channel has read, the last one it
-// read, descriptors the input channel has completed, and the last one.
+// The rings, their descriptors, and the output's GDMA channel, or NONE.
+// COUNTERS: descriptors the output channel has read, and the last one it
+// read.
 static mut TX_RING: [1024]u32 = [0u32; 1024]
 static mut RX_RING: [1024]u32 = [0u32; 1024]
 static mut TX_DESCRIPTORS: [24]u32 = [0u32; 24]
 static mut RX_DESCRIPTORS: [24]u32 = [0u32; 24]
-static mut CHANNELS: [2]u32 = [0xFFu32, 0xFF]
-static mut COUNTERS: [4]u32 = [0u32; 4]
+static mut CHANNELS: [1]u32 = [0xFFu32]
+static mut COUNTERS: [2]u32 = [0u32; 2]
 // The output's BCLK and WS pins (BCLK in bits 15-8), for an input that
 // shares them, or NONE; and its sample rate and slot width.
 static mut OUTPUT_CLOCK: u32 = 0xFF
@@ -385,8 +390,8 @@ pub fn output_clock_pins() -> u32 {
 
 // The runtime's DMA interrupt handlers call this, through the chip
 // package's dodo_dma_interrupt, before anything else: it zeroes the output
-// descriptors the output channel has read and counts them, and counts the
-// input descriptors completed, acknowledging both interrupts.
+// descriptors the output channel has read and counts them, acknowledging
+// the interrupt.
 pub fn dma_interrupt() {
     // SAFETY: the rings' channels and counters, which the streams only read
     // or change with interrupts masked.
@@ -412,24 +417,6 @@ pub fn dma_interrupt() {
                     }
                     COUNTERS[1] = index
                     COUNTERS[0] = COUNTERS[0] + advance
-                }
-            }
-        }
-        input := CHANNELS[1]
-        if input != NONE {
-            interrupts := GDMA_IN_INT + 0x10 * input as usize
-            if (mmio.read32(interrupts + 4) & IN_SUC_EOF) != 0 {
-                mmio.write32(interrupts + 0xC, IN_SUC_EOF)
-                address := mmio.read32(GDMA_CHANNEL + GDMA_STRIDE * input as usize + IN_SUC_EOF_DES_ADDR) as usize
-                first := ptr.as_ptr(&RX_DESCRIPTORS) as usize
-                index := RING_DESCRIPTORS
-                if address >= first {
-                    index = ((address - first) / 12) as u32
-                }
-                if index < RING_DESCRIPTORS {
-                    advance := (index + RING_DESCRIPTORS - COUNTERS[3]) % RING_DESCRIPTORS
-                    COUNTERS[3] = index
-                    COUNTERS[2] = COUNTERS[2] + advance
                 }
             }
         }
@@ -574,8 +561,11 @@ pub struct Output {
                 tx |= WS_IDLE_HIGH
             }
             update(TX_CONF, tx)
-            // The channel: peripheral mode, no owner checks, the ring.
+            // The channel: peripheral mode, no owner checks, the ring. A
+            // channel set up for copies routes its output to its own input
+            // (IN_CONF0.MEM_TRANS_EN), which must be off.
             base := GDMA_CHANNEL + GDMA_STRIDE * channel as usize
+            mmio.write32(base + IN_CONF0, 0)
             mmio.write32(base + OUT_LINK, OUT_LINK_STOP)
             mmio.write32(base + OUT_CONF0, OUT_CONF | CHANNEL_RESET)
             mmio.write32(base + OUT_CONF0, OUT_CONF)
@@ -731,18 +721,22 @@ pub struct Input {
     right_justified: bool
     right: bool
     shared: bool
-    // The next frame to read: an absolute descriptor count, as the
-    // interrupt handler counts the ones completed, and a byte offset.
+    // RX_CONF while running, for restarts.
+    rx_conf: u32
+    // Absolute descriptor counts: the next one to read (with a byte offset
+    // into it), and the first one not yet seen complete; descriptor n is
+    // ring slot n % RING_DESCRIPTORS. And descriptors completed in all.
     read_at: u32
     read_offset: u32
+    seen: u32
+    completed: u32
 
     // Start the receiver with `config`'s stream through GDMA channel
     // `channel`: as master, or with `shared` as slave to the running
     // output's BCLK and WS. InvalidInput as for `check`, and with `shared`
     // unless an output runs at the same sample rate and slot width.
     // SAFETY: the caller owns I2S0's receiver (bus clock on, out of
-    // reset), the GDMA channel, and its DMA_IN interrupt, which must call
-    // dma_interrupt once enabled; it routes the pins.
+    // reset) and the GDMA channel; it routes the pins.
     pub unsafe fn start(channel: u32, shared: bool, config: &Config) -> Input!hal.Error {
         timing := check(config)?
         if shared {
@@ -763,44 +757,34 @@ pub struct Input {
             }
             Channel.Left => {}
         }
+        rx := MONO_FIRST_VALID | PCM_BYPASS | LEFT_ALIGN | TDM
+        if !philips {
+            rx |= WS_IDLE_HIGH
+        }
+        if shared {
+            rx |= SLAVE
+        }
         unsafe {
-            link_ring(&mut RX_DESCRIPTORS, ptr.as_ptr(&RX_RING) as usize, false)
-            section := hal.Critical.enter()
-            CHANNELS[1] = channel
-            COUNTERS[2] = 0
-            COUNTERS[3] = RING_DESCRIPTORS - 1
-            core.drop(section)
-            // The receiver's clock follows the transmitter's when shared.
             set_clock(PCR_I2S_RX_CLKM_CONF, PCR_I2S_RX_CLKM_DIV_CONF, &timing, 0)
             mmio.write32(RX_CONF, UNIT_RESET | FIFO_RESET)
             mmio.write32(RX_CONF1, conf1(config.slot_bits, timing.bit_divider, philips))
             mmio.write32(RX_TDM_CTRL, (1u32 << 16) | 0x3)
-            mmio.write32(RXEOF_NUM, DESCRIPTOR_BYTES * 8 / config.slot_bits - 1)
-            rx := MONO_FIRST_VALID | PCM_BYPASS | LEFT_ALIGN | TDM
-            if !philips {
-                rx |= WS_IDLE_HIGH
-            }
+            // EOFs as rarely as the field allows; their spacing is a
+            // multiple of a descriptor whether it counts samples or bytes.
+            mmio.write32(RXEOF_NUM, 0xFFF)
             if shared {
-                rx |= SLAVE
                 tx := mmio.read32(TX_CONF)
                 update(TX_CONF, tx | SIG_LOOPBACK)
             }
             update(RX_CONF, rx)
             base := GDMA_CHANNEL + GDMA_STRIDE * channel as usize
-            mmio.write32(base + IN_LINK, IN_LINK_STOP)
-            mmio.write32(base + IN_CONF0, IN_BURSTS | CHANNEL_RESET)
-            mmio.write32(base + IN_CONF0, IN_BURSTS)
-            mmio.write32(base + IN_CONF1, 0)
+            mmio.write32(base + IN_CONF1, CHECK_OWNER)
             mmio.write32(base + IN_PERI_SEL, PERIPHERAL_I2S)
-            interrupts := GDMA_IN_INT + 0x10 * channel as usize
-            mmio.write32(interrupts + 0xC, ALL_DMA_INTERRUPTS)
-            mmio.write32(interrupts + 8, IN_SUC_EOF)
-            cpu.fence()
-            first := ptr.as_ptr(&RX_DESCRIPTORS) as u32
-            mmio.write32(base + IN_LINK, (first & LINK_ADDRESS) | IN_LINK_START)
-            mmio.write32(RX_CONF, rx | START)
+            mmio.write32(GDMA_IN_INT + 0x10 * channel as usize + 8, 0)
         }
-        return ok(Input { channel, timing, bits: config.bits, channels: config.channels, slot_bits: config.slot_bits, right_justified, right, shared, read_at: 0, read_offset: 0 })
+        input := Input { channel, timing, bits: config.bits, channels: config.channels, slot_bits: config.slot_bits, right_justified, right, shared, rx_conf: rx, read_at: 0, read_offset: 0, seen: 0, completed: 0 }
+        input.run()
+        return ok(input)
     }
 
     // Frames per second, as asked for.
@@ -837,27 +821,27 @@ pub struct Input {
     // The samples received since the last call, as many whole frames as
     // fit `samples`, a descriptor at a time, without waiting; returns how
     // many samples. A 24-bit sample comes in the top 24 bits, the bits
-    // below zero. Overrun once after the ring filled up: the frames it held
-    // then are dropped, and the next call returns the samples that follow.
+    // below zero. Overrun once after the ring filled up and the channel
+    // stopped: the frames it held are dropped, the receiver restarts, and
+    // the next calls return the samples that follow.
     pub fn poll_read(&mut self, samples: &mut[i32]) -> usize!hal.Error {
-        completed := counter(2)
-        if completed > self.read_at + RING_DESCRIPTORS - 1 {
-            self.read_at = completed
-            self.read_offset = 0
+        if self.stalled() {
+            self.run()
             return err(hal.Error.Overrun)
         }
+        self.advance()
         channels := self.channels as usize
         frame_bytes := self.frame_bytes()
         frames := samples.len / channels
         done := 0usize
         cpu.fence()
-        for done < frames && self.read_at < completed {
+        for done < frames && self.read_at < self.seen {
             slot := (self.read_at % RING_DESCRIPTORS) as usize
             word := DESCRIPTOR_WORDS * slot + (self.read_offset / 4) as usize
             left := 0i32
             right := 0i32
-            // SAFETY: a descriptor the channel completed and will not
-            // write again until it has gone round the ring.
+            // SAFETY: a descriptor the channel completed and handed back;
+            // it waits for the owner bit before writing it again.
             unsafe {
                 if self.slot_bits == 16 {
                     pair := ptr.read_volatile(ptr.as_ptr(&RX_RING[word..word + 1]))
@@ -881,32 +865,30 @@ pub struct Input {
             done += 1
             self.read_offset += frame_bytes
             if self.read_offset >= DESCRIPTOR_BYTES {
+                // Hand the descriptor back to the channel.
                 self.read_offset = 0
+                cpu.fence()
+                // SAFETY: the descriptor is the program's until handed back.
+                unsafe {
+                    ptr.write_volatile(ptr.as_mut_ptr(&mut RX_DESCRIPTORS[3 * slot..3 * slot + 1]), DESCRIPTOR_BYTES | DESCRIPTOR_OWNED)
+                }
                 self.read_at += 1
             }
-        }
-        // The channel may have overwritten what was just read.
-        if counter(2) > self.read_at + RING_DESCRIPTORS - 1 {
-            self.read_at = counter(2)
-            self.read_offset = 0
-            return err(hal.Error.Overrun)
         }
         return ok(done * channels)
     }
 
     // The frames received and not yet read, in completed descriptors.
-    pub fn available(&self) -> u32 {
-        completed := counter(2)
-        if completed <= self.read_at {
-            return 0
-        }
-        return ((completed - self.read_at) * DESCRIPTOR_BYTES - self.read_offset) / self.frame_bytes()
+    pub fn available(&mut self) -> u32 {
+        self.advance()
+        return ((self.seen - self.read_at) * DESCRIPTOR_BYTES - self.read_offset) / self.frame_bytes()
     }
 
     // The frames received since the input started, a descriptor at a time:
-    // a count that rises at the sample rate.
-    pub fn frames_received(&self) -> u64 {
-        return counter(2) as u64 * (DESCRIPTOR_BYTES / self.frame_bytes()) as u64
+    // a count that rises at the sample rate while the program keeps up.
+    pub fn frames_received(&mut self) -> u64 {
+        self.advance()
+        return self.completed as u64 * (DESCRIPTOR_BYTES / self.frame_bytes()) as u64
     }
 
     // Frames per descriptor: 64 in 32-bit slots, 128 in 16-bit ones.
@@ -923,20 +905,64 @@ pub struct Input {
             mmio.write32(RX_CONF, mmio.read32(RX_CONF) & ~START)
             base := GDMA_CHANNEL + GDMA_STRIDE * self.channel as usize
             mmio.write32(base + IN_LINK, IN_LINK_STOP)
-            interrupts := GDMA_IN_INT + 0x10 * self.channel as usize
-            mmio.write32(interrupts + 8, 0)
-            mmio.write32(interrupts + 0xC, ALL_DMA_INTERRUPTS)
+            mmio.write32(GDMA_IN_INT + 0x10 * self.channel as usize + 0xC, ALL_DMA_INTERRUPTS)
             mmio.write32(RX_CONF, UNIT_RESET | FIFO_RESET)
             if self.shared {
                 tx := mmio.read32(TX_CONF)
                 update(TX_CONF, tx & ~SIG_LOOPBACK)
             }
             mmio.write32(PCR_I2S_RX_CLKM_CONF, mmio.read32(PCR_I2S_RX_CLKM_CONF) & ~CLKM_ENABLE)
-            section := hal.Critical.enter()
-            CHANNELS[1] = NONE
-            core.drop(section)
         }
         return self.channel
+    }
+
+    // Count the descriptors the channel handed back (owner bit clear).
+    fn advance(&mut self) {
+        for self.seen < self.read_at + RING_DESCRIPTORS {
+            slot := (self.seen % RING_DESCRIPTORS) as usize
+            // SAFETY: a word read of a descriptor the channel writes back.
+            word := unsafe {
+                ptr.read_volatile(ptr.as_ptr(&RX_DESCRIPTORS[3 * slot..3 * slot + 1]))
+            }
+            if (word & DESCRIPTOR_OWNED) != 0 {
+                return
+            }
+            self.seen += 1
+            self.completed += 1
+        }
+    }
+
+    // Whether the channel stopped at a descriptor the program had not
+    // handed back (IN_DSCR_ERR or IN_DSCR_EMPTY).
+    fn stalled(&mut self) -> bool {
+        // SAFETY: a read of the channel's raw interrupt bits.
+        unsafe {
+            return (mmio.read32(GDMA_IN_INT + 0x10 * self.channel as usize) & IN_STALLED) != 0
+        }
+    }
+
+    // (Re)start receiving into a fresh ring from its first descriptor.
+    fn run(&mut self) {
+        // SAFETY: the input owns the receiver, the channel, and the ring.
+        unsafe {
+            mmio.write32(RX_CONF, self.rx_conf)
+            base := GDMA_CHANNEL + GDMA_STRIDE * self.channel as usize
+            mmio.write32(base + IN_LINK, IN_LINK_STOP)
+            link_ring(&mut RX_DESCRIPTORS, ptr.as_ptr(&RX_RING) as usize, false)
+            mmio.write32(RX_CONF, self.rx_conf | UNIT_RESET | FIFO_RESET)
+            mmio.write32(base + IN_CONF0, IN_BURSTS | CHANNEL_RESET)
+            mmio.write32(base + IN_CONF0, IN_BURSTS)
+            mmio.write32(GDMA_IN_INT + 0x10 * self.channel as usize + 0xC, ALL_DMA_INTERRUPTS)
+            cpu.fence()
+            first := ptr.as_ptr(&RX_DESCRIPTORS) as u32
+            mmio.write32(base + IN_LINK, (first & LINK_ADDRESS) | IN_LINK_START)
+            mmio.write32(RX_CONF, self.rx_conf | START)
+        }
+        // The ring starts again at slot 0.
+        next := (self.seen / RING_DESCRIPTORS + 1) * RING_DESCRIPTORS
+        self.read_at = next
+        self.seen = next
+        self.read_offset = 0
     }
 
     fn frame_bytes(&self) -> u32 {
