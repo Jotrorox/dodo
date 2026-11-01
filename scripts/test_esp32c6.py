@@ -199,6 +199,10 @@ def read_part(fd, follow):
             except OSError:
                 if restarting:
                     return output, True
+                # DODO_ESP32C6_KEEP_OUTPUT=1: report what arrived before
+                # the board left the USB bus (it reset) instead of failing.
+                if os.environ.get("DODO_ESP32C6_KEEP_OUTPUT"):
+                    return output + b"\n(board disconnected)\n", False
                 raise
             if not data and restarting:
                 return output, True
