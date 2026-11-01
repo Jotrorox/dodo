@@ -1,0 +1,304 @@
+package jxl
+
+import "core/num"
+import "std/image/pixels"
+
+// Decoding one frame's sections into the modular arena (18181-1 annex G):
+// LfGlobal (patches, splines, noise, LF dequantization, the VarDCT globals
+// and GlobalModular), the LF groups, HfGlobal and the pass groups, then the
+// inverse of the global transforms.
+
+// Per-frame values of the frame being decoded.
+struct FrameVals {
+    // LfChannelDequantization multipliers (already divided by 128).
+    m_lf: [3]f32
+    // Channels of the global list decoded by GlobalModular.
+    gend: usize
+    // Logical bit position of the patches in LfGlobal.
+    patches_bit: u64
+    splines_bit: u64
+    // Noise LUT, and the frame counters seeding the noise generator.
+    noise_lut: [8]f32
+    visible: u32
+    nonvisible: u32
+    wp: [11]i32
+}
+
+// Section `index` of the frame: seek to it and limit reads to it. With a
+// single-entry TOC all sections are read in sequence from the one section.
+fn enter_section(r: &mut Reader, f: &FrameHeader, toc: &[u32], index: usize) -> void!pixels.Error {
+    if f.toc_entries == 1 {
+        if index == 0 {
+            r.seek_byte(f.data_start)
+            if f.data_start as u64 + toc[1] as u64 > num.MAX as u64 {
+                return err(pixels.Error.TooLarge)
+            }
+            r.set_limit(f.data_start + toc[1] as usize)
+        }
+        return ok()
+    }
+    if index >= f.toc_entries as usize {
+        return err(pixels.Error.Malformed)
+    }
+    start := f.data_start as u64 + toc[2 * index] as u64
+    end := start + toc[2 * index + 1] as u64
+    if end > num.MAX as u64 {
+        return err(pixels.Error.TooLarge)
+    }
+    r.seek_byte(start as usize)
+    r.set_limit(end as usize)
+    return ok()
+}
+
+fn leave_section(r: &mut Reader, f: &FrameHeader) -> void!pixels.Error {
+    if r.overrun {
+        return err(pixels.Error.Truncated)
+    }
+    if r.broken {
+        return err(pixels.Error.Malformed)
+    }
+    return ok()
+}
+
+// Note where the splines of LfGlobal start and parse past them.
+fn skip_splines(r: &mut Reader, f: &FrameHeader, tcode: &mut Code, n1: &mut Code, n2: &mut Code, window: &mut[u32], vals: &mut FrameVals) -> void!pixels.Error {
+    vals.splines_bit = r.position()
+    if (f.flags & FLAG_SPLINES) == 0 {
+        return ok()
+    }
+    e1 := [0.0f32; 1]
+    e2 := [0i32; 1]
+    e3 := [0.0f32; 1]
+    return splines(r, f, tcode, n1, n2, window, false, &mut e1, 0, 0, &mut e2, &mut e3, 0.0, 1.0)
+}
+
+// The noise LUT of LfGlobal (when the frame has noise).
+fn read_noise(r: &mut Reader, f: &FrameHeader, vals: &mut FrameVals) {
+    if (f.flags & FLAG_NOISE) != 0 {
+        for i in 0usize..8 {
+            vals.noise_lut[i] = r.bits(10) as f32 / 1024.0
+        }
+    }
+}
+
+// Allocate the frame's channels and describe them in gch.
+fn setup_channels(h: &ImageHeader, f: &FrameHeader, work: &mut ModularWork, gch: &mut ChanList, gtr: &mut TrList, gstash: &mut ChanList) -> void!pixels.Error {
+    work.arena_used = 0
+    gch.reset()
+    gtr.count = 0
+    gstash.reset()
+    w := f.sample_width as usize
+    hh := f.sample_height as usize
+    if f.modular {
+        for c in 0u32..f.color_channels {
+            // YCbCr chroma channels may be subsampled.
+            hs := 0u32
+            vs := 0u32
+            if f.ycbcr {
+                hs = chroma_shift(f, c as usize, false)
+                vs = chroma_shift(f, c as usize, true)
+            }
+            cw := ceil_shift(w as u64, hs)
+            ch := ceil_shift(hh as u64, vs)
+            off := work.alloc(cw * ch)?
+            at := gch.count
+            gch.insert(at)?
+            gch.set(at, off, cw as usize, cw as usize, ch as usize, hs as i32, vs as i32)
+        }
+    }
+    for i in 0usize..h.num_extra as usize {
+        shift := ec_shift(f, i)
+        ew := ceil_shift(w as u64, shift) as usize
+        eh := ceil_shift(hh as u64, shift) as usize
+        off := work.alloc(ew as u64 * eh as u64)?
+        at := gch.count
+        gch.insert(at)?
+        gch.set(at, off, ew, ew, eh, shift as i32, shift as i32)
+    }
+    return ok()
+}
+
+// Pass p covers channel shifts [pass_min[p], pass_max[p]).
+fn pass_ranges(f: &FrameHeader, pass_min: &mut[i32], pass_max: &mut[i32]) {
+    for p in 0usize..MAX_PASSES {
+        pass_min[p] = 0
+        pass_max[p] = 0
+    }
+    maxshift := 3i32
+    for i in 0usize..f.num_ds as usize {
+        minshift := log2_exact(f.downsample[i]) as i32
+        p := f.last_pass[i] as usize
+        pass_min[p] = minshift
+        pass_max[p] = maxshift
+        maxshift = minshift
+    }
+    last := (f.num_passes - 1) as usize
+    pass_min[last] = 0
+    pass_max[last] = maxshift
+}
+
+// Build fb.lch for one group: tiles of the global channels gend.. that
+// belong to this stage. `lf` selects LF-group channels (both shifts >= 3);
+// otherwise pass `pass` of group (gx, gy).
+fn group_channels(f: &FrameHeader, gch: &ChanList, gend: usize, lch: &mut ChanList, ltr: &mut TrList, lstash: &mut ChanList, lf: bool, pass: usize, gx: usize, gy: usize, pass_min: &[i32], pass_max: &[i32]) -> void!pixels.Error {
+    lch.reset()
+    ltr.count = 0
+    lstash.reset()
+    group_dim := f.group_dim as usize
+    for i in gend..gch.count {
+        hs := gch.hshift(i)
+        vs := gch.vshift(i)
+        if hs < 0 || vs < 0 {
+            return err(pixels.Error.Malformed)
+        }
+        is_lf := hs >= 3 && vs >= 3
+        if lf != is_lf {
+            continue
+        }
+        tile_w := 0usize
+        tile_h := 0usize
+        if lf {
+            tile_w = (group_dim << 3) >> (hs as usize)
+            tile_h = (group_dim << 3) >> (vs as usize)
+        } else {
+            shift := hs
+            if vs < shift {
+                shift = vs
+            }
+            owner := MAX_PASSES
+            for p in 0usize..f.num_passes as usize {
+                if shift >= pass_min[p] && shift < pass_max[p] {
+                    owner = p
+                    break
+                }
+            }
+            if owner == MAX_PASSES {
+                return err(pixels.Error.Malformed)
+            }
+            if owner != pass {
+                continue
+            }
+            if hs > 30 || vs > 30 {
+                return err(pixels.Error.Malformed)
+            }
+            tile_w = group_dim >> (hs as usize)
+            tile_h = group_dim >> (vs as usize)
+        }
+        if tile_w == 0 || tile_h == 0 {
+            return err(pixels.Error.Malformed)
+        }
+        w := gch.width(i)
+        h := gch.height(i)
+        x0 := gx * tile_w
+        y0 := gy * tile_h
+        if x0 >= w || y0 >= h {
+            continue
+        }
+        tw := w - x0
+        if tw > tile_w {
+            tw = tile_w
+        }
+        th := h - y0
+        if th > tile_h {
+            th = tile_h
+        }
+        stride := gch.stride(i)
+        at := lch.count
+        lch.insert(at)?
+        lch.set(at, gch.offset(i) + y0 * stride + x0, stride, tw, th, hs, vs)
+    }
+    return ok()
+}
+
+// Decode a group's modular stream (if it has channels) and undo its local
+// transforms; local palette storage is released afterwards.
+fn decode_group_stream(r: &mut Reader, h: &ImageHeader, f: &FrameHeader, work: &mut ModularWork, gcode: &Code, lcode: &mut Code, tcode: &mut Code, n1: &mut Code, n2: &mut Code, window: &mut[u32], lch: &mut ChanList, ltr: &mut TrList, lstash: &mut ChanList, wp: &mut[i32], stream_index: u32) -> void!pixels.Error {
+    if lch.count == 0 {
+        return ok()
+    }
+    mark := work.arena_used
+    decode_stream(r, work, gcode, lcode, tcode, n1, n2, window, lch, ltr, lstash, wp, false, f.group_dim as usize, stream_index)?
+    inverse_transforms(work, lch, ltr, lstash, wp, h.bits)?
+    work.arena_used = mark
+    return ok()
+}
+
+// Decode all sections of a frame into the arena.
+fn decode_frame_data(r: &mut Reader, h: &ImageHeader, f: &FrameHeader, work: &mut ModularWork, gcode: &mut Code, lcode: &mut Code, tcode: &mut Code, n1: &mut Code, n2: &mut Code, window: &mut[u32], gch: &mut ChanList, lch: &mut ChanList, gstash: &mut ChanList, lstash: &mut ChanList, gtr: &mut TrList, ltr: &mut TrList, toc: &[u32], vals: &mut FrameVals, vb: &mut VBufs, planes: &mut[f32], t: &mut[f32], hcode: &mut Code) -> void!pixels.Error {
+    if !f.modular {
+        return decode_vardct_frame(r, h, f, work, gcode, lcode, tcode, n1, n2, window, gch, lch, gstash, lstash, gtr, ltr, toc, vals, vb, planes, t, hcode)
+    }
+    // Only VarDCT frames take their LF from an LF frame.
+    if (f.flags & FLAG_USE_LF_FRAME) != 0 {
+        return err(pixels.Error.Unsupported)
+    }
+    setup_channels(h, f, work, gch, gtr, gstash)?
+    // LfGlobal.
+    enter_section(r, f, toc, 0)?
+    vals.patches_bit = r.position()
+    if (f.flags & FLAG_PATCHES) != 0 {
+        skip_patches(r, h, f, tcode, n1, n2, window)?
+    }
+    skip_splines(r, f, tcode, n1, n2, window, vals)?
+    read_noise(r, f, vals)
+    vals.m_lf = [1.0f32 / 4096.0, 1.0 / 512.0, 1.0 / 256.0]
+    if !r.bit() {
+        for c in 0usize..3 {
+            vals.m_lf[c] = r.f16() / 128.0
+            if vals.m_lf[c] < 0.00000001 {
+                return err(pixels.Error.Malformed)
+            }
+        }
+    }
+    // GlobalModular: the optional global tree, then the global stream.
+    work.gtree_nodes = 0
+    if r.bit() {
+        nch := f.color_channels as u64 + h.num_extra as u64
+        limit := 1024 + f.width as u64 * f.height as u64 * nch / 16
+        if limit > 4194304 {
+            limit = 4194304
+        }
+        work.gtree_nodes = read_tree(r, limit, work.gtree, tcode, n1, n2, window, gcode)?
+    }
+    vals.gend = 0
+    if gch.count > 0 {
+        vals.gend = decode_stream(r, work, gcode, lcode, tcode, n1, n2, window, gch, gtr, gstash, &mut vals.wp, true, f.group_dim as usize, 0)?
+    }
+    leave_section(r, f)?
+    num_lf := f.num_lf_groups() as usize
+    num_groups := f.num_groups() as usize
+    gend := vals.gend
+    // LF groups.
+    for g in 0usize..num_lf {
+        enter_section(r, f, toc, 1 + g)?
+        gx := g % f.lf_groups_x as usize
+        gy := g / f.lf_groups_x as usize
+        pm := [0i32; MAX_PASSES]
+        px := [0i32; MAX_PASSES]
+        group_channels(f, gch, gend, lch, ltr, lstash, true, 0, gx, gy, &pm, &px)?
+        decode_group_stream(r, h, f, work, gcode, lcode, tcode, n1, n2, window, lch, ltr, lstash, &mut vals.wp, (1 + num_lf + g) as u32)?
+        leave_section(r, f)?
+    }
+    // HfGlobal is empty for modular frames.
+    pass_min := [0i32; MAX_PASSES]
+    pass_max := [0i32; MAX_PASSES]
+    pass_ranges(f, &mut pass_min, &mut pass_max)
+    for p in 0usize..f.num_passes as usize {
+        for g in 0usize..num_groups {
+            enter_section(r, f, toc, 2 + num_lf + p * num_groups + g)?
+            gx := g % f.groups_x as usize
+            gy := g / f.groups_x as usize
+            group_channels(f, gch, gend, lch, ltr, lstash, false, p, gx, gy, &pass_min, &pass_max)?
+            decode_group_stream(r, h, f, work, gcode, lcode, tcode, n1, n2, window, lch, ltr, lstash, &mut vals.wp, (1 + 3 * num_lf + 17 + p * num_groups + g) as u32)?
+            leave_section(r, f)?
+        }
+    }
+    r.clear_limit()
+    inverse_transforms(work, gch, gtr, gstash, &vals.wp, h.bits)?
+    // The channel list is back to color then extra channels.
+    expected := h.num_extra as usize + f.color_channels as usize
+    if gch.count != expected {
+        return err(pixels.Error.Malformed)
+    }
+    return ok()
+}

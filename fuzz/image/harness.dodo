@@ -1,0 +1,230 @@
+package main
+
+import "std/console"
+import "std/env"
+import "std/fs"
+import "std/platform"
+import "targets"
+
+// Runs the std/image fuzz targets (fuzz/image/targets) on files, so that
+// crashes found by any campaign reproduce outside it:
+//
+//     dodo build fuzz/image/harness.dodo -o build/image-harness
+//     build/image-harness png crash.png             one or more files
+//     build/image-harness png -                     standard input
+//     build/image-harness png --batch cases.bin     length-prefixed batch
+//     build/image-harness --verbose png crash.png   print every stage's outcome
+//     build/image-harness --list                    target names
+//
+// A batch file is a sequence of records, each a 4-byte little-endian length
+// followed by that many bytes; tests/image_fuzz.rs writes them. Before each
+// input the harness prints "@<index>" so that a trap or hang can be pinned on
+// one record, and after an input that asked for 16 MiB of scratch or more
+// (or skipped work at a cap) "scratch <index> <bytes> <width> <height>
+// <skipped> <frame_sized>" (frame_sized is 1 when the size may follow JPEG
+// XL frame dimensions, which can exceed the image's). "done <count>" ends a successful run. Traps abort the process
+// with the runtime's message on standard error.
+
+const INPUT_CAP: usize = 67108864
+const REPORT_SCRATCH: u64 = 16777216
+
+static mut INPUT: [INPUT_CAP]u8 = [0u8; INPUT_CAP]
+
+fn usage() -> i32 {
+    console.println("usage: image-harness [--verbose] TARGET FILE... | TARGET - | TARGET --batch FILE | --list")!
+    return 2
+}
+
+fn report(index: usize) {
+    scratch := targets.largest_scratch()
+    skipped := targets.skipped()
+    if scratch >= REPORT_SCRATCH || skipped > 0 {
+        frame_sized := 0u32
+        if targets.frame_sized() {
+            frame_sized = 1
+        }
+        console.printf("scratch {} {} {} {} {} {}\n", index, scratch, targets.largest_width(), targets.largest_height(), skipped, frame_sized)!
+    }
+}
+
+fn run_one(target: u32, index: usize, data: &[u8]) {
+    console.printf("@{}\n", index)!
+    targets.run(target, data)
+    report(index)
+}
+
+// Read `path` into INPUT; returns the length, or none after printing why.
+fn load(path: &str) -> Option<usize> {
+    workspace := platform.workspace()
+    unsafe {
+        match fs.read_file(path, &mut INPUT, &mut workspace) {
+            ok(value) => {
+                if !value.eof {
+                    console.printf("{} is larger than the input buffer\n", path)!
+                    return none
+                }
+                return some(value.read)
+            }
+            err(_) => {
+                console.printf("cannot read {}\n", path)!
+                return none
+            }
+        }
+    }
+}
+
+fn load_stdin() -> usize {
+    input := console.stdin()
+    used := 0usize
+    unsafe {
+        for used < INPUT_CAP {
+            count := match input.read(&mut INPUT[used..]) {
+                ok(value) => value,
+                err(_) => {
+                    0usize
+                },
+            }
+            if count == 0 {
+                break
+            }
+            used += count
+        }
+    }
+    return used
+}
+
+fn le32(data: &[u8], offset: usize) -> usize {
+    return data[offset] as usize | (data[offset + 1] as usize << 8) | (data[offset + 2] as usize << 16) | (data[offset + 3] as usize << 24)
+}
+
+fn run_batch(target: u32, length: usize) -> i32 {
+    position := 0usize
+    index := 0usize
+    unsafe {
+        for position < length {
+            if length - position < 4 {
+                console.println("batch: truncated record header")!
+                return 2
+            }
+            size := le32(&INPUT, position)
+            position += 4
+            if size > length - position {
+                console.println("batch: truncated record")!
+                return 2
+            }
+            run_one(target, index, &INPUT[position..position + size])
+            position += size
+            index += 1
+        }
+    }
+    console.printf("done {}\n", index)!
+    return 0
+}
+
+fn run() -> i32 {
+    storage := platform.list_workspace()
+    arguments := match env.Arguments.capture(&mut storage, platform.TextPolicy.Strict) {
+        ok(value) => value,
+        err(_) => {
+            return usage()
+        },
+    }
+    first_argument := 1usize
+    flag_storage := [0u8; 64]
+    match arguments.get(1, &mut flag_storage) {
+        ok(some(flag)) => {
+            if targets.same_text(flag, "--verbose") {
+                targets.set_verbose(true)
+                first_argument = 2
+            }
+        }
+        ok(none) => {}
+        err(_) => {}
+    }
+    name_storage := [0u8; 64]
+    name := match arguments.get(first_argument, &mut name_storage) {
+        ok(some(value)) => value,
+        ok(none) => {
+            return usage()
+        },
+        err(_) => {
+            return usage()
+        },
+    }
+    if targets.same_text(name, "--list") {
+        for t in 0u32..targets.TARGET_COUNT {
+            console.println(targets.target_name(t))!
+        }
+        return 0
+    }
+    target := targets.target_id(name)
+    if target == targets.TARGET_COUNT {
+        console.printf("unknown target {}\n", name)!
+        return usage()
+    }
+    path_storage := [0u8; 4096]
+    first := match arguments.get(first_argument + 1, &mut path_storage) {
+        ok(some(value)) => value,
+        ok(none) => {
+            return usage()
+        },
+        err(_) => {
+            return usage()
+        },
+    }
+    if targets.same_text(first, "--batch") {
+        batch_storage := [0u8; 4096]
+        path := match arguments.get(first_argument + 2, &mut batch_storage) {
+            ok(some(value)) => value,
+            ok(none) => {
+                return usage()
+            },
+            err(_) => {
+                return usage()
+            },
+        }
+        length := match load(path) {
+            some(value) => value,
+            none => {
+                return 1
+            },
+        }
+        return run_batch(target, length)
+    }
+    if targets.same_text(first, "-") {
+        length := load_stdin()
+        unsafe {
+            run_one(target, 0, &INPUT[..length])
+        }
+        console.println("done 1")!
+        return 0
+    }
+    count := arguments.len()
+    for index in first_argument + 1..count {
+        file_storage := [0u8; 4096]
+        path := match arguments.get(index, &mut file_storage) {
+            ok(some(value)) => value,
+            ok(none) => {
+                return usage()
+            },
+            err(_) => {
+                return usage()
+            },
+        }
+        length := match load(path) {
+            some(value) => value,
+            none => {
+                return 1
+            },
+        }
+        unsafe {
+            run_one(target, index - first_argument - 1, &INPUT[..length])
+        }
+    }
+    console.printf("done {}\n", count - first_argument - 1)!
+    return 0
+}
+
+fn main() -> i32 {
+    return run()
+}

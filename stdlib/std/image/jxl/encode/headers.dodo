@@ -1,0 +1,311 @@
+package encode
+
+import "std/image/color"
+import "std/image/shared/binary"
+
+// Codestream headers (signature, SizeHeader, ImageMetadata with the color
+// encoding, FrameHeader, TOC) and the ISOBMFF container boxes.
+
+// What the image headers describe.
+struct Shape {
+    width: u32
+    height: u32
+    // 1 (gray) or 3 (RGB).
+    color_channels: usize
+    alpha: bool
+    // Bits per sample: 8 or 16 for integers, 16 or 32 for floats.
+    bits: u32
+    float: bool
+    alpha_associated: bool
+    // EXIF orientation 1..8.
+    orientation: u32
+}
+
+fn write_image_header(w: &mut BitWriter, shape: &Shape, info: &color.ColorInfo) {
+    w.write(16, 0x0AFF)
+    write_size(w, shape.width, shape.height)
+    // ImageMetadata: never all-default since samples are not XYB.
+    w.write(1, 0)
+    extra := shape.orientation != 1
+    w.bit(extra)
+    if extra {
+        w.write(3, (shape.orientation - 1) as u64)
+        // No intrinsic size, preview or animation.
+        w.write(3, 0)
+    }
+    write_bit_depth(w, shape.bits, shape.float)
+    // 16-bit buffers suffice for 8-bit integer samples, transforms included.
+    w.bit(!shape.float && shape.bits <= 8)
+    if shape.alpha {
+        w.u32(1, 0, 0, 1, 0, 2, 4, 1, 12)
+        if !shape.float && shape.bits == 8 && !shape.alpha_associated {
+            // Default extra channel: 8-bit straight alpha.
+            w.write(1, 1)
+        } else {
+            w.write(1, 0)
+            w.enumeration(0)
+            write_bit_depth(w, shape.bits, shape.float)
+            // dim_shift 0, empty name.
+            w.write(2, 0)
+            w.write(2, 0)
+            w.bit(shape.alpha_associated)
+        }
+    } else {
+        w.u32(0, 0, 0, 1, 0, 2, 4, 1, 12)
+    }
+    // Not XYB encoded.
+    w.write(1, 0)
+    write_color_encoding(w, info, shape.color_channels == 1)
+    if extra {
+        // Default tone mapping.
+        w.write(1, 1)
+    }
+    w.u64_zero()
+    // Default transform data (no custom upsampling weights).
+    w.write(1, 1)
+}
+
+fn write_bit_depth(w: &mut BitWriter, bits: u32, float: bool) {
+    if float {
+        w.write(1, 1)
+        w.u32(bits, 32, 0, 16, 0, 24, 0, 1, 6)
+        if bits == 32 {
+            w.write(4, 7)
+        } else {
+            w.write(4, 4)
+        }
+    } else {
+        w.write(1, 0)
+        w.u32(bits, 8, 0, 10, 0, 12, 0, 1, 6)
+    }
+}
+
+// Width for SizeHeader ratio code r (1..7) given the height.
+fn ratio_width(r: u32, height: u32) -> u64 {
+    h := height as u64
+    if r == 1 {
+        return h
+    }
+    if r == 2 {
+        return h * 6 / 5
+    }
+    if r == 3 {
+        return h * 4 / 3
+    }
+    if r == 4 {
+        return h * 3 / 2
+    }
+    if r == 5 {
+        return h * 16 / 9
+    }
+    if r == 6 {
+        return h * 5 / 4
+    }
+    return h * 2
+}
+
+fn write_size(w: &mut BitWriter, width: u32, height: u32) {
+    ratio := 0u32
+    for r in 1u32..8 {
+        if ratio == 0 && ratio_width(r, height) == width as u64 {
+            ratio = r
+        }
+    }
+    small_height := height % 8 == 0 && height <= 256
+    small_width := width % 8 == 0 && width <= 256
+    div8 := small_height && (ratio != 0 || small_width)
+    w.bit(div8)
+    if div8 {
+        w.write(5, (height / 8 - 1) as u64)
+    } else {
+        w.u32(height, 1, 9, 1, 13, 1, 18, 1, 30)
+    }
+    w.write(3, ratio as u64)
+    if ratio == 0 {
+        if div8 {
+            w.write(5, (width / 8 - 1) as u64)
+        } else {
+            w.u32(width, 1, 9, 1, 13, 1, 18, 1, 30)
+        }
+    }
+}
+
+// JPEG XL enum values for the color encoding.
+const WHITE_D65: u32 = 1
+const WHITE_CUSTOM: u32 = 2
+const WHITE_DCI: u32 = 11
+const PRIM_SRGB: u32 = 1
+const PRIM_CUSTOM: u32 = 2
+const PRIM_2100: u32 = 9
+const PRIM_P3: u32 = 11
+const TF_709: u32 = 1
+const TF_LINEAR: u32 = 8
+const TF_SRGB: u32 = 13
+const TF_PQ: u32 = 16
+const TF_DCI: u32 = 17
+const TF_HLG: u32 = 18
+
+// ColorEncoding from CICP code points. Named CICP primaries and transfer
+// curves map to their JPEG XL enums, custom chromaticities and power-law
+// gammas are written explicitly, and anything else falls back to sRGB. An
+// ICC profile cannot be embedded; its CICP fields are used instead.
+fn write_color_encoding(w: &mut BitWriter, info: &color.ColorInfo, gray: bool) {
+    white := WHITE_D65
+    primaries := PRIM_SRGB
+    custom := info.custom_primaries && info.primaries == color.PRIMARIES_UNSPECIFIED && info.white_x != 0 && info.white_y != 0
+    if custom {
+        white = WHITE_CUSTOM
+        primaries = PRIM_CUSTOM
+    } else if info.primaries == color.PRIMARIES_BT2020 {
+        primaries = PRIM_2100
+    } else if info.primaries == color.PRIMARIES_DISPLAY_P3 {
+        primaries = PRIM_P3
+    } else if info.primaries == color.PRIMARIES_DCI_P3 {
+        primaries = PRIM_P3
+        white = WHITE_DCI
+    }
+    tf := TF_SRGB
+    gamma := 0u32
+    t := info.transfer
+    if t == color.TRANSFER_SRGB {
+        tf = TF_SRGB
+    } else if t == color.TRANSFER_LINEAR {
+        tf = TF_LINEAR
+    } else if t == color.TRANSFER_BT709 || t == color.TRANSFER_BT601 || t == color.TRANSFER_BT2020_10 || t == color.TRANSFER_BT2020_12 {
+        tf = TF_709
+    } else if t == color.TRANSFER_PQ {
+        tf = TF_PQ
+    } else if t == color.TRANSFER_HLG {
+        tf = TF_HLG
+    } else if t == color.TRANSFER_SMPTE428 {
+        tf = TF_DCI
+    } else if info.gamma > 0 && info.gamma <= 100000 {
+        gamma = info.gamma * 100
+    } else if t == color.TRANSFER_GAMMA22 {
+        gamma = 4545455
+    } else if t == color.TRANSFER_GAMMA28 {
+        gamma = 3571429
+    }
+    intent := info.intent as u32
+    if intent > 3 {
+        intent = 1
+    }
+    all_default := !gray && white == WHITE_D65 && primaries == PRIM_SRGB && gamma == 0 && tf == TF_SRGB && intent == 1
+    w.bit(all_default)
+    if all_default {
+        return
+    }
+    // No ICC profile; RGB or gray.
+    w.write(1, 0)
+    if gray {
+        w.enumeration(1)
+    } else {
+        w.enumeration(0)
+    }
+    w.enumeration(white)
+    if white == WHITE_CUSTOM {
+        write_xy(w, info.white_x, info.white_y)
+    }
+    if !gray {
+        w.enumeration(primaries)
+        if primaries == PRIM_CUSTOM {
+            write_xy(w, info.red_x, info.red_y)
+            write_xy(w, info.green_x, info.green_y)
+            write_xy(w, info.blue_x, info.blue_y)
+        }
+    }
+    if gamma != 0 {
+        w.write(1, 1)
+        w.write(24, gamma as u64)
+    } else {
+        w.write(1, 0)
+        w.enumeration(tf)
+    }
+    w.enumeration(intent)
+}
+
+// A chromaticity pair given x 100000, stored x 1000000.
+fn write_xy(w: &mut BitWriter, x: u32, y: u32) {
+    w.u32(pack_signed(x as i64 * 10) as u32, 0, 19, 524288, 19, 1048576, 20, 2097152, 21)
+    w.u32(pack_signed(y as i64 * 10) as u32, 0, 19, 524288, 19, 1048576, 20, 2097152, 21)
+}
+
+// FrameHeader of the single, final, lossless modular frame with 256x256
+// groups and one pass, followed by the TOC permutation flag.
+fn write_frame_header(w: &mut BitWriter, alpha: bool) {
+    w.pad()
+    // Not all-default; regular frame; modular; no flags; no YCbCr.
+    w.write(1, 0)
+    w.write(2, 0)
+    w.write(1, 1)
+    w.u64_zero()
+    w.write(1, 0)
+    // Upsampling 1 for color and alpha.
+    w.write(2, 0)
+    if alpha {
+        w.write(2, 0)
+    }
+    // group_size_shift 1: 256x256 groups.
+    w.write(2, 1)
+    // One pass, no crop, replace blending.
+    w.write(2, 0)
+    w.write(1, 0)
+    w.write(2, 0)
+    if alpha {
+        w.write(2, 0)
+    }
+    // is_last, no name.
+    w.write(1, 1)
+    w.write(2, 0)
+    // Restoration filter: no Gaborish, no EPF, no extensions.
+    w.write(1, 0)
+    w.write(1, 0)
+    w.write(2, 0)
+    w.u64_zero()
+    // No frame header extensions; TOC not permuted.
+    w.u64_zero()
+    w.write(1, 0)
+    w.pad()
+}
+
+// Bits of one TOC entry.
+fn toc_entry_bits(size: u32) -> u32 {
+    if size < 1024 {
+        return 12
+    }
+    if size < 17408 {
+        return 16
+    }
+    if size < 4211712 {
+        return 24
+    }
+    return 32
+}
+
+fn write_toc_entry(w: &mut BitWriter, size: u32) {
+    w.u32(size, 0, 10, 1024, 14, 17408, 22, 4211712, 30)
+}
+
+// ---------------------------------------------------------------------------
+// Container
+
+const SIGNATURE_BOX: [12]u8 = [0, 0, 0, 12, 0x4A, 0x58, 0x4C, 0x20, 0x0D, 0x0A, 0x87, 0x0A]
+const FTYP_BOX: [20]u8 = [0, 0, 0, 20, 0x66, 0x74, 0x79, 0x70, 0x6A, 0x78, 0x6C, 0x20, 0, 0, 0, 0, 0x6A, 0x78, 0x6C, 0x20]
+
+// Write a box header (size including the header, four-character type) at
+// output[offset..offset + 8]; the caller checked the output length.
+fn put_box_header(output: &mut[u8], offset: usize, size: u32, kind: &[u8]) {
+    binary.put_be32(output, offset, size)
+    for i in 0usize..4 {
+        output[offset + 4 + i] = kind[i]
+    }
+}
+
+// Byte offset of the TIFF header inside an EXIF payload: 6 after an
+// "Exif\0\0" prefix (as in JPEG APP1), else 0.
+fn exif_tiff_offset(exif: &[u8]) -> u32 {
+    if exif.len >= 6 && exif[0] == 0x45 && exif[1] == 0x78 && exif[2] == 0x69 && exif[3] == 0x66 && exif[4] == 0 && exif[5] == 0 {
+        return 6
+    }
+    return 0
+}

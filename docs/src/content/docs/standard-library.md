@@ -46,6 +46,8 @@ they are not prerequisites for using the safe entry APIs.
 | Decode or encode JSON | `@derive(Json)` and `json.decode<T>` | [JSON](json.md) |
 | Store values | `fixed_vector.Vector.new` with `Option<T>` slots | [Collections](collections.md) |
 | Draw shapes, text, or images | `graphics.canvas` over a byte array | [Graphics](graphics.md) |
+| Decode or encode PNG, QOI, BMP or Netpbm files | `image.info`, `image.decode` and `image.encode` with caller buffers | [Images](image.md) |
+| Load, resize and save an image file | `image_alloc.load`, `picture.resize` and `picture.save_auto` | [Images](image.md#owned-images-and-files) |
 | Draw smooth shapes, gradients, or TrueType text | `canvas.aa_fill_circle`, `graphics.Gradient`, `truetype.Font.new` | [Graphics](graphics.md#antialiased-drawing) |
 | Open windows | `window.App.new`, `app.open` and `win.canvas()` | [Windows](window.md) |
 | Render with the GPU through OpenGL | `opengl.Context.create`, `opengl.Target.new` and the `gl` commands | [OpenGL](opengl.md) |
@@ -200,6 +202,7 @@ individual modules and links every public declaration back to its source.
 | [Mathematics](math.md) | `std/math`, `std/math/trig` | Portable. |
 | [Hashing and checksums](hash.md) | `std/checksum`, `std/hash` | Portable. |
 | [Graphics](graphics.md) | `std/graphics`, `std/graphics/fake`, `std/graphics/font`, `std/graphics/image`, `std/graphics/truetype`; panels in `std/embedded/display`, `std/embedded/display/st7789`, `std/embedded/display/ssd1306` | Portable; caller-supplied pixel and file buffers. |
+| [Images](image.md) | `std/image`, `std/image/pixels`, `std/image/color`, `std/image/convert`, `std/image/sink`, `std/image/meta`, `std/image/ops`, `std/image/shared/binary`, `std/image/shared/scratch`, `std/image/shared/isobmff`, `std/image/ppm`, `std/image/qoi`, `std/image/bmp`, `std/image/png`, `std/image/jxl`, `std/image/jxl/encode`; owned images and files in `std/image_alloc` | Portable with caller-supplied pixel, scratch and file buffers; `std/image_alloc` adds an explicit allocator and hosted files. |
 | [Windows](window.md) | `std/window`, `std/window/x11` | Hosted: X11 on Linux, AppKit on macOS, Win32 on Windows; the X11 protocol code is portable. |
 | [OpenGL](opengl.md) | `std/gpu/opengl`, `std/gpu/opengl/gl` | Hosted: EGL on Linux, CGL on macOS, WGL on Windows, loaded at run time; the generated binding is portable. |
 | [Metal](metal.md) | `std/gpu/metal`, `std/gpu/metal/objc` | macOS only (Apple silicon and Intel); links Metal, QuartzCore and Foundation. |

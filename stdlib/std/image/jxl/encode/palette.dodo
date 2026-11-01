@@ -1,0 +1,173 @@
+package encode
+
+import "std/image/pixels"
+
+// Palette detection: a small open-addressing hash of the distinct colors
+// (all channels of a pixel, 8 or 16 bits each) in caller scratch.
+
+const MAX_PALETTE: usize = 1024
+const HASH_SLOTS: usize = 4096
+// u32 words: colors (channel-major, c * MAX_PALETTE + i), sort keys, then
+// hash keys (low, high) and values (index + 1, 0 when empty).
+const PALETTE_WORDS: usize = 5 * MAX_PALETTE + 3 * HASH_SLOTS
+const HASH_LOW: usize = 5 * MAX_PALETTE
+const HASH_HIGH: usize = 5 * MAX_PALETTE + HASH_SLOTS
+const HASH_VALUE: usize = 5 * MAX_PALETTE + 2 * HASH_SLOTS
+
+fn slot_of(low: u32, high: u32) -> usize {
+    h := core.wrapping_mul(low, 2654435761u32) ^ core.wrapping_mul(high ^ 0x5bd1e995, 2246822519u32)
+    return ((h >> 20) as usize) & (HASH_SLOTS - 1)
+}
+
+// The color of pixel x of `row` packed into two words.
+fn pixel_key(row: &[u8], x: usize, channels: usize, wide: bool) -> u64 {
+    if !wide {
+        start := x * channels
+        key := 0u64
+        for c in 0usize..channels {
+            key = key | ((row[start + c] as u64) << ((8 * c) as u64))
+        }
+        return key
+    }
+    start := x * channels * 2
+    key := 0u64
+    for c in 0usize..channels {
+        key = key | ((pixels.get16(row, start + 2 * c) as u64) << ((16 * c) as u64))
+    }
+    return key
+}
+
+// Insert a color; returns false when the table already holds `limit`
+// colors and this one is new.
+fn palette_insert(words: &mut[u32], key: u64, count: &mut usize, limit: usize) -> bool {
+    low := (key & 0xFFFFFFFF) as u32
+    high := (key >> 32) as u32
+    s := slot_of(low, high)
+    for {
+        v := words[HASH_VALUE + s]
+        if v == 0 {
+            if *count >= limit {
+                return false
+            }
+            words[HASH_LOW + s] = low
+            words[HASH_HIGH + s] = high
+            *count += 1
+            words[HASH_VALUE + s] = *count as u32
+            return true
+        }
+        if words[HASH_LOW + s] == low && words[HASH_HIGH + s] == high {
+            return true
+        }
+        s = (s + 1) & (HASH_SLOTS - 1)
+    }
+}
+
+// Index of a color known to be in the palette.
+fn palette_index(words: &[u32], key: u64) -> i32 {
+    low := (key & 0xFFFFFFFF) as u32
+    high := (key >> 32) as u32
+    s := slot_of(low, high)
+    for words[HASH_VALUE + s] != 0 {
+        if words[HASH_LOW + s] == low && words[HASH_HIGH + s] == high {
+            return words[HASH_VALUE + s] as i32 - 1
+        }
+        s = (s + 1) & (HASH_SLOTS - 1)
+    }
+    return 0
+}
+
+// Count the distinct colors of the image; 0 when there are more than
+// `limit`. On success the colors are sorted (by luma, then alpha, then
+// value) into words[c * MAX_PALETTE + i] and the hash maps colors to their
+// sorted index.
+fn find_palette(source: &pixels.View, channels: usize, wide: bool, limit: usize, words: &mut[u32]) -> usize {
+    for i in 0usize..HASH_SLOTS {
+        words[HASH_VALUE + i] = 0
+    }
+    count := 0usize
+    width := source.width() as usize
+    height := source.height()
+    for y in 0u32..height {
+        row := source.row(y)
+        for x in 0usize..width {
+            key := pixel_key(row, x, channels, wide)
+            if !palette_insert(words, key, &mut count, limit) {
+                return 0
+            }
+        }
+    }
+    // Gather colors and sort keys.
+    keys := [0u64; 1024]
+    order := [0u32; 1024]
+    at := 0usize
+    shift := 8u64
+    mask := 255u64
+    if wide {
+        shift = 16
+        mask = 65535
+    }
+    for s in 0usize..HASH_SLOTS {
+        if words[HASH_VALUE + s] != 0 {
+            keys[at] = (words[HASH_LOW + s] as u64) | ((words[HASH_HIGH + s] as u64) << 32)
+            order[at] = at as u32
+            at += 1
+        }
+    }
+    for i in 0usize..count {
+        k := keys[i]
+        c0 := k & mask
+        c1 := (k >> shift) & mask
+        c2 := (k >> (2 * shift)) & mask
+        c3 := (k >> (3 * shift)) & mask
+        luma := c0
+        alpha := 0u64
+        if channels == 2 {
+            alpha = c1
+        } else if channels >= 3 {
+            luma = (c0 * 299 + c1 * 587 + c2 * 114) / 1000
+            if channels == 4 {
+                alpha = c3
+            }
+        }
+        words[4 * MAX_PALETTE + i] = ((luma << 16) | alpha) as u32
+    }
+    // Insertion sort on (sort key, color) keeps the order deterministic.
+    for i in 1usize..count {
+        o := order[i]
+        j := i
+        for j > 0 && before(words, &keys, o as usize, order[j - 1] as usize) {
+            order[j] = order[j - 1]
+            j -= 1
+        }
+        order[j] = o
+    }
+    for i in 0usize..HASH_SLOTS {
+        words[HASH_VALUE + i] = 0
+    }
+    for i in 0usize..count {
+        k := keys[order[i] as usize]
+        for c in 0usize..channels {
+            words[c * MAX_PALETTE + i] = ((k >> (c as u64 * shift)) & mask) as u32
+        }
+        // Re-insert with the sorted index.
+        low := (k & 0xFFFFFFFF) as u32
+        high := (k >> 32) as u32
+        s := slot_of(low, high)
+        for words[HASH_VALUE + s] != 0 {
+            s = (s + 1) & (HASH_SLOTS - 1)
+        }
+        words[HASH_LOW + s] = low
+        words[HASH_HIGH + s] = high
+        words[HASH_VALUE + s] = (i + 1) as u32
+    }
+    return count
+}
+
+fn before(words: &[u32], keys: &[u64], a: usize, b: usize) -> bool {
+    ka := words[4 * MAX_PALETTE + a]
+    kb := words[4 * MAX_PALETTE + b]
+    if ka != kb {
+        return ka < kb
+    }
+    return keys[a] < keys[b]
+}

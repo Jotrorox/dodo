@@ -1,0 +1,425 @@
+package codecs
+
+import "std/fs"
+import "std/image/color"
+import "std/image/convert"
+import "std/image/meta"
+import "std/image/pixels"
+import "std/image/ppm"
+import "std/image/sink"
+import "std/platform"
+import "std/platform/error"
+import "std/text"
+
+// PPM/PGM/PAM/PFM decoding against tests/image/codecs/fixtures (each NAME
+// with NAME.raw, the native pixels, written by generate_raster.py), encoder
+// round trips in several layouts, and malformed input. The raster_ helpers
+// here are shared with qoi_test.dodo and bmp_test.dodo.
+
+const RASTER_FILE_LIMIT: usize = 16384
+const RASTER_PIXEL_LIMIT: usize = 8192
+
+fn raster_read(name: &str, output: &mut[u8]) -> usize {
+    path_storage := [0u8; 256]
+    builder := text.Builder.new(&mut path_storage)
+    directory := text.Text.from_str("tests/image/codecs/fixtures/")
+    builder.append(&directory)!
+    base := text.Text.from_str(name)
+    builder.append(&base)!
+    built := builder.as_text()
+    workspace := platform.workspace()
+    match fs.read_file(built.as_str(), output, &mut workspace) {
+        ok(report) => {
+            assert(report.eof, "fixture larger than the test's buffer")
+            return report.read
+        }
+        err(reason) => {
+            assert(reason.cause.kind != error.Kind.NotFound, "fixture missing: run from the repository root, or run tests/image/codecs/generate_raster.py")
+            assert(false, "fixture unreadable")
+            return 0
+        }
+    }
+}
+
+// Collects rects into tightly packed rows in the header's native layout,
+// checking that every rect arrives in that layout and inside the image.
+struct RasterCapture {
+    data: &mut[u8]
+    width: u32
+    height: u32
+    bpp: usize
+    layout: pixels.Layout
+    pixels: u64
+
+    fn new(data: &mut[u8]) -> RasterCapture from(data) {
+        return RasterCapture { data: data, width: 0, height: 0, bpp: 0, layout: pixels.Layout.rgba8(), pixels: 0 }
+    }
+    pub fn begin(&mut self, header: &pixels.Header) -> void!pixels.Error {
+        self.width = header.width
+        self.height = header.height
+        self.layout = header.native.clone()
+        self.bpp = header.native.bytes_per_pixel()
+        assert(header.width as usize * header.height as usize * self.bpp <= self.data.len, "capture too small")
+        return ok()
+    }
+    pub fn rect(&mut self, x: u32, y: u32, source: &pixels.View) -> void!pixels.Error {
+        assert(source.layout().equals(&self.layout), "rect not in the native layout")
+        assert(x + source.width() <= self.width && y + source.height() <= self.height, "rect outside the image")
+        row := source.width() as usize * self.bpp
+        for r in 0u32..source.height() {
+            line := source.row(r)
+            start := ((y + r) as usize * self.width as usize + x as usize) * self.bpp
+            for i in 0usize..row {
+                self.data[start + i] = line[i]
+            }
+        }
+        self.pixels += source.width() as u64 * source.height() as u64
+        return ok()
+    }
+}
+
+// The bytes the captured image occupies.
+fn raster_size(header: &pixels.Header) -> usize {
+    return header.width as usize * header.height as usize * header.native.bytes_per_pixel()
+}
+
+fn raster_same(a: &[u8], b: &[u8], name: &str) {
+    assert(a.len == b.len, name)
+    for i in 0usize..a.len {
+        assert(a[i] == b[i], name)
+    }
+}
+
+// Fill `data` with a width x height pattern in `layout`, every channel
+// varying, from straight 16-bit RGBA.
+fn raster_pattern(data: &mut[u8], width: u32, height: u32, layout: &pixels.Layout, seed: u32) {
+    row := width as usize * layout.bytes_per_pixel()
+    wide := [0u16; 4]
+    for y in 0u32..height {
+        for x in 0u32..width {
+            h := core.wrapping_mul(x * 7919 + y * 104729 + seed, 2654435761u32)
+            wide[0] = (h >> 16) as u16
+            wide[1] = (core.wrapping_mul(h, 40503u32) & 0xffff) as u16
+            wide[2] = ((x * 977 + y * 31) & 0xffff) as u16
+            wide[3] = ((h >> 3) & 0xffff) as u16
+            if (x + y) % 5 == 0 {
+                wide[3] = 65535
+            }
+            start := y as usize * row
+            convert.store_rgba16(&wide, &mut data[start..start + row], layout, x as usize, 1)
+        }
+    }
+}
+
+// The decoded native pixels equal `source` converted to their layout.
+fn raster_expect(source: &pixels.View, decoded: &[u8], layout: &pixels.Layout, name: &str) {
+    width := source.width()
+    row := width as usize * layout.bytes_per_pixel()
+    expected := [0u8; 1024]
+    assert(row <= expected.len, name)
+    source_layout := source.layout().clone()
+    for y in 0u32..source.height() {
+        convert.row(source.row(y), &source_layout, 0, &mut expected, layout, 0, width as usize)
+        line := &decoded[y as usize * row..(y as usize + 1) * row]
+        if layout.sample_code() == pixels.SAMPLE_F32 {
+            // Float luma may round differently from the integer path.
+            for i in 0usize..row / 4 {
+                a := pixels.get32(&expected, i * 4)
+                b := pixels.get32(line, i * 4)
+                assert(a == b || (a > b && a - b <= 2) || (b > a && b - a <= 2), name)
+            }
+        } else {
+            raster_same(&expected[..row], line, name)
+        }
+    }
+}
+
+fn raster_layouts(k: usize) -> pixels.Layout {
+    if k == 0 {
+        return pixels.Layout.gray8()
+    }
+    if k == 1 {
+        return pixels.Layout.gray_alpha8()
+    }
+    if k == 2 {
+        return pixels.Layout.rgb8()
+    }
+    if k == 3 {
+        return pixels.Layout.rgba8()
+    }
+    if k == 4 {
+        return pixels.Layout.rgb16()
+    }
+    if k == 5 {
+        return pixels.Layout.rgba16()
+    }
+    if k == 6 {
+        return pixels.Layout.gray16()
+    }
+    if k == 7 {
+        return pixels.Layout.rgb_f32()
+    }
+    return pixels.Layout.rgba_f32()
+}
+
+const RASTER_LAYOUTS: usize = 9
+
+fn ppm_native(name: &str, raw: &str, channels: usize, sample: u32, bit_depth: u32) {
+    raster_file := [0u8; RASTER_FILE_LIMIT]
+    raster_raw := [0u8; RASTER_FILE_LIMIT]
+    raster_pixels := [0u8; RASTER_PIXEL_LIMIT]
+    unsafe {
+        length := raster_read(name, &mut raster_file)
+        file := &raster_file[..length]
+        raw_length := raster_read(raw, &mut raster_raw)
+        assert(ppm.matches(file), name)
+        header := ppm.info(file)!
+        assert(header.format == pixels.Format.Ppm, name)
+        assert(header.native.channel_count() == channels && header.native.sample_code() == sample, name)
+        assert(header.bit_depth == bit_depth, name)
+        assert_eq(ppm.scratch_size(file)!, 0usize)
+        capture := RasterCapture.new(&mut raster_pixels)
+        empty := [0u8; 0]
+        ppm.decode(file, &mut capture, &mut empty)!
+        assert(capture.pixels == header.width as u64 * header.height as u64, name)
+        raster_same(&raster_pixels[..raster_size(&header)], &raster_raw[..raw_length], name)
+        found := ppm.metadata(file)!
+        assert(!found.exif.present() && !found.xmp.present() && !found.icc.present(), name)
+    }
+}
+
+@test
+fn ppm_fixtures_decode_to_native_layouts() {
+    raster_file := [0u8; RASTER_FILE_LIMIT]
+    raster_pixels := [0u8; RASTER_PIXEL_LIMIT]
+    ppm_native("p5_maxval15.ppm", "p5_maxval15.raw", 1, pixels.SAMPLE_U8, 4)
+    ppm_native("p6_maxval1000.ppm", "p6_maxval1000.raw", 3, pixels.SAMPLE_U16, 10)
+    ppm_native("p6_16.ppm", "p6_16.raw", 3, pixels.SAMPLE_U16, 16)
+    ppm_native("p5_16.ppm", "p5_16.raw", 1, pixels.SAMPLE_U16, 16)
+    ppm_native("p6_8.ppm", "p6_8.raw", 3, pixels.SAMPLE_U8, 8)
+    ppm_native("pam_gray.pam", "pam_gray.raw", 1, pixels.SAMPLE_U8, 8)
+    ppm_native("pam_gray_alpha16.pam", "pam_gray_alpha16.raw", 2, pixels.SAMPLE_U16, 16)
+    ppm_native("pam_rgb.pam", "pam_rgb.raw", 3, pixels.SAMPLE_U8, 8)
+    ppm_native("pam_rgba.pam", "pam_rgba.raw", 4, pixels.SAMPLE_U8, 8)
+    ppm_native("pam_rgba16.pam", "pam_rgba16.raw", 4, pixels.SAMPLE_U16, 16)
+    ppm_native("pam_bw.pam", "pam_bw.raw", 1, pixels.SAMPLE_U8, 1)
+    ppm_native("pam_bw_alpha.pam", "pam_bw_alpha.raw", 2, pixels.SAMPLE_U8, 1)
+    ppm_native("pam_notype.pam", "pam_notype.raw", 4, pixels.SAMPLE_U8, 8)
+    ppm_native("pam_maxval100.pam", "pam_maxval100.raw", 3, pixels.SAMPLE_U8, 7)
+    ppm_native("pfm_rgb.pfm", "pfm_rgb.raw", 3, pixels.SAMPLE_F32, 32)
+    ppm_native("pfm_gray_be.pfm", "pfm_gray_be.raw", 1, pixels.SAMPLE_F32, 32)
+    unsafe {
+        pfm_name := "pfm_rgb.pfm"
+        length := raster_read(pfm_name, &mut raster_file)
+        header := ppm.info(&raster_file[..length])!
+        assert(header.color.is_linear())
+        // Pixel (1, 0) is (-0.5, 2.5, 1e10): out-of-range values are kept.
+        capture := RasterCapture.new(&mut raster_pixels)
+        empty := [0u8; 0]
+        ppm.decode(&raster_file[..length], &mut capture, &mut empty)!
+        assert_eq(pixels.get32(&raster_pixels, 12), convert.f32_bits(-0.5f32))
+        assert_eq(pixels.get32(&raster_pixels, 16), convert.f32_bits(2.5f32))
+        // 16-bit PPM samples survive exactly: first sample of p6_16.
+        ppm_name := "p6_16.ppm"
+        length = raster_read(ppm_name, &mut raster_file)
+        file := &raster_file[..length]
+        capture2 := RasterCapture.new(&mut raster_pixels)
+        ppm.decode(file, &mut capture2, &mut empty)!
+        start := length - 5 * 3 * 3 * 2
+        assert_eq(pixels.get16(&raster_pixels, 0) as u32, ((file[start] as u32) << 8) | (file[start + 1] as u32))
+    }
+}
+
+@test
+fn ppm_converts_through_view_sink() {
+    raster_file := [0u8; RASTER_FILE_LIMIT]
+    raster_raw := [0u8; RASTER_FILE_LIMIT]
+    raster_pixels := [0u8; RASTER_PIXEL_LIMIT]
+    unsafe {
+        pam_name := "pam_rgba16.pam"
+        raw_name := "pam_rgba16.raw"
+        length := raster_read(pam_name, &mut raster_file)
+        file := &raster_file[..length]
+        raw_length := raster_read(raw_name, &mut raster_raw)
+        native := pixels.View.new(&raster_raw[..raw_length], 2, 2, pixels.Layout.rgba16())!
+        for k in 0usize..RASTER_LAYOUTS {
+            layout := raster_layouts(k)
+            target := pixels.ViewMut.new(&mut raster_pixels, 2, 2, layout.clone())!
+            view_sink := sink.ViewSink.new(&mut target)
+            empty := [0u8; 0]
+            ppm.decode(file, &mut view_sink, &mut empty)!
+            raster_expect(&native, &raster_pixels, &layout, "pam_rgba16 into layouts")
+        }
+    }
+}
+
+fn ppm_round_trip(layout: &pixels.Layout, kind: u32, width: u32, height: u32, name: &str) {
+    raster_pixels := [0u8; RASTER_PIXEL_LIMIT]
+    raster_source := [0u8; RASTER_PIXEL_LIMIT]
+    raster_encoded := [0u8; RASTER_FILE_LIMIT]
+    unsafe {
+        size := pixels.bytes_needed(width, height, layout)!
+        raster_pattern(&mut raster_source, width, height, layout, kind * 17 + layout.sample_code())
+        if layout.is_float() {
+            // Out-of-range float samples survive PFM.
+            pixels.put32(&mut raster_source, 0, convert.f32_bits(-0.75f32))
+            pixels.put32(&mut raster_source, 4, convert.f32_bits(12.5f32))
+        }
+        source := pixels.View.new(&raster_source[..size], width, height, layout.clone())!
+        options := ppm.EncodeOptions.new()
+        options.kind = kind
+        total := ppm.max_encoded_size(width, height, layout, &options)!
+        assert_eq(ppm.encode_scratch_size(width, height, layout, &options)!, 0usize)
+        empty := [0u8; 0]
+        length := ppm.encode(&source, &options, &mut raster_encoded, &mut empty)!
+        assert(length == total, name)
+        match ppm.encode(&source, &options, &mut raster_encoded[..total - 1], &mut empty) {
+            ok(_) => {
+                assert(false, name)
+            }
+            err(reason) => {
+                assert(reason == pixels.Error.BufferTooSmall, name)
+            }
+        }
+        header := ppm.info(&raster_encoded[..length])!
+        assert(header.width == width && header.height == height, name)
+        capture := RasterCapture.new(&mut raster_pixels)
+        ppm.decode(&raster_encoded[..length], &mut capture, &mut empty)!
+        raster_expect(&source, &raster_pixels, &header.native, name)
+        if layout.is_float() && header.native.is_float() {
+            assert(pixels.get32(&raster_pixels, 0) == convert.f32_bits(-0.75f32), name)
+        }
+    }
+}
+
+@test
+fn ppm_encoders_round_trip() {
+    for k in 0usize..RASTER_LAYOUTS {
+        layout := raster_layouts(k)
+        ppm_round_trip(&layout, ppm.KIND_AUTO, 70, 5, "auto")
+        ppm_round_trip(&layout, ppm.KIND_PAM, 3, 2, "pam")
+        ppm_round_trip(&layout, ppm.KIND_PFM, 5, 3, "pfm")
+        ppm_round_trip(&layout, ppm.KIND_PPM, 4, 4, "ppm")
+        ppm_round_trip(&layout, ppm.KIND_PGM, 1, 1, "pgm")
+    }
+    // The automatic choices.
+    empty := [0u8; 0]
+    output := [0u8; 128]
+    data := [0u8; 16]
+    options := ppm.EncodeOptions.new()
+    for k in 0usize..RASTER_LAYOUTS {
+        layout := raster_layouts(k)
+        view := pixels.View.new(&data, 1, 1, layout.clone())!
+        ppm.encode(&view, &options, &mut output, &mut empty)!
+        expected := b'6'
+        if layout.is_float() {
+            expected = b'F'
+        } else if layout.has_alpha() {
+            expected = b'7'
+        } else if layout.is_gray() {
+            expected = b'5'
+        }
+        assert(output[0] == b'P' && output[1] == expected)
+    }
+    // The exact header of an 8-bit P6 file.
+    rgb := [1u8, 2, 3, 4, 5, 6]
+    view := pixels.View.new(&rgb, 2, 1, pixels.Layout.rgb8())!
+    length := ppm.encode(&view, &options, &mut output, &mut empty)!
+    expected := [b'P', b'6', 10, b'2', b' ', b'1', 10, b'2', b'5', b'5', 10, 1, 2, 3, 4, 5, 6]
+    raster_same(&output[..length], &expected, "P6 bytes")
+    options.kind = 9
+    rgb_layout := pixels.Layout.rgb8()
+    match ppm.max_encoded_size(2, 1, &rgb_layout, &options) {
+        ok(_) => {
+            assert(false)
+        }
+        err(reason) => {
+            assert(reason == pixels.Error.Unsupported)
+        }
+    }
+}
+
+fn ppm_expect_error(text: &[u8], expected: pixels.Error) {
+    match ppm.info(text) {
+        ok(_) => {
+            assert(false, "malformed header accepted")
+        }
+        err(reason) => {
+            assert(reason == expected, pixels.error_name(reason))
+        }
+    }
+}
+
+@test
+fn ppm_rejects_malformed_files() {
+    ppm_expect_error(b"P3\n1 1\n255\n0 0 0", pixels.Error.Unsupported)
+    ppm_expect_error(b"P4\n1 1\n0", pixels.Error.Unsupported)
+    ppm_expect_error(b"P9\n1 1\n255\n", pixels.Error.Malformed)
+    ppm_expect_error(b"P6\n1 1\n0\n", pixels.Error.Malformed)
+    ppm_expect_error(b"P6\n1 1\n65536\n", pixels.Error.Malformed)
+    ppm_expect_error(b"P6\n1 1\n255", pixels.Error.Truncated)
+    ppm_expect_error(b"P6\n99999999 1\n255\n", pixels.Error.TooLarge)
+    ppm_expect_error(b"P6\nx 1\n255\n", pixels.Error.Malformed)
+    ppm_expect_error(b"P7\nWIDTH 1\nHEIGHT 1\nDEPTH 5\nMAXVAL 255\nENDHDR\n", pixels.Error.Unsupported)
+    ppm_expect_error(b"P7\nWIDTH 1\nHEIGHT 1\nDEPTH 3\nMAXVAL 255\nTUPLTYPE GRAYSCALE\nENDHDR\n", pixels.Error.Malformed)
+    ppm_expect_error(b"P7\nWIDTH 1\nDEPTH 3\nMAXVAL 255\nENDHDR\n", pixels.Error.Malformed)
+    ppm_expect_error(b"P7\nWIDTH 1\nHEIGHT 1\nDEPTH 3\nMAXVAL 255\n", pixels.Error.Truncated)
+    ppm_expect_error(b"P7\nWIDTH 1\nBOGUS 3\nENDHDR\n", pixels.Error.Malformed)
+    ppm_expect_error(b"PF\n1 1\n0.0\n", pixels.Error.Malformed)
+    ppm_expect_error(b"PF\n1 1\n-1.0x\n", pixels.Error.Malformed)
+    ppm_expect_error(b"PF\n1 1\n-1.0", pixels.Error.Truncated)
+    assert(!ppm.matches(b"P3\n"))
+    assert(!ppm.matches(b"P6"))
+    assert(ppm.matches(b"Pf\n"))
+
+    // Data shorter than the header promises.
+    sink_storage := sink.NullSink.new()
+    empty := [0u8; 0]
+    match ppm.decode(b"P5\n2 2\n255\n\x01\x02\x03", &mut sink_storage, &mut empty) {
+        ok() => {
+            assert(false)
+        }
+        err(reason) => {
+            assert(reason == pixels.Error.Truncated)
+        }
+    }
+}
+
+// Every prefix of a file fails cleanly or decodes; none traps.
+fn raster_prefixes_ppm(name: &str) {
+    raster_file := [0u8; RASTER_FILE_LIMIT]
+    unsafe {
+        length := raster_read(name, &mut raster_file)
+        empty := [0u8; 0]
+        for cut in 0usize..length + 1 {
+            data := &raster_file[..cut]
+            null_sink := sink.NullSink.new()
+            match ppm.decode(data, &mut null_sink, &mut empty) {
+                ok() => {
+                    assert(cut == length, name)
+                }
+                err(reason) => {
+                    assert(cut < length, name)
+                    assert(reason == pixels.Error.Truncated || reason == pixels.Error.Malformed, name)
+                }
+            }
+            match ppm.info(data) {
+                ok(_) => {}
+                err(_) => {}
+            }
+            match ppm.metadata(data) {
+                ok(_) => {}
+                err(_) => {}
+            }
+        }
+    }
+}
+
+@test
+fn ppm_prefixes_fail_cleanly() {
+    raster_prefixes_ppm("p6_maxval1000.ppm")
+    raster_prefixes_ppm("p5_maxval15.ppm")
+    raster_prefixes_ppm("pam_gray_alpha16.pam")
+    raster_prefixes_ppm("pfm_gray_be.pfm")
+    raster_prefixes_ppm("pfm_rgb.pfm")
+}

@@ -1,0 +1,595 @@
+package pixels
+
+import "core/num"
+import "std/image/color"
+
+// The image data model shared by every codec: errors, formats, pixel
+// layouts, borrowed views of pixel storage, and the header a decoder reports.
+//
+// A Layout names the channels (gray, gray+alpha, RGB, RGBA), the sample type
+// (8 or 16-bit unsigned, 16 or 32-bit IEEE float) and whether color is
+// premultiplied by alpha. Samples are stored little-endian; integer samples
+// are normalized (0 is black, the maximum is full intensity) and float
+// samples are nominally 0.0 to 1.0, with values outside that range allowed
+// for HDR. Views are row-major with a byte stride between rows, so a View
+// can describe a crop of a larger buffer. Nothing here allocates.
+
+pub enum Error {
+    // The data ended before the image did.
+    Truncated,
+    // The data is not a valid file of its format.
+    Malformed,
+    // A valid file using something this package does not implement.
+    Unsupported,
+    // A dimension exceeds MAX_DIMENSION or a size overflows.
+    TooLarge,
+    // The pixel storage, scratch or output buffer is shorter than required.
+    BufferTooSmall
+}
+
+pub fn error_name(error: Error) -> &str from(static) {
+    match error {
+        Error.Truncated => {
+            return "Truncated"
+        }
+        Error.Malformed => {
+            return "Malformed"
+        }
+        Error.Unsupported => {
+            return "Unsupported"
+        }
+        Error.TooLarge => {
+            return "TooLarge"
+        }
+        Error.BufferTooSmall => {
+            return "BufferTooSmall"
+        }
+    }
+}
+
+// The largest width or height any codec accepts, as in std/graphics.
+pub const MAX_DIMENSION: u32 = 16777216
+
+pub enum Format {
+    // Netpbm binary PPM (P6), PGM (P5) or PAM (P7).
+    Ppm,
+    Qoi,
+    Bmp,
+    Png,
+    Jxl
+}
+
+pub fn format_name(format: &Format) -> &str from(static) {
+    match format {
+        Format.Ppm => {
+            return "ppm"
+        }
+        Format.Qoi => {
+            return "qoi"
+        }
+        Format.Bmp => {
+            return "bmp"
+        }
+        Format.Png => {
+            return "png"
+        }
+        Format.Jxl => {
+            return "jxl"
+        }
+    }
+}
+
+pub fn clone_format(format: &Format) -> Format {
+    match format {
+        Format.Ppm => {
+            return Format.Ppm
+        }
+        Format.Qoi => {
+            return Format.Qoi
+        }
+        Format.Bmp => {
+            return Format.Bmp
+        }
+        Format.Png => {
+            return Format.Png
+        }
+        Format.Jxl => {
+            return Format.Jxl
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Layout
+
+pub enum Channels {
+    Gray,
+    GrayAlpha,
+    Rgb,
+    Rgba
+}
+
+pub enum Sample {
+    U8,
+    U16,
+    // IEEE 754 binary16.
+    F16,
+    // IEEE 754 binary32.
+    F32
+}
+
+// Sample codes for code that dispatches on a scalar; see Layout.sample_code.
+pub const SAMPLE_U8: u32 = 0
+pub const SAMPLE_U16: u32 = 1
+pub const SAMPLE_F16: u32 = 2
+pub const SAMPLE_F32: u32 = 3
+
+pub struct Layout {
+    pub channels: Channels
+    pub sample: Sample
+    // Color samples are multiplied by alpha. Only meaningful with alpha.
+    pub premultiplied: bool
+
+    pub fn new(channels: Channels, sample: Sample) -> Layout {
+        return Layout { channels: channels, sample: sample, premultiplied: false }
+    }
+    // A layout from channel count (1 to 4) and sample code, the inverse of
+    // channel_count() and sample_code().
+    pub fn from_codes(channels: usize, sample: u32, premultiplied: bool) -> Layout {
+        kind := Channels.Rgba
+        if channels == 1 {
+            kind = Channels.Gray
+        } else if channels == 2 {
+            kind = Channels.GrayAlpha
+        } else if channels == 3 {
+            kind = Channels.Rgb
+        }
+        size := Sample.U8
+        if sample == SAMPLE_U16 {
+            size = Sample.U16
+        } else if sample == SAMPLE_F16 {
+            size = Sample.F16
+        } else if sample == SAMPLE_F32 {
+            size = Sample.F32
+        }
+        return Layout { channels: kind, sample: size, premultiplied: premultiplied && (channels == 2 || channels == 4) }
+    }
+    pub fn rgba8() -> Layout {
+        return Layout.new(Channels.Rgba, Sample.U8)
+    }
+    pub fn rgb8() -> Layout {
+        return Layout.new(Channels.Rgb, Sample.U8)
+    }
+    pub fn gray8() -> Layout {
+        return Layout.new(Channels.Gray, Sample.U8)
+    }
+    pub fn gray_alpha8() -> Layout {
+        return Layout.new(Channels.GrayAlpha, Sample.U8)
+    }
+    pub fn rgba16() -> Layout {
+        return Layout.new(Channels.Rgba, Sample.U16)
+    }
+    pub fn rgb16() -> Layout {
+        return Layout.new(Channels.Rgb, Sample.U16)
+    }
+    pub fn gray16() -> Layout {
+        return Layout.new(Channels.Gray, Sample.U16)
+    }
+    pub fn rgba_f32() -> Layout {
+        return Layout.new(Channels.Rgba, Sample.F32)
+    }
+    pub fn rgb_f32() -> Layout {
+        return Layout.new(Channels.Rgb, Sample.F32)
+    }
+    pub fn clone(&self) -> Layout {
+        return Layout.from_codes(self.channel_count(), self.sample_code(), self.premultiplied)
+    }
+    pub fn equals(&self, other: &Layout) -> bool {
+        return self.channel_count() == other.channel_count() && self.sample_code() == other.sample_code() && self.premultiplied == other.premultiplied
+    }
+    // 1 to 4.
+    pub fn channel_count(&self) -> usize {
+        match &self.channels {
+            Channels.Gray => {
+                return 1
+            }
+            Channels.GrayAlpha => {
+                return 2
+            }
+            Channels.Rgb => {
+                return 3
+            }
+            Channels.Rgba => {
+                return 4
+            }
+        }
+    }
+    // SAMPLE_U8, SAMPLE_U16, SAMPLE_F16 or SAMPLE_F32.
+    pub fn sample_code(&self) -> u32 {
+        match &self.sample {
+            Sample.U8 => {
+                return SAMPLE_U8
+            }
+            Sample.U16 => {
+                return SAMPLE_U16
+            }
+            Sample.F16 => {
+                return SAMPLE_F16
+            }
+            Sample.F32 => {
+                return SAMPLE_F32
+            }
+        }
+    }
+    pub fn sample_bytes(&self) -> usize {
+        code := self.sample_code()
+        if code == SAMPLE_U8 {
+            return 1
+        }
+        if code == SAMPLE_F32 {
+            return 4
+        }
+        return 2
+    }
+    pub fn bytes_per_pixel(&self) -> usize {
+        return self.channel_count() * self.sample_bytes()
+    }
+    pub fn has_alpha(&self) -> bool {
+        count := self.channel_count()
+        return count == 2 || count == 4
+    }
+    pub fn is_gray(&self) -> bool {
+        return self.channel_count() <= 2
+    }
+    pub fn is_float(&self) -> bool {
+        return self.sample_code() >= SAMPLE_F16
+    }
+    // This layout with an alpha channel added or removed.
+    pub fn with_alpha(&self, alpha: bool) -> Layout {
+        count := self.channel_count()
+        if alpha && (count == 1 || count == 3) {
+            count += 1
+        } else if !alpha && (count == 2 || count == 4) {
+            count -= 1
+        }
+        return Layout.from_codes(count, self.sample_code(), self.premultiplied)
+    }
+    // This layout with another sample type.
+    pub fn with_sample(&self, sample: u32) -> Layout {
+        return Layout.from_codes(self.channel_count(), sample, self.premultiplied)
+    }
+}
+
+// Bytes in one tightly packed row.
+pub fn row_bytes(width: u32, layout: &Layout) -> usize!Error {
+    return checked(width as usize, layout.bytes_per_pixel(), 0)
+}
+
+// Bytes a tightly packed width x height image needs.
+pub fn bytes_needed(width: u32, height: u32, layout: &Layout) -> usize!Error {
+    if width > MAX_DIMENSION || height > MAX_DIMENSION {
+        return err(Error.TooLarge)
+    }
+    row := row_bytes(width, layout)?
+    return checked(row, height as usize, 0)
+}
+
+// count * per + extra, or TooLarge.
+pub fn checked(count: usize, per: usize, extra: usize) -> usize!Error {
+    match num.checked_mul(count, per) {
+        ok(product) => {
+            match num.checked_add(product, extra) {
+                ok(total) => {
+                    return ok(total)
+                }
+                err(_) => {
+                    return err(Error.TooLarge)
+                }
+            }
+        }
+        err(_) => {
+            return err(Error.TooLarge)
+        }
+    }
+}
+
+// Bytes a view needs: every row but the last at the stride, then one row.
+fn span(width: u32, height: u32, stride: usize, layout: &Layout) -> usize!Error {
+    if width > MAX_DIMENSION || height > MAX_DIMENSION {
+        return err(Error.TooLarge)
+    }
+    row := row_bytes(width, layout)?
+    if stride < row {
+        return err(Error.Malformed)
+    }
+    if height == 0 {
+        return ok(0)
+    }
+    return checked(stride, height as usize - 1, row)
+}
+
+// ---------------------------------------------------------------------------
+// Sample access. Samples are little-endian.
+
+pub fn get16(data: &[u8], offset: usize) -> u16 {
+    return ((data[offset] as u32) | ((data[offset + 1] as u32) << 8)) as u16
+}
+
+pub fn put16(data: &mut[u8], offset: usize, value: u16) {
+    data[offset] = (value & 255) as u8
+    data[offset + 1] = (value >> 8) as u8
+}
+
+pub fn get32(data: &[u8], offset: usize) -> u32 {
+    return (data[offset] as u32) | ((data[offset + 1] as u32) << 8) | ((data[offset + 2] as u32) << 16) | ((data[offset + 3] as u32) << 24)
+}
+
+pub fn put32(data: &mut[u8], offset: usize, value: u32) {
+    data[offset] = (value & 255) as u8
+    data[offset + 1] = ((value >> 8) & 255) as u8
+    data[offset + 2] = ((value >> 16) & 255) as u8
+    data[offset + 3] = (value >> 24) as u8
+}
+
+// ---------------------------------------------------------------------------
+// Views
+
+// Borrowed, read-only pixels: row y starts at byte y * stride.
+pub struct View {
+    data: &[u8]
+    width: u32
+    height: u32
+    stride: usize
+    layout: Layout
+
+    // A view of tightly packed rows. Fails with BufferTooSmall when `data`
+    // is shorter than bytes_needed(width, height, layout).
+    pub fn new(data: &[u8], width: u32, height: u32, layout: Layout) -> View!Error from(data) {
+        stride := row_bytes(width, &layout)?
+        return View.with_stride(data, width, height, stride, layout)
+    }
+    // A view whose rows are `stride` bytes apart; the last row needs only
+    // its own pixels.
+    pub fn with_stride(data: &[u8], width: u32, height: u32, stride: usize, layout: Layout) -> View!Error from(data) {
+        need := span(width, height, stride, &layout)?
+        if data.len < need {
+            return err(Error.BufferTooSmall)
+        }
+        return ok(View { data: data, width: width, height: height, stride: stride, layout: layout })
+    }
+    pub fn width(&self) -> u32 {
+        return self.width
+    }
+    pub fn height(&self) -> u32 {
+        return self.height
+    }
+    pub fn stride(&self) -> usize {
+        return self.stride
+    }
+    pub fn layout(&self) -> &Layout {
+        return &self.layout
+    }
+    pub fn bytes_per_pixel(&self) -> usize {
+        return self.layout.bytes_per_pixel()
+    }
+    // The bytes of row y, exactly width * bytes_per_pixel long. Panics when
+    // y >= height.
+    pub fn row(&self, y: u32) -> &[u8] from(self) {
+        assert(y < self.height, "row outside the view")
+        start := y as usize * self.stride
+        return &self.data[start..start + self.width as usize * self.layout.bytes_per_pixel()]
+    }
+    // The bytes of pixel (x, y).
+    pub fn pixel(&self, x: u32, y: u32) -> &[u8] from(self) {
+        assert(x < self.width && y < self.height, "pixel outside the view")
+        size := self.layout.bytes_per_pixel()
+        start := y as usize * self.stride + x as usize * size
+        return &self.data[start..start + size]
+    }
+    // The underlying bytes from the first pixel to the end of the last row.
+    pub fn bytes(&self) -> &[u8] from(self) {
+        if self.height == 0 {
+            return &self.data[..0]
+        }
+        end := (self.height as usize - 1) * self.stride + self.width as usize * self.layout.bytes_per_pixel()
+        return &self.data[..end]
+    }
+    // True when rows are tightly packed, so bytes() is the whole image.
+    pub fn is_packed(&self) -> bool {
+        return self.stride == self.width as usize * self.layout.bytes_per_pixel()
+    }
+    // The width x height rectangle at (x, y), sharing these pixels. Fails
+    // with Malformed when it does not fit.
+    pub fn sub(&self, x: u32, y: u32, width: u32, height: u32) -> View!Error from(self) {
+        if x as u64 + width as u64 > self.width as u64 || y as u64 + height as u64 > self.height as u64 {
+            return err(Error.Malformed)
+        }
+        if width == 0 || height == 0 {
+            return ok(View { data: &self.data[..0], width: width, height: height, stride: self.stride, layout: self.layout.clone() })
+        }
+        start := y as usize * self.stride + x as usize * self.layout.bytes_per_pixel()
+        return View.with_stride(&self.data[start..], width, height, self.stride, self.layout.clone())
+    }
+}
+
+// Borrowed, writable pixels.
+pub struct ViewMut {
+    data: &mut[u8]
+    width: u32
+    height: u32
+    stride: usize
+    layout: Layout
+
+    pub fn new(data: &mut[u8], width: u32, height: u32, layout: Layout) -> ViewMut!Error from(data) {
+        stride := row_bytes(width, &layout)?
+        return ViewMut.with_stride(data, width, height, stride, layout)
+    }
+    pub fn with_stride(data: &mut[u8], width: u32, height: u32, stride: usize, layout: Layout) -> ViewMut!Error from(data) {
+        need := span(width, height, stride, &layout)?
+        if data.len < need {
+            return err(Error.BufferTooSmall)
+        }
+        return ok(ViewMut { data: data, width: width, height: height, stride: stride, layout: layout })
+    }
+    pub fn width(&self) -> u32 {
+        return self.width
+    }
+    pub fn height(&self) -> u32 {
+        return self.height
+    }
+    pub fn stride(&self) -> usize {
+        return self.stride
+    }
+    pub fn layout(&self) -> &Layout {
+        return &self.layout
+    }
+    pub fn bytes_per_pixel(&self) -> usize {
+        return self.layout.bytes_per_pixel()
+    }
+    pub fn row(&self, y: u32) -> &[u8] from(self) {
+        assert(y < self.height, "row outside the view")
+        start := y as usize * self.stride
+        return &self.data[start..start + self.width as usize * self.layout.bytes_per_pixel()]
+    }
+    pub fn row_mut(&mut self, y: u32) -> &mut[u8] from(self) {
+        assert(y < self.height, "row outside the view")
+        start := y as usize * self.stride
+        end := start + self.width as usize * self.layout.bytes_per_pixel()
+        return &mut self.data[start..end]
+    }
+    pub fn pixel(&self, x: u32, y: u32) -> &[u8] from(self) {
+        assert(x < self.width && y < self.height, "pixel outside the view")
+        size := self.layout.bytes_per_pixel()
+        start := y as usize * self.stride + x as usize * size
+        return &self.data[start..start + size]
+    }
+    pub fn pixel_mut(&mut self, x: u32, y: u32) -> &mut[u8] from(self) {
+        assert(x < self.width && y < self.height, "pixel outside the view")
+        size := self.layout.bytes_per_pixel()
+        start := y as usize * self.stride + x as usize * size
+        return &mut self.data[start..start + size]
+    }
+    pub fn bytes(&self) -> &[u8] from(self) {
+        if self.height == 0 {
+            return &self.data[..0]
+        }
+        end := (self.height as usize - 1) * self.stride + self.width as usize * self.layout.bytes_per_pixel()
+        return &self.data[..end]
+    }
+    pub fn bytes_mut(&mut self) -> &mut[u8] from(self) {
+        if self.height == 0 {
+            return &mut self.data[..0]
+        }
+        end := (self.height as usize - 1) * self.stride + self.width as usize * self.layout.bytes_per_pixel()
+        return &mut self.data[..end]
+    }
+    pub fn is_packed(&self) -> bool {
+        return self.stride == self.width as usize * self.layout.bytes_per_pixel()
+    }
+    // A read-only view of the same pixels.
+    pub fn as_view(&self) -> View from(self) {
+        return View { data: self.bytes(), width: self.width, height: self.height, stride: self.stride, layout: self.layout.clone() }
+    }
+    // A writable width x height rectangle at (x, y).
+    pub fn sub_mut(&mut self, x: u32, y: u32, width: u32, height: u32) -> ViewMut!Error from(self) {
+        if x as u64 + width as u64 > self.width as u64 || y as u64 + height as u64 > self.height as u64 {
+            return err(Error.Malformed)
+        }
+        stride := self.stride
+        layout := self.layout.clone()
+        if width == 0 || height == 0 {
+            return ok(ViewMut { data: &mut self.data[..0], width: width, height: height, stride: stride, layout: layout })
+        }
+        start := y as usize * stride + x as usize * layout.bytes_per_pixel()
+        return ViewMut.with_stride(&mut self.data[start..], width, height, stride, layout)
+    }
+    // Reinterpret the pixels with another layout of the same pixel size,
+    // such as after premultiplying in place.
+    pub fn relabel(&mut self, layout: Layout) -> void!Error {
+        if layout.bytes_per_pixel() != self.layout.bytes_per_pixel() {
+            return err(Error.Malformed)
+        }
+        self.layout = layout
+        return ok()
+    }
+    // Set every byte of every pixel to zero: transparent black, or black.
+    pub fn clear(&mut self) {
+        row := self.width as usize * self.layout.bytes_per_pixel()
+        for y in 0u32..self.height {
+            start := y as usize * self.stride
+            for i in start..start + row {
+                self.data[i] = 0
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Header
+
+// What a decoder reports about a file before decoding it.
+pub struct Header {
+    pub format: Format
+    pub width: u32
+    pub height: u32
+    // The layout that holds the file's samples without loss: palettes expand
+    // to RGB or RGBA, gray below 8 bits widens to 8.
+    pub native: Layout
+    // Significant bits per sample as stored: 1 to 16 for integers, 16 or 32
+    // for floats.
+    pub bit_depth: u32
+    pub color: color.ColorInfo
+    pub orientation: color.Orientation
+    // 1 unless the file is animated.
+    pub frames: u32
+    // How often an animation plays; 0 means forever.
+    pub loops: u32
+    pub animated: bool
+    pub lossy: bool
+    // Interlaced PNG, progressive JPEG XL.
+    pub progressive: bool
+
+    // A header with the defaults for a single, lossless, untagged sRGB frame.
+    pub fn new(format: Format, width: u32, height: u32, native: Layout, bit_depth: u32) -> Header {
+        return Header { format: format, width: width, height: height, native: native, bit_depth: bit_depth, color: color.ColorInfo.srgb(), orientation: color.Orientation.Identity, frames: 1, loops: 0, animated: false, lossy: false, progressive: false }
+    }
+    pub fn clone(&self) -> Header {
+        return Header { format: clone_format(&self.format), width: self.width, height: self.height, native: self.native.clone(), bit_depth: self.bit_depth, color: self.color.clone(), orientation: color.clone_orientation(&self.orientation), frames: self.frames, loops: self.loops, animated: self.animated, lossy: self.lossy, progressive: self.progressive }
+    }
+    pub fn has_alpha(&self) -> bool {
+        return self.native.has_alpha()
+    }
+    // Width and height once the orientation is applied.
+    pub fn display_width(&self) -> u32 {
+        if color.swaps_axes(&self.orientation) {
+            return self.height
+        }
+        return self.width
+    }
+    pub fn display_height(&self) -> u32 {
+        if color.swaps_axes(&self.orientation) {
+            return self.width
+        }
+        return self.height
+    }
+}
+
+// Timing of one animation frame: it shows for numerator / denominator
+// seconds.
+pub struct FrameInfo {
+    pub numerator: u32
+    pub denominator: u32
+
+    // The duration rounded to milliseconds, saturating at 0xffffffff
+    // (frame timing comes from the file: 2^32 - 1 seconds fit a FrameInfo).
+    pub fn milliseconds(&self) -> u32 {
+        if self.denominator == 0 {
+            return 0
+        }
+        value := (self.numerator as u64 * 1000 + self.denominator as u64 / 2) / self.denominator as u64
+        if value > 0xffffffff {
+            return 0xffffffff
+        }
+        return value as u32
+    }
+}

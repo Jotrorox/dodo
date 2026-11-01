@@ -1,0 +1,1223 @@
+package jxl
+
+import "core/ptr"
+import "std/image/convert"
+import "std/image/pixels"
+import "std/image/sink"
+
+// The float pipeline (see decode.dodo): decoded modular channels (XYB
+// dequantized, bit depths normalized) or the VarDCT color planes go through
+// chroma upsampling, Gaborish and the edge-preserving filter, become the
+// frame's f32 planes (upsampled), get patches, splines and noise, then the
+// color transform and blending onto the canvas over reference slots,
+// following libjxl's render pipeline order.
+
+const PATCH_NONE: u32 = 0
+const PATCH_REPLACE: u32 = 1
+const PATCH_ADD: u32 = 2
+const PATCH_MUL: u32 = 3
+const PATCH_BLEND_ABOVE: u32 = 4
+const PATCH_BLEND_BELOW: u32 = 5
+const PATCH_MULADD_ABOVE: u32 = 6
+const PATCH_MULADD_BELOW: u32 = 7
+
+// Float planes: the frame (planes of fw x fh), the canvas (image size),
+// the reference slots, and filter rows. Plane count is 3 + extra channels.
+struct FloatBufs {
+    frame: &mut[f32]
+    canvas: &mut[f32]
+    slots: &mut[f32]
+    ftemp: &mut[f32]
+    // Three frame-sized planes for noise synthesis (empty without noise).
+    noise: &mut[f32]
+    planes: usize
+    fw: usize
+    fh: usize
+    slot_off: [4]usize
+    slot_cap: [4]usize
+    slot_w: [4]usize
+    slot_h: [4]usize
+    slot_valid: [4]bool
+    // False for a single frame covering the image: it is emitted from the
+    // frame planes directly.
+    use_canvas: bool
+}
+
+// The arena seen as f32 (for channels converted in place).
+fn as_f32(ints: &mut[i32]) -> &mut[f32] from(ints) {
+    unsafe {
+        return ptr.borrow_slice_mut(ptr.as_mut_ptr(ints) as *mut f32, ints.len, ints)
+    }
+}
+
+fn float_bits_i32(v: f32) -> i32 {
+    return wrap_i32(convert.f32_bits(v) as i64)
+}
+
+// Convert the decoded channels to float in place: XYB dequantization for
+// XYB images, bit depth normalization otherwise.
+fn channels_to_float(h: &ImageHeader, f: &FrameHeader, work: &mut ModularWork, gch: &ChanList, vals: &FrameVals) {
+    if !f.modular {
+        // VarDCT: the color planes are separate, gch holds extra channels.
+        for e in 0usize..h.num_extra as usize {
+            convert_channel(work, gch, e, h.ec_bits[e], h.ec_exp_bits[e])
+        }
+        return
+    }
+    color := f.color_channels as usize
+    if h.xyb && color == 3 {
+        w := gch.width(0)
+        hh := gch.height(0)
+        for y in 0usize..hh {
+            p0 := gch.offset(0) + y * gch.stride(0)
+            p1 := gch.offset(1) + y * gch.stride(1)
+            p2 := gch.offset(2) + y * gch.stride(2)
+            for x in 0usize..w {
+                yv := work.arena[p0 + x] as i64
+                xv := work.arena[p1 + x] as i64
+                bv := work.arena[p2 + x] as i64 + yv
+                if bv > 2147483647 {
+                    bv = 2147483647
+                }
+                if bv < -2147483648 {
+                    bv = -2147483648
+                }
+                work.arena[p0 + x] = float_bits_i32(xv as f32 * vals.m_lf[0])
+                work.arena[p1 + x] = float_bits_i32(yv as f32 * vals.m_lf[1])
+                work.arena[p2 + x] = float_bits_i32(bv as f32 * vals.m_lf[2])
+            }
+        }
+    } else {
+        for c in 0usize..color {
+            convert_channel(work, gch, c, h.bits, h.exp_bits)
+        }
+    }
+    for e in 0usize..h.num_extra as usize {
+        convert_channel(work, gch, color + e, h.ec_bits[e], h.ec_exp_bits[e])
+    }
+}
+
+fn convert_channel(work: &mut ModularWork, gch: &ChanList, c: usize, bits: u32, exp_bits: u32) {
+    for y in 0usize..gch.height(c) {
+        p := gch.offset(c) + y * gch.stride(c)
+        for x in 0usize..gch.width(c) {
+            work.arena[p + x] = float_bits_i32(sample_to_float(work.arena[p + x], bits, exp_bits))
+        }
+    }
+}
+
+// 3x3 Gaborish smoothing of the three color channels (float, in the arena).
+fn gaborish(f: &FrameHeader, a: &mut[f32], gch: &ChanList, temp: &mut[f32]) -> void!pixels.Error {
+    for c in 0usize..3 {
+        w1 := f.gab_weights[c * 2]
+        w2 := f.gab_weights[c * 2 + 1]
+        div := 1.0f32 + 4.0 * (w1 + w2)
+        k0 := 1.0f32 / div
+        k1 := w1 / div
+        k2 := w2 / div
+        w := gch.width(c)
+        h := gch.height(c)
+        off := gch.offset(c)
+        stride := gch.stride(c)
+        if 3 * w > temp.len {
+            return err(pixels.Error.TooLarge)
+        }
+        // temp: original rows y - 1, y and y + 1 (mirrored at the edges).
+        r0 := off + mirror(-1, h) * stride
+        for x in 0usize..w {
+            temp[x] = a[r0 + x]
+            temp[w + x] = a[off + x]
+        }
+        for y in 0usize..h {
+            ny := off + mirror(y as i64 + 1, h) * stride
+            for x in 0usize..w {
+                temp[2 * w + x] = a[ny + x]
+            }
+            row := off + y * stride
+            for x in 0usize..w {
+                l := mirror(x as i64 - 1, w)
+                rr := mirror(x as i64 + 1, w)
+                edges := temp[x] + temp[2 * w + x] + temp[w + l] + temp[w + rr]
+                corners := temp[l] + temp[rr] + temp[2 * w + l] + temp[2 * w + rr]
+                a[row + x] = k0 * temp[w + x] + k1 * edges + k2 * corners
+            }
+            for x in 0usize..w {
+                temp[x] = temp[w + x]
+                temp[w + x] = temp[2 * w + x]
+            }
+        }
+    }
+    return ok()
+}
+
+// Edge-preserving filter (libjxl stage_epf.cc), steps 0 to 2 on the three
+// color channels in the arena; `src` receives a copy of each step's input.
+// The inverse sigma is `inv_sigma` over the frame (modular frames:
+// kInvSigmaNum over epf_sigma_for_modular) or, when `sigma_stride` is not 0,
+// sigma[(y / 8) * sigma_stride + x / 8] per 8x8 block (VarDCT). Pixels
+// whose inverse sigma is below kMinSigma stay unfiltered.
+fn epf(f: &FrameHeader, a: &mut[f32], gch: &ChanList, src: &mut[f32], inv_sigma: f32, sigma: &[f32], sigma_stride: usize) -> void!pixels.Error {
+    per_block := sigma_stride > 0
+    if !per_block && inv_sigma < -3.9052429 {
+        return ok()
+    }
+    w := gch.width(0)
+    h := gch.height(0)
+    plane := w * h
+    if 3 * plane > src.len {
+        return err(pixels.Error.TooLarge)
+    }
+    for step in 0u32..3 {
+        if step == 0 && f.epf_iters < 3 {
+            continue
+        }
+        if step == 2 && f.epf_iters < 2 {
+            continue
+        }
+        for c in 0usize..3 {
+            off := gch.offset(c)
+            stride := gch.stride(c)
+            for y in 0usize..h {
+                for x in 0usize..w {
+                    src[c * plane + y * w + x] = a[off + y * stride + x]
+                }
+            }
+        }
+        sm := 1.65f32
+        if step == 0 {
+            sm = f.epf_pass0_sigma * 1.65
+        } else if step == 2 {
+            sm = f.epf_pass2_sigma * 1.65
+        }
+        bsm := sm * f.epf_border_sad
+        count := 4usize
+        if step == 0 {
+            count = 12
+        }
+        for y in 0usize..h {
+            border_row := (y % 8) == 0 || (y % 8) == 7
+            for x in 0usize..w {
+                inv := inv_sigma
+                if per_block {
+                    inv = sigma[(y / 8) * sigma_stride + x / 8]
+                    if inv < -3.9052429 {
+                        continue
+                    }
+                }
+                mul := sm
+                if border_row || (x % 8) == 0 || (x % 8) == 7 {
+                    mul = bsm
+                }
+                strength := inv * mul
+                total := 1.0f32
+                acc := [0.0f32; 3]
+                for c in 0usize..3 {
+                    acc[c] = src[c * plane + y * w + x]
+                }
+                for i in 0usize..count {
+                    dy := 0i64
+                    dx := 0i64
+                    if step == 0 {
+                        dy = EPF_OFFSETS[i * 2] as i64
+                        dx = EPF_OFFSETS[i * 2 + 1] as i64
+                    } else {
+                        dy = EPF_PLUS[(i + 1) * 2] as i64
+                        dx = EPF_PLUS[(i + 1) * 2 + 1] as i64
+                    }
+                    ny := mirror(y as i64 + dy, h)
+                    nx := mirror(x as i64 + dx, w)
+                    sad := 0.0f32
+                    for c in 0usize..3 {
+                        base := c * plane
+                        d := 0.0f32
+                        if step == 2 {
+                            d = src[base + ny * w + nx] - src[base + y * w + x]
+                            if d < 0.0 {
+                                d = -d
+                            }
+                        } else {
+                            for k in 0usize..5 {
+                                oy := EPF_PLUS[k * 2] as i64
+                                ox := EPF_PLUS[k * 2 + 1] as i64
+                                p := src[base + mirror(y as i64 + oy, h) * w + mirror(x as i64 + ox, w)]
+                                q := src[base + mirror(y as i64 + dy + oy, h) * w + mirror(x as i64 + dx + ox, w)]
+                                e := p - q
+                                if e < 0.0 {
+                                    e = -e
+                                }
+                                d += e
+                            }
+                        }
+                        sad += d * f.epf_channel_scale[c]
+                    }
+                    weight := sad * strength + 1.0
+                    if weight < 0.0 {
+                        weight = 0.0
+                    }
+                    total += weight
+                    for c in 0usize..3 {
+                        acc[c] += weight * src[c * plane + ny * w + nx]
+                    }
+                }
+                norm := 1.0f32 / total
+                for c in 0usize..3 {
+                    a[gch.offset(c) + y * gch.stride(c) + x] = acc[c] * norm
+                }
+            }
+        }
+    }
+    return ok()
+}
+
+// Step 0 neighbors (row, column), and the plus shape (center first).
+static EPF_OFFSETS: [24]i32 = [-2, 0, -1, -1, -1, 0, -1, 1, 0, -2, 0, -1, 0, 1, 0, 2, 1, -1, 1, 0, 1, 1, 2, 0]
+static EPF_PLUS: [10]i32 = [0, 0, -1, 0, 0, -1, 0, 1, 1, 0]
+
+fn mirror(v: i64, size: usize) -> usize {
+    n := size as i64
+    x := v
+    for {
+        if x < 0 {
+            x = -x - 1
+        } else if x >= n {
+            x = 2 * n - x - 1
+        } else {
+            return x as usize
+        }
+    }
+}
+
+// Upsampling weights for factor `n` (2, 4 or 8): the header's custom ones
+// or the defaults.
+fn upsampling_kernel(r: &mut Reader, h: &ImageHeader, n: usize, kernel: &mut[f32]) {
+    count := 15usize
+    defaults := &UP2_WEIGHTS[..]
+    bit := 1u32
+    if n == 4 {
+        count = 55
+        defaults = &UP4_WEIGHTS[..]
+        bit = 2
+    } else if n == 8 {
+        count = 210
+        defaults = &UP8_WEIGHTS[..]
+        bit = 4
+    }
+    weights := [0.0f32; 210]
+    for i in 0usize..count {
+        weights[i] = defaults[i]
+    }
+    if (h.custom_weights & bit) != 0 {
+        skip := 0u64
+        if bit > 1 && (h.custom_weights & 1) != 0 {
+            skip += 15
+        }
+        if bit > 2 && (h.custom_weights & 2) != 0 {
+            skip += 55
+        }
+        r.clear_limit()
+        r.seek_bit(h.weights_bit + skip * 16)
+        for i in 0usize..count {
+            weights[i] = r.f16()
+        }
+    }
+    half := n / 2
+    for ky in 0usize..half {
+        for kx in 0usize..half {
+            o0 := (ky * n + kx) * 25
+            o1 := (ky * n + (n - 1 - kx)) * 25
+            o2 := ((n - 1 - ky) * n + kx) * 25
+            o3 := ((n - 1 - ky) * n + (n - 1 - kx)) * 25
+            for py in 0usize..5 {
+                for px in 0usize..5 {
+                    j := 5 * ky + py
+                    i := 5 * kx + px
+                    my := i
+                    mx := j
+                    if j < i {
+                        my = j
+                        mx = i
+                    }
+                    index := mx
+                    if my > 0 {
+                        index = 5 * half * my - my * (my - 1) / 2 + mx - my
+                    }
+                    w := weights[index]
+                    kernel[o0 + py * 5 + px] = w
+                    kernel[o1 + py * 5 + (4 - px)] = w
+                    kernel[o2 + (4 - py) * 5 + px] = w
+                    kernel[o3 + (4 - py) * 5 + (4 - px)] = w
+                }
+            }
+        }
+    }
+}
+
+// Copy or upsample a float channel of the arena into frame plane `plane`.
+fn fill_plane(r: &mut Reader, h: &ImageHeader, a: &[f32], gch: &ChanList, c: usize, factor: usize, fb: &mut FloatBufs, plane: usize) {
+    fw := fb.fw
+    fh := fb.fh
+    dst := plane * fw * fh
+    off := gch.offset(c)
+    stride := gch.stride(c)
+    w := gch.width(c)
+    hh := gch.height(c)
+    if factor <= 1 {
+        for y in 0usize..fh {
+            sy := y
+            if sy >= hh {
+                sy = hh - 1
+            }
+            for x in 0usize..fw {
+                sx := x
+                if sx >= w {
+                    sx = w - 1
+                }
+                fb.frame[dst + y * fw + x] = a[off + sy * stride + sx]
+            }
+        }
+        return
+    }
+    kernel := [0.0f32; 1600]
+    upsampling_kernel(r, h, factor, &mut kernel)
+    for y in 0usize..fh {
+        iy := y / factor
+        oy := y % factor
+        for x in 0usize..fw {
+            ix := x / factor
+            ox := x % factor
+            k := (oy * factor + ox) * 25
+            sum := 0.0f32
+            lo := 3.4e38f32
+            hi := -3.4e38f32
+            for py in 0usize..5 {
+                sy := mirror(iy as i64 + py as i64 - 2, hh)
+                row := off + sy * stride
+                for px in 0usize..5 {
+                    sx := mirror(ix as i64 + px as i64 - 2, w)
+                    v := a[row + sx]
+                    sum += kernel[k + py * 5 + px] * v
+                    if v < lo {
+                        lo = v
+                    }
+                    if v > hi {
+                        hi = v
+                    }
+                }
+            }
+            if sum < lo {
+                sum = lo
+            }
+            if sum > hi {
+                sum = hi
+            }
+            fb.frame[dst + y * fw + x] = sum
+        }
+    }
+}
+
+// Horizontal chroma upsampling of row `row` (channel c of `gch`) at
+// output column x.
+fn chroma_h(a: &[f32], gch: &ChanList, c: usize, row: usize, x: usize) -> f32 {
+    base := gch.offset(c) + row * gch.stride(c)
+    if gch.hshift(c) == 0 {
+        return a[base + x]
+    }
+    n := gch.width(c)
+    sx := x >> 1
+    cur := a[base + sx] * 0.75
+    if (x & 1) == 0 {
+        return 0.25 * a[base + mirror(sx as i64 - 1, n)] + cur
+    }
+    return 0.25 * a[base + mirror(sx as i64 + 1, n)] + cur
+}
+
+// Copy a (possibly subsampled) YCbCr channel into frame plane `plane`,
+// upsampling as libjxl does: 3/4 nearest + 1/4 next sample, horizontally
+// then vertically, edges mirrored.
+fn fill_chroma(a: &[f32], gch: &ChanList, c: usize, fb: &mut FloatBufs, plane: usize) {
+    fw := fb.fw
+    fh := fb.fh
+    dst := plane * fw * fh
+    m := gch.height(c)
+    for y in 0usize..fh {
+        for x in 0usize..fw {
+            v := 0.0f32
+            if gch.vshift(c) == 0 {
+                v = chroma_h(a, gch, c, y, x)
+            } else {
+                sy := y >> 1
+                mid := chroma_h(a, gch, c, sy, x) * 0.75
+                other := mirror(sy as i64 - 1, m)
+                if (y & 1) == 1 {
+                    other = mirror(sy as i64 + 1, m)
+                }
+                v = chroma_h(a, gch, c, other, x) * 0.25 + mid
+            }
+            fb.frame[dst + y * fw + x] = v
+        }
+    }
+}
+
+fn clamp01(v: f32) -> f32 {
+    if v < 0.0 {
+        return 0.0
+    }
+    if v > 1.0 {
+        return 1.0
+    }
+    return v
+}
+
+// Round to nearest, ties to even, for 0 <= v < 2^31.
+fn nearest(v: f32) -> u32 {
+    if !(v > 0.0) {
+        return 0
+    }
+    if v >= 4294967040.0 {
+        return 0xffffff00
+    }
+    whole := v as u32
+    fraction := v - whole as f32
+    if fraction > 0.5 || (fraction == 0.5 && (whole & 1) == 1) {
+        return whole + 1
+    }
+    return whole
+}
+
+fn uses_alpha(mode: u32) -> bool {
+    return mode == PATCH_BLEND_ABOVE || mode == PATCH_BLEND_BELOW || mode == PATCH_MULADD_ABOVE || mode == PATCH_MULADD_BELOW
+}
+
+// libjxl's PerformBlending for one pixel: bg and fg hold 3 + num_ec values,
+// modes/alphas/clamps hold the color blending (index 0) and one per extra
+// channel; the result goes to out.
+fn blend_pixel(h: &ImageHeader, bg: &[f32], fg: &[f32], out: &mut[f32], modes: &[u32], alphas: &[u32], clamps: &[bool], has_alpha: bool) {
+    nec := h.num_extra as usize
+    for i in 0usize..nec {
+        mode := modes[1 + i]
+        b := bg[3 + i]
+        fv := fg[3 + i]
+        alpha := alphas[1 + i] as usize
+        if alpha >= nec {
+            alpha = 0
+        }
+        premultiplied := h.ec_associated[alpha]
+        v := b
+        if mode == PATCH_ADD {
+            v = b + fv
+        } else if mode == PATCH_BLEND_ABOVE || mode == PATCH_BLEND_BELOW {
+            lower := b
+            lower_a := bg[3 + alpha]
+            upper := fv
+            upper_a := fg[3 + alpha]
+            if mode == PATCH_BLEND_BELOW {
+                lower = fv
+                lower_a = fg[3 + alpha]
+                upper = b
+                upper_a = bg[3 + alpha]
+            }
+            fa := upper_a
+            if clamps[1 + i] {
+                fa = clamp01(fa)
+            }
+            if alpha == i {
+                v = 1.0 - (1.0 - fa) * (1.0 - lower_a)
+            } else if premultiplied {
+                v = upper + lower * (1.0 - fa)
+            } else {
+                new_a := 1.0 - (1.0 - fa) * (1.0 - lower_a)
+                inv := 0.0f32
+                if new_a > 0.0 {
+                    inv = 1.0 / new_a
+                }
+                v = (upper * fa + lower * lower_a * (1.0 - fa)) * inv
+            }
+        } else if mode == PATCH_MULADD_ABOVE || mode == PATCH_MULADD_BELOW {
+            lower := b
+            upper := fv
+            upper_a := fg[3 + alpha]
+            if mode == PATCH_MULADD_BELOW {
+                lower = fv
+                upper = b
+                upper_a = bg[3 + alpha]
+            }
+            if alpha == i {
+                v = lower
+            } else {
+                fa := upper_a
+                if clamps[1 + i] {
+                    fa = clamp01(fa)
+                }
+                v = lower + upper * fa
+            }
+        } else if mode == PATCH_MUL {
+            m := fv
+            if clamps[1 + i] {
+                m = clamp01(m)
+            }
+            v = b * m
+        } else if mode == PATCH_REPLACE {
+            v = fv
+        }
+        out[3 + i] = v
+    }
+    mode := modes[0]
+    alpha := alphas[0] as usize
+    if alpha >= nec {
+        alpha = 0
+    }
+    if mode == PATCH_ADD || ((mode == PATCH_MULADD_ABOVE || mode == PATCH_MULADD_BELOW) && !has_alpha) {
+        for c in 0usize..3 {
+            out[c] = bg[c] + fg[c]
+        }
+    } else if mode == PATCH_MULADD_ABOVE || mode == PATCH_MULADD_BELOW {
+        fa := fg[3 + alpha]
+        if mode == PATCH_MULADD_BELOW {
+            fa = bg[3 + alpha]
+        }
+        if clamps[0] {
+            fa = clamp01(fa)
+        }
+        for c in 0usize..3 {
+            if mode == PATCH_MULADD_ABOVE {
+                out[c] = bg[c] + fg[c] * fa
+            } else {
+                out[c] = fg[c] + bg[c] * fa
+            }
+        }
+    } else if mode == PATCH_BLEND_ABOVE || mode == PATCH_BLEND_BELOW {
+        if !has_alpha {
+            for c in 0usize..3 {
+                out[c] = fg[c]
+            }
+        } else {
+            premultiplied := h.ec_associated[alpha]
+            above := mode == PATCH_BLEND_ABOVE
+            lower_a := bg[3 + alpha]
+            fa := fg[3 + alpha]
+            if !above {
+                lower_a = fg[3 + alpha]
+                fa = bg[3 + alpha]
+            }
+            if clamps[0] {
+                fa = clamp01(fa)
+            }
+            new_a := 1.0 - (1.0 - fa) * (1.0 - lower_a)
+            inv := 0.0f32
+            if new_a > 0.0 {
+                inv = 1.0 / new_a
+            }
+            for c in 0usize..3 {
+                upper := fg[c]
+                lower := bg[c]
+                if !above {
+                    upper = bg[c]
+                    lower = fg[c]
+                }
+                if premultiplied {
+                    out[c] = upper + lower * (1.0 - fa)
+                } else {
+                    out[c] = (upper * fa + lower * lower_a * (1.0 - fa)) * inv
+                }
+            }
+            out[3 + alpha] = new_a
+        }
+    } else if mode == PATCH_MUL {
+        for c in 0usize..3 {
+            m := fg[c]
+            if clamps[0] {
+                m = clamp01(m)
+            }
+            out[c] = bg[c] * m
+        }
+    } else if mode == PATCH_REPLACE {
+        for c in 0usize..3 {
+            out[c] = fg[c]
+        }
+    } else {
+        for c in 0usize..3 {
+            out[c] = bg[c]
+        }
+    }
+}
+
+// Frame blending mode to patch blending mode.
+fn patch_mode(mode: u32) -> u32 {
+    if mode == BLEND_ADD {
+        return PATCH_ADD
+    }
+    if mode == BLEND_BLEND {
+        return PATCH_BLEND_ABOVE
+    }
+    if mode == BLEND_MULADD {
+        return PATCH_MULADD_ABOVE
+    }
+    if mode == BLEND_MUL {
+        return PATCH_MUL
+    }
+    return PATCH_REPLACE
+}
+
+// Parse the patches at the reader; with `apply`, blend each patch from its
+// reference slot into the frame planes as it is read (in decoding order,
+// which is libjxl's order for overlapping patches).
+fn patches(r: &mut Reader, h: &ImageHeader, f: &FrameHeader, tcode: &mut Code, n1: &mut Code, n2: &mut Code, window: &mut[u32], apply: bool, fb: &mut FloatBufs) -> void!pixels.Error {
+    read_code(r, 10, tcode, n1, n2, window)?
+    stream := Stream.new(window)
+    stream.begin(tcode, r)
+    nec := h.num_extra as usize
+    fw := f.width as u64
+    fh := f.height as u64
+    max_refs := 1024 + fw * fh / 4
+    max_patches := max_refs * 4
+    num_refs := tcode.read(&mut stream, r, 0, 0) as u64
+    if num_refs > max_refs {
+        return err(pixels.Error.Malformed)
+    }
+    total := 0u64
+    has_alpha := h.alpha_channel() < MAX_EXTRA
+    modes := [0u32; MAX_EXTRA + 1]
+    alphas := [0u32; MAX_EXTRA + 1]
+    clamps := [false; MAX_EXTRA + 1]
+    bg := [0.0f32; MAX_EXTRA + 3]
+    fg := [0.0f32; MAX_EXTRA + 3]
+    out := [0.0f32; MAX_EXTRA + 3]
+    for i in 0u64..num_refs {
+        slot := tcode.read(&mut stream, r, 1, 0) as usize
+        if slot >= 4 {
+            return err(pixels.Error.Malformed)
+        }
+        rx := tcode.read(&mut stream, r, 3, 0) as usize
+        ry := tcode.read(&mut stream, r, 3, 0) as usize
+        pw := tcode.read(&mut stream, r, 2, 0) as usize + 1
+        ph := tcode.read(&mut stream, r, 2, 0) as usize + 1
+        if apply {
+            if !fb.slot_valid[slot] || rx + pw > fb.slot_w[slot] || ry + ph > fb.slot_h[slot] {
+                return err(pixels.Error.Malformed)
+            }
+        }
+        count := tcode.read(&mut stream, r, 7, 0) as u64
+        if count > max_patches {
+            return err(pixels.Error.Malformed)
+        }
+        count += 1
+        total += count
+        if total > max_patches {
+            return err(pixels.Error.Malformed)
+        }
+        px := 0i64
+        py := 0i64
+        for k in 0u64..count {
+            if k == 0 {
+                px = tcode.read(&mut stream, r, 4, 0) as i64
+                py = tcode.read(&mut stream, r, 4, 0) as i64
+            } else {
+                px += unpack_signed(tcode.read(&mut stream, r, 6, 0)) as i64
+                py += unpack_signed(tcode.read(&mut stream, r, 6, 0)) as i64
+                if px < 0 || py < 0 {
+                    return err(pixels.Error.Malformed)
+                }
+            }
+            if px as u64 + pw as u64 > fw || py as u64 + ph as u64 > fh {
+                return err(pixels.Error.Malformed)
+            }
+            for j in 0usize..nec + 1 {
+                mode := tcode.read(&mut stream, r, 5, 0)
+                if mode >= 8 {
+                    return err(pixels.Error.Malformed)
+                }
+                modes[j] = mode
+                alphas[j] = 0
+                if uses_alpha(mode) && nec > 1 {
+                    alphas[j] = tcode.read(&mut stream, r, 8, 0)
+                    if alphas[j] as usize >= nec {
+                        return err(pixels.Error.Malformed)
+                    }
+                }
+                clamps[j] = false
+                if uses_alpha(mode) || mode == PATCH_MUL {
+                    clamps[j] = tcode.read(&mut stream, r, 9, 0) != 0
+                }
+            }
+            if r.overrun {
+                return err(pixels.Error.Truncated)
+            }
+            if !apply {
+                continue
+            }
+            planes := 3 + nec
+            frame_plane := fb.fw * fb.fh
+            sw := fb.slot_w[slot]
+            slot_plane := sw * fb.slot_h[slot]
+            base := fb.slot_off[slot]
+            for dy in 0usize..ph {
+                for dx in 0usize..pw {
+                    tx := px as usize + dx
+                    ty := py as usize + dy
+                    for c in 0usize..planes {
+                        bg[c] = fb.frame[c * frame_plane + ty * fb.fw + tx]
+                        fg[c] = fb.slots[base + c * slot_plane + (ry + dy) * sw + rx + dx]
+                    }
+                    blend_pixel(h, &bg, &fg, &mut out, &modes, &alphas, &clamps, has_alpha)
+                    for c in 0usize..planes {
+                        fb.frame[c * frame_plane + ty * fb.fw + tx] = out[c]
+                    }
+                }
+            }
+        }
+    }
+    stream.finish(tcode)?
+    return ok()
+}
+
+fn skip_patches(r: &mut Reader, h: &ImageHeader, f: &FrameHeader, tcode: &mut Code, n1: &mut Code, n2: &mut Code, window: &mut[u32]) -> void!pixels.Error {
+    e1 := [0.0f32; 1]
+    e2 := [0.0f32; 1]
+    e3 := [0.0f32; 1]
+    e4 := [0.0f32; 1]
+    e5 := [0.0f32; 1]
+    fb := FloatBufs { frame: &mut e1, canvas: &mut e2, slots: &mut e3, ftemp: &mut e4, noise: &mut e5, planes: 0, fw: 0, fh: 0, slot_off: [0usize; 4], slot_cap: [0usize; 4], slot_w: [0usize; 4], slot_h: [0usize; 4], slot_valid: [false; 4], use_canvas: false }
+    return patches(r, h, f, tcode, n1, n2, window, false, &mut fb)
+}
+
+// Copy planes into reference slot k: from the frame (pre color transform)
+// or from the canvas.
+fn save_slot(fb: &mut FloatBufs, k: usize, from_frame: bool, width: usize, height: usize) -> void!pixels.Error {
+    pixels_count := width * height
+    if pixels_count > fb.slot_cap[k] {
+        return err(pixels.Error.TooLarge)
+    }
+    base := fb.slot_off[k]
+    for c in 0usize..fb.planes {
+        for i in 0usize..pixels_count {
+            v := 0.0f32
+            if from_frame {
+                v = fb.frame[c * pixels_count + i]
+            } else {
+                v = fb.canvas[c * pixels_count + i]
+            }
+            fb.slots[base + c * pixels_count + i] = v
+        }
+    }
+    fb.slot_w[k] = width
+    fb.slot_h[k] = height
+    fb.slot_valid[k] = true
+    return ok()
+}
+
+// The background sample of plane c at canvas (x, y) from slot k (zero when
+// the slot is empty or smaller).
+fn slot_sample(fb: &FloatBufs, k: usize, c: usize, x: usize, y: usize) -> f32 {
+    if !fb.slot_valid[k] || x >= fb.slot_w[k] || y >= fb.slot_h[k] {
+        return 0.0
+    }
+    return fb.slots[fb.slot_off[k] + c * fb.slot_w[k] * fb.slot_h[k] + y * fb.slot_w[k] + x]
+}
+
+// Compose the frame onto the canvas: over the reference slots for blended
+// or cropped frames, as a copy otherwise.
+fn compose(h: &ImageHeader, f: &FrameHeader, fb: &mut FloatBufs) {
+    width := h.width as usize
+    height := h.height as usize
+    canvas_plane := width * height
+    frame_plane := fb.fw * fb.fh
+    planes := fb.planes
+    nec := h.num_extra as usize
+    if !f.needs_blending(h.num_extra) {
+        for c in 0usize..planes {
+            for y in 0usize..height {
+                for x in 0usize..width {
+                    v := 0.0f32
+                    if x < fb.fw && y < fb.fh {
+                        v = fb.frame[c * frame_plane + y * fb.fw + x]
+                    }
+                    fb.canvas[c * canvas_plane + y * width + x] = v
+                }
+            }
+        }
+        return
+    }
+    modes := [0u32; MAX_EXTRA + 1]
+    alphas := [0u32; MAX_EXTRA + 1]
+    clamps := [false; MAX_EXTRA + 1]
+    sources := [0usize; MAX_EXTRA + 1]
+    modes[0] = patch_mode(f.blend_mode)
+    alphas[0] = f.blend_alpha
+    clamps[0] = f.blend_clamp
+    sources[0] = f.blend_source as usize
+    for i in 0usize..nec {
+        modes[1 + i] = patch_mode(f.ec_blend_mode[i])
+        alphas[1 + i] = f.ec_blend_alpha[i]
+        clamps[1 + i] = f.ec_blend_clamp[i]
+        sources[1 + i] = f.ec_blend_source[i] as usize
+    }
+    has_alpha := h.alpha_channel() < MAX_EXTRA
+    bg := [0.0f32; MAX_EXTRA + 3]
+    fg := [0.0f32; MAX_EXTRA + 3]
+    out := [0.0f32; MAX_EXTRA + 3]
+    for y in 0usize..height {
+        for x in 0usize..width {
+            for c in 0usize..planes {
+                s := sources[0]
+                if c >= 3 {
+                    s = sources[c - 2]
+                }
+                bg[c] = slot_sample(fb, s, c, x, y)
+            }
+            fx := x as i64 - f.x0 as i64
+            fy := y as i64 - f.y0 as i64
+            if fx >= 0 && fy >= 0 && fx < fb.fw as i64 && fy < fb.fh as i64 {
+                for c in 0usize..planes {
+                    fg[c] = fb.frame[c * frame_plane + fy as usize * fb.fw + fx as usize]
+                }
+                blend_pixel(h, &bg, &fg, &mut out, &modes, &alphas, &clamps, has_alpha)
+                for c in 0usize..planes {
+                    fb.canvas[c * canvas_plane + y * width + x] = out[c]
+                }
+            } else {
+                for c in 0usize..planes {
+                    fb.canvas[c * canvas_plane + y * width + x] = bg[c]
+                }
+            }
+        }
+    }
+}
+
+// Render one decoded frame through the float pipeline. VarDCT frames
+// bring their color samples in `planes` (3 planes of vb.rw x vb.rh).
+fn render_frame(r: &mut Reader, h: &ImageHeader, f: &FrameHeader, work: &mut ModularWork, gch: &ChanList, vals: &FrameVals, fb: &mut FloatBufs, vb: &mut VBufs, planes: &mut[f32], sbuf: &mut[i32], cpf: &mut[f32], tcode: &mut Code, n1: &mut Code, n2: &mut Code, window: &mut[u32], ct: &ColorTransform) -> void!pixels.Error {
+    fw := f.width as usize
+    fh := f.height as usize
+    if f.frame_type == FT_LF {
+        // LF frames hold the 1:8 image.
+        if f.upsampling != 1 {
+            return err(pixels.Error.Unsupported)
+        }
+        fw = f.sample_width as usize
+        fh = f.sample_height as usize
+    }
+    if fb.planes * fw * fh > fb.frame.len {
+        return err(pixels.Error.TooLarge)
+    }
+    fb.fw = fw
+    fb.fh = fh
+    channels_to_float(h, f, work, gch, vals)
+    color := f.color_channels as usize
+    if !f.modular {
+        // The VarDCT color planes as a channel list.
+        cd := [0i32; 3 * CH_STRIDE]
+        cch := ChanList { d: &mut cd, count: 3, nb_meta: 0 }
+        for c in 0usize..3 {
+            cch.set(c, c * vb.rw * vb.rh, vb.rw, f.sample_width as usize, f.sample_height as usize, 0, 0)
+        }
+        if vb.subsampled {
+            upsample_chroma(f, vb, planes)
+        }
+        if f.gab {
+            gaborish(f, planes, &cch, fb.ftemp)?
+        }
+        if f.epf_iters > 0 {
+            epf(f, planes, &cch, fb.frame, 0.0, vb.sigma, vb.bw)?
+        }
+        for c in 0usize..3 {
+            fill_plane(r, h, planes, &cch, c, f.upsampling as usize, fb, c)
+        }
+        for e in 0usize..h.num_extra as usize {
+            fill_plane(r, h, as_f32(work.arena), gch, e, f.ec_upsampling[e] as usize, fb, 3 + e)
+        }
+    } else if color == 1 && (f.gab || f.epf_iters > 0) {
+        // Gray: the filters see three copies of the channel (as libjxl
+        // does); the copies live at the arena top meanwhile.
+        mark := work.arena_used
+        w := gch.width(0)
+        hh := gch.height(0)
+        cd := [0i32; 3 * CH_STRIDE]
+        cch := ChanList { d: &mut cd, count: 3, nb_meta: 0 }
+        cch.set(0, gch.offset(0), gch.stride(0), w, hh, 0, 0)
+        for c in 1usize..3 {
+            off := work.alloc(w as u64 * hh as u64)?
+            for y in 0usize..hh {
+                for x in 0usize..w {
+                    work.arena[off + y * w + x] = work.arena[gch.offset(0) + y * gch.stride(0) + x]
+                }
+            }
+            cch.set(c, off, w, w, hh, 0, 0)
+        }
+        if f.gab {
+            gaborish(f, as_f32(work.arena), &cch, fb.ftemp)?
+        }
+        if f.epf_iters > 0 {
+            empty := [0.0f32; 1]
+            epf(f, as_f32(work.arena), &cch, fb.frame, -1.1715728752538099 / f.epf_sigma_modular, &empty, 0)?
+        }
+        for c in 0usize..3 {
+            fill_plane(r, h, as_f32(work.arena), &cch, c, f.upsampling as usize, fb, c)
+        }
+        for e in 0usize..h.num_extra as usize {
+            fill_plane(r, h, as_f32(work.arena), gch, color + e, f.ec_upsampling[e] as usize, fb, 3 + e)
+        }
+        work.arena_used = mark
+    } else {
+        if f.gab {
+            gaborish(f, as_f32(work.arena), gch, fb.ftemp)?
+        }
+        if f.epf_iters > 0 {
+            // kInvSigmaNum / sigma; the frame planes are free scratch here.
+            empty := [0.0f32; 1]
+            epf(f, as_f32(work.arena), gch, fb.frame, -1.1715728752538099 / f.epf_sigma_modular, &empty, 0)?
+        }
+        subsampled := f.ycbcr && chroma_subsampled(f)
+        if subsampled && (f.upsampling != 1 || f.gab || f.epf_iters > 0) {
+            return err(pixels.Error.Unsupported)
+        }
+        for c in 0usize..3 {
+            source := c
+            if color == 1 {
+                source = 0
+            }
+            if subsampled {
+                fill_chroma(as_f32(work.arena), gch, c, fb, c)
+            } else {
+                fill_plane(r, h, as_f32(work.arena), gch, source, f.upsampling as usize, fb, c)
+            }
+        }
+        for e in 0usize..h.num_extra as usize {
+            fill_plane(r, h, as_f32(work.arena), gch, color + e, f.ec_upsampling[e] as usize, fb, 3 + e)
+        }
+    }
+    if (f.flags & FLAG_PATCHES) != 0 {
+        if f.upsampling != 1 {
+            return err(pixels.Error.Unsupported)
+        }
+        r.clear_limit()
+        r.seek_bit(vals.patches_bit)
+        patches(r, h, f, tcode, n1, n2, window, true, fb)?
+    }
+    ytox := 0.0f32
+    ytob := 1.0f32
+    if !f.modular {
+        ytox = vb.base_x
+        ytob = vb.base_b
+    }
+    if (f.flags & FLAG_SPLINES) != 0 {
+        if f.upsampling != 1 {
+            return err(pixels.Error.Unsupported)
+        }
+        r.clear_limit()
+        r.seek_bit(vals.splines_bit)
+        splines(r, f, tcode, n1, n2, window, true, fb.frame, fw, fh, sbuf, cpf, ytox, ytob)?
+    }
+    if (f.flags & FLAG_NOISE) != 0 {
+        render_noise(f, fb, &vals.noise_lut, vals.visible, vals.nonvisible, ytox, ytob)?
+    }
+    if f.frame_type == FT_LF {
+        store_lf_slot(vb, (f.lf_level - 1) as usize, fb.frame, fw, fh)?
+    }
+    if f.can_reference() && f.save_before_ct {
+        save_slot(fb, f.save_as_reference as usize, true, fw, fh)?
+    }
+    // Color transform.
+    plane := fw * fh
+    if h.xyb {
+        for i in 0usize..plane {
+            x := fb.frame[i]
+            y := fb.frame[plane + i]
+            b := fb.frame[2 * plane + i]
+            xyb_pixel(ct, &mut x, &mut y, &mut b)
+            fb.frame[i] = x
+            fb.frame[plane + i] = y
+            fb.frame[2 * plane + i] = b
+        }
+    } else if f.ycbcr {
+        for i in 0usize..plane {
+            cb := fb.frame[i]
+            yv := fb.frame[plane + i] + 128.0 / 255.0
+            cr := fb.frame[2 * plane + i]
+            fb.frame[i] = yv + 1.402 * cr
+            fb.frame[plane + i] = yv - 0.344136 * cb - 0.714136 * cr
+            fb.frame[2 * plane + i] = yv + 1.772 * cb
+        }
+    }
+    if !f.is_normal() {
+        if f.can_reference() && !f.save_before_ct {
+            save_slot(fb, f.save_as_reference as usize, true, fw, fh)?
+        }
+        return ok()
+    }
+    if !fb.use_canvas {
+        return ok()
+    }
+    compose(h, f, fb)
+    if f.can_reference() && !f.save_before_ct {
+        save_slot(fb, f.save_as_reference as usize, false, h.width as usize, h.height as usize)?
+    }
+    return ok()
+}
+
+// Emit the canvas in the native layout.
+fn emit_canvas<S: sink.Sink>(output: &mut S, h: &ImageHeader, fb: &FloatBufs, layout: &pixels.Layout, tile: &mut[u8]) -> void!pixels.Error {
+    channels := layout.channel_count()
+    sample := layout.sample_code()
+    size := layout.sample_bytes()
+    bpp := layout.bytes_per_pixel()
+    width := h.width as usize
+    height := h.height as usize
+    plane := width * height
+    alpha := h.alpha_channel()
+    src := [0usize, 1, 2, 3]
+    if channels <= 2 {
+        src[0] = 0
+        src[1] = 3 + alpha
+    } else if channels == 4 {
+        src[3] = 3 + alpha
+    }
+    ty := 0usize
+    for ty < height {
+        th := height - ty
+        if th > TILE {
+            th = TILE
+        }
+        tx := 0usize
+        for tx < width {
+            tw := width - tx
+            if tw > TILE {
+                tw = TILE
+            }
+            row_bytes := tw * bpp
+            for y in 0usize..th {
+                for x in 0usize..tw {
+                    for k in 0usize..channels {
+                        v := 0.0f32
+                        if fb.use_canvas {
+                            v = fb.canvas[src[k] * plane + (ty + y) * width + tx + x]
+                        } else {
+                            v = fb.frame[src[k] * plane + (ty + y) * width + tx + x]
+                        }
+                        at := y * row_bytes + x * bpp + k * size
+                        if sample == pixels.SAMPLE_F32 {
+                            pixels.put32(tile, at, convert.f32_bits(v))
+                        } else if sample == pixels.SAMPLE_U16 {
+                            put_sample(tile, at, sample, nearest(clamp01(v) * 65535.0))
+                        } else {
+                            // Ordered dithering, as libjxl does for 8-bit output.
+                            d := DITHER[((ty + y + k * 13) % 32) * 32 + (tx + x + k * 23) % 32]
+                            q := v * 255.0 + d
+                            if q < 0.0 {
+                                q = 0.0
+                            }
+                            if q > 255.0 {
+                                q = 255.0
+                            }
+                            put_sample(tile, at, sample, nearest(q))
+                        }
+                    }
+                }
+            }
+            view := pixels.View.new(&tile[..row_bytes * th], tw as u32, th as u32, layout.clone())?
+            output.rect(tx as u32, ty as u32, &view)?
+            tx += tw
+        }
+        ty += th
+    }
+    return ok()
+}
+
+static UP2_WEIGHTS: [15]f32 = [
+    -0.01716200, -0.03452303, -0.04022174, -0.02921014, -0.00624645,
+    0.14111091, 0.28896755, 0.00278718, -0.01610267, 0.56661550,
+    0.03777607, -0.01986694, -0.03144731, -0.01185068, -0.00213539
+]
+
+static UP4_WEIGHTS: [55]f32 = [
+    -0.02419067, -0.03491987, -0.03693351, -0.03094285, -0.00529785,
+    -0.01663432, -0.03556863, -0.03888905, -0.03516850, -0.00989469,
+    0.23651958, 0.33392945, -0.01073543, -0.01313181, -0.03556694,
+    0.13048175, 0.40103025, 0.03951150, -0.02077584, 0.46914198,
+    -0.00209270, -0.01484589, -0.04064806, 0.18942530, 0.56279892,
+    0.06674400, -0.02335494, -0.03551682, -0.00754830, -0.02267919,
+    -0.02363578, 0.00315804, -0.03399098, -0.01359519, -0.00091653,
+    -0.00335467, -0.01163294, -0.01610294, -0.00974088, -0.00191622,
+    -0.01095446, -0.03198464, -0.04455121, -0.02799790, -0.00645912,
+    0.06390599, 0.22963888, 0.00630981, -0.01897349, 0.67537268,
+    0.08483369, -0.02534994, -0.02205197, -0.01667999, -0.00384443
+]
+
+static UP8_WEIGHTS: [210]f32 = [
+    -0.02928613, -0.03706353, -0.03783812, -0.03324558, -0.00447632,
+    -0.02519406, -0.03752601, -0.03901508, -0.03663285, -0.00646649,
+    -0.02066407, -0.03838633, -0.04002101, -0.03900035, -0.00901973,
+    -0.01626393, -0.03954148, -0.04046620, -0.03979621, -0.01224485,
+    0.29895328, 0.35757708, -0.02447552, -0.01081748, -0.04314594,
+    0.23903219, 0.41119301, -0.00573046, -0.01450239, -0.04246845,
+    0.17567618, 0.45220643, 0.02287757, -0.01936783, -0.03583255,
+    0.11572472, 0.47416733, 0.06284440, -0.02685066, 0.42720050,
+    -0.02248939, -0.01155273, -0.04562755, 0.28689496, 0.49093869,
+    -0.00007891, -0.01545926, -0.04562659, 0.21238920, 0.53980934,
+    0.03369474, -0.02070211, -0.03866988, 0.14229550, 0.56593398,
+    0.08045181, -0.02888298, -0.03680918, -0.00542229, -0.02920477,
+    -0.02788574, -0.02118180, -0.03942402, -0.00775547, -0.02433614,
+    -0.03193943, -0.02030828, -0.04044014, -0.01074016, -0.01930822,
+    -0.03620399, -0.01974125, -0.03919545, -0.01456093, -0.00045072,
+    -0.00360110, -0.01020207, -0.01231907, -0.00638988, -0.00071592,
+    -0.00279122, -0.00957115, -0.01288327, -0.00730937, -0.00107783,
+    -0.00210156, -0.00890705, -0.01317668, -0.00813895, -0.00153491,
+    -0.02128481, -0.04173044, -0.04831487, -0.03293190, -0.00525260,
+    -0.01720322, -0.04052736, -0.05045706, -0.03607317, -0.00738030,
+    -0.01341764, -0.03965629, -0.05151616, -0.03814886, -0.01005819,
+    0.18968273, 0.33063684, -0.01300105, -0.01372950, -0.04017465,
+    0.13727832, 0.36402234, 0.01027890, -0.01832107, -0.03365072,
+    0.08734506, 0.38194295, 0.04338228, -0.02525993, 0.56408126,
+    0.00458352, -0.01648227, -0.04887868, 0.24585519, 0.62026135,
+    0.04314807, -0.02213737, -0.04158014, 0.16637289, 0.65027023,
+    0.09621636, -0.03101388, -0.04082742, -0.00904519, -0.02790922,
+    -0.02117818, 0.00798662, -0.03995711, -0.01243427, -0.02231705,
+    -0.02946266, 0.00992055, -0.03600283, -0.01684920, -0.00111684,
+    -0.00411204, -0.01297130, -0.01723725, -0.01022545, -0.00165306,
+    -0.00313110, -0.01218016, -0.01763266, -0.01125620, -0.00231663,
+    -0.01374149, -0.03797620, -0.05142937, -0.03117307, -0.00581914,
+    -0.01064003, -0.03608089, -0.05272168, -0.03375670, -0.00795586,
+    0.09628104, 0.27129991, -0.00353779, -0.01734151, -0.03153981,
+    0.05686230, 0.28500998, 0.02230594, -0.02374955, 0.68214326,
+    0.05018048, -0.02320852, -0.04383616, 0.18459474, 0.71517975,
+    0.10805613, -0.03263677, -0.03637639, -0.01394373, -0.02511203,
+    -0.01728636, 0.05407331, -0.02867568, -0.01893131, -0.00240854,
+    -0.00446511, -0.01636187, -0.02377053, -0.01522848, -0.00333334,
+    -0.00819975, -0.02964169, -0.04499287, -0.02745350, -0.00612408,
+    0.02727416, 0.19446600, 0.00159832, -0.02232473, 0.74982506,
+    0.11452620, -0.03348048, -0.01605681, -0.02070339, -0.00458223
+]
+// 32x32 blue noise dither (libjxl stage_write.cc), applied to 8-bit output.
+static DITHER: [1024]f32 = [
+    -0.26057, 0.32619, 0.21039, -0.03281, -0.10616, 0.16792, 0.43042, -0.48061, -0.00965, -0.31075, 0.24899, -0.35322, -0.02509, -0.25285, 0.02895, 0.10230, -0.28373, -0.00193, 0.23355, 0.43428, -0.23741, 0.18336, -0.31847, -0.11002, -0.36094, 0.26057, -0.19108, -0.29531, 0.40726, -0.09458, 0.11002, -0.48833,
+    0.16020, -0.35708, -0.18336, 0.36094, -0.28373, -0.34550, -0.20267, 0.07914, 0.35708, -0.41498, 0.47675, -0.21811, -0.12546, 0.44200, -0.41884, -0.17178, 0.39954, 0.33778, -0.33778, 0.04053, -0.46517, 0.27215, -0.16792, 0.39182, 0.20653, -0.43814, -0.02895, 0.17950, -0.41498, 0.01737, 0.24899, 0.49219,
+    -0.00965, 0.08300, 0.41112, -0.46903, 0.04053, 0.47289, 0.26057, -0.05983, -0.13704, 0.14862, 0.03281, 0.29531, -0.45744, 0.22583, 0.14862, -0.09072, -0.37638, 0.19881, -0.14476, 0.14476, -0.09072, 0.48447, -0.39954, 0.06369, -0.05983, -0.26829, 0.43428, -0.12546, 0.28759, -0.22969, -0.32619, -0.15248,
+    -0.42270, 0.23741, -0.23355, -0.11774, 0.18722, 0.11388, -0.43814, -0.24899, 0.41884, 0.21039, -0.28373, -0.06756, 0.07914, 0.36480, -0.31075, 0.30303, -0.03281, 0.07142, -0.42656, 0.38024, -0.27987, 0.00579, 0.12546, -0.22197, 0.29917, 0.36866, 0.13704, -0.47289, 0.09072, 0.35708, -0.04825, 0.38796,
+    -0.28759, -0.07142, 0.44200, 0.27601, -0.38024, -0.16020, -0.01737, 0.30303, -0.33006, -0.40340, -0.16792, 0.40726, -0.36480, -0.00579, -0.19108, 0.41498, -0.26443, 0.46903, -0.21811, 0.28759, -0.04053, 0.22197, 0.34550, -0.44972, -0.14476, -0.34164, 0.04053, -0.19494, 0.45358, -0.37252, 0.21425, 0.05597,
+    0.31075, 0.14090, -0.33778, 0.00579, 0.34550, -0.29917, 0.38796, 0.13704, 0.05983, -0.10230, 0.34164, 0.10616, -0.23741, 0.19494, -0.47675, 0.04439, -0.39568, 0.24127, 0.10616, -0.49219, -0.17950, -0.36094, -0.30303, 0.45744, -0.01351, 0.24513, -0.39182, -0.07528, 0.18722, -0.26057, -0.11002, -0.45358,
+    0.46903, -0.17178, -0.41112, 0.07528, -0.09458, 0.21811, -0.20267, -0.48833, 0.44972, 0.00965, 0.24127, -0.42656, 0.48447, -0.11774, 0.26443, 0.14090, -0.15634, -0.07142, -0.32233, 0.36094, 0.42270, 0.19108, 0.07142, -0.11002, 0.15634, 0.38024, -0.28759, 0.27987, -0.00193, 0.33006, 0.11388, -0.21039,
+    0.02123, 0.17950, 0.38024, -0.24127, -0.44586, 0.48833, -0.03667, 0.26829, -0.36866, -0.22583, 0.17178, -0.30689, 0.29145, -0.04825, -0.35322, 0.43042, 0.34936, 0.00193, 0.16792, -0.12932, 0.03667, -0.06756, 0.31847, -0.40726, -0.24513, 0.09458, -0.17564, 0.47675, -0.43042, -0.32233, 0.40340, 0.26057,
+    -0.47675, -0.12160, -0.04825, 0.28759, 0.10230, 0.15634, -0.14862, -0.27601, 0.36094, -0.12932, -0.05983, -0.45358, -0.17950, 0.01737, 0.09458, -0.29145, -0.22969, -0.43428, 0.45744, -0.38796, -0.27601, -0.21039, -0.46131, 0.22969, 0.41112, -0.05211, -0.48061, 0.16406, 0.05211, -0.14862, -0.03281, -0.36866,
+    -0.27215, 0.34164, -0.31075, 0.42656, -0.38410, -0.32619, 0.02895, 0.19881, 0.08300, 0.42270, 0.31461, 0.13318, 0.45744, 0.37638, -0.40726, 0.31847, -0.08686, 0.21425, 0.29917, 0.07914, 0.26829, 0.13704, 0.48447, -0.15248, 0.02509, -0.34936, 0.34936, -0.10230, 0.42656, -0.23741, 0.22583, 0.09072,
+    0.44972, 0.20267, 0.04825, -0.21425, 0.24513, -0.07142, 0.39954, -0.46131, -0.39568, -0.01351, -0.33392, 0.05597, -0.26443, 0.22197, -0.20653, 0.15248, 0.04439, -0.46517, -0.16406, -0.04439, -0.34936, 0.37252, -0.01351, -0.30689, 0.29917, 0.20653, -0.26829, 0.26443, 0.13318, -0.39954, 0.30303, -0.08686,
+    -0.42656, 0.12932, -0.14476, -0.46903, -0.00579, 0.34936, -0.18722, 0.28373, -0.23741, 0.22969, -0.16020, -0.38024, -0.08300, -0.48447, -0.02123, -0.14862, 0.48061, -0.31847, 0.39568, -0.24899, 0.18722, -0.41884, 0.10230, -0.08300, -0.38796, 0.06369, -0.19881, -0.44972, 0.00579, -0.33392, 0.37252, -0.19108,
+    -0.02509, -0.35708, 0.32619, 0.46517, 0.17178, -0.28373, 0.10616, 0.47675, -0.09458, 0.15248, 0.43428, 0.35322, 0.17564, 0.27215, 0.41112, -0.36480, 0.24899, 0.11774, 0.01351, 0.33006, -0.11388, -0.18336, 0.41884, -0.23355, 0.16406, 0.46131, 0.38410, -0.04825, -0.15634, 0.49219, 0.17564, 0.03667,
+    0.40726, 0.23355, -0.25285, -0.08300, -0.41112, -0.12160, -0.35708, 0.05211, -0.41884, -0.29531, 0.02123, -0.21425, 0.09844, -0.30689, -0.11388, 0.34550, -0.26443, -0.07142, -0.39954, 0.44586, 0.05983, -0.48833, 0.24127, 0.34936, -0.44200, -0.12546, 0.12160, -0.30303, 0.27215, 0.07528, -0.48447, -0.29145,
+    0.28373, -0.17564, 0.09458, 0.02123, 0.30689, 0.41884, 0.20653, -0.03667, 0.32233, 0.25671, -0.45744, -0.05597, 0.46517, -0.41498, 0.00965, 0.07142, -0.44586, 0.16406, -0.20653, 0.21811, -0.29917, 0.28759, -0.05597, 0.03281, -0.32619, -0.00965, 0.31847, -0.37252, 0.18722, -0.11002, -0.22969, -0.06369,
+    -0.39568, 0.36866, -0.45744, -0.31847, 0.14476, -0.22583, -0.49219, 0.37638, -0.19494, -0.13318, 0.39182, -0.35322, 0.29531, -0.24127, 0.21039, -0.18722, 0.45358, 0.31461, -0.13318, -0.01737, -0.36094, 0.12932, -0.25671, 0.43814, -0.16792, 0.23355, -0.22197, 0.44972, -0.42270, 0.33392, 0.42656, 0.11774,
+    -0.13318, 0.19494, -0.03667, 0.44972, 0.24513, -0.15248, 0.08300, -0.33006, 0.00579, 0.12546, 0.19494, 0.05983, -0.15634, 0.14476, 0.36480, -0.04053, -0.33006, 0.25671, -0.46903, 0.37252, 0.48833, -0.09458, -0.41112, 0.19108, 0.08686, -0.46903, -0.07528, 0.04053, -0.26829, -0.02895, 0.22197, -0.34164,
+    0.47289, -0.21811, 0.06756, -0.38410, -0.27987, -0.06369, 0.27987, 0.43814, -0.25671, -0.39182, 0.49219, -0.27601, -0.07914, -0.48061, 0.42656, -0.38410, 0.11002, 0.03667, -0.27215, 0.15634, 0.07528, -0.22197, 0.33006, 0.38410, -0.34936, 0.27987, 0.15248, 0.40340, 0.09844, -0.16406, -0.46131, 0.03281,
+    -0.29531, 0.31461, -0.10616, 0.39954, 0.01351, 0.33778, -0.43814, 0.17178, -0.08686, 0.23741, -0.44586, 0.33778, -0.00193, -0.31461, 0.23741, -0.12932, -0.22583, -0.06756, 0.40340, -0.16792, -0.43428, 0.01351, -0.14476, -0.04053, -0.29145, 0.46517, -0.13704, -0.39182, -0.32233, 0.29531, 0.38410, 0.16020,
+    -0.44200, 0.26443, 0.12546, -0.42270, 0.21425, -0.19881, -0.35708, 0.04825, 0.36480, -0.02895, -0.21425, 0.09072, 0.41498, 0.18336, 0.04439, 0.29917, 0.47675, -0.40340, 0.27601, -0.31461, 0.31075, 0.17564, 0.24899, -0.45744, 0.05597, -0.19494, 0.00193, 0.36094, 0.24127, -0.09844, -0.24513, -0.00965,
+    -0.17564, -0.05597, -0.34550, -0.24899, 0.48061, 0.15248, -0.11388, 0.45358, -0.16406, -0.32233, 0.31461, -0.11774, -0.36866, -0.18722, -0.25671, -0.44200, 0.13318, -0.02123, 0.19881, -0.10616, 0.43042, -0.36866, -0.24899, 0.41112, 0.11002, 0.21425, -0.25671, -0.47675, -0.04439, 0.13704, -0.37252, 0.43814,
+    0.19108, 0.03667, 0.35708, -0.14090, 0.08300, -0.02123, -0.30303, -0.48061, 0.11774, 0.20267, -0.43042, 0.25285, 0.14090, -0.04439, 0.38796, 0.34550, -0.34164, -0.19494, 0.05983, -0.48447, 0.09844, -0.00579, -0.07914, 0.33778, -0.41498, -0.10230, 0.30689, 0.17178, 0.48833, -0.20267, 0.07914, 0.33392,
+    -0.48833, -0.30689, 0.41498, 0.22969, -0.44586, 0.32233, 0.25285, 0.39182, -0.23355, 0.01737, 0.42270, -0.27987, 0.46903, -0.47289, 0.02123, -0.09072, 0.21811, 0.44586, -0.25285, 0.36480, -0.29145, 0.47289, -0.18722, 0.14476, -0.31461, 0.43814, -0.36094, 0.04439, -0.29917, -0.41884, 0.25285, -0.11774,
+    0.46131, 0.11388, -0.21039, -0.07528, -0.38024, -0.26057, 0.06369, -0.05983, 0.29145, -0.40340, -0.09072, 0.06756, -0.16020, 0.27601, -0.31075, 0.10616, -0.14090, -0.43042, 0.25671, -0.05211, -0.13318, 0.23355, -0.44972, 0.02895, 0.26829, -0.02895, -0.17950, 0.37252, -0.13704, 0.40726, 0.01351, -0.26443,
+    -0.03281, -0.40340, 0.27987, 0.17564, 0.02509, 0.44200, -0.15248, -0.34550, 0.14862, -0.19881, -0.01351, 0.36866, -0.38796, 0.19494, -0.22197, 0.32619, -0.37638, 0.00193, 0.30689, 0.12160, -0.39182, 0.16792, -0.34550, 0.39954, -0.23355, 0.09072, -0.43428, 0.22969, -0.06369, 0.12546, -0.35322, 0.30689,
+    -0.09844, 0.06756, 0.38410, -0.33392, -0.18336, 0.35322, 0.21039, -0.42270, 0.48833, 0.33006, 0.21811, -0.33392, 0.12932, -0.05211, 0.39568, 0.04825, 0.48061, 0.17950, -0.31847, -0.21811, 0.38024, 0.05211, 0.32233, -0.06756, -0.12546, 0.46131, 0.16020, -0.25285, 0.29531, -0.44972, 0.17950, -0.16406,
+    0.22583, -0.46131, -0.27601, -0.00579, 0.12932, -0.47289, -0.09844, 0.10230, -0.28759, -0.12160, -0.49219, -0.24127, 0.44586, -0.11388, -0.45358, -0.27215, -0.17178, -0.07528, -0.47675, 0.43042, -0.02509, -0.27215, -0.19108, 0.19881, -0.49219, -0.37252, 0.33392, -0.00193, -0.33006, -0.20267, 0.48061, 0.34164,
+    -0.22969, 0.42270, -0.12160, 0.31075, 0.46903, -0.22583, 0.27215, -0.02509, 0.03281, 0.40340, 0.25671, 0.08686, 0.00965, 0.29145, -0.41112, 0.14090, 0.24513, 0.34164, 0.08686, -0.14862, 0.27601, -0.42656, 0.48447, 0.09844, 0.26443, -0.27987, 0.05597, -0.10230, 0.43428, 0.08686, 0.02895, -0.38024,
+    0.15634, 0.09458, -0.36480, 0.18336, -0.05211, -0.40726, 0.36866, -0.33778, -0.19881, 0.16020, -0.37638, -0.16020, -0.29917, 0.20267, 0.41884, -0.01737, -0.34936, -0.24127, 0.02509, 0.20653, -0.36480, -0.08686, 0.01737, -0.33778, 0.41498, -0.03667, 0.37638, -0.17178, -0.47289, 0.26829, -0.28759, -0.05597,
+    0.35708, 0.00193, 0.25285, -0.15634, -0.30303, 0.06369, 0.22197, 0.45358, -0.43814, 0.30303, -0.04053, 0.46517, 0.35322, -0.21039, 0.06756, -0.14090, 0.37638, -0.43042, 0.45744, -0.29531, 0.39568, 0.14862, 0.23741, -0.13704, -0.21425, 0.16406, -0.40726, 0.22583, 0.13318, 0.38796, -0.12932, -0.43428,
+    -0.31461, -0.20653, 0.46131, -0.45358, 0.39568, -0.24513, -0.14090, 0.11002, -0.08300, -0.26829, 0.05211, -0.46517, -0.09844, -0.39568, -0.32619, -0.06369, 0.16792, 0.28373, 0.11388, -0.04439, -0.18336, -0.44200, 0.35322, -0.26057, -0.46517, 0.31075, -0.07914, -0.34164, -0.24513, -0.02123, 0.19108, 0.44200,
+    0.04825, -0.07914, -0.39954, 0.12160, 0.29145, 0.00965, -0.37638, 0.32233, 0.20267, -0.17564, 0.39182, 0.12160, 0.18336, 0.32619, 0.26057, 0.49219, -0.48447, -0.20653, -0.10616, -0.38796, 0.31847, 0.07528, -0.01737, 0.44586, 0.11774, 0.02509, 0.47289, 0.07142, 0.33392, -0.38410, -0.17950, 0.28373
+]

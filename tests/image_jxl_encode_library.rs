@@ -1,0 +1,27 @@
+//! The pure-Dodo JPEG XL lossless encoder (std/image/jxl/encode): golden
+//! codestreams, container and header structure, buffer errors, size bounds
+//! and every pixel layout, through `dodo test tests/image/jxl_encode`.
+//! Bit-exact decoding is checked against libjxl by
+//! tests/image/jxl_encode/verify.py (needs djxl, so not run here).
+use std::path::PathBuf;
+use std::process::Command;
+
+#[test]
+fn jpeg_xl_encoder_tests_pass() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let output = Command::new(env!("CARGO_BIN_EXE_dodo"))
+        .args(["test", "tests/image/jxl_encode", "-O", "0"])
+        .env_remove("DODO_UPDATE_GOLDEN")
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "dodo test tests/image/jxl_encode: {}\n{}\n{}",
+        output.status,
+        stdout,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(stdout.contains("8 passed"), "{stdout}");
+}

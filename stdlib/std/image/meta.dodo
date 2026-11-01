@@ -1,0 +1,141 @@
+package meta
+
+import "std/compress/deflate"
+import "std/compress/zlib"
+import "std/image/pixels"
+import "std/image/shared/binary"
+
+// Image metadata located without copying: decoders report EXIF, XMP and ICC
+// payloads as byte ranges of the input file plus how they are encoded.
+// Helpers here read the EXIF orientation and inflate zlib payloads; JPEG XL
+// specific encodings are decoded through std/image or std/image/jxl.
+
+// How an Item's bytes are stored.
+pub const ENCODING_RAW: u8 = 0
+// A zlib stream (PNG iCCP, compressed iTXt).
+pub const ENCODING_ZLIB: u8 = 1
+// Brotli (JPEG XL "brob" boxes).
+pub const ENCODING_BROTLI: u8 = 2
+// Entropy-coded in a JPEG XL codestream (ICC only).
+pub const ENCODING_JXL: u8 = 3
+
+// One payload: data[offset..offset + length] in `encoding`. Absent when
+// length is zero. EXIF items start at the TIFF header ("II*\0" or
+// "MM\0*"); XMP items are the XML packet.
+pub struct Item {
+    pub offset: usize
+    pub length: usize
+    pub encoding: u8
+
+    pub fn none() -> Item {
+        return Item { offset: 0, length: 0, encoding: ENCODING_RAW }
+    }
+    pub fn raw(offset: usize, length: usize) -> Item {
+        return Item { offset: offset, length: length, encoding: ENCODING_RAW }
+    }
+    pub fn present(&self) -> bool {
+        return self.length > 0
+    }
+    pub fn clone(&self) -> Item {
+        return Item { offset: self.offset, length: self.length, encoding: self.encoding }
+    }
+    // The item's stored bytes in `data`, the file it came from.
+    pub fn bytes(&self, data: &[u8]) -> &[u8]!pixels.Error from(data) {
+        return binary.range(data, self.offset, self.length)
+    }
+}
+
+pub struct Metadata {
+    pub exif: Item
+    pub xmp: Item
+    pub icc: Item
+
+    pub fn empty() -> Metadata {
+        return Metadata { exif: Item.none(), xmp: Item.none(), icc: Item.none() }
+    }
+}
+
+// Inflate a zlib-encoded item into `output`, returning the byte count; raw
+// items are copied. Brotli and JPEG XL items fail with Unsupported here.
+pub fn decode(data: &[u8], item: &Item, output: &mut[u8]) -> usize!pixels.Error {
+    stored := item.bytes(data)?
+    if item.encoding == ENCODING_RAW {
+        if output.len < stored.len {
+            return err(pixels.Error.BufferTooSmall)
+        }
+        for i in 0usize..stored.len {
+            output[i] = stored[i]
+        }
+        return ok(stored.len)
+    }
+    if item.encoding != ENCODING_ZLIB {
+        return err(pixels.Error.Unsupported)
+    }
+    match zlib.decode(stored, output) {
+        ok(result) => {
+            return ok(result.output_written)
+        }
+        err(error) => {
+            if error == deflate.Error.OutputFull {
+                return err(pixels.Error.BufferTooSmall)
+            }
+            if error == deflate.Error.Truncated {
+                return err(pixels.Error.Truncated)
+            }
+            return err(pixels.Error.Malformed)
+        }
+    }
+}
+
+// The orientation tag (0x0112) of a TIFF-structured EXIF payload, 1 to 8,
+// or 1 when absent. Only IFD0 is searched, as the tag lives there.
+pub fn exif_orientation(exif: &[u8]) -> u32!pixels.Error {
+    if exif.len < 8 {
+        return err(pixels.Error.Truncated)
+    }
+    little := false
+    if exif[0] == b'I' && exif[1] == b'I' {
+        little = true
+    } else if exif[0] != b'M' || exif[1] != b'M' {
+        return err(pixels.Error.Malformed)
+    }
+    if tiff16(exif, 2, little)? != 42 {
+        return err(pixels.Error.Malformed)
+    }
+    ifd := tiff32(exif, 4, little)? as usize
+    count := tiff16(exif, ifd, little)? as usize
+    for i in 0usize..count {
+        entry := ifd + 2 + i * 12
+        tag := tiff16(exif, entry, little)?
+        if tag == 0x0112 {
+            kind := tiff16(exif, entry + 2, little)?
+            value := 1u32
+            if kind == 3 {
+                value = tiff16(exif, entry + 8, little)?
+            } else if kind == 4 {
+                value = tiff32(exif, entry + 8, little)?
+            } else {
+                return err(pixels.Error.Malformed)
+            }
+            if value < 1 || value > 8 {
+                return ok(1)
+            }
+            return ok(value)
+        }
+    }
+    return ok(1)
+}
+
+fn tiff16(data: &[u8], offset: usize, little: bool) -> u32!pixels.Error {
+    if little {
+        return binary.le16(data, offset)
+    }
+    return binary.be16(data, offset)
+}
+
+fn tiff32(data: &[u8], offset: usize, little: bool) -> u32!pixels.Error {
+    if little {
+        return binary.le32(data, offset)
+    }
+    return binary.be32(data, offset)
+}

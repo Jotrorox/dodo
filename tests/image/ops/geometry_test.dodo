@@ -1,0 +1,219 @@
+package ops_test
+
+import "std/image/color"
+import "std/image/ops"
+import "std/image/pixels"
+
+// Geometry on small hand-built images: every orientation against the
+// expected placement, layout conversion during a transform, crops and the
+// in-place variants.
+
+// A 3x2 gray image numbered 1..6 row by row.
+fn numbered(storage: &mut[u8]) {
+    for i in 0usize..6 {
+        storage[i] = (i + 1) as u8
+    }
+}
+
+fn check_orientation(exif: u32, expected: &[u8], width: u32, height: u32) {
+    data := [0u8; 6]
+    numbered(&mut data)
+    source := pixels.View.new(&data, 3, 2, pixels.Layout.gray8())!
+    orientation := color.orientation_from_exif(exif)
+    size := ops.oriented_size(3, 2, &orientation)
+    assert_eq(size.width, width)
+    assert_eq(size.height, height)
+    out := [0u8; 6]
+    target := pixels.ViewMut.new(&mut out, width, height, pixels.Layout.gray8())!
+    ops.orient(&source, &mut target, &orientation)!
+    for i in 0usize..6 {
+        assert_eq(out[i] + 48, expected[i])
+    }
+}
+
+@test
+fn all_eight_orientations_place_pixels() {
+    // 1 2 3
+    // 4 5 6
+    check_orientation(1, b"123456", 3, 2)
+    check_orientation(2, b"321654", 3, 2)
+    check_orientation(3, b"654321", 3, 2)
+    check_orientation(4, b"456123", 3, 2)
+    check_orientation(5, b"142536", 2, 3)
+    check_orientation(6, b"415263", 2, 3)
+    check_orientation(7, b"635241", 2, 3)
+    check_orientation(8, b"362514", 2, 3)
+}
+
+// A 3x2 RGBA8 image whose pixel k has red = k + 1 and alpha 200.
+fn numbered_rgba(storage: &mut[u8]) {
+    for k in 0usize..6 {
+        storage[k * 4] = (k + 1) as u8
+        storage[k * 4 + 1] = (10 * k) as u8
+        storage[k * 4 + 2] = 7
+        storage[k * 4 + 3] = 200
+    }
+}
+
+@test
+fn transforms_convert_layouts() {
+    data := [0u8; 24]
+    numbered_rgba(&mut data)
+    source := pixels.View.new(&data, 3, 2, pixels.Layout.rgba8())!
+    // Rotate into 16-bit RGBA: red k + 1 lands where rotate90 puts it.
+    wide := [0u8; 48]
+    target := pixels.ViewMut.new(&mut wide, 2, 3, pixels.Layout.rgba16())!
+    ops.rotate90(&source, &mut target)!
+    expected := b"415263"
+    for p in 0usize..6 {
+        assert_eq(pixels.get16(&wide, p * 8), (expected[p] - 48) as u16 * 257)
+        assert_eq(pixels.get16(&wide, p * 8 + 6), 200 * 257)
+    }
+    // Rotate270 into float RGBA.
+    floats := [0u8; 96]
+    float_target := pixels.ViewMut.new(&mut floats, 2, 3, pixels.Layout.rgba_f32())!
+    ops.rotate270(&source, &mut float_target)!
+    // Pixel (0, 0) of rotate270 is source (2, 0): red 3.
+    v := pixels.get32(&floats, 0)
+    assert_eq(v, 0x3c40c0c1u32)
+    // Transpose into RGB8 drops alpha.
+    rgb := [0u8; 18]
+    rgb_target := pixels.ViewMut.new(&mut rgb, 2, 3, pixels.Layout.rgb8())!
+    ops.transpose(&source, &mut rgb_target)!
+    transposed := b"142536"
+    for p in 0usize..6 {
+        assert_eq(rgb[p * 3] + 48, transposed[p])
+    }
+    // Same-layout flips, transverse and 180.
+    out := [0u8; 24]
+    flipped := pixels.ViewMut.new(&mut out, 3, 2, pixels.Layout.rgba8())!
+    ops.flip_horizontal(&source, &mut flipped)!
+    ops.flip_vertical(&source, &mut flipped)!
+    ops.rotate180(&source, &mut flipped)!
+    reversed := b"654321"
+    for p in 0usize..6 {
+        assert_eq(out[p * 4] + 48, reversed[p])
+        assert_eq(out[p * 4 + 3], 200)
+    }
+    turned := [0u8; 24]
+    across := pixels.ViewMut.new(&mut turned, 2, 3, pixels.Layout.rgba8())!
+    ops.transverse(&source, &mut across)!
+    expected_transverse := b"635241"
+    for p in 0usize..6 {
+        assert_eq(turned[p * 4] + 48, expected_transverse[p])
+    }
+}
+
+@test
+fn wrong_target_sizes_are_malformed() {
+    data := [0u8; 6]
+    numbered(&mut data)
+    source := pixels.View.new(&data, 3, 2, pixels.Layout.gray8())!
+    out := [0u8; 6]
+    target := pixels.ViewMut.new(&mut out, 3, 2, pixels.Layout.gray8())!
+    match ops.rotate90(&source, &mut target) {
+        ok() => {
+            assert(false, "rotate90 needs a 2x3 target")
+        }
+        err(e) => {
+            assert_eq(pixels.error_name(e), "Malformed")
+        }
+    }
+    tall := pixels.ViewMut.new(&mut out, 2, 3, pixels.Layout.gray8())!
+    match ops.flip_vertical(&source, &mut tall) {
+        ok() => {
+            assert(false, "flip needs a 3x2 target")
+        }
+        err(e) => {
+            assert_eq(pixels.error_name(e), "Malformed")
+        }
+    }
+}
+
+@test
+fn crops_share_pixels() {
+    data := [0u8; 6]
+    numbered(&mut data)
+    source := pixels.View.new(&data, 3, 2, pixels.Layout.gray8())!
+    part := ops.crop(&source, 1, 0, 2, 2)!
+    assert_eq(part.width(), 2)
+    assert_eq(part.pixel(0, 0)[0], 2)
+    assert_eq(part.pixel(1, 1)[0], 6)
+    // Transform a crop: rotate the right 2x2 block by 180.
+    out := [0u8; 4]
+    target := pixels.ViewMut.new(&mut out, 2, 2, pixels.Layout.gray8())!
+    ops.rotate180(&part, &mut target)!
+    assert_eq(out[0], 6)
+    assert_eq(out[1], 5)
+    assert_eq(out[2], 3)
+    assert_eq(out[3], 2)
+    match ops.crop(&source, 2, 0, 2, 1) {
+        ok(_) => {
+            assert(false, "crop outside the image")
+        }
+        err(e) => {
+            assert_eq(pixels.error_name(e), "Malformed")
+        }
+    }
+    // Writable crops and copies into them.
+    canvas := [0u8; 16]
+    whole := pixels.ViewMut.new(&mut canvas, 4, 4, pixels.Layout.gray8())!
+    window := ops.crop_mut(&mut whole, 1, 1, 3, 2)!
+    ops.copy(&source, &mut window)!
+    assert_eq(canvas[5], 1)
+    assert_eq(canvas[7], 3)
+    assert_eq(canvas[9], 4)
+    assert_eq(canvas[11], 6)
+    assert_eq(canvas[4], 0)
+}
+
+@test
+fn in_place_variants_match_the_copying_ones() {
+    for exif in 1u32..9 {
+        orientation := color.orientation_from_exif(exif)
+        // Square 3x3 RGB16 image.
+        data := [0u8; 54]
+        for i in 0usize..27 {
+            pixels.put16(&mut data, i * 2, (i * 1000) as u16)
+        }
+        copy := [0u8; 54]
+        for i in 0usize..54 {
+            copy[i] = data[i]
+        }
+        source := pixels.View.new(&copy, 3, 3, pixels.Layout.rgb16())!
+        expected := [0u8; 54]
+        target := pixels.ViewMut.new(&mut expected, 3, 3, pixels.Layout.rgb16())!
+        ops.orient(&source, &mut target, &orientation)!
+        view := pixels.ViewMut.new(&mut data, 3, 3, pixels.Layout.rgb16())!
+        ops.orient_in_place(&mut view, &orientation)!
+        for i in 0usize..54 {
+            assert_eq(data[i], expected[i])
+        }
+        // The inverse orientation restores the original.
+        back := ops.inverse_orientation(&orientation)
+        restored := pixels.ViewMut.new(&mut data, 3, 3, pixels.Layout.rgb16())!
+        ops.orient_in_place(&mut restored, &back)!
+        for i in 0usize..54 {
+            assert_eq(data[i], copy[i])
+        }
+    }
+    // Non-square in place: flips and 180 work, quarter turns are refused.
+    data := [0u8; 6]
+    numbered(&mut data)
+    view := pixels.ViewMut.new(&mut data, 3, 2, pixels.Layout.gray8())!
+    ops.rotate180_in_place(&mut view)
+    ops.flip_horizontal_in_place(&mut view)
+    turn := color.Orientation.Rotate90
+    match ops.orient_in_place(&mut view, &turn) {
+        ok() => {
+            assert(false, "quarter turn of a non-square view")
+        }
+        err(e) => {
+            assert_eq(pixels.error_name(e), "Malformed")
+        }
+    }
+    // 180 then horizontal flip is a vertical flip.
+    assert_eq(data[0], 4)
+    assert_eq(data[2], 6)
+    assert_eq(data[3], 1)
+}

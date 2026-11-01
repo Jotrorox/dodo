@@ -1,0 +1,612 @@
+package bmp
+
+import "std/image/color"
+import "std/image/meta"
+import "std/image/pixels"
+import "std/image/shared/binary"
+import "std/image/sink"
+
+// Windows and OS/2 bitmaps: 1, 4 and 8-bit palettes (uncompressed, or RLE8
+// and RLE4), 16, 24 and 32-bit pixels with or without bit-field masks,
+// bottom-up or top-down rows. Headers from the 12-byte OS/2
+// BITMAPCOREHEADER through BITMAPV5HEADER are read; a V4/V5 header's sRGB
+// color space tags the image, and a V5 embedded ICC profile is reported in
+// metadata() and the header's ColorInfo.
+//
+// Pixels decode to Rgb8, or Rgba8 when the file has an alpha mask. Pixels an
+// RLE stream skips (delta and end-of-line escapes) decode as black; RLE
+// images above 2^26 pixels need a stream byte per 4096 pixels, else
+// TooLarge, which bounds the decoding time. The
+// encoder writes 24-bit BMP, or 32-bit with a V5 header and an alpha mask
+// when the source has alpha.
+
+const BI_RGB: u32 = 0
+const BI_RLE8: u32 = 1
+const BI_RLE4: u32 = 2
+const BI_BITFIELDS: u32 = 3
+const BI_ALPHABITFIELDS: u32 = 6
+// bV5CSType values, as little-endian u32.
+const LCS_SRGB: u32 = 0x73524742
+const PROFILE_EMBEDDED: u32 = 0x4d424544
+// Pixels converted per batch.
+const CHUNK: usize = 64
+
+struct Fields {
+    width: u32
+    height: u32
+    top_down: bool
+    bits: u32
+    compression: u32
+    // Offset of the pixel data, and bytes per stored row (uncompressed).
+    data: usize
+    stride: usize
+    palette: usize
+    palette_count: u32
+    // Bytes per palette entry: 4, or 3 in OS/2 files.
+    entry: usize
+    red_mask: u32
+    green_mask: u32
+    blue_mask: u32
+    alpha_mask: u32
+    srgb: bool
+    icc_offset: usize
+    icc_length: usize
+}
+
+pub fn matches(data: &[u8]) -> bool {
+    return data.len >= 2 && data[0] == b'B' && data[1] == b'M'
+}
+
+fn fields(data: &[u8]) -> Fields!pixels.Error {
+    if data.len < 26 {
+        return err(pixels.Error.Truncated)
+    }
+    if !matches(data) {
+        return err(pixels.Error.Malformed)
+    }
+    offset := binary.le32(data, 10)? as usize
+    header_size := binary.le32(data, 14)?
+    if header_size == 12 {
+        return core_fields(data, offset)
+    }
+    if header_size < 40 {
+        // OS/2 2.x short headers and other variants.
+        return err(pixels.Error.Unsupported)
+    }
+    raw_width := binary.le32(data, 18)?
+    raw_height := binary.le32(data, 22)?
+    planes := binary.le16(data, 26)?
+    bits := binary.le16(data, 28)?
+    compression := binary.le32(data, 30)?
+    colors_used := binary.le32(data, 46)?
+    if planes != 1 || raw_width == 0 || raw_width > 0x7fffffff {
+        return err(pixels.Error.Malformed)
+    }
+    width := raw_width
+    height := raw_height
+    top_down := false
+    if raw_height > 0x7fffffff {
+        // A negative height stores rows top-down.
+        top_down = true
+        height = core.wrapping_sub(0u32, raw_height)
+    }
+    binary.check_dimensions(width, height)?
+    red := 0u32
+    green := 0u32
+    blue := 0u32
+    alpha := 0u32
+    if compression == BI_BITFIELDS || compression == BI_ALPHABITFIELDS {
+        if bits != 16 && bits != 32 {
+            return err(pixels.Error.Malformed)
+        }
+        // Masks follow a 40-byte header, or sit inside a V2+ header.
+        red = binary.le32(data, 54)?
+        green = binary.le32(data, 58)?
+        blue = binary.le32(data, 62)?
+        if compression == BI_ALPHABITFIELDS || header_size >= 56 {
+            alpha = binary.le32(data, 66)?
+        }
+    } else if compression == BI_RLE8 || compression == BI_RLE4 {
+        if (compression == BI_RLE8 && bits != 8) || (compression == BI_RLE4 && bits != 4) || top_down {
+            return err(pixels.Error.Malformed)
+        }
+    } else if compression != BI_RGB {
+        return err(pixels.Error.Unsupported)
+    } else if bits == 16 {
+        red = 0x7c00
+        green = 0x03e0
+        blue = 0x001f
+    } else if bits == 24 || bits == 32 {
+        red = 0x00ff0000
+        green = 0x0000ff00
+        blue = 0x000000ff
+    }
+    if bits != 1 && bits != 4 && bits != 8 && bits != 16 && bits != 24 && bits != 32 {
+        return err(pixels.Error.Unsupported)
+    }
+    palette_count := 0u32
+    if bits <= 8 {
+        palette_count = colors_used
+        if palette_count == 0 || palette_count > (1u32 << bits) {
+            palette_count = 1u32 << bits
+        }
+    }
+    row_bits := pixels.checked(width as usize, bits as usize, 31)?
+    palette := pixels.checked(header_size as usize, 1, 14)?
+    result := Fields { width: width, height: height, top_down: top_down, bits: bits, compression: compression, data: offset, stride: (row_bits / 32) * 4, palette: palette, palette_count: palette_count, entry: 4, red_mask: red, green_mask: green, blue_mask: blue, alpha_mask: alpha, srgb: false, icc_offset: 0, icc_length: 0 }
+    if header_size >= 108 {
+        space := binary.le32(data, 70)?
+        if space == LCS_SRGB {
+            result.srgb = true
+        } else if space == PROFILE_EMBEDDED && header_size >= 124 {
+            start := pixels.checked(binary.le32(data, 126)? as usize, 1, 14)?
+            length := binary.le32(data, 130)? as usize
+            binary.range(data, start, length)?
+            if length > 0 {
+                result.icc_offset = start
+                result.icc_length = length
+            }
+        }
+    }
+    return ok(result)
+}
+
+// The OS/2 1.x BITMAPCOREHEADER: 16-bit dimensions, 3-byte palette entries.
+fn core_fields(data: &[u8], offset: usize) -> Fields!pixels.Error {
+    width := binary.le16(data, 18)?
+    height := binary.le16(data, 20)?
+    planes := binary.le16(data, 22)?
+    bits := binary.le16(data, 24)?
+    if planes != 1 || width == 0 {
+        return err(pixels.Error.Malformed)
+    }
+    if bits != 1 && bits != 4 && bits != 8 && bits != 24 {
+        return err(pixels.Error.Unsupported)
+    }
+    palette_count := 0u32
+    red := 0u32
+    green := 0u32
+    blue := 0u32
+    if bits <= 8 {
+        palette_count = 1u32 << bits
+        // Short palettes end where the pixels start.
+        if offset > 26 && (offset - 26) / 3 < palette_count as usize && offset - 26 >= 3 {
+            palette_count = ((offset - 26) / 3) as u32
+        }
+    } else {
+        red = 0x00ff0000
+        green = 0x0000ff00
+        blue = 0x000000ff
+    }
+    row_bits := pixels.checked(width as usize, bits as usize, 31)?
+    return ok(Fields { width: width, height: height, top_down: false, bits: bits, compression: BI_RGB, data: offset, stride: (row_bits / 32) * 4, palette: 26, palette_count: palette_count, entry: 3, red_mask: red, green_mask: green, blue_mask: blue, alpha_mask: 0, srgb: false, icc_offset: 0, icc_length: 0 })
+}
+
+fn header_of(f: &Fields) -> pixels.Header {
+    layout := pixels.Layout.rgb8()
+    if f.alpha_mask != 0 {
+        layout = pixels.Layout.rgba8()
+    }
+    depth := 8u32
+    if f.bits == 16 {
+        depth = 5
+    }
+    header := pixels.Header.new(pixels.Format.Bmp, f.width, f.height, layout, depth)
+    if f.srgb {
+        header.color.tagged = true
+    }
+    if f.icc_length > 0 {
+        header.color.tagged = true
+        header.color.icc_encoding = color.ICC_RAW
+        header.color.icc_offset = f.icc_offset
+        header.color.icc_length = f.icc_length
+    }
+    return header
+}
+
+pub fn info(data: &[u8]) -> pixels.Header!pixels.Error {
+    f := fields(data)?
+    return ok(header_of(&f))
+}
+
+// A V5 header's embedded ICC profile, raw.
+pub fn metadata(data: &[u8]) -> meta.Metadata!pixels.Error {
+    f := fields(data)?
+    result := meta.Metadata.empty()
+    if f.icc_length > 0 {
+        result.icc = meta.Item.raw(f.icc_offset, f.icc_length)
+    }
+    return ok(result)
+}
+
+// The decoder needs no scratch.
+pub fn scratch_size(data: &[u8]) -> usize!pixels.Error {
+    fields(data)?
+    return ok(0)
+}
+
+// The masked field of `value` widened or narrowed to 8 bits. A mask with
+// gaps, which no real encoder writes, uses its lowest contiguous run.
+fn channel(value: u32, mask: u32) -> u8 {
+    if mask == 0 {
+        return 0
+    }
+    shift := 0u32
+    for ((mask >> shift) & 1) == 0 {
+        shift += 1
+    }
+    width := 0u32
+    for shift + width < 32 && ((mask >> (shift + width)) & 1) == 1 {
+        width += 1
+    }
+    low := (value & mask) >> shift
+    if width >= 8 {
+        return ((low >> (width - 8)) & 255) as u8
+    }
+    maximum := (1u32 << width) - 1
+    field := low & maximum
+    return ((field * 255 + maximum / 2) / maximum) as u8
+}
+
+// Write palette entry `index` as RGB at out[o..o + 3].
+fn put_entry(data: &[u8], f: &Fields, index: u32, out: &mut[u8], o: usize) -> void!pixels.Error {
+    if index >= f.palette_count {
+        return err(pixels.Error.Malformed)
+    }
+    p := f.palette + index as usize * f.entry
+    out[o] = data[p + 2]
+    out[o + 1] = data[p + 1]
+    out[o + 2] = data[p]
+    return ok()
+}
+
+pub fn decode<S: sink.Sink>(data: &[u8], output: &mut S, scratch: &mut[u8]) -> void!pixels.Error {
+    f := fields(data)?
+    header := header_of(&f)
+    if f.bits <= 8 {
+        end := pixels.checked(f.palette_count as usize, f.entry, f.palette)?
+        if end > data.len {
+            return err(pixels.Error.Truncated)
+        }
+    }
+    if f.compression == BI_RLE8 || f.compression == BI_RLE4 {
+        if f.data > data.len {
+            return err(pixels.Error.Truncated)
+        }
+        // Escapes skip pixels for free; bound the work by the stream size
+        // beyond 2^26 pixels.
+        count := binary.pixel_count(f.width, f.height)?
+        if count > 67108864 && count / 4096 > data.len - f.data {
+            return err(pixels.Error.TooLarge)
+        }
+        output.begin(&header)?
+        return decode_rle(data, &f, &header.native, output)
+    }
+    end := pixels.checked(f.stride, f.height as usize, f.data)?
+    if data.len < end {
+        return err(pixels.Error.Truncated)
+    }
+    output.begin(&header)?
+    channels := header.native.channel_count()
+    buffer := [0u8; CHUNK * 4]
+    for stored in 0u32..f.height {
+        y := f.height - 1 - stored
+        if f.top_down {
+            y = stored
+        }
+        start := f.data + stored as usize * f.stride
+        column := 0u32
+        for column < f.width {
+            count := f.width - column
+            if count > CHUNK as u32 {
+                count = CHUNK as u32
+            }
+            for k in 0usize..count as usize {
+                x := column as usize + k
+                o := k * channels
+                if f.bits <= 8 {
+                    bit := x * f.bits as usize
+                    byte := data[start + bit / 8]
+                    shift := 8 - f.bits - (bit % 8) as u32
+                    index := ((byte as u32) >> shift) & ((1u32 << f.bits) - 1)
+                    match put_entry(data, &f, index, &mut buffer, o) {
+                        ok() => {}
+                        err(error) => {
+                            // Draw the pixels before the bad index first.
+                            if k > 0 {
+                                view := pixels.View.new(&buffer[..k * channels], k as u32, 1, header.native.clone())?
+                                output.rect(column, y, &view)?
+                            }
+                            return err(error)
+                        }
+                    }
+                } else {
+                    value := 0u32
+                    i := start + x * (f.bits / 8) as usize
+                    if f.bits == 16 {
+                        value = (data[i] as u32) | ((data[i + 1] as u32) << 8)
+                    } else if f.bits == 24 {
+                        value = (data[i] as u32) | ((data[i + 1] as u32) << 8) | ((data[i + 2] as u32) << 16)
+                    } else {
+                        value = (data[i] as u32) | ((data[i + 1] as u32) << 8) | ((data[i + 2] as u32) << 16) | ((data[i + 3] as u32) << 24)
+                    }
+                    buffer[o] = channel(value, f.red_mask)
+                    buffer[o + 1] = channel(value, f.green_mask)
+                    buffer[o + 2] = channel(value, f.blue_mask)
+                    if channels == 4 {
+                        buffer[o + 3] = channel(value, f.alpha_mask)
+                    }
+                }
+            }
+            view := pixels.View.new(&buffer[..count as usize * channels], count, 1, header.native.clone())?
+            output.rect(column, y, &view)?
+            column += count
+        }
+    }
+    return ok()
+}
+
+// ---------------------------------------------------------------------------
+// RLE8 and RLE4
+
+// Where an RLE stream is drawing: column x of stored row `stored` (counted
+// from the bottom), and the run of RGB pixels collected for that row.
+struct Rle {
+    width: u32
+    height: u32
+    x: u32
+    stored: u32
+    start: u32
+    fill: usize
+    buffer: [CHUNK * 3]u8
+}
+
+fn rle_flush<S: sink.Sink>(state: &mut Rle, layout: &pixels.Layout, output: &mut S) -> void!pixels.Error {
+    if state.fill == 0 {
+        return ok()
+    }
+    count := state.fill
+    state.fill = 0
+    view := pixels.View.new(&state.buffer[..count * 3], count as u32, 1, layout.clone())?
+    return output.rect(state.start, state.height - 1 - state.stored, &view)
+}
+
+// One pixel at the current position; pixels past the row's end or the last
+// row are dropped.
+fn rle_put<S: sink.Sink>(state: &mut Rle, r: u8, g: u8, b: u8, layout: &pixels.Layout, output: &mut S) -> void!pixels.Error {
+    if state.x >= state.width || state.stored >= state.height {
+        return ok()
+    }
+    if state.fill == 0 {
+        state.start = state.x
+    }
+    o := state.fill * 3
+    state.buffer[o] = r
+    state.buffer[o + 1] = g
+    state.buffer[o + 2] = b
+    state.fill += 1
+    state.x += 1
+    if state.fill == CHUNK {
+        rle_flush(state, layout, output)?
+    }
+    return ok()
+}
+
+// Black to the end of the current row, then move to the next.
+fn rle_end_row<S: sink.Sink>(state: &mut Rle, layout: &pixels.Layout, output: &mut S) -> void!pixels.Error {
+    if state.stored >= state.height {
+        return ok()
+    }
+    for state.x < state.width {
+        rle_put(state, 0, 0, 0, layout, output)?
+    }
+    rle_flush(state, layout, output)?
+    state.stored += 1
+    state.x = 0
+    return ok()
+}
+
+fn decode_rle<S: sink.Sink>(data: &[u8], f: &Fields, layout: &pixels.Layout, output: &mut S) -> void!pixels.Error {
+    state := Rle { width: f.width, height: f.height, x: 0, stored: 0, start: 0, fill: 0, buffer: [0u8; CHUNK * 3] }
+    four := f.compression == BI_RLE4
+    position := f.data
+    rgb := [0u8; 6]
+    for state.stored < state.height {
+        if data.len - position < 2 {
+            return err(pixels.Error.Truncated)
+        }
+        count := data[position] as u32
+        value := data[position + 1] as u32
+        position += 2
+        if count > 0 {
+            // A run of one index, or of two alternating 4-bit indices.
+            if four {
+                put_entry(data, f, value >> 4, &mut rgb, 0)?
+                put_entry(data, f, value & 15, &mut rgb, 3)?
+            } else {
+                put_entry(data, f, value, &mut rgb, 0)?
+                put_entry(data, f, value, &mut rgb, 3)?
+            }
+            for i in 0u32..count {
+                if state.x >= state.width {
+                    break
+                }
+                o := (i % 2) as usize * 3
+                rle_put(&mut state, rgb[o], rgb[o + 1], rgb[o + 2], layout, output)?
+            }
+        } else if value == 0 {
+            rle_end_row(&mut state, layout, output)?
+        } else if value == 1 {
+            // End of bitmap: the rest is black.
+            for state.stored < state.height {
+                rle_end_row(&mut state, layout, output)?
+            }
+        } else if value == 2 {
+            if data.len - position < 2 {
+                return err(pixels.Error.Truncated)
+            }
+            dx := data[position] as u32
+            dy := data[position + 1] as u32
+            position += 2
+            target := state.x + dx
+            for _ in 0u32..dy {
+                rle_end_row(&mut state, layout, output)?
+            }
+            if target > state.width {
+                target = state.width
+            }
+            for state.x < target && state.stored < state.height {
+                rle_put(&mut state, 0, 0, 0, layout, output)?
+            }
+        } else {
+            // Absolute mode: `value` indices, padded to a 16-bit boundary.
+            bytes := value as usize
+            if four {
+                bytes = (bytes + 1) / 2
+            }
+            padded := (bytes + 1) / 2 * 2
+            if data.len - position < padded {
+                return err(pixels.Error.Truncated)
+            }
+            for i in 0usize..value as usize {
+                index := 0u32
+                if four {
+                    byte := data[position + i / 2] as u32
+                    index = byte & 15
+                    if i % 2 == 0 {
+                        index = byte >> 4
+                    }
+                } else {
+                    index = data[position + i] as u32
+                }
+                put_entry(data, f, index, &mut rgb, 0)?
+                rle_put(&mut state, rgb[0], rgb[1], rgb[2], layout, output)?
+            }
+            position += padded
+        }
+    }
+    return ok()
+}
+
+// ---------------------------------------------------------------------------
+// Encoder
+
+pub struct EncodeOptions {
+    // Keep the source's alpha channel: write 32-bit pixels with a V5 header
+    // and an alpha mask. Sources without alpha always give 24-bit files.
+    pub alpha: bool
+
+    pub fn new() -> EncodeOptions {
+        return EncodeOptions { alpha: true }
+    }
+}
+
+const INFO_HEADER: usize = 54
+const V5_HEADER: usize = 138
+
+// The exact size encode writes.
+pub fn max_encoded_size(width: u32, height: u32, layout: &pixels.Layout, options: &EncodeOptions) -> usize!pixels.Error {
+    // A zero width is invalid in BMP (decoders, this one included, reject
+    // it), and an empty image has nothing to store.
+    if width == 0 || height == 0 {
+        return err(pixels.Error.Unsupported)
+    }
+    binary.check_dimensions(width, height)?
+    total := 0usize
+    if options.alpha && layout.has_alpha() {
+        stride := pixels.checked(width as usize, 4, 0)?
+        total = pixels.checked(stride, height as usize, V5_HEADER)?
+    } else {
+        stride := pixels.checked(width as usize, 3, 3)? / 4 * 4
+        total = pixels.checked(stride, height as usize, INFO_HEADER)?
+    }
+    if total > 0xffffffff {
+        return err(pixels.Error.TooLarge)
+    }
+    return ok(total)
+}
+
+pub fn encode_scratch_size(width: u32, height: u32, layout: &pixels.Layout, options: &EncodeOptions) -> usize!pixels.Error {
+    max_encoded_size(width, height, layout, options)?
+    return ok(0)
+}
+
+pub fn encode(source: &pixels.View, options: &EncodeOptions, output: &mut[u8], scratch: &mut[u8]) -> usize!pixels.Error {
+    view_source := sink.ViewSource.new(source)
+    return encode_from(&view_source, options, output, scratch)
+}
+
+// Write `source` as an uncompressed bottom-up BMP and return the byte
+// count, max_encoded_size(...).
+pub fn encode_from<S: sink.Source>(source: &S, options: &EncodeOptions, output: &mut[u8], scratch: &mut[u8]) -> usize!pixels.Error {
+    width := source.width()
+    height := source.height()
+    layout := source.layout()
+    total := max_encoded_size(width, height, &layout, options)?
+    if output.len < total {
+        return err(pixels.Error.BufferTooSmall)
+    }
+    alpha := options.alpha && layout.has_alpha()
+    offset := INFO_HEADER
+    size := 3usize
+    if alpha {
+        offset = V5_HEADER
+        size = 4
+    }
+    stride := (width as usize * size + 3) / 4 * 4
+    for i in 0usize..offset {
+        output[i] = 0
+    }
+    output[0] = b'B'
+    output[1] = b'M'
+    binary.put_le32(output, 2, total as u32)
+    binary.put_le32(output, 10, offset as u32)
+    binary.put_le32(output, 14, (offset - 14) as u32)
+    binary.put_le32(output, 18, width)
+    binary.put_le32(output, 22, height)
+    binary.put_le16(output, 26, 1)
+    binary.put_le16(output, 28, (size * 8) as u32)
+    if alpha {
+        binary.put_le32(output, 30, BI_BITFIELDS)
+    }
+    binary.put_le32(output, 34, (stride * height as usize) as u32)
+    // 2835 pixels per metre is 72 DPI.
+    binary.put_le32(output, 38, 2835)
+    binary.put_le32(output, 42, 2835)
+    if alpha {
+        binary.put_le32(output, 54, 0x00ff0000)
+        binary.put_le32(output, 58, 0x0000ff00)
+        binary.put_le32(output, 62, 0x000000ff)
+        binary.put_le32(output, 66, 0xff000000)
+        binary.put_le32(output, 70, LCS_SRGB)
+        // LCS_GM_IMAGES: relative colorimetric.
+        binary.put_le32(output, 122, 4)
+    }
+    buffer := [0u8; CHUNK * 4]
+    for stored in 0u32..height {
+        row := height - 1 - stored
+        start := offset + stored as usize * stride
+        column := 0u32
+        for column < width {
+            count := width - column
+            if count > CHUNK as u32 {
+                count = CHUNK as u32
+            }
+            source.load_rgba8(column, row, count as usize, &mut buffer)
+            for k in 0usize..count as usize {
+                i := start + (column as usize + k) * size
+                output[i] = buffer[k * 4 + 2]
+                output[i + 1] = buffer[k * 4 + 1]
+                output[i + 2] = buffer[k * 4]
+                if alpha {
+                    output[i + 3] = buffer[k * 4 + 3]
+                }
+            }
+            column += count
+        }
+        for i in start + width as usize * size..start + stride {
+            output[i] = 0
+        }
+    }
+    return ok(total)
+}

@@ -1,0 +1,592 @@
+package jxl
+
+import "std/image/pixels"
+
+// FrameHeader and table of contents (18181-1 section C.4 and F).
+
+const FT_REGULAR: u32 = 0
+const FT_LF: u32 = 1
+const FT_REFERENCE: u32 = 2
+const FT_SKIP_PROGRESSIVE: u32 = 3
+
+const BLEND_REPLACE: u32 = 0
+const BLEND_ADD: u32 = 1
+const BLEND_BLEND: u32 = 2
+const BLEND_MULADD: u32 = 3
+const BLEND_MUL: u32 = 4
+
+const FLAG_NOISE: u64 = 1
+const FLAG_PATCHES: u64 = 2
+const FLAG_SPLINES: u64 = 16
+const FLAG_USE_LF_FRAME: u64 = 32
+const FLAG_SKIP_LF_SMOOTHING: u64 = 128
+
+const MAX_PASSES: usize = 11
+const MAX_TOC: u32 = 65536
+
+struct FrameHeader {
+    frame_type: u32
+    modular: bool
+    flags: u64
+    ycbcr: bool
+    jpeg_upsampling: [3]u32
+    upsampling: u32
+    // Total upsampling of each extra channel, dim_shift included.
+    ec_upsampling: [MAX_EXTRA]u32
+    group_shift: u32
+    x_qm_scale: u32
+    b_qm_scale: u32
+    num_passes: u32
+    num_ds: u32
+    pass_shift: [MAX_PASSES]u32
+    downsample: [4]u32
+    last_pass: [4]u32
+    lf_level: u32
+    have_crop: bool
+    x0: i32
+    y0: i32
+    width: u32
+    height: u32
+    partial: bool
+    blend_mode: u32
+    blend_alpha: u32
+    blend_clamp: bool
+    blend_source: u32
+    ec_blend_mode: [MAX_EXTRA]u32
+    ec_blend_alpha: [MAX_EXTRA]u32
+    ec_blend_clamp: [MAX_EXTRA]bool
+    ec_blend_source: [MAX_EXTRA]u32
+    duration: u32
+    timecode: u32
+    is_last: bool
+    save_as_reference: u32
+    save_before_ct: bool
+    // Restoration filters.
+    gab: bool
+    gab_weights: [6]f32
+    epf_iters: u32
+    epf_sharp: [8]f32
+    epf_channel_scale: [3]f32
+    epf_quant_mul: f32
+    epf_pass0_sigma: f32
+    epf_pass2_sigma: f32
+    epf_border_sad: f32
+    epf_sigma_modular: f32
+    // Derived geometry: the coded color sample size and group grid.
+    color_channels: u32
+    sample_width: u32
+    sample_height: u32
+    group_dim: u32
+    groups_x: u32
+    groups_y: u32
+    lf_groups_x: u32
+    lf_groups_y: u32
+    // Table of contents: entry count, whether it is permuted, the logical
+    // byte offset of the first section and the total size of all sections.
+    toc_entries: u32
+    toc_permuted: bool
+    data_start: usize
+    data_size: u64
+    // Logical byte offset of the frame header.
+    start: usize
+
+    fn num_groups(&self) -> u32 {
+        return self.groups_x * self.groups_y
+    }
+    fn num_lf_groups(&self) -> u32 {
+        return self.lf_groups_x * self.lf_groups_y
+    }
+    fn is_normal(&self) -> bool {
+        return self.frame_type == FT_REGULAR || self.frame_type == FT_SKIP_PROGRESSIVE
+    }
+    // Shown to the viewer (an animation frame or the last frame).
+    fn is_keyframe(&self) -> bool {
+        return self.is_normal() && (self.is_last || self.duration != 0)
+    }
+    fn can_reference(&self) -> bool {
+        return !self.is_last && self.frame_type != FT_LF && (self.duration == 0 || self.save_as_reference != 0)
+    }
+    // Every channel is replaced over the whole canvas: earlier frames do not
+    // show through.
+    fn replaces_all(&self, num_extra: u32) -> bool {
+        if self.blend_mode != BLEND_REPLACE || self.partial {
+            return false
+        }
+        for i in 0usize..num_extra as usize {
+            if self.ec_blend_mode[i] != BLEND_REPLACE {
+                return false
+            }
+        }
+        return true
+    }
+    fn needs_blending(&self, num_extra: u32) -> bool {
+        if !self.is_normal() {
+            return false
+        }
+        return self.have_crop || !self.replaces_all(num_extra)
+    }
+    fn end(&self) -> u64 {
+        return self.data_start as u64 + self.data_size
+    }
+}
+
+// Chroma subsampling shifts of channel c (0 Cb, 1 Y, 2 Cr) from the
+// jpeg_upsampling modes: horizontal when `vertical` is false.
+fn chroma_shift(f: &FrameHeader, c: usize, vertical: bool) -> u32 {
+    hs := [0u32, 1, 1, 0]
+    vs := [0u32, 1, 0, 1]
+    maxs := 0u32
+    for i in 0usize..3 {
+        v := hs[f.jpeg_upsampling[i] as usize]
+        if vertical {
+            v = vs[f.jpeg_upsampling[i] as usize]
+        }
+        if v > maxs {
+            maxs = v
+        }
+    }
+    own := hs[f.jpeg_upsampling[c] as usize]
+    if vertical {
+        own = vs[f.jpeg_upsampling[c] as usize]
+    }
+    return maxs - own
+}
+
+fn chroma_subsampled(f: &FrameHeader) -> bool {
+    for c in 0usize..3 {
+        if chroma_shift(f, c, false) != 0 || chroma_shift(f, c, true) != 0 {
+            return true
+        }
+    }
+    return false
+}
+
+// VarDCT block grid size: 8x8 blocks covering the color samples, rounded
+// to whole chroma blocks when a jpeg_upsampling mode subsamples.
+fn vardct_blocks(f: &FrameHeader, vertical: bool) -> usize {
+    round := 0usize
+    for c in 0usize..3 {
+        mode := f.jpeg_upsampling[c]
+        if mode == 1 || (!vertical && mode == 2) || (vertical && mode == 3) {
+            round = 1
+        }
+    }
+    size := f.sample_width as usize
+    if vertical {
+        size = f.sample_height as usize
+    }
+    return (((size + 7) / 8 + round) >> round) << round
+}
+
+fn read_blending(r: &mut Reader, num_extra: u32, partial: bool, mode: &mut u32, alpha: &mut u32, clamp: &mut bool, source: &mut u32) -> void!pixels.Error {
+    *mode = r.u32c(dist(0, 0), dist(1, 0), dist(2, 0), dist(3, 2))
+    if *mode > 4 {
+        return err(pixels.Error.Malformed)
+    }
+    uses_alpha := num_extra > 0 && (*mode == BLEND_BLEND || *mode == BLEND_MULADD)
+    *alpha = 0
+    if uses_alpha {
+        *alpha = r.u32c(dist(0, 0), dist(1, 0), dist(2, 0), dist(3, 3))
+        if *alpha >= num_extra {
+            return err(pixels.Error.Malformed)
+        }
+    }
+    *clamp = false
+    if uses_alpha || *mode == BLEND_MUL {
+        *clamp = r.bit()
+    }
+    *source = 0
+    if *mode != BLEND_REPLACE || partial {
+        *source = r.bits(2)
+    }
+    return ok()
+}
+
+// Parse a frame header at the reader (byte aligned), then its TOC: offsets
+// go to `toc` when it is long enough (two words per entry: offset relative
+// to data_start, size), using `work` for a permuted TOC.
+fn read_frame_header(r: &mut Reader, h: &ImageHeader) -> FrameHeader!pixels.Error {
+    f := FrameHeader { frame_type: FT_REGULAR, modular: false, flags: 0, ycbcr: false, jpeg_upsampling: [0u32; 3], upsampling: 1, ec_upsampling: [1u32; MAX_EXTRA], group_shift: 1, x_qm_scale: 2, b_qm_scale: 2, num_passes: 1, num_ds: 0, pass_shift: [0u32; MAX_PASSES], downsample: [1u32; 4], last_pass: [0u32; 4], lf_level: 0, have_crop: false, x0: 0, y0: 0, width: h.width, height: h.height, partial: false, blend_mode: BLEND_REPLACE, blend_alpha: 0, blend_clamp: false, blend_source: 0, ec_blend_mode: [0u32; MAX_EXTRA], ec_blend_alpha: [0u32; MAX_EXTRA], ec_blend_clamp: [false; MAX_EXTRA], ec_blend_source: [0u32; MAX_EXTRA], duration: 0, timecode: 0, is_last: true, save_as_reference: 0, save_before_ct: false, gab: true, gab_weights: [0.115169525f32, 0.061248592, 0.115169525, 0.061248592, 0.115169525, 0.061248592], epf_iters: 2, epf_sharp: [0.0f32, 0.14285715, 0.2857143, 0.42857143, 0.5714286, 0.71428573, 0.85714287, 1.0], epf_channel_scale: [40.0f32, 5.0, 3.5], epf_quant_mul: 0.46, epf_pass0_sigma: 0.9, epf_pass2_sigma: 6.5, epf_border_sad: 0.6666667, epf_sigma_modular: 1.0, color_channels: 3, sample_width: 0, sample_height: 0, group_dim: 256, groups_x: 0, groups_y: 0, lf_groups_x: 0, lf_groups_y: 0, toc_entries: 0, toc_permuted: false, data_start: 0, data_size: 0, start: r.byte_position() }
+    num_extra := h.num_extra
+    for i in 0usize..num_extra as usize {
+        f.ec_upsampling[i] = 1u32 << h.ec_dim_shift[i]
+    }
+    if h.xyb {
+        f.x_qm_scale = 3
+    }
+    all_default := r.bit()
+    if !all_default {
+        f.frame_type = r.bits(2)
+        f.modular = r.bit()
+        f.flags = r.u64c()
+        if !h.xyb {
+            f.ycbcr = r.bit()
+        }
+        use_lf_frame := (f.flags & FLAG_USE_LF_FRAME) != 0
+        if f.ycbcr && !use_lf_frame {
+            for i in 0usize..3 {
+                f.jpeg_upsampling[i] = r.bits(2)
+            }
+        }
+        if !use_lf_frame {
+            f.upsampling = r.u32c(dist(1, 0), dist(2, 0), dist(4, 0), dist(8, 0))
+            for i in 0usize..num_extra as usize {
+                coded := r.u32c(dist(1, 0), dist(2, 0), dist(4, 0), dist(8, 0))
+                total := coded << h.ec_dim_shift[i]
+                if total < f.upsampling || total > 8 {
+                    return err(pixels.Error.Malformed)
+                }
+                f.ec_upsampling[i] = total
+            }
+        }
+        if f.modular {
+            f.group_shift = r.bits(2)
+        }
+        if !f.modular && h.xyb {
+            f.x_qm_scale = r.bits(3)
+            f.b_qm_scale = r.bits(3)
+        } else {
+            f.x_qm_scale = 2
+            f.b_qm_scale = 2
+        }
+        if f.frame_type != FT_REFERENCE {
+            f.num_passes = r.u32c(dist(1, 0), dist(2, 0), dist(3, 0), dist(4, 3))
+            if f.num_passes != 1 {
+                f.num_ds = r.u32c(dist(0, 0), dist(1, 0), dist(2, 0), dist(3, 1))
+                if f.num_ds >= f.num_passes {
+                    return err(pixels.Error.Malformed)
+                }
+                for i in 0usize..(f.num_passes - 1) as usize {
+                    f.pass_shift[i] = r.bits(2)
+                }
+                for i in 0usize..f.num_ds as usize {
+                    f.downsample[i] = r.u32c(dist(1, 0), dist(2, 0), dist(4, 0), dist(8, 0))
+                    if i > 0 && f.downsample[i] >= f.downsample[i - 1] {
+                        return err(pixels.Error.Malformed)
+                    }
+                }
+                for i in 0usize..f.num_ds as usize {
+                    f.last_pass[i] = r.u32c(dist(0, 0), dist(1, 0), dist(2, 0), dist(0, 3))
+                    if f.last_pass[i] >= f.num_passes || (i > 0 && f.last_pass[i] <= f.last_pass[i - 1]) {
+                        return err(pixels.Error.Malformed)
+                    }
+                }
+            }
+        }
+        if f.frame_type == FT_LF {
+            f.lf_level = r.u32c(dist(1, 0), dist(2, 0), dist(3, 0), dist(4, 0))
+        }
+        if f.frame_type != FT_LF {
+            f.have_crop = r.bit()
+            if f.have_crop {
+                if f.frame_type != FT_REFERENCE {
+                    f.x0 = unpack_signed(r.u32c(dist(0, 8), dist(256, 11), dist(2304, 14), dist(18688, 30)))
+                    f.y0 = unpack_signed(r.u32c(dist(0, 8), dist(256, 11), dist(2304, 14), dist(18688, 30)))
+                }
+                f.width = r.u32c(dist(0, 8), dist(256, 11), dist(2304, 14), dist(18688, 30))
+                f.height = r.u32c(dist(0, 8), dist(256, 11), dist(2304, 14), dist(18688, 30))
+                if f.width == 0 || f.height == 0 {
+                    return err(pixels.Error.Malformed)
+                }
+                if f.width > pixels.MAX_DIMENSION || f.height > pixels.MAX_DIMENSION {
+                    return err(pixels.Error.TooLarge)
+                }
+                if f.is_normal() {
+                    right := f.x0 as i64 + f.width as i64
+                    bottom := f.y0 as i64 + f.height as i64
+                    f.partial = f.x0 > 0 || f.y0 > 0 || right < h.width as i64 || bottom < h.height as i64
+                }
+            }
+        }
+        if f.is_normal() {
+            read_blending(r, num_extra, f.partial, &mut f.blend_mode, &mut f.blend_alpha, &mut f.blend_clamp, &mut f.blend_source)?
+            for i in 0usize..num_extra as usize {
+                mode := 0u32
+                alpha := 0u32
+                clamp := false
+                source := 0u32
+                read_blending(r, num_extra, f.partial, &mut mode, &mut alpha, &mut clamp, &mut source)?
+                f.ec_blend_mode[i] = mode
+                f.ec_blend_alpha[i] = alpha
+                f.ec_blend_clamp[i] = clamp
+                f.ec_blend_source[i] = source
+            }
+            if h.animated {
+                f.duration = r.u32c(dist(0, 0), dist(1, 0), dist(0, 8), dist(0, 32))
+                if h.have_timecodes {
+                    f.timecode = r.bits(32)
+                }
+            }
+            f.is_last = r.bit()
+        } else {
+            f.is_last = false
+        }
+        if f.frame_type != FT_LF && !f.is_last {
+            f.save_as_reference = r.bits(2)
+        }
+        if f.can_reference() && f.blend_mode == BLEND_REPLACE && !f.partial && f.is_normal() {
+            f.save_before_ct = r.bit()
+        } else if f.frame_type == FT_REFERENCE {
+            f.save_before_ct = r.bit()
+        }
+        if f.frame_type == FT_LF {
+            f.save_before_ct = true
+        }
+        skip_name(r)
+        // Restoration filter.
+        if !r.bit() {
+            f.gab = r.bit()
+            if f.gab && r.bit() {
+                for i in 0usize..6 {
+                    f.gab_weights[i] = r.f16()
+                }
+                for c in 0usize..3 {
+                    sum := 1.0f32 + (f.gab_weights[c * 2] + f.gab_weights[c * 2 + 1]) * 4.0
+                    if sum < 0.00000001 && sum > -0.00000001 {
+                        return err(pixels.Error.Malformed)
+                    }
+                }
+            }
+            f.epf_iters = r.bits(2)
+            if f.epf_iters > 0 {
+                if !f.modular && r.bit() {
+                    for i in 0usize..8 {
+                        f.epf_sharp[i] = r.f16()
+                    }
+                }
+                if r.bit() {
+                    for i in 0usize..3 {
+                        f.epf_channel_scale[i] = r.f16()
+                    }
+                    r.f16()
+                    r.f16()
+                }
+                if r.bit() {
+                    if !f.modular {
+                        f.epf_quant_mul = r.f16()
+                    }
+                    f.epf_pass0_sigma = r.f16()
+                    f.epf_pass2_sigma = r.f16()
+                    f.epf_border_sad = r.f16()
+                }
+                if f.modular {
+                    f.epf_sigma_modular = r.f16()
+                    if f.epf_sigma_modular < 0.00000001 {
+                        return err(pixels.Error.Malformed)
+                    }
+                }
+            }
+            read_extensions(r)
+        }
+        read_extensions(r)
+    } else {
+        f.gab = true
+        f.epf_iters = 2
+    }
+    if f.frame_type == FT_REFERENCE && !f.save_before_ct && (f.width < h.width || f.height < h.height) {
+        return err(pixels.Error.Malformed)
+    }
+    if r.broken {
+        return err(pixels.Error.Malformed)
+    }
+    if r.overrun {
+        return err(pixels.Error.Truncated)
+    }
+    // Derived geometry.
+    f.color_channels = 3
+    if f.modular && !f.ycbcr && !h.xyb && h.is_gray() {
+        f.color_channels = 1
+    }
+    w := f.width
+    hh := f.height
+    if f.upsampling > 1 {
+        w = (w + f.upsampling - 1) / f.upsampling
+        hh = (hh + f.upsampling - 1) / f.upsampling
+    }
+    if f.lf_level > 0 {
+        shift := 3 * f.lf_level
+        w = ((w as u64 + (1u64 << (shift as u64)) - 1) >> (shift as u64)) as u32
+        hh = ((hh as u64 + (1u64 << (shift as u64)) - 1) >> (shift as u64)) as u32
+    }
+    f.sample_width = w
+    f.sample_height = hh
+    f.group_dim = 128u32 << f.group_shift
+    f.groups_x = (w + f.group_dim - 1) / f.group_dim
+    f.groups_y = (hh + f.group_dim - 1) / f.group_dim
+    lf_dim := f.group_dim * 8
+    f.lf_groups_x = (w + lf_dim - 1) / lf_dim
+    f.lf_groups_y = (hh + lf_dim - 1) / lf_dim
+    groups := f.groups_x as u64 * f.groups_y as u64
+    if groups == 1 && f.num_passes == 1 {
+        f.toc_entries = 1
+    } else {
+        entries := 2 + f.lf_groups_x as u64 * f.lf_groups_y as u64 + groups * f.num_passes as u64
+        if entries > MAX_TOC as u64 {
+            return err(pixels.Error.TooLarge)
+        }
+        f.toc_entries = entries as u32
+    }
+    return ok(f)
+}
+
+// The TOC: when `toc` has room (4 words per entry), it receives the offset
+// (relative to data_start) and size of each section in canonical order;
+// otherwise the TOC is only skipped. A permuted TOC is entropy coded with
+// `tcode` (nested Codes n1, n2 and an LZ77 window).
+fn read_toc(r: &mut Reader, f: &mut FrameHeader, toc: &mut[u32], tcode: &mut Code, n1: &mut Code, n2: &mut Code, window: &mut[u32]) -> void!pixels.Error {
+    entries := f.toc_entries as usize
+    store := toc.len >= entries * 4
+    f.toc_permuted = r.bit()
+    if f.toc_permuted {
+        read_permutation(r, entries, toc, store, tcode, n1, n2, window)?
+    }
+    r.pad()
+    total := 0u64
+    for i in 0usize..entries {
+        size := r.u32c(dist(0, 10), dist(1024, 14), dist(17408, 22), dist(4211712, 30))
+        if store {
+            toc[entries + i] = size
+        }
+        total += size as u64
+    }
+    r.pad()
+    if r.overrun {
+        return err(pixels.Error.Truncated)
+    }
+    if r.broken {
+        return err(pixels.Error.Malformed)
+    }
+    f.data_start = r.byte_position()
+    f.data_size = total
+    if total > 0xffffffff {
+        return err(pixels.Error.TooLarge)
+    }
+    if store {
+        // Bitstream offsets, then canonical order: section i sits at
+        // bitstream position permutation[i].
+        offset := 0u32
+        for i in 0usize..entries {
+            toc[2 * entries + i] = offset
+            offset += toc[entries + i]
+        }
+        for i in 0usize..entries {
+            position := i
+            if f.toc_permuted {
+                position = toc[i] as usize
+            }
+            toc[3 * entries + i] = toc[2 * entries + position]
+        }
+        for i in 0usize..entries {
+            position := i
+            if f.toc_permuted {
+                position = toc[i] as usize
+            }
+            toc[2 * entries + i] = toc[entries + position]
+        }
+        for i in 0usize..entries {
+            toc[2 * i] = toc[3 * entries + i]
+            toc[2 * i + 1] = toc[2 * entries + i]
+        }
+    }
+    return ok()
+}
+
+fn permutation_context(x: u32) -> u32 {
+    v := bits_for(x)
+    if v > 7 {
+        return 7
+    }
+    return v
+}
+
+// A Lehmer-coded permutation of `size` entries into toc[0..size] (when
+// storing), using toc[size..3 size] as a Fenwick tree of remaining
+// entries.
+fn read_permutation(r: &mut Reader, size: usize, toc: &mut[u32], store: bool, code: &mut Code, n1: &mut Code, n2: &mut Code, window: &mut[u32]) -> void!pixels.Error {
+    read_code(r, 8, code, n1, n2, window)?
+    stream := Stream.new(window)
+    stream.begin(code, r)
+    end := code.read(&mut stream, r, permutation_context(size as u32), 0) as usize
+    if end > size {
+        return err(pixels.Error.Malformed)
+    }
+    fenwick := 2 * size
+    if store {
+        for i in 0usize..size {
+            toc[fenwick + i] = 0
+        }
+        for i in 0usize..size {
+            j := i + 1
+            for j <= size {
+                toc[fenwick + j - 1] += 1
+                j += lowbit(j)
+            }
+        }
+    }
+    previous := 0u32
+    for k in 0usize..end {
+        value := code.read(&mut stream, r, permutation_context(previous), 0)
+        if value as usize >= size - k {
+            return err(pixels.Error.Malformed)
+        }
+        previous = value
+        if store {
+            // Find the (value + 1)-th remaining index.
+            target := value + 1
+            position := 0usize
+            step := 1usize
+            for step * 2 <= size {
+                step *= 2
+            }
+            for step > 0 {
+                next := position + step
+                if next <= size && toc[fenwick + next - 1] < target {
+                    position = next
+                    target -= toc[fenwick + next - 1]
+                }
+                step /= 2
+            }
+            toc[k] = position as u32
+            j := position + 1
+            for j <= size {
+                toc[fenwick + j - 1] -= 1
+                j += lowbit(j)
+            }
+        }
+        if r.overrun {
+            return err(pixels.Error.Truncated)
+        }
+    }
+    stream.finish(code)?
+    if store {
+        // The rest in increasing order.
+        k := end
+        for i in 0usize..size {
+            // Remaining iff its own count is still present.
+            if fenwick_get(toc, fenwick, size, i) == 1 {
+                toc[k] = i as u32
+                k += 1
+            }
+        }
+    }
+    return ok()
+}
+
+// The value at index i of a Fenwick tree (prefix difference).
+fn fenwick_get(toc: &[u32], base: usize, size: usize, i: usize) -> u32 {
+    return fenwick_prefix(toc, base, i + 1) - fenwick_prefix(toc, base, i)
+}
+
+fn fenwick_prefix(toc: &[u32], base: usize, n: usize) -> u32 {
+    sum := 0u32
+    j := n
+    for j > 0 {
+        sum += toc[base + j - 1]
+        j -= lowbit(j)
+    }
+    return sum
+}
+
+fn lowbit(j: usize) -> usize {
+    return j & core.wrapping_sub(0usize, j)
+}

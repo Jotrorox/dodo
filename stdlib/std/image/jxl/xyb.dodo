@@ -1,0 +1,301 @@
+package jxl
+
+import "std/math"
+
+// XYB to the output color space (f32): the opsin inverse (cube, bias,
+// inverse matrix scaled to the intensity target), a primaries/white point
+// conversion when the target is not sRGB-gamut (Bradford-adapted through
+// XYZ D50, as libjxl does), luma weights for gray targets, then the target
+// transfer function. Also YCbCr to RGB.
+
+struct ColorTransform {
+    // Rows of the linear matrix applied to the mixed (cubed) values.
+    m: [9]f32
+    bias: [3]f32
+    bias_cbrt: [3]f32
+    // Output transfer: TF_* code, or 0 for a gamma exponent.
+    transfer: u32
+    gamma: f64
+    intensity: f64
+    gray: bool
+    luma: [3]f64
+    hlg_exponent: f64
+}
+
+fn mul3(a: &[f64], b: &[f64], out: &mut[f64]) {
+    for i in 0usize..3 {
+        for j in 0usize..3 {
+            out[i * 3 + j] = a[i * 3] * b[j] + a[i * 3 + 1] * b[3 + j] + a[i * 3 + 2] * b[6 + j]
+        }
+    }
+}
+
+fn inv3(m: &mut[f64]) -> bool {
+    a := m[0]
+    b := m[1]
+    c := m[2]
+    d := m[3]
+    e := m[4]
+    f := m[5]
+    g := m[6]
+    h := m[7]
+    i := m[8]
+    det := a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g)
+    if math.abs(det) < 0.000000000001 {
+        return false
+    }
+    m[0] = (e * i - f * h) / det
+    m[1] = (c * h - b * i) / det
+    m[2] = (b * f - c * e) / det
+    m[3] = (f * g - d * i) / det
+    m[4] = (a * i - c * g) / det
+    m[5] = (c * d - a * f) / det
+    m[6] = (d * h - e * g) / det
+    m[7] = (b * g - a * h) / det
+    m[8] = (a * e - b * d) / det
+    return true
+}
+
+fn primaries_to_xyz(rx: f64, ry: f64, gx: f64, gy: f64, bx: f64, by: f64, wx: f64, wy: f64, out: &mut[f64]) -> bool {
+    if wx < 0.0 || wx > 1.0 || wy <= 0.0 || wy > 1.0 {
+        return false
+    }
+    p := [rx, gx, bx, ry, gy, by, 1.0 - rx - ry, 1.0 - gx - gy, 1.0 - bx - by]
+    inv := [rx, gx, bx, ry, gy, by, 1.0 - rx - ry, 1.0 - gx - gy, 1.0 - bx - by]
+    if !inv3(&mut inv) {
+        return false
+    }
+    w := [wx / wy, 1.0, (1.0 - wx - wy) / wy]
+    xyz := [0.0f64; 3]
+    for k in 0usize..3 {
+        xyz[k] = inv[k * 3] * w[0] + inv[k * 3 + 1] * w[1] + inv[k * 3 + 2] * w[2]
+    }
+    a := [xyz[0], 0.0, 0.0, 0.0, xyz[1], 0.0, 0.0, 0.0, xyz[2]]
+    mul3(&p, &a, out)
+    return true
+}
+
+static BRADFORD: [9]f64 = [0.8951, 0.2664, -0.1614, -0.7502, 1.7135, 0.0367, 0.0389, -0.0685, 1.0296]
+static BRADFORD_INV: [9]f64 = [0.9869929, -0.1470543, 0.1599627, 0.4323053, 0.5183603, 0.0492912, -0.0085287, 0.0400428, 0.9684867]
+
+fn adapt_to_d50(wx: f64, wy: f64, out: &mut[f64]) -> bool {
+    if wx < 0.0 || wx > 1.0 || wy <= 0.0 || wy > 1.0 {
+        return false
+    }
+    w := [wx / wy, 1.0, (1.0 - wx - wy) / wy]
+    w50 := [0.96422f64, 1.0, 0.82521]
+    lms := [0.0f64; 3]
+    lms50 := [0.0f64; 3]
+    for k in 0usize..3 {
+        lms[k] = BRADFORD[k * 3] * w[0] + BRADFORD[k * 3 + 1] * w[1] + BRADFORD[k * 3 + 2] * w[2]
+        lms50[k] = BRADFORD[k * 3] * w50[0] + BRADFORD[k * 3 + 1] * w50[1] + BRADFORD[k * 3 + 2] * w50[2]
+    }
+    if lms[0] == 0.0 || lms[1] == 0.0 || lms[2] == 0.0 {
+        return false
+    }
+    a := [lms50[0] / lms[0], 0.0, 0.0, 0.0, lms50[1] / lms[1], 0.0, 0.0, 0.0, lms50[2] / lms[2]]
+    b := [0.0f64; 9]
+    mul3(&a, &BRADFORD, &mut b)
+    mul3(&BRADFORD_INV, &b, out)
+    return true
+}
+
+fn xy(v: i32) -> f64 {
+    return v as f64 / 1000000.0
+}
+
+// The transform from XYB to the encoded color space of `h` (or linear...
+// sRGB when that space cannot be targeted).
+fn xyb_transform(h: &ImageHeader) -> ColorTransform {
+    inv := [0.0f64; 9]
+    for k in 0usize..9 {
+        inv[k] = h.opsin[k] as f64
+    }
+    t := ColorTransform { m: [0.0f32; 9], bias: [0.0f32; 3], bias_cbrt: [0.0f32; 3], transfer: TF_SRGB, gamma: 1.0, intensity: h.intensity_target as f64, gray: false, luma: [0.2126f64, 0.7152, 0.0722], hlg_exponent: 0.0 }
+    for k in 0usize..3 {
+        t.bias[k] = h.opsin_bias[k]
+        t.bias_cbrt[k] = math.cbrt(h.opsin_bias[k] as f64) as f32
+    }
+    if !xyb_target_supported(h) {
+        // Linear sRGB primaries, sRGB transfer.
+        t.transfer = TF_SRGB
+    } else {
+        if h.have_gamma {
+            t.transfer = 0
+            t.gamma = h.gamma as f64 / 10000000.0
+        } else {
+            t.transfer = h.transfer
+            if t.transfer == TF_DCI {
+                t.transfer = 0
+                t.gamma = 1.0 / 2.6
+            }
+        }
+        t.gray = h.color_space == CS_GREY
+        non_srgb := h.primaries != PR_SRGB || h.white_point != WP_D65
+        if non_srgb && !t.gray {
+            to_xyz := [0.0f64; 9]
+            srgb_xyz := [0.0f64; 9]
+            adapt := [0.0f64; 9]
+            srgb_adapt := [0.0f64; 9]
+            ok1 := primaries_to_xyz(xy(h.red_x), xy(h.red_y), xy(h.green_x), xy(h.green_y), xy(h.blue_x), xy(h.blue_y), xy(h.white_x), xy(h.white_y), &mut to_xyz)
+            ok2 := primaries_to_xyz(0.639998686, 0.330010138, 0.300003784, 0.600003357, 0.150002046, 0.059997204, 0.3127, 0.329, &mut srgb_xyz)
+            ok3 := adapt_to_d50(xy(h.white_x), xy(h.white_y), &mut adapt)
+            ok4 := adapt_to_d50(0.3127, 0.329, &mut srgb_adapt)
+            if ok1 && ok2 && ok3 && ok4 {
+                for k in 0usize..3 {
+                    t.luma[k] = to_xyz[3 + k]
+                }
+                // xyzd50_to_original = inverse(adapt * to_xyz)
+                original := [0.0f64; 9]
+                mul3(&adapt, &to_xyz, &mut original)
+                srgb_d50 := [0.0f64; 9]
+                mul3(&srgb_adapt, &srgb_xyz, &mut srgb_d50)
+                if inv3(&mut original) {
+                    srgb_to_original := [0.0f64; 9]
+                    mul3(&original, &srgb_d50, &mut srgb_to_original)
+                    product := [0.0f64; 9]
+                    mul3(&srgb_to_original, &inv, &mut product)
+                    for k in 0usize..9 {
+                        inv[k] = product[k]
+                    }
+                }
+            }
+        }
+        if t.gray {
+            luma := [t.luma[0], t.luma[1], t.luma[2], t.luma[0], t.luma[1], t.luma[2], t.luma[0], t.luma[1], t.luma[2]]
+            product := [0.0f64; 9]
+            mul3(&luma, &inv, &mut product)
+            for k in 0usize..9 {
+                inv[k] = product[k]
+            }
+        }
+        if t.transfer == TF_HLG {
+            target := h.intensity_target as f64
+            if target <= 0.0 {
+                target = 1000.0
+            }
+            g := (1.0 / 1.2) * pow64(1.111, -log2_64(target / 1000.0))
+            t.hlg_exponent = g - 1.0
+        }
+    }
+    scale := 255.0 / (h.intensity_target as f64)
+    for k in 0usize..9 {
+        t.m[k] = narrow64(inv[k] * scale)
+    }
+    return t
+}
+
+fn pow64(base: f64, exponent: f64) -> f64 {
+    match math.pow(base, exponent) {
+        ok(v) => {
+            return v
+        }
+        err(_) => {
+            return 0.0
+        }
+    }
+}
+
+fn log2_64(v: f64) -> f64 {
+    match math.log2(v) {
+        ok(r) => {
+            return r
+        }
+        err(_) => {
+            return 0.0
+        }
+    }
+}
+
+// Linear light to the encoded value of transfer `t`.
+fn encode_transfer(t: &ColorTransform, v: f32) -> f32 {
+    x := v as f64
+    negative := x < 0.0
+    if negative {
+        x = -x
+    }
+    y := x
+    if t.transfer == TF_SRGB {
+        if x <= 0.0031308 {
+            y = 12.92 * x
+        } else {
+            y = 1.055 * pow64(x, 1.0 / 2.4) - 0.055
+        }
+    } else if t.transfer == TF_LINEAR {
+        y = x
+    } else if t.transfer == TF_709 {
+        if x < 0.018 {
+            y = 4.5 * x
+        } else {
+            y = 1.099 * pow64(x, 0.45) - 0.099
+        }
+    } else if t.transfer == TF_PQ {
+        d := x * t.intensity / 10000.0
+        m1 := 2610.0 / 16384.0
+        m2 := 2523.0 / 4096.0 * 128.0
+        c1 := 3424.0 / 4096.0
+        c2 := 2413.0 / 4096.0 * 32.0
+        c3 := 2392.0 / 4096.0 * 32.0
+        p := pow64(d, m1)
+        y = pow64((c1 + c2 * p) / (1.0 + c3 * p), m2)
+    } else if t.transfer == TF_HLG {
+        if x <= 1.0 / 12.0 {
+            match math.sqrt(3.0 * x) {
+                ok(s) => {
+                    y = s
+                }
+                err(_) => {
+                    y = 0.0
+                }
+            }
+        } else {
+            match math.log(12.0 * x - 0.28466892) {
+                ok(l) => {
+                    y = 0.17883277 * l + 0.55991073
+                }
+                err(_) => {
+                    y = 0.0
+                }
+            }
+        }
+    } else if t.transfer == 0 {
+        if x <= 0.00001 {
+            y = 0.0
+        } else {
+            y = pow64(x, t.gamma)
+        }
+    }
+    if negative {
+        y = -y
+    }
+    return narrow64(y)
+}
+
+// XYB pixel to the target color space, in place.
+fn xyb_pixel(t: &ColorTransform, px: &mut f32, py: &mut f32, pb: &mut f32) {
+    gr := *py + *px - t.bias_cbrt[0]
+    gg := *py - *px - t.bias_cbrt[1]
+    gb := *pb - t.bias_cbrt[2]
+    mr := gr * gr * gr + t.bias[0]
+    mg := gg * gg * gg + t.bias[1]
+    mb := gb * gb * gb + t.bias[2]
+    r := t.m[0] * mr + t.m[1] * mg + t.m[2] * mb
+    g := t.m[3] * mr + t.m[4] * mg + t.m[5] * mb
+    b := t.m[6] * mr + t.m[7] * mg + t.m[8] * mb
+    if t.transfer == TF_HLG && (t.hlg_exponent > 0.01 || t.hlg_exponent < -0.01) {
+        luminance := t.luma[0] * r as f64 + t.luma[1] * g as f64 + t.luma[2] * b as f64
+        ratio := 0.0f64
+        if luminance > 0.0 {
+            ratio = pow64(luminance, t.hlg_exponent)
+        }
+        if ratio > 1000000000.0 {
+            ratio = 1000000000.0
+        }
+        r = narrow64(r as f64 * ratio)
+        g = narrow64(g as f64 * ratio)
+        b = narrow64(b as f64 * ratio)
+    }
+    *px = encode_transfer(t, r)
+    *py = encode_transfer(t, g)
+    *pb = encode_transfer(t, b)
+}

@@ -1,0 +1,335 @@
+package targets
+
+import "core/mem"
+import "std/console"
+import "std/image/pixels"
+
+// Fuzz targets for std/image. Every target takes one input and exercises one
+// stage of a codec; untrusted input may make a codec return any
+// pixels.Error, but a trap (bounds, overflow, cast, assertion), a hang or
+// scratch_size growing without bound is a bug.
+//
+// All buffers are static. Scratch is sized by the codec's scratch_size and
+// capped at SCRATCH_CAP: larger requests are skipped and recorded in the
+// report so the driver can flag suspicious growth.
+
+pub const SCRATCH_CAP: usize = 67108864
+// Decoding into a view needs the image in PIXEL_CAP bytes.
+pub const PIXEL_CAP: usize = 16777216
+// Images with more pixels than this are not decoded (only parsed): decoding
+// garbage of that size takes seconds at -O0.
+pub const DECODE_PIXELS: u64 = 4194304
+// Animation frames decoded per input (each frame decode starts over).
+pub const FRAME_CAP: u32 = 6
+// Decoded payloads (ICC, EXIF, XMP) and encoder output.
+pub const OUTPUT_CAP: usize = 4194304
+
+const COVER_BYTES: usize = 524288
+
+static mut SCRATCH: [SCRATCH_CAP]u8 = [0u8; SCRATCH_CAP]
+static mut PIXELS: [PIXEL_CAP]u8 = [0u8; PIXEL_CAP]
+static mut EXPECTED: [PIXEL_CAP]u8 = [0u8; PIXEL_CAP]
+static mut OUTPUT: [OUTPUT_CAP]u8 = [0u8; OUTPUT_CAP]
+static mut COVER: [COVER_BYTES]u8 = [0u8; COVER_BYTES]
+
+// What the last run saw: the largest scratch_size requested (whether or not
+// it was granted), the image size it belonged to, and how many stages were
+// skipped because they exceeded a cap.
+static mut LARGEST_SCRATCH: u64 = 0
+static mut LARGEST_WIDTH: u32 = 0
+static mut LARGEST_HEIGHT: u32 = 0
+static mut SKIPPED: u32 = 0
+// Scratch follows the frame sizes of a JPEG XL file, which may exceed the
+// image size, rather than the image size.
+static mut FRAME_SIZED: bool = false
+static mut VERBOSE: bool = false
+
+pub const TARGET_PNG: u32 = 0
+pub const TARGET_BMP: u32 = 1
+pub const TARGET_QOI: u32 = 2
+pub const TARGET_PPM: u32 = 3
+pub const TARGET_JXL_CONTAINER: u32 = 4
+pub const TARGET_JXL_HEADERS: u32 = 5
+pub const TARGET_JXL_DECODE: u32 = 6
+pub const TARGET_IMAGE: u32 = 7
+pub const TARGET_ROUNDTRIP_PNG: u32 = 8
+pub const TARGET_ROUNDTRIP_QOI: u32 = 9
+pub const TARGET_ROUNDTRIP_BMP: u32 = 10
+pub const TARGET_ROUNDTRIP_PPM: u32 = 11
+pub const TARGET_ROUNDTRIP_JXL: u32 = 12
+pub const TARGET_COUNT: u32 = 13
+
+// The target's command-line name.
+pub fn target_name(target: u32) -> &str from(static) {
+    if target == TARGET_PNG {
+        return "png"
+    }
+    if target == TARGET_BMP {
+        return "bmp"
+    }
+    if target == TARGET_QOI {
+        return "qoi"
+    }
+    if target == TARGET_PPM {
+        return "ppm"
+    }
+    if target == TARGET_JXL_CONTAINER {
+        return "jxl_container"
+    }
+    if target == TARGET_JXL_HEADERS {
+        return "jxl_headers"
+    }
+    if target == TARGET_JXL_DECODE {
+        return "jxl_decode"
+    }
+    if target == TARGET_IMAGE {
+        return "image"
+    }
+    if target == TARGET_ROUNDTRIP_PNG {
+        return "roundtrip_png"
+    }
+    if target == TARGET_ROUNDTRIP_QOI {
+        return "roundtrip_qoi"
+    }
+    if target == TARGET_ROUNDTRIP_BMP {
+        return "roundtrip_bmp"
+    }
+    if target == TARGET_ROUNDTRIP_PPM {
+        return "roundtrip_ppm"
+    }
+    if target == TARGET_ROUNDTRIP_JXL {
+        return "roundtrip_jxl"
+    }
+    return "unknown"
+}
+
+// The target named `name`, or TARGET_COUNT for none.
+pub fn target_id(name: &str) -> u32 {
+    for t in 0u32..TARGET_COUNT {
+        if same_text(name, target_name(t)) {
+            return t
+        }
+    }
+    return TARGET_COUNT
+}
+
+pub fn same_text(a: &str, b: &str) -> bool {
+    x := mem.str_bytes(a)
+    y := mem.str_bytes(b)
+    if x.len != y.len {
+        return false
+    }
+    for i in 0usize..x.len {
+        if x[i] != y[i] {
+            return false
+        }
+    }
+    return true
+}
+
+// Run `target` on `data`. Returns false for an unknown target. Traps (the
+// bugs this looks for) abort the process.
+pub fn run(target: u32, data: &[u8]) -> bool {
+    unsafe {
+        LARGEST_SCRATCH = 0
+        LARGEST_WIDTH = 0
+        LARGEST_HEIGHT = 0
+        SKIPPED = 0
+        FRAME_SIZED = target == TARGET_JXL_CONTAINER || target == TARGET_JXL_HEADERS || target == TARGET_JXL_DECODE
+    }
+    if target == TARGET_PNG {
+        png_target(data)
+    } else if target == TARGET_BMP {
+        still_target(CODEC_BMP, data)
+    } else if target == TARGET_QOI {
+        still_target(CODEC_QOI, data)
+    } else if target == TARGET_PPM {
+        still_target(CODEC_PPM, data)
+    } else if target == TARGET_JXL_CONTAINER {
+        jxl_container_target(data)
+    } else if target == TARGET_JXL_HEADERS {
+        jxl_headers_target(data)
+    } else if target == TARGET_JXL_DECODE {
+        still_target(CODEC_JXL, data)
+    } else if target == TARGET_IMAGE {
+        image_target(data)
+    } else if target == TARGET_ROUNDTRIP_PNG {
+        roundtrip_target(CODEC_PNG, data)
+    } else if target == TARGET_ROUNDTRIP_QOI {
+        roundtrip_target(CODEC_QOI, data)
+    } else if target == TARGET_ROUNDTRIP_BMP {
+        roundtrip_target(CODEC_BMP, data)
+    } else if target == TARGET_ROUNDTRIP_PPM {
+        roundtrip_target(CODEC_PPM, data)
+    } else if target == TARGET_ROUNDTRIP_JXL {
+        roundtrip_target(CODEC_JXL, data)
+    } else {
+        return false
+    }
+    return true
+}
+
+pub fn largest_scratch() -> u64 {
+    unsafe {
+        return LARGEST_SCRATCH
+    }
+}
+
+pub fn largest_width() -> u32 {
+    unsafe {
+        return LARGEST_WIDTH
+    }
+}
+
+pub fn largest_height() -> u32 {
+    unsafe {
+        return LARGEST_HEIGHT
+    }
+}
+
+pub fn skipped() -> u32 {
+    unsafe {
+        return SKIPPED
+    }
+}
+
+pub fn frame_sized() -> bool {
+    unsafe {
+        return FRAME_SIZED
+    }
+}
+
+fn mark_frame_sized() {
+    unsafe {
+        FRAME_SIZED = true
+    }
+}
+
+// Print every stage's outcome (harness --verbose), to see how far an input
+// gets.
+pub fn set_verbose(on: bool) {
+    unsafe {
+        VERBOSE = on
+    }
+}
+
+fn passed(stage: &str) {
+    unsafe {
+        if VERBOSE {
+            console.printf("  {}: ok\n", stage)!
+        }
+    }
+}
+
+fn failed(stage: &str, error: pixels.Error) {
+    unsafe {
+        if VERBOSE {
+            console.printf("  {}: {}\n", stage, pixels.error_name(error))!
+        }
+    }
+}
+
+// Record a scratch request for a width x height image; true when it fits
+// the cap.
+fn grant(need: usize, width: u32, height: u32) -> bool {
+    unsafe {
+        if need as u64 > LARGEST_SCRATCH {
+            LARGEST_SCRATCH = need as u64
+            LARGEST_WIDTH = width
+            LARGEST_HEIGHT = height
+        }
+        if need > SCRATCH_CAP {
+            SKIPPED += 1
+            return false
+        }
+    }
+    return true
+}
+
+// True when a width x height image is small enough to decode.
+fn decodable(width: u32, height: u32) -> bool {
+    if width as u64 * height as u64 > DECODE_PIXELS {
+        unsafe {
+            SKIPPED += 1
+        }
+        return false
+    }
+    return true
+}
+
+fn skip() {
+    unsafe {
+        SKIPPED += 1
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A sink that checks the decoder contract (see std/image/sink.dodo): begin
+// once with the header info() reported, then rects inside the image in the
+// native layout; on success every pixel arrived at least once.
+
+struct CheckSink {
+    width: u32
+    height: u32
+    layout: pixels.Layout
+    check_layout: bool
+    cover: bool
+    began: bool
+    rects: u64
+
+    fn new(header: &pixels.Header, check_layout: bool) -> CheckSink {
+        count := header.width as u64 * header.height as u64
+        cover := count <= (COVER_BYTES * 8) as u64
+        if cover {
+            bytes := ((count + 7) / 8) as usize
+            unsafe {
+                for i in 0usize..bytes {
+                    COVER[i] = 0
+                }
+            }
+        }
+        return CheckSink { width: header.width, height: header.height, layout: header.native.clone(), check_layout: check_layout, cover: cover, began: false, rects: 0 }
+    }
+    pub fn begin(&mut self, header: &pixels.Header) -> void!pixels.Error {
+        assert(!self.began, "sink: begin() called twice")
+        self.began = true
+        assert(header.width == self.width && header.height == self.height, "sink: begin() header size differs from info()")
+        if self.check_layout {
+            assert(header.native.equals(&self.layout), "sink: begin() layout differs from info()")
+        }
+        return ok()
+    }
+    pub fn rect(&mut self, x: u32, y: u32, source: &pixels.View) -> void!pixels.Error {
+        assert(self.began, "sink: rect() before begin()")
+        assert(x as u64 + source.width() as u64 <= self.width as u64 && y as u64 + source.height() as u64 <= self.height as u64, "sink: rect() outside the image")
+        if self.check_layout {
+            assert(source.layout().equals(&self.layout), "sink: rect() layout differs from header.native")
+        }
+        if self.cover {
+            for r in 0u32..source.height() {
+                base := (y + r) as usize * self.width as usize + x as usize
+                for c in 0usize..source.width() as usize {
+                    bit := base + c
+                    unsafe {
+                        COVER[bit / 8] = COVER[bit / 8] | (1u8 << (bit % 8) as u8)
+                    }
+                }
+            }
+        }
+        self.rects += 1
+        return ok()
+    }
+    // After a successful decode.
+    fn finish(&self) {
+        assert(self.began, "sink: decode succeeded without begin()")
+        if !self.cover {
+            return
+        }
+        count := self.width as usize * self.height as usize
+        for bit in 0usize..count {
+            unsafe {
+                assert((COVER[bit / 8] & (1u8 << (bit % 8) as u8)) != 0, "sink: decode succeeded but a pixel never arrived")
+            }
+        }
+    }
+}
