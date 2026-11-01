@@ -180,6 +180,30 @@ fn vm_idiv_int(L: *mut State, m: i64, n: i64) -> i64!Throw {
     }
 }
 
+// Floor modulo for a nonzero divisor.
+fn vm_mod_ii(m: i64, n: i64) -> i64 {
+    if n == -1 {
+        return 0
+    }
+    r := m % n
+    if r != 0 && (r ^ n) < 0 {
+        r += n
+    }
+    return r
+}
+
+// Floor division for a nonzero divisor.
+fn vm_idiv_ii(m: i64, n: i64) -> i64 {
+    if n == -1 {
+        return core.wrapping_sub(0i64, m)
+    }
+    q := m / n
+    if (m ^ n) < 0 && m % n != 0 {
+        q -= 1
+    }
+    return q
+}
+
 fn vm_mod_float(a: f64, b: f64) -> f64 {
     unsafe {
         m := fmod(a, b)
@@ -697,7 +721,7 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                 let i = *pc
                 pc = ptr.offset(pc, 1)
                 if trap {
-                    trap = vm_trace(L, ci, pc)?
+                    vm_trace(L, ci, pc)?
                     base = ptr.offset((*ci).func, 1)
                 }
                 let ra = ptr.offset(base, ((i >> 7) & 255) as isize)
@@ -1028,14 +1052,122 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                             }
                         }
                     },
-                    25..=31 => {
-                        // MODK, POWK, DIVK, IDIVK, BANDK, BORK, BXORK
+                    25 => {
+                        // MODK
                         let rb = ptr.offset(base, ((i >> 16) & 255) as isize)
-                        let kc = ptr.offset(k, (i >> 24) as isize)
-                        let op = arith_op_event(i & 127)
-                        (*ci).savedpc = pc
-                        (*L).top = (*ci).top
-                        if vm_arith_num(L, op, rb, kc, ra)? {
+                        let rc = ptr.offset(k, (i >> 24) as isize)
+                        if (*rb).tag == TAG_INT && (*rc).tag == TAG_INT && val_int(rc) != 0 {
+                            let a = val_int(rb)
+                            let b = val_int(rc)
+                            set_int(ra, vm_mod_ii(a, b))
+                            pc = ptr.offset(pc, 1)
+                        } else {
+                            f1: f64 = 0.0
+                            f2: f64 = 0.0
+                            if to_float_ns(rb, ptr.from_mut(&mut f1)) && to_float_ns(rc, ptr.from_mut(&mut f2)) && ((*rb).tag != TAG_INT || (*rc).tag != TAG_INT) {
+                                set_float(ra, vm_mod_float(f1, f2))
+                                pc = ptr.offset(pc, 1)
+                            } else {
+                                (*ci).savedpc = pc
+                            (*L).top = (*ci).top
+                            if vm_arith_num(L, arith_op_event(i & 127), rb, rc, ra)? {
+                                pc = ptr.offset(pc, 1)
+                            }
+                            }
+                        }
+                    },
+                    26 => {
+                        // POWK
+                        let rb = ptr.offset(base, ((i >> 16) & 255) as isize)
+                        let rc = ptr.offset(k, (i >> 24) as isize)
+                        {
+                            f1: f64 = 0.0
+                            f2: f64 = 0.0
+                            if to_float_ns(rb, ptr.from_mut(&mut f1)) && to_float_ns(rc, ptr.from_mut(&mut f2)) && true {
+                                set_float(ra, vm_pow(f1, f2))
+                                pc = ptr.offset(pc, 1)
+                            } else {
+                                (*ci).savedpc = pc
+                            (*L).top = (*ci).top
+                            if vm_arith_num(L, arith_op_event(i & 127), rb, rc, ra)? {
+                                pc = ptr.offset(pc, 1)
+                            }
+                            }
+                        }
+                    },
+                    27 => {
+                        // DIVK
+                        let rb = ptr.offset(base, ((i >> 16) & 255) as isize)
+                        let rc = ptr.offset(k, (i >> 24) as isize)
+                        {
+                            f1: f64 = 0.0
+                            f2: f64 = 0.0
+                            if to_float_ns(rb, ptr.from_mut(&mut f1)) && to_float_ns(rc, ptr.from_mut(&mut f2)) && true {
+                                set_float(ra, f1 / f2)
+                                pc = ptr.offset(pc, 1)
+                            } else {
+                                (*ci).savedpc = pc
+                            (*L).top = (*ci).top
+                            if vm_arith_num(L, arith_op_event(i & 127), rb, rc, ra)? {
+                                pc = ptr.offset(pc, 1)
+                            }
+                            }
+                        }
+                    },
+                    28 => {
+                        // IDIVK
+                        let rb = ptr.offset(base, ((i >> 16) & 255) as isize)
+                        let rc = ptr.offset(k, (i >> 24) as isize)
+                        if (*rb).tag == TAG_INT && (*rc).tag == TAG_INT && val_int(rc) != 0 {
+                            let a = val_int(rb)
+                            let b = val_int(rc)
+                            set_int(ra, vm_idiv_ii(a, b))
+                            pc = ptr.offset(pc, 1)
+                        } else {
+                            f1: f64 = 0.0
+                            f2: f64 = 0.0
+                            if to_float_ns(rb, ptr.from_mut(&mut f1)) && to_float_ns(rc, ptr.from_mut(&mut f2)) && ((*rb).tag != TAG_INT || (*rc).tag != TAG_INT) {
+                                set_float(ra, vm_idiv_float(f1, f2))
+                                pc = ptr.offset(pc, 1)
+                            } else {
+                                (*ci).savedpc = pc
+                            (*L).top = (*ci).top
+                            if vm_arith_num(L, arith_op_event(i & 127), rb, rc, ra)? {
+                                pc = ptr.offset(pc, 1)
+                            }
+                            }
+                        }
+                    },
+                    29 => {
+                        // BANDK
+                        let rb = ptr.offset(base, ((i >> 16) & 255) as isize)
+                        let rc = ptr.offset(k, (i >> 24) as isize)
+                        ia: i64 = 0
+                        ib: i64 = 0
+                        if vm_to_integer_strict(rb, ptr.from_mut(&mut ia)) && vm_to_integer_strict(rc, ptr.from_mut(&mut ib)) {
+                            set_int(ra, ia & ib)
+                            pc = ptr.offset(pc, 1)
+                        }
+                    },
+                    30 => {
+                        // BORK
+                        let rb = ptr.offset(base, ((i >> 16) & 255) as isize)
+                        let rc = ptr.offset(k, (i >> 24) as isize)
+                        ia: i64 = 0
+                        ib: i64 = 0
+                        if vm_to_integer_strict(rb, ptr.from_mut(&mut ia)) && vm_to_integer_strict(rc, ptr.from_mut(&mut ib)) {
+                            set_int(ra, ia | ib)
+                            pc = ptr.offset(pc, 1)
+                        }
+                    },
+                    31 => {
+                        // BXORK
+                        let rb = ptr.offset(base, ((i >> 16) & 255) as isize)
+                        let rc = ptr.offset(k, (i >> 24) as isize)
+                        ia: i64 = 0
+                        ib: i64 = 0
+                        if vm_to_integer_strict(rb, ptr.from_mut(&mut ia)) && vm_to_integer_strict(rc, ptr.from_mut(&mut ib)) {
+                            set_int(ra, ia ^ ib)
                             pc = ptr.offset(pc, 1)
                         }
                     },
@@ -1105,14 +1237,144 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                             }
                         }
                     },
-                    37..=45 => {
-                        // MOD, POW, DIV, IDIV, BAND, BOR, BXOR, SHL, SHR
+                    37 => {
+                        // MOD
                         let rb = ptr.offset(base, ((i >> 16) & 255) as isize)
                         let rc = ptr.offset(base, (i >> 24) as isize)
-                        let op = arith_op_event(i & 127)
-                        (*ci).savedpc = pc
-                        (*L).top = (*ci).top
-                        if vm_arith_num(L, op, rb, rc, ra)? {
+                        if (*rb).tag == TAG_INT && (*rc).tag == TAG_INT && val_int(rc) != 0 {
+                            let a = val_int(rb)
+                            let b = val_int(rc)
+                            set_int(ra, vm_mod_ii(a, b))
+                            pc = ptr.offset(pc, 1)
+                        } else {
+                            f1: f64 = 0.0
+                            f2: f64 = 0.0
+                            if to_float_ns(rb, ptr.from_mut(&mut f1)) && to_float_ns(rc, ptr.from_mut(&mut f2)) && ((*rb).tag != TAG_INT || (*rc).tag != TAG_INT) {
+                                set_float(ra, vm_mod_float(f1, f2))
+                                pc = ptr.offset(pc, 1)
+                            } else {
+                                (*ci).savedpc = pc
+                            (*L).top = (*ci).top
+                            if vm_arith_num(L, arith_op_event(i & 127), rb, rc, ra)? {
+                                pc = ptr.offset(pc, 1)
+                            }
+                            }
+                        }
+                    },
+                    38 => {
+                        // POW
+                        let rb = ptr.offset(base, ((i >> 16) & 255) as isize)
+                        let rc = ptr.offset(base, (i >> 24) as isize)
+                        {
+                            f1: f64 = 0.0
+                            f2: f64 = 0.0
+                            if to_float_ns(rb, ptr.from_mut(&mut f1)) && to_float_ns(rc, ptr.from_mut(&mut f2)) && true {
+                                set_float(ra, vm_pow(f1, f2))
+                                pc = ptr.offset(pc, 1)
+                            } else {
+                                (*ci).savedpc = pc
+                            (*L).top = (*ci).top
+                            if vm_arith_num(L, arith_op_event(i & 127), rb, rc, ra)? {
+                                pc = ptr.offset(pc, 1)
+                            }
+                            }
+                        }
+                    },
+                    39 => {
+                        // DIV
+                        let rb = ptr.offset(base, ((i >> 16) & 255) as isize)
+                        let rc = ptr.offset(base, (i >> 24) as isize)
+                        {
+                            f1: f64 = 0.0
+                            f2: f64 = 0.0
+                            if to_float_ns(rb, ptr.from_mut(&mut f1)) && to_float_ns(rc, ptr.from_mut(&mut f2)) && true {
+                                set_float(ra, f1 / f2)
+                                pc = ptr.offset(pc, 1)
+                            } else {
+                                (*ci).savedpc = pc
+                            (*L).top = (*ci).top
+                            if vm_arith_num(L, arith_op_event(i & 127), rb, rc, ra)? {
+                                pc = ptr.offset(pc, 1)
+                            }
+                            }
+                        }
+                    },
+                    40 => {
+                        // IDIV
+                        let rb = ptr.offset(base, ((i >> 16) & 255) as isize)
+                        let rc = ptr.offset(base, (i >> 24) as isize)
+                        if (*rb).tag == TAG_INT && (*rc).tag == TAG_INT && val_int(rc) != 0 {
+                            let a = val_int(rb)
+                            let b = val_int(rc)
+                            set_int(ra, vm_idiv_ii(a, b))
+                            pc = ptr.offset(pc, 1)
+                        } else {
+                            f1: f64 = 0.0
+                            f2: f64 = 0.0
+                            if to_float_ns(rb, ptr.from_mut(&mut f1)) && to_float_ns(rc, ptr.from_mut(&mut f2)) && ((*rb).tag != TAG_INT || (*rc).tag != TAG_INT) {
+                                set_float(ra, vm_idiv_float(f1, f2))
+                                pc = ptr.offset(pc, 1)
+                            } else {
+                                (*ci).savedpc = pc
+                            (*L).top = (*ci).top
+                            if vm_arith_num(L, arith_op_event(i & 127), rb, rc, ra)? {
+                                pc = ptr.offset(pc, 1)
+                            }
+                            }
+                        }
+                    },
+                    41 => {
+                        // BAND
+                        let rb = ptr.offset(base, ((i >> 16) & 255) as isize)
+                        let rc = ptr.offset(base, (i >> 24) as isize)
+                        ia: i64 = 0
+                        ib: i64 = 0
+                        if vm_to_integer_strict(rb, ptr.from_mut(&mut ia)) && vm_to_integer_strict(rc, ptr.from_mut(&mut ib)) {
+                            set_int(ra, ia & ib)
+                            pc = ptr.offset(pc, 1)
+                        }
+                    },
+                    42 => {
+                        // BOR
+                        let rb = ptr.offset(base, ((i >> 16) & 255) as isize)
+                        let rc = ptr.offset(base, (i >> 24) as isize)
+                        ia: i64 = 0
+                        ib: i64 = 0
+                        if vm_to_integer_strict(rb, ptr.from_mut(&mut ia)) && vm_to_integer_strict(rc, ptr.from_mut(&mut ib)) {
+                            set_int(ra, ia | ib)
+                            pc = ptr.offset(pc, 1)
+                        }
+                    },
+                    43 => {
+                        // BXOR
+                        let rb = ptr.offset(base, ((i >> 16) & 255) as isize)
+                        let rc = ptr.offset(base, (i >> 24) as isize)
+                        ia: i64 = 0
+                        ib: i64 = 0
+                        if vm_to_integer_strict(rb, ptr.from_mut(&mut ia)) && vm_to_integer_strict(rc, ptr.from_mut(&mut ib)) {
+                            set_int(ra, ia ^ ib)
+                            pc = ptr.offset(pc, 1)
+                        }
+                    },
+                    44 => {
+                        // SHL
+                        let rb = ptr.offset(base, ((i >> 16) & 255) as isize)
+                        let rc = ptr.offset(base, (i >> 24) as isize)
+                        ia: i64 = 0
+                        ib: i64 = 0
+                        if vm_to_integer_strict(rb, ptr.from_mut(&mut ia)) && vm_to_integer_strict(rc, ptr.from_mut(&mut ib)) {
+                            set_int(ra, vm_shiftl(ia, ib))
+                            pc = ptr.offset(pc, 1)
+                        }
+                    },
+                    45 => {
+                        // SHR
+                        let rb = ptr.offset(base, ((i >> 16) & 255) as isize)
+                        let rc = ptr.offset(base, (i >> 24) as isize)
+                        ia: i64 = 0
+                        ib: i64 = 0
+                        if vm_to_integer_strict(rb, ptr.from_mut(&mut ia)) && vm_to_integer_strict(rc, ptr.from_mut(&mut ib)) {
+                            set_int(ra, vm_shiftl(ia, core.wrapping_sub(0i64, ib)))
                             pc = ptr.offset(pc, 1)
                         }
                     },
@@ -1323,10 +1585,118 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                             trap = (*L).hookmask != 0
                         }
                     },
-                    62..=65 => {
-                        // LTI, LEI, GTI, GEI
+                    62 => {
+                        // LTI
                         let im = arg_sb(i)
-                        let op = i & 127
+                        let op = 62u32
+                        cond := false
+                        if (*ra).tag == TAG_INT {
+                            let a = val_int(ra)
+                            let b = im as i64
+                            cond = if op == 62 { a < b } else if op == 63 { a <= b } else if op == 64 { a > b } else { a >= b }
+                        } else if (*ra).tag == TAG_FLOAT {
+                            let a = val_float(ra)
+                            let b = im as f64
+                            cond = if op == 62 { a < b } else if op == 63 { a <= b } else if op == 64 { a > b } else { a >= b }
+                        } else {
+                            let isf = (i >> 24) != 0
+                            (*ci).savedpc = pc
+                            (*L).top = (*ci).top
+                            if op == 62 {
+                                cond = meta_call_order_imm(L, ra, im, false, isf, TM_LT)?
+                            } else if op == 63 {
+                                cond = meta_call_order_imm(L, ra, im, false, isf, TM_LE)?
+                            } else if op == 64 {
+                                cond = meta_call_order_imm(L, ra, im, true, isf, TM_LT)?
+                            } else {
+                                cond = meta_call_order_imm(L, ra, im, true, isf, TM_LE)?
+                            }
+                            base = ptr.offset((*ci).func, 1)
+                            trap = (*L).hookmask != 0
+                        }
+                        if cond != (((i >> 15) & 1) != 0) {
+                            pc = ptr.offset(pc, 1)
+                        } else {
+                            pc = ptr.offset(pc, (arg_sj(*pc) + 1) as isize)
+                            trap = (*L).hookmask != 0
+                        }
+                    },
+                    63 => {
+                        // LEI
+                        let im = arg_sb(i)
+                        let op = 63u32
+                        cond := false
+                        if (*ra).tag == TAG_INT {
+                            let a = val_int(ra)
+                            let b = im as i64
+                            cond = if op == 62 { a < b } else if op == 63 { a <= b } else if op == 64 { a > b } else { a >= b }
+                        } else if (*ra).tag == TAG_FLOAT {
+                            let a = val_float(ra)
+                            let b = im as f64
+                            cond = if op == 62 { a < b } else if op == 63 { a <= b } else if op == 64 { a > b } else { a >= b }
+                        } else {
+                            let isf = (i >> 24) != 0
+                            (*ci).savedpc = pc
+                            (*L).top = (*ci).top
+                            if op == 62 {
+                                cond = meta_call_order_imm(L, ra, im, false, isf, TM_LT)?
+                            } else if op == 63 {
+                                cond = meta_call_order_imm(L, ra, im, false, isf, TM_LE)?
+                            } else if op == 64 {
+                                cond = meta_call_order_imm(L, ra, im, true, isf, TM_LT)?
+                            } else {
+                                cond = meta_call_order_imm(L, ra, im, true, isf, TM_LE)?
+                            }
+                            base = ptr.offset((*ci).func, 1)
+                            trap = (*L).hookmask != 0
+                        }
+                        if cond != (((i >> 15) & 1) != 0) {
+                            pc = ptr.offset(pc, 1)
+                        } else {
+                            pc = ptr.offset(pc, (arg_sj(*pc) + 1) as isize)
+                            trap = (*L).hookmask != 0
+                        }
+                    },
+                    64 => {
+                        // GTI
+                        let im = arg_sb(i)
+                        let op = 64u32
+                        cond := false
+                        if (*ra).tag == TAG_INT {
+                            let a = val_int(ra)
+                            let b = im as i64
+                            cond = if op == 62 { a < b } else if op == 63 { a <= b } else if op == 64 { a > b } else { a >= b }
+                        } else if (*ra).tag == TAG_FLOAT {
+                            let a = val_float(ra)
+                            let b = im as f64
+                            cond = if op == 62 { a < b } else if op == 63 { a <= b } else if op == 64 { a > b } else { a >= b }
+                        } else {
+                            let isf = (i >> 24) != 0
+                            (*ci).savedpc = pc
+                            (*L).top = (*ci).top
+                            if op == 62 {
+                                cond = meta_call_order_imm(L, ra, im, false, isf, TM_LT)?
+                            } else if op == 63 {
+                                cond = meta_call_order_imm(L, ra, im, false, isf, TM_LE)?
+                            } else if op == 64 {
+                                cond = meta_call_order_imm(L, ra, im, true, isf, TM_LT)?
+                            } else {
+                                cond = meta_call_order_imm(L, ra, im, true, isf, TM_LE)?
+                            }
+                            base = ptr.offset((*ci).func, 1)
+                            trap = (*L).hookmask != 0
+                        }
+                        if cond != (((i >> 15) & 1) != 0) {
+                            pc = ptr.offset(pc, 1)
+                        } else {
+                            pc = ptr.offset(pc, (arg_sj(*pc) + 1) as isize)
+                            trap = (*L).hookmask != 0
+                        }
+                    },
+                    65 => {
+                        // GEI
+                        let im = arg_sb(i)
+                        let op = 65u32
                         cond := false
                         if (*ra).tag == TAG_INT {
                             let a = val_int(ra)
@@ -1388,8 +1758,9 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                             (*L).top = ptr.offset(ra, b)
                         }
                         (*ci).savedpc = pc
-                        let newci = precall(L, ra, nresults)?
-                        if ptr.is_null(newci) {
+                        precall(L, ra, nresults)?
+                        let newci = (*L).ci
+                        if newci == ci {
                             base = ptr.offset((*ci).func, 1)
                             trap = (*L).hookmask != 0
                         } else {
@@ -1411,7 +1782,8 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                         if ((i >> 15) & 1) != 0 {
                             func_close_upvals(L, base)
                         }
-                        let n = pretailcall(L, ci, ra, b, delta)?
+                        n := 0i32
+                        pretailcall(L, ci, ra, b, delta, ptr.from_mut(&mut n))?
                         if n < 0 {
                             break
                         }

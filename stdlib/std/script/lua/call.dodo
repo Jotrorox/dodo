@@ -108,14 +108,22 @@ fn try_call_tm(L: *mut State, func0: *mut Value) -> (*mut Value)!Throw {
     }
 }
 
-// Call a native function at `func` with the arguments above it. Returns the
-// number of results (already moved into place).
-fn precall_native(L: *mut State, func0: *mut Value, nresults: i32, f: NativeFn) -> i32!Throw {
+// Call a native function at `func` with the arguments above it; its
+// results end up at func.. (adjusted to `nresults`).
+fn precall_native(L: *mut State, func0: *mut Value, nresults: i32, f: NativeFn) -> void!Throw {
     unsafe {
-        let off = save_stack(L, func0)
-        stack_check(L, MIN_STACK)?
-        let func = restore_stack(L, off)
-        let ci = ci_next(L)?
+        func := func0
+        if sdiff((*L).stack_last, (*L).top) <= MIN_STACK {
+            let off = save_stack(L, func0)
+            stack_grow(L, MIN_STACK)?
+            func = restore_stack(L, off)
+        }
+        let cur = (*L).ci
+        ci := (*cur).next
+        if ptr.is_null(ci) {
+            ci = ci_extend(L, cur)?
+        }
+        (*L).ci = ci
         (*ci).nresults = nresults
         (*ci).callstatus = CIST_NATIVE
         (*ci).func = func
@@ -127,45 +135,52 @@ fn precall_native(L: *mut State, func0: *mut Value, nresults: i32, f: NativeFn) 
         cx := Cx { L: L }
         let n = f(&mut cx)?
         poscall(L, ci, n)?
-        return ok(n)
+        return ok()
     }
 }
 
 // Prepare a call of the value at `func` (arguments up to top). For a Lua
-// function, push its frame and return it (the caller runs it); for a native
-// function, run it to completion and return null.
-fn precall(L: *mut State, func0: *mut Value, nresults: i32) -> (*mut CallInfo)!Throw {
+// function, push its frame (it becomes L.ci; the caller runs it); for a
+// native function, run it to completion (L.ci is unchanged afterwards).
+fn precall(L: *mut State, func0: *mut Value, nresults: i32) -> void!Throw {
     unsafe {
         func := func0
         for {
             let tag = (*func).tag
             if tag == TAG_LCLOSURE {
-                let cl = val_gc(func) as *mut LClosure
-                let p = (*cl).p
-                let narg = sdiff((*L).top, func) - 1
-                let nfix = (*p).numparams as isize
+                let p = (*(val_gc(func) as *mut LClosure)).p
                 let fsize = (*p).maxstacksize as isize
                 if sdiff((*L).stack_last, (*L).top) <= fsize {
                     let off = save_stack(L, func)
                     stack_grow(L, fsize)?
                     func = restore_stack(L, off)
                 }
-                let ci = ci_next(L)?
+                let cur = (*L).ci
+                ci := (*cur).next
+                if ptr.is_null(ci) {
+                    ci = ci_extend(L, cur)?
+                }
+                (*L).ci = ci
                 (*ci).nresults = nresults
                 (*ci).callstatus = 0
                 (*ci).func = func
                 (*ci).top = ptr.offset(func, 1 + fsize)
                 (*ci).savedpc = (*p).code
-                for i in narg..nfix {
-                    (*(*L).top).tag = TAG_NIL
-                    (*L).top = ptr.offset((*L).top, 1)
+                let narg = sdiff((*L).top, func) - 1
+                let nfix = (*p).numparams as isize
+                if narg < nfix {
+                    top := (*L).top
+                    for i in narg..nfix {
+                        (*top).tag = TAG_NIL
+                        top = ptr.offset(top, 1)
+                    }
+                    (*L).top = top
                 }
-                return ok(ci)
+                return ok()
             }
             if tag == TAG_NCLOSURE {
                 let cl = val_gc(func) as *mut NClosure
-                precall_native(L, func, nresults, (*cl).f)?
-                return ok(0 as *mut CallInfo)
+                return precall_native(L, func, nresults, (*cl).f)
             }
             func = try_call_tm(L, func)?
         }
@@ -174,9 +189,9 @@ fn precall(L: *mut State, func0: *mut Value, nresults: i32) -> (*mut CallInfo)!T
 
 // Prepare a tail call from frame `ci` of the function at `func` with
 // `narg1` (function + arguments) values; `delta` is the vararg shift of the
-// calling frame. Returns -1 for a Lua callee (ci now runs it) or the number
-// of results of a native callee (on top of the stack).
-fn pretailcall(L: *mut State, ci: *mut CallInfo, func0: *mut Value, narg10: i32, delta: i32) -> i32!Throw {
+// calling frame. Stores -1 in *nres for a Lua callee (ci now runs it) or
+// the number of results of a native callee (on top of the stack).
+fn pretailcall(L: *mut State, ci: *mut CallInfo, func0: *mut Value, narg10: i32, delta: i32, nres: *mut i32) -> void!Throw {
     unsafe {
         func := func0
         narg1 := narg10
@@ -205,12 +220,15 @@ fn pretailcall(L: *mut State, ci: *mut CallInfo, func0: *mut Value, narg10: i32,
                 (*ci).callstatus = (*ci).callstatus | CIST_TAIL
                 let np = if narg1 > nfix + 1 { narg1 } else { nfix + 1 }
                 (*L).top = ptr.offset(base, np as isize)
-                return ok(-1)
+                *nres = -1
+                return ok()
             }
             if tag == TAG_NCLOSURE {
                 let cl = val_gc(func) as *mut NClosure
-                let n = precall_native(L, func, MULTRET, (*cl).f)?
-                return ok(n)
+                let off = save_stack(L, func)
+                precall_native(L, func, MULTRET, (*cl).f)?
+                *nres = sdiff((*L).top, restore_stack(L, off)) as i32
+                return ok()
             }
             func = try_call_tm(L, func)?
             narg1 += 1
@@ -223,20 +241,18 @@ fn pretailcall(L: *mut State, ci: *mut CallInfo, func0: *mut Value, narg10: i32,
 fn call_value(L: *mut State, func: *mut Value, nresults: i32) -> void!Throw {
     unsafe {
         (*L).n_ccalls = (*L).n_ccalls + 1
+        let old = (*L).ci
         if (*L).n_ccalls >= MAX_CCALLS {
             let off = save_stack(L, func)
             check_cstack(L)?
-            let ci = precall(L, restore_stack(L, off), nresults)?
-            if !ptr.is_null(ci) {
-                (*ci).callstatus = CIST_FRESH
-                vm_execute(L, ci)?
-            }
+            precall(L, restore_stack(L, off), nresults)?
         } else {
-            let ci = precall(L, func, nresults)?
-            if !ptr.is_null(ci) {
-                (*ci).callstatus = CIST_FRESH
-                vm_execute(L, ci)?
-            }
+            precall(L, func, nresults)?
+        }
+        let ci = (*L).ci
+        if ci != old {
+            (*ci).callstatus = CIST_FRESH
+            vm_execute(L, ci)?
         }
         (*L).n_ccalls = (*L).n_ccalls - 1
         return ok()
@@ -593,8 +609,10 @@ fn resume_body(L: *mut State, nargs: i32) -> void!Throw {
         let first = ptr.offset((*L).top, -(nargs as isize))
         if (*L).status == ST_OK {
             // Starting the coroutine body.
-            let ci = precall(L, ptr.offset(first, -1), MULTRET)?
-            if !ptr.is_null(ci) {
+            let old = (*L).ci
+            precall(L, ptr.offset(first, -1), MULTRET)?
+            let ci = (*L).ci
+            if ci != old {
                 (*ci).callstatus = CIST_FRESH
                 vm_execute(L, ci)?
             }

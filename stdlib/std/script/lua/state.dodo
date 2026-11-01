@@ -424,26 +424,28 @@ fn stack_shrink(L: *mut State) {
 
 // --- CallInfo records -------------------------------------------------------
 
+// Allocate a frame record after `cur` (slow path of ci_next).
+fn ci_extend(L: *mut State, cur: *mut CallInfo) -> (*mut CallInfo)!Throw {
+    unsafe {
+        let nxt = mem_alloc(L, mem.size_of::<CallInfo>())? as *mut CallInfo
+        (*nxt).previous = cur
+        (*nxt).next = 0 as *mut CallInfo
+        (*cur).next = nxt
+        (*L).nci = (*L).nci + 1
+        return ok(nxt)
+    }
+}
+
 // The next frame record after the current one (allocating if needed); it
-// becomes the current frame.
+// becomes the current frame. The caller initializes func, top, nresults,
+// callstatus (and savedpc for Lua frames).
 fn ci_next(L: *mut State) -> (*mut CallInfo)!Throw {
     unsafe {
         let cur = (*L).ci
         nxt := (*cur).next
         if ptr.is_null(nxt) {
-            nxt = mem_alloc(L, mem.size_of::<CallInfo>())? as *mut CallInfo
-            (*nxt).previous = cur
-            (*nxt).next = 0 as *mut CallInfo
-            (*cur).next = nxt
-            (*L).nci = (*L).nci + 1
+            nxt = ci_extend(L, cur)?
         }
-        (*nxt).callstatus = 0
-        (*nxt).nextraargs = 0
-        (*nxt).nyield = 0
-        (*nxt).nres = 0
-        (*nxt).ctx = 0
-        (*nxt).ftransfer = 0
-        (*nxt).ntransfer = 0
         (*L).ci = nxt
         return ok(nxt)
     }

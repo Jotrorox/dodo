@@ -301,7 +301,8 @@ fn tab_get_int(t: *mut Table, key: i64) -> *mut Value {
 
 fn tab_get_shortstr(t: *mut Table, s: *mut LString) -> *mut Value {
     unsafe {
-        n := hash_pow2(t, (*s).hash)
+        let mask = ((1u32 << ((*t).lsizenode as u32)) - 1)
+        n := ptr.offset((*t).node, ((*s).hash & mask) as isize)
         let bits = s as u64
         for {
             if (*n).key_tag == TAG_SHORTSTR && (*n).key_bits == bits {
