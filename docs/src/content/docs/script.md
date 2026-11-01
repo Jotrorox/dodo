@@ -1052,11 +1052,10 @@ The interpreter is written for optimized builds: build programs that embed
 Lua with `-O 2` (or `dodo build --release`). An unoptimized build runs Lua
 code several times slower and is meant for debugging. On the benchmark set in
 `benchmarks/lua`, an `-O 2` build of `examples/lua` ran at a geometric mean of
-0.96 times the time of the reference PUC Lua 5.4.9 built with its default
-`-O2` (Apple M-series, macOS, at the time of writing): from 0.6× on
-`table_ops`, `string_format` and `coroutine_ring` to 1.5× on `mandelbrot`,
-with function calls and method dispatch the slowest relative to the
-reference. Run `python3 scripts/test_lua.py bench` to measure on your machine.
+0.82 times the time of the reference PUC Lua 5.4.9 built with its default
+`-O2` (Apple M-series, macOS, at the time of writing): from 0.5× on
+`coroutine_ring` and 0.6× on `table_ops` to about 1.0× on `mandelbrot` and
+`table_append`, the only benchmarks not faster than the reference. Run `python3 scripts/test_lua.py bench` to measure on your machine.
 
 Calls between Dodo and Lua are direct function calls with no marshalling
 layer. Keep hot loops on one side of the boundary where possible, reuse
