@@ -1,0 +1,583 @@
+package jxl_encode
+
+import "core/bytes"
+import "core/mem"
+import "std/env"
+import "std/fs"
+import "std/image/color"
+import "std/image/convert"
+import "std/image/jxl"
+import "std/image/jxl/encode"
+import "std/image/pixels"
+import "std/image/sink"
+import "std/platform"
+import "std/text"
+
+// Tests of lossy JPEG XL encoding (VarDCT in XYB, std/image/jxl/encode
+// with lossless = false).
+//
+// Run from the repository root:
+//
+//     dodo test tests/image/jxl_encode
+//
+// Every encoding is decoded with std/image/jxl into the source layout and
+// compared by PSNR (alpha must survive exactly). With
+// DODO_LOSSY_DUMP=DIRECTORY each encoding is also written there as
+// NAME.jxl, with our decoder's pixels as NAME.pam (integers) or NAME.pfm
+// (floats); tests/image/jxl_encode/verify_lossy.py decodes the files with
+// libjxl's djxl and checks both decoders agree.
+
+static mut LPIXELS: [2097152]u8 = [0u8; 2097152]
+static mut LOUTPUT: [4194304]u8 = [0u8; 4194304]
+static mut LOUTPUT2: [4194304]u8 = [0u8; 4194304]
+static mut LSCRATCH: [12582912]u8 = [0u8; 12582912]
+static mut LDECODED: [2097152]u8 = [0u8; 2097152]
+static mut LDECODE_SCRATCH: [33554432]u8 = [0u8; 33554432]
+
+// A smooth, textured test image: gradients, a soft disc, ripples, a few
+// hard edges and low-amplitude noise, as linear-ish values in 0..1.
+fn scene(x: u32, y: u32, w: u32, h: u32, c: u32) -> f32 {
+    fx := x as f32 / w as f32
+    fy := y as f32 / h as f32
+    v := 0.15f32 + 0.5 * fx * (0.6 + 0.4 * fy)
+    if c == 1 {
+        v = 0.25 + 0.45 * fy
+    } else if c == 2 {
+        v = 0.7 - 0.4 * fx * fy
+    }
+    dx := fx - 0.6
+    dy := fy - 0.4
+    d := dx * dx + dy * dy
+    if d < 0.04 {
+        v += (0.04 - d) * 6.0 * (c as f32 * 0.3 + 0.4)
+    }
+    // Ripples: a triangle wave in x + y.
+    t := ((x * 3 + y * 2) % 23) as f32 / 23.0
+    if t > 0.5 {
+        t = 1.0 - t
+    }
+    v += (t - 0.25) * 0.12
+    // Hard edges: a dark bar and a bright square.
+    if x % 61 < 4 && y > h / 3 {
+        v = 0.08
+    }
+    if x > w / 8 && x < w / 8 + 9 && y > h / 2 && y < h / 2 + 9 {
+        v = 0.95
+    }
+    // Hash noise.
+    n := ((x as u64 * 1103515245 + y as u64 * 12345 + c as u64 * 2654435761) & 0xFFFFFFFF) >> 7
+    v += ((n % 64) as f32 - 31.5) / 2000.0
+    if v < 0.0 {
+        v = 0.0
+    }
+    if v > 1.0 {
+        v = 1.0
+    }
+    return v
+}
+
+// Fill data with the scene in `layout` (alpha is a ramp with a hole).
+fn make_scene(data: &mut[u8], w: u32, h: u32, layout: &pixels.Layout) {
+    channels := layout.channel_count() as u32
+    sample := layout.sample_code()
+    alpha := layout.has_alpha()
+    for y in 0u32..h {
+        for x in 0u32..w {
+            for c in 0u32..channels {
+                v := scene(x, y, w, h, c)
+                if layout.is_gray() && c == 0 {
+                    v = scene(x, y, w, h, 1)
+                }
+                if alpha && c == channels - 1 {
+                    v = x as f32 / w as f32
+                    if x > w / 3 && x < w / 2 && y > h / 3 && y < h / 2 {
+                        v = 0.0
+                    }
+                }
+                at := ((y * w + x) * channels + c) as usize
+                if sample == pixels.SAMPLE_U8 {
+                    data[at] = (v * 255.0 + 0.5) as u8
+                } else if sample == pixels.SAMPLE_U16 {
+                    q := (v * 65535.0 + 0.5) as u32
+                    pixels.put16(data, at * 2, q as u16)
+                } else if sample == pixels.SAMPLE_F16 {
+                    pixels.put16(data, at * 2, convert.f32_bits_to_half(convert.f32_bits(v)))
+                } else {
+                    pixels.put32(data, at * 4, convert.f32_bits(v))
+                }
+            }
+        }
+    }
+}
+
+// Sample c of pixel i as a 0..1 value.
+fn sample_at(data: &[u8], layout: &pixels.Layout, index: usize) -> f64 {
+    sample := layout.sample_code()
+    if sample == pixels.SAMPLE_U8 {
+        return data[index] as f64 / 255.0
+    }
+    if sample == pixels.SAMPLE_U16 {
+        return pixels.get16(data, index * 2) as f64 / 65535.0
+    }
+    if sample == pixels.SAMPLE_F16 {
+        return convert.f32_from_bits(convert.half_to_f32_bits(pixels.get16(data, index * 2))) as f64
+    }
+    return convert.f32_from_bits(pixels.get32(data, index * 4)) as f64
+}
+
+// Encode with exactly the advertised scratch and output bounds.
+fn lossy_encode(view: &pixels.View, options: &encode.EncodeOptions, output: &mut[u8]) -> usize {
+    layout := view.layout()
+    need := encode.encode_scratch_size(view.width(), view.height(), layout, options)!
+    bound := encode.max_encoded_size(view.width(), view.height(), layout, options)!
+    assert(need <= 12582912, "test scratch too small")
+    assert(bound <= output.len, "test output too small")
+    scratch := unsafe {
+        &mut LSCRATCH
+    }
+    n := encode.encode(view, options, &mut output[..bound], &mut scratch[..need])!
+    assert(n <= bound, "output exceeds max_encoded_size")
+    return n
+}
+
+// Decode `encoded` into the source's layout and return the PSNR of the
+// color channels (alpha must be exact).
+fn lossy_psnr(encoded: &[u8], source: &pixels.View, name: &str) -> f64 {
+    header := jxl.info(encoded)!
+    assert(header.width == source.width() && header.height == source.height(), "size")
+    assert(header.lossy, "the header describes a lossy image")
+    layout := source.layout()
+    need := jxl.scratch_size(encoded)!
+    sum := 0.0f64
+    count := 0u64
+    unsafe {
+        assert(need <= LDECODE_SCRATCH.len)
+        target := pixels.ViewMut.new(&mut LDECODED, source.width(), source.height(), layout.clone())!
+        output := sink.ViewSink.new(&mut target)
+        jxl.decode(encoded, &mut output, &mut LDECODE_SCRATCH[..need])!
+        channels := layout.channel_count()
+        alpha := layout.has_alpha()
+        for y in 0u32..source.height() {
+            expected := source.row(y)
+            actual := target.row(y)
+            for x in 0usize..source.width() as usize {
+                for c in 0usize..channels {
+                    i := x * channels + c
+                    if alpha && c == channels - 1 {
+                        assert(sample_at(expected, layout, i) == sample_at(actual, layout, i), "alpha is lossless")
+                        continue
+                    }
+                    d := sample_at(expected, layout, i) - sample_at(actual, layout, i)
+                    sum += d * d
+                    count += 1
+                }
+            }
+        }
+        dump(name, encoded, source.width(), source.height(), layout)
+    }
+    mse := sum / count as f64
+    if mse < 0.0000000001 {
+        return 100.0
+    }
+    return 10.0 * log10(1.0 / mse)
+}
+
+fn log10(v: f64) -> f64 {
+    // log10 by repeated scaling and a short series: enough for PSNR.
+    x := v
+    e := 0.0f64
+    for x >= 10.0 {
+        x = x / 10.0
+        e += 1.0
+    }
+    for x < 1.0 {
+        x = x * 10.0
+        e -= 1.0
+    }
+    // ln(x) with x in [1, 10): ln(x) = 2 atanh((x - 1) / (x + 1)).
+    z := (x - 1.0) / (x + 1.0)
+    z2 := z * z
+    term := z
+    ln := 0.0f64
+    for k in 0u32..40 {
+        ln += term / (2 * k + 1) as f64
+        term = term * z2
+    }
+    return e + 2.0 * ln / 2.302585092994046
+}
+
+// With DODO_LOSSY_DUMP set, write NAME.jxl and our decoded pixels.
+fn dump(name: &str, encoded: &[u8], w: u32, h: u32, layout: &pixels.Layout) {
+    dir_storage := [0u8; 256]
+    workspace := env.Workspace.new()
+    dir := match env.get("DODO_LOSSY_DUMP", &mut dir_storage, &mut workspace, platform.TextPolicy.Strict) {
+        ok(value) => {
+            match value {
+                some(v) => {
+                    v
+                }
+                none => {
+                    return
+                }
+            }
+        }
+        err(_) => {
+            return
+        }
+    }
+    if mem.str_bytes(dir).len == 0 {
+        return
+    }
+    files := platform.workspace()
+    path_storage := [0u8; 512]
+    {
+        builder := text.Builder.new(&mut path_storage)
+        put(&mut builder, dir)
+        put(&mut builder, "/")
+        put(&mut builder, name)
+        put(&mut builder, ".jxl")
+        built := builder.as_text()
+        fs.write_file(built.as_str(), encoded, &mut files)!
+    }
+    // Decoded pixels as PAM (integers, big-endian 16-bit) or PFM (floats,
+    // bottom-up, little-endian).
+    channels := layout.channel_count()
+    float := layout.is_float()
+    header_storage := [0u8; 160]
+    hb := text.Builder.new(&mut header_storage)
+    if float {
+        if channels >= 3 {
+            put(&mut hb, "PF\n")
+        } else {
+            put(&mut hb, "Pf\n")
+        }
+        append_number(&mut hb, w)
+        put(&mut hb, " ")
+        append_number(&mut hb, h)
+        put(&mut hb, "\n-1.0\n")
+    } else {
+        put(&mut hb, "P7\nWIDTH ")
+        append_number(&mut hb, w)
+        put(&mut hb, "\nHEIGHT ")
+        append_number(&mut hb, h)
+        put(&mut hb, "\nDEPTH ")
+        append_number(&mut hb, channels as u32)
+        put(&mut hb, "\nMAXVAL ")
+        if layout.sample_code() == pixels.SAMPLE_U8 {
+            put(&mut hb, "255")
+        } else {
+            put(&mut hb, "65535")
+        }
+        put(&mut hb, "\nENDHDR\n")
+    }
+    head := hb.as_text()
+    head_bytes := mem.str_bytes(head.as_str())
+    out := unsafe {
+        &mut LOUTPUT2
+    }
+    at := 0usize
+    for i in 0usize..head_bytes.len {
+        out[at] = head_bytes[i]
+        at += 1
+    }
+    // Color channels only for PFM (no alpha there).
+    pfm_channels := channels
+    if float {
+        pfm_channels = 3
+        if channels < 3 {
+            pfm_channels = 1
+        }
+    }
+    unsafe {
+        for row in 0u32..h {
+            y := row
+            if float {
+                y = h - 1 - row
+            }
+            for x in 0usize..w as usize {
+                for c in 0usize..pfm_channels {
+                    i := (y as usize * w as usize + x) * channels + c
+                    if float {
+                        bits := convert.f32_bits(sample_at(&LDECODED, layout, i) as f32)
+                        out[at] = (bits & 255) as u8
+                        out[at + 1] = ((bits >> 8) & 255) as u8
+                        out[at + 2] = ((bits >> 16) & 255) as u8
+                        out[at + 3] = ((bits >> 24) & 255) as u8
+                        at += 4
+                    } else if layout.sample_code() == pixels.SAMPLE_U8 {
+                        out[at] = LDECODED[i]
+                        at += 1
+                    } else {
+                        v := pixels.get16(&LDECODED, i * 2)
+                        out[at] = ((v >> 8) & 255) as u8
+                        out[at + 1] = (v & 255) as u8
+                        at += 2
+                    }
+                }
+            }
+        }
+    }
+    path2 := [0u8; 512]
+    builder2 := text.Builder.new(&mut path2)
+    put(&mut builder2, dir)
+    put(&mut builder2, "/")
+    put(&mut builder2, name)
+    if float {
+        put(&mut builder2, ".pfm")
+    } else {
+        put(&mut builder2, ".pam")
+    }
+    built2 := builder2.as_text()
+    fs.write_file(built2.as_str(), &out[..at], &mut files)!
+}
+
+fn append_number(b: &mut text.Builder, v: u32) {
+    digits := [0u8; 10]
+    n := 0usize
+    x := v
+    for {
+        digits[n] = 48 + (x % 10) as u8
+        n += 1
+        x = x / 10
+        if x == 0 {
+            break
+        }
+    }
+    rev := [0u8; 10]
+    for i in 0usize..n {
+        rev[i] = digits[n - 1 - i]
+    }
+    t := text.Text.new(&rev[..n])!
+    b.append(&t)!
+}
+
+fn put(b: &mut text.Builder, s: &str) {
+    t := text.Text.from_str(s)
+    b.append(&t)!
+}
+
+// Encode the scene in `layout` at (w, h), distance and effort; returns the
+// PSNR and stores the encoded size in *size.
+fn round_trip(name: &str, w: u32, h: u32, layout: pixels.Layout, distance: f32, effort: u32, size: &mut usize) -> f64 {
+    data := unsafe {
+        &mut LPIXELS
+    }
+    make_scene(&mut data[..], w, h, &layout)
+    view := pixels.View.new(&data[..], w, h, layout)!
+    options := encode.EncodeOptions.lossy(distance)
+    options.effort = effort
+    output := unsafe {
+        &mut LOUTPUT
+    }
+    n := lossy_encode(&view, &options, &mut output[..])
+    *size = n
+    return lossy_psnr(&output[..n], &view, name)
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+
+@test
+fn every_layout_decodes_close_to_the_source() {
+    size := 0usize
+    assert(round_trip("rgb8", 64, 48, pixels.Layout.rgb8(), 1.0, 2, &mut size) > 34.0, "rgb8 PSNR")
+    assert(round_trip("rgba8", 64, 48, pixels.Layout.rgba8(), 1.0, 2, &mut size) > 34.0, "rgba8 PSNR")
+    assert(round_trip("gray8", 64, 48, pixels.Layout.gray8(), 1.0, 2, &mut size) > 34.0, "gray8 PSNR")
+    assert(round_trip("graya8", 40, 24, pixels.Layout.from_codes(2, pixels.SAMPLE_U8, false), 1.0, 3, &mut size) > 34.0, "graya8 PSNR")
+    assert(round_trip("rgb16", 48, 40, pixels.Layout.rgb16(), 1.0, 2, &mut size) > 34.0, "rgb16 PSNR")
+    assert(round_trip("rgba16", 33, 17, pixels.Layout.from_codes(4, pixels.SAMPLE_U16, false), 1.0, 3, &mut size) > 31.0, "rgba16 PSNR")
+    assert(round_trip("rgbf16", 40, 32, pixels.Layout.from_codes(3, pixels.SAMPLE_F16, false), 1.0, 2, &mut size) > 32.0, "rgbf16 PSNR")
+    assert(round_trip("rgbaf32", 40, 32, pixels.Layout.from_codes(4, pixels.SAMPLE_F32, false), 1.0, 2, &mut size) > 32.0, "rgbaf32 PSNR")
+    assert(round_trip("premultiplied", 24, 24, pixels.Layout.from_codes(4, pixels.SAMPLE_U8, true), 1.0, 1, &mut size) > 30.0, "premultiplied PSNR")
+}
+
+@test
+fn odd_sizes_and_group_boundaries_round_trip() {
+    size := 0usize
+    assert(round_trip("tiny", 1, 1, pixels.Layout.rgb8(), 1.0, 2, &mut size) > 30.0, "1x1")
+    assert(round_trip("odd", 37, 29, pixels.Layout.rgb8(), 1.0, 3, &mut size) > 33.0, "37x29")
+    assert(round_trip("tall", 9, 70, pixels.Layout.rgb8(), 2.0, 3, &mut size) > 30.0, "9x70")
+    // Several groups (and partial ones) with the varblock search.
+    assert(round_trip("groups", 264, 40, pixels.Layout.rgba8(), 1.0, 3, &mut size) > 34.0, "264x40")
+    assert(round_trip("groups2", 40, 270, pixels.Layout.rgb8(), 1.0, 2, &mut size) > 34.0, "40x270")
+    // One whole 64x64 tile: 64x64 and 64x32 varblocks are candidates.
+    assert(round_trip("big", 72, 64, pixels.Layout.rgb8(), 2.0, 7, &mut size) > 32.0, "72x64")
+}
+
+@test
+fn several_lf_groups_round_trip() {
+    size := 0usize
+    assert(round_trip("lfgroups", 2100, 24, pixels.Layout.rgb8(), 1.5, 2, &mut size) > 32.0, "2100x24")
+}
+
+@test
+fn every_effort_decodes_and_distance_trades_size_for_quality() {
+    for effort in 1u32..10 {
+        size := 0usize
+        assert(round_trip("effort", 72, 56, pixels.Layout.rgb8(), 1.0, effort, &mut size) > 34.0, "PSNR at each effort")
+    }
+    small := 0usize
+    medium := 0usize
+    large := 0usize
+    fine := round_trip("d05", 96, 64, pixels.Layout.rgb8(), 0.5, 3, &mut large)
+    normal := round_trip("d1", 96, 64, pixels.Layout.rgb8(), 1.0, 3, &mut medium)
+    coarse := round_trip("d4", 96, 64, pixels.Layout.rgb8(), 4.0, 3, &mut small)
+    assert(fine > normal && normal > coarse, "PSNR falls with the distance")
+    assert(large > medium && medium > small, "size falls with the distance")
+    assert(coarse > 26.0, "distance 4 is still recognizable")
+    // Far below the 3 bytes per pixel of the raw samples.
+    assert(medium < 96 * 64, "distance 1 compresses")
+}
+
+@test
+fn lossy_output_is_deterministic() {
+    data := unsafe {
+        &mut LPIXELS
+    }
+    layout := pixels.Layout.rgb8()
+    make_scene(&mut data[..], 80, 40, &layout)
+    view := pixels.View.new(&data[..], 80, 40, layout)!
+    options := encode.EncodeOptions.lossy(1.0)
+    options.effort = 3
+    a := unsafe {
+        &mut LOUTPUT
+    }
+    b := unsafe {
+        &mut LOUTPUT2
+    }
+    n := lossy_encode(&view, &options, &mut a[..])
+    m := lossy_encode(&view, &options, &mut b[..])
+    assert_eq(n, m, "same size")
+    assert(bytes.equal(&a[..n], &b[..m]), "same bytes")
+}
+
+@test
+fn worst_case_noise_stays_within_max_encoded_size() {
+    data := unsafe {
+        &mut LPIXELS
+    }
+    w := 64u32
+    h := 40u32
+    for i in 0usize..(w * h * 4) as usize {
+        data[i] = (((i as u64 * 2654435761) >> 13) & 255) as u8
+    }
+    view := pixels.View.new(&data[..], w, h, pixels.Layout.rgba8())!
+    output := unsafe {
+        &mut LOUTPUT
+    }
+    // The smallest distance keeps the most coefficients.
+    options := encode.EncodeOptions.lossy(0.05)
+    efforts := [1u32, 3, 7]
+    for k in 0usize..3 {
+        options.effort = efforts[k]
+        n := lossy_encode(&view, &options, &mut output[..])
+        assert(n > 0)
+    }
+    float := unsafe {
+        &mut LPIXELS
+    }
+    // Float samples far outside 0..1 (and NaN) must neither trap nor
+    // overflow the bound.
+    for i in 0usize..(w * h * 3) as usize {
+        bits := ((i as u64 * 2654435761) & 0xFFFFFFFF) as u32
+        pixels.put32(&mut float[..], i * 4, bits)
+    }
+    fview := pixels.View.new(&float[..], w, h, pixels.Layout.from_codes(3, pixels.SAMPLE_F32, false))!
+    n := lossy_encode(&fview, &options, &mut output[..])
+    assert(n > 0)
+}
+
+@test
+fn lossy_buffer_errors_are_reported() {
+    data := unsafe {
+        &mut LPIXELS
+    }
+    layout := pixels.Layout.rgb8()
+    make_scene(&mut data[..], 32, 32, &layout)
+    view := pixels.View.new(&data[..], 32, 32, layout)!
+    options := encode.EncodeOptions.lossy(1.0)
+    need := encode.encode_scratch_size(32, 32, view.layout(), &options)!
+    output := unsafe {
+        &mut LOUTPUT
+    }
+    scratch := unsafe {
+        &mut LSCRATCH
+    }
+    match encode.encode(&view, &options, &mut output[..], &mut scratch[..need - 1]) {
+        ok(_) => {
+            assert(false, "short scratch must fail")
+        }
+        err(e) => {
+            assert(e == pixels.Error.BufferTooSmall, "short scratch")
+        }
+    }
+    n := encode.encode(&view, &options, &mut output[..], &mut scratch[..need])!
+    match encode.encode(&view, &options, &mut output[..n - 1], &mut scratch[..need]) {
+        ok(_) => {
+            assert(false, "short output must fail")
+        }
+        err(e) => {
+            assert(e == pixels.Error.BufferTooSmall, "short output")
+        }
+    }
+    // Exactly enough output works, even without the TOC slack.
+    m := encode.encode(&view, &options, &mut output[..n], &mut scratch[..need])!
+    assert_eq(m, n, "exact output")
+}
+
+@test
+fn quality_maps_to_distance_like_cjxl() {
+    assert(encode.distance_from_quality(100.0) == 0.0)
+    d90 := encode.distance_from_quality(90.0)
+    assert(d90 > 0.99 && d90 < 1.01, "quality 90 is distance 1")
+    d30 := encode.distance_from_quality(30.0)
+    assert(d30 > 6.39 && d30 < 6.41, "quality 30")
+    assert(encode.distance_from_quality(0.0) == 25.0, "quality 0")
+    // Lossless stays the default.
+    options := encode.EncodeOptions.new()
+    assert(options.lossless, "lossless by default")
+}
+
+// The scene with `info` as the color description: the decoder converts
+// XYB back to that space, so the samples must come back close.
+fn color_round_trip(name: &str, layout: pixels.Layout, info: color.ColorInfo) -> f64 {
+    data := unsafe {
+        &mut LPIXELS
+    }
+    w := 48u32
+    h := 32u32
+    make_scene(&mut data[..], w, h, &layout)
+    view := pixels.View.new(&data[..], w, h, layout)!
+    options := encode.EncodeOptions.lossy(1.0)
+    options.color = info
+    output := unsafe {
+        &mut LOUTPUT
+    }
+    n := lossy_encode(&view, &options, &mut output[..])
+    return lossy_psnr(&output[..n], &view, name)
+}
+
+@test
+fn color_encodings_round_trip() {
+    p3 := color.ColorInfo.srgb()
+    p3.primaries = color.PRIMARIES_DISPLAY_P3
+    assert(color_round_trip("p3", pixels.Layout.rgb8(), p3) > 34.0, "Display P3")
+    linear := color.ColorInfo.linear()
+    assert(color_round_trip("linear", pixels.Layout.rgb16(), linear) > 30.0, "linear")
+    pq := color.ColorInfo.srgb()
+    pq.primaries = color.PRIMARIES_BT2020
+    pq.transfer = color.TRANSFER_PQ
+    // A few saturated pixels (one channel near 5 nits, the others near 250)
+    // clip at zero after coding: XYB scales linear light like libjxl.
+    assert(color_round_trip("pq", pixels.Layout.rgb16(), pq) > 26.0, "BT.2020 PQ")
+    hlg := color.ColorInfo.srgb()
+    hlg.transfer = color.TRANSFER_HLG
+    assert(color_round_trip("hlg", pixels.Layout.rgb16(), hlg) > 30.0, "HLG")
+    gamma := color.ColorInfo.srgb()
+    gamma.transfer = color.TRANSFER_UNSPECIFIED
+    gamma.gamma = 45455
+    assert(color_round_trip("gamma", pixels.Layout.from_codes(2, pixels.SAMPLE_U8, false), gamma) > 34.0, "gray gamma 2.2")
+    bt709 := color.ColorInfo.srgb()
+    bt709.transfer = color.TRANSFER_BT709
+    assert(color_round_trip("bt709", pixels.Layout.rgba8(), bt709) > 34.0, "BT.709")
+}

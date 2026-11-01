@@ -18,7 +18,7 @@ top.
 | `std/image/shared/scratch` | Typed views (`u32s`, `f32s`, ...) of one byte scratch buffer. |
 | `std/image/shared/isobmff` | ISO base media file format box iteration (JPEG XL container, AVIF). |
 | `std/image/ppm`, `qoi`, `bmp`, `png`, `jxl` | Codec layer, one package per format. |
-| `std/image/jxl/encode` | JPEG XL lossless encoder (modular, prefix codes or ANS, embedded ICC profiles, efforts 1 to 3). |
+| `std/image/jxl/encode` | JPEG XL encoder: lossless modular (prefix codes or ANS, embedded ICC profiles, efforts 1 to 3) or lossy VarDCT in XYB at a Butteraugli distance (prefix codes, efforts 1 to 9). |
 | `std/image/ops` | Crop, flip/rotate/orient, resize, quantize/dither, compare, histogram. |
 | `std/graphics/image` | The original Canvas-based API, forwarding to the codec packages. |
 | `std/image_alloc` | Owned `Image<A>` and `Bytes<A>` in an explicit allocator, `load`/`save` through std/fs, in-place convert/orient/resize/crop/quantize, metadata copies. |

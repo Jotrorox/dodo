@@ -6,10 +6,12 @@ import "std/image/pixels"
 import "std/image/shared/binary"
 import "std/image/shared/scratch"
 
-// JPEG XL lossless encoder: pure Dodo, no allocation, integer-only, with
-// byte-identical output on every target.
+// JPEG XL encoder: pure Dodo, no allocation. Lossless (the default) is
+// integer-only with byte-identical output on every target; lossy
+// (EncodeOptions.lossless = false) writes a VarDCT frame at a Butteraugli
+// distance.
 //
-// Design
+// Design (lossless)
 //
 // Output is one lossless modular frame (not XYB) as a bare codestream, or in
 // the ISOBMFF container (signature, ftyp, optional jxll/Exif/xml boxes, then
@@ -73,14 +75,81 @@ import "std/image/shared/scratch"
 // scratch stays between about 0.4 and 1.5 MiB at effort 1 and 0.7 and 4
 // MiB at effort 2+, for any image. max_encoded_size() bounds the output
 // (max_encoded_size_with_metadata() with metadata and ICC profile).
+//
+// Design (lossy, vd_*.dodo)
+//
+// One VarDCT frame in XYB (image metadata xyb_encoded; the color encoding
+// names the source's space, which the decoder converts back to). Samples
+// are linearized with the header's transfer curve (sRGB, linear, BT.709,
+// PQ, HLG, power laws), moved to sRGB primaries when needed, and turned into
+// XYB by libjxl's opsin matrix, bias and cube root; float and 16-bit
+// sources keep their precision up to that point. Per frame: a global quant
+// scale and LF quant from the distance (libjxl's formulas), default
+// dequantization matrices, x_qm_scale from the distance, Gaborish (effort 2+,
+// distance above 0.5) and EPF iterations (0 to 3 by distance) signalled as
+// applied. Per 256x256 group, analyzed with an 8-pixel border so results do
+// not depend on group order: the adaptive quant field (libjxl's masking
+// model) from the original XYB, inverse Gaborish (libjxl's 5x5 kernel),
+// then per 64x64 tile the varblock search (effort 3+: libjxl's entropy plus
+// information-loss estimate, merging DCT8 into 16x8, 16x16, 32x16, 32x32
+// and, at effort 7+, 64x32 and 64x64), the quant field per varblock,
+// chroma-from-luma factors fitted per tile (least squares, libjxl's
+// weighting), and quantization with libjxl's dead zones and per-block quant
+// adjustment (effort 3+). The LF image (one value per 8x8 block, the
+// lowest frequencies of each varblock folded back) is quantized with LF
+// chroma-from-luma, and with the HF metadata (chroma-from-luma tiles,
+// varblock types and quants, EPF sharpness) coded per LF group in modular
+// streams with their own trees. HF coefficients use the default block
+// context map, the decoder's nonzero-count prediction and contexts and the
+// natural coefficient orders; their tokens (hybrid integers 4/1/0, runs of
+// equal tokens as LZ77 copies) are clustered into at most 32 prefix codes
+// with an MTF + LZ77 coded context map. Alpha stays lossless in the modular
+// stream (global tree and codes, one stream per group).
+//
+// Two passes, group by group: the first analyzes each LF group's groups,
+// writes the LF group and counts the HF tokens; after the HF code is built
+// the second analyzes every group again (reusing the first pass's
+// decisions when the image is one LF group, up to 2048x2048) and writes
+// its tokens. Every HF token goes through VdHfCoder.token in vd_hf.dodo,
+// the single seam to the entropy coder.
+//
+// Lossy memory: encode_scratch_size() is about
+//   2.7 MiB fixed (HF histograms 7426 contexts x 64 symbols x 4 bytes,
+//     dequantization weights, orders, the modular coder)
+//   + 18 g^2 bytes for the group (XYB planes with an 8-pixel border,
+//     quantized coefficients), plus 8 g^2 more at effort 3+ (masking
+//     field), g = min(256, image side rounded up to 8)
+//   + 28 b^2 bytes for the LF group (LF image, metadata, block info),
+//     b = min(256, image side in blocks)
+//   + 1 KiB (8-bit) or 256 KiB (16-bit and half-float) linearization table
+//   + 4 bytes per alpha sample of one group,
+// at most about 7 MiB whatever the image size. max_encoded_size() is a
+// true bound (29 bits per HF coefficient, 36 per LF and metadata symbol,
+// the alpha samples' lossless bound, and the coding overhead).
 
 // Default effort for EncodeOptions.new().
 pub const DEFAULT_EFFORT: u32 = 2
 
+// Default Butteraugli distance of lossy encoding (cjxl's default, about
+// quality 90).
+pub const DEFAULT_DISTANCE: f32 = 1.0
+
 // Encoder settings.
 pub struct EncodeOptions {
-    // 1 (fastest) to 9; values above 3 currently behave like 3, 0 like 1.
+    // 1 (fastest) to 9. Lossless: values above 3 currently behave like 3,
+    // 0 like 1. Lossy: 1 DCT8 with uniform quantization; 2 adds adaptive
+    // quantization, inverse Gaborish and chroma-from-luma; 3-6 add the
+    // varblock search (DCT8 to DCT32 and rectangles) and per-block quant
+    // adjustment; 7-9 also try 64x64 varblocks.
     pub effort: u32
+    // Lossless modular coding (the default). When false, a lossy VarDCT
+    // frame in XYB is written at `distance`; alpha stays lossless.
+    pub lossless: bool
+    // Target Butteraugli distance of lossy coding: 1.0 is visually
+    // lossless, 0.5 very high quality, 3 to 8 small files. Clamped to
+    // 0.05..25; zero or less means lossless. distance_from_quality() maps
+    // a 0..100 quality the way cjxl does.
+    pub distance: f32
     // Wrap the codestream in the ISOBMFF container. Implied when metadata
     // is attached (encode_with_metadata).
     pub container: bool
@@ -93,7 +162,17 @@ pub struct EncodeOptions {
     pub orientation: color.Orientation
 
     pub fn new() -> EncodeOptions {
-        return EncodeOptions { effort: DEFAULT_EFFORT, container: false, color: color.ColorInfo.srgb(), orientation: color.Orientation.Identity }
+        return EncodeOptions { effort: DEFAULT_EFFORT, lossless: true, distance: DEFAULT_DISTANCE, container: false, color: color.ColorInfo.srgb(), orientation: color.Orientation.Identity }
+    }
+    // Lossy settings at Butteraugli distance `distance`.
+    pub fn lossy(distance: f32) -> EncodeOptions {
+        options := EncodeOptions.new()
+        options.lossless = false
+        options.distance = distance
+        return options
+    }
+    fn is_lossy(&self) -> bool {
+        return !self.lossless && (self.distance > 0.0 || !(self.distance == self.distance))
     }
 }
 
@@ -281,6 +360,10 @@ pub fn icc_bound(length: usize) -> usize!pixels.Error {
 // far smaller, and encode() reports BufferTooSmall rather than overrunning a
 // smaller buffer.
 pub fn max_encoded_size(width: u32, height: u32, layout: &pixels.Layout, options: &EncodeOptions) -> usize!pixels.Error {
+    if options.is_lossy() {
+        md := Metadata.new(b"", b"")
+        return vd_max_encoded_size(width, height, layout, options, &md)
+    }
     bound := codestream_bound(width, height, layout)?
     prefix := container_prefix(options, b"", b"", bound, needs_level10(width, height, layout))?
     return pixels.checked(1, bound, prefix)
@@ -288,6 +371,9 @@ pub fn max_encoded_size(width: u32, height: u32, layout: &pixels.Layout, options
 
 // max_encoded_size() including the metadata boxes and the ICC profile.
 pub fn max_encoded_size_with_metadata(width: u32, height: u32, layout: &pixels.Layout, options: &EncodeOptions, metadata: &Metadata) -> usize!pixels.Error {
+    if options.is_lossy() {
+        return vd_max_encoded_size(width, height, layout, options, metadata)
+    }
     bound := pixels.checked(1, codestream_bound(width, height, layout)?, icc_bound(metadata.icc.len)?)?
     prefix := container_prefix(options, metadata.exif, metadata.xmp, bound, needs_level10(width, height, layout))?
     return pixels.checked(1, bound, prefix)
@@ -335,6 +421,9 @@ fn uses_ans(options: &EncodeOptions) -> bool {
 
 // Bytes of scratch encode() needs for this image and options.
 pub fn encode_scratch_size(width: u32, height: u32, layout: &pixels.Layout, options: &EncodeOptions) -> usize!pixels.Error {
+    if options.is_lossy() {
+        return vd_scratch_size(width, height, layout, options)
+    }
     check_size(width, height)?
     total := scratch.size(plane_words(width, height, layout), 4)?
     total = scratch.add(total, scratch.size(HIST_WORDS, 4)?)?
@@ -372,6 +461,9 @@ fn encode_boxes(source: &pixels.View, options: &EncodeOptions, metadata: &Metada
     exif := metadata.exif
     xmp := metadata.xmp
     icc := metadata.icc
+    if options.is_lossy() {
+        return vd_encode(source, options, metadata, output, scratch_bytes)
+    }
     width := source.width()
     height := source.height()
     layout := source.layout()
@@ -413,7 +505,7 @@ fn encode_boxes(source: &pixels.View, options: &EncodeOptions, metadata: &Metada
     if output.len < base {
         return err(pixels.Error.BufferTooSmall)
     }
-    shape := Shape { width: width, height: height, color_channels: plan.color_channels, alpha: plan.alpha, bits: plan.bits, float: plan.float, alpha_associated: plan.premultiplied, orientation: color.exif_value(&options.orientation) }
+    shape := Shape { width: width, height: height, color_channels: plan.color_channels, alpha: plan.alpha, bits: plan.bits, float: plan.float, alpha_associated: plan.premultiplied, orientation: color.exif_value(&options.orientation), xyb: false }
 
     // The image header and ICC profile go first, while all scratch is free
     // for the ICC coder; the writer state is kept for the frame.

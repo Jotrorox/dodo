@@ -1,0 +1,760 @@
+package encode
+
+import "core/slice"
+import "std/image/color"
+import "std/image/pixels"
+import "std/image/shared/binary"
+import "std/image/shared/scratch"
+
+// Lossy encoding, frame level: one VarDCT frame of XYB samples with 256x256
+// groups and 2048x2048 LF groups. Alpha stays lossless in the modular
+// stream (global tree and codes in LfGlobal, one stream per group).
+//
+// Two passes over the image, group by group:
+//   A. per LF group: analyze its groups, quantize their LF values into the
+//      LF group's modular stream, gather the HF metadata (chroma-from-luma
+//      tiles, varblock types and quants, EPF sharpness) into another, write
+//      both (each with its own MA tree and codes), and count every HF token
+//      into the frame's histograms;
+//   B. cluster the histograms into the HfPass code, write HfGlobal, then
+//      analyze every group again and write its HF tokens (and alpha).
+// Section order matches the TOC: LfGlobal, LF groups, HfGlobal, groups.
+
+// Modular coder buffers (one MA tree's contexts, clusters and codes).
+struct VdMod {
+    hist: &mut[u32]
+    sums: &mut[u32]
+    choice: &mut[u32]
+    codes: &mut[u16]
+    lengths: &mut[u8]
+    map: &mut[u8]
+}
+
+// LF group buffers.
+struct VdLf {
+    // Quantized LF image (Y, X, B planes of lbw x lbh).
+    lfp: &mut[i32]
+    // HF metadata channels.
+    meta: &mut[i32]
+    // Per block: block info | quant << 8.
+    lbi: &mut[i32]
+}
+
+// HF code buffers.
+struct VdHf {
+    hist: &mut[u32]
+    seeds: &mut[u32]
+    sums: &mut[u32]
+    alone: &mut[f32]
+    nearest: &mut[f32]
+    map: &mut[u8]
+    lengths: &mut[u8]
+    codes: &mut[u16]
+    mtf: &mut[u8]
+}
+
+// Alpha: the group's samples and its global code.
+struct VdAlpha {
+    planes: &mut[i32]
+    map: &mut[u8]
+    lengths: &mut[u8]
+    codes: &mut[u16]
+}
+
+// Element counts of every scratch buffer.
+struct VdSizes {
+    wtab: usize
+    nat: usize
+    t: usize
+    lut: usize
+    xyb: usize
+    cells: usize
+    mask: usize
+    mtmp: usize
+    ring: usize
+    blocks: usize
+    coef: usize
+    tile: usize
+    cand: usize
+    lfp: usize
+    meta: usize
+    lbi: usize
+    alpha: usize
+    toc: usize
+}
+
+fn vd_toc_entries(plan: &VdPlan) -> usize {
+    groups := plan.groups_x * plan.groups_y
+    if groups == 1 {
+        return 1
+    }
+    return 2 + plan.lf_x * plan.lf_y + groups
+}
+
+fn vd_sizes(plan: &VdPlan) -> VdSizes {
+    s := plan.gpw + 2 * VD_BORDER
+    tiles := ((plan.lfbw + 7) / 8) * ((plan.lfbh + 7) / 8)
+    lfb := plan.lfbw * plan.lfbh
+    mask := 0usize
+    mtmp := 0usize
+    cand := 0usize
+    if plan.acs {
+        mask = plan.gpw * plan.gph
+        mtmp = (plan.gpw + 4) * (plan.gph + 4)
+        cand = VD_CAND
+    }
+    alpha := 0usize
+    if plan.alpha {
+        alpha = vd_min_usize(plan.width, 256) * vd_min_usize(plan.height, 256)
+    }
+    return VdSizes { wtab: VD_WTOTAL, nat: VD_ORDER_WORDS, t: VD_DCT_TEMP, lut: vd_lut_size(plan.sample), xyb: 3 * s * (plan.gph + 2 * VD_BORDER), cells: (plan.gpw / 4 + 2) * (plan.gph / 4 + 2), mask: mask, mtmp: mtmp, ring: 3 * s, blocks: 1024, coef: 3 * plan.gpw * plan.gph, tile: VD_TILE, cand: cand, lfp: 3 * lfb, meta: 2 * tiles + 3 * lfb, lbi: lfb, alpha: alpha, toc: vd_toc_entries(plan) }
+}
+
+const VD_HF_WORDS: usize = VD_HF_CONTEXTS * VD_HF_ALPHA
+const VD_SUM_WORDS: usize = MAX_CLUSTERS * MAX_ALPHA
+
+fn vd_scratch_bytes(z: &VdSizes) -> usize!pixels.Error {
+    total := scratch.size(z.wtab, 4)?
+    total = scratch.add(total, scratch.size(z.wtab, 4)?)?
+    total = scratch.add(total, scratch.size(z.nat, 4)?)?
+    total = scratch.add(total, scratch.size(z.t, 4)?)?
+    total = scratch.add(total, scratch.size(z.lut, 4)?)?
+    total = scratch.add(total, scratch.size(z.xyb, 4)?)?
+    total = scratch.add(total, scratch.size(z.cells, 4)?)?
+    total = scratch.add(total, scratch.size(z.mask, 4)?)?
+    total = scratch.add(total, scratch.size(z.mtmp, 4)?)?
+    total = scratch.add(total, scratch.size(z.ring, 4)?)?
+    total = scratch.add(total, scratch.size(z.blocks, 4)?)?
+    total = scratch.add(total, scratch.size(z.blocks, 1)?)?
+    total = scratch.add(total, scratch.size(z.blocks, 4)?)?
+    total = scratch.add(total, scratch.size(z.blocks, 4)?)?
+    total = scratch.add(total, scratch.size(z.coef, 2)?)?
+    total = scratch.add(total, scratch.size(3 * z.blocks, 4)?)?
+    total = scratch.add(total, scratch.size(z.tile, 4)?)?
+    total = scratch.add(total, scratch.size(z.cand, 4)?)?
+    // LF group.
+    total = scratch.add(total, scratch.size(z.lfp, 4)?)?
+    total = scratch.add(total, scratch.size(z.meta, 4)?)?
+    total = scratch.add(total, scratch.size(z.lbi, 4)?)?
+    // Modular coder.
+    total = scratch.add(total, scratch.size(MAX_CONTEXTS * MAX_ALPHA, 4)?)?
+    total = scratch.add(total, scratch.size(VD_SUM_WORDS, 4)?)?
+    total = scratch.add(total, scratch.size(MAX_CONTEXTS, 4)?)?
+    total = scratch.add(total, scratch.size(VD_SUM_WORDS, 2)?)?
+    total = scratch.add(total, scratch.size(VD_SUM_WORDS, 1)?)?
+    total = scratch.add(total, scratch.size(MAX_CONTEXTS, 1)?)?
+    // HF code.
+    total = scratch.add(total, scratch.size(VD_HF_WORDS, 4)?)?
+    total = scratch.add(total, scratch.size(MAX_CLUSTERS * VD_HF_ALPHA, 4)?)?
+    total = scratch.add(total, scratch.size(VD_SUM_WORDS, 4)?)?
+    total = scratch.add(total, scratch.size(VD_HF_CONTEXTS, 4)?)?
+    total = scratch.add(total, scratch.size(VD_HF_CONTEXTS, 4)?)?
+    total = scratch.add(total, scratch.size(VD_HF_CONTEXTS, 1)?)?
+    total = scratch.add(total, scratch.size(VD_SUM_WORDS, 1)?)?
+    total = scratch.add(total, scratch.size(VD_SUM_WORDS, 2)?)?
+    total = scratch.add(total, scratch.size(VD_HF_CONTEXTS, 1)?)?
+    // Alpha.
+    total = scratch.add(total, scratch.size(z.alpha, 4)?)?
+    total = scratch.add(total, scratch.size(MAX_CONTEXTS, 1)?)?
+    total = scratch.add(total, scratch.size(VD_SUM_WORDS, 1)?)?
+    total = scratch.add(total, scratch.size(VD_SUM_WORDS, 2)?)?
+    total = scratch.add(total, scratch.size(z.toc, 4)?)?
+    return ok(total)
+}
+
+// Worst-case codestream bytes: 29 bits per HF coefficient token (a 15-bit
+// code and 14 extra bits; at most 64 tokens per 8x8 block and channel), 36
+// bits per LF and metadata symbol (residuals below 2^24), the alpha
+// samples' lossless bound, and the coding overhead: per modular stream with
+// its own tree at most 2560 tree tokens of 40 bits, 32 prefix codes of 250
+// bytes and a 256-entry context map (24 KiB); the HF code spec at most
+// 7426 context map symbols of 17 bits plus 32 codes (32 KiB); headers,
+// padding and TOC.
+fn vd_codestream_bound(plan: &VdPlan, layout: &pixels.Layout) -> usize!pixels.Error {
+    padded := pixels.checked(plan.bw * 8, plan.bh * 8, 0)?
+    blocks := plan.bw * plan.bh
+    bits := pixels.checked(padded, 87, 0)?
+    bits = pixels.checked(blocks, 216, bits)?
+    if plan.alpha {
+        bits = pixels.checked(plan.width * plan.height, sample_bound_bits(layout), bits)?
+    }
+    streams := 2 * plan.lf_x * plan.lf_y
+    if plan.alpha {
+        streams += 1
+    }
+    overhead := pixels.checked(streams, 24576, 4096 + 32768)?
+    overhead = pixels.checked(vd_toc_entries(plan), 72, overhead)?
+    return pixels.checked(1, bits / 8 + 1, overhead)
+}
+
+// A ColorInfo the lossy header can describe for this layout (gray images
+// keep the D65 white point the decoder needs for XYB).
+fn vd_header_color(info: &color.ColorInfo, gray: bool) -> color.ColorInfo {
+    c := info.clone()
+    if gray {
+        c.custom_primaries = false
+    }
+    return c
+}
+
+// FrameHeader of the single VarDCT frame, then the TOC permutation flag.
+fn vd_write_frame_header(w: &mut BitWriter, plan: &VdPlan) {
+    w.pad()
+    // Not all-default; regular frame; VarDCT; no flags (XYB: no YCbCr).
+    w.write(1, 0)
+    w.write(2, 0)
+    w.write(1, 0)
+    w.u64_zero()
+    // Upsampling 1 for color and alpha.
+    w.write(2, 0)
+    if plan.alpha {
+        w.write(2, 0)
+    }
+    w.write(3, plan.x_qm_scale as u64)
+    w.write(3, plan.b_qm_scale as u64)
+    // One pass, no crop, replace blending, last frame, no name.
+    w.write(2, 0)
+    w.write(1, 0)
+    w.write(2, 0)
+    if plan.alpha {
+        w.write(2, 0)
+    }
+    w.write(1, 1)
+    w.write(2, 0)
+    // Restoration filter: Gaborish and EPF as the encoder assumed them.
+    if plan.gab && plan.epf == 2 {
+        w.write(1, 1)
+    } else {
+        w.write(1, 0)
+        w.bit(plan.gab)
+        if plan.gab {
+            w.write(1, 0)
+        }
+        w.write(2, plan.epf as u64)
+        if plan.epf > 0 {
+            w.write(1, 0)
+            w.write(1, 0)
+            w.write(1, 0)
+        }
+        w.u64_zero()
+    }
+    w.u64_zero()
+    w.write(1, 0)
+    w.pad()
+}
+
+// ---------------------------------------------------------------------------
+// Modular streams with local trees (LF image, HF metadata)
+
+// A stream with its own tree and codes: header, tree, code spec, data.
+fn vd_code_local(planes: &[i32], stream: &Stream, tree: &mut Tree, md: &mut VdMod, w: &mut BitWriter) {
+    tree_ctxs := [0u8; 2560]
+    tree_values := [0u32; 2560]
+    tokens := tree.serialize(&mut tree_ctxs, &mut tree_values)
+    contexts := tree.contexts + 1
+    for i in 0usize..contexts * MAX_ALPHA {
+        md.hist[i] = 0
+    }
+    no_ans := [0u16; 1]
+    set := CodeSet.new(&mut md.map[..], &mut md.lengths[..], &mut md.codes[..], &mut no_ans[..0], contexts, true, 7)
+    no_tokens := [0u32; 1]
+    proj := [0u16; 288]
+    projection(CONFIG_DEFAULT, LZ77_MIN_SYMBOL, &mut proj)
+    {
+        empty := [0u8; 1]
+        dummy := BitWriter.new(&mut empty, 1)
+        e := Emitter.new(true, &mut md.hist[..], &mut no_tokens[..0], CONFIG_DEFAULT, LZ77_MIN_SYMBOL, true, 7, tree.contexts)
+        code_stream(planes, stream, tree, &mut e, &set, &mut dummy)
+    }
+    set.clusters = cluster_histograms(md.hist, contexts, MAX_CLUSTERS, set.map, md.sums, md.choice, &proj)
+    set.build(md.sums)
+    // Local tree, default weighted predictor, no transforms.
+    w.write(1, 0)
+    w.write(1, 1)
+    w.write(2, 0)
+    write_tree(w, &tree_ctxs, &tree_values, tokens, false, 0)
+    set.write(w)
+    e := Emitter.new(false, &mut md.hist[..], &mut no_tokens[..0], CONFIG_DEFAULT, LZ77_MIN_SYMBOL, true, set.min_length as usize, tree.contexts)
+    code_stream(planes, stream, tree, &mut e, &set, w)
+}
+
+// LF image: gradient prediction per channel (Y, X, B), with activity
+// contexts when the LF group is large enough to pay for them.
+fn vd_lf_tree(tree: &mut Tree, blocks: usize) {
+    roots := [0usize; 3]
+    for c in 0usize..3 {
+        if blocks >= 1024 {
+            roots[c] = activity_subtree(tree, PRED_GRADIENT, 0)
+        } else {
+            roots[c] = tree.leaf(PRED_GRADIENT)
+        }
+    }
+    low := tree.node(PROP_CHANNEL, 0, roots[1], roots[0])
+    tree.node(PROP_CHANNEL, 1, roots[2], low)
+}
+
+// HF metadata: chroma-from-luma tiles and varblock info by left
+// prediction, the two block info rows apart, EPF sharpness.
+fn vd_meta_tree(tree: &mut Tree) {
+    x := tree.leaf(PRED_W)
+    b := tree.leaf(PRED_W)
+    kinds := tree.leaf(PRED_W)
+    quants := tree.leaf(PRED_W)
+    sharp := tree.leaf(PRED_W)
+    info := tree.node(PROP_Y, 0, quants, kinds)
+    low := tree.node(PROP_CHANNEL, 0, b, x)
+    high := tree.node(PROP_CHANNEL, 2, sharp, info)
+    tree.node(PROP_CHANNEL, 1, high, low)
+}
+
+@inline
+fn vd_lf_round(v: f32) -> i32 {
+    if !(v == v) {
+        return 0
+    }
+    if v > 4194303.0 {
+        return 4194303
+    }
+    if v < -4194303.0 {
+        return -4194303
+    }
+    if v >= 0.0 {
+        return (v + 0.5) as i32
+    }
+    return -((0.5 - v) as i32)
+}
+
+// ---------------------------------------------------------------------------
+// Alpha
+
+fn vd_alpha_tree(plan: &VdPlan, tree: &mut Tree) {
+    if plan.sample == pixels.SAMPLE_F32 {
+        tree.leaf(PRED_ZERO)
+        return
+    }
+    shift := 0u32
+    if plan.bits > 8 {
+        shift = plan.bits - 8
+    }
+    activity_subtree(tree, PRED_GRADIENT, shift)
+}
+
+fn vd_fill_alpha(source: &pixels.View, plan: &VdPlan, x0: usize, y0: usize, gw: usize, gh: usize, planes: &mut[i32]) {
+    a := plan.channels - 1
+    for y in 0usize..gh {
+        row := source.row((y0 + y) as u32)
+        for x in 0usize..gw {
+            planes[y * gw + x] = sample_value(row, (x0 + x) * plan.channels + a, plan.sample)
+        }
+    }
+}
+
+fn vd_single_group(plan: &VdPlan) -> bool {
+    return plan.groups_x == 1 && plan.groups_y == 1
+}
+
+// The alpha stream of group gi (or the global stream of a single-group
+// image): header unless `bare`, then the samples.
+fn vd_code_alpha(source: &pixels.View, plan: &VdPlan, tree: &Tree, planes: &mut[i32], gi: usize, e: &mut Emitter, set: &CodeSet, w: &mut BitWriter, header: bool) {
+    gx := gi % plan.groups_x
+    gy := gi / plan.groups_x
+    x0 := gx * 256
+    y0 := gy * 256
+    gw := vd_min_usize(plan.width - x0, 256)
+    gh := vd_min_usize(plan.height - y0, 256)
+    if header {
+        w.write(1, 1)
+        w.write(1, 1)
+        w.write(2, 0)
+    }
+    vd_fill_alpha(source, plan, x0, y0, gw, gh, planes)
+    id := 0u32
+    if !vd_single_group(plan) {
+        id = (1 + 3 * plan.lf_x * plan.lf_y + 17 + gi) as u32
+    }
+    stream := Stream.new(id)
+    stream.add(0, gw, gh)
+    code_stream(planes, &stream, tree, e, set, w)
+}
+
+// ---------------------------------------------------------------------------
+// Sections
+
+// LfGlobal: default LF dequantization, the quantizer, default block
+// contexts and LF chroma-from-luma, then the global modular stream (alpha's
+// tree and codes, and for a single group its samples).
+fn vd_write_lf_global(source: &pixels.View, plan: &VdPlan, atree: &Tree, atree_ctxs: &[u8], atree_values: &[u32], atree_tokens: usize, aset: &CodeSet, planes: &mut[i32], hist: &mut[u32], w: &mut BitWriter) {
+    w.write(1, 1)
+    w.u32(plan.global_scale, 1, 11, 2049, 11, 4097, 12, 8193, 16)
+    w.u32(plan.quant_lf, 16, 0, 1, 5, 1, 8, 1, 16)
+    w.write(1, 1)
+    w.write(1, 1)
+    if !plan.alpha {
+        w.write(1, 0)
+        return
+    }
+    w.write(1, 1)
+    write_tree(w, atree_ctxs, atree_values, atree_tokens, false, 0)
+    aset.write(w)
+    // Global stream header: global tree, default WP, no transforms.
+    w.write(1, 1)
+    w.write(1, 1)
+    w.write(2, 0)
+    if vd_single_group(plan) {
+        no_tokens := [0u32; 1]
+        e := Emitter.new(false, hist, &mut no_tokens[..0], CONFIG_DEFAULT, LZ77_MIN_SYMBOL, true, 7, atree.contexts)
+        vd_code_alpha(source, plan, atree, planes, 0, &mut e, aset, w, false)
+    }
+}
+
+// Pass A over LF group lg: analyze its groups, write the LF group section
+// and count the HF tokens.
+fn vd_lf_group(source: &pixels.View, plan: &VdPlan, col: &VdColor, wk: &mut VdWork, lf: &mut VdLf, md: &mut VdMod, coder: &mut VdHfCoder, hset: &CodeSet, lg: usize, w: &mut BitWriter) {
+    lgx := lg % plan.lf_x
+    lgy := lg / plan.lf_x
+    lbx0 := lgx * 256
+    lby0 := lgy * 256
+    lbw := vd_min_usize(plan.bw - lbx0, 256)
+    lbh := vd_min_usize(plan.bh - lby0, 256)
+    lfb := lbw * lbh
+    ltx := (lbw + 7) / 8
+    lty := (lbh + 7) / 8
+    tiles := ltx * lty
+    empty := [0u8; 1]
+    dummy := BitWriter.new(&mut empty, 1)
+    gy_end := vd_min_usize(plan.groups_y, lgy * 8 + 8)
+    gx_end := vd_min_usize(plan.groups_x, lgx * 8 + 8)
+    for gy in lgy * 8..gy_end {
+        for gx in lgx * 8..gx_end {
+            gi := gy * plan.groups_x + gx
+            vd_analyze_group(source, plan, col, wk, gi, lf, false)
+            g := vd_group(plan, gi)
+            ox := gx * 32 - lbx0
+            oy := gy * 32 - lby0
+            gplane := g.bw * g.bh
+            for by in 0usize..g.bh {
+                for bx in 0usize..g.bw {
+                    b := by * g.bw + bx
+                    lb := (oy + by) * lbw + ox + bx
+                    yv := wk.glf[gplane + b]
+                    qy := vd_lf_round(yv / plan.lf_step[1])
+                    ydq := qy as f32 * plan.lf_step[1]
+                    lf.lfp[lb] = qy
+                    lf.lfp[lfb + lb] = vd_lf_round(wk.glf[b] / plan.lf_step[0])
+                    lf.lfp[2 * lfb + lb] = vd_lf_round((wk.glf[2 * gplane + b] - ydq) / plan.lf_step[2])
+                    v := wk.acs[b] as i32
+                    if (wk.acs[b] & VD_FIRST) != 0 {
+                        v = v | (wk.qraw[b] << 8) | (wk.qorig[b] << 17)
+                    }
+                    lf.lbi[lb] = v
+                }
+            }
+            for ty in 0usize..(g.bh + 7) / 8 {
+                for tx in 0usize..(g.bw + 7) / 8 {
+                    lt := (oy / 8 + ty) * ltx + ox / 8 + tx
+                    lf.meta[lt] = wk.cfl[ty * 4 + tx]
+                    lf.meta[tiles + lt] = wk.cfl[16 + ty * 4 + tx]
+                }
+            }
+            vd_group_tokens(wk.acs, wk.coef, wk.nat, g.bw, g.bh, coder, hset, &mut dummy)
+        }
+    }
+    // LF image: no extra precision, then its stream.
+    w.write(2, 0)
+    {
+        tree := Tree.new()
+        vd_lf_tree(&mut tree, lfb)
+        stream := Stream.new((1 + lg) as u32)
+        stream.add(0, lbw, lbh)
+        stream.add(lfb, lbw, lbh)
+        stream.add(2 * lfb, lbw, lbh)
+        vd_code_local(lf.lfp, &stream, &mut tree, md, w)
+    }
+    // HF metadata.
+    nb := 0usize
+    for i in 0usize..lfb {
+        if (lf.lbi[i] & (VD_FIRST as i32)) != 0 {
+            nb += 1
+        }
+    }
+    info := 2 * tiles
+    k := 0usize
+    for i in 0usize..lfb {
+        v := lf.lbi[i]
+        if (v & (VD_FIRST as i32)) != 0 {
+            lf.meta[info + k] = v & 127
+            lf.meta[info + nb + k] = ((v >> 8) & 511) - 1
+            k += 1
+        }
+    }
+    sharp := info + 2 * nb
+    for i in 0usize..lfb {
+        lf.meta[sharp + i] = 4
+    }
+    w.write(vd_ceil_log2(lfb as u32), (nb - 1) as u64)
+    {
+        tree := Tree.new()
+        vd_meta_tree(&mut tree)
+        stream := Stream.new((1 + 2 * plan.lf_x * plan.lf_y + lg) as u32)
+        stream.add(0, ltx, lty)
+        stream.add(tiles, ltx, lty)
+        stream.add(info, nb, 2)
+        stream.add(sharp, lbw, lbh)
+        vd_code_local(lf.meta, &stream, &mut tree, md, w)
+    }
+}
+
+// Every section, recording byte sizes (one entry for a single group, whose
+// sections share one entry unpadded).
+fn vd_write_sections(source: &pixels.View, plan: &VdPlan, col: &VdColor, wk: &mut VdWork, lf: &mut VdLf, md: &mut VdMod, hf: &mut VdHf, al: &mut VdAlpha, atree: &Tree, atree_ctxs: &[u8], atree_values: &[u32], atree_tokens: usize, sizes: &mut[u32], w: &mut BitWriter) {
+    single := vd_single_group(plan)
+    num_lf := plan.lf_x * plan.lf_y
+    num_groups := plan.groups_x * plan.groups_y
+    no_ans := [0u16; 1]
+    no_tokens := [0u32; 1]
+    proj := [0u16; 288]
+    projection(CONFIG_DEFAULT, LZ77_MIN_SYMBOL, &mut proj)
+    aset := CodeSet.new(&mut al.map[..], &mut al.lengths[..], &mut al.codes[..], &mut no_ans[..0], atree.contexts + 1, true, 7)
+    if plan.alpha {
+        // The global alpha code: count every group's samples.
+        contexts := atree.contexts + 1
+        for i in 0usize..contexts * MAX_ALPHA {
+            md.hist[i] = 0
+        }
+        empty := [0u8; 1]
+        dummy := BitWriter.new(&mut empty, 1)
+        {
+            e := Emitter.new(true, &mut md.hist[..], &mut no_tokens[..0], CONFIG_DEFAULT, LZ77_MIN_SYMBOL, true, 7, atree.contexts)
+            for gi in 0usize..num_groups {
+                vd_code_alpha(source, plan, atree, al.planes, gi, &mut e, &aset, &mut dummy, false)
+            }
+        }
+        aset.clusters = cluster_histograms(md.hist, contexts, MAX_CLUSTERS, aset.map, md.sums, md.choice, &proj)
+        aset.build(md.sums)
+    }
+    section := w.pos
+    vd_write_lf_global(source, plan, atree, atree_ctxs, atree_values, atree_tokens, &aset, al.planes, md.hist, w)
+    if !single {
+        w.pad()
+        sizes[0] = (w.pos - section) as u32
+    }
+    // Pass A.
+    for i in 0usize..VD_HF_WORDS {
+        hf.hist[i] = 0
+    }
+    no_hans := [0u16; 1]
+    hset := CodeSet.new(&mut hf.map[..], &mut hf.lengths[..], &mut hf.codes[..], &mut no_hans[..0], VD_HF_CONTEXTS, true, 0)
+    hset.split = VD_HF_SPLIT
+    hset.msb = VD_HF_MSB
+    hset.lsb = VD_HF_LSB
+    {
+        coder := VdHfCoder.new(true, &mut hf.hist[..])
+        for lg in 0usize..num_lf {
+            section = w.pos
+            vd_lf_group(source, plan, col, wk, lf, md, &mut coder, &hset, lg, w)
+            if !single {
+                w.pad()
+                sizes[1 + lg] = (w.pos - section) as u32
+            }
+        }
+    }
+    hset.clusters = vd_cluster(hf.hist, VD_HF_CONTEXTS, MAX_CLUSTERS, hset.map, hf.seeds, hf.sums, hf.alone, hf.nearest)
+    hset.build(hf.sums)
+    // HfGlobal: default dequantization matrices, one HF preset, HfPass with
+    // natural coefficient orders and the HF code.
+    section = w.pos
+    w.write(1, 1)
+    w.write(vd_ceil_log2(num_groups as u32), 0)
+    w.u32(0, 0x5f, 0, 0x13, 0, 0, 0, 0, 13)
+    vd_write_hf_spec(w, &hset, hf.mtf)
+    if !single {
+        w.pad()
+        sizes[1 + num_lf] = (w.pos - section) as u32
+    }
+    // Pass B: groups.
+    coder := VdHfCoder.new(false, &mut hf.hist[..])
+    for gi in 0usize..num_groups {
+        section = w.pos
+        vd_analyze_group(source, plan, col, wk, gi, lf, num_lf == 1)
+        g := vd_group(plan, gi)
+        vd_group_tokens(wk.acs, wk.coef, wk.nat, g.bw, g.bh, &mut coder, &hset, w)
+        if plan.alpha && !single {
+            e := Emitter.new(false, &mut md.hist[..], &mut no_tokens[..0], CONFIG_DEFAULT, LZ77_MIN_SYMBOL, true, 7, atree.contexts)
+            vd_code_alpha(source, plan, atree, al.planes, gi, &mut e, &aset, w, true)
+        }
+        w.pad()
+        if !single {
+            sizes[2 + num_lf + gi] = (w.pos - section) as u32
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Entry points
+
+fn vd_max_encoded_size(width: u32, height: u32, layout: &pixels.Layout, options: &EncodeOptions, metadata: &Metadata) -> usize!pixels.Error {
+    check_size(width, height)?
+    exif := metadata.exif
+    xmp := metadata.xmp
+    plan := vd_plan(width, height, layout, options)
+    bound := vd_codestream_bound(&plan, layout)?
+    prefix := container_prefix(options, exif, xmp, bound, needs_level10(width, height, layout))?
+    return pixels.checked(1, bound, prefix)
+}
+
+fn vd_scratch_size(width: u32, height: u32, layout: &pixels.Layout, options: &EncodeOptions) -> usize!pixels.Error {
+    check_size(width, height)?
+    plan := vd_plan(width, height, layout, options)
+    sizes := vd_sizes(&plan)
+    return vd_scratch_bytes(&sizes)
+}
+
+fn vd_encode(source: &pixels.View, options: &EncodeOptions, metadata: &Metadata, output: &mut[u8], scratch_bytes: &mut[u8]) -> usize!pixels.Error {
+    exif := metadata.exif
+    xmp := metadata.xmp
+    if metadata.icc.len > 0 {
+        return err(pixels.Error.Unsupported)
+    }
+    width := source.width()
+    height := source.height()
+    layout := source.layout()
+    check_size(width, height)?
+    plan := vd_plan(width, height, layout, options)
+    z := vd_sizes(&plan)
+    if scratch_bytes.len < vd_scratch_bytes(&z)? {
+        return err(pixels.Error.BufferTooSmall)
+    }
+    let slice.SplitMut { left: b_wq, right: r1 } = scratch.split(scratch_bytes, scratch.size(z.wtab, 4)?)?
+    let slice.SplitMut { left: b_wd, right: r2 } = scratch.split(r1, scratch.size(z.wtab, 4)?)?
+    let slice.SplitMut { left: b_nat, right: r3 } = scratch.split(r2, scratch.size(z.nat, 4)?)?
+    let slice.SplitMut { left: b_t, right: r4 } = scratch.split(r3, scratch.size(z.t, 4)?)?
+    let slice.SplitMut { left: b_lut, right: r5 } = scratch.split(r4, scratch.size(z.lut, 4)?)?
+    let slice.SplitMut { left: b_xyb, right: r6 } = scratch.split(r5, scratch.size(z.xyb, 4)?)?
+    let slice.SplitMut { left: b_cells, right: r7 } = scratch.split(r6, scratch.size(z.cells, 4)?)?
+    let slice.SplitMut { left: b_mask, right: r8 } = scratch.split(r7, scratch.size(z.mask, 4)?)?
+    let slice.SplitMut { left: b_mtmp, right: r9 } = scratch.split(r8, scratch.size(z.mtmp, 4)?)?
+    let slice.SplitMut { left: b_ring, right: r10 } = scratch.split(r9, scratch.size(z.ring, 4)?)?
+    let slice.SplitMut { left: b_qf, right: r11 } = scratch.split(r10, scratch.size(z.blocks, 4)?)?
+    let slice.SplitMut { left: b_acs, right: r12 } = scratch.split(r11, scratch.size(z.blocks, 1)?)?
+    let slice.SplitMut { left: b_qraw, right: r12b } = scratch.split(r12, scratch.size(z.blocks, 4)?)?
+    let slice.SplitMut { left: b_qorig, right: r13 } = scratch.split(r12b, scratch.size(z.blocks, 4)?)?
+    let slice.SplitMut { left: b_coef, right: r14 } = scratch.split(r13, scratch.size(z.coef, 2)?)?
+    let slice.SplitMut { left: b_glf, right: r15 } = scratch.split(r14, scratch.size(3 * z.blocks, 4)?)?
+    let slice.SplitMut { left: b_tile, right: r16 } = scratch.split(r15, scratch.size(z.tile, 4)?)?
+    let slice.SplitMut { left: b_cand, right: r17 } = scratch.split(r16, scratch.size(z.cand, 4)?)?
+    let slice.SplitMut { left: b_lfp, right: r18 } = scratch.split(r17, scratch.size(z.lfp, 4)?)?
+    let slice.SplitMut { left: b_meta, right: r19 } = scratch.split(r18, scratch.size(z.meta, 4)?)?
+    let slice.SplitMut { left: b_lbi, right: r20 } = scratch.split(r19, scratch.size(z.lbi, 4)?)?
+    let slice.SplitMut { left: b_mhist, right: r21 } = scratch.split(r20, scratch.size(MAX_CONTEXTS * MAX_ALPHA, 4)?)?
+    let slice.SplitMut { left: b_msums, right: r22 } = scratch.split(r21, scratch.size(VD_SUM_WORDS, 4)?)?
+    let slice.SplitMut { left: b_mchoice, right: r23 } = scratch.split(r22, scratch.size(MAX_CONTEXTS, 4)?)?
+    let slice.SplitMut { left: b_mcodes, right: r24 } = scratch.split(r23, scratch.size(VD_SUM_WORDS, 2)?)?
+    let slice.SplitMut { left: b_mlengths, right: r25 } = scratch.split(r24, scratch.size(VD_SUM_WORDS, 1)?)?
+    let slice.SplitMut { left: b_mmap, right: r26 } = scratch.split(r25, scratch.size(MAX_CONTEXTS, 1)?)?
+    let slice.SplitMut { left: b_hhist, right: r27 } = scratch.split(r26, scratch.size(VD_HF_WORDS, 4)?)?
+    let slice.SplitMut { left: b_hseeds, right: r28 } = scratch.split(r27, scratch.size(MAX_CLUSTERS * VD_HF_ALPHA, 4)?)?
+    let slice.SplitMut { left: b_hsums, right: r29 } = scratch.split(r28, scratch.size(VD_SUM_WORDS, 4)?)?
+    let slice.SplitMut { left: b_halone, right: r30 } = scratch.split(r29, scratch.size(VD_HF_CONTEXTS, 4)?)?
+    let slice.SplitMut { left: b_hnear, right: r31 } = scratch.split(r30, scratch.size(VD_HF_CONTEXTS, 4)?)?
+    let slice.SplitMut { left: b_hmap, right: r32 } = scratch.split(r31, scratch.size(VD_HF_CONTEXTS, 1)?)?
+    let slice.SplitMut { left: b_hlengths, right: r33 } = scratch.split(r32, scratch.size(VD_SUM_WORDS, 1)?)?
+    let slice.SplitMut { left: b_hcodes, right: r34 } = scratch.split(r33, scratch.size(VD_SUM_WORDS, 2)?)?
+    let slice.SplitMut { left: b_mtf, right: r35 } = scratch.split(r34, scratch.size(VD_HF_CONTEXTS, 1)?)?
+    let slice.SplitMut { left: b_apl, right: r36 } = scratch.split(r35, scratch.size(z.alpha, 4)?)?
+    let slice.SplitMut { left: b_amap, right: r37 } = scratch.split(r36, scratch.size(MAX_CONTEXTS, 1)?)?
+    let slice.SplitMut { left: b_alengths, right: r38 } = scratch.split(r37, scratch.size(VD_SUM_WORDS, 1)?)?
+    let slice.SplitMut { left: b_acodes, right: b_toc } = scratch.split(r38, scratch.size(VD_SUM_WORDS, 2)?)?
+    wq := scratch.f32s(b_wq)
+    wd := scratch.f32s(b_wd)
+    nat := scratch.u32s(b_nat)
+    tdct := scratch.f32s(b_t)
+    lut := scratch.f32s(b_lut)
+    vd_init_weights(wq, wd)?
+    vd_natural_orders(nat, VD_ORDERS)
+    vd_init_dct_tables(tdct)
+    info := vd_header_color(&options.color, plan.color_channels == 1)
+    col := vd_color(&info, layout)
+    vd_fill_lut(&col, lut)
+    wk := VdWork { wq: wq, wd: wd, nat: nat, t: tdct, lut: lut, xyb: scratch.f32s(b_xyb), cells: scratch.f32s(b_cells), mask: scratch.f32s(b_mask), mtmp: scratch.f32s(b_mtmp), ring: scratch.f32s(b_ring), qf: scratch.f32s(b_qf), acs: b_acs, qraw: scratch.i32s(b_qraw), qorig: scratch.i32s(b_qorig), coef: scratch.i16s(b_coef), glf: scratch.f32s(b_glf), tile: scratch.f32s(b_tile), cand: scratch.f32s(b_cand), cfl: [0i32; 32] }
+    lf := VdLf { lfp: scratch.i32s(b_lfp), meta: scratch.i32s(b_meta), lbi: scratch.i32s(b_lbi) }
+    md := VdMod { hist: scratch.u32s(b_mhist), sums: scratch.u32s(b_msums), choice: scratch.u32s(b_mchoice), codes: scratch.u16s(b_mcodes), lengths: b_mlengths, map: b_mmap }
+    hf := VdHf { hist: scratch.u32s(b_hhist), seeds: scratch.u32s(b_hseeds), sums: scratch.u32s(b_hsums), alone: scratch.f32s(b_halone), nearest: scratch.f32s(b_hnear), map: b_hmap, lengths: b_hlengths, codes: scratch.u16s(b_hcodes), mtf: b_mtf }
+    al := VdAlpha { planes: scratch.i32s(b_apl), map: b_amap, lengths: b_alengths, codes: scratch.u16s(b_acodes) }
+    sizes := scratch.u32s(b_toc)
+
+    atree := Tree.new()
+    if plan.alpha {
+        vd_alpha_tree(&plan, &mut atree)
+    } else {
+        atree.leaf(PRED_ZERO)
+    }
+    atree_ctxs := [0u8; 2560]
+    atree_values := [0u32; 2560]
+    atree_tokens := atree.serialize(&mut atree_ctxs, &mut atree_values)
+
+    level10 := needs_level10(width, height, layout)
+    bound := vd_codestream_bound(&plan, layout)?
+    base := container_prefix(options, exif, xmp, bound, level10)?
+    if output.len < base {
+        return err(pixels.Error.BufferTooSmall)
+    }
+    shape := Shape { width: width, height: height, color_channels: plan.color_channels, alpha: plan.alpha, bits: plan.bits, float: plan.float, alpha_associated: plan.premultiplied, orientation: color.exif_value(&options.orientation), xyb: true }
+    entries := vd_toc_entries(&plan)
+    reserve := 4 * entries + 1
+    toc_start := 0usize
+    end := 0usize
+    overflow := false
+    {
+        w := BitWriter.new(output, base)
+        write_image_header(&mut w, &shape, &info, false)
+        vd_write_frame_header(&mut w, &plan)
+        toc_start = w.pos
+        w.pos = toc_start + reserve
+        start := w.pos
+        vd_write_sections(source, &plan, &col, &mut wk, &mut lf, &mut md, &mut hf, &mut al, &atree, &atree_ctxs, &atree_values, atree_tokens, sizes, &mut w)
+        if entries == 1 {
+            sizes[0] = (w.pos - start) as u32
+        }
+        end = w.pos
+        overflow = w.overflow
+    }
+    toc_bits := 0usize
+    for i in 0usize..entries {
+        toc_bits += toc_entry_bits(sizes[i]) as usize
+    }
+    toc_used := (toc_bits + 7) / 8
+    final_end := end - (reserve - toc_used)
+    if final_end > output.len {
+        return err(pixels.Error.BufferTooSmall)
+    }
+    if overflow {
+        // Fits only without the TOC slack: write again with the TOC known.
+        w := BitWriter.new(output, base)
+        write_image_header(&mut w, &shape, &info, false)
+        vd_write_frame_header(&mut w, &plan)
+        for i in 0usize..entries {
+            write_toc_entry(&mut w, sizes[i])
+        }
+        w.pad()
+        vd_write_sections(source, &plan, &col, &mut wk, &mut lf, &mut md, &mut hf, &mut al, &atree, &atree_ctxs, &atree_values, atree_tokens, sizes, &mut w)
+        if w.overflow || w.pos != final_end {
+            return err(pixels.Error.BufferTooSmall)
+        }
+    } else {
+        from_at := toc_start + reserve
+        to_at := toc_start + toc_used
+        for i in 0usize..end - from_at {
+            output[to_at + i] = output[from_at + i]
+        }
+        w := BitWriter.new(output, toc_start)
+        for i in 0usize..entries {
+            write_toc_entry(&mut w, sizes[i])
+        }
+        w.pad()
+    }
+    codestream := final_end - base
+    if base > 0 {
+        write_container(exif, xmp, output, base, codestream, level10)
+    }
+    return ok(base + codestream)
+}

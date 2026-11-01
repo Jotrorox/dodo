@@ -19,6 +19,9 @@ struct Shape {
     alpha_associated: bool
     // EXIF orientation 1..8.
     orientation: u32
+    // Samples are XYB (lossy VarDCT); the color encoding then names the
+    // space the decoder converts back to.
+    xyb: bool
 }
 
 // The signature, SizeHeader and ImageMetadata; with `icc` the color
@@ -26,7 +29,7 @@ struct Shape {
 fn write_image_header(w: &mut BitWriter, shape: &Shape, info: &color.ColorInfo, icc: bool) {
     w.write(16, 0x0AFF)
     write_size(w, shape.width, shape.height)
-    // ImageMetadata: never all-default since samples are not XYB.
+    // ImageMetadata: never all-default (the encoder keeps it simple).
     w.write(1, 0)
     extra := shape.orientation != 1
     w.bit(extra)
@@ -55,8 +58,7 @@ fn write_image_header(w: &mut BitWriter, shape: &Shape, info: &color.ColorInfo, 
     } else {
         w.u32(0, 0, 0, 1, 0, 2, 4, 1, 12)
     }
-    // Not XYB encoded.
-    w.write(1, 0)
+    w.bit(shape.xyb)
     if icc {
         // Not all-default, want_icc, RGB or gray.
         w.write(1, 0)
