@@ -1634,11 +1634,15 @@ Function attributes are `@test`, `@ignore("reason")`, `@interrupt(VECTOR)`
 (section 16.6), `@link_name("symbol")` (section 16.1), `@naked` (section 16.4),
 `@section("name")`, and `@align(N)` (section 16.5); statics
 accept `@section` and `@align`. Accepted struct attributes are `@repr(C)`, `@unsafe_send`, `@unsafe_sync`,
-`@derive(Json)`, and `@json_deny_unknown`; the latter requires `@derive(Json)`.
-Derived JSON structs may rename fields with `@json_name("name")`. JSON derivation
-generates ordinary type- and borrow-checked methods for concrete structs;
-supported field types and encoding policies are specified in the
-[JSON reference](json.md). Thread contracts are described in the
+`@derive(D, ...)` with the derives `Json` and `Row`, and `@json_deny_unknown`;
+the latter requires `@derive(Json)`. A derive may be listed once per struct,
+in one `@derive` attribute or several. Derived JSON structs may rename fields
+with `@json_name("name")`; derived Row structs may rename columns with
+`@db_name("name")` and mark nested Row structs `@db_flatten`. A field
+attribute requires its derive on the enclosing struct. Derivation generates
+ordinary type- and borrow-checked methods for concrete structs; supported
+field types and policies are specified in the [JSON reference](json.md) and
+the [SQLite guide](sqlite.md#mapping-rows-to-structs). Thread contracts are described in the
 [thread reference](threads.md); `@unsafe_send` and `@unsafe_sync` require the
 `unsafe` modifier on the struct (`@unsafe_send pub unsafe struct S`), and
 `unsafe` on a struct is valid only with one of them. Enum declarations support only `pub`. Unknown,

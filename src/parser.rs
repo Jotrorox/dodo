@@ -60,7 +60,7 @@ impl Parser {
             depth: 0,
             slice_first: false,
             discarded_tails: HashSet::new(),
-            json_derives: Vec::new(),
+            derive_requests: Vec::new(),
             in_interface: false,
             await_operand: false,
         }
@@ -82,7 +82,7 @@ struct Parser {
     // Explicit semicolons suppress implicit block values without changing the
     // statement AST used by semantic analysis and the backend.
     discarded_tails: HashSet<usize>,
-    json_derives: Vec<crate::json_derive::Derive>,
+    derive_requests: Vec<crate::derive::Request>,
     // Interface methods are signatures without bodies.
     in_interface: bool,
     // Parsing the operand of `await`: a trailing `?` or `!` applies to the
@@ -103,9 +103,9 @@ struct Modifiers {
     repr_c: bool,
     unsafe_send: bool,
     unsafe_sync: bool,
-    derive_json: bool,
-    json_name: Option<String>,
-    json_deny_unknown: bool,
+    // `@derive(...)` names, and attributes owned by a registered derive.
+    derives: Vec<&'static crate::derive::Spec>,
+    derive_attributes: Vec<crate::derive::Attribute>,
     interrupt: Option<String>,
     // `@link_name("symbol")`: the C symbol an extern declaration binds.
     link_name: Option<String>,
@@ -120,6 +120,10 @@ struct Modifiers {
 impl Modifiers {
     fn compiler(&self) -> bool {
         self.printing.is_some() || self.pio
+    }
+
+    fn derive_syntax(&self) -> bool {
+        !self.derives.is_empty() || !self.derive_attributes.is_empty()
     }
 }
 
@@ -287,7 +291,7 @@ impl Parser {
                 self.synchronize(cursor, true);
             }
         }
-        let derives = std::mem::take(&mut self.json_derives);
+        let derives = std::mem::take(&mut self.derive_requests);
         if !derives.is_empty() {
             let identifiers = self
                 .tokens
@@ -297,7 +301,7 @@ impl Parser {
                     _ => None,
                 })
                 .collect();
-            if let Err(error) = crate::json_derive::expand(&mut program, derives, &identifiers) {
+            if let Err(error) = crate::derive::expand(&mut program, derives, &identifiers) {
                 if !self.recover {
                     return Err(error);
                 }
@@ -382,9 +386,7 @@ impl Parser {
                 || mods.repr_c
                 || mods.unsafe_send
                 || mods.unsafe_sync
-                || mods.derive_json
-                || mods.json_deny_unknown
-                || mods.json_name.is_some()
+                || mods.derive_syntax()
                 || mods.compiler()
                 || mods.test
                 || mods.ignore.is_some()
@@ -402,9 +404,7 @@ impl Parser {
                 || mods.repr_c
                 || mods.unsafe_send
                 || mods.unsafe_sync
-                || mods.derive_json
-                || mods.json_deny_unknown
-                || mods.json_name.is_some()
+                || mods.derive_syntax()
                 || mods.compiler()
                 || mods.test
                 || mods.ignore.is_some()
@@ -414,11 +414,14 @@ impl Parser {
             program.aliases.push(self.type_alias(mods.public, start)?);
             return Ok(());
         }
-        if (mods.derive_json || mods.json_deny_unknown) && !self.at("struct") {
-            return Err(self.error("@derive(Json) and @json_deny_unknown apply only to structs"));
-        }
-        if mods.json_name.is_some() {
-            return Err(self.error("@json_name applies only to fields of @derive(Json) structs"));
+        if mods.derive_syntax() && !self.at("struct") {
+            if let Some(attribute) = mods.derive_attributes.iter().find(|attribute| {
+                crate::derive::attribute(attribute.name)
+                    .is_some_and(|(_, spec)| spec.target == crate::derive::Target::Field)
+            }) {
+                return Err(field_attribute_misplaced(attribute));
+            }
+            return Err(self.error("@derive and derive attributes apply only to structs"));
         }
         if mods.compiler() && !self.at("fn") {
             return Err(self.error("@compiler applies only to functions"));
@@ -578,39 +581,61 @@ impl Parser {
             } else if self.eat("@") {
                 let name = self.identifier()?;
                 if name == "derive" {
-                    if mods.derive_json {
-                        return Err(self.error("duplicate @derive(Json) attribute"));
-                    }
                     self.expect("(")?;
-                    if !self.eat("Json") {
-                        return Err(self.error("supported derive: @derive(Json)"));
+                    loop {
+                        let derive = self.identifier()?;
+                        let Some(spec) = crate::derive::find(&derive) else {
+                            return Err(Diagnostic::new(
+                                self.tokens[self.cursor.saturating_sub(1)].span,
+                                format!(
+                                    "unknown derive `{derive}`; supported derives: {}",
+                                    crate::derive::supported_derives()
+                                ),
+                            ));
+                        };
+                        if mods.derives.iter().any(|known| known.name == spec.name) {
+                            return Err(self.error(format!("duplicate @derive({derive})")));
+                        }
+                        mods.derives.push(spec);
+                        if !self.eat(",") || self.at(")") {
+                            break;
+                        }
                     }
                     self.expect(")")?;
-                    mods.derive_json = true;
                     self.newlines();
                     continue;
                 }
-                if name == "json_deny_unknown" {
-                    if mods.json_deny_unknown {
-                        return Err(self.error("duplicate @json_deny_unknown attribute"));
+                if let Some((owner, spec)) = crate::derive::attribute(&name) {
+                    let start = self.previous_start();
+                    if mods
+                        .derive_attributes
+                        .iter()
+                        .any(|known| known.name == spec.name)
+                    {
+                        return Err(self.error(format!("duplicate @{name} attribute")));
                     }
-                    mods.json_deny_unknown = true;
-                    self.newlines();
-                    continue;
-                }
-                if name == "json_name" {
-                    if mods.json_name.is_some() {
-                        return Err(self.error("duplicate @json_name attribute"));
-                    }
-                    self.expect("(")?;
-                    let TokenKind::String(value, false) = self.bump().kind else {
-                        return Err(self.error("@json_name expects a string field name"));
+                    let value = match spec.argument {
+                        crate::derive::Argument::Flag => None,
+                        crate::derive::Argument::Text(expected) => {
+                            self.expect("(")?;
+                            let TokenKind::String(value, false) = self.bump().kind else {
+                                return Err(self.error(format!("@{name} expects {expected}")));
+                            };
+                            let value = String::from_utf8(value).map_err(|_| {
+                                self.error(format!(
+                                    "@{name} of @derive({}) must be UTF-8",
+                                    owner.name
+                                ))
+                            })?;
+                            self.expect(")")?;
+                            Some(value)
+                        }
                     };
-                    mods.json_name = Some(
-                        String::from_utf8(value)
-                            .map_err(|_| self.error("JSON field name must be UTF-8"))?,
-                    );
-                    self.expect(")")?;
+                    mods.derive_attributes.push(crate::derive::Attribute {
+                        name: spec.name,
+                        value,
+                        span: self.since(start),
+                    });
                     self.newlines();
                     continue;
                 }
@@ -797,7 +822,9 @@ impl Parser {
                 }
                 if name != "repr" {
                     return Err(self.error(format!(
-                        "unknown attribute `@{name}`; supported: @repr(C), @unsafe_send, @unsafe_sync, @test, @ignore(\"reason\"), @derive(Json), @json_name(\"name\"), @json_deny_unknown, @interrupt(VECTOR), @link_name(\"symbol\"), @section(\"name\"), @align(N), @inline, @inline(never), @cold, @naked"
+                        "unknown attribute `@{name}`; supported: @repr(C), @unsafe_send, @unsafe_sync, @test, @ignore(\"reason\"), {}, {}, @interrupt(VECTOR), @link_name(\"symbol\"), @section(\"name\"), @align(N), @inline, @inline(never), @cold, @naked",
+                        crate::derive::supported_derives(),
+                        crate::derive::supported_attributes(),
                     )));
                 }
                 if mods.repr_c {
@@ -893,9 +920,7 @@ impl Parser {
                 || mods.repr_c
                 || mods.unsafe_send
                 || mods.unsafe_sync
-                || mods.derive_json
-                || mods.json_deny_unknown
-                || mods.json_name.is_some()
+                || mods.derive_syntax()
                 || mods.compiler()
                 || mods.test
                 || mods.ignore.is_some()
@@ -1250,8 +1275,19 @@ impl Parser {
         start: usize,
     ) -> ParseResult<()> {
         self.expect("struct")?;
-        if mods.json_deny_unknown && !mods.derive_json {
-            return Err(self.error("@json_deny_unknown requires @derive(Json)"));
+        let mut struct_attributes = Vec::new();
+        for attribute in &mods.derive_attributes {
+            let (owner, spec) = crate::derive::attribute(attribute.name).unwrap();
+            if spec.target == crate::derive::Target::Field {
+                return Err(field_attribute_misplaced(attribute));
+            }
+            if !mods.derives.iter().any(|derive| derive.name == owner.name) {
+                return Err(Diagnostic::new(
+                    attribute.span,
+                    format!("@{} requires @derive({})", attribute.name, owner.name),
+                ));
+            }
+            struct_attributes.push(attribute.clone());
         }
         let name = self.identifier()?;
         let (generics, bounds) = self.generic_params()?;
@@ -1275,22 +1311,30 @@ impl Parser {
         self.expect("{")?;
         self.separators();
         let mut fields = Vec::new();
-        let mut json_names = Vec::new();
+        let mut field_attributes = Vec::new();
         while !self.eat("}") {
             if self.eof() {
                 return Err(self.error("unclosed struct declaration; expected `}`"));
             }
             let field_start = self.span().start;
             let field_mods = self.modifiers()?;
-            if field_mods.derive_json || field_mods.json_deny_unknown {
-                return Err(
-                    self.error("@derive(Json) and @json_deny_unknown apply only to structs")
-                );
+            if !field_mods.derives.is_empty() {
+                return Err(self.error("@derive applies only to structs"));
             }
-            if field_mods.json_name.is_some() && (!mods.derive_json || self.at("fn")) {
-                return Err(
-                    self.error("@json_name applies only to fields of @derive(Json) structs")
-                );
+            for attribute in &field_mods.derive_attributes {
+                let (owner, spec) = crate::derive::attribute(attribute.name).unwrap();
+                if spec.target == crate::derive::Target::Struct {
+                    return Err(Diagnostic::new(
+                        attribute.span,
+                        format!(
+                            "@{} applies only to @derive({}) structs, not to their members",
+                            attribute.name, owner.name
+                        ),
+                    ));
+                }
+                if self.at("fn") || !mods.derives.iter().any(|derive| derive.name == owner.name) {
+                    return Err(field_attribute_misplaced(attribute));
+                }
             }
             if field_mods.compiler() && !self.at("fn") {
                 return Err(self.error("@compiler applies only to functions"));
@@ -1339,7 +1383,7 @@ impl Parser {
                 {
                     return Err(self.error("struct fields only support the `pub` modifier"));
                 }
-                let field_start = if field_mods.json_name.is_some() {
+                let field_start = if !field_mods.derive_attributes.is_empty() {
                     // Attribute text is preserved by the formatter, independently
                     // from the field declaration that follows it.
                     self.span().start
@@ -1347,7 +1391,7 @@ impl Parser {
                     field_start
                 };
                 let (field_name, ty) = self.typed_name()?;
-                json_names.push(field_mods.json_name.unwrap_or_else(|| field_name.clone()));
+                field_attributes.push(field_mods.derive_attributes);
                 fields.push(Field {
                     name: field_name,
                     ty,
@@ -1363,11 +1407,12 @@ impl Parser {
             self.separators();
         }
         self.self_type = None;
-        if mods.derive_json {
-            self.json_derives.push(crate::json_derive::Derive {
+        if !mods.derives.is_empty() {
+            self.derive_requests.push(crate::derive::Request {
                 name: name.clone(),
-                json_names,
-                deny_unknown: mods.json_deny_unknown,
+                derives: mods.derives,
+                attributes: struct_attributes,
+                fields: field_attributes,
             });
         }
         program.structs.push(Struct {
@@ -3259,6 +3304,17 @@ fn binary(token: &TokenKind) -> Option<(BinaryOp, u8, u8)> {
         _ => return None,
     };
     Some((operator, precedence, precedence + 1))
+}
+
+fn field_attribute_misplaced(attribute: &crate::derive::Attribute) -> Diagnostic {
+    let owner = crate::derive::attribute(attribute.name).map_or("", |(owner, _)| owner.name);
+    Diagnostic::new(
+        attribute.span,
+        format!(
+            "@{} applies only to fields of @derive({owner}) structs",
+            attribute.name
+        ),
+    )
 }
 
 #[cfg(test)]
