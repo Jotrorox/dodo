@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Real-time clocks share one protocol in `std/embedded/hal`: `hal.Rtc` reads
+  and sets the time as Unix milliseconds and `hal.RtcAlarm` fires once at a
+  time, with `hal.rtc_now`, `rtc_set`, `rtc_alarm_at`, and `rtc_alarm_in`
+  converting to and from `std/time`'s `DateTime`. Every board has `b.rtc`:
+  the RP2040's RTC, clocked from the crystal and counting seconds, and the
+  RP2350's always-on timer, a millisecond counter that keeps counting through
+  resets. The register-level drivers are in `std/embedded/chip/rp_rtc`, with
+  RTC_IRQ and POWMAN_IRQ_TIMER raised by their alarms.
+  `std/embedded/rtc/ds3231` drives a battery-backed DS3231 clock chip on I2C
+  through the same protocols, and `fake.Rtc` tests clock code on a desktop.
+  The Pico self-tests check the clocks and their alarms on the boards.
 - `std/embedded/hal` settles its device protocols before a second chip
   vendor arrives, so drivers written now keep working:
   - Polling forms of the buses, `hal.I2cPoll`, `hal.SpiPoll`, and, in the
