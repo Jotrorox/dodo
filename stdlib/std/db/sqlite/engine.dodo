@@ -19,7 +19,7 @@ import "std/math"
 
 // The smallest workspace for databases with 4096-byte pages (SQLite's
 // default); see min_workspace_bytes for other page sizes.
-pub const MIN_WORKSPACE_BYTES: usize = 409600
+pub const MIN_WORKSPACE_BYTES: usize = 434176
 pub const WORKSPACE_BYTES: usize = 2097152
 
 const PATH_CAP: usize = 1024
@@ -155,10 +155,9 @@ struct Engine {
     scratch_page: usize
     cell_buf: usize
     cell_buf2: usize
-    mj_off: usize
-    mj_cap: usize
-    mj_used: usize
     stamp: u64
+    // Cache slot size: the largest page size of the open databases.
+    slot_ps: usize
 
     // Database file state.
     page_size: usize
@@ -193,6 +192,27 @@ struct Engine {
     // database is created with (PRAGMA encoding).
     enc: u8
     enc_new: u8
+    // Journal bitmap slice of the current database (dbs.dodo).
+    bm_base: usize
+    bm_len: usize
+    path_off: usize
+
+    // Attached databases (dbs.dodo). The fields above hold the current
+    // database's state; the others are parked in these arrays.
+    cur_db: usize
+    ndb: usize
+    bm_used: usize
+    dbs: [12]DbSaved
+    dfile: [12]Option<fs.File>
+    djournal: [12]Option<fs.File>
+    dw: [12]WalState
+    // Database a statement writes (compile time) and the database whose
+    // objects unqualified names inside a view or trigger body refer to.
+    wdb: usize
+    fix_db: usize
+    // Databases the statement being compiled uses (bit per index).
+    db_mask: u32
+    test_crash: u32
 
     // Statement results.
     last_rowid: i64
@@ -647,17 +667,17 @@ fn gather_bytes(ps: usize, a: bool) -> usize {
 }
 
 fn sj_meta_bytes() -> usize {
-    SP_MAX * SP_ENTRY + SP_NAMES + 4096
+    (SP_MAX + 1) * SP_ENTRY + SP_NAMES + 4096
 }
 
 // Workspace bytes that depend on the page size: gather buffers, scratch
 // pages, two statement-journal records, and the smallest page cache.
 fn page_bytes(ps: usize) -> usize {
-    gather_bytes(ps, true) + gather_bytes(ps, false) + 2 * ps + 2 * (ps + 64) + 2 * (ps + 4) + MIN_CACHE_SLOTS * (ps + SLOT_META + 8) + 64 * 4
+    gather_bytes(ps, true) + gather_bytes(ps, false) + 2 * ps + 2 * (ps + 64) + 2 * (ps + 8) + MIN_CACHE_SLOTS * (ps + SLOT_META + 8) + 64 * 4
 }
 
 fn fixed_bytes() -> usize {
-    PATH_CAP + MSG_CAP + NREGS * REG_BYTES + NCURSORS * CURSOR_BYTES + MIN_SCHEMA + (STMT_SLOT_COUNT + 1) * MIN_SLOT + MIN_ARENA + MIN_SORT + MIN_KEEP + MIN_BITMAP + sj_meta_bytes() + 64
+    PATH_CAP + MSG_CAP + DB_AREA_BYTES + NREGS * REG_BYTES + NCURSORS * CURSOR_BYTES + MIN_SCHEMA + (STMT_SLOT_COUNT + 1) * MIN_SLOT + MIN_ARENA + MIN_SORT + MIN_KEEP + MIN_BITMAP + sj_meta_bytes() + 64
 }
 
 // The smallest workspace that can open a database with `page_size`-byte
@@ -668,7 +688,7 @@ pub fn min_workspace_bytes(page_size: usize) -> usize {
 }
 
 fn g_init(e: &mut Engine, g: usize, a: bool) {
-    ps := e.page_size
+    ps := e.slot_ps
     stu(e.ws, g + G_ECAP, gather_entries(ps, a))
     stu(e.ws, g + G_DOFF, G_ENTRIES + gather_entries(ps, a) * 4)
     stu(e.ws, g + G_DCAP, gather_data(ps, a))
@@ -679,7 +699,7 @@ fn g_init(e: &mut Engine, g: usize, a: bool) {
 // new database picks another page size.
 fn layout(e: &mut Engine) -> void!db.Error {
     total := e.ws.len
-    ps := e.page_size
+    ps := e.slot_ps
     need := fixed_bytes() + page_bytes(ps)
     if total < need {
         x := full(e, "workspace too small for this page size (")
@@ -689,7 +709,7 @@ fn layout(e: &mut Engine) -> void!db.Error {
     }
     // Whatever the minimums leave is shared out in proportion.
     extra := total - need
-    o := PATH_CAP + MSG_CAP
+    o := PATH_CAP + MSG_CAP + DB_AREA_BYTES
     e.schema_cap = MIN_SCHEMA + extra / 16
     e.schema_off = o
     o += e.schema_cap
@@ -721,7 +741,7 @@ fn layout(e: &mut Engine) -> void!db.Error {
     e.bitmap_bytes = MIN_BITMAP + extra / 64
     e.bitmap_off = o
     o += e.bitmap_bytes
-    e.sj_cap = sj_meta_bytes() + 2 * (ps + 4) + extra / 16
+    e.sj_cap = sj_meta_bytes() + 2 * (ps + 8) + extra / 16
     e.sj_off = o
     o += e.sj_cap
     e.tail_off = o
@@ -732,7 +752,7 @@ fn layout(e: &mut Engine) -> void!db.Error {
 // and page cache, from tail_off to the end of the workspace.
 fn layout_tail(e: &mut Engine) -> void!db.Error {
     total := e.ws.len
-    ps := e.page_size
+    ps := e.slot_ps
     sj_layout(e)
     if e.sj_ws_recs < 2 {
         return err(full(e, "workspace too small for this page size (statement journal)"))
@@ -756,21 +776,8 @@ fn layout_tail(e: &mut Engine) -> void!db.Error {
         return err(full(e, "workspace too small for this page size"))
     }
     remaining := total - o
-    if e.memory {
-        // In-memory databases keep rollback images in a memory journal.
-        e.mj_cap = remaining / 3
-        floor := MIN_CACHE_SLOTS * (ps + SLOT_META + 8) + 64 * 4
-        if remaining - e.mj_cap < floor {
-            e.mj_cap = if remaining > floor {
-                remaining - floor
-            } else {
-                0usize
-            }
-        }
-        e.mj_off = o
-        o += e.mj_cap
-        remaining = total - o
-    }
+    // In-memory databases keep their pages and rollback images in the
+    // cache (pinned until they are dropped).
     per_slot := ps + SLOT_META + 8
     slots := remaining / per_slot
     if slots < MIN_CACHE_SLOTS {

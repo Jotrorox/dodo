@@ -125,6 +125,14 @@ pub struct Connection {
         self.e.explicit_txn
     }
 
+    // Test hook for crash-recovery tests: the process aborts at `point` of
+    // the next multi-file commit (1: super-journal written, 2: first
+    // database file written, 3: all files written, 4: super-journal
+    // deleted). 0 disables it.
+    pub fn set_crash_point_for_testing(&mut self, point: u32) {
+        self.e.test_crash = point
+    }
+
     // Waits up to `milliseconds` for other processes' locks (like
     // sqlite3_busy_timeout).
     pub fn set_busy_timeout(&mut self, milliseconds: u32) {
@@ -355,18 +363,19 @@ fn prepare_one(e: &mut Engine, slot: usize, sql: &str) -> void!db.Error {
     if e.active == slot {
         stmt_finish(e, slot, true)?
     }
-    // Schema resolution needs the current schema.
-    begin_read(e)?
+    // Schema resolution needs the current schema (of every database:
+    // read transactions this starts end afterwards, even inside BEGIN).
+    fresh := begin_read_mask(e, 4095)?
     r := load_schema(e)
     match r {
         ok() => {},
         err(reason) => {
-            end_read(e)
+            release_reads(e, fresh)
             return err(reason)
         },
     }
     res := prepare_slot(e, slot, bytes)
-    end_read(e)
+    release_reads(e, fresh)
     res?
     tail := sh(e, slot, SH_TAIL)
     if tail < bytes.len {

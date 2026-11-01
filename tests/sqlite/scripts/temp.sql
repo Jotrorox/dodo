@@ -1,0 +1,128 @@
+-- The TEMP database: CREATE TEMP TABLE/VIEW/TRIGGER, indexes on temporary
+-- tables, name resolution (temp first), sqlite_temp_master, transactions.
+pragma database_list;
+create table t(id integer primary key, v text);
+insert into t values (1, 'main'), (2, 'main2');
+select * from sqlite_temp_master;
+pragma database_list;
+create temp table tt(a integer primary key, b text unique, c);
+create temporary table t(id integer primary key, v text);
+pragma database_list;
+insert into t values (10, 'temp');
+insert into tt(b, c) values ('x', 1), ('y', 2);
+select * from t;
+select * from main.t order by id;
+select * from temp.t;
+select * from tt;
+select type, name, tbl_name, rootpage, sql from sqlite_temp_master order by name;
+select type, name, tbl_name, rootpage, sql from temp.sqlite_master order by name;
+select type, name, tbl_name, sql from sqlite_temp_schema order by name;
+select type, name from sqlite_master order by name;
+-- Indexes on temporary tables go into TEMP.
+create index tt_c on tt(c);
+create index temp.tt_bc on tt(b, c);
+create index t_v on t(v);
+select type, name, tbl_name from sqlite_temp_master where type = 'index' order by name;
+select type, name, tbl_name from main.sqlite_master where type = 'index' order by name;
+select c from tt where c = 2;
+pragma temp.index_list(tt);
+pragma temp.table_info(t);
+pragma table_info(tt);
+-- Errors.
+create temp table main.x(y);
+create temp view main.vx as select 1;
+create temp table tt(z);
+create table temp.tt(z);
+insert into tt(b) values ('x');
+-- Views.
+create temp view tv as select id, v from main.t;
+create temp view tv2 as select * from t;
+select * from tv order by id;
+select * from tv2;
+create view mv as select count(*) from t;
+select * from mv;
+select type, name, sql from sqlite_temp_master where type = 'view' order by name;
+-- Temporary triggers may watch and write tables of other databases.
+create table log(msg);
+create temp trigger tr_main after insert on main.t begin insert into main.log values ('main.t ' || new.id); end;
+create temp trigger tr_temp after insert on t begin insert into log values ('temp.t ' || new.id); end;
+insert into main.t values (3, 'm3');
+insert into t values (11, 't11');
+insert into temp.t values (12, 't12');
+select * from log order by rowid;
+select type, name, tbl_name, sql from sqlite_temp_master where type = 'trigger' order by name;
+create temp trigger tr_upd before update on main.t begin insert into log values ('update ' || old.id || ' -> ' || new.v); end;
+update main.t set v = 'changed' where id = 1;
+select * from log order by rowid;
+-- A trigger stored in main sees main's tables only.
+create trigger m_trig after delete on t begin insert into log values ('main trigger ' || old.id); end;
+delete from main.t where id = 3;
+delete from t where id = 12;
+select * from log order by rowid;
+-- Transactions include TEMP.
+begin;
+insert into tt(b, c) values ('in txn', 3);
+insert into main.t values (4, 'txn');
+rollback;
+select count(*) from tt;
+select count(*) from main.t;
+begin;
+insert into tt(b, c) values ('kept', 4);
+insert into main.t values (5, 'kept');
+commit;
+select b from tt order by a;
+select v from main.t order by id;
+begin;
+insert into tt(b, c) values ('stmt', 5);
+insert into tt(b, c) values ('x', 6);
+select b from tt order by a;
+commit;
+savepoint s1;
+delete from tt;
+insert into t values (20, 'sp');
+rollback to s1;
+release s1;
+select count(*) from tt;
+select count(*) from t;
+-- Many rows: TEMP pages stay in the cache, rollback restores them.
+create temp table big(n integer primary key, s text);
+insert into big(s) values ('first');
+insert into big(s) select s || n from big;
+insert into big(s) select s || n from big;
+insert into big(s) select s || n from big;
+insert into big(s) select s || n from big;
+insert into big(s) select s || n from big;
+insert into big(s) select s || n from big;
+insert into big(s) select s || n from big;
+insert into big(s) select s || n from big;
+insert into big(s) select hex(randomblob(40)) from big;
+create index big_s on big(s);
+select count(*), max(n) from big;
+begin;
+delete from big where n % 3 = 0;
+update big set s = 'x' || s;
+select count(*) from big;
+rollback;
+select count(*), sum(length(s)) > 0 from big;
+pragma temp.integrity_check;
+pragma integrity_check;
+-- ALTER and DROP of temporary objects.
+alter table tt add column d default 'dd';
+select * from tt order by a;
+alter table temp.tt rename to tt2;
+select type, name, tbl_name from sqlite_temp_master where tbl_name = 'tt2' order by name;
+drop trigger tr_main;
+drop view tv;
+drop table t;
+select * from t order by id;
+drop table temp.big;
+drop table tt2;
+select type, name from sqlite_temp_master order by name;
+pragma temp.journal_mode;
+pragma database_list;
+-- The TEMP database keeps working after main's schema changes.
+create table after(x);
+create temp table t3(y);
+insert into t3 values (1);
+insert into after select y from t3;
+select * from after;

@@ -143,12 +143,19 @@ fn lookup_in(e: &mut Engine, src: usize, n: usize) -> (usize, usize, bool) {
     ql := ndd(e, n)
     name := na(e, n)
     nl := nb(e, n)
+    qdb := ndb_of(e, n)
     found := 0usize
     found_col := NO_COL
     ambiguous := false
     s := src
     for s != 0 {
         t := ng(e, s)
+        if qdb != NO_DB && (t >= LOCAL_OBJ || obj_db(e, t) != qdb || ndd(e, s) != 0) {
+            // schema.table.column names a table of that database (not an
+            // alias).
+            s = nnext(e, s)
+            continue
+        }
         if ql != 0 {
             let s_c = nc(e, s)
             let s_d = ndd(e, s)
@@ -751,7 +758,12 @@ fn resolve_core(e: &mut Engine, s: usize, own_order: bool) -> void!db.Error {
         } else {
             let tn = na(e, src)
             let tl = nb(e, src)
-            ci := cte_find(e, tn, tl)
+            let q = ndb_of(e, src)
+            ci := if q == NO_DB {
+                cte_find(e, tn, tl)
+            } else {
+                NO_COL
+            }
             if ci != NO_COL {
                 let (cs, ct) = cte_source(e, ci, src)?
                 if cs == QUEUE_SOURCE {
@@ -761,15 +773,39 @@ fn resolve_core(e: &mut Engine, s: usize, own_order: bool) -> void!db.Error {
                 }
                 t = ct
             } else {
-                t = find_obj(e, OT_TABLE, tn, tl)
+                ldb := lookup_db(e, q)
+                t = find_obj(e, ldb, OT_TABLE, tn, tl)
+                v := find_obj(e, ldb, OT_VIEW, tn, tl)
+                if v != NO_COL && t != NO_COL && db_rank(obj_db(e, v)) < db_rank(obj_db(e, t)) {
+                    t = NO_COL
+                }
                 if t == NO_COL {
-                    v := find_obj(e, OT_VIEW, tn, tl)
                     if v != NO_COL {
+                        let vdb0 = obj_db(e, v)
+                        mark_db(e, vdb0)
                         let (vsel, vcols) = view_select(e, v)?
                         sub = vsel
-                        t = subquery_obj(e, sub, vcols, src)?
+                        // A view's body names objects of its own database
+                        // (TEMP views use the normal search order).
+                        save_fix := e.fix_db
+                        let vdb = obj_db(e, v)
+                        e.fix_db = if vdb == DB_TEMP {
+                            NO_DB
+                        } else {
+                            vdb
+                        }
+                        r := subquery_obj(e, sub, vcols, src)
+                        e.fix_db = save_fix
+                        t = r?
                     } else if name_is(e, tn, tl, "sqlite_schema") || name_is(e, tn, tl, "sqlite_master") {
-                        t = schema_table_obj(e)?
+                        sdb := if ldb == NO_DB {
+                            0usize
+                        } else {
+                            ldb
+                        }
+                        t = schema_table_obj(e, sdb)?
+                    } else if (ldb == NO_DB || ldb == DB_TEMP) && (name_is(e, tn, tl, "sqlite_temp_schema") || name_is(e, tn, tl, "sqlite_temp_master")) {
+                        t = schema_table_obj(e, DB_TEMP)?
                     } else {
                         e.msg_len = 0
                         msg_add(e, "no such table: ")
@@ -781,6 +817,10 @@ fn resolve_core(e: &mut Engine, s: usize, own_order: bool) -> void!db.Error {
         }
         if (obj_flags(e, t) & OF_UNSUPPORTED) != 0 {
             return err(fail(e, SQLITE_ERROR, "table uses unsupported features"))
+        }
+        if t < LOCAL_OBJ {
+            let tdb = obj_db(e, t)
+            mark_db(e, tdb)
         }
         c := alloc_cursor(e)?
         set_nf(e, src, 6, t)
@@ -1117,12 +1157,15 @@ fn view_select(e: &mut Engine, v: usize) -> (usize, usize)!db.Error {
     ok((ndd(e, vs), nc(e, vs)))
 }
 
-fn schema_table_obj(e: &mut Engine) -> usize!db.Error {
+fn schema_table_obj(e: &mut Engine, db: usize) -> usize!db.Error {
     // A synthetic catalog entry for sqlite_schema (root page 1).
     for i in 0usize..e.schema_objs {
-        if obj_type(e, i) == OT_TABLE && obj_root(e, i) == 1 {
+        if obj_type(e, i) == OT_TABLE && obj_root(e, i) == 1 && obj_db(e, i) == db {
             return ok(i)
         }
+    }
+    if db == DB_TEMP {
+        temp_open(e)?
     }
     i := new_obj(e)?
     names := ["type", "name", "tbl_name", "rootpage", "sql"]
@@ -1145,6 +1188,7 @@ fn schema_table_obj(e: &mut Engine) -> usize!db.Error {
     copy_in(e.ws, d, nm)
     o := obj(e, i)
     e.ws[o + O_TYPE] = OT_TABLE
+    e.ws[o + O_DB] = db as u8
     st16(e.ws, o + O_NCOL, 5)
     st32(e.ws, o + O_ROOT, 1)
     stu(e.ws, o + O_NAME, d)
@@ -1910,6 +1954,8 @@ fn level_reset(e: &mut Engine, info: usize) {
 }
 
 fn open_index_cursor(e: &mut Engine, ic: usize, x: usize) {
+    let odb = obj_db(e, x)
+    use_db(e, odb)
     let root = obj_root(e, x)
     cur_open(e, ic, root, true)
     o := cur(e, ic)
@@ -1937,6 +1983,8 @@ fn open_index_cursor(e: &mut Engine, ic: usize, x: usize) {
 // Opens a cursor on a table: rowid tables are table b-trees; WITHOUT ROWID
 // tables are index b-trees ordered by their PRIMARY KEY.
 fn open_table_cursor(e: &mut Engine, c: usize, t: usize) {
+    let odb = obj_db(e, t)
+    use_db(e, odb)
     let root = obj_root(e, t)
     if !is_wr(e, t) {
         cur_open(e, c, root, false)

@@ -74,8 +74,13 @@ fn schema_update(e: &mut Engine, rowid: i64, name: usize, nl: usize, tbl: usize,
     table_insert(e, c, rowid, rec, size)
 }
 
-// Increments the schema cookie and reloads the catalog.
+// Increments the current database's schema cookie and reloads the catalog.
 fn schema_changed(e: &mut Engine) -> void!db.Error {
+    schema_cookie_bump(e)?
+    load_schema(e)
+}
+
+fn schema_cookie_bump(e: &mut Engine) -> void!db.Error {
     cookie := hdr_get(e, 40)?
     hdr_set(e, 40, core.wrapping_add(cookie, 1u32))?
     if hdr_get(e, 44)? < 4 {
@@ -85,11 +90,11 @@ fn schema_changed(e: &mut Engine) -> void!db.Error {
     }
     e.schema_cookie = core.wrapping_add(cookie, 1u32)
     e.schema_loaded = false
-    load_schema(e)
+    ok()
 }
 
-fn name_taken(e: &mut Engine, o: usize, l: usize) -> db.Error {
-    t := find_obj(e, 0, o, l)
+fn name_taken(e: &mut Engine, d: usize, o: usize, l: usize) -> db.Error {
+    t := find_obj(e, d, 0, o, l)
     e.msg_len = 0
     if t != NO_COL && obj_type(e, t) == OT_INDEX {
         msg_add(e, "there is already an index named ")
@@ -120,11 +125,13 @@ fn normalized_sql(e: &mut Engine, prefix: &str, start: usize, end: usize) -> (us
 fn exec_create_table(e: &mut Engine, s: usize) -> void!db.Error {
     name := na(e, s)
     nl := nb(e, s)
-    if find_obj(e, 0, name, nl) != NO_COL {
-        if (nflags(e, s) & 1) != 0 && find_obj(e, OT_TABLE, name, nl) != NO_COL {
+    d := stmt_target_db(e, s)
+    enter_db(e, d)?
+    if find_obj(e, d, 0, name, nl) != NO_COL {
+        if (nflags(e, s) & 1) != 0 && find_obj(e, d, OT_TABLE, name, nl) != NO_COL {
             return ok()
         }
-        return err(name_taken(e, name, nl))
+        return err(name_taken(e, d, name, nl))
     }
     if reserved_name(e, name, nl) && !name_is(e, name, nl, "sqlite_sequence") {
         e.msg_len = 0
@@ -136,6 +143,7 @@ fn exec_create_table(e: &mut Engine, s: usize) -> void!db.Error {
     t := new_obj(e)?
     o := obj(e, t)
     e.ws[o + O_TYPE] = OT_TABLE
+    e.ws[o + O_DB] = d as u8
     stu(e.ws, o + O_NAME, name)
     stu(e.ws, o + O_NAMEL, nl)
     table_from_ast(e, t, s)?
@@ -189,10 +197,10 @@ fn exec_create_table(e: &mut Engine, s: usize) -> void!db.Error {
         iroot := btree_create(e, true)?
         schema_insert(e, "index", io, m, name, nl, iroot, 0, 0)?
     }
-    if autoinc && find_obj(e, OT_TABLE, 0, 0) == NO_COL {
+    if autoinc {
         seqo := arena_alloc(e, 15)?
         copy_in(e.ws, seqo, mem_bytes("sqlite_sequence"))
-        if find_obj(e, OT_TABLE, seqo, 15) == NO_COL {
+        if find_obj(e, d, OT_TABLE, seqo, 15) == NO_COL {
             sroot := btree_create(e, false)?
             sq := mem_bytes("CREATE TABLE sqlite_sequence(name,seq)")
             so := arena_alloc(e, sq.len)?
@@ -206,12 +214,14 @@ fn exec_create_table(e: &mut Engine, s: usize) -> void!db.Error {
 fn exec_create_view(e: &mut Engine, s: usize) -> void!db.Error {
     name := na(e, s)
     nl := nb(e, s)
-    if find_obj(e, 0, name, nl) != NO_COL {
-        if (nflags(e, s) & 1) != 0 && find_obj(e, OT_VIEW, name, nl) != NO_COL {
+    d := stmt_target_db(e, s)
+    enter_db(e, d)?
+    if find_obj(e, d, 0, name, nl) != NO_COL {
+        if (nflags(e, s) & 1) != 0 && find_obj(e, d, OT_VIEW, name, nl) != NO_COL {
             return ok()
         }
         e.msg_len = 0
-        let value = if find_obj(e, OT_VIEW, name, nl) != NO_COL {
+        let value = if find_obj(e, d, OT_VIEW, name, nl) != NO_COL {
             "view "
         } else {
             "table "
@@ -227,6 +237,9 @@ fn exec_create_view(e: &mut Engine, s: usize) -> void!db.Error {
         msg_add_ws(e, name, nl)
         return err(make_error(e, SQLITE_ERROR))
     }
+    if d != DB_TEMP {
+        check_fixed_refs(e, "view", name, nl, d, false)?
+    }
     let start = ne_(e, s)
     let end = nff(e, s)
     let (sql, sqll) = normalized_sql(e, "CREATE VIEW ", start, end)?
@@ -237,11 +250,14 @@ fn exec_create_view(e: &mut Engine, s: usize) -> void!db.Error {
 fn exec_create_index(e: &mut Engine, s: usize) -> void!db.Error {
     name := na(e, s)
     nl := nb(e, s)
-    if find_obj(e, 0, name, nl) != NO_COL {
-        if (nflags(e, s) & 1) != 0 && find_obj(e, OT_INDEX, name, nl) != NO_COL {
+    // The index goes into its table's database.
+    d := stmt_target_db(e, s)
+    enter_db(e, d)?
+    if find_obj(e, d, 0, name, nl) != NO_COL {
+        if (nflags(e, s) & 1) != 0 && find_obj(e, d, OT_INDEX, name, nl) != NO_COL {
             return ok()
         }
-        return err(name_taken(e, name, nl))
+        return err(name_taken(e, d, name, nl))
     }
     if reserved_name(e, name, nl) {
         e.msg_len = 0
@@ -251,7 +267,7 @@ fn exec_create_index(e: &mut Engine, s: usize) -> void!db.Error {
     }
     let s_c = nc(e, s)
     let s_d = ndd(e, s)
-    t := find_obj(e, OT_TABLE, s_c, s_d)
+    t := find_obj(e, d, OT_TABLE, s_c, s_d)
     if t == NO_COL {
         e.msg_len = 0
         msg_add(e, "no such table: ")
@@ -269,6 +285,7 @@ fn exec_create_index(e: &mut Engine, s: usize) -> void!db.Error {
     x := new_obj(e)?
     o := obj(e, x)
     e.ws[o + O_TYPE] = OT_INDEX
+    e.ws[o + O_DB] = d as u8
     stu(e.ws, o + O_TABLE, t)
     match index_from_ast(e, x, t, s) {
         ok() => {},
@@ -424,7 +441,8 @@ fn exec_drop(e: &mut Engine, s: usize) -> void!db.Error {
     } else {
         OT_INDEX
     }
-    i := find_obj(e, kind, name, nl)
+    let q = ndb_of(e, s)
+    i := find_obj(e, q, kind, name, nl)
     if i == NO_COL {
         if (nflags(e, s) & 1) != 0 {
             return ok()
@@ -442,22 +460,36 @@ fn exec_drop(e: &mut Engine, s: usize) -> void!db.Error {
         msg_add_ws(e, name, nl)
         return err(make_error(e, SQLITE_ERROR))
     }
+    d := obj_db(e, i)
+    enter_db(e, d)?
+    temp_changed := false
     if kind == OT_TABLE {
         if reserved_name(e, name, nl) && !name_is(e, name, nl, "sqlite_sequence") || obj_root(e, i) == 1 {
             return err(fail(e, SQLITE_ERROR, "table sqlite_master may not be dropped"))
         }
-        // Indexes and triggers of the table go with it.
+        // Indexes and triggers of the table go with it (TEMP triggers on
+        // it too).
         for j in 0usize..e.schema_objs {
             k := obj_type(e, j)
             let tbl = obj_u(e, j, O_TBL)
             let tbl_len = obj_u(e, j, O_TBLL)
-            if (k == OT_INDEX || k == OT_TRIGGER) && names_eq(e, tbl, tbl_len, name, nl) {
+            let jd = obj_db(e, j)
+            link := obj_u(e, j, O_TABLE)
+            mine := jd == d && names_eq(e, tbl, tbl_len, name, nl) && (k == OT_INDEX || k == OT_TRIGGER && (link == i || link == NO_COL))
+            other := jd != d && k == OT_TRIGGER && link == i
+            if mine {
                 if k == OT_INDEX && obj_root(e, j) != 0 {
                     let root = obj_root(e, j)
                     btree_drop(e, root)?
                 }
                 let schema_rowid = obj_u(e, j, O_ROWNO) as i64
                 schema_delete(e, schema_rowid)?
+            } else if other {
+                let schema_rowid_t = obj_u(e, j, O_ROWNO) as i64
+                use_db(e, jd)
+                schema_delete(e, schema_rowid_t)?
+                use_db(e, d)
+                temp_changed = true
             }
         }
         let root2 = obj_root(e, i)
@@ -468,7 +500,7 @@ fn exec_drop(e: &mut Engine, s: usize) -> void!db.Error {
         for j in 0usize..e.schema_objs {
             let name2 = obj_u(e, j, O_NAME)
             let name_len = obj_u(e, j, O_NAMEL)
-            if obj_type(e, j) == OT_TABLE && name_is(e, name2, name_len, "sqlite_sequence") {
+            if obj_type(e, j) == OT_TABLE && obj_db(e, j) == d && name_is(e, name2, name_len, "sqlite_sequence") {
                 let root3 = obj_root(e, j)
                 drop_sequence_row(e, root3, name, nl)?
             }
@@ -477,7 +509,13 @@ fn exec_drop(e: &mut Engine, s: usize) -> void!db.Error {
         for j in 0usize..e.schema_objs {
             if obj_type(e, j) == OT_TRIGGER && obj_u(e, j, O_TABLE) == i {
                 let trow = obj_u(e, j, O_ROWNO) as i64
+                let jd2 = obj_db(e, j)
+                use_db(e, jd2)
                 schema_delete(e, trow)?
+                use_db(e, d)
+                if jd2 != d {
+                    temp_changed = true
+                }
             }
         }
         let rowno = obj_u(e, i, O_ROWNO) as i64
@@ -493,6 +531,11 @@ fn exec_drop(e: &mut Engine, s: usize) -> void!db.Error {
         btree_drop(e, root4)?
         let schema_rowid3 = obj_u(e, i, O_ROWNO) as i64
         schema_delete(e, schema_rowid3)?
+    }
+    if temp_changed {
+        use_db(e, DB_TEMP)
+        schema_cookie_bump(e)?
+        use_db(e, d)
     }
     schema_changed(e)
 }
@@ -589,7 +632,12 @@ fn quoted_name(e: &mut Engine, o: usize, l: usize) -> (usize, usize)!db.Error {
 fn exec_alter(e: &mut Engine, s: usize) -> void!db.Error {
     name := na(e, s)
     nl := nb(e, s)
-    t := find_obj(e, OT_TABLE, name, nl)
+    let q = ndb_of(e, s)
+    t := find_obj(e, q, OT_TABLE, name, nl)
+    if t != NO_COL {
+        let td = obj_db(e, t)
+        enter_db(e, td)?
+    }
     if t == NO_COL {
         e.msg_len = 0
         msg_add(e, "no such table: ")
@@ -610,7 +658,8 @@ fn exec_alter(e: &mut Engine, s: usize) -> void!db.Error {
         // RENAME TO
         nn := nc(e, s)
         nnl := ndd(e, s)
-        if find_obj(e, 0, nn, nnl) != NO_COL {
+        let adb = obj_db(e, t)
+        if find_obj(e, adb, 0, nn, nnl) != NO_COL {
             e.msg_len = 0
             msg_add(e, "there is already another table or index with this name: ")
             msg_add_ws(e, nn, nnl)
@@ -633,7 +682,7 @@ fn exec_alter(e: &mut Engine, s: usize) -> void!db.Error {
         for j in 0usize..e.schema_objs {
             let tbl = obj_u(e, j, O_TBL)
             let tbl_len = obj_u(e, j, O_TBLL)
-            if obj_type(e, j) != OT_INDEX || !names_eq(e, tbl, tbl_len, name, nl) {
+            if obj_type(e, j) != OT_INDEX || obj_db(e, j) != adb || !names_eq(e, tbl, tbl_len, name, nl) {
                 continue
             }
             isql := obj_u(e, j, O_SQL)
@@ -1461,7 +1510,7 @@ fn rename_table_refs(e: &mut Engine, t: usize, old: usize, ol: usize, nn: usize,
     edits := arena_alloc(e, EDIT_MAX * 8)?
     for j in 0usize..e.schema_objs {
         k := obj_type(e, j)
-        if j == t || k == OT_INDEX {
+        if j == t || k == OT_INDEX || obj_db(e, j) != obj_db(e, t) {
             continue
         }
         sql := obj_u(e, j, O_SQL)
@@ -1500,6 +1549,9 @@ fn rename_column_refs(e: &mut Engine, t: usize, co: usize, cl: usize, qo: usize,
     edits := arena_alloc(e, EDIT_MAX * 8)?
     for j in 0usize..e.schema_objs {
         k := obj_type(e, j)
+        if obj_db(e, j) != obj_db(e, t) {
+            continue
+        }
         if k == OT_TABLE && j != t {
             // Foreign keys: REFERENCES t(col, ...).
             sql0 := obj_u(e, j, O_SQL)

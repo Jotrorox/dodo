@@ -17,6 +17,8 @@ const C_PAYVALID: usize = 7
 const C_NKEY: usize = 8
 const C_NULLROW: usize = 12
 const C_OPEN: usize = 13
+// The database of the cursor's b-tree.
+const C_DB: usize = 14
 const C_ROWID: usize = 16
 const C_PAYOFF: usize = 24
 const C_PAYLEN: usize = 28
@@ -126,6 +128,16 @@ fn cur_open(e: &mut Engine, c: usize, root: u32, index: bool) {
         0
     }
     e.ws[o + C_OPEN] = 1
+    let db = e.cur_db as u8
+    e.ws[o + C_DB] = db
+}
+
+// Makes the cursor's database current (cursor entry points call this).
+fn cursor_db(e: &mut Engine, c: usize) {
+    k := e.ws[cur(e, c) + C_DB] as usize
+    if k != e.cur_db {
+        use_db(e, k)
+    }
 }
 
 fn cur_is_index(e: &Engine, c: usize) -> bool {
@@ -235,6 +247,7 @@ fn load_payload(e: &mut Engine, cell: usize, t: u8) -> (usize, usize)!db.Error {
 
 // Payload of the entry under cursor `c`, cached in the arena.
 fn cur_payload(e: &mut Engine, c: usize) -> (usize, usize)!db.Error {
+    cursor_db(e, c)
     o := cur(e, c)
     if e.ws[o + C_PAYVALID] != 0 {
         return ok((ldu(e.ws, o + C_PAYOFF), ldu(e.ws, o + C_PAYLEN)))
@@ -273,6 +286,7 @@ fn page_type(e: &mut Engine, pgno: u32) -> u8!db.Error {
 }
 
 fn cur_root(e: &mut Engine, c: usize) {
+    cursor_db(e, c)
     root := ld32(e.ws, cur(e, c) + C_ROOT)
     set_path(e, c, 0, root, 0)
     set_depth(e, c, 1)
@@ -280,6 +294,7 @@ fn cur_root(e: &mut Engine, c: usize) {
 }
 
 fn push(e: &mut Engine, c: usize, pgno: u32, idx: usize) -> void!db.Error {
+    cursor_db(e, c)
     dp := depth(e, c)
     if dp >= MAX_DEPTH {
         return err(corrupt(e))
@@ -290,6 +305,7 @@ fn push(e: &mut Engine, c: usize, pgno: u32, idx: usize) -> void!db.Error {
 }
 
 fn load_rowid(e: &mut Engine, c: usize) -> void!db.Error {
+    cursor_db(e, c)
     if cur_is_index(e, c) {
         return ok()
     }
@@ -309,6 +325,7 @@ fn load_rowid(e: &mut Engine, c: usize) -> void!db.Error {
 // Descends from the current top (an interior page with its index set) to
 // the leftmost leaf below the selected child.
 fn descend_left(e: &mut Engine, c: usize) -> void!db.Error {
+    cursor_db(e, c)
     for {
         level := depth(e, c) - 1
         pg := path_pg(e, c, level)
@@ -325,6 +342,7 @@ fn descend_left(e: &mut Engine, c: usize) -> void!db.Error {
 }
 
 fn top_count(e: &mut Engine, c: usize) -> (u8, usize)!db.Error {
+    cursor_db(e, c)
     level := depth(e, c) - 1
     pg := path_pg(e, c, level)
     t := page_type(e, pg)?
@@ -333,6 +351,12 @@ fn top_count(e: &mut Engine, c: usize) -> (u8, usize)!db.Error {
 }
 
 fn cur_first(e: &mut Engine, c: usize) -> bool!db.Error {
+    cursor_db(e, c)
+    if e.db_pages == 0 {
+        // An empty database file (its sqlite_schema has no page yet).
+        set_state(e, c, ST_EOF)
+        return ok(false)
+    }
     cur_root(e, c)
     descend_left(e, c)?
     let (_, n) = top_count(e, c)?
@@ -346,6 +370,12 @@ fn cur_first(e: &mut Engine, c: usize) -> bool!db.Error {
 }
 
 fn cur_last(e: &mut Engine, c: usize) -> bool!db.Error {
+    cursor_db(e, c)
+    if e.db_pages == 0 {
+        // An empty database file (its sqlite_schema has no page yet).
+        set_state(e, c, ST_EOF)
+        return ok(false)
+    }
     cur_root(e, c)
     root := path_pg(e, c, 0)
     t := page_type(e, root)?
@@ -375,6 +405,7 @@ fn cur_last(e: &mut Engine, c: usize) -> bool!db.Error {
 
 // The top page is newly pushed; walk right-most children down to a leaf.
 fn descend_right_from_top(e: &mut Engine, c: usize) -> void!db.Error {
+    cursor_db(e, c)
     for {
         level := depth(e, c) - 1
         pg := path_pg(e, c, level)
@@ -397,6 +428,7 @@ fn descend_right_from_top(e: &mut Engine, c: usize) -> void!db.Error {
 
 // Climbs after the top leaf is exhausted; positions on the next entry.
 fn climb_next(e: &mut Engine, c: usize) -> bool!db.Error {
+    cursor_db(e, c)
     index := cur_is_index(e, c)
     for {
         dp := depth(e, c)
@@ -431,6 +463,7 @@ fn climb_next(e: &mut Engine, c: usize) -> bool!db.Error {
 }
 
 fn cur_next(e: &mut Engine, c: usize) -> bool!db.Error {
+    cursor_db(e, c)
     o := cur(e, c)
     if e.ws[o + C_STATE] != ST_VALID {
         return ok(false)
@@ -462,6 +495,7 @@ fn cur_next(e: &mut Engine, c: usize) -> bool!db.Error {
 }
 
 fn cur_prev(e: &mut Engine, c: usize) -> bool!db.Error {
+    cursor_db(e, c)
     o := cur(e, c)
     if e.ws[o + C_STATE] != ST_VALID {
         return ok(false)
@@ -522,6 +556,12 @@ fn cur_prev(e: &mut Engine, c: usize) -> bool!db.Error {
 // Positions on `rowid`. Returns true when found; otherwise the top leaf
 // index is the insertion point.
 fn seek_rowid(e: &mut Engine, c: usize, rowid: i64) -> bool!db.Error {
+    cursor_db(e, c)
+    if e.db_pages == 0 {
+        // An empty database file (its sqlite_schema has no page yet).
+        set_state(e, c, ST_EOF)
+        return ok(false)
+    }
     cur_root(e, c)
     for {
         level := depth(e, c) - 1
@@ -569,6 +609,7 @@ fn seek_rowid(e: &mut Engine, c: usize, rowid: i64) -> bool!db.Error {
 
 // After a failed seek, moves to the first entry after the insertion point.
 fn settle_forward(e: &mut Engine, c: usize) -> bool!db.Error {
+    cursor_db(e, c)
     level := depth(e, c) - 1
     pg := path_pg(e, c, level)
     d := pg_fetch(e, pg)?
@@ -604,6 +645,7 @@ fn cell_compare(e: &mut Engine, pg: u32, idx: usize, key: usize, nkey: usize, in
 // Returns 0 when that entry's prefix equals the key, nonzero otherwise
 // (also when no such entry exists, with the cursor at EOF).
 fn seek_index(e: &mut Engine, c: usize, key: usize, nkey: usize) -> i32!db.Error {
+    cursor_db(e, c)
     info := cur(e, c) + C_INFO
     cur_root(e, c)
     for {
@@ -644,6 +686,7 @@ fn seek_index(e: &mut Engine, c: usize, key: usize, nkey: usize) -> i32!db.Error
 
 // Descends to the leaf position where key would be inserted.
 fn seek_index_leaf(e: &mut Engine, c: usize, key: usize, nkey: usize) -> void!db.Error {
+    cursor_db(e, c)
     info := cur(e, c) + C_INFO
     cur_root(e, c)
     for {
@@ -1034,6 +1077,7 @@ fn interior_of(t: u8) -> u8 {
 }
 
 fn rebalance(e: &mut Engine, c: usize, level: usize) -> void!db.Error {
+    cursor_db(e, c)
     gb := e.gather_b
     ga := e.gather_a
     lv := level
@@ -1272,6 +1316,7 @@ fn rebalance(e: &mut Engine, c: usize, level: usize) -> void!db.Error {
 // Root with virtual content in B: write it, deepen the tree, or (when an
 // interior root lost its last divider) pull its only child up.
 fn balance_root(e: &mut Engine, c: usize) -> void!db.Error {
+    cursor_db(e, c)
     gb := e.gather_b
     ga := e.gather_a
     root := path_pg(e, c, 0)
@@ -1314,6 +1359,7 @@ fn balance_root(e: &mut Engine, c: usize) -> void!db.Error {
 
 // Inserts a prepared cell at the cursor's leaf position.
 fn insert_cell_at_cursor(e: &mut Engine, c: usize, cell: usize, size: usize) -> void!db.Error {
+    cursor_db(e, c)
     level := depth(e, c) - 1
     pg := path_pg(e, c, level)
     idx := path_idx(e, c, level)
@@ -1363,6 +1409,7 @@ fn insert_cell_at_cursor(e: &mut Engine, c: usize, cell: usize, size: usize) -> 
 }
 
 fn table_insert(e: &mut Engine, c: usize, rowid: i64, rec: usize, len: usize) -> void!db.Error {
+    cursor_db(e, c)
     if seek_rowid(e, c, rowid)? {
         cur_delete(e, c)?
         seek_rowid(e, c, rowid)?
@@ -1376,6 +1423,7 @@ fn table_insert(e: &mut Engine, c: usize, rowid: i64, rec: usize, len: usize) ->
 // Inserts an index record (key fields followed by the rowid). The record's
 // fields are decoded into the btree key registers for positioning.
 fn index_insert(e: &mut Engine, c: usize, rec: usize, len: usize) -> void!db.Error {
+    cursor_db(e, c)
     nkey := record_to_regs(e, rec, len, R_BTKEY)?
     seek_index_leaf(e, c, R_BTKEY, nkey)?
     let cell_buf2 = e.cell_buf
@@ -1409,6 +1457,7 @@ fn record_to_regs(e: &mut Engine, rec: usize, len: usize, first: usize) -> usize
 
 // Removes the leaf cell under the cursor and rebalances if needed.
 fn leaf_delete(e: &mut Engine, c: usize, free_ovfl: bool) -> void!db.Error {
+    cursor_db(e, c)
     level := depth(e, c) - 1
     pg := path_pg(e, c, level)
     idx := path_idx(e, c, level)
@@ -1438,6 +1487,7 @@ fn leaf_delete(e: &mut Engine, c: usize, free_ovfl: bool) -> void!db.Error {
 
 // Deletes the entry under the cursor. The cursor is invalid afterwards.
 fn cur_delete(e: &mut Engine, c: usize) -> void!db.Error {
+    cursor_db(e, c)
     level := depth(e, c) - 1
     pg := path_pg(e, c, level)
     t := page_type(e, pg)?

@@ -74,10 +74,15 @@ fn parse_fragment_stmt(e: &mut Engine, o: usize, l: usize) -> usize!db.Error {
     parse_statement(e)
 }
 
-fn table_for_write(e: &mut Engine, o: usize, l: usize) -> usize!db.Error {
-    t := find_obj(e, OT_TABLE, o, l)
+// The table a write statement `s` names (fields 0 and 1, schema byte).
+fn table_for_write(e: &mut Engine, s: usize) -> usize!db.Error {
+    o := na(e, s)
+    l := nb(e, s)
+    let q = ndb_of(e, s)
+    db := lookup_db(e, q)
+    t := find_obj(e, db, OT_TABLE, o, l)
     if t == NO_COL {
-        if find_obj(e, OT_VIEW, o, l) != NO_COL {
+        if find_obj(e, db, OT_VIEW, o, l) != NO_COL {
             e.msg_len = 0
             msg_add(e, "cannot modify ")
             msg_add_ws(e, o, l)
@@ -93,6 +98,11 @@ fn table_for_write(e: &mut Engine, o: usize, l: usize) -> usize!db.Error {
         return err(make_error(e, SQLITE_ERROR))
     }
     flags := obj_flags(e, t)
+    if e.tstack_n == 0 && e.wdb == NO_DB {
+        e.wdb = obj_db(e, t)
+    }
+    let tdb = obj_db(e, t)
+    mark_db(e, tdb)
     if (flags & OF_UNSUPPORTED) != 0 {
         return err(fail(e, SQLITE_ERROR, "table uses unsupported features"))
     }
@@ -188,12 +198,13 @@ fn write_info(e: &mut Engine, s: usize, t: usize) -> usize!db.Error {
     stu(e.ws, w + W_CHECKS, checks)
     // AUTOINCREMENT bookkeeping.
     if (obj_flags(e, t) & OF_AUTOINC) != 0 && rowid_col(e, t) != NO_COL {
-        seq := find_obj(e, OT_TABLE, 0, 0)
+        seq := NO_COL
         seqname := mem_bytes("sqlite_sequence")
+        tdb := obj_db(e, t)
         for i in 0usize..e.schema_objs {
             let name = obj_u(e, i, O_NAME)
             let name_len = obj_u(e, i, O_NAMEL)
-            if obj_type(e, i) == OT_TABLE && name_is(e, name, name_len, "sqlite_sequence") {
+            if obj_type(e, i) == OT_TABLE && obj_db(e, i) == tdb && name_is(e, name, name_len, "sqlite_sequence") {
                 seq = i
             }
         }
@@ -235,7 +246,11 @@ fn open_write_cursors(e: &mut Engine, w: usize) {
 fn resolve_insert(e: &mut Engine, s: usize) -> void!db.Error {
     let s_a0 = na(e, s)
     let s_b0 = nb(e, s)
-    view := view_target(e, s_a0, s_b0, TE_INSERT)
+    view := view_target(e, s, TE_INSERT)
+    if view != 0 {
+        let vdb = obj_db(e, view - 1)
+        mark_db(e, vdb)
+    }
     resolve_insert_rows(e, s, view)?
     w := sget_w(e, s)
     t := wget(e, w, W_TABLE)
@@ -263,7 +278,7 @@ fn resolve_insert_rows(e: &mut Engine, s: usize, view: usize) -> void!db.Error {
         }
         t = view_columns(e, view - 1)?
     } else {
-        t = table_for_write(e, s_a, s_b)?
+        t = table_for_write(e, s)?
     }
     w := write_info(e, s, t)?
     stu(e.ws, w + W_VIEW, view)
@@ -1442,6 +1457,8 @@ fn read_sequence(e: &mut Engine, w: usize) -> (i64, i64)!db.Error {
     sc := wget(e, w, W_SEQCUR)
     t := wget(e, w, W_TABLE)
     let root = obj_root(e, seq)
+    let sdb = obj_db(e, seq)
+    use_db(e, sdb)
     cur_open(e, sc, root, false)
     more := cur_first(e, sc)?
     for more {
@@ -1465,6 +1482,8 @@ fn write_sequence(e: &mut Engine, w: usize, value: i64, row: i64) -> void!db.Err
     sc := wget(e, w, W_SEQCUR)
     t := wget(e, w, W_TABLE)
     let root = obj_root(e, seq)
+    let sdb = obj_db(e, seq)
+    use_db(e, sdb)
     cur_open(e, sc, root, false)
     rowid := row
     if rowid == 0 {
@@ -1501,6 +1520,8 @@ fn synth_select(e: &mut Engine, s: usize, t: usize) -> usize!db.Error {
     set_nf(e, src, 0, s_a)
     let s_b = nb(e, s)
     set_nf(e, src, 1, s_b)
+    let tdb = obj_db(e, t)
+    set_ndb(e, src, 0, tdb)
     set_nf(e, sel, 1, src)
     // The result is the rowid of the scanned table, or the PRIMARY KEY of
     // a WITHOUT ROWID table.
@@ -1546,7 +1567,11 @@ fn synth_select(e: &mut Engine, s: usize, t: usize) -> usize!db.Error {
 fn resolve_update(e: &mut Engine, s: usize) -> void!db.Error {
     let s_a0 = na(e, s)
     let s_b0 = nb(e, s)
-    view := view_target(e, s_a0, s_b0, TE_UPDATE)
+    view := view_target(e, s, TE_UPDATE)
+    if view != 0 {
+        let vdb = obj_db(e, view - 1)
+        mark_db(e, vdb)
+    }
     if view != 0 {
         resolve_view_update(e, s, view)?
     } else {
@@ -1598,7 +1623,7 @@ fn resolve_view_update(e: &mut Engine, s: usize, view: usize) -> void!db.Error {
 fn resolve_update_table(e: &mut Engine, s: usize) -> void!db.Error {
     let s_a = na(e, s)
     let s_b = nb(e, s)
-    t := table_for_write(e, s_a, s_b)?
+    t := table_for_write(e, s)?
     w := write_info(e, s, t)?
     sel := synth_select(e, s, t)?
     stu(e.ws, w + W_SEL, sel)
@@ -1715,6 +1740,8 @@ fn exec_update(e: &mut Engine, s: usize) -> void!db.Error {
         } else {
             rowid = u2i(ld64(e.ws, start + i * 8))
             let root = obj_root(e, t)
+            let tdb = obj_db(e, t)
+            use_db(e, tdb)
             cur_open(e, scan, root, false)
             if !seek_rowid(e, scan, rowid)? {
                 continue
@@ -1811,7 +1838,11 @@ fn exec_update(e: &mut Engine, s: usize) -> void!db.Error {
 fn resolve_delete(e: &mut Engine, s: usize) -> void!db.Error {
     let s_a = na(e, s)
     let s_b = nb(e, s)
-    view := view_target(e, s_a, s_b, TE_DELETE)
+    view := view_target(e, s, TE_DELETE)
+    if view != 0 {
+        let vdb = obj_db(e, view - 1)
+        mark_db(e, vdb)
+    }
     if view != 0 {
         t := view_columns(e, view - 1)?
         w := write_info(e, s, t)?
@@ -1824,7 +1855,7 @@ fn resolve_delete(e: &mut Engine, s: usize) -> void!db.Error {
         compile_triggers(e, s, w, t, TE_DELETE)?
         return view_needs_trigger(e, w)
     }
-    t := table_for_write(e, s_a, s_b)?
+    t := table_for_write(e, s)?
     w := write_info(e, s, t)?
     sel := synth_select(e, s, t)?
     stu(e.ws, w + W_SEL, sel)
@@ -1841,6 +1872,8 @@ fn exec_delete(e: &mut Engine, s: usize) -> void!db.Error {
     has_after := has_triggers(e, w, trig_mask(TE_DELETE, TT_AFTER))
     if ndd(e, s) == 0 && wget(e, w, W_RET) == 0 && !has_before && !has_after {
         // DELETE without WHERE: clear the table and its indexes.
+        let tdb = obj_db(e, t)
+        use_db(e, tdb)
         let root = obj_root(e, t)
         count := btree_count(e, root, MAX_DEPTH)?
         let root2 = obj_root(e, t)

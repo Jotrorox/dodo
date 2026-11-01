@@ -63,7 +63,7 @@ cache, the parsed statements, the values of the current row, and the space for
 sorting and grouping. `sqlite.WORKSPACE_BYTES` (2 MiB) suits most programs.
 The smallest workspace depends on the page size:
 `sqlite.min_workspace_bytes(page_size)` returns it, and
-`sqlite.MIN_WORKSPACE_BYTES` (400 KiB) covers SQLite's default 4096-byte
+`sqlite.MIN_WORKSPACE_BYTES` (424 KiB) covers SQLite's default 4096-byte
 pages. Databases with 65536-byte pages fit in the default 2 MiB workspace.
 Larger workspaces cache more pages and can sort, group, and materialize larger
 results. Put a large workspace in a `static mut` array rather than on the
@@ -162,6 +162,39 @@ When another process holds a conflicting lock, the operation fails with
 `db.ErrorKind.Busy` ("database is locked"). `Options.busy_timeout_ms`,
 `conn.set_busy_timeout(ms)`, or `PRAGMA busy_timeout = ms` make the
 connection wait and retry for up to that long first.
+
+## Attached and temporary databases
+
+`ATTACH 'file' AS name` opens another database file on the same connection
+(up to ten, as in SQLite; `':memory:'` or `''` attaches an in-memory
+database), and `DETACH name` closes it. Tables, indexes, views, and triggers
+are then named `name.object`; an unqualified name means the TEMP database
+first, then `main`, then the attached databases in attach order. `PRAGMA
+database_list` lists them, and pragmas such as `integrity_check`,
+`table_info`, `page_count`, or `journal_mode` accept a `name.` prefix
+(unqualified `journal_mode = ...` applies to every database, as in SQLite).
+
+```dodo
+conn.exec("attach 'archive.db' as archive")?
+conn.exec("insert into archive.orders select * from orders where year < 2020")?
+conn.exec("detach archive")?
+```
+
+`CREATE TEMP TABLE` (and `TEMP VIEW`, `TEMP TRIGGER`, and indexes on temp
+tables) put objects into the `temp` database, which is private to the
+connection and disappears when it closes. Its pages stay in the workspace's
+page cache, as with `temp_store = MEMORY`, so the workspace bounds its size.
+A temp trigger may fire on a table of another database, and a temp object
+may shadow one of the same name in `main`.
+
+A transaction covers every database it writes. When it writes more than one
+file in rollback-journal mode, the commit goes through a super-journal
+(`<main>-mjXXXXXXXX`) exactly as in SQLite, so after a crash either every
+file has the transaction or none does, and Dodo and SQLite each recover the
+other's interrupted multi-file commits. (In WAL mode, as in SQLite, the
+commit is atomic per file only.) Statements lock only the databases they
+use. Attached databases must use the main database's text encoding; a new
+attached file takes it.
 
 ## WAL mode
 
@@ -353,7 +386,7 @@ workspace bounds its size.
 are accepted and
 ignored, as SQLite does for unknown pragmas.
 
-**Not supported.** Virtual tables, `ATTACH`, and temporary tables.
+**Not supported.** Virtual tables.
 
 **Concurrency.** Locks follow SQLite's protocol, so Dodo and SQLite processes
 can use one file safely. As with SQLite's POSIX locking, two connections to
