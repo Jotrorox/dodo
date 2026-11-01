@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Interoperability with SQLite on one database file: hot-journal recovery in
-both directions, the POSIX lock protocol, and WAL mode (crash recovery both
-ways, concurrent readers and writers, checkpoints, big-endian checksums).
+both directions, the POSIX lock protocol, WAL mode (crash recovery both
+ways, concurrent readers and writers, checkpoints, big-endian checksums),
+and UTF-16 databases written by both.
 Usage: interop.py SHELL WORKDIR"""
 import os
 import shutil
@@ -17,7 +18,7 @@ failures = []
 
 def shell(db, script, **kw):
     path = os.path.join(WORK, "interop_script.sql")
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8") as f:
         f.write(script)
     return subprocess.run([SHELL, db, path], capture_output=True, **kw)
 
@@ -443,5 +444,37 @@ os._exit(0)
     ok = keeper.execute("pragma integrity_check").fetchone()[0]
     keeper.close()
     check(r == (3002, sum(range(3000)) + 7 + 10 + 8) and ok == "ok", f"SQLite agrees after the {victim} crash: {r} {ok}")
+
+# 4. UTF-16 databases change hands: each side writes into the other's file
+# (index seeks compare UTF-16 keys) and the other side reads it back.
+words = ["zeta", "Ā", "ÿ", "€", "😀", "日本", "", "abc", "\ue000", "𝄞", "Ωmega", "naïve"]
+for enc in ("UTF-16le", "UTF-16be"):
+    db = fresh(f"utf16_{enc}.db")
+    c = sqlite3.connect(db, isolation_level=None)
+    c.execute(f"pragma encoding = '{enc}'")
+    c.execute("create table t(id integer primary key, s text unique, n int)")
+    c.execute("create index t_n on t(n, s)")
+    for i, w in enumerate(words):
+        c.execute("insert into t values (?, ?, ?)", (i, w * 3 + str(i), i % 4))
+    c.close()
+    script = "".join(f"insert into t(s, n) values ('{w}x', {i % 3});\n" for i, w in enumerate(words))
+    script += "update t set s = s || 'é' where n = 1;\ndelete from t where n = 2;\npragma encoding;\nselect id, s from t order by s, id;\n"
+    out = shell(db, script).stdout.decode()
+    c = sqlite3.connect(db)
+    want = c.execute("pragma encoding").fetchone()[0] + "\n" + "".join(f"{i}|{w}\n" for i, w in c.execute("select id, s from t order by s, id"))
+    ok = c.execute("pragma integrity_check").fetchone()[0]
+    c.close()
+    check(out == want and ok == "ok", f"Dodo writes into SQLite's {enc} database")
+    db2 = fresh(f"utf16_dodo_{enc}.db")
+    shell(db2, f"pragma encoding = '{enc}';\ncreate table t(s text primary key, n);\ncreate index t_n on t(n, s);\n" + "".join(f"insert into t values ('{w}{i}', {i % 3});\n" for i, w in enumerate(words)))
+    c = sqlite3.connect(db2, isolation_level=None)
+    for i, w in enumerate(words):
+        c.execute("insert into t values (?, ?)", (w + "!", i))
+    c.execute("delete from t where n = 1")
+    want = c.execute("pragma encoding").fetchone()[0] + "\n" + "".join(f"{s}|{n}\n" for s, n in c.execute("select s, n from t order by s"))
+    ok = c.execute("pragma integrity_check").fetchone()[0]
+    c.close()
+    out = shell(db2, "pragma encoding;\nselect s, n from t order by s;\n").stdout.decode()
+    check(out == want and ok == "ok", f"SQLite writes into Dodo's {enc} database")
 
 sys.exit(1 if failures else 0)

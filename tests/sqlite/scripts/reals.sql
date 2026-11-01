@@ -1,0 +1,22 @@
+-- Real <-> text conversion edge cases (SQLite 3.53+ rounding).
+select 0.1, 0.2, 0.1 + 0.2, 1.0 / 3, 2.0 / 3, 49.47, 100.0, 1e15, 1e16, 1e17, 1e22, 1e23;
+select 5e-324, 2.2250738585072014e-308, 2.2250738585072009e-308, 1.7976931348623157e308, -1.7976931348623157e308;
+select 123456789012345678.0, 9007199254740993.0, 0.30000000000000004, 1.0000000000000002, 0.9999999999999999;
+select -0.0, cast(-0.0 as text), printf('%f', -0.0), 1e308 * 10, -1e308 * 10, quote(1e308 * 10), quote(-1e308 * 10);
+select printf('%.0f %.0f %.0f %.0f', 0.5, 1.5, 2.5, -0.5), printf('%.1f %.1f %.2f', 0.25, 0.35, 1.005);
+select printf('%g %g %g %g %g', 100000, 1000000, 1e-4, 1e-5, 123456789), printf('%#g %#.3g %!g %!.3g', 1.0, 1.0, 1.0, 1.0);
+select printf('%e %E %.0e %#.0e %!.0e', 12345.678, 12345.678, 12345.678, 12345.678, 12345.678);
+select printf('%.20f', 0.1), printf('%!.20f', 0.1), printf('%.30e', 1.0 / 3), printf('%!.30e', 1.0 / 3);
+select printf('%10.3f|%-10.3f|%010.3f|%+.3f|% .3f', 3.14159, 3.14159, -3.14159, 3.14159, 3.14159);
+select printf('%f %e %g', 1e300, 1e300, 1e300), printf('%.3f', 1e-320), printf('%g', 5e-324);
+select round(2.5), round(-2.5), round(1.005, 2), round(2.675, 2), round(1.23456789, 30), round(123.456, -1);
+select round(0.5), round(-0.4), round(1e15 + 0.5), round(4503599627370497.0), round(1.0e16, 3);
+select cast('1e400' as real), cast('-1e400' as real), cast('1e-400' as real), cast('4.9e-324' as real), cast('2.4703282292062328e-324' as real);
+select cast('0.1' as real), cast('  12.5e2  ' as real), cast('1.5abc' as real), cast('.5' as real), cast('5.' as real), cast('-.5e-3' as real);
+select cast('3500000000000000.2500001' as real), cast('123456789012345678901234567890' as real), cast('0.000000000000000000000000000001' as real);
+select cast('9007199254740993' as real), cast('9007199254740993.0' as real), cast('1.00000000000000011102230246251565404236316680908203125' as real);
+select 1e-7, 1.5e-7, 123e-20, 1.7976931348623157e+308 / 10, 4.35, 0.1 * 3, 1.1 * 1.1;
+select cast(1e20 as text), cast(1.5e20 as text), cast(12345678901234567890.0 as text), cast(1e-5 as text), cast(0.0001 as text);
+select sum(x), avg(x), total(x) from (select 0.1 as x union all select 0.2 union all select 0.3);
+select x, cast(x as text) = x from (select 0.1 + 0.2 as x);
+select julianday('2024-01-01 12:34:56.789'), julianday('2000-01-01'), unixepoch('2024-01-01 00:00:00.5', 'subsec');

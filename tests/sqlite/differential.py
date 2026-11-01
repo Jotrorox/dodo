@@ -4,7 +4,11 @@ and through the Dodo shell (tests/sqlite/shell.dodo), compare every result row,
 then check the Dodo-written database with SQLite's integrity_check and compare
 the final table contents.
 
-Usage: differential.py SHELL_BINARY WORKDIR SCRIPT...
+Usage: differential.py [--encoding NAME] SHELL_BINARY WORKDIR SCRIPT...
+
+--encoding runs every script against a new database in that text encoding
+(it prepends "pragma encoding = 'NAME';"). The environment, TZ included,
+applies to both SQLite and the shell.
 """
 import os
 import sqlite3
@@ -24,12 +28,20 @@ def fmt(conn, value):
     return value
 
 
+# SQLite 3.47 changed real-to-text conversion from 15 to (up to) 17
+# significant digits, and 3.53 replaced its decimal conversion, which
+# changes some last digits; the Dodo driver matches 3.53 and later exactly,
+# so older oracles (such as Debian's 3.46) only need to agree numerically.
+OLD_REAL_FORMAT = sqlite3.sqlite_version_info < (3, 53)
+
+
 def same_row(e, g):
-    """Rows match exactly, or differ only in how reals are printed: SQLite
-    3.47 changed real-to-text conversion from 15 to (up to) 17 significant
-    digits, and this driver follows the newer rule."""
+    """Rows match exactly (or, on an older SQLite, differ only in how reals
+    are printed)."""
     if e == g:
         return True
+    if not OLD_REAL_FORMAT:
+        return False
     a, b = e.split("|"), g.split("|")
     if len(a) != len(b):
         return False
@@ -104,9 +116,13 @@ def contents(path):
 
 
 def main():
-    shell, workdir = sys.argv[1], sys.argv[2]
+    args = sys.argv[1:]
+    encoding = None
+    if args[0] == "--encoding":
+        encoding, args = args[1], args[2:]
+    shell, workdir = args[0], args[1]
     failures = 0
-    for script_path in sys.argv[3:]:
+    for script_path in args[2:]:
         name = os.path.basename(script_path)
         with open(script_path, encoding="utf-8") as f:
             script = f.read()
@@ -117,6 +133,12 @@ def main():
             if sqlite3.sqlite_version_info < need:
                 print(f"skip {name} (needs SQLite {first.split(':', 1)[1].strip()})")
                 continue
+        if encoding:
+            script = f"pragma encoding = '{encoding}';\n" + script
+            name = f"{encoding}-{name}"
+            script_path = os.path.join(workdir, name)
+            with open(script_path, "w", encoding="utf-8") as f:
+                f.write(script)
         a = os.path.join(workdir, name + ".sqlite.db")
         b = os.path.join(workdir, name + ".dodo.db")
         for p in (a, a + "-wal", a + "-shm", b, b + "-journal", b + "-wal", b + "-shm"):

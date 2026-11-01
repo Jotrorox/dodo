@@ -1,7 +1,6 @@
 package sqlite
 
 import "std/db"
-import "std/text"
 
 // Tokenizer and recursive-descent parser for SQLite's SQL dialect. The parse
 // tree lives in the statement slot as fixed 48-byte nodes:
@@ -836,9 +835,10 @@ fn number_literal(e: &mut Engine, negate: bool) -> usize!db.Error {
             return ok(n)
         }
     }
-    f := match text.parse_f64(&buf[..m]) {
-        ok(v) => v,
-        err(_) => 1.0e308 * 10.0,
+    f := if m == len {
+        fp_atof(e.ws, start, len)
+    } else {
+        fp_atof(&buf, 0, m)
     }
     n := new_node(e, N_REAL)?
     set_x(e, n, f2u(if negate {

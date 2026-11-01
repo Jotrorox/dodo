@@ -789,8 +789,9 @@ fn apply_header(e: &mut Engine, hdr: usize, pages: u32, size: u64) -> void!db.Er
     if e.ws[hdr + 21] != 64 || e.ws[hdr + 22] != 32 || e.ws[hdr + 23] != 32 {
         return err(fail(e, SQLITE_NOTADB, "file is not a database"))
     }
-    if rd32(e.ws, hdr + 56) > 1 {
-        return err(fail(e, SQLITE_CANTOPEN, "only UTF-8 databases are supported"))
+    text_enc := rd32(e.ws, hdr + 56)
+    if text_enc > 3 {
+        return err(fail(e, SQLITE_CANTOPEN, "unsupported text encoding"))
     }
     reserved := e.ws[hdr + 20] as usize
     counter := rd32(e.ws, hdr + 24)
@@ -819,6 +820,13 @@ fn apply_header(e: &mut Engine, hdr: usize, pages: u32, size: u64) -> void!db.Er
     e.change_counter = counter
     e.schema_cookie = cookie
     e.schema_format = rd32(e.ws, hdr + 44)
+    if npages > 0 {
+        e.enc = if text_enc == 0 {
+            ENC_UTF8
+        } else {
+            text_enc as u8
+        }
+    }
     e.db_pages = npages
     e.file_pages = npages
     e.initialized = true
@@ -835,6 +843,7 @@ fn init_new_db_state(e: &mut Engine) {
     e.db_pages = 0
     e.file_pages = 0
     e.schema_format = 4
+    e.enc = e.enc_new
     e.initialized = true
 }
 
@@ -1808,7 +1817,8 @@ fn create_page1(e: &mut Engine) -> void!db.Error {
     let schema_cookie2 = e.schema_cookie
     wr32(e.ws, d + 40, schema_cookie2)
     wr32(e.ws, d + 44, 4)
-    wr32(e.ws, d + 56, 1)
+    let enc2 = e.enc as u32
+    wr32(e.ws, d + 56, enc2)
     let change_counter3 = e.change_counter
     wr32(e.ws, d + 92, change_counter3)
     wr32(e.ws, d + 96, WRITER_VERSION)

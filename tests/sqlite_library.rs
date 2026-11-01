@@ -1,5 +1,6 @@
 //! std/db/sqlite: differential tests against SQLite (Python's sqlite3
-//! module), crash-recovery and locking interoperability on shared files, and
+//! module, also with UTF-16 databases and under several time zones),
+//! crash-recovery, locking, and UTF-16 interoperability on shared files, and
 //! the Dodo API checks. The SQLite-based parts are skipped when Python 3 with
 //! its sqlite3 module is unavailable.
 use std::fs;
@@ -87,6 +88,20 @@ fn matches_sqlite_on_every_script() {
         .filter(|path| path.extension().is_some_and(|e| e == "sql"))
         .collect();
     scripts.sort();
+    // Every hand-written script also runs against UTF-16 databases.
+    for encoding in ["UTF-16le", "UTF-16be"] {
+        success(
+            Command::new(python)
+                .arg(root().join("tests/sqlite/differential.py"))
+                .args(["--encoding", encoding])
+                .arg(&shell)
+                .arg(&workspace.0)
+                .args(&scripts)
+                .output()
+                .unwrap(),
+            &format!("differential scripts in {encoding} databases"),
+        );
+    }
     for entry in fs::read_dir(&generated).unwrap() {
         scripts.push(entry.unwrap().path());
     }
@@ -100,6 +115,41 @@ fn matches_sqlite_on_every_script() {
             .unwrap(),
         "differential scripts",
     );
+}
+
+// The 'localtime' and 'utc' modifiers follow the OS time zone rules, as
+// SQLite's do: compare both under zones with DST gaps and overlaps,
+// half-hour offsets, and none. TZ takes IANA names on POSIX systems only.
+#[cfg(unix)]
+#[test]
+fn localtime_matches_sqlite_in_several_time_zones() {
+    let Some(python) = python_with_sqlite() else {
+        eprintln!("skipped: python3 with the sqlite3 module is unavailable");
+        return;
+    };
+    let workspace = Workspace::new();
+    let shell = build_shell(&workspace.0, "0");
+    for zone in [
+        "America/New_York",
+        "Europe/Berlin",
+        "Australia/Lord_Howe",
+        "Asia/Kolkata",
+        "America/St_Johns",
+        "UTC",
+    ] {
+        success(
+            Command::new(python)
+                .arg(root().join("tests/sqlite/differential.py"))
+                .arg(&shell)
+                .arg(&workspace.0)
+                .arg(root().join("tests/sqlite/localtime.sql"))
+                .arg(root().join("tests/sqlite/localtime_zero_offset.sql"))
+                .env("TZ", zone)
+                .output()
+                .unwrap(),
+            &format!("localtime scripts with TZ={zone}"),
+        );
+    }
 }
 
 #[cfg(unix)]
@@ -118,7 +168,7 @@ fn shares_files_with_sqlite() {
             .arg(&workspace.0)
             .output()
             .unwrap(),
-        "crash recovery and locking interop",
+        "crash recovery, locking, and UTF-16 interop",
     );
 }
 

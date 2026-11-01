@@ -578,6 +578,28 @@ fn minimum_and_large_page_workspaces() {
     remove(path)
 }
 
+// A UTF-16 database stores text as UTF-16; the API still binds and returns
+// UTF-8, and the BINARY order is that of the UTF-16 bytes.
+@test
+fn utf16_database_round_trip() {
+    conn := sqlite.Connection.open_memory(workspace())!
+    conn.exec("pragma encoding = 'UTF-16be'; create table u(s text); create index us on u(s)")!
+    params := [db.Value.Text("na\u{ef}ve \u{1f600}")]
+    conn.execute("insert into u values (?)", &params)!
+    conn.exec("insert into u values ('\u{e000}'), ('\u{10000}')")!
+    none_: [0]db.Value = []
+    rows := conn.select("select s, hex(s), length(s), (select group_concat(hex(s), ',') from (select s from u order by s)) from u where rowid = 1", &none_)!
+    let some(row) = rows.next()! else {
+        assert(false)
+        return
+    }
+    assert(same(row.text(0), "na\u{ef}ve \u{1f600}"))
+    assert(same(row.text(1), "006E006100EF007600650020D83DDE00"))
+    assert_eq(row.int(2), 7i64)
+    assert(same(row.text(3), "006E006100EF007600650020D83DDE00,D800DC00,E000"))
+}
+
+
 // A transaction much larger than a tiny page cache spills pages (including
 // newly allocated ones) to the file before commit; it must commit and roll
 // back correctly.
