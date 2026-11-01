@@ -425,7 +425,7 @@ fn scratch_size_is_bounded() {
         channels := 3u64 + jxl.extra_channel_count(data)! as u64
         assert(need <= scratch_bound(header.width, header.height, channels), name)
     }
-    names := ["frame_big", "frame_huge", "frame_negative", "ref_patches", "ref_huge", "vd_window"]
+    names := ["frame_big", "frame_huge", "frame_negative", "ref_patches", "ref_huge", "vd_window", "patches_up_window", "ec_window"]
     for n in 0usize..names.len {
         file := [0u8; FILE_LIMIT]
         length := read_fixture(names[n], ".jxl", &mut file)
@@ -758,12 +758,15 @@ fn robustness_jpeg_noise_splines() {
 }
 
 // Frame windows: frames larger than the image, reference frames read by
-// patches, a VarDCT frame cropped to the window.
+// patches (also from an upsampled frame), extra channels of a windowed
+// frame, a VarDCT frame cropped to the window.
 @test
 fn robustness_frame_windows() {
     mangle("frame_huge")
     mangle("ref_patches")
     mangle("patches_text")
+    mangle("patches_up_window")
+    mangle("ec_window")
 }
 
 @test

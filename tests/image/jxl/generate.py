@@ -355,22 +355,37 @@ def tree_tokens(s, tree):
             leaves += 1
     zero_code(s, leaves)
 
-def frame_jxl_header(w, iw, ih):
+def frame_jxl_header(w, iw, ih, ecs=()):
+    """ecs: extra channels as (type, dim_shift), 8-bit (type 0 shift 0 is
+    the default alpha)."""
     w.u(8, 0xFF); w.u(8, 0x0A)
     w.u(1, 0); w.u(2, 1); w.u(13, ih - 1)
     w.u(3, 0); w.u(2, 1); w.u(13, iw - 1)
     w.u(1, 0); w.u(1, 0)              # metadata: not default, no extra fields
     w.u(1, 0); w.u(2, 0)              # integer samples, 8 bits
-    w.u(1, 1); w.u(2, 0)              # 16-bit buffers, no extra channels
+    w.u(1, 1)                         # 16-bit buffers
+    u32d(w, len(ecs), [(0, 0), (1, 0), (2, 4), (1, 12)])
+    for kind, shift in ecs:
+        if kind == 0 and shift == 0:
+            w.u(1, 1)
+            continue
+        w.u(1, 0)
+        u32d(w, kind, [(0, 0), (1, 0), (2, 4), (18, 6)])
+        w.u(1, 0); w.u(2, 0)          # integer samples, 8 bits
+        u32d(w, shift, [(0, 0), (3, 0), (4, 0), (1, 3)])
+        w.u(2, 0)                     # no name
+        if kind == 0:
+            w.u(1, 0)                 # not associated
     w.u(1, 0); w.u(1, 1); w.u(2, 0)   # not XYB, sRGB, no extensions
     w.u(1, 1)                         # default transform data
     w.pad()
 
-def frame_jxl_frame(w, iw, ih, f):
+def frame_jxl_frame(w, iw, ih, f, nec=0):
     """One frame. f: dict with type (0 regular, 2 reference-only), crop
     (x0, y0, width, height) or None, last, save (slot), before (save before
     the color transform), tree, patches (list of (slot, rx, ry, pw, ph,
-    [(x, y)...])), group_shift."""
+    [(x, y)...]), replacing every channel), group_shift, up (upsampling),
+    ec_up (coded upsampling of each of the nec extra channels)."""
     ftype = f.get('type', 0)
     gshift = f.get('group_shift', 1)
     crop = f.get('crop')
@@ -384,7 +399,10 @@ def frame_jxl_frame(w, iw, ih, f):
     else:
         w.u(2, 0)
     w.u(1, 0)                         # not YCbCr
-    w.u(2, 0)                         # upsampling 1
+    up = f.get('up', 1)
+    w.u(2, up.bit_length() - 1)       # upsampling
+    for e in f.get('ec_up', [1] * nec):
+        w.u(2, e.bit_length() - 1)
     w.u(2, gshift)
     if ftype != 2:
         w.u(2, 0)                     # one pass
@@ -395,9 +413,10 @@ def frame_jxl_frame(w, iw, ih, f):
         u32d(w, fw, CROP_DIST); u32d(w, fh, CROP_DIST)
     partial = crop is not None and ftype != 2 and (x0 > 0 or y0 > 0 or x0 + fw < iw or y0 + fh < ih)
     if ftype in (0, 3):
-        w.u(2, 0)                     # replace
-        if partial:
-            w.u(2, f.get('source', 0))
+        for c in range(1 + nec):
+            w.u(2, 0)                 # replace
+            if partial:
+                w.u(2, f.get('source', 0))
         w.u(1, 1 if last else 0)
     if not last:
         w.u(2, f.get('save', 0))
@@ -408,10 +427,11 @@ def frame_jxl_frame(w, iw, ih, f):
     w.u(2, 0)                         # no extensions
     # Sections.
     gd = 128 << gshift
-    gx = (fw + gd - 1) // gd
-    gy = (fh + gd - 1) // gd
-    lgx = (fw + 8 * gd - 1) // (8 * gd)
-    lgy = (fh + 8 * gd - 1) // (8 * gd)
+    sw, sh = (fw + up - 1) // up, (fh + up - 1) // up
+    gx = (sw + gd - 1) // gd
+    gy = (sh + gd - 1) // gd
+    lgx = (sw + 8 * gd - 1) // (8 * gd)
+    lgy = (sh + 8 * gd - 1) // (8 * gd)
     s = BitWriter()
     if patches:
         spline_code(s, 10)
@@ -427,7 +447,8 @@ def frame_jxl_frame(w, iw, ih, f):
                 else:
                     spline_uint(s, packed(x - px)); spline_uint(s, packed(y - py))
                 px, py = x, y
-                spline_uint(s, 1)     # replace
+                for c in range(1 + nec):
+                    spline_uint(s, 1) # replace
     s.u(1, 1)                         # default LF dequantization
     s.u(1, 1)                         # global tree
     tree_tokens(s, f['tree'])
@@ -445,14 +466,14 @@ def frame_jxl_frame(w, iw, ih, f):
     w.pad()
     return b''.join(sections)
 
-def frames_jxl(path, iw, ih, frames):
+def frames_jxl(path, iw, ih, frames, ecs=()):
     w = BitWriter()
-    frame_jxl_header(w, iw, ih)
+    frame_jxl_header(w, iw, ih, ecs)
     out = b''
     for f in frames:
         # Frames start byte aligned: header + TOC, then the sections.
         hw = BitWriter()
-        data = frame_jxl_frame(hw, iw, ih, f)
+        data = frame_jxl_frame(hw, iw, ih, f, len(ecs))
         out += hw.data() + data
     open(path, 'wb').write(w.data() + out)
 
@@ -490,6 +511,19 @@ def frame_cases():
                 {'tree': BASE_TREE, 'last': True, 'patches': [(1, 100, 60, 30, 20, [(5, 5), (30, 26)]), (1, 200, 150, 20, 18, [(40, 20)])]}]
     frames_jxl(os.path.join(OUT, 'ref_patches.jxl'), iw, ih, ref((4000, 3000)))
     frames_jxl(os.path.join(OUT, 'ref_huge.jxl'), iw, ih, ref((30000, 20000)))
+    # An upsampled frame larger than the image with patches (applied at
+    # its coded size, alpha too) from a large reference frame: patches
+    # inside, straddling and far outside the visible part.
+    frames_jxl(os.path.join(OUT, 'patches_up_window.jxl'), iw, ih, [
+        dict(base), {'type': 2, 'tree': SPRITE_TREE, 'crop': (0, 0, 4000, 3000), 'save': 1, 'before': True},
+        {'tree': BASE_TREE, 'last': True, 'up': 2, 'ec_up': [2], 'crop': (6, 4, 3000, 2000),
+         'patches': [(1, 100, 60, 30, 20, [(3, 2), (20, 14)]), (1, 2500, 2000, 40, 30, [(700, 500)]), (1, 200, 150, 24, 18, [(26, 20)])]}],
+        ecs=[(0, 0)])
+    # Extra channels (alpha, and a depth channel at half size) of an
+    # upsampled frame larger than the image.
+    frames_jxl(os.path.join(OUT, 'ec_window.jxl'), iw, ih, [
+        dict(base), {'tree': SPRITE_TREE, 'last': True, 'up': 2, 'ec_up': [2, 2], 'crop': (10, 6, 3000, 2000)}],
+        ecs=[(0, 0), (1, 1)])
 
 
 class BitReader:
@@ -884,6 +918,10 @@ def add_file(name, sample=0):
     ref = os.path.join(TMP, name)
     run(['djxl', jxl, ref + '.pam', '--quiet'])
     w, h, depth, maxval, vals = read_pam(ref + '.pam')
+    if depth > 4:
+        # Color and the first (alpha) extra channel are output.
+        vals = [vals[i * depth + c] for i in range(w * h) for c in range(4)]
+        depth = 4
     CASES.append((name, '', w, h, depth, sample, 0, 0, fnv(native_bytes(vals, maxval, sample))))
 
 def add_alias(name, other):
@@ -1264,6 +1302,10 @@ def main():
     add_file('frame_negative')
     add_file('ref_patches')
     add_alias('ref_huge', 'ref_patches')
+    add_file('patches_up_window')
+    add_file('ec_window')
+    add_ec('ec_window', 0, 0)
+    add_ec('ec_window', 1, 0)
     vardct_window_jxl(os.path.join(OUT, 'vd_window.jxl'), (160, 120), (1400, 1100), (40, 30), 2)
     add_png('vd_window', None, [], 0, jxlref=True)
     hand_written()
