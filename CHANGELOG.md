@@ -16,6 +16,18 @@
   unused bytes for the next fill. A stopped source reports `Timeout` and
   failing health checks `Bus`. Both drivers are generic over
   `hal.Registers` and tested against simulated registers on the desktop.
+- Fixed: `Fifo.set_signal` and the FIFO interrupt hook of
+  `std/embedded/chip/rp_multicore` wrote 0 to `FIFO_ST` to clear its sticky
+  WOF and ROE flags, which only a 1 clears. A flag left set, such as the ROE
+  that core 1's boot ROM leaves while it waits to be launched, kept the FIFO
+  interrupt raised, so an executor waiting for FIFO words could spin instead
+  of sleeping.
+- CI runs firmware on emulated RP2040 and RP2350 chips: a self-test of the
+  startup runtime, the integer and floating-point helpers, interrupts,
+  SysTick, timer alarms, the executor, DMA, PIO, a UART, and the second core
+  with its FIFOs and spinlocks, at -O0 and -O2. `scripts/test_emulator.py`
+  builds `tests/emulator` and runs it in `emulator/`, a runner around the
+  picoem emulator crates with fixes in `emulator/patches`; it takes seconds.
 - Real-time clocks share one protocol in `std/embedded/hal`: `hal.Rtc` reads
   and sets the time as Unix milliseconds and `hal.RtcAlarm` fires once at a
   time, with `hal.rtc_now`, `rtc_set`, `rtc_alarm_at`, and `rtc_alarm_in`

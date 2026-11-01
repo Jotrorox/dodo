@@ -3093,7 +3093,9 @@ The compiler compiles the runtime itself with the selected target machine, so
 no assembler or C toolchain is involved. `scripts/test_pico.py` (with
 `--board pico`, `--board pico2`, or `--board pico2_w`) shows how to check a chip
 on real hardware, and `scripts/test_rp2350_float.py` checks the RP2350's
-coprocessor `f64` helpers against the software ones on a board.
+coprocessor `f64` helpers against the software ones on a board. Without a
+board, `scripts/test_emulator.py` runs the self-test in `tests/emulator` on
+emulated RP2040 and RP2350 chips, as CI does.
 
 ### Unsupported chips
 
