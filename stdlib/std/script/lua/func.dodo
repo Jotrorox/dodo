@@ -88,6 +88,7 @@ fn lcl_upvals(cl: *mut LClosure) -> *mut *mut UpVal {
         }
     }
 }
+@inline
 fn lcl_upval(cl: *mut LClosure, i: isize) -> *mut UpVal {
     unsafe {
         unsafe {
@@ -274,6 +275,7 @@ fn upval_unlink(uv: *mut UpVal) {
 }
 
 // Close every open upvalue at or above `level`.
+@inline(never)
 fn func_close_upvals(L: *mut State, level: *mut Value) {
     unsafe {
         for !ptr.is_null((*L).openupval) && (*(*L).openupval).v as usize >= level as usize {
@@ -289,6 +291,7 @@ fn func_close_upvals(L: *mut State, level: *mut Value) {
 
 // Create the closure for prototype `p` in slot `ra`, capturing upvalues from
 // the enclosing closure `encl` and the frame whose registers start at `base`.
+@inline(never)
 fn func_push_closure(L: *mut State, p: *mut Proto, encl: *mut LClosure, base: *mut Value, ra: *mut Value) -> void!Throw {
     unsafe {
         let nup = (*p).sizeupvalues

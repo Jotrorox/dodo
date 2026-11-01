@@ -251,6 +251,7 @@ fn link_gclist(o: *mut GCObject, list: *mut *mut GCObject) {
 
 // --- Barriers ---------------------------------------------------------------
 
+@cold
 fn barrier_forward(L: *mut State, o: *mut GCObject, v: *mut GCObject) {
     unsafe {
         let g = G(L)
@@ -264,6 +265,7 @@ fn barrier_forward(L: *mut State, o: *mut GCObject, v: *mut GCObject) {
 }
 
 // `o` now refers to the collectable value `v`.
+@inline
 fn gc_barrier(L: *mut State, o: *mut GCObject, v: *mut Value) {
     unsafe {
         if ((*v).tag & COLLECTABLE) != 0 && is_black(o) && is_white(val_gc(v)) {
@@ -280,6 +282,7 @@ fn gc_barrier_obj(L: *mut State, o: *mut GCObject, v: *mut GCObject) {
     }
 }
 
+@cold
 fn barrier_back_now(L: *mut State, t: *mut GCObject) {
     unsafe {
         let g = G(L)
@@ -288,6 +291,7 @@ fn barrier_back_now(L: *mut State, t: *mut GCObject) {
 }
 
 // Table `t` now holds the value `v`.
+@inline
 fn gc_barrier_back(L: *mut State, t: *mut Table, v: *mut Value) {
     unsafe {
         if ((*v).tag & COLLECTABLE) != 0 && is_black(t as *mut GCObject) && is_white(val_gc(v)) {
@@ -1199,6 +1203,7 @@ fn set_pause(g: *mut Global) {
 }
 
 // One incremental step, sized by the allocation debt.
+@cold
 fn gc_step(L: *mut State) {
     unsafe {
         let g = G(L)
@@ -1242,6 +1247,7 @@ fn gc_step(L: *mut State) {
 }
 
 // Collector check point: everything live must be reachable from the roots.
+@inline
 fn gc_check(L: *mut State) {
     unsafe {
         let g = G(L)

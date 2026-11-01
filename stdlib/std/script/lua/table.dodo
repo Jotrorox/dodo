@@ -84,7 +84,7 @@ fn node_val(n: *mut Node) -> *mut Value {
 fn node_size(t: *mut Table) -> isize {
     unsafe {
         unsafe {
-            return 1isize << ((*t).lsizenode as isize)
+            return 1isize << (((*t).lsizenode as isize) & 63)
         }
     }
 }
@@ -102,6 +102,7 @@ fn node_next(n: *mut Node) -> *mut Node {
         }
     }
 }
+@inline
 fn val_is_empty(v: *mut Value) -> bool {
     unsafe {
         unsafe {
@@ -161,6 +162,7 @@ fn u2i(u: u64) -> i64 {
 
 // --- Creation and destruction -----------------------------------------------
 
+@inline(never)
 fn tab_new(L: *mut State) -> (*mut Table)!Throw {
     unsafe {
         let o = gc_new(L, mem.size_of::<Table>(), TAG_TABLE)?
@@ -203,6 +205,7 @@ fn tab_mem_size(t: *mut Table) -> usize {
 
 // --- Hashing ----------------------------------------------------------------
 
+@inline
 fn hash_mod(t: *mut Table, n: u64) -> *mut Node {
     unsafe {
         let m = (((node_size(t) - 1) | 1) as u64)
@@ -215,6 +218,7 @@ fn hash_pow2(t: *mut Table, h: u32) -> *mut Node {
         return gnode(t, (h & mask) as isize)
     }
 }
+@inline
 fn hash_int(t: *mut Table, i: i64) -> *mut Node {
     unsafe {
         return hash_mod(t, i2u(i))
@@ -307,6 +311,7 @@ fn node_key_equals(n: *mut Node, key: *mut Value, dead_ok: bool) -> bool {
 // --- Lookup -----------------------------------------------------------------
 
 // Slot of integer key `key`, or the absent marker.
+@inline
 fn tab_get_int(t: *mut Table, key: i64) -> *mut Value {
     unsafe {
         let idx = core.wrapping_sub(i2u(key), 1)
@@ -331,9 +336,10 @@ fn tab_get_int(t: *mut Table, key: i64) -> *mut Value {
     }
 }
 
+@inline
 fn tab_get_shortstr(t: *mut Table, s: *mut LString) -> *mut Value {
     unsafe {
-        let mask = ((1u32 << ((*t).lsizenode as u32)) - 1)
+        let mask = core.wrapping_sub(1u32 << (((*t).lsizenode as u32) & 31), 1)
         n := ptr.offset((*t).node, ((*s).hash & mask) as isize)
         let bits = s as u64
         for {
@@ -348,6 +354,7 @@ fn tab_get_shortstr(t: *mut Table, s: *mut LString) -> *mut Value {
     }
 }
 
+@inline(never)
 fn tab_get_generic(t: *mut Table, key: *mut Value, dead_ok: bool) -> *mut Value {
     unsafe {
         n := main_position(t, key)
@@ -390,6 +397,7 @@ fn float_to_int_exact(f: f64, out: *mut i64) -> bool {
 }
 
 // Slot for any key, or the absent marker.
+@inline(never)
 fn tab_get(t: *mut Table, key: *mut Value) -> *mut Value {
     unsafe {
         let tag = (*key).tag
@@ -684,6 +692,7 @@ fn tab_rehash(L: *mut State, t: *mut Table, extra: *mut Value) -> void!Throw {
 
 // Give the table an array part of `newasize` slots and a hash part with room
 // for `nhsize` keys, moving entries as needed.
+@inline(never)
 fn tab_resize(L: *mut State, t: *mut Table, newasize: u32, nhsize: u32) -> void!Throw {
     unsafe {
         // Allocate first, so a failure leaves the table untouched.
@@ -901,18 +910,38 @@ fn tab_length(t: *mut Table) -> u64 {
 // --- Traversal --------------------------------------------------------------
 
 // Index after which traversal continues for `key` (0 for nil).
-fn tab_find_index(L: *mut State, t: *mut Table, key: *mut Value) -> u64!Throw {
+fn tab_find_index(L: *mut State, t: *mut Table, key: *mut Value, out: *mut u64) -> void!Throw {
     unsafe {
-        if ((*key).tag & 15) == TYPE_NIL {
-            return ok(0)
+        let tag = (*key).tag
+        if (tag & 15) == TYPE_NIL {
+            *out = 0
+            return ok()
         }
         let asize = (*t).asize as u64
-        if (*key).tag == TAG_INT {
+        if tag == TAG_INT {
             let idx = core.wrapping_sub(i2u(val_int(key)), 1)
             if idx < asize {
-                return ok(idx + 1)
+                *out = idx + 1
+                return ok()
+            }
+        } else if tag == TAG_SHORTSTR {
+            // A removed entry's key may have turned into a dead key: then
+            // the generic lookup below finds it.
+            let slot = tab_get_shortstr(t, val_str(key))
+            if (*slot).tag != TAG_ABSENT {
+                *out = (node_offset(slot as *mut Node, (*t).node) as u64) + 1 + asize
+                return ok()
             }
         }
+        tab_find_slow(L, t, key, out)?
+        return ok()
+    }
+}
+
+@inline(never)
+fn tab_find_slow(L: *mut State, t: *mut Table, key: *mut Value, out: *mut u64) -> void!Throw {
+    unsafe {
+        let asize = (*t).asize as u64
         kv := Value { bits: 0, tag: 0 }
         let k = ptr.from_mut(&mut kv)
         set_obj(k, key)
@@ -922,7 +951,8 @@ fn tab_find_index(L: *mut State, t: *mut Table, key: *mut Value) -> u64!Throw {
                 set_int(k, i)
                 let idx = core.wrapping_sub(i2u(i), 1)
                 if idx < asize {
-                    return ok(idx + 1)
+                    *out = idx + 1
+                    return ok()
                 }
             }
         }
@@ -931,7 +961,8 @@ fn tab_find_index(L: *mut State, t: *mut Table, key: *mut Value) -> u64!Throw {
             if (*slot).tag != TAG_ABSENT {
                 let n = slot as *mut Node
                 let idx = node_offset(n, (*t).node) as u64
-                return ok(idx + 1 + asize)
+                *out = idx + 1 + asize
+                return ok()
             }
         }
         return err(err_runtime(L, "invalid key to 'next'"))
@@ -943,7 +974,8 @@ fn tab_find_index(L: *mut State, t: *mut Table, key: *mut Value) -> u64!Throw {
 fn tab_next(L: *mut State, t: *mut Table, key: *mut Value) -> bool!Throw {
     unsafe {
         let asize = (*t).asize as u64
-        i := tab_find_index(L, t, key)?
+        i := 0u64
+        tab_find_index(L, t, key, ptr.from_mut(&mut i))?
         for i < asize {
             let v = ptr.offset((*t).array, i as isize)
             if !val_is_empty(v) {

@@ -161,6 +161,12 @@ struct Global {
     // Testing aid (Lua.set_gc_stress): 1 = one collector step at every check
     // point, 2 = a full collection at every check point.
     gc_stress: u8
+    // Small-block allocator (mem.dodo): a free list per 16-byte size class,
+    // the unused tail of the newest chunk, and the list of chunks.
+    small_free: [17]*mut u8
+    small_cursor: *mut u8
+    small_end: *mut u8
+    small_chunks: *mut u8
 }
 
 // A Lua thread. `*mut State` is the `L` parameter of every internal function.
@@ -302,12 +308,19 @@ fn sv(p: *mut Value, n: isize) -> *mut Value {
     }
 }
 // a - b, in Values.
+@inline
 fn sdiff(a: *mut Value, b: *mut Value) -> isize {
     unsafe {
         unsafe {
-            return ((a as isize) - (b as isize)) >> 4
+            return core.wrapping_sub(a as isize, b as isize) >> 4
         }
     }
+}
+// Narrow a non-negative count below 2^31 (stack sizes, argument counts) to
+// i32 without a conversion check.
+@inline
+fn small_i32(x: isize) -> i32 {
+    return (x & 0x7FFFFFFF) as i32
 }
 // Stack offset of a slot (stable across reallocation).
 fn save_stack(L: *mut State, p: *mut Value) -> isize {
@@ -393,6 +406,7 @@ fn stack_in_use_size(L: *mut State) -> isize {
 
 // Grow the stack so that `n` more slots are available above top. Raises
 // "stack overflow" when the thread exceeds MAX_STACK.
+@cold
 fn stack_grow(L: *mut State, n: isize) -> void!Throw {
     unsafe {
         let size = stack_in_use_size(L)
@@ -469,6 +483,7 @@ fn stack_shrink(L: *mut State) {
 // --- CallInfo records -------------------------------------------------------
 
 // Allocate a frame record after `cur` (slow path of ci_next).
+@cold
 fn ci_extend(L: *mut State, cur: *mut CallInfo) -> (*mut CallInfo)!Throw {
     unsafe {
         let nxt = mem_alloc(L, mem.size_of::<CallInfo>())? as *mut CallInfo
@@ -896,6 +911,7 @@ fn state_close(L0: *mut State) -> isize {
             mem_free(L, (*g).mt as *mut u8, 9 * 8)
         }
         let leaked = (*g).total_bytes
+        mem_release_chunks(g)
         let block = ptr.offset(L as *mut u8, -(mem.offset_of::<MainBlock>("l") as isize))
         free(block)
         return leaked

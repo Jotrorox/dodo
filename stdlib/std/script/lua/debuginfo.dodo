@@ -806,6 +806,7 @@ fn dbg_find_local(L: *mut State, ci: *mut CallInfo, n: i32, ni: &mut NameInfo) -
 
 // --- Hooks ------------------------------------------------------------------
 
+@cold
 fn run_hook(L: *mut State, event: i32, line: i32, ftransfer: i32, ntransfer: i32) -> void!Throw {
     unsafe {
         if !(*L).has_hook || (*L).allowhook == 0 {
@@ -866,6 +867,7 @@ fn run_hook(L: *mut State, event: i32, line: i32, ftransfer: i32, ntransfer: i32
 }
 
 // Call hook for a Lua function entering (savedpc at its first instruction).
+@cold
 fn hook_call_lua(L: *mut State, ci: *mut CallInfo) -> void!Throw {
     unsafe {
         (*L).oldpc = 0
@@ -919,6 +921,7 @@ fn hook_return(L: *mut State, ci: *mut CallInfo, nres: i32) -> void!Throw {
 // Line and count hooks, called before executing each instruction while
 // hooks are active (`pc` points after the instruction). Returns whether the
 // interpreter must keep tracing.
+@cold
 fn vm_trace(L: *mut State, ci: *mut CallInfo, pc: *mut u32) -> bool!Throw {
     unsafe {
         if ((*L).hookmask & HOOK_MASK_INTERRUPT) != 0 {

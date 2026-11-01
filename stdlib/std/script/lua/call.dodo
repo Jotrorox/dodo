@@ -78,6 +78,7 @@ fn move_results(L: *mut State, res: *mut Value, nres: i32, wanted: i32) {
 
 // Finish a call: run the return hook, move the results into place and
 // return to the previous frame.
+@inline(never)
 fn poscall(L: *mut State, ci: *mut CallInfo, nres: i32) -> void!Throw {
     unsafe {
         // A native function's to-be-closed slots are closed on return.
@@ -156,6 +157,7 @@ fn precall_native(L: *mut State, func0: *mut Value, nresults: i32, f: NativeFn) 
 // Prepare a call of the value at `func` (arguments up to top). For a Lua
 // function, push its frame (it becomes L.ci; the caller runs it); for a
 // native function, run it to completion (L.ci is unchanged afterwards).
+@inline(never)
 fn precall(L: *mut State, func0: *mut Value, nresults: i32) -> void!Throw {
     unsafe {
         func := func0
@@ -208,6 +210,7 @@ fn precall(L: *mut State, func0: *mut Value, nresults: i32) -> void!Throw {
 // `narg1` (function + arguments) values; `delta` is the vararg shift of the
 // calling frame. Stores -1 in *nres for a Lua callee (ci now runs it) or
 // the number of results of a native callee (on top of the stack).
+@inline(never)
 fn pretailcall(L: *mut State, ci: *mut CallInfo, func0: *mut Value, narg10: i32, delta: i32, nres: *mut i32) -> void!Throw {
     unsafe {
         func := func0
@@ -263,6 +266,7 @@ fn pretailcall(L: *mut State, ci: *mut CallInfo, func0: *mut Value, narg10: i32,
 
 // Call the value at `func` (arguments up to top) from native code. The call
 // can yield if the context allows it.
+@inline(never)
 fn call_value(L: *mut State, func: *mut Value, nresults: i32) -> void!Throw {
     unsafe {
         (*L).n_ccalls = (*L).n_ccalls + 1
@@ -500,6 +504,7 @@ fn do_pcall_k(L: *mut State, func_off: isize, nresults: i32, errfunc: isize, ctx
 
 // Mark the value at stack offset `off` as to-be-closed (nil and false are
 // ignored; values without __close are an error).
+@cold
 fn tbc_mark(L: *mut State, off: isize) -> void!Throw {
     unsafe {
         let obj = restore_stack(L, off)
@@ -552,6 +557,7 @@ const CLOSE_KTOP: i32 = -1
 // Close upvalues and to-be-closed variables at or above stack offset
 // `level`. For an error `status` the current error object must be on top of
 // the stack; each __close receives it (and a new error replaces it).
+@cold
 fn do_close(L: *mut State, level: isize, status: i32, yieldable: bool) -> void!Throw {
     unsafe {
         func_close_upvals(L, restore_stack(L, level))

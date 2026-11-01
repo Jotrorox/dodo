@@ -682,6 +682,10 @@ impl<'ctx> BasicBlock<'ctx> {
     pub(super) fn get_terminator(self) -> Option<Value<'ctx>> {
         Value::optional(unsafe { LLVMGetBasicBlockTerminator(self.0) })
     }
+    /// The block's address (`blockaddress`), a target of `indirectbr`.
+    pub(super) fn address(self, function: Value<'ctx>) -> Value<'ctx> {
+        Value(unsafe { LLVMBlockAddress(function.0, self.0) }, PhantomData)
+    }
 }
 
 pub struct Module<'ctx>(LLVMModuleRef, PhantomData<&'ctx Context>);
@@ -1552,6 +1556,18 @@ impl<'ctx> Builder<'ctx> {
             unsafe { LLVMAddCase(switch, value.0, block.0) }
         }
         Ok(Value(switch, PhantomData))
+    }
+    pub(super) fn build_indirect_br(
+        &self,
+        address: Value<'ctx>,
+        destinations: &[BasicBlock<'ctx>],
+    ) -> Result<Value<'ctx>> {
+        self.positioned()?;
+        let branch = unsafe { LLVMBuildIndirectBr(self.0, address.0, destinations.len() as u32) };
+        for block in destinations {
+            unsafe { LLVMAddDestination(branch, block.0) }
+        }
+        Ok(Value(branch, PhantomData))
     }
     pub(super) fn build_phi(&self, ty: LlvmType<'ctx>, name: &str) -> Result<Value<'ctx>> {
         self.positioned()?;

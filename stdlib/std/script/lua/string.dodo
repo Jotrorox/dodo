@@ -178,14 +178,12 @@ fn str_intern(L: *mut State, bytes: *const u8, length: usize) -> (*mut LString)!
 
 fn mem_equal(a: *mut u8, b: *mut u8, n: usize) -> bool {
     unsafe {
-        for i in 0usize..n {
-            if *ptr.offset(a, i as isize) != *ptr.offset(b, i as isize) {
-                return false
-            }
-        }
-        return true
+        return n == 0 || str_memcmp(a as *const u8, b as *const u8, n) == 0
     }
 }
+
+@link_name("memcmp")
+unsafe extern "C" fn str_memcmp(a: *const u8, b: *const u8, n: usize) -> i32
 
 // A long string with `length` uninitialized bytes, to be filled by the caller
 // before it becomes visible.
@@ -248,13 +246,10 @@ fn str_compare(a: *mut LString, b: *mut LString) -> i32 {
         } else {
             lb
         }
-        let pa = str_data(a)
-        let pb = str_data(b)
-        for i in 0usize..n {
-            let x = *ptr.offset(pa, i as isize)
-            let y = *ptr.offset(pb, i as isize)
-            if x != y {
-                return if x < y {
+        if n > 0 {
+            let r = str_memcmp(str_data(a) as *const u8, str_data(b) as *const u8, n)
+            if r != 0 {
+                return if r < 0 {
                     -1
                 } else {
                     1

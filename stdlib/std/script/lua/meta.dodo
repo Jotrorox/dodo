@@ -287,6 +287,7 @@ fn meta_call_tm_bool(L: *mut State, f: *mut Value, p1: *mut Value, p2: *mut Valu
 
 // Binary operation on operands that are not both numbers (or that failed a
 // conversion): try the metamethods, else raise the proper error.
+@inline(never)
 fn meta_trybin(L: *mut State, p1: *mut Value, p2: *mut Value, res: isize, event: u32) -> void!Throw {
     unsafe {
         tm := meta_get_tm_by_obj(L, p1, event)
@@ -311,6 +312,7 @@ fn meta_trybin(L: *mut State, p1: *mut Value, p2: *mut Value, res: isize, event:
 
 // Like meta_trybin with an immediate or constant second operand; `flip`
 // means the constant was the first operand in the source.
+@inline(never)
 fn meta_trybin_k(L: *mut State, p1: *mut Value, p2: *mut Value, flip: bool, res: isize, event: u32) -> void!Throw {
     unsafe {
         if flip {
@@ -322,6 +324,7 @@ fn meta_trybin_k(L: *mut State, p1: *mut Value, p2: *mut Value, flip: bool, res:
 
 // --- Comparison -------------------------------------------------------------
 
+@cold
 fn meta_call_order(L: *mut State, p1: *mut Value, p2: *mut Value, event: u32) -> bool!Throw {
     unsafe {
         tm := meta_get_tm_by_obj(L, p1, event)
@@ -351,6 +354,7 @@ fn meta_call_order(L: *mut State, p1: *mut Value, p2: *mut Value, event: u32) ->
 }
 
 // Order metamethod with an immediate operand `v2` (an integer or float).
+@cold
 fn meta_call_order_imm(L: *mut State, p1: *mut Value, v2: i32, flip: bool, isfloat: bool, event: u32) -> bool!Throw {
     unsafe {
         tmp := Value { bits: 0, tag: 0 }
@@ -428,6 +432,7 @@ fn int_float_eq(i: i64, f: f64) -> bool {
 }
 
 // Equality with __eq for tables and full userdata.
+@inline(never)
 fn vm_equal(L: *mut State, t1: *mut Value, t2: *mut Value) -> bool!Throw {
     unsafe {
         let a = (*t1).tag
@@ -453,6 +458,7 @@ fn vm_equal(L: *mut State, t1: *mut Value, t2: *mut Value) -> bool!Throw {
 
 // Finish `t[key]` after the fast path missed (`slot` is the raw lookup result
 // when t is a table, null otherwise); the result goes to stack offset `res`.
+@inline(never)
 fn vm_finish_get(L: *mut State, t0: *mut Value, key: *mut Value, res: isize, slot0: *mut Value) -> void!Throw {
     unsafe {
         let g = G(L)
@@ -495,6 +501,7 @@ fn vm_finish_get(L: *mut State, t0: *mut Value, key: *mut Value, res: isize, slo
 }
 
 // Finish `t[key] = val` after the fast path missed.
+@inline(never)
 fn vm_finish_set(L: *mut State, t0: *mut Value, key: *mut Value, val: *mut Value, slot0: *mut Value) -> void!Throw {
     unsafe {
         let g = G(L)
@@ -572,6 +579,7 @@ fn vm_set(L: *mut State, t: *mut Value, key: *mut Value, val: *mut Value) -> voi
 // --- Length -----------------------------------------------------------------
 
 // R[res] := #rb
+@inline(never)
 fn vm_objlen(L: *mut State, res: isize, rb: *mut Value) -> void!Throw {
     unsafe {
         let t = (*rb).tag
@@ -645,6 +653,7 @@ fn is_empty_string(v: *mut Value) -> bool {
 
 // Concatenate the `total` values on top of the stack; the result replaces
 // them (at top - total) and top drops accordingly. May call __concat.
+@inline(never)
 fn vm_concat(L: *mut State, total0: i32) -> void!Throw {
     unsafe {
         total := total0
