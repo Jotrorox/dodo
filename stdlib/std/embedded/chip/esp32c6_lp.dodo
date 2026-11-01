@@ -1,0 +1,314 @@
+package esp32c6_lp
+
+import "core/mmio"
+import "std/embedded/chip/esp_lp_shared"
+import "std/embedded/hal"
+
+// Support for programs on the ESP32-C6's low-power (LP) core, built with
+// `chip = "esp32c6_lp"`: a small RISC-V core in the always-on LP system,
+// clocked from the 17.5 MHz fast RC oscillator, that keeps running while
+// the main core hibernates. A main firmware embeds the program with
+// `lp-core = "PATH"` in its target and runs it through esp32c6.LpCore.
+//
+// The program's `main` runs from the start each time the core wakes: once
+// for `LpCore.start()`, and again after every period of
+// `LpCore.start_every_us(...)`. When `main` returns, the core halts until
+// its next wake. Statics keep their values from one run to the next, as
+// nothing reinitializes them; they start out as the program set them, and
+// zero. The program has the first 12 KiB of LP SRAM for its code, data,
+// and stack, and no heap; the compiler builds it at -O2 unless the
+// firmware's settings ask for more.
+//
+// The core reaches the LP peripherals: the LP IO pads, GPIO 0 to 7, through
+// `take().pins`; the LP timer, for `now_us` and `take().delay`; and the
+// PMU, for `wake_hp`. The two cores talk through the shared words
+// (`shared` and `set_shared` here, LpCore.shared and set_shared there),
+// which survive hibernation like the rest of LP SRAM. A panic records its
+// message for the main core (LpCore.panic_message) and stops the LP core.
+
+// GPIO 0 to PIN_COUNT - 1 are LP IO pads.
+pub const PIN_COUNT: u32 = 8
+// How many shared words the programs have, for `shared`.
+pub const SHARED_WORDS: u32 = esp_lp_shared.USER_WORDS
+
+const PMU_HP_LP_CPU_COMM: usize = 0x600B_0184
+const LP_TRIGGER_HP: u32 = 1 << 30
+const LP_TIMER_BASE: usize = 0x600B_0C00
+const TIMER_UPDATE: usize = LP_TIMER_BASE + 0x10
+const MAIN_TIMER_UPDATE: u32 = 1 << 28
+const MAIN_BUF0_LOW: usize = LP_TIMER_BASE + 0x14
+const MAIN_BUF0_HIGH: usize = LP_TIMER_BASE + 0x18
+// LP IO: output values and enables (write one to set or clear), the input
+// levels, the pads' configuration (pulls, input enable, function 0, LP
+// GPIO), and LP_AON GPIO_MUX, which hands a pad to the LP IO MUX.
+const LP_IO_BASE: usize = 0x600B_2000
+const LP_OUT_W1TS: usize = LP_IO_BASE + 0x04
+const LP_OUT_W1TC: usize = LP_IO_BASE + 0x08
+const LP_ENABLE_W1TS: usize = LP_IO_BASE + 0x10
+const LP_ENABLE_W1TC: usize = LP_IO_BASE + 0x14
+const LP_IN: usize = LP_IO_BASE + 0x24
+const LP_PIN: usize = LP_IO_BASE + 0x28
+const LP_GPIO: usize = LP_IO_BASE + 0x48
+const PAD_DRIVER: u32 = 1 << 2
+const FUN_WPD: u32 = 1 << 7
+const FUN_WPU: u32 = 1 << 8
+const FUN_IE: u32 = 1 << 9
+const MCU_IE: u32 = 1 << 4
+const MCU_SEL: u32 = 0b111 << 12
+const SLP_SEL: u32 = 1 << 1
+const LP_AON_GPIO_MUX: usize = 0x600B_1028
+// LP_PERI CLK_EN.LP_IO_CK_EN: the LP IO's clock.
+const LP_PERI_CLK_EN: usize = 0x600B_2800
+const LP_IO_CLOCK: u32 = 1 << 27
+
+// The runtime's halt: arms the next periodic wake and stops the core.
+unsafe extern "C" fn dodo_lp_halt()
+
+// Shared word `index`, below SHARED_WORDS: what either core last wrote.
+// Traps past the end.
+pub fn shared(index: u32) -> u32 {
+    core.assert(index < SHARED_WORDS)
+    return esp_lp_shared.read(esp_lp_shared.USER + index)
+}
+
+pub fn set_shared(index: u32, value: u32) {
+    core.assert(index < SHARED_WORDS)
+    esp_lp_shared.write(esp_lp_shared.USER + index, value)
+}
+
+// How many times the core has started since the main core loaded the
+// program, this run included.
+pub fn runs() -> u32 {
+    return esp_lp_shared.read(esp_lp_shared.RUNS)
+}
+
+// Wake the main core: end its hibernation, if it waits for the LP core
+// (Hibernation.wake_on_lp_core), or, while it runs, raise the request that
+// LpCore.take_wake_request reports.
+pub fn wake_hp() {
+    // SAFETY: a write-one trigger in the PMU, which only this core uses.
+    unsafe {
+        mmio.write32(PMU_HP_LP_CPU_COMM, LP_TRIGGER_HP)
+    }
+}
+
+// Stop until the next wake, as returning from `main` does. Does not
+// return; the next wake starts `main` again.
+pub fn halt() {
+    // SAFETY: the runtime's halt only arms the timer and stops the core.
+    unsafe {
+        dodo_lp_halt()
+    }
+    for {}
+}
+
+// Change the time from one start to the next, from the next halt on; 0
+// stops the periodic wakes, so the core runs again only when the main
+// core starts it.
+pub fn set_period_us(microseconds: u64) {
+    ticks := microseconds * ticks_per_10ms() / 10_000
+    if microseconds != 0 && ticks == 0 {
+        ticks = 1
+    }
+    esp_lp_shared.write(esp_lp_shared.PERIOD_HIGH, (ticks >> 32) as u32)
+    esp_lp_shared.write(esp_lp_shared.PERIOD_LOW, (ticks & 0xFFFF_FFFF) as u32)
+}
+
+// The LP timer's count, 48 bits of its RC slow clock, about 136 kHz.
+pub fn ticks() -> u64 {
+    // SAFETY: latching and reading the count has no other effect; the main
+    // core latches the same buffer, so a read can race with its latch and
+    // see a newer count, never an older one.
+    unsafe {
+        mmio.write32(TIMER_UPDATE, MAIN_TIMER_UPDATE)
+        low := mmio.read32(MAIN_BUF0_LOW) as u64
+        high := (mmio.read32(MAIN_BUF0_HIGH) & 0xFFFF) as u64
+        return (high << 32) | low
+    }
+}
+
+// The LP timer's counts per 10 ms, as the main core measured them; 1360,
+// the oscillator's nominal rate, if it has not.
+pub fn ticks_per_10ms() -> u64 {
+    rate := esp_lp_shared.read(esp_lp_shared.TICKS_PER_10MS) as u64
+    if rate == 0 {
+        return 1360
+    }
+    return rate
+}
+
+// Microseconds on the LP timer, since some fixed start; it keeps counting
+// through hibernation and every reset but a power cycle, in steps of about
+// 7 us.
+pub fn now_us() -> u64 {
+    return ticks() * 10_000 / ticks_per_10ms()
+}
+
+// The LP core's peripherals, from `take`.
+pub struct Peripherals {
+    pub pins: Pins
+    pub delay: Delay
+}
+
+// The LP core's peripherals. Each run of `main` takes them anew; a second
+// take in one run hands out the same pads twice, so take once.
+pub fn take() -> Peripherals {
+    // SAFETY: the LP IO clock's bit, which only the LP core changes.
+    unsafe {
+        enable := mmio.read32(LP_PERI_CLK_EN)
+        mmio.write32(LP_PERI_CLK_EN, enable | LP_IO_CLOCK)
+    }
+    return Peripherals { pins: Pins { taken: 0 }, delay: Delay {} }
+}
+
+// A busy-waiting delay on the LP timer, implementing hal.Delay; it waits at
+// least the time asked, rounded up to the timer's 7 us steps.
+pub struct Delay: hal.Delay {
+    pub fn delay_us(&mut self, microseconds: u32) {
+        start := ticks()
+        wait := (microseconds as u64 * ticks_per_10ms() + 9_999) / 10_000 + 1
+        for ticks() - start < wait {}
+    }
+
+    pub fn delay_ms(&mut self, milliseconds: u32) {
+        for _ in 0u32..milliseconds {
+            self.delay_us(1000)
+        }
+    }
+}
+
+// The LP IO pads, GPIO 0 to 7, handed to the LP core as they are claimed.
+// The main program must not claim the same pins.
+pub struct Pins {
+    taken: u32
+
+    // GPIO `number` as an output, low. InvalidInput past GPIO 7, Busy if
+    // claimed already.
+    pub fn output(&mut self, number: u32) -> Pin!hal.Error {
+        pin := self.claim(number)?
+        pin.set_low()
+        pin.set_as_output()
+        return ok(pin)
+    }
+
+    // GPIO `number` as an input, without pulls.
+    pub fn input(&mut self, number: u32) -> Pin!hal.Error {
+        pin := self.claim(number)?
+        pin.set_as_input()
+        return ok(pin)
+    }
+
+    // Give a pin back: it becomes an input without pulls, and the main
+    // core's IO MUX drives the pad again.
+    pub fn release(&mut self, pin: Pin) {
+        number := pin.number
+        pin.set_as_input()
+        pin.set_pull(false, false)
+        // SAFETY: the pin's own bits.
+        unsafe {
+            mux := mmio.read32(LP_AON_GPIO_MUX)
+            mmio.write32(LP_AON_GPIO_MUX, mux & ~(1u32 << number))
+        }
+        self.taken &= ~(1u32 << number)
+    }
+
+    fn claim(&mut self, number: u32) -> Pin!hal.Error {
+        if number >= PIN_COUNT {
+            return err(hal.Error.InvalidInput)
+        }
+        bit := 1u32 << number
+        if (self.taken & bit) != 0 {
+            return err(hal.Error.Busy)
+        }
+        self.taken |= bit
+        // SAFETY: the pad's own configuration register and bits; the pad
+        // is this program's from now on.
+        unsafe {
+            pad := LP_GPIO + 4 * number as usize
+            value := mmio.read32(pad) & ~(MCU_SEL | SLP_SEL)
+            mmio.write32(pad, value | FUN_IE | MCU_IE)
+            mmio.write32(LP_PIN + 4 * number as usize, 0)
+            mux := mmio.read32(LP_AON_GPIO_MUX)
+            mmio.write32(LP_AON_GPIO_MUX, mux | bit)
+        }
+        return ok(Pin { number, mask: bit })
+    }
+}
+
+// One LP IO pad. Implements the std/embedded/hal output and input pin
+// protocols, so drivers written against them run on the LP core too.
+pub struct Pin: hal.OutputPin + hal.InputPin {
+    number: u32
+    mask: u32
+
+    pub fn number(&self) -> u32 {
+        return self.number
+    }
+
+    pub fn set_high(&mut self) {
+        // SAFETY: write-one-to-set: only this pin's bit changes.
+        unsafe {
+            mmio.write32(LP_OUT_W1TS, self.mask)
+        }
+    }
+
+    pub fn set_low(&mut self) {
+        // SAFETY: as in set_high.
+        unsafe {
+            mmio.write32(LP_OUT_W1TC, self.mask)
+        }
+    }
+
+    // The level at the pad, whether the pin drives it or not.
+    pub fn is_high(&self) -> bool {
+        // SAFETY: reading the input levels has no side effects.
+        unsafe {
+            return (mmio.read32(LP_IN) & self.mask) != 0
+        }
+    }
+
+    pub fn set_as_output(&mut self) {
+        // SAFETY: as in set_high.
+        unsafe {
+            mmio.write32(LP_ENABLE_W1TS, self.mask)
+        }
+    }
+
+    pub fn set_as_input(&mut self) {
+        // SAFETY: as in set_high.
+        unsafe {
+            mmio.write32(LP_ENABLE_W1TC, self.mask)
+        }
+    }
+
+    // The pad's pull-up and pull-down, which keep working while the main
+    // core hibernates.
+    pub fn set_pull(&mut self, up: bool, down: bool) {
+        // SAFETY: the pad's own configuration register.
+        unsafe {
+            pad := LP_GPIO + 4 * self.number as usize
+            value := mmio.read32(pad) & ~(FUN_WPU | FUN_WPD)
+            if up {
+                value |= FUN_WPU
+            }
+            if down {
+                value |= FUN_WPD
+            }
+            mmio.write32(pad, value)
+        }
+    }
+
+    // Drive only low, and let the pad float otherwise, for shared lines
+    // such as I2C.
+    pub fn set_open_drain(&mut self, on: bool) {
+        // SAFETY: the pad's own register.
+        unsafe {
+            address := LP_PIN + 4 * self.number as usize
+            value := mmio.read32(address) & ~PAD_DRIVER
+            if on {
+                value |= PAD_DRIVER
+            }
+            mmio.write32(address, value)
+        }
+    }
+}

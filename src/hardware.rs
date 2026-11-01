@@ -26,6 +26,7 @@ use std::path::PathBuf;
 mod atmega328p;
 pub mod avr;
 mod esp32c6;
+pub mod esp32c6_lp;
 pub mod esp_flash;
 pub mod image;
 mod rp2040;
@@ -124,6 +125,11 @@ pub enum ImageFormat {
         page_size: u16,
         baud: u32,
     },
+    /// The program of a coprocessor on chip `host`, such as the ESP32-C6's
+    /// LP core: the contents of its memory from the region's origin, which
+    /// a `host` firmware embeds (`lp-core = "PATH"`) and loads; never
+    /// flashed by itself.
+    Coprocessor { host: &'static str },
 }
 
 #[derive(Debug)]
@@ -140,6 +146,7 @@ pub static CHIPS: &[&Chip] = &[
     &rp2040::CHIP,
     &rp2350::CHIP,
     &esp32c6::CHIP,
+    &esp32c6_lp::CHIP,
     &atmega328p::CHIP,
 ];
 
@@ -273,6 +280,7 @@ impl Platform {
             ImageFormat::Uf2 { .. } => "uf2",
             ImageFormat::EspFlash { .. } => "bin",
             ImageFormat::Stk500 { .. } => "hex",
+            ImageFormat::Coprocessor { .. } => "bin",
         }
     }
 
@@ -297,7 +305,9 @@ impl Platform {
         (self.chip.fixup)(self, elf, &segments)?;
         Ok(match self.chip.image {
             ImageFormat::Uf2 { family, .. } => image::uf2(elf, &segments, family),
-            ImageFormat::EspFlash { .. } => image::flat(elf, &segments, flash.origin),
+            ImageFormat::EspFlash { .. } | ImageFormat::Coprocessor { .. } => {
+                image::flat(elf, &segments, flash.origin)
+            }
             ImageFormat::Stk500 { .. } => {
                 avr::intel_hex(&image::flat(elf, &segments, flash.origin), flash.origin)
                     .into_bytes()
@@ -312,6 +322,7 @@ impl Platform {
             ImageFormat::Uf2 { drive_id, .. } => image::uf2_drives(drive_id),
             ImageFormat::EspFlash { .. } => vec![],
             ImageFormat::Stk500 { .. } => vec![],
+            ImageFormat::Coprocessor { .. } => vec![],
         }
     }
 
@@ -320,6 +331,7 @@ impl Platform {
             ImageFormat::Uf2 { drive_id, .. } => drive_id,
             ImageFormat::EspFlash { .. } => "",
             ImageFormat::Stk500 { .. } => "",
+            ImageFormat::Coprocessor { .. } => "",
         }
     }
 }
@@ -377,7 +389,7 @@ mod tests {
         assert!(
             Platform::select(None, Some("rp2041"))
                 .unwrap_err()
-                .contains("available chips: rp2040, rp2350, esp32c6, atmega328p")
+                .contains("available chips: rp2040, rp2350, esp32c6, esp32c6_lp, atmega328p")
         );
     }
 
@@ -503,7 +515,10 @@ mod tests {
                 .copied()
                 .filter(|name| !name.ends_with("_Handler"))
                 .collect();
-            assert!(!irqs.is_empty(), "{}", chip.name);
+            // A coprocessor, such as the ESP32-C6's LP core, may take no
+            // interrupts at all.
+            let coprocessor = matches!(chip.image, ImageFormat::Coprocessor { .. });
+            assert!(coprocessor || !irqs.is_empty(), "{}", chip.name);
             assert_eq!(table, irqs, "{}", chip.name);
         }
     }

@@ -18,7 +18,7 @@ grouped under `std/embedded` in layers, on top of two small compiler packages:
 | Interrupts | `std/embedded/hal`, `std/embedded/cortex_m` | `@interrupt` handlers; `hal.Critical`, a section that masks interrupts until it is dropped; `hal.Handler`, a slot for a handler chosen at run time; the Cortex-M interrupt controller and SysTick; the ESP32-C6's interrupt matrix in `std/embedded/chip/esp32c6`. |
 | Tasks | `std/embedded/executor` | Several activities on one core, each woken on time or by an interrupt, with the core asleep in between. |
 | Real-time clocks | `std/embedded/hal`, `std/embedded/chip/rp_rtc`, `std/embedded/rtc/ds3231` | `hal.Rtc` and `hal.RtcAlarm`: the time of day and an alarm, the same on the RP2040's RTC, the RP2350's always-on timer, the ESP32-C6's low-power timer, and a DS3231 clock chip on I2C. |
-| Low power | `std/embedded/power` | Sleep and deep sleep, clock gating, and a dormant state woken by pins, through one `Power` protocol that every chip and the fakes implement. |
+| Low power | `std/embedded/power` | Sleep and deep sleep, clock gating, and a dormant state woken by pins, through one `Power` protocol that every chip and the fakes implement; the ESP32-C6's hibernation and its low-power core. |
 | DMA | `std/embedded/hal`, `std/embedded/chip/rp_dma`, `std/embedded/chip/esp32c6` | `hal.DmaChannel`, through which drivers move data while the program does other work; the RP2040's and RP2350's channels, and the ESP32-C6's. |
 | Persistent storage | `std/embedded/hal`, `std/embedded/storage`, `std/embedded/chip/rp_flash`, `std/embedded/chip/esp_flash` | `hal.Flash`, erasing and writing NOR flash; a power-cut-safe key-value store and flash regions on any such device; the RP2040's, RP2350's, and ESP32-C6's program flash. |
 | Desktop testing | `std/embedded/hal/fake` | In-memory pins, delays, buses, serial ports, flash, a real-time clock, a simulated clock, and simulated power controls that record what a driver did. |
@@ -2088,7 +2088,9 @@ that the host finds the port again, and the host has to reopen it.
 time on the low-power timer, which `lp_ticks()` reads. The low-power
 timer's one comparator serves both that timeout and the real-time clock's
 alarm, so an RTC alarm that falls due during a dormant state does not raise
-its interrupt.
+its interrupt. The PMU's deep sleep, which powers the main core down and
+boots the firmware again on waking, is `b.power.hibernate(&wake)`; see
+[hibernation and the LP core](#hibernation-and-the-lp-core-on-the-esp32-c6).
 
 ### Testing power-aware code
 
@@ -3577,26 +3579,28 @@ what earlier firmware left:
 | `p.pins` | GPIO 0 to 23, except GPIO 12 and 13, the USB serial port's lines (GPIO 24 to 30 are the module's flash). The GPIO matrix connects any peripheral signal to any pin, so `i2c`, `i2c_target`, `spi`, `spi_with_select`, `spi_target`, `uart`, `uart_flow`, `pwm`, `pwm_input`, `can`, `i2s_output`, and `i2s_input` take any free pins. `Pin` adds `set_pull(up, down)` and `set_open_drain(on)`, and `listen` watches one edge, both edges, or one level. |
 | I2C | One controller (`esp_i2c`), as master, 1 kHz to 1 MHz, with 7- and 10-bit addresses and `probe`; open-drain lines with the pads' pull-ups. Transactions of any length run as runs of up to 31 bytes that keep the bus, blocking or polled (`hal.I2cPoll`, one run per poll). `i2c_target(sda, scl, address, ten_bit, hz)` makes it a target (`hal.I2cTarget`) at a 7- or 10-bit address, stretching the clock while its receive FIFO is full and while a read waits for `respond`. |
 | SPI | GP-SPI2 (`esp_spi`), as master, from 78.2 kHz to 80 MHz, full duplex in runs of 64 bytes, blocking or polled (`hal.SpiPoll`). Chip selects are output pins, or with `spi_with_select(clock, tx, rx, select, mode, hz)` the controller's own CS0, low across a whole transfer. `spi.dma(&mut channel, &mut buffer)` returns a `hal.SpiDma` session over one DMA channel for transfers of up to 32 736 bytes. `spi_target(clock, tx, rx, select, mode)` makes it a target (`hal.SpiTarget`) for transactions of up to 64 bytes. `set_loopback(true)` reads MISO from the MOSI pin, for self-tests. |
-| Serial ports | UART0 and UART1 (`esp_uart`), 300 to 5 000 000 bit/s, with 128-byte FIFOs, the Reader and Writer protocols and `serial.Port` and `serial.PollPort` with `poll_flush`, `set_format`, `set_crlf`, `set_break`, `set_loopback`, flow control, and interrupts, as `pl011` offers. |
+| Serial ports | UART0 and UART1 (`esp_uart`), 300 to 5 000 000 bit/s, with 128-byte FIFOs, the Reader and Writer protocols and `serial.Port` and `serial.PollPort` with `poll_flush`, `set_format`, `set_crlf`, `set_break`, `set_loopback`, flow control, and interrupts, as `pl011` offers. `port.dma(&mut rx, &mut ring)` receives into a ring buffer by DMA through UHCI0 ([serial ports by DMA](#serial-ports-by-dma-on-the-esp32-c6), `esp_uhci`). |
 | CAN | TWAI0 and TWAI1 (`esp_twai`), classic CAN up to 1 Mbit/s as `hal.Can`: `pins.can(tx, rx, &config, &filters)` with `esp_twai.Config.new(bitrate)`, normal, self-test, and listen-only modes, one-shot sending, and automatic or manual bus-off recovery. The hardware filter is set to pass a superset of the `hal.CanFilter`s and `poll_receive` checks each frame exactly. With `tx == rx` the controller uses one open-drain pad, for a self-test without a transceiver. CAN FD frames are `Unsupported`. |
 | I2S | I2S0 as controller (`esp_i2s`): `pins.i2s_output(data, bclk, ws, &mut dma, &config)` and `i2s_input(...)` with rp_i2s's `Config` (16-, 24-, or 32-bit samples in 16- or 32-bit slots, mono or stereo, Philips or left- or right-justified), as `hal.I2sOutput` and `hal.I2sInput`. Samples stream through a ring of eight 512-byte DMA buffers; the output plays silence when its queue runs dry, and an input given the output's clock pins shares its clocks, for full-duplex codecs. Standard rates from 8 to 96 kHz are exact. |
 | PWM input | `pins.pwm_input(pin, window_us)` measures a pulse train as `hal.PwmInput` (`esp_capture`): the MCPWM capture unit timestamps edges at 6.25 ns and a pulse counter counts them, so periods are averaged over the window, from 1 µs to 25 s. Exact up to 1 MHz; one input at a time. |
 | PWM | The LED PWM controller's six channels and four timers, 5 Hz to 40 MHz, with up to 16384 duty steps; outputs at the same frequency share a timer. |
-| ADC | ADC1 on GPIO 0 to 6, 12 bits at the largest attenuation, calibrated from the chip's eFuse so that 4095 is 3.3 V: `hal.read_millivolts(&mut input, 3300)`. `temperature()` reads the on-chip sensor; `esp32c6.millicelsius` converts its 8-bit readings. |
+| ADC | ADC1 on GPIO 0 to 6, 12 bits at the largest attenuation, calibrated from the chip's eFuse so that 4095 is 3.3 V: `hal.read_millivolts(&mut input, 3300)`. `temperature()` reads the on-chip sensor; `esp32c6.millicelsius` converts its 8-bit readings. `analog_stream` converts up to eight inputs continuously at any attenuation, 306 to 83 333 conversions a second, by DMA into a ring of calibrated samples ([continuous sampling](#continuous-adc-sampling-on-the-esp32-c6), `esp_adc`). |
 | `p.timer` | The system timer: `now_us`, `now_ticks` (16 MHz), the delay protocol, and three alarms. `alarm.schedule_at(time_us)` takes a 64-bit microsecond time; `sleep_until` makes an alarm the [executor](#tasks-and-the-executor)'s clock. |
 | `p.usb.serial()` | The USB serial port (`esp_usb_serial`): the Reader and Writer protocols and `serial.Port` and `serial.PollPort` over the hardware's 64-byte FIFOs. A write waits for a host that has the port open (DTR on) for up to 50 ms, so printing never stops the program, and keeps the first 64 bytes for a terminal opened later. |
 | `p.dma` | The general DMA controller's three channels, as `hal.DmaChannel`, for copies of up to 32 736 bytes between buffers in SRAM, with `copy`, `set_signal`, and interrupts. Its peripherals take DMA through their own interfaces, not register addresses, so a `hal.DmaTransfer` paced by a peripheral is `InvalidInput`; the SPI bus and I2S streams take a channel instead. |
-| `p.rng` | The hardware random number generator (`esp_rng`), as `hal.Rng`. While no analog input is claimed, each fill turns on the ADC's noise source, which Espressif rates fit for keys; with one claimed, only the internal oscillator's jitter is mixed in, which is not. |
+| `p.rng` | The hardware random number generator (`esp_rng`), as `hal.Rng`. While no analog input or stream is claimed, each fill turns on the ADC's noise source, which Espressif rates fit for keys; with one claimed, only the internal oscillator's jitter is mixed in, which is not. |
 | `p.watchdog` | Timer group 0's watchdog (`esp_watchdog`), with `rp_watchdog`'s interface: `start(timeout_ms)` up to one hour in 10 µs steps, `feed`, `stop`, `remaining_us`, `restart`, `reset_reason()`, and two `scratch` words that survive its reset. It resets the whole chip, which boots the firmware again, and a panic while it runs ends in a `Timeout` reset. |
 | `p.rtc` | The low-power timer as a real-time clock (`esp_rtc`), with `hal.Rtc` and `hal.RtcAlarm`: milliseconds that keep counting through every reset but a power cycle, like the RP2350's always-on timer. Its slow clock, about 138 kHz, is calibrated against the crystal at `take()` (within a few hundred ppm; it drifts with temperature, and `rtc.calibrate()` measures again). The alarm raises `LP_RTC_TIMER`. |
 | `p.flash` | The program flash above the image (`esp_flash`), with `rp_flash`'s interface: `program_end()`, `region`, `last`, `free`, and `release`, as `hal.Flash` with 4096-byte erases and single-byte writes, for a [`std/embedded/storage`](#persistent-storage) store. Erasing and writing run from SRAM with interrupts masked, at most about 45 ms per sector, and reads through the flash mapping see the new data at once. |
-| `p.power` | Low power with the [`std/embedded/power`](#low-power) protocol (`esp32c6.Power`). Every `wfi` stops the CPU's clock and wakes within microseconds. The clock gates are `esp32c6.CLOCK_*`, one per enable in the clock controller (57 in all), with `ALARM_CLOCKS` (the system timer), `ESSENTIAL_CLOCKS`, and `ALL_CLOCKS`; claiming a peripheral starts its clocks again. Deep sleep stops the clocks outside the sleep set around each wait and restarts them before the interrupt runs; `dormant(&wake)` is the PMU's light sleep with the crystal, PLL, and fast RC oscillator off. |
-| `pins.ws2812(pin)` | Up to seven WS2812 addressable LEDs, sent by the remote control peripheral (RMT). |
+| `p.power` | Low power with the [`std/embedded/power`](#low-power) protocol (`esp32c6.Power`). Every `wfi` stops the CPU's clock and wakes within microseconds. The clock gates are `esp32c6.CLOCK_*`, one per enable in the clock controller (57 in all), with `ALARM_CLOCKS` (the system timer), `ESSENTIAL_CLOCKS`, and `ALL_CLOCKS`; claiming a peripheral starts its clocks again. Deep sleep stops the clocks outside the sleep set around each wait and restarts them before the interrupt runs; `dormant(&wake)` is the PMU's light sleep with the crystal, PLL, and fast RC oscillator off. `hibernate(&wake)` powers everything but the LP system down until the LP timer, a pin, or the LP core [wakes the chip](#hibernation-and-the-lp-core-on-the-esp32-c6), which then boots again; `wake_cause()` tells which. |
+| `p.lp_core` | The low-power core (`esp32c6.LpCore`), which runs a second Dodo program, built for `chip = "esp32c6_lp"` and embedded with `lp-core`, once or periodically, also while the main core hibernates. |
+| RMT | The remote control peripheral (`esp_rmt`) sends and measures pulse trains, for infrared remotes, one-wire protocols, and servo-like waveforms: `pins.rmt_tx(pin, &config)` claims one of its two transmit channels and `pins.rmt_rx(pin, &config)` one of its two receive channels, on any pin. Pulses are 32-bit codes of two levels and durations of up to 32 767 ticks, at 312.5 kHz to 80 MHz. Each channel has 48 codes of memory and may take the blocks of the channels after it; longer pulse trains are refilled or emptied a quarter of the memory at a time while they run, blocking (`transmit`, `receive` with a timeout) or polled (`poll_transmit`, `poll_receive`). Transmitters add a carrier, an idle level, and loops of up to 1023 repeats or until stopped; receivers end a frame after an idle time, filter glitches up to 3.2 µs, and demodulate a carrier. A receiver given a transmitter's pin reads that pad, for self-tests. |
+| `pins.ws2812(pin)` | WS2812 addressable LEDs on an RMT transmit channel. A write also takes the free memory blocks after the channel, so up to seven LEDs fit in memory at once; longer chains are refilled while they go out, which needs an optimized build. Interrupts are masked during a write. |
 | `esp32c6.reboot_to_bootloader()`, `restart()` | Restart into the boot ROM's download mode, or into the firmware. `dodo run` clears the download request when it flashes. |
 
 The ESP32-C6-DevKitC-1's package, `std/embedded/board/esp32c6_devkitc`,
 hands out the board contract's `pins`, `timer`, `usb`, `dma`, `rng`,
-`watchdog`, `rtc`, `flash`, and `power`, and claims the RGB LED as `b.led`: `set_high` lights it in `LED_ON_COLOR`, a dim
+`watchdog`, `rtc`, `flash`, and `power`, the chip's `lp_core`, and claims the RGB LED as `b.led`: `set_high` lights it in `LED_ON_COLOR`, a dim
 white, and `b.led.set_color(0x00_10_00)` shows any color. `BUTTON_PIN` is
 the BOOT button on GPIO 9, low while pressed. The usual bus pins are on the
 J1 header: I2C on GPIO 6 and 7, SPI on GPIO 2, 4, and 5 with GPIO 3 for a
@@ -3605,6 +3609,121 @@ serial adapter connects to its second USB connector.
 [`examples/esp32c6_tasks`](https://github.com/Jotrorox/dodo/blob/main/examples/esp32c6_tasks/main.dodo)
 runs three tasks on the board, woken by an alarm, the BOOT button's GPIO
 interrupt, and the USB serial port's receive interrupt.
+
+#### Hibernation and the LP core on the ESP32-C6
+
+Hibernation is what Espressif calls deep sleep: the PMU powers down the CPU,
+SRAM, every peripheral of the main (HP) system, the flash, and the crystal,
+and keeps only the always-on LP system: the LP timer, the 16 KiB of LP SRAM,
+GPIO 0 to 7 (the LP IO pads), and the LP core if it runs. A wake boots the
+firmware again from the start, as a reset does, and `b.power.wake_cause()`
+says what woke it:
+
+```dodo
+import "std/embedded/board"
+import "std/embedded/chip"
+import "std/embedded/power"
+
+// Counts the wakes; LP SRAM keeps it through hibernation.
+@section(".lp_noinit")
+static mut WAKES: u32 = 0
+
+fn main() {
+    b := board.take()!
+    unsafe {
+        if b.power.woke_from_hibernation() {
+            WAKES += 1
+        } else {
+            WAKES = 0
+        }
+    }
+    if (b.power.wake_cause() & chip.WAKE_PINS) != 0 {
+        // The button woke the chip: b.power.wake_pins() has bit 4.
+    }
+    button := b.pins.input(4)!
+    button.set_pull(true, false)
+    wake := chip.Hibernation.new()
+    wake.wake_after_us(60_000_000)
+    wake.wake_on_pin(4, power.LEVEL_LOW)
+    error := b.power.hibernate(&wake)
+    // Reached only if the chip cannot hibernate.
+}
+```
+
+`Hibernation` collects the sources: `wake_after_us` on the LP timer,
+`wake_on_pin(pin, level)` for a level, `power.LEVEL_HIGH` or
+`power.LEVEL_LOW`, on GPIO 0 to 7, and `wake_on_lp_core()`. `hibernate`
+returns only on failure: `InvalidInput` without sources, for another pin or
+an edge, or for an LP core that is not running. Claim each wake pin as an
+input with the pull it needs first: its pulls carry over to the LP IO pad,
+which holds them while the main system is off. A source that holds already
+ends the hibernation at once. `wake_cause()` returns the sources that ended
+it, `WAKE_TIMER`, `WAKE_PINS`, and `WAKE_LP_CORE`, or 0 after any other
+reset, and `wake_pins()` the pins among them. SRAM does not survive, but
+statics placed with `@section(".lp_noinit")` live in LP SRAM, up to 3040
+bytes of them, and keep their values through hibernation and every reset but
+a power cycle; they start out random, so mark them valid yourself. The USB
+serial port disappears while the chip hibernates and comes back with the new
+boot. The timer uses the LP timer's target 0, like the RTC's alarm.
+
+The LP core is a second, slower RISC-V core in the LP system, clocked from
+the 17.5 MHz RC oscillator. It runs its own Dodo program, built for
+`chip = "esp32c6_lp"` with `std/embedded/chip/esp32c6_lp` (its
+`std/embedded/chip`), from the first 12 KiB of LP SRAM. Name the program's
+entry file in the firmware's target, or pass `--lp-core FILE`, and the
+compiler builds it, at -O2 unless the firmware asks for more, and embeds its
+image:
+
+```toml
+[targets.app]
+entry = "main.dodo"
+board = "esp32c6_devkitc"
+lp-core = "lp/main.dodo"
+```
+
+```dodo
+// lp/main.dodo, on the LP core.
+package main
+
+import "std/embedded/chip"
+
+// Statics keep their values from one run to the next.
+static mut LOW_COUNT: u32 = 0
+
+fn main() {
+    p := chip.take()
+    sensor := p.pins.input(2)!
+    sensor.set_pull(true, false)
+    if !sensor.is_high() {
+        unsafe {
+            LOW_COUNT += 1
+            chip.set_shared(0, LOW_COUNT)
+        }
+        chip.wake_hp()
+    }
+}
+```
+
+`b.lp_core.start()` loads the image into LP SRAM and runs its `main` once;
+`start_every_us(period)` runs it now and again each period, timed by the LP
+timer, until `stop()`. `main` starts afresh at each run and the core halts
+when it returns, so a periodic program does a little work and sleeps,
+drawing almost nothing in between. The programs share 240 words of LP SRAM,
+`shared(index)` and `set_shared(index, value)` on both cores; `load()`
+clears them, so load, set, then start. The LP program wakes the main core
+with `chip.wake_hp()`: that ends a hibernation that waits for the LP core,
+and while the main core runs, `b.lp_core.take_wake_request()` reports it. On
+the LP core, `take()` hands out `pins`, the LP IO pads GPIO 0 to 7 as `hal`
+output and input pins with pulls and open drain, and `delay`, a `hal.Delay`
+on the LP timer; `now_us()`, `runs()`, `set_period_us`, and `halt()` round it
+out. The main program must not claim the pins the LP program uses. A panic
+on the LP core stops it and leaves its message for
+`b.lp_core.panic_message(&mut buffer)`. The LP core keeps running through
+hibernation, so the boot after a wake finds it as it was; every other reset
+stops it in `take()`, so a program flashed later never meets an earlier
+one's LP core. The repository's
+[`tests/hardware/esp32c6_hibernate`](https://github.com/Jotrorox/dodo/blob/main/tests/hardware/esp32c6_hibernate/main.dodo)
+runs both, with its LP program in `lp/main.dodo`.
 
 #### Interrupts on the ESP32-C6
 
@@ -3637,6 +3756,137 @@ esp32c6.enable(alarm.irq())
 Sources are level-triggered: a handler must clear its peripheral's
 condition, or it runs again at once. Handlers run with interrupts masked,
 one at a time.
+
+#### Pulse trains on the ESP32-C6
+
+The remote control peripheral (RMT), driven by
+`std/embedded/peripheral/esp_rmt`, is the ESP32-C6's counterpart to PIO
+for pulse trains. A pulse train is a slice of `u32` codes, each a level and
+a duration in ticks, then a second level and duration; `esp_rmt.code`
+builds one and `level0`, `ticks0`, `level1`, and `ticks1` take one apart.
+A zero duration ends the train, so a receiver's last code holds one where
+the line went idle. This sends an NEC infrared command on a 38 kHz carrier,
+1 µs per tick:
+
+```dodo
+config := esp_rmt.TxConfig.new(1_000_000)
+config.carrier_hz = 38_000
+config.carrier_duty_percent = 33
+ir := b.pins.rmt_tx(4, &config)!
+codes: [34]u32 = [0u32; 34]
+codes[0] = esp_rmt.code(true, 9000, false, 4500)
+for bit in 0..32u32 {
+    space := 560u32
+    if ((command >> bit) & 1) != 0 {
+        space = 1690
+    }
+    codes[1 + bit as usize] = esp_rmt.code(true, 560, false, space)
+}
+codes[33] = esp_rmt.code(true, 560, false, 560)
+ir.transmit(&codes)!
+```
+
+`esp_rmt.RxConfig.new(resolution_hz, idle_ticks)` sets up a receiver whose
+frames end once the line keeps its level for `idle_ticks`;
+`rx.receive(&mut buffer, timeout_us)` returns the number of codes. The
+channels count ticks of the PLL's 80 MHz output divided by 1 to 256, and
+`resolution_hz()` reports the tick the divider gives. Pulse trains longer
+than a channel's memory are refilled, or emptied, by each poll that finds a
+quarter of the memory done, so a program must poll before the channel has
+gone through the other three quarters: 45 µs for one block of WS2812
+pulses, which an unoptimized build is too slow for (it reports `Overrun`).
+`listen` raises the `RMT` interrupt when a channel needs a poll.
+
+#### Serial ports by DMA on the ESP32-C6
+
+`port.dma(&mut rx, &mut ring)` returns an `esp32c6.UartDma`, a serial port
+with the `std/io` Reader and Writer protocols, `serial.Port`, and
+`serial.PollPort`, like `esp32c6.Uart`, that receives by DMA: UHCI0, the
+chip's bridge between its UARTs and the DMA controller (`esp_uhci`), moves
+every byte that arrives into `ring`, so input waits there and not just in the
+128-byte FIFO. UHCI's packet framing (SLIP separators, headers, CRC, escapes)
+is off, so every byte value arrives unchanged.
+
+```dodo
+port := b.pins.uart(board.UART_TX_PIN, some(board.UART_RX_PIN), 115_200)!
+port.set_crlf(true)
+rx := b.dma.channel()!
+ring: [1024]u8 = [0; 1024]
+serial := port.dma(&mut rx, &mut ring)!
+fmt.printf(&mut serial, "ready\n")!
+```
+
+The ring is the part of `ring` from its first word-aligned byte, cut into 32
+parts of the same size; `ring_size()` tells, and below 131 bytes is
+`InvalidInput`. A part closes, and its bytes become readable, when it is full
+or when the line has been idle for 30 bit times after a byte (2.6 ms at
+115200 baud), so a message is readable just after it ends; `available()`
+counts the readable bytes. Each message takes at least one part, so the ring
+holds at most 32 messages, however short. When it is full, the channel stops
+instead of overwriting it: bytes that arrive beyond the FIFO's 128 are lost,
+and a read returns what the ring held and then reports `esp_uart.OVERRUN`,
+after which reception goes on. Bytes with framing or parity errors, and
+breaks, are dropped, and a read reports them after the bytes it returns.
+
+Writes go through the transmit FIFO, as on `esp32c6.Uart`: a write waits
+only while the FIFO is full. UHCI's transmit side does not work on the
+ESP32-C6: linked to either UART, it writes the first byte of a transfer into
+the FIFO over and over and never takes the next. `read`, `poll_read`,
+`set_crlf`, the poll limits, and the interrupt methods work as on
+`esp32c6.Uart`. One port at a time receives by DMA (`Busy` otherwise), and
+dropping the session stops the channel and hands the port back; input still
+in the ring is lost.
+
+#### Continuous ADC sampling on the ESP32-C6
+
+`pins.analog_stream(&channels, rate_hz, &mut dma, &mut buffer)` converts
+analog inputs continuously and streams the results by DMA, while the
+program does other work. `channels` lists up to eight `esp_adc.Channel`s,
+each a pin (GPIO 0 to 6) and an attenuation (`Db0`, `Db2p5`, `Db6`, or
+`Db12`, which reach about 0.95, 1.25, 1.75, and 3.3 V); the converter's
+timer takes them in turn, `rate_hz` conversions a second in all, from 306
+to 83 333. The rate is 1.25 MHz divided by a whole number, and `rate_hz()`
+tells the one it got.
+
+```dodo
+import "std/embedded/chip/esp_adc"
+
+channels := [esp_adc.Channel { pin: 1, attenuation: esp_adc.Attenuation.Db12 },
+             esp_adc.Channel { pin: 2, attenuation: esp_adc.Attenuation.Db0 }]
+dma := b.dma.channel()!
+buffer: [4096]u8 = [0; 4096]
+stream := b.pins.analog_stream(&channels, 10_000, &mut dma, &mut buffer)!
+samples: [64]u32 = [0u32; 64]
+count := stream.poll_read(&mut samples)!
+for index in 0..count {
+    pin := esp_adc.sample_channel(samples[index])
+    millivolts := esp_adc.sample_millivolts(samples[index])
+}
+b.pins.release_analog_stream(stream)
+```
+
+Each sample is a word: `esp_adc.sample_millivolts` gives the voltage,
+calibrated from the chip's eFuse for the channel's attenuation as Espressif's
+drivers do it, `sample_channel` the pin, and `sample_raw` the 12-bit
+reading. The channel stores 4 bytes per conversion in a ring: the buffer
+from its first word-aligned byte, split into eight parts. Samples become
+readable a part at a time, so a 4 KiB buffer holds 1024 samples, 102 ms at
+10 kHz, readable every 12.8 ms; `available()`, `capacity()`, and
+`part_samples()` tell. `poll_read` returns what is there without waiting,
+and `read` waits until its slice is full. When the ring is full, the
+channel stops instead of overwriting it: the conversions that follow are
+lost, and once the program has read what the ring held, the next
+`poll_read` reports `Overrun` and the stream starts again from the first
+channel.
+
+The stream has the converter to itself: `analog_stream` is `Busy` while an
+analog input or the temperature sensor is claimed, and they are `Busy` until
+`release_analog_stream` gives the stream back, which also resets the
+converter for them. Meanwhile the random number generator mixes in only its
+secondary source, as with an analog input claimed. The converter corrects its
+offset with one setting for all conversions, the one for the first channel's
+attenuation, so channels at other attenuations in the same stream read a few
+millivolts off.
 
 ### Custom boards
 
@@ -3696,7 +3946,8 @@ toolchain is involved. `scripts/test_pico.py` (with
 check a chip on real hardware, and `scripts/test_rp2350_float.py` checks the
 RP2350's coprocessor `f64` helpers against the software ones on a board.
 `scripts/test_esp32c6.py --project tests/hardware/esp32c6_buses` (or
-`esp32c6_can_audio`, `esp32c6_system` with `--follow-resets`, or
+`esp32c6_can_audio`, `esp32c6_dma`, `esp32c6_rmt` with `-O 2`,
+`esp32c6_system` or `esp32c6_hibernate` with `--follow-resets`, or
 `esp32c6_power` with `--reconnect`) runs the ESP32-C6's other hardware
 checks. Without a
 board, `scripts/test_emulator.py` runs the self-test in `tests/emulator` on
@@ -3731,23 +3982,32 @@ dodo build firmware.dodo --emit obj --target thumbv7em-none-eabihf \
 
 - The boards are `pico`, `pico2`, `pico2_w`, `esp32c6_devkitc`, and
   `arduino_uno`, on the `rp2040`, `rp2350`, `esp32c6`, and `atmega328p`
-  chips. The Raspberry Pi chip packages cover clocks, GPIO, I2C, SPI, UART, PWM, the ADC,
+  chips, and `esp32c6_lp` builds for the ESP32-C6's low-power core. The Raspberry Pi chip packages cover clocks, GPIO, I2C, SPI, UART, PWM, the ADC,
   PIO, the timer, the real-time clock, the watchdog, DMA, a USB serial port,
   the random number generators, low power, and the second core; other USB
   devices (HID, mass storage, several functions at once) or USB host mode
   are not bundled
   yet. Write them with `hal.Reg` as above.
-- On the ESP32-C6, the radios (Wi-Fi, Bluetooth LE, IEEE 802.15.4) and the
-  low-power core are not supported. The I2C target cannot tell two writes
+- On the ESP32-C6, the radios (Wi-Fi, Bluetooth LE, IEEE 802.15.4) are not
+  supported. The LP core's program takes no interrupts and reaches the LP
+  IO pads and the LP timer; the LP UART and LP I2C have no drivers, and its
+  wakes by LP IO or ETM events are not exposed. The I2C target cannot tell two writes
   joined by a repeated START apart, and the SPI target exchanges
   transactions of up to 64 bytes, with time to poll between them. I2S runs
   as controller only, and one PWM input runs at a time. The real-time clock
   runs from the internal slow oscillator, which drifts with temperature; a
-  32 kHz crystal is not supported. Deep sleep is clock gating around each
-  wait rather than a hardware state, and the dormant state sees pin levels,
-  not edges. An ADC input draws enough current while it samples that
-  sources above about 10 kOhm read low. Flashing works from macOS and
-  Linux.
+  32 kHz crystal is not supported. `power.Mode.DeepSleep` is clock gating
+  around each wait rather than a hardware state (hibernation is the
+  hardware's deep sleep, ending in a new boot), and the dormant state and
+  hibernation see pin levels, not edges. An ADC input draws enough current
+  while it samples that sources above about 10 kOhm read low, and an ADC
+  stream corrects the converter's offset for its first channel's
+  attenuation only. A serial port receives by DMA but sends through its
+  FIFO, as UHCI0's transmit side does not work. RMT channels are refilled
+  and emptied by polling, so pulse trains longer than their memory at a few
+  microseconds per code, such as WS2812 chains of more than seven LEDs,
+  need an optimized build; the two transmit channels cannot start in sync.
+  Flashing works from macOS and Linux.
 - PIO state machines move words through their FIFOs by polling or their
   interrupts. DMA can pace transfers by their FIFOs' data requests
   (`rp_dma.request` with `sm.tx_fifo_address()`), and `hal.DmaStream` runs
@@ -3757,9 +4017,12 @@ dodo build firmware.dodo --emit obj --target thumbv7em-none-eabihf \
   supported. `rp_pio.assemble` takes one program per call.
 - PWM inputs measure by counting over windows, as the slices cannot
   timestamp edges; the PWM wrap interrupt is not exposed. ADC reads are
-  polled one at a time, without the round-robin sampler, FIFO, or DMA.
-- A serial port keeps no more input than its 32-byte FIFO unless it
-  receives [by DMA](#serial-ports-by-dma), a program serves its interrupts,
+  polled one at a time, without the round-robin sampler, FIFO, or DMA,
+  which the ESP32-C6 has ([continuous sampling](#continuous-adc-sampling-on-the-esp32-c6)).
+- A serial port keeps no more input than its FIFO (32 bytes on the
+  Raspberry Pi chips, 128 on the ESP32-C6) unless it receives by DMA
+  ([RP2040 and RP2350](#serial-ports-by-dma),
+  [ESP32-C6](#serial-ports-by-dma-on-the-esp32-c6)), a program serves its interrupts,
   as in [an interrupt-driven driver](#an-interrupt-driven-driver), or the
   other end honours RTS. An I2C master is the bus's only master, without high-speed
   mode, which the chips' controllers lack, and cannot send empty transfers.

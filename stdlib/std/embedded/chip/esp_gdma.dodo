@@ -1,0 +1,259 @@
+package esp_gdma
+
+import "core/cpu"
+import "core/ptr"
+import "std/embedded/hal"
+
+// Streams between the ESP32-C6's peripherals and memory through its general
+// DMA controller (GDMA), for the drivers that keep a peripheral's data
+// flowing in the background: std/embedded/peripheral/esp_uhci (serial ports
+// by DMA) and std/embedded/chip/esp_adc (the ADC's continuous sampler). The
+// chip package claims the channels (esp32c6.Dma), opens SRAM to the
+// controller, and passes descriptor storage in SRAM; the drivers here touch
+// the controller only through a hal.Registers that spans the chip's address
+// space (offsets are bus addresses), so desktop tests run them against a
+// simulated controller that follows the same descriptors.
+//
+// InRing receives. Its descriptors split a buffer into parts of the same
+// size and are linked into a loop that the channel follows round and
+// round. A descriptor handed to the channel has its owner bit set; the
+// channel fills the part, writes the descriptor back with the length it
+// stored and the owner bit clear, and moves on to the next. A part closes
+// when it is full or when the peripheral marks the end of its data early
+// (an EOF, such as a pause on a serial line). The channel checks owner bits
+// (IN_CHECK_OWNER), so it never overwrites a part the program has not read:
+// the program reads closed parts in ring order, hands each back once read,
+// and a ring that fills up stops the channel at the oldest unread part
+// (IN_DSCR_ERR). Nothing is lost from the ring then; what the peripheral
+// produces meanwhile is. The program learns of it from `stalled`, once it
+// has read everything the ring held, and `start` begins again.
+//
+// This is how progress is tracked without interrupts: the descriptors'
+// owner bits and lengths, which the channel writes to memory after the
+// data, say exactly which bytes are complete, however late the program
+// looks. The channel's address registers (IN_DSCR) would only tell where it
+// is now, not how many times it went round.
+//
+// Register names follow the ESP32-C6 technical reference manual (GDMA
+// Controller).
+
+pub const BASE: usize = 0x6008_0000
+// Receive interrupt registers, 0x10 apart per channel: raw, status,
+// enable, clear.
+const IN_INT: usize = BASE + 0x00
+// Per channel, 0xC0 apart.
+const CHANNEL: usize = BASE + 0x70
+const STRIDE: usize = 0xC0
+const IN_CONF0: usize = 0x00
+const IN_CONF1: usize = 0x04
+const IN_LINK: usize = 0x10
+const IN_PERI_SEL: usize = 0x30
+const CHANNEL_RESET: u32 = 1 << 0
+// IN_CONF0: burst reads of descriptors and burst data writes, which the
+// word-aligned parts allow.
+const IN_BURSTS: u32 = (1u32 << 2) | (1u32 << 3)
+const CHECK_OWNER: u32 = 1 << 12
+const LINK_ADDRESS: u32 = 0xF_FFFF
+const IN_LINK_STOP: u32 = 1 << 21
+const IN_LINK_START: u32 = 1 << 22
+// IN_DSCR_ERR and IN_DSCR_EMPTY: the channel met a descriptor it does not
+// own, or ran out of them.
+const IN_STALLED: u32 = (1u32 << 3) | (1u32 << 4)
+const ALL_INTERRUPTS: u32 = 0x7F
+
+// Peripherals in IN_PERI_SEL.
+pub const PERIPHERAL_UHCI0: u32 = 2
+pub const PERIPHERAL_ADC: u32 = 8
+pub const NO_PERIPHERAL: u32 = 0x3F
+
+// Descriptor word 0: the part's size (bits 11-0), the length stored
+// (23-12), EOF (30), and owned by the channel (31); then the part's address
+// and the next descriptor's.
+pub const OWNED: u32 = 1u32 << 31
+pub const EOF: u32 = 1 << 30
+pub const DESCRIPTOR_BYTES: usize = 4092
+pub const DESCRIPTOR_WORDS: usize = 3
+
+// The low 32 bits of an address: the chip's own, and on a desktop what a
+// simulated controller matches against the buffers it knows.
+pub fn low32(address: usize) -> u32 {
+    return (address & 0xFFFF_FFFF) as u32
+}
+
+fn channel_base(channel: u32) -> usize {
+    return CHANNEL + STRIDE * channel as usize
+}
+
+fn word_address(words: &[u32]) -> usize {
+    // SAFETY: the pointer becomes a number and is never dereferenced here.
+    unsafe {
+        return ptr.as_ptr(words) as usize
+    }
+}
+
+// A receive channel streaming into a ring of parts; see above.
+pub struct InRing {
+    channel: u32
+    peripheral: u32
+    descriptors: &mut[u32]
+    buffer: &mut[u8]
+    // The first word-aligned byte of `buffer`, the parts, and their size.
+    start: usize
+    count: usize
+    size: usize
+    // The part to read next, and the bytes of it already read.
+    read_at: usize
+    read_offset: usize
+
+    // Divide `buffer` into descriptors.len / 3 parts of the same size, a
+    // multiple of 4 bytes up to DESCRIPTOR_BYTES, from its first
+    // word-aligned byte, for GDMA channel `channel` serving `peripheral`.
+    // Nothing starts until `start`. InvalidInput for fewer than two
+    // descriptors or a buffer too short for a word in each part.
+    pub fn new(channel: u32, peripheral: u32, descriptors: &mut[u32], buffer: &mut[u8]) -> InRing!hal.Error from(descriptors, buffer) {
+        address := hal.address_of(buffer)
+        start := (4 - address % 4) % 4
+        count := descriptors.len / DESCRIPTOR_WORDS
+        if count < 2 || start >= buffer.len {
+            return err(hal.Error.InvalidInput)
+        }
+        size := (buffer.len - start) / count / 4 * 4
+        if size > DESCRIPTOR_BYTES {
+            size = DESCRIPTOR_BYTES
+        }
+        if size == 0 {
+            return err(hal.Error.InvalidInput)
+        }
+        return ok(InRing { channel, peripheral, descriptors, buffer, start, count, size, read_at: 0, read_offset: 0 })
+    }
+
+    pub fn channel(&self) -> u32 {
+        return self.channel
+    }
+
+    // Bytes in each part.
+    pub fn part_size(&self) -> usize {
+        return self.size
+    }
+
+    pub fn parts(&self) -> usize {
+        return self.count
+    }
+
+    // The bytes the ring holds when full.
+    pub fn ring_size(&self) -> usize {
+        return self.size * self.count
+    }
+
+    // The address of the first descriptor, where the channel starts.
+    pub fn first_descriptor(&self) -> usize {
+        return word_address(self.descriptors)
+    }
+
+    // The address of the first part.
+    pub fn first_part(&self) -> usize {
+        return hal.address_of(self.buffer) + self.start
+    }
+
+    // Link the descriptors into a loop, hand every part to the channel,
+    // reset the channel, and start it at the first part.
+    pub fn start(&mut self, bus: &mut dyn hal.Registers) {
+        base := channel_base(self.channel)
+        bus.write(base + IN_LINK, IN_LINK_STOP)
+        first := self.first_descriptor()
+        data := self.first_part()
+        for index in 0..self.count {
+            self.descriptors[DESCRIPTOR_WORDS * index] = self.size as u32 | OWNED
+            self.descriptors[DESCRIPTOR_WORDS * index + 1] = low32(data + index * self.size)
+            self.descriptors[DESCRIPTOR_WORDS * index + 2] = low32(first + 4 * DESCRIPTOR_WORDS * ((index + 1) % self.count))
+        }
+        self.read_at = 0
+        self.read_offset = 0
+        bus.write(base + IN_CONF0, IN_BURSTS | CHANNEL_RESET)
+        bus.write(base + IN_CONF0, IN_BURSTS)
+        bus.write(base + IN_CONF1, CHECK_OWNER)
+        bus.write(base + IN_PERI_SEL, self.peripheral)
+        bus.write(IN_INT + 0x10 * self.channel as usize + 0xC, ALL_INTERRUPTS)
+        // The descriptors reach memory before the channel reads them.
+        cpu.fence()
+        bus.write(base + IN_LINK, (low32(first) & LINK_ADDRESS) | IN_LINK_START)
+    }
+
+    // Stop the channel and disconnect it from the peripheral.
+    pub fn stop(&mut self, bus: &mut dyn hal.Registers) {
+        base := channel_base(self.channel)
+        bus.write(base + IN_LINK, IN_LINK_STOP)
+        bus.write(base + IN_CONF0, IN_BURSTS | CHANNEL_RESET)
+        bus.write(base + IN_CONF0, IN_BURSTS)
+        bus.write(base + IN_PERI_SEL, NO_PERIPHERAL)
+        bus.write(IN_INT + 0x10 * self.channel as usize + 0xC, ALL_INTERRUPTS)
+    }
+
+    // Whether the channel stopped at a part the program had not read: the
+    // ring filled up, and whatever the peripheral produced since was lost.
+    pub fn stalled(&mut self, bus: &mut dyn hal.Registers) -> bool {
+        return (bus.read(IN_INT + 0x10 * self.channel as usize) & IN_STALLED) != 0
+    }
+
+    // The bytes in closed parts not yet read.
+    pub fn available(&mut self) -> usize {
+        total := 0usize
+        index := self.read_at
+        for _ in 0..self.count {
+            word := self.descriptor_word(index)
+            if (word & OWNED) != 0 {
+                break
+            }
+            total += ((word >> 12) & 0xFFF) as usize
+            index = (index + 1) % self.count
+        }
+        return total - self.read_offset
+    }
+
+    // Copy bytes of closed parts, oldest first, into `out`, up to its
+    // length, handing each part back to the channel once read; returns how
+    // many.
+    pub fn read(&mut self, out: &mut[u8]) -> usize {
+        count := 0usize
+        for count < out.len {
+            word := self.descriptor_word(self.read_at)
+            if (word & OWNED) != 0 {
+                break
+            }
+            length := ((word >> 12) & 0xFFF) as usize
+            // The part's data was in memory before its descriptor.
+            cpu.fence()
+            part := self.start + self.read_at * self.size
+            for count < out.len && self.read_offset < length {
+                out[count] = self.buffer[part + self.read_offset]
+                count += 1
+                self.read_offset += 1
+            }
+            if self.read_offset >= length {
+                self.hand_back()
+            }
+        }
+        return count
+    }
+
+    // Word 0 of descriptor `index`, as the channel last wrote it.
+    fn descriptor_word(&self, index: usize) -> u32 {
+        // SAFETY: a word read of a descriptor the channel writes back.
+        unsafe {
+            return ptr.read_volatile(ptr.as_ptr(&self.descriptors[DESCRIPTOR_WORDS * index..DESCRIPTOR_WORDS * index + 1]))
+        }
+    }
+
+    // Give the part being read back to the channel and move to the next.
+    fn hand_back(&mut self) {
+        index := DESCRIPTOR_WORDS * self.read_at
+        // The reads of the part finish before the channel may write it.
+        cpu.fence()
+        // SAFETY: the descriptor is the program's until this write.
+        unsafe {
+            ptr.write_volatile(ptr.as_mut_ptr(&mut self.descriptors[index..index + 1]), self.size as u32 | OWNED)
+        }
+        self.read_at = (self.read_at + 1) % self.count
+        self.read_offset = 0
+    }
+}

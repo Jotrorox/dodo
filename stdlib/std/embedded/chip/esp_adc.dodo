@@ -1,0 +1,426 @@
+package esp_adc
+
+import "std/embedded/chip/esp_gdma"
+import "std/embedded/hal"
+
+// Continuous sampling with the ESP32-C6's SAR ADC1, for the esp32c6 chip
+// package, which hands a Stream out wrapped as `esp32c6.AnalogStream` from
+// `Pins.analog_stream`. The converter's digital controller (APB_SARADC)
+// converts the entries of its pattern table in turn, up to MAX_CHANNELS
+// inputs on GPIO 0 to 6, each with its own attenuation, one conversion each
+// time its timer expires; the results stream through a GDMA channel
+// (peripheral ADC) into a ring buffer while the program does other work.
+//
+// Timing. The controller's clock is the 40 MHz crystal divided by
+// CLOCK_DIVIDER in PCR (the chip package sets it); its timer counts at half
+// that, TIMER_HZ, and starts a conversion every SARADC_TIMER_TARGET counts,
+// 15 to 4095, so `rate_hz` runs from MIN_RATE_HZ to MAX_RATE_HZ
+// conversions a second in all, shared by the channels in turn. The rate is
+// TIMER_HZ divided by a whole number: 10 kHz is exact, 44.1 kHz comes out
+// at 44 643 Hz (`rate_hz()` tells).
+//
+// Results. Each conversion is a 32-bit word in memory: the 12-bit reading,
+// the channel (bits 15-13), and the unit (bit 16, 0 for ADC1). The stream
+// turns each into a sample word for the program: millivolts in bits 15-0,
+// calibrated from eFuse for the channel's attenuation as Espressif's
+// drivers do it (`Calibration`), the channel in bits 19-16, and the raw
+// reading in bits 31-20; `sample_millivolts`, `sample_channel`, and
+// `sample_raw` take them apart.
+//
+// The ring. The buffer is split into the descriptors' parts (an
+// esp_gdma.InRing), and the controller marks the end of each part's worth
+// of conversions (APB_ADC_EOF_NUM), so samples become readable a part at a
+// time: with the chip package's eight parts, an eighth of the buffer at a
+// time. A 4 KiB buffer holds 1024 samples, 102 ms at 10 kHz, readable every
+// 12.8 ms. The channel never overwrites a part the program has not read:
+// when the ring is full it stops, the conversions that follow are lost,
+// and once the program has read every sample the ring held, the next
+// poll_read reports Overrun and the stream starts again from the pattern's
+// first entry.
+//
+// The converter's offset correction (its initial code) is one setting for
+// all conversions; the chip package loads the one for the first channel's
+// attenuation, so channels at other attenuations in the same stream read a
+// few millivolts off.
+//
+// The stream works over any hal.Registers spanning the chip's address
+// space, the APB_SARADC and GDMA registers at their bus addresses
+// (esp32c6 passes a hal.RegisterBlock at 0; a desktop test, a model).
+// Register names follow the ESP32-C6 technical reference manual (On-Chip
+// Sensors and Analog Signal Processing, GDMA Controller).
+
+pub const APB_SARADC_BASE: usize = 0x6000_E000
+const CTRL: usize = APB_SARADC_BASE + 0x00
+const CTRL2: usize = APB_SARADC_BASE + 0x04
+const FSM_WAIT: usize = APB_SARADC_BASE + 0x0C
+const PATT_TAB1: usize = APB_SARADC_BASE + 0x18
+const PATT_TAB2: usize = APB_SARADC_BASE + 0x1C
+const ONETIME_SAMPLE: usize = APB_SARADC_BASE + 0x20
+const DMA_CONF: usize = APB_SARADC_BASE + 0x50
+// CTRL: software start (the one-shot conversions' mode) and its trigger,
+// the SAR clock gate, the SAR clock divider, the pattern length less one,
+// clearing the pattern pointer, and the converter's forced power.
+const START_FORCE: u32 = 1 << 0
+const START: u32 = 1 << 1
+const SAR_CLOCK_GATED: u32 = 1 << 6
+const SAR_CLOCK_DIVIDER: u32 = 0xFF << 7
+const PATTERN_LENGTH: u32 = 0b111 << 15
+const PATTERN_POINTER_CLEAR: u32 = 1 << 23
+const FORCED_POWER: u32 = 0b11 << 27
+// CTRL2: the conversion limit (off), its count, the timer's target, and
+// the timer.
+const MAX_CONVERSIONS: u32 = 0xFF << 1
+const TIMER_TARGET: u32 = 0xFFF << 12
+const TIMER_ENABLE: u32 = 1 << 24
+// FSM_WAIT: the converter's power-up, reset, and standby waits, as
+// Espressif's drivers set them.
+const FSM_TIMES: u32 = 5 | (8u32 << 8) | (100u32 << 16)
+// DMA_CONF: conversions per EOF, the controller's reset, and DMA on.
+const EOF_COUNT: u32 = 0xFFFF
+const RESET_FSM: u32 = 1 << 30
+const DMA_ON: u32 = 1u32 << 31
+
+// The PCR divider of the 40 MHz crystal that clocks the controller, and the
+// timer's rate.
+pub const CLOCK_DIVIDER: u32 = 16
+pub const TIMER_HZ: u32 = 1_250_000
+pub const MIN_RATE_HZ: u32 = 306
+pub const MAX_RATE_HZ: u32 = 83_333
+const MIN_TARGET: u32 = 15
+const MAX_TARGET: u32 = 4095
+
+// Pattern table entries, and GPIO 0 to 6 as ADC1 channels 0 to 6.
+pub const MAX_CHANNELS: usize = 8
+pub const ADC_CHANNELS: u32 = 7
+// Bytes per conversion in memory.
+const RESULT_BYTES: usize = 4
+
+// The analog front end's attenuation of an input: the larger, the higher
+// the voltage it reads, from about 0.95 V at 0 dB to about 3.3 V at 12 dB.
+pub enum Attenuation {
+    Db0,
+    Db2p5,
+    Db6,
+    Db12
+}
+
+// The attenuation's code, 0 to 3, as the converter and eFuse number them.
+pub fn attenuation_code(attenuation: &Attenuation) -> u32 {
+    match attenuation {
+        Attenuation.Db0 => {
+            return 0
+        }
+        Attenuation.Db2p5 => {
+            return 1
+        }
+        Attenuation.Db6 => {
+            return 2
+        }
+        Attenuation.Db12 => {
+            return 3
+        }
+    }
+}
+
+// One entry of a stream's pattern: an input, GPIO 0 to 6, and its
+// attenuation.
+pub struct Channel {
+    pub pin: u32
+    pub attenuation: Attenuation
+}
+
+// The millivolts at full scale for each attenuation without calibration
+// data, roughly.
+const NOMINAL_MV: [4]u32 = [950u32, 1250, 1750, 3300]
+
+// The converter's calibration, from the chip's eFuse, per attenuation code:
+// the initial code that cancels its offset, and a reference point (a
+// reading and the millivolts that gave it); and per channel the offset
+// from the others at 0 dB, which shrinks with attenuation. `scheme` is 0
+// for a chip without calibration data, where millivolts are only roughly
+// right.
+pub struct Calibration {
+    pub scheme: u32
+    pub init_code: [4]u32
+    pub reference_mv: [4]u32
+    pub reference_code: [4]u32
+    pub channel_offset: [7]i32
+
+    // No calibration data.
+    pub fn none() -> Calibration {
+        return Calibration { scheme: 0, init_code: [0u32; 4], reference_mv: [0u32; 4], reference_code: [0u32; 4], channel_offset: [0i32; 7] }
+    }
+
+    // The millivolts a reading `raw` of `channel` at attenuation code
+    // `attenuation` stands for: the reading less the channel's offset,
+    // scaled by the reference point, as Espressif's drivers compute it.
+    pub fn millivolts(&self, channel: u32, attenuation: u32, raw: u32) -> u16 {
+        code := attenuation & 3
+        if self.scheme == 0 || self.reference_code[code as usize] == 0 {
+            return (raw * NOMINAL_MV[code as usize] / 4095) as u16
+        }
+        offset := 0i32
+        if channel < ADC_CHANNELS {
+            offset = self.channel_offset[channel as usize] * (4 - code as i32)
+        }
+        basic := raw as i32 - offset
+        if basic < 0 {
+            basic = 0
+        } else if basic > 4095 {
+            basic = 4095
+        }
+        millivolts := basic as u32 * self.reference_mv[code as usize] / self.reference_code[code as usize]
+        if millivolts > 0xFFFF {
+            millivolts = 0xFFFF
+        }
+        return millivolts as u16
+    }
+}
+
+// The parts of a sample word.
+pub fn sample_millivolts(sample: u32) -> u16 {
+    return (sample & 0xFFFF) as u16
+}
+
+pub fn sample_channel(sample: u32) -> u32 {
+    return (sample >> 16) & 0xF
+}
+
+pub fn sample_raw(sample: u32) -> u16 {
+    return ((sample >> 20) & 0xFFF) as u16
+}
+
+// The conversion a result word in memory holds: the reading, the channel,
+// and whether it is an ADC1 conversion of one of its channels.
+pub fn result_raw(word: u32) -> u32 {
+    return word & 0xFFF
+}
+
+pub fn result_channel(word: u32) -> u32 {
+    return (word >> 13) & 0x7
+}
+
+pub fn result_valid(word: u32) -> bool {
+    return ((word >> 16) & 1) == 0 && result_channel(word) < ADC_CHANNELS
+}
+
+// The timer target for `rate_hz` conversions a second; InvalidInput out of
+// range.
+pub fn timer_target(rate_hz: u32) -> u32!hal.Error {
+    if rate_hz < MIN_RATE_HZ || rate_hz > MAX_RATE_HZ {
+        return err(hal.Error.InvalidInput)
+    }
+    target := (TIMER_HZ + rate_hz / 2) / rate_hz
+    if target < MIN_TARGET || target > MAX_TARGET {
+        return err(hal.Error.InvalidInput)
+    }
+    return ok(target)
+}
+
+// A pattern table entry: the channel and the attenuation code.
+fn pattern_entry(pin: u32, attenuation: u32) -> u32 {
+    return (pin << 2) | attenuation
+}
+
+// The controller's settings a stream changes, to put back when it stops.
+struct Saved {
+    ctrl: u32
+    ctrl2: u32
+    fsm_wait: u32
+    pattern1: u32
+    pattern2: u32
+}
+
+// A running continuous conversion; see above.
+pub struct Stream<R: hal.Registers> {
+    bus: R
+    ring: esp_gdma.InRing
+    calibration: Calibration
+    // Attenuation codes by channel.
+    attenuations: [7]u32
+    channel_count: u32
+    target: u32
+    saved: Saved
+    stopped: bool
+
+    // Convert `channels` in turn, `rate_hz` conversions a second in all,
+    // into `buffer` through GDMA channel `dma` with descriptors
+    // `descriptors` (3 words per part), calibrating with `calibration`.
+    // The caller owns the converter, has powered it, set its clock (the
+    // crystal divided by CLOCK_DIVIDER), and loaded the initial code, owns
+    // the channel, and has checked that the buffer is in SRAM.
+    // InvalidInput for no channels or more than MAX_CHANNELS, a pin other
+    // than GPIO 0 to 6 or the same pin twice, a rate out of range, or a
+    // buffer too short for a sample in each part.
+    pub fn start(bus: R, channels: &[Channel], rate_hz: u32, dma: u32, descriptors: &mut[u32], buffer: &mut[u8], calibration: Calibration) -> Stream<R>!hal.Error from(descriptors, buffer) {
+        if channels.len == 0 || channels.len > MAX_CHANNELS {
+            return err(hal.Error.InvalidInput)
+        }
+        attenuations: [7]u32 = [0u32; 7]
+        seen := 0u32
+        for index in 0..channels.len {
+            pin := channels[index].pin
+            if pin >= ADC_CHANNELS || (seen & (1u32 << pin)) != 0 {
+                return err(hal.Error.InvalidInput)
+            }
+            seen |= 1u32 << pin
+            attenuations[pin as usize] = attenuation_code(&channels[index].attenuation)
+        }
+        target := timer_target(rate_hz)?
+        ring := esp_gdma.InRing.new(dma, esp_gdma.PERIPHERAL_ADC, descriptors, buffer)?
+        stream := Stream<R> {
+            bus,
+            ring,
+            calibration,
+            attenuations,
+            channel_count: channels.len as u32,
+            target,
+            saved: Saved { ctrl: 0, ctrl2: 0, fsm_wait: 0, pattern1: 0, pattern2: 0 },
+            stopped: false,
+        }
+        stream.saved = Saved {
+            ctrl: stream.bus.read(CTRL),
+            ctrl2: stream.bus.read(CTRL2),
+            fsm_wait: stream.bus.read(FSM_WAIT),
+            pattern1: stream.bus.read(PATT_TAB1),
+            pattern2: stream.bus.read(PATT_TAB2),
+        }
+        // The pattern: six bits per entry, the first in bits 23-18 of
+        // PATT_TAB1, the fifth in those of PATT_TAB2.
+        tables: [2]u32 = [0xFF_FFFFu32, 0xFF_FFFF]
+        for index in 0..channels.len {
+            shift := 18 - 6 * (index % 4) as u32
+            table := index / 4
+            entry := pattern_entry(channels[index].pin, attenuation_code(&channels[index].attenuation))
+            tables[table] = (tables[table] & ~(0x3Fu32 << shift)) | (entry << shift)
+        }
+        stream.bus.write(CTRL2, stream.saved.ctrl2 & ~TIMER_ENABLE)
+        stream.bus.write(ONETIME_SAMPLE, 0)
+        stream.bus.write(PATT_TAB1, tables[0])
+        stream.bus.write(PATT_TAB2, tables[1])
+        stream.bus.write(FSM_WAIT, FSM_TIMES)
+        control := stream.saved.ctrl & ~(START_FORCE | START | SAR_CLOCK_DIVIDER | PATTERN_LENGTH | PATTERN_POINTER_CLEAR | FORCED_POWER)
+        control |= SAR_CLOCK_GATED | hal.encode(SAR_CLOCK_DIVIDER, 1) | hal.encode(PATTERN_LENGTH, channels.len as u32 - 1) | FORCED_POWER
+        stream.bus.write(CTRL, control)
+        stream.bus.write(CTRL2, MAX_CONVERSIONS | hal.encode(TIMER_TARGET, target))
+        stream.run()
+        return ok(stream)
+    }
+
+    // The conversions a second the timer gives, in all channels.
+    pub fn rate_hz(&self) -> u32 {
+        return TIMER_HZ / self.target
+    }
+
+    // The entries in the pattern.
+    pub fn channels(&self) -> u32 {
+        return self.channel_count
+    }
+
+    // The samples the ring holds when full.
+    pub fn capacity(&self) -> usize {
+        return self.ring.ring_size() / RESULT_BYTES
+    }
+
+    // Samples per part: they become readable this many at a time.
+    pub fn part_samples(&self) -> usize {
+        return self.ring.part_size() / RESULT_BYTES
+    }
+
+    // The samples converted and readable now.
+    pub fn available(&mut self) -> usize {
+        return self.ring.available() / RESULT_BYTES
+    }
+
+    // The samples converted since the last call, oldest first, as many as
+    // fit `samples`, without waiting; returns how many. Overrun once after
+    // the ring filled up: the conversions after the last sample read were
+    // lost, and the stream starts again.
+    pub fn poll_read(&mut self, samples: &mut[u32]) -> usize!hal.Error {
+        if self.ring.available() < RESULT_BYTES && self.ring.stalled(&mut self.bus) {
+            self.restart()
+            return err(hal.Error.Overrun)
+        }
+        count := 0usize
+        chunk: [64]u8 = [0; 64]
+        for count < samples.len {
+            wanted := samples.len - count
+            if wanted > 16 {
+                wanted = 16
+            }
+            taken := self.ring.read(&mut chunk[..RESULT_BYTES * wanted])
+            if taken == 0 {
+                break
+            }
+            index := 0usize
+            for index + RESULT_BYTES <= taken {
+                word := chunk[index] as u32 | ((chunk[index + 1] as u32) << 8) | ((chunk[index + 2] as u32) << 16) | ((chunk[index + 3] as u32) << 24)
+                index += RESULT_BYTES
+                if result_valid(word) {
+                    channel := result_channel(word)
+                    raw := result_raw(word)
+                    millivolts := self.calibration.millivolts(channel, self.attenuations[channel as usize], raw) as u32
+                    samples[count] = (raw << 20) | (channel << 16) | millivolts
+                    count += 1
+                }
+            }
+        }
+        return ok(count)
+    }
+
+    // Wait until `samples` is full. Overrun as for poll_read, with the
+    // samples read before it dropped.
+    pub fn read(&mut self, samples: &mut[u32]) -> void!hal.Error {
+        done := 0usize
+        for done < samples.len {
+            done += self.poll_read(&mut samples[done..])?
+        }
+        return ok()
+    }
+
+    // Stop converting and streaming, and put the controller's settings
+    // back, the converter's power no longer forced. Dropping the stream
+    // does this too.
+    pub fn stop(&mut self) {
+        if self.stopped {
+            return
+        }
+        self.stopped = true
+        self.bus.write(CTRL2, self.saved.ctrl2 & ~TIMER_ENABLE)
+        self.bus.write(DMA_CONF, RESET_FSM)
+        self.bus.write(DMA_CONF, 0)
+        self.ring.stop(&mut self.bus)
+        self.bus.write(PATT_TAB1, self.saved.pattern1)
+        self.bus.write(PATT_TAB2, self.saved.pattern2)
+        self.bus.write(FSM_WAIT, self.saved.fsm_wait)
+        self.bus.write(CTRL, self.saved.ctrl & ~FORCED_POWER)
+        self.bus.write(CTRL2, self.saved.ctrl2 & ~TIMER_ENABLE)
+    }
+
+    // Start the ring and the controller from the pattern's first entry.
+    fn run(&mut self) {
+        self.bus.write(DMA_CONF, RESET_FSM)
+        self.bus.write(DMA_CONF, 0)
+        control := self.bus.read(CTRL)
+        self.bus.write(CTRL, control | PATTERN_POINTER_CLEAR)
+        self.bus.write(CTRL, control & ~PATTERN_POINTER_CLEAR)
+        self.ring.start(&mut self.bus)
+        samples := (self.ring.part_size() / RESULT_BYTES) as u32
+        self.bus.write(DMA_CONF, (samples & EOF_COUNT) | DMA_ON)
+        timer := self.bus.read(CTRL2)
+        self.bus.write(CTRL2, timer | TIMER_ENABLE)
+    }
+
+    // Start again with an empty ring after it filled up.
+    fn restart(&mut self) {
+        timer := self.bus.read(CTRL2)
+        self.bus.write(CTRL2, timer & ~TIMER_ENABLE)
+        self.bus.write(DMA_CONF, 0)
+        self.ring.stop(&mut self.bus)
+        self.run()
+    }
+
+    fn drop(&mut self) {
+        self.stop()
+    }
+}

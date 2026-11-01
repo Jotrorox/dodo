@@ -1,0 +1,67 @@
+package esp_lp_shared
+
+import "core/mmio"
+
+// The 1 KiB of LP SRAM that the ESP32-C6's two cores share, at 0x50003000:
+// the main core's esp32c6.LpCore and the LP core's std/embedded/chip/
+// esp32c6_lp both read and write it, and the LP core's runtime keeps its
+// own words at the start. It sits after the LP core's 12 KiB and before
+// the main core's `.lp_noinit` statics, so it keeps its contents through
+// hibernation and every reset but a power cycle; LpCore.load clears it.
+//
+// Words, 32 bits each:
+//
+//     0       RUNS: how many times the LP core has started since loaded;
+//             its runtime counts each start.
+//     1, 2    PERIOD: LP timer counts from one start to the next, low word
+//             first, 0 for no periodic wake. The runtime arms the timer
+//             when `main` returns.
+//     3       TICKS_PER_10MS: the LP timer's rate, measured by the main
+//             core, for the LP core's microseconds.
+//     4       PANIC: PANIC_MAGIC once the LP program panicked, then 5 to 8:
+//             the failed check's and the file's addresses (NUL-terminated,
+//             in LP SRAM), the line, and the column.
+//     9-15    Reserved.
+//     16-255  The programs' own, USER_WORDS of them: `shared(index)` on
+//             both cores.
+
+pub const BASE: usize = 0x5000_3000
+pub const WORDS: u32 = 256
+
+pub const RUNS: u32 = 0
+pub const PERIOD_LOW: u32 = 1
+pub const PERIOD_HIGH: u32 = 2
+pub const TICKS_PER_10MS: u32 = 3
+pub const PANIC: u32 = 4
+pub const PANIC_CHECK: u32 = 5
+pub const PANIC_FILE: u32 = 6
+pub const PANIC_LINE: u32 = 7
+pub const PANIC_COLUMN: u32 = 8
+pub const PANIC_MAGIC: u32 = 0x5041_4E43
+pub const USER: u32 = 16
+pub const USER_WORDS: u32 = WORDS - USER
+
+// Word `word` of the area. Traps past its end.
+pub fn read(word: u32) -> u32 {
+    core.assert(word < WORDS)
+    // SAFETY: the area is LP SRAM that no linker script gives to anything
+    // else; both cores read and write it a word at a time.
+    unsafe {
+        return mmio.read32(BASE + 4 * word as usize)
+    }
+}
+
+pub fn write(word: u32, value: u32) {
+    core.assert(word < WORDS)
+    // SAFETY: as in read.
+    unsafe {
+        mmio.write32(BASE + 4 * word as usize, value)
+    }
+}
+
+// Clear every word, for a newly loaded LP program.
+pub fn clear() {
+    for word in 0u32..WORDS {
+        write(word, 0)
+    }
+}

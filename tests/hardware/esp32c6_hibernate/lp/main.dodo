@@ -1,0 +1,63 @@
+package main
+
+import "std/embedded/chip"
+
+// The LP core program of the esp32c6_hibernate checks, built for
+// `chip = "esp32c6_lp"` and embedded through the target's `lp-core`. Every
+// run counts itself in shared word COUNT and does what shared word MODE
+// asks; the main core sets the mode and checks the results.
+
+const MODE: u32 = 0
+const COUNT: u32 = 1
+const RUNS: u32 = 2
+const TARGET: u32 = 3
+const PIN_SEEN: u32 = 4
+const MATH: u32 = 5
+
+const MODE_COUNT: u32 = 0
+const MODE_WAKE_REQUEST: u32 = 1
+const MODE_WAKE_AT_TARGET: u32 = 2
+const MODE_PIN: u32 = 3
+const MODE_PANIC: u32 = 4
+
+const PIN: u32 = 5
+
+// Kept from one run to the next: statics are not reinitialized.
+static mut KEPT: u32 = 0
+
+fn main() {
+    count := unsafe {
+        KEPT += 1
+        KEPT
+    }
+    chip.set_shared(COUNT, count)
+    chip.set_shared(RUNS, chip.runs())
+    // 64-bit division and multiplication through the runtime helpers.
+    big := 0x1234_5678_9ABC_DEF0u64 + count as u64
+    chip.set_shared(MATH, ((big / 1_000_003) % 1_000_000) as u32)
+    mode := chip.shared(MODE)
+    if mode == MODE_WAKE_REQUEST {
+        chip.wake_hp()
+    } else if mode == MODE_WAKE_AT_TARGET {
+        if count >= chip.shared(TARGET) {
+            chip.wake_hp()
+        }
+    } else if mode == MODE_PIN {
+        p := chip.take()
+        pin := p.pins.output(PIN)!
+        pin.set_high()
+        p.delay.delay_us(50)
+        high := pin.is_high()
+        pin.set_low()
+        p.delay.delay_us(50)
+        low := !pin.is_high()
+        seen := 0u32
+        if high && low {
+            seen = 1
+        }
+        p.pins.release(pin)
+        chip.set_shared(PIN_SEEN, seen)
+    } else if mode == MODE_PANIC {
+        core.assert(count == 0)
+    }
+}

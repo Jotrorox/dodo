@@ -644,3 +644,21 @@ module asm ".set SHA, DefaultHandler"
 module asm ".set RSA, DefaultHandler"
 module asm ".set ECC, DefaultHandler"
 module asm ".text"
+
+; dodo_lp_image_start() and dodo_lp_image_end(): where the embedded LP core
+; program lies in flash (`.lp_image`), for std/embedded/chip/esp32c6's
+; LpCore; equal without one.
+module asm ".section .text.dodo_lp_image_start, \22ax\22, @progbits"
+module asm ".global dodo_lp_image_start"
+module asm ".type dodo_lp_image_start, @function"
+module asm "dodo_lp_image_start:"
+module asm "    lui a0, %hi(__lp_image_start)"
+module asm "    addi a0, a0, %lo(__lp_image_start)"
+module asm "    ret"
+module asm ".section .text.dodo_lp_image_end, \22ax\22, @progbits"
+module asm ".global dodo_lp_image_end"
+module asm ".type dodo_lp_image_end, @function"
+module asm "dodo_lp_image_end:"
+module asm "    lui a0, %hi(__lp_image_end)"
+module asm "    addi a0, a0, %lo(__lp_image_end)"
+module asm "    ret"

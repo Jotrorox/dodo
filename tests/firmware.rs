@@ -1510,11 +1510,15 @@ fn esp32c6_projects_link_to_flashable_firmware() {
     let tasks = root().join("examples/esp32c6_tasks");
     let selftest = root().join("tests/hardware/esp32c6_devkitc");
     let can_audio = root().join("tests/hardware/esp32c6_can_audio");
+    let rmt = root().join("tests/hardware/esp32c6_rmt");
+    let dma = root().join("tests/hardware/esp32c6_dma");
     for (project, name, board) in [
         (&blink, "blink", &["--board", "esp32c6_devkitc"][..]),
         (&tasks, "tasks", &[][..]),
         (&selftest, "selftest", &[][..]),
         (&can_audio, "can-audio", &[][..]),
+        (&rmt, "rmt", &[][..]),
+        (&dma, "dma", &[][..]),
     ] {
         for level in ["0", "2"] {
             let elf = scratch.path(&format!("{name}-O{level}.elf"));
@@ -1570,6 +1574,110 @@ fn esp32c6_projects_link_to_flashable_firmware() {
     let bytes = fs::read(&elf).unwrap();
     assert!(elf_symbol(&bytes, "dodo_panic_report").is_some());
     assert!(elf_symbol(&bytes, "dodo_board_panic").is_some());
+}
+
+// A program for the ESP32-C6's LP core is the raw contents of its LP SRAM,
+// with the trap table at 0x50000000 and the reset handler at 0x50000080; a
+// firmware embeds it through `lp-core`, between `__lp_image_start` and
+// `__lp_image_end` in flash.
+#[test]
+fn esp32c6_lp_core_programs_build_and_embed() {
+    if !ld_lld() {
+        return;
+    }
+    let scratch = Scratch::new("esp32c6-lp");
+    let lp = root().join("tests/hardware/esp32c6_hibernate/lp/main.dodo");
+    let lp_elf = scratch.path("lp.elf");
+    let output = dodo(&[
+        "build",
+        lp.to_str().unwrap(),
+        "--chip",
+        "esp32c6_lp",
+        "-o",
+        &lp_elf,
+    ]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let bytes = fs::read(&lp_elf).unwrap();
+    let image = fs::read(Path::new(&lp_elf).with_extension("bin")).unwrap();
+    assert_eq!(word(&bytes, 0x18), 0x5000_0080);
+    assert_eq!(elf_symbol(&bytes, "Reset_Handler"), Some(0x5000_0080));
+    assert_eq!(elf_symbol(&bytes, "__lp_vector_table"), Some(0x5000_0000));
+    assert!(elf_symbol(&bytes, "dodo_lp_panic").is_some());
+    // Every trap enters the same handler: `j` with the same target, less 4
+    // bytes per entry.
+    assert_eq!(word(&image, 0) & 0x7F, 0x6F);
+    assert!(
+        image.len() > 0x84 && image.len() <= 0x3000,
+        "{}",
+        image.len()
+    );
+    // An LP program is not flashed by itself.
+    let refused = dodo(&["run", lp.to_str().unwrap(), "--chip", "esp32c6_lp"]);
+    assert!(!refused.status.success());
+
+    // The firmware embeds the same image, -O0 on the main core or not.
+    let project = root().join("tests/hardware/esp32c6_hibernate");
+    for level in ["0", "2"] {
+        let elf = scratch.path(&format!("hibernate-O{level}.elf"));
+        build_esp32c6(&["build", project.to_str().unwrap(), "-O", level, "-o", &elf]);
+        check_esp32c6_firmware(Path::new(&elf));
+        let firmware = fs::read(&elf).unwrap();
+        let flat = fs::read(Path::new(&elf).with_extension("bin")).unwrap();
+        let start = elf_symbol(&firmware, "__lp_image_start").expect("LP image start");
+        let end = elf_symbol(&firmware, "__lp_image_end").expect("LP image end");
+        assert_eq!(start % 4, 0);
+        let offset = (start - 0x4200_0000) as usize;
+        let embedded = &flat[offset..offset + (end - start) as usize];
+        if level == "2" {
+            assert_eq!(embedded, &image[..]);
+        }
+        assert_eq!(&embedded[..4], &image[..4]);
+    }
+    // Without `lp-core`, the image is empty.
+    let selftest = root().join("tests/hardware/esp32c6_devkitc");
+    let elf = scratch.path("selftest.elf");
+    build_esp32c6(&["build", selftest.to_str().unwrap(), "-o", &elf]);
+    let firmware = fs::read(&elf).unwrap();
+    assert_eq!(
+        elf_symbol(&firmware, "__lp_image_start"),
+        elf_symbol(&firmware, "__lp_image_end")
+    );
+    // Only an ESP32-C6 firmware embeds one.
+    let blink = root().join("examples/blink");
+    let other = dodo(&[
+        "build",
+        blink.to_str().unwrap(),
+        "--board",
+        "pico",
+        "--lp-core",
+        lp.to_str().unwrap(),
+        "-o",
+        &scratch.path("pico.elf"),
+    ]);
+    assert!(!other.status.success());
+    assert!(
+        String::from_utf8_lossy(&other.stderr).contains("lp-core"),
+        "{}",
+        String::from_utf8_lossy(&other.stderr)
+    );
+    // A program larger than the LP core's 12 KiB is refused.
+    let big = scratch.write(
+        "big.dodo",
+        "package main\nimport \"std/embedded/chip\"\nstatic TABLE: [4096]u32 = [7u32; 4096]\nfn main() {\n chip.set_shared(0, TABLE[chip.shared(1) as usize])\n}\n",
+    );
+    let too_big = dodo(&[
+        "build",
+        big.to_str().unwrap(),
+        "--chip",
+        "esp32c6_lp",
+        "-o",
+        &scratch.path("big.elf"),
+    ]);
+    assert!(!too_big.status.success());
 }
 
 // The ESP32-C6 runtime saves the registers and calls `@interrupt` handlers

@@ -17,10 +17,11 @@ its checks are then named by number only. `--follow-resets` lets such a
 project reset the chip on purpose, to check what survives a reset: after it
 prints `selftest restarting`, the script waits for the USB serial port to
 disappear and come back, sends another byte, and keeps reading, until
-`selftest done N`. A panic report after `selftest restarting` is then
-expected too; only one in the last part fails the run. The script holds an exclusive
-lock on the board (DODO_ESP32C6_LOCK, default /tmp/dodo-esp32c6.lock) from
-flashing until the result is read, so several runs, from several checkouts,
+`selftest done N`; tests/hardware/esp32c6_hibernate hibernates the same
+way. A panic report after `selftest restarting` is then expected too; only
+one in the last part fails the run. The script holds an exclusive lock on
+the board (DODO_ESP32C6_LOCK, default /tmp/dodo-esp32c6.lock) from flashing
+until the result is read, so several runs, from several checkouts,
 take turns instead of flashing over each other. `--reconnect` is for a
 project that releases the USB serial port for a while, such as across a
 dormant state, which drops the connection: it prints `selftest waiting`

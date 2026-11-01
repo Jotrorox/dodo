@@ -822,6 +822,44 @@ fn espressif_bus_features_execute_against_simulated_controllers() {
 }
 
 #[test]
+fn espressif_remote_control_executes_against_a_simulated_peripheral() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let scratch = Scratch::new("esp-rmt");
+    let source = root.join("tests/stdlib/esp_rmt_checks.dodo");
+    for optimization in ["0", "3"] {
+        let executable = scratch.0.join(format!(
+            "esp-rmt-O{optimization}{}",
+            std::env::consts::EXE_SUFFIX
+        ));
+        let args = ["build", source.to_str().unwrap(), "-O", optimization, "-o"];
+        success(&dodo(&args, &executable), "compile Espressif RMT fixture");
+        success(
+            &Command::new(&executable).output().unwrap(),
+            "execute Espressif RMT fixture",
+        );
+    }
+}
+
+#[test]
+fn espressif_dma_streams_execute_against_a_simulated_chip() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let scratch = Scratch::new("esp-dma");
+    let source = root.join("tests/stdlib/esp_dma_checks.dodo");
+    for optimization in ["0", "3"] {
+        let executable = scratch.0.join(format!(
+            "esp-dma-O{optimization}{}",
+            std::env::consts::EXE_SUFFIX
+        ));
+        let args = ["build", source.to_str().unwrap(), "-O", optimization, "-o"];
+        success(&dodo(&args, &executable), "compile Espressif DMA fixture");
+        success(
+            &Command::new(&executable).output().unwrap(),
+            "execute Espressif DMA fixture",
+        );
+    }
+}
+
+#[test]
 fn espressif_low_power_executes_against_simulated_registers() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let scratch = Scratch::new("esp-power");

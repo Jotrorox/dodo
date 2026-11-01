@@ -8,6 +8,12 @@
 
 ENTRY(Reset_Handler)
 
+/* The part of LP SRAM for statics that survive hibernation; see .lp_noinit. */
+MEMORY
+{
+    LP_NOINIT (rw) : ORIGIN = 0x50003400, LENGTH = 0xBE0
+}
+
 SECTIONS
 {
     /* The boot ROM jumps to flash + 8 when the first two words of flash are
@@ -32,6 +38,15 @@ SECTIONS
         /* Addresses of weak symbols, resolved at link time. */
         *(.got .got.*)
         . = ALIGN(4);
+    } > FLASH
+
+    /* The LP core's program, when the firmware embeds one (lp-core =
+       "PATH"): the image esp32c6.LpCore copies to LP SRAM. Empty otherwise. */
+    .lp_image : ALIGN(4)
+    {
+        __lp_image_start = .;
+        KEEP(*(.lp_image))
+        __lp_image_end = .;
     } > FLASH
 
     /* Initialized statics, and functions placed with @section(".ramfunc")
@@ -65,6 +80,18 @@ SECTIONS
         . = ALIGN(4);
         __noinit_end = .;
     } > RAM
+
+    /* LP SRAM, 16 KiB at 0x50000000, which keeps its contents through
+       hibernation and every reset but a power cycle: the LP core's program
+       in the first 12 KiB (copied there from .lp_image by esp32c6.LpCore),
+       1 KiB the HP and LP programs share (std/embedded/chip/esp_lp_shared),
+       statics placed with @section(".lp_noinit"), neither loaded nor
+       zeroed, and esp_rtc's record in the last 32 bytes. */
+    .lp_noinit (NOLOAD) : ALIGN(4)
+    {
+        *(.lp_noinit .lp_noinit.*)
+        . = ALIGN(4);
+    } > LP_NOINIT
 
     /* The full-descending stack starts at the top of RAM, 16-byte aligned
        as the RISC-V calling convention requires. */

@@ -92,6 +92,8 @@ pub struct Settings {
     pub link_args: Option<Vec<OsString>>,
     pub board: Option<String>,
     pub chip: Option<String>,
+    /// The ESP32-C6 LP core program a firmware embeds, an entry file.
+    pub lp_core: Option<PathBuf>,
 }
 impl Settings {
     fn overlay(&mut self, other: &Self, source: &str, origins: &mut BTreeMap<String, String>) {
@@ -113,6 +115,7 @@ impl Settings {
         field!(link_args, "link-args");
         field!(board, "board");
         field!(chip, "chip");
+        field!(lp_core, "lp-core");
     }
 }
 #[derive(Clone, Debug)]
@@ -213,6 +216,7 @@ const SETTINGS: &[&str] = &[
     "link-args",
     "board",
     "chip",
+    "lp-core",
 ];
 fn settings(t: &Fields, root: &Path) -> ParseResult<Settings> {
     if let (Some(_), Some(hook)) = (t.get("panic"), t.get("panic-hook")) {
@@ -231,6 +235,7 @@ fn settings(t: &Fields, root: &Path) -> ParseResult<Settings> {
         link_args: t.get("link-args").map(strings).transpose()?,
         board: optional_string(t, "board")?,
         chip: optional_string(t, "chip")?,
+        lp_core: optional_string(t, "lp-core")?.map(|s| absolute(Path::new(&s), root)),
         ..Default::default()
     };
     if let Some(name) = &result.board
@@ -645,6 +650,7 @@ pub fn resolve(request: Request<'_>) -> Result<Resolved, String> {
             link_args: Some(vec![]),
             board: None,
             chip: None,
+            lp_core: None,
         },
         "compiler defaults",
         &mut r.origins,
@@ -873,6 +879,13 @@ impl Resolved {
         }
         if let Some(chip) = &s.chip {
             add("chip", toml::quote(chip), &self.origins["chip"]);
+        }
+        if let Some(path) = &s.lp_core {
+            add(
+                "lp-core",
+                toml::quote(&path.to_string_lossy()),
+                &self.origins["lp-core"],
+            );
         }
         let (key, value) = match s.panic.as_ref().unwrap() {
             Panic::Auto => ("panic", "auto"),

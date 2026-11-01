@@ -44,6 +44,46 @@
   `--project`, 98 more checks of the buses, CAN, I2S, PWM input, system
   services, and low power in `tests/hardware/esp32c6_*`, which pass at -O0
   to -O3.
+- The ESP32-C6 hibernates: `b.power.hibernate(&wake)` is the PMU's deep
+  sleep, which powers down everything but the LP system until the LP timer,
+  a level on GPIO 0 to 7, or the LP core wakes the chip, which then boots
+  again; `wake_cause()` and `wake_pins()` tell what woke it, and statics
+  placed with `@section(".lp_noinit")` keep their values in LP SRAM. The
+  chip's low-power core runs Dodo too: the new chip `esp32c6_lp` builds a
+  program for it with `std/embedded/chip/esp32c6_lp` (LP IO pins as `hal`
+  pins, a delay on the LP timer, shared words, and waking the main core),
+  the new `lp-core` setting (`--lp-core`) embeds it in an ESP32-C6 firmware,
+  and `b.lp_core` (`esp32c6.LpCore`) runs it once or periodically, also
+  while the main core hibernates, and reports its wake requests and panics.
+  `tests/hardware/esp32c6_hibernate` checks both on the board across four
+  boots. `take()` now also clears the PMU's power-domain overrides, as
+  ESP-IDF's start-up does, so light and deep sleeps power down what their
+  states say whatever ran before.
+- New driver `std/embedded/peripheral/esp_rmt` for the ESP32-C6's remote
+  control peripheral (RMT), the chip's counterpart to PIO for pulse trains:
+  `pins.rmt_tx` and `pins.rmt_rx` claim its two transmit and two receive
+  channels on any pin, with pulse trains as `u32` codes (`esp_rmt.code`,
+  `esp_rmt.encode`), ticks from 312.5 kHz to 80 MHz, and trains longer than
+  a channel's memory refilled or emptied while they run, blocking or polled.
+  Transmitters have a carrier, an idle level, and loops; receivers an idle
+  threshold, a glitch filter, and carrier demodulation. `pins.ws2812` keeps
+  its API but now runs on an RMT transmit channel, so it leaves the other
+  channels free, and takes chains of any length (more than seven LEDs need
+  an optimized build). `tests/hardware/esp32c6_rmt` adds 16 hardware
+  checks, which loop pulse trains from a transmitter to a receiver through
+  one pad and pass at -O1 to -O3.
+- The ESP32-C6's serial ports receive by DMA: `port.dma(&mut rx, &mut ring)`
+  returns an `esp32c6.UartDma` that moves input into a ring buffer through
+  UHCI0 (new driver `std/embedded/peripheral/esp_uhci`), with
+  `available()`, `ring_size()`, and `OVERRUN` once the ring has filled, and
+  sends through the FIFO, as UHCI0's transmit side does not work on the
+  chip. `pins.analog_stream(&channels, rate_hz, &mut dma, &mut buffer)`
+  converts up to eight ADC inputs continuously, each at its own attenuation,
+  306 to 83 333 conversions a second, by DMA into a ring of samples
+  calibrated from eFuse (new `std/embedded/chip/esp_adc`, on a GDMA
+  descriptor ring in the new `esp_gdma`), refusing and refused by one-shot
+  analog inputs. `tests/hardware/esp32c6_dma` checks both on the board (17
+  checks).
 - Functions placed with `@section`, such as `@section(".ramfunc")`, are no
   longer inlined into their callers, which would have run their code from the
   caller's section instead.

@@ -345,7 +345,8 @@ arguments depend on the selected toolchain.
 | `-g`, `--debug` | Include source-level DWARF debug information; `--no-debug` disables it. |
 | `--target TRIPLE` | Select the compilation target; default compiler host. |
 | `--board NAME` | Firmware board (`pico`, `pico2`, `pico2_w`, `esp32c6_devkitc`, `arduino_uno`): its chip's target, CPU, panic hook, linker, startup code, and flashable image, and the package `std/embedded/board` resolves to. `run` flashes the board. |
-| `--chip NAME` | Firmware chip for a custom board (`rp2040`, `rp2350`, `esp32c6`, `atmega328p`); implied by `--board`. `std/embedded/chip` resolves to its package. |
+| `--chip NAME` | Firmware chip for a custom board (`rp2040`, `rp2350`, `esp32c6`, `atmega328p`), or `esp32c6_lp` for a program for the ESP32-C6's low-power core; implied by `--board`. `std/embedded/chip` resolves to its package. |
+| `--lp-core FILE` | Build `FILE` for the ESP32-C6's low-power core and embed it in an ESP32-C6 firmware, for `esp32c6.LpCore`. |
 | `--cpu NAME` | Select target CPU features; default `generic`. |
 | `--features LIST` | Explicit LLVM target features, for example `+sse4.2`. |
 | `--linker PATH` | C linker driver; overrides `DODO_CC`, which overrides `cc`. |

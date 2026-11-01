@@ -1,0 +1,756 @@
+package main
+
+import "core/ptr"
+import "std/embedded/chip/esp_adc"
+import "std/embedded/chip/esp_gdma"
+import "std/embedded/hal"
+import "std/embedded/peripheral/esp_uart"
+import "std/embedded/peripheral/esp_uhci"
+import "std/io"
+
+// Host checks for the ESP32-C6's DMA streams: the GDMA descriptor ring
+// (esp_gdma), serial ports receiving by DMA through UHCI0 (esp_uhci), and
+// the ADC's continuous sampler (esp_adc). One model stands for the chip's address
+// space: UART0, UHCI0, APB_SARADC, and a GDMA controller that follows the
+// drivers' descriptors in this program's memory, checks owner bits, writes
+// descriptors back, and stops at one it does not own, as the chip does.
+// Descriptors hold 32-bit addresses, so the model matches them against the
+// buffers each check registers.
+
+// --- The chip model ----------------------------------------------------------
+
+const UART_BASE: usize = 0x6000_0000
+const UHCI_BASE: usize = 0x6000_5000
+const SARADC_BASE: usize = 0x6000_E000
+const GDMA_BASE: usize = 0x6008_0000
+
+// Registers by word: UART0, UHCI0, and APB_SARADC 64 each, GDMA 192.
+static mut UART: [64]u32 = [0u32; 64]
+static mut UHCI: [64]u32 = [0u32; 64]
+static mut SARADC: [64]u32 = [0u32; 64]
+static mut GDMA: [192]u32 = [0u32; 192]
+// GDMA per channel: raw interrupt bits, a receive transfer running, its
+// descriptor and the bytes stored in its part.
+static mut IN_RAW: [3]u32 = [0u32; 3]
+static mut IN_RUNNING: [3]bool = [false; 3]
+static mut IN_CURRENT: [3]usize = [0usize; 3]
+static mut IN_FILLED: [3]usize = [0usize; 3]
+static mut STALLS: u32 = 0
+// Memory the GDMA reaches: the test's buffers and descriptors.
+static mut BASES: [8]usize = [0usize; 8]
+static mut LENGTHS: [8]usize = [0usize; 8]
+static mut REGIONS: usize = 0
+// The UART: its receive FIFO, the bytes since UHCI last ended a packet,
+// and every byte written to its transmit FIFO.
+static mut RX_FIFO: [128]u8 = [0u8; 128]
+static mut RX_COUNT: usize = 0
+static mut SINCE_EOF: usize = 0
+static mut LINE: [4096]u8 = [0u8; 4096]
+static mut LINE_COUNT: usize = 0
+// The ADC: each channel's reading, the next pattern entry, and the
+// conversions since the last EOF.
+static mut LEVELS: [8]u32 = [0u32; 8]
+static mut PATTERN_INDEX: u32 = 0
+static mut CONVERSIONS: u32 = 0
+
+fn reset_model() {
+    unsafe {
+        UART = [0u32; 64]
+        UHCI = [0u32; 64]
+        SARADC = [0u32; 64]
+        GDMA = [0u32; 192]
+        IN_RAW = [0u32; 3]
+        IN_RUNNING = [false; 3]
+        IN_CURRENT = [0usize; 3]
+        IN_FILLED = [0usize; 3]
+        STALLS = 0
+        REGIONS = 0
+        RX_COUNT = 0
+        SINCE_EOF = 0
+        LINE_COUNT = 0
+        LEVELS = [0u32; 8]
+        PATTERN_INDEX = 0
+        CONVERSIONS = 0
+        // Reset values the drivers read back and modify.
+        UART[0x48 / 4] = 0x0004_0100
+        SARADC[0] = 0x4003_8240
+        SARADC[1] = 0xA1FE
+        SARADC[3] = 0x00FF_0808
+        SARADC[6] = 0xFF_FFFF
+        SARADC[7] = 0xFF_FFFF
+    }
+}
+
+fn add_region(address: usize, length: usize) {
+    unsafe {
+        BASES[REGIONS] = address
+        LENGTHS[REGIONS] = length
+        REGIONS += 1
+    }
+}
+
+fn add_bytes(bytes: &[u8]) {
+    add_region(hal.address_of(bytes), bytes.len)
+}
+
+fn add_words(words: &[u32]) {
+    address := unsafe {
+        ptr.as_ptr(words) as usize
+    }
+    add_region(address, 4 * words.len)
+}
+
+// The address in this program that a descriptor's 32-bit address (or the
+// low `bits` bits of one) stands for.
+fn resolve(address: u32, mask: usize) -> usize {
+    unsafe {
+        for index in 0..REGIONS {
+            base := BASES[index] & mask
+            offset := core.wrapping_sub(address as usize & mask, base) & mask
+            if offset < LENGTHS[index] {
+                return BASES[index] + offset
+            }
+        }
+    }
+    core.assert(false)
+    return 0
+}
+
+fn peek32(address: usize) -> u32 {
+    unsafe {
+        return ptr.read_volatile(address as *const u32)
+    }
+}
+
+fn poke32(address: usize, value: u32) {
+    unsafe {
+        ptr.write_volatile(address as *mut u32, value)
+    }
+}
+
+fn channel_word(channel: usize, offset: usize) -> usize {
+    return (0x70 + 0xC0 * channel + offset) / 4
+}
+
+// The channel receiving for `peripheral`, or 3.
+fn receiver(peripheral: u32) -> usize {
+    unsafe {
+        for channel in 0usize..3 {
+            if IN_RUNNING[channel] && GDMA[channel_word(channel, 0x30)] == peripheral {
+                return channel
+            }
+        }
+    }
+    return 3
+}
+
+// Store `byte` through receive channel `channel`; false if it stopped or
+// holds no part the controller owns.
+fn gdma_push(channel: usize, byte: u8) -> bool {
+    unsafe {
+        if channel > 2 || !IN_RUNNING[channel] {
+            return false
+        }
+        descriptor := IN_CURRENT[channel]
+        word := peek32(descriptor)
+        if IN_FILLED[channel] == 0 && (word & esp_gdma.OWNED) == 0 {
+            IN_RAW[channel] |= 1 << 3
+            IN_RUNNING[channel] = false
+            STALLS += 1
+            return false
+        }
+        size := (word & 0xFFF) as usize
+        part := resolve(peek32(descriptor + 4), 0xFFFF_FFFF)
+        ptr.write_volatile((part + IN_FILLED[channel]) as *mut u8, byte)
+        IN_FILLED[channel] += 1
+        if IN_FILLED[channel] == size {
+            gdma_close(channel, false)
+        }
+        return true
+    }
+}
+
+// Hand the part being filled back, with EOF if `eof`, and move on.
+fn gdma_close(channel: usize, eof: bool) {
+    unsafe {
+        descriptor := IN_CURRENT[channel]
+        word := (peek32(descriptor) & 0xFFF) | ((IN_FILLED[channel] as u32) << 12)
+        if eof {
+            word |= esp_gdma.EOF
+            IN_RAW[channel] |= 1 << 1
+        }
+        poke32(descriptor, word)
+        IN_RAW[channel] |= 1
+        IN_CURRENT[channel] = resolve(peek32(descriptor + 8), 0xFFFF_FFFF)
+        IN_FILLED[channel] = 0
+    }
+}
+
+// The peripheral marks the end of its data: the part closes early.
+fn gdma_eof(channel: usize) {
+    unsafe {
+        if channel <= 2 && IN_RUNNING[channel] && IN_FILLED[channel] > 0 {
+            gdma_close(channel, true)
+        }
+    }
+}
+
+fn uhci_linked() -> bool {
+    unsafe {
+        return (UHCI[0] & (1u32 << 2)) != 0
+    }
+}
+
+fn uart_receive_byte(byte: u8) {
+    unsafe {
+        if RX_COUNT == 128 {
+            UART[1] |= 1 << 4
+            return
+        }
+        RX_FIFO[RX_COUNT] = byte
+        RX_COUNT += 1
+    }
+}
+
+// Move bytes from the UART's receive FIFO through UHCI into the ring while
+// the channel takes them, ending a packet every PKT_THRES bytes.
+fn uart_pump() {
+    if !uhci_linked() {
+        return
+    }
+    unsafe {
+        channel := receiver(esp_gdma.PERIPHERAL_UHCI0)
+        for RX_COUNT > 0 {
+            if !gdma_push(channel, RX_FIFO[0]) {
+                return
+            }
+            for index in 1..RX_COUNT {
+                RX_FIFO[index - 1] = RX_FIFO[index]
+            }
+            RX_COUNT -= 1
+            SINCE_EOF += 1
+            if (UHCI[0] & (1u32 << 9)) != 0 && SINCE_EOF == UHCI[0x7C / 4] as usize {
+                gdma_eof(channel)
+                SINCE_EOF = 0
+            }
+        }
+    }
+}
+
+// Bytes arrive on the UART's receive line.
+fn uart_receive(bytes: &[u8]) {
+    for index in 0..bytes.len {
+        uart_receive_byte(bytes[index])
+    }
+    uart_pump()
+}
+
+// The line goes idle: UHCI ends the packet.
+fn uart_idle() {
+    uart_pump()
+    unsafe {
+        if uhci_linked() && (UHCI[0] & (1u32 << 8)) != 0 {
+            gdma_eof(receiver(esp_gdma.PERIPHERAL_UHCI0))
+            SINCE_EOF = 0
+        }
+    }
+}
+
+// The ADC's timer expires `count` times: each conversion takes the next
+// pattern entry and goes to the ADC's receive channel as a 32-bit word.
+fn adc_convert(count: u32) {
+    unsafe {
+        if (SARADC[1] & (1u32 << 24)) == 0 || (SARADC[0x50 / 4] & (1u32 << 31)) == 0 {
+            return
+        }
+        length := ((SARADC[0] >> 15) & 7) + 1
+        for _ in 0..count {
+            table := SARADC[6 + (PATTERN_INDEX / 4) as usize]
+            entry := (table >> (18 - 6 * (PATTERN_INDEX % 4))) & 0x3F
+            channel := entry >> 2
+            adc_result(LEVELS[channel as usize] | (channel << 13))
+            PATTERN_INDEX = (PATTERN_INDEX + 1) % length
+        }
+    }
+}
+
+// One result word, as the controller writes it.
+fn adc_result(word: u32) {
+    unsafe {
+        channel := receiver(esp_gdma.PERIPHERAL_ADC)
+        for shift in 0u32..4 {
+            if !gdma_push(channel, ((word >> (8 * shift)) & 0xFF) as u8) {
+                return
+            }
+        }
+        CONVERSIONS += 1
+        if CONVERSIONS == (SARADC[0x50 / 4] & 0xFFFF) {
+            gdma_eof(channel)
+            CONVERSIONS = 0
+        }
+    }
+}
+
+struct Chip: hal.Registers {
+    pub fn read(&mut self, offset: usize) -> u32 {
+        core.assert(offset % 4 == 0)
+        unsafe {
+            if offset >= UART_BASE && offset < UART_BASE + 0x100 {
+                register := offset - UART_BASE
+                if register == 0x1C {
+                    return RX_COUNT as u32
+                }
+                if register == 0x70 || register == 0x98 {
+                    return 0
+                }
+                return UART[register / 4]
+            }
+            if offset >= UHCI_BASE && offset < UHCI_BASE + 0x100 {
+                return UHCI[(offset - UHCI_BASE) / 4]
+            }
+            if offset >= SARADC_BASE && offset < SARADC_BASE + 0x100 {
+                return SARADC[(offset - SARADC_BASE) / 4]
+            }
+            core.assert(offset >= GDMA_BASE && offset < GDMA_BASE + 0x300)
+            register := offset - GDMA_BASE
+            if register < 0x30 && register % 0x10 == 0 {
+                return IN_RAW[register / 0x10]
+            }
+            return GDMA[register / 4]
+        }
+    }
+
+    pub fn write(&mut self, offset: usize, value: u32) {
+        core.assert(offset % 4 == 0)
+        unsafe {
+            if offset >= UART_BASE && offset < UART_BASE + 0x100 {
+                register := offset - UART_BASE
+                if register == 0x10 {
+                    UART[1] &= ~value
+                    return
+                }
+                if register == 0x00 {
+                    byte := (value & 0xFF) as u8
+                    LINE[LINE_COUNT] = byte
+                    LINE_COUNT += 1
+                    if (UART[0x20 / 4] & (1u32 << 12)) != 0 {
+                        uart_receive_byte(byte)
+                    }
+                    return
+                }
+                UART[register / 4] = value
+                return
+            }
+            if offset >= UHCI_BASE && offset < UHCI_BASE + 0x100 {
+                UHCI[(offset - UHCI_BASE) / 4] = value
+                return
+            }
+            if offset >= SARADC_BASE && offset < SARADC_BASE + 0x100 {
+                register := offset - SARADC_BASE
+                if register == 0 && (value & (1u32 << 23)) != 0 {
+                    PATTERN_INDEX = 0
+                }
+                if register == 0x50 && (value & (1u32 << 30)) != 0 {
+                    CONVERSIONS = 0
+                }
+                SARADC[register / 4] = value
+                return
+            }
+            core.assert(offset >= GDMA_BASE && offset < GDMA_BASE + 0x300)
+            register := offset - GDMA_BASE
+            if register < 0x30 && register % 0x10 == 0xC {
+                IN_RAW[register / 0x10] &= ~value
+                return
+            }
+            if register >= 0x70 {
+                channel := (register - 0x70) / 0xC0
+                within := (register - 0x70) % 0xC0
+                if within == 0x10 {
+                    if (value & (1u32 << 21)) != 0 {
+                        IN_RUNNING[channel] = false
+                    }
+                    if (value & (1u32 << 22)) != 0 {
+                        // The chip checks owner bits only with IN_CHECK_OWNER.
+                        core.assert((GDMA[channel_word(channel, 0x04)] & (1u32 << 12)) != 0)
+                        IN_RUNNING[channel] = true
+                        IN_CURRENT[channel] = resolve(value & 0xF_FFFF, 0xF_FFFF)
+                        IN_FILLED[channel] = 0
+                    }
+                } else if within == 0x00 && (value & 1) != 0 {
+                    IN_FILLED[channel] = 0
+                }
+            }
+            GDMA[register / 4] = value
+        }
+    }
+}
+
+fn uart_register(offset: usize) -> u32 {
+    unsafe {
+        return UART[offset / 4]
+    }
+}
+
+fn uhci_register(offset: usize) -> u32 {
+    unsafe {
+        return UHCI[offset / 4]
+    }
+}
+
+fn saradc_register(offset: usize) -> u32 {
+    unsafe {
+        return SARADC[offset / 4]
+    }
+}
+
+fn gdma_register(channel: usize, offset: usize) -> u32 {
+    unsafe {
+        return GDMA[channel_word(channel, offset)]
+    }
+}
+
+fn refused<T>(result: T!hal.Error, expected: hal.Error) -> bool {
+    match result {
+        ok(_) => {
+            return false
+        }
+        err(error) => {
+            return error == expected
+        }
+    }
+}
+
+// --- The descriptor ring ------------------------------------------------------
+
+fn ring_checks() {
+    reset_model()
+    descriptors: [24]u32 = [0u32; 24]
+    one: [3]u32 = [0u32; 3]
+    buffer: [100]u8 = [0; 100]
+    tiny: [9]u8 = [0; 9]
+    core.assert(refused(esp_gdma.InRing.new(0, 2, &mut one, &mut buffer), hal.Error.InvalidInput))
+    core.assert(refused(esp_gdma.InRing.new(0, 2, &mut descriptors, &mut tiny), hal.Error.InvalidInput))
+    // From an odd address, 99 bytes in 8 parts of 12.
+    {
+        ring := esp_gdma.InRing.new(1, 2, &mut descriptors, &mut buffer[1..])!
+        core.assert(ring.parts() == 8 && ring.ring_size() == ring.parts() * ring.part_size())
+        core.assert(ring.part_size() % 4 == 0 && ring.part_size() >= 8 && ring.first_part() % 4 == 0)
+    }
+    // Large buffers are capped at 4092 bytes a part.
+    big: [40000]u8 = [0; 40000]
+    {
+        ring := esp_gdma.InRing.new(2, 8, &mut descriptors, &mut big)!
+        core.assert(ring.part_size() == esp_gdma.DESCRIPTOR_BYTES && ring.ring_size() == 8 * 4092)
+    }
+    // A running ring: parts close, are read in order, and go back.
+    add_words(&descriptors)
+    add_bytes(&buffer)
+    bus := Chip {}
+    ring := esp_gdma.InRing.new(0, esp_gdma.PERIPHERAL_UHCI0, &mut descriptors, &mut buffer[..64])!
+    core.assert(ring.part_size() == 8)
+    ring.start(&mut bus)
+    core.assert(gdma_register(0, 0x30) == esp_gdma.PERIPHERAL_UHCI0 && (gdma_register(0, 0x04) & (1u32 << 12)) != 0)
+    unsafe {
+        core.assert(IN_RUNNING[0])
+    }
+    for index in 0u32..11 {
+        core.assert(gdma_push(0, (index + 1) as u8))
+    }
+    // The first part is full, the second holds 3 bytes and is still open.
+    core.assert(ring.available() == 8)
+    gdma_eof(0)
+    core.assert(ring.available() == 11 && !ring.stalled(&mut bus))
+    out: [5]u8 = [0; 5]
+    core.assert(ring.read(&mut out) == 5 && out[0] == 1 && out[4] == 5)
+    core.assert(ring.available() == 6)
+    rest: [20]u8 = [0; 20]
+    core.assert(ring.read(&mut rest) == 6 && rest[0] == 6 && rest[5] == 11)
+    core.assert(ring.available() == 0 && ring.read(&mut rest) == 0)
+    ring.stop(&mut bus)
+    core.assert(gdma_register(0, 0x30) == esp_gdma.NO_PERIPHERAL)
+}
+
+// --- Serial ports by DMA -------------------------------------------------------
+
+fn open_port(descriptors: &mut[u32], ring: &mut[u8]) -> esp_uhci.DmaPort<Chip>!hal.Error from(descriptors, ring) {
+    return esp_uhci.DmaPort.open(Chip {}, UART_BASE, UHCI_BASE, 0, 0, descriptors, ring, false, esp_uart.DEFAULT_POLL_LIMIT, esp_uart.NO_POLL_LIMIT)
+}
+
+fn read_all(port: &mut esp_uhci.DmaPort<Chip>, buffer: &mut[u8]) -> usize {
+    progress := port.poll_read(buffer)!
+    return progress.transferred
+}
+
+fn error_code<T>(result: T!io.Error) -> i32 {
+    match result {
+        ok(_) => {
+            return 0
+        }
+        err(error) => {
+            return error.code
+        }
+    }
+}
+
+fn uart_checks() {
+    reset_model()
+    descriptors: [96]u32 = [0u32; 96]
+    few: [3]u32 = [0u32; 3]
+    ring: [1024]u8 = [0; 1024]
+    short: [100]u8 = [0; 100]
+    core.assert(refused(open_port(&mut descriptors, &mut short), hal.Error.InvalidInput))
+    core.assert(refused(open_port(&mut few, &mut ring), hal.Error.InvalidInput))
+    core.assert(refused(esp_uhci.DmaPort.open(Chip {}, UART_BASE, UHCI_BASE, 2, 0, &mut descriptors, &mut ring, false, 0, 0), hal.Error.InvalidInput))
+    add_words(&descriptors)
+    add_bytes(&ring)
+    {
+        port := open_port(&mut descriptors, &mut ring)!
+        // UHCI passes raw bytes: no separators, header, CRC, or escapes;
+        // packets end on an idle line and every part's worth of bytes.
+        core.assert(uhci_register(0x00) == ((1u32 << 11) | (1u32 << 2) | (1u32 << 8) | (1u32 << 9)))
+        core.assert(uhci_register(0x14) == 0 && uhci_register(0x20) == 0 && uhci_register(0x24) == 0)
+        core.assert(port.ring_size() >= 992 && port.ring_size() % 128 == 0)
+        core.assert(uhci_register(0x7C) == (port.ring_size() / 32) as u32)
+        core.assert((uart_register(0x48) & 0x3FF) == esp_uhci.IDLE_BITS && (uart_register(0x48) >> 10) == 0x100)
+        core.assert(gdma_register(0, 0x30) == esp_gdma.PERIPHERAL_UHCI0)
+
+        // A message is readable once the line goes idle.
+        hello: [5]u8 = [104, 101, 108, 108, 111]
+        uart_receive(&hello)
+        buffer: [200]u8 = [0; 200]
+        pending := port.poll_read(&mut buffer)!
+        core.assert(pending.transferred == 0 && pending.state == io.PollState.Pending && port.available() == 0)
+        uart_idle()
+        core.assert(port.available() == 5)
+        core.assert(read_all(&mut port, &mut buffer) == 5 && buffer[0] == 104 && buffer[4] == 111)
+
+        // A run longer than a part closes parts as they fill.
+        long: [100]u8 = [0; 100]
+        for index in 0usize..100 {
+            long[index] = ((index * 3) & 255) as u8
+        }
+        uart_receive(&long)
+        part := port.ring_size() / 32
+        core.assert(port.available() == 100 / part * part)
+        uart_idle()
+        core.assert(port.available() == 100)
+        got := read_all(&mut port, &mut buffer[..60])
+        got += read_all(&mut port, &mut buffer[60..])
+        same := got == 100
+        for index in 0usize..100 {
+            if buffer[index] != ((index * 3) & 255) as u8 {
+                same = false
+            }
+        }
+        core.assert(same)
+
+        // Newlines: a carriage return, alone or before a line feed, reads
+        // as one line feed.
+        port.set_crlf(true)
+        typed: [5]u8 = [97, 13, 10, 98, 13]
+        uart_receive(&typed)
+        uart_idle()
+        core.assert(read_all(&mut port, &mut buffer) == 4 && buffer[0] == 97 && buffer[1] == 10 && buffer[2] == 98 && buffer[3] == 10)
+        port.set_crlf(false)
+
+        // A framing error comes after the bytes read with it.
+        uart_receive(&hello)
+        uart_idle()
+        unsafe {
+            UART[1] |= 1 << 3
+        }
+        match port.poll_read(&mut buffer) {
+            ok(_) => {
+                core.assert(false)
+            }
+            err(error) => {
+                core.assert(error.transferred == 5 && error.code == esp_uart.FRAMING_ERROR)
+            }
+        }
+        core.assert((uart_register(0x04) & (1u32 << 3)) == 0)
+
+        // Each pause closes a part: 40 one-byte messages fill the 32 parts,
+        // the channel stops, and the rest wait in the FIFO. A read returns
+        // the 32 bytes, then OVERRUN, and reception starts again.
+        for index in 0u32..40 {
+            one: [1]u8 = [index as u8]
+            uart_receive(&one)
+            uart_idle()
+        }
+        unsafe {
+            core.assert(STALLS == 1 && RX_COUNT == 8)
+        }
+        core.assert(port.available() == 32)
+        match port.poll_read(&mut buffer) {
+            ok(_) => {
+                core.assert(false)
+            }
+            err(error) => {
+                core.assert(error.transferred == 32 && error.code == esp_uart.OVERRUN && buffer[0] == 0 && buffer[31] == 31)
+            }
+        }
+        // The FIFO's bytes follow once the line is idle again.
+        uart_idle()
+        core.assert(read_all(&mut port, &mut buffer) == 8 && buffer[0] == 32 && buffer[7] == 39)
+
+        // Writes go through the transmit FIFO, newlines translated; in
+        // loopback they come back through the ring.
+        port.set_crlf(true)
+        line: [3]u8 = [111, 107, 10]
+        core.assert(port.write(&line)! == 3)
+        port.flush()!
+        core.assert(port.poll_flush()!)
+        unsafe {
+            core.assert(LINE_COUNT == 4 && LINE[0] == 111 && LINE[2] == 13 && LINE[3] == 10)
+            UART[0x20 / 4] |= 1u32 << 12
+        }
+        progress := port.poll_write(&hello)!
+        core.assert(progress.transferred == 5 && progress.state == io.PollState.Ready)
+        uart_idle()
+        core.assert(read_all(&mut port, &mut buffer) == 5 && buffer[0] == 104)
+        port.set_crlf(false)
+
+        // A read waits for its first byte up to the read poll limit.
+        port.set_read_poll_limit(50)
+        match port.read(&mut buffer) {
+            ok(_) => {
+                core.assert(false)
+            }
+            err(error) => {
+                core.assert(error.kind == io.ErrorKind.TimedOut)
+            }
+        }
+        core.drop(port)
+    }
+    // Dropping the port stops the channel and unlinks UHCI.
+    core.assert(uhci_register(0x00) == (1u32 << 11))
+    core.assert(gdma_register(0, 0x30) == esp_gdma.NO_PERIPHERAL)
+    core.assert((uart_register(0x48) & 0x3FF) == 0x100)
+}
+
+// --- The ADC's continuous sampler ----------------------------------------------
+
+fn calibration() -> esp_adc.Calibration {
+    calibration := esp_adc.Calibration.none()
+    calibration.scheme = 2
+    calibration.init_code = [1700u32, 1750, 1800, 1900]
+    calibration.reference_mv = [750u32, 1000, 1500, 2800]
+    calibration.reference_code = [2860u32, 2840, 2910, 2830]
+    calibration.channel_offset = [0i32, 2, -1, 0, 0, 0, 3]
+    return calibration
+}
+
+fn adc_checks() {
+    // Rates: 1.25 MHz divided by a whole number from 15 to 4095.
+    core.assert(esp_adc.timer_target(10_000)! == 125)
+    core.assert(esp_adc.timer_target(44_100)! == 28)
+    core.assert(esp_adc.timer_target(esp_adc.MAX_RATE_HZ)! == 15 && esp_adc.timer_target(esp_adc.MIN_RATE_HZ)! == 4085)
+    core.assert(refused(esp_adc.timer_target(305), hal.Error.InvalidInput) && refused(esp_adc.timer_target(83_334), hal.Error.InvalidInput))
+
+    // Calibration: the reading less the channel's offset, scaled by the
+    // reference point; roughly nominal without calibration data.
+    table := calibration()
+    core.assert(table.millivolts(0, 3, 2830) == 2800)
+    core.assert(table.millivolts(1, 3, 1417) == (1415 * 2800 / 2830) as u16)
+    core.assert(table.millivolts(1, 0, 1438) == (1430 * 750 / 2860) as u16)
+    core.assert(table.millivolts(2, 0, 2) == (6 * 750 / 2860) as u16)
+    core.assert(table.millivolts(6, 3, 1) == 0)
+    plain := esp_adc.Calibration.none()
+    core.assert(plain.millivolts(0, 3, 4095) == 3300 && plain.millivolts(0, 0, 4095) == 950)
+    sample := (0xABCu32 << 20) | (5u32 << 16) | 1234
+    core.assert(esp_adc.sample_raw(sample) == 0xABC && esp_adc.sample_channel(sample) == 5 && esp_adc.sample_millivolts(sample) == 1234)
+    core.assert(esp_adc.result_valid(0x0000_2FFF) && !esp_adc.result_valid(0x0001_0000) && !esp_adc.result_valid(7u32 << 13))
+
+    reset_model()
+    descriptors: [24]u32 = [0u32; 24]
+    buffer: [1024]u8 = [0; 1024]
+    two := [esp_adc.Channel { pin: 1, attenuation: esp_adc.Attenuation.Db12 }, esp_adc.Channel { pin: 2, attenuation: esp_adc.Attenuation.Db0 }]
+    none: [0]esp_adc.Channel = []
+    seven := [esp_adc.Channel { pin: 7, attenuation: esp_adc.Attenuation.Db12 }]
+    twice := [esp_adc.Channel { pin: 3, attenuation: esp_adc.Attenuation.Db12 }, esp_adc.Channel { pin: 3, attenuation: esp_adc.Attenuation.Db6 }]
+    core.assert(refused(esp_adc.Stream.start(Chip {}, &none, 10_000, 2, &mut descriptors, &mut buffer, calibration()), hal.Error.InvalidInput))
+    core.assert(refused(esp_adc.Stream.start(Chip {}, &seven, 10_000, 2, &mut descriptors, &mut buffer, calibration()), hal.Error.InvalidInput))
+    core.assert(refused(esp_adc.Stream.start(Chip {}, &twice, 10_000, 2, &mut descriptors, &mut buffer, calibration()), hal.Error.InvalidInput))
+    core.assert(refused(esp_adc.Stream.start(Chip {}, &two, 100, 2, &mut descriptors, &mut buffer, calibration()), hal.Error.InvalidInput))
+    small: [20]u8 = [0; 20]
+    core.assert(refused(esp_adc.Stream.start(Chip {}, &two, 10_000, 2, &mut descriptors, &mut small, calibration()), hal.Error.InvalidInput))
+    add_words(&descriptors)
+    add_bytes(&buffer)
+    unsafe {
+        LEVELS[1] = 2830
+        LEVELS[2] = 100
+        SARADC[0] = 0x4003_8240 | 3
+    }
+    {
+        stream := esp_adc.Stream.start(Chip {}, &two, 10_000, 2, &mut descriptors, &mut buffer, calibration())!
+        core.assert(stream.rate_hz() == 10_000 && stream.channels() == 2 && stream.capacity() == 256 && stream.part_samples() == 32)
+        // The controller: timer mode with forced power, two entries, the
+        // SAR clock undivided; the timer; DMA with an EOF every part.
+        control := saradc_register(0x00)
+        core.assert((control & 3) == 0 && ((control >> 15) & 7) == 1 && ((control >> 7) & 0xFF) == 1 && ((control >> 27) & 3) == 3 && (control & (1u32 << 6)) != 0)
+        core.assert(saradc_register(0x18) == ((((1u32 << 2) | 3) << 18) | ((2u32 << 2) << 12) | 0xFFF))
+        core.assert(saradc_register(0x04) == ((1u32 << 24) | (125u32 << 12) | (0xFFu32 << 1)))
+        core.assert(saradc_register(0x50) == ((1u32 << 31) | 32) && saradc_register(0x20) == 0)
+        core.assert(gdma_register(2, 0x30) == esp_gdma.PERIPHERAL_ADC)
+
+        // Samples become readable a part at a time, channels in turn.
+        adc_convert(31)
+        core.assert(stream.available() == 0)
+        adc_convert(33)
+        core.assert(stream.available() == 64)
+        samples: [100]u32 = [0u32; 100]
+        core.assert(stream.poll_read(&mut samples[..40])! == 40)
+        core.assert(stream.poll_read(&mut samples[40..])! == 24)
+        alternate := true
+        for index in 0usize..64 {
+            channel := esp_adc.sample_channel(samples[index])
+            if index % 2 == 0 {
+                alternate = alternate && channel == 1 && esp_adc.sample_millivolts(samples[index]) == (2828 * 2800 / 2830) as u16 && esp_adc.sample_raw(samples[index]) == 2830
+            } else {
+                alternate = alternate && channel == 2 && esp_adc.sample_millivolts(samples[index]) == (104 * 750 / 2860) as u16
+            }
+        }
+        core.assert(alternate && stream.poll_read(&mut samples)! == 0)
+
+        // Results that are not ADC1 conversions of a channel are skipped.
+        for _ in 0..16 {
+            adc_result(1u32 << 16)
+            adc_result(7u32 << 13)
+        }
+        core.assert(stream.available() == 32 && stream.poll_read(&mut samples)! == 0)
+
+        // Left alone, the ring fills and the channel stops: the samples it
+        // held, then Overrun once, then a fresh start from the first entry.
+        adc_convert(300)
+        unsafe {
+            core.assert(STALLS == 1)
+        }
+        core.assert(stream.available() == 256)
+        read := 0usize
+        for read < 256 {
+            read += stream.poll_read(&mut samples)!
+        }
+        core.assert(read == 256 && refused(stream.poll_read(&mut samples), hal.Error.Overrun))
+        unsafe {
+            core.assert(IN_RUNNING[2] && PATTERN_INDEX == 0)
+        }
+        adc_convert(32)
+        core.assert(stream.poll_read(&mut samples)! == 32 && esp_adc.sample_channel(samples[0]) == 1)
+        // read waits until the slice is full.
+        adc_convert(64)
+        stream.read(&mut samples[..50])!
+        core.assert(esp_adc.sample_channel(samples[49]) == 2 && stream.available() == 14)
+        core.drop(stream)
+    }
+    // Stopping puts the controller back: no timer, no DMA, power not
+    // forced, the old pattern; the channel disconnected.
+    core.assert((saradc_register(0x04) & (1u32 << 24)) == 0 && saradc_register(0x50) == 0)
+    core.assert(saradc_register(0x00) == (0x4003_8240 | 3) && saradc_register(0x18) == 0xFF_FFFF)
+    core.assert(gdma_register(2, 0x30) == esp_gdma.NO_PERIPHERAL)
+}
+
+fn main() {
+    ring_checks()
+    uart_checks()
+    adc_checks()
+}

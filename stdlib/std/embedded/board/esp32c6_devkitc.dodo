@@ -92,6 +92,9 @@ pub struct Board {
     // Sleep modes, clock gating, and the dormant state, the
     // std/embedded/power protocol; see esp32c6.Power.
     pub power: esp32c6.Power
+    // The low-power core, which runs the program the firmware embeds with
+    // `lp-core`; see esp32c6.LpCore.
+    pub lp_core: esp32c6.LpCore
 }
 
 // Start the chip and claim the LED, off. A second call returns
@@ -99,10 +102,10 @@ pub struct Board {
 pub fn take() -> Board!hal.Error {
     chip := esp32c6.take()?
     leds := chip.pins.ws2812(LED_PIN)?
-    let esp32c6.Peripherals { pins, timer, usb, dma, rng, watchdog, rtc, flash, power } = chip
+    let esp32c6.Peripherals { pins, timer, usb, dma, rng, watchdog, rtc, flash, power, lp_core } = chip
     led := Led { leds, color: LED_ON_COLOR, on: false }
     led.set_low()
-    return ok(Board { led, pins, timer, usb, dma, rng, watchdog, rtc, flash, power })
+    return ok(Board { led, pins, timer, usb, dma, rng, watchdog, rtc, flash, power, lp_core })
 }
 
 // The board's RGB LED: an output pin, on when high, for the board contract
