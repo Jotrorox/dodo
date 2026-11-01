@@ -1,0 +1,1 @@
+local x <close>, y <close> = 1, 2
