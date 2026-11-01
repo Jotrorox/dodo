@@ -117,7 +117,7 @@ fn interpreter_runs_precompiled_programs_and_options() {
     let version = success(Command::new(&exe).arg("-v").output().unwrap());
     assert_eq!(
         String::from_utf8_lossy(&version.stdout),
-        "Lua 5.4.9  Copyright (C) 1994-2026 Lua.org, PUC-Rio\n"
+        "Lua 5.4.9  Dodo std/script/lua, implementing Lua by Lua.org, PUC-Rio\n"
     );
     let bad = Command::new(&exe).arg("-x").output().unwrap();
     assert_eq!(bad.status.code(), Some(1));
