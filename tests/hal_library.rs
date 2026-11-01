@@ -463,6 +463,25 @@ fn dma_channels_and_sessions_execute_against_simulated_controllers() {
 }
 
 #[test]
+fn adc_sampler_and_its_dma_sessions_execute_against_a_simulated_converter() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let scratch = Scratch::new("adc");
+    let source = root.join("tests/stdlib/adc_checks.dodo");
+    for optimization in ["0", "3"] {
+        let executable = scratch.0.join(format!(
+            "adc-O{optimization}{}",
+            std::env::consts::EXE_SUFFIX
+        ));
+        let args = ["build", source.to_str().unwrap(), "-O", optimization, "-o"];
+        success(&dodo(&args, &executable), "compile adc fixture");
+        success(
+            &Command::new(&executable).output().unwrap(),
+            "execute adc fixture",
+        );
+    }
+}
+
+#[test]
 fn usb_serial_device_enumerates_and_moves_data_against_a_simulated_host() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let scratch = Scratch::new("usb");

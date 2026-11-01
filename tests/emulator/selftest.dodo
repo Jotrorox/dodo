@@ -5,6 +5,7 @@ import "core/mmio"
 import "core/ptr"
 import "std/embedded/board"
 import "std/embedded/chip"
+import "std/embedded/chip/rp_adc"
 import "std/embedded/chip/rp_dma"
 import "std/embedded/chip/rp_multicore"
 import "std/embedded/chip/rp_pio"
@@ -434,6 +435,127 @@ fn dma_checks(dma: &mut rp_dma.Dma) {
     dma.release(second)
 }
 
+// The ADC's sampler: polled reads, the FIFO interrupt and its signal, a
+// DMA capture, and a DMA stream. The emulators convert back to back
+// whatever DIV says and make up each result as the input's number times
+// 256 plus a conversion counter, so consecutive values from DMA show that
+// none was lost. Only the RP2350's emulator advances the round (CS.RROBIN),
+// so only there do the values show the inputs the tags name. Nothing is
+// connected to the pins, so on real boards the values are noise.
+const SAMPLES: executor.Signal = executor.Signal { id: 2 }
+const ROUND: u32 = rp_adc.GPIO26 | rp_adc.GPIO27 | rp_adc.TEMPERATURE
+@align(128)
+static mut ADC_RING: [64]u16 = [0u16; 64]
+
+// samples[..count] follow the round from GPIO 26 and, where the emulator
+// advances the round, come from the inputs they name.
+fn follows_round(samples: &[u16], count: usize, rounds: bool) -> bool {
+    good := true
+    for index in 0..count {
+        sample := samples[index]
+        good = good && rp_adc.sample_input(sample) == rp_adc.input_at(ROUND, index) && !rp_adc.sample_failed(sample)
+        if rounds {
+            good = good && (rp_adc.sample_value(sample) >> 8) as u32 == rp_adc.sample_input(sample)
+        }
+    }
+    return good
+}
+
+// Consecutive conversions: the emulators' counter in the low byte.
+fn consecutive(samples: &[u16], count: usize) -> bool {
+    good := true
+    for index in 1..count {
+        good = good && (samples[index] & 0xFF) == ((samples[index - 1] + 1) & 0xFF)
+    }
+    return good
+}
+
+fn adc_checks(pins: &mut chip.Pins, dma: &mut rp_dma.Dma) {
+    rounds := dma.channels() == 16
+    sampler := pins.sampler(ROUND, 100_000)!
+    assert(refused(pins.analog(28), hal.Error.Busy) && refused(pins.temperature(), hal.Error.Busy) && refused(pins.output(26), hal.Error.Busy), "ADC sampler claims")
+    assert(sampler.rate_hz() == 100_000 && sampler.input_count() == 3, "ADC sampler rate")
+    samples: [8]u16 = [0; 8]
+    // Three samples, one round, read right after the start, before the
+    // FIFO can overflow: the emulators ignore DIV and convert 500 000
+    // times a second, and their FIFOs hold 4 samples, not 8. Should it
+    // overflow anyway, the sampler starts over.
+    read := false
+    for attempt in 0..5u32 {
+        if !read {
+            sampler.start()
+            match sampler.read(&mut samples[..3]) {
+                ok() => {
+                    read = true
+                }
+                err(error) => {
+                    assert(error == hal.Error.Overrun, "an ADC read failed")
+                }
+            }
+        }
+    }
+    // At 500 000 a second, the RP2040 emulator's conversions outrun an
+    // unoptimized read loop on its slower core even then; on a real chip
+    // the sampler converts at the rate it was given.
+    assert(read || !rounds, "polled ADC reads keep overrunning")
+    assert(!read || follows_round(&samples, 3, rounds), "polled ADC samples follow the round")
+    sampler.stop()
+
+    // The FIFO interrupt raises the sampler's signal.
+    sampler.set_threshold(4)!
+    sampler.set_signal(&SAMPLES)
+    cx := executor.Context.new(0)
+    raised := SAMPLES.take(&mut cx)
+    sampler.start()
+    polls := 0u32
+    for !SAMPLES.take(&mut cx) && polls < 1_000_000 {
+        polls += 1
+    }
+    assert(polls < 1_000_000, "the ADC's FIFO interrupt does not raise the signal")
+    sampler.stop()
+    sampler.clear_signal()
+    sampler.set_threshold(1)!
+
+    channel := dma.channel()!
+    capture: [64]u16 = [0; 64]
+    sampler.capture(&mut channel, &mut capture)!
+    assert(follows_round(&capture, 64, rounds) && consecutive(&capture, 64), "an ADC capture by DMA")
+    bytes: [16]u8 = [0; 16]
+    sampler.capture_bytes(&mut channel, &mut bytes)!
+    assert(!sampler.is_running(), "a capture leaves the sampler stopped")
+    unsafe {
+        stream := sampler.stream(&mut channel, &mut ADC_RING)!
+        assert(stream.ring_size() == 64, "the ADC stream's ring")
+        streamed: [8]u16 = [0; 8]
+        total := 0usize
+        tries := 0u32
+        for total < 100 && tries < 100_000 {
+            tries += 1
+            match stream.poll_read(&mut streamed) {
+                ok(count) => {
+                    total += count
+                    if rounds {
+                        for index in 0..count {
+                            sample := streamed[index]
+                            assert((rp_adc.sample_value(sample) >> 8) as u32 == rp_adc.sample_input(sample), "streamed ADC samples follow the round")
+                        }
+                    }
+                }
+                err(error) => {
+                    assert(error == hal.Error.Overrun, "an ADC stream read failed")
+                }
+            }
+        }
+        assert(total >= 100, "the ADC stream stalls")
+    }
+    dma.release(channel)
+    pins.release_sampler(sampler)
+    knob := pins.analog(26)!
+    value := knob.read()!
+    assert(value <= rp_adc.MAX_VALUE, "an analog input after the sampler")
+    pins.release_analog(knob)
+}
+
 // A UART sends 16 bytes at 1 Mbaud and drains its transmit FIFO. (The
 // RP2040 emulator has no internal loopback to read them back.)
 fn uart_checks(pins: &mut chip.Pins) {
@@ -690,6 +812,8 @@ pub fn run(float64: bool) {
     executor_checks(&mut b.timer)
     step()
     dma_checks(&mut b.dma)
+    step()
+    adc_checks(&mut b.pins, &mut b.dma)
     step()
     uart_checks(&mut b.pins)
     step()

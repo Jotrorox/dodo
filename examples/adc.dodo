@@ -1,0 +1,156 @@
+package main
+
+import "std/embedded/board"
+import "std/embedded/chip/rp_adc"
+import "std/embedded/executor"
+import "std/embedded/hal"
+import "std/embedded/peripheral/pl011"
+import "std/fmt"
+
+// The ADC samples by itself while the core does other work:
+//
+// - first a burst: GP26 sampled 250 000 times a second into a buffer by
+//   DMA, about 1 ms of it, whose lowest and highest values are printed;
+// - then a monitor: GP26, GP27, and the temperature sensor sampled one
+//   after the other 3000 times a second into the ADC's FIFO, a task woken
+//   by the sampler's signal whenever six samples wait, and their averages
+//   printed every second;
+// - the LED blinks, showing that neither holds up the core.
+//
+//     dodo run examples/adc.dodo --board pico
+//     picocom -b 115200 /dev/ttyACM0
+//
+// The serial port is GP0 (TX) and GP1 (RX) at 115200 baud. Turn a
+// potentiometer on GP26 or GP27 to see the averages follow.
+
+// Signals, numbered for the whole program.
+const SAMPLES: executor.Signal = executor.Signal { id: 0 }
+
+// The ADC's reference, 3.3 V on the Pico boards.
+const REFERENCE_MV: u32 = 3300
+
+// Adds up each input's samples as they come and prints the averages.
+struct Monitor {
+    sampler: rp_adc.AdcSampler
+    port: pl011.Port
+    ticker: executor.Ticker
+    sums: [5]u32
+    counts: [5]u32
+    overruns: u32
+
+    pub fn poll(&mut self, cx: &mut executor.Context) -> executor.Poll {
+        if SAMPLES.take(cx) {
+            self.collect()
+        }
+        if self.ticker.ready(cx) {
+            self.report()!
+        }
+        return executor.Poll.Pending
+    }
+
+    // Read what waits in the FIFO; reading also lets the sampler's
+    // interrupt raise the signal again.
+    fn collect(&mut self) {
+        samples: [8]u16 = [0; 8]
+        match self.sampler.poll_read(&mut samples) {
+            ok(count) => {
+                for index in 0..count {
+                    sample := samples[index]
+                    if !rp_adc.sample_failed(sample) {
+                        input := rp_adc.sample_input(sample) as usize
+                        self.sums[input] += rp_adc.sample_value(sample) as u32
+                        self.counts[input] += 1
+                    }
+                }
+            }
+            err(error) => {
+                // The task fell more than eight samples behind.
+                self.overruns += 1
+            }
+        }
+    }
+
+    fn report(&mut self) -> void!hal.Error {
+        gp26 := self.average_mv(0)
+        gp27 := self.average_mv(1)
+        celsius := rp_adc.millicelsius(self.average(4) as u16, REFERENCE_MV) / 1000
+        samples := self.counts[0] + self.counts[1] + self.counts[4]
+        overruns := self.overruns
+        match fmt.printf(&mut self.port, "GP26 {} mV, GP27 {} mV, {} C ({} samples, {} overruns)\n", gp26, gp27, celsius, samples, overruns) {
+            ok(written) => {}
+            err(error) => {
+                return err(hal.Error.Bus)
+            }
+        }
+        self.sums = [0; 5]
+        self.counts = [0; 5]
+        return ok()
+    }
+
+    fn average(&self, input: usize) -> u32 {
+        if self.counts[input] == 0 {
+            return 0
+        }
+        return self.sums[input] / self.counts[input]
+    }
+
+    fn average_mv(&self, input: usize) -> u32 {
+        return self.average(input) * REFERENCE_MV / rp_adc.MAX_VALUE as u32
+    }
+}
+
+struct Blinker<L> {
+    led: &mut L
+    ticker: executor.Ticker
+
+    pub fn poll(&mut self, cx: &mut executor.Context) -> executor.Poll {
+        if self.ticker.ready(cx) {
+            self.led.toggle()
+        }
+        return executor.Poll.Pending
+    }
+}
+
+fn main() {
+    b := board.take()!
+    clock := b.timer.alarm(0)!
+    port := b.pins.uart(board.UART_TX_PIN, some(board.UART_RX_PIN), 115_200)!
+    port.set_crlf(true)
+
+    // The burst: each sample comes from GP26, so input_at(i) is 0.
+    burst := b.pins.sampler(rp_adc.GPIO26, 250_000)!
+    channel := b.dma.channel()!
+    samples: [256]u16 = [0; 256]
+    burst.capture(&mut channel, &mut samples)!
+    lowest := rp_adc.MAX_VALUE
+    highest: u16 = 0
+    for index in 0..samples.len {
+        value := rp_adc.sample_value(samples[index])
+        if value < lowest {
+            lowest = value
+        }
+        if value > highest {
+            highest = value
+        }
+    }
+    fmt.printf(&mut port, "{}: GP26 burst of {} samples, {} to {}\n", board.NAME, samples.len, lowest, highest)!
+    b.dma.release(channel)
+    b.pins.release_sampler(burst)
+
+    // The monitor: 1000 samples of each input a second.
+    sampler := b.pins.sampler(rp_adc.GPIO26 | rp_adc.GPIO27 | rp_adc.TEMPERATURE, 3000)!
+    sampler.set_threshold(6)!
+    sampler.set_signal(&SAMPLES)
+    sampler.start()
+    monitor := Monitor {
+        sampler,
+        port,
+        ticker: executor.Ticker.every_ms(1000),
+        sums: [0; 5],
+        counts: [0; 5],
+        overruns: 0,
+    }
+    blinker := Blinker { led: &mut b.led, ticker: executor.Ticker.every_ms(250) }
+    tasks: [2]&mut dyn executor.Task = [&mut monitor, &mut blinker]
+    executor.run(&mut tasks, &mut clock)
+}
