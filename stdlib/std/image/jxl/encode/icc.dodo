@@ -46,6 +46,8 @@ const ICC_LZ77_BASE: u32 = 264
 // Clusters of the ICC stream: enough for its 41 byte contexts, and few
 // enough prefix tables for small decoders (std/image/jxl's ICC table pool).
 const ICC_MAX_CLUSTERS: usize = 8
+// Profiles up to this size choose LZ77 and the cluster count by trial.
+const ICC_SEARCH_LIMIT: usize = 262144
 // u32 words of LZ77 working memory: window bytes (as u32 words / 4),
 // hash heads and the chain.
 const ICC_RING_WORDS: usize = 16384
@@ -206,7 +208,7 @@ fn icc_linear_prediction(icc: &[u8], start: usize, i: usize, stride: usize, widt
         return (icc_predict(p1, p2, p3, order) & 255) as u8
     }
     if width == 2 {
-        at := start + (i & 0xFFFFFFFFFFFFFFFE)
+        at := start + i - (i & 1)
         p1 := ((icc[at - stride] as u32) << 8) | icc[at - stride + 1] as u32
         p2 := ((icc[at - 2 * stride] as u32) << 8) | icc[at - 2 * stride + 1] as u32
         p3 := ((icc[at - 3 * stride] as u32) << 8) | icc[at - 3 * stride + 1] as u32
@@ -216,7 +218,7 @@ fn icc_linear_prediction(icc: &[u8], start: usize, i: usize, stride: usize, widt
         }
         return ((pred >> 8) & 255) as u8
     }
-    at := start + (i & 0xFFFFFFFFFFFFFFFC)
+    at := start + i - (i & 3)
     p1 := icc_be32(icc, (at - stride) as u64) as u32
     p2 := icc_be32(icc, (at - 2 * stride) as u64) as u32
     p3 := icc_be32(icc, (at - 3 * stride) as u64) as u32
@@ -729,15 +731,19 @@ fn icc_generate(icc: &[u8], s: &mut IccStream, set: &CodeSet, w: &mut BitWriter)
                 numo := icc[(tagstart + 9) as usize] as usize
                 width := icc[(clutstart + 16) as usize] as usize
                 stride := width * numo
-                num := width * numo
+                product := (width * numo) as u64
                 c := clutstart as usize
                 for k in 0usize..numi {
-                    if c + k >= size || num >= 268435456 {
+                    if c + k >= size || product >= 268435456 {
                         break
                     }
-                    num = num * icc[c + k] as usize
+                    product = product * icc[c + k] as u64
                 }
-                if (width == 1 || width == 2) && num > 64 && num < 268435456 && pos + num <= size && pos > stride * 4 {
+                num := 0usize
+                if product < 268435456 {
+                    num = product as usize
+                }
+                if (width == 1 || width == 2) && num > 64 && pos + num <= size && pos > stride * 4 {
                     if !emitted {
                         icc_insert(icc, last0, last1, s, set, w)
                         emitted = true
@@ -870,34 +876,72 @@ fn write_u64(w: &mut BitWriter, value: u64) {
 // ICC_CHAIN_WORDS words) the LZ77 window. Returns false if the coder found
 // an inconsistency (never expected).
 fn write_icc(w: &mut BitWriter, icc: &[u8], set: &mut CodeSet, hist: &mut[u32], sums: &mut[u32], choice: &mut[u32], ring: &mut[u32], head: &mut[u32], chain: &mut[u32]) -> bool {
-    contexts := ICC_CONTEXTS + 1
-    for i in 0usize..contexts * MAX_ALPHA {
-        hist[i] = 0
-    }
     s := IccStream.new(ring, head, chain, hist)
     enc_size := icc_stream_size(icc, set, &mut s)
     commands := s.commands
-    // Count with LZ77 matching; drop LZ77 when it never matched.
-    empty := [0u8; 1]
-    {
-        dummy := BitWriter.new(&mut empty[..0], 0)
-        s.reset(true, true)
-        icc_pass(icc, commands, &mut s, set, &mut dummy)
+    proj := [0u16; 288]
+    projection(CONFIG_EXACT, ICC_LZ77_BASE, &mut proj)
+    set.min_length = ICC_MIN_MATCH as u32
+    // Profiles up to ICC_SEARCH_LIMIT bytes try LZ77 on and off and up to
+    // 1, 2, 4 or 8 clusters, keeping the smallest exact size; larger ones
+    // use LZ77 (when it matches) and 8 clusters.
+    best_lz77 := true
+    best_limit := ICC_MAX_CLUSTERS
+    if icc.len <= ICC_SEARCH_LIMIT {
+        best_bits := 0xFFFFFFFFFFFFFFFFu64
+        for variant in 0usize..2 {
+            lz77 := variant == 0
+            if !icc_count(icc, commands, lz77, &mut s, set) {
+                // LZ77 never matched: the same as without it.
+                continue
+            }
+            for step in 0usize..4 {
+                limit := 1usize << step
+                icc_build(set, &s, lz77, limit, sums, choice, &proj)
+                empty := [0u8; 1]
+                dry := BitWriter.new(&mut empty[..0], 0)
+                set.write(&mut dry)
+                s.reset(false, lz77)
+                icc_pass(icc, commands, &mut s, set, &mut dry)
+                bits := dry.bits_since(0)
+                if bits < best_bits {
+                    best_bits = bits
+                    best_lz77 = lz77
+                    best_limit = limit
+                }
+            }
+        }
     }
-    lz77 := s.copies > 0
-    if !lz77 {
-        contexts = ICC_CONTEXTS
+    best_lz77 = icc_count(icc, commands, best_lz77, &mut s, set) && best_lz77
+    icc_build(set, &s, best_lz77, best_limit, sums, choice, &proj)
+    write_u64(w, enc_size)
+    set.write(w)
+    s.reset(false, best_lz77)
+    icc_pass(icc, commands, &mut s, set, w)
+    return !s.broken
+}
+
+// Count the stream's tokens (with or without LZ77) into s.hist; false when
+// LZ77 was asked for but never matched.
+fn icc_count(icc: &[u8], commands: u64, lz77: bool, s: &mut IccStream, set: &CodeSet) -> bool {
+    for i in 0usize..(ICC_CONTEXTS + 1) * MAX_ALPHA {
+        s.hist[i] = 0
+    }
+    empty := [0u8; 1]
+    dummy := BitWriter.new(&mut empty[..0], 0)
+    s.reset(true, lz77)
+    icc_pass(icc, commands, s, set, &mut dummy)
+    return !lz77 || s.copies > 0
+}
+
+// Cluster the counted histograms into at most `limit` codes and build them.
+fn icc_build(set: &mut CodeSet, s: &IccStream, lz77: bool, limit: usize, sums: &mut[u32], choice: &mut[u32], proj: &[u16]) {
+    contexts := ICC_CONTEXTS
+    if lz77 {
+        contexts += 1
     }
     set.contexts = contexts
     set.lz77 = lz77
-    set.min_length = ICC_MIN_MATCH as u32
-    proj := [0u16; 288]
-    projection(CONFIG_EXACT, ICC_LZ77_BASE, &mut proj)
-    set.clusters = cluster_histograms(s.hist, contexts, ICC_MAX_CLUSTERS, set.map, sums, choice, &proj)
+    set.clusters = cluster_histograms(s.hist, contexts, limit, set.map, sums, choice, proj)
     set.build_tuned(sums, CONFIG_EXACT, ICC_LZ77_BASE, true, 0, 1)
-    write_u64(w, enc_size)
-    set.write(w)
-    s.reset(false, lz77)
-    icc_pass(icc, commands, &mut s, set, w)
-    return !s.broken
 }

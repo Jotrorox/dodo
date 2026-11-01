@@ -170,7 +170,9 @@ the table above lists; float sources are clamped to 0.0 to 1.0 except in PFM.
   PPM, BMP and stored PNG it is exact.
 - `image.encode_scratch_size(format, &source, &options)` is the scratch
   `encode` needs: the deflate encoder's buffer and workspace for compressed
-  PNG (about 350 KiB), nothing otherwise.
+  PNG (about 350 KiB), JPEG XL's group planes and histograms plus, at effort
+  2 and up, ANS tables and a token buffer (about 0.4 to 4 MiB), nothing
+  otherwise.
 - `image.encode_with_metadata(format, &source, &options, &exif, &icc, ...)`
   also writes a TIFF-structured EXIF payload and an ICC profile where the
   format stores them (PNG `eXIf` and `iCCP`; JPEG XL an `Exif` box and the
