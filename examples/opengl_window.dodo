@@ -1,23 +1,20 @@
 package main
 
 import "core/ptr"
-import "std/graphics"
 import "std/gpu/opengl"
 import "std/gpu/opengl/gl"
 import "std/window"
 
-// Draw a triangle with OpenGL and show it in a std/window window. The GPU
-// renders into an offscreen target; each frame is read back and copied into
-// the window's canvas. Press Escape or close the window to quit.
+// Draw a spinning triangle with OpenGL straight into a std/window window.
+// The window has no pixel buffer: the context draws into the window's own
+// framebuffer and swap_buffers() shows each frame, with no copy through the
+// CPU. Press Escape or close the window to quit.
 
 const WIDTH: u32 = 480
 const HEIGHT: u32 = 320
 
-const VERTEX_SHADER: &[u8] = b"#version 330 core\nlayout(location = 0) in vec2 position;\nlayout(location = 1) in vec3 color;\nout vec3 shade;\nvoid main() {\n    shade = color;\n    gl_Position = vec4(position, 0.0, 1.0);\n}\n\0"
+const VERTEX_SHADER: &[u8] = b"#version 330 core\nlayout(location = 0) in vec2 position;\nlayout(location = 1) in vec3 color;\nuniform float angle;\nuniform vec2 aspect;\nout vec3 shade;\nvoid main() {\n    shade = color;\n    float c = cos(angle);\n    float s = sin(angle);\n    gl_Position = vec4(mat2(c, s, -s, c) * position * aspect, 0.0, 1.0);\n}\n\0"
 const FRAGMENT_SHADER: &[u8] = b"#version 330 core\nin vec3 shade;\nout vec4 result;\nvoid main() {\n    result = vec4(shade, 1.0);\n}\n\0"
-
-// Room for the window at up to twice the size on high-density displays.
-static mut FRAME: [2457600]u8 = [0; 2457600]
 
 fn compile(kind: u32, source: &[u8]) -> u32 {
     unsafe {
@@ -31,9 +28,9 @@ fn compile(kind: u32, source: &[u8]) -> u32 {
 
 fn setup() -> u32 {
     vertices := [
-        -0.6f32, -0.6, 1.0, 0.3, 0.2,
-        0.6, -0.6, 0.2, 0.9, 0.4,
-        0.0, 0.6, 0.3, 0.4, 1.0
+        -0.6f32, -0.5, 1.0, 0.3, 0.2,
+        0.6, -0.5, 0.2, 0.9, 0.4,
+        0.0, 0.7, 0.3, 0.4, 1.0
     ]
     vertex := compile(gl.VERTEX_SHADER, VERTEX_SHADER)
     fragment := compile(gl.FRAGMENT_SHADER, FRAGMENT_SHADER)
@@ -57,46 +54,81 @@ fn setup() -> u32 {
     }
 }
 
-fn run() -> void!opengl.Error {
-    context := opengl.Context.create(opengl.Options.default())?
-    title := context.renderer()
-    win := window.open(window.Options { title: title, width: WIDTH, height: HEIGHT, resizable: false })!
-    // The canvas has scale() times more pixels per side than the window.
-    scale := win.scale()
-    if scale > 2 {
-        scale = 2
+// Clear the window's framebuffer and draw the triangle turned by `angle`
+// radians, keeping its shape whatever the window's proportions.
+fn draw(program: u32, width: u32, height: u32, angle: f32) {
+    sx := 1.0f32
+    sy := 1.0f32
+    if width > height {
+        sx = height as f32 / width as f32
+    } else {
+        sy = width as f32 / height as f32
     }
-    width := WIDTH * scale
-    height := HEIGHT * scale
-
-    target := opengl.Target.new(width, height)?
-    program := setup()
     unsafe {
+        gl.bind_framebuffer(gl.FRAMEBUFFER, 0)
+        gl.viewport(0, 0, width as i32, height as i32)
         gl.clear_color(0.11, 0.13, 0.19, 1.0)
         gl.clear(gl.COLOR_BUFFER_BIT)
         gl.use_program(program)
+        gl.uniform_1f(gl.get_uniform_location(program, ptr.as_ptr(b"angle\0")), angle)
+        gl.uniform_2f(gl.get_uniform_location(program, ptr.as_ptr(b"aspect\0")), sx, sy)
         gl.draw_arrays(gl.TRIANGLES, 0, 3)
     }
-    frame := unsafe {
-        &mut FRAME[..]
+}
+
+fn run() -> void!opengl.Error {
+    win := match window.open(window.Options.gpu("OpenGL", WIDTH, HEIGHT)) {
+        ok(win) => win,
+        err(_) => {
+            return err(opengl.Error.NoDisplay)
+        }
     }
-    target.read_bgra(frame)?
-    image := graphics.Canvas.new(frame, width, height, graphics.PixelFormat.Bgra8888)!
+    native := match win.native_handle() {
+        ok(native) => native,
+        err(_) => {
+            return err(opengl.Error.NoDisplay)
+        }
+    }
+    context := opengl.Context.create_for_window(&native, opengl.Options.default())?
+    match win.set_title(context.renderer()) {
+        ok() => {}
+        err(_) => {}
+    }
+    // Frames follow the display; wait_event_until_frame paces them too.
+    match context.set_swap_interval(1) {
+        ok() => {}
+        err(_) => {}
+    }
+    program := setup()
+    // Radians per second, advanced by the display's refresh period.
+    period := win.frame_interval()
+    step := 1.2f32 * (period.seconds() as f32 + period.subsec_nanos() as f32 / 1000000000.0)
+    angle := 0.0f32
     for {
-        canvas := win.canvas()
-        canvas.blit(&image, 0, 0)
-        dirty := canvas.take_dirty()
-        win.update(dirty)!
-        match win.wait_event()! {
-            window.Event.Close => {
+        event := match win.wait_event_until_frame() {
+            ok(event) => event,
+            err(_) => {
                 return ok()
             }
-            window.Event.Key(key) => {
+        }
+        match event {
+            some(window.Event.Close) => {
+                return ok()
+            }
+            some(window.Event.Key(key)) => {
                 if key.key == window.Key.Escape {
                     return ok()
                 }
             }
-            _ => {}
+            some(window.Event.Resize(_, _)) => {
+                context.update_surface()
+            }
+            some(_) => {}
+            none => {
+                draw(program, win.width(), win.height(), angle)
+                context.swap_buffers()?
+                angle += step
+            }
         }
     }
 }

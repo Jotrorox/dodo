@@ -2,6 +2,7 @@ package window
 
 import "std/graphics"
 import "std/time"
+import "std/window/handle"
 import "std/window/native" as backend
 import "std/window/raw"
 
@@ -19,9 +20,18 @@ import "std/window/raw"
 // user32/gdi32 on Windows. A process has at most one window open at a time,
 // and must use it from the thread that opened it; on macOS that has to be
 // the main thread.
+//
+// A GPU draws into a window through native_handle(), which hands Vulkan,
+// OpenGL or Metal the window system's own objects. A window opened with
+// Options.gpu() has no pixel buffer at all, for programs that draw only on
+// the GPU.
 
 // Why a window could not be opened or used; see raw.Error for each variant.
 pub type Error = raw.Error
+
+// The window-system objects behind a window, for GPU APIs; see
+// std/window/handle.
+pub type NativeHandle = handle.NativeHandle
 
 pub fn error_name(error: Error) -> &str from(static) {
     match error {
@@ -66,10 +76,19 @@ pub struct Options {
     pub height: u32
     // Whether the user may resize the window.
     pub resizable: bool
+    // Whether the window has a pixel buffer for canvas() and update(). A
+    // window that only a GPU draws into needs none, which saves its memory
+    // and the copy on every resize.
+    pub pixel_buffer: bool
 
-    // A resizable window with the given title and size.
+    // A resizable window with the given title and size and a pixel buffer.
     pub fn new(title: &str, width: u32, height: u32) -> Options from(title) {
-        return Options { title: title, width: width, height: height, resizable: true }
+        return Options { title: title, width: width, height: height, resizable: true, pixel_buffer: true }
+    }
+    // A resizable window without a pixel buffer, for drawing with Vulkan,
+    // OpenGL or Metal through native_handle().
+    pub fn gpu(title: &str, width: u32, height: u32) -> Options from(title) {
+        return Options { title: title, width: width, height: height, resizable: true, pixel_buffer: false }
     }
 }
 
@@ -80,8 +99,8 @@ pub fn open(options: Options) -> Window!Error {
     if options.width == 0 || options.height == 0 || options.width > MAX_SIZE || options.height > MAX_SIZE {
         return err(Error.InvalidInput)
     }
-    handle := backend.Backend.open(options.title, options.width, options.height, options.resizable)?
-    return ok(Window { backend: handle, pending: raw.Event.empty(), frame_deadline: 0, frame_previous: 0, frame_requested: false, frame_signalled: false, animating: false })
+    system := backend.Backend.open(options.title, options.width, options.height, options.resizable, options.pixel_buffer)?
+    return ok(Window { backend: system, pending: raw.Event.empty(), frame_deadline: 0, frame_previous: 0, frame_requested: false, frame_signalled: false, animating: false })
 }
 
 // Something that happened to the window.
@@ -263,19 +282,36 @@ pub struct Window {
         return factor
     }
 
+    // Whether the window has a pixel buffer: false when it was opened with
+    // Options.gpu().
+    pub fn has_pixel_buffer(&self) -> bool {
+        return self.backend.has_pixel_buffer()
+    }
+
     // The window's pixel buffer as a canvas, in graphics.PixelFormat.Bgra8888.
     // It keeps what was drawn into it until the window is resized. Drawing
     // shows nothing until update(); the borrow must end before the next
-    // event call, since a resize replaces the buffer.
+    // event call, since a resize replaces the buffer. A window without a
+    // pixel buffer lends out an empty 0x0 canvas.
     pub fn canvas(&mut self) -> graphics.Canvas from(self) {
         width := self.backend.width()
         height := self.backend.height()
         stride := self.backend.stride()
+        if !self.backend.has_pixel_buffer() {
+            width = 0
+            height = 0
+            stride = 0
+        }
         return graphics.Canvas.with_stride(self.backend.pixels(), width, height, stride, graphics.PixelFormat.Bgra8888)!
     }
     // Show the `dirty` part of the pixel buffer, typically the rectangle
-    // canvas.take_dirty() returned. An empty rectangle shows nothing.
+    // canvas.take_dirty() returned. An empty rectangle shows nothing. Fails
+    // with Unsupported for a window without a pixel buffer, whose frames
+    // the GPU presents.
     pub fn update(&mut self, dirty: graphics.Rect) -> void!Error {
+        if !self.backend.has_pixel_buffer() {
+            return err(Error.Unsupported)
+        }
         bounds := graphics.Rect { x: 0, y: 0, width: self.backend.width(), height: self.backend.height() }
         area := dirty.intersect(&bounds)
         if area.is_empty() {
@@ -283,8 +319,12 @@ pub struct Window {
         }
         return self.backend.present(area.x, area.y, area.width, area.height)
     }
-    // Show the whole pixel buffer.
+    // Show the whole pixel buffer. Fails with Unsupported for a window
+    // without one.
     pub fn update_all(&mut self) -> void!Error {
+        if !self.backend.has_pixel_buffer() {
+            return err(Error.Unsupported)
+        }
         width := self.backend.width()
         height := self.backend.height()
         if width == 0 || height == 0 {
@@ -440,6 +480,40 @@ pub struct Window {
     pub fn set_cursor_visible(&mut self, visible: bool) -> void!Error {
         return self.backend.set_cursor_visible(visible)
     }
+    // -- GPU access ---------------------------------------------------------
+
+    // The window system's objects behind this window, for creating a Vulkan,
+    // OpenGL or Metal surface that draws straight into it: the X11 window
+    // and a libxcb connection on Linux, the NSWindow and NSView on macOS,
+    // the HWND and HINSTANCE on Windows. The drawing area's size in pixels
+    // is size(); after a Resize event, resize the GPU's swapchain or
+    // drawable to the new size.
+    //
+    // On Linux the first call loads libxcb (libxcb.so.1, part of every X11
+    // installation) and opens a second connection to the X server, since
+    // Vulkan and EGL need a library connection rather than std/window's own
+    // socket; programs that never ask need nothing beyond libc. The
+    // connection closes with the window. Fails with NoDisplay when libxcb is
+    // missing or cannot connect, and Closed after close().
+    //
+    // The addresses stay valid until the window closes: destroy every
+    // surface made from them first. A window without a pixel buffer
+    // (Options.gpu()) avoids keeping an unused one, but any window works.
+    pub fn native_handle(&mut self) -> NativeHandle!Error {
+        return self.backend.native_handle()
+    }
+    // macOS: make a CAMetalLayer the backing layer of the window's view and
+    // return its address, a CAMetalLayer * that the view keeps alive until
+    // the window closes. Metal renders into it through
+    // metal.MetalLayer.from_object, Vulkan through VK_EXT_metal_surface.
+    // Calling it again returns the same layer. std/window keeps the layer's
+    // contentsScale and drawableSize at the window's scale and pixel size,
+    // also across resizes. Fails with Unsupported on other systems and for a
+    // window with a pixel buffer, whose own layer shows the buffer.
+    pub fn metal_layer(&mut self) -> usize!Error {
+        return self.backend.metal_layer()
+    }
+
     // Close the window. Later calls fail with Closed; closing twice does
     // nothing. Dropping the window closes it too.
     pub fn close(&mut self) {
@@ -459,8 +533,11 @@ pub struct Window {
     // canvas's bounds() and the window and ignores the rest, so a smaller
     // canvas, one with an origin, or one left over from before a resize
     // updates just the part it covers. Fails with Device when the window
-    // system fails.
+    // system fails or the window has no pixel buffer.
     pub fn present(&mut self, canvas: &graphics.Canvas, dirty: graphics.Rect) -> void!graphics.Error {
+        if !self.backend.has_pixel_buffer() {
+            return err(graphics.Error.Device)
+        }
         bounds := canvas.bounds()
         screen := graphics.Rect { x: 0, y: 0, width: self.backend.width(), height: self.backend.height() }
         inside := dirty.intersect(&bounds)

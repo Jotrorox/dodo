@@ -48,6 +48,7 @@ they are not prerequisites for using the safe entry APIs.
 | Draw shapes, text, or images | `graphics.canvas` over a byte array | [Graphics](graphics.md) |
 | Draw smooth shapes, gradients, or TrueType text | `canvas.aa_fill_circle`, `graphics.Gradient`, `truetype.Font.new` | [Graphics](graphics.md#antialiased-drawing) |
 | Open a window | `window.open` and `win.canvas()` | [Windows](window.md) |
+| Draw into a window with the GPU | `window.Options.gpu`, `win.native_handle()`, `opengl.Context.create_for_window` | [Windows](window.md#drawing-with-the-gpu) |
 | Render with the GPU through OpenGL | `opengl.Context.create`, `opengl.Target.new` and the `gl` commands | [OpenGL](opengl.md) |
 | Run a shader on the GPU (macOS) | `metal.Device.system_default` and `new_library_with_source` | [Metal](metal.md) |
 | Run a shader on the GPU | `vk.open()` and `library.entry()` from `std/gpu/vulkan` | [GPU programming with Vulkan](gpu.md) |
@@ -188,7 +189,7 @@ individual modules and links every public declaration back to its source.
 | [Mathematics](math.md) | `std/math`, `std/math/trig` | Portable. |
 | [Hashing and checksums](hash.md) | `std/checksum`, `std/hash` | Portable. |
 | [Graphics](graphics.md) | `std/graphics`, `std/graphics/fake`, `std/graphics/font`, `std/graphics/image`, `std/graphics/truetype`; panels in `std/embedded/display`, `std/embedded/display/st7789`, `std/embedded/display/ssd1306` | Portable; caller-supplied pixel and file buffers. |
-| [Windows](window.md) | `std/window`, `std/window/x11` | Hosted: X11 on Linux, AppKit on macOS, Win32 on Windows; the X11 protocol code is portable. |
+| [Windows](window.md) | `std/window`, `std/window/x11`, `std/window/handle` | Hosted: X11 on Linux, AppKit on macOS, Win32 on Windows; the X11 protocol code and the native handle type are portable. |
 | [OpenGL](opengl.md) | `std/gpu/opengl`, `std/gpu/opengl/gl` | Hosted: EGL on Linux, CGL on macOS, WGL on Windows, loaded at run time; the generated binding is portable. |
 | [Metal](metal.md) | `std/gpu/metal`, `std/gpu/metal/objc` | macOS only (Apple silicon and Intel); links Metal, QuartzCore and Foundation. |
 | [GPU programming with Vulkan](gpu.md) | `std/gpu/vulkan` | Hosted; the Vulkan loader is opened at run time, nothing is linked. |

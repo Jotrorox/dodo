@@ -5,8 +5,9 @@
  *
  * macOS and Windows keep one window per process in static state. Its pixel
  * buffer is 32-bit BGRA, top-down, and replaced only inside
- * dodo_window_next_event when the drawing area changes size. Events are queued
- * in a ring and handed out one at a time in the std/window/raw Event layout.
+ * dodo_window_next_event when the drawing area changes size. A window opened
+ * for the GPU has no buffer and only tracks its size. Events are queued in a
+ * ring and handed out one at a time in the std/window/raw Event layout.
  *
  * Error codes match std/window/raw from_code: 0 success, 1 NoDisplay,
  * 2 AlreadyOpen, 3 Closed, 4 InvalidInput, 5 OutOfMemory, 6 Protocol,
@@ -33,6 +34,9 @@ enum {
 };
 enum { F_PRESSED = 1, F_REPEAT = 2 };
 enum { M_SHIFT = 1, M_CONTROL = 2, M_ALT = 4, M_META = 8, M_CAPS = 16 };
+/* dodo_window_open flags, and what dodo_window_native reports. */
+enum { O_RESIZABLE = 1, O_PIXEL_BUFFER = 2 };
+enum { NATIVE_APPKIT = 1, NATIVE_WIN32 = 2 };
 #define FOREVER 0xffffffffu
 
 struct dodo_window_event {
@@ -77,11 +81,18 @@ static void push_text(uint32_t code_point) {
     push(EV_TEXT, code_point, 0, 0, 0, 0);
 }
 
-/* The pixel buffer. Resizing keeps the old picture in the top-left corner. */
+/* The pixel buffer. Resizing keeps the old picture in the top-left corner.
+ * Without one (has_pixels 0) pixels stays NULL and only the size is kept;
+ * sized says whether the size is known yet. */
 static uint8_t *pixels;
 static uint32_t pixel_width, pixel_height;
+static int has_pixels, sized;
 
 static int resize_buffer(uint32_t width, uint32_t height) {
+    if (!has_pixels) {
+        pixel_width = width; pixel_height = height; sized = 1;
+        return 0;
+    }
     size_t bytes = (size_t)width * height * 4;
     uint8_t *next = calloc(bytes ? bytes : 4, 1);
     if (!next) return E_MEMORY;
@@ -92,16 +103,21 @@ static int resize_buffer(uint32_t width, uint32_t height) {
             memcpy(next + (size_t)y * width * 4, pixels + (size_t)y * pixel_width * 4, (size_t)columns * 4);
         free(pixels);
     }
-    pixels = next; pixel_width = width; pixel_height = height;
+    pixels = next; pixel_width = width; pixel_height = height; sized = 1;
     return 0;
 }
 static void free_buffer(void) {
-    free(pixels); pixels = NULL; pixel_width = 0; pixel_height = 0;
+    free(pixels); pixels = NULL; pixel_width = 0; pixel_height = 0; sized = 0;
 }
 
+/* A window without a buffer reports its size with an empty one. */
 void dodo_window_buffer(intptr_t handle, uint8_t **out, uint32_t *width, uint32_t *height, size_t *stride) {
-    if (!handle || !pixels) {
+    if (!handle || !sized) {
         *out = (uint8_t *)empty_pixels; *width = 0; *height = 0; *stride = 0;
+        return;
+    }
+    if (!pixels) {
+        *out = (uint8_t *)empty_pixels; *width = pixel_width; *height = pixel_height; *stride = 0;
         return;
     }
     *out = pixels; *width = pixel_width; *height = pixel_height; *stride = (size_t)pixel_width * 4;
@@ -141,6 +157,7 @@ typedef long (*send_long)(id, SEL);
 typedef CGPoint (*send_point)(id, SEL);
 typedef CGPoint (*send_point_point_id)(id, SEL, CGPoint, id);
 typedef CGSize (*send_size_size)(id, SEL, CGSize);
+typedef void (*send_void_size)(id, SEL, CGSize);
 typedef const char *(*send_cstring)(id, SEL);
 
 static id cls(const char *name) { return (id)objc_getClass(name); }
@@ -161,7 +178,10 @@ static CGRect msg_rect(id target, const char *name) {
 #endif
 }
 
-static id app, window, view, layer, delegate;
+static id app, window, view, delegate;
+/* The CAMetalLayer dodo_window_metal_layer made the view's backing layer,
+ * retained here until the window closes. */
+static id metal_layer;
 static CGColorSpaceRef color_space;
 static double backing_scale = 1;
 static int cursor_hidden, mouse_inside;
@@ -208,10 +228,20 @@ static unsigned long modifier_bit(unsigned short code) {
     }
 }
 
+/* The view's layer is fetched when needed rather than kept: a GPU program
+ * may replace it. */
 static void update_scale(void) {
     double scale = SEND(send_double)(window, sel("backingScaleFactor"));
     backing_scale = scale > 0 ? scale : 1;
-    SEND(send_void_double)(layer, sel("setContentsScale:"), backing_scale);
+    if (has_pixels) SEND(send_void_double)(msg(view, "layer"), sel("setContentsScale:"), backing_scale);
+    if (metal_layer) SEND(send_void_double)(metal_layer, sel("setContentsScale:"), backing_scale);
+}
+
+/* Keep the Metal layer's drawables at the drawing area's size in pixels. */
+static void size_metal_layer(void) {
+    if (!metal_layer) return;
+    CGSize size = CGSizeMake(pixel_width ? pixel_width : 1, pixel_height ? pixel_height : 1);
+    SEND(send_void_size)(metal_layer, sel("setDrawableSize:"), size);
 }
 
 /* Bring the buffer to the content view's size in pixels. */
@@ -221,9 +251,10 @@ static int sync_size(int report) {
     double width = floor(bounds.size.width * backing_scale + 0.5);
     double height = floor(bounds.size.height * backing_scale + 0.5);
     uint32_t w = width > 0 ? (uint32_t)width : 0, h = height > 0 ? (uint32_t)height : 0;
-    if (pixels && w == pixel_width && h == pixel_height) return 0;
+    if (sized && w == pixel_width && h == pixel_height) return 0;
     int code = resize_buffer(w, h);
     if (code) return code;
+    size_metal_layer();
     if (report) push(EV_RESIZE, 0, 0, 0, (int32_t)w, (int32_t)h);
     return 0;
 }
@@ -346,20 +377,23 @@ static void release_all(void) {
         msg_void(window, "close");
         msg_void(window, "release");
     }
+    if (metal_layer) msg_void(metal_layer, "release");
     /* The menu's Quit item targets the delegate released below. */
     if (app && delegate) msg_void_id(app, "setMainMenu:", nil);
     if (delegate) msg_void(delegate, "release");
     if (color_space) CGColorSpaceRelease(color_space);
     if (cursor_hidden) msg_void(cls("NSCursor"), "unhide");
-    window = view = layer = delegate = nil;
-    color_space = NULL; cursor_hidden = 0; mouse_inside = 0;
+    window = view = delegate = metal_layer = nil;
+    color_space = NULL; cursor_hidden = 0; mouse_inside = 0; has_pixels = 0;
     queue_head = queue_count = 0;
     free_buffer();
 }
 
-int32_t dodo_window_open(const uint8_t *title, size_t title_length, uint32_t width, uint32_t height, uint32_t resizable, intptr_t *handle) {
+int32_t dodo_window_open(const uint8_t *title, size_t title_length, uint32_t width, uint32_t height, uint32_t flags, intptr_t *handle) {
     if (window) return E_ALREADY_OPEN;
     if (!pthread_main_np()) return E_UNSUPPORTED;
+    int resizable = (flags & O_RESIZABLE) != 0;
+    has_pixels = (flags & O_PIXEL_BUFFER) != 0;
     void *pool = objc_autoreleasePoolPush();
     app = msg(cls("NSApplication"), "sharedApplication");
     if (!app) { objc_autoreleasePoolPop(pool); return E_NO_DISPLAY; }
@@ -382,10 +416,14 @@ int32_t dodo_window_open(const uint8_t *title, size_t title_length, uint32_t wid
     msg_void_id(window, "setTitle:", text);
     msg_void(text, "release");
     view = msg(window, "contentView");
-    msg_void_bool(view, "setWantsLayer:", YES);
-    layer = msg(view, "layer");
-    msg_void_id(layer, "setContentsGravity:", kCAGravityTopLeft);
-    msg_void_id(layer, "setMagnificationFilter:", kCAFilterNearest);
+    /* The pixel buffer is shown as the contents of the view's layer. A GPU
+     * window leaves the view alone for NSOpenGLContext or a Metal layer. */
+    if (has_pixels) {
+        msg_void_bool(view, "setWantsLayer:", YES);
+        id layer = msg(view, "layer");
+        msg_void_id(layer, "setContentsGravity:", kCAGravityTopLeft);
+        msg_void_id(layer, "setMagnificationFilter:", kCAFilterNearest);
+    }
     create_display_link();
     /* Moves and exits over the drawing area, focused or not. */
     id area = SEND(id (*)(id, SEL, CGRect, unsigned long, id, id))(msg(cls("NSTrackingArea"), "alloc"),
@@ -526,6 +564,7 @@ int32_t dodo_window_next_event(intptr_t handle, uint32_t milliseconds, struct do
 int32_t dodo_window_present(intptr_t handle, int32_t x, int32_t y, uint32_t width, uint32_t height) {
     (void)x; (void)y; (void)width; (void)height;
     if (!handle || !window) return E_CLOSED;
+    if (!pixels) return E_UNSUPPORTED;
     if (!pixel_width || !pixel_height) return 0;
     void *pool = objc_autoreleasePoolPush();
     /* The image takes a copy, so the program can keep drawing at once. */
@@ -539,7 +578,7 @@ int32_t dodo_window_present(intptr_t handle, int32_t x, int32_t y, uint32_t widt
         id transaction = cls("CATransaction");
         msg_void(transaction, "begin");
         msg_void_bool(transaction, "setDisableActions:", YES);
-        msg_void_id(layer, "setContents:", (id)image);
+        msg_void_id(msg(view, "layer"), "setContents:", (id)image);
         msg_void(transaction, "commit");
         msg_void(transaction, "flush");
         CGImageRelease(image);
@@ -599,6 +638,33 @@ int32_t dodo_window_request_frame(intptr_t handle) {
     if (!display_link) return 0;
     msg_void_bool(display_link, "setPaused:", NO);
     return 1;
+}
+
+int32_t dodo_window_native(intptr_t handle, uintptr_t *first, uintptr_t *second) {
+    if (!handle || !window) return -E_CLOSED;
+    *first = (uintptr_t)window; *second = (uintptr_t)view;
+    return NATIVE_APPKIT;
+}
+
+/* A layer-hosting view: the CAMetalLayer is set before wantsLayer. */
+int32_t dodo_window_metal_layer(intptr_t handle, uintptr_t *out) {
+    if (!handle || !window) return E_CLOSED;
+    if (has_pixels) return E_UNSUPPORTED;
+    if (!metal_layer) {
+        id type = cls("CAMetalLayer");
+        if (!type) return E_UNSUPPORTED;
+        void *pool = objc_autoreleasePoolPush();
+        id created = msg(msg(type, "alloc"), "init");
+        if (!created) { objc_autoreleasePoolPop(pool); return E_SYSTEM; }
+        metal_layer = created;
+        msg_void_id(view, "setLayer:", metal_layer);
+        msg_void_bool(view, "setWantsLayer:", YES);
+        update_scale();
+        size_metal_layer();
+        objc_autoreleasePoolPop(pool);
+    }
+    *out = (uintptr_t)metal_layer;
+    return 0;
 }
 
 void dodo_window_set_animating(intptr_t handle, uint32_t animating) {
@@ -1045,9 +1111,11 @@ static void drop_resizes(void) {
     for (unsigned i = 0; i < count; ++i) push(kept[i].kind, kept[i].code, kept[i].modifiers, kept[i].flags, kept[i].x, kept[i].y);
 }
 
-int32_t dodo_window_open(const uint8_t *title, size_t title_length, uint32_t width, uint32_t height, uint32_t resizable, intptr_t *handle) {
+int32_t dodo_window_open(const uint8_t *title, size_t title_length, uint32_t width, uint32_t height, uint32_t flags, intptr_t *handle) {
     static ATOM registered;
     if (hwnd) return E_ALREADY_OPEN;
+    int resizable = (flags & O_RESIZABLE) != 0;
+    has_pixels = (flags & O_PIXEL_BUFFER) != 0;
     HINSTANCE instance = GetModuleHandleW(NULL);
     if (!registered) {
         become_dpi_aware();
@@ -1185,6 +1253,7 @@ void dodo_window_close(intptr_t handle) {
     high_surrogate = 0;
     queue_head = queue_count = 0;
     free_buffer();
+    has_pixels = 0;
 }
 
 int32_t dodo_window_next_event(intptr_t handle, uint32_t milliseconds, struct dodo_window_event *event) {
@@ -1210,6 +1279,7 @@ int32_t dodo_window_next_event(intptr_t handle, uint32_t milliseconds, struct do
 
 int32_t dodo_window_present(intptr_t handle, int32_t x, int32_t y, uint32_t width, uint32_t height) {
     if (!handle || !hwnd) return E_CLOSED;
+    if (!pixels) return E_UNSUPPORTED;
     if (!pixel_width || !pixel_height) return 0;
     HDC dc = GetDC(hwnd);
     if (!dc) return E_SYSTEM;
@@ -1240,5 +1310,17 @@ int32_t dodo_window_set_cursor_visible(intptr_t handle, uint32_t visible) {
 uint32_t dodo_window_scale_percent(intptr_t handle) {
     if (!handle || !hwnd) return 100;
     return (uint32_t)MulDiv((int)dpi, 100, 96);
+}
+
+int32_t dodo_window_native(intptr_t handle, uintptr_t *first, uintptr_t *second) {
+    if (!handle || !hwnd) return -E_CLOSED;
+    *first = (uintptr_t)hwnd; *second = (uintptr_t)GetModuleHandleW(NULL);
+    return NATIVE_WIN32;
+}
+
+/* Metal layers are macOS only. */
+int32_t dodo_window_metal_layer(intptr_t handle, uintptr_t *out) {
+    *out = 0;
+    return !handle || !hwnd ? E_CLOSED : E_UNSUPPORTED;
 }
 #endif

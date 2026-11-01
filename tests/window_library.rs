@@ -1,6 +1,9 @@
 //! Desktop windows: the X11 protocol code and key tables everywhere, code
 //! generation for every hosted target, the C runtime for each window system,
-//! and on Linux a real window on a virtual X server driven with xdotool.
+//! and on Linux real windows on a virtual X server driven with xdotool: one
+//! with a pixel buffer, and GPU windows that OpenGL (Mesa's llvmpipe) and
+//! Vulkan (lavapipe) present into. On macOS the GPU window fixture runs when
+//! DODO_DESKTOP_TESTS is set, since it opens a window on the desktop.
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -73,39 +76,45 @@ fn protocol_and_key_checks_execute() {
 #[test]
 fn windows_build_for_every_hosted_target() {
     let scratch = Scratch::new("targets");
-    let source = root().join("tests/stdlib/window_events.dodo");
-    for target in [
-        "x86_64-unknown-linux-gnu",
-        "aarch64-unknown-linux-gnu",
-        "aarch64-apple-darwin",
-        "x86_64-apple-darwin",
-        "x86_64-pc-windows-msvc",
-        "x86_64-pc-windows-gnu",
+    for (name, source) in [
+        ("events", "tests/stdlib/window_events.dodo"),
+        ("gpu", "tests/stdlib/window_gpu.dodo"),
     ] {
-        let object = scratch.0.join(format!("events-{target}.o"));
-        success(
-            &Command::new(env!("CARGO_BIN_EXE_dodo"))
-                .args([
-                    "build",
-                    source.to_str().unwrap(),
-                    "--emit",
-                    "obj",
-                    "--target",
-                    target,
-                    "-o",
-                ])
-                .arg(&object)
-                .output()
-                .unwrap(),
-            &format!("emit the window fixture for {target}"),
-        );
-        assert!(fs::metadata(object).unwrap().len() > 0);
+        let source = root().join(source);
+        for target in [
+            "x86_64-unknown-linux-gnu",
+            "aarch64-unknown-linux-gnu",
+            "aarch64-apple-darwin",
+            "x86_64-apple-darwin",
+            "x86_64-pc-windows-msvc",
+            "x86_64-pc-windows-gnu",
+        ] {
+            let object = scratch.0.join(format!("{name}-{target}.o"));
+            success(
+                &Command::new(env!("CARGO_BIN_EXE_dodo"))
+                    .args([
+                        "build",
+                        source.to_str().unwrap(),
+                        "--emit",
+                        "obj",
+                        "--target",
+                        target,
+                        "-o",
+                    ])
+                    .arg(&object)
+                    .output()
+                    .unwrap(),
+                &format!("emit {} for {target}", source.display()),
+            );
+            assert!(fs::metadata(object).unwrap().len() > 0);
+        }
     }
-    // The protocol code needs no operating system.
+    // The protocol code and the native handle type need no operating
+    // system, so GPU packages can name handles on any target.
     let portable = scratch.0.join("portable.dodo");
     fs::write(
         &portable,
-        "package main\nimport \"std/window/x11\"\nfn main() {\n    out := [0u8; 64]\n    core.assert_eq(x11.map_window(&mut out, 1), 8usize)\n}\n",
+        "package main\nimport \"std/window/handle\"\nimport \"std/window/x11\"\nfn main() {\n    out := [0u8; 64]\n    core.assert_eq(x11.map_window(&mut out, 1), 8usize)\n    native := handle.NativeHandle.Win32(1, 2)\n    core.assert_eq(handle.kind_name(&native).len, 5usize)\n}\n",
     )
     .unwrap();
     for target in ["wasm32-unknown-unknown", "thumbv6m-none-eabi"] {
@@ -161,6 +170,29 @@ fn windows_build_for_every_hosted_target() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(stderr.contains(expected), "{import} for {target}: {stderr}");
     }
+}
+
+/// A GPU window on the macOS desktop: its AppKit handle, its CAMetalLayer,
+/// and no pixel buffer. Opt-in, because it shows a window.
+#[cfg(target_os = "macos")]
+#[test]
+fn gpu_window_on_the_macos_desktop() {
+    if std::env::var_os("DODO_DESKTOP_TESTS").is_none() {
+        eprintln!("skipping: set DODO_DESKTOP_TESTS to open desktop windows");
+        return;
+    }
+    let scratch = Scratch::new("macos-gpu");
+    let executable = scratch.0.join("gpu");
+    build(
+        &root().join("tests/stdlib/window_gpu.dodo"),
+        &executable,
+        "0",
+    );
+    let output = Command::new(&executable).output().unwrap();
+    success(&output, "run the GPU window fixture");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.starts_with("native AppKit "), "{stdout}");
+    assert!(stdout.ends_with("passed\n"), "{stdout}");
 }
 
 #[cfg(unix)]
@@ -446,5 +478,183 @@ mod x11 {
             assert!(index >= previous, "{line:?} out of order in:\n{log}");
             previous = index;
         }
+    }
+
+    /// Starts `executable` with `args` on `display`, logging stdout to
+    /// `log`, and waits until the log contains `marker` or the program
+    /// exits. Returns the child and whether the marker appeared.
+    fn launch(
+        executable: &Path,
+        args: &[&str],
+        display: &str,
+        log: &Path,
+        marker: &str,
+    ) -> (Child, bool) {
+        let mut app = Command::new(executable)
+            .args(args)
+            .env("DISPLAY", display)
+            .env_remove("XAUTHORITY")
+            .stdout(fs::File::create(log).unwrap())
+            .spawn()
+            .unwrap();
+        let started = Instant::now();
+        loop {
+            if fs::read_to_string(log).unwrap().contains(marker) {
+                return (app, true);
+            }
+            if app.try_wait().unwrap().is_some() {
+                return (app, false);
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(20),
+                "{} did not print {marker:?}: {}",
+                executable.display(),
+                fs::read_to_string(log).unwrap()
+            );
+            sleep(Duration::from_millis(50));
+        }
+    }
+
+    fn finish(mut app: Child, log: &Path) -> (std::process::ExitStatus, String) {
+        let started = Instant::now();
+        let status = loop {
+            if let Some(status) = app.try_wait().unwrap() {
+                break status;
+            }
+            if started.elapsed() > Duration::from_secs(20) {
+                let _ = app.kill();
+                panic!(
+                    "the program did not exit: {}",
+                    fs::read_to_string(log).unwrap()
+                );
+            }
+            sleep(Duration::from_millis(50));
+        };
+        (status, fs::read_to_string(log).unwrap())
+    }
+
+    /// A window without a pixel buffer hands out the X11 window and a libxcb
+    /// connection; the id is the one the X server reports.
+    #[test]
+    fn gpu_window_hands_out_an_xcb_handle_under_xvfb() {
+        if !have_window_tools() {
+            return;
+        }
+        let scratch = Scratch::new("xvfb-gpu");
+        let executable = scratch.0.join("gpu");
+        build(
+            &root().join("tests/stdlib/window_gpu.dodo"),
+            &executable,
+            "0",
+        );
+        let (_server, display) = start_xvfb(2);
+        let log = scratch.0.join("gpu.log");
+        let (app, shown) = launch(&executable, &[], &display, &log, "native ");
+        assert!(shown, "{}", fs::read_to_string(&log).unwrap());
+        let windows = xdotool(&display, &["search", "--name", "^GPU$"]);
+        let (status, log) = finish(app, &log);
+        assert!(status.success(), "{status}: {log}");
+        let id: u64 = log
+            .lines()
+            .find_map(|line| line.strip_prefix("native Xcb "))
+            .unwrap_or_else(|| panic!("no Xcb handle in:\n{log}"))
+            .parse()
+            .unwrap();
+        assert!(
+            windows.lines().any(|line| line.parse() == Ok(id)),
+            "window {id} not among {windows:?}"
+        );
+        assert!(log.ends_with("passed\n"), "{log}");
+    }
+
+    /// OpenGL draws straight into the window: what the context swapped in
+    /// is what the X server shows.
+    #[test]
+    fn opengl_window_presents_under_xvfb() {
+        if !have_window_tools() {
+            return;
+        }
+        let required = std::env::var_os("DODO_REQUIRE_OPENGL_TESTS").is_some();
+        let scratch = Scratch::new("xvfb-opengl");
+        let executable = scratch.0.join("opengl");
+        build(
+            &root().join("tests/gpu/opengl_window_checks.dodo"),
+            &executable,
+            "0",
+        );
+        let (_server, display) = start_xvfb(3);
+        let log = scratch.0.join("opengl.log");
+        let (app, shown) = launch(&executable, &[], &display, &log, "shown");
+        if !shown {
+            let (status, log) = finish(app, &log);
+            assert!(status.success(), "{status}: {log}");
+            let reason = log
+                .strip_prefix("unavailable\n")
+                .unwrap_or_else(|| panic!("{log}"));
+            assert!(!required, "OpenGL is required but unavailable: {reason}");
+            eprintln!("skipping: no OpenGL window ({})", reason.trim());
+            return;
+        }
+        sleep(Duration::from_millis(300));
+        // Without a window manager the window sits at the root's origin.
+        assert_eq!(screen_pixel(&display, 2, 2), 0x336699);
+        assert_eq!(screen_pixel(&display, 80, 60), 0xff0000);
+        xdotool(&display, &["mousemove", "40", "40", "key", "Escape"]);
+        let (status, log) = finish(app, &log);
+        assert!(status.success(), "{status}: {log}");
+        assert!(log.ends_with("passed\n"), "{log}");
+    }
+
+    /// Vulkan presents into the window through VK_KHR_xcb_surface, and
+    /// rebuilds its swapchain when the window is resized.
+    #[test]
+    fn vulkan_window_presents_under_xvfb() {
+        if !have_window_tools() {
+            return;
+        }
+        let required = std::env::var_os("DODO_REQUIRE_VULKAN_TESTS").is_some();
+        let scratch = Scratch::new("xvfb-vulkan");
+        let executable = scratch.0.join("vulkan");
+        build(
+            &root().join("examples/vulkan_window.dodo"),
+            &executable,
+            "0",
+        );
+        let (_server, display) = start_xvfb(4);
+        let log = scratch.0.join("vulkan.log");
+        let (app, shown) = launch(&executable, &["150"], &display, &log, "presented");
+        if !shown {
+            let (status, log) = finish(app, &log);
+            // No loader (2), or a loader without a driver that presents.
+            let missing = status.code() == Some(2)
+                || (status.code() == Some(1)
+                    && [
+                        "ERROR_INCOMPATIBLE_DRIVER",
+                        "ERROR_INITIALIZATION_FAILED",
+                        "ERROR_EXTENSION_NOT_PRESENT",
+                    ]
+                    .iter()
+                    .any(|name| log.contains(name)));
+            assert!(missing, "{status}: {log}");
+            assert!(!required, "Vulkan is required but unavailable: {log}");
+            eprintln!("skipping: no Vulkan driver ({})", log.trim());
+            return;
+        }
+        sleep(Duration::from_millis(300));
+        // The 480x320 window: background in the corner, and the spinning
+        // triangle always covers the centre.
+        let background = 0x1c2130;
+        assert_eq!(screen_pixel(&display, 3, 3), background);
+        let centre = screen_pixel(&display, 240, 160);
+        assert!(centre != background && centre != 0, "centre {centre:06x}");
+        let window = xdotool(&display, &["search", "--class", "Dodo"]);
+        let window = window.lines().next().unwrap().to_owned();
+        xdotool(&display, &["windowsize", &window, "600", "200"]);
+        sleep(Duration::from_millis(500));
+        // The rebuilt swapchain covers the wider window.
+        assert_eq!(screen_pixel(&display, 590, 190), background);
+        let (status, log) = finish(app, &log);
+        assert!(status.success(), "{status}: {log}");
+        assert!(log.contains("150 frames"), "{log}");
     }
 }

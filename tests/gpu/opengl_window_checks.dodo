@@ -1,0 +1,178 @@
+package main
+
+import "core/ptr"
+import "std/console"
+import "std/gpu/opengl"
+import "std/gpu/opengl/gl"
+import "std/window"
+
+// Draws into a std/window window through a window context: clears the
+// window's framebuffer, draws a red triangle over its centre, reads the back
+// buffer before showing it, and swaps. Prints "shown" once the frame is on
+// screen, keeps it there until Escape or two idle seconds, and prints
+// "passed". tests/opengl_library.rs also reads the screen under Xvfb.
+// Prints "unavailable REASON" and exits successfully when there is no
+// window system or no OpenGL 3.3, so the test decides whether that is
+// allowed.
+
+const VERTEX_SHADER: &[u8] = b"#version 330 core\nlayout(location = 0) in vec2 position;\nvoid main() {\n    gl_Position = vec4(position, 0.0, 1.0);\n}\n\0"
+const FRAGMENT_SHADER: &[u8] = b"#version 330 core\nout vec4 result;\nvoid main() {\n    result = vec4(1.0, 0.0, 0.0, 1.0);\n}\n\0"
+
+fn compile(kind: u32, source: &[u8]) -> u32 {
+    unsafe {
+        shader := gl.create_shader(kind)
+        text := ptr.as_ptr(source)
+        gl.shader_source(shader, 1, ptr.from_ref(&text), 0usize as *const i32)
+        gl.compile_shader(shader)
+        status := 0i32
+        gl.get_shaderiv(shader, gl.COMPILE_STATUS, ptr.from_mut(&mut status))
+        assert(status != 0, "shader compiles")
+        return shader
+    }
+}
+
+fn program() -> u32 {
+    vertex := compile(gl.VERTEX_SHADER, VERTEX_SHADER)
+    fragment := compile(gl.FRAGMENT_SHADER, FRAGMENT_SHADER)
+    vertices := [-0.5f32, -0.5, 0.5, -0.5, 0.0, 0.5]
+    unsafe {
+        program := gl.create_program()
+        gl.attach_shader(program, vertex)
+        gl.attach_shader(program, fragment)
+        gl.link_program(program)
+        array := 0u32
+        gl.gen_vertex_arrays(1, ptr.from_mut(&mut array))
+        gl.bind_vertex_array(array)
+        buffer := 0u32
+        gl.gen_buffers(1, ptr.from_mut(&mut buffer))
+        gl.bind_buffer(gl.ARRAY_BUFFER, buffer)
+        gl.buffer_data(gl.ARRAY_BUFFER, 24, ptr.as_ptr(&vertices) as *const u8, gl.STATIC_DRAW)
+        gl.vertex_attrib_pointer(0, 2, gl.FLOAT, 0, 8, 0usize as *const u8)
+        gl.enable_vertex_attrib_array(0)
+        return program
+    }
+}
+
+fn draw(program: u32, width: u32, height: u32) {
+    unsafe {
+        gl.bind_framebuffer(gl.FRAMEBUFFER, 0)
+        gl.viewport(0, 0, width as i32, height as i32)
+        gl.clear_color(0.2, 0.4, 0.6, 1.0)
+        gl.clear(gl.COLOR_BUFFER_BIT)
+        gl.use_program(program)
+        gl.draw_arrays(gl.TRIANGLES, 0, 3)
+    }
+}
+
+// The 0xRRGGBB color of the back buffer at (x, y), counted from the bottom.
+fn back_pixel(x: u32, y: u32) -> u32 {
+    rgba := [0u8; 4]
+    unsafe {
+        gl.read_buffer(gl.BACK)
+        gl.pixel_storei(gl.PACK_ALIGNMENT, 1)
+        gl.read_pixels(x as i32, y as i32, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, ptr.as_mut_ptr(&mut rgba))
+    }
+    return (rgba[0] as u32 << 16) | (rgba[1] as u32 << 8) | rgba[2] as u32
+}
+
+// Within a step or two of rounding of `expected`, per channel.
+fn near(actual: u32, expected: u32) -> bool {
+    for channel in 0u32..3 {
+        shift := channel * 8
+        a := ((actual >> shift) & 0xff) as i32
+        e := ((expected >> shift) & 0xff) as i32
+        if a - e > 2 || e - a > 2 {
+            return false
+        }
+    }
+    return true
+}
+
+fn main() -> i32 {
+    win := match window.open(window.Options.gpu("OpenGL window", 160, 120)) {
+        ok(win) => win,
+        err(error) => {
+            console.printf("unavailable\nwindow {}\n", window.error_name(error))!
+            return 0
+        }
+    }
+    native := match win.native_handle() {
+        ok(native) => native,
+        err(error) => {
+            console.printf("unavailable\nnative handle {}\n", window.error_name(error))!
+            return 0
+        }
+    }
+    context := match opengl.Context.create_for_window(&native, opengl.Options.default()) {
+        ok(context) => context,
+        err(error) => {
+            console.printf("unavailable\n{}\n", opengl.error_name(error))!
+            return 0
+        }
+    }
+    console.printf("renderer {}\n", context.renderer())!
+    assert(context.is_current())
+    match context.set_swap_interval(1) {
+        ok() => {}
+        err(_) => {}
+    }
+    shader := program()
+    width := win.width()
+    height := win.height()
+    draw(shader, width, height)
+    corner := back_pixel(2, 2)
+    centre := back_pixel(width / 2, height / 2)
+    console.printf("corner {} centre {}\n", corner, centre)!
+    assert(near(corner, 0x336699), "the clear color fills the window")
+    assert(near(centre, 0xff0000), "the triangle covers the centre")
+    assert(unsafe {
+        gl.get_error()
+    } == gl.NO_ERROR)
+    context.swap_buffers()!
+    console.println("shown")!
+    idle := 0u32
+    for idle < 20 {
+        match win.wait_event_timeout(100)! {
+            some(window.Event.Key(key)) => {
+                if key.key == window.Key.Escape {
+                    break
+                }
+            }
+            some(window.Event.Close) => {
+                break
+            }
+            some(window.Event.Resize(_, _)) => {
+                context.update_surface()
+                draw(shader, win.width(), win.height())
+                context.swap_buffers()!
+            }
+            some(_) => {}
+            none => {
+                idle += 1
+                // Keep the frame on screen for anyone reading it.
+                draw(shader, win.width(), win.height())
+                context.swap_buffers()!
+            }
+        }
+    }
+    // An offscreen context has no window to show.
+    core.drop(context)
+    offscreen := match opengl.Context.create(opengl.Options.default()) {
+        ok(offscreen) => offscreen,
+        err(error) => {
+            console.printf("offscreen {}\n", opengl.error_name(error))!
+            return 1
+        }
+    }
+    match offscreen.swap_buffers() {
+        ok() => {
+            assert(false, "swapping without a window")
+        }
+        err(opengl.Error.Unsupported) => {}
+        err(_) => {
+            assert(false, "swapping without a window")
+        }
+    }
+    console.println("passed")!
+    return 0
+}

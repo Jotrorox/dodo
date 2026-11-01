@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+- GPUs draw straight into `std/window` windows:
+  - `win.native_handle()` returns a `window.NativeHandle` (defined in the
+    new, dependency-free `std/window/handle`): `Xcb(connection, window,
+    screen, visual)` on Linux, `AppKit(window, view)` on macOS and
+    `Win32(hwnd, instance)` on Windows. On Linux the first call loads
+    `libxcb.so.1` at run time and opens a second connection to the X
+    server, since Vulkan and EGL cannot use std/window's own socket;
+    programs that never ask still need nothing beyond libc.
+  - `window.Options.gpu(title, width, height)` opens a window without a
+    pixel buffer, and `Options` gains the `pixel_buffer` field. Its
+    `canvas()` is empty and `update()` fails with `Unsupported`.
+    `win.has_pixel_buffer()` tells the two kinds apart.
+  - `win.metal_layer()` gives a GPU window's view a `CAMetalLayer` on macOS,
+    for Metal and Vulkan's `VK_EXT_metal_surface`. std/window keeps its
+    drawable size and contents scale in step with the window.
+  - `opengl.Context.create_for_window(&native, options)` draws into a
+    window's framebuffer 0 through EGL's XCB platform (or Xlib and EGL's X11
+    platform), an `NSOpenGLContext` or WGL, with `swap_buffers()`,
+    `set_swap_interval()` and `update_surface()`.
+  - `examples/opengl_window.dodo` now presents its frames directly instead of
+    reading them back through the CPU, and `examples/vulkan_window.dodo` and
+    `examples/metal_window.dodo` draw a spinning triangle with Vulkan (XCB,
+    Win32 and Metal surfaces, rebuilding the swapchain on resize) and Metal.
+  - `std/gpu/opengl` declares `dlsym` as `std/dylib` and `std/gpu/metal` do,
+    so programs using them together link.
 - `std/embedded/hal` settles its device protocols before a second chip
   vendor arrives, so drivers written now keep working:
   - Polling forms of the buses, `hal.I2cPoll`, `hal.SpiPoll`, and, in the

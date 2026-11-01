@@ -1,7 +1,8 @@
 //! Metal through the Objective-C runtime: code generation for both macOS
 //! architectures and rejection elsewhere everywhere; on macOS the GPU
 //! fixture at O0 and O3 (and as x86-64 under Rosetta), every constant
-//! against the SDK headers, and the binding-index checks.
+//! against the SDK headers, and the binding-index checks. Rendering into a
+//! std/window window's CAMetalLayer runs when DODO_DESKTOP_TESTS is set.
 use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Output};
@@ -44,23 +45,29 @@ fn dodo(arguments: &[&str]) -> Output {
 #[test]
 fn metal_builds_for_macos_and_is_rejected_elsewhere() {
     let scratch = Scratch::new("targets");
-    let source = root().join("tests/stdlib/gpu_metal_checks.dodo");
-    for target in ["aarch64-apple-darwin", "x86_64-apple-darwin"] {
-        let object = scratch.0.join(format!("checks-{target}.o"));
-        success(
-            &dodo(&[
-                "build",
-                source.to_str().unwrap(),
-                "--emit",
-                "obj",
-                "--target",
-                target,
-                "-o",
-                object.to_str().unwrap(),
-            ]),
-            &format!("emit the Metal fixture for {target}"),
-        );
-        assert!(fs::metadata(object).unwrap().len() > 0);
+    for (name, source) in [
+        ("checks", "tests/stdlib/gpu_metal_checks.dodo"),
+        ("window-checks", "tests/stdlib/gpu_metal_window.dodo"),
+        ("window", "examples/metal_window.dodo"),
+    ] {
+        let source = root().join(source);
+        for target in ["aarch64-apple-darwin", "x86_64-apple-darwin"] {
+            let object = scratch.0.join(format!("{name}-{target}.o"));
+            success(
+                &dodo(&[
+                    "build",
+                    source.to_str().unwrap(),
+                    "--emit",
+                    "obj",
+                    "--target",
+                    target,
+                    "-o",
+                    object.to_str().unwrap(),
+                ]),
+                &format!("emit {} for {target}", source.display()),
+            );
+            assert!(fs::metadata(object).unwrap().len() > 0);
+        }
     }
     for import in ["std/gpu/metal", "std/gpu/metal/objc"] {
         let program = scratch.0.join("import.dodo");
@@ -301,4 +308,33 @@ fn constants_match_the_sdk_headers() {
     for ((name, value), actual) in expected.iter().zip(actual) {
         assert_eq!(*value, actual, "{name}");
     }
+}
+
+/// Metal renders into a window's CAMetalLayer, whose drawables have the
+/// window's size in pixels. Opt-in, because it shows a window.
+#[cfg(target_os = "macos")]
+#[test]
+fn metal_draws_into_a_window_on_the_macos_desktop() {
+    if std::env::var_os("DODO_DESKTOP_TESTS").is_none() {
+        eprintln!("skipping: set DODO_DESKTOP_TESTS to open desktop windows");
+        return;
+    }
+    let scratch = Scratch::new("window");
+    let executable = scratch.0.join("window");
+    let source = root().join("tests/stdlib/gpu_metal_window.dodo");
+    success(
+        &dodo(&[
+            "build",
+            source.to_str().unwrap(),
+            "-O",
+            "0",
+            "-o",
+            executable.to_str().unwrap(),
+        ]),
+        "compile the Metal window fixture",
+    );
+    let output = Command::new(&executable).output().unwrap();
+    success(&output, "run the Metal window fixture");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.ends_with("passed\n"), "{stdout}");
 }

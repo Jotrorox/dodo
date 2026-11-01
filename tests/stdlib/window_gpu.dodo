@@ -1,0 +1,138 @@
+package main
+
+import "std/console"
+import "std/graphics"
+import "std/window"
+import "std/window/handle"
+
+// Opens a window without a pixel buffer and checks what a GPU program gets
+// from it: the native handle of this OS's window system, an empty canvas,
+// updates refused, and on macOS one CAMetalLayer. Prints "native KIND
+// WINDOW" (the X11 window id on Linux, so tests/window_library.rs can find
+// it), then "passed". Prints "error NAME" and exits 1 when no window opens.
+
+fn rejected(result: void!window.Error) -> bool {
+    match result {
+        ok() => {
+            return false
+        }
+        err(window.Error.Unsupported) => {
+            return true
+        }
+        err(_) => {
+            return false
+        }
+    }
+}
+
+fn is_appkit(native: &handle.NativeHandle) -> bool {
+    match native {
+        handle.NativeHandle.AppKit(_, _) => {
+            return true
+        }
+        _ => {
+            return false
+        }
+    }
+}
+
+fn run() -> void!window.Error {
+    win := window.open(window.Options.gpu("GPU", 200, 120))?
+    assert(!win.has_pixel_buffer())
+    assert(win.width() > 0 && win.height() > 0)
+    {
+        canvas := win.canvas()
+        assert_eq(canvas.width(), 0u32)
+        assert_eq(canvas.height(), 0u32)
+    }
+    assert(rejected(win.update_all()))
+    assert(rejected(win.update(graphics.Rect { x: 0, y: 0, width: 10, height: 10 })))
+    native := win.native_handle()?
+    id := 0usize
+    match &native {
+        handle.NativeHandle.Xcb(connection, window_id, _, visual) => {
+            assert(*connection != 0)
+            assert(*window_id != 0)
+            assert(*visual != 0)
+            id = *window_id as usize
+        }
+        handle.NativeHandle.AppKit(window_object, view) => {
+            assert(*window_object != 0 && *view != 0)
+        }
+        handle.NativeHandle.Win32(hwnd, instance) => {
+            assert(*hwnd != 0 && *instance != 0)
+            id = *hwnd
+        }
+    }
+    // A second call hands out the same objects.
+    again := win.native_handle()?
+    match &again {
+        handle.NativeHandle.Xcb(_, window_id, _, _) => {
+            assert_eq(*window_id as usize, id)
+        }
+        _ => {}
+    }
+    match win.metal_layer() {
+        ok(layer) => {
+            assert(layer != 0)
+            assert_eq(win.metal_layer()?, layer)
+            assert(is_appkit(&native))
+        }
+        err(window.Error.Unsupported) => {
+            assert(!is_appkit(&native))
+        }
+        err(error) => {
+            return err(error)
+        }
+    }
+    console.printf("native {} {}\n", handle.kind_name(&native), id)!
+    // Events still flow; the window stays up briefly for the test to see.
+    idle := 0u32
+    for idle < 5 {
+        match win.wait_event_timeout(100)? {
+            some(window.Event.Key(key)) => {
+                if key.key == window.Key.Escape {
+                    break
+                }
+            }
+            some(window.Event.Close) => {
+                break
+            }
+            some(_) => {}
+            none => {
+                idle += 1
+            }
+        }
+    }
+    win.close()
+    match win.native_handle() {
+        ok(_) => {
+            assert(false)
+        }
+        err(window.Error.Closed) => {}
+        err(_) => {
+            assert(false)
+        }
+    }
+    // A pixel-buffer window has no Metal layer to give.
+    plain := window.open(window.Options.new("Plain", 64, 64))?
+    assert(plain.has_pixel_buffer())
+    assert(rejected(match plain.metal_layer() {
+        ok(_) => ok(),
+        err(error) => err(error)
+    }))
+    return ok()
+}
+
+fn main() -> i32 {
+    match run() {
+        ok() => {
+            console.println("passed")!
+            return 0
+        }
+        err(error) => {
+            console.printf("error {}\n", window.error_name(error))!
+            return 1
+        }
+    }
+}

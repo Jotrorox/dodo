@@ -2,6 +2,7 @@ package linux
 
 import "core/ptr"
 import "std/gpu/opengl/common"
+import "std/window/handle"
 
 // OpenGL contexts on Linux through EGL, without an X server or Wayland.
 //
@@ -12,9 +13,23 @@ import "std/gpu/opengl/common"
 // such as NVIDIA's serve headless. Contexts are made current without a
 // surface where EGL_KHR_surfaceless_context allows, and with a 1x1 pbuffer
 // elsewhere; drawing goes to framebuffer objects either way.
+//
+// A context for a std/window window draws into the X11 window through EGL's
+// XCB platform on the window's libxcb connection. Drivers without that
+// platform get an Xlib connection of their own, from libX11 loaded at run
+// time, and EGL's X11 platform.
 
 unsafe extern "C" fn dlopen(path: *const u8, mode: i32) -> *mut u8
-unsafe extern "C" fn dlsym(handle: *mut u8, name: *const u8) -> usize
+// Declared as std/dylib and std/gpu/metal declare it, so programs using
+// them together link one symbol.
+@link_name("dlsym")
+unsafe extern "C" fn dlsym_pointer(handle: *mut u8, name: *const u8) -> *mut u8
+
+unsafe fn dlsym(handle: *mut u8, name: *const u8) -> usize {
+    unsafe {
+        return dlsym_pointer(handle, name) as usize
+    }
+}
 unsafe extern "C" fn dlclose(handle: *mut u8) -> i32
 
 const RTLD_NOW: i32 = 2
@@ -34,6 +49,20 @@ const EGL_CONTEXT_OPENGL_PROFILE_MASK: i32 = 0x30fd
 const EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT: i32 = 0x0001
 const EGL_CONTEXT_OPENGL_DEBUG: i32 = 0x31b0
 const EGL_PLATFORM_SURFACELESS_MESA: u32 = 0x31dd
+const EGL_WINDOW_BIT: i32 = 0x0004
+const EGL_RED_SIZE: i32 = 0x3024
+const EGL_GREEN_SIZE: i32 = 0x3023
+const EGL_BLUE_SIZE: i32 = 0x3022
+const EGL_DEPTH_SIZE: i32 = 0x3025
+const EGL_STENCIL_SIZE: i32 = 0x3026
+const EGL_BUFFER_SIZE: i32 = 0x3020
+const EGL_NATIVE_VISUAL_ID: i32 = 0x302e
+const EGL_PLATFORM_X11_KHR: u32 = 0x31d5
+const EGL_PLATFORM_X11_SCREEN_KHR: i32 = 0x31d6
+const EGL_PLATFORM_XCB_EXT: u32 = 0x31dc
+const EGL_PLATFORM_XCB_SCREEN_EXT: i32 = 0x31de
+// How many matching configurations to look through for the window's visual.
+const CONFIGS: usize = 64
 
 type GetProcAddress = extern "C" fn(*const u8) -> usize
 type QueryString = extern "C" fn(*mut u8, i32) -> *const u8
@@ -48,6 +77,13 @@ type CreatePbufferSurface = extern "C" fn(*mut u8, *mut u8, *const i32) -> *mut 
 type DestroySurface = extern "C" fn(*mut u8, *mut u8) -> u32
 type MakeCurrent = extern "C" fn(*mut u8, *mut u8, *mut u8, *mut u8) -> u32
 type GetCurrentContext = extern "C" fn() -> *mut u8
+type SwapBuffers = extern "C" fn(*mut u8, *mut u8) -> u32
+type SwapInterval = extern "C" fn(*mut u8, i32) -> u32
+type GetConfigAttrib = extern "C" fn(*mut u8, *mut u8, i32, *mut i32) -> u32
+type Terminate = extern "C" fn(*mut u8) -> u32
+type CreatePlatformWindowSurface = extern "C" fn(*mut u8, *mut u8, *mut u8, *const i32) -> *mut u8
+type XOpenDisplay = extern "C" fn(*const u8) -> *mut u8
+type XCloseDisplay = extern "C" fn(*mut u8) -> i32
 
 fn null() -> *mut u8 {
     unsafe {
@@ -75,6 +111,10 @@ struct Egl {
     destroy_surface: DestroySurface
     make_current: MakeCurrent
     get_current_context: GetCurrentContext
+    swap_buffers: SwapBuffers
+    swap_interval: SwapInterval
+    get_config_attrib: GetConfigAttrib
+    terminate: Terminate
 }
 
 unsafe fn load_egl(library: *mut u8) -> Option<Egl> {
@@ -82,10 +122,11 @@ unsafe fn load_egl(library: *mut u8) -> Option<Egl> {
         b"eglGetProcAddress\0", b"eglQueryString\0", b"eglGetDisplay\0", b"eglInitialize\0",
         b"eglBindAPI\0", b"eglChooseConfig\0", b"eglCreateContext\0",
         b"eglDestroyContext\0", b"eglCreatePbufferSurface\0", b"eglDestroySurface\0",
-        b"eglMakeCurrent\0", b"eglGetCurrentContext\0"
+        b"eglMakeCurrent\0", b"eglGetCurrentContext\0", b"eglSwapBuffers\0",
+        b"eglSwapInterval\0", b"eglGetConfigAttrib\0", b"eglTerminate\0"
     ]
-    addresses := [0usize; 12]
-    for i in 0usize..12 {
+    addresses := [0usize; 16]
+    for i in 0usize..16 {
         address := unsafe {
             dlsym(library, common.c_string(names[i]))
         }
@@ -107,7 +148,11 @@ unsafe fn load_egl(library: *mut u8) -> Option<Egl> {
             create_pbuffer_surface: addresses[8] as CreatePbufferSurface,
             destroy_surface: addresses[9] as DestroySurface,
             make_current: addresses[10] as MakeCurrent,
-            get_current_context: addresses[11] as GetCurrentContext
+            get_current_context: addresses[11] as GetCurrentContext,
+            swap_buffers: addresses[12] as SwapBuffers,
+            swap_interval: addresses[13] as SwapInterval,
+            get_config_attrib: addresses[14] as GetConfigAttrib,
+            terminate: addresses[15] as Terminate
         })
     }
 }
@@ -121,10 +166,16 @@ pub struct Backend {
     display: *mut u8
     context: *mut u8
     surface: *mut u8
+    // Whether surface is a window surface, and the display is this
+    // backend's own to terminate.
+    window: bool
+    // An Xlib connection opened for EGL's X11 platform, or null, and
+    // XCloseDisplay to close it with.
+    xlib: *mut u8
+    close_xlib: usize
 
-    // Create a context for OpenGL `major`.`minor`, core profile from 3.2, and
-    // make it current on the calling thread.
-    pub fn create(major: u32, minor: u32, debug: bool) -> Backend!common.Error {
+    // libEGL and its entry points, with no display yet.
+    fn load() -> Backend!common.Error {
         library := unsafe {
             open(b"libEGL.so.1\0")
         }
@@ -156,14 +207,23 @@ pub struct Backend {
                 open(b"libGL.so.1\0")
             }
         }
-        backend := Backend {
+        return ok(Backend {
             library: library,
             gl_library: gl_library,
             egl: egl,
             display: null(),
             context: null(),
-            surface: null()
-        }
+            surface: null(),
+            window: false,
+            xlib: null(),
+            close_xlib: 0
+        })
+    }
+
+    // Create a context for OpenGL `major`.`minor`, core profile from 3.2, and
+    // make it current on the calling thread.
+    pub fn create(major: u32, minor: u32, debug: bool) -> Backend!common.Error {
+        backend := Backend.load()?
         backend.open_display()?
         bind := backend.egl.bind_api
         if unsafe {
@@ -193,6 +253,208 @@ pub struct Backend {
         if chosen == 0 || count < 1 {
             return err(common.Error.NoConfig)
         }
+        backend.create_context(config, major, minor, debug)?
+        if !surfaceless {
+            size := [EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE]
+            create_surface := backend.egl.create_pbuffer_surface
+            surface := unsafe {
+                create_surface(backend.display, config, ptr.as_ptr(&size))
+            }
+            if ptr.is_null(surface) {
+                return err(common.Error.System)
+            }
+            backend.surface = surface
+        }
+        backend.make_current()?
+        return ok(backend)
+    }
+
+    // Create a context that draws into the X11 window of `native`, a
+    // handle from std/window, and make it current on the calling thread.
+    pub fn create_for_window(native: &handle.NativeHandle, major: u32, minor: u32, debug: bool) -> Backend!common.Error {
+        connection := 0usize
+        window := 0u32
+        screen := 0u32
+        visual := 0u32
+        match native {
+            handle.NativeHandle.Xcb(c, w, s, v) => {
+                connection = *c
+                window = *w
+                screen = *s
+                visual = *v
+            }
+            _ => {
+                return err(common.Error.InvalidInput)
+            }
+        }
+        if connection == 0 || window == 0 {
+            return err(common.Error.InvalidInput)
+        }
+        backend := Backend.load()?
+        backend.window = true
+        xcb := backend.open_window_display(connection, screen)?
+        bind := backend.egl.bind_api
+        if unsafe {
+            bind(EGL_OPENGL_API)
+        } == 0 {
+            return err(common.Error.Unsupported)
+        }
+        config := backend.window_config(visual)?
+        backend.create_context(config, major, minor, debug)?
+        resolve := backend.egl.get_proc_address
+        address := unsafe {
+            resolve(common.c_string(b"eglCreatePlatformWindowSurfaceEXT\0"))
+        }
+        if address == 0 {
+            return err(common.Error.Unsupported)
+        }
+        // XCB windows are 32-bit ids, Xlib's Window an unsigned long; the
+        // platform surface takes a pointer to either.
+        xcb_window := window
+        xlib_window := window as u64
+        native_window := unsafe {
+            ptr.from_mut(&mut xlib_window) as *mut u8
+        }
+        if xcb {
+            native_window = unsafe {
+                ptr.from_mut(&mut xcb_window) as *mut u8
+            }
+        }
+        surface := unsafe {
+            create_surface := address as CreatePlatformWindowSurface
+            create_surface(backend.display, config, native_window, 0usize as *const i32)
+        }
+        if ptr.is_null(surface) {
+            return err(common.Error.System)
+        }
+        backend.surface = surface
+        backend.make_current()?
+        return ok(backend)
+    }
+
+    // An EGL display on the X server: the XCB platform on std/window's
+    // connection, or else the X11 platform on an Xlib connection of our
+    // own. Returns whether it is the XCB platform.
+    fn open_window_display(&mut self, connection: usize, screen: u32) -> bool!common.Error {
+        query := self.egl.query_string
+        initialize := self.egl.initialize
+        resolve := self.egl.get_proc_address
+        clients := unsafe {
+            query(null(), EGL_EXTENSIONS)
+        }
+        address := unsafe {
+            resolve(common.c_string(b"eglGetPlatformDisplayEXT\0"))
+        }
+        if address == 0 {
+            return err(common.Error.Unsupported)
+        }
+        if unsafe {
+            common.has_word(clients, b"EGL_EXT_platform_xcb")
+        }
+        {
+            attributes := [EGL_PLATFORM_XCB_SCREEN_EXT, screen as i32, EGL_NONE]
+            display := unsafe {
+                get_platform_display := address as GetPlatformDisplay
+                get_platform_display(EGL_PLATFORM_XCB_EXT, connection as *mut u8, ptr.as_ptr(&attributes))
+            }
+            if !ptr.is_null(display) && unsafe {
+                initialize(display, 0usize as *mut i32, 0usize as *mut i32)
+            } != 0 {
+                self.display = display
+                return ok(true)
+            }
+        }
+        x11 := unsafe {
+            common.has_word(clients, b"EGL_KHR_platform_x11") || common.has_word(clients, b"EGL_EXT_platform_x11")
+        }
+        if !x11 {
+            return err(common.Error.Unsupported)
+        }
+        xlib := unsafe {
+            open(b"libX11.so.6\0")
+        }
+        if ptr.is_null(xlib) {
+            return err(common.Error.NoLibrary)
+        }
+        open_display := unsafe {
+            dlsym(xlib, common.c_string(b"XOpenDisplay\0"))
+        }
+        close_display := unsafe {
+            dlsym(xlib, common.c_string(b"XCloseDisplay\0"))
+        }
+        if open_display == 0 || close_display == 0 {
+            return err(common.Error.NoLibrary)
+        }
+        connection_xlib := unsafe {
+            connect := open_display as XOpenDisplay
+            connect(0usize as *const u8)
+        }
+        if ptr.is_null(connection_xlib) {
+            return err(common.Error.NoDisplay)
+        }
+        self.xlib = connection_xlib
+        self.close_xlib = close_display
+        attributes := [EGL_PLATFORM_X11_SCREEN_KHR, screen as i32, EGL_NONE]
+        display := unsafe {
+            get_platform_display := address as GetPlatformDisplay
+            get_platform_display(EGL_PLATFORM_X11_KHR, connection_xlib, ptr.as_ptr(&attributes))
+        }
+        if ptr.is_null(display) || unsafe {
+            initialize(display, 0usize as *mut i32, 0usize as *mut i32)
+        } == 0 {
+            return err(common.Error.NoDisplay)
+        }
+        self.display = display
+        return ok(false)
+    }
+
+    // A window configuration with 8-bit color and a depth and stencil
+    // buffer, preferably on the window's own visual, which drivers may
+    // insist on, and otherwise without alpha, like the window.
+    fn window_config(&self, visual: u32) -> *mut u8!common.Error {
+        attributes := [
+            EGL_SURFACE_TYPE, EGL_WINDOW_BIT, EGL_RENDERABLE_TYPE, EGL_OPENGL_BIT,
+            EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8,
+            EGL_DEPTH_SIZE, 24, EGL_STENCIL_SIZE, 8, EGL_NONE
+        ]
+        configs := [0usize; CONFIGS]
+        count := 0i32
+        choose := self.egl.choose_config
+        chosen := unsafe {
+            choose(self.display, ptr.as_ptr(&attributes), ptr.as_mut_ptr(&mut configs) as *mut *mut u8, CONFIGS as i32, ptr.from_mut(&mut count))
+        }
+        if chosen == 0 || count < 1 {
+            return err(common.Error.NoConfig)
+        }
+        get := self.egl.get_config_attrib
+        opaque := CONFIGS
+        for i in 0usize..count as usize {
+            config := unsafe {
+                configs[i] as *mut u8
+            }
+            id := 0i32
+            size := 0i32
+            unsafe {
+                get(self.display, config, EGL_NATIVE_VISUAL_ID, ptr.from_mut(&mut id))
+                get(self.display, config, EGL_BUFFER_SIZE, ptr.from_mut(&mut size))
+            }
+            if visual != 0 && id as u32 == visual {
+                return ok(config)
+            }
+            if size == 24 && opaque == CONFIGS {
+                opaque = i
+            }
+        }
+        if opaque == CONFIGS {
+            opaque = 0
+        }
+        return ok(unsafe {
+            configs[opaque] as *mut u8
+        })
+    }
+
+    // The context, for the current API, on `config`.
+    fn create_context(&mut self, config: *mut u8, major: u32, minor: u32, debug: bool) -> void!common.Error {
         profile := 0i32
         if major > 3 || (major == 3 && minor >= 2) {
             profile = EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT
@@ -214,27 +476,15 @@ pub struct Backend {
             context_attributes[used] = EGL_CONTEXT_OPENGL_DEBUG
             context_attributes[used + 1] = 1
         }
-        create := backend.egl.create_context
+        create := self.egl.create_context
         context := unsafe {
-            create(backend.display, config, null(), ptr.as_ptr(&context_attributes))
+            create(self.display, config, null(), ptr.as_ptr(&context_attributes))
         }
         if ptr.is_null(context) {
             return err(common.Error.Unsupported)
         }
-        backend.context = context
-        if !surfaceless {
-            size := [EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE]
-            create_surface := backend.egl.create_pbuffer_surface
-            surface := unsafe {
-                create_surface(backend.display, config, ptr.as_ptr(&size))
-            }
-            if ptr.is_null(surface) {
-                return err(common.Error.System)
-            }
-            backend.surface = surface
-        }
-        backend.make_current()?
-        return ok(backend)
+        self.context = context
+        return ok()
     }
 
     // Mesa's surfaceless platform first, then the default display.
@@ -303,6 +553,37 @@ pub struct Backend {
         }
     }
 
+    // Show the window surface's back buffer. Unsupported without a window.
+    pub fn swap_buffers(&self) -> void!common.Error {
+        if !self.window {
+            return err(common.Error.Unsupported)
+        }
+        swap := self.egl.swap_buffers
+        if unsafe {
+            swap(self.display, self.surface)
+        } == 0 {
+            return err(common.Error.System)
+        }
+        return ok()
+    }
+
+    // Wait for `interval` display refreshes per swap; 0 swaps at once.
+    pub fn set_swap_interval(&self, interval: i32) -> void!common.Error {
+        if !self.window {
+            return err(common.Error.Unsupported)
+        }
+        set := self.egl.swap_interval
+        if unsafe {
+            set(self.display, interval)
+        } == 0 {
+            return err(common.Error.Unsupported)
+        }
+        return ok()
+    }
+
+    // X11 window surfaces follow the window's size by themselves.
+    pub fn update_surface(&self) {}
+
     // The address of an OpenGL command, or 0.
     pub fn resolve(&self, name: *const u8) -> usize {
         resolve := self.egl.get_proc_address
@@ -337,7 +618,21 @@ pub struct Backend {
             // EGL displays are reference counted per process, not per
             // eglInitialize call, so terminating would break other contexts
             // on the same display. They stay initialized, as Mesa's own
-            // tools leave them; libEGL stays loaded with them.
+            // tools leave them; libEGL stays loaded with them. A window's
+            // display is terminated, since its connection closes with the
+            // window and a later one may reuse the address.
+            if self.window {
+                terminate := self.egl.terminate
+                unsafe {
+                    terminate(self.display)
+                }
+            }
+        }
+        if !ptr.is_null(self.xlib) {
+            unsafe {
+                close := self.close_xlib as XCloseDisplay
+                close(self.xlib)
+            }
         }
     }
 }

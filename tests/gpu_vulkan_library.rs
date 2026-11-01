@@ -2,6 +2,7 @@
 //! levels, code generation for every hosted target, and the compute example
 //! on whatever Vulkan driver the machine has (lavapipe in a Linux container
 //! is enough). Without a driver the example must say so and exit cleanly.
+//! The window example presents under Xvfb in window_library.rs.
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -102,6 +103,7 @@ fn vulkan_builds_for_every_hosted_target() {
     for (name, source) in [
         ("checks", root().join("tests/stdlib/vulkan_checks.dodo")),
         ("compute", root().join("examples/vulkan_compute.dodo")),
+        ("window", root().join("examples/vulkan_window.dodo")),
     ] {
         for target in [
             "x86_64-unknown-linux-gnu",

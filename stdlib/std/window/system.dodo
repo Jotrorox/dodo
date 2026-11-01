@@ -2,13 +2,14 @@ package system
 
 import "core/ptr"
 import "core/mem"
+import "std/window/handle"
 import "std/window/raw"
 
 // The window adapter shared by macOS and Windows, whose window systems are
 // reached through the C runtime in runtime.c. The runtime keeps the single
 // window's state and pixel buffer; a Backend is the handle to it.
 
-unsafe extern "C" fn dodo_window_open(title: *const u8, title_length: usize, width: u32, height: u32, resizable: u32, handle: *mut isize) -> i32
+unsafe extern "C" fn dodo_window_open(title: *const u8, title_length: usize, width: u32, height: u32, flags: u32, handle: *mut isize) -> i32
 unsafe extern "C" fn dodo_window_close(handle: isize)
 unsafe extern "C" fn dodo_window_next_event(handle: isize, milliseconds: u32, event: *mut raw.Event) -> i32
 unsafe extern "C" fn dodo_window_buffer(handle: isize, pixels: *mut *mut u8, width: *mut u32, height: *mut u32, stride: *mut usize)
@@ -21,6 +22,15 @@ unsafe extern "C" fn dodo_window_frame_period(handle: isize) -> u64
 unsafe extern "C" fn dodo_window_next_vblank(handle: isize, now: u64) -> u64
 unsafe extern "C" fn dodo_window_request_frame(handle: isize) -> i32
 unsafe extern "C" fn dodo_window_set_animating(handle: isize, animating: u32)
+unsafe extern "C" fn dodo_window_native(handle: isize, first: *mut usize, second: *mut usize) -> i32
+unsafe extern "C" fn dodo_window_metal_layer(handle: isize, layer: *mut usize) -> i32
+
+// dodo_window_open flags.
+const RESIZABLE: u32 = 1
+const PIXEL_BUFFER: u32 = 2
+// What dodo_window_native reports.
+const NATIVE_APPKIT: i32 = 1
+const NATIVE_WIN32: i32 = 2
 
 fn null() -> *mut u8 {
     unsafe {
@@ -41,17 +51,25 @@ pub struct Backend {
     width: u32
     height: u32
     stride: usize
+    pixel_buffer: bool
 
-    pub fn open(title: &str, width: u32, height: u32, resizable: bool) -> Backend!raw.Error {
+    pub fn open(title: &str, width: u32, height: u32, resizable: bool, pixel_buffer: bool) -> Backend!raw.Error {
         handle := 0isize
         text := mem.str_bytes(title)
+        flags := 0u32
+        if resizable {
+            flags |= RESIZABLE
+        }
+        if pixel_buffer {
+            flags |= PIXEL_BUFFER
+        }
         code := unsafe {
-            dodo_window_open(ptr.as_ptr(text), text.len, width, height, flag(resizable), ptr.from_mut(&mut handle))
+            dodo_window_open(ptr.as_ptr(text), text.len, width, height, flags, ptr.from_mut(&mut handle))
         }
         if code != 0 {
             return err(raw.from_code(code))
         }
-        backend := Backend { handle: handle, pixels: null(), width: 0, height: 0, stride: 0 }
+        backend := Backend { handle: handle, pixels: null(), width: 0, height: 0, stride: 0, pixel_buffer: pixel_buffer }
         backend.refresh()
         return ok(backend)
     }
@@ -77,6 +95,9 @@ pub struct Backend {
     pub fn stride(&self) -> usize {
         return self.stride
     }
+    pub fn has_pixel_buffer(&self) -> bool {
+        return self.pixel_buffer
+    }
     pub fn scale_percent(&self) -> u32 {
         if self.handle == 0 {
             return 100
@@ -87,6 +108,7 @@ pub struct Backend {
     }
     // The runtime keeps a nonnull buffer of stride * height bytes, replaced
     // only inside next_event, which cannot run while this borrow is live.
+    // Without a pixel buffer the stride is 0, so the slice is empty.
     pub fn pixels(&mut self) -> &mut[u8] from(self) {
         unsafe {
             pointer := self.pixels
@@ -193,6 +215,41 @@ pub struct Backend {
             return err(raw.from_code(code))
         }
         return ok()
+    }
+    // The NSWindow and NSView on macOS, the HWND and HINSTANCE on Windows.
+    pub fn native_handle(&mut self) -> handle.NativeHandle!raw.Error {
+        if self.handle == 0 {
+            return err(raw.Error.Closed)
+        }
+        first := 0usize
+        second := 0usize
+        kind := unsafe {
+            dodo_window_native(self.handle, ptr.from_mut(&mut first), ptr.from_mut(&mut second))
+        }
+        if kind == NATIVE_APPKIT {
+            return ok(handle.NativeHandle.AppKit(first, second))
+        }
+        if kind == NATIVE_WIN32 {
+            return ok(handle.NativeHandle.Win32(first, second))
+        }
+        if kind < 0 {
+            return err(raw.from_code(-kind))
+        }
+        return err(raw.Error.System)
+    }
+    // A CAMetalLayer backing the view, on macOS only.
+    pub fn metal_layer(&mut self) -> usize!raw.Error {
+        if self.handle == 0 {
+            return err(raw.Error.Closed)
+        }
+        layer := 0usize
+        code := unsafe {
+            dodo_window_metal_layer(self.handle, ptr.from_mut(&mut layer))
+        }
+        if code != 0 {
+            return err(raw.from_code(code))
+        }
+        return ok(layer)
     }
     pub fn close(&mut self) {
         if self.handle == 0 {
