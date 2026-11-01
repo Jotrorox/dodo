@@ -1,0 +1,589 @@
+package protocol
+
+import "core/mem"
+import "core/ptr"
+import "std/db"
+import "std/float_decimal"
+import "std/math"
+import "std/text"
+
+// Type OIDs of the built-in types this codec knows (pg_type.oid).
+pub const OID_BOOL: u32 = 16
+pub const OID_BYTEA: u32 = 17
+pub const OID_INT8: u32 = 20
+pub const OID_INT2: u32 = 21
+pub const OID_INT4: u32 = 23
+pub const OID_TEXT: u32 = 25
+pub const OID_OID: u32 = 26
+pub const OID_FLOAT4: u32 = 700
+pub const OID_FLOAT8: u32 = 701
+pub const OID_VARCHAR: u32 = 1043
+
+// How a column or parameter is transferred. Every kind except KIND_TEXT
+// uses PostgreSQL's binary format; KIND_TEXT uses the text format, which the
+// server produces and parses for every type (numeric, timestamps, uuid,
+// json, arrays, ...).
+pub const KIND_TEXT: u8 = 0
+pub const KIND_BOOL: u8 = 1
+pub const KIND_INT2: u8 = 2
+pub const KIND_INT4: u8 = 3
+pub const KIND_INT8: u8 = 4
+pub const KIND_OID: u8 = 5
+pub const KIND_FLOAT4: u8 = 6
+pub const KIND_FLOAT8: u8 = 7
+pub const KIND_BYTEA: u8 = 8
+
+pub fn kind_of(oid: u32) -> u8 {
+    if oid == OID_BOOL {
+        return KIND_BOOL
+    }
+    if oid == OID_BYTEA {
+        return KIND_BYTEA
+    }
+    if oid == OID_INT8 {
+        return KIND_INT8
+    }
+    if oid == OID_INT2 {
+        return KIND_INT2
+    }
+    if oid == OID_INT4 {
+        return KIND_INT4
+    }
+    if oid == OID_OID {
+        return KIND_OID
+    }
+    if oid == OID_FLOAT4 {
+        return KIND_FLOAT4
+    }
+    if oid == OID_FLOAT8 {
+        return KIND_FLOAT8
+    }
+    KIND_TEXT
+}
+
+// Format code (0 text, 1 binary) for a kind.
+pub fn format_of(kind: u8) -> u16 {
+    if kind == KIND_TEXT {
+        return 0
+    }
+    1
+}
+
+// ParameterDescription: the number of parameters, and each one's kind
+// written to `kinds` (parameters beyond kinds.len are sent as text).
+pub fn parameter_kinds(body: &[u8], kinds: &mut[u8]) -> usize!db.Error {
+    r := Reader.new(body)
+    count := r.u16()? as usize
+    for i in 0usize..count {
+        oid := r.u32()?
+        if i < kinds.len {
+            kinds[i] = kind_of(oid)
+        }
+    }
+    ok(count)
+}
+
+// One field of a RowDescription.
+pub struct Field {
+    pub name: Span
+    pub type_oid: u32
+    pub format: u16
+}
+
+// Walks the fields of a RowDescription.
+pub struct Fields {
+    r: Reader
+    count: usize
+    index: usize
+
+    pub fn new(body: &[u8]) -> Fields!db.Error from(body) {
+        r := Reader.new(body)
+        count := r.u16()? as usize
+        ok(Fields { r, count, index: 0 })
+    }
+
+    pub fn count(&self) -> usize {
+        self.count
+    }
+
+    pub fn next(&mut self) -> Option<Field>!db.Error {
+        if self.index == self.count {
+            return ok(none)
+        }
+        self.index += 1
+        name := self.r.cstr()?
+        self.r.take(6)?
+        type_oid := self.r.u32()?
+        self.r.take(6)?
+        format := self.r.u16()?
+        if format > 1 {
+            return err(violation())
+        }
+        ok(some(Field { name, type_oid, format }))
+    }
+}
+
+// Walks the column values of a DataRow. Each value is a span into the body,
+// or none for NULL.
+pub struct Columns {
+    r: Reader
+    count: usize
+    index: usize
+
+    pub fn new(body: &[u8]) -> Columns!db.Error from(body) {
+        r := Reader.new(body)
+        count := r.u16()? as usize
+        ok(Columns { r, count, index: 0 })
+    }
+
+    pub fn count(&self) -> usize {
+        self.count
+    }
+
+    // The next value: ok(some(true)) with `span` set, ok(some(false)) for
+    // NULL, ok(none) after the last column.
+    pub fn next(&mut self, span: &mut Span) -> Option<bool>!db.Error {
+        if self.index == self.count {
+            return ok(none)
+        }
+        self.index += 1
+        length := self.r.i32()?
+        if length < 0 {
+            if length != -1 {
+                return err(violation())
+            }
+            return ok(some(false))
+        }
+        s := self.r.take(length as usize)?
+        span.start = s.start
+        span.end = s.end
+        ok(some(true))
+    }
+}
+
+fn be(data: &[u8]) -> u64 {
+    v := 0u64
+    for i in 0usize..data.len {
+        v = (v << 8) | (data[i] as u64)
+    }
+    v
+}
+
+fn signed(v: u64, bytes: usize) -> i64 {
+    if bytes == 8 {
+        if v < 9223372036854775808u64 {
+            return v as i64
+        }
+        return ((v - 9223372036854775808u64) as i64) - 9223372036854775807 - 1
+    }
+    bits := (bytes * 8) as u64
+    half := 1u64 << (bits - 1)
+    if v < half {
+        return v as i64
+    }
+    (v as i64) - ((1u64 << bits) as i64)
+}
+
+fn f32_value(bits: u32) -> f64 {
+    raw := bits
+    value := unsafe {
+        ptr.read_unaligned(ptr.from_ref(&raw) as *const f32)
+    }
+    value as f64
+}
+
+fn f32_bits(value: f32) -> u32 {
+    unsafe {
+        ptr.read_unaligned(ptr.from_ref(&value) as *const u32)
+    }
+}
+
+fn text_value(data: &[u8]) -> db.Value from(data) {
+    match text.validate(data) {
+        ok() => db.Value.Text(unsafe {
+            mem.str_from_utf8(data)
+        }),
+        err(_) => db.Value.Bytes(data),
+    }
+}
+
+// Decodes one non-NULL value of the given kind and format (0 text,
+// 1 binary). Text and Bytes borrow `data`. Text-format values of known
+// numeric kinds are converted, so a text result still reads as Int or Real.
+pub fn decode(kind: u8, format: u16, data: &[u8]) -> db.Value!db.Error from(data) {
+    if format == 1 {
+        if kind == KIND_BOOL {
+            if data.len != 1 {
+                return err(violation())
+            }
+            if data[0] != 0 {
+                return ok(db.Value.Int(1))
+            }
+            return ok(db.Value.Int(0))
+        }
+        if kind == KIND_INT2 || kind == KIND_INT4 || kind == KIND_INT8 {
+            expected := 8usize
+            if kind == KIND_INT2 {
+                expected = 2
+            } else if kind == KIND_INT4 {
+                expected = 4
+            }
+            if data.len != expected {
+                return err(violation())
+            }
+            return ok(db.Value.Int(signed(be(data), expected)))
+        }
+        if kind == KIND_OID {
+            if data.len != 4 {
+                return err(violation())
+            }
+            return ok(db.Value.Int(be(data) as i64))
+        }
+        if kind == KIND_FLOAT4 {
+            if data.len != 4 {
+                return err(violation())
+            }
+            return ok(db.Value.Real(f32_value(be(data) as u32)))
+        }
+        if kind == KIND_FLOAT8 {
+            if data.len != 8 {
+                return err(violation())
+            }
+            return ok(db.Value.Real(math.from_bits(be(data))))
+        }
+        if kind == KIND_BYTEA {
+            return ok(db.Value.Bytes(data))
+        }
+        return ok(text_value(data))
+    }
+    if kind == KIND_BOOL {
+        if data.len == 1 && data[0] == b't' {
+            return ok(db.Value.Int(1))
+        }
+        if data.len == 1 && data[0] == b'f' {
+            return ok(db.Value.Int(0))
+        }
+        return err(violation())
+    }
+    if kind == KIND_INT2 || kind == KIND_INT4 || kind == KIND_INT8 || kind == KIND_OID {
+        match text.parse_i64(data, 10) {
+            ok(v) => {
+                return ok(db.Value.Int(v))
+            },
+            err(_) => {
+                return err(violation())
+            },
+        }
+    }
+    if kind == KIND_FLOAT4 || kind == KIND_FLOAT8 {
+        if same(data, b"NaN") {
+            return ok(db.Value.Real(math.from_bits(0x7ff8000000000000u64)))
+        }
+        if same(data, b"Infinity") {
+            return ok(db.Value.Real(math.from_bits(0x7ff0000000000000u64)))
+        }
+        if same(data, b"-Infinity") {
+            return ok(db.Value.Real(math.from_bits(0xfff0000000000000u64)))
+        }
+        match text.parse_f64(data) {
+            ok(v) => {
+                return ok(db.Value.Real(v))
+            },
+            err(_) => {
+                return err(violation())
+            },
+        }
+    }
+    ok(text_value(data))
+}
+
+// One parameter encoded for Bind: either `scratch[..length]` (inline) or
+// the value's own text or bytes.
+struct Encoded {
+    format: u16
+    length: i32
+    inline: bool
+}
+
+fn mismatch() -> db.Error {
+    db.Error.new(db.ErrorKind.Type, 0)
+}
+
+fn put_be(out: &mut[u8], value: u64, bytes: usize) {
+    for i in 0usize..bytes {
+        out[i] = ((value >> (((bytes - 1 - i) * 8) as u64)) & 255) as u8
+    }
+}
+
+fn int_bits(v: i64) -> u64 {
+    if v >= 0 {
+        return v as u64
+    }
+    ((v + 9223372036854775807 + 1) as u64) + 9223372036854775808u64
+}
+
+// Decimal text of an integer.
+pub fn format_int(v: i64, out: &mut[u8]) -> usize {
+    digits := [0u8; 20]
+    n := 0usize
+    magnitude := 0u64
+    if v < 0 {
+        magnitude = 18446744073709551615u64 - int_bits(v) + 1
+    } else {
+        magnitude = v as u64
+    }
+    for {
+        digits[n] = 48 + (magnitude % 10) as u8
+        n += 1
+        magnitude = magnitude / 10
+        if magnitude == 0 {
+            break
+        }
+    }
+    at := 0usize
+    if v < 0 {
+        out[0] = 45
+        at = 1
+    }
+    for i in 0usize..n {
+        out[at + i] = digits[n - 1 - i]
+    }
+    at + n
+}
+
+// Text that PostgreSQL's float and numeric input functions read back as
+// exactly `v`: the fewest significant digits (at most 17) that round-trip,
+// in scientific notation, or NaN / Infinity / -Infinity. `out` must hold
+// 32 bytes.
+pub fn format_real(v: f64, out: &mut[u8]) -> usize {
+    bits := math.to_bits(v)
+    magnitude := bits & 0x7fffffffffffffffu64
+    negative := (bits >> 63) != 0
+    if magnitude > 0x7ff0000000000000u64 {
+        return copy_text(b"NaN", out)
+    }
+    if magnitude == 0x7ff0000000000000u64 {
+        if negative {
+            return copy_text(b"-Infinity", out)
+        }
+        return copy_text(b"Infinity", out)
+    }
+    at := 0usize
+    if negative && magnitude != 0 {
+        out[0] = 45
+        at = 1
+    }
+    value := math.from_bits(magnitude)
+    for digits in 0usize..17 {
+        match float_decimal.convert(&mut out[at..], value, digits, true) {
+            ok(n) => {
+                match text.parse_f64(&out[at..at + n]) {
+                    ok(back) => {
+                        if math.to_bits(back) == magnitude || digits == 16 {
+                            return at + n
+                        }
+                    },
+                    err(_) => {},
+                }
+            },
+            err(_) => {
+                return 0
+            },
+        }
+    }
+    0
+}
+
+fn copy_text(word: &[u8], out: &mut[u8]) -> usize {
+    for i in 0usize..word.len {
+        out[i] = word[i]
+    }
+    word.len
+}
+
+fn integral(v: f64, min: f64, max: f64) -> bool {
+    v == v && v >= min && v <= max && math.floor(v) == v
+}
+
+// Encodes a parameter for a target of `kind`; scratch must hold 32 bytes.
+fn encode(value: &db.Value, kind: u8, scratch: &mut[u8]) -> Encoded!db.Error {
+    match value {
+        db.Value.Null => ok(Encoded { format: 0, length: -1, inline: false }),
+        db.Value.Text(s) => {
+            n := mem.str_bytes(*s).len
+            if n > 1073741823 {
+                return err(capacity())
+            }
+            ok(Encoded { format: 0, length: n as i32, inline: false })
+        },
+        db.Value.Bytes(b) => {
+            if b.len > 1073741823 {
+                return err(capacity())
+            }
+            format := 0u16
+            if kind == KIND_BYTEA {
+                format = 1
+            }
+            ok(Encoded { format, length: b.len as i32, inline: false })
+        },
+        db.Value.Int(v) => encode_int(*v, kind, scratch),
+        db.Value.Real(v) => encode_real(*v, kind, scratch),
+    }
+}
+
+fn binary(length: i32) -> Encoded {
+    Encoded { format: 1, length, inline: true }
+}
+
+fn encode_int(v: i64, kind: u8, scratch: &mut[u8]) -> Encoded!db.Error {
+    if kind == KIND_INT2 {
+        if v < -32768 || v > 32767 {
+            return err(mismatch())
+        }
+        put_be(scratch, int_bits(v), 2)
+        return ok(binary(2))
+    }
+    if kind == KIND_INT4 {
+        if v < -2147483648 || v > 2147483647 {
+            return err(mismatch())
+        }
+        put_be(scratch, int_bits(v), 4)
+        return ok(binary(4))
+    }
+    if kind == KIND_INT8 {
+        put_be(scratch, int_bits(v), 8)
+        return ok(binary(8))
+    }
+    if kind == KIND_OID {
+        if v < 0 || v > 4294967295 {
+            return err(mismatch())
+        }
+        put_be(scratch, v as u64, 4)
+        return ok(binary(4))
+    }
+    if kind == KIND_BOOL {
+        scratch[0] = 0
+        if v != 0 {
+            scratch[0] = 1
+        }
+        return ok(binary(1))
+    }
+    if kind == KIND_FLOAT4 {
+        put_be(scratch, f32_bits(v as f32) as u64, 4)
+        return ok(binary(4))
+    }
+    if kind == KIND_FLOAT8 {
+        put_be(scratch, math.to_bits(v as f64), 8)
+        return ok(binary(8))
+    }
+    n := format_int(v, scratch)
+    ok(Encoded { format: 0, length: n as i32, inline: true })
+}
+
+fn encode_real(v: f64, kind: u8, scratch: &mut[u8]) -> Encoded!db.Error {
+    if kind == KIND_FLOAT8 {
+        put_be(scratch, math.to_bits(v), 8)
+        return ok(binary(8))
+    }
+    if kind == KIND_FLOAT4 {
+        bits := math.to_bits(v)
+        magnitude := bits & 0x7fffffffffffffffu64
+        single := 0u32
+        if magnitude > 0x7ff0000000000000u64 {
+            single = 0x7fc00000u32
+        } else if magnitude == 0x7ff0000000000000u64 {
+            single = 0x7f800000u32
+            if (bits >> 63) != 0 {
+                single = 0xff800000u32
+            }
+        } else {
+            if v > 3.4028234663852886e38 || v < -3.4028234663852886e38 {
+                return err(mismatch())
+            }
+            single = f32_bits(v as f32)
+        }
+        put_be(scratch, single as u64, 4)
+        return ok(binary(4))
+    }
+    if kind == KIND_INT2 || kind == KIND_INT4 || kind == KIND_INT8 || kind == KIND_OID {
+        if !integral(v, -9223372036854775808.0, 9223372036854774784.0) {
+            return err(mismatch())
+        }
+        return encode_int(v as i64, kind, scratch)
+    }
+    if kind == KIND_BOOL || kind == KIND_BYTEA {
+        return err(mismatch())
+    }
+    n := format_real(v, scratch)
+    ok(Encoded { format: 0, length: n as i32, inline: true })
+}
+
+fn kind_at(kinds: &[u8], index: usize) -> u8 {
+    if index < kinds.len {
+        return kinds[index]
+    }
+    KIND_TEXT
+}
+
+fn bit(bits: &[u8], index: usize) -> bool {
+    index / 8 < bits.len && (bits[index / 8] & (1u8 << ((index % 8) as u8))) != 0
+}
+
+// Bind: binds `params` to the prepared statement `statement` as portal
+// `portal`. `kinds` holds each parameter's kind from its ParameterDescription
+// (missing entries are sent as text), and result column i is requested in
+// binary when bit i of `binary_columns` is set, in text otherwise.
+// Parameters are converted for their target type: an Int for an int2
+// parameter must fit, a Real for an integer parameter must be integral, and
+// values that do not fit are Type errors before anything is written.
+pub fn bind<W>(w: &mut W, portal: &[u8], statement: &[u8], params: &[db.Value], kinds: &[u8], binary_columns: &[u8], columns: usize) -> void!db.Error {
+    check_cstr(portal)?
+    check_cstr(statement)?
+    if params.len > 65535 || columns > 65535 {
+        return err(capacity())
+    }
+    scratch := [0u8; 32]
+    body := cstr_len(portal) + cstr_len(statement) + 2 + 2 * params.len + 2 + 2 + 2 * columns
+    for i in 0usize..params.len {
+        e := encode(&params[i], kind_at(kinds, i), &mut scratch)?
+        body += 4
+        if e.length > 0 {
+            body += e.length as usize
+        }
+    }
+    put_header(w, 66, body)?
+    put_cstr(w, portal)?
+    put_cstr(w, statement)?
+    put_u16(w, params.len as u16)?
+    for i in 0usize..params.len {
+        e := encode(&params[i], kind_at(kinds, i), &mut scratch)?
+        put_u16(w, e.format)?
+    }
+    put_u16(w, params.len as u16)?
+    for i in 0usize..params.len {
+        e := encode(&params[i], kind_at(kinds, i), &mut scratch)?
+        put_i32(w, e.length)?
+        if e.inline {
+            w.put(&scratch[..e.length as usize])?
+        } else {
+            match &params[i] {
+                db.Value.Text(s) => {
+                    w.put(mem.str_bytes(*s))?
+                },
+                db.Value.Bytes(b) => {
+                    w.put(*b)?
+                },
+                _ => {},
+            }
+        }
+    }
+    put_u16(w, columns as u16)?
+    for i in 0usize..columns {
+        if bit(binary_columns, i) {
+            put_u16(w, 1)?
+        } else {
+            put_u16(w, 0)?
+        }
+    }
+    ok()
+}

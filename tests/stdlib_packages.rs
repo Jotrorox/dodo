@@ -537,6 +537,33 @@ fn portable_package_dependencies_are_independent_and_reserved() {
             "std/embedded/storage",
             vec!["alloc/", "std/io", "std/platform", "std/fs", "std/checksum"],
         ),
+        // Shared database vocabulary, the pool included, needs nothing native.
+        (
+            "std/db",
+            vec![
+                "alloc/",
+                "std/net",
+                "std/tls",
+                "std/crypto",
+                "std/fs",
+                "std/sync",
+                "std/thread",
+            ],
+        ),
+        // The PostgreSQL wire engine stays portable: the hosted client
+        // supplies sockets, TLS and the hash functions.
+        (
+            "std/db/postgres/protocol",
+            vec![
+                "alloc/",
+                "std/net",
+                "std/tls",
+                "std/crypto",
+                "std/fs",
+                "std/sync",
+                "std/thread",
+            ],
+        ),
     ] {
         let source = workspace.write(
             "main.dodo",

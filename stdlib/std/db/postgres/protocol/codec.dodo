@@ -1,0 +1,556 @@
+package protocol
+
+import "std/db"
+
+// PostgreSQL frontend/backend protocol 3.0, without I/O.
+//
+// Writers append whole messages to a sink: any value with
+//
+//     pub fn put(&mut self, data: &[u8]) -> void!db.Error
+//
+// such as `Buffer` (a caller-owned byte slice) or a hosted client's socket
+// writer. Every writer computes the message length first, so a sink may pass
+// large values straight to the transport instead of copying them.
+//
+// Readers work on complete messages: `frame` finds the next message in
+// received bytes, and the parsing functions below take its body (the bytes
+// after the tag and length) and return scalars or `Span`s into it.
+
+pub const PROTOCOL_VERSION: i32 = 196608
+pub const SSL_REQUEST_CODE: i32 = 80877103
+pub const CANCEL_REQUEST_CODE: i32 = 80877102
+pub const DEFAULT_PORT: u16 = 5432
+
+// Backend message tags.
+pub const AUTHENTICATION: u8 = 82 // 'R'
+pub const BACKEND_KEY_DATA: u8 = 75 // 'K'
+pub const BIND_COMPLETE: u8 = 50 // '2'
+pub const CLOSE_COMPLETE: u8 = 51 // '3'
+pub const COMMAND_COMPLETE: u8 = 67 // 'C'
+pub const COPY_IN_RESPONSE: u8 = 71 // 'G'
+pub const COPY_OUT_RESPONSE: u8 = 72 // 'H'
+pub const COPY_BOTH_RESPONSE: u8 = 87 // 'W'
+pub const COPY_DATA: u8 = 100 // 'd'
+pub const COPY_DONE: u8 = 99 // 'c'
+pub const DATA_ROW: u8 = 68 // 'D'
+pub const EMPTY_QUERY_RESPONSE: u8 = 73 // 'I'
+pub const ERROR_RESPONSE: u8 = 69 // 'E'
+pub const NEGOTIATE_PROTOCOL_VERSION: u8 = 118 // 'v'
+pub const NO_DATA: u8 = 110 // 'n'
+pub const NOTICE_RESPONSE: u8 = 78 // 'N'
+pub const NOTIFICATION_RESPONSE: u8 = 65 // 'A'
+pub const PARAMETER_DESCRIPTION: u8 = 116 // 't'
+pub const PARAMETER_STATUS: u8 = 83 // 'S'
+pub const PARSE_COMPLETE: u8 = 49 // '1'
+pub const PORTAL_SUSPENDED: u8 = 115 // 's'
+pub const READY_FOR_QUERY: u8 = 90 // 'Z'
+pub const ROW_DESCRIPTION: u8 = 84 // 'T'
+
+// Authentication request codes (the first field of an 'R' message).
+pub const AUTH_OK: i32 = 0
+pub const AUTH_CLEARTEXT_PASSWORD: i32 = 3
+pub const AUTH_MD5_PASSWORD: i32 = 5
+pub const AUTH_SASL: i32 = 10
+pub const AUTH_SASL_CONTINUE: i32 = 11
+pub const AUTH_SASL_FINAL: i32 = 12
+
+// Transaction status reported by ReadyForQuery.
+pub const STATUS_IDLE: u8 = 73 // 'I'
+pub const STATUS_TRANSACTION: u8 = 84 // 'T'
+pub const STATUS_FAILED: u8 = 69 // 'E'
+
+pub fn capacity() -> db.Error {
+    db.Error.new(db.ErrorKind.Capacity, 0)
+}
+
+pub fn violation() -> db.Error {
+    db.Error.new(db.ErrorKind.Protocol, 0)
+}
+
+pub fn misuse() -> db.Error {
+    db.Error.new(db.ErrorKind.Misuse, 0)
+}
+
+// A sink over a caller-owned byte slice. A message that does not fit fails
+// with ErrorKind.Capacity and leaves the bytes written so far.
+pub struct Buffer {
+    data: &mut[u8]
+    used: usize
+
+    pub fn new(data: &mut[u8]) -> Buffer from(data) {
+        Buffer { data, used: 0 }
+    }
+
+    pub fn put(&mut self, bytes: &[u8]) -> void!db.Error {
+        if bytes.len > self.data.len - self.used {
+            return err(capacity())
+        }
+        for i in 0usize..bytes.len {
+            self.data[self.used + i] = bytes[i]
+        }
+        self.used += bytes.len
+        ok()
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.data[..self.used]
+    }
+
+    pub fn used(&self) -> usize {
+        self.used
+    }
+
+    pub fn clear(&mut self) {
+        self.used = 0
+    }
+}
+
+pub fn put_u8<W>(w: &mut W, value: u8) -> void!db.Error {
+    b := [value]
+    w.put(&b)
+}
+
+pub fn put_u16<W>(w: &mut W, value: u16) -> void!db.Error {
+    b := [(value >> 8) as u8, (value & 255) as u8]
+    w.put(&b)
+}
+
+pub fn put_u32<W>(w: &mut W, value: u32) -> void!db.Error {
+    b := [(value >> 24) as u8, ((value >> 16) & 255) as u8, ((value >> 8) & 255) as u8, (value & 255) as u8]
+    w.put(&b)
+}
+
+pub fn put_i32<W>(w: &mut W, value: i32) -> void!db.Error {
+    put_u32(w, signed_bits(value))
+}
+
+pub fn signed_bits(value: i32) -> u32 {
+    if value >= 0 {
+        return value as u32
+    }
+    ((value + 2147483647 + 1) as u32) + 2147483648u32
+}
+
+// Writes a NUL-terminated string. Text containing NUL cannot be represented
+// and fails with ErrorKind.Misuse.
+pub fn put_cstr<W>(w: &mut W, text: &[u8]) -> void!db.Error {
+    check_cstr(text)?
+    w.put(text)?
+    put_u8(w, 0)
+}
+
+pub fn check_cstr(text: &[u8]) -> void!db.Error {
+    for i in 0usize..text.len {
+        if text[i] == 0 {
+            return err(misuse())
+        }
+    }
+    ok()
+}
+
+// Tag and length of a message whose body (everything after the length) is
+// `body` bytes long.
+pub fn put_header<W>(w: &mut W, tag: u8, body: usize) -> void!db.Error {
+    if body > 1073741819 {
+        return err(capacity())
+    }
+    put_u8(w, tag)?
+    put_u32(w, (body + 4) as u32)
+}
+
+fn cstr_len(text: &[u8]) -> usize {
+    text.len + 1
+}
+
+// StartupMessage. Empty `database` and `application_name` are left out
+// (the server then uses the user name as the database name). The client
+// encoding is always UTF8, which every text value in `std/db` assumes.
+pub fn startup<W>(w: &mut W, user: &[u8], database: &[u8], application_name: &[u8]) -> void!db.Error {
+    check_cstr(user)?
+    check_cstr(database)?
+    check_cstr(application_name)?
+    body := 4 + cstr_len(b"user") + cstr_len(user) + cstr_len(b"client_encoding") + cstr_len(b"UTF8") + 1
+    if database.len != 0 {
+        body += cstr_len(b"database") + cstr_len(database)
+    }
+    if application_name.len != 0 {
+        body += cstr_len(b"application_name") + cstr_len(application_name)
+    }
+    put_u32(w, (body + 4) as u32)?
+    put_i32(w, PROTOCOL_VERSION)?
+    put_cstr(w, b"user")?
+    put_cstr(w, user)?
+    if database.len != 0 {
+        put_cstr(w, b"database")?
+        put_cstr(w, database)?
+    }
+    if application_name.len != 0 {
+        put_cstr(w, b"application_name")?
+        put_cstr(w, application_name)?
+    }
+    put_cstr(w, b"client_encoding")?
+    put_cstr(w, b"UTF8")?
+    put_u8(w, 0)
+}
+
+// SSLRequest: the server answers with one byte, 'S' (start TLS) or 'N'.
+pub fn ssl_request<W>(w: &mut W) -> void!db.Error {
+    put_u32(w, 8)?
+    put_i32(w, SSL_REQUEST_CODE)
+}
+
+// CancelRequest, sent on a new connection with the target's key data.
+pub fn cancel_request<W>(w: &mut W, process_id: i32, secret_key: i32) -> void!db.Error {
+    put_u32(w, 16)?
+    put_i32(w, CANCEL_REQUEST_CODE)?
+    put_i32(w, process_id)?
+    put_i32(w, secret_key)
+}
+
+// PasswordMessage carrying a cleartext or md5 password.
+pub fn password<W>(w: &mut W, secret: &[u8]) -> void!db.Error {
+    check_cstr(secret)?
+    put_header(w, 112, cstr_len(secret))?
+    put_cstr(w, secret)
+}
+
+// SASLInitialResponse.
+pub fn sasl_initial<W>(w: &mut W, mechanism: &[u8], data: &[u8]) -> void!db.Error {
+    check_cstr(mechanism)?
+    put_header(w, 112, cstr_len(mechanism) + 4 + data.len)?
+    put_cstr(w, mechanism)?
+    put_u32(w, data.len as u32)?
+    w.put(data)
+}
+
+// SASLResponse.
+pub fn sasl_response<W>(w: &mut W, data: &[u8]) -> void!db.Error {
+    put_header(w, 112, data.len)?
+    w.put(data)
+}
+
+// Query: one or more statements in the simple query protocol.
+pub fn query<W>(w: &mut W, sql: &[u8]) -> void!db.Error {
+    check_cstr(sql)?
+    put_header(w, 81, cstr_len(sql))?
+    put_cstr(w, sql)
+}
+
+// Parse with every parameter type left for the server to infer.
+pub fn parse<W>(w: &mut W, name: &[u8], sql: &[u8]) -> void!db.Error {
+    check_cstr(name)?
+    check_cstr(sql)?
+    put_header(w, 80, cstr_len(name) + cstr_len(sql) + 2)?
+    put_cstr(w, name)?
+    put_cstr(w, sql)?
+    put_u16(w, 0)
+}
+
+pub fn describe_statement<W>(w: &mut W, name: &[u8]) -> void!db.Error {
+    check_cstr(name)?
+    put_header(w, 68, 1 + cstr_len(name))?
+    put_u8(w, 83)?
+    put_cstr(w, name)
+}
+
+pub fn describe_portal<W>(w: &mut W, name: &[u8]) -> void!db.Error {
+    check_cstr(name)?
+    put_header(w, 68, 1 + cstr_len(name))?
+    put_u8(w, 80)?
+    put_cstr(w, name)
+}
+
+// Execute; max_rows 0 returns every row.
+pub fn execute<W>(w: &mut W, portal: &[u8], max_rows: u32) -> void!db.Error {
+    check_cstr(portal)?
+    put_header(w, 69, cstr_len(portal) + 4)?
+    put_cstr(w, portal)?
+    put_u32(w, max_rows)
+}
+
+pub fn close_statement<W>(w: &mut W, name: &[u8]) -> void!db.Error {
+    check_cstr(name)?
+    put_header(w, 67, 1 + cstr_len(name))?
+    put_u8(w, 83)?
+    put_cstr(w, name)
+}
+
+pub fn sync<W>(w: &mut W) -> void!db.Error {
+    put_header(w, 83, 0)
+}
+
+pub fn flush<W>(w: &mut W) -> void!db.Error {
+    put_header(w, 72, 0)
+}
+
+pub fn terminate<W>(w: &mut W) -> void!db.Error {
+    put_header(w, 88, 0)
+}
+
+// A complete backend message at the start of some received bytes: `tag`, and
+// the body length (the message occupies 5 + body bytes).
+pub struct Frame {
+    pub tag: u8
+    pub body: usize
+}
+
+// The next message in `input`, or none when fewer than five bytes (tag and
+// length) have arrived. The body itself may still be incomplete: compare
+// 5 + body with the bytes available.
+pub fn frame(input: &[u8]) -> Option<Frame>!db.Error {
+    if input.len < 5 {
+        return ok(none)
+    }
+    length := ((input[1] as u32) << 24) | ((input[2] as u32) << 16) | ((input[3] as u32) << 8) | (input[4] as u32)
+    if length < 4 || length > 1073741823u32 {
+        return err(violation())
+    }
+    ok(some(Frame { tag: input[0], body: (length - 4) as usize }))
+}
+
+// A byte range inside a message body.
+pub struct Span {
+    pub start: usize
+    pub end: usize
+
+    pub fn empty() -> Span {
+        Span { start: 0, end: 0 }
+    }
+
+    pub fn len(&self) -> usize {
+        self.end - self.start
+    }
+}
+
+// Sequential reader over a message body. Every read past the end is a
+// Protocol error.
+pub struct Reader {
+    data: &[u8]
+    at: usize
+
+    pub fn new(data: &[u8]) -> Reader from(data) {
+        Reader { data, at: 0 }
+    }
+
+    pub fn position(&self) -> usize {
+        self.at
+    }
+
+    pub fn remaining(&self) -> usize {
+        self.data.len - self.at
+    }
+
+    pub fn u8(&mut self) -> u8!db.Error {
+        if self.at >= self.data.len {
+            return err(violation())
+        }
+        v := self.data[self.at]
+        self.at += 1
+        ok(v)
+    }
+
+    pub fn u16(&mut self) -> u16!db.Error {
+        if self.data.len - self.at < 2 {
+            return err(violation())
+        }
+        v := ((self.data[self.at] as u16) << 8) | (self.data[self.at + 1] as u16)
+        self.at += 2
+        ok(v)
+    }
+
+    pub fn u32(&mut self) -> u32!db.Error {
+        if self.data.len - self.at < 4 {
+            return err(violation())
+        }
+        d := self.data
+        a := self.at
+        v := ((d[a] as u32) << 24) | ((d[a + 1] as u32) << 16) | ((d[a + 2] as u32) << 8) | (d[a + 3] as u32)
+        self.at += 4
+        ok(v)
+    }
+
+    pub fn i32(&mut self) -> i32!db.Error {
+        v := self.u32()?
+        ok(unsigned_bits(v))
+    }
+
+    // A NUL-terminated string; the span excludes the terminator.
+    pub fn cstr(&mut self) -> Span!db.Error {
+        start := self.at
+        for self.at < self.data.len {
+            if self.data[self.at] == 0 {
+                end := self.at
+                self.at += 1
+                return ok(Span { start, end })
+            }
+            self.at += 1
+        }
+        err(violation())
+    }
+
+    pub fn take(&mut self, count: usize) -> Span!db.Error {
+        if self.data.len - self.at < count {
+            return err(violation())
+        }
+        start := self.at
+        self.at += count
+        ok(Span { start, end: self.at })
+    }
+}
+
+pub fn unsigned_bits(value: u32) -> i32 {
+    if value < 2147483648u32 {
+        return value as i32
+    }
+    ((value - 2147483648u32) as i32) - 2147483647 - 1
+}
+
+pub fn span_bytes(body: &[u8], span: &Span) -> &[u8] from(body) {
+    &body[span.start..span.end]
+}
+
+// The request code of an Authentication message.
+pub fn auth_code(body: &[u8]) -> i32!db.Error {
+    r := Reader.new(body)
+    r.i32()
+}
+
+// The SASL mechanisms an AuthenticationSASL message offers include `name`.
+pub fn offers_mechanism(body: &[u8], name: &[u8]) -> bool!db.Error {
+    r := Reader.new(body)
+    r.i32()?
+    for {
+        s := r.cstr()?
+        if s.len() == 0 {
+            return ok(false)
+        }
+        if same(&body[s.start..s.end], name) {
+            return ok(true)
+        }
+    }
+}
+
+pub fn same(a: &[u8], b: &[u8]) -> bool {
+    if a.len != b.len {
+        return false
+    }
+    for i in 0usize..a.len {
+        if a[i] != b[i] {
+            return false
+        }
+    }
+    true
+}
+
+pub fn starts_with(data: &[u8], prefix: &[u8]) -> bool {
+    data.len >= prefix.len && same(&data[..prefix.len], prefix)
+}
+
+// BackendKeyData (protocol 3.0: a 4-byte secret key).
+pub struct KeyData {
+    pub process_id: i32
+    pub secret_key: i32
+}
+
+pub fn key_data(body: &[u8]) -> KeyData!db.Error {
+    r := Reader.new(body)
+    process_id := r.i32()?
+    secret_key := r.i32()?
+    ok(KeyData { process_id, secret_key })
+}
+
+// ParameterStatus: name and value spans.
+pub struct Setting {
+    pub name: Span
+    pub value: Span
+}
+
+pub fn setting(body: &[u8]) -> Setting!db.Error {
+    r := Reader.new(body)
+    name := r.cstr()?
+    value := r.cstr()?
+    ok(Setting { name, value })
+}
+
+// NotificationResponse (LISTEN/NOTIFY).
+pub struct Notification {
+    pub process_id: i32
+    pub channel: Span
+    pub payload: Span
+}
+
+pub fn notification(body: &[u8]) -> Notification!db.Error {
+    r := Reader.new(body)
+    process_id := r.i32()?
+    channel := r.cstr()?
+    payload := r.cstr()?
+    ok(Notification { process_id, channel, payload })
+}
+
+// ReadyForQuery: the transaction status byte.
+pub fn ready_status(body: &[u8]) -> u8!db.Error {
+    if body.len != 1 {
+        return err(violation())
+    }
+    s := body[0]
+    if s != STATUS_IDLE && s != STATUS_TRANSACTION && s != STATUS_FAILED {
+        return err(violation())
+    }
+    ok(s)
+}
+
+// The command tag of a CommandComplete message.
+pub fn command_tag(body: &[u8]) -> Span!db.Error {
+    r := Reader.new(body)
+    r.cstr()
+}
+
+// Rows affected by a command, from its tag: the last number of
+// "INSERT 0 5", "UPDATE 3", "DELETE 1", "SELECT 7", "MERGE 2", "COPY 9",
+// "FETCH 4" or "MOVE 4"; 0 for other commands.
+pub fn affected_rows(tag: &[u8]) -> u64 {
+    if !(starts_with(tag, b"INSERT ") || starts_with(tag, b"UPDATE ") || starts_with(tag, b"DELETE ") ||
+        starts_with(tag, b"SELECT ") || starts_with(tag, b"MERGE ") || starts_with(tag, b"COPY ") ||
+        starts_with(tag, b"FETCH ") || starts_with(tag, b"MOVE ")) {
+        return 0
+    }
+    end := tag.len
+    start := end
+    for start > 0 && tag[start - 1] >= 48 && tag[start - 1] <= 57 {
+        start -= 1
+    }
+    if start == end || end - start > 19 {
+        return 0
+    }
+    v := 0u64
+    for i in start..end {
+        digit := (tag[i] - 48) as u64
+        if v > (18446744073709551615u64 - digit) / 10 {
+            return 0
+        }
+        v = v * 10 + digit
+    }
+    v
+}
+
+// Converts PostgreSQL's 1-based character position in `sql` into a 0-based
+// byte offset, or -1 when it lies outside the text.
+pub fn byte_position(sql: &[u8], position: i32) -> i32 {
+    if position <= 0 {
+        return -1
+    }
+    chars := 1i32
+    for i in 0usize..sql.len {
+        // Count only lead bytes of UTF-8 sequences.
+        if (sql[i] & 192) != 128 {
+            if chars == position {
+                if i > 2147483647usize {
+                    return -1
+                }
+                return i as i32
+            }
+            chars += 1
+        }
+    }
+    -1
+}

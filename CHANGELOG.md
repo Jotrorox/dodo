@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+- New `std/db/postgres`, a PostgreSQL client written in Dodo, with the same
+  API as the SQLite driver (`exec`, `execute`, `select`, `query`, `prepare`,
+  `Rows`, `Row`, `@derive(Row)`) and the `sql.Conn` interface. It speaks
+  protocol 3.0 over `std/net`, with TLS for every libpq `sslmode` (prefer by
+  default, `verify-full` against system or caller-supplied roots), SCRAM-SHA-256,
+  md5 and cleartext passwords, libpq connection URLs, binary transfer of
+  integer, float, bool and bytea values (text for every other type), a
+  per-connection cache of server-side prepared statements that re-prepares
+  after schema changes, PostgreSQL's errors mapped onto `db.ErrorKind` with
+  the SQLSTATE, message, detail and hint kept, timeouts, `postgres.cancel`,
+  and LISTEN/NOTIFY. Like the rest of the library it works in a caller-owned
+  workspace. The wire protocol, SCRAM included, is the portable package
+  `std/db/postgres/protocol`, which imports no sockets, TLS or cryptography
+  backend.
+- New `db.Pool`: a fixed set of caller-owned connections that open on first
+  use, are reset when returned, and can be pinged before reuse; `pool.get()`
+  lends one through a lease, `acquire`/`conn`/`release` several at once.
+- `std/crypto/openssl` adds `pbkdf2_hmac_sha256` and `Md5`/`md5`.
+- `openssl.Config` (TLS) adds `verify`: `Verify.Full` (the default) as
+  before, or the explicit `Verify.Chain` (no name check) and `Verify.None`
+  (no authentication) that PostgreSQL's `verify-ca` and `require` modes need.
 - New board `esp32c6_devkitc`, the Espressif ESP32-C6-DevKitC-1, on the new
   `esp32c6` chip: the first RISC-V firmware target (`riscv32-unknown-none-elf`,
   RV32IMAC). The firmware boots through the boot ROM's direct boot, so the

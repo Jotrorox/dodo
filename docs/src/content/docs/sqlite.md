@@ -16,7 +16,7 @@ Two small packages sit next to it:
 
 | Import | Contents |
 | --- | --- |
-| `std/db` | Shared vocabulary for every database driver: `db.Error` (portable `db.ErrorKind`, `db.Constraint`, and the driver's native code), the borrowed `db.Value`, and `db.IsolationLevel`. |
+| `std/db` | Shared vocabulary for every database driver: `db.Error` (portable `db.ErrorKind`, `db.Constraint`, and the driver's native code), the borrowed `db.Value`, `db.IsolationLevel`, and the connection pool `db.Pool` (see [PostgreSQL](postgres.md#connection-pools)). |
 | `std/db/sql` | Interfaces that every SQL driver matches: `sql.Conn`, `sql.Row`, and `sql.RowSink`, the ready-made sinks `sql.Count` and `sql.ScalarInt`, and the value conversions behind `@derive(Row)`. |
 | `std/db/sqlite` | The SQLite driver: `sqlite.Connection`, prepared statements, row cursors. |
 

@@ -1,0 +1,385 @@
+package postgres
+
+import "std/db"
+import "std/db/postgres/protocol"
+
+// When to use TLS, with libpq's meaning for each `sslmode`.
+pub enum SslMode {
+    // Never use TLS.
+    Disable,
+    // Use TLS when the server supports it, without checking its certificate;
+    // fall back to an unencrypted connection otherwise (libpq's default).
+    Prefer,
+    // Require TLS, without checking the certificate: protects against
+    // eavesdropping, not against an active attacker.
+    Require,
+    // Require TLS and a certificate that chains to a trusted root.
+    VerifyCa,
+    // Require TLS, a trusted certificate, and a certificate name that matches
+    // the host. Use this whenever the network is not trusted.
+    VerifyFull,
+}
+
+// Connection settings. Byte fields borrow the URL or the caller's storage.
+pub struct Config {
+    // Host name or IP address (IPv6 without brackets). Unix-domain sockets
+    // are not supported.
+    pub host: &[u8]
+    pub port: u16
+    pub user: &[u8]
+    // Empty when the server does not ask for a password.
+    pub password: &[u8]
+    // Empty selects the database named like the user.
+    pub database: &[u8]
+    // Shown in pg_stat_activity. Empty leaves it unset.
+    pub application_name: &[u8]
+    pub ssl_mode: SslMode
+    // PEM roots for VerifyCa and VerifyFull; empty uses the system roots.
+    // With Require, roots make the client check the chain (as libpq does
+    // when a root certificate is configured).
+    pub trust_pem: &[u8]
+    // Resolution, connection, TLS handshake and authentication together;
+    // 0 waits forever.
+    pub connect_timeout_ms: u64
+    // Each later wait for the server; 0 waits as long as a query takes.
+    // A statement whose response times out keeps running on the server and
+    // the next request first skips its response; `cancel` stops it.
+    pub timeout_ms: u64
+    // Keep prepared statements on the server, keyed by SQL text, so
+    // repeated statements cost one round trip and use the binary format.
+    // Disable for poolers that do not support named prepared statements
+    // (PgBouncer before 1.21 in transaction mode); every statement then
+    // costs two round trips.
+    pub statement_cache: bool
+
+    pub fn new(host: &[u8], user: &[u8]) -> Config from(host, user) {
+        Config { host, port: protocol.DEFAULT_PORT, user, password: b"", database: b"", application_name: b"",
+        ssl_mode: SslMode.Prefer, trust_pem: b"", connect_timeout_ms: 10000, timeout_ms: 0,
+        statement_cache: true }
+    }
+
+    // Parses a libpq connection URL:
+    //
+    //     postgres://user:password@host:port/database?sslmode=require
+    //
+    // `postgresql://` works too. Percent-escapes in the user, password, host,
+    // database and parameter values are decoded into `storage`, which needs
+    // at most url.len bytes (none when the URL has no escapes). The host
+    // defaults to "localhost" and the port to 5432. Recognized parameters:
+    // sslmode (disable, allow, prefer, require, verify-ca, verify-full),
+    // application_name, connect_timeout (seconds), host, port, user,
+    // password and dbname. Other parameters are ignored, so URLs written for
+    // other tools still work.
+    pub fn parse(url: &[u8], storage: &mut[u8]) -> Config!db.Error from(url, storage) {
+        rest := 0usize
+        if protocol.starts_with(url, b"postgres://") {
+            rest = 11
+        } else if protocol.starts_with(url, b"postgresql://") {
+            rest = 13
+        } else {
+            return err(invalid())
+        }
+        end := url.len
+        query := url.len
+        for i in rest..url.len {
+            if url[i] == b'?' && query == url.len {
+                query = i
+            }
+            if url[i] == b'#' {
+                end = i
+                break
+            }
+        }
+        if query > end {
+            query = end
+        }
+        // Authority runs to the first '/', or to the query.
+        slash := query
+        for i in rest..query {
+            if url[i] == b'/' {
+                slash = i
+                break
+            }
+        }
+        authority := rest
+        at := rest
+        found_at := false
+        for i in rest..slash {
+            if url[i] == b'@' {
+                at = i
+                found_at = true
+            }
+        }
+        used := 0usize
+        user := Part.none()
+        password := Part.none()
+        if found_at {
+            colon := at
+            for i in rest..at {
+                if url[i] == b':' {
+                    colon = i
+                    break
+                }
+            }
+            user = part(url, rest, colon, storage, &mut used)?
+            if colon < at {
+                password = part(url, colon + 1, at, storage, &mut used)?
+            }
+            authority = at + 1
+        }
+        host := Part.none()
+        port := protocol.DEFAULT_PORT
+        if authority < slash {
+            host_end := slash
+            port_start := slash
+            if url[authority] == b'[' {
+                close := authority
+                for i in authority..slash {
+                    if url[i] == b']' {
+                        close = i
+                        break
+                    }
+                }
+                if close == authority {
+                    return err(invalid())
+                }
+                host = Part { stored: false, start: authority + 1, end: close }
+                if close + 1 < slash {
+                    if url[close + 1] != b':' {
+                        return err(invalid())
+                    }
+                    port_start = close + 2
+                }
+            } else {
+                for i in authority..slash {
+                    if url[i] == b':' {
+                        host_end = i
+                        port_start = i + 1
+                        break
+                    }
+                }
+                host = part(url, authority, host_end, storage, &mut used)?
+                if host_end == authority {
+                    host = Part.none()
+                }
+            }
+            if port_start < slash {
+                port = parse_port(&url[port_start..slash])?
+            } else if port_start == slash && host_end < slash {
+                return err(invalid())
+            }
+        }
+        database := Part.none()
+        if slash < query && slash + 1 < query {
+            database = part(url, slash + 1, query, storage, &mut used)?
+        }
+        application_name := Part.none()
+        mode := 1u8
+        connect_timeout_ms := 10000u64
+        at_param := query + 1
+        for at_param < end {
+            amp := end
+            for i in at_param..end {
+                if url[i] == b'&' {
+                    amp = i
+                    break
+                }
+            }
+            eq := amp
+            for i in at_param..amp {
+                if url[i] == b'=' {
+                    eq = i
+                    break
+                }
+            }
+            if eq < amp {
+                key := &url[at_param..eq]
+                value_start := eq + 1
+                if protocol.same(key, b"sslmode") {
+                    mode = parse_mode(&url[value_start..amp])?
+                } else if protocol.same(key, b"application_name") {
+                    application_name = part(url, value_start, amp, storage, &mut used)?
+                } else if protocol.same(key, b"connect_timeout") {
+                    // 0 waits forever, as in libpq.
+                    connect_timeout_ms = parse_number(&url[value_start..amp])? * 1000
+                } else if protocol.same(key, b"host") {
+                    if value_start < amp && (url[value_start] == b'/' || url[value_start] == b'%') {
+                        return err(db.Error.new(db.ErrorKind.Unsupported, 0))
+                    }
+                    host = part(url, value_start, amp, storage, &mut used)?
+                } else if protocol.same(key, b"port") {
+                    port = parse_port(&url[value_start..amp])?
+                } else if protocol.same(key, b"user") {
+                    user = part(url, value_start, amp, storage, &mut used)?
+                } else if protocol.same(key, b"password") {
+                    password = part(url, value_start, amp, storage, &mut used)?
+                } else if protocol.same(key, b"dbname") {
+                    database = part(url, value_start, amp, storage, &mut used)?
+                }
+            }
+            at_param = amp + 1
+        }
+        view: &[u8] = storage
+        result := Config.new(b"localhost", pick(url, view, &user))
+        if host.end > host.start {
+            result.host = pick(url, view, &host)
+        }
+        result.port = port
+        result.password = pick(url, view, &password)
+        result.database = pick(url, view, &database)
+        result.application_name = pick(url, view, &application_name)
+        result.ssl_mode = mode_of(mode)
+        result.connect_timeout_ms = connect_timeout_ms
+        ok(result)
+    }
+
+    // A copy borrowing the same bytes, for example one per pool slot.
+    pub fn clone(&self) -> Config from(self) {
+        Config { host: self.host, port: self.port, user: self.user, password: self.password,
+        database: self.database, application_name: self.application_name,
+        ssl_mode: mode_of(mode_number(&self.ssl_mode)), trust_pem: self.trust_pem,
+        connect_timeout_ms: self.connect_timeout_ms, timeout_ms: self.timeout_ms,
+        statement_cache: self.statement_cache }
+    }
+}
+
+fn invalid() -> db.Error {
+    db.Error.new(db.ErrorKind.Misuse, 0)
+}
+
+// A URL component: url[start..end], or storage[start..end] once decoded.
+struct Part {
+    stored: bool
+    start: usize
+    end: usize
+
+    fn none() -> Part {
+        Part { stored: false, start: 0, end: 0 }
+    }
+}
+
+fn pick(url: &[u8], view: &[u8], p: &Part) -> &[u8] from(url, view) {
+    if p.stored {
+        return &view[p.start..p.end]
+    }
+    &url[p.start..p.end]
+}
+
+fn hex(c: u8) -> i32 {
+    if c >= 48 && c <= 57 {
+        return (c - 48) as i32
+    }
+    if c >= 65 && c <= 70 {
+        return (c - 55) as i32
+    }
+    if c >= 97 && c <= 102 {
+        return (c - 87) as i32
+    }
+    -1
+}
+
+fn part(url: &[u8], start: usize, end: usize, storage: &mut[u8], used: &mut usize) -> Part!db.Error {
+    escaped := false
+    for i in start..end {
+        if url[i] == b'%' {
+            escaped = true
+        }
+    }
+    if !escaped {
+        return ok(Part { stored: false, start, end })
+    }
+    first := *used
+    i := start
+    for i < end {
+        c := url[i]
+        if c == b'%' {
+            if i + 2 >= end {
+                return err(invalid())
+            }
+            high := hex(url[i + 1])
+            low := hex(url[i + 2])
+            if high < 0 || low < 0 {
+                return err(invalid())
+            }
+            c = (high * 16 + low) as u8
+            i += 3
+        } else {
+            i += 1
+        }
+        if *used >= storage.len {
+            return err(db.Error.new(db.ErrorKind.Capacity, 0))
+        }
+        storage[*used] = c
+        *used = *used + 1
+    }
+    ok(Part { stored: true, start: first, end: *used })
+}
+
+fn parse_number(text: &[u8]) -> u64!db.Error {
+    if text.len == 0 || text.len > 9 {
+        return err(invalid())
+    }
+    v := 0u64
+    for i in 0usize..text.len {
+        if text[i] < 48 || text[i] > 57 {
+            return err(invalid())
+        }
+        v = v * 10 + (text[i] - 48) as u64
+    }
+    ok(v)
+}
+
+fn parse_port(text: &[u8]) -> u16!db.Error {
+    v := parse_number(text)?
+    if v == 0 || v > 65535 {
+        return err(invalid())
+    }
+    ok(v as u16)
+}
+
+fn parse_mode(text: &[u8]) -> u8!db.Error {
+    if protocol.same(text, b"disable") {
+        return ok(0)
+    }
+    // "allow" tries without TLS first; connecting with TLS when offered is
+    // at least as safe, so it behaves like prefer.
+    if protocol.same(text, b"allow") || protocol.same(text, b"prefer") {
+        return ok(1)
+    }
+    if protocol.same(text, b"require") {
+        return ok(2)
+    }
+    if protocol.same(text, b"verify-ca") {
+        return ok(3)
+    }
+    if protocol.same(text, b"verify-full") {
+        return ok(4)
+    }
+    err(invalid())
+}
+
+fn mode_of(number: u8) -> SslMode {
+    if number == 0 {
+        return SslMode.Disable
+    }
+    if number == 2 {
+        return SslMode.Require
+    }
+    if number == 3 {
+        return SslMode.VerifyCa
+    }
+    if number == 4 {
+        return SslMode.VerifyFull
+    }
+    SslMode.Prefer
+}
+
+fn mode_number(mode: &SslMode) -> u8 {
+    match mode {
+        SslMode.Disable => 0,
+        SslMode.Prefer => 1,
+        SslMode.Require => 2,
+        SslMode.VerifyCa => 3,
+        SslMode.VerifyFull => 4,
+    }
+}
