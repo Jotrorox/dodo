@@ -1,0 +1,264 @@
+package main
+
+import "std/embedded/chip/rp_power"
+import "std/embedded/hal"
+import "std/embedded/hal/fake"
+import "std/embedded/power"
+
+// std/embedded/power on the host: wake sets, the portable helpers over
+// hal/fake's Power, and the RP2040 and RP2350's shared clock-gating and
+// dormant code against simulated register blocks.
+
+const UART: power.Clocks = (1 << 38) | (1 << 39)
+const SPI: power.Clocks = (1 << 24) | (1 << 25)
+const TIMER: power.Clocks = 1 << 37
+const ESSENTIAL: power.Clocks = (1 << 0) | (1 << 4)
+
+// A register block with atomic aliases, as on the RP chips: writes at
+// 0x1000, 0x2000, and 0x3000 above a register XOR, set, and clear its
+// bits. It records the last writes, in order, and can hold one register
+// at a fixed value, as a status register the hardware drives.
+struct Block {
+    words: [256]u32
+    offsets: [16]usize
+    values: [16]u32
+    writes: usize
+    fixed_offset: usize
+    fixed_value: u32
+
+    fn new() -> Block {
+        return Block { words: [0u32; 256], offsets: [0usize; 16], values: [0u32; 16], writes: 0, fixed_offset: 0xFFFF, fixed_value: 0 }
+    }
+
+    // Reads of `offset` return `value` whatever was written.
+    fn fix(&mut self, offset: usize, value: u32) {
+        self.fixed_offset = offset
+        self.fixed_value = value
+    }
+
+    fn word(&self, offset: usize) -> u32 {
+        return self.words[offset / 4]
+    }
+
+    // The offset and value of write `index`, counting from the first.
+    fn written(&self, index: usize) -> usize {
+        return self.offsets[index]
+    }
+
+    fn written_value(&self, index: usize) -> u32 {
+        return self.values[index]
+    }
+
+    pub fn read(&mut self, offset: usize) -> u32 {
+        if offset == self.fixed_offset {
+            return self.fixed_value
+        }
+        return self.words[(offset & 0xFFF) / 4]
+    }
+
+    pub fn write(&mut self, offset: usize, value: u32) {
+        if self.writes < 16 {
+            self.offsets[self.writes] = offset
+            self.values[self.writes] = value
+        }
+        self.writes += 1
+        index := (offset & 0xFFF) / 4
+        alias := offset & 0x3000
+        if alias == 0x1000 {
+            self.words[index] ^= value
+        } else if alias == 0x2000 {
+            self.words[index] |= value
+        } else if alias == 0x3000 {
+            self.words[index] &= ~value
+        } else {
+            self.words[index] = value
+        }
+    }
+}
+
+fn layout() -> rp_power.Layout {
+    return rp_power.Layout {
+        wake_en: 0xA0,
+        sleep_en: 0xA8,
+        rosc_status: 0x18,
+        dormant_wake_inte: 0x160,
+        dormant_wake_ints: 0x180,
+        pin_count: 30,
+    }
+}
+
+fn wake_sets() {
+    wake := power.Wake.new()
+    core.assert(wake.is_empty() && wake.pins() == 0 && wake.events(3) == 0)
+    wake.on(3, power.FALLING_EDGE)
+    wake.on(3, power.LEVEL_HIGH)
+    wake.on(63, power.RISING_EDGE)
+    core.assert(wake.events(3) == (power.FALLING_EDGE | power.LEVEL_HIGH))
+    core.assert(wake.events(63) == power.RISING_EDGE && wake.events(64) == 0)
+    core.assert(wake.pins() == ((1u64 << 3) | (1u64 << 63)) && !wake.is_empty())
+    wake.forget(3)
+    core.assert(wake.events(3) == 0 && wake.pins() == 1u64 << 63)
+
+    core.assert(power.count(power.NO_CLOCKS) == 0)
+    core.assert(power.count(UART | SPI | TIMER) == 5)
+    core.assert(power.count(0xFFFF_FFFF_FFFF_FFFFu64) == 64)
+}
+
+// Code written once against the protocol, as an application's idle task.
+fn quiet<P: power.Power>(chip: &mut P, keep: power.Clocks) -> power.Clocks {
+    stopped := chip.disable_unused_clocks()
+    chip.set_sleep_clocks(keep)
+    chip.set_mode(power.Mode.DeepSleep)
+    chip.sleep()
+    return stopped
+}
+
+fn expect_error(result: void!hal.Error, expected: hal.Error) {
+    match result {
+        ok() => core.assert(false),
+        err(error) => core.assert(error == expected),
+    }
+}
+
+fn fake_power() {
+    chip := fake.Power.new(ESSENTIAL, UART | SPI)
+    core.assert(chip.mode() == power.Mode.Sleep)
+    core.assert(chip.enabled_clocks() == 0xFFFF_FFFF_FFFF_FFFFu64)
+    core.assert(chip.sleep_clocks() == 0xFFFF_FFFF_FFFF_FFFFu64)
+
+    // A claimed peripheral keeps its clocks; essential ones never stop.
+    chip.claim(SPI)
+    expect_error(chip.disable_clocks(ESSENTIAL | TIMER), hal.Error.InvalidInput)
+    expect_error(chip.disable_clocks(SPI), hal.Error.Busy)
+    core.assert(chip.enabled_clocks() == 0xFFFF_FFFF_FFFF_FFFFu64)
+    stopped := quiet(&mut chip, TIMER)
+    core.assert(stopped == UART)
+    core.assert(chip.enabled_clocks() == ~UART)
+    core.assert(chip.sleep_clocks() == TIMER)
+    core.assert(chip.mode() == power.Mode.DeepSleep && chip.deep_sleeps() == 1 && chip.light_sleeps() == 0)
+    // Nothing more is unused; claiming starts clocks again.
+    core.assert(chip.disable_unused_clocks() == power.NO_CLOCKS)
+    chip.claim(UART)
+    core.assert((chip.enabled_clocks() & UART) == UART)
+    chip.release(UART | SPI)
+    core.assert(chip.claimed() == power.NO_CLOCKS)
+    chip.disable_clocks(TIMER)!
+    core.assert((chip.enabled_clocks() & TIMER) == 0)
+    chip.enable_clocks(TIMER)
+    core.assert((chip.enabled_clocks() & TIMER) == TIMER)
+
+    // deep_sleep restores the light mode and the sleep set.
+    chip.set_mode(power.Mode.Sleep)
+    chip.set_sleep_clocks(UART)
+    power.deep_sleep(&mut chip, TIMER)
+    core.assert(chip.mode() == power.Mode.Sleep && chip.sleep_clocks() == UART)
+    core.assert(chip.deep_sleeps() == 2)
+    chip.sleep()
+    core.assert(chip.light_sleeps() == 1)
+
+    // Dormant: only the pins it waits for wake it.
+    wake := power.Wake.new()
+    match chip.dormant(&wake) {
+        ok(_) => core.assert(false),
+        err(error) => core.assert(error == hal.Error.InvalidInput),
+    }
+    chip.wake_next_dormant((1u64 << 7) | (1u64 << 9))
+    woken := power.dormant_until(&mut chip, 7, power.FALLING_EDGE)!
+    core.assert(woken == 1u64 << 7)
+    core.assert(chip.dormant_states() == 1 && chip.requested_events(7) == power.FALLING_EDGE && chip.requested_events(9) == 0)
+    wake.on(9, power.LEVEL_LOW)
+    wake.on(12, power.RISING_EDGE)
+    chip.wake_next_dormant((1u64 << 9) | (1u64 << 12))
+    woken = chip.dormant(&wake)!
+    core.assert(woken == ((1u64 << 9) | (1u64 << 12)) && chip.requested_events(7) == 0)
+}
+
+fn rp_clock_registers() {
+    clocks := Block.new()
+    rp_power.write_clocks(&mut clocks, 0xA0, 0x7FFF_FFFF_FFFF)
+    core.assert(clocks.word(0xA0) == 0xFFFF_FFFF && clocks.word(0xA4) == 0x7FFF)
+    core.assert(rp_power.read_clocks(&mut clocks, 0xA0) == 0x7FFF_FFFF_FFFF)
+
+    // The aliases change only the named bits, and skip a word with none.
+    writes := clocks.writes
+    rp_power.clear_clocks(&mut clocks, 0xA0, UART)
+    core.assert(clocks.writes == writes + 1 && clocks.written(writes) == 0xA4 + 0x3000)
+    core.assert(rp_power.read_clocks(&mut clocks, 0xA0) == (0x7FFF_FFFF_FFFF & ~UART))
+    rp_power.clear_clocks(&mut clocks, 0xA0, SPI | UART)
+    core.assert(clocks.writes == writes + 3)
+    rp_power.set_clocks(&mut clocks, 0xA0, UART)
+    core.assert(rp_power.read_clocks(&mut clocks, 0xA0) == (0x7FFF_FFFF_FFFF & ~SPI))
+    rp_power.set_clocks(&mut clocks, 0xA0, power.NO_CLOCKS)
+    core.assert(clocks.writes == writes + 4)
+}
+
+fn rp_wake_registers() {
+    io := Block.new()
+    plan := layout()
+    wake := power.Wake.new()
+    expect_error(rp_power.check_wake(&wake, 30), hal.Error.InvalidInput)
+    wake.on(30, power.LEVEL_LOW)
+    expect_error(rp_power.check_wake(&wake, 30), hal.Error.InvalidInput)
+    rp_power.check_wake(&wake, 48)!
+    wake.forget(30)
+    wake.on(0, power.LEVEL_LOW)
+    wake.on(7, power.RISING_EDGE)
+    wake.on(9, power.FALLING_EDGE | power.LEVEL_HIGH)
+    wake.on(29, power.RISING_EDGE)
+    rp_power.check_wake(&wake, 30)!
+
+    // Four bits per pin, eight pins per register, through the set alias;
+    // a pin of another register's bits survive.
+    io.write(0x164, 0x0000_0001)
+    rp_power.arm_wake(&mut io, &plan, &wake)
+    core.assert(io.word(0x160) == 0x8000_0001)
+    core.assert(io.word(0x164) == 0x0000_0061)
+    core.assert(io.word(0x168) == 0)
+    core.assert(io.word(0x16C) == 0x0080_0000)
+
+    // What woke the chip: only the events armed count.
+    io.write(0x180, 0x8000_0002)
+    io.write(0x184, 0x0000_0040)
+    core.assert(rp_power.woken_pins(&mut io, &plan, &wake) == ((1u64 << 7) | (1u64 << 9)))
+
+    rp_power.disarm_wake(&mut io, &plan, &wake)
+    core.assert(io.word(0x160) == 0 && io.word(0x164) == 0x0000_0001 && io.word(0x16C) == 0)
+}
+
+fn rp_oscillators() {
+    plan := layout()
+    xosc := Block.new()
+    xosc.fix(0x04, 1u32 << 31)
+    rosc := Block.new()
+    rosc.write(0x00, (0xFABu32 << 12) | 0xAA0)
+    rosc.fix(0x18, 1u32 << 12)
+    // SAFETY: simulated registers.
+    unsafe {
+        rp_power.stop_oscillators(&mut xosc, &mut rosc, &plan)!
+    }
+    // The ring oscillator stops first, keeping its range, and starts
+    // again after the crystal; the crystal gets the dormant word.
+    core.assert(rosc.writes == 3)
+    core.assert(rosc.written_value(1) == ((0xD1Eu32 << 12) | 0xAA0))
+    core.assert(rosc.written_value(2) == ((0xFABu32 << 12) | 0xAA0))
+    core.assert(xosc.writes == 1 && xosc.written(0) == 0x08 && xosc.written_value(0) == 0x636F_6D61)
+
+    // A ring oscillator that was off stays off; a crystal that does not
+    // restart is reported.
+    quiet_xosc := Block.new()
+    off := Block.new()
+    // SAFETY: simulated registers.
+    result := unsafe {
+        rp_power.stop_oscillators(&mut quiet_xosc, &mut off, &plan)
+    }
+    expect_error(result, hal.Error.Timeout)
+    core.assert(off.writes == 0 && quiet_xosc.writes == 1)
+}
+
+fn main() {
+    wake_sets()
+    fake_power()
+    rp_clock_registers()
+    rp_wake_registers()
+    rp_oscillators()
+}
