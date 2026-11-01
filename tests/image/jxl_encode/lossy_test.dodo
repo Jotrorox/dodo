@@ -4,6 +4,7 @@ import "core/bytes"
 import "core/mem"
 import "std/env"
 import "std/fs"
+import "std/image/color"
 import "std/image/convert"
 import "std/image/jxl"
 import "std/image/jxl/encode"
@@ -535,4 +536,48 @@ fn quality_maps_to_distance_like_cjxl() {
     // Lossless stays the default.
     options := encode.EncodeOptions.new()
     assert(options.lossless, "lossless by default")
+}
+
+// The scene with `info` as the color description: the decoder converts
+// XYB back to that space, so the samples must come back close.
+fn color_round_trip(name: &str, layout: pixels.Layout, info: color.ColorInfo) -> f64 {
+    data := unsafe {
+        &mut LPIXELS
+    }
+    w := 48u32
+    h := 32u32
+    make_scene(&mut data[..], w, h, &layout)
+    view := pixels.View.new(&data[..], w, h, layout)!
+    options := encode.EncodeOptions.lossy(1.0)
+    options.color = info
+    output := unsafe {
+        &mut LOUTPUT
+    }
+    n := lossy_encode(&view, &options, &mut output[..])
+    return lossy_psnr(&output[..n], &view, name)
+}
+
+@test
+fn color_encodings_round_trip() {
+    p3 := color.ColorInfo.srgb()
+    p3.primaries = color.PRIMARIES_DISPLAY_P3
+    assert(color_round_trip("p3", pixels.Layout.rgb8(), p3) > 34.0, "Display P3")
+    linear := color.ColorInfo.linear()
+    assert(color_round_trip("linear", pixels.Layout.rgb16(), linear) > 30.0, "linear")
+    pq := color.ColorInfo.srgb()
+    pq.primaries = color.PRIMARIES_BT2020
+    pq.transfer = color.TRANSFER_PQ
+    // A few saturated pixels (one channel near 5 nits, the others near 250)
+    // clip at zero after coding: XYB scales linear light like libjxl.
+    assert(color_round_trip("pq", pixels.Layout.rgb16(), pq) > 26.0, "BT.2020 PQ")
+    hlg := color.ColorInfo.srgb()
+    hlg.transfer = color.TRANSFER_HLG
+    assert(color_round_trip("hlg", pixels.Layout.rgb16(), hlg) > 30.0, "HLG")
+    gamma := color.ColorInfo.srgb()
+    gamma.transfer = color.TRANSFER_UNSPECIFIED
+    gamma.gamma = 45455
+    assert(color_round_trip("gamma", pixels.Layout.from_codes(2, pixels.SAMPLE_U8, false), gamma) > 34.0, "gray gamma 2.2")
+    bt709 := color.ColorInfo.srgb()
+    bt709.transfer = color.TRANSFER_BT709
+    assert(color_round_trip("bt709", pixels.Layout.rgba8(), bt709) > 34.0, "BT.709")
 }
