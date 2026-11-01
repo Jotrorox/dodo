@@ -1,3 +1,22 @@
+diff --git a/src/bus/mod.rs b/src/bus/mod.rs
+index 1fb8caf..61979b7 100644
+--- a/src/bus/mod.rs
++++ b/src/bus/mod.rs
+@@ -570,6 +570,14 @@ pub struct Bus {
+ }
+ 
+ impl Bus {
++    /// IO_QSPI PROC0_INTF or PROC1_INTF (offsets 0x220 and 0x22C) is
++    /// nonzero, forcing the secure IO_IRQ_QSPI on that core (RP2350
++    /// datasheet 9.11.2). The registers live in the catch-all store.
++    pub(crate) fn io_qspi_forced(&self, core: usize) -> bool {
++        let address = 0x4003_0220 + 12 * core as u32;
++        self.peripheral_regs.get(&address).is_some_and(|&value| value != 0)
++    }
++
+     /// Construct a stand-alone `Bus` with its own `CoreAtomics`. The
+     /// returned atomics are not shared with any `CortexM33`; callers
+     /// that build an `Emulator` should use [`Bus::with_atomics`] to
 diff --git a/src/bus/ppb.rs b/src/bus/ppb.rs
 index b3dc7c8..e594116 100644
 --- a/src/bus/ppb.rs
@@ -170,7 +189,7 @@ index d7861a3..09be371 100644
                  bus.emit_mmio_trace('R', 4, addr, val, self.core_id);
              }
 diff --git a/src/lib.rs b/src/lib.rs
-index 5c10c34..bd1abb2 100644
+index 5c10c34..4de5e6d 100644
 --- a/src/lib.rs
 +++ b/src/lib.rs
 @@ -749,6 +749,33 @@ impl Emulator {
@@ -207,7 +226,7 @@ index 5c10c34..bd1abb2 100644
          // Drain bootrom-hook latches into `shutdown_requested` (HLD V5
          // §"Component 3"). The hook check inside
          // `CortexM33::step{,_no_atomics}` halts the core and sets
-@@ -773,6 +800,12 @@ impl Emulator {
+@@ -773,6 +800,17 @@ impl Emulator {
          // the ARMv8-M dual-core contention model is disabled here
          // (CLAUDE.md "Bank contention model").
          self.tick_peripherals(self.step_quantum);
@@ -216,11 +235,16 @@ index 5c10c34..bd1abb2 100644
 +            if self.bus.sio.fifo_irq_level(core) {
 +                self.bus.assert_irq_core(core, crate::irq::IRQ_SIO_IRQ_FIFO);
 +            }
++            // IO_IRQ_QSPI, raised on the core whose PROCn_INTF forces it;
++            // QSPI pin events are not modelled.
++            if self.bus.io_qspi_forced(core) {
++                self.bus.assert_irq_core(core, crate::irq::IRQ_IO_IRQ_QSPI);
++            }
 +        }
          // RISC-V has no SysTick — the SysTick block lives on the M33 PPB.
          if self.cores.is_arm() {
              self.tick_systick();
-@@ -1155,7 +1188,7 @@ impl Emulator {
+@@ -1155,7 +1193,7 @@ impl Emulator {
                      // merge via `take_irq_pending`.
                      if self.bus.atomics.is_halted(i) {
                          let pending = self.bus.atomics.irq_pending_load(i);
