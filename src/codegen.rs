@@ -32,16 +32,32 @@ mod panic;
 use debug::{DebugInfo, SourceMap};
 
 /// Compile LLVM IR text, such as a board runtime, to an object file for the
-/// target in `options`. Only code generation runs, never the IR optimization
-/// pipeline, so hand-written runtime helpers are not rewritten into calls to
-/// the library functions they implement.
+/// target in `options`. The runtime carries no debug information and its
+/// helpers sit on hot paths (software floating point, 64-bit arithmetic), so
+/// it is always fully optimized, whatever the program's optimization level.
+/// Every function gets "no-builtins" first, so that the optimizer never
+/// rewrites a helper into a call to the library function it implements,
+/// such as memset's loop into a call to memset.
 pub fn compile_ir_object(options: &Options, name: &str, text: &str, path: &Path) -> Result<()> {
     let context = Context::create();
     let module = Module::parse_ir(&context, name, text)?;
-    let machine = target_machine(options)?;
+    let options = Options {
+        optimization: 3,
+        ..options.clone()
+    };
+    let machine = target_machine(&options)?;
     module.set_triple(&machine.get_triple());
     module.set_data_layout(&machine.get_target_data().get_data_layout());
     module.verify()?;
+    for function in module.functions() {
+        if function.count_basic_blocks() != 0 {
+            function.add_attribute(
+                AttributeLoc::Function,
+                context.create_string_attribute("no-builtins", ""),
+            );
+        }
+    }
+    module.run_passes("default<O3>", &machine)?;
     function_sections(&module);
     machine.write_to_file(&module, FileType::Object, path)
 }
