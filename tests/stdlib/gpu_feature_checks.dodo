@@ -113,6 +113,12 @@ fn shaders() -> gpu.ShaderSource from(static) {
         "    return vec4<f32>(lit, lit, lit, 1.0);",
         "}",
         "",
+        "@fragment",
+        "fn shadow_border_fragment(in: ScreenOut) -> @location(0) vec4<f32> {",
+        "    let lit = textureSampleCompare(shadow, shadow_sampler, in.uv - vec2<f32>(1.0, 0.0), 0.5);",
+        "    return vec4<f32>(lit, lit, lit, 1.0);",
+        "}",
+        "",
         "@group(0) @binding(3) var<uniform> paint: vec4<f32>;",
         "",
         "@fragment",
@@ -364,7 +370,8 @@ fn left_quad(device: &gpu.Device) -> gpu.Buffer!gpu.Error from(device) {
 
 // A shadow map drawn by a depth-only pass, then read through a comparison
 // sampler: where the map is nearer than the reference 0.5, the comparison
-// fails.
+// fails. Left of the map, where its edge is near, the sampler reads its
+// opaque white border instead, so the comparison passes.
 fn check_shadow(device: &gpu.Device) -> void!gpu.Error {
     source := shaders()
     depth_only := gpu.RenderPipelineDescriptor.depth_only(&source, "position_vertex", gpu.FORMAT_DEPTH32_FLOAT)
@@ -381,7 +388,11 @@ fn check_shadow(device: &gpu.Device) -> void!gpu.Error {
     descriptor := gpu.RenderPipelineDescriptor.new(&source, "screen_vertex", &source, "shadow_fragment", gpu.FORMAT_RGBA8_UNORM)
     descriptor.bindings = &bindings
     reader := device.create_render_pipeline(descriptor)?
+    border_descriptor := gpu.RenderPipelineDescriptor.new(&source, "screen_vertex", &source, "shadow_border_fragment", gpu.FORMAT_RGBA8_UNORM)
+    border_descriptor.bindings = &bindings
+    border_reader := device.create_render_pipeline(border_descriptor)?
     target := device.create_texture(gpu.TextureDescriptor.new(16, 16, gpu.FORMAT_RGBA8_UNORM, gpu.TEXTURE_RENDER | gpu.TEXTURE_COPY_SRC))?
+    border_target := device.create_texture(gpu.TextureDescriptor.new(16, 16, gpu.FORMAT_RGBA8_UNORM, gpu.TEXTURE_RENDER | gpu.TEXTURE_COPY_SRC))?
     encoder := device.encoder()?
     {
         pass := encoder.depth_pass(gpu.DepthAttachment.clear(&map, 1.0))
@@ -395,12 +406,21 @@ fn check_shadow(device: &gpu.Device) -> void!gpu.Error {
         pass.set_texture(2, &map, &comparison)
         pass.draw(3, 1, 0, 0)
     }
+    {
+        pass := encoder.render_pass(gpu.ColorAttachment.clear(&border_target, 1.0, 0.0, 0.0, 1.0))
+        pass.set_pipeline(&border_reader)
+        pass.set_texture(2, &map, &comparison)
+        pass.draw(3, 1, 0, 0)
+    }
     encoder.submit()?
     pixels := [0u8; 1024]
     device.read_texture(&target, target.region(), &mut pixels, 64)?
     expect_pixel(&pixels, 16, 3, 8, BLACK)
     expect_pixel(&pixels, 16, 12, 8, WHITE)
     expect_pixel(&pixels, 16, 12, 1, WHITE)
+    device.read_texture(&border_target, border_target.region(), &mut pixels, 64)?
+    expect_pixel(&pixels, 16, 3, 8, WHITE)
+    expect_pixel(&pixels, 16, 12, 8, WHITE)
     return ok()
 }
 
