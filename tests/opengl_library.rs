@@ -49,6 +49,7 @@ fn opengl_builds_for_every_hosted_target() {
     for source in [
         "tests/gpu/opengl_checks.dodo",
         "tests/gpu/opengl_window_checks.dodo",
+        "tests/gpu/opengl_interleave_checks.dodo",
         "examples/opengl_window.dodo",
     ] {
         let source = root().join(source);
@@ -222,6 +223,45 @@ fn triangle_renders_and_reads_back() {
         if let Some(reason) = stdout.strip_prefix("unavailable\n") {
             assert!(!required, "OpenGL is required but unavailable: {reason}");
             eprintln!("skipping: no OpenGL 3.3 ({})", reason.trim());
+            return;
+        }
+        assert!(stdout.ends_with("passed\n"), "{stdout}");
+    }
+}
+
+/// std/gpu's OpenGL backend with two encoders' render passes recorded in
+/// turn and a second device's context interrupting a pass: every draw must
+/// set again the state the other pass or context changed. Needs OpenGL 4.5,
+/// so it is skipped on macOS and wherever the checks report "unavailable".
+#[test]
+fn interleaved_passes_keep_their_state() {
+    let required = std::env::var_os("DODO_REQUIRE_OPENGL_TESTS").is_some();
+    let scratch = Scratch::new("interleave");
+    for optimization in ["0", "2"] {
+        let executable = scratch.0.join(format!(
+            "interleave-O{optimization}{}",
+            std::env::consts::EXE_SUFFIX
+        ));
+        let source = root().join("tests/gpu/opengl_interleave_checks.dodo");
+        success(
+            &dodo(
+                &["build", source.to_str().unwrap(), "-O", optimization, "-o"],
+                &executable,
+            ),
+            &format!("compile the OpenGL interleave checks -O{optimization}"),
+        );
+        let output = Command::new(&executable).output().unwrap();
+        success(
+            &output,
+            &format!("execute the OpenGL interleave checks -O{optimization}"),
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if let Some(reason) = stdout.strip_prefix("unavailable ") {
+            assert!(
+                !required || cfg!(target_os = "macos"),
+                "OpenGL 4.5 is required but unavailable: {reason}"
+            );
+            eprintln!("skipping: no OpenGL 4.5 ({})", reason.trim());
             return;
         }
         assert!(stdout.ends_with("passed\n"), "{stdout}");

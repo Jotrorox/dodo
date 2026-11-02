@@ -1,5 +1,6 @@
 package macos
 
+import "core/bytes"
 import "core/mem"
 import "core/ptr"
 import "std/gpu/hal"
@@ -20,29 +21,46 @@ import "std/window/handle"
 //                     d = depth bias slope scale (f32 bits) | clamp (f32
 //                     bits) << 32
 //   encoder           a = MTLCommandBuffer, b = the open encoder or 0,
-//                     c = its kind (ENCODER_*)
+//                     c = its kind (ENCODER_*), d = FAILED once Metal
+//                     could not make an encoder: later commands do
+//                     nothing and submit() fails
 //   surface           a = CAMetalLayer, b = the acquired CAMetalDrawable
 //                     or 0, c = the format of its drawables
 //   surface image     a = the drawable's MTLTexture, not retained: the
 //                     drawable keeps it alive
 //
-// Command buffers retain what their commands use, so Metal itself keeps
-// objects alive on the GPU; std/gpu's own tracking still delays their
-// release, which costs nothing here. Each submission signals a shared
-// event with its number, which completed() reads. Buffers use shared
-// storage, which the CPU maps, so std/gpu's staged writes and reads need
-// no extra copies; resources track their own hazards, so barrier() does
+// Command buffers retain what their commands use, and Metal keeps a
+// committed command buffer until it has run, so tracks_resources() is
+// true: std/gpu releases encoders at submit and dropped objects as soon as
+// no encoder records. Each submission signals a shared event with its
+// number, which completed() reads. Buffers use shared storage, which the
+// CPU maps, so std/gpu writes and reads them directly when the GPU is not
+// using them; resources track their own hazards, so barrier() does
 // nothing.
+//
+// Commands use the objects in handles without retaining them (Borrowed):
+// the handle's reference keeps each alive, so recording a draw costs no
+// reference counting.
 
 const ENCODER_NONE: u64 = 0
 const ENCODER_COMPUTE: u64 = 1
 const ENCODER_RENDER: u64 = 2
 const ENCODER_BLIT: u64 = 3
+const FAILED: u64 = 1
+
+// Compiled libraries kept for pipelines made from the same source.
+const LIBRARIES: usize = 16
 
 struct State {
     submitted: u64
     // The last committed command buffer, retained, or 0.
     last: u64
+    // The library cache: a malloc'd copy of each source, its length and
+    // the retained MTLLibrary; `next` is the entry replaced next.
+    sources: [16]usize
+    lengths: [16]usize
+    libraries: [16]u64
+    next: usize
 }
 
 pub struct Device: hal.Backend {
@@ -50,7 +68,7 @@ pub struct Device: hal.Backend {
     queue: metal.CommandQueue
     event: metal.SharedEvent
     options: metal.CompileOptions
-    state: State
+    state: hal.Mutable<State>
 
     pub fn open(debug: bool) -> Device!hal.Error {
         pool := objc.AutoreleasePool.new()
@@ -64,7 +82,8 @@ pub struct Device: hal.Backend {
         event := sys(device.new_shared_event())?
         options := sys(metal.CompileOptions.new())?
         core.drop(pool)
-        return ok(Device { device: device, queue: queue, event: event, options: options, state: State { submitted: 0, last: 0 } })
+        state := State { submitted: 0, last: 0, sources: [0usize; 16], lengths: [0usize; 16], libraries: [0u64; 16], next: 0 }
+        return ok(Device { device: device, queue: queue, event: event, options: options, state: hal.Mutable.new(state) })
     }
 
     pub fn open_for_window(native: &handle.NativeHandle, debug: bool) -> Device!hal.Error {
@@ -76,6 +95,10 @@ pub struct Device: hal.Backend {
     }
 
     pub fn staged(&self) -> bool {
+        return true
+    }
+
+    pub fn tracks_resources(&self) -> bool {
         return true
     }
 
@@ -98,7 +121,7 @@ pub struct Device: hal.Backend {
             max_workgroup_size_y: threads.height as u32,
             max_workgroup_size_z: threads.depth as u32,
             max_workgroup_invocations: 1024,
-            max_color_attachments: 8
+            max_color_attachments: hal.MAX_COLOR_ATTACHMENTS
         }
     }
 
@@ -267,10 +290,10 @@ pub struct Device: hal.Backend {
                 if layout.step == hal.STEP_INSTANCE {
                     step = metal.VERTEX_STEP_FUNCTION_PER_INSTANCE
                 }
-                sys_void(vertices.set_layout(index, layout.stride as usize, step, 1))?
+                convert_void(vertices.set_layout(index, layout.stride as usize, step, 1), hal.Error.System)?
                 for j in 0usize..layout.attributes.len {
                     attribute := &layout.attributes[j]
-                    sys_void(vertices.set_attribute(attribute.location as usize, vertex_format(attribute.format), attribute.offset as usize, index))?
+                    convert_void(vertices.set_attribute(attribute.location as usize, vertex_format(attribute.format), attribute.offset as usize, index), hal.Error.System)?
                 }
             }
             info.set_vertex_descriptor(&vertices)
@@ -336,9 +359,7 @@ pub struct Device: hal.Backend {
         pool := objc.AutoreleasePool.new()
         if object == hal.OBJECT_ENCODER {
             // An abandoned encoder may still have one open.
-            if handle.b != 0 {
-                end_encoder(handle.b, handle.c)
-            }
+            close(handle.b, handle.c)
             release(handle.a)
         } else if object == hal.OBJECT_RENDER_PIPELINE {
             release(handle.a)
@@ -368,46 +389,59 @@ pub struct Device: hal.Backend {
         return ok(handle)
     }
 
-    pub fn submit(&self, encoder: &mut hal.Handle) -> u64!hal.Error {
-        pool := objc.AutoreleasePool.new()
-        close(encoder)
-        commands := unsafe {
-            metal.CommandBuffer.from_object(object(encoder.a))
+    // The upload command buffer is committed just before the encoder's,
+    // without a signal of its own: the queue runs them in order, so the
+    // encoder's signal covers both.
+    pub fn submit(&self, uploads: &mut hal.Handle, encoder: &mut hal.Handle) -> u64!hal.Error {
+        if uploads.d == FAILED || encoder.d == FAILED {
+            return err(hal.Error.System)
         }
-        index := self.commit(&commands)
+        pool := objc.AutoreleasePool.new()
+        if uploads.a != 0 {
+            end_encoding(uploads)
+            upload_commands := command_buffer(uploads)
+            upload_commands.get().commit()
+        }
+        end_encoding(encoder)
+        commands := command_buffer(encoder)
+        index := self.commit(commands.get())
         core.drop(pool)
         return ok(index)
     }
 
     pub fn begin_compute_pass(&self, encoder: &mut hal.Handle) {
-        pool := objc.AutoreleasePool.new()
-        close(encoder)
-        commands := unsafe {
-            metal.CommandBuffer.from_object(object(encoder.a))
+        end_encoding(encoder)
+        if encoder.d == FAILED {
+            return
         }
-        compute := match commands.compute_command_encoder() {
-            ok(compute) => compute,
+        pool := objc.AutoreleasePool.new()
+        commands := command_buffer(encoder)
+        match commands.get().compute_command_encoder() {
+            ok(compute) => {
+                encoder.b = retained(compute.as_object())
+                encoder.c = ENCODER_COMPUTE
+            }
             err(_) => {
-                assert(false, "Metal could not create a compute command encoder")
-                return
+                encoder.d = FAILED
             }
         }
-        encoder.b = retained(compute.as_object())
-        encoder.c = ENCODER_COMPUTE
         core.drop(pool)
     }
 
     pub fn end_compute_pass(&self, encoder: &mut hal.Handle) {
-        close(encoder)
+        end_encoding(encoder)
     }
 
     pub fn begin_render_pass(&self, encoder: &mut hal.Handle, pass: &hal.RenderPassInfo) {
+        end_encoding(encoder)
+        if encoder.d == FAILED {
+            return
+        }
         pool := objc.AutoreleasePool.new()
-        close(encoder)
         descriptor := match metal.RenderPassDescriptor.new() {
             ok(descriptor) => descriptor,
             err(_) => {
-                assert(false, "Metal could not create a render pass descriptor")
+                encoder.d = FAILED
                 return
             }
         }
@@ -415,17 +449,13 @@ pub struct Device: hal.Backend {
             attachment := &pass.colors[i]
             match descriptor.color_attachment(i) {
                 ok(color) => {
-                    target := unsafe {
-                        metal.Texture.from_object(object(attachment.texture.a))
-                    }
-                    color.set_texture(&target)
+                    target := texture_of(attachment.texture.a)
+                    color.set_texture(target.get())
                     color.set_load_action(load_action(attachment.load))
                     color.set_clear_color(metal.ClearColor.new(attachment.clear_red, attachment.clear_green, attachment.clear_blue, attachment.clear_alpha))
                     if attachment.has_resolve {
-                        resolve := unsafe {
-                            metal.Texture.from_object(object(attachment.resolve.a))
-                        }
-                        color.set_resolve_texture(&resolve)
+                        resolve := texture_of(attachment.resolve.a)
+                        color.set_resolve_texture(resolve.get())
                         if attachment.store {
                             color.set_store_action(metal.STORE_ACTION_STORE_AND_MULTISAMPLE_RESOLVE)
                         } else {
@@ -435,108 +465,117 @@ pub struct Device: hal.Backend {
                         color.set_store_action(store_action(attachment.store))
                     }
                 }
-                err(_) => {}
+                err(_) => {
+                    encoder.d = FAILED
+                }
             }
         }
         if pass.has_depth {
             match descriptor.depth_attachment() {
                 ok(depth) => {
-                    target := unsafe {
-                        metal.Texture.from_object(object(pass.depth.texture.a))
-                    }
-                    depth.set_texture(&target)
+                    target := texture_of(pass.depth.texture.a)
+                    depth.set_texture(target.get())
                     depth.set_load_action(load_action(pass.depth.load))
                     depth.set_store_action(store_action(pass.depth.store))
                     depth.set_clear_depth(pass.depth.clear_depth as f64)
                 }
-                err(_) => {}
+                err(_) => {
+                    encoder.d = FAILED
+                }
             }
         }
-        commands := unsafe {
-            metal.CommandBuffer.from_object(object(encoder.a))
-        }
-        render := match commands.render_command_encoder(&descriptor) {
-            ok(render) => render,
-            err(_) => {
-                assert(false, "Metal could not create a render command encoder")
-                return
+        if encoder.d != FAILED {
+            commands := command_buffer(encoder)
+            match commands.get().render_command_encoder(&descriptor) {
+                ok(render) => {
+                    encoder.b = retained(render.as_object())
+                    encoder.c = ENCODER_RENDER
+                }
+                err(_) => {
+                    encoder.d = FAILED
+                }
             }
         }
-        encoder.b = retained(render.as_object())
-        encoder.c = ENCODER_RENDER
         core.drop(pool)
     }
 
     pub fn end_render_pass(&self, encoder: &mut hal.Handle) {
-        close(encoder)
+        end_encoding(encoder)
     }
 
     pub fn set_viewport(&self, encoder: &mut hal.Handle, x: f32, y: f32, width: f32, height: f32, min_depth: f32, max_depth: f32) {
-        render := render_encoder(encoder)
-        render.set_viewport(metal.Viewport.new(x as f64, y as f64, width as f64, height as f64, min_depth as f64, max_depth as f64))
+        if encoder.c == ENCODER_RENDER {
+            render := render_encoder(encoder)
+            render.get().set_viewport(metal.Viewport.new(x as f64, y as f64, width as f64, height as f64, min_depth as f64, max_depth as f64))
+        }
     }
 
     pub fn set_scissor(&self, encoder: &mut hal.Handle, x: u32, y: u32, width: u32, height: u32) {
-        render := render_encoder(encoder)
-        render.set_scissor_rect(metal.ScissorRect.new(x as usize, y as usize, width as usize, height as usize))
+        if encoder.c == ENCODER_RENDER {
+            render := render_encoder(encoder)
+            render.get().set_scissor_rect(metal.ScissorRect.new(x as usize, y as usize, width as usize, height as usize))
+        }
     }
 
     pub fn set_blend_constant(&self, encoder: &mut hal.Handle, red: f64, green: f64, blue: f64, alpha: f64) {
-        render := render_encoder(encoder)
-        render.set_blend_color(red as f32, green as f32, blue as f32, alpha as f32)
+        if encoder.c == ENCODER_RENDER {
+            render := render_encoder(encoder)
+            render.get().set_blend_color(red as f32, green as f32, blue as f32, alpha as f32)
+        }
     }
 
     pub fn dispatch(&self, encoder: &mut hal.Handle, state: &mut hal.PassState, x: u32, y: u32, z: u32) {
-        compute := unsafe {
-            metal.ComputeCommandEncoder.from_object(object(encoder.b))
+        if encoder.c != ENCODER_COMPUTE {
+            return
         }
+        borrowed_compute := compute_encoder(encoder)
+        compute := borrowed_compute.get()
         if state.pipeline_dirty {
-            pipeline := unsafe {
-                metal.ComputePipelineState.from_object(object(state.pipeline.handle.a))
-            }
-            compute.set_compute_pipeline_state(&pipeline)
+            pipeline := borrowed(unsafe {
+                metal.ComputePipelineState.from_object(unretained(state.pipeline.handle.a))
+            })
+            compute.set_compute_pipeline_state(pipeline.get())
             state.pipeline_dirty = false
         }
-        for slot in 0usize..16 {
-            if (state.dirty >> slot as u32 & 1) != 0 && state.pipeline.kinds[slot] != hal.BINDING_NONE {
-                if state.bound[slot] == hal.BOUND_BUFFER {
-                    buffer := unsafe {
-                        metal.Buffer.from_object(object(state.object_a[slot]))
-                    }
-                    compute.set_buffer(&buffer, state.offset[slot] as usize, slot)
-                } else {
-                    texture := unsafe {
-                        metal.Texture.from_object(object(state.object_a[slot]))
-                    }
-                    compute.set_texture(&texture, slot)
-                    if state.bound[slot] == hal.BOUND_SAMPLED_TEXTURE {
-                        sampler := unsafe {
-                            metal.SamplerState.from_object(object(state.sampler[slot]))
-                        }
-                        compute.set_sampler_state(&sampler, slot)
-                    }
+        remaining := state.dirty & state.pipeline.slots
+        state.dirty = state.dirty & ~remaining
+        for remaining != 0 {
+            slot := hal.lowest_bit(remaining) as usize
+            remaining = remaining & (remaining - 1)
+            if state.bound[slot] == hal.BOUND_BUFFER {
+                buffer := buffer_of(state.object_a[slot])
+                compute.set_buffer(buffer.get(), state.offset[slot] as usize, slot)
+            } else {
+                texture := texture_of(state.object_a[slot])
+                compute.set_texture(texture.get(), slot)
+                if state.bound[slot] == hal.BOUND_SAMPLED_TEXTURE {
+                    sampler := sampler_of(state.sampler[slot])
+                    compute.set_sampler_state(sampler.get(), slot)
                 }
             }
         }
-        state.dirty = 0
         pipeline := &state.pipeline
         compute.dispatch_threadgroups(metal.Size.new(x as usize, y as usize, z as usize), metal.Size.new(pipeline.workgroup_size_x as usize, pipeline.workgroup_size_y as usize, pipeline.workgroup_size_z as usize))
     }
 
     pub fn draw(&self, encoder: &mut hal.Handle, state: &mut hal.PassState, vertex_count: u32, instance_count: u32, first_vertex: u32, first_instance: u32) {
+        if encoder.c != ENCODER_RENDER {
+            return
+        }
         render := render_encoder(encoder)
-        apply(&render, state)
+        apply(render.get(), state)
         kind := (state.pipeline.handle.c & 255) as usize
-        render.draw_primitives_instanced(kind, first_vertex as usize, vertex_count as usize, instance_count as usize, first_instance as usize)
+        render.get().draw_primitives_instanced(kind, first_vertex as usize, vertex_count as usize, instance_count as usize, first_instance as usize)
     }
 
     pub fn draw_indexed(&self, encoder: &mut hal.Handle, state: &mut hal.PassState, index_count: u32, instance_count: u32, first_index: u32, base_vertex: i32, first_instance: u32) {
-        render := render_encoder(encoder)
-        apply(&render, state)
-        kind := (state.pipeline.handle.c & 255) as usize
-        indices := unsafe {
-            metal.Buffer.from_object(object(state.index_a))
+        if encoder.c != ENCODER_RENDER {
+            return
         }
+        render := render_encoder(encoder)
+        apply(render.get(), state)
+        kind := (state.pipeline.handle.c & 255) as usize
+        indices := buffer_of(state.index_a)
         index_type := metal.INDEX_TYPE_UINT32
         size := 4u64
         if state.index_format == hal.INDEX_UINT16 {
@@ -544,56 +583,55 @@ pub struct Device: hal.Backend {
             size = 2
         }
         offset := state.index_offset + first_index as u64 * size
-        render.draw_indexed_primitives(kind, index_count as usize, index_type, &indices, offset as usize, instance_count as usize, base_vertex as isize, first_instance as usize)
+        render.get().draw_indexed_primitives(kind, index_count as usize, index_type, indices.get(), offset as usize, instance_count as usize, base_vertex as isize, first_instance as usize)
     }
 
     pub fn copy_buffer(&self, encoder: &mut hal.Handle, source: &hal.Handle, source_offset: u64, destination: &hal.Handle, destination_offset: u64, size: u64) {
+        if !open_blit(encoder) {
+            return
+        }
         blit := blit_encoder(encoder)
-        source_object := unsafe {
-            metal.Buffer.from_object(object(source.a))
-        }
-        to := unsafe {
-            metal.Buffer.from_object(object(destination.a))
-        }
-        blit.copy_buffer(&source_object, source_offset as usize, &to, destination_offset as usize, size as usize)
+        origin := buffer_of(source.a)
+        to := buffer_of(destination.a)
+        blit.get().copy_buffer(origin.get(), source_offset as usize, to.get(), destination_offset as usize, size as usize)
     }
 
     pub fn copy_buffer_to_texture(&self, encoder: &mut hal.Handle, source: &hal.Handle, offset: u64, bytes_per_row: u32, destination: &hal.Handle, descriptor: &hal.TextureDescriptor, region: &hal.Region) {
+        if !open_blit(encoder) {
+            return
+        }
         blit := blit_encoder(encoder)
-        source_object := unsafe {
-            metal.Buffer.from_object(object(source.a))
-        }
-        to := unsafe {
-            metal.Texture.from_object(object(destination.a))
-        }
-        blit.copy_buffer_to_texture(&source_object, offset as usize, bytes_per_row as usize, 0, metal.Size.new(region.width as usize, region.height as usize, 1), &to, 0, region.level as usize, metal.Origin.new(region.x as usize, region.y as usize, 0))
+        origin := buffer_of(source.a)
+        to := texture_of(destination.a)
+        blit.get().copy_buffer_to_texture(origin.get(), offset as usize, bytes_per_row as usize, 0, metal.Size.new(region.width as usize, region.height as usize, 1), to.get(), 0, region.level as usize, metal.Origin.new(region.x as usize, region.y as usize, 0))
     }
 
     pub fn copy_texture_to_buffer(&self, encoder: &mut hal.Handle, source: &hal.Handle, descriptor: &hal.TextureDescriptor, region: &hal.Region, destination: &hal.Handle, offset: u64, bytes_per_row: u32) {
+        if !open_blit(encoder) {
+            return
+        }
         blit := blit_encoder(encoder)
-        source_object := unsafe {
-            metal.Texture.from_object(object(source.a))
-        }
-        to := unsafe {
-            metal.Buffer.from_object(object(destination.a))
-        }
-        blit.copy_texture_to_buffer(&source_object, 0, region.level as usize, metal.Origin.new(region.x as usize, region.y as usize, 0), metal.Size.new(region.width as usize, region.height as usize, 1), &to, offset as usize, bytes_per_row as usize, 0)
+        origin := texture_of(source.a)
+        to := buffer_of(destination.a)
+        blit.get().copy_texture_to_buffer(origin.get(), 0, region.level as usize, metal.Origin.new(region.x as usize, region.y as usize, 0), metal.Size.new(region.width as usize, region.height as usize, 1), to.get(), offset as usize, bytes_per_row as usize, 0)
     }
 
     pub fn generate_mipmaps(&self, encoder: &mut hal.Handle, texture: &hal.Handle, descriptor: &hal.TextureDescriptor) {
-        blit := blit_encoder(encoder)
-        target := unsafe {
-            metal.Texture.from_object(object(texture.a))
+        if !open_blit(encoder) {
+            return
         }
-        blit.generate_mipmaps(&target)
+        blit := blit_encoder(encoder)
+        target := texture_of(texture.a)
+        blit.get().generate_mipmaps(target.get())
     }
 
     pub fn clear_buffer(&self, encoder: &mut hal.Handle, buffer: &hal.Handle, offset: u64, size: u64) {
-        blit := blit_encoder(encoder)
-        target := unsafe {
-            metal.Buffer.from_object(object(buffer.a))
+        if !open_blit(encoder) {
+            return
         }
-        blit.fill_buffer(&target, offset as usize, size as usize, 0)
+        blit := blit_encoder(encoder)
+        target := buffer_of(buffer.a)
+        blit.get().fill_buffer(target.get(), offset as usize, size as usize, 0)
     }
 
     // Textures start out zero, as buffers do: every level a blit from a
@@ -616,68 +654,71 @@ pub struct Device: hal.Backend {
         zeros := match self.device.new_buffer(size, metal.RESOURCE_STORAGE_MODE_PRIVATE) {
             ok(buffer) => buffer,
             err(_) => {
-                assert(false, "Metal could not allocate a buffer to clear a texture")
+                encoder.d = FAILED
                 return
             }
         }
-        target := unsafe {
-            metal.Texture.from_object(object(texture.a))
-        }
-        blit := blit_encoder(encoder)
-        blit.fill_buffer(&zeros, 0, size, 0)
-        for level in 0u32..descriptor.mip_levels {
-            width := hal.level_size(descriptor.width, level) as usize
-            height := hal.level_size(descriptor.height, level) as usize
-            level_row := width * hal.texel_size(descriptor.format) as usize
-            blit.copy_buffer_to_texture(&zeros, 0, level_row, 0, metal.Size.new(width, height, 1), &target, 0, level as usize, metal.Origin.new(0, 0, 0))
+        if open_blit(encoder) {
+            target := texture_of(texture.a)
+            blit := blit_encoder(encoder)
+            blit.get().fill_buffer(&zeros, 0, size, 0)
+            for level in 0u32..descriptor.mip_levels {
+                width := hal.level_size(descriptor.width, level) as usize
+                height := hal.level_size(descriptor.height, level) as usize
+                level_row := width * hal.texel_size(descriptor.format) as usize
+                blit.get().copy_buffer_to_texture(&zeros, 0, level_row, 0, metal.Size.new(width, height, 1), target.get(), 0, level as usize, metal.Origin.new(0, 0, 0))
+            }
         }
         core.drop(pool)
     }
 
     // Clear a render target with an empty render pass: zero, or depth 0.
     fn clear_target(&self, encoder: &mut hal.Handle, texture: &hal.Handle, depth: bool) {
+        end_encoding(encoder)
+        if encoder.d == FAILED {
+            return
+        }
         pool := objc.AutoreleasePool.new()
-        close(encoder)
         descriptor := match metal.RenderPassDescriptor.new() {
             ok(descriptor) => descriptor,
             err(_) => {
-                assert(false, "Metal could not create a render pass descriptor")
+                encoder.d = FAILED
                 return
             }
         }
-        target := unsafe {
-            metal.Texture.from_object(object(texture.a))
-        }
+        target := texture_of(texture.a)
         if depth {
             match descriptor.depth_attachment() {
                 ok(attachment) => {
-                    attachment.set_texture(&target)
+                    attachment.set_texture(target.get())
                     attachment.set_load_action(metal.LOAD_ACTION_CLEAR)
                     attachment.set_store_action(metal.STORE_ACTION_STORE)
                     attachment.set_clear_depth(0.0)
                 }
-                err(_) => {}
+                err(_) => {
+                    encoder.d = FAILED
+                }
             }
         } else {
             match descriptor.color_attachment(0) {
                 ok(attachment) => {
-                    attachment.set_texture(&target)
+                    attachment.set_texture(target.get())
                     attachment.set_load_action(metal.LOAD_ACTION_CLEAR)
                     attachment.set_store_action(metal.STORE_ACTION_STORE)
                     attachment.set_clear_color(metal.ClearColor.new(0.0, 0.0, 0.0, 0.0))
                 }
-                err(_) => {}
+                err(_) => {
+                    encoder.d = FAILED
+                }
             }
         }
-        commands := unsafe {
-            metal.CommandBuffer.from_object(object(encoder.a))
-        }
-        match commands.render_command_encoder(&descriptor) {
+        commands := command_buffer(encoder)
+        match commands.get().render_command_encoder(&descriptor) {
             ok(render) => {
                 render.end_encoding()
             }
             err(_) => {
-                assert(false, "Metal could not create a render command encoder")
+                encoder.d = FAILED
             }
         }
         core.drop(pool)
@@ -733,9 +774,10 @@ pub struct Device: hal.Backend {
 
     pub fn configure_surface(&self, surface: &mut hal.Handle, config: &mut hal.SurfaceConfig) -> void!hal.Error {
         pool := objc.AutoreleasePool.new()
-        layer := unsafe {
-            metal.MetalLayer.from_object(object(surface.a))
-        }
+        borrowed_layer := borrowed(unsafe {
+            metal.MetalLayer.from_object(unretained(surface.a))
+        })
+        layer := borrowed_layer.get()
         layer.set_device(&self.device)
         layer.set_pixel_format(metal.PIXEL_FORMAT_BGRA8_UNORM_SRGB)
         // Drawables can be blitted to and from, as std/gpu's images can.
@@ -757,11 +799,11 @@ pub struct Device: hal.Backend {
 
     pub fn acquire(&self, surface: &mut hal.Handle, texture: &mut hal.Handle) -> u64!hal.Error {
         pool := objc.AutoreleasePool.new()
-        layer := unsafe {
-            metal.MetalLayer.from_object(object(surface.a))
-        }
+        layer := borrowed(unsafe {
+            metal.MetalLayer.from_object(unretained(surface.a))
+        })
         // Waits for a free drawable: Metal's own limit on frames in flight.
-        drawable := match layer.next_drawable() {
+        drawable := match layer.get().next_drawable() {
             some(drawable) => drawable,
             none => {
                 return err(hal.Error.Outdated)
@@ -785,11 +827,11 @@ pub struct Device: hal.Backend {
             return ok(0)
         }
         pool := objc.AutoreleasePool.new()
-        drawable := unsafe {
-            metal.Drawable.from_object(object(surface.b))
-        }
+        drawable := borrowed(unsafe {
+            metal.Drawable.from_object(unretained(surface.b))
+        })
         commands := sys(self.queue.command_buffer())?
-        commands.present_drawable(&drawable)
+        commands.present_drawable(drawable.get())
         index := self.commit(&commands)
         release(surface.b)
         surface.b = 0
@@ -802,47 +844,33 @@ pub struct Device: hal.Backend {
         release(surface.a)
     }
 
-    fn state(&self) -> *mut State {
-        unsafe {
-            return ptr.from_ref(&self.state) as *mut State
-        }
-    }
-
     // Commit a command buffer as the next submission and return its number.
     fn commit(&self, commands: &metal.CommandBuffer) -> u64 {
-        state := self.state()
-        index := unsafe {
-            (*state).submitted + 1
-        }
+        index := self.state.read().submitted + 1
         commands.encode_signal_shared_event(&self.event, index)
         commands.commit()
-        unsafe {
-            release((*state).last)
-            (*state).last = retained(commands.as_object())
-            (*state).submitted = index
-        }
+        last := retained(commands.as_object())
+        self.state.update(fn(state) {
+            release(state.last)
+            state.last = last
+            state.submitted = index
+        })
         return index
     }
 
     // Wait for every submission so far.
     fn wait_all(&self) -> void!hal.Error {
-        state := self.state()
-        last := unsafe {
-            (*state).last
-        }
-        submitted := unsafe {
-            (*state).submitted
-        }
-        if last == 0 || self.completed() >= submitted {
+        last := self.state.read().last
+        if last == 0 || self.completed() >= self.state.read().submitted {
             return ok()
         }
         pool := objc.AutoreleasePool.new()
-        commands := unsafe {
-            metal.CommandBuffer.from_object(object(last))
-        }
-        result := commands.wait_until_completed()
+        commands := borrowed(unsafe {
+            metal.CommandBuffer.from_object(unretained(last))
+        })
+        result := commands.get().wait_until_completed()
         core.drop(pool)
-        return lost_void(result)
+        return convert_void(result, hal.Error.DeviceLost)
     }
 
     // A render pipeline's fragment function, compiled from the vertex
@@ -866,63 +894,114 @@ pub struct Device: hal.Backend {
         }
     }
 
+    // The library compiled from `source`, from the cache when pipelines were
+    // made from the same source before: compiling is most of the cost of
+    // creating a pipeline.
     fn library(&self, source: &hal.ShaderSource) -> metal.Library!hal.Error {
-        match self.device.new_library_with_source(source.msl, &self.options) {
-            ok(library) => {
-                return ok(library)
+        text := mem.str_bytes(source.msl)
+        state := self.state.read()
+        for i in 0usize..LIBRARIES {
+            if state.libraries[i] != 0 && state.lengths[i] == text.len {
+                cached := unsafe {
+                    ptr.borrow_slice(state.sources[i] as *const u8, state.lengths[i], state)
+                }
+                if bytes.equal(cached, text) {
+                    owned := unsafe {
+                        objc.Object.retain(state.libraries[i] as usize as objc.Id)
+                    }
+                    match owned {
+                        some(object) => {
+                            return ok(unsafe {
+                                metal.Library.from_object(object)
+                            })
+                        }
+                        none => {}
+                    }
+                }
             }
+        }
+        library := match self.device.new_library_with_source(source.msl, &self.options) {
+            ok(library) => library,
             err(_) => {
                 return err(hal.Error.InvalidShader)
             }
         }
+        copy := unsafe {
+            malloc(text.len) as usize
+        }
+        if copy != 0 {
+            unsafe {
+                ptr.copy_nonoverlapping(ptr.as_ptr(text), copy as *mut u8, text.len)
+            }
+            kept := retained(library.as_object())
+            self.state.update(fn(state) {
+                slot := state.next
+                state.next = (slot + 1) % LIBRARIES
+                forget_library(state, slot)
+                state.sources[slot] = copy
+                state.lengths[slot] = text.len
+                state.libraries[slot] = kept
+            })
+        }
+        return ok(library)
     }
 
     fn drop(&mut self) {
-        match self.wait_all() {
-            ok() => {}
-            err(_) => {}
+        hal.ignore(self.wait_all())
+        self.state.update(fn(state) {
+            release(state.last)
+            state.last = 0
+            for i in 0usize..LIBRARIES {
+                forget_library(state, i)
+            }
+        })
+    }
+}
+
+unsafe extern "C" fn malloc(size: usize) -> *mut u8
+unsafe extern "C" fn free(block: *mut u8)
+
+// Empty slot `slot` of the library cache.
+fn forget_library(state: &mut State, slot: usize) {
+    if state.libraries[slot] != 0 {
+        release(state.libraries[slot])
+        unsafe {
+            free(state.sources[slot] as *mut u8)
         }
-        release(self.state.last)
-        self.state.last = 0
+        state.libraries[slot] = 0
+        state.sources[slot] = 0
+        state.lengths[slot] = 0
+    }
+}
+
+// A Metal call failed: report it as `error`.
+fn convert<T>(result: T!metal.Error, error: hal.Error) -> T!hal.Error {
+    match result {
+        ok(value) => {
+            return ok(value)
+        }
+        err(failure) => {
+            core.drop(failure)
+            return err(error)
+        }
+    }
+}
+
+fn convert_void(result: void!metal.Error, error: hal.Error) -> void!hal.Error {
+    match result {
+        ok() => {
+            return ok()
+        }
+        err(failure) => {
+            core.drop(failure)
+            return err(error)
+        }
     }
 }
 
 // A Metal call that should not fail did.
 fn sys<T>(result: T!metal.Error) -> T!hal.Error {
-    match result {
-        ok(value) => {
-            return ok(value)
-        }
-        err(error) => {
-            core.drop(error)
-            return err(hal.Error.System)
-        }
-    }
-}
-
-fn sys_void(result: void!metal.Error) -> void!hal.Error {
-    match result {
-        ok() => {
-            return ok()
-        }
-        err(error) => {
-            core.drop(error)
-            return err(hal.Error.System)
-        }
-    }
-}
-
-// A command buffer failed on the GPU.
-fn lost_void(result: void!metal.Error) -> void!hal.Error {
-    match result {
-        ok() => {
-            return ok()
-        }
-        err(error) => {
-            core.drop(error)
-            return err(hal.Error.DeviceLost)
-        }
-    }
+    return convert(result, hal.Error.System)
 }
 
 // Another +1 reference to `object`, as a handle word.
@@ -930,24 +1009,6 @@ fn retained(object: &objc.Object) -> u64 {
     id := object.clone().into_retained()
     unsafe {
         return id as usize as u64
-    }
-}
-
-// A strong reference to the object a handle word holds.
-unsafe fn object(id: u64) -> objc.Object {
-    retained := unsafe {
-        objc.Object.retain(id as usize as objc.Id)
-    }
-    match retained {
-        some(object) => {
-            return object
-        }
-        none => {
-            assert(false, "a std/gpu Metal handle is empty")
-            return unsafe {
-                object(id)
-            }
-        }
     }
 }
 
@@ -960,79 +1021,152 @@ fn release(id: u64) {
     }
 }
 
-// End and release the encoder a handle holds.
-fn end_encoder(id: u64, kind: u64) {
-    if kind == ENCODER_COMPUTE {
-        compute := unsafe {
-            metal.ComputeCommandEncoder.from_object(object(id))
+// A Metal object a handle word holds, used without retaining it: the
+// handle's reference keeps it alive while it is used, and dropping a
+// Borrowed releases nothing.
+struct Borrowed<T> {
+    storage: MaybeUninit<T>
+
+    fn get(&self) -> &T from(self) {
+        unsafe {
+            return ptr.borrow(mem.uninit_as_ptr(&self.storage), self)
         }
-        compute.end_encoding()
-    } else if kind == ENCODER_RENDER {
-        render := unsafe {
-            metal.RenderCommandEncoder.from_object(object(id))
-        }
-        render.end_encoding()
-    } else if kind == ENCODER_BLIT {
-        blit := unsafe {
-            metal.BlitCommandEncoder.from_object(object(id))
-        }
-        blit.end_encoding()
     }
-    release(id)
+}
+
+fn borrowed<T>(value: T) -> Borrowed<T> {
+    return Borrowed { storage: mem.init(value) }
+}
+
+// The object a handle word holds, without a reference of its own. Wrap it
+// in borrowed() at once, so that it is never released.
+unsafe fn unretained(id: u64) -> objc.Object {
+    object := unsafe {
+        objc.Object.from_retained(id as usize as objc.Id)
+    }
+    match object {
+        some(object) => {
+            return object
+        }
+        none => {
+            assert(false, "a std/gpu Metal handle is empty")
+            return unsafe {
+                unretained(id)
+            }
+        }
+    }
+}
+
+fn command_buffer(encoder: &hal.Handle) -> Borrowed<metal.CommandBuffer> {
+    return borrowed(unsafe {
+        metal.CommandBuffer.from_object(unretained(encoder.a))
+    })
+}
+
+fn render_encoder(encoder: &hal.Handle) -> Borrowed<metal.RenderCommandEncoder> {
+    return borrowed(unsafe {
+        metal.RenderCommandEncoder.from_object(unretained(encoder.b))
+    })
+}
+
+fn compute_encoder(encoder: &hal.Handle) -> Borrowed<metal.ComputeCommandEncoder> {
+    return borrowed(unsafe {
+        metal.ComputeCommandEncoder.from_object(unretained(encoder.b))
+    })
+}
+
+fn blit_encoder(encoder: &hal.Handle) -> Borrowed<metal.BlitCommandEncoder> {
+    return borrowed(unsafe {
+        metal.BlitCommandEncoder.from_object(unretained(encoder.b))
+    })
+}
+
+fn buffer_of(id: u64) -> Borrowed<metal.Buffer> {
+    return borrowed(unsafe {
+        metal.Buffer.from_object(unretained(id))
+    })
+}
+
+fn texture_of(id: u64) -> Borrowed<metal.Texture> {
+    return borrowed(unsafe {
+        metal.Texture.from_object(unretained(id))
+    })
+}
+
+fn sampler_of(id: u64) -> Borrowed<metal.SamplerState> {
+    return borrowed(unsafe {
+        metal.SamplerState.from_object(unretained(id))
+    })
+}
+
+// End the open encoder `id` of kind `kind`, if any, and release the
+// handle's reference to it, which ending consumes.
+fn close(id: u64, kind: u64) {
+    if id == 0 {
+        return
+    }
+    if kind == ENCODER_COMPUTE {
+        unsafe {
+            metal.ComputeCommandEncoder.from_object(unretained(id)).end_encoding()
+        }
+    } else if kind == ENCODER_RENDER {
+        unsafe {
+            metal.RenderCommandEncoder.from_object(unretained(id)).end_encoding()
+        }
+    } else if kind == ENCODER_BLIT {
+        unsafe {
+            metal.BlitCommandEncoder.from_object(unretained(id)).end_encoding()
+        }
+    } else {
+        release(id)
+    }
 }
 
 // End the encoder that is open, if any.
-fn close(encoder: &mut hal.Handle) {
-    if encoder.b != 0 {
-        end_encoder(encoder.b, encoder.c)
-        encoder.b = 0
-        encoder.c = ENCODER_NONE
-    }
+fn end_encoding(encoder: &mut hal.Handle) {
+    close(encoder.b, encoder.c)
+    encoder.b = 0
+    encoder.c = ENCODER_NONE
 }
 
-fn render_encoder(encoder: &hal.Handle) -> metal.RenderCommandEncoder {
-    return unsafe {
-        metal.RenderCommandEncoder.from_object(object(encoder.b))
+// Open a blit encoder unless one is open, after ending any other; false
+// when Metal could not make one.
+fn open_blit(encoder: &mut hal.Handle) -> bool {
+    if encoder.c == ENCODER_BLIT {
+        return true
     }
-}
-
-// The open blit encoder, opening one after ending any other.
-fn blit_encoder(encoder: &mut hal.Handle) -> metal.BlitCommandEncoder {
-    if encoder.c != ENCODER_BLIT {
-        close(encoder)
-        pool := objc.AutoreleasePool.new()
-        commands := unsafe {
-            metal.CommandBuffer.from_object(object(encoder.a))
+    end_encoding(encoder)
+    if encoder.d == FAILED {
+        return false
+    }
+    pool := objc.AutoreleasePool.new()
+    commands := command_buffer(encoder)
+    match commands.get().blit_command_encoder() {
+        ok(blit) => {
+            encoder.b = retained(blit.as_object())
+            encoder.c = ENCODER_BLIT
         }
-        match commands.blit_command_encoder() {
-            ok(blit) => {
-                encoder.b = retained(blit.as_object())
-                encoder.c = ENCODER_BLIT
-            }
-            err(_) => {
-                assert(false, "Metal could not create a blit command encoder")
-            }
+        err(_) => {
+            encoder.d = FAILED
         }
-        core.drop(pool)
     }
-    return unsafe {
-        metal.BlitCommandEncoder.from_object(object(encoder.b))
-    }
+    core.drop(pool)
+    return encoder.d != FAILED
 }
 
 // Apply what changed in a render pass's state.
 fn apply(render: &metal.RenderCommandEncoder, state: &mut hal.PassState) {
     if state.pipeline_dirty {
         handle := &state.pipeline.handle
-        pipeline := unsafe {
-            metal.RenderPipelineState.from_object(object(handle.a))
-        }
-        render.set_render_pipeline_state(&pipeline)
+        pipeline := borrowed(unsafe {
+            metal.RenderPipelineState.from_object(unretained(handle.a))
+        })
+        render.set_render_pipeline_state(pipeline.get())
         if handle.b != 0 {
-            depth := unsafe {
-                metal.DepthStencilState.from_object(object(handle.b))
-            }
-            render.set_depth_stencil_state(&depth)
+            depth := borrowed(unsafe {
+                metal.DepthStencilState.from_object(unretained(handle.b))
+            })
+            render.set_depth_stencil_state(depth.get())
         }
         render.set_cull_mode((handle.c >> 8 & 255) as usize)
         render.set_front_facing_winding((handle.c >> 16 & 255) as usize)
@@ -1041,56 +1175,50 @@ fn apply(render: &metal.RenderCommandEncoder, state: &mut hal.PassState) {
         render.set_depth_bias(bias as f32, hal.f32_from_bits((handle.d & 0xffffffff) as u32), hal.f32_from_bits((handle.d >> 32) as u32))
         state.pipeline_dirty = false
     }
-    for slot in 0usize..16 {
+    remaining := state.dirty & state.pipeline.slots
+    state.dirty = state.dirty & ~remaining
+    for remaining != 0 {
+        slot := hal.lowest_bit(remaining) as usize
+        remaining = remaining & (remaining - 1)
         stages := state.pipeline.stages[slot]
-        if (state.dirty >> slot as u32 & 1) != 0 && state.pipeline.kinds[slot] != hal.BINDING_NONE {
-            vertex := (stages & hal.STAGE_VERTEX) != 0
-            fragment := (stages & hal.STAGE_FRAGMENT) != 0
-            if state.bound[slot] == hal.BOUND_BUFFER {
-                buffer := unsafe {
-                    metal.Buffer.from_object(object(state.object_a[slot]))
-                }
-                offset := state.offset[slot] as usize
+        vertex := (stages & hal.STAGE_VERTEX) != 0
+        fragment := (stages & hal.STAGE_FRAGMENT) != 0
+        if state.bound[slot] == hal.BOUND_BUFFER {
+            buffer := buffer_of(state.object_a[slot])
+            offset := state.offset[slot] as usize
+            if vertex {
+                render.set_vertex_buffer(buffer.get(), offset, slot)
+            }
+            if fragment {
+                render.set_fragment_buffer(buffer.get(), offset, slot)
+            }
+        } else {
+            texture := texture_of(state.object_a[slot])
+            if vertex {
+                render.set_vertex_texture(texture.get(), slot)
+            }
+            if fragment {
+                render.set_fragment_texture(texture.get(), slot)
+            }
+            if state.bound[slot] == hal.BOUND_SAMPLED_TEXTURE {
+                sampler := sampler_of(state.sampler[slot])
                 if vertex {
-                    render.set_vertex_buffer(&buffer, offset, slot)
+                    render.set_vertex_sampler_state(sampler.get(), slot)
                 }
                 if fragment {
-                    render.set_fragment_buffer(&buffer, offset, slot)
-                }
-            } else {
-                texture := unsafe {
-                    metal.Texture.from_object(object(state.object_a[slot]))
-                }
-                if vertex {
-                    render.set_vertex_texture(&texture, slot)
-                }
-                if fragment {
-                    render.set_fragment_texture(&texture, slot)
-                }
-                if state.bound[slot] == hal.BOUND_SAMPLED_TEXTURE {
-                    sampler := unsafe {
-                        metal.SamplerState.from_object(object(state.sampler[slot]))
-                    }
-                    if vertex {
-                        render.set_vertex_sampler_state(&sampler, slot)
-                    }
-                    if fragment {
-                        render.set_fragment_sampler_state(&sampler, slot)
-                    }
+                    render.set_fragment_sampler_state(sampler.get(), slot)
                 }
             }
         }
     }
-    state.dirty = 0
-    for i in 0usize..state.pipeline.vertex_buffer_count as usize {
-        if (state.vertex_dirty >> i as u32 & 1) != 0 {
-            buffer := unsafe {
-                metal.Buffer.from_object(object(state.vertex_a[i]))
-            }
-            render.set_vertex_buffer(&buffer, state.vertex_offset[i] as usize, hal.METAL_VERTEX_BUFFER_BASE as usize + i)
-        }
+    vertices := state.vertex_dirty & ((1u32 << state.pipeline.vertex_buffer_count) - 1)
+    state.vertex_dirty = state.vertex_dirty & ~vertices
+    for vertices != 0 {
+        i := hal.lowest_bit(vertices) as usize
+        vertices = vertices & (vertices - 1)
+        buffer := buffer_of(state.vertex_a[i])
+        render.set_vertex_buffer(buffer.get(), state.vertex_offset[i] as usize, hal.METAL_VERTEX_BUFFER_BASE as usize + i)
     }
-    state.vertex_dirty = 0
 }
 
 fn pixel_format(format: u32) -> metal.PixelFormat {

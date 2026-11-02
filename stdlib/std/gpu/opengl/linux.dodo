@@ -19,14 +19,6 @@ import "std/window/handle"
 // platform get an Xlib connection of their own, from libX11 loaded at run
 // time, and EGL's X11 platform.
 
-unsafe extern "C" fn dlopen(path: *const u8, mode: i32) -> *mut u8
-// Declared with the pointer result std/dylib and std/gpu/metal use, as one
-// program may load all three: a symbol has a single C signature.
-unsafe extern "C" fn dlsym(handle: *mut u8, name: *const u8) -> *mut u8
-unsafe extern "C" fn dlclose(handle: *mut u8) -> i32
-
-const RTLD_NOW: i32 = 2
-
 const EGL_NONE: i32 = 0x3038
 const EGL_EXTENSIONS: i32 = 0x3055
 const EGL_SURFACE_TYPE: i32 = 0x3033
@@ -78,18 +70,6 @@ type CreatePlatformWindowSurface = extern "C" fn(*mut u8, *mut u8, *mut u8, *con
 type XOpenDisplay = extern "C" fn(*const u8) -> *mut u8
 type XCloseDisplay = extern "C" fn(*mut u8) -> i32
 
-fn null() -> *mut u8 {
-    unsafe {
-        return 0usize as *mut u8
-    }
-}
-
-unsafe fn open(path: &[u8]) -> *mut u8 {
-    unsafe {
-        return dlopen(common.c_string(path), RTLD_NOW)
-    }
-}
-
 // Every EGL entry point the backend uses, from libEGL's exports.
 struct Egl {
     get_proc_address: GetProcAddress
@@ -121,7 +101,7 @@ unsafe fn load_egl(library: *mut u8) -> Option<Egl> {
     addresses := [0usize; 16]
     for i in 0usize..16 {
         address := unsafe {
-            dlsym(library, common.c_string(names[i])) as usize
+            common.symbol(library, names[i])
         }
         if address == 0 {
             return none
@@ -170,11 +150,11 @@ pub struct Backend {
     // libEGL and its entry points, with no display yet.
     fn load() -> Backend!common.Error {
         library := unsafe {
-            open(b"libEGL.so.1\0")
+            common.open_library(b"libEGL.so.1\0")
         }
         if ptr.is_null(library) {
             library = unsafe {
-                open(b"libEGL.so\0")
+                common.open_library(b"libEGL.so\0")
             }
         }
         if ptr.is_null(library) {
@@ -187,28 +167,28 @@ pub struct Backend {
             some(egl) => egl,
             none => {
                 unsafe {
-                    dlclose(library)
+                    common.close_library(library)
                 }
                 return err(common.Error.NoLibrary)
             }
         }
         gl_library := unsafe {
-            open(b"libOpenGL.so.0\0")
+            common.open_library(b"libOpenGL.so.0\0")
         }
         if ptr.is_null(gl_library) {
             gl_library = unsafe {
-                open(b"libGL.so.1\0")
+                common.open_library(b"libGL.so.1\0")
             }
         }
         return ok(Backend {
             library: library,
             gl_library: gl_library,
             egl: egl,
-            display: null(),
-            context: null(),
-            surface: null(),
+            display: common.null(),
+            context: common.null(),
+            surface: common.null(),
             window: false,
-            xlib: null(),
+            xlib: common.null(),
             close_xlib: 0
         })
     }
@@ -237,7 +217,7 @@ pub struct Backend {
             surface_type = 0
         }
         config_attributes := [EGL_RENDERABLE_TYPE, EGL_OPENGL_BIT, EGL_SURFACE_TYPE, surface_type, EGL_NONE]
-        config := null()
+        config := common.null()
         count := 0i32
         choose := backend.egl.choose_config
         chosen := unsafe {
@@ -333,7 +313,7 @@ pub struct Backend {
         initialize := self.egl.initialize
         resolve := self.egl.get_proc_address
         clients := unsafe {
-            query(null(), EGL_EXTENSIONS)
+            query(common.null(), EGL_EXTENSIONS)
         }
         address := unsafe {
             resolve(common.c_string(b"eglGetPlatformDisplayEXT\0"))
@@ -364,16 +344,16 @@ pub struct Backend {
             return err(common.Error.Unsupported)
         }
         xlib := unsafe {
-            open(b"libX11.so.6\0")
+            common.open_library(b"libX11.so.6\0")
         }
         if ptr.is_null(xlib) {
             return err(common.Error.NoLibrary)
         }
         open_display := unsafe {
-            dlsym(xlib, common.c_string(b"XOpenDisplay\0")) as usize
+            common.symbol(xlib, b"XOpenDisplay\0")
         }
         close_display := unsafe {
-            dlsym(xlib, common.c_string(b"XCloseDisplay\0")) as usize
+            common.symbol(xlib, b"XCloseDisplay\0")
         }
         if open_display == 0 || close_display == 0 {
             return err(common.Error.NoLibrary)
@@ -471,7 +451,7 @@ pub struct Backend {
         }
         create := self.egl.create_context
         context := unsafe {
-            create(self.display, config, null(), ptr.as_ptr(&context_attributes))
+            create(self.display, config, common.null(), ptr.as_ptr(&context_attributes))
         }
         if ptr.is_null(context) {
             return err(common.Error.Unsupported)
@@ -485,7 +465,7 @@ pub struct Backend {
         query := self.egl.query_string
         initialize := self.egl.initialize
         clients := unsafe {
-            query(null(), EGL_EXTENSIONS)
+            query(common.null(), EGL_EXTENSIONS)
         }
         if unsafe {
             common.has_word(clients, b"EGL_MESA_platform_surfaceless")
@@ -498,7 +478,7 @@ pub struct Backend {
             if address != 0 {
                 display := unsafe {
                     get_platform_display := address as GetPlatformDisplay
-                    get_platform_display(EGL_PLATFORM_SURFACELESS_MESA, null(), 0usize as *const i32)
+                    get_platform_display(EGL_PLATFORM_SURFACELESS_MESA, common.null(), 0usize as *const i32)
                 }
                 if !ptr.is_null(display) && unsafe {
                     initialize(display, 0usize as *mut i32, 0usize as *mut i32)
@@ -510,7 +490,7 @@ pub struct Backend {
         }
         get_display := self.egl.get_display
         display := unsafe {
-            get_display(null())
+            get_display(common.null())
         }
         if ptr.is_null(display) || unsafe {
             initialize(display, 0usize as *mut i32, 0usize as *mut i32)
@@ -535,7 +515,7 @@ pub struct Backend {
     pub fn release_current(&self) {
         make := self.egl.make_current
         unsafe {
-            make(self.display, null(), null(), null())
+            make(self.display, common.null(), common.null(), common.null())
         }
     }
 
@@ -585,7 +565,7 @@ pub struct Backend {
         }
         if address == 0 && !ptr.is_null(self.gl_library) {
             address = unsafe {
-                dlsym(self.gl_library, name) as usize
+                common.symbol_at(self.gl_library, name)
             }
         }
         return address
