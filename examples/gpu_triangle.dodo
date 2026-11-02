@@ -6,8 +6,11 @@ import "std/gpu"
 import "std/window"
 
 // A spinning triangle drawn with std/gpu and shown in a std/window window.
-// The GPU renders each frame into a texture; the frame is read back and
-// copied into the window's canvas. Press Escape or close the window to quit.
+// The GPU renders each frame into a texture; the frame is read back
+// without waiting (Device.start_read_texture) and copied into the window's
+// canvas one frame later. examples/gpu_window.dodo presents straight to
+// the window with a gpu.Surface instead, which needs no copies. Press
+// Escape or close the window to quit.
 //
 // The shaders, written once in WGSL for every backend:
 
@@ -97,6 +100,7 @@ fn run() -> void!gpu.Error {
         &mut FRAME[..(width * height * 4) as usize]
     }
     angle := 0.0f32
+    shown: Option<gpu.Readback> = none
     win.request_frame()!
     for {
         match app.wait_event() {
@@ -121,12 +125,22 @@ fn run() -> void!gpu.Error {
                     pass.draw(3, 1, 0, 0)
                 }
                 encoder.submit()?
-                device.read_texture(&target, target.region(), frame, target.bytes_per_row())?
-                image := graphics.Canvas.new(frame, width, height, graphics.PixelFormat.Bgra8888)!
-                canvas := win.canvas()
-                canvas.blit(&image, 0, 0)
-                dirty := canvas.take_dirty()
-                win.update(dirty)!
+                // Start reading this frame back and show the one before,
+                // which the GPU has most likely copied by now: waiting
+                // for this frame's copy would stall on the GPU each time.
+                readback := device.start_read_texture(&target, target.region(), target.bytes_per_row())?
+                match shown {
+                    some(earlier) => {
+                        earlier.read(frame)?
+                        image := graphics.Canvas.new(frame, width, height, graphics.PixelFormat.Bgra8888)!
+                        canvas := win.canvas()
+                        canvas.blit(&image, 0, 0)
+                        dirty := canvas.take_dirty()
+                        win.update(dirty)!
+                    }
+                    none => {}
+                }
+                shown = some(readback)
                 win.request_frame()!
                 angle += 0.02
             }
