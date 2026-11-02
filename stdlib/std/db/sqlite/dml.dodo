@@ -1300,10 +1300,20 @@ fn write_row(e: &mut Engine, w: usize, conf: u8, update: bool, old_rowid: i64) -
             return err(constraint_fail(e, code, "UNIQUE", t, 0, n, x))
         }
     }
+    skip := 0u64
+    positioned := false
     if update {
-        delete_row(e, w, old_rowid)?
+        if !wr && rowid == old_rowid {
+            // Same rowid: the table row is overwritten in place, and index
+            // entries whose key did not change stay as they are.
+            let (sk, found) = delete_row_for_update(e, w, rowid)?
+            skip = sk
+            positioned = found
+        } else {
+            delete_row(e, w, old_rowid)?
+        }
     }
-    store_row(e, w, rowid)?
+    store_row(e, w, rowid, skip, positioned)?
     if !update && has_triggers(e, w, trig_mask(TE_INSERT, TT_AFTER)) {
         fire_triggers(e, w, trig_mask(TE_INSERT, TT_AFTER))?
     }
@@ -1324,7 +1334,11 @@ fn load_trigger_old(e: &mut Engine, w: usize, src: usize) -> void!db.Error {
     ok()
 }
 
-fn store_row(e: &mut Engine, w: usize, rowid: i64) -> void!db.Error {
+// Writes the row in the W_BASE registers and its index entries, except the
+// entries of indexes whose bit is set in `skip` (unchanged by an UPDATE).
+// `positioned`: the table cursor is still on row `rowid` (an UPDATE that
+// keeps the rowid), so no seek is needed to overwrite it.
+fn store_row(e: &mut Engine, w: usize, rowid: i64, skip: u64, positioned: bool) -> void!db.Error {
     t := wget(e, w, W_TABLE)
     c := wget(e, w, W_CUR)
     base := wget(e, w, W_BASE)
@@ -1358,29 +1372,22 @@ fn store_row(e: &mut Engine, w: usize, rowid: i64) -> void!db.Error {
         if ipk != NO_COL {
             set_int(e, base + ipk, rowid)
         }
-        table_insert(e, c, rowid, rec, size)?
+        if positioned {
+            table_replace_at_cursor(e, c, rowid, rec, size)?
+        } else {
+            table_insert(e, c, rowid, rec, size)?
+        }
     }
     arr := wget(e, w, W_IDX)
-    keys := wget(e, w, W_KEYREG)
     for k in 0usize..wget(e, w, W_NIDX) {
-        x := ldu(e.ws, arr + k * IDX_ENTRY)
+        if k < 64 && (skip & (1u64 << (k as u64))) != 0 {
+            continue
+        }
         ic := ldu(e.ws, arr + k * IDX_ENTRY + 4)
-        n := obj_ncol(e, x)
         if !index_applies(e, w, k, false)? {
             continue
         }
-        index_key(e, w, k, base, rowid, false)?
-        for i in 0usize..n {
-            c2 := idx_col(e, x, i)
-            if c2 != NO_COL && c2 != ipk && c2 != EXPR_COL {
-                let affinity = col_aff(e, t, c2)
-                apply_affinity(e, keys + i, affinity)?
-            }
-        }
-        nt := index_ntail(e, x)
-        isize := record_size(e, keys, n + nt)
-        irec := arena_alloc(e, isize)?
-        record_write(e, keys, n + nt, irec)
+        let (irec, isize) = index_record(e, w, k, base, rowid, false)?
         index_insert(e, ic, irec, isize)?
     }
     e.changes += 1
@@ -1388,6 +1395,80 @@ fn store_row(e: &mut Engine, w: usize, rowid: i64) -> void!db.Error {
         e.last_rowid = rowid
     }
     push_returning(e, w)
+}
+
+// Builds the key registers of index entry k (as index_key, with column
+// affinities applied) and the index record, in the arena.
+fn index_record(e: &mut Engine, w: usize, k: usize, row: usize, rowid: i64, old: bool) -> (usize, usize)!db.Error {
+    t := wget(e, w, W_TABLE)
+    keys := wget(e, w, W_KEYREG)
+    x := ldu(e.ws, wget(e, w, W_IDX) + k * IDX_ENTRY)
+    n := obj_ncol(e, x)
+    ipk := rowid_col(e, t)
+    index_key(e, w, k, row, rowid, old)?
+    for i in 0usize..n {
+        c2 := idx_col(e, x, i)
+        if c2 != NO_COL && c2 != ipk && c2 != EXPR_COL {
+            let affinity = col_aff(e, t, c2)
+            apply_affinity(e, keys + i, affinity)?
+        }
+    }
+    nt := index_ntail(e, x)
+    size := record_size(e, keys, n + nt)
+    rec := arena_alloc(e, size)?
+    record_write(e, keys, n + nt, rec)
+    ok((rec, size))
+}
+
+// The first half of an UPDATE that keeps the rowid (of a rowid table): loads
+// the old row into the W_OLD registers and deletes the index entries that
+// change, leaving the table row for store_row to overwrite. Returns the
+// mask of indexes (the first 64) whose entry stays as it is, and whether the
+// row exists (the table cursor then stays on it: only index trees change).
+fn delete_row_for_update(e: &mut Engine, w: usize, rowid: i64) -> (u64, bool)!db.Error {
+    if !load_old_row(e, w, rowid)? {
+        return ok((0u64, false))
+    }
+    base := wget(e, w, W_BASE)
+    old := wget(e, w, W_OLD)
+    arr := wget(e, w, W_IDX)
+    keys := wget(e, w, W_KEYREG)
+    skip := 0u64
+    for k in 0usize..wget(e, w, W_NIDX) {
+        x := ldu(e.ws, arr + k * IDX_ENTRY)
+        ic := ldu(e.ws, arr + k * IDX_ENTRY + 4)
+        if !index_applies(e, w, k, true)? {
+            continue
+        }
+        // (Arena use is released per row by the caller: the key registers
+        // may point into it.)
+        let (orec, osize) = index_record(e, w, k, old, rowid, true)?
+        if k < 64 && index_applies(e, w, k, false)? {
+            let (nrec, nsize) = index_record(e, w, k, base, rowid, false)?
+            same := nsize == osize && bytes_equal(e.ws, orec, nrec, osize)
+            if same {
+                skip = skip | (1u64 << (k as u64))
+                continue
+            }
+            // The key registers must hold the old key again.
+            index_record(e, w, k, old, rowid, true)?
+        }
+        let nt = index_ntail(e, x)
+        let n = obj_ncol(e, x)
+        if seek_index(e, ic, keys, n + nt)? == 0 {
+            cur_delete(e, ic)?
+        }
+    }
+    ok((skip, true))
+}
+
+fn bytes_equal(b: &[u8], x: usize, y: usize, n: usize) -> bool {
+    for i in 0usize..n {
+        if b[x + i] != b[y + i] {
+            return false
+        }
+    }
+    true
 }
 
 // Deletes row `rowid` and its index entries.
@@ -1415,7 +1496,9 @@ fn delete_row(e: &mut Engine, w: usize, rowid: i64) -> void!db.Error {
     }
     set_int(e, old + ncol, rowid)
     delete_index_entries(e, w, rowid)?
-    if seek_rowid(e, c, rowid)? {
+    // Only index trees changed since the seek, so the cursor is still on
+    // the row.
+    if (cur_valid(e, c) && cur_rowid(e, c) == rowid) || seek_rowid(e, c, rowid)? {
         cur_delete(e, c)?
     }
     ok()

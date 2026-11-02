@@ -65,6 +65,95 @@ def bulk(seed, rows):
     return "\n".join(x for x in out if x) + "\n"
 
 
+def churn(seed, ops, page_size):
+    """Small pages under mixed inserts, updates and deletes: cells are freed
+    into freeblocks and reused, same-size updates overwrite rows in place
+    (overflow chains included), changed rows move, unchanged index entries
+    stay, and rowid changes move rows across pages."""
+    r = random.Random(seed)
+    out = [f"pragma page_size = {page_size};",
+           "create table c(id integer primary key, k text, n int, pad text, big text);",
+           "create index c_k on c(k);",
+           "create index c_nk on c(n, k);",
+           "create index c_part on c(k) where n > 0;",
+           "create index c_expr on c(n % 7, length(pad));",
+           "create table d(a text, b int, v text, primary key (a, b)) without rowid;",
+           "create index d_v on d(v);"]
+    w = out.append
+    live = []
+    next_id = 1
+
+    def val(n, k):
+        # A text of exactly n characters that depends on k.
+        if n <= 900:
+            return f"printf('%0{n}d', {k})" if n else "''"
+        return f"(printf('%0900d', {k}) || hex(zeroblob({(n - 900) // 2})))"
+
+    w("begin;")
+    for step in range(ops):
+        op = r.random()
+        if op < 0.3 or not live:
+            i = next_id
+            next_id += r.choice([1, 1, 1, 3, 50])
+            live.append(i)
+            big = r.choice([0, 0, 0, 20, page_size * 2, page_size * 5])
+            w(f"insert into c values ({i}, 'k{r.randint(0, 400)}', {r.randint(-5, 20)}, "
+              f"{val(r.randint(0, 120), i)}, {val(big, step)});")
+            w(f"insert or replace into d values ('a{r.randint(0, 60)}', {r.randint(0, 30)}, {val(r.randint(0, 80), step)});")
+        elif op < 0.45:
+            i = r.choice(live)
+            # Same length: overwritten in place.
+            w(f"update c set pad = {val(r.choice([0, 5, 30, 120]), step)} where id = {i} and length(pad) = 0;")
+            w(f"update c set big = substr(printf('%0900d', {step}) || big, 1, length(big)) where id = {i};")
+            w(f"update c set n = n + 1 where id = {i};")
+        elif op < 0.6:
+            i = r.choice(live)
+            # Size changes, indexed and unindexed columns.
+            w(f"update c set pad = {val(r.randint(0, 150), step)}, k = 'k{r.randint(0, 400)}' where id = {i};")
+            w(f"update c set big = {val(r.choice([0, 10, page_size, page_size * 3]), step)} where id = {i};")
+            w(f"update d set v = {val(r.randint(0, 90), step)} where a = 'a{r.randint(0, 60)}';")
+        elif op < 0.7:
+            # Whole-range updates, some leaving every index key unchanged.
+            lo = r.randint(1, next_id)
+            w(f"update c set pad = pad where id between {lo} and {lo + 40};")
+            w(f"update c set n = -n where id between {lo} and {lo + 25};")
+            w(f"update c set pad = substr(pad || pad || 'x', 1, 140) where id between {lo} and {lo + 30};")
+        elif op < 0.75 and len(live) > 2:
+            i = live.pop(r.randrange(len(live)))
+            j = next_id
+            next_id += 1
+            live.append(j)
+            w(f"update c set id = {j} where id = {i};")
+        elif op < 0.95:
+            i = live.pop(r.randrange(len(live)))
+            w(f"delete from c where id = {i};")
+            w(f"delete from d where b = {r.randint(0, 30)} and a < 'a{r.randint(0, 60)}';")
+        else:
+            lo = r.randint(1, next_id)
+            w(f"delete from c where id between {lo} and {lo + 60};")
+            live = [x for x in live if not lo <= x <= lo + 60]
+        if step % 500 == 499:
+            w("commit;")
+            w("select count(*), sum(n), sum(length(pad)), sum(length(big)), count(distinct k) from c;")
+            w("select count(*), sum(b), sum(length(v)) from d;")
+            w("pragma integrity_check;")
+            w("begin;")
+    w("commit;")
+    w("select count(*), sum(length(big)) from c;")
+    # Shrinking rows frees their overflow chains (and keeps the final
+    # read-back within the sorter's workspace).
+    w("update c set big = substr(big, -500) where length(big) > 500;")
+    w("pragma integrity_check;")
+    w("select id, k, n, pad, length(big), substr(big, -12) from c order by id;")
+    w("select id, n from c order by id desc;")
+    w("select k, n, id from c indexed by c_nk where n between -2 and 3 order by n, k, id;")
+    w("select k, id from c indexed by c_part where n > 0 order by k, id;")
+    w("select n % 7, length(pad), id from c indexed by c_expr order by 1, 2, 3 limit 200;")
+    w("select a, b, v from d order by v, a, b;")
+    w("pragma integrity_check;")
+    return "\n".join(out) + "\n"
+
+
 def sequential(rows):
     out = ["create table s(id integer primary key, a text, b real);", "create index s_a on s(a);", "begin;"]
     for i in range(rows):
@@ -172,6 +261,10 @@ def main():
     os.makedirs(target, exist_ok=True)
     with open(os.path.join(target, "bulk_random.sql"), "w") as f:
         f.write(bulk(7, 3000))
+    with open(os.path.join(target, "bulk_churn_512.sql"), "w") as f:
+        f.write(churn(13, 6000, 512))
+    with open(os.path.join(target, "bulk_churn_4096.sql"), "w") as f:
+        f.write(churn(17, 8000, 4096))
     with open(os.path.join(target, "bulk_sequential.sql"), "w") as f:
         f.write(sequential(20000))
     with open(os.path.join(target, "bulk_reals.sql"), "w", encoding="utf-8") as f:

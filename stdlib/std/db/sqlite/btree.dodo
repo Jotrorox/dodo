@@ -817,6 +817,46 @@ fn defragment(e: &mut Engine, pgno: u32) -> void!db.Error {
     ok()
 }
 
+// Takes `alloc` bytes from the page's freeblock list (first fit, from the
+// end of the block, as SQLite does). Returns the offset, or 0 when no block
+// fits or the leftover would push the fragment count past SQLite's limit.
+fn take_freeblock(e: &mut Engine, d: usize, ho: usize, alloc: usize) -> usize!db.Error {
+    prev := ho + 1
+    fb := rd16(e.ws, d + prev)
+    guard := 0usize
+    for fb != 0 {
+        if fb + 4 > e.usable || guard > e.usable / 4 {
+            return err(corrupt(e))
+        }
+        size := rd16(e.ws, d + fb + 2)
+        next := rd16(e.ws, d + fb)
+        if fb + size > e.usable {
+            return err(corrupt(e))
+        }
+        if size >= alloc {
+            rem := size - alloc
+            if rem < 4 {
+                frag := e.ws[d + ho + 7] as usize
+                if frag + rem > 57 {
+                    return ok(0)
+                }
+                wr16(e.ws, d + prev, next)
+                e.ws[d + ho + 7] = (frag + rem) as u8
+                return ok(fb)
+            }
+            wr16(e.ws, d + fb + 2, rem)
+            return ok(fb + rem)
+        }
+        if next != 0 && next <= fb {
+            return err(corrupt(e))
+        }
+        prev = fb
+        fb = next
+        guard += 1
+    }
+    ok(0)
+}
+
 // Inserts a cell at index `idx` if it fits; returns false otherwise.
 fn cell_insert(e: &mut Engine, pgno: u32, idx: usize, cell: usize, size: usize) -> bool!db.Error {
     d := pg_fetch(e, pgno)?
@@ -835,35 +875,145 @@ fn cell_insert(e: &mut Engine, pgno: u32, idx: usize, cell: usize, size: usize) 
     hs := hdr_size(t)
     top := ho + hs + 2 * n
     cs := content_start(e, d2, ho)
-    if cs < top + alloc + 2 {
-        defragment(e, pgno)?
+    if cs < top {
+        return err(corrupt(e))
     }
-    d3 := pg_fetch(e, pgno)?
-    cs2 := content_start(e, d3, ho)
-    at := cs2 - alloc
-    move_bytes(e.ws, cell, d3 + at, size)
+    at := 0usize
+    if cs >= top + 2 && rd16(e.ws, d2 + ho + 1) != 0 {
+        at = take_freeblock(e, d2, ho, alloc)?
+    }
+    if at == 0 {
+        if cs < top + alloc + 2 {
+            defragment(e, pgno)?
+        }
+        d3 := pg_fetch(e, pgno)?
+        at = content_start(e, d3, ho) - alloc
+        wr16(e.ws, d3 + ho + 5, at)
+    }
+    d4 := pg_fetch(e, pgno)?
+    move_bytes(e.ws, cell, d4 + at, size)
     if size < alloc {
-        zero_bytes(e.ws, d3 + at + size, alloc - size)
+        zero_bytes(e.ws, d4 + at + size, alloc - size)
     }
-    ptrs := d3 + ho + hs
+    ptrs := d4 + ho + hs
     move_bytes(e.ws, ptrs + 2 * idx, ptrs + 2 * idx + 2, 2 * (n - idx))
     wr16(e.ws, ptrs + 2 * idx, at)
-    wr16(e.ws, d3 + ho + 3, n + 1)
-    wr16(e.ws, d3 + ho + 5, at)
+    wr16(e.ws, d4 + ho + 3, n + 1)
     ok(true)
 }
 
-// Removes cell `idx` and repacks the page.
+// Returns `size` bytes at `start` to the page's free space: the sorted
+// freeblock list (merging neighbours; gaps under 4 bytes between them were
+// fragments) or, at the start of the content area, the unallocated gap.
+fn free_space(e: &mut Engine, d: usize, ho: usize, start: usize, size: usize) -> void!db.Error {
+    end := start + size
+    if end > e.usable {
+        return err(corrupt(e))
+    }
+    frag := e.ws[d + ho + 7] as usize
+    // Find the freeblocks before and after `start`.
+    prev := ho + 1
+    prev_blk := 0usize
+    fb := rd16(e.ws, d + prev)
+    guard := 0usize
+    for fb != 0 && fb < start {
+        if fb <= prev_blk || guard > e.usable / 4 {
+            return err(corrupt(e))
+        }
+        prev_blk = fb
+        prev = fb
+        fb = rd16(e.ws, d + fb)
+        guard += 1
+    }
+    if fb != 0 && fb < end {
+        return err(corrupt(e))
+    }
+    blk := start
+    blk_end := end
+    // Merge with the following block (absorbing a fragment gap).
+    if fb != 0 && fb <= end + 3 {
+        gap := fb - end
+        if gap > frag {
+            return err(corrupt(e))
+        }
+        frag -= gap
+        blk_end = fb + rd16(e.ws, d + fb + 2)
+        if blk_end > e.usable {
+            return err(corrupt(e))
+        }
+        fb = rd16(e.ws, d + fb)
+    }
+    // Merge with the preceding block.
+    if prev_blk != 0 {
+        pend := prev_blk + rd16(e.ws, d + prev_blk + 2)
+        if pend > start {
+            return err(corrupt(e))
+        }
+        if pend + 3 >= start {
+            gap := start - pend
+            if gap > frag {
+                return err(corrupt(e))
+            }
+            frag -= gap
+            blk = prev_blk
+        }
+    }
+    e.ws[d + ho + 7] = frag as u8
+    cs := content_start(e, d, ho)
+    if blk <= cs {
+        // The block begins the content area (so it is the first freeblock):
+        // grow the unallocated gap instead.
+        if blk < cs {
+            return err(corrupt(e))
+        }
+        wr16(e.ws, d + ho + 1, fb)
+        wr16(e.ws, d + ho + 5, blk_end)
+        return ok()
+    }
+    if blk != prev_blk {
+        wr16(e.ws, d + prev, blk)
+    }
+    wr16(e.ws, d + blk, fb)
+    wr16(e.ws, d + blk + 2, blk_end - blk)
+    ok()
+}
+
+// Removes cell `idx`; its space joins the page's free space.
 fn cell_remove(e: &mut Engine, pgno: u32, idx: usize) -> void!db.Error {
     d := pg_write(e, pgno)?
     ho := hoff(pgno)
     t := e.ws[d + ho]
     n := pg_ncells(e, d, ho)
+    if idx >= n {
+        return err(corrupt(e))
+    }
     hs := hdr_size(t)
     ptrs := d + ho + hs
+    off := rd16(e.ws, ptrs + 2 * idx)
+    if off < ho + hs + 2 * n || off >= e.usable {
+        return err(corrupt(e))
+    }
+    sz := cell_size(e, d + off, t)
+    alloc := if sz < 4 {
+        4usize
+    } else {
+        sz
+    }
     move_bytes(e.ws, ptrs + 2 * idx + 2, ptrs + 2 * idx, 2 * (n - idx - 1))
     wr16(e.ws, d + ho + 3, n - 1)
-    defragment(e, pgno)
+    if n == 1 {
+        // An empty page: reset it to a clean content area.
+        wr16(e.ws, d + ho + 1, 0)
+        let usable = e.usable
+        wr16(e.ws, d + ho + 5, if usable == 65536 {
+            0usize
+        } else {
+            usable
+        })
+        e.ws[d + ho + 7] = 0
+        return ok()
+    }
+    free_space(e, d, ho, off, alloc)
 }
 
 fn free_overflow(e: &mut Engine, cell: usize, t: u8) -> void!db.Error {
@@ -1439,13 +1589,74 @@ fn insert_cell_at_cursor(e: &mut Engine, c: usize, cell: usize, size: usize) -> 
 fn table_insert(e: &mut Engine, c: usize, rowid: i64, rec: usize, len: usize) -> void!db.Error {
     cursor_db(e, c)
     if seek_rowid(e, c, rowid)? {
-        cur_delete(e, c)?
-        seek_rowid(e, c, rowid)?
+        return table_replace(e, c, rowid, rec, len)
     }
     let cell_buf2 = e.cell_buf
     size := build_cell(e, 13, rowid, rec, len, cell_buf2)?
     let cell_buf3 = e.cell_buf
     insert_cell_at_cursor(e, c, cell_buf3, size)
+}
+
+// table_insert for a cursor known to be positioned on `rowid` (found by a
+// seek, with no change to the tree since).
+fn table_replace_at_cursor(e: &mut Engine, c: usize, rowid: i64, rec: usize, len: usize) -> void!db.Error {
+    cursor_db(e, c)
+    if !cur_valid(e, c) || cur_rowid(e, c) != rowid {
+        return table_insert(e, c, rowid, rec, len)
+    }
+    table_replace(e, c, rowid, rec, len)
+}
+
+// Replaces the row under the cursor (positioned on `rowid` in a table
+// leaf). A payload of the same size is overwritten in place, overflow pages
+// included; otherwise the new cell takes the old one's slot, with no second
+// seek.
+fn table_replace(e: &mut Engine, c: usize, rowid: i64, rec: usize, len: usize) -> void!db.Error {
+    level := depth(e, c) - 1
+    pg := path_pg(e, c, level)
+    idx := path_idx(e, c, level)
+    d := pg_fetch(e, pg)?
+    ho := hoff(pg)
+    t := e.ws[d + ho]
+    if t != 13 || idx >= pg_ncells(e, d, ho) {
+        return err(corrupt(e))
+    }
+    cell := cell_at(e, d, ho, t, idx)
+    let (size, off, local, _) = cell_info(e, cell, t)
+    if size == (len as u64) {
+        coff := cell - d
+        d2 := pg_write(e, pg)?
+        move_bytes(e.ws, rec, d2 + coff + off, local)
+        if local < len {
+            next := rd32(e.ws, d2 + coff + off + local)
+            done := local
+            chunk := e.usable - 4
+            guard := 0usize
+            for done < len {
+                if next == 0 || next > e.db_pages || guard > 1000000 {
+                    return err(corrupt(e))
+                }
+                od := pg_write(e, next)?
+                n := if len - done < chunk {
+                    len - done
+                } else {
+                    chunk
+                }
+                move_bytes(e.ws, rec + done, od + 4, n)
+                done += n
+                next = rd32(e.ws, od)
+                guard += 1
+            }
+        }
+        set_state(e, c, ST_INVALID)
+        return ok()
+    }
+    free_overflow(e, cell, t)?
+    cell_remove(e, pg, idx)?
+    let cell_buf2 = e.cell_buf
+    nsize := build_cell(e, 13, rowid, rec, len, cell_buf2)?
+    let cell_buf3 = e.cell_buf
+    insert_cell_at_cursor(e, c, cell_buf3, nsize)
 }
 
 // Inserts an index record (key fields followed by the rowid). The record's
