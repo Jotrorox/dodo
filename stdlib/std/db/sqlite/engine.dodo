@@ -104,6 +104,8 @@ struct Engine {
     stmt_slots: usize
     reg_off: usize
     cur_off: usize
+    // Bit c is set while cursor c may cache a payload in the arena.
+    pay_mask: u64
     arena_off: usize
     arena_cap: usize
     arena_top: usize
@@ -156,6 +158,9 @@ struct Engine {
     cell_buf: usize
     cell_buf2: usize
     stamp: u64
+    // Page cache recency list ends (slot + 1, 0 = empty); see pager.dodo.
+    lru_head: usize
+    lru_tail: usize
     // Cache slot size: the largest page size of the open databases.
     slot_ps: usize
 
@@ -422,63 +427,126 @@ fn full(e: &mut Engine, what: &str) -> db.Error {
 
 // ---------------------------------------------------------------------------
 // Byte helpers
+//
+// These run in every inner loop (page parsing, records, registers, cursor
+// state), so each one checks its whole range once and then reads through a
+// raw pointer; LLVM merges the byte accesses into single loads and stores.
+// `o <= b.len && b.len - o >= n` cannot overflow, unlike `o + n <= b.len`.
 
+@inline
 fn rd16(b: &[u8], o: usize) -> usize {
-    ((b[o] as usize) << 8) | (b[o + 1] as usize)
+    core.assert(o <= b.len && b.len - o >= 2)
+    unsafe {
+        p := ptr.offset(ptr.as_ptr(b), o as isize)
+        ((*p as usize) << 8) | (*ptr.offset(p, 1) as usize)
+    }
 }
 
+@inline
 fn wr16(b: &mut[u8], o: usize, v: usize) {
-    b[o] = ((v >> 8) & 255) as u8
-    b[o + 1] = (v & 255) as u8
+    core.assert(o <= b.len && b.len - o >= 2)
+    unsafe {
+        p := ptr.offset(ptr.as_mut_ptr(b), o as isize)
+        *p = ((v >> 8) & 255) as u8
+        *ptr.offset(p, 1) = (v & 255) as u8
+    }
 }
 
+@inline
 fn rd32(b: &[u8], o: usize) -> u32 {
-    ((b[o] as u32) << 24) | ((b[o + 1] as u32) << 16) | ((b[o + 2] as u32) << 8) | (b[o + 3] as u32)
+    core.assert(o <= b.len && b.len - o >= 4)
+    unsafe {
+        p := ptr.offset(ptr.as_ptr(b), o as isize)
+        ((*p as u32) << 24) | ((*ptr.offset(p, 1) as u32) << 16) | ((*ptr.offset(p, 2) as u32) << 8) | (*ptr.offset(p, 3) as u32)
+    }
 }
 
+@inline
 fn wr32(b: &mut[u8], o: usize, v: u32) {
-    b[o] = ((v >> 24) & 255) as u8
-    b[o + 1] = ((v >> 16) & 255) as u8
-    b[o + 2] = ((v >> 8) & 255) as u8
-    b[o + 3] = (v & 255) as u8
+    core.assert(o <= b.len && b.len - o >= 4)
+    unsafe {
+        p := ptr.offset(ptr.as_mut_ptr(b), o as isize)
+        *p = ((v >> 24) & 255) as u8
+        *ptr.offset(p, 1) = ((v >> 16) & 255) as u8
+        *ptr.offset(p, 2) = ((v >> 8) & 255) as u8
+        *ptr.offset(p, 3) = (v & 255) as u8
+    }
 }
 
 // Native-order helpers for engine bookkeeping (little endian).
+@inline
 fn ld32(b: &[u8], o: usize) -> u32 {
-    (b[o] as u32) | ((b[o + 1] as u32) << 8) | ((b[o + 2] as u32) << 16) | ((b[o + 3] as u32) << 24)
+    core.assert(o <= b.len && b.len - o >= 4)
+    unsafe {
+        p := ptr.offset(ptr.as_ptr(b), o as isize)
+        (*p as u32) | ((*ptr.offset(p, 1) as u32) << 8) | ((*ptr.offset(p, 2) as u32) << 16) | ((*ptr.offset(p, 3) as u32) << 24)
+    }
 }
 
+@inline
 fn st32(b: &mut[u8], o: usize, v: u32) {
-    b[o] = (v & 255) as u8
-    b[o + 1] = ((v >> 8) & 255) as u8
-    b[o + 2] = ((v >> 16) & 255) as u8
-    b[o + 3] = ((v >> 24) & 255) as u8
+    core.assert(o <= b.len && b.len - o >= 4)
+    unsafe {
+        p := ptr.offset(ptr.as_mut_ptr(b), o as isize)
+        *p = (v & 255) as u8
+        *ptr.offset(p, 1) = ((v >> 8) & 255) as u8
+        *ptr.offset(p, 2) = ((v >> 16) & 255) as u8
+        *ptr.offset(p, 3) = ((v >> 24) & 255) as u8
+    }
 }
 
+@inline
 fn ldu(b: &[u8], o: usize) -> usize {
     ld32(b, o) as usize
 }
 
+@inline
 fn stu(b: &mut[u8], o: usize, v: usize) {
     st32(b, o, v as u32)
 }
 
+@inline
 fn ld64(b: &[u8], o: usize) -> u64 {
-    (ld32(b, o) as u64) | ((ld32(b, o + 4) as u64) << 32)
+    core.assert(o <= b.len && b.len - o >= 8)
+    unsafe {
+        p := ptr.offset(ptr.as_ptr(b), o as isize)
+        v := 0u64
+        for k in 0usize..8 {
+            i := 7 - k
+            v = (v << 8) | (*ptr.offset(p, i as isize) as u64)
+        }
+        v
+    }
 }
 
+@inline
 fn st64(b: &mut[u8], o: usize, v: u64) {
-    st32(b, o, (v & 0xffffffffu64) as u32)
-    st32(b, o + 4, (v >> 32) as u32)
+    core.assert(o <= b.len && b.len - o >= 8)
+    unsafe {
+        p := ptr.offset(ptr.as_mut_ptr(b), o as isize)
+        for i in 0usize..8 {
+            *ptr.offset(p, i as isize) = ((v >> ((i * 8) as u64)) & 255) as u8
+        }
+    }
 }
 
+@inline
 fn ld16(b: &[u8], o: usize) -> usize {
-    (b[o] as usize) | ((b[o + 1] as usize) << 8)
+    core.assert(o <= b.len && b.len - o >= 2)
+    unsafe {
+        p := ptr.offset(ptr.as_ptr(b), o as isize)
+        (*p as usize) | ((*ptr.offset(p, 1) as usize) << 8)
+    }
 }
 
+@inline
 fn st16(b: &mut[u8], o: usize, v: usize) {
-    b[o] = (v & 255) as u8
-    b[o + 1] = ((v >> 8) & 255) as u8
+    core.assert(o <= b.len && b.len - o >= 2)
+    unsafe {
+        p := ptr.offset(ptr.as_mut_ptr(b), o as isize)
+        *p = (v & 255) as u8
+        *ptr.offset(p, 1) = ((v >> 8) & 255) as u8
+    }
 }
 
 fn i2u(v: i64) -> u64 {
@@ -538,7 +606,17 @@ fn copy_in(b: &mut[u8], dst: usize, src: &[u8]) {
 }
 
 // SQLite varint: big-endian groups of 7 bits, 9th byte carries 8 bits.
+@inline
 fn get_varint(b: &[u8], o: usize) -> (u64, usize) {
+    byte := b[o]
+    if byte < 128 {
+        return (byte as u64, 1)
+    }
+    get_varint_long(b, o)
+}
+
+@inline(never)
+fn get_varint_long(b: &[u8], o: usize) -> (u64, usize) {
     v := 0u64
     for i in 0usize..8 {
         byte := b[o + i]
@@ -804,6 +882,7 @@ fn layout_tail(e: &mut Engine) -> void!db.Error {
     let meta_off2 = e.meta_off
     let cache_off2 = e.cache_off - e.meta_off
     zero_bytes(e.ws, meta_off2, cache_off2)
+    lru_init(e)
     ok()
 }
 
@@ -811,37 +890,45 @@ fn layout_tail(e: &mut Engine) -> void!db.Error {
 // Registers: 32 bytes each. [0] type, [8..16] payload, [16..20] data
 // offset, [20..24] data length.
 
+@inline
 fn reg_at(e: &Engine, r: usize) -> usize {
     core.assert(r < NREGS)
     e.reg_off + r * REG_BYTES
 }
 
+@inline
 fn rtype(e: &Engine, r: usize) -> u8 {
     e.ws[reg_at(e, r)]
 }
 
+@inline
 fn rint(e: &Engine, r: usize) -> i64 {
     u2i(ld64(e.ws, reg_at(e, r) + 8))
 }
 
+@inline
 fn rreal(e: &Engine, r: usize) -> f64 {
     u2f(ld64(e.ws, reg_at(e, r) + 8))
 }
 
+@inline
 fn roff(e: &Engine, r: usize) -> usize {
     ldu(e.ws, reg_at(e, r) + 16)
 }
 
+@inline
 fn rlen(e: &Engine, r: usize) -> usize {
     ldu(e.ws, reg_at(e, r) + 20)
 }
 
+@inline
 fn set_null(e: &mut Engine, r: usize) {
     o := reg_at(e, r)
     e.ws[o] = T_NULL
     e.ws[o + 1] = 0
 }
 
+@inline
 fn set_int(e: &mut Engine, r: usize, v: i64) {
     o := reg_at(e, r)
     e.ws[o] = T_INT
@@ -849,6 +936,7 @@ fn set_int(e: &mut Engine, r: usize, v: i64) {
     st64(e.ws, o + 8, i2u(v))
 }
 
+@inline
 fn set_real(e: &mut Engine, r: usize, v: f64) {
     o := reg_at(e, r)
     e.ws[o] = T_REAL
@@ -856,6 +944,7 @@ fn set_real(e: &mut Engine, r: usize, v: f64) {
     st64(e.ws, o + 8, f2u(v))
 }
 
+@inline
 fn set_bytes(e: &mut Engine, r: usize, t: u8, off: usize, len: usize) {
     o := reg_at(e, r)
     e.ws[o] = t
@@ -889,16 +978,35 @@ fn arena_alloc(e: &mut Engine, len: usize) -> usize!db.Error {
 }
 
 // Resets the arena to `mark`, invalidating cursor payload copies above it.
+// Records that cursor `c` caches a payload, for arena_reset.
+@inline
+fn note_payload(e: &mut Engine, c: usize) {
+    e.pay_mask = e.pay_mask | (1u64 << (c as u64))
+}
+
+// Frees the arena above `mark` and drops the cursor payloads cached there.
 fn arena_reset(e: &mut Engine, mark: usize) {
     e.arena_top = mark
     end := e.arena_off + e.arena_cap
-    for c in 0usize..NCURSORS {
-        co := e.cur_off + c * CURSOR_BYTES
-        po := ldu(e.ws, co + C_PAYOFF)
-        if po >= mark && po < end {
-            stu(e.ws, co + C_PAYOFF, 0)
-            e.ws[co + C_PAYVALID] = 0
+    m := e.pay_mask
+    c := 0usize
+    for m != 0 {
+        if (m & 255u64) == 0 {
+            m = m >> 8
+            c += 8
+            continue
         }
+        if (m & 1u64) != 0 {
+            co := e.cur_off + c * CURSOR_BYTES
+            po := ldu(e.ws, co + C_PAYOFF)
+            if po >= mark && po < end {
+                stu(e.ws, co + C_PAYOFF, 0)
+                e.ws[co + C_PAYVALID] = 0
+                e.pay_mask = e.pay_mask & ~(1u64 << (c as u64))
+            }
+        }
+        m = m >> 1
+        c += 1
     }
 }
 

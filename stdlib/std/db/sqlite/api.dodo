@@ -175,42 +175,43 @@ pub struct Connection {
             stmt_finish(&mut self.e, slot, true)?
         }
         sh_set(&mut self.e, slot, SH_INUSE, 0)
-        copy_in(self.e.ws, base + SLOT_SQL, bytes)
-        e := &mut self.e
-        e.src = base + SLOT_SQL
-        e.src_end = e.src + bytes.len
-        e.pos = e.src
-        e.ts = e.src
-        e.tl = 0
-        next_token(e)
-        if e.tk == TK_EOF {
-            return ok(0)
-        }
-        // Like sqlite3_complete: inside CREATE [TEMP] TRIGGER, only a
-        // semicolon after END ends the statement.
-        trigger := false
-        if is_kw(e, "CREATE") {
+        // Scan a growing window, so a long script is not copied into the slot
+        // once per statement. A cut-off window is trusted only when the
+        // semicolon and the start of the next token both lie inside it.
+        win := 4096usize
+        for {
+            if win > bytes.len {
+                win = bytes.len
+            }
+            copy_in(self.e.ws, base + SLOT_SQL, &bytes[..win])
+            e := &mut self.e
+            e.src = base + SLOT_SQL
+            e.src_end = e.src + win
+            e.pos = e.src
+            e.ts = e.src
+            e.tl = 0
             next_token(e)
-            if is_kw(e, "TEMP") || is_kw(e, "TEMPORARY") {
+            if win < bytes.len {
+                if e.tk != TK_EOF && scan_to_statement_end(e) {
+                    next_token(e)
+                    if e.tk != TK_EOF {
+                        return ok(e.ts - e.src)
+                    }
+                }
+                win = win * 4
+                continue
+            }
+            if e.tk == TK_EOF {
+                return ok(0)
+            }
+            if !scan_to_statement_end(e) && bytes.len < all.len {
+                return err(fail(e, SQLITE_TOOBIG, "statement too long for the statement workspace"))
+            }
+            if e.tk == TK_SEMI {
                 next_token(e)
             }
-            trigger = is_kw(e, "TRIGGER")
+            return ok(e.ts - e.src)
         }
-        after_end := false
-        for e.tk != TK_EOF {
-            if e.tk == TK_SEMI && (!trigger || after_end) {
-                break
-            }
-            after_end = e.tk == TK_ID && is_kw(e, "END")
-            next_token(e)
-        }
-        if e.tk != TK_SEMI && bytes.len < all.len {
-            return err(fail(e, SQLITE_TOOBIG, "statement too long for the statement workspace"))
-        }
-        if e.tk == TK_SEMI {
-            next_token(e)
-        }
-        ok(e.ts - e.src)
     }
 
     // Runs one statement and returns the number of rows it changed.
@@ -630,4 +631,27 @@ pub struct Row {
         }
         some(n)
     }
+}
+
+// Advances from the first token of a statement to the semicolon that ends
+// it; false when the input ends first. Like sqlite3_complete: inside
+// CREATE [TEMP] TRIGGER, only a semicolon after END ends the statement.
+fn scan_to_statement_end(e: &mut Engine) -> bool {
+    trigger := false
+    if is_kw(e, "CREATE") {
+        next_token(e)
+        if is_kw(e, "TEMP") || is_kw(e, "TEMPORARY") {
+            next_token(e)
+        }
+        trigger = is_kw(e, "TRIGGER")
+    }
+    after_end := false
+    for e.tk != TK_EOF {
+        if e.tk == TK_SEMI && (!trigger || after_end) {
+            return true
+        }
+        after_end = e.tk == TK_ID && is_kw(e, "END")
+        next_token(e)
+    }
+    false
 }

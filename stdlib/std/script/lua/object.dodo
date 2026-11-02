@@ -237,6 +237,25 @@ fn set_float(v: *mut Value, f: f64) {
         (*v).tag = TAG_FLOAT
     }
 }
+// set_int and set_float for the interpreter's arithmetic: the volatile store
+// keeps LLVM from merging the integer and float result stores of an opcode
+// into one, which would move integer results through a float register; a
+// later integer load of that slot then waits on a slow cross-register-file
+// store-to-load forward.
+@inline
+fn set_int_gpr(v: *mut Value, i: i64) {
+    unsafe {
+        ptr.write_volatile(v as *mut i64, i)
+        (*v).tag = TAG_INT
+    }
+}
+@inline
+fn set_float_fpr(v: *mut Value, f: f64) {
+    unsafe {
+        ptr.write_volatile(v as *mut f64, f)
+        (*v).tag = TAG_FLOAT
+    }
+}
 fn set_lightud(v: *mut Value, p: *mut u8) {
     unsafe {
         *(v as *mut *mut u8) = p

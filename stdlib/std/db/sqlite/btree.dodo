@@ -41,11 +41,13 @@ const G_DOFF: usize = 20
 const G_DCAP: usize = 24
 const G_ENTRIES: usize = 32
 
+@inline
 fn cur(e: &Engine, c: usize) -> usize {
     core.assert(c < NCURSORS)
     e.cur_off + c * CURSOR_BYTES
 }
 
+@inline
 fn hoff(pgno: u32) -> usize {
     if pgno == 1 {
         100
@@ -54,10 +56,12 @@ fn hoff(pgno: u32) -> usize {
     }
 }
 
+@inline
 fn is_leaf(t: u8) -> bool {
     t == 10 || t == 13
 }
 
+@inline
 fn hdr_size(t: u8) -> usize {
     if is_leaf(t) {
         8
@@ -66,14 +70,17 @@ fn hdr_size(t: u8) -> usize {
     }
 }
 
+@inline
 fn pg_ncells(e: &Engine, d: usize, ho: usize) -> usize {
     rd16(e.ws, d + ho + 3)
 }
 
+@inline
 fn cell_at(e: &Engine, d: usize, ho: usize, t: u8, i: usize) -> usize {
     d + rd16(e.ws, d + ho + hdr_size(t) + 2 * i)
 }
 
+@inline
 fn child_at(e: &Engine, d: usize, ho: usize, t: u8, i: usize) -> u32 {
     if i >= pg_ncells(e, d, ho) {
         return rd32(e.ws, d + ho + 8)
@@ -81,39 +88,47 @@ fn child_at(e: &Engine, d: usize, ho: usize, t: u8, i: usize) -> u32 {
     rd32(e.ws, cell_at(e, d, ho, t, i))
 }
 
+@inline
 fn path_pg(e: &Engine, c: usize, level: usize) -> u32 {
     ld32(e.ws, cur(e, c) + C_PATH + level * 8)
 }
 
+@inline
 fn path_idx(e: &Engine, c: usize, level: usize) -> usize {
     ldu(e.ws, cur(e, c) + C_PATH + level * 8 + 4)
 }
 
+@inline
 fn set_path(e: &mut Engine, c: usize, level: usize, pgno: u32, idx: usize) {
     o := cur(e, c) + C_PATH + level * 8
     st32(e.ws, o, pgno)
     stu(e.ws, o + 4, idx)
 }
 
+@inline
 fn set_idx(e: &mut Engine, c: usize, level: usize, idx: usize) {
     let cursor = cur(e, c) + C_PATH + level * 8 + 4
     stu(e.ws, cursor, idx)
 }
 
+@inline
 fn depth(e: &Engine, c: usize) -> usize {
     e.ws[cur(e, c) + C_DEPTH] as usize
 }
 
+@inline
 fn set_depth(e: &mut Engine, c: usize, d: usize) {
     e.ws[cur(e, c) + C_DEPTH] = d as u8
 }
 
+@inline
 fn set_state(e: &mut Engine, c: usize, s: u8) {
     o := cur(e, c)
     e.ws[o + C_STATE] = s
     e.ws[o + C_PAYVALID] = 0
 }
 
+@inline
 fn cur_valid(e: &Engine, c: usize) -> bool {
     e.ws[cur(e, c) + C_STATE] == ST_VALID
 }
@@ -151,6 +166,7 @@ fn cur_rowid(e: &Engine, c: usize) -> i64 {
 // ---------------------------------------------------------------------------
 // Cell parsing
 
+@inline
 fn max_local(e: &Engine, table_leaf: bool) -> usize {
     if table_leaf {
         return e.usable - 35
@@ -158,6 +174,7 @@ fn max_local(e: &Engine, table_leaf: bool) -> usize {
     (e.usable - 12) * 64 / 255 - 23
 }
 
+@inline
 fn local_size(e: &Engine, p: u64, table_leaf: bool) -> usize {
     x := max_local(e, table_leaf)
     if p <= (x as u64) {
@@ -267,6 +284,7 @@ fn cur_payload(e: &mut Engine, c: usize) -> (usize, usize)!db.Error {
     cell := cell_at(e, d, ho, t, idx)
     let (p, n) = load_payload(e, cell, t)?
     o2 := cur(e, c)
+    note_payload(e, c)
     stu(e.ws, o2 + C_PAYOFF, p)
     stu(e.ws, o2 + C_PAYLEN, n)
     e.ws[o2 + C_PAYVALID] = 1
@@ -915,10 +933,12 @@ fn build_cell(e: &mut Engine, t: u8, rowid: i64, rec: usize, size: usize, dst: u
 // ---------------------------------------------------------------------------
 // Gather buffers
 
+@inline
 fn g_entry_cap(e: &Engine, g: usize) -> usize {
     ldu(e.ws, g + G_ECAP)
 }
 
+@inline
 fn g_data(e: &Engine, g: usize) -> usize {
     g + ldu(e.ws, g + G_DOFF)
 }
@@ -930,16 +950,19 @@ fn g_reset(e: &mut Engine, g: usize, t: u8, right: u32) {
     e.ws[g + G_TYPE] = t
 }
 
+@inline
 fn g_n(e: &Engine, g: usize) -> usize {
     ldu(e.ws, g + G_N)
 }
 
 // Entries hold cell offsets; cells are appended back to back, so a cell's
 // size is the distance to the next one (or to the end of the data).
+@inline
 fn g_off(e: &Engine, g: usize, i: usize) -> usize {
     ldu(e.ws, g + G_ENTRIES + i * 4)
 }
 
+@inline
 fn g_size(e: &Engine, g: usize, i: usize) -> usize {
     end := if i + 1 < g_n(e, g) {
         g_off(e, g, i + 1)
@@ -1201,30 +1224,35 @@ fn rebalance(e: &mut Engine, c: usize, level: usize) -> void!db.Error {
             starts[m - 1] = ends[k] + 1
             ends[m - 1] = n
         }
-        // Even out the last two pages so the right one is not nearly empty,
-        // except when appending at the right edge of the tree (sequential
-        // inserts then leave full pages behind, like SQLite's quick balance).
+        // Greedy packing leaves every page but the last full, so the next
+        // insert into one of them would split again. Even out each adjacent
+        // pair from right to left (as SQLite does), except when appending at
+        // the right edge of the tree: sequential inserts then leave full
+        // pages behind, like SQLite's quick balance.
         if m > 1 && !e.bal_append {
-            k := m - 2
-            left := g_bytes(e, ga, starts[k], ends[k])
-            right := g_bytes(e, ga, starts[k + 1], ends[k + 1])
-            for ends[k] - starts[k] > 1 {
-                // Move the last cell of the left page right. With dividers,
-                // the old divider joins the right page and the left page's
-                // last cell becomes the divider.
-                lsz := g_bytes(e, ga, ends[k] - 1, ends[k])
-                gain := if consuming {
-                    g_bytes(e, ga, ends[k], ends[k] + 1)
-                } else {
-                    lsz
+            k := m - 1
+            for k > 0 {
+                k -= 1
+                left := g_bytes(e, ga, starts[k], ends[k])
+                right := g_bytes(e, ga, starts[k + 1], ends[k + 1])
+                for ends[k] - starts[k] > 1 {
+                    // Move the last cell of the left page right. With
+                    // dividers, the old divider joins the right page and the
+                    // left page's last cell becomes the divider.
+                    lsz := g_bytes(e, ga, ends[k] - 1, ends[k])
+                    gain := if consuming {
+                        g_bytes(e, ga, ends[k], ends[k] + 1)
+                    } else {
+                        lsz
+                    }
+                    if right + gain > cap || (consuming && left - lsz <= right + gain) || (!consuming && left - lsz < right + gain) {
+                        break
+                    }
+                    left -= lsz
+                    right += gain
+                    ends[k] -= 1
+                    starts[k + 1] -= 1
                 }
-                if right + gain > cap || (consuming && left - lsz <= right + gain) || (!consuming && left - lsz < right + gain) {
-                    break
-                }
-                left -= lsz
-                right += gain
-                ends[k] -= 1
-                starts[k + 1] -= 1
             }
         }
         // Assign pages.

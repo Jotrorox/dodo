@@ -18,8 +18,13 @@ const WRITER_VERSION: u32 = 3045000
 
 // Slot metadata: [0..4] page number (0 = free), [4] dirty, [5] database
 // (SLOT_JOURNAL | database for a memory database's rollback image, which
-// is not in the hash table), [8..16] stamp. One cache serves every attached
+// is not in the hash table), [8..12] and [12..16] the previous and next
+// slot (+1, 0 = none) in the recency list. One cache serves every attached
 // database; slots are slot_ps bytes, the largest page size in use.
+//
+// The recency list runs from the most recently used slot (e.lru_head) to
+// the least recently used one (e.lru_tail); freed slots go to the tail, so
+// a miss takes a free slot or evicts the least recently used page in O(1).
 
 const SLOT_JOURNAL: u8 = 128
 
@@ -29,6 +34,82 @@ fn slot_meta(e: &Engine, s: usize) -> usize {
 
 fn slot_data(e: &Engine, s: usize) -> usize {
     e.cache_off + s * e.slot_ps
+}
+
+fn lru_unlink(e: &mut Engine, s: usize) {
+    m := slot_meta(e, s)
+    prev := ldu(e.ws, m + 8)
+    next := ldu(e.ws, m + 12)
+    if prev != 0 {
+        let pm = slot_meta(e, prev - 1) + 12
+        stu(e.ws, pm, next)
+    } else {
+        e.lru_head = next
+    }
+    if next != 0 {
+        let nm = slot_meta(e, next - 1) + 8
+        stu(e.ws, nm, prev)
+    } else {
+        e.lru_tail = prev
+    }
+}
+
+fn lru_push_head(e: &mut Engine, s: usize) {
+    m := slot_meta(e, s)
+    let head = e.lru_head
+    stu(e.ws, m + 8, 0)
+    stu(e.ws, m + 12, head)
+    if head != 0 {
+        let hm = slot_meta(e, head - 1) + 8
+        stu(e.ws, hm, s + 1)
+    } else {
+        e.lru_tail = s + 1
+    }
+    e.lru_head = s + 1
+}
+
+fn lru_push_tail(e: &mut Engine, s: usize) {
+    m := slot_meta(e, s)
+    let tail = e.lru_tail
+    stu(e.ws, m + 8, tail)
+    stu(e.ws, m + 12, 0)
+    if tail != 0 {
+        let tm = slot_meta(e, tail - 1) + 12
+        stu(e.ws, tm, s + 1)
+    } else {
+        e.lru_head = s + 1
+    }
+    e.lru_tail = s + 1
+}
+
+// Marks slot `s` most recently used.
+@inline
+fn lru_touch(e: &mut Engine, s: usize) {
+    if e.lru_head != s + 1 {
+        lru_unlink(e, s)
+        lru_push_head(e, s)
+    }
+}
+
+// Links every slot into the recency list; the metadata must be zeroed.
+fn lru_init(e: &mut Engine) {
+    e.lru_head = 0
+    e.lru_tail = 0
+    for s in 0usize..e.nslots {
+        lru_push_tail(e, s)
+    }
+}
+
+// Empties slot `s` (it must not be in the hash table) and queues it for
+// reuse before any page is evicted.
+fn slot_release(e: &mut Engine, s: usize) {
+    m := slot_meta(e, s)
+    st32(e.ws, m, 0)
+    e.ws[m + 4] = 0
+    if e.lru_tail != s + 1 {
+        lru_unlink(e, s)
+        lru_push_tail(e, s)
+    }
 }
 
 fn slot_tag(e: &Engine, s: usize) -> u8 {
@@ -138,8 +219,7 @@ fn cache_clear(e: &mut Engine) {
     for s in 0usize..e.nslots {
         m := slot_meta(e, s)
         if ld32(e.ws, m) != 0 && ((e.ws[m + 5] & 127) as usize) == db {
-            st32(e.ws, m, 0)
-            e.ws[m + 4] = 0
+            slot_release(e, s)
             any = true
         }
     }
@@ -155,6 +235,7 @@ fn cache_clear_all(e: &mut Engine) {
         st32(e.ws, m, 0)
         e.ws[m + 4] = 0
     }
+    lru_init(e)
     let hash_off2 = e.hash_off
     let hash_cap2 = e.hash_cap * 4
     zero_bytes(e.ws, hash_off2, hash_cap2)
@@ -164,9 +245,7 @@ fn cache_drop(e: &mut Engine, pgno: u32) {
     v := hash_find(e, pgno)
     if v != 0 {
         hash_remove(e, pgno)
-        m := slot_meta(e, v - 1)
-        st32(e.ws, m, 0)
-        e.ws[m + 4] = 0
+        slot_release(e, v - 1)
     }
 }
 
@@ -1122,41 +1201,39 @@ fn pending_page(e: &Engine) -> u32 {
 }
 
 fn pick_victim(e: &mut Engine) -> usize!db.Error {
-    best := e.nslots
-    best_stamp := 18446744073709551615u64
-    for s in 0usize..e.nslots {
+    // Walk from the least recently used end. Pinned slots (pages of
+    // in-memory databases and their rollback images) move to the front so
+    // later misses do not walk over them again.
+    for _ in 0usize..e.nslots {
+        tail := e.lru_tail
+        if tail == 0 {
+            break
+        }
+        s := tail - 1
         m := slot_meta(e, s)
-        if ld32(e.ws, m) == 0 {
+        pgno := ld32(e.ws, m)
+        lru_touch(e, s)
+        if pgno == 0 {
             return ok(s)
         }
-        // Pages of in-memory databases and their rollback images stay.
         tag := e.ws[m + 5]
         if (tag & SLOT_JOURNAL) != 0 || db_is_memory(e, tag as usize) {
             continue
         }
-        st := ld64(e.ws, m + 8)
-        if st < best_stamp {
-            best_stamp = st
-            best = s
+        owner := tag as usize
+        if e.ws[m + 4] != 0 {
+            // The page may belong to another attached database.
+            here := e.cur_db
+            use_db(e, owner)
+            r := spill(e, s)
+            use_db(e, here)
+            r?
         }
+        hash_remove_in(e, owner, pgno)
+        st32(e.ws, m, 0)
+        return ok(s)
     }
-    if best == e.nslots {
-        return err(full(e, "page cache (in-memory database is full)"))
-    }
-    m := slot_meta(e, best)
-    pgno := ld32(e.ws, m)
-    owner := e.ws[m + 5] as usize
-    if e.ws[m + 4] != 0 {
-        // The page may belong to another attached database.
-        here := e.cur_db
-        use_db(e, owner)
-        r := spill(e, best)
-        use_db(e, here)
-        r?
-    }
-    hash_remove_in(e, owner, pgno)
-    st32(e.ws, m, 0)
-    ok(best)
+    err(full(e, "page cache (in-memory database is full)"))
 }
 
 // Writes a dirty page to the database file before the transaction commits.
@@ -1192,12 +1269,9 @@ fn pg_fetch(e: &mut Engine, pgno: u32) -> usize!db.Error {
     if pgno == 0 || pgno > e.db_pages {
         return err(corrupt(e))
     }
-    e.stamp += 1
     v := hash_find(e, pgno)
     if v != 0 {
-        let meta = slot_meta(e, v - 1) + 8
-        let stamp2 = e.stamp
-        st64(e.ws, meta, stamp2)
+        lru_touch(e, v - 1)
         return ok(slot_data(e, v - 1))
     }
     s := pick_victim(e)?
@@ -1234,8 +1308,6 @@ fn pg_fetch(e: &mut Engine, pgno: u32) -> usize!db.Error {
     e.ws[m + 4] = 0
     let tag = e.cur_db as u8
     e.ws[m + 5] = tag
-    let stamp3 = e.stamp
-    st64(e.ws, m + 8, stamp3)
     hash_insert(e, pgno, s)
     ok(d)
 }
@@ -2096,13 +2168,13 @@ fn commit_phase_one(e: &mut Engine, sup: usize, sup_len: usize) -> void!db.Error
                 continue
             }
             if tag == (SLOT_JOURNAL | db) {
-                st32(e.ws, m, 0)
+                slot_release(e, s)
                 e.ws[m + 4] = 0
             } else if tag == db {
                 e.ws[m + 4] = 0
                 if pgno > e.db_pages {
                     hash_remove(e, pgno)
-                    st32(e.ws, m, 0)
+                    slot_release(e, s)
                 }
             }
         }
@@ -2235,7 +2307,7 @@ fn rollback_db(e: &mut Engine) -> void!db.Error {
                     let page_size2 = e.page_size
                     move_bytes(e.ws, src, data, page_size2)
                 }
-                st32(e.ws, m, 0)
+                slot_release(e, s)
                 e.ws[m + 4] = 0
             }
         }
@@ -2246,7 +2318,7 @@ fn rollback_db(e: &mut Engine) -> void!db.Error {
                 if ld32(e.ws, m) > e.file_pages {
                     let ld322 = ld32(e.ws, m)
                     hash_remove(e, ld322)
-                    st32(e.ws, m, 0)
+                    slot_release(e, s)
                 }
             }
         }

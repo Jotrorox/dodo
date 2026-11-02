@@ -781,11 +781,11 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                     },
                     1 => {
                         // LOADI
-                        set_int(ra, (arg_sbx(i)) as i64)
+                        set_int_gpr(ra, (arg_sbx(i)) as i64)
                     },
                     2 => {
                         // LOADF
-                        set_float(ra, (arg_sbx(i)) as f64)
+                        set_float_fpr(ra, (arg_sbx(i)) as f64)
                     },
                     3 => {
                         // LOADK
@@ -888,7 +888,7 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                         } else {
                             kv := Value { bits: 0, tag: 0 }
                             let key = ptr.from_mut(&mut kv)
-                            set_int(key, c)
+                            set_int_gpr(key, c)
                             (*ci).savedpc = pc
                             (*L).top = (*ci).top
                             vm_finish_get(L, rb, key, sdiff(ra, (*L).stack), slot)?
@@ -930,6 +930,13 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                         if !ptr.is_null(slot) && !val_is_empty(slot) {
                             set_obj(slot, rc)
                             gc_barrier_back(L, val_gc(upv) as *mut Table, rc)
+                        } else if !ptr.is_null(slot) && (*slot).tag != TAG_ABSENT && tab_no_newindex(val_gc(upv) as *mut Table) {
+                            // A present but empty slot (e.g. t[#t+1] in the
+                            // array part) with no __newindex to consult.
+                            let h = val_gc(upv) as *mut Table
+                            (*h).flags = 0
+                            set_obj(slot, rc)
+                            gc_barrier_back(L, h, rc)
                         } else {
                             (*ci).savedpc = pc
                             (*L).top = (*ci).top
@@ -958,6 +965,13 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                         if !ptr.is_null(slot) && !val_is_empty(slot) {
                             set_obj(slot, rc)
                             gc_barrier_back(L, val_gc(ra) as *mut Table, rc)
+                        } else if !ptr.is_null(slot) && (*slot).tag != TAG_ABSENT && tab_no_newindex(val_gc(ra) as *mut Table) {
+                            // A present but empty slot (e.g. t[#t+1] in the
+                            // array part) with no __newindex to consult.
+                            let h = val_gc(ra) as *mut Table
+                            (*h).flags = 0
+                            set_obj(slot, rc)
+                            gc_barrier_back(L, h, rc)
                         } else {
                             (*ci).savedpc = pc
                             (*L).top = (*ci).top
@@ -981,10 +995,17 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                         if !ptr.is_null(slot) && !val_is_empty(slot) {
                             set_obj(slot, rc)
                             gc_barrier_back(L, val_gc(ra) as *mut Table, rc)
+                        } else if !ptr.is_null(slot) && (*slot).tag != TAG_ABSENT && tab_no_newindex(val_gc(ra) as *mut Table) {
+                            // A present but empty slot (e.g. t[#t+1] in the
+                            // array part) with no __newindex to consult.
+                            let h = val_gc(ra) as *mut Table
+                            (*h).flags = 0
+                            set_obj(slot, rc)
+                            gc_barrier_back(L, h, rc)
                         } else {
                             kv := Value { bits: 0, tag: 0 }
                             let key = ptr.from_mut(&mut kv)
-                            set_int(key, b)
+                            set_int_gpr(key, b)
                             (*ci).savedpc = pc
                             (*L).top = (*ci).top
                             vm_finish_set(L, ra, key, rc, slot)?
@@ -1007,6 +1028,13 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                         if !ptr.is_null(slot) && !val_is_empty(slot) {
                             set_obj(slot, rc)
                             gc_barrier_back(L, val_gc(ra) as *mut Table, rc)
+                        } else if !ptr.is_null(slot) && (*slot).tag != TAG_ABSENT && tab_no_newindex(val_gc(ra) as *mut Table) {
+                            // A present but empty slot (e.g. t[#t+1] in the
+                            // array part) with no __newindex to consult.
+                            let h = val_gc(ra) as *mut Table
+                            (*h).flags = 0
+                            set_obj(slot, rc)
+                            gc_barrier_back(L, h, rc)
                         } else {
                             (*ci).savedpc = pc
                             (*L).top = (*ci).top
@@ -1068,10 +1096,10 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                         let rb = ptr.offset(base, ((i >> 16) & 255) as isize)
                         let imm = arg_sc(i)
                         if (*rb).tag == TAG_INT {
-                            set_int(ra, core.wrapping_add(val_int(rb), imm as i64))
+                            set_int_gpr(ra, core.wrapping_add(val_int(rb), imm as i64))
                             pc = ptr.offset(pc, 1)
                         } else if (*rb).tag == TAG_FLOAT {
-                            set_float(ra, val_float(rb) + (imm as f64))
+                            set_float_fpr(ra, val_float(rb) + (imm as f64))
                             pc = ptr.offset(pc, 1)
                         }
                     },
@@ -1080,13 +1108,13 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                         let rb = ptr.offset(base, ((i >> 16) & 255) as isize)
                         let kc = ptr.offset(k, (i >> 24) as isize)
                         if (*rb).tag == TAG_INT && (*kc).tag == TAG_INT {
-                            set_int(ra, core.wrapping_add(val_int(rb), val_int(kc)))
+                            set_int_gpr(ra, core.wrapping_add(val_int(rb), val_int(kc)))
                             pc = ptr.offset(pc, 1)
                         } else {
                             f1: f64 = 0.0
                             f2: f64 = 0.0
                             if to_float_ns(rb, ptr.from_mut(&mut f1)) && to_float_ns(kc, ptr.from_mut(&mut f2)) {
-                                set_float(ra, f1 + f2)
+                                set_float_fpr(ra, f1 + f2)
                                 pc = ptr.offset(pc, 1)
                             }
                         }
@@ -1096,13 +1124,13 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                         let rb = ptr.offset(base, ((i >> 16) & 255) as isize)
                         let kc = ptr.offset(k, (i >> 24) as isize)
                         if (*rb).tag == TAG_INT && (*kc).tag == TAG_INT {
-                            set_int(ra, core.wrapping_sub(val_int(rb), val_int(kc)))
+                            set_int_gpr(ra, core.wrapping_sub(val_int(rb), val_int(kc)))
                             pc = ptr.offset(pc, 1)
                         } else {
                             f1: f64 = 0.0
                             f2: f64 = 0.0
                             if to_float_ns(rb, ptr.from_mut(&mut f1)) && to_float_ns(kc, ptr.from_mut(&mut f2)) {
-                                set_float(ra, f1 - f2)
+                                set_float_fpr(ra, f1 - f2)
                                 pc = ptr.offset(pc, 1)
                             }
                         }
@@ -1112,13 +1140,13 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                         let rb = ptr.offset(base, ((i >> 16) & 255) as isize)
                         let kc = ptr.offset(k, (i >> 24) as isize)
                         if (*rb).tag == TAG_INT && (*kc).tag == TAG_INT {
-                            set_int(ra, core.wrapping_mul(val_int(rb), val_int(kc)))
+                            set_int_gpr(ra, core.wrapping_mul(val_int(rb), val_int(kc)))
                             pc = ptr.offset(pc, 1)
                         } else {
                             f1: f64 = 0.0
                             f2: f64 = 0.0
                             if to_float_ns(rb, ptr.from_mut(&mut f1)) && to_float_ns(kc, ptr.from_mut(&mut f2)) {
-                                set_float(ra, f1 * f2)
+                                set_float_fpr(ra, f1 * f2)
                                 pc = ptr.offset(pc, 1)
                             }
                         }
@@ -1130,13 +1158,13 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                         if (*rb).tag == TAG_INT && (*rc).tag == TAG_INT && val_int(rc) != 0 {
                             let a = val_int(rb)
                             let b = val_int(rc)
-                            set_int(ra, vm_mod_ii(a, b))
+                            set_int_gpr(ra, vm_mod_ii(a, b))
                             pc = ptr.offset(pc, 1)
                         } else {
                             f1: f64 = 0.0
                             f2: f64 = 0.0
                             if to_float_ns(rb, ptr.from_mut(&mut f1)) && to_float_ns(rc, ptr.from_mut(&mut f2)) && ((*rb).tag != TAG_INT || (*rc).tag != TAG_INT) {
-                                set_float(ra, vm_mod_float(f1, f2))
+                                set_float_fpr(ra, vm_mod_float(f1, f2))
                                 pc = ptr.offset(pc, 1)
                             } else {
                                 (*ci).savedpc = pc
@@ -1155,7 +1183,7 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                             f1: f64 = 0.0
                             f2: f64 = 0.0
                             if to_float_ns(rb, ptr.from_mut(&mut f1)) && to_float_ns(rc, ptr.from_mut(&mut f2)) && true {
-                                set_float(ra, vm_pow(f1, f2))
+                                set_float_fpr(ra, vm_pow(f1, f2))
                                 pc = ptr.offset(pc, 1)
                             } else {
                                 (*ci).savedpc = pc
@@ -1174,7 +1202,7 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                             f1: f64 = 0.0
                             f2: f64 = 0.0
                             if to_float_ns(rb, ptr.from_mut(&mut f1)) && to_float_ns(rc, ptr.from_mut(&mut f2)) && true {
-                                set_float(ra, f1 / f2)
+                                set_float_fpr(ra, f1 / f2)
                                 pc = ptr.offset(pc, 1)
                             } else {
                                 (*ci).savedpc = pc
@@ -1192,13 +1220,13 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                         if (*rb).tag == TAG_INT && (*rc).tag == TAG_INT && val_int(rc) != 0 {
                             let a = val_int(rb)
                             let b = val_int(rc)
-                            set_int(ra, vm_idiv_ii(a, b))
+                            set_int_gpr(ra, vm_idiv_ii(a, b))
                             pc = ptr.offset(pc, 1)
                         } else {
                             f1: f64 = 0.0
                             f2: f64 = 0.0
                             if to_float_ns(rb, ptr.from_mut(&mut f1)) && to_float_ns(rc, ptr.from_mut(&mut f2)) && ((*rb).tag != TAG_INT || (*rc).tag != TAG_INT) {
-                                set_float(ra, vm_idiv_float(f1, f2))
+                                set_float_fpr(ra, vm_idiv_float(f1, f2))
                                 pc = ptr.offset(pc, 1)
                             } else {
                                 (*ci).savedpc = pc
@@ -1216,7 +1244,7 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                         ia: i64 = 0
                         ib: i64 = 0
                         if vm_to_integer_strict(rb, ptr.from_mut(&mut ia)) && vm_to_integer_strict(rc, ptr.from_mut(&mut ib)) {
-                            set_int(ra, ia & ib)
+                            set_int_gpr(ra, ia & ib)
                             pc = ptr.offset(pc, 1)
                         }
                     },
@@ -1227,7 +1255,7 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                         ia: i64 = 0
                         ib: i64 = 0
                         if vm_to_integer_strict(rb, ptr.from_mut(&mut ia)) && vm_to_integer_strict(rc, ptr.from_mut(&mut ib)) {
-                            set_int(ra, ia | ib)
+                            set_int_gpr(ra, ia | ib)
                             pc = ptr.offset(pc, 1)
                         }
                     },
@@ -1238,7 +1266,7 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                         ia: i64 = 0
                         ib: i64 = 0
                         if vm_to_integer_strict(rb, ptr.from_mut(&mut ia)) && vm_to_integer_strict(rc, ptr.from_mut(&mut ib)) {
-                            set_int(ra, ia ^ ib)
+                            set_int_gpr(ra, ia ^ ib)
                             pc = ptr.offset(pc, 1)
                         }
                     },
@@ -1247,7 +1275,7 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                         let rb = ptr.offset(base, ((i >> 16) & 255) as isize)
                         ib: i64 = 0
                         if vm_to_integer_strict(rb, ptr.from_mut(&mut ib)) {
-                            set_int(ra, vm_shiftl(ib, -(arg_sc(i) as i64)))
+                            set_int_gpr(ra, vm_shiftl(ib, -(arg_sc(i) as i64)))
                             pc = ptr.offset(pc, 1)
                         }
                     },
@@ -1256,7 +1284,7 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                         let rb = ptr.offset(base, ((i >> 16) & 255) as isize)
                         ib: i64 = 0
                         if vm_to_integer_strict(rb, ptr.from_mut(&mut ib)) {
-                            set_int(ra, vm_shiftl(arg_sc(i) as i64, ib))
+                            set_int_gpr(ra, vm_shiftl(arg_sc(i) as i64, ib))
                             pc = ptr.offset(pc, 1)
                         }
                     },
@@ -1265,13 +1293,13 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                         let rb = ptr.offset(base, ((i >> 16) & 255) as isize)
                         let rc = ptr.offset(base, (i >> 24) as isize)
                         if (*rb).tag == TAG_INT && (*rc).tag == TAG_INT {
-                            set_int(ra, core.wrapping_add(val_int(rb), val_int(rc)))
+                            set_int_gpr(ra, core.wrapping_add(val_int(rb), val_int(rc)))
                             pc = ptr.offset(pc, 1)
                         } else {
                             f1: f64 = 0.0
                             f2: f64 = 0.0
                             if to_float_ns(rb, ptr.from_mut(&mut f1)) && to_float_ns(rc, ptr.from_mut(&mut f2)) {
-                                set_float(ra, f1 + f2)
+                                set_float_fpr(ra, f1 + f2)
                                 pc = ptr.offset(pc, 1)
                             }
                         }
@@ -1281,13 +1309,13 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                         let rb = ptr.offset(base, ((i >> 16) & 255) as isize)
                         let rc = ptr.offset(base, (i >> 24) as isize)
                         if (*rb).tag == TAG_INT && (*rc).tag == TAG_INT {
-                            set_int(ra, core.wrapping_sub(val_int(rb), val_int(rc)))
+                            set_int_gpr(ra, core.wrapping_sub(val_int(rb), val_int(rc)))
                             pc = ptr.offset(pc, 1)
                         } else {
                             f1: f64 = 0.0
                             f2: f64 = 0.0
                             if to_float_ns(rb, ptr.from_mut(&mut f1)) && to_float_ns(rc, ptr.from_mut(&mut f2)) {
-                                set_float(ra, f1 - f2)
+                                set_float_fpr(ra, f1 - f2)
                                 pc = ptr.offset(pc, 1)
                             }
                         }
@@ -1297,13 +1325,13 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                         let rb = ptr.offset(base, ((i >> 16) & 255) as isize)
                         let rc = ptr.offset(base, (i >> 24) as isize)
                         if (*rb).tag == TAG_INT && (*rc).tag == TAG_INT {
-                            set_int(ra, core.wrapping_mul(val_int(rb), val_int(rc)))
+                            set_int_gpr(ra, core.wrapping_mul(val_int(rb), val_int(rc)))
                             pc = ptr.offset(pc, 1)
                         } else {
                             f1: f64 = 0.0
                             f2: f64 = 0.0
                             if to_float_ns(rb, ptr.from_mut(&mut f1)) && to_float_ns(rc, ptr.from_mut(&mut f2)) {
-                                set_float(ra, f1 * f2)
+                                set_float_fpr(ra, f1 * f2)
                                 pc = ptr.offset(pc, 1)
                             }
                         }
@@ -1315,13 +1343,13 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                         if (*rb).tag == TAG_INT && (*rc).tag == TAG_INT && val_int(rc) != 0 {
                             let a = val_int(rb)
                             let b = val_int(rc)
-                            set_int(ra, vm_mod_ii(a, b))
+                            set_int_gpr(ra, vm_mod_ii(a, b))
                             pc = ptr.offset(pc, 1)
                         } else {
                             f1: f64 = 0.0
                             f2: f64 = 0.0
                             if to_float_ns(rb, ptr.from_mut(&mut f1)) && to_float_ns(rc, ptr.from_mut(&mut f2)) && ((*rb).tag != TAG_INT || (*rc).tag != TAG_INT) {
-                                set_float(ra, vm_mod_float(f1, f2))
+                                set_float_fpr(ra, vm_mod_float(f1, f2))
                                 pc = ptr.offset(pc, 1)
                             } else {
                                 (*ci).savedpc = pc
@@ -1340,7 +1368,7 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                             f1: f64 = 0.0
                             f2: f64 = 0.0
                             if to_float_ns(rb, ptr.from_mut(&mut f1)) && to_float_ns(rc, ptr.from_mut(&mut f2)) && true {
-                                set_float(ra, vm_pow(f1, f2))
+                                set_float_fpr(ra, vm_pow(f1, f2))
                                 pc = ptr.offset(pc, 1)
                             } else {
                                 (*ci).savedpc = pc
@@ -1359,7 +1387,7 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                             f1: f64 = 0.0
                             f2: f64 = 0.0
                             if to_float_ns(rb, ptr.from_mut(&mut f1)) && to_float_ns(rc, ptr.from_mut(&mut f2)) && true {
-                                set_float(ra, f1 / f2)
+                                set_float_fpr(ra, f1 / f2)
                                 pc = ptr.offset(pc, 1)
                             } else {
                                 (*ci).savedpc = pc
@@ -1377,13 +1405,13 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                         if (*rb).tag == TAG_INT && (*rc).tag == TAG_INT && val_int(rc) != 0 {
                             let a = val_int(rb)
                             let b = val_int(rc)
-                            set_int(ra, vm_idiv_ii(a, b))
+                            set_int_gpr(ra, vm_idiv_ii(a, b))
                             pc = ptr.offset(pc, 1)
                         } else {
                             f1: f64 = 0.0
                             f2: f64 = 0.0
                             if to_float_ns(rb, ptr.from_mut(&mut f1)) && to_float_ns(rc, ptr.from_mut(&mut f2)) && ((*rb).tag != TAG_INT || (*rc).tag != TAG_INT) {
-                                set_float(ra, vm_idiv_float(f1, f2))
+                                set_float_fpr(ra, vm_idiv_float(f1, f2))
                                 pc = ptr.offset(pc, 1)
                             } else {
                                 (*ci).savedpc = pc
@@ -1401,7 +1429,7 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                         ia: i64 = 0
                         ib: i64 = 0
                         if vm_to_integer_strict(rb, ptr.from_mut(&mut ia)) && vm_to_integer_strict(rc, ptr.from_mut(&mut ib)) {
-                            set_int(ra, ia & ib)
+                            set_int_gpr(ra, ia & ib)
                             pc = ptr.offset(pc, 1)
                         }
                     },
@@ -1412,7 +1440,7 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                         ia: i64 = 0
                         ib: i64 = 0
                         if vm_to_integer_strict(rb, ptr.from_mut(&mut ia)) && vm_to_integer_strict(rc, ptr.from_mut(&mut ib)) {
-                            set_int(ra, ia | ib)
+                            set_int_gpr(ra, ia | ib)
                             pc = ptr.offset(pc, 1)
                         }
                     },
@@ -1423,7 +1451,7 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                         ia: i64 = 0
                         ib: i64 = 0
                         if vm_to_integer_strict(rb, ptr.from_mut(&mut ia)) && vm_to_integer_strict(rc, ptr.from_mut(&mut ib)) {
-                            set_int(ra, ia ^ ib)
+                            set_int_gpr(ra, ia ^ ib)
                             pc = ptr.offset(pc, 1)
                         }
                     },
@@ -1434,7 +1462,7 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                         ia: i64 = 0
                         ib: i64 = 0
                         if vm_to_integer_strict(rb, ptr.from_mut(&mut ia)) && vm_to_integer_strict(rc, ptr.from_mut(&mut ib)) {
-                            set_int(ra, vm_shiftl(ia, ib))
+                            set_int_gpr(ra, vm_shiftl(ia, ib))
                             pc = ptr.offset(pc, 1)
                         }
                     },
@@ -1445,7 +1473,7 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                         ia: i64 = 0
                         ib: i64 = 0
                         if vm_to_integer_strict(rb, ptr.from_mut(&mut ia)) && vm_to_integer_strict(rc, ptr.from_mut(&mut ib)) {
-                            set_int(ra, vm_shiftl(ia, core.wrapping_sub(0i64, ib)))
+                            set_int_gpr(ra, vm_shiftl(ia, core.wrapping_sub(0i64, ib)))
                             pc = ptr.offset(pc, 1)
                         }
                     },
@@ -1466,7 +1494,7 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                         let res = ptr.offset(base, ((prev >> 7) & 255) as isize)
                         kv := Value { bits: 0, tag: 0 }
                         let imm = ptr.from_mut(&mut kv)
-                        set_int(imm, arg_sb(i) as i64)
+                        set_int_gpr(imm, arg_sb(i) as i64)
                         (*ci).savedpc = pc
                         (*L).top = (*ci).top
                         meta_trybin_k(L, ra, imm, ((i >> 15) & 1) != 0, sdiff(res, (*L).stack), (i >> 24) as u32)?
@@ -1488,9 +1516,9 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                         // UNM
                         let rb = ptr.offset(base, ((i >> 16) & 255) as isize)
                         if (*rb).tag == TAG_INT {
-                            set_int(ra, core.wrapping_sub(0i64, val_int(rb)))
+                            set_int_gpr(ra, core.wrapping_sub(0i64, val_int(rb)))
                         } else if (*rb).tag == TAG_FLOAT {
-                            set_float(ra, -val_float(rb))
+                            set_float_fpr(ra, -val_float(rb))
                         } else {
                             (*ci).savedpc = pc
                             (*L).top = (*ci).top
@@ -1504,7 +1532,7 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                         let rb = ptr.offset(base, ((i >> 16) & 255) as isize)
                         ib: i64 = 0
                         if vm_to_integer_strict(rb, ptr.from_mut(&mut ib)) {
-                            set_int(ra, ~ib)
+                            set_int_gpr(ra, ~ib)
                         } else {
                             (*ci).savedpc = pc
                             (*L).top = (*ci).top
@@ -1526,7 +1554,15 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                         // LEN
                         let rb = ptr.offset(base, ((i >> 16) & 255) as isize)
                         if (*rb).tag == TAG_TABLE && ptr.is_null((*(val_gc(rb) as *mut Table)).metatable) {
-                            set_int(ra, u2i(tab_length(val_gc(rb) as *mut Table)))
+                            let t = val_gc(rb) as *mut Table
+                            let lim = (*t).lenhint
+                            // Common case: the hint is a border inside the
+                            // array part (what tab_length would return).
+                            if lim > 0 && lim < (*t).asize && !val_is_empty(ptr.offset((*t).array, (lim - 1) as isize)) && val_is_empty(ptr.offset((*t).array, lim as isize)) {
+                                set_int_gpr(ra, lim as i64)
+                            } else {
+                                set_int_gpr(ra, u2i(tab_length(t)))
+                            }
                         } else {
                             (*ci).savedpc = pc
                             (*L).top = (*ci).top
@@ -2087,9 +2123,9 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                             if count > 0 {
                                 let step = val_int(ptr.offset(ra, 2))
                                 let idx = core.wrapping_add(val_int(ra), step)
-                                *(ptr.offset(ra, 1) as *mut i64) = u2i(count - 1)
-                                *(ra as *mut i64) = idx
-                                set_int(ptr.offset(ra, 3), idx)
+                                ptr.write_volatile(ptr.offset(ra, 1) as *mut i64, u2i(count - 1))
+                                ptr.write_volatile(ra as *mut i64, idx)
+                                set_int_gpr(ptr.offset(ra, 3), idx)
                                 pc = ptr.offset(pc, -((i >> 15) as isize))
                             }
                         } else {
@@ -2102,8 +2138,8 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                                 limit <= idx
                             }
                             if cont {
-                                *(ra as *mut f64) = idx
-                                set_float(ptr.offset(ra, 3), idx)
+                                ptr.write_volatile(ra as *mut f64, idx)
+                                set_float_fpr(ptr.offset(ra, 3), idx)
                                 pc = ptr.offset(pc, -((i >> 15) as isize))
                             }
                         }
@@ -2127,28 +2163,67 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                     76 => {
                         // TFORCALL
                         let cb = ptr.offset(ra, 4)
-                        set_obj(ptr.offset(cb, 2), ptr.offset(ra, 2))
-                        set_obj(ptr.offset(cb, 1), ptr.offset(ra, 1))
-                        set_obj(cb, ra)
-                        (*L).top = ptr.offset(cb, 3)
-                        (*ci).savedpc = pc
-                        let ftag = (*cb).tag
-                        if (ftag == TAG_LIGHTFN || ftag == TAG_NCLOSURE) && (*L).n_ccalls + 1 < MAX_CCALLS {
-                            // A native iterator (next, ipairs): call it directly,
-                            // counted as a nested call like call_value does.
-                            let f = if ftag == TAG_LIGHTFN {
-                                val_lightfn(cb)
-                            } else {
-                                (*(val_gc(cb) as *mut NClosure)).f
+                        done := false
+                        if (*ra).tag == TAG_LIGHTFN && (*ptr.offset(ra, 1)).tag == TAG_TABLE && (*L).hookmask == 0 {
+                            // The built-in `next` and ipairs iterator step the
+                            // table straight into the loop registers, without
+                            // a native call frame. Anything unusual (hooks,
+                            // keys needing the general lookup, metatables on
+                            // an ipairs miss) takes the real call below.
+                            let t = val_gc(ptr.offset(ra, 1)) as *mut Table
+                            let ctl = ptr.offset(ra, 2)
+                            r := -1i32
+                            if (*ra).bits == lightfn_bits(base_ipairs_aux) {
+                                if (*ctl).tag == TAG_INT {
+                                    let idx = core.wrapping_add(val_int(ctl), 1)
+                                    let slot = tab_get_int(t, idx)
+                                    if !val_is_empty(slot) {
+                                        set_int_gpr(cb, idx)
+                                        set_obj(ptr.offset(cb, 1), slot)
+                                        r = 1
+                                    } else if ptr.is_null((*t).metatable) {
+                                        r = 0
+                                    }
+                                }
+                            } else if (*ra).bits == lightfn_bits(base_next) {
+                                r = tab_next_fast(t, ctl, cb)
                             }
-                            (*L).n_ccalls = (*L).n_ccalls + 1
-                            precall_native(L, cb, (i >> 24) as i32, f)?
-                            (*L).n_ccalls = (*L).n_ccalls - 1
-                        } else {
-                            call_value(L, cb, (i >> 24) as i32)?
+                            if r >= 0 {
+                                let nres = (i >> 24) as isize
+                                if r == 0 {
+                                    (*cb).tag = TAG_NIL
+                                    (*ptr.offset(cb, 1)).tag = TAG_NIL
+                                }
+                                for j in 2isize..nres {
+                                    (*ptr.offset(cb, j)).tag = TAG_NIL
+                                }
+                                done = true
+                            }
                         }
-                        base = ptr.offset((*ci).func, 1)
-                        trap = (*L).hookmask != 0
+                        if !done {
+                            set_obj(ptr.offset(cb, 2), ptr.offset(ra, 2))
+                            set_obj(ptr.offset(cb, 1), ptr.offset(ra, 1))
+                            set_obj(cb, ra)
+                            (*L).top = ptr.offset(cb, 3)
+                            (*ci).savedpc = pc
+                            let ftag = (*cb).tag
+                            if (ftag == TAG_LIGHTFN || ftag == TAG_NCLOSURE) && (*L).n_ccalls + 1 < MAX_CCALLS {
+                                // A native iterator (next, ipairs): call it directly,
+                                // counted as a nested call like call_value does.
+                                let f = if ftag == TAG_LIGHTFN {
+                                    val_lightfn(cb)
+                                } else {
+                                    (*(val_gc(cb) as *mut NClosure)).f
+                                }
+                                (*L).n_ccalls = (*L).n_ccalls + 1
+                                precall_native(L, cb, (i >> 24) as i32, f)?
+                                (*L).n_ccalls = (*L).n_ccalls - 1
+                            } else {
+                                call_value(L, cb, (i >> 24) as i32)?
+                            }
+                            base = ptr.offset((*ci).func, 1)
+                            trap = (*L).hookmask != 0
+                        }
                     },
                     77 => {
                         // TFORLOOP
