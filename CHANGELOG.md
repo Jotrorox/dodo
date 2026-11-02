@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+- `std/db/sqlite` is faster: full-table scans take less than half the
+  instructions, `CREATE INDEX` on a 200k-row table runs about 4.5 times
+  faster, and indexed joins about 2.5 times faster. Rebalancing now evens out
+  every sibling page instead of only the last two, so B-tree pages no longer
+  stay 100% full and split again on the next insert. Page-cache misses take
+  the least recently used slot in constant time instead of scanning every
+  slot. The byte-level helpers check each range once and are inlined. Rows
+  no longer scan every cursor when the per-row arena is reset.
+  `Connection.statement_length` no longer copies the whole remaining script
+  into the workspace on every call.
+
 ## 0.1.6 — 2026-11-02
 
 Dodo 0.1.6 grows the language with interfaces and `dyn` references, function
