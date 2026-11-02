@@ -1570,9 +1570,8 @@ pub struct Device {
     }
 
     fn bury(&self, object: u32, handle: &hal.Handle, wait: u64) {
-        grave := Grave { object: object, handle: handle.copy(), wait: wait }
         self.life.update(fn(life) {
-            life.graves.push(grave)
+            life.graves.push(Grave { object: object, handle: handle.copy(), wait: wait })
         })
     }
 
@@ -1635,13 +1634,13 @@ pub struct Device {
     // An encoder's hazard table is cleared and kept for the next one.
     fn return_hazards(&self, hazards: Hazards) {
         hazards.clear()
-        self.life.update(fn(life) {
-            if life.spare.capacity == 0 {
-                life.spare = hazards
-            } else {
-                hazards.free()
-            }
-        })
+        if self.life.read().spare.capacity == 0 {
+            self.life.update(fn(life) {
+                mem.swap(&mut life.spare, &mut hazards)
+            })
+        }
+        // An empty table now, or one more than needed.
+        hazards.free()
     }
 
     fn drop(&mut self) {
@@ -1863,7 +1862,7 @@ pub struct Readback {
     }
 
     // The CPU memory of a read made at once.
-    fn host_bytes(&self) -> &mut[u8] from(self) {
+    fn host_bytes(&mut self) -> &mut[u8] from(self) {
         unsafe {
             return ptr.borrow_slice_mut(self.address as *mut u8, self.size as usize, self)
         }
@@ -2949,8 +2948,10 @@ struct Hazards {
         unsafe {
             ptr.write_bytes(table, 0u8, capacity)
         }
+        // The new table belongs to no one yet: a local owns the borrow.
+        owner := 0u8
         bigger := unsafe {
-            ptr.borrow_slice_mut(table, capacity, self)
+            ptr.borrow_slice_mut(table, capacity, &mut owner)
         }
         old := unsafe {
             ptr.borrow_slice(self.table, self.capacity, self)
@@ -3049,12 +3050,12 @@ struct Growing<T> {
         self.count += 1
     }
 
-    // Move element `from` to `to`, overwriting it.
-    fn copy_within(&mut self, from: usize, to: usize) {
-        assert(from < self.count && to < self.count, "index out of range")
-        if from != to {
+    // Move element `source` to `to`, overwriting it.
+    fn copy_within(&mut self, source: usize, to: usize) {
+        assert(source < self.count && to < self.count, "index out of range")
+        if source != to {
             unsafe {
-                ptr.copy_nonoverlapping(ptr.offset(self.data, from as isize), ptr.offset(self.data, to as isize), 1)
+                ptr.copy_nonoverlapping(ptr.offset(self.data, source as isize), ptr.offset(self.data, to as isize), 1)
             }
         }
     }
