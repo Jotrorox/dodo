@@ -17,15 +17,6 @@ import "std/window/handle"
 // opened at run time; its CGL context is used like any other. The window
 // already loaded AppKit, which provides NSOpenGLContext.
 
-unsafe extern "C" fn dlopen(path: *const u8, mode: i32) -> *mut u8
-// Declared with the pointer result std/dylib and std/gpu/metal use, as one
-// program may load all three: a symbol has a single C signature.
-unsafe extern "C" fn dlsym(handle: *mut u8, name: *const u8) -> *mut u8
-unsafe extern "C" fn dlclose(handle: *mut u8) -> i32
-
-const RTLD_NOW: i32 = 2
-const RTLD_LOCAL: i32 = 4
-
 // CGLPixelFormatAttribute values, which NSOpenGLPixelFormat shares.
 const PFA_DOUBLE_BUFFER: i32 = 5
 const PFA_COLOR_SIZE: i32 = 8
@@ -61,18 +52,6 @@ type SendIdIdId = extern "C" fn(*mut u8, *mut u8, *mut u8, *mut u8) -> *mut u8
 type SendVoidId = extern "C" fn(*mut u8, *mut u8, *mut u8)
 type SendVoidBool = extern "C" fn(*mut u8, *mut u8, bool)
 
-fn null() -> *mut u8 {
-    unsafe {
-        return 0usize as *mut u8
-    }
-}
-
-unsafe fn symbol(library: *mut u8, name: &[u8]) -> usize {
-    unsafe {
-        return dlsym(library, common.c_string(name)) as usize
-    }
-}
-
 // The Objective-C runtime, for the NSOpenGLContext of a window.
 struct Objc {
     get_class: GetClass
@@ -83,25 +62,25 @@ struct Objc {
 
     fn open() -> Objc!common.Error {
         library := unsafe {
-            dlopen(common.c_string(b"/usr/lib/libobjc.A.dylib\0"), RTLD_NOW | RTLD_LOCAL)
+            common.open_library(b"/usr/lib/libobjc.A.dylib\0")
         }
         if ptr.is_null(library) {
             return err(common.Error.NoLibrary)
         }
         get_class := unsafe {
-            symbol(library, b"objc_getClass\0")
+            common.symbol(library, b"objc_getClass\0")
         }
         register := unsafe {
-            symbol(library, b"sel_registerName\0")
+            common.symbol(library, b"sel_registerName\0")
         }
         send := unsafe {
-            symbol(library, b"objc_msgSend\0")
+            common.symbol(library, b"objc_msgSend\0")
         }
         pool_push := unsafe {
-            symbol(library, b"objc_autoreleasePoolPush\0")
+            common.symbol(library, b"objc_autoreleasePoolPush\0")
         }
         pool_pop := unsafe {
-            symbol(library, b"objc_autoreleasePoolPop\0")
+            common.symbol(library, b"objc_autoreleasePoolPop\0")
         }
         if get_class == 0 || register == 0 || send == 0 || pool_push == 0 || pool_pop == 0 {
             return err(common.Error.NoLibrary)
@@ -199,51 +178,51 @@ pub struct Backend {
     // OpenGL.framework and its CGL entry points, with no context yet.
     fn load() -> Backend!common.Error {
         library := unsafe {
-            dlopen(common.c_string(b"/System/Library/Frameworks/OpenGL.framework/OpenGL\0"), RTLD_NOW | RTLD_LOCAL)
+            common.open_library(b"/System/Library/Frameworks/OpenGL.framework/OpenGL\0")
         }
         if ptr.is_null(library) {
             return err(common.Error.NoLibrary)
         }
         choose := unsafe {
-            symbol(library, b"CGLChoosePixelFormat\0")
+            common.symbol(library, b"CGLChoosePixelFormat\0")
         }
         destroy_format := unsafe {
-            symbol(library, b"CGLDestroyPixelFormat\0")
+            common.symbol(library, b"CGLDestroyPixelFormat\0")
         }
         create := unsafe {
-            symbol(library, b"CGLCreateContext\0")
+            common.symbol(library, b"CGLCreateContext\0")
         }
         destroy := unsafe {
-            symbol(library, b"CGLDestroyContext\0")
+            common.symbol(library, b"CGLDestroyContext\0")
         }
         set_current := unsafe {
-            symbol(library, b"CGLSetCurrentContext\0")
+            common.symbol(library, b"CGLSetCurrentContext\0")
         }
         get_current := unsafe {
-            symbol(library, b"CGLGetCurrentContext\0")
+            common.symbol(library, b"CGLGetCurrentContext\0")
         }
         flush := unsafe {
-            symbol(library, b"CGLFlushDrawable\0")
+            common.symbol(library, b"CGLFlushDrawable\0")
         }
         set_parameter := unsafe {
-            symbol(library, b"CGLSetParameter\0")
+            common.symbol(library, b"CGLSetParameter\0")
         }
         if choose == 0 || destroy_format == 0 || create == 0 || destroy == 0 || set_current == 0 || get_current == 0 || flush == 0 || set_parameter == 0 {
             unsafe {
-                dlclose(library)
+                common.close_library(library)
             }
             return err(common.Error.NoLibrary)
         }
         return ok(unsafe {
             Backend {
                 library: library,
-                context: null(),
+                context: common.null(),
                 set_current: set_current as SetCurrentContext,
                 get_current: get_current as GetCurrentContext,
                 destroy: destroy as DestroyContext,
                 flush: flush as FlushDrawable,
                 set_parameter: set_parameter as SetParameter,
-                window_context: null(),
+                window_context: common.null(),
                 objc: none
             }
         })
@@ -258,32 +237,32 @@ pub struct Backend {
         }
         backend := Backend.load()?
         choose := unsafe {
-            symbol(backend.library, b"CGLChoosePixelFormat\0")
+            common.symbol(backend.library, b"CGLChoosePixelFormat\0")
         }
         destroy_format := unsafe {
-            symbol(backend.library, b"CGLDestroyPixelFormat\0")
+            common.symbol(backend.library, b"CGLDestroyPixelFormat\0")
         }
         create := unsafe {
-            symbol(backend.library, b"CGLCreateContext\0")
+            common.symbol(backend.library, b"CGLCreateContext\0")
         }
         // Prefer a GPU; fall back to any renderer, such as Apple's software one.
         accelerated := [PFA_OPENGL_PROFILE, profile, PFA_ALLOW_OFFLINE_RENDERERS, PFA_ACCELERATED, 0]
         any := [PFA_OPENGL_PROFILE, profile, PFA_ALLOW_OFFLINE_RENDERERS, 0]
-        format := null()
+        format := common.null()
         count := 0i32
         unsafe {
             choose_format := choose as ChoosePixelFormat
             if choose_format(ptr.as_ptr(&accelerated), ptr.from_mut(&mut format), ptr.from_mut(&mut count)) != 0 || ptr.is_null(format) {
-                format = null()
+                format = common.null()
                 if choose_format(ptr.as_ptr(&any), ptr.from_mut(&mut format), ptr.from_mut(&mut count)) != 0 || ptr.is_null(format) {
                     return err(common.Error.NoConfig)
                 }
             }
         }
-        context := null()
+        context := common.null()
         code := unsafe {
             create_context := create as CreateContext
-            created := create_context(format, null(), ptr.from_mut(&mut context))
+            created := create_context(format, common.null(), ptr.from_mut(&mut context))
             release := destroy_format as DestroyPixelFormat
             release(format)
             created
@@ -351,7 +330,7 @@ pub struct Backend {
         initialize_context := objc.selector(b"initWithFormat:shareContext:\0")
         window_context := unsafe {
             send := objc.send as SendIdIdId
-            send(objc.send_id(context_class, b"alloc\0"), initialize_context, format, null())
+            send(objc.send_id(context_class, b"alloc\0"), initialize_context, format, common.null())
         }
         objc.send_void(format, b"release\0")
         if ptr.is_null(window_context) {
@@ -429,7 +408,7 @@ pub struct Backend {
     pub fn release_current(&self) {
         set := self.set_current
         unsafe {
-            set(null())
+            set(common.null())
         }
     }
 
@@ -444,7 +423,7 @@ pub struct Backend {
     // command it implements.
     pub fn resolve(&self, name: *const u8) -> usize {
         return unsafe {
-            dlsym(self.library, name) as usize
+            common.symbol_at(self.library, name)
         }
     }
 

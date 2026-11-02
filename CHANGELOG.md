@@ -31,6 +31,41 @@
   on strings skip the generic comparison (`string_compare` 1.2x). Table
   constructors with up to 12 array slots allocate the array together with
   the table (`binary_trees` 1.15x). Float-float `+ - *` take a direct path.
+- `std/gpu` records draws and dispatches with less work. A draw that changes
+  nothing since the last one skips the binding checks and hazard
+  tracking; binding the same range again or setting the same pipeline
+  changes nothing; bindings carry over between pipelines of the same
+  layout; and backends apply only the slots that changed. On Metal,
+  commands no longer retain and release every object they use, and
+  pipelines built from an already compiled source reuse its library.
+  Measured on an M5: a draw that changes nothing takes about half as long
+  (55 to 66 ns before, 25 to 31 ns now), and a pipeline from an already
+  compiled source 6 to 8 µs instead of 50 to 60 µs.
+- `write_buffer` writes a buffer the CPU can map directly when no submitted
+  work uses it and no earlier write to it is still staged, as `std/gpu` now
+  tracks which submissions use each buffer (on Metal, 200 to 260 ns became
+  6 ns).
+  `read_buffer` waits only for the submissions that use the buffer. Staged
+  writes run in the same submission as the next `submit()`.
+- New `Device.start_read_buffer` and `start_read_texture` read results back
+  without waiting, as a `gpu.Readback` collected later;
+  `examples/gpu_triangle.dodo` uses it.
+- Any number of dropped objects and in-flight uploads can wait for the GPU;
+  the limits of 64 objects and 32 uploads, which made `std/gpu` wait for the
+  GPU or panic, are gone. Hazard tables are reused between encoders.
+- Vulkan: samplers with `ADDRESS_BORDER` use the border color (it clamped to
+  the edge before, so shadow maps lost their opaque white border); a frame
+  makes two queue submissions instead of four; render passes no longer go
+  through secondary command buffers; empty memory blocks are kept for reuse
+  instead of being freed at once; `completed()` handles device loss;
+  swapchains of up to 16 images work.
+- OpenGL: passes of two open encoders that alternate draws keep their own
+  framebuffer, pipeline and state; every call makes the device's context
+  current, so two devices on one thread work; surfaces honor
+  `frames_in_flight`; framebuffers are cached and repeated state calls
+  skipped.
+- Metal: failing to create a command encoder makes `submit()` fail instead
+  of panicking.
 
 ## 0.1.6 — 2026-11-02
 

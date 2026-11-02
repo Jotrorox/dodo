@@ -1,5 +1,6 @@
 package memory
 
+import "core/mem"
 import "core/ptr"
 import "std/gpu/hal"
 import "std/gpu/vulkan" as vk
@@ -10,13 +11,19 @@ import "std/gpu/vulkan" as vk
 // 4096) and each vkAllocateMemory is slow, so buffers and images are carved
 // out of a few large blocks instead: up to 64 MiB each, an eighth of the heap
 // on small heaps. Resources of more than a quarter of a block get a block of
-// their own. Buffers and images never share a block, which keeps them
-// bufferImageGranularity apart without further care.
+// their own (a dedicated block). Buffers and images never share a block,
+// which keeps them bufferImageGranularity apart without further care.
 //
 // Each block keeps its free space as a sorted list of ranges, allocated
-// first fit in steps of 256 bytes, and merged again when freed. A block whose
-// last allocation is freed is returned to the driver unless it is the only
-// one of its memory type and kind left, which stays for the next allocation.
+// first fit in steps of 256 bytes, and merged again when freed.
+//
+// Emptied blocks stay for a while, so that a resource made and destroyed
+// every frame does not allocate and free memory every frame: one empty
+// block per memory type and kind stays, and up to KEPT_DEDICATED emptied
+// dedicated blocks of up to KEPT_DEDICATED_SIZE blocks' size, which serve
+// later large resources that fit them without wasting more than half.
+// Allocations that run out of memory first free every empty block of their
+// memory type, and try again.
 //
 // Host-visible blocks stay mapped for their whole life. The memory type of
 // each kind of allocation is chosen as follows:
@@ -46,6 +53,13 @@ const FLAG_USED: u32 = 1
 const FLAG_LINEAR: u32 = 2
 const FLAG_DEDICATED: u32 = 4
 const FLAG_COHERENT: u32 = 8
+// What blocks of one kind share.
+const KIND_FLAGS: u32 = FLAG_USED | FLAG_LINEAR | FLAG_DEDICATED
+
+// Emptied dedicated blocks kept per memory type and kind, and the largest
+// kept, in normal blocks.
+const KEPT_DEDICATED: usize = 2
+const KEPT_DEDICATED_SIZE: u64 = 4
 
 unsafe extern "C" fn malloc(size: usize) -> *mut u8
 unsafe extern "C" fn free(block: *mut u8)
@@ -83,7 +97,7 @@ pub struct Allocator {
     atom: u64
 
     pub fn new(properties: &vk.PhysicalDeviceMemoryProperties, non_coherent_atom_size: u64) -> Allocator!hal.Error {
-        size := mem_size()
+        size := mem.size_of::<Blocks>()
         address := unsafe {
             malloc(size) as usize
         }
@@ -140,7 +154,8 @@ pub struct Allocator {
                 return
             }
             if ((*b).flags[block] & FLAG_DEDICATED) != 0 {
-                self.release(fns, device, block)
+                (*b).live[block] = 0
+                self.retire(fns, device, block)
                 return
             }
         }
@@ -152,16 +167,13 @@ pub struct Allocator {
             (*b).live[block] == 0
         }
         if last {
-            if self.has_other(block) {
-                self.release(fns, device, block)
-            } else {
-                unsafe {
-                    ranges := (*b).ranges[block] as usize
-                    (*b).free_count[block] = 1
-                    store(ranges, 0, 0)
-                    store(ranges, 1, (*b).size[block])
-                }
+            unsafe {
+                ranges := (*b).ranges[block] as usize
+                (*b).free_count[block] = 1
+                store(ranges, 0, 0)
+                store(ranges, 1, (*b).size[block])
             }
+            self.retire(fns, device, block)
         }
     }
 
@@ -272,38 +284,84 @@ pub struct Allocator {
 
     fn allocate_in(&self, fns: &vk.DeviceFns, device: vk.Device, type_index: u32, size: u64, alignment: u64, linear: bool) -> Allocation!hal.Error {
         block_size := self.block_size(type_index)
+        b := self.table()
+        flags := FLAG_USED
+        if linear {
+            flags = flags | FLAG_LINEAR
+        }
         if size > block_size / 4 || alignment > block_size / 4 {
-            block := self.create_block(fns, device, type_index, size, linear, true)?
+            // Memory starts aligned for any resource of its type.
+            block := self.kept_dedicated(type_index, flags | FLAG_DEDICATED, size)
+            if block == MAX_BLOCKS {
+                block = self.create_block_trimming(fns, device, type_index, size, linear, true)?
+            }
             unsafe {
-                (*self.table()).live[block] = 1
+                (*b).live[block] = 1
             }
             return ok(self.allocation(block, 0, 0))
         }
-        b := self.table()
         count := unsafe {
             (*b).count
         }
-        wanted := FLAG_USED
-        if linear {
-            wanted = wanted | FLAG_LINEAR
-        }
         for i in 0usize..count {
-            flags := unsafe {
-                (*b).flags[i]
+            same := unsafe {
+                (*b).type_index[i] == type_index && ((*b).flags[i] & KIND_FLAGS) == flags
             }
-            matches := unsafe {
-                (*b).type_index[i] == type_index
-            }
-            if matches && (flags & (FLAG_USED | FLAG_LINEAR | FLAG_DEDICATED)) == wanted {
+            if same {
                 offset := take_range(b, i, size, alignment)
                 if offset != NO_ROOM {
                     return ok(self.allocation(i, offset, size))
                 }
             }
         }
-        block := self.create_block(fns, device, type_index, block_size, linear, false)?
+        block := self.create_block_trimming(fns, device, type_index, block_size, linear, false)?
         offset := take_range(b, block, size, alignment)
         return ok(self.allocation(block, offset, size))
+    }
+
+    // An emptied dedicated block of `flags` and memory type `type_index`
+    // that holds `size` bytes without wasting more than half: the smallest,
+    // or MAX_BLOCKS.
+    fn kept_dedicated(&self, type_index: u32, flags: u32, size: u64) -> usize {
+        b := self.table()
+        best := MAX_BLOCKS
+        unsafe {
+            for i in 0usize..(*b).count {
+                fits := (*b).type_index[i] == type_index && ((*b).flags[i] & KIND_FLAGS) == flags && (*b).live[i] == 0 && (*b).size[i] >= size && (*b).size[i] / 2 <= size
+                if fits && (best == MAX_BLOCKS || (*b).size[i] < (*b).size[best]) {
+                    best = i
+                }
+            }
+        }
+        return best
+    }
+
+    // create_block, which when out of memory frees the empty blocks of the
+    // memory type and tries once more.
+    fn create_block_trimming(&self, fns: &vk.DeviceFns, device: vk.Device, type_index: u32, size: u64, linear: bool, dedicated: bool) -> usize!hal.Error {
+        match self.create_block(fns, device, type_index, size, linear, dedicated) {
+            ok(block) => {
+                return ok(block)
+            }
+            err(hal.Error.OutOfMemory) => {}
+            err(error) => {
+                return err(error)
+            }
+        }
+        b := self.table()
+        freed := false
+        unsafe {
+            for i in 0usize..(*b).count {
+                if ((*b).flags[i] & FLAG_USED) != 0 && (*b).type_index[i] == type_index && (*b).live[i] == 0 {
+                    self.release(fns, device, i)
+                    freed = true
+                }
+            }
+        }
+        if !freed {
+            return err(hal.Error.OutOfMemory)
+        }
+        return self.create_block(fns, device, type_index, size, linear, dedicated)
     }
 
     fn allocation(&self, block: usize, offset: u64, size: u64) -> Allocation {
@@ -315,7 +373,11 @@ pub struct Allocator {
         if mapped != 0 {
             address = (mapped + offset) as usize
         }
+        // Never 0: a dedicated allocation (offset and size 0) has size 1.
         id := ((block as u64) << 48) | ((offset / GRANULE) << 24) | (size / GRANULE)
+        if size == 0 {
+            id = id | 1
+        }
         type_index := unsafe {
             (*b).type_index[block]
         }
@@ -434,25 +496,46 @@ pub struct Allocator {
         return ok(slot)
     }
 
-    // Whether another block of the same memory type and kind as `block`
-    // still holds allocations, so that `block` need not stay.
-    fn has_other(&self, block: usize) -> bool {
+    // `block` holds no allocations any more: keep it for reuse, or return
+    // it (or an older one it replaces) to the driver.
+    fn retire(&self, fns: &vk.DeviceFns, device: vk.Device, block: usize) {
         b := self.table()
-        count := unsafe {
-            (*b).count
+        dedicated := unsafe {
+            ((*b).flags[block] & FLAG_DEDICATED) != 0
         }
-        mask := FLAG_USED | FLAG_LINEAR | FLAG_DEDICATED
-        for i in 0usize..count {
-            if i != block {
-                same := unsafe {
-                    (*b).type_index[i] == (*b).type_index[block] && ((*b).flags[i] & mask) == ((*b).flags[block] & mask)
-                }
-                if same {
-                    return true
+        if dedicated && unsafe {
+            (*b).size[block]
+        } > self.block_size(unsafe {
+            (*b).type_index[block]
+        }) * KEPT_DEDICATED_SIZE {
+            self.release(fns, device, block)
+            return
+        }
+        // The other empty blocks of its memory type and kind.
+        kept := 0usize
+        replaced := MAX_BLOCKS
+        unsafe {
+            for i in 0usize..(*b).count {
+                if i != block && (*b).live[i] == 0 && (*b).type_index[i] == (*b).type_index[block] && ((*b).flags[i] & KIND_FLAGS) == ((*b).flags[block] & KIND_FLAGS) {
+                    kept += 1
+                    if replaced == MAX_BLOCKS {
+                        replaced = i
+                    }
                 }
             }
         }
-        return false
+        if !dedicated {
+            // Blocks of one kind are alike: one empty one is enough.
+            if kept != 0 {
+                self.release(fns, device, block)
+            }
+            return
+        }
+        // Dedicated blocks differ in size: keep the latest, which replaces
+        // another.
+        if kept >= KEPT_DEDICATED {
+            self.release(fns, device, replaced)
+        }
     }
 
     fn release(&self, fns: &vk.DeviceFns, device: vk.Device, block: usize) {
@@ -545,11 +628,6 @@ fn type_score(flags: u32, kind: u32, whole_heap: bool) -> u32 {
 
 fn align_up(value: u64, alignment: u64) -> u64 {
     return (value + alignment - 1) / alignment * alignment
-}
-
-fn mem_size() -> usize {
-    // Blocks: eight parallel arrays of MAX_BLOCKS entries and a count.
-    return MAX_BLOCKS * (8 + 8 + 4 + 4 + 8 + 4 + 4 + 8) + 64
 }
 
 fn copy_properties(properties: &vk.PhysicalDeviceMemoryProperties) -> vk.PhysicalDeviceMemoryProperties {

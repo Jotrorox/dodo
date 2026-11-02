@@ -145,11 +145,20 @@ and friends let `read_buffer` fill them.
 `device.write_buffer(&buffer, offset, bytes)` happens after every submission
 made before it and before every later one, exactly as if it were a command
 of its own: a write never changes what an earlier submission sees. It does
-not wait for the GPU: the bytes go into a staging buffer, and the copy runs
-just before the next submission (see [Staging and frames in
-flight](#staging-and-frames-in-flight)). `device.read_buffer(&buffer, offset,
-&mut out)` waits for every submission so far and then copies. Both fail with
-`InvalidInput` when the range does not fit or the buffer lacks the usage.
+not wait for the GPU: a buffer the CPU can map that no submitted work uses
+any more is written directly, and otherwise the bytes go into a staging
+buffer and the copy runs as part of the next submission (see [Staging and
+frames in flight](#staging-and-frames-in-flight)). `device.read_buffer(&buffer,
+offset, &mut out)` waits for the submissions so far that use the buffer and
+then copies. Both fail with `InvalidInput` when the range does not fit or the
+buffer lacks the usage.
+
+`device.start_read_buffer(&buffer, offset, size)` starts the same copy without
+waiting and returns a `gpu.Readback`: `ready()` says whether the GPU has made
+the copy, and `read(&mut out)` copies the `size()` bytes out, waiting first if
+it has not. A program that reads results every frame can collect each one a
+frame later and never stall on the GPU. `device.start_read_texture(&texture,
+region, bytes_per_row)` does the same for texels.
 
 ## Textures and samplers
 
@@ -503,22 +512,28 @@ from the thread that opened the window.
 ## Staging and frames in flight
 
 `std/gpu` keeps the CPU from waiting for the GPU. On Vulkan and Metal,
-`write_buffer`, `write_texture` and `create_buffer_with_data` copy the data
-into a staging ring buffer in memory the GPU can read, and record the copy
-into an upload command buffer that is submitted just ahead of the next
-`submit()`, `present()`, read or `wait()`. Nothing waits until the ring is
-full of copies the GPU has not run yet: it starts at 4 MiB and doubles up to
-64 MiB, and writes of more than 16 MiB get a staging buffer of their own.
-Several writes to the same buffer before a submission land in the order they
-were made. OpenGL's driver stages such calls itself, so there they go
-straight to it.
+`std/gpu` remembers which submissions use each buffer. `write_buffer` and
+`create_buffer_with_data` write a buffer the CPU can map (every buffer on
+Metal) directly when no submitted work uses it any more and no earlier write
+to it is still staged. Other writes, and every `write_texture`, copy the data
+into a staging ring buffer in memory the GPU can read and record the copy
+into an upload command buffer, which runs first in the same submission as
+the next `submit()`, or on its own before a `present()`, read or `wait()`.
+Nothing waits until the ring is full of copies the GPU has not run yet: it
+starts at 4 MiB and doubles up to 64 MiB, and writes of more than 16 MiB get
+a staging buffer of their own. Several writes to the same buffer land in the
+order they were made. OpenGL's driver stages such calls itself, so there
+they go straight to it. A program that updates a buffer every frame while
+earlier frames are in flight can keep one buffer per frame in flight: each
+write then finds its buffer idle and costs a memory copy.
 
-Reading back is the only call that waits: `read_buffer` and `read_texture`
-wait for every submission so far, then copy. On Vulkan, buffers live in GPU
-memory; where the CPU can map that memory (GPUs with unified memory, or
-resizable BAR) reads copy from it directly, and otherwise through a readback
-buffer in memory the CPU caches. With a [Surface](#surfaces), two or three
-frames are in flight.
+Reading back is the only call that waits: `read_buffer` waits for the
+submissions that use the buffer and `read_texture` for every submission so
+far, then they copy; `start_read_buffer` and `start_read_texture` wait for
+nothing. On Vulkan, buffers live in GPU memory; where the CPU can map that
+memory (GPUs with unified memory, or resizable BAR) reads copy from it
+directly, and otherwise through a readback buffer in memory the CPU caches.
+With a [Surface](#surfaces), two or three frames are in flight.
 
 Setting the environment variable `DODO_GPU_UNMAPPED` makes the Vulkan
 backend treat every buffer as unmapped, as on a GPU with memory of its own,
@@ -536,8 +551,9 @@ vertices gets one barrier from compute writes to vertex input, and
 independent dispatches, copies and passes get none. Each submission starts
 after the ones before it have finished.
 
-The Vulkan backend records each render pass into a secondary command
-buffer, so that the barriers its draws need can run before the pass;
+The Vulkan backend records each render pass's commands into a list and
+replays them into the command buffer when the pass ends, so that the
+barriers its draws need can run before the pass;
 OpenGL needs `glMemoryBarrier` only after shader writes to storage buffers
 and textures, and Metal tracks hazards itself. Draws of one render pass are
 not ordered against each other: a draw cannot read what an earlier draw of
@@ -549,9 +565,9 @@ Dropping a buffer, texture, sampler or pipeline that a submitted command or an
 open encoder may still use is safe: `std/gpu` destroys it once the GPU has
 finished every such submission. `submit()`, `wait()` and `poll()` destroy what
 has become free; call `device.poll()` in a program that drops objects and then
-submits nothing for a while. At most 64 objects wait at a time; dropping more
-waits for the GPU to finish what was submitted, and panics only when all of
-them may still be used by encoders that are open.
+submits nothing for a while. Any number of objects can wait. On Metal, whose
+command buffers keep what they use alive, objects dropped while no encoder is
+recording are released at once.
 
 ## What is checked
 
@@ -626,7 +642,15 @@ already-checked descriptors and returns them as `hal.Handle`s, four words whose
 meaning it defines, and it records commands into an encoder handle. `std/gpu`
 does the checking, keeps each pass's bindings in a `hal.PassState` that the
 backend applies at each draw or dispatch, and tells the backend when to destroy
-objects. A backend whose `staged()` is true leaves transfers to `std/gpu`,
+objects; a backend whose `tracks_resources()` is true (Metal) gets no barrier
+calls and keeps submitted work's objects alive itself. Its `submit(uploads,
+encoder)` runs `std/gpu`'s upload encoder, when there is one, first in the
+same submission. Each `PassState` carries dirty bits per slot: the backend
+applies those of the slots the pipeline uses and clears exactly those, and
+bindings carry over between pipelines of the same layout. Constructors
+(`open`, `open_for_window`) are called by name, so `hal.Backend` works as a
+`&dyn` reference, which is how `std/gpu` calls its backend. A backend whose
+`staged()` is true leaves transfers to `std/gpu`,
 which copies through `BUFFER_UPLOAD` and `BUFFER_READBACK` buffers it maps
 with `mapped()`; `barrier(encoder, before, after)` receives the `USE_*`
 bits of the dependent uses; and `create_surface`, `configure_surface`,

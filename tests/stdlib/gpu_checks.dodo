@@ -4,6 +4,7 @@ import "core/bytes"
 import "core/mem"
 import "std/console"
 import "std/gpu"
+import "std/thread"
 
 // std/gpu on every backend this machine has. Each check prints its name;
 // a failed expectation panics with the reason. Exits 0 when at least one
@@ -78,6 +79,10 @@ fn checks(device: &gpu.Device) -> void!gpu.Error {
     console.println("  staging")!
     check_large_writes(device)?
     console.println("  large writes")!
+    check_write_order(device)?
+    console.println("  write order")!
+    check_readbacks(device)?
+    console.println("  readbacks")!
     check_hazards(device)?
     console.println("  hazards")!
     return ok()
@@ -586,6 +591,96 @@ fn check_write_before_submit(device: &gpu.Device) -> void!gpu.Error {
     for i in 0usize..256 {
         assert(words[i] == (i as u32 + 5) * 2, "the submission missed a write made before it")
     }
+    return ok()
+}
+
+// Writes to a buffer the GPU is still reading, or that an earlier staged
+// write has not reached yet, keep their order: std/gpu writes mapped
+// buffers directly only when no submitted or pending work uses them.
+fn check_write_order(device: &gpu.Device) -> void!gpu.Error {
+    words := [0u32; 4096]
+    source := device.create_buffer(16384, gpu.BUFFER_COPY_DST | gpu.BUFFER_COPY_SRC)?
+    target := device.create_buffer(16384 * 16, gpu.BUFFER_COPY_DST | gpu.BUFFER_COPY_SRC)?
+    // Each round's copy must see that round's write, though the next write
+    // follows while the GPU may still be copying.
+    for round in 0u32..16 {
+        for i in 0usize..4096 {
+            words[i] = round * 10000 + i as u32
+        }
+        device.write_buffer(&source, 0, gpu.u32_bytes(&words))?
+        encoder := device.encoder()?
+        encoder.copy_buffer(&source, 0, &target, round as u64 * 16384, 16384)
+        encoder.submit()?
+    }
+    for round in 0u32..16 {
+        device.read_buffer(&target, round as u64 * 16384, gpu.u32_bytes_mut(&mut words))?
+        for i in 0usize..4096 {
+            assert(words[i] == round * 10000 + i as u32, "a copy saw another round's write")
+        }
+    }
+    // A write staged while the GPU used the buffer, then a write once the
+    // GPU is idle but before the staged one ran: the later one wins.
+    first := [1u32; 4]
+    second := [2u32; 4]
+    encoder := device.encoder()?
+    encoder.copy_buffer(&source, 0, &target, 0, 16384)
+    encoder.submit()?
+    device.write_buffer(&source, 0, gpu.u32_bytes(&first))?
+    thread.sleep_ms(20)
+    device.write_buffer(&source, 0, gpu.u32_bytes(&second))?
+    out := [0u32; 4]
+    device.read_buffer(&source, 0, gpu.u32_bytes_mut(&mut out))?
+    assert(out[0] == 2 && out[3] == 2, "a staged write overwrote a later one")
+    // A write after a command recorded in an open encoder that also used
+    // the buffer in a submitted one (not on OpenGL, which runs commands as
+    // they are recorded).
+    if same(api_label(device), "OpenGL") {
+        return ok()
+    }
+    encoder = device.encoder()?
+    encoder.copy_buffer(&source, 0, &target, 0, 16)
+    encoder.submit()?
+    later := device.encoder()?
+    later.copy_buffer(&source, 0, &target, 16, 16)
+    device.write_buffer(&source, 0, gpu.u32_bytes(&first))?
+    later.submit()?
+    device.read_buffer(&target, 0, gpu.u32_bytes_mut(&mut words))?
+    assert(words[0] == 2 && words[3] == 2, "the earlier submission saw a later write")
+    assert(words[4] == 1 && words[7] == 1, "the later submission missed an earlier write")
+    return ok()
+}
+
+// Reads started without waiting, collected later in any order.
+fn check_readbacks(device: &gpu.Device) -> void!gpu.Error {
+    values := [0u32; 64]
+    for i in 0usize..64 {
+        values[i] = i as u32 * 3
+    }
+    buffer := device.create_buffer_with_data(gpu.u32_bytes(&values), gpu.BUFFER_COPY_SRC | gpu.BUFFER_COPY_DST)?
+    early := device.start_read_buffer(&buffer, 8, 13)?
+    changed := [99u32; 4]
+    device.write_buffer(&buffer, 0, gpu.u32_bytes(&changed))?
+    late := device.start_read_buffer(&buffer, 0, 16)?
+    image := device.create_texture(gpu.TextureDescriptor.new(4, 4, gpu.FORMAT_RGBA8_UNORM, gpu.TEXTURE_COPY_DST | gpu.TEXTURE_COPY_SRC))?
+    blues := [BLUE; 16]
+    device.write_texture(&image, image.region(), gpu.u32_bytes(&blues), 16)?
+    texels := device.start_read_texture(&image, gpu.Region.new(1, 1, 2, 2), 8)?
+    expect_error(match device.start_read_buffer(&buffer, 250, 8) {
+        ok(_) => ok(),
+        err(error) => err(error),
+    }, "InvalidInput")
+    pixels := [0u8; 16]
+    texels.read(&mut pixels)?
+    expect_pixel(&pixels, 2, 1, 1, BLUE)
+    out := [0u32; 4]
+    late.read(gpu.u32_bytes_mut(&mut out))?
+    assert(out[0] == 99 && out[3] == 99, "a readback missed an earlier write")
+    bytes := [0u8; 13]
+    early.read(&mut bytes)?
+    // Bytes 8 to 20: values 2 to 4 and the first byte of 5.
+    assert(bytes[0] == 6 && bytes[4] == 9 && bytes[8] == 12 && bytes[12] == 15, "a readback saw a later write")
+    assert(early.ready() && early.size() == 13, "a collected readback is ready")
+    expect_error(early.read(&mut pixels), "InvalidInput")
     return ok()
 }
 

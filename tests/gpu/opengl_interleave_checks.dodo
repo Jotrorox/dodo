@@ -1,0 +1,220 @@
+package main
+
+import "std/console"
+import "std/gpu"
+
+// std/gpu's OpenGL backend with passes of two encoders recorded in turn,
+// and a second device interrupting the first. OpenGL state is global to a
+// context, so each draw must set again whatever another pass (or the other
+// device's context) changed in between: framebuffer, viewport, scissor,
+// program, uniform buffers, and the vertex and index buffers of a vertex
+// array two passes share. Prints "unavailable NAME" and exits successfully
+// when the machine has no OpenGL 4.5 (macOS, a CI runner without Mesa), so
+// tests/opengl_library.rs decides whether that is allowed.
+
+const NO_SPIRV: [0]u32 = []
+
+// One pipeline paints a uniform color, the other a color per vertex.
+const FLAT_GLSL: &str = "#version 450 core\n#ifdef VERTEX\nlayout(location = 0) in vec2 position;\nvoid main() {\n    gl_Position = vec4(position, 0.0, 1.0);\n}\n#endif\n#ifdef FRAGMENT\nlayout(std140, binding = 0) uniform Paint {\n    vec4 color;\n};\nlayout(location = 0) out vec4 result;\nvoid main() {\n    result = color;\n}\n#endif\n"
+
+const SHADED_GLSL: &str = "#version 450 core\n#ifdef VERTEX\nlayout(location = 0) in vec2 position;\nlayout(location = 1) in vec4 color;\nlayout(location = 0) out vec4 shade;\nvoid main() {\n    shade = color;\n    gl_Position = vec4(position, 0.0, 1.0);\n}\n#endif\n#ifdef FRAGMENT\nlayout(location = 0) in vec4 shade;\nlayout(location = 0) out vec4 result;\nvoid main() {\n    result = shade;\n}\n#endif\n"
+
+// RGBA bytes read as a big-endian word.
+const RED: u32 = 0xff0000ff
+const GREEN: u32 = 0x00ff00ff
+const BLUE: u32 = 0x0000ffff
+const BLACK: u32 = 0x000000ff
+const WHITE: u32 = 0xffffffff
+
+fn main() {
+    device := match gpu.Device.open(gpu.Options.with_backend(gpu.Preference.OpenGl)) {
+        ok(device) => device,
+        err(error) => {
+            console.printf("unavailable {}\n", gpu.error_name(error))!
+            return
+        }
+    }
+    console.printf("renderer {}\n", device.name())!
+    match interleave(&device) {
+        ok() => {}
+        err(error) => {
+            console.printf("failed: {}\n", gpu.error_name(error))!
+            assert(false, "the interleaved passes returned an error")
+        }
+    }
+    console.println("interleaved passes")!
+    match two_devices(&device) {
+        ok() => {}
+        err(error) => {
+            console.printf("failed: {}\n", gpu.error_name(error))!
+            assert(false, "two devices returned an error")
+        }
+    }
+    console.println("two devices")!
+    console.println("passed")!
+}
+
+fn flat_pipeline(device: &gpu.Device, source: &gpu.ShaderSource) -> gpu.RenderPipeline!gpu.Error from(device) {
+    attributes := [gpu.VertexAttribute.new(0, gpu.VERTEX_FLOAT32X2, 0)]
+    layouts := [gpu.VertexBufferLayout.new(8, &attributes)]
+    bindings := [gpu.BindingLayout.uniform_buffer(0, gpu.STAGE_FRAGMENT)]
+    descriptor := gpu.RenderPipelineDescriptor.new(source, "main", source, "main", gpu.FORMAT_RGBA8_UNORM)
+    descriptor.vertex_buffers = &layouts
+    descriptor.bindings = &bindings
+    return device.create_render_pipeline(descriptor)
+}
+
+fn shaded_pipeline(device: &gpu.Device, source: &gpu.ShaderSource) -> gpu.RenderPipeline!gpu.Error from(device) {
+    positions := [gpu.VertexAttribute.new(0, gpu.VERTEX_FLOAT32X2, 0)]
+    colors := [gpu.VertexAttribute.new(1, gpu.VERTEX_UNORM8X4, 0)]
+    layouts := [gpu.VertexBufferLayout.new(8, &positions), gpu.VertexBufferLayout.new(4, &colors)]
+    descriptor := gpu.RenderPipelineDescriptor.new(source, "main", source, "main", gpu.FORMAT_RGBA8_UNORM)
+    descriptor.vertex_buffers = &layouts
+    // Its triangles wind clockwise; the flat pipeline's, counterclockwise,
+    // would vanish if this cull mode stayed set for them.
+    descriptor.cull_mode = gpu.CULL_FRONT
+    return device.create_render_pipeline(descriptor)
+}
+
+// Encoder A draws into a 32x32 target with the flat pipeline; encoder B
+// into a 16x16 one, first with the same pipeline (so the same vertex
+// array) and other buffers, then with the shaded one under a scissor.
+// Their draws alternate: A, B, A, B, A.
+fn interleave(device: &gpu.Device) -> void!gpu.Error {
+    flat_source := gpu.ShaderSource { spirv: &NO_SPIRV, msl: "", glsl: FLAT_GLSL }
+    shaded_source := gpu.ShaderSource { spirv: &NO_SPIRV, msl: "", glsl: SHADED_GLSL }
+    flat := flat_pipeline(device, &flat_source)?
+    shaded := shaded_pipeline(device, &shaded_source)?
+    target_a := device.create_texture(gpu.TextureDescriptor.new(32, 32, gpu.FORMAT_RGBA8_UNORM, gpu.TEXTURE_RENDER | gpu.TEXTURE_COPY_SRC))?
+    target_b := device.create_texture(gpu.TextureDescriptor.new(16, 16, gpu.FORMAT_RGBA8_UNORM, gpu.TEXTURE_RENDER | gpu.TEXTURE_COPY_SRC))?
+
+    // A's quads: top left, bottom left, top right, as vertices 0-3, 4-7
+    // and 8-11 of one buffer.
+    quads_a := [
+        -1.0f32, 1.0, -1.0, 0.0, 0.0, 1.0, 0.0, 0.0,
+        -1.0, 0.0, -1.0, -1.0, 0.0, 0.0, 0.0, -1.0,
+        0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0,
+    ]
+    indices_a := [0u16, 1, 2, 2, 1, 3]
+    // B's flat quad: bottom right, indexed with 32-bit indices from 4 on.
+    quad_b := [0.0f32, 0.0, 0.0, -1.0, 1.0, 0.0, 1.0, -1.0]
+    indices_b := [7u32, 7, 7, 7, 0, 1, 2, 2, 1, 3]
+    // B's shaded quad: the whole top half, blue, in clockwise triangles.
+    top := [-1.0f32, 1.0, 1.0, 1.0, -1.0, 0.0, -1.0, 0.0, 1.0, 1.0, 1.0, 0.0]
+    blues := [0xffff0000u32, 0xffff0000, 0xffff0000, 0xffff0000, 0xffff0000, 0xffff0000]
+    red := [1.0f32, 0.0, 0.0, 1.0]
+    green := [0.0f32, 1.0, 0.0, 1.0]
+    vertices_a := device.create_buffer_with_data(gpu.f32_bytes(&quads_a), gpu.BUFFER_VERTEX)?
+    index_a := device.create_buffer_with_data(gpu.u16_bytes(&indices_a), gpu.BUFFER_INDEX)?
+    vertices_b := device.create_buffer_with_data(gpu.f32_bytes(&quad_b), gpu.BUFFER_VERTEX)?
+    index_b := device.create_buffer_with_data(gpu.u32_bytes(&indices_b), gpu.BUFFER_INDEX)?
+    top_b := device.create_buffer_with_data(gpu.f32_bytes(&top), gpu.BUFFER_VERTEX)?
+    colors_b := device.create_buffer_with_data(gpu.u32_bytes(&blues), gpu.BUFFER_VERTEX)?
+    paint_a := device.create_buffer_with_data(gpu.f32_bytes(&red), gpu.BUFFER_UNIFORM)?
+    paint_b := device.create_buffer_with_data(gpu.f32_bytes(&green), gpu.BUFFER_UNIFORM)?
+
+    encoder_a := device.encoder()?
+    encoder_b := device.encoder()?
+    {
+        pass_a := encoder_a.render_pass(gpu.ColorAttachment.clear(&target_a, 0.0, 0.0, 0.0, 1.0))
+        pass_a.set_pipeline(&flat)
+        pass_a.set_buffer(0, &paint_a)
+        pass_a.set_vertex_buffer(0, &vertices_a, 0)
+        pass_a.set_index_buffer(&index_a, gpu.INDEX_UINT16, 0)
+        pass_a.draw_indexed(6, 1, 0, 0, 0)
+
+        pass_b := encoder_b.render_pass(gpu.ColorAttachment.clear(&target_b, 1.0, 1.0, 1.0, 1.0))
+        pass_b.set_pipeline(&flat)
+        pass_b.set_buffer(0, &paint_b)
+        pass_b.set_vertex_buffer(0, &vertices_b, 0)
+        pass_b.set_index_buffer(&index_b, gpu.INDEX_UINT32, 0)
+        pass_b.draw_indexed(6, 1, 4, 0, 0)
+
+        // Nothing changes in A's state: its framebuffer, viewport,
+        // uniform buffer and vertex and index buffers must come back.
+        pass_a.draw_indexed(6, 1, 0, 4, 0)
+
+        pass_b.set_scissor(0, 0, 8, 16)
+        pass_b.set_pipeline(&shaded)
+        pass_b.set_vertex_buffer(0, &top_b, 0)
+        pass_b.set_vertex_buffer(1, &colors_b, 0)
+        pass_b.draw(6, 1, 0, 0)
+
+        // No scissor, the flat program and A's vertex array again.
+        pass_a.draw_indexed(6, 1, 0, 8, 0)
+    }
+    encoder_b.submit()?
+    encoder_a.submit()?
+
+    pixels_a := [0u8; 4096]
+    device.read_texture(&target_a, target_a.region(), &mut pixels_a, 128)?
+    expect(&pixels_a, 32, 8, 8, RED, "A's first quad")
+    expect(&pixels_a, 32, 8, 24, RED, "A's second quad")
+    expect(&pixels_a, 32, 24, 8, RED, "A's third quad")
+    expect(&pixels_a, 32, 24, 24, BLACK, "A's empty quarter")
+    pixels_b := [0u8; 1024]
+    device.read_texture(&target_b, target_b.region(), &mut pixels_b, 64)?
+    expect(&pixels_b, 16, 12, 12, GREEN, "B's flat quad")
+    expect(&pixels_b, 16, 4, 12, WHITE, "B's empty bottom left")
+    expect(&pixels_b, 16, 4, 4, BLUE, "B's shaded quad")
+    expect(&pixels_b, 16, 12, 4, WHITE, "B's scissored top right")
+    return ok()
+}
+
+// A second device's context becomes current whenever it is used; the
+// first device's draws must still reach the first context.
+fn two_devices(device: &gpu.Device) -> void!gpu.Error {
+    other := match gpu.Device.open(gpu.Options.with_backend(gpu.Preference.OpenGl)) {
+        ok(other) => other,
+        err(error) => {
+            console.printf("no second device: {}\n", gpu.error_name(error))!
+            return ok()
+        }
+    }
+    source := gpu.ShaderSource { spirv: &NO_SPIRV, msl: "", glsl: FLAT_GLSL }
+    flat := flat_pipeline(device, &source)?
+    target := device.create_texture(gpu.TextureDescriptor.new(16, 16, gpu.FORMAT_RGBA8_UNORM, gpu.TEXTURE_RENDER | gpu.TEXTURE_COPY_SRC))?
+    left := [-1.0f32, 1.0, -1.0, -1.0, 0.0, 1.0, 0.0, 1.0, -1.0, -1.0, 0.0, -1.0]
+    right := [0.0f32, 1.0, 0.0, -1.0, 1.0, 1.0, 1.0, 1.0, 0.0, -1.0, 1.0, -1.0]
+    green := [0.0f32, 1.0, 0.0, 1.0]
+    vertices_left := device.create_buffer_with_data(gpu.f32_bytes(&left), gpu.BUFFER_VERTEX)?
+    vertices_right := device.create_buffer_with_data(gpu.f32_bytes(&right), gpu.BUFFER_VERTEX)?
+    paint := device.create_buffer_with_data(gpu.f32_bytes(&green), gpu.BUFFER_UNIFORM)?
+    other_target := other.create_texture(gpu.TextureDescriptor.new(16, 16, gpu.FORMAT_RGBA8_UNORM, gpu.TEXTURE_RENDER | gpu.TEXTURE_COPY_SRC))?
+    encoder := device.encoder()?
+    {
+        pass := encoder.render_pass(gpu.ColorAttachment.clear(&target, 0.0, 0.0, 0.0, 1.0))
+        pass.set_pipeline(&flat)
+        pass.set_buffer(0, &paint)
+        pass.set_vertex_buffer(0, &vertices_left, 0)
+        // The other device's context becomes current.
+        other_encoder := other.encoder()?
+        {
+            other_pass := other_encoder.render_pass(gpu.ColorAttachment.clear(&other_target, 0.0, 0.0, 1.0, 1.0))
+            other_pass.end()
+        }
+        other_encoder.submit()?
+        pass.draw(6, 1, 0, 0)
+        core.drop(other.create_buffer(64, gpu.BUFFER_VERTEX)?)
+        pass.set_vertex_buffer(0, &vertices_right, 0)
+        pass.draw(6, 1, 0, 0)
+    }
+    encoder.submit()?
+    pixels := [0u8; 1024]
+    device.read_texture(&target, target.region(), &mut pixels, 64)?
+    expect(&pixels, 16, 4, 8, GREEN, "the first device's left half")
+    expect(&pixels, 16, 12, 8, GREEN, "the first device's right half")
+    other_pixels := [0u8; 1024]
+    other.read_texture(&other_target, other_target.region(), &mut other_pixels, 64)?
+    expect(&other_pixels, 16, 8, 8, BLUE, "the second device's clear")
+    return ok()
+}
+
+fn expect(pixels: &[u8], width: u32, x: u32, y: u32, wanted: u32, what: &str) {
+    at := ((y * width + x) * 4) as usize
+    found := (pixels[at] as u32 << 24) | (pixels[at + 1] as u32 << 16) | (pixels[at + 2] as u32 << 8) | pixels[at + 3] as u32
+    if found != wanted {
+        console.printf("{}: pixel ({}, {}) is {}, expected {}\n", what, x, y, found, wanted)!
+        assert(false, "unexpected pixel")
+    }
+}
