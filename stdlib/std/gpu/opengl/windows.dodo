@@ -18,10 +18,6 @@ import "std/window/handle"
 // instead, sets its pixel format (a window keeps the first one it gets) and
 // shows frames with SwapBuffers.
 
-unsafe extern "C" fn LoadLibraryA(name: *const u8) -> *mut u8
-// Declared with the pointer result std/dylib uses, as one program may load
-// both: a symbol has a single C signature.
-unsafe extern "C" fn GetProcAddress(module: *mut u8, name: *const u8) -> *mut u8
 unsafe extern "C" fn GetModuleHandleA(name: *const u8) -> *mut u8
 
 const CS_OWNDC: u32 = 0x0020
@@ -105,18 +101,6 @@ struct PixelFormatDescriptor {
 
 const CLASS_NAME: &[u8] = b"DodoOpenGLContext\0"
 
-fn null() -> *mut u8 {
-    unsafe {
-        return 0usize as *mut u8
-    }
-}
-
-unsafe fn symbol(module: *mut u8, name: &[u8]) -> usize {
-    unsafe {
-        return GetProcAddress(module, common.c_string(name)) as usize
-    }
-}
-
 // Every entry point the backend uses.
 struct Wgl {
     register_class: RegisterClassExA
@@ -181,13 +165,13 @@ pub struct Backend {
     // opengl32, user32 and gdi32 and their entry points, with no window yet.
     fn load() -> Backend!common.Error {
         opengl := unsafe {
-            LoadLibraryA(common.c_string(b"opengl32.dll\0"))
+            common.open_library(b"opengl32.dll\0")
         }
         user32 := unsafe {
-            LoadLibraryA(common.c_string(b"user32.dll\0"))
+            common.open_library(b"user32.dll\0")
         }
         gdi32 := unsafe {
-            LoadLibraryA(common.c_string(b"gdi32.dll\0"))
+            common.open_library(b"gdi32.dll\0")
         }
         if ptr.is_null(opengl) || ptr.is_null(user32) || ptr.is_null(gdi32) {
             return err(common.Error.NoLibrary)
@@ -199,19 +183,19 @@ pub struct Backend {
         ]
         for i in 0usize..6 {
             addresses[i] = unsafe {
-                symbol(user32, names[i])
+                common.symbol(user32, names[i])
             }
         }
         gdi_names := [b"ChoosePixelFormat\0", b"SetPixelFormat\0", b"GetPixelFormat\0", b"DescribePixelFormat\0", b"SwapBuffers\0"]
         for i in 0usize..5 {
             addresses[6 + i] = unsafe {
-                symbol(gdi32, gdi_names[i])
+                common.symbol(gdi32, gdi_names[i])
             }
         }
         wgl_names := [b"wglCreateContext\0", b"wglDeleteContext\0", b"wglMakeCurrent\0", b"wglGetProcAddress\0", b"wglGetCurrentContext\0"]
         for i in 0usize..5 {
             addresses[11 + i] = unsafe {
-                symbol(opengl, wgl_names[i])
+                common.symbol(opengl, wgl_names[i])
             }
         }
         for i in 0usize..16 {
@@ -240,9 +224,9 @@ pub struct Backend {
                     get_proc_address: addresses[14] as WglGetProcAddress,
                     get_current_context: addresses[15] as WglGetCurrentContext
                 },
-                window: null(),
-                device: null(),
-                context: null(),
+                window: common.null(),
+                device: common.null(),
+                context: common.null(),
                 shown: false
             }
         })
@@ -263,12 +247,12 @@ pub struct Backend {
                 class_extra: 0,
                 window_extra: 0,
                 instance: instance,
-                icon: null(),
-                cursor: null(),
-                background: null(),
+                icon: common.null(),
+                cursor: common.null(),
+                background: common.null(),
                 menu_name: 0usize as *const u8,
                 class_name: common.c_string(CLASS_NAME),
-                small_icon: null()
+                small_icon: common.null()
             }
         }
         register := backend.wgl.register_class
@@ -276,7 +260,7 @@ pub struct Backend {
         unsafe {
             // Fails harmlessly once the class exists from an earlier context.
             register(ptr.from_ref(&class))
-            backend.window = create_window(0, common.c_string(CLASS_NAME), common.c_string(b"\0"), WS_POPUP, 0, 0, 1, 1, null(), null(), instance, null())
+            backend.window = create_window(0, common.c_string(CLASS_NAME), common.c_string(b"\0"), WS_POPUP, 0, 0, 1, 1, common.null(), common.null(), instance, common.null())
         }
         // Without a desktop, such as in a service, there is no window.
         if ptr.is_null(backend.window) {
@@ -390,7 +374,7 @@ pub struct Backend {
         }
         context := unsafe {
             create_attributes := address as WglCreateContextAttribsArb
-            create_attributes(self.device, null(), ptr.as_ptr(&attributes))
+            create_attributes(self.device, common.null(), ptr.as_ptr(&attributes))
         }
         if ptr.is_null(context) {
             return err(common.Error.Unsupported)
@@ -399,7 +383,7 @@ pub struct Backend {
         delete := self.wgl.delete_context
         make := self.wgl.make_current
         unsafe {
-            make(null(), null())
+            make(common.null(), common.null())
             delete(legacy)
         }
         self.context = context
@@ -420,7 +404,7 @@ pub struct Backend {
     pub fn release_current(&self) {
         make := self.wgl.make_current
         unsafe {
-            make(null(), null())
+            make(common.null(), common.null())
         }
     }
 
@@ -477,7 +461,7 @@ pub struct Backend {
             return address
         }
         return unsafe {
-            GetProcAddress(self.opengl, name) as usize
+            common.symbol_at(self.opengl, name)
         }
     }
 

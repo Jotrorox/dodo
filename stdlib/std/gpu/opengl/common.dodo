@@ -1,8 +1,10 @@
 package common
 
 import "core/ptr"
+import "std/dylib/native" as dynamic
 
-// Types shared by std/gpu/opengl and its per-OS context backends.
+// Types and helpers shared by std/gpu/opengl and its per-OS context
+// backends.
 
 // Why an OpenGL context could not be created or made current.
 pub enum Error {
@@ -26,6 +28,44 @@ pub fn c_string(text: &[u8]) -> *const u8 {
     return ptr.as_ptr(text)
 }
 
+pub fn null() -> *mut u8 {
+    unsafe {
+        return 0usize as *mut u8
+    }
+}
+
+// System libraries are opened at run time, so a program links none of them
+// and still starts without one: dlopen and dlsym on Linux and macOS,
+// LoadLibraryA and GetProcAddress on Windows, through std/dylib's adapter.
+
+// Load the library at `path`, a NUL-terminated name or file path; null
+// when there is none.
+pub unsafe fn open_library(path: &[u8]) -> *mut u8 {
+    unsafe {
+        return dynamic.open(c_string(path))
+    }
+}
+
+// The address of the symbol `name` (NUL-terminated) in `library`, or 0.
+pub unsafe fn symbol(library: *mut u8, name: &[u8]) -> usize {
+    unsafe {
+        return dynamic.symbol(library, c_string(name)) as usize
+    }
+}
+
+// The same for a name the driver passed as a C string.
+pub unsafe fn symbol_at(library: *mut u8, name: *const u8) -> usize {
+    unsafe {
+        return dynamic.symbol(library, name) as usize
+    }
+}
+
+pub unsafe fn close_library(library: *mut u8) {
+    unsafe {
+        dynamic.close(library)
+    }
+}
+
 // Whether `list`, a NUL-terminated, space-separated extension list such as
 // eglQueryString returns, contains `name` as a whole word.
 pub unsafe fn has_word(list: *const u8, name: &[u8]) -> bool {
@@ -40,7 +80,7 @@ pub unsafe fn has_word(list: *const u8, name: &[u8]) -> bool {
             byte := unsafe {
                 *ptr.offset(list, end)
             }
-            if byte == 0 || byte == 32 {
+            if byte == 0 || byte == b' ' {
                 break
             }
             end += 1

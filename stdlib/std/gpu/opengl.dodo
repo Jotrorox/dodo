@@ -1,5 +1,6 @@
 package opengl
 
+import "core/ascii"
 import "core/mem"
 import "core/ptr"
 import "std/gpu/opengl/common"
@@ -222,7 +223,7 @@ pub struct Context {
             // Drivers report ASCII; anything else reads as empty.
             bytes := ptr.borrow_slice(text, length, self)
             for i in 0usize..length {
-                if bytes[i] >= 128 {
+                if !ascii.is_ascii(bytes[i]) {
                     return ""
                 }
             }
@@ -247,14 +248,14 @@ pub struct Context {
         major := 0u32
         minor := 0u32
         index := 0usize
-        for index < text.len && text[index] >= 48 && text[index] <= 57 {
-            major = major * 10 + (text[index] - 48) as u32
+        for index < text.len && ascii.is_digit(text[index]) {
+            major = major * 10 + (text[index] - b'0') as u32
             index += 1
         }
-        if index < text.len && text[index] == 46 {
+        if index < text.len && text[index] == b'.' {
             index += 1
-            for index < text.len && text[index] >= 48 && text[index] <= 57 {
-                minor = minor * 10 + (text[index] - 48) as u32
+            for index < text.len && ascii.is_digit(text[index]) {
+                minor = minor * 10 + (text[index] - b'0') as u32
                 index += 1
             }
         }
