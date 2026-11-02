@@ -149,6 +149,24 @@ fn precall_native(L: *mut State, func0: *mut Value, nresults: i32, f: NativeFn) 
         }
         cx := Cx { L: L }
         let n = f(&mut cx)?
+        if (*L).hookmask == 0 && (*L).tbc_count == 0 {
+            // Common return (no hooks, no to-be-closed variables): what
+            // poscall does, without the call. `func` may be stale if the
+            // function grew the stack, so the frame's copy is used.
+            let res = (*ci).func
+            if nresults == 1 {
+                if n == 0 {
+                    (*res).tag = TAG_NIL
+                } else {
+                    set_obj(res, ptr.offset((*L).top, -(n as isize)))
+                }
+                (*L).top = ptr.offset(res, 1)
+            } else {
+                move_results(L, res, n, nresults)
+            }
+            (*L).ci = (*ci).previous
+            return ok()
+        }
         poscall(L, ci, n)?
         return ok()
     }

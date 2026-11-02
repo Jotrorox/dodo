@@ -151,6 +151,12 @@ fn meta_init(L: *mut State) -> void!Throw {
 // Metamethod `event` of metatable `mt`, or null. For the first six events a
 // miss is remembered in mt.flags until the table is modified.
 fn meta_fast_tm(g: *mut Global, mt: *mut Table, event: u32) -> *mut Value {
+    return meta_fast_tm_inline(g, mt, event)
+}
+
+// meta_fast_tm, inlined into hot callers.
+@inline
+fn meta_fast_tm_inline(g: *mut Global, mt: *mut Table, event: u32) -> *mut Value {
     unsafe {
         if ptr.is_null(mt) {
             return 0 as *mut Value
@@ -475,7 +481,7 @@ fn vm_finish_get(L: *mut State, t0: *mut Value, key: *mut Value, res: isize, slo
                     return err(err_type(L, t, "index"))
                 }
             } else {
-                tm = meta_fast_tm(g, (*(val_gc(t) as *mut Table)).metatable, TM_INDEX)
+                tm = meta_fast_tm_inline(g, (*(val_gc(t) as *mut Table)).metatable, TM_INDEX)
                 if ptr.is_null(tm) {
                     (*restore_stack(L, res)).tag = TAG_NIL
                     return ok()
@@ -487,7 +493,12 @@ fn vm_finish_get(L: *mut State, t0: *mut Value, key: *mut Value, res: isize, slo
             set_obj(cur, tm)
             t = cur
             if (*t).tag == TAG_TABLE {
-                slot = tab_get(val_gc(t) as *mut Table, key)
+                // Field names and method names are short strings.
+                slot = if (*key).tag == TAG_SHORTSTR {
+                    tab_get_shortstr(val_gc(t) as *mut Table, val_str(key))
+                } else {
+                    tab_get(val_gc(t) as *mut Table, key)
+                }
                 if !val_is_empty(slot) {
                     set_obj(restore_stack(L, res), slot)
                     return ok()
