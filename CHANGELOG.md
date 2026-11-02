@@ -22,6 +22,15 @@
   written with stores LLVM cannot merge: a merged store moved integers
   through a float register, and the next opcode's integer load of that slot
   stalled on a cross-register-file forward.
+- The Lua interpreter is another 5% faster, now about 0.70x the time of the
+  reference Lua 5.4.9. Lua-to-Lua calls and returns switch frames inside the
+  instruction loop, each dispatching the next instruction from its own
+  indirect branch (`fib` 1.15x faster). A native function in tail position
+  (`return f(x)`) runs as an ordinary call. Strings are hashed and compared
+  eight bytes at a time, `==` on short strings compares pointers and `<`/`<=`
+  on strings skip the generic comparison (`string_compare` 1.2x). Table
+  constructors with up to 12 array slots allocate the array together with
+  the table (`binary_trees` 1.15x). Float-float `+ - *` take a direct path.
 
 ## 0.1.6 — 2026-11-02
 

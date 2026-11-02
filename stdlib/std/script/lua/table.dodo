@@ -38,6 +38,10 @@ struct Table {
     asize: u32
     // Last border found in the array part (a hint for `#t`).
     lenhint: u32
+    // Slots of the array part allocated together with the table (right
+    // after it), 0 if none. The array part starts there until a resize
+    // moves it to its own block; the inline slots then stay unused.
+    ainline: u32
     array: *mut Value
     node: *mut Node
     // Free-position cursor (moves downwards); null for the shared dummy node.
@@ -51,6 +55,10 @@ struct Table {
 const TAG_DEADKEY: u8 = 0x0B
 
 const TM_CACHE_MASK: u8 = 0x3F
+// Largest array part allocated inline with a new table (so that table and
+// array fit one small block).
+const TAB_INLINE_MAX: u32 = 12
+const TAB_INLINE_MIN: u32 = 2
 // Largest array part is 2^MAX_ABITS slots.
 const MAX_ABITS: i32 = 31
 const NODE_SIZE: usize = 32
@@ -171,6 +179,7 @@ fn tab_new(L: *mut State) -> (*mut Table)!Throw {
         (*t).lsizenode = 0
         (*t).asize = 0
         (*t).lenhint = 0
+        (*t).ainline = 0
         (*t).array = 0 as *mut Value
         (*t).node = dummy_node()
         (*t).lastfree = 0 as *mut Node
@@ -180,22 +189,82 @@ fn tab_new(L: *mut State) -> (*mut Table)!Throw {
     }
 }
 
+// A new table sized for `asize` array slots and `nhsize` hash keys (a
+// table constructor). A small array part shares the table's block.
+@inline(never)
+fn tab_new_sized(L: *mut State, asize: u32, nhsize: u32) -> (*mut Table)!Throw {
+    unsafe {
+        if asize == 0 || asize > TAB_INLINE_MAX {
+            let t = tab_new(L)?
+            if asize != 0 || nhsize != 0 {
+                tab_resize(L, t, asize, nhsize)?
+            }
+            return ok(t)
+        }
+        // Room for a few more slots: `{f()}` and `{...}` constructors grow
+        // the array part right away (SETLIST with a multiple-result count).
+        let cap = if asize < TAB_INLINE_MIN {
+            TAB_INLINE_MIN
+        } else {
+            asize
+        }
+        let o = gc_new(L, mem.size_of::<Table>() + (cap as usize) * 16, TAG_TABLE)?
+        let t = o as *mut Table
+        (*t).flags = TM_CACHE_MASK
+        (*t).lsizenode = 0
+        (*t).asize = asize
+        (*t).lenhint = asize
+        (*t).ainline = cap
+        let arr = tab_inline_array(t)
+        (*t).array = arr
+        (*t).node = dummy_node()
+        (*t).lastfree = 0 as *mut Node
+        (*t).metatable = 0 as *mut Table
+        (*t).gclist = 0 as *mut GCObject
+        for i in 0isize..(asize as isize) {
+            (*ptr.offset(arr, i)).tag = TAG_EMPTY
+        }
+        if nhsize != 0 {
+            tab_resize(L, t, asize, nhsize)?
+        }
+        return ok(t)
+    }
+}
+
+@inline
+fn tab_inline_array(t: *mut Table) -> *mut Value {
+    unsafe {
+        return ptr.offset(t as *mut u8, mem.size_of::<Table>() as isize) as *mut Value
+    }
+}
+
+// Whether the array part has its own block (not the inline slots).
+@inline
+fn tab_array_owned(t: *mut Table) -> bool {
+    unsafe {
+        return (*t).asize > 0 && ((*t).ainline == 0 || (*t).array != tab_inline_array(t))
+    }
+}
+
 fn tab_free(L: *mut State, t: *mut Table) {
     unsafe {
         if !tab_is_dummy(t) {
             mem_free(L, (*t).node as *mut u8, (node_size(t) as usize) * NODE_SIZE)
         }
-        if (*t).asize > 0 {
+        if tab_array_owned(t) {
             mem_free(L, (*t).array as *mut u8, ((*t).asize as usize) * 16)
         }
-        mem_free(L, t as *mut u8, mem.size_of::<Table>())
+        mem_free(L, t as *mut u8, mem.size_of::<Table>() + ((*t).ainline as usize) * 16)
     }
 }
 
 // Bytes owned by a table (for collector accounting).
 fn tab_mem_size(t: *mut Table) -> usize {
     unsafe {
-        n := mem.size_of::<Table>() + ((*t).asize as usize) * 16
+        n := mem.size_of::<Table>() + ((*t).ainline as usize) * 16
+        if tab_array_owned(t) {
+            n += ((*t).asize as usize) * 16
+        }
         if !tab_is_dummy(t) {
             n += (node_size(t) as usize) * NODE_SIZE
         }
@@ -727,10 +796,22 @@ fn tab_resize(L: *mut State, t: *mut Table, newasize: u32, nhsize: u32) -> void!
         }
         let oldasize = (*t).asize
         let oldarray = (*t).array
+        let oldowned = tab_array_owned(t)
         newarray := oldarray
         if newasize != oldasize {
             if newasize == 0 {
                 newarray = 0 as *mut Value
+            } else if newasize <= (*t).ainline && !oldowned {
+                // The inline slots (in use or not) are big enough.
+                newarray = tab_inline_array(t)
+                let keep = if oldasize < newasize {
+                    oldasize
+                } else {
+                    newasize
+                }
+                for i in keep..newasize {
+                    (*ptr.offset(newarray, i as isize)).tag = TAG_EMPTY
+                }
             } else {
                 match mem_alloc(L, (newasize as usize) * 16) {
                     ok(p) => {
@@ -792,7 +873,7 @@ fn tab_resize(L: *mut State, t: *mut Table, newasize: u32, nhsize: u32) -> void!
             }
             mem_free(L, oldnode as *mut u8, (oldnsize as usize) * NODE_SIZE)
         }
-        if newasize != oldasize && oldasize > 0 {
+        if newasize != oldasize && oldowned {
             mem_free(L, oldarray as *mut u8, (oldasize as usize) * 16)
         }
         return ok()
