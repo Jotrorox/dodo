@@ -9,12 +9,13 @@
   layout; and backends apply only the slots that changed. On Metal,
   commands no longer retain and release every object they use, and
   pipelines built from an already compiled source reuse its library.
-  Measured on an M5: a draw that changes nothing went from 66 to 31 ns,
-  a dispatch from 165 to 130 ns, and a pipeline from cached source from
-  60 to 8 µs.
+  Measured on an M5: a draw that changes nothing takes about half as long
+  (55 to 66 ns before, 25 to 31 ns now), and a pipeline from an already
+  compiled source 6 to 8 µs instead of 50 to 60 µs.
 - `write_buffer` writes a buffer the CPU can map directly when no submitted
   work uses it and no earlier write to it is still staged, as `std/gpu` now
-  tracks which submissions use each buffer (on Metal, 260 ns became 6 ns).
+  tracks which submissions use each buffer (on Metal, 200 to 260 ns became
+  6 ns).
   `read_buffer` waits only for the submissions that use the buffer. Staged
   writes run in the same submission as the next `submit()`.
 - New `Device.start_read_buffer` and `start_read_texture` read results back
