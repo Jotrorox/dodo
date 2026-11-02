@@ -1,5 +1,7 @@
 package opengl
 
+import "core/ascii"
+import "core/bytes"
 import "core/mem"
 import "core/ptr"
 import "std/gpu/hal"
@@ -22,10 +24,26 @@ import "std/window/handle"
 // and before transfers, any shader writes since the last full barrier get
 // glMemoryBarrier(GL_ALL_BARRIER_BITS).
 //
+// OpenGL state is global to the context, but std/gpu may record passes of
+// several encoders in turn, so each pass gets a serial number and the
+// device remembers whose state OpenGL holds (State.owner). A draw or
+// dispatch of another pass first sets its own framebuffer, viewport,
+// scissor and blend constant again and marks its pipeline, bindings and
+// vertex and index buffers dirty. A Shadow of what the backend last set
+// skips calls that would change nothing, so that re-establishing state,
+// switching pipelines and starting passes cost only the calls that do.
+// Framebuffer objects are kept per set of attachments, in a small cache
+// that forgets the ones whose textures are destroyed.
+//
+// Every entry point that calls OpenGL first makes the device's context
+// current if another one is (two devices on one thread).
+//
 // A device opened for a window draws with the window's context. Its
 // surface renders into a texture, which present() copies into the
 // window's framebuffer, upside down to undo OpenGL's bottom-up window
-// coordinates, before swapping buffers.
+// coordinates, before swapping buffers. A fence after each swap lets
+// acquire() wait until no more than SurfaceConfig.frames frames are in
+// flight.
 //
 // Multisampled attachments resolve with glBlitNamedFramebuffer when their
 // pass ends; attachments a pass does not store are invalidated then.
@@ -34,16 +52,32 @@ import "std/window/handle"
 //   buffer            a = buffer name
 //   texture           a = texture name
 //   sampler           a = sampler name
-//   compute pipeline  a = program
+//   compute pipeline  a = program, d = 1 when it writes storage
 //   render pipeline   a = program, b = vertex array, c = its Settings,
-//                     allocated with malloc
-//   encoder           a = framebuffer of the open render pass or 0, b = a
-//                     malloc'd copy of the pass's RenderPassInfo
+//                     allocated with malloc, d = 1 when it writes storage
+//   encoder           a = serial number of the open pass or 0, b = the
+//                     encoder's Pass record or 0, c = 1 while a render
+//                     pass is open
 //   surface           a = texture, b = framebuffer reading it, c = width,
 //                     d = height
 
 unsafe extern "C" fn malloc(size: usize) -> *mut u8
 unsafe extern "C" fn free(block: *mut u8)
+
+// Color attachments a pass or pipeline may have: hal.MAX_COLOR_ATTACHMENTS.
+const COLOR_SLOTS: usize = hal.MAX_COLOR_ATTACHMENTS as usize
+// Binding slots: hal.MAX_SLOTS.
+const SLOTS: usize = hal.MAX_SLOTS as usize
+// A state value the Shadow does not know, so that the next call setting it
+// reaches OpenGL. No object name or enum takes this value.
+const UNKNOWN: u32 = 0xffffffff
+// Framebuffer objects kept for reuse.
+const FRAMEBUFFERS: usize = 16
+// Presented frames whose fences acquire() may wait for: the most frames
+// in flight std/gpu asks for, plus one.
+const FENCES: usize = 4
+// How long one glClientWaitSync waits, in nanoseconds, before asking again.
+const FENCE_TIMEOUT: u64 = 1000000000
 
 // What a render pipeline sets beyond its program and vertex array.
 struct Settings {
@@ -61,27 +95,802 @@ struct Settings {
     // Per color attachment: blending on, its factors and operations as
     // OpenGL enums, and the channels written.
     count: u32
-    blending: [8]bool
-    color_source: [8]u32
-    color_destination: [8]u32
-    color_operation: [8]u32
-    alpha_source: [8]u32
-    alpha_destination: [8]u32
-    alpha_operation: [8]u32
-    masks: [8]u32
+    blending: [COLOR_SLOTS]bool
+    color_source: [COLOR_SLOTS]u32
+    color_destination: [COLOR_SLOTS]u32
+    color_operation: [COLOR_SLOTS]u32
+    alpha_source: [COLOR_SLOTS]u32
+    alpha_destination: [COLOR_SLOTS]u32
+    alpha_operation: [COLOR_SLOTS]u32
+    masks: [COLOR_SLOTS]u32
+}
+
+// The OpenGL state the backend last set, so that calls repeating it can be
+// skipped. A value of UNKNOWN is not known: the next call goes to OpenGL.
+// Code that changes this state behind the shadow updates it (present's
+// framebuffer binding), and deleting an object forgets it (OpenGL unbinds
+// deleted objects, and their names come back for new ones).
+struct Shadow {
+    program: u32
+    vertex_array: u32
+    // The draw framebuffer.
+    framebuffer: u32
+    // Capabilities: 0 disabled, 1 enabled.
+    cull: u32
+    cull_face: u32
+    front: u32
+    depth_test: u32
+    depth_func: u32
+    depth_mask: u32
+    offset_fill: u32
+    // glPolygonOffset(Clamp)'s slope, bias and clamp, as bit patterns.
+    offset: [3]u32
+    alpha_to_coverage: u32
+    // Per color attachment: blending, then the source and destination
+    // color and alpha factors (4 per attachment), the color and alpha
+    // operations (2 per attachment) and the write mask.
+    blending: [COLOR_SLOTS]u32
+    factors: [32]u32
+    operations: [16]u32
+    masks: [COLOR_SLOTS]u32
+    // Bit patterns of viewport 0 and its depth range, the scissor box and
+    // the blend constant.
+    viewport: [4]u32
+    depth_range: [2]u32
+    scissor: [4]u32
+    blend_color: [4]u32
+    // Per binding slot: the uniform and storage buffer bound with their
+    // ranges, the texture and sampler of its texture unit, and the texture
+    // and format of its image unit.
+    uniform: [SLOTS]u32
+    uniform_offset: [SLOTS]u64
+    uniform_size: [SLOTS]u64
+    storage: [SLOTS]u32
+    storage_offset: [SLOTS]u64
+    storage_size: [SLOTS]u64
+    textures: [SLOTS]u32
+    samplers: [SLOTS]u32
+    images: [SLOTS]u32
+    image_formats: [SLOTS]u32
+
+    fn unknown() -> Shadow {
+        return Shadow {
+            program: UNKNOWN,
+            vertex_array: UNKNOWN,
+            framebuffer: UNKNOWN,
+            cull: UNKNOWN,
+            cull_face: UNKNOWN,
+            front: UNKNOWN,
+            depth_test: UNKNOWN,
+            depth_func: UNKNOWN,
+            depth_mask: UNKNOWN,
+            offset_fill: UNKNOWN,
+            offset: [UNKNOWN; 3],
+            alpha_to_coverage: UNKNOWN,
+            blending: [UNKNOWN; COLOR_SLOTS],
+            factors: [UNKNOWN; 32],
+            operations: [UNKNOWN; 16],
+            masks: [UNKNOWN; COLOR_SLOTS],
+            viewport: [UNKNOWN; 4],
+            depth_range: [UNKNOWN; 2],
+            scissor: [UNKNOWN; 4],
+            blend_color: [UNKNOWN; 4],
+            uniform: [UNKNOWN; SLOTS],
+            uniform_offset: [0u64; SLOTS],
+            uniform_size: [0u64; SLOTS],
+            storage: [UNKNOWN; SLOTS],
+            storage_offset: [0u64; SLOTS],
+            storage_size: [0u64; SLOTS],
+            textures: [UNKNOWN; SLOTS],
+            samplers: [UNKNOWN; SLOTS],
+            images: [UNKNOWN; SLOTS],
+            image_formats: [UNKNOWN; SLOTS]
+        }
+    }
+
+    fn use_program(&mut self, program: u32) {
+        if self.program != program {
+            unsafe {
+                gl.use_program(program)
+            }
+            self.program = program
+        }
+    }
+
+    fn bind_vertex_array(&mut self, array: u32) {
+        if self.vertex_array != array {
+            unsafe {
+                gl.bind_vertex_array(array)
+            }
+            self.vertex_array = array
+        }
+    }
+
+    fn bind_framebuffer(&mut self, framebuffer: u32) {
+        if self.framebuffer != framebuffer {
+            unsafe {
+                gl.bind_framebuffer(gl.DRAW_FRAMEBUFFER, framebuffer)
+            }
+            self.framebuffer = framebuffer
+        }
+    }
+
+    fn viewport(&mut self, values: &[4]f32) {
+        if changed4(&mut self.viewport, values) {
+            unsafe {
+                gl.viewport_indexedf(0, values[0], values[1], values[2], values[3])
+            }
+        }
+    }
+
+    fn depth_range(&mut self, near: f32, far: f32) {
+        a := hal.f32_bits(near)
+        b := hal.f32_bits(far)
+        if self.depth_range[0] != a || self.depth_range[1] != b {
+            unsafe {
+                gl.depth_rangef(near, far)
+            }
+            self.depth_range[0] = a
+            self.depth_range[1] = b
+        }
+    }
+
+    fn scissor(&mut self, values: &[4]i32) {
+        same := true
+        for i in 0usize..4 {
+            bits := hal.i32_bits(values[i])
+            if self.scissor[i] != bits {
+                self.scissor[i] = bits
+                same = false
+            }
+        }
+        if !same {
+            unsafe {
+                gl.scissor(values[0], values[1], values[2], values[3])
+            }
+        }
+    }
+
+    fn blend_color(&mut self, values: &[4]f32) {
+        if changed4(&mut self.blend_color, values) {
+            unsafe {
+                gl.blend_color(values[0], values[1], values[2], values[3])
+            }
+        }
+    }
+
+    fn color_mask(&mut self, index: usize, mask: u32) {
+        if self.masks[index] != mask {
+            unsafe {
+                gl.color_maski(index as u32, (mask & 1) as u8, (mask >> 1 & 1) as u8, (mask >> 2 & 1) as u8, (mask >> 3 & 1) as u8)
+            }
+            self.masks[index] = mask
+        }
+    }
+
+    fn depth_mask(&mut self, write: bool) {
+        value := flag(write)
+        if self.depth_mask != value {
+            unsafe {
+                gl.depth_mask(value as u8)
+            }
+            self.depth_mask = value
+        }
+    }
+
+    // Everything a render pipeline's Settings say.
+    fn settings(&mut self, settings: &Settings) {
+        cull := settings.cull
+        toggle(gl.CULL_FACE, &mut self.cull, cull != hal.CULL_NONE)
+        if cull != hal.CULL_NONE {
+            face := if cull == hal.CULL_FRONT {
+                gl.FRONT
+            } else {
+                gl.BACK
+            }
+            if self.cull_face != face {
+                unsafe {
+                    gl.cull_face(face)
+                }
+                self.cull_face = face
+            }
+        }
+        front := if settings.front == hal.FRONT_CW {
+            gl.CW
+        } else {
+            gl.CCW
+        }
+        if self.front != front {
+            unsafe {
+                gl.front_face(front)
+            }
+            self.front = front
+        }
+        for i in 0usize..settings.count as usize {
+            self.blend(i, settings)
+            self.color_mask(i, settings.masks[i])
+        }
+        toggle(gl.DEPTH_TEST, &mut self.depth_test, settings.depth_test)
+        if settings.depth_test {
+            function := compare_function(settings.depth_compare)
+            if self.depth_func != function {
+                unsafe {
+                    gl.depth_func(function)
+                }
+                self.depth_func = function
+            }
+            self.depth_mask(settings.depth_write)
+        }
+        toggle(gl.POLYGON_OFFSET_FILL, &mut self.offset_fill, settings.biased)
+        if settings.biased {
+            slope := hal.f32_bits(settings.slope)
+            bias := hal.f32_bits(settings.bias)
+            clamp := hal.f32_bits(settings.clamp)
+            if self.offset[0] != slope || self.offset[1] != bias || self.offset[2] != clamp {
+                unsafe {
+                    if settings.clamp != 0.0 {
+                        gl.polygon_offset_clamp(settings.slope, settings.bias, settings.clamp)
+                    } else {
+                        gl.polygon_offset(settings.slope, settings.bias)
+                    }
+                }
+                self.offset[0] = slope
+                self.offset[1] = bias
+                self.offset[2] = clamp
+            }
+        }
+        toggle(gl.SAMPLE_ALPHA_TO_COVERAGE, &mut self.alpha_to_coverage, settings.alpha_to_coverage)
+    }
+
+    // Color attachment `index`'s blending.
+    fn blend(&mut self, index: usize, settings: &Settings) {
+        attachment := index as u32
+        on := flag(settings.blending[index])
+        if self.blending[index] != on {
+            unsafe {
+                if on != 0 {
+                    gl.enablei(gl.BLEND, attachment)
+                } else {
+                    gl.disablei(gl.BLEND, attachment)
+                }
+            }
+            self.blending[index] = on
+        }
+        if on == 0 {
+            return
+        }
+        base := index * 4
+        if self.factors[base] != settings.color_source[index] || self.factors[base + 1] != settings.color_destination[index] || self.factors[base + 2] != settings.alpha_source[index] || self.factors[base + 3] != settings.alpha_destination[index] {
+            unsafe {
+                gl.blend_func_separatei(attachment, settings.color_source[index], settings.color_destination[index], settings.alpha_source[index], settings.alpha_destination[index])
+            }
+            self.factors[base] = settings.color_source[index]
+            self.factors[base + 1] = settings.color_destination[index]
+            self.factors[base + 2] = settings.alpha_source[index]
+            self.factors[base + 3] = settings.alpha_destination[index]
+        }
+        pair := index * 2
+        if self.operations[pair] != settings.color_operation[index] || self.operations[pair + 1] != settings.alpha_operation[index] {
+            unsafe {
+                gl.blend_equation_separatei(attachment, settings.color_operation[index], settings.alpha_operation[index])
+            }
+            self.operations[pair] = settings.color_operation[index]
+            self.operations[pair + 1] = settings.alpha_operation[index]
+        }
+    }
+
+    // Bind what `state` holds in `slot` the way the pipeline's layout says.
+    fn bind(&mut self, state: &hal.PassState, slot: usize) {
+        kind := state.pipeline.kinds[slot]
+        index := slot as u32
+        name := state.object_a[slot] as u32
+        offset := state.offset[slot]
+        size := state.size[slot]
+        if kind == hal.BINDING_UNIFORM_BUFFER {
+            if self.uniform[slot] != name || self.uniform_offset[slot] != offset || self.uniform_size[slot] != size {
+                unsafe {
+                    gl.bind_buffer_range(gl.UNIFORM_BUFFER, index, name, offset as isize, size as isize)
+                }
+                self.uniform[slot] = name
+                self.uniform_offset[slot] = offset
+                self.uniform_size[slot] = size
+            }
+        } else if kind == hal.BINDING_STORAGE_BUFFER || kind == hal.BINDING_READ_ONLY_STORAGE_BUFFER {
+            if self.storage[slot] != name || self.storage_offset[slot] != offset || self.storage_size[slot] != size {
+                unsafe {
+                    gl.bind_buffer_range(gl.SHADER_STORAGE_BUFFER, index, name, offset as isize, size as isize)
+                }
+                self.storage[slot] = name
+                self.storage_offset[slot] = offset
+                self.storage_size[slot] = size
+            }
+        } else if kind == hal.BINDING_SAMPLED_TEXTURE || kind == hal.BINDING_COMPARISON_TEXTURE {
+            if self.textures[slot] != name {
+                unsafe {
+                    gl.bind_texture_unit(index, name)
+                }
+                self.textures[slot] = name
+            }
+            sampler := state.sampler[slot] as u32
+            if self.samplers[slot] != sampler {
+                unsafe {
+                    gl.bind_sampler(index, sampler)
+                }
+                self.samplers[slot] = sampler
+            }
+        } else if kind == hal.BINDING_STORAGE_TEXTURE {
+            format := state.object_b[slot] as u32
+            if self.images[slot] != name || self.image_formats[slot] != format {
+                unsafe {
+                    gl.bind_image_texture(index, name, 0, 0, 0, gl.READ_WRITE, format)
+                }
+                self.images[slot] = name
+                self.image_formats[slot] = format
+            }
+        }
+    }
+
+    // OpenGL unbinds a deleted object everywhere it was bound in the
+    // context; the shadow follows.
+    fn forget_buffer(&mut self, name: u32) {
+        for i in 0usize..SLOTS {
+            if self.uniform[i] == name {
+                self.uniform[i] = UNKNOWN
+            }
+            if self.storage[i] == name {
+                self.storage[i] = UNKNOWN
+            }
+        }
+    }
+
+    fn forget_texture(&mut self, name: u32) {
+        for i in 0usize..SLOTS {
+            if self.textures[i] == name {
+                self.textures[i] = UNKNOWN
+            }
+            if self.images[i] == name {
+                self.images[i] = UNKNOWN
+            }
+        }
+    }
+
+    fn forget_sampler(&mut self, name: u32) {
+        for i in 0usize..SLOTS {
+            if self.samplers[i] == name {
+                self.samplers[i] = UNKNOWN
+            }
+        }
+    }
+
+    fn forget_program(&mut self, name: u32) {
+        if self.program == name {
+            self.program = UNKNOWN
+        }
+    }
+
+    fn forget_vertex_array(&mut self, name: u32) {
+        if self.vertex_array == name {
+            self.vertex_array = UNKNOWN
+        }
+    }
+
+    fn forget_framebuffer(&mut self, name: u32) {
+        if self.framebuffer == name {
+            self.framebuffer = UNKNOWN
+        }
+    }
+}
+
+// Store the bit patterns of `values` in `known` and return whether they
+// differed.
+fn changed4(known: &mut [4]u32, values: &[4]f32) -> bool {
+    same := true
+    for i in 0usize..4 {
+        bits := hal.f32_bits(values[i])
+        if known[i] != bits {
+            known[i] = bits
+            same = false
+        }
+    }
+    return !same
+}
+
+fn flag(on: bool) -> u32 {
+    if on {
+        return 1
+    }
+    return 0
+}
+
+// Enable or disable `capability` unless `known` says it already is.
+fn toggle(capability: u32, known: &mut u32, on: bool) {
+    value := flag(on)
+    if *known == value {
+        return
+    }
+    unsafe {
+        if on {
+            gl.enable(capability)
+        } else {
+            gl.disable(capability)
+        }
+    }
+    *known = value
+}
+
+// What a render pass needs once it has begun: to end it, and to set its
+// state again after another pass ran in between. Each encoder keeps one,
+// reused for all its passes; destroying the encoder hands it back to the
+// device for the next encoder.
+struct Pass {
+    framebuffer: u32
+    // The framebuffer's slot in the device's cache, or FRAMEBUFFERS when
+    // the pass made it alone and deletes it at the end.
+    slot: usize
+    width: u32
+    height: u32
+    color_count: u32
+    // Per color attachment: the texture its samples resolve into, or 0.
+    resolve: [COLOR_SLOTS]u32
+    // Bit N: color attachment N is stored; bit COLOR_SLOTS: depth is.
+    stored: u32
+    has_depth: bool
+    viewport: [4]f32
+    near: f32
+    far: f32
+    scissor: [4]i32
+    blend_color: [4]f32
+    // The next record on the device's free list.
+    next: usize
+
+    fn empty() -> Pass {
+        return Pass {
+            framebuffer: 0,
+            slot: FRAMEBUFFERS,
+            width: 0,
+            height: 0,
+            color_count: 0,
+            resolve: [0u32; COLOR_SLOTS],
+            stored: 0,
+            has_depth: false,
+            viewport: [0.0f32; 4],
+            near: 0.0,
+            far: 1.0,
+            scissor: [0i32; 4],
+            blend_color: [0.0f32; 4],
+            next: 0
+        }
+    }
+}
+
+// A framebuffer from the cache, or one made for a single use when every
+// cached one is in use (slot FRAMEBUFFERS).
+struct Found {
+    name: u32
+    slot: usize
 }
 
 struct State {
     submitted: u64
     // Shader writes to storage buffers or images happened since the last
     // glMemoryBarrier(GL_ALL_BARRIER_BITS).
-    dirty: bool
+    unsettled: bool
+    // The last pass serial number handed out, and the pass whose state
+    // OpenGL holds, or 0 when none does.
+    serial: u64
+    owner: u64
+    shadow: Shadow
+    // The framebuffer cache: per slot, the framebuffer (0 when the slot is
+    // free), its color attachments' textures (COLOR_SLOTS per slot), their
+    // count, the depth attachment's texture or 0, when it was last used,
+    // and how many open passes use it (such slots are never evicted).
+    names: [FRAMEBUFFERS]u32
+    colors: [128]u32
+    counts: [FRAMEBUFFERS]u32
+    depths: [FRAMEBUFFERS]u32
+    used: [FRAMEBUFFERS]u64
+    pins: [FRAMEBUFFERS]u32
+    clock: u64
+    // Pass records no encoder holds, linked through Pass.next.
+    free: usize
+    // Fences after presented frames, oldest first, and how many frames
+    // may be in flight.
+    fences: [FENCES]usize
+    fence_count: usize
+    frames: usize
+
+    fn new() -> State {
+        return State {
+            submitted: 0,
+            unsettled: false,
+            serial: 0,
+            owner: 0,
+            shadow: Shadow.unknown(),
+            names: [0u32; FRAMEBUFFERS],
+            colors: [0u32; 128],
+            counts: [0u32; FRAMEBUFFERS],
+            depths: [0u32; FRAMEBUFFERS],
+            used: [0u64; FRAMEBUFFERS],
+            pins: [0u32; FRAMEBUFFERS],
+            clock: 0,
+            free: 0,
+            fences: [0usize; FENCES],
+            fence_count: 0,
+            frames: 0
+        }
+    }
+
+    // Shader writes since the last full barrier become visible to
+    // everything.
+    fn settle(&mut self) {
+        if self.unsettled {
+            unsafe {
+                gl.memory_barrier(gl.ALL_BARRIER_BITS)
+            }
+            self.unsettled = false
+        }
+    }
+
+    // Make OpenGL hold the state of the pass recording into `encoder`
+    // before one of its draws or dispatches. When another pass's state is
+    // there instead, set this one's framebuffer, viewport, scissor and
+    // blend constant again and mark the rest of its state dirty; the
+    // shadow skips whatever happens to be set already.
+    fn claim(&mut self, encoder: &hal.Handle, state: &mut hal.PassState) {
+        if self.owner == encoder.a {
+            return
+        }
+        self.owner = encoder.a
+        state.pipeline_dirty = true
+        state.dirty = state.dirty | state.bound_slots
+        state.vertex_dirty = state.vertex_dirty | state.vertex_set
+        if state.index_set {
+            state.index_dirty = true
+        }
+        if encoder.c != 0 {
+            token := 0u8
+            pass := unsafe {
+                ptr.borrow(encoder.b as usize as *const Pass, &token)
+            }
+            self.restore(pass)
+        }
+    }
+
+    // A render pass's own state.
+    fn restore(&mut self, pass: &Pass) {
+        self.shadow.bind_framebuffer(pass.framebuffer)
+        self.shadow.viewport(&pass.viewport)
+        self.shadow.depth_range(pass.near, pass.far)
+        self.shadow.scissor(&pass.scissor)
+        self.shadow.blend_color(&pass.blend_color)
+    }
+
+    // Apply what changed in a render pass's state, as the PassState
+    // contract in std/gpu/hal says. The vertex array belongs to the
+    // pipeline, so a pipeline change rebinds every vertex buffer and the
+    // index buffer into the new one.
+    fn apply(&mut self, state: &mut hal.PassState) {
+        array := state.pipeline.handle.b as u32
+        if state.pipeline_dirty {
+            handle := &state.pipeline.handle
+            token := 0u8
+            settings := unsafe {
+                ptr.borrow(handle.c as usize as *const Settings, &token)
+            }
+            self.shadow.use_program(handle.a as u32)
+            self.shadow.bind_vertex_array(array)
+            self.shadow.settings(settings)
+            state.vertex_dirty = state.vertex_dirty | state.vertex_set
+            if state.index_set {
+                state.index_dirty = true
+            }
+            state.pipeline_dirty = false
+        }
+        self.bind(state)
+        used := (1u32 << state.pipeline.vertex_buffer_count) - 1
+        remaining := state.vertex_dirty & used
+        for remaining != 0 {
+            slot := hal.lowest_bit(remaining)
+            remaining = remaining & (remaining - 1)
+            index := slot as usize
+            unsafe {
+                gl.vertex_array_vertex_buffer(array, slot, state.vertex_a[index] as u32, state.vertex_offset[index] as isize, state.pipeline.strides[index] as i32)
+            }
+        }
+        state.vertex_dirty = state.vertex_dirty & ~used
+    }
+
+    // Bind the dirty slots the pipeline uses; the others stay dirty.
+    fn bind(&mut self, state: &mut hal.PassState) {
+        used := state.pipeline.slots
+        remaining := state.dirty & used
+        for remaining != 0 {
+            slot := hal.lowest_bit(remaining)
+            remaining = remaining & (remaining - 1)
+            self.shadow.bind(state, slot as usize)
+        }
+        state.dirty = state.dirty & ~used
+    }
+
+    // A draw or dispatch ran: note whether it may have written storage.
+    fn wrote(&mut self, state: &hal.PassState) {
+        if state.pipeline.handle.d != 0 {
+            self.unsettled = true
+        }
+    }
+
+    // The framebuffer with these attachments, from the cache or made and
+    // cached, evicting the one used longest ago that no open pass uses.
+    fn framebuffer(&mut self, colors: &[COLOR_SLOTS]u32, count: usize, depth: u32) -> Found {
+        self.clock += 1
+        victim := FRAMEBUFFERS
+        for slot in 0usize..FRAMEBUFFERS {
+            name := self.names[slot]
+            if name == 0 {
+                if victim == FRAMEBUFFERS || self.names[victim] != 0 {
+                    victim = slot
+                }
+                continue
+            }
+            if self.counts[slot] as usize == count && self.depths[slot] == depth {
+                same := true
+                for i in 0usize..count {
+                    if self.colors[slot * COLOR_SLOTS + i] != colors[i] {
+                        same = false
+                        break
+                    }
+                }
+                if same {
+                    self.used[slot] = self.clock
+                    return Found { name: name, slot: slot }
+                }
+            }
+            if self.pins[slot] == 0 && (victim == FRAMEBUFFERS || (self.names[victim] != 0 && self.used[slot] < self.used[victim])) {
+                victim = slot
+            }
+        }
+        name := make_framebuffer(colors, count, depth)
+        if victim == FRAMEBUFFERS {
+            return Found { name: name, slot: FRAMEBUFFERS }
+        }
+        self.evict(victim)
+        self.names[victim] = name
+        for i in 0usize..COLOR_SLOTS {
+            self.colors[victim * COLOR_SLOTS + i] = colors[i]
+        }
+        self.counts[victim] = count as u32
+        self.depths[victim] = depth
+        self.used[victim] = self.clock
+        self.pins[victim] = 0
+        return Found { name: name, slot: victim }
+    }
+
+    // Delete a cached framebuffer and free its slot.
+    fn evict(&mut self, slot: usize) {
+        name := self.names[slot]
+        if name == 0 {
+            return
+        }
+        self.drop_framebuffer(name)
+        self.names[slot] = 0
+        self.pins[slot] = 0
+    }
+
+    fn drop_framebuffer(&mut self, name: u32) {
+        unsafe {
+            gl.delete_framebuffers(1, ptr.from_ref(&name))
+        }
+        self.shadow.forget_framebuffer(name)
+    }
+
+    // A texture is about to be deleted: so are the framebuffers it is
+    // attached to, and the shadow forgets it.
+    fn forget_texture(&mut self, name: u32) {
+        if name == 0 {
+            return
+        }
+        for slot in 0usize..FRAMEBUFFERS {
+            if self.names[slot] == 0 {
+                continue
+            }
+            attached := self.depths[slot] == name
+            for i in 0usize..self.counts[slot] as usize {
+                if self.colors[slot * COLOR_SLOTS + i] == name {
+                    attached = true
+                }
+            }
+            if attached {
+                self.evict(slot)
+            }
+        }
+        self.shadow.forget_texture(name)
+    }
+
+    // A pass record for an encoder, from the free list or newly allocated;
+    // null when out of memory.
+    fn take_pass(&mut self) -> *mut Pass {
+        unsafe {
+            if self.free != 0 {
+                record := self.free as *mut Pass
+                self.free = (*record).next
+                return record
+            }
+            record := malloc(mem.size_of::<Pass>()) as *mut Pass
+            if !ptr.is_null(record) {
+                ptr.write(record, Pass.empty())
+            }
+            return record
+        }
+    }
+
+    fn give_pass(&mut self, record: *mut Pass) {
+        unsafe {
+            (*record).next = self.free
+            self.free = record as usize
+        }
+    }
+
+    // Wait until at most `limit` presented frames are unfinished.
+    fn wait_frames(&mut self, limit: usize) {
+        for self.fence_count > limit {
+            sync := unsafe {
+                self.fences[0] as *mut u8
+            }
+            for {
+                result := unsafe {
+                    gl.client_wait_sync(sync, gl.SYNC_FLUSH_COMMANDS_BIT, FENCE_TIMEOUT)
+                }
+                if result != gl.TIMEOUT_EXPIRED {
+                    break
+                }
+            }
+            unsafe {
+                gl.delete_sync(sync)
+            }
+            for i in 1usize..self.fence_count {
+                self.fences[i - 1] = self.fences[i]
+            }
+            self.fence_count -= 1
+        }
+    }
+
+    // Forget presented frames without waiting for them.
+    fn drop_fences(&mut self) {
+        for i in 0usize..self.fence_count {
+            unsafe {
+                gl.delete_sync(self.fences[i] as *mut u8)
+            }
+        }
+        self.fence_count = 0
+    }
+}
+
+// A framebuffer with these attachments, drawing to every color attachment.
+fn make_framebuffer(colors: &[COLOR_SLOTS]u32, count: usize, depth: u32) -> u32 {
+    framebuffer := 0u32
+    buffers := [gl.NONE; COLOR_SLOTS]
+    unsafe {
+        gl.create_framebuffers(1, ptr.from_mut(&mut framebuffer))
+        for i in 0usize..count {
+            gl.named_framebuffer_texture(framebuffer, gl.COLOR_ATTACHMENT0 + i as u32, colors[i], 0)
+            buffers[i] = gl.COLOR_ATTACHMENT0 + i as u32
+        }
+        if depth != 0 {
+            gl.named_framebuffer_texture(framebuffer, gl.DEPTH_ATTACHMENT, depth, 0)
+        }
+        if count == 0 {
+            gl.named_framebuffer_draw_buffer(framebuffer, gl.NONE)
+        } else {
+            gl.named_framebuffer_draw_buffers(framebuffer, count as i32, ptr.as_ptr(&buffers))
+        }
+    }
+    return framebuffer
 }
 
 pub struct Device: hal.Backend {
     context: context.Context
     limits: hal.Limits
-    state: State
+    state: hal.Mutable<State>
     // The window the context draws into: its kind (WINDOW_*) and id.
     window_kind: u32
     window: u64
@@ -103,6 +912,9 @@ pub struct Device: hal.Backend {
     }
 
     pub fn name(&self, out: &mut[u8]) -> usize {
+        if !self.ready() {
+            return 0
+        }
         name := mem.str_bytes(self.context.renderer())
         length := name.len
         if length > out.len {
@@ -166,14 +978,9 @@ pub struct Device: hal.Backend {
         self.current()?
         name := 0u32
         format := pixel_format(descriptor.format)
+        // Swallow earlier errors so the check below sees this call's.
+        clear_errors()
         unsafe {
-            // Swallow earlier errors so the check below sees this call's. A
-            // lost context reports its error again and again, so stop.
-            for _ in 0..16 {
-                if gl.get_error() == gl.NO_ERROR {
-                    break
-                }
-            }
             if descriptor.samples > 1 {
                 gl.create_textures(gl.TEXTURE_2D_MULTISAMPLE, 1, ptr.from_mut(&mut name))
                 gl.texture_storage_2d_multisample(name, descriptor.samples as i32, format.internal, descriptor.width as i32, descriptor.height as i32, 1)
@@ -259,7 +1066,7 @@ pub struct Device: hal.Backend {
         self.current()?
         shader := compile(gl.COMPUTE_SHADER, descriptor.source.glsl, b"#define COMPUTE 1\n", descriptor.entry)?
         program := link(shader, 0)?
-        return ok(hal.Handle { a: program as u64, b: 0, c: 0, d: 0 })
+        return ok(hal.Handle { a: program as u64, b: 0, c: 0, d: writes_storage(descriptor.bindings) })
     }
 
     pub fn create_render_pipeline(&self, descriptor: &hal.RenderPipelineDescriptor) -> hal.Handle!hal.Error {
@@ -285,16 +1092,14 @@ pub struct Device: hal.Backend {
         settings := unsafe {
             malloc(mem.size_of::<Settings>()) as *mut Settings
         }
-        if unsafe {
-            settings as usize
-        } == 0 {
+        if ptr.is_null(settings) {
             unsafe {
                 gl.delete_program(program)
             }
             return err(hal.Error.OutOfMemory)
         }
         unsafe {
-            *settings = settings_of(descriptor)
+            ptr.write(settings, settings_of(descriptor))
         }
         array := 0u32
         unsafe {
@@ -326,54 +1131,61 @@ pub struct Device: hal.Backend {
         address := unsafe {
             settings as usize as u64
         }
-        return ok(hal.Handle { a: program as u64, b: array as u64, c: address, d: 0 })
+        return ok(hal.Handle { a: program as u64, b: array as u64, c: address, d: writes_storage(descriptor.bindings) })
     }
 
     pub fn destroy(&self, object: u32, handle: &hal.Handle) {
-        match self.current() {
-            ok() => {}
-            err(_) => {
-                // The context is gone; so are its objects.
-                return
-            }
+        if object == hal.OBJECT_ENCODER {
+            self.destroy_encoder(handle)
+            return
         }
-        if object == hal.OBJECT_BUFFER {
-            delete_buffer(handle.a as u32)
-        } else if object == hal.OBJECT_TEXTURE {
-            delete_texture(handle.a as u32)
-        } else if object == hal.OBJECT_SAMPLER {
-            name := handle.a as u32
-            unsafe {
-                gl.delete_samplers(1, ptr.from_ref(&name))
-            }
-        } else if object == hal.OBJECT_COMPUTE_PIPELINE {
-            unsafe {
-                gl.delete_program(handle.a as u32)
-            }
-        } else if object == hal.OBJECT_RENDER_PIPELINE {
-            array := handle.b as u32
-            unsafe {
-                gl.delete_program(handle.a as u32)
-                gl.delete_vertex_arrays(1, ptr.from_ref(&array))
-                free(handle.c as usize as *mut u8)
-            }
-        } else if object == hal.OBJECT_ENCODER {
-            // An abandoned encoder may still have a render pass open.
-            if handle.a != 0 {
-                close_framebuffer(handle.a as u32)
+        if !self.ready() {
+            // The context is gone; so are its objects. Settings are ours.
+            if object == hal.OBJECT_RENDER_PIPELINE {
                 unsafe {
-                    free(handle.b as usize as *mut u8)
+                    free(handle.c as usize as *mut u8)
                 }
             }
+            return
         }
+        name := handle.a as u32
+        // Deleting objects unbinds them, so the next draw of an open pass
+        // establishes its state again.
+        self.state.update(fn(state: &mut State) {
+            state.owner = 0
+            if object == hal.OBJECT_BUFFER {
+                state.shadow.forget_buffer(name)
+                delete_buffer(name)
+            } else if object == hal.OBJECT_TEXTURE {
+                state.forget_texture(name)
+                delete_texture(name)
+            } else if object == hal.OBJECT_SAMPLER {
+                state.shadow.forget_sampler(name)
+                unsafe {
+                    gl.delete_samplers(1, ptr.from_ref(&name))
+                }
+            } else if object == hal.OBJECT_COMPUTE_PIPELINE {
+                state.shadow.forget_program(name)
+                unsafe {
+                    gl.delete_program(name)
+                }
+            } else if object == hal.OBJECT_RENDER_PIPELINE {
+                array := handle.b as u32
+                state.shadow.forget_program(name)
+                state.shadow.forget_vertex_array(array)
+                unsafe {
+                    gl.delete_program(name)
+                    gl.delete_vertex_arrays(1, ptr.from_ref(&array))
+                    free(handle.c as usize as *mut u8)
+                }
+            }
+        })
     }
 
     pub fn completed(&self) -> u64 {
         // OpenGL keeps objects alive while queued commands use them, so
         // every submission counts as finished for destroying objects.
-        return unsafe {
-            (*self.state()).submitted
-        }
+        return self.state.read().submitted
     }
 
     pub fn wait(&self, index: u64) -> void!hal.Error {
@@ -393,169 +1205,283 @@ pub struct Device: hal.Backend {
 
     // Never given uploads: std/gpu stages nothing on OpenGL.
     pub fn submit(&self, uploads: &mut hal.Handle, encoder: &mut hal.Handle) -> u64!hal.Error {
+        self.current()?
         unsafe {
             gl.flush()
-            state := self.state()
-            (*state).submitted += 1
-            return ok((*state).submitted)
         }
+        return ok(self.state.update(fn(state: &mut State) -> u64 {
+            state.submitted += 1
+            return state.submitted
+        }))
     }
 
-    pub fn begin_compute_pass(&self, encoder: &mut hal.Handle) {}
+    pub fn begin_compute_pass(&self, encoder: &mut hal.Handle) {
+        encoder.a = self.state.update(fn(state: &mut State) -> u64 {
+            state.serial += 1
+            return state.serial
+        })
+        encoder.c = 0
+    }
 
-    pub fn end_compute_pass(&self, encoder: &mut hal.Handle) {}
+    pub fn end_compute_pass(&self, encoder: &mut hal.Handle) {
+        encoder.a = 0
+    }
 
+    // Bind the pass's framebuffer, cached per set of attachments, set the
+    // pass's initial viewport, scissor and blend constant, and clear the
+    // attachments that load by clearing.
     pub fn begin_render_pass(&self, encoder: &mut hal.Handle, pass: &hal.RenderPassInfo) {
-        saved := unsafe {
-            malloc(mem.size_of::<hal.RenderPassInfo>()) as *mut hal.RenderPassInfo
+        token := 0u8
+        record_token := 0u8
+        state := self.mutable(&mut token)
+        state.serial += 1
+        encoder.a = state.serial
+        if !self.ready() {
+            // A lost context: draws find it lost too and do nothing.
+            return
         }
-        assert(unsafe {
-            saved as usize
-        } != 0, "out of memory for an OpenGL render pass")
-        unsafe {
-            *saved = pass.copy()
+        if encoder.b == 0 {
+            record := state.take_pass()
+            assert(!ptr.is_null(record), "out of memory for an OpenGL render pass")
+            encoder.b = unsafe {
+                record as usize as u64
+            }
         }
-        framebuffer := 0u32
+        record := unsafe {
+            ptr.borrow_mut(encoder.b as usize as *mut Pass, &mut record_token)
+        }
         count := pass.color_count as usize
-        buffers := [gl.NONE; 8]
-        unsafe {
-            gl.create_framebuffers(1, ptr.from_mut(&mut framebuffer))
-            for i in 0usize..count {
-                gl.named_framebuffer_texture(framebuffer, gl.COLOR_ATTACHMENT0 + i as u32, pass.colors[i].texture.a as u32, 0)
-                buffers[i] = gl.COLOR_ATTACHMENT0 + i as u32
-            }
-            if pass.has_depth {
-                gl.named_framebuffer_texture(framebuffer, gl.DEPTH_ATTACHMENT, pass.depth.texture.a as u32, 0)
-            }
-            if count == 0 {
-                gl.named_framebuffer_draw_buffer(framebuffer, gl.NONE)
+        colors := [0u32; COLOR_SLOTS]
+        stored := 0u32
+        for i in 0usize..count {
+            attachment := &pass.colors[i]
+            colors[i] = attachment.texture.a as u32
+            record.resolve[i] = if attachment.has_resolve {
+                attachment.resolve.a as u32
             } else {
-                gl.named_framebuffer_draw_buffers(framebuffer, count as i32, ptr.as_ptr(&buffers))
+                0
             }
-            gl.bind_framebuffer(gl.DRAW_FRAMEBUFFER, framebuffer)
-            gl.viewport(0, 0, pass.width as i32, pass.height as i32)
-            gl.depth_rangef(0.0, 1.0)
-            gl.scissor(0, 0, pass.width as i32, pass.height as i32)
-            gl.blend_color(0.0, 0.0, 0.0, 0.0)
-            // Clears obey the write masks a pipeline may have left.
-            gl.color_mask(1, 1, 1, 1)
-            gl.depth_mask(1)
-            for i in 0usize..count {
-                attachment := &pass.colors[i]
-                if attachment.load == hal.LOAD_CLEAR {
-                    format := attachment.format
-                    if format == hal.FORMAT_R32_SINT {
-                        values := [attachment.clear_red as i32, attachment.clear_green as i32, attachment.clear_blue as i32, attachment.clear_alpha as i32]
-                        gl.clear_named_framebufferiv(framebuffer, gl.COLOR, i as i32, ptr.as_ptr(&values))
-                    } else if hal.is_integer(format) {
-                        values := [unsigned(attachment.clear_red), unsigned(attachment.clear_green), unsigned(attachment.clear_blue), unsigned(attachment.clear_alpha)]
-                        gl.clear_named_framebufferuiv(framebuffer, gl.COLOR, i as i32, ptr.as_ptr(&values))
-                    } else {
-                        values := [attachment.clear_red as f32, attachment.clear_green as f32, attachment.clear_blue as f32, attachment.clear_alpha as f32]
-                        gl.clear_named_framebufferfv(framebuffer, gl.COLOR, i as i32, ptr.as_ptr(&values))
-                    }
+            if attachment.store {
+                stored = stored | (1u32 << i as u32)
+            }
+        }
+        depth := 0u32
+        if pass.has_depth {
+            depth = pass.depth.texture.a as u32
+            if pass.depth.store {
+                stored = stored | (1u32 << COLOR_SLOTS as u32)
+            }
+        }
+        found := state.framebuffer(&colors, count, depth)
+        if found.slot != FRAMEBUFFERS {
+            state.pins[found.slot] += 1
+        }
+        framebuffer := found.name
+        record.framebuffer = framebuffer
+        record.slot = found.slot
+        record.width = pass.width
+        record.height = pass.height
+        record.color_count = pass.color_count
+        record.stored = stored
+        record.has_depth = pass.has_depth
+        record.viewport = [0.0f32, 0.0, pass.width as f32, pass.height as f32]
+        record.near = 0.0
+        record.far = 1.0
+        record.scissor = [0i32, 0, pass.width as i32, pass.height as i32]
+        record.blend_color = [0.0f32; 4]
+        encoder.c = 1
+        state.owner = encoder.a
+        state.restore(record)
+        // Clears obey the write masks a pipeline may have left.
+        for i in 0usize..count {
+            attachment := &pass.colors[i]
+            if attachment.load != hal.LOAD_CLEAR {
+                continue
+            }
+            state.shadow.color_mask(i, hal.COLOR_WRITE_ALL)
+            format := attachment.format
+            unsafe {
+                if format == hal.FORMAT_R32_SINT {
+                    values := [attachment.clear_red as i32, attachment.clear_green as i32, attachment.clear_blue as i32, attachment.clear_alpha as i32]
+                    gl.clear_named_framebufferiv(framebuffer, gl.COLOR, i as i32, ptr.as_ptr(&values))
+                } else if hal.is_integer(format) {
+                    values := [unsigned(attachment.clear_red), unsigned(attachment.clear_green), unsigned(attachment.clear_blue), unsigned(attachment.clear_alpha)]
+                    gl.clear_named_framebufferuiv(framebuffer, gl.COLOR, i as i32, ptr.as_ptr(&values))
+                } else {
+                    values := [attachment.clear_red as f32, attachment.clear_green as f32, attachment.clear_blue as f32, attachment.clear_alpha as f32]
+                    gl.clear_named_framebufferfv(framebuffer, gl.COLOR, i as i32, ptr.as_ptr(&values))
                 }
             }
-            if pass.has_depth && pass.depth.load == hal.LOAD_CLEAR {
-                depth := [pass.depth.clear_depth]
-                gl.clear_named_framebufferfv(framebuffer, gl.DEPTH, 0, ptr.as_ptr(&depth))
-            }
         }
-        encoder.a = framebuffer as u64
-        encoder.b = unsafe {
-            saved as usize as u64
+        if pass.has_depth && pass.depth.load == hal.LOAD_CLEAR {
+            state.shadow.depth_mask(true)
+            depth_value := [pass.depth.clear_depth]
+            unsafe {
+                gl.clear_named_framebufferfv(framebuffer, gl.DEPTH, 0, ptr.as_ptr(&depth_value))
+            }
         }
     }
 
-    // Resolve multisampled attachments, drop the ones not stored, and
-    // delete the framebuffer.
+    // Resolve multisampled attachments, drop the ones not stored, and hand
+    // the framebuffer back to the cache.
     pub fn end_render_pass(&self, encoder: &mut hal.Handle) {
-        framebuffer := encoder.a as u32
-        pass := unsafe {
-            encoder.b as usize as *mut hal.RenderPassInfo
+        if encoder.c == 0 {
+            encoder.a = 0
+            return
         }
+        encoder.c = 0
+        encoder.a = 0
+        token := 0u8
+        record_token := 0u8
+        state := self.mutable(&mut token)
+        record := unsafe {
+            ptr.borrow_mut(encoder.b as usize as *mut Pass, &mut record_token)
+        }
+        if !self.ready() {
+            if record.slot != FRAMEBUFFERS {
+                state.pins[record.slot] -= 1
+            }
+            return
+        }
+        framebuffer := record.framebuffer
+        width := record.width as i32
+        height := record.height as i32
         dropped := [gl.NONE; 9]
         dropped_count := 0usize
-        unsafe {
-            width := (*pass).width as i32
-            height := (*pass).height as i32
-            count := (*pass).color_count as usize
-            for i in 0usize..count {
-                if (*pass).colors[i].has_resolve {
-                    target := 0u32
-                    gl.create_framebuffers(1, ptr.from_mut(&mut target))
-                    gl.named_framebuffer_texture(target, gl.COLOR_ATTACHMENT0, (*pass).colors[i].resolve.a as u32, 0)
-                    gl.named_framebuffer_draw_buffer(target, gl.COLOR_ATTACHMENT0)
+        for i in 0usize..record.color_count as usize {
+            resolve := record.resolve[i]
+            if resolve != 0 {
+                targets := [0u32; COLOR_SLOTS]
+                targets[0] = resolve
+                target := state.framebuffer(&targets, 1, 0)
+                unsafe {
                     gl.named_framebuffer_read_buffer(framebuffer, gl.COLOR_ATTACHMENT0 + i as u32)
                     // Blits obey the scissor test.
                     gl.disable(gl.SCISSOR_TEST)
-                    gl.blit_named_framebuffer(framebuffer, target, 0, 0, width, height, 0, 0, width, height, gl.COLOR_BUFFER_BIT, gl.NEAREST)
+                    gl.blit_named_framebuffer(framebuffer, target.name, 0, 0, width, height, 0, 0, width, height, gl.COLOR_BUFFER_BIT, gl.NEAREST)
                     gl.enable(gl.SCISSOR_TEST)
-                    gl.delete_framebuffers(1, ptr.from_ref(&target))
                 }
-                if !(*pass).colors[i].store {
-                    dropped[dropped_count] = gl.COLOR_ATTACHMENT0 + i as u32
-                    dropped_count += 1
+                if target.slot == FRAMEBUFFERS {
+                    state.drop_framebuffer(target.name)
                 }
             }
-            if (*pass).has_depth && !(*pass).depth.store {
-                dropped[dropped_count] = gl.DEPTH_ATTACHMENT
+            if (record.stored >> i as u32 & 1) == 0 {
+                dropped[dropped_count] = gl.COLOR_ATTACHMENT0 + i as u32
                 dropped_count += 1
             }
-            if dropped_count != 0 {
+        }
+        if record.has_depth && (record.stored >> COLOR_SLOTS as u32 & 1) == 0 {
+            dropped[dropped_count] = gl.DEPTH_ATTACHMENT
+            dropped_count += 1
+        }
+        if dropped_count != 0 {
+            unsafe {
                 gl.invalidate_named_framebuffer_data(framebuffer, dropped_count as i32, ptr.as_ptr(&dropped))
             }
-            free(pass as *mut u8)
         }
-        close_framebuffer(framebuffer)
-        encoder.a = 0
-        encoder.b = 0
+        if record.slot != FRAMEBUFFERS {
+            state.pins[record.slot] -= 1
+        } else {
+            state.drop_framebuffer(framebuffer)
+        }
     }
 
+    // The viewport, scissor and blend constant are the pass's: kept in its
+    // record and set at once only while OpenGL holds this pass's state.
+    // Otherwise the pass's next draw sets them.
     pub fn set_viewport(&self, encoder: &mut hal.Handle, x: f32, y: f32, width: f32, height: f32, min_depth: f32, max_depth: f32) {
-        unsafe {
-            gl.viewport_indexedf(0, x, y, width, height)
-            gl.depth_rangef(min_depth, max_depth)
+        if encoder.c == 0 {
+            return
+        }
+        token := 0u8
+        record_token := 0u8
+        state := self.mutable(&mut token)
+        record := unsafe {
+            ptr.borrow_mut(encoder.b as usize as *mut Pass, &mut record_token)
+        }
+        record.viewport = [x, y, width, height]
+        record.near = min_depth
+        record.far = max_depth
+        if state.owner == encoder.a && self.ready() {
+            state.shadow.viewport(&record.viewport)
+            state.shadow.depth_range(min_depth, max_depth)
         }
     }
 
     pub fn set_scissor(&self, encoder: &mut hal.Handle, x: u32, y: u32, width: u32, height: u32) {
-        unsafe {
-            gl.scissor(x as i32, y as i32, width as i32, height as i32)
+        if encoder.c == 0 {
+            return
+        }
+        token := 0u8
+        record_token := 0u8
+        state := self.mutable(&mut token)
+        record := unsafe {
+            ptr.borrow_mut(encoder.b as usize as *mut Pass, &mut record_token)
+        }
+        record.scissor = [x as i32, y as i32, width as i32, height as i32]
+        if state.owner == encoder.a && self.ready() {
+            state.shadow.scissor(&record.scissor)
         }
     }
 
     pub fn set_blend_constant(&self, encoder: &mut hal.Handle, red: f64, green: f64, blue: f64, alpha: f64) {
-        unsafe {
-            gl.blend_color(red as f32, green as f32, blue as f32, alpha as f32)
+        if encoder.c == 0 {
+            return
+        }
+        token := 0u8
+        record_token := 0u8
+        state := self.mutable(&mut token)
+        record := unsafe {
+            ptr.borrow_mut(encoder.b as usize as *mut Pass, &mut record_token)
+        }
+        record.blend_color = [red as f32, green as f32, blue as f32, alpha as f32]
+        if state.owner == encoder.a && self.ready() {
+            state.shadow.blend_color(&record.blend_color)
         }
     }
 
     pub fn dispatch(&self, encoder: &mut hal.Handle, state: &mut hal.PassState, x: u32, y: u32, z: u32) {
+        if !self.ready() {
+            return
+        }
+        token := 0u8
+        device := self.mutable(&mut token)
+        device.claim(encoder, state)
         if state.pipeline_dirty {
-            unsafe {
-                gl.use_program(state.pipeline.handle.a as u32)
-            }
+            device.shadow.use_program(state.pipeline.handle.a as u32)
             state.pipeline_dirty = false
         }
-        bind(state)
+        device.bind(state)
         unsafe {
             gl.dispatch_compute(x, y, z)
         }
-        self.wrote(state)
+        device.wrote(state)
     }
 
     pub fn draw(&self, encoder: &mut hal.Handle, state: &mut hal.PassState, vertex_count: u32, instance_count: u32, first_vertex: u32, first_instance: u32) {
-        apply(state)
+        if !self.ready() {
+            return
+        }
+        token := 0u8
+        device := self.mutable(&mut token)
+        device.claim(encoder, state)
+        device.apply(state)
         unsafe {
             gl.draw_arrays_instanced_base_instance(mode(state.pipeline.topology), first_vertex as i32, vertex_count as i32, instance_count as i32, first_instance)
         }
-        self.wrote(state)
+        device.wrote(state)
     }
 
     pub fn draw_indexed(&self, encoder: &mut hal.Handle, state: &mut hal.PassState, index_count: u32, instance_count: u32, first_index: u32, base_vertex: i32, first_instance: u32) {
-        apply(state)
+        if !self.ready() {
+            return
+        }
+        token := 0u8
+        device := self.mutable(&mut token)
+        device.claim(encoder, state)
+        device.apply(state)
         if state.index_dirty {
+            // The element array binding is vertex array state.
             unsafe {
                 gl.vertex_array_element_buffer(state.pipeline.handle.b as u32, state.index_a as u32)
             }
@@ -571,16 +1497,22 @@ pub struct Device: hal.Backend {
         unsafe {
             gl.draw_elements_instanced_base_vertex_base_instance(mode(state.pipeline.topology), index_count as i32, index_type, offset as usize as *const u8, instance_count as i32, base_vertex, first_instance)
         }
-        self.wrote(state)
+        device.wrote(state)
     }
 
     pub fn copy_buffer(&self, encoder: &mut hal.Handle, source: &hal.Handle, source_offset: u64, destination: &hal.Handle, destination_offset: u64, size: u64) {
+        if !self.ready() {
+            return
+        }
         unsafe {
             gl.copy_named_buffer_sub_data(source.a as u32, destination.a as u32, source_offset as isize, destination_offset as isize, size as isize)
         }
     }
 
     pub fn copy_buffer_to_texture(&self, encoder: &mut hal.Handle, source: &hal.Handle, offset: u64, bytes_per_row: u32, destination: &hal.Handle, descriptor: &hal.TextureDescriptor, region: &hal.Region) {
+        if !self.ready() {
+            return
+        }
         format := pixel_format(descriptor.format)
         unsafe {
             gl.bind_buffer(gl.PIXEL_UNPACK_BUFFER, source.a as u32)
@@ -593,6 +1525,9 @@ pub struct Device: hal.Backend {
     }
 
     pub fn copy_texture_to_buffer(&self, encoder: &mut hal.Handle, source: &hal.Handle, descriptor: &hal.TextureDescriptor, region: &hal.Region, destination: &hal.Handle, offset: u64, bytes_per_row: u32) {
+        if !self.ready() {
+            return
+        }
         format := pixel_format(descriptor.format)
         row := region.width as u64 * hal.texel_size(descriptor.format) as u64
         size := (region.height as u64 - 1) * bytes_per_row as u64 + row
@@ -607,6 +1542,9 @@ pub struct Device: hal.Backend {
     }
 
     pub fn generate_mipmaps(&self, encoder: &mut hal.Handle, texture: &hal.Handle, descriptor: &hal.TextureDescriptor) {
+        if !self.ready() {
+            return
+        }
         self.settle()
         unsafe {
             gl.generate_texture_mipmap(texture.a as u32)
@@ -614,6 +1552,9 @@ pub struct Device: hal.Backend {
     }
 
     pub fn clear_buffer(&self, encoder: &mut hal.Handle, buffer: &hal.Handle, offset: u64, size: u64) {
+        if !self.ready() {
+            return
+        }
         unsafe {
             gl.clear_named_buffer_sub_data(buffer.a as u32, gl.R8, offset as isize, size as isize, gl.RED, gl.UNSIGNED_BYTE, 0usize as *const u8)
         }
@@ -624,7 +1565,7 @@ pub struct Device: hal.Backend {
 
     // Only shader writes to storage buffers and images need barriers.
     pub fn barrier(&self, encoder: &mut hal.Handle, before: u32, after: u32) {
-        if (before & (hal.USE_FRAGMENT_WRITE | hal.USE_COMPUTE_WRITE)) == 0 {
+        if (before & (hal.USE_FRAGMENT_WRITE | hal.USE_COMPUTE_WRITE)) == 0 || !self.ready() {
             return
         }
         unsafe {
@@ -651,16 +1592,22 @@ pub struct Device: hal.Backend {
         surface.c = 0
         surface.d = 0
         config.format = hal.FORMAT_RGBA8_UNORM_SRGB
+        frames := config.frames as usize
+        if frames == 0 {
+            frames = 1
+        } else if frames >= FENCES {
+            frames = FENCES - 1
+        }
+        self.state.update(fn(state: &mut State) {
+            state.frames = frames
+        })
         self.context.update_surface()
         interval := 0i32
         if config.vsync {
             interval = 1
         }
         // Not every driver lets the interval change; keep its own then.
-        match self.context.set_swap_interval(interval) {
-            ok() => {}
-            err(_) => {}
-        }
+        ignore(self.context.set_swap_interval(interval))
         if config.width == 0 || config.height == 0 {
             return ok()
         }
@@ -679,10 +1626,19 @@ pub struct Device: hal.Backend {
         return ok()
     }
 
+    // The surface has one image, reused every frame; first wait until
+    // fewer than SurfaceConfig.frames presented frames are unfinished.
     pub fn acquire(&self, surface: &mut hal.Handle, texture: &mut hal.Handle) -> u64!hal.Error {
         if surface.a == 0 {
             return err(hal.Error.Outdated)
         }
+        self.current()?
+        self.state.update(fn(state: &mut State) {
+            frames := state.frames
+            if frames != 0 {
+                state.wait_frames(frames - 1)
+            }
+        })
         texture.a = surface.a
         texture.b = gl.SRGB8_ALPHA8 as u64
         texture.c = 0
@@ -692,95 +1648,163 @@ pub struct Device: hal.Backend {
 
     pub fn present(&self, surface: &mut hal.Handle) -> u64!hal.Error {
         self.current()?
-        self.settle()
         width := surface.c as i32
         height := surface.d as i32
-        unsafe {
-            // Copy the bytes as they are: the window shows them as sRGB.
-            gl.disable(gl.FRAMEBUFFER_SRGB)
-            gl.disable(gl.SCISSOR_TEST)
-            gl.bind_framebuffer(gl.DRAW_FRAMEBUFFER, 0)
-            gl.blit_named_framebuffer(surface.b as u32, 0, 0, 0, width, height, 0, height, width, 0, gl.COLOR_BUFFER_BIT, gl.NEAREST)
-            gl.enable(gl.SCISSOR_TEST)
-            gl.enable(gl.FRAMEBUFFER_SRGB)
-        }
-        swapped := self.context.swap_buffers()
-        state := self.state()
-        index := unsafe {
-            (*state).submitted += 1
-            (*state).submitted
-        }
-        match swapped {
-            ok() => {
-                return ok(index)
+        source := surface.b as u32
+        swapped := self.state.update(fn(state: &mut State) -> bool {
+            state.settle()
+            // The blit leaves framebuffer 0 bound, so the next draw of an
+            // open pass binds its own again.
+            state.owner = 0
+            state.shadow.bind_framebuffer(0)
+            unsafe {
+                // Copy the bytes as they are: the window shows them as sRGB.
+                gl.disable(gl.FRAMEBUFFER_SRGB)
+                gl.disable(gl.SCISSOR_TEST)
+                gl.blit_named_framebuffer(source, 0, 0, 0, width, height, 0, height, width, 0, gl.COLOR_BUFFER_BIT, gl.NEAREST)
+                gl.enable(gl.SCISSOR_TEST)
+                gl.enable(gl.FRAMEBUFFER_SRGB)
             }
-            err(_) => {
-                return err(hal.Error.Outdated)
+            shown := match self.context.swap_buffers() {
+                ok() => true,
+                err(_) => false,
             }
+            // acquire() waits for this frame once enough follow it.
+            if state.fence_count == FENCES {
+                state.wait_frames(FENCES - 1)
+            }
+            fence := unsafe {
+                gl.fence_sync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0) as usize
+            }
+            if fence != 0 {
+                state.fences[state.fence_count] = fence
+                state.fence_count += 1
+            }
+            state.submitted += 1
+            return shown
+        })
+        if !swapped {
+            return err(hal.Error.Outdated)
         }
+        return ok(self.state.read().submitted)
     }
 
     pub fn destroy_surface(&self, surface: &hal.Handle) {
-        match self.current() {
-            ok() => {}
-            err(_) => {
-                return
-            }
+        if !self.ready() {
+            return
         }
-        if surface.b != 0 {
-            framebuffer := surface.b as u32
-            unsafe {
-                gl.delete_framebuffers(1, ptr.from_ref(&framebuffer))
+        texture := surface.a as u32
+        framebuffer := surface.b as u32
+        self.state.update(fn(state: &mut State) {
+            state.owner = 0
+            state.drop_fences()
+            if framebuffer != 0 {
+                state.drop_framebuffer(framebuffer)
             }
-        }
-        delete_texture(surface.a as u32)
+            state.forget_texture(texture)
+        })
+        delete_texture(texture)
     }
 
-    // Shader writes since the last full barrier become visible to
-    // everything.
+    // End a pass an abandoned encoder left open, and hand its pass record
+    // back for the next encoder.
+    fn destroy_encoder(&self, handle: &hal.Handle) {
+        encoder := handle.copy()
+        if encoder.c != 0 {
+            self.end_render_pass(&mut encoder)
+        }
+        if encoder.b != 0 {
+            record := unsafe {
+                encoder.b as usize as *mut Pass
+            }
+            self.state.update(fn(state: &mut State) {
+                state.give_pass(record)
+            })
+        }
+    }
+
     fn settle(&self) {
-        state := self.state()
+        self.state.update(fn(state: &mut State) {
+            state.settle()
+        })
+    }
+
+    // The device's state, for entry points run for every draw, where a
+    // closure for Mutable.update would cost too much.
+    fn mutable(&self, token: &mut u8) -> &mut State from(token) {
         unsafe {
-            if (*state).dirty {
-                gl.memory_barrier(gl.ALL_BARRIER_BITS)
-                (*state).dirty = false
-            }
+            return ptr.borrow_mut(self.state.get(), token)
         }
     }
 
-    // A draw or dispatch ran: note whether it may have written storage.
-    fn wrote(&self, state: &hal.PassState) {
-        for slot in 0usize..16 {
-            kind := state.pipeline.kinds[slot]
-            if kind == hal.BINDING_STORAGE_BUFFER || kind == hal.BINDING_STORAGE_TEXTURE {
-                unsafe {
-                    (*self.state()).dirty = true
-                }
-                return
-            }
-        }
-    }
-
-    fn state(&self) -> *mut State {
-        unsafe {
-            return ptr.from_ref(&self.state) as *mut State
-        }
-    }
-
-    // Make the context current, in case the program used another one.
-    fn current(&self) -> void!hal.Error {
+    // Make the context current if another one is, as a program with two
+    // devices on one thread needs; false when the context is lost. Asking
+    // the driver is a read of its thread-local current context, which a
+    // record of our own could only replace with a thread-local one, and
+    // Dodo has no thread-local storage.
+    fn ready(&self) -> bool {
         if self.context.is_current() {
-            return ok()
+            return true
         }
         match self.context.make_current() {
             ok() => {
-                return ok()
+                return true
             }
             err(_) => {
-                return err(hal.Error.DeviceLost)
+                return false
             }
         }
     }
+
+    fn current(&self) -> void!hal.Error {
+        if self.ready() {
+            return ok()
+        }
+        return err(hal.Error.DeviceLost)
+    }
+
+    fn drop(&mut self) {
+        ready := self.ready()
+        self.state.update(fn(state: &mut State) {
+            if ready {
+                state.drop_fences()
+                for slot in 0usize..FRAMEBUFFERS {
+                    state.evict(slot)
+                }
+            }
+            for state.free != 0 {
+                record := unsafe {
+                    state.free as *mut Pass
+                }
+                state.free = unsafe {
+                    (*record).next
+                }
+                unsafe {
+                    free(record as *mut u8)
+                }
+            }
+        })
+    }
+}
+
+// Ignore a failure that changes nothing.
+fn ignore(result: void!context.Error) {
+    match result {
+        ok() => {}
+        err(_) => {}
+    }
+}
+
+// 1 when a pipeline with these bindings may write storage buffers or
+// images, for handle.d.
+fn writes_storage(bindings: &[hal.BindingLayout]) -> u64 {
+    for i in 0usize..bindings.len {
+        kind := bindings[i].kind
+        if kind == hal.BINDING_STORAGE_BUFFER || kind == hal.BINDING_STORAGE_TEXTURE {
+            return 1
+        }
+    }
+    return 0
 }
 
 // An OpenGL texture format: internal format, pixel format and type.
@@ -905,13 +1929,10 @@ fn positive(value: i64) -> u64 {
 fn compile(stage: u32, source: &str, define: &[u8], entry: &str) -> u32!hal.Error {
     text := mem.str_bytes(source)
     split := 0usize
-    if text.len >= 8 && text[0] == 35 && text[1] == 118 {
-        // "#v": the version line ends at the first newline.
-        split = text.len
-        for i in 0usize..text.len {
-            if split == text.len && text[i] == 10 {
-                split = i + 1
-            }
+    if bytes.starts_with(text, b"#version") {
+        split = match bytes.find(text, b'\n') {
+            some(newline) => newline + 1,
+            none => text.len,
         }
     }
     selector := [0u8; 256]
@@ -941,32 +1962,25 @@ fn compile(stage: u32, source: &str, define: &[u8], entry: &str) -> u32!hal.Erro
 // its length, or 0 when `entry` is not an identifier of at most 200 bytes.
 fn entry_define(entry: &str, out: &mut[256]u8) -> usize {
     name := mem.str_bytes(entry)
-    if name.len == 0 || name.len > 200 || (name[0] >= 48 && name[0] <= 57) {
+    if name.len == 0 || name.len > 200 || ascii.is_digit(name[0]) {
         return 0
     }
     for i in 0usize..name.len {
-        byte := name[i]
-        letter := (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || byte == 95
-        if !letter && !(byte >= 48 && byte <= 57) {
+        if !ascii.is_alphanumeric(name[i]) && name[i] != b'_' {
             return 0
         }
     }
-    prefix := b"#define DODO_ENTRY_"
-    length := 0usize
-    for i in 0usize..prefix.len {
-        out[length] = prefix[i]
-        length += 1
+    length := append(out, 0, b"#define DODO_ENTRY_")
+    length = append(out, length, name)
+    return append(out, length, b" 1\n")
+}
+
+// Copy `part` into `out` at `at` and return where it ends.
+fn append(out: &mut[256]u8, at: usize, part: &[u8]) -> usize {
+    for i in 0usize..part.len {
+        out[at + i] = part[i]
     }
-    for i in 0usize..name.len {
-        out[length] = name[i]
-        length += 1
-    }
-    suffix := b" 1\n"
-    for i in 0usize..suffix.len {
-        out[length] = suffix[i]
-        length += 1
-    }
-    return length
+    return at + part.len
 }
 
 // Link shaders into a program and delete them; `second` may be 0.
@@ -1028,13 +2042,6 @@ fn delete_texture(name: u32) {
     }
 }
 
-fn close_framebuffer(framebuffer: u32) {
-    unsafe {
-        gl.bind_framebuffer(gl.DRAW_FRAMEBUFFER, 0)
-        gl.delete_framebuffers(1, ptr.from_ref(&framebuffer))
-    }
-}
-
 // What a render pipeline sets beyond its program and vertex array.
 fn settings_of(descriptor: &hal.RenderPipelineDescriptor) -> Settings {
     settings := Settings {
@@ -1050,14 +2057,14 @@ fn settings_of(descriptor: &hal.RenderPipelineDescriptor) -> Settings {
         clamp: descriptor.depth_bias_clamp,
         alpha_to_coverage: descriptor.alpha_to_coverage,
         count: descriptor.targets.len as u32,
-        blending: [false; 8],
-        color_source: [0u32; 8],
-        color_destination: [0u32; 8],
-        color_operation: [0u32; 8],
-        alpha_source: [0u32; 8],
-        alpha_destination: [0u32; 8],
-        alpha_operation: [0u32; 8],
-        masks: [0u32; 8]
+        blending: [false; COLOR_SLOTS],
+        color_source: [0u32; COLOR_SLOTS],
+        color_destination: [0u32; COLOR_SLOTS],
+        color_operation: [0u32; COLOR_SLOTS],
+        alpha_source: [0u32; COLOR_SLOTS],
+        alpha_destination: [0u32; COLOR_SLOTS],
+        alpha_operation: [0u32; COLOR_SLOTS],
+        masks: [0u32; COLOR_SLOTS]
     }
     for i in 0usize..descriptor.targets.len {
         target := &descriptor.targets[i]
@@ -1088,110 +2095,6 @@ fn mode(topology: u32) -> u32 {
         return gl.POINTS
     }
     return gl.TRIANGLES
-}
-
-// Apply what changed in a render pass's state.
-fn apply(state: &mut hal.PassState) {
-    handle := &state.pipeline.handle
-    array := handle.b as u32
-    if state.pipeline_dirty {
-        settings := unsafe {
-            handle.c as usize as *mut Settings
-        }
-        unsafe {
-            gl.use_program(handle.a as u32)
-            gl.bind_vertex_array(array)
-            cull := (*settings).cull
-            if cull == hal.CULL_NONE {
-                gl.disable(gl.CULL_FACE)
-            } else {
-                gl.enable(gl.CULL_FACE)
-                if cull == hal.CULL_FRONT {
-                    gl.cull_face(gl.FRONT)
-                } else {
-                    gl.cull_face(gl.BACK)
-                }
-            }
-            if (*settings).front == hal.FRONT_CW {
-                gl.front_face(gl.CW)
-            } else {
-                gl.front_face(gl.CCW)
-            }
-            for i in 0usize..(*settings).count as usize {
-                index := i as u32
-                if (*settings).blending[i] {
-                    gl.enablei(gl.BLEND, index)
-                    gl.blend_func_separatei(index, (*settings).color_source[i], (*settings).color_destination[i], (*settings).alpha_source[i], (*settings).alpha_destination[i])
-                    gl.blend_equation_separatei(index, (*settings).color_operation[i], (*settings).alpha_operation[i])
-                } else {
-                    gl.disablei(gl.BLEND, index)
-                }
-                mask := (*settings).masks[i]
-                gl.color_maski(index, (mask & 1) as u8, (mask >> 1 & 1) as u8, (mask >> 2 & 1) as u8, (mask >> 3 & 1) as u8)
-            }
-            if (*settings).depth_test {
-                gl.enable(gl.DEPTH_TEST)
-                // COMPARE_NEVER is 1, GL_NEVER 0x200, in the same order.
-                gl.depth_func(gl.NEVER + (*settings).depth_compare - 1)
-                if (*settings).depth_write {
-                    gl.depth_mask(1)
-                } else {
-                    gl.depth_mask(0)
-                }
-            } else {
-                gl.disable(gl.DEPTH_TEST)
-            }
-            if (*settings).biased {
-                gl.enable(gl.POLYGON_OFFSET_FILL)
-                if (*settings).clamp != 0.0 {
-                    gl.polygon_offset_clamp((*settings).slope, (*settings).bias, (*settings).clamp)
-                } else {
-                    gl.polygon_offset((*settings).slope, (*settings).bias)
-                }
-            } else {
-                gl.disable(gl.POLYGON_OFFSET_FILL)
-            }
-            if (*settings).alpha_to_coverage {
-                gl.enable(gl.SAMPLE_ALPHA_TO_COVERAGE)
-            } else {
-                gl.disable(gl.SAMPLE_ALPHA_TO_COVERAGE)
-            }
-        }
-        state.pipeline_dirty = false
-    }
-    bind(state)
-    for i in 0usize..state.pipeline.vertex_buffer_count as usize {
-        if (state.vertex_dirty >> i as u32 & 1) != 0 {
-            unsafe {
-                gl.vertex_array_vertex_buffer(array, i as u32, state.vertex_a[i] as u32, state.vertex_offset[i] as isize, state.pipeline.strides[i] as i32)
-            }
-        }
-    }
-    state.vertex_dirty = 0
-}
-
-// Bind the slots that changed.
-fn bind(state: &mut hal.PassState) {
-    for slot in 0usize..16 {
-        kind := state.pipeline.kinds[slot]
-        if (state.dirty >> slot as u32 & 1) != 0 && kind != hal.BINDING_NONE {
-            index := slot as u32
-            name := state.object_a[slot] as u32
-            unsafe {
-                if kind == hal.BINDING_UNIFORM_BUFFER {
-                    gl.bind_buffer_range(gl.UNIFORM_BUFFER, index, name, state.offset[slot] as isize, state.size[slot] as isize)
-                } else if kind == hal.BINDING_STORAGE_BUFFER || kind == hal.BINDING_READ_ONLY_STORAGE_BUFFER {
-                    gl.bind_buffer_range(gl.SHADER_STORAGE_BUFFER, index, name, state.offset[slot] as isize, state.size[slot] as isize)
-                } else if kind == hal.BINDING_SAMPLED_TEXTURE || kind == hal.BINDING_COMPARISON_TEXTURE {
-                    gl.bind_texture_unit(index, name)
-                    gl.bind_sampler(index, state.sampler[slot] as u32)
-                } else {
-                    gl.bind_image_texture(index, name, 0, 0, 0, gl.READ_WRITE, state.object_b[slot] as u32)
-                }
-            }
-        }
-    }
-    state.dirty = 0
 }
 
 fn unsigned(value: f64) -> u32 {
@@ -1406,5 +2309,5 @@ fn open_device(window: Option<&handle.NativeHandle>, debug: bool) -> Device!hal.
         gl.enable(gl.SCISSOR_TEST)
     }
     limits := query_limits()
-    return ok(Device { context: created, limits: limits, state: State { submitted: 0, dirty: false }, window_kind: kind, window: id })
+    return ok(Device { context: created, limits: limits, state: hal.Mutable.new(State.new()), window_kind: kind, window: id })
 }
