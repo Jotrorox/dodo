@@ -25,7 +25,12 @@ package hal
 // within an encoder and calls barrier() before a command whose use depends
 // on an earlier one, naming both sides with USE_* bits. Every encoder starts
 // ordered after everything submitted before it, so hazards between
-// submissions never need a barrier call.
+// submissions never need a barrier call. A backend whose API tracks hazards
+// and object lifetimes itself (tracks_resources(), Metal) gets no barrier
+// calls at all.
+//
+// Mutable state: std/gpu's objects borrow their device, so devices and
+// backends work through `&self` and keep what changes in a Mutable.
 
 import "core/mem"
 import "core/ptr"
@@ -214,6 +219,53 @@ pub fn mip_level_count(width: u32, height: u32) -> u32 {
         count += 1
     }
     return count
+}
+
+// The number of the lowest set bit of `mask`, which is not 0: for walking
+// through the slots a dirty mask names without testing every one.
+pub fn lowest_bit(mask: u32) -> u32 {
+    // A de Bruijn sequence: multiplying by the isolated lowest bit puts a
+    // different 5-bit pattern in the top bits for each position.
+    isolated := mask & (~mask + 1)
+    return DE_BRUIJN[(core.wrapping_mul::<u32>(isolated, 0x077cb531) >> 27) as usize]
+}
+
+const DE_BRUIJN: [32]u32 = [0, 1, 28, 2, 29, 14, 24, 3, 30, 22, 20, 15, 25, 17, 4, 8, 31, 27, 13, 23, 21, 19, 16, 7, 26, 12, 18, 6, 11, 5, 10, 9]
+
+// A value changed through shared references. std/gpu's objects borrow
+// their device, so a device and its backend only ever see `&self`; what
+// they change lives in a Mutable. A device is used from one thread, and
+// the one rule is that no change may start while another of the same
+// Mutable is running: update() must not be called from within an update()
+// of the same value, and a reference from read() must not be used after a
+// change.
+pub struct Mutable<T> {
+    value: T
+
+    pub fn new(value: T) -> Mutable<T> {
+        return Mutable { value: value }
+    }
+
+    pub fn read(&self) -> &T from(self) {
+        return &self.value
+    }
+
+    // Change the value in `change`, and return what it returns.
+    pub fn update<R>(&self, change: &mut dyn fn(&mut T) -> R) -> R {
+        token := 0u8
+        value := unsafe {
+            ptr.borrow_mut(ptr.from_ref(&self.value) as *mut T, &mut token)
+        }
+        return change(value)
+    }
+
+    // The value's address, for reading and writing single fields where a
+    // closure would cost too much: on paths run for every draw.
+    pub unsafe fn get(&self) -> *mut T {
+        unsafe {
+            return ptr.from_ref(&self.value) as *mut T
+        }
+    }
 }
 
 // Bit patterns of numbers, for packing them into handles.
@@ -801,6 +853,8 @@ pub struct RenderPipelineDescriptor {
 // against.
 pub struct Pipeline {
     pub handle: Handle
+    // Bit N: slot N is part of the layout.
+    pub slots: u32
     // The binding kind of each slot, BINDING_NONE when unused.
     pub kinds: [16]u32
     pub stages: [16]u32
@@ -826,6 +880,7 @@ pub struct Pipeline {
     pub fn empty() -> Pipeline {
         return Pipeline {
             handle: Handle.null(),
+            slots: 0,
             kinds: [0u32; 16],
             stages: [0u32; 16],
             formats: [0u32; 16],
@@ -846,6 +901,7 @@ pub struct Pipeline {
     pub fn copy(&self) -> Pipeline {
         return Pipeline {
             handle: self.handle.copy(),
+            slots: self.slots,
             kinds: copy16(&self.kinds),
             stages: copy16(&self.stages),
             formats: copy16(&self.formats),
@@ -862,6 +918,20 @@ pub struct Pipeline {
             workgroup_size_y: self.workgroup_size_y,
             workgroup_size_z: self.workgroup_size_z
         }
+    }
+    // Whether both have the same binding layout: the same kind and stages
+    // in every slot. Bindings carry over between pipelines with the same
+    // layout (Vulkan pipeline layouts are then compatible).
+    pub fn same_layout(&self, other: &Pipeline) -> bool {
+        if self.slots != other.slots {
+            return false
+        }
+        for i in 0usize..16 {
+            if self.kinds[i] != other.kinds[i] || self.stages[i] != other.stages[i] {
+                return false
+            }
+        }
+        return true
     }
 }
 
@@ -890,7 +960,17 @@ pub const BOUND_STORAGE_TEXTURE: u32 = 3
 
 // The state of a compute or render pass. std/gpu fills it as commands are
 // recorded and hands it to the backend at each draw or dispatch, which
-// applies whatever the dirty masks say changed and clears them.
+// applies whatever the dirty masks say changed.
+//
+// - pipeline_dirty: the pipeline changed since the last draw or dispatch.
+//   Bindings and vertex buffers stay applied across pipeline changes; when
+//   the new pipeline's layout differs (Pipeline.same_layout), std/gpu marks
+//   every bound slot dirty again.
+// - dirty, vertex_dirty: bit N set when slot N (vertex buffer N) changed.
+//   A backend applies the bits of slots the pipeline uses, `dirty &
+//   pipeline.slots` and the first vertex_buffer_count vertex buffers, and
+//   clears exactly those: a slot bound before a pipeline that uses it stays
+//   dirty until one does. lowest_bit() walks through the set bits.
 pub struct PassState {
     pub pipeline: Pipeline
     pub has_pipeline: bool
@@ -907,6 +987,9 @@ pub struct PassState {
     pub size: [16]u64
     // Bit N: slot N changed since the backend last applied it.
     pub dirty: u32
+
+    // Bit N: slot N holds something.
+    pub bound_slots: u32
 
     pub vertex_a: [8]u64
     pub vertex_offset: [8]u64
@@ -933,6 +1016,7 @@ pub struct PassState {
             offset: [0u64; 16],
             size: [0u64; 16],
             dirty: 0,
+            bound_slots: 0,
             vertex_a: [0u64; 8],
             vertex_offset: [0u64; 8],
             vertex_set: 0,
@@ -1036,6 +1120,12 @@ pub interface Backend {
 
     // Whether std/gpu stages transfers itself (see the top of this file).
     fn staged(&self) -> bool
+    // Whether the API tracks hazards between commands and keeps a
+    // submitted encoder, and every object its commands use, alive until the
+    // GPU has run them (Metal). std/gpu then makes no barrier() calls,
+    // destroys encoders as soon as they are submitted and dropped objects
+    // as soon as no encoder is recording.
+    fn tracks_resources(&self) -> bool
     // The CPU address of a buffer's memory, or 0 when the CPU cannot map
     // it. BUFFER_UPLOAD and BUFFER_READBACK buffers are always mapped; on a
     // GPU with unified memory, ordinary buffers may be too.
@@ -1074,8 +1164,10 @@ pub interface Backend {
 
     fn begin_encoder(&self) -> Handle!Error
     // Submit an encoder's commands and return the submission's number.
-    // The encoder is destroyed later, once that submission has finished.
-    fn submit(&self, encoder: &mut Handle) -> u64!Error
+    // `uploads` is std/gpu's upload encoder, whose commands run first, as
+    // part of the same submission, or a null Handle (staged backends only).
+    // Encoders are destroyed later, once that submission has finished.
+    fn submit(&self, uploads: &mut Handle, encoder: &mut Handle) -> u64!Error
     fn begin_compute_pass(&self, encoder: &mut Handle)
     fn end_compute_pass(&self, encoder: &mut Handle)
     fn begin_render_pass(&self, encoder: &mut Handle, pass: &RenderPassInfo)

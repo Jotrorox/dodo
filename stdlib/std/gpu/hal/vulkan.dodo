@@ -208,6 +208,10 @@ pub struct Device: hal.Backend {
         return true
     }
 
+    pub fn tracks_resources(&self) -> bool {
+        return false
+    }
+
     pub fn mapped(&self, buffer: &hal.Handle) -> usize {
         return buffer.c as usize
     }
@@ -717,7 +721,14 @@ pub struct Device: hal.Backend {
         }, b: primary, c: 0, d: 0 })
     }
 
-    pub fn submit(&self, encoder: &mut hal.Handle) -> u64!hal.Error {
+    pub fn submit(&self, uploads: &mut hal.Handle, encoder: &mut hal.Handle) -> u64!hal.Error {
+        if uploads.a != 0 {
+            self.submit_one(uploads)?
+        }
+        return self.submit_one(encoder)
+    }
+
+    fn submit_one(&self, encoder: &mut hal.Handle) -> u64!hal.Error {
         commands := primary(encoder)
         // Make the GPU's writes visible to the CPU once the work is done.
         self.memory_barrier(commands, vk.PIPELINE_STAGE_ALL_COMMANDS_BIT, vk.ACCESS_MEMORY_WRITE_BIT, vk.PIPELINE_STAGE_HOST_BIT, vk.ACCESS_HOST_READ_BIT)

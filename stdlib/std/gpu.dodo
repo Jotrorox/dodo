@@ -1692,15 +1692,16 @@ pub struct Device {
         }
     }
     fn raw_submit(&self, encoder: &mut hal.Handle) -> u64!Error {
+        uploads := hal.Handle.null()
         match &self.raw {
             Raw.Vulkan(raw) => {
-                return raw.submit(encoder)
+                return raw.submit(&mut uploads, encoder)
             }
             Raw.Native(raw) => {
-                return raw.submit(encoder)
+                return raw.submit(&mut uploads, encoder)
             }
             Raw.OpenGl(raw) => {
-                return raw.submit(encoder)
+                return raw.submit(&mut uploads, encoder)
             }
         }
     }
@@ -2165,6 +2166,7 @@ fn check_bindings(bindings: &[BindingLayout], allowed: u32, pipeline: &mut hal.P
         if binding.kind == hal.BINDING_STORAGE_TEXTURE && !hal.is_storage(binding.format) {
             return err(Error.InvalidInput)
         }
+        pipeline.slots = pipeline.slots | (1u32 << slot)
         pipeline.kinds[slot as usize] = binding.kind
         pipeline.stages[slot as usize] = binding.stages
         pipeline.formats[slot as usize] = binding.format
@@ -2648,6 +2650,7 @@ fn bind_buffer(state: &mut hal.PassState, tracked: &mut Tracked, slot: u32, buff
     state.offset[index] = offset
     state.size[index] = size
     state.dirty = state.dirty | (1u32 << slot)
+    state.bound_slots = state.bound_slots | (1u32 << slot)
     tracked.usage[index] = buffer.usage
     tracked.format[index] = 0
     tracked.texture_a[index] = 0
@@ -2666,6 +2669,7 @@ fn bind_texture(state: &mut hal.PassState, tracked: &mut Tracked, slot: u32, tex
     state.offset[index] = 0
     state.size[index] = 0
     state.dirty = state.dirty | (1u32 << slot)
+    state.bound_slots = state.bound_slots | (1u32 << slot)
     tracked.usage[index] = texture.descriptor.usage
     tracked.format[index] = texture.descriptor.format
     tracked.texture_a[index] = texture.handle.a

@@ -79,6 +79,10 @@ pub struct Device: hal.Backend {
         return true
     }
 
+    pub fn tracks_resources(&self) -> bool {
+        return false
+    }
+
     pub fn mapped(&self, buffer: &hal.Handle) -> usize {
         return buffer.c as usize
     }
@@ -368,8 +372,15 @@ pub struct Device: hal.Backend {
         return ok(handle)
     }
 
-    pub fn submit(&self, encoder: &mut hal.Handle) -> u64!hal.Error {
+    pub fn submit(&self, uploads: &mut hal.Handle, encoder: &mut hal.Handle) -> u64!hal.Error {
         pool := objc.AutoreleasePool.new()
+        if uploads.a != 0 {
+            close(uploads)
+            upload_commands := unsafe {
+                metal.CommandBuffer.from_object(object(uploads.a))
+            }
+            self.commit(&upload_commands)
+        }
         close(encoder)
         commands := unsafe {
             metal.CommandBuffer.from_object(object(encoder.a))

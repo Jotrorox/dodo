@@ -114,6 +114,10 @@ pub struct Device: hal.Backend {
         return length
     }
 
+    pub fn tracks_resources(&self) -> bool {
+        return false
+    }
+
     pub fn staged(&self) -> bool {
         return false
     }
@@ -387,7 +391,8 @@ pub struct Device: hal.Backend {
         return ok(hal.Handle.null())
     }
 
-    pub fn submit(&self, encoder: &mut hal.Handle) -> u64!hal.Error {
+    // Never given uploads: std/gpu stages nothing on OpenGL.
+    pub fn submit(&self, uploads: &mut hal.Handle, encoder: &mut hal.Handle) -> u64!hal.Error {
         unsafe {
             gl.flush()
             state := self.state()
