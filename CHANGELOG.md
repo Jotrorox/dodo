@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+- The Lua interpreter in `std/script/lua` is about 7% faster (geometric mean
+  over `benchmarks/lua`), now taking about 0.74x the time of the reference
+  Lua 5.4.9. Generic `for` loops over `pairs`, `ipairs` and `next` step the
+  table without a native call frame (`iteration` 2x faster); stores into
+  empty array slots and `#t` take inline fast paths (`table_append` 1.3x);
+  native calls return without a separate `poscall`; `__index` chains look up
+  short-string keys directly. Integer and float arithmetic results are now
+  written with stores LLVM cannot merge: a merged store moved integers
+  through a float register, and the next opcode's integer load of that slot
+  stalled on a cross-register-file forward.
+
 ## 0.1.6 — 2026-11-02
 
 Dodo 0.1.6 grows the language with interfaces and `dyn` references, function

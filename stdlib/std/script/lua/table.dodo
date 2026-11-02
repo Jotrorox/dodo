@@ -576,6 +576,16 @@ fn tab_finish_set(L: *mut State, t: *mut Table, key: *mut Value, slot: *mut Valu
     }
 }
 
+// No __newindex metamethod can apply to a store into `t`: it has no
+// metatable, or its metatable's cache says __newindex is absent.
+@inline
+fn tab_no_newindex(t: *mut Table) -> bool {
+    unsafe {
+        let mt = (*t).metatable
+        return ptr.is_null(mt) || ((*mt).flags & (1u8 << (TM_NEWINDEX as u8))) != 0
+    }
+}
+
 // --- Rehash -----------------------------------------------------------------
 
 fn ceil_log2(x: u64) -> i32 {
@@ -1000,5 +1010,63 @@ fn tab_next(L: *mut State, t: *mut Table, key: *mut Value) -> bool!Throw {
             j += 1
         }
         return ok(false)
+    }
+}
+
+// Traversal step for the generic-for fast path (no errors, no allocation):
+// like tab_next, but reads the previous key from `key` and writes the next
+// key and value to out[0] and out[1]. Returns 1 when an entry was found, 0
+// at the end of the traversal, and -1 when the key needs the general path
+// (floats, dead keys, invalid keys).
+@inline(never)
+fn tab_next_fast(t: *mut Table, key: *mut Value, out: *mut Value) -> i32 {
+    unsafe {
+        let asize = (*t).asize as u64
+        i := 0u64
+        let tag = (*key).tag
+        if tag == TAG_INT {
+            let idx = core.wrapping_sub(i2u(val_int(key)), 1)
+            if idx < asize {
+                i = idx + 1
+            } else {
+                let slot = tab_get_int(t, val_int(key))
+                if (*slot).tag == TAG_ABSENT {
+                    return -1
+                }
+                i = (node_offset(slot as *mut Node, (*t).node) as u64) + 1 + asize
+            }
+        } else if tag == TAG_SHORTSTR {
+            let slot = tab_get_shortstr(t, val_str(key))
+            if (*slot).tag == TAG_ABSENT {
+                return -1
+            }
+            i = (node_offset(slot as *mut Node, (*t).node) as u64) + 1 + asize
+        } else if tag != TAG_NIL {
+            return -1
+        }
+        for i < asize {
+            let v = ptr.offset((*t).array, i as isize)
+            if !val_is_empty(v) {
+                set_int(out, (i as i64) + 1)
+                set_obj(ptr.offset(out, 1), v)
+                return 1
+            }
+            i += 1
+        }
+        if tab_is_dummy(t) {
+            return 0
+        }
+        let size = node_size(t) as u64
+        j := i - asize
+        for j < size {
+            let n = gnode(t, j as isize)
+            if !val_is_empty(node_val(n)) {
+                node_get_key(n, out)
+                set_obj(ptr.offset(out, 1), node_val(n))
+                return 1
+            }
+            j += 1
+        }
+        return 0
     }
 }

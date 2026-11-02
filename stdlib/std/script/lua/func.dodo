@@ -332,3 +332,13 @@ fn func_local_name(p: *mut Proto, n0: i32, pc: i32) -> *mut LString {
         return 0 as *mut LString
     }
 }
+
+// Value bits of a light native function (compared against built-ins).
+@inline
+fn lightfn_bits(f: NativeFn) -> u64 {
+    unsafe {
+        tmp := Value { bits: 0, tag: 0 }
+        set_lightfn(ptr.from_mut(&mut tmp), f)
+        return tmp.bits
+    }
+}
