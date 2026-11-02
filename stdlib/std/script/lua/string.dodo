@@ -15,18 +15,77 @@ import "core/ptr"
 
 const STRT_MIN_SIZE: i32 = 128
 
+@inline
+fn load_u64(p: *mut u8) -> u64 {
+    unsafe {
+        return ptr.read_unaligned(p as *mut u64)
+    }
+}
+
+@inline
+fn load_u32(p: *mut u8) -> u64 {
+    unsafe {
+        return ptr.read_unaligned(p as *mut u32) as u64
+    }
+}
+
+// The 1..7 bytes at p as one word (n > 0). Every byte is covered without
+// reading past p+n; the length is mixed into the hash separately.
+@inline
+fn load_tail(p: *mut u8, n: usize) -> u64 {
+    unsafe {
+        if n >= 4 {
+            return load_u32(p) | (load_u32(ptr.offset(p, (n - 4) as isize)) << 32)
+        }
+        let b0 = *p as u64
+        let b1 = *ptr.offset(p, (n >> 1) as isize) as u64
+        let b2 = *ptr.offset(p, (n - 1) as isize) as u64
+        return b0 | (b1 << 8) | (b2 << 16)
+    }
+}
+
+// Hash eight bytes per step (short strings are at most 40 bytes).
 fn str_hash(data: *mut u8, length: usize, seed: u32) -> u32 {
     unsafe {
-        h := seed ^ core.wrapping_mul((length & 0xFFFFFFFF) as u32, 0x9E3779B1u32)
-        for i in 0usize..length {
-            let b = *ptr.offset(data, i as isize) as u32
-            h = core.wrapping_mul(h ^ b, 16777619u32)
+        h := (((seed as u64) << 32) | (seed as u64)) ^ core.wrapping_mul(length as u64, 0x9E3779B97F4A7C15u64)
+        p := data
+        n := length
+        for n >= 8 {
+            h = core.wrapping_mul(h ^ load_u64(p), 0xFF51AFD7ED558CCDu64)
+            h = h ^ (h >> 29)
+            p = ptr.offset(p, 8)
+            n -= 8
         }
-        // Final avalanche.
-        h = h ^ (h >> 15)
-        h = core.wrapping_mul(h, 0x2C1B3C6Du32)
-        h = h ^ (h >> 12)
-        return h
+        if n > 0 {
+            h = core.wrapping_mul(h ^ load_tail(p, n), 0xFF51AFD7ED558CCDu64)
+            h = h ^ (h >> 29)
+        }
+        // Final avalanche, folding the high half into the bucket bits.
+        h = core.wrapping_mul(h, 0xC4CEB9FE1A85EC53u64)
+        h = h ^ (h >> 32)
+        return (h & 0xFFFFFFFFu64) as u32
+    }
+}
+
+// Equality of n bytes at a and b, a word at a time (for short strings).
+@inline
+fn bytes_equal(a: *mut u8, b: *mut u8, n: usize) -> bool {
+    unsafe {
+        if n >= 8 {
+            i := 0usize
+            for i + 8 < n {
+                if load_u64(ptr.offset(a, i as isize)) != load_u64(ptr.offset(b, i as isize)) {
+                    return false
+                }
+                i += 8
+            }
+            // The last (possibly overlapping) word.
+            return load_u64(ptr.offset(a, (n - 8) as isize)) == load_u64(ptr.offset(b, (n - 8) as isize))
+        }
+        if n == 0 {
+            return true
+        }
+        return load_tail(a, n) == load_tail(b, n)
     }
 }
 
@@ -153,7 +212,7 @@ fn str_intern(L: *mut State, bytes: *const u8, length: usize) -> (*mut LString)!
         mask := ((*g).strt_size - 1) as u32
         s := *ptr.offset((*g).strt_hash, (h & mask) as isize)
         for !ptr.is_null(s) {
-            if (*s).length == length && (*s).hash == h && mem_equal(str_data(s), data, length) {
+            if (*s).hash == h && (*s).length == length && bytes_equal(str_data(s), data, length) {
                 // A string found dead by an ongoing sweep comes back to life.
                 if gc_is_dead(g, s as *mut GCObject) {
                     gc_change_white(s as *mut GCObject)
@@ -235,6 +294,16 @@ fn str_equal(a: *mut LString, b: *mut LString) -> bool {
     }
 }
 
+// A little-endian word reordered so that integer order is byte order.
+@inline
+fn byte_order_key(x: u64) -> u64 {
+    unsafe {
+        y := ((x & 0x00FF00FF00FF00FFu64) << 8) | ((x >> 8) & 0x00FF00FF00FF00FFu64)
+        y = ((y & 0x0000FFFF0000FFFFu64) << 16) | ((y >> 16) & 0x0000FFFF0000FFFFu64)
+        return ((y & 0xFFFFFFFFu64) << 32) | (y >> 32)
+    }
+}
+
 // memcmp-style three-way comparison of two strings (bytewise, like strcoll
 // in the C locale; embedded zeros are handled).
 fn str_compare(a: *mut LString, b: *mut LString) -> i32 {
@@ -246,15 +315,32 @@ fn str_compare(a: *mut LString, b: *mut LString) -> i32 {
         } else {
             lb
         }
-        if n > 0 {
-            let r = str_memcmp(str_data(a) as *const u8, str_data(b) as *const u8, n)
-            if r != 0 {
-                return if r < 0 {
+        let pa = str_data(a)
+        let pb = str_data(b)
+        i := 0usize
+        for i + 8 <= n {
+            let x = load_u64(ptr.offset(pa, i as isize))
+            let y = load_u64(ptr.offset(pb, i as isize))
+            if x != y {
+                return if byte_order_key(x) < byte_order_key(y) {
                     -1
                 } else {
                     1
                 }
             }
+            i += 8
+        }
+        for i < n {
+            let x = *ptr.offset(pa, i as isize)
+            let y = *ptr.offset(pb, i as isize)
+            if x != y {
+                return if x < y {
+                    -1
+                } else {
+                    1
+                }
+            }
+            i += 1
         }
         if la == lb {
             return 0

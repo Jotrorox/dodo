@@ -755,7 +755,10 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
         base := ptr.offset((*ci).func, 1)
         for {
             let proto = (*cl).p
-            let k = (*proto).k
+            // Constants of the running function; Lua-to-Lua calls and
+            // returns without hooks switch frames inside the instruction
+            // loop and update it there.
+            k := (*proto).k
             trap := (*L).hookmask != 0
             if trap && pc == (*proto).code {
                 if (*proto).is_vararg != 0 {
@@ -1056,11 +1059,8 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                         pc = ptr.offset(pc, 1)
                         (*ci).savedpc = pc
                         (*L).top = (*ci).top
-                        let t = tab_new(L)?
+                        let t = tab_new_sized(L, c, b)?
                         set_gc(ra, t as *mut GCObject, TAG_TABLE)
-                        if b != 0 || c != 0 {
-                            tab_resize(L, t, c, b)?
-                        }
                         // Registers above ra are dead here: not roots.
                         (*L).top = ptr.offset(ra, 1)
                         gc_check(L)
@@ -1107,8 +1107,13 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                         // ADDK
                         let rb = ptr.offset(base, ((i >> 16) & 255) as isize)
                         let kc = ptr.offset(k, (i >> 24) as isize)
-                        if (*rb).tag == TAG_INT && (*kc).tag == TAG_INT {
+                        let tb = (*rb).tag
+                        let tc = (*kc).tag
+                        if ((tb ^ TAG_INT) | (tc ^ TAG_INT)) == 0 {
                             set_int_gpr(ra, core.wrapping_add(val_int(rb), val_int(kc)))
+                            pc = ptr.offset(pc, 1)
+                        } else if ((tb ^ TAG_FLOAT) | (tc ^ TAG_FLOAT)) == 0 {
+                            set_float_fpr(ra, val_float(rb) + val_float(kc))
                             pc = ptr.offset(pc, 1)
                         } else {
                             f1: f64 = 0.0
@@ -1123,8 +1128,13 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                         // SUBK
                         let rb = ptr.offset(base, ((i >> 16) & 255) as isize)
                         let kc = ptr.offset(k, (i >> 24) as isize)
-                        if (*rb).tag == TAG_INT && (*kc).tag == TAG_INT {
+                        let tb = (*rb).tag
+                        let tc = (*kc).tag
+                        if ((tb ^ TAG_INT) | (tc ^ TAG_INT)) == 0 {
                             set_int_gpr(ra, core.wrapping_sub(val_int(rb), val_int(kc)))
+                            pc = ptr.offset(pc, 1)
+                        } else if ((tb ^ TAG_FLOAT) | (tc ^ TAG_FLOAT)) == 0 {
+                            set_float_fpr(ra, val_float(rb) - val_float(kc))
                             pc = ptr.offset(pc, 1)
                         } else {
                             f1: f64 = 0.0
@@ -1139,8 +1149,13 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                         // MULK
                         let rb = ptr.offset(base, ((i >> 16) & 255) as isize)
                         let kc = ptr.offset(k, (i >> 24) as isize)
-                        if (*rb).tag == TAG_INT && (*kc).tag == TAG_INT {
+                        let tb = (*rb).tag
+                        let tc = (*kc).tag
+                        if ((tb ^ TAG_INT) | (tc ^ TAG_INT)) == 0 {
                             set_int_gpr(ra, core.wrapping_mul(val_int(rb), val_int(kc)))
+                            pc = ptr.offset(pc, 1)
+                        } else if ((tb ^ TAG_FLOAT) | (tc ^ TAG_FLOAT)) == 0 {
+                            set_float_fpr(ra, val_float(rb) * val_float(kc))
                             pc = ptr.offset(pc, 1)
                         } else {
                             f1: f64 = 0.0
@@ -1292,8 +1307,13 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                         // ADD
                         let rb = ptr.offset(base, ((i >> 16) & 255) as isize)
                         let rc = ptr.offset(base, (i >> 24) as isize)
-                        if (*rb).tag == TAG_INT && (*rc).tag == TAG_INT {
+                        let tb = (*rb).tag
+                        let tc = (*rc).tag
+                        if ((tb ^ TAG_INT) | (tc ^ TAG_INT)) == 0 {
                             set_int_gpr(ra, core.wrapping_add(val_int(rb), val_int(rc)))
+                            pc = ptr.offset(pc, 1)
+                        } else if ((tb ^ TAG_FLOAT) | (tc ^ TAG_FLOAT)) == 0 {
+                            set_float_fpr(ra, val_float(rb) + val_float(rc))
                             pc = ptr.offset(pc, 1)
                         } else {
                             f1: f64 = 0.0
@@ -1308,8 +1328,13 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                         // SUB
                         let rb = ptr.offset(base, ((i >> 16) & 255) as isize)
                         let rc = ptr.offset(base, (i >> 24) as isize)
-                        if (*rb).tag == TAG_INT && (*rc).tag == TAG_INT {
+                        let tb = (*rb).tag
+                        let tc = (*rc).tag
+                        if ((tb ^ TAG_INT) | (tc ^ TAG_INT)) == 0 {
                             set_int_gpr(ra, core.wrapping_sub(val_int(rb), val_int(rc)))
+                            pc = ptr.offset(pc, 1)
+                        } else if ((tb ^ TAG_FLOAT) | (tc ^ TAG_FLOAT)) == 0 {
+                            set_float_fpr(ra, val_float(rb) - val_float(rc))
                             pc = ptr.offset(pc, 1)
                         } else {
                             f1: f64 = 0.0
@@ -1324,8 +1349,13 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                         // MUL
                         let rb = ptr.offset(base, ((i >> 16) & 255) as isize)
                         let rc = ptr.offset(base, (i >> 24) as isize)
-                        if (*rb).tag == TAG_INT && (*rc).tag == TAG_INT {
+                        let tb = (*rb).tag
+                        let tc = (*rc).tag
+                        if ((tb ^ TAG_INT) | (tc ^ TAG_INT)) == 0 {
                             set_int_gpr(ra, core.wrapping_mul(val_int(rb), val_int(rc)))
+                            pc = ptr.offset(pc, 1)
+                        } else if ((tb ^ TAG_FLOAT) | (tc ^ TAG_FLOAT)) == 0 {
+                            set_float_fpr(ra, val_float(rb) * val_float(rc))
                             pc = ptr.offset(pc, 1)
                         } else {
                             f1: f64 = 0.0
@@ -1607,8 +1637,13 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                         // EQ
                         let rb = ptr.offset(base, ((i >> 16) & 255) as isize)
                         cond := false
-                        if (*ra).tag == (*rb).tag && (*ra).tag == TAG_INT {
-                            cond = val_int(ra) == val_int(rb)
+                        let ta = (*ra).tag
+                        if ta == (*rb).tag && (ta == TAG_INT || ta == TAG_SHORTSTR) {
+                            // Interned short strings are equal exactly
+                            // when they are the same object.
+                            cond = (*ra).bits == (*rb).bits
+                        } else if ta == TAG_LONGSTR && (*rb).tag == TAG_LONGSTR {
+                            cond = str_equal(val_str(ra), val_str(rb))
                         } else {
                             (*ci).savedpc = pc
                             (*L).top = (*ci).top
@@ -1631,6 +1666,8 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                             cond = val_int(ra) < val_int(rb)
                         } else if both_numbers(ra, rb) {
                             cond = num_lt(ra, rb)
+                        } else if both_strings(ra, rb) {
+                            cond = str_compare(val_str(ra), val_str(rb)) < 0
                         } else {
                             (*ci).savedpc = pc
                             (*L).top = (*ci).top
@@ -1653,6 +1690,8 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                             cond = val_int(ra) <= val_int(rb)
                         } else if both_numbers(ra, rb) {
                             cond = num_le(ra, rb)
+                        } else if both_strings(ra, rb) {
+                            cond = str_compare(val_str(ra), val_str(rb)) <= 0
                         } else {
                             (*ci).savedpc = pc
                             (*L).top = (*ci).top
@@ -1670,7 +1709,15 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                     60 => {
                         // EQK
                         let kb = ptr.offset(k, ((i >> 16) & 255) as isize)
-                        let cond = vm_raw_equal(ra, kb)
+                        let ta = (*ra).tag
+                        let tk = (*kb).tag
+                        cond := false
+                        if ta == tk && (ta == TAG_SHORTSTR || ta == TAG_INT) {
+                            cond = (*ra).bits == (*kb).bits
+                        } else if ((ta ^ tk) & 15) == 0 {
+                            // Same basic type: subtypes, floats, long strings.
+                            cond = vm_raw_equal(ra, kb)
+                        }
                         if cond != (((i >> 15) & 1) != 0) {
                             pc = ptr.offset(pc, 1)
                         } else {
@@ -1971,26 +2018,32 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                             cl = ncl
                             pc = (*p).code
                             base = ptr.offset(func, 1)
-                            break
-                        }
-                        let ftag = (*ra).tag
-                        if ftag == TAG_LIGHTFN {
-                            precall_native(L, ra, nresults, val_lightfn(ra))?
-                        } else if ftag == TAG_NCLOSURE {
-                            precall_native(L, ra, nresults, (*(val_gc(ra) as *mut NClosure)).f)?
+                            if (*L).hookmask != 0 {
+                                // The call hook runs at frame entry.
+                                break
+                            }
+                            k = (*p).k
+                            trap = false
                         } else {
-                            precall(L, ra, nresults)?
-                        }
-                        let newci = (*L).ci
-                        if newci == ci {
-                            base = ptr.offset((*ci).func, 1)
-                            trap = (*L).hookmask != 0
-                        } else {
-                            ci = newci
-                            cl = val_gc((*ci).func) as *mut LClosure
-                            pc = (*ci).savedpc
-                            base = ptr.offset((*ci).func, 1)
-                            break
+                            let ftag = (*ra).tag
+                            if ftag == TAG_LIGHTFN {
+                                precall_native(L, ra, nresults, val_lightfn(ra))?
+                            } else if ftag == TAG_NCLOSURE {
+                                precall_native(L, ra, nresults, (*(val_gc(ra) as *mut NClosure)).f)?
+                            } else {
+                                precall(L, ra, nresults)?
+                            }
+                            let newci = (*L).ci
+                            if newci == ci {
+                                base = ptr.offset((*ci).func, 1)
+                                trap = (*L).hookmask != 0
+                            } else {
+                                ci = newci
+                                cl = val_gc((*ci).func) as *mut LClosure
+                                pc = (*ci).savedpc
+                                base = ptr.offset((*ci).func, 1)
+                                break
+                            }
                         }
                     },
                     69 => {
@@ -2011,24 +2064,73 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                         if ((i >> 15) & 1) != 0 {
                             func_close_upvals(L, base)
                         }
-                        n := 0i32
-                        pretailcall(L, ci, ra, b, delta, ptr.from_mut(&mut n))?
-                        if n < 0 {
+                        let ftag = (*ra).tag
+                        returned := true
+                        if (ftag == TAG_LIGHTFN || ftag == TAG_NCLOSURE) && (*L).hookmask == 0 {
+                            // A native callee (`return f(x)`): run it like
+                            // CALL does and return its results from this
+                            // frame, without pretailcall and poscall.
+                            let f = if ftag == TAG_LIGHTFN {
+                                val_lightfn(ra)
+                            } else {
+                                (*(val_gc(ra) as *mut NClosure)).f
+                            }
+                            let ra_off = sdiff(ra, (*L).stack)
+                            precall_native(L, ra, MULTRET, f)?
+                            let first = ptr.offset((*L).stack, ra_off)
+                            let n = small_i32(sdiff((*L).top, first))
+                            (*ci).func = ptr.offset((*ci).func, -(delta as isize))
+                            if (*L).hookmask != 0 {
+                                poscall(L, ci, n)?
+                            } else {
+                                let res = (*ci).func
+                                let wanted = (*ci).nresults
+                                if wanted == 1 {
+                                    if n == 0 {
+                                        (*res).tag = TAG_NIL
+                                    } else {
+                                        set_obj(res, first)
+                                    }
+                                    (*L).top = ptr.offset(res, 1)
+                                } else {
+                                    move_results(L, res, n, wanted)
+                                }
+                                (*L).ci = (*ci).previous
+                            }
+                        } else {
+                            n := 0i32
+                            pretailcall(L, ci, ra, b, delta, ptr.from_mut(&mut n))?
+                            if n < 0 {
+                                // A Lua callee now runs in this frame.
+                                cl = val_gc((*ci).func) as *mut LClosure
+                                pc = (*ci).savedpc
+                                base = ptr.offset((*ci).func, 1)
+                                if (*L).hookmask != 0 {
+                                    break
+                                }
+                                k = (*(*cl).p).k
+                                trap = false
+                                returned = false
+                            } else {
+                                (*ci).func = ptr.offset((*ci).func, -(delta as isize))
+                                poscall(L, ci, n)?
+                            }
+                        }
+                        if returned {
+                            if ((*ci).callstatus & CIST_FRESH) != 0 {
+                                return ok()
+                            }
+                            // Back in the calling Lua frame (its CALL).
+                            ci = (*ci).previous
                             cl = val_gc((*ci).func) as *mut LClosure
                             pc = (*ci).savedpc
                             base = ptr.offset((*ci).func, 1)
-                            break
+                            if (*L).hookmask != 0 {
+                                break
+                            }
+                            k = (*(*cl).p).k
+                            trap = false
                         }
-                        (*ci).func = ptr.offset((*ci).func, -(delta as isize))
-                        poscall(L, ci, n)?
-                        if ((*ci).callstatus & CIST_FRESH) != 0 {
-                            return ok()
-                        }
-                        ci = (*ci).previous
-                        cl = val_gc((*ci).func) as *mut LClosure
-                        pc = (*ci).savedpc
-                        base = ptr.offset((*ci).func, 1)
-                        break
                     },
                     70 => {
                         // RETURN
@@ -2054,11 +2156,18 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                         if ((*ci).callstatus & CIST_FRESH) != 0 {
                             return ok()
                         }
+                        // Back in the calling Lua frame (its CALL).
                         ci = (*ci).previous
                         cl = val_gc((*ci).func) as *mut LClosure
                         pc = (*ci).savedpc
                         base = ptr.offset((*ci).func, 1)
-                        break
+                        if (*L).hookmask != 0 {
+                            break
+                        }
+                        // Falling through dispatches the caller's next
+                        // instruction from this arm's own indirect branch.
+                        k = (*(*cl).p).k
+                        trap = false
                     },
                     71 => {
                         // RETURN0
@@ -2079,11 +2188,18 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                         if ((*ci).callstatus & CIST_FRESH) != 0 {
                             return ok()
                         }
+                        // Back in the calling Lua frame (its CALL).
                         ci = (*ci).previous
                         cl = val_gc((*ci).func) as *mut LClosure
                         pc = (*ci).savedpc
                         base = ptr.offset((*ci).func, 1)
-                        break
+                        if (*L).hookmask != 0 {
+                            break
+                        }
+                        // Falling through dispatches the caller's next
+                        // instruction from this arm's own indirect branch.
+                        k = (*(*cl).p).k
+                        trap = false
                     },
                     72 => {
                         // RETURN1
@@ -2110,11 +2226,18 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                         if ((*ci).callstatus & CIST_FRESH) != 0 {
                             return ok()
                         }
+                        // Back in the calling Lua frame (its CALL).
                         ci = (*ci).previous
                         cl = val_gc((*ci).func) as *mut LClosure
                         pc = (*ci).savedpc
                         base = ptr.offset((*ci).func, 1)
-                        break
+                        if (*L).hookmask != 0 {
+                            break
+                        }
+                        // Falling through dispatches the caller's next
+                        // instruction from this arm's own indirect branch.
+                        k = (*(*cl).p).k
+                        trap = false
                     },
                     73 => {
                         // FORLOOP
@@ -2263,7 +2386,7 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                     },
                     79 => {
                         // CLOSURE
-                        let p = *ptr.offset((*proto).p, (i >> 15) as isize)
+                        let p = *ptr.offset((*(*cl).p).p, (i >> 15) as isize)
                         (*ci).savedpc = pc
                         (*L).top = (*ci).top
                         func_push_closure(L, p, cl, base, ra)?
@@ -2284,7 +2407,7 @@ fn vm_execute(L: *mut State, startci: *mut CallInfo) -> void!Throw {
                     81 => {
                         // VARARGPREP
                         (*ci).savedpc = pc
-                        vm_adjust_varargs(L, ci, ((i >> 7) & 255) as i32, proto)?
+                        vm_adjust_varargs(L, ci, ((i >> 7) & 255) as i32, (*cl).p)?
                         base = ptr.offset((*ci).func, 1)
                         trap = (*L).hookmask != 0
                         if trap {
