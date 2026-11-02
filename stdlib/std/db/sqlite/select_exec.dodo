@@ -712,6 +712,7 @@ fn select_next(e: &mut Engine, s: usize) -> bool!db.Error {
             return ok(false)
         }
         got := false
+        mark := e.arena_top
         if e.ws[info + I_PHASE + 1] == 2 {
             got = sorted_next(e, s)?
         } else {
@@ -723,6 +724,8 @@ fn select_next(e: &mut Engine, s: usize) -> bool!db.Error {
         offset := u2i(ld64(e.ws, info + I_OFFSET))
         if offset > 0 {
             st64(e.ws, info + I_OFFSET, i2u(offset - 1))
+            // A skipped row's values are dead (as after each returned row).
+            arena_reset(e, mark)
             continue
         }
         if limit > 0 {
