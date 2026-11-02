@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- `std/db/sqlite` is faster: full-table scans take less than half the
+  instructions, `CREATE INDEX` on a 200k-row table runs about 4.5 times
+  faster, and indexed joins about 2.5 times faster. Rebalancing now evens out
+  every sibling page instead of only the last two, so B-tree pages no longer
+  stay 100% full and split again on the next insert. Page-cache misses take
+  the least recently used slot in constant time instead of scanning every
+  slot. The byte-level helpers check each range once and are inlined. Rows
+  no longer scan every cursor when the per-row arena is reset.
+  `Connection.statement_length` no longer copies the whole remaining script
+  into the workspace on every call.
 - The Lua interpreter in `std/script/lua` is about 7% faster (geometric mean
   over `benchmarks/lua`), now taking about 0.74x the time of the reference
   Lua 5.4.9. Generic `for` loops over `pairs`, `ipairs` and `next` step the
