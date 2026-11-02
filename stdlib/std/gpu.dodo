@@ -676,6 +676,7 @@ pub struct Device {
         encoder := self.backend().begin_encoder()?
         self.backend().copy_buffer(&mut encoder, &buffer.handle, start, &readback, 0, end - start)
         self.run_readback(&mut encoder, &readback, end - start)?
+        self.collect()
         unsafe {
             source := self.uploads.read().readback_address + (offset - start) as usize
             ptr.copy_nonoverlapping(source as *const u8, ptr.as_mut_ptr(out), out.len)
@@ -1135,6 +1136,8 @@ pub struct Device {
         match self.backend().submit(&mut nothing, &mut uploads) {
             ok(index) => {
                 self.uploads_submitted(&uploads, index)
+                // Programs that only write and read reclaim objects here.
+                self.collect()
                 return ok()
             }
             err(error) => {

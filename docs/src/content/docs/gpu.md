@@ -551,8 +551,9 @@ vertices gets one barrier from compute writes to vertex input, and
 independent dispatches, copies and passes get none. Each submission starts
 after the ones before it have finished.
 
-The Vulkan backend records each render pass into a secondary command
-buffer, so that the barriers its draws need can run before the pass;
+The Vulkan backend records each render pass's commands into a list and
+replays them into the command buffer when the pass ends, so that the
+barriers its draws need can run before the pass;
 OpenGL needs `glMemoryBarrier` only after shader writes to storage buffers
 and textures, and Metal tracks hazards itself. Draws of one render pass are
 not ordered against each other: a draw cannot read what an earlier draw of
