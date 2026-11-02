@@ -1,5 +1,6 @@
 package gpu
 
+import "core/ascii"
 import "core/mem"
 import "core/ptr"
 import "std/gpu/hal"
@@ -325,21 +326,42 @@ enum Raw {
     OpenGl(opengl_hal.Device)
 }
 
-// Objects dropped while the GPU may still use them wait here.
-const GRAVEYARD: usize = 64
 // Marks an object that an open encoder may use.
 const PENDING: u64 = 0xffffffffffffffff
 
+// An object dropped while the GPU may still use it, destroyed once
+// submission `wait` has finished (PENDING: once the encoders recording now
+// have been submitted).
+struct Grave {
+    object: u32
+    handle: hal.Handle
+    wait: u64
+}
+
+// Every encoder, upload encoders included, gets the next serial number.
+// Slot `serial % SERIALS` remembers what became of the last SERIALS of
+// them: still RECORDING, abandoned (0) or the number of their submission.
+const SERIALS: usize = 64
+const RECORDING: u64 = 0xffffffffffffffff
+// What outcome() says about a serial too old to remember.
+const FORGOTTEN: u64 = 0xfffffffffffffffe
+// What needed_by() says about a buffer the upload encoder writes.
+const UPLOADING: u64 = 0xffffffffffffffff
+
+// Which submissions may still use the device's objects.
 struct Life {
     open_encoders: u32
     submitted: u64
-    count: usize
-    object: [64]u32
-    a: [64]u64
-    b: [64]u64
-    c: [64]u64
-    d: [64]u64
-    wait: [64]u64
+    graves: Growing<Grave>
+    serial: u64
+    serials: [64]u64
+    outcomes: [64]u64
+    // A cleared hazard table, kept for the next encoder.
+    spare: Hazards
+
+    fn new(tracks: bool) -> Life {
+        return Life { open_encoders: 0, submitted: 0, graves: Growing.new(), serial: 0, serials: [0u64; 64], outcomes: [0u64; 64], spare: Hazards.new(tracks) }
+    }
 }
 
 // The staging ring starts at RING_START bytes and doubles up to RING_MAX
@@ -349,7 +371,13 @@ const RING_START: u64 = 4 * 1024 * 1024
 const RING_MAX: u64 = 64 * 1024 * 1024
 // Ring offsets keep every texel size's alignment.
 const RING_ALIGNMENT: u64 = 16
-const MARKS: usize = 32
+
+// A submitted upload: once submission `index` has finished, the ring is
+// free up to position `end`.
+struct Mark {
+    index: u64
+    end: u64
+}
 
 // Staged transfers: the upload encoder, the ring it copies from, and the
 // buffer reads come back through.
@@ -357,6 +385,7 @@ struct Uploads {
     // The upload encoder is recording; it counts as an open encoder.
     open: bool
     encoder: hal.Handle
+    serial: u64
     hazards: Hazards
     ring: hal.Handle
     ring_size: u64
@@ -365,69 +394,14 @@ struct Uploads {
     // one, everything from `tail` on may still be read by the GPU.
     head: u64
     tail: u64
-    // Submitted uploads, oldest first: once submission `mark_index[i]`
-    // has finished, the ring is free up to `mark_end[i]`.
-    mark_index: [32]u64
-    mark_end: [32]u64
-    marks: usize
+    // Submitted uploads, oldest first.
+    marks: Growing<Mark>
     readback: hal.Handle
     readback_size: u64
     readback_address: usize
-}
 
-// The handles of Uploads, for get_handle and set_handle.
-const UPLOAD_ENCODER: u32 = 0
-const UPLOAD_RING: u32 = 1
-const UPLOAD_READBACK: u32 = 2
-
-// Uploads is changed through a pointer from &Device, which allows reading
-// and writing its fields but no borrows of them.
-fn get_handle(which: u32, uploads: *mut Uploads) -> hal.Handle {
-    unsafe {
-        if which == UPLOAD_ENCODER {
-            return hal.Handle { a: (*uploads).encoder.a, b: (*uploads).encoder.b, c: (*uploads).encoder.c, d: (*uploads).encoder.d }
-        }
-        if which == UPLOAD_RING {
-            return hal.Handle { a: (*uploads).ring.a, b: (*uploads).ring.b, c: (*uploads).ring.c, d: (*uploads).ring.d }
-        }
-        return hal.Handle { a: (*uploads).readback.a, b: (*uploads).readback.b, c: (*uploads).readback.c, d: (*uploads).readback.d }
-    }
-}
-
-fn set_handle(which: u32, uploads: *mut Uploads, handle: &hal.Handle) {
-    unsafe {
-        if which == UPLOAD_ENCODER {
-            (*uploads).encoder.a = handle.a
-            (*uploads).encoder.b = handle.b
-            (*uploads).encoder.c = handle.c
-            (*uploads).encoder.d = handle.d
-        } else if which == UPLOAD_RING {
-            (*uploads).ring.a = handle.a
-            (*uploads).ring.b = handle.b
-            (*uploads).ring.c = handle.c
-            (*uploads).ring.d = handle.d
-        } else {
-            (*uploads).readback.a = handle.a
-            (*uploads).readback.b = handle.b
-            (*uploads).readback.c = handle.c
-            (*uploads).readback.d = handle.d
-        }
-    }
-}
-
-fn take_hazards(uploads: *mut Uploads) -> Hazards {
-    unsafe {
-        return Hazards { table: (*uploads).hazards.table, capacity: (*uploads).hazards.capacity, count: (*uploads).hazards.count, off: (*uploads).hazards.off, degraded: (*uploads).hazards.degraded }
-    }
-}
-
-fn put_hazards(uploads: *mut Uploads, hazards: &Hazards) {
-    unsafe {
-        (*uploads).hazards.table = hazards.table
-        (*uploads).hazards.capacity = hazards.capacity
-        (*uploads).hazards.count = hazards.count
-        (*uploads).hazards.off = hazards.off
-        (*uploads).hazards.degraded = hazards.degraded
+    fn new(tracks: bool) -> Uploads {
+        return Uploads { open: false, encoder: hal.Handle.null(), serial: 0, hazards: Hazards.new(tracks), ring: hal.Handle.null(), ring_size: 0, ring_address: 0, head: 0, tail: 0, marks: Growing.new(), readback: hal.Handle.null(), readback_size: 0, readback_address: 0 }
     }
 }
 
@@ -446,10 +420,10 @@ pub struct Device {
     limits: hal.Limits
     name: [256]u8
     name_length: usize
-    life: Life
-    uploads: Uploads
-    // Whether std/gpu stages transfers itself and tracks hazards for
-    // barriers (both off for OpenGL and Metal respectively).
+    life: hal.Mutable<Life>
+    uploads: hal.Mutable<Uploads>
+    // Whether std/gpu stages transfers itself (not on OpenGL), and tracks
+    // hazards and lifetimes itself (not on Metal, which does both).
     staged: bool
     tracks: bool
 
@@ -553,39 +527,22 @@ pub struct Device {
             limits: hal.Limits { max_texture_size: 0, max_buffer_size: 0, max_uniform_binding_size: 0, max_storage_binding_size: 0, max_workgroups: 0, max_workgroup_size_x: 0, max_workgroup_size_y: 0, max_workgroup_size_z: 0, max_workgroup_invocations: 0, max_color_attachments: 0 },
             name: [0u8; 256],
             name_length: 0,
-            life: Life { open_encoders: 0, submitted: 0, count: 0, object: [0u32; 64], a: [0u64; 64], b: [0u64; 64], c: [0u64; 64], d: [0u64; 64], wait: [0u64; 64] },
-            uploads: Uploads {
-                open: false,
-                encoder: hal.Handle.null(),
-                hazards: Hazards.new(false),
-                ring: hal.Handle.null(),
-                ring_size: 0,
-                ring_address: 0,
-                head: 0,
-                tail: 0,
-                mark_index: [0u64; 32],
-                mark_end: [0u64; 32],
-                marks: 0,
-                readback: hal.Handle.null(),
-                readback_size: 0,
-                readback_address: 0
-            },
+            life: hal.Mutable.new(Life.new(false)),
+            uploads: hal.Mutable.new(Uploads.new(false)),
             staged: false,
             tracks: false
         }
-        device.staged = device.raw_staged()
-        device.tracks = match device.api() {
-            Api.Metal => false,
-            _ => true,
-        }
-        device.uploads.hazards = Hazards.new(device.tracks)
-        device.limits = device.raw_limits()
+        device.staged = device.backend().staged()
+        device.tracks = !device.backend().tracks_resources()
+        device.life = hal.Mutable.new(Life.new(device.tracks))
+        device.uploads = hal.Mutable.new(Uploads.new(device.tracks))
+        device.limits = device.backend().limits()
         name := [0u8; 256]
-        length := device.raw_name(&mut name)
+        length := device.backend().name(&mut name)
         // Names are shown as ASCII.
         for i in 0usize..length {
-            if name[i] >= 128 {
-                name[i] = 63
+            if !ascii.is_ascii(name[i]) {
+                name[i] = b'?'
             }
         }
         device.name = name
@@ -595,17 +552,7 @@ pub struct Device {
 
     // The API this device uses.
     pub fn api(&self) -> Api {
-        match &self.raw {
-            Raw.Vulkan(raw) => {
-                return raw.api()
-            }
-            Raw.Native(raw) => {
-                return raw.api()
-            }
-            Raw.OpenGl(raw) => {
-                return raw.api()
-            }
-        }
+        return self.backend().api()
     }
 
     // The GPU's name as the driver reports it, such as "Apple M2" or
@@ -629,23 +576,18 @@ pub struct Device {
         }
         // Whole words, so that shaders reading u32s stay in bounds.
         rounded := (size + 3) & ~3u64
-        handle := self.raw_create_buffer(rounded, usage)?
+        handle := self.backend().create_buffer(rounded, usage)?
+        buffer := Buffer { device: self, handle: handle, size: size, usage: usage, uses: hal.Mutable.new(BufferUse.new()) }
         // Mapped buffers start out zero; the others are cleared on the GPU
-        // before anything else uses them.
-        if self.staged && self.raw_mapped(&handle) == 0 {
-            match self.upload_encoder() {
-                ok(encoder) => {
-                    self.use_uploaded(&mut encoder, handle.a, hal.USE_COPY_DST)
-                    self.raw_clear_buffer(&mut encoder, &handle, 0, rounded)
-                    self.upload_done(&encoder)
-                }
-                err(error) => {
-                    self.raw_destroy(hal.OBJECT_BUFFER, &handle)
-                    return err(error)
-                }
-            }
+        // before anything else uses them. A failure drops the buffer.
+        if self.staged && self.backend().mapped(&buffer.handle) == 0 {
+            encoder := self.upload_encoder()?
+            self.use_uploaded(&mut encoder, buffer.handle.a, hal.USE_COPY_DST)
+            self.backend().clear_buffer(&mut encoder, &buffer.handle, 0, rounded)
+            self.upload_done(&encoder)
+            self.note_use(&buffer, self.uploads.read().serial)
         }
-        return ok(Buffer { device: self, handle: handle, size: size, usage: usage })
+        return ok(buffer)
     }
 
     // A buffer holding a copy of `data`, which must not be empty. The
@@ -653,18 +595,18 @@ pub struct Device {
     pub fn create_buffer_with_data(&self, data: &[u8], usage: u32) -> Buffer!Error from(self) {
         buffer := self.create_buffer(data.len as u64, usage)?
         if !self.staged {
-            self.raw_write_buffer(&buffer.handle, 0, data)?
+            self.backend().write_buffer(&buffer.handle, 0, data)?
             return ok(buffer)
         }
         // Nothing uses a new buffer yet: write a mapped one directly.
-        address := self.raw_mapped(&buffer.handle)
+        address := self.backend().mapped(&buffer.handle)
         if address != 0 {
             unsafe {
                 ptr.copy_nonoverlapping(ptr.as_ptr(data), address as *mut u8, data.len)
             }
             return ok(buffer)
         }
-        self.stage_buffer_write(&buffer.handle, 0, data)?
+        self.stage_buffer_write(&buffer, 0, data)?
         return ok(buffer)
     }
 
@@ -681,24 +623,32 @@ pub struct Device {
             return ok()
         }
         if !self.staged {
-            return self.raw_write_buffer(&buffer.handle, offset, data)
+            return self.backend().write_buffer(&buffer.handle, offset, data)
         }
-        address := self.raw_mapped(&buffer.handle)
-        if address != 0 && ((offset | data.len as u64) & 3) != 0 {
-            // Copies move whole words on some GPUs: write a mapped buffer
-            // directly instead, once the GPU is done with it.
-            self.finish()?
-            unsafe {
-                ptr.copy_nonoverlapping(ptr.as_ptr(data), (address + offset as usize) as *mut u8, data.len)
+        address := self.backend().mapped(&buffer.handle)
+        if address != 0 {
+            // No submitted work uses the buffer any more, and no earlier
+            // write waits in the upload encoder: write it directly. So
+            // must a write copies cannot make, as they move whole words on
+            // some GPUs, once the GPU is done with the buffer.
+            idle := self.buffer_idle(buffer)
+            if !idle && ((offset | data.len as u64) & 3) != 0 {
+                self.settle(buffer)?
+                idle = true
             }
-            return ok()
+            if idle {
+                unsafe {
+                    ptr.copy_nonoverlapping(ptr.as_ptr(data), (address + offset as usize) as *mut u8, data.len)
+                }
+                return ok()
+            }
         }
-        return self.stage_buffer_write(&buffer.handle, offset, data)
+        return self.stage_buffer_write(buffer, offset, data)
     }
 
     // Copy bytes of `buffer` from `offset` into `out`, after waiting for
-    // every submission made so far. Needs BUFFER_COPY_SRC; fails with
-    // InvalidInput when the range does not fit.
+    // every submission made so far that uses it. Needs BUFFER_COPY_SRC;
+    // fails with InvalidInput when the range does not fit.
     pub fn read_buffer(&self, buffer: &Buffer, offset: u64, out: &mut[u8]) -> void!Error {
         self.check_owner(buffer.device)
         if (buffer.usage & hal.BUFFER_COPY_SRC) == 0 || !fits(offset, out.len as u64, buffer.size) {
@@ -708,12 +658,12 @@ pub struct Device {
             return ok()
         }
         if !self.staged {
-            return self.raw_read_buffer(&buffer.handle, offset, out)
+            return self.backend().read_buffer(&buffer.handle, offset, out)
         }
-        self.finish()?
-        address := self.raw_mapped(&buffer.handle)
+        address := self.backend().mapped(&buffer.handle)
         if address != 0 {
-            self.raw_invalidate(&buffer.handle, offset, out.len as u64)
+            self.settle(buffer)?
+            self.backend().invalidate(&buffer.handle, offset, out.len as u64)
             unsafe {
                 ptr.copy_nonoverlapping((address + offset as usize) as *const u8, ptr.as_mut_ptr(out), out.len)
             }
@@ -723,14 +673,40 @@ pub struct Device {
         start := offset & ~3u64
         end := (offset + out.len as u64 + 3) & ~3u64
         readback := self.readback(end - start)?
-        encoder := self.raw_begin_encoder()?
-        self.raw_copy_buffer(&mut encoder, &buffer.handle, start, &readback, 0, end - start)
+        encoder := self.backend().begin_encoder()?
+        self.backend().copy_buffer(&mut encoder, &buffer.handle, start, &readback, 0, end - start)
         self.run_readback(&mut encoder, &readback, end - start)?
         unsafe {
-            source := (*self.uploads()).readback_address + (offset - start) as usize
+            source := self.uploads.read().readback_address + (offset - start) as usize
             ptr.copy_nonoverlapping(source as *const u8, ptr.as_mut_ptr(out), out.len)
         }
         return ok()
+    }
+
+    // Start copying `size` bytes of `buffer` from `offset` back to the CPU
+    // without waiting for the GPU: collect them with Readback.read() once
+    // ready() says so (or earlier, which waits). The copy is ordered like
+    // a submission made now. Needs BUFFER_COPY_SRC; fails with
+    // InvalidInput when the range does not fit or is empty.
+    pub fn start_read_buffer(&self, buffer: &Buffer, offset: u64, size: u64) -> Readback!Error from(self) {
+        self.check_owner(buffer.device)
+        if (buffer.usage & hal.BUFFER_COPY_SRC) == 0 || size == 0 || !fits(offset, size, buffer.size) {
+            return err(Error.InvalidInput)
+        }
+        start := offset & ~3u64
+        end := (offset + size + 3) & ~3u64
+        readback := self.start_readback(end - start, offset - start, size)?
+        if !self.staged {
+            out := readback.host_bytes()
+            self.backend().read_buffer(&buffer.handle, offset, out)?
+            return ok(readback)
+        }
+        encoder := self.encoder()?
+        self.note_use(buffer, encoder.serial)
+        copy_hazards(self, &mut encoder.hazards, &mut encoder.handle, buffer.handle.a, readback.buffer.a)
+        self.backend().copy_buffer(&mut encoder.handle, &buffer.handle, start, &readback.buffer, 0, end - start)
+        readback.index = encoder.submit_numbered()?
+        return ok(readback)
     }
 
     // A two-dimensional texture. Fails with InvalidInput for a zero size,
@@ -767,21 +743,16 @@ pub struct Device {
         if descriptor.samples != 1 && (descriptor.samples != hal.MULTISAMPLE_COUNT || descriptor.mip_levels != 1 || usage != hal.TEXTURE_RENDER || hal.is_integer(format)) {
             return err(Error.InvalidInput)
         }
-        handle := self.raw_create_texture(&descriptor)?
+        handle := self.backend().create_texture(&descriptor)?
+        texture := Texture { device: self, handle: handle, descriptor: descriptor, external: false }
+        // A failure drops the texture.
         if self.staged {
-            match self.upload_encoder() {
-                ok(encoder) => {
-                    self.use_uploaded(&mut encoder, handle.a ^ TEXTURE_KEY, hal.USE_COPY_DST)
-                    self.raw_initialize_texture(&mut encoder, &handle, &descriptor)
-                    self.upload_done(&encoder)
-                }
-                err(error) => {
-                    self.raw_destroy(hal.OBJECT_TEXTURE, &handle)
-                    return err(error)
-                }
-            }
+            encoder := self.upload_encoder()?
+            self.use_uploaded(&mut encoder, texture.handle.a ^ TEXTURE_KEY, hal.USE_COPY_DST)
+            self.backend().initialize_texture(&mut encoder, &texture.handle, &texture.descriptor)
+            self.upload_done(&encoder)
         }
-        return ok(Texture { device: self, handle: handle, descriptor: descriptor, external: false })
+        return ok(texture)
     }
 
     // Copy texels from `data` into `region` of `texture`, rows
@@ -798,14 +769,14 @@ pub struct Device {
             return ok()
         }
         if !self.staged {
-            return self.raw_write_texture(&texture.handle, &texture.descriptor, &region, data, bytes_per_row)
+            return self.backend().write_texture(&texture.handle, &texture.descriptor, &region, data, bytes_per_row)
         }
         size := copy_size(&texture.descriptor, &region, bytes_per_row)
         staging := self.stage(&data[..size as usize])?
         encoder := self.upload_encoder()?
         self.use_uploaded(&mut encoder, staging.buffer.a, hal.USE_COPY_SRC)
         self.use_uploaded(&mut encoder, texture.handle.a ^ TEXTURE_KEY, hal.USE_COPY_DST)
-        self.raw_copy_buffer_to_texture(&mut encoder, &staging.buffer, staging.offset, bytes_per_row, &texture.handle, &texture.descriptor, &region)
+        self.backend().copy_buffer_to_texture(&mut encoder, &staging.buffer, staging.offset, bytes_per_row, &texture.handle, &texture.descriptor, &region)
         self.upload_done(&encoder)
         self.unstage(&staging)
         return ok()
@@ -823,18 +794,40 @@ pub struct Device {
             return ok()
         }
         if !self.staged {
-            return self.raw_read_texture(&texture.handle, &texture.descriptor, &region, out, bytes_per_row)
+            return self.backend().read_texture(&texture.handle, &texture.descriptor, &region, out, bytes_per_row)
         }
-        self.finish()?
         size := copy_size(&texture.descriptor, &region, bytes_per_row)
         readback := self.readback(size)?
-        encoder := self.raw_begin_encoder()?
-        self.raw_copy_texture_to_buffer(&mut encoder, &texture.handle, &texture.descriptor, &region, &readback, 0, bytes_per_row)
+        encoder := self.backend().begin_encoder()?
+        self.backend().copy_texture_to_buffer(&mut encoder, &texture.handle, &texture.descriptor, &region, &readback, 0, bytes_per_row)
         self.run_readback(&mut encoder, &readback, size)?
         unsafe {
-            ptr.copy_nonoverlapping((*self.uploads()).readback_address as *const u8, ptr.as_mut_ptr(out), size as usize)
+            ptr.copy_nonoverlapping(self.uploads.read().readback_address as *const u8, ptr.as_mut_ptr(out), size as usize)
         }
         return ok()
+    }
+
+    // Start copying texels of `region` back to the CPU, rows
+    // `bytes_per_row` apart, without waiting for the GPU, as
+    // start_read_buffer does. Needs TEXTURE_COPY_SRC; fails with
+    // InvalidInput like read_texture, and for an empty region.
+    pub fn start_read_texture(&self, texture: &Texture, region: Region, bytes_per_row: u32) -> Readback!Error from(self) {
+        self.check_owner(texture.device)
+        if (texture.descriptor.usage & hal.TEXTURE_COPY_SRC) == 0 || region.width == 0 || region.height == 0 || !texture_copy_fits(&texture.descriptor, &region, 0xffffffffffffffff, 0, bytes_per_row) {
+            return err(Error.InvalidInput)
+        }
+        size := copy_size(&texture.descriptor, &region, bytes_per_row)
+        readback := self.start_readback(size, 0, size)?
+        if !self.staged {
+            out := readback.host_bytes()
+            self.backend().read_texture(&texture.handle, &texture.descriptor, &region, out, bytes_per_row)?
+            return ok(readback)
+        }
+        encoder := self.encoder()?
+        copy_hazards(self, &mut encoder.hazards, &mut encoder.handle, texture.handle.a ^ TEXTURE_KEY, readback.buffer.a)
+        self.backend().copy_texture_to_buffer(&mut encoder.handle, &texture.handle, &texture.descriptor, &region, &readback.buffer, 0, bytes_per_row)
+        readback.index = encoder.submit_numbered()?
+        return ok(readback)
     }
 
     // A sampler. Fails with InvalidInput for an unknown filter, address
@@ -860,7 +853,7 @@ pub struct Device {
         if anisotropy > 1 && (descriptor.mag_filter != hal.FILTER_LINEAR || descriptor.min_filter != hal.FILTER_LINEAR || descriptor.mipmap_filter != hal.FILTER_LINEAR) {
             return err(Error.InvalidInput)
         }
-        handle := self.raw_create_sampler(&descriptor)?
+        handle := self.backend().create_sampler(&descriptor)?
         return ok(Sampler { device: self, handle: handle, compare: descriptor.compare != hal.COMPARE_NONE })
     }
 
@@ -888,7 +881,7 @@ pub struct Device {
         pipeline.workgroup_size_x = x
         pipeline.workgroup_size_y = y
         pipeline.workgroup_size_z = z
-        pipeline.handle = self.raw_create_compute_pipeline(&descriptor)?
+        pipeline.handle = self.backend().create_compute_pipeline(&descriptor)?
         return ok(ComputePipeline { device: self, pipeline: pipeline })
     }
 
@@ -1036,25 +1029,29 @@ pub struct Device {
         pipeline.topology = descriptor.topology
         pipeline.depth_format = descriptor.depth_format
         pipeline.samples = samples
-        pipeline.handle = self.raw_create_render_pipeline(&normalized)?
+        pipeline.handle = self.backend().create_render_pipeline(&normalized)?
         return ok(RenderPipeline { device: self, pipeline: pipeline })
     }
 
+
     // Start recording commands.
     pub fn encoder(&self) -> CommandEncoder!Error from(self) {
-        self.collect(false)
-        handle := self.raw_begin_encoder()?
-        unsafe {
-            (*self.life()).open_encoders += 1
-        }
-        return ok(CommandEncoder { device: self, handle: handle, open: true, hazards: Hazards.new(self.tracks) })
+        self.collect()
+        handle := self.backend().begin_encoder()?
+        serial := self.begin_serial()
+        tracks := self.tracks
+        hazards := self.life.update(fn(life) {
+            life.open_encoders += 1
+            mem.replace(&mut life.spare, Hazards.new(tracks))
+        })
+        return ok(CommandEncoder { device: self, handle: handle, open: true, hazards: hazards, serial: serial })
     }
 
     // Wait until the GPU has finished everything submitted so far,
     // including writes not yet followed by a submission.
     pub fn wait(&self) -> void!Error {
         self.finish()?
-        self.collect(false)
+        self.collect()
         return ok()
     }
 
@@ -1063,27 +1060,30 @@ pub struct Device {
     // too; call it in programs that drop objects and then submit nothing
     // for a while.
     pub fn poll(&self) {
-        match self.flush() {
-            ok() => {}
-            err(_) => {}
-        }
-        self.collect(false)
+        hal.ignore(self.flush())
+        self.collect()
     }
 
-    fn uploads(&self) -> *mut Uploads {
-        unsafe {
-            return ptr.from_ref(&self.uploads) as *mut Uploads
+    fn backend(&self) -> &dyn hal.Backend from(self) {
+        match &self.raw {
+            Raw.Vulkan(raw) => {
+                return raw
+            }
+            Raw.Native(raw) => {
+                return raw
+            }
+            Raw.OpenGl(raw) => {
+                return raw
+            }
         }
     }
 
     // Submit staged writes, then wait for every submission.
     fn finish(&self) -> void!Error {
         self.flush()?
-        submitted := unsafe {
-            (*self.life()).submitted
-        }
+        submitted := self.life.read().submitted
         if submitted != 0 {
-            self.raw_wait(submitted)?
+            self.backend().wait(submitted)?
         }
         return ok()
     }
@@ -1091,101 +1091,129 @@ pub struct Device {
     // The upload encoder, begun if it is not recording. Record into the
     // copy, then store it back with upload_done.
     fn upload_encoder(&self) -> hal.Handle!Error {
-        uploads := self.uploads()
-        unsafe {
-            if !(*uploads).open {
-                encoder := self.raw_begin_encoder()?
-                set_handle(UPLOAD_ENCODER, uploads, &encoder)
-                (*uploads).open = true
-                (*self.life()).open_encoders += 1
-                return ok(encoder)
-            }
+        if self.uploads.read().open {
+            return ok(self.uploads.read().encoder.copy())
         }
-        return ok(get_handle(UPLOAD_ENCODER, uploads))
+        encoder := self.backend().begin_encoder()?
+        serial := self.begin_serial()
+        self.uploads.update(fn(uploads) {
+            uploads.encoder = encoder.copy()
+            uploads.serial = serial
+            uploads.open = true
+        })
+        self.life.update(fn(life) {
+            life.open_encoders += 1
+        })
+        return ok(encoder)
     }
 
     fn upload_done(&self, encoder: &hal.Handle) {
-        set_handle(UPLOAD_ENCODER, self.uploads(), encoder)
+        self.uploads.update(fn(uploads) {
+            uploads.encoder = encoder.copy()
+        })
     }
 
     // Record a use by the upload encoder, with the barrier it needs.
     fn use_uploaded(&self, encoder: &mut hal.Handle, key: u64, usage: u32) {
-        uploads := self.uploads()
         before := 0u32
         after := 0u32
-        hazards := take_hazards(uploads)
-        hazards.use_resource(key, usage, (usage & hal.USE_WRITES) != 0, &mut before, &mut after)
-        put_hazards(uploads, &hazards)
+        self.uploads.update(fn(uploads) {
+            uploads.hazards.use_resource(key, usage, (usage & hal.USE_WRITES) != 0, &mut before, &mut after)
+        })
         if before != 0 {
-            self.raw_barrier(encoder, before, after)
+            self.backend().barrier(encoder, before, after)
         }
     }
 
     // Submit the upload encoder, if it recorded anything.
     fn flush(&self) -> void!Error {
-        uploads := self.uploads()
-        open := unsafe {
-            (*uploads).open
-        }
-        if !open {
+        if !self.uploads.read().open {
             return ok()
         }
-        encoder := get_handle(UPLOAD_ENCODER, uploads)
-        hazards := take_hazards(uploads)
-        hazards.clear()
-        put_hazards(uploads, &hazards)
-        unsafe {
-            (*uploads).open = false
-        }
-        index := match self.raw_submit(&mut encoder) {
-            ok(index) => index,
+        uploads := self.take_uploads()
+        nothing := hal.Handle.null()
+        match self.backend().submit(&mut nothing, &mut uploads) {
+            ok(index) => {
+                self.uploads_submitted(&uploads, index)
+                return ok()
+            }
             err(error) => {
-                self.raw_destroy(hal.OBJECT_ENCODER, &encoder)
-                self.close_encoder(0)
+                self.uploads_failed(&uploads)
                 return err(error)
             }
         }
-        unsafe {
-            // Room for the mark: forget the oldest after waiting for it.
-            if (*uploads).marks == MARKS {
-                match self.raw_wait((*uploads).mark_index[0]) {
-                    ok() => {}
-                    err(_) => {}
-                }
-                self.reclaim()
+    }
+
+    // Submit `encoder` with the upload encoder's commands, if it recorded
+    // any, running first in the same submission.
+    fn submit_encoder(&self, encoder: &mut hal.Handle) -> u64!Error {
+        if !self.uploads.read().open {
+            nothing := hal.Handle.null()
+            return self.backend().submit(&mut nothing, encoder)
+        }
+        uploads := self.take_uploads()
+        match self.backend().submit(&mut uploads, encoder) {
+            ok(index) => {
+                self.uploads_submitted(&uploads, index)
+                return ok(index)
             }
-            if (*uploads).marks < MARKS {
-                (*uploads).mark_index[(*uploads).marks] = index
-                (*uploads).mark_end[(*uploads).marks] = (*uploads).head
-                (*uploads).marks += 1
+            err(error) => {
+                self.uploads_failed(&uploads)
+                return err(error)
             }
         }
+    }
+
+    // Stop recording uploads, for submitting what was recorded.
+    fn take_uploads(&self) -> hal.Handle {
+        return self.uploads.update(fn(uploads) {
+            uploads.open = false
+            uploads.hazards.clear()
+            uploads.encoder.copy()
+        })
+    }
+
+    fn uploads_submitted(&self, encoder: &hal.Handle, index: u64) {
+        serial := self.uploads.read().serial
+        self.uploads.update(fn(uploads) {
+            mark := Mark { index: index, end: uploads.head }
+            uploads.marks.push(mark)
+        })
+        self.end_serial(serial, index)
         self.close_encoder(index)
-        self.bury(hal.OBJECT_ENCODER, &encoder, index)
-        return ok()
+        self.dispose_encoder(encoder, index)
+    }
+
+    fn uploads_failed(&self, encoder: &hal.Handle) {
+        self.end_serial(self.uploads.read().serial, 0)
+        self.backend().destroy(hal.OBJECT_ENCODER, encoder)
+        self.close_encoder(0)
     }
 
     // Free the ring space of finished uploads.
     fn reclaim(&self) {
-        uploads := self.uploads()
-        completed := self.raw_completed()
-        unsafe {
+        completed := self.backend().completed()
+        self.uploads.update(fn(uploads) {
             kept := 0usize
-            for i in 0usize..(*uploads).marks {
-                if (*uploads).mark_index[i] <= completed {
-                    (*uploads).tail = (*uploads).mark_end[i]
+            for i in 0usize..uploads.marks.len() {
+                index := uploads.marks.get(i).index
+                end := uploads.marks.get(i).end
+                if index <= completed {
+                    // Merged submissions can finish out of position order.
+                    if end > uploads.tail {
+                        uploads.tail = end
+                    }
                 } else {
-                    (*uploads).mark_index[kept] = (*uploads).mark_index[i]
-                    (*uploads).mark_end[kept] = (*uploads).mark_end[i]
+                    uploads.marks.set(kept, Mark { index: index, end: end })
                     kept += 1
                 }
             }
-            (*uploads).marks = kept
+            uploads.marks.truncate(kept)
             // Nothing submitted or recording uses the ring.
-            if kept == 0 && !(*uploads).open {
-                (*uploads).tail = (*uploads).head
+            if kept == 0 && !uploads.open {
+                uploads.tail = uploads.head
             }
-        }
+        })
     }
 
     // Copy `data` into staging memory for the upload encoder.
@@ -1209,41 +1237,44 @@ pub struct Device {
     // in a buffer of its own.
     fn staging_space(&self, size: u64) -> Staging!Error {
         if size > RING_MAX / 4 {
-            buffer := self.raw_create_buffer((size + 3) & ~3u64, hal.BUFFER_UPLOAD)?
-            address := self.raw_mapped(&buffer)
+            buffer := self.backend().create_buffer((size + 3) & ~3u64, hal.BUFFER_UPLOAD)?
+            address := self.backend().mapped(&buffer)
             return ok(Staging { buffer: buffer, offset: 0, address: address, dedicated: true })
         }
-        uploads := self.uploads()
         for {
             self.reclaim()
-            ring_size := unsafe {
-                (*uploads).ring_size
-            }
-            if ring_size != 0 {
-                unsafe {
-                    start := ((*uploads).head + RING_ALIGNMENT - 1) & ~(RING_ALIGNMENT - 1)
-                    position := start % ring_size
-                    // Allocations never wrap around the end of the ring.
-                    if position + size > ring_size {
-                        start += ring_size - position
-                    }
-                    if start + size - (*uploads).tail <= ring_size {
-                        (*uploads).head = start + size
-                        offset := start % ring_size
-                        return ok(Staging { buffer: get_handle(UPLOAD_RING, uploads), offset: offset, address: (*uploads).ring_address + offset as usize, dedicated: false })
-                    }
+            space := self.uploads.update(fn(uploads) {
+                ring_size := uploads.ring_size
+                if ring_size == 0 {
+                    return none
                 }
+                start := (uploads.head + RING_ALIGNMENT - 1) & ~(RING_ALIGNMENT - 1)
+                position := start % ring_size
+                // Allocations never wrap around the end of the ring.
+                if position + size > ring_size {
+                    start += ring_size - position
+                }
+                if start + size - uploads.tail > ring_size {
+                    return none
+                }
+                uploads.head = start + size
+                offset := start % ring_size
+                return some(Staging { buffer: uploads.ring.copy(), offset: offset, address: uploads.ring_address + offset as usize, dedicated: false })
+            })
+            match space {
+                some(staging) => {
+                    return ok(staging)
+                }
+                none => {}
             }
-            if ring_size < RING_MAX {
+            if self.uploads.read().ring_size < RING_MAX {
                 self.grow_ring(size)?
             } else {
                 // The ring is as large as it gets: wait for the oldest
                 // upload still using it.
                 self.flush()?
-                oldest := unsafe {
-                    (*uploads).mark_index[0]
-                }
-                self.raw_wait(oldest)?
+                oldest := self.uploads.read().marks.get(0).index
+                self.backend().wait(oldest)?
             }
         }
     }
@@ -1251,10 +1282,7 @@ pub struct Device {
     // Replace the ring with one at least twice as large and four times
     // `size`; the old one is retired once the GPU is done with it.
     fn grow_ring(&self, size: u64) -> void!Error {
-        uploads := self.uploads()
-        old_size := unsafe {
-            (*uploads).ring_size
-        }
+        old_size := self.uploads.read().ring_size
         new_size := RING_START
         if old_size * 2 > new_size {
             new_size = old_size * 2
@@ -1265,30 +1293,31 @@ pub struct Device {
         if new_size > RING_MAX {
             new_size = RING_MAX
         }
-        ring := self.raw_create_buffer(new_size, hal.BUFFER_UPLOAD)?
-        address := self.raw_mapped(&ring)
+        ring := self.backend().create_buffer(new_size, hal.BUFFER_UPLOAD)?
+        address := self.backend().mapped(&ring)
         if old_size != 0 {
-            old := get_handle(UPLOAD_RING, uploads)
+            old := self.uploads.read().ring.copy()
             self.retire(hal.OBJECT_BUFFER, &old)
         }
-        set_handle(UPLOAD_RING, uploads, &ring)
-        unsafe {
-            (*uploads).ring_size = new_size
-            (*uploads).ring_address = address
-            (*uploads).head = 0
-            (*uploads).tail = 0
-            (*uploads).marks = 0
-        }
+        self.uploads.update(fn(uploads) {
+            uploads.ring = ring.copy()
+            uploads.ring_size = new_size
+            uploads.ring_address = address
+            uploads.head = 0
+            uploads.tail = 0
+            uploads.marks.truncate(0)
+        })
         return ok()
     }
 
-    fn stage_buffer_write(&self, buffer: &hal.Handle, offset: u64, data: &[u8]) -> void!Error {
+    fn stage_buffer_write(&self, buffer: &Buffer, offset: u64, data: &[u8]) -> void!Error {
         staging := self.stage(data)?
         encoder := self.upload_encoder()?
         self.use_uploaded(&mut encoder, staging.buffer.a, hal.USE_COPY_SRC)
-        self.use_uploaded(&mut encoder, buffer.a, hal.USE_COPY_DST)
-        self.raw_copy_buffer(&mut encoder, &staging.buffer, staging.offset, buffer, offset, data.len as u64)
+        self.use_uploaded(&mut encoder, buffer.handle.a, hal.USE_COPY_DST)
+        self.backend().copy_buffer(&mut encoder, &staging.buffer, staging.offset, &buffer.handle, offset, data.len as u64)
         self.upload_done(&encoder)
+        self.note_use(buffer, self.uploads.read().serial)
         self.unstage(&staging)
         return ok()
     }
@@ -1296,59 +1325,68 @@ pub struct Device {
     // The readback buffer, with room for `size` bytes. It is only used
     // while a read waits for it, so replacing it needs no care.
     fn readback(&self, size: u64) -> hal.Handle!Error {
-        uploads := self.uploads()
-        current := get_handle(UPLOAD_READBACK, uploads)
-        if unsafe {
-            (*uploads).readback_size
-        } >= size {
-            return ok(current)
+        if self.uploads.read().readback_size >= size {
+            return ok(self.uploads.read().readback.copy())
         }
-        unsafe {
-            if (*uploads).readback_size != 0 {
-                self.raw_destroy(hal.OBJECT_BUFFER, &current)
-                (*uploads).readback_size = 0
-            }
+        if self.uploads.read().readback_size != 0 {
+            current := self.uploads.read().readback.copy()
+            self.backend().destroy(hal.OBJECT_BUFFER, &current)
+            self.uploads.update(fn(uploads) {
+                uploads.readback_size = 0
+            })
         }
         rounded := (size + 65535) & ~65535u64
-        readback := self.raw_create_buffer(rounded, hal.BUFFER_READBACK)?
-        address := self.raw_mapped(&readback)
-        set_handle(UPLOAD_READBACK, uploads, &readback)
-        unsafe {
-            (*uploads).readback_size = rounded
-            (*uploads).readback_address = address
-        }
+        readback := self.backend().create_buffer(rounded, hal.BUFFER_READBACK)?
+        address := self.backend().mapped(&readback)
+        self.uploads.update(fn(uploads) {
+            uploads.readback = readback.copy()
+            uploads.readback_size = rounded
+            uploads.readback_address = address
+        })
         return ok(readback)
     }
 
-    // Submit a readback encoder, wait for it and make its writes visible.
+    // Submit a readback encoder after the staged writes, wait for it and
+    // make its writes visible.
     fn run_readback(&self, encoder: &mut hal.Handle, readback: &hal.Handle, size: u64) -> void!Error {
-        index := match self.raw_submit(encoder) {
+        index := match self.submit_encoder(encoder) {
             ok(index) => index,
             err(error) => {
-                self.raw_destroy(hal.OBJECT_ENCODER, encoder)
+                self.backend().destroy(hal.OBJECT_ENCODER, encoder)
                 return err(error)
             }
         }
         self.note_submission(index)
-        result := self.raw_wait(index)
-        self.raw_destroy(hal.OBJECT_ENCODER, encoder)
+        result := self.backend().wait(index)
+        self.backend().destroy(hal.OBJECT_ENCODER, encoder)
         result?
-        self.raw_invalidate(readback, 0, size)
+        self.backend().invalidate(readback, 0, size)
         return ok()
+    }
+
+    // A Readback of `size` bytes, `skip` bytes into a copy of `copied`:
+    // a readback buffer on staged backends, CPU memory on the others.
+    fn start_readback(&self, copied: u64, skip: u64, size: u64) -> Readback!Error {
+        if !self.staged {
+            host := unsafe {
+                malloc(size as usize) as usize
+            }
+            if host == 0 {
+                return err(Error.OutOfMemory)
+            }
+            return ok(Readback { device: self, buffer: hal.Handle.null(), address: host, skip: 0, size: size, index: 0 })
+        }
+        buffer := self.backend().create_buffer(copied, hal.BUFFER_READBACK)?
+        address := self.backend().mapped(&buffer)
+        return ok(Readback { device: self, buffer: buffer, address: address, skip: skip, size: size, index: 0 })
     }
 
     // The backend made submission `index` outside any encoder.
     fn note_submission(&self, index: u64) {
         if index != 0 {
-            unsafe {
-                (*self.life()).submitted = index
-            }
-        }
-    }
-
-    fn life(&self) -> *mut Life {
-        unsafe {
-            return ptr.from_ref(&self.life) as *mut Life
+            self.life.update(fn(life) {
+                life.submitted = index
+            })
         }
     }
 
@@ -1368,18 +1406,160 @@ pub struct Device {
         return ok()
     }
 
+    // Encoder serials.
+
+    fn begin_serial(&self) -> u64 {
+        return self.life.update(fn(life) {
+            life.serial += 1
+            slot := (life.serial % SERIALS as u64) as usize
+            life.serials[slot] = life.serial
+            life.outcomes[slot] = RECORDING
+            life.serial
+        })
+    }
+
+    // Encoder `serial` was submitted as submission `index`, or abandoned (0).
+    fn end_serial(&self, serial: u64, index: u64) {
+        self.life.update(fn(life) {
+            slot := (serial % SERIALS as u64) as usize
+            if life.serials[slot] == serial {
+                life.outcomes[slot] = index
+            }
+        })
+    }
+
+    // What became of encoder `serial`: RECORDING, FORGOTTEN, abandoned (0)
+    // or the number of its submission.
+    fn outcome(&self, serial: u64) -> u64 {
+        life := self.life.read()
+        slot := (serial % SERIALS as u64) as usize
+        if life.serials[slot] != serial {
+            return FORGOTTEN
+        }
+        return life.outcomes[slot]
+    }
+
+    // Per-buffer use tracking: which submissions may still use a buffer,
+    // so that mapped buffers can be written and read directly when no
+    // submission uses them.
+
+    // Encoder `serial` records a use of `buffer`. Runs at every binding,
+    // so it touches the buffer's record directly.
+    fn note_use(&self, buffer: &Buffer, serial: u64) {
+        unsafe {
+            uses := buffer.uses.get()
+            if (*uses).serial == serial {
+                return
+            }
+            if (*uses).older != 0 && self.fold((*uses).older, uses) {
+                (*uses).older = 0
+            }
+            previous := (*uses).serial
+            if previous != 0 && !self.fold(previous, uses) {
+                // Still recording: keep it, or give up on knowing.
+                if (*uses).older == 0 {
+                    (*uses).older = previous
+                } else {
+                    (*uses).shared = true
+                }
+            }
+            (*uses).serial = serial
+        }
+    }
+
+    // Count the submission of encoder `serial` into `busy`; false while the
+    // encoder is still recording.
+    fn fold(&self, serial: u64, uses: *mut BufferUse) -> bool {
+        outcome := self.outcome(serial)
+        if outcome == RECORDING {
+            return false
+        }
+        if outcome == FORGOTTEN {
+            outcome = self.life.read().submitted
+        }
+        unsafe {
+            if outcome > (*uses).busy {
+                (*uses).busy = outcome
+            }
+        }
+        return true
+    }
+
+    // The submission after which no submitted work uses `buffer` (0: none
+    // does), or UPLOADING when the upload encoder writes it. Encoders still
+    // recording do not count: they run after anything the CPU does now.
+    fn needed_by(&self, buffer: &Buffer) -> u64 {
+        uploads := self.uploads.read()
+        uploading := if uploads.open {
+            uploads.serial
+        } else {
+            0
+        }
+        life := self.life.read()
+        uses := unsafe {
+            buffer.uses.get()
+        }
+        needed := 0u64
+        unsafe {
+            if (*uses).shared {
+                if life.open_encoders == 0 {
+                    // Every use is part of a submission by now.
+                    if life.submitted > (*uses).busy {
+                        (*uses).busy = life.submitted
+                    }
+                    (*uses).shared = false
+                } else {
+                    if uploading != 0 {
+                        return UPLOADING
+                    }
+                    needed = life.submitted
+                }
+            }
+            if (*uses).serial == uploading && uploading != 0 || (*uses).older == uploading && uploading != 0 {
+                return UPLOADING
+            }
+            if (*uses).older != 0 && self.fold((*uses).older, uses) {
+                (*uses).older = 0
+            }
+            if (*uses).serial != 0 {
+                self.fold((*uses).serial, uses)
+            }
+            if (*uses).busy > needed {
+                needed = (*uses).busy
+            }
+        }
+        return needed
+    }
+
+    // Whether the CPU may access a mapped buffer now.
+    fn buffer_idle(&self, buffer: &Buffer) -> bool {
+        needed := self.needed_by(buffer)
+        return needed == 0 || (needed != UPLOADING && self.backend().completed() >= needed)
+    }
+
+    // Wait until the CPU may access a mapped buffer.
+    fn settle(&self, buffer: &Buffer) -> void!Error {
+        needed := self.needed_by(buffer)
+        if needed == UPLOADING {
+            self.flush()?
+            needed = self.needed_by(buffer)
+        }
+        if needed != 0 {
+            self.backend().wait(needed)?
+        }
+        return ok()
+    }
+
+    // Object lifetimes.
+
     // An object was dropped: destroy it now if the GPU cannot be using it,
     // otherwise once it has finished.
     fn retire(&self, object: u32, handle: &hal.Handle) {
-        life := self.life()
-        open := unsafe {
-            (*life).open_encoders
-        }
-        submitted := unsafe {
-            (*life).submitted
-        }
-        if open == 0 && (submitted == 0 || self.raw_completed() >= submitted) {
-            self.raw_destroy(object, handle)
+        life := self.life.read()
+        open := life.open_encoders
+        submitted := life.submitted
+        if open == 0 && (!self.tracks || submitted == 0 || self.backend().completed() >= submitted) {
+            self.backend().destroy(object, handle)
             return
         }
         wait := submitted
@@ -1390,680 +1570,111 @@ pub struct Device {
     }
 
     fn bury(&self, object: u32, handle: &hal.Handle, wait: u64) {
-        life := self.life()
-        if unsafe {
-            (*life).count
-        } == GRAVEYARD {
-            // Staged writes keep the graveyard's objects pending: start them
-            // so that waiting can free some.
-            match self.flush() {
-                ok() => {}
-                err(_) => {}
-            }
-            self.collect(true)
-        }
-        unsafe {
-            index := (*life).count
-            (*life).object[index] = object
-            (*life).a[index] = handle.a
-            (*life).b[index] = handle.b
-            (*life).c[index] = handle.c
-            (*life).d[index] = handle.d
-            (*life).wait[index] = wait
-            (*life).count = index + 1
+        grave := Grave { object: object, handle: handle.copy(), wait: wait }
+        self.life.update(fn(life) {
+            life.graves.push(grave)
+        })
+    }
+
+    // A submitted (`index` > 0) or abandoned encoder is no longer needed
+    // once its submission has finished, or at once where the API keeps it.
+    fn dispose_encoder(&self, encoder: &hal.Handle, index: u64) {
+        if self.tracks && index != 0 {
+            self.bury(hal.OBJECT_ENCODER, encoder, index)
+        } else {
+            self.backend().destroy(hal.OBJECT_ENCODER, encoder)
         }
     }
 
-    // Destroy the objects whose submissions have finished. With `block`,
-    // wait for the GPU to make room when nothing can be destroyed yet.
-    fn collect(&self, block: bool) {
-        life := self.life()
-        if unsafe {
-            (*life).count
-        } == 0 {
+    // Destroy the objects whose submissions have finished.
+    fn collect(&self) {
+        if self.life.read().graves.len() == 0 {
             return
         }
-        completed := self.raw_completed()
-        if block {
-            // Objects of submitted work can be waited for even while
-            // encoders are open; those of open encoders stay.
-            submitted := unsafe {
-                (*life).submitted
-            }
-            if completed < submitted {
-                // A failed wait means the device is lost: destroying is
-                // then safe anyway.
-                match self.raw_wait(submitted) {
-                    ok() => {}
-                    err(_) => {}
+        // Without tracking, the API keeps what submitted work uses alive.
+        completed := PENDING - 1
+        if self.tracks {
+            completed = self.backend().completed()
+        }
+        backend := self.backend()
+        self.life.update(fn(life) {
+            kept := 0usize
+            for i in 0usize..life.graves.len() {
+                wait := life.graves.get(i).wait
+                if wait != PENDING && wait <= completed {
+                    grave := life.graves.get(i)
+                    backend.destroy(grave.object, &grave.handle)
+                } else {
+                    life.graves.copy_within(i, kept)
+                    kept += 1
                 }
             }
-            completed = submitted
-        }
-        kept := 0usize
-        count := unsafe {
-            (*life).count
-        }
-        for i in 0usize..count {
-            wait := unsafe {
-                (*life).wait[i]
-            }
-            handle := unsafe {
-                hal.Handle { a: (*life).a[i], b: (*life).b[i], c: (*life).c[i], d: (*life).d[i] }
-            }
-            object := unsafe {
-                (*life).object[i]
-            }
-            if wait != PENDING && wait <= completed {
-                self.raw_destroy(object, &handle)
-            } else {
-                unsafe {
-                    (*life).object[kept] = object
-                    (*life).a[kept] = handle.a
-                    (*life).b[kept] = handle.b
-                    (*life).c[kept] = handle.c
-                    (*life).d[kept] = handle.d
-                    (*life).wait[kept] = wait
-                }
-                kept += 1
-            }
-        }
-        unsafe {
-            (*life).count = kept
-        }
-        assert(!block || kept < GRAVEYARD, "too many std/gpu objects dropped while command encoders are open")
+            life.graves.truncate(kept)
+        })
     }
 
     // An encoder was submitted (`index` > 0) or abandoned (0).
     fn close_encoder(&self, index: u64) {
-        life := self.life()
-        unsafe {
+        self.life.update(fn(life) {
             if index != 0 {
-                (*life).submitted = index
+                life.submitted = index
             }
-            (*life).open_encoders -= 1
-            if (*life).open_encoders == 0 {
+            life.open_encoders -= 1
+            if life.open_encoders == 0 {
                 // Every encoder that may have used these has been
                 // submitted by now, or abandoned.
-                for i in 0usize..(*life).count {
-                    if (*life).wait[i] == PENDING {
-                        (*life).wait[i] = (*life).submitted
+                for i in 0usize..life.graves.len() {
+                    if life.graves.get(i).wait == PENDING {
+                        life.graves.get_mut(i).wait = life.submitted
                     }
                 }
             }
-        }
+        })
     }
 
-    // Dispatch to the backend.
-
-    fn raw_limits(&self) -> hal.Limits {
-        match &self.raw {
-            Raw.Vulkan(raw) => {
-                return raw.limits()
-            }
-            Raw.Native(raw) => {
-                return raw.limits()
-            }
-            Raw.OpenGl(raw) => {
-                return raw.limits()
-            }
-        }
-    }
-    fn raw_name(&self, out: &mut[u8]) -> usize {
-        match &self.raw {
-            Raw.Vulkan(raw) => {
-                return raw.name(out)
-            }
-            Raw.Native(raw) => {
-                return raw.name(out)
-            }
-            Raw.OpenGl(raw) => {
-                return raw.name(out)
-            }
-        }
-    }
-    fn raw_create_buffer(&self, size: u64, usage: u32) -> hal.Handle!Error {
-        match &self.raw {
-            Raw.Vulkan(raw) => {
-                return raw.create_buffer(size, usage)
-            }
-            Raw.Native(raw) => {
-                return raw.create_buffer(size, usage)
-            }
-            Raw.OpenGl(raw) => {
-                return raw.create_buffer(size, usage)
-            }
-        }
-    }
-    fn raw_write_buffer(&self, buffer: &hal.Handle, offset: u64, data: &[u8]) -> void!Error {
-        match &self.raw {
-            Raw.Vulkan(raw) => {
-                return raw.write_buffer(buffer, offset, data)
-            }
-            Raw.Native(raw) => {
-                return raw.write_buffer(buffer, offset, data)
-            }
-            Raw.OpenGl(raw) => {
-                return raw.write_buffer(buffer, offset, data)
-            }
-        }
-    }
-    fn raw_read_buffer(&self, buffer: &hal.Handle, offset: u64, out: &mut[u8]) -> void!Error {
-        match &self.raw {
-            Raw.Vulkan(raw) => {
-                return raw.read_buffer(buffer, offset, out)
-            }
-            Raw.Native(raw) => {
-                return raw.read_buffer(buffer, offset, out)
-            }
-            Raw.OpenGl(raw) => {
-                return raw.read_buffer(buffer, offset, out)
-            }
-        }
-    }
-    fn raw_create_texture(&self, descriptor: &TextureDescriptor) -> hal.Handle!Error {
-        match &self.raw {
-            Raw.Vulkan(raw) => {
-                return raw.create_texture(descriptor)
-            }
-            Raw.Native(raw) => {
-                return raw.create_texture(descriptor)
-            }
-            Raw.OpenGl(raw) => {
-                return raw.create_texture(descriptor)
-            }
-        }
-    }
-    fn raw_write_texture(&self, texture: &hal.Handle, descriptor: &TextureDescriptor, region: &Region, data: &[u8], bytes_per_row: u32) -> void!Error {
-        match &self.raw {
-            Raw.Vulkan(raw) => {
-                return raw.write_texture(texture, descriptor, region, data, bytes_per_row)
-            }
-            Raw.Native(raw) => {
-                return raw.write_texture(texture, descriptor, region, data, bytes_per_row)
-            }
-            Raw.OpenGl(raw) => {
-                return raw.write_texture(texture, descriptor, region, data, bytes_per_row)
-            }
-        }
-    }
-    fn raw_read_texture(&self, texture: &hal.Handle, descriptor: &TextureDescriptor, region: &Region, out: &mut[u8], bytes_per_row: u32) -> void!Error {
-        match &self.raw {
-            Raw.Vulkan(raw) => {
-                return raw.read_texture(texture, descriptor, region, out, bytes_per_row)
-            }
-            Raw.Native(raw) => {
-                return raw.read_texture(texture, descriptor, region, out, bytes_per_row)
-            }
-            Raw.OpenGl(raw) => {
-                return raw.read_texture(texture, descriptor, region, out, bytes_per_row)
-            }
-        }
-    }
-    fn raw_create_sampler(&self, descriptor: &SamplerDescriptor) -> hal.Handle!Error {
-        match &self.raw {
-            Raw.Vulkan(raw) => {
-                return raw.create_sampler(descriptor)
-            }
-            Raw.Native(raw) => {
-                return raw.create_sampler(descriptor)
-            }
-            Raw.OpenGl(raw) => {
-                return raw.create_sampler(descriptor)
-            }
-        }
-    }
-    fn raw_create_compute_pipeline(&self, descriptor: &ComputePipelineDescriptor) -> hal.Handle!Error {
-        match &self.raw {
-            Raw.Vulkan(raw) => {
-                return raw.create_compute_pipeline(descriptor)
-            }
-            Raw.Native(raw) => {
-                return raw.create_compute_pipeline(descriptor)
-            }
-            Raw.OpenGl(raw) => {
-                return raw.create_compute_pipeline(descriptor)
-            }
-        }
-    }
-    fn raw_create_render_pipeline(&self, descriptor: &RenderPipelineDescriptor) -> hal.Handle!Error {
-        match &self.raw {
-            Raw.Vulkan(raw) => {
-                return raw.create_render_pipeline(descriptor)
-            }
-            Raw.Native(raw) => {
-                return raw.create_render_pipeline(descriptor)
-            }
-            Raw.OpenGl(raw) => {
-                return raw.create_render_pipeline(descriptor)
-            }
-        }
-    }
-    fn raw_destroy(&self, object: u32, handle: &hal.Handle) {
-        match &self.raw {
-            Raw.Vulkan(raw) => {
-                raw.destroy(object, handle)
-            }
-            Raw.Native(raw) => {
-                raw.destroy(object, handle)
-            }
-            Raw.OpenGl(raw) => {
-                raw.destroy(object, handle)
-            }
-        }
-    }
-    fn raw_completed(&self) -> u64 {
-        match &self.raw {
-            Raw.Vulkan(raw) => {
-                return raw.completed()
-            }
-            Raw.Native(raw) => {
-                return raw.completed()
-            }
-            Raw.OpenGl(raw) => {
-                return raw.completed()
-            }
-        }
-    }
-    fn raw_wait(&self, index: u64) -> void!Error {
-        match &self.raw {
-            Raw.Vulkan(raw) => {
-                return raw.wait(index)
-            }
-            Raw.Native(raw) => {
-                return raw.wait(index)
-            }
-            Raw.OpenGl(raw) => {
-                return raw.wait(index)
-            }
-        }
-    }
-    fn raw_begin_encoder(&self) -> hal.Handle!Error {
-        match &self.raw {
-            Raw.Vulkan(raw) => {
-                return raw.begin_encoder()
-            }
-            Raw.Native(raw) => {
-                return raw.begin_encoder()
-            }
-            Raw.OpenGl(raw) => {
-                return raw.begin_encoder()
-            }
-        }
-    }
-    fn raw_submit(&self, encoder: &mut hal.Handle) -> u64!Error {
-        uploads := hal.Handle.null()
-        match &self.raw {
-            Raw.Vulkan(raw) => {
-                return raw.submit(&mut uploads, encoder)
-            }
-            Raw.Native(raw) => {
-                return raw.submit(&mut uploads, encoder)
-            }
-            Raw.OpenGl(raw) => {
-                return raw.submit(&mut uploads, encoder)
-            }
-        }
-    }
-    fn raw_begin_compute_pass(&self, encoder: &mut hal.Handle) {
-        match &self.raw {
-            Raw.Vulkan(raw) => {
-                raw.begin_compute_pass(encoder)
-            }
-            Raw.Native(raw) => {
-                raw.begin_compute_pass(encoder)
-            }
-            Raw.OpenGl(raw) => {
-                raw.begin_compute_pass(encoder)
-            }
-        }
-    }
-    fn raw_end_compute_pass(&self, encoder: &mut hal.Handle) {
-        match &self.raw {
-            Raw.Vulkan(raw) => {
-                raw.end_compute_pass(encoder)
-            }
-            Raw.Native(raw) => {
-                raw.end_compute_pass(encoder)
-            }
-            Raw.OpenGl(raw) => {
-                raw.end_compute_pass(encoder)
-            }
-        }
-    }
-    fn raw_begin_render_pass(&self, encoder: &mut hal.Handle, pass: &hal.RenderPassInfo) {
-        match &self.raw {
-            Raw.Vulkan(raw) => {
-                raw.begin_render_pass(encoder, pass)
-            }
-            Raw.Native(raw) => {
-                raw.begin_render_pass(encoder, pass)
-            }
-            Raw.OpenGl(raw) => {
-                raw.begin_render_pass(encoder, pass)
-            }
-        }
-    }
-    fn raw_end_render_pass(&self, encoder: &mut hal.Handle) {
-        match &self.raw {
-            Raw.Vulkan(raw) => {
-                raw.end_render_pass(encoder)
-            }
-            Raw.Native(raw) => {
-                raw.end_render_pass(encoder)
-            }
-            Raw.OpenGl(raw) => {
-                raw.end_render_pass(encoder)
-            }
-        }
-    }
-    fn raw_set_viewport(&self, encoder: &mut hal.Handle, x: f32, y: f32, width: f32, height: f32, min_depth: f32, max_depth: f32) {
-        match &self.raw {
-            Raw.Vulkan(raw) => {
-                raw.set_viewport(encoder, x, y, width, height, min_depth, max_depth)
-            }
-            Raw.Native(raw) => {
-                raw.set_viewport(encoder, x, y, width, height, min_depth, max_depth)
-            }
-            Raw.OpenGl(raw) => {
-                raw.set_viewport(encoder, x, y, width, height, min_depth, max_depth)
-            }
-        }
-    }
-    fn raw_set_scissor(&self, encoder: &mut hal.Handle, x: u32, y: u32, width: u32, height: u32) {
-        match &self.raw {
-            Raw.Vulkan(raw) => {
-                raw.set_scissor(encoder, x, y, width, height)
-            }
-            Raw.Native(raw) => {
-                raw.set_scissor(encoder, x, y, width, height)
-            }
-            Raw.OpenGl(raw) => {
-                raw.set_scissor(encoder, x, y, width, height)
-            }
-        }
-    }
-    fn raw_dispatch(&self, encoder: &mut hal.Handle, state: &mut hal.PassState, x: u32, y: u32, z: u32) {
-        match &self.raw {
-            Raw.Vulkan(raw) => {
-                raw.dispatch(encoder, state, x, y, z)
-            }
-            Raw.Native(raw) => {
-                raw.dispatch(encoder, state, x, y, z)
-            }
-            Raw.OpenGl(raw) => {
-                raw.dispatch(encoder, state, x, y, z)
-            }
-        }
-    }
-    fn raw_draw(&self, encoder: &mut hal.Handle, state: &mut hal.PassState, vertex_count: u32, instance_count: u32, first_vertex: u32, first_instance: u32) {
-        match &self.raw {
-            Raw.Vulkan(raw) => {
-                raw.draw(encoder, state, vertex_count, instance_count, first_vertex, first_instance)
-            }
-            Raw.Native(raw) => {
-                raw.draw(encoder, state, vertex_count, instance_count, first_vertex, first_instance)
-            }
-            Raw.OpenGl(raw) => {
-                raw.draw(encoder, state, vertex_count, instance_count, first_vertex, first_instance)
-            }
-        }
-    }
-    fn raw_draw_indexed(&self, encoder: &mut hal.Handle, state: &mut hal.PassState, index_count: u32, instance_count: u32, first_index: u32, base_vertex: i32, first_instance: u32) {
-        match &self.raw {
-            Raw.Vulkan(raw) => {
-                raw.draw_indexed(encoder, state, index_count, instance_count, first_index, base_vertex, first_instance)
-            }
-            Raw.Native(raw) => {
-                raw.draw_indexed(encoder, state, index_count, instance_count, first_index, base_vertex, first_instance)
-            }
-            Raw.OpenGl(raw) => {
-                raw.draw_indexed(encoder, state, index_count, instance_count, first_index, base_vertex, first_instance)
-            }
-        }
-    }
-    fn raw_copy_buffer(&self, encoder: &mut hal.Handle, source: &hal.Handle, source_offset: u64, destination: &hal.Handle, destination_offset: u64, size: u64) {
-        match &self.raw {
-            Raw.Vulkan(raw) => {
-                raw.copy_buffer(encoder, source, source_offset, destination, destination_offset, size)
-            }
-            Raw.Native(raw) => {
-                raw.copy_buffer(encoder, source, source_offset, destination, destination_offset, size)
-            }
-            Raw.OpenGl(raw) => {
-                raw.copy_buffer(encoder, source, source_offset, destination, destination_offset, size)
-            }
-        }
-    }
-    fn raw_copy_buffer_to_texture(&self, encoder: &mut hal.Handle, source: &hal.Handle, offset: u64, bytes_per_row: u32, destination: &hal.Handle, descriptor: &TextureDescriptor, region: &Region) {
-        match &self.raw {
-            Raw.Vulkan(raw) => {
-                raw.copy_buffer_to_texture(encoder, source, offset, bytes_per_row, destination, descriptor, region)
-            }
-            Raw.Native(raw) => {
-                raw.copy_buffer_to_texture(encoder, source, offset, bytes_per_row, destination, descriptor, region)
-            }
-            Raw.OpenGl(raw) => {
-                raw.copy_buffer_to_texture(encoder, source, offset, bytes_per_row, destination, descriptor, region)
-            }
-        }
-    }
-    fn raw_copy_texture_to_buffer(&self, encoder: &mut hal.Handle, source: &hal.Handle, descriptor: &TextureDescriptor, region: &Region, destination: &hal.Handle, offset: u64, bytes_per_row: u32) {
-        match &self.raw {
-            Raw.Vulkan(raw) => {
-                raw.copy_texture_to_buffer(encoder, source, descriptor, region, destination, offset, bytes_per_row)
-            }
-            Raw.Native(raw) => {
-                raw.copy_texture_to_buffer(encoder, source, descriptor, region, destination, offset, bytes_per_row)
-            }
-            Raw.OpenGl(raw) => {
-                raw.copy_texture_to_buffer(encoder, source, descriptor, region, destination, offset, bytes_per_row)
-            }
-        }
-    }
-
-    fn raw_generate_mipmaps(&self, encoder: &mut hal.Handle, texture: &hal.Handle, descriptor: &TextureDescriptor) {
-        match &self.raw {
-            Raw.Vulkan(raw) => {
-                raw.generate_mipmaps(encoder, texture, descriptor)
-            }
-            Raw.Native(raw) => {
-                raw.generate_mipmaps(encoder, texture, descriptor)
-            }
-            Raw.OpenGl(raw) => {
-                raw.generate_mipmaps(encoder, texture, descriptor)
-            }
-        }
-    }
-    fn raw_set_blend_constant(&self, encoder: &mut hal.Handle, red: f64, green: f64, blue: f64, alpha: f64) {
-        match &self.raw {
-            Raw.Vulkan(raw) => {
-                raw.set_blend_constant(encoder, red, green, blue, alpha)
-            }
-            Raw.Native(raw) => {
-                raw.set_blend_constant(encoder, red, green, blue, alpha)
-            }
-            Raw.OpenGl(raw) => {
-                raw.set_blend_constant(encoder, red, green, blue, alpha)
-            }
-        }
-    }
-
-    fn raw_staged(&self) -> bool {
-        match &self.raw {
-            Raw.Vulkan(raw) => {
-                return raw.staged()
-            }
-            Raw.Native(raw) => {
-                return raw.staged()
-            }
-            Raw.OpenGl(raw) => {
-                return raw.staged()
-            }
-        }
-    }
-    fn raw_mapped(&self, buffer: &hal.Handle) -> usize {
-        match &self.raw {
-            Raw.Vulkan(raw) => {
-                return raw.mapped(buffer)
-            }
-            Raw.Native(raw) => {
-                return raw.mapped(buffer)
-            }
-            Raw.OpenGl(raw) => {
-                return raw.mapped(buffer)
-            }
-        }
-    }
-    fn raw_invalidate(&self, buffer: &hal.Handle, offset: u64, size: u64) {
-        match &self.raw {
-            Raw.Vulkan(raw) => {
-                raw.invalidate(buffer, offset, size)
-            }
-            Raw.Native(raw) => {
-                raw.invalidate(buffer, offset, size)
-            }
-            Raw.OpenGl(raw) => {
-                raw.invalidate(buffer, offset, size)
-            }
-        }
-    }
-    fn raw_clear_buffer(&self, encoder: &mut hal.Handle, buffer: &hal.Handle, offset: u64, size: u64) {
-        match &self.raw {
-            Raw.Vulkan(raw) => {
-                raw.clear_buffer(encoder, buffer, offset, size)
-            }
-            Raw.Native(raw) => {
-                raw.clear_buffer(encoder, buffer, offset, size)
-            }
-            Raw.OpenGl(raw) => {
-                raw.clear_buffer(encoder, buffer, offset, size)
-            }
-        }
-    }
-    fn raw_initialize_texture(&self, encoder: &mut hal.Handle, texture: &hal.Handle, descriptor: &TextureDescriptor) {
-        match &self.raw {
-            Raw.Vulkan(raw) => {
-                raw.initialize_texture(encoder, texture, descriptor)
-            }
-            Raw.Native(raw) => {
-                raw.initialize_texture(encoder, texture, descriptor)
-            }
-            Raw.OpenGl(raw) => {
-                raw.initialize_texture(encoder, texture, descriptor)
-            }
-        }
-    }
-    fn raw_barrier(&self, encoder: &mut hal.Handle, before: u32, after: u32) {
-        match &self.raw {
-            Raw.Vulkan(raw) => {
-                raw.barrier(encoder, before, after)
-            }
-            Raw.Native(raw) => {
-                raw.barrier(encoder, before, after)
-            }
-            Raw.OpenGl(raw) => {
-                raw.barrier(encoder, before, after)
-            }
-        }
-    }
-    fn raw_create_surface(&self, native: &handle.NativeHandle) -> hal.Handle!Error {
-        match &self.raw {
-            Raw.Vulkan(raw) => {
-                return raw.create_surface(native)
-            }
-            Raw.Native(raw) => {
-                return raw.create_surface(native)
-            }
-            Raw.OpenGl(raw) => {
-                return raw.create_surface(native)
-            }
-        }
-    }
-    fn raw_configure_surface(&self, surface: &mut hal.Handle, config: &mut hal.SurfaceConfig) -> void!Error {
-        match &self.raw {
-            Raw.Vulkan(raw) => {
-                return raw.configure_surface(surface, config)
-            }
-            Raw.Native(raw) => {
-                return raw.configure_surface(surface, config)
-            }
-            Raw.OpenGl(raw) => {
-                return raw.configure_surface(surface, config)
-            }
-        }
-    }
-    fn raw_acquire(&self, surface: &mut hal.Handle, texture: &mut hal.Handle) -> u64!Error {
-        match &self.raw {
-            Raw.Vulkan(raw) => {
-                return raw.acquire(surface, texture)
-            }
-            Raw.Native(raw) => {
-                return raw.acquire(surface, texture)
-            }
-            Raw.OpenGl(raw) => {
-                return raw.acquire(surface, texture)
-            }
-        }
-    }
-    fn raw_present(&self, surface: &mut hal.Handle) -> u64!Error {
-        match &self.raw {
-            Raw.Vulkan(raw) => {
-                return raw.present(surface)
-            }
-            Raw.Native(raw) => {
-                return raw.present(surface)
-            }
-            Raw.OpenGl(raw) => {
-                return raw.present(surface)
-            }
-        }
-    }
-    fn raw_destroy_surface(&self, surface: &hal.Handle) {
-        match &self.raw {
-            Raw.Vulkan(raw) => {
-                raw.destroy_surface(surface)
-            }
-            Raw.Native(raw) => {
-                raw.destroy_surface(surface)
-            }
-            Raw.OpenGl(raw) => {
-                raw.destroy_surface(surface)
-            }
-        }
+    // An encoder's hazard table is cleared and kept for the next one.
+    fn return_hazards(&self, hazards: Hazards) {
+        hazards.clear()
+        self.life.update(fn(life) {
+            if life.spare.capacity == 0 {
+                life.spare = hazards
+            } else {
+                hazards.free()
+            }
+        })
     }
 
     fn drop(&mut self) {
         // Every object borrowing the device is gone; only the graveyard and
         // the staging buffers are left. Staged writes no one can see any
         // more are discarded. Destroy the rest once the GPU is idle.
-        if self.uploads.open {
-            handle := self.uploads.encoder.copy()
-            self.raw_destroy(hal.OBJECT_ENCODER, &handle)
-            self.uploads.open = false
-        }
-        self.uploads.hazards.clear()
-        submitted := self.life.submitted
-        if submitted != 0 {
-            match self.raw_wait(submitted) {
-                ok() => {}
-                err(_) => {}
+        backend := self.backend()
+        submitted := self.life.read().submitted
+        self.uploads.update(fn(uploads) {
+            if uploads.open {
+                backend.destroy(hal.OBJECT_ENCODER, &uploads.encoder)
+                uploads.open = false
             }
+            uploads.hazards.free()
+            uploads.marks.free()
+        })
+        if submitted != 0 {
+            hal.ignore(backend.wait(submitted))
         }
-        for i in 0usize..self.life.count {
-            handle := hal.Handle { a: self.life.a[i], b: self.life.b[i], c: self.life.c[i], d: self.life.d[i] }
-            self.raw_destroy(self.life.object[i], &handle)
+        self.life.update(fn(life) {
+            for i in 0usize..life.graves.len() {
+                grave := life.graves.get(i)
+                backend.destroy(grave.object, &grave.handle)
+            }
+            life.graves.free()
+            life.spare.free()
+        })
+        uploads := self.uploads.read()
+        if uploads.ring_size != 0 {
+            backend.destroy(hal.OBJECT_BUFFER, &uploads.ring)
         }
-        self.life.count = 0
-        if self.uploads.ring_size != 0 {
-            ring := self.uploads.ring.copy()
-            self.raw_destroy(hal.OBJECT_BUFFER, &ring)
-            self.uploads.ring_size = 0
-        }
-        if self.uploads.readback_size != 0 {
-            readback := self.uploads.readback.copy()
-            self.raw_destroy(hal.OBJECT_BUFFER, &readback)
-            self.uploads.readback_size = 0
+        if uploads.readback_size != 0 {
+            backend.destroy(hal.OBJECT_BUFFER, &uploads.readback)
         }
     }
 }
@@ -2181,6 +1792,7 @@ pub struct Buffer {
     handle: hal.Handle
     size: u64
     usage: u32
+    uses: hal.Mutable<BufferUse>
 
     pub fn size(&self) -> u64 {
         return self.size
@@ -2191,6 +1803,80 @@ pub struct Buffer {
 
     fn drop(&mut self) {
         self.device.retire(hal.OBJECT_BUFFER, &self.handle)
+    }
+}
+
+// Which encoders used a buffer: the last one, an older one still
+// recording when the last began using it, and the submission all other
+// uses were part of (see Device.note_use).
+struct BufferUse {
+    serial: u64
+    older: u64
+    busy: u64
+    // More encoders recording at once used it than are kept: until none
+    // records, assume every submission does.
+    shared: bool
+
+    fn new() -> BufferUse {
+        return BufferUse { serial: 0, older: 0, busy: 0, shared: false }
+    }
+}
+
+// Bytes on their way back from the GPU, from Device.start_read_buffer or
+// start_read_texture. Dropping it discards them.
+pub struct Readback {
+    device: &Device
+    // The readback buffer, or a null handle where the bytes were copied
+    // into CPU memory at once (OpenGL).
+    buffer: hal.Handle
+    address: usize
+    // The bytes start `skip` bytes into the copy.
+    skip: u64
+    size: u64
+    index: u64
+
+    pub fn size(&self) -> u64 {
+        return self.size
+    }
+
+    // Whether the GPU has made the copy, so that read() returns at once.
+    pub fn ready(&self) -> bool {
+        return self.index == 0 || self.device.backend().completed() >= self.index
+    }
+
+    // Copy the bytes into `out`, which holds size() bytes, after waiting
+    // for the GPU to copy them if it has not yet. For a texture, rows are
+    // the bytes_per_row apart that the read started with.
+    pub fn read(&self, out: &mut[u8]) -> void!Error {
+        if out.len as u64 != self.size {
+            return err(Error.InvalidInput)
+        }
+        device := self.device
+        if self.index != 0 {
+            device.backend().wait(self.index)?
+            device.backend().invalidate(&self.buffer, 0, self.skip + self.size)
+        }
+        unsafe {
+            ptr.copy_nonoverlapping((self.address + self.skip as usize) as *const u8, ptr.as_mut_ptr(out), out.len)
+        }
+        return ok()
+    }
+
+    // The CPU memory of a read made at once.
+    fn host_bytes(&self) -> &mut[u8] from(self) {
+        unsafe {
+            return ptr.borrow_slice_mut(self.address as *mut u8, self.size as usize, self)
+        }
+    }
+
+    fn drop(&mut self) {
+        if self.buffer.a == 0 {
+            unsafe {
+                free(self.address as *mut u8)
+            }
+        } else {
+            self.device.retire(hal.OBJECT_BUFFER, &self.buffer)
+        }
     }
 }
 
@@ -2342,11 +2028,12 @@ pub struct CommandEncoder {
     handle: hal.Handle
     open: bool
     hazards: Hazards
+    serial: u64
 
     // Record a compute pass. The encoder is busy until the pass ends.
     pub fn compute_pass(&mut self) -> ComputePass from(self) {
         device := self.device
-        device.raw_begin_compute_pass(&mut self.handle)
+        device.backend().begin_compute_pass(&mut self.handle)
         return ComputePass { encoder: self, state: hal.PassState.new(), tracked: Tracked.new() }
     }
 
@@ -2466,9 +2153,9 @@ pub struct CommandEncoder {
             }
             self.hazards.use_resource(texture.handle.a ^ TEXTURE_KEY, hal.USE_DEPTH, true, &mut before, &mut after)
         }
-        device.raw_begin_render_pass(&mut self.handle, &info)
+        device.backend().begin_render_pass(&mut self.handle, &info)
         if before != 0 {
-            device.raw_barrier(&mut self.handle, before, after)
+            device.backend().barrier(&mut self.handle, before, after)
         }
         return RenderPass { encoder: self, state: hal.PassState.new(), tracked: tracked }
     }
@@ -2488,9 +2175,9 @@ pub struct CommandEncoder {
         after := 0u32
         self.hazards.use_resource(texture.handle.a ^ TEXTURE_KEY, hal.USE_COPY_SRC | hal.USE_COPY_DST, true, &mut before, &mut after)
         if before != 0 {
-            device.raw_barrier(&mut self.handle, before, after)
+            device.backend().barrier(&mut self.handle, before, after)
         }
-        device.raw_generate_mipmaps(&mut self.handle, &texture.handle, &texture.descriptor)
+        device.backend().generate_mipmaps(&mut self.handle, &texture.handle, &texture.descriptor)
     }
 
     // Copy `size` bytes between buffers. Offsets and size are multiples
@@ -2510,8 +2197,10 @@ pub struct CommandEncoder {
         if size == 0 {
             return
         }
+        device.note_use(source, self.serial)
+        device.note_use(destination, self.serial)
         copy_hazards(device, &mut self.hazards, &mut self.handle, source.handle.a, destination.handle.a)
-        device.raw_copy_buffer(&mut self.handle, &source.handle, source_offset, &destination.handle, destination_offset, size)
+        device.backend().copy_buffer(&mut self.handle, &source.handle, source_offset, &destination.handle, destination_offset, size)
     }
 
     // Copy texels from `source`, starting `offset` bytes in with rows
@@ -2528,8 +2217,9 @@ pub struct CommandEncoder {
         if region.width == 0 || region.height == 0 {
             return
         }
+        device.note_use(source, self.serial)
         copy_hazards(device, &mut self.hazards, &mut self.handle, source.handle.a, destination.handle.a ^ TEXTURE_KEY)
-        device.raw_copy_buffer_to_texture(&mut self.handle, &source.handle, offset, bytes_per_row, &destination.handle, &destination.descriptor, &region)
+        device.backend().copy_buffer_to_texture(&mut self.handle, &source.handle, offset, bytes_per_row, &destination.handle, &destination.descriptor, &region)
     }
 
     // Copy texels of `region` of `source` into `destination`, starting
@@ -2544,28 +2234,37 @@ pub struct CommandEncoder {
         if region.width == 0 || region.height == 0 {
             return
         }
+        device.note_use(destination, self.serial)
         copy_hazards(device, &mut self.hazards, &mut self.handle, source.handle.a ^ TEXTURE_KEY, destination.handle.a)
-        device.raw_copy_texture_to_buffer(&mut self.handle, &source.handle, &source.descriptor, &region, &destination.handle, offset, bytes_per_row)
+        device.backend().copy_texture_to_buffer(&mut self.handle, &source.handle, &source.descriptor, &region, &destination.handle, offset, bytes_per_row)
     }
 
     // Run the recorded commands after everything submitted before, and
     // after the writes made with write_buffer and write_texture so far.
     pub fn submit(self) -> void!Error {
-        device := self.device
-        device.flush()?
-        index := device.raw_submit(&mut self.handle)?
-        self.open = false
-        device.close_encoder(index)
-        device.bury(hal.OBJECT_ENCODER, &self.handle, index)
-        device.collect(false)
+        self.submit_numbered()?
+        self.device.collect()
         return ok()
     }
 
+    // Submit, after the staged writes so far, and return the number of
+    // the submission.
+    fn submit_numbered(&mut self) -> u64!Error {
+        device := self.device
+        index := device.submit_encoder(&mut self.handle)?
+        self.open = false
+        device.end_serial(self.serial, index)
+        device.close_encoder(index)
+        device.dispose_encoder(&self.handle, index)
+        return ok(index)
+    }
+
     fn drop(&mut self) {
-        self.hazards.clear()
+        device := self.device
+        device.return_hazards(mem.replace(&mut self.hazards, Hazards.new(false)))
         if self.open {
-            device := self.device
-            device.raw_destroy(hal.OBJECT_ENCODER, &self.handle)
+            device.backend().destroy(hal.OBJECT_ENCODER, &self.handle)
+            device.end_serial(self.serial, 0)
             device.close_encoder(0)
         }
     }
@@ -2578,7 +2277,7 @@ fn copy_hazards(device: &Device, hazards: &mut Hazards, encoder: &mut hal.Handle
     hazards.use_resource(source, hal.USE_COPY_SRC, false, &mut before, &mut after)
     hazards.use_resource(destination, hal.USE_COPY_DST, true, &mut before, &mut after)
     if before != 0 {
-        device.raw_barrier(encoder, before, after)
+        device.backend().barrier(encoder, before, after)
     }
 }
 
@@ -2615,9 +2314,19 @@ struct Tracked {
     samples: u32
     width: u32
     height: u32
+    // Nothing changed since a draw or dispatch checked the bindings
+    // against the pipeline (`checked`), or recorded the hazards of the
+    // bindings and vertex buffers (`recorded`) and of the index buffer
+    // (`index_recorded`). Draws repeating those skip the work.
+    checked: bool
+    recorded: bool
+    index_recorded: bool
+    // The pipeline's storage slots: dispatches writing them depend on each
+    // other, so their hazards are recorded every time.
+    writes: u32
 
     fn new() -> Tracked {
-        return Tracked { usage: [0u32; 16], format: [0u32; 16], texture_a: [0u64; 16], comparison: [false; 16], vertex_size: [0u64; 8], index_size: 0, attachments: [0u64; 17], attachment_count: 0, color_count: 0, color_formats: [0u32; 8], depth_format: 0, samples: 1, width: 0, height: 0 }
+        return Tracked { usage: [0u32; 16], format: [0u32; 16], texture_a: [0u64; 16], comparison: [false; 16], vertex_size: [0u64; 8], index_size: 0, attachments: [0u64; 17], attachment_count: 0, color_count: 0, color_formats: [0u32; 8], depth_format: 0, samples: 1, width: 0, height: 0, checked: false, recorded: false, index_recorded: false, writes: 0 }
     }
 
     fn attached(&self, a: u64) -> bool {
@@ -2634,13 +2343,58 @@ struct Tracked {
         self.attachments[self.attachment_count] = a
         self.attachment_count += 1
     }
+
+    // The bindings changed.
+    fn rebound(&mut self) {
+        self.checked = false
+        self.recorded = false
+    }
 }
 
-fn bind_buffer(state: &mut hal.PassState, tracked: &mut Tracked, slot: u32, buffer: &Buffer, offset: u64, size: u64) {
+// The pipeline of a pass changes to `pipeline`.
+fn use_pipeline(state: &mut hal.PassState, tracked: &mut Tracked, pipeline: &hal.Pipeline) {
+    // Bindings carry over to a pipeline of the same layout; for another
+    // layout the backend applies every one again.
+    if !state.has_pipeline || !state.pipeline.same_layout(pipeline) {
+        state.dirty = state.dirty | state.bound_slots
+    }
+    state.pipeline = pipeline.copy()
+    state.has_pipeline = true
+    state.pipeline_dirty = true
+    tracked.rebound()
+    tracked.writes = writable_slots(pipeline)
+}
+
+// Whether a pass already uses `pipeline`.
+fn same_pipeline(state: &hal.PassState, pipeline: &hal.Pipeline) -> bool {
+    return state.has_pipeline && state.pipeline.handle.a == pipeline.handle.a && state.pipeline.handle.b == pipeline.handle.b
+}
+
+// The slots of a pipeline's layout that shaders may write.
+fn writable_slots(pipeline: &hal.Pipeline) -> u32 {
+    slots := 0u32
+    for i in 0usize..hal.MAX_SLOTS as usize {
+        kind := pipeline.kinds[i]
+        if kind == hal.BINDING_STORAGE_BUFFER || kind == hal.BINDING_STORAGE_TEXTURE {
+            slots = slots | (1u32 << i as u32)
+        }
+    }
+    return slots
+}
+
+fn bind_buffer(encoder: &CommandEncoder, state: &mut hal.PassState, tracked: &mut Tracked, slot: u32, buffer: &Buffer, offset: u64, size: u64) {
+    device := encoder.device
+    device.check_owner(buffer.device)
     assert(slot < hal.MAX_SLOTS, "binding slot out of range")
+    index := slot as usize
+    // Binding the same range again, as programs do before each draw,
+    // changes nothing.
+    if state.bound[index] == hal.BOUND_BUFFER && state.object_a[index] == buffer.handle.a && state.offset[index] == offset && state.size[index] == size {
+        return
+    }
     assert(offset % BINDING_ALIGNMENT == 0, "bound buffer offsets are multiples of BINDING_ALIGNMENT (256)")
     assert(size != 0 && fits(offset, size, buffer.size), "the bound range lies outside the buffer")
-    index := slot as usize
+    device.note_use(buffer, encoder.serial)
     state.bound[index] = hal.BOUND_BUFFER
     state.object_a[index] = buffer.handle.a
     state.object_b[index] = buffer.handle.b
@@ -2655,11 +2409,15 @@ fn bind_buffer(state: &mut hal.PassState, tracked: &mut Tracked, slot: u32, buff
     tracked.format[index] = 0
     tracked.texture_a[index] = 0
     tracked.comparison[index] = false
+    tracked.rebound()
 }
 
 fn bind_texture(state: &mut hal.PassState, tracked: &mut Tracked, slot: u32, texture: &Texture, sampler: &hal.Handle, compare: bool, kind: u32) {
     assert(slot < hal.MAX_SLOTS, "binding slot out of range")
     index := slot as usize
+    if state.bound[index] == kind && state.object_a[index] == texture.handle.a && state.sampler[index] == sampler.a {
+        return
+    }
     state.bound[index] = kind
     state.object_a[index] = texture.handle.a
     state.object_b[index] = texture.handle.b
@@ -2674,12 +2432,20 @@ fn bind_texture(state: &mut hal.PassState, tracked: &mut Tracked, slot: u32, tex
     tracked.format[index] = texture.descriptor.format
     tracked.texture_a[index] = texture.handle.a
     tracked.comparison[index] = compare
+    tracked.rebound()
 }
 
-// Check that the bound objects fit the pipeline's layout.
-fn check_bound(state: &hal.PassState, tracked: &Tracked, limits: &hal.Limits) {
+// Check that the bound objects fit the pipeline's layout, unless nothing
+// changed since the last check.
+fn check_bound(state: &hal.PassState, tracked: &mut Tracked, limits: &hal.Limits) {
+    if tracked.checked {
+        return
+    }
     assert(state.has_pipeline, "no pipeline is set")
-    for i in 0usize..16 {
+    remaining := state.pipeline.slots
+    for remaining != 0 {
+        i := hal.lowest_bit(remaining) as usize
+        remaining = remaining & (remaining - 1)
         kind := state.pipeline.kinds[i]
         bound := state.bound[i]
         usage := tracked.usage[i]
@@ -2709,6 +2475,7 @@ fn check_bound(state: &hal.PassState, tracked: &Tracked, limits: &hal.Limits) {
             assert(!tracked.attached(tracked.texture_a[i]), "a texture is bound while it is an attachment of the pass")
         }
     }
+    tracked.checked = true
 }
 
 // A compute pass. It ends when dropped or with end().
@@ -2720,10 +2487,10 @@ pub struct ComputePass {
     pub fn set_pipeline(&mut self, pipeline: &ComputePipeline) {
         device := self.encoder.device
         device.check_owner(pipeline.device)
-        self.state.pipeline = pipeline.pipeline.copy()
-        self.state.has_pipeline = true
-        self.state.pipeline_dirty = true
-        self.state.dirty = 0xffff
+        if same_pipeline(&self.state, &pipeline.pipeline) {
+            return
+        }
+        use_pipeline(&mut self.state, &mut self.tracked, &pipeline.pipeline)
     }
 
     // Bind all of `buffer` to `slot`.
@@ -2734,9 +2501,7 @@ pub struct ComputePass {
     // Bind `size` bytes of `buffer` from `offset`, a multiple of
     // BINDING_ALIGNMENT, to `slot`.
     pub fn set_buffer_range(&mut self, slot: u32, buffer: &Buffer, offset: u64, size: u64) {
-        device := self.encoder.device
-        device.check_owner(buffer.device)
-        bind_buffer(&mut self.state, &mut self.tracked, slot, buffer, offset, size)
+        bind_buffer(self.encoder, &mut self.state, &mut self.tracked, slot, buffer, offset, size)
     }
 
     // Bind `texture`, read through `sampler`, to `slot`.
@@ -2759,26 +2524,29 @@ pub struct ComputePass {
     // dispatch sees the writes of the ones before it.
     pub fn dispatch(&mut self, x: u32, y: u32, z: u32) {
         device := self.encoder.device
-        check_bound(&self.state, &self.tracked, &device.limits)
+        check_bound(&self.state, &mut self.tracked, &device.limits)
         maximum := device.limits.max_workgroups
         assert(x <= maximum && y <= maximum && z <= maximum, "the dispatch exceeds limits().max_workgroups")
         if x == 0 || y == 0 || z == 0 {
             return
         }
-        before := 0u32
-        after := 0u32
-        binding_hazards(&self.state, &mut self.encoder.hazards, &mut before, &mut after)
-        if before != 0 {
-            device.raw_barrier(&mut self.encoder.handle, before, after)
+        if !self.encoder.hazards.off && (!self.tracked.recorded || self.tracked.writes != 0) {
+            before := 0u32
+            after := 0u32
+            binding_hazards(&self.state, &mut self.encoder.hazards, &mut before, &mut after)
+            if before != 0 {
+                device.backend().barrier(&mut self.encoder.handle, before, after)
+            }
+            self.tracked.recorded = true
         }
-        device.raw_dispatch(&mut self.encoder.handle, &mut self.state, x, y, z)
+        device.backend().dispatch(&mut self.encoder.handle, &mut self.state, x, y, z)
     }
 
     pub fn end(self) {}
 
     fn drop(&mut self) {
         device := self.encoder.device
-        device.raw_end_compute_pass(&mut self.encoder.handle)
+        device.backend().end_compute_pass(&mut self.encoder.handle)
     }
 }
 
@@ -2793,21 +2561,19 @@ pub struct RenderPass {
         device := self.encoder.device
         device.check_owner(pipeline.device)
         expected := &pipeline.pipeline
+        if same_pipeline(&self.state, expected) {
+            return
+        }
         same := expected.color_count == self.tracked.color_count
-        for i in 0usize..8 {
-            if i < expected.color_count as usize && expected.color_formats[i] != self.tracked.color_formats[i] {
+        for i in 0usize..expected.color_count as usize {
+            if expected.color_formats[i] != self.tracked.color_formats[i] {
                 same = false
             }
         }
         assert(same, "the pipeline's color formats differ from the pass's color attachments")
         assert(expected.depth_format == self.tracked.depth_format, "the pipeline's depth format differs from the pass's depth attachment")
         assert(expected.samples == self.tracked.samples, "the pipeline's sample count differs from the pass's attachments")
-        self.state.pipeline = pipeline.pipeline.copy()
-        self.state.has_pipeline = true
-        self.state.pipeline_dirty = true
-        self.state.dirty = 0xffff
-        self.state.vertex_dirty = 0xff
-        self.state.index_dirty = true
+        use_pipeline(&mut self.state, &mut self.tracked, expected)
     }
 
     pub fn set_buffer(&mut self, slot: u32, buffer: &Buffer) {
@@ -2815,9 +2581,7 @@ pub struct RenderPass {
     }
 
     pub fn set_buffer_range(&mut self, slot: u32, buffer: &Buffer, offset: u64, size: u64) {
-        device := self.encoder.device
-        device.check_owner(buffer.device)
-        bind_buffer(&mut self.state, &mut self.tracked, slot, buffer, offset, size)
+        bind_buffer(self.encoder, &mut self.state, &mut self.tracked, slot, buffer, offset, size)
     }
 
     pub fn set_texture(&mut self, slot: u32, texture: &Texture, sampler: &Sampler) {
@@ -2840,14 +2604,19 @@ pub struct RenderPass {
         device := self.encoder.device
         device.check_owner(buffer.device)
         assert(slot < hal.MAX_VERTEX_BUFFERS, "vertex buffer slot out of range")
+        index := slot as usize
+        if (self.state.vertex_set >> slot & 1) != 0 && self.state.vertex_a[index] == buffer.handle.a && self.state.vertex_offset[index] == offset {
+            return
+        }
         assert((buffer.usage & hal.BUFFER_VERTEX) != 0, "a vertex buffer needs BUFFER_VERTEX")
         assert(offset % 4 == 0 && offset <= buffer.size, "the vertex buffer offset is past the end or not a multiple of 4")
-        index := slot as usize
+        device.note_use(buffer, self.encoder.serial)
         self.state.vertex_a[index] = buffer.handle.a
         self.state.vertex_offset[index] = offset
         self.state.vertex_set = self.state.vertex_set | (1u32 << slot)
         self.state.vertex_dirty = self.state.vertex_dirty | (1u32 << slot)
         self.tracked.vertex_size[index] = buffer.size
+        self.tracked.recorded = false
     }
 
     // Read indices of `format` (INDEX_UINT16 or INDEX_UINT32) from
@@ -2858,12 +2627,14 @@ pub struct RenderPass {
         assert(format == hal.INDEX_UINT16 || format == hal.INDEX_UINT32, "unknown index format")
         assert((buffer.usage & hal.BUFFER_INDEX) != 0, "an index buffer needs BUFFER_INDEX")
         assert(offset % index_size(format) == 0 && offset <= buffer.size, "the index buffer offset is past the end or not a multiple of the index size")
+        device.note_use(buffer, self.encoder.serial)
         self.state.index_a = buffer.handle.a
         self.state.index_offset = offset
         self.state.index_format = format
         self.state.index_set = true
         self.state.index_dirty = true
         self.tracked.index_size = buffer.size
+        self.tracked.index_recorded = false
     }
 
     // Draw into this part of the attachment, in pixels from its top-left
@@ -2873,21 +2644,21 @@ pub struct RenderPass {
         assert(x + width <= self.tracked.width as f32 && y + height <= self.tracked.height as f32, "the viewport extends past the attachment")
         assert(min_depth >= 0.0 && max_depth <= 1.0 && min_depth <= max_depth, "viewport depths lie outside 0.0 to 1.0")
         device := self.encoder.device
-        device.raw_set_viewport(&mut self.encoder.handle, x, y, width, height, min_depth, max_depth)
+        device.backend().set_viewport(&mut self.encoder.handle, x, y, width, height, min_depth, max_depth)
     }
 
     // The color BLEND_FACTOR_CONSTANT reads, until the pass ends; each pass
     // starts with transparent black.
     pub fn set_blend_constant(&mut self, red: f64, green: f64, blue: f64, alpha: f64) {
         device := self.encoder.device
-        device.raw_set_blend_constant(&mut self.encoder.handle, red, green, blue, alpha)
+        device.backend().set_blend_constant(&mut self.encoder.handle, red, green, blue, alpha)
     }
 
     // Discard pixels outside this rectangle.
     pub fn set_scissor(&mut self, x: u32, y: u32, width: u32, height: u32) {
         assert(x as u64 + width as u64 <= self.tracked.width as u64 && y as u64 + height as u64 <= self.tracked.height as u64, "the scissor rectangle extends past the attachment")
         device := self.encoder.device
-        device.raw_set_scissor(&mut self.encoder.handle, x, y, width, height)
+        device.backend().set_scissor(&mut self.encoder.handle, x, y, width, height)
     }
 
     // Draw `vertex_count` vertices from `first_vertex`, `instance_count`
@@ -2895,13 +2666,16 @@ pub struct RenderPass {
     // must be set and long enough.
     pub fn draw(&mut self, vertex_count: u32, instance_count: u32, first_vertex: u32, first_instance: u32) {
         device := self.encoder.device
-        check_bound(&self.state, &self.tracked, &device.limits)
+        check_bound(&self.state, &mut self.tracked, &device.limits)
         check_vertices(&self.state, &self.tracked, first_vertex as u64 + vertex_count as u64, first_instance as u64 + instance_count as u64)
         if vertex_count == 0 || instance_count == 0 {
             return
         }
-        draw_hazards(device, &self.state, &mut self.encoder.hazards, &mut self.encoder.handle, false)
-        device.raw_draw(&mut self.encoder.handle, &mut self.state, vertex_count, instance_count, first_vertex, first_instance)
+        if !self.tracked.recorded {
+            draw_hazards(device, &self.state, &mut self.encoder.hazards, &mut self.encoder.handle, false)
+            self.tracked.recorded = true
+        }
+        device.backend().draw(&mut self.encoder.handle, &mut self.state, vertex_count, instance_count, first_vertex, first_instance)
     }
 
     // Draw `index_count` indices of the index buffer from `first_index`,
@@ -2909,7 +2683,7 @@ pub struct RenderPass {
     // the vertex buffers: an index past their end reads undefined values.
     pub fn draw_indexed(&mut self, index_count: u32, instance_count: u32, first_index: u32, base_vertex: i32, first_instance: u32) {
         device := self.encoder.device
-        check_bound(&self.state, &self.tracked, &device.limits)
+        check_bound(&self.state, &mut self.tracked, &device.limits)
         assert(self.state.index_set, "no index buffer is set")
         needed := self.state.index_offset + (first_index as u64 + index_count as u64) * index_size(self.state.index_format)
         assert(needed <= self.tracked.index_size, "the indices extend past the end of the index buffer")
@@ -2918,21 +2692,28 @@ pub struct RenderPass {
         if index_count == 0 || instance_count == 0 {
             return
         }
-        draw_hazards(device, &self.state, &mut self.encoder.hazards, &mut self.encoder.handle, true)
-        device.raw_draw_indexed(&mut self.encoder.handle, &mut self.state, index_count, instance_count, first_index, base_vertex, first_instance)
+        if !self.tracked.recorded || !self.tracked.index_recorded {
+            draw_hazards(device, &self.state, &mut self.encoder.hazards, &mut self.encoder.handle, true)
+            self.tracked.recorded = true
+            self.tracked.index_recorded = true
+        }
+        device.backend().draw_indexed(&mut self.encoder.handle, &mut self.state, index_count, instance_count, first_index, base_vertex, first_instance)
     }
 
     pub fn end(self) {}
 
     fn drop(&mut self) {
         device := self.encoder.device
-        device.raw_end_render_pass(&mut self.encoder.handle)
+        device.backend().end_render_pass(&mut self.encoder.handle)
     }
 }
 
 // A draw follows: barriers for its bindings, vertex buffers and, when
 // `indexed`, index buffer. Backends run them before the pass.
 fn draw_hazards(device: &Device, state: &hal.PassState, hazards: &mut Hazards, encoder: &mut hal.Handle, indexed: bool) {
+    if hazards.off {
+        return
+    }
     before := 0u32
     after := 0u32
     binding_hazards(state, hazards, &mut before, &mut after)
@@ -2943,7 +2724,7 @@ fn draw_hazards(device: &Device, state: &hal.PassState, hazards: &mut Hazards, e
         hazards.use_resource(state.index_a, hal.USE_INDEX, false, &mut before, &mut after)
     }
     if before != 0 {
-        device.raw_barrier(encoder, before, after)
+        device.backend().barrier(encoder, before, after)
     }
 }
 
@@ -3017,18 +2798,26 @@ pub fn i32_bytes_mut(values: &mut[i32]) -> &mut[u8] from(values) {
 // it after earlier submissions as a whole.
 
 unsafe extern "C" fn malloc(size: usize) -> *mut u8
+unsafe extern "C" fn realloc(block: *mut u8, size: usize) -> *mut u8
 unsafe extern "C" fn free(block: *mut u8)
 
 const TEXTURE_KEY: u64 = 0x8000000000000000
-// Bytes per entry: key, write, reads, visible and padding.
-const ENTRY: usize = 24
 const FIRST_CAPACITY: usize = 64
 // Every USE_* bit, for a barrier against everything.
 const ALL_USES: u32 = 0x7ff
 
+// One resource's uses in an encoder; key 0 marks a free entry.
+struct Entry {
+    key: u64
+    written: u32
+    reads: u32
+    visible: u32
+}
+
 struct Hazards {
-    // Open addressing with linear probing; key 0 marks a free entry.
-    table: usize
+    // Open addressing with linear probing, `capacity` entries in malloc'd
+    // memory. The table is kept when cleared, for the next encoder.
+    table: *mut Entry
     capacity: usize
     count: usize
     // Tracking is off (Metal, which tracks hazards itself).
@@ -3037,20 +2826,35 @@ struct Hazards {
     degraded: bool
 
     fn new(on: bool) -> Hazards {
-        return Hazards { table: 0, capacity: 0, count: 0, off: !on, degraded: false }
+        return Hazards { table: null_entries(), capacity: 0, count: 0, off: !on, degraded: false }
     }
 
-    // Forget every entry and free the table.
+    // Forget every entry, keeping the table.
     fn clear(&mut self) {
-        if self.table != 0 {
+        if self.count != 0 {
+            unsafe {
+                ptr.write_bytes(self.table, 0u8, self.capacity)
+            }
+        }
+        self.count = 0
+        self.degraded = false
+    }
+
+    fn free(&mut self) {
+        if self.capacity != 0 {
             unsafe {
                 free(self.table as *mut u8)
             }
         }
-        self.table = 0
+        self.table = null_entries()
         self.capacity = 0
         self.count = 0
-        self.degraded = false
+    }
+
+    fn entries(&mut self) -> &mut[Entry] from(self) {
+        unsafe {
+            return ptr.borrow_slice_mut(self.table, self.capacity, self)
+        }
     }
 
     // A command uses the resource `key` as `usage` says, writing it when
@@ -3059,30 +2863,31 @@ struct Hazards {
         if self.off {
             return
         }
-        entry := self.find(key)
-        if entry == 0 {
+        found := self.find(key)
+        if found == self.capacity {
             *before = ALL_USES
             *after = *after | usage
             return
         }
-        written := load32(entry, 8)
-        reads := load32(entry, 12)
-        visible := load32(entry, 16)
-        if load64(entry, 0) != key {
+        entries := self.entries()
+        entry := &mut entries[found]
+        if entry.key != key {
             // First use in this encoder.
-            store64(entry, 0, key)
-            store32(entry, 16, 0)
+            entry.key = key
+            entry.visible = 0
             if write {
-                store32(entry, 8, usage)
-                store32(entry, 12, 0)
+                entry.written = usage
+                entry.reads = 0
             } else {
-                store32(entry, 8, 0)
-                store32(entry, 12, usage)
+                entry.written = 0
+                entry.reads = usage
             }
             return
         }
+        written := entry.written
+        reads := entry.reads
         // Read after write, or write after write.
-        if written != 0 && (write || (usage & ~visible) != 0) {
+        if written != 0 && (write || (usage & ~entry.visible) != 0) {
             *before = *before | written
             *after = *after | usage
         }
@@ -3092,38 +2897,38 @@ struct Hazards {
             *after = *after | usage
         }
         if write {
-            store32(entry, 8, usage)
-            store32(entry, 12, 0)
-            store32(entry, 16, 0)
+            entry.written = usage
+            entry.reads = 0
+            entry.visible = 0
         } else {
-            store32(entry, 12, reads | usage)
+            entry.reads = reads | usage
             if written != 0 {
-                store32(entry, 16, visible | usage)
+                entry.visible = entry.visible | usage
             }
         }
     }
 
-    // The address of `key`'s entry, or of the free entry it goes into;
-    // 0 when memory ran out.
+    // The index of `key`'s entry, or of the free entry it goes into;
+    // `capacity` when memory ran out.
     fn find(&mut self, key: u64) -> usize {
         if self.degraded {
-            return 0
+            return self.capacity
         }
         if (self.count + 1) * 2 > self.capacity && !self.grow() {
             self.degraded = true
-            return 0
+            return self.capacity
         }
         mask := self.capacity - 1
         index := hash(key) & mask
+        entries := self.entries()
         for {
-            entry := self.table + index * ENTRY
-            stored := load64(entry, 0)
+            stored := entries[index].key
             if stored == key {
-                return entry
+                return index
             }
             if stored == 0 {
                 self.count += 1
-                return entry
+                return index
             }
             index = (index + 1) & mask
         }
@@ -3136,38 +2941,49 @@ struct Hazards {
             capacity = self.capacity * 2
         }
         table := unsafe {
-            malloc(capacity * ENTRY) as usize
+            malloc(capacity * mem.size_of::<Entry>()) as *mut Entry
         }
-        if table == 0 {
+        if ptr.is_null(table) {
             return false
         }
         unsafe {
-            ptr.write_bytes(table as *mut u8, 0u8, capacity * ENTRY)
+            ptr.write_bytes(table, 0u8, capacity)
+        }
+        bigger := unsafe {
+            ptr.borrow_slice_mut(table, capacity, self)
+        }
+        old := unsafe {
+            ptr.borrow_slice(self.table, self.capacity, self)
         }
         mask := capacity - 1
-        for i in 0usize..self.capacity {
-            old := self.table + i * ENTRY
-            key := load64(old, 0)
+        for i in 0usize..old.len {
+            key := old[i].key
             if key != 0 {
                 index := hash(key) & mask
-                for load64(table + index * ENTRY, 0) != 0 {
+                for bigger[index].key != 0 {
                     index = (index + 1) & mask
                 }
-                entry := table + index * ENTRY
-                store64(entry, 0, key)
-                store32(entry, 8, load32(old, 8))
-                store32(entry, 12, load32(old, 12))
-                store32(entry, 16, load32(old, 16))
+                bigger[index] = Entry { key: key, written: old[i].written, reads: old[i].reads, visible: old[i].visible }
             }
         }
-        if self.table != 0 {
+        self.free_table()
+        self.table = table
+        self.capacity = capacity
+        return true
+    }
+
+    fn free_table(&mut self) {
+        if self.capacity != 0 {
             unsafe {
                 free(self.table as *mut u8)
             }
         }
-        self.table = table
-        self.capacity = capacity
-        return true
+    }
+}
+
+fn null_entries() -> *mut Entry {
+    return unsafe {
+        0usize as *mut Entry
     }
 }
 
@@ -3176,62 +2992,126 @@ fn hash(key: u64) -> usize {
     return ((key >> 4) ^ (key >> 20) ^ (key >> 36) ^ (key >> 63)) as usize
 }
 
-fn load64(entry: usize, offset: usize) -> u64 {
-    return unsafe {
-        *((entry + offset) as *const u64)
-    }
-}
+// A growable array of plain values (without drop) in malloc'd memory, for
+// the device's bookkeeping. Running out of memory panics.
+struct Growing<T> {
+    data: *mut T
+    count: usize
+    capacity: usize
 
-fn store64(entry: usize, offset: usize, value: u64) {
-    unsafe {
-        *((entry + offset) as *mut u64) = value
+    fn new() -> Growing<T> {
+        return Growing { data: unsafe {
+            0usize as *mut T
+        }, count: 0, capacity: 0 }
     }
-}
 
-fn load32(entry: usize, offset: usize) -> u32 {
-    return unsafe {
-        *((entry + offset) as *const u32)
+    fn len(&self) -> usize {
+        return self.count
     }
-}
 
-fn store32(entry: usize, offset: usize, value: u32) {
-    unsafe {
-        *((entry + offset) as *mut u32) = value
+    fn get(&self, index: usize) -> &T from(self) {
+        assert(index < self.count, "index out of range")
+        unsafe {
+            return ptr.borrow(ptr.offset(self.data, index as isize), self)
+        }
+    }
+
+    fn get_mut(&mut self, index: usize) -> &mut T from(self) {
+        assert(index < self.count, "index out of range")
+        unsafe {
+            return ptr.borrow_mut(ptr.offset(self.data, index as isize), self)
+        }
+    }
+
+    fn set(&mut self, index: usize, value: T) {
+        assert(index < self.count, "index out of range")
+        unsafe {
+            ptr.write(ptr.offset(self.data, index as isize), value)
+        }
+    }
+
+    fn push(&mut self, value: T) {
+        if self.count == self.capacity {
+            capacity := 16usize
+            if self.capacity != 0 {
+                capacity = self.capacity * 2
+            }
+            data := unsafe {
+                realloc(self.data as *mut u8, capacity * mem.size_of::<T>()) as *mut T
+            }
+            assert(!ptr.is_null(data), "std/gpu ran out of memory")
+            self.data = data
+            self.capacity = capacity
+        }
+        unsafe {
+            ptr.write(ptr.offset(self.data, self.count as isize), value)
+        }
+        self.count += 1
+    }
+
+    // Move element `from` to `to`, overwriting it.
+    fn copy_within(&mut self, from: usize, to: usize) {
+        assert(from < self.count && to < self.count, "index out of range")
+        if from != to {
+            unsafe {
+                ptr.copy_nonoverlapping(ptr.offset(self.data, from as isize), ptr.offset(self.data, to as isize), 1)
+            }
+        }
+    }
+
+    fn truncate(&mut self, count: usize) {
+        if count < self.count {
+            self.count = count
+        }
+    }
+
+    fn free(&mut self) {
+        if self.capacity != 0 {
+            unsafe {
+                free(self.data as *mut u8)
+            }
+        }
+        self.data = unsafe {
+            0usize as *mut T
+        }
+        self.count = 0
+        self.capacity = 0
     }
 }
 
 // The uses of the pipeline's bound slots by a draw or dispatch.
 fn binding_hazards(state: &hal.PassState, hazards: &mut Hazards, before: &mut u32, after: &mut u32) {
-    for slot in 0usize..16 {
+    remaining := state.pipeline.slots
+    for remaining != 0 {
+        slot := hal.lowest_bit(remaining) as usize
+        remaining = remaining & (remaining - 1)
         kind := state.pipeline.kinds[slot]
-        if kind != hal.BINDING_NONE {
-            stages := state.pipeline.stages[slot]
-            usage := 0u32
-            if (stages & hal.STAGE_VERTEX) != 0 {
-                usage = usage | hal.USE_VERTEX_READ
-            }
+        stages := state.pipeline.stages[slot]
+        usage := 0u32
+        if (stages & hal.STAGE_VERTEX) != 0 {
+            usage = usage | hal.USE_VERTEX_READ
+        }
+        if (stages & hal.STAGE_FRAGMENT) != 0 {
+            usage = usage | hal.USE_FRAGMENT_READ
+        }
+        if (stages & hal.STAGE_COMPUTE) != 0 {
+            usage = usage | hal.USE_COMPUTE_READ
+        }
+        writable := kind == hal.BINDING_STORAGE_BUFFER || kind == hal.BINDING_STORAGE_TEXTURE
+        if writable {
+            // Vertex shaders never write (see check_bindings).
             if (stages & hal.STAGE_FRAGMENT) != 0 {
-                usage = usage | hal.USE_FRAGMENT_READ
+                usage = usage | hal.USE_FRAGMENT_WRITE
             }
             if (stages & hal.STAGE_COMPUTE) != 0 {
-                usage = usage | hal.USE_COMPUTE_READ
+                usage = usage | hal.USE_COMPUTE_WRITE
             }
-            writable := kind == hal.BINDING_STORAGE_BUFFER || kind == hal.BINDING_STORAGE_TEXTURE
-            if writable {
-                // Vertex shaders never write (see check_bindings).
-                if (stages & hal.STAGE_FRAGMENT) != 0 {
-                    usage = usage | hal.USE_FRAGMENT_WRITE
-                }
-                if (stages & hal.STAGE_COMPUTE) != 0 {
-                    usage = usage | hal.USE_COMPUTE_WRITE
-                }
-            }
-            key := state.object_a[slot]
-            if state.bound[slot] != hal.BOUND_BUFFER {
-                key = key ^ TEXTURE_KEY
-            }
-            hazards.use_resource(key, usage, writable, before, after)
         }
+        key := state.object_a[slot]
+        if state.bound[slot] != hal.BOUND_BUFFER {
+            key = key ^ TEXTURE_KEY
+        }
+        hazards.use_resource(key, usage, writable, before, after)
     }
 }
 
@@ -3279,7 +3159,7 @@ pub struct Surface {
         if options.frames_in_flight < 2 || options.frames_in_flight > 3 || width > device.limits.max_texture_size || height > device.limits.max_texture_size {
             return err(Error.InvalidInput)
         }
-        handle := device.raw_create_surface(native)?
+        handle := device.backend().create_surface(native)?
         surface := Surface { device: device, handle: handle, config: hal.SurfaceConfig { width: width, height: height, vsync: options.vsync, frames: options.frames_in_flight, format: hal.FORMAT_NONE } }
         surface.configure()?
         return ok(surface)
@@ -3327,7 +3207,7 @@ pub struct Surface {
         if self.config.width == 0 || self.config.height == 0 {
             return err(Error.Outdated)
         }
-        index := match device.raw_acquire(&mut self.handle, &mut texture) {
+        index := match device.backend().acquire(&mut self.handle, &mut texture) {
             ok(index) => index,
             err(Error.Outdated) => {
                 // Rebuild for the window's current size and try once more.
@@ -3335,7 +3215,7 @@ pub struct Surface {
                 if self.config.width == 0 || self.config.height == 0 {
                     return err(Error.Outdated)
                 }
-                device.raw_acquire(&mut self.handle, &mut texture)?
+                device.backend().acquire(&mut self.handle, &mut texture)?
             }
             err(error) => {
                 return err(error)
@@ -3353,18 +3233,15 @@ pub struct Surface {
 
     fn drop(&mut self) {
         device := self.device
-        match device.finish() {
-            ok() => {}
-            err(_) => {}
-        }
-        device.raw_destroy_surface(&self.handle)
+        hal.ignore(device.finish())
+        device.backend().destroy_surface(&self.handle)
     }
 }
 
 // Wait for the GPU, then make a surface's images for its settings.
 fn configure_surface(device: &Device, surface: &mut hal.Handle, config: &mut hal.SurfaceConfig) -> void!Error {
     device.finish()?
-    return device.raw_configure_surface(surface, config)
+    return device.backend().configure_surface(surface, config)
 }
 
 // One image of a Surface, to render into and present. Dropping a frame
@@ -3389,19 +3266,16 @@ pub struct Frame {
     fn show(&mut self) -> void!Error {
         device := self.surface.device
         device.flush()?
-        index := device.raw_present(&mut self.surface.handle)?
+        index := device.backend().present(&mut self.surface.handle)?
         device.note_submission(index)
-        device.collect(false)
+        device.collect()
         return ok()
     }
 
     fn drop(&mut self) {
         if !self.presented {
             self.presented = true
-            match self.show() {
-                ok() => {}
-                err(_) => {}
-            }
+            hal.ignore(self.show())
         }
     }
 }

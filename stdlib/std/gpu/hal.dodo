@@ -268,6 +268,15 @@ pub struct Mutable<T> {
     }
 }
 
+// Ignore the outcome of a call whose failure changes nothing, such as
+// waiting for the GPU while shutting down.
+pub fn ignore(result: void!Error) {
+    match result {
+        ok() => {}
+        err(_) => {}
+    }
+}
+
 // Bit patterns of numbers, for packing them into handles.
 pub fn f32_bits(value: f32) -> u32 {
     bits := 0u32
@@ -1105,13 +1114,15 @@ pub struct SurfaceConfig {
 // What std/gpu needs from a backend. Every method except the
 // constructors works on objects this device created; std/gpu destroys an
 // object only once the GPU has finished every submission that used it.
+//
+// Each backend Device also has two constructors, which std/gpu calls by
+// name so that the interface stays usable as `&dyn Backend`:
+// `open(debug: bool) -> Device!Error` opens the backend's preferred GPU,
+// with the API's validation where `debug` asks for it and it exists, and
+// `open_for_window(native: &handle.NativeHandle, debug: bool)` one that
+// can present to the window (OpenGL makes its context the window's, which
+// its surface then needs).
 pub interface Backend {
-    // Open the backend's preferred GPU. `debug` asks for the API's
-    // validation where it exists.
-    fn open(debug: bool) -> Self!Error
-    // Open a GPU that can present to `native`'s window. OpenGL makes its
-    // context the window's, which its surface then needs.
-    fn open_for_window(native: &handle.NativeHandle, debug: bool) -> Self!Error
     fn api(&self) -> Api
     fn limits(&self) -> Limits
     // Copy the GPU's name into `out`, cut at a character boundary, and
