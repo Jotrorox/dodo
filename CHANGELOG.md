@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- `std/db/sqlite` updates and deletes rows 2 to 5 times faster. Removing a
+  cell puts its space on the page's freeblock list instead of rewriting the
+  page, and inserts reuse freeblocks. An `UPDATE` that keeps the rowid
+  overwrites the row in place (overflow pages included when the size is
+  unchanged), leaves index entries whose key did not change alone, and no
+  longer seeks the row again; `DELETE` reuses its seek too.
+  `count(DISTINCT x)` and other `DISTINCT` aggregates use a hash set instead
+  of a list searched from the start for every row (20k values: about 100
+  times faster) and hold more values in the same workspace.
+- A single-table `std/db/sqlite` query ordered by its rowid (or INTEGER
+  PRIMARY KEY), ascending or descending, reads the table in that order
+  instead of sorting, so it no longer fails on tables larger than the
+  sorter's workspace. Rows skipped by `OFFSET` no longer use up the value
+  area, and `substr(x, start)` with a negative start before the beginning of
+  the string no longer drops the last character.
 - `std/db/sqlite` is faster: full-table scans take less than half the
   instructions, `CREATE INDEX` on a 200k-row table runs about 4.5 times
   faster, and indexed joins about 2.5 times faster. Rebalancing now evens out

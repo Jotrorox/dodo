@@ -78,7 +78,9 @@ When a region is too small for a request, for example a single value
 larger than the value area or an `ORDER BY` over more rows than the sorter
 holds, the statement fails with `db.ErrorKind.Capacity`, rolls back, and
 `conn.message()` names the region. Query results are never spilled to
-temporary files.
+temporary files. A single-table query ordered by its rowid (or INTEGER
+PRIMARY KEY), ascending or descending, reads the table in that order and
+needs no sorter space.
 
 ## Running statements
 

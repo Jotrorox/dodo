@@ -75,6 +75,8 @@ const PLAN_INDEX: usize = 2
 const PLAN_RANGE: usize = 3
 const PLAN_SUBQ: usize = 4
 const PLAN_QUEUE: usize = 5
+// A full table scan in descending rowid order (for ORDER BY rowid DESC).
+const PLAN_SCAN_DESC: usize = 6
 const QUEUE_SOURCE: usize = 4294967294
 
 const MODE_STREAM: usize = 0
@@ -1702,7 +1704,7 @@ fn plan_output(e: &mut Engine, s: usize, info: usize) -> void!db.Error {
     distinct := (nflags(e, s) & 1) != 0
     norder := list_len(e, order)
     iset(e, info, I_NORDER, norder)
-    if order != 0 || distinct {
+    if distinct || (order != 0 && !scan_gives_order(e, s, info, order)) {
         iset(e, info, I_MODE, MODE_SORT)
     }
     nres := iget(e, info, I_NRES)
@@ -1799,6 +1801,53 @@ fn plan_output(e: &mut Engine, s: usize, info: usize) -> void!db.Error {
     }
     iset(e, info, I_GRPINFO, ginfo)
     ok()
+}
+
+// True when the rows of a single-table select already come out in ORDER BY
+// order, so the sorter is not needed: the first term is the rowid and the
+// table is read in rowid order (a full scan, possibly switched to a
+// backward scan for DESC, a rowid range, or a single-row lookup). Rowids are
+// unique, so later terms cannot reorder anything; they must be plain
+// columns, as skipping the sort skips evaluating them.
+fn scan_gives_order(e: &mut Engine, s: usize, info: usize, order: usize) -> bool {
+    if nnext(e, s) != 0 || iget(e, info, I_AGG) != AGG_NONE || iget(e, info, I_WIN) != 0 {
+        return false
+    }
+    if iget(e, info, I_NLEV) != 1 {
+        return false
+    }
+    lv := lev(e, info, 0)
+    plan := ldu(e.ws, lv + L_PLAN)
+    if plan != PLAN_SCAN && plan != PLAN_RANGE && plan != PLAN_ROWID {
+        return false
+    }
+    c := ldu(e.ws, lv + L_CUR)
+    t := ldu(e.ws, lv + L_TABLE)
+    if is_wr(e, t) {
+        return false
+    }
+    first := na(e, order)
+    if !is_rowid_ref(e, first, c, t) {
+        return false
+    }
+    o := nnext(e, order)
+    for o != 0 {
+        x := na(e, o)
+        if nkind(e, x) != N_COL || na(e, x) != c {
+            return false
+        }
+        o = nnext(e, o)
+    }
+    if (nflags(e, order) & 1) != 0 {
+        // Descending: a full scan can run backwards; a single row needs
+        // nothing.
+        if plan == PLAN_SCAN {
+            stu(e.ws, lv + L_PLAN, PLAN_SCAN_DESC)
+            return true
+        }
+        return plan == PLAN_ROWID
+    }
+    true
 }
 
 fn slot_is_group_key(e: &Engine, info: usize, c: usize, col: usize) -> bool {
@@ -2054,6 +2103,12 @@ fn level_move(e: &mut Engine, info: usize, l: usize, first: bool) -> bool!db.Err
             return cur_first(e, c)
         }
         return cur_next(e, c)
+    }
+    if plan == PLAN_SCAN_DESC {
+        if first {
+            return cur_last(e, c)
+        }
+        return cur_prev(e, c)
     }
     if plan == PLAN_QUEUE {
         // The current row of a recursive common table expression.
