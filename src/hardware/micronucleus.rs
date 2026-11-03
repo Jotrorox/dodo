@@ -259,7 +259,7 @@ fn reconnect(device: Device, info: &Info) -> Result<Device, String> {
     if get_info(&device, TIMEOUT).is_ok() {
         return Ok(device);
     }
-    drop(device);
+    device.close();
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         if let Some(device) = Device::open(VENDOR, PRODUCT)?

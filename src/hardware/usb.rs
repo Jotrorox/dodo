@@ -40,6 +40,10 @@ impl Device {
         platform::open(vendor, product)
     }
 
+    /// Release the device, for example before looking for it again after it
+    /// enumerated anew.
+    pub fn close(self) {}
+
     /// Send a vendor request to the device with `data`, if any.
     pub fn control_out(
         &self,
