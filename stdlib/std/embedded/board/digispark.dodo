@@ -1,0 +1,132 @@
+package digispark
+
+import "std/embedded/hal"
+import "std/embedded/chip/attiny85"
+
+// Digispark (Digistump's ATtiny85 USB board, and the many "Digispark
+// compatible" clones, such as the "v3" boards with a micro USB socket): an
+// ATtiny85 running at 16.5 MHz from its internal oscillator, which the
+// micronucleus bootloader tunes to the computer's USB clock, with 6012 of
+// its 8192 bytes of flash left for programs, 512 bytes of SRAM, 512 bytes
+// of EEPROM, and a user LED on P1 (Model A boards, the usual ones; on Model
+// B boards it is on P0). Build with `board = "digispark"` and import this
+// package as `std/embedded/board`, so the program also builds for other
+// boards:
+//
+//     import "std/embedded/board"
+//
+//     fn main() {
+//         b := board.take()!
+//         for {
+//             b.led.toggle()
+//             b.timer.delay_ms(500)
+//         }
+//     }
+//
+// It follows the board contract described in std/embedded/hal. Pins have
+// the numbers printed on the board: P0 to P5 are 0 to 5 (the constants P0
+// to P5), the chip's PB0 to PB5. P3 and P4 carry USB (D- and D+, with a
+// 1.5 kOhm pull-up on P3 and 3.6 V Zener diodes on both), so they read and
+// drive weakly while the board is plugged into a computer; P5 is the reset
+// pin on most boards. P2, P3, P4 and P5 are analog inputs.
+//
+// `dodo run` writes the program through micronucleus, which runs for about
+// five seconds after the board is plugged in: run the command, then plug
+// the board in (or unplug it and plug it in again) when asked. The program
+// starts once the flash is written, and again on every power-up after the
+// bootloader's five seconds. `reboot_to_bootloader()` gets back into the
+// bootloader without unplugging.
+//
+// What the contract names and the Digispark lacks: a USB serial port (the
+// bootloader speaks USB, programs here do not), a UART (`b.pins.uart` is a
+// transmit-only port the chip times itself, for a USB serial adapter on any
+// pin), a random number generator, a real-time clock, DMA, and a second
+// core.
+
+pub const NAME: &str = "Digispark"
+pub const LED_PIN: u32 = 1
+// The clock micronucleus tunes the internal oscillator to.
+pub const CPU_HZ: u32 = 16_500_000
+
+pub const P0: u32 = 0
+pub const P1: u32 = 1
+pub const P2: u32 = 2
+pub const P3: u32 = 3
+pub const P4: u32 = 4
+pub const P5: u32 = 5
+
+// The usual bus pins, fixed by the chip's USI: I2C on P0 (SDA) and P2
+// (SCL); SPI on P2 (clock), P1 (data out) and P0 (data in), with P3 as chip
+// select. The serial port can be on any pin; P2 is free of USB and of the
+// LED, and needs no receive pin, as the port only transmits:
+//
+//     i2c := b.pins.i2c(I2C_SDA_PIN, I2C_SCL_PIN, hal.I2C_STANDARD_HZ)!
+//     port := b.pins.uart(UART_TX_PIN, none, 9600)!
+//
+// The LED shares P1 with SPI's data out: release it first,
+// `b.pins.release(b.led)`, by taking the board apart with `let`.
+pub const I2C_SDA_PIN: u32 = 0
+pub const I2C_SCL_PIN: u32 = 2
+pub const SPI_RX_PIN: u32 = 0
+pub const SPI_SELECT_PIN: u32 = 3
+pub const SPI_CLOCK_PIN: u32 = 2
+pub const SPI_TX_PIN: u32 = 1
+pub const UART_TX_PIN: u32 = 2
+// The port cannot receive; Pins.uart takes `none` for its receive pin.
+pub const UART_RX_PIN: u32 = 5
+
+pub struct Board {
+    // The user LED, an output pin that is on when high.
+    pub led: attiny85.Pin
+    // The remaining pins, and the serial port, I2C, SPI, PWM and analog
+    // inputs on them; P1 is already taken by `led`.
+    pub pins: attiny85.Pins
+    // Microseconds since take(), and delays: delay_us, delay_ms, now_us.
+    pub timer: attiny85.Timer
+    // The watchdog, stopped until `start(timeout_ms)`.
+    pub watchdog: attiny85.Watchdog
+    // The 512-byte EEPROM, for data that survives power cycles and
+    // flashing: read(offset, buffer) and update(offset, bytes).
+    pub eeprom: attiny85.Eeprom
+}
+
+// Start the chip's time base and claim the LED. A second call returns
+// hal.Error.Busy.
+pub fn take() -> Board!hal.Error {
+    chip := attiny85.take(attiny85.Config { cpu_hz: CPU_HZ })?
+    led := chip.pins.output(LED_PIN)?
+    let attiny85.Peripherals { pins: pins, timer: timer, watchdog: watchdog, eeprom: eeprom } = chip
+    return ok(Board { led, pins, timer, watchdog, eeprom })
+}
+
+// Write a failed check's message to the serial port, if one is open, as the
+// default panic hook does before it halts. For a panic hook of your own:
+//
+//     extern "C" fn dodo_board_panic(check: *const u8, file: *const u8, line: u32, column: u32) {
+//         unsafe {
+//             board.report_panic(check, file, line, column)
+//         }
+//         board.restart()
+//     }
+//
+// SAFETY: `check` and `file` must be the hook's strings, which are in
+// program memory, and the caller must halt or reset afterwards, as this
+// takes over the serial port.
+pub unsafe fn report_panic(check: *const u8, file: *const u8, line: u32, column: u32) {
+    unsafe {
+        attiny85.report_panic(check, file, line, column)
+    }
+}
+
+// Start the bootloader, as if the board had been plugged in: `dodo run` can
+// flash it for the next five seconds, after which the program starts again.
+// Does not return.
+pub fn reboot_to_bootloader() {
+    attiny85.jump_to_start()
+}
+
+// Restart the program, through the bootloader and its five seconds. Does
+// not return.
+pub fn restart() {
+    attiny85.jump_to_start()
+}

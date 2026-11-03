@@ -1,7 +1,7 @@
 //! Command-line driver. Linking is an explicit process invocation, never a shell command.
 use cli::{Action, Invocation, Parsed};
 use dodoc::codegen::{Context, FileType};
-use dodoc::hardware::{ImageFormat, Platform, esp_flash, image, serial, stk500};
+use dodoc::hardware::{ImageFormat, Platform, esp_flash, image, micronucleus, serial, stk500};
 use dodoc::{cli, codegen, lsp, package, project, sema, toml};
 use project::{Emit, Purpose, Resolved};
 use std::ffi::{OsStr, OsString};
@@ -897,6 +897,13 @@ fn flash(args: &mut Args, platform: Platform, loaded: &package::Loaded) -> Resul
     {
         return flash_stk500(args, platform, loaded, signature, page_size, baud);
     }
+    if let ImageFormat::Micronucleus {
+        signature,
+        page_size,
+    } = platform.chip.image
+    {
+        return flash_micronucleus(args, platform, loaded, signature, page_size);
+    }
     if let ImageFormat::EspFlash {
         chip_id,
         usb,
@@ -1037,6 +1044,48 @@ fn flash_stk500(
             written.bytes,
             flash.length,
             port.display()
+        );
+    }
+    Ok(0)
+}
+/// Build firmware and write it through the board's micronucleus USB
+/// bootloader, waiting for the board to be plugged in, then start it.
+fn flash_micronucleus(
+    args: &mut Args,
+    platform: Platform,
+    loaded: &package::Loaded,
+    signature: [u8; 3],
+    page_size: u16,
+) -> Result<i32, String> {
+    let temp = TempDir::new(&std::env::temp_dir())?;
+    let elf = temp.0.join("firmware.elf");
+    args.emit = Emit::Exe;
+    compile(args, loaded, &elf)?;
+    let bytes = fs::read(&elf).map_err(|e| e.to_string())?;
+    let flashable = image::flat(
+        &bytes,
+        &image::load_segments(&bytes)?,
+        platform.flash().origin,
+    );
+    if args.verbose {
+        eprintln!("Flashing: {} -> micronucleus bootloader", elf.display());
+    }
+    let written = micronucleus::flash(
+        platform.description(),
+        &flashable,
+        signature,
+        page_size,
+        args.verbose,
+        args.quiet,
+    )?;
+    if !args.quiet {
+        eprintln!(
+            "Flashed {} ({} of {} bytes of flash) through micronucleus {}.{:02}",
+            args.input.display(),
+            written.bytes,
+            written.info.flash_size,
+            written.info.major,
+            written.info.minor
         );
     }
     Ok(0)

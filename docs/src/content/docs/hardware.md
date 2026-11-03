@@ -2479,6 +2479,11 @@ writes the firmware through the board's bootloader itself, the way avrdude
 would, then starts it. `dodo build` writes an `.elf` and an Intel HEX `.hex`
 next to it.
 
+A [Digispark](#the-attiny85-and-digispark) (`board = "digispark"`) is
+flashed the same way, through its micronucleus USB bootloader, which runs
+for a few seconds after the board is plugged in: run `dodo run`, then plug
+the board in when it asks.
+
 The `board` setting selects the chip's instruction set, its startup code and
 linker script, and the package `std/embedded/board` resolves to. That package is
 `std/embedded/board/pico` here, and every board package offers the same entry points,
@@ -2519,6 +2524,7 @@ import `std/embedded/board`; keep that code in drivers and test them with fakes.
 | `pico2_w` | `rp2350` | `std/embedded/board/pico2_w`: Raspberry Pi Pico 2 W, 4 MiB flash, LED on the CYW43439 wireless chip. |
 | `esp32c6_devkitc` | `esp32c6` | `std/embedded/board/esp32c6_devkitc`: Espressif ESP32-C6-DevKitC-1, 8 MiB flash, RGB LED (WS2812) on GPIO 8. |
 | `arduino_uno` | `atmega328p` | `std/embedded/board/arduino_uno`: Arduino Uno, 31.5 KiB flash below the bootloader, 2 KiB SRAM, LED on D13. |
+| `digispark` | `attiny85` | `std/embedded/board/digispark`: Digispark and its clones, 6012 bytes of flash below the bootloader, 512 bytes of SRAM, LED on P1. |
 
 ### The RP2040 and Raspberry Pi Pico
 
@@ -2666,6 +2672,87 @@ after a watchdog reset and clears the reset flags first, so
 `dodo run` reaches the bootloader through the reset line instead.
 `scripts/test_arduino_uno.py` runs the board's self-test, which needs nothing
 wired to the board.
+
+### The ATtiny85 and Digispark
+
+The `attiny85` chip is the 8-pin AVR of the Digispark, Digistump's USB
+board, and its many clones (the "Digispark compatible" and "v3" boards with
+a micro USB socket among them). It compiles for `avr-none` and the
+`attiny85` CPU, like the [ATmega328P](#the-atmega328p-and-arduino-uno), and
+everything said there about 16-bit `usize`, program memory, and constants in
+SRAM applies, with less of each: 8 KiB of flash, of which the Digispark's
+bootloader leaves 6012 bytes, and 512 bytes of SRAM. Its core has no
+hardware multiplier and no long jumps, so the runtime multiplies in
+software, and the vector table holds `rjmp`s, which reach all of the flash
+as the program counter wraps around.
+
+```toml
+[targets.blink]
+entry = "main.dodo"
+board = "digispark"
+```
+
+The [blink program](#boards) runs unchanged, in 746 bytes. `dodo run` waits
+for the micronucleus bootloader: the board runs it for about five seconds
+after it is plugged in, so plug it in (or unplug it and plug it in again)
+when `dodo run` asks. It then erases the application flash, writes the
+image a 64-byte page at a time, and starts the program, all through USB
+control requests, so neither the micronucleus tool nor libusb is needed. It
+works with the original 1.x bootloaders and with 2.x. The bootloader cannot
+read flash back, so there is no verification step. On Linux, writing to the
+board's USB device needs permission, which a udev rule grants:
+
+```text
+SUBSYSTEMS=="usb", ATTRS{idVendor}=="16d0", ATTRS{idProduct}=="0753", MODE="0660", TAG+="uaccess"
+```
+
+(in `/etc/udev/rules.d/49-micronucleus.rules`, then `sudo udevadm control
+--reload`). Windows is not supported for flashing yet. The program starts
+once it is written, and again after every power-up, once the bootloader's
+five seconds are over. `board.reboot_to_bootloader()` gets back into the
+bootloader without unplugging, for the next `dodo run`.
+
+| Part | What it does |
+| --- | --- |
+| Vector table | An `rjmp` for reset and each of the 14 interrupts, with weak handlers that `@interrupt(NAME)` replaces: `INT0`, `PCINT0`, `TIMER1_COMPA`, `TIMER1_OVF`, `TIMER0_OVF`, `EE_RDY`, `ANA_COMP`, `ADC`, `TIMER1_COMPB`, `TIMER0_COMPA`, `TIMER0_COMPB`, `WDT`, `USI_START`, `USI_OVF`. micronucleus moves the reset and `PCINT0` vectors into a table of its own and keeps them working. |
+| Reset | As on the ATmega328P. |
+| Time base | `TIMER0_OVF` adds up the microseconds of each Timer 0 overflow once `take` starts it, so `b.timer.now_us()` needs no 64-bit arithmetic; it counts in 3.9 µs steps at 16.5 MHz. |
+| Serial output | `dodo_avr_soft_tx` sends a byte on any pin, timing each bit by counting cycles, as the chip has no UART. |
+| Panic hook | As on the ATmega328P, writing to the serial port if one is open. |
+| Runtime helpers | As on the ATmega328P, with multiplication and 32-bit division in compact assembly. The `f32` helpers are large here: addition alone takes 2.7 KiB, and addition, multiplication and division together do not fit beside a program. |
+| Linker script | Flash from 0 (6012 bytes on the Digispark), 512 bytes of SRAM, and a check that statics and constants leave at least 128 bytes for the stack. |
+
+The Digispark runs at 16.5 MHz from the chip's internal oscillator, which
+the bootloader tunes to the computer's USB clock and leaves tuned, so
+`board.CPU_HZ` is 16,500,000. Flash is tight, and some library code is
+large on an 8-bit core without a multiplier: `std/fmt`'s number formatting
+takes about 3 KiB, `u64` division 1 KiB, and 32-bit arithmetic costs four
+times 8-bit. Prefer `u8` and `u16` where values fit, and write numbers
+out yourself, as `examples/digispark_breathe.dodo` does.
+
+`std/embedded/chip/attiny85` numbers its six pins 0 to 5, PB0 to PB5, which
+the Digispark prints as P0 to P5. P3 and P4 carry USB (with a 1.5 kΩ pull-up
+on P3 and Zener diodes on both), and P5 is the reset pin on most boards.
+`take` starts the time base and returns the peripherals once:
+
+| Part | Interface |
+| --- | --- |
+| Pins | `output(n)`, `input(n)`, and `input_pull_up(n)`; pins implement the pin protocols and `toggle()`. |
+| Serial port | `uart(tx, none, baud)` on any pin, 9600 to 115200 baud, transmit only, with interrupts masked for each frame. Implements the `std/io` Writer and the serial port protocols; reading reports `InvalidInput`. A USB serial adapter's RX on the pin shows the output. |
+| I2C | `i2c(0, 2, hz)` on P0 and P2 through the USI, controller only, up to 400 kHz, with a time limit on every wait. The lines need pull-up resistors, as most modules have. |
+| SPI | `spi(2, 1, some(0), mode, hz)` on P2, P1 and P0 through the USI, controller only, all four modes, at up to a few hundred kHz. The LED shares P1: release it first. |
+| PWM | `pwm(pin, hz)`: P1 and P4 on Timer 1, which they share, from 4 Hz up, with up to 255 steps, fewer at higher frequencies; P0 on Timer 0 at its fixed 1007 Hz. |
+| Analog | `analog(pin)` on P2 to P5 against the supply, and `temperature()`, the chip's sensor against its 1.1 V reference; 10-bit, `attiny85.millicelsius(reading)` converts the sensor's. |
+| Watchdog | `start(timeout_ms)` with the longest of 16 ms to 8 s within the timeout, `feed()`, `stop()`. |
+| EEPROM | The 512-byte EEPROM: `read(offset, buffer)`, `update(offset, bytes)`, and the `hal.Flash` protocol. Flashing leaves it as it was. |
+
+The Digispark has no USB serial port (its bootloader speaks USB, programs
+do not), no UART, random number generator, real-time clock, DMA, or second
+core. `board.restart()` starts the bootloader, which starts the program
+again after its five seconds. `scripts/test_digispark.py` runs the board's
+self-test, which needs nothing wired to the board: lacking a way to send
+data, each part reports the first failed check by when it starts the
+bootloader again.
 
 ### I2C and SPI on the RP2040 and RP2350
 
@@ -4555,8 +4642,9 @@ chip = "rp2040"
 ```
 
 A chip alone assumes 2 MiB of flash (4 MiB for `chip = "rp2350"` and
-`chip = "esp32c6"`, the whole 32 KiB for `chip = "atmega328p"`, whose
-`Config` holds the CPU clock, `cpu_hz`, instead of a crystal). An ESP32-C6
+`chip = "esp32c6"`, the whole 32 KiB for `chip = "atmega328p"` and 8 KiB
+for `chip = "attiny85"`, whose `Config` holds the CPU clock, `cpu_hz`,
+instead of a crystal). An ESP32-C6
 board needs no configuration: `p := chip.take()!`. To give the board a name that
 `std/embedded/board` resolves to, add it to the compiler (see below).
 
@@ -4582,7 +4670,8 @@ The compiler compiles and optimizes the runtime itself with the selected
 target machine, whatever the program's `-O` level, so no assembler or C
 toolchain is involved. `scripts/test_pico.py` (with
 `--board pico`, `--board pico2`, or `--board pico2_w`),
-`scripts/test_esp32c6.py`, and `scripts/test_arduino_uno.py` show how to
+`scripts/test_esp32c6.py`, `scripts/test_arduino_uno.py`, and
+`scripts/test_digispark.py` show how to
 check a chip on real hardware, and `scripts/test_rp2350_float.py` checks the
 RP2350's coprocessor `f64` helpers against the software ones on a board.
 `scripts/test_esp32c6.py --project tests/hardware/esp32c6_buses` (or
@@ -4620,9 +4709,9 @@ dodo build firmware.dodo --emit obj --target thumbv7em-none-eabihf \
 
 ## Current limits
 
-- The boards are `pico`, `pico2`, `pico2_w`, `esp32c6_devkitc`, and
-  `arduino_uno`, on the `rp2040`, `rp2350`, `esp32c6`, and `atmega328p`
-  chips, and `esp32c6_lp` builds for the ESP32-C6's low-power core. The Raspberry Pi chip packages cover clocks, GPIO, I2C, SPI, UART, PWM, the ADC,
+- The boards are `pico`, `pico2`, `pico2_w`, `esp32c6_devkitc`,
+  `arduino_uno`, and `digispark`, on the `rp2040`, `rp2350`, `esp32c6`,
+  `atmega328p`, and `attiny85` chips, and `esp32c6_lp` builds for the ESP32-C6's low-power core. The Raspberry Pi chip packages cover clocks, GPIO, I2C, SPI, UART, PWM, the ADC,
   PIO, the timer, the real-time clock, the watchdog, DMA, a USB serial port,
   the random number generators, low power, and the second core; other USB
   devices (HID, mass storage, several functions at once) or USB host mode

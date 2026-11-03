@@ -212,7 +212,10 @@ far enough for its LED; Wi-Fi and Bluetooth are not supported yet.
 `std/embedded/chip/atmega328p` and `std/embedded/board/arduino_uno` support
 the ATmega328P and Arduino Uno: pins, the serial port, I2C, SPI, PWM, the
 ADC, the watchdog, and the EEPROM, flashed by `dodo run` through the board's
-bootloader.
+bootloader. `std/embedded/chip/attiny85` and `std/embedded/board/digispark`
+do the same for the ATtiny85 and the Digispark, through its micronucleus
+USB bootloader: pins, a transmit-only serial port, I2C and SPI on the USI,
+PWM, the ADC, the watchdog, and the EEPROM.
 `std/embedded/rtc/ds3231` drives a DS3231 battery-backed clock chip on I2C
 through the same real-time clock protocols as the chips' own clocks.
 [Compiler limits](implementation.md) and [container element restrictions](container-elements.md)

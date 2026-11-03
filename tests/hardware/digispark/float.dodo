@@ -1,0 +1,30 @@
+package main
+
+import "checks"
+import "std/embedded/board"
+
+// Digispark self-test, part three: binary32 multiplication and division,
+// whose helpers multiply through the software __mulsi3, comparisons, and
+// conversions (see core.dodo for how the result is reported). Addition,
+// which multiplies nothing, would not fit beside them: the binary32
+// helpers take most of the flash.
+
+fn main() {
+    b := board.take()!
+    third := checks.opaque_f32(1.0) / checks.opaque_f32(3.0)
+    checks.check(third > 0.33333 && third < 0.33334)
+    product := checks.opaque_f32(2.25) * checks.opaque_f32(-4.0)
+    checks.check(product == -9.0)
+    conversion_checks()
+    checks.finish()
+}
+
+@inline(never)
+fn conversion_checks() {
+    converted := checks.opaque_f32(-1234.75) as i32
+    widened := checks.opaque_i32(-7) as f32
+    checks.check(converted == -1234 && widened == -7.0)
+    zero := checks.opaque_f32(0.0)
+    nan := checks.opaque_f32(zero / zero)
+    checks.check(!(nan == nan) && !(nan < 1.0) && !(nan > 1.0) && checks.opaque_f32(-1.0) < checks.opaque_f32(1.0))
+}

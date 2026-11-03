@@ -2573,6 +2573,56 @@ fn avr_runtime_provides_startup_and_helper_symbols() {
     }
 }
 
+#[test]
+fn attiny85_runtime_provides_startup_and_helper_symbols() {
+    let scratch = Scratch::new("attiny85-runtime");
+    let chip = dodoc::hardware::chip("attiny85").unwrap();
+    let object = scratch.0.join("attiny85.o");
+    let options = dodoc::codegen::Options {
+        target: Some(chip.triple.into()),
+        cpu: Some(chip.cpu.into()),
+        optimization: 2,
+        ..Default::default()
+    };
+    dodoc::codegen::compile_ir_object(&options, chip.name, &(chip.runtime)(), &object).unwrap();
+    let bytes = fs::read(&object).unwrap();
+    let text = String::from_utf8_lossy(&bytes);
+    for name in [
+        ".vectors",
+        "__vectors",
+        "__reset",
+        "__do_copy_data",
+        "__do_clear_bss",
+        chip.panic_hook,
+        "dodo_panic_report",
+        "TIMER0_OVF",
+        "dodo_avr_micros",
+        "dodo_avr_set_clock",
+        "dodo_avr_delay_loops32",
+        "dodo_avr_soft_tx",
+        "dodo_avr_jump_to_zero",
+        "dodo_avr_eeprom_write",
+        "dodo_avr_watchdog",
+        "memcpy",
+        "__mulqi3",
+        "__mulhi3",
+        "__mulsi3",
+        "__muldi3",
+        "__mulosi4",
+        "__udivmodqi4",
+        "__udivmodhi4",
+        "__udivmodsi4",
+        "__divmodsi4",
+        "__udivdi3",
+        "__addsf3",
+        "__fixsfsi",
+        "__sync_fetch_and_add_4",
+    ] {
+        assert!(text.contains(name), "attiny85 runtime lacks {name}");
+    }
+    assert!(!text.contains("USART_RX"));
+}
+
 // Function values are word addresses in AVR program memory (address space
 // 1), interrupt handlers use the signal ABI, panic messages stay in flash,
 // and size counts more than speed.
@@ -2719,6 +2769,118 @@ fn main() {
         config.contains("opt-level = 3 # built-in release profile"),
         "{config}"
     );
+}
+
+/// A linked ATtiny85 program: its Intel HEX image starts with the vector
+/// table's rjmp instructions, which micronucleus needs, fits below the
+/// Digispark's bootloader, and holds `.data`'s load image, whose RAM copy
+/// lies in the 512 bytes of SRAM.
+fn check_attiny85_firmware(elf: &Path, flash: usize) -> Vec<u8> {
+    let bytes = fs::read(elf).unwrap();
+    assert_eq!(&bytes[..4], b"\x7fELF");
+    assert_eq!(u16::from_le_bytes([bytes[18], bytes[19]]), 83, "EM_AVR");
+    let image = intel_hex_image(&fs::read_to_string(elf.with_extension("hex")).unwrap());
+    assert!(image.len() <= flash, "{} bytes", image.len());
+    for vector in 0..15 {
+        let word = u16::from_le_bytes([image[2 * vector], image[2 * vector + 1]]);
+        assert_eq!(word & 0xF000, 0xC000, "vector {vector} is not an rjmp");
+    }
+    let start = elf_symbol(&bytes, "__data_start").unwrap();
+    let end = elf_symbol(&bytes, "__data_end").unwrap();
+    let load = elf_symbol(&bytes, "__data_load").unwrap() as usize;
+    assert!((0x80_0060..=0x80_0260).contains(&start) && end >= start);
+    assert_eq!(load + (end - start) as usize, image.len().max(load));
+    image
+}
+
+#[test]
+fn digispark_projects_link_to_flashable_firmware() {
+    if !ld_lld() {
+        return;
+    }
+    let scratch = Scratch::new("digispark");
+    // Board-generic examples that fit, the Digispark's own, and the
+    // hardware self-test's parts.
+    let mut sources = vec![
+        ("examples/blink", vec![], "blink"),
+        ("examples/hal_sensor_board.dodo", vec![], "sensor"),
+        ("examples/digispark_breathe.dodo", vec![], "breathe"),
+    ];
+    for part in ["core", "wide", "float", "peripherals", "buses"] {
+        sources.push(("tests/hardware/digispark", vec!["-b", part], part));
+    }
+    for (source, args, name) in sources {
+        let elf = scratch.path(&format!("{name}.elf"));
+        let source = root().join(source);
+        let mut command = vec!["build", source.to_str().unwrap()];
+        if args.is_empty() {
+            command.extend_from_slice(&["--board", "digispark"]);
+        }
+        command.extend_from_slice(&args);
+        command.extend_from_slice(&["-o", &elf]);
+        let output = dodo(&command);
+        let message = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(output.status.success(), "{command:?}: {message}");
+        let image = check_attiny85_firmware(Path::new(&elf), 6012);
+        if name == "blink" {
+            // The chip package's blink stays small.
+            assert!(image.len() < 1024, "blink takes {} bytes", image.len());
+        }
+    }
+    // A custom board with only `chip` set gets all 8 KiB.
+    let custom = scratch.write(
+        "custom.dodo",
+        "package main\nimport \"std/embedded/chip\"\nfn main() {\n p := chip.take(chip.Config { cpu_hz: 8_000_000 })!\n led := p.pins.output(chip.PB0)!\n led.set_high()\n}\n",
+    );
+    let elf = scratch.path("custom.elf");
+    let output = dodo(&[
+        "build",
+        custom.to_str().unwrap(),
+        "--chip",
+        "attiny85",
+        "-o",
+        &elf,
+    ]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    check_attiny85_firmware(Path::new(&elf), 8192);
+    // Statics and constants live in SRAM on AVR, and the ATtiny85 has 512
+    // bytes.
+    let large = scratch.write(
+        "large.dodo",
+        "package main\nimport \"std/embedded/board\"\nstatic mut TABLE: [400]u8 = [0u8; 400]\nfn main() {\n b := board.take()!\n index := (b.timer.now_us() & 255) as usize\n unsafe {\n TABLE[index + 100] = 7\n b.timer.delay_ms(TABLE[index] as u32)\n }\n}\n",
+    );
+    let error = stderr(&dodo(&[
+        "build",
+        large.to_str().unwrap(),
+        "--board",
+        "digispark",
+        "-o",
+        &scratch.path("large.elf"),
+    ]));
+    assert!(
+        error.contains(
+            "ATtiny85 RAM: statics and constants leave less than 128 of its 512 bytes for the stack"
+        ),
+        "{error}"
+    );
+    // Programs larger than the bootloader leaves fail at the link.
+    let big = scratch.write(
+        "big.dodo",
+        "package main\nimport \"std/embedded/board\"\nimport \"core/ptr\"\nfn main() {\n b := board.take()!\n x: f64 = 1.5\n y := unsafe { ptr.read_volatile(ptr.from_ref(&x)) }\n z := y * y / (y + 1.0)\n b.timer.delay_ms(z as u32)\n}\n",
+    );
+    let error = stderr(&dodo(&[
+        "build",
+        big.to_str().unwrap(),
+        "--board",
+        "digispark",
+        "-o",
+        &scratch.path("big.elf"),
+    ]));
+    assert!(error.contains("will not fit in region 'FLASH'"), "{error}");
 }
 
 /// The flash contents an Intel HEX file describes, gaps erased.

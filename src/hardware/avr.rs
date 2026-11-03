@@ -1,5 +1,7 @@
 //! What the 8-bit AVR chips share: their runtime helpers, assembled from the
-//! chip's startup code, `avr_builtins.ll`, the shared soft-float code with
+//! chip's startup code, `avr_builtins.ll`, the multiplication helpers for
+//! chips with or without the MUL instruction, with their 32-bit division
+//! (`avr_mul.ll`, `avr_nomul.ll`), the shared soft-float code with
 //! native binary32 arithmetic (`avr_float32.ll`) and AVR names
 //! (`avr_float.ll`); and Intel HEX, the image format their bootloaders and
 //! tools take.
@@ -11,11 +13,26 @@
 //! memory, where the chip runtime's panic hook expects them.
 use std::borrow::Cow;
 
+/// Whether an AVR core multiplies in hardware.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Multiplier {
+    /// MUL and its signed forms, as on the ATmega chips (`avr5`).
+    Instruction,
+    /// None, as on the ATtiny85 (`avr25`): products come from shift-and-add
+    /// helpers, and since such chips have little flash, 32-bit division
+    /// from compact assembly too.
+    Software,
+}
+
 /// The runtime IR of an AVR chip: its startup code, which declares the data
 /// layout, followed by the integer and floating-point helpers.
-pub fn runtime(chip: &str) -> Cow<'static, str> {
+pub fn runtime(chip: &str, multiplier: Multiplier) -> Cow<'static, str> {
     let mut text = String::from(chip);
     text.push_str(include_str!("avr_builtins.ll"));
+    text.push_str(match multiplier {
+        Multiplier::Instruction => include_str!("avr_mul.ll"),
+        Multiplier::Software => include_str!("avr_nomul.ll"),
+    });
     text.push_str(&soft_float(concat!(
         include_str!("arm_float.ll"),
         include_str!("arm_float_soft.ll")
@@ -118,7 +135,10 @@ mod tests {
     /// shared code's names do not clash with AVR's.
     #[test]
     fn runtime_defines_the_gnu_names_once() {
-        let text = runtime(include_str!("atmega328p/runtime.ll"));
+        let text = runtime(
+            include_str!("atmega328p/runtime.ll"),
+            Multiplier::Instruction,
+        );
         for name in [
             "__lesf2",
             "__gesf2",
@@ -141,5 +161,27 @@ mod tests {
         }
         assert!(text.starts_with("; Microchip ATmega328P"));
         assert!(text.contains("define weak cc 87 { i16, i16 } @__udivmodhi4"));
+        assert!(text.contains("define weak i32 @__mulsi3("));
+        assert!(text.contains("define weak cc 87 { i32, i32 } @__udivmodsi4("));
+        assert!(!text.contains("__mulhi3:"));
+    }
+
+    /// Chips without MUL get the 8-, 16- and 32-bit products LLVM calls
+    /// for, and no IR __mulsi3 or 32-bit division beside the assembly ones.
+    #[test]
+    fn software_multiplier_runtimes_define_every_product_helper() {
+        let text = runtime(include_str!("attiny85/runtime.ll"), Multiplier::Software);
+        for name in [
+            "__mulqi3",
+            "__mulhi3",
+            "__mulsi3",
+            "__udivmodsi4",
+            "__divmodsi4",
+        ] {
+            assert!(text.contains(&format!("module asm \"{name}:\"")), "{name}");
+        }
+        assert!(!text.contains("@__mulsi3("));
+        assert!(!text.contains("@__udivmodsi4("));
+        assert!(text.starts_with("; Microchip ATtiny85"));
     }
 }

@@ -20,7 +20,12 @@ pub static CHIP: Chip = Chip {
         origin: 0x0080_0100,
         length: 2 * 1024,
     },
-    runtime: || avr::runtime(include_str!("atmega328p/runtime.ll")),
+    runtime: || {
+        avr::runtime(
+            include_str!("atmega328p/runtime.ll"),
+            avr::Multiplier::Instruction,
+        )
+    },
     linker_script: include_str!("atmega328p/link.ld"),
     panic_hook: "dodo_board_panic",
     interrupts: &[
