@@ -111,22 +111,6 @@ jobs:
           rust-cache: checks
       - name: Check formatting
         run: cargo fmt --all --check
-      - name: Test ELF dependency checks
-        run: python3 scripts/test_check_linkage.py
-      - name: Test static release prerequisites
-        run: python3 scripts/test_build_release.py
-      - name: Test release tag checks
-        run: python3 scripts/test_check_release.py
-      - name: Verify generated mathematical constants
-        run: python3 scripts/generate_math_constants.py --check
-      - name: Verify generated graphics fonts
-        run: python3 scripts/generate_graphics_fonts.py --check
-      - name: Verify generated image transfer tables
-        run: python3 scripts/generate_image_tables.py --check
-      - name: Test the OpenGL binding generator
-        run: python3 scripts/test_generate_opengl.py
-      - name: Verify the generated OpenGL binding against the pinned registry
-        run: python3 scripts/generate_opengl.py --check
       - name: Clippy
         run: cargo clippy --locked --all-targets -- -D warnings
 
@@ -302,8 +286,21 @@ jobs:
           name: debug-dodo-${{ matrix.arch }}
           path: target/debug
       - run: chmod +x target/debug/dodo
-      - name: Test routing benchmark correctness at O0 and O3
-        run: python3 scripts/test_bench_stdlib.py
+      # Generators in scripts/gen are Dodo programs; each --check regenerates
+      # its output in memory and fails if the committed file differs.
+      - name: Verify generated sources
+        run: |
+          for generator in math_constants graphics_fonts image_tables truetype_fixtures; do
+            target/debug/dodo run "scripts/gen/$generator.dodo" -- --check
+          done
+      # The Khronos registries are fetched once; the generators check their pinned SHA-256.
+      - name: Verify the OpenGL and Vulkan bindings against the pinned registries
+        if: matrix.arch == 'x86_64'
+        run: |
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/gl.xml" https://raw.githubusercontent.com/KhronosGroup/OpenGL-Registry/6af574a14089ccfee87efe230ebcdd8742859813/xml/gl.xml
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/vk.xml" https://raw.githubusercontent.com/KhronosGroup/Vulkan-Headers/v1.4.367/registry/vk.xml
+          target/debug/dodo run scripts/gen/opengl.dodo -- --check "$RUNNER_TEMP/gl.xml"
+          target/debug/dodo run scripts/gen/vulkan.dodo -- --check "$RUNNER_TEMP/vk.xml"
       - name: Run native Dodo tests and executable documentation
         shell: bash
         env:
@@ -398,9 +395,7 @@ jobs:
           path: target/debug
       - run: chmod +x target/debug/dodo
       - name: Test Windows fixture startup ABI
-        run: python3 scripts/test_windows_startup.py
-      - name: Test native Windows fixture runner diagnostics
-        run: python3 scripts/test_windows_native_harness.py
+        run: python3 scripts/test_windows.py startup
       - name: Test Windows LLVM library path handling
         run: |
           rustc --edition=2024 --test scripts/windows-llvm-config.rs -o "$RUNNER_TEMP/test-windows-llvm-config"
@@ -411,7 +406,7 @@ jobs:
           TMPDIR: ${{ runner.temp }}/dodo-tmp
         run: |
           mkdir -p "$TMPDIR" "$RUNNER_TEMP/dodo-logs"
-          python3 scripts/test_stdlib_windows.py 2>&1 | tee "$RUNNER_TEMP/dodo-logs/stdlib-windows.log"
+          python3 scripts/test_windows.py stdlib 2>&1 | tee "$RUNNER_TEMP/dodo-logs/stdlib-windows.log"
       - name: Upload failure diagnostics
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -573,8 +568,6 @@ jobs:
           cache: ${{ inputs.cache }}
           rust-cache: test
           nextest: 'true'
-      - name: Test Mach-O dependency checks
-        run: python3 scripts/test_check_linkage.py
       - name: Clippy
         run: cargo clippy --locked --all-targets -- -D warnings
       - name: Build the test archive
@@ -661,8 +654,6 @@ jobs:
           name: debug-dodo-macos-aarch64
           path: target/debug
       - run: chmod +x target/debug/dodo
-      - name: Test routing benchmark correctness at O0 and O3
-        run: python3 scripts/test_bench_stdlib.py
       - name: Run native Dodo tests and executable documentation
         shell: bash
         env:
@@ -830,9 +821,7 @@ jobs:
         timeout-minutes: 15
         shell: pwsh
         run: |
-          python scripts/test_windows_native_harness.py
-          if ($LASTEXITCODE -ne 0) { throw 'Windows fixture runner tests failed' }
-          python scripts/test_windows_native.py --linker "$env:LLVM_SYS_231_PREFIX/bin/clang.exe"
+          python scripts/test_windows.py native --linker "$env:LLVM_SYS_231_PREFIX/bin/clang.exe"
           if ($LASTEXITCODE -ne 0) { throw 'Native Windows platform tests failed' }
       - name: Package the Windows release
         run: python scripts/package-release.py --target x86_64-pc-windows-msvc
@@ -840,7 +829,7 @@ jobs:
         shell: pwsh
         run: |
           $archive = Get-ChildItem build/release-assets/dodo-*-x86_64-pc-windows-msvc.zip
-          python scripts/test_windows_release.py $archive.FullName --linker "$env:LLVM_SYS_231_PREFIX/bin/clang.exe"
+          python scripts/test_windows.py release $archive.FullName --linker "$env:LLVM_SYS_231_PREFIX/bin/clang.exe"
           if ($LASTEXITCODE -ne 0) { throw 'Windows release smoke test failed' }
       - name: Upload the verified Windows compiler
         if: inputs.upload

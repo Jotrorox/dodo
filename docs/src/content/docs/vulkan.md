@@ -229,10 +229,11 @@ do not arise.
 
 ## Updating the bindings
 
-`scripts/generate_vulkan.py path/to/vk.xml` regenerates `types.dodo` and
-`commands.dodo` from a registry in
-[Vulkan-Headers](https://github.com/KhronosGroup/Vulkan-Headers); add an
-extension to its `EXTENSIONS` list to bind it.
+`dodo run scripts/gen/vulkan.dodo -- path/to/vk.xml` regenerates `types.dodo`
+and `commands.dodo` from a registry in
+[Vulkan-Headers](https://github.com/KhronosGroup/Vulkan-Headers) (the
+checked-in files come from v1.4.367), and `--check` verifies them instead; add
+an extension to its `extensions()` list to bind it.
 `scripts/vulkan_layout_check.py path/to/vk.xml DIR` writes a C program and a
 Dodo program that print every struct's size, alignment and field offsets;
 their outputs must be identical.

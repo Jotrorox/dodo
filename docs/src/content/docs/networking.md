@@ -380,11 +380,11 @@ slow-peer deadlines, cancellation with partial progress, resource exhaustion and
 cleanup, name-resolution errors, independent Rust TCP peers, parser properties
 and malformed DNS input, checked borrowing and moved socket rejection. Portable
 fixtures cross-compile for wasm32 and Cortex-M0; native fixtures cross-compile to
-Windows x64. `scripts/test_stdlib_windows.py --fixture tests/net/native_checks.dodo`
+Windows x64. `scripts/test_windows.py stdlib --fixture tests/net/native_checks.dodo`
 executes real Windows binaries under Wine, including UDP truncation. Native
 Windows CI runs the loopback and backpressure fixtures at both optimization
 levels and checks connected/accepted socket inheritability with
-`scripts/test_windows_native.py`. This does not cover all network drivers,
+`scripts/test_windows.py native`. This does not cover all network drivers,
 IPv6 interface scopes, resolver configurations, socket exhaustion, or load.
 No Internet endpoint is required: the negative resolver case uses an invalid
 numeric address with `AI_NUMERICHOST`, and hostname resolution uses `localhost`.

@@ -69,7 +69,7 @@ local setup and cleanup. Use loopback peers instead of public services. Validate
 these separately at O0 and O3; do not mark an example executable merely to make
 discovery count it. A silent successful example should assert its result and
 explain what exit 0 proves. Use a fresh loopback port for each automated peer, as
-`scripts/test_http_web.py` does; a recently closed fixed port may still be
+`scripts/test_web.py` does; a recently closed fixed port may still be
 reserved by the OS. Do not use `@test`-only code with a `dodo run` command.
 The test runner checks exit status and assertions, not prose about stdout; compare
 observable output separately when changing a quickstart.
@@ -156,7 +156,6 @@ Verify generated source and extraction behavior from the repository root:
 
 ```sh
 python3 scripts/generate_api_docs.py --check
-python3 scripts/test_generate_api_docs.py
 dodo test docs --doc
 dodo test docs --doc -O 3
 ```

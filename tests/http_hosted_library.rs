@@ -6,8 +6,8 @@ use std::process::Command;
 fn fluent_https_reports_startup_errors_and_preserves_web_features() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let output = Command::new("python3")
-        .arg(root.join("scripts/test_web_https.py"))
-        .arg("--compiler")
+        .arg(root.join("scripts/test_web.py"))
+        .args(["https", "--compiler"])
         .arg(env!("CARGO_BIN_EXE_dodo"))
         .output()
         .unwrap();

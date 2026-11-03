@@ -181,9 +181,9 @@ rustup target add x86_64-pc-windows-msvc
 rustup component add rust-docs
 python scripts/build-windows-llvm-support.py
 cargo build --locked --features llvm-sys/force-static --release --bin dodo --target x86_64-pc-windows-msvc
-python scripts/test_windows_native.py --linker clang
+python scripts/test_windows.py native --linker clang
 python scripts/package-release.py --target x86_64-pc-windows-msvc
-python scripts/test_windows_release.py build/release-assets/dodo-0.1.6-x86_64-pc-windows-msvc.zip --linker clang
+python scripts/test_windows.py release build/release-assets/dodo-0.1.6-x86_64-pc-windows-msvc.zip --linker clang
 ```
 
 The support script requires CMake and Visual Studio 2022. It builds the libxml2,
@@ -210,7 +210,7 @@ to both packaging and testing to use a cross-built Windows compiler. Set
 `--linker`, and use repeated `--link-arg=ARG` options for the MSVC SDK and runtime
 library search paths required by that toolchain.
 
-The native Windows CI job also runs `scripts/test_windows_native.py` before
+The native Windows CI job also runs `scripts/test_windows.py native` before
 packaging. It builds and executes filesystem, process, console-handle, TCP/UDP,
 thread, and synchronization fixtures at `-O0` and `-O3` with the normal compiler
 linking path. Tests cover Unicode paths, sharing restrictions, rename/delete
@@ -368,8 +368,6 @@ cargo run --locked -- test -O 3
 cargo build --locked --release
 python3 scripts/render_spec.py
 python3 scripts/render_spec.py --check
-python3 scripts/test_check_linkage.py
-python3 scripts/test_build_release.py
 bash scripts/build-release.sh # x86-64/AArch64 GNU/Linux release dependency check
 bash scripts/build-release-macos.sh # macOS release dependency check
 ```

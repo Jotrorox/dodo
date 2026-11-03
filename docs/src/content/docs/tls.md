@@ -383,7 +383,7 @@ TLS stream and TCP adapter against Python's independent `ssl` server on controll
 IPv4 loopback. It checks ALPN and local trust, serialized requests, incremental
 response parsing with three-byte input scratch, one-byte body consumption,
 connection nonreuse, and bilateral close_notify at both optimization levels. Native allocation-failure injection checks constructor cleanup at both
-levels. `scripts/test_tls_windows.py` cross-links the credential/engine fixture and the
+levels. `scripts/test_windows.py tls` cross-links the credential/engine fixture and the
 HTTP/TLS/TCP loopback client with an explicitly supplied Windows OpenSSL build.
 It executes four real PE fixtures under Wine: both client/server engines and
 both HTTPS loopback optimization levels. Native Windows deployment still needs checks

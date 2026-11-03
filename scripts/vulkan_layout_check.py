@@ -11,13 +11,22 @@ run `dodo run layout.dodo` for the same architecture; the two outputs must be
 identical. Window-system structs whose headers are rarely installed (Xlib,
 XCB, Wayland, Win32, Metal) are left out; their fields are all pointers and
 32-bit values.
+
+The structs and their Dodo field names are read from the checked-in
+stdlib/std/gpu/vulkan/types.dodo (written by scripts/gen/vulkan.dodo), and
+the C field names from vk.xml, which must be the registry types.dodo was
+generated from.
 """
 
 import os
+import re
 import sys
+import xml.etree.ElementTree as ET
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import generate_vulkan as g  # noqa: E402
+API = "vulkan"
+TYPES = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "stdlib", "std", "gpu", "vulkan", "types.dodo"
+)
 
 PLATFORM_STRUCTS = {
     "VkXlibSurfaceCreateInfoKHR",
@@ -28,13 +37,46 @@ PLATFORM_STRUCTS = {
 }
 
 
+def api_ok(element):
+    api = element.get("api")
+    return api is None or API in api.split(",")
+
+
+def registry_types(path):
+    """vk.xml's type elements by name, as scripts/gen/vulkan.dodo indexes them."""
+    types = {}
+    for t in ET.parse(path).getroot().find("types"):
+        if t.tag != "type" or not api_ok(t):
+            continue
+        name = t.get("name") or (t.findtext("name") or "").strip()
+        if name:
+            types[name] = t
+    return types
+
+
+def generated_structs():
+    """(name, [field, ...]) of every @repr(C) struct in types.dodo, in order."""
+    structs = []
+    with open(TYPES) as f:
+        lines = f.read().split("\n")
+    for index, line in enumerate(lines):
+        if line != "@repr(C)":
+            continue
+        name = re.fullmatch(r"pub struct (\w+) \{", lines[index + 1]).group(1)
+        fields = []
+        for body in lines[index + 2:]:
+            field = re.fullmatch(r"    pub (\w+): .*", body)
+            if not field:
+                break
+            fields.append(field.group(1))
+        structs.append((name, fields))
+    return structs
+
+
 def main():
     if len(sys.argv) != 3:
         raise SystemExit(__doc__)
-    registry = g.Registry(sys.argv[1])
-    registry.select()
-    generator = g.Generator(registry)
-    generator.run()
+    types = registry_types(sys.argv[1])
     c = [
         "#define VK_ENABLE_BETA_EXTENSIONS",
         "#include <vulkan/vulkan.h>",
@@ -52,16 +94,13 @@ def main():
         "",
         "fn main() {",
     ]
-    for name in generator.order:
-        element = registry.types.get(name)
-        if (
-            element is None
-            or element.get("category") not in ("struct", "union")
-            or element.get("alias")
-            or name in PLATFORM_STRUCTS
-        ):
+    for short, fields in generated_structs():
+        name = "Vk" + short
+        element = types.get(name)
+        if element is None:
+            raise SystemExit(f"{name} is not in {sys.argv[1]}; regenerate types.dodo from it")
+        if name in PLATFORM_STRUCTS:
             continue
-        short = g.strip_vk(name)
         c.append(f'    printf("{short} %zu %zu\\n", sizeof({name}), _Alignof({name}));')
         dodo.append(
             f'    console.printf("{short} {{}} {{}}\\n", '
@@ -69,11 +108,10 @@ def main():
         )
         if element.get("category") == "union":
             continue
-        for member in element.findall("member"):
-            if not g.api_ok(member):
-                continue
-            c_field = member.findtext("name")
-            field = g.snake(c_field)
+        members = [m.findtext("name") for m in element.findall("member") if api_ok(m)]
+        if len(members) != len(fields):
+            raise SystemExit(f"{name}: types.dodo does not match {sys.argv[1]}; regenerate it")
+        for c_field, field in zip(members, fields):
             c.append(f'    printf("{short}.{field} %zu\\n", offsetof({name}, {c_field}));')
             dodo.append(
                 f'    console.printf("{short}.{field} {{}}\\n", '
