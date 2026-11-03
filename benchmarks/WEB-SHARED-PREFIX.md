@@ -102,7 +102,6 @@ trie speedup or an end-to-end HTTP throughput improvement.
 
 ```sh
 cargo build --locked --bin dodo
-python scripts/test_bench_stdlib.py
 python scripts/bench_stdlib.py --suite web-dynamic --route-sizes 8 64 256 2048 --samples 5 --seconds 0.1 --linker clang --report benchmark-data/web-shared-prefix.json
 ```
 

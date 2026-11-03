@@ -461,7 +461,7 @@ collection, malformed framing/EOF, body/header/time limits, redirect method and
 body handling, chain/hostname rejection, repeated requests, cancellation, and
 socket cleanup. The existing HTTP/web, TLS, and Windows harnesses continue to
 exercise the lower layers. `--skip-tls` is an explicit reduced test selection.
-`python3 scripts/test_web_https.py` additionally checks fluent routes, middleware,
+`python3 scripts/test_web.py https` additionally checks fluent routes, middleware,
 credential bounds and diagnostics, custom storage, and cancellation at O0/O3;
 it also runs through `cargo test --test http_hosted_library`.
 

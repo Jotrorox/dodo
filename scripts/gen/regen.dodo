@@ -1,0 +1,579 @@
+package regen
+
+import "core/mem"
+import "std/console"
+import "std/env"
+import "std/fs"
+import "std/io"
+import "std/platform"
+
+// Usage: `import "regen"`. Shared plumbing for the generators in scripts/gen:
+// command-line arguments, finding the repository root, output buffers with
+// the number formatting the generators need, byte-string helpers, and the
+// --check / --write handling of generated files and of generated blocks
+// between marker lines.
+//
+// Dodo has no equivalent of Python's __file__, so `find_root` finds the
+// repository root as the nearest directory, current or parent, that holds the
+// generator's own source. Generators therefore run from anywhere inside the
+// checkout.
+
+// Files a generator reads, writes or rewrites must fit this many bytes.
+pub const FILE_LIMIT: usize = 2097152
+
+unsafe extern "C" fn exit(status: i32)
+
+// Exits the process with this status.
+pub fn quit(status: i32) {
+    unsafe {
+        exit(status)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Messages
+
+// Prints `message` to stderr and returns exit status 1.
+pub fn fail(message: &str) -> i32 {
+    errors := console.stderr()
+    errors.println(message)!
+    return 1
+}
+
+// Prints "<relative><message>" to stderr and returns exit status 1.
+pub fn fail_at(relative: &str, message: &str) -> i32 {
+    errors := console.stderr()
+    errors.print(relative)!
+    return fail(message)
+}
+
+// Prints "error: <message>" and exits with status 1.
+pub fn die(message: &str) {
+    errors := console.stderr()
+    errors.printf("error: {}\n", message)!
+    quit(1)
+}
+
+// Writes bytes to stdout.
+pub fn print(bytes: &[u8]) -> i32 {
+    output := console.stdout()
+    match io.write_all(&mut output, bytes) {
+        ok(_) => {
+            return 0
+        },
+        err(_) => {
+            return 1
+        },
+    }
+}
+
+// Prints usage lines to stderr (after a mistake) or stdout (for --help).
+pub fn usage(lines: &[&str], to_stderr: bool) {
+    for i in 0usize..lines.len {
+        if to_stderr {
+            fail(lines[i])
+        } else {
+            print(mem.str_bytes(lines[i]))
+            print(b"\n")
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Arguments
+
+const MAX_ARGUMENTS: usize = 16
+
+// The command-line arguments after the program name, copied once.
+pub struct Arguments {
+    text: [16384]u8
+    starts: [MAX_ARGUMENTS]usize
+    ends: [MAX_ARGUMENTS]usize
+    count: usize
+
+    pub fn len(&self) -> usize {
+        return self.count
+    }
+
+    pub fn get(&self, index: usize) -> &str from(self) {
+        // Captured with TextPolicy.Strict, so every argument is UTF-8.
+        unsafe {
+            return mem.str_from_utf8(&self.text[self.starts[index]..self.ends[index]])
+        }
+    }
+
+    // Whether argument `index` is the literal.
+    pub fn is(&self, index: usize, value: &str) -> bool {
+        return equal(mem.str_bytes(self.get(index)), value)
+    }
+}
+
+pub fn arguments() -> Arguments {
+    result := Arguments { text: [0u8; 16384], starts: [0usize; MAX_ARGUMENTS], ends: [0usize; MAX_ARGUMENTS], count: 0 }
+    storage := platform.list_workspace()
+    found := env.Arguments.capture(&mut storage, platform.TextPolicy.Strict)!
+    used := 0usize
+    for index in 1usize..found.len() {
+        if result.count >= MAX_ARGUMENTS {
+            break
+        }
+        match found.get(index, &mut result.text[used..])! {
+            some(value) => {
+                size := mem.str_bytes(value).len
+                result.starts[result.count] = used
+                result.ends[result.count] = used + size
+                used += size
+                result.count += 1
+            }
+            none => {
+                break
+            }
+        }
+    }
+    return result
+}
+
+// ---------------------------------------------------------------------------
+// The repository root
+
+// Number of "../" steps from the current directory to the repository root.
+static mut UP: usize = 0
+
+// Finds the repository root: the nearest directory, current or up to fifteen
+// parents, containing `self_path` (the generator's own repository path).
+pub fn find_root(self_path: &str) -> bool {
+    probe := [0u8; 1]
+    for levels in 0usize..16 {
+        unsafe {
+            UP = levels
+        }
+        storage := [0u8; 1024]
+        let candidate = path(self_path, &mut storage)
+        workspace := platform.workspace()
+        match fs.read_file(candidate, &mut probe, &mut workspace) {
+            ok(_) => {
+                return true
+            },
+            err(_) => {},
+        }
+    }
+    return false
+}
+
+// Like find_root, printing why when the root is not found.
+pub fn locate_root(self_path: &str) -> bool {
+    if find_root(self_path) {
+        return true
+    }
+    errors := console.stderr()
+    errors.print("cannot find the repository root (no ")!
+    errors.print(self_path)!
+    errors.println(" here or in a parent directory); run inside the dodo checkout")!
+    return false
+}
+
+// A repository-relative path as seen from the current directory.
+pub fn path(relative: &str, storage: &mut[u8]) -> &str from(storage) {
+    spelling := Buf.new(storage)
+    levels := unsafe {
+        UP
+    }
+    for _ in 0usize..levels {
+        spelling.str("../")
+    }
+    spelling.str(relative)
+    used := spelling.used
+    unsafe {
+        return mem.str_from_utf8(&storage[..used])
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Byte strings
+
+pub fn same(a: &[u8], b: &[u8]) -> bool {
+    if a.len != b.len {
+        return false
+    }
+    for i in 0usize..a.len {
+        if a[i] != b[i] {
+            return false
+        }
+    }
+    return true
+}
+
+// Whether the bytes spell the literal.
+pub fn equal(a: &[u8], b: &str) -> bool {
+    return same(a, mem.str_bytes(b))
+}
+
+pub fn starts_with(a: &[u8], prefix: &str) -> bool {
+    p := mem.str_bytes(prefix)
+    return a.len >= p.len && same(&a[..p.len], p)
+}
+
+// The first index at or after `offset` where `needle` occurs in `haystack`.
+pub fn find(haystack: &[u8], needle: &[u8], offset: usize) -> Option<usize> {
+    if needle.len > haystack.len {
+        return none
+    }
+    for start in offset..haystack.len - needle.len + 1 {
+        if same(&haystack[start..start + needle.len], needle) {
+            return some(start)
+        }
+    }
+    return none
+}
+
+// Whether the literal occurs in the bytes.
+pub fn contains(a: &[u8], needle: &str) -> bool {
+    match find(a, mem.str_bytes(needle), 0) {
+        some(_) => {
+            return true
+        },
+        none => {
+            return false
+        },
+    }
+}
+
+// ASCII whitespace as Python's str.isspace sees it.
+pub fn is_space(b: u8) -> bool {
+    return b == b' ' || b == b'\t' || b == b'\n' || b == b'\r' || b == 11 || b == 12
+}
+
+// The bytes without leading and trailing whitespace.
+pub fn trim(line: &[u8]) -> &[u8] from(line) {
+    start := 0usize
+    end := line.len
+    for start < end && is_space(line[start]) {
+        start += 1
+    }
+    for end > start && is_space(line[end - 1]) {
+        end -= 1
+    }
+    return &line[start..end]
+}
+
+// ---------------------------------------------------------------------------
+// Number formatting
+
+// Writes the decimal digits of `value` right-aligned into `digits` (at least
+// 20 bytes) and returns the index of the first one.
+fn decimal(value: u64, digits: &mut[u8]) -> usize {
+    start := digits.len
+    for {
+        start -= 1
+        digits[start] = b'0' + (value % 10) as u8
+        value = value / 10
+        if value == 0 {
+            return start
+        }
+    }
+}
+
+fn hex_digit(value: u8, upper: bool) -> u8 {
+    if value < 10 {
+        return b'0' + value
+    }
+    if upper {
+        return b'A' + value - 10
+    }
+    return b'a' + value - 10
+}
+
+// ---------------------------------------------------------------------------
+// Buffers
+
+// Bytes appended to caller-owned storage. Overflowing the storage traps.
+pub struct Buf {
+    pub data: &mut[u8]
+    pub used: usize
+
+    pub fn new(data: &mut[u8]) -> Buf from(data) {
+        return Buf { data: data, used: 0 }
+    }
+    pub fn byte(&mut self, value: u8) {
+        self.data[self.used] = value
+        self.used += 1
+    }
+    pub fn bytes(&mut self, values: &[u8]) {
+        for i in 0usize..values.len {
+            self.byte(values[i])
+        }
+    }
+    pub fn str(&mut self, value: &str) {
+        self.bytes(mem.str_bytes(value))
+    }
+    // Decimal digits.
+    pub fn uint(&mut self, value: u64) {
+        digits := [0u8; 20]
+        start := decimal(value, &mut digits)
+        self.bytes(&digits[start..])
+    }
+    // Two hexadecimal digits, lowercase or uppercase.
+    pub fn hex2(&mut self, value: u8, upper: bool) {
+        self.byte(hex_digit(value >> 4, upper))
+        self.byte(hex_digit(value & 15, upper))
+    }
+    pub fn view(&self) -> &[u8] from(self) {
+        return &self.data[..self.used]
+    }
+}
+
+// A short text with its own storage, for names and types built piece by
+// piece.
+pub struct Text {
+    data: [1024]u8
+    used: usize
+
+    pub fn new() -> Text {
+        return Text { data: [0u8; 1024], used: 0 }
+    }
+    pub fn clear(&mut self) {
+        self.used = 0
+    }
+    pub fn byte(&mut self, value: u8) {
+        if self.used >= 1024 {
+            die("a name or type is too long")
+        }
+        self.data[self.used] = value
+        self.used += 1
+    }
+    pub fn bytes(&mut self, values: &[u8]) {
+        for i in 0usize..values.len {
+            self.byte(values[i])
+        }
+    }
+    pub fn str(&mut self, value: &str) {
+        self.bytes(mem.str_bytes(value))
+    }
+    pub fn view(&self) -> &[u8] from(self) {
+        return &self.data[..self.used]
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The output: one static buffer that generators of large files append to
+// with the put functions.
+
+static mut OUT: [FILE_LIMIT]u8 = [0u8; FILE_LIMIT]
+static mut OUT_LEN: usize = 0
+
+// Starts a new output file.
+pub fn reset() {
+    unsafe {
+        OUT_LEN = 0
+    }
+}
+
+// The output so far.
+pub fn output() -> &[u8] from(static) {
+    unsafe {
+        return &OUT[0..OUT_LEN]
+    }
+}
+
+pub fn put_byte(value: u8) {
+    unsafe {
+        if OUT_LEN >= FILE_LIMIT {
+            die("the output buffer is full")
+        }
+        OUT[OUT_LEN] = value
+        OUT_LEN += 1
+    }
+}
+
+pub fn put_bytes(value: &[u8]) {
+    for i in 0usize..value.len {
+        put_byte(value[i])
+    }
+}
+
+pub fn put(value: &str) {
+    put_bytes(mem.str_bytes(value))
+}
+
+// A literal followed by a line end.
+pub fn line(value: &str) {
+    put(value)
+    put_byte(b'\n')
+}
+
+// An unsigned decimal number.
+pub fn put_int(value: u64) {
+    digits := [0u8; 20]
+    start := decimal(value, &mut digits)
+    put_bytes(&digits[start..])
+}
+
+// The two's-complement bits of a signed number in decimal.
+pub fn put_signed(bits: u64) {
+    if bits >> 63 != 0 {
+        put_byte(b'-')
+        put_int(core.wrapping_add(~bits, 1u64))
+    } else {
+        put_int(bits)
+    }
+}
+
+// Lowercase hexadecimal with a 0x prefix, like Python's hex().
+pub fn put_hex(value: u64) {
+    put("0x")
+    started := false
+    for i in 0u64..16 {
+        digit := ((value >> (60 - 4 * i)) & 15) as u8
+        if digit != 0 || started || i == 15 {
+            started = true
+            put_byte(hex_digit(digit, false))
+        }
+    }
+}
+
+// Removes trailing line ends, keeping exactly one.
+pub fn end_with_one_newline() {
+    unsafe {
+        for OUT_LEN > 0 && OUT[OUT_LEN - 1] == b'\n' {
+            OUT_LEN -= 1
+        }
+    }
+    put_byte(b'\n')
+}
+
+// ---------------------------------------------------------------------------
+// Generated files
+
+// A checked-in file, read for comparison and rewritten in place.
+static mut OLD: [FILE_LIMIT]u8 = [0u8; FILE_LIMIT]
+
+// Reads a repository file into `storage`; none (after printing why) if it is
+// missing, unreadable or larger than `storage`.
+pub fn read(relative: &str, storage: &mut[u8]) -> Option<usize> {
+    path_storage := [0u8; 1024]
+    let spelling = path(relative, &mut path_storage)
+    workspace := platform.workspace()
+    match fs.read_file(spelling, storage, &mut workspace) {
+        ok(report) => {
+            if !report.eof {
+                fail_at(relative, " is too large for the generator's buffer")
+                return none
+            }
+            return some(report.read)
+        },
+        err(_) => {
+            fail_at(relative, ": cannot read the file")
+            return none
+        },
+    }
+}
+
+// Replaces a repository file. Returns the exit status.
+pub fn write(relative: &str, data: &[u8]) -> i32 {
+    path_storage := [0u8; 1024]
+    let spelling = path(relative, &mut path_storage)
+    workspace := platform.workspace()
+    match fs.write_file(spelling, data, &mut workspace) {
+        ok() => {
+            return 0
+        },
+        err(_) => {
+            return fail_at(relative, ": cannot write the file")
+        },
+    }
+}
+
+// Prints "<relative> is out of date; run <command>" (without the "; run"
+// part when `command` is empty) and returns exit status 1.
+fn stale(relative: &str, command: &str) -> i32 {
+    errors := console.stderr()
+    errors.print(relative)!
+    errors.print(" is out of date")!
+    if mem.str_bytes(command).len > 0 {
+        errors.print("; run ")!
+        errors.print(command)!
+    }
+    errors.println("")!
+    return 1
+}
+
+// Compares (check) or replaces (write) a whole repository file. `command`
+// says how to regenerate it. Returns the exit status.
+pub fn update_file(relative: &str, generated: &[u8], check: bool, command: &str) -> i32 {
+    if !check {
+        return write(relative, generated)
+    }
+    unsafe {
+        match read(relative, &mut OLD) {
+            some(used) => {
+                if same(&OLD[..used], generated) {
+                    return 0
+                }
+                return stale(relative, command)
+            },
+            none => {
+                return 1
+            },
+        }
+    }
+}
+
+// Compares (check) or replaces (write) the part of a repository file from the
+// first `begin` through the end of the first `end` after it. `generated` must
+// itself start with `begin` and end with `end`. Returns the exit status.
+pub fn update_block(relative: &str, begin: &str, end: &str, generated: &[u8], check: bool, command: &str) -> i32 {
+    unsafe {
+        used := 0usize
+        match read(relative, &mut OLD) {
+            some(count) => {
+                used = count
+            },
+            none => {
+                return 1
+            },
+        }
+        start := 0usize
+        stop := 0usize
+        match find(&OLD[..used], mem.str_bytes(begin), 0) {
+            some(found) => {
+                start = found
+            },
+            none => {
+                return fail_at(relative, ": missing the generated block's first line")
+            },
+        }
+        match find(&OLD[..used], mem.str_bytes(end), start) {
+            some(found) => {
+                stop = found + mem.str_bytes(end).len
+            },
+            none => {
+                return fail_at(relative, ": missing the generated block's last line")
+            },
+        }
+        if same(&OLD[start..stop], generated) {
+            return 0
+        }
+        if check {
+            return stale(relative, command)
+        }
+        // Move the text after the block into place, then copy the block in.
+        size := used - stop + start + generated.len
+        if size > FILE_LIMIT {
+            return fail_at(relative, " is too large for the generator's buffer")
+        }
+        moved := start + generated.len
+        tail := used - stop
+        for i in 0usize..tail {
+            k := if moved > stop {
+                tail - 1 - i
+            } else {
+                i
+            }
+            OLD[moved + k] = OLD[stop + k]
+        }
+        for i in 0usize..generated.len {
+            OLD[start + i] = generated[i]
+        }
+        return write(relative, &OLD[..size])
+    }
+}

@@ -283,8 +283,8 @@ fn runnable_examples_interoperate_with_independent_http_peer() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     success(
         Command::new("python3")
-            .arg(root.join("scripts/test_http_web.py"))
-            .arg("--compiler")
+            .arg(root.join("scripts/test_web.py"))
+            .args(["http", "--compiler"])
             .arg(env!("CARGO_BIN_EXE_dodo"))
             .output()
             .unwrap(),
@@ -296,8 +296,8 @@ fn concurrent_server_keeps_peers_independent_and_bounds_reuse() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     success(
         Command::new("python3")
-            .arg(root.join("scripts/test_web_reactor.py"))
-            .arg("--compiler")
+            .arg(root.join("scripts/test_web.py"))
+            .args(["reactor", "--compiler"])
             .arg(env!("CARGO_BIN_EXE_dodo"))
             .output()
             .unwrap(),
@@ -341,8 +341,8 @@ fn buffered_requests_and_responses_interoperate_with_independent_peers() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     success(
         Command::new("python3")
-            .arg(root.join("scripts/test_web_request_response.py"))
-            .arg("--compiler")
+            .arg(root.join("scripts/test_web.py"))
+            .args(["request-response", "--compiler"])
             .arg(env!("CARGO_BIN_EXE_dodo"))
             .output()
             .unwrap(),
@@ -368,8 +368,8 @@ fn application_setup_limits_and_shutdown_execute() {
     }
     success(
         Command::new("python3")
-            .arg(root.join("scripts/test_web_app.py"))
-            .arg("--compiler")
+            .arg(root.join("scripts/test_web.py"))
+            .args(["app", "--compiler"])
             .arg(env!("CARGO_BIN_EXE_dodo"))
             .output()
             .unwrap(),
@@ -381,8 +381,8 @@ fn fluent_applications_interoperate_with_independent_peers() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     success(
         Command::new("python3")
-            .arg(root.join("scripts/test_web_developer.py"))
-            .arg("--compiler")
+            .arg(root.join("scripts/test_web.py"))
+            .args(["developer", "--compiler"])
             .arg(env!("CARGO_BIN_EXE_dodo"))
             .output()
             .unwrap(),

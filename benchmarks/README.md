@@ -108,9 +108,7 @@ This suite can run on hosts such as macOS without Dodo hosted adapters; the
 other suites require supported hosted targets. Each scan/index pair discards
 calibration and one warmup per mode, then alternates execution order across
 measured batches. IDs, HEAD flags, and exact 404/405 errors are asserted in the
-loop; Python checks checksums, including partial route cycles. Run correctness
-guards with `python scripts/test_bench_stdlib.py` after building Dodo (O0/O3,
-all five layouts and four request classes, including an incomplete mixed group).
+loop; Python checks checksums, including partial route cycles.
 `web_operations.dodo` compares ordinal and sequential header access, parameter
 access, and validated-path lookup. Its capture and path-proof construction are
 outside timing; the application benchmark includes request construction.
