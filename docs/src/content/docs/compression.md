@@ -230,6 +230,8 @@ whole compressed input up front. It ignores bytes after the stream, and
 `decompressed_size(input, window, workspace)` decodes through such a window,
 discarding the data, to size an output buffer.
 
-`scripts/generate_brotli_tables.py` generates the static dictionary, checked
+`scripts/gen/brotli_tables.dodo` generates the static dictionary, checked
 against RFC 7932's length and CRC-32 and against google/brotli's
 `dictionary.bin`, and the transform and context tables, parsed from the RFC.
+Both inputs are pinned by SHA-256; the generator's usage text lists the
+`curl` commands that fetch them.

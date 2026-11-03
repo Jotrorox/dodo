@@ -213,7 +213,7 @@ Underlying byte and UTF-16 constructors and caller-slice APIs remain available.
 `-O0` and `-O3`, controlled temporary files/local children, native text failures,
 exact boundaries, retained output, timeout cleanup, and injected clock failures.
 The hosted fixtures also emit Windows objects; execute them with
-`scripts/test_stdlib_windows.py` when Clang, MinGW headers/libraries and Wine are
+`scripts/test_windows.py stdlib` when Clang, MinGW headers/libraries and Wine are
 available. That does not substitute for native Windows execution. The portable
 `io_bounded`, time, and lexical-path fixtures continue to emit WebAssembly and
 Cortex-M0 objects without hosted providers.

@@ -411,7 +411,7 @@ and run them in Wine at both optimization levels:
 
 ```sh
 cargo build --locked --bin dodo
-python3 scripts/test_stdlib_windows.py
+python3 scripts/test_windows.py stdlib
 python3 scripts/test_portable_stdlib.py
 ```
 

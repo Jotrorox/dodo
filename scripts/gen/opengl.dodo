@@ -1,0 +1,789 @@
+package main
+
+// Generate stdlib/std/gpu/opengl/gl.dodo from the Khronos OpenGL registry.
+//
+// Usage: dodo run scripts/gen/opengl.dodo -- (--check | --write) path/to/gl.xml
+//
+// The output is the raw OpenGL binding: every enum and command of the OpenGL
+// 4.6 core profile, one to one. Commands are reached through a table of
+// function addresses that `gl.load` fills from a context's loader, so a
+// program links no OpenGL library and starts on machines without one.
+//
+// Names follow Dodo style: `glTexImage2D` becomes `gl.tex_image_2d`,
+// `GL_COLOR_BUFFER_BIT` becomes `gl.COLOR_BUFFER_BIT`, and parameters are
+// snake_case. Reserved words get a trailing underscore (`type_`).
+//
+// The registry is pinned: download gl.xml from the OpenGL-Registry commit
+// below (the usage text prints the curl command); its SHA-256 is verified
+// before anything is generated. To move to a newer registry, update COMMIT
+// and SHA256 together and run --write. Run with --check to verify the
+// checked-in file or --write to regenerate it. Paths in the repository
+// resolve from the repository root, wherever inside it this runs.
+
+import "core/mem"
+import "std/console"
+import "regen"
+import "sha256"
+import "xml"
+
+const TARGET: &str = "stdlib/std/gpu/opengl/gl.dodo"
+const API: &str = "gl"
+const PROFILE: &str = "core"
+const VERSION_MAJOR: u32 = 4
+const VERSION_MINOR: u32 = 6
+const COMMIT: &str = "6af574a14089ccfee87efe230ebcdd8742859813"
+const SHA256: &str = "b9ca2cfa5c676e901c20d34af3407f1687cde0f1336a5ff7a8974d04c7494ad3"
+const URL: &str = "https://raw.githubusercontent.com/KhronosGroup/OpenGL-Registry/6af574a14089ccfee87efe230ebcdd8742859813/xml/gl.xml"
+
+const DEBUG_PROC: &str = "extern \"C\" fn(u32, u32, u32, u32, i32, *const u8, *const u8)"
+
+// Dodo's reserved words, plus contextual names a parameter must not shadow.
+fn reserved(name: &[u8]) -> bool {
+    words := [
+        "package", "import", "pub", "fn", "struct", "enum", "interface", "type", "dyn", "const",
+        "let", "return", "if", "else", "for", "in", "break", "continue", "match", "unsafe", "extern",
+        "as", "from", "stores", "requires_plain", "static", "void", "mut", "true", "false", "asm",
+        "self", "Self", "some", "none", "ok", "err", "core",
+    ]
+    for i in 0usize..words.len {
+        if regen.equal(name, words[i]) {
+            return true
+        }
+    }
+    return false
+}
+
+// The Dodo type of a GL scalar type name, or "" when it is not one.
+fn scalar(name: &[u8]) -> &str from(static) {
+    names := [
+        "GLenum", "GLboolean", "GLbitfield", "GLbyte", "GLubyte", "GLshort", "GLushort", "GLint",
+        "GLuint", "GLsizei", "GLfloat", "GLclampf", "GLdouble", "GLclampd", "GLchar", "GLhalf",
+        "GLfixed", "GLintptr", "GLsizeiptr", "GLint64", "GLuint64", "GLsync", "void",
+    ]
+    // GLsync is an opaque driver handle; `void` as a pointee is a byte.
+    types := [
+        "u32", "u8", "u32", "i8", "u8", "i16", "u16", "i32", "u32", "i32", "f32", "f32", "f64",
+        "f64", "u8", "u16", "i32", "isize", "isize", "i64", "u64", "*mut u8", "u8",
+    ]
+    for i in 0usize..names.len {
+        if regen.equal(name, names[i]) {
+            return types[i]
+        }
+    }
+    return ""
+}
+
+fn is_upper(c: u8) -> bool {
+    return c >= b'A' && c <= b'Z'
+}
+
+fn is_lower(c: u8) -> bool {
+    return c >= b'a' && c <= b'z'
+}
+
+fn is_digit(c: u8) -> bool {
+    return c >= b'0' && c <= b'9'
+}
+
+fn is_alpha(c: u8) -> bool {
+    return is_upper(c) || is_lower(c)
+}
+
+fn lower(c: u8) -> u8 {
+    if is_upper(c) {
+        return c + 32
+    }
+    return c
+}
+
+// `TexImage2D` -> `tex_image_2d`, `VertexAttribI4ui` -> `vertex_attrib_i4ui`.
+fn snake(name: &[u8], out: &mut regen.Text) {
+    raw := regen.Text.new()
+    for index in 0usize..name.len {
+        c := name[index]
+        previous: u8 = if index > 0 {
+            name[index - 1]
+        } else {
+            0
+        }
+        following: u8 = if index + 1 < name.len {
+            name[index + 1]
+        } else {
+            0
+        }
+        if is_upper(c) && (is_lower(previous) || (is_upper(previous) && is_lower(following))) {
+            // A new word: after a lowercase letter, or the last capital of an
+            // acronym that starts one (`2DMultisample`, `IPointer`).
+            raw.byte(b'_')
+        } else if is_digit(c) && is_alpha(previous) {
+            // A lone capital before a digit is a type prefix (I4ui, P4uiv, L1d).
+            lone := is_upper(previous) && (index < 2 || !is_upper(name[index - 2]))
+            // Matrix dimensions stay together (`Matrix2x3fv`).
+            dimension := previous == b'x' && index >= 2 && is_digit(name[index - 2])
+            if !lone && !dimension {
+                raw.byte(b'_')
+            }
+        }
+        raw.byte(lower(c))
+    }
+    // Python's str.replace("__", "_").
+    text := raw.view()
+    i := 0usize
+    for i < text.len {
+        if text[i] == b'_' && i + 1 < text.len && text[i + 1] == b'_' {
+            out.byte(b'_')
+            i += 2
+        } else {
+            out.byte(text[i])
+            i += 1
+        }
+    }
+}
+
+fn identifier(name: &[u8], out: &mut regen.Text) {
+    out.clear()
+    snake(name, out)
+    if reserved(out.view()) {
+        out.byte(b'_')
+    }
+}
+
+// The C type text of a <proto> or <param>, without its name, with runs of
+// whitespace collapsed to one space.
+fn c_type(element: u32, out: &mut regen.Text) {
+    raw := regen.Text.new()
+    raw.bytes(xml.text(element))
+    child := xml.first(element)
+    for child != xml.NONE {
+        if xml.is(child, "name") {
+            break
+        }
+        raw.bytes(xml.text(child))
+        raw.bytes(xml.tail(child))
+        child = xml.next(child)
+    }
+    out.clear()
+    text := raw.view()
+    pending_space := false
+    for i in 0usize..text.len {
+        c := text[i]
+        if c == b' ' || c == b'\t' || c == b'\n' || c == b'\r' {
+            pending_space = out.view().len > 0
+        } else {
+            if pending_space {
+                out.byte(b' ')
+                pending_space = false
+            }
+            out.byte(c)
+        }
+    }
+}
+
+fn fail_type(context: &[u8], text: &[u8]) {
+    errors := console.stderr()
+    errors.write(context)!
+    errors.printf(": unsupported C type '")!
+    errors.write(text)!
+    errors.printf("'\n")!
+    regen.quit(1)
+}
+
+// Write the Dodo type of the C type text to the output.
+fn put_type(text: &[u8], context: &[u8]) {
+    // Split into tokens with `const` and `*` standing alone.
+    starts := [0usize; 32]
+    ends := [0usize; 32]
+    count := 0usize
+    i := 0usize
+    for i < text.len {
+        c := text[i]
+        if c == b' ' {
+            i += 1
+            continue
+        }
+        if count >= 32 {
+            fail_type(context, text)
+        }
+        start := i
+        if c == b'*' {
+            i += 1
+        } else if i + 5 <= text.len && regen.equal(&text[i..i + 5], "const") {
+            i += 5
+        } else {
+            for i < text.len && text[i] != b' ' && text[i] != b'*' && !(i + 5 <= text.len && regen.equal(&text[i..i + 5], "const")) {
+                i += 1
+            }
+        }
+        starts[count] = start
+        ends[count] = i
+        count += 1
+    }
+    if count == 1 && regen.equal(&text[starts[0]..ends[0]], "GLDEBUGPROC") {
+        regen.put(DEBUG_PROC)
+        return
+    }
+    base := 0usize
+    bases := 0usize
+    stars := 0usize
+    for t in 0usize..count {
+        token := &text[starts[t]..ends[t]]
+        if regen.equal(token, "*") {
+            stars += 1
+        } else if !regen.equal(token, "const") && !regen.equal(token, "struct") {
+            base = t
+            bases += 1
+        }
+    }
+    if bases != 1 {
+        fail_type(context, text)
+    }
+    base_name := &text[starts[base]..ends[base]]
+    result := scalar(base_name)
+    if mem.str_bytes(result).len == 0 {
+        fail_type(context, text)
+    }
+    if stars == 0 {
+        if regen.equal(base_name, "void") {
+            regen.put("void")
+        } else {
+            regen.put(result)
+        }
+        return
+    }
+    // Build from the inside out. The first pointer's pointee is the base,
+    // constant when `const` comes before the first `*`; each later pointer's
+    // pointee is the previous pointer, constant when `const` follows its `*`.
+    // The outermost pointer is written first.
+    level := stars
+    for level > 0 {
+        level -= 1
+        // The tokens between star `level - 1` (or the start) and star `level`.
+        seen := 0usize
+        constant := false
+        for t in 0usize..count {
+            token := &text[starts[t]..ends[t]]
+            if regen.equal(token, "*") {
+                seen += 1
+                if seen > level {
+                    break
+                }
+            } else if seen == level && regen.equal(token, "const") {
+                constant = true
+            }
+        }
+        if constant {
+            regen.put("*const ")
+        } else {
+            regen.put("*mut ")
+        }
+    }
+    regen.put(result)
+}
+
+// Whether the C type text maps to `void`.
+fn is_void(text: &[u8]) -> bool {
+    return regen.equal(text, "void")
+}
+
+// ---------------------------------------------------------------------------
+// Selection
+
+const COMMANDS: u32 = 1
+const ENUMS: u32 = 2
+const SEEN_COMMANDS: u32 = 3
+const SEEN_ENUMS: u32 = 4
+const REMOVED_COMMANDS: u32 = 5
+const REMOVED_ENUMS: u32 = 6
+const TAKEN: u32 = 7
+
+const MAX_ITEMS: usize = 65536
+static mut WANTED_COMMANDS: [MAX_ITEMS]u64 = [0u64; MAX_ITEMS]
+static mut COMMAND_MAJOR: [MAX_ITEMS]u32 = [0u32; MAX_ITEMS]
+static mut COMMAND_MINOR: [MAX_ITEMS]u32 = [0u32; MAX_ITEMS]
+static mut COMMAND_COUNT: usize = 0
+static mut WANTED_ENUMS: [MAX_ITEMS]u64 = [0u64; MAX_ITEMS]
+static mut ENUM_COUNT: usize = 0
+
+// The selected commands and enums, after removals: element numbers.
+static mut OUT_COMMANDS: [MAX_ITEMS]u32 = [0u32; MAX_ITEMS]
+static mut OUT_MAJOR: [MAX_ITEMS]u32 = [0u32; MAX_ITEMS]
+static mut OUT_MINOR: [MAX_ITEMS]u32 = [0u32; MAX_ITEMS]
+static mut OUT_COMMAND_COUNT: usize = 0
+static mut OUT_ENUMS: [MAX_ITEMS]u32 = [0u32; MAX_ITEMS]
+static mut OUT_ENUM_COUNT: usize = 0
+
+// Parse "4.6" into (4, 6); a third part makes the version newer than any
+// two-part one with the same prefix.
+fn feature_wanted(number: &[u8], major: &mut u32, minor: &mut u32) -> bool {
+    parts := [0u32; 8]
+    count := 1usize
+    for i in 0usize..number.len {
+        c := number[i]
+        if c == b'.' {
+            count += 1
+            if count > 8 {
+                xml.fail_at("bad feature number", number)
+            }
+        } else if c >= b'0' && c <= b'9' {
+            parts[count - 1] = parts[count - 1] * 10 + (c - b'0') as u32
+        } else {
+            xml.fail_at("bad feature number", number)
+        }
+    }
+    *major = parts[0]
+    *minor = parts[1]
+    if parts[0] != VERSION_MAJOR {
+        return parts[0] < VERSION_MAJOR
+    }
+    if count < 2 {
+        return true
+    }
+    if parts[1] != VERSION_MINOR {
+        return parts[1] < VERSION_MINOR
+    }
+    return count <= 2
+}
+
+fn profile_ok(element: u32) -> bool {
+    return !xml.has(element, "profile") || regen.equal(xml.get(element, "profile"), PROFILE)
+}
+
+fn collect() {
+    root := xml.root()
+    commands := xml.find(root, "commands")
+    command := xml.first(commands)
+    for command != xml.NONE {
+        proto := xml.find(command, "proto")
+        name := xml.find(proto, "name")
+        xml.put(COMMANDS, xml.text_str(name), command)
+        command = xml.next(command)
+    }
+    group := xml.find(root, "enums")
+    for group != xml.NONE {
+        value := xml.find(group, "enum")
+        for value != xml.NONE {
+            api := xml.get(value, "api")
+            if api.len == 0 || regen.equal(api, API) {
+                xml.put(ENUMS, xml.get_str(value, "name"), value)
+            }
+            value = xml.find_next(value, "enum")
+        }
+        group = xml.find_next(group, "enums")
+    }
+
+    feature := xml.find(root, "feature")
+    for feature != xml.NONE {
+        major := 0u32
+        minor := 0u32
+        if regen.equal(xml.get(feature, "api"), API) && feature_wanted(xml.get(feature, "number"), &mut major, &mut minor) {
+            require := xml.find(feature, "require")
+            for require != xml.NONE {
+                if profile_ok(require) {
+                    item := xml.first(require)
+                    for item != xml.NONE {
+                        name := xml.get_str(item, "name")
+                        if xml.is(item, "command") && !xml.present(SEEN_COMMANDS, xml.bytes(name)) {
+                            xml.put(SEEN_COMMANDS, name, 1)
+                            unsafe {
+                                WANTED_COMMANDS[COMMAND_COUNT] = name
+                                COMMAND_MAJOR[COMMAND_COUNT] = major
+                                COMMAND_MINOR[COMMAND_COUNT] = minor
+                                COMMAND_COUNT += 1
+                            }
+                        } else if xml.is(item, "enum") && !xml.present(SEEN_ENUMS, xml.bytes(name)) {
+                            xml.put(SEEN_ENUMS, name, 1)
+                            unsafe {
+                                WANTED_ENUMS[ENUM_COUNT] = name
+                                ENUM_COUNT += 1
+                            }
+                        }
+                        item = xml.next(item)
+                    }
+                }
+                require = xml.find_next(require, "require")
+            }
+            remove := xml.find(feature, "remove")
+            for remove != xml.NONE {
+                if profile_ok(remove) {
+                    item := xml.first(remove)
+                    for item != xml.NONE {
+                        if xml.is(item, "command") {
+                            xml.put(REMOVED_COMMANDS, xml.get_str(item, "name"), 1)
+                        } else if xml.is(item, "enum") {
+                            xml.put(REMOVED_ENUMS, xml.get_str(item, "name"), 1)
+                        }
+                        item = xml.next(item)
+                    }
+                }
+                remove = xml.find_next(remove, "remove")
+            }
+        }
+        feature = xml.find_next(feature, "feature")
+    }
+
+    unsafe {
+        for i in 0usize..COMMAND_COUNT {
+            name := xml.bytes(WANTED_COMMANDS[i])
+            if xml.present(REMOVED_COMMANDS, name) {
+                continue
+            }
+            element := xml.lookup(COMMANDS, name)
+            if element == xml.NONE {
+                xml.fail_at("unknown command", name)
+            }
+            OUT_COMMANDS[OUT_COMMAND_COUNT] = element
+            OUT_MAJOR[OUT_COMMAND_COUNT] = COMMAND_MAJOR[i]
+            OUT_MINOR[OUT_COMMAND_COUNT] = COMMAND_MINOR[i]
+            OUT_COMMAND_COUNT += 1
+        }
+        for i in 0usize..ENUM_COUNT {
+            name := xml.bytes(WANTED_ENUMS[i])
+            if xml.present(REMOVED_ENUMS, name) {
+                continue
+            }
+            element := xml.lookup(ENUMS, name)
+            if element == xml.NONE {
+                xml.fail_at("unknown enum", name)
+            }
+            OUT_ENUMS[OUT_ENUM_COUNT] = element
+            OUT_ENUM_COUNT += 1
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Rendering
+
+fn command_name(command: u32) -> &[u8] from(static) {
+    return xml.findtext(xml.find(command, "proto"), "name")
+}
+
+fn render() {
+    collect()
+    count := unsafe {
+        OUT_COMMAND_COUNT
+    }
+    commit := mem.str_bytes(COMMIT)
+    regen.line("package gl")
+    regen.line("")
+    regen.line("// GENERATED by scripts/gen/opengl.dodo from the Khronos OpenGL registry")
+    regen.put("// (gl.xml at OpenGL-Registry ")
+    regen.put_bytes(&commit[0..12])
+    regen.line(", Apache-2.0). Do not edit;")
+    regen.line("// regenerate instead.")
+    regen.line("//")
+    regen.put("// The OpenGL ")
+    regen.put_int(VERSION_MAJOR as u64)
+    regen.put(".")
+    regen.put_int(VERSION_MINOR as u64)
+    regen.line(" core profile, one to one: every enum is a")
+    regen.line("// constant and every command an unsafe function. `glClearColor` is")
+    regen.line("// `gl.clear_color` and `GL_COLOR_BUFFER_BIT` is `gl.COLOR_BUFFER_BIT`.")
+    regen.line("// GLboolean is u8, GLsizei i32, GLintptr and GLsizeiptr isize, GLsync a raw")
+    regen.line("// pointer and `void *` a byte pointer. Constants are u32 (u64 when the")
+    regen.line("// registry says so); cast them where a command takes GLint.")
+    regen.line("//")
+    regen.line("// Commands go through a table of addresses that load() fills with the")
+    regen.line("// current context's entry points; std/gpu/opengl does that when it makes a")
+    regen.line("// context current. Calling a command that is not loaded, because no context")
+    regen.line("// was made current or the driver lacks it (macOS stops at 4.1), panics.")
+    regen.line("// Like the C API, the commands are unsafe: they take raw pointers, act on")
+    regen.line("// the calling thread's current context and leave validity to the caller.")
+    regen.line("")
+    regen.line("import \"core/bytes\"")
+    regen.line("import \"core/mem\"")
+    regen.line("import \"core/ptr\"")
+    regen.line("")
+    regen.put("pub const COMMAND_COUNT: usize = ")
+    regen.put_int(count as u64)
+    regen.line("")
+    regen.line("")
+    regen.put("static mut ADDRESSES: [")
+    regen.put_int(count as u64)
+    regen.put("]usize = [0; ")
+    regen.put_int(count as u64)
+    regen.line("]")
+    regen.line("")
+    regen.line("// The registry name of every command, NUL-terminated, in table order.")
+    regen.put("const NAMES: &[u8] = b\"")
+    for index in 0usize..count {
+        command := unsafe {
+            OUT_COMMANDS[index]
+        }
+        regen.put_bytes(command_name(command))
+        regen.put("\\0")
+    }
+    regen.line("\"")
+    regen.line("")
+    regen.line("// Fill the table: resolve receives each command's NUL-terminated registry")
+    regen.line("// name (\"glClearColor\") and returns its address or null. Returns how many")
+    regen.line("// commands resolved. Entries resolve() does not know are cleared, so a")
+    regen.line("// table loaded for one context never keeps another's addresses.")
+    regen.line("pub unsafe fn load(resolve: &mut dyn fn(*const u8) -> usize) -> usize {")
+    regen.line("    loaded := 0usize")
+    regen.line("    start := 0usize")
+    regen.line("    index := 0usize")
+    regen.line("    for index < COMMAND_COUNT {")
+    regen.line("        end := start")
+    regen.line("        for NAMES[end] != 0 {")
+    regen.line("            end += 1")
+    regen.line("        }")
+    regen.line("        address := resolve(ptr.as_ptr(&NAMES[start..end]))")
+    regen.line("        unsafe {")
+    regen.line("            ADDRESSES[index] = address")
+    regen.line("        }")
+    regen.line("        if address != 0 {")
+    regen.line("            loaded += 1")
+    regen.line("        }")
+    regen.line("        start = end + 1")
+    regen.line("        index += 1")
+    regen.line("    }")
+    regen.line("    return loaded")
+    regen.line("}")
+    regen.line("")
+    regen.line("// Forget every address; commands panic until the next load().")
+    regen.line("pub unsafe fn unload() {")
+    regen.line("    index := 0usize")
+    regen.line("    for index < COMMAND_COUNT {")
+    regen.line("        unsafe {")
+    regen.line("            ADDRESSES[index] = 0")
+    regen.line("        }")
+    regen.line("        index += 1")
+    regen.line("    }")
+    regen.line("}")
+    regen.line("")
+    regen.line("// Whether the command with this registry name (\"glDispatchCompute\") is")
+    regen.line("// loaded. Unknown names are not.")
+    regen.line("pub fn is_loaded(name: &str) -> bool {")
+    regen.line("    wanted := mem.str_bytes(name)")
+    regen.line("    start := 0usize")
+    regen.line("    index := 0usize")
+    regen.line("    for index < COMMAND_COUNT {")
+    regen.line("        end := start")
+    regen.line("        for NAMES[end] != 0 {")
+    regen.line("            end += 1")
+    regen.line("        }")
+    regen.line("        if bytes.equal(&NAMES[start..end], wanted) {")
+    regen.line("            return unsafe {")
+    regen.line("                ADDRESSES[index]")
+    regen.line("            } != 0")
+    regen.line("        }")
+    regen.line("        start = end + 1")
+    regen.line("        index += 1")
+    regen.line("    }")
+    regen.line("    return false")
+    regen.line("}")
+    regen.line("")
+    regen.line("// The debug message callback glDebugMessageCallback takes: source, type,")
+    regen.line("// id, severity, message length, NUL-terminated message and user parameter.")
+    regen.put("pub type DebugProc = ")
+    regen.line(DEBUG_PROC)
+    regen.line("")
+    regen.line("// Enums")
+    regen.line("")
+    enum_count := unsafe {
+        OUT_ENUM_COUNT
+    }
+    for index in 0usize..enum_count {
+        element := unsafe {
+            OUT_ENUMS[index]
+        }
+        put_enum(element)
+    }
+    regen.line("")
+    regen.line("// Commands")
+    regen.line("")
+    for index in 0usize..count {
+        put_command(index)
+    }
+}
+
+fn put_enum(element: u32) {
+    name := xml.get(element, "name")
+    value := xml.get(element, "value")
+    constant := if regen.starts_with(name, "GL_") {
+        &name[3..]
+    } else {
+        name
+    }
+    if value.len > 0 && value[0] == b'-' {
+        xml.fail_at("negative enum value", name)
+    }
+    regen.put("pub const ")
+    if constant.len > 0 && is_digit(constant[0]) {
+        regen.put("N")
+    }
+    regen.put_bytes(constant)
+    if regen.equal(xml.get(element, "type"), "ull") {
+        regen.put(": u64 = ")
+    } else {
+        regen.put(": u32 = ")
+    }
+    if regen.starts_with(value, "0x") {
+        for i in 0usize..value.len {
+            regen.put_byte(lower(value[i]))
+        }
+    } else {
+        regen.put_bytes(value)
+    }
+    regen.line("")
+}
+
+// Write the parameters as `name: type, ...` (names), `type, ...` (types)
+// or `name, ...` (arguments).
+const NAMES_AND_TYPES: u32 = 0
+const TYPES_ONLY: u32 = 1
+const NAMES_ONLY: u32 = 2
+
+fn put_params(command: u32, what: u32) {
+    name := command_name(command)
+    param := xml.find(command, "param")
+    first := true
+    identifier_text := regen.Text.new()
+    type_text := regen.Text.new()
+    context := regen.Text.new()
+    for param != xml.NONE {
+        if !first {
+            regen.put(", ")
+        }
+        first = false
+        identifier(xml.findtext(param, "name"), &mut identifier_text)
+        if what != TYPES_ONLY {
+            regen.put_bytes(identifier_text.view())
+        }
+        if what == NAMES_AND_TYPES {
+            regen.put(": ")
+        }
+        if what != NAMES_ONLY {
+            c_type(param, &mut type_text)
+            context.clear()
+            context.bytes(name)
+            context.byte(b'.')
+            context.bytes(identifier_text.view())
+            put_type(type_text.view(), context.view())
+        }
+        param = xml.find_next(param, "param")
+    }
+}
+
+fn put_command(index: usize) {
+    command := unsafe {
+        OUT_COMMANDS[index]
+    }
+    major := unsafe {
+        OUT_MAJOR[index]
+    }
+    minor := unsafe {
+        OUT_MINOR[index]
+    }
+    name := command_name(command)
+    proto := xml.find(command, "proto")
+    result := regen.Text.new()
+    c_type(proto, &mut result)
+    function := regen.Text.new()
+    identifier(&name[2..], &mut function)
+    if xml.present(TAKEN, function.view()) {
+        xml.fail_at("duplicate Dodo name", function.view())
+    }
+    xml.put(TAKEN, xml.intern(function.view()), 1)
+    void_result := is_void(result.view())
+
+    regen.put("// ")
+    regen.put_bytes(name)
+    regen.put(", OpenGL ")
+    regen.put_int(major as u64)
+    regen.put(".")
+    regen.put_int(minor as u64)
+    regen.line(".")
+    regen.put("pub unsafe fn ")
+    regen.put_bytes(function.view())
+    regen.put("(")
+    put_params(command, NAMES_AND_TYPES)
+    regen.put(")")
+    if !void_result {
+        regen.put(" -> ")
+        put_type(result.view(), name)
+    }
+    regen.line(" {")
+    regen.line("    unsafe {")
+    regen.put("        address := ADDRESSES[")
+    regen.put_int(index as u64)
+    regen.line("]")
+    regen.put("        core.assert(address != 0) // ")
+    regen.put_bytes(name)
+    regen.line(" is not loaded")
+    regen.put("        call := address as extern \"C\" fn(")
+    put_params(command, TYPES_ONLY)
+    regen.put(")")
+    if !void_result {
+        regen.put(" -> ")
+        put_type(result.view(), name)
+    }
+    regen.line("")
+    if void_result {
+        regen.put("        call(")
+    } else {
+        regen.put("        return call(")
+    }
+    put_params(command, NAMES_ONLY)
+    regen.line(")")
+    regen.line("    }")
+    regen.line("}")
+}
+
+// ---------------------------------------------------------------------------
+
+fn usage() {
+    errors := console.stderr()
+    errors.printf("usage: dodo run scripts/gen/opengl.dodo -- (--check | --write) path/to/gl.xml\n\n")!
+    errors.printf("Generates {} from the pinned Khronos OpenGL registry.\n", TARGET)!
+    errors.printf("--check fails when the checked-in file differs; --write regenerates it.\n")!
+    errors.printf("Download the registry first:\n\n")!
+    errors.printf("    curl -fsSL -o gl.xml {}\n\n", URL)!
+    errors.printf("Its SHA-256 must be {}.\n", SHA256)!
+    regen.quit(2)
+}
+
+fn main() -> i32 {
+    arguments := regen.arguments()
+    check := false
+    write := false
+    path := 0usize
+    i := 0usize
+    for i < arguments.len() {
+        if arguments.is(i, "--check") {
+            check = true
+        } else if arguments.is(i, "--write") {
+            write = true
+        } else if arguments.is(i, "--registry") && i + 1 < arguments.len() {
+            // The Python generator's spelling.
+            i += 1
+            path = i + 1
+        } else if path == 0 && !regen.starts_with(mem.str_bytes(arguments.get(i)), "-") {
+            path = i + 1
+        } else {
+            usage()
+        }
+        i += 1
+    }
+    if check == write || path == 0 {
+        usage()
+    }
+    registry := arguments.get(path - 1)
+    xml.load(registry)
+    digest := [0u8; 64]
+    sha256.hex(xml.data(), &mut digest)
+    if !regen.equal(&digest, SHA256) {
+        errors := console.stderr()
+        errors.printf("{}: SHA-256 ", registry)!
+        errors.write(&digest)!
+        errors.printf(", expected {}\n", SHA256)!
+        return 1
+    }
+    if !regen.find_root("scripts/gen/opengl.dodo") {
+        regen.die("run this from inside the Dodo repository")
+    }
+    xml.parse()
+    render()
+    return regen.update_file(TARGET, regen.output(), check, "with --write")
+}

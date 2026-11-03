@@ -1,0 +1,856 @@
+package xml
+
+// Usage: `import "xml"`, then `xml.load(path)`, `xml.parse()` and walk the
+// tree from `xml.root()`.
+//
+// A minimal XML reader for the Khronos registry generators in scripts/gen
+// (opengl.dodo and vulkan.dodo). It covers what gl.xml and vk.xml use:
+// elements, attributes, mixed text content, comments, processing
+// instructions, CDATA sections, the five standard entities and numeric
+// character references. There is no DTD support; a DOCTYPE is an error.
+//
+// The tree mirrors Python's xml.etree.ElementTree, which the generators were
+// first written against: an element's `text` is the character data before
+// its first child element and a child's `tail` the data after it, both with
+// comments and processing instructions dropped (the data around them is
+// joined). Line ends are normalized to "\n" and whitespace in attribute
+// values to spaces, as expat does. A missing text, tail or attribute reads as
+// an empty slice; `has` tells a missing attribute from an empty one.
+//
+// Everything lives in static arrays, so there is one document per process:
+// the file's bytes, a pool of strings decoded from it, and the elements and
+// attributes as parallel arrays indexed by element number. Strings are
+// passed around as `Str`, a (start, length) pair packed into a u64 that
+// indexes the pool and can be stored and compared freely. The package also
+// keeps a string-keyed hash table (`put`, `lookup`) that the generators use
+// for their name lookups and sets.
+
+import "core/mem"
+import "std/console"
+import "std/fs"
+import "std/platform"
+import "regen"
+
+// A string in the pool: start << 32 | length.
+pub type Str = u64
+
+// No element, or a missing table entry.
+pub const NONE: u32 = 4294967295
+
+const POOL_SIZE: usize = 33554432
+const MAX_ELEMENTS: usize = 524288
+const MAX_ATTRIBUTES: usize = 524288
+const MAX_DEPTH: usize = 256
+
+// The file's bytes at [0, INPUT_LEN), then strings decoded from it.
+static mut POOL: [POOL_SIZE]u8 = [0u8; POOL_SIZE]
+static mut POOL_USED: usize = 0
+static mut INPUT_LEN: usize = 0
+
+static mut TAG: [MAX_ELEMENTS]u64 = [0u64; MAX_ELEMENTS]
+static mut TEXT: [MAX_ELEMENTS]u64 = [0u64; MAX_ELEMENTS]
+static mut TAIL: [MAX_ELEMENTS]u64 = [0u64; MAX_ELEMENTS]
+static mut FIRST: [MAX_ELEMENTS]u32 = [0u32; MAX_ELEMENTS]
+static mut LAST: [MAX_ELEMENTS]u32 = [0u32; MAX_ELEMENTS]
+static mut NEXT: [MAX_ELEMENTS]u32 = [0u32; MAX_ELEMENTS]
+static mut ATTR_START: [MAX_ELEMENTS]u32 = [0u32; MAX_ELEMENTS]
+static mut ATTR_COUNT: [MAX_ELEMENTS]u32 = [0u32; MAX_ELEMENTS]
+static mut ELEMENTS: usize = 0
+
+static mut ATTR_NAME: [MAX_ATTRIBUTES]u64 = [0u64; MAX_ATTRIBUTES]
+static mut ATTR_VALUE: [MAX_ATTRIBUTES]u64 = [0u64; MAX_ATTRIBUTES]
+static mut ATTRIBUTES: usize = 0
+
+// ---------------------------------------------------------------------------
+// Errors
+
+// Like regen.die, followed by a quoted detail such as a name from the registry.
+pub fn fail_at(message: &str, detail: &[u8]) {
+    errors := console.stderr()
+    errors.printf("error: {} '", message)!
+    errors.write(detail)!
+    errors.printf("'\n")!
+    regen.quit(1)
+}
+
+fn syntax(message: &str, position: usize) {
+    line := 1usize
+    for i in 0usize..position {
+        if byte(i) == b'\n' {
+            line += 1
+        }
+    }
+    errors := console.stderr()
+    errors.printf("error: XML line {}: {}\n", line, message)!
+    regen.quit(1)
+}
+
+// ---------------------------------------------------------------------------
+// Strings
+
+pub fn make(start: usize, length: usize) -> Str {
+    return (start as u64 << 32) | length as u64
+}
+
+pub fn length(s: Str) -> usize {
+    return (s & 4294967295) as usize
+}
+
+// The bytes of a pool string.
+pub fn bytes(s: Str) -> &[u8] from(static) {
+    start := (s >> 32) as usize
+    unsafe {
+        return &POOL[start..start + length(s)]
+    }
+}
+
+// Copy bytes into the pool.
+pub fn intern(value: &[u8]) -> Str {
+    unsafe {
+        start := POOL_USED
+        if start + value.len > POOL_SIZE {
+            regen.die("XML string pool is full")
+        }
+        for i in 0usize..value.len {
+            POOL[start + i] = value[i]
+        }
+        POOL_USED = start + value.len
+        return make(start, value.len)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Loading
+
+// Read the file into the pool. Fails when it cannot be read or does not fit.
+pub fn load(path: &str) {
+    workspace := platform.workspace()
+    unsafe {
+        match fs.read_file(path, &mut POOL[0..POOL_SIZE / 2], &mut workspace) {
+            ok(report) => {
+                if !report.eof {
+                    regen.die("the XML file is too large")
+                }
+                INPUT_LEN = report.read
+                POOL_USED = report.read
+            }
+            err(reason) => {
+                errors := console.stderr()
+                errors.printf("error: cannot read {}: ", path)!
+                errors.println(&reason.cause)!
+                regen.quit(1)
+            }
+        }
+    }
+}
+
+// The file's raw bytes.
+pub fn data() -> &[u8] from(static) {
+    unsafe {
+        return &POOL[0..INPUT_LEN]
+    }
+}
+
+fn byte(i: usize) -> u8 {
+    unsafe {
+        if i >= INPUT_LEN {
+            return 0
+        }
+        return POOL[i]
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Parsing
+
+// Character data waiting for the next tag, ElementTree's TreeBuilder style.
+// It points into the input while it is one undecoded run, and is copied to
+// the end of the pool once an entity, a line end or a second run (after a
+// comment) joins it.
+struct Pending {
+    start: usize
+    size: usize
+    copied: bool
+}
+
+fn pending_run(p: &mut Pending, start: usize, end: usize) {
+    if end == start {
+        return
+    }
+    if p.size == 0 && !p.copied {
+        p.start = start
+        p.size = end - start
+        return
+    }
+    if !p.copied && p.start + p.size == start {
+        p.size += end - start
+        return
+    }
+    pending_copy(p)
+    unsafe {
+        for i in start..end {
+            POOL[POOL_USED] = POOL[i]
+            POOL_USED += 1
+        }
+    }
+    p.size += end - start
+}
+
+fn pending_copy(p: &mut Pending) {
+    if p.copied {
+        return
+    }
+    unsafe {
+        if POOL_USED + p.size + INPUT_LEN > POOL_SIZE {
+            regen.die("XML string pool is full")
+        }
+        origin := p.start
+        p.start = POOL_USED
+        for i in 0usize..p.size {
+            POOL[POOL_USED] = POOL[origin + i]
+            POOL_USED += 1
+        }
+    }
+    p.copied = true
+}
+
+fn pending_byte(p: &mut Pending, value: u8) {
+    pending_copy(p)
+    unsafe {
+        POOL[POOL_USED] = value
+        POOL_USED += 1
+    }
+    p.size += 1
+}
+
+fn pending_take(p: &mut Pending) -> Str {
+    s := make(p.start, p.size)
+    p.start = 0
+    p.size = 0
+    p.copied = false
+    return s
+}
+
+fn is_space(c: u8) -> bool {
+    return c == b' ' || c == b'\t' || c == b'\n' || c == b'\r'
+}
+
+fn is_name_end(c: u8) -> bool {
+    return is_space(c) || c == b'/' || c == b'>' || c == b'=' || c == 0
+}
+
+fn skip_space(position: usize) -> usize {
+    i := position
+    for is_space(byte(i)) {
+        i += 1
+    }
+    return i
+}
+
+// Whether the input at position starts with the literal.
+fn looking_at(position: usize, literal: &str) -> bool {
+    l := mem.str_bytes(literal)
+    for i in 0usize..l.len {
+        if byte(position + i) != l[i] {
+            return false
+        }
+    }
+    return true
+}
+
+// The position just after the next occurrence of the literal.
+fn skip_past(position: usize, literal: &str, what: &str) -> usize {
+    i := position
+    end := unsafe {
+        INPUT_LEN
+    }
+    for i < end {
+        if looking_at(i, literal) {
+            return i + mem.str_bytes(literal).len
+        }
+        i += 1
+    }
+    syntax(what, position)
+    return end
+}
+
+fn hex_digit(c: u8) -> u32 {
+    if c >= b'0' && c <= b'9' {
+        return (c - b'0') as u32
+    }
+    if c >= b'a' && c <= b'f' {
+        return (c - b'a') as u32 + 10
+    }
+    if c >= b'A' && c <= b'F' {
+        return (c - b'A') as u32 + 10
+    }
+    return 16
+}
+
+// Decode the reference at position ('&'), feed its UTF-8 bytes to the
+// pending text and return the position after the ';'.
+fn reference(p: &mut Pending, position: usize) -> usize {
+    end := position + 1
+    for byte(end) != b';' {
+        if byte(end) == 0 || end - position > 12 {
+            syntax("unterminated character reference", position)
+        }
+        end += 1
+    }
+    unsafe {
+        name := &POOL[position + 1..end]
+        if regen.equal(name, "lt") {
+            pending_byte(p, b'<')
+        } else if regen.equal(name, "gt") {
+            pending_byte(p, b'>')
+        } else if regen.equal(name, "amp") {
+            pending_byte(p, b'&')
+        } else if regen.equal(name, "quot") {
+            pending_byte(p, b'"')
+        } else if regen.equal(name, "apos") {
+            pending_byte(p, b'\'')
+        } else if name.len > 1 && name[0] == b'#' {
+            code := 0u32
+            base := 10u32
+            first := 1usize
+            if name[1] == b'x' {
+                base = 16
+                first = 2
+            }
+            if first >= name.len {
+                syntax("bad character reference", position)
+            }
+            for i in first..name.len {
+                digit := hex_digit(name[i])
+                if digit >= base || code > 1114111 {
+                    syntax("bad character reference", position)
+                }
+                code = code * base + digit
+            }
+            if code == 0 || code > 1114111 {
+                syntax("bad character reference", position)
+            }
+            if code < 128 {
+                pending_byte(p, code as u8)
+            } else if code < 2048 {
+                pending_byte(p, (192 | (code >> 6)) as u8)
+                pending_byte(p, (128 | (code & 63)) as u8)
+            } else if code < 65536 {
+                pending_byte(p, (224 | (code >> 12)) as u8)
+                pending_byte(p, (128 | ((code >> 6) & 63)) as u8)
+                pending_byte(p, (128 | (code & 63)) as u8)
+            } else {
+                pending_byte(p, (240 | (code >> 18)) as u8)
+                pending_byte(p, (128 | ((code >> 12) & 63)) as u8)
+                pending_byte(p, (128 | ((code >> 6) & 63)) as u8)
+                pending_byte(p, (128 | (code & 63)) as u8)
+            }
+        } else {
+            syntax("unknown entity", position)
+        }
+    }
+    return end + 1
+}
+
+fn new_element(name: Str) -> u32 {
+    unsafe {
+        index := ELEMENTS
+        if index >= MAX_ELEMENTS {
+            regen.die("too many XML elements")
+        }
+        ELEMENTS = index + 1
+        TAG[index] = name
+        TEXT[index] = 0
+        TAIL[index] = 0
+        FIRST[index] = NONE
+        LAST[index] = NONE
+        NEXT[index] = NONE
+        ATTR_START[index] = ATTRIBUTES as u32
+        ATTR_COUNT[index] = 0
+        return index as u32
+    }
+}
+
+fn append_child(parent: u32, child: u32) {
+    unsafe {
+        p := parent as usize
+        if FIRST[p] == NONE {
+            FIRST[p] = child
+        } else {
+            NEXT[LAST[p] as usize] = child
+        }
+        LAST[p] = child
+    }
+}
+
+// Parse attributes from position up to '>' or '/>' of a start tag; returns
+// the position of that '>' or '/'.
+fn attributes(element: u32, position: usize) -> usize {
+    i := skip_space(position)
+    for byte(i) != b'>' && byte(i) != b'/' {
+        if byte(i) == 0 {
+            syntax("unterminated start tag", position)
+        }
+        name_start := i
+        for !is_name_end(byte(i)) {
+            i += 1
+        }
+        if i == name_start {
+            syntax("expected an attribute name", i)
+        }
+        name := make(name_start, i - name_start)
+        i = skip_space(i)
+        if byte(i) != b'=' {
+            syntax("expected '=' after an attribute name", i)
+        }
+        i = skip_space(i + 1)
+        quote := byte(i)
+        if quote != b'"' && quote != b'\'' {
+            syntax("expected a quoted attribute value", i)
+        }
+        i += 1
+        value := Pending { start: 0, size: 0, copied: false }
+        run := i
+        for byte(i) != quote {
+            c := byte(i)
+            if c == 0 || c == b'<' {
+                syntax("bad attribute value", i)
+            }
+            if c == b'&' || (is_space(c) && c != b' ') {
+                pending_run(&mut value, run, i)
+                if c == b'&' {
+                    i = reference(&mut value, i)
+                } else {
+                    // Attribute-value normalization: each tab or line end
+                    // (CR LF counting as one) becomes a space.
+                    pending_byte(&mut value, b' ')
+                    if c == b'\r' && byte(i + 1) == b'\n' {
+                        i += 1
+                    }
+                    i += 1
+                }
+                run = i
+            } else {
+                i += 1
+            }
+        }
+        pending_run(&mut value, run, i)
+        // An empty value still records a valid position.
+        if value.size == 0 && !value.copied {
+            value.start = run
+        }
+        unsafe {
+            index := ATTRIBUTES
+            if index >= MAX_ATTRIBUTES {
+                regen.die("too many XML attributes")
+            }
+            ATTR_NAME[index] = name
+            ATTR_VALUE[index] = pending_take(&mut value)
+            ATTRIBUTES = index + 1
+            ATTR_COUNT[element as usize] += 1
+        }
+        i = skip_space(i + 1)
+    }
+    return i
+}
+
+// Assign pending text to the last element's text, or its tail after it
+// closed (ElementTree's TreeBuilder._flush).
+fn flush(p: &mut Pending, last: u32, tail: bool) {
+    if p.size == 0 {
+        p.copied = false
+        return
+    }
+    s := pending_take(p)
+    if last == NONE {
+        return
+    }
+    unsafe {
+        if tail {
+            TAIL[last as usize] = s
+        } else {
+            TEXT[last as usize] = s
+        }
+    }
+}
+
+// Parse the loaded file into the tree.
+pub fn parse() {
+    stack := [0u32; MAX_DEPTH]
+    depth := 0usize
+    root_element := NONE
+    last := NONE
+    tail := false
+    text := Pending { start: 0, size: 0, copied: false }
+    end := unsafe {
+        INPUT_LEN
+    }
+    i := 0usize
+    if byte(0) == 239 && byte(1) == 187 && byte(2) == 191 {
+        i = 3
+    }
+    for i < end {
+        c := byte(i)
+        if c == b'<' {
+            if looking_at(i, "<!--") {
+                i = skip_past(i + 4, "-->", "unterminated comment")
+            } else if looking_at(i, "<?") {
+                i = skip_past(i + 2, "?>", "unterminated processing instruction")
+            } else if looking_at(i, "<![CDATA[") {
+                if depth == 0 {
+                    syntax("CDATA outside the root element", i)
+                }
+                close := skip_past(i + 9, "]]>", "unterminated CDATA section")
+                pending_run(&mut text, i + 9, close - 3)
+                i = close
+            } else if looking_at(i, "<!") {
+                syntax("DOCTYPE and other declarations are not supported", i)
+            } else if byte(i + 1) == b'/' {
+                name_start := i + 2
+                j := name_start
+                for !is_name_end(byte(j)) {
+                    j += 1
+                }
+                j = skip_space(j)
+                if byte(j) != b'>' {
+                    syntax("bad end tag", i)
+                }
+                if depth == 0 {
+                    syntax("end tag without a start tag", i)
+                }
+                open := stack[depth - 1]
+                name := unsafe {
+                    &POOL[name_start..j]
+                }
+                if !regen.same(bytes(tag_str(open)), trim(name)) {
+                    syntax("mismatched end tag", i)
+                }
+                flush(&mut text, last, tail)
+                depth -= 1
+                last = open
+                tail = true
+                i = j + 1
+            } else {
+                if depth == 0 && root_element != NONE {
+                    syntax("more than one root element", i)
+                }
+                name_start := i + 1
+                j := name_start
+                for !is_name_end(byte(j)) {
+                    j += 1
+                }
+                if j == name_start {
+                    syntax("expected an element name", i)
+                }
+                flush(&mut text, last, tail)
+                element := new_element(make(name_start, j - name_start))
+                if depth > 0 {
+                    append_child(stack[depth - 1], element)
+                } else {
+                    root_element = element
+                }
+                last = element
+                tail = false
+                j = attributes(element, j)
+                if byte(j) == b'/' {
+                    if byte(j + 1) != b'>' {
+                        syntax("bad empty-element tag", j)
+                    }
+                    // <a/> is <a></a>: nothing to flush in between.
+                    tail = true
+                    i = j + 2
+                } else {
+                    if depth >= MAX_DEPTH {
+                        syntax("elements nest too deeply", i)
+                    }
+                    stack[depth] = element
+                    depth += 1
+                    i = j + 1
+                }
+            }
+        } else if depth == 0 {
+            if !is_space(c) {
+                syntax("text outside the root element", i)
+            }
+            i += 1
+        } else {
+            run := i
+            for i < end && byte(i) != b'<' && byte(i) != b'&' && byte(i) != b'\r' {
+                i += 1
+            }
+            pending_run(&mut text, run, i)
+            if i < end && byte(i) == b'&' {
+                i = reference(&mut text, i)
+            } else if i < end && byte(i) == b'\r' {
+                pending_byte(&mut text, b'\n')
+                if byte(i + 1) == b'\n' {
+                    i += 1
+                }
+                i += 1
+            }
+        }
+    }
+    if depth != 0 {
+        syntax("unclosed element at end of file", end)
+    }
+    if root_element == NONE {
+        syntax("no root element", end)
+    }
+}
+
+fn trim(name: &[u8]) -> &[u8] from(name) {
+    n := name.len
+    for n > 0 && is_space(name[n - 1]) {
+        n -= 1
+    }
+    return &name[0..n]
+}
+
+// ---------------------------------------------------------------------------
+// The tree
+
+// Stop with a message when a lookup found no element (NONE) but the caller
+// needs one: the registry does not have the expected layout.
+fn valid(element: u32) -> usize {
+    unsafe {
+        if element as usize >= ELEMENTS {
+            regen.die("expected XML element is missing; has the registry layout changed?")
+        }
+    }
+    return element as usize
+}
+
+// The root element (always element 0).
+pub fn root() -> u32 {
+    return 0
+}
+
+pub fn tag_str(element: u32) -> Str {
+    unsafe {
+        return TAG[valid(element)]
+    }
+}
+
+pub fn tag(element: u32) -> &[u8] from(static) {
+    return bytes(tag_str(element))
+}
+
+// Whether the element's tag is the literal.
+pub fn is(element: u32, name: &str) -> bool {
+    return regen.equal(tag(element), name)
+}
+
+// The character data before the first child (ElementTree's `text`).
+pub fn text_str(element: u32) -> Str {
+    unsafe {
+        return TEXT[valid(element)]
+    }
+}
+
+pub fn text(element: u32) -> &[u8] from(static) {
+    return bytes(text_str(element))
+}
+
+// The character data after the element's end tag (ElementTree's `tail`).
+pub fn tail(element: u32) -> &[u8] from(static) {
+    unsafe {
+        return bytes(TAIL[valid(element)])
+    }
+}
+
+// The first child element, or NONE.
+pub fn first(element: u32) -> u32 {
+    unsafe {
+        return FIRST[valid(element)]
+    }
+}
+
+// The next sibling element, or NONE.
+pub fn next(element: u32) -> u32 {
+    unsafe {
+        return NEXT[valid(element)]
+    }
+}
+
+// The first child with this tag, or NONE (ElementTree's `find`). Loop over
+// `findall` with `c := find(e, t); for c != NONE { ...; c = find_next(c, t) }`.
+pub fn find(element: u32, name: &str) -> u32 {
+    child := first(element)
+    for child != NONE && !is(child, name) {
+        child = next(child)
+    }
+    return child
+}
+
+// The next sibling after this one with this tag, or NONE.
+pub fn find_next(element: u32, name: &str) -> u32 {
+    child := next(element)
+    for child != NONE && !is(child, name) {
+        child = next(child)
+    }
+    return child
+}
+
+// The text of the first child with this tag; empty when there is none.
+pub fn findtext(element: u32, name: &str) -> &[u8] from(static) {
+    child := find(element, name)
+    if child == NONE {
+        return bytes(0)
+    }
+    return text(child)
+}
+
+pub fn findtext_str(element: u32, name: &str) -> Str {
+    child := find(element, name)
+    if child == NONE {
+        return 0
+    }
+    return text_str(child)
+}
+
+fn attribute(element: u32, name: &str) -> u32 {
+    unsafe {
+        start := ATTR_START[valid(element)] as usize
+        count := ATTR_COUNT[element as usize] as usize
+        for i in start..start + count {
+            if regen.equal(bytes(ATTR_NAME[i]), name) {
+                return i as u32
+            }
+        }
+    }
+    return NONE
+}
+
+// The number of attributes and the name and value of the i-th, in document
+// order.
+pub fn attribute_count(element: u32) -> usize {
+    unsafe {
+        return ATTR_COUNT[valid(element)] as usize
+    }
+}
+
+pub fn attribute_name(element: u32, i: usize) -> &[u8] from(static) {
+    unsafe {
+        return bytes(ATTR_NAME[ATTR_START[element as usize] as usize + i])
+    }
+}
+
+pub fn attribute_value(element: u32, i: usize) -> &[u8] from(static) {
+    unsafe {
+        return bytes(ATTR_VALUE[ATTR_START[element as usize] as usize + i])
+    }
+}
+
+// Whether the element has this attribute.
+pub fn has(element: u32, name: &str) -> bool {
+    return attribute(element, name) != NONE
+}
+
+// An attribute's value as a pool string; empty when it is missing.
+pub fn get_str(element: u32, name: &str) -> Str {
+    index := attribute(element, name)
+    if index == NONE {
+        return 0
+    }
+    unsafe {
+        return ATTR_VALUE[index as usize]
+    }
+}
+
+// An attribute's value; empty when it is missing.
+pub fn get(element: u32, name: &str) -> &[u8] from(static) {
+    return bytes(get_str(element, name))
+}
+
+// Append the element's text, its descendants' text and their tails, but not
+// its own tail (ElementTree's `itertext`), to out[used..]; returns the new
+// length.
+pub fn itertext(element: u32, out: &mut[u8], used: usize) -> usize {
+    n := copy_into(text(element), out, used)
+    child := first(element)
+    for child != NONE {
+        n = itertext(child, out, n)
+        n = copy_into(tail(child), out, n)
+        child = next(child)
+    }
+    return n
+}
+
+fn copy_into(value: &[u8], out: &mut[u8], used: usize) -> usize {
+    if used + value.len > out.len {
+        regen.die("itertext buffer is too small")
+    }
+    for i in 0usize..value.len {
+        out[used + i] = value[i]
+    }
+    return used + value.len
+}
+
+// ---------------------------------------------------------------------------
+// A string-keyed table: (namespace, key) -> u32, open addressing with linear
+// probing. Callers pick small namespace numbers to keep several maps and sets
+// in one table. Keys must be pool strings and stay unchanged.
+
+const TABLE_SIZE: usize = 1048576
+static mut TABLE_KEY: [TABLE_SIZE]u64 = [0u64; TABLE_SIZE]
+static mut TABLE_SPACE: [TABLE_SIZE]u32 = [0u32; TABLE_SIZE]
+static mut TABLE_VALUE: [TABLE_SIZE]u32 = [0u32; TABLE_SIZE]
+static mut TABLE_USED: usize = 0
+
+fn slot(space: u32, key: &[u8]) -> usize {
+    h := 14695981039346656037u64 ^ space as u64
+    for i in 0usize..key.len {
+        h = core.wrapping_mul(h ^ key[i] as u64, 1099511628211u64)
+    }
+    return (h & (TABLE_SIZE as u64 - 1)) as usize
+}
+
+// Find the slot of the key, or the empty slot where it would go.
+fn probe(space: u32, key: &[u8]) -> usize {
+    i := slot(space, key)
+    unsafe {
+        for TABLE_SPACE[i] != 0 {
+            if TABLE_SPACE[i] == space + 1 && regen.same(bytes(TABLE_KEY[i]), key) {
+                return i
+            }
+            i = (i + 1) & (TABLE_SIZE - 1)
+        }
+    }
+    return i
+}
+
+// Set (or replace) the key's value.
+pub fn put(space: u32, key: Str, value: u32) {
+    i := probe(space, bytes(key))
+    unsafe {
+        if TABLE_SPACE[i] == 0 {
+            TABLE_USED += 1
+            if TABLE_USED * 2 > TABLE_SIZE {
+                regen.die("the name table is full")
+            }
+            TABLE_SPACE[i] = space + 1
+            TABLE_KEY[i] = key
+        }
+        TABLE_VALUE[i] = value
+    }
+}
+
+// The key's value, or NONE.
+pub fn lookup(space: u32, key: &[u8]) -> u32 {
+    i := probe(space, key)
+    unsafe {
+        if TABLE_SPACE[i] == 0 {
+            return NONE
+        }
+        return TABLE_VALUE[i]
+    }
+}
+
+pub fn lookup_str(space: u32, key: &str) -> u32 {
+    return lookup(space, mem.str_bytes(key))
+}
+
+// Whether the key is present.
+pub fn present(space: u32, key: &[u8]) -> bool {
+    return lookup(space, key) != NONE
+}

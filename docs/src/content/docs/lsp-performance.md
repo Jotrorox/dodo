@@ -16,7 +16,6 @@ then build and run from the repository root:
 
 ```sh
 cargo build --locked --release
-python3 scripts/test_bench_lsp.py
 python3 scripts/bench_lsp.py target/release/dodo --features --samples 100 \
   --workload functions large-function errors generic-imports project \
   --compiler-revision "$(git rev-parse HEAD)" --build-profile release \

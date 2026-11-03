@@ -1,0 +1,1839 @@
+package main
+
+// Generate std/gpu/vulkan's raw bindings from the Khronos Vulkan registry.
+//
+// Usage: dodo run scripts/gen/vulkan.dodo -- [--check | --write] path/to/vk.xml
+//
+// vk.xml is published in https://github.com/KhronosGroup/Vulkan-Headers under
+// registry/. The generator writes stdlib/std/gpu/vulkan/types.dodo (constants,
+// handles, enums, bitmasks, structs) and commands.dodo (function pointer types
+// and the three dispatch tables with their loaders); with --check it only
+// verifies that both are up to date. The hand-written loader in
+// stdlib/std/gpu/vulkan/loader.dodo opens the Vulkan library and fills them.
+// Paths in the repository resolve from the repository root, wherever inside
+// it this runs.
+//
+// The bindings cover the core API up to MAX_VERSION plus the extensions in
+// EXTENSIONS: the window-system surfaces, swapchains, portability (MoltenVK)
+// and debug utils. Add an extension name there and rerun to bind another one.
+//
+// Mapping, kept close to the C API so its documentation applies directly:
+//   VkFormat, VK_FORMAT_R8_UNORM      -> Format (an i32 alias), FORMAT_R8_UNORM
+//   VkBufferUsageFlags                -> BufferUsageFlags (a u32 alias)
+//   VkInstanceCreateInfo.sType        -> InstanceCreateInfo.s_type
+//   VkInstance (dispatchable handle)  -> Instance = *mut InstanceT
+//   VkBuffer (non-dispatchable)       -> Buffer = u64
+//   vkCreateBuffer                    -> DeviceFns.create_buffer: PfnCreateBuffer
+//   unions                            -> a struct with one word array, `data`
+
+import "core/mem"
+import "std/console"
+import "regen"
+import "xml"
+
+const MAX_MAJOR: u32 = 1
+const MAX_MINOR: u32 = 4
+
+fn extensions() -> [11]&str from(static) {
+    return [
+        "VK_KHR_surface",
+        "VK_KHR_swapchain",
+        "VK_KHR_xlib_surface",
+        "VK_KHR_xcb_surface",
+        "VK_KHR_wayland_surface",
+        "VK_KHR_win32_surface",
+        "VK_EXT_metal_surface",
+        "VK_EXT_headless_surface",
+        "VK_KHR_portability_enumeration",
+        "VK_KHR_portability_subset",
+        "VK_EXT_debug_utils",
+    ]
+}
+
+const API: &str = "vulkan"
+// Every hosted Dodo target is 64-bit.
+const POINTER_SIZE: usize = 8
+
+const TYPES_FILE: &str = "stdlib/std/gpu/vulkan/types.dodo"
+const COMMANDS_FILE: &str = "stdlib/std/gpu/vulkan/commands.dodo"
+
+type Str = xml.Str
+
+// The Dodo spelling of a C primitive, or "".
+fn primitive(name: &[u8]) -> &str from(static) {
+    names := [
+        "void", "char", "int8_t", "uint8_t", "int16_t", "uint16_t", "int32_t", "uint32_t",
+        "int64_t", "uint64_t", "int", "size_t", "float", "double",
+    ]
+    types := [
+        "void", "u8", "i8", "u8", "i16", "u16", "i32", "u32", "i64", "u64", "i32", "usize", "f32",
+        "f64",
+    ]
+    for i in 0usize..names.len {
+        if regen.equal(name, names[i]) {
+            return types[i]
+        }
+    }
+    return ""
+}
+
+// Window-system types from platform headers, or "". Opaque structs are only
+// used behind pointers, so they become u8 pointees.
+fn platform(name: &[u8]) -> &str from(static) {
+    names := [
+        "Display", "VisualID", "Window", "xcb_connection_t", "xcb_window_t", "xcb_visualid_t",
+        "wl_display", "wl_surface", "HINSTANCE", "HWND", "HMONITOR", "HANDLE", "DWORD", "LPCWSTR",
+        "SECURITY_ATTRIBUTES", "CAMetalLayer",
+    ]
+    types := [
+        "u8", "u64", "u64", "u8", "u32", "u32", "u8", "u8", "*mut u8", "*mut u8", "*mut u8",
+        "*mut u8", "u32", "*const u16", "u8", "u8",
+    ]
+    for i in 0usize..names.len {
+        if regen.equal(name, names[i]) {
+            return types[i]
+        }
+    }
+    return ""
+}
+
+// The size of a Dodo scalar, or 0.
+fn scalar_size(name: &[u8]) -> usize {
+    names := ["u8", "i8", "u16", "i16", "u32", "i32", "f32", "u64", "i64", "f64", "usize"]
+    sizes := [1usize, 1, 2, 2, 4, 4, 4, 8, 8, 8, 8]
+    for i in 0usize..names.len {
+        if regen.equal(name, names[i]) {
+            return sizes[i]
+        }
+    }
+    return 0
+}
+
+fn is_entry_command(name: &[u8]) -> bool {
+    return regen.equal(name, "vkGetInstanceProcAddr") || regen.equal(name, "vkCreateInstance") || regen.equal(name, "vkEnumerateInstanceExtensionProperties") || regen.equal(name, "vkEnumerateInstanceLayerProperties") || regen.equal(name, "vkEnumerateInstanceVersion")
+}
+
+fn reserved(name: &[u8]) -> bool {
+    words := [
+        "package", "import", "pub", "fn", "struct", "enum", "interface", "type", "dyn", "const",
+        "let", "return", "if", "else", "for", "in", "break", "continue", "match", "unsafe", "extern",
+        "as", "from", "stores", "requires_plain", "static", "void", "mut", "true", "false", "asm",
+        "self", "Self", "ok", "err", "some", "none",
+    ]
+    for i in 0usize..words.len {
+        if regen.equal(name, words[i]) {
+            return true
+        }
+    }
+    return false
+}
+
+fn is_upper(c: u8) -> bool {
+    return c >= b'A' && c <= b'Z'
+}
+
+fn is_lower(c: u8) -> bool {
+    return c >= b'a' && c <= b'z'
+}
+
+fn is_digit(c: u8) -> bool {
+    return c >= b'0' && c <= b'9'
+}
+
+fn is_space(c: u8) -> bool {
+    return c == b' ' || c == b'\t' || c == b'\n' || c == b'\r'
+}
+
+// camelCase to snake_case, splitting acronyms like heck does.
+fn snake(name: &[u8], out: &mut regen.Text) {
+    out.clear()
+    for i in 0usize..name.len {
+        c := name[i]
+        if i > 0 && is_upper(c) {
+            previous := name[i - 1]
+            following: u8 = if i + 1 < name.len {
+                name[i + 1]
+            } else {
+                0
+            }
+            if is_lower(previous) || is_digit(previous) || (is_upper(previous) && is_lower(following)) {
+                out.byte(b'_')
+            }
+        }
+        if is_upper(c) {
+            out.byte(c + 32)
+        } else {
+            out.byte(c)
+        }
+    }
+    if reserved(out.view()) {
+        out.byte(b'_')
+    }
+}
+
+fn put_snake(name: &[u8]) {
+    text := regen.Text.new()
+    snake(name, &mut text)
+    regen.put_bytes(text.view())
+}
+
+// `VkFoo` -> `Foo`, `PFN_vkFoo` -> `PfnFoo`.
+fn strip_vk(name: &[u8], out: &mut regen.Text) {
+    if regen.starts_with(name, "Vk") {
+        out.bytes(&name[2..])
+    } else if regen.starts_with(name, "PFN_vk") {
+        out.str("Pfn")
+        out.bytes(&name[6..])
+    } else {
+        xml.fail_at("not a Vulkan name", name)
+    }
+}
+
+fn put_strip_vk(name: &[u8]) {
+    text := regen.Text.new()
+    strip_vk(name, &mut text)
+    regen.put_bytes(text.view())
+}
+
+// `VK_FOO` -> `FOO`.
+fn put_constant_name(name: &[u8]) {
+    if !regen.starts_with(name, "VK_") {
+        xml.fail_at("not a Vulkan constant", name)
+    }
+    regen.put_bytes(&name[3..])
+}
+
+fn api_ok(element: u32) -> bool {
+    if !xml.has(element, "api") {
+        return true
+    }
+    api := xml.get(element, "api")
+    start := 0usize
+    for i in 0usize..api.len + 1 {
+        if i == api.len || api[i] == b',' {
+            if regen.equal(&api[start..i], API) {
+                return true
+            }
+            start = i + 1
+        }
+    }
+    return false
+}
+
+// Whether a "major.minor" version is at most MAX_VERSION.
+fn version_ok(text: &[u8]) -> bool {
+    major := 0u32
+    minor := 0u32
+    dots := 0usize
+    for i in 0usize..text.len {
+        c := text[i]
+        if c == b'.' {
+            dots += 1
+        } else if is_digit(c) && dots == 0 {
+            major = major * 10 + (c - b'0') as u32
+        } else if is_digit(c) && dots == 1 {
+            minor = minor * 10 + (c - b'0') as u32
+        } else {
+            xml.fail_at("bad version", text)
+        }
+    }
+    if dots != 1 {
+        xml.fail_at("bad version", text)
+    }
+    return major < MAX_MAJOR || (major == MAX_MAJOR && minor <= MAX_MINOR)
+}
+
+fn str_start(s: Str) -> usize {
+    return (s >> 32) as usize
+}
+
+// The string without leading and trailing whitespace.
+fn strip(s: Str) -> Str {
+    text := xml.bytes(s)
+    a := 0usize
+    b := text.len
+    for a < b && is_space(text[a]) {
+        a += 1
+    }
+    for b > a && is_space(text[b - 1]) {
+        b -= 1
+    }
+    return xml.make(str_start(s) + a, b - a)
+}
+
+// A decimal integer, optionally negative.
+fn parse_int(text: &[u8]) -> u64 {
+    negative := text.len > 0 && text[0] == b'-'
+    first: usize = if negative {
+        1
+    } else {
+        0
+    }
+    hex := text.len > first + 1 && text[first] == b'0' && (text[first + 1] == b'x' || text[first + 1] == b'X')
+    if hex {
+        first += 2
+    }
+    if first >= text.len {
+        xml.fail_at("bad number", text)
+    }
+    value := 0u64
+    for i in first..text.len {
+        c := text[i]
+        digit := 0u64
+        if is_digit(c) {
+            digit = (c - b'0') as u64
+        } else if hex && c >= b'a' && c <= b'f' {
+            digit = (c - b'a') as u64 + 10
+        } else if hex && c >= b'A' && c <= b'F' {
+            digit = (c - b'A') as u64 + 10
+        } else {
+            xml.fail_at("bad number", text)
+        }
+        if hex {
+            value = value * 16 + digit
+        } else {
+            value = value * 10 + digit
+        }
+    }
+    if negative {
+        return core.wrapping_add(~value, 1u64)
+    }
+    return value
+}
+
+// ---------------------------------------------------------------------------
+// The registry
+
+// Name-table namespaces.
+const TYPES: u32 = 1
+const CONSTANTS: u32 = 2
+const ENUM_BLOCKS: u32 = 3
+const COMMANDS: u32 = 4
+const EXTENSIONS: u32 = 5
+const SELECTED: u32 = 6
+const EMITTED: u32 = 7
+const LAYOUTS: u32 = 8
+const ENUM_LISTS: u32 = 9
+const BITWIDTH_64: u32 = 10
+const SEEN_VALUES: u32 = 11
+const SEEN_COMMANDS: u32 = 12
+
+const MAX_ITEMS: usize = 65536
+
+static mut HEADER_VERSION: u64 = 0
+
+static mut REQUIRED_TYPES: [MAX_ITEMS]u64 = [0u64; MAX_ITEMS]
+static mut REQUIRED_TYPE_COUNT: usize = 0
+static mut REQUIRED_COMMANDS: [MAX_ITEMS]u64 = [0u64; MAX_ITEMS]
+static mut REQUIRED_COMMAND_COUNT: usize = 0
+// Enum items extending an enum, with their extension number (NONE in a
+// feature).
+static mut REQUIRED_ENUMS: [MAX_ITEMS]u32 = [0u32; MAX_ITEMS]
+static mut REQUIRED_ENUM_NUMBERS: [MAX_ITEMS]u32 = [0u32; MAX_ITEMS]
+static mut REQUIRED_ENUM_COUNT: usize = 0
+static mut EXTENSION_CONSTANTS: [MAX_ITEMS]u32 = [0u32; MAX_ITEMS]
+static mut EXTENSION_CONSTANT_COUNT: usize = 0
+
+fn push_required_type(name: Str) {
+    unsafe {
+        REQUIRED_TYPES[REQUIRED_TYPE_COUNT] = name
+        REQUIRED_TYPE_COUNT += 1
+    }
+}
+
+fn type_element(name: &[u8]) -> u32 {
+    return xml.lookup(TYPES, name)
+}
+
+fn index_registry() {
+    root := xml.root()
+    types := xml.find(root, "types")
+    t := xml.first(types)
+    for t != xml.NONE {
+        if xml.is(t, "type") && api_ok(t) {
+            name := xml.get_str(t, "name")
+            if xml.length(name) == 0 {
+                name = strip(xml.findtext_str(t, "name"))
+            }
+            if xml.length(name) == 0 && xml.find(t, "proto") != xml.NONE {
+                name = xml.findtext_str(xml.find(t, "proto"), "name")
+            }
+            if xml.length(name) != 0 {
+                xml.put(TYPES, name, t)
+            }
+        }
+        t = xml.next(t)
+    }
+    block := xml.find(root, "enums")
+    for block != xml.NONE {
+        if regen.equal(xml.get(block, "name"), "API Constants") {
+            e := xml.find(block, "enum")
+            for e != xml.NONE {
+                if api_ok(e) {
+                    xml.put(CONSTANTS, xml.get_str(e, "name"), e)
+                }
+                e = xml.find_next(e, "enum")
+            }
+        } else {
+            xml.put(ENUM_BLOCKS, xml.get_str(block, "name"), block)
+        }
+        block = xml.find_next(block, "enums")
+    }
+    c := xml.first(xml.find(root, "commands"))
+    for c != xml.NONE {
+        if api_ok(c) {
+            proto := xml.find(c, "proto")
+            name := if proto == xml.NONE {
+                xml.get_str(c, "name")
+            } else {
+                xml.findtext_str(proto, "name")
+            }
+            xml.put(COMMANDS, name, c)
+        }
+        c = xml.next(c)
+    }
+    e := xml.first(xml.find(root, "extensions"))
+    for e != xml.NONE {
+        xml.put(EXTENSIONS, xml.get_str(e, "name"), e)
+        e = xml.next(e)
+    }
+    t = xml.first(types)
+    for t != xml.NONE {
+        if regen.equal(xml.get(t, "category"), "define") && regen.equal(xml.findtext(t, "name"), "VK_HEADER_VERSION") && api_ok(t) {
+            text := [0u8; 4096]
+            n := xml.itertext(t, &mut text, 0)
+            // The last whitespace-separated word.
+            end := n
+            for end > 0 && is_space(text[end - 1]) {
+                end -= 1
+            }
+            start := end
+            for start > 0 && !is_space(text[start - 1]) {
+                start -= 1
+            }
+            unsafe {
+                HEADER_VERSION = parse_int(&text[start..end])
+            }
+        }
+        t = xml.next(t)
+    }
+}
+
+// Evaluate a registry `depends` expression against the selection: names
+// joined by `+` (and) and `,` (or), with parentheses.
+struct Depends {
+    starts: [256]usize
+    ends: [256]usize
+    count: usize
+    position: usize
+}
+
+fn token_char(c: u8) -> bool {
+    return is_upper(c) || is_lower(c) || is_digit(c) || c == b'_' || c == b':'
+}
+
+fn satisfied(expression: &[u8]) -> bool {
+    d := Depends { starts: [0usize; 256], ends: [0usize; 256], count: 0, position: 0 }
+    i := 0usize
+    for i < expression.len {
+        c := expression[i]
+        start := i
+        if token_char(c) {
+            for i < expression.len && token_char(expression[i]) {
+                i += 1
+            }
+        } else if c == b'+' || c == b',' || c == b'(' || c == b')' {
+            i += 1
+        } else {
+            i += 1
+            continue
+        }
+        if d.count >= 256 {
+            xml.fail_at("depends expression too long", expression)
+        }
+        d.starts[d.count] = start
+        d.ends[d.count] = i
+        d.count += 1
+    }
+    return disjunction(&mut d, expression)
+}
+
+fn token_is(d: &Depends, expression: &[u8], value: u8) -> bool {
+    if d.position >= d.count {
+        return false
+    }
+    token := &expression[d.starts[d.position]..d.ends[d.position]]
+    return token.len == 1 && token[0] == value
+}
+
+fn primary(d: &mut Depends, expression: &[u8]) -> bool {
+    if d.position >= d.count {
+        xml.fail_at("bad depends expression", expression)
+    }
+    start := d.starts[d.position]
+    end := d.ends[d.position]
+    d.position += 1
+    if end - start == 1 && expression[start] == b'(' {
+        value := disjunction(d, expression)
+        d.position += 1
+        return value
+    }
+    // `VK_EXT_foo::feature` depends on the extension.
+    cut := start
+    for cut < end && !(expression[cut] == b':' && cut + 1 < end && expression[cut + 1] == b':') {
+        cut += 1
+    }
+    return xml.present(SELECTED, &expression[start..cut])
+}
+
+fn conjunction(d: &mut Depends, expression: &[u8]) -> bool {
+    value := primary(d, expression)
+    for token_is(d, expression, b'+') {
+        d.position += 1
+        next := primary(d, expression)
+        value = next && value
+    }
+    return value
+}
+
+fn disjunction(d: &mut Depends, expression: &[u8]) -> bool {
+    value := conjunction(d, expression)
+    for token_is(d, expression, b',') {
+        d.position += 1
+        next := conjunction(d, expression)
+        value = next || value
+    }
+    return value
+}
+
+fn select_block(block: u32, number: u32) {
+    require := xml.find(block, "require")
+    for require != xml.NONE {
+        if api_ok(require) && (!xml.has(require, "depends") || xml.get(require, "depends").len == 0 || satisfied(xml.get(require, "depends"))) {
+            item := xml.first(require)
+            for item != xml.NONE {
+                if api_ok(item) {
+                    name := xml.get_str(item, "name")
+                    if xml.is(item, "type") {
+                        push_required_type(name)
+                    } else if xml.is(item, "command") {
+                        unsafe {
+                            REQUIRED_COMMANDS[REQUIRED_COMMAND_COUNT] = name
+                            REQUIRED_COMMAND_COUNT += 1
+                        }
+                    } else if xml.is(item, "enum") {
+                        if xml.get(item, "extends").len > 0 {
+                            unsafe {
+                                REQUIRED_ENUMS[REQUIRED_ENUM_COUNT] = item
+                                REQUIRED_ENUM_NUMBERS[REQUIRED_ENUM_COUNT] = number
+                                REQUIRED_ENUM_COUNT += 1
+                            }
+                        } else if number != xml.NONE && (xml.has(item, "value") || xml.get(item, "alias").len > 0) {
+                            unsafe {
+                                EXTENSION_CONSTANTS[EXTENSION_CONSTANT_COUNT] = item
+                                EXTENSION_CONSTANT_COUNT += 1
+                            }
+                        } else {
+                            push_required_type(name)
+                        }
+                    }
+                }
+                item = xml.next(item)
+            }
+        }
+        require = xml.find_next(require, "require")
+    }
+}
+
+fn select() {
+    root := xml.root()
+    feature := xml.find(root, "feature")
+    for feature != xml.NONE {
+        if api_ok(feature) && version_ok(xml.get(feature, "number")) {
+            xml.put(SELECTED, xml.get_str(feature, "name"), 1)
+        }
+        feature = xml.find_next(feature, "feature")
+    }
+    names := extensions()
+    for i in 0usize..names.len {
+        xml.put(SELECTED, xml.intern(mem.str_bytes(names[i])), 1)
+    }
+    feature = xml.find(root, "feature")
+    for feature != xml.NONE {
+        if api_ok(feature) && version_ok(xml.get(feature, "number")) {
+            select_block(feature, xml.NONE)
+        }
+        feature = xml.find_next(feature, "feature")
+    }
+    for i in 0usize..names.len {
+        extension := xml.lookup_str(EXTENSIONS, names[i])
+        if extension == xml.NONE {
+            xml.fail_at("unknown extension", mem.str_bytes(names[i]))
+        }
+        number := parse_int(xml.get(extension, "number"))
+        select_block(extension, number as u32)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Dependency closure
+
+static mut ORDER: [MAX_ITEMS]u64 = [0u64; MAX_ITEMS]
+static mut ORDER_COUNT: usize = 0
+
+fn push_order(name: Str) {
+    unsafe {
+        ORDER[ORDER_COUNT] = name
+        ORDER_COUNT += 1
+    }
+}
+
+fn need(name: Str) {
+    text := xml.bytes(name)
+    if xml.present(EMITTED, text) {
+        return
+    }
+    if mem.str_bytes(primitive(text)).len > 0 || mem.str_bytes(platform(text)).len > 0 {
+        return
+    }
+    if xml.present(CONSTANTS, text) {
+        xml.put(EMITTED, name, 1)
+        push_order(name)
+        return
+    }
+    element := type_element(text)
+    if element == xml.NONE {
+        xml.fail_at("unknown type", text)
+    }
+    category := xml.get(element, "category")
+    if regen.equal(category, "include") || regen.equal(category, "define") {
+        return
+    }
+    if !xml.has(element, "category") {
+        xml.fail_at("unmapped external type; add it to platform()", text)
+    }
+    xml.put(EMITTED, name, 1)
+    if xml.get(element, "alias").len > 0 {
+        need(xml.get_str(element, "alias"))
+        push_order(name)
+        return
+    }
+    if regen.equal(category, "struct") || regen.equal(category, "union") {
+        member := xml.find(element, "member")
+        for member != xml.NONE {
+            if api_ok(member) {
+                need(xml.findtext_str(member, "type"))
+                size := xml.findtext_str(member, "enum")
+                if xml.length(size) > 0 {
+                    need(size)
+                }
+            }
+            member = xml.find_next(member, "member")
+        }
+    } else if regen.equal(category, "funcpointer") {
+        need_signature(element)
+    } else if regen.equal(category, "bitmask") {
+        bits := xml.get_str(element, "requires")
+        if xml.length(bits) == 0 {
+            bits = xml.get_str(element, "bitvalues")
+        }
+        if xml.length(bits) > 0 {
+            need(bits)
+        }
+    } else if regen.equal(category, "basetype") {
+        inner := xml.findtext_str(element, "type")
+        if xml.length(inner) > 0 {
+            need(inner)
+        }
+    }
+    push_order(name)
+}
+
+fn need_signature(element: u32) {
+    need(xml.findtext_str(xml.find(element, "proto"), "type"))
+    param := xml.find(element, "param")
+    for param != xml.NONE {
+        if api_ok(param) {
+            need(xml.findtext_str(param, "type"))
+        }
+        param = xml.find_next(param, "param")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Type spelling
+
+fn base(ctype: &[u8], out: &mut regen.Text) {
+    p := primitive(ctype)
+    if mem.str_bytes(p).len > 0 {
+        out.str(p)
+        return
+    }
+    q := platform(ctype)
+    if mem.str_bytes(q).len > 0 {
+        out.str(q)
+        return
+    }
+    strip_vk(ctype, out)
+}
+
+fn constant_value(name: &[u8]) -> u64 {
+    e := xml.lookup(CONSTANTS, name)
+    if e == xml.NONE {
+        xml.fail_at("unknown constant", name)
+    }
+    if xml.get(e, "alias").len > 0 {
+        return constant_value(xml.get(e, "alias"))
+    }
+    value := xml.get(e, "value")
+    n := value.len
+    for n > 0 && value[n - 1] == b'U' {
+        n -= 1
+    }
+    return parse_int(&value[0..n])
+}
+
+// The Dodo type of a member or parameter element, into out.
+fn spell(element: u32, parameter: bool, out: &mut regen.Text) {
+    out.clear()
+    ctype := xml.findtext(element, "type")
+    before := xml.text(element)
+    after := xml.tail(xml.find(element, "type"))
+    name_element := xml.find(element, "name")
+    suffix := regen.Text.new()
+    suffix.bytes(xml.tail(name_element))
+    child := xml.next(name_element)
+    for child != xml.NONE {
+        if xml.is(child, "enum") {
+            suffix.bytes(xml.text(child))
+        }
+        suffix.bytes(xml.tail(child))
+        child = xml.next(child)
+    }
+    if regen.contains(suffix.view(), ":") {
+        xml.fail_at("bitfield member", xml.findtext(element, "name"))
+    }
+    base_const := regen.contains(before, "const")
+    ty := regen.Text.new()
+    base(ctype, &mut ty)
+    stars := 0usize
+    for i in 0usize..after.len {
+        if after[i] == b'*' {
+            stars += 1
+        }
+    }
+    if stars > 0 && regen.equal(ty.view(), "void") {
+        ty.clear()
+        ty.str("u8")
+    }
+
+    // Array dimensions: the [...] groups of the suffix.
+    text := suffix.view()
+    dims := 0usize
+    for i in 0usize..text.len {
+        if text[i] == b'[' {
+            dims += 1
+        }
+    }
+    if dims > 0 && parameter {
+        if base_const {
+            out.str("*const ")
+        } else {
+            out.str("*mut ")
+        }
+    } else if dims > 0 {
+        i := 0usize
+        for i < text.len {
+            if text[i] != b'[' {
+                i += 1
+                continue
+            }
+            j := i + 1
+            for j < text.len && text[j] != b']' {
+                j += 1
+            }
+            if j == text.len || j == i + 1 {
+                xml.fail_at("bad array dimension", text)
+            }
+            dim := strip_bytes(&text[i + 1..j])
+            out.byte(b'[')
+            if all_digits(dim) {
+                out.bytes(dim)
+            } else {
+                number := regen.Text.new()
+                put_number(constant_value(dim), &mut number)
+                out.bytes(number.view())
+            }
+            out.byte(b']')
+            i = j + 1
+        }
+    }
+    // Pointers, the outermost first: level 0's pointee is the base, constant
+    // with a leading `const`; level n's pointee is pointer n - 1, constant
+    // when `const` comes between star n - 1 and star n.
+    level := stars
+    for level > 0 {
+        level -= 1
+        constant := false
+        if level == 0 {
+            constant = base_const
+        } else {
+            // The text between star level - 1 and star level.
+            seen := 0usize
+            start := 0usize
+            for i in 0usize..after.len {
+                if after[i] == b'*' {
+                    seen += 1
+                    if seen == level {
+                        start = i + 1
+                    } else if seen == level + 1 {
+                        constant = regen.contains(&after[start..i], "const")
+                        break
+                    }
+                }
+            }
+        }
+        if constant {
+            out.str("*const ")
+        } else {
+            out.str("*mut ")
+        }
+    }
+    out.bytes(ty.view())
+}
+
+fn strip_bytes(text: &[u8]) -> &[u8] from(text) {
+    a := 0usize
+    b := text.len
+    for a < b && is_space(text[a]) {
+        a += 1
+    }
+    for b > a && is_space(text[b - 1]) {
+        b -= 1
+    }
+    return &text[a..b]
+}
+
+fn all_digits(text: &[u8]) -> bool {
+    if text.len == 0 {
+        return false
+    }
+    for i in 0usize..text.len {
+        if !is_digit(text[i]) {
+            return false
+        }
+    }
+    return true
+}
+
+fn put_number(value: u64, out: &mut regen.Text) {
+    digits := [0u8; 20]
+    n := 0usize
+    v := value
+    for {
+        digits[n] = b'0' + (v % 10) as u8
+        n += 1
+        v = v / 10
+        if v == 0 {
+            break
+        }
+    }
+    for i in 0usize..n {
+        out.byte(digits[n - 1 - i])
+    }
+}
+
+fn put_spell(element: u32, parameter: bool) {
+    text := regen.Text.new()
+    spell(element, parameter, &mut text)
+    regen.put_bytes(text.view())
+}
+
+// ---------------------------------------------------------------------------
+// Layout (for unions only)
+
+static mut LAYOUT_SIZE: [MAX_ITEMS]usize = [0usize; MAX_ITEMS]
+static mut LAYOUT_ALIGN: [MAX_ITEMS]usize = [0usize; MAX_ITEMS]
+static mut LAYOUT_COUNT: usize = 0
+
+fn layout(ty: &[u8], size: &mut usize, align: &mut usize) {
+    if ty.len > 0 && ty[0] == b'*' {
+        *size = POINTER_SIZE
+        *align = POINTER_SIZE
+        return
+    }
+    if ty.len > 0 && ty[0] == b'[' {
+        j := 1usize
+        count := 0usize
+        for j < ty.len && is_digit(ty[j]) {
+            count = count * 10 + (ty[j] - b'0') as usize
+            j += 1
+        }
+        if j == 1 || j >= ty.len || ty[j] != b']' {
+            xml.fail_at("bad array type", ty)
+        }
+        inner_size := 0usize
+        layout(&ty[j + 1..], &mut inner_size, align)
+        *size = inner_size * count
+        return
+    }
+    scalar := scalar_size(ty)
+    if scalar > 0 {
+        *size = scalar
+        *align = scalar
+        return
+    }
+    name := regen.Text.new()
+    name.str("Vk")
+    name.bytes(ty)
+    named_layout(name.view(), size, align)
+}
+
+fn named_layout(cname: &[u8], size: &mut usize, align: &mut usize) {
+    cached := xml.lookup(LAYOUTS, cname)
+    if cached != xml.NONE {
+        unsafe {
+            *size = LAYOUT_SIZE[cached as usize]
+            *align = LAYOUT_ALIGN[cached as usize]
+        }
+        return
+    }
+    element := type_element(cname)
+    if element == xml.NONE {
+        xml.fail_at("no layout for", cname)
+    }
+    category := xml.get(element, "category")
+    if xml.get(element, "alias").len > 0 {
+        named_layout(xml.get(element, "alias"), size, align)
+    } else if regen.equal(category, "struct") || regen.equal(category, "union") {
+        union := regen.equal(category, "union")
+        total := 0usize
+        largest := 1usize
+        member := xml.find(element, "member")
+        ty := regen.Text.new()
+        for member != xml.NONE {
+            if api_ok(member) {
+                spell(member, false, &mut ty)
+                member_size := 0usize
+                member_align := 0usize
+                layout(ty.view(), &mut member_size, &mut member_align)
+                if member_align > largest {
+                    largest = member_align
+                }
+                if union {
+                    if member_size > total {
+                        total = member_size
+                    }
+                } else {
+                    total = (total + member_align - 1) / member_align * member_align + member_size
+                }
+            }
+            member = xml.find_next(member, "member")
+        }
+        *size = (total + largest - 1) / largest * largest
+        *align = largest
+    } else if regen.equal(category, "handle") {
+        *size = 8
+        *align = 8
+    } else if regen.equal(category, "enum") {
+        *size = 4
+        *align = 4
+    } else if regen.equal(category, "bitmask") || regen.equal(category, "basetype") {
+        inner := regen.Text.new()
+        alias_target(element, &mut inner)
+        layout(inner.view(), size, align)
+    } else if regen.equal(category, "funcpointer") {
+        *size = POINTER_SIZE
+        *align = POINTER_SIZE
+    } else {
+        xml.fail_at("no layout for", cname)
+    }
+    unsafe {
+        index := LAYOUT_COUNT
+        LAYOUT_SIZE[index] = *size
+        LAYOUT_ALIGN[index] = *align
+        LAYOUT_COUNT += 1
+        xml.put(LAYOUTS, xml.intern(cname), index as u32)
+    }
+}
+
+fn alias_target(element: u32, out: &mut regen.Text) {
+    inner := xml.findtext(element, "type")
+    if regen.equal(xml.get(element, "category"), "bitmask") {
+        if regen.equal(inner, "VkFlags64") {
+            out.str("u64")
+        } else {
+            out.str("u32")
+        }
+        return
+    }
+    base(inner, out)
+}
+
+// ---------------------------------------------------------------------------
+// Enum values: one linked list per enum type.
+
+static mut VALUE_NAME: [MAX_ITEMS]u64 = [0u64; MAX_ITEMS]
+static mut VALUE_IS_ALIAS: [MAX_ITEMS]bool = [false; MAX_ITEMS]
+static mut VALUE_BITS: [MAX_ITEMS]u64 = [0u64; MAX_ITEMS]
+static mut VALUE_ALIAS: [MAX_ITEMS]u64 = [0u64; MAX_ITEMS]
+static mut VALUE_NEXT: [MAX_ITEMS]u32 = [0u32; MAX_ITEMS]
+static mut VALUE_COUNT: usize = 0
+static mut LIST_FIRST: [MAX_ITEMS]u32 = [0u32; MAX_ITEMS]
+static mut LIST_LAST: [MAX_ITEMS]u32 = [0u32; MAX_ITEMS]
+static mut LIST_COUNT: usize = 0
+
+fn new_list(name: Str) {
+    unsafe {
+        index := LIST_COUNT
+        LIST_FIRST[index] = xml.NONE
+        LIST_LAST[index] = xml.NONE
+        LIST_COUNT += 1
+        xml.put(ENUM_LISTS, name, index as u32)
+    }
+}
+
+// The first value of an enum type's list, or NONE.
+fn first_value(name: &[u8]) -> u32 {
+    list := xml.lookup(ENUM_LISTS, name)
+    if list == xml.NONE {
+        return xml.NONE
+    }
+    unsafe {
+        return LIST_FIRST[list as usize]
+    }
+}
+
+fn next_value(value: u32) -> u32 {
+    unsafe {
+        return VALUE_NEXT[value as usize]
+    }
+}
+
+fn value_name(value: u32) -> &[u8] from(static) {
+    unsafe {
+        return xml.bytes(VALUE_NAME[value as usize])
+    }
+}
+
+fn value_is_alias(value: u32) -> bool {
+    unsafe {
+        return VALUE_IS_ALIAS[value as usize]
+    }
+}
+
+fn value_bits(value: u32) -> u64 {
+    unsafe {
+        return VALUE_BITS[value as usize]
+    }
+}
+
+fn value_alias(value: u32) -> &[u8] from(static) {
+    unsafe {
+        return xml.bytes(VALUE_ALIAS[value as usize])
+    }
+}
+
+// Append the value of enum item e to list (an enum type's list number).
+fn add_value(list: u32, e: u32, number: u32) {
+    unsafe {
+        index := VALUE_COUNT
+        if index >= MAX_ITEMS {
+            regen.die("too many enum values")
+        }
+        VALUE_COUNT += 1
+        VALUE_NAME[index] = xml.get_str(e, "name")
+        VALUE_NEXT[index] = xml.NONE
+        VALUE_IS_ALIAS[index] = false
+        VALUE_BITS[index] = 0
+        VALUE_ALIAS[index] = 0
+        if xml.get(e, "alias").len > 0 {
+            VALUE_IS_ALIAS[index] = true
+            VALUE_ALIAS[index] = xml.get_str(e, "alias")
+        } else {
+            VALUE_BITS[index] = enum_value(e, number)
+        }
+        l := list as usize
+        if LIST_FIRST[l] == xml.NONE {
+            LIST_FIRST[l] = index as u32
+        } else {
+            VALUE_NEXT[LIST_LAST[l] as usize] = index as u32
+        }
+        LIST_LAST[l] = index as u32
+    }
+}
+
+// The value's two's-complement bits.
+fn enum_value(e: u32, number: u32) -> u64 {
+    if xml.has(e, "bitpos") {
+        bit := parse_int(xml.get(e, "bitpos"))
+        return 1u64 << bit
+    }
+    if xml.has(e, "value") {
+        return parse_int(xml.get(e, "value"))
+    }
+    if xml.has(e, "offset") {
+        extension := 0u64
+        if xml.get(e, "extnumber").len > 0 {
+            extension = parse_int(xml.get(e, "extnumber"))
+        } else if number != xml.NONE {
+            extension = number as u64
+        } else {
+            xml.fail_at("enum offset without an extension", xml.get(e, "name"))
+        }
+        value := 1000000000u64 + (extension - 1) * 1000 + parse_int(xml.get(e, "offset"))
+        if regen.equal(xml.get(e, "dir"), "-") {
+            return core.wrapping_add(~value, 1u64)
+        }
+        return value
+    }
+    xml.fail_at("enum without value", xml.get(e, "name"))
+    return 0
+}
+
+fn collect_enums() {
+    count := unsafe {
+        ORDER_COUNT
+    }
+    for i in 0usize..count {
+        name := unsafe {
+            ORDER[i]
+        }
+        element := type_element(xml.bytes(name))
+        if element == xml.NONE || !regen.equal(xml.get(element, "category"), "enum") || xml.get(element, "alias").len > 0 {
+            continue
+        }
+        new_list(name)
+        list := xml.lookup(ENUM_LISTS, xml.bytes(name))
+        block := xml.lookup(ENUM_BLOCKS, xml.bytes(name))
+        if block != xml.NONE {
+            e := xml.find(block, "enum")
+            for e != xml.NONE {
+                if api_ok(e) {
+                    add_value(list, e, xml.NONE)
+                    xml.put(SEEN_VALUES, xml.get_str(e, "name"), 1)
+                }
+                e = xml.find_next(e, "enum")
+            }
+            if regen.equal(xml.get(block, "bitwidth"), "64") {
+                xml.put(BITWIDTH_64, name, 1)
+            }
+        }
+    }
+    required := unsafe {
+        REQUIRED_ENUM_COUNT
+    }
+    for i in 0usize..required {
+        item := unsafe {
+            REQUIRED_ENUMS[i]
+        }
+        number := unsafe {
+            REQUIRED_ENUM_NUMBERS[i]
+        }
+        list := xml.lookup(ENUM_LISTS, xml.get(item, "extends"))
+        if xml.present(SEEN_VALUES, xml.get(item, "name")) || list == xml.NONE {
+            continue
+        }
+        xml.put(SEEN_VALUES, xml.get_str(item, "name"), 1)
+        add_value(list, item, number)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Emission
+
+fn run() {
+    count := unsafe {
+        REQUIRED_TYPE_COUNT
+    }
+    for i in 0usize..count {
+        need(unsafe {
+            REQUIRED_TYPES[i]
+        })
+    }
+    commands := unsafe {
+        REQUIRED_COMMAND_COUNT
+    }
+    for i in 0usize..commands {
+        name := unsafe {
+            REQUIRED_COMMANDS[i]
+        }
+        command := xml.lookup(COMMANDS, xml.bytes(name))
+        if command == xml.NONE {
+            xml.fail_at("unknown command", xml.bytes(name))
+        }
+        if xml.get(command, "alias").len > 0 {
+            continue
+        }
+        need_signature(command)
+    }
+    collect_enums()
+}
+
+fn header(what: &str) {
+    regen.put("// ")
+    regen.line(what)
+    regen.line("//")
+    regen.line("// Generated by scripts/gen/vulkan.dodo from vk.xml (header version")
+    regen.put("// ")
+    regen.put_int(unsafe {
+        HEADER_VERSION
+    })
+    regen.put("); do not edit. Core Vulkan up to ")
+    regen.put_int(MAX_MAJOR as u64)
+    regen.put(".")
+    regen.put_int(MAX_MINOR as u64)
+    regen.line(" and the extensions")
+    regen.line("// listed in the script are bound.")
+    regen.line("")
+}
+
+fn types_file() {
+    regen.line("package vulkan")
+    regen.line("")
+    header("Vulkan constants, handles, enums, bitmasks and structs.")
+    regen.put("pub const HEADER_VERSION: u32 = ")
+    regen.put_int(unsafe {
+        HEADER_VERSION
+    })
+    regen.line("")
+    for v in 0u32..MAX_MINOR + 1 {
+        regen.put("pub const API_VERSION_")
+        regen.put_int(MAX_MAJOR as u64)
+        regen.put("_")
+        regen.put_int(v as u64)
+        regen.put(": u32 = ")
+        regen.put_int(((MAX_MAJOR << 22) | (v << 12)) as u64)
+        regen.line("")
+    }
+    regen.line("")
+    count := unsafe {
+        ORDER_COUNT
+    }
+    for i in 0usize..count {
+        name := xml.bytes(unsafe {
+            ORDER[i]
+        })
+        if xml.present(CONSTANTS, name) {
+            api_constant(name)
+        }
+    }
+    regen.line("")
+    constants := unsafe {
+        EXTENSION_CONSTANT_COUNT
+    }
+    for i in 0usize..constants {
+        extension_constant(unsafe {
+            EXTENSION_CONSTANTS[i]
+        })
+    }
+    regen.line("")
+    for i in 0usize..count {
+        name := xml.bytes(unsafe {
+            ORDER[i]
+        })
+        if xml.present(CONSTANTS, name) {
+            continue
+        }
+        element := type_element(name)
+        category := xml.get(element, "category")
+        if xml.get(element, "alias").len > 0 {
+            regen.put("pub type ")
+            put_strip_vk(name)
+            regen.put(" = ")
+            put_strip_vk(xml.get(element, "alias"))
+            regen.line("")
+        } else if regen.equal(category, "basetype") {
+            if xml.find(element, "type") == xml.NONE {
+                regen.put("pub struct ")
+                put_strip_vk(name)
+                regen.line(" {")
+                regen.line("    opaque: u8")
+                regen.line("}")
+            } else {
+                regen.put("pub type ")
+                put_strip_vk(name)
+                regen.put(" = ")
+                inner := regen.Text.new()
+                base(xml.findtext(element, "type"), &mut inner)
+                regen.put_bytes(inner.view())
+                regen.line("")
+            }
+        } else if regen.equal(category, "bitmask") {
+            regen.put("pub type ")
+            put_strip_vk(name)
+            regen.put(" = ")
+            inner := regen.Text.new()
+            alias_target(element, &mut inner)
+            regen.put_bytes(inner.view())
+            regen.line("")
+        } else if regen.equal(category, "handle") {
+            handle(name, element)
+        } else if regen.equal(category, "enum") {
+            put_enum(name)
+        } else if regen.equal(category, "struct") || regen.equal(category, "union") {
+            put_struct(name, element)
+        } else if regen.equal(category, "funcpointer") {
+            regen.put("pub type ")
+            put_strip_vk(name)
+            regen.put(" = ")
+            signature(element)
+            regen.line("")
+        } else {
+            xml.fail_at("unhandled category for", name)
+        }
+    }
+    result_names()
+}
+
+fn constant_type(name: &[u8]) -> &str from(static) {
+    e := xml.lookup(CONSTANTS, name)
+    if xml.get(e, "alias").len > 0 {
+        return constant_type(xml.get(e, "alias"))
+    }
+    t := xml.get(e, "type")
+    if regen.equal(t, "uint32_t") {
+        return "u32"
+    }
+    if regen.equal(t, "uint64_t") {
+        return "u64"
+    }
+    if regen.equal(t, "float") {
+        return "f32"
+    }
+    if regen.equal(t, "int32_t") {
+        return "i32"
+    }
+    xml.fail_at("unknown constant type", t)
+    return ""
+}
+
+// Without trailing bytes that are any of the given characters.
+fn rstrip(text: &[u8], characters: &str) -> &[u8] from(text) {
+    c := mem.str_bytes(characters)
+    n := text.len
+    for n > 0 {
+        found := false
+        for i in 0usize..c.len {
+            if text[n - 1] == c[i] {
+                found = true
+            }
+        }
+        if !found {
+            break
+        }
+        n -= 1
+    }
+    return &text[0..n]
+}
+
+fn api_constant(name: &[u8]) {
+    e := xml.lookup(CONSTANTS, name)
+    regen.put("pub const ")
+    put_constant_name(name)
+    regen.put(": ")
+    if xml.get(e, "alias").len > 0 {
+        regen.put(constant_type(xml.get(e, "alias")))
+        regen.put(" = ")
+        put_constant_name(xml.get(e, "alias"))
+        regen.line("")
+        return
+    }
+    ty := constant_type(name)
+    regen.put(ty)
+    regen.put(" = ")
+    value := xml.get(e, "value")
+    if regen.starts_with(value, "(~") {
+        // Python's value.strip("()~").rstrip("ULF").
+        a := 0usize
+        b := value.len
+        for a < b && (value[a] == b'(' || value[a] == b')' || value[a] == b'~') {
+            a += 1
+        }
+        for b > a && (value[b - 1] == b'(' || value[b - 1] == b')' || value[b - 1] == b'~') {
+            b -= 1
+        }
+        body := rstrip(&value[a..b], "ULF")
+        bits := ~parse_int(body)
+        if !regen.equal(mem.str_bytes(ty), "u64") {
+            bits = bits & 4294967295
+        }
+        regen.put_int(bits)
+    } else if regen.equal(mem.str_bytes(ty), "f32") {
+        regen.put_bytes(rstrip(value, "F"))
+    } else {
+        regen.put_bytes(rstrip(value, "U"))
+    }
+    regen.line("")
+}
+
+fn extension_constant(item: u32) {
+    if xml.get(item, "alias").len > 0 {
+        return
+    }
+    name := xml.get(item, "name")
+    value := xml.get(item, "value")
+    regen.put("pub const ")
+    put_constant_name(name)
+    if value.len > 0 && value[0] == b'"' {
+        a := 0usize
+        b := value.len
+        for a < b && value[a] == b'"' {
+            a += 1
+        }
+        for b > a && value[b - 1] == b'"' {
+            b -= 1
+        }
+        regen.put(": &[u8] = b\"")
+        regen.put_bytes(&value[a..b])
+        regen.line("\\0\"")
+        return
+    }
+    regen.put(": u32 = ")
+    regen.put_bytes(value)
+    regen.line("")
+}
+
+fn handle(name: &[u8], element: u32) {
+    short := regen.Text.new()
+    strip_vk(name, &mut short)
+    if regen.equal(xml.findtext(element, "type"), "VK_DEFINE_HANDLE") {
+        regen.put("// An opaque driver object behind the dispatchable handle ")
+        regen.put_bytes(short.view())
+        regen.line(".")
+        regen.put("pub struct ")
+        regen.put_bytes(short.view())
+        regen.line("T {")
+        regen.line("    opaque: u8")
+        regen.line("}")
+        regen.put("pub type ")
+        regen.put_bytes(short.view())
+        regen.put(" = *mut ")
+        regen.put_bytes(short.view())
+        regen.line("T")
+        return
+    }
+    regen.put("pub type ")
+    regen.put_bytes(short.view())
+    regen.line(" = u64")
+}
+
+fn put_enum(name: &[u8]) {
+    short := regen.Text.new()
+    strip_vk(name, &mut short)
+    block := xml.lookup(ENUM_BLOCKS, name)
+    is_bits := if block != xml.NONE {
+        regen.equal(xml.get(block, "type"), "bitmask")
+    } else {
+        regen.contains(name, "FlagBits")
+    }
+    wide := xml.present(BITWIDTH_64, name)
+    regen.put("pub type ")
+    regen.put_bytes(short.view())
+    if !is_bits {
+        regen.line(" = i32")
+    } else if wide {
+        regen.line(" = u64")
+    } else {
+        regen.line(" = u32")
+    }
+    value := first_value(name)
+    for value != xml.NONE {
+        if value_is_alias(value) {
+            target := value_alias(value)
+            other := first_value(name)
+            found := false
+            for other != xml.NONE {
+                if regen.same(value_name(other), target) {
+                    found = true
+                }
+                other = next_value(other)
+            }
+            if found {
+                regen.put("pub const ")
+                put_constant_name(value_name(value))
+                regen.put(": ")
+                regen.put_bytes(short.view())
+                regen.put(" = ")
+                put_constant_name(target)
+                regen.line("")
+            }
+            value = next_value(value)
+            continue
+        }
+        bits := value_bits(value)
+        regen.put("pub const ")
+        put_constant_name(value_name(value))
+        regen.put(": ")
+        regen.put_bytes(short.view())
+        regen.put(" = ")
+        if is_bits {
+            if bits >> 63 != 0 && !wide {
+                bits = bits & 4294967295
+            }
+            if bits > 9 {
+                regen.put_hex(bits)
+            } else {
+                regen.put_int(bits)
+            }
+        } else {
+            regen.put_signed(bits)
+        }
+        regen.line("")
+        value = next_value(value)
+    }
+}
+
+fn put_struct(name: &[u8], element: u32) {
+    short := regen.Text.new()
+    strip_vk(name, &mut short)
+    if regen.equal(xml.get(element, "category"), "union") {
+        size := 0usize
+        align := 0usize
+        named_layout(name, &mut size, &mut align)
+        regen.put("// The C union ")
+        regen.put_bytes(name)
+        regen.put(" of ")
+        member := xml.find(element, "member")
+        first := true
+        for member != xml.NONE {
+            if api_ok(member) {
+                if !first {
+                    regen.put(", ")
+                }
+                first = false
+                regen.put_bytes(xml.findtext(member, "name"))
+            }
+            member = xml.find_next(member, "member")
+        }
+        regen.line(".")
+        regen.line("@repr(C)")
+        regen.put("pub struct ")
+        regen.put_bytes(short.view())
+        regen.line(" {")
+        regen.put("    pub data: [")
+        if align == 8 {
+            regen.put_int((size / 8) as u64)
+            regen.line("]u64")
+        } else {
+            regen.put_int((size / 4) as u64)
+            regen.line("]u32")
+        }
+    } else {
+        regen.line("@repr(C)")
+        regen.put("pub struct ")
+        regen.put_bytes(short.view())
+        regen.line(" {")
+        member := xml.find(element, "member")
+        for member != xml.NONE {
+            if api_ok(member) {
+                regen.put("    pub ")
+                put_snake(xml.findtext(member, "name"))
+                regen.put(": ")
+                put_spell(member, false)
+                regen.line("")
+            }
+            member = xml.find_next(member, "member")
+        }
+    }
+    s_type := 0u64
+    member := xml.find(element, "member")
+    for member != xml.NONE {
+        if regen.equal(xml.findtext(member, "name"), "sType") && xml.get(member, "values").len > 0 {
+            values := xml.get_str(member, "values")
+            text := xml.bytes(values)
+            n := 0usize
+            for n < text.len && text[n] != b',' {
+                n += 1
+            }
+            s_type = xml.make(str_start(values), n)
+        }
+        member = xml.find_next(member, "member")
+    }
+    regen.line("")
+    if s_type != 0 {
+        regen.line("    // All zero, with s_type set.")
+    } else {
+        regen.line("    // All zero.")
+    }
+    regen.put("    pub fn default() -> ")
+    regen.put_bytes(short.view())
+    regen.line(" {")
+    if s_type != 0 {
+        regen.line("        value := unsafe {")
+        regen.put("            zeroed::<")
+        regen.put_bytes(short.view())
+        regen.line(">()")
+        regen.line("        }")
+        regen.put("        value.s_type = ")
+        put_constant_name(xml.bytes(s_type))
+        regen.line("")
+        regen.line("        return value")
+    } else {
+        regen.line("        return unsafe {")
+        regen.put("            zeroed::<")
+        regen.put_bytes(short.view())
+        regen.line(">()")
+        regen.line("        }")
+    }
+    regen.line("    }")
+    regen.line("}")
+}
+
+fn signature(element: u32) {
+    result := regen.Text.new()
+    spell(xml.find(element, "proto"), false, &mut result)
+    regen.put("extern \"C\" fn(")
+    param := xml.find(element, "param")
+    first := true
+    for param != xml.NONE {
+        if api_ok(param) {
+            if !first {
+                regen.put(", ")
+            }
+            first = false
+            put_spell(param, true)
+        }
+        param = xml.find_next(param, "param")
+    }
+    regen.put(")")
+    if !regen.equal(result.view(), "void") {
+        regen.put(" -> ")
+        regen.put_bytes(result.view())
+    }
+}
+
+fn result_names() {
+    regen.line("")
+    regen.line("// The name of a Result code, such as \"ERROR_DEVICE_LOST\", or \"UNKNOWN\".")
+    regen.line("pub fn result_name(code: Result) -> &str from(static) {")
+    value := first_value(mem.str_bytes("VkResult"))
+    for value != xml.NONE {
+        if !value_is_alias(value) {
+            regen.put("    if code == ")
+            put_constant_name(value_name(value))
+            regen.line(" {")
+            regen.put("        return \"")
+            put_constant_name(value_name(value))
+            regen.line("\"")
+            regen.line("    }")
+        }
+        value = next_value(value)
+    }
+    regen.line("    return \"UNKNOWN\"")
+    regen.line("}")
+}
+
+// Dispatch tables: 0 entry, 1 instance, 2 device.
+static mut TABLE_OF: [MAX_ITEMS]u8 = [0u8; MAX_ITEMS]
+static mut TABLE_COMMANDS: [MAX_ITEMS]u64 = [0u64; MAX_ITEMS]
+static mut TABLE_COMMAND_COUNT: usize = 0
+
+fn is_instance_dispatchable(name: &[u8]) -> bool {
+    return regen.equal(name, "VkInstance") || regen.equal(name, "VkPhysicalDevice")
+}
+
+fn is_device_dispatchable(name: &[u8]) -> bool {
+    return regen.equal(name, "VkDevice") || regen.equal(name, "VkQueue") || regen.equal(name, "VkCommandBuffer")
+}
+
+fn record_table(table: u8, name: Str) {
+    unsafe {
+        TABLE_OF[TABLE_COMMAND_COUNT] = table
+        TABLE_COMMANDS[TABLE_COMMAND_COUNT] = name
+        TABLE_COMMAND_COUNT += 1
+    }
+}
+
+fn commands_file() {
+    regen.line("package vulkan")
+    regen.line("")
+    regen.line("import \"core/ptr\"")
+    regen.line("")
+    header("Vulkan command signatures and dispatch tables.")
+    count := unsafe {
+        REQUIRED_COMMAND_COUNT
+    }
+    for i in 0usize..count {
+        name_str := unsafe {
+            REQUIRED_COMMANDS[i]
+        }
+        name := xml.bytes(name_str)
+        command := xml.lookup(COMMANDS, name)
+        if xml.get(command, "alias").len > 0 || xml.present(SEEN_COMMANDS, name) {
+            continue
+        }
+        xml.put(SEEN_COMMANDS, name_str, 1)
+        first := xml.findtext(xml.find(command, "param"), "type")
+        table := 0u8
+        if is_entry_command(name) {
+            table = 0
+        } else if regen.equal(name, "vkGetDeviceProcAddr") || is_instance_dispatchable(first) {
+            table = 1
+        } else if is_device_dispatchable(first) {
+            table = 2
+        } else {
+            xml.fail_at("cannot dispatch", name)
+        }
+        record_table(table, name_str)
+        regen.put("pub type Pfn")
+        regen.put_bytes(&name[2..])
+        regen.put(" = ")
+        signature(command)
+        regen.line("")
+    }
+    regen.line("")
+    dispatch_table(0, "entry", "EntryFns", "Commands available before an instance exists, resolved with\n// vkGetInstanceProcAddr(NULL, name).", "get_instance_proc_addr: PfnGetInstanceProcAddr", "get_instance_proc_addr", "null_handle::<InstanceT>()")
+    dispatch_table(1, "instance", "InstanceFns", "Instance and physical-device commands of one instance, resolved\n// with vkGetInstanceProcAddr(instance, name).", "get_instance_proc_addr: PfnGetInstanceProcAddr, instance: Instance", "get_instance_proc_addr", "instance")
+    dispatch_table(2, "device", "DeviceFns", "Device, queue and command-buffer commands of one device, resolved\n// with vkGetDeviceProcAddr(device, name).", "get_device_proc_addr: PfnGetDeviceProcAddr, device: Device", "get_device_proc_addr", "device")
+    regen.end_with_one_newline()
+}
+
+fn dispatch_table(table: u8, kind: &str, name: &str, doc: &str, params: &str, getter: &str, handle_value: &str) {
+    count := unsafe {
+        TABLE_COMMAND_COUNT
+    }
+    regen.put("// ")
+    regen.put(doc)
+    regen.line(" A command the driver does not")
+    regen.line("// provide, or whose extension or version was not enabled, holds address")
+    regen.line("// zero: check `unsafe { fns.name as usize } != 0` before calling it.")
+    regen.put("pub struct ")
+    regen.put(name)
+    regen.line(" {")
+    for i in 0usize..count {
+        if unsafe {
+            TABLE_OF[i]
+        } != table {
+            continue
+        }
+        command := xml.bytes(unsafe {
+            TABLE_COMMANDS[i]
+        })
+        regen.put("    pub ")
+        put_snake(&command[2..])
+        regen.put(": Pfn")
+        regen.put_bytes(&command[2..])
+        regen.line("")
+    }
+    regen.line("}")
+    regen.line("")
+    regen.put("// Resolve every ")
+    regen.put(name)
+    regen.line(" command. Unsafe: the getter must be the")
+    regen.line("// loader's, and the handle live for as long as the table is used.")
+    regen.put("pub unsafe fn load_")
+    regen.put(kind)
+    regen.put("(")
+    regen.put(params)
+    regen.put(") -> ")
+    regen.put(name)
+    regen.line(" {")
+    regen.line("    unsafe {")
+    regen.put("        fns := zeroed::<")
+    regen.put(name)
+    regen.line(">()")
+    for i in 0usize..count {
+        if unsafe {
+            TABLE_OF[i]
+        } != table {
+            continue
+        }
+        command := xml.bytes(unsafe {
+            TABLE_COMMANDS[i]
+        })
+        regen.put("        fns.")
+        put_snake(&command[2..])
+        if regen.equal(command, "vkGetInstanceProcAddr") {
+            regen.line(" = get_instance_proc_addr")
+            continue
+        }
+        regen.put(" = ")
+        regen.put(getter)
+        regen.put("(")
+        regen.put(handle_value)
+        regen.put(", ptr.as_ptr(b\"")
+        regen.put_bytes(command)
+        regen.put("\\0\")) as Pfn")
+        regen.put_bytes(&command[2..])
+        regen.line("")
+    }
+    regen.line("        return fns")
+    regen.line("    }")
+    regen.line("}")
+    regen.line("")
+}
+
+// ---------------------------------------------------------------------------
+
+fn usage() {
+    errors := console.stderr()
+    errors.printf("usage: dodo run scripts/gen/vulkan.dodo -- [--check | --write] path/to/vk.xml\n\n")!
+    errors.printf("Writes {} and {}\n", TYPES_FILE, COMMANDS_FILE)!
+    errors.printf("from the Vulkan registry (the default, or --write); --check only\n")!
+    errors.printf("verifies them. vk.xml is in https://github.com/KhronosGroup/Vulkan-Headers\n")!
+    errors.printf("under registry/; the checked-in bindings come from v1.4.367:\n\n")!
+    errors.printf("    curl -fsSL -o vk.xml https://raw.githubusercontent.com/KhronosGroup/Vulkan-Headers/v1.4.367/registry/vk.xml\n")!
+    regen.quit(2)
+}
+
+fn lines(text: &[u8]) -> u64 {
+    n := 0u64
+    for i in 0usize..text.len {
+        if text[i] == b'\n' {
+            n += 1
+        }
+    }
+    return n
+}
+
+// Write or check the output as the repository-relative file; false when a
+// check fails.
+fn finish(relative: &str, check: bool) -> bool {
+    if regen.update_file(relative, regen.output(), check, "with --write") != 0 {
+        return false
+    }
+    if !check {
+        console.printf("wrote {}: {} lines\n", relative, lines(regen.output()))!
+    }
+    return true
+}
+
+fn main() -> i32 {
+    arguments := regen.arguments()
+    check := false
+    path := 0usize
+    for i in 0usize..arguments.len() {
+        if arguments.is(i, "--check") {
+            check = true
+        } else if arguments.is(i, "--write") {
+            // Writing is the default; accepted for symmetry with --check.
+        } else if path == 0 && !regen.starts_with(mem.str_bytes(arguments.get(i)), "-") {
+            path = i + 1
+        } else {
+            usage()
+        }
+    }
+    if path == 0 {
+        usage()
+    }
+    xml.load(arguments.get(path - 1))
+    if !regen.find_root("scripts/gen/vulkan.dodo") {
+        regen.die("run this from inside the Dodo repository")
+    }
+    xml.parse()
+    index_registry()
+    select()
+    run()
+    types_file()
+    good := finish(TYPES_FILE, check)
+    regen.reset()
+    commands_file()
+    if !finish(COMMANDS_FILE, check) {
+        good = false
+    }
+    if !good {
+        return 1
+    }
+    return 0
+}

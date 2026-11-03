@@ -307,7 +307,7 @@ quotes, spaces, empty arguments, trailing backslashes, native Unix argument
 bytes, environment inheritance and replacement, explicit working directories,
 stdin ownership and EOF, exit/signal/cancellation/timeout distinctions, missing
 executables, and destructor cleanup. Windows CI executes the Windows fixtures
-natively with `scripts/test_windows_native.py`; the Wine suite also runs them.
+natively with `scripts/test_windows.py native`; the Wine suite also runs them.
 Windows-specific checks verify that unrelated inheritable handles stay in the
 parent, a concurrent child cannot hold stdin EOF open, and repeated spawn,
 failed spawn, and destruction release process and pipe handles.

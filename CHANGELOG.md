@@ -19,6 +19,12 @@
   `scripts/test_digispark.py` runs the on-board self-test, which reports
   through the timing of the bootloader's return, as the board has no other
   way to talk to the computer.
+- The code generators for the math constants, Brotli tables, bitmap and
+  TrueType test fonts, sRGB tables, and the OpenGL and Vulkan bindings are
+  now Dodo programs in `scripts/gen/` (`dodo run scripts/gen/<name>.dodo --
+  --check`), and CI checks the Vulkan bindings against their pinned registry
+  too. The web and Windows test scripts are merged into `scripts/test_web.py`
+  and `scripts/test_windows.py`, with one subcommand per former script.
 - `std/db/sqlite` updates and deletes rows 2 to 5 times faster. Removing a
   cell puts its space on the page's freeblock list instead of rewriting the
   page, and inserts reuse freeblocks. An `UPDATE` that keeps the rowid

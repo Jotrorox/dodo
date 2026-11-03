@@ -1,0 +1,641 @@
+package main
+
+// Generate stdlib/std/compress/brotli/tables.dodo from RFC 7932.
+//
+// The file holds the 122,784-byte static dictionary (Appendix A), the 121
+// word transforms (Appendix B) and the literal context lookup tables Lut0,
+// Lut1 and Lut2 (section 7.1). Sources:
+//
+//   * the dictionary from google/brotli c/common/dictionary.bin, checked
+//     against its pinned SHA-256 and the length and CRC-32 that RFC 7932
+//     Appendix A states;
+//   * the transforms and context tables parsed from the RFC text (pinned by
+//     its SHA-256), checked against the lengths and CRC-32 values the RFC
+//     states for them.
+//
+// The generator does not download anything; fetch both files first (see the
+// usage text) and pass their paths. Run with --write to update the file in
+// place or --check to verify it; with neither, print the generated file to
+// stdout. Run from anywhere inside the repository.
+
+import "std/checksum"
+import "std/console"
+import "std/fs"
+import "std/platform"
+import "core/mem"
+import "regen"
+import "sha256"
+
+const TARGET: &str = "stdlib/std/compress/brotli/tables.dodo"
+// A file only this repository has, to find the root from any subdirectory.
+const SELF_PATH: &str = "scripts/gen/brotli_tables.dodo"
+const DICTIONARY_SHA256: &str = "20e42eb1b511c21806d4d227d07e5dd06877d8ce7b3a817f378f313653f35c70"
+const RFC_SHA256: &str = "394abd1879e016f4eac89512c2acaf92f7b2d67feb8ab58b6b118c213be07146"
+const DICTIONARY_CRC: u32 = 0x5136CB04
+const DICTIONARY_LEN: usize = 122784
+const TRANSFORMS_CRC: u32 = 0x3D965F81
+const TRANSFORMS_LEN: usize = 648
+const LUT_NAMES: [3]&str = ["Lut0", "Lut1", "Lut2"]
+const LUT_CRCS: [3]u32 = [0x8E91EFB7, 0xD01A32F4, 0x0DD7A0D6]
+
+const USAGE: [16]&str = [
+    "usage: dodo run scripts/gen/brotli_tables.dodo -- --dictionary PATH --rfc PATH [--check | --write]",
+    "",
+    "Generate stdlib/std/compress/brotli/tables.dodo from RFC 7932 and",
+    "google/brotli's dictionary.bin, both pinned by SHA-256. Fetch them with:",
+    "",
+    "  curl -fLo dictionary.bin https://raw.githubusercontent.com/google/brotli/master/c/common/dictionary.bin",
+    "  curl -fLo rfc7932.txt https://www.rfc-editor.org/rfc/rfc7932.txt",
+    "",
+    "  --dictionary PATH  the static dictionary (dictionary.bin)",
+    "  --rfc PATH         the RFC text (rfc7932.txt)",
+    "  --check            fail if the checked-in file differs",
+    "  --write            rewrite the file in place",
+    "  (neither)          print the generated file to stdout",
+    "",
+    "Paths are relative to the current directory; the generated file is found",
+    "from anywhere inside the repository.",
+]
+
+static mut DICTIONARY: [131072]u8 = [0u8; 131072]
+static mut RFC: [1048576]u8 = [0u8; 1048576]
+static mut OUTPUT: [1048576]u8 = [0u8; 1048576]
+
+// ---------------------------------------------------------------------------
+// Output
+
+fn byte_string(out: &mut regen.Buf, data: &[u8]) {
+    out.str("b\"")
+    for i in 0usize..data.len {
+        b := data[i]
+        if b == 0x22 {
+            out.str("\\\"")
+        } else if b == 0x5C {
+            out.str("\\\\")
+        } else if b >= 0x20 && b < 0x7F {
+            out.byte(b)
+        } else {
+            out.str("\\x")
+            out.hex2(b, false)
+        }
+    }
+    out.str("\"")
+}
+
+fn u8_table(out: &mut regen.Buf, name: &str, values: &[u8]) {
+    out.str("static ")
+    out.str(name)
+    out.str(": [")
+    out.uint(values.len as u64)
+    out.str("]u8 = [\n")
+    start := 0usize
+    for start < values.len {
+        out.str("    ")
+        stop := if start + 16 < values.len {
+            start + 16
+        } else {
+            values.len
+        }
+        for i in start..stop {
+            if i != start {
+                out.str(", ")
+            }
+            out.uint(values[i] as u64)
+        }
+        if start + 16 < values.len {
+            out.str(",")
+        }
+        out.str("\n")
+        start = start + 16
+    }
+    out.str("]")
+}
+
+// ---------------------------------------------------------------------------
+// Errors and small helpers
+
+// Report a fatal input problem and stop.
+fn fail(message: &str) {
+    errors := console.stderr()
+    errors.print("brotli_tables: ")!
+    errors.println(message)!
+    regen.quit(1)
+}
+
+fn is_digit(b: u8) -> bool {
+    return b >= b'0' && b <= b'9'
+}
+
+// ---------------------------------------------------------------------------
+// RFC text
+
+// RFC lines without page headers, footers and form feeds: (start, end)
+// offsets into the text, which form feeds have been removed from.
+struct Lines {
+    starts: [16384]usize
+    ends: [16384]usize
+    count: usize
+}
+
+fn rfc_pages(text: &[u8], lines: &mut Lines) {
+    start := 0usize
+    for start < text.len {
+        stop := start
+        for stop < text.len && text[stop] != b'\n' {
+            stop = stop + 1
+        }
+        end := stop
+        if end > start && text[end - 1] == b'\r' {
+            end = end - 1
+        }
+        line := &text[start..end]
+        if !regen.starts_with(line, "RFC 7932 ") && !regen.starts_with(line, "Alakuijala & Szabadka") {
+            lines.starts[lines.count] = start
+            lines.ends[lines.count] = end
+            lines.count = lines.count + 1
+        }
+        start = stop + 1
+    }
+}
+
+// Remove form feeds in place; returns the new length.
+fn strip_form_feeds(text: &mut[u8]) -> usize {
+    used := 0usize
+    for i in 0usize..text.len {
+        if text[i] != 12 {
+            text[used] = text[i]
+            used = used + 1
+        }
+    }
+    return used
+}
+
+fn first_line_starting(text: &[u8], lines: &Lines, prefix: &str) -> usize {
+    for i in 0usize..lines.count {
+        if regen.starts_with(&text[lines.starts[i]..lines.ends[i]], prefix) {
+            return i
+        }
+    }
+    fail("RFC section not found")
+    return 0
+}
+
+// One parsed transform: prefix, elementary transform code, suffix.
+struct Transforms {
+    affixes: [2048]u8
+    // Per transform: prefix start/end and suffix start/end in affixes.
+    bounds: [484]usize
+    kinds: [121]u8
+    count: usize
+    used: usize
+}
+
+// Skip at least one whitespace byte; returns the new position or none.
+fn skip_space(line: &[u8], at: usize) -> Option<usize> {
+    i := at
+    for i < line.len && regen.is_space(line[i]) {
+        i = i + 1
+    }
+    if i == at {
+        return none
+    }
+    return some(i)
+}
+
+// Decode the C string literal starting at line[at] (the opening quote) into
+// t.affixes; returns the position after the closing quote.
+fn c_string(line: &[u8], at: usize, t: &mut Transforms) -> Option<usize> {
+    if at >= line.len || line[at] != b'"' {
+        return none
+    }
+    i := at + 1
+    for i < line.len && line[i] != b'"' {
+        c := line[i]
+        if c != b'\\' {
+            t.affixes[t.used] = c
+            t.used = t.used + 1
+            i = i + 1
+            continue
+        }
+        if i + 1 >= line.len {
+            return none
+        }
+        e := line[i + 1]
+        if e == b'x' {
+            if i + 3 >= line.len {
+                return none
+            }
+            t.affixes[t.used] = (hex_value(line[i + 2]) << 4) | hex_value(line[i + 3])
+            i = i + 4
+        } else if e == b'n' || e == b't' {
+            t.affixes[t.used] = if e == b'n' {
+                10u8
+            } else {
+                9u8
+            }
+            i = i + 2
+        } else if e == b'"' || e == b'\'' || e == b'\\' {
+            t.affixes[t.used] = e
+            i = i + 2
+        } else {
+            fail("unknown escape in a transform string")
+        }
+        t.used = t.used + 1
+    }
+    if i >= line.len {
+        return none
+    }
+    return some(i + 1)
+}
+
+fn hex_value(c: u8) -> u8 {
+    if is_digit(c) {
+        return c - b'0'
+    }
+    if c >= b'a' && c <= b'f' {
+        return c - b'a' + 10
+    }
+    if c >= b'A' && c <= b'F' {
+        return c - b'A' + 10
+    }
+    fail("bad hex escape in a transform string")
+    return 0
+}
+
+// RFC elementary transform names -> the codes used in tables.dodo (and in
+// the RFC's check-value serialization): 0 Identity, 1 FermentFirst,
+// 2 FermentAll, 3..11 OmitFirst1..9, 12..20 OmitLast1..9.
+fn transform_code(name: &[u8]) -> u8 {
+    if regen.same(name, b"Identity") {
+        return 0
+    }
+    if regen.same(name, b"FermentFirst") {
+        return 1
+    }
+    if regen.same(name, b"FermentAll") {
+        return 2
+    }
+    if name.len == 10 && regen.starts_with(name, "OmitFirst") && name[9] >= b'1' && name[9] <= b'9' {
+        return 2 + (name[9] - b'0')
+    }
+    if name.len == 9 && regen.starts_with(name, "OmitLast") && name[8] >= b'1' && name[8] <= b'9' {
+        return 11 + (name[8] - b'0')
+    }
+    fail("unknown transform name")
+    return 0
+}
+
+fn is_word(b: u8) -> bool {
+    return is_digit(b) || (b >= b'a' && b <= b'z') || (b >= b'A' && b <= b'Z') || b == b'_'
+}
+
+// Match `^\s+(\d+)\s+"..."\s+(\w+)\s+"..."\s*$`, appending the transform to t.
+// Returns false (leaving t unchanged) when the line is not a transform row.
+fn parse_row(line: &[u8], t: &mut Transforms) -> bool {
+    saved := t.used
+    i := match skip_space(line, 0) {
+        some(n) => n,
+        none => {
+            return false
+        },
+    }
+    index := 0usize
+    digits_start := i
+    for i < line.len && is_digit(line[i]) {
+        if index < 100000 {
+            index = index * 10 + (line[i] - b'0') as usize
+        }
+        i = i + 1
+    }
+    if i == digits_start {
+        return false
+    }
+    i = match skip_space(line, i) {
+        some(n) => n,
+        none => {
+            return false
+        },
+    }
+    prefix_start := t.used
+    i = match c_string(line, i, t) {
+        some(n) => n,
+        none => {
+            t.used = saved
+            return false
+        },
+    }
+    prefix_end := t.used
+    i = match skip_space(line, i) {
+        some(n) => n,
+        none => {
+            t.used = saved
+            return false
+        },
+    }
+    name_start := i
+    for i < line.len && is_word(line[i]) {
+        i = i + 1
+    }
+    name_end := i
+    if name_end == name_start {
+        t.used = saved
+        return false
+    }
+    i = match skip_space(line, i) {
+        some(n) => n,
+        none => {
+            t.used = saved
+            return false
+        },
+    }
+    suffix_start := t.used
+    i = match c_string(line, i, t) {
+        some(n) => n,
+        none => {
+            t.used = saved
+            return false
+        },
+    }
+    suffix_end := t.used
+    for i < line.len && regen.is_space(line[i]) {
+        i = i + 1
+    }
+    if i != line.len {
+        t.used = saved
+        return false
+    }
+    if index != t.count {
+        fail("transform out of order")
+    }
+    if t.count == 121 {
+        fail("more than 121 transforms")
+    }
+    t.bounds[4 * t.count] = prefix_start
+    t.bounds[4 * t.count + 1] = prefix_end
+    t.bounds[4 * t.count + 2] = suffix_start
+    t.bounds[4 * t.count + 3] = suffix_end
+    t.kinds[t.count] = transform_code(&line[name_start..name_end])
+    t.count = t.count + 1
+    return true
+}
+
+fn parse_transforms(text: &[u8], lines: &Lines, t: &mut Transforms) {
+    start := first_line_starting(text, lines, "Appendix B.")
+    end := first_line_starting(text, lines, "Appendix C.")
+    for i in start..end {
+        parse_row(&text[lines.starts[i]..lines.ends[i]], t)
+    }
+    if t.count != 121 {
+        fail("did not find 121 transforms")
+    }
+    // The RFC's check value covers prefix NUL type suffix NUL per transform.
+    serial := [0u8; 2048]
+    used := 0usize
+    for k in 0usize..121 {
+        for i in t.bounds[4 * k]..t.bounds[4 * k + 1] {
+            serial[used] = t.affixes[i]
+            used = used + 1
+        }
+        serial[used] = 0
+        serial[used + 1] = t.kinds[k]
+        used = used + 2
+        for i in t.bounds[4 * k + 2]..t.bounds[4 * k + 3] {
+            serial[used] = t.affixes[i]
+            used = used + 1
+        }
+        serial[used] = 0
+        used = used + 1
+    }
+    if used != TRANSFORMS_LEN || checksum.crc32(&serial[..used]) != TRANSFORMS_CRC {
+        fail("transform list does not match the RFC check value")
+    }
+}
+
+fn parse_lut(text: &[u8], lines: &Lines, which: usize, values: &mut[256]u8) {
+    start := lines.count
+    for i in 0usize..lines.count {
+        line := regen.trim(&text[lines.starts[i]..lines.ends[i]])
+        if line.len == 7 && regen.starts_with(line, LUT_NAMES[which]) && regen.same(&line[4..], b" :=") {
+            start = i
+            break
+        }
+    }
+    if start == lines.count {
+        fail("context lookup table not found")
+    }
+    count := 0usize
+    for i in start + 1..lines.count {
+        if count == 256 {
+            break
+        }
+        line := &text[lines.starts[i]..lines.ends[i]]
+        j := 0usize
+        for j < line.len {
+            if regen.is_space(line[j]) || line[j] == b',' {
+                j = j + 1
+                continue
+            }
+            if !is_digit(line[j]) {
+                fail("non-numeric entry in a context lookup table")
+            }
+            value := 0usize
+            for j < line.len && is_digit(line[j]) {
+                value = value * 10 + (line[j] - b'0') as usize
+                if value > 255 {
+                    fail("context lookup table entry out of range")
+                }
+                j = j + 1
+            }
+            if count == 256 {
+                fail("context lookup table has more than 256 entries")
+            }
+            values[count] = value as u8
+            count = count + 1
+        }
+    }
+    if count != 256 || checksum.crc32(&values[..]) != LUT_CRCS[which] {
+        fail("a context lookup table does not match the RFC check value")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Generation
+
+fn check_sha256(data: &[u8], expected: &str, what: &str) {
+    digest := [0u8; 64]
+    sha256.hex(data, &mut digest)
+    if !regen.same(&digest, mem.str_bytes(expected)) {
+        errors := console.stderr()
+        errors.print("brotli_tables: SHA-256 mismatch for ")!
+        errors.println(what)!
+        errors.print("  expected ")!
+        errors.println(expected)!
+        errors.print("  found    ")!
+        errors.write(&digest)!
+        errors.println("")!
+        regen.quit(1)
+    }
+}
+
+fn generate(dictionary: &[u8], rfc: &[u8], out: &mut regen.Buf) {
+    if dictionary.len != DICTIONARY_LEN {
+        fail("the dictionary does not have 122,784 bytes")
+    }
+    check_sha256(dictionary, DICTIONARY_SHA256, "the dictionary")
+    if checksum.crc32(dictionary) != DICTIONARY_CRC {
+        fail("dictionary CRC-32 does not match RFC 7932 Appendix A")
+    }
+    lines := Lines { starts: [0usize; 16384], ends: [0usize; 16384], count: 0 }
+    rfc_pages(rfc, &mut lines)
+    t := Transforms { affixes: [0u8; 2048], bounds: [0usize; 484], kinds: [0u8; 121], count: 0, used: 0 }
+    parse_transforms(rfc, &lines, &mut t)
+    // Affixes are stored once each in AFFIXES, a byte string of
+    // length-prefixed entries; TRANSFORMS holds (prefix offset, elementary
+    // transform, suffix offset) per transform.
+    affixes := [0u8; 256]
+    affix_count := 0usize
+    // Offsets in affixes of the distinct entries, in first-seen order.
+    entries := [0usize; 242]
+    entry_count := 0usize
+    triples := [0u8; 363]
+    for k in 0usize..121 {
+        for side in 0usize..2 {
+            affix := &t.affixes[t.bounds[4 * k + 2 * side]..t.bounds[4 * k + 2 * side + 1]]
+            found := affixes.len
+            for e in 0usize..entry_count {
+                offset := entries[e]
+                length := affixes[offset] as usize
+                if regen.same(&affixes[offset + 1..offset + 1 + length], affix) {
+                    found = offset
+                    break
+                }
+            }
+            if found == affixes.len {
+                if affix_count + 1 + affix.len > 255 {
+                    fail("affix table exceeds 8-bit offsets")
+                }
+                found = affix_count
+                entries[entry_count] = affix_count
+                entry_count = entry_count + 1
+                affixes[affix_count] = affix.len as u8
+                for i in 0usize..affix.len {
+                    affixes[affix_count + 1 + i] = affix[i]
+                }
+                affix_count = affix_count + 1 + affix.len
+            }
+            triples[3 * k + 2 * side] = found as u8
+        }
+        triples[3 * k + 1] = t.kinds[k]
+    }
+    lut0 := [0u8; 256]
+    lut1 := [0u8; 256]
+    lut2 := [0u8; 256]
+    parse_lut(rfc, &lines, 0, &mut lut0)
+    parse_lut(rfc, &lines, 1, &mut lut1)
+    parse_lut(rfc, &lines, 2, &mut lut2)
+
+    out.str("package brotli\n\n")
+    out.str("// Generated by scripts/gen/brotli_tables.dodo from RFC 7932; do not edit.\n\n")
+    out.str("// The static dictionary (RFC 7932 Appendix A, google/brotli\n")
+    out.str("// c/common/dictionary.bin): 122,784 bytes, CRC-32 0x5136cb04.\n")
+    out.str("const DICTIONARY: &[u8] = ")
+    byte_string(out, dictionary)
+    out.str("\n\n")
+    out.str("// Prefixes and suffixes of the word transforms, each a length byte\n")
+    out.str("// followed by the bytes.\n")
+    out.str("const AFFIXES: &[u8] = ")
+    byte_string(out, &affixes[..affix_count])
+    out.str("\n\n")
+    out.str("// Per transform (Appendix B): prefix offset in AFFIXES, elementary\n")
+    out.str("// transform (0 Identity, 1 FermentFirst, 2 FermentAll, 3..11 OmitFirst1..9,\n")
+    out.str("// 12..20 OmitLast1..9), suffix offset in AFFIXES.\n")
+    u8_table(out, "TRANSFORMS", &triples)
+    out.str("\n\n")
+    out.str("// Literal context lookup tables (section 7.1).\n")
+    u8_table(out, "LUT0", &lut0)
+    out.str("\n")
+    u8_table(out, "LUT1", &lut1)
+    out.str("\n")
+    u8_table(out, "LUT2", &lut2)
+    out.str("\n")
+}
+
+// ---------------------------------------------------------------------------
+// Files and the command line
+
+fn read_into(path: &str, storage: &mut[u8], what: &str) -> usize {
+    workspace := platform.workspace()
+    match fs.read_file(path, storage, &mut workspace) {
+        ok(report) => {
+            if !report.eof {
+                fail("an input file is too large")
+            }
+            return report.read
+        },
+        err(_) => {
+            errors := console.stderr()
+            errors.print("brotli_tables: cannot read ")!
+            errors.println(what)!
+            regen.quit(1)
+            return 0
+        },
+    }
+}
+
+fn main() -> i32 {
+    check := false
+    write := false
+    // Argument indexes after --dictionary and --rfc, plus one; 0 if absent.
+    dictionary_path := 0usize
+    rfc_path := 0usize
+    arguments := regen.arguments()
+    count := arguments.len()
+    i := 0usize
+    for i < count {
+        if arguments.is(i, "--dictionary") && dictionary_path == 0 && i + 1 < count {
+            i += 1
+            dictionary_path = i + 1
+        } else if arguments.is(i, "--rfc") && rfc_path == 0 && i + 1 < count {
+            i += 1
+            rfc_path = i + 1
+        } else if arguments.is(i, "--check") && !write {
+            check = true
+        } else if arguments.is(i, "--write") && !check {
+            write = true
+        } else if arguments.is(i, "-h") || arguments.is(i, "--help") {
+            regen.usage(&USAGE, false)
+            return 0
+        } else {
+            regen.usage(&USAGE, true)
+            return 2
+        }
+        i += 1
+    }
+    if dictionary_path == 0 || rfc_path == 0 {
+        regen.usage(&USAGE, true)
+        return 2
+    }
+
+    dictionary_len := 0usize
+    rfc_len := 0usize
+    unsafe {
+        dictionary_len = read_into(arguments.get(dictionary_path - 1), &mut DICTIONARY, "the dictionary")
+        rfc_len = read_into(arguments.get(rfc_path - 1), &mut RFC, "the RFC text")
+    }
+    out := regen.Buf.new(unsafe {
+        &mut OUTPUT
+    })
+    unsafe {
+        check_sha256(&RFC[..rfc_len], RFC_SHA256, "the RFC text")
+        rfc_len = strip_form_feeds(&mut RFC[..rfc_len])
+        generate(&DICTIONARY[..dictionary_len], &RFC[..rfc_len], &mut out)
+    }
+    if !(check || write) {
+        return regen.print(out.view())
+    }
+    if !regen.find_root(SELF_PATH) {
+        regen.fail("Run this generator from inside the Dodo repository.")
+        return 2
+    }
+    return regen.update_file(TARGET, out.view(), check, "")
+}

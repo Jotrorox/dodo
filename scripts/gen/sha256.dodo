@@ -1,0 +1,111 @@
+package sha256
+
+// Usage: `import "sha256"`, then `sha256.hex(data, &mut out)` writes the 64 lowercase hex digits of SHA-256(data) into out[..64].
+//
+// A small pure-Dodo SHA-256 (FIPS 180-4) for the generators in scripts/gen,
+// which pin the hashes of downloaded inputs. The standard library's SHA-256
+// goes through OpenSSL, which generators should not depend on. Speed is not a
+// goal: inputs are a few megabytes at most.
+
+const K: [64]u32 = [
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+]
+
+fn rotr(x: u32, n: u32) -> u32 {
+    return (x >> n) | ((x & ((1u32 << n) - 1)) << (32 - n))
+}
+
+fn add(a: u32, b: u32) -> u32 {
+    return core.wrapping_add(a, b)
+}
+
+// Compress one 64-byte block into the state.
+fn compress(state: &mut[8]u32, block: &[u8]) {
+    w := [0u32; 64]
+    for i in 0usize..16 {
+        w[i] = (block[4 * i] as u32 << 24) | (block[4 * i + 1] as u32 << 16) | (block[4 * i + 2] as u32 << 8) | block[4 * i + 3] as u32
+    }
+    for i in 16usize..64 {
+        x := w[i - 15]
+        y := w[i - 2]
+        s0 := rotr(x, 7) ^ rotr(x, 18) ^ (x >> 3)
+        s1 := rotr(y, 17) ^ rotr(y, 19) ^ (y >> 10)
+        w[i] = add(add(w[i - 16], s0), add(w[i - 7], s1))
+    }
+    a := state[0]
+    b := state[1]
+    c := state[2]
+    d := state[3]
+    e := state[4]
+    f := state[5]
+    g := state[6]
+    h := state[7]
+    for i in 0usize..64 {
+        s1 := rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25)
+        ch := (e & f) ^ (~e & g)
+        t1 := add(add(add(h, s1), add(ch, K[i])), w[i])
+        s0 := rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22)
+        maj := (a & b) ^ (a & c) ^ (b & c)
+        t2 := add(s0, maj)
+        h = g
+        g = f
+        f = e
+        e = add(d, t1)
+        d = c
+        c = b
+        b = a
+        a = add(t1, t2)
+    }
+    state[0] = add(state[0], a)
+    state[1] = add(state[1], b)
+    state[2] = add(state[2], c)
+    state[3] = add(state[3], d)
+    state[4] = add(state[4], e)
+    state[5] = add(state[5], f)
+    state[6] = add(state[6], g)
+    state[7] = add(state[7], h)
+}
+
+// Write SHA-256(data) as 64 lowercase hex digits into out[..64].
+pub fn hex(data: &[u8], out: &mut[u8]) {
+    state := [
+        0x6a09e667u32, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
+    ]
+    full := data.len / 64
+    for i in 0usize..full {
+        compress(&mut state, &data[64 * i..64 * i + 64])
+    }
+    // Pad the tail: 0x80, zeros, then the bit length as a big-endian u64.
+    tail := [0u8; 128]
+    rest := data.len - 64 * full
+    for i in 0usize..rest {
+        tail[i] = data[64 * full + i]
+    }
+    tail[rest] = 0x80
+    blocks: usize = if rest < 56 {
+        1
+    } else {
+        2
+    }
+    bits := data.len as u64 * 8
+    for i in 0usize..8 {
+        tail[64 * blocks - 1 - i] = ((bits >> (8 * i as u64)) & 255) as u8
+    }
+    for i in 0usize..blocks {
+        compress(&mut state, &tail[64 * i..64 * i + 64])
+    }
+    digits := b"0123456789abcdef"
+    for i in 0usize..32 {
+        byte := (state[i / 4] >> (24 - 8 * (i % 4) as u32)) & 255
+        out[2 * i] = digits[(byte >> 4) as usize]
+        out[2 * i + 1] = digits[(byte & 15) as usize]
+    }
+}
